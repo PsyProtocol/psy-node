@@ -5,7 +5,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
-use crate::{crypto::hash::traits::{CodeSerializableHash, ZeroableHash}, data::serializable::{QPDSerializable, QPDSerializableFixed}};
+use crate::{crypto::hash::traits::{CodeSerializableHash, ZeroableHash}, data::serializable::{QPDSerializable, QPDSerializableFixed}, protocol::core_types::QHashBase};
 
 
 #[serde_as]
@@ -110,4 +110,7 @@ impl CodeSerializableHash for Hash256 {
     fn get_type_name() -> String {
         "Hash256".to_string()
     }
+}
+
+impl QHashBase for Hash256 {
 }
