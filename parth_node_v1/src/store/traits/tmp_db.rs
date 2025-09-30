@@ -69,14 +69,14 @@ pub trait QPBasicStoreKVWriter {
         let value_bytes = value.to_bytes()?;
         self.set_exact_bytes(table_type, &key_bytes, &value_bytes).await
     }
-    async fn set_exact_bytes_many(&self, table_type: u32, entries: &[QPDPair<Vec<u8>, Vec<u8>>]) -> anyhow::Result<()>;
+    async fn set_exact_bytes_many(&self, table_type: u32, entries: Vec<QPDPair<Vec<u8>, Vec<u8>>>) -> anyhow::Result<()>;
     async fn set_exact_object_key_bytes_many<K: QPDSerializableFixed + Sync>(&self, table_type: u32, entries: &[QPDPair<K, Vec<u8>>]) -> anyhow::Result<()> {
         let key_bytes: Vec<QPDPair<Vec<u8>, Vec<u8>>> = entries.iter().map(|e| QPDPair { key: e.key.to_bytes().unwrap(), value: e.value.clone() }).collect();
-        self.set_exact_bytes_many(table_type, &key_bytes).await
+        self.set_exact_bytes_many(table_type, key_bytes).await
     }
     async fn set_exact_object_many<K: QPDSerializableFixed + Sync, V: QPDSerializable + Sync>(&self, table_type: u32, entries: &[QPDPair<K, V>]) -> anyhow::Result<()> {
         let key_bytes: Vec<QPDPair<Vec<u8>, Vec<u8>>> = entries.iter().map(|e| QPDPair { key: e.key.to_bytes().unwrap(), value: e.value.to_bytes().unwrap() }).collect();
-        self.set_exact_bytes_many(table_type, &key_bytes).await
+        self.set_exact_bytes_many(table_type, key_bytes).await
     }
 }
 
