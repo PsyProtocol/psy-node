@@ -1263,7 +1263,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
     ) -> anyhow::Result<()> {
         let mut batch_list: Vec<Batch> = Vec::new();
         let mut value_list: Vec<Vec<(i64, Vec<u8>)>> = Vec::new();
-        for chunk in rows.chunks(INSERT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE) {
+        for chunk in rows.chunks(INSERT_KEY_ID_VALUE_CHECKPOINTED_OBJECT_BATCH_SIZE) {
             let mut batch: Batch = Default::default();
             for _node in chunk {
                 batch.append_statement(single_prepared.insert_1_statement.clone());
@@ -1312,7 +1312,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
         }
         Ok(())
     }
-    pub async fn insert_many_kivs_at_checkpoint_t<V: Serialize + DeserializeOwned, R: QDatabaseKeyIdValueTableRowLike<V>>(
+    pub async fn insert_many_kivs_t<V: Serialize + DeserializeOwned, R: QDatabaseKeyIdValueTableRowLike<V>>(
         &self, 
         single_prepared: &ScyllaGenericKeyIdValueTablePreparedStatements, 
         rows: &[R]

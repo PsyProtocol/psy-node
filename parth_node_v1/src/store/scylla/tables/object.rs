@@ -97,7 +97,7 @@ impl ScyllaGenericObjectDoubleIdTablePreparedStatements {
         let select_value_1_statement = Statement::new(format!("SELECT value FROM {}.{} WHERE obj_id = ? AND secondary_id = ? AND checkpoint_id <= ? LIMIT 1", keyspace, table_name));
         let select_value_1_prepared = session.prepare(select_value_1_statement.clone()).await?;
 
-        let select_value_checkpoint_id_obj_ids_1_statement = Statement::new(format!("SELECT obj_id, secondary_id, checkpoint_id, value, secondary_id FROM {}.{} WHERE obj_id = ? AND secondary_id = ? AND checkpoint_id <= ? LIMIT 1", keyspace, table_name));
+        let select_value_checkpoint_id_obj_ids_1_statement = Statement::new(format!("SELECT obj_id, secondary_id, checkpoint_id, value FROM {}.{} WHERE obj_id = ? AND secondary_id = ? AND checkpoint_id <= ? LIMIT 1", keyspace, table_name));
         let select_value_checkpoint_id_obj_ids_1_prepared = session.prepare(select_value_checkpoint_id_obj_ids_1_statement.clone()).await?;
 
         let select_all_statement = Statement::new(format!("SELECT obj_id, secondary_id, checkpoint_id, value FROM {}.{}", keyspace, table_name));
