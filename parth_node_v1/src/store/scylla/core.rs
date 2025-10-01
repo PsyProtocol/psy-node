@@ -2,29 +2,18 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use futures::future::join_all;
-use parth_core::{crypto::hash::traits::MerkleZeroHasher, data::{hash::merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}, serializable::{BinaryKVWithCheckpointId, QPDPair, QPDSerializable}}, protocol::core_types::QHashBase};
-use scylla::{client::session::{Session, SessionConfig}, statement::{batch::Batch, prepared::PreparedStatement, Statement}};
+use parth_core::{crypto::hash::traits::MerkleZeroHasher, data::{db::row::{QDatabaseDoubleIdTableRow, QDatabaseDoubleIdTableRowCreatable, QDatabaseDoubleIdTableRowLike, QDatabaseDoubleIdTableRowNoCheckpointId, QDatabaseDoubleIdTableRowNoCheckpointIdLike, QDatabaseSingleIdTableRow, QDatabaseSingleIdTableRowCreatable, QDatabaseSingleIdTableRowLike, QDatabaseSingleIdTableRowNoCheckpointId, QDatabaseSingleIdTableRowNoCheckpointIdLike, QDoubleIdKey}, hash::merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}, serializable::{BinaryKVWithCheckpointId, QPDPair, QPDSerializable}}, protocol::core_types::QHashBase};
+use scylla::{client::session::{Session, SessionConfig}, statement::batch::Batch};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+
+use crate::store::scylla::{constants::{INSERT_DOUBLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE, INSERT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE, MAX_PREPARED_INSERT_BATCH_SIZE, SELECT_DOUBLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE, SELECT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE}, tables::{merkle::{ScyllaBlobPreparedStatements, ScyllaDoubleMerkleNodesPreparedStatements, ScyllaMerkleNodesPreparedStatements}, object::{ScyllaGenericKeyIdValueTablePreparedStatements, ScyllaGenericObjectDoubleIdTablePreparedStatements, ScyllaGenericObjectSingleIdTablePreparedStatements}}, utils::{convert_checkpoint_id_to_i64, convert_i64_to_checkpoint_id, i64_to_u64_exact, u64_to_i64_exact, u8_to_i8_exact}};
 
 
 
 
-const MAX_PREPARED_INSERT_BATCH_SIZE: usize = 128usize;
 //const MAX_SELECT_SIZE: usize = 128usize;
 
 
-
-pub const fn u64_to_i64_exact(num: u64) -> i64 {
-    i64::from_ne_bytes(num.to_ne_bytes())
-}
-pub const fn i64_to_u64_exact(num: i64) -> u64 {
-    u64::from_ne_bytes(num.to_ne_bytes())
-}
-pub const fn u8_to_i8_exact(num: u8) -> i8 {
-    i8::from_ne_bytes([num])
-}
-pub const fn i8_to_u8_exact(num: i8) -> u8 {
-    u8::from_ne_bytes(num.to_ne_bytes())
-}
 #[derive(Clone)]
 pub struct ScyllaCoreStore<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> {
     pub session: Arc<Session>,
@@ -37,151 +26,6 @@ pub struct ScyllaCoreStore<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> {
 
     _phantom_hash: std::marker::PhantomData<Hash>,
     _phantom_hasher: std::marker::PhantomData<Hasher>,
-}
-#[derive(Clone)]
-pub struct ScyllaBlobPreparedStatements {
-    pub insert_1: Arc<PreparedStatement>,
-    pub insert_prepared_batches: [Arc<Batch>; MAX_PREPARED_INSERT_BATCH_SIZE],
-    pub select_1: Arc<PreparedStatement>,
-    pub select_1_with_checkpoint: Arc<PreparedStatement>,
-    pub select_2: Arc<PreparedStatement>,
-    pub select_15: Arc<PreparedStatement>,
-    pub select_all: Arc<PreparedStatement>,
-
-
-}
-impl ScyllaBlobPreparedStatements {
-    pub async fn new_from_session(session: Arc<Session>) -> anyhow::Result<Self> {
-
-        let insert_1 = session.prepare(Statement::new("INSERT INTO checkpointed_kvs (node_key, checkpoint_id, node_value) VALUES (?, ?, ?)")).await?;
-        let select_1 = session.prepare(Statement::new("SELECT node_value FROM checkpointed_kvs WHERE node_key = ? AND checkpoint_id <= ? LIMIT 1")).await?;
-        let select_1_with_checkpoint = session.prepare(Statement::new("SELECT node_value, checkpoint_id FROM checkpointed_kvs WHERE node_key = ? AND checkpoint_id <= ? LIMIT 1")).await?;
-
-        let select_2 = session.prepare(Statement::new("SELECT node_key, node_value from checkpointed_kvs WHERE node_key IN (?, ?) AND checkpoint_id <= ? PER PARTITION LIMIT 1")).await?;
-        let select_15 = session.prepare(Statement::new("SELECT node_key, node_value from checkpointed_kvs WHERE node_key IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) AND checkpoint_id <= ? PER PARTITION LIMIT 1")).await?;
-
-    let insert_prepared_alt = 
-        session
-            .prepare("INSERT INTO checkpointed_kvs (node_key, checkpoint_id, node_value) VALUES (?, ?, ?)")
-            .await?;
-    let mut batches: Vec<Arc<Batch>> = Vec::with_capacity(MAX_PREPARED_INSERT_BATCH_SIZE);
-    for i in 0..MAX_PREPARED_INSERT_BATCH_SIZE {
-        let mut batch: Batch = Default::default();
-        for _ in 0..=i {
-            batch.append_statement(insert_prepared_alt.clone());
-        }
-        let prepared_batch = session.prepare_batch(&batch).await?;
-        batches.push(Arc::new(prepared_batch));
-    }
-
-    let insert_prepared_batches: [Arc<Batch>; MAX_PREPARED_INSERT_BATCH_SIZE] = match batches.try_into() {
-        Ok(x) => x,
-        Err(_) => anyhow::bail!("error preparing batches"),
-    };
-    let select_all = session.prepare("SELECT node_key, checkpoint_id, node_value from checkpointed_kvs").await?;
-        Ok(Self {
-            insert_1: Arc::new(insert_1),
-            insert_prepared_batches,
-            select_1: Arc::new(select_1),
-            select_1_with_checkpoint: Arc::new(select_1_with_checkpoint),
-            select_2: Arc::new(select_2),
-            select_15: Arc::new(select_15),
-            select_all: Arc::new(select_all),
-        })
-    }
-    pub async fn create_table(session: Arc<Session>, keyspace: &str) -> anyhow::Result<()> {
-        session
-            .query_unpaged(
-                format!("CREATE TABLE IF NOT EXISTS {}.checkpointed_kvs (
-                node_key blob,
-                checkpoint_id bigint,
-                node_value blob,
-                PRIMARY KEY ((node_key), checkpoint_id)
-            ) WITH CLUSTERING ORDER BY (checkpoint_id DESC)", keyspace),
-                &[],
-            ).await?;
-        session.await_schema_agreement().await?;
-        Ok(())
-    }
-}
-
-#[derive(Clone)]
-pub struct ScyllaMerkleNodesPreparedStatements {
-    pub insert_1: Arc<PreparedStatement>,
-    pub insert_1_statement: Statement,
-    pub select_1: Arc<PreparedStatement>,
-    pub select_1_statement: Statement,
-
-}
-
-impl ScyllaMerkleNodesPreparedStatements {
-    pub async fn new_from_session(session: Arc<Session>) -> anyhow::Result<Self> {
-        let insert_1_statement = Statement::new("INSERT INTO merkle_nodes (tree_id, level, node_index, checkpoint_id, value) VALUES (?, ?, ?, ?, ?)");
-        let insert_prep = session.prepare(insert_1_statement.clone()).await?;
-        let select_1_statement = Statement::new("SELECT value FROM merkle_nodes WHERE tree_id = ? AND level = ? AND node_index = ? AND checkpoint_id <= ? LIMIT 1");
-        let select_prep = session.prepare(select_1_statement.clone()).await?;
-
-        Ok(Self {
-            insert_1: Arc::new(insert_prep),
-            select_1: Arc::new(select_prep),
-            insert_1_statement: insert_1_statement,
-            select_1_statement: select_1_statement,
-        })
-    }
-    pub async fn create_table(session: Arc<Session>, keyspace: &str) -> anyhow::Result<()> {
-        session
-            .query_unpaged(
-                format!("CREATE TABLE IF NOT EXISTS {}.merkle_nodes (
-                    tree_id BIGINT,
-                    level TINYINT,
-                    node_index BIGINT,
-                    checkpoint_id BIGINT,
-                    value BLOB,
-                    PRIMARY KEY ((tree_id), level, node_index, checkpoint_id)
-                ) WITH CLUSTERING ORDER BY (level ASC, node_index ASC, checkpoint_id DESC)", keyspace),
-                &[],
-            ).await?;
-        session.await_schema_agreement().await?;
-        Ok(())
-    }
-}
-
-#[derive(Clone)]
-pub struct ScyllaDoubleMerkleNodesPreparedStatements {
-    pub insert_1: Arc<PreparedStatement>,
-    pub insert_1_statement: Statement,
-    pub select_1: Arc<PreparedStatement>,
-    pub select_1_statement: Statement,
-}
-
-impl ScyllaDoubleMerkleNodesPreparedStatements {
-    pub async fn new_from_session(session: Arc<Session>) -> anyhow::Result<Self> {
-        let insert_1_statement = Statement::new("INSERT INTO double_merkle_nodes (tree_id, tree_sub_id, level, node_index, checkpoint_id, value) VALUES (?, ?, ?, ?, ?, ?)");
-        let insert_prep = session.prepare(insert_1_statement.clone()).await?;
-        let select_1_statement = Statement::new("SELECT value FROM double_merkle_nodes WHERE tree_id = ? AND tree_sub_id = ? AND level = ? AND node_index = ? AND checkpoint_id <= ? LIMIT 1");
-        let select_prep = session.prepare(select_1_statement.clone()).await?;
-
-        Ok(Self {
-            insert_1: Arc::new(insert_prep),
-            select_1: Arc::new(select_prep),
-            select_1_statement,
-            insert_1_statement,
-        })
-    }
-    pub async fn create_table(session: Arc<Session>, keyspace: &str) -> anyhow::Result<()> {
-        session
-            .query_unpaged(
-                format!("CREATE TABLE IF NOT EXISTS {}.checkpointed_kvs (
-                node_key blob,
-                checkpoint_id bigint,
-                node_value blob,
-                PRIMARY KEY ((node_key), checkpoint_id)
-            ) WITH CLUSTERING ORDER BY (checkpoint_id DESC)", &keyspace),
-                &[],
-            ).await?;
-        session.await_schema_agreement().await?;
-        Ok(())
-    }
 }
 
 impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Hasher> {
@@ -220,12 +64,27 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
             _phantom_hasher: std::marker::PhantomData,
         })
     }
+    pub async fn init_single_id_checkpointed(&self, table_name: &str) -> anyhow::Result<ScyllaGenericObjectSingleIdTablePreparedStatements> {
+        ScyllaGenericObjectSingleIdTablePreparedStatements::create_table(self.session.clone(), &self.keyspace, table_name).await?;
+        let prep = ScyllaGenericObjectSingleIdTablePreparedStatements::new_from_session(self.session.clone(), &self.keyspace, table_name).await?;
+        Ok(prep)
+    }
+    pub async fn init_double_id_checkpointed(&self, table_name: &str) -> anyhow::Result<ScyllaGenericObjectDoubleIdTablePreparedStatements> {
+        ScyllaGenericObjectDoubleIdTablePreparedStatements::create_table(self.session.clone(), &self.keyspace, table_name).await?;
+        let prep = ScyllaGenericObjectDoubleIdTablePreparedStatements::new_from_session(self.session.clone(), &self.keyspace, table_name).await?;
+        Ok(prep)
+    }
+    pub async fn init_key_id_value(&self, table_name: &str) -> anyhow::Result<ScyllaGenericKeyIdValueTablePreparedStatements> {
+        ScyllaGenericKeyIdValueTablePreparedStatements::create_table(self.session.clone(), &self.keyspace, table_name).await?;
+        let prep = ScyllaGenericKeyIdValueTablePreparedStatements::new_from_session(self.session.clone(), &self.keyspace, table_name).await?;
+        Ok(prep)
+    }
 }
 
 
 impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Hasher> {
     pub async fn select_single_id_merkle_node_max_checkpoint_internal(&self, checkpoint_id: u64, tree_id: u64, tree_height: u8, key: SimpleMerkleNodeKey) -> anyhow::Result<Hash> {
-        let res = self.session.execute_unpaged(&self.prep_merkle.select_1, (u64_to_i64_exact(tree_id), u8_to_i8_exact(key.level), u64_to_i64_exact(key.index), u64_to_i64_exact(checkpoint_id))).await?;
+        let res = self.session.execute_unpaged(&self.prep_merkle.select_1, (u64_to_i64_exact(tree_id), u8_to_i8_exact(key.level), u64_to_i64_exact(key.index), convert_checkpoint_id_to_i64(checkpoint_id))).await?;
         let rows = res.into_rows_result()?;
         match rows.maybe_first_row::<(Vec<u8>,)>()? {
             Some(row) => Ok(Hash::from_bytes(&row.0)?),
@@ -344,7 +203,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
         Ok(())
     }
     pub async fn select_double_id_merkle_node_max_checkpoint_internal(&self, checkpoint_id: u64, tree_id: u64, tree_height: u8, tree_secondary_id: u64, key: SimpleMerkleNodeKey) -> anyhow::Result<Hash> {
-        let res = self.session.execute_unpaged(&self.prep_double_merkle.select_1, (u64_to_i64_exact(tree_id), u64_to_i64_exact(tree_secondary_id), u8_to_i8_exact(key.level), u64_to_i64_exact(key.index), u64_to_i64_exact(checkpoint_id))).await?;
+        let res = self.session.execute_unpaged(&self.prep_double_merkle.select_1, (u64_to_i64_exact(tree_id), u64_to_i64_exact(tree_secondary_id), u8_to_i8_exact(key.level), u64_to_i64_exact(key.index), convert_checkpoint_id_to_i64(checkpoint_id))).await?;
         let rows = res.into_rows_result()?;
         match rows.maybe_first_row::<(Vec<u8>,)>()? {
             Some(row) => if row.0.len() == Hash::get_fixed_size() {
@@ -654,4 +513,585 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
         }
         Ok(results)
     }
+
 }   
+
+
+
+impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Hasher> {
+
+    pub async fn select_one_single_checkpointed_object_value<V: Serialize + DeserializeOwned>(
+        &self, 
+        single_prepared: &ScyllaGenericObjectSingleIdTablePreparedStatements, 
+        obj_id: u64, 
+        max_checkpoint_id: u64
+    ) -> anyhow::Result<Option<V>> {
+        let res = self.session.execute_unpaged(&single_prepared.select_value_1_prepared, (u64_to_i64_exact(obj_id), convert_checkpoint_id_to_i64(max_checkpoint_id))).await?;
+        let rows = res.into_rows_result()?;
+        match rows.maybe_first_row::<(Vec<u8>,)>()? {
+            Some(row) => match bincode::deserialize::<V>(&row.0) {
+                Ok(value) => Ok(Some(value)),
+                Err(e) => {
+                    tracing::error!("Deserialization error for latest object ID with {} in table {}.{}: {:?}", obj_id, single_prepared.keyspace, single_prepared.table_name, e);
+                    Ok(None)
+                }
+            },
+            None => Ok(None), // Return zero hash if not found
+        }
+    }
+    pub async fn select_one_single_checkpointed_object_value_and_ids<V: Serialize + DeserializeOwned>(
+        &self, 
+        single_prepared: &ScyllaGenericObjectSingleIdTablePreparedStatements, 
+        obj_id: u64, 
+        max_checkpoint_id: u64
+    ) -> anyhow::Result<Option<QDatabaseSingleIdTableRow<V>>> {
+        let res = self.session.execute_unpaged(&single_prepared.select_value_1_prepared, (u64_to_i64_exact(obj_id), convert_checkpoint_id_to_i64(max_checkpoint_id))).await?;
+        let rows = res.into_rows_result()?;
+        match rows.maybe_first_row::<(i64, i64, Vec<u8>)>()? {
+            Some(row) => match bincode::deserialize::<V>(&row.2) {
+                Ok(value) => Ok(Some(QDatabaseSingleIdTableRow {
+                    value,
+                    obj_id: i64_to_u64_exact(row.0),
+                    checkpoint_id: convert_i64_to_checkpoint_id(row.1),
+                })),
+                Err(e) => {
+                    tracing::error!("Deserialization error for object ID {} at checkpoint_id={} in {}.{}: {:?}", obj_id, convert_i64_to_checkpoint_id(row.1), single_prepared.keyspace, single_prepared.table_name, e);
+                    Ok(None)
+                }
+            },
+            None => Ok(None), // Return zero hash if not found
+        }
+    }
+    pub async fn select_all_single_checkpointed_object<V: Serialize + DeserializeOwned>(
+        &self, 
+        single_prepared: &ScyllaGenericObjectSingleIdTablePreparedStatements, 
+    ) -> anyhow::Result<Vec<QDatabaseSingleIdTableRow<V>>> {
+        let res = self.session.execute_unpaged(&single_prepared.select_all_prepared, ()).await?;
+        let rows_result = res.into_rows_result()?;
+        let rows_iter = rows_result.rows::<(i64,i64,Vec<u8>)>()?;
+        let rows_vec: Vec<_> = rows_iter.collect();
+        let mut results = Vec::with_capacity(rows_vec.len());
+
+        for row in rows_vec {
+            let (obj_id, checkpoint_id, value): (i64, i64, Vec<u8>) = row?;
+            results.push(QDatabaseSingleIdTableRow {
+                obj_id: i64_to_u64_exact(obj_id),
+                checkpoint_id: convert_i64_to_checkpoint_id(checkpoint_id),
+                value: match bincode::deserialize(&value){
+                    Ok(value) => value,
+                    Err(e) => {
+                        tracing::error!("Deserialization error for object ID {} at checkpoint_id={} in {}.{}: {:?}", obj_id, convert_i64_to_checkpoint_id(checkpoint_id), single_prepared.keyspace, single_prepared.table_name, e);
+                        anyhow::bail!("Deserialization error for object ID {} at checkpoint_id={} in {}.{}: {:?}", obj_id, convert_i64_to_checkpoint_id(checkpoint_id), single_prepared.keyspace, single_prepared.table_name, e);
+                    }
+                },
+            });
+        }
+        Ok(results)
+    }
+
+
+    pub async fn insert_one_single_checkpointed_object<V: Serialize>(
+        &self, 
+        single_prepared: &ScyllaGenericObjectSingleIdTablePreparedStatements, 
+        obj_id: u64, 
+        checkpoint_id: u64, 
+        value: &V
+    ) -> anyhow::Result<()> {
+        let value_bytes = bincode::serialize(value)?;
+        self.session.execute_unpaged(&single_prepared.insert_1_prepared, (u64_to_i64_exact(obj_id), u64_to_i64_exact(checkpoint_id), &value_bytes)).await?;
+        Ok(())
+    }
+    pub async fn insert_many_single_checkpointed_object_rows<V: Serialize>(
+        &self, 
+        single_prepared: &ScyllaGenericObjectSingleIdTablePreparedStatements, 
+        rows: &[QDatabaseSingleIdTableRow<V>]
+    ) -> anyhow::Result<()> {
+        let mut batch_list: Vec<Batch> = Vec::new();
+        //tree_id, tree_sub_id, level, node_index, checkpoint_id, value
+        let mut value_list: Vec<Vec<(i64, i64, Vec<u8>)>> = Vec::new();
+        for chunk in rows.chunks(INSERT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE) {
+            let mut batch: Batch = Default::default();
+            for _node in chunk {
+                batch.append_statement(single_prepared.insert_1_statement.clone());
+            }
+            let values: Vec<_> = chunk
+                .iter()
+                .map(|n| {
+                    Ok((u64_to_i64_exact(n.obj_id), convert_checkpoint_id_to_i64(n.checkpoint_id), bincode::serialize(&n.value)?))
+                })
+                .collect::<anyhow::Result<_>>()?;
+            batch_list.push(batch);
+            value_list.push(values);
+        }
+        let batches: Vec<_> = batch_list.iter().zip(value_list.into_iter()).map(|(batch, values)| self.session.batch(batch, values)).collect();
+        let results = join_all(batches).await;
+        for res in results {
+            res.context("Batch insert failed")?;
+        }
+        Ok(())
+    }
+
+    pub async fn insert_many_single_checkpointed_object_rows_t<V: Serialize + DeserializeOwned, R: QDatabaseSingleIdTableRowLike<V>>(
+        &self, 
+        single_prepared: &ScyllaGenericObjectSingleIdTablePreparedStatements, 
+        rows: &[R]
+    ) -> anyhow::Result<()> {
+        let mut batch_list: Vec<Batch> = Vec::new();
+        //tree_id, tree_sub_id, level, node_index, checkpoint_id, value
+        let mut value_list: Vec<Vec<(i64, i64, Vec<u8>)>> = Vec::new();
+        for chunk in rows.chunks(INSERT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE) {
+            let mut batch: Batch = Default::default();
+            for _node in chunk {
+                batch.append_statement(single_prepared.insert_1_statement.clone());
+            }
+            let values: Vec<_> = chunk
+                .iter()
+                .map(|n| {
+                    Ok((u64_to_i64_exact(n.get_row_obj_id()), convert_checkpoint_id_to_i64(n.get_row_checkpoint_id()), bincode::serialize(&n.get_row_value_ref())?))
+                })
+                .collect::<anyhow::Result<_>>()?;
+            batch_list.push(batch);
+            value_list.push(values);
+        }
+        let batches: Vec<_> = batch_list.iter().zip(value_list.into_iter()).map(|(batch, values)| self.session.batch(batch, values)).collect();
+        let results = join_all(batches).await;
+        for res in results {
+            res.context("Batch insert failed")?;
+        }
+        Ok(())
+    }
+    pub async fn insert_many_single_checkpointed_objects_at_checkpoint<V: Serialize>(
+        &self, 
+        single_prepared: &ScyllaGenericObjectSingleIdTablePreparedStatements, 
+        checkpoint_id: u64,
+        rows: &[QDatabaseSingleIdTableRowNoCheckpointId<V>]
+    ) -> anyhow::Result<()> {
+        let mut batch_list: Vec<Batch> = Vec::new();
+        //tree_id, tree_sub_id, level, node_index, checkpoint_id, value
+        let mut value_list: Vec<Vec<(i64, i64, Vec<u8>)>> = Vec::new();
+        for chunk in rows.chunks(INSERT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE) {
+            let mut batch: Batch = Default::default();
+            for _node in chunk {
+                batch.append_statement(single_prepared.insert_1_statement.clone());
+            }
+            let values: Vec<_> = chunk
+                .iter()
+                .map(|n| {
+                    Ok((u64_to_i64_exact(n.obj_id), convert_checkpoint_id_to_i64(checkpoint_id), bincode::serialize(&n.value)?))
+                })
+                .collect::<anyhow::Result<_>>()?;
+            batch_list.push(batch);
+            value_list.push(values);
+        }
+        let batches: Vec<_> = batch_list.iter().zip(value_list.into_iter()).map(|(batch, values)| self.session.batch(batch, values)).collect();
+        let results = join_all(batches).await;
+        for res in results {
+            res.context("Batch insert failed")?;
+        }
+        Ok(())
+    }
+    pub async fn insert_many_single_checkpointed_objects_at_checkpoint_t<V: Serialize + DeserializeOwned, R: QDatabaseSingleIdTableRowNoCheckpointIdLike<V>>(
+        &self, 
+        single_prepared: &ScyllaGenericObjectSingleIdTablePreparedStatements, 
+        checkpoint_id: u64,
+        rows: &[R]
+    ) -> anyhow::Result<()> {
+        let mut batch_list: Vec<Batch> = Vec::new();
+        //tree_id, tree_sub_id, level, node_index, checkpoint_id, value
+        let mut value_list: Vec<Vec<(i64, i64, Vec<u8>)>> = Vec::new();
+        for chunk in rows.chunks(INSERT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE) {
+            let mut batch: Batch = Default::default();
+            for _node in chunk {
+                batch.append_statement(single_prepared.insert_1_statement.clone());
+            }
+            let values: Vec<_> = chunk
+                .iter()
+                .map(|n| {
+                    Ok((u64_to_i64_exact(n.get_row_obj_id()), convert_checkpoint_id_to_i64(checkpoint_id), bincode::serialize(&n.get_row_value_ref())?))
+                })
+                .collect::<anyhow::Result<_>>()?;
+            batch_list.push(batch);
+            value_list.push(values);
+        }
+        let batches: Vec<_> = batch_list.iter().zip(value_list.into_iter()).map(|(batch, values)| self.session.batch(batch, values)).collect();
+        let results = join_all(batches).await;
+        for res in results {
+            res.context("Batch insert failed")?;
+        }
+        Ok(())
+    }
+    pub async fn select_many_single_checkpointed_object_values<V: Serialize + DeserializeOwned>(
+        &self, 
+        single_prepared: &ScyllaGenericObjectSingleIdTablePreparedStatements, 
+        obj_ids: &[u64], 
+        max_checkpoint_id: u64
+    ) -> anyhow::Result<Vec<Option<V>>> {
+        let mut results = Vec::with_capacity(obj_ids.len());
+        let max_cp_i64 = convert_checkpoint_id_to_i64(max_checkpoint_id);
+        let obj_ids_i64 = obj_ids.iter().map(|id| u64_to_i64_exact(*id)).collect::<Vec<_>>();
+        for chunk in obj_ids_i64.chunks(SELECT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE) {
+            let futures: Vec<_> = chunk
+                .iter()
+                .map(|key| {
+                    let session = self.session.clone();
+                    let prep = single_prepared.select_value_1_prepared.clone();
+                    async move {
+                        let res = session.execute_unpaged(&prep, (*key, max_cp_i64)).await?;
+                        let rows = res.into_rows_result()?;
+                        if let Some(row) = rows.maybe_first_row::<(Vec<u8>,)>()? {
+                            match bincode::deserialize::<V>(&row.0) {
+                                Ok(value) => core::result::Result::<_, anyhow::Error>::Ok(Some(value)),
+                                Err(e) => {
+                                    tracing::error!("Deserialization error for object ID {} at checkpoint_id={} in {}.{}: {:?}", i64_to_u64_exact(*key), convert_i64_to_checkpoint_id(max_cp_i64), single_prepared.keyspace, single_prepared.table_name, e);
+                                    Ok(None)
+                                }
+                            }
+                        } else {
+                            // Assume reverse_level = level for simplicity; adjust if tree height known
+                            Ok(None)
+                        }
+                    }
+                })
+                .collect();
+            let chunk_results = join_all(futures).await;
+            for res in chunk_results {
+                results.push(res?);
+            }
+        }
+        Ok(results)
+    }
+    pub async fn select_many_single_checkpointed_object_keys_and_values<V: Serialize + DeserializeOwned, R: QDatabaseSingleIdTableRowCreatable<V>>(
+        &self, 
+        single_prepared: &ScyllaGenericObjectSingleIdTablePreparedStatements, 
+        obj_ids: &[u64], 
+        max_checkpoint_id: u64
+    ) -> anyhow::Result<Vec<R>> {
+        let mut results = Vec::with_capacity(obj_ids.len());
+        let max_cp_i64 = convert_checkpoint_id_to_i64(max_checkpoint_id);
+        let obj_ids_i64 = obj_ids.iter().map(|id| u64_to_i64_exact(*id)).collect::<Vec<_>>();
+        for chunk in obj_ids_i64.chunks(SELECT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE) {
+            let futures: Vec<_> = chunk
+                .iter()
+                .map(|key| {
+                    let session = self.session.clone();
+                    let prep = single_prepared.select_value_checkpoint_id_obj_id_1_prepared.clone();
+                    async move {
+                        let res = session.execute_unpaged(&prep, (*key, max_cp_i64)).await?;
+                        let rows = res.into_rows_result()?;
+                        if let Some(row) = rows.maybe_first_row::<(i64, i64, Vec<u8>)>()? {
+                            match bincode::deserialize::<V>(&row.2) {
+                                Ok(value) => core::result::Result::<_, anyhow::Error>::Ok(Some(R::create_from_single_row(i64_to_u64_exact(row.0), convert_i64_to_checkpoint_id(row.1), value))),
+                                Err(e) => {
+                                    tracing::error!("Deserialization error for object ID {} at checkpoint_id={} in {}.{}: {:?}", i64_to_u64_exact(*key), convert_i64_to_checkpoint_id(max_cp_i64), single_prepared.keyspace, single_prepared.table_name, e);
+                                    Ok(None)
+                                }
+                            }
+                        } else {
+                            // Assume reverse_level = level for simplicity; adjust if tree height known
+                            Ok(None)
+                        }
+                    }
+                })
+                .collect();
+            let chunk_results = join_all(futures).await;
+            for res in chunk_results {
+                let r = res?;
+                if let Some(r) = r {
+                    results.push(r);
+                }
+            }
+        }
+        Ok(results)
+    }
+
+
+}
+
+
+impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Hasher> {
+
+    pub async fn select_one_double_checkpointed_object_value<V: Serialize + DeserializeOwned>(
+        &self, 
+        double_prepared: &ScyllaGenericObjectDoubleIdTablePreparedStatements, 
+        obj_id: u64,
+        secondary_id: u64,
+        max_checkpoint_id: u64
+    ) -> anyhow::Result<Option<V>> {
+        let res = self.session.execute_unpaged(&double_prepared.select_value_1_prepared, (u64_to_i64_exact(obj_id), u64_to_i64_exact(secondary_id), convert_checkpoint_id_to_i64(max_checkpoint_id))).await?;
+        let rows = res.into_rows_result()?;
+        match rows.maybe_first_row::<(Vec<u8>,)>()? {
+            Some(row) => match bincode::deserialize::<V>(&row.0) {
+                Ok(value) => Ok(Some(value)),
+                Err(e) => {
+                    tracing::error!("Deserialization error for latest object ID with ({}, {}) in table {}.{}: {:?}", obj_id, secondary_id, double_prepared.keyspace, double_prepared.table_name, e);
+                    Ok(None)
+                }
+            },
+            None => Ok(None), // Return zero hash if not found
+        }
+    }
+    pub async fn select_one_double_checkpointed_object_value_and_ids<V: Serialize + DeserializeOwned>(
+        &self, 
+        double_prepared: &ScyllaGenericObjectDoubleIdTablePreparedStatements, 
+        obj_id: u64, 
+        secondary_id: u64,
+        max_checkpoint_id: u64
+    ) -> anyhow::Result<Option<QDatabaseDoubleIdTableRow<V>>> {
+        let res = self.session.execute_unpaged(&double_prepared.select_value_1_prepared, (u64_to_i64_exact(obj_id), u64_to_i64_exact(secondary_id), convert_checkpoint_id_to_i64(max_checkpoint_id))).await?;
+        let rows = res.into_rows_result()?;
+        match rows.maybe_first_row::<(i64, i64, i64, Vec<u8>)>()? {
+            Some(row) => match bincode::deserialize::<V>(&row.3) {
+                Ok(value) => Ok(Some(QDatabaseDoubleIdTableRow {
+                    value,
+                    obj_id: i64_to_u64_exact(row.0),
+                    secondary_id: i64_to_u64_exact(row.1),
+                    checkpoint_id: convert_i64_to_checkpoint_id(row.2),
+                })),
+                Err(e) => {
+                    tracing::error!("Deserialization error for object ID ({}, {}) at checkpoint_id={} in {}.{}: {:?}", obj_id, secondary_id, convert_i64_to_checkpoint_id(row.2), double_prepared.keyspace, double_prepared.table_name, e);
+                    Ok(None)
+                }
+            },
+            None => Ok(None), // Return zero hash if not found
+        }
+    }
+    pub async fn select_all_double_checkpointed_object<V: Serialize + DeserializeOwned>(
+        &self, 
+        double_prepared: &ScyllaGenericObjectDoubleIdTablePreparedStatements, 
+    ) -> anyhow::Result<Vec<QDatabaseDoubleIdTableRow<V>>> {
+        let res = self.session.execute_unpaged(&double_prepared.select_all_prepared, ()).await?;
+        let rows_result = res.into_rows_result()?;
+        let rows_iter = rows_result.rows::<(i64,i64,i64,Vec<u8>)>()?;
+        let rows_vec: Vec<_> = rows_iter.collect();
+        let mut results = Vec::with_capacity(rows_vec.len());
+
+        for row in rows_vec {
+            let (obj_id, secondary_id, checkpoint_id, value): (i64, i64, i64, Vec<u8>) = row?;
+            results.push(QDatabaseDoubleIdTableRow {
+                obj_id: i64_to_u64_exact(obj_id),
+                secondary_id: i64_to_u64_exact(secondary_id),
+                checkpoint_id: convert_i64_to_checkpoint_id(checkpoint_id),
+                value: match bincode::deserialize(&value){
+                    Ok(value) => value,
+                    Err(e) => {
+                        tracing::error!("Deserialization error for object ID ({}, {}) at checkpoint_id={} in {}.{}: {:?}", obj_id, secondary_id, convert_i64_to_checkpoint_id(checkpoint_id), double_prepared.keyspace, double_prepared.table_name, e);
+                        anyhow::bail!("Deserialization error for object ID ({}, {}) at checkpoint_id={} in {}.{}: {:?}", obj_id, secondary_id, convert_i64_to_checkpoint_id(checkpoint_id), double_prepared.keyspace, double_prepared.table_name, e);
+                    }
+                },
+            });
+        }
+        Ok(results)
+    }
+
+
+    pub async fn insert_one_double_checkpointed_object<V: Serialize>(
+        &self, 
+        double_prepared: &ScyllaGenericObjectDoubleIdTablePreparedStatements, 
+        obj_id: u64, 
+        secondary_id: u64,
+        checkpoint_id: u64, 
+        value: &V
+    ) -> anyhow::Result<()> {
+        let value_bytes = bincode::serialize(value)?;
+        self.session.execute_unpaged(&double_prepared.insert_1_prepared, (u64_to_i64_exact(obj_id), u64_to_i64_exact(secondary_id), u64_to_i64_exact(checkpoint_id), &value_bytes)).await?;
+        Ok(())
+    }
+    pub async fn insert_many_double_checkpointed_object_rows<V: Serialize>(
+        &self, 
+        double_prepared: &ScyllaGenericObjectDoubleIdTablePreparedStatements, 
+        rows: &[QDatabaseDoubleIdTableRow<V>]
+    ) -> anyhow::Result<()> {
+        let mut batch_list: Vec<Batch> = Vec::new();
+        let mut value_list: Vec<Vec<(i64, i64, i64, Vec<u8>)>> = Vec::new();
+        for chunk in rows.chunks(INSERT_DOUBLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE) {
+            let mut batch: Batch = Default::default();
+            for _node in chunk {
+                batch.append_statement(double_prepared.insert_1_statement.clone());
+            }
+            let values: Vec<_> = chunk
+                .iter()
+                .map(|n| {
+                    Ok((u64_to_i64_exact(n.obj_id), u64_to_i64_exact(n.secondary_id), convert_checkpoint_id_to_i64(n.checkpoint_id), bincode::serialize(&n.value)?))
+                })
+                .collect::<anyhow::Result<_>>()?;
+            batch_list.push(batch);
+            value_list.push(values);
+        }
+        let batches: Vec<_> = batch_list.iter().zip(value_list.into_iter()).map(|(batch, values)| self.session.batch(batch, values)).collect();
+        let results = join_all(batches).await;
+        for res in results {
+            res.context("Batch insert failed")?;
+        }
+        Ok(())
+    }
+
+    pub async fn insert_many_double_checkpointed_object_rows_t<V: Serialize + DeserializeOwned, R: QDatabaseDoubleIdTableRowLike<V>>(
+        &self, 
+        double_prepared: &ScyllaGenericObjectDoubleIdTablePreparedStatements, 
+        rows: &[R]
+    ) -> anyhow::Result<()> {
+        let mut batch_list: Vec<Batch> = Vec::new();
+        let mut value_list: Vec<Vec<(i64, i64, i64, Vec<u8>)>> = Vec::new();
+        for chunk in rows.chunks(INSERT_DOUBLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE) {
+            let mut batch: Batch = Default::default();
+            for _node in chunk {
+                batch.append_statement(double_prepared.insert_1_statement.clone());
+            }
+            let values: Vec<_> = chunk
+                .iter()
+                .map(|n| {
+                    Ok((u64_to_i64_exact(n.get_row_obj_id()), u64_to_i64_exact(n.get_row_secondary_id()), convert_checkpoint_id_to_i64(n.get_row_checkpoint_id()), bincode::serialize(&n.get_row_value_ref())?))
+                })
+                .collect::<anyhow::Result<_>>()?;
+            batch_list.push(batch);
+            value_list.push(values);
+        }
+        let batches: Vec<_> = batch_list.iter().zip(value_list.into_iter()).map(|(batch, values)| self.session.batch(batch, values)).collect();
+        let results = join_all(batches).await;
+        for res in results {
+            res.context("Batch insert failed")?;
+        }
+        Ok(())
+    }
+    pub async fn insert_many_double_checkpointed_objects_at_checkpoint<V: Serialize>(
+        &self, 
+        double_prepared: &ScyllaGenericObjectDoubleIdTablePreparedStatements, 
+        checkpoint_id: u64,
+        rows: &[QDatabaseDoubleIdTableRowNoCheckpointId<V>]
+    ) -> anyhow::Result<()> {
+        let mut batch_list: Vec<Batch> = Vec::new();
+        let mut value_list: Vec<Vec<(i64, i64, i64, Vec<u8>)>> = Vec::new();
+        for chunk in rows.chunks(INSERT_DOUBLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE) {
+            let mut batch: Batch = Default::default();
+            for _node in chunk {
+                batch.append_statement(double_prepared.insert_1_statement.clone());
+            }
+            let values: Vec<_> = chunk
+                .iter()
+                .map(|n| {
+                    Ok((u64_to_i64_exact(n.obj_id), u64_to_i64_exact(n.secondary_id), convert_checkpoint_id_to_i64(checkpoint_id), bincode::serialize(&n.value)?))
+                })
+                .collect::<anyhow::Result<_>>()?;
+            batch_list.push(batch);
+            value_list.push(values);
+        }
+        let batches: Vec<_> = batch_list.iter().zip(value_list.into_iter()).map(|(batch, values)| self.session.batch(batch, values)).collect();
+        let results = join_all(batches).await;
+        for res in results {
+            res.context("Batch insert failed")?;
+        }
+        Ok(())
+    }
+    pub async fn insert_many_double_checkpointed_objects_at_checkpoint_t<V: Serialize + DeserializeOwned, R: QDatabaseDoubleIdTableRowNoCheckpointIdLike<V>>(
+        &self, 
+        double_prepared: &ScyllaGenericObjectDoubleIdTablePreparedStatements, 
+        checkpoint_id: u64,
+        rows: &[R]
+    ) -> anyhow::Result<()> {
+        let mut batch_list: Vec<Batch> = Vec::new();
+        let mut value_list: Vec<Vec<(i64, i64, i64, Vec<u8>)>> = Vec::new();
+        for chunk in rows.chunks(INSERT_DOUBLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE) {
+            let mut batch: Batch = Default::default();
+            for _node in chunk {
+                batch.append_statement(double_prepared.insert_1_statement.clone());
+            }
+            let values: Vec<_> = chunk
+                .iter()
+                .map(|n| {
+                    Ok((u64_to_i64_exact(n.get_row_obj_id()), u64_to_i64_exact(n.get_row_secondary_id()), convert_checkpoint_id_to_i64(checkpoint_id), bincode::serialize(&n.get_row_value_ref())?))
+                })
+                .collect::<anyhow::Result<_>>()?;
+            batch_list.push(batch);
+            value_list.push(values);
+        }
+        let batches: Vec<_> = batch_list.iter().zip(value_list.into_iter()).map(|(batch, values)| self.session.batch(batch, values)).collect();
+        let results = join_all(batches).await;
+        for res in results {
+            res.context("Batch insert failed")?;
+        }
+        Ok(())
+    }
+    pub async fn select_many_double_checkpointed_object_values<V: Serialize + DeserializeOwned>(
+        &self, 
+        double_prepared: &ScyllaGenericObjectDoubleIdTablePreparedStatements, 
+        obj_ids: &[QDoubleIdKey],
+        max_checkpoint_id: u64
+    ) -> anyhow::Result<Vec<Option<V>>> {
+        let mut results = Vec::with_capacity(obj_ids.len());
+        let max_cp_i64 = convert_checkpoint_id_to_i64(max_checkpoint_id);
+        for chunk in obj_ids.chunks(SELECT_DOUBLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE) {
+            let futures: Vec<_> = chunk
+                .iter()
+                .map(|key| {
+                    let session = self.session.clone();
+                    let prep = double_prepared.select_value_1_prepared.clone();
+                    async move {
+                        let res = session.execute_unpaged(&prep, (u64_to_i64_exact(key.obj_id), u64_to_i64_exact(key.secondary_id), max_cp_i64)).await?;
+                        let rows = res.into_rows_result()?;
+                        if let Some(row) = rows.maybe_first_row::<(Vec<u8>,)>()? {
+                            match bincode::deserialize::<V>(&row.0) {
+                                Ok(value) => core::result::Result::<_, anyhow::Error>::Ok(Some(value)),
+                                Err(e) => {
+                                    tracing::error!("Deserialization error for object ID ({},{}) at checkpoint_id={} in {}.{}: {:?}", key.obj_id, key.secondary_id, convert_i64_to_checkpoint_id(max_cp_i64), double_prepared.keyspace, double_prepared.table_name, e);
+                                    Ok(None)
+                                }
+                            }
+                        } else {
+                            // Assume reverse_level = level for simplicity; adjust if tree height known
+                            Ok(None)
+                        }
+                    }
+                })
+                .collect();
+            let chunk_results = join_all(futures).await;
+            for res in chunk_results {
+                results.push(res?);
+            }
+        }
+        Ok(results)
+    }
+    pub async fn select_many_double_checkpointed_object_keys_and_values<V: Serialize + DeserializeOwned, R: QDatabaseDoubleIdTableRowCreatable<V>>(
+        &self, 
+        double_prepared: &ScyllaGenericObjectDoubleIdTablePreparedStatements, 
+        obj_ids: &[QDoubleIdKey], 
+        max_checkpoint_id: u64
+    ) -> anyhow::Result<Vec<R>> {
+        let mut results = Vec::with_capacity(obj_ids.len());
+        let max_cp_i64 = convert_checkpoint_id_to_i64(max_checkpoint_id);
+        for chunk in obj_ids.chunks(SELECT_DOUBLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE) {
+            let futures: Vec<_> = chunk
+                .iter()
+                .map(|key| {
+                    let session = self.session.clone();
+                    let prep = double_prepared.select_value_checkpoint_id_obj_ids_1_prepared.clone();
+                    async move {
+                        let res = session.execute_unpaged(&prep, (u64_to_i64_exact(key.obj_id), u64_to_i64_exact(key.secondary_id), max_cp_i64)).await?;
+                        let rows = res.into_rows_result()?;
+                        if let Some(row) = rows.maybe_first_row::<(i64, i64, i64, Vec<u8>)>()? {
+                            match bincode::deserialize::<V>(&row.3) {
+                                Ok(value) => core::result::Result::<_, anyhow::Error>::Ok(Some(R::create_from_double_row(i64_to_u64_exact(row.0), i64_to_u64_exact(row.1), convert_i64_to_checkpoint_id(row.2), value))),
+                                Err(e) => {
+                                    tracing::error!("Deserialization error for object ID ({},{}) at checkpoint_id={} in {}.{}: {:?}", key.obj_id, key.secondary_id, convert_i64_to_checkpoint_id(max_cp_i64), double_prepared.keyspace, double_prepared.table_name, e);
+                                    Ok(None)
+                                }
+                            }
+                        } else {
+                            // Assume reverse_level = level for simplicity; adjust if tree height known
+                            Ok(None)
+                        }
+                    }
+                })
+                .collect();
+            let chunk_results = join_all(futures).await;
+            for res in chunk_results {
+                let r = res?;
+                if let Some(r) = r {
+                    results.push(r);
+                }
+            }
+        }
+        Ok(results)
+    }
+
+
+}
