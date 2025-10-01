@@ -1,13 +1,25 @@
 
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_with::serde_as;
+
+use crate::data::db::row::QDatabaseKeyIdValueTableRowCreatable;
+use crate::data::db::row::QDatabaseSingleIdTableRowCreatable;
+use crate::data::db::row::QDatabaseSingleIdTableRowLike;
+use crate::data::db::row::QDatabaseSingleIdTableRowNoCheckpointIdLike;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QPDPairWithCheckpointId<K: Serialize + Clone, V: Serialize + Clone> {
     pub pair: QPDPair<K, V>,
     pub checkpoint_id: u64,
 }
+
+impl<V: Serialize + Clone> QDatabaseSingleIdTableRowCreatable<V> for QPDPairWithCheckpointId<u64,V> {
+    fn create_from_single_row(obj_id: u64, checkpoint_id: u64, value: V) -> Self {
+        Self { pair: QPDPair { key: obj_id, value }, checkpoint_id }
+    }
+} 
 
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Eq, PartialOrd, Ord)]
@@ -25,6 +37,24 @@ pub struct BinaryKVWithCheckpointId {
 pub struct QPDPair<K, V> {
     pub key: K,
     pub value: V,
+}
+impl<V: Serialize + DeserializeOwned> QDatabaseSingleIdTableRowNoCheckpointIdLike<V> for QPDPair<u64, V> {
+    fn get_row_obj_id(&self) -> u64 {
+        self.key
+    }
+    fn get_row_value_ref(&self) -> &V {
+        &self.value
+    }
+}
+impl<V: Serialize + DeserializeOwned> QDatabaseSingleIdTableRowLike<V> for QPDPair<u64, V> {
+    fn get_row_checkpoint_id(&self) -> u64 {
+        self.key
+    }
+}
+impl<V> QDatabaseKeyIdValueTableRowCreatable<V> for QPDPair<u64, V> {
+    fn create_from_key_id_value_row(obj_id: u64, value: V) -> Self {
+        Self { key: obj_id, value }
+    }
 }
 
 impl<K: Copy, V: Copy> Copy for QPDPair<K,V>{}

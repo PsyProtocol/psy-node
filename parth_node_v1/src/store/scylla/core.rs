@@ -4,7 +4,7 @@ use anyhow::Context;
 use futures::future::join_all;
 use parth_core::{crypto::hash::traits::MerkleZeroHasher, data::{db::row::{QDatabaseDoubleIdTableRow, QDatabaseDoubleIdTableRowCreatable, QDatabaseDoubleIdTableRowLike, QDatabaseDoubleIdTableRowNoCheckpointId, QDatabaseDoubleIdTableRowNoCheckpointIdLike, QDatabaseSingleIdTableRow, QDatabaseSingleIdTableRowCreatable, QDatabaseSingleIdTableRowLike, QDatabaseSingleIdTableRowNoCheckpointId, QDatabaseSingleIdTableRowNoCheckpointIdLike, QDoubleIdKey}, hash::merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}, serializable::{BinaryKVWithCheckpointId, QPDPair, QPDSerializable}}, protocol::core_types::QHashBase};
 use scylla::{client::session::{Session, SessionConfig}, statement::batch::Batch};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Serialize};
 
 use crate::store::scylla::{constants::{INSERT_DOUBLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE, INSERT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE, MAX_PREPARED_INSERT_BATCH_SIZE, SELECT_DOUBLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE, SELECT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE}, tables::{merkle::{ScyllaBlobPreparedStatements, ScyllaDoubleMerkleNodesPreparedStatements, ScyllaMerkleNodesPreparedStatements}, object::{ScyllaGenericKeyIdValueTablePreparedStatements, ScyllaGenericObjectDoubleIdTablePreparedStatements, ScyllaGenericObjectSingleIdTablePreparedStatements}}, utils::{convert_checkpoint_id_to_i64, convert_i64_to_checkpoint_id, i64_to_u64_exact, u64_to_i64_exact, u8_to_i8_exact}};
 
@@ -49,7 +49,9 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
         ScyllaBlobPreparedStatements::create_table(session.clone(), &keyspace).await?;
         // Prepare statements
         let prep_blob = ScyllaBlobPreparedStatements::new_from_session(session.clone()).await?;
+
         let prep_merkle = ScyllaMerkleNodesPreparedStatements::new_from_session(session.clone()).await?;
+        
         let prep_double_merkle = ScyllaDoubleMerkleNodesPreparedStatements::new_from_session(session.clone()).await?;
         
         Ok(Self {
@@ -545,11 +547,13 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
         obj_id: u64, 
         max_checkpoint_id: u64
     ) -> anyhow::Result<Option<QDatabaseSingleIdTableRow<V>>> {
-        let res = self.session.execute_unpaged(&single_prepared.select_value_1_prepared, (u64_to_i64_exact(obj_id), convert_checkpoint_id_to_i64(max_checkpoint_id))).await?;
+        let res = self.session.execute_unpaged(&single_prepared.select_value_checkpoint_id_obj_id_1_prepared, (u64_to_i64_exact(obj_id), convert_checkpoint_id_to_i64(max_checkpoint_id))).await?;
         let rows = res.into_rows_result()?;
         match rows.maybe_first_row::<(i64, i64, Vec<u8>)>()? {
+
             Some(row) => match bincode::deserialize::<V>(&row.2) {
-                Ok(value) => Ok(Some(QDatabaseSingleIdTableRow {
+                Ok(value) => 
+                    Ok(Some(QDatabaseSingleIdTableRow {
                     value,
                     obj_id: i64_to_u64_exact(row.0),
                     checkpoint_id: convert_i64_to_checkpoint_id(row.1),
@@ -562,6 +566,28 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
             None => Ok(None), // Return zero hash if not found
         }
     }
+    pub async fn select_one_single_checkpointed_object_value_and_ids_t<V: Serialize + DeserializeOwned, R: QDatabaseSingleIdTableRowCreatable<V>>(
+        &self, 
+        single_prepared: &ScyllaGenericObjectSingleIdTablePreparedStatements, 
+        obj_id: u64, 
+        max_checkpoint_id: u64
+    ) -> anyhow::Result<Option<R>> {
+        let res = self.session.execute_unpaged(&single_prepared.select_value_checkpoint_id_obj_id_1_prepared, (u64_to_i64_exact(obj_id), convert_checkpoint_id_to_i64(max_checkpoint_id))).await?;
+        let rows = res.into_rows_result()?;
+        match rows.maybe_first_row::<(i64, i64, Vec<u8>)>()? {
+            Some(row) => match bincode::deserialize::<V>(&row.2) {
+                Ok(value) => Ok(Some(R::create_from_single_row(i64_to_u64_exact(row.0), convert_i64_to_checkpoint_id(row.1), value))),
+                Err(e) => {
+                    tracing::error!("Deserialization error for object ID {} at checkpoint_id={} in {}.{}: {:?}", obj_id, convert_i64_to_checkpoint_id(row.1), single_prepared.keyspace, single_prepared.table_name, e);
+                    Ok(None)
+                }
+            },
+            None => Ok(None), // Return zero hash if not found
+        }
+    }
+
+
+    
     pub async fn select_all_single_checkpointed_object<V: Serialize + DeserializeOwned>(
         &self, 
         single_prepared: &ScyllaGenericObjectSingleIdTablePreparedStatements, 
@@ -837,7 +863,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
         secondary_id: u64,
         max_checkpoint_id: u64
     ) -> anyhow::Result<Option<QDatabaseDoubleIdTableRow<V>>> {
-        let res = self.session.execute_unpaged(&double_prepared.select_value_1_prepared, (u64_to_i64_exact(obj_id), u64_to_i64_exact(secondary_id), convert_checkpoint_id_to_i64(max_checkpoint_id))).await?;
+        let res = self.session.execute_unpaged(&double_prepared.select_value_checkpoint_id_obj_ids_1_prepared, (u64_to_i64_exact(obj_id), u64_to_i64_exact(secondary_id), convert_checkpoint_id_to_i64(max_checkpoint_id))).await?;
         let rows = res.into_rows_result()?;
         match rows.maybe_first_row::<(i64, i64, i64, Vec<u8>)>()? {
             Some(row) => match bincode::deserialize::<V>(&row.3) {
