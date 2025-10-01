@@ -89,6 +89,20 @@ impl ScyllaBlobPreparedStatements {
             select_all: Arc::new(select_all),
         })
     }
+    pub async fn create_table(session: Arc<Session>, keyspace: &str) -> anyhow::Result<()> {
+        session
+            .query_unpaged(
+                format!("CREATE TABLE IF NOT EXISTS {}.checkpointed_kvs (
+                node_key blob,
+                checkpoint_id bigint,
+                node_value blob,
+                PRIMARY KEY ((node_key), checkpoint_id)
+            ) WITH CLUSTERING ORDER BY (checkpoint_id DESC)", keyspace),
+                &[],
+            ).await?;
+        session.await_schema_agreement().await?;
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -114,6 +128,22 @@ impl ScyllaMerkleNodesPreparedStatements {
             select_1_statement: select_1_statement,
         })
     }
+    pub async fn create_table(session: Arc<Session>, keyspace: &str) -> anyhow::Result<()> {
+        session
+            .query_unpaged(
+                format!("CREATE TABLE IF NOT EXISTS {}.merkle_nodes (
+                    tree_id BIGINT,
+                    level TINYINT,
+                    node_index BIGINT,
+                    checkpoint_id BIGINT,
+                    value BLOB,
+                    PRIMARY KEY ((tree_id), level, node_index, checkpoint_id)
+                ) WITH CLUSTERING ORDER BY (level ASC, node_index ASC, checkpoint_id DESC)", keyspace),
+                &[],
+            ).await?;
+        session.await_schema_agreement().await?;
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -138,6 +168,20 @@ impl ScyllaDoubleMerkleNodesPreparedStatements {
             insert_1_statement,
         })
     }
+    pub async fn create_table(session: Arc<Session>, keyspace: &str) -> anyhow::Result<()> {
+        session
+            .query_unpaged(
+                format!("CREATE TABLE IF NOT EXISTS {}.checkpointed_kvs (
+                node_key blob,
+                checkpoint_id bigint,
+                node_value blob,
+                PRIMARY KEY ((node_key), checkpoint_id)
+            ) WITH CLUSTERING ORDER BY (checkpoint_id DESC)", &keyspace),
+                &[],
+            ).await?;
+        session.await_schema_agreement().await?;
+        Ok(())
+    }
 }
 
 impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Hasher> {
@@ -156,44 +200,9 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
             .await?;
         session.await_schema_agreement().await?;
         session.use_keyspace(&keyspace, false).await?;
-        session
-            .query_unpaged(
-                format!("CREATE TABLE IF NOT EXISTS {}.merkle_nodes (
-                    tree_id BIGINT,
-                    level TINYINT,
-                    node_index BIGINT,
-                    checkpoint_id BIGINT,
-                    value BLOB,
-                    PRIMARY KEY ((tree_id), level, node_index, checkpoint_id)
-                ) WITH CLUSTERING ORDER BY (level ASC, node_index ASC, checkpoint_id DESC)", &keyspace),
-                &[],
-            ).await?;
-        session.await_schema_agreement().await?;
-        session
-            .query_unpaged(
-                format!("CREATE TABLE IF NOT EXISTS {}.double_merkle_nodes (
-                    tree_id BIGINT,
-                    tree_sub_id BIGINT,
-                    level TINYINT,
-                    node_index BIGINT,
-                    checkpoint_id BIGINT,
-                    value BLOB,
-                    PRIMARY KEY ((tree_id, tree_sub_id), level, node_index, checkpoint_id)
-                ) WITH CLUSTERING ORDER BY (level ASC, node_index ASC, checkpoint_id DESC)", &keyspace),
-                &[],
-            ).await?;
-        session.await_schema_agreement().await?;
-        session
-            .query_unpaged(
-                format!("CREATE TABLE IF NOT EXISTS {}.checkpointed_kvs (
-                node_key blob,
-                checkpoint_id bigint,
-                node_value blob,
-                PRIMARY KEY ((node_key), checkpoint_id)
-            ) WITH CLUSTERING ORDER BY (checkpoint_id DESC)", &keyspace),
-                &[],
-            ).await?;
-        session.await_schema_agreement().await?;
+        ScyllaMerkleNodesPreparedStatements::create_table(session.clone(), &keyspace).await?;
+        ScyllaDoubleMerkleNodesPreparedStatements::create_table(session.clone(), &keyspace).await?;
+        ScyllaBlobPreparedStatements::create_table(session.clone(), &keyspace).await?;
         // Prepare statements
         let prep_blob = ScyllaBlobPreparedStatements::new_from_session(session.clone()).await?;
         let prep_merkle = ScyllaMerkleNodesPreparedStatements::new_from_session(session.clone()).await?;
@@ -309,7 +318,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
         tree_sub_id: u64,
         nodes: Vec<SimpleMerkleNode<Hash>>,
     ) -> anyhow::Result<()> {
-        const BATCH_SIZE: usize = 500; // Safe batch size to avoid payload limits
+        const BATCH_SIZE: usize = 256; // Safe batch size to avoid payload limits
         let mut batch_list: Vec<Batch> = Vec::new();
         //tree_id, tree_sub_id, level, node_index, checkpoint_id, value
         let mut value_list: Vec<Vec<(i64, i64, i8, i64, i64, Vec<u8>)>> = Vec::new();
@@ -356,14 +365,14 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
         tree_height: u8,
         keys: &[SimpleMerkleNodeKey],
     ) -> anyhow::Result<Vec<Hash>> {
-        const CONCURRENT_LIMIT: usize = 1000; // Batch concurrent queries
+        const CONCURRENT_LIMIT: usize = 512; // Batch concurrent queries
         let mut results = Vec::with_capacity(keys.len());
         for chunk in keys.chunks(CONCURRENT_LIMIT) {
             let futures: Vec<_> = chunk
                 .iter()
                 .map(|key| {
                     let session = self.session.clone();
-                    let prep = self.prep_merkle.select_1.clone();
+                    let prep = self.prep_double_merkle.select_1.clone();
                     let tree_id_i64 = u64_to_i64_exact(tree_id);
                     let tree_sub_id_i64 = u64_to_i64_exact(tree_sub_id);
                     let level_i8 = u8_to_i8_exact(key.level);
@@ -523,18 +532,18 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
             None => Ok(None),
         }
     }
-    pub async fn select_one_checkpoint_kv_blob_with_checkpoint(&self, checkpoint_id: u64, node_key: &[u8]) -> anyhow::Result<Option<(Vec<u8>, u64)>> {
+    pub async fn select_one_checkpoint_kv_blob_with_checkpoint(&self, max_checkpoint_id: u64, node_key: &[u8]) -> anyhow::Result<Option<(Vec<u8>, u64)>> {
         let stmt = &self.prep_blob.select_1_with_checkpoint;
-        let res = self.session.execute_unpaged(stmt, (node_key, checkpoint_id as i64)).await?;
+        let res = self.session.execute_unpaged(stmt, (node_key, max_checkpoint_id as i64)).await?;
         let rows = res.into_rows_result()?;
         match rows.maybe_first_row::<(Vec<u8>, i64)>()? {
             Some(row) => Ok(Some((row.0, row.1 as u64))),
             None => Ok(None),
         }
     }
-    pub async fn select_one_checkpoint_kv_obj_with_checkpoint<K: QPDSerializable, V: QPDSerializable>(&self, checkpoint_id: u64, node_key: &K) -> anyhow::Result<Option<(V, u64)>> {
+    pub async fn select_one_checkpoint_kv_obj_with_checkpoint<K: QPDSerializable, V: QPDSerializable>(&self, max_checkpoint_id: u64, node_key: &K) -> anyhow::Result<Option<(V, u64)>> {
         let key_bytes = node_key.to_bytes()?;
-        let value_bytes_opt = self.select_one_checkpoint_kv_blob_with_checkpoint(checkpoint_id, &key_bytes).await?;
+        let value_bytes_opt = self.select_one_checkpoint_kv_blob_with_checkpoint(max_checkpoint_id, &key_bytes).await?;
         match value_bytes_opt {
             Some((value_bytes, chkpt_id)) => {
                 let value = V::from_bytes(&value_bytes)?;
@@ -542,6 +551,89 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
             },
             None => Ok(None),
         }
+    }
+    pub async fn select_15_checkpoint_kv_obj_with_checkpoint<K: QPDSerializable, V: QPDSerializable>(&self, max_checkpoint_id: u64, keys: [K; 15] ) -> anyhow::Result<Vec<Option<V>>> {
+
+
+        let key_ids: [_; 15] = core::array::from_fn(|x| keys[x].to_bytes().unwrap());
+
+
+        
+
+
+
+        let result = self.session.execute_unpaged(&self.prep_blob.select_15, (
+            &key_ids[0],
+            &key_ids[1],
+            &key_ids[2],
+            &key_ids[3],
+            &key_ids[4],
+            &key_ids[5],
+            &key_ids[6],
+            &key_ids[7],
+            &key_ids[8],
+            &key_ids[9],
+            &key_ids[10],
+            &key_ids[11],
+            &key_ids[12],
+            &key_ids[13],
+            &key_ids[14],
+            if max_checkpoint_id > i64::MAX as u64 { i64::MAX } else { max_checkpoint_id as i64 }
+        )).await?;
+        let res = result.into_rows_result()?;
+
+        let mut final_result = Vec::with_capacity(15);
+
+        for row in res.rows::<(Vec<u8>, Vec<u8>)>()? {
+            match row {
+                Ok(a) => {
+                    let (node_uuid, value) = a;
+                    //let regen = get_partial_node_key(&node_uuid)?;
+
+                    for (i, v) in key_ids.iter().enumerate(){
+                        if v.eq(&node_uuid) {
+                            final_result[i] = Some(V::from_bytes(&value)?);
+
+                        }
+                    }
+                },
+                Err(e) => println!("derser: {:?}",e),
+            }
+
+        }
+
+        Ok(final_result)
+    }
+    pub async fn select_many_checkpoint_kv_obj_with_checkpoint<K: QPDSerializable + Copy, V: QPDSerializable>(&self, max_checkpoint_id: u64, keys: &[K]) -> anyhow::Result<Vec<Option<V>>> {
+        let mut results: Vec<Option<V>> = Vec::with_capacity(keys.len());
+
+        let full_batches = keys.len()/15;
+        //let remainder = keys.len()%15;
+
+        for batch_id in 0..full_batches {
+
+            let batch : [K; 15] = core::array::from_fn(|x| keys[(batch_id*15)+x]);
+            results.extend_from_slice(&self.select_15_checkpoint_kv_obj_with_checkpoint(max_checkpoint_id, batch).await?);
+
+        }
+        for key in keys[full_batches*15..].iter() {
+            let v = self.select_one_checkpoint_kv_obj::<K,V>(max_checkpoint_id, key).await?;
+            results.push(v)
+        }
+        Ok(results)
+        
+        /*
+        if KVQMerkleNodeKey::node_list_in_same_tree(keys) && false {
+            // todo implement that
+            todo!("implement this opt");
+        }else{
+            let mut results = Vec::with_capacity(keys.len());
+            for key in keys.iter() {
+                let v = self.get_node_value_at_checkpoint(key).await?;
+                results.push(v)
+            }
+            Ok(results)
+        }*/
     }
 
     pub async fn select_all_checkpoint_kv_blobs(&self) -> anyhow::Result<Vec<BinaryKVWithCheckpointId>> {
