@@ -1227,34 +1227,6 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
         self.session.execute_unpaged(&single_prepared.insert_1_prepared, (u64_to_i64_exact(obj_id), &value_bytes)).await?;
         Ok(())
     }
-    pub async fn insert_many_kiv_rows<V: Serialize>(
-        &self, 
-        single_prepared: &ScyllaGenericKeyIdValueTablePreparedStatements, 
-        rows: &[QDatabaseKeyIdValueTableRow<V>]
-    ) -> anyhow::Result<()> {
-        let mut batch_list: Vec<Batch> = Vec::new();
-        let mut value_list: Vec<Vec<(i64, Vec<u8>)>> = Vec::new();
-        for chunk in rows.chunks(INSERT_KEY_ID_VALUE_CHECKPOINTED_OBJECT_BATCH_SIZE) {
-            let mut batch: Batch = Default::default();
-            for _node in chunk {
-                batch.append_statement(single_prepared.insert_1_statement.clone());
-            }
-            let values: Vec<_> = chunk
-                .iter()
-                .map(|n| {
-                    Ok((u64_to_i64_exact(n.obj_id), bincode::serialize(&n.value)?))
-                })
-                .collect::<anyhow::Result<_>>()?;
-            batch_list.push(batch);
-            value_list.push(values);
-        }
-        let batches: Vec<_> = batch_list.iter().zip(value_list.into_iter()).map(|(batch, values)| self.session.batch(batch, values)).collect();
-        let results = join_all(batches).await;
-        for res in results {
-            res.context("Batch insert failed")?;
-        }
-        Ok(())
-    }
 
     pub async fn insert_many_kiv_rows_t<V: Serialize + DeserializeOwned, R: QDatabaseKeyIdValueTableRowLike<V>>(
         &self, 
