@@ -43,6 +43,15 @@ rsmq = { workspace = true }
 [dev-dependencies]
 criterion = { workspace = true }
 
+
+[[bench]]
+name = "obj_operations"
+harness = false
+
 [[bench]]
 name = "large_ops"
+harness = false
+
+[[bench]]
+name = "object_ops"
 harness = false

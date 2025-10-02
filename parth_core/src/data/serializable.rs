@@ -8,6 +8,7 @@ use crate::data::db::row::QDatabaseDoubleIdTableRowCreatable;
 use crate::data::db::row::QDatabaseDoubleIdTableRowLike;
 use crate::data::db::row::QDatabaseDoubleIdTableRowNoCheckpointIdLike;
 use crate::data::db::row::QDatabaseKeyIdValueTableRowCreatable;
+use crate::data::db::row::QDatabaseKeyIdValueTableRowLike;
 use crate::data::db::row::QDatabaseSingleIdTableRowCreatable;
 use crate::data::db::row::QDatabaseSingleIdTableRowLike;
 use crate::data::db::row::QDatabaseSingleIdTableRowNoCheckpointIdLike;
@@ -67,6 +68,14 @@ impl<V: Serialize + DeserializeOwned> QDatabaseDoubleIdTableRowNoCheckpointIdLik
 impl<V> QDatabaseKeyIdValueTableRowCreatable<V> for QPDPair<u64, V> {
     fn create_from_key_id_value_row(obj_id: u64, value: V) -> Self {
         Self { key: obj_id, value }
+    }
+}
+impl<V: Serialize + Clone + DeserializeOwned> QDatabaseKeyIdValueTableRowLike<V> for QPDPair<u64, V> {
+    fn get_row_obj_id(&self) -> u64 {
+        self.key
+    }
+    fn get_row_value_ref(&self) -> &V {
+        &self.value
     }
 }
 impl<K: Copy, V: Copy> Copy for QPDPair<K,V>{}
