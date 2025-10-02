@@ -623,7 +623,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
         checkpoint_id: u64, 
         value: &V
     ) -> anyhow::Result<()> {
-        let value_bytes = bincode::serialize(value)?;
+        let value_bytes = postcard::to_stdvec(value)?;
         self.session.execute_unpaged(&single_prepared.insert_1_prepared, (u64_to_i64_exact(obj_id), u64_to_i64_exact(checkpoint_id), &value_bytes)).await?;
         Ok(())
     }

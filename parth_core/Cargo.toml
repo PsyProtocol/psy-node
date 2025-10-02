@@ -27,3 +27,4 @@ flate2 = { workspace = true }
 strum = { workspace = true }
 strum_macros = { workspace = true }
 hashbrown = { workspace = true }
+postcard = { workspace = true }

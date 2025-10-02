@@ -38,7 +38,7 @@ redis = { workspace = true }
 bb8-redis = { workspace = true }
 bb8 = { workspace = true }
 rsmq = { workspace = true }
-
+postcard = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
