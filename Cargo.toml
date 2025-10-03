@@ -3,6 +3,7 @@ members = [
     "pser",
     "parth_core",
     "psy_core",
+    "psy_node_core",
     "parth_node_core",
     "parth_node_v1"
 ]
@@ -87,6 +88,10 @@ async-nats = "0.43.1"
 speedy = "0.8.7"
 
 parth_core = { path = "./parth_core" }
+
+psy_core = { path = "./psy_core" }
+pser = { path = "./pser" }
+psy_node_core = { path = "./psy_node_core" }
 
 plonky2 = { git = "https://github.com/clint-long/plonky2-hwa", rev = "5bf6940a3ea2d27e854931787e93bb46be27ffa3" }
 plonky2_maybe_rayon = { git = "https://github.com/clint-long/plonky2-hwa", rev = "5bf6940a3ea2d27e854931787e93bb46be27ffa3", default-features = false }

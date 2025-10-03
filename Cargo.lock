@@ -1814,6 +1814,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "psy_node_core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "auto_impl",
+ "bincode",
+ "ecdsa",
+ "flate2",
+ "hashbrown 0.14.5",
+ "hex",
+ "hex-literal",
+ "k256",
+ "parth_core",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "serde_repr",
+ "serde_with",
+ "sha2",
+ "strum",
+ "strum_macros",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "ptr_meta"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
