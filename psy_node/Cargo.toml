@@ -22,7 +22,7 @@ rand = { workspace = true }
 plonky2 = { workspace = true }
 plonky2_maybe_rayon = { workspace = true }
 # start workspace dependencies
-parth_common_v0 = { workspace = true }
+parth_core = { workspace = true }
 rkyv = { workspace = true }
 speedy = { workspace = true }
 postcard = { workspace = true }

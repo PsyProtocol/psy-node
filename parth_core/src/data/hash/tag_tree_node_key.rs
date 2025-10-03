@@ -3,8 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::data::{hash::merkle_node_key::SimpleMerkleNodeKey, serializable::{QPDSerializable, QPDSerializableFixed}};
 
 
-#[derive(Serialize, Deserialize, PartialEq, Clone, Copy, PartialOrd, Ord, Debug, Eq, Hash, rkyv::Serialize, rkyv::Deserialize, rkyv::Archive, speedy::Readable, speedy::Writable)]
-
+#[pderive::serialize_copy_default]
 pub struct TagTreeNodeKey {
     pub tag_tree_id: u32,
     pub key: SimpleMerkleNodeKey,

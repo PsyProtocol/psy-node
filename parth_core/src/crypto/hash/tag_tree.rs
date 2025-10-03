@@ -86,7 +86,7 @@ impl<Hash: QPDSerializableFixed + Copy> QPDSerializable for TagTreeNodeStorage<H
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Ord, PartialOrd, Copy)]
+#[pderive::serialize_copy]
 pub struct TagTreeNodePreimage<Hash: PartialEq + Copy> {
     pub left: Hash,
     pub right: Hash,
@@ -116,7 +116,8 @@ pub struct TagTreeProofNode<Hash: PartialEq + Copy> {
 }
 
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Ord, PartialOrd)]
+
+#[pderive::serialize_clone]
 pub struct TagTreeMerkleProofPartial<Hash: PartialEq + Copy> {
     pub index: u64,
     pub leaf: TagTreeNodePreimage<Hash>,
@@ -143,7 +144,7 @@ impl<Hash: PartialEq + Copy> TagTreeMerkleProofPartial<Hash> {
         }
     }
 }
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Ord, PartialOrd)]
+#[pderive::serialize_clone]
 pub struct TagTreeMerkleProof<Hash: PartialEq + Copy> {
     pub index: u64,
     pub leaf: TagTreeNodePreimage<Hash>,

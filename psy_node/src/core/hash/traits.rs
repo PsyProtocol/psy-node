@@ -1,5 +1,5 @@
-use parth_common_v0::crypto::hash::traits::MerkleHasher;
-use parth_common_v0::crypto::hash::traits::MerkleZeroHasher;
+use parth_core::crypto::hash::traits::MerkleHasher;
+use parth_core::crypto::hash::traits::MerkleZeroHasher;
 use plonky2::hash::hash_types::HashOut;
 use plonky2::hash::hash_types::RichField;
 use plonky2::hash::poseidon::PoseidonHash;

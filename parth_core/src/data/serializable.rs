@@ -136,7 +136,7 @@ impl<const N: usize> QPDSerializableFixed for [u8; N] {
 }
 
 
-#[derive(Serialize, Deserialize, PartialEq, Clone, Copy, PartialOrd, Ord, Debug, Eq, Hash, rkyv::Serialize, rkyv::Deserialize, rkyv::Archive, speedy::Readable, speedy::Writable)]
+#[pderive::serialize_copy]
 #[serde(bound = "for<'de2> K: Deserialize<'de2>")]
 pub struct FastQPDPair<K: Serialize + DeserializeOwned + Clone + Copy, V: Serialize + DeserializeOwned + Clone> {
     pub key: K,

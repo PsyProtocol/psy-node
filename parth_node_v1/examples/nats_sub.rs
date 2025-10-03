@@ -1,4 +1,4 @@
-use parth_common_v0::data::hash::merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey};
+use parth_core::data::hash::merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey};
 use parth_node_v1::jobhq::nats::core::NatsJetStreamClient;
 
 #[tokio::main]

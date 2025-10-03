@@ -1,10 +1,16 @@
+#[cfg(feature = "ptypes_goldilocks_qhashout")]
+pub mod pgoldilocks;
+mod ptypes;
+pub use ptypes::*;
 pub mod constants;
+pub mod felt;
 pub mod crypto;
 pub mod data;
 pub mod protocol;
 pub mod utils;
 pub mod store;
 pub mod node;
+
 
 #[macro_export]
 macro_rules! impl_qpq_serialize_primitive {

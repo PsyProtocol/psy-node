@@ -1,4 +1,4 @@
-use parth_common_v0::crypto::hash::merkle_proof::MerkleZeroHasherWithCache;
+use parth_core::crypto::hash::merkle_proof::MerkleZeroHasherWithCache;
 use plonky2::{field::goldilocks_field::GoldilocksField, hash::hash_types::HashOut};
 
 use crate::core::hash::{qhashout::QHashOut, traits::PoseidonHasher};

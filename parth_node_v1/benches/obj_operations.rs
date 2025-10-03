@@ -1,16 +1,6 @@
-use anyhow::Result;
 use criterion::Criterion;
-use parth_common_v0::{
-    crypto::hash::{sha256::CoreSha256Hasher, traits::MerkleZeroHasher},
-    data::{
-        db::row::{
-            QDatabaseDoubleIdTableRow, QDatabaseDoubleIdTableRowNoCheckpointId, QDatabaseKeyIdValueTableRow, QDatabaseSingleIdTableRow, QDoubleIdKey,
-        },
-        hash::hash256::Hash256,
-        serializable::{QPDPair, QPDPairWithCheckpointId},
-    },
-    protocol::core_types::QHashBase,
-};
+use parth_core::{crypto::hash::traits::MerkleZeroHasher, data::{db::row::{QDatabaseDoubleIdTableRow, QDatabaseDoubleIdTableRowNoCheckpointId, QDatabaseKeyIdValueTableRow, QDatabaseSingleIdTableRow, QDoubleIdKey}, hash::hash256::Hash256, serializable::{QPDPair, QPDPairWithCheckpointId}}, protocol::core_types::QHashBase};
+use parth_crypto::hash::sha256::CoreSha256Hasher;
 use parth_node_v1::store::scylla::{
     core::ScyllaCoreStore,
     tables::object::{
@@ -337,7 +327,7 @@ struct ExDatabaseManager<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> {
 }
 
 impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ExDatabaseManager<Hash, Hasher> {
-    pub async fn new(realm_id: u64, realm_sub_id: u64, keyspace: String, scylla_nodes: &[String]) -> Result<Self> {
+    pub async fn new(realm_id: u64, realm_sub_id: u64, keyspace: String, scylla_nodes: &[String]) -> anyhow::Result<Self> {
         let scylla_helper = ScyllaCoreStore::<Hash, Hasher>::new(realm_id, realm_sub_id, keyspace.clone(), scylla_nodes).await?;
 
         let contract_function_info_table = scylla_helper

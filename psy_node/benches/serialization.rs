@@ -1,6 +1,6 @@
 use anyhow::Result;
 use criterion::Criterion;
-use parth_common_v0::{
+use parth_core::{
     crypto::hash::{merkle_proof::{DeltaMerkleProofCore, MerkleProofCore}, sha256::CoreSha256Hasher, traits::{MerkleHasher, MerkleZeroHasher, RandomHash}},
     data::{
         db::row::{

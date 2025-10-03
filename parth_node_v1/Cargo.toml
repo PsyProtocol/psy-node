@@ -32,15 +32,18 @@ hashbrown = { workspace = true }
 async-nats = { workspace = true }
 scylla = { workspace = true }
 thiserror = { workspace = true }
-# start local packages
-parth_common_v0 = { workspace = true }
 redis = { workspace = true }
 bb8-redis = { workspace = true }
 bb8 = { workspace = true }
 rsmq = { workspace = true }
 postcard = { workspace = true }
 bytes = { workspace = true }
+# start local packages
 pser = { workspace = true }
+pderive = { workspace = true }
+parth_core = { workspace = true }
+parth_crypto = { workspace = true }
+parth_common = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

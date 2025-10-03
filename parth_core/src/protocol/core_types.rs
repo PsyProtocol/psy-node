@@ -1,6 +1,6 @@
 use serde::{de::DeserializeOwned, Serialize};
 
-use crate::{crypto::hash::traits::{QHasher, ZeroableHash}, data::{hash::merkle_node_key::SimpleMerkleNodeKey, parth::public_preimage::{QParthProofPublicInputsPreimage, QParthProofPublicInputsPreimageWithoutRewardsHash}, serializable::{QPDSerializable, QPDSerializableFixed}}, protocol::core_felt::QFelt64};
+use crate::{crypto::hash::traits::{QHasher, ZeroableHash}, data::{hash::merkle_node_key::SimpleMerkleNodeKey, parth::public_preimage::{QParthProofPublicInputsPreimage, QParthProofPublicInputsPreimageWithoutRewardsHash}, serializable::{QPDSerializable, QPDSerializableFixed}}, felt::QFelt64};
 
 pub trait QStorableBase: Serialize + DeserializeOwned + Send + Sync + Clone + PartialEq + Eq {}
 pub trait QStorableSizedBase: QStorableBase + Sized {}
@@ -60,5 +60,6 @@ pub trait QNetworkTypesConfigBase {
     const MAX_REALMS: u32; // = 2**COORDINATOR_GLOBAL_USER_TREE_HEIGHT
     const MAX_USERS_PER_REALM: u32; // = 2**REALM_GLOBAL_USER_TREE_HEIGHT
 }
+
 
 

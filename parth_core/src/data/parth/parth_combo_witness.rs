@@ -1,9 +1,9 @@
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::{crypto::hash::merkle_proof::MerkleProofCore, data::parth::public_preimage::QParthProofPublicInputsPreimage, protocol::core_types::{QHashBase, QJobIdBase}};
 
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[pderive::serialize_clone]
 #[serde(bound = "for<'de2> Hash: Deserialize<'de2>")]
 pub struct QParthSingleRecursiveWitness<Hash: QHashBase, JobID: QJobIdBase> {
     pub job_id: JobID,

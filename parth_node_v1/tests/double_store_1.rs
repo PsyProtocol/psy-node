@@ -1,6 +1,6 @@
 use anyhow::Result;
-use parth_common_v0::{
-    crypto::hash::{sha256::CoreSha256Hasher, traits::MerkleZeroHasher},
+use parth_core::{
+    crypto::hash::traits::MerkleZeroHasher,
     data::{
         db::row::{QDatabaseDoubleIdTableRow, QDatabaseDoubleIdTableRowNoCheckpointId, QDatabaseSingleIdTableRow, QDoubleIdKey},
         hash::
@@ -10,6 +10,8 @@ use parth_common_v0::{
     },
     protocol::core_types::QHashBase,
 };
+use parth_crypto::hash::sha256::CoreSha256Hasher;
+
 use parth_node_v1::store::scylla::{core::ScyllaCoreStore, tables::object::{ScyllaGenericObjectDoubleIdTablePreparedStatements, ScyllaGenericObjectSingleIdTablePreparedStatements}};
 use rand::{seq::SliceRandom, thread_rng, RngCore};
 use serde::{Deserialize, Serialize};

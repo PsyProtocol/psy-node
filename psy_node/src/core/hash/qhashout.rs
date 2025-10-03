@@ -1,7 +1,7 @@
 use std::{fmt::Display, str::FromStr};
 
 use anyhow::ensure;
-use parth_common_v0::{crypto::hash::traits::RandomHash, data::hash::hash256::Hash256};
+use parth_core::{crypto::hash::traits::RandomHash, data::hash::hash256::Hash256};
 use plonky2::{
     field::{
         goldilocks_field::GoldilocksField,

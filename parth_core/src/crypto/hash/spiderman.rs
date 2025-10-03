@@ -1,10 +1,11 @@
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Serialize};
 
 use crate::{crypto::hash::{merkle_proof::{DeltaMerkleProofCore, MerkleProofCore}, traits::{MerkleHasher, ZeroableHash}}, data::serializable::QPDSerializable, utils::math::{log2_ceil, log2_strict}};
 use crate::crypto::hash::traits::MerkleLeafHasher;
 use pser::{QBytesSerialize, QBytesDeserialize};
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Ord, PartialOrd, rkyv::Serialize, rkyv::Deserialize, rkyv::Archive, speedy::Readable, speedy::Writable)]
+
+#[pderive::serialize_clone]
 pub struct SpidermanUpdateProof<Hash: PartialEq + Copy> {
     pub top_line_proof: DeltaMerkleProofCore<Hash>,
     pub web_proof_old_leaves: Vec<Hash>,

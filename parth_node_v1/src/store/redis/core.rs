@@ -3,7 +3,7 @@ use std::{num::NonZeroUsize, time::Duration};
 
 use bb8::Pool;
 use bb8_redis::RedisConnectionManager;
-use parth_common_v0::data::serializable::{QPDPair, QPDSerializable};
+use parth_core::data::serializable::{QPDPair, QPDSerializable};
 use redis::AsyncCommands;
 use tokio::time::sleep;
 

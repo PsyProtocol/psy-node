@@ -4,7 +4,7 @@ use crate::data::serializable::{QPDSerializable, QPDSerializableFixed};
 
 
 
-#[derive(Serialize, Deserialize, PartialEq, Clone, Copy, PartialOrd, Ord, Debug, Eq, Hash, rkyv::Serialize, rkyv::Deserialize, rkyv::Archive, speedy::Readable, speedy::Writable)]
+#[pderive::serialize_copy_default]
 pub struct QMerkleStoreKey {
     pub tree_type: u16, // 2
     pub tree_id: u64, // 10

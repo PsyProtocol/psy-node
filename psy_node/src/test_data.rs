@@ -1,4 +1,4 @@
-use parth_common_v0::crypto::hash::merkle_proof::DeltaMerkleProofCore;
+use parth_core::crypto::hash::merkle_proof::DeltaMerkleProofCore;
 use plonky2::hash::hash_types::RichField;
 use serde::{Deserialize, Serialize};
 

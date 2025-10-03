@@ -28,4 +28,7 @@ strum = { workspace = true }
 strum_macros = { workspace = true }
 hashbrown = { workspace = true }
 # start local packages
-parth_common_v0 = { workspace = true }
+pser = { workspace = true }
+pderive = { workspace = true }
+parth_core = { workspace = true }
+parth_common = { workspace = true }

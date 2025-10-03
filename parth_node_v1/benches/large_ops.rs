@@ -1,5 +1,6 @@
 use criterion::Criterion;
-use parth_common_v0::{crypto::hash::{sha256::CoreSha256Hasher, traits::MerkleZeroHasher}, data::{hash::{hash256::Hash256, merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}, merkle_store_key::QMerkleStoreBlobKey}, serializable::QPDPair}};
+use parth_core::{crypto::hash::traits::MerkleZeroHasher, data::{hash::{hash256::Hash256, merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}, merkle_store_key::QMerkleStoreBlobKey}, serializable::QPDPair}};
+use parth_crypto::hash::sha256::CoreSha256Hasher;
 use parth_node_v1::{ store::scylla::core::ScyllaCoreStore};
 
 fn bench_large_ops(c: &mut Criterion) {

@@ -3,7 +3,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use crate::data::serializable::{QPDSerializable, QPDSerializableFixed};
 
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash, Copy, Default, Ord, PartialOrd)]
+#[pderive::serialize_copy]
 pub struct QDoubleIdKey {
     pub obj_id: u64,
     pub secondary_id: u64,

@@ -1,5 +1,6 @@
 use anyhow::Result;
-use parth_common_v0::{crypto::hash::sha256::CoreSha256Hasher, data::hash::hash256::Hash256};
+use parth_core::data::hash::hash256::Hash256;
+use parth_crypto::hash::sha256::CoreSha256Hasher;
 use parth_node_v1::store::scylla::core::ScyllaCoreStore;
 
 

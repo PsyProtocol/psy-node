@@ -4,9 +4,7 @@ use crate::protocol::core_types::QHashBase;
 
 
 // ZKPublicKeyInfo
-#[derive(
-    Serialize, Deserialize, PartialEq, Debug, Clone, Copy, Eq, Hash
-)]
+#[pderive::serialize_clone]
 #[serde(bound = "for<'de2> Hash: Deserialize<'de2>")]
 pub struct QPUserPublicKeyInfo<Hash: QHashBase> {
     pub fingerprint: Hash,
@@ -14,7 +12,7 @@ pub struct QPUserPublicKeyInfo<Hash: QHashBase> {
 }
 
 // QBCDeployContract
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[pderive::serialize_clone]
 #[serde(bound = "for<'de2> Hash: Deserialize<'de2>, for<'de3> QContractCodeDefinition: Deserialize<'de3>")]
 pub struct QPDeployContract<Hash: QHashBase, QContractCodeDefinition: Serialize + Clone> {
     pub deployer: Hash,
@@ -24,7 +22,7 @@ pub struct QPDeployContract<Hash: QHashBase, QContractCodeDefinition: Serialize 
 
 
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[pderive::serialize_clone]
 #[serde(bound = "for<'de2> Hash: Deserialize<'de2>, for<'de3> QContractCodeDefinition: Deserialize<'de3>")]
 pub struct QBCDeployContractWithRoot<Hash: QHashBase, QContractCodeDefinition: Serialize + Clone> {
     pub deployer: Hash,

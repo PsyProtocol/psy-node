@@ -4,6 +4,11 @@ name    = "parth_core"
 version = "0.1.0"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[features]
+default = []
+goldilocks = ["plonky2"]
+ptypes_goldilocks_qhashout = ["goldilocks"]
+ptypes_u64_hash256 = []
 
 [dependencies]
 anyhow     = { workspace = true }
@@ -16,7 +21,6 @@ hex = { workspace = true }
 hex-literal = { workspace = true }
 bincode = { workspace = true }
 tracing = { workspace = true }
-tokio = { workspace = true}
 uuid = { workspace = true }
 rand = { workspace = true }
 auto_impl = { workspace = true }
@@ -30,3 +34,10 @@ ts-rs = { workspace = true }
 
 # start local packages
 pser = { workspace = true }
+pderive = { workspace = true }
+
+plonky2 = { workspace = true, optional = true }
+
+[dev-dependencies]
+plonky2 = { workspace = true }
+ts-rs = { workspace = true }

@@ -1,11 +1,14 @@
 [workspace]
 members = [
     "pser",
+    "pderive",
     "parth_core",
     "parth_common",
-    "parth_common_v0",
+    "psy_global_types",
+    "psy_type_defaults",
     "psy_core",
     "psy_common",
+    "psy_node_core",
     "psy_node_common",
     "parth_node_v1"
 ]
@@ -19,6 +22,12 @@ version = "0.1.0"
 [workspace.lints]
 
 [workspace.dependencies]
+syn = { version = "2.0", features = ["full"] }
+proc-macro2 = { version = "1.0", features = ["span-locations"] }
+quote = "1.0"
+
+
+
 colored = "2"
 serde = { version = "1.0.193", features = ["derive"] }
 serde_json = "1.0"
@@ -78,7 +87,6 @@ tokio-reactor-trait = "2"
 
 futures = "0.3.0"
 chalk = "0.1"
-proc-macro2 = { version = "1.0", features = ["span-locations"] }
 
 uuid = { version = "1.0", features = ["serde", "v4", "js"] }
 
@@ -108,17 +116,22 @@ rsmq = { git = "https://github.com/jimzk/rsmq-async-rs", package = "rsmq_async",
 
 
 # Workspace Packages
+pser = { path = "./pser" }
+pderive = { path = "./pderive" }
 
 parth_core = { path = "./parth_core" }
 parth_common = { path = "./parth_common" }
 parth_crypto = { path = "./parth_crypto" }
 
-parth_common_v0 = { path = "./parth_common_v0" }
+
 
 psy_core = { path = "./psy_core" }
 psy_common = { path = "./psy_common" }
-pser = { path = "./pser" }
+psy_node_core = { path = "./psy_node_core" }
 psy_node_common = { path = "./psy_node_common" }
+psy_global_types = { path = "./psy_global_types" }
+psy_type_defaults = { path = "./psy_type_defaults" }
+
 
 # Dev dependencies
 criterion = "0.5.1"  # For benchmarking efficiency

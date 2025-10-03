@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::protocol::core_types::QHashBase;
 
 
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, Copy)]
+#[pderive::serialize_copy]
 #[serde(bound = "for<'de2> Hash: Deserialize<'de2>")]
 pub struct QParthProofPublicInputsPreimage<Hash: QHashBase> {
     pub index: u64, // this index of the node in the merkle tree that this proof is proving updates to

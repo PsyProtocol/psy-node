@@ -16,16 +16,8 @@ hex = { workspace = true }
 hex-literal = { workspace = true }
 bincode = { workspace = true }
 tracing = { workspace = true }
-tokio = { workspace = true}
-uuid = { workspace = true }
-rand = { workspace = true }
-sha2 = { workspace = true }
 auto_impl = { workspace = true }
 k256 = { workspace = true }
-ecdsa = { workspace = true }
-flate2 = { workspace = true }
-strum = { workspace = true }
-strum_macros = { workspace = true }
 hashbrown = { workspace = true }
 postcard = { workspace = true }
 rkyv = { workspace = true }

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::data::serializable::{QPDSerializable, QPDSerializableFixed};
 
 
-#[derive(Serialize, Deserialize, PartialEq, Clone, Copy, Debug, Eq, Hash, Ord, rkyv::Serialize, rkyv::Deserialize, rkyv::Archive, speedy::Readable, speedy::Writable)]
+#[pderive::serialize_copy_default_no_ord]
 pub struct SimpleMerkleNodeKey {
     pub level: u8,
     pub index: u64,
@@ -19,7 +19,15 @@ impl PartialOrd for SimpleMerkleNodeKey {
         }
     }
 }
-
+impl Ord for SimpleMerkleNodeKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        if self.level != other.level {
+            self.level.cmp(&other.level)
+        }else{
+            self.index.cmp(&other.index)
+        }
+    }
+}
 impl SimpleMerkleNodeKey {
     pub fn new_root() -> Self {
         Self { level: 0, index: 0 }
