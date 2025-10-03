@@ -3,7 +3,7 @@ use std::{num::NonZeroUsize, time::Duration};
 
 use bb8::Pool;
 use bb8_redis::RedisConnectionManager;
-use parth_core::data::serializable::{QPDPair, QPDSerializable};
+use parth_common_v0::data::serializable::{QPDPair, QPDSerializable};
 use redis::AsyncCommands;
 use tokio::time::sleep;
 
@@ -304,7 +304,7 @@ impl QPTempQueueEmphemeralSubscriber for ProofStoreRedisAsync {
         self.pop_from_generic_bytes_queue_or_none_internal(&self.get_ephemeral_queue_key(queue_type as u32, unique_id)).await
     }
 
-    async fn wait_for_pop_bytes_from_emphemeral_queue(&self, queue_type: QPEphemeralQueueType, unique_id: u128, timeout_ms: u64) -> anyhow::Result<Vec<u8>>{
+    async fn wait_for_pop_bytes_from_emphemeral_queue(&self, queue_type: QPEphemeralQueueType, unique_id: u128, _timeout_ms: u64) -> anyhow::Result<Vec<u8>>{
         self.wait_for_generic_bytes_queue_internal(&self.get_ephemeral_queue_key(queue_type as u32, unique_id)).await
     }
    

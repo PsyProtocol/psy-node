@@ -1,8 +1,15 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{data::hash::{merkle_node_key::SimpleMerkleNodeKey, merkle_store_key::QMerkleStoreKey}, store::merkle_store::SerializableMerkleTableKey};
+use crate::{data::hash::{merkle_node_key::SimpleMerkleNodeKey, merkle_store_key::QMerkleStoreKey}};
 
 
+pub trait SerializableMerkleTableKey {
+    const TREE_HEIGHT: u8;
+
+    //fn get_full_merkle_key(&self, node: &SimpleMerkleNodeKey, checkpoint_id: u64) -> QMerkleStoreKey;
+    fn get_merkle_key_bytes(&self, node: &SimpleMerkleNodeKey, checkpoint_id: u64) -> Vec<u8>;
+    fn decode_merkle_key_bytes(&self, bytes: &[u8]) -> anyhow::Result<QMerkleStoreKey>;
+}
 pub trait DoubleTreeSerializableMerkleTableKey: SerializableMerkleTableKey {
     fn get_primary_id(&self) -> u64;
     fn new_with_primary_id(primary_id: u64) -> Self;

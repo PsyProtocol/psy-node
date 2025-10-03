@@ -1,7 +1,6 @@
 pub mod constants;
 pub mod crypto;
 pub mod data;
-pub mod jobs;
 pub mod protocol;
 pub mod utils;
 pub mod store;

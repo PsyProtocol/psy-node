@@ -8,8 +8,7 @@ use async_nats::{
         self,
         consumer::{pull::Config as PullConfig, PullConsumer},
         kv::Store,
-    },
-    Client,
+    }
 };
 use bytes::Bytes;
 use futures::{future::try_join_all, stream::StreamExt};

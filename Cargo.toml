@@ -2,11 +2,12 @@
 members = [
     "pser",
     "parth_core",
+    "parth_common",
+    "parth_common_v0",
     "psy_core",
-    "psy_node_core",
-    "parth_node_core",
-    "parth_node_v1",
-    "parth_p2"
+    "psy_common",
+    "psy_node_common",
+    "parth_node_v1"
 ]
 resolver = "2"
 
@@ -57,6 +58,7 @@ env_logger = { version = "0.11", default-features = false }
 hashbrown = "0.14.5"
 rkyv = "0.8.12"
 
+ts-rs = "10.1.0"
 k256 = { version = "0.13.2", features = [
   "arithmetic",
   "ecdsa",
@@ -88,11 +90,6 @@ maybe-async = { version = "0.2", default-features = false }
 async-nats = "0.43.1"
 speedy = "0.8.7"
 
-parth_core = { path = "./parth_core" }
-
-psy_core = { path = "./psy_core" }
-pser = { path = "./pser" }
-psy_node_core = { path = "./psy_node_core" }
 
 plonky2 = { git = "https://github.com/clint-long/plonky2-hwa", rev = "5bf6940a3ea2d27e854931787e93bb46be27ffa3" }
 plonky2_maybe_rayon = { git = "https://github.com/clint-long/plonky2-hwa", rev = "5bf6940a3ea2d27e854931787e93bb46be27ffa3", default-features = false }
@@ -109,6 +106,19 @@ bb8-redis = "0.22.0"
 bb8 = "0.9"
 rsmq = { git = "https://github.com/jimzk/rsmq-async-rs", package = "rsmq_async", features = ["break-js-comp", "sync", "tokio"] }
 
+
+# Workspace Packages
+
+parth_core = { path = "./parth_core" }
+parth_common = { path = "./parth_common" }
+parth_crypto = { path = "./parth_crypto" }
+
+parth_common_v0 = { path = "./parth_common_v0" }
+
+psy_core = { path = "./psy_core" }
+psy_common = { path = "./psy_common" }
+pser = { path = "./pser" }
+psy_node_common = { path = "./psy_node_common" }
 
 # Dev dependencies
 criterion = "0.5.1"  # For benchmarking efficiency

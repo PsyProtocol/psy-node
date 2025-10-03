@@ -1,5 +1,5 @@
 use criterion::Criterion;
-use parth_core::{
+use parth_common_v0::{
     crypto::hash::sha256::CoreSha256Hasher,
     data::
         hash::{

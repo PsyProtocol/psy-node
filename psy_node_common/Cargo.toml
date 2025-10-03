@@ -1,0 +1,31 @@
+[package]
+edition = "2021"
+name    = "psy_node_common"
+version = "0.1.0"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow     = { workspace = true }
+async-trait      = { workspace = true }
+serde      = { workspace = true }
+serde_json      = { workspace = true }
+serde_repr      = { workspace = true }
+serde_with      = { workspace = true }
+hex = { workspace = true }
+hex-literal = { workspace = true }
+bincode = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true}
+uuid = { workspace = true }
+rand = { workspace = true }
+sha2 = { workspace = true }
+auto_impl = { workspace = true }
+k256 = { workspace = true }
+ecdsa = { workspace = true }
+flate2 = { workspace = true }
+strum = { workspace = true }
+strum_macros = { workspace = true }
+hashbrown = { workspace = true }
+# start local packages
+parth_common_v0 = { workspace = true }

@@ -1,5 +1,4 @@
-use parth_core::data::serializable::{QPDPair, QPDSerializable, QPDSerializableFixed};
-use pser::{QBytesDeserialize, QBytesSerialize};
+use parth_common_v0::data::serializable::{QPDPair, QPDSerializable, QPDSerializableFixed};
 
 use async_trait::async_trait;
 use serde::{de::DeserializeOwned, Serialize};
