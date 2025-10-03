@@ -5,6 +5,13 @@ version = "0.1.0"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+default = ["std", "serialize_rkyv", "serialize_speedy", "serialize_postcard"]
+std = []
+serialize_rkyv = ["dep:rkyv"]
+serialize_speedy = ["dep:speedy", "std"]
+serialize_postcard = ["dep:postcard"]
+
 [dependencies]
 anyhow     = { workspace = true }
 serde      = { workspace = true }
@@ -12,4 +19,6 @@ serde_json      = { workspace = true }
 serde_repr      = { workspace = true }
 serde_with      = { workspace = true }
 bincode = { workspace = true }
-postcard = { workspace = true }
+speedy = { workspace = true, optional = true }
+rkyv = { workspace = true, optional = true }
+postcard = { workspace = true, optional = true }

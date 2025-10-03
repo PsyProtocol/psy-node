@@ -4,6 +4,12 @@ name    = "parth_common"
 version = "0.1.0"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[features]
+default = ["std", "parth_core/serialize_rkyv", "parth_core/serialize_speedy", "parth_core/serialize_postcard"]
+std = ["parth_core/std", "pser/std"]
+serialize_rkyv = ["dep:rkyv","pser/serialize_rkyv", "parth_core/serialize_rkyv"]
+serialize_speedy = ["dep:speedy", "pser/serialize_speedy", "parth_core/serialize_speedy"]
+serialize_postcard = ["dep:postcard", "pser/serialize_postcard", "parth_core/serialize_postcard"]
 
 [dependencies]
 anyhow     = { workspace = true }
@@ -13,16 +19,14 @@ serde_json      = { workspace = true }
 serde_repr      = { workspace = true }
 serde_with      = { workspace = true }
 hex = { workspace = true }
+hashbrown = { workspace = true }
 hex-literal = { workspace = true }
 bincode = { workspace = true }
-tracing = { workspace = true }
 auto_impl = { workspace = true }
-k256 = { workspace = true }
-hashbrown = { workspace = true }
-postcard = { workspace = true }
-rkyv = { workspace = true }
+postcard = { workspace = true, optional = true }
+rkyv = { workspace = true, optional = true }
+speedy = { workspace = true, optional = true }
 pser = { workspace = true }
-speedy = { workspace = true }
 ts-rs = { workspace = true }
 
 # start local packages

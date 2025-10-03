@@ -6,7 +6,7 @@ use syn::{parse_macro_input, Attribute, ItemStruct};
 pub fn serialize_copy(_attr: TokenStream, input: TokenStream) -> TokenStream {
     let mut item_struct = parse_macro_input!(input as ItemStruct);
 
-    let derive_attr: Attribute = syn::parse_quote!(
+    let derive_serde: Attribute = syn::parse_quote!(
         #[derive(
             Debug,
             Copy,
@@ -17,17 +17,20 @@ pub fn serialize_copy(_attr: TokenStream, input: TokenStream) -> TokenStream {
             PartialOrd,
             Ord,
             serde::Serialize,
-            serde::Deserialize,
-            rkyv::Archive,
-            rkyv::Serialize,
-            rkyv::Deserialize,
-            speedy::Readable,
-            speedy::Writable
+            serde::Deserialize
         )]
     );
+    let derive_rkyv: Attribute = syn::parse_quote!(
+        #[cfg_attr(feature = "serialize_rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
+    );
+    let derive_speedy: Attribute = syn::parse_quote!(
+        #[cfg_attr(feature = "serialize_speedy", derive(speedy::Readable, speedy::Writable))]
+    );
 
-    // Insert at the beginning so it appears first in the output
-    item_struct.attrs.insert(0, derive_attr);
+    // Insert attributes in reverse order to maintain the desired output order
+    item_struct.attrs.insert(0, derive_speedy);
+    item_struct.attrs.insert(0, derive_rkyv);
+    item_struct.attrs.insert(0, derive_serde);
 
     TokenStream::from(item_struct.into_token_stream())
 }
@@ -37,7 +40,7 @@ pub fn serialize_copy(_attr: TokenStream, input: TokenStream) -> TokenStream {
 pub fn serialize_clone(_attr: TokenStream, input: TokenStream) -> TokenStream {
     let mut item_struct = parse_macro_input!(input as ItemStruct);
 
-    let derive_attr: Attribute = syn::parse_quote!(
+    let derive_serde: Attribute = syn::parse_quote!(
         #[derive(
             Debug,
             Clone,
@@ -47,17 +50,19 @@ pub fn serialize_clone(_attr: TokenStream, input: TokenStream) -> TokenStream {
             PartialOrd,
             Ord,
             serde::Serialize,
-            serde::Deserialize,
-            rkyv::Archive,
-            rkyv::Serialize,
-            rkyv::Deserialize,
-            speedy::Readable,
-            speedy::Writable
+            serde::Deserialize
         )]
     );
+    let derive_rkyv: Attribute = syn::parse_quote!(
+        #[cfg_attr(feature = "serialize_rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
+    );
+    let derive_speedy: Attribute = syn::parse_quote!(
+        #[cfg_attr(feature = "serialize_speedy", derive(speedy::Readable, speedy::Writable))]
+    );
 
-    // Insert at the beginning so it appears first in the output
-    item_struct.attrs.insert(0, derive_attr);
+    item_struct.attrs.insert(0, derive_speedy);
+    item_struct.attrs.insert(0, derive_rkyv);
+    item_struct.attrs.insert(0, derive_serde);
 
     TokenStream::from(item_struct.into_token_stream())
 }
@@ -67,7 +72,7 @@ pub fn serialize_clone(_attr: TokenStream, input: TokenStream) -> TokenStream {
 pub fn serialize_copy_default(_attr: TokenStream, input: TokenStream) -> TokenStream {
     let mut item_struct = parse_macro_input!(input as ItemStruct);
 
-    let derive_attr: Attribute = syn::parse_quote!(
+    let derive_serde: Attribute = syn::parse_quote!(
         #[derive(
             Debug,
             Copy,
@@ -79,17 +84,19 @@ pub fn serialize_copy_default(_attr: TokenStream, input: TokenStream) -> TokenSt
             Ord,
             serde::Serialize,
             serde::Deserialize,
-            Default,
-            rkyv::Archive,
-            rkyv::Serialize,
-            rkyv::Deserialize,
-            speedy::Readable,
-            speedy::Writable
+            Default
         )]
     );
+    let derive_rkyv: Attribute = syn::parse_quote!(
+        #[cfg_attr(feature = "serialize_rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
+    );
+    let derive_speedy: Attribute = syn::parse_quote!(
+        #[cfg_attr(feature = "serialize_speedy", derive(speedy::Readable, speedy::Writable))]
+    );
 
-    // Insert at the beginning so it appears first in the output
-    item_struct.attrs.insert(0, derive_attr);
+    item_struct.attrs.insert(0, derive_speedy);
+    item_struct.attrs.insert(0, derive_rkyv);
+    item_struct.attrs.insert(0, derive_serde);
 
     TokenStream::from(item_struct.into_token_stream())
 }
@@ -99,7 +106,7 @@ pub fn serialize_copy_default(_attr: TokenStream, input: TokenStream) -> TokenSt
 pub fn serialize_clone_default(_attr: TokenStream, input: TokenStream) -> TokenStream {
     let mut item_struct = parse_macro_input!(input as ItemStruct);
 
-    let derive_attr: Attribute = syn::parse_quote!(
+    let derive_serde: Attribute = syn::parse_quote!(
         #[derive(
             Debug,
             Clone,
@@ -110,17 +117,19 @@ pub fn serialize_clone_default(_attr: TokenStream, input: TokenStream) -> TokenS
             Ord,
             serde::Serialize,
             serde::Deserialize,
-            Default,
-            rkyv::Archive,
-            rkyv::Serialize,
-            rkyv::Deserialize,
-            speedy::Readable,
-            speedy::Writable
+            Default
         )]
     );
+    let derive_rkyv: Attribute = syn::parse_quote!(
+        #[cfg_attr(feature = "serialize_rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
+    );
+    let derive_speedy: Attribute = syn::parse_quote!(
+        #[cfg_attr(feature = "serialize_speedy", derive(speedy::Readable, speedy::Writable))]
+    );
 
-    // Insert at the beginning so it appears first in the output
-    item_struct.attrs.insert(0, derive_attr);
+    item_struct.attrs.insert(0, derive_speedy);
+    item_struct.attrs.insert(0, derive_rkyv);
+    item_struct.attrs.insert(0, derive_serde);
 
     TokenStream::from(item_struct.into_token_stream())
 }
@@ -130,7 +139,7 @@ pub fn serialize_clone_default(_attr: TokenStream, input: TokenStream) -> TokenS
 pub fn serialize_copy_no_ord(_attr: TokenStream, input: TokenStream) -> TokenStream {
     let mut item_struct = parse_macro_input!(input as ItemStruct);
 
-    let derive_attr: Attribute = syn::parse_quote!(
+    let derive_serde: Attribute = syn::parse_quote!(
         #[derive(
             Debug,
             Copy,
@@ -139,17 +148,19 @@ pub fn serialize_copy_no_ord(_attr: TokenStream, input: TokenStream) -> TokenStr
             Eq,
             Hash,
             serde::Serialize,
-            serde::Deserialize,
-            rkyv::Archive,
-            rkyv::Serialize,
-            rkyv::Deserialize,
-            speedy::Readable,
-            speedy::Writable
+            serde::Deserialize
         )]
     );
+    let derive_rkyv: Attribute = syn::parse_quote!(
+        #[cfg_attr(feature = "serialize_rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
+    );
+    let derive_speedy: Attribute = syn::parse_quote!(
+        #[cfg_attr(feature = "serialize_speedy", derive(speedy::Readable, speedy::Writable))]
+    );
 
-    // Insert at the beginning so it appears first in the output
-    item_struct.attrs.insert(0, derive_attr);
+    item_struct.attrs.insert(0, derive_speedy);
+    item_struct.attrs.insert(0, derive_rkyv);
+    item_struct.attrs.insert(0, derive_serde);
 
     TokenStream::from(item_struct.into_token_stream())
 }
@@ -159,7 +170,7 @@ pub fn serialize_copy_no_ord(_attr: TokenStream, input: TokenStream) -> TokenStr
 pub fn serialize_clone_no_ord(_attr: TokenStream, input: TokenStream) -> TokenStream {
     let mut item_struct = parse_macro_input!(input as ItemStruct);
 
-    let derive_attr: Attribute = syn::parse_quote!(
+    let derive_serde: Attribute = syn::parse_quote!(
         #[derive(
             Debug,
             Clone,
@@ -167,17 +178,19 @@ pub fn serialize_clone_no_ord(_attr: TokenStream, input: TokenStream) -> TokenSt
             Eq,
             Hash,
             serde::Serialize,
-            serde::Deserialize,
-            rkyv::Archive,
-            rkyv::Serialize,
-            rkyv::Deserialize,
-            speedy::Readable,
-            speedy::Writable
+            serde::Deserialize
         )]
     );
+    let derive_rkyv: Attribute = syn::parse_quote!(
+        #[cfg_attr(feature = "serialize_rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
+    );
+    let derive_speedy: Attribute = syn::parse_quote!(
+        #[cfg_attr(feature = "serialize_speedy", derive(speedy::Readable, speedy::Writable))]
+    );
 
-    // Insert at the beginning so it appears first in the output
-    item_struct.attrs.insert(0, derive_attr);
+    item_struct.attrs.insert(0, derive_speedy);
+    item_struct.attrs.insert(0, derive_rkyv);
+    item_struct.attrs.insert(0, derive_serde);
 
     TokenStream::from(item_struct.into_token_stream())
 }
@@ -187,7 +200,7 @@ pub fn serialize_clone_no_ord(_attr: TokenStream, input: TokenStream) -> TokenSt
 pub fn serialize_copy_default_no_ord(_attr: TokenStream, input: TokenStream) -> TokenStream {
     let mut item_struct = parse_macro_input!(input as ItemStruct);
 
-    let derive_attr: Attribute = syn::parse_quote!(
+    let derive_serde: Attribute = syn::parse_quote!(
         #[derive(
             Debug,
             Copy,
@@ -197,17 +210,19 @@ pub fn serialize_copy_default_no_ord(_attr: TokenStream, input: TokenStream) -> 
             Hash,
             serde::Serialize,
             serde::Deserialize,
-            Default,
-            rkyv::Archive,
-            rkyv::Serialize,
-            rkyv::Deserialize,
-            speedy::Readable,
-            speedy::Writable
+            Default
         )]
     );
+    let derive_rkyv: Attribute = syn::parse_quote!(
+        #[cfg_attr(feature = "serialize_rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
+    );
+    let derive_speedy: Attribute = syn::parse_quote!(
+        #[cfg_attr(feature = "serialize_speedy", derive(speedy::Readable, speedy::Writable))]
+    );
 
-    // Insert at the beginning so it appears first in the output
-    item_struct.attrs.insert(0, derive_attr);
+    item_struct.attrs.insert(0, derive_speedy);
+    item_struct.attrs.insert(0, derive_rkyv);
+    item_struct.attrs.insert(0, derive_serde);
 
     TokenStream::from(item_struct.into_token_stream())
 }
@@ -217,7 +232,7 @@ pub fn serialize_copy_default_no_ord(_attr: TokenStream, input: TokenStream) -> 
 pub fn serialize_clone_default_no_ord(_attr: TokenStream, input: TokenStream) -> TokenStream {
     let mut item_struct = parse_macro_input!(input as ItemStruct);
 
-    let derive_attr: Attribute = syn::parse_quote!(
+    let derive_serde: Attribute = syn::parse_quote!(
         #[derive(
             Debug,
             Clone,
@@ -226,20 +241,19 @@ pub fn serialize_clone_default_no_ord(_attr: TokenStream, input: TokenStream) ->
             Hash,
             serde::Serialize,
             serde::Deserialize,
-            Default,
-            rkyv::Archive,
-            rkyv::Serialize,
-            rkyv::Deserialize,
-            speedy::Readable,
-            speedy::Writable
+            Default
         )]
     );
+    let derive_rkyv: Attribute = syn::parse_quote!(
+        #[cfg_attr(feature = "serialize_rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
+    );
+    let derive_speedy: Attribute = syn::parse_quote!(
+        #[cfg_attr(feature = "serialize_speedy", derive(speedy::Readable, speedy::Writable))]
+    );
 
-    // Insert at the beginning so it appears first in the output
-    item_struct.attrs.insert(0, derive_attr);
+    item_struct.attrs.insert(0, derive_speedy);
+    item_struct.attrs.insert(0, derive_rkyv);
+    item_struct.attrs.insert(0, derive_serde);
 
     TokenStream::from(item_struct.into_token_stream())
 }
-
-
-

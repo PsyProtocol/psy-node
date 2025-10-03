@@ -5,10 +5,16 @@ version = "0.1.0"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [features]
-default = []
+default = ["rand", "std", "parth_node"]
+std = []
 goldilocks = ["plonky2"]
 ptypes_goldilocks_qhashout = ["goldilocks"]
 ptypes_u64_hash256 = []
+rand = ["dep:rand"]
+parth_node = []
+serialize_rkyv = ["dep:rkyv", "plonky2?/serialize_rkyv"]
+serialize_speedy = ["dep:speedy", "plonky2?/serialize_rkyv"]
+serialize_postcard = ["dep:postcard"]
 
 [dependencies]
 anyhow     = { workspace = true }
@@ -20,16 +26,13 @@ serde_with      = { workspace = true }
 hex = { workspace = true }
 hex-literal = { workspace = true }
 bincode = { workspace = true }
-tracing = { workspace = true }
-uuid = { workspace = true }
-rand = { workspace = true }
+rand = { workspace = true, optional = true }
 auto_impl = { workspace = true }
 strum = { workspace = true }
 strum_macros = { workspace = true }
-hashbrown = { workspace = true }
-postcard = { workspace = true }
-rkyv = { workspace = true }
-speedy = { workspace = true }
+postcard = { workspace = true, optional = true }
+rkyv = { workspace = true, optional = true }
+speedy = { workspace = true, optional = true }
 ts-rs = { workspace = true }
 
 # start local packages

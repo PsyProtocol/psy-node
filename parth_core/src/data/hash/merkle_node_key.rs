@@ -1,7 +1,4 @@
 use std::cmp::Ordering;
-
-use serde::{Deserialize, Serialize};
-
 use crate::data::serializable::{QPDSerializable, QPDSerializableFixed};
 
 
@@ -203,7 +200,8 @@ impl QPDSerializableFixed for SimpleMerkleNodeKey {
         9
     }
 }
-#[derive(Serialize, Deserialize, PartialEq, Clone, Copy, Debug, Eq, Hash, Ord, rkyv::Serialize, rkyv::Deserialize, rkyv::Archive, speedy::Readable, speedy::Writable)]
+
+#[pderive::serialize_copy_no_ord]
 pub struct SimpleMerkleNode<Hash> {
     pub key: SimpleMerkleNodeKey,
     pub value: Hash,
@@ -235,7 +233,8 @@ impl<Hash: PartialOrd> PartialOrd for SimpleMerkleNode<Hash> {
     }
 }
 
-#[derive(Serialize, Deserialize, PartialEq, Clone, Copy, Debug, Eq, Hash, rkyv::Serialize, rkyv::Deserialize, rkyv::Archive, speedy::Readable, speedy::Writable)]
+
+#[pderive::serialize_copy]
 pub struct SimpleMerkleNodeNCAAggregation {
     pub nca: SimpleMerkleNodeKey,
     pub left: SimpleMerkleNodeKey,

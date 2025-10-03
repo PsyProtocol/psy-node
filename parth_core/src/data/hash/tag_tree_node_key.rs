@@ -1,5 +1,3 @@
-use serde::{Deserialize, Serialize};
-
 use crate::data::{hash::merkle_node_key::SimpleMerkleNodeKey, serializable::{QPDSerializable, QPDSerializableFixed}};
 
 
@@ -113,8 +111,7 @@ impl QPDSerializableFixed for TagTreeNodeKey {
 }
 
 
-#[derive(Serialize, Deserialize, PartialEq, Clone, Copy, PartialOrd, Ord, Debug, Eq, Hash, rkyv::Serialize, rkyv::Deserialize, rkyv::Archive, speedy::Readable, speedy::Writable)]
-
+#[pderive::serialize_copy]
 pub struct TagTreeNodeKeyWithCheckpoint {
     pub tt_node_key: TagTreeNodeKey,
     pub checkpoint_id: u64,

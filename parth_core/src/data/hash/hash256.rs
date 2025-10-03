@@ -2,14 +2,13 @@ use std::fmt::Display;
 
 use hex::FromHexError;
 use rand::RngCore;
-use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
 use crate::{crypto::hash::traits::{CodeSerializableHash, RandomHash, ZeroableHash}, data::serializable::{QPDSerializable, QPDSerializableFixed}, protocol::core_types::QHashBase};
 
 
 #[serde_as]
-#[derive(Serialize, Deserialize, PartialEq, Clone, Copy, Debug, Eq, Hash, PartialOrd, Ord, rkyv::Serialize, rkyv::Deserialize, rkyv::Archive, speedy::Readable, speedy::Writable)]
+#[pderive::serialize_copy]
 pub struct Hash256(#[serde_as(as = "serde_with::hex::Hex")] pub [u8; 32]);
 impl Default for Hash256 {
     fn default() -> Self {
