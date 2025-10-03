@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "pser",
     "parth_core",
     "psy_core",
     "parth_node_core",
@@ -28,7 +29,8 @@ chrono = "0.4.39"
 rand = "0.8.5"
 rand_core = "0.9"
 rand_pcg = "0.9"
-bincode = "=2.0.1"
+#bincode = { version = "=2.0.1", features = ["serde"] }
+bincode = { version = "=1.3.3" }
 serde_cbor = { version = "0.11.2" }
 auto_impl = "1"
 strum = "0.27"
@@ -82,7 +84,7 @@ futures-util = "0.3.28"
 maybe-async = { version = "0.2", default-features = false }
 
 async-nats = "0.43.1"
-
+speedy = "0.8.7"
 
 parth_core = { path = "./parth_core" }
 

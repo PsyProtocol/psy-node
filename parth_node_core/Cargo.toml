@@ -38,7 +38,7 @@ redis = { workspace = true }
 bb8-redis = { workspace = true }
 bb8 = { workspace = true }
 rsmq = { workspace = true }
-
+pser = { path = "../pser" }
 
 [dev-dependencies]
 criterion = { workspace = true }

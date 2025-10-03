@@ -531,7 +531,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
         let res = self.session.execute_unpaged(&single_prepared.select_value_1_prepared, (u64_to_i64_exact(obj_id), convert_checkpoint_id_to_i64(max_checkpoint_id))).await?;
         let rows = res.into_rows_result()?;
         match rows.maybe_first_row::<(Vec<u8>,)>()? {
-            Some(row) => match bincode::deserialize::<V>(&row.0) {
+            Some(row) => match pser::deserialize::<V>(&row.0) {
                 Ok(value) => Ok(Some(value)),
                 Err(e) => {
                     tracing::error!("Deserialization error for latest object ID with {} in table {}.{}: {:?}", obj_id, single_prepared.keyspace, single_prepared.table_name, e);
@@ -551,7 +551,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
         let rows = res.into_rows_result()?;
         match rows.maybe_first_row::<(i64, i64, Vec<u8>)>()? {
 
-            Some(row) => match bincode::deserialize::<V>(&row.2) {
+            Some(row) => match pser::deserialize::<V>(&row.2) {
                 Ok(value) => 
                     Ok(Some(QDatabaseSingleIdTableRow {
                     value,
@@ -575,7 +575,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
         let res = self.session.execute_unpaged(&single_prepared.select_value_checkpoint_id_obj_id_1_prepared, (u64_to_i64_exact(obj_id), convert_checkpoint_id_to_i64(max_checkpoint_id))).await?;
         let rows = res.into_rows_result()?;
         match rows.maybe_first_row::<(i64, i64, Vec<u8>)>()? {
-            Some(row) => match bincode::deserialize::<V>(&row.2) {
+            Some(row) => match pser::deserialize::<V>(&row.2) {
                 Ok(value) => Ok(Some(R::create_from_single_row(i64_to_u64_exact(row.0), convert_i64_to_checkpoint_id(row.1), value))),
                 Err(e) => {
                     tracing::error!("Deserialization error for object ID {} at checkpoint_id={} in {}.{}: {:?}", obj_id, convert_i64_to_checkpoint_id(row.1), single_prepared.keyspace, single_prepared.table_name, e);
@@ -603,7 +603,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
             results.push(QDatabaseSingleIdTableRow {
                 obj_id: i64_to_u64_exact(obj_id),
                 checkpoint_id: convert_i64_to_checkpoint_id(checkpoint_id),
-                value: match bincode::deserialize(&value){
+                value: match pser::deserialize(&value){
                     Ok(value) => value,
                     Err(e) => {
                         tracing::error!("Deserialization error for object ID {} at checkpoint_id={} in {}.{}: {:?}", obj_id, convert_i64_to_checkpoint_id(checkpoint_id), single_prepared.keyspace, single_prepared.table_name, e);
@@ -643,7 +643,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
             let values: Vec<_> = chunk
                 .iter()
                 .map(|n| {
-                    Ok((u64_to_i64_exact(n.obj_id), convert_checkpoint_id_to_i64(n.checkpoint_id), bincode::serialize(&n.value)?))
+                    Ok((u64_to_i64_exact(n.obj_id), convert_checkpoint_id_to_i64(n.checkpoint_id), pser::serialize(&n.value)?))
                 })
                 .collect::<anyhow::Result<_>>()?;
             batch_list.push(batch);
@@ -673,7 +673,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
             let values: Vec<_> = chunk
                 .iter()
                 .map(|n| {
-                    Ok((u64_to_i64_exact(n.get_row_obj_id()), convert_checkpoint_id_to_i64(n.get_row_checkpoint_id()), bincode::serialize(&n.get_row_value_ref())?))
+                    Ok((u64_to_i64_exact(n.get_row_obj_id()), convert_checkpoint_id_to_i64(n.get_row_checkpoint_id()), pser::serialize(&n.get_row_value_ref())?))
                 })
                 .collect::<anyhow::Result<_>>()?;
             batch_list.push(batch);
@@ -703,7 +703,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
             let values: Vec<_> = chunk
                 .iter()
                 .map(|n| {
-                    Ok((u64_to_i64_exact(n.obj_id), convert_checkpoint_id_to_i64(checkpoint_id), bincode::serialize(&n.value)?))
+                    Ok((u64_to_i64_exact(n.obj_id), convert_checkpoint_id_to_i64(checkpoint_id), pser::serialize(&n.value)?))
                 })
                 .collect::<anyhow::Result<_>>()?;
             batch_list.push(batch);
@@ -733,7 +733,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
             let values: Vec<_> = chunk
                 .iter()
                 .map(|n| {
-                    Ok((u64_to_i64_exact(n.get_row_obj_id()), convert_checkpoint_id_to_i64(checkpoint_id), bincode::serialize(&n.get_row_value_ref())?))
+                    Ok((u64_to_i64_exact(n.get_row_obj_id()), convert_checkpoint_id_to_i64(checkpoint_id), pser::serialize(&n.get_row_value_ref())?))
                 })
                 .collect::<anyhow::Result<_>>()?;
             batch_list.push(batch);
@@ -765,7 +765,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
                         let res = session.execute_unpaged(&prep, (*key, max_cp_i64)).await?;
                         let rows = res.into_rows_result()?;
                         if let Some(row) = rows.maybe_first_row::<(Vec<u8>,)>()? {
-                            match bincode::deserialize::<V>(&row.0) {
+                            match pser::deserialize::<V>(&row.0) {
                                 Ok(value) => core::result::Result::<_, anyhow::Error>::Ok(Some(value)),
                                 Err(e) => {
                                     tracing::error!("Deserialization error for object ID {} with max_checkpoint_id={} in {}.{}: {:?}", i64_to_u64_exact(*key), max_checkpoint_id, single_prepared.keyspace, single_prepared.table_name, e);
@@ -805,7 +805,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
                         let res = session.execute_unpaged(&prep, (*key, max_cp_i64)).await?;
                         let rows = res.into_rows_result()?;
                         if let Some(row) = rows.maybe_first_row::<(i64, i64, Vec<u8>)>()? {
-                            match bincode::deserialize::<V>(&row.2) {
+                            match pser::deserialize::<V>(&row.2) {
                                 Ok(value) => core::result::Result::<_, anyhow::Error>::Ok(Some(R::create_from_single_row(i64_to_u64_exact(row.0), convert_i64_to_checkpoint_id(row.1), value))),
                                 Err(e) => {
                                     tracing::error!("Deserialization error for object ID {} at checkpoint_id={} in {}.{}: {:?}", i64_to_u64_exact(*key), convert_i64_to_checkpoint_id(row.1), single_prepared.keyspace, single_prepared.table_name, e);
@@ -846,7 +846,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
         let res = self.session.execute_unpaged(&double_prepared.select_value_1_prepared, (u64_to_i64_exact(obj_id), u64_to_i64_exact(secondary_id), convert_checkpoint_id_to_i64(max_checkpoint_id))).await?;
         let rows = res.into_rows_result()?;
         match rows.maybe_first_row::<(Vec<u8>,)>()? {
-            Some(row) => match bincode::deserialize::<V>(&row.0) {
+            Some(row) => match pser::deserialize::<V>(&row.0) {
                 Ok(value) => Ok(Some(value)),
                 Err(e) => {
                     tracing::error!("Deserialization error for latest object ID with ({}, {}) in table {}.{}: {:?}", obj_id, secondary_id, double_prepared.keyspace, double_prepared.table_name, e);
@@ -866,7 +866,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
         let res = self.session.execute_unpaged(&double_prepared.select_value_checkpoint_id_obj_ids_1_prepared, (u64_to_i64_exact(obj_id), u64_to_i64_exact(secondary_id), convert_checkpoint_id_to_i64(max_checkpoint_id))).await?;
         let rows = res.into_rows_result()?;
         match rows.maybe_first_row::<(i64, i64, i64, Vec<u8>)>()? {
-            Some(row) => match bincode::deserialize::<V>(&row.3) {
+            Some(row) => match pser::deserialize::<V>(&row.3) {
                 Ok(value) => Ok(Some(QDatabaseDoubleIdTableRow {
                     value,
                     obj_id: i64_to_u64_exact(row.0),
@@ -897,7 +897,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
                 obj_id: i64_to_u64_exact(obj_id),
                 secondary_id: i64_to_u64_exact(secondary_id),
                 checkpoint_id: convert_i64_to_checkpoint_id(checkpoint_id),
-                value: match bincode::deserialize(&value){
+                value: match pser::deserialize(&value){
                     Ok(value) => value,
                     Err(e) => {
                         tracing::error!("Deserialization error for object ID ({}, {}) at checkpoint_id={} in {}.{}: {:?}", obj_id, secondary_id, convert_i64_to_checkpoint_id(checkpoint_id), double_prepared.keyspace, double_prepared.table_name, e);
@@ -918,7 +918,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
         checkpoint_id: u64, 
         value: &V
     ) -> anyhow::Result<()> {
-        let value_bytes = bincode::serialize(value)?;
+        let value_bytes = pser::serialize(value)?;
         self.session.execute_unpaged(&double_prepared.insert_1_prepared, (u64_to_i64_exact(obj_id), u64_to_i64_exact(secondary_id), u64_to_i64_exact(checkpoint_id), &value_bytes)).await?;
         Ok(())
     }
@@ -937,7 +937,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
             let values: Vec<_> = chunk
                 .iter()
                 .map(|n| {
-                    Ok((u64_to_i64_exact(n.obj_id), u64_to_i64_exact(n.secondary_id), convert_checkpoint_id_to_i64(n.checkpoint_id), bincode::serialize(&n.value)?))
+                    Ok((u64_to_i64_exact(n.obj_id), u64_to_i64_exact(n.secondary_id), convert_checkpoint_id_to_i64(n.checkpoint_id), pser::serialize(&n.value)?))
                 })
                 .collect::<anyhow::Result<_>>()?;
             batch_list.push(batch);
@@ -966,7 +966,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
             let values: Vec<_> = chunk
                 .iter()
                 .map(|n| {
-                    Ok((u64_to_i64_exact(n.get_row_obj_id()), u64_to_i64_exact(n.get_row_secondary_id()), convert_checkpoint_id_to_i64(n.get_row_checkpoint_id()), bincode::serialize(&n.get_row_value_ref())?))
+                    Ok((u64_to_i64_exact(n.get_row_obj_id()), u64_to_i64_exact(n.get_row_secondary_id()), convert_checkpoint_id_to_i64(n.get_row_checkpoint_id()), pser::serialize(&n.get_row_value_ref())?))
                 })
                 .collect::<anyhow::Result<_>>()?;
             batch_list.push(batch);
@@ -995,7 +995,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
             let values: Vec<_> = chunk
                 .iter()
                 .map(|n| {
-                    Ok((u64_to_i64_exact(n.obj_id), u64_to_i64_exact(n.secondary_id), convert_checkpoint_id_to_i64(checkpoint_id), bincode::serialize(&n.value)?))
+                    Ok((u64_to_i64_exact(n.obj_id), u64_to_i64_exact(n.secondary_id), convert_checkpoint_id_to_i64(checkpoint_id), pser::serialize(&n.value)?))
                 })
                 .collect::<anyhow::Result<_>>()?;
             batch_list.push(batch);
@@ -1024,7 +1024,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
             let values: Vec<_> = chunk
                 .iter()
                 .map(|n| {
-                    Ok((u64_to_i64_exact(n.get_row_obj_id()), u64_to_i64_exact(n.get_row_secondary_id()), convert_checkpoint_id_to_i64(checkpoint_id), bincode::serialize(&n.get_row_value_ref())?))
+                    Ok((u64_to_i64_exact(n.get_row_obj_id()), u64_to_i64_exact(n.get_row_secondary_id()), convert_checkpoint_id_to_i64(checkpoint_id), pser::serialize(&n.get_row_value_ref())?))
                 })
                 .collect::<anyhow::Result<_>>()?;
             batch_list.push(batch);
@@ -1055,7 +1055,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
                         let res = session.execute_unpaged(&prep, (u64_to_i64_exact(key.obj_id), u64_to_i64_exact(key.secondary_id), max_cp_i64)).await?;
                         let rows = res.into_rows_result()?;
                         if let Some(row) = rows.maybe_first_row::<(Vec<u8>,)>()? {
-                            match bincode::deserialize::<V>(&row.0) {
+                            match pser::deserialize::<V>(&row.0) {
                                 Ok(value) => core::result::Result::<_, anyhow::Error>::Ok(Some(value)),
                                 Err(e) => {
                                     tracing::error!("Deserialization error for object ID ({},{}) with max_checkpoint_id={} in {}.{}: {:?}", key.obj_id, key.secondary_id, convert_i64_to_checkpoint_id(max_cp_i64), double_prepared.keyspace, double_prepared.table_name, e);
@@ -1094,7 +1094,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
                         let res = session.execute_unpaged(&prep, (u64_to_i64_exact(key.obj_id), u64_to_i64_exact(key.secondary_id), max_cp_i64)).await?;
                         let rows = res.into_rows_result()?;
                         if let Some(row) = rows.maybe_first_row::<(i64, i64, i64, Vec<u8>)>()? {
-                            match bincode::deserialize::<V>(&row.3) {
+                            match pser::deserialize::<V>(&row.3) {
                                 Ok(value) => core::result::Result::<_, anyhow::Error>::Ok(Some(R::create_from_double_row(i64_to_u64_exact(row.0), i64_to_u64_exact(row.1), convert_i64_to_checkpoint_id(row.2), value))),
                                 Err(e) => {
                                     tracing::error!("Deserialization error for object ID ({},{}) at checkpoint_id={} in {}.{}: {:?}", key.obj_id, key.secondary_id, convert_i64_to_checkpoint_id(row.2), double_prepared.keyspace, double_prepared.table_name, e);
@@ -1136,7 +1136,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
         let res = self.session.execute_unpaged(&single_prepared.select_value_1_prepared, (u64_to_i64_exact(obj_id),)).await?;
         let rows = res.into_rows_result()?;
         match rows.maybe_first_row::<(Vec<u8>,)>()? {
-            Some(row) => match bincode::deserialize::<V>(&row.0) {
+            Some(row) => match pser::deserialize::<V>(&row.0) {
                 Ok(value) => Ok(Some(value)),
                 Err(e) => {
                     tracing::error!("Deserialization error for latest object ID with {} in table {}.{}: {:?}", obj_id, single_prepared.keyspace, single_prepared.table_name, e);
@@ -1155,7 +1155,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
         let rows = res.into_rows_result()?;
         match rows.maybe_first_row::<(i64, Vec<u8>)>()? {
 
-            Some(row) => match bincode::deserialize::<V>(&row.1) {
+            Some(row) => match pser::deserialize::<V>(&row.1) {
                 Ok(value) => 
                     Ok(Some(QDatabaseKeyIdValueTableRow {
                     value,
@@ -1177,7 +1177,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
         let res = self.session.execute_unpaged(&single_prepared.select_value_obj_id_1_prepared, (u64_to_i64_exact(obj_id),)).await?;
         let rows = res.into_rows_result()?;
         match rows.maybe_first_row::<(i64, Vec<u8>)>()? {
-            Some(row) => match bincode::deserialize::<V>(&row.1) {
+            Some(row) => match pser::deserialize::<V>(&row.1) {
                 Ok(value) => Ok(Some(R::create_from_key_id_value_row(i64_to_u64_exact(row.0), value))),
                 Err(e) => {
                     tracing::error!("Deserialization error for object ID {} in {}.{}: {:?}", obj_id, single_prepared.keyspace, single_prepared.table_name, e);
@@ -1204,7 +1204,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
             let (obj_id, value): (i64, Vec<u8>) = row?;
             results.push(QDatabaseKeyIdValueTableRow {
                 obj_id: i64_to_u64_exact(obj_id),
-                value: match bincode::deserialize(&value){
+                value: match pser::deserialize(&value){
                     Ok(value) => value,
                     Err(e) => {
                         tracing::error!("Deserialization error for object ID {} in {}.{}: {:?}", obj_id, single_prepared.keyspace, single_prepared.table_name, e);
@@ -1223,7 +1223,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
         obj_id: u64, 
         value: &V
     ) -> anyhow::Result<()> {
-        let value_bytes = bincode::serialize(value)?;
+        let value_bytes = pser::serialize(value)?;
         self.session.execute_unpaged(&single_prepared.insert_1_prepared, (u64_to_i64_exact(obj_id), &value_bytes)).await?;
         Ok(())
     }
@@ -1243,7 +1243,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
             let values: Vec<_> = chunk
                 .iter()
                 .map(|n| {
-                    Ok((u64_to_i64_exact(n.get_row_obj_id()),  bincode::serialize(&n.get_row_value_ref())?))
+                    Ok((u64_to_i64_exact(n.get_row_obj_id()),  pser::serialize(&n.get_row_value_ref())?))
                 })
                 .collect::<anyhow::Result<_>>()?;
             batch_list.push(batch);
@@ -1271,7 +1271,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
             let values: Vec<_> = chunk
                 .iter()
                 .map(|n| {
-                    Ok((u64_to_i64_exact(n.obj_id), bincode::serialize(&n.value)?))
+                    Ok((u64_to_i64_exact(n.obj_id), pser::serialize(&n.value)?))
                 })
                 .collect::<anyhow::Result<_>>()?;
             batch_list.push(batch);
@@ -1299,7 +1299,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
             let values: Vec<_> = chunk
                 .iter()
                 .map(|n| {
-                    Ok((u64_to_i64_exact(n.get_row_obj_id()), bincode::serialize(&n.get_row_value_ref())?))
+                    Ok((u64_to_i64_exact(n.get_row_obj_id()), pser::serialize(&n.get_row_value_ref())?))
                 })
                 .collect::<anyhow::Result<_>>()?;
             batch_list.push(batch);
@@ -1329,7 +1329,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
                         let res = session.execute_unpaged(&prep, (*key,)).await?;
                         let rows = res.into_rows_result()?;
                         if let Some(row) = rows.maybe_first_row::<(Vec<u8>,)>()? {
-                            match bincode::deserialize::<V>(&row.0) {
+                            match pser::deserialize::<V>(&row.0) {
                                 Ok(value) => core::result::Result::<_, anyhow::Error>::Ok(Some(value)),
                                 Err(e) => {
                                     tracing::error!("Deserialization error for object ID {} in {}.{}: {:?}", i64_to_u64_exact(*key), single_prepared.keyspace, single_prepared.table_name, e);
@@ -1367,7 +1367,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
                         let res = session.execute_unpaged(&prep, (*key,)).await?;
                         let rows = res.into_rows_result()?;
                         if let Some(row) = rows.maybe_first_row::<(i64, Vec<u8>)>()? {
-                            match bincode::deserialize::<V>(&row.1) {
+                            match pser::deserialize::<V>(&row.1) {
                                 Ok(value) => core::result::Result::<_, anyhow::Error>::Ok(Some(R::create_from_key_id_value_row(i64_to_u64_exact(row.0), value))),
                                 Err(e) => {
                                     tracing::error!("Deserialization error for object ID {} in {}.{}: {:?}", i64_to_u64_exact(*key), single_prepared.keyspace, single_prepared.table_name, e);

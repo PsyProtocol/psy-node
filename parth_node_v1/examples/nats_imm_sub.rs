@@ -16,24 +16,31 @@ async fn main() -> anyhow::Result<()> {
         5000
     ).await?;
 
+    let start_time = std::time::Instant::now();
+
     let total_jobs_to_proc = 5000;
     let mut got_jobs = 0;
-    let mut jobs_vec = Vec::new();
     while got_jobs < total_jobs_to_proc {
         let result = client.get_message_if_exists(realm_id, realm_sub_id, ex_queue_type, unique_topic, task_group).await?;
         if let Some(job) = result {
-            jobs_vec.push(job);
+            
+        //println!("report_message_completed for job: {}", hex::encode(job));
+        client.report_message_completed(realm_id, realm_sub_id, ex_queue_type, unique_topic, task_group, job).await?;
             got_jobs += 1;
-            println!("Got job {}", hex::encode(&job));
+            //println!("Got job {}", hex::encode(&job));
         } else {
             println!("No more jobs available, waiting a bit...");
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
     }
+    let end_time = std::time::Instant::now();
+    let duration = end_time.duration_since(start_time);
+    println!("Time taken to process {} jobs: {:?}, {} jobs per second", got_jobs, duration, got_jobs as f64 / duration.as_secs_f64());
+    /* 
     for job in jobs_vec.iter() {
         println!("report_message_completed for job: {}", hex::encode(job));
         client.report_message_completed(realm_id, realm_sub_id, ex_queue_type, unique_topic, task_group, *job).await?;
-    }
+    }*/
 
 
     println!("Processed {} jobs", got_jobs);

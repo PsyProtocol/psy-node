@@ -39,18 +39,20 @@ bb8-redis = { workspace = true }
 bb8 = { workspace = true }
 rsmq = { workspace = true }
 postcard = { workspace = true }
+bytes = { workspace = true }
+pser = { path = "../pser" }
 
 [dev-dependencies]
 criterion = { workspace = true }
 
 
-[[bench]]
-name = "obj_operations"
-harness = false
+#[[bench]]
+#name = "obj_operations"
+#harness = false
 
-[[bench]]
-name = "large_ops"
-harness = false
+#[[bench]]
+#name = "large_ops"
+#harness = false
 
 [[bench]]
 name = "object_ops"

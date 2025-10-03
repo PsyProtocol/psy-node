@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use async_trait::async_trait;
 use crate::data::{hash::hash256::Hash256, serializable::{QPDSerializable, QPDSerializableFixed}};
+use pser::{QBytesSerialize, QBytesDeserialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Copy)]
 pub struct QJobManagerConfig {
@@ -13,11 +14,11 @@ pub struct QJobManagerConfig {
 
 impl QPDSerializable for QJobManagerConfig {
     fn to_bytes(&self) -> anyhow::Result<Vec<u8>> {
-        bincode::serialize(self).map_err(|e| anyhow::anyhow!(e))
+        self.to_qbytes()
     }
 
     fn from_bytes(bytes: &[u8]) -> anyhow::Result<Self> {
-        bincode::deserialize(bytes).map_err(|e| anyhow::anyhow!(e))
+        Self::from_qbytes(bytes)
     }
 }
 

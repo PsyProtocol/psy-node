@@ -1,4 +1,5 @@
 use std::{num::NonZeroUsize, time::Duration};
+use pser::{QBytesSerialize, QBytesDeserialize};
 
 use auto_impl::auto_impl;
 use bb8::Pool;
@@ -448,7 +449,7 @@ impl<Hash: QHashBase> GenericTagTreeTempStoreWriter<Hash> for ProofStoreRedisAsy
         let ns_key = self.temporary_tag_tree_queue_key(tree_id, unique_checkpoint_id, partition);
         let mut con = self.pool.get().await?;
         // push to array
-        let _: () = con.rpush(&ns_key, bincode::serialize(&node)?).await?;
+        let _: () = con.rpush(&ns_key, node.to_qbytes()?).await?;
         Ok(())
     }
 }
@@ -462,7 +463,7 @@ impl<Hash: QHashBase> GenericTagTreeTempStoreDumper<Hash> for ProofStoreRedisAsy
             let data: Vec<Vec<u8>> = con.lrange(&ns_key, 0, -1).await?;
             let mut result = Vec::new();
             for d in data {
-                result.push(bincode::deserialize::<SimpleMerkleNode<TagTreeNodeStorage<Hash>>>(&d)?);
+                result.push(SimpleMerkleNode::<TagTreeNodeStorage<Hash>>::from_qbytes(&d)?);
             }
             let _: () = con.del(ns_key).await?;
             Ok(result)

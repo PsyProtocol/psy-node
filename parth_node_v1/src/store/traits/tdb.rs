@@ -141,7 +141,7 @@ pub trait QPTempQueueEmphemeralSubscriber {
     async fn pop_s_obj_from_emphemeral_queue_or_none<T: DeserializeOwned>(&self, queue_type: QPEphemeralQueueType, unique_id: u128) -> anyhow::Result<Option<T>> {
         let bytes = self.pop_bytes_from_emphemeral_queue_or_none(queue_type, unique_id).await?;
         match bytes {
-            Some(b) => Ok(Some(bincode::deserialize(&b)?)),
+            Some(b) => Ok(Some(pser::deserialize(&b)?)),
             None => Ok(None),
         }
     }
@@ -152,6 +152,6 @@ pub trait QPTempQueueEmphemeralSubscriber {
     }
     async fn wait_for_pop_s_obj_from_emphemeral_queue<T: DeserializeOwned>(&self, queue_type: QPEphemeralQueueType, unique_id: u128, timeout_ms: u64) -> anyhow::Result<T> {
         let bytes = self.wait_for_pop_bytes_from_emphemeral_queue(queue_type, unique_id, timeout_ms).await?;
-        Ok(bincode::deserialize(&bytes)?)
+        Ok(pser::deserialize(&bytes)?)
     }
 }

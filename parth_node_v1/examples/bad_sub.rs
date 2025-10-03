@@ -16,7 +16,7 @@ async fn main() -> anyhow::Result<()> {
         5000
     ).await?;
 
-    let total_jobs_to_proc = 5000;
+    let total_jobs_to_proc = 10;
     let mut got_jobs = 0;
     let mut jobs_vec = Vec::new();
     while got_jobs < total_jobs_to_proc {
@@ -30,12 +30,14 @@ async fn main() -> anyhow::Result<()> {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
     }
+    /*
     for job in jobs_vec.iter() {
         println!("report_message_completed for job: {}", hex::encode(job));
         client.report_message_completed(realm_id, realm_sub_id, ex_queue_type, unique_topic, task_group, *job).await?;
     }
+    */
+    
 
-
-    println!("Processed {} jobs", got_jobs);
+    println!("Processed {} jobs without ACKing", got_jobs);
     Ok(())
 }

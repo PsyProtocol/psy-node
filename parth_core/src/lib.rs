@@ -1,4 +1,3 @@
-pub mod qbytes;
 pub mod constants;
 pub mod crypto;
 pub mod data;
@@ -31,11 +30,13 @@ macro_rules! impl_qpq_serialize_bincode {
         $(
             impl QPDSerializable for $typ {
                 fn to_bytes(&self) -> anyhow::Result<Vec<u8>> {
-                    bincode::serialize(self).map_err(|e| anyhow::anyhow!(e))
+                    //b1incode::serialize(self).map_err(|e| anyhow::anyhow!(e))
+                    self.to_qbytes()
                 }
 
                 fn from_bytes(bytes: &[u8]) -> anyhow::Result<Self> {
-                    bincode::deserialize(bytes).map_err(|e| anyhow::anyhow!(e))
+                    //bi1ncode::deserialize(bytes).map_err(|e| anyhow::anyhow!(e))
+                    Self::from_qbytes(bytes)
                 }
             }
         )+

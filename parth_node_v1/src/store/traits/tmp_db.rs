@@ -1,5 +1,5 @@
 use parth_core::data::serializable::{QPDPair, QPDSerializable, QPDSerializableFixed};
-
+use pser::{QBytesDeserialize, QBytesSerialize};
 
 use async_trait::async_trait;
 use serde::{de::DeserializeOwned, Serialize};
@@ -112,7 +112,7 @@ pub trait QPTempQueueEmphemeralPublisher {
         self.push_bytes_to_ephemeral_queue(queue_type, unique_id, &value.to_bytes()?).await
     }
     async fn push_s_obj_to_ephemeral_queue<T: Serialize + Sync>(&self, queue_type: QPEphemeralQueueType, unique_id: u128, value: &T) -> anyhow::Result<()> {
-        self.push_bytes_to_ephemeral_queue(queue_type, unique_id, &bincode::serialize(value)?).await
+        self.push_bytes_to_ephemeral_queue(queue_type, unique_id, &pser::serialize(value)?).await
     }
     async fn push_many_bytes_to_ephemeral_queue(&self, queue_type: QPEphemeralQueueType, unique_id: u128, values: &[Vec<u8>]) -> anyhow::Result<()>;
     async fn push_many_objs_to_ephemeral_queue<T: QPDSerializable + Sync>(&self, queue_type: QPEphemeralQueueType, unique_id: u128, values: &[T]) -> anyhow::Result<()> {
@@ -120,7 +120,7 @@ pub trait QPTempQueueEmphemeralPublisher {
         self.push_many_bytes_to_ephemeral_queue(queue_type, unique_id, &value_bytes).await
     }
     async fn push_many_s_objs_to_ephemeral_queue<T: Serialize + Sync>(&self, queue_type: QPEphemeralQueueType, unique_id: u128, values: &[T]) -> anyhow::Result<()> {
-        let value_bytes: Vec<Vec<u8>> = values.iter().map(|v| bincode::serialize(v).unwrap()).collect();
+        let value_bytes: Vec<Vec<u8>> = values.iter().map(|v| pser::serialize(v).unwrap()).collect();
         self.push_many_bytes_to_ephemeral_queue(queue_type, unique_id, &value_bytes).await
     }
 }
@@ -135,7 +135,7 @@ pub trait QPTempQueueEmphemeralSubscriber {
     }
     async fn dump_entire_ephemeral_queue_as_s_objs<T: DeserializeOwned>(&self, queue_type: QPEphemeralQueueType, unique_id: u128) -> anyhow::Result<Vec<T>> {
         let bytes = self.dump_entire_ephemeral_queue(queue_type, unique_id).await?;
-        bytes.into_iter().map(|b| bincode::deserialize(&b).map_err(|e| anyhow::anyhow!(e))).collect()
+        bytes.into_iter().map(|b| pser::deserialize(&b).map_err(|e| anyhow::anyhow!(e))).collect()
     }
     async fn pop_bytes_from_emphemeral_queue_or_none(&self, queue_type: QPEphemeralQueueType, unique_id: u128) -> anyhow::Result<Option<Vec<u8>>>;
     async fn pop_obj_from_emphemeral_queue_or_none<T: QPDSerializable>(&self, queue_type: QPEphemeralQueueType, unique_id: u128) -> anyhow::Result<Option<T>> {
@@ -148,7 +148,7 @@ pub trait QPTempQueueEmphemeralSubscriber {
     async fn pop_s_obj_from_emphemeral_queue_or_none<T: DeserializeOwned>(&self, queue_type: QPEphemeralQueueType, unique_id: u128) -> anyhow::Result<Option<T>> {
         let bytes = self.pop_bytes_from_emphemeral_queue_or_none(queue_type, unique_id).await?;
         match bytes {
-            Some(b) => Ok(Some(bincode::deserialize(&b)?)),
+            Some(b) => Ok(Some(pser::deserialize(&b)?)),
             None => Ok(None),
         }
     }
@@ -159,6 +159,6 @@ pub trait QPTempQueueEmphemeralSubscriber {
     }
     async fn wait_for_pop_s_obj_from_emphemeral_queue<T: DeserializeOwned>(&self, queue_type: QPEphemeralQueueType, unique_id: u128, timeout_ms: u64) -> anyhow::Result<T> {
         let bytes = self.wait_for_pop_bytes_from_emphemeral_queue(queue_type, unique_id, timeout_ms).await?;
-        Ok(bincode::deserialize(&bytes)?)
+        Ok(pser::deserialize(&bytes)?)
     }
 }

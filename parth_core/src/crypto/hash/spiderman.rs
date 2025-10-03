@@ -2,6 +2,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::{crypto::hash::{merkle_proof::{DeltaMerkleProofCore, MerkleProofCore}, traits::{MerkleHasher, ZeroableHash}}, data::serializable::QPDSerializable, utils::math::{log2_ceil, log2_strict}};
 use crate::crypto::hash::traits::MerkleLeafHasher;
+use pser::{QBytesSerialize, QBytesDeserialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub struct SpidermanUpdateProof<Hash: PartialEq + Copy> {
@@ -126,10 +127,12 @@ impl<Hash: PartialEq + Copy> SpidermanUpdateProof<Hash> {
 
 impl<Hash: PartialEq + Copy + Serialize + DeserializeOwned> QPDSerializable for SpidermanUpdateProof<Hash> {
     fn to_bytes(&self) -> anyhow::Result<Vec<u8>> {
-        bincode::serialize(self).map_err(|e| anyhow::anyhow!(e))
+        //b1incode::serialize(self).map_err(|e| anyhow::anyhow!(e))
+        self.to_qbytes()
     }
 
     fn from_bytes(bytes: &[u8]) -> anyhow::Result<Self> {
-        bincode::deserialize(bytes).map_err(|e| anyhow::anyhow!(e))
+        //b1incode::deserialize(bytes).map_err(|e| anyhow::anyhow!(e))
+        Self::from_qbytes(bytes)
     }
 }

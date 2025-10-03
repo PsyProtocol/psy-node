@@ -31,7 +31,7 @@ impl QPWorkerNodeCoreLogic {
             QJobTopic::ComputeCombinedRealmRootUpdateMerkleRoot => {
                 // Perform the computation to get the merkle root
 
-                let leaves: Vec<Hash256> = bincode::deserialize(&response.data)?;
+                let leaves: Vec<Hash256> = pser::deserialize(&response.data)?;
                 let computed_root = compute_partial_merkle_root_from_leaves::<Hash256, CoreSha256Hasher>(&leaves);
 
             

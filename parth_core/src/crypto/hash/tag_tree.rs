@@ -1,3 +1,4 @@
+use pser::{QBytesSerialize, QBytesDeserialize};
 use serde::{Deserialize, Serialize};
 
 use crate::{crypto::hash::traits::MerkleHasher, data::serializable::{QPDSerializable, QPDSerializableFixed}};
@@ -177,10 +178,10 @@ where
     for<'de2> Hash: Deserialize<'de2>,
 {
     fn to_bytes(&self) -> anyhow::Result<Vec<u8>> {
-        Ok(bincode::serialize(self)?)
+      self.to_qbytes()
     }
 
     fn from_bytes(bytes: &[u8]) -> anyhow::Result<Self> {
-        Ok(bincode::deserialize(bytes)?)
+        Self::from_qbytes(bytes)
     }
 }
