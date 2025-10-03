@@ -1,11 +1,14 @@
 use serde::{de::DeserializeOwned, Serialize};
 
-use crate::{crypto::hash::traits::{QHasher, ZeroableHash}, data::{hash::merkle_node_key::SimpleMerkleNodeKey, parth::public_preimage::{QParthProofPublicInputsPreimage, QParthProofPublicInputsPreimageWithoutRewardsHash}, serializable::{QPDSerializable, QPDSerializableFixed}}};
+use crate::{crypto::hash::traits::{QHasher, ZeroableHash}, data::{hash::merkle_node_key::SimpleMerkleNodeKey, parth::public_preimage::{QParthProofPublicInputsPreimage, QParthProofPublicInputsPreimageWithoutRewardsHash}, serializable::{QPDSerializable, QPDSerializableFixed}}, protocol::core_felt::QFelt64};
 
+pub trait QStorableBase: Serialize + DeserializeOwned + Send + Sync + Clone + PartialEq + Eq {}
+pub trait QStorableSizedBase: QStorableBase + Sized {}
+impl<T: Serialize + DeserializeOwned + Send + Sync + Clone + PartialEq + Eq> QStorableBase for T {}
+impl<T: QStorableBase + Sized> QStorableSizedBase for T {}
 
 pub trait QHashBase: PartialEq + ZeroableHash + Copy + Serialize + DeserializeOwned + QPDSerializable + QPDSerializableFixed + Sync + Send {}
 pub trait QProofBase: PartialEq + Clone + Serialize + DeserializeOwned + QPDSerializable {}
-
 
 pub trait QHasherBase<Hash: QHashBase, Proof: QProofBase>: QHasher<Hash> {
     fn get_proof_public_input(proof: &Proof) -> Hash; // the public inputs of the proof is a hash which is the hash of the QParthProofPublicInputsPreimage
@@ -48,6 +51,8 @@ pub trait QNetworkTypesConfigBase {
     type ZKProof: QProofBase;
     type HasherBase: QHasherBase<Self::QHash, Self::ZKProof>;
     type JobId: QJobIdBase;
+    type F: QFelt64;
+
     const GLOBAL_USER_TREE_HEIGHT: u8; // the height of the global user tree, ie. the full merkle tree that can hold all users
     const COORDINATOR_GLOBAL_USER_TREE_HEIGHT: u8; // the height of the global user tree stored in the coordinator (ie. the upper half of the merkle tree)
     const REALM_GLOBAL_USER_TREE_HEIGHT: u8; // the height of the global user tree stored in each realm (ie. the height of the sub-trees stored in each realm == GLOBAL_USER_TREE_HEIGHT - COORDINATOR_GLOBAL_USER_TREE_HEIGHT)

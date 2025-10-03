@@ -5,7 +5,8 @@ members = [
     "psy_core",
     "psy_node_core",
     "parth_node_core",
-    "parth_node_v1"
+    "parth_node_v1",
+    "parth_p2"
 ]
 resolver = "2"
 

@@ -30,3 +30,4 @@ hashbrown = { workspace = true }
 postcard = { workspace = true }
 rkyv = { workspace = true }
 pser = { path = "../pser" }
+speedy = { workspace = true }

@@ -1,6 +1,8 @@
 use crate::{protocol::core_types::QHashBase, utils::math::log2_ceil};
 
-
+pub trait RandomHash {
+    fn rand_hash() -> Self;
+}
 pub trait BasicDataHasher<Data, Hash: PartialEq> {
     fn hash_data(data: Data) -> Hash;
 }

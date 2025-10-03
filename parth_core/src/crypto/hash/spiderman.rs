@@ -4,7 +4,7 @@ use crate::{crypto::hash::{merkle_proof::{DeltaMerkleProofCore, MerkleProofCore}
 use crate::crypto::hash::traits::MerkleLeafHasher;
 use pser::{QBytesSerialize, QBytesDeserialize};
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Ord, PartialOrd, rkyv::Serialize, rkyv::Deserialize, rkyv::Archive, speedy::Readable, speedy::Writable)]
 pub struct SpidermanUpdateProof<Hash: PartialEq + Copy> {
     pub top_line_proof: DeltaMerkleProofCore<Hash>,
     pub web_proof_old_leaves: Vec<Hash>,

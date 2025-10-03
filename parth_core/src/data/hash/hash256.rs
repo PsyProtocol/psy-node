@@ -5,11 +5,11 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
-use crate::{crypto::hash::traits::{CodeSerializableHash, ZeroableHash}, data::serializable::{QPDSerializable, QPDSerializableFixed}, protocol::core_types::QHashBase};
+use crate::{crypto::hash::traits::{CodeSerializableHash, RandomHash, ZeroableHash}, data::serializable::{QPDSerializable, QPDSerializableFixed}, protocol::core_types::QHashBase};
 
 
 #[serde_as]
-#[derive(Serialize, Deserialize, PartialEq, Clone, Copy, Debug, Eq, Hash, PartialOrd, Ord)]
+#[derive(Serialize, Deserialize, PartialEq, Clone, Copy, Debug, Eq, Hash, PartialOrd, Ord, rkyv::Serialize, rkyv::Deserialize, rkyv::Archive, speedy::Readable, speedy::Writable)]
 pub struct Hash256(#[serde_as(as = "serde_with::hex::Hex")] pub [u8; 32]);
 impl Default for Hash256 {
     fn default() -> Self {
@@ -22,6 +22,11 @@ impl ZeroableHash for Hash256 {
     }
 }
 
+impl RandomHash for Hash256 {
+    fn rand_hash() -> Self {
+        Self::rand()
+    }
+}
 impl Hash256 {
     pub const ZERO: Self = Self([0u8; 32]);
     pub fn from_hex_string(s: &str) -> Result<Self, FromHexError> {
@@ -33,6 +38,52 @@ impl Hash256 {
     }
     pub fn to_hex_string(&self) -> String {
         hex::encode(&self.0)
+    }
+
+    pub fn to_le_u64_x4(&self) -> [u64; 4] {
+        [
+            u64::from_le_bytes([
+                self.0[0],
+                self.0[1],
+                self.0[2],
+                self.0[3],
+                self.0[4],
+                self.0[5],
+                self.0[6],
+                self.0[7],
+            ]),
+            u64::from_le_bytes([
+                self.0[8],
+                self.0[9],
+                self.0[10],
+                self.0[11],
+                self.0[12],
+                self.0[13],
+                self.0[14],
+                self.0[15],
+            ]),
+            u64::from_le_bytes([
+                self.0[16],
+                self.0[17],
+                self.0[18],
+                self.0[19],
+                self.0[20],
+                self.0[21],
+                self.0[22],
+                self.0[23],
+            ]),
+            u64::from_le_bytes([
+                self.0[24],
+                self.0[25],
+                self.0[26],
+                self.0[27],
+                self.0[28],
+                self.0[29],
+                self.0[30],
+                self.0[31],
+            ]),
+
+        ]
     }
     pub fn rand() -> Self {
         let mut bytes = [0u8; 32];

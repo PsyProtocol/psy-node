@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::data::serializable::{QPDSerializable, QPDSerializableFixed};
 
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Ord)]
+#[derive(Serialize, Deserialize, PartialEq, Clone, Copy, Debug, Eq, Hash, Ord, rkyv::Serialize, rkyv::Deserialize, rkyv::Archive, speedy::Readable, speedy::Writable)]
 pub struct SimpleMerkleNodeKey {
     pub level: u8,
     pub index: u64,
@@ -195,7 +195,7 @@ impl QPDSerializableFixed for SimpleMerkleNodeKey {
         9
     }
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Ord)]
+#[derive(Serialize, Deserialize, PartialEq, Clone, Copy, Debug, Eq, Hash, Ord, rkyv::Serialize, rkyv::Deserialize, rkyv::Archive, speedy::Readable, speedy::Writable)]
 pub struct SimpleMerkleNode<Hash> {
     pub key: SimpleMerkleNodeKey,
     pub value: Hash,
@@ -227,7 +227,7 @@ impl<Hash: PartialOrd> PartialOrd for SimpleMerkleNode<Hash> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, PartialEq, Clone, Copy, Debug, Eq, Hash, rkyv::Serialize, rkyv::Deserialize, rkyv::Archive, speedy::Readable, speedy::Writable)]
 pub struct SimpleMerkleNodeNCAAggregation {
     pub nca: SimpleMerkleNodeKey,
     pub left: SimpleMerkleNodeKey,

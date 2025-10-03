@@ -175,7 +175,7 @@ pub fn calc_merkle_root_from_leaves<Hash: PartialEq + Copy, Hasher: MerkleHasher
 
 
 // Start Merkle Proof
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Ord, PartialOrd)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Ord, PartialOrd, rkyv::Serialize, rkyv::Deserialize, rkyv::Archive, speedy::Readable, speedy::Writable)]
 pub struct MerkleProofCore<Hash: PartialEq + Copy> {
     pub root: Hash,
     pub value: Hash,
@@ -249,7 +249,7 @@ where
 
 // Start Delta Merkle Proof
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Ord, PartialOrd, rkyv::Serialize, rkyv::Deserialize, rkyv::Archive, speedy::Readable, speedy::Writable)]
 pub struct DeltaMerkleProofCore<Hash: PartialEq + Copy> {
     pub old_root: Hash,
     pub old_value: Hash,
@@ -378,7 +378,7 @@ where
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Ord, PartialOrd, rkyv::Serialize, rkyv::Deserialize, rkyv::Archive, speedy::Readable, speedy::Writable)]
 pub struct DeltaMerkleProofCorePartial<Hash: PartialEq + Copy> {
     pub old_value: Hash,
     pub new_value: Hash,
