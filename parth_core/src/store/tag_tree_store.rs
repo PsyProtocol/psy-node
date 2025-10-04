@@ -1,29 +1,6 @@
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 
-use crate::{crypto::hash::tag_tree::TagTreeNodeStorage, data::hash::{merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}, tag_tree_node_key::TagTreeNodeKey}, protocol::core_types::QHashBase};
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Copy)]
-pub struct SerializableTagTreeTableKey {
-    pub tag_tree_id: u32,
-}
-impl SerializableTagTreeTableKey {
-    pub fn new(tag_tree_id: u32) -> Self {
-        Self { tag_tree_id }
-    }
-    pub fn get_tag_tree_node_key(&self, level: u8, index: u64) -> TagTreeNodeKey {
-        TagTreeNodeKey {
-            tag_tree_id: self.tag_tree_id,
-            key: SimpleMerkleNodeKey { level, index }
-        }
-    }
-    pub fn get_node_key_from_merkle_key(&self, node_key: SimpleMerkleNodeKey) -> TagTreeNodeKey {
-        TagTreeNodeKey {
-            tag_tree_id: self.tag_tree_id,
-            key: node_key,
-        }
-    }
-}
+use crate::{crypto::hash::tag_tree::TagTreeNodeStorage, data::hash::merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}, protocol::core_types::QHashBase};
 
 #[async_trait]
 pub trait GenericTagTreeStoreReader<Hash: QHashBase> {

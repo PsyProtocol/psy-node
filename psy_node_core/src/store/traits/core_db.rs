@@ -1,12 +1,30 @@
+use std::hash::Hash;
+
 use async_trait::async_trait;
-use parth_core::{crypto::hash::traits::MerkleZeroHasher, data::{db::row::{QDatabaseDoubleIdTableRow, QDatabaseDoubleIdTableRowCreatable, QDatabaseDoubleIdTableRowLike, QDatabaseDoubleIdTableRowNoCheckpointId, QDatabaseDoubleIdTableRowNoCheckpointIdLike, QDatabaseKeyIdValueTableRow, QDatabaseKeyIdValueTableRowCreatable, QDatabaseKeyIdValueTableRowLike, QDatabaseSingleIdTableRow, QDatabaseSingleIdTableRowCreatable, QDatabaseSingleIdTableRowLike, QDatabaseSingleIdTableRowNoCheckpointId, QDatabaseSingleIdTableRowNoCheckpointIdLike, QDoubleIdKey}, hash::merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}}, protocol::core_types::QHashBase};
+use parth_core::{crypto::hash::traits::MerkleZeroHasher, data::{db::row::{QDatabaseDoubleIdTableRow, QDatabaseDoubleIdTableRowCreatable, QDatabaseDoubleIdTableRowLike, QDatabaseDoubleIdTableRowNoCheckpointId, QDatabaseDoubleIdTableRowNoCheckpointIdLike, QDatabaseKeyIdValueTableRow, QDatabaseKeyIdValueTableRowCreatable, QDatabaseKeyIdValueTableRowLike, QDatabaseSingleIdTableRow, QDatabaseSingleIdTableRowCreatable, QDatabaseSingleIdTableRowLike, QDatabaseSingleIdTableRowNoCheckpointId, QDatabaseSingleIdTableRowNoCheckpointIdLike, QDoubleIdKey}, hash::merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}, serializable::{QPDSerializable, QPDSerializableFixed}}, protocol::core_types::QHashBase};
 use serde::{de::DeserializeOwned, Serialize};
 
-pub trait CoreDatabaseValueDeserialize: DeserializeOwned + Send + Sync + Serialize {
 
+
+#[async_trait]
+pub trait CoreDatabaseBidirectionalMappingCheckpointedReader<TableIdentifier: Clone + Send + Sync, K1: BiDirectionalMappingKey, K2: BiDirectionalMappingKey> {
+    async fn db_select_one_by_k1<V: CoreDatabaseValueDeserialize>(&self, table: &TableIdentifier, k1: &K1) -> anyhow::Result<Option<K2>>;
+    async fn db_select_one_by_k2<V: CoreDatabaseValueDeserialize>(&self, table: &TableIdentifier, k2: &K2) -> anyhow::Result<Option<K1>>;
+
+    async fn db_select_one_single_checkpointed_object_value_and_ids<V: CoreDatabaseValueDeserialize>(&self, table: &TableIdentifier, obj_id: u64, max_checkpoint_id: u64) -> anyhow::Result<Option<QDatabaseSingleIdTableRow<V>>>;
+    async fn db_select_one_single_checkpointed_object_value_and_ids_t<V: CoreDatabaseValueDeserialize, R: QDatabaseSingleIdTableRowCreatable<V> + Send + Sync>(&self, table: &TableIdentifier, obj_id: u64, max_checkpoint_id: u64) -> anyhow::Result<Option<R>>;
+    async fn db_select_all_single_checkpointed_object<V: CoreDatabaseValueDeserialize>(&self, table: &TableIdentifier) -> anyhow::Result<Vec<QDatabaseSingleIdTableRow<V>>>;
+    async fn db_select_many_single_checkpointed_object_values<V: CoreDatabaseValueDeserialize>(&self, table: &TableIdentifier, obj_ids: &[u64], max_checkpoint_id: u64) -> anyhow::Result<Vec<Option<V>>>;
+    async fn db_select_many_single_checkpointed_object_keys_and_values<V: CoreDatabaseValueDeserialize, R: QDatabaseSingleIdTableRowCreatable<V> + Send + Sync>(&self, table: &TableIdentifier, obj_ids: &[u64], max_checkpoint_id: u64) -> anyhow::Result<Vec<R>>;
 }
-impl<V: DeserializeOwned + Send + Sync + Serialize> CoreDatabaseValueDeserialize for V {
 
+#[async_trait]
+pub trait CoreDatabaseSingleIdCheckpointedWriter<TableIdentifier: Clone + Send + Sync> {
+    async fn db_insert_one_single_checkpointed_object<V: Serialize + Send + Sync>(&self, table: &TableIdentifier, obj_id: u64, checkpoint_id: u64, value: &V) -> anyhow::Result<()>;
+    async fn db_insert_many_single_checkpointed_object_rows<V: Serialize + Send + Sync>(&self, table: &TableIdentifier, rows: &[QDatabaseSingleIdTableRow<V>]) -> anyhow::Result<()>;
+    async fn db_insert_many_single_checkpointed_object_rows_t<V: Serialize + DeserializeOwned + Send + Sync, R: QDatabaseSingleIdTableRowLike<V> + Send + Sync>(&self, table: &TableIdentifier, rows: &[R]) -> anyhow::Result<()>;
+    async fn db_insert_many_single_checkpointed_objects_at_checkpoint<V: Serialize + Send + Sync>(&self, table: &TableIdentifier, checkpoint_id: u64, rows: &[QDatabaseSingleIdTableRowNoCheckpointId<V>]) -> anyhow::Result<()>;
+    async fn db_insert_many_single_checkpointed_objects_at_checkpoint_t<V: Serialize + DeserializeOwned + Send + Sync, R: QDatabaseSingleIdTableRowNoCheckpointIdLike<V> + Send + Sync>(&self, table: &TableIdentifier, checkpoint_id: u64, rows: &[R]) -> anyhow::Result<()>;
 }
 
 #[async_trait]
