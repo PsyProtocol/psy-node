@@ -1,22 +1,44 @@
 use criterion::Criterion;
-use parth_core::data::hash::{hash256::Hash256, merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}};
+use parth_core::data::{db::table::QDatabaseTableRoutingKey, hash::{hash256::Hash256, merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}}};
 use parth_crypto::hash::sha256::CoreSha256Hasher;
-use parth_node_v1::{ store::scylla::core::ScyllaCoreStore};
+use parth_node_v1::store::scylla::{core::ScyllaCoreStore, tables::merkle::{ScyllaDoubleMerkleNodesPreparedStatements, ScyllaMerkleNodesPreparedStatements}};
 
+async fn setup_store(
+    realm_id: u64,
+    realm_sub_id: u64,
+    keyspace_prefix: String,
+) -> (
+    ScyllaCoreStore<Hash256, CoreSha256Hasher>,
+    ScyllaMerkleNodesPreparedStatements,
+    ScyllaDoubleMerkleNodesPreparedStatements,
+) {
+    let store = ScyllaCoreStore::<Hash256, CoreSha256Hasher>::new(realm_id, realm_sub_id, keyspace_prefix, &["127.0.0.1:9042".to_string()])
+        .await
+        .unwrap();
+    let single_merkle = store
+        .init_single_merkle_table(
+            "bench_single_merkle_nodes",
+            QDatabaseTableRoutingKey::new_with_empty_secondary_routing_key(0),
+        )
+        .await
+        .unwrap();
+    let double_merkle = store
+        .init_double_merkle_table(
+            "bench_double_merkle_nodes",
+            QDatabaseTableRoutingKey::new_with_empty_secondary_routing_key(1),
+        )
+        .await
+        .unwrap();
+    (store, single_merkle, double_merkle)
+}
 pub fn bench_lops2(c: &mut Criterion) {
     let realm_id = 1;
     let realm_sub_id = 1;
     let keyspace_prefix = format!("bench_large_ops_v3_{}_{}", realm_id, realm_sub_id);
 
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let store = rt
-        .block_on(ScyllaCoreStore::<Hash256, CoreSha256Hasher>::new(
-            realm_id,
-            realm_sub_id,
-            keyspace_prefix,
-            &["127.0.0.1:9042".to_string()],
-        ))
-        .unwrap();
+    let (store, single_merkle_table, double_merkle_table) = rt
+        .block_on(setup_store(realm_id, realm_sub_id, keyspace_prefix));
     let tree_height: u8 = 32;
     let mut group = c.benchmark_group("lops2");
     /*
@@ -65,7 +87,7 @@ pub fn bench_lops2(c: &mut Criterion) {
                         value: Hash256([(i & 255) as u8; 32]),
                     })
                     .collect();
-                rt.block_on(store.set_single_id_merkle_nodes_batch_internal(c, tree_id, nodes)).unwrap();
+                rt.block_on(store.set_single_id_merkle_nodes_batch_internal(&single_merkle_table, c, tree_id, nodes)).unwrap();
             });
         });
         /* 

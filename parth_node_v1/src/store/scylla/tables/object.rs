@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use parth_core::data::db::table::QDatabaseTableRoutingKey;
 use scylla::{client::session::Session, statement::{prepared::PreparedStatement, Statement}};
 
 
@@ -18,10 +19,11 @@ pub struct ScyllaGenericObjectSingleIdTablePreparedStatements {
 
     pub keyspace: String,
     pub table_name: String,
+    pub table_key: QDatabaseTableRoutingKey,
 }
 
 impl ScyllaGenericObjectSingleIdTablePreparedStatements {
-    pub async fn new_from_session(session: Arc<Session>, keyspace: &str, table_name: &str) -> anyhow::Result<Self> {
+    pub async fn new_from_session(session: Arc<Session>, keyspace: &str, table_name: &str, table_key: QDatabaseTableRoutingKey) -> anyhow::Result<Self> {
         let insert_1_statement = Statement::new(format!("INSERT INTO {}.{} (obj_id, checkpoint_id, value) VALUES (?, ?, ?)", keyspace, table_name));
         let insert_1_prepared = session.prepare(insert_1_statement.clone()).await?;
         
@@ -45,9 +47,10 @@ impl ScyllaGenericObjectSingleIdTablePreparedStatements {
             select_all_prepared: Arc::new(select_all_prepared),
             keyspace: keyspace.to_string(),
             table_name: table_name.to_string(),
+            table_key,
         })
     }
-    pub async fn create_table(session: Arc<Session>, keyspace: &str, table_name: &str) -> anyhow::Result<()> {
+    pub async fn create_table(session: Arc<Session>, keyspace: &str, table_name: &str, _table_key: QDatabaseTableRoutingKey) -> anyhow::Result<()> {
         session
             .query_unpaged(
                 format!("CREATE TABLE IF NOT EXISTS {}.{} (
@@ -61,9 +64,9 @@ impl ScyllaGenericObjectSingleIdTablePreparedStatements {
         session.await_schema_agreement().await?;
         Ok(())
     }
-    pub async fn new_create_table(session: Arc<Session>, keyspace: &str, table_name: &str) -> anyhow::Result<Self> {
-        Self::create_table(session.clone(), keyspace, table_name).await?;
-        Self::new_from_session(session, keyspace, table_name).await
+    pub async fn new_create_from_session(session: Arc<Session>, keyspace: &str, table_name: &str, table_key: QDatabaseTableRoutingKey) -> anyhow::Result<Self> {
+        Self::create_table(session.clone(), keyspace, table_name, table_key).await?;
+        Self::new_from_session(session, keyspace, table_name, table_key).await
     }
 }
 
@@ -87,10 +90,11 @@ pub struct ScyllaGenericObjectDoubleIdTablePreparedStatements {
 
     pub keyspace: String,
     pub table_name: String,
+    pub table_key: QDatabaseTableRoutingKey,
 }
 
 impl ScyllaGenericObjectDoubleIdTablePreparedStatements {
-    pub async fn new_from_session(session: Arc<Session>, keyspace: &str, table_name: &str) -> anyhow::Result<Self> {
+    pub async fn new_from_session(session: Arc<Session>, keyspace: &str, table_name: &str, table_key: QDatabaseTableRoutingKey) -> anyhow::Result<Self> {
         let insert_1_statement = Statement::new(format!("INSERT INTO {}.{} (obj_id, secondary_id, checkpoint_id, value) VALUES (?, ?, ?, ?)", keyspace, table_name));
         let insert_1_prepared = session.prepare(insert_1_statement.clone()).await?;
         
@@ -114,9 +118,10 @@ impl ScyllaGenericObjectDoubleIdTablePreparedStatements {
             select_all_prepared: Arc::new(select_all_prepared),
             keyspace: keyspace.to_string(),
             table_name: table_name.to_string(),
+            table_key,
         })
     }
-    pub async fn create_table(session: Arc<Session>, keyspace: &str, table_name: &str) -> anyhow::Result<()> {
+    pub async fn create_table(session: Arc<Session>, keyspace: &str, table_name: &str, _table_key: QDatabaseTableRoutingKey) -> anyhow::Result<()> {
         session
             .query_unpaged(
                 format!("CREATE TABLE IF NOT EXISTS {}.{} (
@@ -131,9 +136,9 @@ impl ScyllaGenericObjectDoubleIdTablePreparedStatements {
         session.await_schema_agreement().await?;
         Ok(())
     }
-    pub async fn new_create_table(session: Arc<Session>, keyspace: &str, table_name: &str) -> anyhow::Result<Self> {
-        Self::create_table(session.clone(), keyspace, table_name).await?;
-        Self::new_from_session(session, keyspace, table_name).await
+    pub async fn new_create_from_session(session: Arc<Session>, keyspace: &str, table_name: &str, table_key: QDatabaseTableRoutingKey) -> anyhow::Result<Self> {
+        Self::create_table(session.clone(), keyspace, table_name, table_key).await?;
+        Self::new_from_session(session, keyspace, table_name, table_key).await
     }
 }
 
@@ -159,10 +164,11 @@ pub struct ScyllaGenericKeyIdValueTablePreparedStatements {
 
     pub keyspace: String,
     pub table_name: String,
+    pub table_key: QDatabaseTableRoutingKey,
 }
 
 impl ScyllaGenericKeyIdValueTablePreparedStatements {
-    pub async fn new_from_session(session: Arc<Session>, keyspace: &str, table_name: &str) -> anyhow::Result<Self> {
+    pub async fn new_from_session(session: Arc<Session>, keyspace: &str, table_name: &str, table_key: QDatabaseTableRoutingKey) -> anyhow::Result<Self> {
         let insert_1_statement = Statement::new(format!("INSERT INTO {}.{} (obj_id, value) VALUES (?, ?)", keyspace, table_name));
         let insert_1_prepared = session.prepare(insert_1_statement.clone()).await?;
         
@@ -186,9 +192,10 @@ impl ScyllaGenericKeyIdValueTablePreparedStatements {
             select_all_prepared: Arc::new(select_all_prepared),
             keyspace: keyspace.to_string(),
             table_name: table_name.to_string(),
+            table_key,
         })
     }
-    pub async fn create_table(session: Arc<Session>, keyspace: &str, table_name: &str) -> anyhow::Result<()> {
+    pub async fn create_table(session: Arc<Session>, keyspace: &str, table_name: &str, _table_key: QDatabaseTableRoutingKey) -> anyhow::Result<()> {
         session
             .query_unpaged(
                 format!("CREATE TABLE IF NOT EXISTS {}.{} (
@@ -201,8 +208,8 @@ impl ScyllaGenericKeyIdValueTablePreparedStatements {
         session.await_schema_agreement().await?;
         Ok(())
     }
-    pub async fn new_create_table(session: Arc<Session>, keyspace: &str, table_name: &str) -> anyhow::Result<Self> {
-        Self::create_table(session.clone(), keyspace, table_name).await?;
-        Self::new_from_session(session, keyspace, table_name).await
+    pub async fn new_create_from_session(session: Arc<Session>, keyspace: &str, table_name: &str, table_key: QDatabaseTableRoutingKey) -> anyhow::Result<Self> {
+        Self::create_table(session.clone(), keyspace, table_name, table_key).await?;
+        Self::new_from_session(session, keyspace, table_name, table_key).await
     }
 }

@@ -1,9 +1,9 @@
 use async_trait::async_trait;
-use parth_core::{crypto::hash::traits::MerkleZeroHasher, data::{db::row::{QDatabaseDoubleIdTableRow, QDatabaseDoubleIdTableRowCreatable, QDatabaseDoubleIdTableRowLike, QDatabaseDoubleIdTableRowNoCheckpointId, QDatabaseDoubleIdTableRowNoCheckpointIdLike, QDatabaseKeyIdValueTableRow, QDatabaseKeyIdValueTableRowCreatable, QDatabaseKeyIdValueTableRowLike, QDatabaseSingleIdTableRow, QDatabaseSingleIdTableRowCreatable, QDatabaseSingleIdTableRowLike, QDatabaseSingleIdTableRowNoCheckpointId, QDatabaseSingleIdTableRowNoCheckpointIdLike, QDoubleIdKey}, hash::merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}}, protocol::core_types::QHashBase};
-use psy_node_core::store::traits::core_db::{CoreDatabaseDoubleIdCheckpointedReader, CoreDatabaseDoubleIdCheckpointedWriter, CoreDatabaseDoubleIdMerkleReader, CoreDatabaseDoubleIdMerkleWriter, CoreDatabaseKivReader, CoreDatabaseKivWriter, CoreDatabaseSingleIdCheckpointedReader, CoreDatabaseSingleIdCheckpointedWriter, CoreDatabaseSingleIdMerkleReader, CoreDatabaseSingleIdMerkleWriter, CoreDatabaseValueDeserialize};
+use parth_core::{crypto::hash::traits::MerkleZeroHasher, data::{db::{data_types::CoreDatabaseValueDeserialize, row::{QDatabaseDoubleIdTableRow, QDatabaseDoubleIdTableRowCreatable, QDatabaseDoubleIdTableRowLike, QDatabaseDoubleIdTableRowNoCheckpointId, QDatabaseDoubleIdTableRowNoCheckpointIdLike, QDatabaseKeyIdValueTableRow, QDatabaseKeyIdValueTableRowCreatable, QDatabaseKeyIdValueTableRowLike, QDatabaseSingleIdTableRow, QDatabaseSingleIdTableRowCreatable, QDatabaseSingleIdTableRowLike, QDatabaseSingleIdTableRowNoCheckpointId, QDatabaseSingleIdTableRowNoCheckpointIdLike, QDoubleIdKey}}, hash::merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}}, protocol::core_types::QHashBase};
+use psy_node_core::store::traits::core_db::{CoreDatabaseDoubleIdCheckpointedReader, CoreDatabaseDoubleIdCheckpointedWriter, CoreDatabaseDoubleIdMerkleReader, CoreDatabaseDoubleIdMerkleWriter, CoreDatabaseKivReader, CoreDatabaseKivWriter, CoreDatabaseSingleIdCheckpointedReader, CoreDatabaseSingleIdCheckpointedWriter, CoreDatabaseSingleIdMerkleReader, CoreDatabaseSingleIdMerkleWriter};
 use serde::{de::DeserializeOwned, Serialize};
 
-use crate::store::scylla::{core::ScyllaCoreStore, tables::object::{ScyllaGenericKeyIdValueTablePreparedStatements, ScyllaGenericObjectDoubleIdTablePreparedStatements, ScyllaGenericObjectSingleIdTablePreparedStatements}};
+use crate::store::scylla::{core::ScyllaCoreStore, tables::{merkle::{ScyllaDoubleMerkleNodesPreparedStatements, ScyllaMerkleNodesPreparedStatements}, object::{ScyllaGenericKeyIdValueTablePreparedStatements, ScyllaGenericObjectDoubleIdTablePreparedStatements, ScyllaGenericObjectSingleIdTablePreparedStatements}}};
 
 #[async_trait]
 impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync> CoreDatabaseSingleIdCheckpointedReader<ScyllaGenericObjectSingleIdTablePreparedStatements> for ScyllaCoreStore<Hash, Hasher> {
@@ -123,41 +123,41 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
 }
 
 #[async_trait]
-impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync> CoreDatabaseSingleIdMerkleReader<Hash, Hasher> for ScyllaCoreStore<Hash, Hasher> {
-    async fn db_select_single_id_merkle_node_max_checkpoint(&self, checkpoint_id: u64, tree_id: u64, tree_height: u8, key: SimpleMerkleNodeKey) -> anyhow::Result<Hash> {
-        self.select_single_id_merkle_node_max_checkpoint_internal(checkpoint_id, tree_id, tree_height, key).await
+impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync> CoreDatabaseSingleIdMerkleReader<Hash, Hasher, ScyllaMerkleNodesPreparedStatements> for ScyllaCoreStore<Hash, Hasher> {
+    async fn db_select_single_id_merkle_node_max_checkpoint(&self, table: &ScyllaMerkleNodesPreparedStatements, checkpoint_id: u64, tree_id: u64, tree_height: u8, key: SimpleMerkleNodeKey) -> anyhow::Result<Hash> {
+        self.select_single_id_merkle_node_max_checkpoint_internal(&table, checkpoint_id, tree_id, tree_height, key).await
     }
-    async fn db_select_many_single_id_merkle_nodes_max_checkpoint(&self, max_checkpoint_id: u64, tree_id: u64, tree_height: u8, keys: &[SimpleMerkleNodeKey]) -> anyhow::Result<Vec<Hash>> {
-        self.select_many_single_id_merkle_nodes_max_checkpoint_internal(max_checkpoint_id, tree_id, tree_height, keys).await
-    }
-}
-
-#[async_trait]
-impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync> CoreDatabaseSingleIdMerkleWriter<Hash, Hasher> for ScyllaCoreStore<Hash, Hasher> {
-    async fn db_insert_single_id_merkle_node(&self, checkpoint_id: u64, tree_id: u64, key: SimpleMerkleNodeKey, value: &Hash) -> anyhow::Result<()> {
-        self.insert_single_id_merkle_node_internal(checkpoint_id, tree_id, key, &value.to_bytes()?).await
-    }
-    async fn db_set_single_id_merkle_nodes_batch(&self, checkpoint_id: u64, tree_id: u64, nodes: Vec<SimpleMerkleNode<Hash>>) -> anyhow::Result<()> {
-        self.set_single_id_merkle_nodes_batch_internal(checkpoint_id, tree_id, nodes).await
+    async fn db_select_many_single_id_merkle_nodes_max_checkpoint(&self, table: &ScyllaMerkleNodesPreparedStatements, max_checkpoint_id: u64, tree_id: u64, tree_height: u8, keys: &[SimpleMerkleNodeKey]) -> anyhow::Result<Vec<Hash>> {
+        self.select_many_single_id_merkle_nodes_max_checkpoint_internal(&table, max_checkpoint_id, tree_id, tree_height, keys).await
     }
 }
 
 #[async_trait]
-impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync> CoreDatabaseDoubleIdMerkleReader<Hash, Hasher> for ScyllaCoreStore<Hash, Hasher> {
-    async fn db_select_double_id_merkle_node_max_checkpoint(&self, checkpoint_id: u64, tree_id: u64, tree_sub_id: u64, tree_height: u8, key: SimpleMerkleNodeKey) -> anyhow::Result<Hash> {
-        self.select_double_id_merkle_node_max_checkpoint_internal(checkpoint_id, tree_id, tree_height, tree_sub_id, key).await
+impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync> CoreDatabaseSingleIdMerkleWriter<Hash, Hasher, ScyllaMerkleNodesPreparedStatements> for ScyllaCoreStore<Hash, Hasher> {
+    async fn db_insert_single_id_merkle_node(&self, table: &ScyllaMerkleNodesPreparedStatements, checkpoint_id: u64, tree_id: u64, key: SimpleMerkleNodeKey, value: &Hash) -> anyhow::Result<()> {
+        self.insert_single_id_merkle_node_internal(table, checkpoint_id, tree_id, key, &value.to_bytes()?).await
     }
-    async fn db_select_many_double_id_merkle_nodes_max_checkpoint(&self, max_checkpoint_id: u64, tree_id: u64, tree_sub_id: u64, tree_height: u8, keys: &[SimpleMerkleNodeKey]) -> anyhow::Result<Vec<Hash>> {
-        self.select_many_double_id_merkle_nodes_max_checkpoint_internal(max_checkpoint_id, tree_id, tree_sub_id, tree_height, keys).await
+    async fn db_set_single_id_merkle_nodes_batch(&self, table: &ScyllaMerkleNodesPreparedStatements, checkpoint_id: u64, tree_id: u64, nodes: Vec<SimpleMerkleNode<Hash>>) -> anyhow::Result<()> {
+        self.set_single_id_merkle_nodes_batch_internal(&table, checkpoint_id, tree_id, nodes).await
     }
 }
 
 #[async_trait]
-impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync> CoreDatabaseDoubleIdMerkleWriter<Hash, Hasher> for ScyllaCoreStore<Hash, Hasher> {
-    async fn db_insert_double_id_merkle_node(&self, checkpoint_id: u64, tree_id: u64, tree_sub_id: u64, key: SimpleMerkleNodeKey, value: &Hash) -> anyhow::Result<()> {
-        self.insert_double_id_merkle_node_internal(checkpoint_id, tree_id, tree_sub_id, key, &value.to_bytes()?).await
+impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync> CoreDatabaseDoubleIdMerkleReader<Hash, Hasher, ScyllaDoubleMerkleNodesPreparedStatements> for ScyllaCoreStore<Hash, Hasher> {
+    async fn db_select_double_id_merkle_node_max_checkpoint(&self, table: &ScyllaDoubleMerkleNodesPreparedStatements, checkpoint_id: u64, tree_id: u64, tree_sub_id: u64, tree_height: u8, key: SimpleMerkleNodeKey) -> anyhow::Result<Hash> {
+        self.select_double_id_merkle_node_max_checkpoint_internal(&table, checkpoint_id, tree_id, tree_height, tree_sub_id, key).await
     }
-    async fn db_set_double_id_merkle_nodes_batch(&self, checkpoint_id: u64, tree_id: u64, tree_sub_id: u64, nodes: Vec<SimpleMerkleNode<Hash>>) -> anyhow::Result<()> {
-        self.set_double_id_merkle_nodes_batch_internal(checkpoint_id, tree_id, tree_sub_id, nodes).await
+    async fn db_select_many_double_id_merkle_nodes_max_checkpoint(&self, table: &ScyllaDoubleMerkleNodesPreparedStatements, max_checkpoint_id: u64, tree_id: u64, tree_sub_id: u64, tree_height: u8, keys: &[SimpleMerkleNodeKey]) -> anyhow::Result<Vec<Hash>> {
+        self.select_many_double_id_merkle_nodes_max_checkpoint_internal(&table, max_checkpoint_id, tree_id, tree_sub_id, tree_height, keys).await
+    }
+}
+
+#[async_trait]
+impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync> CoreDatabaseDoubleIdMerkleWriter<Hash, Hasher, ScyllaDoubleMerkleNodesPreparedStatements> for ScyllaCoreStore<Hash, Hasher> {
+    async fn db_insert_double_id_merkle_node(&self, table: &ScyllaDoubleMerkleNodesPreparedStatements, checkpoint_id: u64, tree_id: u64, tree_sub_id: u64, key: SimpleMerkleNodeKey, value: &Hash) -> anyhow::Result<()> {
+        self.insert_double_id_merkle_node_internal(&table, checkpoint_id, tree_id, tree_sub_id, key, &value.to_bytes()?).await
+    }
+    async fn db_set_double_id_merkle_nodes_batch(&self, table: &ScyllaDoubleMerkleNodesPreparedStatements, checkpoint_id: u64, tree_id: u64, tree_sub_id: u64, nodes: Vec<SimpleMerkleNode<Hash>>) -> anyhow::Result<()> {
+        self.set_double_id_merkle_nodes_batch_internal(&table, checkpoint_id, tree_id, tree_sub_id, nodes).await
     }
 }

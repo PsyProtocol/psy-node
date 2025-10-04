@@ -3,7 +3,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use crate::data::serializable::{QPDSerializable, QPDSerializableFixed};
 
 
-#[pderive::serialize_copy]
+#[pderive::serialize_copy_default]
 pub struct QDoubleIdKey {
     pub obj_id: u64,
     pub secondary_id: u64,
@@ -77,7 +77,7 @@ pub trait QDatabaseKeyIdValueTableRowCreatable<V> {
     fn create_from_key_id_value_row(obj_id: u64, value: V) -> Self;
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[pderive::serialize_clone]
 pub struct QDatabaseSingleIdTableRow<V> {
     pub obj_id: u64,
     pub checkpoint_id: u64,
@@ -99,7 +99,7 @@ impl<V: Serialize + DeserializeOwned> QDatabaseSingleIdTableRowLike<V> for QData
 }
 
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[pderive::serialize_clone]
 pub struct QDatabaseSingleIdTableRowNoCheckpointId<V: Serialize> {
     pub obj_id: u64,
     pub value: V,
@@ -113,7 +113,7 @@ impl <V: Serialize + DeserializeOwned> QDatabaseSingleIdTableRowNoCheckpointIdLi
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[pderive::serialize_clone]
 pub struct QDatabaseDoubleIdTableRow<V> {
     pub obj_id: u64,
     pub secondary_id: u64,
@@ -137,7 +137,7 @@ impl <V: Serialize + DeserializeOwned> QDatabaseDoubleIdTableRowLike<V> for QDat
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[pderive::serialize_clone]
 pub struct QDatabaseDoubleIdTableRowNoCheckpointId<V: Serialize> {
     pub obj_id: u64,
     pub secondary_id: u64,
@@ -155,7 +155,7 @@ impl <V: Serialize + DeserializeOwned> QDatabaseDoubleIdTableRowNoCheckpointIdLi
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[pderive::serialize_clone]
 pub struct QDatabaseKeyIdValueTableRow<V> {
     pub obj_id: u64,
     pub value: V,

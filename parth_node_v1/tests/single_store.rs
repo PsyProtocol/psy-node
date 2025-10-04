@@ -1,5 +1,5 @@
 use anyhow::Result;
-use parth_core::{crypto::hash::traits::MerkleZeroHasher, data::{db::row::QDatabaseSingleIdTableRow, hash::hash256::Hash256, serializable::{QPDPair, QPDPairWithCheckpointId}}, protocol::core_types::QHashBase};
+use parth_core::{crypto::hash::traits::MerkleZeroHasher, data::{db::{row::QDatabaseSingleIdTableRow, table::QDatabaseTableRoutingKey}, hash::hash256::Hash256, serializable::{QPDPair, QPDPairWithCheckpointId}}, protocol::core_types::QHashBase};
 use parth_node_v1::store::scylla::{core::ScyllaCoreStore, tables::object::ScyllaGenericObjectSingleIdTablePreparedStatements};
 use parth_crypto::hash::sha256::CoreSha256Hasher;
 
@@ -130,8 +130,8 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ExDatabaseManager<Hash, Ha
     pub async fn new(realm_id: u64, realm_sub_id: u64, keyspace: String, scylla_nodes: &[String]) -> Result<Self> {
         let scylla_helper = ScyllaCoreStore::<Hash, Hasher>::new(realm_id, realm_sub_id, keyspace.clone(), scylla_nodes).await?;
                 
-        let user_leaf_table = scylla_helper.init_single_id_checkpointed(ExDatabaseTables::USER_LEAF_TABLE_NAME).await?;
-        let contract_info_table = scylla_helper.init_single_id_checkpointed(ExDatabaseTables::CONTRACT_INFO_TABLE_NAME).await?;
+        let user_leaf_table = scylla_helper.init_single_id_checkpointed(ExDatabaseTables::USER_LEAF_TABLE_NAME, QDatabaseTableRoutingKey::new_with_empty_secondary_routing_key(0)).await?;
+        let contract_info_table = scylla_helper.init_single_id_checkpointed(ExDatabaseTables::CONTRACT_INFO_TABLE_NAME, QDatabaseTableRoutingKey::new_with_empty_secondary_routing_key(1)).await?;
 
         Ok(Self {
             realm_id,

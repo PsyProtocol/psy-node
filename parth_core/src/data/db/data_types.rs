@@ -1,4 +1,4 @@
-use serde::{de::DeserializeOwned, Serialize, Deserialize};
+use serde::{de::DeserializeOwned, Serialize};
 use std::hash::Hash;
 
 use crate::data::serializable::{QPDSerializable, QPDSerializableFixed};
