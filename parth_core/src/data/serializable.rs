@@ -135,6 +135,65 @@ impl<const N: usize> QPDSerializableFixed for [u8; N] {
     }
 }
 
+impl QPDSerializableFixed for u64 {
+    fn get_fixed_size() -> usize {
+        8
+    }
+}
+impl QPDSerializable for u64 {
+    fn to_bytes(&self) -> anyhow::Result<Vec<u8>> {
+        Ok(self.to_le_bytes().to_vec())
+    }
+    fn from_bytes(bytes: &[u8]) -> anyhow::Result<Self> {
+        if bytes.len() != 8 {
+            anyhow::bail!("invalid size, expected 8 bytes, got {}", bytes.len());
+        }
+        let mut arr = [0u8; 8];
+        arr.copy_from_slice(&bytes[0..8]);
+        Ok(u64::from_le_bytes(arr))
+    }
+}
+
+
+impl QPDSerializableFixed for u32 {
+    fn get_fixed_size() -> usize {
+        4
+    }
+}
+impl QPDSerializable for u32 {
+    fn to_bytes(&self) -> anyhow::Result<Vec<u8>> {
+        Ok(self.to_le_bytes().to_vec())
+    }
+    fn from_bytes(bytes: &[u8]) -> anyhow::Result<Self> {
+        if bytes.len() != 4 {
+            anyhow::bail!("invalid size, expected 4 bytes, got {}", bytes.len());
+        }
+        let mut arr = [0u8; 4];
+        arr.copy_from_slice(&bytes[0..4]);
+        Ok(u32::from_le_bytes(arr))
+    }
+}
+
+
+impl QPDSerializableFixed for u128 {
+    fn get_fixed_size() -> usize {
+        16
+    }
+}
+impl QPDSerializable for u128 {
+    fn to_bytes(&self) -> anyhow::Result<Vec<u8>> {
+        Ok(self.to_le_bytes().to_vec())
+    }
+    fn from_bytes(bytes: &[u8]) -> anyhow::Result<Self> {
+        if bytes.len() != 16 {
+            anyhow::bail!("invalid size, expected 16 bytes, got {}", bytes.len());
+        }
+        let mut arr = [0u8; 16];
+        arr.copy_from_slice(&bytes[0..16]);
+        Ok(u128::from_le_bytes(arr))
+    }
+}
+
 
 #[pderive::serialize_copy]
 #[serde(bound = "for<'de2> K: Deserialize<'de2>")]
