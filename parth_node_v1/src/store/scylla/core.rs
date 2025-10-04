@@ -881,6 +881,26 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
             None => Ok(None), // Return zero hash if not found
         }
     }
+    pub async fn select_one_double_checkpointed_object_value_and_ids_t<V: Serialize + DeserializeOwned, R: QDatabaseDoubleIdTableRowCreatable<V>>(
+        &self, 
+        double_prepared: &ScyllaGenericObjectDoubleIdTablePreparedStatements, 
+        obj_id: u64, 
+        secondary_id: u64,
+        max_checkpoint_id: u64
+    ) -> anyhow::Result<Option<R>> {
+        let res = self.session.execute_unpaged(&double_prepared.select_value_checkpoint_id_obj_ids_1_prepared, (u64_to_i64_exact(obj_id), u64_to_i64_exact(secondary_id), convert_checkpoint_id_to_i64(max_checkpoint_id))).await?;
+        let rows = res.into_rows_result()?;
+        match rows.maybe_first_row::<(i64, i64, i64, Vec<u8>)>()? {
+            Some(row) => match pser::deserialize::<V>(&row.3) {
+                Ok(value) => Ok(Some(R::create_from_double_row(i64_to_u64_exact(row.0), i64_to_u64_exact(row.1), convert_i64_to_checkpoint_id(row.2), value))),
+                Err(e) => {
+                    tracing::error!("Deserialization error for object ID ({}, {}) at checkpoint_id={} in {}.{}: {:?}", obj_id, secondary_id, convert_i64_to_checkpoint_id(row.2), double_prepared.keyspace, double_prepared.table_name, e);
+                    Ok(None)
+                }
+            },
+            None => Ok(None), // Return zero hash if not found
+        }
+    }
     pub async fn select_all_double_checkpointed_object<V: Serialize + DeserializeOwned>(
         &self, 
         double_prepared: &ScyllaGenericObjectDoubleIdTablePreparedStatements, 

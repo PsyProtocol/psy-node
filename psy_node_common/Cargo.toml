@@ -34,5 +34,9 @@ strum = { workspace = true }
 strum_macros = { workspace = true }
 
 # start local packages
-parth_core = { workspace = true }
 pser = { workspace = true }
+parth_core = { workspace = true }
+parth_common = { workspace = true }
+psy_core = { workspace = true }
+psy_common = { workspace = true }
+psy_data = { workspace = true }

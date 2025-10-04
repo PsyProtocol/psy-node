@@ -5,6 +5,13 @@ version = "0.1.0"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+default = ["std", "parth_core/serialize_rkyv", "parth_core/serialize_speedy", "parth_core/serialize_postcard"]
+std = ["parth_core/std", "pser/std"]
+serialize_rkyv = ["dep:rkyv","pser/serialize_rkyv", "parth_core/serialize_rkyv"]
+serialize_speedy = ["dep:speedy", "pser/serialize_speedy", "parth_core/serialize_speedy"]
+serialize_postcard = ["dep:postcard", "pser/serialize_postcard", "parth_core/serialize_postcard"]
+
 [dependencies]
 postcard = { workspace = true, optional = true }
 rkyv = { workspace = true, optional = true }

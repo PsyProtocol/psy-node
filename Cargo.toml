@@ -136,7 +136,7 @@ psy_type_defaults = { path = "./psy_type_defaults" }
 
 
 # Dev dependencies
-criterion = "0.5.1"  # For benchmarking efficiency
+criterion = { version = "0.5.1", features = ["async_tokio"] }
 
 [profile.release]
 debug = true

@@ -707,7 +707,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ExDatabaseManager<Hash, Ha
     }
 }
 
-fn bench_obj_operations(c: &mut Criterion) {
+pub fn bench_obj_operations(c: &mut Criterion) {
     let realm_id = 1;
     let realm_sub_id = 1;
     let keyspace_prefix = format!("bench_object_ops_v2_{}_{}", realm_id, realm_sub_id);
@@ -770,6 +770,8 @@ fn bench_obj_operations(c: &mut Criterion) {
         });
     });
 }
-
+/* 
 criterion::criterion_group!(benches, bench_obj_operations);
 criterion::criterion_main!(benches);
+
+*/

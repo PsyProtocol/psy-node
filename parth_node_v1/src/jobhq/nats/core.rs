@@ -3,12 +3,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use async_nats::{
-    jetstream::{
-        self,
-        consumer::{pull::Config as PullConfig, PullConsumer},
-        kv::Store,
-    }
+use async_nats::jetstream::{
+    self,
+    consumer::{pull::Config as PullConfig, PullConsumer},
+    kv::Store,
 };
 use bytes::Bytes;
 use futures::{future::try_join_all, stream::StreamExt};
@@ -18,7 +16,7 @@ pub struct NatsJetStreamClient {
     pub base_namespace: String,
     pub jetstream: Arc<jetstream::Context>,
     pub timeout_ms: u64,
-    stream_name: String,
+    pub stream_name: String,
     kv: Store,
 }
 
@@ -61,7 +59,7 @@ impl NatsJetStreamClient {
         })
     }
 
-    async fn ensure_stream(&self) -> anyhow::Result<()> {
+    pub async fn ensure_stream(&self) -> anyhow::Result<()> {
         let stream_config = jetstream::stream::Config {
             name: self.stream_name.clone(),
             subjects: vec![format!("{}.>", &self.base_namespace)],
@@ -78,7 +76,7 @@ impl NatsJetStreamClient {
         Ok(())
     }
 
-    async fn ensure_consumer(&self, subject: &str, durable_name: &str) -> anyhow::Result<()> {
+    pub async fn ensure_consumer(&self, subject: &str, durable_name: &str) -> anyhow::Result<()> {
         let config = PullConfig {
             durable_name: Some(durable_name.to_string()),
             filter_subject: subject.to_string(),
@@ -111,11 +109,13 @@ impl NatsJetStreamClient {
             self.base_namespace, realm_id, realm_sub_id, queue_type, unique_topic, task_group
         )
     }
-    pub async fn push_messages_dq(&self, subject: &str, data: &[QueueJobData]) -> anyhow::Result<()> {
+    pub async fn ensure_stream_consumer(&self, subject: &str) -> anyhow::Result<()> {
         self.ensure_stream().await?;
-
         let durable_name = subject.replace('.', "_");
-        self.ensure_consumer(subject, &durable_name).await?;
+        self.ensure_consumer(subject, &durable_name).await
+    }
+    pub async fn push_messages_dq(&self, subject: &str, data: &[QueueJobData]) -> anyhow::Result<()> {
+        self.ensure_stream_consumer(subject).await?;
 
         const BATCH_SIZE: usize = 1000; // Adjust based on testing; 1000-5000 is a good starting point
         let subject = subject.to_string();
@@ -160,6 +160,72 @@ impl NatsJetStreamClient {
     ) -> anyhow::Result<()> {
         let subject = self.get_queue_subject(realm_id, realm_sub_id, queue_type, unique_topic, task_group);
         self.push_messages_dq(&subject, data).await
+    }
+
+    pub async fn dump_queue(
+        &self,
+        realm_id: u64,
+        realm_sub_id: u64,
+        queue_type: u32,
+        unique_topic: u128,
+        task_group: u64,
+        ack_messages: bool,
+        max_messages_per_batch: usize,
+        max_messages_total_to_dump: usize,
+    ) -> anyhow::Result<Vec<QueueJobData>> {
+        let subject = self.get_queue_subject(realm_id, realm_sub_id, queue_type, unique_topic, task_group);
+        self.dump_queue_dq(&subject, ack_messages, max_messages_per_batch, max_messages_total_to_dump)
+            .await
+    }
+
+    pub async fn dump_queue_dq(
+        &self,
+        subject: &str,
+        ack_messages: bool,
+        max_messages_per_batch: usize,
+        max_messages_total_to_dump: usize,
+    ) -> anyhow::Result<Vec<QueueJobData>> {
+        self.ensure_stream().await?;
+
+        let durable_name = subject.replace('.', "_");
+        self.ensure_consumer(subject, &durable_name).await?;
+
+        let consumer: PullConsumer = self
+            .jetstream
+            .get_consumer_from_stream::<PullConfig, _, _>(&durable_name, &self.stream_name)
+            .await?;
+        let mut messages = consumer.fetch().max_messages(max_messages_per_batch).messages().await?;
+        let mut total_messages_dumped = 0;
+        let mut all_jobs: Vec<QueueJobData> = Vec::new();
+        if max_messages_total_to_dump == 0 {
+            return Ok(all_jobs);
+        }
+
+        while let Some(Ok(jet_msg)) = messages.next().await {
+            if jet_msg.payload.len() != 24 {
+                return Err(anyhow::anyhow!("Invalid job data length"));
+            }
+            let mut job = [0u8; 24];
+            job.copy_from_slice(&jet_msg.payload);
+            total_messages_dumped += 1;
+            all_jobs.push(job);
+            let kv_key = format!("{}.{}", subject, hex::encode(job));
+            if jet_msg.reply.is_none() {
+                return Err(anyhow::anyhow!("Message reply is empty, cannot track completion"));
+            } else {
+                if ack_messages {
+                    jet_msg.ack().await.map_err(|e| anyhow::anyhow!("Failed to ACK message: {}", e))?;
+                } else {
+                    self.kv
+                        .put(&kv_key, Bytes::copy_from_slice(jet_msg.reply.as_deref().unwrap().as_bytes()))
+                        .await?;
+                }
+            }
+            if total_messages_dumped >= max_messages_total_to_dump {
+                break;
+            }
+        }
+        Ok(all_jobs)
     }
 
     pub async fn get_message_if_exists_dq(&self, subject: &str) -> anyhow::Result<Option<QueueJobData>> {

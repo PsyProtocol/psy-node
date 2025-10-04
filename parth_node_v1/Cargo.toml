@@ -44,6 +44,7 @@ pderive = { workspace = true }
 parth_core = { workspace = true }
 parth_crypto = { workspace = true }
 parth_common = { workspace = true }
+psy_node_core = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
@@ -57,6 +58,9 @@ criterion = { workspace = true }
 #name = "large_ops"
 #harness = false
 
+#[[bench]]
+#name = "object_ops"
+#harness = false
 [[bench]]
-name = "object_ops"
+name = "main"
 harness = false

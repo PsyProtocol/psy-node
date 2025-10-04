@@ -78,7 +78,7 @@ pub trait QDatabaseKeyIdValueTableRowCreatable<V> {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct QDatabaseSingleIdTableRow<V: Serialize> {
+pub struct QDatabaseSingleIdTableRow<V> {
     pub obj_id: u64,
     pub checkpoint_id: u64,
     pub value: V,
@@ -114,7 +114,7 @@ impl <V: Serialize + DeserializeOwned> QDatabaseSingleIdTableRowNoCheckpointIdLi
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct QDatabaseDoubleIdTableRow<V: Serialize> {
+pub struct QDatabaseDoubleIdTableRow<V> {
     pub obj_id: u64,
     pub secondary_id: u64,
     pub checkpoint_id: u64,
@@ -156,7 +156,7 @@ impl <V: Serialize + DeserializeOwned> QDatabaseDoubleIdTableRowNoCheckpointIdLi
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct QDatabaseKeyIdValueTableRow<V: Serialize> {
+pub struct QDatabaseKeyIdValueTableRow<V> {
     pub obj_id: u64,
     pub value: V,
 }

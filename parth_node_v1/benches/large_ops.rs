@@ -3,7 +3,7 @@ use parth_core::{crypto::hash::traits::MerkleZeroHasher, data::{hash::{hash256::
 use parth_crypto::hash::sha256::CoreSha256Hasher;
 use parth_node_v1::{ store::scylla::core::ScyllaCoreStore};
 
-fn bench_large_ops(c: &mut Criterion) {
+pub fn bench_large_ops(c: &mut Criterion) {
     let realm_id = 1;
     let realm_sub_id = 1;
     let keyspace_prefix = format!("bench_large_ops_v2_{}_{}", realm_id, realm_sub_id);
@@ -70,6 +70,3 @@ fn bench_large_ops(c: &mut Criterion) {
         });
     });
 }
-
-criterion::criterion_group!(benches, bench_large_ops);
-criterion::criterion_main!(benches);
