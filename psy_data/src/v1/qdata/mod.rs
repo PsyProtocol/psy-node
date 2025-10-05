@@ -4,3 +4,6 @@ pub mod pm_rewards_commitment;
 pub mod pm_jobs_completed_stats;
 pub mod contract;
 pub mod contract_inclusion;
+pub mod checkpoint;
+pub mod public_key;
+pub mod checkpoint_sync;

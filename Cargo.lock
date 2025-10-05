@@ -2086,6 +2086,7 @@ dependencies = [
  "bincode",
  "hex",
  "hex-literal",
+ "parth_common",
  "parth_core",
  "pderive",
  "postcard",

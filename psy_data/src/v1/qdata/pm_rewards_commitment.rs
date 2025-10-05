@@ -3,6 +3,7 @@ use parth_core::{crypto::hash::traits::MerkleHasher, felt::{QFelt64, QFeltSized,
 pub const PM_REWARD_COMMITMENT_SIZE: usize = 12;
 
 #[pderive::serialize_copy_hash_ts]
+#[derive(Default)]
 #[ts(export, concrete(Hash = parth_core::PHash), rename = "PMRewardCommitmentHash")]
 pub struct PPMRewardCommitment<Hash: QHashBase> {
     pub register_users_root: Hash,
