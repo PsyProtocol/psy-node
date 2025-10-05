@@ -1,6 +1,7 @@
 
 
 use parth_core::{crypto::hash::{merkle_proof::MerkleProofCore, traits::{FieldQHasher, QFieldHashable}}, data::serializable::QPDSerializable, felt::{QFelt, QFelt64}, impl_qpd_serialize_params, protocol::core_types::{QFHashBase, QHashBase}};
+use pser::{QBytesSerialize, QBytesDeserialize};
 
 use crate::v1::qdata::contract::PQEDContractLeaf;
 
