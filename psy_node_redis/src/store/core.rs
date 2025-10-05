@@ -458,7 +458,7 @@ impl QStandardEphemeralQueueSubscriber for StandardRedisStore {
         let subject = queue_key.get_queue_subject(&self.root_prefix, realm_id, realm_sub_id, unique_id, task_group);
         let mut con = self.pool.get().await?;
         let items: Vec<Vec<u8>> = con.lrange(&subject, 0, (max_items as isize) - 1).await?;
-        let _: () = con.ltrim(&subject, (items.len() as isize), -1).await?;
+        let _: () = con.ltrim(&subject, items.len() as isize, -1).await?;
         Ok(items)
     }
     async fn dump_entire_ephemeral_queue<QK: PCoreStandardQueueKeyForRealm>(
@@ -473,7 +473,7 @@ impl QStandardEphemeralQueueSubscriber for StandardRedisStore {
         let subject = queue_key.get_queue_subject(&self.root_prefix, realm_id, realm_sub_id, unique_id, task_group);
         let mut con = self.pool.get().await?;
         let items: Vec<Vec<u8>> = con.lrange(&subject, 0, (max_items as isize) - 1).await?;
-        let _: () = con.ltrim(&subject, (items.len() as isize), -1).await?;
+        let _: () = con.ltrim(&subject, items.len() as isize, -1).await?;
         let result: Vec<QK::QueueItem> = items.into_iter().map(|x| QK::QueueItem::decode_queue_item_ref(&x)).collect::<anyhow::Result<_>>()?;
         Ok(result)
     }

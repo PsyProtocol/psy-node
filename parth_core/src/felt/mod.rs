@@ -3,8 +3,37 @@ use std::fmt::{Debug, Display};
 use std::hash::Hash;
 
 use serde::{de::DeserializeOwned, Serialize};
+use ts_rs::TS;
 pub trait ToU64Value {
     fn to_u64_value(&self) -> u64;
+}
+
+pub trait FromPrimitiveValuesFelt {
+    fn from_u8_value(value: u8) -> Self;
+    fn from_u16_value(value: u16) -> Self;
+    fn from_u32_value(value: u32) -> Self;
+    fn from_u64_value(value: u64) -> Self;
+}
+impl FromPrimitiveValuesFelt for u64 {
+    fn from_u8_value(value: u8) -> Self {
+        value as u64
+    }
+    fn from_u16_value(value: u16) -> Self {
+        value as u64
+    }
+    fn from_u32_value(value: u32) -> Self {
+        value as u64
+    }
+    fn from_u64_value(value: u64) -> Self {
+        value
+    }
+}
+pub trait ZeroableFelt {
+    const ZERO_VALUE: Self;
+
+}
+impl ZeroableFelt for u64 {
+    const ZERO_VALUE: Self = 0;
 }
 pub trait QFelt: 
     'static
@@ -27,7 +56,9 @@ pub trait QFelt:
     + Send
     + Sync
     + Serialize
-    + DeserializeOwned {}
+    + DeserializeOwned + ZeroableFelt + TS + FromPrimitiveValuesFelt {
+
+}
 impl<T: 
     'static
     + Copy
@@ -50,7 +81,47 @@ impl<T:
     + Sync
     + Serialize
     + DeserializeOwned
-> QFelt for T {}
+    + ZeroableFelt
+    + TS + FromPrimitiveValuesFelt
+> QFelt for T {
+}
 
 pub trait QFelt64: QFelt + ToU64Value {}
 impl<T: QFelt + ToU64Value> QFelt64 for T {}
+
+
+pub trait QFeltSized {
+    fn q_felt_size() -> usize;
+    fn self_qsize(&self) -> usize {
+        Self::q_felt_size()
+    }
+}
+pub trait ToQFelts<F> {
+    fn to_qfelts(&self) -> Vec<F>;
+    fn from_qfelts(felts: &[F]) -> Self;
+}
+
+impl<F: Copy> ToQFelts<F> for F {
+    fn to_qfelts(&self) -> Vec<F> {
+        vec![*self]
+    }
+    fn from_qfelts(felts: &[F]) -> Self {
+        if felts.len() != 1 {
+            panic!("Invalid number of elements for Felt");
+        }
+        felts[0]
+    }
+}
+impl<const N: usize, F: Copy> ToQFelts<F> for [F; N] {
+    fn to_qfelts(&self) -> Vec<F> {
+        self.to_vec()
+    }
+    fn from_qfelts(felts: &[F]) -> Self {
+        if felts.len() != N {
+            panic!("Invalid number of elements for [F; {}]", N);
+        }
+        let mut arr = [felts[0]; N];
+        arr.copy_from_slice(&felts[0..N]);
+        arr
+    }
+}

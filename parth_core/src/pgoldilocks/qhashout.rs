@@ -1,22 +1,22 @@
 use std::{fmt::Display, str::FromStr};
 
 use anyhow::ensure;
-use crate::{crypto::hash::traits::RandomHash, data::hash::hash256::Hash256};
+use ts_rs::TS;
+use crate::{crypto::hash::traits::{FromU64x4, HashTo4Felts, RandomHash, ToU64x4, ZeroableHash}, data::{hash::hash256::Hash256, serializable::{QPDSerializable, QPDSerializableFixed}}, felt::ToQFelts, protocol::core_types::QHashBase};
 use plonky2::{
     field::{
         goldilocks_field::GoldilocksField,
         types::{Field, Sample},
-    },
-    hash::hash_types::{HashOut, RichField},
-    plonk::config::GenericHashOut,
+    }, hash::hash_types::{HashOut, HashOutTarget, RichField}, iop::target::Target, plonk::config::GenericHashOut
 };
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_with::serde_as;
 
 
-#[derive(Clone, Debug, PartialEq, Eq, Copy, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Copy, Hash, TS)]
 #[pderive::non_serde_serialize]
+#[ts(export, concrete(F = GoldilocksField))]
 pub struct QHashOut<F: Field>(pub HashOut<F>);
 
 pub type GoldilocksHashOut = QHashOut<GoldilocksField>;
@@ -57,6 +57,20 @@ impl<'de, F: RichField> Deserialize<'de> for QHashOut<F> {
     }
 }
 
+impl<F: RichField> QPDSerializableFixed for QHashOut<F> {
+    fn get_fixed_size() -> usize {
+        32
+    }
+}
+impl<F: RichField> QPDSerializable for QHashOut<F> {
+    fn to_bytes(&self) -> anyhow::Result<Vec<u8>> {
+        Ok(self.to_le_bytes().to_vec())
+    }
+
+    fn from_bytes(bytes: &[u8]) -> anyhow::Result<Self> {
+        Self::from_le_bytes(bytes)
+    }
+}
 impl<F: Field> Default for QHashOut<F> {
     fn default() -> Self {
         QHashOut(HashOut::ZERO)
@@ -158,6 +172,14 @@ impl<F: RichField> QHashOut<F> {
             elements: [slice[0], slice[1], slice[2], slice[3]],
         })
     }
+    pub fn from_le_bytes(bytes: &[u8]) -> anyhow::Result<Self> {
+        ensure!(bytes.len() == 32, "Invalid byte length for HashOut");
+        let elements_0 = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+        let elements_1 = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+        let elements_2 = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
+        let elements_3 = u64::from_le_bytes(bytes[24..32].try_into().unwrap());
+        Ok(Self::from_values(elements_0, elements_1, elements_2, elements_3))
+    }
     pub fn to_le_bytes(&self) -> [u8; 32] {
         let mut result = [0u8; 32];
         result[0..8].copy_from_slice(&self.0.elements[0].to_canonical_u64().to_le_bytes());
@@ -186,6 +208,46 @@ impl<F: RichField> QHashOut<F> {
 impl<F: RichField> RandomHash for QHashOut<F> {
     fn rand_hash() -> Self {
         Self::rand()
+    }
+}
+
+
+impl<F: Field> ToQFelts<F> for HashOut<F> {
+    fn to_qfelts(&self) -> Vec<F> {
+        self.elements.to_vec()
+    }
+
+    fn from_qfelts(felts: &[F]) -> Self {
+        if felts.len() != 4 {
+            panic!("Invalid number of elements for HashOut");
+        }
+        Self {
+            elements: [felts[0], felts[1], felts[2], felts[3]],
+        }
+    }
+}
+impl<F: RichField> ToQFelts<F> for QHashOut<F> {
+    fn to_qfelts(&self) -> Vec<F> {
+        self.0.elements.to_vec()
+    }
+    fn from_qfelts(felts: &[F]) -> Self {
+        if felts.len() != 4 {
+            panic!("Invalid number of elements for QHashOut");
+        }
+        QHashOut(
+            HashOut {elements: [felts[0], felts[1], felts[2], felts[3]]}
+        )
+    }
+}
+impl ToQFelts<Target> for HashOutTarget {
+    fn to_qfelts(&self) -> Vec<Target> {
+        self.elements.to_vec()
+    }
+    fn from_qfelts(felts: &[Target]) -> Self {
+        if felts.len() != 4 {
+            panic!("Invalid number of elements for QHashOut");
+        }
+        HashOutTarget {elements: [felts[0], felts[1], felts[2], felts[3]]}
     }
 }
 
@@ -221,3 +283,33 @@ mod tests {
 
     }
 }
+impl<F: RichField> ZeroableHash for QHashOut<F> {
+    fn get_zero_value() -> Self {
+        Self::ZERO
+    }
+}
+impl<F: RichField> ToU64x4 for QHashOut<F> {
+    fn to_u64x4(&self) -> [u64; 4] {
+        [
+            self.0.elements[0].to_canonical_u64(),
+            self.0.elements[1].to_canonical_u64(),
+            self.0.elements[2].to_canonical_u64(),
+            self.0.elements[3].to_canonical_u64(),
+        ]
+    }
+}
+impl<F: RichField> HashTo4Felts<F> for QHashOut<F> {
+    fn to_4_felts(&self) -> [F; 4] {
+        self.0.elements
+    }
+    
+    fn from_4_felts(felts: [F; 4]) -> Self {
+        QHashOut(HashOut { elements: felts })
+    }
+}
+impl<F: RichField> FromU64x4 for QHashOut<F> {
+    fn from_u64x4(data: [u64; 4]) -> Self {
+        Self::from_values(data[0], data[1], data[2], data[3])
+    }
+}
+impl<F: RichField> QHashBase for QHashOut<F> {}

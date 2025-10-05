@@ -1,0 +1,166 @@
+use parth_core::{crypto::hash::traits::{FieldQHasher, QFieldHashable}, data::serializable::QPDSerializable, felt::{QFelt, QFelt64, QFeltSized, ToQFelts}, impl_qpd_serialize_params, impl_qpq_serialize_bincode, protocol::core_types::{QFHashBase, QHashBase}};
+use ts_rs::TS;
+use pser::{QBytesDeserialize, QBytesSerialize};
+
+
+#[pderive::serialize_copy_f_hash_ts]
+#[ts(export, concrete(F = parth_core::PF, Hash = parth_core::PHash), rename = "PQEDContractLeaf")]
+pub struct PQEDContractLeaf<F: QFelt, Hash: QHashBase> {
+    pub deployer: Hash,
+    pub function_tree_root: Hash,
+    pub state_tree_height: F,
+}
+impl_qpd_serialize_params!(
+    PQEDContractLeaf,
+    { F: QFelt, Hash: QHashBase } => { F, Hash }
+);
+
+impl<F: QFelt, Hash: QHashBase> QFeltSized for PQEDContractLeaf<F, Hash> {
+    fn q_felt_size() -> usize {
+        9
+    }
+}
+impl<F: QFelt64, Hash: QFHashBase<F>> ToQFelts<F> for PQEDContractLeaf<F, Hash> {
+    fn to_qfelts(&self) -> Vec<F> {
+        let deployer = self.deployer.to_4_felts();
+        let function_tree_root = self.function_tree_root.to_4_felts();
+
+        vec![
+            deployer[0],
+            deployer[1],
+            deployer[2],
+            deployer[3],
+            function_tree_root[0],
+            function_tree_root[1],
+            function_tree_root[2],
+            function_tree_root[3],
+            self.state_tree_height,
+        ]
+    }
+
+    fn from_qfelts(felts: &[F]) -> Self {
+        if felts.len() != 9 {
+            panic!("Invalid number of elements for QEDContractLeaf");
+        }
+        let deployer = Hash::from_4_felts_slice(&felts[0..4]);
+        let function_tree_root = Hash::from_4_felts_slice(&felts[4..8]);
+        let state_tree_height = felts[8];
+        PQEDContractLeaf {
+            deployer,
+            function_tree_root,
+            state_tree_height,
+        }
+    }
+}
+
+
+impl<F: QFelt64, Hash: QFHashBase<F>> QFieldHashable<F, Hash> for PQEDContractLeaf<F, Hash> {
+    fn qfhash<H: FieldQHasher<F, Hash>>(&self) -> Hash {
+        let deployer = self.deployer.to_4_felts();
+        let function_tree_root = self.function_tree_root.to_4_felts();
+
+        H::q_hash_many(&[
+            deployer[0],
+            deployer[1],
+            deployer[2],
+            deployer[3],
+            function_tree_root[0],
+            function_tree_root[1],
+            function_tree_root[2],
+            function_tree_root[3],
+            self.state_tree_height,
+        ])
+    }
+}
+#[pderive::serialize_clone]
+#[derive(TS)]
+#[ts(export)]
+pub struct ContractFunctionCodeDefinition {
+    // TODO: in the future method id = sha256(functionName(arg0[arg0_size],arg1[arg1_size]))&0xffffffff
+    // CURRENT: sha256(functionName + "-|-" + args_count)&0xffffffff
+    pub method_id: u32,
+    pub num_inputs: u32,
+    pub num_outputs: u32,
+    pub vm_type: u32,
+    pub code: Vec<u8>,
+}
+impl_qpq_serialize_bincode!(ContractFunctionCodeDefinition);
+
+#[pderive::serialize_copy]
+#[derive(TS)]
+#[ts(export)]
+pub struct SimpleContractFunctionCodeDefinition {
+    pub method_id: u32,
+    pub num_inputs: u32,
+    pub num_outputs: u32,
+    pub vm_type: u32,
+}
+impl_qpq_serialize_bincode!(SimpleContractFunctionCodeDefinition);
+
+
+#[pderive::serialize_clone]
+#[derive(TS)]
+#[ts(export)]
+pub struct ContractCodeDefinition {
+    pub state_tree_height: u16,
+    pub functions: Vec<ContractFunctionCodeDefinition>,
+}
+impl_qpq_serialize_bincode!(ContractCodeDefinition);
+
+#[pderive::serialize_clone]
+#[derive(TS)]
+#[ts(export)]
+pub struct SimpleContractCodeDefinition {
+    pub state_tree_height: u16,
+    pub functions: Vec<SimpleContractFunctionCodeDefinition>,
+}
+impl_qpq_serialize_bincode!(SimpleContractCodeDefinition);
+
+impl From<&ContractCodeDefinition> for SimpleContractCodeDefinition {
+    fn from(value: &ContractCodeDefinition) -> Self {
+        Self {
+            state_tree_height: value.state_tree_height,
+            functions: value.functions.clone().into_iter().map(|f| SimpleContractFunctionCodeDefinition {
+                method_id: f.method_id,
+                num_inputs: f.num_inputs,
+                num_outputs: f.num_outputs,
+                vm_type: f.vm_type,
+            }).collect(),
+        }
+    }
+}
+#[pderive::serialize_clone]
+#[derive(TS)]
+#[ts(export)]
+pub struct RootConfig {
+    pub genesis: GenesisConfig,
+}
+
+#[pderive::serialize_clone]
+#[derive(TS)]
+#[ts(export)]
+pub struct GenesisConfig {
+    pub precompiles: Vec<ContractConfig>,
+}
+
+#[pderive::serialize_clone]
+#[derive(TS)]
+#[ts(export)]
+pub struct PrecompileConfig {
+    pub contracts: Vec<ContractConfig>,
+}
+
+#[pderive::serialize_clone]
+#[derive(TS)]
+#[ts(export)]
+pub struct ContractConfig {
+    pub name: String,
+    pub path: String,
+    pub contract_name: String,
+    pub method_names: Vec<String>,
+}
+impl_qpq_serialize_bincode!(RootConfig);
+impl_qpq_serialize_bincode!(GenesisConfig);
+impl_qpq_serialize_bincode!(PrecompileConfig);
+impl_qpq_serialize_bincode!(ContractConfig);
+

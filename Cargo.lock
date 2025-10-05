@@ -2087,8 +2087,10 @@ dependencies = [
  "hex",
  "hex-literal",
  "parth_core",
+ "pderive",
  "postcard",
  "pser",
+ "psy_core",
  "rand 0.8.5",
  "rkyv",
  "serde",
@@ -2100,6 +2102,7 @@ dependencies = [
  "strum_macros",
  "tokio",
  "tracing",
+ "ts-rs",
 ]
 
 [[package]]
@@ -2119,6 +2122,7 @@ dependencies = [
  "psy_common",
  "psy_core",
  "psy_data",
+ "psy_node_core",
  "rand 0.8.5",
  "rkyv",
  "serde",

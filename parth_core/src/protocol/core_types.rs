@@ -1,13 +1,16 @@
 use serde::{de::DeserializeOwned, Serialize};
+use ts_rs::TS;
 
-use crate::{crypto::hash::traits::{QHasher, ZeroableHash}, data::{hash::merkle_node_key::SimpleMerkleNodeKey, parth::public_preimage::{QParthProofPublicInputsPreimage, QParthProofPublicInputsPreimageWithoutRewardsHash}, queue::queue_key::PCoreQueueItemBase, serializable::{QPDSerializable, QPDSerializableFixed}}, felt::QFelt64, QJobIdSerialized};
+use crate::{crypto::hash::traits::{FromU64x4, HashTo4Felts, QHasher, ZeroableHash}, data::{hash::merkle_node_key::SimpleMerkleNodeKey, parth::public_preimage::{QParthProofPublicInputsPreimage, QParthProofPublicInputsPreimageWithoutRewardsHash}, queue::queue_key::PCoreQueueItemBase, serializable::{QPDSerializable, QPDSerializableFixed}}, felt::QFelt64, QJobIdSerialized};
 
 pub trait QStorableBase: Serialize + DeserializeOwned + Send + Sync + Clone + PartialEq + Eq {}
 pub trait QStorableSizedBase: QStorableBase + Sized {}
 impl<T: Serialize + DeserializeOwned + Send + Sync + Clone + PartialEq + Eq> QStorableBase for T {}
 impl<T: QStorableBase + Sized> QStorableSizedBase for T {}
 
-pub trait QHashBase: PartialEq + ZeroableHash + Copy + Serialize + DeserializeOwned + QPDSerializable + QPDSerializableFixed + Sync + Send {}
+pub trait QHashBase: PartialEq + ZeroableHash + Copy + Serialize + DeserializeOwned + QPDSerializable + QPDSerializableFixed + Sync + Send + FromU64x4 + TS {}
+pub trait QFHashBase<F: QFelt64>: QHashBase + HashTo4Felts<F> {}
+
 pub trait QProofBase: PartialEq + Clone + Serialize + DeserializeOwned + QPDSerializable {}
 
 pub trait QHasherBase<Hash: QHashBase, Proof: QProofBase>: QHasher<Hash> {

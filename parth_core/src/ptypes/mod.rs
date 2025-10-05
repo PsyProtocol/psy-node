@@ -1,3 +1,7 @@
+use plonky2::field::types::PrimeField64;
+
+use crate::felt::{QFelt, QFelt64, ToU64Value, ZeroableFelt};
+
 
 // start ptypes_u64_hash256
 // PF = u64, PHash = Hash256
@@ -32,4 +36,10 @@ pub type PF = u64;
 pub type PHash = crate::data::hash::hash256::Hash256;
 // end default ptype fallback
 
+
+impl ToU64Value for PF {
+    fn to_u64_value(&self) -> u64 {
+        self.to_canonical_u64()
+    }
+}
 

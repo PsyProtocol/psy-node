@@ -48,3 +48,48 @@ macro_rules! impl_qpq_serialize_bincode {
         )+
     };
 }
+
+/*
+expected one of `where` or `{`, found `<`
+expected one of `where` or `{`rustcClick for full compiler diagnostic
+user.rs(32, 1):
+
+*/
+
+#[macro_export]
+macro_rules! impl_qpd_serialize_params {
+    (
+        $typ:ident,
+        { $($impl_generics:tt)* } => { $($type_generics:tt)* }
+    ) => {
+        impl<$($impl_generics)*> QPDSerializable for $typ<$($type_generics)*> {
+            fn to_bytes(&self) -> anyhow::Result<Vec<u8>> {
+                //bincode::serialize(self).map_err(|e| anyhow::anyhow!(e))
+                self.to_qbytes()
+            }
+
+            fn from_bytes(bytes: &[u8]) -> anyhow::Result<Self> {
+                //bincode::deserialize(bytes).map_err(|e| anyhow::anyhow!(e))
+                Self::from_qbytes(bytes)
+            }
+        }
+    };
+}
+#[macro_export]
+macro_rules! impl_qpq_serialize_bincode_f {
+    ($($typ:ty),+ $(,)?) => {
+        $(
+            impl<F: QFelt> QPDSerializable for $typ<F> {
+                fn to_bytes(&self) -> anyhow::Result<Vec<u8>> {
+                    //b1incode::serialize(self).map_err(|e| anyhow::anyhow!(e))
+                    self.to_qbytes()
+                }
+
+                fn from_bytes(bytes: &[u8]) -> anyhow::Result<Self> {
+                    //bi1ncode::deserialize(bytes).map_err(|e| anyhow::anyhow!(e))
+                    Self::from_qbytes(bytes)
+                }
+            }
+        )+
+    };
+}

@@ -1,4 +1,4 @@
-use crate::{protocol::core_types::QHashBase, utils::math::log2_ceil};
+use crate::{felt::QFelt64, protocol::core_types::QHashBase, utils::math::log2_ceil};
 
 pub trait RandomHash {
     fn rand_hash() -> Self;
@@ -18,6 +18,28 @@ pub trait CodeSerializableHash {
 
 pub trait ZeroableHash: Sized + Copy + Clone {
     fn get_zero_value() -> Self;
+}
+pub trait ToU64x4 {
+    fn to_u64x4(&self) -> [u64; 4];
+}
+pub trait FromU64x4: Sized {
+    fn from_u64x4(data: [u64; 4]) -> Self;
+    fn from_u64s(a: u64, b: u64, c: u64, d: u64) -> Self {
+        Self::from_u64x4([a, b, c, d])
+    }
+}
+pub trait HashTo4Felts<F: Copy>: Sized {
+    fn to_4_felts(&self) -> [F; 4];
+    fn from_4_felts(felts: [F; 4]) -> Self;
+    fn from_4_felts_slice(felts: &[F]) -> Self{
+        if felts.len() != 4 {
+            panic!("from_4_felts_slice called with a slice that is not length 4");
+        }
+        Self::from_4_felts([felts[0], felts[1], felts[2], felts[3]])
+    }
+    fn from_felts(f0: F, f1: F, f2: F, f3: F) -> Self {
+        Self::from_4_felts([f0, f1, f2, f3])
+    }
 }
 
 impl<const N: usize> ZeroableHash for [u8; N] {
@@ -91,6 +113,14 @@ pub trait MerkleZeroHasher<Hash: PartialEq>: MerkleHasher<Hash> {
     fn get_zero_hash(reverse_level: usize) -> Hash;
 }
 
+pub trait QFieldHashable<F: Copy + PartialEq, Hash: PartialEq + Copy>: Sized {
+    fn qfhash<H: FieldQHasher<F, Hash>>(&self) -> Hash;
+}
+pub trait FieldQHasher<F: Copy + PartialEq, Hash: PartialEq + Copy>: Sized + MerkleHasher<Hash> + MerkleZeroHasher<Hash> {
+    fn q_hash_many(elements: &[F]) -> Hash;
+    fn q_hash_many_pad(elements: &[F]) -> Hash;
+    fn q_two_to_one(left: Hash, right: Hash) -> Hash;
+}
 
 
 pub trait QHashable<Hash: QHashBase, QH: QHasher<Hash>> {
