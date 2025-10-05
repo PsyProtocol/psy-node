@@ -15,7 +15,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_with::serde_as;
 
 
-#[derive(Clone, Debug, PartialEq, Eq, Copy, Hash,  rkyv::Serialize, rkyv::Deserialize, rkyv::Archive, speedy::Readable, speedy::Writable)]
+#[derive(Clone, Debug, PartialEq, Eq, Copy, Hash)]
+#[pderive::non_serde_serialize]
 pub struct QHashOut<F: Field>(pub HashOut<F>);
 
 pub type GoldilocksHashOut = QHashOut<GoldilocksField>;
@@ -185,5 +186,38 @@ impl<F: RichField> QHashOut<F> {
 impl<F: RichField> RandomHash for QHashOut<F> {
     fn rand_hash() -> Self {
         Self::rand()
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use plonky2::field::goldilocks_field::GoldilocksField as F;
+    #[test]
+    fn test_qhashout_serde_str() {
+        let h = QHashOut::<F>::from_values(1, 2, 3, 4);
+        let s = serde_json::to_string(&h).unwrap();
+        println!("Serialized: {}", s);
+        let h2: QHashOut<F> = serde_json::from_str(&s).unwrap();
+        assert_eq!(h, h2);
+    }
+    #[test]
+    fn test_qhashout_byte_order(){
+        let h = QHashOut::<F>::from_values(0x0102030405060708, 0x1112131415161718, 0x2122232425262728, 0x3132333435363738);
+        let known_le_serialization: [u8; 32] = [
+            0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
+            0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11,
+            0x28, 0x27, 0x26, 0x25, 0x24, 0x23, 0x22, 0x21,
+            0x38, 0x37, 0x36, 0x35, 0x34, 0x33, 0x32, 0x31,
+        ];
+        let bytes = h.to_le_bytes();
+        assert_eq!(bytes, known_le_serialization);
+        let bincode_bytes = bincode::serialize(&h).unwrap();
+        assert_eq!(bincode_bytes, known_le_serialization);
+        let h2: QHashOut<F> = bincode::deserialize(&bincode_bytes).unwrap();
+        assert_eq!(h, h2);
+
+
     }
 }

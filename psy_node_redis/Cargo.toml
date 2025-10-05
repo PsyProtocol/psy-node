@@ -1,9 +1,10 @@
 [package]
 edition = "2021"
-name    = "psy_node_core"
+name    = "psy_node_redis"
 version = "0.1.0"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
 
 [features]
 default = ["std", "parth_core/serialize_rkyv", "parth_core/serialize_speedy", "parth_core/serialize_postcard"]
@@ -31,13 +32,20 @@ rand = { workspace = true }
 auto_impl = { workspace = true }
 strum = { workspace = true }
 strum_macros = { workspace = true }
-futures = { workspace = true }
+redis = { workspace = true }
+bb8-redis = { workspace = true }
+bb8 = { workspace = true }
+rsmq = { workspace = true }
 
 # start local packages
 pser = { workspace = true }
-pderive = { workspace = true }
 parth_core = { workspace = true }
 parth_common = { workspace = true }
 psy_core = { workspace = true }
 psy_common = { workspace = true }
+psy_node_core = { workspace = true }
 psy_data = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+

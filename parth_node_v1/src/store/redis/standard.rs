@@ -1,54 +1,50 @@
-use async_trait::async_trait;
-use psy_node_core::store::traits::proof_store::QParthProofStoreReader;
+
 use std::{num::NonZeroUsize, time::Duration};
 
+use async_trait::async_trait;
 use bb8::Pool;
 use bb8_redis::RedisConnectionManager;
-use parth_core::data::serializable::{QPDPair, QPDSerializable};
-use redis::AsyncCommands;
+use parth_core::{data::serializable::{QPDPair, QPDSerializable}, utils::auto_implement::QAutoImplementGeneric, QJobIdSerialized};
+use psy_node_core::store::traits::{proof_store::{QParthProofStoreReader, QParthProofStoreWriter}, temp_db::{QTempDatabaseCounterWriterBase, QTempDatabaseKVReaderBase, QTempDatabaseRawCounterReaderBase, QTempDatabaseRawCounterWriterBase, QTempDatabaseRawKVReaderBase, QTempDatabaseRawKVWriterBase}};
+use redis::AsyncCommands as _;
 use tokio::time::sleep;
 
-use crate::store::traits::tmp_db::{QPBasicStoreKVReader, QPBasicStoreKVWriter, QPEphemeralQueueType, QPTempQueueEmphemeralPublisher, QPTempQueueEmphemeralSubscriber, QPTempStoreKVU64Reader, QPTempStoreKVU64Writer};
-pub const REDIS_TMP_EPHEMERAL_QUEUE_PREFIX: &str = "TEMOV1";
+pub const REDIS_TMP_PROOF_STORE_PREFIX: &str = "TMPPSV1";
 pub const REDIS_TMP_KV_STORE_PREFIX: &str = "TKVSV1";
-fn get_ephemeral_queue_ns_key(biz_key: &str, realm_id: u64, realm_sub_id: u64, queue_type: u32, unique_id: u128) -> String {
-    format!("{}-{}-{}-{}-{}-{}", REDIS_TMP_EPHEMERAL_QUEUE_PREFIX, biz_key, realm_id, realm_sub_id, queue_type, unique_id)
+fn get_tmp_kv_store_ns_key(root_prefix: &str, realm_id: u64, realm_sub_id: u64) -> String {
+    format!("{}-{}-{}-{}", REDIS_TMP_KV_STORE_PREFIX, root_prefix, realm_id, realm_sub_id)
 }
-fn get_tmp_kv_store_ns_key(biz_key: &str, realm_id: u64, realm_sub_id: u64, table_type: u32) -> String {
-    format!("{}-{}-{}-{}-{}", REDIS_TMP_KV_STORE_PREFIX, biz_key, realm_id, realm_sub_id, table_type)
+
+fn get_tmp_proof_store_ns_key(root_prefix: &str, realm_id: u64, realm_sub_id: u64) -> String {
+    format!("{}-{}-{}-{}", REDIS_TMP_PROOF_STORE_PREFIX, root_prefix, realm_id, realm_sub_id)
 }
 
 #[derive(Debug, Clone)]
-pub struct ProofStoreRedisAsync {
+pub struct StandardRedisStore {
     pub pool: Pool<RedisConnectionManager>,
-    biz_key: String,
-    realm_id: u64,
-    realm_sub_id: u64,
+    pub root_prefix: String,
+    pub realm_id: u64,
+    pub realm_sub_id: u64,
+    pub proof_store_namespace: String,
+    pub kv_store_namespace: String,
 }
 
 
-impl ProofStoreRedisAsync {
+impl StandardRedisStore {
     pub fn new(
         pool: Pool<RedisConnectionManager>,
-        biz_key: String,
+        root_prefix: String,
         realm_id: u64,
         realm_sub_id: u64,
     ) -> Self {
         Self {
             pool,
-            biz_key,
+            proof_store_namespace: get_tmp_proof_store_ns_key(&root_prefix, realm_id, realm_sub_id),
+            kv_store_namespace: get_tmp_kv_store_ns_key(&root_prefix, realm_id, realm_sub_id),
+            root_prefix,
             realm_id,
             realm_sub_id,
         }
-    }
-    pub fn get_kv_store_key(&self, table_type: u32) -> String {
-        get_tmp_kv_store_ns_key(&self.biz_key, self.realm_id, self.realm_sub_id, table_type)
-    }
-    pub fn get_ephemeral_queue_key(&self, queue_type: u32, unique_id: u128) -> String {
-        get_ephemeral_queue_ns_key(&self.biz_key, self.realm_id, self.realm_sub_id, queue_type, unique_id)
-    }
-    pub fn pool(&self) -> &Pool<RedisConnectionManager> {
-        &self.pool
     }
 
     pub async fn get_bytes_generic_internal(&self, ns_key: &str, key: &[u8]) -> anyhow::Result<Vec<u8>> {
@@ -57,6 +53,11 @@ impl ProofStoreRedisAsync {
         Ok(data)
     }
     pub async fn get_many_bytes_generic_internal(&self, ns_key: &str, keys: &[Vec<u8>]) -> anyhow::Result<Vec<Vec<u8>>> {
+        let mut con = self.pool.get().await?;
+        let data: Vec<Vec<u8>> = con.hget(ns_key, keys).await?;
+        Ok(data)
+    }
+    pub async fn get_many_bytes_generic_internal_ref(&self, ns_key: &str, keys: &[&[u8]]) -> anyhow::Result<Vec<Vec<u8>>> {
         let mut con = self.pool.get().await?;
         let data: Vec<Vec<u8>> = con.hget(ns_key, keys).await?;
         Ok(data)
@@ -71,6 +72,18 @@ impl ProofStoreRedisAsync {
 
         let mut con = self.pool.get().await?;
         let _: () = con.hset_multiple(ns_key, &items.into_iter().map(|x| (x.key, x.value)).collect::<Vec<_>>()).await?;
+        Ok(())
+    }
+    pub async fn set_many_bytes_generic_internal_tuple(&self, ns_key: &str, items: &[(Vec<u8>, Vec<u8>)]) -> anyhow::Result<()> {
+
+        let mut con = self.pool.get().await?;
+        let _: () = con.hset_multiple(ns_key, &items).await?;
+        Ok(())
+    }
+    pub async fn set_many_bytes_generic_internal_ref(&self, ns_key: &str, items: &[QPDPair<Vec<u8>, Vec<u8>>]) -> anyhow::Result<()> {
+
+        let mut con = self.pool.get().await?;
+        let _: () = con.hset_multiple(ns_key, &items.into_iter().map(|x| (&x.key, &x.value)).collect::<Vec<_>>()).await?;
         Ok(())
     }
     pub async fn get_iu64_generic_internal(&self, ns_key: &str, key: &[u8]) -> anyhow::Result<u64> {
@@ -239,74 +252,117 @@ impl ProofStoreRedisAsync {
         Ok(result)
     }
 }
-#[async_trait]
-impl QPBasicStoreKVReader for ProofStoreRedisAsync {
-    async fn get_exact_bytes(&self, table_type: u32, key: &[u8]) -> anyhow::Result<Vec<u8>>{
-        self.get_bytes_generic_internal(&self.get_kv_store_key(table_type), key).await
-    }
-    async fn get_exact_bytes_many(&self, table_type: u32, keys: &[Vec<u8>]) -> anyhow::Result<Vec<Vec<u8>>>{
-        self.get_many_bytes_generic_internal(&self.get_kv_store_key(table_type), keys).await
-    }
-}
-#[async_trait]
-impl QPBasicStoreKVWriter for ProofStoreRedisAsync {
-
-    async fn set_exact_bytes(&self, table_type: u32, key: &[u8], value: &[u8]) -> anyhow::Result<()>{
-        self.set_bytes_generic_internal(&self.get_kv_store_key(table_type), key, value).await
-    }
-
-    async fn set_exact_bytes_many(&self, table_type: u32, entries: Vec<QPDPair<Vec<u8>, Vec<u8>>>) -> anyhow::Result<()>{
-        self.set_many_bytes_generic_internal(&self.get_kv_store_key(table_type), entries).await
-    }
-    
-}
-
 
 #[async_trait]
-impl QPTempStoreKVU64Reader for ProofStoreRedisAsync {
-    async fn get_iu64_generic(&self, table_type: u32, key: &[u8]) -> anyhow::Result<u64>{
-        self.get_iu64_generic_internal(&self.get_kv_store_key(table_type), key).await
+impl QParthProofStoreReader for StandardRedisStore {
+
+    async fn get_proof_bytes_by_job_id<J:  Into<QJobIdSerialized> + Copy + Send + Sync>(&self, job_id: J) -> anyhow::Result<Option<Vec<u8>>> {
+        let job_id_bytes = job_id.into().to_vec();
+        let data = self.get_bytes_generic_internal(&self.proof_store_namespace, &job_id_bytes).await?;
+        if data.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(data))
+        }
     }
-}
-
-#[async_trait]
-impl QPTempStoreKVU64Writer for ProofStoreRedisAsync {
-
-
-    async fn set_iu64_generic(&self, table_type: u32, key: &[u8], value: u64) -> anyhow::Result<()>{
-        self.set_iu64_generic_internal(&self.get_kv_store_key(table_type), key, value as i64).await
+    async fn get_proof_by_job_id<J: Into<QJobIdSerialized> + Copy + Send + Sync, P: QPDSerializable>(&self, job_id: J) -> anyhow::Result<Option<P>>{
+        let job_id_bytes = job_id.into().to_vec();
+        let data = self.get_bytes_generic_internal(&self.proof_store_namespace, &job_id_bytes).await?;
+        if data.is_empty() {
+            Ok(None)
+        } else {
+            let proof: P = P::from_bytes(&data)?;
+            Ok(Some(proof))
+        }
     }
-    async fn inc_iu64_generic(&self, table_type: u32, key: &[u8], delta: i64) -> anyhow::Result<u64> {
-        self.inc_iu64_generic_internal(&self.get_kv_store_key(table_type), key, delta).await
+    async fn contains_proof_for_job_id<J: Into<QJobIdSerialized> + Copy + Send + Sync>(&self, job_id: J) -> anyhow::Result<bool> {
+        let job_id_bytes = job_id.into().to_vec();
+        let data = self.get_bytes_generic_internal(&self.proof_store_namespace, &job_id_bytes).await?;
+        Ok(!data.is_empty())
+
     }
     
 }
 
 #[async_trait]
-impl QPTempQueueEmphemeralPublisher for ProofStoreRedisAsync {
-
-    async fn push_bytes_to_ephemeral_queue(&self, queue_type: QPEphemeralQueueType, unique_id: u128, value: &[u8]) -> anyhow::Result<()>{
-        self.push_to_generic_bytes_queue_internal(&self.get_ephemeral_queue_key(queue_type as u32, unique_id), value).await
+impl QParthProofStoreWriter for StandardRedisStore {
+    async fn put_proof_bytes_for_job_id<J: Into<QJobIdSerialized> + Copy + Send + Sync>(&self, job_id: J, proof_bytes: &[u8]) -> anyhow::Result<()>{
+        let job_id_bytes = job_id.into().to_vec();
+        self.set_bytes_generic_internal(&self.proof_store_namespace, &job_id_bytes, proof_bytes).await
     }
-    
-    async fn push_many_bytes_to_ephemeral_queue(&self, queue_type: QPEphemeralQueueType, unique_id: u128, values: &[Vec<u8>]) -> anyhow::Result<()>{
-        self.push_many_to_generic_bytes_queue_internal(&self.get_ephemeral_queue_key(queue_type as u32, unique_id), values).await
+    async fn put_proof_for_job_id<J: Into<QJobIdSerialized> + Copy + Send + Sync, P: QPDSerializable + Send + Sync>(&self, job_id: J, proof: &P) -> anyhow::Result<()>{
+        let job_id_bytes = job_id.into().to_vec();
+        let proof_bytes = proof.to_bytes()?;
+        self.set_bytes_generic_internal(&self.proof_store_namespace, &job_id_bytes, &proof_bytes).await
     }
 }
 
 #[async_trait]
-impl QPTempQueueEmphemeralSubscriber for ProofStoreRedisAsync {
- 
-    async fn dump_entire_ephemeral_queue(&self, queue_type: QPEphemeralQueueType, unique_id: u128) -> anyhow::Result<Vec<Vec<u8>>>{
-        self.dump_generic_bytes_queue_internal(&self.get_ephemeral_queue_key(queue_type as u32, unique_id)).await
-    }
+impl QTempDatabaseRawKVReaderBase for StandardRedisStore {
 
-    async fn pop_bytes_from_emphemeral_queue_or_none(&self, queue_type: QPEphemeralQueueType, unique_id: u128) -> anyhow::Result<Option<Vec<u8>>>{
-        self.pop_from_generic_bytes_queue_or_none_internal(&self.get_ephemeral_queue_key(queue_type as u32, unique_id)).await
+    async fn qtdb_raw_kv_get_value(&self, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
+        let data = self.get_bytes_generic_internal(&self.kv_store_namespace, key).await?;
+        if data.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(data))
+        }
     }
+    async fn qtdb_raw_kv_get_many_values(&self, keys: &[&[u8]]) -> anyhow::Result<Vec<Option<Vec<u8>>>>{
+        let data = self.get_many_bytes_generic_internal_ref(&self.kv_store_namespace, keys).await?;
+        Ok(data.into_iter().map(|v| if v.is_empty() { None } else { Some(v) }).collect())
 
-    async fn wait_for_pop_bytes_from_emphemeral_queue(&self, queue_type: QPEphemeralQueueType, unique_id: u128, _timeout_ms: u64) -> anyhow::Result<Vec<u8>>{
-        self.wait_for_generic_bytes_queue_internal(&self.get_ephemeral_queue_key(queue_type as u32, unique_id)).await
     }
-   
+    async fn qtdb_raw_kv_get_many_values_vec(&self, keys: &[Vec<u8>]) -> anyhow::Result<Vec<Option<Vec<u8>>>>{
+        let data = self.get_many_bytes_generic_internal(&self.kv_store_namespace, keys).await?;
+        Ok(data.into_iter().map(|v| if v.is_empty() { None } else { Some(v) }).collect())
+    }
+    async fn qtdb_raw_kv_contains_key(&self, key: &[u8]) -> anyhow::Result<bool> {
+        let data = self.get_bytes_generic_internal(&self.kv_store_namespace, key).await?;
+        Ok(!data.is_empty())
+    }
 }
+
+#[async_trait]
+impl QTempDatabaseRawKVWriterBase for StandardRedisStore {
+    async fn qtdb_raw_kv_put_value(&self, key: &[u8], value: &[u8]) -> anyhow::Result<()>{
+        self.set_bytes_generic_internal(&self.kv_store_namespace, key, value).await
+    }
+    async fn qtdb_raw_kv_delete_key(&self, key: &[u8]) -> anyhow::Result<()>{
+        let mut con = self.pool.get().await?;
+        let _: () = con.hdel(&self.kv_store_namespace, key).await?;
+        Ok(())
+    }
+    async fn qtdb_raw_kv_put_many_values(&self, entries: &[QPDPair<Vec<u8>, Vec<u8>>]) -> anyhow::Result<()>{
+        self.set_many_bytes_generic_internal_ref(&self.kv_store_namespace, entries).await
+    }
+    async fn qtdb_raw_kv_put_many_values_tuple(&self, entries: &[(Vec<u8>, Vec<u8>)]) -> anyhow::Result<()>{
+        self.set_many_bytes_generic_internal_tuple(&self.kv_store_namespace, entries).await
+    }
+
+
+
+}
+#[async_trait]
+impl QTempDatabaseRawCounterReaderBase for StandardRedisStore {
+    async fn qtdb_raw_counter_get_value(&self, key: &[u8]) -> anyhow::Result<i64> {
+        let value = self.get_iu64_generic_internal(&self.kv_store_namespace, key).await?;
+        Ok(value as i64)
+    }
+}
+
+#[async_trait]
+impl QTempDatabaseRawCounterWriterBase for StandardRedisStore {
+
+    async fn qtdb_raw_counter_increment_by(&self, key: &[u8], increment_by: i64) -> anyhow::Result<i64>{
+        let new_value = self.inc_iu64_generic_internal(&self.kv_store_namespace, key, increment_by).await?;
+        Ok(new_value as i64)
+
+    }
+    async fn qtdb_raw_counter_set_value(&self, key: &[u8], value: i64) -> anyhow::Result<()> {
+        self.set_iu64_generic_internal(&self.kv_store_namespace, key, value).await
+    }
+}
+
+impl QAutoImplementGeneric for StandardRedisStore {}
+

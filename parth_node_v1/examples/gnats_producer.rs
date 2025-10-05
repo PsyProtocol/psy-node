@@ -118,7 +118,7 @@ async fn main() -> Result<(), async_nats::Error> {
     let overall_duration = end_time_overall.duration_since(start_time_overall);
     println!("Overall time taken: {:?}, across {} streams", overall_duration, all_stats.len());
     let messages_per_sec = all_stats.iter().map(|(_, produced, _, _, _, _, _, _, _)| *produced).sum::<usize>() as f64 / overall_duration.as_secs_f64();
-    println!("Overall throughput: {:.2} messages/sec", messages_per_sec); 
+    println!("Overall throughput: {:.2} tx/sec", messages_per_sec); 
     
     // Print summary statistics
     println!("\n===== BENCHMARK RESULTS =====");

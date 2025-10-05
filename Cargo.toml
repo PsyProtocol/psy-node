@@ -11,6 +11,8 @@ members = [
     "psy_data",
     "psy_node_core",
     "psy_node_common",
+    "psy_node_redis",
+    "psy_node_nats",
     "parth_node_v1"
 ]
 resolver = "2"
@@ -133,6 +135,9 @@ psy_node_core = { path = "./psy_node_core" }
 psy_node_common = { path = "./psy_node_common" }
 psy_global_types = { path = "./psy_global_types" }
 psy_type_defaults = { path = "./psy_type_defaults" }
+
+psy_node_redis = { path = "./psy_node_redis" }
+psy_node_nats = { path = "./psy_node_nats" }
 
 
 # Dev dependencies

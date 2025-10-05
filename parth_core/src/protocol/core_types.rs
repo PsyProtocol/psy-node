@@ -1,6 +1,6 @@
 use serde::{de::DeserializeOwned, Serialize};
 
-use crate::{crypto::hash::traits::{QHasher, ZeroableHash}, data::{hash::merkle_node_key::SimpleMerkleNodeKey, parth::public_preimage::{QParthProofPublicInputsPreimage, QParthProofPublicInputsPreimageWithoutRewardsHash}, serializable::{QPDSerializable, QPDSerializableFixed}}, felt::QFelt64};
+use crate::{crypto::hash::traits::{QHasher, ZeroableHash}, data::{hash::merkle_node_key::SimpleMerkleNodeKey, parth::public_preimage::{QParthProofPublicInputsPreimage, QParthProofPublicInputsPreimageWithoutRewardsHash}, queue::queue_key::PCoreQueueItemBase, serializable::{QPDSerializable, QPDSerializableFixed}}, felt::QFelt64, QJobIdSerialized};
 
 pub trait QStorableBase: Serialize + DeserializeOwned + Send + Sync + Clone + PartialEq + Eq {}
 pub trait QStorableSizedBase: QStorableBase + Sized {}
@@ -26,9 +26,9 @@ pub trait QZKProofVerifier<Hash: QHashBase, Proof: QProofBase>: QHasherBase<Hash
         self.verify_zk_proof(circuit_type, proof)
     }
 }
-pub trait QJobIdBase: Send + Sync + Serialize + DeserializeOwned + Clone + PartialEq + Eq + std::fmt::Debug + QPDSerializableFixed + Sized {
-    fn to_bytes_24(&self) -> [u8; 24];
-    fn from_bytes_24(bytes: &[u8; 24]) -> anyhow::Result<Self>;
+pub trait QJobIdBase: Send + Sync + Serialize + DeserializeOwned + Clone + PartialEq + Eq + std::fmt::Debug + QPDSerializableFixed + Sized + Into<QJobIdSerialized> + TryFrom<QJobIdSerialized> + PCoreQueueItemBase {
+    fn to_bytes_fixed(&self) -> QJobIdSerialized;
+    fn from_bytes_fixed(bytes: &QJobIdSerialized) -> anyhow::Result<Self>;
     fn circuit_type_u32(&self) -> u32;
     fn input_witness_id(&self) -> Self;
     fn output_proof_id(&self) -> Self;
@@ -39,7 +39,6 @@ pub trait QJobIdBase: Send + Sync + Serialize + DeserializeOwned + Clone + Parti
     fn get_parth_index(&self) -> u64;
     fn get_parth_level(&self) -> u8;
     fn get_parth_merkle_node_key(&self) -> SimpleMerkleNodeKey;
-    
     
 }
 

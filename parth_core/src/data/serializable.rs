@@ -35,6 +35,12 @@ pub struct BinaryKVWithCheckpointId {
 }
 
 
+pub trait QPDSizedPairKey: Sized + Copy + Clone + QPDSerializableFixed + Serialize + DeserializeOwned {}
+pub struct QPDSizedPair<K: Sized + Copy + , V: QPDSerializableFixed> {
+    pub key: K,
+    pub value: V,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct QPDPair<K, V> {
     pub key: K,
@@ -193,6 +199,7 @@ impl QPDSerializable for u128 {
         Ok(u128::from_le_bytes(arr))
     }
 }
+
 
 
 #[pderive::serialize_copy]
