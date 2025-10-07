@@ -1,33 +1,25 @@
-use serde::{Deserialize, Serialize};
-
-use crate::protocol::core_types::QHashBase;
 
 
-// ZKPublicKeyInfo
-#[pderive::serialize_clone]
-#[serde(bound = "for<'de2> Hash: Deserialize<'de2>")]
-pub struct QPUserPublicKeyInfo<Hash: QHashBase> {
+use crate::{crypto::hash::traits::{FieldQHasher, MerkleHasher, QFieldHashable}, data::serializable::QPDSerializable, felt::QFelt64, impl_qpd_serialize_params, protocol::core_types::{QFHashBase, QHashBase}};
+use pser::{QBytesDeserialize, QBytesSerialize};
+
+#[pderive::serialize_copy_hash_ts]
+#[ts(export, concrete(Hash = crate::PHash), rename = "ZKPublicKeyInfo")]
+pub struct PZKPublicKeyInfo<Hash: QHashBase> {
     pub fingerprint: Hash,
     pub public_key_param: Hash,
 }
 
-// QBCDeployContract
-#[pderive::serialize_clone]
-#[serde(bound = "for<'de2> Hash: Deserialize<'de2>, for<'de3> QContractCodeDefinition: Deserialize<'de3>")]
-pub struct QPDeployContract<Hash: QHashBase, QContractCodeDefinition: Serialize + Clone> {
-    pub deployer: Hash,
-    pub code_definition: QContractCodeDefinition,
-    pub function_whitelist: Vec<Hash>,
+impl<Hash: QHashBase> PZKPublicKeyInfo<Hash> {
+    pub fn to_hash<H: MerkleHasher<Hash>>( &self) -> Hash {
+        H::two_to_one(&self.fingerprint, &self.public_key_param)
+    }
 }
 
-
-
-#[pderive::serialize_clone]
-#[serde(bound = "for<'de2> Hash: Deserialize<'de2>, for<'de3> QContractCodeDefinition: Deserialize<'de3>")]
-pub struct QBCDeployContractWithRoot<Hash: QHashBase, QContractCodeDefinition: Serialize + Clone> {
-    pub deployer: Hash,
-    pub function_whitelist_root: Hash,
-    pub code_definition: QContractCodeDefinition,
-    pub function_whitelist: Vec<Hash>,
+impl<F: QFelt64, Hash: QFHashBase<F>> QFieldHashable<F, Hash> for PZKPublicKeyInfo<Hash> {
+    fn qfhash<H: FieldQHasher<F, Hash>>(&self) -> Hash {
+        H::q_two_to_one(self.fingerprint, self.public_key_param)
+    }
 }
 
+impl_qpd_serialize_params!(PZKPublicKeyInfo, { Hash: QHashBase } => { Hash });

@@ -6,7 +6,7 @@ use crate::protocol::core_types::QHashBase;
 // QBCDeployContract
 #[pderive::serialize_clone]
 #[serde(bound = "for<'de2> Hash: Deserialize<'de2>, for<'de3> QContractCodeDefinition: Deserialize<'de3>")]
-pub struct QPDeployContract<Hash: QHashBase, QContractCodeDefinition: Serialize + Clone> {
+pub struct QPBCDeployContract<Hash: QHashBase, QContractCodeDefinition: Serialize + Clone> {
     pub deployer: Hash,
     pub code_definition: QContractCodeDefinition,
     pub function_whitelist: Vec<Hash>,

@@ -5,10 +5,10 @@ use parth_core::crypto::hash::merkle_proof::{DeltaMerkleProofCore, MerkleProofCo
 use parth_core::crypto::hash::traits::{FieldQHasher, MerkleZeroHasher, QFieldHashable};
 use parth_core::felt::QFelt64;
 use parth_core::protocol::core_types::QFHashBase;
+use parth_core::protocol::generic_types::user::PZKPublicKeyInfo;
 use parth_core::{felt::QFelt, protocol::core_types::QHashBase};
 
 use crate::v1::qdata::checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, PQEDCheckpointLeafStats, QEDL2BlockState};
-use crate::v1::qdata::public_key::PZKPublicKeyInfo;
 
 #[pderive::serialize_clone_f_hash_ts]
 #[ts(export, concrete(F = parth_core::PF, Hash = parth_core::PHash), rename = "QEDCheckpointSyncInfoCompact")]
