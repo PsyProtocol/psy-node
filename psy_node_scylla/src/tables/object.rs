@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use parth_core::data::db::table::QDatabaseTableRoutingKey;
 use scylla::{client::session::Session, statement::{prepared::PreparedStatement, Statement}};
 
-use crate::store::scylla::tables::traits::ScylaPreparedTableStatements;
+use crate::tables::traits::ScylaPreparedTableStatements;
 
 
 

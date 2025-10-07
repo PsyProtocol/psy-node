@@ -12,6 +12,7 @@ members = [
     "psy_node_core",
     "psy_node_common",
     "psy_node_redis",
+    "psy_node_scylla",
     "psy_node_nats",
     "parth_node_v1"
 ]

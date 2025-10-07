@@ -6,7 +6,7 @@ use parth_core::{crypto::hash::traits::MerkleZeroHasher, data::{db::{row::{QData
 use scylla::{client::session::{Session, SessionConfig}, statement::batch::Batch};
 use serde::{de::DeserializeOwned, Serialize};
 
-use crate::store::scylla::{constants::{INSERT_DOUBLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE, INSERT_KEY_ID_VALUE_CHECKPOINTED_OBJECT_BATCH_SIZE, INSERT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE, SELECT_DOUBLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE, SELECT_KEY_ID_VALUE_CHECKPOINTED_OBJECT_BATCH_SIZE, SELECT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE}, tables::{merkle::{ScyllaDoubleMerkleNodesPreparedStatements, ScyllaMerkleNodesPreparedStatements}, object::{ScyllaGenericKeyIdValueTablePreparedStatements, ScyllaGenericObjectDoubleIdTablePreparedStatements, ScyllaGenericObjectSingleIdTablePreparedStatements}}, utils::{convert_checkpoint_id_to_i64, convert_i64_to_checkpoint_id, i64_to_u64_exact, u64_to_i64_exact, u8_to_i8_exact}};
+use crate::{constants::{INSERT_DOUBLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE, INSERT_KEY_ID_VALUE_CHECKPOINTED_OBJECT_BATCH_SIZE, INSERT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE, SELECT_DOUBLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE, SELECT_KEY_ID_VALUE_CHECKPOINTED_OBJECT_BATCH_SIZE, SELECT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE}, tables::{merkle::{ScyllaDoubleMerkleNodesPreparedStatements, ScyllaMerkleNodesPreparedStatements}, object::{ScyllaGenericKeyIdValueTablePreparedStatements, ScyllaGenericObjectDoubleIdTablePreparedStatements, ScyllaGenericObjectSingleIdTablePreparedStatements}}, utils::{convert_checkpoint_id_to_i64, convert_i64_to_checkpoint_id, i64_to_u64_exact, u64_to_i64_exact, u8_to_i8_exact}};
 
 
 
@@ -359,7 +359,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
         checkpoint_id: u64, 
         value: &V
     ) -> anyhow::Result<()> {
-        let value_bytes = postcard::to_stdvec(value)?;
+        let value_bytes = pser::serialize(value)?;
         self.session.execute_unpaged(&single_prepared.insert_1_prepared, (u64_to_i64_exact(obj_id), u64_to_i64_exact(checkpoint_id), &value_bytes)).await?;
         Ok(())
     }

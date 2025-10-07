@@ -1736,6 +1736,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "parth_node_scylla"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "auto_impl",
+ "bincode",
+ "bytes",
+ "criterion",
+ "futures",
+ "hex",
+ "hex-literal",
+ "parth_common",
+ "parth_core",
+ "parth_crypto",
+ "postcard",
+ "pser",
+ "psy_common",
+ "psy_core",
+ "psy_data",
+ "psy_node_core",
+ "rand 0.8.5",
+ "rkyv",
+ "scylla",
+ "serde",
+ "serde_json",
+ "serde_repr",
+ "serde_with",
+ "speedy",
+ "strum",
+ "strum_macros",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "parth_node_v1"
 version = "0.1.0"
 dependencies = [

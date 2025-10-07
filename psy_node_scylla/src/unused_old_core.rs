@@ -2,15 +2,16 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use futures::future::join_all;
-use parth_core::{crypto::hash::traits::MerkleZeroHasher, data::{db::{row::{QDatabaseDoubleIdTableRow, QDatabaseDoubleIdTableRowCreatable, QDatabaseDoubleIdTableRowLike, QDatabaseDoubleIdTableRowNoCheckpointId, QDatabaseDoubleIdTableRowNoCheckpointIdLike, QDatabaseKeyIdValueTableRow, QDatabaseKeyIdValueTableRowCreatable, QDatabaseKeyIdValueTableRowLike, QDatabaseSingleIdTableRow, QDatabaseSingleIdTableRowCreatable, QDatabaseSingleIdTableRowLike, QDatabaseSingleIdTableRowNoCheckpointId, QDatabaseSingleIdTableRowNoCheckpointIdLike, QDoubleIdKey}, table::QDatabaseTableRoutingKey}, hash::merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}}, protocol::core_types::QHashBase};
+use parth_core::{crypto::hash::traits::MerkleZeroHasher, data::{db::row::{QDatabaseDoubleIdTableRow, QDatabaseDoubleIdTableRowCreatable, QDatabaseDoubleIdTableRowLike, QDatabaseDoubleIdTableRowNoCheckpointId, QDatabaseDoubleIdTableRowNoCheckpointIdLike, QDatabaseKeyIdValueTableRow, QDatabaseKeyIdValueTableRowCreatable, QDatabaseKeyIdValueTableRowLike, QDatabaseSingleIdTableRow, QDatabaseSingleIdTableRowCreatable, QDatabaseSingleIdTableRowLike, QDatabaseSingleIdTableRowNoCheckpointId, QDatabaseSingleIdTableRowNoCheckpointIdLike, QDoubleIdKey}, hash::merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}, serializable::{BinaryKVWithCheckpointId, QPDPair, QPDSerializable}}, protocol::core_types::QHashBase};
 use scylla::{client::session::{Session, SessionConfig}, statement::batch::Batch};
 use serde::{de::DeserializeOwned, Serialize};
 
-use crate::store::scylla::{constants::{INSERT_DOUBLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE, INSERT_KEY_ID_VALUE_CHECKPOINTED_OBJECT_BATCH_SIZE, INSERT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE, SELECT_DOUBLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE, SELECT_KEY_ID_VALUE_CHECKPOINTED_OBJECT_BATCH_SIZE, SELECT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE}, tables::{merkle::{ScyllaDoubleMerkleNodesPreparedStatements, ScyllaMerkleNodesPreparedStatements}, object::{ScyllaGenericKeyIdValueTablePreparedStatements, ScyllaGenericObjectDoubleIdTablePreparedStatements, ScyllaGenericObjectSingleIdTablePreparedStatements}}, utils::{convert_checkpoint_id_to_i64, convert_i64_to_checkpoint_id, i64_to_u64_exact, u64_to_i64_exact, u8_to_i8_exact}};
+use crate::store::scylla::{constants::{INSERT_DOUBLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE, INSERT_KEY_ID_VALUE_CHECKPOINTED_OBJECT_BATCH_SIZE, INSERT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE, MAX_PREPARED_INSERT_BATCH_SIZE, SELECT_DOUBLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE, SELECT_KEY_ID_VALUE_CHECKPOINTED_OBJECT_BATCH_SIZE, SELECT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE}, tables::{merkle::{ScyllaBlobPreparedStatements, ScyllaDoubleMerkleNodesPreparedStatements, ScyllaMerkleNodesPreparedStatements}, object::{ScyllaGenericKeyIdValueTablePreparedStatements, ScyllaGenericObjectDoubleIdTablePreparedStatements, ScyllaGenericObjectSingleIdTablePreparedStatements}}, utils::{convert_checkpoint_id_to_i64, convert_i64_to_checkpoint_id, i64_to_u64_exact, u64_to_i64_exact, u8_to_i8_exact}};
 
 
 
 
+//const MAX_SELECT_SIZE: usize = 128usize;
 
 
 #[derive(Clone)]
@@ -19,6 +20,10 @@ pub struct ScyllaCoreStore<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> {
     pub keyspace: String,
     pub realm_id: u64,
     pub realm_sub_id: u64,
+    pub prep_blob: ScyllaBlobPreparedStatements,
+    pub prep_merkle: ScyllaMerkleNodesPreparedStatements,
+    pub prep_double_merkle: ScyllaDoubleMerkleNodesPreparedStatements,
+
     _phantom_hash: std::marker::PhantomData<Hash>,
     _phantom_hasher: std::marker::PhantomData<Hasher>,
 }
@@ -38,36 +43,50 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
             )
             .await?;
         session.await_schema_agreement().await?;
+        session.use_keyspace(&keyspace, false).await?;
+        ScyllaMerkleNodesPreparedStatements::create_table(session.clone(), &keyspace).await?;
+        ScyllaDoubleMerkleNodesPreparedStatements::create_table(session.clone(), &keyspace).await?;
+        ScyllaBlobPreparedStatements::create_table(session.clone(), &keyspace).await?;
+        // Prepare statements
+        let prep_blob = ScyllaBlobPreparedStatements::new_from_session(session.clone()).await?;
+
+        let prep_merkle = ScyllaMerkleNodesPreparedStatements::new_from_session(session.clone()).await?;
+        
+        let prep_double_merkle = ScyllaDoubleMerkleNodesPreparedStatements::new_from_session(session.clone()).await?;
+        
         Ok(Self {
             session,
             keyspace,
             realm_id,
             realm_sub_id,
+            prep_blob,
+            prep_merkle,
+            prep_double_merkle,
             _phantom_hash: std::marker::PhantomData,
             _phantom_hasher: std::marker::PhantomData,
         })
     }
-    pub async fn init_single_id_checkpointed(&self, table_name: &str, table_key: QDatabaseTableRoutingKey) -> anyhow::Result<ScyllaGenericObjectSingleIdTablePreparedStatements> {
-       ScyllaGenericObjectSingleIdTablePreparedStatements::new_create_from_session(self.session.clone(), &self.keyspace, table_name, table_key).await
+    pub async fn init_single_id_checkpointed(&self, table_name: &str) -> anyhow::Result<ScyllaGenericObjectSingleIdTablePreparedStatements> {
+        ScyllaGenericObjectSingleIdTablePreparedStatements::create_table(self.session.clone(), &self.keyspace, table_name).await?;
+        let prep = ScyllaGenericObjectSingleIdTablePreparedStatements::new_from_session(self.session.clone(), &self.keyspace, table_name).await?;
+        Ok(prep)
     }
-    pub async fn init_double_id_checkpointed(&self, table_name: &str, table_key: QDatabaseTableRoutingKey) -> anyhow::Result<ScyllaGenericObjectDoubleIdTablePreparedStatements> {
-               ScyllaGenericObjectDoubleIdTablePreparedStatements::new_create_from_session(self.session.clone(), &self.keyspace, table_name, table_key).await
+    pub async fn init_double_id_checkpointed(&self, table_name: &str) -> anyhow::Result<ScyllaGenericObjectDoubleIdTablePreparedStatements> {
+        ScyllaGenericObjectDoubleIdTablePreparedStatements::create_table(self.session.clone(), &self.keyspace, table_name).await?;
+        let prep = ScyllaGenericObjectDoubleIdTablePreparedStatements::new_from_session(self.session.clone(), &self.keyspace, table_name).await?;
+        Ok(prep)
     }
-    pub async fn init_key_id_value(&self, table_name: &str, table_key: QDatabaseTableRoutingKey) -> anyhow::Result<ScyllaGenericKeyIdValueTablePreparedStatements> {
-       ScyllaGenericKeyIdValueTablePreparedStatements::new_create_from_session(self.session.clone(), &self.keyspace, table_name, table_key).await
-    }
-    pub async fn init_single_merkle_table(&self, table_name: &str, table_key: QDatabaseTableRoutingKey) -> anyhow::Result<ScyllaMerkleNodesPreparedStatements> {
-        ScyllaMerkleNodesPreparedStatements::new_create_from_session(self.session.clone(), &self.keyspace, table_name, table_key).await
-    }
-    pub async fn init_double_merkle_table(&self, table_name: &str, table_key: QDatabaseTableRoutingKey) -> anyhow::Result<ScyllaDoubleMerkleNodesPreparedStatements> {
-        ScyllaDoubleMerkleNodesPreparedStatements::new_create_from_session(self.session.clone(), &self.keyspace, table_name, table_key).await
+    pub async fn init_key_id_value(&self, table_name: &str) -> anyhow::Result<ScyllaGenericKeyIdValueTablePreparedStatements> {
+        ScyllaGenericKeyIdValueTablePreparedStatements::create_table(self.session.clone(), &self.keyspace, table_name).await?;
+        let prep = ScyllaGenericKeyIdValueTablePreparedStatements::new_from_session(self.session.clone(), &self.keyspace, table_name).await?;
+        Ok(prep)
     }
 }
 
 
 impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Hasher> {
-    pub async fn select_single_id_merkle_node_max_checkpoint_internal(&self, merkle_prepared: &ScyllaMerkleNodesPreparedStatements, checkpoint_id: u64, tree_id: u64, tree_height: u8, key: SimpleMerkleNodeKey) -> anyhow::Result<Hash> {
-        let res = self.session.execute_unpaged(&merkle_prepared.select_1_prepared, (u64_to_i64_exact(tree_id), u8_to_i8_exact(key.level), u64_to_i64_exact(key.index), convert_checkpoint_id_to_i64(checkpoint_id))).await?;
+    pub async fn select_single_id_merkle_node_max_checkpoint_internal(&self, checkpoint_id: u64, tree_id: u64, tree_height: u8, key: SimpleMerkleNodeKey) -> anyhow::Result<Hash> {
+        let res = self.session.execute_unpaged(&self.prep_merkle.select_1, (u64_to_i64_exact(tree_id), u8_to_i8_exact(key.level), u64_to_i64_exact(key.index), convert_checkpoint_id_to_i64(checkpoint_id))).await?;
         let rows = res.into_rows_result()?;
         match rows.maybe_first_row::<(Vec<u8>,)>()? {
             Some(row) => Ok(Hash::from_bytes(&row.0)?),
@@ -78,7 +97,6 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
 
     pub async fn select_many_single_id_merkle_nodes_max_checkpoint_internal(
         &self,
-        merkle_prepared: &ScyllaMerkleNodesPreparedStatements,
         max_checkpoint_id: u64,
         tree_id: u64,
         tree_height: u8,
@@ -91,7 +109,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
                 .iter()
                 .map(|key| {
                     let session = self.session.clone();
-                    let prep = merkle_prepared.select_1_prepared.clone();
+                    let prep = self.prep_merkle.select_1.clone();
                     let tree_id_i64 = u64_to_i64_exact(tree_id);
                     let level_i8 = u8_to_i8_exact(key.level);
                     let index_i64 = u64_to_i64_exact(key.index);
@@ -119,13 +137,12 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
         }
         Ok(results)
     }
-    pub async fn insert_single_id_merkle_node_internal(&self, merkle_prepared: &ScyllaMerkleNodesPreparedStatements,checkpoint_id: u64, tree_id: u64, key: SimpleMerkleNodeKey, value: &[u8]) -> anyhow::Result<()> {
-        self.session.execute_unpaged(&merkle_prepared.insert_1_prepared, (u64_to_i64_exact(tree_id), u8_to_i8_exact(key.level), u64_to_i64_exact(key.index), u64_to_i64_exact(checkpoint_id), value)).await?;
+    pub async fn insert_single_id_merkle_node_internal(&self, checkpoint_id: u64, tree_id: u64, key: SimpleMerkleNodeKey, value: &[u8]) -> anyhow::Result<()> {
+        self.session.execute_unpaged(&self.prep_merkle.insert_1, (u64_to_i64_exact(tree_id), u8_to_i8_exact(key.level), u64_to_i64_exact(key.index), u64_to_i64_exact(checkpoint_id), value)).await?;
         Ok(())
     }
     pub async fn set_single_id_merkle_nodes_batch_internal(
         &self,
-        merkle_prepared: &ScyllaMerkleNodesPreparedStatements,
         checkpoint_id: u64,
         tree_id: u64,
         nodes: Vec<SimpleMerkleNode<Hash>>,
@@ -137,7 +154,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
         for chunk in nodes.chunks(BATCH_SIZE) {
             let mut batch: Batch = Default::default();
             for _node in chunk {
-                batch.append_statement(merkle_prepared.insert_1_statement.clone());
+                batch.append_statement(self.prep_merkle.insert_1_statement.clone());
             }
             let values: Vec<_> = chunk
                 .iter()
@@ -157,7 +174,6 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
     }
     pub async fn set_double_id_merkle_nodes_batch_internal(
         &self,
-        double_merkle_prepared: &ScyllaDoubleMerkleNodesPreparedStatements,
         checkpoint_id: u64,
         tree_id: u64,
         tree_sub_id: u64,
@@ -170,7 +186,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
         for chunk in nodes.chunks(BATCH_SIZE) {
             let mut batch: Batch = Default::default();
             for _node in chunk {
-                batch.append_statement(double_merkle_prepared.insert_1_statement.clone());
+                batch.append_statement(self.prep_double_merkle.insert_1_statement.clone());
             }
             let values: Vec<_> = chunk
                 .iter()
@@ -188,8 +204,8 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
         }
         Ok(())
     }
-    pub async fn select_double_id_merkle_node_max_checkpoint_internal(&self, double_merkle_prepared: &ScyllaDoubleMerkleNodesPreparedStatements, checkpoint_id: u64, tree_id: u64, tree_height: u8, tree_secondary_id: u64, key: SimpleMerkleNodeKey) -> anyhow::Result<Hash> {
-        let res = self.session.execute_unpaged(&double_merkle_prepared.select_1_prepared, (u64_to_i64_exact(tree_id), u64_to_i64_exact(tree_secondary_id), u8_to_i8_exact(key.level), u64_to_i64_exact(key.index), convert_checkpoint_id_to_i64(checkpoint_id))).await?;
+    pub async fn select_double_id_merkle_node_max_checkpoint_internal(&self, checkpoint_id: u64, tree_id: u64, tree_height: u8, tree_secondary_id: u64, key: SimpleMerkleNodeKey) -> anyhow::Result<Hash> {
+        let res = self.session.execute_unpaged(&self.prep_double_merkle.select_1, (u64_to_i64_exact(tree_id), u64_to_i64_exact(tree_secondary_id), u8_to_i8_exact(key.level), u64_to_i64_exact(key.index), convert_checkpoint_id_to_i64(checkpoint_id))).await?;
         let rows = res.into_rows_result()?;
         match rows.maybe_first_row::<(Vec<u8>,)>()? {
             Some(row) => if row.0.len() == Hash::get_fixed_size() {
@@ -204,7 +220,6 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
 
     pub async fn select_many_double_id_merkle_nodes_max_checkpoint_internal(
         &self,
-        double_merkle_prepared: &ScyllaDoubleMerkleNodesPreparedStatements,
         max_checkpoint_id: u64,
         tree_id: u64,
         tree_sub_id: u64,
@@ -218,7 +233,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
                 .iter()
                 .map(|key| {
                     let session = self.session.clone();
-                    let prep = double_merkle_prepared.select_1_prepared.clone();
+                    let prep = self.prep_double_merkle.select_1.clone();
                     let tree_id_i64 = u64_to_i64_exact(tree_id);
                     let tree_sub_id_i64 = u64_to_i64_exact(tree_sub_id);
                     let level_i8 = u8_to_i8_exact(key.level);
@@ -247,9 +262,258 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>  ScyllaCoreStore<Hash, Has
         }
         Ok(results)
     }
-    pub async fn insert_double_id_merkle_node_internal(&self, double_merkle_prepared: &ScyllaDoubleMerkleNodesPreparedStatements, checkpoint_id: u64, tree_id: u64, tree_secondary_id: u64, key: SimpleMerkleNodeKey, value: &[u8]) -> anyhow::Result<()> {
-        self.session.execute_unpaged(&double_merkle_prepared.insert_1_prepared, (u64_to_i64_exact(tree_id), u64_to_i64_exact(tree_secondary_id), u8_to_i8_exact(key.level), u64_to_i64_exact(key.index), convert_checkpoint_id_to_i64(checkpoint_id), value)).await?;
+    pub async fn insert_double_id_merkle_node_internal(&self, checkpoint_id: u64, tree_id: u64, tree_secondary_id: u64, key: SimpleMerkleNodeKey, value: &[u8]) -> anyhow::Result<()> {
+        self.session.execute_unpaged(&self.prep_double_merkle.insert_1, (u64_to_i64_exact(tree_id), u64_to_i64_exact(tree_secondary_id), u8_to_i8_exact(key.level), u64_to_i64_exact(key.index), u64_to_i64_exact(checkpoint_id), value)).await?;
         Ok(())
+    }
+    pub async fn insert_checkpoint_kv_blob(&self, checkpoint_id: u64, node_key: &[u8], node_value: &[u8]) -> anyhow::Result<()> {
+        let stmt = &self.prep_blob.insert_1;
+        self.session.execute_unpaged(stmt, (node_key, checkpoint_id as i64, node_value)).await?;
+        Ok(())
+    }
+    pub async fn insert_checkpoint_kv_obj<K: QPDSerializable, V: QPDSerializable>(&self, checkpoint_id: u64, node_key: &K, node_value: &V) -> anyhow::Result<()> {
+        let stmt = &self.prep_blob.insert_1;
+        self.session.execute_unpaged(stmt, (node_key.to_bytes()?, checkpoint_id as i64, node_value.to_bytes()?)).await?;
+        Ok(())
+    }
+    pub async fn insert_checkpoint_kv_blobs(&self, checkpoint_id: u64, kvs: &[QPDPair<Vec<u8>, Vec<u8>>]) -> anyhow::Result<()> {
+
+        if kvs.len() == 0 {
+            return Ok(())
+        }else if kvs.len() == 1 {
+            return self.insert_checkpoint_kv_blob(checkpoint_id, &kvs[0].key, &kvs[0].value).await;
+        }
+        let remainder_nodes = kvs.len()%MAX_PREPARED_INSERT_BATCH_SIZE;
+        let full_batches = kvs.len()/MAX_PREPARED_INSERT_BATCH_SIZE;
+
+
+        let mut kvs_iter = kvs.iter();
+
+
+        for _ in 0..full_batches {
+            let mut row = Vec::with_capacity(MAX_PREPARED_INSERT_BATCH_SIZE);
+            for (_, kv) in (0..MAX_PREPARED_INSERT_BATCH_SIZE).zip(&mut kvs_iter) {
+                row.push((
+                    &kv.key,
+                    checkpoint_id as i64,
+                    &kv.value
+                ));
+            }
+            self.session.batch(&self.prep_blob.insert_prepared_batches[MAX_PREPARED_INSERT_BATCH_SIZE-1], row).await?;
+        }
+
+        if remainder_nodes != 0 {
+            let mut row = Vec::with_capacity(MAX_PREPARED_INSERT_BATCH_SIZE);
+            for kv in kvs_iter {
+                row.push((
+                    &kv.key,
+                    checkpoint_id as i64,
+                    &kv.value
+                ));
+            }
+            self.session.batch(&self.prep_blob.insert_prepared_batches[remainder_nodes-1], row).await?;
+
+        }
+
+
+        //Vec::with_capacity(nodes.len());
+
+
+
+
+
+        Ok(())
+    }
+    pub async fn insert_checkpoint_kv_objs<K: QPDSerializable, V: QPDSerializable>(&self, checkpoint_id: u64, kvs: &[QPDPair<K, V>]) -> anyhow::Result<()> {
+
+        if kvs.len() == 0 {
+            return Ok(())
+        }else if kvs.len() == 1 {
+            return self.insert_checkpoint_kv_obj(checkpoint_id, &kvs[0].key, &kvs[0].value).await;
+        }
+        let remainder_nodes = kvs.len()%MAX_PREPARED_INSERT_BATCH_SIZE;
+        let full_batches = kvs.len()/MAX_PREPARED_INSERT_BATCH_SIZE;
+
+
+        let mut kvs_iter = kvs.iter();
+
+
+        for _ in 0..full_batches {
+            let mut row = Vec::with_capacity(MAX_PREPARED_INSERT_BATCH_SIZE);
+            for (_, kv) in (0..MAX_PREPARED_INSERT_BATCH_SIZE).zip(&mut kvs_iter) {
+                row.push((
+                    kv.key.to_bytes()?,
+                    checkpoint_id as i64,
+                    kv.value.to_bytes()?
+                ));
+            }
+            self.session.batch(&self.prep_blob.insert_prepared_batches[MAX_PREPARED_INSERT_BATCH_SIZE-1], row).await?;
+        }
+
+        if remainder_nodes != 0 {
+            let mut row = Vec::with_capacity(MAX_PREPARED_INSERT_BATCH_SIZE);
+            for kv in kvs_iter {
+                row.push((
+                    kv.key.to_bytes()?,
+                    checkpoint_id as i64,
+                    kv.value.to_bytes()?
+                ));
+            }
+            self.session.batch(&self.prep_blob.insert_prepared_batches[remainder_nodes-1], row).await?;
+
+        }
+
+
+        //Vec::with_capacity(nodes.len());
+
+
+
+
+
+        Ok(())
+    }
+
+    pub async fn select_one_checkpoint_kv_blob(&self, checkpoint_id: u64, node_key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
+        let stmt = &self.prep_blob.select_1;
+        let res = self.session.execute_unpaged(stmt, (node_key, checkpoint_id as i64)).await?;
+        let rows = res.into_rows_result()?;
+        match rows.maybe_first_row::<(Vec<u8>,)>()? {
+            Some(row) => Ok(Some(row.0)),
+            None => Ok(None),
+        }
+    }
+    pub async fn select_one_checkpoint_kv_obj<K: QPDSerializable, V: QPDSerializable>(&self, checkpoint_id: u64, node_key: &K) -> anyhow::Result<Option<V>> {
+        let key_bytes = node_key.to_bytes()?;
+        let value_bytes_opt = self.select_one_checkpoint_kv_blob(checkpoint_id, &key_bytes).await?;
+        match value_bytes_opt {
+            Some(value_bytes) => {
+                let value = V::from_bytes(&value_bytes)?;
+                Ok(Some(value))
+            },
+            None => Ok(None),
+        }
+    }
+    pub async fn select_one_checkpoint_kv_blob_with_checkpoint(&self, max_checkpoint_id: u64, node_key: &[u8]) -> anyhow::Result<Option<(Vec<u8>, u64)>> {
+        let stmt = &self.prep_blob.select_1_with_checkpoint;
+        let res = self.session.execute_unpaged(stmt, (node_key, max_checkpoint_id as i64)).await?;
+        let rows = res.into_rows_result()?;
+        match rows.maybe_first_row::<(Vec<u8>, i64)>()? {
+            Some(row) => Ok(Some((row.0, row.1 as u64))),
+            None => Ok(None),
+        }
+    }
+    pub async fn select_one_checkpoint_kv_obj_with_checkpoint<K: QPDSerializable, V: QPDSerializable>(&self, max_checkpoint_id: u64, node_key: &K) -> anyhow::Result<Option<(V, u64)>> {
+        let key_bytes = node_key.to_bytes()?;
+        let value_bytes_opt = self.select_one_checkpoint_kv_blob_with_checkpoint(max_checkpoint_id, &key_bytes).await?;
+        match value_bytes_opt {
+            Some((value_bytes, chkpt_id)) => {
+                let value = V::from_bytes(&value_bytes)?;
+                Ok(Some((value, chkpt_id)))
+            },
+            None => Ok(None),
+        }
+    }
+    pub async fn select_15_checkpoint_kv_obj_with_checkpoint<K: QPDSerializable, V: QPDSerializable>(&self, max_checkpoint_id: u64, keys: [K; 15] ) -> anyhow::Result<Vec<Option<V>>> {
+
+
+        let key_ids: [_; 15] = core::array::from_fn(|x| keys[x].to_bytes().unwrap());
+
+
+        
+
+
+
+        let result = self.session.execute_unpaged(&self.prep_blob.select_15, (
+            &key_ids[0],
+            &key_ids[1],
+            &key_ids[2],
+            &key_ids[3],
+            &key_ids[4],
+            &key_ids[5],
+            &key_ids[6],
+            &key_ids[7],
+            &key_ids[8],
+            &key_ids[9],
+            &key_ids[10],
+            &key_ids[11],
+            &key_ids[12],
+            &key_ids[13],
+            &key_ids[14],
+            if max_checkpoint_id > i64::MAX as u64 { i64::MAX } else { max_checkpoint_id as i64 }
+        )).await?;
+        let res = result.into_rows_result()?;
+
+        let mut final_result = Vec::with_capacity(15);
+
+        for row in res.rows::<(Vec<u8>, Vec<u8>)>()? {
+            match row {
+                Ok(a) => {
+                    let (node_uuid, value) = a;
+                    //let regen = get_partial_node_key(&node_uuid)?;
+
+                    for (i, v) in key_ids.iter().enumerate(){
+                        if v.eq(&node_uuid) {
+                            final_result[i] = Some(V::from_bytes(&value)?);
+
+                        }
+                    }
+                },
+                Err(e) => println!("derser: {:?}",e),
+            }
+
+        }
+
+        Ok(final_result)
+    }
+    pub async fn select_many_checkpoint_kv_obj_with_checkpoint<K: QPDSerializable + Copy, V: QPDSerializable>(&self, max_checkpoint_id: u64, keys: &[K]) -> anyhow::Result<Vec<Option<V>>> {
+        let mut results: Vec<Option<V>> = Vec::with_capacity(keys.len());
+
+        let full_batches = keys.len()/15;
+        //let remainder = keys.len()%15;
+
+        for batch_id in 0..full_batches {
+
+            let batch : [K; 15] = core::array::from_fn(|x| keys[(batch_id*15)+x]);
+            results.extend_from_slice(&self.select_15_checkpoint_kv_obj_with_checkpoint(max_checkpoint_id, batch).await?);
+
+        }
+        for key in keys[full_batches*15..].iter() {
+            let v = self.select_one_checkpoint_kv_obj::<K,V>(max_checkpoint_id, key).await?;
+            results.push(v)
+        }
+        Ok(results)
+        
+        /*
+        if KVQMerkleNodeKey::node_list_in_same_tree(keys) && false {
+            // todo implement that
+            todo!("implement this opt");
+        }else{
+            let mut results = Vec::with_capacity(keys.len());
+            for key in keys.iter() {
+                let v = self.get_node_value_at_checkpoint(key).await?;
+                results.push(v)
+            }
+            Ok(results)
+        }*/
+    }
+
+    pub async fn select_all_checkpoint_kv_blobs(&self) -> anyhow::Result<Vec<BinaryKVWithCheckpointId>> {
+        let stmt = &self.prep_blob.select_all;
+        let res = self.session.execute_unpaged(stmt, ()).await?;
+        let rows_result = res.into_rows_result()?;
+        let rows_iter = rows_result.rows::<(Vec<u8>,i64,Vec<u8>)>()?;
+        let rows_vec: Vec<_> = rows_iter.collect();
+        let mut results = Vec::with_capacity(rows_vec.len());
+
+        for row in rows_vec {
+            let (node_key, checkpoint_id, node_value): (Vec<u8>, i64, Vec<u8>) = row?;
+            results.push(BinaryKVWithCheckpointId {
+                key: node_key,
+                value: node_value,
+                checkpoint_id: checkpoint_id as u64,
+            });
+        }
+        Ok(results)
     }
 
 }   
