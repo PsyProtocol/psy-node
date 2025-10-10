@@ -88,8 +88,6 @@ impl<T:
 
 pub trait QFelt64: QFelt + ToU64Value {}
 impl<T: QFelt + ToU64Value> QFelt64 for T {}
-
-
 pub trait QFeltSized {
     fn q_felt_size() -> usize;
     fn self_qsize(&self) -> usize {

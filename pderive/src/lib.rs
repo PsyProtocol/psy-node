@@ -46,7 +46,6 @@ pub fn serialize_clone_f_hash(_attr: TokenStream, input: TokenStream) -> TokenSt
     let derive_serde: Attribute = syn::parse_quote!(
         #[derive(
             Debug,
-            Copy,
             Clone,
             PartialEq,
             Eq,

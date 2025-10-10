@@ -159,7 +159,7 @@ pub fn bench_lops2(c: &mut Criterion) {
     group.bench_function("set_10000_single_id_nodes_merkle_kv_blob", |b| {
         b.iter(|| {
             let nodes: Vec<_> = (0..10000).map(|i| QPDPair {
-                key: QMerkleStoreBlobKey { table_type: 0x2000, tree_id: 1337, level: tree_height, index: i },
+                key: QMerkleStoreSingleIdKey { table_type: 0x2000, tree_id: 1337, level: tree_height, index: i },
                 value: Hash256([(i & 255) as u8; 32]),
             }).collect();
             rt.block_on(store.insert_checkpoint_kv_objs(3, &nodes)).unwrap();

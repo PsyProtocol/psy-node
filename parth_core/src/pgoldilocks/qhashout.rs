@@ -2,7 +2,7 @@ use std::{fmt::Display, str::FromStr};
 
 use anyhow::ensure;
 use ts_rs::TS;
-use crate::{crypto::hash::traits::{FromU64x4, HashTo4Felts, RandomHash, ToU64x4, ZeroableHash}, data::{hash::hash256::Hash256, serializable::{QPDSerializable, QPDSerializableFixed}}, felt::ToQFelts, protocol::core_types::QHashBase};
+use crate::{crypto::hash::traits::{FromU64x4, HashTo4Felts, RandomHash, ToU64x4, ZeroableHash}, data::{hash::hash256::Hash256, serializable::{QPDSerializable, QPDSerializableFixed}}, felt::{QFelt64, ToQFelts}, protocol::core_types::QHashBase};
 use plonky2::{
     field::{
         goldilocks_field::GoldilocksField,
@@ -18,6 +18,41 @@ use serde_with::serde_as;
 #[pderive::non_serde_serialize]
 #[ts(export, concrete(F = GoldilocksField))]
 pub struct QHashOut<F: Field>(pub HashOut<F>);
+
+impl<F: QFelt64 + Field> PartialOrd for QHashOut<F> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        let self_felts = [
+            self.0.elements[0].to_u64_value(),
+            self.0.elements[1].to_u64_value(),
+            self.0.elements[2].to_u64_value(),
+            self.0.elements[3].to_u64_value(),
+        ];
+        let other_felts = [
+            other.0.elements[0].to_u64_value(),
+            other.0.elements[1].to_u64_value(),
+            other.0.elements[2].to_u64_value(),
+            other.0.elements[3].to_u64_value(),
+        ];
+        self_felts.partial_cmp(&other_felts)
+    }
+}
+impl<F: QFelt64 + Field> Ord for QHashOut<F> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let self_felts = [
+            self.0.elements[0].to_u64_value(),
+            self.0.elements[1].to_u64_value(),
+            self.0.elements[2].to_u64_value(),
+            self.0.elements[3].to_u64_value(),
+        ];
+        let other_felts = [
+            other.0.elements[0].to_u64_value(),
+            other.0.elements[1].to_u64_value(),
+            other.0.elements[2].to_u64_value(),
+            other.0.elements[3].to_u64_value(),
+        ];
+        self_felts.cmp(&other_felts)
+    }
+}
 
 pub type GoldilocksHashOut = QHashOut<GoldilocksField>;
 
@@ -312,4 +347,4 @@ impl<F: RichField> FromU64x4 for QHashOut<F> {
         Self::from_values(data[0], data[1], data[2], data[3])
     }
 }
-impl<F: RichField> QHashBase for QHashOut<F> {}
+impl<F: RichField + QFelt64> QHashBase for QHashOut<F> {}

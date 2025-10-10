@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use parth_core::{
-    crypto::hash::{tag_tree::TagTreeMerkleProof, traits::MerkleZeroHasher},
+    crypto::hash::{merkle_proof::MerkleProofCore, tag_tree::TagTreeMerkleProof, traits::MerkleZeroHasher},
     data::{
         db::{
             data_types::{BiDirectionalMappingRow, CoreDatabaseValueDeserialize, QDatabasePrimitiveKey},
@@ -17,7 +17,6 @@ use parth_core::{
     protocol::core_types::QHashBase,
 };
 use serde::{de::DeserializeOwned, Serialize};
-
 #[async_trait]
 pub trait CoreDatabaseBidirectionalMappingReader<TableIdentifier: Clone + Send + Sync> {
     async fn db_select_one_by_k1<K1: QDatabasePrimitiveKey, K2: QDatabasePrimitiveKey>(
@@ -114,7 +113,6 @@ impl<
     > CoreDatabaseBidirectionalU64U128MappingStore<TableIdentifier> for T
 {
 }
-
 #[async_trait]
 pub trait CoreDatabaseU64Reader<TableIdentifier: Clone + Send + Sync> {
     async fn db_select_u64_value(&self, table: &TableIdentifier, obj_id: u64) -> anyhow::Result<Option<u64>>;
@@ -224,6 +222,7 @@ impl<
     > CoreDatabaseSingleIdCheckpointedStore<TableIdentifier> for T
 {
 }
+
 #[async_trait]
 pub trait CoreDatabaseDoubleIdCheckpointedReader<TableIdentifier: Clone + Send + Sync> {
     async fn db_select_one_double_checkpointed_object_value<V: CoreDatabaseValueDeserialize>(
@@ -395,6 +394,8 @@ pub trait CoreDatabaseSingleIdMerkleReader<
         tree_height: u8,
         keys: &[SimpleMerkleNodeKey],
     ) -> anyhow::Result<Vec<Hash>>;
+
+    
 }
 
 #[async_trait]
@@ -419,6 +420,7 @@ pub trait CoreDatabaseSingleIdMerkleWriter<
         tree_id: u64,
         nodes: Vec<SimpleMerkleNode<Hash>>,
     ) -> anyhow::Result<()>;
+    
 }
 pub trait CoreDatabaseSingleIdMerkleStore<
     Hash: QHashBase + Send + Sync,
@@ -437,11 +439,7 @@ impl<
 }
 
 #[async_trait]
-pub trait CoreDatabaseTagTreeReader<
-    Hash: QHashBase + Send + Sync,
-    Hasher: MerkleZeroHasher<Hash> + Send + Sync,
-    TableIdentifier: Clone + Send + Sync,
->
+pub trait CoreDatabaseTagTreeReader<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync, TableIdentifier: Clone + Send + Sync>
 {
     async fn db_get_tag_tree_node_value(
         &self,
@@ -461,25 +459,17 @@ pub trait CoreDatabaseTagTreeReader<
         unique_pending_id: u64,
         key: &SimpleMerkleNodeKey,
     ) -> anyhow::Result<Option<Hash>>;
-    async fn db_get_tag_tree_root(
-        &self,
-        table: &TableIdentifier,        
-        unique_pending_id: u64,
-    ) -> anyhow::Result<Option<Hash>>;
+    async fn db_get_tag_tree_root(&self, table: &TableIdentifier, unique_pending_id: u64) -> anyhow::Result<Option<Hash>>;
     async fn db_get_tag_tree_merkle_proof(
         &self,
-        table: &TableIdentifier,        
+        table: &TableIdentifier,
         unique_pending_id: u64,
         key: &SimpleMerkleNodeKey,
     ) -> anyhow::Result<TagTreeMerkleProof<Hash>>;
 }
 
 #[async_trait]
-pub trait CoreDatabaseTagTreeWriter<
-    Hash: QHashBase + Send + Sync,
-    Hasher: MerkleZeroHasher<Hash> + Send + Sync,
-    TableIdentifier: Clone + Send + Sync,
->
+pub trait CoreDatabaseTagTreeWriter<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync, TableIdentifier: Clone + Send + Sync>
 {
     async fn set_tag_tree_tag_value(
         &self,
@@ -489,19 +479,10 @@ pub trait CoreDatabaseTagTreeWriter<
         tag: &Hash,
         value: &Hash,
     ) -> anyhow::Result<()>;
-    async fn set_tag_tree_tag(
-        &self,
-        table: &TableIdentifier,
-        unique_pending_id: u64,
-        key: &SimpleMerkleNodeKey,
-        tag: &Hash,
-    ) -> anyhow::Result<()>;
+    async fn set_tag_tree_tag(&self, table: &TableIdentifier, unique_pending_id: u64, key: &SimpleMerkleNodeKey, tag: &Hash) -> anyhow::Result<()>;
 }
-pub trait CoreDatabaseTagTreeStore<
-    Hash: QHashBase + Send + Sync,
-    Hasher: MerkleZeroHasher<Hash> + Send + Sync,
-    TableIdentifier: Clone + Send + Sync,
->: CoreDatabaseTagTreeReader<Hash, Hasher, TableIdentifier> + CoreDatabaseTagTreeWriter<Hash, Hasher, TableIdentifier>
+pub trait CoreDatabaseTagTreeStore<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync, TableIdentifier: Clone + Send + Sync>:
+    CoreDatabaseTagTreeReader<Hash, Hasher, TableIdentifier> + CoreDatabaseTagTreeWriter<Hash, Hasher, TableIdentifier>
 {
 }
 impl<

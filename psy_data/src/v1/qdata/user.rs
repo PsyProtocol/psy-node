@@ -2,8 +2,7 @@ use parth_core::{crypto::hash::traits::{FieldQHasher, QFieldHashable}, data::ser
 use serde::{Deserialize, Serialize};
 use pser::{QBytesDeserialize, QBytesSerialize};
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Copy, Default,ts_rs::TS)]
-#[serde(bound = "for<'de2> F: Deserialize<'de2>, for<'de2> Hash: Deserialize<'de2>")]
+#[pderive::serialize_copy_f_hash_ts]
 #[ts(export, concrete(F = parth_core::PF, Hash = parth_core::PHash), rename = "QEDUserLeaf")]
 pub struct PQEDUserLeaf<F: QFelt, Hash: QHashBase> {
     pub public_key: Hash,

@@ -244,7 +244,17 @@ impl<Hash: PartialOrd> PartialOrd for SimpleMerkleNode<Hash> {
         }
     }
 }
-
+impl<Hash: Ord> Ord for SimpleMerkleNode<Hash> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        if self.key.level != other.key.level {
+            self.key.level.cmp(&other.key.level)
+        }else if self.key.index != other.key.index {
+            self.key.index.cmp(&other.key.index)
+        }else {
+            self.value.cmp(&other.value)
+        }
+    }
+}
 
 #[pderive::serialize_copy]
 pub struct SimpleMerkleNodeNCAAggregation {
