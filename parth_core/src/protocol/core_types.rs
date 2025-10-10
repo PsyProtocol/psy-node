@@ -1,12 +1,13 @@
 use serde::{de::DeserializeOwned, Serialize};
 use ts_rs::TS;
 
-use crate::{crypto::hash::traits::{FromU64x4, HashTo4Felts, QHasher, ZeroableHash}, data::{hash::merkle_node_key::SimpleMerkleNodeKey, parth::public_preimage::{QParthProofPublicInputsPreimage, QParthProofPublicInputsPreimageWithoutRewardsHash}, queue::queue_key::PCoreQueueItemBase, serializable::{QPDSerializable, QPDSerializableFixed}}, felt::QFelt64, QJobIdSerialized};
+use crate::{crypto::hash::traits::{FieldQHasher, FromU64x4, HashTo4Felts, QHasher, ZeroableHash}, data::{hash::merkle_node_key::SimpleMerkleNodeKey, parth::public_preimage::{QParthProofPublicInputsPreimage, QParthProofPublicInputsPreimageWithoutRewardsHash}, queue::queue_key::PCoreQueueItemBase, serializable::{QPDSerializable, QPDSerializableFixed}}, felt::QFelt64, QJobIdSerialized};
 
 pub trait QStorableBase: Serialize + DeserializeOwned + Send + Sync + Clone + PartialEq + Eq {}
 pub trait QStorableSizedBase: QStorableBase + Sized {}
 impl<T: Serialize + DeserializeOwned + Send + Sync + Clone + PartialEq + Eq> QStorableBase for T {}
 impl<T: QStorableBase + Sized> QStorableSizedBase for T {}
+pub trait QFHasherU64<F: QFelt64, Hash: QFHashBase<F>>: FieldQHasher<F, Hash> + QHasher<Hash> {}
 
 pub trait QHashBase: PartialEq + ZeroableHash + Copy + Serialize + DeserializeOwned + QPDSerializable + QPDSerializableFixed + Sync + Send + FromU64x4 + TS + Default {}
 pub trait QFHashBase<F: QFelt64>: QHashBase + HashTo4Felts<F> {}
@@ -48,20 +49,57 @@ pub trait QJobIdBase: Send + Sync + Serialize + DeserializeOwned + Clone + Parti
 pub trait QJobPlanner<JobId: QJobIdBase> {
     fn get_child_job_for_circuit_type(&self, children_circuit_types: &[u32]) -> u32;
 }
-pub trait QNetworkTypesConfigBase {
+
+pub trait QNetworkTreeConstants {
+    const CHECKPOINT_TREE_HEIGHT_USIZE: usize;
+    const CHECKPOINT_TREE_HEIGHT: u8;
+
+    const GLOBAL_USER_TREE_HEIGHT_USIZE: usize;
+    const GLOBAL_USER_TREE_HEIGHT: u8;
+
+    const GLOBAL_CONTRACT_TREE_HEIGHT_USIZE: usize;
+    const GLOBAL_CONTRACT_TREE_HEIGHT: u8;
+    
+    const CONTRACT_FUNCTION_TREE_HEIGHT_USIZE: usize;
+    const CONTRACT_FUNCTION_TREE_HEIGHT: u8;
+
+    // the height of the global user tree stored in the coordinator (ie. the upper half of the merkle tree)
+    const COORDINATOR_GLOBAL_USER_TREE_HEIGHT_USIZE: usize;
+    const COORDINATOR_GLOBAL_USER_TREE_HEIGHT: u8;
+    
+     // the height of the global user tree stored in each realm (ie. the height of the sub-trees stored in each realm == GLOBAL_USER_TREE_HEIGHT - COORDINATOR_GLOBAL_USER_TREE_HEIGHT)
+    const REALM_GLOBAL_USER_TREE_HEIGHT_USIZE: usize;
+    const REALM_GLOBAL_USER_TREE_HEIGHT: u8;
+
+
+    const MAX_CONTRACT_STATE_TREE_HEIGHT_USIZE: usize;
+    const MAX_CONTRACT_STATE_TREE_HEIGHT: u8;
+
+
+    const MAX_USERS: u64; // = 2**GLOBAL_USER_TREE_HEIGHT
+    const MAX_REALMS: u32; // = 2**COORDINATOR_GLOBAL_USER_TREE_HEIGHT
+    const MAX_USERS_PER_REALM: u32; // = 2**REALM_GLOBAL_USER_TREE_HEIGHT
+}
+pub trait QNetworkHashTypes {
+    type QHash: QFHashBase<Self::F>;
+    type HasherBase: QFHasherU64<Self::F, Self::QHash>;
+    type F: QFelt64;
+}
+pub trait QNetworkZKTypes: QNetworkHashTypes {
+    type ZKProof: QProofBase;
+    type ZKVerifier: QZKProofVerifier<Self::QHash, Self::ZKProof>;
+}
+
+pub trait QNetworkTypesConfig: QNetworkTreeConstants + QNetworkZKTypes + QJobIdBase + QJobPlanner<Self::JobId> {
+    type JobId: QJobIdBase;
+    type JobPlanner: QJobPlanner<Self::JobId>;
+}
+/*
+pub trait QNetworkTypesConfigBase: QNetworkTreeConstants {
     type QHash: QHashBase;
     type ZKProof: QProofBase;
     type HasherBase: QHasherBase<Self::QHash, Self::ZKProof>;
     type JobId: QJobIdBase;
     type F: QFelt64;
-
-    const GLOBAL_USER_TREE_HEIGHT: u8; // the height of the global user tree, ie. the full merkle tree that can hold all users
-    const COORDINATOR_GLOBAL_USER_TREE_HEIGHT: u8; // the height of the global user tree stored in the coordinator (ie. the upper half of the merkle tree)
-    const REALM_GLOBAL_USER_TREE_HEIGHT: u8; // the height of the global user tree stored in each realm (ie. the height of the sub-trees stored in each realm == GLOBAL_USER_TREE_HEIGHT - COORDINATOR_GLOBAL_USER_TREE_HEIGHT)
-    const MAX_USERS: u64; // = 2**GLOBAL_USER_TREE_HEIGHT
-    const MAX_REALMS: u32; // = 2**COORDINATOR_GLOBAL_USER_TREE_HEIGHT
-    const MAX_USERS_PER_REALM: u32; // = 2**REALM_GLOBAL_USER_TREE_HEIGHT
 }
-
-
-
+*/

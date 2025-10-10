@@ -1,8 +1,3 @@
-pub const GLOBAL_USER_TREE_HEIGHT: u8 = 24;
-pub const COORDINATOR_USER_TREE_HEIGHT: u8 = 4;
-pub const REALM_USER_TREE_HEIGHT: u8 = 20;
-pub const GROUP_REALM_HEIGHT: u8 = 1;
-pub const USERS_PER_REALM: u64 = 1048576;
 
 // Native currency configuration
 pub const NATIVE_CURRENCY_DECIMAL: u8 = 9;
@@ -46,15 +41,6 @@ impl QEDTreeConfig for QEDTestnetTreeConfig {
 pub const QED_NETWORK_MAGIC_MAINNET: u64 = 0x1337CF514544C069u64;
 pub const QED_NETWORK_MAGIC_TESTNET: u64 = 0x1337CF514544C169u64;
 pub const QED_NETWORK_MAGIC_REGTEST: u64 = 0x1337CF514544CF69u64;
-
-pub const CHECKPOINT_TREE_HEIGHT: u8 = 32;
-pub const GLOBAL_CONTRACT_TREE_HEIGHT: u8 = 24;
-pub const GLOBAL_DEPOSIT_TREE_HEIGHT: u8 = 32;
-pub const GLOBAL_WITHDRAWAL_TREE_HEIGHT: u8 = 32;
-
-pub const CONTRACT_FUNCTION_TREE_HEIGHT: u8 = 16;
-
-pub const MAX_CONTRACT_STATE_TREE_HEIGHT: u8 = 32;
 
 
 // Number of blocks that a data availability mining challenge is open for

@@ -1,1 +1,2 @@
 pub mod simple_memory_merkle_store;
+pub mod simple_memory_tag_tree_store;

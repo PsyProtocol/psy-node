@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use parth_core::{
-    crypto::hash::traits::MerkleZeroHasher,
+    crypto::hash::{tag_tree::TagTreeMerkleProof, traits::MerkleZeroHasher},
     data::{
         db::{
             data_types::{BiDirectionalMappingRow, CoreDatabaseValueDeserialize, QDatabasePrimitiveKey},
@@ -433,6 +433,83 @@ impl<
         TableIdentifier: Clone + Send + Sync,
         T: CoreDatabaseSingleIdMerkleReader<Hash, Hasher, TableIdentifier> + CoreDatabaseSingleIdMerkleWriter<Hash, Hasher, TableIdentifier>,
     > CoreDatabaseSingleIdMerkleStore<Hash, Hasher, TableIdentifier> for T
+{
+}
+
+#[async_trait]
+pub trait CoreDatabaseTagTreeReader<
+    Hash: QHashBase + Send + Sync,
+    Hasher: MerkleZeroHasher<Hash> + Send + Sync,
+    TableIdentifier: Clone + Send + Sync,
+>
+{
+    async fn db_get_tag_tree_node_value(
+        &self,
+        table: &TableIdentifier,
+        unique_pending_id: u64,
+        key: &SimpleMerkleNodeKey,
+    ) -> anyhow::Result<Option<Hash>>;
+    async fn db_get_tag_tree_node_values(
+        &self,
+        table: &TableIdentifier,
+        unique_pending_id: u64,
+        keys: &[SimpleMerkleNodeKey],
+    ) -> anyhow::Result<Vec<Option<Hash>>>;
+    async fn db_get_tag_tree_node_tag(
+        &self,
+        table: &TableIdentifier,
+        unique_pending_id: u64,
+        key: &SimpleMerkleNodeKey,
+    ) -> anyhow::Result<Option<Hash>>;
+    async fn db_get_tag_tree_root(
+        &self,
+        table: &TableIdentifier,        
+        unique_pending_id: u64,
+    ) -> anyhow::Result<Option<Hash>>;
+    async fn db_get_tag_tree_merkle_proof(
+        &self,
+        table: &TableIdentifier,        
+        unique_pending_id: u64,
+        key: &SimpleMerkleNodeKey,
+    ) -> anyhow::Result<TagTreeMerkleProof<Hash>>;
+}
+
+#[async_trait]
+pub trait CoreDatabaseTagTreeWriter<
+    Hash: QHashBase + Send + Sync,
+    Hasher: MerkleZeroHasher<Hash> + Send + Sync,
+    TableIdentifier: Clone + Send + Sync,
+>
+{
+    async fn set_tag_tree_tag_value(
+        &self,
+        table: &TableIdentifier,
+        unique_pending_id: u64,
+        key: &SimpleMerkleNodeKey,
+        tag: &Hash,
+        value: &Hash,
+    ) -> anyhow::Result<()>;
+    async fn set_tag_tree_tag(
+        &self,
+        table: &TableIdentifier,
+        unique_pending_id: u64,
+        key: &SimpleMerkleNodeKey,
+        tag: &Hash,
+    ) -> anyhow::Result<()>;
+}
+pub trait CoreDatabaseTagTreeStore<
+    Hash: QHashBase + Send + Sync,
+    Hasher: MerkleZeroHasher<Hash> + Send + Sync,
+    TableIdentifier: Clone + Send + Sync,
+>: CoreDatabaseTagTreeReader<Hash, Hasher, TableIdentifier> + CoreDatabaseTagTreeWriter<Hash, Hasher, TableIdentifier>
+{
+}
+impl<
+        Hash: QHashBase + Send + Sync,
+        Hasher: MerkleZeroHasher<Hash> + Send + Sync,
+        TableIdentifier: Clone + Send + Sync,
+        T: CoreDatabaseTagTreeReader<Hash, Hasher, TableIdentifier> + CoreDatabaseTagTreeWriter<Hash, Hasher, TableIdentifier>,
+    > CoreDatabaseTagTreeStore<Hash, Hasher, TableIdentifier> for T
 {
 }
 

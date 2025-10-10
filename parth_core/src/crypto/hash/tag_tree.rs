@@ -15,8 +15,15 @@ Level[2][0] = hash(hash(Level[1][0], Level[1][1]), Tag[2][0])
 
 Level[n][i] = hash(hash(Level[n-1][2*i], Level[n-1][2*i+1]), Tag[n][i])
 */
+#[inline]
+pub fn hash_tag_tree_node<Hash: PartialEq + Copy, Hasher: MerkleHasher<Hash>>(left: &Hash, right: &Hash, tag: &Hash) -> Hash {
+    Hasher::two_to_one(&Hasher::two_to_one(left, right), tag)
+}
 
-
+#[inline]
+pub fn hash_tag_tree_node_owned<Hash: PartialEq + Copy, Hasher: MerkleHasher<Hash>>(left: Hash, right: Hash, tag: Hash) -> Hash {
+    Hasher::two_to_one(&Hasher::two_to_one(&left, &right), &tag)
+}
 
 pub fn compute_tag_tree_root_for_proof<Hash: PartialEq + Copy, Hasher: MerkleHasher<Hash>>(
     index: u64,
@@ -105,7 +112,7 @@ impl<Hash: PartialEq + Copy + Default> Default for TagTreeNodePreimage<Hash> {
 
 impl<Hash: PartialEq + Copy> TagTreeNodePreimage<Hash> {
     fn get_node_hash<Hasher: MerkleHasher<Hash>>(&self) -> Hash {
-        Hasher::two_to_one(&Hasher::two_to_one(&self.left, &self.right), &self.tag)
+        hash_tag_tree_node::<Hash, Hasher>(&self.left, &self.right, &self.tag)
     }
 }
 
@@ -113,6 +120,13 @@ impl<Hash: PartialEq + Copy> TagTreeNodePreimage<Hash> {
 pub struct TagTreeProofNode<Hash: PartialEq + Copy> {
     pub sibling: Hash,
     pub parent_tag: Hash,
+}
+
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Ord, PartialOrd, Copy)]
+pub struct TagTreeStorageNode<Hash: PartialEq + Copy> {
+    pub value: Hash,
+    pub tag: Hash,
 }
 
 

@@ -34,3 +34,4 @@ parth_core = { workspace = true }
 
 [dev-dependencies]
 parth_crypto = { workspace = true }
+rand = { workspace = true }

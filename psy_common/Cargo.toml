@@ -34,4 +34,6 @@ hashbrown = { workspace = true }
 
 # start local packages
 parth_core = { workspace = true }
+psy_core = { workspace = true }
+psy_data = { workspace = true }
 pser = { workspace = true }

@@ -1,3 +1,4 @@
+use core::panic;
 use std::cmp::Ordering;
 use crate::data::serializable::{QPDSerializable, QPDSerializableFixed};
 
@@ -242,6 +243,138 @@ pub struct SimpleMerkleNodeNCAAggregation {
 }
 
 
+// --- Add this new helper function ---
+
+/// A truly efficient recursive helper that avoids HashMap lookups in the hot path.
+///
+/// It returns a tuple `(SimpleMerkleNodeKey, usize)` representing the NCA key and its
+/// calculated dependency level. This avoids the need for a shared map to store levels,
+/// passing the state up the call stack instead.
+fn build_recursive_truly_efficient(
+    nodes: &[SimpleMerkleNodeKey],
+    subtree_root: SimpleMerkleNodeKey,
+    tree_height: u8,
+    // We still collect the aggregations with their levels as we go.
+    aggregations: &mut Vec<SimpleMerkleNodeNCAAggregation>,
+) -> Option<SimpleMerkleNodeKey> { // Return type changed!
+    if nodes.is_empty() {
+        return None;
+    }
+    // Base case: A single node is a leaf in the NCA tree. Its level is 0.
+    if nodes.len() == 1 {
+        return Some(nodes[0]); // Return key and level 0.
+    }
+
+    // --- Divide Phase ---
+    let right_child = subtree_root.right_child();
+    let split_leaf_index = right_child.first_leaf_child(tree_height).index;
+    let partition_idx = nodes.partition_point(|node| node.index < split_leaf_index);
+    let (left_nodes, right_nodes) = nodes.split_at(partition_idx);
+
+    // --- Conquer Phase ---
+    let left_result = build_recursive_truly_efficient(
+        left_nodes,
+        subtree_root.left_child(),
+        tree_height,
+        aggregations,
+    );
+    let right_result = build_recursive_truly_efficient(
+        right_nodes,
+        right_child,
+        tree_height,
+        aggregations,
+    );
+
+    // --- Combine Phase ---
+    match (left_result, right_result) {
+        (Some(l_key), Some(r_key)) => {
+            let combined_nca_key = l_key.find_nearest_common_ancestor(&r_key);
+            
+            let agg = SimpleMerkleNodeNCAAggregation {
+                nca: combined_nca_key,
+                left: l_key,
+                right: r_key,
+            };
+            aggregations.push(agg);
+            
+            // Pass the new key and its calculated level up the call stack.
+            Some(combined_nca_key)
+        }
+        // If only one side has a result, pass it up directly.
+        (Some(l_res), None) => Some(l_res),
+        (None, Some(r_res)) => Some(r_res),
+        (None, None) => None,
+    }
+}
+
+
+// --- New top-level function. Can replace the old `efficient` one ---
+
+pub fn generate_nca_tree_groups_efficient(leaves: &[SimpleMerkleNodeKey], _leaf_level: u8) -> Vec<Vec<SimpleMerkleNodeNCAAggregation>> {
+    if leaves.len() < 2 {
+        return vec![];
+    }
+    
+    let tree_height = leaves[0].level;
+
+    let mut sorted_leaves = leaves.to_vec();
+    sorted_leaves.sort();
+
+    let mut aggregations = Vec::new();
+    let root_node = SimpleMerkleNodeKey::new(0, 0);
+
+    // This single call builds the tree and determines the level for each aggregation.
+    build_recursive_truly_efficient(
+        &sorted_leaves, 
+        root_node, 
+        tree_height, 
+        &mut aggregations,
+    );
+
+    if aggregations.is_empty() {
+        return vec![];
+    }
+
+    let mut nca_map: std::collections::HashMap<SimpleMerkleNodeKey, SimpleMerkleNodeNCAAggregation> = std::collections::HashMap::new();
+    aggregations.iter().for_each(|x| {
+        nca_map.insert(x.nca.clone(), x.clone());
+    });
+    let mut levels = Vec::with_capacity(tree_height as usize + 1);
+
+    let root = aggregations.last().unwrap().clone();
+    if root.left.level == tree_height && root.right.level == tree_height {
+        return vec![vec![root]];
+    }
+
+    let mut has_non_leaf_children = true;
+    let mut current_level = vec![root];
+    
+    while has_non_leaf_children {
+        levels.push(current_level.clone());
+        let mut next_level = Vec::new();
+        has_non_leaf_children = false;
+        for agg in current_level.iter() {
+            if agg.left.level != tree_height {
+                if let Some(left_agg) = nca_map.get(&agg.left) {
+                    next_level.push(left_agg.clone());
+                    has_non_leaf_children = true;
+                }
+            }
+            if agg.right.level != tree_height {
+                if let Some(right_agg) = nca_map.get(&agg.right) {
+                    next_level.push(right_agg.clone());
+                    has_non_leaf_children = true;
+                }
+            }
+        }
+        current_level = next_level;
+    }
+    if current_level.len() > 0 {
+        levels.push(current_level);
+    }
+    levels.reverse();
+    levels
+}
 // --- Function Implementation ---
 
 /// Recursively builds the aggregation path for a given set of nodes within a specific sub-tree.
@@ -336,6 +469,89 @@ pub fn generate_nca_tree(leaves: &[SimpleMerkleNodeKey]) -> Vec<SimpleMerkleNode
     aggregations
 }
 
+pub fn generate_nca_tree_groups_naive(leaves: &[SimpleMerkleNodeKey], leaf_level: u8) -> Vec<Vec<SimpleMerkleNodeNCAAggregation>> {
+    let mut ncas = generate_nca_tree(leaves);
+    let mut nca_map: std::collections::HashMap<SimpleMerkleNodeKey, SimpleMerkleNodeNCAAggregation> = std::collections::HashMap::new();
+    ncas.iter().for_each(|x| {
+        nca_map.insert(x.nca.clone(), x.clone());
+    });
+    let mut levels = Vec::with_capacity(leaf_level as usize + 1);
+
+    let root = ncas.last().unwrap();
+    if root.left.level == leaf_level && root.right.level == leaf_level {
+        return vec![vec![root.clone()]];
+    }
+
+    let mut has_non_leaf_children = true;
+    let mut current_level = vec![ncas.pop().unwrap()];
+    
+    while has_non_leaf_children {
+        levels.push(current_level.clone());
+        let mut next_level = Vec::new();
+        has_non_leaf_children = false;
+        for agg in current_level.iter() {
+            if agg.left.level != leaf_level {
+                if let Some(left_agg) = nca_map.get(&agg.left) {
+                    next_level.push(left_agg.clone());
+                    has_non_leaf_children = true;
+                }
+            }
+            if agg.right.level != leaf_level {
+                if let Some(right_agg) = nca_map.get(&agg.right) {
+                    next_level.push(right_agg.clone());
+                    has_non_leaf_children = true;
+                }
+            }
+        }
+        current_level = next_level;
+    }
+    if current_level.len() > 0 {
+        levels.push(current_level);
+    }
+    levels.reverse();
+    levels
+
+
+
+
+
+}
+// for a given NCA node, its left and right children must be in the group directly below
+pub fn check_nca_tree_groups(
+    groups: &[Vec<SimpleMerkleNodeNCAAggregation>],
+    leaf_level: u8
+) -> bool {
+    //let mut nca_set = std::collections::HashSet::new();
+    for i in 1.. groups.len() {
+        let group = &groups[i];
+        for node in group.iter(){
+            // Check if the NCA is unique in this group
+            if group.iter().filter(|x| x.nca == node.nca).count() > 1 {
+                println!("Duplicate NCA found in group {}: {:?}", i, node.nca);
+                return false;
+            }
+            // Check if the left and right children are unique in this group
+            if group.iter().filter(|x| x.left == node.left).count() > 1 {
+                println!("Duplicate left child found in group {}: {:?}", i, node.left);
+                return false;
+            }
+            if group.iter().filter(|x| x.right == node.right).count() > 1 {
+                println!("Duplicate right child found in group {}: {:?}", i, node.right);
+                return false;
+            }
+            if node.left.level != leaf_level && !groups[i-1].iter().any(|x| x.nca == node.left) {
+                println!("The dependencies of a group MUST be in the group directly below");
+                return false;
+            }
+            if node.right.level != leaf_level && !groups[i-1].iter().any(|x| x.nca == node.right) {
+                println!("The dependencies of a group MUST be in the group directly below");
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /*
 remember: 
 
@@ -381,9 +597,66 @@ bad nca(SimpleMerkleNodeKey { level: 19, index: 0 }, SimpleMerkleNodeKey { level
 #[cfg(test)]
 mod tests {
 
+
+    struct NCAGroupCheckerHelper {
+        pub node_to_group_id_map: std::collections::HashMap<SimpleMerkleNodeKey, usize>,
+        pub tree_height: u8,
+    }
+
+    impl NCAGroupCheckerHelper {
+        pub fn new(tree_height: u8) -> Self {
+            Self {
+                node_to_group_id_map: std::collections::HashMap::new(),
+                tree_height,
+            }
+        }
+        pub fn insert(&mut self, key: SimpleMerkleNodeKey, group_id: usize) {
+            self.node_to_group_id_map.insert(key, group_id);
+        }
+        pub fn validate_nca_children(&self, nca: &SimpleMerkleNodeNCAAggregation) -> bool {
+            let left_group_id = self.get_group_id(&nca.left);
+            let right_group_id = self.get_group_id(&nca.right);
+            let nca_group_id = self.get_group_id(&nca.nca);
+            if left_group_id.is_none() && right_group_id.is_none() {
+                return true;
+            }else if left_group_id.is_none() {
+                return right_group_id.unwrap() + 1 == nca_group_id.unwrap();
+            }else if right_group_id.is_none() {
+                return left_group_id.unwrap() + 1 == nca_group_id.unwrap();
+            }else{
+                return left_group_id.unwrap() + 1 == nca_group_id.unwrap() && right_group_id.unwrap() + 1 == nca_group_id.unwrap();
+            }
+        }
+        pub fn get_group_id(&self, key: &SimpleMerkleNodeKey) -> Option<usize> {
+            if key.level == self.tree_height {
+                None
+            } else {
+                self.node_to_group_id_map.get(key).cloned()
+            }
+        }
+        pub fn check_groups(groups: Vec<Vec<SimpleMerkleNodeNCAAggregation>>, tree_height: u8) -> bool {
+            let mut helper = NCAGroupCheckerHelper::new(tree_height);
+            for (group_id, group) in groups.iter().enumerate() {
+                for nca in group.iter() {
+                    helper.insert(nca.nca.clone(), group_id);
+                }
+            }
+            for group in groups.iter() {
+                for nca in group.iter() {
+                    if !helper.validate_nca_children(nca) {
+                        println!("NCA {:?} has invalid children", nca.nca);
+                        return false;
+                    }
+                }
+            }
+            true
+        }
+
+    }
+
     use std::collections::HashSet;
 
-    use crate::data::hash::merkle_node_key::{generate_nca_tree, SimpleMerkleNodeKey, SimpleMerkleNodeNCAAggregation};
+    use crate::data::hash::merkle_node_key::{check_nca_tree_groups, generate_nca_tree, generate_nca_tree_groups_efficient, generate_nca_tree_groups_naive, SimpleMerkleNodeKey, SimpleMerkleNodeNCAAggregation};
 
 
     fn is_unique_node_set(node_set: &[SimpleMerkleNodeKey]) -> bool {
@@ -450,7 +723,57 @@ mod tests {
         random_nodes_test_gen(5004, 24);
 
     }
+    #[test]
+    fn check_tree_groups() {
+        let height: u8 = 24;
+        let leaves = random_nodes_in_tree(height, 1337);
+        let ncas = generate_nca_tree(&leaves);
+        let groups = generate_nca_tree_groups_naive(&leaves, height);
 
+        let groups_alt = generate_nca_tree_groups_efficient(&leaves, height);
+
+        assert_eq!(groups.len(), groups_alt.len(), "group lengths differ");
+
+        assert!(check_nca_tree_groups(&groups, height), "NCA tree groups are not valid");
+        println!("NCA tree groups are valid");
+    }
+    #[test]
+    fn check_tree_groups_2() {
+        let guta_height = 3u8;
+        let leaf_1 = SimpleMerkleNodeKey::new(guta_height, 0);
+        let leaf_2 = SimpleMerkleNodeKey::new(guta_height, 1);
+        let leaf_3 = SimpleMerkleNodeKey::new(guta_height, 2);
+        let leaf_5 = SimpleMerkleNodeKey::new(guta_height, 5);
+        let leaf_6 = SimpleMerkleNodeKey::new(guta_height, 6);
+        let leaves = vec![leaf_1, leaf_2, leaf_3, leaf_5, leaf_6];
+        let e_group_levels = generate_nca_tree_groups_efficient(&leaves, guta_height);
+        println!("efficient groups: {:#?}", e_group_levels);
+        let n_group_levels = generate_nca_tree_groups_naive(&leaves, guta_height);
+        println!("naive groups: {:#?}", n_group_levels);
+
+        assert!(NCAGroupCheckerHelper::check_groups(n_group_levels.clone(), guta_height), "naive groups are not valid");
+        assert!(NCAGroupCheckerHelper::check_groups(e_group_levels.clone(), guta_height), "efficient groups are not valid");
+        assert_eq!(n_group_levels, e_group_levels, "group levels differ");
+    }
+    #[test]
+    fn check_tree_groups_3() {
+        let guta_height = 32u8;
+        let leaves = random_nodes_in_tree(guta_height,  133713);
+        let e_group_levels = generate_nca_tree_groups_efficient(&leaves, guta_height);
+        let n_group_levels = generate_nca_tree_groups_naive(&leaves, guta_height);
+
+        assert!(NCAGroupCheckerHelper::check_groups(n_group_levels.clone(), guta_height), "naive groups are not valid");
+        assert!(NCAGroupCheckerHelper::check_groups(e_group_levels.clone(), guta_height), "efficient groups are not valid");
+        assert_eq!(n_group_levels, e_group_levels, "group levels differ");
+    }
+    #[test]
+    fn run_many_random_nodes() {
+        let nodes = random_nodes_in_tree(32, 1000*1000);
+        let start_time = std::time::Instant::now();
+        let ncas = generate_nca_tree(&nodes);
+        let duration = start_time.elapsed();
+        println!("Generated {} NCAs for {} leaves in {:?}", ncas.len(), nodes.len(), duration);
+    }
     #[test]
     fn test_with_prompt_example() {
         // This is the example from the prompt where linear aggregation works by coincidence.
@@ -501,26 +824,28 @@ mod tests {
 
         // Expected individual calculations
         let nca_01 = x0.find_nearest_common_ancestor(&x1); // {2, 0}
-        let nca_56 = x5.find_nearest_common_ancestor(&x6); // {2, 2}
+        let nca_56 = x5.find_nearest_common_ancestor(&x6); // {1, 1}
+        println!("nca_01: {:?}, nca_56: {:?}", nca_01, nca_56);
         
         // Root of the left sub-tree (indices 0-3)
         let nca_left_half = nca_01.find_nearest_common_ancestor(&x3); // {1, 0}
         // Root of the right sub-tree (indices 4-7) is just nca_56 in this case.
+        println!("nca_left_half: {:?}", nca_left_half);
         let nca_right_half = nca_56;
 
         // Final combination
         let final_nca = nca_left_half.find_nearest_common_ancestor(&nca_right_half); // {0, 0}
-
+        println!("final_nca: {:?}", final_nca);
         // The path should contain these aggregations. The order is determined by post-order traversal.
         // 1. nca(x0, x1) -> {2, 0}
-        // 2. nca(x5, x6) -> {2, 2}
+        // 2. nca(x5, x6) -> {1, 1}
         // 3. nca({2, 0}, x3) -> {1, 0}
-        // 4. nca({1, 0}, {2, 2}) -> {0, 0}
+        // 4. nca({1, 0}, {1, 2}) -> {0, 0}
         
         let expected_path = vec![
             SimpleMerkleNodeNCAAggregation { nca: nca_01, left: x0, right: x1 },
-            SimpleMerkleNodeNCAAggregation { nca: nca_56, left: x5, right: x6 },
             SimpleMerkleNodeNCAAggregation { nca: nca_left_half, left: nca_01, right: x3 },
+            SimpleMerkleNodeNCAAggregation { nca: nca_56, left: x5, right: x6 },
             SimpleMerkleNodeNCAAggregation { nca: final_nca, left: nca_left_half, right: nca_right_half },
         ];
         

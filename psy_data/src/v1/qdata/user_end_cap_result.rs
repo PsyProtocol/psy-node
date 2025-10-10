@@ -1,5 +1,4 @@
-use parth_core::{crypto::hash::traits::{FieldQHasher, QFieldHashable}, data::serializable::QPDSerializable, felt::{QFelt, QFelt64, QFeltSized}, protocol::core_types::{QFHashBase, QHashBase}};
-use psy_core::constants::protocol::GLOBAL_USER_TREE_HEIGHT;
+use parth_core::{crypto::hash::traits::FieldQHasher, data::serializable::QPDSerializable, felt::{QFelt, QFelt64, QFeltSized}, protocol::core_types::{QFHashBase, QHashBase}};
 
 
 #[pderive::serialize_copy_f_hash_ts]
@@ -28,8 +27,8 @@ impl<F: QFelt, Hash: QHashBase> QFeltSized for PUPSEndCapResultCompact<F, Hash> 
     }
 }
 
-impl<F: QFelt64, Hash: QFHashBase<F>> QFieldHashable<F, Hash> for PUPSEndCapResultCompact<F, Hash> {
-    fn qfhash<H: FieldQHasher<F, Hash>>(&self) -> Hash {
+impl<F: QFelt64, Hash: QFHashBase<F>> PUPSEndCapResultCompact<F, Hash> {
+    pub fn qfhash_with_guta_height<H: FieldQHasher<F, Hash>>(&self, global_user_tree_height: u8) -> Hash {
         let start_user_leaf_hash = self.start_user_leaf_hash.to_4_felts();
         let end_user_leaf_hash = self.end_user_leaf_hash.to_4_felts();
 
@@ -46,7 +45,7 @@ impl<F: QFelt64, Hash: QFHashBase<F>> QFieldHashable<F, Hash> for PUPSEndCapResu
             end_user_leaf_hash[2],
             end_user_leaf_hash[3],
 
-            F::from_u8_value(GLOBAL_USER_TREE_HEIGHT),
+            F::from_u8_value(global_user_tree_height),
         ]);
 
         let end_cap_result_hash = H::q_two_to_one(

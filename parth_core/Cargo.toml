@@ -45,3 +45,10 @@ plonky2 = { workspace = true, optional = true }
 [dev-dependencies]
 plonky2 = { workspace = true }
 ts-rs = { workspace = true }
+criterion = { workspace = true }
+
+
+
+[[bench]]
+name = "nca_group_gen"
+harness = false

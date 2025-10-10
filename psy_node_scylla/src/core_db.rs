@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use parth_core::{
-    crypto::hash::traits::MerkleZeroHasher,
+    crypto::hash::{tag_tree::TagTreeMerkleProof, traits::MerkleZeroHasher},
     data::{
         db::{
             data_types::{BiDirectionalMappingRow, CoreDatabaseValueDeserialize, QDatabasePrimitiveKey},
@@ -15,20 +15,19 @@ use parth_core::{
     },
     protocol::core_types::QHashBase,
 };
+use parth_core::data::serializable::QPDSerializable;
 use psy_node_core::store::traits::core_db::{
-    CoreDatabaseBidirectionalMappingReader, CoreDatabaseBidirectionalMappingWriter, CoreDatabaseBidirectionalU64U128MappingReader, CoreDatabaseBidirectionalU64U128MappingWriter, CoreDatabaseDoubleIdCheckpointedReader, CoreDatabaseDoubleIdCheckpointedWriter, CoreDatabaseDoubleIdMerkleReader, CoreDatabaseDoubleIdMerkleWriter, CoreDatabaseKivReader, CoreDatabaseKivWriter, CoreDatabaseSingleIdCheckpointedReader, CoreDatabaseSingleIdCheckpointedWriter, CoreDatabaseSingleIdMerkleReader, CoreDatabaseSingleIdMerkleWriter, CoreDatabaseU64Reader, CoreDatabaseU64Writer
+    CoreDatabaseBidirectionalMappingReader, CoreDatabaseBidirectionalMappingWriter, CoreDatabaseBidirectionalU64U128MappingReader, CoreDatabaseBidirectionalU64U128MappingWriter, CoreDatabaseDoubleIdCheckpointedReader, CoreDatabaseDoubleIdCheckpointedWriter, CoreDatabaseDoubleIdMerkleReader, CoreDatabaseDoubleIdMerkleWriter, CoreDatabaseKivReader, CoreDatabaseKivWriter, CoreDatabaseSingleIdCheckpointedReader, CoreDatabaseSingleIdCheckpointedWriter, CoreDatabaseSingleIdMerkleReader, CoreDatabaseSingleIdMerkleWriter, CoreDatabaseTagTreeReader, CoreDatabaseTagTreeWriter, CoreDatabaseU64Reader, CoreDatabaseU64Writer
 };
 use serde::{de::DeserializeOwned, Serialize};
 
 use crate::{
     core::ScyllaCoreStore,
     tables::{
-        blob::ScyllaBiDirectionalBlobToBlobTablePreparedStatements,
-        merkle::{ScyllaDoubleMerkleNodesPreparedStatements, ScyllaMerkleNodesPreparedStatements},
-        object::{
+        blob::ScyllaBiDirectionalBlobToBlobTablePreparedStatements, merkle::{ScyllaDoubleMerkleNodesPreparedStatements, ScyllaMerkleNodesPreparedStatements}, object::{
             ScyllaGenericKeyIdValueTablePreparedStatements, ScyllaGenericObjectDoubleIdTablePreparedStatements,
             ScyllaGenericObjectSingleIdTablePreparedStatements,
-        }, u64_tbl::{ScyllaBidirectionalU64U128MappingPreparedStatements, ScyllaU64ToU64TablePreparedStatements},
+        }, tag_tree::ScyllaTagTreeNodesPreparedStatements, u64_tbl::{ScyllaBidirectionalU64U128MappingPreparedStatements, ScyllaU64ToU64TablePreparedStatements}
     },
 };
 
@@ -590,5 +589,97 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
     }
     async fn db_insert_u64_u128_mapping_pairs(&self, table: &ScyllaBidirectionalU64U128MappingPreparedStatements, keys: &[BiDirectionalMappingRow<u64, u128>]) -> anyhow::Result<()>{
         table.insert_u64_u128_mapping_pairs(&self.session, keys).await
+    }
+}
+
+
+
+#[async_trait]
+impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+    CoreDatabaseTagTreeReader<Hash, Hasher, ScyllaTagTreeNodesPreparedStatements> for ScyllaCoreStore<Hash, Hasher>
+{
+    async fn db_get_tag_tree_node_value(
+        &self,
+        table: &ScyllaTagTreeNodesPreparedStatements,
+        unique_pending_id: u64,
+        key: &SimpleMerkleNodeKey,
+    ) -> anyhow::Result<Option<Hash>>{
+        table.select_one_tag_tree_value(&self.session, unique_pending_id, *key).await
+
+    }
+    async fn db_get_tag_tree_node_values(
+        &self,
+        table: &ScyllaTagTreeNodesPreparedStatements,
+        unique_pending_id: u64,
+        keys: &[SimpleMerkleNodeKey],
+    ) -> anyhow::Result<Vec<Option<Hash>>>{
+        table.select_many_tag_tree_values(&self.session, unique_pending_id, keys).await
+
+    }
+    async fn db_get_tag_tree_node_tag(
+        &self,
+        table: &ScyllaTagTreeNodesPreparedStatements,
+        unique_pending_id: u64,
+        key: &SimpleMerkleNodeKey,
+    ) -> anyhow::Result<Option<Hash>>{
+        let r = table.select_one_tag_tree_tag_and_value(&self.session, unique_pending_id, key).await?;
+        if let Some(tts) = r {
+
+            Ok(Some(tts.tag))
+        } else {
+            Ok(None)
+
+
+        }
+
+
+
+    }
+    async fn db_get_tag_tree_root(
+        &self,
+        table: &ScyllaTagTreeNodesPreparedStatements,        
+        unique_pending_id: u64,
+    ) -> anyhow::Result<Option<Hash>>{
+        let root_key = SimpleMerkleNodeKey::new_root();
+        table.select_one_tag_tree_value(&self.session, unique_pending_id, root_key).await
+
+    }
+    async fn db_get_tag_tree_merkle_proof(
+        &self,
+        table: &ScyllaTagTreeNodesPreparedStatements,        
+        unique_pending_id: u64,
+        key: &SimpleMerkleNodeKey,
+    ) -> anyhow::Result<TagTreeMerkleProof<Hash>>{
+        table.select_tag_tree_proof::<Hash>(&self.session, unique_pending_id, *key).await
+
+    }
+}
+
+#[async_trait]
+impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+    CoreDatabaseTagTreeWriter<Hash, Hasher, ScyllaTagTreeNodesPreparedStatements> for ScyllaCoreStore<Hash, Hasher>
+{
+    async fn set_tag_tree_tag_value(
+        &self,
+        table: &ScyllaTagTreeNodesPreparedStatements,
+        unique_pending_id: u64,
+        key: &SimpleMerkleNodeKey,
+        tag: &Hash,
+        value: &Hash,
+    ) -> anyhow::Result<()>{
+        let tag_vec = tag.to_bytes()?;
+        let value_vec = value.to_bytes()?;
+        table.set_or_insert_one(&self.session, unique_pending_id, key, &tag_vec, &value_vec).await
+    }
+    async fn set_tag_tree_tag(
+        &self,
+        table: &ScyllaTagTreeNodesPreparedStatements,
+        unique_pending_id: u64,
+        key: &SimpleMerkleNodeKey,
+        tag: &Hash,
+    ) -> anyhow::Result<()>{
+        table.set_tag_only_computed::<Hash, Hasher>(&self.session, unique_pending_id, *key, tag).await
+
+
     }
 }

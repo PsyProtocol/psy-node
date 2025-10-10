@@ -1,4 +1,4 @@
-use crate::{felt::QFelt64, protocol::core_types::QHashBase, utils::math::log2_ceil};
+use crate::{protocol::core_types::QHashBase, utils::math::log2_ceil};
 
 pub trait RandomHash {
     fn rand_hash() -> Self;
