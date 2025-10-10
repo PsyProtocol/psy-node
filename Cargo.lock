@@ -1980,6 +1980,7 @@ dependencies = [
  "hex-literal",
  "parth_common",
  "parth_core",
+ "pderive",
  "postcard",
  "pser",
  "psy_common",

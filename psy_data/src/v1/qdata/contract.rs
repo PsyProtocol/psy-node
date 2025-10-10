@@ -1,10 +1,11 @@
-use parth_core::{crypto::hash::traits::{FieldQHasher, QFieldHashable}, data::serializable::QPDSerializable, felt::{QFelt, QFelt64, QFeltSized, ToQFelts}, impl_qpd_serialize_params, impl_qpq_serialize_bincode, protocol::core_types::{QFHashBase, QHashBase}};
+use parth_common::memory_stores::simple_memory_merkle_store::SimpleMemoryMerkleStore;
+use parth_core::{crypto::hash::traits::{FieldQHasher, MerkleZeroHasher, QFieldHashable}, data::serializable::QPDSerializable, felt::{QFelt, QFelt64, QFeltSized, ToQFelts}, impl_qpd_serialize_params, impl_qpq_serialize_bincode, protocol::core_types::{QFHashBase, QHashBase}};
 use ts_rs::TS;
 use pser::{QBytesDeserialize, QBytesSerialize};
 
 
 #[pderive::serialize_copy_f_hash_ts]
-#[ts(export, concrete(F = parth_core::PF, Hash = parth_core::PHash), rename = "PQEDContractLeaf")]
+#[ts(export, concrete(F = parth_core::PF, Hash = parth_core::PHash), rename = "QEDContractLeaf")]
 pub struct PQEDContractLeaf<F: QFelt, Hash: QHashBase> {
     pub deployer: Hash,
     pub function_tree_root: Hash,
@@ -163,4 +164,62 @@ impl_qpq_serialize_bincode!(RootConfig);
 impl_qpq_serialize_bincode!(GenesisConfig);
 impl_qpq_serialize_bincode!(PrecompileConfig);
 impl_qpq_serialize_bincode!(ContractConfig);
+
+
+
+#[pderive::serialize_clone_hash_ts]
+#[ts(export, concrete(Hash = parth_core::PHash), rename = "QBCDeployContract")]
+pub struct PQBCDeployContract<Hash: QHashBase> {
+    pub deployer: Hash,
+    pub code_definition: ContractCodeDefinition,
+    pub function_whitelist: Vec<Hash>,
+
+}
+
+impl<Hash: QHashBase> PQBCDeployContract<Hash> {
+    pub fn new(deployer: Hash, code_definition: ContractCodeDefinition, function_whitelist: Vec<Hash>) -> Self {
+        Self {
+            deployer,
+            code_definition,
+            function_whitelist,
+        }
+    }
+    pub fn into_with_whitelist_root<H: MerkleZeroHasher<Hash>>(self, contract_function_tree_height: u8) -> anyhow::Result<PQBCDeployContractWithRoot<Hash>>{
+        PQBCDeployContractWithRoot::<Hash>::new::<H>(self.deployer, self.code_definition, self.function_whitelist, contract_function_tree_height)
+
+    }
+}
+
+
+
+
+#[pderive::serialize_clone_hash_ts]
+#[ts(export, concrete(Hash = parth_core::PHash), rename = "QBCDeployContractWithRoot")]
+pub struct PQBCDeployContractWithRoot<Hash: QHashBase> {
+    pub deployer: Hash,
+    pub code_definition: ContractCodeDefinition,
+    pub function_whitelist: Vec<Hash>,
+    pub function_whitelist_root: Hash,
+    
+
+}
+
+impl<Hash: QHashBase> PQBCDeployContractWithRoot<Hash> {
+    pub fn new<H: MerkleZeroHasher<Hash>>(deployer: Hash, code_definition: ContractCodeDefinition, function_whitelist: Vec<Hash>, contract_function_tree_height: u8) -> anyhow::Result<Self> {
+            let mut t = SimpleMemoryMerkleStore::<H, Hash>::new(contract_function_tree_height);
+            for (i,l) in function_whitelist.iter().enumerate() {
+                t.set_leaf(i as u64, *l);
+            }
+            let function_whitelist_root = t.get_root();
+
+            
+
+        Ok(Self {
+            deployer,
+            code_definition,
+            function_whitelist,
+            function_whitelist_root,
+        })
+    }
+}
 
