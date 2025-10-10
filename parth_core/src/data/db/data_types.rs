@@ -27,3 +27,4 @@ impl<K1: QDatabasePrimitiveKey, K2: QDatabasePrimitiveKey> BiDirectionalMappingR
         Self { k1, k2 }
     }
 }
+
