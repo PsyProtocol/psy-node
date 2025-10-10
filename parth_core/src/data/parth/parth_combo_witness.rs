@@ -1,6 +1,6 @@
 use serde::Deserialize;
 
-use crate::{crypto::hash::merkle_proof::MerkleProofCore, data::parth::public_preimage::QParthProofPublicInputsPreimage, protocol::core_types::{QHashBase, QJobIdBase}};
+use crate::{crypto::hash::merkle_proof::MerkleProofCore, data::parth::public_preimage::QParthProofPublicInputsPreimage, protocol::core_types::QHashBase, QJobIdBase};
 
 
 #[pderive::serialize_clone]

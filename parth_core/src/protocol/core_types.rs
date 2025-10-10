@@ -1,7 +1,7 @@
 use serde::{de::DeserializeOwned, Serialize};
 use ts_rs::TS;
 
-use crate::{crypto::hash::traits::{FieldQHasher, FromU64x4, HashTo4Felts, QHasher, ZeroableHash}, data::{hash::merkle_node_key::SimpleMerkleNodeKey, parth::public_preimage::{QParthProofPublicInputsPreimage, QParthProofPublicInputsPreimageWithoutRewardsHash}, queue::queue_key::PCoreQueueItemBase, serializable::{QPDSerializable, QPDSerializableFixed}}, felt::QFelt64, QJobIdSerialized};
+use crate::{crypto::hash::traits::{FieldQHasher, FromU64x4, HashTo4Felts, QHasher, ZeroableHash}, data::{parth::public_preimage::{QParthProofPublicInputsPreimage, QParthProofPublicInputsPreimageWithoutRewardsHash}, serializable::{QPDSerializable, QPDSerializableFixed}}, felt::QFelt64, QJobIdBase};
 
 pub trait QStorableBase: Serialize + DeserializeOwned + Send + Sync + Clone + PartialEq + Eq {}
 pub trait QStorableSizedBase: QStorableBase + Sized {}
@@ -30,22 +30,6 @@ pub trait QZKProofVerifier<Hash: QHashBase, Proof: QProofBase>: QHasherBase<Hash
         self.verify_zk_proof(circuit_type, proof)
     }
 }
-pub trait QJobIdBase: Send + Sync + Serialize + DeserializeOwned + Clone + PartialEq + Eq + std::fmt::Debug + QPDSerializableFixed + Sized + Into<QJobIdSerialized> + TryFrom<QJobIdSerialized> + PCoreQueueItemBase {
-    fn to_bytes_fixed(&self) -> QJobIdSerialized;
-    fn from_bytes_fixed(bytes: &QJobIdSerialized) -> anyhow::Result<Self>;
-    fn circuit_type_u32(&self) -> u32;
-    fn input_witness_id(&self) -> Self;
-    fn output_proof_id(&self) -> Self;
-    fn group_counter_id(&self) -> Self;
-    fn get_checkpoint_id(&self) -> u64;
-    fn is_user_guta_proof_circuit_type(&self) -> bool;
-    fn is_end_cap_proof_circuit_type(&self) -> bool;
-    fn get_parth_index(&self) -> u64;
-    fn get_parth_level(&self) -> u8;
-    fn get_parth_merkle_node_key(&self) -> SimpleMerkleNodeKey;
-    
-}
-
 pub trait QJobPlanner<JobId: QJobIdBase> {
     fn get_child_job_for_circuit_type(&self, children_circuit_types: &[u32]) -> u32;
 }

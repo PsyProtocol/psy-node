@@ -1,6 +1,6 @@
 use async_trait::async_trait;
-use parth_core::{data::db::row::QDatabaseKeyIdValueTableRow, felt::QFelt, protocol::{core_types::QHashBase, generic_types::user::PZKPublicKeyInfo}};
-use psy_data::v1::qdata::user::PQEDUserLeaf;
+use parth_core::{data::db::row::QDatabaseKeyIdValueTableRow, felt::QFelt, protocol::core_types::QHashBase};
+use psy_data::v1::qdata::{public_key::PZKPublicKeyInfo, user::PQEDUserLeaf};
 
 
 

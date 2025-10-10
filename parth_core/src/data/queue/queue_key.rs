@@ -15,7 +15,7 @@ pub trait PCoreQueueItemBase: Sized + Clone + Send + Sync {
     fn is_queue_item(data: &[u8]) -> bool;
     fn decode_queue_item_ref(data: &[u8]) -> anyhow::Result<Self>;
     fn encode_queue_item_vec(&self) -> anyhow::Result<Vec<u8>>;
-    fn get_restorable_job_id(&self) -> [u8; 24];
+    fn get_restorable_job_id(&self) -> Vec<u8>;
     fn get_size_hint() -> usize;
     fn has_fixed_size() -> bool;
 }

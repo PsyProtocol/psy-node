@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{crypto::hash::traits::MerkleZeroHasher, protocol::core_types::QHashBase};
+use crate::protocol::core_types::QHashBase;
 
 
 // QBCDeployContract

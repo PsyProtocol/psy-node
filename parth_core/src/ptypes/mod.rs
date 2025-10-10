@@ -1,6 +1,6 @@
 use plonky2::field::types::PrimeField64;
 
-use crate::felt::{QFelt, QFelt64, ToU64Value, ZeroableFelt};
+use crate::felt::ToU64Value;
 
 
 // start ptypes_u64_hash256

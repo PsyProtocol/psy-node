@@ -10,8 +10,10 @@ pub mod protocol;
 pub mod utils;
 pub mod store;
 pub mod node;
-pub mod base_types;
-pub use base_types::*;
+mod job_id_base;
+pub use job_id_base::*;
+mod protocol_types;
+pub use protocol_types::*;
 
 #[macro_export]
 macro_rules! impl_qpq_serialize_primitive {

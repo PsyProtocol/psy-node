@@ -1,6 +1,6 @@
-use core::panic;
 use std::cmp::Ordering;
 use crate::data::serializable::{QPDSerializable, QPDSerializableFixed};
+pub const JOB_ID_EMPTY_REWARD_PATH_INFO: u64 = 0xFFFF_FFFF_FFFF_FFFFu64;
 
 
 #[pderive::serialize_copy_default_no_ord]
@@ -43,6 +43,17 @@ impl SimpleMerkleNodeKey {
                 index: (1u64 << diff) * self.index,
             }
         }
+    }
+    pub fn to_reward_path_info(&self) -> u64 {
+        ((self.level as u64) << 56) | (self.index & 0x00FFFFFFFFFFFFFF)
+    }
+    pub fn from_reward_path_info(reward_path_info: u64) -> Self {
+        let level = (reward_path_info >> 56) as u8;
+        let index = reward_path_info & 0x00FFFFFFFFFFFFFF;
+        Self { level, index }
+    }
+    pub fn is_empty_reward_path(&self) -> bool {
+        self.to_reward_path_info() == JOB_ID_EMPTY_REWARD_PATH_INFO
     }
     pub fn sibling(&self) -> Self {
         Self {
@@ -727,7 +738,6 @@ mod tests {
     fn check_tree_groups() {
         let height: u8 = 24;
         let leaves = random_nodes_in_tree(height, 1337);
-        let ncas = generate_nca_tree(&leaves);
         let groups = generate_nca_tree_groups_naive(&leaves, height);
 
         let groups_alt = generate_nca_tree_groups_efficient(&leaves, height);

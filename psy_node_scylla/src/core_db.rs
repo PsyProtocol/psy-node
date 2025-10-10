@@ -15,7 +15,6 @@ use parth_core::{
     },
     protocol::core_types::QHashBase,
 };
-use parth_core::data::serializable::QPDSerializable;
 use psy_node_core::store::traits::core_db::{
     CoreDatabaseBidirectionalMappingReader, CoreDatabaseBidirectionalMappingWriter, CoreDatabaseBidirectionalU64U128MappingReader, CoreDatabaseBidirectionalU64U128MappingWriter, CoreDatabaseDoubleIdCheckpointedReader, CoreDatabaseDoubleIdCheckpointedWriter, CoreDatabaseDoubleIdMerkleReader, CoreDatabaseDoubleIdMerkleWriter, CoreDatabaseKivReader, CoreDatabaseKivWriter, CoreDatabaseSingleIdCheckpointedReader, CoreDatabaseSingleIdCheckpointedWriter, CoreDatabaseSingleIdMerkleReader, CoreDatabaseSingleIdMerkleWriter, CoreDatabaseTagTreeReader, CoreDatabaseTagTreeWriter, CoreDatabaseU64Reader, CoreDatabaseU64Writer
 };
@@ -504,11 +503,11 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
     }
     async fn db_select_all_pairs_from_k1<K1: QDatabasePrimitiveKey, K2: QDatabasePrimitiveKey>(
         &self,
-        table: &ScyllaBiDirectionalBlobToBlobTablePreparedStatements,
-        start_k1: Option<K1>,
-        max_count: usize,
+        _table: &ScyllaBiDirectionalBlobToBlobTablePreparedStatements,
+        _start_k1: Option<K1>,
+        _max_count: usize,
     ) -> anyhow::Result<Vec<BiDirectionalMappingRow<K1, K2>>> {
-        anyhow::bail!("Not implemented");
+        anyhow::bail!("db_select_all_pairs_from_k1: Not implemented");
     }
 }
 

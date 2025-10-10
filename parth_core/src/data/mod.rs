@@ -4,3 +4,4 @@ pub mod parth;
 pub mod db;
 pub mod fixed_serializable;
 pub mod queue;
+pub mod job_serialized;

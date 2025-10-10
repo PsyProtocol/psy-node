@@ -1,6 +1,6 @@
 
 use hex::FromHexError;
-use parth_core::data::serializable::QPDSerializable;
+use parth_core::{data::{hash::merkle_node_key::{SimpleMerkleNodeKey, JOB_ID_EMPTY_REWARD_PATH_INFO}, queue::queue_key::PCoreQueueItemBase, serializable::{QPDSerializable, QPDSerializableFixed}}, QJobIdBase, QJobIdSerialized, QProvingJobDataIDWithRewardPath};
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use serde_with::serde_as;
@@ -344,11 +344,9 @@ impl From<ProvingJobCircuitType> for u8 {
     }
 }
 
-pub type QProvingJobDataIDSerialized = [u8; 24];
-
 #[serde_as]
 #[derive(Serialize, Deserialize, PartialEq, Copy, Eq, Hash, Clone, Debug)]
-pub struct QProvingJobDataIDSerializedWrapped(#[serde_as(as = "serde_with::hex::Hex")] pub QProvingJobDataIDSerialized);
+pub struct QProvingJobDataIDSerializedWrapped(#[serde_as(as = "serde_with::hex::Hex")] pub QJobIdSerialized);
 
 impl QProvingJobDataIDSerializedWrapped {
     pub fn from_hex_string(s: &str) -> Result<Self, FromHexError> {
@@ -359,7 +357,6 @@ impl QProvingJobDataIDSerializedWrapped {
         Ok(Self(array))
     }
 }
-
 
 #[derive(Serialize, Deserialize, PartialEq, Debug, Clone, Copy, Eq, Hash, PartialOrd, Ord)]
 pub struct QProvingJobDataID {
@@ -373,6 +370,25 @@ pub struct QProvingJobDataID {
     pub data_index: u8,
 }
 impl QProvingJobDataID {
+    pub fn with_empty_reward_path(&self) -> QProvingJobDataIDWithRewardPath<Self> {
+        QProvingJobDataIDWithRewardPath { job_data_id: *self, reward_path_info: JOB_ID_EMPTY_REWARD_PATH_INFO }
+    }
+    pub fn into_with_empty_reward_path(self) -> QProvingJobDataIDWithRewardPath<Self> {
+        QProvingJobDataIDWithRewardPath { job_data_id: self, reward_path_info: JOB_ID_EMPTY_REWARD_PATH_INFO }
+    }
+    pub fn with_reward_path_info(&self, reward_path_info: u64) -> QProvingJobDataIDWithRewardPath<Self> {
+        QProvingJobDataIDWithRewardPath { job_data_id: *self, reward_path_info }
+    }
+    pub fn into_with_reward_path_info(self, reward_path_info: u64) -> QProvingJobDataIDWithRewardPath<Self> {
+        QProvingJobDataIDWithRewardPath { job_data_id: self, reward_path_info }
+    }
+    pub fn with_reward_path_merkle_key(&self, reward_path_key: &SimpleMerkleNodeKey) -> QProvingJobDataIDWithRewardPath<Self> {
+        QProvingJobDataIDWithRewardPath { job_data_id: *self, reward_path_info: reward_path_key.to_reward_path_info() }
+    }
+    pub fn into_with_reward_path_merkle_key(self, reward_path_key: &SimpleMerkleNodeKey) -> QProvingJobDataIDWithRewardPath<Self> {
+        QProvingJobDataIDWithRewardPath { job_data_id: self, reward_path_info: reward_path_key.to_reward_path_info() }
+    }
+
     pub fn notify_realm_complete(checkpoint_id: u64, realm_id: u32) -> Self {
         Self {
             topic: QJobTopic::NotifyRealmComplete,
@@ -850,7 +866,7 @@ impl QProvingJobDataID {
             ..*self
         }
     }
-    pub fn to_fixed_bytes(&self) -> QProvingJobDataIDSerialized {
+    pub fn to_fixed_bytes(&self) -> QJobIdSerialized {
         self.into()
     }
     pub fn with_task_index(&self, task_index: u32) -> Self {
@@ -911,5 +927,107 @@ impl QPDSerializable for QProvingJobDataID {
 
     fn from_bytes(bytes: &[u8]) -> anyhow::Result<Self> {
         QProvingJobDataID::try_from_byte_vec(bytes)
+    }
+}
+impl PCoreQueueItemBase for QProvingJobDataID {
+    fn is_queue_item(data: &[u8]) -> bool {
+        if data.len() != 24 {
+            return false;
+        }
+        let topic: Result<QJobTopic, _> = data[0].try_into();
+        let circuit_type: Result<ProvingJobCircuitType, _> = data[9].try_into();
+        let data_type: Result<ProvingJobDataType, _> = data[22].try_into();
+        topic.is_ok() && circuit_type.is_ok() && data_type.is_ok()
+    }
+    
+    fn decode_queue_item_ref(data: &[u8]) -> anyhow::Result<Self> {
+        QProvingJobDataID::try_from_byte_vec(data)
+    }
+    
+    fn encode_queue_item_vec(&self) -> anyhow::Result<Vec<u8>> {
+        self.to_bytes()
+    }
+    
+    fn get_restorable_job_id(&self) -> Vec<u8> {
+        self.to_fixed_bytes().to_vec()
+    }
+    
+    fn get_size_hint() -> usize {
+        24
+    }
+    
+    fn has_fixed_size() -> bool {
+        true
+    }
+}
+impl QPDSerializableFixed for QProvingJobDataID {
+    
+    fn get_fixed_size() -> usize {
+        24
+    }
+}
+impl From<QProvingJobDataID> for QJobIdSerialized {
+    fn from(value: QProvingJobDataID) -> Self {
+        value.to_fixed_bytes()
+    }
+}
+
+impl QJobIdBase for QProvingJobDataID{
+    fn to_bytes_fixed(&self) -> QJobIdSerialized {
+        self.to_fixed_bytes()
+    }
+
+    fn from_bytes_fixed(bytes: &QJobIdSerialized) -> anyhow::Result<Self> {
+        QProvingJobDataID::try_from(*bytes)
+    }
+
+    fn circuit_type_u32(&self) -> u32 {
+        self.circuit_type as u32
+    }
+
+    fn input_witness_id(&self) -> Self {
+        self.get_input_witness_id()
+    }
+
+    fn output_proof_id(&self) -> Self {
+        self.get_output_id()
+    }
+
+    fn group_counter_id(&self) -> Self {
+        self.get_sub_group_counter_id()
+    }
+
+    fn get_checkpoint_id(&self) -> u64 {
+        self.goal_id
+    }
+
+    fn is_user_guta_proof_circuit_type(&self) -> bool {
+        matches!(
+            self.circuit_type,
+            ProvingJobCircuitType::GUTATwoEndCap
+                | ProvingJobCircuitType::GUTATwoGUTA
+                | ProvingJobCircuitType::GUTALeftEndCapRightGUTA
+                | ProvingJobCircuitType::GUTALeftGUTARightEndCap
+                | ProvingJobCircuitType::GUTASingleEndCap
+                | ProvingJobCircuitType::GUTARegisterUsers
+                | ProvingJobCircuitType::GUTAVerifyToCap
+                | ProvingJobCircuitType::GUTAOnlyRegisterUsers
+                | ProvingJobCircuitType::GUTANoChange
+                | ProvingJobCircuitType::GUTATwoGUTAWithCheckpointUpgrade
+                | ProvingJobCircuitType::GUTAVerifyToCapWithCheckpointUpgrade
+        )
+
+    }
+
+    fn is_end_cap_proof_circuit_type(&self) -> bool {
+        self.circuit_type == ProvingJobCircuitType::UserEndCap
+    }
+
+    fn get_parth_index(&self) -> u64 {
+        self.task_index as u64
+    }
+
+    fn get_reverse_parth_level(&self) -> u8 {
+        self.sub_group_id as u8
     }
 }
