@@ -17,7 +17,7 @@ use scylla::{
 };
 
 use crate::{
-    tables::traits::ScylaPreparedTableStatements,
+    tables::traits::ScyllaStandardPreparedTableStatements,
     utils::{convert_checkpoint_id_to_i64, u64_to_i64_exact, u8_to_i8_exact},
 };
 #[derive(Clone)]
@@ -212,7 +212,7 @@ impl<const TREE_HEIGHT: u8> ScyllaMerkleNodesZeroPreparedStatements<TREE_HEIGHT>
 }
 
 #[async_trait]
-impl<const TREE_HEIGHT: u8> ScylaPreparedTableStatements for ScyllaMerkleNodesZeroPreparedStatements<TREE_HEIGHT> {
+impl<const TREE_HEIGHT: u8> ScyllaStandardPreparedTableStatements for ScyllaMerkleNodesZeroPreparedStatements<TREE_HEIGHT> {
     async fn create_table_standard(
         session: Arc<Session>,
         keyspace: &str,

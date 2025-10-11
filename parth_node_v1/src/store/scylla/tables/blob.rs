@@ -6,7 +6,7 @@ use futures::future::join_all;
 use parth_core::data::{db::table::QDatabaseTableRoutingKey, serializable::QPDPair};
 use scylla::{client::session::Session, statement::{batch::Batch, prepared::PreparedStatement, Statement}};
 
-use crate::store::scylla::{constants::{INSERT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE, SELECT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE}, tables::traits::ScylaPreparedTableStatements};
+use crate::store::scylla::{constants::{INSERT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE, SELECT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE}, tables::traits::ScyllaStandardPreparedTableStatements};
 
 
 #[derive(Clone)]
@@ -229,7 +229,7 @@ impl ScyllaBlobToBlobTablePreparedStatements {
 }
 
 #[async_trait]
-impl ScylaPreparedTableStatements for ScyllaBlobToBlobTablePreparedStatements {
+impl ScyllaStandardPreparedTableStatements for ScyllaBlobToBlobTablePreparedStatements {
     async fn create_table_standard(
         session: Arc<Session>,
         keyspace: &str,

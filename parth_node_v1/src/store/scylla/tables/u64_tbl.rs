@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::store::scylla::{
     constants::{INSERT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE, SELECT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE},
-    tables::traits::ScylaPreparedTableStatements,
+    tables::traits::ScyllaStandardPreparedTableStatements,
     utils::{i64_to_u64_exact, u64_to_i64_exact},
 };
 
@@ -108,7 +108,7 @@ impl ScyllaU64ToU64TablePreparedStatements {
     }
 }
 #[async_trait]
-impl ScylaPreparedTableStatements for ScyllaU64ToU64TablePreparedStatements {
+impl ScyllaStandardPreparedTableStatements for ScyllaU64ToU64TablePreparedStatements {
     async fn create_table_standard(
         session: Arc<Session>,
         keyspace: &str,
@@ -323,7 +323,7 @@ impl ScyllaU128ToU64TablePreparedStatements {
 }
 
 #[async_trait]
-impl ScylaPreparedTableStatements for ScyllaU128ToU64TablePreparedStatements {
+impl ScyllaStandardPreparedTableStatements for ScyllaU128ToU64TablePreparedStatements {
     async fn create_table_standard(
         session: Arc<Session>,
         keyspace: &str,
@@ -483,7 +483,7 @@ impl ScyllaU64ToU128TablePreparedStatements {
 }
 
 #[async_trait]
-impl ScylaPreparedTableStatements for ScyllaU64ToU128TablePreparedStatements {
+impl ScyllaStandardPreparedTableStatements for ScyllaU64ToU128TablePreparedStatements {
     async fn create_table_standard(
         session: Arc<Session>,
         keyspace: &str,

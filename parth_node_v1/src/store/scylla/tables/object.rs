@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use parth_core::data::db::table::QDatabaseTableRoutingKey;
 use scylla::{client::session::Session, statement::{prepared::PreparedStatement, Statement}};
 
-use crate::store::scylla::tables::traits::ScylaPreparedTableStatements;
+use crate::store::scylla::tables::traits::ScyllaStandardPreparedTableStatements;
 
 
 
@@ -80,7 +80,7 @@ impl ScyllaGenericObjectSingleIdTablePreparedStatements {
 
 
 #[async_trait]
-impl ScylaPreparedTableStatements for ScyllaGenericObjectSingleIdTablePreparedStatements {
+impl ScyllaStandardPreparedTableStatements for ScyllaGenericObjectSingleIdTablePreparedStatements {
     async fn create_table_standard(session: Arc<Session>, keyspace: &str, table_name: &str, table_key: QDatabaseTableRoutingKey) -> anyhow::Result<Self> {
         Self::new_create_from_session(session, keyspace, table_name, table_key).await
     }
@@ -158,7 +158,7 @@ impl ScyllaGenericObjectDoubleIdTablePreparedStatements {
 
 
 #[async_trait]
-impl ScylaPreparedTableStatements for ScyllaGenericObjectDoubleIdTablePreparedStatements {
+impl ScyllaStandardPreparedTableStatements for ScyllaGenericObjectDoubleIdTablePreparedStatements {
     async fn create_table_standard(session: Arc<Session>, keyspace: &str, table_name: &str, table_key: QDatabaseTableRoutingKey) -> anyhow::Result<Self> {
         Self::new_create_from_session(session, keyspace, table_name, table_key).await
     }
@@ -235,7 +235,7 @@ impl ScyllaGenericKeyIdValueTablePreparedStatements {
 
 
 #[async_trait]
-impl ScylaPreparedTableStatements for ScyllaGenericKeyIdValueTablePreparedStatements {
+impl ScyllaStandardPreparedTableStatements for ScyllaGenericKeyIdValueTablePreparedStatements {
     async fn create_table_standard(session: Arc<Session>, keyspace: &str, table_name: &str, table_key: QDatabaseTableRoutingKey) -> anyhow::Result<Self> {
         Self::new_create_from_session(session, keyspace, table_name, table_key).await
     }

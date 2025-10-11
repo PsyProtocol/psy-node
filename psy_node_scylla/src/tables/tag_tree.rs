@@ -16,7 +16,7 @@ use scylla::{
     statement::{batch::Batch, prepared::PreparedStatement, Statement},
 };
 
-use crate::{constants::{INSERT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE, SELECT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE}, tables::traits::ScylaPreparedTableStatements, utils::{u64_to_i64_exact, u8_to_i8_exact}};
+use crate::{constants::{INSERT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE, SELECT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE}, tables::traits::ScyllaStandardPreparedTableStatements, utils::{u64_to_i64_exact, u8_to_i8_exact}};
 
 #[derive(Clone)]
 pub struct ScyllaTagTreeNodesPreparedStatements {
@@ -108,7 +108,7 @@ impl ScyllaTagTreeNodesPreparedStatements {
 }
 
 #[async_trait]
-impl ScylaPreparedTableStatements for ScyllaTagTreeNodesPreparedStatements {
+impl ScyllaStandardPreparedTableStatements for ScyllaTagTreeNodesPreparedStatements {
     async fn create_table_standard(
         session: Arc<Session>,
         keyspace: &str,

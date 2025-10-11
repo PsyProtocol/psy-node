@@ -17,7 +17,7 @@ use scylla::{
 };
 
 use crate::{
-    tables::traits::ScylaPreparedTableStatements,
+    tables::traits::ScyllaStandardPreparedTableStatements,
     utils::{convert_checkpoint_id_to_i64, u64_to_i64_exact, u8_to_i8_exact},
 };
 
@@ -95,7 +95,7 @@ impl ScyllaDoubleMerkleNodesPreparedStatements {
 
 
 #[async_trait]
-impl ScylaPreparedTableStatements for ScyllaDoubleMerkleNodesPreparedStatements {
+impl ScyllaStandardPreparedTableStatements for ScyllaDoubleMerkleNodesPreparedStatements {
     async fn create_table_standard(
         session: Arc<Session>,
         keyspace: &str,
