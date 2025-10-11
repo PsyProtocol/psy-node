@@ -353,7 +353,7 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
         tree_height: u8,
         key: SimpleMerkleNodeKey,
     ) -> anyhow::Result<Hash> {
-        self.select_single_id_merkle_node_max_checkpoint_internal(&table, checkpoint_id, tree_id, tree_height, key)
+        table.select_single_id_merkle_node_max_checkpoint_internal::<Hash, Hasher>(&self.session, checkpoint_id, tree_id, tree_height, key)
             .await
     }
     async fn db_select_many_single_id_merkle_nodes_max_checkpoint(
@@ -364,7 +364,7 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
         tree_height: u8,
         keys: &[SimpleMerkleNodeKey],
     ) -> anyhow::Result<Vec<Hash>> {
-        self.select_many_single_id_merkle_nodes_max_checkpoint_internal(&table, max_checkpoint_id, tree_id, tree_height, keys)
+        table.select_many_single_id_merkle_nodes_max_checkpoint_internal::<Hash, Hasher>(&self.session, max_checkpoint_id, tree_id, tree_height, keys)
             .await
     }
 }
@@ -381,7 +381,7 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
         key: SimpleMerkleNodeKey,
         value: &Hash,
     ) -> anyhow::Result<()> {
-        self.insert_single_id_merkle_node_internal(table, checkpoint_id, tree_id, key, &value.to_bytes()?)
+        table.insert_single_id_merkle_node_internal(&self.session, checkpoint_id, tree_id, key, &value.to_bytes()?)
             .await
     }
     async fn db_set_single_id_merkle_nodes_batch(
@@ -391,7 +391,7 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
         tree_id: u64,
         nodes: Vec<SimpleMerkleNode<Hash>>,
     ) -> anyhow::Result<()> {
-        self.set_single_id_merkle_nodes_batch_internal(&table, checkpoint_id, tree_id, nodes)
+        table.set_single_id_merkle_nodes_batch_internal::<Hash>(&self.session, checkpoint_id, tree_id, nodes)
             .await
     }
 }
@@ -409,7 +409,7 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
         tree_height: u8,
         key: SimpleMerkleNodeKey,
     ) -> anyhow::Result<Hash> {
-        self.select_double_id_merkle_node_max_checkpoint_internal(&table, checkpoint_id, tree_id, tree_height, tree_sub_id, key)
+        table.select_double_id_merkle_node_max_checkpoint_internal::<Hash, Hasher>(&self.session, checkpoint_id, tree_id, tree_height, tree_sub_id, key)
             .await
     }
     async fn db_select_many_double_id_merkle_nodes_max_checkpoint(
@@ -421,7 +421,7 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
         tree_height: u8,
         keys: &[SimpleMerkleNodeKey],
     ) -> anyhow::Result<Vec<Hash>> {
-        self.select_many_double_id_merkle_nodes_max_checkpoint_internal(&table, max_checkpoint_id, tree_id, tree_sub_id, tree_height, keys)
+        table.select_many_double_id_merkle_nodes_max_checkpoint_internal::<Hash, Hasher>(&self.session, max_checkpoint_id, tree_id, tree_sub_id, tree_height, keys)
             .await
     }
 }
@@ -439,7 +439,7 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
         key: SimpleMerkleNodeKey,
         value: &Hash,
     ) -> anyhow::Result<()> {
-        self.insert_double_id_merkle_node_internal(&table, checkpoint_id, tree_id, tree_sub_id, key, &value.to_bytes()?)
+        table.insert_double_id_merkle_node_internal(&self.session, checkpoint_id, tree_id, tree_sub_id, key, &value.to_bytes()?)
             .await
     }
     async fn db_set_double_id_merkle_nodes_batch(
@@ -450,7 +450,7 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
         tree_sub_id: u64,
         nodes: Vec<SimpleMerkleNode<Hash>>,
     ) -> anyhow::Result<()> {
-        self.set_double_id_merkle_nodes_batch_internal(&table, checkpoint_id, tree_id, tree_sub_id, nodes)
+        table.set_double_id_merkle_nodes_batch_internal(&self.session, checkpoint_id, tree_id, tree_sub_id, nodes)
             .await
     }
 }
