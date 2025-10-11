@@ -1,18 +1,29 @@
 use std::cmp::Ordering;
+
+use rand::Rng;
+
 use crate::data::serializable::{QPDSerializable, QPDSerializableFixed};
 pub const JOB_ID_EMPTY_REWARD_PATH_INFO: u64 = 0xFFFF_FFFF_FFFF_FFFFu64;
-
 
 #[pderive::serialize_copy_default_no_ord]
 pub struct SimpleMerkleNodeKey {
     pub level: u8,
     pub index: u64,
 }
+impl SimpleMerkleNodeKey {
+    pub fn random_simple_merkle_node_in_tree(tree_height: u8) -> Self {
+        let mut rng = rand::thread_rng();
+        let level = rng.gen_range(0..=tree_height);
+        let max_index = 1u64 << (tree_height - level);
+        let index = rng.gen_range(0..max_index);
+        Self { level, index }
+    }
+}
 impl PartialOrd for SimpleMerkleNodeKey {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         if self.level != other.level {
             self.level.partial_cmp(&other.level)
-        }else{
+        } else {
             self.index.partial_cmp(&other.index)
         }
     }
@@ -21,7 +32,7 @@ impl Ord for SimpleMerkleNodeKey {
     fn cmp(&self, other: &Self) -> Ordering {
         if self.level != other.level {
             self.level.cmp(&other.level)
-        }else{
+        } else {
             self.index.cmp(&other.index)
         }
     }
@@ -61,6 +72,7 @@ impl SimpleMerkleNodeKey {
             index: self.index ^ 1,
         }
     }
+
     pub fn siblings(&self) -> Vec<Self> {
         let mut result = Vec::with_capacity(self.level as usize);
         let mut current = *self;
@@ -75,11 +87,10 @@ impl SimpleMerkleNodeKey {
     pub fn is_direct_path_related(&self, other: &SimpleMerkleNodeKey) -> bool {
         if other.level == self.level {
             self.index == other.index
-        }else if other.level < self.level {
+        } else if other.level < self.level {
             // opt?: (self.index>>(self.level-other.level)) == other.index
             self.parent_at_level(other.level).index == other.index
-
-        }else{
+        } else {
             other.parent_at_level(self.level).index == self.index
         }
     }
@@ -164,9 +175,9 @@ impl SimpleMerkleNodeKey {
     pub fn get_siblings_keys_to_height(&self, to_level: u8) -> Vec<SimpleMerkleNodeKey> {
         if to_level > self.level {
             vec![]
-        }else{
+        } else {
             let mut my_node = self.clone();
-            let mut siblings = Vec::with_capacity((self.level-to_level) as usize);
+            let mut siblings = Vec::with_capacity((self.level - to_level) as usize);
             while my_node.level != to_level {
                 siblings.push(my_node.sibling());
                 my_node = my_node.parent();
@@ -174,6 +185,23 @@ impl SimpleMerkleNodeKey {
 
             siblings
         }
+    }
+    pub fn get_above_path_to_height(&self, to_level: u8) -> Vec<SimpleMerkleNodeKey> {
+        if to_level >= self.level {
+            vec![]
+        } else {
+            let mut my_node = self.parent();
+            let mut path_node_keys = Vec::with_capacity((self.level - to_level - 1) as usize);
+            while my_node.level != to_level {
+                path_node_keys.push(my_node.clone());
+                my_node = my_node.parent();
+            }
+
+            path_node_keys
+        }
+    }
+    pub fn get_above_path(&self) -> Vec<SimpleMerkleNodeKey> {
+        self.get_above_path_to_height(0)
     }
 }
 
@@ -200,10 +228,7 @@ impl QPDSerializable for SimpleMerkleNodeKey {
                 index: u64::from_be_bytes(bytes[1..9].try_into().unwrap()),
             })
         } else {
-            anyhow::bail!(
-                "error deserializing SimpleMerkleNodeKey, expected 9 bytes, got {}",
-                bytes.len()
-            );
+            anyhow::bail!("error deserializing SimpleMerkleNodeKey, expected 9 bytes, got {}", bytes.len());
         }
     }
 }
@@ -237,9 +262,9 @@ impl<Hash: PartialOrd> PartialOrd for SimpleMerkleNode<Hash> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         if self.key.level != other.key.level {
             self.key.level.partial_cmp(&other.key.level)
-        }else if self.key.index != other.key.index {
+        } else if self.key.index != other.key.index {
             self.key.index.partial_cmp(&other.key.index)
-        }else {
+        } else {
             self.value.partial_cmp(&other.value)
         }
     }
@@ -248,9 +273,9 @@ impl<Hash: Ord> Ord for SimpleMerkleNode<Hash> {
     fn cmp(&self, other: &Self) -> Ordering {
         if self.key.level != other.key.level {
             self.key.level.cmp(&other.key.level)
-        }else if self.key.index != other.key.index {
+        } else if self.key.index != other.key.index {
             self.key.index.cmp(&other.key.index)
-        }else {
+        } else {
             self.value.cmp(&other.value)
         }
     }
@@ -263,21 +288,22 @@ pub struct SimpleMerkleNodeNCAAggregation {
     pub right: SimpleMerkleNodeKey,
 }
 
-
 // --- Add this new helper function ---
 
-/// A truly efficient recursive helper that avoids HashMap lookups in the hot path.
+/// A truly efficient recursive helper that avoids HashMap lookups in the hot
+/// path.
 ///
-/// It returns a tuple `(SimpleMerkleNodeKey, usize)` representing the NCA key and its
-/// calculated dependency level. This avoids the need for a shared map to store levels,
-/// passing the state up the call stack instead.
+/// It returns a tuple `(SimpleMerkleNodeKey, usize)` representing the NCA key
+/// and its calculated dependency level. This avoids the need for a shared map
+/// to store levels, passing the state up the call stack instead.
 fn build_recursive_truly_efficient(
     nodes: &[SimpleMerkleNodeKey],
     subtree_root: SimpleMerkleNodeKey,
     tree_height: u8,
     // We still collect the aggregations with their levels as we go.
     aggregations: &mut Vec<SimpleMerkleNodeNCAAggregation>,
-) -> Option<SimpleMerkleNodeKey> { // Return type changed!
+) -> Option<SimpleMerkleNodeKey> {
+    // Return type changed!
     if nodes.is_empty() {
         return None;
     }
@@ -293,31 +319,21 @@ fn build_recursive_truly_efficient(
     let (left_nodes, right_nodes) = nodes.split_at(partition_idx);
 
     // --- Conquer Phase ---
-    let left_result = build_recursive_truly_efficient(
-        left_nodes,
-        subtree_root.left_child(),
-        tree_height,
-        aggregations,
-    );
-    let right_result = build_recursive_truly_efficient(
-        right_nodes,
-        right_child,
-        tree_height,
-        aggregations,
-    );
+    let left_result = build_recursive_truly_efficient(left_nodes, subtree_root.left_child(), tree_height, aggregations);
+    let right_result = build_recursive_truly_efficient(right_nodes, right_child, tree_height, aggregations);
 
     // --- Combine Phase ---
     match (left_result, right_result) {
         (Some(l_key), Some(r_key)) => {
             let combined_nca_key = l_key.find_nearest_common_ancestor(&r_key);
-            
+
             let agg = SimpleMerkleNodeNCAAggregation {
                 nca: combined_nca_key,
                 left: l_key,
                 right: r_key,
             };
             aggregations.push(agg);
-            
+
             // Pass the new key and its calculated level up the call stack.
             Some(combined_nca_key)
         }
@@ -328,14 +344,13 @@ fn build_recursive_truly_efficient(
     }
 }
 
-
 // --- New top-level function. Can replace the old `efficient` one ---
 
 pub fn generate_nca_tree_groups_efficient(leaves: &[SimpleMerkleNodeKey], _leaf_level: u8) -> Vec<Vec<SimpleMerkleNodeNCAAggregation>> {
     if leaves.len() < 2 {
         return vec![];
     }
-    
+
     let tree_height = leaves[0].level;
 
     let mut sorted_leaves = leaves.to_vec();
@@ -344,13 +359,9 @@ pub fn generate_nca_tree_groups_efficient(leaves: &[SimpleMerkleNodeKey], _leaf_
     let mut aggregations = Vec::new();
     let root_node = SimpleMerkleNodeKey::new(0, 0);
 
-    // This single call builds the tree and determines the level for each aggregation.
-    build_recursive_truly_efficient(
-        &sorted_leaves, 
-        root_node, 
-        tree_height, 
-        &mut aggregations,
-    );
+    // This single call builds the tree and determines the level for each
+    // aggregation.
+    build_recursive_truly_efficient(&sorted_leaves, root_node, tree_height, &mut aggregations);
 
     if aggregations.is_empty() {
         return vec![];
@@ -369,7 +380,7 @@ pub fn generate_nca_tree_groups_efficient(leaves: &[SimpleMerkleNodeKey], _leaf_
 
     let mut has_non_leaf_children = true;
     let mut current_level = vec![root];
-    
+
     while has_non_leaf_children {
         levels.push(current_level.clone());
         let mut next_level = Vec::new();
@@ -398,9 +409,11 @@ pub fn generate_nca_tree_groups_efficient(leaves: &[SimpleMerkleNodeKey], _leaf_
 }
 // --- Function Implementation ---
 
-/// Recursively builds the aggregation path for a given set of nodes within a specific sub-tree.
+/// Recursively builds the aggregation path for a given set of nodes within a
+/// specific sub-tree.
 ///
-/// This is the helper function that implements the core divide-and-conquer logic.
+/// This is the helper function that implements the core divide-and-conquer
+/// logic.
 fn build_recursive(
     nodes: &[SimpleMerkleNodeKey],
     subtree_root: SimpleMerkleNodeKey,
@@ -411,15 +424,16 @@ fn build_recursive(
     if nodes.is_empty() {
         return None;
     }
-    // Base case: If there is only one node, it is the de-facto root of this sub-tree.
+    // Base case: If there is only one node, it is the de-facto root of this
+    // sub-tree.
     if nodes.len() == 1 {
         return Some(nodes[0]);
     }
 
     // --- Divide Phase ---
-    // Find the split point to partition the nodes into the left and right children's domains.
-    // The first leaf index belonging to the right child of our current sub-tree root serves
-    // as the partition boundary.
+    // Find the split point to partition the nodes into the left and right
+    // children's domains. The first leaf index belonging to the right child of
+    // our current sub-tree root serves as the partition boundary.
     let right_child = subtree_root.right_child();
     let split_leaf_index = right_child.first_leaf_child(tree_height).index;
 
@@ -453,29 +467,31 @@ fn build_recursive(
     }
 }
 
-
 /// Generates the PARTH tree aggregation path for a set of leaf nodes using a
-/// recursive, divide-and-conquer strategy that respects the Merkle tree's binary structure.
+/// recursive, divide-and-conquer strategy that respects the Merkle tree's
+/// binary structure.
 ///
-/// This method avoids path conflicts by building up sub-proofs for distinct sub-trees
-/// before combining them, correctly handling sparse distributions of leaves.
+/// This method avoids path conflicts by building up sub-proofs for distinct
+/// sub-trees before combining them, correctly handling sparse distributions of
+/// leaves.
 ///
 /// # Arguments
 ///
-/// * `leaves` - A slice of `SimpleMerkleNodeKey` representing the initial nodes. It's assumed
-///   all leaves are at the same level (tree height).
+/// * `leaves` - A slice of `SimpleMerkleNodeKey` representing the initial
+///   nodes. It's assumed all leaves are at the same level (tree height).
 ///
 /// # Returns
 ///
-/// A `Vec<SimpleMerkleNodeNCAAggregation>` detailing the correct aggregation path. The
-/// vector is ordered such that independent sub-tree aggregations appear before the
-/// steps that combine them.
+/// A `Vec<SimpleMerkleNodeNCAAggregation>` detailing the correct aggregation
+/// path. The vector is ordered such that independent sub-tree aggregations
+/// appear before the steps that combine them.
 pub fn generate_nca_tree(leaves: &[SimpleMerkleNodeKey]) -> Vec<SimpleMerkleNodeNCAAggregation> {
     if leaves.len() < 2 {
         return vec![];
     }
-    
-    // Assume all leaves are at the same level and use the first to determine tree height.
+
+    // Assume all leaves are at the same level and use the first to determine tree
+    // height.
     let tree_height = leaves[0].level;
 
     // Sorting is crucial for the partitioning logic to work correctly.
@@ -505,7 +521,7 @@ pub fn generate_nca_tree_groups_naive(leaves: &[SimpleMerkleNodeKey], leaf_level
 
     let mut has_non_leaf_children = true;
     let mut current_level = vec![ncas.pop().unwrap()];
-    
+
     while has_non_leaf_children {
         levels.push(current_level.clone());
         let mut next_level = Vec::new();
@@ -531,21 +547,14 @@ pub fn generate_nca_tree_groups_naive(leaves: &[SimpleMerkleNodeKey], leaf_level
     }
     levels.reverse();
     levels
-
-
-
-
-
 }
-// for a given NCA node, its left and right children must be in the group directly below
-pub fn check_nca_tree_groups(
-    groups: &[Vec<SimpleMerkleNodeNCAAggregation>],
-    leaf_level: u8
-) -> bool {
+// for a given NCA node, its left and right children must be in the group
+// directly below
+pub fn check_nca_tree_groups(groups: &[Vec<SimpleMerkleNodeNCAAggregation>], leaf_level: u8) -> bool {
     //let mut nca_set = std::collections::HashSet::new();
-    for i in 1.. groups.len() {
+    for i in 1..groups.len() {
         let group = &groups[i];
-        for node in group.iter(){
+        for node in group.iter() {
             // Check if the NCA is unique in this group
             if group.iter().filter(|x| x.nca == node.nca).count() > 1 {
                 println!("Duplicate NCA found in group {}: {:?}", i, node.nca);
@@ -560,11 +569,11 @@ pub fn check_nca_tree_groups(
                 println!("Duplicate right child found in group {}: {:?}", i, node.right);
                 return false;
             }
-            if node.left.level != leaf_level && !groups[i-1].iter().any(|x| x.nca == node.left) {
+            if node.left.level != leaf_level && !groups[i - 1].iter().any(|x| x.nca == node.left) {
                 println!("The dependencies of a group MUST be in the group directly below");
                 return false;
             }
-            if node.right.level != leaf_level && !groups[i-1].iter().any(|x| x.nca == node.right) {
+            if node.right.level != leaf_level && !groups[i - 1].iter().any(|x| x.nca == node.right) {
                 println!("The dependencies of a group MUST be in the group directly below");
                 return false;
             }
@@ -574,7 +583,7 @@ pub fn check_nca_tree_groups(
 }
 
 /*
-remember: 
+remember:
 
         let x0 = SimpleMerkleNodeKey::new(24, 10);
 
@@ -618,7 +627,6 @@ bad nca(SimpleMerkleNodeKey { level: 19, index: 0 }, SimpleMerkleNodeKey { level
 #[cfg(test)]
 mod tests {
 
-
     struct NCAGroupCheckerHelper {
         pub node_to_group_id_map: std::collections::HashMap<SimpleMerkleNodeKey, usize>,
         pub tree_height: u8,
@@ -640,11 +648,11 @@ mod tests {
             let nca_group_id = self.get_group_id(&nca.nca);
             if left_group_id.is_none() && right_group_id.is_none() {
                 return true;
-            }else if left_group_id.is_none() {
+            } else if left_group_id.is_none() {
                 return right_group_id.unwrap() + 1 == nca_group_id.unwrap();
-            }else if right_group_id.is_none() {
+            } else if right_group_id.is_none() {
                 return left_group_id.unwrap() + 1 == nca_group_id.unwrap();
-            }else{
+            } else {
                 return left_group_id.unwrap() + 1 == nca_group_id.unwrap() && right_group_id.unwrap() + 1 == nca_group_id.unwrap();
             }
         }
@@ -672,13 +680,14 @@ mod tests {
             }
             true
         }
-
     }
 
     use std::collections::HashSet;
 
-    use crate::data::hash::merkle_node_key::{check_nca_tree_groups, generate_nca_tree, generate_nca_tree_groups_efficient, generate_nca_tree_groups_naive, SimpleMerkleNodeKey, SimpleMerkleNodeNCAAggregation};
-
+    use crate::data::hash::merkle_node_key::{
+        check_nca_tree_groups, generate_nca_tree, generate_nca_tree_groups_efficient, generate_nca_tree_groups_naive, SimpleMerkleNodeKey,
+        SimpleMerkleNodeNCAAggregation,
+    };
 
     fn is_unique_node_set(node_set: &[SimpleMerkleNodeKey]) -> bool {
         let unique_len = HashSet::<SimpleMerkleNodeKey>::from_iter(node_set.to_vec().into_iter()).len();
@@ -691,28 +700,24 @@ mod tests {
         hset.into_iter().collect::<Vec<_>>()
     }
 
-    fn random_nodes_in_tree(height: u8, count: usize) -> Vec<SimpleMerkleNodeKey>{
-
+    fn random_nodes_in_tree(height: u8, count: usize) -> Vec<SimpleMerkleNodeKey> {
         let max_node_id = 1u64 << (height as u64);
 
         let mut result = Vec::with_capacity(count);
         for _ in 0..count {
             result.push(SimpleMerkleNodeKey {
                 level: height,
-                index: rand::random::<u64>()%max_node_id,
+                index: rand::random::<u64>() % max_node_id,
             });
         }
 
         get_unique_node_set(result)
-        
-
     }
 
-    fn random_nodes_test_gen(count: usize, height: u8){
-
+    fn random_nodes_test_gen(count: usize, height: u8) {
         let leaves = random_nodes_in_tree(height, count);
         let ncas = generate_nca_tree(&leaves);
-        let ncp= ncas.iter().map(|x|x.nca).collect::<Vec<_>>();
+        let ncp = ncas.iter().map(|x| x.nca).collect::<Vec<_>>();
 
         assert!(is_unique_node_set(&ncp), "is not unique node set");
     }
@@ -742,7 +747,6 @@ mod tests {
         random_nodes_test_gen(5002, 24);
         random_nodes_test_gen(5003, 24);
         random_nodes_test_gen(5004, 24);
-
     }
     #[test]
     fn check_tree_groups() {
@@ -771,24 +775,36 @@ mod tests {
         let n_group_levels = generate_nca_tree_groups_naive(&leaves, guta_height);
         println!("naive groups: {:#?}", n_group_levels);
 
-        assert!(NCAGroupCheckerHelper::check_groups(n_group_levels.clone(), guta_height), "naive groups are not valid");
-        assert!(NCAGroupCheckerHelper::check_groups(e_group_levels.clone(), guta_height), "efficient groups are not valid");
+        assert!(
+            NCAGroupCheckerHelper::check_groups(n_group_levels.clone(), guta_height),
+            "naive groups are not valid"
+        );
+        assert!(
+            NCAGroupCheckerHelper::check_groups(e_group_levels.clone(), guta_height),
+            "efficient groups are not valid"
+        );
         assert_eq!(n_group_levels, e_group_levels, "group levels differ");
     }
     #[test]
     fn check_tree_groups_3() {
         let guta_height = 32u8;
-        let leaves = random_nodes_in_tree(guta_height,  133713);
+        let leaves = random_nodes_in_tree(guta_height, 133713);
         let e_group_levels = generate_nca_tree_groups_efficient(&leaves, guta_height);
         let n_group_levels = generate_nca_tree_groups_naive(&leaves, guta_height);
 
-        assert!(NCAGroupCheckerHelper::check_groups(n_group_levels.clone(), guta_height), "naive groups are not valid");
-        assert!(NCAGroupCheckerHelper::check_groups(e_group_levels.clone(), guta_height), "efficient groups are not valid");
+        assert!(
+            NCAGroupCheckerHelper::check_groups(n_group_levels.clone(), guta_height),
+            "naive groups are not valid"
+        );
+        assert!(
+            NCAGroupCheckerHelper::check_groups(e_group_levels.clone(), guta_height),
+            "efficient groups are not valid"
+        );
         assert_eq!(n_group_levels, e_group_levels, "group levels differ");
     }
     #[test]
     fn run_many_random_nodes() {
-        let nodes = random_nodes_in_tree(32, 1000*1000);
+        let nodes = random_nodes_in_tree(32, 1000 * 1000);
         let start_time = std::time::Instant::now();
         let ncas = generate_nca_tree(&nodes);
         let duration = start_time.elapsed();
@@ -796,13 +812,13 @@ mod tests {
     }
     #[test]
     fn test_with_prompt_example() {
-        // This is the example from the prompt where linear aggregation works by coincidence.
-        // Our algorithm must also produce the correct result here.
+        // This is the example from the prompt where linear aggregation works by
+        // coincidence. Our algorithm must also produce the correct result here.
         let x0 = SimpleMerkleNodeKey::new(24, 10);
         let x1 = SimpleMerkleNodeKey::new(24, 26);
         let x2 = SimpleMerkleNodeKey::new(24, 76);
         let x3 = SimpleMerkleNodeKey::new(24, 140);
-        
+
         let leaves = vec![x0, x1, x2, x3];
         let path = generate_nca_tree(&leaves);
 
@@ -816,15 +832,37 @@ mod tests {
         // Let's check that the final aggregation is correct.
         let final_agg = path.last().unwrap();
         assert_eq!(final_agg.nca, nca_0123);
-        
-        // Let's check the individual steps more carefully. The dependencies must be met.
-        // In this case, because the leaves are spread out, the tree is very unbalanced.
+
+        // Let's check the individual steps more carefully. The dependencies must be
+        // met. In this case, because the leaves are spread out, the tree is
+        // very unbalanced.
         // 1. nca(x0, x1) -> nca_01
         // 2. nca(nca_01, x2) -> nca_012
         // 3. nca(nca_012, x3) -> nca_0123
-        assert_eq!(path[0], SimpleMerkleNodeNCAAggregation { nca: nca_01, left: x0, right: x1 });
-        assert_eq!(path[1], SimpleMerkleNodeNCAAggregation { nca: nca_012, left: nca_01, right: x2 });
-        assert_eq!(path[2], SimpleMerkleNodeNCAAggregation { nca: nca_0123, left: nca_012, right: x3 });
+        assert_eq!(
+            path[0],
+            SimpleMerkleNodeNCAAggregation {
+                nca: nca_01,
+                left: x0,
+                right: x1
+            }
+        );
+        assert_eq!(
+            path[1],
+            SimpleMerkleNodeNCAAggregation {
+                nca: nca_012,
+                left: nca_01,
+                right: x2
+            }
+        );
+        assert_eq!(
+            path[2],
+            SimpleMerkleNodeNCAAggregation {
+                nca: nca_0123,
+                left: nca_012,
+                right: x3
+            }
+        );
     }
 
     #[test]
@@ -836,7 +874,7 @@ mod tests {
         let x3 = SimpleMerkleNodeKey::new(h, 3);
         let x5 = SimpleMerkleNodeKey::new(h, 5);
         let x6 = SimpleMerkleNodeKey::new(h, 6);
-        
+
         let leaves = vec![x0, x1, x3, x5, x6];
         let path = generate_nca_tree(&leaves);
 
@@ -846,29 +884,46 @@ mod tests {
         let nca_01 = x0.find_nearest_common_ancestor(&x1); // {2, 0}
         let nca_56 = x5.find_nearest_common_ancestor(&x6); // {1, 1}
         println!("nca_01: {:?}, nca_56: {:?}", nca_01, nca_56);
-        
+
         // Root of the left sub-tree (indices 0-3)
         let nca_left_half = nca_01.find_nearest_common_ancestor(&x3); // {1, 0}
-        // Root of the right sub-tree (indices 4-7) is just nca_56 in this case.
+                                                                      // Root of the right sub-tree (indices 4-7) is just nca_56 in this case.
         println!("nca_left_half: {:?}", nca_left_half);
         let nca_right_half = nca_56;
 
         // Final combination
         let final_nca = nca_left_half.find_nearest_common_ancestor(&nca_right_half); // {0, 0}
         println!("final_nca: {:?}", final_nca);
-        // The path should contain these aggregations. The order is determined by post-order traversal.
+        // The path should contain these aggregations. The order is determined by
+        // post-order traversal.
         // 1. nca(x0, x1) -> {2, 0}
         // 2. nca(x5, x6) -> {1, 1}
         // 3. nca({2, 0}, x3) -> {1, 0}
         // 4. nca({1, 0}, {1, 2}) -> {0, 0}
-        
+
         let expected_path = vec![
-            SimpleMerkleNodeNCAAggregation { nca: nca_01, left: x0, right: x1 },
-            SimpleMerkleNodeNCAAggregation { nca: nca_left_half, left: nca_01, right: x3 },
-            SimpleMerkleNodeNCAAggregation { nca: nca_56, left: x5, right: x6 },
-            SimpleMerkleNodeNCAAggregation { nca: final_nca, left: nca_left_half, right: nca_right_half },
+            SimpleMerkleNodeNCAAggregation {
+                nca: nca_01,
+                left: x0,
+                right: x1,
+            },
+            SimpleMerkleNodeNCAAggregation {
+                nca: nca_left_half,
+                left: nca_01,
+                right: x3,
+            },
+            SimpleMerkleNodeNCAAggregation {
+                nca: nca_56,
+                left: x5,
+                right: x6,
+            },
+            SimpleMerkleNodeNCAAggregation {
+                nca: final_nca,
+                left: nca_left_half,
+                right: nca_right_half,
+            },
         ];
-        
+
         assert_eq!(path, expected_path);
     }
     #[test]
@@ -889,8 +944,6 @@ mod tests {
         println!("bad nca({:?}, {:?}) = {:?}", x0, x1, x01);
         println!("bad nca({:?}, {:?}) = {:?}", x2, x3, x23);
         println!("bad nca({:?}, {:?}) = {:?}", x01, x23, x0123);
-
-
     }
     #[test]
     fn it_test_good() {
@@ -902,17 +955,12 @@ mod tests {
 
         let x3 = SimpleMerkleNodeKey::new(24, 140);
 
-
-
         let x01 = x0.find_nearest_common_ancestor(&x1);
         let x012 = x01.find_nearest_common_ancestor(&x2);
         let x0123 = x012.find_nearest_common_ancestor(&x3);
 
-    
-
         println!("good nca({:?}, {:?}) = {:?}", x0, x1, x01);
         println!("good nca({:?}, {:?}) = {:?}", x01, x2, x012);
         println!("good nca({:?}, {:?}) = {:?}", x012, x3, x0123);
-
     }
 }

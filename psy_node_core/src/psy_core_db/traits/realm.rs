@@ -1,7 +1,7 @@
 use async_trait::async_trait;
-use parth_core::{crypto::hash::merkle_proof::{DeltaMerkleProofCore, MerkleProofCore}, data::hash::merkle_node_key::SimpleMerkleNode, felt::ToU64Value, protocol::core_types::{QNetworkDatabaseTypes, QNetworkTypesConfig}, QCoreProcCheckpointUniqueId};
+use parth_core::{crypto::hash::merkle_proof::MerkleProofCore, felt::ToU64Value, protocol::core_types::{QNetworkDatabaseTypes, QNetworkTypesConfig}, QCoreProcCheckpointUniqueId};
 use psy_data::v1::qdata::{checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState}, checkpoint_sync::PQEDCheckpointSyncInfo, user::PQEDUserLeaf};
-use psy_node_core::data::pending::realm::RealmPendingCheckpoint;
+use crate::data::pending::realm::RealmPendingCheckpoint;
 
 #[async_trait]
 pub trait QEDRealmStoreReaderAsync<N: QNetworkDatabaseTypes> {

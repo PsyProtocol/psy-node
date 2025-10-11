@@ -4,7 +4,7 @@ members = [
     "pderive",
     "parth_core",
     "parth_common",
-    "psy_global_types",
+    "psy_scratchpad",
     "psy_type_defaults",
     "psy_core",
     "psy_common",
@@ -13,7 +13,8 @@ members = [
     "psy_node_common",
     "psy_node_redis",
     "psy_node_scylla",
-    "psy_node_nats"
+    "psy_node_nats",
+    "psy_node_store_memory"
 ]
 resolver = "2"
 
@@ -116,8 +117,8 @@ redis = { version = "0.30.0", default-features = false, features = [
 bb8-redis = "0.22.0"
 bb8 = "0.9"
 rsmq = { git = "https://github.com/jimzk/rsmq-async-rs", package = "rsmq_async", features = ["break-js-comp", "sync", "tokio"] }
-
-
+dashmap = "6.1.0"
+parking_lot = "0.12.5"
 # Workspace Packages
 pser = { path = "./pser" }
 pderive = { path = "./pderive" }
@@ -133,7 +134,7 @@ psy_data = { path = "./psy_data" }
 psy_common = { path = "./psy_common" }
 psy_node_core = { path = "./psy_node_core" }
 psy_node_common = { path = "./psy_node_common" }
-psy_global_types = { path = "./psy_global_types" }
+psy_scratchpad = { path = "./psy_scratchpad" }
 psy_type_defaults = { path = "./psy_type_defaults" }
 
 psy_node_redis = { path = "./psy_node_redis" }

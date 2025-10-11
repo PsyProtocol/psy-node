@@ -122,7 +122,6 @@ impl ScyllaStandardPreparedTableStatements for ScyllaU64ToU64TablePreparedStatem
 impl ScyllaU64ToU64TablePreparedStatements {
     pub async fn atomic_increment(&self, session: &Session, obj_id: u64, amount: u64) -> anyhow::Result<u64> {
         let obj_id_i64 = u64_to_i64_exact(obj_id);
-
         loop {
             let res = session
                 .execute_unpaged(&self.select_value_1_prepared, (obj_id_i64,))
@@ -133,13 +132,13 @@ impl ScyllaU64ToU64TablePreparedStatements {
                 .map(|(val,)| val.unwrap_or(0));
             let current_value_u64 = i64_to_u64_exact(current_value_i64.unwrap_or(0));
 
-            let new_value_u64 = current_value_u64 + amount;
-            let new_value_i64 = u64_to_i64_exact(new_value_u64);
+            let new_value_i64 = u64_to_i64_exact(current_value_u64)+ u64_to_i64_exact(amount);
+            let new_value_u64 = i64_to_u64_exact(new_value_i64);
             if current_value_i64.is_some() {
                 let update_result = session
                     .execute_unpaged(&self.update_if_exists_prepared, (new_value_i64, obj_id_i64, current_value_i64.unwrap()))
                     .await?;
-                let applied = update_result.into_rows_result()?.first_row::<(bool,)>()?.0;
+                let applied = update_result.into_rows_result()?.first_row::<(bool,i64)>()?.0;
                 if applied {
                     return Ok(new_value_u64);
                 }
@@ -147,7 +146,7 @@ impl ScyllaU64ToU64TablePreparedStatements {
                 let insert_result = session
                     .execute_unpaged(&self.insert_if_not_exists_prepared, (obj_id_i64, new_value_i64))
                     .await?;
-                let applied = insert_result.into_rows_result()?.first_row::<(bool,)>()?.0;
+                let applied = insert_result.into_rows_result()?.first_row::<(bool,Option<i64>, Option<i64>)>()?.0;
                 if applied {
                     return Ok(new_value_u64);
                 }

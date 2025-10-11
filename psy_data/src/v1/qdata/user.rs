@@ -1,5 +1,4 @@
 use parth_core::{crypto::hash::traits::{FieldQHasher, QFieldHashable}, data::serializable::QPDSerializable, felt::{QFelt, QFelt64, QFeltSized, ToQFelts}, impl_qpd_serialize_params, protocol::core_types::{QFHashBase, QHashBase}};
-use serde::{Deserialize, Serialize};
 use pser::{QBytesDeserialize, QBytesSerialize};
 
 #[pderive::serialize_copy_f_hash_ts]

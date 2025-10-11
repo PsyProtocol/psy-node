@@ -1,13 +1,13 @@
 use serde::{de::DeserializeOwned, Serialize};
 use std::hash::Hash;
 
-use crate::data::serializable::{QPDSerializable, QPDSerializableFixed};
+use crate::{data::serializable::{QPDSerializable, QPDSerializableFixed}, utils::QPGenRandom};
 
 
-pub trait CoreDatabaseValueDeserialize: DeserializeOwned + Send + Sync + Serialize {
+pub trait CoreDatabaseValueDeserialize: DeserializeOwned + Send + Sync + Serialize + PartialEq + Clone {
 
 }
-impl<V: DeserializeOwned + Send + Sync + Serialize> CoreDatabaseValueDeserialize for V {
+impl<V: DeserializeOwned + Send + Sync + Serialize + PartialEq + Clone> CoreDatabaseValueDeserialize for V {
 
 }
 
@@ -28,3 +28,8 @@ impl<K1: QDatabasePrimitiveKey, K2: QDatabasePrimitiveKey> BiDirectionalMappingR
     }
 }
 
+impl<K1: QDatabasePrimitiveKey + QPGenRandom, K2: QDatabasePrimitiveKey+ QPGenRandom> QPGenRandom for BiDirectionalMappingRow<K1, K2> {
+    fn qp_rand_gen() -> Self where Self: Sized {
+        Self { k1: K1::qp_rand_gen(), k2: K2::qp_rand_gen() }
+    }
+}

@@ -201,7 +201,7 @@ impl ScyllaMerkleNodesPreparedStatements {
         session: &Session,
         checkpoint_id: u64,
         tree_id: u64,
-        nodes: Vec<SimpleMerkleNode<Hash>>,
+        nodes: &[SimpleMerkleNode<Hash>],
     ) -> anyhow::Result<()> {
         const BATCH_SIZE: usize = 256; // Safe batch size to avoid payload limits
         let mut batch_list: Vec<Batch> = Vec::new();

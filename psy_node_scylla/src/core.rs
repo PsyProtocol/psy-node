@@ -3,7 +3,7 @@ use std::sync::Arc;
 use parth_core::{crypto::hash::traits::MerkleZeroHasher, data::db::table::QDatabaseTableRoutingKey, protocol::core_types::QHashBase};
 use scylla::client::session::{Session, SessionConfig};
 
-use crate::tables::traits::ScyllaStandardPreparedTableStatements;
+use crate::tables::{merkle::ScyllaMerkleNodesZeroPreparedStatements, traits::ScyllaStandardPreparedTableStatements};
 
 #[derive(Clone)]
 pub struct ScyllaCoreStore<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> {
@@ -46,6 +46,16 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
         table_name: &str,
         table_key: QDatabaseTableRoutingKey,
     ) -> anyhow::Result<T> {
+        println!("intializing table: {}", table_name);
         T::create_table_standard(self.session.clone(), &self.keyspace, table_name, table_key).await
+    }
+    pub async fn init_zero_id_merkle_table(
+        &self,
+        table_name: &str,
+        table_key: QDatabaseTableRoutingKey,
+        tree_height: u8,
+    ) -> anyhow::Result<ScyllaMerkleNodesZeroPreparedStatements> {
+        println!("intializing zero id merkle table: {}", table_name);
+        ScyllaMerkleNodesZeroPreparedStatements::new_create_from_session(self.session.clone(), &self.keyspace, table_name, table_key, tree_height).await
     }
 }

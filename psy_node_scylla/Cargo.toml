@@ -38,6 +38,7 @@ bytes = { workspace = true }
 futures = { workspace = true }
 # start local packages
 pser = { workspace = true }
+pderive = { workspace = true }
 parth_core = { workspace = true }
 # parth_common = { workspace = true }
 # psy_core = { workspace = true }
@@ -48,4 +49,5 @@ psy_node_core = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+parth_crypto = { workspace = true }
 

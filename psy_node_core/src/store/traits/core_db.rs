@@ -17,6 +17,7 @@ use parth_core::{
     protocol::core_types::QHashBase,
 };
 use serde::{de::DeserializeOwned, Serialize};
+
 #[async_trait]
 pub trait CoreDatabaseBidirectionalMappingReader<TableIdentifier: Clone + Send + Sync> {
     async fn db_select_one_by_k1<K1: QDatabasePrimitiveKey, K2: QDatabasePrimitiveKey>(
@@ -418,7 +419,7 @@ pub trait CoreDatabaseSingleIdMerkleWriter<
         table: &TableIdentifier,
         checkpoint_id: u64,
         tree_id: u64,
-        nodes: Vec<SimpleMerkleNode<Hash>>,
+        nodes: &[SimpleMerkleNode<Hash>],
     ) -> anyhow::Result<()>;
     
 }
@@ -601,7 +602,7 @@ pub trait CoreDatabaseDoubleIdMerkleWriter<
         checkpoint_id: u64,
         tree_id: u64,
         tree_sub_id: u64,
-        nodes: Vec<SimpleMerkleNode<Hash>>,
+        nodes: &[SimpleMerkleNode<Hash>],
     ) -> anyhow::Result<()>;
 }
 pub trait CoreDatabaseDoubleIdMerkleStore<

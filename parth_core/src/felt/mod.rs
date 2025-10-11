@@ -1,9 +1,11 @@
-use std::{iter::Sum, ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign, Div, DivAssign}};
+use std::{iter::Sum, ops::{Add, AddAssign, Mul, MulAssign, Sub, SubAssign, Div, DivAssign}};
 use std::fmt::{Debug, Display};
 use std::hash::Hash;
 
 use serde::{de::DeserializeOwned, Serialize};
 use ts_rs::TS;
+
+use crate::utils::QPGenRandom;
 pub trait ToU64Value {
     fn to_u64_value(&self) -> u64;
 }
@@ -28,6 +30,10 @@ impl FromPrimitiveValuesFelt for u64 {
         value
     }
 }
+
+pub trait SimpleRandFelt {
+    fn get_simple_rand() -> Self;
+}
 pub trait ZeroableFelt {
     const ZERO_VALUE: Self;
 
@@ -40,7 +46,6 @@ pub trait QFelt:
     + Copy
     + Eq
     + Hash
-    + Neg<Output = Self>
     + Add<Self, Output = Self>
     + AddAssign<Self>
     + Sum
@@ -56,7 +61,7 @@ pub trait QFelt:
     + Send
     + Sync
     + Serialize
-    + DeserializeOwned + ZeroableFelt + TS + FromPrimitiveValuesFelt {
+    + DeserializeOwned + ZeroableFelt + TS + FromPrimitiveValuesFelt + SimpleRandFelt + QPGenRandom {
 
 }
 impl<T: 
@@ -64,7 +69,6 @@ impl<T:
     + Copy
     + Eq
     + Hash
-    + Neg<Output = Self>
     + Add<Self, Output = Self>
     + AddAssign<Self>
     + Sum
@@ -82,7 +86,7 @@ impl<T:
     + Serialize
     + DeserializeOwned
     + ZeroableFelt
-    + TS + FromPrimitiveValuesFelt
+    + TS + FromPrimitiveValuesFelt + SimpleRandFelt + QPGenRandom
 > QFelt for T {
 }
 
@@ -121,5 +125,23 @@ impl<const N: usize, F: Copy> ToQFelts<F> for [F; N] {
         let mut arr = [felts[0]; N];
         arr.copy_from_slice(&felts[0..N]);
         arr
+    }
+}
+
+
+impl ToU64Value for u64 {
+    fn to_u64_value(&self) -> u64 {
+        *self
+    }
+}
+impl SimpleRandFelt for u64 {
+    fn get_simple_rand() -> Self {
+        rand::random::<u64>()
+    }
+}
+
+impl QPGenRandom for u64 {
+    fn qp_rand_gen() -> Self where Self: Sized {
+        rand::random::<u64>()
     }
 }

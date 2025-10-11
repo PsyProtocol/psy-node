@@ -1,9 +1,10 @@
 [package]
 edition = "2021"
-name    = "psy_node_core"
+name    = "psy_node_store_memory"
 version = "0.1.0"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
 
 [features]
 default = ["std", "parth_core/serialize_rkyv", "parth_core/serialize_speedy", "parth_core/serialize_postcard"]
@@ -13,10 +14,13 @@ serialize_speedy = ["dep:speedy", "pser/serialize_speedy", "parth_core/serialize
 serialize_postcard = ["dep:postcard", "pser/serialize_postcard", "parth_core/serialize_postcard"]
 
 [dependencies]
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
 postcard = { workspace = true, optional = true }
 rkyv = { workspace = true, optional = true }
 speedy = { workspace = true, optional = true }
 anyhow     = { workspace = true }
+uuid = { workspace = true }
 async-trait      = { workspace = true }
 serde      = { workspace = true }
 serde_json      = { workspace = true }
@@ -31,14 +35,18 @@ rand = { workspace = true }
 auto_impl = { workspace = true }
 strum = { workspace = true }
 strum_macros = { workspace = true }
+bytes = { workspace = true }
 futures = { workspace = true }
-
 # start local packages
 pser = { workspace = true }
-pderive = { workspace = true }
 parth_core = { workspace = true }
+# parth_common = { workspace = true }
+# psy_core = { workspace = true }
+# parth_crypto = { workspace = true }
+# psy_common = { workspace = true }
+psy_node_core = { workspace = true }
+# psy_data = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
 parth_crypto = { workspace = true }
-parth_common = { workspace = true }
-psy_core = { workspace = true }
-psy_common = { workspace = true }
-psy_data = { workspace = true }

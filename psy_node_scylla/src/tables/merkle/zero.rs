@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use anyhow::Context;
-use async_trait::async_trait;
 use futures::future::join_all;
 use parth_core::{
     crypto::hash::traits::MerkleZeroHasher,
@@ -16,12 +15,11 @@ use scylla::{
     statement::{batch::Batch, prepared::PreparedStatement, Statement},
 };
 
-use crate::{
-    tables::traits::ScyllaStandardPreparedTableStatements,
-    utils::{convert_checkpoint_id_to_i64, u64_to_i64_exact, u8_to_i8_exact},
-};
+use crate::
+    utils::{convert_checkpoint_id_to_i64, u64_to_i64_exact, u8_to_i8_exact}
+;
 #[derive(Clone)]
-pub struct ScyllaMerkleNodesZeroPreparedStatements<const TREE_HEIGHT: u8> {
+pub struct ScyllaMerkleNodesZeroPreparedStatements {
     pub insert_1_statement: Statement,
     pub insert_1_prepared: Arc<PreparedStatement>,
     pub select_1_statement: Statement,
@@ -29,14 +27,16 @@ pub struct ScyllaMerkleNodesZeroPreparedStatements<const TREE_HEIGHT: u8> {
     pub keyspace: String,
     pub table_name: String,
     pub table_key: QDatabaseTableRoutingKey,
+    pub tree_height: u8,
 }
 
-impl<const TREE_HEIGHT: u8> ScyllaMerkleNodesZeroPreparedStatements<TREE_HEIGHT> {
+impl ScyllaMerkleNodesZeroPreparedStatements {
     pub async fn new_from_session(
         session: Arc<Session>,
         keyspace: &str,
         table_name: &str,
         table_key: QDatabaseTableRoutingKey,
+        tree_height: u8,
     ) -> anyhow::Result<Self> {
         let insert_1_statement = Statement::new(&format!(
             "INSERT INTO {}.{} (level, node_index, checkpoint_id, value) VALUES (?, ?, ?, ?)",
@@ -57,6 +57,7 @@ impl<const TREE_HEIGHT: u8> ScyllaMerkleNodesZeroPreparedStatements<TREE_HEIGHT>
             keyspace: keyspace.to_string(),
             table_name: table_name.to_string(),
             table_key,
+            tree_height,
         })
     }
     pub async fn create_table(session: Arc<Session>, keyspace: &str, table_name: &str, _table_key: QDatabaseTableRoutingKey) -> anyhow::Result<()> {
@@ -69,7 +70,7 @@ impl<const TREE_HEIGHT: u8> ScyllaMerkleNodesZeroPreparedStatements<TREE_HEIGHT>
                     checkpoint_id BIGINT,
                     value BLOB,
                     PRIMARY KEY ((level), node_index, checkpoint_id)
-                ) WITH CLUSTERING ORDER BY (level ASC, node_index ASC, checkpoint_id DESC)",
+                ) WITH CLUSTERING ORDER BY (node_index ASC, checkpoint_id DESC)",
                     keyspace, table_name
                 ),
                 &[],
@@ -83,13 +84,14 @@ impl<const TREE_HEIGHT: u8> ScyllaMerkleNodesZeroPreparedStatements<TREE_HEIGHT>
         keyspace: &str,
         table_name: &str,
         table_key: QDatabaseTableRoutingKey,
+        tree_height: u8,
     ) -> anyhow::Result<Self> {
         Self::create_table(session.clone(), keyspace, table_name, table_key).await?;
-        Self::new_from_session(session, keyspace, table_name, table_key).await
+        Self::new_from_session(session, keyspace, table_name, table_key, tree_height).await
     }
 }
 
-impl<const TREE_HEIGHT: u8> ScyllaMerkleNodesZeroPreparedStatements<TREE_HEIGHT> {
+impl ScyllaMerkleNodesZeroPreparedStatements {
     pub async fn select_zero_id_merkle_node_max_checkpoint_internal<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>(
         &self,
         session: &Session,
@@ -109,7 +111,7 @@ impl<const TREE_HEIGHT: u8> ScyllaMerkleNodesZeroPreparedStatements<TREE_HEIGHT>
         let rows = res.into_rows_result()?;
         match rows.maybe_first_row::<(Vec<u8>,)>()? {
             Some(row) => Ok(Hash::from_bytes(&row.0)?),
-            None => Ok(Hasher::get_zero_hash((TREE_HEIGHT - key.level) as usize)), // Return zero hash if not found
+            None => Ok(Hasher::get_zero_hash((self.tree_height - key.level) as usize)), // Return zero hash if not found
         }
     }
 
@@ -136,7 +138,7 @@ impl<const TREE_HEIGHT: u8> ScyllaMerkleNodesZeroPreparedStatements<TREE_HEIGHT>
                             Hash::from_bytes(&row.0)
                         } else {
                             // Assume reverse_level = level for simplicity; adjust if tree height known
-                            Ok(Hasher::get_zero_hash((TREE_HEIGHT - key.level) as usize))
+                            Ok(Hasher::get_zero_hash((self.tree_height - key.level) as usize))
                         }
                     }
                 })
@@ -210,17 +212,3 @@ impl<const TREE_HEIGHT: u8> ScyllaMerkleNodesZeroPreparedStatements<TREE_HEIGHT>
         Ok(())
     }
 }
-
-#[async_trait]
-impl<const TREE_HEIGHT: u8> ScyllaStandardPreparedTableStatements for ScyllaMerkleNodesZeroPreparedStatements<TREE_HEIGHT> {
-    async fn create_table_standard(
-        session: Arc<Session>,
-        keyspace: &str,
-        table_name: &str,
-        table_key: QDatabaseTableRoutingKey,
-    ) -> anyhow::Result<Self> {
-        Self::new_create_from_session(session, keyspace, table_name, table_key).await
-    }
-}
-
-impl<const TREE_HEIGHT: u8> ScyllaMerkleNodesZeroPreparedStatements<TREE_HEIGHT> {}

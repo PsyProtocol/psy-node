@@ -2,7 +2,7 @@ use std::{fmt::Display, str::FromStr};
 
 use anyhow::ensure;
 use ts_rs::TS;
-use crate::{crypto::hash::traits::{FromU64x4, HashTo4Felts, RandomHash, ToU64x4, ZeroableHash}, data::{hash::hash256::Hash256, serializable::{QPDSerializable, QPDSerializableFixed}}, felt::{QFelt64, ToQFelts}, protocol::core_types::QHashBase};
+use crate::{crypto::hash::traits::{FromU64x4, HashTo4Felts, RandomHash, ToU64x4, ZeroableHash}, data::{hash::hash256::Hash256, serializable::{QPDSerializable, QPDSerializableFixed}}, felt::{QFelt64, ToQFelts}, protocol::core_types::QHashBase, utils::QPGenRandom};
 use plonky2::{
     field::{
         goldilocks_field::GoldilocksField,
@@ -242,6 +242,12 @@ impl<F: RichField> QHashOut<F> {
 
 impl<F: RichField> RandomHash for QHashOut<F> {
     fn rand_hash() -> Self {
+        Self::rand()
+    }
+}
+
+impl<F: RichField> QPGenRandom for QHashOut<F> {
+    fn qp_rand_gen() -> Self where Self: Sized {
         Self::rand()
     }
 }

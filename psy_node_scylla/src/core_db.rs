@@ -16,14 +16,14 @@ use parth_core::{
     protocol::core_types::QHashBase,
 };
 use psy_node_core::store::traits::core_db::{
-    CoreDatabaseBidirectionalMappingReader, CoreDatabaseBidirectionalMappingWriter, CoreDatabaseBidirectionalU64U128MappingReader, CoreDatabaseBidirectionalU64U128MappingWriter, CoreDatabaseDoubleIdCheckpointedReader, CoreDatabaseDoubleIdCheckpointedWriter, CoreDatabaseDoubleIdMerkleReader, CoreDatabaseDoubleIdMerkleWriter, CoreDatabaseKivReader, CoreDatabaseKivWriter, CoreDatabaseSingleIdCheckpointedReader, CoreDatabaseSingleIdCheckpointedWriter, CoreDatabaseSingleIdMerkleReader, CoreDatabaseSingleIdMerkleWriter, CoreDatabaseTagTreeReader, CoreDatabaseTagTreeWriter, CoreDatabaseU64Reader, CoreDatabaseU64Writer
+    CoreDatabaseBidirectionalMappingReader, CoreDatabaseBidirectionalMappingWriter, CoreDatabaseBidirectionalU64U128MappingReader, CoreDatabaseBidirectionalU64U128MappingWriter, CoreDatabaseDoubleIdCheckpointedReader, CoreDatabaseDoubleIdCheckpointedWriter, CoreDatabaseDoubleIdMerkleReader, CoreDatabaseDoubleIdMerkleWriter, CoreDatabaseKivReader, CoreDatabaseKivWriter, CoreDatabaseSingleIdCheckpointedReader, CoreDatabaseSingleIdCheckpointedWriter, CoreDatabaseSingleIdMerkleReader, CoreDatabaseSingleIdMerkleWriter, CoreDatabaseTagTreeReader, CoreDatabaseTagTreeWriter, CoreDatabaseU64Reader, CoreDatabaseU64Writer, CoreDatabaseZeroIdMerkleReader, CoreDatabaseZeroIdMerkleWriter
 };
 use serde::{de::DeserializeOwned, Serialize};
 
 use crate::{
     core::ScyllaCoreStore,
     tables::{
-        blob::ScyllaBiDirectionalBlobToBlobTablePreparedStatements, merkle::{ScyllaDoubleMerkleNodesPreparedStatements, ScyllaMerkleNodesPreparedStatements}, object::{
+        blob::ScyllaBiDirectionalBlobToBlobTablePreparedStatements, merkle::{ScyllaDoubleMerkleNodesPreparedStatements, ScyllaMerkleNodesPreparedStatements, ScyllaMerkleNodesZeroPreparedStatements}, object::{
             ScyllaGenericKeyIdValueTablePreparedStatements, ScyllaGenericObjectDoubleIdTablePreparedStatements,
             ScyllaGenericObjectSingleIdTablePreparedStatements,
         }, tag_tree::ScyllaTagTreeNodesPreparedStatements, u64_tbl::{ScyllaBidirectionalU64U128MappingPreparedStatements, ScyllaU64ToU64TablePreparedStatements}
@@ -343,6 +343,55 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
 
 #[async_trait]
 impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+    CoreDatabaseZeroIdMerkleReader<Hash, Hasher, ScyllaMerkleNodesZeroPreparedStatements> for ScyllaCoreStore<Hash, Hasher>
+{
+
+    async fn db_select_zero_id_merkle_node_max_checkpoint(
+        &self,
+        table: &ScyllaMerkleNodesZeroPreparedStatements,
+        max_checkpoint_id: u64,
+        key: &SimpleMerkleNodeKey,
+    ) -> anyhow::Result<Hash>{
+        table.select_zero_id_merkle_node_max_checkpoint_internal::<Hash, Hasher>(&self.session, max_checkpoint_id, *key).await
+    }
+    async fn db_select_many_zero_id_merkle_nodes_max_checkpoint(
+        &self,
+        table: &ScyllaMerkleNodesZeroPreparedStatements,
+        max_checkpoint_id: u64,
+        keys: &[SimpleMerkleNodeKey],
+    ) -> anyhow::Result<Vec<Hash>>{
+        table.select_many_zero_id_merkle_nodes_max_checkpoint_internal::<Hash, Hasher>(&self.session, max_checkpoint_id, keys).await
+    }
+}
+
+
+#[async_trait]
+impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+    CoreDatabaseZeroIdMerkleWriter<Hash, Hasher, ScyllaMerkleNodesZeroPreparedStatements> for ScyllaCoreStore<Hash, Hasher>
+{
+
+    async fn db_insert_zero_id_merkle_node(
+        &self,
+        table: &ScyllaMerkleNodesZeroPreparedStatements,
+        checkpoint_id: u64,
+        key: &SimpleMerkleNodeKey,
+        value: &Hash,
+    ) -> anyhow::Result<()>{
+        table.insert_zero_id_merkle_node_internal(&self.session, checkpoint_id, *key, &value.to_bytes()?).await
+    }
+    async fn db_set_zero_id_merkle_nodes_batch(
+        &self,
+        table: &ScyllaMerkleNodesZeroPreparedStatements,
+        checkpoint_id: u64,
+        nodes: &[SimpleMerkleNode<Hash>],
+    ) -> anyhow::Result<()>{
+        table.set_zero_id_merkle_nodes_batch_internal::<Hash>(&self.session, checkpoint_id, nodes).await
+    }
+}
+
+
+#[async_trait]
+impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
     CoreDatabaseSingleIdMerkleReader<Hash, Hasher, ScyllaMerkleNodesPreparedStatements> for ScyllaCoreStore<Hash, Hasher>
 {
     async fn db_select_single_id_merkle_node_max_checkpoint(
@@ -389,7 +438,7 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
         table: &ScyllaMerkleNodesPreparedStatements,
         checkpoint_id: u64,
         tree_id: u64,
-        nodes: Vec<SimpleMerkleNode<Hash>>,
+        nodes: &[SimpleMerkleNode<Hash>],
     ) -> anyhow::Result<()> {
         table.set_single_id_merkle_nodes_batch_internal::<Hash>(&self.session, checkpoint_id, tree_id, nodes)
             .await
@@ -448,7 +497,7 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
         checkpoint_id: u64,
         tree_id: u64,
         tree_sub_id: u64,
-        nodes: Vec<SimpleMerkleNode<Hash>>,
+        nodes: &[SimpleMerkleNode<Hash>],
     ) -> anyhow::Result<()> {
         table.set_double_id_merkle_nodes_batch_internal(&self.session, checkpoint_id, tree_id, tree_sub_id, nodes)
             .await
