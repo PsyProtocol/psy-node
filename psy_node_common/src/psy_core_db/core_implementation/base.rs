@@ -9,8 +9,7 @@ use parth_core::{
     QCoreProcCheckpointUniqueId,
 };
 use psy_data::v1::qdata::{
-    checkpoint::{self, PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState},
-    user::PQEDUserLeaf,
+    checkpoint::{self, PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState}, checkpoint_sync::PQEDCheckpointSyncInfo, user::PQEDUserLeaf
 };
 use psy_node_core::store::traits::core_db::{
     CoreDatabaseBidirectionalMappingReader, CoreDatabaseBidirectionalMappingWriter, CoreDatabaseBidirectionalU64U128MappingReader,
@@ -247,6 +246,19 @@ impl<
             Some(id) => Ok(id),
             None => Ok(0),
         }
+    }
+
+    async fn apply_global_block_update_internal(&self, global_block_update: &PQEDCheckpointSyncInfo<N::F, N::QHash>) -> anyhow::Result<()>{
+        let latest_pending_id = self.get_latest_pending_id().await?;
+        let latest_checkpoint_id = self.get_latest_checkpoint_id().await?;
+        let new_checkpoint_id = global_block_update.core.l2_block_state.checkpoint_id;
+        if new_checkpoint_id != (latest_checkpoint_id + 1) {
+            anyhow::bail!("Global block update checkpoints MUST be applied in order, got a global checkpoint with id {} while our latest checkpoint is {}", new_checkpoint_id, latest_checkpoint_id);
+        }
+
+
+
+        Ok(())
     }
 }
 #[async_trait]

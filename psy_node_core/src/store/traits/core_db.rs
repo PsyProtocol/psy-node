@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use parth_core::{
-    crypto::hash::{merkle_proof::MerkleProofCore, tag_tree::TagTreeMerkleProof, traits::MerkleZeroHasher},
+    crypto::hash::{tag_tree::TagTreeMerkleProof, traits::MerkleZeroHasher},
     data::{
         db::{
             data_types::{BiDirectionalMappingRow, CoreDatabaseValueDeserialize, QDatabasePrimitiveKey},
