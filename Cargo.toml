@@ -120,6 +120,7 @@ rsmq = { git = "https://github.com/jimzk/rsmq-async-rs", package = "rsmq_async",
 dashmap = "6.1.0"
 parking_lot = "0.12.5"
 # Workspace Packages
+
 pser = { path = "./pser" }
 pderive = { path = "./pderive" }
 

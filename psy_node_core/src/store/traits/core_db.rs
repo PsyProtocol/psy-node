@@ -1,6 +1,7 @@
 use async_trait::async_trait;
+use auto_impl::auto_impl;
 use parth_core::{
-    crypto::hash::{tag_tree::TagTreeMerkleProof, traits::MerkleZeroHasher},
+    crypto::hash::{merkle_node_cache::QMerkleNodeCacheReader, tag_tree::TagTreeMerkleProof, traits::MerkleZeroHasher},
     data::{
         db::{
             data_types::{BiDirectionalMappingRow, CoreDatabaseValueDeserialize, QDatabasePrimitiveKey},
@@ -17,8 +18,8 @@ use parth_core::{
     protocol::core_types::QHashBase,
 };
 use serde::{de::DeserializeOwned, Serialize};
-
 #[async_trait]
+#[auto_impl(&, Arc)]
 pub trait CoreDatabaseBidirectionalMappingReader<TableIdentifier: Clone + Send + Sync> {
     async fn db_select_one_by_k1<K1: QDatabasePrimitiveKey, K2: QDatabasePrimitiveKey>(
         &self,
@@ -59,6 +60,7 @@ pub trait CoreDatabaseBidirectionalMappingReader<TableIdentifier: Clone + Send +
 }
 
 #[async_trait]
+#[auto_impl(&, Arc)]
 pub trait CoreDatabaseBidirectionalMappingWriter<TableIdentifier: Clone + Send + Sync> {
     async fn db_insert_pair_ref<K1: QDatabasePrimitiveKey, K2: QDatabasePrimitiveKey>(
         &self,
@@ -91,6 +93,7 @@ impl<
 }
 
 #[async_trait]
+#[auto_impl(&, Arc)]
 pub trait CoreDatabaseBidirectionalU64U128MappingReader<TableIdentifier: Clone + Send + Sync> {
     async fn db_select_one_u128_value_by_u64(&self, table: &TableIdentifier, key: u64) -> anyhow::Result<Option<u128>>;
     async fn db_select_one_u64_key_by_u128(&self, table: &TableIdentifier, value: u128) -> anyhow::Result<Option<u64>>;
@@ -99,6 +102,7 @@ pub trait CoreDatabaseBidirectionalU64U128MappingReader<TableIdentifier: Clone +
 }
 
 #[async_trait]
+#[auto_impl(&, Arc)]
 pub trait CoreDatabaseBidirectionalU64U128MappingWriter<TableIdentifier: Clone + Send + Sync> {
     async fn db_insert_u64_u128_mapping_pair(&self, table: &TableIdentifier, k1: u64, k2: u128) -> anyhow::Result<()>;
     async fn db_insert_u64_u128_mapping_pairs(&self, table: &TableIdentifier, keys: &[BiDirectionalMappingRow<u64, u128>]) -> anyhow::Result<()>;
@@ -114,13 +118,16 @@ impl<
     > CoreDatabaseBidirectionalU64U128MappingStore<TableIdentifier> for T
 {
 }
+
 #[async_trait]
+#[auto_impl(&, Arc)]
 pub trait CoreDatabaseU64Reader<TableIdentifier: Clone + Send + Sync> {
     async fn db_select_u64_value(&self, table: &TableIdentifier, obj_id: u64) -> anyhow::Result<Option<u64>>;
     async fn db_select_u64_values(&self, table: &TableIdentifier, obj_ids: &[u64]) -> anyhow::Result<Vec<Option<u64>>>;
 }
 
 #[async_trait]
+#[auto_impl(&, Arc)]
 pub trait CoreDatabaseU64Writer<TableIdentifier: Clone + Send + Sync> {
     async fn db_inc_counter(&self, table: &TableIdentifier, obj_id: u64, amount: i64) -> anyhow::Result<u64>;
     async fn db_set_u64_value(&self, table: &TableIdentifier, obj_id: u64, value: u64) -> anyhow::Result<()>;
@@ -132,6 +139,7 @@ pub trait CoreDatabaseU64Store<TableIdentifier: Clone + Send + Sync>:
 }
 
 #[async_trait]
+#[auto_impl(&, Arc)]
 pub trait CoreDatabaseSingleIdCheckpointedReader<TableIdentifier: Clone + Send + Sync> {
     async fn db_select_one_single_checkpointed_object_value<V: CoreDatabaseValueDeserialize>(
         &self,
@@ -176,6 +184,7 @@ pub trait CoreDatabaseSingleIdCheckpointedReader<TableIdentifier: Clone + Send +
 }
 
 #[async_trait]
+#[auto_impl(&, Arc)]
 pub trait CoreDatabaseSingleIdCheckpointedWriter<TableIdentifier: Clone + Send + Sync> {
     async fn db_insert_one_single_checkpointed_object<V: Serialize + Send + Sync>(
         &self,
@@ -225,6 +234,7 @@ impl<
 }
 
 #[async_trait]
+#[auto_impl(&, Arc)]
 pub trait CoreDatabaseDoubleIdCheckpointedReader<TableIdentifier: Clone + Send + Sync> {
     async fn db_select_one_double_checkpointed_object_value<V: CoreDatabaseValueDeserialize>(
         &self,
@@ -272,6 +282,7 @@ pub trait CoreDatabaseDoubleIdCheckpointedReader<TableIdentifier: Clone + Send +
 }
 
 #[async_trait]
+#[auto_impl(&, Arc)]
 pub trait CoreDatabaseDoubleIdCheckpointedWriter<TableIdentifier: Clone + Send + Sync> {
     async fn db_insert_one_double_checkpointed_object<V: Serialize + Send + Sync>(
         &self,
@@ -320,7 +331,9 @@ impl<
     > CoreDatabaseDoubleIdCheckpointedStore<TableIdentifier> for T
 {
 }
+
 #[async_trait]
+#[auto_impl(&, Arc)]
 pub trait CoreDatabaseKivReader<TableIdentifier: Clone + Send + Sync> {
     async fn db_select_one_kiv_value<V: CoreDatabaseValueDeserialize>(&self, table: &TableIdentifier, obj_id: u64) -> anyhow::Result<Option<V>>;
     async fn db_select_one_kiv_value_and_ids<V: CoreDatabaseValueDeserialize>(
@@ -350,6 +363,7 @@ pub trait CoreDatabaseKivReader<TableIdentifier: Clone + Send + Sync> {
 }
 
 #[async_trait]
+#[auto_impl(&, Arc)]
 pub trait CoreDatabaseKivWriter<TableIdentifier: Clone + Send + Sync> {
     async fn db_insert_one_kiv<V: Serialize + Send + Sync>(&self, table: &TableIdentifier, obj_id: u64, value: &V) -> anyhow::Result<()>;
     async fn db_insert_many_kivs<V: Serialize + Send + Sync>(
@@ -373,6 +387,7 @@ impl<TableIdentifier: Clone + Send + Sync, T: CoreDatabaseKivReader<TableIdentif
 }
 
 #[async_trait]
+#[auto_impl(&, Arc)]
 pub trait CoreDatabaseSingleIdMerkleReader<
     Hash: QHashBase + Send + Sync,
     Hasher: MerkleZeroHasher<Hash> + Send + Sync,
@@ -396,10 +411,12 @@ pub trait CoreDatabaseSingleIdMerkleReader<
         keys: &[SimpleMerkleNodeKey],
     ) -> anyhow::Result<Vec<Hash>>;
 
+
     
 }
 
 #[async_trait]
+#[auto_impl(&, Arc)]
 pub trait CoreDatabaseSingleIdMerkleWriter<
     Hash: QHashBase + Send + Sync,
     Hasher: MerkleZeroHasher<Hash> + Send + Sync,
@@ -440,6 +457,7 @@ impl<
 }
 
 #[async_trait]
+#[auto_impl(&, Arc)]
 pub trait CoreDatabaseTagTreeReader<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync, TableIdentifier: Clone + Send + Sync>
 {
     async fn db_get_tag_tree_node_value(
@@ -470,6 +488,7 @@ pub trait CoreDatabaseTagTreeReader<Hash: QHashBase + Send + Sync, Hasher: Merkl
 }
 
 #[async_trait]
+#[auto_impl(&, Arc)]
 pub trait CoreDatabaseTagTreeWriter<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync, TableIdentifier: Clone + Send + Sync>
 {
     async fn set_tag_tree_tag_value(
@@ -496,6 +515,7 @@ impl<
 }
 
 #[async_trait]
+#[auto_impl(&, Arc)]
 pub trait CoreDatabaseZeroIdMerkleReader<
     Hash: QHashBase + Send + Sync,
     Hasher: MerkleZeroHasher<Hash> + Send + Sync,
@@ -517,6 +537,7 @@ pub trait CoreDatabaseZeroIdMerkleReader<
 }
 
 #[async_trait]
+#[auto_impl(&, Arc)]
 pub trait CoreDatabaseZeroIdMerkleWriter<
     Hash: QHashBase + Send + Sync,
     Hasher: MerkleZeroHasher<Hash> + Send + Sync,
@@ -554,6 +575,7 @@ impl<
 }
 
 #[async_trait]
+#[auto_impl(&, Arc)]
 pub trait CoreDatabaseDoubleIdMerkleReader<
     Hash: QHashBase + Send + Sync,
     Hasher: MerkleZeroHasher<Hash> + Send + Sync,
@@ -581,6 +603,7 @@ pub trait CoreDatabaseDoubleIdMerkleReader<
 }
 
 #[async_trait]
+#[auto_impl(&, Arc)]
 pub trait CoreDatabaseDoubleIdMerkleWriter<
     Hash: QHashBase + Send + Sync,
     Hasher: MerkleZeroHasher<Hash> + Send + Sync,

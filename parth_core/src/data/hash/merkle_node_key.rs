@@ -203,6 +203,29 @@ impl SimpleMerkleNodeKey {
     pub fn get_above_path(&self) -> Vec<SimpleMerkleNodeKey> {
         self.get_above_path_to_height(0)
     }
+    pub fn get_path_above_self_to_level(&self, sub_root_level: u8, include_sub_root: bool) -> Vec<SimpleMerkleNodeKey> {
+        if sub_root_level >= self.level {
+            return vec![];
+        }
+
+        let real_sub_root = if include_sub_root {
+            sub_root_level
+        } else {
+            sub_root_level - 1
+        };
+        if real_sub_root >= self.level {
+            vec![]
+        }else{
+            let mut path_node_keys = Vec::with_capacity((self.level - sub_root_level) as usize);
+            let mut my_node = self.clone();
+            while my_node.level > sub_root_level {
+                my_node = my_node.parent();
+                path_node_keys.push(my_node.clone());
+            }
+
+            path_node_keys
+        }
+    }
 }
 
 impl QPDSerializable for SimpleMerkleNodeKey {

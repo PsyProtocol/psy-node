@@ -154,6 +154,41 @@ pub fn verify_delta_merkle_proof_core<Hash: PartialEq + Copy, Hasher: MerkleHash
     current == proof.new_root
 }
 
+pub fn verify_delta_merkle_proof_core_debug<Hash: PartialEq + Copy + Serialize, Hasher: MerkleHasher<Hash>>(
+    proof: &DeltaMerkleProofCore<Hash>,
+) -> bool {
+    println!("got delta merkle proof: {}", serde_json::to_string_pretty(proof).unwrap());
+    
+    if proof.siblings.len() > 64 {
+        return false;
+    }
+    println!("starting old path");
+    let mut current = proof.old_value;
+    for (i, sibling) in proof.siblings.iter().enumerate() {
+        println!("at level {}, at index {}, current = {}, sibling = {}", i, proof.index >> i, serde_json::to_string(&current).unwrap(), serde_json::to_string(&sibling).unwrap());
+        if proof.index & (1 << i) == 0 {
+            current = Hasher::two_to_one(&current, sibling);
+        } else {
+            current = Hasher::two_to_one(sibling, &current);
+        }
+        println!("hash(swap = {}, left = {}, right = {}) = {}", proof.index & (1 << i) == 0, serde_json::to_string(&current).unwrap(), serde_json::to_string(&sibling).unwrap(), serde_json::to_string(&current).unwrap());
+    }
+    if current != proof.old_root {
+        println!("failed old path verification: computed root {} but expected {}", serde_json::to_string(&current).unwrap(), serde_json::to_string(&proof.old_root).unwrap());
+        return false;
+    }
+    println!("verified old path");
+    current = proof.new_value;
+    for (i, sibling) in proof.siblings.iter().enumerate() {
+        if proof.index & (1 << i) == 0 {
+            current = Hasher::two_to_one(&current, sibling);
+        } else {
+            current = Hasher::two_to_one(sibling, &current);
+        }
+    }
+    current == proof.new_root
+}
+
 
 pub fn calc_merkle_root_from_leaves<Hash: PartialEq + Copy, Hasher: MerkleHasher<Hash>>(
     leaves: &[Hash],

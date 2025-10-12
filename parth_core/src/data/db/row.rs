@@ -43,25 +43,25 @@ impl From<QDoubleIdKey> for (u64, u64) {
     }
 }
 
-pub trait QDatabaseSingleIdTableRowNoCheckpointIdLike<V: Serialize + DeserializeOwned> {
+pub trait QDatabaseSingleIdTableRowNoCheckpointIdLike<V> {
     fn get_row_obj_id(&self) -> u64;
     fn get_row_value_ref(&self) -> &V;
 }
-pub trait QDatabaseSingleIdTableRowLike<V: Serialize + DeserializeOwned>: QDatabaseSingleIdTableRowNoCheckpointIdLike<V> {
+pub trait QDatabaseSingleIdTableRowLike<V>: QDatabaseSingleIdTableRowNoCheckpointIdLike<V> {
     fn get_row_checkpoint_id(&self) -> u64;
 }
 
 
-pub trait QDatabaseDoubleIdTableRowNoCheckpointIdLike<V: Serialize + DeserializeOwned> {
+pub trait QDatabaseDoubleIdTableRowNoCheckpointIdLike<V> {
     fn get_row_obj_id(&self) -> u64;
     fn get_row_secondary_id(&self) -> u64;
     fn get_row_value_ref(&self) -> &V;
 }
-pub trait QDatabaseDoubleIdTableRowLike<V: Serialize + DeserializeOwned>: QDatabaseDoubleIdTableRowNoCheckpointIdLike<V> {
+pub trait QDatabaseDoubleIdTableRowLike<V>: QDatabaseDoubleIdTableRowNoCheckpointIdLike<V> {
     fn get_row_checkpoint_id(&self) -> u64;
 }
 
-pub trait QDatabaseKeyIdValueTableRowLike<V: Serialize + DeserializeOwned> {
+pub trait QDatabaseKeyIdValueTableRowLike<V> {
     fn get_row_obj_id(&self) -> u64;
     fn get_row_value_ref(&self) -> &V;
 }
@@ -83,6 +83,15 @@ pub struct QDatabaseSingleIdTableRow<V> {
     pub checkpoint_id: u64,
     pub value: V,
 }
+impl<V> QDatabaseSingleIdTableRow<V> {
+    pub fn new(obj_id: u64, checkpoint_id: u64, value: V) -> Self {
+        Self {
+            obj_id,
+            checkpoint_id,
+            value,
+        }
+    }
+}
 impl<V: Serialize + DeserializeOwned> QDatabaseSingleIdTableRowNoCheckpointIdLike<V> for QDatabaseSingleIdTableRow<V> {
     fn get_row_obj_id(&self) -> u64 {
         self.obj_id
@@ -100,9 +109,17 @@ impl<V: Serialize + DeserializeOwned> QDatabaseSingleIdTableRowLike<V> for QData
 
 
 #[pderive::serialize_clone]
-pub struct QDatabaseSingleIdTableRowNoCheckpointId<V: Serialize> {
+pub struct QDatabaseSingleIdTableRowNoCheckpointId<V> {
     pub obj_id: u64,
     pub value: V,
+}
+impl <V> QDatabaseSingleIdTableRowNoCheckpointId<V> {
+    pub fn new(obj_id: u64, value: V) -> Self {
+        Self {
+            obj_id,
+            value,
+        }
+    }
 }
 impl <V: Serialize + DeserializeOwned> QDatabaseSingleIdTableRowNoCheckpointIdLike<V> for QDatabaseSingleIdTableRowNoCheckpointId<V> {
     fn get_row_obj_id(&self) -> u64 {
@@ -119,6 +136,16 @@ pub struct QDatabaseDoubleIdTableRow<V> {
     pub secondary_id: u64,
     pub checkpoint_id: u64,
     pub value: V,
+}
+impl<V> QDatabaseDoubleIdTableRow<V> {
+    pub fn new(obj_id: u64, secondary_id: u64, checkpoint_id: u64, value: V) -> Self {
+        Self {
+            obj_id,
+            secondary_id,
+            checkpoint_id,
+            value,
+        }
+    }
 }
 impl <V: Serialize + DeserializeOwned> QDatabaseDoubleIdTableRowNoCheckpointIdLike<V> for QDatabaseDoubleIdTableRow<V> {
     fn get_row_obj_id(&self) -> u64 {
@@ -138,10 +165,19 @@ impl <V: Serialize + DeserializeOwned> QDatabaseDoubleIdTableRowLike<V> for QDat
 }
 
 #[pderive::serialize_clone]
-pub struct QDatabaseDoubleIdTableRowNoCheckpointId<V: Serialize> {
+pub struct QDatabaseDoubleIdTableRowNoCheckpointId<V> {
     pub obj_id: u64,
     pub secondary_id: u64,
     pub value: V,
+}
+impl<V> QDatabaseDoubleIdTableRowNoCheckpointId<V> {
+    pub fn new(obj_id: u64, secondary_id: u64, value: V) -> Self {
+        Self {
+            obj_id,
+            secondary_id,
+            value,
+        }
+    }
 }
 impl <V: Serialize + DeserializeOwned> QDatabaseDoubleIdTableRowNoCheckpointIdLike<V> for QDatabaseDoubleIdTableRowNoCheckpointId<V> {
     fn get_row_obj_id(&self) -> u64 {
@@ -160,8 +196,15 @@ pub struct QDatabaseKeyIdValueTableRow<V> {
     pub obj_id: u64,
     pub value: V,
 }
-
-impl <V: Serialize + DeserializeOwned> QDatabaseKeyIdValueTableRowLike<V> for QDatabaseKeyIdValueTableRow<V> {
+impl<V> QDatabaseKeyIdValueTableRow<V> {
+    pub fn new(obj_id: u64, value: V) -> Self {
+        Self {
+            obj_id,
+            value,
+        }
+    }
+}
+impl <V> QDatabaseKeyIdValueTableRowLike<V> for QDatabaseKeyIdValueTableRow<V> {
     fn get_row_obj_id(&self) -> u64 {
         self.obj_id
     }
@@ -169,7 +212,7 @@ impl <V: Serialize + DeserializeOwned> QDatabaseKeyIdValueTableRowLike<V> for QD
         &self.value
     }
 }
-impl<V: Serialize> QDatabaseSingleIdTableRowCreatable<V> for QDatabaseSingleIdTableRow<V> {
+impl<V> QDatabaseSingleIdTableRowCreatable<V> for QDatabaseSingleIdTableRow<V> {
     fn create_from_single_row(obj_id: u64, checkpoint_id: u64, value: V) -> Self {
         Self {
             obj_id,
@@ -178,7 +221,7 @@ impl<V: Serialize> QDatabaseSingleIdTableRowCreatable<V> for QDatabaseSingleIdTa
         }
     }
 }
-impl<V: Serialize> QDatabaseDoubleIdTableRowCreatable<V> for QDatabaseDoubleIdTableRow<V> {
+impl<V> QDatabaseDoubleIdTableRowCreatable<V> for QDatabaseDoubleIdTableRow<V> {
     fn create_from_double_row(obj_id: u64, secondary_id: u64, checkpoint_id: u64, value: V) -> Self {
         Self {
             obj_id,
@@ -188,7 +231,7 @@ impl<V: Serialize> QDatabaseDoubleIdTableRowCreatable<V> for QDatabaseDoubleIdTa
         }
     }
 }
-impl<V: Serialize> QDatabaseKeyIdValueTableRowCreatable<V> for QDatabaseKeyIdValueTableRow<V> {
+impl<V> QDatabaseKeyIdValueTableRowCreatable<V> for QDatabaseKeyIdValueTableRow<V> {
     fn create_from_key_id_value_row(obj_id: u64, value: V) -> Self {
         Self {
             obj_id,

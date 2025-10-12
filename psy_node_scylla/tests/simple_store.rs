@@ -1,14 +1,14 @@
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc, u64::MAX};
 
 use parth_core::{
     crypto::hash::{
-        merkle_proof::MerkleProofCore,
+        merkle_proof::{DeltaMerkleProofCore, MerkleProofCore},
         traits::{MerkleZeroHasher, QHasher},
     },
     data::{
         db::{
             data_types::{BiDirectionalMappingRow, CoreDatabaseValueDeserialize, QDatabasePrimitiveKey},
-            row::{QDatabaseKeyIdValueTableRowLike, QDatabaseSingleIdTableRowNoCheckpointIdLike},
+            row::{QDatabaseDoubleIdTableRow, QDatabaseDoubleIdTableRowNoCheckpointIdLike, QDatabaseKeyIdValueTableRowLike, QDatabaseSingleIdTableRow, QDatabaseSingleIdTableRowNoCheckpointId, QDatabaseSingleIdTableRowNoCheckpointIdLike, QDoubleIdKey},
             table::QDatabaseTableRoutingKey,
         },
         hash::{
@@ -38,8 +38,8 @@ use parth_node_scylla::{
     },
 };
 use pser::{QBytesDeserialize, QBytesSerialize};
-use psy_node_core::store::traits::core_db::{CoreDatabaseStore, CoreDatabaseTagTreeStore};
-use scylla::client::session::Session;
+use psy_node_core::store::traits::{core_db::{CoreDatabaseSingleIdMerkleReader, CoreDatabaseStore, CoreDatabaseTagTreeStore}, helpers::{db_helper_double_id_merkle_node_simple_set_leaves, db_helper_record_update_single_id_merkle_node_to_level_dmp, db_helper_select_double_id_merkle_proof_max_checkpoint, db_helper_select_single_id_merkle_proof_max_checkpoint, db_helper_select_zero_id_merkle_proof_max_checkpoint, db_helper_single_id_merkle_node_simple_set_leaves, db_helper_zero_id_merkle_node_simple_set_leaves}};
+use scylla::{client::session::Session, policies::retry};
 
 pub trait CreateRandomTestDataItem: Sized {
     fn create_random_test_data_item() -> Self;
@@ -53,6 +53,10 @@ const DEFINITELY_MISSING_CHECKPOINT_ID: u64 = MAX_REAL_CHECKPOINT_ID + 1;
 const MAX_REAL_U128_ID_VALUE: u128 = 0x0000_00FF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFFu128;
 const DEFINITELY_MISSING_U128_ID_VALUE: u128 = MAX_REAL_U128_ID_VALUE + 1;
 
+
+const MAX_GET_UNIQUE_ID_RETRY_ATTEMPTS: usize = 64;
+
+
 fn rand_real_u64_id() -> u64 {
     rand::random::<u64>() % MAX_REAL_U64_ID_VALUE
 }
@@ -62,6 +66,83 @@ fn rand_real_checkpoint_id() -> u64 {
 }
 fn rand_real_u128_id() -> u128 {
     rand::random::<u128>() % MAX_REAL_U128_ID_VALUE
+}
+
+fn rand_child(key: &SimpleMerkleNodeKey) -> SimpleMerkleNodeKey {
+    let bit: bool = rand::random::<bool>();
+    if bit {
+        key.left_child()
+    } else {
+        key.right_child()
+    }
+}
+fn rand_children_to_height(sub_root_key: &SimpleMerkleNodeKey, height: u8) -> Vec<SimpleMerkleNodeKey> {
+    assert!(height > sub_root_key.level, "Height must be greater than sub root level");
+
+    let mut keys = Vec::with_capacity(height as usize - sub_root_key.level as usize);
+    let mut key = sub_root_key.clone();
+    while key.level < height {
+        key = rand_child(&key);
+        keys.push(key.clone());
+    }
+    keys
+}
+fn fisher_yates_shuffle_array<T: Copy>(arr: &mut [T]) {
+    let len = arr.len();
+    for i in (1..len).rev() {
+        let j = rand::random::<usize>() % (i + 1);
+        arr.swap(i, j);
+    }
+}
+fn unique_u64s_in_range(count: usize, min_inclusive: u64, max_exclusive: u64) -> Vec<u64> {
+    assert!(max_exclusive > min_inclusive, "Max must be greater than min");
+    let span = max_exclusive - min_inclusive;
+    assert!(span >= (count as u64), "Range must be at least as large as count");
+    let span_usize = span as usize;
+    
+    if count == span_usize {
+        let mut arr: Vec<u64> = (min_inclusive..max_exclusive).collect();
+        fisher_yates_shuffle_array(&mut arr);
+        return arr;
+    }
+
+    // The heuristic for choosing the algorithm.
+    // A threshold of 25% or even 10% is often a good trade-off.
+    // We only create the full vector if the number of items we need is a significant
+    // fraction of the total range.
+    if count > span_usize / 4 { // Using 25% as a reasonable threshold
+        let mut all: Vec<u64> = (min_inclusive..max_exclusive).collect();
+        fisher_yates_shuffle_array(&mut all);
+        return all.into_iter().take(count).collect();
+    }
+
+    // This is the correct path for your case: low count, large span.
+    let mut set = std::collections::HashSet::with_capacity(count);
+    while set.len() < count {
+        let value = min_inclusive + (rand::random::<u64>() % span);
+        set.insert(value);
+    }
+    set.into_iter().collect()
+}
+fn rand_leaves_for_subtree<Hash: PartialEq + Copy + QPGenRandom>(sub_root_key: &SimpleMerkleNodeKey, tree_height: u8, count: usize) -> Vec<SimpleMerkleNode<Hash>> {
+    assert!(tree_height > sub_root_key.level, "Tree height must be greater than sub root level");
+    let num_leaves_in_span_u64: u64 = 1u64 << (tree_height - sub_root_key.level - 1);
+    let num_leaves_in_span: usize = num_leaves_in_span_u64 as usize;
+    let start_leaf_offset = sub_root_key.index * num_leaves_in_span_u64;
+    assert!(count <= num_leaves_in_span, "Count must be less than or equal to number of leaves in span");
+
+    let leaf_indexes = unique_u64s_in_range(count, start_leaf_offset, start_leaf_offset + num_leaves_in_span_u64);
+
+    leaf_indexes.into_iter()
+        .map(|index| {
+            SimpleMerkleNode {
+                value: Hash::qp_rand_gen(),
+                key: SimpleMerkleNodeKey::new(tree_height, index),
+            }
+        })
+        .collect::<Vec<SimpleMerkleNode<Hash>>>()
+
+
 }
 
 pub trait THStandardTableIdentifier: Clone + Send + Sync {}
@@ -110,7 +191,11 @@ pub struct QSimpleStore<
             SingleIdMerkleTableIdentifier,
             DoubleIdMerkleTableIdentifier,
             ZeroIdMerkleTableIdentifier,
-        > + CoreDatabaseTagTreeStore<Hash, Hasher, RewardTreeTableIdentifier>
+        > + CoreDatabaseTagTreeStore<Hash, Hasher, RewardTreeTableIdentifier> + CoreDatabaseSingleIdMerkleReader<
+            Hash,
+            Hasher,
+            SingleIdMerkleTableIdentifier,
+            >
         + Send
         + Sync,
 > {
@@ -1458,7 +1543,7 @@ impl<
         S,
     >
 {
-    pub async fn th_test_u128_u64_pairs_table(&self, table: &BiDirectionalU64U128MappingTableIdentifier) -> anyhow::Result<()> {
+    pub async fn th_test_u128_u64_pairs_table_1(&self, table: &BiDirectionalU64U128MappingTableIdentifier) -> anyhow::Result<()> {
         let test_rows = vec![
             BiDirectionalMappingRow { k1: 1u64, k2: 100u128 },
             BiDirectionalMappingRow { k1: 2u64, k2: 200u128 },
@@ -1505,7 +1590,7 @@ impl<
         Ok(())
     }
 
-    pub async fn th_test_u64_table(&self, table: &U64TableIdentifier) -> anyhow::Result<()> {
+    pub async fn th_test_u64_table_1(&self, table: &U64TableIdentifier) -> anyhow::Result<()> {
         let test_ids = vec![1u64, 2u64, 3u64, 4u64, 5u64];
         for id in test_ids.iter() {
             let selected = self.th_util_select_u64_value(table, *id).await?;
@@ -1590,8 +1675,1670 @@ impl<
         self.th_util_set_many_u64_values(table, &batch_rows).await?;
         Ok(())
     }
-}
 
+    pub async fn get_many_non_existent_ids_in_single_object_single_try<V: CoreDatabaseValueDeserialize>(&self, table: &SingleIdTableIdentifier, max_count: usize) -> anyhow::Result<Vec<u64>> {
+        let ids = (0..(max_count+16)).map(|_| rand_real_u64_id()).collect::<Vec<u64>>();
+        let results = self.store.db_select_many_single_checkpointed_object_values::<V>(table, &ids, MAX_REAL_CHECKPOINT_ID).await?;
+        let non_existent_ids = ids.iter().zip(results.iter()).filter_map(|(&id, res)| if res.is_none() { Some(id) } else { None }).collect::<Vec<u64>>();
+        
+        if non_existent_ids.len() > max_count {
+            Ok(non_existent_ids.into_iter().take(max_count).collect())
+        } else {
+            Ok(non_existent_ids)
+        }
+       }
+        pub async fn get_many_non_existent_ids_in_single_object<V: CoreDatabaseValueDeserialize>(&self, table: &SingleIdTableIdentifier, count: usize) -> anyhow::Result<Vec<u64>> {
+        let mut non_existent_ids = self.get_many_non_existent_ids_in_single_object_single_try::<V>(table, count).await?;
+        let mut retry_counter = 0;
+        while non_existent_ids.len() < count {
+            if retry_counter > MAX_GET_UNIQUE_ID_RETRY_ATTEMPTS {
+                return Err(anyhow::anyhow!("Too many retries to find non-existent ids"));
+            }
+            let needed = count - non_existent_ids.len();
+            let mut new_ids = self.get_many_non_existent_ids_in_single_object_single_try::<V>(table, needed).await?;
+            non_existent_ids.append(&mut new_ids);
+            retry_counter += 1;
+        }
+        Ok(non_existent_ids.into_iter().take(count).collect())
+    }
+
+    pub async fn get_non_existent_id_in_single_object<V: CoreDatabaseValueDeserialize>(&self, table: &SingleIdTableIdentifier) -> anyhow::Result<u64> {
+        let mut id = rand_real_u64_id();
+        let mut result = self.store.db_select_one_single_checkpointed_object_value::<V>(table, id, MAX_REAL_CHECKPOINT_ID).await?;
+        let mut retry_counter = 0;
+        while result.is_some() {
+            if retry_counter > MAX_GET_UNIQUE_ID_RETRY_ATTEMPTS {
+                return Err(anyhow::anyhow!("Too many retries to find a non-existent id"));
+            }
+            id = rand_real_u64_id();
+            result = self.store.db_select_one_single_checkpointed_object_value::<V>(table, id, MAX_REAL_CHECKPOINT_ID).await?;
+            retry_counter += 1;
+        }
+        Ok(id)
+    }
+    pub async fn get_non_existent_id_in_double_object<V: CoreDatabaseValueDeserialize>(&self, table: &DoubleIdTableIdentifier) -> anyhow::Result<(u64, u64)> {
+        let mut id = rand_real_u64_id();
+        let mut secondary_id = rand_real_u64_id();
+        let mut result = self.store.db_select_one_double_checkpointed_object_value::<V>(table, id, secondary_id, MAX_REAL_CHECKPOINT_ID).await?;
+        let mut retry_counter = 0;
+
+        while result.is_some() {
+            if retry_counter > MAX_GET_UNIQUE_ID_RETRY_ATTEMPTS {
+                return Err(anyhow::anyhow!("Too many retries to find a non-existent id"));
+            }
+            id = rand_real_u64_id();
+            secondary_id = rand_real_u64_id();
+            result = self.store.db_select_one_double_checkpointed_object_value::<V>(table, id, secondary_id, MAX_REAL_CHECKPOINT_ID).await?;
+            retry_counter += 1;
+        }
+        Ok((id, secondary_id))
+    }
+
+
+    pub async fn th_test_single_checkpointed_object_1_full_history_1<V: CoreDatabaseValueDeserialize + QPGenRandom>(&self, table: &SingleIdTableIdentifier) -> anyhow::Result<()>{
+
+        let obj_id = self.get_non_existent_id_in_single_object::<V>(table).await?;
+        // ensure the id is really non-existent
+        let check = self.store.db_select_one_single_checkpointed_object_value::<V>(table, obj_id, MAX_REAL_CHECKPOINT_ID).await?;
+        assert!(check.is_none(), "Expected non-existent id to not be found");
+
+        
+
+
+
+
+        let value_c_1337 = V::qp_rand_gen();
+        let start_checkpoint_id = 1337u64;
+        self.store.db_insert_one_single_checkpointed_object(table, obj_id, start_checkpoint_id, &value_c_1337).await?;
+
+        let result = self.th_util_select_one_single_checkpointed_object_value::<V>(table, obj_id, start_checkpoint_id).await?;
+        assert!(result.is_some(), "Value not found after insert at checkpoint 1337");
+        let result_unwrapped = result.unwrap();
+        assert!(result_unwrapped == value_c_1337, "Inserted value does not match");
+        let result_with_ids = self.store.db_select_one_single_checkpointed_object_value_and_ids::<V>(table, obj_id, start_checkpoint_id).await?;
+        assert!(result_with_ids.is_some(), "Value with ids not found after insert at checkpoint 1337");
+        let result_with_ids_unwrapped = result_with_ids.unwrap();
+        assert!(result_with_ids_unwrapped.obj_id == obj_id, "Object id does not match");
+        assert!(result_with_ids_unwrapped.checkpoint_id == start_checkpoint_id, "Checkpoint id does not match");
+        assert!(result_with_ids_unwrapped.value == value_c_1337, "Value does not match");
+        // checking at a higher checkpoint should return the same value
+        let result_higher = self.th_util_select_one_single_checkpointed_object_value::<V>(table, obj_id, start_checkpoint_id + 100).await?;
+        assert!(result_higher.is_some(), "Value not found at higher checkpoint after insert at checkpoint 1337");
+        let result_higher_unwrapped = result_higher.unwrap();
+        assert!(result_higher_unwrapped == value_c_1337, "Value does not match at higher checkpoint");
+        let result_higher_with_ids = self.store.db_select_one_single_checkpointed_object_value_and_ids::<V>(table, obj_id, start_checkpoint_id + 100).await?;
+        assert!(result_higher_with_ids.is_some(), "Value with ids not found at higher checkpoint after insert at checkpoint 1337");
+        let result_higher_with_ids_unwrapped = result_higher_with_ids.unwrap();
+        assert!(result_higher_with_ids_unwrapped.obj_id == obj_id, "Object id does not match at higher checkpoint");
+        assert_eq!(result_higher_with_ids_unwrapped.checkpoint_id, start_checkpoint_id, "Checkpoint id does not match at higher checkpoint");
+        assert!(result_higher_with_ids_unwrapped.value == value_c_1337, "Value does not match at higher checkpoint");
+
+        // checking at a lower checkpoint should return None
+        let result_lower = self.store.db_select_one_single_checkpointed_object_value::<V>(table, obj_id, start_checkpoint_id - 1).await?;
+        assert!(result_lower.is_none(), "Value should not be found at lower checkpoint after insert at checkpoint 1337");
+        let result_lower_with_ids = self.store.db_select_one_single_checkpointed_object_value_and_ids::<V>(table, obj_id, start_checkpoint_id - 1).await?;
+        assert!(result_lower_with_ids.is_none(), "Value with ids should not be found at lower checkpoint after insert at checkpoint 1337");
+        // inserting at a lower checkpoint should work
+        let value_c_1000 = V::qp_rand_gen();
+        let lower_checkpoint_id = 1000u64;
+        self.store.db_insert_one_single_checkpointed_object(table, obj_id, lower_checkpoint_id, &value_c_1000).await?;
+        let result_after_lower_insert = self.th_util_select_one_single_checkpointed_object_value::<V>(table, obj_id, lower_checkpoint_id).await?;
+        assert!(result_after_lower_insert.is_some(), "Value not found after insert at lower checkpoint 1000");
+        let result_after_lower_insert_unwrapped = result_after_lower_insert.unwrap();
+        assert!(result_after_lower_insert_unwrapped == value_c_1000, "Inserted value at lower checkpoint does not match");
+        let result_after_lower_insert_with_ids = self.store.db_select_one_single_checkpointed_object_value_and_ids::<V>(table, obj_id, lower_checkpoint_id).await?;
+        assert!(result_after_lower_insert_with_ids.is_some(), "Value with ids not found after insert at lower checkpoint 1000");
+        let result_after_lower_insert_with_ids_unwrapped = result_after_lower_insert_with_ids.unwrap();
+        assert!(result_after_lower_insert_with_ids_unwrapped.obj_id == obj_id, "Object id does not match after lower checkpoint insert");
+        assert!(result_after_lower_insert_with_ids_unwrapped.checkpoint_id == lower_checkpoint_id, "Checkpoint id does not match after lower checkpoint insert");
+        assert!(result_after_lower_insert_with_ids_unwrapped.value == value_c_1000, "Value does not match after lower checkpoint insert");
+        // checking at a higher checkpoint should still return the original value
+        let result_higher_after_lower_insert = self.th_util_select_one_single_checkpointed_object_value::<V>(table, obj_id, start_checkpoint_id).await?;
+        assert!(result_higher_after_lower_insert.is_some(), "Value not found at original checkpoint after lower checkpoint insert");
+        let result_higher_after_lower_insert_unwrapped = result_higher_after_lower_insert.unwrap();
+        assert!(result_higher_after_lower_insert_unwrapped == value_c_1337, "Value at original checkpoint does not match after lower checkpoint insert");
+        let result_higher_after_lower_insert_with_ids = self.store.db_select_one_single_checkpointed_object_value_and_ids::<V>(table, obj_id, start_checkpoint_id).await?;
+        assert!(result_higher_after_lower_insert_with_ids.is_some(), "Value with ids not found at original checkpoint after lower checkpoint insert");
+        let result_higher_after_lower_insert_with_ids_unwrapped = result_higher_after_lower_insert_with_ids.unwrap();
+        assert!(result_higher_after_lower_insert_with_ids_unwrapped.obj_id == obj_id, "Object id does not match at original checkpoint after lower checkpoint insert");
+        assert!(result_higher_after_lower_insert_with_ids_unwrapped.checkpoint_id == start_checkpoint_id, "Checkpoint id does not match at original checkpoint after lower checkpoint insert");
+        assert!(result_higher_after_lower_insert_with_ids_unwrapped.value == value_c_1337, "Value does not match at original checkpoint after lower checkpoint insert");
+
+        // 0-100 full history test
+        let first_100_checkpoints = (0..100u64).map(|i| V::qp_rand_gen()).collect::<Vec<_>>();
+        
+        let should_be_empty_pre_insert_0 = self.store.db_select_one_single_checkpointed_object_value::<V>(table, obj_id, 0).await?;
+        assert!(should_be_empty_pre_insert_0.is_none(), "Value should not be found at checkpoint 0 before insert");
+        let should_be_empty_pre_insert_50 = self.store.db_select_one_single_checkpointed_object_value::<V>(table, obj_id, 50).await?;
+        assert!(should_be_empty_pre_insert_50.is_none(), "Value should not be found at checkpoint 50 before insert");
+        let should_be_empty_pre_insert_99 = self.store.db_select_one_single_checkpointed_object_value::<V>(table, obj_id, 99).await?;
+        assert!(should_be_empty_pre_insert_99.is_none(), "Value should not be found at checkpoint 99 before insert");
+
+
+
+        
+
+
+        for (checkpoint_id, value) in first_100_checkpoints.iter().enumerate() {
+            self.store.db_insert_one_single_checkpointed_object(table, obj_id, checkpoint_id as u64, &value).await?;
+            let should_be_value_post_insert = self.store.db_select_one_single_checkpointed_object_value::<V>(table, obj_id, checkpoint_id as u64).await?;
+            assert!(should_be_value_post_insert.is_some(), "Value should be found at checkpoint {} after insert", checkpoint_id);
+            let should_be_value_post_insert_unwrapped = should_be_value_post_insert.unwrap();
+            assert!(should_be_value_post_insert_unwrapped == *value, "Value at checkpoint {} does not match inserted value", checkpoint_id);
+            // check all future checkpoints to 100 are also the same as this value
+            for future_checkpoint in (checkpoint_id + 1)..100 {
+                let should_be_value_future = self.store.db_select_one_single_checkpointed_object_value::<V>(table, obj_id, future_checkpoint as u64).await?;
+                assert!(should_be_value_future.is_some(), "Value should be found at future checkpoint {} after insert at checkpoint {}", future_checkpoint, checkpoint_id);
+                let should_be_value_future_unwrapped = should_be_value_future.unwrap();
+                assert!(should_be_value_future_unwrapped == *value, "Value at future checkpoint {} does not match value at checkpoint {} after insert", future_checkpoint, checkpoint_id);
+            }
+        }
+
+
+        // 5000-5600 full history test with batches
+        let checkpoints_5000_5600 = (5000..5600u64).map(|i| QDatabaseSingleIdTableRow::new(obj_id, i, V::qp_rand_gen())).collect::<Vec<_>>();
+
+        // insert the first 300 in a batch
+        self.store.db_insert_many_single_checkpointed_object_rows_t(table, &checkpoints_5000_5600[0..300]).await?;
+        
+            
+        for chk in checkpoints_5000_5600[0..300].iter() {
+            let actual_value = self.th_util_select_one_single_checkpointed_object_value::<V>(table, obj_id, chk.checkpoint_id).await?;
+            assert!(actual_value.is_some(), "Value should be found at checkpoint {} after batch insert", chk.checkpoint_id);
+            let actual_value_unwrapped = actual_value.unwrap();
+            assert!(actual_value_unwrapped == chk.value, "Value at checkpoint {} does not match inserted value after batch insert", chk.checkpoint_id);
+        }
+        let actual_value_max_real = self.store.db_select_one_single_checkpointed_object_value::<V>(table, obj_id, MAX_REAL_CHECKPOINT_ID).await?;
+        assert!(actual_value_max_real.is_some(), "Value should be found at MAX_REAL_CHECKPOINT_ID after batch insert");
+        let actual_value_max_real_unwrapped = actual_value_max_real.unwrap();
+        assert!(actual_value_max_real_unwrapped == checkpoints_5000_5600[299].value, "Value at MAX_REAL_CHECKPOINT_ID does not match last inserted value after batch insert");
+
+        let actual_value_u64_max = self.store.db_select_one_single_checkpointed_object_value::<V>(table, obj_id, u64::MAX).await?;
+        assert!(actual_value_u64_max.is_some(), "Value should be found at u64::MAX after batch insert");
+        let actual_value_u64_max_unwrapped = actual_value_u64_max.unwrap();
+        assert!(actual_value_u64_max_unwrapped == checkpoints_5000_5600[299].value, "Value at u64::MAX does not match last inserted value after batch insert");
+        assert!(actual_value_u64_max_unwrapped == actual_value_max_real_unwrapped, "Value at u64::MAX does not match value at MAX_REAL_CHECKPOINT_ID after batch insert");
+
+        // insert the next 300 in a batch
+        self.store.db_insert_many_single_checkpointed_object_rows_t(table, &checkpoints_5000_5600[300..600]).await?;
+        for chk in checkpoints_5000_5600[0..600].iter() {
+            let actual_value = self.th_util_select_one_single_checkpointed_object_value::<V>(table, obj_id, chk.checkpoint_id).await?;
+            assert!(actual_value.is_some(), "Value should be found at checkpoint {} after second batch insert", chk.checkpoint_id);
+            let actual_value_unwrapped = actual_value.unwrap();
+            assert!(actual_value_unwrapped == chk.value, "Value at checkpoint {} does not match inserted value after second batch insert", chk.checkpoint_id);
+        }
+        let actual_value_max_real = self.store.db_select_one_single_checkpointed_object_value::<V>(table, obj_id, MAX_REAL_CHECKPOINT_ID).await?;
+        assert!(actual_value_max_real.is_some(), "Value should be found at MAX_REAL_CHECKPOINT_ID after second batch insert");
+        let actual_value_max_real_unwrapped = actual_value_max_real.unwrap();
+        assert!(actual_value_max_real_unwrapped == checkpoints_5000_5600[599].value, "Value at MAX_REAL_CHECKPOINT_ID does not match last inserted value after second batch insert");
+        let actual_value_u64_max = self.store.db_select_one_single_checkpointed_object_value::<V>(table, obj_id, u64::MAX).await?;
+        assert!(actual_value_u64_max.is_some(), "Value should be found at u64::MAX after second batch insert"); 
+        
+        let actual_value_u64_max_unwrapped = actual_value_u64_max.unwrap();
+        assert!(actual_value_u64_max_unwrapped == checkpoints_5000_5600[599].value, "Value at u64::MAX does not match last inserted value after second batch insert");
+        assert!(actual_value_u64_max_unwrapped == actual_value_max_real_unwrapped, "Value at u64::MAX does not match value at MAX_REAL_CHECKPOINT_ID after second batch insert");
+        Ok(())
+
+
+    }
+
+    pub async fn th_test_single_checkpointed_object_1_full_history_2<V: CoreDatabaseValueDeserialize + QPGenRandom>(&self, table: &SingleIdTableIdentifier) -> anyhow::Result<()>{
+        // ensure the id is really non-existent
+        let obj_id = self.get_non_existent_id_in_single_object::<V>(table).await?;
+        let check = self.store.db_select_one_single_checkpointed_object_value::<V>(table, obj_id, MAX_REAL_CHECKPOINT_ID).await?;
+        assert!(check.is_none(), "Expected non-existent id to not be found");
+
+        
+
+
+
+
+        let value_c_1337 = V::qp_rand_gen();
+        let start_checkpoint_id = 1337u64;
+        self.store.db_insert_one_single_checkpointed_object(table, obj_id, start_checkpoint_id, &value_c_1337).await?;
+
+        let result = self.th_util_select_one_single_checkpointed_object_value::<V>(table, obj_id, start_checkpoint_id).await?;
+        assert!(result.is_some(), "Value not found after insert at checkpoint 1337");
+        let result_unwrapped = result.unwrap();
+        assert!(result_unwrapped == value_c_1337, "Inserted value does not match");
+        let result_with_ids = self.store.db_select_one_single_checkpointed_object_value_and_ids::<V>(table, obj_id, start_checkpoint_id).await?;
+        assert!(result_with_ids.is_some(), "Value with ids not found after insert at checkpoint 1337");
+        let result_with_ids_unwrapped = result_with_ids.unwrap();
+        assert!(result_with_ids_unwrapped.obj_id == obj_id, "Object id does not match");
+        assert!(result_with_ids_unwrapped.checkpoint_id == start_checkpoint_id, "Checkpoint id does not match");
+        assert!(result_with_ids_unwrapped.value == value_c_1337, "Value does not match");
+        // checking at a higher checkpoint should return the same value
+        let result_higher = self.th_util_select_one_single_checkpointed_object_value::<V>(table, obj_id, start_checkpoint_id + 100).await?;
+        assert!(result_higher.is_some(), "Value not found at higher checkpoint after insert at checkpoint 1337");
+        let result_higher_unwrapped = result_higher.unwrap();
+        assert!(result_higher_unwrapped == value_c_1337, "Value does not match at higher checkpoint");
+        let result_higher_with_ids = self.store.db_select_one_single_checkpointed_object_value_and_ids::<V>(table, obj_id, start_checkpoint_id + 100).await?;
+        assert!(result_higher_with_ids.is_some(), "Value with ids not found at higher checkpoint after insert at checkpoint 1337");
+        let result_higher_with_ids_unwrapped = result_higher_with_ids.unwrap();
+        assert!(result_higher_with_ids_unwrapped.obj_id == obj_id, "Object id does not match at higher checkpoint");
+        assert!(result_higher_with_ids_unwrapped.checkpoint_id == start_checkpoint_id, "Checkpoint id does not match at higher checkpoint");
+        assert!(result_higher_with_ids_unwrapped.value == value_c_1337, "Value does not match at higher checkpoint");
+
+        // checking at a lower checkpoint should return None
+        let result_lower = self.store.db_select_one_single_checkpointed_object_value::<V>(table, obj_id, start_checkpoint_id - 1).await?;
+        assert!(result_lower.is_none(), "Value should not be found at lower checkpoint after insert at checkpoint 1337");
+        let result_lower_with_ids = self.store.db_select_one_single_checkpointed_object_value_and_ids::<V>(table, obj_id, start_checkpoint_id - 1).await?;
+        assert!(result_lower_with_ids.is_none(), "Value with ids should not be found at lower checkpoint after insert at checkpoint 1337");
+        // inserting at a lower checkpoint should work
+        let value_c_1000 = V::qp_rand_gen();
+        let lower_checkpoint_id = 1000u64;
+        self.store.db_insert_one_single_checkpointed_object(table, obj_id, lower_checkpoint_id, &value_c_1000).await?;
+        let result_after_lower_insert = self.th_util_select_one_single_checkpointed_object_value::<V>(table, obj_id, lower_checkpoint_id).await?;
+        assert!(result_after_lower_insert.is_some(), "Value not found after insert at lower checkpoint 1000");
+        let result_after_lower_insert_unwrapped = result_after_lower_insert.unwrap();
+        assert!(result_after_lower_insert_unwrapped == value_c_1000, "Inserted value at lower checkpoint does not match");
+        let result_after_lower_insert_with_ids = self.store.db_select_one_single_checkpointed_object_value_and_ids::<V>(table, obj_id, lower_checkpoint_id).await?;
+        assert!(result_after_lower_insert_with_ids.is_some(), "Value with ids not found after insert at lower checkpoint 1000");
+        let result_after_lower_insert_with_ids_unwrapped = result_after_lower_insert_with_ids.unwrap();
+        assert!(result_after_lower_insert_with_ids_unwrapped.obj_id == obj_id, "Object id does not match after lower checkpoint insert");
+        assert!(result_after_lower_insert_with_ids_unwrapped.checkpoint_id == lower_checkpoint_id, "Checkpoint id does not match after lower checkpoint insert");
+        assert!(result_after_lower_insert_with_ids_unwrapped.value == value_c_1000, "Value does not match after lower checkpoint insert");
+        // checking at a higher checkpoint should still return the original value
+        let result_higher_after_lower_insert = self.th_util_select_one_single_checkpointed_object_value::<V>(table, obj_id, start_checkpoint_id).await?;
+        assert!(result_higher_after_lower_insert.is_some(), "Value not found at original checkpoint after lower checkpoint insert");
+        let result_higher_after_lower_insert_unwrapped = result_higher_after_lower_insert.unwrap();
+        assert!(result_higher_after_lower_insert_unwrapped == value_c_1337, "Value at original checkpoint does not match after lower checkpoint insert");
+        let result_higher_after_lower_insert_with_ids = self.store.db_select_one_single_checkpointed_object_value_and_ids::<V>(table, obj_id, start_checkpoint_id).await?;
+        assert!(result_higher_after_lower_insert_with_ids.is_some(), "Value with ids not found at original checkpoint after lower checkpoint insert");
+        let result_higher_after_lower_insert_with_ids_unwrapped = result_higher_after_lower_insert_with_ids.unwrap();
+        assert!(result_higher_after_lower_insert_with_ids_unwrapped.obj_id == obj_id, "Object id does not match at original checkpoint after lower checkpoint insert");
+        assert!(result_higher_after_lower_insert_with_ids_unwrapped.checkpoint_id == start_checkpoint_id, "Checkpoint id does not match at original checkpoint after lower checkpoint insert");
+        assert!(result_higher_after_lower_insert_with_ids_unwrapped.value == value_c_1337, "Value does not match at original checkpoint after lower checkpoint insert");
+
+        // 0-10 full history test
+        let first_10_checkpoints = (0..10u64).map(|i| V::qp_rand_gen()).collect::<Vec<_>>();
+        
+        let should_be_empty_pre_insert_0 = self.store.db_select_one_single_checkpointed_object_value::<V>(table, obj_id, 0).await?;
+        assert!(should_be_empty_pre_insert_0.is_none(), "Value should not be found at checkpoint 0 before insert");
+        let should_be_empty_pre_insert_5 = self.store.db_select_one_single_checkpointed_object_value::<V>(table, obj_id, 5).await?;
+        assert!(should_be_empty_pre_insert_5.is_none(), "Value should not be found at checkpoint 5 before insert");
+        let should_be_empty_pre_insert_9 = self.store.db_select_one_single_checkpointed_object_value::<V>(table, obj_id, 9).await?;
+        assert!(should_be_empty_pre_insert_9.is_none(), "Value should not be found at checkpoint 9 before insert");
+
+
+
+        
+
+
+        for (checkpoint_id, value) in first_10_checkpoints.iter().enumerate() {
+            self.store.db_insert_one_single_checkpointed_object(table, obj_id, checkpoint_id as u64, &value).await?;
+            let should_be_value_post_insert = self.store.db_select_one_single_checkpointed_object_value::<V>(table, obj_id, checkpoint_id as u64).await?;
+            assert!(should_be_value_post_insert.is_some(), "Value should be found at checkpoint {} after insert", checkpoint_id);
+            let should_be_value_post_insert_unwrapped = should_be_value_post_insert.unwrap();
+            assert!(should_be_value_post_insert_unwrapped == *value, "Value at checkpoint {} does not match inserted value", checkpoint_id);
+            // check all future checkpoints to 10 are also the same as this value
+            for future_checkpoint in (checkpoint_id + 1)..10 {
+                let should_be_value_future = self.store.db_select_one_single_checkpointed_object_value::<V>(table, obj_id, future_checkpoint as u64).await?;
+                assert!(should_be_value_future.is_some(), "Value should be found at future checkpoint {} after insert at checkpoint {}", future_checkpoint, checkpoint_id);
+                let should_be_value_future_unwrapped = should_be_value_future.unwrap();
+                assert!(should_be_value_future_unwrapped == *value, "Value at future checkpoint {} does not match value at checkpoint {} after insert", future_checkpoint, checkpoint_id);
+            }
+        }
+
+        // test if we can get many non-existent ids and this id
+
+        let non_existent_obj_id_a = self.get_non_existent_id_in_single_object::<V>(table).await?;
+        
+        let non_existent_obj_id_b = self.get_non_existent_id_in_single_object::<V>(table).await?;
+
+
+        let result = self.store.db_select_many_single_checkpointed_object_values::<V>(table, &[non_existent_obj_id_a, obj_id, non_existent_obj_id_b], MAX_REAL_CHECKPOINT_ID).await?;
+        assert!(result.len() == 3, "Expected 3 results from multi-select");
+        assert!(result[0].is_none(), "Expected first result to be None for non-existent id");
+        assert!(result[1].is_some(), "Expected second result to be Some for existing id");
+        assert!(result[1].as_ref().unwrap() == &value_c_1337, "Expected second result to match inserted value");
+        assert!(result[2].is_none(), "Expected third result to be None for non-existent id");
+
+
+        // check an intermediate checkpoint id 1336
+        let result = self.store.db_select_many_single_checkpointed_object_values::<V>(table, &[non_existent_obj_id_a, obj_id, non_existent_obj_id_b], 500).await?;
+        assert!(result.len() == 3, "Expected 3 results from multi-select at intermediate checkpoint");
+        assert!(result[0].is_none(), "Expected first result to be None for non-existent id at intermediate checkpoint");
+        assert!(result[1].is_some(), "Expected second result to be Some for existing id at intermediate checkpoint");
+        assert!(result[1].as_ref().unwrap() == &first_10_checkpoints[9], "Expected second result to match inserted value at intermediate first_10_checkpoints[9]");
+        assert!(result[2].is_none(), "Expected third result to be None for non-existent id at intermediate checkpoint");
+        
+
+        // test multiple occurrences of the same id
+        let result = self.store.db_select_many_single_checkpointed_object_values::<V>(table, &[obj_id, non_existent_obj_id_a, obj_id, non_existent_obj_id_b, obj_id], MAX_REAL_CHECKPOINT_ID).await?;
+        assert!(result.len() == 5, "Expected 5 results from multi-select with duplicates");
+        assert!(result[0].is_some(), "Expected first result to be Some for existing id");
+        assert!(result[0].as_ref().unwrap() == &value_c_1337, "Expected first result to match inserted value");
+        assert!(result[1].is_none(), "Expected second result to be None for non-existent id");
+        assert!(result[2].is_some(), "Expected third result to be Some for existing id");
+        assert!(result[2].as_ref().unwrap() == &value_c_1337, "Expected third result to match inserted value");
+        assert!(result[3].is_none(), "Expected fourth result to be None for non-existent id");
+        assert!(result[4].is_some(), "Expected fifth result to be Some for existing id");
+        assert!(result[4].as_ref().unwrap() == &value_c_1337, "Expected fifth result to match inserted value");
+
+
+        Ok(())
+
+
+    }
+
+        pub async fn th_test_single_checkpointed_object_1_full_history_3<V: CoreDatabaseValueDeserialize + QPGenRandom>(&self, table: &SingleIdTableIdentifier) -> anyhow::Result<()>{
+
+            let first_checkpoint = 0u64;
+            let second_checkpoint = 1u64;
+            let last_checkpoint = 100_000u64;
+            
+            let obj_ids_batch_a = self.get_many_non_existent_ids_in_single_object::<V>(table, 2000).await?;
+            assert!(obj_ids_batch_a.len() == 2000, "Expected to get 2000 non-existent ids");
+            
+            let obj_rows_batch_a = obj_ids_batch_a.iter().map(|&id| QDatabaseSingleIdTableRowNoCheckpointId::new(id, V::qp_rand_gen())).collect::<Vec<_>>();
+            
+            self.store.db_insert_many_single_checkpointed_objects_at_checkpoint(table,  first_checkpoint, &obj_rows_batch_a).await?;
+            let objs_a_at_first = self.store.db_select_many_single_checkpointed_object_values::<V>(table, &obj_ids_batch_a, first_checkpoint).await?;
+            let objs_a_at_first = objs_a_at_first.into_iter().collect::<Option<Vec<V>>>().ok_or_else(|| anyhow::anyhow!("Expected all objects to be found at first checkpoint"))?;
+            assert!(objs_a_at_first.len() == obj_ids_batch_a.len(), "Expected all objects to be found at first checkpoint");
+            for (i, obj) in objs_a_at_first.iter().enumerate() {
+                assert!(obj == &obj_rows_batch_a[i].value, "Expected object value to match at first checkpoint");
+            }
+            let objs_a_at_second = self.store.db_select_many_single_checkpointed_object_values::<V>(table, &obj_ids_batch_a, second_checkpoint).await?;
+            let objs_a_at_second = objs_a_at_second.into_iter().collect::<Option<Vec<V>>>().ok_or_else(|| anyhow::anyhow!("Expected all objects to be found at second checkpoint"))?;
+            assert!(objs_a_at_second.len() == obj_ids_batch_a.len(), "Expected all objects to be found at second checkpoint");
+            for (i, obj) in objs_a_at_second.iter().enumerate() {
+                assert!(obj == &obj_rows_batch_a[i].value, "Expected object value to match at second checkpoint");
+            }
+            let objs_a_at_high = self.store.db_select_many_single_checkpointed_object_keys_and_values::<V, QDatabaseSingleIdTableRow<V>>(table, &obj_ids_batch_a, 12312732).await?;
+            for (i, row) in objs_a_at_high.iter().enumerate() {
+                assert!(row.obj_id == obj_ids_batch_a[i], "Expected object id to match at high checkpoint");
+                assert!(row.checkpoint_id == first_checkpoint, "Expected checkpoint id to match at high checkpoint");
+                assert!(row.value == obj_rows_batch_a[i].value, "Expected object value to match at high checkpoint");
+            }
+
+            // insert at second_checkpoint
+            let obj_rows_batch_a_second = obj_ids_batch_a.iter().map(|&id| QDatabaseSingleIdTableRowNoCheckpointId::new(id, V::qp_rand_gen())).collect::<Vec<_>>();
+            let obj_ids_batch_b = self.get_many_non_existent_ids_in_single_object::<V>(table, 1500).await?;
+            assert!(obj_ids_batch_b.len() == 1500, "Expected to get 1500 non-existent ids for batch b");
+            let obj_rows_batch_b = obj_ids_batch_b.iter().map(|&id| QDatabaseSingleIdTableRowNoCheckpointId::new(id, V::qp_rand_gen())).collect::<Vec<_>>();
+            let combined_rows: Vec<QDatabaseSingleIdTableRowNoCheckpointId<V>> = obj_rows_batch_a_second.iter().chain(obj_rows_batch_b.iter()).cloned().collect();
+            self.store.db_insert_many_single_checkpointed_objects_at_checkpoint(table,  second_checkpoint, &combined_rows).await?;
+
+            let combined_ids = obj_ids_batch_a.iter().chain(obj_ids_batch_b.iter()).cloned().collect::<Vec<_>>();
+            let objs_combined_at_second = self.store.db_select_many_single_checkpointed_object_values::<V>(table, &combined_ids, second_checkpoint).await?;
+            let objs_combined_at_second = objs_combined_at_second.into_iter().collect::<Option<Vec<V>>>().ok_or_else(|| anyhow::anyhow!("Expected all objects to be found at second checkpoint after second insert"))?;
+            assert!(objs_combined_at_second.len() == combined_ids.len(), "Expected all objects to be found at second checkpoint after second insert");
+            for i in 0..obj_ids_batch_a.len() {
+                assert!(objs_combined_at_second[i] == obj_rows_batch_a_second[i].value, "Expected object value to match for batch a at second checkpoint after second insert");
+            }
+            for i in 0..obj_ids_batch_b.len() {
+                assert!(objs_combined_at_second[i + obj_ids_batch_a.len()] == obj_rows_batch_b[i].value, "Expected object value to match for batch b at second checkpoint after second insert");
+            }
+            // check that batch a ids at first checkpoint are still the same, and batch b ids are not found
+            let objs_a_at_first_post_second = self.store.db_select_many_single_checkpointed_object_values::<V>(table, &combined_ids, first_checkpoint).await?;
+            let objs_a_at_first_post_second = objs_a_at_first_post_second[0..obj_ids_batch_a.len()].to_vec().into_iter().collect::<Option<Vec<V>>>().ok_or_else(|| anyhow::anyhow!("Expected all batch a objects to be found at first checkpoint after second insert"))?;
+            assert!(objs_a_at_first_post_second.len() == obj_ids_batch_a.len(), "Expected all batch a objects to be found at first checkpoint after second insert");
+            for (i, obj) in objs_a_at_first_post_second.iter().enumerate() {
+                assert!(obj == &obj_rows_batch_a[i].value, "Expected batch a object value to match at first checkpoint after second insert");
+            }
+            let objs_b_at_first_post_second = self.store.db_select_many_single_checkpointed_object_values::<V>(table, &obj_ids_batch_b, first_checkpoint).await?;
+            for obj in objs_b_at_first_post_second.iter() {
+                assert!(obj.is_none(), "Expected batch b object to not be found at first checkpoint after second insert");
+            }
+            // insert at last_checkpoint
+            let obj_rows_batch_a_last = obj_ids_batch_a.iter().map(|&id| QDatabaseSingleIdTableRowNoCheckpointId::new(id, V::qp_rand_gen())).collect::<Vec<_>>();
+            let obj_rows_batch_b_last = obj_ids_batch_b.iter().map(|&id| QDatabaseSingleIdTableRowNoCheckpointId::new(id, V::qp_rand_gen())).collect::<Vec<_>>();
+            self.store.db_insert_many_single_checkpointed_objects_at_checkpoint(table,  last_checkpoint, &obj_rows_batch_a_last).await?;
+            self.store.db_insert_many_single_checkpointed_objects_at_checkpoint_t(table,  last_checkpoint, &obj_rows_batch_b_last).await?;
+            let combined_ids = obj_ids_batch_a.iter().chain(obj_ids_batch_b.iter()).cloned().collect::<Vec<_>>();
+            let objs_combined_at_last = self.store.db_select_many_single_checkpointed_object_values::<V>(table, &combined_ids, last_checkpoint).await?;
+            let objs_combined_at_last = objs_combined_at_last.into_iter().collect::<Option<Vec<V>>>().ok_or_else(|| anyhow::anyhow!("Expected all objects to be found at last checkpoint after last insert"))?;
+            assert!(objs_combined_at_last.len() == combined_ids.len(), "Expected all objects to be found at last checkpoint after last insert");
+            for i in 0..obj_ids_batch_a.len() {
+                assert!(objs_combined_at_last[i] == obj_rows_batch_a_last[i].value, "Expected object value to match for batch a at last checkpoint after last insert");
+            }
+            for i in 0..obj_ids_batch_b.len() {
+                assert!(objs_combined_at_last[i + obj_ids_batch_a.len()] == obj_rows_batch_b_last[i].value, "Expected object value to match for batch b at last checkpoint after last insert");
+            }
+            // check that batch a ids at second checkpoint are still the same, and batch b ids are not found
+            let objs_a_at_second_post_last = self.store.db_select_many_single_checkpointed_object_values::<V>(table, &combined_ids, second_checkpoint).await?;
+            let objs_a_at_second_post_last = objs_a_at_second_post_last[0..obj_ids_batch_a.len()].to_vec().into_iter().collect::<Option<Vec<V>>>().ok_or_else(|| anyhow::anyhow!("Expected all batch a objects to be found at second checkpoint after last insert"))?;
+            assert!(objs_a_at_second_post_last.len() == obj_ids_batch_a.len(), "Expected all batch a objects to be found at second checkpoint after last insert");
+            for (i, obj) in objs_a_at_second_post_last.iter().enumerate() {
+                assert!(obj == &obj_rows_batch_a_second[i].value, "Expected batch a object value to match at second checkpoint after last insert");
+            }
+            let objs_b_at_second_post_last = self.store.db_select_many_single_checkpointed_object_values::<V>(table, &obj_ids_batch_b, second_checkpoint).await?;
+            for obj in objs_b_at_second_post_last.iter() {
+                assert!(obj.is_some(), "Expected batch b object to be found at second checkpoint after last insert");
+                assert!(obj.as_ref().unwrap() == &obj_rows_batch_b[objs_b_at_second_post_last.iter().position(|x| x == obj).unwrap()].value, "Expected batch b object value to match at second checkpoint after last insert");
+            }
+            // check that batch a ids at first checkpoint are still the same, and batch b ids are not found
+            let objs_a_at_first_post_last = self.store.db_select_many_single_checkpointed_object_values::<V>(table, &combined_ids, first_checkpoint).await?;
+            let objs_a_at_first_post_last = objs_a_at_first_post_last[0..obj_ids_batch_a.len()].to_vec().into_iter().collect::<Option<Vec<V>>>().ok_or_else(|| anyhow::anyhow!("Expected all batch a objects to be found at first checkpoint after last insert"))?;
+            assert!(objs_a_at_first_post_last.len() == obj_ids_batch_a.len(), "Expected all batch a objects to be found at first checkpoint after last insert");
+            for (i, obj) in objs_a_at_first_post_last.iter().enumerate() {
+                assert!(obj == &obj_rows_batch_a[i].value, "Expected batch a object value to match at first checkpoint after last insert");
+            }
+            let objs_b_at_first_post_last = self.store.db_select_many_single_checkpointed_object_values::<V>(table, &obj_ids_batch_b, first_checkpoint).await?;
+            for obj in objs_b_at_first_post_last.iter() {
+                assert!(obj.is_none(), "Expected batch b object to not be found at first checkpoint after last insert");
+            }
+
+
+
+            // batch set obj_ids_batch_a to first_checkpoint
+
+
+            Ok(())
+
+
+
+
+
+        }
+        
+        async fn th_ensure_single_id_merkle_zero_hashes_at_checkpoint_for_sub_tree_a(&self, table: &SingleIdMerkleTableIdentifier, tree_id: u64, checkpoint_id: u64, tree_height: u8, root: SimpleMerkleNodeKey) -> anyhow::Result<()> {
+            assert!(tree_height >= root.level, "Tree height must be greater than or equal to root level");
+            let root_value = self.store.db_select_single_id_merkle_node_max_checkpoint(table, checkpoint_id, tree_id, tree_height, root).await?;
+            assert!(root_value == Hasher::get_zero_hash((tree_height-root.level) as usize), "Root value must be zero hash at root level");
+            if root.level == tree_height {
+                return Ok(());
+            }
+
+            let child_keys = rand_children_to_height(&root, tree_height);
+            let node_values = self.store.db_select_many_single_id_merkle_nodes_max_checkpoint(table, checkpoint_id, tree_id, tree_height, &child_keys).await?;
+            let expected_values = child_keys.iter().map(|key| Hasher::get_zero_hash((tree_height - key.level) as usize)).collect::<Vec<_>>();
+            assert!(node_values.len() == expected_values.len(), "Node values and expected values lengths must match");
+            for (i, value) in node_values.iter().enumerate() {
+                assert!(value == &expected_values[i], "Node value must match expected zero hash");
+            }
+
+            Ok(())
+        }
+        pub async fn th_test_insert_single_id_merkle_leaves_sub_tree_dmp(&self, table: &SingleIdMerkleTableIdentifier, checkpoint_id: u64, tree_id: u64, tree_height: u8, sub_root_key: &SimpleMerkleNodeKey, leaves: &[SimpleMerkleNode<Hash>]) -> anyhow::Result<Vec<DeltaMerkleProofCore<Hash>>> {
+            if leaves.is_empty() {
+                return Ok(vec![]);
+            }
+            assert!(sub_root_key.level <= tree_height, "Sub root level must be at or below the tree height level");
+            
+            let first_leaf_level = leaves[0].key.level;
+            assert!(first_leaf_level <= tree_height, "Leaf keys must be at or below the tree height level");
+            assert!(first_leaf_level >= sub_root_key.level, "Leaf keys must be at or below the sub root level");
+
+            for leaf in leaves.iter() {
+                assert!(leaf.key.level == first_leaf_level, "All leaf keys must be at the same level");
+            }
+            let leaf_values = leaves.iter().map(|node| node.value).collect::<Vec<_>>();
+            let leaf_keys = leaves.iter().map(|node| node.key).collect::<Vec<_>>();
+            let dmps = db_helper_single_id_merkle_node_simple_set_leaves::<Hash, Hasher, SingleIdMerkleTableIdentifier,_>(&self.store, table, checkpoint_id, tree_id, tree_height, 0, 9999, leaves).await?;
+            assert!(dmps.len() == leaves.len(), "Number of DeltaMerkleProofs must match number of inserted leaves");
+            let selected_leaf_values = self.store.db_select_many_single_id_merkle_nodes_max_checkpoint(table, checkpoint_id, tree_id, tree_height, &leaf_keys).await?;
+            assert!(selected_leaf_values.len() == leaf_values.len(), "Selected leaf values length must match inserted leaf values length");
+            for (i, value) in selected_leaf_values.iter().enumerate() {
+                assert!(value == &leaf_values[i], "Selected leaf value must match inserted leaf value");
+            }
+            for dmp in dmps.iter() {
+
+                assert!(dmp.verify::<Hasher>(), "DeltaMerkleProof must verify correctly");
+            }
+
+            for i in 1..dmps.len() {
+                assert!(dmps[i-1].new_root == dmps[i].old_root, "Consecutive DeltaMerkleProofs must be connected back to back, ie. new_root of previous must equal old_root of next"); 
+            }
+            
+
+            Ok(dmps)
+
+        }
+        pub async fn th_test_single_id_merkle_nodes_basic(&self, table: &SingleIdMerkleTableIdentifier, tree_id: u64, tree_height: u8) -> anyhow::Result<()> {
+
+            let first_checkpoint_id = 1u64;
+            let second_checkpoint_id = 2u64;
+            let third_checkpoint_id = 3u64;
+            let fourth_checkpoint_id = 999u64;
+            let last_checkpoint_id = 12874892u64;
+            self.th_ensure_single_id_merkle_zero_hashes_at_checkpoint_for_sub_tree_a(table, tree_id, first_checkpoint_id, tree_height, SimpleMerkleNodeKey::new_root()).await?;
+            self.th_ensure_single_id_merkle_zero_hashes_at_checkpoint_for_sub_tree_a(table, tree_id, second_checkpoint_id, tree_height, SimpleMerkleNodeKey::new_root()).await?;
+            self.th_ensure_single_id_merkle_zero_hashes_at_checkpoint_for_sub_tree_a(table, tree_id, third_checkpoint_id, tree_height, SimpleMerkleNodeKey::new_root()).await?;
+            self.th_ensure_single_id_merkle_zero_hashes_at_checkpoint_for_sub_tree_a(table, tree_id, fourth_checkpoint_id, tree_height, SimpleMerkleNodeKey::new_root()).await?;
+            self.th_ensure_single_id_merkle_zero_hashes_at_checkpoint_for_sub_tree_a(table, tree_id, last_checkpoint_id, tree_height, SimpleMerkleNodeKey::new_root()).await?;
+
+            let max_leaves_in_tree = 1u64 << tree_height;
+            let num_leaves_to_insert = 16u64.min(max_leaves_in_tree);
+            let num_leaves_to_insert_usize = num_leaves_to_insert as usize;
+            let root_key = SimpleMerkleNodeKey::new_root();
+            let first_batch = rand_leaves_for_subtree::<Hash>(&root_key, tree_height, num_leaves_to_insert_usize);
+
+            let dmps_0 = self.th_test_insert_single_id_merkle_leaves_sub_tree_dmp(table, first_checkpoint_id, tree_id, tree_height, &SimpleMerkleNodeKey::new_root(), &first_batch).await?;
+            assert!(dmps_0.len() == first_batch.len(), "Number of DeltaMerkleProofs must match number of inserted leaves at first checkpoint");
+
+            self.th_ensure_single_id_merkle_zero_hashes_at_checkpoint_for_sub_tree_a(table, tree_id, 0, tree_height, SimpleMerkleNodeKey::new_root()).await?;
+            let second_batch = rand_leaves_for_subtree::<Hash>(&root_key, tree_height, num_leaves_to_insert_usize);
+            let dmps_1 = self.th_test_insert_single_id_merkle_leaves_sub_tree_dmp(table, second_checkpoint_id, tree_id, tree_height, &SimpleMerkleNodeKey::new_root(), &second_batch).await?;
+            assert!(dmps_1.len() == second_batch.len(), "Number of DeltaMerkleProofs must match number of inserted leaves at second checkpoint");
+            
+
+            let first_second_batch_combined_halves = [
+                first_batch[0..(num_leaves_to_insert_usize/2)].to_vec(),
+                second_batch[(num_leaves_to_insert_usize/2)..num_leaves_to_insert_usize].to_vec()
+            ].concat();
+            let third_batch_unmodified = [
+                first_batch[(num_leaves_to_insert_usize/2)..num_leaves_to_insert_usize].to_vec(),
+                second_batch[0..(num_leaves_to_insert_usize/2)].to_vec()
+            ].concat();
+            let third_batch_new_leaves = rand_leaves_for_subtree::<Hash>(&root_key, tree_height, num_leaves_to_insert_usize);
+            let first_second_batch_leaves_at_third_checkpoint = first_second_batch_combined_halves.iter().map(|x|{
+                SimpleMerkleNode {
+                    key: x.key,
+                    value: Hash::qp_rand_gen(),
+                }
+            }).collect::<Vec<_>>();
+            let third_batch = [first_second_batch_leaves_at_third_checkpoint, third_batch_new_leaves.clone()].concat();
+            let dmps_2 = self.th_test_insert_single_id_merkle_leaves_sub_tree_dmp(table, third_checkpoint_id, tree_id, tree_height, &SimpleMerkleNodeKey::new_root(), &third_batch).await?;
+            assert!(dmps_2.len() == third_batch.len(), "Number of DeltaMerkleProofs must match number of inserted leaves at third checkpoint");
+            // ensure that the unmodified leaves are still the same at third checkpoint
+            let b12_unmodified_keys = third_batch_unmodified.iter().map(|x| x.key).collect::<Vec<_>>();
+            let b12_unmodified_values = third_batch_unmodified.iter().map(|x| x.value).collect::<Vec<_>>();
+            let selected_unmodified_values = self.store.db_select_many_single_id_merkle_nodes_max_checkpoint(table, third_checkpoint_id, tree_id, tree_height, &b12_unmodified_keys).await?;
+            assert!(selected_unmodified_values.len() == b12_unmodified_values.len(), "Selected unmodified values length must match unmodified values length at third checkpoint");
+            for (i, value) in selected_unmodified_values.iter().enumerate() {
+                assert!(value == &b12_unmodified_values[i], "Selected unmodified value must match unmodified value at third checkpoint");
+            }
+            // ensure that the modified leaves are different at third checkpoint
+            let b3_modified_keys = third_batch_new_leaves.iter().map(|x| x.key).collect::<Vec<_>>();
+            let b3_modified_values = third_batch_new_leaves.iter().map(|x| x.value).collect::<Vec<_>>();
+            let selected_modified_values = self.store.db_select_many_single_id_merkle_nodes_max_checkpoint(table, third_checkpoint_id, tree_id, tree_height, &b3_modified_keys).await?;
+            assert!(selected_modified_values.len() == b3_modified_values.len(), "Selected modified values length must match modified values length at third checkpoint");
+            for (i, value) in selected_modified_values.iter().enumerate() {
+                assert!(value == &b3_modified_values[i], "Selected modified value must match modified value at third checkpoint");
+            }
+
+            let fourth_batch = rand_leaves_for_subtree::<Hash>(&root_key, tree_height, num_leaves_to_insert_usize);
+            let dmps_3 = self.th_test_insert_single_id_merkle_leaves_sub_tree_dmp(table, fourth_checkpoint_id, tree_id, tree_height, &SimpleMerkleNodeKey::new_root(), &fourth_batch).await?;
+            assert!(dmps_3.len() == fourth_batch.len(), "Number of DeltaMerkleProofs must match number of inserted leaves at fourth checkpoint");
+
+            let last_batch = rand_leaves_for_subtree::<Hash>(&root_key, tree_height, num_leaves_to_insert_usize);
+            let dmps_4 = self.th_test_insert_single_id_merkle_leaves_sub_tree_dmp(table, last_checkpoint_id, tree_id, tree_height, &SimpleMerkleNodeKey::new_root(), &last_batch).await?;
+            assert!(dmps_4.len() == last_batch.len(), "Number of DeltaMerkleProofs must match number of inserted leaves at last checkpoint");
+
+            let keys_to_check: Vec<_> = first_batch.iter().chain(second_batch.iter()).chain(third_batch.iter()).chain(fourth_batch.iter()).chain(last_batch.iter()).map(|x| x.key)
+                .into_iter()
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect();
+
+            for k in keys_to_check {
+                let mp = db_helper_select_single_id_merkle_proof_max_checkpoint::<Hash, Hasher, _, _>(&self.store, table, first_checkpoint_id+1, tree_id, tree_height, k). await?;
+                assert!(mp.verify::<Hasher>(), "MerkleProof must verify correctly for key {:?}", k);
+                let mp = db_helper_select_single_id_merkle_proof_max_checkpoint::<Hash, Hasher, _, _>(&self.store, table, second_checkpoint_id, tree_id, tree_height, k). await?;
+                assert!(mp.verify::<Hasher>(), "MerkleProof must verify correctly for key {:?}", k);
+                let mp = db_helper_select_single_id_merkle_proof_max_checkpoint::<Hash, Hasher, _, _>(&self.store, table, third_checkpoint_id, tree_id, tree_height, k). await?;
+                assert!(mp.verify::<Hasher>(), "MerkleProof must verify correctly for key {:?}", k);
+                let mp = db_helper_select_single_id_merkle_proof_max_checkpoint::<Hash, Hasher, _, _>(&self.store, table, fourth_checkpoint_id, tree_id, tree_height, k). await?;
+                assert!(mp.verify::<Hasher>(), "MerkleProof must verify correctly for key {:?}", k);
+                let mp = db_helper_select_single_id_merkle_proof_max_checkpoint::<Hash, Hasher, _, _>(&self.store, table, last_checkpoint_id, tree_id, tree_height, k). await?;
+                assert!(mp.verify::<Hasher>(), "MerkleProof must verify correctly for key {:?}", k);
+                let mp = db_helper_select_single_id_merkle_proof_max_checkpoint::<Hash, Hasher, _, _>(&self.store, table, last_checkpoint_id+100, tree_id, tree_height, k). await?;
+                assert!(mp.verify::<Hasher>(), "MerkleProof must verify correctly for key {:?}", k);
+            }
+            Ok(())
+        }
+
+
+    
+}
+impl<
+        const ZERO_ID_TREE_A_HEIGHT: usize,
+        const ZERO_ID_TREE_B_HEIGHT: usize,
+        const SINGLE_ID_TREE_A_HEIGHT: usize,
+        const SINGLE_ID_TREE_B_HEIGHT: usize,
+        const DOUBLE_ID_TREE_A_HEIGHT: usize,
+        const DOUBLE_ID_TREE_B_HEIGHT: usize,
+        BidirectionalMappingTableAK1: QDatabasePrimitiveKey + QPGenRandom,
+        BidirectionalMappingTableAK2: QDatabasePrimitiveKey + QPGenRandom,
+        BidirectionalMappingTableBK1: QDatabasePrimitiveKey + QPGenRandom,
+        BidirectionalMappingTableBK2: QDatabasePrimitiveKey + QPGenRandom,
+        KivTableAValue: CoreDatabaseValueDeserialize + QPGenRandom,
+        KivTableBValue: CoreDatabaseValueDeserialize + QPGenRandom,
+        ObjSingleIdTableAValue: CoreDatabaseValueDeserialize + QPGenRandom,
+        ObjDoubleIdTableBValue: CoreDatabaseValueDeserialize + QPGenRandom,
+        Hash: QHashBase + QPGenRandom,
+        Hasher: THHasher<Hash>,
+        BiDirectionalMappingTableIdentifier: THStandardTableIdentifier,
+        BiDirectionalU64U128MappingTableIdentifier: THStandardTableIdentifier,
+        U64TableIdentifier: THStandardTableIdentifier,
+        SingleIdTableIdentifier: THStandardTableIdentifier,
+        DoubleIdTableIdentifier: THStandardTableIdentifier,
+        KivTableIdentifier: THStandardTableIdentifier,
+        SingleIdMerkleTableIdentifier: THStandardTableIdentifier,
+        DoubleIdMerkleTableIdentifier: THStandardTableIdentifier,
+        ZeroIdMerkleTableIdentifier: THStandardTableIdentifier,
+        RewardTreeTableIdentifier: THStandardTableIdentifier,
+        S: CoreDatabaseStore<
+                Hash,
+                Hasher,
+                BiDirectionalMappingTableIdentifier,
+                BiDirectionalU64U128MappingTableIdentifier,
+                U64TableIdentifier,
+                SingleIdTableIdentifier,
+                DoubleIdTableIdentifier,
+                KivTableIdentifier,
+                SingleIdMerkleTableIdentifier,
+                DoubleIdMerkleTableIdentifier,
+                ZeroIdMerkleTableIdentifier,
+            > + CoreDatabaseTagTreeStore<Hash, Hasher, RewardTreeTableIdentifier>
+            + Send
+            + Sync,
+    >
+    QSimpleStore<
+        ZERO_ID_TREE_A_HEIGHT,
+        ZERO_ID_TREE_B_HEIGHT,
+        SINGLE_ID_TREE_A_HEIGHT,
+        SINGLE_ID_TREE_B_HEIGHT,
+        DOUBLE_ID_TREE_A_HEIGHT,
+        DOUBLE_ID_TREE_B_HEIGHT,
+        BidirectionalMappingTableAK1,
+        BidirectionalMappingTableAK2,
+        BidirectionalMappingTableBK1,
+        BidirectionalMappingTableBK2,
+        KivTableAValue,
+        KivTableBValue,
+        ObjSingleIdTableAValue,
+        ObjDoubleIdTableBValue,
+        Hash,
+        Hasher,
+        BiDirectionalMappingTableIdentifier,
+        BiDirectionalU64U128MappingTableIdentifier,
+        U64TableIdentifier,
+        SingleIdTableIdentifier,
+        DoubleIdTableIdentifier,
+        KivTableIdentifier,
+        SingleIdMerkleTableIdentifier,
+        DoubleIdMerkleTableIdentifier,
+        ZeroIdMerkleTableIdentifier,
+        RewardTreeTableIdentifier,
+        S,
+    >
+{
+    pub async fn th_util_select_one_double_checkpointed_object_value<V: CoreDatabaseValueDeserialize>(
+        &self,
+        table: &DoubleIdTableIdentifier,
+        obj_id: u64,
+        secondary_id: u64,
+        max_checkpoint_id: u64,
+    ) -> anyhow::Result<Option<V>> {
+        let result = self
+            .store
+            .db_select_one_double_checkpointed_object_value::<V>(table, obj_id, secondary_id, max_checkpoint_id)
+            .await?;
+        let result_with_ids = self
+            .store
+            .db_select_one_double_checkpointed_object_value_and_ids::<V>(table, obj_id, secondary_id, max_checkpoint_id)
+            .await?;
+        if result.is_some() {
+            let r = result.clone().unwrap();
+            let row = result_with_ids.ok_or_else(|| anyhow::anyhow!("Value with ids not found after select"))?;
+            assert!(row.obj_id == obj_id, "Object id does not match");
+            assert!(row.secondary_id == secondary_id, "Secondary id does not match");
+            assert!(row.checkpoint_id <= max_checkpoint_id, "Checkpoint id is greater than max_checkpoint_id");
+            assert!(row.value == r, "Value with ids does not match value without ids");
+
+            let above_checkpoint_id = row.checkpoint_id + 1;
+            let result_above = self
+                .store
+                .db_select_one_double_checkpointed_object_value_and_ids::<V>(table, obj_id, secondary_id, above_checkpoint_id)
+                .await?;
+            assert!(
+                result_above.is_some(),
+                "Value not found when selecting with checkpoint_id above the one returned in value with ids"
+            );
+            let result_above_unwrapped = result_above.unwrap();
+            assert!(
+                result_above_unwrapped.obj_id == obj_id,
+                "Object id does not match when selecting with checkpoint_id above the one returned in value with ids"
+            );
+            assert!(
+                result_above_unwrapped.secondary_id == secondary_id,
+                "Secondary id does not match when selecting with checkpoint_id above the one returned in value with ids"
+            );
+            if result_above_unwrapped.checkpoint_id != row.checkpoint_id {
+                assert!(result_above_unwrapped.checkpoint_id > row.checkpoint_id, "Checkpoint id is not greater than the one returned in value with ids when selecting with checkpoint_id above the one returned in value with ids");
+            }
+            if row.checkpoint_id > 0 {
+                let result_below = self
+                    .store
+                    .db_select_one_double_checkpointed_object_value_and_ids::<V>(table, obj_id, secondary_id, row.checkpoint_id - 1)
+                    .await?;
+                if result_below.is_some() {
+                    let result_below_unwrapped = result_below.unwrap();
+                    assert!(
+                        result_below_unwrapped.obj_id == obj_id,
+                        "Object id does not match when selecting with checkpoint_id equal to the one returned in value with ids"
+                    );
+                    assert!(
+                        result_below_unwrapped.secondary_id == secondary_id,
+                        "Secondary id does not match when selecting with checkpoint_id equal to the one returned in value with ids"
+                    );
+                    assert!(result_below_unwrapped.checkpoint_id < row.checkpoint_id);
+                }
+            }
+        } else {
+            assert!(result_with_ids.is_none(), "Value with ids should be None when value without ids is None");
+        }
+        let keys = vec![
+            QDoubleIdKey { obj_id, secondary_id },
+            QDoubleIdKey { obj_id: DEFINITELY_MISSING_U64_VALUE, secondary_id: DEFINITELY_MISSING_U64_VALUE },
+            QDoubleIdKey { obj_id, secondary_id },
+        ];
+        let multi_result = self
+            .store
+            .db_select_many_double_checkpointed_object_values::<V>(table, &keys, max_checkpoint_id)
+            .await?;
+        assert!(multi_result.len() == 3, "Multi select did not return correct number of results");
+        assert!(multi_result[0] == result, "Multi select first result does not match single select result");
+        assert!(multi_result[1].is_none(), "Multi select second result should be None");
+        assert!(multi_result[2] == result, "Multi select third result does not match single select result");
+
+        Ok(result)
+    }
+
+    pub async fn th_util_select_many_double_checkpointed_object_values<V: CoreDatabaseValueDeserialize>(
+        &self,
+        table: &DoubleIdTableIdentifier,
+        keys: &[QDoubleIdKey],
+        max_checkpoint_id: u64,
+    ) -> anyhow::Result<Vec<Option<V>>> {
+        let result = self
+            .store
+            .db_select_many_double_checkpointed_object_values::<V>(table, keys, max_checkpoint_id)
+            .await?;
+        assert!(
+            result.len() == keys.len(),
+            "Number of retrieved values does not match number of requested values"
+        );
+        for (i, key) in keys.iter().enumerate() {
+            let single_result = self
+                .th_util_select_one_double_checkpointed_object_value::<V>(table, key.obj_id, key.secondary_id, max_checkpoint_id)
+                .await?;
+            assert!(result[i] == single_result, "Multi select result does not match single select result");
+        }
+        Ok(result)
+    }
+
+    pub async fn th_util_insert_double_checkpointed_object<V: CoreDatabaseValueDeserialize>(
+        &self,
+        table: &DoubleIdTableIdentifier,
+        obj_id: u64,
+        secondary_id: u64,
+        checkpoint_id: u64,
+        value: &V,
+    ) -> anyhow::Result<()> {
+        let prev_lower = if checkpoint_id > 0 {
+            self.th_util_select_one_double_checkpointed_object_value::<V>(table, obj_id, secondary_id, checkpoint_id - 1)
+                .await?
+        } else {
+            None
+        };
+
+        let higher = self
+            .th_util_select_one_double_checkpointed_object_value::<V>(table, obj_id, secondary_id, checkpoint_id + 1)
+            .await?;
+
+        self.store
+            .db_insert_one_double_checkpointed_object(table, obj_id, secondary_id, checkpoint_id, value)
+            .await?;
+
+        let after = self
+            .th_util_select_one_double_checkpointed_object_value::<V>(table, obj_id, secondary_id, checkpoint_id)
+            .await?;
+
+        assert!(after.is_some(), "Value not found after insert");
+        let after_unwrapped = after.clone().unwrap();
+        assert!(after_unwrapped == *value, "Inserted value does not match retrieved value after insert");
+        if higher.is_none() {
+            let higher_new = self
+                .th_util_select_one_double_checkpointed_object_value::<V>(table, obj_id, secondary_id, checkpoint_id + 1)
+                .await?;
+            assert!(higher_new.is_some(), "Higher value should be found after insert");
+            let higher_new_unwrapped = higher_new.unwrap();
+            assert!(higher_new_unwrapped == after_unwrapped, "Higher value should match inserted value");
+        }
+
+        if prev_lower.is_some() {
+            let prev_lower_unwrapped = prev_lower.unwrap();
+            let prev_lower_again = self
+                .th_util_select_one_double_checkpointed_object_value::<V>(table, obj_id, secondary_id, checkpoint_id - 1)
+                .await?;
+            assert!(prev_lower_again.is_some(), "Previous lower value should still be found after insert");
+            let prev_lower_again_unwrapped = prev_lower_again.unwrap();
+            assert!(
+                prev_lower_again_unwrapped == prev_lower_unwrapped,
+                "Previous lower value should not change after insert"
+            );
+        }
+
+        let keys = vec![
+            QDoubleIdKey { obj_id, secondary_id },
+            QDoubleIdKey { obj_id: DEFINITELY_MISSING_U64_VALUE, secondary_id: DEFINITELY_MISSING_U64_VALUE },
+            QDoubleIdKey { obj_id, secondary_id },
+        ];
+        let multi_result = self
+            .store
+            .db_select_many_double_checkpointed_object_values::<V>(table, &keys, checkpoint_id)
+            .await?;
+        assert!(multi_result.len() == 3, "Multi select did not return correct number of results");
+        assert!(multi_result[0] == after, "Multi select first result does not match single select result");
+        assert!(multi_result[1].is_none(), "Multi select second result should be None");
+        assert!(multi_result[2] == after, "Multi select third result does not match single select result");
+
+        Ok(())
+    }
+
+    pub async fn th_util_insert_many_double_checkpointed_objects<
+        V: CoreDatabaseValueDeserialize,
+        R: QDatabaseDoubleIdTableRowNoCheckpointIdLike<V> + Send + Sync,
+    >(
+        &self,
+        table: &DoubleIdTableIdentifier,
+        rows: &[R],
+        checkpoint_id: u64,
+    ) -> anyhow::Result<()> {
+        let mut prev_lowers = Vec::with_capacity(rows.len());
+        let mut highers = Vec::with_capacity(rows.len());
+        for row in rows.iter() {
+            let prev_lower = if checkpoint_id > 0 {
+                self.th_util_select_one_double_checkpointed_object_value::<V>(table, row.get_row_obj_id(), row.get_row_secondary_id(), checkpoint_id - 1)
+                    .await?
+            } else {
+                None
+            };
+            prev_lowers.push(prev_lower);
+            let higher = self
+                .th_util_select_one_double_checkpointed_object_value::<V>(table, row.get_row_obj_id(), row.get_row_secondary_id(), checkpoint_id + 1)
+                .await?;
+            highers.push(higher);
+        }
+
+        self.store
+            .db_insert_many_double_checkpointed_objects_at_checkpoint_t::<V, R>(table, checkpoint_id, rows)
+            .await?;
+
+        for (i, row) in rows.iter().enumerate() {
+            let after = self
+                .th_util_select_one_double_checkpointed_object_value::<V>(table, row.get_row_obj_id(), row.get_row_secondary_id(), checkpoint_id)
+                .await?;
+            assert!(after.is_some(), "Value not found after insert");
+            let after_unwrapped = after.clone().unwrap();
+            assert!(
+                after_unwrapped == *row.get_row_value_ref(),
+                "Inserted value does not match retrieved value after insert"
+            );
+
+            if highers[i].is_none() {
+                let higher_new = self
+                    .th_util_select_one_double_checkpointed_object_value::<V>(table, row.get_row_obj_id(), row.get_row_secondary_id(), checkpoint_id + 1)
+                    .await?;
+                assert!(higher_new.is_some(), "Higher value should be found after insert");
+                let higher_new_unwrapped = higher_new.unwrap();
+                assert!(higher_new_unwrapped == after_unwrapped, "Higher value should match inserted value");
+            }
+
+            if prev_lowers[i].is_some() {
+                let prev_lower_unwrapped = prev_lowers[i].as_ref().unwrap();
+                let prev_lower_again = self
+                    .th_util_select_one_double_checkpointed_object_value::<V>(table, row.get_row_obj_id(), row.get_row_secondary_id(), checkpoint_id - 1)
+                    .await?;
+                assert!(prev_lower_again.is_some(), "Previous lower value should still be found after insert");
+                let prev_lower_again_unwrapped = prev_lower_again.unwrap();
+                assert!(
+                    prev_lower_again_unwrapped == *prev_lower_unwrapped,
+                    "Previous lower value should not change after insert"
+                );
+            }
+        }
+        let keys: Vec<QDoubleIdKey> = rows.iter().map(|r| QDoubleIdKey { obj_id: r.get_row_obj_id(), secondary_id: r.get_row_secondary_id() }).collect();
+        let multi_result = self
+            .store
+            .db_select_many_double_checkpointed_object_values::<V>(table, &keys, checkpoint_id)
+            .await?;
+        assert!(multi_result.len() == rows.len(), "Multi select did not return correct number of results");
+        for (i, row) in rows.iter().enumerate() {
+            let after = self
+                .th_util_select_one_double_checkpointed_object_value::<V>(table, row.get_row_obj_id(), row.get_row_secondary_id(), checkpoint_id)
+                .await?;
+            assert!(multi_result[i] == after, "Multi select result does not match single select result");
+        }
+        Ok(())
+    }
+
+    pub async fn th_test_double_checkpointed_object_1_full_history_1<V: CoreDatabaseValueDeserialize + QPGenRandom>(&self, table: &DoubleIdTableIdentifier) -> anyhow::Result<()>{
+        let (obj_id, secondary_id) = self.get_non_existent_id_in_double_object::<V>(table).await?;
+        let check = self.store.db_select_one_double_checkpointed_object_value::<V>(table, obj_id, secondary_id, MAX_REAL_CHECKPOINT_ID).await?;
+        assert!(check.is_none(), "Expected non-existent id to not be found");
+
+        let value_c_1337 = V::qp_rand_gen();
+        let start_checkpoint_id = 1337u64;
+        self.store.db_insert_one_double_checkpointed_object(table, obj_id, secondary_id, start_checkpoint_id, &value_c_1337).await?;
+
+        let result = self.th_util_select_one_double_checkpointed_object_value::<V>(table, obj_id, secondary_id, start_checkpoint_id).await?;
+        assert!(result.is_some(), "Value not found after insert at checkpoint 1337");
+        let result_unwrapped = result.unwrap();
+        assert!(result_unwrapped == value_c_1337, "Inserted value does not match");
+        let result_with_ids = self.store.db_select_one_double_checkpointed_object_value_and_ids::<V>(table, obj_id, secondary_id, start_checkpoint_id).await?;
+        assert!(result_with_ids.is_some(), "Value with ids not found after insert at checkpoint 1337");
+        let result_with_ids_unwrapped = result_with_ids.unwrap();
+        assert!(result_with_ids_unwrapped.obj_id == obj_id, "Object id does not match");
+        assert!(result_with_ids_unwrapped.secondary_id == secondary_id, "Secondary id does not match");
+        assert!(result_with_ids_unwrapped.checkpoint_id == start_checkpoint_id, "Checkpoint id does not match");
+        assert!(result_with_ids_unwrapped.value == value_c_1337, "Value does not match");
+
+        let result_higher = self.th_util_select_one_double_checkpointed_object_value::<V>(table, obj_id, secondary_id, start_checkpoint_id + 100).await?;
+        assert!(result_higher.is_some(), "Value not found at higher checkpoint after insert at checkpoint 1337");
+        let result_higher_unwrapped = result_higher.unwrap();
+        assert!(result_higher_unwrapped == value_c_1337, "Value does not match at higher checkpoint");
+        let result_higher_with_ids = self.store.db_select_one_double_checkpointed_object_value_and_ids::<V>(table, obj_id, secondary_id, start_checkpoint_id + 100).await?;
+        assert!(result_higher_with_ids.is_some(), "Value with ids not found at higher checkpoint after insert at checkpoint 1337");
+        let result_higher_with_ids_unwrapped = result_higher_with_ids.unwrap();
+        assert!(result_higher_with_ids_unwrapped.obj_id == obj_id, "Object id does not match at higher checkpoint");
+        assert!(result_higher_with_ids_unwrapped.secondary_id == secondary_id, "Secondary id does not match at higher checkpoint");
+        assert!(result_higher_with_ids_unwrapped.checkpoint_id == start_checkpoint_id, "Checkpoint id does not match at higher checkpoint");
+        assert!(result_higher_with_ids_unwrapped.value == value_c_1337, "Value does not match at higher checkpoint");
+
+        let result_lower = self.store.db_select_one_double_checkpointed_object_value::<V>(table, obj_id, secondary_id, start_checkpoint_id - 1).await?;
+        assert!(result_lower.is_none(), "Value should not be found at lower checkpoint after insert at checkpoint 1337");
+        let result_lower_with_ids = self.store.db_select_one_double_checkpointed_object_value_and_ids::<V>(table, obj_id, secondary_id, start_checkpoint_id - 1).await?;
+        assert!(result_lower_with_ids.is_none(), "Value with ids should not be found at lower checkpoint after insert at checkpoint 1337");
+
+        let value_c_1000 = V::qp_rand_gen();
+        let lower_checkpoint_id = 1000u64;
+        self.store.db_insert_one_double_checkpointed_object(table, obj_id, secondary_id, lower_checkpoint_id, &value_c_1000).await?;
+        let result_after_lower_insert = self.th_util_select_one_double_checkpointed_object_value::<V>(table, obj_id, secondary_id, lower_checkpoint_id).await?;
+        assert!(result_after_lower_insert.is_some(), "Value not found after insert at lower checkpoint 1000");
+        let result_after_lower_insert_unwrapped = result_after_lower_insert.unwrap();
+        assert!(result_after_lower_insert_unwrapped == value_c_1000, "Inserted value at lower checkpoint does not match");
+        let result_after_lower_insert_with_ids = self.store.db_select_one_double_checkpointed_object_value_and_ids::<V>(table, obj_id, secondary_id, lower_checkpoint_id).await?;
+        assert!(result_after_lower_insert_with_ids.is_some(), "Value with ids not found after insert at lower checkpoint 1000");
+        let result_after_lower_insert_with_ids_unwrapped = result_after_lower_insert_with_ids.unwrap();
+        assert!(result_after_lower_insert_with_ids_unwrapped.obj_id == obj_id, "Object id does not match after lower checkpoint insert");
+        assert!(result_after_lower_insert_with_ids_unwrapped.secondary_id == secondary_id, "Secondary id does not match after lower checkpoint insert");
+        assert!(result_after_lower_insert_with_ids_unwrapped.checkpoint_id == lower_checkpoint_id, "Checkpoint id does not match after lower checkpoint insert");
+        assert!(result_after_lower_insert_with_ids_unwrapped.value == value_c_1000, "Value does not match after lower checkpoint insert");
+
+        let result_higher_after_lower_insert = self.th_util_select_one_double_checkpointed_object_value::<V>(table, obj_id, secondary_id, start_checkpoint_id).await?;
+        assert!(result_higher_after_lower_insert.is_some(), "Value not found at original checkpoint after lower checkpoint insert");
+        let result_higher_after_lower_insert_unwrapped = result_higher_after_lower_insert.unwrap();
+        assert!(result_higher_after_lower_insert_unwrapped == value_c_1337, "Value at original checkpoint does not match after lower checkpoint insert");
+        let result_higher_after_lower_insert_with_ids = self.store.db_select_one_double_checkpointed_object_value_and_ids::<V>(table, obj_id, secondary_id, start_checkpoint_id).await?;
+        assert!(result_higher_after_lower_insert_with_ids.is_some(), "Value with ids not found at original checkpoint after lower checkpoint insert");
+        let result_higher_after_lower_insert_with_ids_unwrapped = result_higher_after_lower_insert_with_ids.unwrap();
+        assert!(result_higher_after_lower_insert_with_ids_unwrapped.obj_id == obj_id, "Object id does not match at original checkpoint after lower checkpoint insert");
+        assert!(result_higher_after_lower_insert_with_ids_unwrapped.secondary_id == secondary_id, "Secondary id does not match at original checkpoint after lower checkpoint insert");
+        assert!(result_higher_after_lower_insert_with_ids_unwrapped.checkpoint_id == start_checkpoint_id, "Checkpoint id does not match at original checkpoint after lower checkpoint insert");
+        assert!(result_higher_after_lower_insert_with_ids_unwrapped.value == value_c_1337, "Value does not match at original checkpoint after lower checkpoint insert");
+
+        let first_100_checkpoints = (0..100u64).map(|_| V::qp_rand_gen()).collect::<Vec<_>>();
+        for (checkpoint_id, value) in first_100_checkpoints.iter().enumerate() {
+            self.store.db_insert_one_double_checkpointed_object(table, obj_id, secondary_id, checkpoint_id as u64, value).await?;
+            let should_be_value_post_insert = self.store.db_select_one_double_checkpointed_object_value::<V>(table, obj_id, secondary_id, checkpoint_id as u64).await?;
+            assert!(should_be_value_post_insert.is_some(), "Value should be found at checkpoint {} after insert", checkpoint_id);
+            let should_be_value_post_insert_unwrapped = should_be_value_post_insert.unwrap();
+            assert!(should_be_value_post_insert_unwrapped == *value, "Value at checkpoint {} does not match inserted value", checkpoint_id);
+            for future_checkpoint in (checkpoint_id + 1)..100 {
+                let should_be_value_future = self.store.db_select_one_double_checkpointed_object_value::<V>(table, obj_id, secondary_id, future_checkpoint as u64).await?;
+                assert!(should_be_value_future.is_some(), "Value should be found at future checkpoint {} after insert at checkpoint {}", future_checkpoint, checkpoint_id);
+                let should_be_value_future_unwrapped = should_be_value_future.unwrap();
+                assert!(should_be_value_future_unwrapped == *value, "Value at future checkpoint {} does not match value at checkpoint {} after insert", future_checkpoint, checkpoint_id);
+            }
+        }
+
+        let checkpoints_5000_5600 = (5000..5600u64).map(|i| QDatabaseDoubleIdTableRow::new(obj_id, secondary_id, i, V::qp_rand_gen())).collect::<Vec<_>>();
+        self.store.db_insert_many_double_checkpointed_object_rows_t(table, &checkpoints_5000_5600[0..300]).await?;
+        for chk in checkpoints_5000_5600[0..300].iter() {
+            let actual_value = self.th_util_select_one_double_checkpointed_object_value::<V>(table, obj_id, secondary_id, chk.checkpoint_id).await?;
+            assert!(actual_value.is_some(), "Value should be found at checkpoint {} after batch insert", chk.checkpoint_id);
+            let actual_value_unwrapped = actual_value.unwrap();
+            assert!(actual_value_unwrapped == chk.value, "Value at checkpoint {} does not match inserted value after batch insert", chk.checkpoint_id);
+        }
+        let actual_value_max_real = self.store.db_select_one_double_checkpointed_object_value::<V>(table, obj_id, secondary_id, MAX_REAL_CHECKPOINT_ID).await?;
+        assert!(actual_value_max_real.is_some(), "Value should be found at MAX_REAL_CHECKPOINT_ID after batch insert");
+        let actual_value_max_real_unwrapped = actual_value_max_real.unwrap();
+        assert!(actual_value_max_real_unwrapped == checkpoints_5000_5600[299].value, "Value at MAX_REAL_CHECKPOINT_ID does not match last inserted value after batch insert");
+        let actual_value_u64_max = self.store.db_select_one_double_checkpointed_object_value::<V>(table, obj_id, secondary_id, u64::MAX).await?;
+        assert!(actual_value_u64_max.is_some(), "Value should be found at u64::MAX after batch insert");
+        let actual_value_u64_max_unwrapped = actual_value_u64_max.unwrap();
+        assert!(actual_value_u64_max_unwrapped == checkpoints_5000_5600[299].value, "Value at u64::MAX does not match last inserted value after batch insert");
+        assert!(actual_value_u64_max_unwrapped == actual_value_max_real_unwrapped, "Value at u64::MAX does not match value at MAX_REAL_CHECKPOINT_ID after batch insert");
+
+        self.store.db_insert_many_double_checkpointed_object_rows_t(table, &checkpoints_5000_5600[300..600]).await?;
+        for chk in checkpoints_5000_5600[0..600].iter() {
+            let actual_value = self.th_util_select_one_double_checkpointed_object_value::<V>(table, obj_id, secondary_id, chk.checkpoint_id).await?;
+            assert!(actual_value.is_some(), "Value should be found at checkpoint {} after second batch insert", chk.checkpoint_id);
+            let actual_value_unwrapped = actual_value.unwrap();
+            assert!(actual_value_unwrapped == chk.value, "Value at checkpoint {} does not match inserted value after second batch insert", chk.checkpoint_id);
+        }
+        let actual_value_max_real = self.store.db_select_one_double_checkpointed_object_value::<V>(table, obj_id, secondary_id, MAX_REAL_CHECKPOINT_ID).await?;
+        assert!(actual_value_max_real.is_some(), "Value should be found at MAX_REAL_CHECKPOINT_ID after second batch insert");
+        let actual_value_max_real_unwrapped = actual_value_max_real.unwrap();
+        assert!(actual_value_max_real_unwrapped == checkpoints_5000_5600[599].value, "Value at MAX_REAL_CHECKPOINT_ID does not match last inserted value after second batch insert");
+        let actual_value_u64_max = self.store.db_select_one_double_checkpointed_object_value::<V>(table, obj_id, secondary_id, u64::MAX).await?;
+        assert!(actual_value_u64_max.is_some(), "Value should be found at u64::MAX after second batch insert");
+        let actual_value_u64_max_unwrapped = actual_value_u64_max.unwrap();
+        assert!(actual_value_u64_max_unwrapped == checkpoints_5000_5600[599].value, "Value at u64::MAX does not match last inserted value after second batch insert");
+        assert!(actual_value_u64_max_unwrapped == actual_value_max_real_unwrapped, "Value at u64::MAX does not match value at MAX_REAL_CHECKPOINT_ID after second batch insert");
+        Ok(())
+    }
+
+    pub async fn th_util_select_double_id_merkle_node_max_checkpoint(
+        &self,
+        table: &DoubleIdMerkleTableIdentifier,
+        tree_height: u8,
+        max_checkpoint_id: u64,
+        tree_id: u64,
+        tree_sub_id: u64,
+        key: SimpleMerkleNodeKey,
+    ) -> anyhow::Result<Hash> {
+        let result = self
+            .store
+            .db_select_double_id_merkle_node_max_checkpoint(table, max_checkpoint_id, tree_id, tree_sub_id, tree_height, key)
+            .await?;
+        let zero_hash_at_level = Hasher::get_zero_hash((tree_height - key.level) as usize);
+        if result == zero_hash_at_level {
+            if max_checkpoint_id > 0 {
+                let lower_checkpoint = max_checkpoint_id - 1;
+                let lower_result = self
+                    .store
+                    .db_select_double_id_merkle_node_max_checkpoint(table, lower_checkpoint, tree_id, tree_sub_id, tree_height, key)
+                    .await?;
+                assert!(lower_result == result, "Lower checkpoint result does not match when result is zero hash");
+            }
+        }
+
+        let multi_result = self
+            .store
+            .db_select_many_double_id_merkle_nodes_max_checkpoint(table, max_checkpoint_id, tree_id, tree_sub_id, tree_height, &[key, key])
+            .await?;
+
+        assert!(multi_result.len() == 2, "Multi select did not return correct number of results");
+        assert!(multi_result[0] == result, "Multi select first result does not match single select result");
+        assert!(
+            multi_result[1] == result,
+            "Multi select second result does not match single select result"
+        );
+
+        Ok(result)
+    }
+
+    pub async fn th_util_select_many_double_id_merkle_nodes_max_checkpoint(
+        &self,
+        table: &DoubleIdMerkleTableIdentifier,
+        tree_height: u8,
+        max_checkpoint_id: u64,
+        tree_id: u64,
+        tree_sub_id: u64,
+        keys: &[SimpleMerkleNodeKey],
+    ) -> anyhow::Result<Vec<Hash>> {
+        let result = self
+            .store
+            .db_select_many_double_id_merkle_nodes_max_checkpoint(table, max_checkpoint_id, tree_id, tree_sub_id, tree_height, keys)
+            .await?;
+        assert!(
+            result.len() == keys.len(),
+            "Number of retrieved values does not match number of requested values"
+        );
+        for (i, key) in keys.iter().enumerate() {
+            let single_result = self
+                .th_util_select_double_id_merkle_node_max_checkpoint(table, tree_height, max_checkpoint_id, tree_id, tree_sub_id, *key)
+                .await?;
+            assert!(result[i] == single_result, "Multi select result does not match single select result");
+        }
+        Ok(result)
+    }
+
+    pub async fn th_util_insert_double_id_merkle_node_max_checkpoint(
+        &self,
+        table: &DoubleIdMerkleTableIdentifier,
+        tree_height: u8,
+        checkpoint_id: u64,
+        tree_id: u64,
+        tree_sub_id: u64,
+        key: SimpleMerkleNodeKey,
+        hash: &Hash,
+    ) -> anyhow::Result<()> {
+        let prev_lower = if checkpoint_id > 0 {
+            self.th_util_select_double_id_merkle_node_max_checkpoint(table, tree_height, checkpoint_id - 1, tree_id, tree_sub_id, key)
+                .await?
+        } else {
+            Hasher::get_zero_hash((tree_height - key.level) as usize)
+        };
+
+        let higher = self
+            .th_util_select_double_id_merkle_node_max_checkpoint(table, tree_height, checkpoint_id + 1, tree_id, tree_sub_id, key)
+            .await?;
+
+        self.store
+            .db_insert_double_id_merkle_node(table, checkpoint_id, tree_id, tree_sub_id, key, hash)
+            .await?;
+
+        let after = self
+            .th_util_select_double_id_merkle_node_max_checkpoint(table, tree_height, checkpoint_id, tree_id, tree_sub_id, key)
+            .await?;
+
+        assert!(after == *hash, "Inserted hash does not match retrieved hash after insert");
+        if higher == Hasher::get_zero_hash((tree_height - key.level) as usize) {
+            let higher_new = self
+                .th_util_select_double_id_merkle_node_max_checkpoint(table, tree_height, checkpoint_id + 1, tree_id, tree_sub_id, key)
+                .await?;
+            assert!(higher_new == after, "Higher hash should match inserted hash");
+        }
+
+        if prev_lower != Hasher::get_zero_hash((tree_height - key.level) as usize) {
+            let prev_lower_again = self
+                .th_util_select_double_id_merkle_node_max_checkpoint(
+                    table,
+                    tree_height,
+                    if checkpoint_id > 0 { checkpoint_id - 1 } else { 0 },
+                    tree_id,
+                    tree_sub_id,
+                    key,
+                )
+                .await?;
+            assert!(prev_lower_again == prev_lower, "Previous lower hash should not change after insert");
+        }
+
+        let multi_result = self
+            .store
+            .db_select_many_double_id_merkle_nodes_max_checkpoint(table, checkpoint_id, tree_id, tree_sub_id, tree_height, &[key, key])
+            .await?;
+        assert!(multi_result.len() == 2, "Multi select did not return correct number of results");
+        assert!(multi_result[0] == after, "Multi select first result does not match single select result");
+        assert!(multi_result[1] == after, "Multi select second result does not match single select result");
+
+        Ok(())
+    }
+
+    pub async fn th_util_insert_many_double_id_merkle_node_max_checkpoint(
+        &self,
+        table: &DoubleIdMerkleTableIdentifier,
+        tree_height: u8,
+        checkpoint_id: u64,
+        tree_id: u64,
+        tree_sub_id: u64,
+        nodes: &[SimpleMerkleNode<Hash>],
+    ) -> anyhow::Result<()> {
+        let keys = nodes.iter().map(|n| n.key).collect::<Vec<SimpleMerkleNodeKey>>();
+        let mut prev_lowers = Vec::with_capacity(nodes.len());
+        let mut highers = Vec::with_capacity(nodes.len());
+        for key in keys.iter() {
+            let prev_lower = if checkpoint_id > 0 {
+                self.th_util_select_double_id_merkle_node_max_checkpoint(table, tree_height, checkpoint_id - 1, tree_id, tree_sub_id, *key)
+                    .await?
+            } else {
+                Hasher::get_zero_hash((tree_height - key.level) as usize)
+            };
+            prev_lowers.push(prev_lower);
+            let higher = self
+                .th_util_select_double_id_merkle_node_max_checkpoint(table, tree_height, checkpoint_id + 1, tree_id, tree_sub_id, *key)
+                .await?;
+            highers.push(higher);
+        }
+
+        self.store
+            .db_set_double_id_merkle_nodes_batch(table, checkpoint_id, tree_id, tree_sub_id, nodes)
+            .await?;
+        for (i, node) in nodes.iter().enumerate() {
+            let after = self
+                .th_util_select_double_id_merkle_node_max_checkpoint(table, tree_height, checkpoint_id, tree_id, tree_sub_id, node.key)
+                .await?;
+            assert!(after == node.value, "Inserted hash does not match retrieved hash after insert");
+
+            if highers[i] == Hasher::get_zero_hash((tree_height - node.key.level) as usize) {
+                let higher_new = self
+                    .th_util_select_double_id_merkle_node_max_checkpoint(table, tree_height, checkpoint_id + 1, tree_id, tree_sub_id, node.key)
+                    .await?;
+                assert!(higher_new == after, "Higher hash should match inserted hash");
+            }
+
+            if prev_lowers[i] != Hasher::get_zero_hash((tree_height - node.key.level) as usize) {
+                let prev_lower_again = self
+                    .th_util_select_double_id_merkle_node_max_checkpoint(
+                        table,
+                        tree_height,
+                        if checkpoint_id > 0 { checkpoint_id - 1 } else { 0 },
+                        tree_id,
+                        tree_sub_id,
+                        node.key,
+                    )
+                    .await?;
+                assert!(prev_lower_again == prev_lowers[i], "Previous lower hash should not change after insert");
+            }
+        }
+        let multi_result = self
+            .store
+            .db_select_many_double_id_merkle_nodes_max_checkpoint(table, checkpoint_id, tree_id, tree_sub_id, tree_height, &keys)
+            .await?;
+        assert!(multi_result.len() == nodes.len(), "Multi select did not return correct number of results");
+        for (i, node) in nodes.iter().enumerate() {
+            let after = self
+                .th_util_select_double_id_merkle_node_max_checkpoint(table, tree_height, checkpoint_id, tree_id, tree_sub_id, node.key)
+                .await?;
+            assert!(multi_result[i] == after, "Multi select result does not match single select result");
+        }
+        Ok(())
+    }
+
+    pub async fn th_test_insert_double_id_merkle_leaves_sub_tree_dmp(&self, table: &DoubleIdMerkleTableIdentifier, checkpoint_id: u64, tree_id: u64, tree_sub_id: u64, tree_height: u8, sub_root_key: &SimpleMerkleNodeKey, leaves: &[SimpleMerkleNode<Hash>]) -> anyhow::Result<Vec<DeltaMerkleProofCore<Hash>>> {
+        if leaves.is_empty() {
+            return Ok(vec![]);
+        }
+        assert!(sub_root_key.level <= tree_height, "Sub root level must be at or below the tree height level");
+
+        let first_leaf_level = leaves[0].key.level;
+        assert!(first_leaf_level <= tree_height, "Leaf keys must be at or below the tree height level");
+        assert!(first_leaf_level >= sub_root_key.level, "Leaf keys must be at or below the sub root level");
+
+        for leaf in leaves.iter() {
+            assert!(leaf.key.level == first_leaf_level, "All leaf keys must be at the same level");
+        }
+        let leaf_values = leaves.iter().map(|node| node.value).collect::<Vec<_>>();
+        let leaf_keys = leaves.iter().map(|node| node.key).collect::<Vec<_>>();
+        let dmps = db_helper_double_id_merkle_node_simple_set_leaves::<Hash, Hasher, DoubleIdMerkleTableIdentifier,_>(&self.store, table, checkpoint_id, tree_id, tree_sub_id, tree_height, 0, 9999, leaves).await?;
+        assert!(dmps.len() == leaves.len(), "Number of DeltaMerkleProofs must match number of inserted leaves");
+        let selected_leaf_values = self.store.db_select_many_double_id_merkle_nodes_max_checkpoint(table, checkpoint_id, tree_id, tree_sub_id, tree_height, &leaf_keys).await?;
+        assert!(selected_leaf_values.len() == leaf_values.len(), "Selected leaf values length must match inserted leaf values length");
+        for (i, value) in selected_leaf_values.iter().enumerate() {
+            assert!(value == &leaf_values[i], "Selected leaf value must match inserted leaf value");
+        }
+        for dmp in dmps.iter() {
+            assert!(dmp.verify::<Hasher>(), "DeltaMerkleProof must verify correctly");
+        }
+
+        for i in 1..dmps.len() {
+            assert!(dmps[i-1].new_root == dmps[i].old_root, "Consecutive DeltaMerkleProofs must be connected back to back, ie. new_root of previous must equal old_root of next"); 
+        }
+
+        Ok(dmps)
+    }
+
+    pub async fn th_test_double_id_merkle_nodes_basic(&self, table: &DoubleIdMerkleTableIdentifier, tree_id: u64, tree_sub_id: u64, tree_height: u8) -> anyhow::Result<()> {
+
+        let first_checkpoint_id = 1u64;
+        let second_checkpoint_id = 2u64;
+        let third_checkpoint_id = 3u64;
+        let fourth_checkpoint_id = 999u64;
+        let last_checkpoint_id = 12874892u64;
+
+        let max_leaves_in_tree = 1u64 << tree_height;
+        let num_leaves_to_insert = 16u64.min(max_leaves_in_tree);
+        let num_leaves_to_insert_usize = num_leaves_to_insert as usize;
+        let root_key = SimpleMerkleNodeKey::new_root();
+        let first_batch = rand_leaves_for_subtree::<Hash>(&root_key, tree_height, num_leaves_to_insert_usize);
+
+        let dmps_0 = self.th_test_insert_double_id_merkle_leaves_sub_tree_dmp(table, first_checkpoint_id, tree_id, tree_sub_id, tree_height, &SimpleMerkleNodeKey::new_root(), &first_batch).await?;
+        assert!(dmps_0.len() == first_batch.len(), "Number of DeltaMerkleProofs must match number of inserted leaves at first checkpoint");
+
+        let second_batch = rand_leaves_for_subtree::<Hash>(&root_key, tree_height, num_leaves_to_insert_usize);
+        let dmps_1 = self.th_test_insert_double_id_merkle_leaves_sub_tree_dmp(table, second_checkpoint_id, tree_id, tree_sub_id, tree_height, &SimpleMerkleNodeKey::new_root(), &second_batch).await?;
+        assert!(dmps_1.len() == second_batch.len(), "Number of DeltaMerkleProofs must match number of inserted leaves at second checkpoint");
+
+        let first_second_batch_combined_halves = [
+            first_batch[0..(num_leaves_to_insert_usize/2)].to_vec(),
+            second_batch[(num_leaves_to_insert_usize/2)..num_leaves_to_insert_usize].to_vec()
+        ].concat();
+        let third_batch_unmodified = [
+            first_batch[(num_leaves_to_insert_usize/2)..num_leaves_to_insert_usize].to_vec(),
+            second_batch[0..(num_leaves_to_insert_usize/2)].to_vec()
+        ].concat();
+        let third_batch_new_leaves = rand_leaves_for_subtree::<Hash>(&root_key, tree_height, num_leaves_to_insert_usize);
+        let first_second_batch_leaves_at_third_checkpoint = first_second_batch_combined_halves.iter().map(|x|{
+            SimpleMerkleNode {
+                key: x.key,
+                value: Hash::qp_rand_gen(),
+            }
+        }).collect::<Vec<_>>();
+        let third_batch = [first_second_batch_leaves_at_third_checkpoint, third_batch_new_leaves.clone()].concat();
+        let dmps_2 = self.th_test_insert_double_id_merkle_leaves_sub_tree_dmp(table, third_checkpoint_id, tree_id, tree_sub_id, tree_height, &SimpleMerkleNodeKey::new_root(), &third_batch).await?;
+        assert!(dmps_2.len() == third_batch.len(), "Number of DeltaMerkleProofs must match number of inserted leaves at third checkpoint");
+
+        let b12_unmodified_keys = third_batch_unmodified.iter().map(|x| x.key).collect::<Vec<_>>();
+        let b12_unmodified_values = third_batch_unmodified.iter().map(|x| x.value).collect::<Vec<_>>();
+        let selected_unmodified_values = self.store.db_select_many_double_id_merkle_nodes_max_checkpoint(table, third_checkpoint_id, tree_id, tree_sub_id, tree_height, &b12_unmodified_keys).await?;
+        assert!(selected_unmodified_values.len() == b12_unmodified_values.len(), "Selected unmodified values length must match unmodified values length at third checkpoint");
+        for (i, value) in selected_unmodified_values.iter().enumerate() {
+            assert!(value == &b12_unmodified_values[i], "Selected unmodified value must match unmodified value at third checkpoint");
+        }
+
+        let b3_modified_keys = third_batch_new_leaves.iter().map(|x| x.key).collect::<Vec<_>>();
+        let b3_modified_values = third_batch_new_leaves.iter().map(|x| x.value).collect::<Vec<_>>();
+        let selected_modified_values = self.store.db_select_many_double_id_merkle_nodes_max_checkpoint(table, third_checkpoint_id, tree_id, tree_sub_id, tree_height, &b3_modified_keys).await?;
+        assert!(selected_modified_values.len() == b3_modified_values.len(), "Selected modified values length must match modified values length at third checkpoint");
+        for (i, value) in selected_modified_values.iter().enumerate() {
+            assert!(value == &b3_modified_values[i], "Selected modified value must match modified value at third checkpoint");
+        }
+
+        let fourth_batch = rand_leaves_for_subtree::<Hash>(&root_key, tree_height, num_leaves_to_insert_usize);
+        let dmps_3 = self.th_test_insert_double_id_merkle_leaves_sub_tree_dmp(table, fourth_checkpoint_id, tree_id, tree_sub_id, tree_height, &SimpleMerkleNodeKey::new_root(), &fourth_batch).await?;
+        assert!(dmps_3.len() == fourth_batch.len(), "Number of DeltaMerkleProofs must match number of inserted leaves at fourth checkpoint");
+
+        let last_batch = rand_leaves_for_subtree::<Hash>(&root_key, tree_height, num_leaves_to_insert_usize);
+        let dmps_4 = self.th_test_insert_double_id_merkle_leaves_sub_tree_dmp(table, last_checkpoint_id, tree_id, tree_sub_id, tree_height, &SimpleMerkleNodeKey::new_root(), &last_batch).await?;
+        assert!(dmps_4.len() == last_batch.len(), "Number of DeltaMerkleProofs must match number of inserted leaves at last checkpoint");
+
+        let keys_to_check: Vec<_> = first_batch.iter().chain(second_batch.iter()).chain(third_batch.iter()).chain(fourth_batch.iter()).chain(last_batch.iter()).map(|x| x.key)
+            .into_iter()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+
+        for k in keys_to_check {
+            let mp = db_helper_select_double_id_merkle_proof_max_checkpoint::<Hash, Hasher, _, _>(&self.store, table, first_checkpoint_id+1, tree_id, tree_sub_id, tree_height, &k). await?;
+            assert!(mp.verify::<Hasher>(), "MerkleProof must verify correctly for key {:?}", k);
+            let mp = db_helper_select_double_id_merkle_proof_max_checkpoint::<Hash, Hasher, _, _>(&self.store, table, second_checkpoint_id, tree_id, tree_sub_id, tree_height, &k). await?;
+            assert!(mp.verify::<Hasher>(), "MerkleProof must verify correctly for key {:?}", k);
+            let mp = db_helper_select_double_id_merkle_proof_max_checkpoint::<Hash, Hasher, _, _>(&self.store, table, third_checkpoint_id, tree_id, tree_sub_id, tree_height, &k). await?;
+            assert!(mp.verify::<Hasher>(), "MerkleProof must verify correctly for key {:?}", k);
+            let mp = db_helper_select_double_id_merkle_proof_max_checkpoint::<Hash, Hasher, _, _>(&self.store, table, fourth_checkpoint_id, tree_id, tree_sub_id, tree_height, &k). await?;
+            assert!(mp.verify::<Hasher>(), "MerkleProof must verify correctly for key {:?}", k);
+            let mp = db_helper_select_double_id_merkle_proof_max_checkpoint::<Hash, Hasher, _, _>(&self.store, table, last_checkpoint_id, tree_id, tree_sub_id, tree_height, &k). await?;
+            assert!(mp.verify::<Hasher>(), "MerkleProof must verify correctly for key {:?}", k);
+            let mp = db_helper_select_double_id_merkle_proof_max_checkpoint::<Hash, Hasher, _, _>(&self.store, table, last_checkpoint_id+100, tree_id, tree_sub_id, tree_height, &k). await?;
+            assert!(mp.verify::<Hasher>(), "MerkleProof must verify correctly for key {:?}", k);
+        }
+        Ok(())
+    }
+
+    pub async fn th_util_select_zero_id_merkle_node_max_checkpoint(
+        &self,
+        table: &ZeroIdMerkleTableIdentifier,
+        max_checkpoint_id: u64,
+        key: &SimpleMerkleNodeKey,
+    ) -> anyhow::Result<Hash> {
+        let result = self
+            .store
+            .db_select_zero_id_merkle_node_max_checkpoint(table, max_checkpoint_id, key)
+            .await?;
+        let zero_hash_at_level = Hasher::get_zero_hash(key.level as usize);
+        if result == zero_hash_at_level {
+            if max_checkpoint_id > 0 {
+                let lower_checkpoint = max_checkpoint_id - 1;
+                let lower_result = self
+                    .store
+                    .db_select_zero_id_merkle_node_max_checkpoint(table, lower_checkpoint, key)
+                    .await?;
+                assert!(lower_result == result, "Lower checkpoint result does not match when result is zero hash");
+            }
+        }
+
+        let multi_result = self
+            .store
+            .db_select_many_zero_id_merkle_nodes_max_checkpoint(table, max_checkpoint_id, &[key.clone(), key.clone()])
+            .await?;
+
+        assert!(multi_result.len() == 2, "Multi select did not return correct number of results");
+        assert!(multi_result[0] == result, "Multi select first result does not match single select result");
+        assert!(
+            multi_result[1] == result,
+            "Multi select second result does not match single select result"
+        );
+
+        Ok(result)
+    }
+
+    pub async fn th_util_select_many_zero_id_merkle_nodes_max_checkpoint(
+        &self,
+        table: &ZeroIdMerkleTableIdentifier,
+        max_checkpoint_id: u64,
+        keys: &[SimpleMerkleNodeKey],
+    ) -> anyhow::Result<Vec<Hash>> {
+        let result = self
+            .store
+            .db_select_many_zero_id_merkle_nodes_max_checkpoint(table, max_checkpoint_id, keys)
+            .await?;
+        assert!(
+            result.len() == keys.len(),
+            "Number of retrieved values does not match number of requested values"
+        );
+        for (i, key) in keys.iter().enumerate() {
+            let single_result = self
+                .th_util_select_zero_id_merkle_node_max_checkpoint(table, max_checkpoint_id, key)
+                .await?;
+            assert!(result[i] == single_result, "Multi select result does not match single select result");
+        }
+        Ok(result)
+    }
+
+    pub async fn th_util_insert_zero_id_merkle_node_max_checkpoint(
+        &self,
+        table: &ZeroIdMerkleTableIdentifier,
+        checkpoint_id: u64,
+        key: &SimpleMerkleNodeKey,
+        hash: &Hash,
+    ) -> anyhow::Result<()> {
+        let prev_lower = if checkpoint_id > 0 {
+            self.th_util_select_zero_id_merkle_node_max_checkpoint(table, checkpoint_id - 1, key)
+                .await?
+        } else {
+            Hasher::get_zero_hash(key.level as usize)
+        };
+
+        let higher = self
+            .th_util_select_zero_id_merkle_node_max_checkpoint(table, checkpoint_id + 1, key)
+            .await?;
+
+        self.store
+            .db_insert_zero_id_merkle_node(table, checkpoint_id, key, hash)
+            .await?;
+
+        let after = self
+            .th_util_select_zero_id_merkle_node_max_checkpoint(table, checkpoint_id, key)
+            .await?;
+
+        assert!(after == *hash, "Inserted hash does not match retrieved hash after insert");
+        if higher == Hasher::get_zero_hash(key.level as usize) {
+            let higher_new = self
+                .th_util_select_zero_id_merkle_node_max_checkpoint(table, checkpoint_id + 1, key)
+                .await?;
+            assert!(higher_new == after, "Higher hash should match inserted hash");
+        }
+
+        if prev_lower != Hasher::get_zero_hash(key.level as usize) {
+            let prev_lower_again = self
+                .th_util_select_zero_id_merkle_node_max_checkpoint(
+                    table,
+                    if checkpoint_id > 0 { checkpoint_id - 1 } else { 0 },
+                    key,
+                )
+                .await?;
+            assert!(prev_lower_again == prev_lower, "Previous lower hash should not change after insert");
+        }
+
+        let multi_result = self
+            .store
+            .db_select_many_zero_id_merkle_nodes_max_checkpoint(table, checkpoint_id, &[key.clone(), key.clone()])
+            .await?;
+        assert!(multi_result.len() == 2, "Multi select did not return correct number of results");
+        assert!(multi_result[0] == after, "Multi select first result does not match single select result");
+        assert!(multi_result[1] == after, "Multi select second result does not match single select result");
+
+        Ok(())
+    }
+
+    pub async fn th_util_insert_many_zero_id_merkle_node_max_checkpoint(
+        &self,
+        table: &ZeroIdMerkleTableIdentifier,
+        checkpoint_id: u64,
+        nodes: &[SimpleMerkleNode<Hash>],
+    ) -> anyhow::Result<()> {
+        let keys = nodes.iter().map(|n| n.key.clone()).collect::<Vec<SimpleMerkleNodeKey>>();
+        let mut prev_lowers = Vec::with_capacity(nodes.len());
+        let mut highers = Vec::with_capacity(nodes.len());
+        for key in keys.iter() {
+            let prev_lower = if checkpoint_id > 0 {
+                self.th_util_select_zero_id_merkle_node_max_checkpoint(table, checkpoint_id - 1, key)
+                    .await?
+            } else {
+                Hasher::get_zero_hash(key.level as usize)
+            };
+            prev_lowers.push(prev_lower);
+            let higher = self
+                .th_util_select_zero_id_merkle_node_max_checkpoint(table, checkpoint_id + 1, key)
+                .await?;
+            highers.push(higher);
+        }
+
+        self.store
+            .db_set_zero_id_merkle_nodes_batch(table, checkpoint_id, nodes)
+            .await?;
+        for (i, node) in nodes.iter().enumerate() {
+            let after = self
+                .th_util_select_zero_id_merkle_node_max_checkpoint(table, checkpoint_id, &node.key)
+                .await?;
+            assert!(after == node.value, "Inserted hash does not match retrieved hash after insert");
+
+            if highers[i] == Hasher::get_zero_hash(node.key.level as usize) {
+                let higher_new = self
+                    .th_util_select_zero_id_merkle_node_max_checkpoint(table, checkpoint_id + 1, &node.key)
+                    .await?;
+                assert!(higher_new == after, "Higher hash should match inserted hash");
+            }
+
+            if prev_lowers[i] != Hasher::get_zero_hash(node.key.level as usize) {
+                let prev_lower_again = self
+                    .th_util_select_zero_id_merkle_node_max_checkpoint(
+                        table,
+                        if checkpoint_id > 0 { checkpoint_id - 1 } else { 0 },
+                        &node.key,
+                    )
+                    .await?;
+                assert!(prev_lower_again == prev_lowers[i], "Previous lower hash should not change after insert");
+            }
+        }
+        let multi_result = self
+            .store
+            .db_select_many_zero_id_merkle_nodes_max_checkpoint(table, checkpoint_id, &keys)
+            .await?;
+        assert!(multi_result.len() == nodes.len(), "Multi select did not return correct number of results");
+        for (i, node) in nodes.iter().enumerate() {
+            let after = self
+                .th_util_select_zero_id_merkle_node_max_checkpoint(table, checkpoint_id, &node.key)
+                .await?;
+            assert!(multi_result[i] == after, "Multi select result does not match single select result");
+        }
+        Ok(())
+    }
+
+    pub async fn th_test_insert_zero_id_merkle_leaves_sub_tree_dmp(&self, table: &ZeroIdMerkleTableIdentifier, checkpoint_id: u64, sub_root_key: &SimpleMerkleNodeKey, leaves: &[SimpleMerkleNode<Hash>]) -> anyhow::Result<Vec<DeltaMerkleProofCore<Hash>>> {
+        if leaves.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let first_leaf_level = leaves[0].key.level;
+        for leaf in leaves.iter() {
+            assert!(leaf.key.level == first_leaf_level, "All leaf keys must be at the same level");
+        }
+        let leaf_values = leaves.iter().map(|node| node.value).collect::<Vec<_>>();
+        let leaf_keys = leaves.iter().map(|node| node.key.clone()).collect::<Vec<_>>();
+        let dmps = db_helper_zero_id_merkle_node_simple_set_leaves::<Hash, Hasher, ZeroIdMerkleTableIdentifier,_>(&self.store, table, checkpoint_id, 0, 9999, leaves).await?;
+        assert!(dmps.len() == leaves.len(), "Number of DeltaMerkleProofs must match number of inserted leaves");
+        let selected_leaf_values = self.store.db_select_many_zero_id_merkle_nodes_max_checkpoint(table, checkpoint_id, &leaf_keys).await?;
+        assert!(selected_leaf_values.len() == leaf_values.len(), "Selected leaf values length must match inserted leaf values length");
+        for (i, value) in selected_leaf_values.iter().enumerate() {
+            assert!(value == &leaf_values[i], "Selected leaf value must match inserted leaf value");
+        }
+        for dmp in dmps.iter() {
+            assert!(dmp.verify::<Hasher>(), "DeltaMerkleProof must verify correctly");
+        }
+
+        for i in 1..dmps.len() {
+            assert!(dmps[i-1].new_root == dmps[i].old_root, "Consecutive DeltaMerkleProofs must be connected back to back, ie. new_root of previous must equal old_root of next"); 
+        }
+
+        Ok(dmps)
+    }
+
+    pub async fn th_test_zero_id_merkle_nodes_basic(&self, table: &ZeroIdMerkleTableIdentifier, tree_height: u8) -> anyhow::Result<()> {
+
+        let first_checkpoint_id = 1u64;
+        let second_checkpoint_id = 2u64;
+        let third_checkpoint_id = 3u64;
+        let fourth_checkpoint_id = 999u64;
+        let last_checkpoint_id = 12874892u64;
+
+        let max_leaves_in_tree = 1u64 << tree_height;
+        let num_leaves_to_insert = 16u64.min(max_leaves_in_tree);
+        let num_leaves_to_insert_usize = num_leaves_to_insert as usize;
+        let root_key = SimpleMerkleNodeKey::new_root();
+        let first_batch = rand_leaves_for_subtree::<Hash>(&root_key, tree_height, num_leaves_to_insert_usize);
+
+        let dmps_0 = self.th_test_insert_zero_id_merkle_leaves_sub_tree_dmp(table, first_checkpoint_id, &SimpleMerkleNodeKey::new_root(), &first_batch).await?;
+        assert!(dmps_0.len() == first_batch.len(), "Number of DeltaMerkleProofs must match number of inserted leaves at first checkpoint");
+
+        let second_batch = rand_leaves_for_subtree::<Hash>(&root_key, tree_height, num_leaves_to_insert_usize);
+        let dmps_1 = self.th_test_insert_zero_id_merkle_leaves_sub_tree_dmp(table, second_checkpoint_id, &SimpleMerkleNodeKey::new_root(), &second_batch).await?;
+        assert!(dmps_1.len() == second_batch.len(), "Number of DeltaMerkleProofs must match number of inserted leaves at second checkpoint");
+
+        let first_second_batch_combined_halves = [
+            first_batch[0..(num_leaves_to_insert_usize/2)].to_vec(),
+            second_batch[(num_leaves_to_insert_usize/2)..num_leaves_to_insert_usize].to_vec()
+        ].concat();
+        let third_batch_unmodified = [
+            first_batch[(num_leaves_to_insert_usize/2)..num_leaves_to_insert_usize].to_vec(),
+            second_batch[0..(num_leaves_to_insert_usize/2)].to_vec()
+        ].concat();
+        let third_batch_new_leaves = rand_leaves_for_subtree::<Hash>(&root_key, tree_height, num_leaves_to_insert_usize);
+        let first_second_batch_leaves_at_third_checkpoint = first_second_batch_combined_halves.iter().map(|x|{
+            SimpleMerkleNode {
+                key: x.key,
+                value: Hash::qp_rand_gen(),
+            }
+        }).collect::<Vec<_>>();
+        let third_batch = [first_second_batch_leaves_at_third_checkpoint, third_batch_new_leaves.clone()].concat();
+        let dmps_2 = self.th_test_insert_zero_id_merkle_leaves_sub_tree_dmp(table, third_checkpoint_id, &SimpleMerkleNodeKey::new_root(), &third_batch).await?;
+        assert!(dmps_2.len() == third_batch.len(), "Number of DeltaMerkleProofs must match number of inserted leaves at third checkpoint");
+
+        let b12_unmodified_keys = third_batch_unmodified.iter().map(|x| x.key.clone()).collect::<Vec<_>>();
+        let b12_unmodified_values = third_batch_unmodified.iter().map(|x| x.value).collect::<Vec<_>>();
+        let selected_unmodified_values = self.store.db_select_many_zero_id_merkle_nodes_max_checkpoint(table, third_checkpoint_id, &b12_unmodified_keys).await?;
+        assert!(selected_unmodified_values.len() == b12_unmodified_values.len(), "Selected unmodified values length must match unmodified values length at third checkpoint");
+        for (i, value) in selected_unmodified_values.iter().enumerate() {
+            assert!(value == &b12_unmodified_values[i], "Selected unmodified value must match unmodified value at third checkpoint");
+        }
+
+        let b3_modified_keys = third_batch_new_leaves.iter().map(|x| x.key.clone()).collect::<Vec<_>>();
+        let b3_modified_values = third_batch_new_leaves.iter().map(|x| x.value).collect::<Vec<_>>();
+        let selected_modified_values = self.store.db_select_many_zero_id_merkle_nodes_max_checkpoint(table, third_checkpoint_id, &b3_modified_keys).await?;
+        assert!(selected_modified_values.len() == b3_modified_values.len(), "Selected modified values length must match modified values length at third checkpoint");
+        for (i, value) in selected_modified_values.iter().enumerate() {
+            assert!(value == &b3_modified_values[i], "Selected modified value must match modified value at third checkpoint");
+        }
+
+        let fourth_batch = rand_leaves_for_subtree::<Hash>(&root_key, tree_height, num_leaves_to_insert_usize);
+        let dmps_3 = self.th_test_insert_zero_id_merkle_leaves_sub_tree_dmp(table, fourth_checkpoint_id, &SimpleMerkleNodeKey::new_root(), &fourth_batch).await?;
+        assert!(dmps_3.len() == fourth_batch.len(), "Number of DeltaMerkleProofs must match number of inserted leaves at fourth checkpoint");
+
+        let last_batch = rand_leaves_for_subtree::<Hash>(&root_key, tree_height, num_leaves_to_insert_usize);
+        let dmps_4 = self.th_test_insert_zero_id_merkle_leaves_sub_tree_dmp(table, last_checkpoint_id, &SimpleMerkleNodeKey::new_root(), &last_batch).await?;
+        assert!(dmps_4.len() == last_batch.len(), "Number of DeltaMerkleProofs must match number of inserted leaves at last checkpoint");
+
+        let keys_to_check: Vec<_> = first_batch.iter().chain(second_batch.iter()).chain(third_batch.iter()).chain(fourth_batch.iter()).chain(last_batch.iter()).map(|x| x.key.clone())
+            .into_iter()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+
+        for k in keys_to_check {
+            let mp = db_helper_select_zero_id_merkle_proof_max_checkpoint::<Hash, Hasher, _, _>(&self.store, table, first_checkpoint_id+1, &k). await?;
+            assert!(mp.verify::<Hasher>(), "MerkleProof must verify correctly for key {:?}", k);
+            let mp = db_helper_select_zero_id_merkle_proof_max_checkpoint::<Hash, Hasher, _, _>(&self.store, table, second_checkpoint_id, &k). await?;
+            assert!(mp.verify::<Hasher>(), "MerkleProof must verify correctly for key {:?}", k);
+            let mp = db_helper_select_zero_id_merkle_proof_max_checkpoint::<Hash, Hasher, _, _>(&self.store, table, third_checkpoint_id, &k). await?;
+            assert!(mp.verify::<Hasher>(), "MerkleProof must verify correctly for key {:?}", k);
+            let mp = db_helper_select_zero_id_merkle_proof_max_checkpoint::<Hash, Hasher, _, _>(&self.store, table, fourth_checkpoint_id, &k). await?;
+            assert!(mp.verify::<Hasher>(), "MerkleProof must verify correctly for key {:?}", k);
+            let mp = db_helper_select_zero_id_merkle_proof_max_checkpoint::<Hash, Hasher, _, _>(&self.store, table, last_checkpoint_id, &k). await?;
+            assert!(mp.verify::<Hasher>(), "MerkleProof must verify correctly for key {:?}", k);
+            let mp = db_helper_select_zero_id_merkle_proof_max_checkpoint::<Hash, Hasher, _, _>(&self.store, table, last_checkpoint_id+100, &k). await?;
+            assert!(mp.verify::<Hasher>(), "MerkleProof must verify correctly for key {:?}", k);
+        }
+        Ok(())
+    }
+}
 #[pderive::serialize_copy_f_hash]
 pub struct PQEDUserLeaf<F: QFelt, Hash: QHashBase> {
     pub public_key: Hash,
@@ -1776,21 +3523,41 @@ impl SimpleStoreEx {
         })
     }
 
-    pub async fn basic_test(&self) -> anyhow::Result<()> {
-        self.store.th_test_u128_u64_pairs_table(&self.store.u64_u128_bi_directional_mapping_table_a).await?;
-        self.store.th_test_u64_table(&self.store.u64_table_a).await?;
+    pub async fn basic_test_1(&self) -> anyhow::Result<()> {
+        println!("starting basic_test_1");
+
+        // u128 <-> u64 bi-directional mapping tests
+        self.store.th_test_u128_u64_pairs_table_1(&self.store.u64_u128_bi_directional_mapping_table_a).await?;
+
+        // u64 value table tests
+        self.store.th_test_u64_table_1(&self.store.u64_table_a).await?;
+
+        // single checkpointed object id tests
+        self.store.th_test_single_checkpointed_object_1_full_history_1::<ExObjSingleIdTableAValue>(&self.store.obj_single_id_table_a).await?;
+        // ensure that we can have multiple different objects in the same table and they do not interfere
+        self.store.th_test_single_checkpointed_object_1_full_history_1::<ExObjSingleIdTableAValue>(&self.store.obj_single_id_table_a).await?;
+        self.store.th_test_single_checkpointed_object_1_full_history_1::<ExObjSingleIdTableAValue>(&self.store.obj_single_id_table_b).await?;
+
+
+        self.store.th_test_single_checkpointed_object_1_full_history_2::<ExObjSingleIdTableAValue>(&self.store.obj_single_id_table_a).await?;
+        self.store.th_test_single_checkpointed_object_1_full_history_3::<ExObjSingleIdTableAValue>(&self.store.obj_single_id_table_a).await?;
+        self.store.th_test_single_checkpointed_object_1_full_history_2::<ExObjSingleIdTableAValue>(&self.store.obj_single_id_table_b).await?;
+        self.store.th_test_single_checkpointed_object_1_full_history_3::<ExObjSingleIdTableAValue>(&self.store.obj_single_id_table_b).await?;
+        self.store.th_test_single_id_merkle_nodes_basic(&self.store.merkle_node_single_id_table_a, 1337, EX_SINGLE_ID_TREE_A_HEIGHT as u8).await?;
+
         Ok(())
     }
 }
 
 
 #[tokio::test]
-async fn simple_store_basic_test() -> anyhow::Result<()> {
+async fn simple_store_basic_test_1() -> anyhow::Result<()> {
     let key_space = format!("psy_node_scylla_test_ex1_{}", rand::random::<u64>());
     let scylla_db = ScyllaCoreStore::<ExHash, ExHasher>::new(0, 0, key_space, &[
         "127.0.0.1:9042".to_string()
     ]).await?;
     let simple_store = SimpleStoreEx::setup(Arc::new(scylla_db)).await?;
-    simple_store.basic_test().await?;
+    println!("setup simple store");
+    simple_store.basic_test_1().await?;
     Ok(())
 }
