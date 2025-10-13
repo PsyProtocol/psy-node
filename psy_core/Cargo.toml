@@ -29,7 +29,9 @@ rand = { workspace = true }
 auto_impl = { workspace = true }
 strum = { workspace = true }
 strum_macros = { workspace = true }
+ts-rs = { workspace = true }
 
 # start local packages
 parth_core = { workspace = true }
 pser = { workspace = true }
+pderive = { workspace = true }

@@ -5,7 +5,7 @@ pub const PM_JOBS_COMPLETED_STATS_SIZE: usize = 3;
 
 #[pderive::serialize_copy_f_ts]
 #[ts(export, concrete(F = parth_core::PF), rename = "PMJobsCompletedStats")]
-pub struct PPMJobsCompletedStats<F: QFelt> {
+pub struct PPMJobsCompletedStats<F> {
     pub deploy_contracts_completed: F,
     pub register_users_completed: F, 
     pub gutas_completed: F,

@@ -1,9 +1,9 @@
-use parth_core::{crypto::hash::traits::{FieldQHasher, QFieldHashable}, data::serializable::QPDSerializable, felt::{QFelt, QFelt64, QFeltSized, ToQFelts}, impl_qpd_serialize_params, protocol::core_types::{QFHashBase, QHashBase}};
+use parth_core::{crypto::hash::traits::{FieldQHasher, QFieldHashable}, data::serializable::QPDSerializable, felt::{QFelt, QFelt64, QFeltSized, ToQFelts, ZeroableFelt}, impl_qpd_serialize_params, protocol::core_types::{QFHashBase, QHashBase}};
 use pser::{QBytesDeserialize, QBytesSerialize};
 
 #[pderive::serialize_copy_f_hash_ts]
 #[ts(export, concrete(F = parth_core::PF, Hash = parth_core::PHash), rename = "QEDUserLeaf")]
-pub struct PQEDUserLeaf<F: QFelt, Hash: QHashBase> {
+pub struct PQEDUserLeaf<F, Hash> {
     pub public_key: Hash,
     pub user_state_tree_root: Hash,
     pub balance: F,
@@ -12,7 +12,7 @@ pub struct PQEDUserLeaf<F: QFelt, Hash: QHashBase> {
     pub event_index: F,
     pub user_id: F,
 }
-impl<F: QFelt, Hash: QHashBase> PQEDUserLeaf<F, Hash> {
+impl<F: ZeroableFelt, Hash> PQEDUserLeaf<F, Hash> {
     pub fn new_user_default(user_id: F, public_key: Hash, user_state_tree_root: Hash) -> Self {
         Self {
             public_key,

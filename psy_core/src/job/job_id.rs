@@ -1,11 +1,13 @@
-
+// fix new_two_to_one_proof_id to implement all the proof types and also use a more elegant syntax... there must be something better than those aweful match if else...
 use hex::FromHexError;
-use parth_core::{data::{hash::merkle_node_key::{SimpleMerkleNodeKey, JOB_ID_EMPTY_REWARD_PATH_INFO}, queue::queue_key::PCoreQueueItemBase, serializable::{QPDSerializable, QPDSerializableFixed}}, QJobIdBase, QJobIdSerialized, QProvingJobDataIDWithRewardPath};
+use parth_core::{data::{hash::merkle_node_key::{SimpleMerkleNodeKey, JOB_ID_EMPTY_REWARD_PATH_INFO}, queue::queue_key::PCoreQueueItemBase, serializable::{QPDSerializable, QPDSerializableFixed}}, QJobIdBase, QJobIdCreatable, QJobIdSerialized, QProvingJobDataIDWithRewardPath};
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use serde_with::serde_as;
 use strum_macros::{Display, AsRefStr};
-
+use ts_rs::TS;
+#[derive(TS)]
+#[ts(export)]
 #[derive(
     Serialize_repr,
     Deserialize_repr,
@@ -74,6 +76,8 @@ pub enum QCircuitCommonGatesType {
     E = 4,
     F = 5,
 }
+#[derive(TS)]
+#[ts(export)]
 #[derive(Serialize_repr, Deserialize_repr, PartialEq, Debug, Clone, Copy, Eq, Hash, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum QJobTopic {
@@ -83,6 +87,9 @@ pub enum QJobTopic {
     NotifyCoordinatorComplete = 3,
     NotifyRealmComplete = 4,
     AggregateJobs = 5,
+
+    Invalid = 254,
+    Unknown = 255,
 }
 impl QJobTopic {
     pub fn to_u8(&self) -> u8 {
@@ -105,11 +112,14 @@ impl TryFrom<u8> for QJobTopic {
             3 => Ok(QJobTopic::NotifyCoordinatorComplete),
             4 => Ok(QJobTopic::NotifyRealmComplete),
             5 => Ok(QJobTopic::AggregateJobs),
+            254 => Ok(QJobTopic::Invalid),
+            255 => Ok(QJobTopic::Unknown),
             _ => Err(anyhow::format_err!("Invalid QJobTopic value: {}", value)),
         }
     }
 }
-
+#[derive(TS)]
+#[ts(export)]
 #[derive(Serialize_repr, Deserialize_repr, PartialEq, Debug, Clone, Copy, Eq, Hash, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum ProvingJobDataType {
@@ -140,7 +150,8 @@ impl From<ProvingJobDataType> for u8 {
         value as u8
     }
 }
-
+#[derive(TS)]
+#[ts(export)]
 #[derive(Serialize_repr, Deserialize_repr, PartialEq, Debug, Clone, Copy, Eq, Hash, PartialOrd, Ord, Display, AsRefStr)]
 #[repr(u8)]
 pub enum ProvingJobCircuitType {
@@ -205,6 +216,7 @@ pub enum ProvingJobCircuitType {
     TypeD = 227,
     TypeE = 228,
     TypeF = 229,
+    Invalid = 254,
     Unknown = 255,
 }
 
@@ -332,6 +344,7 @@ impl TryFrom<u8> for ProvingJobCircuitType {
             227 => Ok(ProvingJobCircuitType::TypeD),
             228 => Ok(ProvingJobCircuitType::TypeE),
             229 => Ok(ProvingJobCircuitType::TypeF),
+            254 => Ok(ProvingJobCircuitType::Invalid),
             255 => Ok(ProvingJobCircuitType::Unknown),
             _ => Err(anyhow::format_err!("Invalid ProvingJobCircuitType value: {}", value)),
         }
@@ -359,6 +372,8 @@ impl QProvingJobDataIDSerializedWrapped {
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Debug, Clone, Copy, Eq, Hash, PartialOrd, Ord)]
+#[derive(TS)]
+#[ts(export)]
 pub struct QProvingJobDataID {
     pub topic: QJobTopic,
     pub goal_id: u64,
@@ -877,6 +892,27 @@ impl QProvingJobDataID {
     }
 }
 
+
+impl QProvingJobDataID {
+
+    fn is_user_guta_proof_circuit_type_or_end_cap(&self) -> bool {
+        matches!(
+            self.circuit_type,
+            ProvingJobCircuitType::GUTATwoEndCap
+                | ProvingJobCircuitType::GUTATwoGUTA
+                | ProvingJobCircuitType::GUTALeftEndCapRightGUTA
+                | ProvingJobCircuitType::GUTALeftGUTARightEndCap
+                | ProvingJobCircuitType::GUTASingleEndCap
+                | ProvingJobCircuitType::GUTARegisterUsers
+                | ProvingJobCircuitType::GUTAVerifyToCap
+                | ProvingJobCircuitType::GUTAOnlyRegisterUsers
+                | ProvingJobCircuitType::GUTANoChange
+                | ProvingJobCircuitType::GUTATwoGUTAWithCheckpointUpgrade
+                | ProvingJobCircuitType::GUTAVerifyToCapWithCheckpointUpgrade
+                | ProvingJobCircuitType::UserEndCap
+        )
+    }
+}
 pub trait QWorkerModeFilter {
     fn can_process_job(&self, job_id: QProvingJobDataID) -> bool;
 }
@@ -967,11 +1003,41 @@ impl QJobIdBase for QProvingJobDataID{
         self.get_sub_group_counter_id()
     }
 
-    fn get_checkpoint_id(&self) -> u64 {
-        self.goal_id
+
+    fn is_end_cap_proof_circuit_type(&self) -> bool {
+        self.circuit_type == ProvingJobCircuitType::UserEndCap
     }
 
-    fn is_user_guta_proof_circuit_type(&self) -> bool {
+    fn get_parth_index(&self) -> u64 {
+        self.task_index as u64
+    }
+
+    fn get_reverse_parth_level(&self) -> u8 {
+        self.sub_group_id as u8
+    }
+    
+    fn new_invalid_job_id() -> Self {
+        Self {
+            topic: QJobTopic::Invalid,
+            goal_id: 0,
+            circuit_type: ProvingJobCircuitType::Invalid,
+            group_id: 0,
+            sub_group_id: 0,
+            task_index: 0,
+            data_type: ProvingJobDataType::BaseInputProof,
+            data_index: 0,
+        }
+    }
+    
+    fn is_valid(&self) -> bool {
+        !(self.circuit_type == ProvingJobCircuitType::Invalid || self.topic == QJobTopic::Invalid)
+    }
+    
+    fn get_synced_checkpoint_id(&self) -> u64 {
+        self.goal_id
+    }
+    
+    fn is_guta_proof_circuit_type(&self) -> bool {
         matches!(
             self.circuit_type,
             ProvingJobCircuitType::GUTATwoEndCap
@@ -986,18 +1052,112 @@ impl QJobIdBase for QProvingJobDataID{
                 | ProvingJobCircuitType::GUTATwoGUTAWithCheckpointUpgrade
                 | ProvingJobCircuitType::GUTAVerifyToCapWithCheckpointUpgrade
         )
-
-    }
-
-    fn is_end_cap_proof_circuit_type(&self) -> bool {
-        self.circuit_type == ProvingJobCircuitType::UserEndCap
-    }
-
-    fn get_parth_index(&self) -> u64 {
-        self.task_index as u64
-    }
-
-    fn get_reverse_parth_level(&self) -> u8 {
-        self.sub_group_id as u8
     }
 }
+
+
+impl QJobIdCreatable for QProvingJobDataID {
+    fn new_standard_user_end_cap_proof_id(at_checkpoint_id: u64, user_id: u64, global_user_tree_height: u8) -> Self {
+        Self {
+            topic: QJobTopic::GenerateStandardProof,
+            goal_id: at_checkpoint_id,
+            group_id: 0,
+            circuit_type: ProvingJobCircuitType::UserEndCap,
+            sub_group_id: global_user_tree_height as u32,
+            task_index: user_id as u32,
+            data_type: ProvingJobDataType::BaseInputProof,
+            data_index: 0,
+        }
+    }
+
+    fn new_alt_user_end_cap_proof_id(at_checkpoint_id: u64, user_id: u64, global_user_tree_height: u8, circuit_type: u32) -> Self {
+        if circuit_type > u8::MAX as u32 || circuit_type != ProvingJobCircuitType::UserEndCap as u32 {
+            Self::new_invalid_job_id().get_input_proof_id(0)
+        }else{
+            Self {
+                topic: QJobTopic::GenerateStandardProof,
+                goal_id: at_checkpoint_id,
+                group_id: 0,
+                circuit_type: ProvingJobCircuitType::UserEndCap,
+                sub_group_id: global_user_tree_height as u32,
+                task_index: user_id as u32,
+                data_type: ProvingJobDataType::BaseInputProof,
+                data_index: 0,
+            }
+        }
+    }
+    
+    
+    fn new_two_to_one_proof_id_or_invalid(target_checkpoint_id: u64, left_proof_id: &Self, right_proof_id: &Self, parth_index: u64, parth_level: u8, reverse_aggregation_level: u8) -> Self {
+        Self::new_two_to_one_proof_id(target_checkpoint_id, left_proof_id, right_proof_id, parth_index, parth_level, reverse_aggregation_level)
+            .unwrap_or_else(|_| Self::new_invalid_job_id().get_output_id()) // Return invalid proof with OutputProof type for consistency
+    }
+    
+    fn new_two_to_one_proof_id(target_checkpoint_id: u64, left_proof_id: &Self, right_proof_id: &Self, parth_index: u64, parth_level: u8, reverse_aggregation_level: u8) -> anyhow::Result<Self> {
+        if !left_proof_id.is_valid() || !right_proof_id.is_valid() {
+            anyhow::bail!("invalid left or right proof id");
+        }
+
+        let left_circuit = left_proof_id.circuit_type;
+        let right_circuit = right_proof_id.circuit_type;
+
+        // Determine the resulting circuit type from the aggregation
+        let circuit_type = {
+            // First, handle the special case for GUTA and EndCap proofs
+            let left_is_guta = left_proof_id.is_guta_proof_circuit_type();
+            let left_is_end_cap = left_proof_id.is_end_cap_proof_circuit_type();
+            let right_is_guta = right_proof_id.is_guta_proof_circuit_type();
+            let right_is_end_cap = right_proof_id.is_end_cap_proof_circuit_type();
+
+            if (left_is_guta || left_is_end_cap) && (right_is_guta || right_is_end_cap) {
+                match (left_is_end_cap, right_is_end_cap) {
+                    (true, true) => ProvingJobCircuitType::GUTATwoEndCap,
+                    (true, false) => ProvingJobCircuitType::GUTALeftEndCapRightGUTA,
+                    (false, true) => ProvingJobCircuitType::GUTALeftGUTARightEndCap,
+                    (false, false) => {
+                        // If both are GUTA, check if a checkpoint upgrade is needed
+                        if left_proof_id.get_synced_checkpoint_id() == target_checkpoint_id
+                            && right_proof_id.get_synced_checkpoint_id() == target_checkpoint_id
+                        {
+                            ProvingJobCircuitType::GUTATwoGUTA
+                        } else {
+                            ProvingJobCircuitType::GUTATwoGUTAWithCheckpointUpgrade
+                        }
+                    }
+                }
+            } else {
+                // Handle all other standard aggregatable proof types generically
+                let left_leaf = left_circuit.get_agg_leaf_circuit_type_or_err();
+                let right_leaf = right_circuit.get_agg_leaf_circuit_type_or_err();
+
+                match (left_leaf, right_leaf) {
+                    (Ok(ll), Ok(rl)) if ll == rl => {
+                        // If both proofs belong to the same aggregatable "family" (i.e., they normalize
+                        // to the same leaf type), the result is the aggregate circuit for that family.
+                        ll.get_agg_circuit_type_or_err()?
+                    }
+                    _ => {
+                        // If they don't have a leaf type, or the leaf types don't match,
+                        // they cannot be aggregated this way.
+                        return Err(anyhow::bail!(
+                            "Cannot aggregate mismatched or non-aggregatable circuit types: {:?} and {:?}",
+                            left_circuit, right_circuit
+                        ));
+                    }
+                }
+            }
+        };
+
+        // Construct the new job ID for the aggregation proof
+        Ok(Self {
+            topic: QJobTopic::GenerateStandardProof,
+            goal_id: target_checkpoint_id,
+            group_id: left_proof_id.group_id, // Assume group_id is consistent
+            circuit_type,
+            sub_group_id: reverse_aggregation_level as u32,
+            task_index: parth_index as u32,
+            data_type: ProvingJobDataType::BaseInputProof, // The result of aggregation is a proof
+            data_index: 0,
+        })
+    }
+} 

@@ -73,7 +73,7 @@ pub fn compute_partial_merkle_root_from_leaves<
     current[0]
 }
 
-pub fn compute_root_merkle_proof_generic<Hash: PartialEq + Copy, H: MerkleHasher<Hash>>(
+pub fn compute_root_merkle_proof_generic<Hash, H: MerkleHasher<Hash>>(
     value: Hash,
     index: u64,
     siblings: &[Hash]
@@ -190,7 +190,7 @@ pub fn verify_delta_merkle_proof_core_debug<Hash: PartialEq + Copy + Serialize, 
 }
 
 
-pub fn calc_merkle_root_from_leaves<Hash: PartialEq + Copy, Hasher: MerkleHasher<Hash>>(
+pub fn calc_merkle_root_from_leaves<Hash: Copy, Hasher: MerkleHasher<Hash>>(
     leaves: &[Hash],
 ) -> Hash {
     let mut current_leaves: Vec<Hash> = leaves
@@ -209,11 +209,27 @@ pub fn calc_merkle_root_from_leaves<Hash: PartialEq + Copy, Hasher: MerkleHasher
 }
 
 
+pub fn compute_historical_and_current_merkle_roots_core_gt<Hash: Copy, Hasher: MerkleZeroHasher<Hash>>(
+    proof: &MerkleProofCore<Hash>,
+) -> (Hash, Hash) {
+    let mut current = proof.value;
+    let mut historical = current.clone();
+    for (i, sibling) in proof.siblings.iter().enumerate() {
+        if proof.index & (1 << i) == 0 {
+            current = Hasher::two_to_one(&current, sibling);
+            historical = Hasher::two_to_one(&historical, &Hasher::get_zero_hash(i));
+        } else {
+            current = Hasher::two_to_one(sibling, &current);
+            historical = Hasher::two_to_one(sibling, &historical);
+        }
+    }
+    (historical, current)
+}
 // Start Merkle Proof
 #[pderive::serialize_clone]
 #[derive(ts_rs::TS)]
 #[ts(export)]
-pub struct MerkleProofCore<Hash: PartialEq + Copy> {
+pub struct MerkleProofCore<Hash> {
     pub root: Hash,
     pub value: Hash,
 
@@ -221,7 +237,7 @@ pub struct MerkleProofCore<Hash: PartialEq + Copy> {
     pub siblings: Vec<Hash>,
 }
 
-impl<Hash: PartialEq + Copy + Default> Default for MerkleProofCore<Hash> {
+impl<Hash: Default> Default for MerkleProofCore<Hash> {
     fn default() -> Self {
         Self {
             root: Default::default(),
@@ -289,7 +305,7 @@ where
 #[pderive::serialize_clone]
 #[derive(ts_rs::TS)]
 #[ts(export)]
-pub struct DeltaMerkleProofCore<Hash: PartialEq + Copy> {
+pub struct DeltaMerkleProofCore<Hash> {
     pub old_root: Hash,
     pub old_value: Hash,
 
@@ -379,7 +395,7 @@ impl<Hash: PartialEq + Copy> From<MerkleProofCore<Hash>> for DeltaMerkleProofCor
         }
     }
 }
-impl<Hash: PartialEq + Copy> From<&MerkleProofCore<Hash>> for DeltaMerkleProofCore<Hash> {
+impl<Hash: Copy> From<&MerkleProofCore<Hash>> for DeltaMerkleProofCore<Hash> {
     fn from(value: &MerkleProofCore<Hash>) -> Self {
         Self {
             old_root: value.root,
@@ -391,7 +407,7 @@ impl<Hash: PartialEq + Copy> From<&MerkleProofCore<Hash>> for DeltaMerkleProofCo
         }
     }
 }
-impl<Hash: PartialEq + Copy + Default> Default for DeltaMerkleProofCore<Hash> {
+impl<Hash: Default> Default for DeltaMerkleProofCore<Hash> {
     fn default() -> Self {
         Self {
             old_root: Default::default(),

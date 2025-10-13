@@ -1909,6 +1909,7 @@ dependencies = [
  "hex",
  "hex-literal",
  "parth_core",
+ "pderive",
  "postcard",
  "pser",
  "rand 0.8.5",
@@ -1922,6 +1923,7 @@ dependencies = [
  "strum_macros",
  "tokio",
  "tracing",
+ "ts-rs",
 ]
 
 [[package]]

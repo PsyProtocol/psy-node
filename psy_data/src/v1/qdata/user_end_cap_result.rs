@@ -3,7 +3,7 @@ use parth_core::{crypto::hash::traits::FieldQHasher, data::serializable::QPDSeri
 
 #[pderive::serialize_copy_f_hash_ts]
 #[ts(export, concrete(F = parth_core::PF, Hash = parth_core::PHash), rename = "UPSEndCapResultCompact")]
-pub struct PUPSEndCapResultCompact<F: QFelt, Hash: QHashBase> {
+pub struct PUPSEndCapResultCompact<F, Hash> {
     pub start_user_leaf_hash: Hash,
     pub end_user_leaf_hash: Hash,
     pub checkpoint_tree_root_hash: Hash,

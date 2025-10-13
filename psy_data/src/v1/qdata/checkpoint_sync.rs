@@ -12,7 +12,7 @@ use crate::v1::qdata::public_key::PZKPublicKeyInfo;
 
 #[pderive::serialize_clone_f_hash_ts]
 #[ts(export, concrete(F = parth_core::PF, Hash = parth_core::PHash), rename = "QEDCheckpointSyncInfoCompact")]
-pub struct PQEDCheckpointSyncInfoCompact<F: QFelt, Hash: QHashBase> {
+pub struct PQEDCheckpointSyncInfoCompact<F, Hash> {
     pub l2_block_state: QEDL2BlockState,
     pub stats: PQEDCheckpointLeafStats<F, Hash>,
     pub state_roots: PQEDCheckpointGlobalStateRoots<Hash>,
@@ -104,7 +104,7 @@ impl<F: QFelt, Hash: QHashBase> From<&PQEDCheckpointSyncInfo<F, Hash>> for PQEDC
 
 #[pderive::serialize_copy_f_hash_ts]
 #[ts(export, concrete(F = parth_core::PF, Hash = parth_core::PHash), rename = "QEDCheckpointCoreSyncInfo")]
-pub struct PQEDCheckpointCoreSyncInfo<F: QFelt, Hash: QHashBase> {
+pub struct PQEDCheckpointCoreSyncInfo<F, Hash> {
     pub checkpoint_tree_root: Hash,
     pub checkpoint_leaf_hash: Hash,
     pub l2_block_state: QEDL2BlockState,
@@ -114,7 +114,7 @@ pub struct PQEDCheckpointCoreSyncInfo<F: QFelt, Hash: QHashBase> {
 
 #[pderive::serialize_clone_f_hash_ts]
 #[ts(export, concrete(F = parth_core::PF, Hash = parth_core::PHash), rename = "QEDCheckpointSyncInfo")]
-pub struct PQEDCheckpointSyncInfo<F: QFelt, Hash: QHashBase> {
+pub struct PQEDCheckpointSyncInfo<F, Hash> {
     pub core: PQEDCheckpointCoreSyncInfo<F, Hash>,
     pub checkpoint_tree_update_proof: DeltaMerkleProofCore<Hash>,
     pub regsitered_users_start_pivot_siblings: Vec<Hash>,

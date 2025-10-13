@@ -1,12 +1,13 @@
 use parth_common::memory_stores::simple_memory_merkle_store::SimpleMemoryMerkleStore;
 use parth_core::{crypto::hash::traits::{FieldQHasher, MerkleZeroHasher, QFieldHashable}, data::serializable::QPDSerializable, felt::{QFelt, QFelt64, QFeltSized, ToQFelts}, impl_qpd_serialize_params, impl_qpq_serialize_bincode, protocol::core_types::{QFHashBase, QHashBase}};
+use serde::Serialize;
 use ts_rs::TS;
 use pser::{QBytesDeserialize, QBytesSerialize};
 
 
 #[pderive::serialize_copy_f_hash_ts]
 #[ts(export, concrete(F = parth_core::PF, Hash = parth_core::PHash), rename = "QEDContractLeaf")]
-pub struct PQEDContractLeaf<F: QFelt, Hash: QHashBase> {
+pub struct PQEDContractLeaf<F, Hash> {
     pub deployer: Hash,
     pub function_tree_root: Hash,
     pub state_tree_height: F,
@@ -169,7 +170,7 @@ impl_qpq_serialize_bincode!(ContractConfig);
 
 #[pderive::serialize_clone_hash_ts]
 #[ts(export, concrete(Hash = parth_core::PHash), rename = "QBCDeployContract")]
-pub struct PQBCDeployContract<Hash: QHashBase> {
+pub struct PQBCDeployContract<Hash: Copy + PartialEq + Serialize> {
     pub deployer: Hash,
     pub code_definition: ContractCodeDefinition,
     pub function_whitelist: Vec<Hash>,
@@ -195,7 +196,7 @@ impl<Hash: QHashBase> PQBCDeployContract<Hash> {
 
 #[pderive::serialize_clone_hash_ts]
 #[ts(export, concrete(Hash = parth_core::PHash), rename = "QBCDeployContractWithRoot")]
-pub struct PQBCDeployContractWithRoot<Hash: QHashBase> {
+pub struct PQBCDeployContractWithRoot<Hash> {
     pub deployer: Hash,
     pub code_definition: ContractCodeDefinition,
     pub function_whitelist: Vec<Hash>,

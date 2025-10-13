@@ -5,7 +5,7 @@ use pser::{QBytesDeserialize, QBytesSerialize};
 
 #[pderive::serialize_copy_hash_ts]
 #[ts(export, concrete(Hash = parth_core::PHash), rename = "ZKPublicKeyInfo")]
-pub struct PZKPublicKeyInfo<Hash: QHashBase> {
+pub struct PZKPublicKeyInfo<Hash> {
     pub fingerprint: Hash,
     pub public_key_param: Hash,
 }

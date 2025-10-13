@@ -20,20 +20,27 @@ pub trait JobIDWithRewardPathSerializable: Sized + Copy + Send + Sync + Clone + 
     fn get_reward_path_info(&self) -> u64;
 }
 
-
-pub trait QJobIdBase: Send + Sync + Serialize + DeserializeOwned + Clone + PartialEq + Eq + std::fmt::Debug + QPDSerializableFixed + Sized + Into<QJobIdSerialized> + TryFrom<QJobIdSerialized> + PCoreQueueItemBase {
+pub trait QJobIdBase: Copy + Send + Sync + Serialize + DeserializeOwned + Clone + PartialEq + Eq + std::fmt::Debug + QPDSerializableFixed + Sized + Into<QJobIdSerialized> + TryFrom<QJobIdSerialized> + PCoreQueueItemBase {
     fn to_bytes_fixed(&self) -> QJobIdSerialized;
     fn from_bytes_fixed(bytes: &QJobIdSerialized) -> anyhow::Result<Self>;
     fn circuit_type_u32(&self) -> u32;
     fn input_witness_id(&self) -> Self;
     fn output_proof_id(&self) -> Self;
     fn group_counter_id(&self) -> Self;
-    fn get_checkpoint_id(&self) -> u64;
-    fn is_user_guta_proof_circuit_type(&self) -> bool;
+    fn get_synced_checkpoint_id(&self) -> u64;
+    fn is_guta_proof_circuit_type(&self) -> bool;
     fn is_end_cap_proof_circuit_type(&self) -> bool;
     fn get_parth_index(&self) -> u64;
     fn get_reverse_parth_level(&self) -> u8;
-    
+    fn new_invalid_job_id() -> Self;
+    fn is_valid(&self) -> bool;
+}
+
+pub trait QJobIdCreatable: QJobIdBase {
+    fn new_standard_user_end_cap_proof_id(at_checkpoint_id: u64, user_id: u64, global_user_tree_height: u8) -> Self;
+    fn new_alt_user_end_cap_proof_id(at_checkpoint_id: u64, user_id: u64, global_user_tree_height: u8, circuit_type: u32) -> Self;
+    fn new_two_to_one_proof_id_or_invalid(target_checkpoint_id: u64, left_proof_id: &Self, right_proof_id: &Self, parth_index: u64, parth_level: u8, reverse_aggregation_level: u8) -> Self;
+    fn new_two_to_one_proof_id(target_checkpoint_id: u64, left_proof_id: &Self, right_proof_id: &Self, parth_index: u64, parth_level: u8, reverse_aggregation_level: u8) -> anyhow::Result<Self>;
 }
 
 

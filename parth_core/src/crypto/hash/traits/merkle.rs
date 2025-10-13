@@ -1,7 +1,7 @@
 use crate::utils::math::log2_ceil;
 
 
-pub trait MerkleHasher<Hash: PartialEq> {
+pub trait MerkleHasher<Hash> {
     fn two_to_one(left: &Hash, right: &Hash) -> Hash;
     fn two_to_one_swap(swap: bool, left: &Hash, right: &Hash) -> Hash {
         if swap {
@@ -12,11 +12,11 @@ pub trait MerkleHasher<Hash: PartialEq> {
     }
 }
 
-pub trait MerkleLeafHasher<Hash: PartialEq + Copy> {
+pub trait MerkleLeafHasher<Hash> {
     fn compute_root_from_leaves(leaves: &[Hash]) -> anyhow::Result<Hash>;
 }
 
-impl<Hash: PartialEq + Copy, H: MerkleHasher<Hash>> MerkleLeafHasher<Hash> for H {
+impl<Hash: Copy, H: MerkleHasher<Hash>> MerkleLeafHasher<Hash> for H {
     fn compute_root_from_leaves(leaves: &[Hash]) -> anyhow::Result<Hash> {
         let leaves_len = leaves.len();
         if leaves_len == 0 {
@@ -53,6 +53,6 @@ impl<Hash: PartialEq + Copy, H: MerkleHasher<Hash>> MerkleLeafHasher<Hash> for H
         }
     }
 }
-pub trait MerkleZeroHasher<Hash: PartialEq>: MerkleHasher<Hash> {
+pub trait MerkleZeroHasher<Hash>: MerkleHasher<Hash> {
     fn get_zero_hash(reverse_level: usize) -> Hash;
 }

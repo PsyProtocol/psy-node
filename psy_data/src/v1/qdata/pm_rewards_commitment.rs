@@ -1,11 +1,11 @@
-use parth_core::{crypto::hash::traits::MerkleHasher, felt::{QFelt64, QFeltSized, ToQFelts}, protocol::core_types::{QFHashBase, QHashBase}};
+use parth_core::{crypto::hash::traits::MerkleHasher, felt::{QFelt64, QFeltSized, ToQFelts}, protocol::core_types::QFHashBase};
 
 pub const PM_REWARD_COMMITMENT_SIZE: usize = 12;
 
 #[pderive::serialize_copy_hash_ts]
 #[derive(Default)]
 #[ts(export, concrete(Hash = parth_core::PHash), rename = "PMRewardCommitmentHash")]
-pub struct PPMRewardCommitment<Hash: QHashBase> {
+pub struct PPMRewardCommitment<Hash> {
     pub register_users_root: Hash,
     pub gutas_root: Hash,
     pub deploy_contracts_root: Hash,
@@ -13,7 +13,7 @@ pub struct PPMRewardCommitment<Hash: QHashBase> {
 
 
 
-impl<Hash: QHashBase> PPMRewardCommitment<Hash> {
+impl<Hash: PartialEq> PPMRewardCommitment<Hash> {
     pub fn combine_with<H: MerkleHasher<Hash>>(&self, other: &Self) -> Self {
         let register_users_root = H::two_to_one(
             &self.register_users_root,
@@ -48,7 +48,7 @@ impl<Hash: QHashBase> PPMRewardCommitment<Hash> {
     }
 }
 
-impl<Hash: QHashBase> QFeltSized for PPMRewardCommitment<Hash> {
+impl<Hash> QFeltSized for PPMRewardCommitment<Hash> {
     fn q_felt_size() -> usize {
         PM_REWARD_COMMITMENT_SIZE
     }

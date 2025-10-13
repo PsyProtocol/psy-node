@@ -8,7 +8,7 @@ use crate::v1::qdata::contract::PQEDContractLeaf;
 
 #[pderive::serialize_clone_f_hash_ts]
 #[ts(export, concrete(F = parth_core::PF, Hash = parth_core::PHash), rename = "QEDContractInclusionProof")]
-pub struct PQEDContractInclusionProof<F: QFelt, Hash: QHashBase> {
+pub struct PQEDContractInclusionProof<F, Hash> {
     pub contract_leaf: PQEDContractLeaf<F, Hash>,
     pub contract_tree_merkle_proof: MerkleProofCore<Hash>,
 }
@@ -27,7 +27,7 @@ impl_qpd_serialize_params!(
 
 #[pderive::serialize_clone_f_hash_ts]
 #[ts(export, concrete(F = parth_core::PF, Hash = parth_core::PHash), rename = "QEDContractFunctionInclusionProof")]
-pub struct PQEDContractFunctionInclusionProof<F: QFelt, Hash: QHashBase> {
+pub struct PQEDContractFunctionInclusionProof<F: Copy + PartialEq, Hash: Copy + PartialEq> {
     pub contract_inclusion_proof: PQEDContractInclusionProof<F, Hash>,
     pub contract_function_merkle_proof: MerkleProofCore<Hash>,
 }

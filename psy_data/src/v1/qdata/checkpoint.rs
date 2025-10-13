@@ -13,7 +13,7 @@ use crate::v1::qdata::{checkpoint_sync::PQEDCheckpointSyncInfoCompact, pm_jobs_c
 
 #[pderive::serialize_copy_f_hash_ts]
 #[ts(export, concrete(F = parth_core::PF, Hash = parth_core::PHash), rename = "QEDCheckpointLeafStats")]
-pub struct PQEDCheckpointLeafStats<F: QFelt, Hash: QHashBase> {
+pub struct PQEDCheckpointLeafStats<F, Hash> {
     pub fees_collected: F,
     pub user_ops_processed: F,
     pub total_transactions: F,
@@ -117,7 +117,7 @@ impl<F: QFelt64, Hash: QFHashBase<F>> QFieldHashable<F, Hash>
 
 #[pderive::serialize_copy_hash_ts]
 #[ts(export, concrete(Hash = parth_core::PHash), rename = "QEDCheckpointGlobalStateRoots")]
-pub struct PQEDCheckpointGlobalStateRoots<Hash: QHashBase> {
+pub struct PQEDCheckpointGlobalStateRoots<Hash> {
     pub contract_tree_root: Hash,
     pub deposit_tree_root: Hash,
     pub user_tree_root: Hash,
@@ -172,7 +172,7 @@ impl<F: QFelt64, Hash: QFHashBase<F>> QFieldHashable<F, Hash>
 
 #[pderive::serialize_copy_f_hash_ts]
 #[ts(export, concrete(F = parth_core::PF, Hash = parth_core::PHash), rename = "QEDCheckpointLeaf")]
-pub struct PQEDCheckpointLeaf<F: QFelt, Hash: QHashBase> {
+pub struct PQEDCheckpointLeaf<F, Hash> {
     pub global_chain_root: Hash,
     pub stats: PQEDCheckpointLeafStats<F, Hash>,
 }
@@ -236,7 +236,7 @@ impl<F: QFelt64, Hash: QFHashBase<F>> QFieldHashable<F, Hash> for PQEDCheckpoint
 
 #[pderive::serialize_copy_hash_ts]
 #[ts(export, concrete(Hash = parth_core::PHash), rename = "QEDCheckpointLeafCompact")]
-pub struct PQEDCheckpointLeafCompact<Hash: QHashBase> {
+pub struct PQEDCheckpointLeafCompact<Hash> {
     pub global_chain_root: Hash,
     pub stats_hash: Hash,
 }
@@ -310,7 +310,7 @@ impl QEDL2BlockState {
 
 #[pderive::serialize_copy_hash_ts]
 #[ts(export, concrete(Hash = parth_core::PHash), rename = "QEDCheckpointLeafCompactWithStateRoots")]
-pub struct PQEDCheckpointLeafCompactWithStateRoots<Hash: QHashBase> {
+pub struct PQEDCheckpointLeafCompactWithStateRoots<Hash> {
     pub checkpoint_leaf: PQEDCheckpointLeafCompact<Hash>,
     pub global_state_roots: PQEDCheckpointGlobalStateRoots<Hash>,
 }
@@ -358,7 +358,7 @@ impl<F: QFelt64, Hash: QFHashBase<F>> QFieldHashable<F, Hash>
 /// push the latest checkpoint sync info
 #[pderive::serialize_clone_f_hash_ts]
 #[ts(export, concrete(F = parth_core::PF, Hash = parth_core::PHash), rename = "CheckpointSyncInfo")]
-pub struct PCheckpointSyncInfo<F: QFelt, Hash: QHashBase> {
+pub struct PCheckpointSyncInfo<F, Hash> {
     pub latest_checkpoint_id: u64,
     pub description: Option<String>,
     pub source_coordinator_edge_id: Option<String>,

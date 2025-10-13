@@ -21,7 +21,7 @@ pub fn serialize_copy_f_hash(_attr: TokenStream, input: TokenStream) -> TokenStr
         )]
     );
     let serde_bound: Attribute = syn::parse_quote!(
-        #[serde(bound = "for<'de2> F: serde::Deserialize<'de2>, for<'de2> Hash: serde::Deserialize<'de2>")]
+        #[serde(bound = "for<'de2> F: serde::Deserialize<'de2> + serde::Serialize, for<'de2> Hash: serde::Deserialize<'de2> + serde::Serialize")]
     );
     let derive_rkyv: Attribute = syn::parse_quote!(
         #[cfg_attr(feature = "serialize_rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
@@ -29,7 +29,6 @@ pub fn serialize_copy_f_hash(_attr: TokenStream, input: TokenStream) -> TokenStr
     let derive_speedy: Attribute = syn::parse_quote!(
         #[cfg_attr(feature = "serialize_speedy", derive(speedy::Readable, speedy::Writable))]
     );
-
     // Insert attributes in reverse order to maintain the desired output order
     item_struct.attrs.insert(0, serde_bound);
     item_struct.attrs.insert(0, derive_speedy);
@@ -57,7 +56,7 @@ pub fn serialize_clone_f_hash(_attr: TokenStream, input: TokenStream) -> TokenSt
         )]
     );
     let serde_bound: Attribute = syn::parse_quote!(
-        #[serde(bound = "for<'de2> Hash: serde::Deserialize<'de2>")]
+        #[serde(bound = "for<'de2> Hash: serde::Deserialize<'de2> + serde::Serialize, for<'de2> F: serde::Deserialize<'de2> + serde::Serialize")]
     );
     let derive_rkyv: Attribute = syn::parse_quote!(
         #[cfg_attr(feature = "serialize_rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
@@ -96,7 +95,7 @@ pub fn serialize_copy_f_hash_ts(_attr: TokenStream, input: TokenStream) -> Token
         )]
     );
     let serde_bound: Attribute = syn::parse_quote!(
-        #[serde(bound = "for<'de2> F: serde::Deserialize<'de2>, for<'de2> Hash: serde::Deserialize<'de2>")]
+        #[serde(bound = "for<'de2> F: serde::Deserialize<'de2> + serde::Serialize, for<'de2> Hash: serde::Deserialize<'de2> + serde::Serialize")]
     );
     let derive_rkyv: Attribute = syn::parse_quote!(
         #[cfg_attr(feature = "serialize_rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
@@ -104,8 +103,12 @@ pub fn serialize_copy_f_hash_ts(_attr: TokenStream, input: TokenStream) -> Token
     let derive_speedy: Attribute = syn::parse_quote!(
         #[cfg_attr(feature = "serialize_speedy", derive(speedy::Readable, speedy::Writable))]
     );
+    let ts_bound: Attribute = syn::parse_quote!(
+        #[ts(bound = "F: ts_rs::TS, Hash: ts_rs::TS")]
+    );
 
     // Insert attributes in reverse order to maintain the desired output order
+    item_struct.attrs.insert(0, ts_bound);
     item_struct.attrs.insert(0, serde_bound);
     item_struct.attrs.insert(0, derive_speedy);
     item_struct.attrs.insert(0, derive_rkyv);
@@ -133,7 +136,7 @@ pub fn serialize_clone_f_hash_ts(_attr: TokenStream, input: TokenStream) -> Toke
         )]
     );
     let serde_bound: Attribute = syn::parse_quote!(
-        #[serde(bound = "for<'de2> F: serde::Deserialize<'de2>, for<'de2> Hash: serde::Deserialize<'de2>")]
+        #[serde(bound = "for<'de2> F: serde::Deserialize<'de2> + serde::Serialize, for<'de2> Hash: serde::Deserialize<'de2> + serde::Serialize")]
     );
     let derive_rkyv: Attribute = syn::parse_quote!(
         #[cfg_attr(feature = "serialize_rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
@@ -141,8 +144,13 @@ pub fn serialize_clone_f_hash_ts(_attr: TokenStream, input: TokenStream) -> Toke
     let derive_speedy: Attribute = syn::parse_quote!(
         #[cfg_attr(feature = "serialize_speedy", derive(speedy::Readable, speedy::Writable))]
     );
+    let ts_bound: Attribute = syn::parse_quote!(
+        #[ts(bound = "F: ts_rs::TS, Hash: ts_rs::TS")]
+    );
+
 
     // Insert attributes in reverse order to maintain the desired output order
+    item_struct.attrs.insert(0, ts_bound);
     item_struct.attrs.insert(0, serde_bound);
     item_struct.attrs.insert(0, derive_speedy);
     item_struct.attrs.insert(0, derive_rkyv);
@@ -171,7 +179,7 @@ pub fn serialize_clone_hash_ts(_attr: TokenStream, input: TokenStream) -> TokenS
         )]
     );
     let serde_bound: Attribute = syn::parse_quote!(
-        #[serde(bound = "for<'de2> Hash: serde::Deserialize<'de2>")]
+        #[serde(bound = "for<'de2> Hash: serde::Deserialize<'de2> + serde::Serialize")]
     );
     let derive_rkyv: Attribute = syn::parse_quote!(
         #[cfg_attr(feature = "serialize_rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
@@ -179,8 +187,12 @@ pub fn serialize_clone_hash_ts(_attr: TokenStream, input: TokenStream) -> TokenS
     let derive_speedy: Attribute = syn::parse_quote!(
         #[cfg_attr(feature = "serialize_speedy", derive(speedy::Readable, speedy::Writable))]
     );
+    let ts_bound: Attribute = syn::parse_quote!(
+        #[ts(bound = "Hash: ts_rs::TS")]
+    );
 
     // Insert attributes in reverse order to maintain the desired output order
+    item_struct.attrs.insert(0, ts_bound);
     item_struct.attrs.insert(0, serde_bound);
     item_struct.attrs.insert(0, derive_speedy);
     item_struct.attrs.insert(0, derive_rkyv);
@@ -209,7 +221,7 @@ pub fn serialize_copy_hash(_attr: TokenStream, input: TokenStream) -> TokenStrea
         )]
     );
     let serde_bound: Attribute = syn::parse_quote!(
-        #[serde(bound = "for<'de2> Hash: serde::Deserialize<'de2>")]
+        #[serde(bound = "for<'de2> Hash: serde::Deserialize<'de2> + serde::Serialize")]
     );
     let derive_rkyv: Attribute = syn::parse_quote!(
         #[cfg_attr(feature = "serialize_rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
@@ -248,7 +260,7 @@ pub fn serialize_copy_hash_ts(_attr: TokenStream, input: TokenStream) -> TokenSt
         )]
     );
     let serde_bound: Attribute = syn::parse_quote!(
-        #[serde(bound = "for<'de2> Hash: serde::Deserialize<'de2>")]
+        #[serde(bound = "for<'de2> Hash: serde::Deserialize<'de2> + serde::Serialize")]
     );
     let derive_rkyv: Attribute = syn::parse_quote!(
         #[cfg_attr(feature = "serialize_rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
@@ -256,8 +268,12 @@ pub fn serialize_copy_hash_ts(_attr: TokenStream, input: TokenStream) -> TokenSt
     let derive_speedy: Attribute = syn::parse_quote!(
         #[cfg_attr(feature = "serialize_speedy", derive(speedy::Readable, speedy::Writable))]
     );
+    let ts_bound: Attribute = syn::parse_quote!(
+        #[ts(bound = "Hash: ts_rs::TS")]
+    );
 
     // Insert attributes in reverse order to maintain the desired output order
+    item_struct.attrs.insert(0, ts_bound);
     item_struct.attrs.insert(0, serde_bound);
     item_struct.attrs.insert(0, derive_speedy);
     item_struct.attrs.insert(0, derive_rkyv);
@@ -287,7 +303,7 @@ pub fn serialize_copy_f_ts(_attr: TokenStream, input: TokenStream) -> TokenStrea
         )]
     );
     let serde_bound: Attribute = syn::parse_quote!(
-        #[serde(bound = "for<'de2> F: serde::Deserialize<'de2>")]
+        #[serde(bound = "for<'de2> F: serde::Deserialize<'de2> + serde::Serialize")]
     );
     let derive_rkyv: Attribute = syn::parse_quote!(
         #[cfg_attr(feature = "serialize_rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
@@ -295,8 +311,12 @@ pub fn serialize_copy_f_ts(_attr: TokenStream, input: TokenStream) -> TokenStrea
     let derive_speedy: Attribute = syn::parse_quote!(
         #[cfg_attr(feature = "serialize_speedy", derive(speedy::Readable, speedy::Writable))]
     );
+    let ts_bound: Attribute = syn::parse_quote!(
+        #[ts(bound = "F: ts_rs::TS")]
+    );
 
     // Insert attributes in reverse order to maintain the desired output order
+    item_struct.attrs.insert(0, ts_bound);
     item_struct.attrs.insert(0, serde_bound);
     item_struct.attrs.insert(0, derive_speedy);
     item_struct.attrs.insert(0, derive_rkyv);
