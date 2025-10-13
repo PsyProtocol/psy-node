@@ -115,6 +115,21 @@ impl ScyllaMerkleNodesZeroPreparedStatements {
         }
     }
 
+    /*
+        Gets all the non-zero nodes with the highest checkpoint version in the database where checkpoint_id <= max_checkpoint_id.
+        This is performed from time to time when the processor node starts up to populate the in-memory cache of the latest nodes for quick access.
+        Note that this does NOT return all non-zero nodes, only the latest version of each non-zero node.
+        The tree will be at most 26 levels high, so this is feasible to do in memory.
+        The implementation should be efficient and avoid loading unnecessary data into memory, and should not fail even for very large trees (assuming the machine has enough memory).
+     */ 
+    pub async fn dump_non_zero_latest_nodes_for_tree_max_checkpoint_internal<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>(
+        &self,
+        session: &Session,
+        max_checkpoint_id: u64,
+    ) -> anyhow::Result<Vec<SimpleMerkleNode<Hash>>> {
+        todo!("implement dump_non_zero_latest_nodes_for_tree_max_checkpoint_internal");
+    }
+
     pub async fn select_many_zero_id_merkle_nodes_max_checkpoint_internal<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>(
         &self,
         session: &Session,
