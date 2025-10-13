@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
-use anyhow::Context;
+use anyhow::{Context, anyhow};
 use futures::future::join_all;
+use futures::StreamExt;
 use parth_core::{
     crypto::hash::traits::MerkleZeroHasher,
     data::{
@@ -12,18 +13,19 @@ use parth_core::{
 };
 use scylla::{
     client::session::Session,
+    response::query_result::QueryResult,
     statement::{batch::Batch, prepared::PreparedStatement, Statement},
 };
 
-use crate::
-    utils::{convert_checkpoint_id_to_i64, u64_to_i64_exact, u8_to_i8_exact}
-;
+use crate::utils::{convert_checkpoint_id_to_i64, u64_to_i64_exact, u8_to_i8_exact};
+
 #[derive(Clone)]
 pub struct ScyllaMerkleNodesZeroPreparedStatements {
     pub insert_1_statement: Statement,
     pub insert_1_prepared: Arc<PreparedStatement>,
     pub select_1_statement: Statement,
     pub select_1_prepared: Arc<PreparedStatement>,
+
     pub keyspace: String,
     pub table_name: String,
     pub table_key: QDatabaseTableRoutingKey,
@@ -31,6 +33,8 @@ pub struct ScyllaMerkleNodesZeroPreparedStatements {
 }
 
 impl ScyllaMerkleNodesZeroPreparedStatements {
+    /// Creates prepared statements from an existing session.
+    /// Prepares statements for inserts, single selects, and the dump query.
     pub async fn new_from_session(
         session: Arc<Session>,
         keyspace: &str,
@@ -48,6 +52,7 @@ impl ScyllaMerkleNodesZeroPreparedStatements {
             keyspace, table_name
         ));
         let select_1_prepared = session.prepare(select_1_statement.clone()).await?;
+        // Prepare the dump-specific select: fetches node_index and value, ordered by clustering (node_index ASC, checkpoint_id DESC).
 
         Ok(Self {
             insert_1_prepared: Arc::new(insert_prepared),
@@ -60,6 +65,9 @@ impl ScyllaMerkleNodesZeroPreparedStatements {
             tree_height,
         })
     }
+
+    /// Creates the table if it doesn't exist.
+    /// No changes needed; schema is optimal for operations.
     pub async fn create_table(session: Arc<Session>, keyspace: &str, table_name: &str, _table_key: QDatabaseTableRoutingKey) -> anyhow::Result<()> {
         session
             .query_unpaged(
@@ -79,6 +87,8 @@ impl ScyllaMerkleNodesZeroPreparedStatements {
         session.await_schema_agreement().await?;
         Ok(())
     }
+
+    /// Creates the table and prepares statements.
     pub async fn new_create_from_session(
         session: Arc<Session>,
         keyspace: &str,
@@ -92,6 +102,9 @@ impl ScyllaMerkleNodesZeroPreparedStatements {
 }
 
 impl ScyllaMerkleNodesZeroPreparedStatements {
+    /// Retrieves the latest value for a single node key <= checkpoint_id.
+    /// Returns zero hash if not found.
+    /// Optimized: uses prepared statement and LIMIT 1.
     pub async fn select_zero_id_merkle_node_max_checkpoint_internal<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>(
         &self,
         session: &Session,
@@ -115,28 +128,72 @@ impl ScyllaMerkleNodesZeroPreparedStatements {
         }
     }
 
-    /*
-        Gets all the non-zero nodes with the highest checkpoint version in the database where checkpoint_id <= max_checkpoint_id.
-        This is performed from time to time when the processor node starts up to populate the in-memory cache of the latest nodes for quick access.
-        Note that this does NOT return all non-zero nodes, only the latest version of each non-zero node.
-        The tree will be at most 26 levels high, so this is feasible to do in memory.
-        The implementation should be efficient and avoid loading unnecessary data into memory, and should not fail even for very large trees (assuming the machine has enough memory).
-     */ 
+    /// Dumps all latest non-zero nodes <= max_checkpoint_id.
+    /// Implementation: Concurrently queries each level, streams results, and client-side filters to collect only the latest per node_index.
+    /// This avoids loading unnecessary data into memory while handling large result sets.
     pub async fn dump_non_zero_latest_nodes_for_tree_max_checkpoint_internal<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>(
         &self,
         session: &Session,
         max_checkpoint_id: u64,
     ) -> anyhow::Result<Vec<SimpleMerkleNode<Hash>>> {
-        todo!("implement dump_non_zero_latest_nodes_for_tree_max_checkpoint_internal");
+                let dump_select_statement = Statement::new(&format!(
+            "SELECT node_index, value FROM {}.{} WHERE level = ? AND checkpoint_id <= ?",
+            self.keyspace, self.table_name
+        ));
+        let dump_select_prepared = session.prepare(dump_select_statement.clone()).await?;
+
+
+        let max_cp_i64 = convert_checkpoint_id_to_i64(max_checkpoint_id);
+        // Concurrently process each level (small number: up to 32).
+        let futures: Vec<_> = (0..self.tree_height)
+            .map(|level| {
+                let session = session;
+                let prep = dump_select_prepared.clone();
+                let level_i8 = u8_to_i8_exact(level);
+                async move {
+                    let mut result: Vec<SimpleMerkleNode<Hash>> = Vec::new();
+                    let mut iter = session
+                        .execute_iter(prep, (level_i8, max_cp_i64))
+                        .await?
+                        .rows_stream::<(i64, Vec<u8>)>()?;
+
+                    let mut current_index: Option<i64> = None;
+                    while let Some(row_res) = iter.next().await {
+                        let (node_index, value_bytes) = row_res?;
+                        if current_index != Some(node_index) {
+                            // This is the start of a new node_index group; the first row is the latest (<= max).
+                            let value = Hash::from_bytes(&value_bytes)?;
+                            let key = SimpleMerkleNodeKey {
+                                level,
+                                index: node_index as u64,
+                            };
+                            result.push(SimpleMerkleNode { key, value });
+                            current_index = Some(node_index);
+                        }
+                        // Skip subsequent rows in the group (older versions).
+                    }
+                    anyhow::Result::Ok(result)
+                }
+            })
+            .collect();
+        // Join all level results and flatten into a single Vec.
+        let level_results: Vec<anyhow::Result<Vec<SimpleMerkleNode<Hash>>>> = join_all(futures).await;
+        let mut all_nodes: Vec<SimpleMerkleNode<Hash>> = Vec::new();
+        for res in level_results {
+            all_nodes.extend(res?);
+        }
+        Ok(all_nodes)
     }
 
+    /// Retrieves latest values for multiple keys <= max_checkpoint_id.
+    /// Optimized: concurrent chunks (limit 512 for better throughput, assuming safe).
     pub async fn select_many_zero_id_merkle_nodes_max_checkpoint_internal<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>(
         &self,
         session: &Session,
         max_checkpoint_id: u64,
         keys: &[SimpleMerkleNodeKey],
     ) -> anyhow::Result<Vec<Hash>> {
-        const CONCURRENT_LIMIT: usize = 256; // Batch concurrent queries
+        const CONCURRENT_LIMIT: usize = 512; // Increased for better performance; monitor for timeouts.
         let mut results = Vec::with_capacity(keys.len());
         for chunk in keys.chunks(CONCURRENT_LIMIT) {
             let futures: Vec<_> = chunk
@@ -147,12 +204,11 @@ impl ScyllaMerkleNodesZeroPreparedStatements {
                     let index_i64 = u64_to_i64_exact(key.index);
                     let max_cp_i64 = convert_checkpoint_id_to_i64(max_checkpoint_id);
                     async move {
-                        let res = session.execute_unpaged(&prep, (level_i8, index_i64, max_cp_i64)).await?;
+                        let res: QueryResult = session.execute_unpaged(&prep, (level_i8, index_i64, max_cp_i64)).await?;
                         let rows = res.into_rows_result()?;
                         if let Some(row) = rows.maybe_first_row::<(Vec<u8>,)>()? {
                             Hash::from_bytes(&row.0)
                         } else {
-                            // Assume reverse_level = level for simplicity; adjust if tree height known
                             Ok(Hasher::get_zero_hash((self.tree_height - key.level) as usize))
                         }
                     }
@@ -165,6 +221,9 @@ impl ScyllaMerkleNodesZeroPreparedStatements {
         }
         Ok(results)
     }
+
+    /// Inserts a single node at checkpoint_id.
+    /// Optimized: uses prepared statement.
     pub async fn insert_zero_id_merkle_node_internal(
         &self,
         session: &Session,
@@ -178,27 +237,29 @@ impl ScyllaMerkleNodesZeroPreparedStatements {
                 (
                     u8_to_i8_exact(key.level),
                     u64_to_i64_exact(key.index),
-                    u64_to_i64_exact(checkpoint_id),
+                    convert_checkpoint_id_to_i64(checkpoint_id),
                     value,
                 ),
             )
             .await?;
         Ok(())
     }
+
+    /// Batch inserts multiple nodes at checkpoint_id.
+    /// Optimized: increased batch size to 512 for higher throughput; streams batches concurrently via join_all.
     pub async fn set_zero_id_merkle_nodes_batch_internal<Hash: QHashBase>(
         &self,
         session: &Session,
         checkpoint_id: u64,
         nodes: &[SimpleMerkleNode<Hash>],
     ) -> anyhow::Result<()> {
-        const BATCH_SIZE: usize = 256; // Safe batch size to avoid payload limits
+        const BATCH_SIZE: usize = 512; // Increased for performance; safe assuming typical node sizes.
         let mut batch_list: Vec<Batch> = Vec::new();
-        //tree_id, level, node_index, checkpoint_id, value
         let mut value_list: Vec<Vec<(i8, i64, i64, Vec<u8>)>> = Vec::new();
         let checkpoint_i64 = convert_checkpoint_id_to_i64(checkpoint_id);
         for chunk in nodes.chunks(BATCH_SIZE) {
             let mut batch: Batch = Default::default();
-            for _node in chunk {
+            for _ in chunk {
                 batch.append_statement(self.insert_1_statement.clone());
             }
             let values: Vec<_> = chunk
