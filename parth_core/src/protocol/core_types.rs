@@ -1,7 +1,7 @@
 use serde::{de::DeserializeOwned, Serialize};
 use ts_rs::TS;
 
-use crate::{crypto::hash::traits::{FieldQHasher, FromU64x4, HashTo4Felts, MerkleZeroHasher, QHasher, RandomHash, ZeroableHash}, data::{db::data_types::{CoreDatabaseValueDeserialize, QDatabasePrimitiveKey}, parth::public_preimage::{QParthProofPublicInputsPreimage, QParthProofPublicInputsPreimageWithoutRewardsHash}, serializable::{QPDSerializable, QPDSerializableFixed}}, felt::QFelt64, QJobIdBase};
+use crate::{crypto::hash::{traits::{FieldQHasher, FromU64x4, HashTo4Felts, QHasher, RandomHash, ZeroableHash}, traits::MerkleZeroHasher}, data::{db::data_types::{CoreDatabaseValueDeserialize, QDatabasePrimitiveKey}, parth::public_preimage::{QParthProofPublicInputsPreimage, QParthProofPublicInputsPreimageWithoutRewardsHash}, serializable::{QPDSerializable, QPDSerializableFixed}}, felt::QFelt64, QJobIdBase};
 
 pub trait QStorableBase: Serialize + DeserializeOwned + Send + Sync + Clone + PartialEq + Eq {}
 pub trait QStorableSizedBase: QStorableBase + Sized {}

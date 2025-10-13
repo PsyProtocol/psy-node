@@ -1,7 +1,7 @@
 use pser::{QBytesSerialize, QBytesDeserialize};
 use serde::{Deserialize, Serialize};
 
-use crate::{crypto::hash::traits::{CodeSerializableHash, MerkleHasher, MerkleZeroHasher, ZeroableHash}, data::serializable::QPDSerializable};
+use crate::{crypto::hash::{traits::{CodeSerializableHash, ZeroableHash}, traits::{MerkleHasher, MerkleZeroHasher}}, data::serializable::QPDSerializable};
 
 
 

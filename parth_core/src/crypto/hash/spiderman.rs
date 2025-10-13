@@ -1,6 +1,6 @@
 use serde::{de::DeserializeOwned, Serialize};
 
-use crate::{crypto::hash::{merkle_proof::{DeltaMerkleProofCore, MerkleProofCore}, traits::{MerkleHasher, ZeroableHash}}, data::serializable::QPDSerializable, utils::math::{log2_ceil, log2_strict}};
+use crate::{crypto::hash::{traits::ZeroableHash, merkle_proof::{DeltaMerkleProofCore, MerkleProofCore}, traits::MerkleHasher}, data::serializable::QPDSerializable, utils::math::{log2_ceil, log2_strict}};
 use crate::crypto::hash::traits::MerkleLeafHasher;
 use pser::{QBytesSerialize, QBytesDeserialize};
 

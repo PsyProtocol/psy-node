@@ -1,7 +1,9 @@
 pub mod merkle_proof;
-pub mod traits;
+//pub mod traits;
 pub mod spiderman;
 pub mod tag_tree;
 pub mod merkle_update_builder;
 pub mod merkle_node_cache;
 pub mod nca;
+pub mod merkle_store;
+pub mod traits;

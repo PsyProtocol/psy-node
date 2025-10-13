@@ -3,7 +3,7 @@ use std::{collections::{HashMap, HashSet}, sync::Arc};
 use parth_common::memory_stores::simple_memory_tag_tree_store::SimpleMemoryTagTreeStore;
 use parth_core::{
     crypto::hash::{
-        merkle_proof::{DeltaMerkleProofCore, MerkleProofCore}, tag_tree::{hash_tag_tree_node, compute_tag_tree_root_for_proof, TagTreeNodePreimage, TagTreeMerkleProof, TagTreeStorageNode}, traits::MerkleZeroHasher
+        merkle_proof::DeltaMerkleProofCore, tag_tree::{hash_tag_tree_node, compute_tag_tree_root_for_proof, TagTreeNodePreimage, TagTreeMerkleProof, TagTreeStorageNode}, traits::MerkleZeroHasher
     },
     data::{
         db::{
@@ -401,103 +401,7 @@ impl<
             _phantom_obj_double_id_table_b_value: std::marker::PhantomData,
         }
     }
-    // start merkle helpers
 
-    async fn db_select_double_id_merkle_proof_max_checkpoint(
-        &self,
-        table: &DoubleIdMerkleTableIdentifier,
-        max_checkpoint_id: u64,
-        tree_id: u64,
-        tree_sub_id: u64,
-        tree_height: u8,
-        key: &SimpleMerkleNodeKey,
-    ) -> anyhow::Result<MerkleProofCore<Hash>> {
-        let mut lookup = key.siblings();
-        lookup.push(key.clone());
-        lookup.push(SimpleMerkleNodeKey::new_root());
-        let mut results = self
-            .store
-            .db_select_many_double_id_merkle_nodes_max_checkpoint(table, max_checkpoint_id, tree_id, tree_sub_id, tree_height, &lookup)
-            .await?;
-        let root = results.pop().ok_or_else(|| anyhow::anyhow!("No root found in merkle proof"))?;
-        let value = results.pop().ok_or_else(|| anyhow::anyhow!("No node found in merkle proof"))?;
-        Ok(MerkleProofCore {
-            root,
-            value,
-            index: key.index,
-            siblings: results,
-        })
-    }
-
-    async fn db_select_single_id_merkle_proof_max_checkpoint(
-        &self,
-        table: &SingleIdMerkleTableIdentifier,
-        checkpoint_id: u64,
-        tree_id: u64,
-        tree_height: u8,
-        key: SimpleMerkleNodeKey,
-    ) -> anyhow::Result<MerkleProofCore<Hash>> {
-        let mut lookup = key.siblings();
-        lookup.push(key.clone());
-        lookup.push(SimpleMerkleNodeKey::new_root());
-        let mut results = self
-            .store
-            .db_select_many_single_id_merkle_nodes_max_checkpoint(table, checkpoint_id, tree_id, tree_height, &lookup)
-            .await?;
-        let root = results.pop().ok_or_else(|| anyhow::anyhow!("No root found in merkle proof"))?;
-        let value = results.pop().ok_or_else(|| anyhow::anyhow!("No node value found in merkle proof"))?;
-        Ok(MerkleProofCore {
-            root,
-            value,
-            siblings: results,
-            index: key.index,
-        })
-    }
-    async fn db_select_zero_id_merkle_proof_max_checkpoint(
-        &self,
-        table: &ZeroIdMerkleTableIdentifier,
-        max_checkpoint_id: u64,
-        key: &SimpleMerkleNodeKey,
-    ) -> anyhow::Result<MerkleProofCore<Hash>> {
-        let mut lookup = key.siblings();
-        lookup.push(key.clone());
-        lookup.push(SimpleMerkleNodeKey::new_root());
-        let mut results = self
-            .store
-            .db_select_many_zero_id_merkle_nodes_max_checkpoint(table, max_checkpoint_id, &lookup)
-            .await?;
-        let root = results.pop().ok_or_else(|| anyhow::anyhow!("No root found in merkle proof"))?;
-        let value = results.pop().ok_or_else(|| anyhow::anyhow!("No node found in merkle proof"))?;
-        Ok(MerkleProofCore {
-            root,
-            value,
-            index: key.index,
-            siblings: results,
-        })
-    }
-    async fn db_select_zero_id_merkle_proof_max_checkpoint_to_root_level(
-        &self,
-        table: &ZeroIdMerkleTableIdentifier,
-        max_checkpoint_id: u64,
-        root_level: u8,
-        key: &SimpleMerkleNodeKey,
-    ) -> anyhow::Result<MerkleProofCore<Hash>> {
-        let mut lookup = key.siblings();
-        lookup.push(key.clone());
-        lookup.push(key.parent_at_level(root_level));
-        let mut results = self
-            .store
-            .db_select_many_zero_id_merkle_nodes_max_checkpoint(table, max_checkpoint_id, &lookup)
-            .await?;
-        let root = results.pop().ok_or_else(|| anyhow::anyhow!("No root found in merkle proof"))?;
-        let value = results.pop().ok_or_else(|| anyhow::anyhow!("No node found in merkle proof"))?;
-        Ok(MerkleProofCore {
-            root,
-            value,
-            index: key.index,
-            siblings: results,
-        })
-    }
 }
 
 // START: TH Helpers

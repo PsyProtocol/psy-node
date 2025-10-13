@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use anyhow::{Context, anyhow};
+use anyhow::Context;
 use futures::future::join_all;
 use futures::StreamExt;
 use parth_core::{

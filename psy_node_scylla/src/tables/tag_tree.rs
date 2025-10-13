@@ -280,7 +280,7 @@ impl ScyllaTagTreeNodesPreparedStatements {
         let rows = res.into_rows_result()?;
         if let Some(row) = rows.maybe_first_row::<(Option<Vec<u8>>,)>()? {
             match row.0 {
-                Some(d) => Ok((Hash::from_bytes(&d)?)),
+                Some(d) => Ok(Hash::from_bytes(&d)?),
                 None => Ok(Hash::get_zero_value()),
             }
         } else {

@@ -517,6 +517,20 @@ impl<
 
 #[async_trait]
 #[auto_impl(&, Arc)]
+pub trait CoreDatabaseZeroIdMerkleDumpReader<
+    Hash: QHashBase + Send + Sync,
+    Hasher: MerkleZeroHasher<Hash> + Send + Sync,
+    TableIdentifier: Clone + Send + Sync,
+>
+{
+    async fn db_dump_zero_id_merkle_nodes(
+        &self,
+        table: &TableIdentifier,
+        checkpoint_id: u64,
+    ) -> anyhow::Result<Vec<SimpleMerkleNode<Hash>>>;
+}
+#[async_trait]
+#[auto_impl(&, Arc)]
 pub trait CoreDatabaseZeroIdMerkleReader<
     Hash: QHashBase + Send + Sync,
     Hasher: MerkleZeroHasher<Hash> + Send + Sync,

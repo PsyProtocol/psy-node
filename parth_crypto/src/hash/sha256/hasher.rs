@@ -1,6 +1,6 @@
 use sha2::{Digest, Sha256};
 
-use parth_core::{crypto::hash::traits::{BasicBytesHasher, BasicDataHasher, MerkleHasher}, data::hash::hash256::Hash256};
+use parth_core::{crypto::hash::{traits::{BasicBytesHasher, BasicDataHasher}, traits::MerkleHasher}, data::hash::hash256::Hash256};
 
 
 
