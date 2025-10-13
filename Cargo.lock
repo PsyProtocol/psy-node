@@ -1620,6 +1620,7 @@ dependencies = [
  "futures",
  "hex",
  "hex-literal",
+ "parth_common",
  "parth_core",
  "parth_crypto",
  "pderive",

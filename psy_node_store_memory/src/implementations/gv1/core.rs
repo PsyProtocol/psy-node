@@ -1536,6 +1536,18 @@ impl<
         Ok(())
     }
 
+    async fn set_tag_tree_tag_known_height(
+        &self,
+        table: &TTID,
+        unique_pending_id: u64,
+        _tag_tree_height: u8,
+        key: &SimpleMerkleNodeKey,
+        tag: &H,
+    ) -> anyhow::Result<()> {let tags_table = get_or_create_table(&self.tag_tree_tags, table);
+        let db_key = (unique_pending_id, *key);
+        tags_table.insert(db_key, *tag);
+        Ok(())
+    }
     async fn set_tag_tree_tag(&self, table: &TTID, unique_pending_id: u64, key: &SimpleMerkleNodeKey, tag: &H) -> anyhow::Result<()> {
         let tags_table = get_or_create_table(&self.tag_tree_tags, table);
         let db_key = (unique_pending_id, *key);

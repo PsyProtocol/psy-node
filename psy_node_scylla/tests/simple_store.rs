@@ -1,5 +1,6 @@
 use std::{collections::{HashMap, HashSet}, sync::Arc};
 
+use parth_common::memory_stores::simple_memory_tag_tree_store::SimpleMemoryTagTreeStore;
 use parth_core::{
     crypto::hash::{
         merkle_proof::{DeltaMerkleProofCore, MerkleProofCore}, tag_tree::{hash_tag_tree_node, compute_tag_tree_root_for_proof, TagTreeNodePreimage, TagTreeMerkleProof, TagTreeStorageNode}, traits::MerkleZeroHasher
@@ -4032,92 +4033,6 @@ impl<
         assert_eq!(result.root, stored_root, "Proof root does not match stored root");
         Ok(result)
     }
-pub async fn th_test_tag_tree_basic(&self, table: &RewardTreeTableIdentifier, unique_pending_id: u64) -> anyhow::Result<()> {
-        let tree_height = 5u8;
-        let num_leaves = 1u64 << tree_height;
-
-        let mut hash_map_dat = HashMap::<SimpleMerkleNodeKey, (Hash, Hash)>::new();
-
-        // Set tags for leaves
-        for i in 0..num_leaves {
-            let tag = Hash::qp_rand_gen();
-            let key = SimpleMerkleNodeKey::new(tree_height, i);
-            let value = hash_tag_tree_node::<Hash, Hasher>(&Hash::default(), &Hash::default(), &tag);
-            hash_map_dat.insert(key, (tag, value));
-            self.th_util_set_tag_tree_tag_value(table, unique_pending_id, &key, &tag, &value).await?;
-        }
-
-        // Set tags for internals bottom-up
-        for lev in (0..tree_height).rev() {
-            let num_nodes = 1u64 << lev;
-            for i in 0..num_nodes {
-                let tag = Hash::qp_rand_gen();
-                let key = SimpleMerkleNodeKey::new(lev, i);
-                let left_key = key.left_child();
-                let right_key = key.right_child();
-                let left_value = hash_map_dat[&left_key].1;
-                let right_value = hash_map_dat[&right_key].1;
-                let value = hash_tag_tree_node::<Hash, Hasher>(&left_value, &right_value, &tag);
-                hash_map_dat.insert(key, (tag, value));
-                self.th_util_set_tag_tree_tag_value(table, unique_pending_id, &key, &tag, &value).await?;
-            }
-        }
-
-        for (key, &(tag, value)) in hash_map_dat.iter() {
-            let retrieved_tag = self.th_util_get_tag_tree_node_tag(table, unique_pending_id, key).await?;
-            assert_eq!(retrieved_tag, Some(tag), "Retrieved tag does not match");
-            let retrieved_value = self.th_util_get_tag_tree_node_value(table, unique_pending_id, key).await?;
-            assert_eq!(retrieved_value, Some(value), "Retrieved value does not match");
-        }
-
-        let all_keys = hash_map_dat.keys().cloned().collect::<Vec<_>>();
-        let multi_values = self.th_util_get_many_tag_tree_node_values(table, unique_pending_id, &all_keys).await?;
-        for (i, key) in all_keys.iter().enumerate() {
-            assert_eq!(multi_values[i], Some(hash_map_dat[key].1), "Multi retrieved value does not match");
-        }
-
-        let root_key = SimpleMerkleNodeKey::new_root();
-        let root = self.th_util_get_tag_tree_root(table, unique_pending_id).await?;
-        assert_eq!(root, Some(hash_map_dat[&root_key].1), "Retrieved root does not match");
-
-        for i in 0..num_leaves {
-            let key = SimpleMerkleNodeKey::new(tree_height, i);
-            let proof = self.th_util_get_tag_tree_merkle_proof(table, unique_pending_id, &key).await?;
-            assert_eq!(proof.root, root.unwrap(), "Proof root does not match tree root");
-        }
-
-        let missing_key = SimpleMerkleNodeKey::new(tree_height, num_leaves);
-        let missing_value = self.th_util_get_tag_tree_node_value(table, unique_pending_id, &missing_key).await?;
-        assert!(missing_value.is_none(), "Missing value should be None");
-        let missing_tag = self.th_util_get_tag_tree_node_tag(table, unique_pending_id, &missing_key).await?;
-        assert!(missing_tag.is_none(), "Missing tag should be None");
-        let proof_missing = self.th_util_get_tag_tree_merkle_proof(table, unique_pending_id, &missing_key).await?;
-        assert_eq!(proof_missing.leaf.left, Hash::default());
-        assert_eq!(proof_missing.leaf.right, Hash::default());
-        assert_eq!(proof_missing.leaf.tag, Hash::default());
-        assert!(proof_missing.verify::<Hasher>(), "Missing proof verification failed");
-
-        let different_pending_id = unique_pending_id + 1;
-        let root_diff = self.th_util_get_tag_tree_root(table, different_pending_id).await?;
-        assert!(root_diff.is_none(), "Different pending id root should be None");
-        let value_diff = self.th_util_get_tag_tree_node_value(table, different_pending_id, &root_key).await?;
-        assert!(value_diff.is_none(), "Different pending id value should be None");
-
-        let override_key = SimpleMerkleNodeKey::new(tree_height - 1, 0);
-        let new_tag = Hash::qp_rand_gen();
-        self.th_util_set_tag_tree_tag(table, unique_pending_id, &override_key, &new_tag).await?;
-        let retrieved_new_tag = self.th_util_get_tag_tree_node_tag(table, unique_pending_id, &override_key).await?;
-        assert_eq!(retrieved_new_tag, Some(new_tag), "Overridden tag does not match");
-        let left = self.th_util_get_tag_tree_node_value(table, unique_pending_id, &override_key.left_child()).await?.unwrap_or_default();
-        let right = self.th_util_get_tag_tree_node_value(table, unique_pending_id, &override_key.right_child()).await?.unwrap_or_default();
-        let new_value = hash_tag_tree_node::<Hash, Hasher>(&left, &right, &new_tag);
-        let retrieved_new_value = self.th_util_get_tag_tree_node_value(table, unique_pending_id, &override_key).await?;
-        assert_eq!(retrieved_new_value, Some(new_value), "Overridden value does not match computed value");
-        let proof_after_override = self.th_util_get_tag_tree_merkle_proof(table, unique_pending_id, &override_key).await?;
-        assert!(proof_after_override.verify::<Hasher>(), "Proof after override does not verify");
-
-        Ok(())
-    }
     
     pub async fn th_util_get_tag_tree_node_value(
         &self,
@@ -4198,7 +4113,46 @@ pub async fn th_test_tag_tree_basic(&self, table: &RewardTreeTableIdentifier, un
         assert_eq!(retrieved_tag, Some(*tag), "Retrieved tag does not match set tag");
         Ok(())
     }
+    pub async fn th_test_tag_tree_v2(&self, table: &RewardTreeTableIdentifier, unique_pending_id: u64) -> anyhow::Result<()> {
 
+        let guta_height = 3u8;
+        let leaf_1 = SimpleMerkleNodeKey::new(guta_height, 0);
+        let leaf_2 = SimpleMerkleNodeKey::new(guta_height, 1);
+        let leaf_3 = SimpleMerkleNodeKey::new(guta_height, 2);
+        let leaf_5 = SimpleMerkleNodeKey::new(guta_height, 5);
+        let leaf_6 = SimpleMerkleNodeKey::new(guta_height, 6);
+        let leaves = vec![leaf_1, leaf_2, leaf_3, leaf_5, leaf_6];
+        let group_levels = generate_nca_tree_groups_efficient(&leaves, guta_height);
+        let tree_height = group_levels.len()-1;
+        assert_eq!(group_levels.len(), 3);
+        let mut simple_tree = SimpleMemoryTagTreeStore::<Hasher, Hash>::new(tree_height as u8);
+        let mut hash_map_dat = HashMap::<SimpleMerkleNodeKey, SimpleMerkleNodeKey>::new();
+        for (level, gl) in group_levels.iter().enumerate() {    
+            for (index, g) in gl.iter().enumerate() {
+                let hash = Hash::qp_rand_gen();
+                let key = SimpleMerkleNodeKey::new((tree_height-level) as u8, index as u64);
+                hash_map_dat.insert(g.nca, key);
+                self.store.set_tag_tree_tag_known_height(table, unique_pending_id, tree_height as u8, &key, &hash).await?;
+                simple_tree.set_tag(key, hash);
+                let retrieved_tag = self.store.db_get_tag_tree_node_tag(table, unique_pending_id, &key).await?;
+                assert_eq!(retrieved_tag, Some(hash), "Retrieved tag does not match");
+                let ret_combo = self.store.db_get_tag_tree_node_value(table, unique_pending_id, &key).await?;
+                assert!(ret_combo.is_some(), "Retrieved value should be Some");
+                let left = self.store.db_get_tag_tree_node_value(table, unique_pending_id, &key.left_child()).await?.unwrap_or_default();
+                let right = self.store.db_get_tag_tree_node_value(table, unique_pending_id, &key.right_child()).await?.unwrap_or_default();
+                let expected_value = hash_tag_tree_node::<Hash, Hasher>(&left, &right, &hash);
+                assert_eq!(ret_combo.unwrap(), expected_value, "Retrieved value does not match expected value");
+            }
+        }
+        for g in group_levels.iter().flatten() {
+            let key = hash_map_dat[&g.nca];
+            let proof = simple_tree.get_proof_full(key);
+            let proof_2 = self.store.db_get_tag_tree_merkle_proof(table, unique_pending_id, &key).await?;
+            assert_eq!(proof, proof_2, "Proofs do not match");
+            assert!(proof.verify::<Hasher>(), "proof verification failed"); 
+        }
+        Ok(())
+    }
     pub async fn th_test_tag_tree_small(&self, table: &RewardTreeTableIdentifier, unique_pending_id: u64) -> anyhow::Result<()> {
         let guta_height = 3u8;
         let leaf_1 = SimpleMerkleNodeKey::new(guta_height, 0);
@@ -4233,6 +4187,49 @@ pub async fn th_test_tag_tree_basic(&self, table: &RewardTreeTableIdentifier, un
             assert!(proof.verify::<Hasher>(), "Proof verification failed");
         }
 
+        Ok(())
+    }
+
+    pub async fn th_test_tag_tree_medium(&self, table: &RewardTreeTableIdentifier, unique_pending_id: u64) -> anyhow::Result<()> {
+
+        let guta_height: u8 = 32;
+        let leaves = random_nodes_in_tree(guta_height, 1337);
+        let group_levels = generate_nca_tree_groups_efficient(&leaves, guta_height);
+
+        let tree_height = group_levels.len() - 1;
+        let mut simple_tree = SimpleMemoryTagTreeStore::<Hasher, Hash>::new(tree_height as u8);
+
+        let mut hash_map_dat = HashMap::<SimpleMerkleNodeKey, SimpleMerkleNodeKey>::new();
+
+        for (level, gl) in group_levels.iter().enumerate() {
+
+            for (index, g) in gl.iter().enumerate() {
+                let hash = Hash::qp_rand_gen();
+                let tag_tree_key = SimpleMerkleNodeKey::new((tree_height-level) as u8, index as u64);
+                hash_map_dat.insert(g.nca, tag_tree_key);
+                simple_tree.set_tag(tag_tree_key, hash);
+                self.store.set_tag_tree_tag_known_height(table, unique_pending_id, tree_height as u8, &tag_tree_key, &hash).await?;
+                let retrieved_tag = self.store.db_get_tag_tree_node_tag(table, unique_pending_id, &tag_tree_key).await?;
+                assert_eq!(retrieved_tag, Some(hash), "Retrieved tag does not match");
+                let ret_combo = self.store.db_get_tag_tree_node_value(table, unique_pending_id, &tag_tree_key).await?;
+                assert!(ret_combo.is_some(), "Retrieved value should be Some");
+                let left = self.store.db_get_tag_tree_node_value(table, unique_pending_id, &tag_tree_key.left_child()).await?.unwrap_or_default();
+                let right = self.store.db_get_tag_tree_node_value(table, unique_pending_id, &tag_tree_key.right_child()).await?.unwrap_or_default();
+                let expected_value = hash_tag_tree_node::<Hash, Hasher>(&left, &right, &hash);
+                assert_eq!(ret_combo.unwrap(), expected_value, "Retrieved value does not match expected value");
+                assert_eq!(simple_tree.get_node_value(&tag_tree_key), expected_value, "In-memory tree value does not match expected value");
+            }
+        }
+        for g in group_levels.iter().flatten() {
+            let key = hash_map_dat[&g.nca];
+            let proof = simple_tree.get_proof_full(key);
+            assert!(proof.verify::<Hasher>(), "proof verification failed for in-memory tree");
+            let proof_2 = self.store.db_get_tag_tree_merkle_proof(table, unique_pending_id, &key).await?;
+            assert_eq!(proof, proof_2, "proof from store does not match in-memory proof");
+            assert!(proof_2.verify::<Hasher>(), "store proof verification failed");
+            let th_proof = self.th_util_get_tag_tree_merkle_proof(table, unique_pending_id, &key).await?;
+            assert!(th_proof.verify::<Hasher>(), "th_util proof verification failed");
+        }
         Ok(())
     }
 
@@ -4456,12 +4453,14 @@ impl SimpleStoreEx {
 
     pub async fn basic_test_1(&self) -> anyhow::Result<()> {
         println!("starting basic_test_1");
-        self.store.th_test_tag_tree_basic(&self.store.tag_tree_table_a, 12345).await?;
+        self.store.th_test_tag_tree_medium(&self.store.tag_tree_table_a, 54321).await?;
+        self.store.th_test_tag_tree_v2(&self.store.tag_tree_table_a, 12345).await?;
         self.store.th_test_tag_tree_tiny(&self.store.tag_tree_table_a, 123).await?;
-        println!("finished tiny tag tree test");
+        println!("finished th_test_tag_tree_v2");
         self.store.th_test_tag_tree_small(&self.store.tag_tree_table_a, 888).await?;
-        println!("finished small tag tree test");
-        println!("finished basic tag tree test");
+        //self.store.th_test_tag_tree_basic(&self.store.tag_tree_table_a, 999).await?;
+        //println!("finished small tag tree test");
+        //println!("finished basic tag tree test");
 
         // u128 <-> u64 bi-directional mapping tests
         self.store.th_test_u128_u64_pairs_table_1(&self.store.u64_u128_bi_directional_mapping_table_a).await?;

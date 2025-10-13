@@ -11,22 +11,32 @@ use parth_core::{
                 QDatabaseSingleIdTableRowLike, QDatabaseSingleIdTableRowNoCheckpointId, QDatabaseSingleIdTableRowNoCheckpointIdLike, QDoubleIdKey,
             },
         },
-        hash::merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}, serializable::QPDPair,
+        hash::merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey},
+        serializable::QPDPair,
     },
     protocol::core_types::QHashBase,
 };
 use psy_node_core::store::traits::core_db::{
-    CoreDatabaseBidirectionalMappingReader, CoreDatabaseBidirectionalMappingWriter, CoreDatabaseBidirectionalU64U128MappingReader, CoreDatabaseBidirectionalU64U128MappingWriter, CoreDatabaseDoubleIdCheckpointedReader, CoreDatabaseDoubleIdCheckpointedWriter, CoreDatabaseDoubleIdMerkleReader, CoreDatabaseDoubleIdMerkleWriter, CoreDatabaseKivReader, CoreDatabaseKivWriter, CoreDatabaseSingleIdCheckpointedReader, CoreDatabaseSingleIdCheckpointedWriter, CoreDatabaseSingleIdMerkleReader, CoreDatabaseSingleIdMerkleWriter, CoreDatabaseTagTreeReader, CoreDatabaseTagTreeWriter, CoreDatabaseU64Reader, CoreDatabaseU64Writer, CoreDatabaseZeroIdMerkleReader, CoreDatabaseZeroIdMerkleWriter
+    CoreDatabaseBidirectionalMappingReader, CoreDatabaseBidirectionalMappingWriter, CoreDatabaseBidirectionalU64U128MappingReader,
+    CoreDatabaseBidirectionalU64U128MappingWriter, CoreDatabaseDoubleIdCheckpointedReader, CoreDatabaseDoubleIdCheckpointedWriter,
+    CoreDatabaseDoubleIdMerkleReader, CoreDatabaseDoubleIdMerkleWriter, CoreDatabaseKivReader, CoreDatabaseKivWriter,
+    CoreDatabaseSingleIdCheckpointedReader, CoreDatabaseSingleIdCheckpointedWriter, CoreDatabaseSingleIdMerkleReader,
+    CoreDatabaseSingleIdMerkleWriter, CoreDatabaseTagTreeReader, CoreDatabaseTagTreeWriter, CoreDatabaseU64Reader, CoreDatabaseU64Writer,
+    CoreDatabaseZeroIdMerkleReader, CoreDatabaseZeroIdMerkleWriter,
 };
 use serde::{de::DeserializeOwned, Serialize};
 
 use crate::{
     core::ScyllaCoreStore,
     tables::{
-        blob::ScyllaBiDirectionalBlobToBlobTablePreparedStatements, merkle::{ScyllaDoubleMerkleNodesPreparedStatements, ScyllaMerkleNodesPreparedStatements, ScyllaMerkleNodesZeroPreparedStatements}, object::{
+        blob::ScyllaBiDirectionalBlobToBlobTablePreparedStatements,
+        merkle::{ScyllaDoubleMerkleNodesPreparedStatements, ScyllaMerkleNodesPreparedStatements, ScyllaMerkleNodesZeroPreparedStatements},
+        object::{
             ScyllaGenericKeyIdValueTablePreparedStatements, ScyllaGenericObjectDoubleIdTablePreparedStatements,
             ScyllaGenericObjectSingleIdTablePreparedStatements,
-        }, tag_tree::ScyllaTagTreeNodesPreparedStatements, u64_tbl::{ScyllaBidirectionalU64U128MappingPreparedStatements, ScyllaU64ToU64TablePreparedStatements}
+        },
+        tag_tree::ScyllaTagTreeNodesPreparedStatements,
+        u64_tbl::{ScyllaBidirectionalU64U128MappingPreparedStatements, ScyllaU64ToU64TablePreparedStatements},
     },
 };
 
@@ -40,7 +50,9 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
         obj_id: u64,
         max_checkpoint_id: u64,
     ) -> anyhow::Result<Option<V>> {
-        table.select_one_single_checkpointed_object_value(&self.session, obj_id, max_checkpoint_id).await
+        table
+            .select_one_single_checkpointed_object_value(&self.session, obj_id, max_checkpoint_id)
+            .await
     }
     async fn db_select_one_single_checkpointed_object_value_and_ids<V: CoreDatabaseValueDeserialize>(
         &self,
@@ -48,7 +60,8 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
         obj_id: u64,
         max_checkpoint_id: u64,
     ) -> anyhow::Result<Option<QDatabaseSingleIdTableRow<V>>> {
-        table.select_one_single_checkpointed_object_value_and_ids(&self.session, obj_id, max_checkpoint_id)
+        table
+            .select_one_single_checkpointed_object_value_and_ids(&self.session, obj_id, max_checkpoint_id)
             .await
     }
     async fn db_select_one_single_checkpointed_object_value_and_ids_t<
@@ -60,7 +73,8 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
         obj_id: u64,
         max_checkpoint_id: u64,
     ) -> anyhow::Result<Option<R>> {
-        table.select_one_single_checkpointed_object_value_and_ids_t(&self.session, obj_id, max_checkpoint_id)
+        table
+            .select_one_single_checkpointed_object_value_and_ids_t(&self.session, obj_id, max_checkpoint_id)
             .await
     }
     async fn db_select_all_single_checkpointed_object<V: CoreDatabaseValueDeserialize>(
@@ -75,7 +89,8 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
         obj_ids: &[u64],
         max_checkpoint_id: u64,
     ) -> anyhow::Result<Vec<Option<V>>> {
-        table.select_many_single_checkpointed_object_values(&self.session, obj_ids, max_checkpoint_id)
+        table
+            .select_many_single_checkpointed_object_values(&self.session, obj_ids, max_checkpoint_id)
             .await
     }
     async fn db_select_many_single_checkpointed_object_keys_and_values<
@@ -87,7 +102,8 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
         obj_ids: &[u64],
         max_checkpoint_id: u64,
     ) -> anyhow::Result<Vec<R>> {
-        table.select_many_single_checkpointed_object_keys_and_values(&self.session, obj_ids, max_checkpoint_id)
+        table
+            .select_many_single_checkpointed_object_keys_and_values(&self.session, obj_ids, max_checkpoint_id)
             .await
     }
 }
@@ -103,7 +119,9 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
         checkpoint_id: u64,
         value: &V,
     ) -> anyhow::Result<()> {
-        table.insert_one_single_checkpointed_object(&self.session, obj_id, checkpoint_id, value).await
+        table
+            .insert_one_single_checkpointed_object(&self.session, obj_id, checkpoint_id, value)
+            .await
     }
     async fn db_insert_many_single_checkpointed_object_rows<V: Serialize + Send + Sync>(
         &self,
@@ -128,7 +146,8 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
         checkpoint_id: u64,
         rows: &[QDatabaseSingleIdTableRowNoCheckpointId<V>],
     ) -> anyhow::Result<()> {
-        table.insert_many_single_checkpointed_objects_at_checkpoint(&self.session, checkpoint_id, rows)
+        table
+            .insert_many_single_checkpointed_objects_at_checkpoint(&self.session, checkpoint_id, rows)
             .await
     }
     async fn db_insert_many_single_checkpointed_objects_at_checkpoint_t<
@@ -140,7 +159,8 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
         checkpoint_id: u64,
         rows: &[R],
     ) -> anyhow::Result<()> {
-        table.insert_many_single_checkpointed_objects_at_checkpoint_t(&self.session, checkpoint_id, rows)
+        table
+            .insert_many_single_checkpointed_objects_at_checkpoint_t(&self.session, checkpoint_id, rows)
             .await
     }
 }
@@ -156,7 +176,8 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
         secondary_id: u64,
         max_checkpoint_id: u64,
     ) -> anyhow::Result<Option<V>> {
-        table.select_one_double_checkpointed_object_value(&self.session, obj_id, secondary_id, max_checkpoint_id)
+        table
+            .select_one_double_checkpointed_object_value(&self.session, obj_id, secondary_id, max_checkpoint_id)
             .await
     }
     async fn db_select_one_double_checkpointed_object_value_and_ids<V: CoreDatabaseValueDeserialize>(
@@ -166,7 +187,8 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
         secondary_id: u64,
         max_checkpoint_id: u64,
     ) -> anyhow::Result<Option<QDatabaseDoubleIdTableRow<V>>> {
-        table.select_one_double_checkpointed_object_value_and_ids(&self.session, obj_id, secondary_id, max_checkpoint_id)
+        table
+            .select_one_double_checkpointed_object_value_and_ids(&self.session, obj_id, secondary_id, max_checkpoint_id)
             .await
     }
     async fn db_select_one_double_checkpointed_object_value_and_ids_t<
@@ -179,7 +201,8 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
         secondary_id: u64,
         max_checkpoint_id: u64,
     ) -> anyhow::Result<Option<R>> {
-        table.select_one_double_checkpointed_object_value_and_ids_t(&self.session, obj_id, secondary_id, max_checkpoint_id)
+        table
+            .select_one_double_checkpointed_object_value_and_ids_t(&self.session, obj_id, secondary_id, max_checkpoint_id)
             .await // Note: using the non-_t method, adjust if needed
     }
     async fn db_select_all_double_checkpointed_object<V: CoreDatabaseValueDeserialize>(
@@ -194,7 +217,8 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
         obj_ids: &[QDoubleIdKey],
         max_checkpoint_id: u64,
     ) -> anyhow::Result<Vec<Option<V>>> {
-        table.select_many_double_checkpointed_object_values(&self.session, obj_ids, max_checkpoint_id)
+        table
+            .select_many_double_checkpointed_object_values(&self.session, obj_ids, max_checkpoint_id)
             .await
     }
     async fn db_select_many_double_checkpointed_object_keys_and_values<
@@ -206,7 +230,8 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
         obj_ids: &[QDoubleIdKey],
         max_checkpoint_id: u64,
     ) -> anyhow::Result<Vec<R>> {
-        table.select_many_double_checkpointed_object_keys_and_values(&self.session, obj_ids, max_checkpoint_id)
+        table
+            .select_many_double_checkpointed_object_keys_and_values(&self.session, obj_ids, max_checkpoint_id)
             .await
     }
 }
@@ -223,7 +248,8 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
         checkpoint_id: u64,
         value: &V,
     ) -> anyhow::Result<()> {
-        table.insert_one_double_checkpointed_object(&self.session, obj_id, secondary_id, checkpoint_id, value)
+        table
+            .insert_one_double_checkpointed_object(&self.session, obj_id, secondary_id, checkpoint_id, value)
             .await
     }
     async fn db_insert_many_double_checkpointed_object_rows<V: Serialize + Send + Sync>(
@@ -249,7 +275,8 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
         checkpoint_id: u64,
         rows: &[QDatabaseDoubleIdTableRowNoCheckpointId<V>],
     ) -> anyhow::Result<()> {
-        table.insert_many_double_checkpointed_objects_at_checkpoint(&self.session, checkpoint_id, rows)
+        table
+            .insert_many_double_checkpointed_objects_at_checkpoint(&self.session, checkpoint_id, rows)
             .await
     }
     async fn db_insert_many_double_checkpointed_objects_at_checkpoint_t<
@@ -261,7 +288,8 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
         checkpoint_id: u64,
         rows: &[R],
     ) -> anyhow::Result<()> {
-        table.insert_many_double_checkpointed_objects_at_checkpoint_t(&self.session, checkpoint_id, rows)
+        table
+            .insert_many_double_checkpointed_objects_at_checkpoint_t(&self.session, checkpoint_id, rows)
             .await
     }
 }
@@ -345,50 +373,54 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
 impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
     CoreDatabaseZeroIdMerkleReader<Hash, Hasher, ScyllaMerkleNodesZeroPreparedStatements> for ScyllaCoreStore<Hash, Hasher>
 {
-
     async fn db_select_zero_id_merkle_node_max_checkpoint(
         &self,
         table: &ScyllaMerkleNodesZeroPreparedStatements,
         max_checkpoint_id: u64,
         key: &SimpleMerkleNodeKey,
-    ) -> anyhow::Result<Hash>{
-        table.select_zero_id_merkle_node_max_checkpoint_internal::<Hash, Hasher>(&self.session, max_checkpoint_id, *key).await
+    ) -> anyhow::Result<Hash> {
+        table
+            .select_zero_id_merkle_node_max_checkpoint_internal::<Hash, Hasher>(&self.session, max_checkpoint_id, *key)
+            .await
     }
     async fn db_select_many_zero_id_merkle_nodes_max_checkpoint(
         &self,
         table: &ScyllaMerkleNodesZeroPreparedStatements,
         max_checkpoint_id: u64,
         keys: &[SimpleMerkleNodeKey],
-    ) -> anyhow::Result<Vec<Hash>>{
-        table.select_many_zero_id_merkle_nodes_max_checkpoint_internal::<Hash, Hasher>(&self.session, max_checkpoint_id, keys).await
+    ) -> anyhow::Result<Vec<Hash>> {
+        table
+            .select_many_zero_id_merkle_nodes_max_checkpoint_internal::<Hash, Hasher>(&self.session, max_checkpoint_id, keys)
+            .await
     }
 }
-
 
 #[async_trait]
 impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
     CoreDatabaseZeroIdMerkleWriter<Hash, Hasher, ScyllaMerkleNodesZeroPreparedStatements> for ScyllaCoreStore<Hash, Hasher>
 {
-
     async fn db_insert_zero_id_merkle_node(
         &self,
         table: &ScyllaMerkleNodesZeroPreparedStatements,
         checkpoint_id: u64,
         key: &SimpleMerkleNodeKey,
         value: &Hash,
-    ) -> anyhow::Result<()>{
-        table.insert_zero_id_merkle_node_internal(&self.session, checkpoint_id, *key, &value.to_bytes()?).await
+    ) -> anyhow::Result<()> {
+        table
+            .insert_zero_id_merkle_node_internal(&self.session, checkpoint_id, *key, &value.to_bytes()?)
+            .await
     }
     async fn db_set_zero_id_merkle_nodes_batch(
         &self,
         table: &ScyllaMerkleNodesZeroPreparedStatements,
         checkpoint_id: u64,
         nodes: &[SimpleMerkleNode<Hash>],
-    ) -> anyhow::Result<()>{
-        table.set_zero_id_merkle_nodes_batch_internal::<Hash>(&self.session, checkpoint_id, nodes).await
+    ) -> anyhow::Result<()> {
+        table
+            .set_zero_id_merkle_nodes_batch_internal::<Hash>(&self.session, checkpoint_id, nodes)
+            .await
     }
 }
-
 
 #[async_trait]
 impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
@@ -402,7 +434,8 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
         tree_height: u8,
         key: SimpleMerkleNodeKey,
     ) -> anyhow::Result<Hash> {
-        table.select_single_id_merkle_node_max_checkpoint_internal::<Hash, Hasher>(&self.session, checkpoint_id, tree_id, tree_height, key)
+        table
+            .select_single_id_merkle_node_max_checkpoint_internal::<Hash, Hasher>(&self.session, checkpoint_id, tree_id, tree_height, key)
             .await
     }
     async fn db_select_many_single_id_merkle_nodes_max_checkpoint(
@@ -413,7 +446,8 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
         tree_height: u8,
         keys: &[SimpleMerkleNodeKey],
     ) -> anyhow::Result<Vec<Hash>> {
-        table.select_many_single_id_merkle_nodes_max_checkpoint_internal::<Hash, Hasher>(&self.session, max_checkpoint_id, tree_id, tree_height, keys)
+        table
+            .select_many_single_id_merkle_nodes_max_checkpoint_internal::<Hash, Hasher>(&self.session, max_checkpoint_id, tree_id, tree_height, keys)
             .await
     }
 }
@@ -430,7 +464,8 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
         key: SimpleMerkleNodeKey,
         value: &Hash,
     ) -> anyhow::Result<()> {
-        table.insert_single_id_merkle_node_internal(&self.session, checkpoint_id, tree_id, key, &value.to_bytes()?)
+        table
+            .insert_single_id_merkle_node_internal(&self.session, checkpoint_id, tree_id, key, &value.to_bytes()?)
             .await
     }
     async fn db_set_single_id_merkle_nodes_batch(
@@ -440,7 +475,8 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
         tree_id: u64,
         nodes: &[SimpleMerkleNode<Hash>],
     ) -> anyhow::Result<()> {
-        table.set_single_id_merkle_nodes_batch_internal::<Hash>(&self.session, checkpoint_id, tree_id, nodes)
+        table
+            .set_single_id_merkle_nodes_batch_internal::<Hash>(&self.session, checkpoint_id, tree_id, nodes)
             .await
     }
 }
@@ -458,7 +494,15 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
         tree_height: u8,
         key: SimpleMerkleNodeKey,
     ) -> anyhow::Result<Hash> {
-        table.select_double_id_merkle_node_max_checkpoint_internal::<Hash, Hasher>(&self.session, checkpoint_id, tree_id, tree_height, tree_sub_id, key)
+        table
+            .select_double_id_merkle_node_max_checkpoint_internal::<Hash, Hasher>(
+                &self.session,
+                checkpoint_id,
+                tree_id,
+                tree_height,
+                tree_sub_id,
+                key,
+            )
             .await
     }
     async fn db_select_many_double_id_merkle_nodes_max_checkpoint(
@@ -470,7 +514,15 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
         tree_height: u8,
         keys: &[SimpleMerkleNodeKey],
     ) -> anyhow::Result<Vec<Hash>> {
-        table.select_many_double_id_merkle_nodes_max_checkpoint_internal::<Hash, Hasher>(&self.session, max_checkpoint_id, tree_id, tree_sub_id, tree_height, keys)
+        table
+            .select_many_double_id_merkle_nodes_max_checkpoint_internal::<Hash, Hasher>(
+                &self.session,
+                max_checkpoint_id,
+                tree_id,
+                tree_sub_id,
+                tree_height,
+                keys,
+            )
             .await
     }
 }
@@ -488,7 +540,8 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
         key: SimpleMerkleNodeKey,
         value: &Hash,
     ) -> anyhow::Result<()> {
-        table.insert_double_id_merkle_node_internal(&self.session, checkpoint_id, tree_id, tree_sub_id, key, &value.to_bytes()?)
+        table
+            .insert_double_id_merkle_node_internal(&self.session, checkpoint_id, tree_id, tree_sub_id, key, &value.to_bytes()?)
             .await
     }
     async fn db_set_double_id_merkle_nodes_batch(
@@ -499,7 +552,8 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
         tree_sub_id: u64,
         nodes: &[SimpleMerkleNode<Hash>],
     ) -> anyhow::Result<()> {
-        table.set_double_id_merkle_nodes_batch_internal(&self.session, checkpoint_id, tree_id, tree_sub_id, nodes)
+        table
+            .set_double_id_merkle_nodes_batch_internal(&self.session, checkpoint_id, tree_id, tree_sub_id, nodes)
             .await
     }
 }
@@ -589,58 +643,87 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
     }
 }
 
-
 #[async_trait]
-impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync> CoreDatabaseU64Reader<ScyllaU64ToU64TablePreparedStatements> for ScyllaCoreStore<Hash, Hasher> {
-    async fn db_select_u64_value(&self, table: &ScyllaU64ToU64TablePreparedStatements, obj_id: u64) -> anyhow::Result<Option<u64>>{
+impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync> CoreDatabaseU64Reader<ScyllaU64ToU64TablePreparedStatements>
+    for ScyllaCoreStore<Hash, Hasher>
+{
+    async fn db_select_u64_value(&self, table: &ScyllaU64ToU64TablePreparedStatements, obj_id: u64) -> anyhow::Result<Option<u64>> {
         table.select_one_single(&self.session, obj_id).await
     }
-    async fn db_select_u64_values(&self, table: &ScyllaU64ToU64TablePreparedStatements, obj_ids: &[u64]) -> anyhow::Result<Vec<Option<u64>>>{
+    async fn db_select_u64_values(&self, table: &ScyllaU64ToU64TablePreparedStatements, obj_ids: &[u64]) -> anyhow::Result<Vec<Option<u64>>> {
         table.select_many_values(self.session.clone(), obj_ids).await
     }
 }
 
 #[async_trait]
-impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync> CoreDatabaseU64Writer<ScyllaU64ToU64TablePreparedStatements> for ScyllaCoreStore<Hash, Hasher> {
-    async fn db_inc_counter(&self, table: &ScyllaU64ToU64TablePreparedStatements, obj_id: u64, amount: i64) -> anyhow::Result<u64>{
+impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync> CoreDatabaseU64Writer<ScyllaU64ToU64TablePreparedStatements>
+    for ScyllaCoreStore<Hash, Hasher>
+{
+    async fn db_inc_counter(&self, table: &ScyllaU64ToU64TablePreparedStatements, obj_id: u64, amount: i64) -> anyhow::Result<u64> {
         table.atomic_increment(&self.session, obj_id, amount as u64).await
     }
-    async fn db_set_u64_value(&self, table: &ScyllaU64ToU64TablePreparedStatements, obj_id: u64, value: u64) -> anyhow::Result<()>{
+    async fn db_set_u64_value(&self, table: &ScyllaU64ToU64TablePreparedStatements, obj_id: u64, value: u64) -> anyhow::Result<()> {
         table.set_or_insert_one(&self.session, obj_id, value).await
     }
-    async fn db_set_many_u64_values(&self, table: &ScyllaU64ToU64TablePreparedStatements, rows: &[QPDPair<u64, u64>]) -> anyhow::Result<()>{
+    async fn db_set_many_u64_values(&self, table: &ScyllaU64ToU64TablePreparedStatements, rows: &[QPDPair<u64, u64>]) -> anyhow::Result<()> {
         table.set_or_insert_many_qpd_pair(&self.session, rows).await
     }
 }
 
 #[async_trait]
-impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync> CoreDatabaseBidirectionalU64U128MappingReader<ScyllaBidirectionalU64U128MappingPreparedStatements> for ScyllaCoreStore<Hash, Hasher> {
-    async fn db_select_one_u128_value_by_u64(&self, table: &ScyllaBidirectionalU64U128MappingPreparedStatements, key: u64) -> anyhow::Result<Option<u128>>{
+impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+    CoreDatabaseBidirectionalU64U128MappingReader<ScyllaBidirectionalU64U128MappingPreparedStatements> for ScyllaCoreStore<Hash, Hasher>
+{
+    async fn db_select_one_u128_value_by_u64(
+        &self,
+        table: &ScyllaBidirectionalU64U128MappingPreparedStatements,
+        key: u64,
+    ) -> anyhow::Result<Option<u128>> {
         table.get_k2_from_k1(&self.session, key).await
-
     }
-    async fn db_select_one_u64_key_by_u128(&self, table: &ScyllaBidirectionalU64U128MappingPreparedStatements, value: u128) -> anyhow::Result<Option<u64>>{
+    async fn db_select_one_u64_key_by_u128(
+        &self,
+        table: &ScyllaBidirectionalU64U128MappingPreparedStatements,
+        value: u128,
+    ) -> anyhow::Result<Option<u64>> {
         table.get_k1_from_k2(&self.session, value).await
     }
-    async fn db_select_many_u128_values_by_u64s(&self, table: &ScyllaBidirectionalU64U128MappingPreparedStatements, keys: &[u64]) -> anyhow::Result<Vec<Option<u128>>>{
+    async fn db_select_many_u128_values_by_u64s(
+        &self,
+        table: &ScyllaBidirectionalU64U128MappingPreparedStatements,
+        keys: &[u64],
+    ) -> anyhow::Result<Vec<Option<u128>>> {
         table.get_k2s_from_k1s(self.session.clone(), keys).await
     }
-    async fn db_select_many_u64_keys_by_u128s(&self, table: &ScyllaBidirectionalU64U128MappingPreparedStatements, values: &[u128]) -> anyhow::Result<Vec<Option<u64>>>{
+    async fn db_select_many_u64_keys_by_u128s(
+        &self,
+        table: &ScyllaBidirectionalU64U128MappingPreparedStatements,
+        values: &[u128],
+    ) -> anyhow::Result<Vec<Option<u64>>> {
         table.get_k1s_from_k2s(self.session.clone(), values).await
     }
 }
 
 #[async_trait]
-impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync> CoreDatabaseBidirectionalU64U128MappingWriter<ScyllaBidirectionalU64U128MappingPreparedStatements> for ScyllaCoreStore<Hash, Hasher> {
-    async fn db_insert_u64_u128_mapping_pair(&self, table: &ScyllaBidirectionalU64U128MappingPreparedStatements, k1: u64, k2: u128) -> anyhow::Result<()>{
+impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+    CoreDatabaseBidirectionalU64U128MappingWriter<ScyllaBidirectionalU64U128MappingPreparedStatements> for ScyllaCoreStore<Hash, Hasher>
+{
+    async fn db_insert_u64_u128_mapping_pair(
+        &self,
+        table: &ScyllaBidirectionalU64U128MappingPreparedStatements,
+        k1: u64,
+        k2: u128,
+    ) -> anyhow::Result<()> {
         table.insert_u64_u128_mapping_pair(&self.session, k1, k2).await
     }
-    async fn db_insert_u64_u128_mapping_pairs(&self, table: &ScyllaBidirectionalU64U128MappingPreparedStatements, keys: &[BiDirectionalMappingRow<u64, u128>]) -> anyhow::Result<()>{
+    async fn db_insert_u64_u128_mapping_pairs(
+        &self,
+        table: &ScyllaBidirectionalU64U128MappingPreparedStatements,
+        keys: &[BiDirectionalMappingRow<u64, u128>],
+    ) -> anyhow::Result<()> {
         table.insert_u64_u128_mapping_pairs(&self.session, keys).await
     }
 }
-
-
 
 #[async_trait]
 impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
@@ -651,55 +734,41 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
         table: &ScyllaTagTreeNodesPreparedStatements,
         unique_pending_id: u64,
         key: &SimpleMerkleNodeKey,
-    ) -> anyhow::Result<Option<Hash>>{
+    ) -> anyhow::Result<Option<Hash>> {
         table.select_one_tag_tree_value(&self.session, unique_pending_id, *key).await
-
     }
     async fn db_get_tag_tree_node_values(
         &self,
         table: &ScyllaTagTreeNodesPreparedStatements,
         unique_pending_id: u64,
         keys: &[SimpleMerkleNodeKey],
-    ) -> anyhow::Result<Vec<Option<Hash>>>{
+    ) -> anyhow::Result<Vec<Option<Hash>>> {
         table.select_many_tag_tree_values(&self.session, unique_pending_id, keys).await
-
     }
     async fn db_get_tag_tree_node_tag(
         &self,
         table: &ScyllaTagTreeNodesPreparedStatements,
         unique_pending_id: u64,
         key: &SimpleMerkleNodeKey,
-    ) -> anyhow::Result<Option<Hash>>{
+    ) -> anyhow::Result<Option<Hash>> {
         let r = table.select_one_tag_tree_tag_and_value(&self.session, unique_pending_id, key).await?;
         if let Some(tts) = r {
-
             Ok(Some(tts.tag))
         } else {
             Ok(None)
-
-
         }
-
-
-
     }
-    async fn db_get_tag_tree_root(
-        &self,
-        table: &ScyllaTagTreeNodesPreparedStatements,        
-        unique_pending_id: u64,
-    ) -> anyhow::Result<Option<Hash>>{
+    async fn db_get_tag_tree_root(&self, table: &ScyllaTagTreeNodesPreparedStatements, unique_pending_id: u64) -> anyhow::Result<Option<Hash>> {
         let root_key = SimpleMerkleNodeKey::new_root();
         table.select_one_tag_tree_value(&self.session, unique_pending_id, root_key).await
-
     }
     async fn db_get_tag_tree_merkle_proof(
         &self,
-        table: &ScyllaTagTreeNodesPreparedStatements,        
+        table: &ScyllaTagTreeNodesPreparedStatements,
         unique_pending_id: u64,
         key: &SimpleMerkleNodeKey,
-    ) -> anyhow::Result<TagTreeMerkleProof<Hash>>{
+    ) -> anyhow::Result<TagTreeMerkleProof<Hash>> {
         table.select_tag_tree_proof::<Hash>(&self.session, unique_pending_id, *key).await
-
     }
 }
 
@@ -707,6 +776,18 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
 impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
     CoreDatabaseTagTreeWriter<Hash, Hasher, ScyllaTagTreeNodesPreparedStatements> for ScyllaCoreStore<Hash, Hasher>
 {
+    async fn set_tag_tree_tag_known_height(
+        &self,
+        table: &ScyllaTagTreeNodesPreparedStatements,
+        unique_pending_id: u64,
+        tag_tree_height: u8,
+        key: &SimpleMerkleNodeKey,
+        tag: &Hash,
+    ) -> anyhow::Result<()> {
+        table
+            .set_tag_only_computed::<Hash, Hasher>(&self.session, unique_pending_id, *key, Some(tag_tree_height), tag)
+            .await
+    }
     async fn set_tag_tree_tag_value(
         &self,
         table: &ScyllaTagTreeNodesPreparedStatements,
@@ -714,7 +795,7 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
         key: &SimpleMerkleNodeKey,
         tag: &Hash,
         value: &Hash,
-    ) -> anyhow::Result<()>{
+    ) -> anyhow::Result<()> {
         let tag_vec = tag.to_bytes()?;
         let value_vec = value.to_bytes()?;
         table.set_or_insert_one(&self.session, unique_pending_id, key, &tag_vec, &value_vec).await
@@ -725,9 +806,9 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
         unique_pending_id: u64,
         key: &SimpleMerkleNodeKey,
         tag: &Hash,
-    ) -> anyhow::Result<()>{
-        table.set_tag_only_computed::<Hash, Hasher>(&self.session, unique_pending_id, *key, tag).await
-
-
+    ) -> anyhow::Result<()> {
+        table
+            .set_tag_only_computed::<Hash, Hasher>(&self.session, unique_pending_id, *key, None, tag)
+            .await
     }
 }

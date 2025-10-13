@@ -1355,6 +1355,12 @@ where
     ZIM_TID: TIDBase,
     TT_TID: TIDBase,
 {
+    async fn set_tag_tree_tag_known_height(&self, table: &TT_TID, unique_pending_id: u64, _tag_tree_height: u8, key: &SimpleMerkleNodeKey, tag: &Hash) -> Result<()> {
+        let inner_map = self.tag_tree_tables.entry(table.clone()).or_default();
+        let mut entry = inner_map.entry((unique_pending_id, *key)).or_insert((*tag, Hash::get_zero_value()));
+        entry.0 = *tag;
+        Ok(())
+    }
     async fn set_tag_tree_tag_value(
         &self,
         table: &TT_TID,

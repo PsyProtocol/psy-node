@@ -500,6 +500,7 @@ pub trait CoreDatabaseTagTreeWriter<Hash: QHashBase + Send + Sync, Hasher: Merkl
         value: &Hash,
     ) -> anyhow::Result<()>;
     async fn set_tag_tree_tag(&self, table: &TableIdentifier, unique_pending_id: u64, key: &SimpleMerkleNodeKey, tag: &Hash) -> anyhow::Result<()>;
+    async fn set_tag_tree_tag_known_height(&self, table: &TableIdentifier, unique_pending_id: u64, tag_tree_height: u8, key: &SimpleMerkleNodeKey, tag: &Hash) -> anyhow::Result<()>;
 }
 pub trait CoreDatabaseTagTreeStore<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync, TableIdentifier: Clone + Send + Sync>:
     CoreDatabaseTagTreeReader<Hash, Hasher, TableIdentifier> + CoreDatabaseTagTreeWriter<Hash, Hasher, TableIdentifier>
