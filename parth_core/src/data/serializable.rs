@@ -209,3 +209,7 @@ pub struct FastQPDPair<K: Serialize + DeserializeOwned + Clone + Copy, V: Serial
     pub value: V,
 }
 
+
+
+pub trait QProofWitnessSerializable: Send + Sync + pser::QBytesSerialize + pser::QBytesDeserialize + Clone {}
+impl<T: Send + Sync + pser::QBytesSerialize + pser::QBytesDeserialize + Clone> QProofWitnessSerializable for T {}

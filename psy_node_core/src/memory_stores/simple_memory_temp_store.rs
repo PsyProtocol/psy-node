@@ -171,6 +171,14 @@ impl QTempDatabaseRawKVWriterBase for SimpleMemoryTempStore {
         }
         Ok(())
     }
+
+    async fn qtdb_raw_kv_put_many_values_tuple_ref<'a>(&self, entries: &[(&'a [u8], &'a [u8])]) -> anyhow::Result<()>{
+        let mut kv_map = self.kv_map.write().map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        for (key, value) in entries {
+            kv_map.insert(key.to_vec(), value.to_vec());
+        }
+        Ok(())
+    }
 }
 
 impl QAutoImplementGeneric for SimpleMemoryTempStore {}

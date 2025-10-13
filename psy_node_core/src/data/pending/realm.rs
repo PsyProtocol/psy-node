@@ -9,8 +9,8 @@ pub struct RealmPendingCheckpoint<F: QFelt, Hash: QHashBase> {
     pub proc_checkpoint_unique_id: QCoreProcCheckpointUniqueId,
     pub update_user_leaves: Vec<PQEDUserLeaf<F, Hash>>,
     pub update_user_tree_nodes: Vec<SimpleMerkleNode<Hash>>,
-    pub update_user_contract_tree_nodes: Vec<QMerkleStoreSingleIdNode<Hash>>,
-    pub update_user_contract_state_tree_nodes: Vec<QMerkleStoreDoubleIdNode<Hash>>,
+    pub update_user_contract_tree_nodes: Vec<Vec<QMerkleStoreSingleIdNode<Hash>>>,
+    pub update_user_contract_state_tree_nodes: Vec<Vec<QMerkleStoreDoubleIdNode<Hash>>>,
     pub old_realm_root: Hash,
     pub new_realm_root: Hash,
 }

@@ -23,6 +23,7 @@ pub trait QTempDatabaseRawKVWriterBase {
     async fn qtdb_raw_kv_delete_key(&self, key: &[u8]) -> anyhow::Result<()>;
     async fn qtdb_raw_kv_put_many_values(&self, entries: &[QPDPair<Vec<u8>, Vec<u8>>]) -> anyhow::Result<()>;
     async fn qtdb_raw_kv_put_many_values_tuple(&self, entries: &[(Vec<u8>, Vec<u8>)]) -> anyhow::Result<()>;
+    async fn qtdb_raw_kv_put_many_values_tuple_ref<'a>(&self, entries: &[(&'a [u8], &'a [u8])]) -> anyhow::Result<()>;
 }
 
 #[async_trait]
@@ -54,6 +55,21 @@ pub trait QTempDatabaseKVReaderBase {
         table: &T,
         key: &T::Key,
     ) -> anyhow::Result<Option<T::Value>>;
+    async fn get_temp_database_value_raw<const CKS: usize, const KS: usize, T: TempTableDefintion<CKS, KS>>(
+        &self,
+        table: &T,
+        key: &T::Key,
+    ) -> anyhow::Result<Option<Vec<u8>>>;
+    async fn get_many_temp_database_values_key_refs_raw<const CKS: usize, const KS: usize, T: TempTableDefintion<CKS, KS>>(
+        &self,
+        table: &T,
+        keys: &[T::Key],
+    ) -> anyhow::Result<Vec<Option<Vec<u8>>>>;
+    async fn get_many_temp_database_values_key_refs<const CKS: usize, const KS: usize, T: TempTableDefintion<CKS, KS>>(
+        &self,
+        table: &T,
+        keys: &[T::Key],
+    ) -> anyhow::Result<Vec<Option<T::Value>>>;
     async fn get_many_temp_database_values<'a, const CKS: usize, const KS: usize, T: TempTableDefintion<CKS, KS>>(
         &self,
         table: &T,
@@ -74,10 +90,27 @@ pub trait QTempDatabaseKVWriterBase {
         key: &T::Key,
         value: &T::Value,
     ) -> anyhow::Result<()>;
+    async fn put_temp_database_value_raw<const CKS: usize, const KS: usize, T: TempTableDefintion<CKS, KS>>(
+        &self,
+        table: &T,
+        key: &T::Key,
+        value: &[u8],
+    ) -> anyhow::Result<()>;
+    async fn put_temp_database_value_raw_owned<const CKS: usize, const KS: usize, T: TempTableDefintion<CKS, KS>>(
+        &self,
+        table: &T,
+        key: &T::Key,
+        value: Vec<u8>,
+    ) -> anyhow::Result<()>;
     async fn delete_temp_database_key<const CKS: usize, const KS: usize, T: TempTableDefintion<CKS, KS>>(
         &self,
         table: &T,
         key: &T::Key,
+    ) -> anyhow::Result<()>;
+    async fn put_many_temp_database_values_raw_tuple<const CKS: usize, const KS: usize, T: TempTableDefintion<CKS, KS>>(
+        &self,
+        table: &T,
+        entries: &[(T::Key, Vec<u8>)],
     ) -> anyhow::Result<()>;
     async fn put_many_temp_database_values<const CKS: usize, const KS: usize, T: TempTableDefintion<CKS, KS>>(
         &self,
@@ -131,6 +164,45 @@ impl<DB: QTempDatabaseRawKVReaderBase + QAutoImplementGeneric + Send + Sync> QTe
             None => Ok(None),
         }
     }
+    async fn get_many_temp_database_values_key_refs_raw<const CKS: usize, const KS: usize, T: TempTableDefintion<CKS, KS>>(
+        &self,
+        table: &T,
+        keys: &[T::Key],
+    ) -> anyhow::Result<Vec<Option<Vec<u8>>>>{
+        let key_bytes = keys.iter().map(|k| table.get_key_prefix().ttp_get_full_key_vec(k)).collect::<Vec<_>>();
+        let results = self
+            .qtdb_raw_kv_get_many_values_vec(&key_bytes)
+            .await?;
+        Ok(results)
+    }
+    async fn get_temp_database_value_raw<const CKS: usize, const KS: usize, T: TempTableDefintion<CKS, KS>>(
+        &self,
+        table: &T,
+        key: &T::Key,
+    ) -> anyhow::Result<Option<Vec<u8>>>{
+        self.qtdb_raw_kv_get_value(&table.get_key_prefix().ttp_get_full_key_vec(key)).await
+    }
+    async fn get_many_temp_database_values_key_refs<const CKS: usize, const KS: usize, T: TempTableDefintion<CKS, KS>>(
+        &self,
+        table: &T,
+        keys: &[T::Key],
+    ) -> anyhow::Result<Vec<Option<T::Value>>>{
+        let key_bytes = keys.iter().map(|k| table.get_key_prefix().ttp_get_full_key_vec(k)).collect::<Vec<_>>();
+        let results = self
+            .qtdb_raw_kv_get_many_values_vec(&key_bytes)
+            .await?
+            .into_iter()
+            .map(|opt_bytes| match opt_bytes {
+                Some(b) => {
+                    let v = T::Value::ttp_from_bytes(&b)?;
+                    Ok(Some(v))
+                }
+                None => Ok(None),
+            })
+            .collect::<Result<Vec<Option<T::Value>>, anyhow::Error>>()?;
+        Ok(results)
+
+    }
     async fn get_many_temp_database_values<'a, const CKS: usize, const KS: usize, T: TempTableDefintion<CKS, KS>>(
         &self,
         table: &T,
@@ -172,6 +244,25 @@ impl<DB: QTempDatabaseRawKVWriterBase + QAutoImplementGeneric + Send + Sync> QTe
         let value_bytes = value.ttp_to_bytes()?;
         self.qtdb_raw_kv_put_value(&key_bytes, &value_bytes).await
     }
+    async fn put_temp_database_value_raw<const CKS: usize, const KS: usize, T: TempTableDefintion<CKS, KS>>(
+        &self,
+        table: &T,
+        key: &T::Key,
+        value: &[u8],
+    ) -> anyhow::Result<()>{
+        let key_bytes = table.get_key_prefix().ttp_get_full_key_vec(key);
+        self.qtdb_raw_kv_put_value(&key_bytes, value).await
+    }
+
+    async fn put_temp_database_value_raw_owned<const CKS: usize, const KS: usize, T: TempTableDefintion<CKS, KS>>(
+        &self,
+        table: &T,
+        key: &T::Key,
+        value: Vec<u8>,
+    ) -> anyhow::Result<()>{
+        let key_bytes = table.get_key_prefix().ttp_get_full_key_vec(key);
+        self.qtdb_raw_kv_put_value(&key_bytes, &value).await
+    }
     async fn delete_temp_database_key<const CKS: usize, const KS: usize, T: TempTableDefintion<CKS, KS>>(
         &self,
         table: &T,
@@ -209,6 +300,21 @@ impl<DB: QTempDatabaseRawKVWriterBase + QAutoImplementGeneric + Send + Sync> QTe
                 let key_bytes = table.get_key_prefix().ttp_get_full_key_vec(key);
                 let value_bytes = value.ttp_to_bytes()?;
                 Ok((key_bytes, value_bytes))
+            })
+            .collect::<Result<Vec<(Vec<u8>, Vec<u8>)>, anyhow::Error>>()?;
+        self.qtdb_raw_kv_put_many_values_tuple(&kv_bytes).await
+    }
+
+    async fn put_many_temp_database_values_raw_tuple<const CKS: usize, const KS: usize, T: TempTableDefintion<CKS, KS>>(
+        &self,
+        table: &T,
+        entries: &[(T::Key, Vec<u8>)],
+    ) -> anyhow::Result<()>{
+        let kv_bytes = entries
+            .iter()
+            .map(|(key, value)| {
+                let key_bytes = table.get_key_prefix().ttp_get_full_key_vec(key);
+                Ok((key_bytes, value.clone()))
             })
             .collect::<Result<Vec<(Vec<u8>, Vec<u8>)>, anyhow::Error>>()?;
         self.qtdb_raw_kv_put_many_values_tuple(&kv_bytes).await

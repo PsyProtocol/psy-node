@@ -596,6 +596,12 @@ impl QTempDatabaseRawKVWriterBase for StandardRedisStore {
     async fn qtdb_raw_kv_put_many_values_tuple(&self, entries: &[(Vec<u8>, Vec<u8>)]) -> anyhow::Result<()> {
         self.set_many_bytes_generic_internal_tuple(&self.kv_store_namespace, entries).await
     }
+
+    async fn qtdb_raw_kv_put_many_values_tuple_ref<'a>(&self, entries: &[(&'a [u8], &'a [u8])]) -> anyhow::Result<()>{
+        let mut con = self.pool.get().await?;
+        let _: () = con.hset_multiple(&self.kv_store_namespace, entries).await?;
+        Ok(())
+    }
 }
 #[async_trait]
 impl QTempDatabaseRawCounterReaderBase for StandardRedisStore {

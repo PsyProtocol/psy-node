@@ -1,4 +1,6 @@
-use crate::data::serializable::{QPDSerializable, QPDSerializableFixed};
+use rkyv::validation::archive;
+
+use crate::{data::serializable::{QPDSerializable, QPDSerializableFixed}, utils::QPGenRandom};
 
 
 
@@ -37,11 +39,29 @@ impl QPDSerializableFixed for QMerkleStoreSingleIdKey {
     }
 }
 
+impl QPGenRandom for QMerkleStoreSingleIdKey {
+    fn qp_rand_gen() -> Self where Self: Sized {
+        Self {
+            tree_id: QPGenRandom::qp_rand_gen(),
+            level: QPGenRandom::qp_rand_gen(),
+            index: QPGenRandom::qp_rand_gen(),
+        }
+    }
+}
 
 #[pderive::serialize_copy_default]
 pub struct QMerkleStoreSingleIdNode<Hash> {
     pub key: QMerkleStoreSingleIdKey,
     pub hash: Hash,
+}
+impl<Hash: QPGenRandom> QPGenRandom for QMerkleStoreSingleIdNode<Hash> {
+    
+    fn qp_rand_gen() -> Self where Self: Sized {
+        Self {
+            key: QMerkleStoreSingleIdKey::qp_rand_gen(),
+            hash: QPGenRandom::qp_rand_gen(),
+        }
+    }
 }
 
 

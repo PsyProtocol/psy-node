@@ -3,7 +3,12 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use crate::data::{queue::queue_key::PCoreQueueItemBase, serializable::QPDSerializableFixed};
 
 pub const QJOB_ID_SERIALIZED_SIZE: usize = 24;
+pub const QJOB_ID_WITH_REALM_PREFIX_SERIALIZED_SIZE: usize = 32;
+
 pub const QJOB_ID_WITH_REWARD_PATH_SERIALIZED_SIZE: usize = 32;
+pub const QJOB_ID_WITH_UNIQUE_PENDING_ID_SERIALIZED_SIZE: usize = 32;
+pub const QJOB_ID_WITH_UNIQUE_PENDING_ID_AND_REALM_PREFIX_SERIALIZED_SIZE: usize = 40;
+
 pub type QJobIdSerialized = [u8; QJOB_ID_SERIALIZED_SIZE];
 pub type QJobIdWithRewardPathSerialized = [u8; QJOB_ID_WITH_REWARD_PATH_SERIALIZED_SIZE];
 
