@@ -111,7 +111,7 @@ impl<Hash: PartialEq + Copy + Default> Default for TagTreeNodePreimage<Hash> {
 }
 
 impl<Hash: PartialEq + Copy> TagTreeNodePreimage<Hash> {
-    fn get_node_hash<Hasher: MerkleHasher<Hash>>(&self) -> Hash {
+    pub fn get_node_hash<Hasher: MerkleHasher<Hash>>(&self) -> Hash {
         hash_tag_tree_node::<Hash, Hasher>(&self.left, &self.right, &self.tag)
     }
 }

@@ -1,6 +1,6 @@
 use std::{fmt::Debug, marker::PhantomData};
 
-use parth_core::{crypto::hash::{tag_tree::{TagTreeMerkleProof, TagTreeMerkleProofPartial, TagTreeNodePreimage, TagTreeProofNode, TagTreeStorageNode}, traits::MerkleZeroHasher}, data::hash::merkle_node_key::SimpleMerkleNodeKey};
+use parth_core::{crypto::hash::{tag_tree::{TagTreeMerkleProof, TagTreeMerkleProofPartial, TagTreeNodePreimage, TagTreeProofNode, TagTreeStorageNode}, traits::MerkleHasher}, data::hash::merkle_node_key::SimpleMerkleNodeKey};
 
 #[derive(Debug, Clone)]
 pub struct SimpleMemoryTagTreeStore<Hasher, Hash: Copy + PartialEq + Default> {
@@ -9,7 +9,7 @@ pub struct SimpleMemoryTagTreeStore<Hasher, Hash: Copy + PartialEq + Default> {
     _hasher: PhantomData<Hasher>,
 }
 
-impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + PartialEq + Default>
+impl<Hasher: MerkleHasher<Hash>, Hash: Copy + PartialEq + Default>
     SimpleMemoryTagTreeStore<Hasher, Hash>
 {
     pub fn new(height: u8) -> Self {

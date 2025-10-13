@@ -1,9 +1,8 @@
-use std::{collections::HashSet, sync::Arc, u64::MAX};
+use std::{collections::{HashMap, HashSet}, sync::Arc};
 
 use parth_core::{
     crypto::hash::{
-        merkle_proof::{DeltaMerkleProofCore, MerkleProofCore},
-        traits::{MerkleZeroHasher, QHasher},
+        merkle_proof::{DeltaMerkleProofCore, MerkleProofCore}, tag_tree::{hash_tag_tree_node, compute_tag_tree_root_for_proof, TagTreeNodePreimage, TagTreeMerkleProof, TagTreeStorageNode}, traits::MerkleZeroHasher
     },
     data::{
         db::{
@@ -13,13 +12,13 @@ use parth_core::{
         },
         hash::{
             hash256::Hash256,
-            merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey},
+            merkle_node_key::{generate_nca_tree_groups_efficient, SimpleMerkleNode, SimpleMerkleNodeKey},
         },
         serializable::{QPDPair, QPDSerializable},
     },
     felt::QFelt,
     impl_qpd_serialize_params,
-    protocol::core_types::{QHashBase, QHasherBase},
+    protocol::core_types::QHashBase,
     utils::QPGenRandom,
 };
 use parth_crypto::hash::sha256::CoreSha256Hasher;
@@ -33,13 +32,11 @@ use parth_node_scylla::{
             ScyllaGenericObjectSingleIdTablePreparedStatements,
         },
         tag_tree::ScyllaTagTreeNodesPreparedStatements,
-        traits::ScyllaStandardPreparedTableStatements,
         u64_tbl::{ScyllaBidirectionalU64U128MappingPreparedStatements, ScyllaU64ToU64TablePreparedStatements},
     },
 };
 use pser::{QBytesDeserialize, QBytesSerialize};
-use psy_node_core::store::traits::{core_db::{CoreDatabaseSingleIdMerkleReader, CoreDatabaseStore, CoreDatabaseTagTreeStore}, helpers::{db_helper_double_id_merkle_node_simple_set_leaves, db_helper_record_update_single_id_merkle_node_to_level_dmp, db_helper_select_double_id_merkle_proof_max_checkpoint, db_helper_select_single_id_merkle_proof_max_checkpoint, db_helper_select_zero_id_merkle_proof_max_checkpoint, db_helper_single_id_merkle_node_simple_set_leaves, db_helper_zero_id_merkle_node_simple_set_leaves}};
-use scylla::{client::session::Session, policies::retry};
+use psy_node_core::store::traits::{core_db::{CoreDatabaseSingleIdMerkleReader, CoreDatabaseStore, CoreDatabaseTagTreeStore}, helpers::{db_helper_double_id_merkle_node_simple_set_leaves, db_helper_select_double_id_merkle_proof_max_checkpoint, db_helper_select_single_id_merkle_proof_max_checkpoint, db_helper_select_zero_id_merkle_proof_max_checkpoint, db_helper_single_id_merkle_node_simple_set_leaves, db_helper_zero_id_merkle_node_simple_set_leaves}};
 
 pub trait CreateRandomTestDataItem: Sized {
     fn create_random_test_data_item() -> Self;
@@ -48,7 +45,7 @@ const MAX_REAL_U64_ID_VALUE: u64 = 0x0000_FFFF_FFFF_FFFF;
 const DEFINITELY_MISSING_U64_VALUE: u64 = MAX_REAL_U64_ID_VALUE + 1;
 
 const MAX_REAL_CHECKPOINT_ID: u64 = 0x0000_FFFF_FFFF_FFFF;
-const DEFINITELY_MISSING_CHECKPOINT_ID: u64 = MAX_REAL_CHECKPOINT_ID + 1;
+//const DEFINITELY_MISSING_CHECKPOINT_ID: u64 = MAX_REAL_CHECKPOINT_ID + 1;
 
 const MAX_REAL_U128_ID_VALUE: u128 = 0x0000_00FF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFFu128;
 const DEFINITELY_MISSING_U128_ID_VALUE: u128 = MAX_REAL_U128_ID_VALUE + 1;
@@ -56,14 +53,36 @@ const DEFINITELY_MISSING_U128_ID_VALUE: u128 = MAX_REAL_U128_ID_VALUE + 1;
 
 const MAX_GET_UNIQUE_ID_RETRY_ATTEMPTS: usize = 64;
 
+fn get_unique_node_set(node_set: Vec<SimpleMerkleNodeKey>) -> Vec<SimpleMerkleNodeKey> {
+    let hset = HashSet::<SimpleMerkleNodeKey>::from_iter(node_set.into_iter());
+    hset.into_iter().collect::<Vec<_>>()
+}
+
+fn random_nodes_in_tree(height: u8, count: usize) -> Vec<SimpleMerkleNodeKey>{
+
+    let max_node_id = 1u64 << (height as u64);
+
+    let mut result = Vec::with_capacity(count);
+    for _ in 0..count {
+        result.push(SimpleMerkleNodeKey {
+            level: height,
+            index: rand::random::<u64>()%max_node_id,
+        });
+    }
+
+    get_unique_node_set(result)
+    
+}
 
 fn rand_real_u64_id() -> u64 {
     rand::random::<u64>() % MAX_REAL_U64_ID_VALUE
 }
+/* 
 fn rand_real_checkpoint_id() -> u64 {
     // add some padding for addon checks
     (rand::random::<u64>() % MAX_REAL_CHECKPOINT_ID) - 0xFFFF
 }
+    */
 fn rand_real_u128_id() -> u128 {
     rand::random::<u128>() % MAX_REAL_U128_ID_VALUE
 }
@@ -655,7 +674,7 @@ impl<
             actual_rows.len() == rows.len(),
             "Number of retrieved rows does not match number of inserted rows"
         );
-        for (i, row) in rows.iter().enumerate() {
+        for row in rows.iter() {
             let actual_row = actual_rows
                 .iter()
                 .find(|r| r.k1 == row.k1)
@@ -1951,7 +1970,7 @@ impl<
         assert!(result_higher_after_lower_insert_with_ids_unwrapped.value == value_c_1337, "Value does not match at original checkpoint after lower checkpoint insert");
 
         // 0-10 full history test
-        let first_10_checkpoints = (0..10u64).map(|i| V::qp_rand_gen()).collect::<Vec<_>>();
+        let first_10_checkpoints = (0..10u64).map(|_| V::qp_rand_gen()).collect::<Vec<_>>();
         
         let should_be_empty_pre_insert_0 = self.store.db_select_one_single_checkpointed_object_value::<V>(table, obj_id, 0).await?;
         assert!(should_be_empty_pre_insert_0.is_none(), "Value should not be found at checkpoint 0 before insert");
@@ -3660,7 +3679,7 @@ impl<
         Ok(())
     }
 }
-/* 
+/*
 impl<
         const ZERO_ID_TREE_A_HEIGHT: usize,
         const ZERO_ID_TREE_B_HEIGHT: usize,
@@ -3668,15 +3687,15 @@ impl<
         const SINGLE_ID_TREE_B_HEIGHT: usize,
         const DOUBLE_ID_TREE_A_HEIGHT: usize,
         const DOUBLE_ID_TREE_B_HEIGHT: usize,
-        BidirectionalMappingTableAK1: QDatabasePrimitiveKey + QPGenRandom,
-        BidirectionalMappingTableAK2: QDatabasePrimitiveKey + QPGenRandom,
-        BidirectionalMappingTableBK1: QDatabasePrimitiveKey + QPGenRandom,
-        BidirectionalMappingTableBK2: QDatabasePrimitiveKey + QPGenRandom,
-        KivTableAValue: CoreDatabaseValueDeserialize + QPGenRandom,
-        KivTableBValue: CoreDatabaseValueDeserialize + QPGenRandom,
-        ObjSingleIdTableAValue: CoreDatabaseValueDeserialize + QPGenRandom,
-        ObjDoubleIdTableBValue: CoreDatabaseValueDeserialize + QPGenRandom,
-        Hash: QHashBase + QPGenRandom,
+        BidirectionalMappingTableAK1: QDatabasePrimitiveKey,
+        BidirectionalMappingTableAK2: QDatabasePrimitiveKey,
+        BidirectionalMappingTableBK1: QDatabasePrimitiveKey,
+        BidirectionalMappingTableBK2: QDatabasePrimitiveKey,
+        KivTableAValue: CoreDatabaseValueDeserialize,
+        KivTableBValue: CoreDatabaseValueDeserialize,
+        ObjSingleIdTableAValue: CoreDatabaseValueDeserialize,
+        ObjDoubleIdTableBValue: CoreDatabaseValueDeserialize,
+        Hash: QHashBase + QPGenRandom + std::fmt::Debug + Default + Clone + Send + Sync,
         Hasher: THHasher<Hash>,
         BiDirectionalMappingTableIdentifier: THStandardTableIdentifier,
         BiDirectionalU64U128MappingTableIdentifier: THStandardTableIdentifier,
@@ -3734,992 +3753,523 @@ impl<
         S,
     >
 {
-    pub async fn th_util_select_one_double_checkpointed_object_value<V: CoreDatabaseValueDeserialize>(
+    pub async fn th_util_get_tag_tree_node_value(
         &self,
-        table: &DoubleIdTableIdentifier,
-        obj_id: u64,
-        secondary_id: u64,
-        max_checkpoint_id: u64,
-    ) -> anyhow::Result<Option<V>> {
-        let result = self
-            .store
-            .db_select_one_double_checkpointed_object_value::<V>(table, obj_id, secondary_id, max_checkpoint_id)
-            .await?;
-        let result_with_ids = self
-            .store
-            .db_select_one_double_checkpointed_object_value_and_ids::<V>(table, obj_id, secondary_id, max_checkpoint_id)
-            .await?;
-        if result.is_some() {
-            let r = result.clone().unwrap();
-            let row = result_with_ids.ok_or_else(|| anyhow::anyhow!("Value with ids not found after select"))?;
-            assert!(row.obj_id == obj_id, "Object id does not match");
-            assert!(row.secondary_id == secondary_id, "Secondary id does not match");
-            assert!(row.checkpoint_id <= max_checkpoint_id, "Checkpoint id is greater than max_checkpoint_id");
-            assert!(row.value == r, "Value with ids does not match value without ids");
-
-            let above_checkpoint_id = row.checkpoint_id + 1;
-            let result_above = self
-                .store
-                .db_select_one_double_checkpointed_object_value_and_ids::<V>(table, obj_id, secondary_id, above_checkpoint_id)
-                .await?;
-            assert!(
-                result_above.is_some(),
-                "Value not found when selecting with checkpoint_id above the one returned in value with ids"
-            );
-            let result_above_unwrapped = result_above.unwrap();
-            assert!(
-                result_above_unwrapped.obj_id == obj_id,
-                "Object id does not match when selecting with checkpoint_id above the one returned in value with ids"
-            );
-            assert!(
-                result_above_unwrapped.secondary_id == secondary_id,
-                "Secondary id does not match when selecting with checkpoint_id above the one returned in value with ids"
-            );
-            if result_above_unwrapped.checkpoint_id != row.checkpoint_id {
-                assert!(result_above_unwrapped.checkpoint_id > row.checkpoint_id, "Checkpoint id is not greater than the one returned in value with ids when selecting with checkpoint_id above the one returned in value with ids");
-            }
-            if row.checkpoint_id > 0 {
-                let result_below = self
-                    .store
-                    .db_select_one_double_checkpointed_object_value_and_ids::<V>(table, obj_id, secondary_id, row.checkpoint_id - 1)
-                    .await?;
-                if result_below.is_some() {
-                    let result_below_unwrapped = result_below.unwrap();
-                    assert!(
-                        result_below_unwrapped.obj_id == obj_id,
-                        "Object id does not match when selecting with checkpoint_id equal to the one returned in value with ids"
-                    );
-                    assert!(
-                        result_below_unwrapped.secondary_id == secondary_id,
-                        "Secondary id does not match when selecting with checkpoint_id equal to the one returned in value with ids"
-                    );
-                    assert!(result_below_unwrapped.checkpoint_id < row.checkpoint_id);
-                }
-            }
-        } else {
-            assert!(result_with_ids.is_none(), "Value with ids should be None when value without ids is None");
-        }
-        let keys = vec![
-            QDoubleIdKey { obj_id, secondary_id },
-            QDoubleIdKey { obj_id: DEFINITELY_MISSING_U64_VALUE, secondary_id: DEFINITELY_MISSING_U64_VALUE },
-            QDoubleIdKey { obj_id, secondary_id },
-        ];
-        let multi_result = self
-            .store
-            .db_select_many_double_checkpointed_object_values::<V>(table, &keys, max_checkpoint_id)
-            .await?;
-        assert!(multi_result.len() == 3, "Multi select did not return correct number of results");
-        assert!(multi_result[0] == result, "Multi select first result does not match single select result");
-        assert!(multi_result[1].is_none(), "Multi select second result should be None");
-        assert!(multi_result[2] == result, "Multi select third result does not match single select result");
-
-        Ok(result)
-    }
-
-    pub async fn th_util_select_many_double_checkpointed_object_values<V: CoreDatabaseValueDeserialize>(
-        &self,
-        table: &DoubleIdTableIdentifier,
-        keys: &[QDoubleIdKey],
-        max_checkpoint_id: u64,
-    ) -> anyhow::Result<Vec<Option<V>>> {
-        let result = self
-            .store
-            .db_select_many_double_checkpointed_object_values::<V>(table, keys, max_checkpoint_id)
-            .await?;
-        assert!(
-            result.len() == keys.len(),
-            "Number of retrieved values does not match number of requested values"
-        );
-        for (i, key) in keys.iter().enumerate() {
-            let single_result = self
-                .th_util_select_one_double_checkpointed_object_value::<V>(table, key.obj_id, key.secondary_id, max_checkpoint_id)
-                .await?;
-            assert!(result[i] == single_result, "Multi select result does not match single select result");
-        }
-        Ok(result)
-    }
-
-    pub async fn th_util_insert_double_checkpointed_object<V: CoreDatabaseValueDeserialize>(
-        &self,
-        table: &DoubleIdTableIdentifier,
-        obj_id: u64,
-        secondary_id: u64,
-        checkpoint_id: u64,
-        value: &V,
-    ) -> anyhow::Result<()> {
-        let prev_lower = if checkpoint_id > 0 {
-            self.th_util_select_one_double_checkpointed_object_value::<V>(table, obj_id, secondary_id, checkpoint_id - 1)
-                .await?
-        } else {
-            None
-        };
-
-        let higher = self
-            .th_util_select_one_double_checkpointed_object_value::<V>(table, obj_id, secondary_id, checkpoint_id + 1)
-            .await?;
-
-        self.store
-            .db_insert_one_double_checkpointed_object(table, obj_id, secondary_id, checkpoint_id, value)
-            .await?;
-
-        let after = self
-            .th_util_select_one_double_checkpointed_object_value::<V>(table, obj_id, secondary_id, checkpoint_id)
-            .await?;
-
-        assert!(after.is_some(), "Value not found after insert");
-        let after_unwrapped = after.clone().unwrap();
-        assert!(after_unwrapped == *value, "Inserted value does not match retrieved value after insert");
-        if higher.is_none() {
-            let higher_new = self
-                .th_util_select_one_double_checkpointed_object_value::<V>(table, obj_id, secondary_id, checkpoint_id + 1)
-                .await?;
-            assert!(higher_new.is_some(), "Higher value should be found after insert");
-            let higher_new_unwrapped = higher_new.unwrap();
-            assert!(higher_new_unwrapped == after_unwrapped, "Higher value should match inserted value");
-        }
-
-        if prev_lower.is_some() {
-            let prev_lower_unwrapped = prev_lower.unwrap();
-            let prev_lower_again = self
-                .th_util_select_one_double_checkpointed_object_value::<V>(table, obj_id, secondary_id, checkpoint_id - 1)
-                .await?;
-            assert!(prev_lower_again.is_some(), "Previous lower value should still be found after insert");
-            let prev_lower_again_unwrapped = prev_lower_again.unwrap();
-            assert!(
-                prev_lower_again_unwrapped == prev_lower_unwrapped,
-                "Previous lower value should not change after insert"
-            );
-        }
-
-        let keys = vec![
-            QDoubleIdKey { obj_id, secondary_id },
-            QDoubleIdKey { obj_id: DEFINITELY_MISSING_U64_VALUE, secondary_id: DEFINITELY_MISSING_U64_VALUE },
-            QDoubleIdKey { obj_id, secondary_id },
-        ];
-        let multi_result = self
-            .store
-            .db_select_many_double_checkpointed_object_values::<V>(table, &keys, checkpoint_id)
-            .await?;
-        assert!(multi_result.len() == 3, "Multi select did not return correct number of results");
-        assert!(multi_result[0] == after, "Multi select first result does not match single select result");
-        assert!(multi_result[1].is_none(), "Multi select second result should be None");
-        assert!(multi_result[2] == after, "Multi select third result does not match single select result");
-
-        Ok(())
-    }
-
-    pub async fn th_util_insert_many_double_checkpointed_objects<
-        V: CoreDatabaseValueDeserialize,
-        R: QDatabaseDoubleIdTableRowNoCheckpointIdLike<V> + Send + Sync,
-    >(
-        &self,
-        table: &DoubleIdTableIdentifier,
-        rows: &[R],
-        checkpoint_id: u64,
-    ) -> anyhow::Result<()> {
-        let mut prev_lowers = Vec::with_capacity(rows.len());
-        let mut highers = Vec::with_capacity(rows.len());
-        for row in rows.iter() {
-            let prev_lower = if checkpoint_id > 0 {
-                self.th_util_select_one_double_checkpointed_object_value::<V>(table, row.get_row_obj_id(), row.get_row_secondary_id(), checkpoint_id - 1)
-                    .await?
-            } else {
-                None
-            };
-            prev_lowers.push(prev_lower);
-            let higher = self
-                .th_util_select_one_double_checkpointed_object_value::<V>(table, row.get_row_obj_id(), row.get_row_secondary_id(), checkpoint_id + 1)
-                .await?;
-            highers.push(higher);
-        }
-
-        self.store
-            .db_insert_many_double_checkpointed_objects_at_checkpoint_t::<V, R>(table, checkpoint_id, rows)
-            .await?;
-
-        for (i, row) in rows.iter().enumerate() {
-            let after = self
-                .th_util_select_one_double_checkpointed_object_value::<V>(table, row.get_row_obj_id(), row.get_row_secondary_id(), checkpoint_id)
-                .await?;
-            assert!(after.is_some(), "Value not found after insert");
-            let after_unwrapped = after.clone().unwrap();
-            assert!(
-                after_unwrapped == *row.get_row_value_ref(),
-                "Inserted value does not match retrieved value after insert"
-            );
-
-            if highers[i].is_none() {
-                let higher_new = self
-                    .th_util_select_one_double_checkpointed_object_value::<V>(table, row.get_row_obj_id(), row.get_row_secondary_id(), checkpoint_id + 1)
-                    .await?;
-                assert!(higher_new.is_some(), "Higher value should be found after insert");
-                let higher_new_unwrapped = higher_new.unwrap();
-                assert!(higher_new_unwrapped == after_unwrapped, "Higher value should match inserted value");
-            }
-
-            if prev_lowers[i].is_some() {
-                let prev_lower_unwrapped = prev_lowers[i].as_ref().unwrap();
-                let prev_lower_again = self
-                    .th_util_select_one_double_checkpointed_object_value::<V>(table, row.get_row_obj_id(), row.get_row_secondary_id(), checkpoint_id - 1)
-                    .await?;
-                assert!(prev_lower_again.is_some(), "Previous lower value should still be found after insert");
-                let prev_lower_again_unwrapped = prev_lower_again.unwrap();
-                assert!(
-                    prev_lower_again_unwrapped == *prev_lower_unwrapped,
-                    "Previous lower value should not change after insert"
-                );
-            }
-        }
-        let keys: Vec<QDoubleIdKey> = rows.iter().map(|r| QDoubleIdKey { obj_id: r.get_row_obj_id(), secondary_id: r.get_row_secondary_id() }).collect();
-        let multi_result = self
-            .store
-            .db_select_many_double_checkpointed_object_values::<V>(table, &keys, checkpoint_id)
-            .await?;
-        assert!(multi_result.len() == rows.len(), "Multi select did not return correct number of results");
-        for (i, row) in rows.iter().enumerate() {
-            let after = self
-                .th_util_select_one_double_checkpointed_object_value::<V>(table, row.get_row_obj_id(), row.get_row_secondary_id(), checkpoint_id)
-                .await?;
-            assert!(multi_result[i] == after, "Multi select result does not match single select result");
-        }
-        Ok(())
-    }
-
-    pub async fn th_test_double_checkpointed_object_1_full_history_1<V: CoreDatabaseValueDeserialize + QPGenRandom>(&self, table: &DoubleIdTableIdentifier) -> anyhow::Result<()>{
-        let (obj_id, secondary_id) = self.get_non_existent_id_in_double_object::<V>(table).await?;
-        let check = self.store.db_select_one_double_checkpointed_object_value::<V>(table, obj_id, secondary_id, MAX_REAL_CHECKPOINT_ID).await?;
-        assert!(check.is_none(), "Expected non-existent id to not be found");
-
-        let value_c_1337 = V::qp_rand_gen();
-        let start_checkpoint_id = 1337u64;
-        self.store.db_insert_one_double_checkpointed_object(table, obj_id, secondary_id, start_checkpoint_id, &value_c_1337).await?;
-
-        let result = self.th_util_select_one_double_checkpointed_object_value::<V>(table, obj_id, secondary_id, start_checkpoint_id).await?;
-        assert!(result.is_some(), "Value not found after insert at checkpoint 1337");
-        let result_unwrapped = result.unwrap();
-        assert!(result_unwrapped == value_c_1337, "Inserted value does not match");
-        let result_with_ids = self.store.db_select_one_double_checkpointed_object_value_and_ids::<V>(table, obj_id, secondary_id, start_checkpoint_id).await?;
-        assert!(result_with_ids.is_some(), "Value with ids not found after insert at checkpoint 1337");
-        let result_with_ids_unwrapped = result_with_ids.unwrap();
-        assert!(result_with_ids_unwrapped.obj_id == obj_id, "Object id does not match");
-        assert!(result_with_ids_unwrapped.secondary_id == secondary_id, "Secondary id does not match");
-        assert!(result_with_ids_unwrapped.checkpoint_id == start_checkpoint_id, "Checkpoint id does not match");
-        assert!(result_with_ids_unwrapped.value == value_c_1337, "Value does not match");
-
-        let result_higher = self.th_util_select_one_double_checkpointed_object_value::<V>(table, obj_id, secondary_id, start_checkpoint_id + 100).await?;
-        assert!(result_higher.is_some(), "Value not found at higher checkpoint after insert at checkpoint 1337");
-        let result_higher_unwrapped = result_higher.unwrap();
-        assert!(result_higher_unwrapped == value_c_1337, "Value does not match at higher checkpoint");
-        let result_higher_with_ids = self.store.db_select_one_double_checkpointed_object_value_and_ids::<V>(table, obj_id, secondary_id, start_checkpoint_id + 100).await?;
-        assert!(result_higher_with_ids.is_some(), "Value with ids not found at higher checkpoint after insert at checkpoint 1337");
-        let result_higher_with_ids_unwrapped = result_higher_with_ids.unwrap();
-        assert!(result_higher_with_ids_unwrapped.obj_id == obj_id, "Object id does not match at higher checkpoint");
-        assert!(result_higher_with_ids_unwrapped.secondary_id == secondary_id, "Secondary id does not match at higher checkpoint");
-        assert!(result_higher_with_ids_unwrapped.checkpoint_id == start_checkpoint_id, "Checkpoint id does not match at higher checkpoint");
-        assert!(result_higher_with_ids_unwrapped.value == value_c_1337, "Value does not match at higher checkpoint");
-
-        let result_lower = self.store.db_select_one_double_checkpointed_object_value::<V>(table, obj_id, secondary_id, start_checkpoint_id - 1).await?;
-        assert!(result_lower.is_none(), "Value should not be found at lower checkpoint after insert at checkpoint 1337");
-        let result_lower_with_ids = self.store.db_select_one_double_checkpointed_object_value_and_ids::<V>(table, obj_id, secondary_id, start_checkpoint_id - 1).await?;
-        assert!(result_lower_with_ids.is_none(), "Value with ids should not be found at lower checkpoint after insert at checkpoint 1337");
-
-        let value_c_1000 = V::qp_rand_gen();
-        let lower_checkpoint_id = 1000u64;
-        self.store.db_insert_one_double_checkpointed_object(table, obj_id, secondary_id, lower_checkpoint_id, &value_c_1000).await?;
-        let result_after_lower_insert = self.th_util_select_one_double_checkpointed_object_value::<V>(table, obj_id, secondary_id, lower_checkpoint_id).await?;
-        assert!(result_after_lower_insert.is_some(), "Value not found after insert at lower checkpoint 1000");
-        let result_after_lower_insert_unwrapped = result_after_lower_insert.unwrap();
-        assert!(result_after_lower_insert_unwrapped == value_c_1000, "Inserted value at lower checkpoint does not match");
-        let result_after_lower_insert_with_ids = self.store.db_select_one_double_checkpointed_object_value_and_ids::<V>(table, obj_id, secondary_id, lower_checkpoint_id).await?;
-        assert!(result_after_lower_insert_with_ids.is_some(), "Value with ids not found after insert at lower checkpoint 1000");
-        let result_after_lower_insert_with_ids_unwrapped = result_after_lower_insert_with_ids.unwrap();
-        assert!(result_after_lower_insert_with_ids_unwrapped.obj_id == obj_id, "Object id does not match after lower checkpoint insert");
-        assert!(result_after_lower_insert_with_ids_unwrapped.secondary_id == secondary_id, "Secondary id does not match after lower checkpoint insert");
-        assert!(result_after_lower_insert_with_ids_unwrapped.checkpoint_id == lower_checkpoint_id, "Checkpoint id does not match after lower checkpoint insert");
-        assert!(result_after_lower_insert_with_ids_unwrapped.value == value_c_1000, "Value does not match after lower checkpoint insert");
-
-        let result_higher_after_lower_insert = self.th_util_select_one_double_checkpointed_object_value::<V>(table, obj_id, secondary_id, start_checkpoint_id).await?;
-        assert!(result_higher_after_lower_insert.is_some(), "Value not found at original checkpoint after lower checkpoint insert");
-        let result_higher_after_lower_insert_unwrapped = result_higher_after_lower_insert.unwrap();
-        assert!(result_higher_after_lower_insert_unwrapped == value_c_1337, "Value at original checkpoint does not match after lower checkpoint insert");
-        let result_higher_after_lower_insert_with_ids = self.store.db_select_one_double_checkpointed_object_value_and_ids::<V>(table, obj_id, secondary_id, start_checkpoint_id).await?;
-        assert!(result_higher_after_lower_insert_with_ids.is_some(), "Value with ids not found at original checkpoint after lower checkpoint insert");
-        let result_higher_after_lower_insert_with_ids_unwrapped = result_higher_after_lower_insert_with_ids.unwrap();
-        assert!(result_higher_after_lower_insert_with_ids_unwrapped.obj_id == obj_id, "Object id does not match at original checkpoint after lower checkpoint insert");
-        assert!(result_higher_after_lower_insert_with_ids_unwrapped.secondary_id == secondary_id, "Secondary id does not match at original checkpoint after lower checkpoint insert");
-        assert!(result_higher_after_lower_insert_with_ids_unwrapped.checkpoint_id == start_checkpoint_id, "Checkpoint id does not match at original checkpoint after lower checkpoint insert");
-        assert!(result_higher_after_lower_insert_with_ids_unwrapped.value == value_c_1337, "Value does not match at original checkpoint after lower checkpoint insert");
-
-        let first_100_checkpoints = (0..100u64).map(|_| V::qp_rand_gen()).collect::<Vec<_>>();
-        for (checkpoint_id, value) in first_100_checkpoints.iter().enumerate() {
-            self.store.db_insert_one_double_checkpointed_object(table, obj_id, secondary_id, checkpoint_id as u64, value).await?;
-            let should_be_value_post_insert = self.store.db_select_one_double_checkpointed_object_value::<V>(table, obj_id, secondary_id, checkpoint_id as u64).await?;
-            assert!(should_be_value_post_insert.is_some(), "Value should be found at checkpoint {} after insert", checkpoint_id);
-            let should_be_value_post_insert_unwrapped = should_be_value_post_insert.unwrap();
-            assert!(should_be_value_post_insert_unwrapped == *value, "Value at checkpoint {} does not match inserted value", checkpoint_id);
-            for future_checkpoint in (checkpoint_id + 1)..100 {
-                let should_be_value_future = self.store.db_select_one_double_checkpointed_object_value::<V>(table, obj_id, secondary_id, future_checkpoint as u64).await?;
-                assert!(should_be_value_future.is_some(), "Value should be found at future checkpoint {} after insert at checkpoint {}", future_checkpoint, checkpoint_id);
-                let should_be_value_future_unwrapped = should_be_value_future.unwrap();
-                assert!(should_be_value_future_unwrapped == *value, "Value at future checkpoint {} does not match value at checkpoint {} after insert", future_checkpoint, checkpoint_id);
-            }
-        }
-
-        let checkpoints_5000_5600 = (5000..5600u64).map(|i| QDatabaseDoubleIdTableRow::new(obj_id, secondary_id, i, V::qp_rand_gen())).collect::<Vec<_>>();
-        self.store.db_insert_many_double_checkpointed_object_rows_t(table, &checkpoints_5000_5600[0..300]).await?;
-        for chk in checkpoints_5000_5600[0..300].iter() {
-            let actual_value = self.th_util_select_one_double_checkpointed_object_value::<V>(table, obj_id, secondary_id, chk.checkpoint_id).await?;
-            assert!(actual_value.is_some(), "Value should be found at checkpoint {} after batch insert", chk.checkpoint_id);
-            let actual_value_unwrapped = actual_value.unwrap();
-            assert!(actual_value_unwrapped == chk.value, "Value at checkpoint {} does not match inserted value after batch insert", chk.checkpoint_id);
-        }
-        let actual_value_max_real = self.store.db_select_one_double_checkpointed_object_value::<V>(table, obj_id, secondary_id, MAX_REAL_CHECKPOINT_ID).await?;
-        assert!(actual_value_max_real.is_some(), "Value should be found at MAX_REAL_CHECKPOINT_ID after batch insert");
-        let actual_value_max_real_unwrapped = actual_value_max_real.unwrap();
-        assert!(actual_value_max_real_unwrapped == checkpoints_5000_5600[299].value, "Value at MAX_REAL_CHECKPOINT_ID does not match last inserted value after batch insert");
-        let actual_value_u64_max = self.store.db_select_one_double_checkpointed_object_value::<V>(table, obj_id, secondary_id, u64::MAX).await?;
-        assert!(actual_value_u64_max.is_some(), "Value should be found at u64::MAX after batch insert");
-        let actual_value_u64_max_unwrapped = actual_value_u64_max.unwrap();
-        assert!(actual_value_u64_max_unwrapped == checkpoints_5000_5600[299].value, "Value at u64::MAX does not match last inserted value after batch insert");
-        assert!(actual_value_u64_max_unwrapped == actual_value_max_real_unwrapped, "Value at u64::MAX does not match value at MAX_REAL_CHECKPOINT_ID after batch insert");
-
-        self.store.db_insert_many_double_checkpointed_object_rows_t(table, &checkpoints_5000_5600[300..600]).await?;
-        for chk in checkpoints_5000_5600[0..600].iter() {
-            let actual_value = self.th_util_select_one_double_checkpointed_object_value::<V>(table, obj_id, secondary_id, chk.checkpoint_id).await?;
-            assert!(actual_value.is_some(), "Value should be found at checkpoint {} after second batch insert", chk.checkpoint_id);
-            let actual_value_unwrapped = actual_value.unwrap();
-            assert!(actual_value_unwrapped == chk.value, "Value at checkpoint {} does not match inserted value after second batch insert", chk.checkpoint_id);
-        }
-        let actual_value_max_real = self.store.db_select_one_double_checkpointed_object_value::<V>(table, obj_id, secondary_id, MAX_REAL_CHECKPOINT_ID).await?;
-        assert!(actual_value_max_real.is_some(), "Value should be found at MAX_REAL_CHECKPOINT_ID after second batch insert");
-        let actual_value_max_real_unwrapped = actual_value_max_real.unwrap();
-        assert!(actual_value_max_real_unwrapped == checkpoints_5000_5600[599].value, "Value at MAX_REAL_CHECKPOINT_ID does not match last inserted value after second batch insert");
-        let actual_value_u64_max = self.store.db_select_one_double_checkpointed_object_value::<V>(table, obj_id, secondary_id, u64::MAX).await?;
-        assert!(actual_value_u64_max.is_some(), "Value should be found at u64::MAX after second batch insert");
-        let actual_value_u64_max_unwrapped = actual_value_u64_max.unwrap();
-        assert!(actual_value_u64_max_unwrapped == checkpoints_5000_5600[599].value, "Value at u64::MAX does not match last inserted value after second batch insert");
-        assert!(actual_value_u64_max_unwrapped == actual_value_max_real_unwrapped, "Value at u64::MAX does not match value at MAX_REAL_CHECKPOINT_ID after second batch insert");
-        Ok(())
-    }
-
-    pub async fn th_util_select_double_id_merkle_node_max_checkpoint(
-        &self,
-        table: &DoubleIdMerkleTableIdentifier,
-        tree_height: u8,
-        max_checkpoint_id: u64,
-        tree_id: u64,
-        tree_sub_id: u64,
-        key: SimpleMerkleNodeKey,
-    ) -> anyhow::Result<Hash> {
-        let result = self
-            .store
-            .db_select_double_id_merkle_node_max_checkpoint(table, max_checkpoint_id, tree_id, tree_sub_id, tree_height, key)
-            .await?;
-        let zero_hash_at_level = Hasher::get_zero_hash((tree_height - key.level) as usize);
-        if result == zero_hash_at_level {
-            if max_checkpoint_id > 0 {
-                let lower_checkpoint = max_checkpoint_id - 1;
-                let lower_result = self
-                    .store
-                    .db_select_double_id_merkle_node_max_checkpoint(table, lower_checkpoint, tree_id, tree_sub_id, tree_height, key)
-                    .await?;
-                assert!(lower_result == result, "Lower checkpoint result does not match when result is zero hash");
-            }
-        }
-
-        let multi_result = self
-            .store
-            .db_select_many_double_id_merkle_nodes_max_checkpoint(table, max_checkpoint_id, tree_id, tree_sub_id, tree_height, &[key, key])
-            .await?;
-
-        assert!(multi_result.len() == 2, "Multi select did not return correct number of results");
-        assert!(multi_result[0] == result, "Multi select first result does not match single select result");
-        assert!(
-            multi_result[1] == result,
-            "Multi select second result does not match single select result"
-        );
-
-        Ok(result)
-    }
-
-    pub async fn th_util_select_many_double_id_merkle_nodes_max_checkpoint(
-        &self,
-        table: &DoubleIdMerkleTableIdentifier,
-        tree_height: u8,
-        max_checkpoint_id: u64,
-        tree_id: u64,
-        tree_sub_id: u64,
-        keys: &[SimpleMerkleNodeKey],
-    ) -> anyhow::Result<Vec<Hash>> {
-        let result = self
-            .store
-            .db_select_many_double_id_merkle_nodes_max_checkpoint(table, max_checkpoint_id, tree_id, tree_sub_id, tree_height, keys)
-            .await?;
-        assert!(
-            result.len() == keys.len(),
-            "Number of retrieved values does not match number of requested values"
-        );
-        for (i, key) in keys.iter().enumerate() {
-            let single_result = self
-                .th_util_select_double_id_merkle_node_max_checkpoint(table, tree_height, max_checkpoint_id, tree_id, tree_sub_id, *key)
-                .await?;
-            assert!(result[i] == single_result, "Multi select result does not match single select result");
-        }
-        Ok(result)
-    }
-
-    pub async fn th_util_insert_double_id_merkle_node_max_checkpoint(
-        &self,
-        table: &DoubleIdMerkleTableIdentifier,
-        tree_height: u8,
-        checkpoint_id: u64,
-        tree_id: u64,
-        tree_sub_id: u64,
-        key: SimpleMerkleNodeKey,
-        hash: &Hash,
-    ) -> anyhow::Result<()> {
-        let prev_lower = if checkpoint_id > 0 {
-            self.th_util_select_double_id_merkle_node_max_checkpoint(table, tree_height, checkpoint_id - 1, tree_id, tree_sub_id, key)
-                .await?
-        } else {
-            Hasher::get_zero_hash((tree_height - key.level) as usize)
-        };
-
-        let higher = self
-            .th_util_select_double_id_merkle_node_max_checkpoint(table, tree_height, checkpoint_id + 1, tree_id, tree_sub_id, key)
-            .await?;
-
-        self.store
-            .db_insert_double_id_merkle_node(table, checkpoint_id, tree_id, tree_sub_id, key, hash)
-            .await?;
-
-        let after = self
-            .th_util_select_double_id_merkle_node_max_checkpoint(table, tree_height, checkpoint_id, tree_id, tree_sub_id, key)
-            .await?;
-
-        assert!(after == *hash, "Inserted hash does not match retrieved hash after insert");
-        if higher == Hasher::get_zero_hash((tree_height - key.level) as usize) {
-            let higher_new = self
-                .th_util_select_double_id_merkle_node_max_checkpoint(table, tree_height, checkpoint_id + 1, tree_id, tree_sub_id, key)
-                .await?;
-            assert!(higher_new == after, "Higher hash should match inserted hash");
-        }
-
-        if prev_lower != Hasher::get_zero_hash((tree_height - key.level) as usize) {
-            let prev_lower_again = self
-                .th_util_select_double_id_merkle_node_max_checkpoint(
-                    table,
-                    tree_height,
-                    if checkpoint_id > 0 { checkpoint_id - 1 } else { 0 },
-                    tree_id,
-                    tree_sub_id,
-                    key,
-                )
-                .await?;
-            assert!(prev_lower_again == prev_lower, "Previous lower hash should not change after insert");
-        }
-
-        let multi_result = self
-            .store
-            .db_select_many_double_id_merkle_nodes_max_checkpoint(table, checkpoint_id, tree_id, tree_sub_id, tree_height, &[key, key])
-            .await?;
-        assert!(multi_result.len() == 2, "Multi select did not return correct number of results");
-        assert!(multi_result[0] == after, "Multi select first result does not match single select result");
-        assert!(multi_result[1] == after, "Multi select second result does not match single select result");
-
-        Ok(())
-    }
-
-    pub async fn th_util_insert_many_double_id_merkle_node_max_checkpoint(
-        &self,
-        table: &DoubleIdMerkleTableIdentifier,
-        tree_height: u8,
-        checkpoint_id: u64,
-        tree_id: u64,
-        tree_sub_id: u64,
-        nodes: &[SimpleMerkleNode<Hash>],
-    ) -> anyhow::Result<()> {
-        let keys = nodes.iter().map(|n| n.key).collect::<Vec<SimpleMerkleNodeKey>>();
-        let mut prev_lowers = Vec::with_capacity(nodes.len());
-        let mut highers = Vec::with_capacity(nodes.len());
-        for key in keys.iter() {
-            let prev_lower = if checkpoint_id > 0 {
-                self.th_util_select_double_id_merkle_node_max_checkpoint(table, tree_height, checkpoint_id - 1, tree_id, tree_sub_id, *key)
-                    .await?
-            } else {
-                Hasher::get_zero_hash((tree_height - key.level) as usize)
-            };
-            prev_lowers.push(prev_lower);
-            let higher = self
-                .th_util_select_double_id_merkle_node_max_checkpoint(table, tree_height, checkpoint_id + 1, tree_id, tree_sub_id, *key)
-                .await?;
-            highers.push(higher);
-        }
-
-        self.store
-            .db_set_double_id_merkle_nodes_batch(table, checkpoint_id, tree_id, tree_sub_id, nodes)
-            .await?;
-        for (i, node) in nodes.iter().enumerate() {
-            let after = self
-                .th_util_select_double_id_merkle_node_max_checkpoint(table, tree_height, checkpoint_id, tree_id, tree_sub_id, node.key)
-                .await?;
-            assert!(after == node.value, "Inserted hash does not match retrieved hash after insert");
-
-            if highers[i] == Hasher::get_zero_hash((tree_height - node.key.level) as usize) {
-                let higher_new = self
-                    .th_util_select_double_id_merkle_node_max_checkpoint(table, tree_height, checkpoint_id + 1, tree_id, tree_sub_id, node.key)
-                    .await?;
-                assert!(higher_new == after, "Higher hash should match inserted hash");
-            }
-
-            if prev_lowers[i] != Hasher::get_zero_hash((tree_height - node.key.level) as usize) {
-                let prev_lower_again = self
-                    .th_util_select_double_id_merkle_node_max_checkpoint(
-                        table,
-                        tree_height,
-                        if checkpoint_id > 0 { checkpoint_id - 1 } else { 0 },
-                        tree_id,
-                        tree_sub_id,
-                        node.key,
-                    )
-                    .await?;
-                assert!(prev_lower_again == prev_lowers[i], "Previous lower hash should not change after insert");
-            }
-        }
-        let multi_result = self
-            .store
-            .db_select_many_double_id_merkle_nodes_max_checkpoint(table, checkpoint_id, tree_id, tree_sub_id, tree_height, &keys)
-            .await?;
-        assert!(multi_result.len() == nodes.len(), "Multi select did not return correct number of results");
-        for (i, node) in nodes.iter().enumerate() {
-            let after = self
-                .th_util_select_double_id_merkle_node_max_checkpoint(table, tree_height, checkpoint_id, tree_id, tree_sub_id, node.key)
-                .await?;
-            assert!(multi_result[i] == after, "Multi select result does not match single select result");
-        }
-        Ok(())
-    }
-
-    pub async fn th_test_insert_double_id_merkle_leaves_sub_tree_dmp(&self, table: &DoubleIdMerkleTableIdentifier, checkpoint_id: u64, tree_id: u64, tree_sub_id: u64, tree_height: u8, sub_root_key: &SimpleMerkleNodeKey, leaves: &[SimpleMerkleNode<Hash>]) -> anyhow::Result<Vec<DeltaMerkleProofCore<Hash>>> {
-        if leaves.is_empty() {
-            return Ok(vec![]);
-        }
-        assert!(sub_root_key.level <= tree_height, "Sub root level must be at or below the tree height level");
-
-        let first_leaf_level = leaves[0].key.level;
-        assert!(first_leaf_level <= tree_height, "Leaf keys must be at or below the tree height level");
-        assert!(first_leaf_level >= sub_root_key.level, "Leaf keys must be at or below the sub root level");
-
-        for leaf in leaves.iter() {
-            assert!(leaf.key.level == first_leaf_level, "All leaf keys must be at the same level");
-        }
-        let leaf_values = leaves.iter().map(|node| node.value).collect::<Vec<_>>();
-        let leaf_keys = leaves.iter().map(|node| node.key).collect::<Vec<_>>();
-        let dmps = db_helper_double_id_merkle_node_simple_set_leaves::<Hash, Hasher, DoubleIdMerkleTableIdentifier,_>(&self.store, table, checkpoint_id, tree_id, tree_sub_id, tree_height, 0, 9999, leaves).await?;
-        assert!(dmps.len() == leaves.len(), "Number of DeltaMerkleProofs must match number of inserted leaves");
-        let selected_leaf_values = self.store.db_select_many_double_id_merkle_nodes_max_checkpoint(table, checkpoint_id, tree_id, tree_sub_id, tree_height, &leaf_keys).await?;
-        assert!(selected_leaf_values.len() == leaf_values.len(), "Selected leaf values length must match inserted leaf values length");
-        for (i, value) in selected_leaf_values.iter().enumerate() {
-            assert!(value == &leaf_values[i], "Selected leaf value must match inserted leaf value");
-        }
-        for dmp in dmps.iter() {
-            assert!(dmp.verify::<Hasher>(), "DeltaMerkleProof must verify correctly");
-        }
-
-        println!("th_test_insert_double_id_merkle_leaves_sub_tree_dmp: Inserted {} leaves at checkpoint {}, tree_id {}, tree_sub_id {}, tree_height {}, sub_root_key {:?}, first_leaf_level {}", leaves.len(), checkpoint_id, tree_id, tree_sub_id, tree_height, sub_root_key, first_leaf_level);
-        for i in 1..dmps.len() {
-            assert!(dmps[i-1].new_root == dmps[i].old_root, "Consecutive DeltaMerkleProofs must be connected back to back, ie. new_root of previous must equal old_root of next"); 
-        }
-        println!("completed th_test_insert_double_id_merkle_leaves_sub_tree_dmp successfully");
-
-        Ok(dmps)
-    }
-
-    pub async fn th_test_double_id_merkle_nodes_basic(&self, table: &DoubleIdMerkleTableIdentifier, tree_id: u64, tree_sub_id: u64, tree_height: u8) -> anyhow::Result<()> {
-
-        let first_checkpoint_id = 1u64;
-        let second_checkpoint_id = 2u64;
-        let third_checkpoint_id = 3u64;
-        let fourth_checkpoint_id = 999u64;
-        let last_checkpoint_id = 12874892u64;
-
-        let max_leaves_in_tree = 1u64 << tree_height;
-        let num_leaves_to_insert = 16u64.min(max_leaves_in_tree);
-        let num_leaves_to_insert_usize = num_leaves_to_insert as usize;
-        let root_key = SimpleMerkleNodeKey::new_root();
-        let first_batch = rand_leaves_for_subtree::<Hash>(&root_key, tree_height, num_leaves_to_insert_usize);
-
-        let dmps_0 = self.th_test_insert_double_id_merkle_leaves_sub_tree_dmp(table, first_checkpoint_id, tree_id, tree_sub_id, tree_height, &SimpleMerkleNodeKey::new_root(), &first_batch).await?;
-        assert!(dmps_0.len() == first_batch.len(), "Number of DeltaMerkleProofs must match number of inserted leaves at first checkpoint");
-
-        let second_batch = rand_leaves_for_subtree::<Hash>(&root_key, tree_height, num_leaves_to_insert_usize);
-        let dmps_1 = self.th_test_insert_double_id_merkle_leaves_sub_tree_dmp(table, second_checkpoint_id, tree_id, tree_sub_id, tree_height, &SimpleMerkleNodeKey::new_root(), &second_batch).await?;
-        assert!(dmps_1.len() == second_batch.len(), "Number of DeltaMerkleProofs must match number of inserted leaves at second checkpoint");
-
-        let first_second_batch_combined_halves = [
-            first_batch[0..(num_leaves_to_insert_usize/2)].to_vec(),
-            second_batch[(num_leaves_to_insert_usize/2)..num_leaves_to_insert_usize].to_vec()
-        ].concat();
-        let third_batch_unmodified = [
-            first_batch[(num_leaves_to_insert_usize/2)..num_leaves_to_insert_usize].to_vec(),
-            second_batch[0..(num_leaves_to_insert_usize/2)].to_vec()
-        ].concat();
-        let third_batch_new_leaves = rand_leaves_for_subtree::<Hash>(&root_key, tree_height, num_leaves_to_insert_usize);
-        let first_second_batch_leaves_at_third_checkpoint = first_second_batch_combined_halves.iter().map(|x|{
-            SimpleMerkleNode {
-                key: x.key,
-                value: Hash::qp_rand_gen(),
-            }
-        }).collect::<Vec<_>>();
-        let third_batch = [first_second_batch_leaves_at_third_checkpoint, third_batch_new_leaves.clone()].concat();
-        let dmps_2 = self.th_test_insert_double_id_merkle_leaves_sub_tree_dmp(table, third_checkpoint_id, tree_id, tree_sub_id, tree_height, &SimpleMerkleNodeKey::new_root(), &third_batch).await?;
-        assert!(dmps_2.len() == third_batch.len(), "Number of DeltaMerkleProofs must match number of inserted leaves at third checkpoint");
-
-        let b12_unmodified_keys = third_batch_unmodified.iter().map(|x| x.key).collect::<Vec<_>>();
-        let b12_unmodified_values = third_batch_unmodified.iter().map(|x| x.value).collect::<Vec<_>>();
-        let selected_unmodified_values = self.store.db_select_many_double_id_merkle_nodes_max_checkpoint(table, third_checkpoint_id, tree_id, tree_sub_id, tree_height, &b12_unmodified_keys).await?;
-        assert!(selected_unmodified_values.len() == b12_unmodified_values.len(), "Selected unmodified values length must match unmodified values length at third checkpoint");
-        for (i, value) in selected_unmodified_values.iter().enumerate() {
-            assert!(value == &b12_unmodified_values[i], "Selected unmodified value must match unmodified value at third checkpoint");
-        }
-
-        let b3_modified_keys = third_batch_new_leaves.iter().map(|x| x.key).collect::<Vec<_>>();
-        let b3_modified_values = third_batch_new_leaves.iter().map(|x| x.value).collect::<Vec<_>>();
-        let selected_modified_values = self.store.db_select_many_double_id_merkle_nodes_max_checkpoint(table, third_checkpoint_id, tree_id, tree_sub_id, tree_height, &b3_modified_keys).await?;
-        assert!(selected_modified_values.len() == b3_modified_values.len(), "Selected modified values length must match modified values length at third checkpoint");
-        for (i, value) in selected_modified_values.iter().enumerate() {
-            assert!(value == &b3_modified_values[i], "Selected modified value must match modified value at third checkpoint");
-        }
-
-        let fourth_batch = rand_leaves_for_subtree::<Hash>(&root_key, tree_height, num_leaves_to_insert_usize);
-        let dmps_3 = self.th_test_insert_double_id_merkle_leaves_sub_tree_dmp(table, fourth_checkpoint_id, tree_id, tree_sub_id, tree_height, &SimpleMerkleNodeKey::new_root(), &fourth_batch).await?;
-        assert!(dmps_3.len() == fourth_batch.len(), "Number of DeltaMerkleProofs must match number of inserted leaves at fourth checkpoint");
-
-        let last_batch = rand_leaves_for_subtree::<Hash>(&root_key, tree_height, num_leaves_to_insert_usize);
-        let dmps_4 = self.th_test_insert_double_id_merkle_leaves_sub_tree_dmp(table, last_checkpoint_id, tree_id, tree_sub_id, tree_height, &SimpleMerkleNodeKey::new_root(), &last_batch).await?;
-        assert!(dmps_4.len() == last_batch.len(), "Number of DeltaMerkleProofs must match number of inserted leaves at last checkpoint");
-
-        let keys_to_check: Vec<_> = first_batch.iter().chain(second_batch.iter()).chain(third_batch.iter()).chain(fourth_batch.iter()).chain(last_batch.iter()).map(|x| x.key)
-            .into_iter()
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-
-        for k in keys_to_check {
-            let mp = db_helper_select_double_id_merkle_proof_max_checkpoint::<Hash, Hasher, _, _>(&self.store, table, first_checkpoint_id+1, tree_id, tree_sub_id, tree_height, &k). await?;
-            assert!(mp.verify::<Hasher>(), "MerkleProof must verify correctly for key {:?}", k);
-            let mp = db_helper_select_double_id_merkle_proof_max_checkpoint::<Hash, Hasher, _, _>(&self.store, table, second_checkpoint_id, tree_id, tree_sub_id, tree_height, &k). await?;
-            assert!(mp.verify::<Hasher>(), "MerkleProof must verify correctly for key {:?}", k);
-            let mp = db_helper_select_double_id_merkle_proof_max_checkpoint::<Hash, Hasher, _, _>(&self.store, table, third_checkpoint_id, tree_id, tree_sub_id, tree_height, &k). await?;
-            assert!(mp.verify::<Hasher>(), "MerkleProof must verify correctly for key {:?}", k);
-            let mp = db_helper_select_double_id_merkle_proof_max_checkpoint::<Hash, Hasher, _, _>(&self.store, table, fourth_checkpoint_id, tree_id, tree_sub_id, tree_height, &k). await?;
-            assert!(mp.verify::<Hasher>(), "MerkleProof must verify correctly for key {:?}", k);
-            let mp = db_helper_select_double_id_merkle_proof_max_checkpoint::<Hash, Hasher, _, _>(&self.store, table, last_checkpoint_id, tree_id, tree_sub_id, tree_height, &k). await?;
-            assert!(mp.verify::<Hasher>(), "MerkleProof must verify correctly for key {:?}", k);
-            let mp = db_helper_select_double_id_merkle_proof_max_checkpoint::<Hash, Hasher, _, _>(&self.store, table, last_checkpoint_id+100, tree_id, tree_sub_id, tree_height, &k). await?;
-            assert!(mp.verify::<Hasher>(), "MerkleProof must verify correctly for key {:?}", k);
-        }
-        Ok(())
-    }
-
-    pub async fn th_util_select_zero_id_merkle_node_max_checkpoint(
-        &self,
-        table: &ZeroIdMerkleTableIdentifier,
-        max_checkpoint_id: u64,
+        table: &RewardTreeTableIdentifier,
+        unique_pending_id: u64,
         key: &SimpleMerkleNodeKey,
-    ) -> anyhow::Result<Hash> {
-        let result = self
-            .store
-            .db_select_zero_id_merkle_node_max_checkpoint(table, max_checkpoint_id, key)
-            .await?;
-        let zero_hash_at_level = Hasher::get_zero_hash(key.level as usize);
-        if result == zero_hash_at_level {
-            if max_checkpoint_id > 0 {
-                let lower_checkpoint = max_checkpoint_id - 1;
-                let lower_result = self
-                    .store
-                    .db_select_zero_id_merkle_node_max_checkpoint(table, lower_checkpoint, key)
-                    .await?;
-                assert!(lower_result == result, "Lower checkpoint result does not match when result is zero hash");
-            }
-        }
-
-        let multi_result = self
-            .store
-            .db_select_many_zero_id_merkle_nodes_max_checkpoint(table, max_checkpoint_id, &[key.clone(), key.clone()])
-            .await?;
-
-        assert!(multi_result.len() == 2, "Multi select did not return correct number of results");
-        assert!(multi_result[0] == result, "Multi select first result does not match single select result");
-        assert!(
-            multi_result[1] == result,
-            "Multi select second result does not match single select result"
-        );
-
+    ) -> anyhow::Result<Option<Hash>> {
+        let result = self.store.db_get_tag_tree_node_value(table, unique_pending_id, key).await?;
+        let multi_result = self.store.db_get_tag_tree_node_values(table, unique_pending_id, &[key.clone(), key.clone()]).await?;
+        assert!(multi_result.len() == 2, "Multi get did not return correct number of results");
+        assert!(multi_result[0] == result, "Multi get first result does not match single get result");
+        assert!(multi_result[1] == result, "Multi get second result does not match single get result");
         Ok(result)
     }
 
-    pub async fn th_util_select_many_zero_id_merkle_nodes_max_checkpoint(
+    pub async fn th_util_get_many_tag_tree_node_values(
         &self,
-        table: &ZeroIdMerkleTableIdentifier,
-        max_checkpoint_id: u64,
+        table: &RewardTreeTableIdentifier,
+        unique_pending_id: u64,
         keys: &[SimpleMerkleNodeKey],
-    ) -> anyhow::Result<Vec<Hash>> {
-        let result = self
-            .store
-            .db_select_many_zero_id_merkle_nodes_max_checkpoint(table, max_checkpoint_id, keys)
-            .await?;
+    ) -> anyhow::Result<Vec<Option<Hash>>> {
+        let result = self.store.db_get_tag_tree_node_values(table, unique_pending_id, keys).await?;
         assert!(
             result.len() == keys.len(),
-            "Number of retrieved values does not match number of requested values"
+            "Number of retrieved values does not match number of requested keys"
         );
         for (i, key) in keys.iter().enumerate() {
-            let single_result = self
-                .th_util_select_zero_id_merkle_node_max_checkpoint(table, max_checkpoint_id, key)
-                .await?;
-            assert!(result[i] == single_result, "Multi select result does not match single select result");
+            let single_result = self.th_util_get_tag_tree_node_value(table, unique_pending_id, key).await?;
+            assert!(result[i] == single_result, "Multi get result does not match single get result");
+        }
+        Ok(result)
+    }
+pub async fn th_util_get_tag_tree_node_tag(
+        &self,
+        table: &RewardTreeTableIdentifier,
+        unique_pending_id: u64,
+        key: &SimpleMerkleNodeKey,
+    ) -> anyhow::Result<Option<Hash>> {
+        let result = self.store.db_get_tag_tree_node_tag(table, unique_pending_id, key).await?;
+        let value = self.th_util_get_tag_tree_node_value(table, unique_pending_id, key).await?;
+        if let Some(v) = value {
+            let storage = TagTreeStorageNode { value: v, tag: result.unwrap_or_default() };
+            let left = self.th_util_get_tag_tree_node_value(table, unique_pending_id, &key.left_child()).await?.unwrap_or_default();
+            let right = self.th_util_get_tag_tree_node_value(table, unique_pending_id, &key.right_child()).await?.unwrap_or_default();
+            let preimage = TagTreeNodePreimage { left, right, tag: storage.tag };
+            assert_eq!(preimage.get_node_hash::<Hasher>(), storage.value, "Computed node value from preimage does not match stored value");
         }
         Ok(result)
     }
 
-    pub async fn th_util_insert_zero_id_merkle_node_max_checkpoint(
-        &self,
-        table: &ZeroIdMerkleTableIdentifier,
-        checkpoint_id: u64,
-        key: &SimpleMerkleNodeKey,
-        hash: &Hash,
-    ) -> anyhow::Result<()> {
-        let prev_lower = if checkpoint_id > 0 {
-            self.th_util_select_zero_id_merkle_node_max_checkpoint(table, checkpoint_id - 1, key)
-                .await?
-        } else {
-            Hasher::get_zero_hash(key.level as usize)
-        };
-
-        let higher = self
-            .th_util_select_zero_id_merkle_node_max_checkpoint(table, checkpoint_id + 1, key)
-            .await?;
-
-        self.store
-            .db_insert_zero_id_merkle_node(table, checkpoint_id, key, hash)
-            .await?;
-
-        let after = self
-            .th_util_select_zero_id_merkle_node_max_checkpoint(table, checkpoint_id, key)
-            .await?;
-
-        assert!(after == *hash, "Inserted hash does not match retrieved hash after insert");
-        if higher == Hasher::get_zero_hash(key.level as usize) {
-            let higher_new = self
-                .th_util_select_zero_id_merkle_node_max_checkpoint(table, checkpoint_id + 1, key)
-                .await?;
-            assert!(higher_new == after, "Higher hash should match inserted hash");
-        }
-
-        if prev_lower != Hasher::get_zero_hash(key.level as usize) {
-            let prev_lower_again = self
-                .th_util_select_zero_id_merkle_node_max_checkpoint(
-                    table,
-                    if checkpoint_id > 0 { checkpoint_id - 1 } else { 0 },
-                    key,
-                )
-                .await?;
-            assert!(prev_lower_again == prev_lower, "Previous lower hash should not change after insert");
-        }
-
-        let multi_result = self
-            .store
-            .db_select_many_zero_id_merkle_nodes_max_checkpoint(table, checkpoint_id, &[key.clone(), key.clone()])
-            .await?;
-        assert!(multi_result.len() == 2, "Multi select did not return correct number of results");
-        assert!(multi_result[0] == after, "Multi select first result does not match single select result");
-        assert!(multi_result[1] == after, "Multi select second result does not match single select result");
-
-        Ok(())
-    }
-
-    pub async fn th_util_insert_many_zero_id_merkle_node_max_checkpoint(
-        &self,
-        table: &ZeroIdMerkleTableIdentifier,
-        checkpoint_id: u64,
-        nodes: &[SimpleMerkleNode<Hash>],
-    ) -> anyhow::Result<()> {
-        let keys = nodes.iter().map(|n| n.key.clone()).collect::<Vec<SimpleMerkleNodeKey>>();
-        let mut prev_lowers = Vec::with_capacity(nodes.len());
-        let mut highers = Vec::with_capacity(nodes.len());
-        for key in keys.iter() {
-            let prev_lower = if checkpoint_id > 0 {
-                self.th_util_select_zero_id_merkle_node_max_checkpoint(table, checkpoint_id - 1, key)
-                    .await?
-            } else {
-                Hasher::get_zero_hash(key.level as usize)
-            };
-            prev_lowers.push(prev_lower);
-            let higher = self
-                .th_util_select_zero_id_merkle_node_max_checkpoint(table, checkpoint_id + 1, key)
-                .await?;
-            highers.push(higher);
-        }
-
-        self.store
-            .db_set_zero_id_merkle_nodes_batch(table, checkpoint_id, nodes)
-            .await?;
-        for (i, node) in nodes.iter().enumerate() {
-            let after = self
-                .th_util_select_zero_id_merkle_node_max_checkpoint(table, checkpoint_id, &node.key)
-                .await?;
-            assert!(after == node.value, "Inserted hash does not match retrieved hash after insert");
-
-            if highers[i] == Hasher::get_zero_hash(node.key.level as usize) {
-                let higher_new = self
-                    .th_util_select_zero_id_merkle_node_max_checkpoint(table, checkpoint_id + 1, &node.key)
-                    .await?;
-                assert!(higher_new == after, "Higher hash should match inserted hash");
-            }
-
-            if prev_lowers[i] != Hasher::get_zero_hash(node.key.level as usize) {
-                let prev_lower_again = self
-                    .th_util_select_zero_id_merkle_node_max_checkpoint(
-                        table,
-                        if checkpoint_id > 0 { checkpoint_id - 1 } else { 0 },
-                        &node.key,
-                    )
-                    .await?;
-                assert!(prev_lower_again == prev_lowers[i], "Previous lower hash should not change after insert");
-            }
-        }
-        let multi_result = self
-            .store
-            .db_select_many_zero_id_merkle_nodes_max_checkpoint(table, checkpoint_id, &keys)
-            .await?;
-        assert!(multi_result.len() == nodes.len(), "Multi select did not return correct number of results");
-        for (i, node) in nodes.iter().enumerate() {
-            let after = self
-                .th_util_select_zero_id_merkle_node_max_checkpoint(table, checkpoint_id, &node.key)
-                .await?;
-            assert!(multi_result[i] == after, "Multi select result does not match single select result");
-        }
-        Ok(())
-    }
-
-    pub async fn th_test_insert_zero_id_merkle_leaves_sub_tree_dmp(&self, table: &ZeroIdMerkleTableIdentifier, checkpoint_id: u64, sub_root_key: &SimpleMerkleNodeKey, leaves: &[SimpleMerkleNode<Hash>]) -> anyhow::Result<Vec<DeltaMerkleProofCore<Hash>>> {
-        if leaves.is_empty() {
-            return Ok(vec![]);
-        }
-
-        let first_leaf_level = leaves[0].key.level;
-        for leaf in leaves.iter() {
-            assert!(leaf.key.level == first_leaf_level, "All leaf keys must be at the same level");
-        }
-        let leaf_values = leaves.iter().map(|node| node.value).collect::<Vec<_>>();
-        let leaf_keys = leaves.iter().map(|node| node.key.clone()).collect::<Vec<_>>();
-        let dmps = db_helper_zero_id_merkle_node_simple_set_leaves::<Hash, Hasher, ZeroIdMerkleTableIdentifier,_>(&self.store, table, checkpoint_id, 0, 9999, leaves).await?;
-        assert!(dmps.len() == leaves.len(), "Number of DeltaMerkleProofs must match number of inserted leaves");
-        let selected_leaf_values = self.store.db_select_many_zero_id_merkle_nodes_max_checkpoint(table, checkpoint_id, &leaf_keys).await?;
-        assert!(selected_leaf_values.len() == leaf_values.len(), "Selected leaf values length must match inserted leaf values length");
-        for (i, value) in selected_leaf_values.iter().enumerate() {
-            assert!(value == &leaf_values[i], "Selected leaf value must match inserted leaf value");
-        }
-        for dmp in dmps.iter() {
-            assert!(dmp.verify::<Hasher>(), "DeltaMerkleProof must verify correctly");
-        }
-
-        for i in 1..dmps.len() {
-            assert!(dmps[i-1].new_root == dmps[i].old_root, "Consecutive DeltaMerkleProofs must be connected back to back, ie. new_root of previous must equal old_root of next"); 
-        }
-
-        Ok(dmps)
-    }
-
-    pub async fn th_test_zero_id_merkle_nodes_basic(&self, table: &ZeroIdMerkleTableIdentifier, tree_height: u8) -> anyhow::Result<()> {
-
-        let first_checkpoint_id = 1u64;
-        let second_checkpoint_id = 2u64;
-        let third_checkpoint_id = 3u64;
-        let fourth_checkpoint_id = 999u64;
-        let last_checkpoint_id = 12874892u64;
-
-        let max_leaves_in_tree = 1u64 << tree_height;
-        let num_leaves_to_insert = 16u64.min(max_leaves_in_tree);
-        let num_leaves_to_insert_usize = num_leaves_to_insert as usize;
+    pub async fn th_util_get_tag_tree_root(&self, table: &RewardTreeTableIdentifier, unique_pending_id: u64) -> anyhow::Result<Option<Hash>> {
+        let result = self.store.db_get_tag_tree_root(table, unique_pending_id).await?;
         let root_key = SimpleMerkleNodeKey::new_root();
-        let first_batch = rand_leaves_for_subtree::<Hash>(&root_key, tree_height, num_leaves_to_insert_usize);
+        let value_from_node = self.th_util_get_tag_tree_node_value(table, unique_pending_id, &root_key).await?;
+        assert!(result == value_from_node, "Root from get_root does not match get_node_value for root key");
+        Ok(result)
+    }
 
-        let dmps_0 = self.th_test_insert_zero_id_merkle_leaves_sub_tree_dmp(table, first_checkpoint_id, &SimpleMerkleNodeKey::new_root(), &first_batch).await?;
-        assert!(dmps_0.len() == first_batch.len(), "Number of DeltaMerkleProofs must match number of inserted leaves at first checkpoint");
+    pub async fn th_util_get_tag_tree_merkle_proof(
+        &self,
+        table: &RewardTreeTableIdentifier,
+        unique_pending_id: u64,
+        key: &SimpleMerkleNodeKey,
+    ) -> anyhow::Result<TagTreeMerkleProof<Hash>> {
+        let result = self.store.db_get_tag_tree_merkle_proof(table, unique_pending_id, key).await?;
+        assert!(result.verify::<Hasher>(), "Retrieved proof does not verify");
+        let computed_root = compute_tag_tree_root_for_proof::<Hash, Hasher>(result.index, &result.leaf, &result.siblings);
+        assert_eq!(computed_root, result.root, "Computed root does not match proof root");
+        let stored_root = self.th_util_get_tag_tree_root(table, unique_pending_id).await?.unwrap_or_default();
+        assert_eq!(result.root, stored_root, "Proof root does not match stored root");
+        Ok(result)
+    }
 
-        let second_batch = rand_leaves_for_subtree::<Hash>(&root_key, tree_height, num_leaves_to_insert_usize);
-        let dmps_1 = self.th_test_insert_zero_id_merkle_leaves_sub_tree_dmp(table, second_checkpoint_id, &SimpleMerkleNodeKey::new_root(), &second_batch).await?;
-        assert!(dmps_1.len() == second_batch.len(), "Number of DeltaMerkleProofs must match number of inserted leaves at second checkpoint");
+    pub async fn th_util_set_tag_tree_tag_value(
+        &self,
+        table: &RewardTreeTableIdentifier,
+        unique_pending_id: u64,
+        key: &SimpleMerkleNodeKey,
+        tag: &Hash,
+        value: &Hash,
+    ) -> anyhow::Result<()> {
+        self.store.set_tag_tree_tag_value(table, unique_pending_id, key, tag, value).await?;
+        let retrieved_value = self.th_util_get_tag_tree_node_value(table, unique_pending_id, key).await?;
+        assert_eq!(retrieved_value, Some(*value), "Retrieved value does not match set value");
+        let retrieved_tag = self.th_util_get_tag_tree_node_tag(table, unique_pending_id, key).await?;
+        assert_eq!(retrieved_tag, Some(*tag), "Retrieved tag does not match set tag");
+        Ok(())
+    }
 
-        let first_second_batch_combined_halves = [
-            first_batch[0..(num_leaves_to_insert_usize/2)].to_vec(),
-            second_batch[(num_leaves_to_insert_usize/2)..num_leaves_to_insert_usize].to_vec()
-        ].concat();
-        let third_batch_unmodified = [
-            first_batch[(num_leaves_to_insert_usize/2)..num_leaves_to_insert_usize].to_vec(),
-            second_batch[0..(num_leaves_to_insert_usize/2)].to_vec()
-        ].concat();
-        let third_batch_new_leaves = rand_leaves_for_subtree::<Hash>(&root_key, tree_height, num_leaves_to_insert_usize);
-        let first_second_batch_leaves_at_third_checkpoint = first_second_batch_combined_halves.iter().map(|x|{
-            SimpleMerkleNode {
-                key: x.key,
-                value: Hash::qp_rand_gen(),
+    pub async fn th_util_set_tag_tree_tag(
+        &self,
+        table: &RewardTreeTableIdentifier,
+        unique_pending_id: u64,
+        key: &SimpleMerkleNodeKey,
+        tag: &Hash,
+    ) -> anyhow::Result<()> {
+        let left = self.th_util_get_tag_tree_node_value(table, unique_pending_id, &key.left_child()).await?.unwrap_or_default();
+        let right = self.th_util_get_tag_tree_node_value(table, unique_pending_id, &key.right_child()).await?.unwrap_or_default();
+        let expected_value = hash_tag_tree_node::<Hash, Hasher>(&left, &right, tag);
+        self.store.set_tag_tree_tag(table, unique_pending_id, key, tag).await?;
+        let retrieved_value = self.th_util_get_tag_tree_node_value(table, unique_pending_id, key).await?;
+        assert_eq!(retrieved_value, Some(expected_value), "Retrieved value does not match computed value");
+        let retrieved_tag = self.th_util_get_tag_tree_node_tag(table, unique_pending_id, key).await?;
+        assert_eq!(retrieved_tag, Some(*tag), "Retrieved tag does not match set tag");
+        Ok(())
+    }
+pub async fn th_test_tag_tree_basic(&self, table: &RewardTreeTableIdentifier, unique_pending_id: u64) -> anyhow::Result<()> {
+        let height = 32u8;
+        let leaves = random_nodes_in_tree(height, 1337);
+        let group_levels = generate_nca_tree_groups_efficient(&leaves, height);
+
+        let tree_height = (group_levels.len() - 1) as u8;
+
+        let mut hash_map_dat = HashMap::<SimpleMerkleNodeKey, (Hash, Hash)>::new();
+
+        for (level, gl) in group_levels.iter().enumerate() {
+            for (index, g) in gl.iter().enumerate() {
+                let tag = Hash::qp_rand_gen();
+                let key = SimpleMerkleNodeKey::new(tree_height - level as u8, index as u64);
+                let left_key = key.left_child();
+                let right_key = key.right_child();
+                let left_value = hash_map_dat.get(&left_key).map(|&(_, v)| v).unwrap_or_default();
+                let right_value = hash_map_dat.get(&right_key).map(|&(_, v)| v).unwrap_or_default();
+                let value = hash_tag_tree_node::<Hash, Hasher>(&left_value, &right_value, &tag);
+                hash_map_dat.insert(key, (tag, value));
+                self.th_util_set_tag_tree_tag_value(table, unique_pending_id, &key, &tag, &value).await?;
             }
-        }).collect::<Vec<_>>();
-        let third_batch = [first_second_batch_leaves_at_third_checkpoint, third_batch_new_leaves.clone()].concat();
-        let dmps_2 = self.th_test_insert_zero_id_merkle_leaves_sub_tree_dmp(table, third_checkpoint_id, &SimpleMerkleNodeKey::new_root(), &third_batch).await?;
-        assert!(dmps_2.len() == third_batch.len(), "Number of DeltaMerkleProofs must match number of inserted leaves at third checkpoint");
-
-        let b12_unmodified_keys = third_batch_unmodified.iter().map(|x| x.key.clone()).collect::<Vec<_>>();
-        let b12_unmodified_values = third_batch_unmodified.iter().map(|x| x.value).collect::<Vec<_>>();
-        let selected_unmodified_values = self.store.db_select_many_zero_id_merkle_nodes_max_checkpoint(table, third_checkpoint_id, &b12_unmodified_keys).await?;
-        assert!(selected_unmodified_values.len() == b12_unmodified_values.len(), "Selected unmodified values length must match unmodified values length at third checkpoint");
-        for (i, value) in selected_unmodified_values.iter().enumerate() {
-            assert!(value == &b12_unmodified_values[i], "Selected unmodified value must match unmodified value at third checkpoint");
         }
 
-        let b3_modified_keys = third_batch_new_leaves.iter().map(|x| x.key.clone()).collect::<Vec<_>>();
-        let b3_modified_values = third_batch_new_leaves.iter().map(|x| x.value).collect::<Vec<_>>();
-        let selected_modified_values = self.store.db_select_many_zero_id_merkle_nodes_max_checkpoint(table, third_checkpoint_id, &b3_modified_keys).await?;
-        assert!(selected_modified_values.len() == b3_modified_values.len(), "Selected modified values length must match modified values length at third checkpoint");
-        for (i, value) in selected_modified_values.iter().enumerate() {
-            assert!(value == &b3_modified_values[i], "Selected modified value must match modified value at third checkpoint");
+        for (key, &(tag, value)) in hash_map_dat.iter() {
+            let retrieved_tag = self.th_util_get_tag_tree_node_tag(table, unique_pending_id, key).await?;
+            assert_eq!(retrieved_tag, Some(tag), "Retrieved tag does not match");
+            let retrieved_value = self.th_util_get_tag_tree_node_value(table, unique_pending_id, key).await?;
+            assert_eq!(retrieved_value, Some(value), "Retrieved value does not match");
         }
 
-        let fourth_batch = rand_leaves_for_subtree::<Hash>(&root_key, tree_height, num_leaves_to_insert_usize);
-        let dmps_3 = self.th_test_insert_zero_id_merkle_leaves_sub_tree_dmp(table, fourth_checkpoint_id, &SimpleMerkleNodeKey::new_root(), &fourth_batch).await?;
-        assert!(dmps_3.len() == fourth_batch.len(), "Number of DeltaMerkleProofs must match number of inserted leaves at fourth checkpoint");
-
-        let last_batch = rand_leaves_for_subtree::<Hash>(&root_key, tree_height, num_leaves_to_insert_usize);
-        let dmps_4 = self.th_test_insert_zero_id_merkle_leaves_sub_tree_dmp(table, last_checkpoint_id, &SimpleMerkleNodeKey::new_root(), &last_batch).await?;
-        assert!(dmps_4.len() == last_batch.len(), "Number of DeltaMerkleProofs must match number of inserted leaves at last checkpoint");
-
-        let keys_to_check: Vec<_> = first_batch.iter().chain(second_batch.iter()).chain(third_batch.iter()).chain(fourth_batch.iter()).chain(last_batch.iter()).map(|x| x.key.clone())
-            .into_iter()
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-
-        for k in keys_to_check {
-            let mp = db_helper_select_zero_id_merkle_proof_max_checkpoint::<Hash, Hasher, _, _>(&self.store, table, first_checkpoint_id+1, &k). await?;
-            assert!(mp.verify::<Hasher>(), "MerkleProof must verify correctly for key {:?}", k);
-            let mp = db_helper_select_zero_id_merkle_proof_max_checkpoint::<Hash, Hasher, _, _>(&self.store, table, second_checkpoint_id, &k). await?;
-            assert!(mp.verify::<Hasher>(), "MerkleProof must verify correctly for key {:?}", k);
-            let mp = db_helper_select_zero_id_merkle_proof_max_checkpoint::<Hash, Hasher, _, _>(&self.store, table, third_checkpoint_id, &k). await?;
-            assert!(mp.verify::<Hasher>(), "MerkleProof must verify correctly for key {:?}", k);
-            let mp = db_helper_select_zero_id_merkle_proof_max_checkpoint::<Hash, Hasher, _, _>(&self.store, table, fourth_checkpoint_id, &k). await?;
-            assert!(mp.verify::<Hasher>(), "MerkleProof must verify correctly for key {:?}", k);
-            let mp = db_helper_select_zero_id_merkle_proof_max_checkpoint::<Hash, Hasher, _, _>(&self.store, table, last_checkpoint_id, &k). await?;
-            assert!(mp.verify::<Hasher>(), "MerkleProof must verify correctly for key {:?}", k);
-            let mp = db_helper_select_zero_id_merkle_proof_max_checkpoint::<Hash, Hasher, _, _>(&self.store, table, last_checkpoint_id+100, &k). await?;
-            assert!(mp.verify::<Hasher>(), "MerkleProof must verify correctly for key {:?}", k);
+        let all_keys = hash_map_dat.keys().cloned().collect::<Vec<_>>();
+        let multi_values = self.th_util_get_many_tag_tree_node_values(table, unique_pending_id, &all_keys).await?;
+        for (i, key) in all_keys.iter().enumerate() {
+            assert_eq!(multi_values[i], Some(hash_map_dat[key].1), "Multi retrieved value does not match");
         }
+
+        let root_key = SimpleMerkleNodeKey::new_root();
+        let root = self.th_util_get_tag_tree_root(table, unique_pending_id).await?;
+        assert_eq!(root, Some(hash_map_dat[&root_key].1), "Retrieved root does not match");
+
+        for g in group_levels.iter().flatten() {
+            let key = g.nca.clone();
+            let proof = self.th_util_get_tag_tree_merkle_proof(table, unique_pending_id, &key).await?;
+            assert_eq!(proof.root, root.unwrap(), "Proof root does not match tree root");
+        }
+
+        let missing_key = SimpleMerkleNodeKey::random_simple_merkle_node_in_tree(tree_height);
+        if !hash_map_dat.contains_key(&missing_key) {
+            let missing_value = self.th_util_get_tag_tree_node_value(table, unique_pending_id, &missing_key).await?;
+            assert!(missing_value.is_none(), "Missing value should be None");
+            let missing_tag = self.th_util_get_tag_tree_node_tag(table, unique_pending_id, &missing_key).await?;
+            assert!(missing_tag.is_none(), "Missing tag should be None");
+            let proof_missing = self.th_util_get_tag_tree_merkle_proof(table, unique_pending_id, &missing_key).await?;
+            assert_eq!(proof_missing.leaf.left, Hash::default());
+            assert_eq!(proof_missing.leaf.right, Hash::default());
+            assert_eq!(proof_missing.leaf.tag, Hash::default());
+            assert_eq!(proof_missing.root, root.unwrap_or_default());
+        }
+
+        let different_pending_id = unique_pending_id + 1;
+        let root_diff = self.th_util_get_tag_tree_root(table, different_pending_id).await?;
+        assert!(root_diff.is_none(), "Different pending id root should be None");
+        let value_diff = self.th_util_get_tag_tree_node_value(table, different_pending_id, &root_key).await?;
+        assert!(value_diff.is_none(), "Different pending id value should be None");
+
+        let override_key = SimpleMerkleNodeKey::random_simple_merkle_node_in_tree(tree_height);
+        if hash_map_dat.contains_key(&override_key) {
+            let old_tag = hash_map_dat[&override_key].0;
+            let new_tag = Hash::qp_rand_gen();
+            self.th_util_set_tag_tree_tag(table, unique_pending_id, &override_key, &new_tag).await?;
+            let retrieved_new_tag = self.th_util_get_tag_tree_node_tag(table, unique_pending_id, &override_key).await?;
+            assert_eq!(retrieved_new_tag, Some(new_tag), "Overridden tag does not match");
+            let left = self.th_util_get_tag_tree_node_value(table, unique_pending_id, &override_key.left_child()).await?.unwrap_or_default();
+            let right = self.th_util_get_tag_tree_node_value(table, unique_pending_id, &override_key.right_child()).await?.unwrap_or_default();
+            let new_value = hash_tag_tree_node::<Hash, Hasher>(&left, &right, &new_tag);
+            let retrieved_new_value = self.th_util_get_tag_tree_node_value(table, unique_pending_id, &override_key).await?;
+            assert_eq!(retrieved_new_value, Some(new_value), "Overridden value does not match computed value");
+            let proof_after_override = self.th_util_get_tag_tree_merkle_proof(table, unique_pending_id, &override_key).await?;
+            assert!(proof_after_override.verify::<Hasher>(), "Proof after override does not verify");
+        }
+
         Ok(())
     }
 }
 
 */
+
+impl<
+        const ZERO_ID_TREE_A_HEIGHT: usize,
+        const ZERO_ID_TREE_B_HEIGHT: usize,
+        const SINGLE_ID_TREE_A_HEIGHT: usize,
+        const SINGLE_ID_TREE_B_HEIGHT: usize,
+        const DOUBLE_ID_TREE_A_HEIGHT: usize,
+        const DOUBLE_ID_TREE_B_HEIGHT: usize,
+        BidirectionalMappingTableAK1: QDatabasePrimitiveKey,
+        BidirectionalMappingTableAK2: QDatabasePrimitiveKey,
+        BidirectionalMappingTableBK1: QDatabasePrimitiveKey,
+        BidirectionalMappingTableBK2: QDatabasePrimitiveKey,
+        KivTableAValue: CoreDatabaseValueDeserialize,
+        KivTableBValue: CoreDatabaseValueDeserialize,
+        ObjSingleIdTableAValue: CoreDatabaseValueDeserialize,
+        ObjDoubleIdTableBValue: CoreDatabaseValueDeserialize,
+        Hash: QHashBase + QPGenRandom + std::fmt::Debug + Default + Clone + Send + Sync,
+        Hasher: THHasher<Hash>,
+        BiDirectionalMappingTableIdentifier: THStandardTableIdentifier,
+        BiDirectionalU64U128MappingTableIdentifier: THStandardTableIdentifier,
+        U64TableIdentifier: THStandardTableIdentifier,
+        SingleIdTableIdentifier: THStandardTableIdentifier,
+        DoubleIdTableIdentifier: THStandardTableIdentifier,
+        KivTableIdentifier: THStandardTableIdentifier,
+        SingleIdMerkleTableIdentifier: THStandardTableIdentifier,
+        DoubleIdMerkleTableIdentifier: THStandardTableIdentifier,
+        ZeroIdMerkleTableIdentifier: THStandardTableIdentifier,
+        RewardTreeTableIdentifier: THStandardTableIdentifier,
+        S: CoreDatabaseStore<
+                Hash,
+                Hasher,
+                BiDirectionalMappingTableIdentifier,
+                BiDirectionalU64U128MappingTableIdentifier,
+                U64TableIdentifier,
+                SingleIdTableIdentifier,
+                DoubleIdTableIdentifier,
+                KivTableIdentifier,
+                SingleIdMerkleTableIdentifier,
+                DoubleIdMerkleTableIdentifier,
+                ZeroIdMerkleTableIdentifier,
+            > + CoreDatabaseTagTreeStore<Hash, Hasher, RewardTreeTableIdentifier>
+            + Send
+            + Sync,
+    >
+    QSimpleStore<
+        ZERO_ID_TREE_A_HEIGHT,
+        ZERO_ID_TREE_B_HEIGHT,
+        SINGLE_ID_TREE_A_HEIGHT,
+        SINGLE_ID_TREE_B_HEIGHT,
+        DOUBLE_ID_TREE_A_HEIGHT,
+        DOUBLE_ID_TREE_B_HEIGHT,
+        BidirectionalMappingTableAK1,
+        BidirectionalMappingTableAK2,
+        BidirectionalMappingTableBK1,
+        BidirectionalMappingTableBK2,
+        KivTableAValue,
+        KivTableBValue,
+        ObjSingleIdTableAValue,
+        ObjDoubleIdTableBValue,
+        Hash,
+        Hasher,
+        BiDirectionalMappingTableIdentifier,
+        BiDirectionalU64U128MappingTableIdentifier,
+        U64TableIdentifier,
+        SingleIdTableIdentifier,
+        DoubleIdTableIdentifier,
+        KivTableIdentifier,
+        SingleIdMerkleTableIdentifier,
+        DoubleIdMerkleTableIdentifier,
+        ZeroIdMerkleTableIdentifier,
+        RewardTreeTableIdentifier,
+        S,
+    >
+{
+    pub async fn th_util_get_tag_tree_merkle_proof(
+        &self,
+        table: &RewardTreeTableIdentifier,
+        unique_pending_id: u64,
+        key: &SimpleMerkleNodeKey,
+    ) -> anyhow::Result<TagTreeMerkleProof<Hash>> {
+        let result = self.store.db_get_tag_tree_merkle_proof(table, unique_pending_id, key).await?;
+        assert!(result.verify::<Hasher>(), "Retrieved proof does not verify");
+        let computed_root = compute_tag_tree_root_for_proof::<Hash, Hasher>(result.index, &result.leaf, &result.siblings);
+        assert_eq!(computed_root, result.root, "Computed root does not match proof root");
+        let stored_root = self.th_util_get_tag_tree_root(table, unique_pending_id).await?.unwrap_or_default();
+        assert_eq!(result.root, stored_root, "Proof root does not match stored root");
+        Ok(result)
+    }
+pub async fn th_test_tag_tree_basic(&self, table: &RewardTreeTableIdentifier, unique_pending_id: u64) -> anyhow::Result<()> {
+        let tree_height = 5u8;
+        let num_leaves = 1u64 << tree_height;
+
+        let mut hash_map_dat = HashMap::<SimpleMerkleNodeKey, (Hash, Hash)>::new();
+
+        // Set tags for leaves
+        for i in 0..num_leaves {
+            let tag = Hash::qp_rand_gen();
+            let key = SimpleMerkleNodeKey::new(tree_height, i);
+            let value = hash_tag_tree_node::<Hash, Hasher>(&Hash::default(), &Hash::default(), &tag);
+            hash_map_dat.insert(key, (tag, value));
+            self.th_util_set_tag_tree_tag_value(table, unique_pending_id, &key, &tag, &value).await?;
+        }
+
+        // Set tags for internals bottom-up
+        for lev in (0..tree_height).rev() {
+            let num_nodes = 1u64 << lev;
+            for i in 0..num_nodes {
+                let tag = Hash::qp_rand_gen();
+                let key = SimpleMerkleNodeKey::new(lev, i);
+                let left_key = key.left_child();
+                let right_key = key.right_child();
+                let left_value = hash_map_dat[&left_key].1;
+                let right_value = hash_map_dat[&right_key].1;
+                let value = hash_tag_tree_node::<Hash, Hasher>(&left_value, &right_value, &tag);
+                hash_map_dat.insert(key, (tag, value));
+                self.th_util_set_tag_tree_tag_value(table, unique_pending_id, &key, &tag, &value).await?;
+            }
+        }
+
+        for (key, &(tag, value)) in hash_map_dat.iter() {
+            let retrieved_tag = self.th_util_get_tag_tree_node_tag(table, unique_pending_id, key).await?;
+            assert_eq!(retrieved_tag, Some(tag), "Retrieved tag does not match");
+            let retrieved_value = self.th_util_get_tag_tree_node_value(table, unique_pending_id, key).await?;
+            assert_eq!(retrieved_value, Some(value), "Retrieved value does not match");
+        }
+
+        let all_keys = hash_map_dat.keys().cloned().collect::<Vec<_>>();
+        let multi_values = self.th_util_get_many_tag_tree_node_values(table, unique_pending_id, &all_keys).await?;
+        for (i, key) in all_keys.iter().enumerate() {
+            assert_eq!(multi_values[i], Some(hash_map_dat[key].1), "Multi retrieved value does not match");
+        }
+
+        let root_key = SimpleMerkleNodeKey::new_root();
+        let root = self.th_util_get_tag_tree_root(table, unique_pending_id).await?;
+        assert_eq!(root, Some(hash_map_dat[&root_key].1), "Retrieved root does not match");
+
+        for i in 0..num_leaves {
+            let key = SimpleMerkleNodeKey::new(tree_height, i);
+            let proof = self.th_util_get_tag_tree_merkle_proof(table, unique_pending_id, &key).await?;
+            assert_eq!(proof.root, root.unwrap(), "Proof root does not match tree root");
+        }
+
+        let missing_key = SimpleMerkleNodeKey::new(tree_height, num_leaves);
+        let missing_value = self.th_util_get_tag_tree_node_value(table, unique_pending_id, &missing_key).await?;
+        assert!(missing_value.is_none(), "Missing value should be None");
+        let missing_tag = self.th_util_get_tag_tree_node_tag(table, unique_pending_id, &missing_key).await?;
+        assert!(missing_tag.is_none(), "Missing tag should be None");
+        let proof_missing = self.th_util_get_tag_tree_merkle_proof(table, unique_pending_id, &missing_key).await?;
+        assert_eq!(proof_missing.leaf.left, Hash::default());
+        assert_eq!(proof_missing.leaf.right, Hash::default());
+        assert_eq!(proof_missing.leaf.tag, Hash::default());
+        assert!(proof_missing.verify::<Hasher>(), "Missing proof verification failed");
+
+        let different_pending_id = unique_pending_id + 1;
+        let root_diff = self.th_util_get_tag_tree_root(table, different_pending_id).await?;
+        assert!(root_diff.is_none(), "Different pending id root should be None");
+        let value_diff = self.th_util_get_tag_tree_node_value(table, different_pending_id, &root_key).await?;
+        assert!(value_diff.is_none(), "Different pending id value should be None");
+
+        let override_key = SimpleMerkleNodeKey::new(tree_height - 1, 0);
+        let new_tag = Hash::qp_rand_gen();
+        self.th_util_set_tag_tree_tag(table, unique_pending_id, &override_key, &new_tag).await?;
+        let retrieved_new_tag = self.th_util_get_tag_tree_node_tag(table, unique_pending_id, &override_key).await?;
+        assert_eq!(retrieved_new_tag, Some(new_tag), "Overridden tag does not match");
+        let left = self.th_util_get_tag_tree_node_value(table, unique_pending_id, &override_key.left_child()).await?.unwrap_or_default();
+        let right = self.th_util_get_tag_tree_node_value(table, unique_pending_id, &override_key.right_child()).await?.unwrap_or_default();
+        let new_value = hash_tag_tree_node::<Hash, Hasher>(&left, &right, &new_tag);
+        let retrieved_new_value = self.th_util_get_tag_tree_node_value(table, unique_pending_id, &override_key).await?;
+        assert_eq!(retrieved_new_value, Some(new_value), "Overridden value does not match computed value");
+        let proof_after_override = self.th_util_get_tag_tree_merkle_proof(table, unique_pending_id, &override_key).await?;
+        assert!(proof_after_override.verify::<Hasher>(), "Proof after override does not verify");
+
+        Ok(())
+    }
+    
+    pub async fn th_util_get_tag_tree_node_value(
+        &self,
+        table: &RewardTreeTableIdentifier,
+        unique_pending_id: u64,
+        key: &SimpleMerkleNodeKey,
+    ) -> anyhow::Result<Option<Hash>> {
+        let result = self.store.db_get_tag_tree_node_value(table, unique_pending_id, key).await?;
+        let multi_result = self.store.db_get_tag_tree_node_values(table, unique_pending_id, &[key.clone(), key.clone()]).await?;
+        assert!(multi_result.len() == 2, "Multi get did not return correct number of results");
+        assert!(multi_result[0] == result, "Multi get first result does not match single get result");
+        assert!(multi_result[1] == result, "Multi get second result does not match single get result");
+        Ok(result)
+    }
+
+    pub async fn th_util_get_many_tag_tree_node_values(
+        &self,
+        table: &RewardTreeTableIdentifier,
+        unique_pending_id: u64,
+        keys: &[SimpleMerkleNodeKey],
+    ) -> anyhow::Result<Vec<Option<Hash>>> {
+        let result = self.store.db_get_tag_tree_node_values(table, unique_pending_id, keys).await?;
+        assert!(
+            result.len() == keys.len(),
+            "Number of retrieved values does not match number of requested keys"
+        );
+        for (i, key) in keys.iter().enumerate() {
+            let single_result = self.th_util_get_tag_tree_node_value(table, unique_pending_id, key).await?;
+            assert!(result[i] == single_result, "Multi get result does not match single get result");
+        }
+        Ok(result)
+    }
+
+    pub async fn th_util_get_tag_tree_node_tag(
+        &self,
+        table: &RewardTreeTableIdentifier,
+        unique_pending_id: u64,
+        key: &SimpleMerkleNodeKey,
+    ) -> anyhow::Result<Option<Hash>> {
+        let result = self.store.db_get_tag_tree_node_tag(table, unique_pending_id, key).await?;
+        Ok(result)
+    }
+
+    pub async fn th_util_get_tag_tree_root(&self, table: &RewardTreeTableIdentifier, unique_pending_id: u64) -> anyhow::Result<Option<Hash>> {
+        let result = self.store.db_get_tag_tree_root(table, unique_pending_id).await?;
+        let root_key = SimpleMerkleNodeKey::new_root();
+        let value_from_node = self.th_util_get_tag_tree_node_value(table, unique_pending_id, &root_key).await?;
+        assert_eq!(result, value_from_node, "Root from get_root does not match get_node_value for root key");
+        Ok(result)
+    }
+
+
+    pub async fn th_util_set_tag_tree_tag_value(
+        &self,
+        table: &RewardTreeTableIdentifier,
+        unique_pending_id: u64,
+        key: &SimpleMerkleNodeKey,
+        tag: &Hash,
+        value: &Hash,
+    ) -> anyhow::Result<()> {
+        self.store.set_tag_tree_tag_value(table, unique_pending_id, key, tag, value).await?;
+        let retrieved_value = self.th_util_get_tag_tree_node_value(table, unique_pending_id, key).await?;
+        assert_eq!(retrieved_value, Some(*value), "Retrieved value does not match set value");
+        let retrieved_tag = self.th_util_get_tag_tree_node_tag(table, unique_pending_id, key).await?;
+        assert_eq!(retrieved_tag, Some(*tag), "Retrieved tag does not match set tag");
+        Ok(())
+    }
+
+    pub async fn th_util_set_tag_tree_tag(
+        &self,
+        table: &RewardTreeTableIdentifier,
+        unique_pending_id: u64,
+        key: &SimpleMerkleNodeKey,
+        tag: &Hash,
+    ) -> anyhow::Result<()> {
+        self.store.set_tag_tree_tag(table, unique_pending_id, key, tag).await?;
+        let retrieved_tag = self.th_util_get_tag_tree_node_tag(table, unique_pending_id, key).await?;
+        assert_eq!(retrieved_tag, Some(*tag), "Retrieved tag does not match set tag");
+        Ok(())
+    }
+
+    pub async fn th_test_tag_tree_small(&self, table: &RewardTreeTableIdentifier, unique_pending_id: u64) -> anyhow::Result<()> {
+        let guta_height = 3u8;
+        let leaf_1 = SimpleMerkleNodeKey::new(guta_height, 0);
+        let leaf_2 = SimpleMerkleNodeKey::new(guta_height, 1);
+        let leaf_3 = SimpleMerkleNodeKey::new(guta_height, 2);
+        let leaf_5 = SimpleMerkleNodeKey::new(guta_height, 5);
+        let leaf_6 = SimpleMerkleNodeKey::new(guta_height, 6);
+        let leaves = vec![leaf_1, leaf_2, leaf_3, leaf_5, leaf_6];
+        let group_levels = generate_nca_tree_groups_efficient(&leaves, guta_height);
+
+        let tree_height = (group_levels.len() - 1) as u8;
+
+        let mut tags = HashMap::new();
+
+        for (level, gl) in group_levels.iter().enumerate() {
+            for (index, g) in gl.iter().enumerate() {
+                let tag = Hash::qp_rand_gen();
+                let key = SimpleMerkleNodeKey::new(tree_height - level as u8, index as u64);
+                tags.insert(key, tag);
+                self.th_util_set_tag_tree_tag(table, unique_pending_id, &key, &tag).await?;
+            }
+        }
+
+        for (key, tag) in tags.iter() {
+            let retrieved_tag = self.th_util_get_tag_tree_node_tag(table, unique_pending_id, key).await?;
+            assert_eq!(retrieved_tag, Some(*tag), "Retrieved tag does not match");
+        }
+
+        for g in group_levels.iter().flatten() {
+            let key = g.nca.clone();
+            let proof = self.th_util_get_tag_tree_merkle_proof(table, unique_pending_id, &key).await?;
+            assert!(proof.verify::<Hasher>(), "Proof verification failed");
+        }
+
+        Ok(())
+    }
+
+    pub async fn th_test_tag_tree_tiny(&self, table: &RewardTreeTableIdentifier, unique_pending_id: u64) -> anyhow::Result<()> {
+        let guta_height = 1u8;
+        let leaf_1 = SimpleMerkleNodeKey::new(guta_height, 0);
+        let leaf_2 = SimpleMerkleNodeKey::new(guta_height, 1);
+        let tag_1 = Hash::qp_rand_gen();
+        let tag_2 = Hash::qp_rand_gen();
+        let tag_root = Hash::qp_rand_gen();
+        self.th_util_set_tag_tree_tag(table, unique_pending_id, &leaf_1, &tag_1).await?;
+        self.th_util_set_tag_tree_tag(table, unique_pending_id, &leaf_2, &tag_2).await?;
+        self.th_util_set_tag_tree_tag(table, unique_pending_id, &SimpleMerkleNodeKey::new_root(), &tag_root).await?;
+
+        let expected_left_value = hash_tag_tree_node::<Hash, Hasher>(&Hash::default(), &Hash::default(), &tag_1);
+        let expected_right_value = hash_tag_tree_node::<Hash, Hasher>(&Hash::default(), &Hash::default(), &tag_2);
+        assert_eq!(self.th_util_get_tag_tree_node_tag(table, unique_pending_id, &leaf_1).await?, Some(tag_1));
+        assert_eq!(self.th_util_get_tag_tree_node_tag(table, unique_pending_id, &leaf_2).await?, Some(tag_2));
+        assert_eq!(self.th_util_get_tag_tree_node_tag(table, unique_pending_id, &SimpleMerkleNodeKey::new_root()).await?, Some(tag_root));
+
+        assert_eq!(self.th_util_get_tag_tree_node_value(table, unique_pending_id, &leaf_1).await?, Some(expected_left_value));
+        assert_eq!(self.th_util_get_tag_tree_node_value(table, unique_pending_id, &leaf_2).await?, Some(expected_right_value));
+
+        let expected_root_value = hash_tag_tree_node::<Hash, Hasher>(&expected_left_value, &expected_right_value, &tag_root);
+
+        let root = self.th_util_get_tag_tree_root(table, unique_pending_id).await?;
+        assert_eq!(root, Some(expected_root_value));
+        let proof_1 = self.th_util_get_tag_tree_merkle_proof(table, unique_pending_id, &leaf_1).await?;
+        let proof_2 = self.th_util_get_tag_tree_merkle_proof(table, unique_pending_id, &leaf_2).await?;
+        assert!(proof_1.verify::<Hasher>(), "proof 1 verification failed");
+        assert!(proof_2.verify::<Hasher>(), "proof 2 verification failed");
+
+        Ok(())
+    }
+}
+
+
 #[pderive::serialize_copy_f_hash]
 pub struct PQEDUserLeaf<F: QFelt, Hash: QHashBase> {
     pub public_key: Hash,
@@ -4906,6 +4456,12 @@ impl SimpleStoreEx {
 
     pub async fn basic_test_1(&self) -> anyhow::Result<()> {
         println!("starting basic_test_1");
+        self.store.th_test_tag_tree_basic(&self.store.tag_tree_table_a, 12345).await?;
+        self.store.th_test_tag_tree_tiny(&self.store.tag_tree_table_a, 123).await?;
+        println!("finished tiny tag tree test");
+        self.store.th_test_tag_tree_small(&self.store.tag_tree_table_a, 888).await?;
+        println!("finished small tag tree test");
+        println!("finished basic tag tree test");
 
         // u128 <-> u64 bi-directional mapping tests
         self.store.th_test_u128_u64_pairs_table_1(&self.store.u64_u128_bi_directional_mapping_table_a).await?;

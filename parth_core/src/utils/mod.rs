@@ -1,4 +1,4 @@
-use crate::{crypto::hash::traits::RandomHash, data::hash::hash256::Hash256, felt::{QFelt, SimpleRandFelt}};
+use crate::{crypto::hash::traits::RandomHash, data::hash::hash256::Hash256};
 
 pub mod math;
 pub mod auto_implement;

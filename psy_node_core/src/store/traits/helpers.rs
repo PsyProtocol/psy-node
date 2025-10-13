@@ -1,6 +1,6 @@
 
 use parth_core::{
-    crypto::hash::{merkle_node_cache::QMerkleNodeCacheReader, merkle_proof::{verify_delta_merkle_proof_core_debug, DeltaMerkleProofCore, MerkleProofCore}, merkle_update_builder::{QMerkleUpdaterReaderSync, QMerkleUpdaterWriterSyncMut, SimpleMemoryMerkleUpdaterUnique}, traits::MerkleZeroHasher},
+    crypto::hash::{merkle_node_cache::QMerkleNodeCacheReader, merkle_proof::{DeltaMerkleProofCore, MerkleProofCore}, merkle_update_builder::{QMerkleUpdaterReaderSync, QMerkleUpdaterWriterSyncMut, SimpleMemoryMerkleUpdaterUnique}, traits::MerkleZeroHasher},
     data::hash::merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey},
     protocol::core_types::QHashBase,
 };
@@ -424,7 +424,7 @@ pub async fn db_helper_single_id_merkle_node_simple_set_leaves<
 
 
 
-    for (i, node) in nodes.iter().enumerate() {
+    for node in nodes.iter() {
         if sub_root_level > node.key.level {
             return Err(anyhow::anyhow!("Sub root level cannot be greater than node height"));
         }
@@ -628,7 +628,7 @@ pub async fn db_helper_zero_id_merkle_node_simple_set_leaves<
     let mut delta_merkle_proofs = Vec::with_capacity(nodes.len());
     let mut recorder = Recorder::<Hash>::new();
 
-    for (i, node) in nodes.iter().enumerate() {
+    for node in nodes.iter() {
         if sub_root_level > node.key.level {
             return Err(anyhow::anyhow!("Sub root level cannot be greater than node height"));
         }
@@ -675,7 +675,7 @@ pub async fn db_helper_double_id_merkle_node_simple_set_leaves<
     let mut delta_merkle_proofs = Vec::with_capacity(nodes.len());
     let mut recorder = Recorder::<Hash>::new();
 
-    for (i, node) in nodes.iter().enumerate() {
+    for node in nodes.iter() {
         if sub_root_level > node.key.level {
             return Err(anyhow::anyhow!("Sub root level cannot be greater than node height"));
         }

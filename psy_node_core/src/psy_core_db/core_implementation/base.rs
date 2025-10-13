@@ -9,14 +9,12 @@ use parth_core::{
     QCoreProcCheckpointUniqueId,
 };
 use psy_data::v1::qdata::{
-    checkpoint::{self, PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState}, checkpoint_sync::PQEDCheckpointSyncInfo, user::PQEDUserLeaf
+    checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState}, checkpoint_sync::PQEDCheckpointSyncInfo, user::PQEDUserLeaf
 };
 use crate::store::traits::core_db::{
-    CoreDatabaseBidirectionalMappingReader, CoreDatabaseBidirectionalMappingWriter, CoreDatabaseBidirectionalU64U128MappingReader,
-    CoreDatabaseBidirectionalU64U128MappingWriter, CoreDatabaseDoubleIdCheckpointedReader, CoreDatabaseDoubleIdCheckpointedWriter,
-    CoreDatabaseKivReader, CoreDatabaseKivWriter, CoreDatabaseSingleIdCheckpointedReader, CoreDatabaseSingleIdCheckpointedWriter,
-    CoreDatabaseSingleIdMerkleReader, CoreDatabaseSingleIdMerkleWriter, CoreDatabaseStore, CoreDatabaseTagTreeReader, CoreDatabaseTagTreeStore,
-    CoreDatabaseTagTreeWriter, CoreDatabaseU64Reader, CoreDatabaseU64Writer, CoreDatabaseZeroIdMerkleReader, CoreDatabaseZeroIdMerkleWriter,
+    CoreDatabaseBidirectionalMappingReader, CoreDatabaseBidirectionalU64U128MappingReader,
+    CoreDatabaseKivReader, CoreDatabaseSingleIdCheckpointedReader, CoreDatabaseSingleIdMerkleReader, CoreDatabaseStore, CoreDatabaseTagTreeStore,
+    CoreDatabaseU64Reader, CoreDatabaseZeroIdMerkleReader,
 };
 
 use crate::psy_core_db::{
@@ -248,6 +246,7 @@ impl<
         }
     }
 
+
     async fn apply_global_block_update_internal(&self, global_block_update: &PQEDCheckpointSyncInfo<N::F, N::QHash>) -> anyhow::Result<()>{
         let latest_pending_id = self.get_latest_pending_id().await?;
         let latest_checkpoint_id = self.get_latest_checkpoint_id().await?;
@@ -258,8 +257,13 @@ impl<
 
 
 
+
+
+
+
         Ok(())
     }
+
 }
 #[async_trait]
 impl<

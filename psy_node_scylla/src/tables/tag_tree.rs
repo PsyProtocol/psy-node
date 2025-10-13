@@ -128,6 +128,7 @@ impl ScyllaTagTreeNodesPreparedStatements {
         tag: &[u8],
         value: &[u8],
     ) -> anyhow::Result<()> {
+        println!("set_or_insert_one");
         session
             .execute_unpaged(
                 &self.insert_1_prepared,
@@ -149,6 +150,7 @@ impl ScyllaTagTreeNodesPreparedStatements {
         node: SimpleMerkleNodeKey,
         tag: &Hash,
     ) -> anyhow::Result<()> {
+        println!("set_tag_only_computed");
         let left_value_fut = self.select_one_tag_tree_value::<Hash>(&session, unique_pending_id, node.left_child());
         let right_value_fut = self.select_one_tag_tree_value::<Hash>(&session, unique_pending_id, node.right_child());
         let (left_value, right_value) = tokio::join!(left_value_fut, right_value_fut);
@@ -175,6 +177,7 @@ impl ScyllaTagTreeNodesPreparedStatements {
         unique_pending_id: u64,
         entries: &[TagTreeNodeWithKey<Hash>],
     ) -> anyhow::Result<()> {
+        println!("set_or_insert_many.entries.len() = {}", entries.len());
         let mut batch_list: Vec<Batch> = Vec::new();
         //tree_id, tree_sub_id, level, node_index, checkpoint_id, value
         let unique_pending_id_i64 = u64_to_i64_exact(unique_pending_id);
@@ -219,6 +222,7 @@ impl ScyllaTagTreeNodesPreparedStatements {
         unique_pending_id: u64,
         key: SimpleMerkleNodeKey,
     ) -> anyhow::Result<Option<Hash>> {
+        println!("select_one_tag_tree_value");
         let res = session
             .execute_unpaged(
                 &self.select_1_value_prepared,
@@ -245,6 +249,7 @@ impl ScyllaTagTreeNodesPreparedStatements {
         unique_pending_id: u64,
         key: &SimpleMerkleNodeKey,
     ) -> anyhow::Result<Option<TagTreeNodeStorage<Hash>>> {
+        println!("select_one_tag_tree_tag_and_value");
         let res = session
             .execute_unpaged(
                 &self.select_1_value_and_tag_prepared,
@@ -269,6 +274,7 @@ impl ScyllaTagTreeNodesPreparedStatements {
         }
     }
     pub async fn select_tag_tree_proof<Hash: QHashBase>(&self, session: &Session, unique_pending_id: u64, key: SimpleMerkleNodeKey) -> anyhow::Result<TagTreeMerkleProof<Hash>>{
+        println!("select_tag_tree_proof");
         let sibling_keys = key.siblings();
         let parent_keys = sibling_keys.iter().map(|s| s.parent()).collect::<Vec<_>>();
         let left_value_key = key.left_child();
@@ -337,6 +343,7 @@ impl ScyllaTagTreeNodesPreparedStatements {
         unique_pending_id: u64,
         keys: &[SimpleMerkleNodeKey],
     ) -> anyhow::Result<Vec<Option<TagTreeNodeStorage<Hash>>>> {
+        println!("select_many_tag_tree_tags_and_values");
         let mut results = Vec::with_capacity(keys.len());
         let unique_pending_id_i64 = u64_to_i64_exact(unique_pending_id);
         let keys_i64 = keys
@@ -350,7 +357,7 @@ impl ScyllaTagTreeNodesPreparedStatements {
                     let session = &session;
                     let prep = self.select_1_value_and_tag_prepared.clone();
                     async move {
-                        let res = session.execute_unpaged(&prep, (*key,)).await?;
+                        let res = session.execute_unpaged(&prep, *key).await?;
                         let rows = res.into_rows_result()?;
                         if let Some(row) = rows.maybe_first_row::<(Option<Vec<u8>>, Option<Vec<u8>>)>()? {
                             match (row.0, row.1) {
@@ -380,6 +387,7 @@ impl ScyllaTagTreeNodesPreparedStatements {
         unique_pending_id: u64,
         keys: &[SimpleMerkleNodeKey],
     ) -> anyhow::Result<Vec<Option<Hash>>> {
+        println!("select_many_tag_tree_values");
         let mut results = Vec::with_capacity(keys.len());
         let unique_pending_id_i64 = u64_to_i64_exact(unique_pending_id);
         let keys_i64 = keys
@@ -393,7 +401,7 @@ impl ScyllaTagTreeNodesPreparedStatements {
                     let session = &session;
                     let prep = self.select_1_value_prepared.clone();
                     async move {
-                        let res = session.execute_unpaged(&prep, (*key,)).await?;
+                        let res = session.execute_unpaged(&prep, *key).await?;
                         let rows = res.into_rows_result()?;
                         if let Some(row) = rows.maybe_first_row::<(Option<Vec<u8>>,)>()? {
                             match row.0 {
@@ -420,6 +428,7 @@ impl ScyllaTagTreeNodesPreparedStatements {
         unique_pending_id: u64,
         keys: &[SimpleMerkleNodeKey],
     ) -> anyhow::Result<Vec<Option<Hash>>> {
+        println!("select_many_tag_tree_tags");
         let mut results = Vec::with_capacity(keys.len());
         let unique_pending_id_i64 = u64_to_i64_exact(unique_pending_id);
         let keys_i64 = keys
@@ -433,7 +442,7 @@ impl ScyllaTagTreeNodesPreparedStatements {
                     let session = &session;
                     let prep = self.select_1_tag_prepared.clone();
                     async move {
-                        let res = session.execute_unpaged(&prep, (*key,)).await?;
+                        let res = session.execute_unpaged(&prep, *key).await?;
                         let rows = res.into_rows_result()?;
                         if let Some(row) = rows.maybe_first_row::<(Option<Vec<u8>>,)>()? {
                             match row.0 {
