@@ -5,8 +5,8 @@ use crate::crypto::hash::traits::MerkleLeafHasher;
 use pser::{QBytesSerialize, QBytesDeserialize};
 
 
-#[pderive::serialize_clone]
-pub struct SpidermanUpdateProof<Hash: PartialEq + Copy> {
+#[pderive::serialize_clone_ts_export]
+pub struct SpidermanUpdateProof<Hash> {
     pub top_line_proof: DeltaMerkleProofCore<Hash>,
     pub web_proof_old_leaves: Vec<Hash>,
     pub web_proof_new_leaves: Vec<Hash>,
@@ -126,7 +126,7 @@ impl<Hash: PartialEq + Copy> SpidermanUpdateProof<Hash> {
 
 
 
-impl<Hash: PartialEq + Copy + Serialize + DeserializeOwned> QPDSerializable for SpidermanUpdateProof<Hash> {
+impl<Hash: Copy + PartialEq +  Serialize + DeserializeOwned> QPDSerializable for SpidermanUpdateProof<Hash> {
     fn to_bytes(&self) -> anyhow::Result<Vec<u8>> {
         //b1incode::serialize(self).map_err(|e| anyhow::anyhow!(e))
         self.to_qbytes()

@@ -895,7 +895,7 @@ impl QProvingJobDataID {
 
 impl QProvingJobDataID {
 
-    fn is_user_guta_proof_circuit_type_or_end_cap(&self) -> bool {
+    pub fn is_user_guta_proof_circuit_type_or_end_cap(&self) -> bool {
         matches!(
             self.circuit_type,
             ProvingJobCircuitType::GUTATwoEndCap

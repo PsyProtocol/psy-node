@@ -16,16 +16,16 @@ Level[2][0] = hash(hash(Level[1][0], Level[1][1]), Tag[2][0])
 Level[n][i] = hash(hash(Level[n-1][2*i], Level[n-1][2*i+1]), Tag[n][i])
 */
 #[inline]
-pub fn hash_tag_tree_node<Hash: PartialEq + Copy, Hasher: MerkleHasher<Hash>>(left: &Hash, right: &Hash, tag: &Hash) -> Hash {
+pub fn hash_tag_tree_node<Hash, Hasher: MerkleHasher<Hash>>(left: &Hash, right: &Hash, tag: &Hash) -> Hash {
     Hasher::two_to_one(&Hasher::two_to_one(left, right), tag)
 }
 
 #[inline]
-pub fn hash_tag_tree_node_owned<Hash: PartialEq + Copy, Hasher: MerkleHasher<Hash>>(left: Hash, right: Hash, tag: Hash) -> Hash {
+pub fn hash_tag_tree_node_owned<Hash, Hasher: MerkleHasher<Hash>>(left: Hash, right: Hash, tag: Hash) -> Hash {
     Hasher::two_to_one(&Hasher::two_to_one(&left, &right), &tag)
 }
 
-pub fn compute_tag_tree_root_for_proof<Hash: PartialEq + Copy, Hasher: MerkleHasher<Hash>>(
+pub fn compute_tag_tree_root_for_proof<Hash: Copy, Hasher: MerkleHasher<Hash>>(
     index: u64,
     leaf: &TagTreeNodePreimage<Hash>,
     siblings: &[TagTreeProofNode<Hash>],
@@ -61,13 +61,14 @@ pub fn verify_tag_tree_proof<Hash: PartialEq + Copy, Hasher: MerkleHasher<Hash>>
 }
 
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Ord, PartialOrd, Copy)]
-pub struct TagTreeNodeStorage<Hash: PartialEq + Copy> {
+
+#[pderive::serialize_copy_ts_export]
+pub struct TagTreeNodeStorage<Hash> {
     pub value: Hash,
     pub tag: Hash,
 }
 
-impl<Hash: PartialEq + Copy + Default> Default for TagTreeNodeStorage<Hash> {
+impl<Hash: Default> Default for TagTreeNodeStorage<Hash> {
     fn default() -> Self {
         Self {
             value: Default::default(),
@@ -93,14 +94,14 @@ impl<Hash: QPDSerializableFixed + Copy> QPDSerializable for TagTreeNodeStorage<H
     }
 }
 
-#[pderive::serialize_copy]
-pub struct TagTreeNodePreimage<Hash: PartialEq + Copy> {
+#[pderive::serialize_copy_ts_export]
+pub struct TagTreeNodePreimage<Hash> {
     pub left: Hash,
     pub right: Hash,
     pub tag: Hash,
 }
 
-impl<Hash: PartialEq + Copy + Default> Default for TagTreeNodePreimage<Hash> {
+impl<Hash: Default> Default for TagTreeNodePreimage<Hash> {
     fn default() -> Self {
         Self {
             left: Default::default(),
@@ -110,29 +111,31 @@ impl<Hash: PartialEq + Copy + Default> Default for TagTreeNodePreimage<Hash> {
     }
 }
 
-impl<Hash: PartialEq + Copy> TagTreeNodePreimage<Hash> {
+impl<Hash> TagTreeNodePreimage<Hash> {
     pub fn get_node_hash<Hasher: MerkleHasher<Hash>>(&self) -> Hash {
         hash_tag_tree_node::<Hash, Hasher>(&self.left, &self.right, &self.tag)
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Ord, PartialOrd, Copy)]
-pub struct TagTreeProofNode<Hash: PartialEq + Copy> {
+
+#[pderive::serialize_copy_ts_export]
+pub struct TagTreeProofNode<Hash> {
     pub sibling: Hash,
     pub parent_tag: Hash,
 }
 
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Ord, PartialOrd, Copy)]
-pub struct TagTreeStorageNode<Hash: PartialEq + Copy> {
+
+#[pderive::serialize_copy_ts_export]
+pub struct TagTreeStorageNode<Hash> {
     pub value: Hash,
     pub tag: Hash,
 }
 
 
 
-#[pderive::serialize_clone]
-pub struct TagTreeMerkleProofPartial<Hash: PartialEq + Copy> {
+#[pderive::serialize_clone_ts_export]
+pub struct TagTreeMerkleProofPartial<Hash> {
     pub index: u64,
     pub leaf: TagTreeNodePreimage<Hash>,
     pub siblings: Vec<TagTreeProofNode<Hash>>,
@@ -145,6 +148,9 @@ impl<Hash: PartialEq + Copy> TagTreeMerkleProofPartial<Hash> {
             siblings,
         }
     }
+}
+
+impl<Hash: PartialEq + Copy> TagTreeMerkleProofPartial<Hash> {
     pub fn get_root<Hasher: MerkleHasher<Hash>>(&self) -> Hash {
         compute_tag_tree_root_for_proof::<Hash, Hasher>(self.index, &self.leaf, &self.siblings)
     }
@@ -158,8 +164,8 @@ impl<Hash: PartialEq + Copy> TagTreeMerkleProofPartial<Hash> {
         }
     }
 }
-#[pderive::serialize_clone]
-pub struct TagTreeMerkleProof<Hash: PartialEq + Copy> {
+#[pderive::serialize_clone_ts_export]
+pub struct TagTreeMerkleProof<Hash> {
     pub index: u64,
     pub leaf: TagTreeNodePreimage<Hash>,
     pub root: Hash,
