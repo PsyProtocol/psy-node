@@ -62,12 +62,13 @@ tracing-subscriber = { version = "0.3.17", features = [
     "chrono",
 ] }
 bytes = "1"
+bytemuck = { version = "1.24.0", features = ["derive"] }
 sha2 = "0.10.8"
 sha3 = "0.10.8"
 num = { version = "0.4.0", default-features = false }
 postcard = { version = "1.1.3", default-features = true, features = ["alloc", "use-std"] }
 speedy = "0.8.7"
-rkyv = "0.8.12"
+rkyv = { version = "0.8.12" }
 
 log = { version = "0.4.14", default-features = false }
 env_logger = { version = "0.11", default-features = false }
@@ -103,8 +104,8 @@ maybe-async = { version = "0.2", default-features = false }
 
 async-nats = "0.43.1"
 
-plonky2 = { git = "https://github.com/PsyRepoForks/plonky2-hwa", rev = "94d6d252a5c63bd74f8d1282550dc834555d8242" }
-plonky2_maybe_rayon = { git = "https://github.com/PsyRepoForks/plonky2-hwa", rev = "94d6d252a5c63bd74f8d1282550dc834555d8242", default-features = false }
+plonky2 = { git = "https://github.com/PsyRepoForks/plonky2-hwa", rev = "8d5b56f42fe87942312f270a5dc26c0059f973fb" }
+plonky2_maybe_rayon = { git = "https://github.com/PsyRepoForks/plonky2-hwa", rev = "8d5b56f42fe87942312f270a5dc26c0059f973fb", default-features = false }
 
 redis = { version = "0.30.0", default-features = false, features = [
     "acl",

@@ -8,8 +8,23 @@ pub trait QStorableSizedBase: QStorableBase + Sized {}
 impl<T: Serialize + DeserializeOwned + Send + Sync + Clone + PartialEq + Eq> QStorableBase for T {}
 impl<T: QStorableBase + Sized> QStorableSizedBase for T {}
 pub trait QFHasherU64<F: QFelt64, Hash: QFHashBase<F>>: FieldQHasher<F, Hash> + QHasher<Hash> + MerkleZeroHasher<Hash> {}
+pub trait Q256BitHash: FromU64x4 + Sized + Copy {
+    fn from_owned_32bytes(bytes: [u8; 32]) -> Self;
+    fn into_owned_32bytes(self) -> [u8; 32];
+    fn from_ref_32bytes(bytes: &[u8; 32]) -> Self;
+    fn from_slice_32bytes(bytes: &[u8]) -> anyhow::Result<Self>;
+    fn to_vec_32bytes(&self) -> Vec<u8>;
+}
+pub trait Q256BitHashTransparent: Q256BitHash {
+    fn from_ref_32bytes_transparent(bytes: &[u8; 32]) -> &Self;
+    fn as_ref_32bytes_transparent(&self) -> &[u8; 32];
+}
 
+pub trait Q256BitHashNonTransparent: Q256BitHash {
+}
 pub trait QHashBase: PartialEq + ZeroableHash + Copy + Serialize + DeserializeOwned + QPDSerializable + QPDSerializableFixed + Sync + Send + FromU64x4 + TS + Default + CoreDatabaseValueDeserialize + QDatabasePrimitiveKey + RandomHash {}
+pub trait QHash256Base: QHashBase + Q256BitHash {}
+impl<T: QHashBase + Q256BitHash> QHash256Base for T {}
 pub trait QFHashBase<F: QFelt64>: QHashBase + HashTo4Felts<F> {}
 
 pub trait QProofBase: PartialEq + Clone + Serialize + DeserializeOwned + QPDSerializable {}

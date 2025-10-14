@@ -14,6 +14,7 @@ mod job_id_base;
 pub use job_id_base::*;
 mod protocol_types;
 pub use protocol_types::*;
+pub mod proof_hasher;
 
 #[macro_export]
 macro_rules! impl_qpq_serialize_primitive {

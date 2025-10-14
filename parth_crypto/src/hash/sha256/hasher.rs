@@ -1,6 +1,6 @@
 use sha2::{Digest, Sha256};
 
-use parth_core::{crypto::hash::{traits::{BasicBytesHasher, BasicDataHasher}, traits::MerkleHasher}, data::hash::hash256::Hash256};
+use parth_core::{crypto::hash::traits::{BasicBytesHasher, BasicDataHasher, FieldQHasher, MerkleHasher}, data::hash::hash256::Hash256};
 
 
 
@@ -65,3 +65,28 @@ impl BasicBytesHasher<Hash256> for CoreSha256Hasher {
     }
 }
 
+impl FieldQHasher<u64, Hash256> for CoreSha256Hasher {
+    fn q_hash_many(elements: &[u64]) -> Hash256 {
+        Self::hash_u64s(elements)
+    }
+    fn q_hash_many_pad(elements: &[u64]) -> Hash256 {
+        let mut padded = elements.to_vec();
+        let pad_len = (64 - (elements.len() % 64)) % 64;
+        padded.extend(vec![0u64; pad_len]);
+        Self::hash_u64s(&padded)
+    }
+    fn q_two_to_one(left: Hash256, right: Hash256) -> Hash256 {
+        let mut hasher = Sha256::new();
+        hasher.update(left.0);
+        hasher.update(right.0);
+        let result = hasher.finalize();
+        Hash256(result.into())
+    }
+    fn q_two_to_one_ref(left: &Hash256, right: &Hash256) -> Hash256 {
+        let mut hasher = Sha256::new();
+        hasher.update(left.0);
+        hasher.update(right.0);
+        let result = hasher.finalize();
+        Hash256(result.into())
+    }
+}

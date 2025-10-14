@@ -113,6 +113,15 @@ impl<'de, K: Deserialize<'de>, V: Deserialize<'de>> Deserialize<'de> for QPDPair
     }
 }
 
+pub trait FastFixedSerializable<const N: usize>: Sized {
+    fn ffs_from_owned_bytes(data: [u8; N]) -> Self;
+    fn ffs_from_slice_or_panic(data: &[u8]) -> Self;
+    fn ffs_try_from_slice(data: &[u8]) -> anyhow::Result<Self>;
+    fn ffs_to_bytes(&self) -> [u8; N];
+    fn ffs_into_bytes(self) -> [u8; N];
+}
+
+
 pub trait QPDSerializable: Clone + PartialEq {
     fn to_bytes(&self) -> anyhow::Result<Vec<u8>>;
     fn from_bytes(bytes: &[u8]) -> anyhow::Result<Self>;

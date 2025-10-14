@@ -1,46 +1,7 @@
 
 mod qhashout;
-use plonky2::field::types::{Field, PrimeField64, Sample};
+mod poseidon;
+mod felt;
+pub use felt::*;
 pub use qhashout::*;
-
-use crate::{felt::{FromPrimitiveValuesFelt, SimpleRandFelt, ToU64Value, ZeroableFelt}, utils::QPGenRandom};
-pub type PGoldilocksHash = QHashOut<plonky2::field::goldilocks_field::GoldilocksField>;
-pub type PGoldilocksFelt = plonky2::field::goldilocks_field::GoldilocksField;
-
-impl ZeroableFelt for PGoldilocksFelt {
-    const ZERO_VALUE: Self = plonky2::field::goldilocks_field::GoldilocksField::ZERO;
-}
-
-impl FromPrimitiveValuesFelt for PGoldilocksFelt {
-    fn from_u8_value(value: u8) -> Self {
-        plonky2::field::goldilocks_field::GoldilocksField::from_canonical_u8(value)
-    }
-    fn from_u16_value(value: u16) -> Self {
-        plonky2::field::goldilocks_field::GoldilocksField::from_canonical_u16(value)
-    }
-    fn from_u32_value(value: u32) -> Self {
-        plonky2::field::goldilocks_field::GoldilocksField::from_canonical_u32(value)
-    }
-    fn from_u64_value(value: u64) -> Self {
-        plonky2::field::goldilocks_field::GoldilocksField::from_noncanonical_u64(value)
-    }
-}
-
-impl SimpleRandFelt for PGoldilocksFelt {
-    fn get_simple_rand() -> Self {
-        Self::rand()
-    }
-}
-
-
-impl ToU64Value for PGoldilocksFelt {
-    fn to_u64_value(&self) -> u64 {
-        self.to_canonical_u64()
-    }
-}
-
-impl QPGenRandom for PGoldilocksFelt {
-    fn qp_rand_gen() -> Self where Self: Sized {
-        Self::rand()
-    }
-}
+pub use poseidon::*;

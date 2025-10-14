@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 
 use rand::Rng;
 
-use crate::data::serializable::{QPDSerializable, QPDSerializableFixed};
+use crate::{data::serializable::{QPDSerializable, QPDSerializableFixed}, utils::QPGenRandom};
 pub const JOB_ID_EMPTY_REWARD_PATH_INFO: u64 = 0xFFFF_FFFF_FFFF_FFFFu64;
 
 #[pderive::serialize_copy_default_no_ord]
@@ -224,6 +224,14 @@ impl SimpleMerkleNodeKey {
             }
 
             path_node_keys
+        }
+    }
+}
+impl QPGenRandom for SimpleMerkleNodeKey {
+    fn qp_rand_gen() -> Self where Self: Sized {
+        Self {
+            level: rand::random::<u8>() % 64,
+            index: rand::random::<u64>(),
         }
     }
 }

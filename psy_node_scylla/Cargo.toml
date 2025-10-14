@@ -51,3 +51,9 @@ psy_node_core = { workspace = true }
 criterion = { workspace = true }
 parth_crypto = { workspace = true }
 parth_common = { workspace = true }
+
+
+
+[[bench]]
+name = "main"
+harness = false

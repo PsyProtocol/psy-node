@@ -5,8 +5,9 @@ version = "0.1.0"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [features]
-default = ["rand", "std", "parth_node", "ptypes_goldilocks_qhashout"]
+default = ["rand", "std", "parth_node", "ptypes_goldilocks_qhashout", "serialize_bytemuck", "serialize_rkyv", "serialize_speedy"]
 std = []
+proof_hasher_plonky2_goldilocks = ["ptypes_goldilocks_qhashout"]
 ptypes_goldilocks_qhashout = ["goldilocks"]
 goldilocks = ["plonky2"]
 ptypes_u64_hash256 = []
@@ -15,6 +16,7 @@ parth_node = []
 serialize_rkyv = ["dep:rkyv", "plonky2?/serialize_rkyv"]
 serialize_speedy = ["dep:speedy", "plonky2?/serialize_rkyv"]
 serialize_postcard = ["dep:postcard"]
+serialize_bytemuck = ["dep:bytemuck", "plonky2/serialize_bytemuck"]
 
 [dependencies]
 anyhow     = { workspace = true }
@@ -34,6 +36,7 @@ strum_macros = { workspace = true }
 postcard = { workspace = true, optional = true }
 rkyv = { workspace = true, optional = true }
 speedy = { workspace = true, optional = true }
+bytemuck = { workspace = true, optional = true }
 ts-rs = { workspace = true }
 
 # start local packages
@@ -50,5 +53,5 @@ criterion = { workspace = true }
 
 
 [[bench]]
-name = "nca_group_gen"
+name = "main"
 harness = false

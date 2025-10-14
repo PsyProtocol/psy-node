@@ -8,12 +8,13 @@ use ts_rs::TS;
 use crate::{
     crypto::hash::traits::{CodeSerializableHash, FromU64x4, HashTo4Felts, RandomHash, ToU64x4, ZeroableHash},
     data::serializable::{QPDSerializable, QPDSerializableFixed},
-    protocol::core_types::QHashBase,
+    protocol::core_types::{Q256BitHash, Q256BitHashTransparent, QHashBase},
 };
 
 #[serde_as]
 #[pderive::serialize_copy]
 #[derive(TS)]
+#[repr(transparent)]
 pub struct Hash256(
     #[serde_as(as = "serde_with::hex::Hex")]
     #[ts(type = "string")]
@@ -157,4 +158,44 @@ impl FromU64x4 for Hash256 {
     }
 }
 
+
+impl Q256BitHash for Hash256 {
+    fn from_owned_32bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+    fn into_owned_32bytes(self) -> [u8; 32] {
+        self.0
+    }
+    fn from_ref_32bytes(bytes: &[u8; 32]) -> Self {
+        Self(*bytes)
+    }
+    fn from_slice_32bytes(bytes: &[u8]) -> anyhow::Result<Self> {
+        if bytes.len() != 32 {
+            anyhow::bail!("expected 32 bytes for deserializing Hash256, got {} bytes", bytes.len());
+        }
+        let mut inner_data = [0u8; 32];
+        inner_data.copy_from_slice(bytes);
+        Ok(Hash256(inner_data))
+    }
+    fn to_vec_32bytes(&self) -> Vec<u8> {
+        self.0.to_vec()
+    }
+}
+
+// SECURITY: [START UNSAFE CODE BLOCK]
+impl Q256BitHashTransparent for Hash256 {
+    fn from_ref_32bytes_transparent(bytes: &[u8; 32]) -> &Self {
+        // SAFETY: This is safe because Hash256 is a transparent wrapper around [u8; 32]
+        unsafe { &*(bytes as *const [u8; 32] as *const Hash256) }
+    }
+
+    fn as_ref_32bytes_transparent(&self) -> &[u8; 32] {
+        // SAFETY: This is safe because Hash256 is a transparent wrapper around [u8; 32]
+        unsafe { &*(self as *const Hash256 as *const [u8; 32]) }
+    }
+}
+// SECURITY: [END UNSAFE CODE BLOCK]
+
 impl QHashBase for Hash256 {}
+
+

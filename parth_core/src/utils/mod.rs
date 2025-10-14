@@ -2,6 +2,8 @@ use crate::{crypto::hash::traits::RandomHash, data::hash::hash256::Hash256};
 
 pub mod math;
 pub mod auto_implement;
+pub mod signed_helpers;
+
 pub trait QPGenRandom {
     fn qp_rand_gen() -> Self where Self: Sized;
 }

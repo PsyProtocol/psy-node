@@ -150,11 +150,7 @@ impl ScyllaMerkleNodesPreparedStatements {
                     let tree_id_i64 = u64_to_i64_exact(tree_id);
                     let level_i8 = u8_to_i8_exact(key.level);
                     let index_i64 = u64_to_i64_exact(key.index);
-                    let max_cp_i64 = if max_checkpoint_id > i64::MAX as u64 {
-                        i64::MAX
-                    } else {
-                        max_checkpoint_id as i64
-                    };
+                    let max_cp_i64 = convert_checkpoint_id_to_i64(max_checkpoint_id);
                     async move {
                         let res = session.execute_unpaged(&prep, (tree_id_i64, level_i8, index_i64, max_cp_i64)).await?;
                         let rows = res.into_rows_result()?;

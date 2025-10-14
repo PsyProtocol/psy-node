@@ -139,7 +139,7 @@ fn random_nodes_in_tree(height: u8, count: usize) -> Vec<SimpleMerkleNodeKey> {
 
 // --- The Benchmark ---
 
-fn benchmark_nca_group_generation(c: &mut Criterion) {
+pub fn benchmark_nca_group_generation(c: &mut Criterion) {
     let mut group = c.benchmark_group("NCA Group Generation");
     let tree_height: u8 = 24;
 
@@ -164,5 +164,5 @@ fn benchmark_nca_group_generation(c: &mut Criterion) {
 }
 
 // Criterion boilerplate to register and run the benchmarks
-criterion_group!(benches, benchmark_nca_group_generation);
-criterion_main!(benches);
+//criterion_group!(benches, benchmark_nca_group_generation);
+//criterion_main!(benches);

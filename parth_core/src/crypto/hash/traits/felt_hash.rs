@@ -5,6 +5,7 @@ pub trait FieldQHasher<F: Copy + PartialEq, Hash: PartialEq + Copy>: Sized + Mer
     fn q_hash_many(elements: &[F]) -> Hash;
     fn q_hash_many_pad(elements: &[F]) -> Hash;
     fn q_two_to_one(left: Hash, right: Hash) -> Hash;
+    fn q_two_to_one_ref(left: &Hash, right: &Hash) -> Hash;
 }
 
 
