@@ -1,9 +1,8 @@
 use anyhow::Context;
 
-use crate::qblob::{blob_type::{is_valid_qblob_merkle_node_batch_type, QBlobDataType, QBlobMerkleNodeTreeType, QBLOB_STANDARD_V1_MAGIC_U32}, traits::common::QBlobStructHeaderBase};
+use crate::qblob::{blob_type::{get_item_size_for_data_type, is_valid_qblob_merkle_node_batch_type, QBlobDataType, QBlobMerkleNodeTreeType, QBLOB_STANDARD_V1_MAGIC_U32}, traits::common::QBlobStructHeaderBase};
 
 pub const QBLOB_TREE_NODE_BATCH_HEADER_SIZE: usize = 80;
-
 
 #[pderive::serialize_copy]
 pub struct QBlobMerkleTreeNodeBatchHeaderV1 {
@@ -85,7 +84,16 @@ impl QBlobMerkleTreeNodeBatchHeaderV1 {
         buf[76..80].copy_from_slice(&self.item_size.to_le_bytes());
         buf
     }
-    pub fn clip_header_get_payload(mut full_data: Vec<u8>, expected_blob_type: Option<QBlobDataType>, expected_tree_type: Option<QBlobMerkleNodeTreeType>, expected_item_size: usize) -> anyhow::Result<(Self, Vec<u8>)> {
+    pub fn clip_header_get_payload_for_blob_type_and_tree(mut full_data: Vec<u8>, expected_blob_type: QBlobDataType, expected_tree_type: QBlobMerkleNodeTreeType, exact_size: bool) -> anyhow::Result<(Self, Vec<u8>)> {
+        Self::clip_header_get_payload_internal(full_data, Some(expected_blob_type), Some(expected_tree_type), exact_size)
+    }
+    pub fn clip_header_get_payload(mut full_data: Vec<u8>, expected_blob_type: Option<QBlobDataType>, expected_tree_type: Option<QBlobMerkleNodeTreeType>, exact_size: bool) -> anyhow::Result<(Self, Vec<u8>)> {
+        Self::clip_header_get_payload_internal(full_data, expected_blob_type, expected_tree_type, exact_size)
+    }
+
+    fn clip_header_get_payload_internal(mut full_data: Vec<u8>, expected_blob_type: Option<QBlobDataType>, expected_tree_type: Option<QBlobMerkleNodeTreeType>, exact_size: bool) -> anyhow::Result<(Self, Vec<u8>)> {
+
+
         let full_data_len = full_data.len();
         if full_data_len < QBLOB_TREE_NODE_BATCH_HEADER_SIZE {
             return Err(anyhow::anyhow!(
@@ -112,12 +120,45 @@ impl QBlobMerkleTreeNodeBatchHeaderV1 {
                 expected_tree_type.unwrap()
             ));
         }
-        if full_data.len() != header.total_size as usize {
+        let expected_item_size = get_item_size_for_data_type(header.blob_type);
+        if expected_item_size.is_none() {
             return Err(anyhow::anyhow!(
-                "Full data length does not match total_size in header: {} != {}",
-                full_data.len(),
-                header.total_size
+                "Could not determine expected item size for blob_type: {:?}",
+                header.blob_type
             ));
+        }
+        let expected_item_size = expected_item_size.unwrap();
+        let full_data_len = full_data.len();
+        let calculated_total_size = QBLOB_TREE_NODE_BATCH_HEADER_SIZE + (header.item_count as usize * expected_item_size);
+        if exact_size {
+            if full_data_len != header.total_size as usize {
+                return Err(anyhow::anyhow!(
+                    "Full data length does not match total_size in header: {} != {}",
+                    full_data_len,
+                    header.total_size
+                ));
+            }else if full_data_len != calculated_total_size {
+                return Err(anyhow::anyhow!(
+                    "Full data length does not match calculated total size from header: {} != {}",
+                    full_data_len,
+                    calculated_total_size
+                ));
+            }
+        }else{
+            if full_data_len < header.total_size as usize {
+                return Err(anyhow::anyhow!(
+                    "Full data length is less than total_size in header: {} < {}",
+                    full_data_len,
+                    header.total_size
+                ));
+            }
+            if full_data_len < calculated_total_size {
+                return Err(anyhow::anyhow!(
+                    "Full data length is less than expected for header item_count and item_size: {} < {}",
+                    full_data_len,
+                    calculated_total_size
+                ));
+            }
         }
         if expected_item_size != header.item_size as usize {
             return Err(anyhow::anyhow!(

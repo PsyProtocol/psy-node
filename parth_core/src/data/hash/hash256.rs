@@ -6,6 +6,7 @@ use serde_with::serde_as;
 use ts_rs::TS;
 
 use crate::{
+    generic_traits::QStaticNamedType,
     crypto::hash::traits::{CodeSerializableHash, FromU64x4, HashTo4Felts, RandomHash, ToU64x4, ZeroableHash},
     data::serializable::{QPDSerializable, QPDSerializableFixed},
     protocol::core_types::{Q256BitHash, Q256BitHashTransparent, QHashBase},
@@ -196,6 +197,11 @@ impl Q256BitHashTransparent for Hash256 {
 }
 // SECURITY: [END UNSAFE CODE BLOCK]
 
+impl QStaticNamedType for Hash256 {
+    fn q_static_type_name() -> &'static str {
+        "Hash256"
+    }
+}
 impl QHashBase for Hash256 {}
 
 

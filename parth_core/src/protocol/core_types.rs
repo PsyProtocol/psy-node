@@ -1,7 +1,7 @@
 use serde::{de::DeserializeOwned, Serialize};
 use ts_rs::TS;
 
-use crate::{crypto::hash::{traits::{FieldQHasher, FromU64x4, HashTo4Felts, QHasher, RandomHash, ZeroableHash}, traits::MerkleZeroHasher}, data::{db::data_types::{CoreDatabaseValueDeserialize, QDatabasePrimitiveKey}, parth::public_preimage::{QParthProofPublicInputsPreimage, QParthProofPublicInputsPreimageWithoutRewardsHash}, serializable::{QPDSerializable, QPDSerializableFixed}}, felt::QFelt64, QJobIdBase};
+use crate::{crypto::hash::traits::{FieldQHasher, FromU64x4, HashTo4Felts, MerkleZeroHasher, QHasher, RandomHash, ZeroableHash}, data::{db::data_types::{CoreDatabaseValueDeserialize, QDatabasePrimitiveKey}, parth::public_preimage::{QParthProofPublicInputsPreimage, QParthProofPublicInputsPreimageWithoutRewardsHash}, serializable::{QPDSerializable, QPDSerializableFixed}}, felt::QFelt64, generic_traits::QNamedType, QJobIdBase};
 
 pub trait QStorableBase: Serialize + DeserializeOwned + Send + Sync + Clone + PartialEq + Eq {}
 pub trait QStorableSizedBase: QStorableBase + Sized {}
@@ -22,7 +22,9 @@ pub trait Q256BitHashTransparent: Q256BitHash {
 
 pub trait Q256BitHashNonTransparent: Q256BitHash {
 }
-pub trait QHashBase: PartialEq + ZeroableHash + Copy + Serialize + DeserializeOwned + QPDSerializable + QPDSerializableFixed + Sync + Send + FromU64x4 + TS + Default + CoreDatabaseValueDeserialize + QDatabasePrimitiveKey + RandomHash {}
+pub trait QDBHashBase: QHash256Base + Q256BitHash {}
+impl<T: QHash256Base + Q256BitHash> QDBHashBase for T {}
+pub trait QHashBase: PartialEq + ZeroableHash + Copy + Serialize + DeserializeOwned + QPDSerializable + QPDSerializableFixed + Sync + Send + FromU64x4 + TS + Default + CoreDatabaseValueDeserialize + QDatabasePrimitiveKey + RandomHash + QNamedType  {}
 pub trait QHash256Base: QHashBase + Q256BitHash {}
 impl<T: QHashBase + Q256BitHash> QHash256Base for T {}
 pub trait QFHashBase<F: QFelt64>: QHashBase + HashTo4Felts<F> {}

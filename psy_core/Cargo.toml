@@ -35,3 +35,4 @@ ts-rs = { workspace = true }
 parth_core = { workspace = true }
 pser = { workspace = true }
 pderive = { workspace = true }
+cf_utils = { workspace = true }

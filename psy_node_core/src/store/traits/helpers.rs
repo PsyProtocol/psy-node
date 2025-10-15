@@ -1,11 +1,11 @@
 
 use parth_core::{
     crypto::hash::{merkle_node_cache::QMerkleNodeCacheReader, merkle_proof::{DeltaMerkleProofCore, MerkleProofCore}, merkle_update_builder::{QMerkleUpdaterReaderSync, QMerkleUpdaterWriterSyncMut, SimpleMemoryMerkleUpdaterUnique}, traits::MerkleZeroHasher},
-    data::hash::merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey},
-    protocol::core_types::QHashBase,
+    data::hash::{merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}, merkle_store_key::QMerkleStoreDoubleIdNode},
+    protocol::core_types::{Q256BitHash, QHashBase},
 };
 
-use crate::store::traits::core_db::{CoreDatabaseDoubleIdMerkleReader, CoreDatabaseDoubleIdMerkleWriter, CoreDatabaseSingleIdMerkleReader, CoreDatabaseSingleIdMerkleWriter, CoreDatabaseZeroIdMerkleReader, CoreDatabaseZeroIdMerkleWriter};
+use crate::{qblob::{data_views::double_merkle_node_batch::QBlobDoubleMerkleNodeBatchDataView, structs::common::tree_node_batch_header::QBLOB_TREE_NODE_BATCH_HEADER_SIZE}, store::traits::core_db::{CoreDatabaseDoubleIdMerkleReader, CoreDatabaseDoubleIdMerkleWriter, CoreDatabaseSingleIdMerkleReader, CoreDatabaseSingleIdMerkleWriter, CoreDatabaseZeroIdMerkleReader, CoreDatabaseZeroIdMerkleWriter}};
 
 
 async fn db_select_many_zero_id_merkle_node_max_checkpoint_with_cache<
@@ -690,6 +690,156 @@ pub async fn db_helper_double_id_merkle_node_simple_set_leaves<
     if recorder.get_total_node_count() > 0 {
         let drained = recorder.drain_updates();
         store.db_set_double_id_merkle_nodes_batch(table, checkpoint_id, tree_id, tree_sub_id, &drained).await?;
+    }
+    Ok(delta_merkle_proofs)
+}
+
+
+
+pub async fn db_helper_zero_id_merkle_node_simple_set_leaves_fast_serialize<
+    Hash: QHashBase + Q256BitHash + Send + Sync,
+    Hasher: MerkleZeroHasher<Hash> + Send + Sync,
+    TableIdentifier: Clone + Send + Sync,
+    Store: CoreDatabaseZeroIdMerkleReader<Hash, Hasher, TableIdentifier> + CoreDatabaseZeroIdMerkleWriter<Hash, Hasher, TableIdentifier> + Send + Sync,
+>(
+    store: &Store,
+    table: &TableIdentifier,
+    checkpoint_id: u64,
+    sub_root_level: u8,
+    max_batch_size: usize,
+    nodes: &[SimpleMerkleNode<Hash>],
+) -> anyhow::Result<Vec<DeltaMerkleProofCore<Hash>>> {
+
+    type Recorder<Hash> = SimpleMemoryMerkleUpdaterUnique<Hash>;
+    if nodes.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let mut delta_merkle_proofs = Vec::with_capacity(nodes.len());
+    let mut recorder = Recorder::<Hash>::new();
+
+    for node in nodes.iter() {
+        if sub_root_level > node.key.level {
+            return Err(anyhow::anyhow!("Sub root level cannot be greater than node height"));
+        }
+        let current_dmp = db_helper_record_cache_update_zero_id_merkle_node_to_level_dmp(store, table, &mut recorder, true, checkpoint_id, sub_root_level, &node).await?;
+        delta_merkle_proofs.push(current_dmp);
+        if recorder.get_total_node_count() >=  max_batch_size {
+            let drained = recorder.drain_updates();
+            store.db_set_zero_id_merkle_nodes_batch(table, checkpoint_id, &drained).await?;
+            recorder = Recorder::<Hash>::new_clean();
+        }
+    }
+    if recorder.get_total_node_count() > 0 {
+        let drained = recorder.drain_updates();
+        store.db_set_zero_id_merkle_nodes_batch(table, checkpoint_id, &drained).await?;
+    }
+    Ok(delta_merkle_proofs)
+}
+
+
+
+pub async fn db_helper_single_id_merkle_node_simple_set_leaves_fast_serialize<
+    Hash: QHashBase + Q256BitHash + Send + Sync,
+    Hasher: MerkleZeroHasher<Hash> + Send + Sync,
+    TableIdentifier: Clone + Send + Sync,
+    Store: CoreDatabaseSingleIdMerkleReader<Hash, Hasher, TableIdentifier> + CoreDatabaseSingleIdMerkleWriter<Hash, Hasher, TableIdentifier> + Send + Sync,
+>(
+    store: &Store,
+    table: &TableIdentifier,
+    checkpoint_id: u64,
+    tree_id: u64,
+    tree_height: u8,
+    sub_root_level: u8,
+    max_batch_size: usize,
+    nodes: &[SimpleMerkleNode<Hash>],
+) -> anyhow::Result<Vec<DeltaMerkleProofCore<Hash>>> {
+    if sub_root_level > tree_height {
+        return Err(anyhow::anyhow!("Sub root level cannot be greater than tree height"));
+    }
+
+    type Recorder<Hash> = SimpleMemoryMerkleUpdaterUnique<Hash>;
+    if nodes.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let mut delta_merkle_proofs = Vec::with_capacity(nodes.len());
+    let mut recorder = Recorder::<Hash>::new();
+
+
+
+    for node in nodes.iter() {
+        if sub_root_level > node.key.level {
+            return Err(anyhow::anyhow!("Sub root level cannot be greater than node height"));
+        }
+        let current_dmp = db_helper_record_cache_update_single_id_merkle_node_to_level_dmp(store, table, &mut recorder, true, checkpoint_id, tree_id, tree_height, sub_root_level, &node).await?;
+
+        delta_merkle_proofs.push(current_dmp);
+        if recorder.get_total_node_count() >=  max_batch_size {
+            let drained = recorder.drain_updates();
+            store.db_set_single_id_merkle_nodes_batch(table, checkpoint_id, tree_id, &drained).await?;
+            recorder = Recorder::<Hash>::new_clean();
+        }
+    }
+    if recorder.get_total_node_count() > 0 {
+        let drained = recorder.drain_updates();
+        store.db_set_single_id_merkle_nodes_batch(table, checkpoint_id, tree_id, &drained).await?;
+    }
+    Ok(delta_merkle_proofs)
+
+}
+
+
+
+pub async fn db_helper_double_id_merkle_node_simple_set_leaves_fast_serialize<
+    Hash: QHashBase + Q256BitHash + Send + Sync,
+    Hasher: MerkleZeroHasher<Hash> + Send + Sync,
+    TableIdentifier: Clone + Send + Sync,
+    Store: CoreDatabaseDoubleIdMerkleReader<Hash, Hasher, TableIdentifier> + CoreDatabaseDoubleIdMerkleWriter<Hash, Hasher, TableIdentifier> + Send + Sync,
+>(
+    store: &Store,
+    table: &TableIdentifier,
+    checkpoint_id: u64,
+    tree_id: u64,
+    tree_sub_id: u64,
+    tree_height: u8,
+    sub_root_level: u8,
+    max_batch_size: usize,
+    nodes: &[SimpleMerkleNode<Hash>],
+) -> anyhow::Result<Vec<DeltaMerkleProofCore<Hash>>> {
+    if sub_root_level > tree_height {
+        return Err(anyhow::anyhow!("Sub root level cannot be greater than tree height"));
+    }
+
+    type Recorder<Hash> = SimpleMemoryMerkleUpdaterUnique<Hash>;
+    if nodes.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let mut delta_merkle_proofs = Vec::with_capacity(nodes.len());
+    let mut recorder = Recorder::<Hash>::new();
+
+    for node in nodes.iter() {
+        if sub_root_level > node.key.level {
+            return Err(anyhow::anyhow!("Sub root level cannot be greater than node height"));
+        }
+        let current_dmp = db_helper_record_cache_update_double_id_merkle_node_to_level_dmp(store, table, &mut recorder, true, checkpoint_id, tree_id, tree_sub_id, tree_height, sub_root_level, &node).await?;
+        delta_merkle_proofs.push(current_dmp);
+        if recorder.get_total_node_count() >=  max_batch_size {
+            let drained = recorder.drain_updates();
+            let double_nodes = QMerkleStoreDoubleIdNode::from_simple_merkle_nodes_for_tree_clone(tree_id, tree_sub_id, &drained);
+            let double_nodes_serialized = QBlobDoubleMerkleNodeBatchDataView::generate_double_merkle_node_batch_blob_data_from_ref_default_context(&double_nodes);
+
+            store.db_set_double_id_merkle_nodes_from_fast_serialized(table, checkpoint_id, &double_nodes_serialized[QBLOB_TREE_NODE_BATCH_HEADER_SIZE..]).await?;
+            recorder = Recorder::<Hash>::new_clean();
+        }
+    }
+    if recorder.get_total_node_count() > 0 {
+            let drained = recorder.drain_updates();
+            let double_nodes = QMerkleStoreDoubleIdNode::from_simple_merkle_nodes_for_tree_clone(tree_id, tree_sub_id, &drained);
+            let double_nodes_serialized = QBlobDoubleMerkleNodeBatchDataView::generate_double_merkle_node_batch_blob_data_from_ref_default_context(&double_nodes);
+
+            store.db_set_double_id_merkle_nodes_from_fast_serialized(table, checkpoint_id, &double_nodes_serialized[QBLOB_TREE_NODE_BATCH_HEADER_SIZE..]).await?;
     }
     Ok(delta_merkle_proofs)
 }

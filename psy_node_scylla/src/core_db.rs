@@ -14,7 +14,7 @@ use parth_core::{
         hash::merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey},
         serializable::QPDPair,
     },
-    protocol::core_types::QHashBase,
+    protocol::core_types::QDBHashBase,
 };
 use psy_node_core::store::traits::core_db::{
     CoreDatabaseBidirectionalMappingReader, CoreDatabaseBidirectionalMappingWriter, CoreDatabaseBidirectionalU64U128MappingReader,
@@ -41,7 +41,7 @@ use crate::{
 };
 
 #[async_trait]
-impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
     CoreDatabaseSingleIdCheckpointedReader<ScyllaGenericObjectSingleIdTablePreparedStatements> for ScyllaCoreStore<Hash, Hasher>
 {
     async fn db_select_one_single_checkpointed_object_value<V: serde::Serialize + DeserializeOwned + Send + Sync>(
@@ -109,7 +109,7 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
 }
 
 #[async_trait]
-impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
     CoreDatabaseSingleIdCheckpointedWriter<ScyllaGenericObjectSingleIdTablePreparedStatements> for ScyllaCoreStore<Hash, Hasher>
 {
     async fn db_insert_one_single_checkpointed_object<V: Serialize + Send + Sync>(
@@ -166,7 +166,7 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
 }
 
 #[async_trait]
-impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
     CoreDatabaseDoubleIdCheckpointedReader<ScyllaGenericObjectDoubleIdTablePreparedStatements> for ScyllaCoreStore<Hash, Hasher>
 {
     async fn db_select_one_double_checkpointed_object_value<V: CoreDatabaseValueDeserialize>(
@@ -237,7 +237,7 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
 }
 
 #[async_trait]
-impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
     CoreDatabaseDoubleIdCheckpointedWriter<ScyllaGenericObjectDoubleIdTablePreparedStatements> for ScyllaCoreStore<Hash, Hasher>
 {
     async fn db_insert_one_double_checkpointed_object<V: Serialize + Send + Sync>(
@@ -295,7 +295,7 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
 }
 
 #[async_trait]
-impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
     CoreDatabaseKivReader<ScyllaGenericKeyIdValueTablePreparedStatements> for ScyllaCoreStore<Hash, Hasher>
 {
     async fn db_select_one_kiv_value<V: CoreDatabaseValueDeserialize>(
@@ -342,7 +342,7 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
 }
 
 #[async_trait]
-impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
     CoreDatabaseKivWriter<ScyllaGenericKeyIdValueTablePreparedStatements> for ScyllaCoreStore<Hash, Hasher>
 {
     async fn db_insert_one_kiv<V: Serialize + Send + Sync>(
@@ -370,7 +370,7 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
 }
 
 #[async_trait]
-impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
     CoreDatabaseZeroIdMerkleReader<Hash, Hasher, ScyllaMerkleNodesZeroPreparedStatements> for ScyllaCoreStore<Hash, Hasher>
 {
     async fn db_select_zero_id_merkle_node_max_checkpoint(
@@ -396,7 +396,7 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
 }
 
 #[async_trait]
-impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
     CoreDatabaseZeroIdMerkleWriter<Hash, Hasher, ScyllaMerkleNodesZeroPreparedStatements> for ScyllaCoreStore<Hash, Hasher>
 {
     async fn db_insert_zero_id_merkle_node(
@@ -420,10 +420,19 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
             .set_zero_id_merkle_nodes_batch_internal::<Hash>(&self.session, checkpoint_id, nodes)
             .await
     }
+
+    async fn db_set_zero_id_merkle_nodes_from_fast_serialized(
+        &self,
+        table: &ScyllaMerkleNodesZeroPreparedStatements,
+        checkpoint_id: u64,
+        nodes: &[u8],
+    ) -> anyhow::Result<()>{
+        table.set_zero_id_merkle_nodes_batch_fast_serialize::<Hash>(&self.session, checkpoint_id, nodes).await
+    }
 }
 
 #[async_trait]
-impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
     CoreDatabaseSingleIdMerkleReader<Hash, Hasher, ScyllaMerkleNodesPreparedStatements> for ScyllaCoreStore<Hash, Hasher>
 {
     async fn db_select_single_id_merkle_node_max_checkpoint(
@@ -453,7 +462,7 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
 }
 
 #[async_trait]
-impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
     CoreDatabaseSingleIdMerkleWriter<Hash, Hasher, ScyllaMerkleNodesPreparedStatements> for ScyllaCoreStore<Hash, Hasher>
 {
     async fn db_insert_single_id_merkle_node(
@@ -479,10 +488,20 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
             .set_single_id_merkle_nodes_batch_internal::<Hash>(&self.session, checkpoint_id, tree_id, nodes)
             .await
     }
+
+    async fn db_set_single_id_merkle_nodes_from_fast_serialized(
+        &self,
+        table: &ScyllaMerkleNodesPreparedStatements,
+        checkpoint_id: u64,
+        nodes: &[u8],
+    ) -> anyhow::Result<()>{
+        table.set_single_id_merkle_nodes_batch_fast_serialize::<Hash>(&self.session, checkpoint_id, nodes).await
+
+    }
 }
 
 #[async_trait]
-impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
     CoreDatabaseDoubleIdMerkleReader<Hash, Hasher, ScyllaDoubleMerkleNodesPreparedStatements> for ScyllaCoreStore<Hash, Hasher>
 {
     async fn db_select_double_id_merkle_node_max_checkpoint(
@@ -528,7 +547,7 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
 }
 
 #[async_trait]
-impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
     CoreDatabaseDoubleIdMerkleWriter<Hash, Hasher, ScyllaDoubleMerkleNodesPreparedStatements> for ScyllaCoreStore<Hash, Hasher>
 {
     async fn db_insert_double_id_merkle_node(
@@ -556,10 +575,20 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
             .set_double_id_merkle_nodes_batch_internal(&self.session, checkpoint_id, tree_id, tree_sub_id, nodes)
             .await
     }
+    async fn db_set_double_id_merkle_nodes_from_fast_serialized(
+        &self,
+        table: &ScyllaDoubleMerkleNodesPreparedStatements,
+        checkpoint_id: u64,
+        data: &[u8],
+    ) -> anyhow::Result<()> {
+        table
+            .set_double_id_merkle_nodes_batch_256_from_fast_serialized_data::<Hash>(&self.session, checkpoint_id, data)
+            .await
+    }
 }
 
 #[async_trait]
-impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
     CoreDatabaseBidirectionalMappingReader<ScyllaBiDirectionalBlobToBlobTablePreparedStatements> for ScyllaCoreStore<Hash, Hasher>
 {
     async fn db_select_one_by_k1<K1: QDatabasePrimitiveKey, K2: QDatabasePrimitiveKey>(
@@ -615,7 +644,7 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
 }
 
 #[async_trait]
-impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
     CoreDatabaseBidirectionalMappingWriter<ScyllaBiDirectionalBlobToBlobTablePreparedStatements> for ScyllaCoreStore<Hash, Hasher>
 {
     async fn db_insert_pair_ref<K1: QDatabasePrimitiveKey, K2: QDatabasePrimitiveKey>(
@@ -644,7 +673,7 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
 }
 
 #[async_trait]
-impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync> CoreDatabaseU64Reader<ScyllaU64ToU64TablePreparedStatements>
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync> CoreDatabaseU64Reader<ScyllaU64ToU64TablePreparedStatements>
     for ScyllaCoreStore<Hash, Hasher>
 {
     async fn db_select_u64_value(&self, table: &ScyllaU64ToU64TablePreparedStatements, obj_id: u64) -> anyhow::Result<Option<u64>> {
@@ -656,7 +685,7 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
 }
 
 #[async_trait]
-impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync> CoreDatabaseU64Writer<ScyllaU64ToU64TablePreparedStatements>
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync> CoreDatabaseU64Writer<ScyllaU64ToU64TablePreparedStatements>
     for ScyllaCoreStore<Hash, Hasher>
 {
     async fn db_inc_counter(&self, table: &ScyllaU64ToU64TablePreparedStatements, obj_id: u64, amount: i64) -> anyhow::Result<u64> {
@@ -671,7 +700,7 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
 }
 
 #[async_trait]
-impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
     CoreDatabaseBidirectionalU64U128MappingReader<ScyllaBidirectionalU64U128MappingPreparedStatements> for ScyllaCoreStore<Hash, Hasher>
 {
     async fn db_select_one_u128_value_by_u64(
@@ -705,7 +734,7 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
 }
 
 #[async_trait]
-impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
     CoreDatabaseBidirectionalU64U128MappingWriter<ScyllaBidirectionalU64U128MappingPreparedStatements> for ScyllaCoreStore<Hash, Hasher>
 {
     async fn db_insert_u64_u128_mapping_pair(
@@ -726,7 +755,7 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
 }
 
 #[async_trait]
-impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
     CoreDatabaseTagTreeReader<Hash, Hasher, ScyllaTagTreeNodesPreparedStatements> for ScyllaCoreStore<Hash, Hasher>
 {
     async fn db_get_tag_tree_node_value(
@@ -773,7 +802,7 @@ impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync
 }
 
 #[async_trait]
-impl<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
     CoreDatabaseTagTreeWriter<Hash, Hasher, ScyllaTagTreeNodesPreparedStatements> for ScyllaCoreStore<Hash, Hasher>
 {
     async fn set_tag_tree_tag_known_height(

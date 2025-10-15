@@ -438,6 +438,12 @@ pub trait CoreDatabaseSingleIdMerkleWriter<
         tree_id: u64,
         nodes: &[SimpleMerkleNode<Hash>],
     ) -> anyhow::Result<()>;
+    async fn db_set_single_id_merkle_nodes_from_fast_serialized(
+        &self,
+        table: &TableIdentifier,
+        checkpoint_id: u64,
+        nodes: &[u8],
+    ) -> anyhow::Result<()>;
     
 }
 pub trait CoreDatabaseSingleIdMerkleStore<
@@ -572,6 +578,12 @@ pub trait CoreDatabaseZeroIdMerkleWriter<
         checkpoint_id: u64,
         nodes: &[SimpleMerkleNode<Hash>],
     ) -> anyhow::Result<()>;
+    async fn db_set_zero_id_merkle_nodes_from_fast_serialized(
+        &self,
+        table: &TableIdentifier,
+        checkpoint_id: u64,
+        nodes: &[u8],
+    ) -> anyhow::Result<()>;
 }
 pub trait CoreDatabaseZeroIdMerkleStore<
     Hash: QHashBase + Send + Sync,
@@ -641,6 +653,12 @@ pub trait CoreDatabaseDoubleIdMerkleWriter<
         tree_id: u64,
         tree_sub_id: u64,
         nodes: &[SimpleMerkleNode<Hash>],
+    ) -> anyhow::Result<()>;
+    async fn db_set_double_id_merkle_nodes_from_fast_serialized(
+        &self,
+        table: &TableIdentifier,
+        checkpoint_id: u64,
+        nodes: &[u8],
     ) -> anyhow::Result<()>;
 }
 pub trait CoreDatabaseDoubleIdMerkleStore<

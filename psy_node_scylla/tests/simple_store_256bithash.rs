@@ -15,7 +15,7 @@ use parth_core::{
             merkle_node_key::{generate_nca_tree_groups_efficient, SimpleMerkleNode, SimpleMerkleNodeKey}, merkle_store_key::QMerkleStoreDoubleIdNode,
         },
         serializable::{QPDPair, QPDSerializable},
-    }, felt::QFelt, impl_qpd_serialize_params, protocol::core_types::{Q256BitHash, QHashBase}, utils::QPGenRandom
+    }, felt::QFelt, impl_qpd_serialize_params, protocol::core_types::{Q256BitHash, QHashBase, QDBHashBase}, utils::QPGenRandom
 };
 use parth_crypto::hash::sha256::CoreSha256Hasher;
 use parth_node_scylla::{
@@ -163,8 +163,8 @@ fn rand_leaves_for_subtree<Hash: PartialEq + Copy + QPGenRandom>(sub_root_key: &
 pub trait THStandardTableIdentifier: Clone + Send + Sync {}
 impl<T: Clone + Send + Sync> THStandardTableIdentifier for T {}
 
-pub trait THHasher<Hash: QHashBase>: MerkleZeroHasher<Hash> + Send + Sync + Sized + 'static {}
-impl<T: MerkleZeroHasher<Hash> + Send + Sync + Sized + 'static, Hash: QHashBase> THHasher<Hash> for T {}
+pub trait THHasher<Hash: QDBHashBase>: MerkleZeroHasher<Hash> + Send + Sync + Sized + 'static {}
+impl<T: MerkleZeroHasher<Hash> + Send + Sync + Sized + 'static, Hash: QDBHashBase> THHasher<Hash> for T {}
 
 #[derive(Clone)]
 pub struct QSimpleStore<
@@ -182,7 +182,7 @@ pub struct QSimpleStore<
     KivTableBValue: CoreDatabaseValueDeserialize,
     ObjSingleIdTableAValue: CoreDatabaseValueDeserialize,
     ObjDoubleIdTableBValue: CoreDatabaseValueDeserialize,
-    Hash: QHashBase,
+    Hash: QDBHashBase,
     Hasher: THHasher<Hash>,
     BiDirectionalMappingTableIdentifier: THStandardTableIdentifier,
     BiDirectionalU64U128MappingTableIdentifier: THStandardTableIdentifier,
@@ -274,7 +274,7 @@ impl<
         KivTableBValue: CoreDatabaseValueDeserialize,
         ObjSingleIdTableAValue: CoreDatabaseValueDeserialize,
         ObjDoubleIdTableBValue: CoreDatabaseValueDeserialize,
-        Hash: QHashBase,
+        Hash: QDBHashBase,
         Hasher: THHasher<Hash>,
         BiDirectionalMappingTableIdentifier: THStandardTableIdentifier,
         BiDirectionalU64U128MappingTableIdentifier: THStandardTableIdentifier,
@@ -416,7 +416,7 @@ impl<
         KivTableBValue: CoreDatabaseValueDeserialize,
         ObjSingleIdTableAValue: CoreDatabaseValueDeserialize,
         ObjDoubleIdTableBValue: CoreDatabaseValueDeserialize,
-        Hash: QHashBase,
+        Hash: QDBHashBase,
         Hasher: THHasher<Hash>,
         BiDirectionalMappingTableIdentifier: THStandardTableIdentifier,
         BiDirectionalU64U128MappingTableIdentifier: THStandardTableIdentifier,
@@ -649,7 +649,7 @@ impl<
         KivTableBValue: CoreDatabaseValueDeserialize,
         ObjSingleIdTableAValue: CoreDatabaseValueDeserialize,
         ObjDoubleIdTableBValue: CoreDatabaseValueDeserialize,
-        Hash: QHashBase,
+        Hash: QDBHashBase,
         Hasher: THHasher<Hash>,
         BiDirectionalMappingTableIdentifier: THStandardTableIdentifier,
         BiDirectionalU64U128MappingTableIdentifier: THStandardTableIdentifier,
@@ -1404,7 +1404,7 @@ impl<
         KivTableBValue: CoreDatabaseValueDeserialize + QPGenRandom,
         ObjSingleIdTableAValue: CoreDatabaseValueDeserialize + QPGenRandom,
         ObjDoubleIdTableBValue: CoreDatabaseValueDeserialize + QPGenRandom,
-        Hash: QHashBase + QPGenRandom,
+        Hash: QDBHashBase + QPGenRandom,
         Hasher: THHasher<Hash>,
         BiDirectionalMappingTableIdentifier: THStandardTableIdentifier,
         BiDirectionalU64U128MappingTableIdentifier: THStandardTableIdentifier,
@@ -2219,7 +2219,7 @@ impl<
         KivTableBValue: CoreDatabaseValueDeserialize + QPGenRandom,
         ObjSingleIdTableAValue: CoreDatabaseValueDeserialize + QPGenRandom,
         ObjDoubleIdTableBValue: CoreDatabaseValueDeserialize + QPGenRandom,
-        Hash: QHashBase + QPGenRandom,
+        Hash: QDBHashBase + QPGenRandom,
         Hasher: THHasher<Hash>,
         BiDirectionalMappingTableIdentifier: THStandardTableIdentifier,
         BiDirectionalU64U128MappingTableIdentifier: THStandardTableIdentifier,
@@ -3132,7 +3132,7 @@ impl<
             assert!(leaf.key.level == first_leaf_level, "All leaf keys must be at the same level");
         }
         let leaf_values = leaves.iter().map(|node| node.value).collect::<Vec<_>>();
-        let leaf_keys = leaves.iter().map(|node| node.key).collect::<Vec<_>>();
+        let leaf_keys = leaves.iter().map(|node: &SimpleMerkleNode<Hash>| node.key).collect::<Vec<_>>();
         let dmps = db_helper_double_id_merkle_node_simple_set_leaves::<Hash, Hasher, DoubleIdMerkleTableIdentifier,_>(&self.store, table, checkpoint_id, tree_id, tree_sub_id, tree_height, 0, 9999, leaves).await?;
         assert!(dmps.len() == leaves.len(), "Number of DeltaMerkleProofs must match number of inserted leaves");
         let selected_leaf_values = self.store.db_select_many_double_id_merkle_nodes_max_checkpoint(table, checkpoint_id, tree_id, tree_sub_id, tree_height, &leaf_keys).await?;
@@ -3596,7 +3596,7 @@ impl<
         KivTableBValue: CoreDatabaseValueDeserialize + QPGenRandom,
         ObjSingleIdTableAValue: CoreDatabaseValueDeserialize + QPGenRandom,
         ObjDoubleIdTableBValue: CoreDatabaseValueDeserialize + QPGenRandom,
-        Hash: QHashBase + QPGenRandom + Q256BitHash,
+        Hash: QDBHashBase + QPGenRandom + Q256BitHash,
         Hasher: THHasher<Hash>,
         BiDirectionalMappingTableIdentifier: THStandardTableIdentifier,
         BiDirectionalU64U128MappingTableIdentifier: THStandardTableIdentifier,
@@ -3747,7 +3747,7 @@ impl<
         KivTableBValue: CoreDatabaseValueDeserialize,
         ObjSingleIdTableAValue: CoreDatabaseValueDeserialize,
         ObjDoubleIdTableBValue: CoreDatabaseValueDeserialize,
-        Hash: QHashBase + QPGenRandom + std::fmt::Debug + Default + Clone + Send + Sync,
+        Hash: QDBHashBase + QPGenRandom + std::fmt::Debug + Default + Clone + Send + Sync,
         Hasher: THHasher<Hash>,
         BiDirectionalMappingTableIdentifier: THStandardTableIdentifier,
         BiDirectionalU64U128MappingTableIdentifier: THStandardTableIdentifier,
@@ -4012,7 +4012,7 @@ impl<
         KivTableBValue: CoreDatabaseValueDeserialize,
         ObjSingleIdTableAValue: CoreDatabaseValueDeserialize,
         ObjDoubleIdTableBValue: CoreDatabaseValueDeserialize,
-        Hash: QHashBase + QPGenRandom + std::fmt::Debug + Default + Clone + Send + Sync,
+        Hash: QDBHashBase + QPGenRandom + std::fmt::Debug + Default + Clone + Send + Sync,
         Hasher: THHasher<Hash>,
         BiDirectionalMappingTableIdentifier: THStandardTableIdentifier,
         BiDirectionalU64U128MappingTableIdentifier: THStandardTableIdentifier,
@@ -4319,7 +4319,7 @@ impl<
 
 
 #[pderive::serialize_copy_f_hash]
-pub struct PQEDUserLeaf<F: QFelt, Hash: QHashBase> {
+pub struct PQEDUserLeaf<F: QFelt, Hash: QDBHashBase> {
     pub public_key: Hash,
     pub user_state_tree_root: Hash,
     pub balance: F,
@@ -4331,10 +4331,10 @@ pub struct PQEDUserLeaf<F: QFelt, Hash: QHashBase> {
 
 impl_qpd_serialize_params!(
     PQEDUserLeaf,
-    { F: QFelt, Hash: QHashBase } => { F, Hash }
+    { F: QFelt, Hash: QDBHashBase } => { F, Hash }
 );
 
-impl<F: QFelt, Hash: QHashBase> QPGenRandom for PQEDUserLeaf<F, Hash> {
+impl<F: QFelt, Hash: QDBHashBase> QPGenRandom for PQEDUserLeaf<F, Hash> {
     fn qp_rand_gen() -> Self{
         Self {
             public_key: Hash::rand_hash(),

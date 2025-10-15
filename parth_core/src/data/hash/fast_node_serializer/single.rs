@@ -7,6 +7,7 @@ use crate::{
 
 // tree_id (8 bytes) + level (1 byte) + index (8 bytes) + hash (32 bytes) = 49 bytes
 pub const QMS_FAST_SERIALIZER_SINGLE_ID_NODE_SIZE: usize = 49;
+pub type QMSFastSingleIdNodeSignedInsertTuple =  (i64, i8, i64, i64, [u8; 32]);
 
 pub struct QMerkleStoreFastSingleNodeSerializer {}
 
@@ -51,7 +52,7 @@ impl QMerkleStoreFastSingleNodeSerializer {
     }
 
     //"INSERT INTO {}.{} (tree_id, level, node_index, checkpoint_id, value) VALUES (?, ?, ?, ?, ?)",
-    pub fn deserialize_single_id_node_signed_insert_tuple<Hash: Q256BitHash>(slice: &[u8], checkpoint_id_i64: i64) -> (i64, i8, i64, i64, [u8; 32]) {
+    pub fn deserialize_single_id_node_signed_insert_tuple<Hash: Q256BitHash>(slice: &[u8], checkpoint_id_i64: i64) -> QMSFastSingleIdNodeSignedInsertTuple {
         assert!(slice.len() >= QMS_FAST_SERIALIZER_SINGLE_ID_NODE_SIZE);
         let tree_id = i64::from_le_bytes(slice[0..8].try_into().unwrap());
         let level = u8_to_i8_exact(slice[8]);

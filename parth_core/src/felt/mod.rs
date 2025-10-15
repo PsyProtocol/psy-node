@@ -1,11 +1,17 @@
-use std::{iter::Sum, ops::{Add, AddAssign, Mul, MulAssign, Sub, SubAssign, Div, DivAssign}};
-use std::fmt::{Debug, Display};
-use std::hash::Hash;
+use std::{
+    fmt::{Debug, Display},
+    hash::Hash,
+    iter::Sum,
+    ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Sub, SubAssign},
+};
 
 use serde::{de::DeserializeOwned, Serialize};
 use ts_rs::TS;
 
-use crate::utils::QPGenRandom;
+use crate::{
+    generic_traits::{QNamedType, QStaticNamedType},
+    utils::QPGenRandom,
+};
 pub trait ToU64Value {
     fn to_u64_value(&self) -> u64;
 }
@@ -36,35 +42,11 @@ pub trait SimpleRandFelt {
 }
 pub trait ZeroableFelt {
     const ZERO_VALUE: Self;
-
 }
 impl ZeroableFelt for u64 {
     const ZERO_VALUE: Self = 0;
 }
-pub trait QFelt: 
-    'static
-    + Copy
-    + Eq
-    + Hash
-    + Add<Self, Output = Self>
-    + AddAssign<Self>
-    + Sum
-    + Sub<Self, Output = Self>
-    + SubAssign<Self>
-    + Mul<Self, Output = Self>
-    + MulAssign<Self>
-    + Div<Self, Output = Self>
-    + DivAssign<Self>
-    + Debug
-    + Default
-    + Display
-    + Send
-    + Sync
-    + Serialize
-    + DeserializeOwned + ZeroableFelt + TS + FromPrimitiveValuesFelt + SimpleRandFelt + QPGenRandom {
-
-}
-impl<T: 
+pub trait QFelt:
     'static
     + Copy
     + Eq
@@ -86,8 +68,42 @@ impl<T:
     + Serialize
     + DeserializeOwned
     + ZeroableFelt
-    + TS + FromPrimitiveValuesFelt + SimpleRandFelt + QPGenRandom
-> QFelt for T {
+    + TS
+    + FromPrimitiveValuesFelt
+    + SimpleRandFelt
+    + QPGenRandom
+    + QNamedType
+{
+}
+impl<
+        T: 'static
+            + Copy
+            + Eq
+            + Hash
+            + Add<Self, Output = Self>
+            + AddAssign<Self>
+            + Sum
+            + Sub<Self, Output = Self>
+            + SubAssign<Self>
+            + Mul<Self, Output = Self>
+            + MulAssign<Self>
+            + Div<Self, Output = Self>
+            + DivAssign<Self>
+            + Debug
+            + Default
+            + Display
+            + Send
+            + Sync
+            + Serialize
+            + DeserializeOwned
+            + ZeroableFelt
+            + TS
+            + FromPrimitiveValuesFelt
+            + SimpleRandFelt
+            + QPGenRandom
+            + QNamedType,
+    > QFelt for T
+{
 }
 
 pub trait QFelt64: QFelt + ToU64Value {}
@@ -128,7 +144,6 @@ impl<const N: usize, F: Copy> ToQFelts<F> for [F; N] {
     }
 }
 
-
 impl ToU64Value for u64 {
     fn to_u64_value(&self) -> u64 {
         *self
@@ -141,7 +156,10 @@ impl SimpleRandFelt for u64 {
 }
 
 impl QPGenRandom for u64 {
-    fn qp_rand_gen() -> Self where Self: Sized {
+    fn qp_rand_gen() -> Self
+    where
+        Self: Sized,
+    {
         rand::random::<u64>()
     }
 }

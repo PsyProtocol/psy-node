@@ -2,7 +2,7 @@
 use plonky2::field::{goldilocks_field::GoldilocksField, types::{Field, PrimeField64, Sample}};
 
 use super::qhashout::QHashOut;
-use crate::{felt::{FromPrimitiveValuesFelt, SimpleRandFelt, ToU64Value, ZeroableFelt}, utils::QPGenRandom};
+use crate::{felt::{FromPrimitiveValuesFelt, SimpleRandFelt, ToU64Value, ZeroableFelt}, generic_traits::{QNamedType, QStaticNamedType}, utils::QPGenRandom};
 pub type PGoldilocksHash = QHashOut<GoldilocksField>;
 pub type PGoldilocksFelt = GoldilocksField;
 
@@ -41,5 +41,11 @@ impl ToU64Value for PGoldilocksFelt {
 impl QPGenRandom for PGoldilocksFelt {
     fn qp_rand_gen() -> Self where Self: Sized {
         Self::rand()
+    }
+}
+
+impl QStaticNamedType for PGoldilocksFelt {
+    fn q_static_type_name() -> &'static str {
+        "PGoldilocksFelt"
     }
 }

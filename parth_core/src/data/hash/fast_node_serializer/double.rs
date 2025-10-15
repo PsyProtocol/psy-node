@@ -1,12 +1,14 @@
 use crate::{
     data::hash::
-        merkle_store_key::{QMerkleDoubleIdStoreKey, QMerkleStoreDoubleIdNode}
+        merkle_store_key::{QMerkleStoreDoubleIdKey, QMerkleStoreDoubleIdNode}
     ,
     protocol::core_types::Q256BitHash, utils::signed_helpers::u8_to_i8_exact,
 };
 
 // tree_id (8 bytes) + sub_tree_id (8 bytes) + level (1 byte) + index (8 bytes) + hash (32 bytes) = 57 bytes
 pub const QMS_FAST_SERIALIZER_DOUBLE_ID_NODE_SIZE: usize = 57;
+pub type QMSFastDoubleIdNodeSignedInsertTuple = (i64, i64, i8, i64, i64, [u8; 32]);
+
 
 pub struct QMerkleStoreFastDoubleNodeSerializer {}
 
@@ -47,7 +49,7 @@ impl QMerkleStoreFastDoubleNodeSerializer {
         let index = u64::from_le_bytes(slice[17..25].try_into().unwrap());
         let hash = Hash::from_owned_32bytes(slice[25..57].try_into().unwrap());
         QMerkleStoreDoubleIdNode {
-            key: QMerkleDoubleIdStoreKey {
+            key: QMerkleStoreDoubleIdKey {
                 tree_id,
                 tree_sub_id,
                 level,
@@ -56,7 +58,7 @@ impl QMerkleStoreFastDoubleNodeSerializer {
             hash,
         }
     }
-    pub fn deserialize_double_id_node_signed_insert_tuple<Hash: Q256BitHash>(slice: &[u8], checkpoint_id_i64: i64) -> (i64, i64, i8, i64, i64, [u8; 32]) {
+    pub fn deserialize_double_id_node_signed_insert_tuple<Hash: Q256BitHash>(slice: &[u8], checkpoint_id_i64: i64) -> QMSFastDoubleIdNodeSignedInsertTuple {
         // "INSERT INTO {}.{} (tree_id, tree_sub_id, level, node_index, checkpoint_id, value) VALUES (?, ?, ?, ?, ?, ?)",
         assert!(slice.len() >= QMS_FAST_SERIALIZER_DOUBLE_ID_NODE_SIZE);
         let tree_id = i64::from_le_bytes(slice[0..8].try_into().unwrap());
@@ -100,7 +102,7 @@ mod tests {
     fn test_double_id_node_round_trip_serialization_hash256() {
         let base_examples = [
             QMerkleStoreDoubleIdNode {
-                key: QMerkleDoubleIdStoreKey {
+                key: QMerkleStoreDoubleIdKey {
                     tree_id: 0,
                     tree_sub_id: 0,
                     level: 0,
@@ -109,7 +111,7 @@ mod tests {
                 hash: Hash256::ZERO,
             },
             QMerkleStoreDoubleIdNode {
-                key: QMerkleDoubleIdStoreKey {
+                key: QMerkleStoreDoubleIdKey {
                     tree_id: u64::MAX,
                     tree_sub_id: u64::MAX,
                     level: u8::MAX,
@@ -118,7 +120,7 @@ mod tests {
                 hash: Hash256([0xFF; 32]),
             },
             QMerkleStoreDoubleIdNode {
-                key: QMerkleDoubleIdStoreKey {
+                key: QMerkleStoreDoubleIdKey {
                     tree_id: 0,
                     tree_sub_id: 0,
                     level: 0,
@@ -127,7 +129,7 @@ mod tests {
                 hash: Hash256::rand(),
             },
             QMerkleStoreDoubleIdNode {
-                key: QMerkleDoubleIdStoreKey {
+                key: QMerkleStoreDoubleIdKey {
                     tree_id: 0,
                     tree_sub_id: 0,
                     level: 1,
@@ -136,7 +138,7 @@ mod tests {
                 hash: Hash256::rand(),
             },
             QMerkleStoreDoubleIdNode {
-                key: QMerkleDoubleIdStoreKey {
+                key: QMerkleStoreDoubleIdKey {
                     tree_id: 0,
                     tree_sub_id: 0,
                     level: 255,

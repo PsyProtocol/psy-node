@@ -1,26 +1,28 @@
 use std::sync::Arc;
-
+use rayon::slice::{ParallelSlice};
+use rayon::iter::ParallelIterator;
 use anyhow::Context;
+use futures::{future::join_all, stream, StreamExt, TryStreamExt};
+
 use async_trait::async_trait;
-use futures::future::join_all;
 use parth_core::{
     crypto::hash::traits::MerkleZeroHasher,
     data::{
         db::table::QDatabaseTableRoutingKey,
-        hash::merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey},
+        hash::{fast_node_serializer::{QMerkleStoreFastSingleNodeSerializer, QMS_FAST_SERIALIZER_SINGLE_ID_NODE_SIZE}, merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}},
     },
-    protocol::core_types::QHashBase,
+    protocol::core_types::{QHash256Base, QHashBase},
 };
 use scylla::{
     client::session::Session,
     statement::{batch::Batch, prepared::PreparedStatement, Statement},
 };
 
+use crate::utils::{calc_best_batch_size, generate_batch_prepared_statement};
 use crate::{
     tables::traits::ScyllaStandardPreparedTableStatements,
     utils::{convert_checkpoint_id_to_i64, u64_to_i64_exact, u8_to_i8_exact},
 };
-
 
 #[derive(Clone)]
 pub struct ScyllaMerkleNodesPreparedStatements {
@@ -28,6 +30,11 @@ pub struct ScyllaMerkleNodesPreparedStatements {
     pub insert_1_prepared: Arc<PreparedStatement>,
     pub select_1_statement: Statement,
     pub select_1_prepared: Arc<PreparedStatement>,
+    //pub insert_batch_serialized_512_prepared: Arc<Batch>,
+    pub insert_batch_serialized_256_prepared: Arc<Batch>,
+    pub insert_batch_serialized_128_prepared: Arc<Batch>,
+    pub insert_batch_serialized_64_prepared: Arc<Batch>,
+    //pub insert_batch_serialized_32_prepared: Arc<Batch>,
     pub keyspace: String,
     pub table_name: String,
     pub table_key: QDatabaseTableRoutingKey,
@@ -52,8 +59,11 @@ impl ScyllaMerkleNodesPreparedStatements {
         let select_1_prepared = session.prepare(select_1_statement.clone()).await?;
 
         Ok(Self {
+            insert_batch_serialized_256_prepared: Arc::new(generate_batch_prepared_statement(&session, &insert_prepared, 512).await?),
+            insert_batch_serialized_128_prepared: Arc::new(generate_batch_prepared_statement(&session, &insert_prepared, 128).await?),
+            insert_batch_serialized_64_prepared: Arc::new(generate_batch_prepared_statement(&session, &insert_prepared, 64).await?),  
             insert_1_prepared: Arc::new(insert_prepared),
-            select_1_prepared: Arc::new(select_1_prepared),
+            select_1_prepared: Arc::new(select_1_prepared),        
             insert_1_statement: insert_1_statement,
             select_1_statement: select_1_statement,
             keyspace: keyspace.to_string(),
@@ -237,3 +247,86 @@ impl ScyllaMerkleNodesPreparedStatements {
 }
 
 
+impl ScyllaMerkleNodesPreparedStatements {
+
+    async fn set_single_id_merkle_nodes_batch_fast_serialize_with_batch_size_internal<Hash: QHash256Base>(
+        &self,
+        session: &Session,
+        checkpoint_id: u64,
+        data: &[u8],
+        batch_size: usize,
+    ) -> anyhow::Result<()> {
+        let checkpoint_i64 = convert_checkpoint_id_to_i64(checkpoint_id);
+        if data.len() % QMS_FAST_SERIALIZER_SINGLE_ID_NODE_SIZE != 0 {
+            anyhow::bail!("Data length is not a multiple of double id node size");
+        }
+        let num_nodes = data.len() / QMS_FAST_SERIALIZER_SINGLE_ID_NODE_SIZE;
+
+        if num_nodes == 0 {
+            return Ok(());
+        }
+
+        const CONCURRENCY_LIMIT: usize = 64; // Tuned for typical Scylla clusters
+
+
+        // Parallel deserialization using rayon
+        let values: Vec<(i64, i8, i64, i64, [u8; 32])> = data
+            .par_chunks(QMS_FAST_SERIALIZER_SINGLE_ID_NODE_SIZE)
+            .map(|slice| {
+                QMerkleStoreFastSingleNodeSerializer::deserialize_single_id_node_signed_insert_tuple::<Hash>(slice, checkpoint_i64)
+            })
+            .collect();
+
+        // Map batch size to pre-prepared batch
+        let batch_prepared = match batch_size {
+            //512 => &self.insert_batch_serialized_512_prepared,
+            256 => &self.insert_batch_serialized_256_prepared,
+            128 => &self.insert_batch_serialized_128_prepared,
+            64 => &self.insert_batch_serialized_64_prepared,
+            //32 => &self.insert_batch_serialized_32_prepared,
+            _ => unreachable!(),
+        };
+
+        // Process batches concurrently
+        let chunks = values.chunks(batch_size);
+        stream::iter(chunks)
+            .map(anyhow::Ok)
+            .try_for_each_concurrent(CONCURRENCY_LIMIT, |chunk| {
+                let batch_prepared = batch_prepared.clone();
+                async move {
+                    if chunk.len() == batch_size {
+                        session.batch(&batch_prepared, chunk).await.context("Batch insert failed")?;
+                    } else {
+                        let mut batch = Batch::default();
+                        for _ in 0..chunk.len() {
+                            batch.append_statement(self.insert_1_statement.clone());
+                        }
+                        session.batch(&batch, chunk).await.context("Partial batch insert failed")?;
+                    }
+                    Ok(())
+                }
+            })
+            .await?;
+
+        Ok(())
+    }
+     
+    pub async fn set_single_id_merkle_nodes_batch_fast_serialize<Hash: QHash256Base>(
+        &self,
+        session: &Session,
+        checkpoint_id: u64,
+        data: &[u8],
+    ) -> anyhow::Result<()> {
+        if data.len() % QMS_FAST_SERIALIZER_SINGLE_ID_NODE_SIZE != 0 {
+            anyhow::bail!("Data length is not a multiple of single id node size");
+        }
+        let num_nodes = data.len() / QMS_FAST_SERIALIZER_SINGLE_ID_NODE_SIZE;
+        if num_nodes == 0 {
+            return Ok(());
+        }
+        
+        let batch_size = calc_best_batch_size(num_nodes, &[256, 128, 64]);
+        self.set_single_id_merkle_nodes_batch_fast_serialize_with_batch_size_internal::<Hash>(session, checkpoint_id, data, batch_size).await
+
+    }
+}

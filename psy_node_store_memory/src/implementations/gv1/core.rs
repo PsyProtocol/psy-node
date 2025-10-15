@@ -17,7 +17,7 @@ use parth_core::{
         hash::merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey},
         serializable::QPDPair,
     },
-    protocol::core_types::QHashBase,
+    protocol::core_types::{QDBHashBase, QHashBase},
 };
 use parking_lot::RwLock;
 use serde::{de::DeserializeOwned, Serialize};
@@ -54,7 +54,7 @@ fn deserialize_value<V: CoreDatabaseValueDeserialize>(data: &[u8]) -> anyhow::Re
 
 #[derive(Debug, Clone)]
 pub struct InMemoryDb<
-    Hash: QHashBase + Send + Sync,
+    Hash: QDBHashBase + Send + Sync,
     Hasher: MerkleZeroHasher<Hash> + Send + Sync,
     BiDirectionalMappingTableIdentifier: TIDBase + Debug,
     BiDirectionalU64U128MappingTableIdentifier: TIDBase,
@@ -96,7 +96,7 @@ pub struct InMemoryDb<
 }
 
 impl<
-    H: QHashBase + Send + Sync,
+    H: QDBHashBase + Send + Sync,
     Hs: MerkleZeroHasher<H> + Send + Sync,
     BMID: TIDBase + Debug,
     BMUID: TIDBase,
@@ -163,7 +163,7 @@ fn find_latest_version<V: Clone>(version_map: &BTreeMap<u64, V>, max_checkpoint_
 
 #[async_trait]
 impl<
-    H: QHashBase + Send + Sync,
+    H: QDBHashBase + Send + Sync,
     Hs: MerkleZeroHasher<H> + Send + Sync,
     BMID: TIDBase + Debug,
     BMUID: TIDBase,
@@ -310,7 +310,7 @@ impl<
 
 #[async_trait]
 impl<
-    H: QHashBase + Send + Sync,
+    H: QDBHashBase + Send + Sync,
     Hs: MerkleZeroHasher<H> + Send + Sync,
     BMID: TIDBase + Debug,
     BMUID: TIDBase,
@@ -380,7 +380,7 @@ impl<
 
 #[async_trait]
 impl<
-    H: QHashBase + Send + Sync,
+    H: QDBHashBase + Send + Sync,
     Hs: MerkleZeroHasher<H> + Send + Sync,
     BMID: TIDBase + Debug,
     BMUID: TIDBase,
@@ -419,7 +419,7 @@ impl<
 
 #[async_trait]
 impl<
-    H: QHashBase + Send + Sync,
+    H: QDBHashBase + Send + Sync,
     Hs: MerkleZeroHasher<H> + Send + Sync,
     BMID: TIDBase + Debug,
     BMUID: TIDBase,
@@ -461,7 +461,7 @@ impl<
 
 #[async_trait]
 impl<
-    H: QHashBase + Send + Sync,
+    H: QDBHashBase + Send + Sync,
     Hs: MerkleZeroHasher<H> + Send + Sync,
     BMID: TIDBase + Debug,
     BMUID: TIDBase,
@@ -489,7 +489,7 @@ impl<
 
 #[async_trait]
 impl<
-    H: QHashBase + Send + Sync,
+    H: QDBHashBase + Send + Sync,
     Hs: MerkleZeroHasher<H> + Send + Sync,
     BMID: TIDBase + Debug,
     BMUID: TIDBase,
@@ -543,7 +543,7 @@ impl<
 
 #[async_trait]
 impl<
-    H: QHashBase + Send + Sync,
+    H: QDBHashBase + Send + Sync,
     Hs: MerkleZeroHasher<H> + Send + Sync,
     BMID: TIDBase + Debug,
     BMUID: TIDBase,
@@ -661,7 +661,7 @@ impl<
 
 #[async_trait]
 impl<
-    H: QHashBase + Send + Sync,
+    H: QDBHashBase + Send + Sync,
     Hs: MerkleZeroHasher<H> + Send + Sync,
     BMID: TIDBase + Debug,
     BMUID: TIDBase,
@@ -753,7 +753,7 @@ impl<
 
 #[async_trait]
 impl<
-    H: QHashBase + Send + Sync,
+    H: QDBHashBase + Send + Sync,
     Hs: MerkleZeroHasher<H> + Send + Sync,
     BMID: TIDBase + Debug,
     BMUID: TIDBase,
@@ -877,7 +877,7 @@ impl<
 
 #[async_trait]
 impl<
-    H: QHashBase + Send + Sync,
+    H: QDBHashBase + Send + Sync,
     Hs: MerkleZeroHasher<H> + Send + Sync,
     BMID: TIDBase + Debug,
     BMUID: TIDBase,
@@ -971,7 +971,7 @@ impl<
 
 #[async_trait]
 impl<
-    H: QHashBase + Send + Sync,
+    H: QDBHashBase + Send + Sync,
     Hs: MerkleZeroHasher<H> + Send + Sync,
     BMID: TIDBase + Debug,
     BMUID: TIDBase,
@@ -1067,7 +1067,7 @@ impl<
 
 #[async_trait]
 impl<
-    H: QHashBase + Send + Sync,
+    H: QDBHashBase + Send + Sync,
     Hs: MerkleZeroHasher<H> + Send + Sync,
     BMID: TIDBase + Debug,
     BMUID: TIDBase,
@@ -1124,7 +1124,7 @@ impl<
 
 #[async_trait]
 impl<
-    H: QHashBase + Send + Sync,
+    H: QDBHashBase + Send + Sync,
     Hs: MerkleZeroHasher<H> + Send + Sync,
     BMID: TIDBase + Debug,
     BMUID: TIDBase,
@@ -1177,7 +1177,7 @@ impl<
 
 #[async_trait]
 impl<
-    H: QHashBase + Send + Sync,
+    H: QDBHashBase + Send + Sync,
     Hs: MerkleZeroHasher<H> + Send + Sync,
     BMID: TIDBase + Debug,
     BMUID: TIDBase,
@@ -1220,6 +1220,14 @@ impl<
         }
         Ok(())
     }
+    async fn db_set_single_id_merkle_nodes_from_fast_serialized(
+        &self,
+        table: &SMID,
+        checkpoint_id: u64,
+        nodes: &[u8],
+    ) -> anyhow::Result<()> {
+        todo!("not implemented");
+    }
 }
 
 
@@ -1232,7 +1240,7 @@ impl<
 
 #[async_trait]
 impl<
-    H: QHashBase + Send + Sync,
+    H: QDBHashBase + Send + Sync,
     Hs: MerkleZeroHasher<H> + Send + Sync,
     BMID: TIDBase + Debug,
     BMUID: TIDBase,
@@ -1288,7 +1296,7 @@ impl<
 
 #[async_trait]
 impl<
-    H: QHashBase + Send + Sync,
+    H: QDBHashBase + Send + Sync,
     Hs: MerkleZeroHasher<H> + Send + Sync,
     BMID: TIDBase + Debug,
     BMUID: TIDBase,
@@ -1333,6 +1341,15 @@ impl<
         }
         Ok(())
     }
+
+    async fn db_set_double_id_merkle_nodes_from_fast_serialized(
+        &self,
+        table: &DMID,
+        checkpoint_id: u64,
+        nodes: &[u8],
+    ) -> anyhow::Result<()> {
+        todo!("not implemented");
+    }
 }
 
 
@@ -1344,7 +1361,7 @@ impl<
 
 #[async_trait]
 impl<
-    H: QHashBase + Send + Sync,
+    H: QDBHashBase + Send + Sync,
     Hs: MerkleZeroHasher<H> + Send + Sync,
     BMID: TIDBase + Debug,
     BMUID: TIDBase,
@@ -1396,7 +1413,7 @@ impl<
 
 #[async_trait]
 impl<
-    H: QHashBase + Send + Sync,
+    H: QDBHashBase + Send + Sync,
     Hs: MerkleZeroHasher<H> + Send + Sync,
     BMID: TIDBase + Debug,
     BMUID: TIDBase,
@@ -1434,6 +1451,14 @@ impl<
         }
         Ok(())
     }
+    async fn db_set_zero_id_merkle_nodes_from_fast_serialized(
+        &self,
+        table: &ZMID,
+        checkpoint_id: u64,
+        nodes: &[u8],
+    ) -> anyhow::Result<()> {
+        todo!("not implemented");
+    }
 }
 
 
@@ -1445,7 +1470,7 @@ impl<
 
 #[async_trait]
 impl<
-    H: QHashBase + Send + Sync,
+    H: QDBHashBase + Send + Sync,
     Hs: MerkleZeroHasher<H> + Send + Sync,
     BMID: TIDBase + Debug,
     BMUID: TIDBase,
@@ -1506,7 +1531,7 @@ impl<
 
 #[async_trait]
 impl<
-    H: QHashBase + Send + Sync,
+    H: QDBHashBase + Send + Sync,
     Hs: MerkleZeroHasher<H> + Send + Sync,
     BMID: TIDBase + Debug,
     BMUID: TIDBase,

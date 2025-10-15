@@ -1,9 +1,9 @@
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{black_box, BenchmarkId, Criterion};
 use parth_core::{
     data::{
         hash::hash256::Hash256,
         serializable::{FastFixedSerializable, QPDSerializable, QPDSerializableFixed},
-    }, pgoldilocks::{PGoldilocksHash, QHashOut}, protocol::core_types::Q256BitHash, utils::QPGenRandom
+    }, pgoldilocks::PGoldilocksHash, protocol::core_types::Q256BitHash, utils::QPGenRandom
 };
 use speedy::{Readable, Writable};
 
@@ -218,14 +218,14 @@ impl<Hash: Q256BitHash> FastFixedSerializable<49> for QMerkleStoreSingleIdNode<H
     speedy::Writable,
 )]
 
-pub struct QMerkleDoubleIdStoreKey {
+pub struct QMerkleStoreDoubleIdKey {
     pub tree_id: u64,     // 8
     pub tree_sub_id: u64, // 16
     pub level: u8,        // 17
     pub index: u64,       // 25
 }
 
-impl FastFixedSerializable<25> for QMerkleDoubleIdStoreKey {
+impl FastFixedSerializable<25> for QMerkleStoreDoubleIdKey {
     fn ffs_from_owned_bytes(data: [u8; 25]) -> Self {
         Self {
             tree_id: u64::from_le_bytes(data[0..8].try_into().unwrap()),
@@ -246,7 +246,7 @@ impl FastFixedSerializable<25> for QMerkleDoubleIdStoreKey {
 
     fn ffs_try_from_slice(data: &[u8]) -> anyhow::Result<Self> {
         if data.len() != 25 {
-            anyhow::bail!("invalid length for QMerkleDoubleIdStoreKey, expected 25 bytes, got {}", data.len());
+            anyhow::bail!("invalid length for QMerkleStoreDoubleIdKey, expected 25 bytes, got {}", data.len());
         }
         Ok(Self {
             tree_id: u64::from_le_bytes(data[0..8].try_into().unwrap()),
@@ -276,7 +276,7 @@ impl FastFixedSerializable<25> for QMerkleDoubleIdStoreKey {
         data
     }
 }
-impl QPGenRandom for QMerkleDoubleIdStoreKey {
+impl QPGenRandom for QMerkleStoreDoubleIdKey {
     fn qp_rand_gen() -> Self
     where
         Self: Sized,
@@ -289,7 +289,7 @@ impl QPGenRandom for QMerkleDoubleIdStoreKey {
         }
     }
 }
-impl QPDSerializable for QMerkleDoubleIdStoreKey {
+impl QPDSerializable for QMerkleStoreDoubleIdKey {
     fn to_bytes(&self) -> anyhow::Result<Vec<u8>> {
         let mut data: [u8; 25] = [0u8; 25];
         data[0..8].copy_from_slice(&self.tree_id.to_le_bytes());
@@ -302,7 +302,7 @@ impl QPDSerializable for QMerkleDoubleIdStoreKey {
 
     fn from_bytes(bytes: &[u8]) -> anyhow::Result<Self> {
         if bytes.len() != 25 {
-            anyhow::bail!("invalid length for QMerkleDoubleIdStoreKey, expected 25 bytes, got {}", bytes.len());
+            anyhow::bail!("invalid length for QMerkleStoreDoubleIdKey, expected 25 bytes, got {}", bytes.len());
         }
         Ok(Self {
             tree_id: u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
@@ -313,7 +313,7 @@ impl QPDSerializable for QMerkleDoubleIdStoreKey {
     }
 }
 
-impl QPDSerializableFixed for QMerkleDoubleIdStoreKey {
+impl QPDSerializableFixed for QMerkleStoreDoubleIdKey {
     fn get_fixed_size() -> usize {
         25
     }
@@ -339,7 +339,7 @@ impl QPDSerializableFixed for QMerkleDoubleIdStoreKey {
 )]
 
 pub struct QMerkleStoreDoubleIdNode<Hash> {
-    pub key: QMerkleDoubleIdStoreKey,
+    pub key: QMerkleStoreDoubleIdKey,
     pub hash: Hash,
 }
 
@@ -349,7 +349,7 @@ impl<Hash: QPGenRandom> QPGenRandom for QMerkleStoreDoubleIdNode<Hash> {
         Self: Sized,
     {
         Self {
-            key: QMerkleDoubleIdStoreKey::qp_rand_gen(),
+            key: QMerkleStoreDoubleIdKey::qp_rand_gen(),
             hash: QPGenRandom::qp_rand_gen(),
         }
     }
@@ -357,14 +357,14 @@ impl<Hash: QPGenRandom> QPGenRandom for QMerkleStoreDoubleIdNode<Hash> {
 impl<Hash: Q256BitHash> FastFixedSerializable<57> for QMerkleStoreDoubleIdNode<Hash> {
     fn ffs_from_owned_bytes(data: [u8; 57]) -> Self {
         Self {
-            key: QMerkleDoubleIdStoreKey::ffs_from_owned_bytes(data[0..25].try_into().unwrap()),
+            key: QMerkleStoreDoubleIdKey::ffs_from_owned_bytes(data[0..25].try_into().unwrap()),
             hash: Hash::from_ref_32bytes(data[25..57].try_into().unwrap()),
         }
     }
 
     fn ffs_from_slice_or_panic(data: &[u8]) -> Self {
         Self {
-            key: QMerkleDoubleIdStoreKey::ffs_from_slice_or_panic(&data[0..25]),
+            key: QMerkleStoreDoubleIdKey::ffs_from_slice_or_panic(&data[0..25]),
             hash: Hash::from_ref_32bytes(data[25..57].try_into().unwrap()),
         }
     }
@@ -374,7 +374,7 @@ impl<Hash: Q256BitHash> FastFixedSerializable<57> for QMerkleStoreDoubleIdNode<H
             anyhow::bail!("invalid length for QMerkleStoreDoubleIdNode, expected 57 bytes, got {}", data.len());
         }
         Ok(Self {
-            key: QMerkleDoubleIdStoreKey::ffs_try_from_slice(&data[0..25])?,
+            key: QMerkleStoreDoubleIdKey::ffs_try_from_slice(&data[0..25])?,
             hash: Hash::from_slice_32bytes(&data[25..57])?,
         })
     }

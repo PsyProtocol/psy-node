@@ -2,7 +2,7 @@ use std::{fmt::Display, str::FromStr};
 
 use anyhow::ensure;
 use ts_rs::TS;
-use crate::{crypto::hash::traits::{FromU64x4, HashTo4Felts, RandomHash, ToU64x4, ZeroableHash}, data::{hash::hash256::Hash256, serializable::{QPDSerializable, QPDSerializableFixed}}, felt::{QFelt64, ToQFelts}, protocol::core_types::{Q256BitHash, QHashBase}, utils::QPGenRandom};
+use crate::{crypto::hash::traits::{FromU64x4, HashTo4Felts, RandomHash, ToU64x4, ZeroableHash}, data::{hash::hash256::Hash256, serializable::{QPDSerializable, QPDSerializableFixed}}, felt::{QFelt64, ToQFelts}, generic_traits::QNamedType, protocol::core_types::{Q256BitHash, QHashBase}, utils::QPGenRandom};
 use plonky2::{
     field::{
         goldilocks_field::GoldilocksField,
@@ -420,7 +420,11 @@ impl Q256BitHash for QHashOut<GoldilocksField> {
     }
 }
 
-
+impl<F: RichField + QFelt64> QNamedType for QHashOut<F> {
+    fn q_type_name() -> String {
+        format!("QHashOut<{}>", F::q_type_name())
+    }
+}
 
 impl<F: RichField + QFelt64> QHashBase for QHashOut<F> {}
 

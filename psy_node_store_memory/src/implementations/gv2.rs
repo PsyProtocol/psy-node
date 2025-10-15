@@ -18,7 +18,7 @@ use parth_core::{
         hash::merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey},
         serializable::QPDPair,
     },
-    protocol::core_types::QHashBase,
+    protocol::core_types::{QDBHashBase, QHashBase},
 };
 
 use psy_node_core::store::traits::core_db::{
@@ -40,7 +40,7 @@ use crate::utils::TIDBase;
 /// blockchain-like state engines.
 #[derive(Debug)]
 pub struct InMemoryStore<
-    Hash: QHashBase + Send + Sync,
+    Hash: QDBHashBase + Send + Sync,
     Hasher: MerkleZeroHasher<Hash> + Send + Sync,
     BM_TID: TIDBase, // BiDirectionalMappingTableIdentifier
     BU_TID: TIDBase, // BiDirectionalU64U128MappingTableIdentifier
@@ -69,7 +69,7 @@ pub struct InMemoryStore<
 impl<Hash, Hasher, BM_TID, BU_TID, U64_TID, SI_TID, DI_TID, KIV_TID, SIM_TID, DIM_TID, ZIM_TID, TT_TID>
     InMemoryStore<Hash, Hasher, BM_TID, BU_TID, U64_TID, SI_TID, DI_TID, KIV_TID, SIM_TID, DIM_TID, ZIM_TID, TT_TID>
 where
-    Hash: QHashBase + Send + Sync,
+    Hash: QDBHashBase + Send + Sync,
     Hasher: MerkleZeroHasher<Hash> + Send + Sync,
     BM_TID: TIDBase,
     BU_TID: TIDBase,
@@ -91,7 +91,7 @@ where
 impl<Hash, Hasher, BM_TID, BU_TID, U64_TID, SI_TID, DI_TID, KIV_TID, SIM_TID, DIM_TID, ZIM_TID, TT_TID> Default
     for InMemoryStore<Hash, Hasher, BM_TID, BU_TID, U64_TID, SI_TID, DI_TID, KIV_TID, SIM_TID, DIM_TID, ZIM_TID, TT_TID>
 where
-    Hash: QHashBase + Send + Sync,
+    Hash: QDBHashBase + Send + Sync,
     Hasher: MerkleZeroHasher<Hash> + Send + Sync,
     BM_TID: TIDBase,
     BU_TID: TIDBase,
@@ -138,7 +138,7 @@ impl<Hash, Hasher, BM_TID, BU_TID, U64_TID, SI_TID, DI_TID, KIV_TID, SIM_TID, DI
     CoreDatabaseBidirectionalMappingReader<BM_TID>
     for InMemoryStore<Hash, Hasher, BM_TID, BU_TID, U64_TID, SI_TID, DI_TID, KIV_TID, SIM_TID, DIM_TID, ZIM_TID, TT_TID>
 where
-    Hash: QHashBase + Send + Sync,
+    Hash: QDBHashBase + Send + Sync,
     Hasher: MerkleZeroHasher<Hash> + Send + Sync,
     BM_TID: TIDBase,
     BU_TID: TIDBase,
@@ -304,7 +304,7 @@ impl<Hash, Hasher, BM_TID, BU_TID, U64_TID, SI_TID, DI_TID, KIV_TID, SIM_TID, DI
     CoreDatabaseBidirectionalMappingWriter<BM_TID>
     for InMemoryStore<Hash, Hasher, BM_TID, BU_TID, U64_TID, SI_TID, DI_TID, KIV_TID, SIM_TID, DIM_TID, ZIM_TID, TT_TID>
 where
-    Hash: QHashBase + Send + Sync,
+    Hash: QDBHashBase + Send + Sync,
     Hasher: MerkleZeroHasher<Hash> + Send + Sync,
     BM_TID: TIDBase,
     BU_TID: TIDBase,
@@ -373,7 +373,7 @@ impl<Hash, Hasher, BM_TID, BU_TID, U64_TID, SI_TID, DI_TID, KIV_TID, SIM_TID, DI
     CoreDatabaseBidirectionalU64U128MappingReader<BU_TID>
     for InMemoryStore<Hash, Hasher, BM_TID, BU_TID, U64_TID, SI_TID, DI_TID, KIV_TID, SIM_TID, DIM_TID, ZIM_TID, TT_TID>
 where
-    Hash: QHashBase + Send + Sync,
+    Hash: QDBHashBase + Send + Sync,
     Hasher: MerkleZeroHasher<Hash> + Send + Sync,
     BM_TID: TIDBase,
     BU_TID: TIDBase,
@@ -432,7 +432,7 @@ impl<Hash, Hasher, BM_TID, BU_TID, U64_TID, SI_TID, DI_TID, KIV_TID, SIM_TID, DI
     CoreDatabaseBidirectionalU64U128MappingWriter<BU_TID>
     for InMemoryStore<Hash, Hasher, BM_TID, BU_TID, U64_TID, SI_TID, DI_TID, KIV_TID, SIM_TID, DIM_TID, ZIM_TID, TT_TID>
 where
-    Hash: QHashBase + Send + Sync,
+    Hash: QDBHashBase + Send + Sync,
     Hasher: MerkleZeroHasher<Hash> + Send + Sync,
     BM_TID: TIDBase,
     BU_TID: TIDBase,
@@ -476,7 +476,7 @@ impl<Hash, Hasher, BM_TID, BU_TID, U64_TID, SI_TID, DI_TID, KIV_TID, SIM_TID, DI
     CoreDatabaseU64Reader<U64_TID>
     for InMemoryStore<Hash, Hasher, BM_TID, BU_TID, U64_TID, SI_TID, DI_TID, KIV_TID, SIM_TID, DIM_TID, ZIM_TID, TT_TID>
 where
-    Hash: QHashBase + Send + Sync,
+    Hash: QDBHashBase + Send + Sync,
     Hasher: MerkleZeroHasher<Hash> + Send + Sync,
     BM_TID: TIDBase,
     BU_TID: TIDBase,
@@ -515,7 +515,7 @@ impl<Hash, Hasher, BM_TID, BU_TID, U64_TID, SI_TID, DI_TID, KIV_TID, SIM_TID, DI
     CoreDatabaseU64Writer<U64_TID>
     for InMemoryStore<Hash, Hasher, BM_TID, BU_TID, U64_TID, SI_TID, DI_TID, KIV_TID, SIM_TID, DIM_TID, ZIM_TID, TT_TID>
 where
-    Hash: QHashBase + Send + Sync,
+    Hash: QDBHashBase + Send + Sync,
     Hasher: MerkleZeroHasher<Hash> + Send + Sync,
     BM_TID: TIDBase,
     BU_TID: TIDBase,
@@ -564,7 +564,7 @@ impl<Hash, Hasher, BM_TID, BU_TID, U64_TID, SI_TID, DI_TID, KIV_TID, SIM_TID, DI
     CoreDatabaseSingleIdCheckpointedReader<SI_TID>
     for InMemoryStore<Hash, Hasher, BM_TID, BU_TID, U64_TID, SI_TID, DI_TID, KIV_TID, SIM_TID, DIM_TID, ZIM_TID, TT_TID>
 where
-    Hash: QHashBase + Send + Sync,
+    Hash: QDBHashBase + Send + Sync,
     Hasher: MerkleZeroHasher<Hash> + Send + Sync,
     BM_TID: TIDBase,
     BU_TID: TIDBase,
@@ -686,7 +686,7 @@ impl<Hash, Hasher, BM_TID, BU_TID, U64_TID, SI_TID, DI_TID, KIV_TID, SIM_TID, DI
     CoreDatabaseSingleIdCheckpointedWriter<SI_TID>
     for InMemoryStore<Hash, Hasher, BM_TID, BU_TID, U64_TID, SI_TID, DI_TID, KIV_TID, SIM_TID, DIM_TID, ZIM_TID, TT_TID>
 where
-    Hash: QHashBase + Send + Sync,
+    Hash: QDBHashBase + Send + Sync,
     Hasher: MerkleZeroHasher<Hash> + Send + Sync,
     BM_TID: TIDBase,
     BU_TID: TIDBase,
@@ -779,7 +779,7 @@ impl<Hash, Hasher, BM_TID, BU_TID, U64_TID, SI_TID, DI_TID, KIV_TID, SIM_TID, DI
     CoreDatabaseDoubleIdCheckpointedReader<DI_TID>
     for InMemoryStore<Hash, Hasher, BM_TID, BU_TID, U64_TID, SI_TID, DI_TID, KIV_TID, SIM_TID, DIM_TID, ZIM_TID, TT_TID>
 where
-    Hash: QHashBase + Send + Sync,
+    Hash: QDBHashBase + Send + Sync,
     Hasher: MerkleZeroHasher<Hash> + Send + Sync,
     BM_TID: TIDBase,
     BU_TID: TIDBase,
@@ -908,7 +908,7 @@ impl<Hash, Hasher, BM_TID, BU_TID, U64_TID, SI_TID, DI_TID, KIV_TID, SIM_TID, DI
     CoreDatabaseDoubleIdCheckpointedWriter<DI_TID>
     for InMemoryStore<Hash, Hasher, BM_TID, BU_TID, U64_TID, SI_TID, DI_TID, KIV_TID, SIM_TID, DIM_TID, ZIM_TID, TT_TID>
 where
-    Hash: QHashBase + Send + Sync,
+    Hash: QDBHashBase + Send + Sync,
     Hasher: MerkleZeroHasher<Hash> + Send + Sync,
     BM_TID: TIDBase,
     BU_TID: TIDBase,
@@ -1007,7 +1007,7 @@ impl<Hash, Hasher, BM_TID, BU_TID, U64_TID, SI_TID, DI_TID, KIV_TID, SIM_TID, DI
     CoreDatabaseKivReader<KIV_TID>
     for InMemoryStore<Hash, Hasher, BM_TID, BU_TID, U64_TID, SI_TID, DI_TID, KIV_TID, SIM_TID, DIM_TID, ZIM_TID, TT_TID>
 where
-    Hash: QHashBase + Send + Sync,
+    Hash: QDBHashBase + Send + Sync,
     Hasher: MerkleZeroHasher<Hash> + Send + Sync,
     BM_TID: TIDBase,
     BU_TID: TIDBase,
@@ -1109,7 +1109,7 @@ impl<Hash, Hasher, BM_TID, BU_TID, U64_TID, SI_TID, DI_TID, KIV_TID, SIM_TID, DI
     CoreDatabaseKivWriter<KIV_TID>
     for InMemoryStore<Hash, Hasher, BM_TID, BU_TID, U64_TID, SI_TID, DI_TID, KIV_TID, SIM_TID, DIM_TID, ZIM_TID, TT_TID>
 where
-    Hash: QHashBase + Send + Sync,
+    Hash: QDBHashBase + Send + Sync,
     Hasher: MerkleZeroHasher<Hash> + Send + Sync,
     BM_TID: TIDBase,
     BU_TID: TIDBase,
@@ -1161,7 +1161,7 @@ impl<Hash, Hasher, BM_TID, BU_TID, U64_TID, SI_TID, DI_TID, KIV_TID, SIM_TID, DI
     CoreDatabaseSingleIdMerkleReader<Hash, Hasher, SIM_TID>
     for InMemoryStore<Hash, Hasher, BM_TID, BU_TID, U64_TID, SI_TID, DI_TID, KIV_TID, SIM_TID, DIM_TID, ZIM_TID, TT_TID>
 where
-    Hash: QHashBase + Send + Sync,
+    Hash: QDBHashBase + Send + Sync,
     Hasher: MerkleZeroHasher<Hash> + Send + Sync,
     BM_TID: TIDBase,
     BU_TID: TIDBase,
@@ -1221,7 +1221,7 @@ impl<Hash, Hasher, BM_TID, BU_TID, U64_TID, SI_TID, DI_TID, KIV_TID, SIM_TID, DI
     CoreDatabaseSingleIdMerkleWriter<Hash, Hasher, SIM_TID>
     for InMemoryStore<Hash, Hasher, BM_TID, BU_TID, U64_TID, SI_TID, DI_TID, KIV_TID, SIM_TID, DIM_TID, ZIM_TID, TT_TID>
 where
-    Hash: QHashBase + Send + Sync,
+    Hash: QDBHashBase + Send + Sync,
     Hasher: MerkleZeroHasher<Hash> + Send + Sync,
     BM_TID: TIDBase,
     BU_TID: TIDBase,
@@ -1262,6 +1262,14 @@ where
         }
         Ok(())
     }
+    async fn db_set_single_id_merkle_nodes_from_fast_serialized(
+        &self,
+        table: &SIM_TID,
+        checkpoint_id: u64,
+        nodes: &[u8],
+    ) -> anyhow::Result<()> {
+        todo!("not implemented");
+    }
 }
 
 
@@ -1270,7 +1278,7 @@ impl<Hash, Hasher, BM_TID, BU_TID, U64_TID, SI_TID, DI_TID, KIV_TID, SIM_TID, DI
     CoreDatabaseTagTreeReader<Hash, Hasher, TT_TID>
     for InMemoryStore<Hash, Hasher, BM_TID, BU_TID, U64_TID, SI_TID, DI_TID, KIV_TID, SIM_TID, DIM_TID, ZIM_TID, TT_TID>
 where
-    Hash: QHashBase + Send + Sync,
+    Hash: QDBHashBase + Send + Sync,
     Hasher: MerkleZeroHasher<Hash> + Send + Sync,
     BM_TID: TIDBase,
     BU_TID: TIDBase,
@@ -1342,7 +1350,7 @@ impl<Hash, Hasher, BM_TID, BU_TID, U64_TID, SI_TID, DI_TID, KIV_TID, SIM_TID, DI
     CoreDatabaseTagTreeWriter<Hash, Hasher, TT_TID>
     for InMemoryStore<Hash, Hasher, BM_TID, BU_TID, U64_TID, SI_TID, DI_TID, KIV_TID, SIM_TID, DIM_TID, ZIM_TID, TT_TID>
 where
-    Hash: QHashBase + Send + Sync,
+    Hash: QDBHashBase + Send + Sync,
     Hasher: MerkleZeroHasher<Hash> + Send + Sync,
     BM_TID: TIDBase,
     BU_TID: TIDBase,
@@ -1388,7 +1396,7 @@ impl<Hash, Hasher, BM_TID, BU_TID, U64_TID, SI_TID, DI_TID, KIV_TID, SIM_TID, DI
     CoreDatabaseZeroIdMerkleReader<Hash, Hasher, ZIM_TID>
     for InMemoryStore<Hash, Hasher, BM_TID, BU_TID, U64_TID, SI_TID, DI_TID, KIV_TID, SIM_TID, DIM_TID, ZIM_TID, TT_TID>
 where
-    Hash: QHashBase + Send + Sync,
+    Hash: QDBHashBase + Send + Sync,
     Hasher: MerkleZeroHasher<Hash> + Send + Sync,
     BM_TID: TIDBase,
     BU_TID: TIDBase,
@@ -1442,7 +1450,7 @@ impl<Hash, Hasher, BM_TID, BU_TID, U64_TID, SI_TID, DI_TID, KIV_TID, SIM_TID, DI
     CoreDatabaseZeroIdMerkleWriter<Hash, Hasher, ZIM_TID>
     for InMemoryStore<Hash, Hasher, BM_TID, BU_TID, U64_TID, SI_TID, DI_TID, KIV_TID, SIM_TID, DIM_TID, ZIM_TID, TT_TID>
 where
-    Hash: QHashBase + Send + Sync,
+    Hash: QDBHashBase + Send + Sync,
     Hasher: MerkleZeroHasher<Hash> + Send + Sync,
     BM_TID: TIDBase,
     BU_TID: TIDBase,
@@ -1479,6 +1487,14 @@ where
         }
         Ok(())
     }
+    async fn db_set_zero_id_merkle_nodes_from_fast_serialized(
+        &self,
+        table: &ZIM_TID,
+        checkpoint_id: u64,
+        nodes: &[u8],
+    ) -> anyhow::Result<()> {
+        todo!("not implemented");
+    }
 }
 
 
@@ -1487,7 +1503,7 @@ impl<Hash, Hasher, BM_TID, BU_TID, U64_TID, SI_TID, DI_TID, KIV_TID, SIM_TID, DI
     CoreDatabaseDoubleIdMerkleReader<Hash, Hasher, DIM_TID>
     for InMemoryStore<Hash, Hasher, BM_TID, BU_TID, U64_TID, SI_TID, DI_TID, KIV_TID, SIM_TID, DIM_TID, ZIM_TID, TT_TID>
 where
-    Hash: QHashBase + Send + Sync,
+    Hash: QDBHashBase + Send + Sync,
     Hasher: MerkleZeroHasher<Hash> + Send + Sync,
     BM_TID: TIDBase,
     BU_TID: TIDBase,
@@ -1549,7 +1565,7 @@ impl<Hash, Hasher, BM_TID, BU_TID, U64_TID, SI_TID, DI_TID, KIV_TID, SIM_TID, DI
     CoreDatabaseDoubleIdMerkleWriter<Hash, Hasher, DIM_TID>
     for InMemoryStore<Hash, Hasher, BM_TID, BU_TID, U64_TID, SI_TID, DI_TID, KIV_TID, SIM_TID, DIM_TID, ZIM_TID, TT_TID>
 where
-    Hash: QHashBase + Send + Sync,
+    Hash: QDBHashBase + Send + Sync,
     Hasher: MerkleZeroHasher<Hash> + Send + Sync,
     BM_TID: TIDBase,
     BU_TID: TIDBase,
@@ -1591,6 +1607,15 @@ where
             inner_map.entry(composite_key).or_default().insert(checkpoint_id, node.value);
         }
         Ok(())
+    }
+
+    async fn db_set_double_id_merkle_nodes_from_fast_serialized(
+        &self,
+        table: &DIM_TID,
+        checkpoint_id: u64,
+        nodes: &[u8],
+    ) -> anyhow::Result<()> {
+        todo!("not implemented");
     }
 }
 

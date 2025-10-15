@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "cf_utils",
     "pser",
     "pderive",
     "parth_core",
@@ -30,7 +31,7 @@ syn = { version = "2.0", features = ["full"] }
 proc-macro2 = { version = "1.0", features = ["span-locations"] }
 quote = "1.0"
 
-
+const_format = "0.2.35"
 
 colored = "2"
 serde = { version = "1.0.193", features = ["derive"] }
@@ -94,7 +95,7 @@ tokio-reactor-trait = "2"
 
 futures = "0.3.0"
 chalk = "0.1"
-
+rayon = "1.11.0"
 uuid = { version = "1.0", features = ["serde", "v4", "js"] }
 
 num-traits = "0.2"
@@ -117,10 +118,11 @@ redis = { version = "0.30.0", default-features = false, features = [
 ] }
 bb8-redis = "0.22.0"
 bb8 = "0.9"
-rsmq = { git = "https://github.com/jimzk/rsmq-async-rs", package = "rsmq_async", features = ["break-js-comp", "sync", "tokio"] }
+rsmq = { git = "https://github.com/PsyRepoForks/rsmq-async-rs", package = "rsmq_async", features = ["break-js-comp", "sync", "tokio"] }
 dashmap = "6.1.0"
 parking_lot = "0.12.5"
 # Workspace Packages
+cf_utils = { path = "./cf_utils" }
 
 pser = { path = "./pser" }
 pderive = { path = "./pderive" }

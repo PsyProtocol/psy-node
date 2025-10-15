@@ -7,13 +7,14 @@ version = "0.1.0"
 
 
 [features]
-default = ["std", "parth_core/serialize_rkyv", "parth_core/serialize_speedy", "parth_core/serialize_postcard"]
+default = ["std", "parth_core/serialize_rkyv", "parth_core/serialize_speedy", "parth_core/serialize_postcard", "parallel_rayon"]
 std = ["parth_core/std", "pser/std"]
 serialize_rkyv = ["dep:rkyv","pser/serialize_rkyv", "parth_core/serialize_rkyv"]
 serialize_speedy = ["dep:speedy", "pser/serialize_speedy", "parth_core/serialize_speedy"]
 serialize_postcard = ["dep:postcard", "pser/serialize_postcard", "parth_core/serialize_postcard"]
-
+parallel_rayon = ["dep:rayon"]
 [dependencies]
+rayon = { workspace = true, optional = true }
 postcard = { workspace = true, optional = true }
 rkyv = { workspace = true, optional = true }
 speedy = { workspace = true, optional = true }

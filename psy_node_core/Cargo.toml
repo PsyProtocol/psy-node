@@ -36,6 +36,7 @@ futures = { workspace = true }
 # start local packages
 pser = { workspace = true }
 pderive = { workspace = true }
+cf_utils = { workspace = true }
 parth_core = { workspace = true }
 parth_crypto = { workspace = true }
 parth_common = { workspace = true }

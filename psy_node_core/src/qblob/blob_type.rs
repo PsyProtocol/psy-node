@@ -1,3 +1,4 @@
+use parth_core::data::hash::fast_node_serializer::{QMS_FAST_SERIALIZER_DOUBLE_ID_NODE_SIZE, QMS_FAST_SERIALIZER_SINGLE_ID_NODE_SIZE, QMS_FAST_SERIALIZER_ZERO_ID_NODE_SIZE};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use strum_macros::{Display, FromRepr};
 
@@ -57,5 +58,24 @@ pub const fn is_valid_qblob_merkle_node_batch_type(blob_data_type: QBlobDataType
         ),
         QBlobDataType::GenericDoubleIdMerkleNodeBatch => matches!(tree_type, QBlobMerkleNodeTreeType::UserContractStateTree),
         _ => false,
+    }
+}
+
+pub const fn get_item_size_for_data_type(blob_data_type: QBlobDataType) -> Option<usize> {
+    match blob_data_type {
+        QBlobDataType::GenericZeroIdMerkleNodeBatch => Some(QMS_FAST_SERIALIZER_ZERO_ID_NODE_SIZE),
+        QBlobDataType::GenericSingleIdMerkleNodeBatch => Some(QMS_FAST_SERIALIZER_SINGLE_ID_NODE_SIZE),
+        QBlobDataType::GenericDoubleIdMerkleNodeBatch => Some(QMS_FAST_SERIALIZER_DOUBLE_ID_NODE_SIZE),
+        _ => None,
+    }
+}
+pub const fn get_item_size_for_merkle_tree_type(tree_type: QBlobMerkleNodeTreeType) -> Option<usize> {
+    match tree_type {
+        QBlobMerkleNodeTreeType::GlobalUserTree
+        | QBlobMerkleNodeTreeType::GlobalContractTree
+        | QBlobMerkleNodeTreeType::GlobalUserRegistrationTree => Some(QMS_FAST_SERIALIZER_ZERO_ID_NODE_SIZE),
+        QBlobMerkleNodeTreeType::UserContractTree | QBlobMerkleNodeTreeType::ContractFunctionTree => Some(QMS_FAST_SERIALIZER_SINGLE_ID_NODE_SIZE),
+        QBlobMerkleNodeTreeType::UserContractStateTree => Some(QMS_FAST_SERIALIZER_DOUBLE_ID_NODE_SIZE),
+        _ => None,
     }
 }

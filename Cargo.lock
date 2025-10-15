@@ -314,6 +314,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "cf_utils"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "hex",
+ "hex-literal",
+ "rand 0.8.5",
+]
+
+[[package]]
 name = "cfg-if"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -430,6 +441,26 @@ dependencies = [
  "getrandom 0.2.16",
  "once_cell",
  "tiny-keccak",
+]
+
+[[package]]
+name = "const_format"
+version = "0.2.35"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7faa7469a93a566e9ccc1c73fe783b4a65c274c5ace346038dca9c39fe0030ad"
+dependencies = [
+ "const_format_proc_macros",
+]
+
+[[package]]
+name = "const_format_proc_macros"
+version = "0.2.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d57c2eccfb16dbac1f4e61e206105db5820c9d26c3c472bc17c774259ef7744"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-xid",
 ]
 
 [[package]]
@@ -1560,6 +1591,8 @@ dependencies = [
  "auto_impl",
  "bincode",
  "bytemuck",
+ "cf_utils",
+ "const_format",
  "criterion",
  "hex",
  "hex-literal",
@@ -1649,6 +1682,7 @@ dependencies = [
  "pser",
  "psy_node_core",
  "rand 0.8.5",
+ "rayon",
  "rkyv",
  "scylla",
  "serde",
@@ -1929,6 +1963,7 @@ dependencies = [
  "async-trait",
  "auto_impl",
  "bincode",
+ "cf_utils",
  "hex",
  "hex-literal",
  "parth_core",
@@ -2019,6 +2054,7 @@ dependencies = [
  "async-trait",
  "auto_impl",
  "bincode",
+ "cf_utils",
  "futures",
  "hex",
  "hex-literal",
@@ -2448,7 +2484,7 @@ dependencies = [
 [[package]]
 name = "rsmq_async"
 version = "15.0.0"
-source = "git+https://github.com/jimzk/rsmq-async-rs#49b317094585e75dcdb619d204b6cf19010049fb"
+source = "git+https://github.com/PsyRepoForks/rsmq-async-rs#49b317094585e75dcdb619d204b6cf19010049fb"
 dependencies = [
  "bb8",
  "lazy_static",
@@ -3306,6 +3342,12 @@ name = "unicode-ident"
 version = "1.0.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f63a545481291138910575129486daeaf8ac54aee4387fe7906919f7830c7d9d"
+
+[[package]]
+name = "unicode-xid"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
 
 [[package]]
 name = "unroll"

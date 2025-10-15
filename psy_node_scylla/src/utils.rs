@@ -1,3 +1,5 @@
+use scylla::{client::session::Session, statement::{batch::Batch, prepared::PreparedStatement}};
+
 
 
 pub const fn u64_to_i64_exact(num: u64) -> i64 {
@@ -27,6 +29,44 @@ pub const fn convert_i64_to_checkpoint_id(checkpoint_id: i64) -> u64 {
     } else {
         checkpoint_id as u64
     }
+}
+
+
+pub fn calc_best_batch_size(num_nodes: usize, batch_sizes: &[usize]) -> usize {
+
+    let batch_size = batch_sizes
+        .iter()
+        .find(|&&size| num_nodes >= size && (num_nodes % size == 0 || num_nodes / size >= 1))
+        .unwrap_or(&32);
+
+    *batch_size
+}
+/*
+// commented out because we switched to using PreparedStatement directly, I think this is ok
+pub async fn generate_batch_prepared_statement(session: &Session, statement: &Statement, batch_size: usize) -> anyhow::Result<Batch> {
+    if batch_size == 0 {
+        anyhow::bail!("Batch size must be greater than 0");
+    }
+    let mut batch = Batch::default();
+    for _ in 0..batch_size {
+        batch.append_statement(statement.clone());
+    }
+
+    let prepared = session.prepare_batch(&batch).await?;
+    Ok(prepared)
+}
+*/
+pub async fn generate_batch_prepared_statement(session: &Session, statement: &PreparedStatement, batch_size: usize) -> anyhow::Result<Batch> {
+    if batch_size == 0 {
+        anyhow::bail!("Batch size must be greater than 0");
+    }
+    let mut batch = Batch::default();
+    for _ in 0..batch_size {
+        batch.append_statement(statement.clone());
+    }
+
+    let prepared = session.prepare_batch(&batch).await?;
+    Ok(prepared)
 }
 
 #[cfg(test)]
