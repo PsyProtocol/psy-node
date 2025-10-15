@@ -553,6 +553,89 @@ impl ScyllaDoubleMerkleNodesPreparedStatements {
     }
 }
 
+
+impl ScyllaDoubleMerkleNodesPreparedStatements {
+
+    async fn set_double_id_merkle_nodes_batch_fast_serialize_with_batch_size_internal<Hash: QHash256Base>(
+        &self,
+        session: &Session,
+        checkpoint_id: u64,
+        data: &[u8],
+        batch_size: usize,
+    ) -> anyhow::Result<()> {
+        let checkpoint_i64 = convert_checkpoint_id_to_i64(checkpoint_id);
+        if data.len() % QMS_FAST_SERIALIZER_DOUBLE_ID_NODE_SIZE != 0 {
+            anyhow::bail!("Data length is not a multiple of double id node size");
+        }
+        let num_nodes = data.len() / QMS_FAST_SERIALIZER_DOUBLE_ID_NODE_SIZE;
+
+        if num_nodes == 0 {
+            return Ok(());
+        }
+
+        const CONCURRENCY_LIMIT: usize = 64; // Tuned for typical Scylla clusters
+
+        // Parallel deserialization using rayon
+        let values: Vec<(i64, i64, i8, i64, i64, [u8; 32])> = data
+            .par_chunks(QMS_FAST_SERIALIZER_DOUBLE_ID_NODE_SIZE)
+            .map(|slice| QMerkleStoreFastDoubleNodeSerializer::deserialize_double_id_node_signed_insert_tuple::<Hash>(slice, checkpoint_i64))
+            .collect();
+
+        if batch_size != 64 && batch_size != 128 && batch_size != 256 {
+            anyhow::bail!("Invalid batch size, must be one of 64, 128, or 256");
+        }
+        // Map batch size to pre-prepared batch
+        let batch_prepared = match batch_size {
+            //512 => &self.insert_batch_serialized_512_prepared,
+            256 => &self.insert_batch_serialized_256_prepared,
+            128 => &self.insert_batch_serialized_128_prepared,
+            64 => &self.insert_batch_serialized_64_prepared,
+            //32 => &self.insert_batch_serialized_32_prepared,
+            _ => unreachable!(),
+        };
+
+        // Process batches concurrently
+        let chunks = values.chunks(batch_size);
+        stream::iter(chunks)
+            .map(anyhow::Ok)
+            .try_for_each_concurrent(CONCURRENCY_LIMIT, |chunk| {
+                let batch_prepared = batch_prepared.clone();
+                async move {
+                    if chunk.len() == batch_size {
+                        session.batch(&batch_prepared, chunk).await.context("Batch insert failed")?;
+                    } else {
+                        let mut batch = Batch::default();
+                        for _ in 0..chunk.len() {
+                            batch.append_statement(self.insert_1_statement.clone());
+                        }
+                        session.batch(&batch, chunk).await.context("Partial batch insert failed")?;
+                    }
+                    Ok(())
+                }
+            })
+            .await?;
+
+        Ok(())
+    }
+    pub async fn set_double_id_merkle_nodes_batch_fast_serialize<Hash: QHash256Base>(
+        &self,
+        session: &Session,
+        checkpoint_id: u64,
+        data: &[u8],
+    ) -> anyhow::Result<()> {
+        let num_nodes = data.len() / QMS_FAST_SERIALIZER_DOUBLE_ID_NODE_SIZE;
+        
+        self.set_double_id_merkle_nodes_batch_fast_serialize_with_batch_size_internal::<Hash>(
+            session,
+            checkpoint_id,
+            data,
+            calc_best_batch_size(num_nodes, &[256, 128, 64]),
+        )
+        .await
+    }
+}
+
+
 impl ScyllaDoubleMerkleNodesPreparedStatements {
     // Add this to your imports
 

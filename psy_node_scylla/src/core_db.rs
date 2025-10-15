@@ -582,7 +582,7 @@ impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sy
         data: &[u8],
     ) -> anyhow::Result<()> {
         table
-            .set_double_id_merkle_nodes_batch_256_from_fast_serialized_data::<Hash>(&self.session, checkpoint_id, data)
+            .set_double_id_merkle_nodes_batch_fast_serialize::<Hash>(&self.session, checkpoint_id, data)
             .await
     }
 }
