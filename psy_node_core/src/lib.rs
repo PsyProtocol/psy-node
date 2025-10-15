@@ -5,3 +5,4 @@ pub mod queue;
 pub mod psy_core_db;
 pub mod psy_temp_db;
 pub mod qblob;
+pub mod processor_builders;

@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 
 use rand::Rng;
 
-use crate::{data::serializable::{QPDSerializable, QPDSerializableFixed}, utils::QPGenRandom};
+use crate::{data::serializable::{FastFixedSerializable, QPDSerializable, QPDSerializableFixed}, protocol::core_types::Q256BitHash, utils::QPGenRandom};
 pub const JOB_ID_EMPTY_REWARD_PATH_INFO: u64 = 0xFFFF_FFFF_FFFF_FFFFu64;
 
 #[pderive::serialize_copy_default_no_ord]
@@ -269,6 +269,49 @@ impl QPDSerializableFixed for SimpleMerkleNodeKey {
     }
 }
 
+
+impl FastFixedSerializable<9> for SimpleMerkleNodeKey {
+    fn ffs_from_owned_bytes(data: [u8; 9]) -> Self {
+        Self {
+            level: data[0],
+            index: u64::from_le_bytes(data[1..9].try_into().unwrap()),
+        }
+    }
+
+    fn ffs_from_slice_or_panic(data: &[u8]) -> Self {
+        Self {
+            level: data[0],
+            index: u64::from_le_bytes(data[1..9].try_into().unwrap()),
+        }
+    }
+
+    fn ffs_try_from_slice(data: &[u8]) -> anyhow::Result<Self> {
+        if data.len() != 9 {
+            anyhow::bail!("invalid length for SimpleMerkleNodeKey, expected 9 bytes, got {}",data.len());
+        }
+        Ok(Self {
+            level: data[0],
+            index: u64::from_le_bytes(data[1..9].try_into().unwrap()),
+        })
+    }
+
+    fn ffs_to_bytes(&self) -> [u8; 9] {
+        let mut data: [u8; 9] = [0u8; 9];
+        data[0] = self.level;
+
+        data[1..9].copy_from_slice(&self.index.to_le_bytes());
+        data
+    }
+
+    fn ffs_into_bytes(self) -> [u8; 9] {
+        let mut data: [u8; 9] = [0u8; 9];
+        data[0] = self.level;
+
+        data[1..9].copy_from_slice(&self.index.to_le_bytes());
+        data
+    }
+}
+
 #[pderive::serialize_copy_no_ord]
 pub struct SimpleMerkleNode<Hash> {
     pub key: SimpleMerkleNodeKey,
@@ -308,6 +351,56 @@ impl<Hash: Ord> Ord for SimpleMerkleNode<Hash> {
             self.key.index.cmp(&other.key.index)
         } else {
             self.value.cmp(&other.value)
+        }
+    }
+}
+
+
+impl<Hash: Q256BitHash> FastFixedSerializable<41> for SimpleMerkleNode<Hash> {
+    fn ffs_from_owned_bytes(data: [u8; 41]) -> Self {
+        Self {
+            key: SimpleMerkleNodeKey::ffs_from_owned_bytes(data[0..9].try_into().unwrap()),
+            value: Hash::from_ref_32bytes(data[9..41].try_into().unwrap()),
+        }
+    }
+
+    fn ffs_from_slice_or_panic(data: &[u8]) -> Self {
+        Self {
+            key: SimpleMerkleNodeKey::ffs_from_slice_or_panic(&data[0..9]),
+            value: Hash::from_ref_32bytes(data[9..41].try_into().unwrap()),
+        }
+    }
+
+    fn ffs_try_from_slice(data: &[u8]) -> anyhow::Result<Self> {
+        if data.len() != 41 {
+            anyhow::bail!("invalid length for SimpleMerkleNode, expected 41 bytes, got {}",data.len());
+        }
+        Ok(Self {
+            key: SimpleMerkleNodeKey::ffs_try_from_slice(&data[0..9])?,
+            value: Hash::from_slice_32bytes(&data[9..41])?,
+        })
+    }
+
+    fn ffs_to_bytes(&self) -> [u8; 41] {
+        let mut data: [u8; 41] = [0u8; 41];
+        data[0..9].copy_from_slice(&self.key.ffs_to_bytes());
+        data[9..41].copy_from_slice(&self.value.into_owned_32bytes());
+        data
+    }
+
+    fn ffs_into_bytes(self) -> [u8; 41] {
+        let mut data: [u8; 41] = [0u8; 41];
+        data[0..9].copy_from_slice(&self.key.ffs_into_bytes());
+        data[9..41].copy_from_slice(&self.value.into_owned_32bytes());
+        data
+    }
+}
+
+impl<Hash: QPGenRandom> QPGenRandom for SimpleMerkleNode<Hash> {
+    fn qp_rand_gen() -> Self where Self: Sized {
+        Self {
+            key: SimpleMerkleNodeKey::qp_rand_gen(),
+            value: Hash::qp_rand_gen(),
         }
     }
 }
