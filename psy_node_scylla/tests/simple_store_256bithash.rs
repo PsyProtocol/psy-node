@@ -32,7 +32,7 @@ use parth_node_scylla::{
     },
 };
 use pser::{QBytesDeserialize, QBytesSerialize};
-use psy_node_core::{qblob::{data_views::double_merkle_node_batch::QBlobDoubleMerkleNodeBatchDataView, structs::common::{blob_metadata_header::QBlobWriterContextMetadataHeader, tree_node_batch_header::QBLOB_TREE_NODE_BATCH_HEADER_SIZE}}, store::traits::{core_db::{CoreDatabaseSingleIdMerkleReader, CoreDatabaseStore, CoreDatabaseTagTreeStore}, helpers::{db_helper_double_id_merkle_node_simple_set_leaves, db_helper_select_double_id_merkle_proof_max_checkpoint, db_helper_select_single_id_merkle_proof_max_checkpoint, db_helper_select_zero_id_merkle_proof_max_checkpoint, db_helper_single_id_merkle_node_simple_set_leaves, db_helper_zero_id_merkle_node_simple_set_leaves}}};
+use psy_node_core::{qblob::{data_views::double_merkle_node_batch::QBlobDoubleMerkleNodeBatchDataView, structs::common::{blob_metadata_header::QBlobWriterContextMetadataHeader, tree_node_batch_header::QBLOB_TREE_NODE_BATCH_HEADER_SIZE}}, store::traits::{core_db::{CoreDatabaseSingleIdMerkleReader, CoreDatabaseStore, CoreDatabaseTagTreeStore}, helpers::{db_helper_double_id_merkle_node_simple_set_leaves, db_helper_double_id_merkle_node_simple_set_leaves_fast_serialize, db_helper_select_double_id_merkle_proof_max_checkpoint, db_helper_select_single_id_merkle_proof_max_checkpoint, db_helper_select_zero_id_merkle_proof_max_checkpoint, db_helper_single_id_merkle_node_simple_set_leaves, db_helper_single_id_merkle_node_simple_set_leaves_fast_serialize, db_helper_zero_id_merkle_node_simple_set_leaves, db_helper_zero_id_merkle_node_simple_set_leaves_fast_serialize}}};
 
 pub trait CreateRandomTestDataItem: Sized {
     fn create_random_test_data_item() -> Self;
@@ -2086,7 +2086,7 @@ impl<
             }
             let leaf_values = leaves.iter().map(|node| node.value).collect::<Vec<_>>();
             let leaf_keys = leaves.iter().map(|node| node.key).collect::<Vec<_>>();
-            let dmps = db_helper_single_id_merkle_node_simple_set_leaves::<Hash, Hasher, SingleIdMerkleTableIdentifier,_>(&self.store, table, checkpoint_id, tree_id, tree_height, 0, 9999, leaves).await?;
+            let dmps = db_helper_single_id_merkle_node_simple_set_leaves_fast_serialize::<Hash, Hasher, SingleIdMerkleTableIdentifier,_>(&self.store, table, checkpoint_id, tree_id, tree_height, 0, 9999, leaves).await?;
             assert!(dmps.len() == leaves.len(), "Number of DeltaMerkleProofs must match number of inserted leaves");
             let selected_leaf_values = self.store.db_select_many_single_id_merkle_nodes_max_checkpoint(table, checkpoint_id, tree_id, tree_height, &leaf_keys).await?;
             assert!(selected_leaf_values.len() == leaf_values.len(), "Selected leaf values length must match inserted leaf values length");
@@ -3133,7 +3133,7 @@ impl<
         }
         let leaf_values = leaves.iter().map(|node| node.value).collect::<Vec<_>>();
         let leaf_keys = leaves.iter().map(|node: &SimpleMerkleNode<Hash>| node.key).collect::<Vec<_>>();
-        let dmps = db_helper_double_id_merkle_node_simple_set_leaves::<Hash, Hasher, DoubleIdMerkleTableIdentifier,_>(&self.store, table, checkpoint_id, tree_id, tree_sub_id, tree_height, 0, 9999, leaves).await?;
+        let dmps = db_helper_double_id_merkle_node_simple_set_leaves_fast_serialize::<Hash, Hasher, DoubleIdMerkleTableIdentifier,_>(&self.store, table, checkpoint_id, tree_id, tree_sub_id, tree_height, 0, 9999, leaves).await?;
         assert!(dmps.len() == leaves.len(), "Number of DeltaMerkleProofs must match number of inserted leaves");
         let selected_leaf_values = self.store.db_select_many_double_id_merkle_nodes_max_checkpoint(table, checkpoint_id, tree_id, tree_sub_id, tree_height, &leaf_keys).await?;
         assert!(selected_leaf_values.len() == leaf_values.len(), "Selected leaf values length must match inserted leaf values length");
@@ -3466,7 +3466,7 @@ impl<
         }
         let leaf_values = leaves.iter().map(|node| node.value).collect::<Vec<_>>();
         let leaf_keys = leaves.iter().map(|node| node.key.clone()).collect::<Vec<_>>();
-        let dmps = db_helper_zero_id_merkle_node_simple_set_leaves::<Hash, Hasher, ZeroIdMerkleTableIdentifier,_>(&self.store, table, checkpoint_id, 0, 9999, leaves).await?;
+        let dmps = db_helper_zero_id_merkle_node_simple_set_leaves_fast_serialize::<Hash, Hasher, ZeroIdMerkleTableIdentifier,_>(&self.store, table, checkpoint_id, 0, 9999, leaves).await?;
         assert!(dmps.len() == leaves.len(), "Number of DeltaMerkleProofs must match number of inserted leaves");
         let selected_leaf_values = self.store.db_select_many_zero_id_merkle_nodes_max_checkpoint(table, checkpoint_id, &leaf_keys).await?;
         assert!(selected_leaf_values.len() == leaf_values.len(), "Selected leaf values length must match inserted leaf values length");
