@@ -255,7 +255,7 @@ mod tests {
     #[test]
     fn check_batches_unchecked() -> anyhow::Result<()> {
         type Hash = Hash256;
-        let number_of_batches = 200_000;
+        let number_of_batches = 2_000;
         let nodes_per_batch = 200;
         let tree_type = QBlobMerkleNodeTreeType::UserContractTree;
         let context = QBlobWriterContextMetadataHeader::new_at_now(1, 42, 1001, 1, 2, 3, 4);

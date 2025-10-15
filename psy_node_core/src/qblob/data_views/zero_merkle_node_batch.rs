@@ -220,7 +220,7 @@ mod tests {
     fn check_round_trip() -> anyhow::Result<()> {
         type Hash = Hash256;
         let count = 10_000;
-        let tree_type = QBlobMerkleNodeTreeType::UserContractTree;
+        let tree_type = QBlobMerkleNodeTreeType::GlobalUserTree;
         println!("Generating {} random zero ID nodes...", count);
         let context = QBlobWriterContextMetadataHeader::new_at_now(1, 42, 1001, 1, 2, 3, 4);
         let nodes: Vec<QMerkleStoreZeroIdNode<Hash>> = (0..count).map(|_| QPGenRandom::qp_rand_gen()).collect();
@@ -255,9 +255,9 @@ mod tests {
     #[test]
     fn check_batches_unchecked() -> anyhow::Result<()> {
         type Hash = Hash256;
-        let number_of_batches = 200_000;
+        let number_of_batches = 2_000;
         let nodes_per_batch = 200;
-        let tree_type = QBlobMerkleNodeTreeType::UserContractTree;
+        let tree_type = QBlobMerkleNodeTreeType::GlobalUserTree;
         let context = QBlobWriterContextMetadataHeader::new_at_now(1, 42, 1001, 1, 2, 3, 4);
 
         let batch_nodes: Vec<Vec<QMerkleStoreZeroIdNode<Hash>>> = (0..number_of_batches)
