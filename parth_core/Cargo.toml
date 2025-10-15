@@ -14,7 +14,7 @@ ptypes_u64_hash256 = []
 rand = ["dep:rand"]
 parth_node = []
 serialize_rkyv = ["dep:rkyv", "plonky2?/serialize_rkyv"]
-serialize_speedy = ["dep:speedy", "plonky2?/serialize_rkyv"]
+serialize_speedy = ["dep:speedy", "plonky2?/serialize_speedy"]
 serialize_postcard = ["dep:postcard"]
 serialize_bytemuck = ["dep:bytemuck", "plonky2/serialize_bytemuck"]
 

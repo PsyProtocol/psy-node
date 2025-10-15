@@ -13,25 +13,7 @@ use speedy::{Readable, Writable};
 // rkyv = { version = "0.7", features = ["derive", "validation"] }
 // or a similar combination for your specific rkyv version.
 
-#[derive(
-    Debug,
-    Copy,
-    Clone,
-    PartialEq,
-    Eq,
-    Hash,
-    PartialOrd,
-    Ord,
-    serde::Serialize,
-    serde::Deserialize,
-    Default,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-    speedy::Readable,
-    speedy::Writable,
-)]
-
+#[pderive::serialize_copy_default]
 pub struct QMerkleStoreSingleIdKey {
     pub tree_id: u64, // 8
     pub level: u8,    // 9
@@ -125,25 +107,8 @@ impl QPGenRandom for QMerkleStoreSingleIdKey {
     }
 }
 
-#[derive(
-    Debug,
-    Copy,
-    Clone,
-    PartialEq,
-    Eq,
-    Hash,
-    PartialOrd,
-    Ord,
-    serde::Serialize,
-    serde::Deserialize,
-    Default,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-    speedy::Readable,
-    speedy::Writable,
-)]
 
+#[pderive::serialize_copy_default]
 pub struct QMerkleStoreSingleIdNode<Hash> {
     pub key: QMerkleStoreSingleIdKey,
     pub hash: Hash,
@@ -199,25 +164,8 @@ impl<Hash: Q256BitHash> FastFixedSerializable<49> for QMerkleStoreSingleIdNode<H
     }
 }
 
-#[derive(
-    Debug,
-    Copy,
-    Clone,
-    PartialEq,
-    Eq,
-    Hash,
-    PartialOrd,
-    Ord,
-    serde::Serialize,
-    serde::Deserialize,
-    Default,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-    speedy::Readable,
-    speedy::Writable,
-)]
 
+#[pderive::serialize_copy_default]
 pub struct QMerkleStoreDoubleIdKey {
     pub tree_id: u64,     // 8
     pub tree_sub_id: u64, // 16
@@ -319,24 +267,8 @@ impl QPDSerializableFixed for QMerkleStoreDoubleIdKey {
     }
 }
 
-#[derive(
-    Debug,
-    Copy,
-    Clone,
-    PartialEq,
-    Eq,
-    Hash,
-    PartialOrd,
-    Ord,
-    serde::Serialize,
-    serde::Deserialize,
-    Default,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-    speedy::Readable,
-    speedy::Writable,
-)]
+
+#[pderive::serialize_copy_hash]
 
 pub struct QMerkleStoreDoubleIdNode<Hash> {
     pub key: QMerkleStoreDoubleIdKey,

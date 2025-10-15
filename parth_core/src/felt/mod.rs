@@ -9,8 +9,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use ts_rs::TS;
 
 use crate::{
-    generic_traits::QNamedType,
-    utils::QPGenRandom,
+    data::maybe_serialization::MaybeSpeedy, generic_traits::QNamedType, utils::QPGenRandom
 };
 pub trait ToU64Value {
     fn to_u64_value(&self) -> u64;
@@ -101,7 +100,8 @@ impl<
             + FromPrimitiveValuesFelt
             + SimpleRandFelt
             + QPGenRandom
-            + QNamedType,
+            + QNamedType
+            + MaybeSpeedy,
     > QFelt for T
 {
 }

@@ -2,7 +2,7 @@ use std::{fmt::Display, str::FromStr};
 
 use anyhow::ensure;
 use ts_rs::TS;
-use crate::{crypto::hash::traits::{FromU64x4, HashTo4Felts, RandomHash, ToU64x4, ZeroableHash}, data::{hash::hash256::Hash256, serializable::{QPDSerializable, QPDSerializableFixed}}, felt::{QFelt64, ToQFelts}, generic_traits::QNamedType, protocol::core_types::{Q256BitHash, QHashBase}, utils::QPGenRandom};
+use crate::{crypto::hash::traits::{FromU64x4, HashTo4Felts, RandomHash, ToU64x4, ZeroableHash}, data::{hash::hash256::Hash256, maybe_serialization::MaybeSpeedy, serializable::{QPDSerializable, QPDSerializableFixed}}, felt::{QFelt64, ToQFelts}, generic_traits::QNamedType, protocol::core_types::{Q256BitHash, QHashBase}, utils::QPGenRandom};
 use plonky2::{
     field::{
         goldilocks_field::GoldilocksField,
@@ -16,8 +16,9 @@ use serde_with::serde_as;
 
 #[derive(Clone, Debug, PartialEq, Eq, Copy, Hash, TS)]
 #[cfg_attr(feature = "serialize_bytemuck", derive(bytemuck::Pod, bytemuck::Zeroable))]
-#[pderive::non_serde_serialize]
-#[ts(export, concrete(F = GoldilocksField))]
+        #[cfg_attr(feature = "serialize_rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
+
+        #[ts(export, concrete(F = GoldilocksField))]
 #[repr(transparent)]
 pub struct QHashOut<F: Field>(pub HashOut<F>);
 
@@ -426,8 +427,48 @@ impl<F: RichField + QFelt64> QNamedType for QHashOut<F> {
     }
 }
 
-impl<F: RichField + QFelt64> QHashBase for QHashOut<F> {}
+#[cfg(feature = "serialize_speedy")]
+use speedy::{Readable, Writable, LittleEndian, Context, Reader, Writer};
 
+// ... (Your existing imports and code remain unchanged)
+
+
+// Updated speedy implementations for QHashOut<F>
+#[cfg(feature = "serialize_speedy")]
+impl<'a, F: Field> Readable<'a, LittleEndian> for QHashOut<F>
+where
+    F: for<'b> Readable<'b, LittleEndian> + Writable<LittleEndian>,
+{
+    fn read_from<R: Reader<'a, LittleEndian>>(reader: &mut R) -> Result<Self, speedy::Error> {
+        let elements = [
+            F::read_from(reader)?,
+            F::read_from(reader)?,
+            F::read_from(reader)?,
+            F::read_from(reader)?,
+        ];
+        Ok(QHashOut(HashOut { elements }))
+    }
+}
+
+#[cfg(feature = "serialize_speedy")]
+impl<F: Writable<LittleEndian> + Field> Writable<LittleEndian> for QHashOut<F> {
+    fn write_to<T: ?Sized + Writer<LittleEndian>>(&self, writer: &mut T) -> Result<(), speedy::Error> {
+        for element in self.0.elements.iter() {
+            element.write_to(writer)?;
+        }
+        Ok(())
+    }
+}
+
+// ... (Your existing code for QHashOut<F>, Serialize, Deserialize, QPDSerializable, etc., remains unchanged)
+
+// QHashBase implementation (unchanged)
+
+#[cfg(feature = "serialize_speedy")]
+impl<F: RichField + QFelt64 + MaybeSpeedy + for<'b> Readable<'b, LittleEndian>> QHashBase for QHashOut<F> {}
+
+#[cfg(not(feature = "serialize_speedy"))]
+impl<F: RichField + QFelt64 + MaybeSpeedy> QHashBase for QHashOut<F> {}
 #[cfg(test)]
 mod tests {
     use crate::{crypto::hash::traits::{FieldQHasher, MerkleHasher}, pgoldilocks::PoseidonHasher};

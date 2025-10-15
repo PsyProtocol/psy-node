@@ -6,6 +6,7 @@ use pser::{QBytesSerialize, QBytesDeserialize};
 use crate::v1::qdata::contract::PQEDContractLeaf;
 
 
+
 #[pderive::serialize_clone_f_hash_ts]
 #[ts(export, concrete(F = parth_core::PF, Hash = parth_core::PHash), rename = "QEDContractInclusionProof")]
 pub struct PQEDContractInclusionProof<F, Hash> {

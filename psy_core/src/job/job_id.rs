@@ -8,18 +8,7 @@ use strum_macros::{Display, AsRefStr};
 use ts_rs::TS;
 #[derive(TS)]
 #[ts(export)]
-#[derive(
-    Serialize_repr,
-    Deserialize_repr,
-    PartialEq,
-    Debug,
-    Clone,
-    Copy,
-    Eq,
-    Hash,
-    PartialOrd,
-    Ord,
-)]
+#[pderive::serialize_enum_repr_strum]
 #[repr(u32)]
 pub enum QWorkerMode {
     All = 0,
@@ -54,16 +43,7 @@ impl TryFrom<u32> for QWorkerMode {
             _ => Err(anyhow::format_err!("Invalid QWorkerMode value: {}", value)),
         }
     }
-}
 
-impl ToString for QWorkerMode {
-    fn to_string(&self) -> String {
-        match *self {
-            QWorkerMode::All => "all".to_string(),
-            QWorkerMode::NoGroth16 => "no-groth16".to_string(),
-            QWorkerMode::OnlyGroth16 => "only-groth16".to_string(),
-        }
-    }
 }
 
 #[derive(Serialize_repr, Deserialize_repr, PartialEq, Debug, Clone, Copy, Eq, Hash, PartialOrd, Ord)]
@@ -78,7 +58,7 @@ pub enum QCircuitCommonGatesType {
 }
 #[derive(TS)]
 #[ts(export)]
-#[derive(Serialize_repr, Deserialize_repr, PartialEq, Debug, Clone, Copy, Eq, Hash, PartialOrd, Ord)]
+#[pderive::serialize_enum_repr_strum]
 #[repr(u8)]
 pub enum QJobTopic {
     GenerateStandardProof = 0,
@@ -120,7 +100,7 @@ impl TryFrom<u8> for QJobTopic {
 }
 #[derive(TS)]
 #[ts(export)]
-#[derive(Serialize_repr, Deserialize_repr, PartialEq, Debug, Clone, Copy, Eq, Hash, PartialOrd, Ord)]
+#[pderive::serialize_enum_repr_strum]
 #[repr(u8)]
 pub enum ProvingJobDataType {
     InputWitness = 0,
@@ -152,7 +132,7 @@ impl From<ProvingJobDataType> for u8 {
 }
 #[derive(TS)]
 #[ts(export)]
-#[derive(Serialize_repr, Deserialize_repr, PartialEq, Debug, Clone, Copy, Eq, Hash, PartialOrd, Ord, Display, AsRefStr)]
+#[pderive::serialize_enum_repr_strum]
 #[repr(u8)]
 pub enum ProvingJobCircuitType {
     AppendUserRegistrationTree = 0,
@@ -371,9 +351,7 @@ impl QProvingJobDataIDSerializedWrapped {
     }
 }
 
-#[derive(Serialize, Deserialize, PartialEq, Debug, Clone, Copy, Eq, Hash, PartialOrd, Ord)]
-#[derive(TS)]
-#[ts(export)]
+#[pderive::serialize_copy_ts_export]
 pub struct QProvingJobDataID {
     pub topic: QJobTopic,
     pub goal_id: u64,

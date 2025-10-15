@@ -5,3 +5,5 @@ pub mod db;
 pub mod fixed_serializable;
 pub mod queue;
 pub mod job_serialized;
+pub mod buffer_writable;
+pub mod maybe_serialization;

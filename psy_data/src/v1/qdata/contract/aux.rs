@@ -1,79 +1,9 @@
 use parth_common::memory_stores::simple_memory_merkle_store::SimpleMemoryMerkleStore;
-use parth_core::{crypto::hash::traits::{FieldQHasher, MerkleZeroHasher, QFieldHashable}, data::serializable::QPDSerializable, felt::{QFelt, QFelt64, QFeltSized, ToQFelts}, impl_qpd_serialize_params, impl_qpq_serialize_bincode, protocol::core_types::{QFHashBase, QHashBase}};
+use parth_core::{crypto::hash::traits::{FieldQHasher, MerkleZeroHasher, QFieldHashable}, data::serializable::{FastFixedSerializable, QPDSerializable}, felt::{QFelt, QFelt64, QFeltSized, ToQFelts}, impl_qpd_serialize_params, impl_qpq_serialize_bincode, protocol::core_types::{QFHashBase, QHashBase}};
 use serde::Serialize;
 use ts_rs::TS;
 use pser::{QBytesDeserialize, QBytesSerialize};
 
-
-#[pderive::serialize_copy_f_hash_ts]
-#[ts(export, concrete(F = parth_core::PF, Hash = parth_core::PHash), rename = "QEDContractLeaf")]
-pub struct PQEDContractLeaf<F, Hash> {
-    pub deployer: Hash,
-    pub function_tree_root: Hash,
-    pub state_tree_height: F,
-}
-impl_qpd_serialize_params!(
-    PQEDContractLeaf,
-    { F: QFelt, Hash: QHashBase } => { F, Hash }
-);
-
-impl<F: QFelt, Hash: QHashBase> QFeltSized for PQEDContractLeaf<F, Hash> {
-    fn q_felt_size() -> usize {
-        9
-    }
-}
-impl<F: QFelt64, Hash: QFHashBase<F>> ToQFelts<F> for PQEDContractLeaf<F, Hash> {
-    fn to_qfelts(&self) -> Vec<F> {
-        let deployer = self.deployer.to_4_felts();
-        let function_tree_root = self.function_tree_root.to_4_felts();
-
-        vec![
-            deployer[0],
-            deployer[1],
-            deployer[2],
-            deployer[3],
-            function_tree_root[0],
-            function_tree_root[1],
-            function_tree_root[2],
-            function_tree_root[3],
-            self.state_tree_height,
-        ]
-    }
-
-    fn from_qfelts(felts: &[F]) -> Self {
-        if felts.len() != 9 {
-            panic!("Invalid number of elements for QEDContractLeaf");
-        }
-        let deployer = Hash::from_4_felts_slice(&felts[0..4]);
-        let function_tree_root = Hash::from_4_felts_slice(&felts[4..8]);
-        let state_tree_height = felts[8];
-        PQEDContractLeaf {
-            deployer,
-            function_tree_root,
-            state_tree_height,
-        }
-    }
-}
-
-
-impl<F: QFelt64, Hash: QFHashBase<F>> QFieldHashable<F, Hash> for PQEDContractLeaf<F, Hash> {
-    fn qfhash<H: FieldQHasher<F, Hash>>(&self) -> Hash {
-        let deployer = self.deployer.to_4_felts();
-        let function_tree_root = self.function_tree_root.to_4_felts();
-
-        H::q_hash_many(&[
-            deployer[0],
-            deployer[1],
-            deployer[2],
-            deployer[3],
-            function_tree_root[0],
-            function_tree_root[1],
-            function_tree_root[2],
-            function_tree_root[3],
-            self.state_tree_height,
-        ])
-    }
-}
 #[pderive::serialize_clone]
 #[derive(TS)]
 #[ts(export)]
