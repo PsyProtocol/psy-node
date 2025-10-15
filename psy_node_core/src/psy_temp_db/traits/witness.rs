@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use auto_impl::auto_impl;
-use parth_core::{data::serializable::QProofWitnessSerializable, node::realm_identifier::QRealmIdentifier, QJobIdBase, QJobIdSerialized};
+use parth_core::{data::serializable::QProofWitnessSerializable, node::realm_identifier::QRealmIdentifier, QJobIdBase};
 
 
 

@@ -2,7 +2,7 @@
 use plonky2::field::{goldilocks_field::GoldilocksField, types::{Field, PrimeField64, Sample}};
 
 use super::qhashout::QHashOut;
-use crate::{felt::{FromPrimitiveValuesFelt, SimpleRandFelt, ToU64Value, ZeroableFelt}, generic_traits::{QNamedType, QStaticNamedType}, utils::QPGenRandom};
+use crate::{felt::{FromPrimitiveValuesFelt, SimpleRandFelt, ToU64Value, ZeroableFelt}, generic_traits::QStaticNamedType, utils::QPGenRandom};
 pub type PGoldilocksHash = QHashOut<GoldilocksField>;
 pub type PGoldilocksFelt = GoldilocksField;
 

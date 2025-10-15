@@ -9,7 +9,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use ts_rs::TS;
 
 use crate::{
-    generic_traits::{QNamedType, QStaticNamedType},
+    generic_traits::QNamedType,
     utils::QPGenRandom,
 };
 pub trait ToU64Value {

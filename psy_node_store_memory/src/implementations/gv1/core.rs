@@ -1,5 +1,3 @@
-//https://aistudio.google.com/prompts/1nX4AInNPB95SSRStlCvRIqs0AEoVTgWN?_gl=1*m14tst*_ga*MTQ4NDUwODIzMi4xNzQyNjUzNzMx*_ga_P1DBVKWT6V*MTc0MjY1MzczMC4xLjAuMTc0MjY1MzczMy41Ny4wLjk4OTg3NDExNg..
-
 use async_trait::async_trait;
 use dashmap::DashMap;
 use parth_core::{
@@ -17,7 +15,7 @@ use parth_core::{
         hash::merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey},
         serializable::QPDPair,
     },
-    protocol::core_types::{QDBHashBase, QHashBase},
+    protocol::core_types::QDBHashBase,
 };
 use parking_lot::RwLock;
 use serde::{de::DeserializeOwned, Serialize};

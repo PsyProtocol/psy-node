@@ -1,5 +1,3 @@
-use crate::qblob::blob_type::QBlobDataType;
-
 pub trait QBlobStructHeaderBase: Sized {
     const BLOB_MAGIC: u32;
 

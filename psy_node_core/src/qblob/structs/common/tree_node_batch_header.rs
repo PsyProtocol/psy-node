@@ -84,10 +84,10 @@ impl QBlobMerkleTreeNodeBatchHeaderV1 {
         buf[76..80].copy_from_slice(&self.item_size.to_le_bytes());
         buf
     }
-    pub fn clip_header_get_payload_for_blob_type_and_tree(mut full_data: Vec<u8>, expected_blob_type: QBlobDataType, expected_tree_type: QBlobMerkleNodeTreeType, exact_size: bool) -> anyhow::Result<(Self, Vec<u8>)> {
+    pub fn clip_header_get_payload_for_blob_type_and_tree(full_data: Vec<u8>, expected_blob_type: QBlobDataType, expected_tree_type: QBlobMerkleNodeTreeType, exact_size: bool) -> anyhow::Result<(Self, Vec<u8>)> {
         Self::clip_header_get_payload_internal(full_data, Some(expected_blob_type), Some(expected_tree_type), exact_size)
     }
-    pub fn clip_header_get_payload(mut full_data: Vec<u8>, expected_blob_type: Option<QBlobDataType>, expected_tree_type: Option<QBlobMerkleNodeTreeType>, exact_size: bool) -> anyhow::Result<(Self, Vec<u8>)> {
+    pub fn clip_header_get_payload(full_data: Vec<u8>, expected_blob_type: Option<QBlobDataType>, expected_tree_type: Option<QBlobMerkleNodeTreeType>, exact_size: bool) -> anyhow::Result<(Self, Vec<u8>)> {
         Self::clip_header_get_payload_internal(full_data, expected_blob_type, expected_tree_type, exact_size)
     }
 
