@@ -18,6 +18,7 @@ mod protocol_types;
 pub use protocol_types::*;
 pub mod proof_hasher;
 pub mod generic_traits;
+pub mod canonical_db_serialize;
 
 #[macro_export]
 macro_rules! impl_qpq_serialize_primitive {
@@ -206,14 +207,14 @@ macro_rules! impl_psyser_for_ffs_with_params {
     ) => {
         impl<$($impl_generics)*> parth_core::PsyCanonicalSer for $type<$($type_generics)*> {
             #[inline]
-            fn psyser_serialize<W: ::std::io::Write>(&self, writer: &mut W) -> ::std::io::Result<()> {
+            fn psyser_serialize<W: ::std::io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
                 // This relies on the type implementing FastFixedSerializable<$size>
                 let bytes = self.ffs_to_bytes();
-                writer.write_all(&bytes)
+                writer.write_all(&bytes).map_err(Into::into)
             }
 
             #[inline]
-            fn psyser_deserialize<R: ::std::io::Read>(reader: &mut R) -> ::std::io::Result<Self> {
+            fn psyser_deserialize<R: ::std::io::Read>(reader: &mut R) -> anyhow::Result<Self> {
                 let mut buf = [0u8; $size];
                 reader.read_exact(&mut buf)?;
                 // This relies on the type implementing FastFixedSerializable<$size>

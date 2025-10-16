@@ -221,6 +221,26 @@ pub trait CoreDatabaseSingleIdCheckpointedWriter<TableIdentifier: Clone + Send +
         checkpoint_id: u64,
         rows: &[R],
     ) -> anyhow::Result<()>;
+
+
+    // first 8 bytes are the object_id, last_8 bytes 
+    async fn db_insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_start(
+        &self,
+        table: &TableIdentifier,
+        object_size: usize,
+        checkpoint_id: u64,
+        rows: &[u8],
+    ) -> anyhow::Result<()>;
+
+    // for user leafs and similar, where we want to insert many objects at a checkpoint, but the id is at the end of the row
+    async fn db_insert_many_single_checkpointed_objects_at_checkpoint_ffs_with_id_at_index(
+        &self,
+        table: &TableIdentifier,
+        object_size: usize,
+        object_id_location: usize,
+        checkpoint_id: u64,
+        rows: &[u8],
+    ) -> anyhow::Result<()>;
 }
 pub trait CoreDatabaseSingleIdCheckpointedStore<TableIdentifier: Clone + Send + Sync>:
     CoreDatabaseSingleIdCheckpointedReader<TableIdentifier> + CoreDatabaseSingleIdCheckpointedWriter<TableIdentifier>

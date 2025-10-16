@@ -64,13 +64,13 @@ impl QStaticNamedType for PGoldilocksFelt {
     }
 }
 impl PsyCanonicalSer for PGoldilocksFelt {
-    fn psyser_serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        writer.write_all(&self.0.to_le_bytes())
+    fn psyser_serialize<W: std::io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
+        writer.write_all(&self.0.to_le_bytes()).map_err(Into::into)
     }
 
-    fn psyser_deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+    fn psyser_deserialize<R: crate::canonical_serialize::io::Read>(reader: &mut R) -> anyhow::Result<Self> {
         let mut buf = [0u8; 8];
-        reader.read_exact(&mut buf)?;
+        reader.read_exact(&mut buf).map_err(|e| anyhow::anyhow!(e))?;
         Ok(Self::from_noncanonical_u64(u64::from_le_bytes(buf)))
     }
 

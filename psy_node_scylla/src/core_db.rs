@@ -112,6 +112,30 @@ impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sy
 impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
     CoreDatabaseSingleIdCheckpointedWriter<ScyllaGenericObjectSingleIdTablePreparedStatements> for ScyllaCoreStore<Hash, Hasher>
 {
+    
+    // first 8 bytes are the object_id, last_8 bytes 
+    async fn db_insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_start(
+        &self,
+        table: &ScyllaGenericObjectSingleIdTablePreparedStatements,
+        object_size_without_id: usize,
+        checkpoint_id: u64,
+        rows: &[u8],
+    ) -> anyhow::Result<()>{
+        table.insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_start(&self.session, object_size_without_id, checkpoint_id, rows).await
+    }
+
+    // for user leafs and similar, where we want to insert many objects at a checkpoint, but the id is at the end of the row
+    async fn db_insert_many_single_checkpointed_objects_at_checkpoint_ffs_with_id_at_index(
+        &self,
+        table: &ScyllaGenericObjectSingleIdTablePreparedStatements,
+        object_size: usize,
+        object_id_location: usize,
+        checkpoint_id: u64,
+        rows: &[u8],
+    ) -> anyhow::Result<()>{
+        table.insert_many_single_checkpointed_objects_at_checkpoint_ffs_with_id_at_index(&self.session, object_size, object_id_location, checkpoint_id, rows).await
+
+    }
     async fn db_insert_one_single_checkpointed_object<V: Serialize + Send + Sync>(
         &self,
         table: &ScyllaGenericObjectSingleIdTablePreparedStatements,

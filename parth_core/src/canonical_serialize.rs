@@ -1,173 +1,181 @@
-use std::io::{self, Read, Write, Cursor};
-use std::mem;
-
+// This is the master switch. It enables `no_std` only when the "std" feature is OFF.
+#![cfg_attr(not(feature = "std"), no_std)]
 
 // ============================================================================
-// 1. Varint Helpers (Performance Critical)
+// 0. Conditional Imports and Type Aliases
 // ============================================================================
 
-/// Minimal efficient Varint (LEB128ish) writing for usize.
-/// Used for Vec lengths.
-#[inline(always)]
-fn write_varint<W: Write>(mut n: usize, writer: &mut W) -> io::Result<()> {
-    // Optimize for small lengths common in networking
-    if n < 128 {
-        return writer.write_all(&[n as u8]);
+// --- `alloc` is only needed for `no_std` builds that need heap allocation. ---
+#[cfg(not(feature = "std"))]
+extern crate alloc;
+#[cfg(not(feature = "std"))]
+use alloc::vec::{self, Vec};
+
+// --- In `std` builds, `Vec` is in the prelude or `std::vec`. ---
+#[cfg(feature = "std")]
+use std::vec::Vec;
+
+
+// --- Universal imports that work in both modes. ---
+use core::mem;
+use anyhow::{bail, Context};
+
+// --- Conditionally select the I/O traits and Cursor. ---
+#[cfg(feature = "std")]
+pub mod io {
+    // In std mode, our I/O traits are just aliases for std::io's traits.
+    pub use std::io::{Read, Write, Cursor};
+}
+
+#[cfg(not(feature = "std"))]
+pub mod io {
+    // In no_std mode, we use the `embedded-io` traits.
+    pub use embedded_io::{Read, Write};
+
+    // We also provide our own no_std-compatible Cursor implementation.
+    pub struct Cursor<'a> {
+        slice: &'a [u8],
+        pos: usize,
     }
+    impl<'a> Cursor<'a> {
+        pub fn new(slice: &'a [u8]) -> Self { Self { slice, pos: 0 } }
+        pub fn position(&self) -> usize { self.pos }
+    }
+    impl<'a> embedded_io::ErrorType for Cursor<'a> {
+        type Error = core::convert::Infallible;
+    }
+    impl<'a> Read for Cursor<'a> {
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+            let bytes_to_read = core::cmp::min(buf.len(), self.slice.len() - self.pos);
+            let end = self.pos + bytes_to_read;
+            buf[..bytes_to_read].copy_from_slice(&self.slice[self.pos..end]);
+            self.pos = end;
+            Ok(bytes_to_read)
+        }
+    }
+}
 
-    let mut buf = [0u8; 10]; // Max usize (u64) takes 10 bytes
+// By aliasing here, the rest of the code can just use `Read` and `Write`
+// without caring where they came from.
+use io::{Read, Write, Cursor};
+
+
+// Our result type is universal thanks to anyhow.
+pub type SerResult<T> = anyhow::Result<T>;
+
+// ============================================================================
+// 1. Varint Helpers (Unaffected by std/no_std)
+// ============================================================================
+
+#[inline(always)]
+fn write_varint<W: Write>(mut n: usize, writer: &mut W) -> SerResult<()> {
+    if n < 128 {
+        return writer.write_all(&[n as u8]).context("Failed to write single-byte varint");
+    }
+    let mut buf = [0u8; 10];
     let mut i = 0;
     loop {
         let mut byte = (n as u8) & 0x7F;
         n >>= 7;
-        if n != 0 {
-            byte |= 0x80;
-        }
+        if n != 0 { byte |= 0x80; }
         buf[i] = byte;
         i += 1;
-        if n == 0 {
-            break;
-        }
+        if n == 0 { break; }
     }
-    writer.write_all(&buf[..i])
+    writer.write_all(&buf[..i]).context("Failed to write multi-byte varint")
 }
 
 #[inline(always)]
-fn read_varint<R: Read>(reader: &mut R) -> io::Result<usize> {
+fn read_varint<R: Read>(reader: &mut R) -> SerResult<usize> {
     let mut result = 0usize;
     let mut shift = 0;
     let mut buf = [0u8; 1];
-
     loop {
         if shift >= usize::BITS {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "Varint overflow"));
+            bail!("Varint overflow: larger than supported usize");
         }
-        reader.read_exact(&mut buf)?;
+        reader.read_exact(&mut buf).context("Failed to read varint byte from stream")?;
         let byte = buf[0];
         result |= ((byte & 0x7F) as usize) << shift;
-        if byte & 0x80 == 0 {
-            return Ok(result);
-        }
+        if byte & 0x80 == 0 { return Ok(result); }
         shift += 7;
     }
 }
 
-/// Returns number of bytes required to serialize len as varint
 #[inline(always)]
 const fn varint_size(n: usize) -> usize {
     if n == 0 { return 1; }
-    // Fast log2 approximation logic for varint size
-    let bits = (usize::BITS as usize) - n.leading_zeros() as usize;
-    (bits + 6) / 7
+    let bits = usize::BITS - n.leading_zeros();
+    (bits as usize + 6) / 7
 }
 
 // ============================================================================
-// 2. The Main Trait
+// 2. The Main Trait (Now generic over the selected I/O traits)
 // ============================================================================
 
-/// The unique, canonical serialization trait.
-/// Implementors must implement 3 things: serialize, deserialize, and size_hint.
 pub trait PsyCanonicalSer: Sized {
-    /// Write canonical format to a generic writer.
-    fn psyser_serialize<W: Write>(&self, writer: &mut W) -> io::Result<()>;
-
-    /// Read canonical format from a generic reader.
-    fn psyser_deserialize<R: Read>(reader: &mut R) -> io::Result<Self>;
-
-    /// Returns the exact number of bytes this instance will write.
-    /// Crucial for pre-allocating buffers to avoid re-allocations.
+    fn psyser_serialize<W: Write>(&self, writer: &mut W) -> SerResult<()>;
+    fn psyser_deserialize<R: Read>(reader: &mut R) -> SerResult<Self>;
     fn psyser_serialized_size(&self) -> usize;
-
-    /// Compile-time hint: If Some(N), every instance of this type is exactly N bytes.
-    /// Enables O(1) size calculation for containers (Vec).
     const FIXED_SERIALIZED_SIZE: Option<usize> = None;
 
-    // ------------------------------------------------------------------------
-    // Convenience methods (Default implementations provided using std::io::Cursor)
-    // DO NOT override these unless you have a specific optimization reason.
-    // ------------------------------------------------------------------------
-
     #[inline]
-    fn psyser_to_vec(&self) -> io::Result<Vec<u8>> {
-        // Pre-allocate exact size for performance
+    fn psyser_to_vec(&self) -> SerResult<Vec<u8>> {
         let mut vec = Vec::with_capacity(self.psyser_serialized_size());
+        // In std mode, Vec implements Write. In no_std, we depend on a crate
+        // or a feature of embedded-io to do this. For simplicity here, we assume
+        // a `Write` impl for `Vec` is available. `embedded-io` provides this
+        // behind its "alloc" feature.
         self.psyser_serialize(&mut vec)?;
         Ok(vec)
     }
 
     #[inline]
-    fn psyser_to_writer<W: Write>(&self, writer: &mut W) -> io::Result<()> {
-        self.psyser_serialize(writer)
-    }
-
-    #[inline]
-    fn psyser_write_to_slice(&self, buffer: &mut [u8]) -> io::Result<usize> {
-        let mut cursor = Cursor::new(buffer);
-        self.psyser_serialize(&mut cursor)?;
-        Ok(cursor.position() as usize)
-    }
-
-    #[inline]
-    fn psyser_from_bytes(bytes: &[u8]) -> io::Result<Self> {
+    fn psyser_from_bytes(bytes: &[u8]) -> SerResult<Self> {
         let mut cursor = Cursor::new(bytes);
-        let res = Self::psyser_deserialize(&mut cursor)?;
-        // Optional: Check if all bytes were consumed if strictness is required
-        // if cursor.position() as usize != bytes.len() { return Err(...) }
-        Ok(res)
-    }
-
-    /// Reads from slice, returns (Self, bytes_consumed)
-    #[inline]
-    fn psyser_read_from_slice(bytes: &[u8]) -> io::Result<(Self, usize)> {
-        let mut cursor = Cursor::new(bytes);
-        let obj = Self::psyser_deserialize(&mut cursor)?;
-        Ok((obj, cursor.position() as usize))
+        Self::psyser_deserialize(&mut cursor)
     }
 }
 
 // ============================================================================
-// 3. Basic Primitives Implementation (Endianness definition)
+// 3. Primitives Implementation (Unaffected by std/no_std)
 // ============================================================================
 
-// Example: Defines canonical format as Little Endian for primitives.
 macro_rules! impl_primitive {
     ($($t:ty),*) => {
         $(
             impl PsyCanonicalSer for $t {
                 #[inline(always)]
-                fn psyser_serialize<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+                fn psyser_serialize<W: Write>(&self, writer: &mut W) -> SerResult<()> {
                     writer.write_all(&self.to_le_bytes())
+                        .with_context(|| format!("Failed to serialize primitive <{}>", stringify!($t)))
                 }
 
                 #[inline(always)]
-                fn psyser_deserialize<R: Read>(reader: &mut R) -> io::Result<Self> {
+                fn psyser_deserialize<R: Read>(reader: &mut R) -> SerResult<Self> {
                     let mut buf = [0u8; mem::size_of::<Self>()];
-                    reader.read_exact(&mut buf)?;
+                    reader.read_exact(&mut buf)
+                        .with_context(|| format!("Failed to deserialize primitive <{}>", stringify!($t)))?;
                     Ok(Self::from_le_bytes(buf))
                 }
 
                 #[inline(always)]
-                fn psyser_serialized_size(&self) -> usize {
-                    mem::size_of::<Self>()
-                }
-
+                fn psyser_serialized_size(&self) -> usize { mem::size_of::<Self>() }
                 const FIXED_SERIALIZED_SIZE: Option<usize> = Some(mem::size_of::<Self>());
             }
         )*
     };
 }
-
 impl_primitive!(u8, u16, u32, u64, i8, i16, i32, i64, f32, f64);
-// bool is often treated as u8
 impl PsyCanonicalSer for bool {
     #[inline(always)]
-    fn psyser_serialize<W: Write>(&self, writer: &mut W) -> io::Result<()> {
-        writer.write_all(&[*self as u8])
+    fn psyser_serialize<W: Write>(&self, writer: &mut W) -> SerResult<()> {
+        writer.write_all(&[*self as u8]).context("Failed to serialize bool")
     }
     #[inline(always)]
-    fn psyser_deserialize<R: Read>(reader: &mut R) -> io::Result<Self> {
+    fn psyser_deserialize<R: Read>(reader: &mut R) -> SerResult<Self> {
         let mut buf = [0u8; 1];
-        reader.read_exact(&mut buf)?;
+        reader.read_exact(&mut buf).context("Failed to deserialize bool")?;
         Ok(buf[0] != 0)
     }
     fn psyser_serialized_size(&self) -> usize { 1 }
@@ -176,52 +184,36 @@ impl PsyCanonicalSer for bool {
 
 
 // ============================================================================
-// 5. Efficient Vec<T> Implementation
+// 5. Collection Implementations (Unaffected by std/no_std)
 // ============================================================================
 
 impl<T: PsyCanonicalSer> PsyCanonicalSer for Vec<T> {
-    fn psyser_serialize<W: Write>(&self, writer: &mut W) -> io::Result<()> {
-        // 1. Write Length (Varint)
+    fn psyser_serialize<W: Write>(&self, writer: &mut W) -> SerResult<()> {
         write_varint(self.len(), writer)?;
-
-        // 2. Write items
-        // Note: If T is u8, LLVM optimizes this loop into a memcpy automatically
-        // when writer is a generic buffer.
         for item in self {
             item.psyser_serialize(writer)?;
         }
         Ok(())
     }
 
-    fn psyser_deserialize<R: Read>(reader: &mut R) -> io::Result<Self> {
-        // 1. Read Length
+    fn psyser_deserialize<R: Read>(reader: &mut R) -> SerResult<Self> {
         let len = read_varint(reader)?;
-
-        // Security: Put a hard cap on allocation based on use case to prevent OOM attacks.
-        // e.g., if max message size is 64MB, len cannot exceed that.
-        const MAX_VEC_LEN: usize = 1024 * 1024 * 64; // Example limit
+        const MAX_VEC_LEN: usize = 1024 * 1024 * 64; // 64 MiB
         if len > MAX_VEC_LEN {
-             return Err(io::Error::new(io::ErrorKind::InvalidData, "Vec len exceeds max limit"));
+            bail!("Vec length ({}) exceeds max limit ({})", len, MAX_VEC_LEN);
         }
-
-        // 2. Allocate efficiently
         let mut vec = Vec::new();
-
-        if let Some(_fixed_size) = T::FIXED_SERIALIZED_SIZE {
-            // If items are fixed size, we know exactly how many we need.
-            // Rust's Vec handles zero-sized types (ZSTs) correctly here too.
+        if T::FIXED_SERIALIZED_SIZE.is_some() {
             vec.reserve_exact(len);
         } else {
-            // Variable sized items. Reserve hesitantly to prevent malicious
-            // input saying "len = 10Billion" followed by 1 byte of data.
             vec.reserve(len.min(4096));
         }
-
-        // 3. Read items
-        for _ in 0..len {
-            vec.push(T::psyser_deserialize(reader)?);
+        for i in 0..len {
+            vec.push(
+                T::psyser_deserialize(reader)
+                    .with_context(|| format!("Failed to deserialize item {} in Vec", i))?
+            );
         }
-
         Ok(vec)
     }
 
@@ -229,42 +221,27 @@ impl<T: PsyCanonicalSer> PsyCanonicalSer for Vec<T> {
     fn psyser_serialized_size(&self) -> usize {
         let len = self.len();
         let header_size = varint_size(len);
-
-        // OPTIMIZATION: Check compile-time constant
         if let Some(item_fixed_size) = T::FIXED_SERIALIZED_SIZE {
-            // O(1) calculation
             header_size + (len * item_fixed_size)
         } else {
-            // O(N) calculation for variable sized items
-            self.iter()
-                .fold(header_size, |acc, item| acc + item.psyser_serialized_size())
+            self.iter().fold(header_size, |acc, item| acc + item.psyser_serialized_size())
         }
     }
-
-    // A Vec itself implies variable total size.
-    const FIXED_SERIALIZED_SIZE: Option<usize> = None;
 }
 
-// Optimized specialization for Byte Arrays (Vec<u8>)
-// NOTE: In stable Rust, we can't have impl<T> for Vec<T> AND impl for Vec<u8>.
-// The generic impl above relies on LLVM optimizing the loop for u8.
-// Alternatively, wrap Vec<u8> in a newtype `pub struct ByteBuf(pub Vec<u8>);`
-// and implement specific bulk I/O for ByteBuf.
 
-/// Wrapper for raw byte buffers to ensure bulk I/O performance.
 pub struct PsyByteBuf(pub Vec<u8>);
 
 impl PsyCanonicalSer for PsyByteBuf {
-    fn psyser_serialize<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+    fn psyser_serialize<W: Write>(&self, writer: &mut W) -> SerResult<()> {
         write_varint(self.0.len(), writer)?;
-        writer.write_all(&self.0) // Uses efficient memcpy
+        writer.write_all(&self.0).context("Failed to write byte buffer contents")
     }
 
-    fn psyser_deserialize<R: Read>(reader: &mut R) -> io::Result<Self> {
+    fn psyser_deserialize<R: Read>(reader: &mut R) -> SerResult<Self> {
         let len = read_varint(reader)?;
-        // Add sanity limits here
-        let mut vec = vec![0u8; len]; // Allocate and zero
-        reader.read_exact(&mut vec)?; // Bulk read
+        let mut vec = vec![0u8; len];
+        reader.read_exact(&mut vec).context("Failed to read byte buffer contents")?;
         Ok(PsyByteBuf(vec))
     }
 

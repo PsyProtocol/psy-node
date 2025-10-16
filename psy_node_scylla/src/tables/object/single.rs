@@ -1,12 +1,16 @@
+use futures::{future::join_all, stream, StreamExt, TryStreamExt};
+
+use rayon::slice::{ParallelSlice};
+use rayon::iter::ParallelIterator;
 use std::sync::Arc;
 use anyhow::Context;
 use async_trait::async_trait;
-use futures::future::join_all;
 use parth_core::data::db::{row::{QDatabaseSingleIdTableRow, QDatabaseSingleIdTableRowCreatable, QDatabaseSingleIdTableRowLike, QDatabaseSingleIdTableRowNoCheckpointId, QDatabaseSingleIdTableRowNoCheckpointIdLike}, table::QDatabaseTableRoutingKey};
 use scylla::{client::session::Session, statement::{batch::Batch, prepared::PreparedStatement, Statement}};
 use serde::{de::DeserializeOwned, Serialize};
 
-use crate::{constants::{INSERT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE, SELECT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE}, tables::traits::ScyllaStandardPreparedTableStatements, utils::{convert_checkpoint_id_to_i64, convert_i64_to_checkpoint_id, i64_to_u64_exact, u64_to_i64_exact}};
+use crate::utils::calc_best_batch_size;
+use crate::{constants::{INSERT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE, SELECT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE}, tables::traits::ScyllaStandardPreparedTableStatements, utils::{convert_checkpoint_id_to_i64, convert_i64_to_checkpoint_id, generate_batch_prepared_statement, i64_to_u64_exact, u64_to_i64_exact}};
 
 
 
@@ -23,6 +27,11 @@ pub struct ScyllaGenericObjectSingleIdTablePreparedStatements {
 
     pub select_value_checkpoint_id_obj_id_1_statement: Statement,
     pub select_value_checkpoint_id_obj_id_1_prepared: Arc<PreparedStatement>,
+
+    
+    pub insert_batch_serialized_256_prepared: Arc<Batch>,
+    pub insert_batch_serialized_128_prepared: Arc<Batch>,
+    pub insert_batch_serialized_64_prepared: Arc<Batch>,
 
     pub select_all_statement: Statement,
     pub select_all_prepared: Arc<PreparedStatement>,
@@ -47,6 +56,10 @@ impl ScyllaGenericObjectSingleIdTablePreparedStatements {
         let select_all_prepared = session.prepare(select_all_statement.clone()).await?;
 
         Ok(Self {
+
+            insert_batch_serialized_256_prepared: Arc::new(generate_batch_prepared_statement(&session, &insert_1_prepared, 512).await?),
+            insert_batch_serialized_128_prepared: Arc::new(generate_batch_prepared_statement(&session, &insert_1_prepared, 128).await?),
+            insert_batch_serialized_64_prepared: Arc::new(generate_batch_prepared_statement(&session, &insert_1_prepared, 64).await?),  
             insert_1_statement: insert_1_statement,
             insert_1_prepared: Arc::new(insert_1_prepared),
             select_value_1_statement: select_value_1_statement,
@@ -91,7 +104,190 @@ impl ScyllaStandardPreparedTableStatements for ScyllaGenericObjectSingleIdTableP
 
 
 impl ScyllaGenericObjectSingleIdTablePreparedStatements {
+async fn insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_start_internal(
+        &self,
+        session: &Session, 
+        object_size_without_id: usize,
+        checkpoint_id: u64,
+        data: &[u8],
+        batch_size: usize,
+    ) -> anyhow::Result<()>{
+        let object_size_with_id = object_size_without_id + 8;
 
+        let checkpoint_i64 = convert_checkpoint_id_to_i64(checkpoint_id);
+        if data.len() < object_size_with_id || data.len() % object_size_with_id != 0 {
+            anyhow::bail!("Data length is not a multiple of object size with id");
+        }
+        let num_nodes = data.len() / object_size_with_id;
+
+        if num_nodes == 0 {
+            return Ok(());
+        }
+
+        const CONCURRENCY_LIMIT: usize = 64; // Tuned for typical Scylla clusters
+
+
+        // Parallel deserialization using rayon
+        let values: Vec<(i64, i64, &[u8])> = data
+            .par_chunks(object_size_with_id)
+            .map(|slice| {
+                (
+                    i64::from_le_bytes(slice[0..8].try_into().unwrap()),
+                    checkpoint_i64,
+                    &slice[8..object_size_with_id],
+                )
+            })
+            .collect();
+
+        // Map batch size to pre-prepared batch
+        let batch_prepared = match batch_size {
+            //512 => &self.insert_batch_serialized_512_prepared,
+            256 => &self.insert_batch_serialized_256_prepared,
+            128 => &self.insert_batch_serialized_128_prepared,
+            64 => &self.insert_batch_serialized_64_prepared,
+            //32 => &self.insert_batch_serialized_32_prepared,
+            _ => anyhow::bail!("Unsupported batch size"),
+        };
+
+        // Process batches concurrently
+        let chunks = values.chunks(batch_size);
+        stream::iter(chunks)
+            .map(anyhow::Ok)
+            .try_for_each_concurrent(CONCURRENCY_LIMIT, |chunk| {
+                let batch_prepared = batch_prepared.clone();
+                async move {
+                    if chunk.len() == batch_size {
+                        session.batch(&batch_prepared, chunk).await.context("Batch insert failed")?;
+                    } else {
+                        let mut batch = Batch::default();
+                        for _ in 0..chunk.len() {
+                            batch.append_statement(self.insert_1_statement.clone());
+                        }
+                        session.batch(&batch, chunk).await.context("Partial batch insert failed")?;
+                    }
+                    Ok(())
+                }
+            })
+            .await?;
+
+        Ok(())
+    }
+    
+    async fn insert_many_single_checkpointed_objects_at_checkpoint_ffs_with_id_at_index_internal(
+        &self,
+        session: &Session, 
+        object_size: usize,
+        object_id_location: usize,
+        checkpoint_id: u64,
+        data: &[u8],
+        batch_size: usize,
+    ) -> anyhow::Result<()>{
+        if object_id_location + 8 > object_size {
+            anyhow::bail!("Object ID location is out of bounds");
+        }
+
+
+        let checkpoint_i64 = convert_checkpoint_id_to_i64(checkpoint_id);
+        if data.len() < object_size || data.len() % object_size != 0 {
+            anyhow::bail!("Data length is not a multiple of object size with id");
+        }
+        let num_nodes = data.len() / object_size;
+
+        if num_nodes == 0 {
+            return Ok(());
+        }
+
+        const CONCURRENCY_LIMIT: usize = 64; // Tuned for typical Scylla clusters
+
+
+        // Parallel deserialization using rayon
+        let values: Vec<(i64, i64, &[u8])> = data
+            .par_chunks(object_size)
+            .map(|slice| {
+                (
+                    i64::from_le_bytes(slice[object_id_location..object_id_location+8].try_into().unwrap()),
+                    checkpoint_i64,
+                    &slice[..],
+                )
+            })
+            .collect();
+
+        // Map batch size to pre-prepared batch
+        let batch_prepared = match batch_size {
+            //512 => &self.insert_batch_serialized_512_prepared,
+            256 => &self.insert_batch_serialized_256_prepared,
+            128 => &self.insert_batch_serialized_128_prepared,
+            64 => &self.insert_batch_serialized_64_prepared,
+            //32 => &self.insert_batch_serialized_32_prepared,
+            _ => anyhow::bail!("Unsupported batch size"),
+        };
+
+        // Process batches concurrently
+        let chunks = values.chunks(batch_size);
+        stream::iter(chunks)
+            .map(anyhow::Ok)
+            .try_for_each_concurrent(CONCURRENCY_LIMIT, |chunk| {
+                let batch_prepared = batch_prepared.clone();
+                async move {
+                    if chunk.len() == batch_size {
+                        session.batch(&batch_prepared, chunk).await.context("Batch insert failed")?;
+                    } else {
+                        let mut batch = Batch::default();
+                        for _ in 0..chunk.len() {
+                            batch.append_statement(self.insert_1_statement.clone());
+                        }
+                        session.batch(&batch, chunk).await.context("Partial batch insert failed")?;
+                    }
+                    Ok(())
+                }
+            })
+            .await?;
+
+        Ok(())
+    }
+    // first 8 bytes are the object_id, last_8 bytes 
+    pub async fn insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_start<'a>(
+        &self,
+        session: &Session, 
+        object_size_without_id: usize,
+        checkpoint_id: u64,
+        data: &[u8],
+    ) -> anyhow::Result<()>{
+        if data.len() % (object_size_without_id+8) != 0 {
+            anyhow::bail!("Data length is not a multiple of object size with id");
+        }
+        let num_nodes = data.len() / (object_size_without_id + 8);
+        if num_nodes == 0 {
+            return Ok(());
+        }
+        
+        let batch_size = calc_best_batch_size(num_nodes, &[256, 128, 64]);
+        self.insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_start_internal(session, object_size_without_id, checkpoint_id, data, batch_size).await
+        
+    }
+
+    // for user leafs and similar, where we want to insert many objects at a checkpoint, but the id is at the end of the row
+    pub async fn insert_many_single_checkpointed_objects_at_checkpoint_ffs_with_id_at_index(
+        &self,
+        session: &Session, 
+        object_size: usize,
+        object_id_location: usize,
+        checkpoint_id: u64,
+        rows: &[u8],
+    ) -> anyhow::Result<()>{
+        if rows.len() % object_size != 0 {
+            anyhow::bail!("Data length is not a multiple of object size with id");
+        }
+        let num_nodes = rows.len() / object_size;
+        if num_nodes == 0 {
+            return Ok(());
+        }
+        
+        let batch_size = calc_best_batch_size(num_nodes, &[256, 128, 64]);
+        self.insert_many_single_checkpointed_objects_at_checkpoint_ffs_with_id_at_index_internal(session, object_size, object_id_location, checkpoint_id, rows, batch_size).await
+
+
+    }
     pub async fn select_one_single_checkpointed_object_value<V: Serialize + DeserializeOwned>(
         &self, 
         session: &Session, 

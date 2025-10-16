@@ -18,11 +18,11 @@ pub trait Q256BitHash: FromU64x4 + Sized + Copy + MaybeBytemuck + Debug {
     fn to_vec_32bytes(&self) -> Vec<u8>;
 }
 impl<T: Q256BitHash> PsyCanonicalSer for T {
-    fn psyser_serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        writer.write_all(&self.to_vec_32bytes())
+    fn psyser_serialize<W: std::io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
+        writer.write_all(&self.to_vec_32bytes()).map_err(Into::into)
     }
 
-    fn psyser_deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+    fn psyser_deserialize<R: std::io::Read>(reader: &mut R) -> anyhow::Result<Self> {
         let mut buf = [0u8; 32];
         reader.read_exact(&mut buf)?;
         Ok(Self::from_owned_32bytes(buf))
@@ -101,7 +101,7 @@ pub trait QNetworkTreeConstants: Sized + Send + Sync + Copy + Clone {
     const MAX_USERS_PER_REALM: u32; // = 2**REALM_GLOBAL_USER_TREE_HEIGHT
 }
 pub trait QNetworkHashTypes{
-    type QHash: QFHashBase<Self::F>;
+    type QHash: QFHashBase<Self::F> + Q256BitHash;
     type HasherBase: QFHasherU64<Self::F, Self::QHash> + Send + Sync;
     type F: QFelt64;
 }
