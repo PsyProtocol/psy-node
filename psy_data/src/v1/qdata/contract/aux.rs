@@ -39,6 +39,7 @@ pub struct ContractCodeDefinition {
 }
 impl_qpq_serialize_bincode!(ContractCodeDefinition);
 
+
 #[pderive::serialize_clone]
 #[derive(TS)]
 #[ts(export)]

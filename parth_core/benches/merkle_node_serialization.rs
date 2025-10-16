@@ -269,7 +269,6 @@ impl QPDSerializableFixed for QMerkleStoreDoubleIdKey {
 
 
 #[pderive::serialize_copy_hash]
-
 pub struct QMerkleStoreDoubleIdNode<Hash> {
     pub key: QMerkleStoreDoubleIdKey,
     pub hash: Hash,

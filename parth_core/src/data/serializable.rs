@@ -119,7 +119,67 @@ pub trait FastFixedSerializable<const N: usize>: Sized {
     fn ffs_try_from_slice(data: &[u8]) -> anyhow::Result<Self>;
     fn ffs_to_bytes(&self) -> [u8; N];
     fn ffs_into_bytes(self) -> [u8; N];
+
+
+    fn ffs_serialize_vec_of_self_ref(data: &[Self]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(data.len() * N);
+        for item in data {
+            bytes.extend_from_slice(&item.ffs_to_bytes());
+        }
+        bytes
+    }
+    fn ffs_serialize_vec_of_self(data: Vec<Self>) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(data.len() * N);
+        for item in data {
+            bytes.extend_from_slice(&item.ffs_to_bytes());
+        }
+        bytes
+    }
+    fn ffs_deserialize_vec_of_self(data: &[u8]) -> anyhow::Result<Vec<Self>> {
+        if data.len() % N != 0 {
+            anyhow::bail!("Data length {} is not a multiple of object size {}", data.len(), N);
+        }
+
+        // Use chunks_exact to iterate over the byte slice in N-sized chunks.
+        // This is highly optimized by the compiler (often using SIMD).
+        Ok(data
+            .chunks_exact(N)
+            .map(|chunk| {
+                // For each chunk, call the single-item deserializer.
+                // try_into().unwrap() is safe because chunks_exact guarantees length N.
+                Self::ffs_from_owned_bytes(chunk.try_into().unwrap())
+            })
+            .collect())
+    }
+    fn ffs_deserialize_vec_of_self_owned(data: Vec<u8>) -> anyhow::Result<Vec<Self>> {
+        let items = Self::ffs_deserialize_vec_of_self(&data)?;
+        Ok(items)
+    }
 }
+/* 
+pub trait GFastFixedSerializable: Sized + Copy {
+    /// The exact size of the serialized type in bytes.
+    const SIZE: usize;
+
+    /// Creates an instance from a fixed-size byte array.
+    fn ffs_from_bytes(data: [u8; Self::SIZE]) -> Self;
+
+    /// Converts the instance into a fixed-size byte array.
+    fn ffs_to_bytes(&self) -> [u8; Self::SIZE];
+
+    // Optional helper, not strictly required by PsyCanonicalSer
+    fn ffs_try_from_slice(data: &[u8]) -> io::Result<Self> {
+        if data.len() != Self::SIZE {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Slice wrong length for FFS"));
+        }
+        // This is safe because we checked the length.
+        let arr_ptr = data.as_ptr() as *const [u8; Self::SIZE];
+        // SAFETY: We have checked the slice length is exactly Self::SIZE.
+        let arr = unsafe { &*arr_ptr };
+        Ok(Self::ffs_from_bytes(*arr))
+    }
+}
+    */
 
 
 pub trait QPDSerializable: Clone + PartialEq {

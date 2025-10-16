@@ -1,3 +1,4 @@
+
 /*use serde::{de::DeserializeOwned, Serialize};
 
 pub type QBytes = std::vec::Vec<u8>;
@@ -28,7 +29,8 @@ impl<T: DeserializeOwned> QBytesDeserialize for T {
     }
 }*/
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-
+mod canonical;
+pub use canonical::*;
 pub type QBytes = std::vec::Vec<u8>;
 pub trait QBytesSerialize {
     fn to_qbytes(&self) -> anyhow::Result<QBytes>;
@@ -126,3 +128,5 @@ pub fn serialize<T: QBytesSerialize>(value: &T) -> anyhow::Result<QBytes> {
 pub fn deserialize<T: QBytesDeserialize>(bytes: &[u8]) -> anyhow::Result<T> where for<'de> T: Deserialize<'de> {
     T::from_qbytes(bytes)
 }
+
+

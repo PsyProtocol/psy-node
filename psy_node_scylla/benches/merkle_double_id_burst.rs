@@ -87,7 +87,7 @@ fn bench_merkle_double_id_internal<Hash: BenchFastRand + QDBHashBase, Hasher: Me
     group.measurement_time(Duration::from_millis((recover_time_ms*(samples as u64)).min(10000)));
     group.sample_size(samples);
 
-    group.bench_function(&format!("fast_v5_grok_3"), |b| {
+    group.bench_function(&format!("fast_v5"), |b| {
         b.iter_custom(|iters| {
             let mut total_duration = Duration::ZERO;
             for _ in 0..iters {
@@ -129,5 +129,5 @@ fn bench_merkle_double_id_internal<Hash: BenchFastRand + QDBHashBase, Hasher: Me
 pub fn bench_merkle_double_id_burst(c: &mut Criterion) {
     //bench_merkle_double_id_internal::<PGoldilocksHash, PoseidonHasher>(c, 1_000_000, 6000);
 
-    bench_merkle_double_id_internal::<PGoldilocksHash, PoseidonHasher>(c, 100_000, 500);
+    bench_merkle_double_id_internal::<PGoldilocksHash, PoseidonHasher>(c, 1_000_000, 500);
 }

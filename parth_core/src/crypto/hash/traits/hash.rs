@@ -12,6 +12,7 @@ pub trait ZeroableHash: Sized + Copy + Clone {
 }
 pub trait ToU64x4 {
     fn to_u64x4(&self) -> [u64; 4];
+    fn into_u64x4_serialize_non_canonical(self) -> [u64; 4];
 }
 pub trait FromU64x4: Sized {
     fn from_u64x4(data: [u64; 4]) -> Self;

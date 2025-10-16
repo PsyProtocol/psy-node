@@ -9,10 +9,12 @@ use serde::{de::DeserializeOwned, Serialize};
 use ts_rs::TS;
 
 use crate::{
-    data::maybe_serialization::MaybeSpeedy, generic_traits::QNamedType, utils::QPGenRandom
+    data::maybe_serialization::{MaybeBytemuck, MaybeSpeedy}, generic_traits::QNamedType, utils::QPGenRandom, PsyCanonicalSer
 };
 pub trait ToU64Value {
     fn to_u64_value(&self) -> u64;
+    fn into_u64_value_serialize_non_canonical(self) -> u64;
+    fn from_owned_u64(value: u64) -> Self;
 }
 
 pub trait FromPrimitiveValuesFelt {
@@ -72,6 +74,7 @@ pub trait QFelt:
     + SimpleRandFelt
     + QPGenRandom
     + QNamedType
+    + PsyCanonicalSer
 {
 }
 impl<
@@ -101,13 +104,15 @@ impl<
             + SimpleRandFelt
             + QPGenRandom
             + QNamedType
-            + MaybeSpeedy,
+            + MaybeSpeedy
+            + PsyCanonicalSer
+            + MaybeBytemuck 
     > QFelt for T
 {
 }
 
-pub trait QFelt64: QFelt + ToU64Value {}
-impl<T: QFelt + ToU64Value> QFelt64 for T {}
+pub trait QFelt64: QFelt + ToU64Value + MaybeBytemuck {}
+impl<T: QFelt + ToU64Value + MaybeBytemuck> QFelt64 for T {}
 pub trait QFeltSized {
     fn q_felt_size() -> usize;
     fn self_qsize(&self) -> usize {
@@ -145,8 +150,19 @@ impl<const N: usize, F: Copy> ToQFelts<F> for [F; N] {
 }
 
 impl ToU64Value for u64 {
+    #[inline(always)]
     fn to_u64_value(&self) -> u64 {
         *self
+    }
+    
+    #[inline(always)]
+    fn into_u64_value_serialize_non_canonical(self) -> u64 {
+        self
+    }
+    
+    #[inline(always)]
+    fn from_owned_u64(value: u64) -> Self {
+        value
     }
 }
 impl SimpleRandFelt for u64 {

@@ -110,6 +110,56 @@ impl<F: QFelt64, Hash: QFHashBase<F>> QFieldHashable<F, Hash> for PQEDUserLeaf<F
 
 
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serialize_bytemuck", derive(bytemuck::Pod, bytemuck::Zeroable))]
+#[repr(C)]
+struct PQEDUserLeafSerialize256HashU64Felt {
+    pub public_key: [u8; 32],
+    pub user_state_tree_root: [u8; 32],
+    pub balance: u64,
+    pub nonce: u64,
+    pub last_checkpoint_id: u64,
+    pub event_index: u64,
+    pub user_id: u64,
+}
+
+#[cfg(all(target_endian = "little", feature = "serialize_bytemuck"))]
+impl FastFixedSerializable<104> for PQEDUserLeafSerialize256HashU64Felt {
+    #[inline(always)]
+    fn ffs_from_owned_bytes(data: [u8; 104]) -> Self {
+        bytemuck::cast(data)
+    }
+    #[inline(always)]
+    fn ffs_from_slice_or_panic(data: &[u8]) -> Self {
+        if data.len() != 104 {
+            panic!("Invalid number of bytes for ExampleUserSerialize");
+        }
+        let mut arr = [0u8; 104];
+        arr.copy_from_slice(data);
+        Self::ffs_from_owned_bytes(arr)
+    }
+
+    #[inline(always)]
+    fn ffs_try_from_slice(data: &[u8]) -> anyhow::Result<Self> {
+        if data.len() != 104 {
+            anyhow::bail!("Invalid number of bytes for ExampleUserSerialize");
+        }
+        let mut arr = [0u8; 104];
+        arr.copy_from_slice(data);
+        Ok(Self::ffs_from_owned_bytes(arr))
+    }
+
+    #[inline(always)]
+    fn ffs_to_bytes(&self) -> [u8; 104] {
+        bytemuck::cast(*self)
+    }
+
+    #[inline(always)]
+    fn ffs_into_bytes(self) -> [u8; 104] {
+        bytemuck::cast(self)
+    }
+}
+
 #[cfg(not(all(target_endian = "little", feature = "serialize_bytemuck")))]
 impl FastFixedSerializable<104> for PQEDUserLeafSerialize256HashU64Felt {
     fn ffs_from_owned_bytes(data: [u8; 104]) -> Self {
@@ -175,53 +225,82 @@ impl FastFixedSerializable<104> for PQEDUserLeafSerialize256HashU64Felt {
 
 
 
-#[cfg(all(feature = "serialize_bytemuck", target_endian = "little"))]
-unsafe impl<F, Hash> bytemuck::Zeroable for PQEDUserLeaf<F, Hash>
-where
-    F: bytemuck::Zeroable,
-    Hash: bytemuck::Zeroable,
-{
-    // The `#[repr(C)]` attribute ensures there are no padding bytes.
-    // The trait bounds on F and Hash ensure that all fields are Zeroable.
+
+impl<F: QFelt64, Hash: Q256BitHash> PQEDUserLeaf<F, Hash> {
+    #[inline(always)]
+    fn to_serialize_h256_u64(self) -> PQEDUserLeafSerialize256HashU64Felt {
+        PQEDUserLeafSerialize256HashU64Felt {
+            public_key: self.public_key.into_owned_32bytes(),
+            user_state_tree_root: self.user_state_tree_root.into_owned_32bytes(),
+            balance: self.balance.into_u64_value_serialize_non_canonical(),
+            nonce: self.nonce.into_u64_value_serialize_non_canonical(),
+            last_checkpoint_id: self.last_checkpoint_id.into_u64_value_serialize_non_canonical(),
+            event_index: self.event_index.into_u64_value_serialize_non_canonical(),
+            user_id: self.user_id.into_u64_value_serialize_non_canonical(),
+        }
+    }
+    #[inline(always)]
+    fn from_serialize_h256_u64(data: PQEDUserLeafSerialize256HashU64Felt) -> Self {
+        Self {
+            public_key: Hash::from_ref_32bytes(&data.public_key),
+            user_state_tree_root: Hash::from_ref_32bytes(&data.user_state_tree_root),
+            balance: F::from_u64_value(data.balance),
+            nonce: F::from_u64_value(data.nonce),
+            last_checkpoint_id: F::from_u64_value(data.last_checkpoint_id),
+            event_index: F::from_u64_value(data.event_index),
+            user_id: F::from_u64_value(data.user_id),
+        }
+    }
+    #[inline(always)]
+    fn to_serialize_bytes(self) -> [u8; 104] {
+        let data = self.to_serialize_h256_u64();
+        data.ffs_to_bytes()
+    }
+    #[inline(always)]
+    fn from_serialize_bytes(data: [u8; 104]) -> Self {
+        let data = PQEDUserLeafSerialize256HashU64Felt::ffs_from_owned_bytes(data);
+        Self::from_serialize_h256_u64(data)
+    }
+
+
 }
 
-#[cfg(all(feature = "serialize_bytemuck", target_endian = "little"))]
-unsafe impl<F, Hash> bytemuck::Pod for PQEDUserLeaf<F, Hash>
-where
-    F: bytemuck::Pod,
-    Hash: bytemuck::Pod,
-{
-    // The `#[repr(C)]` attribute ensures a defined layout with no padding.
-    // The trait bounds on F and Hash ensure that all fields are Pod.
-}
-
-#[cfg(all(feature = "serialize_bytemuck", target_endian = "little"))]
-impl<F: QFelt64 + bytemuck::Pod, Hash: Q256BitHash + bytemuck::Pod> FastFixedSerializable<104> for PQEDUserLeaf<F, Hash> {
+impl<F: QFelt64, Hash: Q256BitHash> FastFixedSerializable<104> for PQEDUserLeaf<F, Hash> {
+    
     #[inline(always)]
     fn ffs_from_owned_bytes(data: [u8; 104]) -> Self {
-        bytemuck::cast(data)
+        Self::from_serialize_bytes(data)
     }
 
     #[inline(always)]
     fn ffs_from_slice_or_panic(data: &[u8]) -> Self {
-        *bytemuck::from_bytes(data)
+        if data.len() != PSY_OBJECT_FFS_SIZE_USER_LEAF {
+            panic!("Invalid number of bytes for PQEDUserLeaf");
+        }
+        let mut arr = [0u8; PSY_OBJECT_FFS_SIZE_USER_LEAF];
+        arr.copy_from_slice(data);
+        Self::from_serialize_bytes(arr)
     }
 
     #[inline(always)]
     fn ffs_try_from_slice(data: &[u8]) -> anyhow::Result<Self> {
-        bytemuck::try_from_bytes(data)
-            .map(|&s| s)
-            .map_err(|e| anyhow::anyhow!("Failed to cast slice to PQEDUserLeaf: {}", e))
+        if data.len() != PSY_OBJECT_FFS_SIZE_USER_LEAF {
+            anyhow::bail!("Invalid number of bytes for PQEDUserLeaf");
+        }
+        let mut arr = [0u8; PSY_OBJECT_FFS_SIZE_USER_LEAF];
+        arr.copy_from_slice(data);
+        Ok(Self::from_serialize_bytes(arr))
     }
 
     #[inline(always)]
-    fn ffs_to_bytes(&self) -> [u8; 104] {
-        bytemuck::cast(*self)
+    fn ffs_to_bytes(&self) -> [u8; PSY_OBJECT_FFS_SIZE_USER_LEAF] {
+        self.to_serialize_bytes()
     }
 
     #[inline(always)]
-    fn ffs_into_bytes(self) -> [u8; 104] {
-        bytemuck::cast(self)
+    fn ffs_into_bytes(self) -> [u8; PSY_OBJECT_FFS_SIZE_USER_LEAF] {
+        self.to_serialize_bytes()
     }
 }
+
 

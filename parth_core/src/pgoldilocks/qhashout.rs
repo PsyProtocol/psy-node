@@ -2,7 +2,7 @@ use std::{fmt::Display, str::FromStr};
 
 use anyhow::ensure;
 use ts_rs::TS;
-use crate::{crypto::hash::traits::{FromU64x4, HashTo4Felts, RandomHash, ToU64x4, ZeroableHash}, data::{hash::hash256::Hash256, maybe_serialization::MaybeSpeedy, serializable::{QPDSerializable, QPDSerializableFixed}}, felt::{QFelt64, ToQFelts}, generic_traits::QNamedType, protocol::core_types::{Q256BitHash, QHashBase}, utils::QPGenRandom};
+use crate::{crypto::hash::traits::{FromU64x4, HashTo4Felts, RandomHash, ToU64x4, ZeroableHash}, data::{hash::hash256::Hash256, serializable::{QPDSerializable, QPDSerializableFixed}}, felt::{QFelt64, ToQFelts}, generic_traits::QNamedType, protocol::core_types::{Q256BitHash, QHashBase}, utils::QPGenRandom};
 use plonky2::{
     field::{
         goldilocks_field::GoldilocksField,
@@ -16,9 +16,8 @@ use serde_with::serde_as;
 
 #[derive(Clone, Debug, PartialEq, Eq, Copy, Hash, TS)]
 #[cfg_attr(feature = "serialize_bytemuck", derive(bytemuck::Pod, bytemuck::Zeroable))]
-        #[cfg_attr(feature = "serialize_rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
-
-        #[ts(export, concrete(F = GoldilocksField))]
+#[cfg_attr(feature = "serialize_rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
+#[ts(export, concrete(F = GoldilocksField))]
 #[repr(transparent)]
 pub struct QHashOut<F: Field>(pub HashOut<F>);
 
@@ -465,10 +464,11 @@ impl<F: Writable<LittleEndian> + Field> Writable<LittleEndian> for QHashOut<F> {
 // QHashBase implementation (unchanged)
 
 #[cfg(feature = "serialize_speedy")]
-impl<F: RichField + QFelt64 + MaybeSpeedy + for<'b> Readable<'b, LittleEndian>> QHashBase for QHashOut<F> {}
+impl QHashBase for QHashOut<GoldilocksField> {}
 
 #[cfg(not(feature = "serialize_speedy"))]
-impl<F: RichField + QFelt64 + MaybeSpeedy> QHashBase for QHashOut<F> {}
+impl QHashBase for QHashOut<GoldilocksField> {}
+
 #[cfg(test)]
 mod tests {
     use crate::{crypto::hash::traits::{FieldQHasher, MerkleHasher}, pgoldilocks::PoseidonHasher};
@@ -802,6 +802,16 @@ impl<F: RichField> ToU64x4 for QHashOut<F> {
             self.0.elements[2].to_canonical_u64(),
             self.0.elements[3].to_canonical_u64(),
         ]
+    }
+
+    fn into_u64x4_serialize_non_canonical(self) -> [u64; 4] {
+        [
+            self.0.elements[0].to_noncanonical_u64(),
+            self.0.elements[1].to_noncanonical_u64(),
+            self.0.elements[2].to_noncanonical_u64(),
+            self.0.elements[3].to_noncanonical_u64(),
+        ]
+
     }
 }
 impl<F: RichField> HashTo4Felts<F> for QHashOut<F> {

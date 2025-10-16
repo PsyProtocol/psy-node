@@ -1,5 +1,5 @@
 use criterion::{black_box, BenchmarkId, Criterion};
-use parth_core::{crypto::hash::traits::MerkleHasher, data::{hash::hash256::Hash256, maybe_serialization::MaybeSpeedy}, felt::{QFelt, QFelt64}, generic_traits::QNamedType, pgoldilocks::{PGoldilocksFelt, PGoldilocksHash, PoseidonHasher}, protocol::core_types::{QDBHashBase, QFHashBase, QHash256Base, QHashBase}, utils::QPGenRandom};
+use parth_core::{crypto::hash::traits::MerkleHasher, data::{hash::hash256::Hash256, maybe_serialization::MaybeSpeedy, serializable::FastFixedSerializable}, felt::{QFelt, QFelt64}, generic_traits::QNamedType, pgoldilocks::{PGoldilocksFelt, PGoldilocksHash, PoseidonHasher}, protocol::core_types::{QDBHashBase, QFHashBase, QHash256Base, QHashBase}, utils::QPGenRandom};
 use psy_data::v1::qdata::user::PQEDUserLeaf;
 
 use speedy::{Readable, Writable};
@@ -52,13 +52,25 @@ fn benckmark_serialize_round_trip_user_leaf_internal<F: BenchFastRand + QFelt64 
         let items = gen_random_user_leaves::<F, Hash>(*count);
         let speedy_bytes = items.write_to_vec().expect("Serialization should succeed");
         //let ex_1 = items[0].user_id.write_to_vec()
-
         
         // Benchmark the naive implementation
-        group.bench_with_input(BenchmarkId::new("serialize_user_leaves", *count), &items, |b, l| {
+        group.bench_with_input(BenchmarkId::new("serialize_user_leaves_bincode", *count), &items, |b, l| {
             // `b.iter` runs the closure multiple times to get a stable measurement.
             // `black_box` prevents the compiler from optimizing away the function call.
             //b.iter(|| Vec::<PQEDUserLeaf::<F, Hash>>::read_from(black_box(l)));
+            b.iter(||bincode::serialize(black_box(l)).unwrap());
+        });
+        group.bench_with_input(BenchmarkId::new("serialize_user_leaves_speedy", *count), &items, |b, l| {
+            // `b.iter` runs the closure multiple times to get a stable measurement.
+            // `black_box` prevents the compiler from optimizing away the function call.
+            //b.iter(|| Vec::<PQEDUserLeaf::<F, Hash>>::read_from(black_box(l)));
+            b.iter(||black_box(l).write_to_vec().unwrap());
+        });
+        group.bench_with_input(BenchmarkId::new("serialize_user_leaves_ffs", *count), &items, |b, l| {
+            // `b.iter` runs the closure multiple times to get a stable measurement.
+            // `black_box` prevents the compiler from optimizing away the function call.
+            //b.iter(|| Vec::<PQEDUserLeaf::<F, Hash>>::read_from(black_box(l)));
+            b.iter(||black_box(l));
         });
     }
     group.finish();

@@ -15,6 +15,7 @@ use crate::{
 #[serde_as]
 #[pderive::serialize_copy]
 #[derive(TS)]
+#[cfg_attr(feature = "serialize_bytemuck", derive(bytemuck::Pod, bytemuck::Zeroable))]
 #[repr(transparent)]
 pub struct Hash256(
     #[serde_as(as = "serde_with::hex::Hex")]
@@ -141,6 +142,9 @@ impl CodeSerializableHash for Hash256 {
 
 impl ToU64x4 for Hash256 {
     fn to_u64x4(&self) -> [u64; 4] {
+        self.to_le_u64_x4()
+    }
+    fn into_u64x4_serialize_non_canonical(self) -> [u64; 4] {
         self.to_le_u64_x4()
     }
 }
