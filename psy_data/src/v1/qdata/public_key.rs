@@ -5,6 +5,7 @@ use parth_core::{
     impl_qpd_serialize_params,
     protocol::core_types::{Q256BitHash, QFHashBase, QHashBase}, utils::QPGenRandom,
 };
+use pser::{QBytesSerialize, QBytesDeserialize};
 
 use crate::v1::qdata::ffs_sizes::PSY_OBJECT_FFS_SIZE_ZK_PUBLIC_KEY;
 

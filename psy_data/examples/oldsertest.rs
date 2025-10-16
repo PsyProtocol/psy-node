@@ -43,6 +43,11 @@ impl ToU64Value for ExampleFelt {
     fn from_owned_u64(value: u64) -> Self {
         ExampleFelt(value)
     }
+    
+    #[inline(always)]
+    fn tuv_to_canonical_u64(&self) -> u64 {
+        self.0
+    }
 }
 
 
