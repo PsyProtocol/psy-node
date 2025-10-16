@@ -1,6 +1,4 @@
 #[cfg(all(target_endian = "little", feature = "serialize_bytemuck"))]
-use core::fmt;
-#[cfg(all(target_endian = "little", feature = "serialize_bytemuck"))]
 use std::fmt::Debug;
 
 use parth_core::{

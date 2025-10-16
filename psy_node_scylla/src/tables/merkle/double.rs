@@ -248,7 +248,6 @@ impl ScyllaDoubleMerkleNodesPreparedStatements {
         session: &Session,
         checkpoint_id: u64,
         data: &[u8],
-        batch_size: usize,
     ) -> anyhow::Result<()> {
         let checkpoint_i64 = convert_checkpoint_id_to_i64(checkpoint_id);
         if data.len() % QMS_FAST_SERIALIZER_DOUBLE_ID_NODE_SIZE != 0 {
@@ -309,7 +308,6 @@ impl ScyllaDoubleMerkleNodesPreparedStatements {
         session: &Session,
         checkpoint_id: u64,
         data: &[u8],
-        batch_size: usize,
     ) -> anyhow::Result<()> {
         let checkpoint_i64 = convert_checkpoint_id_to_i64(checkpoint_id);
         if data.len() % QMS_FAST_SERIALIZER_DOUBLE_ID_NODE_SIZE != 0 {

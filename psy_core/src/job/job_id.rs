@@ -4,7 +4,6 @@ use parth_core::{data::{hash::merkle_node_key::{SimpleMerkleNodeKey, JOB_ID_EMPT
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use serde_with::serde_as;
-use strum_macros::{Display, AsRefStr};
 use ts_rs::TS;
 #[derive(TS)]
 #[ts(export)]
@@ -1072,7 +1071,8 @@ impl QJobIdCreatable for QProvingJobDataID {
             .unwrap_or_else(|_| Self::new_invalid_job_id().get_output_id()) // Return invalid proof with OutputProof type for consistency
     }
     
-    fn new_two_to_one_proof_id(target_checkpoint_id: u64, left_proof_id: &Self, right_proof_id: &Self, parth_index: u64, parth_level: u8, reverse_aggregation_level: u8) -> anyhow::Result<Self> {
+    // TODO: should we use parth level and encode it in the job id?
+    fn new_two_to_one_proof_id(target_checkpoint_id: u64, left_proof_id: &Self, right_proof_id: &Self, parth_index: u64, _parth_level: u8, reverse_aggregation_level: u8) -> anyhow::Result<Self> {
         if !left_proof_id.is_valid() || !right_proof_id.is_valid() {
             anyhow::bail!("invalid left or right proof id");
         }
@@ -1118,10 +1118,7 @@ impl QJobIdCreatable for QProvingJobDataID {
                     _ => {
                         // If they don't have a leaf type, or the leaf types don't match,
                         // they cannot be aggregated this way.
-                        return Err(anyhow::bail!(
-                            "Cannot aggregate mismatched or non-aggregatable circuit types: {:?} and {:?}",
-                            left_circuit, right_circuit
-                        ));
+                        unreachable!("cannot aggregate proofs of different or non-aggregatable types: left={:?}, right={:?}", left_circuit, right_circuit);
                     }
                 }
             }

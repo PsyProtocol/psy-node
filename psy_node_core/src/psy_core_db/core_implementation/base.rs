@@ -247,8 +247,8 @@ impl<
     }
 
 
-    async fn apply_global_block_update_internal(&self, global_block_update: &PQEDCheckpointSyncInfo<N::F, N::QHash>) -> anyhow::Result<()>{
-        let latest_pending_id = self.get_latest_pending_id().await?;
+    async fn _apply_global_block_update_internal(&self, global_block_update: &PQEDCheckpointSyncInfo<N::F, N::QHash>) -> anyhow::Result<()>{
+        let _latest_pending_id = self.get_latest_pending_id().await?;
         let latest_checkpoint_id = self.get_latest_checkpoint_id().await?;
         let new_checkpoint_id = global_block_update.core.l2_block_state.checkpoint_id;
         if new_checkpoint_id != (latest_checkpoint_id + 1) {

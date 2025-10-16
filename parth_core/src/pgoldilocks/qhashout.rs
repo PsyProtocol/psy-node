@@ -427,7 +427,7 @@ impl<F: RichField + QFelt64> QNamedType for QHashOut<F> {
 }
 
 #[cfg(feature = "serialize_speedy")]
-use speedy::{Readable, Writable, LittleEndian, Context, Reader, Writer};
+use speedy::{Readable, Writable, LittleEndian, Reader, Writer};
 
 // ... (Your existing imports and code remain unchanged)
 

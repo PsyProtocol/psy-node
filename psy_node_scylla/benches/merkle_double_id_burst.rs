@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use criterion::{BatchSize, Criterion};
+use criterion::Criterion;
 use parth_core::{
     crypto::hash::traits::MerkleZeroHasher,
     data::{
@@ -46,7 +46,7 @@ impl BenchFastRand for PGoldilocksHash {
         PGoldilocksHash::from_hash256_le(Hash256::rand())
     }
 }
-fn gen_rand_double_id_nodes<Hash: QPGenRandom>(count: usize) -> Vec<QMerkleStoreDoubleIdNode<Hash>> {
+fn _gen_rand_double_id_nodes<Hash: QPGenRandom>(count: usize) -> Vec<QMerkleStoreDoubleIdNode<Hash>> {
     let mut nodes = Vec::with_capacity(count);
     for _ in 0..count {
         let node = QMerkleStoreDoubleIdNode::qp_rand_gen();

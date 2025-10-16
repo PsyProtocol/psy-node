@@ -1,6 +1,6 @@
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-use crate::data::{maybe_serialization::MaybeBytemuck, queue::queue_key::PCoreQueueItemBase, serializable::QPDSerializableFixed};
+use crate::data::{queue::queue_key::PCoreQueueItemBase, serializable::QPDSerializableFixed};
 
 pub const QJOB_ID_SERIALIZED_SIZE: usize = 24;
 pub const QJOB_ID_WITH_REALM_PREFIX_SERIALIZED_SIZE: usize = 32;

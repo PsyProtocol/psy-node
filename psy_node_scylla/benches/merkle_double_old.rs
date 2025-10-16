@@ -67,7 +67,7 @@ pub fn bench_merkle_double_id(c: &mut Criterion) {
     });*/
     group.bench_function(&format!("h256_insert_{}_QMerkleStoreDoubleIdNode_fast_serialized_data_v2", node_count), |b| {
         b.iter(|| {
-            rt.block_on(double_id_merkle_table.set_double_id_merkle_nodes_batch_g_internal_fast_v2::<Hash>(&store.session, checkpoint_id_test_a, &fast_serialized_a[QBLOB_TREE_NODE_BATCH_HEADER_SIZE..], 256)).unwrap();
+            rt.block_on(double_id_merkle_table.set_double_id_merkle_nodes_batch_g_internal_fast_v2::<Hash>(&store.session, checkpoint_id_test_a, &fast_serialized_a[QBLOB_TREE_NODE_BATCH_HEADER_SIZE..])).unwrap();
         });
     });
     group.bench_function(&format!("h256_insert_{}_QMerkleStoreDoubleIdNode_fast_serialized_data_v5_gemini_1", node_count), |b| {
