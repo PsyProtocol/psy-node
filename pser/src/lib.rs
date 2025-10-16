@@ -29,8 +29,6 @@ impl<T: DeserializeOwned> QBytesDeserialize for T {
     }
 }*/
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-mod canonical;
-pub use canonical::*;
 pub type QBytes = std::vec::Vec<u8>;
 pub trait QBytesSerialize {
     fn to_qbytes(&self) -> anyhow::Result<QBytes>;
@@ -130,3 +128,1129 @@ pub fn deserialize<T: QBytesDeserialize>(bytes: &[u8]) -> anyhow::Result<T> wher
 }
 
 
+#[macro_export]
+macro_rules! impl_bytemuck_pod_and_zeroable {
+    // Matcher for a type name followed by one or more generic parameters.
+    // Example: MyType, F, Hash
+    ($type_name:ident, $( $generic:ident ),+) => {
+        #[cfg(all(feature = "serialize_bytemuck", target_endian = "little"))]
+        unsafe impl< $( $generic: bytemuck::Pod ),+ > bytemuck::Zeroable for $type_name< $( $generic ),+ > {}
+
+        #[cfg(all(feature = "serialize_bytemuck", target_endian = "little"))]
+        unsafe impl< $( $generic: bytemuck::Pod ),+ > bytemuck::Pod for $type_name< $( $generic ),+ > {}
+    };
+}
+
+
+#[macro_export]
+macro_rules! impl_bytemuck_ffs_with_tests {
+    ($struct_name:ident, { $($t:tt)* } => { $($generics:tt)* }, $size:expr) => {
+        // --- ZERO-COPY FastFixedSerializable IMPLEMENTATION ---
+        // We replace the entire intermediate-struct-and-copy mechanism with direct
+        // casts. This is safe because of #[repr(C)] and the unsafe `Pod` impl above.
+        #[cfg(all(target_endian = "little", feature = "serialize_bytemuck"))]
+        impl<F: QFelt64, Hash: Q256BitHash> FastFixedSerializable<$size> for $struct_name<F, Hash> {
+            #[inline(always)]
+            fn ffs_try_from_slice(data: &[u8]) -> anyhow::Result<Self> {
+                bytemuck::try_from_bytes(data)
+                    .map(|&s| s)
+                    .map_err(|e| anyhow::anyhow!("Failed to cast slice to {}: {}", stringify!($struct_name), e))
+            }
+
+            #[inline(always)]
+            fn ffs_from_owned_bytes(data: [u8; $size]) -> Self {
+                bytemuck::cast(data)
+            }
+
+            #[inline(always)]
+            fn ffs_from_slice_or_panic(data: &[u8]) -> Self {
+                *bytemuck::from_bytes(data)
+            }
+
+            #[inline(always)]
+            fn ffs_to_bytes(&self) -> [u8; $size] {
+                bytemuck::cast(*self)
+            }
+
+            #[inline(always)]
+            fn ffs_into_bytes(self) -> [u8; $size] {
+                bytemuck::cast(self)
+            }
+
+            // --- OPTIMIZED VECTOR IMPLEMENTATIONS ---
+
+            /// Serializes a slice of `Self` into a `Vec<u8>` using a single, efficient
+            /// memory copy.
+            #[inline(always)]
+            fn ffs_serialize_vec_of_self_ref(data: &[Self]) -> Vec<u8> {
+                bytemuck::cast_slice(data).to_vec()
+            }
+
+            /// Serializes a `Vec<Self>` into a `Vec<u8>` using a zero-copy memory
+            /// reinterpret cast.
+            #[inline(always)]
+            fn ffs_serialize_vec_of_self(data: Vec<Self>) -> Vec<u8> {
+                // This is a zero-copy operation that reinterprets the `Vec<Self>` as a
+                // `Vec<u8>`. It's safe because `Self` is `Pod` and its memory
+                // representation is just a sequence of bytes.
+                let mut data = std::mem::ManuallyDrop::new(data);
+                let len = data.len() * $size;
+                let capacity = data.capacity() * $size;
+                let ptr = data.as_mut_ptr() as *mut u8;
+                // SAFETY: The original Vec is not dropped (thanks to ManuallyDrop), so we are
+                // taking ownership of its allocation. The new length and capacity are
+                // calculated correctly. Since `Self` is `Pod`, it's safe to view its
+                // bytes as `u8`.
+                unsafe { Vec::from_raw_parts(ptr, len, capacity) }
+            }
+
+            /// Deserializes a slice of bytes into a `Vec<Self>`, copying only if memory
+            /// alignment is incorrect.
+            #[inline(always)]
+            fn ffs_deserialize_vec_of_self(data: &[u8]) -> anyhow::Result<Vec<Self>> {
+                if data.len() % $size != 0 {
+                    anyhow::bail!(
+                        "Data length {} is not a multiple of object size {}",
+                        data.len(),
+                        $size
+                    );
+                }
+                // `pod_collect_to_vec` is the canonical way to safely convert `&[u8]` to
+                // `Vec<Pod>`. It handles potential memory alignment issues by copying
+                // the data if and only if the source slice is not already suitably
+                // aligned for `Self`.
+                Ok(bytemuck::pod_collect_to_vec(data))
+            }
+
+            /// Deserializes a `Vec<u8>` into a `Vec<Self>`, performing a zero-copy cast
+            /// if memory is aligned, otherwise falling back to a copy.
+            #[inline(always)]
+            fn ffs_deserialize_vec_of_self_owned(data: Vec<u8>) -> anyhow::Result<Vec<Self>> {
+                if data.len() % $size != 0 {
+                    anyhow::bail!(
+                        "Data length {} is not a multiple of object size {}",
+                        data.len(),
+                        $size
+                    );
+                }
+
+                // Check if the alignment of the `Vec<u8>` buffer is sufficient for `Self`.
+                // If it is, we can perform a zero-copy conversion. Otherwise, we must copy.
+                if data.as_ptr() as usize % std::mem::align_of::<Self>() == 0 {
+                    // Alignment is correct, proceed with zero-copy.
+                    let mut data = std::mem::ManuallyDrop::new(data);
+                    let len = data.len() / $size;
+                    let capacity = data.capacity() / $size;
+                    let ptr = data.as_mut_ptr() as *mut Self;
+                    // SAFETY: We checked length and alignment. The original Vec is not dropped.
+                    // `Self` is `Pod`, so any correctly-sized byte pattern is valid.
+                    Ok(unsafe { Vec::from_raw_parts(ptr, len, capacity) })
+                } else {
+                    // Alignment is incorrect, fall back to a safe, copying deserialization.
+                    Ok(bytemuck::pod_collect_to_vec(&data))
+                }
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use parth_core::{PHash, PF};
+
+            use super::*;
+
+            const SIZE_OF_ITEM: usize = $size;
+            type ItemForTesting = $struct_name<PF, PHash>;
+            
+            fn gen_item_vec(count: usize) -> Vec<ItemForTesting> {
+                let mut base = Vec::with_capacity(count);
+                for _ in 0..count {
+                    base.push(ItemForTesting::qp_rand_gen());
+                }
+                base
+            }
+            #[test]
+            fn test_ffs_serialization_fuzz_many_v0() {
+                let many = gen_item_vec(100_000);
+                let original = many.clone();
+                let start_time = std::time::Instant::now();
+                let bytes = ItemForTesting::ffs_serialize_vec_of_self(many);
+                let deserialized = ItemForTesting::ffs_deserialize_vec_of_self(&bytes).unwrap();
+                let duration = start_time.elapsed();
+                println!("Serialized and deserialized 100_000 in {:?}", duration);
+                assert_eq!(original.len(), deserialized.len());
+                for (o, d) in original.iter().zip(deserialized.iter()) {
+                    assert_eq!(o, d);
+                }
+            }
+
+            fn gen_single_item() -> ItemForTesting {
+                ItemForTesting::qp_rand_gen()
+            }
+
+            // --- Single Item Serialization Tests ---
+
+            #[test]
+            fn test_ffs_to_bytes_and_from_slice() {
+                let original = gen_single_item();
+                let bytes_arr = original.ffs_to_bytes();
+                let deserialized = ItemForTesting::ffs_from_slice_or_panic(&bytes_arr);
+                assert_eq!(original, deserialized);
+            }
+
+            #[test]
+            fn test_ffs_into_bytes_and_from_owned_bytes() {
+                let original = gen_single_item();
+                let bytes_arr = original.ffs_into_bytes();
+                let deserialized = ItemForTesting::ffs_from_owned_bytes(bytes_arr);
+                assert_eq!(original, deserialized);
+            }
+
+            #[test]
+            fn test_ffs_try_from_slice_valid() {
+                let original = gen_single_item();
+                let bytes = original.ffs_to_bytes();
+                let result = ItemForTesting::ffs_try_from_slice(&bytes);
+                assert!(result.is_ok());
+                assert_eq!(original, result.unwrap());
+            }
+
+            // --- Error Condition Tests for Single Items ---
+
+            #[test]
+            fn test_ffs_try_from_slice_invalid_length() {
+                // Test with a slice that is too short
+                let short_data = vec![0u8;  SIZE_OF_ITEM - 1];
+                let result = ItemForTesting::ffs_try_from_slice(&short_data);
+                assert!(result.is_err(), "Should fail with slice too short");
+
+                // Test with a slice that is too long
+                let long_data = vec![0u8;  SIZE_OF_ITEM + 1];
+                let result = ItemForTesting::ffs_try_from_slice(&long_data);
+                assert!(result.is_err(), "Should fail with slice too long");
+            }
+
+            #[test]
+            #[should_panic]
+            fn test_ffs_from_slice_or_panic_with_invalid_length() {
+                let short_data = vec![0u8; 10];
+                // This should panic because the length is incorrect
+                ItemForTesting::ffs_from_slice_or_panic(&short_data);
+            }
+
+            // --- Vector Serialization/Deserialization Tests ---
+
+            #[test]
+            fn test_deserialization_of_unaligned_data() {
+                const N: usize =  SIZE_OF_ITEM;
+                let original_vec: Vec<_> = gen_item_vec(10);
+
+                // Create a perfectly valid byte representation of our vector.
+                let valid_bytes = ItemForTesting::ffs_serialize_vec_of_self_ref(&original_vec);
+                assert_eq!(valid_bytes.len(), 10 * N);
+
+                // Now, create a larger buffer and copy the valid bytes into it at an
+                // offset of 1, guaranteeing the sub-slice is unaligned for any type
+                // with alignment > 1 (which ItemForTesting has).
+                let mut unaligned_buffer = vec![0u8; valid_bytes.len() + 1];
+                unaligned_buffer[1..].copy_from_slice(&valid_bytes);
+
+                // Create the unaligned slice. Direct casting would fail on this.
+                let unaligned_slice = &unaligned_buffer[1..];
+                assert_eq!(unaligned_slice.len(), valid_bytes.len());
+
+                // 1. Test ffs_deserialize_vec_of_self with the unaligned slice.
+                // This should now succeed by using the copying fallback.
+                let result_from_slice = ItemForTesting::ffs_deserialize_vec_of_self(unaligned_slice);
+                assert!(result_from_slice.is_ok(), "Deserializing from unaligned slice should succeed");
+                assert_eq!(original_vec, result_from_slice.unwrap());
+
+                // 2. Test ffs_deserialize_vec_of_self_owned with an unaligned Vec.
+                // Note: Creating an owned Vec<u8> with a guaranteed unaligned buffer is tricky,
+                // as the allocator might re-align it. Slicing is the most reliable way to test
+                // this. However, we can simulate the scenario by passing an unaligned
+                // slice's owned data.
+                let unaligned_owned_vec = unaligned_slice.to_vec();
+
+                let result_from_owned = ItemForTesting::ffs_deserialize_vec_of_self_owned(unaligned_owned_vec);
+                assert!(result_from_owned.is_ok(), "Deserializing from unaligned owned vec should succeed");
+                assert_eq!(original_vec, result_from_owned.unwrap());
+            }
+            #[test]
+            fn test_vec_serialization_deserialization_roundtrip() {
+                let original_vec = gen_item_vec(69);
+
+                // Test `ffs_serialize_vec_of_self` (takes ownership)
+                let bytes = ItemForTesting::ffs_serialize_vec_of_self(original_vec.clone());
+
+                // Test `ffs_deserialize_vec_of_self` (takes a slice)
+                let deserialized_vec_result = ItemForTesting::ffs_deserialize_vec_of_self(&bytes);
+
+                assert!(deserialized_vec_result.is_ok());
+                assert_eq!(original_vec, deserialized_vec_result.unwrap());
+            }
+
+            #[test]
+            fn test_vec_ref_serialization_deserialization_roundtrip() {
+                let original_vec = gen_item_vec(1337);
+
+                // Test `ffs_serialize_vec_of_self_ref` (takes a slice)
+                let bytes = ItemForTesting::ffs_serialize_vec_of_self_ref(&original_vec);
+
+                // Test `ffs_deserialize_vec_of_self_owned` (takes ownership)
+                let deserialized_vec_result = ItemForTesting::ffs_deserialize_vec_of_self_owned(bytes);
+
+                assert!(deserialized_vec_result.is_ok());
+                assert_eq!(original_vec, deserialized_vec_result.unwrap());
+            }
+
+            // --- Error Condition and Edge Case Tests for Vectors ---
+
+            #[test]
+            fn test_deserialize_vec_with_invalid_length() {
+                let valid_bytes = ItemForTesting::ffs_serialize_vec_of_self(gen_item_vec(2));
+
+                // Create a byte vector with a length that's not a multiple of the object size
+                let mut invalid_bytes = valid_bytes;
+                invalid_bytes.push(0xAB); // Add an extra byte
+
+                let result = ItemForTesting::ffs_deserialize_vec_of_self(&invalid_bytes);
+                assert!(result.is_err(), "Deserialization should fail for data with incorrect length");
+            }
+
+            #[test]
+            fn test_empty_vec_serialization_roundtrip() {
+                let empty_vec: Vec<ItemForTesting> = Vec::new();
+
+                // Serialize empty vector (ref)
+                let bytes_ref = ItemForTesting::ffs_serialize_vec_of_self_ref(&empty_vec);
+                assert!(bytes_ref.is_empty());
+
+                // Serialize empty vector (owned)
+                let bytes_owned = ItemForTesting::ffs_serialize_vec_of_self(empty_vec.clone());
+                assert!(bytes_owned.is_empty());
+
+                // Deserialize back from empty byte slice
+                let deserialized_result = ItemForTesting::ffs_deserialize_vec_of_self(&bytes_ref);
+                assert!(deserialized_result.is_ok());
+                assert!(deserialized_result.unwrap().is_empty());
+            }
+
+            #[test]
+            fn test_single_element_vec_serialization_roundtrip() {
+                let single_element_vec = gen_item_vec(1);
+
+                let bytes = ItemForTesting::ffs_serialize_vec_of_self_ref(&single_element_vec);
+                assert_eq!(bytes.len(),  SIZE_OF_ITEM);
+
+                let deserialized_result = ItemForTesting::ffs_deserialize_vec_of_self(&bytes);
+                assert!(deserialized_result.is_ok());
+                assert_eq!(single_element_vec, deserialized_result.unwrap());
+            }
+
+            // --- Fuzz and Performance Test (Adapted from original) ---
+
+            #[test]
+            fn test_ffs_serialization_fuzz_many() {
+                let many = gen_item_vec(1_000);
+                let original = many.clone();
+
+                let start_time = std::time::Instant::now();
+
+                // Serialize using the bytemuck-optimized method
+                let bytes = ItemForTesting::ffs_serialize_vec_of_self(many);
+                // Deserialize using the bytemuck-optimized method
+                let deserialized = ItemForTesting::ffs_deserialize_vec_of_self(&bytes).unwrap();
+
+                let duration = start_time.elapsed();
+                println!(
+                    "Optimized bytemuck serialization and deserialization of 1,000 ItemForTesting took: {:?}",
+                    duration
+                );
+
+                // Verify correctness
+                assert_eq!(original.len(), deserialized.len());
+                assert_eq!(original, deserialized, "The deserialized vector must be identical to the original");
+            }
+        }
+    };
+}
+
+
+
+
+/// Implements `FastFixedSerializable` for a `#[repr(C)]` struct using `bytemuck`
+/// for zero-copy/low-copy serialization and deserialization.
+///
+/// This macro is designed for structs that are Plain Old Data (`Pod`) and are
+/// feature-gated behind `all(target_endian = "little", feature = "serialize_bytemuck")`.
+///
+/// It also generates a comprehensive `#[cfg(test)]` module to verify the correctness
+/// of the implementation, including single-item and vector roundtrips, error handling,
+/// and behavior with unaligned data.
+///
+/// # Pre-requisites
+///
+/// The target struct MUST:
+/// 1. Be annotated with `#[repr(C)]`.
+/// 2. Derive or implement `bytemuck::Pod` and `bytemuck::Zeroable`.
+/// 3. Derive or implement `Copy`, `Clone`, and `PartialEq` (for tests).
+///
+/// # Usage
+///
+/// ```rust,ignore
+/// impl_bytemuck_ffs_with_tests!(
+///     // 1. The name of the struct.
+///     MyStruct,
+///     // 2. Generic parameters and their required trait bounds for the impl.
+///     //    These bounds should include `bytemuck::Pod` and `Copy`.
+///     { F: MyFieldTrait + bytemuck::Pod + Copy, H: MyHashTrait + bytemuck::Pod + Copy },
+///     // 3. The concrete types to use when creating an instance for testing.
+///     //    These must match the order of the generic parameters.
+///     { ConcreteField, ConcreteHash },
+///     // 4. The compile-time constant size of the struct in bytes.
+///     128
+/// );
+/// ```
+#[macro_export]
+macro_rules! impl_bytemuck_ffs_with_tests_v2 {
+    (
+        $struct_name:ident,
+        { $($generic_param:ident: $trait_bound:path),* },
+        { $($concrete_type:ty),* },
+        $size:literal
+    ) => {
+        // --- ZERO-COPY FastFixedSerializable IMPLEMENTATION ---
+        // This implementation uses `bytemuck` to perform zero-copy or low-copy
+        // serialization and deserialization. This is highly efficient but requires the
+        // struct to be `#[repr(C)]` and implement `bytemuck::Pod` (Plain Old Data).
+        // This code is only compiled when the appropriate features and target are enabled.
+        #[cfg(all(target_endian = "little", feature = "serialize_bytemuck"))]
+        impl<
+            $($generic_param: $trait_bound + bytemuck::Pod + Copy),*
+        > parth_core::data::serializable::FastFixedSerializable<$size> for $struct_name<$($generic_param),*> {
+            #[inline(always)]
+            fn ffs_try_from_slice(data: &[u8]) -> ::anyhow::Result<Self> {
+                bytemuck::try_from_bytes(data)
+                    .map(|&s| s)
+                    .map_err(|e| ::anyhow::anyhow!("Failed to cast slice to {}: {}", stringify!($struct_name), e))
+            }
+
+            #[inline(always)]
+            fn ffs_from_owned_bytes(data: [u8; $size]) -> Self {
+                bytemuck::cast(data)
+            }
+
+            #[inline(always)]
+            fn ffs_from_slice_or_panic(data: &[u8]) -> Self {
+                *bytemuck::from_bytes(data)
+            }
+
+            #[inline(always)]
+            fn ffs_to_bytes(&self) -> [u8; $size] {
+                bytemuck::cast(*self)
+            }
+
+            #[inline(always)]
+            fn ffs_into_bytes(self) -> [u8; $size] {
+                bytemuck::cast(self)
+            }
+
+            // --- OPTIMIZED VECTOR IMPLEMENTATIONS ---
+
+            /// Serializes a slice of `Self` into a `Vec<u8>` using a single, efficient
+            /// memory copy.
+            #[inline(always)]
+            fn ffs_serialize_vec_of_self_ref(data: &[Self]) -> Vec<u8> {
+                bytemuck::cast_slice(data).to_vec()
+            }
+
+            /// Serializes a `Vec<Self>` into a `Vec<u8>` using a zero-copy memory
+            /// reinterpret cast.
+            #[inline(always)]
+            fn ffs_serialize_vec_of_self(data: Vec<Self>) -> Vec<u8> {
+                // This is a zero-copy operation that reinterprets the `Vec<Self>` as a
+                // `Vec<u8>`. It's safe because `Self` is `Pod` and its memory
+                // representation is just a sequence of bytes.
+                let mut data = ::std::mem::ManuallyDrop::new(data);
+                let len = data.len() * $size;
+                let capacity = data.capacity() * $size;
+                let ptr = data.as_mut_ptr() as *mut u8;
+                // SAFETY: The original Vec is not dropped (thanks to ManuallyDrop), so we are
+                // taking ownership of its allocation. The new length and capacity are
+                // calculated correctly. Since `Self` is `Pod`, it's safe to view its
+                // bytes as `u8`.
+                unsafe { Vec::from_raw_parts(ptr, len, capacity) }
+            }
+
+            /// Deserializes a slice of bytes into a `Vec<Self>`, copying only if memory
+            /// alignment is incorrect.
+            #[inline(always)]
+            fn ffs_deserialize_vec_of_self(data: &[u8]) -> ::anyhow::Result<Vec<Self>> {
+                if data.len() % $size != 0 {
+                    ::anyhow::bail!(
+                        "Data length {} is not a multiple of object size {}",
+                        data.len(),
+                        $size
+                    );
+                }
+                // `pod_collect_to_vec` is the canonical way to safely convert `&[u8]` to
+                // `Vec<Pod>`. It handles potential memory alignment issues by copying
+                // the data if and only if the source slice is not already suitably
+                // aligned for `Self`.
+                Ok(bytemuck::pod_collect_to_vec(data))
+            }
+
+            /// Deserializes a `Vec<u8>` into a `Vec<Self>`, performing a zero-copy cast
+            /// if memory is aligned, otherwise falling back to a copy.
+            #[inline(always)]
+            fn ffs_deserialize_vec_of_self_owned(data: Vec<u8>) -> ::anyhow::Result<Vec<Self>> {
+                if data.len() % $size != 0 {
+                    ::anyhow::bail!(
+                        "Data length {} is not a multiple of object size {}",
+                        data.len(),
+                        $size
+                    );
+                }
+
+                // Check if the alignment of the `Vec<u8>` buffer is sufficient for `Self`.
+                // If it is, we can perform a zero-copy conversion. Otherwise, we must copy.
+                if data.as_ptr() as usize % ::std::mem::align_of::<Self>() == 0 {
+                    // Alignment is correct, proceed with zero-copy.
+                    let mut data = ::std::mem::ManuallyDrop::new(data);
+                    let len = data.len() / $size;
+                    let capacity = data.capacity() / $size;
+                    let ptr = data.as_mut_ptr() as *mut Self;
+                    // SAFETY: We checked length and alignment. The original Vec is not dropped.
+                    // `Self` is `Pod`, so any correctly-sized byte pattern is valid.
+                    Ok(unsafe { Vec::from_raw_parts(ptr, len, capacity) })
+                } else {
+                    // Alignment is incorrect, fall back to a safe, copying deserialization.
+                    Ok(bytemuck::pod_collect_to_vec(&data))
+                }
+            }
+        }
+
+        #[cfg(all(test, target_endian = "little", feature = "serialize_bytemuck"))]
+        mod tests {
+            use super::*;
+            use parth_core::data::serializable::FastFixedSerializable;
+            use parth_core::utils::QPGenRandom;
+
+            const SIZE_OF_ITEM: usize = $size;
+            type ItemForTesting = $struct_name<$($concrete_type),*>;
+
+            fn gen_item_vec(count: usize) -> Vec<ItemForTesting> {
+                let mut base = Vec::with_capacity(count);
+                for _ in 0..count {
+                    base.push(ItemForTesting::qp_rand_gen());
+                }
+                base
+            }
+            #[test]
+            fn test_ffs_serialization_fuzz_many_v0() {
+                let many = gen_item_vec(100_000);
+                let original = many.clone();
+                let start_time = ::std::time::Instant::now();
+                let bytes = ItemForTesting::ffs_serialize_vec_of_self(many);
+                let deserialized = ItemForTesting::ffs_deserialize_vec_of_self(&bytes).unwrap();
+                let duration = start_time.elapsed();
+                println!("Serialized and deserialized 100_000 in {:?}", duration);
+                assert_eq!(original.len(), deserialized.len());
+                for (o, d) in original.iter().zip(deserialized.iter()) {
+                    assert_eq!(o, d);
+                }
+            }
+
+            fn gen_single_item() -> ItemForTesting {
+                ItemForTesting::qp_rand_gen()
+            }
+
+            // --- Single Item Serialization Tests ---
+
+            #[test]
+            fn test_ffs_to_bytes_and_from_slice() {
+                let original = gen_single_item();
+                let bytes_arr = original.ffs_to_bytes();
+                let deserialized = ItemForTesting::ffs_from_slice_or_panic(&bytes_arr);
+                assert_eq!(original, deserialized);
+            }
+
+            #[test]
+            fn test_ffs_into_bytes_and_from_owned_bytes() {
+                let original = gen_single_item();
+                let bytes_arr = original.ffs_into_bytes();
+                let deserialized = ItemForTesting::ffs_from_owned_bytes(bytes_arr);
+                assert_eq!(original, deserialized);
+            }
+
+            #[test]
+            fn test_ffs_try_from_slice_valid() {
+                let original = gen_single_item();
+                let bytes = original.ffs_to_bytes();
+                let result = ItemForTesting::ffs_try_from_slice(&bytes);
+                assert!(result.is_ok());
+                assert_eq!(original, result.unwrap());
+            }
+
+            // --- Error Condition Tests for Single Items ---
+
+            #[test]
+            fn test_ffs_try_from_slice_invalid_length() {
+                // Test with a slice that is too short
+                let short_data = vec![0u8;  SIZE_OF_ITEM - 1];
+                let result = ItemForTesting::ffs_try_from_slice(&short_data);
+                assert!(result.is_err(), "Should fail with slice too short");
+
+                // Test with a slice that is too long
+                let long_data = vec![0u8;  SIZE_OF_ITEM + 1];
+                let result = ItemForTesting::ffs_try_from_slice(&long_data);
+                assert!(result.is_err(), "Should fail with slice too long");
+            }
+
+            #[test]
+            #[should_panic]
+            fn test_ffs_from_slice_or_panic_with_invalid_length() {
+                let short_data = vec![0u8; 10];
+                // This should panic because the length is incorrect
+                ItemForTesting::ffs_from_slice_or_panic(&short_data);
+            }
+
+            // --- Vector Serialization/Deserialization Tests ---
+
+            #[test]
+            fn test_deserialization_of_unaligned_data() {
+                const N: usize =  SIZE_OF_ITEM;
+                let original_vec: Vec<_> = gen_item_vec(10);
+
+                // Create a perfectly valid byte representation of our vector.
+                let valid_bytes = ItemForTesting::ffs_serialize_vec_of_self_ref(&original_vec);
+                assert_eq!(valid_bytes.len(), 10 * N);
+
+                // Now, create a larger buffer and copy the valid bytes into it at an
+                // offset of 1, guaranteeing the sub-slice is unaligned for any type
+                // with alignment > 1 (which ItemForTesting likely has).
+                let mut unaligned_buffer = vec![0u8; valid_bytes.len() + 1];
+                unaligned_buffer[1..].copy_from_slice(&valid_bytes);
+
+                // Create the unaligned slice. Direct casting would fail on this.
+                let unaligned_slice = &unaligned_buffer[1..];
+                assert_eq!(unaligned_slice.len(), valid_bytes.len());
+
+                // 1. Test ffs_deserialize_vec_of_self with the unaligned slice.
+                // This should succeed by using the copying fallback.
+                let result_from_slice = ItemForTesting::ffs_deserialize_vec_of_self(unaligned_slice);
+                assert!(result_from_slice.is_ok(), "Deserializing from unaligned slice should succeed");
+                assert_eq!(original_vec, result_from_slice.unwrap());
+
+                // 2. Test ffs_deserialize_vec_of_self_owned with an unaligned Vec.
+                // This simulates passing an owned Vec<u8> with an unaligned buffer.
+                let unaligned_owned_vec = unaligned_slice.to_vec();
+
+                let result_from_owned = ItemForTesting::ffs_deserialize_vec_of_self_owned(unaligned_owned_vec);
+                assert!(result_from_owned.is_ok(), "Deserializing from unaligned owned vec should succeed");
+                assert_eq!(original_vec, result_from_owned.unwrap());
+            }
+
+            #[test]
+            fn test_vec_serialization_deserialization_roundtrip() {
+                let original_vec = gen_item_vec(69);
+
+                // Test `ffs_serialize_vec_of_self` (takes ownership)
+                let bytes = ItemForTesting::ffs_serialize_vec_of_self(original_vec.clone());
+
+                // Test `ffs_deserialize_vec_of_self` (takes a slice)
+                let deserialized_vec_result = ItemForTesting::ffs_deserialize_vec_of_self(&bytes);
+
+                assert!(deserialized_vec_result.is_ok());
+                assert_eq!(original_vec, deserialized_vec_result.unwrap());
+            }
+
+            #[test]
+            fn test_vec_ref_serialization_deserialization_roundtrip() {
+                let original_vec = gen_item_vec(1337);
+
+                // Test `ffs_serialize_vec_of_self_ref` (takes a slice)
+                let bytes = ItemForTesting::ffs_serialize_vec_of_self_ref(&original_vec);
+
+                // Test `ffs_deserialize_vec_of_self_owned` (takes ownership)
+                let deserialized_vec_result = ItemForTesting::ffs_deserialize_vec_of_self_owned(bytes);
+
+                assert!(deserialized_vec_result.is_ok());
+                assert_eq!(original_vec, deserialized_vec_result.unwrap());
+            }
+
+            // --- Error Condition and Edge Case Tests for Vectors ---
+
+            #[test]
+            fn test_deserialize_vec_with_invalid_length() {
+                let valid_bytes = ItemForTesting::ffs_serialize_vec_of_self(gen_item_vec(2));
+
+                // Create a byte vector with a length that's not a multiple of the object size
+                let mut invalid_bytes = valid_bytes;
+                invalid_bytes.push(0xAB); // Add an extra byte
+
+                let result = ItemForTesting::ffs_deserialize_vec_of_self(&invalid_bytes);
+                assert!(result.is_err(), "Deserialization should fail for data with incorrect length");
+            }
+
+            #[test]
+            fn test_empty_vec_serialization_roundtrip() {
+                let empty_vec: Vec<ItemForTesting> = Vec::new();
+
+                // Serialize empty vector (ref)
+                let bytes_ref = ItemForTesting::ffs_serialize_vec_of_self_ref(&empty_vec);
+                assert!(bytes_ref.is_empty());
+
+                // Serialize empty vector (owned)
+                let bytes_owned = ItemForTesting::ffs_serialize_vec_of_self(empty_vec.clone());
+                assert!(bytes_owned.is_empty());
+
+                // Deserialize back from empty byte slice
+                let deserialized_result = ItemForTesting::ffs_deserialize_vec_of_self(&bytes_ref);
+                assert!(deserialized_result.is_ok());
+                assert!(deserialized_result.unwrap().is_empty());
+            }
+
+            #[test]
+            fn test_single_element_vec_serialization_roundtrip() {
+                let single_element_vec = gen_item_vec(1);
+
+                let bytes = ItemForTesting::ffs_serialize_vec_of_self_ref(&single_element_vec);
+                assert_eq!(bytes.len(),  SIZE_OF_ITEM);
+
+                let deserialized_result = ItemForTesting::ffs_deserialize_vec_of_self(&bytes);
+                assert!(deserialized_result.is_ok());
+                assert_eq!(single_element_vec, deserialized_result.unwrap());
+            }
+
+            // --- Fuzz and Performance Test ---
+
+            #[test]
+            fn test_ffs_serialization_fuzz_many() {
+                let many = gen_item_vec(1_000);
+                let original = many.clone();
+
+                let start_time = ::std::time::Instant::now();
+
+                // Serialize using the bytemuck-optimized method
+                let bytes = ItemForTesting::ffs_serialize_vec_of_self(many);
+                // Deserialize using the bytemuck-optimized method
+                let deserialized = ItemForTesting::ffs_deserialize_vec_of_self(&bytes).unwrap();
+
+                let duration = start_time.elapsed();
+                println!(
+                    "Optimized bytemuck S/D of 1,000 {} took: {:?}",
+                    stringify!($struct_name),
+                    duration
+                );
+
+                // Verify correctness
+                assert_eq!(original.len(), deserialized.len());
+                assert_eq!(original, deserialized, "The deserialized vector must be identical to the original");
+            }
+        }
+    };
+}
+
+
+/// Implements `FastFixedSerializable` for a `#[repr(C)]` struct using `bytemuck`
+/// for zero-copy/low-copy serialization and deserialization.
+///
+/// This macro is designed for structs that are Plain Old Data (`Pod`) and is
+/// feature-gated behind `all(target_endian = "little", feature = "serialize_bytemuck")`.
+///
+/// # Pre-requisites
+///
+/// The target struct MUST:
+/// 1. Be annotated with `#[repr(C)]`.
+/// 2. Derive or implement `bytemuck::Pod` and `bytemuck::Zeroable`.
+/// 3. Derive or implement `Copy`.
+///
+/// # Usage
+///
+/// ```rust,ignore
+/// impl_bytemuck_ffs!(
+///     // 1. The name of the struct.
+///     MyStruct,
+///     // 2. Generic parameters and their required trait bounds for the impl.
+///     //    These bounds should typically be the concrete marker traits that
+///     //    ensure the struct is `Pod`.
+///     { F: MyFieldTrait, H: MyHashTrait },
+///     // 3. The compile-time constant size of the struct in bytes.
+///     128
+/// );
+/// ```
+#[macro_export]
+macro_rules! impl_bytemuck_ffs {
+    (
+        $struct_name:ident,
+        { $($generic_param:ident: $trait_bound:path),* },
+        $size:literal
+    ) => {
+        // --- ZERO-COPY FastFixedSerializable IMPLEMENTATION ---
+        // This implementation uses `bytemuck` to perform zero-copy or low-copy
+        // serialization and deserialization. This is highly efficient but requires the
+        // struct to be `#[repr(C)]` and implement `bytemuck::Pod` (Plain Old Data).
+        // This code is only compiled when the appropriate features and target are enabled.
+        #[cfg(all(target_endian = "little", feature = "serialize_bytemuck"))]
+        impl<
+            $($generic_param: $trait_bound + bytemuck::Pod + Copy),*
+        > parth_core::data::serializable::FastFixedSerializable<$size> for $struct_name<$($generic_param),*> {
+            #[inline(always)]
+            fn ffs_try_from_slice(data: &[u8]) -> ::anyhow::Result<Self> {
+                bytemuck::try_from_bytes(data)
+                    .map(|&s| s)
+                    .map_err(|e| ::anyhow::anyhow!("Failed to cast slice to {}: {}", stringify!($struct_name), e))
+            }
+
+            #[inline(always)]
+            fn ffs_from_owned_bytes(data: [u8; $size]) -> Self {
+                bytemuck::cast(data)
+            }
+
+            #[inline(always)]
+            fn ffs_from_slice_or_panic(data: &[u8]) -> Self {
+                *bytemuck::from_bytes(data)
+            }
+
+            #[inline(always)]
+            fn ffs_to_bytes(&self) -> [u8; $size] {
+                bytemuck::cast(*self)
+            }
+
+            #[inline(always)]
+            fn ffs_into_bytes(self) -> [u8; $size] {
+                bytemuck::cast(self)
+            }
+
+            // --- OPTIMIZED VECTOR IMPLEMENTATIONS ---
+
+            /// Serializes a slice of `Self` into a `Vec<u8>` using a single, efficient
+            /// memory copy.
+            #[inline(always)]
+            fn ffs_serialize_vec_of_self_ref(data: &[Self]) -> Vec<u8> {
+                bytemuck::cast_slice(data).to_vec()
+            }
+
+            /// Serializes a `Vec<Self>` into a `Vec<u8>` using a zero-copy memory
+            /// reinterpret cast.
+            #[inline(always)]
+            fn ffs_serialize_vec_of_self(data: Vec<Self>) -> Vec<u8> {
+                // This is a zero-copy operation that reinterprets the `Vec<Self>` as a
+                // `Vec<u8>`. It's safe because `Self` is `Pod` and its memory
+                // representation is just a sequence of bytes.
+                let mut data = ::std::mem::ManuallyDrop::new(data);
+                let len = data.len() * $size;
+                let capacity = data.capacity() * $size;
+                let ptr = data.as_mut_ptr() as *mut u8;
+                // SAFETY: The original Vec is not dropped (thanks to ManuallyDrop), so we are
+                // taking ownership of its allocation. The new length and capacity are
+                // calculated correctly. Since `Self` is `Pod`, it's safe to view its
+                // bytes as `u8`.
+                unsafe { Vec::from_raw_parts(ptr, len, capacity) }
+            }
+
+            /// Deserializes a slice of bytes into a `Vec<Self>`, copying only if memory
+            /// alignment is incorrect.
+            #[inline(always)]
+            fn ffs_deserialize_vec_of_self(data: &[u8]) -> ::anyhow::Result<Vec<Self>> {
+                if data.len() % $size != 0 {
+                    ::anyhow::bail!(
+                        "Data length {} is not a multiple of object size {}",
+                        data.len(),
+                        $size
+                    );
+                }
+                // `pod_collect_to_vec` is the canonical way to safely convert `&[u8]` to
+                // `Vec<Pod>`. It handles potential memory alignment issues by copying
+                // the data if and only if the source slice is not already suitably
+                // aligned for `Self`.
+                Ok(bytemuck::pod_collect_to_vec(data))
+            }
+
+            /// Deserializes a `Vec<u8>` into a `Vec<Self>`, performing a zero-copy cast
+            /// if memory is aligned, otherwise falling back to a copy.
+            #[inline(always)]
+            fn ffs_deserialize_vec_of_self_owned(data: Vec<u8>) -> ::anyhow::Result<Vec<Self>> {
+                if data.len() % $size != 0 {
+                    ::anyhow::bail!(
+                        "Data length {} is not a multiple of object size {}",
+                        data.len(),
+                        $size
+                    );
+                }
+
+                // Check if the alignment of the `Vec<u8>` buffer is sufficient for `Self`.
+                // If it is, we can perform a zero-copy conversion. Otherwise, we must copy.
+                if data.as_ptr() as usize % ::std::mem::align_of::<Self>() == 0 {
+                    // Alignment is correct, proceed with zero-copy.
+                    let mut data = ::std::mem::ManuallyDrop::new(data);
+                    let len = data.len() / $size;
+                    let capacity = data.capacity() / $size;
+                    let ptr = data.as_mut_ptr() as *mut Self;
+                    // SAFETY: We checked length and alignment. The original Vec is not dropped.
+                    // `Self` is `Pod`, so any correctly-sized byte pattern is valid.
+                    Ok(unsafe { Vec::from_raw_parts(ptr, len, capacity) })
+                } else {
+                    // Alignment is incorrect, fall back to a safe, copying deserialization.
+                    Ok(bytemuck::pod_collect_to_vec(&data))
+                }
+            }
+        }
+    };
+}
+
+/// Generates a comprehensive test suite for a `FastFixedSerializable` implementation
+/// that uses `bytemuck`.
+///
+/// This macro should be called after `impl_bytemuck_ffs` and will verify the
+/// correctness of the implementation, including single-item and vector roundtrips,
+/// error handling, and behavior with unaligned data.
+///
+/// # Pre-requisites
+///
+/// The tested struct MUST implement:
+/// 1. `QPGenRandom` to generate test instances.
+/// 2. `PartialEq` and `Clone` to compare results.
+///
+/// # Usage
+///
+/// ```rust,ignore
+/// impl_bytemuck_ffs_tests!(
+///     // 1. The name of the struct.
+///     MyStruct,
+///     // 2. The concrete types to use when creating an instance for testing.
+///     //    These must match the order of the generic parameters.
+///     { ConcreteField, ConcreteHash },
+///     // 3. The compile-time constant size of the struct in bytes.
+///     128
+/// );
+/// ```
+#[macro_export]
+macro_rules! impl_bytemuck_ffs_tests {
+    (
+        $struct_name:ident,
+        { $($concrete_type:ty),* },
+        $size:literal
+    ) => {
+        #[cfg(all(test, target_endian = "little", feature = "serialize_bytemuck"))]
+        mod tests {
+            use super::*;
+            use parth_core::data::serializable::FastFixedSerializable;
+            use parth_core::utils::QPGenRandom;
+
+            const SIZE_OF_ITEM: usize = $size;
+            type ItemForTesting = $struct_name<$($concrete_type),*>;
+
+            fn gen_item_vec(count: usize) -> Vec<ItemForTesting> {
+                let mut base = Vec::with_capacity(count);
+                for _ in 0..count {
+                    base.push(ItemForTesting::qp_rand_gen());
+                }
+                base
+            }
+            #[test]
+            fn test_ffs_serialization_fuzz_many_v0() {
+                let many = gen_item_vec(100_000);
+                let original = many.clone();
+                let start_time = ::std::time::Instant::now();
+                let bytes = ItemForTesting::ffs_serialize_vec_of_self(many);
+                let deserialized = ItemForTesting::ffs_deserialize_vec_of_self(&bytes).unwrap();
+                let duration = start_time.elapsed();
+                println!("Serialized and deserialized 100_000 in {:?}", duration);
+                assert_eq!(original.len(), deserialized.len());
+                for (o, d) in original.iter().zip(deserialized.iter()) {
+                    assert_eq!(o, d);
+                }
+            }
+
+            fn gen_single_item() -> ItemForTesting {
+                ItemForTesting::qp_rand_gen()
+            }
+
+            // --- Single Item Serialization Tests ---
+
+            #[test]
+            fn test_ffs_to_bytes_and_from_slice() {
+                let original = gen_single_item();
+                let bytes_arr = original.ffs_to_bytes();
+                let deserialized = ItemForTesting::ffs_from_slice_or_panic(&bytes_arr);
+                assert_eq!(original, deserialized);
+            }
+
+            #[test]
+            fn test_ffs_into_bytes_and_from_owned_bytes() {
+                let original = gen_single_item();
+                let bytes_arr = original.ffs_into_bytes();
+                let deserialized = ItemForTesting::ffs_from_owned_bytes(bytes_arr);
+                assert_eq!(original, deserialized);
+            }
+
+            #[test]
+            fn test_ffs_try_from_slice_valid() {
+                let original = gen_single_item();
+                let bytes = original.ffs_to_bytes();
+                let result = ItemForTesting::ffs_try_from_slice(&bytes);
+                assert!(result.is_ok());
+                assert_eq!(original, result.unwrap());
+            }
+
+            // --- Error Condition Tests for Single Items ---
+
+            #[test]
+            fn test_ffs_try_from_slice_invalid_length() {
+                // Test with a slice that is too short
+                let short_data = vec![0u8;  SIZE_OF_ITEM - 1];
+                let result = ItemForTesting::ffs_try_from_slice(&short_data);
+                assert!(result.is_err(), "Should fail with slice too short");
+
+                // Test with a slice that is too long
+                let long_data = vec![0u8;  SIZE_OF_ITEM + 1];
+                let result = ItemForTesting::ffs_try_from_slice(&long_data);
+                assert!(result.is_err(), "Should fail with slice too long");
+            }
+
+            #[test]
+            #[should_panic]
+            fn test_ffs_from_slice_or_panic_with_invalid_length() {
+                let short_data = vec![0u8; 10];
+                // This should panic because the length is incorrect
+                ItemForTesting::ffs_from_slice_or_panic(&short_data);
+            }
+
+            // --- Vector Serialization/Deserialization Tests ---
+
+            #[test]
+            fn test_deserialization_of_unaligned_data() {
+                const N: usize =  SIZE_OF_ITEM;
+                let original_vec: Vec<_> = gen_item_vec(10);
+
+                // Create a perfectly valid byte representation of our vector.
+                let valid_bytes = ItemForTesting::ffs_serialize_vec_of_self_ref(&original_vec);
+                assert_eq!(valid_bytes.len(), 10 * N);
+
+                // Now, create a larger buffer and copy the valid bytes into it at an
+                // offset of 1, guaranteeing the sub-slice is unaligned for any type
+                // with alignment > 1 (which ItemForTesting likely has).
+                let mut unaligned_buffer = vec![0u8; valid_bytes.len() + 1];
+                unaligned_buffer[1..].copy_from_slice(&valid_bytes);
+
+                // Create the unaligned slice. Direct casting would fail on this.
+                let unaligned_slice = &unaligned_buffer[1..];
+                assert_eq!(unaligned_slice.len(), valid_bytes.len());
+
+                // 1. Test ffs_deserialize_vec_of_self with the unaligned slice.
+                // This should succeed by using the copying fallback.
+                let result_from_slice = ItemForTesting::ffs_deserialize_vec_of_self(unaligned_slice);
+                assert!(result_from_slice.is_ok(), "Deserializing from unaligned slice should succeed");
+                assert_eq!(original_vec, result_from_slice.unwrap());
+
+                // 2. Test ffs_deserialize_vec_of_self_owned with an unaligned Vec.
+                // This simulates passing an owned Vec<u8> with an unaligned buffer.
+                let unaligned_owned_vec = unaligned_slice.to_vec();
+
+                let result_from_owned = ItemForTesting::ffs_deserialize_vec_of_self_owned(unaligned_owned_vec);
+                assert!(result_from_owned.is_ok(), "Deserializing from unaligned owned vec should succeed");
+                assert_eq!(original_vec, result_from_owned.unwrap());
+            }
+
+            #[test]
+            fn test_vec_serialization_deserialization_roundtrip() {
+                let original_vec = gen_item_vec(69);
+
+                // Test `ffs_serialize_vec_of_self` (takes ownership)
+                let bytes = ItemForTesting::ffs_serialize_vec_of_self(original_vec.clone());
+
+                // Test `ffs_deserialize_vec_of_self` (takes a slice)
+                let deserialized_vec_result = ItemForTesting::ffs_deserialize_vec_of_self(&bytes);
+
+                assert!(deserialized_vec_result.is_ok());
+                assert_eq!(original_vec, deserialized_vec_result.unwrap());
+            }
+
+            #[test]
+            fn test_vec_ref_serialization_deserialization_roundtrip() {
+                let original_vec = gen_item_vec(1337);
+
+                // Test `ffs_serialize_vec_of_self_ref` (takes a slice)
+                let bytes = ItemForTesting::ffs_serialize_vec_of_self_ref(&original_vec);
+
+                // Test `ffs_deserialize_vec_of_self_owned` (takes ownership)
+                let deserialized_vec_result = ItemForTesting::ffs_deserialize_vec_of_self_owned(bytes);
+
+                assert!(deserialized_vec_result.is_ok());
+                assert_eq!(original_vec, deserialized_vec_result.unwrap());
+            }
+
+            // --- Error Condition and Edge Case Tests for Vectors ---
+
+            #[test]
+            fn test_deserialize_vec_with_invalid_length() {
+                let valid_bytes = ItemForTesting::ffs_serialize_vec_of_self(gen_item_vec(2));
+
+                // Create a byte vector with a length that's not a multiple of the object size
+                let mut invalid_bytes = valid_bytes;
+                invalid_bytes.push(0xAB); // Add an extra byte
+
+                let result = ItemForTesting::ffs_deserialize_vec_of_self(&invalid_bytes);
+                assert!(result.is_err(), "Deserialization should fail for data with incorrect length");
+            }
+
+            #[test]
+            fn test_empty_vec_serialization_roundtrip() {
+                let empty_vec: Vec<ItemForTesting> = Vec::new();
+
+                // Serialize empty vector (ref)
+                let bytes_ref = ItemForTesting::ffs_serialize_vec_of_self_ref(&empty_vec);
+                assert!(bytes_ref.is_empty());
+
+                // Serialize empty vector (owned)
+                let bytes_owned = ItemForTesting::ffs_serialize_vec_of_self(empty_vec.clone());
+                assert!(bytes_owned.is_empty());
+
+                // Deserialize back from empty byte slice
+                let deserialized_result = ItemForTesting::ffs_deserialize_vec_of_self(&bytes_ref);
+                assert!(deserialized_result.is_ok());
+                assert!(deserialized_result.unwrap().is_empty());
+            }
+
+            #[test]
+            fn test_single_element_vec_serialization_roundtrip() {
+                let single_element_vec = gen_item_vec(1);
+
+                let bytes = ItemForTesting::ffs_serialize_vec_of_self_ref(&single_element_vec);
+                assert_eq!(bytes.len(),  SIZE_OF_ITEM);
+
+                let deserialized_result = ItemForTesting::ffs_deserialize_vec_of_self(&bytes);
+                assert!(deserialized_result.is_ok());
+                assert_eq!(single_element_vec, deserialized_result.unwrap());
+            }
+
+            // --- Fuzz and Performance Test ---
+
+            #[test]
+            fn test_ffs_serialization_fuzz_many() {
+                let many = gen_item_vec(1_000);
+                let original = many.clone();
+
+                let start_time = ::std::time::Instant::now();
+
+                // Serialize using the bytemuck-optimized method
+                let bytes = ItemForTesting::ffs_serialize_vec_of_self(many);
+                // Deserialize using the bytemuck-optimized method
+                let deserialized = ItemForTesting::ffs_deserialize_vec_of_self(&bytes).unwrap();
+
+                let duration = start_time.elapsed();
+                println!(
+                    "Optimized bytemuck S/D of 1,000 {} took: {:?}",
+                    stringify!($struct_name),
+                    duration
+                );
+
+                // Verify correctness
+                assert_eq!(original.len(), deserialized.len());
+                assert_eq!(original, deserialized, "The deserialized vector must be identical to the original");
+            }
+        }
+    };
+}

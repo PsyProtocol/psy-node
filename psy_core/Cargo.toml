@@ -4,14 +4,16 @@ name    = "psy_core"
 version = "0.1.0"
 
 [features]
-default = ["std", "serialize_rkyv", "parth_core/serialize_rkyv", "parth_core/serialize_speedy", "parth_core/serialize_postcard"]
+default = ["std", "serialize_rkyv", "parth_core/serialize_rkyv", "parth_core/serialize_speedy", "parth_core/serialize_postcard", "serialize_bytemuck"]
 std = ["parth_core/std", "pser/std"]
 serialize_rkyv = ["dep:rkyv","pser/serialize_rkyv", "parth_core/serialize_rkyv"]
 serialize_speedy = ["dep:speedy", "pser/serialize_speedy", "parth_core/serialize_speedy"]
 serialize_postcard = ["dep:postcard", "pser/serialize_postcard", "parth_core/serialize_postcard"]
+serialize_bytemuck = ["dep:bytemuck", "parth_core/serialize_bytemuck"]
 
 [dependencies]
 postcard = { workspace = true, optional = true }
+bytemuck = { workspace = true, optional = true }
 rkyv = { workspace = true, optional = true }
 speedy = { workspace = true, optional = true }
 anyhow     = { workspace = true }

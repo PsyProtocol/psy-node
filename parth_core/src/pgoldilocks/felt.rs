@@ -46,6 +46,10 @@ impl ToU64Value for PGoldilocksFelt {
     fn from_owned_u64(value: u64) -> Self {
         Self::from_noncanonical_u64(value)
     }
+    
+    fn tuv_to_canonical_u64(&self) -> u64 {
+        self.to_canonical_u64()
+    }
 }
 
 impl QPGenRandom for PGoldilocksFelt {

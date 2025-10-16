@@ -3,7 +3,8 @@ use serde::{de::DeserializeOwned, Serialize};
 use crate::data::serializable::{QPDSerializable, QPDSerializableFixed};
 
 
-#[pderive::serialize_copy_default]
+#[pderive::serialize_copy_default_bm]
+#[repr(C)]
 pub struct QDoubleIdKey {
     pub obj_id: u64,
     pub secondary_id: u64,
@@ -77,12 +78,19 @@ pub trait QDatabaseKeyIdValueTableRowCreatable<V> {
     fn create_from_key_id_value_row(obj_id: u64, value: V) -> Self;
 }
 
-#[pderive::serialize_clone]
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize, Default)]
+#[cfg_attr(feature = "serialize_rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
+#[cfg_attr(feature = "serialize_speedy", derive(speedy::Readable, speedy::Writable))]
+//#[cfg_attr(feature = "serialize_bytemuck", derive(bytemuck::Pod, bytemuck::Zeroable))]
+#[repr(C)]
+// how to something like: #[bytemuck(bound="V: bytemuck::Pod")]
 pub struct QDatabaseSingleIdTableRow<V> {
     pub obj_id: u64,
     pub checkpoint_id: u64,
     pub value: V,
 }
+//pser::impl_bytemuck_pod_and_zeroable!(QDatabaseSingleIdTableRow, V);
 impl<V> QDatabaseSingleIdTableRow<V> {
     pub fn new(obj_id: u64, checkpoint_id: u64, value: V) -> Self {
         Self {

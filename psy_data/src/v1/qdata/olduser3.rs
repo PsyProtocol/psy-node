@@ -1,4 +1,4 @@
-use parth_core::{crypto::hash::traits::{FieldQHasher, QFieldHashable}, data::serializable::{FastFixedSerializable, QPDSerializable}, felt::{QFelt, QFelt64, QFeltSized, ToQFelts, ZeroableFelt}, impl_qpd_serialize_params, protocol::core_types::{Q256BitHash, QFHashBase, QHashBase}, utils::QPGenRandom};
+use parth_core::{crypto::hash::traits::{FieldQHasher, QFieldHashable}, data::serializable::{FastFixedSerializable, QPDSerializable}, felt::{QFelt, QFelt64, QFeltSized, ToQFelts, ZeroableFelt}, impl_qpd_serialize_params, protocol::core_types::{Q256BitHash, QFHashBase, QHashBase}};
 use pser::{QBytesDeserialize, QBytesSerialize};
 
 use crate::v1::qdata::ffs_sizes::PSY_OBJECT_FFS_SIZE_USER_LEAF;
@@ -14,37 +14,6 @@ pub struct PQEDUserLeaf<F, Hash> {
     pub last_checkpoint_id: F,
     pub event_index: F,
     pub user_id: F,
-}
-impl<F, Hash> PQEDUserLeaf<F, Hash> {
-    pub fn new(
-        public_key: Hash,
-        user_state_tree_root: Hash,
-        balance: F,
-        nonce: F,
-        last_checkpoint_id: F,
-        event_index: F,
-        user_id: F,
-    ) -> Self {
-        Self {
-            public_key,
-            user_state_tree_root,
-            balance,
-            nonce,
-            last_checkpoint_id,
-            event_index,
-            user_id,
-        }
-    }
-    
-    pub fn read_user_id_from_fixed_bytes(data: &[u8; PSY_OBJECT_FFS_SIZE_USER_LEAF]) -> u64 {
-        u64::from_le_bytes(data[96..104].try_into().unwrap())
-    }
-    pub fn read_user_id_from_bytes_ref(bytes: &[u8]) -> anyhow::Result<u64> {
-        if bytes.len() != PSY_OBJECT_FFS_SIZE_USER_LEAF {
-            anyhow::bail!("Invalid number of bytes for PQEDUserLeaf");
-        }
-        Ok(u64::from_le_bytes(bytes[96..104].try_into().unwrap()))
-    }
 }
 impl<F: ZeroableFelt, Hash> PQEDUserLeaf<F, Hash> {
     pub fn new_user_default(user_id: F, public_key: Hash, user_state_tree_root: Hash) -> Self {
@@ -117,21 +86,6 @@ impl<F: QFelt64, Hash: QFHashBase<F>> ToQFelts<F> for PQEDUserLeaf<F, Hash> {
     }
 }
 
-
-impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for PQEDUserLeaf<F, Hash> {
-    fn qp_rand_gen() -> Self {
-        PQEDUserLeaf {
-            public_key: Hash::qp_rand_gen(),
-            user_state_tree_root: Hash::qp_rand_gen(),
-            balance: F::qp_rand_gen(),
-            nonce: F::qp_rand_gen(),
-            last_checkpoint_id: F::qp_rand_gen(),
-            event_index: F::qp_rand_gen(),
-            user_id: F::qp_rand_gen(),
-        }
-    }
-
-}
 impl<F: QFelt64, Hash: QFHashBase<F>> QFieldHashable<F, Hash> for PQEDUserLeaf<F, Hash> {
     fn qfhash<H: FieldQHasher<F, Hash>>(&self) -> Hash {
         let public_key_felts = self.public_key.to_4_felts();
@@ -220,23 +174,29 @@ impl FastFixedSerializable<104> for PQEDUserLeafSerialize256HashU64Felt {
 }
 
 
-pser::impl_bytemuck_pod_and_zeroable!(PQEDUserLeaf, F, Hash);
 
-pser::impl_bytemuck_ffs_tests!(
-    PQEDUserLeaf,
-    // Note the use of concrete types here
-    { parth_core::PF, parth_core::PHash },
-    104
-);
-// This function is never called, it is just to ensure at compile time
-//  PSY_OBJECT_FFS_SIZE_USER_LEAF matches the FFS implementation
-fn _ensure_compile_time_size_match() {
-    let _bytes_h256: [u8; PSY_OBJECT_FFS_SIZE_USER_LEAF] = PQEDUserLeaf::<u64, parth_core::data::hash::hash256::Hash256>::qp_rand_gen().ffs_into_bytes();
-    let _bytes_phash: [u8; PSY_OBJECT_FFS_SIZE_USER_LEAF] = PQEDUserLeaf::<parth_core::PF, parth_core::PHash>::qp_rand_gen().ffs_into_bytes();
+#[cfg(all(feature = "serialize_bytemuck", target_endian = "little"))]
+unsafe impl<F, Hash> bytemuck::Zeroable for PQEDUserLeaf<F, Hash>
+where
+    F: bytemuck::Zeroable,
+    Hash: bytemuck::Zeroable,
+{
+    // The `#[repr(C)]` attribute ensures there are no padding bytes.
+    // The trait bounds on F and Hash ensure that all fields are Zeroable.
 }
 
 #[cfg(all(feature = "serialize_bytemuck", target_endian = "little"))]
-impl<F: QFelt64 + bytemuck::Pod, Hash: Q256BitHash + bytemuck::Pod> FastFixedSerializable<PSY_OBJECT_FFS_SIZE_USER_LEAF> for PQEDUserLeaf<F, Hash> {
+unsafe impl<F, Hash> bytemuck::Pod for PQEDUserLeaf<F, Hash>
+where
+    F: bytemuck::Pod,
+    Hash: bytemuck::Pod,
+{
+    // The `#[repr(C)]` attribute ensures a defined layout with no padding.
+    // The trait bounds on F and Hash ensure that all fields are Pod.
+}
+
+#[cfg(all(feature = "serialize_bytemuck", target_endian = "little"))]
+impl<F: QFelt64 + bytemuck::Pod, Hash: Q256BitHash + bytemuck::Pod> FastFixedSerializable<104> for PQEDUserLeaf<F, Hash> {
     #[inline(always)]
     fn ffs_from_owned_bytes(data: [u8; 104]) -> Self {
         bytemuck::cast(data)

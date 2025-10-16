@@ -1920,6 +1920,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bincode",
+ "bytemuck",
  "postcard",
  "rkyv",
  "serde",
@@ -1966,6 +1967,7 @@ dependencies = [
  "async-trait",
  "auto_impl",
  "bincode",
+ "bytemuck",
  "cf_utils",
  "hex",
  "hex-literal",
@@ -2059,6 +2061,7 @@ dependencies = [
  "async-trait",
  "auto_impl",
  "bincode",
+ "bytemuck",
  "cf_utils",
  "futures",
  "hex",

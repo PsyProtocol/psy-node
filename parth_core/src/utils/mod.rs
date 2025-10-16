@@ -1,3 +1,5 @@
+use rand::RngCore;
+
 use crate::{crypto::hash::traits::RandomHash, data::hash::hash256::Hash256};
 
 pub mod math;
@@ -28,5 +30,14 @@ impl QPGenRandom for u32 {
 impl QPGenRandom for Hash256 {
     fn qp_rand_gen() -> Self where Self: Sized {
         Hash256::rand_hash()
+    }
+}
+
+
+impl<const N: usize> QPGenRandom for [u8; N] {
+    fn qp_rand_gen() -> Self where Self: Sized {
+        let mut bytes = [0u8; N];
+        rand::thread_rng().fill_bytes(&mut bytes);
+        bytes
     }
 }

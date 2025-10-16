@@ -13,6 +13,7 @@ use crate::{
 };
 pub trait ToU64Value {
     fn to_u64_value(&self) -> u64;
+    fn tuv_to_canonical_u64(&self) -> u64;
     fn into_u64_value_serialize_non_canonical(self) -> u64;
     fn from_owned_u64(value: u64) -> Self;
 }
@@ -163,6 +164,11 @@ impl ToU64Value for u64 {
     #[inline(always)]
     fn from_owned_u64(value: u64) -> Self {
         value
+    }
+
+    #[inline(always)]
+    fn tuv_to_canonical_u64(&self) -> u64 {
+        *self
     }
 }
 impl SimpleRandFelt for u64 {

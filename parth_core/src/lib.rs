@@ -61,6 +61,38 @@ expected one of `where` or `{`rustcClick for full compiler diagnostic
 user.rs(32, 1):
 
 */
+/*
+How to make a Macro that I can call like:
+impl_bytemuck_pod_and_zeroable!(MyType, F, Hash);
+
+that produces:
+#[cfg(all(feature = "serialize_bytemuck", target_endian = "little"))]
+unsafe impl<F: bytemuck::Pod, Hash: bytemuck::Pod> bytemuck::Zeroable for MyType<F, Hash>
+{
+}
+
+#[cfg(all(feature = "serialize_bytemuck", target_endian = "little"))]
+unsafe impl<F: bytemuck::Pod, Hash: bytemuck::Pod> bytemuck::Pod for MyType<F, Hash>
+{
+}
+
+
+Or:
+
+impl_bytemuck_pod_and_zeroable!(MyOtherType, V);
+
+that produces:
+#[cfg(all(feature = "serialize_bytemuck", target_endian = "little"))]
+unsafe impl<V: bytemuck::Pod> bytemuck::Zeroable for MyOtherType<V>
+{
+}
+
+#[cfg(all(feature = "serialize_bytemuck", target_endian = "little"))]
+unsafe impl<V: bytemuck::Pod> bytemuck::Pod for MyOtherType<V>
+{
+}
+
+*/
 
 #[macro_export]
 macro_rules! impl_qpd_serialize_params {
@@ -131,8 +163,6 @@ macro_rules! impl_psyser_for_ffs {
         }
     };
 }
-
-
 
 
 #[macro_export]

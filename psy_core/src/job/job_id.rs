@@ -352,6 +352,7 @@ impl QProvingJobDataIDSerializedWrapped {
 }
 
 #[pderive::serialize_copy_ts_export]
+#[repr(C)]
 pub struct QProvingJobDataID {
     pub topic: QJobTopic,
     pub goal_id: u64,
