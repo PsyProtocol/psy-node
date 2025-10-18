@@ -422,7 +422,7 @@ impl Q256BitHash for QHashOut<GoldilocksField> {
     }
 }
 
-impl<F: RichField + QFelt64> QNamedType for QHashOut<F> {
+impl<F: QNamedType + Field> QNamedType for QHashOut<F> {
     fn q_type_name() -> String {
         format!("QHashOut<{}>", F::q_type_name())
     }

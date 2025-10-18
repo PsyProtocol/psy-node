@@ -27,6 +27,3 @@ pub trait PsyCanonicalDatabaseSerializeBaseSingleFixedTemplate<const N: usize>: 
         Self::fx_tpl_psydbser_from_slice(&data)
     }
 }
-
-
-

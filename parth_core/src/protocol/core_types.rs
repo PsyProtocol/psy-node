@@ -3,7 +3,7 @@ use std::fmt::Debug;
 use serde::{de::DeserializeOwned, Serialize};
 use ts_rs::TS;
 
-use crate::{crypto::hash::traits::{FieldQHasher, FromU64x4, HashTo4Felts, MerkleZeroHasher, QHasher, RandomHash, ZeroableHash}, data::{db::data_types::{CoreDatabaseValueDeserialize, QDatabasePrimitiveKey}, maybe_serialization::{MaybeBytemuck, MaybeSpeedy}, parth::public_preimage::{QParthProofPublicInputsPreimage, QParthProofPublicInputsPreimageWithoutRewardsHash}, serializable::{QPDSerializable, QPDSerializableFixed}}, felt::QFelt64, generic_traits::QNamedType, PsyCanonicalSer, QJobIdBase};
+use crate::{crypto::hash::traits::{FieldQHasher, FromU64x4, HashTo4Felts, MerkleZeroHasher, QHasher, RandomHash, ZeroableHash}, data::{db::data_types::{CoreDatabaseValueDeserialize, QDatabasePrimitiveKey}, maybe_serialization::{MaybeBytemuck, MaybeSpeedy}, parth::public_preimage::{QParthProofPublicInputsPreimage, QParthProofPublicInputsPreimageWithoutRewardsHash}, serializable::{QPDSerializable, QPDSerializableFixed}}, felt::QFelt64, generic_traits::QNamedType, QJobIdBase};
 
 pub trait QStorableBase: Serialize + DeserializeOwned + Send + Sync + Clone + PartialEq + Eq {}
 pub trait QStorableSizedBase: QStorableBase + Sized {}
@@ -17,21 +17,6 @@ pub trait Q256BitHash: FromU64x4 + Sized + Copy + MaybeBytemuck + Debug {
     fn from_slice_32bytes(bytes: &[u8]) -> anyhow::Result<Self>;
     fn to_vec_32bytes(&self) -> Vec<u8>;
 }
-impl<T: Q256BitHash> PsyCanonicalSer for T {
-    fn psyser_serialize<W: std::io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
-        writer.write_all(&self.to_vec_32bytes()).map_err(Into::into)
-    }
-
-    fn psyser_deserialize<R: std::io::Read>(reader: &mut R) -> anyhow::Result<Self> {
-        let mut buf = [0u8; 32];
-        reader.read_exact(&mut buf)?;
-        Ok(Self::from_owned_32bytes(buf))
-    }
-
-    fn psyser_serialized_size(&self) -> usize {
-        32
-    }
-}
 pub trait Q256BitHashTransparent: Q256BitHash {
     fn from_ref_32bytes_transparent(bytes: &[u8; 32]) -> &Self;
     fn as_ref_32bytes_transparent(&self) -> &[u8; 32];
@@ -41,7 +26,7 @@ pub trait Q256BitHashNonTransparent: Q256BitHash {
 }
 pub trait QDBHashBase: QHash256Base + Q256BitHash  {}
 impl<T: QHash256Base + Q256BitHash> QDBHashBase for T {}
-pub trait QHashBase: PartialEq + ZeroableHash + Copy + Serialize + DeserializeOwned + QPDSerializable + QPDSerializableFixed + Sync + Send + FromU64x4 + TS + Default + CoreDatabaseValueDeserialize + QDatabasePrimitiveKey + RandomHash + QNamedType + MaybeSpeedy + MaybeBytemuck + PsyCanonicalSer  {}
+pub trait QHashBase: PartialEq + ZeroableHash + Copy + Serialize + DeserializeOwned + QPDSerializable + QPDSerializableFixed + Sync + Send + FromU64x4 + TS + Default + CoreDatabaseValueDeserialize + QDatabasePrimitiveKey + RandomHash + QNamedType + MaybeSpeedy + MaybeBytemuck  {}
 pub trait QHash256Base: QHashBase + Q256BitHash {}
 impl<T: QHashBase + Q256BitHash> QHash256Base for T {}
 pub trait QFHashBase<F: QFelt64>: QHashBase + HashTo4Felts<F> {}

@@ -5,7 +5,7 @@ use parth_core::{
     crypto::hash::traits::{FieldQHasher, QFieldHashable},
     data::serializable::{QPDSerializable},
     felt::{QFelt, QFelt64, QFeltSized, ToQFelts},
-    impl_psyser_for_ffs_with_params, impl_qpd_serialize_params,
+     impl_qpd_serialize_params,
     protocol::core_types::{Q256BitHash, QFHashBase, QHashBase},
     utils::QPGenRandom,
 };
@@ -31,13 +31,6 @@ impl_qpd_serialize_params!(
     PQEDContractLeaf,
     { F: QFelt, Hash: QHashBase } => { F, Hash }
 );
-
-impl_psyser_for_ffs_with_params!(
-    PQEDContractLeaf,
-    { F: QFelt64, Hash: Q256BitHash } => { F, Hash },
-    72
-);
-
 
 impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for PQEDContractLeaf<F, Hash> {
     fn qp_rand_gen() -> Self

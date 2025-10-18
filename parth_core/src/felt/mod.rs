@@ -9,8 +9,10 @@ use serde::{de::DeserializeOwned, Serialize};
 use ts_rs::TS;
 
 use crate::{
-    data::maybe_serialization::{MaybeBytemuck, MaybeSpeedy}, generic_traits::QNamedType, utils::QPGenRandom, PsyCanonicalSer
+    data::maybe_serialization::{MaybeBytemuck, MaybeSpeedy}, generic_traits::QNamedType, utils::QPGenRandom
 };
+use psy_serialize::PsySerializeCanonical;
+
 pub trait ToU64Value {
     fn to_u64_value(&self) -> u64;
     fn tuv_to_canonical_u64(&self) -> u64;
@@ -75,7 +77,6 @@ pub trait QFelt:
     + SimpleRandFelt
     + QPGenRandom
     + QNamedType
-    + PsyCanonicalSer
 {
 }
 impl<
@@ -106,7 +107,6 @@ impl<
             + QPGenRandom
             + QNamedType
             + MaybeSpeedy
-            + PsyCanonicalSer
             + MaybeBytemuck 
     > QFelt for T
 {
@@ -171,6 +171,7 @@ impl ToU64Value for u64 {
         *self
     }
 }
+
 impl SimpleRandFelt for u64 {
     fn get_simple_rand() -> Self {
         rand::random::<u64>()

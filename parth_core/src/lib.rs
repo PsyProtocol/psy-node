@@ -1,8 +1,8 @@
 #[cfg(feature = "ptypes_goldilocks_qhashout")]
 pub mod pgoldilocks;
 mod ptypes;
-mod canonical_serialize;
-pub use canonical_serialize::*;
+//mod canonical_serialize;
+//pub use canonical_serialize::*;
 pub use ptypes::*;
 pub mod constants;
 pub mod felt;
@@ -18,7 +18,6 @@ mod protocol_types;
 pub use protocol_types::*;
 pub mod proof_hasher;
 pub mod generic_traits;
-pub mod canonical_db_serialize;
 
 #[macro_export]
 macro_rules! impl_qpq_serialize_primitive {
@@ -195,7 +194,7 @@ macro_rules! impl_psyser_for_ffs_crate {
         }
     };
 }
-
+/*
 
 #[macro_export]
 macro_rules! impl_psyser_for_ffs_with_params {
@@ -229,4 +228,4 @@ macro_rules! impl_psyser_for_ffs_with_params {
             const FIXED_SERIALIZED_SIZE: Option<usize> = Some($size);
         }
     };
-}
+}*/
