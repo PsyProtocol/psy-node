@@ -1,5 +1,6 @@
 use parth_core::{crypto::hash::traits::{FieldQHasher, QFieldHashable}, data::serializable::{QPDSerializable}, felt::{QFelt, QFelt64, QFeltSized, ToQFelts, ZeroableFelt}, impl_qpd_serialize_params, protocol::core_types::{Q256BitHash, QFHashBase, QHashBase}, utils::QPGenRandom};
 use pser::{QBytesDeserialize, QBytesSerialize};
+use psy_serialize::{AutoDatabaseSerializationUseFastFixedSerialize, PsyCanonicalSerializeMetadata};
 #[cfg(all(feature = "serialize_bytemuck", target_endian = "little"))]
 use psy_serialize::FastFixedSerializable;
 
@@ -224,6 +225,12 @@ impl FastFixedSerializable<104> for PQEDUserLeafSerialize256HashU64Felt {
 
 pser::impl_bytemuck_pod_and_zeroable!(PQEDUserLeaf, F, Hash);
 
+pser::impl_bytemuck_ffs!(
+    PQEDUserLeaf,
+    { F: QFelt64, Hash: Q256BitHash },
+    104
+);
+
 pser::impl_bytemuck_ffs_tests!(
     PQEDUserLeaf,
     // Note the use of concrete types here
@@ -236,7 +243,7 @@ fn _ensure_compile_time_size_match() {
     let _bytes_h256: [u8; PSY_OBJECT_FFS_SIZE_USER_LEAF] = PQEDUserLeaf::<u64, parth_core::data::hash::hash256::Hash256>::qp_rand_gen().ffs_into_bytes();
     let _bytes_phash: [u8; PSY_OBJECT_FFS_SIZE_USER_LEAF] = PQEDUserLeaf::<parth_core::PF, parth_core::PHash>::qp_rand_gen().ffs_into_bytes();
 }
-
+/* 
 #[cfg(all(feature = "serialize_bytemuck", target_endian = "little"))]
 impl<F: QFelt64 + bytemuck::Pod, Hash: Q256BitHash + bytemuck::Pod> FastFixedSerializable<PSY_OBJECT_FFS_SIZE_USER_LEAF> for PQEDUserLeaf<F, Hash> {
     #[inline(always)]
@@ -266,4 +273,17 @@ impl<F: QFelt64 + bytemuck::Pod, Hash: Q256BitHash + bytemuck::Pod> FastFixedSer
         bytemuck::cast(self)
     }
 }
+*/
 
+
+impl<F: QFelt64, Hash: Q256BitHash> PsyCanonicalSerializeMetadata for PQEDUserLeaf<F, Hash> {
+    const IS_FIXED_SIZE: bool = true;
+    const FIXED_SIZE: usize = 104;
+}
+impl<F: QFelt64, Hash: Q256BitHash> AutoDatabaseSerializationUseFastFixedSerialize<104> for PQEDUserLeaf<F, Hash> {}
+
+psy_serialize::impl_psy_canonical_serialize_for_fixed_type!(
+    PQEDUserLeaf, 
+    {F: QFelt64, Hash: Q256BitHash} => {F, Hash}, 
+    104
+);

@@ -4,6 +4,7 @@ use crate::PsyCanonicalDatabaseSerializeBaseSingle;
 
 
 pub trait PsyCanonicalDatabaseSerializeBaseMulti: PsyCanonicalDatabaseSerializeBaseSingle {
+    #[inline]
     fn psydbser_serialize_vec_of_self_ref(data: &[Self], write_fixed_items_count: bool) -> Vec<u8> {
         if data.is_empty() {
             return Vec::new();
@@ -12,6 +13,7 @@ pub trait PsyCanonicalDatabaseSerializeBaseMulti: PsyCanonicalDatabaseSerializeB
         }
     }
 
+    #[inline]
     fn psydbser_serialize_vec_of_self(data: Vec<Self>, write_fixed_items_count: bool) -> Vec<u8> {
         if data.is_empty() {
             return Vec::new();
@@ -47,9 +49,9 @@ pub trait PsyCanonicalDatabaseSerializeBaseMulti: PsyCanonicalDatabaseSerializeB
         };
         Self::pio_read_many_from_ref_bytes(data, known_sz, include_size_for_fixed)
     }
+    #[inline]
     fn psydbser_deserialize_vec_of_self_owned(data: Vec<u8>, include_size_for_fixed: bool) -> anyhow::Result<Vec<Self>> {
-        let items = Self::psydbser_deserialize_vec_of_self(&data, include_size_for_fixed)?;
-        Ok(items)
+        Self::psydbser_deserialize_vec_of_self(&data, include_size_for_fixed)
     }
 }
 

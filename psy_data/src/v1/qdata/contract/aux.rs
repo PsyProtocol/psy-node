@@ -1,5 +1,5 @@
 use parth_common::memory_stores::simple_memory_merkle_store::SimpleMemoryMerkleStore;
-use parth_core::{crypto::hash::traits::MerkleZeroHasher, impl_qpq_serialize_bincode, protocol::core_types::QHashBase};
+use parth_core::{crypto::hash::traits::MerkleZeroHasher, impl_qpq_serialize_bincode, protocol::core_types::QHashBase, utils::{qp_random_bytes_vec_in_range_insecure, QPGenRandom}};
 use serde::Serialize;
 use ts_rs::TS;
 use pser::{QBytesDeserialize, QBytesSerialize};
@@ -18,6 +18,18 @@ pub struct ContractFunctionCodeDefinition {
     pub code: Vec<u8>,
 }
 impl_qpq_serialize_bincode!(ContractFunctionCodeDefinition);
+impl QPGenRandom for ContractFunctionCodeDefinition {
+    fn qp_rand_gen() -> Self {
+        Self {
+            method_id: QPGenRandom::qp_rand_gen(),
+            num_inputs: QPGenRandom::qp_rand_gen(),
+            num_outputs: QPGenRandom::qp_rand_gen(),
+            vm_type: QPGenRandom::qp_rand_gen(),
+            code: qp_random_bytes_vec_in_range_insecure(32, 1024),
+        }
+    }
+}
+
 
 #[pderive::serialize_copy]
 #[derive(TS)]
@@ -27,6 +39,16 @@ pub struct SimpleContractFunctionCodeDefinition {
     pub num_inputs: u32,
     pub num_outputs: u32,
     pub vm_type: u32,
+}
+impl QPGenRandom for SimpleContractFunctionCodeDefinition {
+    fn qp_rand_gen() -> Self {
+        Self {
+            method_id: QPGenRandom::qp_rand_gen(),
+            num_inputs: QPGenRandom::qp_rand_gen(),
+            num_outputs: QPGenRandom::qp_rand_gen(),
+            vm_type: QPGenRandom::qp_rand_gen(),
+        }
+    }
 }
 impl_qpq_serialize_bincode!(SimpleContractFunctionCodeDefinition);
 
@@ -39,6 +61,15 @@ pub struct ContractCodeDefinition {
     pub functions: Vec<ContractFunctionCodeDefinition>,
 }
 impl_qpq_serialize_bincode!(ContractCodeDefinition);
+impl QPGenRandom for ContractCodeDefinition {
+    fn qp_rand_gen() -> Self {
+        let num_functions: usize = (<u32 as QPGenRandom>::qp_rand_gen() % 30) as usize;
+        Self {
+            state_tree_height: QPGenRandom::qp_rand_gen(),
+            functions: QPGenRandom::qp_rand_gen_vec(num_functions),
+        }
+    }
+}
 
 
 #[pderive::serialize_clone]

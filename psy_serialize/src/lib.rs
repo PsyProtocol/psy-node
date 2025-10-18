@@ -16,39 +16,48 @@ macro_rules! __impl_psy_canonical_serialize_for_fixed_type_internal {
         $size:expr
     ) => {
         impl $($impl_generics)* psy_serialize::PsyIOReadWrite for $type $($where_clause)* {
+            #[inline(always)]
             fn pio_serialized_size(&self) -> usize {
                 <$type as psy_serialize::PsyIOReadWriteFixedTemplate<{$size}>>::fx_tpl_pio_serialized_size(self)
             }
 
+            #[inline(always)]
             fn pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
                 <$type as psy_serialize::PsyIOReadWriteFixedTemplate<{$size}>>::fx_tpl_pio_write_to_io(self, writer)
             }
 
+            #[inline(always)]
             fn pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
                 <$type as psy_serialize::PsyIOReadWriteFixedTemplate<{$size}>>::fx_tpl_pio_read_from_io(reader)
             }
 
+            #[inline(always)]
             fn pio_get_variable_serialized_size(&self) -> usize {
                 <$type as psy_serialize::PsyIOReadWriteFixedTemplate<{$size}>>::fx_tpl_pio_get_variable_serialized_size(self)
             }
 
+            #[inline(always)]
             fn pio_write_to_io_many<W: psy_io::Write>(items: &[$type], writer: &mut W, write_fixed_items_count: bool) -> anyhow::Result<()> {
                 <$type as psy_serialize::PsyIOReadWriteFixedTemplate<{$size}>>::fx_tpl_pio_write_to_io_many(items, writer, write_fixed_items_count)
             }
 
+            #[inline(always)]
             fn pio_read_from_io_many<R: psy_io::Read>(reader: &mut R, known_size: Option<usize>, include_size_for_fixed: bool) -> anyhow::Result<Vec<Self>> {
                 <$type as psy_serialize::PsyIOReadWriteFixedTemplate<{$size}>>::fx_tpl_pio_read_from_io_many(reader, known_size, include_size_for_fixed)
             }
 
+            #[inline(always)]
             fn pio_serialized_size_vec(items: &[$type], include_size_for_fixed: bool) -> usize {
                 <$type as psy_serialize::PsyIOReadWriteFixedTemplate<{$size}>>::fx_tpl_pio_serialized_size_vec(items, include_size_for_fixed)
             }
 
+            #[inline(always)]
             fn pio_read_many_from_ref_bytes(data: &[u8], known_size: Option<usize>, include_size_for_fixed: bool) -> anyhow::Result<Vec<Self>> {
                 <$type as psy_serialize::PsyIOReadWriteFixedTemplate<{$size}>>::fx_tpl_pio_read_many_from_ref_bytes(data, known_size, include_size_for_fixed)
             }
-
             // Delegate the default method to ensure consistency, even though it's defaulted in the trait
+
+            #[inline(always)]
             fn pio_write_many_to_bytes(items: &[$type], write_fixed_items_count: bool) -> anyhow::Result<Vec<u8>> {
                 let total_size = Self::pio_serialized_size_vec(items, write_fixed_items_count);
                 let mut buffer = Vec::with_capacity(total_size);
@@ -61,36 +70,46 @@ macro_rules! __impl_psy_canonical_serialize_for_fixed_type_internal {
         }
 
         impl $($impl_generics)* psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle for $type $($where_clause)* {
+
+            #[inline(always)]
             fn psydbser_from_slice(data: &[u8]) -> anyhow::Result<Self> {
                 <$type as psy_serialize::PsyCanonicalDatabaseSerializeBaseSingleFixedTemplate<{$size}>>::fx_tpl_psydbser_from_slice(data)
             }
 
+            #[inline(always)]
             fn psydbser_to_bytes_vec(&self) -> anyhow::Result<Vec<u8>> {
                 <$type as psy_serialize::PsyCanonicalDatabaseSerializeBaseSingleFixedTemplate<{$size}>>::fx_tpl_psydbser_to_bytes_vec(self)
             }
 
+            #[inline(always)]
             fn psydbser_into_bytes_vec(self) -> anyhow::Result<Vec<u8>> {
                 <$type as psy_serialize::PsyCanonicalDatabaseSerializeBaseSingleFixedTemplate<{$size}>>::fx_tpl_psydbser_into_bytes_vec(self)
             }
 
+            #[inline(always)]
             fn psydbser_from_owned_bytes_vec(data: Vec<u8>) -> anyhow::Result<Self> {
                 <$type as psy_serialize::PsyCanonicalDatabaseSerializeBaseSingleFixedTemplate<{$size}>>::fx_tpl_psydbser_from_owned_bytes_vec(data)
             }
         }
 
         impl $($impl_generics)* psy_serialize::PsyCanonicalDatabaseSerializeBaseMulti for $type $($where_clause)* {
+
+            #[inline(always)]
             fn psydbser_serialize_vec_of_self_ref(data: &[$type], write_fixed_items_count: bool) -> Vec<u8> {
                 <$type as psy_serialize::PsyCanonicalDatabaseSerializeBaseMultiFixedTemplate<{$size}>>::fx_tpl_psydbser_serialize_vec_of_self_ref(data, write_fixed_items_count)
             }
 
+            #[inline(always)]
             fn psydbser_serialize_vec_of_self(data: Vec<$type>, write_fixed_items_count: bool) -> Vec<u8> {
                 <$type as psy_serialize::PsyCanonicalDatabaseSerializeBaseMultiFixedTemplate<{$size}>>::fx_tpl_psydbser_serialize_vec_of_self(data, write_fixed_items_count)
             }
 
+            #[inline(always)]
             fn psydbser_deserialize_vec_of_self(data: &[u8], include_size_for_fixed: bool) -> anyhow::Result<Vec<Self>> {
                 <$type as psy_serialize::PsyCanonicalDatabaseSerializeBaseMultiFixedTemplate<{$size}>>::fx_tpl_psydbser_deserialize_vec_of_self(data, include_size_for_fixed)
             }
-
+            
+            #[inline(always)]
             fn psydbser_deserialize_vec_of_self_owned(data: Vec<u8>, include_size_for_fixed: bool) -> anyhow::Result<Vec<Self>> {
                 <$type as psy_serialize::PsyCanonicalDatabaseSerializeBaseMultiFixedTemplate<{$size}>>::fx_tpl_psydbser_deserialize_vec_of_self_owned(data, include_size_for_fixed)
             }

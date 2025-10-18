@@ -291,6 +291,7 @@ impl<F: RichField> QHashOut<F> {
 }
 
 
+
 impl<F: RichField> RandomHash for QHashOut<F> {
     fn rand_hash() -> Self {
         Self::rand()

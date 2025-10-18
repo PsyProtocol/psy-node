@@ -7,6 +7,7 @@ pub trait PsyCanonicalDatabaseSerializeFixedBase<const SIZE: usize>: Sized + Psy
     fn psydbser_fixed_from_bytes_ref(bytes: &[u8; SIZE]) -> anyhow::Result<Self>;
     fn psydbser_fixed_from_owned_bytes(bytes: [u8; SIZE]) -> anyhow::Result<Self>;
     fn psydbser_fixed_many_from_bytes_ref(bytes: &[u8]) -> anyhow::Result<Vec<Self>>;
+    #[inline]
     fn psydbser_fixed_serialize_vec_of_self_ref(data: &[Self]) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(data.len() * SIZE);
         for item in data {
@@ -14,6 +15,7 @@ pub trait PsyCanonicalDatabaseSerializeFixedBase<const SIZE: usize>: Sized + Psy
         }
         bytes
     }
+    #[inline]
     fn psydbser_fixed_serialize_vec_of_self(data: Vec<Self>) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(data.len() * SIZE);
         for item in data {
@@ -21,6 +23,7 @@ pub trait PsyCanonicalDatabaseSerializeFixedBase<const SIZE: usize>: Sized + Psy
         }
         bytes
     }
+    #[inline]
     fn psydbser_fixed_deserialize_vec_of_self(data: &[u8]) -> anyhow::Result<Vec<Self>> {
         if data.len() % SIZE != 0 {
             anyhow::bail!("Data length {} is not a multiple of object size {}", data.len(), SIZE);
@@ -36,6 +39,7 @@ pub trait PsyCanonicalDatabaseSerializeFixedBase<const SIZE: usize>: Sized + Psy
             })
             .collect::<anyhow::Result<Vec<Self>>>()
     }
+    #[inline(always)]
     fn psydbser_fixed_deserialize_vec_of_self_owned(data: Vec<u8>) -> anyhow::Result<Vec<Self>> {
         Self::psydbser_fixed_deserialize_vec_of_self(&data)
     }

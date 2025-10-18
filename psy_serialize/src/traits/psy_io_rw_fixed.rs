@@ -3,6 +3,8 @@ use psy_io::{p_read_fixed_items_many_count, p_write_fixed_items_manycount, PSY_I
 use crate::{FastFixedSerializable, PsyCanonicalSerializeMetadata};
 
 pub trait PsyIOReadWriteFixedTemplate<const N: usize>: PsyCanonicalSerializeMetadata + FastFixedSerializable<N> + Sized {
+    
+    #[inline(always)]
     fn fx_tpl_pio_serialized_size(&self) -> usize {
         N
     }
@@ -22,7 +24,7 @@ pub trait PsyIOReadWriteFixedTemplate<const N: usize>: PsyCanonicalSerializeMeta
     fn fx_tpl_pio_get_variable_serialized_size(&self) -> usize {
         N
     }
-    #[inline(always)]
+    #[inline]
     fn fx_tpl_pio_write_to_io_many<W: psy_io::Write>(items: &[Self], writer: &mut W, write_fixed_items_count: bool) -> anyhow::Result<()> {
         if write_fixed_items_count {
             p_write_fixed_items_manycount(items.len(), writer)?;
@@ -35,7 +37,8 @@ pub trait PsyIOReadWriteFixedTemplate<const N: usize>: PsyCanonicalSerializeMeta
         }
         Ok(())
     }
-    #[inline(always)]
+
+    #[inline]
     fn fx_tpl_pio_read_from_io_many<R: psy_io::Read>(
         reader: &mut R,
         known_size: Option<usize>,
@@ -62,12 +65,12 @@ pub trait PsyIOReadWriteFixedTemplate<const N: usize>: PsyCanonicalSerializeMeta
         }
         Ok(items)
     }
-    #[inline(always)]
+    #[inline]
     fn fx_tpl_pio_serialized_size_vec(items: &[Self], include_size_for_fixed: bool) -> usize {
         items.len() * Self::FIXED_SIZE + if include_size_for_fixed { PSY_IO_FIXED_ITEMS_MANY_COUNT_SIZE } else { 0 }
     }
 
-    #[inline(always)]
+    #[inline]
     fn fx_tpl_pio_read_many_from_ref_bytes(data: &[u8], known_size: Option<usize>, include_size_for_fixed: bool) -> anyhow::Result<Vec<Self>> {
         if data.is_empty() {
             return Ok(Vec::new());

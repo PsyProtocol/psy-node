@@ -45,6 +45,7 @@ pub trait QHashBase: PartialEq + ZeroableHash + Copy + Serialize + DeserializeOw
 pub trait QHash256Base: QHashBase + Q256BitHash {}
 impl<T: QHashBase + Q256BitHash> QHash256Base for T {}
 pub trait QFHashBase<F: QFelt64>: QHashBase + HashTo4Felts<F> {}
+impl<T: QHashBase + HashTo4Felts<F>, F: QFelt64> QFHashBase<F> for T {}
 
 pub trait QProofBase: PartialEq + Clone + Serialize + DeserializeOwned + QPDSerializable {}
 

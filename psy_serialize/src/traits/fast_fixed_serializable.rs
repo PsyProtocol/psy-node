@@ -5,12 +5,14 @@ pub trait FastFixedSerializable<const N: usize>: Sized {
     fn ffs_to_bytes(&self) -> [u8; N];
     fn ffs_into_bytes(self) -> [u8; N];
 
+    #[inline]
     fn write_ffs_serialize_vec_of_self(data: &[Self], bytes: &mut Vec<u8>) {
         for item in data {
             bytes.extend_from_slice(&item.ffs_to_bytes());
         }
     }
 
+    #[inline]
     fn ffs_serialize_vec_of_self_ref(data: &[Self]) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(data.len() * N);
         for item in data {
@@ -18,6 +20,8 @@ pub trait FastFixedSerializable<const N: usize>: Sized {
         }
         bytes
     }
+
+    #[inline]
     fn ffs_serialize_vec_of_self(data: Vec<Self>) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(data.len() * N);
         for item in data {
@@ -25,6 +29,8 @@ pub trait FastFixedSerializable<const N: usize>: Sized {
         }
         bytes
     }
+
+    #[inline]
     fn ffs_deserialize_vec_of_self(data: &[u8]) -> anyhow::Result<Vec<Self>> {
         if data.len() % N != 0 {
             anyhow::bail!("Data length {} is not a multiple of object size {}", data.len(), N);
@@ -41,8 +47,9 @@ pub trait FastFixedSerializable<const N: usize>: Sized {
             })
             .collect())
     }
+
+    #[inline]
     fn ffs_deserialize_vec_of_self_owned(data: Vec<u8>) -> anyhow::Result<Vec<Self>> {
-        let items = Self::ffs_deserialize_vec_of_self(&data)?;
-        Ok(items)
+        Self::ffs_deserialize_vec_of_self(&data)
     }
 }

@@ -75,6 +75,7 @@ pub trait PsyIOReadWrite: PsyCanonicalSerializeMetadata + Sized {
             Ok(items)
         }
     }
+    #[inline]
     fn pio_serialized_size_vec(items: &[Self], include_size_for_fixed: bool) -> usize {
         if Self::IS_FIXED_SIZE {
             items.len() * Self::FIXED_SIZE + if include_size_for_fixed { PSY_IO_FIXED_ITEMS_MANY_COUNT_SIZE } else { 0 }
@@ -88,6 +89,7 @@ pub trait PsyIOReadWrite: PsyCanonicalSerializeMetadata + Sized {
             total_size
         }
     }
+    #[inline]
     fn pio_read_many_from_ref_bytes(data: &[u8], known_size: Option<usize>, include_size_for_fixed: bool) -> anyhow::Result<Vec<Self>> {
         if data.is_empty() {
             return Ok(Vec::new());
@@ -120,6 +122,7 @@ pub trait PsyIOReadWrite: PsyCanonicalSerializeMetadata + Sized {
         let mut cursor = psy_io::Cursor::new(data);
         Self::pio_read_from_io_many(&mut cursor, known_size, include_size_for_fixed)
     }
+    #[inline]
     fn pio_write_many_to_bytes(items: &[Self], write_fixed_items_count: bool) -> anyhow::Result<Vec<u8>> {
         let total_size = Self::pio_serialized_size_vec(items, write_fixed_items_count);
         let mut buffer = Vec::with_capacity(total_size);

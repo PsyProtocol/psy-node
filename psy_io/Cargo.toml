@@ -13,5 +13,5 @@ alloc = ["embedded-io/alloc", "embedded-io-async/std"]
 anyhow     = { workspace = true }
 hex = { workspace = true }
 hex-literal = { workspace = true }
-embedded-io = { workspace = true, default-features = false }
-embedded-io-async = { workspace = true, default-features = false }
+embedded-io = { workspace = true }
+embedded-io-async = { workspace = true }
