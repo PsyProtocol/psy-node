@@ -142,7 +142,7 @@ fn benckmark_serialize_round_trip_user_leaf_internal<F: BenchFastRand + QFelt64 
             // `b.iter` runs the closure multiple times to get a stable measurement.
             // `black_box` prevents the compiler from optimizing away the function call.
             //b.iter(|| Vec::<PQEDUserLeaf::<F, Hash>>::read_from(black_box(l)));
-            b.iter(|| PQEDUserLeaf::<F, Hash>::pio_read_many_from_ref_bytes(&black_box(l), None, false));
+            b.iter(|| PQEDUserLeaf::<F, Hash>::pio_read_many_from_ref_bytes(&black_box(l), None));
         });
 
 

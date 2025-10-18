@@ -7,7 +7,8 @@ use parth_core::{
     utils::{debug_code_string::QToCodeString, qp_random_bytes_vec_in_range_insecure, QPGenRandom},
 };
 use pser::{QBytesDeserialize, QBytesSerialize};
-use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
+use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
+use psy_serialize::{PsyCanonicalDatabaseSerializeBaseSingle, PsyIOReadWrite};
 use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata};
 use serde::Serialize;
 use ts_rs::TS;
@@ -53,27 +54,29 @@ impl PsyCanonicalSerializeMetadata for ContractFunctionCodeDefinition {
     const IS_FIXED_SIZE: bool = false;
     const FIXED_SIZE: usize = 0;
 }
+
 impl FallbackPsySerializeCanonical for ContractFunctionCodeDefinition {
-    fn fallback_psy_ser_serialized_size(&self) -> usize {
+    fn fallback_pio_serialized_size(&self) -> usize {
         4 + 4 + 4 + 4 + 4 + self.code.len()
     }
-    fn fallback_psy_ser_from_slice(data: &[u8]) -> anyhow::Result<Self> {
-        if data.len() < 20 {
-            anyhow::bail!("Data length {} is too small to deserialize ContractFunctionCodeDefinition", data.len());
-        }
-        let method_id = u32::from_le_bytes(data[0..4].try_into().unwrap());
-        let num_inputs = u32::from_le_bytes(data[4..8].try_into().unwrap());
-        let num_outputs = u32::from_le_bytes(data[8..12].try_into().unwrap());
-        let vm_type = u32::from_le_bytes(data[12..16].try_into().unwrap());
-        let code_len = u32::from_le_bytes(data[16..20].try_into().unwrap()) as usize;
-        if data.len() < 20 + code_len {
-            anyhow::bail!(
-                "Data length {} is too small to contain code of length {}",
-                data.len(),
-                code_len
-            );
-        }
-        let code = data[20..20 + code_len].to_vec();
+    
+    fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
+        writer.psy_write_u32(self.method_id)?;
+        writer.psy_write_u32(self.num_inputs)?;
+        writer.psy_write_u32(self.num_outputs)?;
+        writer.psy_write_u32(self.vm_type)?;
+        writer.psy_write_bytes_vec(&self.code)?;
+
+        Ok(())
+    }
+    
+    fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
+        let method_id = reader.psy_read_u32()?;
+        let num_inputs = reader.psy_read_u32()?;
+        let num_outputs = reader.psy_read_u32()?;
+        let vm_type = reader.psy_read_u32()?;
+        let code = reader.psy_read_bytes_vec()?;
+
         Ok(Self {
             method_id,
             num_inputs,
@@ -81,16 +84,6 @@ impl FallbackPsySerializeCanonical for ContractFunctionCodeDefinition {
             vm_type,
             code,
         })
-    }
-    fn fallback_psy_ser_to_bytes_vec(&self) -> anyhow::Result<Vec<u8>> {
-        let mut bytes = Vec::with_capacity(self.fallback_psy_ser_serialized_size());
-        bytes.extend_from_slice(&self.method_id.to_le_bytes());
-        bytes.extend_from_slice(&self.num_inputs.to_le_bytes());
-        bytes.extend_from_slice(&self.num_outputs.to_le_bytes());
-        bytes.extend_from_slice(&self.vm_type.to_le_bytes());
-        bytes.extend_from_slice(&(self.code.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(&self.code);
-        Ok(bytes)
     }
 
 }
@@ -100,7 +93,6 @@ psy_serialize::impl_psy_canonical_serialize_for_speedy!(ContractFunctionCodeDefi
 #[cfg(not(all(feature = "serialize_speedy", target_endian = "little")))]
 impl AutoImplementFallbackPsySerializeCanonical for ContractFunctionCodeDefinition {}
 
-use speedy::Endianness::LittleEndian;
 
 
 impl QPGenRandom for ContractFunctionCodeDefinition {
@@ -149,48 +141,32 @@ impl PsyCanonicalSerializeMetadata for ContractCodeDefinition {
     const FIXED_SIZE: usize = 0;
 }
 impl FallbackPsySerializeCanonical for ContractCodeDefinition {
-    fn fallback_psy_ser_serialized_size(&self) -> usize {
-        2 + 4 + self.functions.iter().map(|f| f.fallback_psy_ser_serialized_size()).sum::<usize>()
+    fn fallback_pio_serialized_size(&self) -> usize {
+        2 + 4 + self.functions.iter().map(|f| f.fallback_pio_serialized_size()).sum::<usize>()
     }
-    fn fallback_psy_ser_from_slice(data: &[u8]) -> anyhow::Result<Self> {
-        if data.len() < 6 {
-            anyhow::bail!("Data length {} is too small to deserialize ContractCodeDefinition", data.len());
+    
+    fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
+        writer.psy_write_u16(self.state_tree_height)?;
+        writer.psy_write_vec_length(self.functions.len())?;
+        for function in &self.functions {
+            function.pio_write_to_io(writer)?;
         }
-        let state_tree_height = u16::from_le_bytes(data[0..2].try_into().unwrap());
-        let num_functions = u32::from_le_bytes(data[2..6].try_into().unwrap()) as usize;
-        let mut offset = 6;
-        let mut functions = Vec::with_capacity(num_functions);
-        for _ in 0..num_functions {
-            if data.len() < offset + 20 {
-                anyhow::bail!("Data length {} is too small to deserialize function header at offset {}", data.len(), offset);
-            }
-            let code_len = u32::from_le_bytes(data[offset + 16..offset + 20].try_into().unwrap()) as usize;
-            if data.len() < offset + 20 + code_len {
-                anyhow::bail!(
-                    "Data length {} is too small to deserialize function code of length {} at offset {}",
-                    data.len(),
-                    code_len,
-                    offset
-                );
-            }
-            let function = ContractFunctionCodeDefinition::fallback_psy_ser_from_slice(&data[offset..offset + 20 + code_len])?;
-            functions.push(function);
-            offset += 20 + code_len;
+        Ok(())
+    }
+    
+    fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
+        let state_tree_height = reader.psy_read_u16()?;
+        let function_count = reader.psy_read_vec_length()?;
+        
+        let mut function_defs = Vec::with_capacity(function_count);
+        for _ in 0..function_count {
+            let function = ContractFunctionCodeDefinition::pio_read_from_io(&mut *reader)?;
+            function_defs.push(function);
         }
         Ok(Self {
             state_tree_height,
-            functions,
+            functions: function_defs,
         })
-    }
-    fn fallback_psy_ser_to_bytes_vec(&self) -> anyhow::Result<Vec<u8>> {
-        let mut bytes = Vec::with_capacity(self.fallback_psy_ser_serialized_size());
-        bytes.extend_from_slice(&self.state_tree_height.to_le_bytes());
-        bytes.extend_from_slice(&(self.functions.len() as u32).to_le_bytes());
-        for function in &self.functions {
-            let function_bytes = function.fallback_psy_ser_to_bytes_vec()?;
-            bytes.extend_from_slice(&function_bytes);
-        }
-        Ok(bytes)
     }
 
 }

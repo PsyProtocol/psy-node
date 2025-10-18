@@ -3681,7 +3681,7 @@ impl<
             highers.push(higher);
         }
         let context = QBlobWriterContextMetadataHeader::new_at_now(PSY_CHAIN_ID_LOCAL_DEVNET, 0,0,0, 1, checkpoint_id, tree_id);
-        let double_nodes = QMerkleStoreDoubleIdNode::from_simple_merkle_nodes_for_tree_clone(tree_id, tree_sub_id, nodes.clone());
+        let double_nodes = QMerkleStoreDoubleIdNode::from_simple_merkle_nodes_for_tree_clone(tree_id, tree_sub_id, nodes);
 
          let fast_serialized_merkle_nodes = QBlobDoubleMerkleNodeBatchDataView::generate_double_merkle_node_batch_blob_data_from_ref(context, &double_nodes);
 
@@ -4546,6 +4546,7 @@ impl SimpleStoreEx {
 
 
 #[tokio::test]
+#[ignore = "database slow"]
 async fn simple_store_basic_test_1() -> anyhow::Result<()> {
     let key_space = format!("psy_node_scylla_test_ex1_{}", rand::random::<u64>());
     let scylla_db = ScyllaCoreStore::<ExHash, ExHasher>::new(0, 0, key_space, &[

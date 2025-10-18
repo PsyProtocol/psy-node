@@ -1,19 +1,23 @@
 use anyhow::Context;
-use psy_io::{p_read_fixed_items_many_count, p_write_fixed_items_manycount, PsyIOReadableFixedSizeCanonicalStruct, PsyIOWritableCanonicalStruct, PSY_IO_FIXED_ITEMS_MANY_COUNT_SIZE, PsyReaderExtensions, PsyWriterExtensions};
-
+use psy_io::{
+    p_read_fixed_items_many_count, p_write_fixed_items_manycount, PsyReaderExtensions, PsyWriterExtensions,
+    PSY_IO_FIXED_ITEMS_MANY_COUNT_SIZE,
+};
+use crate::traits::metadata::PsyIOWithMaxVecLength;
 use crate::{FastFixedSerializable, PsyCanonicalSerializeMetadata};
 
 pub trait PsyIOReadWriteFixedTemplate<const N: usize>: PsyCanonicalSerializeMetadata + FastFixedSerializable<N> + Sized {
-    
     #[inline(always)]
     fn fx_tpl_pio_serialized_size(&self) -> usize {
         N
     }
+
     #[inline(always)]
     fn fx_tpl_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
         writer.write_all(&self.ffs_to_bytes())?;
         Ok(())
     }
+
     #[inline(always)]
     fn fx_tpl_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
         let mut buf = [0u8; N];
@@ -25,68 +29,70 @@ pub trait PsyIOReadWriteFixedTemplate<const N: usize>: PsyCanonicalSerializeMeta
     fn fx_tpl_pio_get_variable_serialized_size(&self) -> usize {
         N
     }
+
     #[inline]
-    fn fx_tpl_pio_write_to_io_many<W: psy_io::Write>(items: &[Self], writer: &mut W, write_fixed_items_count: bool) -> anyhow::Result<()> {
-        if write_fixed_items_count {
+    fn fx_tpl_pio_write_to_io_many<W: psy_io::Write>(items: &[Self], writer: &mut W, write_count: bool) -> anyhow::Result<()> {
+        if write_count {
             p_write_fixed_items_manycount(items.len(), writer)?;
         }
-        const BATCH_SIZE_BYTES: usize = 1024 * 100;
-
-        let batch_size_count: usize = (BATCH_SIZE_BYTES / N).max(1);
-        for chunk in items.chunks(batch_size_count) {
-            writer.write_all(&Self::ffs_serialize_vec_of_self_ref(&chunk))?;
+        if !items.is_empty() {
+            let serialized_data = Self::ffs_serialize_vec_of_self_ref(items);
+            writer.write_all(&serialized_data)?;
         }
         Ok(())
     }
 
-
     #[inline]
-    fn fx_tpl_pio_read_from_io_many<R: psy_io::Read>(
-        reader: &mut R,
-        known_size: Option<usize>,
-    ) -> anyhow::Result<Vec<Self>> {
-        let length = match known_size {
-            Some(len) => {
-                len
-            },
-            None => {
-                reader.psy_read_vec_length()?
-            }
+    fn fx_tpl_pio_read_from_io_many<R: psy_io::Read>(reader: &mut R, known_count: Option<usize>) -> anyhow::Result<Vec<Self>> {
+        let length = match known_count {
+            Some(len) => len,
+            None => p_read_fixed_items_many_count(reader)?,
         };
+
         if length > Self::psy_io_max_vec_length() {
-            anyhow::bail!("Read size {} exceeds maximum allowed length {}", length, Self::psy_io_max_vec_length());
+            anyhow::bail!("Read count {} exceeds maximum allowed length {}", length, Self::psy_io_max_vec_length());
         }
-        let total_bytes = length.checked_mul(N)
-            .context("Total byte size for vector of fixed structs exceeds usize::MAX")?;
+        if length == 0 {
+            return Ok(Vec::new());
+        }
+
+        let total_bytes = length.checked_mul(N).context("Total byte size for vector of fixed structs exceeds usize::MAX")?;
         let mut data = vec![0u8; total_bytes];
         reader.read_exact(&mut data)?;
         Self::ffs_deserialize_vec_of_self_owned(data)
     }
+
     #[inline]
-    fn fx_tpl_pio_serialized_size_vec(items: &[Self], include_size_for_fixed: bool) -> usize {
-        items.len() * Self::FIXED_SIZE + if include_size_for_fixed { PSY_IO_FIXED_ITEMS_MANY_COUNT_SIZE } else { 0 }
+    fn fx_tpl_pio_serialized_size_vec(items: &[Self], include_size: bool) -> usize {
+        items.len() * Self::FIXED_SIZE + if include_size { PSY_IO_FIXED_ITEMS_MANY_COUNT_SIZE } else { 0 }
     }
 
     #[inline]
     fn fx_tpl_pio_read_many_from_ref_bytes(data: &[u8], known_count: Option<usize>) -> anyhow::Result<Vec<Self>> {
-        let count = match known_count {
-            Some(len) => {
-                if len * Self::FIXED_SIZE > data.len() {
-                    anyhow::bail!("Data length {} is too small for expected count {} of fixed size {}", data.len(), len, Self::FIXED_SIZE);
-                }
-                len
-            },
-            None => {
-                let data_len = data.len();
-                if data_len % Self::FIXED_SIZE != 0 {
-                    anyhow::bail!("Data length {} is not a multiple of fixed size {}", data_len, Self::FIXED_SIZE);
-                }
-                data_len / Self::FIXED_SIZE
+        let view = if let Some(count) = known_count {
+            let expected_len = count * N;
+            if data.len() < expected_len {
+                anyhow::bail!(
+                    "Data length {} is too small for expected count {} of fixed size {} (needs {} bytes)",
+                    data.len(),
+                    count,
+                    N,
+                    expected_len
+                );
             }
+            &data[..expected_len]
+        } else {
+            // Data does not include a count prefix, so deserialize the whole slice.
+            if data.len() % N != 0 {
+                anyhow::bail!("Data length {} is not a multiple of fixed size {}", data.len(), N);
+            }
+            data
         };
-        if count > Self::psy_io_max_vec_length() {
-            anyhow::bail!("Read size {} exceeds maximum allowed length {}", count, Self::psy_io_max_vec_length());
+
+        if view.is_empty() {
+            return Ok(Vec::new());
         }
-        Self::ffs_deserialize_vec_of_self(data)
+
+        Self::ffs_deserialize_vec_of_self(view)
     }
 }

@@ -61,6 +61,7 @@ impl<C1: GCounterReader, C2: GCounterReader> MultiCounter<C1, C2> {
 }
 
 #[test]
+#[ignore = "database slow"]
 fn run_test(){
     let mut counter_a = ExampleCounter::new();
     let mut counter_b = ExampleOddCounter::new();

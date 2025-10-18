@@ -25,7 +25,7 @@ pub const fn convert_checkpoint_id_to_i64(checkpoint_id: u64) -> i64 {
 
 pub const fn convert_i64_to_checkpoint_id(checkpoint_id: i64) -> u64 {
     if checkpoint_id < 0 {
-        0
+        i64::MAX as u64
     } else {
         checkpoint_id as u64
     }
@@ -179,7 +179,7 @@ mod tests {
 
         // fuzz some random values within the i64 range
         for _ in 0..10000 {
-            let x = rand::random::<u64>() % ((i64::MAX as u64) + 1);
+            let x = rand::random::<u64>() % ((i64::MAX as u64)+1);
             assert_eq!(convert_checkpoint_id_to_i64(x), x as i64, "Failed for input value: {}", x);
         }
 
@@ -193,22 +193,22 @@ mod tests {
         assert_eq!(convert_i64_to_checkpoint_id(123456789), 123456789);
         assert_eq!(convert_i64_to_checkpoint_id(i64::MAX), i64::MAX as u64);
 
-        // Negative values (should be clamped to 0)
-        assert_eq!(convert_i64_to_checkpoint_id(-1), 0);
-        assert_eq!(convert_i64_to_checkpoint_id(-123456789), 0);
-        assert_eq!(convert_i64_to_checkpoint_id(i64::MIN), 0);
+        // Negative values (should be clamped to i64::MAX)
+        assert_eq!(convert_i64_to_checkpoint_id(-1), i64::MAX as u64);
+        assert_eq!(convert_i64_to_checkpoint_id(-123456789), i64::MAX as u64);
+        assert_eq!(convert_i64_to_checkpoint_id(i64::MIN), i64::MAX as u64);
 
         // fuzz some random values in the i64:MAX to u64::MAX range
         let base: u64 = u64::MAX - (i64::MAX as u64);
         for _ in 0..10000 {
             let x = (i64::MAX as u64)+ (rand::random::<u64>() % base);
-            assert_eq!(convert_i64_to_checkpoint_id(x as i64), i64::MAX as u64, "Failed for input value: {}", x);
+            assert_eq!(convert_i64_to_checkpoint_id(u64_to_i64_exact(x)), i64::MAX as u64, "Failed for input value: {}", x);
         }
 
         // fuzz some random values within the i64 range
         for _ in 0..10000 {
             let x = rand::random::<i64>();
-            let expected = if x < 0 { 0 } else { x as u64 };
+            let expected = if x < 0 { i64::MAX as u64 } else { x as u64 };
             assert_eq!(convert_i64_to_checkpoint_id(x), expected, "Failed for input value: {}", x);
         }
     }

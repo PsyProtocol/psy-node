@@ -1,4 +1,5 @@
 use postcard::fixint::le;
+use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
 use psy_serialize::{impl_psy_canonical_serialize_for_speedy, AutoDatabaseSerializationUseFastFixedSerialize, AutoImplementFallbackPsySerializeCanonical, FallbackPsySerializeCanonical, PsyCanonicalDatabaseSerializeBaseMulti, PsyCanonicalDatabaseSerializeBaseSingle, PsyCanonicalSerializeMetadata};
 use speedy::Writable;
 
@@ -16,34 +17,31 @@ impl PsyCanonicalSerializeMetadata for ExampleStruct {
     const FIXED_SIZE: usize = 0;
 }
 impl FallbackPsySerializeCanonical for ExampleStruct {
-    fn fallback_psy_ser_serialized_size(&self) -> usize {
+    
+    fn fallback_pio_serialized_size(&self) -> usize {
         4 + 32 + 4 + self.field_b.len()
     }
-    fn fallback_psy_ser_from_slice(data: &[u8]) -> anyhow::Result<Self> {
-        if data.len() < 40 {
-            anyhow::bail!("Data too short to contain ExampleStruct");
-        }
-        let field_a = u32::from_le_bytes(data[0..4].try_into().unwrap());
-        let field_b_len = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
-        if data.len() < 8 + field_b_len + 32 {
-            anyhow::bail!("Data too short to contain field_b and field_c");
-        }
-        let field_b = data[8..8 + field_b_len].to_vec();
-        let field_c: [u8; 32] = data[8 + field_b_len..8 + field_b_len + 32].try_into().unwrap();
-        Ok(ExampleStruct {
-            field_a,
-            field_b,
-            field_c,
-        })
+    
+    fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
+        writer.psy_write_u32(self.field_a)?;
+        writer.psy_write_bytes_vec(&self.field_b)?;
+        writer.psy_write_bytes_fixed(&self.field_c)?;
+        Ok(())
     }
+    
+    fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
+        let field_a = reader.psy_read_u32()?;
+        let field_b = reader.psy_read_bytes_vec()?;
+        let field_c_bytes = reader.psy_read_bytes_fixed::<32>()?;
+        Ok(
+            ExampleStruct {
+                field_a,
+                field_b,
+                field_c: field_c_bytes,
+            }
+        )
 
-    fn fallback_psy_ser_to_bytes_vec(&self) -> anyhow::Result<Vec<u8>> {
-        let mut bytes = Vec::with_capacity(self.fallback_psy_ser_serialized_size());
-        bytes.extend_from_slice(&self.field_a.to_le_bytes());
-        bytes.extend_from_slice(&(self.field_b.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(&self.field_b);
-        bytes.extend_from_slice(&self.field_c);
-        Ok(bytes)
+
     }
 }
 //impl AutoImplementFallbackPsySerializeCanonical for ExampleStruct {}

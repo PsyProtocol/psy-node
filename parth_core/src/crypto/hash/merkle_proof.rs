@@ -1,4 +1,5 @@
 use pser::{QBytesDeserialize, QBytesSerialize};
+use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
 use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalDatabaseSerializeBaseSingle, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
 use serde::{Deserialize, Serialize};
 
@@ -335,32 +336,31 @@ impl<Hash: Q256BitHash> PsyCanonicalDatabaseSerializeBaseSingle for MerkleProofC
     }
 }
 */
+
 impl<Hash: Q256BitHash> FallbackPsySerializeCanonical for MerkleProofCore<Hash> {
-    fn fallback_psy_ser_serialized_size(&self) -> usize {
+    fn fallback_pio_serialized_size(&self) -> usize {
         32 + 32 + 8 + 4 + (self.siblings.len() * 32)
     }
-    fn fallback_psy_ser_from_slice(data: &[u8]) -> anyhow::Result<Self> {
-        if data.len() < (32 + 32 + 8 + 4) {
-            anyhow::bail!("Data length {} is too small to contain MerkleProofCore", data.len());
+    
+    fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
+        writer.psy_write_bytes_fixed(&self.root.into_owned_32bytes())?;
+        writer.psy_write_bytes_fixed(&self.value.into_owned_32bytes())?;
+        writer.psy_write_u64(self.index)?;
+        writer.psy_write_vec_length(self.siblings.len())?;
+        for sibling in &self.siblings {
+            writer.psy_write_bytes_fixed(&sibling.into_owned_32bytes())?;
         }
-        let root = Q256BitHash::from_slice_32bytes(&data[0..32])?;
-        let value = Q256BitHash::from_slice_32bytes(&data[32..64])?;
-        let index = u64::from_le_bytes(data[64..72].try_into().unwrap());
-        let sibling_count = u32::from_le_bytes(data[72..76].try_into().unwrap());
-        let expected_len = 32 + 32 + 8 + 4 + (sibling_count as usize) * 32;
-        if data.len() != expected_len {
-            anyhow::bail!(
-                "Data length {} does not match expected length {} for MerkleProofCore with {} siblings",
-                data.len(),
-                expected_len,
-                sibling_count
-            );
-        }
-        let mut siblings = Vec::with_capacity(sibling_count as usize);
-        for i in 0..sibling_count {
-            let start = 76 + (i as usize) * 32;
-            let end = start + 32;
-            let sibling = Q256BitHash::from_slice_32bytes(&data[start..end])?;
+        Ok(())
+    }
+    
+    fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
+        let root = Hash::from_owned_32bytes(reader.psy_read_bytes_32()?);
+        let value = Hash::from_owned_32bytes(reader.psy_read_bytes_32()?);
+        let index = reader.psy_read_u64()?;
+        let sibling_count = reader.psy_read_vec_length()?;
+        let mut siblings = Vec::with_capacity(sibling_count);
+        for _ in 0..sibling_count {
+            let sibling = Hash::from_owned_32bytes(reader.psy_read_bytes_32()?);
             siblings.push(sibling);
         }
         Ok(Self {
@@ -370,22 +370,9 @@ impl<Hash: Q256BitHash> FallbackPsySerializeCanonical for MerkleProofCore<Hash> 
             siblings,
         })
     }
-
-    fn fallback_psy_ser_to_bytes_vec(&self) -> anyhow::Result<Vec<u8>> {
-        let mut buf = Vec::with_capacity(self.fallback_psy_ser_serialized_size());
-        buf.extend_from_slice(&self.root.into_owned_32bytes());
-        buf.extend_from_slice(&self.value.into_owned_32bytes());
-        buf.extend_from_slice(&self.index.to_le_bytes());
-        let sibling_count = self.siblings.len() as u32;
-        buf.extend_from_slice(&sibling_count.to_le_bytes());
-        for sibling in &self.siblings {
-            buf.extend_from_slice(&sibling.into_owned_32bytes());
-        }
-        Ok(buf)
-    }
 }
 
-#[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
+//#[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
 //#[cfg(not(all(feature = "serialize_speedy", target_endian = "little")))]
 psy_serialize::impl_psy_canonical_serialize_for_speedy!(
     MerkleProofCore,
@@ -517,30 +504,34 @@ impl<Hash: Q256BitHash> PsyCanonicalSerializeMetadata for DeltaMerkleProofCore<H
     const FIXED_SIZE: usize = 0;
 }
 impl<Hash: Q256BitHash> FallbackPsySerializeCanonical for DeltaMerkleProofCore<Hash> {
-    fn fallback_psy_ser_from_slice(data: &[u8]) -> anyhow::Result<Self> {
-        if data.len() < (32 + 32 + 32 + 32 + 8 + 4) {
-            anyhow::bail!("Data length {} is too small to contain DeltaMerkleProofCore", data.len());
+    
+    fn fallback_pio_serialized_size(&self) -> usize {
+        32 + 32 + 32 + 32 + 8 + 4 + (self.siblings.len() * 32)
+    }
+    
+    fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
+        writer.psy_write_bytes_fixed(&self.old_root.into_owned_32bytes())?;
+        writer.psy_write_bytes_fixed(&self.old_value.into_owned_32bytes())?;
+        writer.psy_write_bytes_fixed(&self.new_root.into_owned_32bytes())?;
+        writer.psy_write_bytes_fixed(&self.new_value.into_owned_32bytes())?;
+        writer.psy_write_u64(self.index)?;
+        writer.psy_write_vec_length(self.siblings.len())?;
+        for sibling in &self.siblings {
+            writer.psy_write_bytes_fixed(&sibling.into_owned_32bytes())?;
         }
-        let old_root = Q256BitHash::from_slice_32bytes(&data[0..32])?;
-        let old_value = Q256BitHash::from_slice_32bytes(&data[32..64])?;
-        let new_root = Q256BitHash::from_slice_32bytes(&data[64..96])?;
-        let new_value = Q256BitHash::from_slice_32bytes(&data[96..128])?;
-        let index = u64::from_le_bytes(data[128..136].try_into().unwrap());
-        let sibling_count = u32::from_le_bytes(data[136..140].try_into().unwrap());
-        let expected_len = 32 + 32 + 32 + 32 + 8 + 4 + (sibling_count as usize) * 32;
-        if data.len() != expected_len {
-            anyhow::bail!(
-                "Data length {} does not match expected length {} for DeltaMerkleProofCore with {} siblings",
-                data.len(),
-                expected_len,
-                sibling_count
-            );
-        }
-        let mut siblings = Vec::with_capacity(sibling_count as usize);
-        for i in 0..sibling_count {
-            let start = 140 + (i as usize) * 32;
-            let end = start + 32;
-            let sibling = Q256BitHash::from_slice_32bytes(&data[start..end])?;
+        Ok(())
+    }
+    
+    fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
+        let old_root = Q256BitHash::from_slice_32bytes(&reader.psy_read_bytes_fixed::<32>()?)?;
+        let old_value = Q256BitHash::from_slice_32bytes(&reader.psy_read_bytes_fixed::<32>()?)?;
+        let new_root = Q256BitHash::from_slice_32bytes(&reader.psy_read_bytes_fixed::<32>()?)?;
+        let new_value = Q256BitHash::from_slice_32bytes(&reader.psy_read_bytes_fixed::<32>()?)?;
+        let index = reader.psy_read_u64()?;
+        let sibling_count = reader.psy_read_vec_length()?;
+        let mut siblings = Vec::with_capacity(sibling_count);
+        for _ in 0..sibling_count {
+            let sibling = Q256BitHash::from_slice_32bytes(&reader.psy_read_bytes_fixed::<32>()?)?;
             siblings.push(sibling);
         }
         Ok(Self {
@@ -551,23 +542,6 @@ impl<Hash: Q256BitHash> FallbackPsySerializeCanonical for DeltaMerkleProofCore<H
             index,
             siblings,
         })
-    }
-    fn fallback_psy_ser_to_bytes_vec(&self) -> anyhow::Result<Vec<u8>> {
-        let mut buf = Vec::with_capacity(self.fallback_psy_ser_serialized_size());
-        buf.extend_from_slice(&self.old_root.into_owned_32bytes());
-        buf.extend_from_slice(&self.old_value.into_owned_32bytes());
-        buf.extend_from_slice(&self.new_root.into_owned_32bytes());
-        buf.extend_from_slice(&self.new_value.into_owned_32bytes());
-        buf.extend_from_slice(&self.index.to_le_bytes());
-        let sibling_count = self.siblings.len() as u32;
-        buf.extend_from_slice(&sibling_count.to_le_bytes());
-        for sibling in &self.siblings {
-            buf.extend_from_slice(&sibling.into_owned_32bytes());
-        }
-        Ok(buf)
-    }
-    fn fallback_psy_ser_serialized_size(&self) -> usize {
-        32 + 32 + 32 + 32 + 8 + 4 + (self.siblings.len() * 32)
     }
 }
 
@@ -992,12 +966,13 @@ mod tests {
                 root: PHash::ZERO,
                 value: PHash::ZERO,
                 index: 1,
-                siblings: vec![],
+                siblings: vec![PHash::from_values(1,2,3,4), PHash::from_values(5,6,7,8), PHash::from_values(9,10,11,12)],
             },
         ];
-        let ser_vec = MerkleProofCore::<PHash>::psy_ser_serialize_vec_of_self_ref(&merkle_proofs, false);
-        println!("ser_vec: {}", hex::encode(&ser_vec));
-        let de_vec = MerkleProofCore::<PHash>::psy_ser_deserialize_vec_of_self(&ser_vec, false).unwrap();
+        let ser_vec = MerkleProofCore::<PHash>::psy_ser_serialize_vec_of_self_ref(&merkle_proofs, true);
+        assert_eq!(ser_vec, hex_literal::hex!("0200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000100000000000000030000000100000000000000020000000000000003000000000000000400000000000000050000000000000006000000000000000700000000000000080000000000000009000000000000000a000000000000000b000000000000000c00000000000000"));
+        
+        let de_vec = MerkleProofCore::<PHash>::psy_ser_deserialize_vec_of_self(&ser_vec, true).unwrap();
         assert!(merkle_proofs == de_vec);
 
     }

@@ -1,72 +1,11 @@
-
+use anyhow::Context;
+use psy_io::{PsyWriterExtensions, PsyReaderExtensions, Read, Write};
 pub trait PsyIOWithMaxVecLength {
     #[inline(always)]
     fn psy_io_max_vec_length() -> usize {
         usize::MAX
     }
 }
-
-#[macro_export]
-macro_rules! impl_max_length_for_type {
-    ($ty:ty, $size:expr, $array_size:expr, $fixed_size:expr, $vec_size:expr) => {
-        impl psy_io::PsyIOWithMaxVecLength for $ty {
-            #[inline(always)]
-            fn psy_io_max_vec_length() -> usize {
-                $size as usize
-            }
-        }
-        impl<const N: usize> psy_io::PsyIOWithMaxVecLength for [$ty; N] {
-            #[inline(always)]
-            fn psy_io_max_vec_length() -> usize {
-                $fixed_size as usize
-            }
-        }
-        impl psy_io::PsyIOWithMaxVecLength for Vec<$ty> {
-            #[inline(always)]
-            fn psy_io_max_vec_length() -> usize {
-                $vec_size as usize
-            }
-        }
-    }
-}
-
-
-macro_rules! impl_max_length_for_type_internal {
-    ($ty:ty, $size:expr, $array_size:expr, $fixed_size:expr, $vec_size:expr) => {
-        impl crate::PsyIOWithMaxVecLength for $ty {
-            #[inline(always)]
-            fn psy_io_max_vec_length() -> usize {
-                $size as usize
-            }
-        }
-        impl<const N: usize> crate::PsyIOWithMaxVecLength for [$ty; N] {
-            #[inline(always)]
-            fn psy_io_max_vec_length() -> usize {
-                $fixed_size as usize
-            }
-        }
-        impl crate::PsyIOWithMaxVecLength for Vec<$ty> {
-            #[inline(always)]
-            fn psy_io_max_vec_length() -> usize {
-                $vec_size as usize
-            }
-        }
-    }
-}
-
-
-impl_max_length_for_type_internal!(u8, u32::MAX, u32::MAX, u32::MAX, u32::MAX);
-impl_max_length_for_type_internal!(u16, u32::MAX, u32::MAX, u32::MAX, u32::MAX);
-impl_max_length_for_type_internal!(u32, u32::MAX, u32::MAX, u32::MAX, u32::MAX);
-impl_max_length_for_type_internal!(u64, u32::MAX, u32::MAX, u32::MAX, u32::MAX);
-impl_max_length_for_type_internal!(u128, u32::MAX, u32::MAX, u32::MAX, u32::MAX);
-impl_max_length_for_type_internal!(i8, u32::MAX, u32::MAX, u32::MAX, u32::MAX);
-impl_max_length_for_type_internal!(i16, u32::MAX, u32::MAX, u32::MAX, u32::MAX);
-impl_max_length_for_type_internal!(i32, u32::MAX, u32::MAX, u32::MAX, u32::MAX);
-impl_max_length_for_type_internal!(i64, u32::MAX, u32::MAX, u32::MAX, u32::MAX);
-impl_max_length_for_type_internal!(i128, u32::MAX, u32::MAX, u32::MAX, u32::MAX);
-impl_max_length_for_type_internal!(f32, u32::MAX, u32::MAX, u32::MAX, u32::MAX);
-impl_max_length_for_type_internal!(f64, u32::MAX, u32::MAX, u32::MAX, u32::MAX);
 
 
 pub trait PsyIOWritableCanonicalStruct: PsyIOWithMaxVecLength + Sized {

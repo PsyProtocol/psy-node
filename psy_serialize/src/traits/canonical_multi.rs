@@ -1,64 +1,55 @@
-use psy_io::PSY_IO_FIXED_ITEMS_MANY_COUNT_SIZE;
-
-use crate::PsyCanonicalDatabaseSerializeBaseSingle;
-
+use crate::{PsyCanonicalDatabaseSerializeBaseSingle, PsyIOReadWrite};
 
 pub trait PsyCanonicalDatabaseSerializeBaseMulti: PsyCanonicalDatabaseSerializeBaseSingle {
     #[inline]
-    fn psy_ser_serialize_vec_of_self_ref(data: &[Self], write_fixed_items_count: bool) -> Vec<u8> {
-        if data.is_empty() {
-            return Vec::new();
-        } else {
-            Self::pio_write_many_to_bytes(data, write_fixed_items_count).expect("Failed to serialize vec of self")
-        }
+    fn psy_ser_serialize_vec_of_self_ref(data: &[Self], write_count: bool) -> Vec<u8> {
+        // This is a high-level API; unwrapping is acceptable if serialization to a Vec
+        // is not expected to fail (e.g., OOM).
+        Self::pio_write_many_to_bytes(data, write_count || !Self::IS_FIXED_SIZE).expect("Failed to serialize vec of self")
     }
 
     #[inline]
-    fn psy_ser_serialize_vec_of_self(data: Vec<Self>, write_fixed_items_count: bool) -> Vec<u8> {
-        if data.is_empty() {
-            return Vec::new();
-        } else {
-            Self::pio_write_many_to_bytes(&data, write_fixed_items_count).expect("Failed to serialize vec of self")
-        }
+    fn psy_ser_serialize_vec_of_self(data: Vec<Self>, write_count: bool) -> Vec<u8> {
+        Self::psy_ser_serialize_vec_of_self_ref(&data, write_count || !Self::IS_FIXED_SIZE)
     }
-    fn psy_ser_deserialize_vec_of_self(data: &[u8], include_size_for_fixed: bool) -> anyhow::Result<Vec<Self>> {
+
+    fn psy_ser_deserialize_vec_of_self(data: &[u8], include_count_for_fixed: bool) -> anyhow::Result<Vec<Self>> {
         if data.is_empty() {
             return Ok(Vec::new());
         }
-        let known_sz = if Self::IS_FIXED_SIZE {
-            let data_len = data.len();
-            if include_size_for_fixed {
-                if data_len < PSY_IO_FIXED_ITEMS_MANY_COUNT_SIZE {
-                    anyhow::bail!("Data length {} is too small to contain fixed items count", data.len());
-                } else if (data_len - PSY_IO_FIXED_ITEMS_MANY_COUNT_SIZE) % Self::FIXED_SIZE != 0 {
-                    anyhow::bail!(
-                        "Data length {} minus fixed items count size is not a multiple of fixed size {}",
-                        data_len,
-                        Self::FIXED_SIZE
-                    );
-                }
-                Some((data_len - PSY_IO_FIXED_ITEMS_MANY_COUNT_SIZE) / Self::FIXED_SIZE)
-            } else {
-                if data_len % Self::FIXED_SIZE != 0 {
-                    anyhow::bail!("Data length {} is not a multiple of fixed size {}", data_len, Self::FIXED_SIZE);
-                }
-                Some((data_len) / Self::FIXED_SIZE)
+
+        if Self::IS_FIXED_SIZE && !include_count_for_fixed {
+            // This is a raw slab of fixed-size items with no count prefix.
+            // We calculate the count and pass it to the pio layer.
+            // This enables the fast path for bytemuck zero-copy deserialization.
+            if data.len() % Self::FIXED_SIZE != 0 {
+                anyhow::bail!(
+                    "Data length {} is not a multiple of fixed size {}",
+                    data.len(),
+                    Self::FIXED_SIZE
+                );
             }
+            let count = data.len() / Self::FIXED_SIZE;
+            Self::pio_read_many_from_ref_bytes(data, Some(count))
         } else {
-            None
-        };
-        Self::pio_read_many_from_ref_bytes(data, known_sz, include_size_for_fixed)
+            // This is either variable-size items (which always have a count) or
+            // fixed-size items that are prefixed with a count.
+            // We pass the full slice and let the pio layer read the count.
+            Self::pio_read_many_from_ref_bytes(data, None)
+        }
     }
+
     #[inline]
-    fn psy_ser_deserialize_vec_of_self_owned(data: Vec<u8>, include_size_for_fixed: bool) -> anyhow::Result<Vec<Self>> {
-        Self::psy_ser_deserialize_vec_of_self(&data, include_size_for_fixed)
+    fn psy_ser_deserialize_vec_of_self_owned(data: Vec<u8>, include_count_for_fixed: bool) -> anyhow::Result<Vec<Self>> {
+        // The owned version can also benefit from the same logic.
+        // The pio_rw_fixed layer will use ffs_deserialize_vec_of_self_owned for potential zero-copy.
+        Self::psy_ser_deserialize_vec_of_self(&data, include_count_for_fixed)
     }
 }
 
-
 pub trait PsyCanonicalDatabaseSerializeBaseMultiFixedTemplate<const N: usize>: Sized {
-    fn fx_tpl_psy_ser_serialize_vec_of_self_ref(data: &[Self], write_fixed_items_count: bool) -> Vec<u8>;
-    fn fx_tpl_psy_ser_serialize_vec_of_self(data: Vec<Self>, write_fixed_items_count: bool) -> Vec<u8>;
-    fn fx_tpl_psy_ser_deserialize_vec_of_self(data: &[u8], include_size_for_fixed: bool) -> anyhow::Result<Vec<Self>>;
-    fn fx_tpl_psy_ser_deserialize_vec_of_self_owned(data: Vec<u8>, include_size_for_fixed: bool) -> anyhow::Result<Vec<Self>>;
+    fn fx_tpl_psy_ser_serialize_vec_of_self_ref(data: &[Self], write_count: bool) -> Vec<u8>;
+    fn fx_tpl_psy_ser_serialize_vec_of_self(data: Vec<Self>, write_count: bool) -> Vec<u8>;
+    fn fx_tpl_psy_ser_deserialize_vec_of_self(data: &[u8], include_count: bool) -> anyhow::Result<Vec<Self>>;
+    fn fx_tpl_psy_ser_deserialize_vec_of_self_owned(data: Vec<u8>, include_count: bool) -> anyhow::Result<Vec<Self>>;
 }

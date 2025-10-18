@@ -12,11 +12,6 @@ macro_rules! impl_ffs_for_primitive {
             const fn assert_pod<T: bytemuck::Pod>() {}
             assert_pod::<$ty>();
         };
-
-        impl PsyCanonicalSerializeMetadata for $ty {
-            const IS_FIXED_SIZE: bool = true;
-            const FIXED_SIZE: usize = $size;
-        }
         impl AutoDatabaseSerializationUseFastFixedSerialize<$size> for $ty {}
 
         crate::impl_psy_canonical_serialize_for_fixed_type_crate!(
@@ -139,9 +134,6 @@ macro_rules! impl_ffs_for_array {
         }
     };
 }
-// You can now safely "register" any array types you need.
-impl_ffs_for_array!(u16, 2, 4);
-impl_ffs_for_array!(u64, 8, 32);
 
 impl FastFixedSerializable<1> for u8 {
     #[inline(always)]

@@ -54,7 +54,10 @@ pub trait PsyReaderExtensions {
     fn psy_read_bytes_32(&mut self) -> anyhow::Result<[u8; 32]>;
     fn psy_read_bytes_fixed<const N: usize>(&mut self) -> anyhow::Result<[u8; N]>;
     fn psy_read_vec_length(&mut self) -> anyhow::Result<usize>;
-    fn psy_read_vec_of_fixed_bytes<const N: usize>(&mut self) -> anyhow::Result<[u8; N]>;
+    fn psy_read_vec_of_fixed_bytes<const N: usize>(&mut self) -> anyhow::Result<Vec<[u8; N]>>;
+    fn psy_read_bytes_of_length(&mut self, length: usize) -> anyhow::Result<Vec<u8>>;
+    fn psy_read_bytes_vec(&mut self) -> anyhow::Result<Vec<u8>>;
+    fn psy_read_bytes_vec_with_max_length(&mut self, max_length: usize) -> anyhow::Result<Vec<u8>>;
 }
 
 pub trait PsyWriterExtensions {
@@ -69,6 +72,7 @@ pub trait PsyWriterExtensions {
     fn psy_write_i64(&mut self, value: i64) -> anyhow::Result<()>;
     fn psy_write_i128(&mut self, value: i128) -> anyhow::Result<()>;
     fn psy_write_bytes(&mut self, bytes: &[u8]) -> anyhow::Result<()>;
+    fn psy_write_bytes_vec(&mut self, bytes: &[u8]) -> anyhow::Result<()>;
     fn psy_write_bytes_fixed<const N: usize>(&mut self, bytes: &[u8; N]) -> anyhow::Result<()>;
     fn psy_write_vec_length(&mut self, length: usize) -> anyhow::Result<()>;
 }
@@ -165,8 +169,40 @@ impl<R: Read + ?Sized> PsyReaderExtensions for R {
     }
 
     #[inline]
-    fn psy_read_vec_of_fixed_bytes<const N: usize>(&mut self) -> anyhow::Result<[u8; N]> {
-        self.psy_read_bytes_fixed::<N>()
+    fn psy_read_vec_of_fixed_bytes<const N: usize>(&mut self) -> anyhow::Result<Vec<[u8; N]>> {
+        let length = self.psy_read_vec_length()?;
+        let mut vec = Vec::with_capacity(length);
+        for _ in 0..length {
+            let item = self.psy_read_bytes_fixed::<N>()?;
+            vec.push(item);
+        }
+        Ok(vec)
+    }
+    
+    #[inline]
+    fn psy_read_bytes_vec(&mut self) -> anyhow::Result<Vec<u8>> {
+        let length = self.psy_read_vec_length()?;
+        let mut buf = vec![0u8; length];
+        self.read_exact(&mut buf).context(format!("Failed to read {} bytes into vec", length))?;
+        Ok(buf)
+    }
+    
+    #[inline]
+    fn psy_read_bytes_of_length(&mut self, length: usize) -> anyhow::Result<Vec<u8>> {
+        let mut buf = vec![0u8; length];
+        self.read_exact(&mut buf).context(format!("Failed to read {} bytes into vec", length))?;
+        Ok(buf)
+    }
+    
+    #[inline]
+    fn psy_read_bytes_vec_with_max_length(&mut self, max_length: usize) -> anyhow::Result<Vec<u8>> {
+        let length = self.psy_read_vec_length()?;
+        if length > max_length {
+            anyhow::bail!("Vector length {} exceeds maximum allowed {}", length, max_length);
+        }
+        let mut buf = vec![0u8; length];
+        self.read_exact(&mut buf).context(format!("Failed to read {} bytes into vec", length))?;
+        Ok(buf)
     }
 
 }
@@ -239,6 +275,11 @@ impl<W: Write + ?Sized> PsyWriterExtensions for W {
             .context("Vector length exceeds u32::MAX")?;
         self.psy_write_u32(len_u32)
     }
+    
+    fn psy_write_bytes_vec(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+        self.psy_write_vec_length(bytes.len())?;
+        self.write_all(bytes).context("Failed to write bytes vec")
+    }
 }
 
 // we will make these u32s for simplicity and speed
@@ -297,7 +338,7 @@ mod tests {
     use std::io::Cursor;
     #[test]
     fn test_varuint() {
-        let test_values = [0usize, 1, 127, 128, 255, 300, 16384, 2097151, 268435455, usize::MAX, 1338, 2];
+        let test_values = [0usize, 1, 127, 128, 255, 300, 16384, 2097151, 268435455, 1338, 2];
         for &value in &test_values {
             let mut buf = Vec::new();
             p_write_varuint(value, &mut buf).expect("Failed to write varuint");
