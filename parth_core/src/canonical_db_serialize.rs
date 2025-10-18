@@ -1,6 +1,4 @@
-use psy_io::{
-    p_read_fixed_items_many_count, p_read_varuint, p_varuint_size, p_write_fixed_items_manycount, p_write_varuint, PSY_IO_FIXED_ITEMS_MANY_COUNT_SIZE,
-};
+
 /* 
     impl<const N: usize> PsyCanonicalDatabaseSerializeBaseMulti for ExFFS {
         fn psydbser_serialize_vec_of_self_ref(data: &[Self], write_fixed_items_count: bool) -> Vec<u8> {
@@ -83,10 +81,9 @@ mod tests {
             AutoFFSPsyCanonicalDatabaseSerializeFixedBase, PsyCanonicalDatabaseSerializeBaseMulti, PsyCanonicalDatabaseSerializeBaseSingle,
             PsyCanonicalSerializeMetadata, PsyIOReadWrite,
         },
-        data::serializable::FastFixedSerializable,
         utils::QPGenRandom,
     };
-
+use psy_serialize::FastFixedSerializable;
     #[pderive::serialize_copy]
     #[derive(bytemuck::Pod, bytemuck::Zeroable)]
     #[repr(transparent)]

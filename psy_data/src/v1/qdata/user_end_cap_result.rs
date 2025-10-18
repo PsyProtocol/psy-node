@@ -1,5 +1,5 @@
 use parth_core::{crypto::hash::traits::FieldQHasher, data::serializable::{QPDSerializable}, felt::{QFelt, QFelt64, QFeltSized}, protocol::core_types::{Q256BitHash, QFHashBase, QHashBase}, utils::QPGenRandom};
-use psy_serialize::FastFixedSerializable;
+use psy_serialize::{AutoDatabaseSerializationUseFastFixedSerialize, FastFixedSerializable, PsyCanonicalSerializeMetadata};
 
 use crate::v1::qdata::ffs_sizes::PSY_OBJECT_FFS_SIZE_END_CAP_RESULT_COMPACT;
 
@@ -40,6 +40,17 @@ pser::impl_bytemuck_ffs_tests!(
     PUPSEndCapResultCompact,
     // Note the use of concrete types here
     { parth_core::PF, parth_core::PHash },
+    104
+);
+
+impl<F: QFelt64, Hash: Q256BitHash> PsyCanonicalSerializeMetadata for PUPSEndCapResultCompact<F, Hash> {
+    const IS_FIXED_SIZE: bool = true;
+    const FIXED_SIZE: usize = 104;
+}
+impl<F: QFelt64, Hash: Q256BitHash> AutoDatabaseSerializationUseFastFixedSerialize<104> for PUPSEndCapResultCompact<F, Hash> {}
+psy_serialize::impl_psy_canonical_serialize_for_fixed_type!(
+    PUPSEndCapResultCompact, 
+    {F: QFelt64, Hash: Q256BitHash} => {F, Hash}, 
     104
 );
 

@@ -1,12 +1,15 @@
 use std::cmp::Ordering;
 
-use psy_serialize::FastFixedSerializable;
+use psy_serialize::{AutoDatabaseSerializationUseFastFixedSerialize, FastFixedSerializable, PsyCanonicalSerializeMetadata};
 use rand::Rng;
 
 use crate::{data::serializable::{QPDSerializable, QPDSerializableFixed}, protocol::core_types::Q256BitHash, utils::QPGenRandom};
 pub const JOB_ID_EMPTY_REWARD_PATH_INFO: u64 = 0xFFFF_FFFF_FFFF_FFFFu64;
 
+pub const PSY_OBJECT_FFS_SIZE_SIMPLE_MERKLE_NODE_KEY: usize = 9;
+pub const PSY_OBJECT_FFS_SIZE_SIMPLE_MERKLE_NODE: usize = 41;
 #[pderive::serialize_copy_default_no_ord]
+#[repr(C)]
 pub struct SimpleMerkleNodeKey {
     pub level: u8,
     pub index: u64,
@@ -313,7 +316,27 @@ impl FastFixedSerializable<9> for SimpleMerkleNodeKey {
     }
 }
 
+
+impl PsyCanonicalSerializeMetadata for SimpleMerkleNodeKey {
+    const IS_FIXED_SIZE: bool = true;
+    const FIXED_SIZE: usize = 9;
+}
+impl AutoDatabaseSerializationUseFastFixedSerialize<9> for SimpleMerkleNodeKey {}
+psy_serialize::impl_psy_canonical_serialize_for_fixed_type!(
+    SimpleMerkleNodeKey,
+    9
+);
+
+pser::impl_bytemuck_pod_and_zeroable!(SimpleMerkleNodeKey);
+
+// This function is never called, it is just to ensure at compile time
+//  PSY_OBJECT_FFS_SIZE_CONTRACT_LEAF matches the FFS implementation
+fn _ensure_compile_time_size_match_key() {
+    let _bytes_h256: [u8; PSY_OBJECT_FFS_SIZE_SIMPLE_MERKLE_NODE_KEY] = SimpleMerkleNodeKey::qp_rand_gen().ffs_into_bytes();
+}
+
 #[pderive::serialize_copy_no_ord]
+#[repr(C)]
 pub struct SimpleMerkleNode<Hash> {
     pub key: SimpleMerkleNodeKey,
     pub value: Hash,
@@ -357,6 +380,7 @@ impl<Hash: Ord> Ord for SimpleMerkleNode<Hash> {
 }
 
 
+
 impl<Hash: Q256BitHash> FastFixedSerializable<41> for SimpleMerkleNode<Hash> {
     fn ffs_from_owned_bytes(data: [u8; 41]) -> Self {
         Self {
@@ -396,6 +420,34 @@ impl<Hash: Q256BitHash> FastFixedSerializable<41> for SimpleMerkleNode<Hash> {
         data
     }
 }
+
+pser::impl_bytemuck_pod_and_zeroable!(SimpleMerkleNode, Hash);
+
+pser::impl_bytemuck_ffs_tests!(
+    SimpleMerkleNode,
+    { crate::PHash },
+    41,
+    true
+);
+
+// This function is never called, it is just to ensure at compile time
+//  PSY_OBJECT_FFS_SIZE_CONTRACT_LEAF matches the FFS implementation
+fn _ensure_compile_time_size_match_node() {
+    let _bytes_h256: [u8; PSY_OBJECT_FFS_SIZE_SIMPLE_MERKLE_NODE] = SimpleMerkleNode::<crate::data::hash::hash256::Hash256>::qp_rand_gen().ffs_into_bytes();
+    let _bytes_phash: [u8; PSY_OBJECT_FFS_SIZE_SIMPLE_MERKLE_NODE] = SimpleMerkleNode::< crate::PHash>::qp_rand_gen().ffs_into_bytes();
+}
+
+impl<Hash: Q256BitHash> PsyCanonicalSerializeMetadata for SimpleMerkleNode<Hash> {
+    const IS_FIXED_SIZE: bool = true;
+    const FIXED_SIZE: usize = 41;
+}
+impl<Hash: Q256BitHash> AutoDatabaseSerializationUseFastFixedSerialize<41> for SimpleMerkleNode<Hash> {}
+psy_serialize::impl_psy_canonical_serialize_for_fixed_type!(
+    SimpleMerkleNode, 
+    {Hash: Q256BitHash} => {Hash}, 
+    41
+);
+
 
 impl<Hash: QPGenRandom> QPGenRandom for SimpleMerkleNode<Hash> {
     fn qp_rand_gen() -> Self where Self: Sized {
@@ -750,7 +802,7 @@ bad nca(SimpleMerkleNodeKey { level: 19, index: 0 }, SimpleMerkleNodeKey { level
 
 */
 #[cfg(test)]
-mod tests {
+mod tests_old {
 
     struct NCAGroupCheckerHelper {
         pub node_to_group_id_map: std::collections::HashMap<SimpleMerkleNodeKey, usize>,

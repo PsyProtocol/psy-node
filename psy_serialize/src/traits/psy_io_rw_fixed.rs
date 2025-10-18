@@ -2,7 +2,6 @@ use psy_io::{p_read_fixed_items_many_count, p_write_fixed_items_manycount, PSY_I
 
 use crate::{FastFixedSerializable, PsyCanonicalSerializeMetadata};
 
-
 pub trait PsyIOReadWriteFixedTemplate<const N: usize>: PsyCanonicalSerializeMetadata + FastFixedSerializable<N> + Sized {
     fn fx_tpl_pio_serialized_size(&self) -> usize {
         N

@@ -1,4 +1,9 @@
-use crate::{FastFixedSerializable, PsyCanonicalDatabaseSerializeBaseSingleFixedTemplate, PsyCanonicalDatabaseSerializeFixedBase, PsyCanonicalSerializeMetadata, PsyIOReadWriteFixedTemplate};
+use psy_io::PSY_IO_FIXED_ITEMS_MANY_COUNT_SIZE;
+
+use crate::{
+    FastFixedSerializable, PsyCanonicalDatabaseSerializeBaseMultiFixedTemplate, PsyCanonicalDatabaseSerializeBaseSingleFixedTemplate,
+    PsyCanonicalDatabaseSerializeFixedBase, PsyCanonicalSerializeMetadata, PsyIOReadWriteFixedTemplate,
+};
 
 pub trait AutoDatabaseSerializationUseFastFixedSerialize<const N: usize>: FastFixedSerializable<N> + Sized + PsyCanonicalSerializeMetadata {}
 
@@ -39,8 +44,6 @@ impl<const SIZE: usize, T: AutoDatabaseSerializationUseFastFixedSerialize<SIZE>>
     }
 }
 
-
-
 impl<const N: usize, T: AutoDatabaseSerializationUseFastFixedSerialize<N>> PsyCanonicalDatabaseSerializeBaseSingleFixedTemplate<N> for T {
     fn fx_tpl_psydbser_from_slice(data: &[u8]) -> anyhow::Result<Self> {
         Self::ffs_try_from_slice(data)
@@ -49,12 +52,84 @@ impl<const N: usize, T: AutoDatabaseSerializationUseFastFixedSerialize<N>> PsyCa
     fn fx_tpl_psydbser_to_bytes_vec(&self) -> anyhow::Result<Vec<u8>> {
         Ok(self.ffs_to_bytes().to_vec())
     }
-    
+
     fn fx_tpl_psydbser_into_bytes_vec(self) -> anyhow::Result<Vec<u8>> {
         Ok(self.ffs_into_bytes().to_vec())
     }
-    
+
     fn fx_tpl_psydbser_from_owned_bytes_vec(data: Vec<u8>) -> anyhow::Result<Self> {
-        Ok(Self::ffs_from_owned_bytes(data.try_into().map_err(|e| anyhow::anyhow!("{:?}",e))?))
+        Ok(Self::ffs_from_owned_bytes(data.try_into().map_err(|e| anyhow::anyhow!("{:?}", e))?))
+    }
+}
+
+impl<const N: usize, T: AutoDatabaseSerializationUseFastFixedSerialize<N>> PsyCanonicalDatabaseSerializeBaseMultiFixedTemplate<N> for T {
+    fn fx_tpl_psydbser_serialize_vec_of_self_ref(data: &[Self], write_fixed_items_count: bool) -> Vec<u8> {
+        if write_fixed_items_count {
+            let mut bytes = Vec::with_capacity(data.len() * N + PSY_IO_FIXED_ITEMS_MANY_COUNT_SIZE);
+            bytes.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            <T as FastFixedSerializable<N>>::write_ffs_serialize_vec_of_self(data, &mut bytes);
+            bytes
+        } else {
+            <T as FastFixedSerializable<N>>::ffs_serialize_vec_of_self_ref(data)
+        }
+    }
+
+    fn fx_tpl_psydbser_serialize_vec_of_self(data: Vec<Self>, write_fixed_items_count: bool) -> Vec<u8> {
+        if write_fixed_items_count {
+            let len = data.len();
+            let mut item_bytes = <T as FastFixedSerializable<N>>::ffs_serialize_vec_of_self(data);
+            let mut bytes = Vec::with_capacity(item_bytes.len() + PSY_IO_FIXED_ITEMS_MANY_COUNT_SIZE);
+            bytes.extend_from_slice(&(len as u32).to_le_bytes());
+            bytes.append(&mut item_bytes);
+            bytes
+        } else {
+            <T as FastFixedSerializable<N>>::ffs_serialize_vec_of_self(data)
+        }
+    }
+
+    fn fx_tpl_psydbser_deserialize_vec_of_self(data: &[u8], include_size_for_fixed: bool) -> anyhow::Result<Vec<Self>> {
+        if include_size_for_fixed {
+            if data.len() < PSY_IO_FIXED_ITEMS_MANY_COUNT_SIZE {
+                anyhow::bail!("Data length {} is too small to contain fixed items count", data.len());
+            }
+            let count_bytes: [u8; PSY_IO_FIXED_ITEMS_MANY_COUNT_SIZE] = data[0..PSY_IO_FIXED_ITEMS_MANY_COUNT_SIZE].try_into().unwrap();
+            let count = u32::from_le_bytes(count_bytes) as usize;
+            let expected_len = PSY_IO_FIXED_ITEMS_MANY_COUNT_SIZE + count * N;
+            if data.len() != expected_len {
+                anyhow::bail!(
+                    "Data length {} does not match expected size {} for count {}",
+                    data.len(),
+                    expected_len,
+                    count
+                );
+            }
+            let items_data = &data[PSY_IO_FIXED_ITEMS_MANY_COUNT_SIZE..];
+            <T as FastFixedSerializable<N>>::ffs_deserialize_vec_of_self(items_data)
+        } else {
+            <T as FastFixedSerializable<N>>::ffs_deserialize_vec_of_self(data)
+        }
+    }
+
+    fn fx_tpl_psydbser_deserialize_vec_of_self_owned(data: Vec<u8>, include_size_for_fixed: bool) -> anyhow::Result<Vec<Self>> {
+        if include_size_for_fixed {
+            if data.len() < PSY_IO_FIXED_ITEMS_MANY_COUNT_SIZE {
+                anyhow::bail!("Data length {} is too small to contain fixed items count", data.len());
+            }
+            let count_bytes: [u8; PSY_IO_FIXED_ITEMS_MANY_COUNT_SIZE] = data[0..PSY_IO_FIXED_ITEMS_MANY_COUNT_SIZE].try_into().unwrap();
+            let count = u32::from_le_bytes(count_bytes) as usize;
+            let expected_len = PSY_IO_FIXED_ITEMS_MANY_COUNT_SIZE + count * N;
+            if data.len() != expected_len {
+                anyhow::bail!(
+                    "Data length {} does not match expected size {} for count {}",
+                    data.len(),
+                    expected_len,
+                    count
+                );
+            }
+            let items_data = &data[PSY_IO_FIXED_ITEMS_MANY_COUNT_SIZE..];
+            <T as FastFixedSerializable<N>>::ffs_deserialize_vec_of_self(items_data)
+        } else {
+            <T as FastFixedSerializable<N>>::ffs_deserialize_vec_of_self_owned(data)
+        }
     }
 }

@@ -6,7 +6,7 @@ use parth_core::{
     protocol::core_types::{Q256BitHash, QFHashBase, QHashBase}, utils::QPGenRandom,
 };
 use pser::{QBytesSerialize, QBytesDeserialize};
-use psy_serialize::FastFixedSerializable;
+use psy_serialize::{AutoDatabaseSerializationUseFastFixedSerialize, FastFixedSerializable, PsyCanonicalSerializeMetadata};
 
 use crate::v1::qdata::ffs_sizes::PSY_OBJECT_FFS_SIZE_ZK_PUBLIC_KEY;
 
@@ -102,3 +102,14 @@ impl<Hash: Q256BitHash> FastFixedSerializable<64> for PZKPublicKeyInfo<Hash> {
         bytes
     }
 }
+
+impl<Hash: Q256BitHash> PsyCanonicalSerializeMetadata for PZKPublicKeyInfo<Hash> {
+    const IS_FIXED_SIZE: bool = true;
+    const FIXED_SIZE: usize = 64;
+}
+impl<Hash: Q256BitHash> AutoDatabaseSerializationUseFastFixedSerialize<64> for PZKPublicKeyInfo<Hash> {}
+psy_serialize::impl_psy_canonical_serialize_for_fixed_type!(
+    PZKPublicKeyInfo, 
+    {Hash: Q256BitHash} => {Hash}, 
+    64
+);

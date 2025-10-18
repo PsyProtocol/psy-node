@@ -8,6 +8,13 @@ pub mod signed_helpers;
 
 pub trait QPGenRandom {
     fn qp_rand_gen() -> Self where Self: Sized;
+    fn qp_rand_gen_vec(len: usize) -> Vec<Self> where Self: Sized {
+        let mut vec = Vec::with_capacity(len);
+        for _ in 0..len {
+            vec.push(Self::qp_rand_gen());
+        }
+        vec
+    }
 }
 
 impl QPGenRandom for u8 {

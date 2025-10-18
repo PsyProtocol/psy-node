@@ -2024,6 +2024,7 @@ dependencies = [
  "postcard",
  "pser",
  "psy_core",
+ "psy_io",
  "psy_serialize",
  "rand 0.8.5",
  "rkyv",

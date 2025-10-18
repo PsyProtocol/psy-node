@@ -227,7 +227,7 @@ pub trait CoreDatabaseSingleIdCheckpointedWriter<TableIdentifier: Clone + Send +
     async fn db_insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_start(
         &self,
         table: &TableIdentifier,
-        object_size: usize,
+        object_size_without_id: usize,
         checkpoint_id: u64,
         rows: &[u8],
     ) -> anyhow::Result<()>;

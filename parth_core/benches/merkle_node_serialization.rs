@@ -2,10 +2,12 @@ use criterion::{black_box, BenchmarkId, Criterion};
 use parth_core::{
     data::{
         hash::hash256::Hash256,
-        serializable::{FastFixedSerializable, QPDSerializable, QPDSerializableFixed},
+        serializable::{QPDSerializable, QPDSerializableFixed},
     }, pgoldilocks::PGoldilocksHash, protocol::core_types::Q256BitHash, utils::QPGenRandom
 };
 use speedy::{Readable, Writable};
+use psy_serialize::FastFixedSerializable;
+
 
 // NOTE on Cargo.toml for rkyv:
 // For `` and the derive macros to work,

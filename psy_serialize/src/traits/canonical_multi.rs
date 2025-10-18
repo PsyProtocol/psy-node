@@ -52,3 +52,11 @@ pub trait PsyCanonicalDatabaseSerializeBaseMulti: PsyCanonicalDatabaseSerializeB
         Ok(items)
     }
 }
+
+
+pub trait PsyCanonicalDatabaseSerializeBaseMultiFixedTemplate<const N: usize>: Sized {
+    fn fx_tpl_psydbser_serialize_vec_of_self_ref(data: &[Self], write_fixed_items_count: bool) -> Vec<u8>;
+    fn fx_tpl_psydbser_serialize_vec_of_self(data: Vec<Self>, write_fixed_items_count: bool) -> Vec<u8>;
+    fn fx_tpl_psydbser_deserialize_vec_of_self(data: &[u8], include_size_for_fixed: bool) -> anyhow::Result<Vec<Self>>;
+    fn fx_tpl_psydbser_deserialize_vec_of_self_owned(data: Vec<u8>, include_size_for_fixed: bool) -> anyhow::Result<Vec<Self>>;
+}

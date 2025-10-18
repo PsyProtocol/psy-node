@@ -1,6 +1,8 @@
+use std::hash::Hash;
+
 use crate::{data::{hash::merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}, serializable::{QPDSerializable, QPDSerializableFixed}}, protocol::core_types::Q256BitHash, utils::QPGenRandom};
 
-use psy_serialize::FastFixedSerializable;
+use psy_serialize::{AutoDatabaseSerializationUseFastFixedSerialize, FastFixedSerializable, PsyCanonicalSerializeMetadata};
 
 
 pub type QMerkleStoreZeroIdKey = SimpleMerkleNodeKey;
@@ -58,6 +60,12 @@ impl FastFixedSerializable<17> for QMerkleStoreSingleIdKey {
         data
     }
 }
+impl PsyCanonicalSerializeMetadata for QMerkleStoreSingleIdKey {
+    const IS_FIXED_SIZE: bool = true;
+    const FIXED_SIZE: usize = 17;
+}
+impl AutoDatabaseSerializationUseFastFixedSerialize<17> for QMerkleStoreSingleIdKey {}
+psy_serialize::impl_psy_canonical_serialize_for_fixed_type!(QMerkleStoreSingleIdKey, 17);
 
 impl QPDSerializable for QMerkleStoreSingleIdKey {
     fn to_bytes(&self) -> anyhow::Result<Vec<u8>> {
@@ -152,6 +160,16 @@ impl<Hash: Q256BitHash> FastFixedSerializable<49> for QMerkleStoreSingleIdNode<H
     }
 }
 
+impl<Hash: Q256BitHash> PsyCanonicalSerializeMetadata for QMerkleStoreSingleIdNode<Hash> {
+    const IS_FIXED_SIZE: bool = true;
+    const FIXED_SIZE: usize = 49;
+}
+impl<Hash: Q256BitHash> AutoDatabaseSerializationUseFastFixedSerialize<49> for QMerkleStoreSingleIdNode<Hash> {}
+psy_serialize::impl_psy_canonical_serialize_for_fixed_type!(
+    QMerkleStoreSingleIdNode, 
+    {Hash: Q256BitHash} => {Hash}, 
+    49
+);
 
 
 #[pderive::serialize_copy_default]
@@ -213,6 +231,12 @@ impl FastFixedSerializable<25> for QMerkleStoreDoubleIdKey {
         data
     }
 }
+impl PsyCanonicalSerializeMetadata for QMerkleStoreDoubleIdKey {
+    const IS_FIXED_SIZE: bool = true;
+    const FIXED_SIZE: usize = 25;
+}
+impl AutoDatabaseSerializationUseFastFixedSerialize<25> for QMerkleStoreDoubleIdKey {}
+psy_serialize::impl_psy_canonical_serialize_for_fixed_type!(QMerkleStoreDoubleIdKey, 25);
 impl QPGenRandom for QMerkleStoreDoubleIdKey {
     fn qp_rand_gen() -> Self where Self: Sized {
         Self {
@@ -345,6 +369,18 @@ impl<Hash: Q256BitHash> FastFixedSerializable<57> for QMerkleStoreDoubleIdNode<H
         data
     }
 }
+
+
+impl<Hash: Q256BitHash> PsyCanonicalSerializeMetadata for QMerkleStoreDoubleIdNode<Hash> {
+    const IS_FIXED_SIZE: bool = true;
+    const FIXED_SIZE: usize = 57;
+}
+impl<Hash: Q256BitHash> AutoDatabaseSerializationUseFastFixedSerialize<57> for QMerkleStoreDoubleIdNode<Hash> {}
+psy_serialize::impl_psy_canonical_serialize_for_fixed_type!(
+    QMerkleStoreDoubleIdNode, 
+    {Hash: Q256BitHash} => {Hash}, 
+    57
+);
 
 pub fn convert_ffs_array_to_vec<const N: usize, T: FastFixedSerializable<N>>(data: &[T]) -> Vec<u8> {
     let mut result: Vec<u8> = Vec::with_capacity(data.len() * N);

@@ -10,7 +10,7 @@ use parth_core::{
     utils::QPGenRandom,
 };
 use pser::{QBytesDeserialize, QBytesSerialize};
-use psy_serialize::FastFixedSerializable;
+use psy_serialize::{AutoDatabaseSerializationUseFastFixedSerialize, FastFixedSerializable, PsyCanonicalSerializeMetadata};
 
 use crate::v1::qdata::ffs_sizes::PSY_OBJECT_FFS_SIZE_CONTRACT_LEAF;
 
@@ -37,6 +37,7 @@ impl_psyser_for_ffs_with_params!(
     { F: QFelt64, Hash: Q256BitHash } => { F, Hash },
     72
 );
+
 
 impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for PQEDContractLeaf<F, Hash> {
     fn qp_rand_gen() -> Self
@@ -124,6 +125,19 @@ pser::impl_bytemuck_ffs_tests!(
     { parth_core::PF, parth_core::PHash },
     72
 );
+
+
+impl<F: QFelt64, Hash: Q256BitHash> PsyCanonicalSerializeMetadata for PQEDContractLeaf<F, Hash> {
+    const IS_FIXED_SIZE: bool = true;
+    const FIXED_SIZE: usize = 72;
+}
+impl<F: QFelt64, Hash: Q256BitHash> AutoDatabaseSerializationUseFastFixedSerialize<72> for PQEDContractLeaf<F, Hash> {}
+psy_serialize::impl_psy_canonical_serialize_for_fixed_type!(
+    PQEDContractLeaf, 
+    {F: QFelt64, Hash: Q256BitHash} => {F, Hash}, 
+    72
+);
+
 
 // This function is never called, it is just to ensure at compile time
 //  PSY_OBJECT_FFS_SIZE_CONTRACT_LEAF matches the FFS implementation
