@@ -1,6 +1,4 @@
-use paste::paste;
-
-use crate::{AutoDatabaseSerializationUseFastFixedSerialize, FastFixedSerializable, PsyCanonicalSerializeMetadata};
+use crate::{AutoDatabaseSerializationUseFastFixedSerialize, FastFixedSerializable};
 
 pub const CONST_FFS_PRIMITIVES_ENABLED: bool = true;
 
@@ -83,7 +81,7 @@ impl_ffs_for_primitive!(f64, 8);
 //==================================================================================
 // 4. ROBUST MACRO AND IMPLEMENTATIONS FOR ARRAYS OF PRIMITIVES
 //==================================================================================
-
+/* 
 macro_rules! impl_ffs_for_array {
     ($inner_ty:ty, $inner_size:expr, $array_len:expr) => {
         paste! {
@@ -134,7 +132,7 @@ macro_rules! impl_ffs_for_array {
         }
     };
 }
-
+*/
 impl FastFixedSerializable<1> for u8 {
     #[inline(always)]
     fn ffs_from_owned_bytes(data: [u8; 1]) -> Self {

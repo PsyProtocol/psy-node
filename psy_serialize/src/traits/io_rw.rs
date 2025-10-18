@@ -1,5 +1,5 @@
 use anyhow::Context;
-use psy_io::{PsyWriterExtensions, PsyReaderExtensions, Read, Write};
+use psy_io::{PsyWriterExtensions, PsyReaderExtensions};
 
 use crate::PsyIOWithMaxVecLength;
 

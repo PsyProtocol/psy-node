@@ -1,7 +1,7 @@
 use std::fmt::Display;
 
 use hex::FromHexError;
-use psy_serialize::{impl_psy_canonical_serialize_for_fixed_type, AutoDatabaseSerializationUseFastFixedSerialize, FastFixedSerializable, PsyCanonicalDatabaseSerializeBaseSingle, PsyCanonicalDatabaseSerializeFixedBase, PsyCanonicalSerializeMetadata, PsySerializeCanonical};
+use psy_serialize::{AutoDatabaseSerializationUseFastFixedSerialize, FastFixedSerializable, PsyCanonicalSerializeMetadata};
 use rand::RngCore;
 use serde_with::serde_as;
 use ts_rs::TS;

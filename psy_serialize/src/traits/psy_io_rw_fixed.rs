@@ -1,6 +1,6 @@
 use anyhow::Context;
 use psy_io::{
-    p_read_fixed_items_many_count, p_write_fixed_items_manycount, PsyReaderExtensions, PsyWriterExtensions,
+    p_read_fixed_items_many_count, p_write_fixed_items_manycount,
     PSY_IO_FIXED_ITEMS_MANY_COUNT_SIZE,
 };
 use crate::traits::metadata::PsyIOWithMaxVecLength;

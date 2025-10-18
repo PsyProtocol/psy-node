@@ -1,4 +1,4 @@
-use crate::{PsyCanonicalDatabaseSerializeBaseSingle, PsyIOReadWrite};
+use crate::PsyCanonicalDatabaseSerializeBaseSingle;
 
 pub trait PsyCanonicalDatabaseSerializeBaseMulti: PsyCanonicalDatabaseSerializeBaseSingle {
     #[inline]

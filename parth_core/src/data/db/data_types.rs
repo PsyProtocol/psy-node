@@ -2,7 +2,7 @@ use psy_serialize::PsySerializeCanonical;
 use serde::{de::DeserializeOwned, Serialize};
 use std::hash::Hash;
 
-use crate::{data::serializable::{QPDSerializable, QPDSerializableFixed}, utils::QPGenRandom};
+use crate::utils::QPGenRandom;
 
 
 pub trait CoreDatabaseValueDeserialize: DeserializeOwned + Send + Sync + Serialize + PartialEq + Clone {
