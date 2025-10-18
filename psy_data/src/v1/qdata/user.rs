@@ -287,3 +287,24 @@ psy_serialize::impl_psy_canonical_serialize_for_fixed_type!(
     {F: QFelt64, Hash: Q256BitHash} => {F, Hash}, 
     104
 );
+
+
+#[cfg(test)]
+mod user_leaf_tests {
+    use parth_core::{utils::QPGenRandom, PHash, PF};
+    use psy_serialize::PsyIOReadWrite;
+
+    use crate::v1::qdata::user::PQEDUserLeaf;
+
+    #[test]
+    fn test_pio_read_write() -> anyhow::Result<()>{
+        let users: Vec<PQEDUserLeaf<PF, PHash>> = QPGenRandom::qp_rand_gen_vec(10);
+        let res = PQEDUserLeaf::<PF, PHash>::pio_write_many_to_bytes(&users, false)?;
+        let users_read = PQEDUserLeaf::<PF, PHash>::pio_read_many_from_ref_bytes(&res, None)?;
+        assert_eq!(users.len(), users_read.len());
+        assert!(users == users_read, "Serialized bytes do not match after read/write");
+
+        Ok(())
+
+    }
+}

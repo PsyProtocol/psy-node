@@ -95,4 +95,16 @@ pub trait PsyIOReadWriteFixedTemplate<const N: usize>: PsyCanonicalSerializeMeta
 
         Self::ffs_deserialize_vec_of_self(view)
     }
+
+    #[inline]
+    fn fx_tpl_pio_write_many_to_bytes(items: &[Self], write_count: bool) -> anyhow::Result<Vec<u8>> {
+        if !write_count {
+            Ok(Self::ffs_serialize_vec_of_self_ref(items))
+        }else{
+            let mut buffer = Vec::with_capacity(Self::fx_tpl_pio_serialized_size_vec(items, write_count));
+            Self::fx_tpl_pio_write_to_io_many(items, &mut buffer, write_count)?;
+            Ok(buffer)
+        }
+    }
+    
 }

@@ -55,7 +55,7 @@ macro_rules! __impl_psy_canonical_serialize_for_fixed_type_internal {
 
             #[inline(always)]
             fn pio_write_many_to_bytes(items: &[$type], write_count: bool) -> anyhow::Result<Vec<u8>> {
-                <$type as psy_serialize::PsyIOReadWrite>::pio_write_many_to_bytes(items, write_count)
+                <$type as psy_serialize::PsyIOReadWriteFixedTemplate<{$size}>>::fx_tpl_pio_write_many_to_bytes(items, write_count)
             }
         }
 
@@ -182,7 +182,7 @@ macro_rules! __impl_psy_canonical_serialize_for_fixed_type_internal_crate {
 
             #[inline(always)]
             fn pio_write_many_to_bytes(items: &[$type], write_count: bool) -> anyhow::Result<Vec<u8>> {
-                 <Self as crate::PsyIOReadWrite>::pio_write_many_to_bytes(items, write_count)
+                 <Self as crate::PsyIOReadWriteFixedTemplate<{$size}>>::fx_tpl_pio_write_many_to_bytes(items, write_count)
             }
         }
 

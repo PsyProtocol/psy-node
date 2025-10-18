@@ -1,11 +1,7 @@
 use anyhow::Context;
 use psy_io::{PsyWriterExtensions, PsyReaderExtensions, Read, Write};
-pub trait PsyIOWithMaxVecLength {
-    #[inline(always)]
-    fn psy_io_max_vec_length() -> usize {
-        usize::MAX
-    }
-}
+
+use crate::PsyIOWithMaxVecLength;
 
 
 pub trait PsyIOWritableCanonicalStruct: PsyIOWithMaxVecLength + Sized {

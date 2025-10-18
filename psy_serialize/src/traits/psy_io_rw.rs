@@ -91,6 +91,15 @@ pub trait PsyIOReadWrite: PsyCanonicalSerializeMetadata + Sized {
         Self::pio_read_from_io_many(&mut cursor, known_count)
     }
 
+
+    #[inline]
+    fn pio_write_many_to_bytes_standard(items: &[Self], write_count: bool) -> anyhow::Result<Vec<u8>> {
+        let total_size = Self::pio_serialized_size_vec(items, write_count);
+        let mut buffer = Vec::with_capacity(total_size);
+        Self::pio_write_to_io_many(items, &mut buffer, write_count)?;
+        Ok(buffer)
+    }
+
     #[inline]
     fn pio_write_many_to_bytes(items: &[Self], write_count: bool) -> anyhow::Result<Vec<u8>> {
         let total_size = Self::pio_serialized_size_vec(items, write_count);

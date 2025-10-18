@@ -44,7 +44,7 @@ fn gen_random_user_leaves<F: BenchFastRand, Hash: BenchFastRand>(count: usize) -
     users
 }
 fn benckmark_serialize_round_trip_user_leaf_internal<F: BenchFastRand + QFelt64 + QFelt + MaybeSpeedy,  Hash: BenchFastRand + QDBHashBase + QFHashBase<F>>(c: &mut Criterion, user_counts: &[usize]) {
-    let mut group = c.benchmark_group(format!("serialize_user_leaf{}_v1", Hash::q_type_name()));
+    let mut group = c.benchmark_group(format!("serialize_user_leaf{}_v333", Hash::q_type_name()));
 
 
     // We test with a variety of input sizes to see how performance scales.
@@ -68,15 +68,9 @@ fn benckmark_serialize_round_trip_user_leaf_internal<F: BenchFastRand + QFelt64 
             b.iter(||bincode::serialize(black_box(l)).unwrap());
         });
         group.bench_with_input(BenchmarkId::new("serialize_speedy", *count), &items, |b, l| {
-            // `b.iter` runs the closure multiple times to get a stable measurement.
-            // `black_box` prevents the compiler from optimizing away the function call.
-            //b.iter(|| Vec::<PQEDUserLeaf::<F, Hash>>::read_from(black_box(l)));
             b.iter(||black_box(l).write_to_vec().unwrap());
         });
         group.bench_with_input(BenchmarkId::new("serialize_postcard", *count), &items, |b, l| {
-            // `b.iter` runs the closure multiple times to get a stable measurement.
-            // `black_box` prevents the compiler from optimizing away the function call.
-            //b.iter(|| Vec::<PQEDUserLeaf::<F, Hash>>::read_from(black_box(l)));
             b.iter(||postcard::to_stdvec(black_box(l)).unwrap());
         });
         group.bench_with_input(BenchmarkId::new("serialize_ffs_vec_of_self_ref", *count), &items, |b, l| {
@@ -113,13 +107,6 @@ fn benckmark_serialize_round_trip_user_leaf_internal<F: BenchFastRand + QFelt64 
             //b.iter(|| Vec::<PQEDUserLeaf::<F, Hash>>::read_from(black_box(l)));
             b.iter(||bincode::deserialize::<Vec<PQEDUserLeaf<F, Hash>>>(black_box(l)).unwrap());
         });
-        /* 
-        group.bench_with_input(BenchmarkId::new("serialize_speedy", *count), &items, |b, l| {
-            // `b.iter` runs the closure multiple times to get a stable measurement.
-            // `black_box` prevents the compiler from optimizing away the function call.
-            //b.iter(|| Vec::<PQEDUserLeaf::<F, Hash>>::read_from(black_box(l)));
-            b.iter(||black_box(l).write_to_vec().unwrap());
-        });*/
         group.bench_with_input(BenchmarkId::new("deserialize_postcard", *count), &postcard_bytes, |b, l| {
             // `b.iter` runs the closure multiple times to get a stable measurement.
             // `black_box` prevents the compiler from optimizing away the function call.
@@ -138,11 +125,121 @@ fn benckmark_serialize_round_trip_user_leaf_internal<F: BenchFastRand + QFelt64 
             //b.iter(|| Vec::<PQEDUserLeaf::<F, Hash>>::read_from(black_box(l)));
             b.iter(|| PQEDUserLeaf::<F, Hash>::psy_ser_deserialize_vec_of_self(black_box(l), false));
         });
-        group.bench_with_input(BenchmarkId::new("serialize_pio_write_many_to_bytes", *count), &canonical_bytes, |b, l| {
+        group.bench_with_input(BenchmarkId::new("deserialize_pio_write_many_to_bytes", *count), &canonical_bytes, |b, l| {
             // `b.iter` runs the closure multiple times to get a stable measurement.
             // `black_box` prevents the compiler from optimizing away the function call.
             //b.iter(|| Vec::<PQEDUserLeaf::<F, Hash>>::read_from(black_box(l)));
             b.iter(|| PQEDUserLeaf::<F, Hash>::pio_read_many_from_ref_bytes(&black_box(l), None));
+        });
+
+
+        
+    }
+    group.finish();
+}
+
+
+fn benckmark_serialize_round_trip_user_leaf_internal_known_type(c: &mut Criterion, user_counts: &[usize]) {
+    type Hash = PHash;
+    type F = PF;
+    type ItemType = PQEDUserLeaf<F, Hash>;
+    let mut group = c.benchmark_group(format!("serialize_user_leaf{}_v333", Hash::q_type_name()));
+
+
+    // We test with a variety of input sizes to see how performance scales.
+    for count in user_counts.iter() {
+        // Generate the test data once per size.
+        let items = gen_random_user_leaves::<F, Hash>(*count);
+        let speedy_bytes = items.write_to_vec().expect("Serialization should succeed");
+
+        let bincode_bytes = bincode::serialize(&items).expect("Bincode serialization should succeed");
+        let canonical_bytes = PQEDUserLeaf::psy_ser_serialize_vec_of_self_ref(&items, false);
+        let postcard_bytes = postcard::to_stdvec(&items).expect("Postcard serialization should succeed");
+
+        let rkyv_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&items).expect("Rkyv serialization should succeed");
+        
+
+
+        //let ex_1 = items[0].user_id.write_to_vec()
+        
+        // Benchmark the naive implementation
+        group.bench_with_input(BenchmarkId::new("serialize_bincode", *count), &items, |b, l| {
+            // `b.iter` runs the closure multiple times to get a stable measurement.
+            // `black_box` prevents the compiler from optimizing away the function call.
+            //b.iter(|| Vec::<PQEDUserLeaf::<F, Hash>>::read_from(black_box(l)));
+            b.iter(||bincode::serialize(black_box(l)).unwrap());
+        });
+        group.bench_with_input(BenchmarkId::new("serialize_speedy", *count), &items, |b, l| {
+            b.iter(||black_box(l).write_to_vec().unwrap());
+        });
+        group.bench_with_input(BenchmarkId::new("serialize_postcard", *count), &items, |b, l| {
+            b.iter(||postcard::to_stdvec(black_box(l)).unwrap());
+        });
+        group.bench_with_input(BenchmarkId::new("serialize_rkyv", *count), &items, |b, l| {
+            b.iter(||rkyv::to_bytes::<rkyv::rancor::Error>(black_box(l)).unwrap());
+        });
+        group.bench_with_input(BenchmarkId::new("serialize_ffs_vec_of_self_ref", *count), &items, |b, l| {
+            // `b.iter` runs the closure multiple times to get a stable measurement.
+            // `black_box` prevents the compiler from optimizing away the function call.
+            //b.iter(|| Vec::<PQEDUserLeaf::<F, Hash>>::read_from(black_box(l)));
+            b.iter(|| ItemType::ffs_serialize_vec_of_self_ref(black_box(l)));
+        });
+        group.bench_with_input(BenchmarkId::new("serialize_psy_ser_serialize_vec_of_self_ref", *count), &items, |b, l| {
+            // `b.iter` runs the closure multiple times to get a stable measurement.
+            // `black_box` prevents the compiler from optimizing away the function call.
+            //b.iter(|| Vec::<PQEDUserLeaf::<F, Hash>>::read_from(black_box(l)));
+            b.iter(|| ItemType::psy_ser_serialize_vec_of_self_ref(black_box(l), false));
+        });
+        group.bench_with_input(BenchmarkId::new("serialize_psy_ser_serialize_vec_of_self", *count), &items, |b, l| {
+            // `b.iter` runs the closure multiple times to get a stable measurement.
+            // `black_box` prevents the compiler from optimizing away the function call.
+            //b.iter(|| Vec::<PQEDUserLeaf::<F, Hash>>::read_from(black_box(l)));
+            b.iter(|| ItemType::psy_ser_serialize_vec_of_self(black_box(l).clone(), false));
+        });
+        group.bench_with_input(BenchmarkId::new("serialize_pio_write_many_to_bytes", *count), &items, |b, l| {
+            // `b.iter` runs the closure multiple times to get a stable measurement.
+            // `black_box` prevents the compiler from optimizing away the function call.
+            //b.iter(|| Vec::<PQEDUserLeaf::<F, Hash>>::read_from(black_box(l)));
+            b.iter(|| ItemType::pio_write_many_to_bytes(&black_box(l), false));
+        });
+
+
+        
+        // Benchmark the naive implementation
+        group.bench_with_input(BenchmarkId::new("deserialize_bincode", *count), &bincode_bytes, |b, l| {
+            b.iter(||bincode::deserialize::<Vec<ItemType>>(black_box(l)).unwrap());
+        });
+        group.bench_with_input(BenchmarkId::new("deserialize_postcard", *count), &postcard_bytes, |b, l| {
+            b.iter(||postcard::from_bytes::<Vec<ItemType>>(black_box(l)).unwrap());
+        });
+        group.bench_with_input(BenchmarkId::new("deserialize_speedy", *count), &canonical_bytes, |b, l| {
+            b.iter(|| ItemType::read_from_buffer(black_box(l)).unwrap());
+        });
+        group.bench_with_input(BenchmarkId::new("ffs_deserialize_vec_of_self", *count), &canonical_bytes, |b, l| {
+            // `b.iter` runs the closure multiple times to get a stable measurement.
+            // `black_box` prevents the compiler from optimizing away the function call.
+            //b.iter(|| Vec::<PQEDUserLeaf::<F, Hash>>::read_from(black_box(l)));
+            b.iter(|| ItemType::ffs_deserialize_vec_of_self(black_box(l)).unwrap());
+        });
+        group.bench_with_input(BenchmarkId::new("psy_ser_deserialize_vec_of_self", *count), &canonical_bytes, |b, l| {
+            // `b.iter` runs the closure multiple times to get a stable measurement.
+            // `black_box` prevents the compiler from optimizing away the function call.
+            //b.iter(|| Vec::<PQEDUserLeaf::<F, Hash>>::read_from(black_box(l)));
+            b.iter(|| ItemType::psy_ser_deserialize_vec_of_self(black_box(l), false));
+        });
+        group.bench_with_input(BenchmarkId::new("deserialize_pio_write_many_to_bytes", *count), &canonical_bytes, |b, l| {
+            // `b.iter` runs the closure multiple times to get a stable measurement.
+            // `black_box` prevents the compiler from optimizing away the function call.
+            //b.iter(|| Vec::<PQEDUserLeaf::<F, Hash>>::read_from(black_box(l)));
+            b.iter(|| ItemType::pio_read_many_from_ref_bytes(&black_box(l), None));
+        });
+        group.bench_with_input("deserialize_rkyv_many", &rkyv_bytes, |b, l| {
+            // `b.iter` runs the closure multiple times to get a stable measurement.
+            // `black_box` prevents the compiler from optimizing away the function call.
+            //b.iter(|| Vec::<PQEDUserLeaf::<F, Hash>>::read_from(black_box(l)));
+            b.iter(|| {
+                rkyv::from_bytes::<Vec<ItemType>, rkyv::rancor::Error>(black_box(l)).unwrap();
+            });
         });
 
 
@@ -171,31 +268,30 @@ pub fn benckmark_serialize_round_trip_contract_function(c: &mut Criterion) {
 
         //let ex_1 = items[0].user_id.write_to_vec()
 
-        /*
         
         // Benchmark the naive implementation
-        group.bench_with_input("serialize_bincode_single", &items, |b, l| {
+        group.bench_with_input("con_serialize_bincode_single", &items, |b, l| {
             // `b.iter` runs the closure multiple times to get a stable measurement.
             // `black_box` prevents the compiler from optimizing away the function call.
             //b.iter(|| Vec::<PQEDUserLeaf::<F, Hash>>::read_from(black_box(l)));
             b.iter(||bincode::serialize(black_box(l)).unwrap());
         });
-        group.bench_with_input("serialize_speedy_single", &items, |b, l| {
+        group.bench_with_input("con_serialize_speedy_single", &items, |b, l| {
             // `b.iter` runs the closure multiple times to get a stable measurement.
             // `black_box` prevents the compiler from optimizing away the function call.
             //b.iter(|| Vec::<PQEDUserLeaf::<F, Hash>>::read_from(black_box(l)));
             b.iter(||black_box(l).write_to_vec().unwrap());
         });
-        group.bench_with_input("serialize_psy_canonical_single", &items, |b, l| {
+        group.bench_with_input("con_serialize_psy_canonical_single", &items, |b, l| {
             b.iter(||black_box(l).psy_ser_to_bytes_vec().unwrap());
         });
-        group.bench_with_input("serialize_postcard_single", &items, |b, l| {
+        group.bench_with_input("con_serialize_postcard_single", &items, |b, l| {
             // `b.iter` runs the closure multiple times to get a stable measurement.
             // `black_box` prevents the compiler from optimizing away the function call.
             //b.iter(|| Vec::<PQEDUserLeaf::<F, Hash>>::read_from(black_box(l)));
             b.iter(||postcard::to_stdvec(black_box(l)).unwrap());
         });
-        group.bench_with_input("serialize_rkyv_single", &items, |b, l| {
+        group.bench_with_input("con_serialize_rkyv_single", &items, |b, l| {
             // `b.iter` runs the closure multiple times to get a stable measurement.
             // `black_box` prevents the compiler from optimizing away the function call.
             //b.iter(|| Vec::<PQEDUserLeaf::<F, Hash>>::read_from(black_box(l)));
@@ -205,28 +301,28 @@ pub fn benckmark_serialize_round_trip_contract_function(c: &mut Criterion) {
 
         
         // Benchmark the naive implementation
-        group.bench_with_input("deserialize_bincode_single", &bincode_bytes, |b, l| {
+        group.bench_with_input("con_deserialize_bincode_single", &bincode_bytes, |b, l| {
             // `b.iter` runs the closure multiple times to get a stable measurement.
             // `black_box` prevents the compiler from optimizing away the function call.
             //b.iter(|| Vec::<PQEDUserLeaf::<F, Hash>>::read_from(black_box(l)));
             b.iter(||bincode::deserialize::<ItemType>(black_box(l)).unwrap());
         });
-        group.bench_with_input("deserialize_speedy_single", &speedy_bytes, |b, l| {
+        group.bench_with_input("con_deserialize_speedy_single", &speedy_bytes, |b, l| {
             // `b.iter` runs the closure multiple times to get a stable measurement.
             // `black_box` prevents the compiler from optimizing away the function call.
             //b.iter(|| Vec::<PQEDUserLeaf::<F, Hash>>::read_from(black_box(l)));
             b.iter(||ItemType::read_from_buffer(black_box(l)).unwrap());
         });
-        group.bench_with_input("deserialize_psy_canonical_single", &canonical_bytes, |b, l| {
+        group.bench_with_input("con_deserialize_psy_canonical_single", &canonical_bytes, |b, l| {
             b.iter(||ItemType::psy_ser_from_slice(black_box(l)).unwrap());
         });
-        group.bench_with_input("deserialize_postcard_single", &postcard_bytes, |b, l| {
+        group.bench_with_input("con_deserialize_postcard_single", &postcard_bytes, |b, l| {
             // `b.iter` runs the closure multiple times to get a stable measurement.
             // `black_box` prevents the compiler from optimizing away the function call.
             //b.iter(|| Vec::<PQEDUserLeaf::<F, Hash>>::read_from(black_box(l)));
             b.iter(||postcard::from_bytes::<ItemType>(black_box(l)).unwrap());
         });
-        group.bench_with_input("deserialize_rkyv_single", &rkyv_bytes, |b, l| {
+        group.bench_with_input("con_deserialize_rkyv_single", &rkyv_bytes, |b, l| {
             // `b.iter` runs the closure multiple times to get a stable measurement.
             // `black_box` prevents the compiler from optimizing away the function call.
             //b.iter(|| Vec::<PQEDUserLeaf::<F, Hash>>::read_from(black_box(l)));
@@ -235,7 +331,6 @@ pub fn benckmark_serialize_round_trip_contract_function(c: &mut Criterion) {
             });
         });
 
-*/
     // We test with a variety of input sizes to see how performance scales.
     for count in contract_function_counts.iter() {
         // Generate the test data once per size.
@@ -252,32 +347,31 @@ pub fn benckmark_serialize_round_trip_contract_function(c: &mut Criterion) {
         //let ex_1 = items[0].user_id.write_to_vec()
         
         // Benchmark the naive implementation
-        /* 
-        group.bench_with_input(BenchmarkId::new("serialize_bincode", *count), &items, |b, l| {
+        group.bench_with_input(BenchmarkId::new("con_serialize_bincode", *count), &items, |b, l| {
             // `b.iter` runs the closure multiple times to get a stable measurement.
             // `black_box` prevents the compiler from optimizing away the function call.
             //b.iter(|| Vec::<PQEDUserLeaf::<F, Hash>>::read_from(black_box(l)));
             b.iter(||bincode::serialize(black_box(l)).unwrap());
-        });*/
-        group.bench_with_input(BenchmarkId::new("serialize_speedy", *count), &items, |b, l| {
+        });
+        group.bench_with_input(BenchmarkId::new("con_serialize_speedy", *count), &items, |b, l| {
             // `b.iter` runs the closure multiple times to get a stable measurement.
             // `black_box` prevents the compiler from optimizing away the function call.
             //b.iter(|| Vec::<PQEDUserLeaf::<F, Hash>>::read_from(black_box(l)));
             b.iter(||black_box(l).write_to_vec().unwrap());
         });
-        group.bench_with_input(BenchmarkId::new("serialize_psy_canonical", *count), &items, |b, l| {
+        group.bench_with_input(BenchmarkId::new("con_serialize_psy_canonical", *count), &items, |b, l| {
             // `b.iter` runs the closure multiple times to get a stable measurement.
             // `black_box` prevents the compiler from optimizing away the function call.
             //b.iter(|| Vec::<PQEDUserLeaf::<F, Hash>>::read_from(black_box(l)));
             b.iter(||ItemType::psy_ser_serialize_vec_of_self_ref(black_box(l), false));
         });
-        group.bench_with_input(BenchmarkId::new("serialize_postcard", *count), &items, |b, l| {
+        group.bench_with_input(BenchmarkId::new("con_serialize_postcard", *count), &items, |b, l| {
             // `b.iter` runs the closure multiple times to get a stable measurement.
             // `black_box` prevents the compiler from optimizing away the function call.
             //b.iter(|| Vec::<PQEDUserLeaf::<F, Hash>>::read_from(black_box(l)));
             b.iter(||postcard::to_stdvec(black_box(l)).unwrap());
         });
-        group.bench_with_input(BenchmarkId::new("serialize_rkyv", *count), &items, |b, l| {
+        group.bench_with_input(BenchmarkId::new("con_serialize_rkyv", *count), &items, |b, l| {
             // `b.iter` runs the closure multiple times to get a stable measurement.
             // `black_box` prevents the compiler from optimizing away the function call.
             //b.iter(|| Vec::<PQEDUserLeaf::<F, Hash>>::read_from(black_box(l)));
@@ -286,35 +380,34 @@ pub fn benckmark_serialize_round_trip_contract_function(c: &mut Criterion) {
         
 
 
-        /* 
         // Benchmark the naive implementation
-        group.bench_with_input(BenchmarkId::new("deserialize_bincode", *count), &bincode_bytes, |b, l| {
+        group.bench_with_input(BenchmarkId::new("con_deserialize_bincode", *count), &bincode_bytes, |b, l| {
             // `b.iter` runs the closure multiple times to get a stable measurement.
             // `black_box` prevents the compiler from optimizing away the function call.
             //b.iter(|| Vec::<PQEDUserLeaf::<F, Hash>>::read_from(black_box(l)));
             b.iter(||bincode::deserialize::<Vec<ItemType>>(black_box(l)).unwrap());
-        });*/
-        group.bench_with_input(BenchmarkId::new("deserialize_speedy", *count), &speedy_bytes, |b, l| {
+        });
+        group.bench_with_input(BenchmarkId::new("con_deserialize_speedy", *count), &speedy_bytes, |b, l| {
             // `b.iter` runs the closure multiple times to get a stable measurement.
             // `black_box` prevents the compiler from optimizing away the function call.
             //b.iter(|| Vec::<PQEDUserLeaf::<F, Hash>>::read_from(black_box(l)));
             b.iter(||Vec::<ItemType>::read_from_buffer(black_box(l)).unwrap());
         });
-        group.bench_with_input(BenchmarkId::new("deserialize_psy_canonical", *count), &canonical_bytes, |b, l| {
+        group.bench_with_input(BenchmarkId::new("con_deserialize_psy_canonical", *count), &canonical_bytes, |b, l| {
             // `b.iter` runs the closure multiple times to get a stable measurement.
             // `black_box` prevents the compiler from optimizing away the function call.
             //b.iter(|| Vec::<PQEDUserLeaf::<F, Hash>>::read_from(black_box(l)));
             b.iter(||ItemType::psy_ser_deserialize_vec_of_self(black_box(l), false).unwrap());
         });
-        /*
-        group.bench_with_input(BenchmarkId::new("deserialize_postcard", *count), &postcard_bytes, |b, l| {
+
+        group.bench_with_input(BenchmarkId::new("con_deserialize_postcard", *count), &postcard_bytes, |b, l| {
             // `b.iter` runs the closure multiple times to get a stable measurement.
             // `black_box` prevents the compiler from optimizing away the function call.
             //b.iter(|| Vec::<PQEDUserLeaf::<F, Hash>>::read_from(black_box(l)));
             b.iter(||postcard::from_bytes::<Vec<ItemType>>(black_box(l)).unwrap());
         });
-        */
-        group.bench_with_input(BenchmarkId::new("deserialize_rkyv", *count), &rkyv_bytes, |b, l| {
+    
+        group.bench_with_input(BenchmarkId::new("con_deserialize_rkyv", *count), &rkyv_bytes, |b, l| {
             // `b.iter` runs the closure multiple times to get a stable measurement.
             // `black_box` prevents the compiler from optimizing away the function call.
             //b.iter(|| Vec::<PQEDUserLeaf::<F, Hash>>::read_from(black_box(l)));
@@ -341,8 +434,8 @@ pub fn benckmark_serialization(c: &mut Criterion) {
     type F = PF;
     type Hash = PHash;
 
-    benckmark_serialize_round_trip_user_leaf_internal::<F, Hash>(c, &[100, 100_000]);
-    
+    //benckmark_serialize_round_trip_user_leaf_internal::<F, Hash>(c, &[10_000, 100_000]);
+    benckmark_serialize_round_trip_user_leaf_internal_known_type(c, &[10_000, 100_000]);
 }
 
 
