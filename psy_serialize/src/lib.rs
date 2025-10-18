@@ -406,18 +406,34 @@ macro_rules! __impl_psy_canonical_serialize_for_speedy_internal {
                 Self::read_from_stream_buffered_with_ctx(speedy::LittleEndian::default(), reader)
                     .map_err(anyhow::Error::from)
             }
-            /* 
 
             #[inline(always)]
             fn pio_get_variable_serialized_size(&self) -> usize {
                 // Speedy does not differentiate, so this is the same as the total size.
-                self.pio_serialized_size()
+                self.pio_serialized_size() + 4 // 4 bytes for the length prefix
             }
 
             #[inline(always)]
             fn pio_write_to_io_many<W: psy_io::Write>(items: &[$type], writer: &mut W, write_fixed_items_count: bool) -> anyhow::Result<()> {
                 use speedy::Writable;
-                if write_fixed_items_count {
+                    if write_fixed_items_count || !Self::IS_FIXED_SIZE {
+
+                        psy_io::p_write_varuint(items.len(), writer)?;  
+                    }          
+                    // Write items back-to-back without a length prefix.
+                    
+                        if !Self::IS_FIXED_SIZE {
+                            
+                            for item in items {
+                                psy_io::p_write_varuint(item.pio_serialized_size(), writer)?;
+                                item.write_to_stream_with_ctx(speedy::LittleEndian::default(), &mut *writer)?;
+                            }
+                    }else{
+                        for item in items {
+                            item.write_to_stream_with_ctx(speedy::LittleEndian::default(), &mut *writer)?;
+                        }
+                    }
+                /*if write_fixed_items_count {
                     // Speedy's slice implementation includes a length prefix.
                     items.write_to_stream_with_ctx(speedy::LittleEndian::default(), writer)?;
                 } else {
@@ -425,13 +441,48 @@ macro_rules! __impl_psy_canonical_serialize_for_speedy_internal {
                     for item in items {
                         item.write_to_stream_with_ctx(speedy::LittleEndian::default(), &mut *writer)?;
                     }
-                }
+                }*/
                 Ok(())
             }
+            
+            /* 
+            #[inline(always)]
+            fn pio_read_from_io_many<R: psy_io::Read>(reader: &mut R, known_size: Option<usize>, include_size_for_fixed: bool) -> anyhow::Result<Vec<Self>> {
+                use speedy::Readable;
+                if include_size_for_fixed || !Self::IS_FIXED_SIZE {
+                    // Speedy's Vec implementation reads a length prefix.
+                    let count = psy_io::p_read_varuint(reader)?;
+                            let mut vec = Vec::with_capacity(count);
+                            for _ in 0..count {
+                                if !Self::IS_FIXED_SIZE {
+                                    let mut item_buf = [0u8; 4];
+                                    reader.read_exact(&mut item_buf)?;
+                                    let item_size = u32::from_le_bytes(item_buf) as usize;
+                                }
+                                vec.push(Self::read_from_stream_buffered_with_ctx(speedy::LittleEndian::default(), &mut *reader)?);
+                            }
+                            Ok(vec)
+                } else {
+                    // If no size is encoded, we MUST know it beforehand.
+                    match known_size {
+                        Some(n) => {
+                            let mut vec = Vec::with_capacity(n);
+                            for _ in 0..n {
+                                vec.push(Self::read_from_stream_buffered_with_ctx(speedy::LittleEndian::default(), &mut *reader)?);
+                            }
+                            Ok(vec)
+                        }
+                        None => Err(anyhow::anyhow!("Cannot read items without a known size or an encoded size prefix.")),
+                    }
+                }
+                
+            }*/
+            /* 
 
             #[inline(always)]
             fn pio_read_from_io_many<R: psy_io::Read>(reader: &mut R, known_size: Option<usize>, include_size_for_fixed: bool) -> anyhow::Result<Vec<Self>> {
                 use speedy::Readable;
+                
                 if include_size_for_fixed {
                     // Speedy's Vec implementation reads a length prefix.
                     Vec::<Self>::read_from_stream_buffered_with_ctx(speedy::LittleEndian::default(), reader)
@@ -462,12 +513,13 @@ macro_rules! __impl_psy_canonical_serialize_for_speedy_internal {
                     items.iter().map(|item| item.pio_serialized_size()).sum()
                 }
             }
+            */
 
             #[inline(always)]
             fn pio_read_many_from_ref_bytes(data: &[u8], known_size: Option<usize>, include_size_for_fixed: bool) -> anyhow::Result<Vec<Self>> {
                 let mut cursor = psy_io::Cursor::new(data);
                 Self::pio_read_from_io_many(&mut cursor, known_size, include_size_for_fixed)
-            }*/
+            }
         }
 
         impl $($impl_generics)* psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle for $type
