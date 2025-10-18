@@ -1,5 +1,6 @@
 use std::fmt::Debug;
 
+use psy_serialize::PsySerializeCanonicalAsyncSafe;
 use serde::{de::DeserializeOwned, Serialize};
 use ts_rs::TS;
 
@@ -10,7 +11,7 @@ pub trait QStorableSizedBase: QStorableBase + Sized {}
 impl<T: Serialize + DeserializeOwned + Send + Sync + Clone + PartialEq + Eq> QStorableBase for T {}
 impl<T: QStorableBase + Sized> QStorableSizedBase for T {}
 pub trait QFHasherU64<F: QFelt64, Hash: QFHashBase<F>>: FieldQHasher<F, Hash> + QHasher<Hash> + MerkleZeroHasher<Hash> {}
-pub trait Q256BitHash: FromU64x4 + Sized + Copy + MaybeBytemuck + Debug {
+pub trait Q256BitHash: FromU64x4 + Sized + Copy + MaybeBytemuck + MaybeSpeedy + Debug {
     fn from_owned_32bytes(bytes: [u8; 32]) -> Self;
     fn into_owned_32bytes(self) -> [u8; 32];
     fn from_ref_32bytes(bytes: &[u8; 32]) -> Self;
@@ -87,7 +88,7 @@ pub trait QNetworkTreeConstants: Sized + Send + Sync + Copy + Clone {
     const MAX_USERS_PER_REALM: u32; // = 2**REALM_GLOBAL_USER_TREE_HEIGHT
 }
 pub trait QNetworkHashTypes{
-    type QHash: QFHashBase<Self::F> + Q256BitHash;
+    type QHash: QFHashBase<Self::F> + Q256BitHash + PsySerializeCanonicalAsyncSafe;
     type HasherBase: QFHasherU64<Self::F, Self::QHash> + Send + Sync;
     type F: QFelt64;
 }

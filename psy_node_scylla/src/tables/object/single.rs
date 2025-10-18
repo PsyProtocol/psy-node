@@ -1,5 +1,6 @@
 use futures::{future::join_all, stream, StreamExt, TryStreamExt};
 
+use psy_serialize::PsySerializeCanonicalAsyncSafe;
 use rayon::slice::{ParallelSlice};
 use rayon::iter::ParallelIterator;
 use std::sync::Arc;
@@ -7,7 +8,6 @@ use anyhow::Context;
 use async_trait::async_trait;
 use parth_core::data::db::{row::{QDatabaseSingleIdTableRow, QDatabaseSingleIdTableRowCreatable, QDatabaseSingleIdTableRowLike, QDatabaseSingleIdTableRowNoCheckpointId, QDatabaseSingleIdTableRowNoCheckpointIdLike}, table::QDatabaseTableRoutingKey};
 use scylla::{client::session::Session, statement::{batch::Batch, prepared::PreparedStatement, Statement}};
-use serde::{de::DeserializeOwned, Serialize};
 
 use crate::utils::calc_best_batch_size;
 use crate::{constants::{INSERT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE, SELECT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE}, tables::traits::ScyllaStandardPreparedTableStatements, utils::{convert_checkpoint_id_to_i64, convert_i64_to_checkpoint_id, generate_batch_prepared_statement, i64_to_u64_exact, u64_to_i64_exact}};
@@ -288,7 +288,7 @@ async fn insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_st
 
 
     }
-    pub async fn select_one_single_checkpointed_object_value<V: Serialize + DeserializeOwned>(
+    pub async fn select_one_single_checkpointed_object_value<V: PsySerializeCanonicalAsyncSafe>(
         &self, 
         session: &Session, 
         obj_id: u64, 
@@ -297,17 +297,11 @@ async fn insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_st
         let res = session.execute_unpaged(&self.select_value_1_prepared, (u64_to_i64_exact(obj_id), convert_checkpoint_id_to_i64(max_checkpoint_id))).await?;
         let rows = res.into_rows_result()?;
         match rows.maybe_first_row::<(Vec<u8>,)>()? {
-            Some(row) => match pser::deserialize::<V>(&row.0) {
-                Ok(value) => Ok(Some(value)),
-                Err(e) => {
-                    tracing::error!("Deserialization error for latest object ID with {} in table {}.{}: {:?}", obj_id, self.keyspace, self.table_name, e);
-                    Ok(None)
-                }
-            },
+            Some(row) => Ok(Some(V::psy_ser_from_owned_bytes_vec(row.0)?)),
             None => Ok(None), // Return zero hash if not found
         }
     }
-    pub async fn select_one_single_checkpointed_object_value_and_ids<V: Serialize + DeserializeOwned>(
+    pub async fn select_one_single_checkpointed_object_value_and_ids<V: PsySerializeCanonicalAsyncSafe>(
         &self, 
         session: &Session, 
         obj_id: u64, 
@@ -317,22 +311,15 @@ async fn insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_st
         let rows = res.into_rows_result()?;
         match rows.maybe_first_row::<(i64, i64, Vec<u8>)>()? {
 
-            Some(row) => match pser::deserialize::<V>(&row.2) {
-                Ok(value) => 
-                    Ok(Some(QDatabaseSingleIdTableRow {
-                    value,
-                    obj_id: i64_to_u64_exact(row.0),
-                    checkpoint_id: convert_i64_to_checkpoint_id(row.1),
-                })),
-                Err(e) => {
-                    tracing::error!("Deserialization error for object ID {} at checkpoint_id={} in {}.{}: {:?}", obj_id, convert_i64_to_checkpoint_id(row.1), self.keyspace, self.table_name, e);
-                    Ok(None)
-                }
-            },
+            Some(row) => Ok(Some(QDatabaseSingleIdTableRow{
+                obj_id: i64_to_u64_exact(row.0),
+                checkpoint_id: convert_i64_to_checkpoint_id(row.1),
+                value: V::psy_ser_from_owned_bytes_vec(row.2)?,
+            })),
             None => Ok(None), // Return zero hash if not found
         }
     }
-    pub async fn select_one_single_checkpointed_object_value_and_ids_t<V: Serialize + DeserializeOwned, R: QDatabaseSingleIdTableRowCreatable<V>>(
+    pub async fn select_one_single_checkpointed_object_value_and_ids_t<V: PsySerializeCanonicalAsyncSafe, R: QDatabaseSingleIdTableRowCreatable<V>>(
         &self, 
         session: &Session, 
         obj_id: u64, 
@@ -341,12 +328,8 @@ async fn insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_st
         let res = session.execute_unpaged(&self.select_value_checkpoint_id_obj_id_1_prepared, (u64_to_i64_exact(obj_id), convert_checkpoint_id_to_i64(max_checkpoint_id))).await?;
         let rows = res.into_rows_result()?;
         match rows.maybe_first_row::<(i64, i64, Vec<u8>)>()? {
-            Some(row) => match pser::deserialize::<V>(&row.2) {
-                Ok(value) => Ok(Some(R::create_from_single_row(i64_to_u64_exact(row.0), convert_i64_to_checkpoint_id(row.1), value))),
-                Err(e) => {
-                    tracing::error!("Deserialization error for object ID {} at checkpoint_id={} in {}.{}: {:?}", obj_id, convert_i64_to_checkpoint_id(row.1), self.keyspace, self.table_name, e);
-                    Ok(None)
-                }
+            Some(row) => {
+                Ok(Some(R::create_from_single_row(i64_to_u64_exact(row.0), convert_i64_to_checkpoint_id(row.1), V::psy_ser_from_owned_bytes_vec(row.2)?)))
             },
             None => Ok(None), // Return zero hash if not found
         }
@@ -354,7 +337,7 @@ async fn insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_st
 
 
     
-    pub async fn select_all_single_checkpointed_object<V: Serialize + DeserializeOwned>(
+    pub async fn select_all_single_checkpointed_object<V: PsySerializeCanonicalAsyncSafe>(
         &self, 
         session: &Session, 
     ) -> anyhow::Result<Vec<QDatabaseSingleIdTableRow<V>>> {
@@ -369,31 +352,25 @@ async fn insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_st
             results.push(QDatabaseSingleIdTableRow {
                 obj_id: i64_to_u64_exact(obj_id),
                 checkpoint_id: convert_i64_to_checkpoint_id(checkpoint_id),
-                value: match pser::deserialize(&value){
-                    Ok(value) => value,
-                    Err(e) => {
-                        tracing::error!("Deserialization error for object ID {} at checkpoint_id={} in {}.{}: {:?}", obj_id, convert_i64_to_checkpoint_id(checkpoint_id), self.keyspace, self.table_name, e);
-                        anyhow::bail!("Deserialization error for object ID {} at checkpoint_id={} in {}.{}: {:?}", obj_id, convert_i64_to_checkpoint_id(checkpoint_id), self.keyspace, self.table_name, e);
-                    }
-                },
+                value: V::psy_ser_from_owned_bytes_vec(value)?,
             });
         }
         Ok(results)
     }
 
 
-    pub async fn insert_one_single_checkpointed_object<V: Serialize>(
+    pub async fn insert_one_single_checkpointed_object<V: PsySerializeCanonicalAsyncSafe>(
         &self, 
         session: &Session, 
         obj_id: u64, 
         checkpoint_id: u64, 
         value: &V
     ) -> anyhow::Result<()> {
-        let value_bytes = pser::serialize(value)?;
-        session.execute_unpaged(&self.insert_1_prepared, (u64_to_i64_exact(obj_id), u64_to_i64_exact(checkpoint_id), &value_bytes)).await?;
+        let value_bytes = value.psy_ser_to_bytes_vec()?;
+        session.execute_unpaged(&self.insert_1_prepared, (u64_to_i64_exact(obj_id), u64_to_i64_exact(checkpoint_id), value_bytes)).await?;
         Ok(())
     }
-    pub async fn insert_many_single_checkpointed_object_rows<V: Serialize>(
+    pub async fn insert_many_single_checkpointed_object_rows<V: PsySerializeCanonicalAsyncSafe>(
         &self, 
         session: &Session, 
         rows: &[QDatabaseSingleIdTableRow<V>]
@@ -409,7 +386,7 @@ async fn insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_st
             let values: Vec<_> = chunk
                 .iter()
                 .map(|n| {
-                    Ok((u64_to_i64_exact(n.obj_id), convert_checkpoint_id_to_i64(n.checkpoint_id), pser::serialize(&n.value)?))
+                    Ok((u64_to_i64_exact(n.obj_id), convert_checkpoint_id_to_i64(n.checkpoint_id), n.value.psy_ser_to_bytes_vec()?))
                 })
                 .collect::<anyhow::Result<_>>()?;
             batch_list.push(batch);
@@ -423,7 +400,7 @@ async fn insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_st
         Ok(())
     }
 
-    pub async fn insert_many_single_checkpointed_object_rows_t<V: Serialize + DeserializeOwned, R: QDatabaseSingleIdTableRowLike<V>>(
+    pub async fn insert_many_single_checkpointed_object_rows_t<V: PsySerializeCanonicalAsyncSafe, R: QDatabaseSingleIdTableRowLike<V>>(
         &self, 
         session: &Session, 
         rows: &[R]
@@ -439,7 +416,7 @@ async fn insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_st
             let values: Vec<_> = chunk
                 .iter()
                 .map(|n| {
-                    Ok((u64_to_i64_exact(n.get_row_obj_id()), convert_checkpoint_id_to_i64(n.get_row_checkpoint_id()), pser::serialize(&n.get_row_value_ref())?))
+                    Ok((u64_to_i64_exact(n.get_row_obj_id()), convert_checkpoint_id_to_i64(n.get_row_checkpoint_id()), n.get_row_value_ref().psy_ser_to_bytes_vec()?))
                 })
                 .collect::<anyhow::Result<_>>()?;
             batch_list.push(batch);
@@ -452,7 +429,7 @@ async fn insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_st
         }
         Ok(())
     }
-    pub async fn insert_many_single_checkpointed_objects_at_checkpoint<V: Serialize>(
+    pub async fn insert_many_single_checkpointed_objects_at_checkpoint<V: PsySerializeCanonicalAsyncSafe>(
         &self, 
         session: &Session, 
         checkpoint_id: u64,
@@ -469,7 +446,7 @@ async fn insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_st
             let values: Vec<_> = chunk
                 .iter()
                 .map(|n| {
-                    Ok((u64_to_i64_exact(n.obj_id), convert_checkpoint_id_to_i64(checkpoint_id), pser::serialize(&n.value)?))
+                    Ok((u64_to_i64_exact(n.obj_id), convert_checkpoint_id_to_i64(checkpoint_id), n.value.psy_ser_to_bytes_vec()?))
                 })
                 .collect::<anyhow::Result<_>>()?;
             batch_list.push(batch);
@@ -482,7 +459,7 @@ async fn insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_st
         }
         Ok(())
     }
-    pub async fn insert_many_single_checkpointed_objects_at_checkpoint_t<V: Serialize + DeserializeOwned, R: QDatabaseSingleIdTableRowNoCheckpointIdLike<V>>(
+    pub async fn insert_many_single_checkpointed_objects_at_checkpoint_t<V: PsySerializeCanonicalAsyncSafe, R: QDatabaseSingleIdTableRowNoCheckpointIdLike<V>>(
         &self, 
         session: &Session, 
         checkpoint_id: u64,
@@ -499,7 +476,7 @@ async fn insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_st
             let values: Vec<_> = chunk
                 .iter()
                 .map(|n| {
-                    Ok((u64_to_i64_exact(n.get_row_obj_id()), convert_checkpoint_id_to_i64(checkpoint_id), pser::serialize(&n.get_row_value_ref())?))
+                    Ok((u64_to_i64_exact(n.get_row_obj_id()), convert_checkpoint_id_to_i64(checkpoint_id), n.get_row_value_ref().psy_ser_to_bytes_vec()?))
                 })
                 .collect::<anyhow::Result<_>>()?;
             batch_list.push(batch);
@@ -512,7 +489,7 @@ async fn insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_st
         }
         Ok(())
     }
-    pub async fn select_many_single_checkpointed_object_values<V: Serialize + DeserializeOwned>(
+    pub async fn select_many_single_checkpointed_object_values<V: PsySerializeCanonicalAsyncSafe>(
         &self, 
         session: &Session, 
         obj_ids: &[u64], 
@@ -531,13 +508,7 @@ async fn insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_st
                         let res = session.execute_unpaged(&prep, (*key, max_cp_i64)).await?;
                         let rows = res.into_rows_result()?;
                         if let Some(row) = rows.maybe_first_row::<(Vec<u8>,)>()? {
-                            match pser::deserialize::<V>(&row.0) {
-                                Ok(value) => core::result::Result::<_, anyhow::Error>::Ok(Some(value)),
-                                Err(e) => {
-                                    tracing::error!("Deserialization error for object ID {} with max_checkpoint_id={} in {}.{}: {:?}", i64_to_u64_exact(*key), max_checkpoint_id, self.keyspace, self.table_name, e);
-                                    Ok(None)
-                                }
-                            }
+                            anyhow::Ok(Some(V::psy_ser_from_owned_bytes_vec(row.0)?))
                         } else {
                             // Assume reverse_level = level for simplicity; adjust if tree height known
                             Ok(None)
@@ -552,7 +523,7 @@ async fn insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_st
         }
         Ok(results)
     }
-    pub async fn select_many_single_checkpointed_object_keys_and_values<V: Serialize + DeserializeOwned, R: QDatabaseSingleIdTableRowCreatable<V>>(
+    pub async fn select_many_single_checkpointed_object_keys_and_values<V: PsySerializeCanonicalAsyncSafe, R: QDatabaseSingleIdTableRowCreatable<V>>(
         &self, 
         session: &Session, 
         obj_ids: &[u64], 
@@ -571,13 +542,7 @@ async fn insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_st
                         let res = session.execute_unpaged(&prep, (*key, max_cp_i64)).await?;
                         let rows = res.into_rows_result()?;
                         if let Some(row) = rows.maybe_first_row::<(i64, i64, Vec<u8>)>()? {
-                            match pser::deserialize::<V>(&row.2) {
-                                Ok(value) => core::result::Result::<_, anyhow::Error>::Ok(Some(R::create_from_single_row(i64_to_u64_exact(row.0), convert_i64_to_checkpoint_id(row.1), value))),
-                                Err(e) => {
-                                    tracing::error!("Deserialization error for object ID {} at checkpoint_id={} in {}.{}: {:?}", i64_to_u64_exact(*key), convert_i64_to_checkpoint_id(row.1), self.keyspace, self.table_name, e);
-                                    Ok(None)
-                                }
-                            }
+                            anyhow::Ok(Some(R::create_from_single_row(i64_to_u64_exact(row.0), convert_i64_to_checkpoint_id(row.1), V::psy_ser_from_owned_bytes_vec(row.2)?)))
                         } else {
                             // Assume reverse_level = level for simplicity; adjust if tree height known
                             Ok(None)

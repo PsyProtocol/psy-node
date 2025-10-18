@@ -2,7 +2,7 @@ use parth_core::{crypto::hash::traits::FromU64x4, felt::ToU64Value, protocol::co
 use psy_serialize::FastFixedSerializable;
 
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, bytemuck::Pod, bytemuck::Zeroable,  speedy::Readable, speedy::Writable)]
 #[repr(transparent)]
 pub struct ExampleFelt(pub u64);
 
@@ -30,7 +30,7 @@ impl ToU64Value for ExampleFelt {
 }
 
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, bytemuck::Pod, bytemuck::Zeroable, speedy::Readable, speedy::Writable)]
 #[repr(transparent)]
 pub struct ZHashOut<F> {
     pub elements: [F; 4],

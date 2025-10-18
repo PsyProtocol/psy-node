@@ -3,6 +3,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use futures::future::join_all;
 use parth_core::data::db::{row::{QDatabaseKeyIdValueTableRow, QDatabaseKeyIdValueTableRowCreatable, QDatabaseKeyIdValueTableRowLike}, table::QDatabaseTableRoutingKey};
+use psy_serialize::PsySerializeCanonicalAsyncSafe;
 use scylla::{client::session::Session, statement::{batch::Batch, prepared::PreparedStatement, Statement}};
 use serde::{de::DeserializeOwned, Serialize};
 
@@ -88,7 +89,7 @@ impl ScyllaStandardPreparedTableStatements for ScyllaGenericKeyIdValueTablePrepa
 
 impl ScyllaGenericKeyIdValueTablePreparedStatements {
 
-    pub async fn select_one_kiv_value<V: Serialize + DeserializeOwned>(
+    pub async fn select_one_kiv_value<V: PsySerializeCanonicalAsyncSafe>(
         &self, 
         session: &Session, 
         obj_id: u64
@@ -96,17 +97,11 @@ impl ScyllaGenericKeyIdValueTablePreparedStatements {
         let res = session.execute_unpaged(&self.select_value_1_prepared, (u64_to_i64_exact(obj_id),)).await?;
         let rows = res.into_rows_result()?;
         match rows.maybe_first_row::<(Vec<u8>,)>()? {
-            Some(row) => match pser::deserialize::<V>(&row.0) {
-                Ok(value) => Ok(Some(value)),
-                Err(e) => {
-                    tracing::error!("Deserialization error for latest object ID with {} in table {}.{}: {:?}", obj_id, self.keyspace, self.table_name, e);
-                    Ok(None)
-                }
-            },
-            None => Ok(None), // Return zero hash if not found
+            Some(row) => Ok(Some(V::psy_ser_from_owned_bytes_vec(row.0)?)),
+            None => Ok(None), 
         }
     }
-    pub async fn select_one_kiv_value_and_ids<V: Serialize + DeserializeOwned>(
+    pub async fn select_one_kiv_value_and_ids<V: PsySerializeCanonicalAsyncSafe>(
         &self, 
         session: &Session, 
         obj_id: u64
@@ -115,21 +110,14 @@ impl ScyllaGenericKeyIdValueTablePreparedStatements {
         let rows = res.into_rows_result()?;
         match rows.maybe_first_row::<(i64, Vec<u8>)>()? {
 
-            Some(row) => match pser::deserialize::<V>(&row.1) {
-                Ok(value) => 
-                    Ok(Some(QDatabaseKeyIdValueTableRow {
-                    value,
+            Some(row) =>Ok(Some(QDatabaseKeyIdValueTableRow {
                     obj_id: i64_to_u64_exact(row.0),
+                    value: V::psy_ser_from_owned_bytes_vec(row.1)?,
                 })),
-                Err(e) => {
-                    tracing::error!("Deserialization error for object ID {} in {}.{}: {:?}", obj_id, self.keyspace, self.table_name, e);
-                    Ok(None)
-                }
-            },
             None => Ok(None), // Return zero hash if not found
         }
     }
-    pub async fn select_one_kiv_value_and_ids_t<V: Serialize + DeserializeOwned, R: QDatabaseKeyIdValueTableRowCreatable<V>>(
+    pub async fn select_one_kiv_value_and_ids_t<V: PsySerializeCanonicalAsyncSafe, R: QDatabaseKeyIdValueTableRowCreatable<V>>(
         &self, 
         session: &Session, 
         obj_id: u64, 
@@ -137,20 +125,15 @@ impl ScyllaGenericKeyIdValueTablePreparedStatements {
         let res = session.execute_unpaged(&self.select_value_obj_id_1_prepared, (u64_to_i64_exact(obj_id),)).await?;
         let rows = res.into_rows_result()?;
         match rows.maybe_first_row::<(i64, Vec<u8>)>()? {
-            Some(row) => match pser::deserialize::<V>(&row.1) {
-                Ok(value) => Ok(Some(R::create_from_key_id_value_row(i64_to_u64_exact(row.0), value))),
-                Err(e) => {
-                    tracing::error!("Deserialization error for object ID {} in {}.{}: {:?}", obj_id, self.keyspace, self.table_name, e);
-                    Ok(None)
-                }
-            },
+            Some(row) => Ok(Some(R::create_from_key_id_value_row(i64_to_u64_exact(row.0), V::psy_ser_from_owned_bytes_vec(row.1)?))),
+           
             None => Ok(None), // Return zero hash if not found
         }
     }
 
 
     
-    pub async fn select_all_kiv<V: Serialize + DeserializeOwned>(
+    pub async fn select_all_kiv<V: PsySerializeCanonicalAsyncSafe>(
         &self, 
         session: &Session, 
     ) -> anyhow::Result<Vec<QDatabaseKeyIdValueTableRow<V>>> {
@@ -164,31 +147,25 @@ impl ScyllaGenericKeyIdValueTablePreparedStatements {
             let (obj_id, value): (i64, Vec<u8>) = row?;
             results.push(QDatabaseKeyIdValueTableRow {
                 obj_id: i64_to_u64_exact(obj_id),
-                value: match pser::deserialize(&value){
-                    Ok(value) => value,
-                    Err(e) => {
-                        tracing::error!("Deserialization error for object ID {} in {}.{}: {:?}", obj_id, self.keyspace, self.table_name, e);
-                        anyhow::bail!("Deserialization error for object ID {} in {}.{}: {:?}", obj_id, self.keyspace, self.table_name, e);
-                    }
-                },
+                value: V::psy_ser_from_owned_bytes_vec(value)?,
             });
         }
         Ok(results)
     }
 
 
-    pub async fn insert_one_kiv<V: Serialize>(
+    pub async fn insert_one_kiv<V: PsySerializeCanonicalAsyncSafe>(
         &self, 
         session: &Session, 
         obj_id: u64, 
         value: &V
     ) -> anyhow::Result<()> {
-        let value_bytes = pser::serialize(value)?;
+        let value_bytes = value.psy_ser_to_bytes_vec()?;
         session.execute_unpaged(&self.insert_1_prepared, (u64_to_i64_exact(obj_id), &value_bytes)).await?;
         Ok(())
     }
 
-    pub async fn insert_many_kiv_rows_t<V: Serialize + DeserializeOwned, R: QDatabaseKeyIdValueTableRowLike<V>>(
+    pub async fn insert_many_kiv_rows_t<V: PsySerializeCanonicalAsyncSafe, R: QDatabaseKeyIdValueTableRowLike<V>>(
         &self, 
         session: &Session, 
         rows: &[R]
@@ -203,7 +180,7 @@ impl ScyllaGenericKeyIdValueTablePreparedStatements {
             let values: Vec<_> = chunk
                 .iter()
                 .map(|n| {
-                    Ok((u64_to_i64_exact(n.get_row_obj_id()),  pser::serialize(&n.get_row_value_ref())?))
+                    Ok((u64_to_i64_exact(n.get_row_obj_id()),  n.get_row_value_ref().psy_ser_to_bytes_vec()?))
                 })
                 .collect::<anyhow::Result<_>>()?;
             batch_list.push(batch);
@@ -216,7 +193,7 @@ impl ScyllaGenericKeyIdValueTablePreparedStatements {
         }
         Ok(())
     }
-    pub async fn insert_many_kivs<V: Serialize>(
+    pub async fn insert_many_kivs<V: PsySerializeCanonicalAsyncSafe>(
         &self, 
         session: &Session, 
         rows: &[QDatabaseKeyIdValueTableRow<V>]
@@ -231,7 +208,7 @@ impl ScyllaGenericKeyIdValueTablePreparedStatements {
             let values: Vec<_> = chunk
                 .iter()
                 .map(|n| {
-                    Ok((u64_to_i64_exact(n.obj_id), pser::serialize(&n.value)?))
+                    Ok((u64_to_i64_exact(n.obj_id), n.value.psy_ser_to_bytes_vec()?))
                 })
                 .collect::<anyhow::Result<_>>()?;
             batch_list.push(batch);
@@ -244,7 +221,7 @@ impl ScyllaGenericKeyIdValueTablePreparedStatements {
         }
         Ok(())
     }
-    pub async fn insert_many_kivs_t<V: Serialize + DeserializeOwned, R: QDatabaseKeyIdValueTableRowLike<V>>(
+    pub async fn insert_many_kivs_t<V: PsySerializeCanonicalAsyncSafe, R: QDatabaseKeyIdValueTableRowLike<V>>(
         &self, 
         session: &Session, 
         rows: &[R]
@@ -259,7 +236,7 @@ impl ScyllaGenericKeyIdValueTablePreparedStatements {
             let values: Vec<_> = chunk
                 .iter()
                 .map(|n| {
-                    Ok((u64_to_i64_exact(n.get_row_obj_id()), pser::serialize(&n.get_row_value_ref())?))
+                    Ok((u64_to_i64_exact(n.get_row_obj_id()), n.get_row_value_ref().psy_ser_to_bytes_vec()?))
                 })
                 .collect::<anyhow::Result<_>>()?;
             batch_list.push(batch);
@@ -272,7 +249,7 @@ impl ScyllaGenericKeyIdValueTablePreparedStatements {
         }
         Ok(())
     }
-    pub async fn select_many_kiv_values<V: Serialize + DeserializeOwned>(
+    pub async fn select_many_kiv_values<V: PsySerializeCanonicalAsyncSafe>(
         &self, 
         session: &Session, 
         obj_ids: &[u64],
@@ -288,14 +265,8 @@ impl ScyllaGenericKeyIdValueTablePreparedStatements {
                     async move {
                         let res = session.execute_unpaged(&prep, (*key,)).await?;
                         let rows = res.into_rows_result()?;
-                        if let Some(row) = rows.maybe_first_row::<(Vec<u8>,)>()? {
-                            match pser::deserialize::<V>(&row.0) {
-                                Ok(value) => core::result::Result::<_, anyhow::Error>::Ok(Some(value)),
-                                Err(e) => {
-                                    tracing::error!("Deserialization error for object ID {} in {}.{}: {:?}", i64_to_u64_exact(*key), self.keyspace, self.table_name, e);
-                                    Ok(None)
-                                }
-                            }
+                        if let Some((row,)) = rows.maybe_first_row::<(Vec<u8>,)>()? {
+                           anyhow::Ok(Some(V::psy_ser_from_owned_bytes_vec(row)?))
                         } else {
                             // Assume reverse_level = level for simplicity; adjust if tree height known
                             Ok(None)
@@ -310,7 +281,7 @@ impl ScyllaGenericKeyIdValueTablePreparedStatements {
         }
         Ok(results)
     }
-    pub async fn select_many_kiv_keys_and_values<V: Serialize + DeserializeOwned, R: QDatabaseKeyIdValueTableRowCreatable<V>>(
+    pub async fn select_many_kiv_keys_and_values<V: PsySerializeCanonicalAsyncSafe, R: QDatabaseKeyIdValueTableRowCreatable<V>>(
         &self, 
         session: &Session, 
         obj_ids: &[u64], 
@@ -327,13 +298,7 @@ impl ScyllaGenericKeyIdValueTablePreparedStatements {
                         let res = session.execute_unpaged(&prep, (*key,)).await?;
                         let rows = res.into_rows_result()?;
                         if let Some(row) = rows.maybe_first_row::<(i64, Vec<u8>)>()? {
-                            match pser::deserialize::<V>(&row.1) {
-                                Ok(value) => core::result::Result::<_, anyhow::Error>::Ok(Some(R::create_from_key_id_value_row(i64_to_u64_exact(row.0), value))),
-                                Err(e) => {
-                                    tracing::error!("Deserialization error for object ID {} in {}.{}: {:?}", i64_to_u64_exact(*key), self.keyspace, self.table_name, e);
-                                    Ok(None)
-                                }
-                            }
+                            anyhow::Ok(Some(R::create_from_key_id_value_row(i64_to_u64_exact(row.0), V::psy_ser_from_owned_bytes_vec(row.1)?)))
                         } else {
                             // Assume reverse_level = level for simplicity; adjust if tree height known
                             Ok(None)

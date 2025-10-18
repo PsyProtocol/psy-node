@@ -198,3 +198,9 @@ impl<F: QFelt64, Hash: Q256BitHash> FastFixedSerializable<72> for PQEDContractLe
     }
 }
 
+pser::impl_psy_ser_basic_tests!(
+    PQEDContractLeaf,
+    // Note the use of concrete types here
+    { parth_core::PF, parth_core::PHash },
+    qed_contract_leaf_tests
+);

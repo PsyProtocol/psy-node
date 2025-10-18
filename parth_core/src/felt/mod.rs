@@ -111,8 +111,8 @@ impl<
 {
 }
 
-pub trait QFelt64: QFelt + ToU64Value + MaybeBytemuck {}
-impl<T: QFelt + ToU64Value + MaybeBytemuck> QFelt64 for T {}
+pub trait QFelt64: QFelt + ToU64Value + MaybeBytemuck + MaybeSpeedy {}
+impl<T: QFelt + ToU64Value + MaybeBytemuck + MaybeSpeedy> QFelt64 for T {}
 pub trait QFeltSized {
     fn q_felt_size() -> usize;
     fn self_qsize(&self) -> usize {

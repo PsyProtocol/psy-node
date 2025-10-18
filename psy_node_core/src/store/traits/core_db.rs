@@ -4,7 +4,7 @@ use parth_core::{
     crypto::hash::{tag_tree::TagTreeMerkleProof, traits::MerkleZeroHasher},
     data::{
         db::{
-            data_types::{BiDirectionalMappingRow, CoreDatabaseValueDeserialize, QDatabasePrimitiveKey},
+            data_types::{BiDirectionalMappingRow, QDatabasePrimitiveKey},
             row::{
                 QDatabaseDoubleIdTableRow, QDatabaseDoubleIdTableRowCreatable, QDatabaseDoubleIdTableRowLike,
                 QDatabaseDoubleIdTableRowNoCheckpointId, QDatabaseDoubleIdTableRowNoCheckpointIdLike, QDatabaseKeyIdValueTableRow,
@@ -17,6 +17,7 @@ use parth_core::{
     },
     protocol::core_types::QHashBase,
 };
+use psy_serialize::PsySerializeCanonicalAsyncSafe;
 use serde::{de::DeserializeOwned, Serialize};
 #[async_trait]
 #[auto_impl(&, Arc)]
@@ -141,20 +142,20 @@ pub trait CoreDatabaseU64Store<TableIdentifier: Clone + Send + Sync>:
 #[async_trait]
 #[auto_impl(&, Arc)]
 pub trait CoreDatabaseSingleIdCheckpointedReader<TableIdentifier: Clone + Send + Sync> {
-    async fn db_select_one_single_checkpointed_object_value<V: CoreDatabaseValueDeserialize>(
+    async fn db_select_one_single_checkpointed_object_value<V: PsySerializeCanonicalAsyncSafe>(
         &self,
         table: &TableIdentifier,
         obj_id: u64,
         max_checkpoint_id: u64,
     ) -> anyhow::Result<Option<V>>;
-    async fn db_select_one_single_checkpointed_object_value_and_ids<V: CoreDatabaseValueDeserialize>(
+    async fn db_select_one_single_checkpointed_object_value_and_ids<V: PsySerializeCanonicalAsyncSafe>(
         &self,
         table: &TableIdentifier,
         obj_id: u64,
         max_checkpoint_id: u64,
     ) -> anyhow::Result<Option<QDatabaseSingleIdTableRow<V>>>;
     async fn db_select_one_single_checkpointed_object_value_and_ids_t<
-        V: CoreDatabaseValueDeserialize,
+        V: PsySerializeCanonicalAsyncSafe,
         R: QDatabaseSingleIdTableRowCreatable<V> + Send + Sync,
     >(
         &self,
@@ -162,18 +163,18 @@ pub trait CoreDatabaseSingleIdCheckpointedReader<TableIdentifier: Clone + Send +
         obj_id: u64,
         max_checkpoint_id: u64,
     ) -> anyhow::Result<Option<R>>;
-    async fn db_select_all_single_checkpointed_object<V: CoreDatabaseValueDeserialize>(
+    async fn db_select_all_single_checkpointed_object<V: PsySerializeCanonicalAsyncSafe>(
         &self,
         table: &TableIdentifier,
     ) -> anyhow::Result<Vec<QDatabaseSingleIdTableRow<V>>>;
-    async fn db_select_many_single_checkpointed_object_values<V: CoreDatabaseValueDeserialize>(
+    async fn db_select_many_single_checkpointed_object_values<V: PsySerializeCanonicalAsyncSafe>(
         &self,
         table: &TableIdentifier,
         obj_ids: &[u64],
         max_checkpoint_id: u64,
     ) -> anyhow::Result<Vec<Option<V>>>;
     async fn db_select_many_single_checkpointed_object_keys_and_values<
-        V: CoreDatabaseValueDeserialize,
+        V: PsySerializeCanonicalAsyncSafe,
         R: QDatabaseSingleIdTableRowCreatable<V> + Send + Sync,
     >(
         &self,
@@ -186,34 +187,34 @@ pub trait CoreDatabaseSingleIdCheckpointedReader<TableIdentifier: Clone + Send +
 #[async_trait]
 #[auto_impl(&, Arc)]
 pub trait CoreDatabaseSingleIdCheckpointedWriter<TableIdentifier: Clone + Send + Sync> {
-    async fn db_insert_one_single_checkpointed_object<V: Serialize + Send + Sync>(
+    async fn db_insert_one_single_checkpointed_object<V: PsySerializeCanonicalAsyncSafe>(
         &self,
         table: &TableIdentifier,
         obj_id: u64,
         checkpoint_id: u64,
         value: &V,
     ) -> anyhow::Result<()>;
-    async fn db_insert_many_single_checkpointed_object_rows<V: Serialize + Send + Sync>(
+    async fn db_insert_many_single_checkpointed_object_rows<V: PsySerializeCanonicalAsyncSafe>(
         &self,
         table: &TableIdentifier,
         rows: &[QDatabaseSingleIdTableRow<V>],
     ) -> anyhow::Result<()>;
     async fn db_insert_many_single_checkpointed_object_rows_t<
-        V: Serialize + DeserializeOwned + Send + Sync,
+        V: PsySerializeCanonicalAsyncSafe,
         R: QDatabaseSingleIdTableRowLike<V> + Send + Sync,
     >(
         &self,
         table: &TableIdentifier,
         rows: &[R],
     ) -> anyhow::Result<()>;
-    async fn db_insert_many_single_checkpointed_objects_at_checkpoint<V: Serialize + Send + Sync>(
+    async fn db_insert_many_single_checkpointed_objects_at_checkpoint<V: PsySerializeCanonicalAsyncSafe>(
         &self,
         table: &TableIdentifier,
         checkpoint_id: u64,
         rows: &[QDatabaseSingleIdTableRowNoCheckpointId<V>],
     ) -> anyhow::Result<()>;
     async fn db_insert_many_single_checkpointed_objects_at_checkpoint_t<
-        V: Serialize + DeserializeOwned + Send + Sync,
+        V: PsySerializeCanonicalAsyncSafe,
         R: QDatabaseSingleIdTableRowNoCheckpointIdLike<V> + Send + Sync,
     >(
         &self,
@@ -256,14 +257,14 @@ impl<
 #[async_trait]
 #[auto_impl(&, Arc)]
 pub trait CoreDatabaseDoubleIdCheckpointedReader<TableIdentifier: Clone + Send + Sync> {
-    async fn db_select_one_double_checkpointed_object_value<V: CoreDatabaseValueDeserialize>(
+    async fn db_select_one_double_checkpointed_object_value<V: PsySerializeCanonicalAsyncSafe>(
         &self,
         table: &TableIdentifier,
         obj_id: u64,
         secondary_id: u64,
         max_checkpoint_id: u64,
     ) -> anyhow::Result<Option<V>>;
-    async fn db_select_one_double_checkpointed_object_value_and_ids<V: CoreDatabaseValueDeserialize>(
+    async fn db_select_one_double_checkpointed_object_value_and_ids<V: PsySerializeCanonicalAsyncSafe>(
         &self,
         table: &TableIdentifier,
         obj_id: u64,
@@ -271,7 +272,7 @@ pub trait CoreDatabaseDoubleIdCheckpointedReader<TableIdentifier: Clone + Send +
         max_checkpoint_id: u64,
     ) -> anyhow::Result<Option<QDatabaseDoubleIdTableRow<V>>>;
     async fn db_select_one_double_checkpointed_object_value_and_ids_t<
-        V: CoreDatabaseValueDeserialize,
+        V: PsySerializeCanonicalAsyncSafe,
         R: QDatabaseDoubleIdTableRowCreatable<V> + Send + Sync,
     >(
         &self,
@@ -280,18 +281,18 @@ pub trait CoreDatabaseDoubleIdCheckpointedReader<TableIdentifier: Clone + Send +
         secondary_id: u64,
         max_checkpoint_id: u64,
     ) -> anyhow::Result<Option<R>>;
-    async fn db_select_all_double_checkpointed_object<V: CoreDatabaseValueDeserialize>(
+    async fn db_select_all_double_checkpointed_object<V: PsySerializeCanonicalAsyncSafe>(
         &self,
         table: &TableIdentifier,
     ) -> anyhow::Result<Vec<QDatabaseDoubleIdTableRow<V>>>;
-    async fn db_select_many_double_checkpointed_object_values<V: CoreDatabaseValueDeserialize>(
+    async fn db_select_many_double_checkpointed_object_values<V: PsySerializeCanonicalAsyncSafe>(
         &self,
         table: &TableIdentifier,
         obj_ids: &[QDoubleIdKey],
         max_checkpoint_id: u64,
     ) -> anyhow::Result<Vec<Option<V>>>;
     async fn db_select_many_double_checkpointed_object_keys_and_values<
-        V: CoreDatabaseValueDeserialize,
+        V: PsySerializeCanonicalAsyncSafe,
         R: QDatabaseDoubleIdTableRowCreatable<V> + Send + Sync,
     >(
         &self,
@@ -304,7 +305,7 @@ pub trait CoreDatabaseDoubleIdCheckpointedReader<TableIdentifier: Clone + Send +
 #[async_trait]
 #[auto_impl(&, Arc)]
 pub trait CoreDatabaseDoubleIdCheckpointedWriter<TableIdentifier: Clone + Send + Sync> {
-    async fn db_insert_one_double_checkpointed_object<V: Serialize + Send + Sync>(
+    async fn db_insert_one_double_checkpointed_object<V: PsySerializeCanonicalAsyncSafe>(
         &self,
         table: &TableIdentifier,
         obj_id: u64,
@@ -312,27 +313,27 @@ pub trait CoreDatabaseDoubleIdCheckpointedWriter<TableIdentifier: Clone + Send +
         checkpoint_id: u64,
         value: &V,
     ) -> anyhow::Result<()>;
-    async fn db_insert_many_double_checkpointed_object_rows<V: Serialize + Send + Sync>(
+    async fn db_insert_many_double_checkpointed_object_rows<V: PsySerializeCanonicalAsyncSafe>(
         &self,
         table: &TableIdentifier,
         rows: &[QDatabaseDoubleIdTableRow<V>],
     ) -> anyhow::Result<()>;
     async fn db_insert_many_double_checkpointed_object_rows_t<
-        V: Serialize + DeserializeOwned + Send + Sync,
+        V: PsySerializeCanonicalAsyncSafe,
         R: QDatabaseDoubleIdTableRowLike<V> + Send + Sync,
     >(
         &self,
         table: &TableIdentifier,
         rows: &[R],
     ) -> anyhow::Result<()>;
-    async fn db_insert_many_double_checkpointed_objects_at_checkpoint<V: Serialize + Send + Sync>(
+    async fn db_insert_many_double_checkpointed_objects_at_checkpoint<V: PsySerializeCanonicalAsyncSafe>(
         &self,
         table: &TableIdentifier,
         checkpoint_id: u64,
         rows: &[QDatabaseDoubleIdTableRowNoCheckpointId<V>],
     ) -> anyhow::Result<()>;
     async fn db_insert_many_double_checkpointed_objects_at_checkpoint_t<
-        V: Serialize + DeserializeOwned + Send + Sync,
+        V: PsySerializeCanonicalAsyncSafe,
         R: QDatabaseDoubleIdTableRowNoCheckpointIdLike<V> + Send + Sync,
     >(
         &self,
@@ -355,27 +356,27 @@ impl<
 #[async_trait]
 #[auto_impl(&, Arc)]
 pub trait CoreDatabaseKivReader<TableIdentifier: Clone + Send + Sync> {
-    async fn db_select_one_kiv_value<V: CoreDatabaseValueDeserialize>(&self, table: &TableIdentifier, obj_id: u64) -> anyhow::Result<Option<V>>;
-    async fn db_select_one_kiv_value_and_ids<V: CoreDatabaseValueDeserialize>(
+    async fn db_select_one_kiv_value<V: PsySerializeCanonicalAsyncSafe>(&self, table: &TableIdentifier, obj_id: u64) -> anyhow::Result<Option<V>>;
+    async fn db_select_one_kiv_value_and_ids<V: PsySerializeCanonicalAsyncSafe>(
         &self,
         table: &TableIdentifier,
         obj_id: u64,
     ) -> anyhow::Result<Option<QDatabaseKeyIdValueTableRow<V>>>;
-    async fn db_select_one_kiv_value_and_ids_t<V: CoreDatabaseValueDeserialize, R: QDatabaseKeyIdValueTableRowCreatable<V> + Send + Sync>(
+    async fn db_select_one_kiv_value_and_ids_t<V: PsySerializeCanonicalAsyncSafe, R: QDatabaseKeyIdValueTableRowCreatable<V> + Send + Sync>(
         &self,
         table: &TableIdentifier,
         obj_id: u64,
     ) -> anyhow::Result<Option<R>>;
-    async fn db_select_all_kiv<V: CoreDatabaseValueDeserialize>(
+    async fn db_select_all_kiv<V: PsySerializeCanonicalAsyncSafe>(
         &self,
         table: &TableIdentifier,
     ) -> anyhow::Result<Vec<QDatabaseKeyIdValueTableRow<V>>>;
-    async fn db_select_many_kiv_values<V: CoreDatabaseValueDeserialize>(
+    async fn db_select_many_kiv_values<V: PsySerializeCanonicalAsyncSafe>(
         &self,
         table: &TableIdentifier,
         obj_ids: &[u64],
     ) -> anyhow::Result<Vec<Option<V>>>;
-    async fn db_select_many_kiv_keys_and_values<V: CoreDatabaseValueDeserialize, R: QDatabaseKeyIdValueTableRowCreatable<V> + Send + Sync>(
+    async fn db_select_many_kiv_keys_and_values<V: PsySerializeCanonicalAsyncSafe, R: QDatabaseKeyIdValueTableRowCreatable<V> + Send + Sync>(
         &self,
         table: &TableIdentifier,
         obj_ids: &[u64],
@@ -385,13 +386,13 @@ pub trait CoreDatabaseKivReader<TableIdentifier: Clone + Send + Sync> {
 #[async_trait]
 #[auto_impl(&, Arc)]
 pub trait CoreDatabaseKivWriter<TableIdentifier: Clone + Send + Sync> {
-    async fn db_insert_one_kiv<V: Serialize + Send + Sync>(&self, table: &TableIdentifier, obj_id: u64, value: &V) -> anyhow::Result<()>;
-    async fn db_insert_many_kivs<V: Serialize + Send + Sync>(
+    async fn db_insert_one_kiv<V: PsySerializeCanonicalAsyncSafe>(&self, table: &TableIdentifier, obj_id: u64, value: &V) -> anyhow::Result<()>;
+    async fn db_insert_many_kivs<V: PsySerializeCanonicalAsyncSafe>(
         &self,
         table: &TableIdentifier,
         rows: &[QDatabaseKeyIdValueTableRow<V>],
     ) -> anyhow::Result<()>;
-    async fn db_insert_many_kivs_t<V: Serialize + DeserializeOwned + Send + Sync, R: QDatabaseKeyIdValueTableRowLike<V> + Send + Sync>(
+    async fn db_insert_many_kivs_t<V: PsySerializeCanonicalAsyncSafe, R: QDatabaseKeyIdValueTableRowLike<V> + Send + Sync>(
         &self,
         table: &TableIdentifier,
         rows: &[R],

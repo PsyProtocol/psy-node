@@ -1699,6 +1699,7 @@ dependencies = [
  "postcard",
  "pser",
  "psy_node_core",
+ "psy_serialize",
  "rand 0.8.5",
  "rayon",
  "rkyv",

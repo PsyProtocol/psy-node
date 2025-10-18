@@ -3,8 +3,8 @@ use anyhow::Context;
 use async_trait::async_trait;
 use futures::future::join_all;
 use parth_core::data::db::{row::{QDatabaseDoubleIdTableRow, QDatabaseDoubleIdTableRowCreatable, QDatabaseDoubleIdTableRowLike, QDatabaseDoubleIdTableRowNoCheckpointId, QDatabaseDoubleIdTableRowNoCheckpointIdLike, QDoubleIdKey}, table::QDatabaseTableRoutingKey};
+use psy_serialize::PsySerializeCanonicalAsyncSafe;
 use scylla::{client::session::Session, statement::{batch::Batch, prepared::PreparedStatement, Statement}};
-use serde::{de::DeserializeOwned, Serialize};
 
 use crate::{constants::{INSERT_DOUBLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE, SELECT_DOUBLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE}, tables::traits::ScyllaStandardPreparedTableStatements, utils::{convert_checkpoint_id_to_i64, convert_i64_to_checkpoint_id, i64_to_u64_exact, u64_to_i64_exact}};
 
@@ -92,7 +92,7 @@ impl ScyllaStandardPreparedTableStatements for ScyllaGenericObjectDoubleIdTableP
 
 impl ScyllaGenericObjectDoubleIdTablePreparedStatements {
 
-    pub async fn select_one_double_checkpointed_object_value<V: Serialize + DeserializeOwned>(
+    pub async fn select_one_double_checkpointed_object_value<V: PsySerializeCanonicalAsyncSafe>(
         &self, 
         session: &Session, 
         obj_id: u64,
@@ -102,17 +102,11 @@ impl ScyllaGenericObjectDoubleIdTablePreparedStatements {
         let res = session.execute_unpaged(&self.select_value_1_prepared, (u64_to_i64_exact(obj_id), u64_to_i64_exact(secondary_id), convert_checkpoint_id_to_i64(max_checkpoint_id))).await?;
         let rows = res.into_rows_result()?;
         match rows.maybe_first_row::<(Vec<u8>,)>()? {
-            Some(row) => match pser::deserialize::<V>(&row.0) {
-                Ok(value) => Ok(Some(value)),
-                Err(e) => {
-                    tracing::error!("Deserialization error for latest object ID with ({}, {}) in table {}.{}: {:?}", obj_id, secondary_id, self.keyspace, self.table_name, e);
-                    Ok(None)
-                }
-            },
-            None => Ok(None), // Return zero hash if not found
+            Some(row) => Ok(Some(V::psy_ser_from_owned_bytes_vec(row.0)?)),
+            None => Ok(None),
         }
     }
-    pub async fn select_one_double_checkpointed_object_value_and_ids<V: Serialize + DeserializeOwned>(
+    pub async fn select_one_double_checkpointed_object_value_and_ids<V: PsySerializeCanonicalAsyncSafe>(
         &self, 
         session: &Session, 
         obj_id: u64, 
@@ -122,22 +116,16 @@ impl ScyllaGenericObjectDoubleIdTablePreparedStatements {
         let res = session.execute_unpaged(&self.select_value_checkpoint_id_obj_ids_1_prepared, (u64_to_i64_exact(obj_id), u64_to_i64_exact(secondary_id), convert_checkpoint_id_to_i64(max_checkpoint_id))).await?;
         let rows = res.into_rows_result()?;
         match rows.maybe_first_row::<(i64, i64, i64, Vec<u8>)>()? {
-            Some(row) => match pser::deserialize::<V>(&row.3) {
-                Ok(value) => Ok(Some(QDatabaseDoubleIdTableRow {
-                    value,
-                    obj_id: i64_to_u64_exact(row.0),
-                    secondary_id: i64_to_u64_exact(row.1),
-                    checkpoint_id: convert_i64_to_checkpoint_id(row.2),
+            Some(row) => Ok(Some(QDatabaseDoubleIdTableRow {
+                value: V::psy_ser_from_owned_bytes_vec(row.3)?,
+                obj_id: i64_to_u64_exact(row.0),
+                secondary_id: i64_to_u64_exact(row.1),
+                checkpoint_id: convert_i64_to_checkpoint_id(row.2),
                 })),
-                Err(e) => {
-                    tracing::error!("Deserialization error for object ID ({}, {}) at checkpoint_id={} in {}.{}: {:?}", obj_id, secondary_id, convert_i64_to_checkpoint_id(row.2), self.keyspace, self.table_name, e);
-                    Ok(None)
-                }
-            },
             None => Ok(None), // Return zero hash if not found
         }
     }
-    pub async fn select_one_double_checkpointed_object_value_and_ids_t<V: Serialize + DeserializeOwned, R: QDatabaseDoubleIdTableRowCreatable<V>>(
+    pub async fn select_one_double_checkpointed_object_value_and_ids_t<V: PsySerializeCanonicalAsyncSafe, R: QDatabaseDoubleIdTableRowCreatable<V>>(
         &self, 
         session: &Session, 
         obj_id: u64, 
@@ -147,17 +135,11 @@ impl ScyllaGenericObjectDoubleIdTablePreparedStatements {
         let res = session.execute_unpaged(&self.select_value_checkpoint_id_obj_ids_1_prepared, (u64_to_i64_exact(obj_id), u64_to_i64_exact(secondary_id), convert_checkpoint_id_to_i64(max_checkpoint_id))).await?;
         let rows = res.into_rows_result()?;
         match rows.maybe_first_row::<(i64, i64, i64, Vec<u8>)>()? {
-            Some(row) => match pser::deserialize::<V>(&row.3) {
-                Ok(value) => Ok(Some(R::create_from_double_row(i64_to_u64_exact(row.0), i64_to_u64_exact(row.1), convert_i64_to_checkpoint_id(row.2), value))),
-                Err(e) => {
-                    tracing::error!("Deserialization error for object ID ({}, {}) at checkpoint_id={} in {}.{}: {:?}", obj_id, secondary_id, convert_i64_to_checkpoint_id(row.2), self.keyspace, self.table_name, e);
-                    Ok(None)
-                }
-            },
+            Some(row) => Ok(Some(R::create_from_double_row(i64_to_u64_exact(row.0), i64_to_u64_exact(row.1), convert_i64_to_checkpoint_id(row.2), V::psy_ser_from_owned_bytes_vec(row.3)?))),
             None => Ok(None), // Return zero hash if not found
         }
     }
-    pub async fn select_all_double_checkpointed_object<V: Serialize + DeserializeOwned>(
+    pub async fn select_all_double_checkpointed_object<V: PsySerializeCanonicalAsyncSafe>(
         &self, 
         session: &Session, 
     ) -> anyhow::Result<Vec<QDatabaseDoubleIdTableRow<V>>> {
@@ -173,20 +155,14 @@ impl ScyllaGenericObjectDoubleIdTablePreparedStatements {
                 obj_id: i64_to_u64_exact(obj_id),
                 secondary_id: i64_to_u64_exact(secondary_id),
                 checkpoint_id: convert_i64_to_checkpoint_id(checkpoint_id),
-                value: match pser::deserialize(&value){
-                    Ok(value) => value,
-                    Err(e) => {
-                        tracing::error!("Deserialization error for object ID ({}, {}) at checkpoint_id={} in {}.{}: {:?}", obj_id, secondary_id, convert_i64_to_checkpoint_id(checkpoint_id), self.keyspace, self.table_name, e);
-                        anyhow::bail!("Deserialization error for object ID ({}, {}) at checkpoint_id={} in {}.{}: {:?}", obj_id, secondary_id, convert_i64_to_checkpoint_id(checkpoint_id), self.keyspace, self.table_name, e);
-                    }
-                },
+                value: V::psy_ser_from_owned_bytes_vec(value)?,
             });
         }
         Ok(results)
     }
 
 
-    pub async fn insert_one_double_checkpointed_object<V: Serialize>(
+    pub async fn insert_one_double_checkpointed_object<V: PsySerializeCanonicalAsyncSafe>(
         &self, 
         session: &Session, 
         obj_id: u64, 
@@ -194,11 +170,11 @@ impl ScyllaGenericObjectDoubleIdTablePreparedStatements {
         checkpoint_id: u64, 
         value: &V
     ) -> anyhow::Result<()> {
-        let value_bytes = pser::serialize(value)?;
+        let value_bytes = value.psy_ser_to_bytes_vec()?;
         session.execute_unpaged(&self.insert_1_prepared, (u64_to_i64_exact(obj_id), u64_to_i64_exact(secondary_id), u64_to_i64_exact(checkpoint_id), &value_bytes)).await?;
         Ok(())
     }
-    pub async fn insert_many_double_checkpointed_object_rows<V: Serialize>(
+    pub async fn insert_many_double_checkpointed_object_rows<V: PsySerializeCanonicalAsyncSafe>(
         &self, 
         session: &Session, 
         rows: &[QDatabaseDoubleIdTableRow<V>]
@@ -213,7 +189,7 @@ impl ScyllaGenericObjectDoubleIdTablePreparedStatements {
             let values: Vec<_> = chunk
                 .iter()
                 .map(|n| {
-                    Ok((u64_to_i64_exact(n.obj_id), u64_to_i64_exact(n.secondary_id), convert_checkpoint_id_to_i64(n.checkpoint_id), pser::serialize(&n.value)?))
+                    Ok((u64_to_i64_exact(n.obj_id), u64_to_i64_exact(n.secondary_id), convert_checkpoint_id_to_i64(n.checkpoint_id), n.value.psy_ser_to_bytes_vec()?))
                 })
                 .collect::<anyhow::Result<_>>()?;
             batch_list.push(batch);
@@ -227,7 +203,7 @@ impl ScyllaGenericObjectDoubleIdTablePreparedStatements {
         Ok(())
     }
 
-    pub async fn insert_many_double_checkpointed_object_rows_t<V: Serialize + DeserializeOwned, R: QDatabaseDoubleIdTableRowLike<V>>(
+    pub async fn insert_many_double_checkpointed_object_rows_t<V: PsySerializeCanonicalAsyncSafe, R: QDatabaseDoubleIdTableRowLike<V>>(
         &self, 
         session: &Session, 
         rows: &[R]
@@ -242,7 +218,7 @@ impl ScyllaGenericObjectDoubleIdTablePreparedStatements {
             let values: Vec<_> = chunk
                 .iter()
                 .map(|n| {
-                    Ok((u64_to_i64_exact(n.get_row_obj_id()), u64_to_i64_exact(n.get_row_secondary_id()), convert_checkpoint_id_to_i64(n.get_row_checkpoint_id()), pser::serialize(&n.get_row_value_ref())?))
+                    Ok((u64_to_i64_exact(n.get_row_obj_id()), u64_to_i64_exact(n.get_row_secondary_id()), convert_checkpoint_id_to_i64(n.get_row_checkpoint_id()), n.get_row_value_ref().psy_ser_to_bytes_vec()?))
                 })
                 .collect::<anyhow::Result<_>>()?;
             batch_list.push(batch);
@@ -255,7 +231,7 @@ impl ScyllaGenericObjectDoubleIdTablePreparedStatements {
         }
         Ok(())
     }
-    pub async fn insert_many_double_checkpointed_objects_at_checkpoint<V: Serialize>(
+    pub async fn insert_many_double_checkpointed_objects_at_checkpoint<V: PsySerializeCanonicalAsyncSafe>(
         &self, 
         session: &Session, 
         checkpoint_id: u64,
@@ -271,7 +247,7 @@ impl ScyllaGenericObjectDoubleIdTablePreparedStatements {
             let values: Vec<_> = chunk
                 .iter()
                 .map(|n| {
-                    Ok((u64_to_i64_exact(n.obj_id), u64_to_i64_exact(n.secondary_id), convert_checkpoint_id_to_i64(checkpoint_id), pser::serialize(&n.value)?))
+                    Ok((u64_to_i64_exact(n.obj_id), u64_to_i64_exact(n.secondary_id), convert_checkpoint_id_to_i64(checkpoint_id), n.value.psy_ser_to_bytes_vec()?))
                 })
                 .collect::<anyhow::Result<_>>()?;
             batch_list.push(batch);
@@ -284,7 +260,7 @@ impl ScyllaGenericObjectDoubleIdTablePreparedStatements {
         }
         Ok(())
     }
-    pub async fn insert_many_double_checkpointed_objects_at_checkpoint_t<V: Serialize + DeserializeOwned, R: QDatabaseDoubleIdTableRowNoCheckpointIdLike<V>>(
+    pub async fn insert_many_double_checkpointed_objects_at_checkpoint_t<V: PsySerializeCanonicalAsyncSafe, R: QDatabaseDoubleIdTableRowNoCheckpointIdLike<V>>(
         &self, 
         session: &Session, 
         checkpoint_id: u64,
@@ -300,7 +276,7 @@ impl ScyllaGenericObjectDoubleIdTablePreparedStatements {
             let values: Vec<_> = chunk
                 .iter()
                 .map(|n| {
-                    Ok((u64_to_i64_exact(n.get_row_obj_id()), u64_to_i64_exact(n.get_row_secondary_id()), convert_checkpoint_id_to_i64(checkpoint_id), pser::serialize(&n.get_row_value_ref())?))
+                    Ok((u64_to_i64_exact(n.get_row_obj_id()), u64_to_i64_exact(n.get_row_secondary_id()), convert_checkpoint_id_to_i64(checkpoint_id), n.get_row_value_ref().psy_ser_to_bytes_vec()?))
                 })
                 .collect::<anyhow::Result<_>>()?;
             batch_list.push(batch);
@@ -313,7 +289,7 @@ impl ScyllaGenericObjectDoubleIdTablePreparedStatements {
         }
         Ok(())
     }
-    pub async fn select_many_double_checkpointed_object_values<V: Serialize + DeserializeOwned>(
+    pub async fn select_many_double_checkpointed_object_values<V: PsySerializeCanonicalAsyncSafe>(
         &self, 
         session: &Session, 
         obj_ids: &[QDoubleIdKey],
@@ -331,13 +307,7 @@ impl ScyllaGenericObjectDoubleIdTablePreparedStatements {
                         let res = session.execute_unpaged(&prep, (u64_to_i64_exact(key.obj_id), u64_to_i64_exact(key.secondary_id), max_cp_i64)).await?;
                         let rows = res.into_rows_result()?;
                         if let Some(row) = rows.maybe_first_row::<(Vec<u8>,)>()? {
-                            match pser::deserialize::<V>(&row.0) {
-                                Ok(value) => core::result::Result::<_, anyhow::Error>::Ok(Some(value)),
-                                Err(e) => {
-                                    tracing::error!("Deserialization error for object ID ({},{}) with max_checkpoint_id={} in {}.{}: {:?}", key.obj_id, key.secondary_id, convert_i64_to_checkpoint_id(max_cp_i64), self.keyspace, self.table_name, e);
-                                    Ok(None)
-                                }
-                            }
+                            anyhow::Ok(Some(V::psy_ser_from_owned_bytes_vec(row.0)?))
                         } else {
                             // Assume reverse_level = level for simplicity; adjust if tree height known
                             Ok(None)
@@ -352,7 +322,7 @@ impl ScyllaGenericObjectDoubleIdTablePreparedStatements {
         }
         Ok(results)
     }
-    pub async fn select_many_double_checkpointed_object_keys_and_values<V: Serialize + DeserializeOwned, R: QDatabaseDoubleIdTableRowCreatable<V>>(
+    pub async fn select_many_double_checkpointed_object_keys_and_values<V: PsySerializeCanonicalAsyncSafe, R: QDatabaseDoubleIdTableRowCreatable<V>>(
         &self, 
         session: &Session, 
         obj_ids: &[QDoubleIdKey], 
@@ -370,13 +340,7 @@ impl ScyllaGenericObjectDoubleIdTablePreparedStatements {
                         let res = session.execute_unpaged(&prep, (u64_to_i64_exact(key.obj_id), u64_to_i64_exact(key.secondary_id), max_cp_i64)).await?;
                         let rows = res.into_rows_result()?;
                         if let Some(row) = rows.maybe_first_row::<(i64, i64, i64, Vec<u8>)>()? {
-                            match pser::deserialize::<V>(&row.3) {
-                                Ok(value) => core::result::Result::<_, anyhow::Error>::Ok(Some(R::create_from_double_row(i64_to_u64_exact(row.0), i64_to_u64_exact(row.1), convert_i64_to_checkpoint_id(row.2), value))),
-                                Err(e) => {
-                                    tracing::error!("Deserialization error for object ID ({},{}) at checkpoint_id={} in {}.{}: {:?}", key.obj_id, key.secondary_id, convert_i64_to_checkpoint_id(row.2), self.keyspace, self.table_name, e);
-                                    Ok(None)
-                                }
-                            }
+                            anyhow::Ok(Some(R::create_from_double_row(i64_to_u64_exact(row.0), i64_to_u64_exact(row.1), convert_i64_to_checkpoint_id(row.2), V::psy_ser_from_owned_bytes_vec(row.3)?)))
                         } else {
                             // Assume reverse_level = level for simplicity; adjust if tree height known
                             Ok(None)

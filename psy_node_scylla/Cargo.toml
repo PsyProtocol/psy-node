@@ -8,7 +8,7 @@ version = "0.1.0"
 
 [features]
 default = ["std", "parth_core/serialize_rkyv", "parth_core/serialize_speedy", "parth_core/serialize_postcard", "parallel_rayon"]
-std = ["parth_core/std", "pser/std"]
+std = ["parth_core/std", "pser/std", "psy_serialize/std"]
 serialize_rkyv = ["dep:rkyv","pser/serialize_rkyv", "parth_core/serialize_rkyv"]
 serialize_speedy = ["dep:speedy", "pser/serialize_speedy", "parth_core/serialize_speedy"]
 serialize_postcard = ["dep:postcard", "pser/serialize_postcard", "parth_core/serialize_postcard"]
@@ -41,6 +41,7 @@ futures = { workspace = true }
 pser = { workspace = true }
 pderive = { workspace = true }
 parth_core = { workspace = true }
+psy_serialize = { workspace = true }
 # parth_common = { workspace = true }
 # psy_core = { workspace = true }
 # parth_crypto = { workspace = true }

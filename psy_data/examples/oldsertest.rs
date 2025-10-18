@@ -23,7 +23,7 @@ pub struct SplitData {
 fn split_owned_bytemuck(data: [u8; 104]) -> SplitData {
     bytemuck::cast(data)
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, bytemuck::Pod, bytemuck::Zeroable,  speedy::Readable, speedy::Writable)]
 #[repr(transparent)]
 pub struct ExampleFelt(pub u64);
 
@@ -51,7 +51,7 @@ impl ToU64Value for ExampleFelt {
 }
 
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, bytemuck::Pod, bytemuck::Zeroable, speedy::Readable, speedy::Writable)]
 #[repr(transparent)]
 pub struct ZHashOut<F> {
     pub elements: [F; 4],

@@ -8,8 +8,7 @@ use parth_core::{
 };
 use pser::{QBytesDeserialize, QBytesSerialize};
 use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
-use psy_serialize::{PsyCanonicalDatabaseSerializeBaseSingle, PsyIOReadWrite};
-use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata};
+use psy_serialize::{PsyCanonicalDatabaseSerializeBaseSingle, PsyIOReadWrite, FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata};
 use serde::Serialize;
 use ts_rs::TS;
 
@@ -50,11 +49,6 @@ impl QToCodeString for ContractFunctionCodeDefinition {
     }
 }
     
-impl PsyCanonicalSerializeMetadata for ContractFunctionCodeDefinition {
-    const IS_FIXED_SIZE: bool = false;
-    const FIXED_SIZE: usize = 0;
-}
-
 impl FallbackPsySerializeCanonical for ContractFunctionCodeDefinition {
     fn fallback_pio_serialized_size(&self) -> usize {
         4 + 4 + 4 + 4 + 4 + self.code.len()
@@ -93,6 +87,11 @@ psy_serialize::impl_psy_canonical_serialize_for_speedy!(ContractFunctionCodeDefi
 #[cfg(not(all(feature = "serialize_speedy", target_endian = "little")))]
 impl AutoImplementFallbackPsySerializeCanonical for ContractFunctionCodeDefinition {}
 
+
+impl PsyCanonicalSerializeMetadata for ContractFunctionCodeDefinition {
+    const IS_FIXED_SIZE: bool = false;
+    const FIXED_SIZE: usize = 0;
+}
 
 
 impl QPGenRandom for ContractFunctionCodeDefinition {
@@ -179,6 +178,11 @@ impl AutoImplementFallbackPsySerializeCanonical for ContractCodeDefinition {}
 
 
 
+pser::impl_psy_ser_basic_tests!(
+    ContractCodeDefinition,
+    { },
+    contract_code_definition
+);
 impl_qpq_serialize_bincode!(ContractCodeDefinition);
 impl QPGenRandom for ContractCodeDefinition {
     fn qp_rand_gen() -> Self {

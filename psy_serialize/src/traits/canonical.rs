@@ -8,6 +8,8 @@ pub trait PsySerializeCanonical:
     PsyCanonicalDatabaseSerializeBaseMulti + PsyCanonicalDatabaseSerializeBaseSingle + PsyIOReadWrite
 {
 }
+pub trait PsySerializeCanonicalAsyncSafe: PsySerializeCanonical + Send + Sync {}
+impl<T: PsySerializeCanonical + Send + Sync> PsySerializeCanonicalAsyncSafe for T {}
 
 impl<T: PsyCanonicalDatabaseSerializeBaseMulti + PsyCanonicalDatabaseSerializeBaseSingle + PsyIOReadWrite>
     PsySerializeCanonical for T
@@ -38,7 +40,14 @@ impl<const SIZE: usize, T: PsySerializeCanonical + PsySerializeCanonicalFixedOnl
     for T
 {
 }
-
+pub trait PsySerializeCanonicalFixedAsyncSafe<const SIZE: usize>:
+    PsySerializeCanonicalFixed<SIZE> + Send + Sync
+{
+}
+impl<const SIZE: usize, T: PsySerializeCanonicalFixed<SIZE> + Send + Sync>
+    PsySerializeCanonicalFixedAsyncSafe<SIZE> for T
+{
+}
 // Fallback trait in case the serializer of choice is not implemented.
 // It uses a reader/writer approach for consistency with the main pio traits.
 pub trait FallbackPsySerializeCanonical: PsyCanonicalSerializeMetadata + Sized {

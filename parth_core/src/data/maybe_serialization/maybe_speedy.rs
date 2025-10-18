@@ -22,10 +22,10 @@ where
 }
 
 #[cfg(feature = "serialize_speedy")]
-pub trait MaybeSpeedy: SpeedyReadable + Writable<LittleEndian> {}
+pub trait MaybeSpeedy: SpeedyReadable + Writable<LittleEndian> + Readable<'static, LittleEndian> {}
 
 #[cfg(feature = "serialize_speedy")]
-impl<T: SpeedyReadable + Writable<LittleEndian>> MaybeSpeedy for T {}
+impl<T: SpeedyReadable + Writable<LittleEndian> + Readable<'static, LittleEndian>> MaybeSpeedy for T {}
 
 #[cfg(not(feature = "serialize_speedy"))]
 pub trait MaybeSpeedy {}

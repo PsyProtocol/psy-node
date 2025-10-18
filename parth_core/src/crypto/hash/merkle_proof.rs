@@ -1,4 +1,4 @@
-use pser::{QBytesDeserialize, QBytesSerialize};
+use pser::{impl_psy_ser_basic_tests, QBytesDeserialize, QBytesSerialize};
 use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
 use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata};
 use serde::{Deserialize, Serialize};
@@ -222,6 +222,7 @@ pub fn compute_historical_and_current_merkle_roots_core_gt<Hash: Copy, Hasher: M
 #[pderive::serialize_clone]
 #[derive(ts_rs::TS)]
 #[ts(export)]
+#[repr(C)]
 pub struct MerkleProofCore<Hash> {
     pub root: Hash,
     pub value: Hash,
@@ -245,6 +246,13 @@ impl<Hash: Q256BitHash> PsyCanonicalSerializeMetadata for MerkleProofCore<Hash> 
     const FIXED_SIZE: usize = 0;
 }
 
+pser::impl_psy_ser_basic_tests!(
+    MerkleProofCore,
+    // Note the use of concrete types here
+    { crate::PHash },
+    merkle_proof_core_tests,
+    true
+);
 /*
 impl<Hash: Q256BitHash> PsyIOReadWrite for MerkleProofCore<Hash> {
     fn pio_serialized_size(&self) -> usize {
@@ -372,7 +380,7 @@ impl<Hash: Q256BitHash> FallbackPsySerializeCanonical for MerkleProofCore<Hash> 
     }
 }
 
-//#[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
+#[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
 //#[cfg(not(all(feature = "serialize_speedy", target_endian = "little")))]
 psy_serialize::impl_psy_canonical_serialize_for_speedy!(
     MerkleProofCore,
@@ -545,13 +553,13 @@ impl<Hash: Q256BitHash> FallbackPsySerializeCanonical for DeltaMerkleProofCore<H
     }
 }
 
-//#[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
-#[cfg(not(all(feature = "serialize_speedy", target_endian = "little")))]
+#[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
+//#[cfg(not(all(feature = "serialize_speedy", target_endian = "little")))]
 psy_serialize::impl_psy_canonical_serialize_for_speedy!(
     DeltaMerkleProofCore,
     { Hash: Q256BitHash } => { Hash }
 );
-//#[cfg(not(all(feature = "serialize_speedy", target_endian = "little")))]
+#[cfg(not(all(feature = "serialize_speedy", target_endian = "little")))]
 impl<Hash: Q256BitHash> psy_serialize::AutoImplementFallbackPsySerializeCanonical for DeltaMerkleProofCore<Hash> {}
 
 impl<Hash: PartialEq + Copy> DeltaMerkleProofCore<Hash> {
@@ -697,6 +705,13 @@ mod tests {
     type Hash = PHash;
     use psy_serialize::*;
 
+    fn test_auto<T: PsySerializeCanonicalAsyncSafe>(proof: &T){
+        let serialized = proof.psy_ser_to_bytes_vec().unwrap();
+        let deserialized = T::psy_ser_from_slice(&serialized).unwrap();
+        let reserialized = deserialized.psy_ser_to_bytes_vec().unwrap();
+        assert_eq!(serialized, reserialized);
+    }
+
     use super::*;
     #[test]
     fn round_trip_canonical_serialization_merkle_proof_core() {
@@ -712,6 +727,8 @@ mod tests {
                 assert_eq!(*a, *b);
             }
         }
+        let proof = MerkleProofCore::<Hash>::qp_rand_gen();
+        test_auto(&proof);
     }
 
     #[ignore]

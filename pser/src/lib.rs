@@ -586,3 +586,294 @@ macro_rules! impl_bytemuck_ffs_tests {
         }
     };
 }
+
+/// Generates a basic test suite for types implementing `psy-serialize`'s canonical traits.
+///
+/// This macro creates a nested test module structure: `tests_psy_ser::<module_base_name>`.
+/// This approach does not require any external crates like `paste`.
+///
+/// # Pre-requisites
+///
+/// The tested struct MUST implement:
+/// 1.  `parth_core::utils::QPGenRandom` (or `crate::utils::QPGenRandom`).
+/// 2.  `PartialEq` to compare results.
+/// 3.  The relevant `psy-serialize` traits.
+///
+/// # Usage
+///
+/// ### Basic Usage
+///
+/// This will generate a module `my_struct` inside a parent module `tests_psy_ser`.
+///
+/// ```rust,ignore
+/// impl_psy_ser_basic_tests!(
+///     // 1. The name of the struct.
+///     MyStruct,
+///     // 2. The concrete types for testing (e.g., { ConcreteField, ConcreteHash }).
+///     //    Use `{}` for non-generic types.
+///     { ConcreteField, ConcreteHash },
+///     // 3. The base name for the inner test module.
+///     my_struct
+/// );
+/// ```
+#[macro_export]
+macro_rules! impl_psy_ser_basic_tests_fallback {
+    // Arm 1: Default, uses `parth_core::utils::QPGenRandom`.
+    (
+        $struct_name:ident,
+        { $($concrete_type:ty),* },
+        $module_base_name:ident $(,)?
+    ) => {
+        $crate::impl_psy_ser_basic_tests!(@gen
+            $struct_name,
+            { $($concrete_type),* },
+            $module_base_name,
+            parth_core::utils::QPGenRandom
+        );
+    };
+
+    // Arm 2: For local testing, uses `crate::utils::QPGenRandom`.
+    (
+        $struct_name:ident,
+        { $($concrete_type:ty),* },
+        $module_base_name:ident,
+        true
+    ) => {
+        $crate::impl_psy_ser_basic_tests!(@gen
+            $struct_name,
+            { $($concrete_type),* },
+            $module_base_name,
+            crate::utils::QPGenRandom
+        );
+    };
+
+    // Arm 3: The internal generator arm.
+    // It creates a nested module structure to achieve the desired naming.
+    (@gen
+        $struct_name:ident,
+        { $($concrete_type:ty),* },
+        $module_base_name:ident,
+        $qp_gen_path:path
+    ) => {
+        #[cfg(test)]
+            mod $module_base_name {
+                // The struct is now two levels up, so we use `super::super::`.
+                use super::$struct_name;
+                use $qp_gen_path;
+                use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalDatabaseSerializeBaseMulti, PsyCanonicalDatabaseSerializeBaseSingle};
+
+                type PsySerTestTargetType = $struct_name<$($concrete_type),*>;
+
+                #[test]
+                fn test_simple_round_trip() -> anyhow::Result<()> {
+                    let value = PsySerTestTargetType::qp_rand_gen();
+                    let serialized = value.psy_ser_to_bytes_vec()?;
+                    let deserialized = PsySerTestTargetType::psy_ser_from_slice(&serialized)?;
+                    let deserialized_owned = PsySerTestTargetType::psy_ser_from_owned_bytes_vec(serialized.clone())?;
+
+                    assert!(value == deserialized, "Round trip serialization failed");
+                    assert!(value == deserialized_owned, "Round trip owned serialization failed");
+
+                    let serialized_owned = value.psy_ser_into_bytes_vec()?;
+                    assert_eq!(serialized, serialized_owned, "Owned and non-owned serialization differ");
+
+                    let fallback_serialized = value.fallback_psy_ser_to_bytes_vec()?;
+                    assert_eq!(serialized, fallback_serialized, "Fallback and non-fallback serialization differ");
+
+                    let fallback_deserialized = PsySerTestTargetType::fallback_psy_ser_from_slice(&fallback_serialized)?;
+                    assert!(value == fallback_deserialized, "Fallback round trip serialization failed");
+
+                    let fallback_deserialized_owned = PsySerTestTargetType::fallback_psy_ser_from_owned_bytes_vec(fallback_serialized.clone())?;
+                    assert!(value == fallback_deserialized_owned, "Fallback round trip owned serialization failed");
+
+                    Ok(())
+                }
+
+                #[test]
+                fn fuzz_10000_round_trips() -> anyhow::Result<()> {
+                    for _ in 0..10_000 {
+                        let value = PsySerTestTargetType::qp_rand_gen();
+                        let serialized = value.psy_ser_to_bytes_vec()?;
+                        let deserialized = PsySerTestTargetType::psy_ser_from_slice(&serialized)?;
+                        assert!(value == deserialized, "Round trip serialization failed on fuzz test");
+                    }
+                    Ok(())
+                }
+
+                #[test]
+                fn test_simple_vec_round_trip() -> anyhow::Result<()> {
+                    let values = PsySerTestTargetType::qp_rand_gen_vec(10);
+                    let serialized = PsySerTestTargetType::psy_ser_serialize_vec_of_self_ref(&values, true);
+                    let deserialized = PsySerTestTargetType::psy_ser_deserialize_vec_of_self(&serialized, true)?;
+
+                    assert!(values == deserialized, "Vector round trip serialization failed");
+                    Ok(())
+                }
+
+                #[test]
+                fn fuzz_1000_non_empty_vec_round_trips() -> anyhow::Result<()> {
+                    for _ in 0..1_000 {
+                        let count = (rand::random::<usize>() % 255) + 1;
+                        let values = PsySerTestTargetType::qp_rand_gen_vec(count);
+                        let serialized = PsySerTestTargetType::psy_ser_serialize_vec_of_self_ref(&values, true);
+                        let deserialized = PsySerTestTargetType::psy_ser_deserialize_vec_of_self(&serialized, true)?;
+
+                        assert!(values == deserialized, "Fuzz vector round trip serialization failed");
+                    }
+                    Ok(())
+                }
+
+                #[test]
+                fn test_empty_vec_round_trip() -> anyhow::Result<()> {
+                    let values: Vec<PsySerTestTargetType> = vec![];
+                    let serialized = PsySerTestTargetType::psy_ser_serialize_vec_of_self_ref(&values, true);
+                    let deserialized = PsySerTestTargetType::psy_ser_deserialize_vec_of_self(&serialized, true)?;
+
+                    assert!(values == deserialized, "Empty vector round trip serialization failed");
+                    Ok(())
+                }
+            }
+    };
+}
+
+
+/// Generates a basic test suite for types implementing `psy-serialize`'s canonical traits.
+///
+/// This macro creates a nested test module structure: `tests_psy_ser::<module_base_name>`.
+/// This approach does not require any external crates like `paste`.
+///
+/// # Pre-requisites
+///
+/// The tested struct MUST implement:
+/// 1.  `parth_core::utils::QPGenRandom` (or `crate::utils::QPGenRandom`).
+/// 2.  `PartialEq` to compare results.
+/// 3.  The relevant `psy-serialize` traits.
+///
+/// # Usage
+///
+/// ### Basic Usage
+///
+/// This will generate a module `my_struct` inside a parent module `tests_psy_ser`.
+///
+/// ```rust,ignore
+/// impl_psy_ser_basic_tests!(
+///     // 1. The name of the struct.
+///     MyStruct,
+///     // 2. The concrete types for testing (e.g., { ConcreteField, ConcreteHash }).
+///     //    Use `{}` for non-generic types.
+///     { ConcreteField, ConcreteHash },
+///     // 3. The base name for the inner test module.
+///     my_struct
+/// );
+/// ```
+#[macro_export]
+macro_rules! impl_psy_ser_basic_tests {
+    // Arm 1: Default, uses `parth_core::utils::QPGenRandom`.
+    (
+        $struct_name:ident,
+        { $($concrete_type:ty),* },
+        $module_base_name:ident $(,)?
+    ) => {
+        $crate::impl_psy_ser_basic_tests!(@gen
+            $struct_name,
+            { $($concrete_type),* },
+            $module_base_name,
+            parth_core::utils::QPGenRandom
+        );
+    };
+
+    // Arm 2: For local testing, uses `crate::utils::QPGenRandom`.
+    (
+        $struct_name:ident,
+        { $($concrete_type:ty),* },
+        $module_base_name:ident,
+        true
+    ) => {
+        $crate::impl_psy_ser_basic_tests!(@gen
+            $struct_name,
+            { $($concrete_type),* },
+            $module_base_name,
+            crate::utils::QPGenRandom
+        );
+    };
+
+    // Arm 3: The internal generator arm.
+    // It creates a nested module structure to achieve the desired naming.
+    (@gen
+        $struct_name:ident,
+        { $($concrete_type:ty),* },
+        $module_base_name:ident,
+        $qp_gen_path:path
+    ) => {
+        #[cfg(test)]
+            mod $module_base_name {
+                // The struct is now two levels up, so we use `super::super::`.
+                use super::$struct_name;
+                use $qp_gen_path;
+                use psy_serialize::{PsyCanonicalDatabaseSerializeBaseMulti, PsyCanonicalDatabaseSerializeBaseSingle};
+
+                type PsySerTestTargetType = $struct_name<$($concrete_type),*>;
+
+                #[test]
+                fn test_simple_round_trip() -> anyhow::Result<()> {
+                    let value = PsySerTestTargetType::qp_rand_gen();
+                    let serialized = value.psy_ser_to_bytes_vec()?;
+                    let deserialized = PsySerTestTargetType::psy_ser_from_slice(&serialized)?;
+                    let deserialized_owned = PsySerTestTargetType::psy_ser_from_owned_bytes_vec(serialized.clone())?;
+
+                    assert!(value == deserialized, "Round trip serialization failed");
+                    assert!(value == deserialized_owned, "Round trip owned serialization failed");
+
+                    let serialized_owned = value.psy_ser_into_bytes_vec()?;
+                    assert_eq!(serialized, serialized_owned, "Owned and non-owned serialization differ");
+
+
+                    Ok(())
+                }
+
+                #[test]
+                fn fuzz_10000_round_trips() -> anyhow::Result<()> {
+                    for _ in 0..10_000 {
+                        let value = PsySerTestTargetType::qp_rand_gen();
+                        let serialized = value.psy_ser_to_bytes_vec()?;
+                        let deserialized = PsySerTestTargetType::psy_ser_from_slice(&serialized)?;
+                        assert!(value == deserialized, "Round trip serialization failed on fuzz test");
+                    }
+                    Ok(())
+                }
+
+                #[test]
+                fn test_simple_vec_round_trip() -> anyhow::Result<()> {
+                    let values = PsySerTestTargetType::qp_rand_gen_vec(10);
+                    let serialized = PsySerTestTargetType::psy_ser_serialize_vec_of_self_ref(&values, true);
+                    let deserialized = PsySerTestTargetType::psy_ser_deserialize_vec_of_self(&serialized, true)?;
+
+                    assert!(values == deserialized, "Vector round trip serialization failed");
+                    Ok(())
+                }
+
+                #[test]
+                fn fuzz_1000_non_empty_vec_round_trips() -> anyhow::Result<()> {
+                    for _ in 0..1_000 {
+                        let count = (rand::random::<usize>() % 255) + 1;
+                        let values = PsySerTestTargetType::qp_rand_gen_vec(count);
+                        let serialized = PsySerTestTargetType::psy_ser_serialize_vec_of_self_ref(&values, true);
+                        let deserialized = PsySerTestTargetType::psy_ser_deserialize_vec_of_self(&serialized, true)?;
+
+                        assert!(values == deserialized, "Fuzz vector round trip serialization failed");
+                    }
+                    Ok(())
+                }
+
+                #[test]
+                fn test_empty_vec_round_trip() -> anyhow::Result<()> {
+                    let values: Vec<PsySerTestTargetType> = vec![];
+                    let serialized = PsySerTestTargetType::psy_ser_serialize_vec_of_self_ref(&values, true);
+                    let deserialized = PsySerTestTargetType::psy_ser_deserialize_vec_of_self(&serialized, true)?;
+
+                    assert!(values == deserialized, "Empty vector round trip serialization failed");
+                    Ok(())
+                }
+            }
+    };
+}

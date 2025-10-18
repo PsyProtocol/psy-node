@@ -1,4 +1,3 @@
-use serde::{de::DeserializeOwned, Serialize};
 
 use crate::data::serializable::{QPDSerializable, QPDSerializableFixed};
 
@@ -100,7 +99,7 @@ impl<V> QDatabaseSingleIdTableRow<V> {
         }
     }
 }
-impl<V: Serialize + DeserializeOwned> QDatabaseSingleIdTableRowNoCheckpointIdLike<V> for QDatabaseSingleIdTableRow<V> {
+impl<V> QDatabaseSingleIdTableRowNoCheckpointIdLike<V> for QDatabaseSingleIdTableRow<V> {
     fn get_row_obj_id(&self) -> u64 {
         self.obj_id
     }
@@ -109,7 +108,7 @@ impl<V: Serialize + DeserializeOwned> QDatabaseSingleIdTableRowNoCheckpointIdLik
     }
 }
 
-impl<V: Serialize + DeserializeOwned> QDatabaseSingleIdTableRowLike<V> for QDatabaseSingleIdTableRow<V> {
+impl<V> QDatabaseSingleIdTableRowLike<V> for QDatabaseSingleIdTableRow<V> {
     fn get_row_checkpoint_id(&self) -> u64 {
         self.checkpoint_id
     }
@@ -129,7 +128,7 @@ impl <V> QDatabaseSingleIdTableRowNoCheckpointId<V> {
         }
     }
 }
-impl <V: Serialize + DeserializeOwned> QDatabaseSingleIdTableRowNoCheckpointIdLike<V> for QDatabaseSingleIdTableRowNoCheckpointId<V> {
+impl <V> QDatabaseSingleIdTableRowNoCheckpointIdLike<V> for QDatabaseSingleIdTableRowNoCheckpointId<V> {
     fn get_row_obj_id(&self) -> u64 {
         self.obj_id
     }
@@ -155,7 +154,7 @@ impl<V> QDatabaseDoubleIdTableRow<V> {
         }
     }
 }
-impl <V: Serialize + DeserializeOwned> QDatabaseDoubleIdTableRowNoCheckpointIdLike<V> for QDatabaseDoubleIdTableRow<V> {
+impl <V> QDatabaseDoubleIdTableRowNoCheckpointIdLike<V> for QDatabaseDoubleIdTableRow<V> {
     fn get_row_obj_id(&self) -> u64 {
         self.obj_id
     }
@@ -166,7 +165,7 @@ impl <V: Serialize + DeserializeOwned> QDatabaseDoubleIdTableRowNoCheckpointIdLi
         &self.value
     }
 }
-impl <V: Serialize + DeserializeOwned> QDatabaseDoubleIdTableRowLike<V> for QDatabaseDoubleIdTableRow<V> {
+impl <V> QDatabaseDoubleIdTableRowLike<V> for QDatabaseDoubleIdTableRow<V> {
     fn get_row_checkpoint_id(&self) -> u64 {
         self.checkpoint_id
     }
@@ -187,7 +186,7 @@ impl<V> QDatabaseDoubleIdTableRowNoCheckpointId<V> {
         }
     }
 }
-impl <V: Serialize + DeserializeOwned> QDatabaseDoubleIdTableRowNoCheckpointIdLike<V> for QDatabaseDoubleIdTableRowNoCheckpointId<V> {
+impl <V> QDatabaseDoubleIdTableRowNoCheckpointIdLike<V> for QDatabaseDoubleIdTableRowNoCheckpointId<V> {
     fn get_row_obj_id(&self) -> u64 {
         self.obj_id
     }

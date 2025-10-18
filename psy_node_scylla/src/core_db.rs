@@ -3,7 +3,7 @@ use parth_core::{
     crypto::hash::{tag_tree::TagTreeMerkleProof, traits::MerkleZeroHasher},
     data::{
         db::{
-            data_types::{BiDirectionalMappingRow, CoreDatabaseValueDeserialize, QDatabasePrimitiveKey},
+            data_types::{BiDirectionalMappingRow, QDatabasePrimitiveKey},
             row::{
                 QDatabaseDoubleIdTableRow, QDatabaseDoubleIdTableRowCreatable, QDatabaseDoubleIdTableRowLike,
                 QDatabaseDoubleIdTableRowNoCheckpointId, QDatabaseDoubleIdTableRowNoCheckpointIdLike, QDatabaseKeyIdValueTableRow,
@@ -24,7 +24,7 @@ use psy_node_core::store::traits::core_db::{
     CoreDatabaseSingleIdMerkleWriter, CoreDatabaseTagTreeReader, CoreDatabaseTagTreeWriter, CoreDatabaseU64Reader, CoreDatabaseU64Writer,
     CoreDatabaseZeroIdMerkleReader, CoreDatabaseZeroIdMerkleWriter,
 };
-use serde::{de::DeserializeOwned, Serialize};
+use psy_serialize::PsySerializeCanonicalAsyncSafe;
 
 use crate::{
     core::ScyllaCoreStore,
@@ -45,7 +45,7 @@ use crate::{
 impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
     CoreDatabaseSingleIdCheckpointedReader<ScyllaGenericObjectSingleIdTablePreparedStatements> for ScyllaCoreStore<Hash, Hasher>
 {
-    async fn db_select_one_single_checkpointed_object_value<V: serde::Serialize + DeserializeOwned + Send + Sync>(
+    async fn db_select_one_single_checkpointed_object_value<V: PsySerializeCanonicalAsyncSafe>(
         &self,
         table: &ScyllaGenericObjectSingleIdTablePreparedStatements,
         obj_id: u64,
@@ -55,7 +55,7 @@ impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sy
             .select_one_single_checkpointed_object_value(&self.session, obj_id, max_checkpoint_id)
             .await
     }
-    async fn db_select_one_single_checkpointed_object_value_and_ids<V: CoreDatabaseValueDeserialize>(
+    async fn db_select_one_single_checkpointed_object_value_and_ids<V: PsySerializeCanonicalAsyncSafe>(
         &self,
         table: &ScyllaGenericObjectSingleIdTablePreparedStatements,
         obj_id: u64,
@@ -66,7 +66,7 @@ impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sy
             .await
     }
     async fn db_select_one_single_checkpointed_object_value_and_ids_t<
-        V: CoreDatabaseValueDeserialize,
+        V: PsySerializeCanonicalAsyncSafe,
         R: QDatabaseSingleIdTableRowCreatable<V> + Send + Sync,
     >(
         &self,
@@ -78,13 +78,13 @@ impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sy
             .select_one_single_checkpointed_object_value_and_ids_t(&self.session, obj_id, max_checkpoint_id)
             .await
     }
-    async fn db_select_all_single_checkpointed_object<V: CoreDatabaseValueDeserialize>(
+    async fn db_select_all_single_checkpointed_object<V: PsySerializeCanonicalAsyncSafe>(
         &self,
         table: &ScyllaGenericObjectSingleIdTablePreparedStatements,
     ) -> anyhow::Result<Vec<QDatabaseSingleIdTableRow<V>>> {
         table.select_all_single_checkpointed_object(&self.session).await
     }
-    async fn db_select_many_single_checkpointed_object_values<V: CoreDatabaseValueDeserialize>(
+    async fn db_select_many_single_checkpointed_object_values<V: PsySerializeCanonicalAsyncSafe>(
         &self,
         table: &ScyllaGenericObjectSingleIdTablePreparedStatements,
         obj_ids: &[u64],
@@ -95,7 +95,7 @@ impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sy
             .await
     }
     async fn db_select_many_single_checkpointed_object_keys_and_values<
-        V: CoreDatabaseValueDeserialize,
+        V: PsySerializeCanonicalAsyncSafe,
         R: QDatabaseSingleIdTableRowCreatable<V> + Send + Sync,
     >(
         &self,
@@ -137,7 +137,7 @@ impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sy
         table.insert_many_single_checkpointed_objects_at_checkpoint_ffs_with_id_at_index(&self.session, object_size, object_id_location, checkpoint_id, rows).await
 
     }
-    async fn db_insert_one_single_checkpointed_object<V: Serialize + Send + Sync>(
+    async fn db_insert_one_single_checkpointed_object<V: PsySerializeCanonicalAsyncSafe>(
         &self,
         table: &ScyllaGenericObjectSingleIdTablePreparedStatements,
         obj_id: u64,
@@ -148,7 +148,7 @@ impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sy
             .insert_one_single_checkpointed_object(&self.session, obj_id, checkpoint_id, value)
             .await
     }
-    async fn db_insert_many_single_checkpointed_object_rows<V: Serialize + Send + Sync>(
+    async fn db_insert_many_single_checkpointed_object_rows<V: PsySerializeCanonicalAsyncSafe>(
         &self,
         table: &ScyllaGenericObjectSingleIdTablePreparedStatements,
         rows: &[QDatabaseSingleIdTableRow<V>],
@@ -156,7 +156,7 @@ impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sy
         table.insert_many_single_checkpointed_object_rows(&self.session, rows).await
     }
     async fn db_insert_many_single_checkpointed_object_rows_t<
-        V: Serialize + DeserializeOwned + Send + Sync,
+        V: PsySerializeCanonicalAsyncSafe,
         R: QDatabaseSingleIdTableRowLike<V> + Send + Sync,
     >(
         &self,
@@ -165,7 +165,7 @@ impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sy
     ) -> anyhow::Result<()> {
         table.insert_many_single_checkpointed_object_rows_t(&self.session, rows).await
     }
-    async fn db_insert_many_single_checkpointed_objects_at_checkpoint<V: Serialize + Send + Sync>(
+    async fn db_insert_many_single_checkpointed_objects_at_checkpoint<V: PsySerializeCanonicalAsyncSafe>(
         &self,
         table: &ScyllaGenericObjectSingleIdTablePreparedStatements,
         checkpoint_id: u64,
@@ -176,7 +176,7 @@ impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sy
             .await
     }
     async fn db_insert_many_single_checkpointed_objects_at_checkpoint_t<
-        V: Serialize + DeserializeOwned + Send + Sync,
+        V: PsySerializeCanonicalAsyncSafe,
         R: QDatabaseSingleIdTableRowNoCheckpointIdLike<V> + Send + Sync,
     >(
         &self,
@@ -194,7 +194,7 @@ impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sy
 impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
     CoreDatabaseDoubleIdCheckpointedReader<ScyllaGenericObjectDoubleIdTablePreparedStatements> for ScyllaCoreStore<Hash, Hasher>
 {
-    async fn db_select_one_double_checkpointed_object_value<V: CoreDatabaseValueDeserialize>(
+    async fn db_select_one_double_checkpointed_object_value<V: PsySerializeCanonicalAsyncSafe>(
         &self,
         table: &ScyllaGenericObjectDoubleIdTablePreparedStatements,
         obj_id: u64,
@@ -205,7 +205,7 @@ impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sy
             .select_one_double_checkpointed_object_value(&self.session, obj_id, secondary_id, max_checkpoint_id)
             .await
     }
-    async fn db_select_one_double_checkpointed_object_value_and_ids<V: CoreDatabaseValueDeserialize>(
+    async fn db_select_one_double_checkpointed_object_value_and_ids<V: PsySerializeCanonicalAsyncSafe>(
         &self,
         table: &ScyllaGenericObjectDoubleIdTablePreparedStatements,
         obj_id: u64,
@@ -217,7 +217,7 @@ impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sy
             .await
     }
     async fn db_select_one_double_checkpointed_object_value_and_ids_t<
-        V: CoreDatabaseValueDeserialize,
+        V: PsySerializeCanonicalAsyncSafe,
         R: QDatabaseDoubleIdTableRowCreatable<V> + Send + Sync,
     >(
         &self,
@@ -230,13 +230,13 @@ impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sy
             .select_one_double_checkpointed_object_value_and_ids_t(&self.session, obj_id, secondary_id, max_checkpoint_id)
             .await // Note: using the non-_t method, adjust if needed
     }
-    async fn db_select_all_double_checkpointed_object<V: CoreDatabaseValueDeserialize>(
+    async fn db_select_all_double_checkpointed_object<V: PsySerializeCanonicalAsyncSafe>(
         &self,
         table: &ScyllaGenericObjectDoubleIdTablePreparedStatements,
     ) -> anyhow::Result<Vec<QDatabaseDoubleIdTableRow<V>>> {
         table.select_all_double_checkpointed_object(&self.session).await
     }
-    async fn db_select_many_double_checkpointed_object_values<V: CoreDatabaseValueDeserialize>(
+    async fn db_select_many_double_checkpointed_object_values<V: PsySerializeCanonicalAsyncSafe>(
         &self,
         table: &ScyllaGenericObjectDoubleIdTablePreparedStatements,
         obj_ids: &[QDoubleIdKey],
@@ -247,7 +247,7 @@ impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sy
             .await
     }
     async fn db_select_many_double_checkpointed_object_keys_and_values<
-        V: CoreDatabaseValueDeserialize,
+        V: PsySerializeCanonicalAsyncSafe,
         R: QDatabaseDoubleIdTableRowCreatable<V> + Send + Sync,
     >(
         &self,
@@ -265,7 +265,7 @@ impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sy
 impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
     CoreDatabaseDoubleIdCheckpointedWriter<ScyllaGenericObjectDoubleIdTablePreparedStatements> for ScyllaCoreStore<Hash, Hasher>
 {
-    async fn db_insert_one_double_checkpointed_object<V: Serialize + Send + Sync>(
+    async fn db_insert_one_double_checkpointed_object<V: PsySerializeCanonicalAsyncSafe>(
         &self,
         table: &ScyllaGenericObjectDoubleIdTablePreparedStatements,
         obj_id: u64,
@@ -277,7 +277,7 @@ impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sy
             .insert_one_double_checkpointed_object(&self.session, obj_id, secondary_id, checkpoint_id, value)
             .await
     }
-    async fn db_insert_many_double_checkpointed_object_rows<V: Serialize + Send + Sync>(
+    async fn db_insert_many_double_checkpointed_object_rows<V: PsySerializeCanonicalAsyncSafe>(
         &self,
         table: &ScyllaGenericObjectDoubleIdTablePreparedStatements,
         rows: &[QDatabaseDoubleIdTableRow<V>],
@@ -285,7 +285,7 @@ impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sy
         table.insert_many_double_checkpointed_object_rows(&self.session, rows).await
     }
     async fn db_insert_many_double_checkpointed_object_rows_t<
-        V: Serialize + DeserializeOwned + Send + Sync,
+        V: PsySerializeCanonicalAsyncSafe,
         R: QDatabaseDoubleIdTableRowLike<V> + Send + Sync,
     >(
         &self,
@@ -294,7 +294,7 @@ impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sy
     ) -> anyhow::Result<()> {
         table.insert_many_double_checkpointed_object_rows_t(&self.session, rows).await
     }
-    async fn db_insert_many_double_checkpointed_objects_at_checkpoint<V: Serialize + Send + Sync>(
+    async fn db_insert_many_double_checkpointed_objects_at_checkpoint<V: PsySerializeCanonicalAsyncSafe>(
         &self,
         table: &ScyllaGenericObjectDoubleIdTablePreparedStatements,
         checkpoint_id: u64,
@@ -305,7 +305,7 @@ impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sy
             .await
     }
     async fn db_insert_many_double_checkpointed_objects_at_checkpoint_t<
-        V: Serialize + DeserializeOwned + Send + Sync,
+        V: PsySerializeCanonicalAsyncSafe,
         R: QDatabaseDoubleIdTableRowNoCheckpointIdLike<V> + Send + Sync,
     >(
         &self,
@@ -323,41 +323,41 @@ impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sy
 impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
     CoreDatabaseKivReader<ScyllaGenericKeyIdValueTablePreparedStatements> for ScyllaCoreStore<Hash, Hasher>
 {
-    async fn db_select_one_kiv_value<V: CoreDatabaseValueDeserialize>(
+    async fn db_select_one_kiv_value<V: PsySerializeCanonicalAsyncSafe>(
         &self,
         table: &ScyllaGenericKeyIdValueTablePreparedStatements,
         obj_id: u64,
     ) -> anyhow::Result<Option<V>> {
         table.select_one_kiv_value(&self.session, obj_id).await
     }
-    async fn db_select_one_kiv_value_and_ids<V: CoreDatabaseValueDeserialize>(
+    async fn db_select_one_kiv_value_and_ids<V: PsySerializeCanonicalAsyncSafe>(
         &self,
         table: &ScyllaGenericKeyIdValueTablePreparedStatements,
         obj_id: u64,
     ) -> anyhow::Result<Option<QDatabaseKeyIdValueTableRow<V>>> {
         table.select_one_kiv_value_and_ids(&self.session, obj_id).await
     }
-    async fn db_select_one_kiv_value_and_ids_t<V: CoreDatabaseValueDeserialize, R: QDatabaseKeyIdValueTableRowCreatable<V> + Send + Sync>(
+    async fn db_select_one_kiv_value_and_ids_t<V: PsySerializeCanonicalAsyncSafe, R: QDatabaseKeyIdValueTableRowCreatable<V> + Send + Sync>(
         &self,
         table: &ScyllaGenericKeyIdValueTablePreparedStatements,
         obj_id: u64,
     ) -> anyhow::Result<Option<R>> {
         table.select_one_kiv_value_and_ids_t(&self.session, obj_id).await
     }
-    async fn db_select_all_kiv<V: CoreDatabaseValueDeserialize>(
+    async fn db_select_all_kiv<V: PsySerializeCanonicalAsyncSafe>(
         &self,
         table: &ScyllaGenericKeyIdValueTablePreparedStatements,
     ) -> anyhow::Result<Vec<QDatabaseKeyIdValueTableRow<V>>> {
         table.select_all_kiv(&self.session).await
     }
-    async fn db_select_many_kiv_values<V: CoreDatabaseValueDeserialize>(
+    async fn db_select_many_kiv_values<V: PsySerializeCanonicalAsyncSafe>(
         &self,
         table: &ScyllaGenericKeyIdValueTablePreparedStatements,
         obj_ids: &[u64],
     ) -> anyhow::Result<Vec<Option<V>>> {
         table.select_many_kiv_values(&self.session, obj_ids).await
     }
-    async fn db_select_many_kiv_keys_and_values<V: CoreDatabaseValueDeserialize, R: QDatabaseKeyIdValueTableRowCreatable<V> + Send + Sync>(
+    async fn db_select_many_kiv_keys_and_values<V: PsySerializeCanonicalAsyncSafe, R: QDatabaseKeyIdValueTableRowCreatable<V> + Send + Sync>(
         &self,
         table: &ScyllaGenericKeyIdValueTablePreparedStatements,
         obj_ids: &[u64],
@@ -370,7 +370,7 @@ impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sy
 impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
     CoreDatabaseKivWriter<ScyllaGenericKeyIdValueTablePreparedStatements> for ScyllaCoreStore<Hash, Hasher>
 {
-    async fn db_insert_one_kiv<V: Serialize + Send + Sync>(
+    async fn db_insert_one_kiv<V: PsySerializeCanonicalAsyncSafe>(
         &self,
         table: &ScyllaGenericKeyIdValueTablePreparedStatements,
         obj_id: u64,
@@ -378,14 +378,14 @@ impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sy
     ) -> anyhow::Result<()> {
         table.insert_one_kiv(&self.session, obj_id, value).await
     }
-    async fn db_insert_many_kivs<V: Serialize + Send + Sync>(
+    async fn db_insert_many_kivs<V: PsySerializeCanonicalAsyncSafe>(
         &self,
         table: &ScyllaGenericKeyIdValueTablePreparedStatements,
         rows: &[QDatabaseKeyIdValueTableRow<V>],
     ) -> anyhow::Result<()> {
         table.insert_many_kivs(&self.session, rows).await
     }
-    async fn db_insert_many_kivs_t<V: Serialize + DeserializeOwned + Send + Sync, R: QDatabaseKeyIdValueTableRowLike<V> + Send + Sync>(
+    async fn db_insert_many_kivs_t<V: PsySerializeCanonicalAsyncSafe, R: QDatabaseKeyIdValueTableRowLike<V> + Send + Sync>(
         &self,
         table: &ScyllaGenericKeyIdValueTablePreparedStatements,
         rows: &[R],
