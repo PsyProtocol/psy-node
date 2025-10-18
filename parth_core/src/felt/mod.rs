@@ -11,7 +11,6 @@ use ts_rs::TS;
 use crate::{
     data::maybe_serialization::{MaybeBytemuck, MaybeSpeedy}, generic_traits::QNamedType, utils::QPGenRandom
 };
-use psy_serialize::PsySerializeCanonical;
 
 pub trait ToU64Value {
     fn to_u64_value(&self) -> u64;
