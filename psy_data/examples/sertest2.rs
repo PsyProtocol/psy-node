@@ -1,6 +1,7 @@
 use bytemuck::{Pod, Zeroable};
-use parth_core::{crypto::hash::traits::RandomHash, data::serializable::FastFixedSerializable, felt::FromPrimitiveValuesFelt, pgoldilocks::QHashOut, PF};
+use parth_core::{crypto::hash::traits::RandomHash, felt::FromPrimitiveValuesFelt, pgoldilocks::QHashOut, PF};
 use psy_data::v1::qdata::user::PQEDUserLeaf;
+use psy_serialize::FastFixedSerializable;
 
 #[inline(always)]
 pub fn test_a(x: PQEDUserLeaf<PF, QHashOut<PF>>) -> [u8; 104] {

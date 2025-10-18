@@ -1,6 +1,7 @@
 use criterion::{black_box, BenchmarkId, Criterion};
-use parth_core::{crypto::hash::traits::MerkleHasher, data::{hash::hash256::Hash256, maybe_serialization::MaybeSpeedy, serializable::FastFixedSerializable}, felt::{QFelt, QFelt64}, generic_traits::QNamedType, pgoldilocks::{PGoldilocksFelt, PGoldilocksHash, PoseidonHasher}, protocol::core_types::{QDBHashBase, QFHashBase, QHash256Base, QHashBase}, utils::QPGenRandom};
+use parth_core::{crypto::hash::traits::MerkleHasher, data::{hash::hash256::Hash256, maybe_serialization::MaybeSpeedy}, felt::{QFelt, QFelt64}, generic_traits::QNamedType, pgoldilocks::{PGoldilocksFelt, PGoldilocksHash, PoseidonHasher}, protocol::core_types::{QDBHashBase, QFHashBase, QHash256Base, QHashBase}, utils::QPGenRandom};
 use psy_data::v1::qdata::user::PQEDUserLeaf;
+use psy_serialize::FastFixedSerializable;
 
 use speedy::{Readable, Writable};
 trait BenchFastRand {

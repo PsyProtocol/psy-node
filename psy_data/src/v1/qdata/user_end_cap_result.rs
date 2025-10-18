@@ -1,4 +1,5 @@
-use parth_core::{crypto::hash::traits::FieldQHasher, data::serializable::{FastFixedSerializable, QPDSerializable}, felt::{QFelt, QFelt64, QFeltSized}, protocol::core_types::{Q256BitHash, QFHashBase, QHashBase}, utils::QPGenRandom};
+use parth_core::{crypto::hash::traits::FieldQHasher, data::serializable::{QPDSerializable}, felt::{QFelt, QFelt64, QFeltSized}, protocol::core_types::{Q256BitHash, QFHashBase, QHashBase}, utils::QPGenRandom};
+use psy_serialize::FastFixedSerializable;
 
 use crate::v1::qdata::ffs_sizes::PSY_OBJECT_FFS_SIZE_END_CAP_RESULT_COMPACT;
 

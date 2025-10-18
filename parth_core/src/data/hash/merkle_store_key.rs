@@ -1,5 +1,6 @@
-use crate::{data::{hash::merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}, serializable::{FastFixedSerializable, QPDSerializable, QPDSerializableFixed}}, protocol::core_types::Q256BitHash, utils::QPGenRandom};
+use crate::{data::{hash::merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}, serializable::{QPDSerializable, QPDSerializableFixed}}, protocol::core_types::Q256BitHash, utils::QPGenRandom};
 
+use psy_serialize::FastFixedSerializable;
 
 
 pub type QMerkleStoreZeroIdKey = SimpleMerkleNodeKey;

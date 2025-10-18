@@ -16,7 +16,7 @@ parth_node = []
 serialize_rkyv = ["dep:rkyv", "plonky2?/serialize_rkyv"]
 serialize_speedy = ["dep:speedy", "plonky2?/serialize_speedy"]
 serialize_postcard = ["dep:postcard"]
-serialize_bytemuck = ["dep:bytemuck", "plonky2/serialize_bytemuck"]
+serialize_bytemuck = ["dep:bytemuck", "plonky2/serialize_bytemuck", "psy_serialize/serialize_bytemuck"]
 
 [dependencies]
 anyhow     = { workspace = true }
@@ -46,6 +46,7 @@ plonky2 = { workspace = true, optional = true }
 
 # start local packages
 pser = { workspace = true }
+psy_serialize = { workspace = true }
 pderive = { workspace = true }
 cf_utils = { workspace = true }
 

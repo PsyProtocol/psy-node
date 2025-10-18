@@ -895,7 +895,7 @@ macro_rules! impl_bytemuck_ffs {
         #[cfg(all(target_endian = "little", feature = "serialize_bytemuck"))]
         impl<
             $($generic_param: $trait_bound + bytemuck::Pod + Copy),*
-        > parth_core::data::serializable::FastFixedSerializable<$size> for $struct_name<$($generic_param),*> {
+        > psy_serialize::FastFixedSerializable<$size> for $struct_name<$($generic_param),*> {
             #[inline(always)]
             fn ffs_try_from_slice(data: &[u8]) -> ::anyhow::Result<Self> {
                 bytemuck::try_from_bytes(data)
@@ -1036,7 +1036,7 @@ macro_rules! impl_bytemuck_ffs_tests {
         #[cfg(all(test, target_endian = "little", feature = "serialize_bytemuck"))]
         mod tests {
             use super::*;
-            use parth_core::data::serializable::FastFixedSerializable;
+            use psy_serialize::FastFixedSerializable;
             use parth_core::utils::QPGenRandom;
 
             const SIZE_OF_ITEM: usize = $size;

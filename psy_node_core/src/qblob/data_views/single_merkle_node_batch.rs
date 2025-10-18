@@ -1,10 +1,10 @@
 use parth_core::{
     data::{
         hash::{fast_node_serializer::QMS_FAST_SERIALIZER_SINGLE_ID_NODE_SIZE, merkle_store_key::QMerkleStoreSingleIdNode},
-        serializable::FastFixedSerializable,
     },
     protocol::core_types::Q256BitHash,
 };
+use psy_serialize::FastFixedSerializable;
 
 use crate::qblob::{
     blob_type::{QBlobDataType, QBlobMerkleNodeTreeType, QBLOB_STANDARD_V1_MAGIC_U32},

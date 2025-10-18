@@ -3,13 +3,14 @@ use std::fmt::Debug;
 
 use parth_core::{
     crypto::hash::traits::{FieldQHasher, QFieldHashable},
-    data::serializable::{FastFixedSerializable, QPDSerializable},
+    data::serializable::{QPDSerializable},
     felt::{QFelt, QFelt64, QFeltSized, ToQFelts},
     impl_psyser_for_ffs_with_params, impl_qpd_serialize_params,
     protocol::core_types::{Q256BitHash, QFHashBase, QHashBase},
     utils::QPGenRandom,
 };
 use pser::{QBytesDeserialize, QBytesSerialize};
+use psy_serialize::FastFixedSerializable;
 
 use crate::v1::qdata::ffs_sizes::PSY_OBJECT_FFS_SIZE_CONTRACT_LEAF;
 

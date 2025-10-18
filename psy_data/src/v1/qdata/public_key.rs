@@ -1,11 +1,12 @@
 use parth_core::{
     crypto::hash::traits::{FieldQHasher, MerkleHasher, QFieldHashable},
-    data::serializable::{FastFixedSerializable, QPDSerializable},
+    data::serializable::{ QPDSerializable},
     felt::QFelt64,
     impl_qpd_serialize_params,
     protocol::core_types::{Q256BitHash, QFHashBase, QHashBase}, utils::QPGenRandom,
 };
 use pser::{QBytesSerialize, QBytesDeserialize};
+use psy_serialize::FastFixedSerializable;
 
 use crate::v1::qdata::ffs_sizes::PSY_OBJECT_FFS_SIZE_ZK_PUBLIC_KEY;
 

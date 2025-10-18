@@ -1,6 +1,7 @@
-use parth_core::{data::serializable::FastFixedSerializable, protocol::core_types::Q256BitHash, utils::QPGenRandom, QJobIdSerialized};
+use parth_core::{protocol::core_types::Q256BitHash, utils::QPGenRandom, QJobIdSerialized};
 use psy_data::v1::qdata::ffs_sizes::PSY_OBJECT_FFS_SIZE_USER_UPDATE_METADATA;
 use parth_core::QJOB_ID_SERIALIZED_SIZE;
+use psy_serialize::FastFixedSerializable;
 
 
 

@@ -1,5 +1,6 @@
-use parth_core::{data::serializable::FastFixedSerializable, felt::ToU64Value, pgoldilocks::QHashOut, utils::QPGenRandom, PF};
+use parth_core::{felt::ToU64Value, pgoldilocks::QHashOut, utils::QPGenRandom, PF};
 use psy_data::v1::qdata::user::PQEDUserLeaf;
+use psy_serialize::FastFixedSerializable;
 
 
 fn main() {

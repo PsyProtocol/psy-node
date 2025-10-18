@@ -1,4 +1,5 @@
-use parth_core::{crypto::hash::traits::FromU64x4, data::serializable::FastFixedSerializable, felt::ToU64Value, protocol::core_types::Q256BitHash, utils::QPGenRandom, PF};
+use parth_core::{crypto::hash::traits::FromU64x4, felt::ToU64Value, protocol::core_types::Q256BitHash, utils::QPGenRandom, PF};
+use psy_serialize::FastFixedSerializable;
 
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, bytemuck::Pod, bytemuck::Zeroable)]

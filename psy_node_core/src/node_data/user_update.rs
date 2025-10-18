@@ -1,5 +1,6 @@
-use parth_core::{data::serializable::FastFixedSerializable, felt::QFelt64, protocol::core_types::Q256BitHash};
+use parth_core::{felt::QFelt64, protocol::core_types::Q256BitHash};
 use psy_data::v1::qdata::{ffs_sizes::{PSY_OBJECT_FFS_SIZE_USER_LEAF, PSY_OBJECT_FFS_SIZE_USER_UPDATE_METADATA}, user::PQEDUserLeaf};
+use psy_serialize::FastFixedSerializable;
 
 use crate::node_data::user_update_metadata::PsyNodeUserUpdateMetaData;
 // realm_id + unique_pending_id + metadata + user_leaf

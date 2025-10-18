@@ -1,5 +1,7 @@
-use parth_core::{crypto::hash::traits::{FieldQHasher, QFieldHashable}, data::serializable::{FastFixedSerializable, QPDSerializable}, felt::{QFelt, QFelt64, QFeltSized, ToQFelts, ZeroableFelt}, impl_qpd_serialize_params, protocol::core_types::{Q256BitHash, QFHashBase, QHashBase}, utils::QPGenRandom};
+use parth_core::{crypto::hash::traits::{FieldQHasher, QFieldHashable}, data::serializable::{QPDSerializable}, felt::{QFelt, QFelt64, QFeltSized, ToQFelts, ZeroableFelt}, impl_qpd_serialize_params, protocol::core_types::{Q256BitHash, QFHashBase, QHashBase}, utils::QPGenRandom};
 use pser::{QBytesDeserialize, QBytesSerialize};
+#[cfg(all(feature = "serialize_bytemuck", target_endian = "little"))]
+use psy_serialize::FastFixedSerializable;
 
 use crate::v1::qdata::ffs_sizes::PSY_OBJECT_FFS_SIZE_USER_LEAF;
 

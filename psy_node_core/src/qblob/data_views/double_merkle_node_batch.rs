@@ -1,7 +1,6 @@
 use parth_core::{
     data::{
         hash::{fast_node_serializer::QMS_FAST_SERIALIZER_DOUBLE_ID_NODE_SIZE, merkle_store_key::QMerkleStoreDoubleIdNode},
-        serializable::FastFixedSerializable,
     },
     protocol::core_types::Q256BitHash,
 };
@@ -14,6 +13,7 @@ use crate::qblob::{
     },
     traits::common::QBlobStructHeaderBase,
 };
+use psy_serialize::FastFixedSerializable;
 
 pub struct QBlobDoubleMerkleNodeBatchDataView {}
 

@@ -1,8 +1,9 @@
 use std::cmp::Ordering;
 
+use psy_serialize::FastFixedSerializable;
 use rand::Rng;
 
-use crate::{data::serializable::{FastFixedSerializable, QPDSerializable, QPDSerializableFixed}, protocol::core_types::Q256BitHash, utils::QPGenRandom};
+use crate::{data::serializable::{QPDSerializable, QPDSerializableFixed}, protocol::core_types::Q256BitHash, utils::QPGenRandom};
 pub const JOB_ID_EMPTY_REWARD_PATH_INFO: u64 = 0xFFFF_FFFF_FFFF_FFFFu64;
 
 #[pderive::serialize_copy_default_no_ord]
