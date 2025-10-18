@@ -65,8 +65,8 @@ psy_serialize::impl_psy_canonical_serialize_for_fixed_type!(Test123, 28);
 
 fn run_demo() -> anyhow::Result<()> {
     let t = Test123::qp_rand_gen_vec(1337);
-    let serialized = Test123::psydbser_serialize_vec_of_self_ref(&t, false);
-    let deserialized = Test123::psydbser_deserialize_vec_of_self(&serialized, false)?;
+    let serialized = Test123::psy_ser_serialize_vec_of_self_ref(&t, false);
+    let deserialized = Test123::psy_ser_deserialize_vec_of_self(&serialized, false)?;
     assert_eq!(t.len(), deserialized.len());
     for (original, deser) in t.iter().zip(deserialized.iter()) {
         assert_eq!(original.a, deser.a);

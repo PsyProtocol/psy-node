@@ -95,13 +95,13 @@ impl ScyllaBlobToBlobTablePreparedStatements {
     }
     pub async fn set_or_insert_one_qpk<K: QDatabasePrimitiveKey, V: QDatabasePrimitiveKey>(&self, session: Arc<Session>, obj_id: &K, value: &V) -> anyhow::Result<()> {
         session
-            .execute_unpaged(&self.insert_1_prepared, (obj_id.to_bytes()?, value.to_bytes()?))
+            .execute_unpaged(&self.insert_1_prepared, (obj_id.psy_ser_to_bytes_vec()?, value.psy_ser_to_bytes_vec()?))
             .await?;
         Ok(())
     }
     pub async fn select_one_single_qpk<K: QDatabasePrimitiveKey, V: QDatabasePrimitiveKey>(&self, session: Arc<Session>, obj_id: &K) -> anyhow::Result<Option<V>> {
         let res = session
-            .execute_unpaged(&self.select_value_1_prepared, (obj_id.to_bytes()?,))
+            .execute_unpaged(&self.select_value_1_prepared, (obj_id.psy_ser_to_bytes_vec()?,))
             .await?;
         let value = res.into_rows_result()?.maybe_first_row::<(Option<Vec<u8>>,)>()?.map(|(val,)| val);
         if value.is_none() {
@@ -112,7 +112,7 @@ impl ScyllaBlobToBlobTablePreparedStatements {
                 return Ok(None);
             }else{
                 let value = value.unwrap();
-                Ok(Some(V::from_bytes(&value)?))
+                Ok(Some(V::psy_ser_from_owned_bytes_vec(value)?))
             }
         }
     }
@@ -138,9 +138,9 @@ impl ScyllaBlobToBlobTablePreparedStatements {
             let mut value_chunk = Vec::with_capacity(chunk.len());
             for chk in chunk.iter() {
                 if swap_kv {
-                    value_chunk.push((chk.k2.to_bytes()?, chk.k1.to_bytes()?));
+                    value_chunk.push((chk.k2.psy_ser_to_bytes_vec()?, chk.k1.psy_ser_to_bytes_vec()?));
                 } else {
-                    value_chunk.push((chk.k1.to_bytes()?, chk.k2.to_bytes()?));
+                    value_chunk.push((chk.k1.psy_ser_to_bytes_vec()?, chk.k2.psy_ser_to_bytes_vec()?));
                 }
                 batch.append_statement(self.insert_1_statement.clone());
             }
@@ -213,7 +213,7 @@ impl ScyllaBlobToBlobTablePreparedStatements {
     }
     pub async fn select_many_values_qpk<K: QDatabasePrimitiveKey, V: QDatabasePrimitiveKey>(&self, session: Arc<Session>, obj_ids: &[K]) -> anyhow::Result<Vec<Option<V>>> {
         let mut results = Vec::with_capacity(obj_ids.len());
-        let obj_id_bytes: Vec<Vec<u8>> = obj_ids.iter().map(|k| k.to_bytes()).collect::<Result<_, _>>()?;
+        let obj_id_bytes: Vec<Vec<u8>> = obj_ids.iter().map(|k| k.psy_ser_to_bytes_vec()).collect::<Result<_, _>>()?;
         for chunk in obj_id_bytes.chunks(SELECT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE) {
             let futures: Vec<_> = chunk
                 .iter()
@@ -225,7 +225,7 @@ impl ScyllaBlobToBlobTablePreparedStatements {
                         let rows = res.into_rows_result()?;
                         if let Some(row) = rows.maybe_first_row::<(Option<Vec<u8>>,)>()? {
                             match row.0 {
-                                Some(v) => anyhow::Ok(Some(V::from_bytes(&v)?),),
+                                Some(v) => anyhow::Ok(Some(V::psy_ser_from_owned_bytes_vec(v)?),),
                                 None => Ok(None),
                             }
                         } else {
@@ -250,13 +250,13 @@ impl ScyllaBlobToBlobTablePreparedStatements {
                     let session = session.clone();
                     let prep = self.select_value_1_prepared.clone();
                     async move {
-                        let res = session.execute_unpaged(&prep, (key.to_bytes()?,)).await?;
+                        let res = session.execute_unpaged(&prep, (key.psy_ser_to_bytes_vec()?,)).await?;
                         let rows = res.into_rows_result()?;
                         if let Some(row) = rows.maybe_first_row::<(Option<Vec<u8>>,)>()? {
                             match row.0 {
                                 Some(v) => anyhow::Ok(Some(BiDirectionalMappingRow{
                                     k1: key.clone(),
-                                    k2: V::from_bytes(&v)?
+                                    k2: V::psy_ser_from_owned_bytes_vec(v)?
                             }),),
                                 None => Ok(None),
                             }

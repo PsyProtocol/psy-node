@@ -1,6 +1,6 @@
 use paste::paste;
 
-use crate::FastFixedSerializable;
+use crate::{AutoDatabaseSerializationUseFastFixedSerialize, FastFixedSerializable, PsyCanonicalSerializeMetadata};
 
 pub const CONST_FFS_PRIMITIVES_ENABLED: bool = true;
 
@@ -12,6 +12,18 @@ macro_rules! impl_ffs_for_primitive {
             const fn assert_pod<T: bytemuck::Pod>() {}
             assert_pod::<$ty>();
         };
+
+        impl PsyCanonicalSerializeMetadata for $ty {
+            const IS_FIXED_SIZE: bool = true;
+            const FIXED_SIZE: usize = $size;
+        }
+        impl AutoDatabaseSerializationUseFastFixedSerialize<$size> for $ty {}
+
+        crate::impl_psy_canonical_serialize_for_fixed_type_crate!(
+            $ty,
+            $size
+        );
+
         impl FastFixedSerializable<$size> for $ty {
             #[inline(always)]
             fn ffs_from_owned_bytes(data: [u8; $size]) -> Self {
@@ -278,4 +290,18 @@ impl<const N: usize> FastFixedSerializable<N> for [u8; N] {
             .collect();
         Ok(vec_of_arrays)
     }
+}
+
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_ffs_u32() {
+        use crate::FastFixedSerializable;
+        let values: Vec<u32> = vec![1, 256, 65536, 4294967295];
+        let result_bytes = u32::ffs_serialize_vec_of_self_ref(&values);
+        let deserialized_values = u32::ffs_deserialize_vec_of_self(&result_bytes).unwrap();
+        assert_eq!(values, deserialized_values);
+    }
+
 }

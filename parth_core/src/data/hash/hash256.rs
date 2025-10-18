@@ -1,15 +1,13 @@
 use std::fmt::Display;
 
 use hex::FromHexError;
+use psy_serialize::{impl_psy_canonical_serialize_for_fixed_type, AutoDatabaseSerializationUseFastFixedSerialize, FastFixedSerializable, PsyCanonicalDatabaseSerializeBaseSingle, PsyCanonicalDatabaseSerializeFixedBase, PsyCanonicalSerializeMetadata, PsySerializeCanonical};
 use rand::RngCore;
 use serde_with::serde_as;
 use ts_rs::TS;
 
 use crate::{
-    generic_traits::QStaticNamedType,
-    crypto::hash::traits::{CodeSerializableHash, FromU64x4, HashTo4Felts, RandomHash, ToU64x4, ZeroableHash},
-    data::serializable::{QPDSerializable, QPDSerializableFixed},
-    protocol::core_types::{Q256BitHash, Q256BitHashTransparent, QHashBase},
+    crypto::hash::traits::{CodeSerializableHash, FromU64x4, HashTo4Felts, RandomHash, ToU64x4, ZeroableHash}, data::serializable::{QPDSerializable, QPDSerializableFixed}, generic_traits::QStaticNamedType, protocol::core_types::{Q256BitHash, Q256BitHashTransparent, QHashBase}, utils::debug_code_string::QToCodeString
 };
 
 #[serde_as]
@@ -206,6 +204,101 @@ impl QStaticNamedType for Hash256 {
         "Hash256"
     }
 }
+
+impl FastFixedSerializable<32> for Hash256 {
+    fn ffs_from_owned_bytes(data: [u8; 32]) -> Self {
+        Self(data)
+    }
+
+    fn ffs_from_slice_or_panic(data: &[u8]) -> Self {
+        if data.len() != 32 {
+            panic!("Invalid number of bytes for Hash256");
+        }
+        let mut array = [0u8; 32];
+        array.copy_from_slice(data);
+        Self(array)
+    }
+
+    fn ffs_try_from_slice(data: &[u8]) -> anyhow::Result<Self> {
+        if data.len() != 32 {
+            anyhow::bail!("Invalid number of bytes for Hash256");
+        }
+        let mut array = [0u8; 32];
+        array.copy_from_slice(data);
+        Ok(Self(array))
+    }
+
+    fn ffs_to_bytes(&self) -> [u8; 32] {
+        self.0
+    }
+
+    fn ffs_into_bytes(self) -> [u8; 32] {
+        self.0
+    }
+
+    #[inline]
+    fn write_ffs_serialize_vec_of_self(data: &[Self], bytes: &mut Vec<u8>) {
+        for item in data {
+            bytes.extend_from_slice(&item.ffs_to_bytes());
+        }
+    }
+
+    #[inline]
+    fn ffs_serialize_vec_of_self_ref(data: &[Self]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(32 * data.len());
+        for item in data {
+            bytes.extend_from_slice(&item.0);
+        }
+        bytes
+    }
+
+    #[inline]
+    fn ffs_serialize_vec_of_self(data: Vec<Self>) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(data.len() * 32);
+        for item in data {
+            bytes.extend_from_slice(&item.ffs_to_bytes());
+        }
+        bytes
+    }
+
+    #[inline]
+    fn ffs_deserialize_vec_of_self(data: &[u8]) -> anyhow::Result<Vec<Self>> {
+        if data.len() % 32 != 0 {
+            anyhow::bail!("Data length {} is not a multiple of object size {}", data.len(), 32);
+        }
+
+        let mut new_vec = Vec::with_capacity(data.len() / 32);
+        let count = data.len() / 32;
+        for i in 0..count {
+            new_vec.push(Self( data[(i*32)..(i*32+32)].try_into().unwrap()));
+        }
+        Ok(new_vec)
+    }
+
+    #[inline]
+    fn ffs_deserialize_vec_of_self_owned(data: Vec<u8>) -> anyhow::Result<Vec<Self>> {
+        Self::ffs_deserialize_vec_of_self(&data)
+    }
+}
+impl PsyCanonicalSerializeMetadata for Hash256 {
+    const IS_FIXED_SIZE: bool = true;
+    const FIXED_SIZE: usize = 32;
+}
+impl AutoDatabaseSerializationUseFastFixedSerialize<32> for Hash256 {}
+
+psy_serialize::impl_psy_canonical_serialize_for_fixed_type!(
+    Hash256,
+    32
+);
+
+
+pser::impl_bytemuck_ffs_tests!(Hash256, {}, 32, true);
+
 impl QHashBase for Hash256 {}
 
 
+impl QToCodeString for Hash256 {
+    fn to_debug_code_string(&self) -> String {
+        format!("Hash256::from_hex_string(\"{}\").unwrap()", self.to_hex_string())
+    }
+}

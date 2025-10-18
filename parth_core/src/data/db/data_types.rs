@@ -1,3 +1,4 @@
+use psy_serialize::PsySerializeCanonical;
 use serde::{de::DeserializeOwned, Serialize};
 use std::hash::Hash;
 
@@ -10,8 +11,8 @@ pub trait CoreDatabaseValueDeserialize: DeserializeOwned + Send + Sync + Seriali
 impl<V: DeserializeOwned + Send + Sync + Serialize + PartialEq + Clone> CoreDatabaseValueDeserialize for V {
 
 }
-pub trait QDatabasePrimitiveKey: Send + Sync + Copy + Eq + PartialEq + Ord + PartialOrd + Clone + Hash + serde::Serialize + serde::de::DeserializeOwned + QPDSerializable + QPDSerializableFixed {}
-impl<T: Send + Sync + Copy + Eq + PartialEq + Ord + PartialOrd + Clone + Hash + serde::Serialize + serde::de::DeserializeOwned + QPDSerializable + QPDSerializableFixed> QDatabasePrimitiveKey for T {}
+pub trait QDatabasePrimitiveKey: Send + Sync + Copy + Eq + PartialEq + Ord + PartialOrd + Clone + Hash + PsySerializeCanonical{}
+impl<T: Send + Sync + Copy + Eq + PartialEq + Ord + PartialOrd + Clone + Hash + PsySerializeCanonical> QDatabasePrimitiveKey for T {}
 
 
 #[pderive::serialize_copy]

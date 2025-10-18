@@ -5,7 +5,7 @@ use crate::PsyCanonicalDatabaseSerializeBaseSingle;
 
 pub trait PsyCanonicalDatabaseSerializeBaseMulti: PsyCanonicalDatabaseSerializeBaseSingle {
     #[inline]
-    fn psydbser_serialize_vec_of_self_ref(data: &[Self], write_fixed_items_count: bool) -> Vec<u8> {
+    fn psy_ser_serialize_vec_of_self_ref(data: &[Self], write_fixed_items_count: bool) -> Vec<u8> {
         if data.is_empty() {
             return Vec::new();
         } else {
@@ -14,14 +14,14 @@ pub trait PsyCanonicalDatabaseSerializeBaseMulti: PsyCanonicalDatabaseSerializeB
     }
 
     #[inline]
-    fn psydbser_serialize_vec_of_self(data: Vec<Self>, write_fixed_items_count: bool) -> Vec<u8> {
+    fn psy_ser_serialize_vec_of_self(data: Vec<Self>, write_fixed_items_count: bool) -> Vec<u8> {
         if data.is_empty() {
             return Vec::new();
         } else {
             Self::pio_write_many_to_bytes(&data, write_fixed_items_count).expect("Failed to serialize vec of self")
         }
     }
-    fn psydbser_deserialize_vec_of_self(data: &[u8], include_size_for_fixed: bool) -> anyhow::Result<Vec<Self>> {
+    fn psy_ser_deserialize_vec_of_self(data: &[u8], include_size_for_fixed: bool) -> anyhow::Result<Vec<Self>> {
         if data.is_empty() {
             return Ok(Vec::new());
         }
@@ -50,15 +50,15 @@ pub trait PsyCanonicalDatabaseSerializeBaseMulti: PsyCanonicalDatabaseSerializeB
         Self::pio_read_many_from_ref_bytes(data, known_sz, include_size_for_fixed)
     }
     #[inline]
-    fn psydbser_deserialize_vec_of_self_owned(data: Vec<u8>, include_size_for_fixed: bool) -> anyhow::Result<Vec<Self>> {
-        Self::psydbser_deserialize_vec_of_self(&data, include_size_for_fixed)
+    fn psy_ser_deserialize_vec_of_self_owned(data: Vec<u8>, include_size_for_fixed: bool) -> anyhow::Result<Vec<Self>> {
+        Self::psy_ser_deserialize_vec_of_self(&data, include_size_for_fixed)
     }
 }
 
 
 pub trait PsyCanonicalDatabaseSerializeBaseMultiFixedTemplate<const N: usize>: Sized {
-    fn fx_tpl_psydbser_serialize_vec_of_self_ref(data: &[Self], write_fixed_items_count: bool) -> Vec<u8>;
-    fn fx_tpl_psydbser_serialize_vec_of_self(data: Vec<Self>, write_fixed_items_count: bool) -> Vec<u8>;
-    fn fx_tpl_psydbser_deserialize_vec_of_self(data: &[u8], include_size_for_fixed: bool) -> anyhow::Result<Vec<Self>>;
-    fn fx_tpl_psydbser_deserialize_vec_of_self_owned(data: Vec<u8>, include_size_for_fixed: bool) -> anyhow::Result<Vec<Self>>;
+    fn fx_tpl_psy_ser_serialize_vec_of_self_ref(data: &[Self], write_fixed_items_count: bool) -> Vec<u8>;
+    fn fx_tpl_psy_ser_serialize_vec_of_self(data: Vec<Self>, write_fixed_items_count: bool) -> Vec<u8>;
+    fn fx_tpl_psy_ser_deserialize_vec_of_self(data: &[u8], include_size_for_fixed: bool) -> anyhow::Result<Vec<Self>>;
+    fn fx_tpl_psy_ser_deserialize_vec_of_self_owned(data: Vec<u8>, include_size_for_fixed: bool) -> anyhow::Result<Vec<Self>>;
 }

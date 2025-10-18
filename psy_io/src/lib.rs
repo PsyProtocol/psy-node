@@ -34,7 +34,7 @@ impl Error for IoError {
     }
 }
 
-
+/* 
 
 #[inline(always)]
 pub fn p_write_varuint<W: Write>(mut n: usize, writer: &mut W) -> anyhow::Result<()> {
@@ -77,8 +77,30 @@ pub const fn p_varuint_size(n: usize) -> usize {
     let bits = usize::BITS - n.leading_zeros();
     (bits as usize + 6) / 7
 }
+*/
 
 
+// we will make these u32s for simplicity and speed
+#[inline(always)]
+pub fn p_write_varuint<W: Write>(n: usize, writer: &mut W) -> anyhow::Result<()> {
+    if n >= u32::MAX as usize {
+        anyhow::bail!("Size too large to write as varuint u32, {}", n);
+    }
+    writer.write_all(&(n as u32).to_le_bytes()).context("Failed to write multi-byte varint")
+}
+
+#[inline(always)]
+pub fn p_read_varuint<R: Read>(reader: &mut R) -> anyhow::Result<usize> {
+    let mut buf = [0u8; 4];
+    reader.read_exact(&mut buf).context("Failed to read varint bytes from stream")?;
+    let n_u32 = u32::from_le_bytes(buf);
+    Ok(n_u32 as usize)
+}
+
+#[inline(always)]
+pub const fn p_varuint_size(_n: usize) -> usize {
+    4
+}
 pub const PSY_IO_FIXED_ITEMS_MANY_COUNT_SIZE: usize = 4;
 
 #[inline(always)]
@@ -98,4 +120,45 @@ pub fn p_read_fixed_items_many_count<R: Read>(reader: &mut R) -> anyhow::Result<
 }
 pub fn p_fixed_items_count_many_size() -> usize {
     PSY_IO_FIXED_ITEMS_MANY_COUNT_SIZE
+}
+
+#[cfg(test)]
+mod tests {
+    // test varuint write and read
+    use super::*;
+    use std::io::Cursor;
+    #[test]
+    fn test_varuint() {
+        let test_values = [0usize, 1, 127, 128, 255, 300, 16384, 2097151, 268435455, usize::MAX, 1338, 2];
+        for &value in &test_values {
+            let mut buf = Vec::new();
+            p_write_varuint(value, &mut buf).expect("Failed to write varuint");
+            let mut cursor = Cursor::new(buf);
+            let read_value = p_read_varuint(&mut cursor).expect("Failed to read varuint");
+            assert_eq!(value, read_value, "Mismatch for value {}", value);
+        }
+        let mut buf = Vec::<u8>::new();
+        let mut cursor = Cursor::new(&buf);
+        p_write_varuint(2, &mut buf).unwrap();
+        p_write_varuint(76, &mut buf).unwrap();
+        buf.write_all(&[1u8; 76]).unwrap(); // padding
+        p_write_varuint(76, &mut buf).unwrap();
+        buf.write_all(&[2u8; 76]).unwrap(); // padding
+
+        let mut cursor = Cursor::new(&buf);
+        let v1 = p_read_varuint(&mut cursor).unwrap();
+        assert_eq!(v1, 2);
+        let v2 = p_read_varuint(&mut cursor).unwrap();
+        assert_eq!(v2, 76);
+        let mut padding1 = vec![0u8; 76];
+        cursor.read_exact(&mut padding1).unwrap();
+        assert_eq!(padding1, vec![1u8; 76]);
+        let v3 = p_read_varuint(&mut cursor).unwrap();
+        assert_eq!(v3, 76);
+        let mut padding2 = vec![0u8; 76];
+        cursor.read_exact(&mut padding2).unwrap();
+        assert_eq!(padding2, vec![2u8; 76]);
+
+        
+    }
 }

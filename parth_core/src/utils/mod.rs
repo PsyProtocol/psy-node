@@ -1,7 +1,7 @@
 use rand::{Rng, RngCore};
 
 use crate::{crypto::hash::traits::RandomHash, data::hash::hash256::Hash256};
-
+pub mod debug_code_string;
 pub mod math;
 pub mod auto_implement;
 pub mod signed_helpers;
