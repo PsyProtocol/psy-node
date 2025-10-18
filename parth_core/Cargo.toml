@@ -6,7 +6,7 @@ version = "0.1.0"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [features]
 default = ["rand", "std", "parth_node", "ptypes_goldilocks_qhashout", "serialize_bytemuck", "serialize_rkyv", "serialize_speedy"]
-std = []
+std = ["psy_io/std"]
 proof_hasher_plonky2_goldilocks = ["ptypes_goldilocks_qhashout"]
 ptypes_goldilocks_qhashout = ["goldilocks"]
 goldilocks = ["plonky2"]
@@ -34,6 +34,7 @@ auto_impl = { workspace = true }
 strum = { workspace = true }
 strum_macros = { workspace = true }
 ts-rs = { workspace = true }
+psy_io = { workspace = true, default-features = false }
 
 
 rand = { workspace = true, optional = true }

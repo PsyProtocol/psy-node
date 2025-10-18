@@ -1,0 +1,19 @@
+[package]
+edition = "2021"
+name    = "psy_serialize"
+version = "0.1.0"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[features]
+default = ["std", "serialize_bytemuck"]
+std = []
+serialize_bytemuck = ["dep:bytemuck"]
+
+
+[dependencies]
+anyhow     = { workspace = true }
+bytemuck = { workspace = true, optional = true }
+
+# workspace dependencies
+psy_io = { workspace = true }

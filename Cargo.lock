@@ -778,6 +778,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d"
 
 [[package]]
+name = "embedded-io"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9eb1aa714776b75c7e67e1da744b81a129b3ff919c8712b5e1b32252c1f07cc7"
+
+[[package]]
+name = "embedded-io-async"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2564b9f813c544241430e147d8bc454815ef9ac998878d30cc3055449f7fd4c0"
+dependencies = [
+ "embedded-io 0.7.1",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1601,6 +1616,7 @@ dependencies = [
  "plonky2",
  "postcard",
  "pser",
+ "psy_io",
  "rand 0.8.5",
  "rkyv",
  "serde",
@@ -2022,6 +2038,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "psy_io"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "embedded-io 0.7.1",
+ "embedded-io-async",
+ "hex",
+ "hex-literal",
+]
+
+[[package]]
 name = "psy_node_common"
 version = "0.1.0"
 dependencies = [
@@ -2172,6 +2199,15 @@ dependencies = [
  "serde_json",
  "serde_repr",
  "serde_with",
+]
+
+[[package]]
+name = "psy_serialize"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "psy_io",
 ]
 
 [[package]]

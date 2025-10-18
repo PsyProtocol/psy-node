@@ -120,6 +120,11 @@ pub trait FastFixedSerializable<const N: usize>: Sized {
     fn ffs_to_bytes(&self) -> [u8; N];
     fn ffs_into_bytes(self) -> [u8; N];
 
+    fn write_ffs_serialize_vec_of_self(data: &[Self], bytes: &mut Vec<u8>) {
+        for item in data {
+            bytes.extend_from_slice(&item.ffs_to_bytes());
+        }
+    }
 
     fn ffs_serialize_vec_of_self_ref(data: &[Self]) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(data.len() * N);

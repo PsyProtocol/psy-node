@@ -1,6 +1,8 @@
 [workspace]
 members = [
     "cf_utils",
+    "psy_io",
+    "psy_serialize",
     "pser",
     "pderive",
     "parth_core",
@@ -74,6 +76,8 @@ rkyv = { version = "0.8.12" }
 log = { version = "0.4.14", default-features = false }
 env_logger = { version = "0.11", default-features = false }
 hashbrown = "0.14.5"
+embedded-io = "0.7.0"
+embedded-io-async = "0.7.0"
 
 ts-rs = "10.1.0"
 k256 = { version = "0.13.2", features = [
@@ -126,6 +130,8 @@ cf_utils = { path = "./cf_utils" }
 
 pser = { path = "./pser" }
 pderive = { path = "./pderive" }
+psy_io = { path = "./psy_io" }
+psy_serialize = { path = "./psy_serialize" }
 
 parth_core = { path = "./parth_core" }
 parth_common = { path = "./parth_common" }
