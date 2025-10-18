@@ -18,40 +18,39 @@ impl<const SIZE: usize, T: PsySerializeCanonical + PsySerializeCanonicalFixedOnl
 // Fallback trait incase the serializer of choice is not implemented
 // It MUST produce the same output as PsySerializeCanonical
 pub trait FallbackPsySerializeCanonical: PsyCanonicalSerializeMetadata + Sized {
-    fn fallback_psy_ser_from_slice(data: &[u8]) -> anyhow::Result<Self>;
-    fn fallback_psy_ser_to_bytes_vec(&self) -> anyhow::Result<Vec<u8>>;
-    fn fallback_psy_ser_serialized_size(&self) -> usize {
-        self.fallback_psy_ser_to_bytes_vec().unwrap().len()
-    }
+    fn fallback_psy_ser_serialized_size(&self) -> usize;
+    fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()>;
+    fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self>;
 }
 
 pub trait AutoImplementFallbackPsySerializeCanonical: FallbackPsySerializeCanonical {}
 
 impl<T: AutoImplementFallbackPsySerializeCanonical> PsyIOReadWrite for T {
+    #[inline(always)]
     fn pio_serialized_size(&self) -> usize {
         self.fallback_psy_ser_serialized_size()
     }
 
+    #[inline(always)]
     fn pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
-        let bytes = self.fallback_psy_ser_to_bytes_vec()?;
-        writer.write_all(&bytes)?;
-        Ok(())
+       self.fallback_pio_write_to_io(writer)
     }
 
+    #[inline(always)]
     fn pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
-        let mut buf = Vec::new();
-        reader.read_to_end(&mut buf)?;
-        Self::fallback_psy_ser_from_slice(&buf)
+        Self::fallback_pio_read_from_io(reader)
     }
 }
 
 impl<T: AutoImplementFallbackPsySerializeCanonical> PsyCanonicalDatabaseSerializeBaseSingle for T {
     fn psy_ser_from_slice(data: &[u8]) -> anyhow::Result<Self> {
-        Self::fallback_psy_ser_from_slice(data)
+        Self::fallback_pio_read_from_io(&mut &data[..])
     }
 
     fn psy_ser_to_bytes_vec(&self) -> anyhow::Result<Vec<u8>> {
-        self.fallback_psy_ser_to_bytes_vec()
+        let mut data = Vec::<u8>::with_capacity(self.pio_serialized_size());
+        self.pio_write_to_io(&mut data)?;
+        Ok(data)
     }
 }
 impl<T: AutoImplementFallbackPsySerializeCanonical> PsyCanonicalDatabaseSerializeBaseMulti for T {}
@@ -59,6 +58,8 @@ impl<T: AutoImplementFallbackPsySerializeCanonical> PsyCanonicalDatabaseSerializ
 
 #[cfg(test)]
 mod tests {
+    use psy_io::p_varuint_size;
+
     use crate::{AutoImplementFallbackPsySerializeCanonical, FallbackPsySerializeCanonical, PsyCanonicalDatabaseSerializeBaseMulti, PsyCanonicalSerializeMetadata};
 
     struct ExampleFallbackStruct {
@@ -70,28 +71,28 @@ mod tests {
         const FIXED_SIZE: usize = 0;
     }
     impl FallbackPsySerializeCanonical for ExampleFallbackStruct {
-        fn fallback_psy_ser_from_slice(data: &[u8]) -> anyhow::Result<Self> {
-            if data.len() < 4 {
-                anyhow::bail!("Data too short to contain u32");
-            }
-            let a_len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
-            if data.len() < 4 + a_len + 4 {
-                anyhow::bail!("Data too short to contain a and b");
-            }
-            let a = data[4..4+a_len].to_vec();
-            let b = u32::from_le_bytes(data[4+a_len..4+a_len+4].try_into().unwrap());
-            Ok(ExampleFallbackStruct { a, b })
-        }
-
-        fn fallback_psy_ser_to_bytes_vec(&self) -> anyhow::Result<Vec<u8>> {
-            let mut bytes = Vec::with_capacity(4 + self.a.len() + 4);
-            bytes.extend_from_slice(&(self.a.len() as u32).to_le_bytes());
-            bytes.extend_from_slice(&self.a);
-            bytes.extend_from_slice(&self.b.to_le_bytes());
-            Ok(bytes)
-        }
+        
         fn fallback_psy_ser_serialized_size(&self) -> usize {
             4 + self.a.len() + 4
+        }
+        
+        fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
+            psy_io::p_write_inner_vec_size(self.a.len(), writer)?;
+            writer.write_all(&self.a)?;
+            writer.write_all(&self.b.to_le_bytes())?;
+            Ok(())
+        }
+        
+        fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
+            let mut data = [0u8; 4];
+            reader.read_exact(&mut data)?;
+            let a_len = u32::from_le_bytes(data) as usize;
+            let mut a = vec![0u8; a_len];
+            reader.read_exact(&mut a)?;
+            let mut b_data = [0u8; 4];
+            reader.read_exact(&mut b_data)?;
+            let b = u32::from_le_bytes(b_data);
+            Ok(ExampleFallbackStruct { a, b })
         }
     }
     impl AutoImplementFallbackPsySerializeCanonical for ExampleFallbackStruct {}

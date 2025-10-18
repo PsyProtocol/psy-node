@@ -1,9 +1,9 @@
-use psy_io::{p_read_fixed_items_many_count, p_read_varuint, p_varuint_size, p_write_fixed_items_manycount, p_write_varuint, PSY_IO_FIXED_ITEMS_MANY_COUNT_SIZE};
+use psy_io::{p_read_fixed_items_many_count, p_read_varuint, p_varuint_size, p_write_fixed_items_manycount, p_write_varuint, PsyIOReadableCanonicalStruct, PsyIOWritableCanonicalStruct, PsyReaderExtensions, PsyWriterExtensions, PSY_IO_FIXED_ITEMS_MANY_COUNT_SIZE};
 
 use crate::PsyCanonicalSerializeMetadata;
 
 
-pub trait PsyIOReadWrite: PsyCanonicalSerializeMetadata + Sized {
+pub trait PsyIOReadWrite: PsyCanonicalSerializeMetadata + PsyIOReadableCanonicalStruct + PsyIOWritableCanonicalStruct +Sized {
     fn pio_serialized_size(&self) -> usize;
 
     fn pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()>;
@@ -30,15 +30,21 @@ pub trait PsyIOReadWrite: PsyCanonicalSerializeMetadata + Sized {
         } else {
             p_write_varuint(items.len(), writer)?;
             for item in items {
-                let size = item.pio_serialized_size();
-                p_write_varuint(size, writer)?;
                 item.pio_write_to_io(writer)?;
             }
             Ok(())
         }
     }
     #[inline(always)]
-    fn pio_read_from_io_many<R: psy_io::Read>(reader: &mut R, known_size: Option<usize>, include_size_for_fixed: bool) -> anyhow::Result<Vec<Self>> {
+    fn pio_read_from_io_many<R: psy_io::Read>(reader: &mut R, known_count: Option<usize>) -> anyhow::Result<Vec<Self>> {
+        if known_count.is_some() {
+            let known_size = known_count.unwrap();
+            if known_size > Self::psy_io_max_vec_length() {
+                anyhow::bail!("Known size {} exceeds maximum allowed length {}", known_size, Self::psy_io_max_vec_length());
+            }
+            let mut items = Vec::with_capacity(known_size);
+        }
+        
         if !include_size_for_fixed && known_size.is_none() && Self::IS_FIXED_SIZE {
             anyhow::bail!("Cannot read fixed size items without known size if include_size_for_fixed is false");
         }
@@ -84,13 +90,13 @@ pub trait PsyIOReadWrite: PsyCanonicalSerializeMetadata + Sized {
 
             for item in items {
                 let item_size = item.pio_serialized_size();
-                total_size += p_varuint_size(item_size) + item_size;
+                total_size += item_size;
             }
             total_size
         }
     }
     #[inline]
-    fn pio_read_many_from_ref_bytes(data: &[u8], known_size: Option<usize>, include_size_for_fixed: bool) -> anyhow::Result<Vec<Self>> {
+    fn pio_read_many_from_ref_bytes(data: &[u8], known_count: Option<usize>) -> anyhow::Result<Vec<Self>> {
         if data.is_empty() {
             return Ok(Vec::new());
         }
@@ -120,7 +126,7 @@ pub trait PsyIOReadWrite: PsyCanonicalSerializeMetadata + Sized {
         }
 
         let mut cursor = psy_io::Cursor::new(data);
-        Self::pio_read_from_io_many(&mut cursor, known_size, include_size_for_fixed)
+        Self::pio_read_from_io_many(&mut cursor, known_size)
     }
     #[inline]
     fn pio_write_many_to_bytes(items: &[Self], write_fixed_items_count: bool) -> anyhow::Result<Vec<u8>> {

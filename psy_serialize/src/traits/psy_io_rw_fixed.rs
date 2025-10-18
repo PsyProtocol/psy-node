@@ -1,4 +1,5 @@
-use psy_io::{p_read_fixed_items_many_count, p_write_fixed_items_manycount, PSY_IO_FIXED_ITEMS_MANY_COUNT_SIZE};
+use anyhow::Context;
+use psy_io::{p_read_fixed_items_many_count, p_write_fixed_items_manycount, PsyIOReadableFixedSizeCanonicalStruct, PsyIOWritableCanonicalStruct, PSY_IO_FIXED_ITEMS_MANY_COUNT_SIZE, PsyReaderExtensions, PsyWriterExtensions};
 
 use crate::{FastFixedSerializable, PsyCanonicalSerializeMetadata};
 
@@ -38,32 +39,28 @@ pub trait PsyIOReadWriteFixedTemplate<const N: usize>: PsyCanonicalSerializeMeta
         Ok(())
     }
 
+
     #[inline]
     fn fx_tpl_pio_read_from_io_many<R: psy_io::Read>(
         reader: &mut R,
         known_size: Option<usize>,
-        include_size_for_fixed: bool,
     ) -> anyhow::Result<Vec<Self>> {
-        if !include_size_for_fixed && known_size.is_none() {
-            anyhow::bail!("Cannot read fixed size items without known size if include_size_for_fixed is false");
-        }
-        let len = if let Some(size) = known_size {
-            if include_size_for_fixed {
-                let read_size = p_read_fixed_items_many_count(reader)?;
-                if read_size != size {
-                    anyhow::bail!("Mismatched fixed items count: expected {}, got {}", size, read_size);
-                }
+        let length = match known_size {
+            Some(len) => {
+                len
+            },
+            None => {
+                reader.psy_read_vec_length()?
             }
-            size
-        } else {
-            p_read_fixed_items_many_count(reader)?
         };
-        let mut items = Vec::with_capacity(len);
-        for _ in 0..len {
-            let item = Self::fx_tpl_pio_read_from_io(reader)?;
-            items.push(item);
+        if length > Self::psy_io_max_vec_length() {
+            anyhow::bail!("Read size {} exceeds maximum allowed length {}", length, Self::psy_io_max_vec_length());
         }
-        Ok(items)
+        let total_bytes = length.checked_mul(N)
+            .context("Total byte size for vector of fixed structs exceeds usize::MAX")?;
+        let mut data = vec![0u8; total_bytes];
+        reader.read_exact(&mut data)?;
+        Self::ffs_deserialize_vec_of_self_owned(data)
     }
     #[inline]
     fn fx_tpl_pio_serialized_size_vec(items: &[Self], include_size_for_fixed: bool) -> usize {
@@ -71,36 +68,25 @@ pub trait PsyIOReadWriteFixedTemplate<const N: usize>: PsyCanonicalSerializeMeta
     }
 
     #[inline]
-    fn fx_tpl_pio_read_many_from_ref_bytes(data: &[u8], known_size: Option<usize>, include_size_for_fixed: bool) -> anyhow::Result<Vec<Self>> {
-        if data.is_empty() {
-            return Ok(Vec::new());
-        }
-        let data_len = data.len();
-        if let Some(known_sz) = known_size {
-            if !include_size_for_fixed && data_len != known_sz * Self::FIXED_SIZE {
-                anyhow::bail!(
-                    "Data length {} does not match expected size {} for known size {}",
-                    data_len,
-                    known_sz * Self::FIXED_SIZE,
-                    known_sz
-                );
-            } else if include_size_for_fixed && data_len != known_sz * Self::FIXED_SIZE + PSY_IO_FIXED_ITEMS_MANY_COUNT_SIZE {
-                anyhow::bail!(
-                    "Data length {} does not match expected size {} for known size {}",
-                    data_len,
-                    known_sz * Self::FIXED_SIZE + PSY_IO_FIXED_ITEMS_MANY_COUNT_SIZE,
-                    known_sz
-                );
+    fn fx_tpl_pio_read_many_from_ref_bytes(data: &[u8], known_count: Option<usize>) -> anyhow::Result<Vec<Self>> {
+        let count = match known_count {
+            Some(len) => {
+                if len * Self::FIXED_SIZE > data.len() {
+                    anyhow::bail!("Data length {} is too small for expected count {} of fixed size {}", data.len(), len, Self::FIXED_SIZE);
+                }
+                len
+            },
+            None => {
+                let data_len = data.len();
+                if data_len % Self::FIXED_SIZE != 0 {
+                    anyhow::bail!("Data length {} is not a multiple of fixed size {}", data_len, Self::FIXED_SIZE);
+                }
+                data_len / Self::FIXED_SIZE
             }
-        } else {
-            if data_len % Self::FIXED_SIZE != 0 {
-                anyhow::bail!("Data length {} is not a multiple of fixed size {}", data_len, Self::FIXED_SIZE);
-            }
+        };
+        if count > Self::psy_io_max_vec_length() {
+            anyhow::bail!("Read size {} exceeds maximum allowed length {}", count, Self::psy_io_max_vec_length());
         }
-        if include_size_for_fixed {
-            Self::ffs_deserialize_vec_of_self(&data[PSY_IO_FIXED_ITEMS_MANY_COUNT_SIZE..])
-        } else {
-            Self::ffs_deserialize_vec_of_self(&data)
-        }
+        Self::ffs_deserialize_vec_of_self(data)
     }
 }

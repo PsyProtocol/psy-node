@@ -9,6 +9,7 @@ mod auto_ffs;
 mod canonical_multi;
 mod canonical;
 mod primitive_implementations;
+mod io_rw;
 
 
 
@@ -23,3 +24,4 @@ pub use auto_ffs::*;
 pub use canonical_multi::*;
 pub use canonical::*;
 pub use primitive_implementations::*;
+pub use io_rw::*;
