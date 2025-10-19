@@ -8,8 +8,8 @@ pub trait PsySerializeCanonical:
     PsyCanonicalDatabaseSerializeBaseMulti + PsyCanonicalDatabaseSerializeBaseSingle + PsyIOReadWrite
 {
 }
-pub trait PsySerializeCanonicalAsyncSafe: PsySerializeCanonical + Send + Sync {}
-impl<T: PsySerializeCanonical + Send + Sync> PsySerializeCanonicalAsyncSafe for T {}
+pub trait PsySerializeCanonicalAsyncSafe: PsySerializeCanonical + PartialEq + Send + Sync {}
+impl<T: PsySerializeCanonical + Send + Sync + PartialEq> PsySerializeCanonicalAsyncSafe for T {}
 
 impl<T: PsyCanonicalDatabaseSerializeBaseMulti + PsyCanonicalDatabaseSerializeBaseSingle + PsyIOReadWrite>
     PsySerializeCanonical for T

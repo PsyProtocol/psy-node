@@ -1,6 +1,6 @@
 use parth_core::{crypto::hash::traits::{FieldQHasher, QFieldHashable}, data::serializable::{QPDSerializable}, felt::{QFelt, QFelt64, QFeltSized, ToQFelts, ZeroableFelt}, impl_qpd_serialize_params, protocol::core_types::{Q256BitHash, QFHashBase, QHashBase}, utils::QPGenRandom};
 use pser::{QBytesDeserialize, QBytesSerialize};
-use psy_serialize::{AutoDatabaseSerializationUseFastFixedSerialize, PsyCanonicalSerializeMetadata};
+use psy_serialize::{AutoDatabaseSerializationUseFastFixedSerialize, PsyCanonicalSerializeMetadata, PsySerializeCanonicalAsyncSafe};
 #[cfg(all(feature = "serialize_bytemuck", target_endian = "little"))]
 use psy_serialize::FastFixedSerializable;
 
@@ -221,7 +221,10 @@ impl FastFixedSerializable<104> for PQEDUserLeafSerialize256HashU64Felt {
             bytes
     }
 }
+pub trait PQEDUserLeafAsyncStore: PsySerializeCanonicalAsyncSafe {
 
+}
+impl<F: QFelt64, Hash: Q256BitHash> PQEDUserLeafAsyncStore for PQEDUserLeaf<F, Hash> {}
 
 pser::impl_bytemuck_pod_and_zeroable!(PQEDUserLeaf, F, Hash);
 

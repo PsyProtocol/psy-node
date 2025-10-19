@@ -1,4 +1,4 @@
-use pser::{impl_psy_ser_basic_tests, QBytesDeserialize, QBytesSerialize};
+use pser::{QBytesDeserialize, QBytesSerialize};
 use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
 use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata};
 use serde::{Deserialize, Serialize};

@@ -1,6 +1,5 @@
-use postcard::fixint::le;
 use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
-use psy_serialize::{impl_psy_canonical_serialize_for_speedy, AutoDatabaseSerializationUseFastFixedSerialize, AutoImplementFallbackPsySerializeCanonical, FallbackPsySerializeCanonical, PsyCanonicalDatabaseSerializeBaseMulti, PsyCanonicalDatabaseSerializeBaseSingle, PsyCanonicalSerializeMetadata};
+use psy_serialize::{impl_psy_canonical_serialize_for_speedy, FallbackPsySerializeCanonical, PsyCanonicalDatabaseSerializeBaseMulti, PsyCanonicalDatabaseSerializeBaseSingle, PsyCanonicalSerializeMetadata};
 use speedy::Writable;
 
 #[pderive::serialize_clone]

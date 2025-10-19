@@ -152,7 +152,7 @@ mod tests  {
 
     fn testz<F: QFelt64 + speedy::Readable<'static, speedy::LittleEndian> + speedy::Writable<speedy::LittleEndian>>(x: &PPMJobsCompletedStats<F>) 
     {
-        let bytes = x.pio_get_variable_serialized_size();
+        let _bytes = x.pio_get_variable_serialized_size();
     }
     #[test]
     fn test_gg(){

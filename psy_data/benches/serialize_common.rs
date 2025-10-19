@@ -1,7 +1,7 @@
 use criterion::{black_box, BenchmarkId, Criterion};
-use parth_core::{crypto::hash::traits::MerkleHasher, data::{hash::hash256::Hash256, maybe_serialization::MaybeSpeedy}, felt::{QFelt, QFelt64}, generic_traits::QNamedType, pgoldilocks::{PGoldilocksFelt, PGoldilocksHash, PoseidonHasher}, protocol::core_types::{QDBHashBase, QFHashBase, QHash256Base, QHashBase}, utils::QPGenRandom, PHash, PF};
+use parth_core::{data::{hash::hash256::Hash256, maybe_serialization::MaybeSpeedy}, felt::{QFelt, QFelt64}, generic_traits::QNamedType, pgoldilocks::{PGoldilocksFelt, PGoldilocksHash}, protocol::core_types::{QDBHashBase, QFHashBase}, utils::QPGenRandom, PHash, PF};
 use psy_data::v1::qdata::{contract::ContractFunctionCodeDefinition, user::PQEDUserLeaf};
-use psy_serialize::{FastFixedSerializable, PsyCanonicalDatabaseSerializeBaseMulti, PsyCanonicalDatabaseSerializeBaseSingle, PsyCanonicalDatabaseSerializeFixedBase, PsyIOReadWrite};
+use psy_serialize::{FastFixedSerializable, PsyCanonicalDatabaseSerializeBaseMulti, PsyCanonicalDatabaseSerializeBaseSingle, PsyIOReadWrite};
 
 use speedy::{Readable, Writable};
 trait BenchFastRand {

@@ -11,7 +11,7 @@ pub trait QStorableSizedBase: QStorableBase + Sized {}
 impl<T: Serialize + DeserializeOwned + Send + Sync + Clone + PartialEq + Eq> QStorableBase for T {}
 impl<T: QStorableBase + Sized> QStorableSizedBase for T {}
 pub trait QFHasherU64<F: QFelt64, Hash: QFHashBase<F>>: FieldQHasher<F, Hash> + QHasher<Hash> + MerkleZeroHasher<Hash> {}
-pub trait Q256BitHash: FromU64x4 + Sized + Copy + MaybeBytemuck + MaybeSpeedy + Debug {
+pub trait Q256BitHash: FromU64x4 + Sized + Copy + MaybeBytemuck + MaybeSpeedy + Debug + Sync + Send + PartialEq {
     fn from_owned_32bytes(bytes: [u8; 32]) -> Self;
     fn into_owned_32bytes(self) -> [u8; 32];
     fn from_ref_32bytes(bytes: &[u8; 32]) -> Self;

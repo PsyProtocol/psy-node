@@ -47,12 +47,12 @@ psy_serialize = { workspace = true }
 # parth_crypto = { workspace = true }
 # psy_common = { workspace = true }
 psy_node_core = { workspace = true }
-# psy_data = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
 parth_crypto = { workspace = true }
 parth_common = { workspace = true }
+psy_data = { workspace = true }
 
 
 

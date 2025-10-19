@@ -6,7 +6,7 @@ use parth_core::{
         merkle_proof::DeltaMerkleProofCore, tag_tree::{compute_tag_tree_root_for_proof, hash_tag_tree_node, TagTreeMerkleProof, TagTreeNodePreimage, TagTreeStorageNode}, traits::MerkleZeroHasher
     }, data::{
         db::{
-            data_types::{BiDirectionalMappingRow, CoreDatabaseValueDeserialize, QDatabasePrimitiveKey},
+            data_types::{BiDirectionalMappingRow, QDatabasePrimitiveKey},
             row::{QDatabaseDoubleIdTableRow, QDatabaseDoubleIdTableRowNoCheckpointId, QDatabaseDoubleIdTableRowNoCheckpointIdLike, QDatabaseKeyIdValueTableRowLike, QDatabaseSingleIdTableRow, QDatabaseSingleIdTableRowNoCheckpointId, QDatabaseSingleIdTableRowNoCheckpointIdLike, QDoubleIdKey},
             table::QDatabaseTableRoutingKey,
         },
@@ -32,8 +32,13 @@ use parth_node_scylla::{
     },
 };
 use pser::{QBytesDeserialize, QBytesSerialize};
+use psy_serialize::PsySerializeCanonicalAsyncSafe;
+use psy_data::v1::qdata::user::PQEDUserLeaf;
 use psy_node_core::{qblob::{data_views::double_merkle_node_batch::QBlobDoubleMerkleNodeBatchDataView, structs::common::{blob_metadata_header::QBlobWriterContextMetadataHeader, tree_node_batch_header::QBLOB_TREE_NODE_BATCH_HEADER_SIZE}}, store::traits::{core_db::{CoreDatabaseSingleIdMerkleReader, CoreDatabaseStore, CoreDatabaseTagTreeStore}, helpers::{db_helper_double_id_merkle_node_simple_set_leaves, db_helper_double_id_merkle_node_simple_set_leaves_fast_serialize, db_helper_select_double_id_merkle_proof_max_checkpoint, db_helper_select_single_id_merkle_proof_max_checkpoint, db_helper_select_zero_id_merkle_proof_max_checkpoint, db_helper_single_id_merkle_node_simple_set_leaves, db_helper_single_id_merkle_node_simple_set_leaves_fast_serialize, db_helper_zero_id_merkle_node_simple_set_leaves, db_helper_zero_id_merkle_node_simple_set_leaves_fast_serialize}}};
+trait PsyDBSer:  PsySerializeCanonicalAsyncSafe + PartialEq + Clone {
 
+}
+impl<T: PsySerializeCanonicalAsyncSafe + PartialEq + Clone> PsyDBSer for T {}
 pub trait CreateRandomTestDataItem: Sized {
     fn create_random_test_data_item() -> Self;
 }
@@ -178,10 +183,10 @@ pub struct QSimpleStore<
     BidirectionalMappingTableAK2: QDatabasePrimitiveKey,
     BidirectionalMappingTableBK1: QDatabasePrimitiveKey,
     BidirectionalMappingTableBK2: QDatabasePrimitiveKey,
-    KivTableAValue: CoreDatabaseValueDeserialize,
-    KivTableBValue: CoreDatabaseValueDeserialize,
-    ObjSingleIdTableAValue: CoreDatabaseValueDeserialize,
-    ObjDoubleIdTableBValue: CoreDatabaseValueDeserialize,
+    KivTableAValue: PsyDBSer,
+    KivTableBValue: PsyDBSer,
+    ObjSingleIdTableAValue: PsyDBSer,
+    ObjDoubleIdTableBValue: PsyDBSer,
     Hash: QDBHashBase,
     Hasher: THHasher<Hash>,
     BiDirectionalMappingTableIdentifier: THStandardTableIdentifier,
@@ -270,10 +275,10 @@ impl<
         BidirectionalMappingTableAK2: QDatabasePrimitiveKey,
         BidirectionalMappingTableBK1: QDatabasePrimitiveKey,
         BidirectionalMappingTableBK2: QDatabasePrimitiveKey,
-        KivTableAValue: CoreDatabaseValueDeserialize,
-        KivTableBValue: CoreDatabaseValueDeserialize,
-        ObjSingleIdTableAValue: CoreDatabaseValueDeserialize,
-        ObjDoubleIdTableBValue: CoreDatabaseValueDeserialize,
+        KivTableAValue: PsyDBSer,
+        KivTableBValue: PsyDBSer,
+        ObjSingleIdTableAValue: PsyDBSer,
+        ObjDoubleIdTableBValue: PsyDBSer,
         Hash: QDBHashBase,
         Hasher: THHasher<Hash>,
         BiDirectionalMappingTableIdentifier: THStandardTableIdentifier,
@@ -412,10 +417,10 @@ impl<
         BidirectionalMappingTableAK2: QDatabasePrimitiveKey,
         BidirectionalMappingTableBK1: QDatabasePrimitiveKey,
         BidirectionalMappingTableBK2: QDatabasePrimitiveKey,
-        KivTableAValue: CoreDatabaseValueDeserialize,
-        KivTableBValue: CoreDatabaseValueDeserialize,
-        ObjSingleIdTableAValue: CoreDatabaseValueDeserialize,
-        ObjDoubleIdTableBValue: CoreDatabaseValueDeserialize,
+        KivTableAValue: PsyDBSer,
+        KivTableBValue: PsyDBSer,
+        ObjSingleIdTableAValue: PsyDBSer,
+        ObjDoubleIdTableBValue: PsyDBSer,
         Hash: QDBHashBase,
         Hasher: THHasher<Hash>,
         BiDirectionalMappingTableIdentifier: THStandardTableIdentifier,
@@ -474,7 +479,7 @@ impl<
         S,
     >
 {
-    pub async fn th_util_insert_one_kiv<V: CoreDatabaseValueDeserialize>(
+    pub async fn th_util_insert_one_kiv<V: PsyDBSer>(
         &self,
         table: &KivTableIdentifier,
         obj_id: u64,
@@ -488,7 +493,7 @@ impl<
         Ok(())
     }
 
-    async fn th_util_insert_many_kivs_t<V: CoreDatabaseValueDeserialize, R: QDatabaseKeyIdValueTableRowLike<V> + Send + Sync>(
+    async fn th_util_insert_many_kivs_t<V: PsyDBSer, R: QDatabaseKeyIdValueTableRowLike<V> + Send + Sync>(
         &self,
         table: &KivTableIdentifier,
         rows: &[R],
@@ -645,10 +650,10 @@ impl<
         BidirectionalMappingTableAK2: QDatabasePrimitiveKey,
         BidirectionalMappingTableBK1: QDatabasePrimitiveKey,
         BidirectionalMappingTableBK2: QDatabasePrimitiveKey,
-        KivTableAValue: CoreDatabaseValueDeserialize,
-        KivTableBValue: CoreDatabaseValueDeserialize,
-        ObjSingleIdTableAValue: CoreDatabaseValueDeserialize,
-        ObjDoubleIdTableBValue: CoreDatabaseValueDeserialize,
+        KivTableAValue: PsyDBSer,
+        KivTableBValue: PsyDBSer,
+        ObjSingleIdTableAValue: PsyDBSer,
+        ObjDoubleIdTableBValue: PsyDBSer,
         Hash: QDBHashBase,
         Hasher: THHasher<Hash>,
         BiDirectionalMappingTableIdentifier: THStandardTableIdentifier,
@@ -963,7 +968,7 @@ impl<
         Ok(())
     }
 
-    pub async fn th_util_select_one_single_checkpointed_object_value<V: CoreDatabaseValueDeserialize>(
+    pub async fn th_util_select_one_single_checkpointed_object_value<V: PsyDBSer>(
         &self,
         table: &SingleIdTableIdentifier,
         obj_id: u64,
@@ -1030,7 +1035,7 @@ impl<
         Ok(result)
     }
 
-    pub async fn th_util_select_many_single_checkpointed_object_values<V: CoreDatabaseValueDeserialize>(
+    pub async fn th_util_select_many_single_checkpointed_object_values<V: PsyDBSer>(
         &self,
         table: &SingleIdTableIdentifier,
         obj_id: &[u64],
@@ -1052,7 +1057,7 @@ impl<
         }
         Ok(result)
     }
-    pub async fn th_util_insert_single_checkpointed_object<V: CoreDatabaseValueDeserialize>(
+    pub async fn th_util_insert_single_checkpointed_object<V: PsyDBSer>(
         &self,
         table: &SingleIdTableIdentifier,
         obj_id: u64,
@@ -1117,7 +1122,7 @@ impl<
     }
 
     pub async fn th_util_insert_many_single_checkpointed_objects<
-        V: CoreDatabaseValueDeserialize,
+        V: PsyDBSer,
         R: QDatabaseSingleIdTableRowNoCheckpointIdLike<V> + Send + Sync,
     >(
         &self,
@@ -1400,10 +1405,10 @@ impl<
         BidirectionalMappingTableAK2: QDatabasePrimitiveKey + QPGenRandom,
         BidirectionalMappingTableBK1: QDatabasePrimitiveKey + QPGenRandom,
         BidirectionalMappingTableBK2: QDatabasePrimitiveKey + QPGenRandom,
-        KivTableAValue: CoreDatabaseValueDeserialize + QPGenRandom,
-        KivTableBValue: CoreDatabaseValueDeserialize + QPGenRandom,
-        ObjSingleIdTableAValue: CoreDatabaseValueDeserialize + QPGenRandom,
-        ObjDoubleIdTableBValue: CoreDatabaseValueDeserialize + QPGenRandom,
+        KivTableAValue: PsyDBSer + QPGenRandom,
+        KivTableBValue: PsyDBSer + QPGenRandom,
+        ObjSingleIdTableAValue: PsyDBSer + QPGenRandom,
+        ObjDoubleIdTableBValue: PsyDBSer + QPGenRandom,
         Hash: QDBHashBase + QPGenRandom,
         Hasher: THHasher<Hash>,
         BiDirectionalMappingTableIdentifier: THStandardTableIdentifier,
@@ -1595,7 +1600,7 @@ impl<
         Ok(())
     }
 
-    pub async fn get_many_non_existent_ids_in_single_object_single_try<V: CoreDatabaseValueDeserialize>(&self, table: &SingleIdTableIdentifier, max_count: usize) -> anyhow::Result<Vec<u64>> {
+    pub async fn get_many_non_existent_ids_in_single_object_single_try<V: PsyDBSer>(&self, table: &SingleIdTableIdentifier, max_count: usize) -> anyhow::Result<Vec<u64>> {
         let ids = (0..(max_count+16)).map(|_| rand_real_u64_id()).collect::<Vec<u64>>();
         let results = self.store.db_select_many_single_checkpointed_object_values::<V>(table, &ids, MAX_REAL_CHECKPOINT_ID).await?;
         let non_existent_ids = ids.iter().zip(results.iter()).filter_map(|(&id, res)| if res.is_none() { Some(id) } else { None }).collect::<Vec<u64>>();
@@ -1606,7 +1611,7 @@ impl<
             Ok(non_existent_ids)
         }
        }
-        pub async fn get_many_non_existent_ids_in_single_object<V: CoreDatabaseValueDeserialize>(&self, table: &SingleIdTableIdentifier, count: usize) -> anyhow::Result<Vec<u64>> {
+        pub async fn get_many_non_existent_ids_in_single_object<V: PsyDBSer>(&self, table: &SingleIdTableIdentifier, count: usize) -> anyhow::Result<Vec<u64>> {
         let mut non_existent_ids = self.get_many_non_existent_ids_in_single_object_single_try::<V>(table, count).await?;
         let mut retry_counter = 0;
         while non_existent_ids.len() < count {
@@ -1621,7 +1626,7 @@ impl<
         Ok(non_existent_ids.into_iter().take(count).collect())
     }
 
-    pub async fn get_non_existent_id_in_single_object<V: CoreDatabaseValueDeserialize>(&self, table: &SingleIdTableIdentifier) -> anyhow::Result<u64> {
+    pub async fn get_non_existent_id_in_single_object<V: PsyDBSer>(&self, table: &SingleIdTableIdentifier) -> anyhow::Result<u64> {
         let mut id = rand_real_u64_id();
         let mut result = self.store.db_select_one_single_checkpointed_object_value::<V>(table, id, MAX_REAL_CHECKPOINT_ID).await?;
         let mut retry_counter = 0;
@@ -1635,7 +1640,7 @@ impl<
         }
         Ok(id)
     }
-    pub async fn get_non_existent_id_in_double_object<V: CoreDatabaseValueDeserialize>(&self, table: &DoubleIdTableIdentifier) -> anyhow::Result<(u64, u64)> {
+    pub async fn get_non_existent_id_in_double_object<V: PsyDBSer>(&self, table: &DoubleIdTableIdentifier) -> anyhow::Result<(u64, u64)> {
         let mut id = rand_real_u64_id();
         let mut secondary_id = rand_real_u64_id();
         let mut result = self.store.db_select_one_double_checkpointed_object_value::<V>(table, id, secondary_id, MAX_REAL_CHECKPOINT_ID).await?;
@@ -1654,7 +1659,7 @@ impl<
     }
 
 
-    pub async fn th_test_single_checkpointed_object_1_full_history_1<V: CoreDatabaseValueDeserialize + QPGenRandom>(&self, table: &SingleIdTableIdentifier) -> anyhow::Result<()>{
+    pub async fn th_test_single_checkpointed_object_1_full_history_1<V: PsyDBSer + QPGenRandom>(&self, table: &SingleIdTableIdentifier) -> anyhow::Result<()>{
 
         let obj_id = self.get_non_existent_id_in_single_object::<V>(table).await?;
         // ensure the id is really non-existent
@@ -1739,7 +1744,7 @@ impl<
 
 
         for (checkpoint_id, value) in first_100_checkpoints.iter().enumerate() {
-            self.store.db_insert_one_single_checkpointed_object(table, obj_id, checkpoint_id as u64, &value).await?;
+            self.store.db_insert_one_single_checkpointed_object(table, obj_id, checkpoint_id as u64, value).await?;
             let should_be_value_post_insert = self.store.db_select_one_single_checkpointed_object_value::<V>(table, obj_id, checkpoint_id as u64).await?;
             assert!(should_be_value_post_insert.is_some(), "Value should be found at checkpoint {} after insert", checkpoint_id);
             let should_be_value_post_insert_unwrapped = should_be_value_post_insert.unwrap();
@@ -1801,7 +1806,7 @@ impl<
 
     }
 
-    pub async fn th_test_single_checkpointed_object_1_full_history_2<V: CoreDatabaseValueDeserialize + QPGenRandom>(&self, table: &SingleIdTableIdentifier) -> anyhow::Result<()>{
+    pub async fn th_test_single_checkpointed_object_1_full_history_2<V: PsyDBSer + QPGenRandom>(&self, table: &SingleIdTableIdentifier) -> anyhow::Result<()>{
         // ensure the id is really non-existent
         let obj_id = self.get_non_existent_id_in_single_object::<V>(table).await?;
         let check = self.store.db_select_one_single_checkpointed_object_value::<V>(table, obj_id, MAX_REAL_CHECKPOINT_ID).await?;
@@ -1885,7 +1890,7 @@ impl<
 
 
         for (checkpoint_id, value) in first_10_checkpoints.iter().enumerate() {
-            self.store.db_insert_one_single_checkpointed_object(table, obj_id, checkpoint_id as u64, &value).await?;
+            self.store.db_insert_one_single_checkpointed_object(table, obj_id, checkpoint_id as u64, value).await?;
             let should_be_value_post_insert = self.store.db_select_one_single_checkpointed_object_value::<V>(table, obj_id, checkpoint_id as u64).await?;
             assert!(should_be_value_post_insert.is_some(), "Value should be found at checkpoint {} after insert", checkpoint_id);
             let should_be_value_post_insert_unwrapped = should_be_value_post_insert.unwrap();
@@ -1941,7 +1946,7 @@ impl<
 
     }
 
-        pub async fn th_test_single_checkpointed_object_1_full_history_3<V: CoreDatabaseValueDeserialize + QPGenRandom>(&self, table: &SingleIdTableIdentifier) -> anyhow::Result<()>{
+        pub async fn th_test_single_checkpointed_object_1_full_history_3<V: PsyDBSer + QPGenRandom>(&self, table: &SingleIdTableIdentifier) -> anyhow::Result<()>{
 
             let first_checkpoint = 0u64;
             let second_checkpoint = 1u64;
@@ -2215,10 +2220,10 @@ impl<
         BidirectionalMappingTableAK2: QDatabasePrimitiveKey + QPGenRandom,
         BidirectionalMappingTableBK1: QDatabasePrimitiveKey + QPGenRandom,
         BidirectionalMappingTableBK2: QDatabasePrimitiveKey + QPGenRandom,
-        KivTableAValue: CoreDatabaseValueDeserialize + QPGenRandom,
-        KivTableBValue: CoreDatabaseValueDeserialize + QPGenRandom,
-        ObjSingleIdTableAValue: CoreDatabaseValueDeserialize + QPGenRandom,
-        ObjDoubleIdTableBValue: CoreDatabaseValueDeserialize + QPGenRandom,
+        KivTableAValue: PsyDBSer + QPGenRandom,
+        KivTableBValue: PsyDBSer + QPGenRandom,
+        ObjSingleIdTableAValue: PsyDBSer + QPGenRandom,
+        ObjDoubleIdTableBValue: PsyDBSer + QPGenRandom,
         Hash: QDBHashBase + QPGenRandom,
         Hasher: THHasher<Hash>,
         BiDirectionalMappingTableIdentifier: THStandardTableIdentifier,
@@ -2277,7 +2282,7 @@ impl<
         S,
     >
 {
-    pub async fn th_util_select_one_double_checkpointed_object_value<V: CoreDatabaseValueDeserialize>(
+    pub async fn th_util_select_one_double_checkpointed_object_value<V: PsyDBSer>(
         &self,
         table: &DoubleIdTableIdentifier,
         obj_id: u64,
@@ -2354,7 +2359,7 @@ impl<
         Ok(result)
     }
 
-    pub async fn th_util_select_many_double_checkpointed_object_values<V: CoreDatabaseValueDeserialize>(
+    pub async fn th_util_select_many_double_checkpointed_object_values<V: PsyDBSer>(
         &self,
         table: &DoubleIdTableIdentifier,
         obj_keys: &[QDoubleIdKey],
@@ -2377,7 +2382,7 @@ impl<
         Ok(result)
     }
 
-    pub async fn th_util_insert_double_checkpointed_object<V: CoreDatabaseValueDeserialize>(
+    pub async fn th_util_insert_double_checkpointed_object<V: PsyDBSer>(
         &self,
         table: &DoubleIdTableIdentifier,
         obj_id: u64,
@@ -2443,7 +2448,7 @@ impl<
     }
 
     pub async fn th_util_insert_many_double_checkpointed_objects<
-        V: CoreDatabaseValueDeserialize,
+        V: PsyDBSer,
         R: QDatabaseDoubleIdTableRowNoCheckpointIdLike<V> + Send + Sync,
     >(
         &self,
@@ -2520,7 +2525,7 @@ impl<
         Ok(())
     }
 
-    pub async fn get_many_non_existent_double_ids_in_double_object_single_try<V: CoreDatabaseValueDeserialize>(&self, table: &DoubleIdTableIdentifier, max_count: usize) -> anyhow::Result<Vec<(u64, u64)>> {
+    pub async fn get_many_non_existent_double_ids_in_double_object_single_try<V: PsyDBSer>(&self, table: &DoubleIdTableIdentifier, max_count: usize) -> anyhow::Result<Vec<(u64, u64)>> {
         let ids = (0..(max_count+16)).map(|_| (rand_real_u64_id(), rand_real_u64_id())).collect::<Vec<_>>();
         let keys = ids.iter().map(|&(obj_id, sec_id)| QDoubleIdKey::from((obj_id, sec_id))).collect::<Vec<_>>();
         let results = self.store.db_select_many_double_checkpointed_object_values::<V>(table, &keys, MAX_REAL_CHECKPOINT_ID).await?;
@@ -2533,7 +2538,7 @@ impl<
         }
     }
 
-    pub async fn get_many_non_existent_double_ids_in_double_object<V: CoreDatabaseValueDeserialize>(&self, table: &DoubleIdTableIdentifier, count: usize) -> anyhow::Result<Vec<(u64, u64)>> {
+    pub async fn get_many_non_existent_double_ids_in_double_object<V: PsyDBSer>(&self, table: &DoubleIdTableIdentifier, count: usize) -> anyhow::Result<Vec<(u64, u64)>> {
         let mut non_existent_ids = self.get_many_non_existent_double_ids_in_double_object_single_try::<V>(table, count).await?;
         let mut retry_counter = 0;
         while non_existent_ids.len() < count {
@@ -2548,7 +2553,7 @@ impl<
         Ok(non_existent_ids.into_iter().take(count).collect())
     }
 
-    pub async fn th_test_double_checkpointed_object_1_full_history_1<V: CoreDatabaseValueDeserialize + QPGenRandom>(&self, table: &DoubleIdTableIdentifier) -> anyhow::Result<()> {
+    pub async fn th_test_double_checkpointed_object_1_full_history_1<V: PsyDBSer + QPGenRandom>(&self, table: &DoubleIdTableIdentifier) -> anyhow::Result<()> {
 
         let (obj_id, secondary_id) = self.get_non_existent_id_in_double_object::<V>(table).await?;
         let check = self.store.db_select_one_double_checkpointed_object_value::<V>(table, obj_id, secondary_id, MAX_REAL_CHECKPOINT_ID).await?;
@@ -2678,7 +2683,7 @@ impl<
         Ok(())
     }
 
-    pub async fn th_test_double_checkpointed_object_1_full_history_2<V: CoreDatabaseValueDeserialize + QPGenRandom>(&self, table: &DoubleIdTableIdentifier) -> anyhow::Result<()>{
+    pub async fn th_test_double_checkpointed_object_1_full_history_2<V: PsyDBSer + QPGenRandom>(&self, table: &DoubleIdTableIdentifier) -> anyhow::Result<()>{
         let (obj_id, secondary_id) = self.get_non_existent_id_in_double_object::<V>(table).await?;
         let check = self.store.db_select_one_double_checkpointed_object_value::<V>(table, obj_id, secondary_id, MAX_REAL_CHECKPOINT_ID).await?;
         assert!(check.is_none(), "Expected non-existent pair to not be found");
@@ -2801,7 +2806,7 @@ impl<
         Ok(())
     }
 
-    pub async fn th_test_double_checkpointed_object_1_full_history_3<V: CoreDatabaseValueDeserialize + QPGenRandom>(&self, table: &DoubleIdTableIdentifier) -> anyhow::Result<()>{
+    pub async fn th_test_double_checkpointed_object_1_full_history_3<V: PsyDBSer + QPGenRandom>(&self, table: &DoubleIdTableIdentifier) -> anyhow::Result<()>{
         let first_checkpoint = 0u64;
         let second_checkpoint = 1u64;
         let last_checkpoint = 100_000u64;
@@ -3592,10 +3597,10 @@ impl<
         BidirectionalMappingTableAK2: QDatabasePrimitiveKey + QPGenRandom,
         BidirectionalMappingTableBK1: QDatabasePrimitiveKey + QPGenRandom,
         BidirectionalMappingTableBK2: QDatabasePrimitiveKey + QPGenRandom,
-        KivTableAValue: CoreDatabaseValueDeserialize + QPGenRandom,
-        KivTableBValue: CoreDatabaseValueDeserialize + QPGenRandom,
-        ObjSingleIdTableAValue: CoreDatabaseValueDeserialize + QPGenRandom,
-        ObjDoubleIdTableBValue: CoreDatabaseValueDeserialize + QPGenRandom,
+        KivTableAValue: PsyDBSer + QPGenRandom,
+        KivTableBValue: PsyDBSer + QPGenRandom,
+        ObjSingleIdTableAValue: PsyDBSer + QPGenRandom,
+        ObjDoubleIdTableBValue: PsyDBSer + QPGenRandom,
         Hash: QDBHashBase + QPGenRandom + Q256BitHash,
         Hasher: THHasher<Hash>,
         BiDirectionalMappingTableIdentifier: THStandardTableIdentifier,
@@ -3743,10 +3748,10 @@ impl<
         BidirectionalMappingTableAK2: QDatabasePrimitiveKey,
         BidirectionalMappingTableBK1: QDatabasePrimitiveKey,
         BidirectionalMappingTableBK2: QDatabasePrimitiveKey,
-        KivTableAValue: CoreDatabaseValueDeserialize,
-        KivTableBValue: CoreDatabaseValueDeserialize,
-        ObjSingleIdTableAValue: CoreDatabaseValueDeserialize,
-        ObjDoubleIdTableBValue: CoreDatabaseValueDeserialize,
+        KivTableAValue: PsyDBSer,
+        KivTableBValue: PsyDBSer,
+        ObjSingleIdTableAValue: PsyDBSer,
+        ObjDoubleIdTableBValue: PsyDBSer,
         Hash: QDBHashBase + QPGenRandom + std::fmt::Debug + Default + Clone + Send + Sync,
         Hasher: THHasher<Hash>,
         BiDirectionalMappingTableIdentifier: THStandardTableIdentifier,
@@ -4008,10 +4013,10 @@ impl<
         BidirectionalMappingTableAK2: QDatabasePrimitiveKey,
         BidirectionalMappingTableBK1: QDatabasePrimitiveKey,
         BidirectionalMappingTableBK2: QDatabasePrimitiveKey,
-        KivTableAValue: CoreDatabaseValueDeserialize,
-        KivTableBValue: CoreDatabaseValueDeserialize,
-        ObjSingleIdTableAValue: CoreDatabaseValueDeserialize,
-        ObjDoubleIdTableBValue: CoreDatabaseValueDeserialize,
+        KivTableAValue: PsyDBSer,
+        KivTableBValue: PsyDBSer,
+        ObjSingleIdTableAValue: PsyDBSer,
+        ObjDoubleIdTableBValue: PsyDBSer,
         Hash: QDBHashBase + QPGenRandom + std::fmt::Debug + Default + Clone + Send + Sync,
         Hasher: THHasher<Hash>,
         BiDirectionalMappingTableIdentifier: THStandardTableIdentifier,
@@ -4317,36 +4322,6 @@ impl<
     }
 }
 
-
-#[pderive::serialize_copy_f_hash]
-pub struct PQEDUserLeaf<F: QFelt, Hash: QDBHashBase> {
-    pub public_key: Hash,
-    pub user_state_tree_root: Hash,
-    pub balance: F,
-    pub nonce: F,
-    pub last_checkpoint_id: F,
-    pub event_index: F,
-    pub user_id: F,
-}
-
-impl_qpd_serialize_params!(
-    PQEDUserLeaf,
-    { F: QFelt, Hash: QDBHashBase } => { F, Hash }
-);
-
-impl<F: QFelt, Hash: QDBHashBase> QPGenRandom for PQEDUserLeaf<F, Hash> {
-    fn qp_rand_gen() -> Self{
-        Self {
-            public_key: Hash::rand_hash(),
-            user_state_tree_root: Hash::rand_hash(),
-            balance: F::get_simple_rand(),
-            nonce: F::get_simple_rand(),
-            last_checkpoint_id: F::get_simple_rand(),
-            event_index: F::get_simple_rand(),
-            user_id: F::get_simple_rand(),
-        }
-    }
-}
 
 const EX_ZERO_ID_TREE_A_HEIGHT: usize = 32;
 const EX_ZERO_ID_TREE_B_HEIGHT: usize = 22;
