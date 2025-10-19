@@ -15,6 +15,7 @@ serialize_postcard = ["dep:postcard", "pser/serialize_postcard", "parth_core/ser
 
 [dependencies]
 dashmap = { workspace = true }
+crossbeam-skiplist = { workspace = true }
 parking_lot = { workspace = true }
 postcard = { workspace = true, optional = true }
 rkyv = { workspace = true, optional = true }
