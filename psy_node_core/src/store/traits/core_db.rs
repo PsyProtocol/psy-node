@@ -18,7 +18,7 @@ use parth_core::{
     protocol::core_types::QHashBase,
 };
 use psy_serialize::PsySerializeCanonicalAsyncSafe;
-use serde::{de::DeserializeOwned, Serialize};
+
 #[async_trait]
 #[auto_impl(&, Arc)]
 pub trait CoreDatabaseBidirectionalMappingReader<TableIdentifier: Clone + Send + Sync> {

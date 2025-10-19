@@ -1,5 +1,4 @@
 use std::hash::Hash;
-
 use crate::{data::{hash::merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}, serializable::{QPDSerializable, QPDSerializableFixed}}, protocol::core_types::Q256BitHash, utils::QPGenRandom};
 
 use psy_serialize::{AutoDatabaseSerializationUseFastFixedSerialize, FastFixedSerializable, PsyCanonicalSerializeMetadata};
@@ -109,14 +108,14 @@ impl QPGenRandom for QMerkleStoreSingleIdKey {
 #[pderive::serialize_copy_default]
 pub struct QMerkleStoreSingleIdNode<Hash> {
     pub key: QMerkleStoreSingleIdKey,
-    pub hash: Hash,
+    pub value: Hash,
 }
 impl<Hash: QPGenRandom> QPGenRandom for QMerkleStoreSingleIdNode<Hash> {
     
     fn qp_rand_gen() -> Self where Self: Sized {
         Self {
             key: QMerkleStoreSingleIdKey::qp_rand_gen(),
-            hash: QPGenRandom::qp_rand_gen(),
+            value: QPGenRandom::qp_rand_gen(),
         }
     }
 }
@@ -124,14 +123,14 @@ impl<Hash: Q256BitHash> FastFixedSerializable<49> for QMerkleStoreSingleIdNode<H
     fn ffs_from_owned_bytes(data: [u8; 49]) -> Self {
         Self {
             key: QMerkleStoreSingleIdKey::ffs_from_owned_bytes(data[0..17].try_into().unwrap()),
-            hash: Hash::from_ref_32bytes(data[17..49].try_into().unwrap()),
+            value: Hash::from_ref_32bytes(data[17..49].try_into().unwrap()),
         }
     }
 
     fn ffs_from_slice_or_panic(data: &[u8]) -> Self {
         Self {
             key: QMerkleStoreSingleIdKey::ffs_from_slice_or_panic(&data[0..17]),
-            hash: Hash::from_ref_32bytes(data[17..49].try_into().unwrap()),
+            value: Hash::from_ref_32bytes(data[17..49].try_into().unwrap()),
         }
     }
 
@@ -141,21 +140,21 @@ impl<Hash: Q256BitHash> FastFixedSerializable<49> for QMerkleStoreSingleIdNode<H
         }
         Ok(Self {
             key: QMerkleStoreSingleIdKey::ffs_try_from_slice(&data[0..17])?,
-            hash: Hash::from_slice_32bytes(&data[17..49])?,
+            value: Hash::from_slice_32bytes(&data[17..49])?,
         })
     }
 
     fn ffs_to_bytes(&self) -> [u8; 49] {
         let mut data: [u8; 49] = [0u8; 49];
         data[0..17].copy_from_slice(&self.key.ffs_to_bytes());
-        data[17..49].copy_from_slice(&self.hash.into_owned_32bytes());
+        data[17..49].copy_from_slice(&self.value.into_owned_32bytes());
         data
     }
 
     fn ffs_into_bytes(self) -> [u8; 49] {
         let mut data: [u8; 49] = [0u8; 49];
         data[0..17].copy_from_slice(&self.key.ffs_into_bytes());
-        data[17..49].copy_from_slice(&self.hash.into_owned_32bytes());
+        data[17..49].copy_from_slice(&self.value.into_owned_32bytes());
         data
     }
 }
@@ -285,7 +284,7 @@ impl QPDSerializableFixed for QMerkleStoreDoubleIdKey {
 #[pderive::serialize_copy_default]
 pub struct QMerkleStoreDoubleIdNode<Hash> {
     pub key: QMerkleStoreDoubleIdKey,
-    pub hash: Hash,
+    pub value: Hash,
 }
 impl<Hash: Copy> QMerkleStoreDoubleIdNode<Hash> {
     pub fn from_simple_merkle_nodes_for_tree_clone(tree_id: u64, tree_sub_id: u64, nodes: &[SimpleMerkleNode<Hash>] ) -> Vec<Self> {
@@ -298,7 +297,7 @@ impl<Hash: Copy> QMerkleStoreDoubleIdNode<Hash> {
                     level: node.key.level,
                     index: node.key.index,
                 },
-                hash: node.value,
+                value: node.value,
             });
         }
         result
@@ -313,7 +312,7 @@ impl<Hash: Copy> QMerkleStoreDoubleIdNode<Hash> {
                     level: node.key.level,
                     index: node.key.index,
                 },
-                hash: node.value,
+                value: node.value,
             });
         }
         result
@@ -326,7 +325,7 @@ impl<Hash: QPGenRandom> QPGenRandom for QMerkleStoreDoubleIdNode<Hash> {
     fn qp_rand_gen() -> Self where Self: Sized {
         Self {
             key: QMerkleStoreDoubleIdKey::qp_rand_gen(),
-            hash: QPGenRandom::qp_rand_gen(),
+            value: QPGenRandom::qp_rand_gen(),
         }
     }
 }
@@ -334,14 +333,14 @@ impl<Hash: Q256BitHash> FastFixedSerializable<57> for QMerkleStoreDoubleIdNode<H
     fn ffs_from_owned_bytes(data: [u8; 57]) -> Self {
         Self {
             key: QMerkleStoreDoubleIdKey::ffs_from_owned_bytes(data[0..25].try_into().unwrap()),
-            hash: Hash::from_ref_32bytes(data[25..57].try_into().unwrap()),
+            value: Hash::from_ref_32bytes(data[25..57].try_into().unwrap()),
         }
     }
 
     fn ffs_from_slice_or_panic(data: &[u8]) -> Self {
         Self {
             key: QMerkleStoreDoubleIdKey::ffs_from_slice_or_panic(&data[0..25]),
-            hash: Hash::from_ref_32bytes(data[25..57].try_into().unwrap()),
+            value: Hash::from_ref_32bytes(data[25..57].try_into().unwrap()),
         }
     }
 
@@ -351,21 +350,21 @@ impl<Hash: Q256BitHash> FastFixedSerializable<57> for QMerkleStoreDoubleIdNode<H
         }
         Ok(Self {
             key: QMerkleStoreDoubleIdKey::ffs_try_from_slice(&data[0..25])?,
-            hash: Hash::from_slice_32bytes(&data[25..57])?,
+            value: Hash::from_slice_32bytes(&data[25..57])?,
         })
     }
 
     fn ffs_to_bytes(&self) -> [u8; 57] {
         let mut data: [u8; 57] = [0u8; 57];
         data[0..25].copy_from_slice(&self.key.ffs_to_bytes());
-        data[25..57].copy_from_slice(&self.hash.into_owned_32bytes());
+        data[25..57].copy_from_slice(&self.value.into_owned_32bytes());
         data
     }
 
     fn ffs_into_bytes(self) -> [u8; 57] {
         let mut data: [u8; 57] = [0u8; 57];
         data[0..25].copy_from_slice(&self.key.ffs_into_bytes());
-        data[25..57].copy_from_slice(&self.hash.into_owned_32bytes());
+        data[25..57].copy_from_slice(&self.value.into_owned_32bytes());
         data
     }
 }

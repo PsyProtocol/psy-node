@@ -59,7 +59,7 @@ fn gen_rand_double_id_nodes_fast_rand<Hash: BenchFastRand>(count: usize) -> Vec<
     for _ in 0..count {
         let node = QMerkleStoreDoubleIdNode {
             key: QMerkleStoreDoubleIdKey::qp_rand_gen(),
-            hash: Hash::bench_rand_gen_fast(),
+            value: Hash::bench_rand_gen_fast(),
         };
         nodes.push(node);
     }

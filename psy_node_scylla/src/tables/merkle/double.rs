@@ -387,7 +387,7 @@ impl ScyllaDoubleMerkleNodesPreparedStatements {
                         u8_to_i8_exact(n.key.level),
                         u64_to_i64_exact(n.key.index),
                         convert_checkpoint_id_to_i64(checkpoint_id),
-                        n.hash.into_owned_32bytes(),
+                        n.value.into_owned_32bytes(),
                     ))
                 })
                 .collect::<anyhow::Result<_>>()?;

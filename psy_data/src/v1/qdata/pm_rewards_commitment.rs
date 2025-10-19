@@ -125,7 +125,7 @@ impl<F: QFelt64, Hash: QFHashBase<F>> ToQFelts<F> for PPMRewardCommitment<Hash> 
         }
     }
 }
-
+#[cfg(test)]
 mod test_psy_ser_pm_reward_commitment {
     use super::PPMRewardCommitment;
     use parth_core::utils::QPGenRandom;

@@ -5,7 +5,6 @@ use futures::future::join_all;
 use parth_core::data::db::{row::{QDatabaseKeyIdValueTableRow, QDatabaseKeyIdValueTableRowCreatable, QDatabaseKeyIdValueTableRowLike}, table::QDatabaseTableRoutingKey};
 use psy_serialize::PsySerializeCanonicalAsyncSafe;
 use scylla::{client::session::Session, statement::{batch::Batch, prepared::PreparedStatement, Statement}};
-use serde::{de::DeserializeOwned, Serialize};
 
 use crate::{constants::{INSERT_KEY_ID_VALUE_CHECKPOINTED_OBJECT_BATCH_SIZE, SELECT_KEY_ID_VALUE_CHECKPOINTED_OBJECT_BATCH_SIZE}, tables::traits::ScyllaStandardPreparedTableStatements, utils::{i64_to_u64_exact, u64_to_i64_exact}};
 
