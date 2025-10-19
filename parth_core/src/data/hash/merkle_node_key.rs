@@ -108,6 +108,9 @@ impl SimpleMerkleNodeKey {
         }
     }
     pub fn first_leaf_child(&self, tree_height: u8) -> Self {
+        if self.level >= tree_height {
+            return self.clone();
+        }
         Self {
             level: tree_height,
             index: self.index << (tree_height - self.level),
@@ -207,28 +210,34 @@ impl SimpleMerkleNodeKey {
     pub fn get_above_path(&self) -> Vec<SimpleMerkleNodeKey> {
         self.get_above_path_to_height(0)
     }
+
     pub fn get_path_above_self_to_level(&self, sub_root_level: u8, include_sub_root: bool) -> Vec<SimpleMerkleNodeKey> {
         if sub_root_level >= self.level {
             return vec![];
         }
 
-        let real_sub_root = if include_sub_root {
+        // Determine the level at which we should stop.
+        // If we don't include the sub-root, we stop at the level *above* it.
+        let stop_level = if include_sub_root {
             sub_root_level
         } else {
-            sub_root_level - 1
+            // Use saturating_add to prevent overflow if sub_root_level is 255.
+            sub_root_level.saturating_add(1)
         };
-        if real_sub_root >= self.level {
-            vec![]
-        }else{
-            let mut path_node_keys = Vec::with_capacity((self.level - sub_root_level) as usize);
-            let mut my_node = self.clone();
-            while my_node.level > sub_root_level {
-                my_node = my_node.parent();
-                path_node_keys.push(my_node.clone());
-            }
-
-            path_node_keys
+        
+        // If the stop level is already at or above our current level, there's no path.
+        if stop_level > self.level {
+            return vec![];
         }
+
+        let mut path_node_keys = Vec::with_capacity((self.level - sub_root_level) as usize);
+        let mut my_node = *self;
+        while my_node.level > stop_level {
+            my_node = my_node.parent();
+            path_node_keys.push(my_node);
+        }
+
+        path_node_keys
     }
 }
 impl QPGenRandom for SimpleMerkleNodeKey {

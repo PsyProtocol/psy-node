@@ -1,3 +1,5 @@
+use std::{collections::HashMap, future::Future};
+
 use async_trait::async_trait;
 use auto_impl::auto_impl;
 use parth_core::{
@@ -15,7 +17,7 @@ use parth_core::{
         hash::merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey},
         serializable::QPDPair,
     },
-    protocol::core_types::QHashBase,
+    protocol::core_types::{Q256BitHash, QHashBase},
 };
 use psy_serialize::PsySerializeCanonicalAsyncSafe;
 
@@ -541,6 +543,12 @@ impl<
     > CoreDatabaseTagTreeStore<Hash, Hasher, TableIdentifier> for T
 {
 }
+#[pderive::serialize_enum_repr_strum]
+#[repr(u8)]
+pub enum MerkleTreeDumpStrategy {
+    AppendOnlyTreeStrategy = 0,
+    DumpAllStrategy = 1,
+}
 
 #[async_trait]
 #[auto_impl(&, Arc)]
@@ -548,13 +556,29 @@ pub trait CoreDatabaseZeroIdMerkleDumpReader<
     Hash: QHashBase + Send + Sync,
     Hasher: MerkleZeroHasher<Hash> + Send + Sync,
     TableIdentifier: Clone + Send + Sync,
->
-{
-    async fn db_dump_zero_id_merkle_nodes(
+>{
+
+    async fn dump_all_zero_id_merkle_node_leaves_chunked(
         &self,
         table: &TableIdentifier,
-        checkpoint_id: u64,
+        max_checkpoint_id: u64,
+    ) -> anyhow::Result<HashMap<u64, Hash>>;
+    async fn dump_all_zero_id_merkle_node_leaves_vec(
+        &self,
+        table: &TableIdentifier,
+        max_checkpoint_id: u64,
+        strategy: MerkleTreeDumpStrategy,
     ) -> anyhow::Result<Vec<SimpleMerkleNode<Hash>>>;
+    /* 
+    async fn dump_all_zero_id_merkle_node_leaves_chunked<
+        F: Send + Sync + FnMut(Vec<(u64, Hash)>) -> Fut,
+        Fut: Send + Sync + Future<Output = anyhow::Result<()>>,
+    >(
+        &self,
+        table: &TableIdentifier,
+        max_checkpoint_id: u64,
+        mut on_chunk: F,
+    ) -> anyhow::Result<()>;*/
 }
 #[async_trait]
 #[auto_impl(&, Arc)]

@@ -50,8 +50,8 @@ impl QMerkleStoreFastZeroNodeSerializer {
     pub fn deserialize_zero_id_node_signed_insert_tuple<Hash: Q256BitHash>(slice: &[u8], checkpoint_id_i64: i64) ->(i8, i64, i64, [u8; 32]) {
         assert!(slice.len() >= QMS_FAST_SERIALIZER_ZERO_ID_NODE_SIZE);
         let level = u8_to_i8_exact(slice[0]);
-        let index = i64::from_le_bytes(slice[9..17].try_into().unwrap());
-        let hash: [u8; 32] = slice[17..49].try_into().unwrap();
+        let index = i64::from_le_bytes(slice[1..9].try_into().unwrap());
+        let hash: [u8; 32] = slice[9..41].try_into().unwrap();
         (level, index, checkpoint_id_i64, hash)
     }
 }

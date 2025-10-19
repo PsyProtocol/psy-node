@@ -1,3 +1,5 @@
+use std::{collections::HashMap, future::Future};
+
 use async_trait::async_trait;
 use parth_core::{
     crypto::hash::{tag_tree::TagTreeMerkleProof, traits::MerkleZeroHasher},
@@ -17,12 +19,7 @@ use parth_core::{
     protocol::core_types::QDBHashBase,
 };
 use psy_node_core::store::traits::core_db::{
-    CoreDatabaseBidirectionalMappingReader, CoreDatabaseBidirectionalMappingWriter, CoreDatabaseBidirectionalU64U128MappingReader,
-    CoreDatabaseBidirectionalU64U128MappingWriter, CoreDatabaseDoubleIdCheckpointedReader, CoreDatabaseDoubleIdCheckpointedWriter,
-    CoreDatabaseDoubleIdMerkleReader, CoreDatabaseDoubleIdMerkleWriter, CoreDatabaseKivReader, CoreDatabaseKivWriter,
-    CoreDatabaseSingleIdCheckpointedReader, CoreDatabaseSingleIdCheckpointedWriter, CoreDatabaseSingleIdMerkleReader,
-    CoreDatabaseSingleIdMerkleWriter, CoreDatabaseTagTreeReader, CoreDatabaseTagTreeWriter, CoreDatabaseU64Reader, CoreDatabaseU64Writer,
-    CoreDatabaseZeroIdMerkleReader, CoreDatabaseZeroIdMerkleWriter,
+    CoreDatabaseBidirectionalMappingReader, CoreDatabaseBidirectionalMappingWriter, CoreDatabaseBidirectionalU64U128MappingReader, CoreDatabaseBidirectionalU64U128MappingWriter, CoreDatabaseDoubleIdCheckpointedReader, CoreDatabaseDoubleIdCheckpointedWriter, CoreDatabaseDoubleIdMerkleReader, CoreDatabaseDoubleIdMerkleWriter, CoreDatabaseKivReader, CoreDatabaseKivWriter, CoreDatabaseSingleIdCheckpointedReader, CoreDatabaseSingleIdCheckpointedWriter, CoreDatabaseSingleIdMerkleReader, CoreDatabaseSingleIdMerkleWriter, CoreDatabaseTagTreeReader, CoreDatabaseTagTreeWriter, CoreDatabaseU64Reader, CoreDatabaseU64Writer, CoreDatabaseZeroIdMerkleDumpReader, CoreDatabaseZeroIdMerkleReader, CoreDatabaseZeroIdMerkleWriter, MerkleTreeDumpStrategy
 };
 use psy_serialize::PsySerializeCanonicalAsyncSafe;
 
@@ -453,6 +450,28 @@ impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sy
         nodes: &[u8],
     ) -> anyhow::Result<()>{
         table.set_zero_id_merkle_nodes_batch_fast_serialize::<Hash>(&self.session, checkpoint_id, nodes).await
+    }
+}
+
+#[async_trait]
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+    CoreDatabaseZeroIdMerkleDumpReader<Hash, Hasher, ScyllaMerkleNodesZeroPreparedStatements> for ScyllaCoreStore<Hash, Hasher>
+{
+    async fn dump_all_zero_id_merkle_node_leaves_chunked(
+        &self,
+        table: &ScyllaMerkleNodesZeroPreparedStatements,
+        max_checkpoint_id: u64,
+    ) -> anyhow::Result<HashMap<u64, Hash>> {
+        table.dump_all_zero_id_merkle_node_leaves_fast::<Hash>(&self.session, max_checkpoint_id).await
+    }
+
+    async fn dump_all_zero_id_merkle_node_leaves_vec(
+        &self,
+        table: &ScyllaMerkleNodesZeroPreparedStatements,
+        max_checkpoint_id: u64,
+        strategy: MerkleTreeDumpStrategy,
+    ) -> anyhow::Result<Vec<SimpleMerkleNode<Hash>>>{
+        table.dump_all_zero_id_merkle_node_leaves_vec::<Hash>(&self.session, max_checkpoint_id, strategy).await
     }
 }
 

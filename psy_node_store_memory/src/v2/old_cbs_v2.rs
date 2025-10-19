@@ -104,27 +104,39 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash> + Send + Sync> InMemoryCore
             .or_insert_with(|| Arc::new(DashMap::new()))
             .clone()
     }
+}
 
-}
+/// An enum to identify different logical tables within the in-memory store.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct InMemoryTableIdentifier {
-    pub full_name: String,
+pub enum InMemoryTableIdentifier {
+    KivTableA,
+    KivTableB,
+    BidirectionalMappingTableA,
+    BidirectionalMappingTableB,
+    ObjSingleIdTableA,
+    ObjSingleIdTableB,
+    ObjDoubleIdTableA,
+    ObjDoubleIdTableB,
+    U64TableA,
+    U64TableB,
+    U64U128BiDirectionalMappingTableA,
+    U64U128BiDirectionalMappingTableB,
+    MerkleNodeZeroIdTableA,
+    MerkleNodeZeroIdTableB,
+    MerkleNodeSingleIdTableA,
+    MerkleNodeSingleIdTableB,
+    MerkleNodeDoubleIdTableA,
+    MerkleNodeDoubleIdTableB,
+    TagTreeTableA,
+    TagTreeTableB,
 }
-impl InMemoryTableIdentifier {
-    pub fn new(full_name: String) -> Self {
-        Self { full_name }
-    }
-    pub fn new_with_keyspace(keyspace: &str, table_name: &str) -> Self {
-        Self {
-            full_name: format!("{}-{}", keyspace, table_name),
-        }
-    }
-}
-impl ToString for InMemoryTableIdentifier{
+
+impl ToString for InMemoryTableIdentifier {
     fn to_string(&self) -> String {
-        self.full_name.clone()
+        format!("{:?}", self)
     }
 }
+
 // ================================================================================================
 // 2. KEY GENERATION HELPERS
 // ================================================================================================

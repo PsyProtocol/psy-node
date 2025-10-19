@@ -49,6 +49,7 @@ chrono = "0.4.39"
 rand = "0.8.5"
 rand_core = "0.9"
 rand_pcg = "0.9"
+rand_chacha = "0.3"
 #bincode = { version = "=2.0.1", features = ["serde"] }
 bincode = { version = "=1.3.3" }
 serde_cbor = { version = "0.11.2" }

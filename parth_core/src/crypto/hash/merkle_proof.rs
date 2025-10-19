@@ -218,6 +218,7 @@ pub fn compute_historical_and_current_merkle_roots_core_gt<Hash: Copy, Hasher: M
     }
     (historical, current)
 }
+
 // Start Merkle Proof
 #[pderive::serialize_clone]
 #[derive(ts_rs::TS)]

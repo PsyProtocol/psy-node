@@ -45,3 +45,10 @@ rand = { workspace = true }
 
 hex = { workspace = true }
 hex-literal = { workspace = true }
+
+
+
+
+[[bench]]
+name = "main"
+harness = false
