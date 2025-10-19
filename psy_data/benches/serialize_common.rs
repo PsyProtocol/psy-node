@@ -178,18 +178,21 @@ fn benckmark_serialize_round_trip_user_leaf_internal_known_type(c: &mut Criterio
         group.bench_with_input(BenchmarkId::new("serialize_rkyv", *count), &items, |b, l| {
             b.iter(||rkyv::to_bytes::<rkyv::rancor::Error>(black_box(l)).unwrap());
         });
+        /*
         group.bench_with_input(BenchmarkId::new("serialize_ffs_vec_of_self_ref", *count), &items, |b, l| {
             // `b.iter` runs the closure multiple times to get a stable measurement.
             // `black_box` prevents the compiler from optimizing away the function call.
             //b.iter(|| Vec::<PQEDUserLeaf::<F, Hash>>::read_from(black_box(l)));
             b.iter(|| ItemType::ffs_serialize_vec_of_self_ref(black_box(l)));
         });
+        */
         group.bench_with_input(BenchmarkId::new("serialize_psy_ser_serialize_vec_of_self_ref", *count), &items, |b, l| {
             // `b.iter` runs the closure multiple times to get a stable measurement.
             // `black_box` prevents the compiler from optimizing away the function call.
             //b.iter(|| Vec::<PQEDUserLeaf::<F, Hash>>::read_from(black_box(l)));
             b.iter(|| ItemType::psy_ser_serialize_vec_of_self_ref(black_box(l), false));
         });
+        /*
         group.bench_with_input(BenchmarkId::new("serialize_psy_ser_serialize_vec_of_self", *count), &items, |b, l| {
             // `b.iter` runs the closure multiple times to get a stable measurement.
             // `black_box` prevents the compiler from optimizing away the function call.
@@ -201,7 +204,7 @@ fn benckmark_serialize_round_trip_user_leaf_internal_known_type(c: &mut Criterio
             // `black_box` prevents the compiler from optimizing away the function call.
             //b.iter(|| Vec::<PQEDUserLeaf::<F, Hash>>::read_from(black_box(l)));
             b.iter(|| ItemType::pio_write_many_to_bytes(&black_box(l), false));
-        });
+        });*/
 
 
         
@@ -215,24 +218,27 @@ fn benckmark_serialize_round_trip_user_leaf_internal_known_type(c: &mut Criterio
         group.bench_with_input(BenchmarkId::new("deserialize_speedy", *count), &canonical_bytes, |b, l| {
             b.iter(|| ItemType::read_from_buffer(black_box(l)).unwrap());
         });
+        /*
         group.bench_with_input(BenchmarkId::new("ffs_deserialize_vec_of_self", *count), &canonical_bytes, |b, l| {
             // `b.iter` runs the closure multiple times to get a stable measurement.
             // `black_box` prevents the compiler from optimizing away the function call.
             //b.iter(|| Vec::<PQEDUserLeaf::<F, Hash>>::read_from(black_box(l)));
             b.iter(|| ItemType::ffs_deserialize_vec_of_self(black_box(l)).unwrap());
-        });
+        });*/
         group.bench_with_input(BenchmarkId::new("psy_ser_deserialize_vec_of_self", *count), &canonical_bytes, |b, l| {
             // `b.iter` runs the closure multiple times to get a stable measurement.
             // `black_box` prevents the compiler from optimizing away the function call.
             //b.iter(|| Vec::<PQEDUserLeaf::<F, Hash>>::read_from(black_box(l)));
             b.iter(|| ItemType::psy_ser_deserialize_vec_of_self(black_box(l), false));
         });
+        /*
         group.bench_with_input(BenchmarkId::new("deserialize_pio_write_many_to_bytes", *count), &canonical_bytes, |b, l| {
             // `b.iter` runs the closure multiple times to get a stable measurement.
             // `black_box` prevents the compiler from optimizing away the function call.
             //b.iter(|| Vec::<PQEDUserLeaf::<F, Hash>>::read_from(black_box(l)));
             b.iter(|| ItemType::pio_read_many_from_ref_bytes(&black_box(l), None));
         });
+        */
         group.bench_with_input("deserialize_rkyv_many", &rkyv_bytes, |b, l| {
             // `b.iter` runs the closure multiple times to get a stable measurement.
             // `black_box` prevents the compiler from optimizing away the function call.
