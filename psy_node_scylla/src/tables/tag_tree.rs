@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use futures::future::join_all;
 use parth_core::{
     crypto::hash::{
-        tag_tree::{hash_tag_tree_node, TagTreeMerkleProof, TagTreeNodePreimage, TagTreeNodeStorage, TagTreeProofNode},
+        tag_tree::{hash_tag_tree_node, TagTreeMerkleProof, TagTreeNodePreimage, TagTreeStorageNode, TagTreeProofNode},
         traits::MerkleHasher,
     },
     data::{
@@ -318,7 +318,7 @@ impl ScyllaTagTreeNodesPreparedStatements {
         session: &Session,
         unique_pending_id: u64,
         key: &SimpleMerkleNodeKey,
-    ) -> anyhow::Result<Option<TagTreeNodeStorage<Hash>>> {
+    ) -> anyhow::Result<Option<TagTreeStorageNode<Hash>>> {
         let res = session
             .execute_unpaged(
                 &self.select_1_value_and_tag_prepared,
@@ -332,7 +332,7 @@ impl ScyllaTagTreeNodesPreparedStatements {
         let rows = res.into_rows_result()?;
         if let Some(row) = rows.maybe_first_row::<(Option<Vec<u8>>, Option<Vec<u8>>)>()? {
             match (row.0, row.1) {
-                (Some(value_data), Some(tag_data)) => Ok(Some(TagTreeNodeStorage {
+                (Some(value_data), Some(tag_data)) => Ok(Some(TagTreeStorageNode {
                     value: Hash::from_bytes(&value_data)?,
                     tag: Hash::from_bytes(&tag_data)?,
                 })),
@@ -532,7 +532,7 @@ impl ScyllaTagTreeNodesPreparedStatements {
         session: &Session,
         unique_pending_id: u64,
         keys: &[SimpleMerkleNodeKey],
-    ) -> anyhow::Result<Vec<Option<TagTreeNodeStorage<Hash>>>> {
+    ) -> anyhow::Result<Vec<Option<TagTreeStorageNode<Hash>>>> {
         let mut results = Vec::with_capacity(keys.len());
         let unique_pending_id_i64 = u64_to_i64_exact(unique_pending_id);
         let keys_i64 = keys
@@ -550,7 +550,7 @@ impl ScyllaTagTreeNodesPreparedStatements {
                         let rows = res.into_rows_result()?;
                         if let Some(row) = rows.maybe_first_row::<(Option<Vec<u8>>, Option<Vec<u8>>)>()? {
                             match (row.0, row.1) {
-                                (Some(value_data), Some(tag_data)) => anyhow::Ok(Some(TagTreeNodeStorage {
+                                (Some(value_data), Some(tag_data)) => anyhow::Ok(Some(TagTreeStorageNode {
                                     value: Hash::from_bytes(&value_data)?,
                                     tag: Hash::from_bytes(&tag_data)?,
                                 })),
@@ -614,7 +614,7 @@ impl ScyllaTagTreeNodesPreparedStatements {
         session: &Session,
         unique_pending_id: u64,
         keys: &[SimpleMerkleNodeKey],
-    ) -> anyhow::Result<Vec<TagTreeNodeStorage<Hash>>> {
+    ) -> anyhow::Result<Vec<TagTreeStorageNode<Hash>>> {
         let mut results = Vec::with_capacity(keys.len());
         let unique_pending_id_i64 = u64_to_i64_exact(unique_pending_id);
         let keys_i64 = keys
@@ -632,17 +632,17 @@ impl ScyllaTagTreeNodesPreparedStatements {
                         let rows = res.into_rows_result()?;
                         if let Some(row) = rows.maybe_first_row::<(Option<Vec<u8>>, Option<Vec<u8>>)>()? {
                             match (row.0, row.1) {
-                                (Some(value_data), Some(tag_data)) => anyhow::Ok(TagTreeNodeStorage {
+                                (Some(value_data), Some(tag_data)) => anyhow::Ok(TagTreeStorageNode {
                                     value: Hash::from_bytes(&value_data)?,
                                     tag: Hash::from_bytes(&tag_data)?,
                                 }),
-                                _ => Ok(TagTreeNodeStorage {
+                                _ => Ok(TagTreeStorageNode {
                                     value: Hash::get_zero_value(),
                                     tag: Hash::get_zero_value(),
                                 }),
                             }
                         } else {
-                            Ok(TagTreeNodeStorage {
+                            Ok(TagTreeStorageNode {
                                 value: Hash::get_zero_value(),
                                 tag: Hash::get_zero_value(),
                             })

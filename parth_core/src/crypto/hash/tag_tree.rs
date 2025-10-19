@@ -63,12 +63,12 @@ pub fn verify_tag_tree_proof<Hash: PartialEq + Copy, Hasher: MerkleHasher<Hash>>
 
 
 #[pderive::serialize_copy_ts_export]
-pub struct TagTreeNodeStorage<Hash> {
+pub struct TagTreeStorageNode<Hash> {
     pub value: Hash,
     pub tag: Hash,
 }
 
-impl<Hash: Default> Default for TagTreeNodeStorage<Hash> {
+impl<Hash: Default> Default for TagTreeStorageNode<Hash> {
     fn default() -> Self {
         Self {
             value: Default::default(),
@@ -76,7 +76,7 @@ impl<Hash: Default> Default for TagTreeNodeStorage<Hash> {
         }
     }
 }
-impl<Hash: QPDSerializableFixed + Copy> QPDSerializable for TagTreeNodeStorage<Hash> {
+impl<Hash: QPDSerializableFixed + Copy> QPDSerializable for TagTreeStorageNode<Hash> {
     fn to_bytes(&self) -> anyhow::Result<Vec<u8>> {
         let mut result = Vec::with_capacity(Hash::get_fixed_size() * 2);
         result.extend_from_slice(self.value.to_bytes()?.as_slice());
@@ -86,7 +86,7 @@ impl<Hash: QPDSerializableFixed + Copy> QPDSerializable for TagTreeNodeStorage<H
 
     fn from_bytes(bytes: &[u8]) -> anyhow::Result<Self> {
         if bytes.len() != Hash::get_fixed_size() * 2 {
-            anyhow::bail!("TagTreeNodeStorage: expected {} bytes, got {}", Hash::get_fixed_size() * 2, bytes.len());
+            anyhow::bail!("TagTreeStorageNode: expected {} bytes, got {}", Hash::get_fixed_size() * 2, bytes.len());
         }
         let value = Hash::from_bytes(&bytes[0..Hash::get_fixed_size()])?;
         let tag = Hash::from_bytes(&bytes[Hash::get_fixed_size()..Hash::get_fixed_size() * 2])?;
@@ -125,12 +125,6 @@ pub struct TagTreeProofNode<Hash> {
 }
 
 
-
-#[pderive::serialize_copy_ts_export]
-pub struct TagTreeStorageNode<Hash> {
-    pub value: Hash,
-    pub tag: Hash,
-}
 
 
 
