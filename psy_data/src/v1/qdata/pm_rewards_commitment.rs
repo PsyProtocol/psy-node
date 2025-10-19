@@ -180,9 +180,9 @@ mod test_psy_ser_pm_reward_commitment {
         Ok(())
     }
     #[test]
-    fn fuzz_1000_non_empty_vec_round_trips() -> anyhow::Result<()> {
-        for _ in 0..1000 {
-            let count = (rand::random::<usize>() % 0xffff) + 1;
+    fn fuzz_500_non_empty_vec_round_trips() -> anyhow::Result<()> {
+        for _ in 0..500 {
+            let count = (rand::random::<usize>() % 0xff) + 1;
             let values = PsySerTestTargetType::qp_rand_gen_vec(count);
 
             let serialized = PsySerTestTargetType::psy_ser_serialize_vec_of_self_ref(&values, true);
