@@ -877,3 +877,494 @@ macro_rules! impl_psy_ser_basic_tests {
             }
     };
 }
+
+/// Generates a test suite for types implementing `FastFixedSerializable`.
+///
+/// This macro creates a unique test module name for each invocation by appending
+/// the snake_cased struct name, e.g., `ffs_tests_my_struct_name`.
+///
+/// # Pre-requisites
+///
+/// This macro requires the `paste` crate in `dev-dependencies`.
+
+/// Generates a comprehensive test suite for a `FastFixedSerializable` implementation
+/// that uses `bytemuck`.
+///
+/// This macro should be called after `impl_bytemuck_ffs` and will verify the
+/// correctness of the implementation, including single-item and vector roundtrips,
+/// error handling, and behavior with unaligned data.
+///
+/// # Pre-requisites
+///
+/// The tested struct MUST implement:
+/// 1. `QPGenRandom` to generate test instances.
+/// 2. `PartialEq` and `Clone` to compare results.
+///
+/// # Usage
+///
+/// ```rust,ignore
+/// impl_bytemuck_ffs_tests!(
+///     // 1. The name of the struct.
+///     MyStruct,
+///     // 2. The concrete types to use when creating an instance for testing.
+///     //    These must match the order of the generic parameters.
+///     { ConcreteField, ConcreteHash },
+///     // 3. The compile-time constant size of the struct in bytes.
+///     128
+/// );
+/// ```
+///
+/// To use `crate::utils::QPGenRandom` instead of `parth_core::utils::QPGenRandom`,
+/// add `, true` at the end:
+///
+/// ```rust,ignore
+/// impl_bytemuck_ffs_tests!(MyStruct, { ConcreteField, ConcreteHash }, 128, true);
+/// ```
+#[macro_export]
+macro_rules! impl_bytemuck_ffs_tests_rn {
+    (
+        $struct_name:ident,
+        { $($concrete_type:ty),* },
+        $size:literal $(,)?
+    ) => {
+        $crate::impl_bytemuck_ffs_tests_rn!(@gen
+            $struct_name,
+            { $($concrete_type),* },
+            $size,
+            parth_core::utils::QPGenRandom
+        );
+    };
+    (
+        $struct_name:ident,
+        { $($concrete_type:ty),* },
+        $size:literal,
+        true
+    ) => {
+        $crate::impl_bytemuck_ffs_tests_rn!(@gen
+            $struct_name,
+            { $($concrete_type),* },
+            $size,
+            crate::utils::QPGenRandom
+        );
+    };
+    (@gen
+        $struct_name:ident,
+        { $($concrete_type:ty),* },
+        $size:literal,
+        $qp_gen_path:path
+    ) => {
+        #[cfg(all(test, target_endian = "little", feature = "serialize_bytemuck"))]
+        // Use the `paste` crate to create a unique module name.
+        // e.g., for `TagTreeStorageNode`, this generates `mod ffs_tests_tag_tree_storage_node { ... }`
+        paste::paste! {
+            #[cfg(test)]
+            mod [<ffs_tests_ $struct_name:snake>] {
+
+            use super::*;
+            use psy_serialize::FastFixedSerializable;
+            use $qp_gen_path;
+
+            const SIZE_OF_ITEM: usize = $size;
+            type ItemForTesting = $struct_name<$($concrete_type),*>;
+
+            fn gen_item_vec(count: usize) -> Vec<ItemForTesting> {
+                let mut base = Vec::with_capacity(count);
+                for _ in 0..count {
+                    base.push(ItemForTesting::qp_rand_gen());
+                }
+                base
+            }
+            #[test]
+            fn test_ffs_serialization_fuzz_many_v0() {
+                let many = gen_item_vec(100_000);
+                let original = many.clone();
+                let start_time = ::std::time::Instant::now();
+                let bytes = ItemForTesting::ffs_serialize_vec_of_self(many);
+                let deserialized = ItemForTesting::ffs_deserialize_vec_of_self(&bytes).unwrap();
+                let duration = start_time.elapsed();
+                println!("Serialized and deserialized 100_000 in {:?}", duration);
+                assert_eq!(original.len(), deserialized.len());
+                for (o, d) in original.iter().zip(deserialized.iter()) {
+                    assert_eq!(o, d);
+                }
+            }
+
+            fn gen_single_item() -> ItemForTesting {
+                ItemForTesting::qp_rand_gen()
+            }
+
+            // --- Single Item Serialization Tests ---
+
+            #[test]
+            fn test_ffs_to_bytes_and_from_slice() {
+                let original = gen_single_item();
+                let bytes_arr = original.ffs_to_bytes();
+                let deserialized = ItemForTesting::ffs_from_slice_or_panic(&bytes_arr);
+                assert_eq!(original, deserialized);
+            }
+
+            #[test]
+            fn test_ffs_into_bytes_and_from_owned_bytes() {
+                let original = gen_single_item();
+                let bytes_arr = original.ffs_into_bytes();
+                let deserialized = ItemForTesting::ffs_from_owned_bytes(bytes_arr);
+                assert_eq!(original, deserialized);
+            }
+
+            #[test]
+            fn test_ffs_try_from_slice_valid() {
+                let original = gen_single_item();
+                let bytes = original.ffs_to_bytes();
+                let result = ItemForTesting::ffs_try_from_slice(&bytes);
+                assert!(result.is_ok());
+                assert_eq!(original, result.unwrap());
+            }
+
+            // --- Error Condition Tests for Single Items ---
+
+            #[test]
+            fn test_ffs_try_from_slice_invalid_length() {
+                // Test with a slice that is too short
+                let short_data = vec![0u8;  SIZE_OF_ITEM - 1];
+                let result = ItemForTesting::ffs_try_from_slice(&short_data);
+                assert!(result.is_err(), "Should fail with slice too short");
+
+                // Test with a slice that is too long
+                let long_data = vec![0u8;  SIZE_OF_ITEM + 1];
+                let result = ItemForTesting::ffs_try_from_slice(&long_data);
+                assert!(result.is_err(), "Should fail with slice too long");
+            }
+
+            #[test]
+            #[should_panic]
+            fn test_ffs_from_slice_or_panic_with_invalid_length() {
+                let short_data = vec![0u8; 10];
+                // This should panic because the length is incorrect
+                ItemForTesting::ffs_from_slice_or_panic(&short_data);
+            }
+
+            // --- Vector Serialization/Deserialization Tests ---
+
+            #[test]
+            fn test_deserialization_of_unaligned_data() {
+                const N: usize =  SIZE_OF_ITEM;
+                let original_vec: Vec<_> = gen_item_vec(10);
+
+                // Create a perfectly valid byte representation of our vector.
+                let valid_bytes = ItemForTesting::ffs_serialize_vec_of_self_ref(&original_vec);
+                assert_eq!(valid_bytes.len(), 10 * N);
+
+                // Now, create a larger buffer and copy the valid bytes into it at an
+                // offset of 1, guaranteeing the sub-slice is unaligned for any type
+                // with alignment > 1 (which ItemForTesting likely has).
+                let mut unaligned_buffer = vec![0u8; valid_bytes.len() + 1];
+                unaligned_buffer[1..].copy_from_slice(&valid_bytes);
+
+                // Create the unaligned slice. Direct casting would fail on this.
+                let unaligned_slice = &unaligned_buffer[1..];
+                assert_eq!(unaligned_slice.len(), valid_bytes.len());
+
+                // 1. Test ffs_deserialize_vec_of_self with the unaligned slice.
+                // This should succeed by using the copying fallback.
+                let result_from_slice = ItemForTesting::ffs_deserialize_vec_of_self(unaligned_slice);
+                assert!(result_from_slice.is_ok(), "Deserializing from unaligned slice should succeed");
+                assert_eq!(original_vec, result_from_slice.unwrap());
+
+                // 2. Test ffs_deserialize_vec_of_self_owned with an unaligned Vec.
+                // This simulates passing an owned Vec<u8> with an unaligned buffer.
+                let unaligned_owned_vec = unaligned_slice.to_vec();
+
+                let result_from_owned = ItemForTesting::ffs_deserialize_vec_of_self_owned(unaligned_owned_vec);
+                assert!(result_from_owned.is_ok(), "Deserializing from unaligned owned vec should succeed");
+                assert_eq!(original_vec, result_from_owned.unwrap());
+            }
+
+            #[test]
+            fn test_vec_serialization_deserialization_roundtrip() {
+                let original_vec = gen_item_vec(69);
+
+                // Test `ffs_serialize_vec_of_self` (takes ownership)
+                let bytes = ItemForTesting::ffs_serialize_vec_of_self(original_vec.clone());
+
+                // Test `ffs_deserialize_vec_of_self` (takes a slice)
+                let deserialized_vec_result = ItemForTesting::ffs_deserialize_vec_of_self(&bytes);
+
+                assert!(deserialized_vec_result.is_ok());
+                assert_eq!(original_vec, deserialized_vec_result.unwrap());
+            }
+
+            #[test]
+            fn test_vec_ref_serialization_deserialization_roundtrip() {
+                let original_vec = gen_item_vec(1337);
+
+                // Test `ffs_serialize_vec_of_self_ref` (takes a slice)
+                let bytes = ItemForTesting::ffs_serialize_vec_of_self_ref(&original_vec);
+
+                // Test `ffs_deserialize_vec_of_self_owned` (takes ownership)
+                let deserialized_vec_result = ItemForTesting::ffs_deserialize_vec_of_self_owned(bytes);
+
+                assert!(deserialized_vec_result.is_ok());
+                assert_eq!(original_vec, deserialized_vec_result.unwrap());
+            }
+
+            // --- Error Condition and Edge Case Tests for Vectors ---
+
+            #[test]
+            fn test_deserialize_vec_with_invalid_length() {
+                let valid_bytes = ItemForTesting::ffs_serialize_vec_of_self(gen_item_vec(2));
+
+                // Create a byte vector with a length that's not a multiple of the object size
+                let mut invalid_bytes = valid_bytes;
+                invalid_bytes.push(0xAB); // Add an extra byte
+
+                let result = ItemForTesting::ffs_deserialize_vec_of_self(&invalid_bytes);
+                assert!(result.is_err(), "Deserialization should fail for data with incorrect length");
+            }
+
+            #[test]
+            fn test_empty_vec_serialization_roundtrip() {
+                let empty_vec: Vec<ItemForTesting> = Vec::new();
+
+                // Serialize empty vector (ref)
+                let bytes_ref = ItemForTesting::ffs_serialize_vec_of_self_ref(&empty_vec);
+                assert!(bytes_ref.is_empty());
+
+                // Serialize empty vector (owned)
+                let bytes_owned = ItemForTesting::ffs_serialize_vec_of_self(empty_vec.clone());
+                assert!(bytes_owned.is_empty());
+
+                // Deserialize back from empty byte slice
+                let deserialized_result = ItemForTesting::ffs_deserialize_vec_of_self(&bytes_ref);
+                assert!(deserialized_result.is_ok());
+                assert!(deserialized_result.unwrap().is_empty());
+            }
+
+            #[test]
+            fn test_single_element_vec_serialization_roundtrip() {
+                let single_element_vec = gen_item_vec(1);
+
+                let bytes = ItemForTesting::ffs_serialize_vec_of_self_ref(&single_element_vec);
+                assert_eq!(bytes.len(),  SIZE_OF_ITEM);
+
+                let deserialized_result = ItemForTesting::ffs_deserialize_vec_of_self(&bytes);
+                assert!(deserialized_result.is_ok());
+                assert_eq!(single_element_vec, deserialized_result.unwrap());
+            }
+
+            // --- Fuzz and Performance Test ---
+
+            #[test]
+            fn test_ffs_serialization_fuzz_many() {
+                let many = gen_item_vec(1_000);
+                let original = many.clone();
+
+                let start_time = ::std::time::Instant::now();
+
+                // Serialize using the bytemuck-optimized method
+                let bytes = ItemForTesting::ffs_serialize_vec_of_self(many);
+                // Deserialize using the bytemuck-optimized method
+                let deserialized = ItemForTesting::ffs_deserialize_vec_of_self(&bytes).unwrap();
+
+                let duration = start_time.elapsed();
+                println!(
+                    "Optimized bytemuck S/D of 1,000 {} took: {:?}",
+                    stringify!($struct_name),
+                    duration
+                );
+
+                // Verify correctness
+                assert_eq!(original.len(), deserialized.len());
+                assert_eq!(original, deserialized, "The deserialized vector must be identical to the original");
+            }
+                    
+            }
+        }
+    };
+}
+
+/// A comprehensive macro to implement fast, fixed-size, zero-copy serialization
+/// for a `#[repr(C)]` struct.
+///
+/// This macro is a convenient bundle that generates:
+/// 1. `bytemuck::Pod` and `bytemuck::Zeroable` trait implementations.
+/// 2. The `psy_serialize::FastFixedSerializable` implementation using `bytemuck`.
+/// 3. A test suite for the `FastFixedSerializable` implementation.
+/// 4. `PsyCanonicalSerializeMetadata` to declare the type as fixed-size.
+/// 5. `AutoDatabaseSerializationUseFastFixedSerialize` to enable optimizations.
+/// 6. Implementations for the canonical `psy-serialize` traits that delegate to the
+///    high-performance `ffs_` methods.
+/// 7. A compile-time check to ensure the provided size constant matches the
+///    actual implementation size.
+///
+/// # Usage
+///
+/// ```rust,ignore
+/// impl_ffs_psy_serialize_fixed_size!(
+///     // 1. The name of the struct.
+///     MyStruct,
+///     // 2. Generics definition: { Bounds } => { Names }.
+///     { F: Trait1, H: Trait2 } => { F, H },
+///     // 3. The compile-time constant size of the struct in bytes.
+///     128,
+///     // 4. Concrete types for use in tests and compile-time checks.
+///     { ConcreteF, ConcreteH },
+///     // 5. The name of an existing `const` variable that holds the expected size.
+///     //    This is used for a compile-time assertion.
+///     MY_STRUCT_EXPECTED_SIZE
+/// );
+/// ```
+#[macro_export]
+macro_rules! impl_ffs_psy_serialize_fixed_size {
+    (
+        $struct_name:ident,
+        { $( $generic_param:ident: $trait_bound:path ),* } => { $( $generic_name:ident ),* },
+        $size:literal,
+        { $( $concrete_type:ty ),* },
+        $size_check_const:ident
+    ) => {
+        // Step 1: Implement Pod and Zeroable, which are prerequisites for bytemuck.
+        // Assumes the crate alias `pser` exists or these macros are in the current crate.
+        pser::impl_bytemuck_pod_and_zeroable!($struct_name, $( $generic_name ),*);
+
+        // Step 2: Implement the high-performance FastFixedSerializable trait.
+        pser::impl_bytemuck_ffs!(
+            $struct_name,
+            { $( $generic_param: $trait_bound ),* },
+            $size
+        );
+
+        // Step 3: Generate a test suite for the FFS implementation.
+        pser::impl_bytemuck_ffs_tests!(
+            $struct_name,
+            { $( $concrete_type ),* },
+            $size
+        );
+
+        // Step 4: Implement metadata traits to inform the serialization system
+        // that this type is fixed-size and can use the fast path.
+        impl<$( $generic_param: $trait_bound ),*> psy_serialize::PsyCanonicalSerializeMetadata for $struct_name<$($generic_name),*> {
+            const IS_FIXED_SIZE: bool = true;
+            const FIXED_SIZE: usize = $size;
+        }
+        impl<$( $generic_param: $trait_bound + Copy),*> psy_serialize::AutoDatabaseSerializationUseFastFixedSerialize<$size> for $struct_name<$($generic_name),*> {}
+
+        // Step 5: Implement the canonical serialization traits by delegating to the
+        // fast fixed-size (`ffs_`) methods.
+        psy_serialize::impl_psy_canonical_serialize_for_fixed_type!(
+            $struct_name,
+            { $( $generic_param: $trait_bound ),* } => { $( $generic_name ),* },
+            $size
+        );
+
+        // Step 6: A compile-time check function. This function is never called,
+        // but its body enforces that the type of `ffs_into_bytes()` (which is
+        // `[u8; $size]`) matches the type `[u8; $size_check_const]`.
+        // If `$size` and `$size_check_const` are not equal, this will fail to compile.
+        #[allow(unused)]
+        #[allow(non_snake_case)]
+        fn _ensure_compile_time_size_match() {
+            // This function uses a type annotation to enforce a compile-time size match.
+            // `ffs_into_bytes()` returns `[u8; $size]`.
+            // The variable is explicitly typed as `[u8; $size_check_const]`.
+            // If the two constants differ, the Rust compiler will error due to a type mismatch.
+            let _bytes_check: [u8; $size_check_const] =
+                $struct_name::<$($concrete_type),*>::qp_rand_gen().ffs_into_bytes();
+        }
+    };
+}
+
+
+/// A comprehensive macro to implement fast, fixed-size, zero-copy serialization
+/// for a `#[repr(C)]` struct.
+///
+/// This macro is a convenient bundle that generates:
+/// 1. `bytemuck::Pod` and `bytemuck::Zeroable` trait implementations.
+/// 2. The `psy_serialize::FastFixedSerializable` implementation using `bytemuck`.
+/// 3. A test suite for the `FastFixedSerializable` implementation.
+/// 4. `PsyCanonicalSerializeMetadata` to declare the type as fixed-size.
+/// 5. `AutoDatabaseSerializationUseFastFixedSerialize` to enable optimizations.
+/// 6. Implementations for the canonical `psy-serialize` traits that delegate to the
+///    high-performance `ffs_` methods.
+/// 7. A compile-time check to ensure the provided size constant matches the
+///    actual implementation size.
+///
+/// # Usage
+///
+/// ```rust,ignore
+/// impl_ffs_psy_serialize_fixed_size!(
+///     // 1. The name of the struct.
+///     MyStruct,
+///     // 2. Generics definition: { Bounds } => { Names }.
+///     { F: Trait1, H: Trait2 } => { F, H },
+///     // 3. The compile-time constant size of the struct in bytes.
+///     128,
+///     // 4. Concrete types for use in tests and compile-time checks.
+///     { ConcreteF, ConcreteH },
+///     // 5. The name of an existing `const` variable that holds the expected size.
+///     //    This is used for a compile-time assertion.
+///     MY_STRUCT_EXPECTED_SIZE
+/// );
+/// ```
+#[macro_export]
+macro_rules! impl_ffs_psy_serialize_fixed_size_pc {
+    (
+        $struct_name:ident,
+        { $( $generic_param:ident: $trait_bound:path ),* } => { $( $generic_name:ident ),* },
+        $size:literal,
+        { $( $concrete_type:ty ),* },
+        $size_check_const:ident
+    ) => {
+        // Step 1: Implement Pod and Zeroable, which are prerequisites for bytemuck.
+        // Assumes the crate alias `pser` exists or these macros are in the current crate.
+        pser::impl_bytemuck_pod_and_zeroable!($struct_name, $( $generic_name ),*);
+
+        // Step 2: Implement the high-performance FastFixedSerializable trait.
+        pser::impl_bytemuck_ffs!(
+            $struct_name,
+            { $( $generic_param: $trait_bound ),* },
+            $size
+        );
+
+        // Step 3: Generate a test suite for the FFS implementation.
+        pser::impl_bytemuck_ffs_tests_rn!(
+            $struct_name,
+            { $( $concrete_type ),* },
+            $size,
+            true
+        );
+
+        // Step 4: Implement metadata traits to inform the serialization system
+        // that this type is fixed-size and can use the fast path.
+        impl<$( $generic_param: $trait_bound ),*> psy_serialize::PsyCanonicalSerializeMetadata for $struct_name<$($generic_name),*> {
+            const IS_FIXED_SIZE: bool = true;
+            const FIXED_SIZE: usize = $size;
+        }
+        impl<$( $generic_param: $trait_bound + Copy),*> psy_serialize::AutoDatabaseSerializationUseFastFixedSerialize<$size> for $struct_name<$($generic_name),*> {}
+
+        // Step 5: Implement the canonical serialization traits by delegating to the
+        // fast fixed-size (`ffs_`) methods.
+        psy_serialize::impl_psy_canonical_serialize_for_fixed_type!(
+            $struct_name,
+            { $( $generic_param: $trait_bound ),* } => { $( $generic_name ),* },
+            $size
+        );
+
+        // Step 6: A compile-time check function. This function is never called,
+        // but its body enforces that the type of `ffs_into_bytes()` (which is
+        // `[u8; $size]`) matches the type `[u8; $size_check_const]`.
+        // If `$size` and `$size_check_const` are not equal, this will fail to compile.
+        /*#[allow(unused)]
+        #[allow(non_snake_case)]
+        fn _ensure_compile_time_size_match() {
+            use psy_serialize::FastFixedSerializable;
+            // This function uses a type annotation to enforce a compile-time size match.
+            // `ffs_into_bytes()` returns `[u8; $size]`.
+            // The variable is explicitly typed as `[u8; $size_check_const]`.
+            // If the two constants differ, the Rust compiler will error due to a type mismatch.
+            let _bytes_check: [u8; $size_check_const] =
+                $struct_name::<$($concrete_type),*>::qp_rand_gen().ffs_into_bytes();
+        }*/
+    };
+}
+
+

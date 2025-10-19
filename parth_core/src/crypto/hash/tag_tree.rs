@@ -1,7 +1,13 @@
 use pser::{QBytesSerialize, QBytesDeserialize};
 use serde::{Deserialize, Serialize};
 
-use crate::{crypto::hash::traits::MerkleHasher, data::serializable::{QPDSerializable, QPDSerializableFixed}};
+use crate::{crypto::hash::traits::MerkleHasher, data::serializable::{QPDSerializable, QPDSerializableFixed}, protocol::core_types::Q256BitHash, utils::QPGenRandom};
+
+// TagTreeStorageNode size in bytes
+// value(32 bytes) + tag(32 bytes) = 64 bytes
+pub const PSY_OBJECT_FFS_SIZE_TAG_TREE_STORAGE_NODE: usize = 64;
+pub const PSY_OBJECT_FFS_SIZE_TAG_TREE_PROOF_NODE: usize = 64;
+
 /*
 
 Level[0][0] = hash(hash(0,0),Tag[0][0])
@@ -63,11 +69,29 @@ pub fn verify_tag_tree_proof<Hash: PartialEq + Copy, Hasher: MerkleHasher<Hash>>
 
 
 #[pderive::serialize_copy_ts_export]
+#[repr(C)]
 pub struct TagTreeStorageNode<Hash> {
     pub value: Hash,
     pub tag: Hash,
 }
+impl<Hash: QPGenRandom> QPGenRandom for TagTreeStorageNode<Hash> {
+    fn qp_rand_gen() -> Self {
+        Self {
+            value: Hash::qp_rand_gen(),
+            tag: Hash::qp_rand_gen(),
+        }
+    }
+}
 
+
+
+pser::impl_ffs_psy_serialize_fixed_size_pc!(
+    TagTreeStorageNode,
+    { Hash: Q256BitHash } => { Hash },
+    64,
+    { crate::PHash },
+    PSY_OBJECT_FFS_SIZE_TAG_TREE_STORAGE_NODE
+);
 impl<Hash: Default> Default for TagTreeStorageNode<Hash> {
     fn default() -> Self {
         Self {
@@ -95,6 +119,7 @@ impl<Hash: QPDSerializableFixed + Copy> QPDSerializable for TagTreeStorageNode<H
 }
 
 #[pderive::serialize_copy_ts_export]
+#[repr(C)]
 pub struct TagTreeNodePreimage<Hash> {
     pub left: Hash,
     pub right: Hash,
@@ -119,16 +144,34 @@ impl<Hash> TagTreeNodePreimage<Hash> {
 
 
 #[pderive::serialize_copy_ts_export]
+#[repr(C)]
 pub struct TagTreeProofNode<Hash> {
     pub sibling: Hash,
     pub parent_tag: Hash,
 }
 
+impl<Hash: QPGenRandom> QPGenRandom for TagTreeProofNode<Hash> {
+    fn qp_rand_gen() -> Self {
+        Self {
+            sibling: Hash::qp_rand_gen(),
+            parent_tag: Hash::qp_rand_gen(),
+        }
+    }
+}
 
 
+
+pser::impl_ffs_psy_serialize_fixed_size_pc!(
+    TagTreeProofNode,
+    { Hash: Q256BitHash } => { Hash },
+    64,
+    { crate::PHash },
+    PSY_OBJECT_FFS_SIZE_TAG_TREE_PROOF_NODE
+);
 
 
 #[pderive::serialize_clone_ts_export]
+#[repr(C)]
 pub struct TagTreeMerkleProofPartial<Hash> {
     pub index: u64,
     pub leaf: TagTreeNodePreimage<Hash>,
@@ -159,6 +202,7 @@ impl<Hash: PartialEq + Copy> TagTreeMerkleProofPartial<Hash> {
     }
 }
 #[pderive::serialize_clone_ts_export]
+#[repr(C)]
 pub struct TagTreeMerkleProof<Hash> {
     pub index: u64,
     pub leaf: TagTreeNodePreimage<Hash>,

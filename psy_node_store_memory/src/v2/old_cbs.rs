@@ -1,15 +1,21 @@
+//! In-memory database implementation using crossbeam-skiplist, satisfying the CoreDatabase traits.
 
+#![allow(unused_imports)]
+#![allow(dead_code)]
+
+use anyhow::Context;
 use async_trait::async_trait;
+use auto_impl::auto_impl;
 use crossbeam_skiplist::SkipMap;
 use dashmap::DashMap;
 use futures::future;
 use parth_core::{
     crypto::hash::{
         tag_tree::{
-            hash_tag_tree_node, TagTreeMerkleProof,
+            compute_tag_tree_root_for_proof, hash_tag_tree_node, TagTreeMerkleProof,
             TagTreeNodePreimage, TagTreeProofNode, TagTreeStorageNode,
         },
-        traits::MerkleZeroHasher,
+        traits::{MerkleHasher, MerkleZeroHasher},
     },
     data::{
         db::{
@@ -31,30 +37,38 @@ use parth_core::{
                 QMS_FAST_SERIALIZER_SINGLE_ID_NODE_SIZE, QMS_FAST_SERIALIZER_ZERO_ID_NODE_SIZE,
             },
             merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey},
+            merkle_store_key::QMerkleStoreDoubleIdNode,
         },
         serializable::QPDPair,
     },
-    protocol::core_types::{QDBHashBase, QHashBase},
+    protocol::core_types::{QDBHashBase, QHash256Base, QHashBase},
 };
 use psy_node_core::store::traits::core_db::{
-    CoreDatabaseBidirectionalMappingReader, CoreDatabaseBidirectionalMappingWriter, CoreDatabaseBidirectionalU64U128MappingReader,
-    CoreDatabaseBidirectionalU64U128MappingWriter,
+    CoreDatabaseBidirectionalMappingReader, CoreDatabaseBidirectionalMappingStore,
+    CoreDatabaseBidirectionalMappingWriter, CoreDatabaseBidirectionalU64U128MappingReader,
+    CoreDatabaseBidirectionalU64U128MappingStore, CoreDatabaseBidirectionalU64U128MappingWriter,
     CoreDatabaseDoubleIdCheckpointedReader, CoreDatabaseDoubleIdCheckpointedWriter,
     CoreDatabaseDoubleIdMerkleReader, CoreDatabaseDoubleIdMerkleWriter, CoreDatabaseKivReader,
-    CoreDatabaseKivWriter, CoreDatabaseSingleIdCheckpointedReader, CoreDatabaseSingleIdCheckpointedWriter,
-    CoreDatabaseSingleIdMerkleReader, CoreDatabaseSingleIdMerkleWriter, CoreDatabaseTagTreeReader, CoreDatabaseTagTreeWriter,
-    CoreDatabaseU64Reader, CoreDatabaseU64Store, CoreDatabaseU64Writer, CoreDatabaseZeroIdMerkleReader, CoreDatabaseZeroIdMerkleWriter,
+    CoreDatabaseKivStore, CoreDatabaseKivWriter, CoreDatabaseReader,
+    CoreDatabaseSingleIdCheckpointedReader, CoreDatabaseSingleIdCheckpointedWriter,
+    CoreDatabaseSingleIdMerkleReader, CoreDatabaseSingleIdMerkleWriter, CoreDatabaseStore,
+    CoreDatabaseTagTreeReader, CoreDatabaseTagTreeStore, CoreDatabaseTagTreeWriter,
+    CoreDatabaseU64Reader, CoreDatabaseU64Store, CoreDatabaseU64Writer, CoreDatabaseWriter,
+    CoreDatabaseZeroIdMerkleReader, CoreDatabaseZeroIdMerkleWriter,
 };
 use psy_serialize::{PsyCanonicalDatabaseSerializeBaseSingle, PsySerializeCanonicalAsyncSafe};
+use serde::{de::DeserializeOwned, Serialize};
 use std::{
+    borrow::Borrow,
     marker::PhantomData,
+    ops::RangeBounds,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
 };
+use uuid::Uuid;
 
-#[cfg(feature = "parallel_rayon")]
 use rayon::{iter::ParallelIterator, slice::ParallelSlice};
 
 // ================================================================================================
@@ -823,18 +837,12 @@ where
             anyhow::bail!("Invalid data length for ffs insert");
         }
         let db = self.get_or_create_table(&table.to_string());
-        let process_chunk = |chunk: &[u8]| {
+        rows.par_chunks_exact(object_size).for_each(|chunk| {
             let obj_id = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
             let value = &chunk[8..];
             let key = key_helpers::key_single_id_checkpointed(obj_id, checkpoint_id);
             db.insert(key, value.to_vec());
-        };
-
-        #[cfg(feature = "parallel_rayon")]
-        rows.par_chunks_exact(object_size).for_each(process_chunk);
-
-        #[cfg(not(feature = "parallel_rayon"))]
-        rows.chunks_exact(object_size).for_each(process_chunk);
+        });
         Ok(())
     }
     
@@ -850,14 +858,7 @@ where
             anyhow::bail!("Invalid data length for ffs insert");
         }
         let db = self.get_or_create_table(&table.to_string());
-        #[cfg(feature = "parallel_rayon")]
         rows.par_chunks_exact(object_size).for_each(|chunk| {
-            let obj_id = u64::from_le_bytes(chunk[object_id_location..object_id_location+8].try_into().unwrap());
-            let key = key_helpers::key_single_id_checkpointed(obj_id, checkpoint_id);
-            db.insert(key, chunk.to_vec());
-        });
-        #[cfg(not(feature = "parallel_rayon"))]
-        rows.chunks_exact(object_size).for_each(|chunk| {
             let obj_id = u64::from_le_bytes(chunk[object_id_location..object_id_location+8].try_into().unwrap());
             let key = key_helpers::key_single_id_checkpointed(obj_id, checkpoint_id);
             db.insert(key, chunk.to_vec());
@@ -1113,17 +1114,7 @@ where
     }
     async fn db_set_zero_id_merkle_nodes_from_fast_serialized(&self, table: &InMemoryTableIdentifier, checkpoint_id: u64, nodes: &[u8]) -> anyhow::Result<()> {
         let db = self.get_or_create_table(&table.to_string());
-
-        #[cfg(feature = "parallel_rayon")]
         nodes.par_chunks_exact(QMS_FAST_SERIALIZER_ZERO_ID_NODE_SIZE).for_each(|chunk| {
-            let (level, index, _cp, value_bytes) = QMerkleStoreFastZeroNodeSerializer::deserialize_zero_id_node_signed_insert_tuple::<Hash>(chunk, checkpoint_id as i64);
-            let key = SimpleMerkleNodeKey { level: level as u8, index: index as u64 };
-            let value = Hash::from_owned_32bytes(value_bytes);
-            let db_key = key_helpers::key_merkle_zero_id(&key, checkpoint_id);
-            db.insert(db_key, value.to_bytes().unwrap());
-        });
-        #[cfg(not(feature = "parallel_rayon"))]
-        nodes.chunks_exact(QMS_FAST_SERIALIZER_ZERO_ID_NODE_SIZE).for_each(|chunk| {
             let (level, index, _cp, value_bytes) = QMerkleStoreFastZeroNodeSerializer::deserialize_zero_id_node_signed_insert_tuple::<Hash>(chunk, checkpoint_id as i64);
             let key = SimpleMerkleNodeKey { level: level as u8, index: index as u64 };
             let value = Hash::from_owned_32bytes(value_bytes);
@@ -1177,8 +1168,6 @@ where
     }
     async fn db_set_single_id_merkle_nodes_from_fast_serialized(&self, table: &InMemoryTableIdentifier, checkpoint_id: u64, nodes: &[u8]) -> anyhow::Result<()> {
         let db = self.get_or_create_table(&table.to_string());
-        
-        #[cfg(feature = "parallel_rayon")]
         nodes.par_chunks_exact(QMS_FAST_SERIALIZER_SINGLE_ID_NODE_SIZE).for_each(|chunk| {
             let (tree_id, level, index, _cp, value_bytes) = QMerkleStoreFastSingleNodeSerializer::deserialize_single_id_node_signed_insert_tuple::<Hash>(chunk, checkpoint_id as i64);
             let key = SimpleMerkleNodeKey { level: level as u8, index: index as u64 };
@@ -1186,16 +1175,6 @@ where
             let db_key = key_helpers::key_merkle_single_id(tree_id as u64, &key, checkpoint_id);
             db.insert(db_key, value.to_bytes().unwrap());
         });
-
-        #[cfg(not(feature = "parallel_rayon"))]
-        nodes.chunks_exact(QMS_FAST_SERIALIZER_SINGLE_ID_NODE_SIZE).for_each(|chunk| {
-            let (tree_id, level, index, _cp, value_bytes) = QMerkleStoreFastSingleNodeSerializer::deserialize_single_id_node_signed_insert_tuple::<Hash>(chunk, checkpoint_id as i64);
-            let key = SimpleMerkleNodeKey { level: level as u8, index: index as u64 };
-            let value = Hash::from_owned_32bytes(value_bytes);
-            let db_key = key_helpers::key_merkle_single_id(tree_id as u64, &key, checkpoint_id);
-            db.insert(db_key, value.to_bytes().unwrap());
-        });
-
         Ok(())
     }
 }
@@ -1243,17 +1222,7 @@ where
     }
     async fn db_set_double_id_merkle_nodes_from_fast_serialized(&self, table: &InMemoryTableIdentifier, checkpoint_id: u64, nodes: &[u8]) -> anyhow::Result<()> {
         let db = self.get_or_create_table(&table.to_string());
-
-        #[cfg(feature = "parallel_rayon")]
         nodes.par_chunks_exact(QMS_FAST_SERIALIZER_DOUBLE_ID_NODE_SIZE).for_each(|chunk| {
-            let (tree_id, tree_sub_id, level, index, _cp, value_bytes) = QMerkleStoreFastDoubleNodeSerializer::deserialize_double_id_node_signed_insert_tuple::<Hash>(chunk, checkpoint_id as i64);
-            let key = SimpleMerkleNodeKey { level: level as u8, index: index as u64 };
-            let value = Hash::from_owned_32bytes(value_bytes);
-            let db_key = key_helpers::key_merkle_double_id(tree_id as u64, tree_sub_id as u64, &key, checkpoint_id);
-            db.insert(db_key, value.to_bytes().unwrap());
-        });
-        #[cfg(not(feature = "parallel_rayon"))]
-        nodes.chunks_exact(QMS_FAST_SERIALIZER_DOUBLE_ID_NODE_SIZE).for_each(|chunk| {
             let (tree_id, tree_sub_id, level, index, _cp, value_bytes) = QMerkleStoreFastDoubleNodeSerializer::deserialize_double_id_node_signed_insert_tuple::<Hash>(chunk, checkpoint_id as i64);
             let key = SimpleMerkleNodeKey { level: level as u8, index: index as u64 };
             let value = Hash::from_owned_32bytes(value_bytes);
@@ -1389,3 +1358,5 @@ where
     }
 }
 
+
+// --- Umbrella Trait Implementations ---

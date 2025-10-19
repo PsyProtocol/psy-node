@@ -55,6 +55,7 @@ cf_utils = { workspace = true }
 plonky2 = { workspace = true }
 ts-rs = { workspace = true }
 criterion = { workspace = true }
+paste = { workspace = true }
 
 
 

@@ -27,3 +27,4 @@ pub const PSY_OBJECT_FFS_SIZE_L2_BLOCK_STATE: usize = 64;
 // PQEDCheckpointGlobalStateRoots size in bytes
 // contract_tree_root(32 bytes) + user_tree_root(32 bytes) + l2_block_state_hash(32 bytes) + pm_jobs_completed_stats_hash(32 bytes) + pm_rewards_commitment_hash(32 bytes) = 160 bytes
 pub const PSY_OBJECT_FFS_SIZE_GLOBAL_STATE_ROOTS: usize = 160;
+
