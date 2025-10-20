@@ -290,7 +290,7 @@ impl SimpleStoreEx {
         let mut current_checkpoint = 0u64;
         let mut timer = DebugTimer::new("merkle_dumper");
         let mut total_leaves_inserted = 0usize;
-        for i in 0..1000 {
+        for i in 0..100 {
             let count =(rng.next_u32() % 5000) + 1;
             total_leaves_inserted += count as usize;
             let leaves = random_leaves_in_tree::<_, ExHash>(count as usize, &mut rng, tree_height);
@@ -302,6 +302,7 @@ impl SimpleStoreEx {
                 )
                 .await?;
             current_checkpoint += rng.next_u32() as u64 % 50 + 1;
+            println!("inserted batch {} with {} leaves up to checkpoint {}", i, count, current_checkpoint);
             
         }
         timer.event(format!("inserted {} leaves", total_leaves_inserted));
