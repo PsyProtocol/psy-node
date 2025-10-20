@@ -12,7 +12,7 @@ use parth_core::{
         },
         hash::{
             hash256::Hash256,
-            merkle_node_key::{generate_nca_tree_groups_efficient, SimpleMerkleNode, SimpleMerkleNodeKey}, merkle_store_key::QMerkleStoreDoubleIdNode,
+            merkle_node_key::{generate_nca_tree_groups_v1, SimpleMerkleNode, SimpleMerkleNodeKey}, merkle_store_key::QMerkleStoreDoubleIdNode,
         },
         serializable::{QPDPair, QPDSerializable},
     }, felt::QFelt, impl_qpd_serialize_params, protocol::core_types::{Q256BitHash, QHashBase}, utils::QPGenRandom
@@ -3918,7 +3918,7 @@ pub async fn th_util_get_tag_tree_node_tag(
 pub async fn th_test_tag_tree_basic(&self, table: &RewardTreeTableIdentifier, unique_pending_id: u64) -> anyhow::Result<()> {
         let height = 32u8;
         let leaves = random_nodes_in_tree(height, 1337);
-        let group_levels = generate_nca_tree_groups_efficient(&leaves, height);
+        let group_levels = generate_nca_tree_groups_v1(&leaves, height);
 
         let tree_height = (group_levels.len() - 1) as u8;
 
@@ -4178,7 +4178,7 @@ impl<
         let leaf_5 = SimpleMerkleNodeKey::new(guta_height, 5);
         let leaf_6 = SimpleMerkleNodeKey::new(guta_height, 6);
         let leaves = vec![leaf_1, leaf_2, leaf_3, leaf_5, leaf_6];
-        let group_levels = generate_nca_tree_groups_efficient(&leaves, guta_height);
+        let group_levels = generate_nca_tree_groups_v1(&leaves, guta_height);
         let tree_height = group_levels.len()-1;
         assert_eq!(group_levels.len(), 3);
         let mut simple_tree = SimpleMemoryTagTreeStore::<Hasher, Hash>::new(tree_height as u8);
@@ -4217,7 +4217,7 @@ impl<
         let leaf_5 = SimpleMerkleNodeKey::new(guta_height, 5);
         let leaf_6 = SimpleMerkleNodeKey::new(guta_height, 6);
         let leaves = vec![leaf_1, leaf_2, leaf_3, leaf_5, leaf_6];
-        let group_levels = generate_nca_tree_groups_efficient(&leaves, guta_height);
+        let group_levels = generate_nca_tree_groups_v1(&leaves, guta_height);
 
         let tree_height = (group_levels.len() - 1) as u8;
 
@@ -4250,7 +4250,7 @@ impl<
 
         let guta_height: u8 = 32;
         let leaves = random_nodes_in_tree(guta_height, 1337);
-        let group_levels = generate_nca_tree_groups_efficient(&leaves, guta_height);
+        let group_levels = generate_nca_tree_groups_v1(&leaves, guta_height);
 
         let tree_height = group_levels.len() - 1;
         let mut simple_tree = SimpleMemoryTagTreeStore::<Hasher, Hash>::new(tree_height as u8);

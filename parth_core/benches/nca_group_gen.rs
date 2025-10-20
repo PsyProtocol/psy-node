@@ -9,7 +9,7 @@ use std::collections::HashSet;
 /// It returns a tuple `(SimpleMerkleNodeKey, usize)` representing the NCA key and its
 /// calculated dependency level. This avoids the need for a shared map to store levels,
 /// passing the state up the call stack instead.
-fn build_recursive_truly_efficient(
+fn build_recursive_truly_efficient_2(
     nodes: &[SimpleMerkleNodeKey],
     subtree_root: SimpleMerkleNodeKey,
     tree_height: u8,
@@ -31,13 +31,13 @@ fn build_recursive_truly_efficient(
     let (left_nodes, right_nodes) = nodes.split_at(partition_idx);
 
     // --- Conquer Phase ---
-    let left_result = build_recursive_truly_efficient(
+    let left_result = build_recursive_truly_efficient_2(
         left_nodes,
         subtree_root.left_child(),
         tree_height,
         aggregations_with_levels,
     );
-    let right_result = build_recursive_truly_efficient(
+    let right_result = build_recursive_truly_efficient_2(
         right_nodes,
         right_child,
         tree_height,
@@ -72,7 +72,7 @@ fn build_recursive_truly_efficient(
 
 // --- New top-level function. Can replace the old `efficient` one ---
 
-pub fn generate_nca_tree_groups_efficient(leaves: &[SimpleMerkleNodeKey], _leaf_level: u8) -> Vec<Vec<SimpleMerkleNodeNCAAggregation>> {
+pub fn generate_nca_tree_groups_v1(leaves: &[SimpleMerkleNodeKey], _leaf_level: u8) -> Vec<Vec<SimpleMerkleNodeNCAAggregation>> {
     if leaves.len() < 2 {
         return vec![];
     }
@@ -86,7 +86,7 @@ pub fn generate_nca_tree_groups_efficient(leaves: &[SimpleMerkleNodeKey], _leaf_
     let root_node = SimpleMerkleNodeKey::new(0, 0);
 
     // This single call builds the tree and determines the level for each aggregation.
-    build_recursive_truly_efficient(
+    build_recursive_truly_efficient_2(
         &sorted_leaves, 
         root_node, 
         tree_height, 
@@ -157,7 +157,7 @@ pub fn benchmark_nca_group_generation(c: &mut Criterion) {
 
         // Benchmark the efficient implementation
         group.bench_with_input(BenchmarkId::new("Efficient", size), &leaves, |b, l| {
-            b.iter(|| generate_nca_tree_groups_efficient(black_box(l), tree_height));
+            b.iter(|| generate_nca_tree_groups_v1(black_box(l), tree_height));
         });
     }
     group.finish();

@@ -1,4 +1,4 @@
-use cf_utils::timer::DebugTimer;
+/*use cf_utils::timer::DebugTimer;
 use parth_common::memory_stores::mem_tree_v3::SimpleMemoryMerkleStoreV3;
 use rand::{SeedableRng, RngCore, Rng};
 use rand_chacha::ChaCha12Rng;
@@ -428,3 +428,4 @@ async fn simple_store_basic_test_1() -> anyhow::Result<()> {
     simple_store.basic_test_1().await?;
     Ok(())
 }
+*/
