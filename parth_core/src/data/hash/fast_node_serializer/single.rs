@@ -31,6 +31,13 @@ impl QMerkleStoreFastSingleNodeSerializer {
         bytes.extend_from_slice(&node.value.into_owned_32bytes());
         bytes
     }
+    pub fn serialize_single_id_many_nodes<Hash: Q256BitHash>(nodes: &[QMerkleStoreSingleIdNode<Hash>]) -> Vec<u8> {
+        let mut data = Vec::with_capacity(QMS_FAST_SERIALIZER_SINGLE_ID_NODE_SIZE * nodes.len());
+        for node in nodes {
+            data.extend_from_slice(&Self::serialize_single_id_node_to_fixed(node));
+        }
+        data
+    }
 
     pub fn write_single_id_node_to_slice<Hash: Q256BitHash>(node: &QMerkleStoreSingleIdNode<Hash>, slice: &mut [u8]) {
         assert!(slice.len() >= QMS_FAST_SERIALIZER_SINGLE_ID_NODE_SIZE);

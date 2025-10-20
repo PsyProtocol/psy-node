@@ -4,18 +4,18 @@ use anyhow::Ok;
 use async_trait::async_trait;
 use parth_core::{
     crypto::hash::{merkle_proof::MerkleProofCore, traits::MerkleZeroHasher},
-    data::hash::merkle_node_key::SimpleMerkleNodeKey,
+    data::hash::{fast_node_serializer::{QMerkleStoreFastDoubleNodeSerializer, QMerkleStoreFastSingleNodeSerializer}, merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}, merkle_store_key::{QMerkleStoreDoubleIdNode, QMerkleStoreSingleIdNode}},
     protocol::core_types::QNetworkDatabaseTypes,
     QCoreProcCheckpointUniqueId,
 };
 use psy_data::v1::qdata::{
     checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState}, checkpoint_sync::PQEDCheckpointSyncInfo, user::PQEDUserLeaf
 };
-use crate::store::traits::core_db::{
+use crate::{psy_core_db::traits::realm::QEDRealmStoreWriterAsyncImm, store::traits::core_db::{
     CoreDatabaseBidirectionalMappingReader, CoreDatabaseBidirectionalU64U128MappingReader,
     CoreDatabaseKivReader, CoreDatabaseSingleIdCheckpointedReader, CoreDatabaseSingleIdMerkleReader, CoreDatabaseStore, CoreDatabaseTagTreeStore,
     CoreDatabaseU64Reader, CoreDatabaseZeroIdMerkleReader,
-};
+}};
 
 use crate::psy_core_db::{
     core_implementation::constants::{
@@ -586,5 +586,173 @@ impl<
             key,
         )
         .await
+    }
+}
+
+
+
+
+#[async_trait]
+impl<
+        N: QNetworkDatabaseTypes,
+        BiDirectionalMappingTableIdentifier: Clone + Send + Sync,
+        BiDirectionalU64U128MappingTableIdentifier: Clone + Send + Sync,
+        U64TableIdentifier: Clone + Send + Sync,
+        SingleIdTableIdentifier: Clone + Send + Sync,
+        DoubleIdTableIdentifier: Clone + Send + Sync,
+        KivTableIdentifier: Clone + Send + Sync,
+        SingleIdMerkleTableIdentifier: Clone + Send + Sync,
+        DoubleIdMerkleTableIdentifier: Clone + Send + Sync,
+        ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
+        RewardTreeTableIdentifier: Clone + Send + Sync,
+        S: CoreDatabaseStore<
+                N::QHash,
+                N::HasherBase,
+                BiDirectionalMappingTableIdentifier,
+                BiDirectionalU64U128MappingTableIdentifier,
+                U64TableIdentifier,
+                SingleIdTableIdentifier,
+                DoubleIdTableIdentifier,
+                KivTableIdentifier,
+                SingleIdMerkleTableIdentifier,
+                DoubleIdMerkleTableIdentifier,
+                ZeroIdMerkleTableIdentifier,
+            > + CoreDatabaseTagTreeStore<N::QHash, N::HasherBase, RewardTreeTableIdentifier>+ Send + Sync,
+    >
+    QEDRealmStoreWriterAsyncImm<N> for 
+    QRealmStoreBase<
+        N,
+        BiDirectionalMappingTableIdentifier,
+        BiDirectionalU64U128MappingTableIdentifier,
+        U64TableIdentifier,
+        SingleIdTableIdentifier,
+        DoubleIdTableIdentifier,
+        KivTableIdentifier,
+        SingleIdMerkleTableIdentifier,
+        DoubleIdMerkleTableIdentifier,
+        ZeroIdMerkleTableIdentifier,
+        RewardTreeTableIdentifier,
+        S,
+    >
+{
+
+    /*
+    async fn apply_only_global_block_update_dangerous(&self, global_block_update: &PQEDCheckpointSyncInfo<N::F, N::QHash>) -> anyhow::Result<()>;
+    async fn apply_only_pending_realm_update_dangerous(&self, pending_realm_update: &RealmPendingCheckpoint<N::F, N::QHash>) -> anyhow::Result<()>;
+    async fn apply_realm_checkpoint_update(&self, global_block_update: &PQEDCheckpointSyncInfo<N::F, N::QHash>, pending_realm_update: &RealmPendingCheckpoint<N::F, N::QHash>) -> anyhow::Result<()>;
+    */
+    
+    async fn inc_unique_pending_id(&self, amount: u64) -> anyhow::Result<(u64, QCoreProcCheckpointUniqueId)> {
+        let new_pending_id = self
+            .store
+            .db_inc_counter(&self.u64_singleton_table, U64_SINGLETON_TABLE_OBJ_ID_PENDING_ID, amount as i64)
+            .await?;
+        let unique_id = rand::random::<u128>();
+        self.store
+            .db_insert_u64_u128_mapping_pair(&self.pending_id_to_pending_proc_id_table, new_pending_id, unique_id)
+            .await?;
+        Ok((new_pending_id, unique_id))
+    }
+
+    async fn set_unique_pending_id_checkpoint_id_mapping(&self, unique_pending_id: u64, checkpoint_id: u64) -> anyhow::Result<()> {
+        self.store
+            .db_set_u64_value(&self.pending_id_to_checkpoint_id_table, unique_pending_id, checkpoint_id)
+            .await
+    }
+
+    async fn set_checkpoint_id_to_unique_pending_id_mapping(
+        &self,
+        checkpoint_id: u64,
+        unique_pending_id: u64,
+        unique_id_struct: &QCoreProcCheckpointUniqueId,
+    ) -> anyhow::Result<()> {
+        self.store
+            .db_set_u64_value(&self.checkpoint_id_to_pending_id_table, checkpoint_id, unique_pending_id)
+            .await?;
+        self.store
+            .db_insert_u64_u128_mapping_pair(&self.pending_id_to_pending_proc_id_table, unique_pending_id, *unique_id_struct)
+            .await
+    }
+
+    async fn set_latest_checkpoint_id(&self, checkpoint_id: u64) -> anyhow::Result<()> {
+        self.store
+            .db_set_u64_value(&self.u64_singleton_table, U64_SINGLETON_TABLE_OBJ_ID_CHECKPOINT_ID, checkpoint_id)
+            .await
+    }
+
+    async fn set_checkpoint_leaf_data(&self, checkpoint_id: u64, leaf_data: &PQEDCheckpointLeaf<N::F, N::QHash>) -> anyhow::Result<()> {
+        self.store.db_insert_one_kiv(&self.checkpoint_leaf_table, checkpoint_id, leaf_data).await
+    }
+
+    async fn set_checkpoint_root_hash_to_id_mapping(&self, checkpoint_root: &N::QHash, checkpoint_id: u64) -> anyhow::Result<()> {
+        self.store
+            .db_insert_pair_ref(&self.checkpoint_root_to_checkpoint_id_table, checkpoint_root, &checkpoint_id)
+            .await
+    }
+
+    async fn set_l2_block_state(&self, checkpoint_id: u64, block_state: &QEDL2BlockState) -> anyhow::Result<()> {
+        self.store.db_insert_one_kiv(&self.l2_block_state_table, checkpoint_id, block_state).await
+    }
+
+    async fn set_user_leaf_data(&self, checkpoint_id: u64, user_id: u64, leaf_data: &PQEDUserLeaf<N::F, N::QHash>) -> anyhow::Result<()> {
+        self.store
+            .db_insert_one_single_checkpointed_object(&self.user_leaf_table, user_id, checkpoint_id, leaf_data)
+            .await
+    }
+
+    async fn set_checkpoint_global_state_roots(&self, checkpoint_id: u64, roots: &PQEDCheckpointGlobalStateRoots<N::QHash>) -> anyhow::Result<()> {
+        self.store.db_insert_one_kiv(&self.checkpoint_state_roots_table, checkpoint_id, roots).await
+    }
+
+    async fn set_checkpoint_tree_nodes(&self, checkpoint_id: u64, nodes: &[SimpleMerkleNode<N::QHash>]) -> anyhow::Result<()> {
+        self.store
+            .db_set_zero_id_merkle_nodes_batch(&self.global_checkpoint_tree_table, checkpoint_id, nodes)
+            .await
+    }
+
+    async fn set_checkpoint_tree_nodes_ffs(&self, checkpoint_id: u64, nodes: &[u8]) -> anyhow::Result<()> {
+        self.store
+            .db_set_zero_id_merkle_nodes_from_fast_serialized(&self.global_checkpoint_tree_table, checkpoint_id, nodes)
+            .await
+    }
+
+    async fn set_user_tree_nodes(&self, checkpoint_id: u64, nodes: &[SimpleMerkleNode<N::QHash>]) -> anyhow::Result<()> {
+        self.store.db_set_zero_id_merkle_nodes_batch(&self.global_user_tree_table, checkpoint_id, nodes).await
+    }
+
+    async fn set_user_tree_nodes_ffs(&self, checkpoint_id: u64, nodes: &[u8]) -> anyhow::Result<()> {
+        self.store
+            .db_set_zero_id_merkle_nodes_from_fast_serialized(&self.global_user_tree_table, checkpoint_id, nodes)
+            .await
+    }
+
+    async fn set_user_contract_tree_nodes(&self, checkpoint_id: u64, nodes: &[QMerkleStoreSingleIdNode<N::QHash>]) -> anyhow::Result<()> {
+        let data = QMerkleStoreFastSingleNodeSerializer::serialize_single_id_many_nodes(nodes);
+
+        self.store.db_set_single_id_merkle_nodes_from_fast_serialized(&self.user_contract_tree_table, checkpoint_id, &data).await
+    }
+
+    async fn set_user_contract_tree_nodes_ffs(&self, checkpoint_id: u64, nodes: &[u8]) -> anyhow::Result<()> {
+        self.store
+            .db_set_single_id_merkle_nodes_from_fast_serialized(&self.user_contract_tree_table, checkpoint_id, nodes)
+            .await
+    }
+
+    async fn set_user_contract_state_tree_nodes(&self, checkpoint_id: u64, nodes: &[QMerkleStoreDoubleIdNode<N::QHash>]) -> anyhow::Result<()> {
+        let data = QMerkleStoreFastDoubleNodeSerializer::serialize_double_id_many_nodes(nodes);
+
+        self.store
+            .db_set_double_id_merkle_nodes_from_fast_serialized(&self.contract_state_tree_table, checkpoint_id, &data)
+            .await
+    }
+
+    async fn set_user_contract_state_tree_nodes_ffs(
+        &self,
+        checkpoint_id: u64,
+        nodes: &[u8],
+    ) -> anyhow::Result<()> {
+        self.store
+            .db_set_double_id_merkle_nodes_from_fast_serialized(&self.contract_state_tree_table, checkpoint_id, nodes)
+            .await
     }
 }

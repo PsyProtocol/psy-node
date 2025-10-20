@@ -100,7 +100,7 @@ pub trait QNetworkZKTypes: QNetworkHashTypes {
     type ZKVerifier: QZKProofVerifier<Self::QHash, Self::ZKProof>;
 }
 
-pub trait QNetworkTypesConfig: QNetworkTreeConstants + QNetworkZKTypes + QJobIdBase + QJobPlanner<Self::JobId> {
+pub trait QNetworkTypesConfig: QNetworkDatabaseTypes + QNetworkTreeConstants + QNetworkZKTypes + QJobIdBase + QJobPlanner<Self::JobId> {
     type JobId: QJobIdBase;
     type JobPlanner: QJobPlanner<Self::JobId>;
 }

@@ -33,6 +33,7 @@ auto_impl = { workspace = true }
 strum = { workspace = true }
 strum_macros = { workspace = true }
 futures = { workspace = true }
+jsonrpsee = { workspace = true }
 
 # start local packages
 pser = { workspace = true }

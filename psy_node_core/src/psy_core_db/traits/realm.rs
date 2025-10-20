@@ -161,7 +161,7 @@ pub trait QEDRealmStoreWriterAsyncImm<N: QNetworkDatabaseTypes> {
     async fn set_user_contract_tree_nodes(&self, checkpoint_id: u64, nodes: &[QMerkleStoreSingleIdNode<N::QHash>]) -> anyhow::Result<()>;
     async fn set_user_contract_tree_nodes_ffs(&self, checkpoint_id: u64, nodes: &[u8]) -> anyhow::Result<()>;
     async fn set_user_contract_state_tree_nodes(&self, checkpoint_id: u64, nodes: &[QMerkleStoreDoubleIdNode<N::QHash>]) -> anyhow::Result<()>;
-    async fn set_user_contract_state_tree_nodes_ffs(&self, checkpoint_id: u64, user_id: u64, contract_id: u32, nodes: &[u8]) -> anyhow::Result<()>;
+    async fn set_user_contract_state_tree_nodes_ffs(&self, checkpoint_id: u64, nodes: &[u8]) -> anyhow::Result<()>;
 }
 
 

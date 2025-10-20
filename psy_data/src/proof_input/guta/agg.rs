@@ -1,9 +1,9 @@
 use std::{hash::Hash, ops::Add};
 
-use parth_core::{crypto::hash::{merkle_proof::{compute_historical_and_current_merkle_roots_core_gt, DeltaMerkleProofCore, MerkleProofCore}, nca::nca_proof::PartialUpdateNearestCommonAncestorProof, traits::{MerkleHasher, MerkleZeroHasher}}, felt::QFelt64, protocol::core_types::QFHashBase};
-use psy_core::job::job_id::QProvingJobDataID;
+use parth_core::{crypto::hash::{merkle_proof::{compute_historical_and_current_merkle_roots_core_gt, DeltaMerkleProofCore, MerkleProofCore}, nca::nca_proof::PartialUpdateNearestCommonAncestorProof, traits::{FieldQHasher, MerkleHasher, MerkleZeroHasher, QFieldHashable}}, felt::QFelt64, protocol::core_types::QFHashBase};
+use psy_core::job::job_id::{self, QProvingJobDataID};
 
-use crate::{guta::{header::GlobalUserTreeAggregatorHeader, stats::GUTAStats, sub_tree_transition::SubTreeNodeStateTransition}, v1::qdata::{checkpoint::PQEDCheckpointLeafCompactWithStateRoots, user_end_cap_result::PUPSEndCapResultCompact}};
+use crate::{guta::{header::GlobalUserTreeAggregatorHeader, stats::GUTAStats, sub_tree_transition::SubTreeNodeStateTransition}, v1::qdata::{checkpoint::PQEDCheckpointLeafCompactWithStateRoots, user::PQEDUserLeaf, user_end_cap_result::PUPSEndCapResultCompact}};
 
 
 #[pderive::serialize_clone_f_hash_ts]
@@ -590,4 +590,44 @@ pub struct VerifyGUTARegisterUsersCircuitInputSimple<F, Hash> {
 pub struct GUTAOnlyRegisterUsersInput<F, Hash> {
     pub checkpoint_tree_root: Hash,
     pub guta_register_user_inputs: Vec<GUTARegisterUserFullInput<F>>,
+}
+
+
+
+
+#[pderive::serialize_copy_f_hash_ts]
+#[ts(export, concrete(F = parth_core::PF, Hash = parth_core::PHash))]
+pub struct SubmitUserEndCapNonProofCoreInput<F, Hash> {
+    pub checkpoint_id: F,
+    pub stats: GUTAStats<F>,
+    pub state_transition: PUPSEndCapResultCompact<F, Hash>,
+    pub new_user_leaf: PQEDUserLeaf<F, Hash>,
+}
+impl<F : QFelt64, Hash: QFHashBase<F>> SubmitUserEndCapNonProofCoreInput<F, Hash> {
+
+    pub fn get_proof_public_inputs_hash<Hasher: FieldQHasher<F, Hash>>(&self, global_user_tree_height: u8) -> Hash {
+        Hasher::q_two_to_one(
+            self.state_transition.qfhash_with_guta_height::<Hasher>(global_user_tree_height),
+            self.stats.qfhash::<Hasher>()
+        )
+    }
+}
+
+
+#[pderive::serialize_clone_f_hash_ts]
+#[ts(export, concrete(F = parth_core::PF, Hash = parth_core::PHash))]
+pub struct SubmitGUTARealmResultAPINoProofInput<F, Hash> {
+    pub realm_id: u64,
+    pub checkpoint_id: u64,
+    pub guta_stats: GUTAStats<F>,
+    pub top_line_proof: DeltaMerkleProofCore<Hash>,
+    pub checkpoint_tree_root: Hash,
+    pub circuit_type: job_id::ProvingJobCircuitType,
+}
+
+#[pderive::serialize_clone_f_hash_proof]
+//#[ts(export, concrete(F = parth_core::PF, Hash = parth_core::PHash, Proof = Vec<u8>))]
+pub struct SubmitGUTARealmResultAPIWithProof<F, Hash, Proof> {
+    pub input: SubmitGUTARealmResultAPINoProofInput<F, Hash>,
+    pub proof: Proof,
 }

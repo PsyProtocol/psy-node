@@ -24,6 +24,14 @@ impl QMerkleStoreFastDoubleNodeSerializer {
         data[25..57].copy_from_slice(&node.value.into_owned_32bytes());
         data
     }
+
+    pub fn serialize_double_id_many_nodes<Hash: Q256BitHash>(nodes: &[QMerkleStoreDoubleIdNode<Hash>]) -> Vec<u8> {
+        let mut data = Vec::with_capacity(QMS_FAST_SERIALIZER_DOUBLE_ID_NODE_SIZE * nodes.len());
+        for node in nodes {
+            data.extend_from_slice(&Self::serialize_double_id_node_to_fixed(node));
+        }
+        data
+    }
     pub fn serialize_double_id_node_to_vec<Hash: Q256BitHash>(node: &QMerkleStoreDoubleIdNode<Hash>) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(QMS_FAST_SERIALIZER_DOUBLE_ID_NODE_SIZE);
         bytes.extend_from_slice(&node.key.tree_id.to_le_bytes());
