@@ -17,7 +17,7 @@ use parth_core::{
         hash::merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey},
         serializable::QPDPair,
     },
-    protocol::core_types::{Q256BitHash, QHashBase},
+    protocol::core_types::QHashBase,
 };
 use psy_serialize::PsySerializeCanonicalAsyncSafe;
 

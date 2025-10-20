@@ -8,3 +8,4 @@ pub mod qblob;
 pub mod qobjblob;
 pub mod processor_builders;
 pub mod node_data;
+pub mod nca_planner;

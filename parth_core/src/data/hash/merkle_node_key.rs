@@ -920,7 +920,9 @@ pub fn generate_nca_tree_groups_v2(leaves: &[SimpleMerkleNodeKey], _leaf_level: 
         }
     }
     // Filter out potential empty groups if max_level calculation has gaps, though unlikely.
-    groups.into_iter().filter(|g| !g.is_empty()).collect()
+     groups.into_iter().filter(|g| !g.is_empty()).collect()
+
+
 }
 
 // how to keep v2's speed but make the output match the example correct output:

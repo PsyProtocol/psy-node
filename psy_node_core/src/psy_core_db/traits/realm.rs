@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use parth_core::{crypto::hash::merkle_proof::MerkleProofCore, felt::ToU64Value, protocol::core_types::{QNetworkDatabaseTypes, QNetworkTypesConfig}, QCoreProcCheckpointUniqueId};
+use parth_core::{crypto::hash::merkle_proof::MerkleProofCore, data::hash::{merkle_node_key::SimpleMerkleNode, merkle_store_key::{QMerkleStoreDoubleIdNode, QMerkleStoreSingleIdNode}}, felt::ToU64Value, protocol::core_types::{QNetworkDatabaseTypes, QNetworkTypesConfig}, QCoreProcCheckpointUniqueId};
 use psy_data::v1::qdata::{checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState}, checkpoint_sync::PQEDCheckpointSyncInfo, user::PQEDUserLeaf};
 use crate::data::pending::realm::RealmPendingCheckpoint;
 
@@ -136,10 +136,33 @@ pub trait QEDRealmStoreReaderAsync<N: QNetworkDatabaseTypes> {
 }
 
 #[async_trait]
-pub trait QEDRealmStoreWriterAsyncImm<N: QNetworkTypesConfig> {
+pub trait QEDRealmStoreWriterAsyncImm<N: QNetworkDatabaseTypes> {
+    /*
     async fn apply_only_global_block_update_dangerous(&self, global_block_update: &PQEDCheckpointSyncInfo<N::F, N::QHash>) -> anyhow::Result<()>;
     async fn apply_only_pending_realm_update_dangerous(&self, pending_realm_update: &RealmPendingCheckpoint<N::F, N::QHash>) -> anyhow::Result<()>;
     async fn apply_realm_checkpoint_update(&self, global_block_update: &PQEDCheckpointSyncInfo<N::F, N::QHash>, pending_realm_update: &RealmPendingCheckpoint<N::F, N::QHash>) -> anyhow::Result<()>;
+    */
+    
     async fn inc_unique_pending_id(&self, amount: u64) -> anyhow::Result<(u64, QCoreProcCheckpointUniqueId)>;
     async fn set_unique_pending_id_checkpoint_id_mapping(&self, unique_pending_id: u64, checkpoint_id: u64) -> anyhow::Result<()>;
+
+    async fn set_checkpoint_id_to_unique_pending_id_mapping(&self, checkpoint_id: u64, unique_pending_id: u64, unique_id_struct: &QCoreProcCheckpointUniqueId) -> anyhow::Result<()>;
+    async fn set_latest_checkpoint_id(&self, checkpoint_id: u64) -> anyhow::Result<()>;
+    async fn set_checkpoint_leaf_data(&self, checkpoint_id: u64, leaf_data: &PQEDCheckpointLeaf<N::F, N::QHash>) -> anyhow::Result<()>;
+    async fn set_checkpoint_root_hash_to_id_mapping(&self, checkpoint_root: &N::QHash, checkpoint_id: u64) -> anyhow::Result<()>;
+    async fn set_l2_block_state(&self, checkpoint_id: u64, block_state: &QEDL2BlockState) -> anyhow::Result<()>;
+    async fn set_user_leaf_data(&self, checkpoint_id: u64, user_id: u64, leaf_data: &PQEDUserLeaf<N::F, N::QHash>) -> anyhow::Result<()>;
+    async fn set_checkpoint_global_state_roots(&self, checkpoint_id: u64, roots: &PQEDCheckpointGlobalStateRoots<N::QHash>) -> anyhow::Result<()>;
+
+    async fn set_checkpoint_tree_nodes(&self, checkpoint_id: u64, nodes: &[SimpleMerkleNode<N::QHash>]) -> anyhow::Result<()>;
+    async fn set_checkpoint_tree_nodes_ffs(&self, checkpoint_id: u64, nodes: &[u8]) -> anyhow::Result<()>;
+    async fn set_user_tree_nodes(&self, checkpoint_id: u64, nodes: &[SimpleMerkleNode<N::QHash>]) -> anyhow::Result<()>;
+    async fn set_user_tree_nodes_ffs(&self, checkpoint_id: u64, nodes: &[u8]) -> anyhow::Result<()>;
+    async fn set_user_contract_tree_nodes(&self, checkpoint_id: u64, nodes: &[QMerkleStoreSingleIdNode<N::QHash>]) -> anyhow::Result<()>;
+    async fn set_user_contract_tree_nodes_ffs(&self, checkpoint_id: u64, nodes: &[u8]) -> anyhow::Result<()>;
+    async fn set_user_contract_state_tree_nodes(&self, checkpoint_id: u64, nodes: &[QMerkleStoreDoubleIdNode<N::QHash>]) -> anyhow::Result<()>;
+    async fn set_user_contract_state_tree_nodes_ffs(&self, checkpoint_id: u64, user_id: u64, contract_id: u32, nodes: &[u8]) -> anyhow::Result<()>;
 }
+
+
+

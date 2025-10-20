@@ -102,16 +102,6 @@ fn hash_level_with_left_over<Hash: PartialEq + Copy, Hasher: MerkleZeroHasher<Ha
 
     current_level
 }
-fn hash_tree_of_height<Hash: QPGenRandom + PartialEq + Copy, Hasher: MerkleZeroHasher<Hash>>(
-    tree_height: u8,
-) -> anyhow::Result<Hash> {
-    let total_leaves = 1 << tree_height;
-    let leaves = Hash::qp_rand_gen_vec(total_leaves as usize);
-    let mut current_level = leaves;
-    
-}
-
-
 
 fn test_trees_with_rand_leaves<Hash: QPGenRandom + PartialEq + Copy + std::fmt::Debug + ZeroableHash, Hasher: MerkleZeroHasher<Hash>>(leaves_count: usize) -> anyhow::Result<Hash> {
     let leaves = Hash::qp_rand_gen_vec(leaves_count);
