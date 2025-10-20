@@ -24,8 +24,13 @@ pub trait CoordinatorEdgeRpc<N: QNetworkTypesConfig> {
     #[method(name = "register_user")]
     async fn register_user(&self, public_key: PZKPublicKeyInfo<N::QHash>) -> RpcResult<String>;
 
+
+    // deprecated, should use get_user_ids_for_public_key
     #[method(name = "get_user_id")]
     async fn get_user_id(&self, public_key: N::QHash) -> RpcResult<u64>;
+
+    #[method(name = "get_user_ids_for_public_key")]
+    async fn get_user_ids_for_public_key(&self, public_key: N::QHash) -> RpcResult<Vec<u64>>;
 
     #[method(name = "deploy_contract")]
     async fn deploy_contract(&self, deploy_contract: PQBCDeployContract<N::QHash>) -> RpcResult<String>;

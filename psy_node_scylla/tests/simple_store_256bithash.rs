@@ -6,29 +6,23 @@ use parth_core::{
         merkle_proof::DeltaMerkleProofCore, tag_tree::{compute_tag_tree_root_for_proof, hash_tag_tree_node, TagTreeMerkleProof, TagTreeNodePreimage, TagTreeStorageNode}, traits::MerkleZeroHasher
     }, data::{
         db::{
-            data_types::{BiDirectionalMappingRow, QDatabasePrimitiveKey},
-            row::{QDatabaseDoubleIdTableRow, QDatabaseDoubleIdTableRowNoCheckpointId, QDatabaseDoubleIdTableRowNoCheckpointIdLike, QDatabaseKeyIdValueTableRowLike, QDatabaseSingleIdTableRow, QDatabaseSingleIdTableRowNoCheckpointId, QDatabaseSingleIdTableRowNoCheckpointIdLike, QDoubleIdKey},
-            table::QDatabaseTableRoutingKey,
+            data_types::{BiDirectionalMappingRow, QDatabasePrimitiveKey}, hash_id_u64::{get_data_buffer_for_hash256_and_u64s, read_hash256_refs_and_i64s_from_buffer, QHash256AndU64}, row::{QDatabaseDoubleIdTableRow, QDatabaseDoubleIdTableRowNoCheckpointId, QDatabaseDoubleIdTableRowNoCheckpointIdLike, QDatabaseKeyIdValueTableRowLike, QDatabaseSingleIdTableRow, QDatabaseSingleIdTableRowNoCheckpointId, QDatabaseSingleIdTableRowNoCheckpointIdLike, QDoubleIdKey}, table::QDatabaseTableRoutingKey
         },
         hash::{
             hash256::Hash256,
             merkle_node_key::{generate_nca_tree_groups_v1, SimpleMerkleNode, SimpleMerkleNodeKey}, merkle_store_key::QMerkleStoreDoubleIdNode,
         },
         serializable::{QPDPair, QPDSerializable},
-    }, felt::QFelt, impl_qpd_serialize_params, protocol::core_types::{Q256BitHash, QHashBase, QDBHashBase}, utils::QPGenRandom
+    }, felt::QFelt, impl_qpd_serialize_params, protocol::core_types::{Q256BitHash, QDBHashBase, QHashBase}, utils::{signed_helpers::{i64_to_u64_exact, u64_to_i64_exact}, QPGenRandom}
 };
 use parth_crypto::hash::sha256::CoreSha256Hasher;
 use parth_node_scylla::{
     core::ScyllaCoreStore,
     tables::{
-        blob::ScyllaBiDirectionalBlobToBlobTablePreparedStatements,
-        merkle::{ScyllaDoubleMerkleNodesPreparedStatements, ScyllaMerkleNodesPreparedStatements, ScyllaMerkleNodesZeroPreparedStatements},
-        object::{
+        blob::ScyllaBiDirectionalBlobToBlobTablePreparedStatements, hash_to_many_ids::ScyllaHashToManyIdsTablePreparedStatements, merkle::{ScyllaDoubleMerkleNodesPreparedStatements, ScyllaMerkleNodesPreparedStatements, ScyllaMerkleNodesZeroPreparedStatements}, object::{
             ScyllaGenericKeyIdValueTablePreparedStatements, ScyllaGenericObjectDoubleIdTablePreparedStatements,
             ScyllaGenericObjectSingleIdTablePreparedStatements,
-        },
-        tag_tree::ScyllaTagTreeNodesPreparedStatements,
-        u64_tbl::{ScyllaBidirectionalU64U128MappingPreparedStatements, ScyllaU64ToU64TablePreparedStatements},
+        }, tag_tree::ScyllaTagTreeNodesPreparedStatements, u64_tbl::{ScyllaBidirectionalU64U128MappingPreparedStatements, ScyllaU64ToU64TablePreparedStatements}
     },
 };
 use pser::{QBytesDeserialize, QBytesSerialize};
@@ -199,6 +193,7 @@ pub struct QSimpleStore<
     DoubleIdMerkleTableIdentifier: THStandardTableIdentifier,
     ZeroIdMerkleTableIdentifier: THStandardTableIdentifier,
     RewardTreeTableIdentifier: THStandardTableIdentifier,
+    HashToManyIdsTableIdentifier: THStandardTableIdentifier,
     S: CoreDatabaseStore<
             Hash,
             Hasher,
@@ -211,6 +206,7 @@ pub struct QSimpleStore<
             SingleIdMerkleTableIdentifier,
             DoubleIdMerkleTableIdentifier,
             ZeroIdMerkleTableIdentifier,
+            HashToManyIdsTableIdentifier,
         > + CoreDatabaseTagTreeStore<Hash, Hasher, RewardTreeTableIdentifier> + CoreDatabaseSingleIdMerkleReader<
             Hash,
             Hasher,
@@ -245,6 +241,8 @@ pub struct QSimpleStore<
     // start tag tree
     pub tag_tree_table_a: Arc<RewardTreeTableIdentifier>,
     pub tag_tree_table_b: Arc<RewardTreeTableIdentifier>,
+
+    pub hash_id_to_u64s_table_a: Arc<HashToManyIdsTableIdentifier>,
 
     // start phantom core
     _phantom_hash: std::marker::PhantomData<Hash>,
@@ -291,6 +289,7 @@ impl<
         DoubleIdMerkleTableIdentifier: THStandardTableIdentifier,
         ZeroIdMerkleTableIdentifier: THStandardTableIdentifier,
         RewardTreeTableIdentifier: THStandardTableIdentifier,
+        HashToManyIdsTableIdentifier: THStandardTableIdentifier,
         S: CoreDatabaseStore<
                 Hash,
                 Hasher,
@@ -303,6 +302,7 @@ impl<
                 SingleIdMerkleTableIdentifier,
                 DoubleIdMerkleTableIdentifier,
                 ZeroIdMerkleTableIdentifier,
+                HashToManyIdsTableIdentifier,
             > + CoreDatabaseTagTreeStore<Hash, Hasher, RewardTreeTableIdentifier>
             + Send
             + Sync,
@@ -334,6 +334,8 @@ impl<
         DoubleIdMerkleTableIdentifier,
         ZeroIdMerkleTableIdentifier,
         RewardTreeTableIdentifier,
+        HashToManyIdsTableIdentifier,
+        
         S,
     >
 {
@@ -364,6 +366,7 @@ impl<
         // start tag tree
         tag_tree_table_a: Arc<RewardTreeTableIdentifier>,
         tag_tree_table_b: Arc<RewardTreeTableIdentifier>,
+        hash_id_to_u64s_table_a: Arc<HashToManyIdsTableIdentifier>,
     ) -> Self {
         Self {
             store,
@@ -387,6 +390,8 @@ impl<
             merkle_node_double_id_table_b,
             tag_tree_table_a,
             tag_tree_table_b,
+            hash_id_to_u64s_table_a,
+
             _phantom_hash: std::marker::PhantomData,
             _phantom_hasher: std::marker::PhantomData,
             _phantom_kiv_table_a_value: std::marker::PhantomData,
@@ -433,6 +438,7 @@ impl<
         DoubleIdMerkleTableIdentifier: THStandardTableIdentifier,
         ZeroIdMerkleTableIdentifier: THStandardTableIdentifier,
         RewardTreeTableIdentifier: THStandardTableIdentifier,
+        HashToManyIdsTableIdentifier: THStandardTableIdentifier,
         S: CoreDatabaseStore<
                 Hash,
                 Hasher,
@@ -445,6 +451,7 @@ impl<
                 SingleIdMerkleTableIdentifier,
                 DoubleIdMerkleTableIdentifier,
                 ZeroIdMerkleTableIdentifier,
+                HashToManyIdsTableIdentifier,
             > + CoreDatabaseTagTreeStore<Hash, Hasher, RewardTreeTableIdentifier>
             + Send
             + Sync,
@@ -476,6 +483,8 @@ impl<
         DoubleIdMerkleTableIdentifier,
         ZeroIdMerkleTableIdentifier,
         RewardTreeTableIdentifier,
+        HashToManyIdsTableIdentifier,
+        
         S,
     >
 {
@@ -666,6 +675,7 @@ impl<
         DoubleIdMerkleTableIdentifier: THStandardTableIdentifier,
         ZeroIdMerkleTableIdentifier: THStandardTableIdentifier,
         RewardTreeTableIdentifier: THStandardTableIdentifier,
+        HashToManyIdsTableIdentifier: THStandardTableIdentifier,
         S: CoreDatabaseStore<
                 Hash,
                 Hasher,
@@ -678,6 +688,7 @@ impl<
                 SingleIdMerkleTableIdentifier,
                 DoubleIdMerkleTableIdentifier,
                 ZeroIdMerkleTableIdentifier,
+                HashToManyIdsTableIdentifier,
             > + CoreDatabaseTagTreeStore<Hash, Hasher, RewardTreeTableIdentifier>
             + Send
             + Sync,
@@ -709,6 +720,8 @@ impl<
         DoubleIdMerkleTableIdentifier,
         ZeroIdMerkleTableIdentifier,
         RewardTreeTableIdentifier,
+        HashToManyIdsTableIdentifier,
+        
         S,
     >
 {
@@ -1421,6 +1434,7 @@ impl<
         DoubleIdMerkleTableIdentifier: THStandardTableIdentifier,
         ZeroIdMerkleTableIdentifier: THStandardTableIdentifier,
         RewardTreeTableIdentifier: THStandardTableIdentifier,
+        HashToManyIdsTableIdentifier: THStandardTableIdentifier,
         S: CoreDatabaseStore<
                 Hash,
                 Hasher,
@@ -1433,6 +1447,7 @@ impl<
                 SingleIdMerkleTableIdentifier,
                 DoubleIdMerkleTableIdentifier,
                 ZeroIdMerkleTableIdentifier,
+                HashToManyIdsTableIdentifier,
             > + CoreDatabaseTagTreeStore<Hash, Hasher, RewardTreeTableIdentifier>
             + Send
             + Sync,
@@ -1464,6 +1479,8 @@ impl<
         DoubleIdMerkleTableIdentifier,
         ZeroIdMerkleTableIdentifier,
         RewardTreeTableIdentifier,
+        HashToManyIdsTableIdentifier,
+        
         S,
     >
 {
@@ -2236,6 +2253,7 @@ impl<
         DoubleIdMerkleTableIdentifier: THStandardTableIdentifier,
         ZeroIdMerkleTableIdentifier: THStandardTableIdentifier,
         RewardTreeTableIdentifier: THStandardTableIdentifier,
+        HashToManyIdsTableIdentifier: THStandardTableIdentifier,
         S: CoreDatabaseStore<
                 Hash,
                 Hasher,
@@ -2248,6 +2266,7 @@ impl<
                 SingleIdMerkleTableIdentifier,
                 DoubleIdMerkleTableIdentifier,
                 ZeroIdMerkleTableIdentifier,
+                HashToManyIdsTableIdentifier,
             > + CoreDatabaseTagTreeStore<Hash, Hasher, RewardTreeTableIdentifier>
             + Send
             + Sync,
@@ -2279,6 +2298,8 @@ impl<
         DoubleIdMerkleTableIdentifier,
         ZeroIdMerkleTableIdentifier,
         RewardTreeTableIdentifier,
+        HashToManyIdsTableIdentifier,
+        
         S,
     >
 {
@@ -3613,6 +3634,7 @@ impl<
         DoubleIdMerkleTableIdentifier: THStandardTableIdentifier,
         ZeroIdMerkleTableIdentifier: THStandardTableIdentifier,
         RewardTreeTableIdentifier: THStandardTableIdentifier,
+        HashToManyIdsTableIdentifier: THStandardTableIdentifier,
         S: CoreDatabaseStore<
                 Hash,
                 Hasher,
@@ -3625,6 +3647,7 @@ impl<
                 SingleIdMerkleTableIdentifier,
                 DoubleIdMerkleTableIdentifier,
                 ZeroIdMerkleTableIdentifier,
+                HashToManyIdsTableIdentifier,
             > + CoreDatabaseTagTreeStore<Hash, Hasher, RewardTreeTableIdentifier>
             + Send
             + Sync,
@@ -3656,6 +3679,8 @@ impl<
         DoubleIdMerkleTableIdentifier,
         ZeroIdMerkleTableIdentifier,
         RewardTreeTableIdentifier,
+        HashToManyIdsTableIdentifier,
+        
         S,
     >
 {
@@ -4029,6 +4054,7 @@ impl<
         DoubleIdMerkleTableIdentifier: THStandardTableIdentifier,
         ZeroIdMerkleTableIdentifier: THStandardTableIdentifier,
         RewardTreeTableIdentifier: THStandardTableIdentifier,
+        HashToManyIdsTableIdentifier: THStandardTableIdentifier,
         S: CoreDatabaseStore<
                 Hash,
                 Hasher,
@@ -4041,6 +4067,7 @@ impl<
                 SingleIdMerkleTableIdentifier,
                 DoubleIdMerkleTableIdentifier,
                 ZeroIdMerkleTableIdentifier,
+                HashToManyIdsTableIdentifier,
             > + CoreDatabaseTagTreeStore<Hash, Hasher, RewardTreeTableIdentifier>
             + Send
             + Sync,
@@ -4072,6 +4099,8 @@ impl<
         DoubleIdMerkleTableIdentifier,
         ZeroIdMerkleTableIdentifier,
         RewardTreeTableIdentifier,
+        HashToManyIdsTableIdentifier,
+        
         S,
     >
 {
@@ -4320,6 +4349,220 @@ impl<
 
         Ok(())
     }
+
+    pub async fn th_test_hash_to_u64s_basic(&self, table: &HashToManyIdsTableIdentifier) -> anyhow::Result<()> {
+
+
+        for _ in 0..10 {
+            let user_hash_a = Hash::qp_rand_gen();
+            let mut user_ids = u64::qp_rand_gen_vec(100).iter().map(|x| (*x) & 0x0000_FFFF_FFFF_FFFFu64).collect::<Vec<u64>>();
+            let first_user_id = u64::qp_rand_gen()&0x0000_FFFF_FFFF_FFFFu64;
+            user_ids.push(first_user_id);
+            
+            user_ids.sort_unstable();
+            user_ids.dedup();
+
+            while user_ids.len() != 101 {
+                user_ids.push(u64::qp_rand_gen());
+                user_ids.sort_unstable();
+                user_ids.dedup();
+            }
+
+            let pairs = user_ids.iter().map(|x| QHash256AndU64{
+            hash: user_hash_a,
+            value_u64: *x,
+            }).collect::<Vec<_>>();
+            let serialized_insert_data = get_data_buffer_for_hash256_and_u64s(&pairs);
+            let read_back = read_hash256_refs_and_i64s_from_buffer(&serialized_insert_data)?.iter().map(|x| {
+                QHash256AndU64 {
+                    hash: Hash::from_slice_32bytes(x.0).unwrap(),
+                    value_u64: i64_to_u64_exact(x.1),
+                }
+            }).collect::<Vec<_>>();
+            assert_eq!(read_back, pairs, "read back should match our pairs");
+            let result = self.store.db_select_value_u64_ids_for_hash(table, user_hash_a, 4, 0).await?;
+            assert_eq!(result.len(), 0, "the store should be empty for this hash");
+            self.store.db_insert_one_hash_to_u64(table, user_hash_a, first_user_id).await?;
+            let result = self.store.db_select_value_u64_ids_for_hash(table, user_hash_a, 4, 0).await?;
+            assert_eq!(result.len(), 1, "the store should contain the first user");
+            assert_eq!(result[0], first_user_id, "the store should return the first user id");
+
+            if first_user_id > 0 {
+                let result = self.store.db_select_value_u64_ids_for_hash(table, user_hash_a, 4, first_user_id - 1).await?;
+                assert_eq!(result.len(), 1, "the store should contain the first user");
+                assert_eq!(result[0], first_user_id, "the store should return the first user id");
+
+            }
+            let result = self.store.db_select_value_u64_ids_for_hash(table, user_hash_a, 4, first_user_id / 2).await?;
+            assert_eq!(result.len(), 1, "the store should contain the first user");
+            assert_eq!(result[0], first_user_id, "the store should return the first user id");
+            if first_user_id < i64::MAX as u64 {
+                let result = self.store.db_select_value_u64_ids_for_hash(table, user_hash_a, 4, first_user_id+1).await?;
+                assert_eq!(result.len(), 0, "the store should implement pagination correctly");
+            }
+            
+
+
+
+
+            self.store.db_set_hash_256_to_u64_pairs_from_fast_serialized_data(table, 0, &serialized_insert_data).await?;
+            let result = self.store.db_select_value_u64_ids_for_hash(table, user_hash_a, 15, 0).await?;
+            assert_eq!(result.len(), 15, "the store should contain the first 15 users sorted by user id");
+            assert_eq!(result, user_ids[0..15].to_vec(), "the store should contain the first 15 users sorted by user id");
+            let result = self.store.db_select_value_u64_ids_for_hash(table, user_hash_a, 20, user_ids[15]).await?;
+            assert_eq!(result.len(), 20, "the store should contain the first 15 users sorted by user id");
+            assert_eq!(result, user_ids[15..35].to_vec(), "the store should contain the first 15 users sorted by user id");
+            let result = self.store.db_select_value_u64_ids_for_hash(table, user_hash_a, 200, user_ids[35]).await?;
+            assert_eq!(result.len(), user_ids.len()-35, "the store should contain the first 15 users sorted by user id");
+            assert_eq!(result, user_ids[35..].to_vec(), "the store should contain the last users sorted by user id");
+            let result = self.store.db_select_value_u64_ids_for_hash(table, user_hash_a, 10, user_ids[user_ids.len()-1]+1).await?;
+            assert_eq!(result.len(), 0, "the store should not return results after the highest user id");
+            
+        }
+
+        for _ in 0..2 {
+                        let user_hash_a = Hash::qp_rand_gen();
+            let mut user_ids = u64::qp_rand_gen_vec(10000).iter().map(|x| (*x) & 0x0000_FFFF_FFFF_FFFFu64).collect::<Vec<u64>>();
+            let first_user_id = u64::qp_rand_gen()&0x0000_FFFF_FFFF_FFFFu64;
+            user_ids.push(first_user_id);
+            
+            user_ids.sort_unstable();
+            user_ids.dedup();
+
+            while user_ids.len() != 10001 {
+                user_ids.push(u64::qp_rand_gen());
+                user_ids.sort_unstable();
+                user_ids.dedup();
+            }
+
+            let pairs = user_ids.iter().map(|x| QHash256AndU64{
+            hash: user_hash_a,
+            value_u64: *x,
+            }).collect::<Vec<_>>();
+            let serialized_insert_data = get_data_buffer_for_hash256_and_u64s(&pairs);
+            let tuples = pairs.iter().map(|x| {
+                (x.hash, x.value_u64)
+            }).collect::<Vec<_>>();
+
+            let read_back = read_hash256_refs_and_i64s_from_buffer(&serialized_insert_data)?.iter().map(|x| {
+                QHash256AndU64 {
+                    hash: Hash::from_slice_32bytes(x.0).unwrap(),
+                    value_u64: i64_to_u64_exact(x.1),
+                }
+            }).collect::<Vec<_>>();
+            assert_eq!(read_back, pairs, "read back should match our pairs");
+            let result = self.store.db_select_value_u64_ids_for_hash(table, user_hash_a, 4, 0).await?;
+            assert_eq!(result.len(), 0, "the store should be empty for this hash");
+            self.store.db_insert_one_hash_to_u64(table, user_hash_a, first_user_id).await?;
+            let result = self.store.db_select_value_u64_ids_for_hash(table, user_hash_a, 4, 0).await?;
+            assert_eq!(result.len(), 1, "the store should contain the first user");
+            assert_eq!(result[0], first_user_id, "the store should return the first user id");
+
+            if first_user_id > 0 {
+                let result = self.store.db_select_value_u64_ids_for_hash(table, user_hash_a, 4, first_user_id - 1).await?;
+                assert_eq!(result.len(), 1, "the store should contain the first user");
+                assert_eq!(result[0], first_user_id, "the store should return the first user id");
+
+            }
+            let result = self.store.db_select_value_u64_ids_for_hash(table, user_hash_a, 4, first_user_id / 2).await?;
+            assert_eq!(result.len(), 1, "the store should contain the first user");
+            assert_eq!(result[0], first_user_id, "the store should return the first user id");
+            if first_user_id < i64::MAX as u64 {
+                let result = self.store.db_select_value_u64_ids_for_hash(table, user_hash_a, 4, first_user_id+1).await?;
+                assert_eq!(result.len(), 0, "the store should implement pagination correctly");
+            }
+            
+
+
+
+
+            self.store.db_insert_many_hash_to_u64s(table, &tuples[..]).await?;
+            let result = self.store.db_select_value_u64_ids_for_hash(table, user_hash_a, 15, 0).await?;
+            assert_eq!(result.len(), 15, "the store should contain the first 15 users sorted by user id");
+            assert_eq!(result, user_ids[0..15].to_vec(), "the store should contain the first 15 users sorted by user id");
+            let result = self.store.db_select_value_u64_ids_for_hash(table, user_hash_a, 20, user_ids[15]).await?;
+            assert_eq!(result.len(), 20, "the store should contain the first 15 users sorted by user id");
+            assert_eq!(result, user_ids[15..35].to_vec(), "the store should contain the first 15 users sorted by user id");
+            let result = self.store.db_select_value_u64_ids_for_hash(table, user_hash_a, 9999, user_ids[35]).await?;
+            assert_eq!(result.len(), user_ids.len() - 35, "the store should contain the first 15 users sorted by user id");
+            assert_eq!(result, user_ids[35..(35+9999).min(user_ids.len())].to_vec(), "the store should contain the last users sorted by user id");
+            let result = self.store.db_select_value_u64_ids_for_hash(table, user_hash_a, 10, user_ids[user_ids.len()-1]+1).await?;
+            assert_eq!(result.len(), 0, "the store should not return results after the highest user id");
+        
+        }
+        
+
+
+        for _ in 0..10 {
+            let user_hash_a = Hash::qp_rand_gen();
+            let mut user_ids = u64::qp_rand_gen_vec(100).iter().map(|x| (*x) & 0x0000_FFFF_FFFF_FFFFu64).collect::<Vec<u64>>();
+            let first_user_id = u64::qp_rand_gen()&0x0000_FFFF_FFFF_FFFFu64;
+            user_ids.push(first_user_id);
+            
+            user_ids.sort_unstable();
+            user_ids.dedup();
+
+            while user_ids.len() != 101 {
+                user_ids.push(u64::qp_rand_gen());
+                user_ids.sort_unstable();
+                user_ids.dedup();
+            }
+
+            let pairs = user_ids.iter().map(|x| QHash256AndU64{
+            hash: user_hash_a,
+            value_u64: *x,
+            }).collect::<Vec<_>>();
+            let serialized_insert_data = get_data_buffer_for_hash256_and_u64s(&pairs);
+            let read_back = read_hash256_refs_and_i64s_from_buffer(&serialized_insert_data)?.iter().map(|x| {
+                QHash256AndU64 {
+                    hash: Hash::from_slice_32bytes(x.0).unwrap(),
+                    value_u64: i64_to_u64_exact(x.1),
+                }
+            }).collect::<Vec<_>>();
+            assert_eq!(read_back, pairs, "read back should match our pairs");
+            let result = self.store.db_select_value_u64_ids_for_hash(table, user_hash_a, 4, 0).await?;
+            assert_eq!(result.len(), 0, "the store should be empty for this hash");
+            self.store.db_insert_one_hash_to_u64(table, user_hash_a, first_user_id).await?;
+            let result = self.store.db_select_value_u64_ids_for_hash(table, user_hash_a, 4, 0).await?;
+            assert_eq!(result.len(), 1, "the store should contain the first user");
+            assert_eq!(result[0], first_user_id, "the store should return the first user id");
+
+            if first_user_id > 0 {
+                let result = self.store.db_select_value_u64_ids_for_hash(table, user_hash_a, 4, first_user_id - 1).await?;
+                assert_eq!(result.len(), 1, "the store should contain the first user");
+                assert_eq!(result[0], first_user_id, "the store should return the first user id");
+
+            }
+            let result = self.store.db_select_value_u64_ids_for_hash(table, user_hash_a, 4, first_user_id / 2).await?;
+            assert_eq!(result.len(), 1, "the store should contain the first user");
+            assert_eq!(result[0], first_user_id, "the store should return the first user id");
+            if first_user_id < i64::MAX as u64 {
+                let result = self.store.db_select_value_u64_ids_for_hash(table, user_hash_a, 4, first_user_id+1).await?;
+                assert_eq!(result.len(), 0, "the store should implement pagination correctly");
+            }
+            
+
+
+
+
+            self.store.db_set_hash_256_to_u64_pairs_from_fast_serialized_data(table, 0, &serialized_insert_data).await?;
+            let result = self.store.db_select_value_u64_ids_for_hash(table, user_hash_a, 15, 0).await?;
+            assert_eq!(result.len(), 15, "the store should contain the first 15 users sorted by user id");
+            assert_eq!(result, user_ids[0..15].to_vec(), "the store should contain the first 15 users sorted by user id");
+            let result = self.store.db_select_value_u64_ids_for_hash(table, user_hash_a, 20, user_ids[15]).await?;
+            assert_eq!(result.len(), 20, "the store should contain the first 15 users sorted by user id");
+            assert_eq!(result, user_ids[15..35].to_vec(), "the store should contain the first 15 users sorted by user id");
+            let result = self.store.db_select_value_u64_ids_for_hash(table, user_hash_a, 200, user_ids[35]).await?;
+            assert_eq!(result.len(), user_ids.len()-35, "the store should contain the first 15 users sorted by user id");
+            assert_eq!(result, user_ids[35..].to_vec(), "the store should contain the last users sorted by user id");
+            let result = self.store.db_select_value_u64_ids_for_hash(table, user_hash_a, 10, user_ids[user_ids.len()-1]+1).await?;
+            assert_eq!(result.len(), 0, "the store should not return results after the highest user id");
+            
+        }
+
+        Ok(())
+
+    }
 }
 
 
@@ -4368,6 +4611,7 @@ pub struct SimpleStoreEx {
         ScyllaDoubleMerkleNodesPreparedStatements,
         ScyllaMerkleNodesZeroPreparedStatements,
         ScyllaTagTreeNodesPreparedStatements,
+        ScyllaHashToManyIdsTablePreparedStatements,
         ScyllaCoreStore<ExHash, ExHasher>,
     >,
 }
@@ -4439,6 +4683,9 @@ impl SimpleStoreEx {
             .init_std_table::<ScyllaTagTreeNodesPreparedStatements>("tag_tree_table_b", get_rk(20))
             .await?;
 
+        let hash_ids_to_many_ids_table_a = store.init_std_table::<ScyllaHashToManyIdsTablePreparedStatements>("hash_ids_to_many_ids_table_a", get_rk(21))
+        .await?;
+
         //QSimpleStore::new(store, kiv_table_a, kiv_table_b,
         // bidirectional_mapping_table_a, bidirectional_mapping_table_b,
         // obj_single_id_table_a, obj_single_id_table_b, obj_double_id_table_a,
@@ -4471,6 +4718,7 @@ impl SimpleStoreEx {
             Arc::new(merkle_node_double_id_table_b),
             Arc::new(tag_tree_table_a),
             Arc::new(tag_tree_table_b),
+            Arc::new(hash_ids_to_many_ids_table_a),
         );
         Ok(Self {
             store: simple_store,
@@ -4478,6 +4726,7 @@ impl SimpleStoreEx {
     }
 
     pub async fn basic_test_1(&self) -> anyhow::Result<()> {
+
         println!("starting basic_test_1");
         self.store.th_test_tag_tree_medium(&self.store.tag_tree_table_a, 54321).await?;
         self.store.th_test_tag_tree_v2(&self.store.tag_tree_table_a, 12345).await?;
@@ -4513,7 +4762,7 @@ impl SimpleStoreEx {
         self.store.th_test_double_id_merkle_nodes_basic(&self.store.merkle_node_double_id_table_a, 7331, 1339, EX_DOUBLE_ID_TREE_A_HEIGHT as u8).await?;
         self.store.th_test_zero_id_merkle_nodes_basic(&self.store.merkle_node_zero_id_table_a, EX_ZERO_ID_TREE_A_HEIGHT as u8).await?;
         self.store.th_test_zero_id_merkle_nodes_basic(&self.store.merkle_node_zero_id_table_b, EX_ZERO_ID_TREE_B_HEIGHT as u8).await?;
-        
+        self.store.th_test_hash_to_u64s_basic(&self.store.hash_id_to_u64s_table_a).await?;
 
         Ok(())
     }

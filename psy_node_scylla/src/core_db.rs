@@ -19,21 +19,17 @@ use parth_core::{
     protocol::core_types::QDBHashBase,
 };
 use psy_node_core::store::traits::core_db::{
-    CoreDatabaseBidirectionalMappingReader, CoreDatabaseBidirectionalMappingWriter, CoreDatabaseBidirectionalU64U128MappingReader, CoreDatabaseBidirectionalU64U128MappingWriter, CoreDatabaseDoubleIdCheckpointedReader, CoreDatabaseDoubleIdCheckpointedWriter, CoreDatabaseDoubleIdMerkleReader, CoreDatabaseDoubleIdMerkleWriter, CoreDatabaseKivReader, CoreDatabaseKivWriter, CoreDatabaseSingleIdCheckpointedReader, CoreDatabaseSingleIdCheckpointedWriter, CoreDatabaseSingleIdMerkleReader, CoreDatabaseSingleIdMerkleWriter, CoreDatabaseTagTreeReader, CoreDatabaseTagTreeWriter, CoreDatabaseU64Reader, CoreDatabaseU64Writer, CoreDatabaseZeroIdMerkleDumpReader, CoreDatabaseZeroIdMerkleReader, CoreDatabaseZeroIdMerkleWriter, MerkleTreeDumpStrategy
+    CoreDatabaseBidirectionalMappingReader, CoreDatabaseBidirectionalMappingWriter, CoreDatabaseBidirectionalU64U128MappingReader, CoreDatabaseBidirectionalU64U128MappingWriter, CoreDatabaseDoubleIdCheckpointedReader, CoreDatabaseDoubleIdCheckpointedWriter, CoreDatabaseDoubleIdMerkleReader, CoreDatabaseDoubleIdMerkleWriter, CoreDatabaseHashToManyIdsReader, CoreDatabaseHashToManyIdsWriter, CoreDatabaseKivReader, CoreDatabaseKivWriter, CoreDatabaseSingleIdCheckpointedReader, CoreDatabaseSingleIdCheckpointedWriter, CoreDatabaseSingleIdMerkleReader, CoreDatabaseSingleIdMerkleWriter, CoreDatabaseTagTreeReader, CoreDatabaseTagTreeWriter, CoreDatabaseU64Reader, CoreDatabaseU64Writer, CoreDatabaseZeroIdMerkleDumpReader, CoreDatabaseZeroIdMerkleReader, CoreDatabaseZeroIdMerkleWriter, MerkleTreeDumpStrategy
 };
 use psy_serialize::PsySerializeCanonicalAsyncSafe;
 
 use crate::{
     core::ScyllaCoreStore,
     tables::{
-        blob::ScyllaBiDirectionalBlobToBlobTablePreparedStatements,
-        merkle::{ScyllaDoubleMerkleNodesPreparedStatements, ScyllaMerkleNodesPreparedStatements, ScyllaMerkleNodesZeroPreparedStatements},
-        object::{
+        blob::ScyllaBiDirectionalBlobToBlobTablePreparedStatements, hash_to_many_ids::ScyllaHashToManyIdsTablePreparedStatements, merkle::{ScyllaDoubleMerkleNodesPreparedStatements, ScyllaMerkleNodesPreparedStatements, ScyllaMerkleNodesZeroPreparedStatements}, object::{
             ScyllaGenericKeyIdValueTablePreparedStatements, ScyllaGenericObjectDoubleIdTablePreparedStatements,
             ScyllaGenericObjectSingleIdTablePreparedStatements,
-        },
-        tag_tree::ScyllaTagTreeNodesPreparedStatements,
-        u64_tbl::{ScyllaBidirectionalU64U128MappingPreparedStatements, ScyllaU64ToU64TablePreparedStatements},
+        }, tag_tree::ScyllaTagTreeNodesPreparedStatements, u64_tbl::{ScyllaBidirectionalU64U128MappingPreparedStatements, ScyllaU64ToU64TablePreparedStatements}
     },
 };
 
@@ -883,5 +879,59 @@ impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sy
         table
             .set_tag_only_computed::<Hash, Hasher>(&self.session, unique_pending_id, *key, None, tag)
             .await
+    }
+}
+
+
+
+
+
+#[async_trait]
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+    CoreDatabaseHashToManyIdsReader<Hash, ScyllaHashToManyIdsTablePreparedStatements> for ScyllaCoreStore<Hash, Hasher>
+{
+    async fn db_select_value_u64_ids_for_hash(
+        &self,
+        table: &ScyllaHashToManyIdsTablePreparedStatements,
+        hash: Hash,
+        count: usize,
+        start_u64_value: u64, // The ID to start the query from (inclusive)
+    ) -> anyhow::Result<Vec<u64>>{
+        if count > i32::MAX as usize{
+            anyhow::bail!("cannot select so many user ids!");
+        }
+        table.select_value_u64_ids_for_hash(&self.session, hash, count as i32, start_u64_value).await
+
+    }
+}
+
+#[async_trait]
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+    CoreDatabaseHashToManyIdsWriter<Hash, ScyllaHashToManyIdsTablePreparedStatements> for ScyllaCoreStore<Hash, Hasher>
+{
+    async fn db_insert_one_hash_to_u64(
+        &self,
+        table: &ScyllaHashToManyIdsTablePreparedStatements,
+        hash_id: Hash, 
+        value: u64,
+    ) -> anyhow::Result<()>{
+
+        table.insert_one_hash_to_u64(&self.session, hash_id, value).await
+    }
+    async fn db_insert_many_hash_to_u64s(
+        &self,
+        table: &ScyllaHashToManyIdsTablePreparedStatements,
+        rows: &[(Hash, u64)],
+    ) -> anyhow::Result<()>{
+
+        table.insert_many_hash_to_u64s(&self.session, rows).await
+    }
+    async fn db_set_hash_256_to_u64_pairs_from_fast_serialized_data(
+        &self,
+        table: &ScyllaHashToManyIdsTablePreparedStatements,
+        checkpoint_id: u64,
+        data: &[u8],
+    ) -> anyhow::Result<()>{
+        table.set_hash_256_to_u64_pairs_from_fast_serialized_data(&self.session, data).await
     }
 }

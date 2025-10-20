@@ -69,6 +69,17 @@ pub async fn generate_batch_prepared_statement(session: &Session, statement: &Pr
     Ok(prepared)
 }
 
+
+pub fn generate_batch_pre_prepared_statements(statement: &PreparedStatement, batch_size: usize) -> Batch {
+
+    let mut batch = Batch::default();
+    for _ in 0..batch_size {
+        batch.append_statement(statement.clone());
+    }
+
+    batch
+}
+
 #[cfg(test)]
 mod tests {
     use std::ops::{Shl, Shr};

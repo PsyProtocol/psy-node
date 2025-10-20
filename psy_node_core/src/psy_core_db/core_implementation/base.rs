@@ -38,6 +38,7 @@ pub struct QRealmStoreBase<
     DoubleIdMerkleTableIdentifier: Clone + Send + Sync,
     ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
     RewardTreeTableIdentifier: Clone + Send + Sync,
+    HashToManyIdsTableIdentifier: Clone + Send + Sync,
     S: CoreDatabaseStore<
             N::QHash,
             N::HasherBase,
@@ -50,6 +51,7 @@ pub struct QRealmStoreBase<
             SingleIdMerkleTableIdentifier,
             DoubleIdMerkleTableIdentifier,
             ZeroIdMerkleTableIdentifier,
+            HashToManyIdsTableIdentifier,
         > + CoreDatabaseTagTreeStore<N::QHash, N::HasherBase, RewardTreeTableIdentifier> + Send + Sync,
 > {
     pub store: Arc<S>,
@@ -68,6 +70,10 @@ pub struct QRealmStoreBase<
     pub checkpoint_id_to_pending_id_table: Arc<U64TableIdentifier>,
     pub pending_id_to_checkpoint_id_table: Arc<U64TableIdentifier>,
     pub pending_id_to_pending_proc_id_table: Arc<BiDirectionalU64U128MappingTableIdentifier>,
+
+
+    // mappings
+    pub public_key_hash_to_user_ids_table: Arc<HashToManyIdsTableIdentifier>,
 
     // start trees
     pub global_user_tree_table: Arc<ZeroIdMerkleTableIdentifier>,
@@ -98,6 +104,7 @@ impl<
         DoubleIdMerkleTableIdentifier: Clone + Send + Sync,
         ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
         RewardTreeTableIdentifier: Clone + Send + Sync,
+        HashToManyIdsTableIdentifier: Clone + Send + Sync,
         S: CoreDatabaseStore<
                 N::QHash,
                 N::HasherBase,
@@ -110,6 +117,7 @@ impl<
                 SingleIdMerkleTableIdentifier,
                 DoubleIdMerkleTableIdentifier,
                 ZeroIdMerkleTableIdentifier,
+                HashToManyIdsTableIdentifier,
             > + CoreDatabaseTagTreeStore<N::QHash, N::HasherBase, RewardTreeTableIdentifier>+ Send + Sync,
     >
     QRealmStoreBase<
@@ -124,6 +132,7 @@ impl<
         DoubleIdMerkleTableIdentifier,
         ZeroIdMerkleTableIdentifier,
         RewardTreeTableIdentifier,
+        HashToManyIdsTableIdentifier,
         S,
     >
 {
@@ -278,6 +287,7 @@ impl<
         DoubleIdMerkleTableIdentifier: Clone + Send + Sync,
         ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
         RewardTreeTableIdentifier: Clone + Send + Sync,
+        HashToManyIdsTableIdentifier: Clone + Send + Sync,
         S: CoreDatabaseStore<
                 N::QHash,
                 N::HasherBase,
@@ -290,6 +300,7 @@ impl<
                 SingleIdMerkleTableIdentifier,
                 DoubleIdMerkleTableIdentifier,
                 ZeroIdMerkleTableIdentifier,
+                HashToManyIdsTableIdentifier,
             > + CoreDatabaseTagTreeStore<N::QHash, N::HasherBase, RewardTreeTableIdentifier>+ Send + Sync,
     >
     QEDRealmStoreReaderAsync<N> for 
@@ -305,6 +316,7 @@ impl<
         DoubleIdMerkleTableIdentifier,
         ZeroIdMerkleTableIdentifier,
         RewardTreeTableIdentifier,
+        HashToManyIdsTableIdentifier,
         S,
     >
 {
@@ -605,6 +617,7 @@ impl<
         DoubleIdMerkleTableIdentifier: Clone + Send + Sync,
         ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
         RewardTreeTableIdentifier: Clone + Send + Sync,
+        HashToManyIdsTableIdentifier: Clone + Send + Sync,
         S: CoreDatabaseStore<
                 N::QHash,
                 N::HasherBase,
@@ -617,6 +630,7 @@ impl<
                 SingleIdMerkleTableIdentifier,
                 DoubleIdMerkleTableIdentifier,
                 ZeroIdMerkleTableIdentifier,
+                HashToManyIdsTableIdentifier,
             > + CoreDatabaseTagTreeStore<N::QHash, N::HasherBase, RewardTreeTableIdentifier>+ Send + Sync,
     >
     QEDRealmStoreWriterAsyncImm<N> for 
@@ -632,6 +646,7 @@ impl<
         DoubleIdMerkleTableIdentifier,
         ZeroIdMerkleTableIdentifier,
         RewardTreeTableIdentifier,
+        HashToManyIdsTableIdentifier,
         S,
     >
 {
