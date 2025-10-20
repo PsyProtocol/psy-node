@@ -1,12 +1,13 @@
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
 use parth_core::{
     crypto::hash::merkle_proof::MerkleProofCore,
-    protocol::core_types::QNetworkTypesConfig,
+    protocol::core_types::QNetworkTypesConfig, QProvingJobDataIDWithRewardPath,
 };
+
 use psy_data::{
     proof_input::guta::SubmitGUTARealmResultAPINoProofInput,
     v1::{
-        common_api::APILatestCheckpointResponse,
+        common_api::{APILatestCheckpointResponse, PsyProoffMinerRewardProof},
         qdata::{
             checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState},
             contract::{ContractCodeDefinition, PQBCDeployContract, PQEDContractLeaf},
@@ -243,11 +244,7 @@ pub trait CoordinatorEdgeRpc<N: QNetworkTypesConfig> {
     #[method(name = "get_checkpoint_tree_merkle_proof_f")]
     async fn get_checkpoint_tree_merkle_proof_f(&self, checkpoint_id: N::F, leaf_checkpoint_id: N::F) -> RpcResult<MerkleProofCore<N::QHash>>;
 
-    //#[method(name = "generate_batch_variable_height_reward_proofs")]
-    //async fn generate_batch_variable_height_reward_proofs(&self, checkpoint_id:
-    // u64, job_ids: Vec<QProvingJobDataID>) ->
-    // RpcResult<Vec<(VariableHeightRewardMerkleProof, QProvingJobDataID)>>;
-
-    #[method(name = "get_graphviz")]
-    async fn get_graphviz(&self, checkpoint_id: u64) -> RpcResult<String>;
+    #[method(name = "generate_batch_proof_miner_reward_proofs")]
+    async fn generate_batch_proof_miner_reward_proofs(&self, unique_pending_id: u64, job_ids: Vec<QProvingJobDataIDWithRewardPath<N::JobId>>) -> RpcResult<Vec<PsyProoffMinerRewardProof<N::QHash, N::JobId>>>;
+    
 }
