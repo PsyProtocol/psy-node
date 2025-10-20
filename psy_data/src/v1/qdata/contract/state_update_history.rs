@@ -1,0 +1,91 @@
+use std::collections::HashMap;
+
+use parth_core::{crypto::hash::merkle_proof::DeltaMerkleProofCore, protocol::core_types::QHashBase};
+
+
+#[pderive::serialize_clone_hash_ts]
+#[ts(export, concrete(Hash = parth_core::PHash))]
+pub struct QEDContractStateUpdateHistory<Hash> {
+    pub user_contract_tree_update_proof: DeltaMerkleProofCore<Hash>,
+    pub contract_state_tree_updates: Vec<DeltaMerkleProofCore<Hash>>,
+}
+
+impl<Hash: QHashBase> QEDContractStateUpdateHistory<Hash> {
+    pub fn ensure_basic_consistency(&self, contract_helper: &SimpleContractHeightCache<Hash>) -> anyhow::Result<()> {
+        if self.contract_state_tree_updates.len() == 0 {
+            anyhow::bail!("contract_state_tree_updates cannot be empty")
+        }
+        if self.contract_state_tree_updates[0].old_root != self.user_contract_tree_update_proof.old_value && (
+            self.user_contract_tree_update_proof.old_value != Hash::get_zero_value() || (self.contract_state_tree_updates[0].old_root != contract_helper.get_contract_zero_hash(self.user_contract_tree_update_proof.index)?)
+        ){
+            anyhow::bail!("first CST old root does not match UCT old value");
+        }
+        if self.contract_state_tree_updates.last().as_ref().unwrap().new_root != self.user_contract_tree_update_proof.new_value {
+
+            anyhow::bail!("first CST new root does not match UCT new value");
+        }
+
+        let height = self.contract_state_tree_updates[0].siblings.len();
+
+        for i in 1..self.contract_state_tree_updates.len() {
+            if self.contract_state_tree_updates[i].siblings.len() != height {
+                anyhow::bail!("invalid tree height in siblings");
+            }
+            if self.contract_state_tree_updates[i].old_root != self.contract_state_tree_updates[i-1].new_root {
+                anyhow::bail!("invalid cst transition proof: current old_root != last new_root");
+            }
+        }
+
+
+       Ok(())
+
+    }
+    /*
+    pub fn verify_generate_cst_delta<H: FieldQHasher<F, Hash>>(&self, injestor: &mut CSTUserUpdateStore<Hash>) -> anyhow::Result<()> {
+
+
+        injestor.verify_injest_uct_delta_merkle_proof::<H>(&self.user_contract_tree_update_proof)?;
+
+        let contract_id = self.user_contract_tree_update_proof.index as u32;
+
+
+        for p in self.contract_state_tree_updates.iter() {
+            injestor.verify_injest_delta_merkle_proof::<H>(contract_id, p)?;
+        }
+
+        Ok(())
+
+
+
+    }*/
+}
+
+
+
+#[derive(Clone, Debug)]
+pub struct SimpleContractHeightCache<Hash> {
+    mapping: HashMap<u64, (u8, Hash)>
+}
+
+impl<Hash: Copy> SimpleContractHeightCache<Hash> {
+    pub fn new() -> Self {
+        Self {
+            mapping: HashMap::new(),
+        }
+    }
+    pub fn add_contract(&mut self, contract_id: u64, height: u8, zero_hash: Hash) {
+        self.mapping.insert(contract_id, (height, zero_hash));
+    }
+    pub fn get_contract_height(&self, contract_id: u64) -> anyhow::Result<u8> {
+        match self.mapping.get(&contract_id) {
+            Some(x) => Ok(x.0),
+            None => anyhow::bail!("contract {} not loaded",contract_id),
+        }
+    }
+    pub fn get_contract_zero_hash(&self, contract_id: u64) -> anyhow::Result<Hash> {
+        match self.mapping.get(&contract_id) {
+            Some(x) => Ok(x.1),
+            None => anyhow::bail!("contract {} not loaded",contract_id),
+        }
+    }
+}

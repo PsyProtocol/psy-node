@@ -1,17 +1,24 @@
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
-use parth_core::{crypto::hash::merkle_proof::MerkleProofCore, protocol::core_types::{QNetworkDatabaseTypes, QNetworkTypesConfig}};
-use psy_core::job::job_id::QProvingJobDataID;
-use psy_data::{ guta::stats::GUTAStats, proof_input::guta::SubmitGUTARealmResultAPINoProofInput, v1::qdata::{checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState}, contract::{ContractCodeDefinition, PQBCDeployContract, PQEDContractLeaf}, public_key::PZKPublicKeyInfo}};
+use parth_core::{
+    crypto::hash::merkle_proof::MerkleProofCore,
+    protocol::core_types::QNetworkTypesConfig,
+};
+use psy_data::{
+    proof_input::guta::SubmitGUTARealmResultAPINoProofInput,
+    v1::{
+        common_api::APILatestCheckpointResponse,
+        qdata::{
+            checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState},
+            contract::{ContractCodeDefinition, PQBCDeployContract, PQEDContractLeaf},
+            public_key::PZKPublicKeyInfo,
+            user::PQEDUserLeaf,
+        },
+    },
+};
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Copy)]
-pub struct APILatestCheckpointResponse {
-    pub checkpoint_id: u64,
-}
 
-use psy_data::v1::qdata::user::PQEDUserLeaf;
 #[rpc(server, client, namespace = "psy")]
-pub trait CoordinatorEdgeRpc<N: QNetworkTypesConfig>  {
-    
+pub trait CoordinatorEdgeRpc<N: QNetworkTypesConfig> {
     // Basic methods
     #[method(name = "register_user")]
     async fn register_user(&self, public_key: PZKPublicKeyInfo<N::QHash>) -> RpcResult<String>;
@@ -26,14 +33,8 @@ pub trait CoordinatorEdgeRpc<N: QNetworkTypesConfig>  {
     async fn build_block(&self) -> RpcResult<String>;
 
     #[method(name = "submit_guta")]
-    async fn submit_guta(
-        &self,
-        input: SubmitGUTARealmResultAPINoProofInput<N::F, N::QHash>,
-        proof: N::ZKProof,
-        realm_id: u64,
-    ) -> RpcResult<String>;
+    async fn submit_guta(&self, input: SubmitGUTARealmResultAPINoProofInput<N::F, N::QHash>, proof: N::ZKProof, realm_id: u64) -> RpcResult<String>;
 
-    
     #[method(name = "get_latest_checkpoint")]
     async fn get_latest_checkpoint(&self) -> RpcResult<APILatestCheckpointResponse>;
 
@@ -43,7 +44,7 @@ pub trait CoordinatorEdgeRpc<N: QNetworkTypesConfig>  {
     #[method(name = "get_latest_checkpoint_id")]
     async fn get_latest_checkpoint_id(&self) -> RpcResult<u64>;
 
-    /* 
+    /*
     // Checkpoint sync info
     #[method(name = "get_checkpoint_sync_info")]
     async fn get_checkpoint_sync_info(&self, realm_id: u32, checkpoint_id: u64) -> RpcResult<CheckpointSyncInfo<N::F>>;
@@ -108,7 +109,13 @@ pub trait CoordinatorEdgeRpc<N: QNetworkTypesConfig>  {
     async fn get_user_tree_root_f(&self, checkpoint_id: N::F) -> RpcResult<N::QHash>;
 
     #[method(name = "get_user_sub_tree_merkle_proof")]
-    async fn get_user_sub_tree_merkle_proof(&self, checkpoint_id: u64, root_level: u8, leaf_level: u8, leaf_index: u64) -> RpcResult<MerkleProofCore<N::QHash>>;
+    async fn get_user_sub_tree_merkle_proof(
+        &self,
+        checkpoint_id: u64,
+        root_level: u8,
+        leaf_level: u8,
+        leaf_index: u64,
+    ) -> RpcResult<MerkleProofCore<N::QHash>>;
 
     #[method(name = "get_user_top_tree_merkle_proof")]
     async fn get_user_top_tree_merkle_proof(&self, checkpoint_id: u64, leaf_level: u8, leaf_index: u64) -> RpcResult<MerkleProofCore<N::QHash>>;
@@ -142,10 +149,20 @@ pub trait CoordinatorEdgeRpc<N: QNetworkTypesConfig>  {
     async fn get_contract_function_tree_leaf_hash_f(&self, checkpoint_id: N::F, contract_id: N::F, function_id: N::F) -> RpcResult<N::QHash>;
 
     #[method(name = "get_contract_function_tree_merkle_proof")]
-    async fn get_contract_function_tree_merkle_proof(&self, checkpoint_id: u64, contract_id: u32, function_id: u32) -> RpcResult<MerkleProofCore<N::QHash>>;
+    async fn get_contract_function_tree_merkle_proof(
+        &self,
+        checkpoint_id: u64,
+        contract_id: u32,
+        function_id: u32,
+    ) -> RpcResult<MerkleProofCore<N::QHash>>;
 
     #[method(name = "get_contract_function_tree_merkle_proof_f")]
-    async fn get_contract_function_tree_merkle_proof_f(&self, checkpoint_id: N::F, contract_id: N::F, function_id: N::F) -> RpcResult<MerkleProofCore<N::QHash>>;
+    async fn get_contract_function_tree_merkle_proof_f(
+        &self,
+        checkpoint_id: N::F,
+        contract_id: N::F,
+        function_id: N::F,
+    ) -> RpcResult<MerkleProofCore<N::QHash>>;
 
     // Contract tree
     #[method(name = "get_contract_tree_root")]
@@ -227,7 +244,9 @@ pub trait CoordinatorEdgeRpc<N: QNetworkTypesConfig>  {
     async fn get_checkpoint_tree_merkle_proof_f(&self, checkpoint_id: N::F, leaf_checkpoint_id: N::F) -> RpcResult<MerkleProofCore<N::QHash>>;
 
     //#[method(name = "generate_batch_variable_height_reward_proofs")]
-    //async fn generate_batch_variable_height_reward_proofs(&self, checkpoint_id: u64, job_ids: Vec<QProvingJobDataID>) -> RpcResult<Vec<(VariableHeightRewardMerkleProof, QProvingJobDataID)>>;
+    //async fn generate_batch_variable_height_reward_proofs(&self, checkpoint_id:
+    // u64, job_ids: Vec<QProvingJobDataID>) ->
+    // RpcResult<Vec<(VariableHeightRewardMerkleProof, QProvingJobDataID)>>;
 
     #[method(name = "get_graphviz")]
     async fn get_graphviz(&self, checkpoint_id: u64) -> RpcResult<String>;
