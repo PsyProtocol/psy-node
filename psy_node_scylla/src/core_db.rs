@@ -462,7 +462,7 @@ impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sy
         table: &ScyllaMerkleNodesZeroPreparedStatements,
         max_checkpoint_id: u64,
     ) -> anyhow::Result<HashMap<u64, Hash>> {
-        table.dump_all_zero_id_merkle_node_leaves_fast::<Hash>(&self.session, max_checkpoint_id).await
+        table.dump_all_zero_id_merkle_node_leaves_sparse_sub_trees::<Hash>(&self.session, max_checkpoint_id).await
     }
 
     async fn dump_all_zero_id_merkle_node_leaves_vec(

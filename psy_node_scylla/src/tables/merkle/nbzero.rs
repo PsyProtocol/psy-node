@@ -23,7 +23,7 @@ use scylla::{
     statement::{batch::Batch, prepared::PreparedStatement, Statement},
 };
 
-use crate::utils::{calc_best_batch_size, convert_checkpoint_id_to_i64, generate_batch_prepared_statement, i64_to_u64_exact, u64_to_i64_exact, u8_to_i8_exact};
+use crate::utils::{calc_best_batch_size, convert_checkpoint_id_to_i64, generate_batch_prepared_statement, u64_to_i64_exact, u8_to_i8_exact};
 
 #[derive(Clone)]
 pub struct ScyllaMerkleNodesZeroPreparedStatements {
@@ -193,6 +193,18 @@ impl ScyllaMerkleNodesZeroPreparedStatements {
         Ok(results)
     }
 
+pub async fn dump_all_zero_id_merkle_node_leaves_sparse_sub_trees<Hash: QDBHashBase>(
+        &self,
+        session: &Session,
+        max_checkpoint_id: u64,
+    ) -> anyhow::Result<HashMap<u64, Hash>> {
+        let output_map = DashMap::new();
+
+        // Start the recursive scan from the root of the tree (level 0, index 0).
+        self.sparse_dump_recursive(session, max_checkpoint_id, 0, 0, &output_map).await?;
+
+        Ok(output_map.into_iter().collect())
+    }
     
     /// NEW HELPER: Retrieves a node value if it exists, otherwise returns None.
     /// This is the clean, internal way to check for node existence.
@@ -218,6 +230,65 @@ impl ScyllaMerkleNodesZeroPreparedStatements {
             None => Ok(None),
         }
     
+    }
+    async fn sparse_dump_recursive<Hash: QDBHashBase>(
+        &self,
+        session: &Session,
+        max_checkpoint_id: u64,
+        level: u8,
+        node_index: u64,
+        output_map: &DashMap<u64, Hash>,
+    ) -> anyhow::Result<()> {
+        //println!("sparse_dump_recursive: level {}, index {}", level, node_index);
+        // We don't need to check the absolute root at (0,0), but every node below it.
+        // If the root of the subtree we're asked to scan doesn't exist, prune the entire branch.
+        if level > 0 {
+            if self.select_optional_zero_id_merkle_node_internal::<Hash>(session, max_checkpoint_id, SimpleMerkleNodeKey { level, index: node_index }).await?.is_none() {
+                return Ok(());
+            }
+        }
+        const SUBTREE_SCAN_LEVEL_DIFF: u8 = 8;
+        let scan_level = (level + SUBTREE_SCAN_LEVEL_DIFF).min(self.tree_height);
+        // BASE CASE: If the next scan level is the leaf level, we scan for leaves and finish.
+        if scan_level == self.tree_height {
+            let level_diff = scan_level - level;
+            let start_child_index = node_index << level_diff;
+            let end_child_index = start_child_index + (1u64 << level_diff) - 1;
+            let leaves = self.scan_tree_level_caps::<Hash>(session, max_checkpoint_id, self.tree_height, start_child_index, end_child_index).await?;
+            for (i, hash_opt) in leaves.into_iter().enumerate() {
+                if let Some(hash) = hash_opt {
+                    output_map.insert(start_child_index + i as u64, hash);
+                }
+            }
+            return Ok(());
+        }
+        // RECURSIVE STEP: Scan for intermediate "caps" and recurse on the ones that exist.
+        let level_diff = scan_level - level;
+        let start_child_index = node_index << level_diff;
+        let end_child_index = start_child_index + (1u64 << level_diff) - 1;
+        let caps = self.scan_tree_level_caps::<Hash>(session, max_checkpoint_id, scan_level, start_child_index, end_child_index).await?;
+       
+        let child_indices_to_explore: Vec<u64> = caps
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, hash_opt)| hash_opt.map(|_| start_child_index + i as u64))
+            .collect();
+        let mut futures = Vec::new();
+        for child_node_index in child_indices_to_explore {
+            let fut = self.sparse_dump_recursive(
+                session,
+                max_checkpoint_id,
+                scan_level,
+                child_node_index,
+                output_map,
+            );
+            futures.push(Box::pin(fut));
+        }
+        let results = join_all(futures).await;
+        for result in results {
+            result?;
+        }
+        Ok(())
     }
     /// Inserts a single node at checkpoint_id.
     /// Optimized: uses prepared statement.
@@ -372,101 +443,18 @@ impl ScyllaMerkleNodesZeroPreparedStatements {
     }
 
 
-}
-
-
-impl ScyllaMerkleNodesZeroPreparedStatements {
-
-    // Consolidated dump: stream leaf level, dedup client-side for latest <=
-    // max_checkpoint
-    async fn dump_leaves_stream<Hash: QDBHashBase>(
-        &self,
-        session: &Session,
-        max_checkpoint_id: u64,
-        start_index: u64,
-        end_index: Option<u64>, // None for full
-    ) -> anyhow::Result<HashMap<u64, Hash>> {
-        if end_index.is_some() {
-            return self
-                .dump_leaves_stream_end_index::<Hash>(session, max_checkpoint_id, start_index, end_index.unwrap())
-                .await;
-        }
-        let level_i8 = u8_to_i8_exact(self.tree_height);
-        let max_cp_i64 = convert_checkpoint_id_to_i64(max_checkpoint_id);
-        let query = format!(
-            "SELECT node_index, checkpoint_id, value FROM {}.{} WHERE level = ?",
-            self.keyspace, self.table_name
-        );
-        let mut stream = session.query_iter(query, &(level_i8,)).await?.rows_stream::<(i64, i64, Vec<u8>)>()?;
-        let mut output_map = HashMap::new();
-        let mut prev_index: Option<i64> = None;
-        while let Some(next_row_res) = stream.next().await {
-            let (node_index_i64, cp_i64, value) = next_row_res?;
-            let node_index = i64_to_u64_exact(node_index_i64); // Assuming utils has i64_to_u64_exact
-            if Some(node_index_i64) != prev_index {
-                if cp_i64 <= max_cp_i64 {
-                    let hash = Hash::from_slice_32bytes(&value)?;
-
-                    output_map.insert(node_index, hash);
-                }
-                prev_index = Some(node_index_i64);
-            }
-            // Else skip historical for same index
-        }
-        Ok(output_map)
-    }
-    // Consolidated dump: stream leaf level, dedup client-side for latest <=
-    // max_checkpoint
-    async fn dump_leaves_stream_end_index<Hash: QDBHashBase>(
-        &self,
-        session: &Session,
-        max_checkpoint_id: u64,
-        start_index: u64,
-        end_index: u64, // None for full
-    ) -> anyhow::Result<HashMap<u64, Hash>> {
-        let level_i8 = u8_to_i8_exact(self.tree_height);
-        let max_cp_i64 = convert_checkpoint_id_to_i64(max_checkpoint_id);
-        let query = format!(
-            "SELECT node_index, checkpoint_id, value FROM {}.{} WHERE level = ? AND node_index >= ? AND node_index <= ?",
-            self.keyspace, self.table_name
-        );
-        let mut stream = session // TODO:, make this not i64 or something, it messes up the ranges
-            .query_iter(query, &(level_i8, u64_to_i64_exact(start_index), u64_to_i64_exact(end_index)))
-            .await?
-            .rows_stream::<(i64, i64, Vec<u8>)>()?;
-        let mut output_map = HashMap::new();
-        let mut prev_index: Option<i64> = None;
-        while let Some(next_row_res) = stream.next().await {
-            let (node_index_i64, cp_i64, value) = next_row_res?;
-            let node_index = i64_to_u64_exact(node_index_i64); // Assuming utils has i64_to_u64_exact
-            if Some(node_index_i64) != prev_index {
-                if cp_i64 <= max_cp_i64 {
-                    let hash = Hash::from_slice_32bytes(&value)?;
-
-                    output_map.insert(node_index, hash);
-                }
-                prev_index = Some(node_index_i64);
-            }
-            // Else skip historical for same index
-        }
-        Ok(output_map)
-    }
-
-    pub async fn dump_all_zero_id_merkle_node_leaves_sparse_sub_trees<Hash: QDBHashBase>(
-        &self,
-        session: &Session,
-        max_checkpoint_id: u64,
-    ) -> anyhow::Result<HashMap<u64, Hash>> {
-        self.dump_leaves_stream::<Hash>(session, max_checkpoint_id, 0, None).await
-    }
-
     pub async fn dump_all_zero_id_merkle_node_leaves_fast<Hash: QDBHashBase>(
         &self,
         session: &Session,
         max_checkpoint_id: u64,
     ) -> anyhow::Result<HashMap<u64, Hash>> {
-        self.dump_leaves_stream::<Hash>(session, max_checkpoint_id, 0, None).await
+        let total_leaves = 1u64 << self.tree_height;
+        let mut data_map: HashMap<u64, Hash> = HashMap::with_capacity(total_leaves as usize);
+        // The end_index for dump_leaves_to_hash_map is exclusive.
+        self.dump_leaves_to_hash_map::<Hash>(session, max_checkpoint_id, 0, total_leaves, &mut data_map).await?;
+        Ok(data_map)
     }
+    
 
     pub async fn dump_all_zero_id_merkle_node_leaves_append_only<Hash: QDBHashBase>(
         &self,
@@ -474,25 +462,31 @@ impl ScyllaMerkleNodesZeroPreparedStatements {
         max_checkpoint_id: u64,
     ) -> anyhow::Result<HashMap<u64, Hash>> {
         let total_leaves = 1u64 << self.tree_height;
+        if total_leaves == 0 {
+            return Ok(HashMap::new());
+        }
+
+        let leaf_level = self.tree_height;
+        let max_cp_i64 = convert_checkpoint_id_to_i64(max_checkpoint_id);
+        let level_i8 = u8_to_i8_exact(leaf_level);
+
+        // Binary search to find the first zero leaf. This is more robust for the append-only assumption.
+        // It efficiently finds the total number of non-zero leaves.
         let mut low = 0u64;
         let mut high = total_leaves.saturating_sub(1);
-        let mut first_zero_idx = total_leaves;
+        let mut first_zero_idx = total_leaves; // Assume all leaves are non-zero initially.
+
         while low <= high {
             let mid = low + (high - low) / 2;
-            let res = session
-                .execute_unpaged(
-                    &self.select_1_prepared,
-                    (
-                        u8_to_i8_exact(self.tree_height),
-                        u64_to_i64_exact(mid),
-                        convert_checkpoint_id_to_i64(max_checkpoint_id),
-                    ),
-                )
-                .await?;
+            
+            let res = session.execute_unpaged(&self.select_1_prepared, (level_i8, u64_to_i64_exact(mid), max_cp_i64)).await?;
             let is_present = res.into_rows_result()?.maybe_first_row::<(Vec<u8>,)>()?.is_some();
+
             if is_present {
+                // The leaf at `mid` is non-zero, so the first zero leaf must be to the right.
                 low = mid.saturating_add(1);
             } else {
+                // The leaf at `mid` is zero. This could be the first one. Store it and search to the left.
                 first_zero_idx = mid;
                 if mid == 0 {
                     break;
@@ -500,41 +494,310 @@ impl ScyllaMerkleNodesZeroPreparedStatements {
                 high = mid.saturating_sub(1);
             }
         }
-        if first_zero_idx == 0 {
-            return Ok(HashMap::new());
+
+        let mut data_map = HashMap::new();
+        if first_zero_idx > 0 {
+            // We now know that leaves from 0 to first_zero_idx - 1 are non-zero.
+            // Dump this contiguous range in one efficient bulk operation.
+            self.dump_leaves_to_hash_map::<Hash>(session, max_checkpoint_id, 0, first_zero_idx, &mut data_map).await?;
         }
-        self.dump_leaves_stream::<Hash>(session, max_checkpoint_id, 0, Some(first_zero_idx - 1))
+        
+        Ok(data_map)
+    }
+
+    /// Helper function to perform a bulk read of leaves in a given range and populate a HashMap.
+    async fn dump_leaves_to_hash_map<Hash: QDBHashBase>(
+        &self,
+        session: &Session,
+        max_checkpoint_id: u64,
+        start_index: u64,
+        end_index: u64, // Exclusive
+        data_map: &mut HashMap<u64, Hash>,
+    ) -> anyhow::Result<()> {
+        if start_index >= end_index {
+            return Ok(());
+        }
+        // scan_tree_level_caps takes an inclusive end_index.
+        let results = self.scan_tree_level_caps::<Hash>(session, max_checkpoint_id, self.tree_height, start_index, end_index - 1).await?;
+        for (i, maybe_hash) in results.into_iter().enumerate() {
+            if let Some(hash) = maybe_hash {
+                data_map.insert(start_index + i as u64, hash);
+            }
+        }
+        Ok(())
+    }
+    /// Scans a range of nodes at a specific tree level, returning a vector of optional hashes.
+    async fn scan_tree_level_caps<Hash: QDBHashBase>(
+        &self,
+        session: &Session,
+        max_checkpoint_id: u64,
+        level: u8, 
+        start_index: u64,
+        end_index: u64, // Inclusive
+    ) -> anyhow::Result<Vec<Option<Hash>>> {
+        const CONCURRENT_LIMIT: usize = 512;
+        if start_index > end_index {
+            return Ok(Vec::new());
+        }
+
+        let level_i8 = u8_to_i8_exact(level);
+        let max_cp_i64 = convert_checkpoint_id_to_i64(max_checkpoint_id);
+
+        stream::iter(start_index..=end_index)
+            .map(|index| {
+                let session = session.clone();
+                let prep = self.select_1_prepared.clone();
+                async move {
+                    let index_i64 = u64_to_i64_exact(index);
+                    let res = session.execute_unpaged(&prep, (level_i8, index_i64, max_cp_i64)).await?;
+                    let rows = res.into_rows_result()?;
+                    if let Some(row) = rows.maybe_first_row::<(Vec<u8>,)>()? {
+                        Ok(Some(Hash::from_bytes(&row.0).context("Failed to parse hash from bytes")?))
+                    } else {
+                        Ok(None)
+                    }
+                }
+            })
+            .buffered(CONCURRENT_LIMIT)
+            .try_collect()
             .await
     }
+    async fn find_left_most_zero_merkle_path<Hash: QDBHashBase>(
+        &self,
+        session: &Session,
+        max_checkpoint_id: u64,
+        sub_root: SimpleMerkleNodeKey,
+        scan_cap_batch_log_2: u8,
+        data_map: &DashMap<u64, Hash>,
+    ) -> anyhow::Result<()> {
+        todo!("")
+    }
+    async fn dump_tree_span_v2<Hash: QDBHashBase>(
+        &self,
+        session: &Session,
+        max_checkpoint_id: u64,
+        level: u8, 
+        start_index: u64,
+        end_index: u64,
+        data_map: &DashMap<u64, Hash>,
+    ) -> anyhow::Result<()> {
+
+        let count = end_index - start_index;
+        const CONCURRENT_LIMIT: usize = 512; // Increased for better performance; monitor for timeouts.
+        let level_i8 = u8_to_i8_exact(level);
+        let max_cp_i64 = convert_checkpoint_id_to_i64(max_checkpoint_id);
+
+        let batch_count = count as usize / CONCURRENT_LIMIT + if (count as usize % CONCURRENT_LIMIT) > 0 {1} else {0};
+        for i in 0..batch_count {
+            let max_value = if i == batch_count-1 {
+                let mod_res = count as usize % CONCURRENT_LIMIT;
+                if mod_res == 0 {
+                    CONCURRENT_LIMIT
+                } else {
+                    mod_res
+                }
+            } else {
+                CONCURRENT_LIMIT
+            };
+
+            let futures: Vec<_> = (0..max_value)
+                .map(|idx| {
+                    let prep = self.select_1_prepared.clone();
+                    let idx_u64 =(i*CONCURRENT_LIMIT + idx) as u64 + start_index;
+                    let index_i64 = u64_to_i64_exact(idx_u64);
+                    async move {
+                        let res: QueryResult = session.execute_unpaged(&prep, (level_i8, index_i64, max_cp_i64)).await?;
+                        let rows = res.into_rows_result()?;
+                        if let Some(row) = rows.maybe_first_row::<(Vec<u8>,)>()? {
+                            if row.0.len() != 32 {
+                                anyhow::bail!("Invalid hash length retrieved from database");
+                            }
+                            data_map.insert(idx_u64, Hash::from_owned_32bytes(row.0.try_into().unwrap()));
+                        }
+                        Ok(())
+                    }
+                }).collect();
+            let batch_results = join_all(futures).await;
+            for res in batch_results {
+                res?;
+            }
+        }
+
+        Ok(())
+
+    }
+    async fn dump_leaves_to_dash_map<Hash: QDBHashBase>(
+        &self,
+        session: &Session,
+        max_checkpoint_id: u64,
+        start_index: u64,
+        end_index: u64,
+        data_map: &DashMap<u64, Hash>,
+    ) -> anyhow::Result<()> {
+
+        let count = end_index - start_index;
+        const CONCURRENT_LIMIT: usize = 512; // Increased for better performance; monitor for timeouts.
+        let level_i8 = u8_to_i8_exact(self.tree_height);
+        let max_cp_i64 = convert_checkpoint_id_to_i64(max_checkpoint_id);
+
+        let batch_count = count as usize / CONCURRENT_LIMIT + if (count as usize % CONCURRENT_LIMIT) > 0 {1} else {0};
+        for i in 0..batch_count {
+            let max_value = if i == batch_count-1 {
+                let mod_res = count as usize % CONCURRENT_LIMIT;
+                if mod_res == 0 {
+                    CONCURRENT_LIMIT
+                } else {
+                    mod_res
+                }
+            } else {
+                CONCURRENT_LIMIT
+            };
+
+            let futures: Vec<_> = (0..max_value)
+                .map(|idx| {
+                    let prep = self.select_1_prepared.clone();
+                    let idx_u64 =(i*CONCURRENT_LIMIT + idx) as u64 + start_index;
+                    let index_i64 = u64_to_i64_exact(idx_u64);
+                    async move {
+                        let res: QueryResult = session.execute_unpaged(&prep, (level_i8, index_i64, max_cp_i64)).await?;
+                        let rows = res.into_rows_result()?;
+                        if let Some(row) = rows.maybe_first_row::<(Vec<u8>,)>()? {
+                            if row.0.len() != 32 {
+                                anyhow::bail!("Invalid hash length retrieved from database");
+                            }
+                            data_map.insert(idx_u64, Hash::from_owned_32bytes(row.0.try_into().unwrap()));
+                        }
+                        Ok(())
+                    }
+                }).collect();
+            let batch_results = join_all(futures).await;
+            for res in batch_results {
+                res?;
+            }
+        }
+
+        Ok(())
+
+    }
+    async fn dump_tree_span<Hash: QDBHashBase>(
+        &self,
+        session: &Session,
+        max_checkpoint_id: u64,
+        level: u8, 
+        start_index: u64,
+        end_index: u64,
+        data_map: &DashMap<u64, Hash>,
+    ) -> anyhow::Result<()> {
+        if start_index >= end_index {
+            anyhow::bail!("Invalid index range, start_index >= end_index - start_index: {}, end_index: {}", start_index, end_index);
+        }
+
+        let count = end_index - start_index;
+        const CONCURRENT_LIMIT: usize = 512; // Increased for better performance; monitor for timeouts.
+        let level_i8 = u8_to_i8_exact(level);
+        let max_cp_i64 = convert_checkpoint_id_to_i64(max_checkpoint_id);
+
+        let batch_count = count as usize / CONCURRENT_LIMIT + if (count as usize % CONCURRENT_LIMIT) > 0 {1} else {0};
+        for i in 0..batch_count {
+            let max_value = if i == batch_count-1 {
+                let mod_res = count as usize % CONCURRENT_LIMIT;
+                if mod_res == 0 {
+                    CONCURRENT_LIMIT
+                } else {
+                    mod_res
+                }
+            } else {
+                CONCURRENT_LIMIT
+            };
+
+            let futures: Vec<_> = (0..max_value)
+                .map(|idx| {
+                    let prep = self.select_1_prepared.clone();
+                    let idx_u64 =(i*CONCURRENT_LIMIT + idx) as u64 + start_index;
+                    let index_i64 = u64_to_i64_exact(idx_u64);
+                    async move {
+                        let res: QueryResult = session.execute_unpaged(&prep, (level_i8, index_i64, max_cp_i64)).await?;
+                        let rows = res.into_rows_result()?;
+                        if let Some(row) = rows.maybe_first_row::<(Vec<u8>,)>()? {
+                            if row.0.len() != 32 {
+                                anyhow::bail!("Invalid hash length retrieved from database");
+                            }
+                            data_map.insert(idx_u64, Hash::from_owned_32bytes(row.0.try_into().unwrap()));
+                        }
+                        Ok(())
+                    }
+                }).collect();
+            let batch_results = join_all(futures).await;
+            for res in batch_results {
+                res?;
+            }
+        }
+        Ok(())
+
+    }/* 
+
+    async fn binary_search_non_zero<Hash: QDBHashBase>(
+        &self,
+        session: &Session,
+        max_checkpoint_id: u64,
+        from_level: u8,
+        mut index: u64,
+    ) -> anyhow::Result<Vec<Vec<SimpleMerkleNode<Hash>>>>{
+        // if the tree is append only or has some empty portion to the right, we can do a binary search to find the first non-zero node
+        // first find the first non-zero
+        // gets a merkle path from 
+
+
+        let level_count = (self.tree_height - from_level) as usize;
+        let keys = Vec::with_capacity(level_count);
+        for i in self.tree_height..=from_level {
+            keys.push(SimpleMerkleNodeKey {
+                level: i,
+                index,
+            });
+            index /= 2;
+        }
+
+        Ok(())
+
+
+    }
+
+
+    async fn dump_tree_span_batch<Hash: QDBHashBase>(
+        &self,
+        session: &Session,
+        max_checkpoint_id: u64,
+        level: u8, 
+        start_index: u64,
+        end_index: u64,
+        batch_size: usize,
+    ) -> anyhow::Result<Vec<Vec<SimpleMerkleNode<Hash>>>>{
+
+    }
+
+    async fn dump_all_zero_id_merkle_node_leaves_vec_find_empty_limb_strategy<Hash: QDBHashBase>(
+        &self,
+        session: &Session,
+        max_checkpoint_id: u64,
+    ) -> anyhow::Result<Vec<SimpleMerkleNode<Hash>>>{
+        const START_LEVEL: usize = 10;
+        anyhow::bail!("Not implemented");
+    
+        
+    }
+*/
 
     pub async fn dump_all_zero_id_merkle_node_leaves_vec<Hash: QDBHashBase>(
         &self,
         session: &Session,
         max_checkpoint_id: u64,
         strategy: MerkleTreeDumpStrategy,
-    ) -> anyhow::Result<Vec<SimpleMerkleNode<Hash>>> {
-        let map = match strategy {
-            // Use appropriate based on strategy; here assuming sparse as default
-            //MerkleTreeDumpStrategy::DumpAllStrategy => self.dump_all_zero_id_merkle_node_leaves_sparse_sub_trees::<Hash>(session,
-            // max_checkpoint_id).await?,
-            MerkleTreeDumpStrategy::DumpAllStrategy => self.dump_all_zero_id_merkle_node_leaves_fast::<Hash>(session, max_checkpoint_id).await?,
-            MerkleTreeDumpStrategy::AppendOnlyTreeStrategy => {
-                self.dump_all_zero_id_merkle_node_leaves_append_only::<Hash>(session, max_checkpoint_id)
-                    .await?
-            }
-            // Add others if defined
-        };
-        let mut vec: Vec<_> = map
-            .into_iter()
-            .map(|(index, value)| SimpleMerkleNode {
-                key: SimpleMerkleNodeKey {
-                    level: self.tree_height,
-                    index,
-                },
-                value,
-            })
-            .collect();
-        vec.sort_by_key(|n| n.key.index); // Ensure ordered if needed
-        Ok(vec)
+    ) -> anyhow::Result<Vec<SimpleMerkleNode<Hash>>>{
+
+
+
+        anyhow::bail!("Not implemented");
+        
     }
 }

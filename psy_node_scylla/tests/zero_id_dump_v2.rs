@@ -1,5 +1,5 @@
 use cf_utils::timer::DebugTimer;
-use rand::{SeedableRng, RngCore, Rng};
+use rand::{thread_rng, Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha12Rng;
 use std::{collections::HashMap, hash::Hash, sync::{Arc, RwLock}};
 
@@ -8,7 +8,7 @@ use parth_core::{crypto::hash::traits::MerkleZeroHasher, data::{db::table::QData
 use parth_crypto::hash::sha256::CoreSha256Hasher;
 use parth_node_scylla::{core::ScyllaCoreStore, tables::merkle::ScyllaMerkleNodesZeroPreparedStatements};
 use psy_data::v1::qdata::user::PQEDUserLeaf;
-use psy_node_core::store::traits::core_db::{CoreDatabaseZeroIdMerkleDumpReader, CoreDatabaseZeroIdMerkleReader, CoreDatabaseZeroIdMerkleStore};
+use psy_node_core::store::traits::{core_db::{CoreDatabaseZeroIdMerkleDumpReader, CoreDatabaseZeroIdMerkleReader, CoreDatabaseZeroIdMerkleStore}, helpers::db_helper_zero_id_merkle_node_simple_set_leaves};
 
 use serde::Serialize;
 
@@ -93,9 +93,11 @@ impl <K: Hash + Clone + Eq, V: Clone + Eq> NodeCheckpointRecorder<K, V> {
         for pair in key {
             checkpoint_map.insert(pair.key.clone(), pair.value.clone());
         }
-    }
-    pub fn get_all_nodes_as_of_checkpoint(&self, checkpoint_id: u64) -> Vec<QPDPair<K, V>> {
-        let accumulated_ids = self.inserted_checkpoints.read().unwrap().clone().into_iter().filter(|x| *x <= checkpoint_id).collect::<Vec<u64>>();
+    }pub fn get_all_nodes_as_of_checkpoint(&self, checkpoint_id: u64) -> Vec<QPDPair<K, V>> {
+        let mut accumulated_ids = self.inserted_checkpoints.read().unwrap().clone().into_iter().filter(|x| *x <= checkpoint_id).collect::<Vec<u64>>();
+        // FIX: Ensure checkpoints are processed in chronological order.
+        accumulated_ids.sort_unstable(); 
+        
         let mut all_nodes = HashMap::<K, V>::new();
         for chk_id in accumulated_ids {
             if let Some(checkpoint_map) = self.recorded_checkpoints.get(&chk_id) {
@@ -107,8 +109,7 @@ impl <K: Hash + Clone + Eq, V: Clone + Eq> NodeCheckpointRecorder<K, V> {
         all_nodes.into_iter().map(|(key, value)| {
             QPDPair { key, value }
         }).collect()
-        
-    } 
+    }
 
 }
 
@@ -216,6 +217,7 @@ impl<
                 &nodes,
             )
             .await?;
+        db_helper_zero_id_merkle_node_simple_set_leaves(&self.store, table, checkpoint_id, 0, 512, nodes).await?;
         let tbl_map = self.recorded_map.entry(table.get_table_unique_identifier()).or_insert_with(|| NodeCheckpointRecorder::new());
         tbl_map.record_nodes(checkpoint_id, &nodes.iter().map(|x| {
             QPDPair {
@@ -255,6 +257,13 @@ fn get_rk(table_id: u64) -> QDatabaseTableRoutingKey {
     QDatabaseTableRoutingKey::new_with_connection_empty_secondary_routing_key(table_id, 0)
 }
 
+fn unique_parent_merkle_keys(level: &[SimpleMerkleNodeKey]) -> Vec<SimpleMerkleNodeKey> {
+    let mut parent_keys = level.iter().map(|x| x.parent()).collect::<Vec<SimpleMerkleNodeKey>>();
+    parent_keys.sort_unstable();
+    parent_keys.dedup();
+    parent_keys
+}
+
 impl SimpleStoreEx {
     pub async fn setup(store: Arc<ScyllaCoreStore<ExHash, ExHasher>>) -> anyhow::Result<Self> {
         let merkle_node_zero_id_table_a = store
@@ -275,16 +284,16 @@ impl SimpleStoreEx {
     }
 
     async fn overwrite_test(&self, seed: &str, tree_height: usize) -> anyhow::Result<()> {
-        let mut rng = ChaCha12Rng::from_seed(get_seed_for_rng(seed));
+        let mut rng = thread_rng();//ChaCha12Rng::from_seed(get_seed_for_rng(seed));
         rng.next_u64();
         
         let mut current_checkpoint = 0u64;
         let mut timer = DebugTimer::new("merkle_dumper");
         let mut total_leaves_inserted = 0usize;
-        for i in 0..100 {
-            let count = (rng.next_u32() % 200) + 1;
+        for i in 0..1000 {
+            let count =(rng.next_u32() % 5000) + 1;
             total_leaves_inserted += count as usize;
-            let leaves = random_leaves_in_tree::<ChaCha12Rng, ExHash>(count as usize, &mut rng, tree_height);
+            let leaves = random_leaves_in_tree::<_, ExHash>(count as usize, &mut rng, tree_height);
             self.store
                 .set_zero_id_merkle_nodes_for_checkpoint(
                     &self.store.merkle_node_zero_id_table_a,
@@ -307,6 +316,30 @@ impl SimpleStoreEx {
         timer.event(format!("got {} leaves from the recording", recorded_nodes.len()));
 
         let keys = recorded_nodes.iter().map(|x| x.key).collect::<Vec<SimpleMerkleNodeKey>>();
+        let root_key = SimpleMerkleNodeKey {
+            level: 0,
+            index: 0,
+        };
+        let mut level = unique_parent_merkle_keys(&keys);
+        let mut ctr = 1;
+        while level.len() > 1 {
+            let zero_hash = ExHasher::get_zero_hash(ctr);
+            
+            level = unique_parent_merkle_keys(&level);
+            let mut values = self.store.store.db_select_many_zero_id_merkle_nodes_max_checkpoint(&self.store.merkle_node_zero_id_table_a, current_checkpoint, &level).await?;
+            for v in values.iter() {
+                if *v == zero_hash {
+                    return Err(anyhow::anyhow!("found zero hash at level {} during verification", ctr));
+                }
+            }
+            values.sort_unstable();
+            values.dedup();
+            println!("{} unique nodes at level {}", values.len(), ctr);
+            ctr += 1;
+        }
+        
+        let root = self.store.store.db_select_zero_id_merkle_node_max_checkpoint(&self.store.merkle_node_zero_id_table_a, current_checkpoint, &root_key).await?;
+        assert!(root != ExHasher::get_zero_hash(tree_height as usize));
         println!("recorded nodes count: {}", recorded_nodes.len());
         let fetched_nodes = self.store.store.db_select_many_zero_id_merkle_nodes_max_checkpoint(
             &self.store.merkle_node_zero_id_table_a,
@@ -372,7 +405,7 @@ impl SimpleStoreEx {
 
     pub async fn basic_test_1(&self) -> anyhow::Result<()> {
         
-        self.overwrite_test("aoiwefjowfej", EX_ZERO_ID_TREE_A_HEIGHT as usize).await?;
+        self.overwrite_test("aoiwefjowfej12", EX_ZERO_ID_TREE_A_HEIGHT as usize).await?;
         Ok(())
     }
 }
