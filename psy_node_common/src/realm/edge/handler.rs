@@ -4,7 +4,8 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use jsonrpsee::core::RpcResult;
 use parth_core::{
-    crypto::hash::merkle_proof::MerkleProofCore,
+    crypto::hash::{merkle_proof::MerkleProofCore, traits::MerkleZeroHasher},
+    felt::ToU64Value,
     node::realm_identifier::QRealmIdentifier,
     protocol::core_types::{QNetworkDatabaseTypes, QNetworkTypesConfig},
     store::tag_tree_store,
@@ -16,6 +17,7 @@ use psy_data::{
         common_api::PsyProoffMinerRewardProof,
         qdata::{
             checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState},
+            contract::{DashMapContractHeightCache, PSimpleContractHeightCache},
             user::PQEDUserLeaf,
         },
     },
@@ -38,7 +40,6 @@ use psy_node_core::{
 };
 
 use crate::realm::edge::error::RpcError;
-
 #[derive(Clone)]
 pub struct RealmEdgeHandler<
     N: QNetworkTypesConfig,
@@ -62,7 +63,7 @@ pub struct RealmEdgeHandler<
     pub realm_sub_id_u64: u64,
 
     pub proof_verifier: Arc<N::ZKVerifier>,
-    pub contract_state_tree_height_cache: DashMap<u64, u8>,
+    pub contract_state_tree_height_cache: Arc<DashMapContractHeightCache<N::QHash>>,
 }
 
 impl<
@@ -98,12 +99,16 @@ impl<
             realm_id_u64,
             realm_sub_id_u64,
             proof_verifier,
-            contract_state_tree_height_cache: DashMap::new(),
+            contract_state_tree_height_cache: Arc::new(DashMapContractHeightCache::new()),
         }
     }
+    pub fn user_belongs_to_realm(&self, user_id: u64) -> bool {
+        let users_per_realm = 1u64 << N::REALM_GLOBAL_USER_TREE_HEIGHT;
+        let min_user_id = self.realm_id_u64 * users_per_realm;
+        let max_user_id = min_user_id + users_per_realm;
+        user_id >= min_user_id && user_id < max_user_id
+    }
 }
-
-
 
 impl<
         N: QNetworkTypesConfig,
@@ -115,23 +120,67 @@ impl<
         ProofStore: QParthProofStore,
     > RealmEdgeHandler<N, S, STagTreeRewards, UserUpdateQueue, GetProofWorkQueue, TempDatabase, ProofStore>
 {
-    pub fn handle_user_end_cap_proof_submission(
+    pub async fn ensure_contract_heights_in_cache(&self, contract_ids: &[u32]) -> anyhow::Result<()> {
+        // TODO: make this actually work in the db
+        let mut contract_heights_to_fetch = Vec::new();
+        for &contract_id in contract_ids {
+            if !self.contract_state_tree_height_cache.mapping.contains_key(&contract_id) {
+                contract_heights_to_fetch.push(contract_id as u64);
+            }
+        }
+        if contract_heights_to_fetch.is_empty() {
+            return Ok(());
+        } else {
+            let height = self
+                .db_reader
+                .get_contract_tree_heights(MAX_CHECKPOINT_ID, &contract_heights_to_fetch)
+                .await?;
+
+            height.iter().zip(contract_heights_to_fetch.iter()).for_each(|(&height, &contract_id)| {
+                self.contract_state_tree_height_cache
+                    .add_contract(contract_id as u32, height, N::HasherBase::get_zero_hash(height as usize));
+            });
+        }
+        Ok(())
+    }
+    pub async fn handle_user_end_cap_proof_submission(
         &self,
-        user_ec_input: SubmitUserEndCapNonProofInput<N::F, N::QHash>,
+        user_end_cap_input: SubmitUserEndCapNonProofInput<N::F, N::QHash>,
         proof: N::ZKProof,
     ) -> anyhow::Result<()> {
-        Ok(())
+        let user_id: u64 = user_end_cap_input.core.state_transition.user_id.to_u64_value();
+        if !self.user_belongs_to_realm(user_id) {
+            anyhow::bail!("user_id {} does not belong to this realm", user_id);
+        }
+        let old_user_leaf = self.db_reader.get_user_leaf(MAX_CHECKPOINT_ID, user_id).await?;
 
+        if old_user_leaf.last_checkpoint_id.to_u64_value() > user_end_cap_input.core.new_user_leaf.last_checkpoint_id.to_u64_value() {
+            anyhow::bail!(
+                "Submitted end cap for checkpoint {}, but user's last checkpoint is {}",
+                user_end_cap_input.core.new_user_leaf.last_checkpoint_id.to_u64_value(),
+                old_user_leaf.last_checkpoint_id.to_u64_value()
+            );
+        }
+        let mut contract_ids = user_end_cap_input.contract_state_updates.iter().map(|x| x.user_contract_tree_update_proof.index as u32).collect::<Vec<u32>>();
+        contract_ids.sort_unstable();
+        contract_ids.dedup();
+        self.ensure_contract_heights_in_cache(&contract_ids).await?;
+
+        //let proof_public_inputs = self.proof_verifier.publi(&proof);
+        //user_end_cap_input.ensure_simple_self_consistent(proof_public_inputs_hash, contract_helper, global_user_tree_height)
+
+
+
+        Ok(())
     }
 }
 type QRpcResult<T> = RpcResult<T>;
 
 fn res<T>(data: anyhow::Result<T>) -> QRpcResult<T> {
-        Ok(data.map_err(RpcError::Anyhow)?)
+    Ok(data.map_err(RpcError::Anyhow)?)
 }
 
 const MAX_CHECKPOINT_ID: u64 = i64::MAX as u64;
-
 
 #[async_trait]
 impl<
@@ -198,7 +247,10 @@ impl<
     }
 
     async fn get_user_contract_state_tree_root(&self, checkpoint_id: u64, user_id: u64, contract_id: u32) -> QRpcResult<N::QHash> {
-        res(self.db_reader.contract_state_tree_get_root_hash(checkpoint_id, user_id, contract_id as u64).await)
+        res(self
+            .db_reader
+            .contract_state_tree_get_root_hash(checkpoint_id, user_id, contract_id as u64)
+            .await)
     }
 
     async fn get_user_contract_state_tree_leaf_hash(
@@ -209,7 +261,10 @@ impl<
         _height: u8, // height is not used in the db call
         leaf_id: u64,
     ) -> QRpcResult<N::QHash> {
-        res(self.db_reader.contract_state_tree_get_leaf_hash(checkpoint_id, user_id, contract_id as u64, leaf_id).await)
+        res(self
+            .db_reader
+            .contract_state_tree_get_leaf_hash(checkpoint_id, user_id, contract_id as u64, leaf_id)
+            .await)
     }
 
     async fn get_user_contract_state_tree_merkle_proof(
@@ -220,7 +275,10 @@ impl<
         _height: u8, // height is not used in the db call
         leaf_id: u64,
     ) -> QRpcResult<MerkleProofCore<N::QHash>> {
-        res(self.db_reader.contract_state_tree_get_merkle_proof(checkpoint_id, user_id, contract_id as u64, leaf_id).await)
+        res(self
+            .db_reader
+            .contract_state_tree_get_merkle_proof(checkpoint_id, user_id, contract_id as u64, leaf_id)
+            .await)
     }
 
     async fn get_user_contract_tree_root(&self, checkpoint_id: u64, user_id: u64) -> QRpcResult<N::QHash> {
@@ -228,11 +286,17 @@ impl<
     }
 
     async fn get_user_contract_tree_leaf_hash(&self, checkpoint_id: u64, user_id: u64, contract_id: u32) -> QRpcResult<N::QHash> {
-        res(self.db_reader.user_contract_tree_get_leaf_hash(checkpoint_id, user_id, contract_id as u64).await)
+        res(self
+            .db_reader
+            .user_contract_tree_get_leaf_hash(checkpoint_id, user_id, contract_id as u64)
+            .await)
     }
 
     async fn get_user_contract_tree_merkle_proof(&self, checkpoint_id: u64, user_id: u64, contract_id: u32) -> QRpcResult<MerkleProofCore<N::QHash>> {
-        res(self.db_reader.user_contract_tree_get_merkle_proof(checkpoint_id, user_id, contract_id as u64).await)
+        res(self
+            .db_reader
+            .user_contract_tree_get_merkle_proof(checkpoint_id, user_id, contract_id as u64)
+            .await)
     }
 
     async fn get_user_tree_root(&self, checkpoint_id: u64) -> QRpcResult<N::QHash> {
@@ -244,8 +308,10 @@ impl<
     }
 
     async fn get_user_bottom_tree_merkle_proof(&self, root_level: u8, checkpoint_id: u64, user_id: u64) -> QRpcResult<MerkleProofCore<N::QHash>> {
-        // NOTE: Assumes N::GLOBAL_USER_TREE_HEIGHT is defined and represents the total height of the global user tree.
-        // This is required because the database function needs an explicit leaf level, which is implicitly the max height for a "bottom tree proof".
+        // NOTE: Assumes N::GLOBAL_USER_TREE_HEIGHT is defined and represents the total
+        // height of the global user tree. This is required because the database
+        // function needs an explicit leaf level, which is implicitly the max height for
+        // a "bottom tree proof".
         res(self
             .db_reader
             .global_user_tree_get_merkle_proof_sub_tree(checkpoint_id, root_level, N::GLOBAL_USER_TREE_HEIGHT, user_id)
@@ -259,7 +325,10 @@ impl<
         leaf_level: u8,
         leaf_index: u64,
     ) -> QRpcResult<MerkleProofCore<N::QHash>> {
-        res(self.db_reader.global_user_tree_get_merkle_proof_sub_tree(checkpoint_id, root_level, leaf_level, leaf_index).await)
+        res(self
+            .db_reader
+            .global_user_tree_get_merkle_proof_sub_tree(checkpoint_id, root_level, leaf_level, leaf_index)
+            .await)
     }
 
     async fn get_user_tree_merkle_proof(&self, checkpoint_id: u64, user_id: u64) -> QRpcResult<MerkleProofCore<N::QHash>> {

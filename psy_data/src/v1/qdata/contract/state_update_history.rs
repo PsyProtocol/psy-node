@@ -11,12 +11,12 @@ pub struct QEDContractStateUpdateHistory<Hash> {
 }
 
 impl<Hash: QHashBase> QEDContractStateUpdateHistory<Hash> {
-    pub fn ensure_basic_consistency(&self, contract_helper: &SimpleContractHeightCache<Hash>) -> anyhow::Result<()> {
+    pub fn ensure_basic_consistency<C: PSimpleContractHeightCache<Hash>>(&self, contract_helper: &C) -> anyhow::Result<()> {
         if self.contract_state_tree_updates.len() == 0 {
             anyhow::bail!("contract_state_tree_updates cannot be empty")
         }
         if self.contract_state_tree_updates[0].old_root != self.user_contract_tree_update_proof.old_value && (
-            self.user_contract_tree_update_proof.old_value != Hash::get_zero_value() || (self.contract_state_tree_updates[0].old_root != contract_helper.get_contract_zero_hash(self.user_contract_tree_update_proof.index)?)
+            self.user_contract_tree_update_proof.old_value != Hash::get_zero_value() || (self.contract_state_tree_updates[0].old_root != contract_helper.get_contract_zero_hash(self.user_contract_tree_update_proof.index as u32)?)
         ){
             anyhow::bail!("first CST old root does not match UCT old value");
         }
@@ -61,28 +61,38 @@ impl<Hash: QHashBase> QEDContractStateUpdateHistory<Hash> {
 }
 
 
-
-#[derive(Clone, Debug)]
-pub struct SimpleContractHeightCache<Hash> {
-    mapping: HashMap<u64, (u8, Hash)>
+pub trait PSimpleContractHeightCache<Hash> {
+    fn add_contract(&self, contract_id: u32, height: u8, zero_hash: Hash);
+    fn get_contract_height(&self, contract_id: u32) -> anyhow::Result<u8>;
+    fn get_contract_zero_hash(&self, contract_id: u32) -> anyhow::Result<Hash>;
 }
 
-impl<Hash: Copy> SimpleContractHeightCache<Hash> {
+#[cfg(feature = "node")]
+pub struct DashMapContractHeightCache<Hash> {
+    pub mapping: dashmap::DashMap<u32, (u8, Hash)>
+}
+#[cfg(feature = "node")]
+impl<Hash: Copy> DashMapContractHeightCache<Hash> {
     pub fn new() -> Self {
         Self {
-            mapping: HashMap::new(),
+            mapping: dashmap::DashMap::new(),
         }
     }
-    pub fn add_contract(&mut self, contract_id: u64, height: u8, zero_hash: Hash) {
+}
+#[cfg(feature = "node")]
+impl<Hash: std::hash::Hash + Eq + Copy> PSimpleContractHeightCache<Hash> for DashMapContractHeightCache<Hash> {
+    fn add_contract(&self, contract_id: u32, height: u8, zero_hash: Hash) {
         self.mapping.insert(contract_id, (height, zero_hash));
     }
-    pub fn get_contract_height(&self, contract_id: u64) -> anyhow::Result<u8> {
+
+    fn get_contract_height(&self, contract_id: u32) -> anyhow::Result<u8> {
         match self.mapping.get(&contract_id) {
             Some(x) => Ok(x.0),
             None => anyhow::bail!("contract {} not loaded",contract_id),
         }
     }
-    pub fn get_contract_zero_hash(&self, contract_id: u64) -> anyhow::Result<Hash> {
+
+    fn get_contract_zero_hash(&self, contract_id: u32) -> anyhow::Result<Hash> {
         match self.mapping.get(&contract_id) {
             Some(x) => Ok(x.1),
             None => anyhow::bail!("contract {} not loaded",contract_id),

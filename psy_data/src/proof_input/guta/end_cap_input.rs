@@ -8,7 +8,7 @@ use parth_core::{
 
 use crate::{
     proof_input::guta::SubmitUserEndCapNonProofCoreInput,
-    v1::qdata::contract::{QEDContractStateUpdateHistory, SimpleContractHeightCache},
+    v1::qdata::contract::{QEDContractStateUpdateHistory, PSimpleContractHeightCache},
 };
 
 #[pderive::serialize_clone_f_hash_ts]
@@ -19,10 +19,10 @@ pub struct SubmitUserEndCapNonProofInput<F, Hash> {
 }
 
 impl<F: QFelt64, Hash: QFHashBase<F> + std::fmt::Debug> SubmitUserEndCapNonProofInput<F, Hash> {
-    pub fn ensure_simple_self_consistent<Hasher: FieldQHasher<F, Hash>>(
+    pub fn ensure_simple_self_consistent<Hasher: FieldQHasher<F, Hash>, C: PSimpleContractHeightCache<Hash>>(
         &self,
         proof_public_inputs_hash: Hash,
-        contract_helper: &SimpleContractHeightCache<Hash>,
+        contract_helper: &C,
         global_user_tree_height: u8,
     ) -> anyhow::Result<()> {
         if self.core.checkpoint_id != self.core.new_user_leaf.last_checkpoint_id {

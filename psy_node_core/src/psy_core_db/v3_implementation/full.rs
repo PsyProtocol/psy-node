@@ -1853,6 +1853,61 @@ impl<
                 HashToManyIdsTableIdentifier,
             > + Send + Sync,
     >
+    PsyNodeCoreDatabaseBasicContractInfoStoreReader<N::F, N::QHash> for PsyUnifiedCoreDatabaseStore<
+        N,
+        BiDirectionalMappingTableIdentifier,
+        BiDirectionalU64U128MappingTableIdentifier,
+        U64TableIdentifier,
+        SingleIdTableIdentifier,
+        DoubleIdTableIdentifier,
+        KivTableIdentifier,
+        SingleIdMerkleTableIdentifier,
+        DoubleIdMerkleTableIdentifier,
+        ZeroIdMerkleTableIdentifier,
+        TagTreeTableIdentifier,
+        HashToManyIdsTableIdentifier,
+        S,
+    >
+{
+    async fn get_contract_tree_heights(&self, checkpoint_id: u64, contract_ids: &[u64]) -> anyhow::Result<Vec<u8>>{
+        // TODO: actually implement this
+        let mut heights = Vec::with_capacity(contract_ids.len());
+        for _ in contract_ids {
+            heights.push(32);
+        }
+        Ok(heights)
+    }
+}
+#[async_trait]
+impl<
+        N: QNetworkDatabaseTypes,
+        BiDirectionalMappingTableIdentifier: Clone + Send + Sync,
+        BiDirectionalU64U128MappingTableIdentifier: Clone + Send + Sync,
+        U64TableIdentifier: Clone + Send + Sync,
+        SingleIdTableIdentifier: Clone + Send + Sync,
+        DoubleIdTableIdentifier: Clone + Send + Sync,
+        KivTableIdentifier: Clone + Send + Sync,
+        SingleIdMerkleTableIdentifier: Clone + Send + Sync,
+        DoubleIdMerkleTableIdentifier: Clone + Send + Sync,
+        ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
+        TagTreeTableIdentifier: Clone + Send + Sync,
+        HashToManyIdsTableIdentifier: Clone + Send + Sync,
+        S: CoreDatabaseStore<
+                N::QHash,
+                N::HasherBase,
+                BiDirectionalMappingTableIdentifier,
+                BiDirectionalU64U128MappingTableIdentifier,
+                U64TableIdentifier,
+                SingleIdTableIdentifier,
+                DoubleIdTableIdentifier,
+                KivTableIdentifier,
+                SingleIdMerkleTableIdentifier,
+                DoubleIdMerkleTableIdentifier,
+                ZeroIdMerkleTableIdentifier,
+                TagTreeTableIdentifier,
+                HashToManyIdsTableIdentifier,
+            > + Send + Sync,
+    >
     PsyNodeCoreDatabaseContractObjectStoreReader<N::F, N::QHash> for PsyUnifiedCoreDatabaseStore<
         N,
         BiDirectionalMappingTableIdentifier,
