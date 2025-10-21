@@ -1,1 +1,1 @@
-pub mod standard_edge;
+pub mod standard_edge_rpc;

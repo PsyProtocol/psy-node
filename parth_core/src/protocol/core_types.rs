@@ -4,13 +4,13 @@ use psy_serialize::PsySerializeCanonicalAsyncSafe;
 use serde::{de::DeserializeOwned, Serialize};
 use ts_rs::TS;
 
-use crate::{crypto::hash::traits::{FieldQHasher, FromU64x4, HashTo4Felts, MerkleZeroHasher, QHasher, RandomHash, ZeroableHash}, data::{db::data_types::{CoreDatabaseValueDeserialize, QDatabasePrimitiveKey}, maybe_serialization::{MaybeBytemuck, MaybeSpeedy}, parth::public_preimage::{QParthProofPublicInputsPreimage, QParthProofPublicInputsPreimageWithoutRewardsHash}, serializable::{QPDSerializable, QPDSerializableFixed}}, felt::QFelt64, generic_traits::QNamedType, QJobIdBase};
+use crate::{crypto::hash::traits::{FieldQHasher, FromU64x4, HashTo4Felts, MerkleZeroHasher, RandomHash, ZeroableHash}, data::{db::data_types::{CoreDatabaseValueDeserialize, QDatabasePrimitiveKey}, maybe_serialization::{MaybeBytemuck, MaybeSpeedy}, parth::public_preimage::{QParthProofPublicInputsPreimage, QParthProofPublicInputsPreimageWithoutRewardsHash}, serializable::{QPDSerializable, QPDSerializableFixed}}, felt::QFelt64, generic_traits::QNamedType, QJobIdBase};
 
 pub trait QStorableBase: Serialize + DeserializeOwned + Send + Sync + Clone + PartialEq + Eq {}
 pub trait QStorableSizedBase: QStorableBase + Sized {}
 impl<T: Serialize + DeserializeOwned + Send + Sync + Clone + PartialEq + Eq> QStorableBase for T {}
 impl<T: QStorableBase + Sized> QStorableSizedBase for T {}
-pub trait QFHasherU64<F: QFelt64, Hash: QFHashBase<F>>: FieldQHasher<F, Hash> + QHasher<Hash> + MerkleZeroHasher<Hash> {}
+pub trait QFHasherU64<F: QFelt64, Hash: QFHashBase<F>>: FieldQHasher<F, Hash>  + MerkleZeroHasher<Hash> {}
 pub trait Q256BitHash: FromU64x4 + Sized + Copy + MaybeBytemuck + MaybeSpeedy + Debug + Sync + Send + PartialEq {
     fn from_owned_32bytes(bytes: [u8; 32]) -> Self;
     fn into_owned_32bytes(self) -> [u8; 32];
@@ -35,7 +35,7 @@ impl<T: QHashBase + HashTo4Felts<F>, F: QFelt64> QFHashBase<F> for T {}
 
 pub trait QProofBase: PartialEq + Clone + Serialize + DeserializeOwned + QPDSerializable {}
 
-pub trait QHasherBase<Hash: QHashBase, Proof: QProofBase>: QHasher<Hash> {
+pub trait QHasherBase<Hash: QHashBase, Proof: QProofBase>: MerkleZeroHasher<Hash> {
     fn get_proof_public_input(proof: &Proof) -> Hash; // the public inputs of the proof is a hash which is the hash of the QParthProofPublicInputsPreimage
     fn hash_proof_public_inputs_preimage(preimage: &QParthProofPublicInputsPreimage<Hash>) -> Hash;
     fn hash_proof_public_inputs_preimage_with_rewards_hash(preimage: &QParthProofPublicInputsPreimageWithoutRewardsHash<Hash>, rewards_hash: &Hash) -> Hash;
@@ -96,13 +96,13 @@ pub trait QNetworkDatabaseTypes: QNetworkTreeConstants + QNetworkHashTypes {
 }
 impl<T: QNetworkTreeConstants + QNetworkHashTypes> QNetworkDatabaseTypes for T {}
 pub trait QNetworkZKTypes: QNetworkHashTypes {
-    type ZKProof: QProofBase;
-    type ZKVerifier: QZKProofVerifier<Self::QHash, Self::ZKProof>;
+    type ZKProof: QProofBase + Send + Sync;
+    type ZKVerifier: QZKProofVerifier<Self::QHash, Self::ZKProof> + Send + Sync;
 }
 
-pub trait QNetworkTypesConfig: QNetworkDatabaseTypes + QNetworkTreeConstants + QNetworkZKTypes + QJobIdBase + QJobPlanner<Self::JobId> {
+pub trait QNetworkTypesConfig: QNetworkDatabaseTypes + QNetworkTreeConstants + QNetworkZKTypes + QJobIdBase + QJobPlanner<Self::JobId>  + Sized + Send + Sync + Copy + Clone + Default {
     type JobId: QJobIdBase;
-    type JobPlanner: QJobPlanner<Self::JobId>;
+    type JobPlanner: QJobPlanner<Self::JobId> + Send + Sync;
 }
 /*
 pub trait QNetworkTypesConfigBase: QNetworkTreeConstants {

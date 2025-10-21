@@ -179,6 +179,28 @@ impl QTempDatabaseRawKVWriterBase for SimpleMemoryTempStore {
         }
         Ok(())
     }
+
+    async fn qtdb_raw_kv_put_many_values_buffer<const KEY_SIZE: usize, const VALUE_SIZE: usize>(
+        &self,
+        data: &[u8],
+    ) -> anyhow::Result<()>{
+        let combined_size: usize = KEY_SIZE + VALUE_SIZE;
+        if data.len() % combined_size != 0 {
+            return Err(anyhow::anyhow!("Data length is not a multiple of combined key and value size"));
+        }
+        if data.len() == 0 {
+            return Ok(());
+        }
+        let entry_count = data.len() / combined_size;
+        for i in 0..entry_count {
+            let start = i * combined_size;
+            let key = &data[start..start + KEY_SIZE];
+            let value = &data[start + KEY_SIZE..start + combined_size];
+            self.kv_map.write().map_err(|e| anyhow::anyhow!(e.to_string()))?.insert(key.to_vec(), value.to_vec());
+        }
+        Ok(())
+
+    }
 }
 
 impl QAutoImplementGeneric for SimpleMemoryTempStore {}

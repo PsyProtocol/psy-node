@@ -46,3 +46,4 @@ parth_common = { workspace = true }
 psy_core = { workspace = true }
 psy_common = { workspace = true }
 psy_data = { workspace = true }
+psy_io = { workspace = true }

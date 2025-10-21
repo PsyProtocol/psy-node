@@ -602,6 +602,30 @@ impl QTempDatabaseRawKVWriterBase for StandardRedisStore {
         let _: () = con.hset_multiple(&self.kv_store_namespace, entries).await?;
         Ok(())
     }
+    async fn qtdb_raw_kv_put_many_values_buffer<const KEY_SIZE: usize, const VALUE_SIZE: usize>(
+        &self,
+        data: &[u8],
+    ) -> anyhow::Result<()>{
+        let combined_size: usize = KEY_SIZE + VALUE_SIZE;
+        if data.len() % combined_size != 0 {
+            return Err(anyhow::anyhow!("Data length is not a multiple of combined key and value size"));
+        }
+        if data.len() == 0 {
+            return Ok(());
+        }
+        let entry_count = data.len() / combined_size;
+        let mut entries: Vec<(&[u8], &[u8])> = Vec::with_capacity(entry_count);
+        for i in 0..entry_count {
+            let start = i * combined_size;
+            let key = &data[start..start + KEY_SIZE];
+            let value = &data[start + KEY_SIZE..start + combined_size];
+            entries.push((key, value));
+        }
+        let mut con = self.pool.get().await?;
+        let _: () = con.hset_multiple(&self.kv_store_namespace, &entries).await?;
+        Ok(())
+
+    }
 }
 #[async_trait]
 impl QTempDatabaseRawCounterReaderBase for StandardRedisStore {

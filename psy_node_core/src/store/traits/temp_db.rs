@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use auto_impl::auto_impl;
 use parth_core::{
     data::{
         db::temp_db::{
@@ -9,7 +10,10 @@ use parth_core::{
     utils::auto_implement::QAutoImplementGeneric,
 };
 
+
+
 #[async_trait]
+#[auto_impl(&, Arc)]
 pub trait QTempDatabaseRawKVReaderBase {
     async fn qtdb_raw_kv_get_value(&self, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>>;
     async fn qtdb_raw_kv_get_many_values(&self, keys: &[&[u8]]) -> anyhow::Result<Vec<Option<Vec<u8>>>>;
@@ -17,13 +21,21 @@ pub trait QTempDatabaseRawKVReaderBase {
     async fn qtdb_raw_kv_contains_key(&self, key: &[u8]) -> anyhow::Result<bool>;
 }
 
+
+
+
 #[async_trait]
+#[auto_impl(&, Arc)]
 pub trait QTempDatabaseRawKVWriterBase {
     async fn qtdb_raw_kv_put_value(&self, key: &[u8], value: &[u8]) -> anyhow::Result<()>;
     async fn qtdb_raw_kv_delete_key(&self, key: &[u8]) -> anyhow::Result<()>;
     async fn qtdb_raw_kv_put_many_values(&self, entries: &[QPDPair<Vec<u8>, Vec<u8>>]) -> anyhow::Result<()>;
     async fn qtdb_raw_kv_put_many_values_tuple(&self, entries: &[(Vec<u8>, Vec<u8>)]) -> anyhow::Result<()>;
     async fn qtdb_raw_kv_put_many_values_tuple_ref<'a>(&self, entries: &[(&'a [u8], &'a [u8])]) -> anyhow::Result<()>;
+    async fn qtdb_raw_kv_put_many_values_buffer<const KEY_SIZE: usize, const VALUE_SIZE: usize>(
+        &self,
+        data: &[u8],
+    ) -> anyhow::Result<()>;
 }
 
 #[async_trait]

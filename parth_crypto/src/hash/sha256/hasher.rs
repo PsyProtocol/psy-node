@@ -1,6 +1,6 @@
 use sha2::{Digest, Sha256};
 
-use parth_core::{crypto::hash::traits::{BasicBytesHasher, BasicDataHasher, FieldQHasher, MerkleHasher}, data::hash::hash256::Hash256, generic_traits::QStaticNamedType};
+use parth_core::{crypto::hash::traits::{BasicBytesHasher, BasicDataHasher, FieldQHasher, MerkleHasher}, data::hash::hash256::Hash256, generic_traits::QStaticNamedType, protocol::core_types::QFHasherU64};
 
 
 
@@ -96,3 +96,4 @@ impl QStaticNamedType for CoreSha256Hasher {
         "CoreSha256Hasher"
     }
 }
+impl QFHasherU64<u64, Hash256> for CoreSha256Hasher {}

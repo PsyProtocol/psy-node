@@ -1,3 +1,4 @@
+use psy_serialize::PsySerializeCanonicalAsyncSafe;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::data::{queue::queue_key::PCoreQueueItemBase, serializable::QPDSerializableFixed};
@@ -25,7 +26,8 @@ pub trait JobIDWithRewardPathSerializable: Sized + Copy + Send + Sync + Clone + 
     fn get_reward_path_info(&self) -> u64;
 }
 
-pub trait QJobIdBase: Copy + Send + Sync + Serialize + DeserializeOwned + Clone + PartialEq + Eq + std::fmt::Debug + QPDSerializableFixed + Sized + Into<QJobIdSerialized> + TryFrom<QJobIdSerialized> + PCoreQueueItemBase {
+pub trait QJobIdBase: Copy + Send + Sync + Serialize + DeserializeOwned + Clone + PartialEq + Eq + std::fmt::Debug + QPDSerializableFixed + Sized + Into<QJobIdSerialized> + TryFrom<QJobIdSerialized> + PCoreQueueItemBase  {
+    
     fn to_bytes_fixed(&self) -> QJobIdSerialized;
     fn from_bytes_fixed(bytes: &QJobIdSerialized) -> anyhow::Result<Self>;
     fn circuit_type_u32(&self) -> u32;
@@ -50,8 +52,7 @@ pub trait QJobIdCreatable: QJobIdBase {
 
 
 #[pderive::serialize_copy]
-#[serde(bound = "for<'de2> T: Deserialize<'de2>")]
-pub struct QProvingJobDataIDWithRewardPath<T: QJobIdBase> {
+pub struct QProvingJobDataIDWithRewardPath<T> {
     pub job_data_id: T,
     pub reward_path_info: u64,
 }

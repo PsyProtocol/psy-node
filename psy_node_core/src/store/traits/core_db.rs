@@ -901,6 +901,60 @@ impl<
     > for T
 {
 }
+
+pub trait CoreDatabaseTableConfig: Copy + Send + Sync + Clone + Sized {
+    type BiDirectionalMappingTableIdentifier: Clone + Send + Sync;
+    type BiDirectionalU64U128MappingTableIdentifier: Clone + Send + Sync;
+    type U64TableIdentifier: Clone + Send + Sync;
+    type SingleIdTableIdentifier: Clone + Send + Sync;
+    type DoubleIdTableIdentifier: Clone + Send + Sync;
+    type KivTableIdentifier: Clone + Send + Sync;
+    type SingleIdMerkleTableIdentifier: Clone + Send + Sync;
+    type DoubleIdMerkleTableIdentifier: Clone + Send + Sync;
+    type ZeroIdMerkleTableIdentifier: Clone + Send + Sync;
+    type TagTreeMerkleTableIdentifier: Clone + Send + Sync;
+    type HashToManyIdsTableIdentifier: Clone + Send + Sync;
+}
+pub trait CoreDatabaseStoreComboImpl<
+    Hash: QHashBase + Send + Sync,
+    Hasher: MerkleZeroHasher<Hash> + Send + Sync,
+    T: CoreDatabaseTableConfig,
+>:
+    CoreDatabaseStore<
+        Hash,
+        Hasher,
+        T::BiDirectionalMappingTableIdentifier,
+        T::BiDirectionalU64U128MappingTableIdentifier,
+        T::U64TableIdentifier,
+        T::SingleIdTableIdentifier,
+        T::DoubleIdTableIdentifier,
+        T::KivTableIdentifier,
+        T::SingleIdMerkleTableIdentifier,
+        T::DoubleIdMerkleTableIdentifier,
+        T::ZeroIdMerkleTableIdentifier,
+        T::TagTreeMerkleTableIdentifier,
+        T::HashToManyIdsTableIdentifier,
+    >
+{
+}
+
+
+/* 
+pub trait CoreDatabseStoreCombo<
+    Hash: QHashBase + Send + Sync,
+    Hasher: MerkleZeroHasher<Hash> + Send + Sync,
+    T: CoreDatabaseTableConfig,
+>: CoreDatabaseStore<Hash, Hasher, T::BiDirectionalMappingTableIdentifier, T::BiDirectionalU64U128MappingTableIdentifier, T::U64TableIdentifier, T::SingleIdTableIdentifier, T::DoubleIdTableIdentifier, T::KivTableIdentifier, T::SingleIdMerkleTableIdentifier, T::DoubleIdMerkleTableIdentifier, T::ZeroIdMerkleTableIdentifier, T::TagTreeMerkleTableIdentifier, T::HashToManyIdsTableIdentifier> {
+    
+}
+impl<
+
+    Hash: QHashBase + Send + Sync,
+    Hasher: MerkleZeroHasher<Hash> + Send + Sync,
+    T: CoreDatabaseTableConfig,
+    > CoreDatabaseStore<Hash, Hasher, T::BiDirectionalMappingTableIdentifier, T::BiDirectionalU64U128MappingTableIdentifier, T::U64TableIdentifier, T::SingleIdTableIdentifier, T::DoubleIdTableIdentifier, T::KivTableIdentifier, T::SingleIdMerkleTableIdentifier, T::DoubleIdMerkleTableIdentifier, T::ZeroIdMerkleTableIdentifier, T::TagTreeMerkleTableIdentifier, T::HashToManyIdsTableIdentifier> for T{
+
+    }*/
 pub trait CoreDatabaseStore<
     Hash: QHashBase + Send + Sync,
     Hasher: MerkleZeroHasher<Hash> + Send + Sync,
