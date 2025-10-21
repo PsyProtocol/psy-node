@@ -934,8 +934,12 @@ pub fn generate_nca_tree_groups_v2(leaves: &[SimpleMerkleNodeKey], _leaf_level: 
 For a tree of height 24 with leaves of index:
 238671, 5244926, 13271444, 13990092, 14444179
 
-The correct aggregation strategy isto first aggregate:
+The correct aggregation strategy is to:
+1. Aggregate 13990092 and 14444179 first to form their NCA at level 4, index 13.
+2. aggregate 238671 and 5244926 to form their NCA at level 1, index 0, aggregate 13271444 with the NCA from step 1 to form a new NCA at level 3, index 6.
+3. Finally, aggregate the two NCAs from step 2 to form the root NCA at level 0, index 0.
 
+Remember unless a child (left or right) is a leaf node, then it must appear in the group directly before the current group.
 
 example correct output: [
     [
@@ -1001,7 +1005,7 @@ example correct output: [
         },
     ],
 ]
-example wrong output from v2: [
+example wrong output: [
     [
         SimpleMerkleNodeNCAAggregation {
             nca: SimpleMerkleNodeKey {

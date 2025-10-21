@@ -377,7 +377,7 @@ impl SimpleStoreEx {
         ).await?;
 */
 
-        let dumped_map = self.store.store.dump_all_zero_id_merkle_node_leaves_chunked(
+        let dumped_map = self.store.store.db_dump_all_zero_id_merkle_node_leaves_chunked(
             &self.store.merkle_node_zero_id_table_a,
             current_checkpoint,
         ).await?;

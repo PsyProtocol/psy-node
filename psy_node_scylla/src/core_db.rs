@@ -453,7 +453,7 @@ impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sy
 impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
     CoreDatabaseZeroIdMerkleDumpReader<Hash, Hasher, ScyllaMerkleNodesZeroPreparedStatements> for ScyllaCoreStore<Hash, Hasher>
 {
-    async fn dump_all_zero_id_merkle_node_leaves_chunked(
+    async fn db_dump_all_zero_id_merkle_node_leaves_chunked(
         &self,
         table: &ScyllaMerkleNodesZeroPreparedStatements,
         max_checkpoint_id: u64,
@@ -461,7 +461,7 @@ impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sy
         table.dump_all_zero_id_merkle_node_leaves_sparse_sub_trees::<Hash>(&self.session, max_checkpoint_id).await
     }
 
-    async fn dump_all_zero_id_merkle_node_leaves_vec(
+    async fn db_dump_all_zero_id_merkle_node_leaves_vec(
         &self,
         table: &ScyllaMerkleNodesZeroPreparedStatements,
         max_checkpoint_id: u64,
@@ -827,6 +827,16 @@ impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sy
             Ok(None)
         }
     }
+
+    
+    async fn db_get_tag_tree_node_tags(
+        &self,
+        table: &ScyllaTagTreeNodesPreparedStatements,
+        unique_pending_id: u64,
+        keys: &[SimpleMerkleNodeKey],
+    ) -> anyhow::Result<Vec<Option<Hash>>> {
+        table.select_many_tag_tree_tags::<Hash>(&self.session, unique_pending_id, keys).await
+    }
     async fn db_get_tag_tree_root(&self, table: &ScyllaTagTreeNodesPreparedStatements, unique_pending_id: u64) -> anyhow::Result<Option<Hash>> {
         let root_key = SimpleMerkleNodeKey::new_root();
         table.select_one_tag_tree_value(&self.session, unique_pending_id, root_key).await
@@ -845,7 +855,7 @@ impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sy
 impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
     CoreDatabaseTagTreeWriter<Hash, Hasher, ScyllaTagTreeNodesPreparedStatements> for ScyllaCoreStore<Hash, Hasher>
 {
-    async fn set_tag_tree_tag_known_height(
+    async fn db_set_tag_tree_tag_known_height(
         &self,
         table: &ScyllaTagTreeNodesPreparedStatements,
         unique_pending_id: u64,
@@ -857,7 +867,7 @@ impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sy
             .set_tag_only_computed::<Hash, Hasher>(&self.session, unique_pending_id, *key, Some(tag_tree_height), tag)
             .await
     }
-    async fn set_tag_tree_tag_value(
+    async fn db_set_tag_tree_tag_value(
         &self,
         table: &ScyllaTagTreeNodesPreparedStatements,
         unique_pending_id: u64,
@@ -869,7 +879,7 @@ impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sy
         let value_vec = value.to_bytes()?;
         table.set_or_insert_one(&self.session, unique_pending_id, key, &tag_vec, &value_vec).await
     }
-    async fn set_tag_tree_tag(
+    async fn db_set_tag_tree_tag(
         &self,
         table: &ScyllaTagTreeNodesPreparedStatements,
         unique_pending_id: u64,

@@ -10,9 +10,10 @@ mod canonical_multi;
 mod canonical;
 mod primitive_implementations;
 mod io_rw;
+mod serialization_examples;
 
 
-
+pub use serialization_examples::*;
 pub use fast_fixed_serializable::*;
 pub use metadata::*;
 pub use psy_io_rw::*;

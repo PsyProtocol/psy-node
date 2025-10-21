@@ -1307,6 +1307,17 @@ where
             .map(|entry| TagTreeStorageNode::<Hash>::psy_ser_from_slice(entry.value()).map(|node| node.tag))
             .transpose()?)
     }
+    
+    async fn db_get_tag_tree_node_tags(
+        &self,
+        table: &InMemoryTableIdentifier,
+        unique_pending_id: u64,
+        keys: &[SimpleMerkleNodeKey],
+    ) -> anyhow::Result<Vec<Option<Hash>>> {
+        let futures = keys.iter().map(|key| self.db_get_tag_tree_node_tag(table, unique_pending_id, key));
+        future::try_join_all(futures).await
+
+    }
 
     async fn db_get_tag_tree_root(&self, table: &InMemoryTableIdentifier, unique_pending_id: u64) -> anyhow::Result<Option<Hash>> {
         self.db_get_tag_tree_node_value(table, unique_pending_id, &SimpleMerkleNodeKey::new_root()).await
@@ -1358,7 +1369,7 @@ where
     Hash: QDBHashBase,
     Hasher: MerkleZeroHasher<Hash> + Send + Sync 
 {
-    async fn set_tag_tree_tag_value(
+    async fn db_set_tag_tree_tag_value(
         &self,
         table: &InMemoryTableIdentifier,
         unique_pending_id: u64,
@@ -1374,16 +1385,16 @@ where
         Ok(())
     }
 
-    async fn set_tag_tree_tag(&self, table: &InMemoryTableIdentifier, unique_pending_id: u64, key: &SimpleMerkleNodeKey, tag: &Hash) -> anyhow::Result<()> {
+    async fn db_set_tag_tree_tag(&self, table: &InMemoryTableIdentifier, unique_pending_id: u64, key: &SimpleMerkleNodeKey, tag: &Hash) -> anyhow::Result<()> {
         let left = self.db_get_tag_tree_node_value(table, unique_pending_id, &key.left_child()).await?.unwrap_or_default();
         let right = self.db_get_tag_tree_node_value(table, unique_pending_id, &key.right_child()).await?.unwrap_or_default();
         let value = hash_tag_tree_node::<Hash, Hasher>(&left, &right, tag);
-        self.set_tag_tree_tag_value(table, unique_pending_id, key, tag, &value).await
+        self.db_set_tag_tree_tag_value(table, unique_pending_id, key, tag, &value).await
     }
 
-    async fn set_tag_tree_tag_known_height(&self, table: &InMemoryTableIdentifier, unique_pending_id: u64, _tag_tree_height: u8, key: &SimpleMerkleNodeKey, tag: &Hash) -> anyhow::Result<()> {
+    async fn db_set_tag_tree_tag_known_height(&self, table: &InMemoryTableIdentifier, unique_pending_id: u64, _tag_tree_height: u8, key: &SimpleMerkleNodeKey, tag: &Hash) -> anyhow::Result<()> {
         // Height is not needed for this implementation, just call the base method
-        self.set_tag_tree_tag(table, unique_pending_id, key, tag).await
+        self.db_set_tag_tree_tag(table, unique_pending_id, key, tag).await
     }
 }
 

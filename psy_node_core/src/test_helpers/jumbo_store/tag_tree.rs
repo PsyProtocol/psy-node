@@ -172,7 +172,7 @@ impl<
         tag: &Hash,
         value: &Hash,
     ) -> anyhow::Result<()> {
-        self.store.set_tag_tree_tag_value(table, unique_pending_id, key, tag, value).await?;
+        self.store.db_set_tag_tree_tag_value(table, unique_pending_id, key, tag, value).await?;
         let retrieved_value = self.th_util_get_tag_tree_node_value(table, unique_pending_id, key).await?;
         assert_eq!(retrieved_value, Some(*value), "Retrieved value does not match set value");
         let retrieved_tag = self.th_util_get_tag_tree_node_tag(table, unique_pending_id, key).await?;
@@ -187,7 +187,7 @@ impl<
         key: &SimpleMerkleNodeKey,
         tag: &Hash,
     ) -> anyhow::Result<()> {
-        self.store.set_tag_tree_tag(table, unique_pending_id, key, tag).await?;
+        self.store.db_set_tag_tree_tag(table, unique_pending_id, key, tag).await?;
         let retrieved_tag = self.th_util_get_tag_tree_node_tag(table, unique_pending_id, key).await?;
         assert_eq!(retrieved_tag, Some(*tag), "Retrieved tag does not match set tag");
         Ok(())
@@ -211,7 +211,7 @@ impl<
                 let key = SimpleMerkleNodeKey::new((tree_height - level) as u8, index as u64);
                 hash_map_dat.insert(g.nca, key);
                 self.store
-                    .set_tag_tree_tag_known_height(table, unique_pending_id, tree_height as u8, &key, &hash)
+                    .db_set_tag_tree_tag_known_height(table, unique_pending_id, tree_height as u8, &key, &hash)
                     .await?;
                 simple_tree.set_tag(key, hash);
                 let retrieved_tag = self.store.db_get_tag_tree_node_tag(table, unique_pending_id, &key).await?;
@@ -295,7 +295,7 @@ impl<
                 hash_map_dat.insert(g.nca, tag_tree_key);
                 simple_tree.set_tag(tag_tree_key, hash);
                 self.store
-                    .set_tag_tree_tag_known_height(table, unique_pending_id, tree_height as u8, &tag_tree_key, &hash)
+                    .db_set_tag_tree_tag_known_height(table, unique_pending_id, tree_height as u8, &tag_tree_key, &hash)
                     .await?;
                 let retrieved_tag = self.store.db_get_tag_tree_node_tag(table, unique_pending_id, &tag_tree_key).await?;
                 assert_eq!(retrieved_tag, Some(hash), "Retrieved tag does not match");

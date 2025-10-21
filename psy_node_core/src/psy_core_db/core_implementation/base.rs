@@ -3,10 +3,7 @@ use std::sync::Arc;
 use anyhow::Ok;
 use async_trait::async_trait;
 use parth_core::{
-    crypto::hash::{merkle_proof::MerkleProofCore, traits::MerkleZeroHasher},
-    data::hash::{fast_node_serializer::{QMerkleStoreFastDoubleNodeSerializer, QMerkleStoreFastSingleNodeSerializer}, merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}, merkle_store_key::{QMerkleStoreDoubleIdNode, QMerkleStoreSingleIdNode}},
-    protocol::core_types::QNetworkDatabaseTypes,
-    QCoreProcCheckpointUniqueId,
+    crypto::hash::{merkle_proof::MerkleProofCore, traits::MerkleZeroHasher}, data::hash::{fast_node_serializer::{QMerkleStoreFastDoubleNodeSerializer, QMerkleStoreFastSingleNodeSerializer}, merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}, merkle_store_key::{QMerkleStoreDoubleIdNode, QMerkleStoreSingleIdNode}}, felt::ToU64Value, protocol::core_types::QNetworkDatabaseTypes, QCoreProcCheckpointUniqueId
 };
 use psy_data::v1::qdata::{
     checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState}, checkpoint_sync::PQEDCheckpointSyncInfo, user::PQEDUserLeaf
@@ -323,6 +320,18 @@ impl<
         S,
     >
 {
+    async fn get_user_ids_for_public_key(&self, public_key: N::QHash, start_user_id: u64, count: usize) -> anyhow::Result<Vec<u64>> {
+        let user_ids = self
+            .store
+            .db_select_value_u64_ids_for_hash(
+                &self.public_key_hash_to_user_ids_table,
+                public_key,
+                count,
+                start_user_id,
+            )
+            .await?;
+        Ok(user_ids)
+    }
     async fn get_checkpoint_leaf_data(&self, checkpoint_id: u64) -> anyhow::Result<PQEDCheckpointLeaf<N::F, N::QHash>> {
         let maybe_leaf = self
             .store
@@ -529,12 +538,6 @@ impl<
             None => anyhow::bail!("No unique id found for pending id {}", pending_id),
         }
     }
-    //missing `get_latest_checkpoint_leaf_data`,
-    // `get_checkpoint_id_for_checkpoint_root_hash`, `get_checkpoint_tree_root`,
-    // `get_checkpoint_tree_leaf_hash`, `get_checkpoint_tree_merkle_proof`,
-    // `get_user_contract_tree_root`, `get_user_contract_tree_leaf_hash`,
-    // `get_user_contract_tree_merkle_proof` in implementationrustcClick for full
-    // compiler diagnostic
     async fn get_latest_checkpoint_leaf_data(&self) -> anyhow::Result<PQEDCheckpointLeaf<N::F, N::QHash>> {
         let latest_checkpoint_id = self.get_latest_checkpoint_id().await?;
         self.get_checkpoint_leaf_data(latest_checkpoint_id).await
@@ -713,9 +716,9 @@ impl<
         self.store.db_insert_one_kiv(&self.l2_block_state_table, checkpoint_id, block_state).await
     }
 
-    async fn set_user_leaf_data(&self, checkpoint_id: u64, user_id: u64, leaf_data: &PQEDUserLeaf<N::F, N::QHash>) -> anyhow::Result<()> {
+    async fn set_user_leaf_data(&self, checkpoint_id: u64, leaf_data: &PQEDUserLeaf<N::F, N::QHash>) -> anyhow::Result<()> {
         self.store
-            .db_insert_one_single_checkpointed_object(&self.user_leaf_table, user_id, checkpoint_id, leaf_data)
+            .db_insert_one_single_checkpointed_object(&self.user_leaf_table, leaf_data.user_id.to_u64_value(), checkpoint_id, leaf_data)
             .await
     }
 

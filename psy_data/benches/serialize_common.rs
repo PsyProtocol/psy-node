@@ -53,7 +53,6 @@ fn benckmark_serialize_round_trip_user_leaf_internal<F: BenchFastRand + QFelt64 
     for count in user_counts.iter() {
         // Generate the test data once per size.
         let items = gen_random_user_leaves::<F, Hash>(*count);
-        let speedy_bytes = items.write_to_vec().expect("Serialization should succeed");
 
         let bincode_bytes = bincode::serialize(&items).expect("Bincode serialization should succeed");
         let canonical_bytes = PQEDUserLeaf::psy_ser_serialize_vec_of_self_ref(&items, false);
@@ -152,7 +151,7 @@ fn benckmark_serialize_round_trip_user_leaf_internal_known_type(c: &mut Criterio
     for count in user_counts.iter() {
         // Generate the test data once per size.
         let items = gen_random_user_leaves::<F, Hash>(*count);
-        let speedy_bytes = items.write_to_vec().expect("Serialization should succeed");
+        //let speedy_bytes = items.write_to_vec().expect("Serialization should succeed");
 
         let bincode_bytes = bincode::serialize(&items).expect("Bincode serialization should succeed");
         let canonical_bytes = PQEDUserLeaf::psy_ser_serialize_vec_of_self_ref(&items, false);
@@ -436,9 +435,9 @@ pub fn benckmark_serialization(c: &mut Criterion) {
     //let merkle_tree_heights = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
 
 
-    let linear_hash_counts = vec![10_000];
-    let hash_iterations = vec![10_000];
-    let merkle_tree_heights = vec![16];
+    //let linear_hash_counts = vec![10_000];
+    //let hash_iterations = vec![10_000];
+    //let merkle_tree_heights = vec![16];
     type F = PF;
     type Hash = PHash;
 

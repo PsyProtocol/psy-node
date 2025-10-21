@@ -4,7 +4,11 @@ use psy_data::v1::qdata::{checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheck
 
 #[async_trait]
 pub trait QEDRealmStoreReaderAsync<N: QNetworkDatabaseTypes> {
-    //async fn get_first_user_id(&self, public_key: N::QHash) -> anyhow::Result<u64>;
+
+    
+    //get_user_ids_for_public_key is a replacement for async fn get_first_user_id(&self, public_key: N::QHash) -> anyhow::Result<u64>;
+    // paginates through the user ids for a given public key starting from start_user_id (inclusive), restrict count to some reasonable number to avoid large data transfers
+    async fn get_user_ids_for_public_key(&self, public_key:  N::QHash, start_user_id: u64, count: usize) -> anyhow::Result<Vec<u64>>;
     async fn get_checkpoint_leaf_data(&self, checkpoint_id: u64) -> anyhow::Result<PQEDCheckpointLeaf<N::F, N::QHash>>;
     async fn get_checkpoint_leaf_data_f(&self, checkpoint_id: N::F) -> anyhow::Result<PQEDCheckpointLeaf<N::F, N::QHash>> {
         <Self as QEDRealmStoreReaderAsync<N>>::get_checkpoint_leaf_data(self, checkpoint_id.to_u64_value()).await
@@ -150,7 +154,7 @@ pub trait QEDRealmStoreWriterAsyncImm<N: QNetworkDatabaseTypes> {
     async fn set_checkpoint_leaf_data(&self, checkpoint_id: u64, leaf_data: &PQEDCheckpointLeaf<N::F, N::QHash>) -> anyhow::Result<()>;
     async fn set_checkpoint_root_hash_to_id_mapping(&self, checkpoint_root: &N::QHash, checkpoint_id: u64) -> anyhow::Result<()>;
     async fn set_l2_block_state(&self, checkpoint_id: u64, block_state: &QEDL2BlockState) -> anyhow::Result<()>;
-    async fn set_user_leaf_data(&self, checkpoint_id: u64, user_id: u64, leaf_data: &PQEDUserLeaf<N::F, N::QHash>) -> anyhow::Result<()>;
+    async fn set_user_leaf_data(&self, checkpoint_id: u64, leaf_data: &PQEDUserLeaf<N::F, N::QHash>) -> anyhow::Result<()>;
     async fn set_checkpoint_global_state_roots(&self, checkpoint_id: u64, roots: &PQEDCheckpointGlobalStateRoots<N::QHash>) -> anyhow::Result<()>;
 
     async fn set_checkpoint_tree_nodes(&self, checkpoint_id: u64, nodes: &[SimpleMerkleNode<N::QHash>]) -> anyhow::Result<()>;

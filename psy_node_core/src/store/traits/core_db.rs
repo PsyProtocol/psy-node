@@ -497,6 +497,12 @@ pub trait CoreDatabaseTagTreeReader<Hash: QHashBase + Send + Sync, Hasher: Merkl
         unique_pending_id: u64,
         key: &SimpleMerkleNodeKey,
     ) -> anyhow::Result<Option<Hash>>;
+    async fn db_get_tag_tree_node_tags(
+        &self,
+        table: &TableIdentifier,
+        unique_pending_id: u64,
+        keys: &[SimpleMerkleNodeKey],
+    ) -> anyhow::Result<Vec<Option<Hash>>>;
     async fn db_get_tag_tree_root(&self, table: &TableIdentifier, unique_pending_id: u64) -> anyhow::Result<Option<Hash>>;
     async fn db_get_tag_tree_merkle_proof(
         &self,
@@ -510,7 +516,7 @@ pub trait CoreDatabaseTagTreeReader<Hash: QHashBase + Send + Sync, Hasher: Merkl
 #[auto_impl(&, Arc)]
 pub trait CoreDatabaseTagTreeWriter<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync, TableIdentifier: Clone + Send + Sync>
 {
-    async fn set_tag_tree_tag_value(
+    async fn db_set_tag_tree_tag_value(
         &self,
         table: &TableIdentifier,
         unique_pending_id: u64,
@@ -518,8 +524,8 @@ pub trait CoreDatabaseTagTreeWriter<Hash: QHashBase + Send + Sync, Hasher: Merkl
         tag: &Hash,
         value: &Hash,
     ) -> anyhow::Result<()>;
-    async fn set_tag_tree_tag(&self, table: &TableIdentifier, unique_pending_id: u64, key: &SimpleMerkleNodeKey, tag: &Hash) -> anyhow::Result<()>;
-    async fn set_tag_tree_tag_known_height(
+    async fn db_set_tag_tree_tag(&self, table: &TableIdentifier, unique_pending_id: u64, key: &SimpleMerkleNodeKey, tag: &Hash) -> anyhow::Result<()>;
+    async fn db_set_tag_tree_tag_known_height(
         &self,
         table: &TableIdentifier,
         unique_pending_id: u64,
@@ -555,12 +561,12 @@ pub trait CoreDatabaseZeroIdMerkleDumpReader<
     TableIdentifier: Clone + Send + Sync,
 >
 {
-    async fn dump_all_zero_id_merkle_node_leaves_chunked(
+    async fn db_dump_all_zero_id_merkle_node_leaves_chunked(
         &self,
         table: &TableIdentifier,
         max_checkpoint_id: u64,
     ) -> anyhow::Result<HashMap<u64, Hash>>;
-    async fn dump_all_zero_id_merkle_node_leaves_vec(
+    async fn db_dump_all_zero_id_merkle_node_leaves_vec(
         &self,
         table: &TableIdentifier,
         max_checkpoint_id: u64,

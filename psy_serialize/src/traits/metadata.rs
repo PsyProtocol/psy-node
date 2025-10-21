@@ -5,7 +5,6 @@ pub trait PsyCanonicalSerializeMetadata {
     const FIXED_SIZE: usize;
     const MAX_VEC_LENGTH: usize = u32::MAX as usize;
 }
-
 pub trait PsyIOWithMaxVecLength {
     #[inline(always)]
     fn psy_io_max_vec_length() -> usize {
