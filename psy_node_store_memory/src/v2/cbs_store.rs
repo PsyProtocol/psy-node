@@ -37,13 +37,7 @@ use parth_core::{
     protocol::core_types::{QDBHashBase, QHashBase},
 };
 use psy_node_core::store::traits::core_db::{
-    CoreDatabaseBidirectionalMappingReader, CoreDatabaseBidirectionalMappingWriter, CoreDatabaseBidirectionalU64U128MappingReader,
-    CoreDatabaseBidirectionalU64U128MappingWriter,
-    CoreDatabaseDoubleIdCheckpointedReader, CoreDatabaseDoubleIdCheckpointedWriter,
-    CoreDatabaseDoubleIdMerkleReader, CoreDatabaseDoubleIdMerkleWriter, CoreDatabaseKivReader,
-    CoreDatabaseKivWriter, CoreDatabaseSingleIdCheckpointedReader, CoreDatabaseSingleIdCheckpointedWriter,
-    CoreDatabaseSingleIdMerkleReader, CoreDatabaseSingleIdMerkleWriter, CoreDatabaseTagTreeReader, CoreDatabaseTagTreeWriter,
-    CoreDatabaseU64Reader, CoreDatabaseU64Store, CoreDatabaseU64Writer, CoreDatabaseZeroIdMerkleReader, CoreDatabaseZeroIdMerkleWriter,
+    CoreDatabaseBidirectionalMappingReader, CoreDatabaseBidirectionalMappingWriter, CoreDatabaseBidirectionalU64U128MappingReader, CoreDatabaseBidirectionalU64U128MappingWriter, CoreDatabaseDoubleIdCheckpointedReader, CoreDatabaseDoubleIdCheckpointedWriter, CoreDatabaseDoubleIdMerkleReader, CoreDatabaseDoubleIdMerkleWriter, CoreDatabaseHashToManyIdsReader, CoreDatabaseHashToManyIdsWriter, CoreDatabaseKivReader, CoreDatabaseKivWriter, CoreDatabaseSingleIdCheckpointedReader, CoreDatabaseSingleIdCheckpointedWriter, CoreDatabaseSingleIdMerkleReader, CoreDatabaseSingleIdMerkleWriter, CoreDatabaseTagTreeReader, CoreDatabaseTagTreeWriter, CoreDatabaseU64Reader, CoreDatabaseU64Store, CoreDatabaseU64Writer, CoreDatabaseZeroIdMerkleReader, CoreDatabaseZeroIdMerkleWriter
 };
 use psy_serialize::{PsyCanonicalDatabaseSerializeBaseSingle, PsySerializeCanonicalAsyncSafe};
 use std::{
@@ -193,6 +187,22 @@ mod key_helpers {
         db_key.push(key.level);
         db_key.extend_from_slice(&key.index.to_be_bytes());
         db_key
+    }
+
+    pub fn key_hash_to_u64<Hash: QDBHashBase>(hash: &Hash, value: u64) -> anyhow::Result<Vec<u8>> {
+        let hash_bytes = hash.to_bytes()?;
+        let mut key = Vec::with_capacity(hash_bytes.len() + 8);
+        key.extend_from_slice(&hash_bytes);
+        // Use big-endian for correct lexicographical sorting by u64
+        key.extend_from_slice(&value.to_be_bytes()); 
+        Ok(key)
+    }
+
+    // Helper to extract u64 from the key bytes
+    pub fn extract_u64_from_hash_to_u64_key(key: &[u8]) -> anyhow::Result<u64> {
+        let hash_len = key.len().checked_sub(8).ok_or_else(|| anyhow::anyhow!("Key too short for HashToU64"))?;
+        let u64_bytes: [u8; 8] = key[hash_len..].try_into()?;
+        Ok(u64::from_be_bytes(u64_bytes))
     }
 }
 
@@ -1377,3 +1387,150 @@ where
     }
 }
 
+
+#[async_trait]
+impl<Hash, Hasher> CoreDatabaseHashToManyIdsWriter<Hash, InMemoryTableIdentifier>
+    for InMemoryCoreStore<Hash, Hasher>
+where
+    Hash: QDBHashBase,
+    Hasher: MerkleZeroHasher<Hash> + Send + Sync 
+{
+    async fn db_insert_one_hash_to_u64(&self, table: &InMemoryTableIdentifier, hash_id: Hash, value: u64) -> anyhow::Result<()>{
+        let db = self.get_or_create_table(&table.to_string());
+        let key = key_helpers::key_hash_to_u64(&hash_id, value)?;
+        // Value is an empty vec, as we only store the composite key (Hash, u64)
+        db.insert(key, Vec::new()); 
+        Ok(())
+    }
+
+    async fn db_insert_many_hash_to_u64s(&self, table: &InMemoryTableIdentifier, rows: &[(Hash, u64)]) -> anyhow::Result<()>{
+        let db = self.get_or_create_table(&table.to_string());
+        
+        let results: anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> = rows
+            .iter()
+            .map(|(hash_id, value)| {
+                let key = key_helpers::key_hash_to_u64(hash_id, *value)?;
+                Ok((key, Vec::new()))
+            })
+            .collect();
+
+        for (key, val) in results? {
+            db.insert(key, val);
+        }
+        Ok(())
+    }
+
+    async fn db_set_hash_256_to_u64_pairs_from_fast_serialized_data(
+        &self,
+        table: &InMemoryTableIdentifier,
+        data: &[u8],
+    ) -> anyhow::Result<()>{
+        // Based on Scylla implementation, the input format is: [Hash (32 bytes), u64 (8 bytes)] repeating.
+        // Total size per entry: 40 bytes. Hash is 32 bytes.
+        const ENTRY_SIZE: usize = 40;
+        const HASH_SIZE: usize = 32;
+
+        if data.len() % ENTRY_SIZE != 0 {
+            anyhow::bail!("Invalid data length for fast serialized hash-to-u64 pairs: expected multiple of 40, got {}", data.len());
+        }
+
+        let db = self.get_or_create_table(&table.to_string());
+        let empty_val = Vec::new();
+        
+        let process_chunk = |chunk: &[u8]| -> anyhow::Result<()> {
+            // Hash bytes are chunk[0..32]
+            // u64 bytes are chunk[32..40] (Little Endian in the FFS struct definition, but Scylla binds BLOB (Hash) and BIGINT (u64) separately)
+            
+            // Note on Endianness: The Scylla `read_hash256_refs_and_i64s_from_buffer` uses LE for i64/u64.
+            // However, for the key sort order in SkipMap, we must use BE for the u64 component.
+            // Since this is InMemoryCoreStore, we must reconstruct the BE key manually.
+
+            let hash_bytes = &chunk[0..HASH_SIZE];
+            let value_le_bytes: [u8; 8] = chunk[HASH_SIZE..ENTRY_SIZE].try_into()?;
+            let value_u64 = u64::from_le_bytes(value_le_bytes);
+
+            // Construct the BE key for SkipMap sorting: Hash || u64_BE
+            let mut key = Vec::with_capacity(HASH_SIZE + 8);
+            key.extend_from_slice(hash_bytes);
+            key.extend_from_slice(&value_u64.to_be_bytes()); 
+
+            db.insert(key, empty_val.clone());
+            Ok(())
+        };
+
+        #[cfg(feature = "parallel_rayon")]
+        {
+            use rayon::prelude::*;
+            let results: Vec<anyhow::Result<()>> = data.par_chunks_exact(ENTRY_SIZE).map(process_chunk).collect();
+            results.into_iter().collect::<anyhow::Result<Vec<()>>>()?;
+        }
+
+        #[cfg(not(feature = "parallel_rayon"))]
+        {
+            for chunk in data.chunks_exact(ENTRY_SIZE) {
+                process_chunk(chunk)?;
+            }
+        }
+        
+        Ok(())
+    }
+}
+
+
+#[async_trait]
+impl<Hash, Hasher> CoreDatabaseHashToManyIdsReader<Hash, InMemoryTableIdentifier>
+    for InMemoryCoreStore<Hash, Hasher>
+where
+    Hash: QDBHashBase,
+    Hasher: MerkleZeroHasher<Hash> + Send + Sync 
+{
+    async fn db_select_value_u64_ids_for_hash(
+        &self,
+        table: &InMemoryTableIdentifier,
+        hash: Hash,
+        count: usize,
+        start_u64_value: u64, // The ID to start the query from (inclusive)
+    ) -> anyhow::Result<Vec<u64>> {
+        let db = self.get_or_create_table(&table.to_string());
+
+        // 1. Determine the start key for the range query
+        let start_key = key_helpers::key_hash_to_u64(&hash, start_u64_value)?;
+        
+        // 2. Determine the end boundary key (exclusive)
+        // This is the hash immediately following the target hash.
+        // We assume Hash has a fixed size (e.g., 32 bytes).
+        let hash_bytes = hash.to_bytes()?;
+        let hash_len = hash_bytes.len();
+
+        let mut next_hash_bytes = hash_bytes.clone();
+        
+        // Increment the hash bytes. This is complex and error-prone for arbitrary Hash types.
+        // A safer approach for fixed-size hash (like Hash256) is to increment the last byte
+        // and handle overflow, or simply construct a key that is guaranteed to be lexicographically
+        // greater than any key starting with `hash`.
+        
+        // Since we are iterating over a SkipMap, we can simply define the range start.
+        // The iteration naturally stops when the first `hash_id` component changes.
+        
+        let mut results = Vec::with_capacity(count.min(100)); // Pre-allocate
+
+        // Use `SkipMap::range(start_key..)` and manually check the hash prefix
+        let mut iterator = db.range(start_key..);
+        
+        for entry in iterator.take(count) {
+            let key = entry.key();
+
+            // Check if the hash prefix still matches the target hash
+            if key.len() < hash_len || &key[0..hash_len] != hash_bytes.as_slice() {
+                // We've moved past the target hash or the key is malformed
+                break;
+            }
+
+            // Extract the u64 value
+            let u64_value = key_helpers::extract_u64_from_hash_to_u64_key(key)?;
+            results.push(u64_value);
+        }
+
+        Ok(results)
+    }
+}

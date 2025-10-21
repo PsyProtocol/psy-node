@@ -929,7 +929,6 @@ impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sy
     async fn db_set_hash_256_to_u64_pairs_from_fast_serialized_data(
         &self,
         table: &ScyllaHashToManyIdsTablePreparedStatements,
-        checkpoint_id: u64,
         data: &[u8],
     ) -> anyhow::Result<()>{
         table.set_hash_256_to_u64_pairs_from_fast_serialized_data(&self.session, data).await

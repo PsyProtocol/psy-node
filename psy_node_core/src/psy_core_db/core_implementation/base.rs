@@ -37,7 +37,7 @@ pub struct QRealmStoreBase<
     SingleIdMerkleTableIdentifier: Clone + Send + Sync,
     DoubleIdMerkleTableIdentifier: Clone + Send + Sync,
     ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
-    RewardTreeTableIdentifier: Clone + Send + Sync,
+    TagTreeTableIdentifier: Clone + Send + Sync,
     HashToManyIdsTableIdentifier: Clone + Send + Sync,
     S: CoreDatabaseStore<
             N::QHash,
@@ -51,8 +51,9 @@ pub struct QRealmStoreBase<
             SingleIdMerkleTableIdentifier,
             DoubleIdMerkleTableIdentifier,
             ZeroIdMerkleTableIdentifier,
+            TagTreeTableIdentifier,
             HashToManyIdsTableIdentifier,
-        > + CoreDatabaseTagTreeStore<N::QHash, N::HasherBase, RewardTreeTableIdentifier> + Send + Sync,
+        > + Send + Sync,
 > {
     pub store: Arc<S>,
     // start objects
@@ -82,7 +83,7 @@ pub struct QRealmStoreBase<
     pub global_checkpoint_tree_table: Arc<ZeroIdMerkleTableIdentifier>,
 
     // start reward tree table
-    pub guta_reward_tag_tree_table: Arc<RewardTreeTableIdentifier>,
+    pub guta_reward_tag_tree_table: Arc<TagTreeTableIdentifier>,
 
     // start unused table types
     pub _phantom_double_id_table: std::marker::PhantomData<DoubleIdTableIdentifier>,
@@ -103,7 +104,7 @@ impl<
         SingleIdMerkleTableIdentifier: Clone + Send + Sync,
         DoubleIdMerkleTableIdentifier: Clone + Send + Sync,
         ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
-        RewardTreeTableIdentifier: Clone + Send + Sync,
+        TagTreeTableIdentifier: Clone + Send + Sync,
         HashToManyIdsTableIdentifier: Clone + Send + Sync,
         S: CoreDatabaseStore<
                 N::QHash,
@@ -117,8 +118,9 @@ impl<
                 SingleIdMerkleTableIdentifier,
                 DoubleIdMerkleTableIdentifier,
                 ZeroIdMerkleTableIdentifier,
+                TagTreeTableIdentifier,
                 HashToManyIdsTableIdentifier,
-            > + CoreDatabaseTagTreeStore<N::QHash, N::HasherBase, RewardTreeTableIdentifier>+ Send + Sync,
+            > + Send + Sync
     >
     QRealmStoreBase<
         N,
@@ -131,7 +133,7 @@ impl<
         SingleIdMerkleTableIdentifier,
         DoubleIdMerkleTableIdentifier,
         ZeroIdMerkleTableIdentifier,
-        RewardTreeTableIdentifier,
+        TagTreeTableIdentifier,
         HashToManyIdsTableIdentifier,
         S,
     >
@@ -286,7 +288,7 @@ impl<
         SingleIdMerkleTableIdentifier: Clone + Send + Sync,
         DoubleIdMerkleTableIdentifier: Clone + Send + Sync,
         ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
-        RewardTreeTableIdentifier: Clone + Send + Sync,
+        TagTreeTableIdentifier: Clone + Send + Sync,
         HashToManyIdsTableIdentifier: Clone + Send + Sync,
         S: CoreDatabaseStore<
                 N::QHash,
@@ -300,8 +302,9 @@ impl<
                 SingleIdMerkleTableIdentifier,
                 DoubleIdMerkleTableIdentifier,
                 ZeroIdMerkleTableIdentifier,
+                TagTreeTableIdentifier,
                 HashToManyIdsTableIdentifier,
-            > + CoreDatabaseTagTreeStore<N::QHash, N::HasherBase, RewardTreeTableIdentifier>+ Send + Sync,
+            > + Send + Sync,
     >
     QEDRealmStoreReaderAsync<N> for 
     QRealmStoreBase<
@@ -315,7 +318,7 @@ impl<
         SingleIdMerkleTableIdentifier,
         DoubleIdMerkleTableIdentifier,
         ZeroIdMerkleTableIdentifier,
-        RewardTreeTableIdentifier,
+        TagTreeTableIdentifier,
         HashToManyIdsTableIdentifier,
         S,
     >
@@ -616,7 +619,7 @@ impl<
         SingleIdMerkleTableIdentifier: Clone + Send + Sync,
         DoubleIdMerkleTableIdentifier: Clone + Send + Sync,
         ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
-        RewardTreeTableIdentifier: Clone + Send + Sync,
+        TagTreeTableIdentifier: Clone + Send + Sync,
         HashToManyIdsTableIdentifier: Clone + Send + Sync,
         S: CoreDatabaseStore<
                 N::QHash,
@@ -630,8 +633,9 @@ impl<
                 SingleIdMerkleTableIdentifier,
                 DoubleIdMerkleTableIdentifier,
                 ZeroIdMerkleTableIdentifier,
+                TagTreeTableIdentifier,
                 HashToManyIdsTableIdentifier,
-            > + CoreDatabaseTagTreeStore<N::QHash, N::HasherBase, RewardTreeTableIdentifier>+ Send + Sync,
+            > + Send + Sync,
     >
     QEDRealmStoreWriterAsyncImm<N> for 
     QRealmStoreBase<
@@ -645,7 +649,7 @@ impl<
         SingleIdMerkleTableIdentifier,
         DoubleIdMerkleTableIdentifier,
         ZeroIdMerkleTableIdentifier,
-        RewardTreeTableIdentifier,
+        TagTreeTableIdentifier,
         HashToManyIdsTableIdentifier,
         S,
     >

@@ -735,7 +735,6 @@ pub trait CoreDatabaseHashToManyIdsWriter<Hash: QHashBase + Send + Sync, TableId
     async fn db_set_hash_256_to_u64_pairs_from_fast_serialized_data(
         &self,
         table: &TableIdentifier,
-        checkpoint_id: u64,
         data: &[u8],
     ) -> anyhow::Result<()>;
 }
@@ -765,6 +764,7 @@ pub trait CoreDatabaseReader<
     SingleIdMerkleTableIdentifier: Clone + Send + Sync,
     DoubleIdMerkleTableIdentifier: Clone + Send + Sync,
     ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
+    TagTreeMerkleTableIdentifier: Clone + Send + Sync,
     HashToManyIdsTableIdentifier: Clone + Send + Sync,
 >:
     CoreDatabaseBidirectionalMappingReader<BiDirectionalMappingTableIdentifier>
@@ -776,6 +776,7 @@ pub trait CoreDatabaseReader<
     + CoreDatabaseSingleIdMerkleReader<Hash, Hasher, SingleIdMerkleTableIdentifier>
     + CoreDatabaseDoubleIdMerkleReader<Hash, Hasher, DoubleIdMerkleTableIdentifier>
     + CoreDatabaseZeroIdMerkleReader<Hash, Hasher, ZeroIdMerkleTableIdentifier>
+    + CoreDatabaseTagTreeReader<Hash, Hasher, TagTreeMerkleTableIdentifier>
     + CoreDatabaseHashToManyIdsReader<Hash, HashToManyIdsTableIdentifier>
 {
 }
@@ -791,6 +792,7 @@ impl<
         SingleIdMerkleTableIdentifier: Clone + Send + Sync,
         DoubleIdMerkleTableIdentifier: Clone + Send + Sync,
         ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
+        TagTreeMerkleTableIdentifier: Clone + Send + Sync,
         HashToManyIdsTableIdentifier: Clone + Send + Sync,
         T: CoreDatabaseBidirectionalMappingReader<BiDirectionalMappingTableIdentifier>
             + CoreDatabaseBidirectionalU64U128MappingReader<BiDirectionalU64U128MappingTableIdentifier>
@@ -801,6 +803,7 @@ impl<
             + CoreDatabaseSingleIdMerkleReader<Hash, Hasher, SingleIdMerkleTableIdentifier>
             + CoreDatabaseDoubleIdMerkleReader<Hash, Hasher, DoubleIdMerkleTableIdentifier>
             + CoreDatabaseZeroIdMerkleReader<Hash, Hasher, ZeroIdMerkleTableIdentifier>
+            + CoreDatabaseTagTreeReader<Hash, Hasher, TagTreeMerkleTableIdentifier>
             + CoreDatabaseHashToManyIdsReader<Hash, HashToManyIdsTableIdentifier>,
     >
     CoreDatabaseReader<
@@ -815,6 +818,7 @@ impl<
         SingleIdMerkleTableIdentifier,
         DoubleIdMerkleTableIdentifier,
         ZeroIdMerkleTableIdentifier,
+        TagTreeMerkleTableIdentifier,
         HashToManyIdsTableIdentifier,
     > for T
 {
@@ -832,6 +836,7 @@ pub trait CoreDatabaseWriter<
     SingleIdMerkleTableIdentifier: Clone + Send + Sync,
     DoubleIdMerkleTableIdentifier: Clone + Send + Sync,
     ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
+    TagTreeMerkleTableIdentifier: Clone + Send + Sync,
     HashToManyIdsTableIdentifier: Clone + Send + Sync,
 >:
     CoreDatabaseBidirectionalMappingWriter<BiDirectionalMappingTableIdentifier>
@@ -843,6 +848,7 @@ pub trait CoreDatabaseWriter<
     + CoreDatabaseSingleIdMerkleWriter<Hash, Hasher, SingleIdMerkleTableIdentifier>
     + CoreDatabaseDoubleIdMerkleWriter<Hash, Hasher, DoubleIdMerkleTableIdentifier>
     + CoreDatabaseZeroIdMerkleWriter<Hash, Hasher, ZeroIdMerkleTableIdentifier>
+    + CoreDatabaseTagTreeWriter<Hash, Hasher, TagTreeMerkleTableIdentifier>
     + CoreDatabaseHashToManyIdsWriter<Hash, HashToManyIdsTableIdentifier>
 {
 }
@@ -858,6 +864,7 @@ impl<
         SingleIdMerkleTableIdentifier: Clone + Send + Sync,
         DoubleIdMerkleTableIdentifier: Clone + Send + Sync,
         ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
+        TagTreeMerkleTableIdentifier: Clone + Send + Sync,
         HashToManyIdsTableIdentifier: Clone + Send + Sync,
         T: CoreDatabaseBidirectionalMappingWriter<BiDirectionalMappingTableIdentifier>
             + CoreDatabaseBidirectionalU64U128MappingWriter<BiDirectionalU64U128MappingTableIdentifier>
@@ -868,7 +875,8 @@ impl<
             + CoreDatabaseSingleIdMerkleWriter<Hash, Hasher, SingleIdMerkleTableIdentifier>
             + CoreDatabaseDoubleIdMerkleWriter<Hash, Hasher, DoubleIdMerkleTableIdentifier>
             + CoreDatabaseZeroIdMerkleWriter<Hash, Hasher, ZeroIdMerkleTableIdentifier>
-            + CoreDatabaseHashToManyIdsWriter<Hash, HashToManyIdsTableIdentifier>,
+            + CoreDatabaseTagTreeWriter<Hash, Hasher, TagTreeMerkleTableIdentifier>
+            + CoreDatabaseHashToManyIdsWriter<Hash, HashToManyIdsTableIdentifier>
     >
     CoreDatabaseWriter<
         Hash,
@@ -882,6 +890,7 @@ impl<
         SingleIdMerkleTableIdentifier,
         DoubleIdMerkleTableIdentifier,
         ZeroIdMerkleTableIdentifier,
+        TagTreeMerkleTableIdentifier,
         HashToManyIdsTableIdentifier,
     > for T
 {
@@ -898,6 +907,7 @@ pub trait CoreDatabaseStore<
     SingleIdMerkleTableIdentifier: Clone + Send + Sync,
     DoubleIdMerkleTableIdentifier: Clone + Send + Sync,
     ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
+    TagTreeMerkleTableIdentifier: Clone + Send + Sync,
     HashToManyIdsTableIdentifier: Clone + Send + Sync,
 >:
     CoreDatabaseReader<
@@ -912,6 +922,7 @@ pub trait CoreDatabaseStore<
         SingleIdMerkleTableIdentifier,
         DoubleIdMerkleTableIdentifier,
         ZeroIdMerkleTableIdentifier,
+        TagTreeMerkleTableIdentifier,
         HashToManyIdsTableIdentifier,
     > + CoreDatabaseWriter<
         Hash,
@@ -925,6 +936,7 @@ pub trait CoreDatabaseStore<
         SingleIdMerkleTableIdentifier,
         DoubleIdMerkleTableIdentifier,
         ZeroIdMerkleTableIdentifier,
+        TagTreeMerkleTableIdentifier,
         HashToManyIdsTableIdentifier,
     >
 {
@@ -941,6 +953,7 @@ impl<
         SingleIdMerkleTableIdentifier: Clone + Send + Sync,
         DoubleIdMerkleTableIdentifier: Clone + Send + Sync,
         ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
+        TagTreeMerkleTableIdentifier: Clone + Send + Sync,
         HashToManyIdsTableIdentifier: Clone + Send + Sync,
         T: CoreDatabaseReader<
                 Hash,
@@ -954,6 +967,7 @@ impl<
                 SingleIdMerkleTableIdentifier,
                 DoubleIdMerkleTableIdentifier,
                 ZeroIdMerkleTableIdentifier,
+                TagTreeMerkleTableIdentifier,
                 HashToManyIdsTableIdentifier,
             > + CoreDatabaseWriter<
                 Hash,
@@ -967,6 +981,7 @@ impl<
                 SingleIdMerkleTableIdentifier,
                 DoubleIdMerkleTableIdentifier,
                 ZeroIdMerkleTableIdentifier,
+                TagTreeMerkleTableIdentifier,
                 HashToManyIdsTableIdentifier,
             >,
     >
@@ -982,6 +997,7 @@ impl<
         SingleIdMerkleTableIdentifier,
         DoubleIdMerkleTableIdentifier,
         ZeroIdMerkleTableIdentifier,
+        TagTreeMerkleTableIdentifier,
         HashToManyIdsTableIdentifier,
     > for T
 {

@@ -219,39 +219,3 @@ impl DebugTimer {
 #[cfg(target_arch = "wasm32")]
 pub struct DebugTimer;
 
-
-// Main function to demonstrate the new timer
-fn main() {
-    println!("--- Running DebugTimer Demo ---");
-    let mut timer = DebugTimer::new("App::Startup");
-
-    // Simulate different operations
-    std::thread::sleep(Duration::from_micros(250));
-    timer.lap_micros("Load config");
-
-    std::thread::sleep(Duration::from_millis(750));
-    timer.lap("Connect to database");
-
-    std::thread::sleep(Duration::from_secs(3));
-    timer.lap("Initialize services");
-
-    // --- Batch Operation Demo ---
-    let mut batch_timer = DebugTimer::new("Task::ProcessImages");
-    let num_images = 5000;
-    
-    // Simulate processing a batch of images
-    std::thread::sleep(Duration::from_millis(150));
-    
-    let (total_duration, avg_duration) = batch_timer.lap_batch(
-        "Resize and filter", 
-        "image", 
-        num_images
-    );
-    
-    println!("\nCaptured batch results:");
-    println!(" - Total time: {:?}", total_duration);
-    println!(" - Average time per image: {:?}", avg_duration);
-    println!(" - Average time per image (micros): {}µs", avg_duration.as_micros());
-
-    println!("\n--- Demo Finished ---");
-}

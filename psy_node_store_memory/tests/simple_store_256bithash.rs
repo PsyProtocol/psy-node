@@ -188,6 +188,7 @@ pub struct QSimpleStore<
     DoubleIdMerkleTableIdentifier: THStandardTableIdentifier,
     ZeroIdMerkleTableIdentifier: THStandardTableIdentifier,
     RewardTreeTableIdentifier: THStandardTableIdentifier,
+    HashToManyIdsTableIdentifier: THStandardTableIdentifier,
     S: CoreDatabaseStore<
             Hash,
             Hasher,
@@ -200,11 +201,9 @@ pub struct QSimpleStore<
             SingleIdMerkleTableIdentifier,
             DoubleIdMerkleTableIdentifier,
             ZeroIdMerkleTableIdentifier,
-        > + CoreDatabaseTagTreeStore<Hash, Hasher, RewardTreeTableIdentifier> + CoreDatabaseSingleIdMerkleReader<
-            Hash,
-            Hasher,
-            SingleIdMerkleTableIdentifier,
-            >
+            RewardTreeTableIdentifier,
+            HashToManyIdsTableIdentifier,
+        > 
         + Send
         + Sync,
 > {
@@ -250,6 +249,7 @@ pub struct QSimpleStore<
     _phantom_obj_single_id_table_b_value: std::marker::PhantomData<ObjSingleIdTableAValue>,
     _phantom_obj_double_id_table_a_value: std::marker::PhantomData<ObjDoubleIdTableBValue>,
     _phantom_obj_double_id_table_b_value: std::marker::PhantomData<ObjDoubleIdTableBValue>,
+    _phantom_x: std::marker::PhantomData<HashToManyIdsTableIdentifier>,
 }
 
 //#[async_trait]
@@ -280,6 +280,7 @@ impl<
         DoubleIdMerkleTableIdentifier: THStandardTableIdentifier,
         ZeroIdMerkleTableIdentifier: THStandardTableIdentifier,
         RewardTreeTableIdentifier: THStandardTableIdentifier,
+        HashToManyIdsTableIdentifier: THStandardTableIdentifier,
         S: CoreDatabaseStore<
                 Hash,
                 Hasher,
@@ -292,9 +293,9 @@ impl<
                 SingleIdMerkleTableIdentifier,
                 DoubleIdMerkleTableIdentifier,
                 ZeroIdMerkleTableIdentifier,
-            > + CoreDatabaseTagTreeStore<Hash, Hasher, RewardTreeTableIdentifier>
-            + Send
-            + Sync,
+                RewardTreeTableIdentifier,
+                HashToManyIdsTableIdentifier,
+            >  + Send   + Sync,
     >
     QSimpleStore<
         ZERO_ID_TREE_A_HEIGHT,
@@ -323,6 +324,7 @@ impl<
         DoubleIdMerkleTableIdentifier,
         ZeroIdMerkleTableIdentifier,
         RewardTreeTableIdentifier,
+        HashToManyIdsTableIdentifier,
         S,
     >
 {
@@ -388,6 +390,7 @@ impl<
             _phantom_obj_single_id_table_b_value: std::marker::PhantomData,
             _phantom_obj_double_id_table_a_value: std::marker::PhantomData,
             _phantom_obj_double_id_table_b_value: std::marker::PhantomData,
+            _phantom_x: std::marker::PhantomData,
         }
     }
 
@@ -422,6 +425,7 @@ impl<
         DoubleIdMerkleTableIdentifier: THStandardTableIdentifier,
         ZeroIdMerkleTableIdentifier: THStandardTableIdentifier,
         RewardTreeTableIdentifier: THStandardTableIdentifier,
+        HashToManyIdsTableIdentifier: THStandardTableIdentifier,
         S: CoreDatabaseStore<
                 Hash,
                 Hasher,
@@ -434,8 +438,9 @@ impl<
                 SingleIdMerkleTableIdentifier,
                 DoubleIdMerkleTableIdentifier,
                 ZeroIdMerkleTableIdentifier,
-            > + CoreDatabaseTagTreeStore<Hash, Hasher, RewardTreeTableIdentifier>
-            + Send
+                RewardTreeTableIdentifier,
+                HashToManyIdsTableIdentifier,
+            >  + Send
             + Sync,
     >
     QSimpleStore<
@@ -465,6 +470,7 @@ impl<
         DoubleIdMerkleTableIdentifier,
         ZeroIdMerkleTableIdentifier,
         RewardTreeTableIdentifier,
+        HashToManyIdsTableIdentifier,
         S,
     >
 {
@@ -655,6 +661,7 @@ impl<
         DoubleIdMerkleTableIdentifier: THStandardTableIdentifier,
         ZeroIdMerkleTableIdentifier: THStandardTableIdentifier,
         RewardTreeTableIdentifier: THStandardTableIdentifier,
+        HashToManyIdsTableIdentifier: THStandardTableIdentifier,
         S: CoreDatabaseStore<
                 Hash,
                 Hasher,
@@ -667,6 +674,8 @@ impl<
                 SingleIdMerkleTableIdentifier,
                 DoubleIdMerkleTableIdentifier,
                 ZeroIdMerkleTableIdentifier,
+                RewardTreeTableIdentifier,
+                HashToManyIdsTableIdentifier,
             > + CoreDatabaseTagTreeStore<Hash, Hasher, RewardTreeTableIdentifier>
             + Send
             + Sync,
@@ -698,6 +707,7 @@ impl<
         DoubleIdMerkleTableIdentifier,
         ZeroIdMerkleTableIdentifier,
         RewardTreeTableIdentifier,
+        HashToManyIdsTableIdentifier,
         S,
     >
 {
@@ -1410,6 +1420,7 @@ impl<
         DoubleIdMerkleTableIdentifier: THStandardTableIdentifier,
         ZeroIdMerkleTableIdentifier: THStandardTableIdentifier,
         RewardTreeTableIdentifier: THStandardTableIdentifier,
+        HashToManyIdsTableIdentifier: THStandardTableIdentifier,
         S: CoreDatabaseStore<
                 Hash,
                 Hasher,
@@ -1422,9 +1433,9 @@ impl<
                 SingleIdMerkleTableIdentifier,
                 DoubleIdMerkleTableIdentifier,
                 ZeroIdMerkleTableIdentifier,
-            > + CoreDatabaseTagTreeStore<Hash, Hasher, RewardTreeTableIdentifier>
-            + Send
-            + Sync,
+                RewardTreeTableIdentifier,
+                HashToManyIdsTableIdentifier,
+            > + Send+ Sync,
     >
     QSimpleStore<
         ZERO_ID_TREE_A_HEIGHT,
@@ -1453,6 +1464,7 @@ impl<
         DoubleIdMerkleTableIdentifier,
         ZeroIdMerkleTableIdentifier,
         RewardTreeTableIdentifier,
+        HashToManyIdsTableIdentifier,
         S,
     >
 {
@@ -2225,6 +2237,7 @@ impl<
         DoubleIdMerkleTableIdentifier: THStandardTableIdentifier,
         ZeroIdMerkleTableIdentifier: THStandardTableIdentifier,
         RewardTreeTableIdentifier: THStandardTableIdentifier,
+        HashToManyIdsTableIdentifier: THStandardTableIdentifier,
         S: CoreDatabaseStore<
                 Hash,
                 Hasher,
@@ -2237,6 +2250,8 @@ impl<
                 SingleIdMerkleTableIdentifier,
                 DoubleIdMerkleTableIdentifier,
                 ZeroIdMerkleTableIdentifier,
+                RewardTreeTableIdentifier,
+                HashToManyIdsTableIdentifier,
             > + CoreDatabaseTagTreeStore<Hash, Hasher, RewardTreeTableIdentifier>
             + Send
             + Sync,
@@ -2268,6 +2283,7 @@ impl<
         DoubleIdMerkleTableIdentifier,
         ZeroIdMerkleTableIdentifier,
         RewardTreeTableIdentifier,
+        HashToManyIdsTableIdentifier,
         S,
     >
 {
@@ -3602,6 +3618,7 @@ impl<
         DoubleIdMerkleTableIdentifier: THStandardTableIdentifier,
         ZeroIdMerkleTableIdentifier: THStandardTableIdentifier,
         RewardTreeTableIdentifier: THStandardTableIdentifier,
+        HashToManyIdsTableIdentifier: THStandardTableIdentifier,
         S: CoreDatabaseStore<
                 Hash,
                 Hasher,
@@ -3614,7 +3631,9 @@ impl<
                 SingleIdMerkleTableIdentifier,
                 DoubleIdMerkleTableIdentifier,
                 ZeroIdMerkleTableIdentifier,
-            > + CoreDatabaseTagTreeStore<Hash, Hasher, RewardTreeTableIdentifier>
+                RewardTreeTableIdentifier,
+                HashToManyIdsTableIdentifier
+            > 
             + Send
             + Sync,
     >
@@ -3645,6 +3664,7 @@ impl<
         DoubleIdMerkleTableIdentifier,
         ZeroIdMerkleTableIdentifier,
         RewardTreeTableIdentifier,
+        HashToManyIdsTableIdentifier,
         S,
     >
 {
@@ -4018,6 +4038,7 @@ impl<
         DoubleIdMerkleTableIdentifier: THStandardTableIdentifier,
         ZeroIdMerkleTableIdentifier: THStandardTableIdentifier,
         RewardTreeTableIdentifier: THStandardTableIdentifier,
+        HashToManyIdsTableIdentifier: THStandardTableIdentifier,
         S: CoreDatabaseStore<
                 Hash,
                 Hasher,
@@ -4030,7 +4051,9 @@ impl<
                 SingleIdMerkleTableIdentifier,
                 DoubleIdMerkleTableIdentifier,
                 ZeroIdMerkleTableIdentifier,
-            > + CoreDatabaseTagTreeStore<Hash, Hasher, RewardTreeTableIdentifier>
+                RewardTreeTableIdentifier,
+                HashToManyIdsTableIdentifier,
+            > 
             + Send
             + Sync,
     >
@@ -4061,6 +4084,7 @@ impl<
         DoubleIdMerkleTableIdentifier,
         ZeroIdMerkleTableIdentifier,
         RewardTreeTableIdentifier,
+        HashToManyIdsTableIdentifier,
         S,
     >
 {
@@ -4548,6 +4572,7 @@ pub struct SimpleStoreEx {
         ExObjDoubleIdTableBValue,
         ExHash,
         ExHasher,
+        InMemoryTableIdentifier,
         InMemoryTableIdentifier,
         InMemoryTableIdentifier,
         InMemoryTableIdentifier,
