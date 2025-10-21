@@ -1,10 +1,10 @@
 use serde::{de::DeserializeOwned, Serialize};
 
-use crate::{crypto::hash::{merkle_proof::{DeltaMerkleProofCore, MerkleProofCore}, traits::{MerkleHasher, MerkleZeroHasher, ZeroableHash}}, data::serializable::QPDSerializable, utils::math::{log2_ceil, log2_strict}};
+use crate::{crypto::hash::{merkle_proof::{DeltaMerkleProofCore, MerkleProofCore}, traits::{MerkleHasher, MerkleZeroHasher, ZeroableHash}}, data::serializable::QPDSerializable, utils::math::log2_strict};
 use crate::crypto::hash::traits::MerkleLeafHasher;
 use pser::{QBytesSerialize, QBytesDeserialize};
 
-fn hash_merkle_leaves_partial<Hash: PartialEq + Copy, Hasher: MerkleZeroHasher<Hash>>(
+fn _hash_merkle_leaves_partial<Hash: PartialEq + Copy, Hasher: MerkleZeroHasher<Hash>>(
     leaves: &[Hash],
 ) -> anyhow::Result<Hash> {
     if leaves.len() == 0 {

@@ -1,3 +1,5 @@
+// for benches, allow unused functions
+#![allow(dead_code)]
 use criterion::{black_box, BenchmarkId, Criterion};
 use parth_core::{
     data::{
@@ -373,7 +375,7 @@ fn gen_test_group_of_groups<T: QPGenRandom + Copy + Sized>(group_size: usize, gr
 }
 fn gen_test_group_of_groups_variable_size<T: QPGenRandom + Copy + Sized>(
     group_size: usize,
-    max_random_added_to_group_size: usize,
+    _max_random_added_to_group_size: usize,
     group_count: usize,
 ) -> Vec<Vec<T>> {
     let mut groups: Vec<Vec<T>> = Vec::with_capacity(group_count);

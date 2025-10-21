@@ -1,29 +1,29 @@
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use anyhow::Context;
-use dashmap::DashMap;
-use parth_core::protocol::core_types::QDBHashBase;
-use psy_node_core::store::traits::core_db::MerkleTreeDumpStrategy;
-use rayon::slice::{ParallelSlice};
-use rayon::iter::ParallelIterator;
 use futures::{future::join_all, stream, StreamExt, TryStreamExt};
-
 use parth_core::{
     crypto::hash::traits::MerkleZeroHasher,
     data::{
         db::table::QDatabaseTableRoutingKey,
-        hash::{fast_node_serializer::{QMerkleStoreFastZeroNodeSerializer, QMS_FAST_SERIALIZER_ZERO_ID_NODE_SIZE}, merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}},
+        hash::{
+            fast_node_serializer::{QMerkleStoreFastZeroNodeSerializer, QMS_FAST_SERIALIZER_ZERO_ID_NODE_SIZE},
+            merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey},
+        },
     },
-    protocol::core_types::{QHash256Base, QHashBase},
+    protocol::core_types::{QDBHashBase, QHash256Base, QHashBase},
 };
+use psy_node_core::store::traits::core_db::MerkleTreeDumpStrategy;
+use rayon::{iter::ParallelIterator, slice::ParallelSlice};
 use scylla::{
     client::session::Session,
     response::query_result::QueryResult,
     statement::{batch::Batch, prepared::PreparedStatement, Statement},
 };
 
-use crate::utils::{calc_best_batch_size, convert_checkpoint_id_to_i64, generate_batch_prepared_statement, i64_to_u64_exact, u64_to_i64_exact, u8_to_i8_exact};
+use crate::utils::{
+    calc_best_batch_size, convert_checkpoint_id_to_i64, generate_batch_prepared_statement, i64_to_u64_exact, u64_to_i64_exact, u8_to_i8_exact,
+};
 
 #[derive(Clone)]
 pub struct ScyllaMerkleNodesZeroPreparedStatements {
@@ -37,7 +37,6 @@ pub struct ScyllaMerkleNodesZeroPreparedStatements {
     pub insert_batch_serialized_128_prepared: Arc<Batch>,
     pub insert_batch_serialized_64_prepared: Arc<Batch>,
     //pub insert_batch_serialized_32_prepared: Arc<Batch>,
-
     pub keyspace: String,
     pub table_name: String,
     pub table_key: QDatabaseTableRoutingKey,
@@ -64,16 +63,17 @@ impl ScyllaMerkleNodesZeroPreparedStatements {
             keyspace, table_name
         ));
         let select_1_prepared = session.prepare(select_1_statement.clone()).await?;
-        // Prepare the dump-specific select: fetches node_index and value, ordered by clustering (node_index ASC, checkpoint_id DESC).
+        // Prepare the dump-specific select: fetches node_index and value, ordered by
+        // clustering (node_index ASC, checkpoint_id DESC).
 
         Ok(Self {
             insert_batch_serialized_256_prepared: Arc::new(generate_batch_prepared_statement(&session, &insert_prepared, 256).await?),
             insert_batch_serialized_128_prepared: Arc::new(generate_batch_prepared_statement(&session, &insert_prepared, 128).await?),
-            insert_batch_serialized_64_prepared: Arc::new(generate_batch_prepared_statement(&session, &insert_prepared, 64).await?), 
+            insert_batch_serialized_64_prepared: Arc::new(generate_batch_prepared_statement(&session, &insert_prepared, 64).await?),
             insert_1_prepared: Arc::new(insert_prepared),
             select_1_prepared: Arc::new(select_1_prepared),
             insert_1_statement: insert_1_statement,
-            select_1_statement: select_1_statement,       
+            select_1_statement: select_1_statement,
             keyspace: keyspace.to_string(),
             table_name: table_name.to_string(),
             table_key,
@@ -142,23 +142,27 @@ impl ScyllaMerkleNodesZeroPreparedStatements {
             None => Ok(Hasher::get_zero_hash((self.tree_height - key.level) as usize)), // Return zero hash if not found
         }
     }
-// In `impl ScyllaMerkleNodesZeroPreparedStatements`
+    // In `impl ScyllaMerkleNodesZeroPreparedStatements`
 
-    /// Dumps all latest non-zero nodes for the entire tree at or before a given checkpoint_id.
+    /// Dumps all latest non-zero nodes for the entire tree at or before a given
+    /// checkpoint_id.
     ///
-    /// This implementation is highly optimized to prevent pulling historical data to the client.
-    /// It works in two phases for each tree level, executed concurrently:
-    /// 1. **Discover**: A `SELECT DISTINCT node_index` query is run for the level to find all unique
-    ///    nodes that have ever existed. This is a metadata-only query and is very fast.
-    /// 2. **Fetch**: For each discovered `node_index`, it executes the highly efficient `select_1` query
-    ///    (`... WHERE ... LIMIT 1`) to get the single, latest version of that node at or before
-    ///    the target checkpoint.
+    /// This implementation is highly optimized to prevent pulling historical
+    /// data to the client. It works in two phases for each tree level,
+    /// executed concurrently:
+    /// 1. **Discover**: A `SELECT DISTINCT node_index` query is run for the
+    ///    level to find all unique nodes that have ever existed. This is a
+    ///    metadata-only query and is very fast.
+    /// 2. **Fetch**: For each discovered `node_index`, it executes the highly
+    ///    efficient `select_1` query (`... WHERE ... LIMIT 1`) to get the
+    ///    single, latest version of that node at or before the target
+    ///    checkpoint.
     ///
-    /// This strategy minimizes data transfer and leverages Scylla's strengths for point lookups,
-    /// ensuring the dump is as fast and efficient as possible.
-   
-   
-   pub async fn select_many_zero_id_merkle_nodes_max_checkpoint_internal<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>(
+    /// This strategy minimizes data transfer and leverages Scylla's strengths
+    /// for point lookups, ensuring the dump is as fast and efficient as
+    /// possible.
+
+    pub async fn select_many_zero_id_merkle_nodes_max_checkpoint_internal<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>(
         &self,
         session: &Session,
         max_checkpoint_id: u64,
@@ -193,7 +197,6 @@ impl ScyllaMerkleNodesZeroPreparedStatements {
         Ok(results)
     }
 
-    
     /// NEW HELPER: Retrieves a node value if it exists, otherwise returns None.
     /// This is the clean, internal way to check for node existence.
     pub async fn select_optional_zero_id_merkle_node_internal<Hash: QDBHashBase>(
@@ -217,7 +220,6 @@ impl ScyllaMerkleNodesZeroPreparedStatements {
             Some(row) => Ok(Some(Hash::from_slice_32bytes(&row.0)?)),
             None => Ok(None),
         }
-    
     }
     /// Inserts a single node at checkpoint_id.
     /// Optimized: uses prepared statement.
@@ -243,7 +245,8 @@ impl ScyllaMerkleNodesZeroPreparedStatements {
     }
 
     /// Batch inserts multiple nodes at checkpoint_id.
-    /// Optimized: increased batch size to 512 for higher throughput; streams batches concurrently via join_all.
+    /// Optimized: increased batch size to 512 for higher throughput; streams
+    /// batches concurrently via join_all.
     pub async fn set_zero_id_merkle_nodes_batch_internal<Hash: QHashBase>(
         &self,
         session: &Session,
@@ -286,10 +289,7 @@ impl ScyllaMerkleNodesZeroPreparedStatements {
     }
 }
 
-
-
 impl ScyllaMerkleNodesZeroPreparedStatements {
-
     async fn set_zero_id_merkle_nodes_batch_fast_serialize_with_batch_size_internal<Hash: QHash256Base>(
         &self,
         session: &Session,
@@ -309,13 +309,10 @@ impl ScyllaMerkleNodesZeroPreparedStatements {
 
         const CONCURRENCY_LIMIT: usize = 64; // Tuned for typical Scylla clusters
 
-
         // Parallel deserialization using rayon
         let values: Vec<(i8, i64, i64, [u8; 32])> = data
             .par_chunks(QMS_FAST_SERIALIZER_ZERO_ID_NODE_SIZE)
-            .map(|slice| {
-                QMerkleStoreFastZeroNodeSerializer::deserialize_zero_id_node_signed_insert_tuple::<Hash>(slice, checkpoint_i64)
-            })
+            .map(|slice| QMerkleStoreFastZeroNodeSerializer::deserialize_zero_id_node_signed_insert_tuple::<Hash>(slice, checkpoint_i64))
             .collect();
 
         // Map batch size to pre-prepared batch
@@ -351,7 +348,7 @@ impl ScyllaMerkleNodesZeroPreparedStatements {
 
         Ok(())
     }
-     
+
     pub async fn set_zero_id_merkle_nodes_batch_fast_serialize<Hash: QHash256Base>(
         &self,
         session: &Session,
@@ -365,18 +362,14 @@ impl ScyllaMerkleNodesZeroPreparedStatements {
         if num_nodes == 0 {
             return Ok(());
         }
-        
+
         let batch_size = calc_best_batch_size(num_nodes, &[256, 128, 64]);
-        self.set_zero_id_merkle_nodes_batch_fast_serialize_with_batch_size_internal::<Hash>(session, checkpoint_id, data, batch_size).await
-
+        self.set_zero_id_merkle_nodes_batch_fast_serialize_with_batch_size_internal::<Hash>(session, checkpoint_id, data, batch_size)
+            .await
     }
-
-
 }
 
-
 impl ScyllaMerkleNodesZeroPreparedStatements {
-
     // Consolidated dump: stream leaf level, dedup client-side for latest <=
     // max_checkpoint
     async fn dump_leaves_stream<Hash: QDBHashBase>(
@@ -521,8 +514,7 @@ impl ScyllaMerkleNodesZeroPreparedStatements {
             MerkleTreeDumpStrategy::AppendOnlyTreeStrategy => {
                 self.dump_all_zero_id_merkle_node_leaves_append_only::<Hash>(session, max_checkpoint_id)
                     .await?
-            }
-            // Add others if defined
+            } // Add others if defined
         };
         let mut vec: Vec<_> = map
             .into_iter()

@@ -1,23 +1,23 @@
 use cf_utils::timer::DebugTimer;
-use rand::{thread_rng, Rng, RngCore, SeedableRng};
-use rand_chacha::ChaCha12Rng;
+use rand::{thread_rng, Rng, RngCore};
 use std::{collections::HashMap, hash::Hash, sync::{Arc, RwLock}};
 
 use dashmap::DashMap;
 use parth_core::{crypto::hash::traits::MerkleZeroHasher, data::{db::table::QDatabaseTableRoutingKey, hash::{hash256::Hash256, merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}}, serializable::QPDPair}, protocol::core_types::{QDBHashBase}};
 use parth_crypto::hash::sha256::CoreSha256Hasher;
 use parth_node_scylla::{core::ScyllaCoreStore, tables::merkle::ScyllaMerkleNodesZeroPreparedStatements};
-use psy_data::v1::qdata::user::PQEDUserLeaf;
 use psy_node_core::store::traits::{core_db::{CoreDatabaseZeroIdMerkleDumpReader, CoreDatabaseZeroIdMerkleReader, CoreDatabaseZeroIdMerkleStore}, helpers::db_helper_zero_id_merkle_node_simple_set_leaves};
 
 use serde::Serialize;
 
 
-
+/*
 // A function to create a 32-byte seed from any hashable input (like a string)
 fn get_seed_for_rng(s: &str) -> [u8; 32] {
     CoreSha256Hasher::hash_bytes(s.as_bytes()).0
 }
+
+*/
 fn rand_leaf_node_in_tree<R: RngCore + Rng, Hash: QDBHashBase>(rng: &mut R, tree_height: usize) -> SimpleMerkleNode<Hash> {
     let level: u8 = tree_height as u8;
     // [FIXED] The original code `(1u64 << (tree_height as u8 - level))` always resulted in `1u64 << 0`,
@@ -283,7 +283,7 @@ impl SimpleStoreEx {
         })
     }
 
-    async fn overwrite_test(&self, seed: &str, tree_height: usize) -> anyhow::Result<()> {
+    async fn overwrite_test(&self, _seed: &str, tree_height: usize) -> anyhow::Result<()> {
         let mut rng = thread_rng();//ChaCha12Rng::from_seed(get_seed_for_rng(seed));
         rng.next_u64();
         

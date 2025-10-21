@@ -1,6 +1,5 @@
 
-use parth_common::memory_stores::simple_memory_merkle_store::SimpleMemoryMerkleStore;
-use parth_core::{crypto::hash::traits::{MerkleHasher, MerkleLeafHasher, MerkleZeroHasher, ZeroableHash}, data::hash::hash256::Hash256, protocol::core_types::QDBHashBase, utils::{math::log2_ceil, QPGenRandom}};
+use parth_core::{crypto::hash::traits::{MerkleHasher, MerkleLeafHasher, MerkleZeroHasher, ZeroableHash}, data::hash::hash256::Hash256, utils::{math::log2_ceil, QPGenRandom}};
 use parth_crypto::hash::sha256::CoreSha256Hasher;
 
 fn hash_merkle_leaves_to_root_naive_pad<Hash: PartialEq + Copy + ZeroableHash, Hasher: MerkleHasher<Hash>>(
@@ -31,7 +30,7 @@ fn hash_merkle_leaves_to_root_naive_pad<Hash: PartialEq + Copy + ZeroableHash, H
         }
         current_level = next_level;
     }
-    assert!(current_level[0] == lib_root, "Roots must match in naive padding method");;
+    assert!(current_level[0] == lib_root, "Roots must match in naive padding method");
 
     current_level[0]
 }
@@ -81,7 +80,7 @@ fn hash_merkle_leaves_v2<Hash: PartialEq + Copy, Hasher: MerkleZeroHasher<Hash>>
     Ok(current_level[0])
 }
 
-fn hash_level_with_left_over<Hash: PartialEq + Copy, Hasher: MerkleZeroHasher<Hash>>(
+fn _hash_level_with_left_over<Hash: PartialEq + Copy, Hasher: MerkleZeroHasher<Hash>>(
     current_nodes_level_from_bottom: u8,
     nodes: &[Hash],
 ) -> Vec<Hash> {
