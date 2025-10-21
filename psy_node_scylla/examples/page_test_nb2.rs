@@ -1,3 +1,5 @@
+// for tests/examples only, we allow dead code
+#![allow(dead_code)]
 use anyhow::Result;
 use cf_utils::timer::DebugTimer;
 use futures::StreamExt;
@@ -6,7 +8,7 @@ use parth_core::data::hash::merkle_node_key::SimpleMerkleNode;
 use parth_core::protocol::core_types::Q256BitHash;
 use parth_core::utils::signed_helpers::{i64_to_u64_exact, u64_to_i64_exact};
 use parth_core::utils::QPGenRandom;
-use parth_node_scylla::utils::{convert_checkpoint_id_to_i64, i8_to_u8_exact, u8_to_i8_exact};
+use parth_node_scylla::utils::{convert_checkpoint_id_to_i64, i8_to_u8_exact};
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
 use scylla::response::PagingState;
@@ -21,7 +23,7 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 
 
-const fn get_bucket_for_node(_level: u8, node_index: u64) -> i32 {
+const fn _get_bucket_for_node(_level: u8, node_index: u64) -> i32 {
     // Simple example bucket function: combine level and node_index to create a bucket
     // This is just an example; real implementations may use more complex logic
     (node_index&0xffffu64) as i32
@@ -145,7 +147,7 @@ async fn main() -> Result<()> {
         let prepared = select_1_prepared.clone();
         let permit = sem.clone().acquire_owned().await;
         let node = nodes[i].key.clone();
-        let pp = tokio::task::spawn(async move {
+        let _pp = tokio::task::spawn(async move {
             println!("inside1");
             let _permit = permit;
             let level_i8 = 31i8 + (i&1) as i8; // simulate lots of leaf nodes, half are leaves, half are non leaves

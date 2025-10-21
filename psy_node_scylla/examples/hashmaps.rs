@@ -1,13 +1,11 @@
 use std::collections::HashMap;
 
-use bincode::de;
 use cf_utils::timer::DebugTimer;
 use dashmap::DashMap;
-use parth_core::{data::hash::{hash256::Hash256, merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}}, protocol::core_types::QDBHashBase, utils::QPGenRandom, PHash, PF};
+use parth_core::{data::hash::{hash256::Hash256, merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}}, protocol::core_types::QDBHashBase, utils::QPGenRandom, PHash};
 
 
 type Hash = PHash;
-type F = PF;
 
 
 fn gen_random_semi_realistic_merkle_nodes_for_bench<H: QDBHashBase + QPGenRandom>(leaf_count: usize, tree_height: u8) -> Vec<SimpleMerkleNode<H>> {
@@ -15,7 +13,7 @@ fn gen_random_semi_realistic_merkle_nodes_for_bench<H: QDBHashBase + QPGenRandom
     let max_index = 1u64 << tree_height;
     let count = if leaf_count as u64 > max_index { max_index } else { leaf_count as u64 } ;
     let mut nodes = HashMap::<SimpleMerkleNodeKey, H>::with_capacity((count as usize)*2);
-    for i in 0..count {
+    for _ in 0..count {
         let key = SimpleMerkleNodeKey {
             level: tree_height,
             index: u64::qp_rand_gen() % max_index,

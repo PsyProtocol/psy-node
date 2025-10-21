@@ -1,12 +1,8 @@
 
-// --- Optimized Function ---
-
-use core::num;
 
 use cf_utils::timer::DebugTimer;
 use parth_core::{crypto::hash::traits::MerkleZeroHasher, data::hash::hash256::Hash256, pgoldilocks::PoseidonHasher, protocol::core_types::Q256BitHash, utils::QPGenRandom, PHash};
-use parth_crypto::hash::sha256::CoreSha256Hasher;
-use rayon::slice::ParallelSlice;
+use rayon::{iter::ParallelIterator, slice::ParallelSlice};
 
 /// Computes the Merkle root from a slice of leaves in an efficient, in-place manner.
 ///
@@ -57,8 +53,7 @@ fn hash_merkle_from_leaves_2<Hash: PartialEq + Copy, Hasher: MerkleZeroHasher<Ha
 
 fn hash_tree_of_height(height: u8) -> anyhow::Result<()> {
     type Hash = PHash;
-    let mut timer = DebugTimer::new("hash_leaves");;
-    type Hasher = CoreSha256Hasher;
+    let mut timer = DebugTimer::new("hash_leaves");
     let num_leaves = 1 << height;
     timer.event(format!("start with_capacity {} leaves", num_leaves));
     timer.event(format!("got with_capacity {} leaves", num_leaves));
@@ -78,11 +73,12 @@ fn hash_tree_of_height(height: u8) -> anyhow::Result<()> {
     println!("Merkle root for tree of height {}: {:?}", height, root);
     Ok(())
 }
-/* 
+
+
 fn hash_tree_of_height_parallel(height: u8) -> anyhow::Result<()> {
     type Hash = PHash;
-    let mut timer = DebugTimer::new("hash_leaves");;
-    type Hasher = CoreSha256Hasher;
+    let mut timer = DebugTimer::new("hash_leaves");
+    //type Hasher = CoreSha256Hasher;
     let num_leaves = 1 << height;
     timer.event(format!("start with_capacity {} leaves", num_leaves));
     timer.event(format!("got with_capacity {} leaves", num_leaves));
@@ -104,10 +100,11 @@ fn hash_tree_of_height_parallel(height: u8) -> anyhow::Result<()> {
     println!("Time per leaf: {:.3} µs", per_leaf);
     println!("Merkle root for tree of height {}: {:?}", height, root);
     Ok(())
-}*/
+}
 
 fn main(){
-    //hash_tree_of_height(24).unwrap();
+    hash_tree_of_height(24).unwrap();
+    hash_tree_of_height_parallel(24).unwrap();
 
 
 }

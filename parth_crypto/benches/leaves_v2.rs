@@ -1,3 +1,6 @@
+// allow dead code for benchmark files
+#![allow(dead_code)]
+
 use criterion::{black_box, BenchmarkId, Criterion};
 use parth_core::{crypto::hash::traits::MerkleZeroHasher, data::hash::hash256::Hash256, generic_traits::QNamedType, pgoldilocks::PGoldilocksHash, protocol::core_types::QHashBase};
 use parth_crypto::hash::sha256::CoreSha256Hasher;
@@ -191,7 +194,7 @@ fn hash_merkle_from_leaves_3<Hash: PartialEq + Copy, Hasher: MerkleZeroHasher<Ha
 
 
 
-fn benchmark_merkle_hasher_internal<Hash: BenchFastRand + QHashBase, Hasher: QNamedType + MerkleZeroHasher<Hash>>(c: &mut Criterion, sizes_seed: &str, merkle_tree_heights: &[u64]) {
+fn benchmark_merkle_hasher_internal<Hash: BenchFastRand + QHashBase, Hasher: QNamedType + MerkleZeroHasher<Hash>>(c: &mut Criterion, _sizes_seed: &str, merkle_tree_heights: &[u64]) {
     let mut group = c.benchmark_group(format!("merkle_hasher_{}_v1", Hasher::q_type_name()));
 
     // We test with a variety of input sizes to see how performance scales.
@@ -202,7 +205,7 @@ fn benchmark_merkle_hasher_internal<Hash: BenchFastRand + QHashBase, Hasher: QNa
         let height: u64 = height;
         let leaves_count = 1u64 << height;
         let count = leaves_count as usize;
-        let seed_str = format!("merkle_hasher_{}_height_{}", sizes_seed, height);
+        //let seed_str = format!("merkle_hasher_{}_height_{}", sizes_seed, height);
         // Generate the test data once per size.
         let leaves = Hash::brg_fast_vec((1u64 << height) as usize);
         let fewest_leaves_at_height = (1u64 << (height - 1u64)) as usize;
@@ -249,9 +252,9 @@ pub fn benchmark_merkle_leaf_hashers(c: &mut Criterion) {
     //let merkle_tree_heights = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
 
 
-    let linear_hash_counts = vec![10_000];
-    let hash_iterations = vec![10_000];
-    let merkle_tree_heights = vec![16];
+    //let linear_hash_counts = vec![10_000];
+    //let hash_iterations = vec![10_000];
+    //let merkle_tree_heights = vec![16];
     benchmark_merkle_hasher_internal::<Hash256, CoreSha256Hasher>(c, "test", &[4, 10, 12, 14, 16, 18]);
 
 }

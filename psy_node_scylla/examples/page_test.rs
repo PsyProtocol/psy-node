@@ -15,7 +15,7 @@ use parth_core::{
         QPGenRandom,
     },
 };
-use parth_node_scylla::utils::{convert_checkpoint_id_to_i64, i8_to_u8_exact, u8_to_i8_exact};
+use parth_node_scylla::utils::{convert_checkpoint_id_to_i64, i8_to_u8_exact};
 use scylla::{
     client::{session::Session, session_builder::SessionBuilder},
     response::PagingState,
@@ -157,7 +157,7 @@ async fn main() -> Result<()> {
         let permit = sem.clone().acquire_owned().await;
         let node = nodes[i].key.clone();
         let query_results = query_results.clone();
-        let pp = tokio::task::spawn(async move {
+        let _pp = tokio::task::spawn(async move {
             let _permit = permit;
             let level_i8 = 31i8 + (i & 1) as i8; // simulate lots of leaf nodes, half are leaves, half are non leaves
             let bucket = get_bucket_for_node(node.level, node.index);
@@ -179,7 +179,7 @@ async fn main() -> Result<()> {
         sem.acquire().await.unwrap().forget();
     }
 
-    let results = query_results
+    let _results = query_results
         .clone()
         .iter()
         .map(|entry| SimpleMerkleNode {

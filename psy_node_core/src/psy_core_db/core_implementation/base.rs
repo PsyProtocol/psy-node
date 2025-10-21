@@ -13,7 +13,7 @@ use psy_data::v1::qdata::{
 };
 use crate::{psy_core_db::traits::realm::QEDRealmStoreWriterAsyncImm, store::traits::core_db::{
     CoreDatabaseBidirectionalMappingReader, CoreDatabaseBidirectionalU64U128MappingReader,
-    CoreDatabaseKivReader, CoreDatabaseSingleIdCheckpointedReader, CoreDatabaseSingleIdMerkleReader, CoreDatabaseStore, CoreDatabaseTagTreeStore,
+    CoreDatabaseKivReader, CoreDatabaseSingleIdCheckpointedReader, CoreDatabaseSingleIdMerkleReader, CoreDatabaseStore,
     CoreDatabaseU64Reader, CoreDatabaseZeroIdMerkleReader,
 }};
 

@@ -1,3 +1,6 @@
+// allow dead code for benchmark files
+#![allow(dead_code)]
+
 use criterion::{black_box, BenchmarkId, Criterion};
 use parth_core::{crypto::hash::traits::MerkleHasher, data::hash::hash256::Hash256, generic_traits::QNamedType, pgoldilocks::{PGoldilocksHash, PoseidonHasher}, protocol::core_types::QHashBase};
 use parth_crypto::hash::sha256::CoreSha256Hasher;

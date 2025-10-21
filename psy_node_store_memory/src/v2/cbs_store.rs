@@ -1502,7 +1502,7 @@ where
         let hash_bytes = hash.to_bytes()?;
         let hash_len = hash_bytes.len();
 
-        let mut next_hash_bytes = hash_bytes.clone();
+        //let mut next_hash_bytes = hash_bytes.clone();
         
         // Increment the hash bytes. This is complex and error-prone for arbitrary Hash types.
         // A safer approach for fixed-size hash (like Hash256) is to increment the last byte
@@ -1515,7 +1515,7 @@ where
         let mut results = Vec::with_capacity(count.min(100)); // Pre-allocate
 
         // Use `SkipMap::range(start_key..)` and manually check the hash prefix
-        let mut iterator = db.range(start_key..);
+        let iterator = db.range(start_key..);
         
         for entry in iterator.take(count) {
             let key = entry.key();

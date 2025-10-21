@@ -13,7 +13,7 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 
 
-const fn get_bucket_for_node(_level: u8, node_index: u64) -> i32 {
+const fn _get_bucket_for_node(_level: u8, node_index: u64) -> i32 {
     // Simple example bucket function: combine level and node_index to create a bucket
     // This is just an example; real implementations may use more complex logic
     (node_index&0xffffu64) as i32

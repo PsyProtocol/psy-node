@@ -1,3 +1,5 @@
+// allow dead code for benches
+#![allow(dead_code)]
 use criterion::{black_box, BenchmarkId, Criterion};
 use parth_core::{data::{hash::hash256::Hash256, maybe_serialization::MaybeSpeedy}, felt::{QFelt, QFelt64}, generic_traits::QNamedType, pgoldilocks::{PGoldilocksFelt, PGoldilocksHash}, protocol::core_types::{QDBHashBase, QFHashBase}, utils::QPGenRandom, PHash, PF};
 use psy_data::v1::qdata::{contract::ContractFunctionCodeDefinition, user::PQEDUserLeaf};

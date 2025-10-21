@@ -4,7 +4,7 @@ use parth_core::data::hash::hash256::Hash256;
 use parth_core::data::hash::merkle_node_key::SimpleMerkleNode;
 use parth_core::utils::signed_helpers::u64_to_i64_exact;
 use parth_core::utils::QPGenRandom;
-use parth_node_scylla::utils::{convert_checkpoint_id_to_i64, u8_to_i8_exact};
+use parth_node_scylla::utils::convert_checkpoint_id_to_i64;
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
 use std::env;
@@ -13,7 +13,7 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 
 
-const fn get_bucket_for_node(_level: u8, node_index: u64) -> i32 {
+const fn _get_bucket_for_node(_level: u8, node_index: u64) -> i32 {
     // Simple example bucket function: combine level and node_index to create a bucket
     // This is just an example; real implementations may use more complex logic
     (node_index&0xffffu64) as i32
