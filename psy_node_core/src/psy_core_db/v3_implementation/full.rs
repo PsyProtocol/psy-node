@@ -1873,7 +1873,59 @@ impl<
     >
 {
     async fn get_contract_tree_heights(&self, checkpoint_id: u64, contract_ids: &[u64]) -> anyhow::Result<Vec<u8>>{
-        self.store.db_select_many_single_checkpointed_object_values::<u8>(&self.contract_state_tree_height_table, contract_ids, checkpoint_id).await?.into_iter().map(|opt| opt.unwrap_or_default()).collect()
+        Ok(self.store.db_select_many_single_checkpointed_object_values::<u8>(&self.contract_state_tree_height_table, contract_ids, checkpoint_id).await?.into_iter().map(|opt| opt.unwrap_or_default()).collect())
+    }
+}
+
+
+#[async_trait]
+impl<
+        N: QNetworkDatabaseTypes,
+        BiDirectionalMappingTableIdentifier: Clone + Send + Sync,
+        BiDirectionalU64U128MappingTableIdentifier: Clone + Send + Sync,
+        U64TableIdentifier: Clone + Send + Sync,
+        SingleIdTableIdentifier: Clone + Send + Sync,
+        DoubleIdTableIdentifier: Clone + Send + Sync,
+        KivTableIdentifier: Clone + Send + Sync,
+        SingleIdMerkleTableIdentifier: Clone + Send + Sync,
+        DoubleIdMerkleTableIdentifier: Clone + Send + Sync,
+        ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
+        TagTreeTableIdentifier: Clone + Send + Sync,
+        HashToManyIdsTableIdentifier: Clone + Send + Sync,
+        S: CoreDatabaseStore<
+                N::QHash,
+                N::HasherBase,
+                BiDirectionalMappingTableIdentifier,
+                BiDirectionalU64U128MappingTableIdentifier,
+                U64TableIdentifier,
+                SingleIdTableIdentifier,
+                DoubleIdTableIdentifier,
+                KivTableIdentifier,
+                SingleIdMerkleTableIdentifier,
+                DoubleIdMerkleTableIdentifier,
+                ZeroIdMerkleTableIdentifier,
+                TagTreeTableIdentifier,
+                HashToManyIdsTableIdentifier,
+            > + Send + Sync,
+    >
+    PsyNodeCoreDatabaseBasicContractInfoStoreWriter<N::F, N::QHash> for PsyUnifiedCoreDatabaseStore<
+        N,
+        BiDirectionalMappingTableIdentifier,
+        BiDirectionalU64U128MappingTableIdentifier,
+        U64TableIdentifier,
+        SingleIdTableIdentifier,
+        DoubleIdTableIdentifier,
+        KivTableIdentifier,
+        SingleIdMerkleTableIdentifier,
+        DoubleIdMerkleTableIdentifier,
+        ZeroIdMerkleTableIdentifier,
+        TagTreeTableIdentifier,
+        HashToManyIdsTableIdentifier,
+        S,
+    >
+{
+    async fn set_contract_tree_heights(&self, checkpoint_id: u64, contract_ids: &[(u64, u8)]) -> anyhow::Result<()>{
+        self.store.db_insert_many_single_checkpointed_objects_at_checkpoint_t::<u8, (u64, u8)>(&self.contract_state_tree_height_table, checkpoint_id, contract_ids).await
     }
 }
 #[async_trait]

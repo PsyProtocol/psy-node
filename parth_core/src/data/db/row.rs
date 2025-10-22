@@ -47,6 +47,14 @@ pub trait QDatabaseSingleIdTableRowNoCheckpointIdLike<V> {
     fn get_row_obj_id(&self) -> u64;
     fn get_row_value_ref(&self) -> &V;
 }
+impl QDatabaseSingleIdTableRowNoCheckpointIdLike<u8> for (u64, u8) {
+    fn get_row_obj_id(&self) -> u64 {
+        self.0
+    }
+    fn get_row_value_ref(&self) -> &u8 {
+        &self.1
+    }
+}
 pub trait QDatabaseSingleIdTableRowLike<V>: QDatabaseSingleIdTableRowNoCheckpointIdLike<V> {
     fn get_row_checkpoint_id(&self) -> u64;
 }

@@ -53,11 +53,7 @@ pub trait PsyCanonicalDatabaseSerializeBaseMultiFixedTemplate<const N: usize>: S
     fn fx_tpl_psy_ser_deserialize_vec_of_self(data: &[u8], include_count: bool) -> anyhow::Result<Vec<Self>>;
     fn fx_tpl_psy_ser_deserialize_vec_of_self_owned(data: Vec<u8>, include_count: bool) -> anyhow::Result<Vec<Self>>;
 }
-impl PsyCanonicalSerializeMetadata for u8 {
-    const IS_FIXED_SIZE: bool = true;
 
-    const FIXED_SIZE: usize = 1;
-}
 impl PsyCanonicalDatabaseSerializeBaseMulti for u8 {
     fn psy_ser_serialize_vec_of_self_ref(data: &[Self], write_count: bool) -> Vec<u8> {
         // This is a high-level API; unwrapping is acceptable if serialization to a Vec
