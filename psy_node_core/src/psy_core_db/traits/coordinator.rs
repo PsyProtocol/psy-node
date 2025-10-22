@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use parth_core::{crypto::hash::merkle_proof::MerkleProofCore, felt::ToU64Value, protocol::core_types::QNetworkDatabaseTypes, QCoreProcCheckpointUniqueId};
+use parth_core::{crypto::hash::merkle_proof::MerkleProofCore, protocol::core_types::QNetworkDatabaseTypes, QCoreProcCheckpointUniqueId};
 use psy_data::v1::qdata::{checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState}, checkpoint_sync::PQEDCheckpointSyncInfoCompact, contract::{ContractCodeDefinition, PQEDContractLeaf}};
 use crate::data::pending::coordinator::{CoordinatorPendingCheckpointDatabase, CoordinatorPendingCheckpointSync};
 

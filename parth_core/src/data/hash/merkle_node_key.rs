@@ -197,22 +197,32 @@ impl SimpleMerkleNodeKey {
             siblings
         }
     }
-    pub fn get_above_path_to_height(&self, to_level: u8) -> Vec<SimpleMerkleNodeKey> {
+    pub fn get_above_path_to_height(&self, to_level: u8, include_root: bool) -> Vec<SimpleMerkleNodeKey> {
         if to_level >= self.level {
             vec![]
         } else {
             let mut my_node = self.parent();
-            let mut path_node_keys = Vec::with_capacity((self.level - to_level - 1) as usize);
+            let mut path_node_keys = Vec::with_capacity((self.level - to_level - if include_root {
+                0
+            } else {
+                1
+            }) as usize);
             while my_node.level != to_level {
                 path_node_keys.push(my_node.clone());
                 my_node = my_node.parent();
+            }
+            if include_root {
+                path_node_keys.push(my_node);
             }
 
             path_node_keys
         }
     }
-    pub fn get_above_path(&self) -> Vec<SimpleMerkleNodeKey> {
-        self.get_above_path_to_height(0)
+    pub fn get_above_path_without_root(&self) -> Vec<SimpleMerkleNodeKey> {
+        self.get_above_path_to_height(0, false)
+    }
+    pub fn get_above_path_including_root(&self) -> Vec<SimpleMerkleNodeKey> {
+        self.get_above_path_to_height(0, true)
     }
 
     pub fn get_path_above_self_to_level(&self, sub_root_level: u8, include_sub_root: bool) -> Vec<SimpleMerkleNodeKey> {

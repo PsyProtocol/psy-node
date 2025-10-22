@@ -7,8 +7,7 @@ use crate::{
     psy_temp_db::{
         tt_get_expected_public_inputs_key, tt_get_expected_public_inputs_key_from_job, tt_get_submit_status_key, tt_get_unique_pending_id_key,
         QTempDBExpectedPublicInputsReader, QTempDBExpectedPublicInputsWriter, QTempDBPendingIdReader, QTempDBPendingIdWriter,
-        QTempDBSubmitStatusReader, QTempDBSubmitStatusWriter, TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_KEY_SIZE,
-        TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_VALUE_SIZE,
+        QTempDBSubmitStatusReader, QTempDBSubmitStatusWriter, TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_VALUE_SIZE,
     },
     store::traits::temp_db::{QTempDatabaseRawKVReaderBase, QTempDatabaseRawKVWriterBase},
 };

@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use parth_core::{crypto::hash::merkle_proof::DeltaMerkleProofCore, protocol::core_types::QHashBase};
 
 

@@ -18,7 +18,7 @@ fn gen_random_semi_realistic_merkle_nodes_for_bench<H: QDBHashBase + QPGenRandom
             level: tree_height,
             index: u64::qp_rand_gen() % max_index,
         };
-        for parent in key.get_above_path() {
+        for parent in key.get_above_path_without_root() {
             nodes.insert(parent, H::from_owned_32bytes(Hash256::rand().0));
         }
         nodes.insert(key, H::from_owned_32bytes(Hash256::rand().0));

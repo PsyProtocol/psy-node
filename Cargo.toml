@@ -157,7 +157,7 @@ psy_node_nats = { path = "./psy_node_nats" }
 
 
 # Dev dependencies
-criterion = { version = "0.5.1", features = ["async_tokio"] }
+criterion = { version = "0.5.1", features = ["async_tokio", "async_futures"] }
 
 [profile.release]
 debug = true

@@ -31,6 +31,42 @@ fn get_tmp_proof_store_ns_key(root_prefix: &str, realm_id: u64, realm_sub_id: u6
     format!("{}-{}-{}-{}", REDIS_TMP_PROOF_STORE_PREFIX, root_prefix, realm_id, realm_sub_id)
 }
 
+/// Create a new bb8-redis connection pool
+///
+/// # Arguments
+///
+/// * `redis_url` - Redis URL to connect to
+/// * `pool_size` - Number of connections in the pool
+pub async fn new_redis_async_pool(redis_url: &str, pool_size: usize) -> anyhow::Result<bb8::Pool<bb8_redis::RedisConnectionManager>> {
+    // Create the connection manager
+    let manager = bb8_redis::RedisConnectionManager::new(redis_url)?;
+
+    // Build the pool with similar configuration to fred pool
+    let pool = bb8::Pool::builder()
+        .max_size(pool_size as u32)
+        .connection_timeout(Duration::from_secs(10))
+        .build(manager)
+        .await?;
+
+    // Optionally add client identification (if supported by redis-rs)
+    // This may require getting a connection and executing a command
+    if let Ok(role) = std::env::var("QED_ROLE") {
+        // Try to set a similar client name if possible
+        // Note: bb8-redis doesn't directly expose CLIENT SETNAME
+        if let Ok(mut conn) = pool.get().await {
+            let _: Result<String, _> = redis::cmd("CLIENT")
+                .arg("SETNAME")
+                .arg(format!("bb8-{}-pool", role))
+                .query_async(&mut *conn)
+                .await;
+        }
+    }
+
+    // Log pool creation
+    tracing::info!("✅ Created bb8-redis connection pool with size {}", pool_size);
+
+    Ok(pool)
+}
 #[derive(Debug, Clone)]
 pub struct StandardRedisStore {
     pub pool: Pool<RedisConnectionManager>,
@@ -566,6 +602,11 @@ impl QTempDatabaseRawKVReaderBase for StandardRedisStore {
             Ok(Some(data))
         }
     }
+    async fn qtdb_raw_kv_get_many_values_vec_owned(&self, keys: Vec<Vec<u8>>) -> anyhow::Result<Vec<Option<Vec<u8>>>>{
+        let data = self.get_many_bytes_generic_internal(&self.kv_store_namespace, &keys).await?;
+        Ok(data.into_iter().map(|v| if v.is_empty() { None } else { Some(v) }).collect())
+    }
+
     async fn qtdb_raw_kv_get_many_values(&self, keys: &[&[u8]]) -> anyhow::Result<Vec<Option<Vec<u8>>>> {
         let data = self.get_many_bytes_generic_internal_ref(&self.kv_store_namespace, keys).await?;
         Ok(data.into_iter().map(|v| if v.is_empty() { None } else { Some(v) }).collect())
@@ -601,6 +642,10 @@ impl QTempDatabaseRawKVWriterBase for StandardRedisStore {
         let mut con = self.pool.get().await?;
         let _: () = con.hset_multiple(&self.kv_store_namespace, entries).await?;
         Ok(())
+    }
+
+    async fn qtdb_raw_kv_put_many_values_tuple_owned(&self, entries: Vec<(Vec<u8>, Vec<u8>)>) -> anyhow::Result<()> {
+        self.set_many_bytes_generic_internal_tuple(&self.kv_store_namespace, &entries).await
     }
     async fn qtdb_raw_kv_put_many_values_buffer<const KEY_SIZE: usize, const VALUE_SIZE: usize>(
         &self,

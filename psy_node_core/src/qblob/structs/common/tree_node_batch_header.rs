@@ -1,4 +1,5 @@
 use anyhow::Context;
+use parth_core::data::hash::fast_node_serializer::{QMS_FAST_SERIALIZER_DOUBLE_ID_NODE_SIZE, QMS_FAST_SERIALIZER_SINGLE_ID_NODE_SIZE, QMS_FAST_SERIALIZER_ZERO_ID_NODE_SIZE};
 
 use crate::qblob::{blob_type::{get_item_size_for_data_type, is_valid_qblob_merkle_node_batch_type, QBlobDataType, QBlobMerkleNodeTreeType, QBLOB_STANDARD_V1_MAGIC_U32}, traits::common::QBlobStructHeaderBase};
 
@@ -59,6 +60,65 @@ pub struct QBlobMerkleTreeNodeBatchHeaderV1 {
 }
 
 impl QBlobMerkleTreeNodeBatchHeaderV1 {
+    pub fn new_double_id_header(tree_type: QBlobMerkleNodeTreeType, chain_id: u32, node_id: u32, realm_id: u64, realm_sub_id: u64, unique_pending_id: u64, for_target_id: u64) -> Self {
+        Self {
+            blob_magic: QBLOB_STANDARD_V1_MAGIC_U32,
+            chain_id,
+            total_size: 0,
+            created_by_node_id: node_id,
+            created_at_seconds: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as u32,
+            blob_type: QBlobDataType::GenericDoubleIdMerkleNodeBatch,
+            tree_type,
+            realm_id,
+            realm_sub_id,
+            unique_pending_id,
+            checkpoint_id: 0,
+            for_target_id,
+            item_count: 0,
+            item_size: QMS_FAST_SERIALIZER_DOUBLE_ID_NODE_SIZE as u32,
+        }
+    }
+    pub fn new_single_id_header(tree_type: QBlobMerkleNodeTreeType, chain_id: u32, node_id: u32, realm_id: u64, realm_sub_id: u64, unique_pending_id: u64, for_target_id: u64) -> Self {
+        Self {
+            blob_magic: QBLOB_STANDARD_V1_MAGIC_U32,
+            chain_id,
+            total_size: 0,
+            created_by_node_id: node_id,
+            created_at_seconds: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as u32,
+            blob_type: QBlobDataType::GenericSingleIdMerkleNodeBatch,
+            tree_type,
+            realm_id,
+            realm_sub_id,
+            unique_pending_id,
+            checkpoint_id: 0,
+            for_target_id,
+            item_count: 0,
+            item_size: QMS_FAST_SERIALIZER_SINGLE_ID_NODE_SIZE as u32,
+        }
+    }
+    pub fn new_zero_id_header(tree_type: QBlobMerkleNodeTreeType, chain_id: u32, node_id: u32, realm_id: u64, realm_sub_id: u64, unique_pending_id: u64, for_target_id: u64) -> Self {
+        Self {
+            blob_magic: QBLOB_STANDARD_V1_MAGIC_U32,
+            chain_id,
+            total_size: 0,
+            created_by_node_id: node_id,
+            created_at_seconds: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as u32,
+            blob_type: QBlobDataType::GenericZeroIdMerkleNodeBatch,
+            tree_type,
+            realm_id,
+            realm_sub_id,
+            unique_pending_id,
+            checkpoint_id: 0,
+            for_target_id,
+            item_count: 0,
+            item_size: QMS_FAST_SERIALIZER_ZERO_ID_NODE_SIZE as u32,
+        }
+    }
+    pub fn modify_for_final_count_and_size(&mut self, item_size: u32, final_item_count: u64) {
+        self.item_count = final_item_count;
+        self.item_size = item_size;
+        self.total_size = QBLOB_TREE_NODE_BATCH_HEADER_SIZE as u64 + (item_size as u64 * final_item_count);
+    }
     pub fn is_valid_for_realm_context(&self, chain_id: u32, realm_id: u64, realm_sub_id: u64, unique_pending_id: u64) -> bool {
         self.is_header_valid() && 
         self.chain_id == chain_id &&
@@ -89,6 +149,13 @@ impl QBlobMerkleTreeNodeBatchHeaderV1 {
     }
     pub fn clip_header_get_payload(full_data: Vec<u8>, expected_blob_type: Option<QBlobDataType>, expected_tree_type: Option<QBlobMerkleNodeTreeType>, exact_size: bool) -> anyhow::Result<(Self, Vec<u8>)> {
         Self::clip_header_get_payload_internal(full_data, expected_blob_type, expected_tree_type, exact_size)
+    }
+
+    pub fn clip_header_get_payload_for_blob_type_and_tree_ref(full_data: &[u8], expected_blob_type: QBlobDataType, expected_tree_type: QBlobMerkleNodeTreeType, exact_size: bool) -> anyhow::Result<(Self, &[u8])> {
+        Self::clip_header_get_payload_internal_ref(full_data, Some(expected_blob_type), Some(expected_tree_type), exact_size)
+    }
+    pub fn clip_header_get_payload_ref(full_data: &[u8], expected_blob_type: Option<QBlobDataType>, expected_tree_type: Option<QBlobMerkleNodeTreeType>, exact_size: bool) -> anyhow::Result<(Self, &[u8])> {
+        Self::clip_header_get_payload_internal_ref(full_data, expected_blob_type, expected_tree_type, exact_size)
     }
 
     fn clip_header_get_payload_internal(mut full_data: Vec<u8>, expected_blob_type: Option<QBlobDataType>, expected_tree_type: Option<QBlobMerkleNodeTreeType>, exact_size: bool) -> anyhow::Result<(Self, Vec<u8>)> {
@@ -169,6 +236,88 @@ impl QBlobMerkleTreeNodeBatchHeaderV1 {
         }
         let _ = full_data.drain(0..QBLOB_TREE_NODE_BATCH_HEADER_SIZE);
         Ok((header, full_data))
+
+    }
+
+
+
+    fn clip_header_get_payload_internal_ref(full_data: &[u8], expected_blob_type: Option<QBlobDataType>, expected_tree_type: Option<QBlobMerkleNodeTreeType>, exact_size: bool) -> anyhow::Result<(Self, &[u8])> {
+
+
+        let full_data_len = full_data.len();
+        if full_data_len < QBLOB_TREE_NODE_BATCH_HEADER_SIZE {
+            return Err(anyhow::anyhow!(
+                "Full data length is less than header size: {} < {}",
+                full_data.len(),
+                QBLOB_TREE_NODE_BATCH_HEADER_SIZE
+            ));
+        }
+        let header = Self::try_read_header_from_slice(&full_data[0..QBLOB_TREE_NODE_BATCH_HEADER_SIZE])?;
+        if !header.is_header_valid() {
+            return Err(anyhow::anyhow!("Invalid header in clip_header_get_payload"));
+        }
+        if expected_blob_type.is_some() && header.blob_type != expected_blob_type.unwrap() {
+            return Err(anyhow::anyhow!(
+                "Header blob_type does not match expected: {:?} != {:?}",
+                header.blob_type,
+                expected_blob_type.unwrap()
+            ));
+        }
+        if expected_tree_type.is_some() && header.tree_type != expected_tree_type.unwrap() {
+            return Err(anyhow::anyhow!(
+                "Header tree_type does not match expected: {:?} != {:?}",
+                header.tree_type,
+                expected_tree_type.unwrap()
+            ));
+        }
+        let expected_item_size = get_item_size_for_data_type(header.blob_type);
+        if expected_item_size.is_none() {
+            return Err(anyhow::anyhow!(
+                "Could not determine expected item size for blob_type: {:?}",
+                header.blob_type
+            ));
+        }
+        let expected_item_size = expected_item_size.unwrap();
+        let full_data_len = full_data.len();
+        let calculated_total_size = QBLOB_TREE_NODE_BATCH_HEADER_SIZE + (header.item_count as usize * expected_item_size);
+        if exact_size {
+            if full_data_len != header.total_size as usize {
+                return Err(anyhow::anyhow!(
+                    "Full data length does not match total_size in header: {} != {}",
+                    full_data_len,
+                    header.total_size
+                ));
+            }else if full_data_len != calculated_total_size {
+                return Err(anyhow::anyhow!(
+                    "Full data length does not match calculated total size from header: {} != {}",
+                    full_data_len,
+                    calculated_total_size
+                ));
+            }
+        }else{
+            if full_data_len < header.total_size as usize {
+                return Err(anyhow::anyhow!(
+                    "Full data length is less than total_size in header: {} < {}",
+                    full_data_len,
+                    header.total_size
+                ));
+            }
+            if full_data_len < calculated_total_size {
+                return Err(anyhow::anyhow!(
+                    "Full data length is less than expected for header item_count and item_size: {} < {}",
+                    full_data_len,
+                    calculated_total_size
+                ));
+            }
+        }
+        if expected_item_size != header.item_size as usize {
+            return Err(anyhow::anyhow!(
+                "Header item_size does not match expected: {} != {}",
+                header.item_size,
+                expected_item_size
+            ));
+        }
+        Ok((header, &full_data[QBLOB_TREE_NODE_BATCH_HEADER_SIZE..]))
 
     }
 }
@@ -252,7 +401,7 @@ impl QBlobStructHeaderBase for QBlobMerkleTreeNodeBatchHeaderV1 {
     fn is_header_valid(&self) -> bool {
         self.blob_magic == QBLOB_STANDARD_V1_MAGIC_U32 && 
         is_valid_qblob_merkle_node_batch_type(self.blob_type, self.tree_type) &&
-        self.item_count > 0 &&
+        // self.item_count > 0 && // allow empty batches
         self.item_size > 0 &&
         self.total_size as usize == QBLOB_TREE_NODE_BATCH_HEADER_SIZE + (self.item_count as usize * self.item_size as usize)
     }

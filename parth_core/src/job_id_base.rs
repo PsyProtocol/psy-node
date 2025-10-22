@@ -1,5 +1,4 @@
-use psy_serialize::PsySerializeCanonicalAsyncSafe;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Serialize};
 
 use crate::data::{queue::queue_key::PCoreQueueItemBase, serializable::QPDSerializableFixed};
 

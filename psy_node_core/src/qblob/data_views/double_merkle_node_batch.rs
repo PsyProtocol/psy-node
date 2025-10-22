@@ -1,8 +1,7 @@
+use std::collections::HashMap;
+
 use parth_core::{
-    data::{
-        hash::{fast_node_serializer::QMS_FAST_SERIALIZER_DOUBLE_ID_NODE_SIZE, merkle_store_key::QMerkleStoreDoubleIdNode},
-    },
-    protocol::core_types::Q256BitHash,
+    crypto::hash::{merkle_proof::compute_root_merkle_proof_generic, traits::MerkleHasher}, data::hash::{fast_node_serializer::QMS_FAST_SERIALIZER_DOUBLE_ID_NODE_SIZE, merkle_store_key::{QMerkleStoreDoubleIdKey, QMerkleStoreDoubleIdNode}}, protocol::core_types::Q256BitHash
 };
 
 use crate::qblob::{
@@ -141,7 +140,7 @@ impl QBlobDoubleMerkleNodeBatchDataView {
         header.to_bytes_fixed_size_array().to_vec()
     }
     pub fn uct_header_from_context_and_counts(
-        context: QBlobWriterContextMetadataHeader,
+        context: &QBlobWriterContextMetadataHeader,
         item_count: u64,
     ) -> QBlobMerkleTreeNodeBatchHeaderV1 {
         let total_size = (QBLOB_TREE_NODE_BATCH_HEADER_SIZE + (item_count as usize * QMS_FAST_SERIALIZER_DOUBLE_ID_NODE_SIZE)) as u64;
@@ -205,17 +204,342 @@ impl QBlobDoubleMerkleNodeBatchDataView {
     }
 }
 
+#[derive(Clone)]
+pub struct QBlobDoubleIdMerkleRecorder {
+    map: HashMap<QMerkleStoreDoubleIdKey, bool>,
+    blob: Vec<u8>,
+}
+
+impl QBlobDoubleIdMerkleRecorder {
+    pub fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+            blob: Vec::new(),
+        }
+    }
+    pub fn new_with_size_hint(size_hint: usize) -> Self {
+        Self {
+            map: HashMap::with_capacity(size_hint),
+            blob: Vec::with_capacity(size_hint * QMS_FAST_SERIALIZER_DOUBLE_ID_NODE_SIZE),
+        }
+    }
+    pub fn new_with_header_and_size_hint(size_hint: usize) -> Self {
+        let map = HashMap::with_capacity(size_hint);
+        let mut blob = Vec::with_capacity(QBLOB_TREE_NODE_BATCH_HEADER_SIZE + size_hint * QMS_FAST_SERIALIZER_DOUBLE_ID_NODE_SIZE);
+        blob.extend(&[0u8; QBLOB_TREE_NODE_BATCH_HEADER_SIZE]);
+        Self {
+            map,
+            blob,
+        }
+    }
+    pub fn record_and_compute_merkle_root<Hash: Q256BitHash, Hasher: MerkleHasher<Hash>>(
+        &mut self,
+        tree_id: u64,
+        tree_sub_id: u64,
+        index: u64,
+        level: u8,
+        value: &Hash,
+        siblings: &[Hash],
+    ) -> Hash {
+        let mut current_node = QMerkleStoreDoubleIdNode {
+            key: QMerkleStoreDoubleIdKey {
+                tree_id,
+                tree_sub_id,
+                level,
+                index,
+            },
+            value: value.clone(),
+        };
+        let mut should_record = self.map.insert(current_node.key.clone(), true).is_none();
+        let mut counter = 0;
+        let max_count = siblings.len().min(level as usize);
+        while should_record && counter < max_count {
+            self.blob.extend_from_slice(&current_node.ffs_to_bytes());
+            current_node.value = Hasher::two_to_one_swap(current_node.key.index&1 == 1, &current_node.value, &siblings[counter]);
+            current_node.key.level -= 1;
+            current_node.key.index >>= 1;
+            counter += 1;
+            should_record = self.map.insert(current_node.key.clone(), true).is_none();
+        }
+        if !should_record {
+            compute_root_merkle_proof_generic::<Hash, Hasher>(current_node.value, index, &siblings[counter..])
+        }else{
+            self.blob.extend_from_slice(&current_node.ffs_to_bytes());
+            current_node.value
+        }
+
+    }
+    pub fn finalize(self) -> Vec<u8> {
+        self.blob
+    }
+
+    pub fn finalize_with_header(self, context: &QBlobWriterContextMetadataHeader) -> Vec<u8> {
+        let blob_len = self.blob.len();
+        let mut blob = self.blob;
+        let size_without_header = blob_len - QBLOB_TREE_NODE_BATCH_HEADER_SIZE;
+        let item_count = size_without_header as u64 / QMS_FAST_SERIALIZER_DOUBLE_ID_NODE_SIZE as u64;
+        blob[0..QBLOB_TREE_NODE_BATCH_HEADER_SIZE].copy_from_slice(&QBlobDoubleMerkleNodeBatchDataView::uct_header_from_context_and_counts(
+            context,
+            item_count,
+        ).to_bytes_fixed_size_array());
+        blob
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
+    use parth_common::memory_stores::mem_tree_v3::SimpleMemoryMerkleStoreV3;
     use parth_core::{
-        data::hash::{hash256::Hash256, merkle_store_key::QMerkleStoreDoubleIdNode},
-        utils::QPGenRandom,
+        crypto::hash::{merkle_proof::{compute_path_merkle_proof_generic, compute_root_merkle_proof_generic}, traits::MerkleZeroHasher}, data::hash::{hash256::Hash256, merkle_node_key::SimpleMerkleNodeKey, merkle_store_key::{QMerkleStoreDoubleIdKey, QMerkleStoreDoubleIdNode}}, pgoldilocks::PoseidonHasher, protocol::core_types::Q256BitHash, utils::QPGenRandom, PHash
     };
+    use parth_crypto::hash::sha256::CoreSha256Hasher;
 
     use crate::qblob::{
-        data_views::double_merkle_node_batch::QBlobDoubleMerkleNodeBatchDataView,
-        structs::common::blob_metadata_header::QBlobWriterContextMetadataHeader,
+        blob_type::{QBlobDataType, QBlobMerkleNodeTreeType}, data_views::double_merkle_node_batch::{QBlobDoubleIdMerkleRecorder, QBlobDoubleMerkleNodeBatchDataView}, structs::common::{blob_metadata_header::QBlobWriterContextMetadataHeader, tree_node_batch_header::QBlobMerkleTreeNodeBatchHeaderV1}
     };
+    
+
+    fn fuzz_merkle_hash_recorder_with_sibling_values_helper<Hash: QPGenRandom + Q256BitHash + std::fmt::Debug + Default, Hasher: MerkleZeroHasher<Hash>>(
+        height: u8,
+        count: usize,
+        with_context: Option<QBlobWriterContextMetadataHeader>
+    ) -> anyhow::Result<()>{
+
+        let mut tree = SimpleMemoryMerkleStoreV3::<Hasher, Hash>::new(height);
+
+        let tree_id = rand::random::<u64>();
+        let tree_sub_id = rand::random::<u64>();
+
+
+        let proofs = (0..count).map(|_|{
+            let index = if height != 64 {
+                rand::random::<u64>() & rand::random::<u64>() & ((1u64 << height) -1)
+            }else{
+                rand::random::<u64>()
+            };
+            let value = Hash::qp_rand_gen();
+            let proof = tree.set_leaf(index, value);
+            proof
+        }).collect::<Vec<_>>();
+
+        let mut recorder = if with_context.is_none() {
+            QBlobDoubleIdMerkleRecorder::new()
+        }else{
+            QBlobDoubleIdMerkleRecorder::new_with_header_and_size_hint(count*height as usize)
+        };
+
+
+        let mut reversed_proofs = proofs.clone();
+        reversed_proofs.reverse();
+
+        for i in 0..reversed_proofs.len() {
+            recorder.record_and_compute_merkle_root::<Hash, Hasher>(
+                tree_id,
+                tree_sub_id,
+                reversed_proofs[i].index,
+                height,
+                &reversed_proofs[i].new_value,
+                &reversed_proofs[i].siblings,
+            );
+
+        }
+        let keys = reversed_proofs.iter().map(|x|{
+            
+            [
+                vec![SimpleMerkleNodeKey::new(height, x.index)],
+                SimpleMerkleNodeKey::new(height, x.index).get_above_path_including_root()
+            ].concat()
+
+        }).flat_map(|v| v).collect::<Vec<_>>();
+
+        let mut seen_keys = HashSet::<SimpleMerkleNodeKey>::new();
+        let mut final_key_set= Vec::new();
+        for i in 0..keys.len() {
+            if !seen_keys.contains(&keys[i]) {
+                seen_keys.insert(keys[i].clone());
+                final_key_set.push(keys[i].clone());
+            }
+        }
+
+        let expected_values = final_key_set.iter().map(|key| {
+            tree.get_node_value(key)
+        }).collect::<Vec<Hash>>();
+
+
+        let expected_nodes = final_key_set.iter().zip(expected_values.iter()).map(|(key, value)| {
+            QMerkleStoreDoubleIdNode {
+                key: QMerkleStoreDoubleIdKey {
+                    tree_id,
+                    tree_sub_id,
+                    level: key.level,
+                    index: key.index,
+                },
+                value: value.clone(),
+            }
+        }).collect::<Vec<_>>();
+
+        let blob = if with_context.is_some() {
+            recorder.finalize_with_header(&with_context.as_ref().unwrap())
+        }else{
+            recorder.finalize()
+        };
+
+        let got_nodes = if with_context.is_none() {
+            QBlobDoubleMerkleNodeBatchDataView::read_batch_double_nodes_from_checked_payload::<Hash>(&blob)?
+        }else{
+            let (header, payload) = QBlobMerkleTreeNodeBatchHeaderV1::clip_header_get_payload_for_blob_type_and_tree_ref(&blob, QBlobDataType::GenericDoubleIdMerkleNodeBatch, QBlobMerkleNodeTreeType::UserContractStateTree, true)?;
+            let context = with_context.unwrap();
+            let chain_id = context.chain_id;
+            let realm_id = context.realm_id;
+
+            let realm_sub_id = context.realm_sub_id;
+            let unique_pending_id = context.unique_pending_id;
+
+            let is_valid = QBlobDoubleMerkleNodeBatchDataView::validate_uct_nodes_batch_header_for_realm_context(&header, chain_id, realm_id, realm_sub_id, unique_pending_id);
+            assert_eq!(is_valid, true, "Header validation failed in test");
+
+            QBlobDoubleMerkleNodeBatchDataView::read_batch_double_nodes_from_checked_payload::<Hash>(&payload)?
+        };
+
+        assert_eq!(expected_nodes, got_nodes, "Expected nodes do not match recorded nodes");
+
+
+
+
+
+
+
+        Ok(())
+
+    }
+
+    #[test]
+    fn test_merkle_hash_recorder_simple() -> anyhow::Result<()>{
+        let height = 16;
+        type Hash = Hash256;
+        type Hasher = CoreSha256Hasher;
+
+        let siblings = Hash::qp_rand_gen_vec(height);
+        let value = Hash::qp_rand_gen();
+        let index = rand::random::<u64>() & ((1u64 << height) -1);
+        let tree_id = rand::random::<u64>();
+        let tree_sub_id = rand::random::<u64>();
+        let mut recorder = QBlobDoubleIdMerkleRecorder::new();
+        let expected_root = compute_root_merkle_proof_generic::<Hash, Hasher>(value.clone(), index, &siblings);
+        let expected_path = compute_path_merkle_proof_generic::<Hash, Hasher>(value, index, &siblings);
+        let computed_recorded_root = recorder.record_and_compute_merkle_root::<Hash, Hasher>(tree_id, tree_sub_id, index, height as u8, &value, &siblings);
+        assert_eq!(expected_path.len(), height + 1, "Expected path length does not match height");
+        assert_eq!(expected_path.last().unwrap(), &expected_root, "last expected path node does not match root");
+        assert_eq!(expected_path[0], value, "first expected path node does not match leaf value");
+        assert_eq!(computed_recorded_root, expected_root, "Computed root does not match expected root");
+        let decoded_path_nodes = QBlobDoubleMerkleNodeBatchDataView::read_batch_double_nodes_from_checked_payload::<Hash>(&recorder.blob)?;
+        let decoded_path_hashes = decoded_path_nodes.iter().map(|x| x.value.clone()).collect::<Vec<_>>();
+        assert_eq!(decoded_path_hashes, expected_path, "Decoded path hashes do not match expected path");
+        let leaf_key = QMerkleStoreDoubleIdKey {
+            tree_id,
+            tree_sub_id,
+            level: height as u8,
+            index,
+        };
+
+        let key_path_above = leaf_key.get_above_path_including_root();
+        assert!(key_path_above.len() + 1 == expected_path.len(), "Key path length does not match expected path length");
+        let mut combined_keys = Vec::new();
+        combined_keys.push(leaf_key);
+        combined_keys.extend_from_slice(&key_path_above);
+
+        assert_eq!(combined_keys.len(), expected_path.len(), "Combined keys length does not match expected path length");
+
+        let expected_double_id_nodes = combined_keys.into_iter().zip(expected_path.into_iter()).map(|(key, value)| {
+            QMerkleStoreDoubleIdNode {
+                key,
+                value,
+            }
+        }).collect::<Vec<_>>();
+
+        assert_eq!(decoded_path_nodes, expected_double_id_nodes, "Decoded path nodes do not match expected nodes");
+
+        
+
+
+
+
+
+        Ok(())
+    }
+
+
+    #[test]
+    fn test_merkle_hash_recorder_multiple_proofs() -> anyhow::Result<()>{
+        for i in 0..16 {
+            fuzz_merkle_hash_recorder_with_sibling_values_helper::<Hash256, CoreSha256Hasher>(3, i, None).unwrap();
+        }
+        fuzz_merkle_hash_recorder_with_sibling_values_helper::<Hash256, CoreSha256Hasher>(3, 255, None).unwrap();
+
+        fuzz_merkle_hash_recorder_with_sibling_values_helper::<Hash256, CoreSha256Hasher>(3, 2, None).unwrap();
+        fuzz_merkle_hash_recorder_with_sibling_values_helper::<Hash256, CoreSha256Hasher>(3, 2, None).unwrap();
+
+        fuzz_merkle_hash_recorder_with_sibling_values_helper::<Hash256, CoreSha256Hasher>(24, 10, None).unwrap();
+        fuzz_merkle_hash_recorder_with_sibling_values_helper::<Hash256, CoreSha256Hasher>(32, 32, None).unwrap();
+        fuzz_merkle_hash_recorder_with_sibling_values_helper::<Hash256, CoreSha256Hasher>(64, 23, None).unwrap();
+        fuzz_merkle_hash_recorder_with_sibling_values_helper::<Hash256, CoreSha256Hasher>(54, 32, None).unwrap();
+        fuzz_merkle_hash_recorder_with_sibling_values_helper::<Hash256, CoreSha256Hasher>(11, 6000, None).unwrap();
+
+
+
+
+        for i in 0..16 {
+            fuzz_merkle_hash_recorder_with_sibling_values_helper::<PHash, PoseidonHasher>(3, i, None).unwrap();
+        }
+        fuzz_merkle_hash_recorder_with_sibling_values_helper::<PHash, PoseidonHasher>(3, 255, None).unwrap();
+
+        fuzz_merkle_hash_recorder_with_sibling_values_helper::<PHash, PoseidonHasher>(3, 2, None).unwrap();
+        fuzz_merkle_hash_recorder_with_sibling_values_helper::<PHash, PoseidonHasher>(3, 2, None).unwrap();
+
+        fuzz_merkle_hash_recorder_with_sibling_values_helper::<PHash, PoseidonHasher>(24, 10, None).unwrap();
+        fuzz_merkle_hash_recorder_with_sibling_values_helper::<PHash, PoseidonHasher>(32, 32, None).unwrap();
+        fuzz_merkle_hash_recorder_with_sibling_values_helper::<PHash, PoseidonHasher>(64, 18, None).unwrap();
+        fuzz_merkle_hash_recorder_with_sibling_values_helper::<PHash, PoseidonHasher>(54, 12, None).unwrap();
+        fuzz_merkle_hash_recorder_with_sibling_values_helper::<PHash, PoseidonHasher>(16, 142, None).unwrap();
+
+
+        let context = QBlobWriterContextMetadataHeader::new_at_now(1337, 124, 99, 10, 18247124124, 100101201, 114881);
+
+        for i in 0..16 {
+            fuzz_merkle_hash_recorder_with_sibling_values_helper::<Hash256, CoreSha256Hasher>(3, i, Some(context)).unwrap();
+        }
+        fuzz_merkle_hash_recorder_with_sibling_values_helper::<Hash256, CoreSha256Hasher>(3, 255, Some(context)).unwrap();
+
+        fuzz_merkle_hash_recorder_with_sibling_values_helper::<Hash256, CoreSha256Hasher>(3, 2, Some(context)).unwrap();
+        fuzz_merkle_hash_recorder_with_sibling_values_helper::<Hash256, CoreSha256Hasher>(3, 2, Some(context)).unwrap();
+
+        fuzz_merkle_hash_recorder_with_sibling_values_helper::<Hash256, CoreSha256Hasher>(24, 10, Some(context)).unwrap();
+        fuzz_merkle_hash_recorder_with_sibling_values_helper::<Hash256, CoreSha256Hasher>(32, 32, Some(context)).unwrap();
+        fuzz_merkle_hash_recorder_with_sibling_values_helper::<Hash256, CoreSha256Hasher>(64, 23, Some(context)).unwrap();
+        fuzz_merkle_hash_recorder_with_sibling_values_helper::<Hash256, CoreSha256Hasher>(54, 32, Some(context)).unwrap();
+        fuzz_merkle_hash_recorder_with_sibling_values_helper::<Hash256, CoreSha256Hasher>(11, 6000, Some(context)).unwrap();
+
+
+
+
+        for i in 0..16 {
+            fuzz_merkle_hash_recorder_with_sibling_values_helper::<PHash, PoseidonHasher>(3, i, Some(context)).unwrap();
+        }
+        fuzz_merkle_hash_recorder_with_sibling_values_helper::<PHash, PoseidonHasher>(3, 255, Some(context)).unwrap();
+
+        fuzz_merkle_hash_recorder_with_sibling_values_helper::<PHash, PoseidonHasher>(3, 2, Some(context)).unwrap();
+        fuzz_merkle_hash_recorder_with_sibling_values_helper::<PHash, PoseidonHasher>(3, 2, Some(context)).unwrap();
+
+        fuzz_merkle_hash_recorder_with_sibling_values_helper::<PHash, PoseidonHasher>(24, 10, Some(context)).unwrap();
+        fuzz_merkle_hash_recorder_with_sibling_values_helper::<PHash, PoseidonHasher>(32, 32, Some(context)).unwrap();
+        fuzz_merkle_hash_recorder_with_sibling_values_helper::<PHash, PoseidonHasher>(64, 18, Some(context)).unwrap();
+        fuzz_merkle_hash_recorder_with_sibling_values_helper::<PHash, PoseidonHasher>(54, 12, Some(context)).unwrap();
+        fuzz_merkle_hash_recorder_with_sibling_values_helper::<PHash, PoseidonHasher>(16, 142, Some(context)).unwrap();
+        Ok(())
+    }
 
     #[test]
     fn check_round_trip() -> anyhow::Result<()> {

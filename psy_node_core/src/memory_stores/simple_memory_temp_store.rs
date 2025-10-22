@@ -143,6 +143,10 @@ impl QTempDatabaseRawKVReaderBase for SimpleMemoryTempStore {
         let kv_map = self.kv_map.read().map_err(|e| anyhow::anyhow!(e.to_string()))?;
         Ok(keys.iter().map(|key| kv_map.get(key).cloned()).collect())
     }
+    async fn qtdb_raw_kv_get_many_values_vec_owned(&self, keys: Vec<Vec<u8>>) -> anyhow::Result<Vec<Option<Vec<u8>>>> {
+        let kv_map = self.kv_map.read().map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        Ok(keys.iter().map(|key| kv_map.get(key).cloned()).collect())
+    }
     async fn qtdb_raw_kv_contains_key(&self, key: &[u8]) -> anyhow::Result<bool> {
         Ok(self.kv_map.read().map_err(|e| anyhow::anyhow!(e.to_string()))?.contains_key(key))
     }
@@ -164,6 +168,14 @@ impl QTempDatabaseRawKVWriterBase for SimpleMemoryTempStore {
         }
         Ok(())
     }
+    async fn qtdb_raw_kv_put_many_values_tuple_owned(&self, entries: Vec<(Vec<u8>, Vec<u8>)>) -> anyhow::Result<()> {
+        let mut kv_map = self.kv_map.write().map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        for (key, value) in entries {
+            kv_map.insert(key, value);
+        }
+        Ok(())
+    }
+
     async fn qtdb_raw_kv_put_many_values_tuple(&self, entries: &[(Vec<u8>, Vec<u8>)]) -> anyhow::Result<()> {
         let mut kv_map = self.kv_map.write().map_err(|e| anyhow::anyhow!(e.to_string()))?;
         for (key, value) in entries {

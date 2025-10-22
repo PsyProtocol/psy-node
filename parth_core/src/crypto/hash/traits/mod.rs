@@ -8,4 +8,4 @@ pub use hash::*;
 pub use merkle::*;
 pub use felt_hash::*;
 pub use data_hasher::*;
-pub use hashable::*;
+//pub use hashable::*;

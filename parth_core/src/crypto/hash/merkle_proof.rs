@@ -80,6 +80,19 @@ pub fn compute_root_merkle_proof_generic<Hash, H: MerkleHasher<Hash>>(value: Has
     current
 }
 
+
+pub fn compute_path_merkle_proof_generic<Hash: Copy, H: MerkleHasher<Hash>>(value: Hash, mut index: u64, siblings: &[Hash]) -> Vec<Hash> {
+    let mut current = value;
+    let mut merkle_path = Vec::with_capacity(siblings.len() + 1);
+    merkle_path.push(current);
+    for sibling in siblings.iter(){
+        current = H::two_to_one_swap((index&1) == 1, &current, sibling);
+        merkle_path.push(current);
+        index >>= 1;
+    }
+    merkle_path
+}
+
 pub fn verify_merkle_proof_core<Hash: PartialEq + Copy, Hasher: MerkleHasher<Hash>>(proof: &MerkleProofCore<Hash>) -> bool {
     if proof.siblings.len() > 64 {
         return false;
