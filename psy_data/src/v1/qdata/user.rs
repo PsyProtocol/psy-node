@@ -135,6 +135,22 @@ impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for PQEDUserLeaf<F, Hash> {
     }
 
 }
+
+
+impl<F: QPGenRandom + QFelt64, Hash: QPGenRandom> PQEDUserLeaf<F, Hash> {
+    pub fn random_with_user_id(user_id: u64) -> Self {
+        PQEDUserLeaf {
+            public_key: Hash::qp_rand_gen(),
+            user_state_tree_root: Hash::qp_rand_gen(),
+            balance: F::qp_rand_gen(),
+            nonce: F::qp_rand_gen(),
+            last_checkpoint_id: F::qp_rand_gen(),
+            event_index: F::qp_rand_gen(),
+            user_id: F::from_owned_u64(user_id),
+        }
+    }
+
+}
 impl<F: QFelt64, Hash: QFHashBase<F>> QFieldHashable<F, Hash> for PQEDUserLeaf<F, Hash> {
     fn qfhash<H: FieldQHasher<F, Hash>>(&self) -> Hash {
         let public_key_felts = self.public_key.to_4_felts();

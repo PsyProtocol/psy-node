@@ -90,6 +90,18 @@ impl SimpleMerkleNodeKey {
         }
         result
     }
+    pub fn siblings_to_level(&self, to_level: u8) -> Vec<Self> {
+        if to_level >= self.level {
+            return vec![];
+        }
+        let mut result = Vec::with_capacity((self.level - to_level) as usize);
+        let mut current = *self;
+        for _ in 0..(self.level - to_level) {
+            result.push(current.sibling());
+            current = current.parent();
+        }
+        result
+    }
 
     // if self or other are on the same merkle path
     pub fn is_direct_path_related(&self, other: &SimpleMerkleNodeKey) -> bool {

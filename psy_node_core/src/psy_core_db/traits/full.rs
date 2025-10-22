@@ -219,6 +219,7 @@ pub trait PsyNodeCheckpointObjectDatabaseWriter<F, Hash> {
     async fn set_latest_checkpoint_id(&self, checkpoint_id: u64) -> anyhow::Result<()>;
     async fn set_checkpoint_leaf_data(&self, checkpoint_id: u64, leaf_data: &PQEDCheckpointLeaf<F, Hash>) -> anyhow::Result<()>;
     async fn set_checkpoint_root_hash_to_id_mapping(&self, checkpoint_root: Hash, checkpoint_id: u64) -> anyhow::Result<()>;
+    async fn set_l2_latest_block_state(&self, block_state: &QEDL2BlockState) -> anyhow::Result<()>;
     async fn set_l2_block_state(&self, checkpoint_id: u64, block_state: &QEDL2BlockState) -> anyhow::Result<()>;
     async fn set_checkpoint_global_state_roots(&self, checkpoint_id: u64, roots: &PQEDCheckpointGlobalStateRoots<Hash>) -> anyhow::Result<()>;
     async fn set_realm_rewards_tag_tree_top_proof_at_unique_pending_id(

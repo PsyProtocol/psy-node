@@ -197,7 +197,7 @@ pub async fn db_helper_record_update_single_id_merkle_node_to_level_dmp<
     sub_root_level: u8,
     node: &SimpleMerkleNode<Hash>,
 ) -> anyhow::Result<DeltaMerkleProofCore<Hash>> {
-    let mut lookup = node.key.siblings();
+    let mut lookup = node.key.siblings_to_level(sub_root_level);
     lookup.push(node.key.clone());
     lookup.push(node.key.parent_at_level(sub_root_level));
     let mut results = reader
@@ -235,7 +235,7 @@ pub async fn db_helper_record_cache_update_single_id_merkle_node_to_level_dmp<
     sub_root_level: u8,
     node: &SimpleMerkleNode<Hash>,
 ) -> anyhow::Result<DeltaMerkleProofCore<Hash>> {
-    let mut lookup = node.key.siblings();
+    let mut lookup = node.key.siblings_to_level(sub_root_level);
     lookup.push(node.key.clone());
     lookup.push(node.key.parent_at_level(sub_root_level));
     let mut results = db_select_many_single_id_merkle_node_max_checkpoint_with_cache(reader, table, checkpoint_id, tree_id, tree_height, &lookup, merkle_updater)
@@ -294,7 +294,7 @@ pub async fn db_helper_select_zero_id_merkle_proof_max_checkpoint_to_root_level<
     root_level: u8,
     key: &SimpleMerkleNodeKey,
 ) -> anyhow::Result<MerkleProofCore<Hash>> {
-    let mut lookup = key.siblings();
+    let mut lookup = key.siblings_to_level(root_level);
     lookup.push(key.clone());
     lookup.push(key.parent_at_level(root_level));
     let mut results = reader
@@ -327,7 +327,7 @@ pub async fn db_helper_record_update_zero_id_merkle_node_to_level_dmp<
     sub_root_level: u8,
     node: &SimpleMerkleNode<Hash>,
 ) -> anyhow::Result<DeltaMerkleProofCore<Hash>> {
-    let mut lookup = node.key.siblings();
+    let mut lookup = node.key.siblings_to_level(sub_root_level);
     lookup.push(node.key.clone());
     lookup.push(node.key.parent_at_level(sub_root_level));
     let mut results = reader

@@ -133,15 +133,15 @@ impl SimpleStoreEx {
         // mappings
         let public_key_hash_to_user_ids_table = Arc::new(InMemoryTableIdentifier::new_with_keyspace(&keyspace, "public_key_hash_to_user_ids_table"));
         // start trees
-        let global_user_tree_table = Arc::new(InMemoryTableIdentifier::new_with_keyspace(&keyspace, "global_user_tree_table"));
-        let user_contract_tree_table = Arc::new(InMemoryTableIdentifier::new_with_keyspace(&keyspace, "user_contract_tree_table"));
+        let global_user_tree_table = Arc::new(InMemoryTableIdentifier::new_treee_with_keyspace(&keyspace, "global_user_tree_table", SimpleTestNetworkConfig::GLOBAL_USER_TREE_HEIGHT));
+        let user_contract_tree_table = Arc::new(InMemoryTableIdentifier::new_treee_with_keyspace(&keyspace, "user_contract_tree_table", SimpleTestNetworkConfig::GLOBAL_CONTRACT_TREE_HEIGHT));
         let contract_state_tree_table = Arc::new(InMemoryTableIdentifier::new_with_keyspace(&keyspace, "contract_state_tree_table"));
-        let global_checkpoint_tree_table = Arc::new(InMemoryTableIdentifier::new_with_keyspace(&keyspace, "global_checkpoint_tree_table"));
+        let global_checkpoint_tree_table = Arc::new(InMemoryTableIdentifier::new_treee_with_keyspace(&keyspace, "global_checkpoint_tree_table", SimpleTestNetworkConfig::CHECKPOINT_TREE_HEIGHT));
         // start reward tree table
         let guta_reward_tag_tree_table = Arc::new(InMemoryTableIdentifier::new_with_keyspace(&keyspace, "guta_reward_tag_tree_table"));
         // added tables for completeness
-        let user_registration_tree_table = Arc::new(InMemoryTableIdentifier::new_with_keyspace(&keyspace, "user_registration_tree_table"));
-        let global_contract_tree_table = Arc::new(InMemoryTableIdentifier::new_with_keyspace(&keyspace, "global_contract_tree_table"));
+        let user_registration_tree_table = Arc::new(InMemoryTableIdentifier::new_treee_with_keyspace(&keyspace, "user_registration_tree_table", SimpleTestNetworkConfig::GLOBAL_USER_TREE_HEIGHT));
+        let global_contract_tree_table = Arc::new(InMemoryTableIdentifier::new_treee_with_keyspace(&keyspace, "global_contract_tree_table", SimpleTestNetworkConfig::GLOBAL_CONTRACT_TREE_HEIGHT));
         let contract_function_tree_table = Arc::new(InMemoryTableIdentifier::new_with_keyspace(&keyspace, "contract_function_tree_table"));
         let contract_leaf_table = Arc::new(InMemoryTableIdentifier::new_with_keyspace(&keyspace, "contract_leaf_table"));
         let contract_code_definition_table = Arc::new(InMemoryTableIdentifier::new_with_keyspace(&keyspace, "contract_code_definition_table"));

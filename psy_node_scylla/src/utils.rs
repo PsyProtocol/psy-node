@@ -34,10 +34,13 @@ pub const fn convert_i64_to_checkpoint_id(checkpoint_id: i64) -> u64 {
 
 pub fn calc_best_batch_size(num_nodes: usize, batch_sizes: &[usize]) -> usize {
 
+    if batch_sizes.is_empty() {
+        return 1;
+    }
     let batch_size = batch_sizes
         .iter()
         .find(|&&size| num_nodes >= size && (num_nodes % size == 0 || num_nodes / size >= 1))
-        .unwrap_or(&32);
+        .unwrap_or(&batch_sizes[batch_sizes.len() - 1]);
 
     *batch_size
 }

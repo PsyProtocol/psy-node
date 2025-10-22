@@ -103,14 +103,25 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash> + Send + Sync> InMemoryCore
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct InMemoryTableIdentifier {
     pub full_name: String,
+    pub tree_height: u8,
 }
 impl InMemoryTableIdentifier {
+    pub fn new_tree(full_name: String, tree_height: u8) -> Self {
+        Self { full_name, tree_height }
+    }
+    pub fn new_treee_with_keyspace(keyspace: &str, table_name: &str, tree_height: u8) -> Self {
+        Self {
+            full_name: format!("{}-{}", keyspace, table_name),
+            tree_height,
+        }
+    }
     pub fn new(full_name: String) -> Self {
-        Self { full_name }
+        Self { full_name, tree_height: 0 }
     }
     pub fn new_with_keyspace(keyspace: &str, table_name: &str) -> Self {
         Self {
             full_name: format!("{}-{}", keyspace, table_name),
+            tree_height: 0,
         }
     }
 }
@@ -1070,7 +1081,11 @@ where
         let start_key = key_helpers::key_merkle_zero_id(key, 0);
         let end_key = key_helpers::key_merkle_zero_id(key, max_checkpoint_id);
         
-        let tree_height = if table.to_string().contains("TableA") { 32 } else { 22 }; // HACK for tests
+        let tree_height = if table.tree_height == 0 {
+            if table.to_string().contains("TableA") { 32 } else { 22 } // HACK for tests
+        }else{
+            table.tree_height
+        };
 
         let entry = db.range(start_key..=end_key).next_back();
         if let Some(e) = entry {

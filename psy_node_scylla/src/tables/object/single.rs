@@ -219,7 +219,7 @@ async fn insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_st
             128 => &self.insert_batch_serialized_128_prepared,
             64 => &self.insert_batch_serialized_64_prepared,
             //32 => &self.insert_batch_serialized_32_prepared,
-            _ => anyhow::bail!("Unsupported batch size"),
+            _ => anyhow::bail!("Unsupported batch size {}", batch_size),
         };
 
         // Process batches concurrently

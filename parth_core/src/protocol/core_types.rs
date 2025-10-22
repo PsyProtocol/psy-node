@@ -27,7 +27,7 @@ pub trait Q256BitHashNonTransparent: Q256BitHash {
 }
 pub trait QDBHashBase: QHash256Base + Q256BitHash  {}
 impl<T: QHash256Base + Q256BitHash> QDBHashBase for T {}
-pub trait QHashBase: PartialEq + ZeroableHash + Copy + Serialize + DeserializeOwned + QPDSerializable + QPDSerializableFixed + Sync + Send + FromU64x4 + TS + Default + CoreDatabaseValueDeserialize + QDatabasePrimitiveKey + RandomHash + QNamedType + MaybeSpeedy + MaybeBytemuck  {}
+pub trait QHashBase: PartialEq + ZeroableHash + Copy + Clone + Serialize + DeserializeOwned + QPDSerializable + QPDSerializableFixed + Sync + Send + FromU64x4 + TS + Default + CoreDatabaseValueDeserialize + QDatabasePrimitiveKey + RandomHash + QNamedType + MaybeSpeedy + MaybeBytemuck + std::fmt::Debug  {}
 pub trait QHash256Base: QHashBase + Q256BitHash {}
 impl<T: QHashBase + Q256BitHash> QHash256Base for T {}
 pub trait QFHashBase<F: QFelt64>: QHashBase + HashTo4Felts<F> {}
