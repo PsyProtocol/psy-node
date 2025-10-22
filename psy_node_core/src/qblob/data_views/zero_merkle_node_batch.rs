@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use parth_core::{
-    crypto::hash::{merkle_proof::compute_root_merkle_proof_generic, traits::MerkleHasher},
+    crypto::hash::{merkle_proof::{compute_root_merkle_proof_generic, DeltaMerkleProofCore}, traits::MerkleHasher},
     data::hash::{
         fast_node_serializer::QMS_FAST_SERIALIZER_ZERO_ID_NODE_SIZE, merkle_node_key::SimpleMerkleNodeKey, merkle_store_key::QMerkleStoreZeroIdNode,
     },
@@ -255,6 +255,35 @@ impl QBlobZeroIdMerkleRecorder {
         let mut blob = Vec::with_capacity(QBLOB_TREE_NODE_BATCH_HEADER_SIZE + size_hint * QMS_FAST_SERIALIZER_ZERO_ID_NODE_SIZE);
         blob.extend(&[0u8; QBLOB_TREE_NODE_BATCH_HEADER_SIZE]);
         Self { map, blob }
+    }
+
+
+    pub fn record_and_compute_merkle_root_validate_delta_merkle_proof<Hash: Q256BitHash + Copy, Hasher: MerkleHasher<Hash>>(
+        &mut self,
+        leaf_level: u8,
+        proof: &DeltaMerkleProofCore<Hash>,
+    ) -> anyhow::Result<Hash> {
+        if (leaf_level as usize) < proof.siblings.len() {
+            anyhow::bail!("leaf level is less than siblings length");
+        }
+        let old_proof_computed_root = compute_root_merkle_proof_generic::<Hash, Hasher>(
+            proof.old_value,
+            proof.index,
+            &proof.siblings,
+        );
+        if old_proof_computed_root != proof.old_root {
+            anyhow::bail!("Delta merkle proof old root does not match computed old root");
+        }
+        let new_computed_root = self.record_and_compute_merkle_root::<Hash, Hasher>(
+            proof.index,
+            leaf_level,
+            &proof.new_value,
+            &proof.siblings,
+        );
+        if new_computed_root != proof.new_root {
+            anyhow::bail!("Delta merkle proof new root does not match computed new root");
+        }
+        Ok(new_computed_root)
     }
     pub fn record_and_compute_merkle_root<Hash: Q256BitHash, Hasher: MerkleHasher<Hash>>(
         &mut self,
