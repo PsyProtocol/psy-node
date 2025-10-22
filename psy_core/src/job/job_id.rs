@@ -1,6 +1,6 @@
 // fix new_two_to_one_proof_id to implement all the proof types and also use a more elegant syntax... there must be something better than those aweful match if else...
 use hex::FromHexError;
-use parth_core::{data::{hash::merkle_node_key::{SimpleMerkleNodeKey, JOB_ID_EMPTY_REWARD_PATH_INFO}, queue::queue_key::PCoreQueueItemBase, serializable::{QPDSerializable, QPDSerializableFixed}}, QJobIdBase, QJobIdCreatable, QJobIdSerialized, QProvingJobDataIDWithRewardPath};
+use parth_core::{data::{hash::merkle_node_key::{SimpleMerkleNodeKey, JOB_ID_EMPTY_REWARD_PATH_INFO}, queue::queue_key::PCoreQueueItemBase, serializable::{QPDSerializable, QPDSerializableFixed}}, utils::QPGenRandom, QJobIdBase, QJobIdCreatable, QJobIdSerialized, QProvingJobDataIDWithRewardPath};
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use serde_with::serde_as;
@@ -361,6 +361,20 @@ pub struct QProvingJobDataID {
     pub task_index: u32,
     pub data_type: ProvingJobDataType,
     pub data_index: u8,
+}
+impl QPGenRandom for QProvingJobDataID {
+    fn qp_rand_gen() -> Self where Self: Sized {
+        Self {
+            topic: QJobTopic::GenerateStandardProof,
+            goal_id: QPGenRandom::qp_rand_gen(),
+            circuit_type: ProvingJobCircuitType::BatchDeployContractsAggregate,
+            group_id: QPGenRandom::qp_rand_gen(),
+            sub_group_id: QPGenRandom::qp_rand_gen(),
+            task_index: QPGenRandom::qp_rand_gen(),
+            data_type: ProvingJobDataType::InputWitness,
+            data_index: QPGenRandom::qp_rand_gen(),
+        }
+    }
 }
 impl QProvingJobDataID {
     pub fn with_empty_reward_path(&self) -> QProvingJobDataIDWithRewardPath<Self> {

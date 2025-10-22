@@ -128,26 +128,32 @@ impl StandardRedisStore {
             .hset_multiple(ns_key, &items.into_iter().map(|x| (&x.key, &x.value)).collect::<Vec<_>>())
             .await?;
         Ok(())
-    }
+    } // In impl StandardRedisStore
+
     pub async fn get_iu64_generic_internal(&self, ns_key: &str, key: &[u8]) -> anyhow::Result<u64> {
         let mut con = self.pool.get().await?;
-        let data: Vec<u8> = con.hget(ns_key, key).await?;
-        if data.len() == 8 {
-            let mut array = [0u8; 8];
-            array.copy_from_slice(&data);
-            let value = i64::from_le_bytes(array);
-            if value < 0 {
-                Ok(0)
-            } else {
-                Ok(value as u64)
-            }
-        } else {
+
+        // Ask redis-rs to get the value and parse it as an i64.
+        // This correctly handles parsing the string "5" into the number 5.
+        // If the key does not exist, HGET returns NIL, which redis-rs maps to Ok(None).
+        let value: Option<i64> = con.hget(ns_key, key).await?;
+
+        // If the key didn't exist, value is None. Default to 0 in that case.
+        let value = value.unwrap_or(0);
+
+        // Maintain the original function's behavior of clamping negative numbers to 0.
+        if value < 0 {
             Ok(0)
+        } else {
+            Ok(value as u64)
         }
     }
     pub async fn set_iu64_generic_internal(&self, ns_key: &str, key: &[u8], value: i64) -> anyhow::Result<()> {
         let mut con = self.pool.get().await?;
-        let _: () = con.hset(ns_key, key, &value.to_le_bytes()[..]).await?;
+        // Store the value as a string, which is compatible with HINCRBY.
+        // The redis-rs crate will automatically convert the i64 to its string
+        // representation.
+        let _: () = con.hset(ns_key, key, value).await?;
         Ok(())
     }
 
@@ -429,7 +435,7 @@ impl QStandardEphemeralQueuePublisher for StandardRedisStore {
         Ok(())
     }
 }
-
+/*
 #[async_trait]
 impl QStandardEphemeralQueueSubscriber for StandardRedisStore {
     async fn wait_for_ephemeral_queue_item_bytes<QK: PCoreStandardQueueKeyForRealm>(
@@ -545,6 +551,138 @@ impl QStandardEphemeralQueueSubscriber for StandardRedisStore {
     }
 }
 
+*/
+#[async_trait]
+impl QStandardEphemeralQueueSubscriber for StandardRedisStore {
+    async fn wait_for_ephemeral_queue_item_bytes<QK: PCoreStandardQueueKeyForRealm>(
+        &self,
+        queue_key: &QK,
+        realm_id: u64,
+        realm_sub_id: u64,
+        unique_id: QCoreProcCheckpointUniqueId,
+        task_group: u32,
+        timeout_ms: u64,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        let subject = queue_key.get_queue_subject(&self.root_prefix, realm_id, realm_sub_id, unique_id, task_group);
+        let mut con = self.pool.get().await?;
+        let start = tokio::time::Instant::now();
+        let timeout_duration = Duration::from_millis(timeout_ms);
+        loop {
+            // FIX: Expect a Vec<Vec<u8>> and take the first element.
+            let items: Vec<Vec<u8>> = con.lpop(&subject, NonZeroUsize::new(1)).await?;
+            if let Some(i) = items.into_iter().next() {
+                return Ok(Some(i));
+            } else {
+                if start.elapsed() >= timeout_duration {
+                    return Ok(None);
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+
+    async fn wait_for_ephemeral_queue_item<QK: PCoreStandardQueueKeyForRealm>(
+        &self,
+        queue_key: &QK,
+        realm_id: u64,
+        realm_sub_id: u64,
+        unique_id: QCoreProcCheckpointUniqueId,
+        task_group: u32,
+        timeout_ms: u64,
+    ) -> anyhow::Result<Option<QK::QueueItem>> {
+        // This function calls the one above, so we just need to fix that one.
+        // For clarity, here is the corrected logic directly.
+        let subject = queue_key.get_queue_subject(&self.root_prefix, realm_id, realm_sub_id, unique_id, task_group);
+        let mut con = self.pool.get().await?;
+        let start = tokio::time::Instant::now();
+        let timeout_duration = Duration::from_millis(timeout_ms);
+        loop {
+            // FIX: Expect a Vec<Vec<u8>> and take the first element.
+            let items: Vec<Vec<u8>> = con.lpop(&subject, NonZeroUsize::new(1)).await?;
+            if let Some(i) = items.into_iter().next() {
+                return Ok(Some(QK::QueueItem::decode_queue_item_ref(&i)?));
+            } else {
+                if start.elapsed() >= timeout_duration {
+                    return Ok(None);
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+
+    async fn dump_entire_ephemeral_queue_bytes<QK: PCoreStandardQueueKeyForRealm>(
+        &self,
+        queue_key: &QK,
+        realm_id: u64,
+        realm_sub_id: u64,
+        unique_id: QCoreProcCheckpointUniqueId,
+        task_group: u32,
+        max_items: usize,
+    ) -> anyhow::Result<Vec<Vec<u8>>> {
+        let subject = queue_key.get_queue_subject(&self.root_prefix, realm_id, realm_sub_id, unique_id, task_group);
+        let mut con = self.pool.get().await?;
+        // This function uses lrange/ltrim, which is correct and does not need fixing.
+        let items: Vec<Vec<u8>> = con.lrange(&subject, 0, (max_items as isize) - 1).await?;
+        let _: () = con.ltrim(&subject, items.len() as isize, -1).await?;
+        Ok(items)
+    }
+
+    async fn dump_entire_ephemeral_queue<QK: PCoreStandardQueueKeyForRealm>(
+        &self,
+        queue_key: &QK,
+        realm_id: u64,
+        realm_sub_id: u64,
+        unique_id: QCoreProcCheckpointUniqueId,
+        task_group: u32,
+        max_items: usize,
+    ) -> anyhow::Result<Vec<QK::QueueItem>> {
+        // This function is also correct as is.
+        let subject = queue_key.get_queue_subject(&self.root_prefix, realm_id, realm_sub_id, unique_id, task_group);
+        let mut con = self.pool.get().await?;
+        let items: Vec<Vec<u8>> = con.lrange(&subject, 0, (max_items as isize) - 1).await?;
+        let _: () = con.ltrim(&subject, items.len() as isize, -1).await?;
+        let result: Vec<QK::QueueItem> = items
+            .into_iter()
+            .map(|x| QK::QueueItem::decode_queue_item_ref(&x))
+            .collect::<anyhow::Result<_>>()?;
+        Ok(result)
+    }
+
+    async fn consume_ephemeral_queue_item_or_none_bytes<QK: PCoreStandardQueueKeyForRealm>(
+        &self,
+        queue_key: &QK,
+        realm_id: u64,
+        realm_sub_id: u64,
+        unique_id: QCoreProcCheckpointUniqueId,
+        task_group: u32,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        let subject = queue_key.get_queue_subject(&self.root_prefix, realm_id, realm_sub_id, unique_id, task_group);
+        let mut con = self.pool.get().await?;
+        // FIX: Expect a Vec<Vec<u8>> and take the first element.
+        let items: Vec<Vec<u8>> = con.lpop(&subject, NonZeroUsize::new(1)).await?;
+        Ok(items.into_iter().next())
+    }
+
+    async fn consume_ephemeral_queue_item_or_none<QK: PCoreStandardQueueKeyForRealm>(
+        &self,
+        queue_key: &QK,
+        realm_id: u64,
+        realm_sub_id: u64,
+        unique_id: QCoreProcCheckpointUniqueId,
+        task_group: u32,
+    ) -> anyhow::Result<Option<QK::QueueItem>> {
+        let subject = queue_key.get_queue_subject(&self.root_prefix, realm_id, realm_sub_id, unique_id, task_group);
+        let mut con = self.pool.get().await?;
+        // FIX: Expect a Vec<Vec<u8>> and take the first element.
+        let items: Vec<Vec<u8>> = con.lpop(&subject, NonZeroUsize::new(1)).await?;
+        if let Some(i) = items.into_iter().next() {
+            Ok(Some(QK::QueueItem::decode_queue_item_ref(&i)?))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
 #[async_trait]
 impl QParthProofStoreReader for StandardRedisStore {
     async fn get_proof_bytes_by_job_id<J: Into<QJobIdSerialized> + Copy + Send + Sync>(&self, job_id: J) -> anyhow::Result<Option<Vec<u8>>> {
@@ -602,7 +740,7 @@ impl QTempDatabaseRawKVReaderBase for StandardRedisStore {
             Ok(Some(data))
         }
     }
-    async fn qtdb_raw_kv_get_many_values_vec_owned(&self, keys: Vec<Vec<u8>>) -> anyhow::Result<Vec<Option<Vec<u8>>>>{
+    async fn qtdb_raw_kv_get_many_values_vec_owned(&self, keys: Vec<Vec<u8>>) -> anyhow::Result<Vec<Option<Vec<u8>>>> {
         let data = self.get_many_bytes_generic_internal(&self.kv_store_namespace, &keys).await?;
         Ok(data.into_iter().map(|v| if v.is_empty() { None } else { Some(v) }).collect())
     }
@@ -638,7 +776,7 @@ impl QTempDatabaseRawKVWriterBase for StandardRedisStore {
         self.set_many_bytes_generic_internal_tuple(&self.kv_store_namespace, entries).await
     }
 
-    async fn qtdb_raw_kv_put_many_values_tuple_ref<'a>(&self, entries: &[(&'a [u8], &'a [u8])]) -> anyhow::Result<()>{
+    async fn qtdb_raw_kv_put_many_values_tuple_ref<'a>(&self, entries: &[(&'a [u8], &'a [u8])]) -> anyhow::Result<()> {
         let mut con = self.pool.get().await?;
         let _: () = con.hset_multiple(&self.kv_store_namespace, entries).await?;
         Ok(())
@@ -647,10 +785,7 @@ impl QTempDatabaseRawKVWriterBase for StandardRedisStore {
     async fn qtdb_raw_kv_put_many_values_tuple_owned(&self, entries: Vec<(Vec<u8>, Vec<u8>)>) -> anyhow::Result<()> {
         self.set_many_bytes_generic_internal_tuple(&self.kv_store_namespace, &entries).await
     }
-    async fn qtdb_raw_kv_put_many_values_buffer<const KEY_SIZE: usize, const VALUE_SIZE: usize>(
-        &self,
-        data: &[u8],
-    ) -> anyhow::Result<()>{
+    async fn qtdb_raw_kv_put_many_values_buffer<const KEY_SIZE: usize, const VALUE_SIZE: usize>(&self, data: &[u8]) -> anyhow::Result<()> {
         let combined_size: usize = KEY_SIZE + VALUE_SIZE;
         if data.len() % combined_size != 0 {
             return Err(anyhow::anyhow!("Data length is not a multiple of combined key and value size"));
@@ -669,7 +804,6 @@ impl QTempDatabaseRawKVWriterBase for StandardRedisStore {
         let mut con = self.pool.get().await?;
         let _: () = con.hset_multiple(&self.kv_store_namespace, &entries).await?;
         Ok(())
-
     }
 }
 #[async_trait]
