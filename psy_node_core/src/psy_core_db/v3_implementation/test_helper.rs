@@ -15,7 +15,7 @@ use parth_core::crypto::hash::traits::MerkleZeroHasher;
 use anyhow::Ok;
 use parth_core::{
     crypto::hash::{
-        merkle_proof::{MerkleProofCore, DeltaMerkleProofCore},
+        merkle_proof::{MerkleProofCore},
         tag_tree::TagTreeMerkleProof,
     },
     data::db::row::QDatabaseSingleIdTableRow,

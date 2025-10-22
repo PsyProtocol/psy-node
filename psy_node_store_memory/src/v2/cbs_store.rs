@@ -1080,18 +1080,14 @@ where
         let db = self.get_or_create_table(&table.to_string());
         let start_key = key_helpers::key_merkle_zero_id(key, 0);
         let end_key = key_helpers::key_merkle_zero_id(key, max_checkpoint_id);
-        
-        let tree_height = if table.tree_height == 0 {
-            if table.to_string().contains("TableA") { 32 } else { 22 } // HACK for tests
-        }else{
-            table.tree_height
-        };
 
+
+        assert_ne!(table.tree_height, 0, "Tree height cannot be zero for table {}", table.to_string());
         let entry = db.range(start_key..=end_key).next_back();
         if let Some(e) = entry {
             Ok(Hash::from_bytes(e.value())?)
         } else {
-            Ok(Hasher::get_zero_hash((tree_height - key.level) as usize))
+            Ok(Hasher::get_zero_hash((table.tree_height - key.level) as usize))
         }
     }
 
