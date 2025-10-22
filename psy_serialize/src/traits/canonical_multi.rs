@@ -1,4 +1,4 @@
-use crate::PsyCanonicalDatabaseSerializeBaseSingle;
+use crate::{PsyCanonicalDatabaseSerializeBaseSingle, PsyCanonicalSerializeMetadata};
 
 pub trait PsyCanonicalDatabaseSerializeBaseMulti: PsyCanonicalDatabaseSerializeBaseSingle {
     #[inline]
@@ -52,4 +52,68 @@ pub trait PsyCanonicalDatabaseSerializeBaseMultiFixedTemplate<const N: usize>: S
     fn fx_tpl_psy_ser_serialize_vec_of_self(data: Vec<Self>, write_count: bool) -> Vec<u8>;
     fn fx_tpl_psy_ser_deserialize_vec_of_self(data: &[u8], include_count: bool) -> anyhow::Result<Vec<Self>>;
     fn fx_tpl_psy_ser_deserialize_vec_of_self_owned(data: Vec<u8>, include_count: bool) -> anyhow::Result<Vec<Self>>;
+}
+impl PsyCanonicalSerializeMetadata for u8 {
+    const IS_FIXED_SIZE: bool = true;
+
+    const FIXED_SIZE: usize = 1;
+}
+impl PsyCanonicalDatabaseSerializeBaseMulti for u8 {
+    fn psy_ser_serialize_vec_of_self_ref(data: &[Self], write_count: bool) -> Vec<u8> {
+        // This is a high-level API; unwrapping is acceptable if serialization to a Vec
+        // is not expected to fail (e.g., OOM).
+        if write_count {
+            let mut result = Vec::with_capacity(4 + data.len());
+            let count = data.len() as u32;
+            result.extend_from_slice(&count.to_le_bytes());
+            result.extend_from_slice(data);
+            result
+        } else {
+            data.to_vec()
+        }
+    }
+
+    fn psy_ser_serialize_vec_of_self(data: Vec<Self>, write_count: bool) -> Vec<u8> {
+        if !write_count {
+            data
+        } else {
+            Self::psy_ser_serialize_vec_of_self_ref(&data, write_count)
+        }
+    }
+
+    fn psy_ser_deserialize_vec_of_self(data: &[u8], include_count_for_fixed: bool) -> anyhow::Result<Vec<Self>> {
+        if data.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        if Self::IS_FIXED_SIZE && !include_count_for_fixed {
+            Ok(data.to_vec())
+        } else {
+            let count = if data.len() < 4 {
+                anyhow::bail!("Data length {} is too small to contain count prefix", data.len());
+            } else {
+                let mut count_bytes = [0u8; 4];
+                count_bytes.copy_from_slice(&data[0..4]);
+                u32::from_le_bytes(count_bytes) as usize
+            };
+            let expected_len = 4 + count;
+            if data.len() < expected_len {
+                anyhow::bail!(
+                    "Data length {} is smaller than expected length {} for count {}",
+                    data.len(),
+                    expected_len,
+                    count
+                );
+            }
+            Ok(data[4..expected_len].to_vec())
+        }
+    }
+
+    fn psy_ser_deserialize_vec_of_self_owned(data: Vec<u8>, include_count_for_fixed: bool) -> anyhow::Result<Vec<Self>> {
+        if include_count_for_fixed {
+            return Self::psy_ser_deserialize_vec_of_self(&data, include_count_for_fixed);
+        }else{
+            Ok(data)
+        }
+    }
 }

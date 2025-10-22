@@ -27,3 +27,15 @@ pub trait PsyCanonicalDatabaseSerializeBaseSingleFixedTemplate<const N: usize>: 
         Self::fx_tpl_psy_ser_from_slice(&data)
     }
 }
+impl PsyCanonicalDatabaseSerializeBaseSingle for u8 {
+    fn psy_ser_from_slice(data: &[u8]) -> anyhow::Result<Self> {
+        if data.len() != 1 {
+            anyhow::bail!("Data length {} is not equal to 1 for u8", data.len());
+        }
+        Ok(data[0])
+    }
+
+    fn psy_ser_to_bytes_vec(&self) -> anyhow::Result<Vec<u8>> {
+        Ok(vec![*self])
+    }
+}

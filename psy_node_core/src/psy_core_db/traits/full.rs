@@ -261,6 +261,12 @@ pub trait PsyNodeCoreDatabaseBasicContractInfoStoreReader<F, Hash> {
 
 #[async_trait]
 #[auto_impl(&, Arc)]
+pub trait PsyNodeCoreDatabaseBasicContractInfoStoreWriter<F, Hash> {
+    async fn set_contract_tree_heights(&self, checkpoint_id: u64, contract_ids: &[(u64, u8)]) -> anyhow::Result<()>;
+}
+
+#[async_trait]
+#[auto_impl(&, Arc)]
 pub trait PsyNodeCoreDatabaseContractObjectStoreReader<F, Hash>: PsyNodeCoreDatabaseBasicContractInfoStoreReader<F, Hash> {
     async fn get_contract_leaf(&self, checkpoint_id: u64, contract_id: u64) -> anyhow::Result<PQEDContractLeaf<F, Hash>>;
     async fn get_contract_code_definition(&self, checkpoint_id: u64, contract_id: u64) -> anyhow::Result<ContractCodeDefinition>;
@@ -268,7 +274,7 @@ pub trait PsyNodeCoreDatabaseContractObjectStoreReader<F, Hash>: PsyNodeCoreData
 
 #[async_trait]
 #[auto_impl(&, Arc)]
-pub trait PsyNodeCoreDatabaseContractObjectStoreWriter<F, Hash> {
+pub trait PsyNodeCoreDatabaseContractObjectStoreWriter<F, Hash>: PsyNodeCoreDatabaseBasicContractInfoStoreWriter<F, Hash> {
     async fn set_contract_leaf(&self, checkpoint_id: u64, contract_id: u64, leaf: &PQEDContractLeaf<F, Hash>) -> anyhow::Result<()>;
     async fn set_contract_leaves_ffs(&self, checkpoint_id: u64, data: &[u8]) -> anyhow::Result<()>;
     async fn set_contract_code_definition(

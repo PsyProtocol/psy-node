@@ -70,6 +70,7 @@ pub struct PsyUnifiedCoreDatabaseStore<
     pub user_leaf_table: Arc<SingleIdTableIdentifier>,
     pub user_public_key_table: Arc<SingleIdTableIdentifier>,
     pub u64_singleton_table: Arc<U64TableIdentifier>,
+    pub contract_state_tree_height_table: Arc<SingleIdTableIdentifier>,
     pub checkpoint_id_to_pending_id_table: Arc<U64TableIdentifier>,
     pub pending_id_to_checkpoint_id_table: Arc<U64TableIdentifier>,
     pub pending_id_to_pending_proc_id_table: Arc<BiDirectionalU64U128MappingTableIdentifier>,
@@ -153,6 +154,7 @@ checkpoint_state_roots_table: Arc<KivTableIdentifier>,
 user_leaf_table: Arc<SingleIdTableIdentifier>,
 user_public_key_table: Arc<SingleIdTableIdentifier>,
 u64_singleton_table: Arc<U64TableIdentifier>,
+contract_state_tree_height_table: Arc<SingleIdTableIdentifier>,
 checkpoint_id_to_pending_id_table: Arc<U64TableIdentifier>,
 pending_id_to_checkpoint_id_table: Arc<U64TableIdentifier>,
 pending_id_to_pending_proc_id_table: Arc<BiDirectionalU64U128MappingTableIdentifier>,
@@ -185,6 +187,7 @@ contract_code_definition_table: Arc<SingleIdTableIdentifier>,
             user_leaf_table,
             user_public_key_table,
             u64_singleton_table,
+            contract_state_tree_height_table,
             checkpoint_id_to_pending_id_table,
             pending_id_to_checkpoint_id_table,
             pending_id_to_pending_proc_id_table,
@@ -1870,12 +1873,7 @@ impl<
     >
 {
     async fn get_contract_tree_heights(&self, checkpoint_id: u64, contract_ids: &[u64]) -> anyhow::Result<Vec<u8>>{
-        // TODO: actually implement this
-        let mut heights = Vec::with_capacity(contract_ids.len());
-        for _ in contract_ids {
-            heights.push(32);
-        }
-        Ok(heights)
+        self.store.db_select_many_single_checkpointed_object_values::<u8>(&self.contract_state_tree_height_table, contract_ids, checkpoint_id).await?.into_iter().map(|opt| opt.unwrap_or_default()).collect()
     }
 }
 #[async_trait]

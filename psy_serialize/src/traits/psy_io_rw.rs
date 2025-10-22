@@ -108,3 +108,20 @@ pub trait PsyIOReadWrite: PsyCanonicalSerializeMetadata + Sized {
         Ok(buffer)
     }
 }
+
+
+impl PsyIOReadWrite for u8 {
+    fn pio_serialized_size(&self) -> usize {
+        1
+    }
+
+    fn pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
+        writer.write_all(&[*self]).map_err(|e| anyhow::anyhow!(e))
+    }
+
+    fn pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
+        let mut buf = [0u8; 1];
+        reader.read_exact(&mut buf).map_err(|e| anyhow::anyhow!(e))?;
+        Ok(buf[0])
+    }
+}
