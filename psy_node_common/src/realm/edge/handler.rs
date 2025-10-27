@@ -4,13 +4,14 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use jsonrpsee::core::RpcResult;
 use parth_core::{
-    crypto::hash::{merkle_proof::MerkleProofCore, traits::MerkleZeroHasher},
+    crypto::hash::{merkle_proof::{compute_historical_and_current_merkle_roots_core_gt, MerkleProofCore}, traits::MerkleZeroHasher},
     felt::ToU64Value,
     node::realm_identifier::QRealmIdentifier,
-    protocol::core_types::{QNetworkDatabaseTypes, QNetworkTypesConfig},
+    protocol::core_types::{QHasherBase, QNetworkDatabaseTypes, QNetworkTypesConfig},
     store::tag_tree_store,
     QProvingJobDataIDWithRewardPath,
 };
+use psy_core::job::job_id::ProvingJobCircuitType;
 use psy_data::{
     proof_input::guta::end_cap_input::SubmitUserEndCapNonProofInput,
     v1::{
@@ -18,7 +19,7 @@ use psy_data::{
         qdata::{
             checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState},
             contract::{DashMapContractHeightCache, PSimpleContractHeightCache},
-            user::PQEDUserLeaf,
+            user::{self, PQEDUserLeaf},
         },
     },
 };
@@ -38,8 +39,11 @@ use psy_node_core::{
         proof_store::QParthProofStore,
     },
 };
-
+use parth_core::protocol::core_types::QZKProofVerifier;
 use crate::realm::edge::error::RpcError;
+use parth_core::crypto::hash::traits::QFieldHashable;
+
+const END_CAP_PROOF_CIRCUIT_TYPE_U32: u32 = ProvingJobCircuitType::UserEndCap as u32;
 #[derive(Clone)]
 pub struct RealmEdgeHandler<
     N: QNetworkTypesConfig,
@@ -108,6 +112,19 @@ impl<
         let max_user_id = min_user_id + users_per_realm;
         user_id >= min_user_id && user_id < max_user_id
     }
+    pub async fn get_latest_checkpoint_id(&self) -> anyhow::Result<u64> {
+        self.db_reader.get_latest_checkpoint_id().await
+
+    }
+    pub async fn ensure_user_has_not_submitted(&self, user_id: u64, unique_pending_id: u64) -> anyhow::Result<()> {
+
+        let submitted_status =  self.temp_db.get_submitted_status_for_pending(&self.realm_identifier, unique_pending_id, user_id).await?;
+        if submitted_status != 0 {
+            anyhow::bail!("end cap for user_id {} at unique_pending_id {} has already been submitted", user_id, unique_pending_id);
+        }
+
+        Ok(())
+    }
 }
 
 impl<
@@ -148,28 +165,124 @@ impl<
         user_end_cap_input: SubmitUserEndCapNonProofInput<N::F, N::QHash>,
         proof: N::ZKProof,
     ) -> anyhow::Result<()> {
+        let end_cap_checkpoint_id = user_end_cap_input.core.checkpoint_id.to_u64_value();
+
+        let secondary_end_cap_checkpoint_id = user_end_cap_input.core.new_user_leaf.last_checkpoint_id.to_u64_value();
+        if end_cap_checkpoint_id != secondary_end_cap_checkpoint_id {
+            anyhow::bail!(
+                "end cap checkpoint id {} does not match new_user_leaf last_checkpoint_id {}",
+                end_cap_checkpoint_id,
+                secondary_end_cap_checkpoint_id
+            );
+        }
         let user_id: u64 = user_end_cap_input.core.state_transition.user_id.to_u64_value();
         if !self.user_belongs_to_realm(user_id) {
             anyhow::bail!("user_id {} does not belong to this realm", user_id);
         }
-        let old_user_leaf = self.db_reader.get_user_leaf(MAX_CHECKPOINT_ID, user_id).await?;
+        if user_end_cap_input.contract_state_updates.len() == 0 {
+            anyhow::bail!("invalid contract_state_updates: cannot be empty");
+        }
 
-        if old_user_leaf.last_checkpoint_id.to_u64_value() > user_end_cap_input.core.new_user_leaf.last_checkpoint_id.to_u64_value() {
+        let (unique_pending_id, proc_checkpoint_id) = self.temp_db.get_unique_pending_ids(&self.realm_identifier).await?;
+        self.ensure_user_has_not_submitted(user_id, unique_pending_id).await?;
+
+        
+        let current_checkpoint_id = self.get_latest_checkpoint_id().await?;
+        let old_user_leaf = self.db_reader.get_user_leaf(current_checkpoint_id, user_id).await?;
+        let user_last_checkpoint_id = old_user_leaf.last_checkpoint_id.to_u64_value();
+
+        if user_last_checkpoint_id > secondary_end_cap_checkpoint_id {
             anyhow::bail!(
                 "Submitted end cap for checkpoint {}, but user's last checkpoint is {}",
-                user_end_cap_input.core.new_user_leaf.last_checkpoint_id.to_u64_value(),
-                old_user_leaf.last_checkpoint_id.to_u64_value()
+                end_cap_checkpoint_id,
+                user_last_checkpoint_id
             );
         }
-        let mut contract_ids = user_end_cap_input.contract_state_updates.iter().map(|x| x.user_contract_tree_update_proof.index as u32).collect::<Vec<u32>>();
+
+        if end_cap_checkpoint_id > current_checkpoint_id {
+            anyhow::bail!(
+                "Submitted end cap for checkpoint {}, but current checkpoint is {}",
+                end_cap_checkpoint_id,
+                current_checkpoint_id
+            );
+        }
+
+
+
+        
+
+
+        let old_leaf_hash = old_user_leaf.qfhash::<N::HasherBase>();
+        if user_end_cap_input.core.state_transition.start_user_leaf_hash != old_leaf_hash {
+            anyhow::bail!(
+                "Invalid start_user_leaf_hash, left: {:?}, right: {:?}",
+                user_end_cap_input.core.state_transition.start_user_leaf_hash,
+                old_leaf_hash
+            );
+        }
+
+
+         let checkpoint_tree_proof = self
+            .db_reader
+            .checkpoint_tree_get_merkle_proof(current_checkpoint_id, end_cap_checkpoint_id)
+            .await?;
+        
+        let (historical_root, current_root) = compute_historical_and_current_merkle_roots_core_gt::<N::QHash, N::HasherBase>(&checkpoint_tree_proof);
+        if current_root != checkpoint_tree_proof.root {
+            anyhow::bail!(
+                "Invalid checkpoint tree proof current root, left: {:?}, right: {:?}",
+                current_root,
+                checkpoint_tree_proof.root
+            );
+        } else if historical_root != user_end_cap_input.core.state_transition.checkpoint_tree_root_hash {
+            anyhow::bail!(
+                "Invalid checkpoint tree proof historical root, left: {:?}, right: {:?}",
+                historical_root,
+                user_end_cap_input.core.state_transition.checkpoint_tree_root_hash
+            );
+        }
+
+
+
+        let expected_public_inputs_hash: N::QHash = user_end_cap_input.core.get_proof_public_inputs_hash::<N::HasherBase>(
+            N::GLOBAL_USER_TREE_HEIGHT,
+        );
+        let public_inputs = N::ZKVerifier::get_proof_public_inputs(&proof)?;
+
+        if public_inputs != expected_public_inputs_hash {
+            anyhow::bail!(
+                "Public inputs hash mismatch: expected {:?}, got {:?}",
+                expected_public_inputs_hash,
+                public_inputs
+            );
+        }
+        let mut contract_ids = user_end_cap_input
+            .contract_state_updates
+            .iter()
+            .map(|x| x.user_contract_tree_update_proof.index as u32)
+            .collect::<Vec<u32>>();
         contract_ids.sort_unstable();
         contract_ids.dedup();
         self.ensure_contract_heights_in_cache(&contract_ids).await?;
 
+        user_end_cap_input.ensure_simple_self_consistent::<N::HasherBase, _>(
+            &old_user_leaf,
+            public_inputs,
+            &self.contract_state_tree_height_cache,
+            N::GLOBAL_USER_TREE_HEIGHT,
+            N::GLOBAL_CONTRACT_TREE_HEIGHT_USIZE,
+        )?;
+
+
+
+
+        self.proof_verifier.verify_zk_proof(END_CAP_PROOF_CIRCUIT_TYPE_U32, &proof)?;
+        self.ensure_user_has_not_submitted(user_id, unique_pending_id).await?;
+
+
         //let proof_public_inputs = self.proof_verifier.publi(&proof);
-        //user_end_cap_input.ensure_simple_self_consistent(proof_public_inputs_hash, contract_helper, global_user_tree_height)
-
-
+        //user_end_cap_input.ensure_simple_self_consistent(proof_public_inputs_hash,
+        // contract_helper, global_user_tree_height)
 
         Ok(())
     }

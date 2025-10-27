@@ -1,17 +1,15 @@
 use std::collections::HashMap;
 
 use parth_core::{
-    crypto::hash::{merkle_proof::{compute_root_merkle_proof_generic, DeltaMerkleProofCore}, traits::MerkleHasher}, data::hash::{fast_node_serializer::QMS_FAST_SERIALIZER_SINGLE_ID_NODE_SIZE, merkle_store_key::{QMerkleStoreSingleIdKey, QMerkleStoreSingleIdNode}}, protocol::core_types::Q256BitHash
+    crypto::hash::{merkle_proof::{compute_root_merkle_proof_generic, DeltaMerkleProofCore}, traits::MerkleHasher}, data::hash::{fast_node_serializer::{QMS_FAST_SERIALIZER_DOUBLE_ID_NODE_SIZE, QMS_FAST_SERIALIZER_SINGLE_ID_NODE_SIZE}, merkle_store_key::{QMerkleStoreSingleIdKey, QMerkleStoreSingleIdNode}}, protocol::core_types::Q256BitHash
 };
 use psy_serialize::FastFixedSerializable;
 
 use crate::qblob::{
-    blob_type::{QBlobDataType, QBlobMerkleNodeTreeType, QBLOB_STANDARD_V1_MAGIC_U32},
-    structs::common::{
+    blob_type::{QBlobDataType, QBlobMerkleNodeTreeType, QBLOB_STANDARD_V1_MAGIC_U32}, data_views::double_merkle_node_batch::QBlobDoubleIdMerkleRecorder, structs::common::{
         blob_metadata_header::QBlobWriterContextMetadataHeader,
         tree_node_batch_header::{QBlobMerkleTreeNodeBatchHeaderV1, QBLOB_TREE_NODE_BATCH_HEADER_SIZE},
-    },
-    traits::common::QBlobStructHeaderBase,
+    }, traits::common::QBlobStructHeaderBase
 };
 
 pub struct QBlobSingleMerkleNodeBatchDataView {}
@@ -78,6 +76,33 @@ impl QBlobSingleMerkleNodeBatchDataView {
             return Err(anyhow::anyhow!("Header context does not match expected context"));
         }
         Ok((header, payload_data))
+    }
+    pub fn validate_single_tree_nodes_batch_header_for_realm_context_get_clipped_ref_no_exact_size(
+        data: &[u8],
+        chain_id: u32,
+        realm_id: u64,
+        realm_sub_id: u64,
+        unique_pending_id: u64,
+        tree_type: QBlobMerkleNodeTreeType,
+    ) -> anyhow::Result<(QBlobMerkleTreeNodeBatchHeaderV1, &[u8], &[u8])> {
+        let (header, payload_data) = QBlobMerkleTreeNodeBatchHeaderV1::clip_header_get_payload_for_blob_type_and_tree_ref(
+            data,
+            QBlobDataType::GenericSingleIdMerkleNodeBatch,
+            tree_type,
+            false,
+        )?;
+        if header.chain_id != chain_id
+            || header.realm_id != realm_id
+            || header.realm_sub_id != realm_sub_id
+            || header.unique_pending_id != unique_pending_id
+            || header.tree_type != tree_type
+        {
+            return Err(anyhow::anyhow!("Header context does not match expected context"));
+        }
+
+
+
+        Ok((header, payload_data, &data[header.total_size as usize..]))
     }
     pub fn generate_single_merkle_node_batch_blob_data_from_ref<Hash: Q256BitHash>(
         context: QBlobWriterContextMetadataHeader,
@@ -231,7 +256,8 @@ impl QBlobSingleMerkleNodeBatchDataView {
 #[derive(Clone)]
 pub struct QBlobSingleIdMerkleRecorder {
     map: HashMap<QMerkleStoreSingleIdKey, bool>,
-    blob: Vec<u8>,
+    start_offset: usize,
+    pub blob: Vec<u8>,
 }
 
 impl QBlobSingleIdMerkleRecorder {
@@ -239,21 +265,52 @@ impl QBlobSingleIdMerkleRecorder {
         Self {
             map: HashMap::new(),
             blob: Vec::new(),
+            start_offset: 0,
+        }
+    }
+    pub fn new_with_blob(blob: Vec<u8>) -> Self {
+                let start_offset = blob.len();
+
+        Self {
+            map: HashMap::new(),
+            blob,
+            start_offset,
+        }
+    }
+    pub fn new_from_blob_with_header(blob: Vec<u8>) -> Self {
+        let mut blob = blob;
+        let start_offset = blob.len();
+        blob.extend_from_slice(&[0u8; QBLOB_TREE_NODE_BATCH_HEADER_SIZE]);
+        Self {
+            map: HashMap::new(),
+            blob,
+            start_offset,
+        }
+    }
+    pub fn new_with_multi_size_hints_with_header(single_size_hint: usize, double_size_hint: usize) -> Self {
+        let total_size = single_size_hint*QMS_FAST_SERIALIZER_SINGLE_ID_NODE_SIZE + double_size_hint*QMS_FAST_SERIALIZER_DOUBLE_ID_NODE_SIZE + 2*QBLOB_TREE_NODE_BATCH_HEADER_SIZE;
+        let mut blob = Vec::with_capacity(total_size);
+        blob.extend(&[0u8; QBLOB_TREE_NODE_BATCH_HEADER_SIZE]);
+        Self {
+            map: HashMap::with_capacity(single_size_hint),
+            blob,
+            start_offset: 0,
         }
     }
     pub fn new_with_size_hint(size_hint: usize) -> Self {
         Self {
             map: HashMap::with_capacity(size_hint),
             blob: Vec::with_capacity(size_hint * QMS_FAST_SERIALIZER_SINGLE_ID_NODE_SIZE),
+            start_offset: 0,
         }
     }
     pub fn new_with_header_and_size_hint(size_hint: usize) -> Self {
-        let map = HashMap::with_capacity(size_hint);
         let mut blob = Vec::with_capacity(QBLOB_TREE_NODE_BATCH_HEADER_SIZE + size_hint * QMS_FAST_SERIALIZER_SINGLE_ID_NODE_SIZE);
         blob.extend(&[0u8; QBLOB_TREE_NODE_BATCH_HEADER_SIZE]);
         Self {
-            map,
+            map: HashMap::with_capacity(size_hint),
             blob,
+            start_offset: 0,
         }
     }
 
@@ -326,16 +383,31 @@ impl QBlobSingleIdMerkleRecorder {
     }
 
     pub fn finalize_with_header(self, context: &QBlobWriterContextMetadataHeader, tree_type: QBlobMerkleNodeTreeType) -> Vec<u8> {
-        let blob_len = self.blob.len();
-        let mut blob = self.blob;
-        let size_without_header = blob_len - QBLOB_TREE_NODE_BATCH_HEADER_SIZE;
+        let end_offset = self.blob.len();
+        let size_without_header = end_offset - self.start_offset - QBLOB_TREE_NODE_BATCH_HEADER_SIZE;
         let item_count = size_without_header as u64 / QMS_FAST_SERIALIZER_SINGLE_ID_NODE_SIZE as u64;
-        blob[0..QBLOB_TREE_NODE_BATCH_HEADER_SIZE].copy_from_slice(&QBlobSingleMerkleNodeBatchDataView::tree_header_from_context_and_counts(
+        let mut blob = self.blob;
+        blob[self.start_offset..(self.start_offset + QBLOB_TREE_NODE_BATCH_HEADER_SIZE)].copy_from_slice(&QBlobSingleMerkleNodeBatchDataView::tree_header_from_context_and_counts(
             context,
             tree_type,
             item_count,
         ).to_bytes_fixed_size_array());
         blob
+    }
+
+
+
+    pub fn finalize_with_header_into_double(self, context: &QBlobWriterContextMetadataHeader, tree_type: QBlobMerkleNodeTreeType) -> QBlobDoubleIdMerkleRecorder {
+        let end_offset = self.blob.len();
+        let size_without_header = end_offset - self.start_offset - QBLOB_TREE_NODE_BATCH_HEADER_SIZE;
+        let item_count = size_without_header as u64 / QMS_FAST_SERIALIZER_SINGLE_ID_NODE_SIZE as u64;
+        let mut blob = self.blob;
+        blob[self.start_offset..(self.start_offset + QBLOB_TREE_NODE_BATCH_HEADER_SIZE)].copy_from_slice(&QBlobSingleMerkleNodeBatchDataView::tree_header_from_context_and_counts(
+            context,
+            tree_type,
+            item_count,
+        ).to_bytes_fixed_size_array());
+        QBlobDoubleIdMerkleRecorder::new_from_blob_with_header(blob)
     }
 }
 
@@ -791,3 +863,5 @@ mod tests {
         Ok(())
     }
 }
+
+

@@ -1,3 +1,5 @@
+#[cfg(feature = "node")]
+use auto_impl::auto_impl;
 use parth_core::{crypto::hash::merkle_proof::DeltaMerkleProofCore, protocol::core_types::QHashBase};
 
 
@@ -9,7 +11,7 @@ pub struct QEDContractStateUpdateHistory<Hash> {
 }
 
 impl<Hash: QHashBase> QEDContractStateUpdateHistory<Hash> {
-    pub fn ensure_basic_consistency<C: PSimpleContractHeightCache<Hash>>(&self, contract_helper: &C) -> anyhow::Result<()> {
+    pub fn ensure_basic_consistency<C: PSimpleContractHeightCache<Hash>>(&self, contract_helper: &C, contract_tree_height: usize) -> anyhow::Result<()> {
         if self.contract_state_tree_updates.len() == 0 {
             anyhow::bail!("contract_state_tree_updates cannot be empty")
         }
@@ -21,6 +23,10 @@ impl<Hash: QHashBase> QEDContractStateUpdateHistory<Hash> {
         if self.contract_state_tree_updates.last().as_ref().unwrap().new_root != self.user_contract_tree_update_proof.new_value {
 
             anyhow::bail!("first CST new root does not match UCT new value");
+        }
+
+        if self.user_contract_tree_update_proof.siblings.len() != contract_tree_height {
+            anyhow::bail!("invalid tree height in siblings");
         }
 
         let height = self.contract_state_tree_updates[0].siblings.len();
@@ -37,6 +43,13 @@ impl<Hash: QHashBase> QEDContractStateUpdateHistory<Hash> {
 
        Ok(())
 
+    }
+    pub fn get_double_id_nodes_size_hint(&self) -> usize {
+        if self.contract_state_tree_updates.len() == 0 {
+            0
+        }else{
+            self.contract_state_tree_updates.len() * self.contract_state_tree_updates[0].siblings.len() + 2
+        }
     }
     /*
     pub fn verify_generate_cst_delta<H: FieldQHasher<F, Hash>>(&self, injestor: &mut CSTUserUpdateStore<Hash>) -> anyhow::Result<()> {
@@ -58,7 +71,7 @@ impl<Hash: QHashBase> QEDContractStateUpdateHistory<Hash> {
     }*/
 }
 
-
+#[auto_impl(&, Arc)]
 pub trait PSimpleContractHeightCache<Hash> {
     fn add_contract(&self, contract_id: u32, height: u8, zero_hash: Hash);
     fn get_contract_height(&self, contract_id: u32) -> anyhow::Result<u8>;
@@ -78,7 +91,7 @@ impl<Hash: Copy> DashMapContractHeightCache<Hash> {
     }
 }
 #[cfg(feature = "node")]
-impl<Hash: std::hash::Hash + Eq + Copy> PSimpleContractHeightCache<Hash> for DashMapContractHeightCache<Hash> {
+impl<Hash: Eq + Copy> PSimpleContractHeightCache<Hash> for DashMapContractHeightCache<Hash> {
     fn add_contract(&self, contract_id: u32, height: u8, zero_hash: Hash) {
         self.mapping.insert(contract_id, (height, zero_hash));
     }

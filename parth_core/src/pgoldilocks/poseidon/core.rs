@@ -8,6 +8,7 @@ use crate::crypto::hash::traits::FieldQHasher;
 use crate::crypto::hash::traits::MerkleHasher;
 use crate::crypto::hash::traits::MerkleZeroHasher;
 use crate::generic_traits::QStaticNamedType;
+use crate::protocol::core_types::QFHasherU64;
 
 use super::super::QHashOut;
 type BF = GoldilocksField;
@@ -154,3 +155,5 @@ impl QStaticNamedType for PoseidonHasher {
         "PoseidonHasher"
     }
 }
+
+impl QFHasherU64<GoldilocksField, QHashOut<GoldilocksField>> for PoseidonHasher {}

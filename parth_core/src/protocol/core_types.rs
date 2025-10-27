@@ -36,17 +36,17 @@ impl<T: QHashBase + HashTo4Felts<F>, F: QFelt64> QFHashBase<F> for T {}
 pub trait QProofBase: PartialEq + Clone + Serialize + DeserializeOwned + QPDSerializable {}
 
 pub trait QHasherBase<Hash: QHashBase, Proof: QProofBase>: MerkleZeroHasher<Hash> {
-    fn get_proof_public_input(proof: &Proof) -> Hash; // the public inputs of the proof is a hash which is the hash of the QParthProofPublicInputsPreimage
+    fn get_proof_public_inputs(proof: &Proof) -> anyhow::Result<Hash>; // the public inputs of the proof is a hash which is the hash of the QParthProofPublicInputsPreimage
     fn hash_proof_public_inputs_preimage(preimage: &QParthProofPublicInputsPreimage<Hash>) -> Hash;
     fn hash_proof_public_inputs_preimage_with_rewards_hash(preimage: &QParthProofPublicInputsPreimageWithoutRewardsHash<Hash>, rewards_hash: &Hash) -> Hash;
 }
 
 pub trait QZKProofVerifier<Hash: QHashBase, Proof: QProofBase>: QHasherBase<Hash, Proof> {
-    fn verify_zk_proof(&self, circuit_type: u32, proof: &Proof) -> bool;
-    fn verify_zk_proof_and_check_public_inputs(&self, circuit_type: u32, proof: &Proof, public_inputs_preimage: &QParthProofPublicInputsPreimage<Hash>) -> bool {
-        let public_inputs = Self::get_proof_public_input(proof);
+    fn verify_zk_proof(&self, circuit_type: u32, proof: &Proof) -> anyhow::Result<()>;
+    fn verify_zk_proof_and_check_public_inputs(&self, circuit_type: u32, proof: &Proof, public_inputs_preimage: &QParthProofPublicInputsPreimage<Hash>) -> anyhow::Result<()> {
+        let public_inputs = Self::get_proof_public_inputs(proof)?;
         if public_inputs != Self::hash_proof_public_inputs_preimage(public_inputs_preimage) {
-            return false;
+            anyhow::bail!("Public inputs do not match expected value from preimage");
         }
         self.verify_zk_proof(circuit_type, proof)
     }

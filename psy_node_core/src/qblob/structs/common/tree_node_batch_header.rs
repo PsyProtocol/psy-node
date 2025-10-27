@@ -317,7 +317,7 @@ impl QBlobMerkleTreeNodeBatchHeaderV1 {
                 expected_item_size
             ));
         }
-        Ok((header, &full_data[QBLOB_TREE_NODE_BATCH_HEADER_SIZE..]))
+        Ok((header, &full_data[QBLOB_TREE_NODE_BATCH_HEADER_SIZE..header.total_size as usize]))
 
     }
 }
