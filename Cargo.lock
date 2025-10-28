@@ -2071,6 +2071,7 @@ dependencies = [
  "bincode",
  "bytes",
  "criterion",
+ "dashmap",
  "futures",
  "hex",
  "hex-literal",
@@ -2480,6 +2481,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "psy_dummy_proof"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "auto_impl",
+ "bincode",
+ "hashbrown 0.14.5",
+ "hex",
+ "hex-literal",
+ "parth_core",
+ "postcard",
+ "pser",
+ "psy_core",
+ "psy_data",
+ "rand 0.8.5",
+ "rkyv",
+ "serde",
+ "serde_json",
+ "serde_repr",
+ "serde_with",
+ "speedy",
+ "strum",
+ "strum_macros",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "psy_io"
 version = "0.1.0"
 dependencies = [
@@ -2662,6 +2692,134 @@ dependencies = [
  "psy_data",
  "psy_node_core",
  "psy_serialize",
+ "rand 0.8.5",
+ "rkyv",
+ "serde",
+ "serde_json",
+ "serde_repr",
+ "serde_with",
+ "speedy",
+ "strum",
+ "strum_macros",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "psy_plonky2_basic_helpers"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "auto_impl",
+ "bincode",
+ "hashbrown 0.14.5",
+ "hex",
+ "hex-literal",
+ "itertools 0.14.0",
+ "parth_core",
+ "parth_crypto",
+ "plonky2",
+ "postcard",
+ "pser",
+ "psy_core",
+ "psy_data",
+ "rand 0.8.5",
+ "rkyv",
+ "serde",
+ "serde_json",
+ "serde_repr",
+ "serde_with",
+ "speedy",
+ "strum",
+ "strum_macros",
+ "tokio",
+ "tracing",
+ "ts-rs",
+]
+
+[[package]]
+name = "psy_plonky2_circuits"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "auto_impl",
+ "bincode",
+ "cf_utils",
+ "hashbrown 0.14.5",
+ "hex",
+ "hex-literal",
+ "parth_core",
+ "plonky2",
+ "postcard",
+ "pser",
+ "psy_core",
+ "psy_data",
+ "psy_plonky2_basic_helpers",
+ "rand 0.8.5",
+ "rkyv",
+ "serde",
+ "serde_json",
+ "serde_repr",
+ "serde_with",
+ "speedy",
+ "strum",
+ "strum_macros",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "psy_plonky2_common_circuits"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "auto_impl",
+ "bincode",
+ "bitflags",
+ "cf_utils",
+ "hashbrown 0.14.5",
+ "hex",
+ "hex-literal",
+ "parth_common",
+ "parth_core",
+ "plonky2",
+ "postcard",
+ "pser",
+ "psy_plonky2_basic_helpers",
+ "rand 0.8.5",
+ "rkyv",
+ "serde",
+ "serde_json",
+ "serde_repr",
+ "serde_with",
+ "speedy",
+ "strum",
+ "strum_macros",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "psy_plonky2_worker"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "auto_impl",
+ "bincode",
+ "hashbrown 0.14.5",
+ "hex",
+ "hex-literal",
+ "parth_core",
+ "plonky2",
+ "postcard",
+ "pser",
+ "psy_core",
+ "psy_data",
+ "psy_plonky2_basic_helpers",
  "rand 0.8.5",
  "rkyv",
  "serde",

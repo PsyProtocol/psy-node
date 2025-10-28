@@ -44,7 +44,7 @@ impl TryFrom<u32> for QWorkerMode {
     }
 
 }
-
+/* 
 #[derive(Serialize_repr, Deserialize_repr, PartialEq, Debug, Clone, Copy, Eq, Hash, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum QCircuitCommonGatesType {
@@ -55,6 +55,7 @@ pub enum QCircuitCommonGatesType {
     E = 4,
     F = 5,
 }
+    */
 #[derive(TS)]
 #[ts(export)]
 #[pderive::serialize_enum_repr_strum]

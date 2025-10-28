@@ -1,5 +1,5 @@
 
-use plonky2::field::{goldilocks_field::GoldilocksField, types::{Field, PrimeField64, Sample}};
+use plonky2::{field::{goldilocks_field::GoldilocksField, types::{Field, PrimeField64, Sample}}, hash::hash_types::RichField};
 
 use super::qhashout::QHashOut;
 use crate::{felt::{FromPrimitiveValuesFelt, SimpleRandFelt, ToU64Value, ZeroableFelt}, generic_traits::QStaticNamedType, utils::{debug_code_string::QToCodeString, QPGenRandom}};
@@ -80,3 +80,8 @@ impl QStaticNamedType for PGoldilocksFelt {
 }
 
 
+
+
+
+pub trait QRichField: RichField {}
+impl QRichField for GoldilocksField {}

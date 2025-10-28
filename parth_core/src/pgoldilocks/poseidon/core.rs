@@ -1,6 +1,7 @@
 
 use plonky2::field::goldilocks_field::GoldilocksField;
 use plonky2::hash::hash_types::HashOut;
+use plonky2::hash::hash_types::RichField;
 use plonky2::hash::poseidon::PoseidonHash;
 use plonky2::plonk::config::Hasher;
 
@@ -106,9 +107,10 @@ impl FieldQHasher<BF, BaseHashP2> for PoseidonHash {
         <PoseidonHash as Hasher<BF>>::two_to_one(left, right)
     }
 }
-impl MerkleHasher<BaseHashQ> for PoseidonHasher {
-    fn two_to_one(left: &BaseHashQ, right: &BaseHashQ) -> BaseHashQ {
-        QHashOut(<PoseidonHash as Hasher<BF>>::two_to_one(left.0, right.0))
+impl<F: RichField> MerkleHasher<QHashOut<F>> for PoseidonHasher {
+    #[inline]
+    fn two_to_one(left: &QHashOut<F>, right: &QHashOut<F>) -> QHashOut<F> {
+        QHashOut(<PoseidonHash as Hasher<F>>::two_to_one(left.0, right.0))
     }
 }
 impl MerkleHasher<BaseHashP2> for PoseidonHasher {
@@ -118,10 +120,10 @@ impl MerkleHasher<BaseHashP2> for PoseidonHasher {
     }
 }
 
-impl MerkleHasher<BaseHashQ> for PoseidonHash {
+impl<F: RichField> MerkleHasher<QHashOut<F>> for PoseidonHash {
     #[inline]
-    fn two_to_one(left: &BaseHashQ, right: &BaseHashQ) -> BaseHashQ {
-        QHashOut(<PoseidonHash as Hasher<BF>>::two_to_one(left.0, right.0))
+    fn two_to_one(left: &QHashOut<F>, right: &QHashOut<F>) -> QHashOut<F> {
+        QHashOut(<PoseidonHash as Hasher<F>>::two_to_one(left.0, right.0))
     }
 }
 impl MerkleHasher<BaseHashP2> for PoseidonHash {

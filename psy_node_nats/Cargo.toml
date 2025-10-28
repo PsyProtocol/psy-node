@@ -47,6 +47,7 @@ psy_data = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+dashmap = { workspace = true }
 
 
 # Logging

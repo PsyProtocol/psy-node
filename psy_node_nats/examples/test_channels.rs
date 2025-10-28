@@ -169,6 +169,9 @@ async fn main() -> Result<()> {
 
     let client = async_nats::connect(NATS_URL).await?;
     let js = jetstream::new(client);
+
+
+
     let stream = js.get_stream(STREAM_NAME).await?;
 
     let (trigger_tx, trigger_rx) = mpsc::channel::<TriggerMessage>(1);

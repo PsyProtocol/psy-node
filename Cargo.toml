@@ -18,7 +18,12 @@ members = [
     "psy_node_scylla",
     "psy_node_nats",
     "psy_node_store_memory",
-    "psy_node_v3"
+    "psy_node_v3",
+    "psy_dummy_proof",
+    "psy_plonky2_worker",
+    "psy_plonky2_basic_helpers",
+    "psy_plonky2_common_circuits",
+    "psy_plonky2_circuits"
 ]
 resolver = "2"
 
@@ -130,6 +135,10 @@ bb8 = "0.9"
 rsmq = { git = "https://github.com/PsyRepoForks/rsmq-async-rs", package = "rsmq_async", features = ["break-js-comp", "sync", "tokio"] }
 dashmap = "6.1.0"
 parking_lot = "0.12.5"
+itertools = "0.14"
+
+bitflags = "2.5.0"
+
 # Workspace Packages
 cf_utils = { path = "./cf_utils" }
 
@@ -137,6 +146,10 @@ pser = { path = "./pser" }
 pderive = { path = "./pderive" }
 psy_io = { path = "./psy_io" }
 psy_serialize = { path = "./psy_serialize" }
+psy_plonky2_basic_helpers = { path = "./psy_plonky2_basic_helpers" }
+psy_plonky2_worker = { path = "./psy_plonky2_worker" }
+psy_plonky2_common_circuits = { path = "./psy_plonky2_common_circuits" }
+psy_plonky2_circuits = { path = "./psy_plonky2_circuits" }
 
 parth_core = { path = "./parth_core" }
 parth_common = { path = "./parth_common" }
