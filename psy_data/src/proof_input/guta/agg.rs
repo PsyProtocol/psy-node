@@ -1,6 +1,6 @@
 use std::{hash::Hash, ops::Add};
 
-use parth_core::{crypto::hash::{merkle_proof::{compute_historical_and_current_merkle_roots_core_gt, DeltaMerkleProofCore, MerkleProofCore}, nca::nca_proof::PartialUpdateNearestCommonAncestorProof, traits::{FieldQHasher, MerkleHasher, MerkleZeroHasher, QFieldHashable}}, felt::QFelt64, protocol::core_types::QFHashBase};
+use parth_core::{crypto::hash::{merkle_proof::{compute_historical_and_current_merkle_roots_core_gt, DeltaMerkleProofCore, MerkleProofCore}, nca::nca_proof::PartialUpdateNearestCommonAncestorProof, traits::{FieldQHasher, MerkleHasher, MerkleZeroHasher, QFieldHashable, ZeroableHash}}, felt::QFelt64, protocol::core_types::QFHashBase};
 use psy_core::job::job_id::{self, QProvingJobDataID};
 
 use crate::{guta::{header::GlobalUserTreeAggregatorHeader, stats::GUTAStats, sub_tree_transition::SubTreeNodeStateTransition}, v1::qdata::{checkpoint::PQEDCheckpointLeafCompactWithStateRoots, user::PQEDUserLeaf, user_end_cap_result::PUPSEndCapResultCompact}};
@@ -39,7 +39,7 @@ pub struct VerifyTwoGUTAProofGadgetStandardInput<F, Hash> {
     pub guta_inclusion_proof_b: MerkleProofCore<Hash>,
 }
 
-impl<F: QFelt64, Hash: QFHashBase<F>> VerifyTwoGUTAProofGadgetStandardInput<F, Hash> {
+impl<F: QFelt64, Hash: Copy> VerifyTwoGUTAProofGadgetStandardInput<F, Hash> {
 
     pub fn get_guta_header_a(&self) -> GlobalUserTreeAggregatorHeader<F, Hash> {
         GlobalUserTreeAggregatorHeader {
@@ -451,11 +451,11 @@ impl<F: QFelt64, Hash: PartialEq + Copy> VerifyLeftEndCapRightGUTAInput<F, Hash>
 }
 
 
-#[pderive::serialize_clone_f_hash_ts]
-#[ts(export, concrete(F = parth_core::PF, Hash = parth_core::PHash))]
-pub struct GUTANoChangeFullInput<F, Hash> {
+#[pderive::serialize_clone_hash_ts]
+#[ts(export, concrete(Hash = parth_core::PHash))]
+pub struct GUTANoChangeFullInput<Hash> {
     pub checkpoint_tree_proof: MerkleProofCore<Hash>,
-    pub checkpoint_leaf: PQEDCheckpointLeafCompactWithStateRoots<F>,
+    pub checkpoint_leaf: PQEDCheckpointLeafCompactWithStateRoots<Hash>,
 }
 
 
@@ -468,6 +468,37 @@ pub struct GUTARegisterUserFullInput<Hash> {
     pub global_user_tree_update_proof: DeltaMerkleProofCore<Hash>,
 }
 
+
+impl<Hash: Copy + ZeroableHash> GUTARegisterUserFullInput<Hash> {
+
+
+    pub fn new_dummy(global_user_tree_height: usize, height: usize, dummy_user_leaf_hash: Hash, fake_public_key: Hash) -> Self {
+
+        let siblings = (0..global_user_tree_height).map(|_| Hash::get_zero_value()).collect::<Vec<_>>();
+        let user_registration_tree_merkle_proof = MerkleProofCore {
+            siblings,
+            root: Hash::get_zero_value(),
+            value : fake_public_key,
+            index: 0,
+        };
+
+        let dmp_siblings = (0..height).map(|_| Hash::get_zero_value()).collect();
+        let global_user_tree_update_proof = DeltaMerkleProofCore{
+            siblings: dmp_siblings,
+            old_root: Hash::get_zero_value(),
+            old_value: Hash::get_zero_value(),
+            new_root: Hash::get_zero_value(),
+            new_value: dummy_user_leaf_hash,
+            index: 0,
+        };
+
+        Self {
+            user_registration_tree_merkle_proof,
+            global_user_tree_update_proof,
+        }
+
+    }
+}
 
 
 
@@ -577,7 +608,7 @@ impl<F: QFelt64, Hash: PartialEq + Copy> VerifyGUTAToCapUpgradeCheckpointCircuit
 pub struct VerifyGUTARegisterUsersCircuitInputSimple<F, Hash> {
     pub guta_proof_header: GlobalUserTreeAggregatorHeader<F, Hash>,
     pub top_line_siblings: Vec<Hash>,
-    pub guta_register_user_inputs: Vec<GUTARegisterUserFullInput<F>>
+    pub guta_register_user_inputs: Vec<GUTARegisterUserFullInput<Hash>>
 }
 
 
@@ -585,11 +616,11 @@ pub struct VerifyGUTARegisterUsersCircuitInputSimple<F, Hash> {
 
 
 
-#[pderive::serialize_clone_f_hash_ts]
-#[ts(export, concrete(F = parth_core::PF, Hash = parth_core::PHash))]
-pub struct GUTAOnlyRegisterUsersInput<F, Hash> {
+#[pderive::serialize_clone_hash_ts]
+#[ts(export, concrete(Hash = parth_core::PHash))]
+pub struct GUTAOnlyRegisterUsersInput<Hash> {
     pub checkpoint_tree_root: Hash,
-    pub guta_register_user_inputs: Vec<GUTARegisterUserFullInput<F>>,
+    pub guta_register_user_inputs: Vec<GUTARegisterUserFullInput<Hash>>,
 }
 
 

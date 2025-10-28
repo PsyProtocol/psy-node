@@ -61,6 +61,20 @@ impl<F: ZeroableFelt, Hash> PQEDUserLeaf<F, Hash> {
             user_id,
         }
     }
+}
+impl<F: Copy, Hash> PQEDUserLeaf<F, Hash> {
+
+    pub fn new_user_default_with_zero(zero: F, user_id: F, public_key: Hash, user_state_tree_root: Hash) -> Self {
+        Self {
+            public_key,
+            user_state_tree_root,
+            balance: zero,
+            nonce: zero,
+            last_checkpoint_id: zero,
+            event_index: zero,
+            user_id,
+        }
+    }
 
 }
 

@@ -37,6 +37,8 @@ plonky2 = { workspace = true }
 cf_utils = { workspace = true }
 parth_core = { workspace = true }
 psy_plonky2_basic_helpers = { workspace = true }
+psy_plonky2_common_circuits = { workspace = true }
+parth_common = { workspace = true }
 psy_core = { workspace = true }
 psy_data = { workspace = true }
 pser = { workspace = true }

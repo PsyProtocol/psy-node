@@ -1,3 +1,5 @@
+use parth_core::crypto::hash::traits::FromU64x4;
+
 
 // Native currency configuration
 pub const NATIVE_CURRENCY_DECIMAL: u8 = 9;
@@ -104,7 +106,9 @@ pub const REALM_TO_COORDINATOR_CHANNEL: u64 = 0x5245414C4D544F43;
 
 pub const REALM_PROOF_SYNC_CHANNEL: u64 = 0x524C4D50524F4F46;
 
-
+pub fn get_default_worker_public_key<Hash: FromU64x4>() -> Hash {
+    Hash::from_u64s(1,1,1,1)
+}
 
 #[cfg(test)]
 mod tests {

@@ -14,6 +14,39 @@ pub struct PPMJobsCompletedStats<F> {
     pub gutas_completed: F,
 }
 
+impl<F: Copy> PPMJobsCompletedStats<F> {
+    pub fn new_empty_with_zero(zero: F) -> Self {
+        Self {
+            deploy_contracts_completed: zero,
+            register_users_completed: zero,
+            gutas_completed: zero,
+        }
+    }
+
+    pub fn new_deploy_contracts_with_zero(zero: F, count: F) -> Self {
+        Self {
+            deploy_contracts_completed: count,
+            register_users_completed: zero,
+            gutas_completed: zero,
+        }
+    }
+
+    pub fn new_register_users_with_zero(zero: F, count: F) -> Self {
+        Self {
+            deploy_contracts_completed: zero,
+            register_users_completed: count,
+            gutas_completed: zero,
+        }
+    }
+
+    pub fn new_gutas_with_zero(zero: F, count: F) -> Self {
+        Self {
+            deploy_contracts_completed: zero,
+            register_users_completed: zero,
+            gutas_completed: count,
+        }
+    }
+}
 impl<F: QFelt> PPMJobsCompletedStats<F> {
     pub fn new_empty() -> Self {
         Self {

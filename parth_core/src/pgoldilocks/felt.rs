@@ -2,7 +2,7 @@
 use plonky2::{field::{goldilocks_field::GoldilocksField, types::{Field, PrimeField64, Sample}}, hash::hash_types::RichField};
 
 use super::qhashout::QHashOut;
-use crate::{felt::{FromPrimitiveValuesFelt, SimpleRandFelt, ToU64Value, ZeroableFelt}, generic_traits::QStaticNamedType, utils::{debug_code_string::QToCodeString, QPGenRandom}};
+use crate::{felt::{FromPrimitiveValuesFelt, QFelt64, SimpleRandFelt, ToU64Value, ZeroableFelt}, generic_traits::QStaticNamedType, utils::{debug_code_string::QToCodeString, QPGenRandom}};
 pub type PGoldilocksHash = QHashOut<GoldilocksField>;
 pub type PGoldilocksFelt = GoldilocksField;
 
@@ -20,6 +20,7 @@ impl QToCodeString for PGoldilocksHash {
         )
     }
 }
+
 
 impl ZeroableFelt for PGoldilocksFelt {
     const ZERO_VALUE: Self = GoldilocksField::ZERO;
@@ -83,5 +84,5 @@ impl QStaticNamedType for PGoldilocksFelt {
 
 
 
-pub trait QRichField: RichField {}
+pub trait QRichField: RichField + QFelt64 {}
 impl QRichField for GoldilocksField {}

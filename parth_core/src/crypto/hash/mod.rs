@@ -7,3 +7,4 @@ pub mod merkle_node_cache;
 pub mod nca;
 pub mod merkle_store;
 pub mod traits;
+pub mod treeprover;

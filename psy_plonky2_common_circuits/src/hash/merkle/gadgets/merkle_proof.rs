@@ -262,6 +262,40 @@ impl MerkleProofGadget {
         }
         Ok(())
     }
+
+
+    pub fn set_witness_generic_ho<W: Witness<F>, F: RichField>(
+        &self,
+        witness: &mut W,
+        index: F,
+        value: HashOut<F>,
+        siblings: &[HashOut<F>],
+    ) -> anyhow::Result<()> {
+        if !self
+            .option_flags
+            .contains(MerkleProofGadgetOptionFlags::index)
+        {
+            witness.set_target(self.index, index)?;
+        }
+        if !self
+            .option_flags
+            .contains(MerkleProofGadgetOptionFlags::value)
+        {
+            witness.set_hash_target(self.value, value)?;
+        }
+        if !self
+            .option_flags
+            .contains(MerkleProofGadgetOptionFlags::siblings)
+        {
+            for (i, sibling) in self.siblings.iter().enumerate() {
+              if i >= siblings.len() {
+                panic!("siblings len is not equal to height");
+              }
+                witness.set_hash_target(*sibling, siblings[i])?;
+            }
+        }
+        Ok(())
+    }
     pub fn set_witness<F: RichField>(
         &self,
         witness: &mut PartialWitness<F>,

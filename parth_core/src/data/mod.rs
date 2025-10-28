@@ -7,3 +7,4 @@ pub mod queue;
 pub mod job_serialized;
 pub mod buffer_writable;
 pub mod maybe_serialization;
+pub mod proof_input;
