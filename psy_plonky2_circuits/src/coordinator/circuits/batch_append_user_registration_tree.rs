@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use parth_core::{crypto::hash::{merkle_proof::MerkleProofCore, spiderman::SpidermanUpdateProof, traits::MerkleZeroHasher}, data::proof_input::CircuitInputWithDependencies, pgoldilocks::QHashOut};
+use parth_core::{crypto::hash::{spiderman::SpidermanUpdateProof, traits::MerkleZeroHasher}, pgoldilocks::QHashOut};
 use plonky2::{
     hash::hash_types::{HashOut, HashOutTarget}, iop::
         witness::{PartialWitness, WitnessWrite}, plonk::{
@@ -9,18 +9,17 @@ use plonky2::{
         proof::ProofWithPublicInputs,
     }, field::types::Field
 };
-use psy_core::{constants::protocol::{get_default_worker_public_key, DEFAULT_USER_STATE_TREE_ROOT_U64}, job::job_id::{ProvingJobCircuitType, QProvingJobDataID}};
-use psy_data::{agg::{AggStateTransition, TPAltCircuitFingerprintConfig}, guta::header::GlobalUserTreeAggregatorHeader, proof_input::guta::{GUTANoChangeFullInput, GUTAOnlyRegisterUsersInput, GUTARegisterUserFullInput}, protocol::circuit_inputs::{agg_part_1::QCAggUserRegistartionDeployContractsGUTAInput, append_user_registration_tree::QCAppendUserRegistrationTreeCircuitInput}, v1::qdata::{checkpoint::PQEDCheckpointLeafCompactWithStateRoots, pm_jobs_completed_stats::PPMJobsCompletedStats}};
+use psy_core::{constants::protocol::get_default_worker_public_key, job::job_id::QProvingJobDataID};
+use psy_data::{protocol::circuit_inputs::append_user_registration_tree::QCAppendUserRegistrationTreeCircuitInput, v1::qdata::pm_jobs_completed_stats::PPMJobsCompletedStats};
 use psy_plonky2_basic_helpers::{
-    builder::{comparison::CircuitBuilderComparison, hash::core::CircuitBuilderHashCore, pad_circuit::{pad_circuit_degree, CircuitBuilderQEDCommonGates}}, verifier::circuit_library::CircuitInfoLibrary,
+    builder::{hash::core::CircuitBuilderHashCore, pad_circuit::CircuitBuilderQEDCommonGates}, verifier::circuit_library::CircuitInfoLibrary,
    
 };
 use psy_plonky2_common_circuits::traits::ToTargets;
-use crate::{gadgets::qdata::pm_jobs_completed_stats::PMJobsCompletedStatsGadget, guta::gadgets::guta_only_register_users_gadget::GUTAOnlyRegisterUsersGadget, proof_minifier::{pm_chain_dynamic::QEDProofMinifierDynamicChain, pm_core::get_circuit_fingerprint_generic}, qstandard::{proof_store::{QProofStoreReaderAsync, QProofStoreReaderSync}, provable::QStandardCircuitProvable, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QStandardCircuitProvableWithProofStoreSync}};
+use crate::{gadgets::qdata::pm_jobs_completed_stats::PMJobsCompletedStatsGadget, proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{proof_store::{QProofStoreReaderAsync, QProofStoreReaderSync}, provable::QStandardCircuitProvable, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QStandardCircuitProvableWithProofStoreSync}};
 
 use crate::coordinator::gadgets::append_user_registration_tree::BatchAppendUserRegistrationTreeGadget;
 
-use crate::{coordinator::gadgets::verify_agg_user_registration_deploy_guta::VerifyAggUserRegistartionDeployContractsGUTAGadget};
 
 #[derive(Debug)]
 pub struct BatchAppendUserRegistrationTreeCircuit<C: GenericConfig<D>, const D: usize>
@@ -106,7 +105,7 @@ where
         pw.set_hash_target(self.worker_public_key, worker_public_key.0)?;
 
         let jobs_completed_stats = PPMJobsCompletedStats::new_register_users_with_zero(C::F::ZERO, C::F::ONE);
-        self.pm_jobs_completed.set_witness(&mut pw, &jobs_completed_stats);
+        self.pm_jobs_completed.set_witness(&mut pw, &jobs_completed_stats)?;
 
         self.batch_append_gadget.set_witness_params(
             &mut pw,

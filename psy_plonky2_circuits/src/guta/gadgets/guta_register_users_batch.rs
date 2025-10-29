@@ -6,7 +6,7 @@ use psy_data::{guta::header::GlobalUserTreeAggregatorHeader, proof_input::guta::
 use crate::{treeprover::subtree::gadgets::subtree_core::SubTreeNodeStateTransitionGadget, utils::alghash::AlgHashable};
 
 use super::{guta_header::GlobalUserTreeAggregatorHeaderGadget, guta_register_users::GUTARegisterUsersGadget, helpers::ToGUTAHeader, verify_guta_proof_to_line::VerifyGUTAProofToLineGadget};
-use plonky2::field::types::Field;
+
 
 
 

@@ -1,6 +1,6 @@
 use parth_core::crypto::hash::traits::{MerkleHasher, ZeroableHash};
 
-use crate::{agg::{AggStateTrackableInput, AggStateTrackableWithEventsInput, AggStateTransitionInput, AggStateTransitionWithEventsInput}, tree_planner::{BinaryTreeJob, BinaryTreePlanner}};
+use crate::{agg::{AggStateTrackableInput, AggStateTransitionInput}, tree_planner::{BinaryTreeJob, BinaryTreePlanner}};
 
 
 pub trait TPLeafAggregator<IL, IO> {

@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use parth_core::{crypto::hash::{merkle_proof::MerkleProofCore, spiderman::SpidermanUpdateProof, traits::MerkleZeroHasher}, data::proof_input::CircuitInputWithDependencies, pgoldilocks::QHashOut};
+use parth_core::{crypto::hash::traits::MerkleZeroHasher, data::proof_input::CircuitInputWithDependencies, pgoldilocks::QHashOut};
 use plonky2::{
     hash::hash_types::{HashOut, HashOutTarget}, iop::
         witness::{PartialWitness, WitnessWrite}, plonk::{
@@ -7,20 +7,15 @@ use plonky2::{
         circuit_data::{CircuitConfig, CircuitData, CommonCircuitData, VerifierOnlyCircuitData},
         config::{AlgebraicHasher, GenericConfig},
         proof::ProofWithPublicInputs,
-    }, field::types::Field
+    }
 };
-use psy_core::{constants::protocol::{get_default_worker_public_key, DEFAULT_USER_STATE_TREE_ROOT_U64}, job::job_id::{ProvingJobCircuitType, QProvingJobDataID}};
-use psy_data::{agg::{AggStateTransition, TPAltCircuitFingerprintConfig}, guta::header::GlobalUserTreeAggregatorHeader, proof_input::guta::{GUTANoChangeFullInput, GUTAOnlyRegisterUsersInput, GUTARegisterUserFullInput}, protocol::circuit_inputs::{agg_part_1::QCAggUserRegistartionDeployContractsGUTAInput, append_user_registration_tree::QCAppendUserRegistrationTreeCircuitInput, checkpoint_transition::QCQEDCheckpointStateTransitionInput, deploy_contracts::QCBatchDeployContractsCircuitInput}, v1::qdata::{checkpoint::PQEDCheckpointLeafCompactWithStateRoots, contract::PQEDContractLeaf, pm_jobs_completed_stats::PPMJobsCompletedStats}};
+use psy_core::job::job_id::QProvingJobDataID;
+use psy_data::protocol::circuit_inputs::checkpoint_transition::QCQEDCheckpointStateTransitionInput;
 use psy_plonky2_basic_helpers::{
-    builder::{comparison::CircuitBuilderComparison, hash::core::CircuitBuilderHashCore, pad_circuit::{pad_circuit_degree, CircuitBuilderQEDCommonGates}}, verifier::circuit_library::CircuitInfoLibrary,
+    builder::{hash::core::CircuitBuilderHashCore, pad_circuit::CircuitBuilderQEDCommonGates}, verifier::circuit_library::CircuitInfoLibrary,
    
 };
-use psy_plonky2_common_circuits::traits::ToTargets;
-use crate::{coordinator::gadgets::deploy_contract::BatchDeployContractsGadget, gadgets::qdata::pm_jobs_completed_stats::PMJobsCompletedStatsGadget, guta::gadgets::guta_only_register_users_gadget::GUTAOnlyRegisterUsersGadget, proof_minifier::{pm_chain_dynamic::QEDProofMinifierDynamicChain, pm_core::get_circuit_fingerprint_generic}, qstandard::{proof_store::{QProofStoreReaderAsync, QProofStoreReaderSync}, provable::QStandardCircuitProvable, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QStandardCircuitProvableWithProofStoreSync}};
-
-use crate::coordinator::gadgets::append_user_registration_tree::BatchAppendUserRegistrationTreeGadget;
-
-use crate::{coordinator::gadgets::verify_agg_user_registration_deploy_guta::VerifyAggUserRegistartionDeployContractsGUTAGadget};
+use crate::{proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{proof_store::QProofStoreReaderAsync, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync}};
 
 use crate::coordinator::gadgets::{
     checkpoint_state_transition::CheckpointStateTransitionCoreGadget,

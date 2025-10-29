@@ -9,10 +9,10 @@ use plonky2::{
         proof::ProofWithPublicInputs,
     }, field::types::Field
 };
-use psy_core::{constants::protocol::DEFAULT_USER_STATE_TREE_ROOT_U64, job::job_id::{ProvingJobCircuitType, QProvingJobDataID}};
-use psy_data::{proof_input::guta::{GUTANoChangeFullInput, GUTAOnlyRegisterUsersInput, GUTARegisterUserFullInput}, v1::qdata::{checkpoint::PQEDCheckpointLeafCompactWithStateRoots, pm_jobs_completed_stats::PPMJobsCompletedStats}};
+use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
+use psy_data::{proof_input::guta::{GUTAOnlyRegisterUsersInput, GUTARegisterUserFullInput}, v1::qdata::pm_jobs_completed_stats::PPMJobsCompletedStats};
 use psy_plonky2_basic_helpers::{
-    builder::{comparison::CircuitBuilderComparison, hash::core::CircuitBuilderHashCore, pad_circuit::{pad_circuit_degree, CircuitBuilderQEDCommonGates}}, verifier::circuit_library::CircuitInfoLibrary,
+    builder::{hash::core::CircuitBuilderHashCore, pad_circuit::CircuitBuilderQEDCommonGates}, verifier::circuit_library::CircuitInfoLibrary,
    
 };
 use psy_plonky2_common_circuits::traits::ToTargets;

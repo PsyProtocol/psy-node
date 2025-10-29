@@ -6,7 +6,7 @@ use plonky2::{
         circuit_data::{CircuitConfig, CircuitData, CommonCircuitData, VerifierOnlyCircuitData},
         config::{AlgebraicHasher, GenericConfig},
         proof::ProofWithPublicInputs,
-    }, field::types::Field
+    }
 };
 use parth_core::{
     crypto::hash::{merkle_proof::MerkleProofCore, traits::MerkleZeroHasher},
@@ -18,8 +18,7 @@ use psy_core::
 ;
 use psy_data::{
     guta::header::GlobalUserTreeAggregatorHeader,
-    proof_input::guta::{VerifyGUTAToCapCircuitInputSimple, 
-        VerifyGUTAToCapUpgradeCheckpointCircuitInputSimple}
+    proof_input::guta::VerifyGUTAToCapCircuitInputSimple
     ,
 };
 use psy_plonky2_basic_helpers::{
@@ -29,7 +28,7 @@ use psy_plonky2_basic_helpers::{
     },
     verifier::circuit_library::CircuitInfoLibrary,
 };
-use psy_plonky2_common_circuits::{hash::merkle::gadgets::historical_root_merkle_proof::HistoricalRootMerkleProofGadget, traits::ToTargets};
+use psy_plonky2_common_circuits::traits::ToTargets;
 
 use crate::{
     gadgets::qdata::pm_jobs_completed_stats::PMJobsCompletedStatsGadget,
@@ -161,7 +160,7 @@ where
             top_line_siblings,
         )?;
 
-        pw.set_hash_target(self.worker_public_key_target, worker_public_key.0);
+        pw.set_hash_target(self.worker_public_key_target, worker_public_key.0)?;
 
         self.circuit_data.prove(pw)
 

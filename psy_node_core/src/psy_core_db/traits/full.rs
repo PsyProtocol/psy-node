@@ -3,7 +3,7 @@ use auto_impl::auto_impl;
 use parth_core::{
     crypto::hash::{
         merkle_proof::{DeltaMerkleProofCore, MerkleProofCore},
-        tag_tree::{TagTreeMerkleProof, TagTreeStorageNode},
+        tag_tree::TagTreeMerkleProof,
     },
     data::{
         db::row::QDatabaseSingleIdTableRow,
@@ -12,7 +12,6 @@ use parth_core::{
             merkle_store_key::{QMerkleStoreDoubleIdKey, QMerkleStoreDoubleIdNode, QMerkleStoreSingleIdKey, QMerkleStoreSingleIdNode},
         },
     },
-    protocol::core_types::QNetworkDatabaseTypes,
     QCoreProcCheckpointUniqueId,
 };
 use psy_data::v1::qdata::{

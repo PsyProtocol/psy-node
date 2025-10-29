@@ -2,7 +2,6 @@
 use hex::FromHexError;
 use parth_core::{data::{hash::merkle_node_key::{SimpleMerkleNodeKey, JOB_ID_EMPTY_REWARD_PATH_INFO}, queue::queue_key::PCoreQueueItemBase, serializable::{QPDSerializable, QPDSerializableFixed}}, utils::QPGenRandom, QJobIdBase, QJobIdCreatable, QJobIdSerialized, QProvingJobDataIDWithRewardPath};
 use serde::{Deserialize, Serialize};
-use serde_repr::{Deserialize_repr, Serialize_repr};
 use serde_with::serde_as;
 use ts_rs::TS;
 #[derive(TS)]

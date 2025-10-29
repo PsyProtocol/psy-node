@@ -2,7 +2,7 @@ use parth_core::pgoldilocks::QHashOut;
 use plonky2::{field::extension::Extendable, hash::hash_types::{HashOutTarget, RichField}, iop::{target::Target, witness::Witness}, plonk::{circuit_builder::CircuitBuilder, config::AlgebraicHasher}};
 use psy_data::v1::qdata::contract::PQEDContractLeaf;
 use psy_plonky2_basic_helpers::{builder::core::CircuitBuilderHelpersCore};
-use psy_plonky2_common_circuits::traits::{AlgebraicHashableTarget, CreatableTarget, FromTargets, ToTargets, WitnessValueFor};
+use psy_plonky2_common_circuits::traits::{AlgebraicHashableTarget, FromTargets, ToTargets, WitnessValueFor};
 
 #[derive(Clone, Debug, PartialEq, Eq, Copy)]
 pub struct QEDContractLeafGadget {

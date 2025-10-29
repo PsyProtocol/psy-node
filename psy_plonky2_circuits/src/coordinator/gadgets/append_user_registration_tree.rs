@@ -1,40 +1,16 @@
-use async_trait::async_trait;
 use plonky2::{
-    field::{extension::Extendable, types::Field}, gates::{constant::ConstantGate, gate::GateRef}, hash::hash_types::{HashOut, HashOutTarget, RichField}, iop::{target::Target, 
-        witness::{PartialWitness, Witness, WitnessWrite}}, plonk::{
+    field::extension::Extendable, hash::hash_types::{HashOutTarget, RichField}, iop::witness::Witness, plonk::{
         circuit_builder::CircuitBuilder,
-        circuit_data::{CircuitConfig, CircuitData, CommonCircuitData, VerifierCircuitTarget, VerifierOnlyCircuitData},
-        config::{AlgebraicHasher, GenericConfig},
-        proof::{ProofWithPublicInputs, ProofWithPublicInputsTarget},
+        config::AlgebraicHasher,
     }
 };
 use parth_core::{
-    crypto::hash::{merkle_proof::{DeltaMerkleProofCore, MerkleProofCore}, spiderman::SpidermanUpdateProof, traits::MerkleZeroHasher},
-    data::proof_input::CircuitInputWithDependencies,
+    crypto::hash::spiderman::SpidermanUpdateProof,
     pgoldilocks::QHashOut,
 };
-use psy_core::{constants::protocol::DA_CHALLENGE_WINDOW, 
-    job::job_id::QProvingJobDataID}
-;
-use psy_data::{
-    agg::AggStateTransition, guta::header::GlobalUserTreeAggregatorHeader, proof_input::guta::{VerifyGUTAToCapCircuitInputSimple, 
-        VerifyGUTAToCapUpgradeCheckpointCircuitInputSimple}, v1::qdata::{checkpoint::PQEDCheckpointLeafStats, contract::PQEDContractLeaf, pm_rewards_commitment::PPMRewardCommitment}
-};
-use psy_plonky2_basic_helpers::{
-    builder::{
-        hash::core::CircuitBuilderHashCore,
-        pad_circuit::pad_circuit_degree,
-    },
-    verifier::circuit_library::CircuitInfoLibrary,
-};
-use psy_plonky2_common_circuits::{hash::merkle::gadgets::{delta_merkle_proof::DeltaMerkleProofGadget, historical_root_merkle_proof::HistoricalRootMerkleProofGadget, merkle_proof::MerkleProofGadget, spiderman_append_proof::SpidermanAppendProofGadget}, traits::ToTargets};
+use psy_plonky2_common_circuits::hash::merkle::gadgets::spiderman_append_proof::SpidermanAppendProofGadget;
 
-use crate::{
-    coordinator::gadgets::verify_agg_user_registration_deploy_guta::VerifyAggUserRegistartionDeployContractsGUTAHeaderGadget, gadgets::qdata::{checkpoint::QEDCheckpointLeafGadget, checkpoint_state_roots::QEDCheckpointGlobalStateRootsGadget, checkpoint_stats::QEDCheckpointLeafStatsGadget, pm_jobs_completed_stats::PMJobsCompletedStatsGadget, pm_reward_commitment::PMRewardCommitmentGadget}, guta::gadgets::
-        verify_guta_proof_to_line::VerifyGUTAProofToLineGadget, proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{proof_store::QProofStoreReaderAsync, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync}
-};
 
-use crate::gadgets::qdata::contract::QEDContractLeafGadget;
 
 
 // we keep this separate from DPNProvingSessionCompactMethodCallGadget incase it changes in the future

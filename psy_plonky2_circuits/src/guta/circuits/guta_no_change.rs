@@ -13,7 +13,7 @@ use plonky2::{
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{proof_input::guta::GUTANoChangeFullInput, v1::qdata::{checkpoint::PQEDCheckpointLeafCompactWithStateRoots, pm_jobs_completed_stats::PPMJobsCompletedStats}};
 use psy_plonky2_basic_helpers::{
-    builder::{comparison::CircuitBuilderComparison, hash::core::CircuitBuilderHashCore, pad_circuit::{pad_circuit_degree, CircuitBuilderQEDCommonGates}}, verifier::circuit_library::CircuitInfoLibrary,
+    builder::{hash::core::CircuitBuilderHashCore, pad_circuit::{pad_circuit_degree, CircuitBuilderQEDCommonGates}}, verifier::circuit_library::CircuitInfoLibrary,
    
 };
 use psy_plonky2_common_circuits::traits::ToTargets;

@@ -7,16 +7,15 @@ use plonky2::{
         circuit_data::{CircuitConfig, CircuitData, CommonCircuitData, VerifierOnlyCircuitData},
         config::{AlgebraicHasher, GenericConfig},
         proof::ProofWithPublicInputs,
-    }, field::types::Field
+    }
 };
-use psy_core::{constants::protocol::{get_default_worker_public_key, DEFAULT_USER_STATE_TREE_ROOT_U64}, job::job_id::{ProvingJobCircuitType, QProvingJobDataID}};
-use psy_data::{proof_input::guta::{GUTANoChangeFullInput, GUTAOnlyRegisterUsersInput, GUTARegisterUserFullInput}, protocol::circuit_inputs::append_user_registration_tree::QCAppendUserRegistrationTreeCircuitInput, v1::qdata::{checkpoint::PQEDCheckpointLeafCompactWithStateRoots, pm_jobs_completed_stats::PPMJobsCompletedStats}};
+use psy_core::{constants::protocol::get_default_worker_public_key, job::job_id::QProvingJobDataID};
+use psy_data::protocol::circuit_inputs::append_user_registration_tree::QCAppendUserRegistrationTreeCircuitInput;
 use psy_plonky2_basic_helpers::{
-    builder::{comparison::CircuitBuilderComparison, hash::core::CircuitBuilderHashCore, pad_circuit::{pad_circuit_degree, CircuitBuilderQEDCommonGates}}, verifier::circuit_library::CircuitInfoLibrary,
+    builder::{hash::core::CircuitBuilderHashCore, pad_circuit::CircuitBuilderQEDCommonGates}, verifier::circuit_library::CircuitInfoLibrary,
    
 };
-use psy_plonky2_common_circuits::traits::ToTargets;
-use crate::{gadgets::qdata::pm_jobs_completed_stats::PMJobsCompletedStatsGadget, guta::gadgets::guta_only_register_users_gadget::GUTAOnlyRegisterUsersGadget, proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{proof_store::{QProofStoreReaderAsync, QProofStoreReaderSync}, provable::QStandardCircuitProvable, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QStandardCircuitProvableWithProofStoreSync}};
+use crate::{proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{proof_store::{QProofStoreReaderAsync, QProofStoreReaderSync}, provable::QStandardCircuitProvable, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QStandardCircuitProvableWithProofStoreSync}};
 
 use crate::coordinator::gadgets::append_user_registration_tree::BatchAppendUserRegistrationTreeGadget;
 

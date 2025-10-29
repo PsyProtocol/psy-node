@@ -1,8 +1,8 @@
 
 use plonky2::{
     field::extension::Extendable,
-    hash::{hash_types::{HashOut, HashOutTarget, RichField}, poseidon::PoseidonHash},
-    iop::{target::Target, witness::Witness},
+    hash::hash_types::{HashOut, HashOutTarget, RichField},
+    iop::witness::Witness,
     plonk::{circuit_builder::CircuitBuilder, config::AlgebraicHasher},
 };
 use parth_core::{crypto::hash::{merkle_proof::MerkleProofCore, traits::MerkleZeroHasher}, pgoldilocks::QHashOut};

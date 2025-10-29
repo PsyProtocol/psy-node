@@ -7,16 +7,16 @@ use plonky2::{
         circuit_data::{CircuitConfig, CircuitData, CommonCircuitData, VerifierOnlyCircuitData},
         config::{AlgebraicHasher, GenericConfig},
         proof::ProofWithPublicInputs,
-    }, field::types::Field
+    }
 };
-use psy_core::{constants::protocol::DEFAULT_USER_STATE_TREE_ROOT_U64, job::job_id::{ProvingJobCircuitType, QProvingJobDataID}};
-use psy_data::{guta::header::GlobalUserTreeAggregatorHeader, proof_input::guta::{GUTANoChangeFullInput, GUTAOnlyRegisterUsersInput, GUTARegisterUserFullInput, VerifyGUTARegisterUsersCircuitInputSimple}, v1::qdata::{checkpoint::PQEDCheckpointLeafCompactWithStateRoots, pm_jobs_completed_stats::PPMJobsCompletedStats}};
+use psy_core::job::job_id::QProvingJobDataID;
+use psy_data::{guta::header::GlobalUserTreeAggregatorHeader, proof_input::guta::{GUTARegisterUserFullInput, VerifyGUTARegisterUsersCircuitInputSimple}};
 use psy_plonky2_basic_helpers::{
-    builder::{comparison::CircuitBuilderComparison, hash::core::CircuitBuilderHashCore, pad_circuit::{pad_circuit_degree, CircuitBuilderQEDCommonGates}}, verifier::circuit_library::CircuitInfoLibrary,
+    builder::hash::core::CircuitBuilderHashCore, verifier::circuit_library::CircuitInfoLibrary,
    
 };
 use psy_plonky2_common_circuits::traits::ToTargets;
-use crate::{gadgets::qdata::pm_jobs_completed_stats::PMJobsCompletedStatsGadget, guta::gadgets::guta_only_register_users_gadget::GUTAOnlyRegisterUsersGadget, proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{proof_store::QProofStoreReaderAsync, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync}};
+use crate::{gadgets::qdata::pm_jobs_completed_stats::PMJobsCompletedStatsGadget, proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{proof_store::QProofStoreReaderAsync, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync}};
 
 use crate::{guta::gadgets::guta_register_users_batch::GUTARegisterUsersBatchGadget};
 
@@ -147,13 +147,6 @@ where
         pw.set_hash_target(self.worker_public_key_target, worker_public_key.0)?;
 
 
-        let default_user_state_tree_root = QHashOut::from_values(
-            DEFAULT_USER_STATE_TREE_ROOT_U64[0],
-            DEFAULT_USER_STATE_TREE_ROOT_U64[1],
-            DEFAULT_USER_STATE_TREE_ROOT_U64[2],
-            DEFAULT_USER_STATE_TREE_ROOT_U64[3],
-        );
-
 
         self.register_batch_gadget.set_witness_params(
             &mut pw,
@@ -163,7 +156,7 @@ where
             verifier_data,
             top_line_siblings,
             guta_register_user_inputs,
-            default_user_state_tree_root
+            self.default_user_state_tree_root
         )?;
 
         self.circuit_data.prove(pw)

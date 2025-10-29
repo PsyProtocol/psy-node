@@ -1,48 +1,18 @@
-use async_trait::async_trait;
+use parth_core::{crypto::hash::spiderman::SpidermanUpdateProof, pgoldilocks::QHashOut};
 use plonky2::{
-    field::{extension::Extendable, types::Field}, gates::{constant::ConstantGate, gate::GateRef}, hash::hash_types::{HashOut, HashOutTarget, RichField}, iop::
-        witness::{PartialWitness, Witness, WitnessWrite}, plonk::{
-        circuit_builder::CircuitBuilder,
-        circuit_data::{CircuitConfig, CircuitData, CommonCircuitData, VerifierOnlyCircuitData},
-        config::{AlgebraicHasher, GenericConfig},
-        proof::ProofWithPublicInputs,
-    }
+    field::extension::Extendable,
+    hash::hash_types::RichField,
+    iop::witness::Witness,
+    plonk::{circuit_builder::CircuitBuilder, config::AlgebraicHasher},
 };
-use parth_core::{
-    crypto::hash::{merkle_proof::MerkleProofCore, spiderman::SpidermanUpdateProof, traits::MerkleZeroHasher},
-    data::proof_input::CircuitInputWithDependencies,
-    pgoldilocks::QHashOut,
-};
-use psy_core::
-    job::job_id::QProvingJobDataID
-;
-use psy_data::{
-    guta::header::GlobalUserTreeAggregatorHeader,
-    proof_input::guta::{VerifyGUTAToCapCircuitInputSimple, 
-        VerifyGUTAToCapUpgradeCheckpointCircuitInputSimple}, v1::qdata::contract::PQEDContractLeaf
-    ,
-};
-use psy_plonky2_basic_helpers::{
-    builder::{
-        connect::CircuitBuilderConnectHelpers, hash::core::CircuitBuilderHashCore, pad_circuit::pad_circuit_degree
-    },
-    verifier::circuit_library::CircuitInfoLibrary,
-};
-use psy_plonky2_common_circuits::{hash::merkle::gadgets::{historical_root_merkle_proof::HistoricalRootMerkleProofGadget, spiderman_append_proof::SpidermanAppendProofGadget}, traits::ToTargets};
-
-use crate::{
-    gadgets::qdata::pm_jobs_completed_stats::PMJobsCompletedStatsGadget,
-    guta::gadgets::
-        verify_guta_proof_to_line::VerifyGUTAProofToLineGadget
-    ,
-    proof_minifier::pm_core::get_circuit_fingerprint_generic,
-    qstandard::{proof_store::QProofStoreReaderAsync, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync},
-};
+use psy_data::v1::qdata::contract::PQEDContractLeaf;
+use psy_plonky2_basic_helpers::builder::connect::CircuitBuilderConnectHelpers;
+use psy_plonky2_common_circuits::hash::merkle::gadgets::spiderman_append_proof::SpidermanAppendProofGadget;
 
 use crate::gadgets::qdata::contract::QEDContractLeafGadget;
 
-
-// we keep this separate from DPNProvingSessionCompactMethodCallGadget incase it changes in the future
+// we keep this separate from DPNProvingSessionCompactMethodCallGadget incase it
+// changes in the future
 #[derive(Debug, Clone)]
 pub struct BatchDeployContractsGadget {
     pub spiderman_gadget: SpidermanAppendProofGadget,
@@ -56,32 +26,22 @@ impl BatchDeployContractsGadget {
         batch_sub_tree_height: usize,
         max_contract_state_tree_height: usize,
     ) -> Self {
-        let top_line_height = contract_tree_height-batch_sub_tree_height;
-        let spiderman_gadget = SpidermanAppendProofGadget::add_virtual_to::<H,F,D>(
-            builder,
-            top_line_height,
-            batch_sub_tree_height,
-        );
+        let top_line_height = contract_tree_height - batch_sub_tree_height;
+        let spiderman_gadget = SpidermanAppendProofGadget::add_virtual_to::<H, F, D>(builder, top_line_height, batch_sub_tree_height);
 
-        let total_leaves = 1usize<<batch_sub_tree_height;
-        let contract_leaves = (0..total_leaves).map(|_| {
-            QEDContractLeafGadget::add_virtual_to(builder, max_contract_state_tree_height)
-        }).collect::<Vec<_>>();
+        let total_leaves = 1usize << batch_sub_tree_height;
+        let contract_leaves = (0..total_leaves)
+            .map(|_| QEDContractLeafGadget::add_virtual_to(builder, max_contract_state_tree_height))
+            .collect::<Vec<_>>();
 
-
-
-        // for all the newly added contract leaves, ensure their hashes correspond to our append spiderman tree proof
-        for (i, (leaf, is_added) )in contract_leaves.iter().zip(spiderman_gadget.get_added_leaves().iter()).enumerate() {
-            let contract_leaf_hash = leaf.to_hash::<H,F,D>(builder);
+        // for all the newly added contract leaves, ensure their hashes correspond to
+        // our append spiderman tree proof
+        for (i, (leaf, is_added)) in contract_leaves.iter().zip(spiderman_gadget.get_added_leaves().iter()).enumerate() {
+            let contract_leaf_hash = leaf.to_hash::<H, F, D>(builder);
             // tracing::debug!("Deploy contract spiderman gadget: {:#?}", spiderman_gadget);
             // tracing::debug!("Deploy contract leaf hash: {:#?}", contract_leaf_hash);
-            builder.connect_hashes_if_true(
-                *is_added,
-                contract_leaf_hash,
-                spiderman_gadget.web_proof.new_leaves[i],
-            );
+            builder.connect_hashes_if_true(*is_added, contract_leaf_hash, spiderman_gadget.web_proof.new_leaves[i]);
         }
-
 
         Self {
             spiderman_gadget,
@@ -94,8 +54,9 @@ impl BatchDeployContractsGadget {
         spiderman_append_proof: &SpidermanUpdateProof<QHashOut<F>>,
         contract_leaves: &[PQEDContractLeaf<F, QHashOut<F>>],
     ) -> anyhow::Result<()> {
-        // tracing::debug!("Deploy contract append proof: {:#?}", spiderman_append_proof);
-        // tracing::debug!("Deploy contract leaves: {:#?}", contract_leaves);
+        // tracing::debug!("Deploy contract append proof: {:#?}",
+        // spiderman_append_proof); tracing::debug!("Deploy contract leaves:
+        // {:#?}", contract_leaves);
         self.spiderman_gadget.set_witness(witness, spiderman_append_proof)?;
         for (g, v) in self.contract_leaves.iter().zip(contract_leaves.iter()) {
             g.set_witness(witness, v)?;

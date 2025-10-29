@@ -1,12 +1,10 @@
 use async_trait::async_trait;
-use cf_utils::timer::DebugTimer;
 use parth_core::{
-    crypto::hash::{merkle_proof::MerkleProofCore, traits::MerkleZeroHasher},
+    crypto::hash::traits::MerkleZeroHasher,
     data::proof_input::CircuitInputWithDependencies,
     pgoldilocks::{QHashOut, QRichField},
 };
 use plonky2::{
-    field::types::Field,
     gates::{constant::ConstantGate, gate::GateRef},
     hash::hash_types::{HashOut, HashOutTarget},
     iop::witness::{PartialWitness, WitnessWrite},
@@ -18,17 +16,14 @@ use plonky2::{
     },
 };
 use psy_core::job::job_id::QProvingJobDataID;
-use psy_data::{
-    guta::header::GlobalUserTreeAggregatorHeader,
+use psy_data::
     proof_input::guta::{
-        VerifyGUTAToCapCircuitInputSimple, VerifyGUTAToCapUpgradeCheckpointCircuitInputSimple, VerifyLeftEndCapRightGUTAInput,
-        VerifyLeftEndCapRightGUTAInputSimple, VerifySingleEndCapInput, VerifyTwoEndCapCircuitInput, VerifyTwoGUTAProofUpgradeCheckpointStandardInput,
+        VerifyTwoGUTAProofUpgradeCheckpointStandardInput,
         VerifyTwoGUTAProofUpgradeCheckpointStandardInputSimple,
-    },
-    v1::qdata::pm_jobs_completed_stats::PPMJobsCompletedStats,
-};
+    }
+;
 use psy_plonky2_basic_helpers::{
-    builder::{hash::core::CircuitBuilderHashCore, pad_circuit::pad_circuit_degree},
+    builder::hash::core::CircuitBuilderHashCore,
     verifier::circuit_library::CircuitInfoLibrary,
 };
 use psy_plonky2_common_circuits::{hash::merkle::gadgets::historical_root_merkle_proof::HistoricalRootMerkleProofGadget, traits::ToTargets};
@@ -36,11 +31,10 @@ use psy_plonky2_common_circuits::{hash::merkle::gadgets::historical_root_merkle_
 use crate::{
     gadgets::qdata::pm_jobs_completed_stats::PMJobsCompletedStatsGadget,
     guta::gadgets::{
-        helpers::ToGUTAHeader, two_nca_state_transition::TwoNCAStateTransitionGadget, verify_end_cap::VerifyEndCapProofGadget,
-        verify_guta_proof::VerifyGUTAProofGadget, verify_guta_proof_to_line::VerifyGUTAProofToLineGadget,
+        helpers::ToGUTAHeader, two_nca_state_transition::TwoNCAStateTransitionGadget, verify_guta_proof::VerifyGUTAProofGadget,
     },
     proof_minifier::{pm_chain_dynamic::QEDProofMinifierDynamicChain, pm_core::get_circuit_fingerprint_generic},
-    qstandard::{proof_store::QProofStoreReaderAsync, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync}, utils::converthashout::{convert_ho_guta_header_to_qhashout, convert_q_guta_header_to_hashout},
+    qstandard::{proof_store::QProofStoreReaderAsync, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync},
 };
 
 #[derive(Debug)]
@@ -261,7 +255,6 @@ where
         self.historical_checkpoint_proof_b
             .set_witness_proof_core(&mut pw, &input.historical_checkpoint_proof_b)?;
 
-        let guta_header_a= input.get_guta_header_a::<C::Hasher>();
 
         self.a_guta_gadget.set_witness(
             &mut pw,

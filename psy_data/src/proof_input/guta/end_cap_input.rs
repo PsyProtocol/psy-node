@@ -184,8 +184,7 @@ pub mod gen_fake_data {
         guta::stats::GUTAStats,
         proof_input::guta::{end_cap_input::SubmitUserEndCapNonProofInput, SubmitUserEndCapNonProofCoreInput},
         v1::qdata::{
-            checkpoint,
-            contract::{self, DashMapContractHeightCache, PSimpleContractHeightCache, QEDContractStateUpdateHistory},
+            contract::{DashMapContractHeightCache, PSimpleContractHeightCache, QEDContractStateUpdateHistory},
             user::PQEDUserLeaf,
             user_end_cap_result::PUPSEndCapResultCompact,
         },
@@ -214,7 +213,7 @@ pub mod gen_fake_data {
                 let max_leaf_id = 1u64 << contract_state_tree_height;
                 contract_helper.add_contract(0, contract_state_tree_height, tree.get_root());
 
-                for i in 0..1000 {
+                for _ in 0..1000 {
                     let rand_leaf_id = rand::random::<u64>() % max_leaf_id;
                     tree.set_leaf(rand_leaf_id, Hash::qp_rand_gen());
                 }

@@ -1,5 +1,5 @@
 use parth_core::pgoldilocks::QHashOut;
-use plonky2::{field::extension::Extendable, hash::hash_types::{HashOutTarget, RichField}, iop::{target::Target, witness::{Witness, WitnessWrite}}, plonk::{circuit_builder::CircuitBuilder, config::AlgebraicHasher}};
+use plonky2::{field::extension::Extendable, hash::hash_types::{HashOutTarget, RichField}, iop::{target::Target, witness::Witness}, plonk::{circuit_builder::CircuitBuilder, config::AlgebraicHasher}};
 use psy_data::v1::qdata::pm_rewards_commitment::PPMRewardCommitment;
 use psy_plonky2_common_circuits::traits::{AlgebraicHashableTarget, CreatableTarget, FromTargets, ToTargets, WitnessValueFor};
 

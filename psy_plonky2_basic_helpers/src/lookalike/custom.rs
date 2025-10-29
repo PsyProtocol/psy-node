@@ -18,7 +18,7 @@ pub fn get_lookalike_custom<C: GenericConfig<D>, const D: usize>(
     let input_hash = builder.add_virtual_hash();
     let output_hash = builder.hash_two_to_one::<C::Hasher>(input_hash, input_hash);
 
-    for i in 0..public_inputs {
+    for _ in 0..public_inputs {
         builder.register_public_input(output_hash.elements[0]);
     }
     match common_gates_type {

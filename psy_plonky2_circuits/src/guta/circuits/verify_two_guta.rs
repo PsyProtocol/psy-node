@@ -1,12 +1,10 @@
 use async_trait::async_trait;
-use cf_utils::timer::DebugTimer;
 use parth_core::{
-    crypto::hash::{merkle_proof::MerkleProofCore, traits::MerkleZeroHasher},
+    crypto::hash::traits::MerkleZeroHasher,
     data::proof_input::CircuitInputWithDependencies,
     pgoldilocks::{QHashOut, QRichField},
 };
 use plonky2::{
-    field::types::Field,
     gates::{constant::ConstantGate, gate::GateRef},
     hash::hash_types::{HashOut, HashOutTarget},
     iop::witness::{PartialWitness, WitnessWrite},
@@ -18,29 +16,24 @@ use plonky2::{
     },
 };
 use psy_core::job::job_id::QProvingJobDataID;
-use psy_data::{
-    guta::header::GlobalUserTreeAggregatorHeader,
+use psy_data::
     proof_input::guta::{
-        VerifyGUTAToCapCircuitInputSimple, VerifyGUTAToCapUpgradeCheckpointCircuitInputSimple, VerifyLeftEndCapRightGUTAInput,
-        VerifyLeftEndCapRightGUTAInputSimple, VerifySingleEndCapInput, VerifyTwoEndCapCircuitInput, VerifyTwoGUTAProofGadgetStandardInput,
-        VerifyTwoGUTAProofGadgetStandardInputSimple, VerifyTwoGUTAProofUpgradeCheckpointStandardInput,
-        VerifyTwoGUTAProofUpgradeCheckpointStandardInputSimple,
-    },
-    v1::qdata::pm_jobs_completed_stats::PPMJobsCompletedStats,
-};
+        VerifyTwoGUTAProofGadgetStandardInput,
+        VerifyTwoGUTAProofGadgetStandardInputSimple,
+    }
+;
 use psy_plonky2_basic_helpers::{
     builder::{hash::core::CircuitBuilderHashCore, pad_circuit::pad_circuit_degree},
     verifier::circuit_library::CircuitInfoLibrary,
 };
-use psy_plonky2_common_circuits::{hash::merkle::gadgets::historical_root_merkle_proof::HistoricalRootMerkleProofGadget, traits::ToTargets};
+use psy_plonky2_common_circuits::traits::ToTargets;
 
 use crate::{
     gadgets::qdata::pm_jobs_completed_stats::PMJobsCompletedStatsGadget,
     guta::gadgets::{
-        helpers::ToGUTAHeader, two_nca_state_transition::TwoNCAStateTransitionGadget, verify_end_cap::VerifyEndCapProofGadget,
-        verify_guta_proof::VerifyGUTAProofGadget, verify_guta_proof_to_line::VerifyGUTAProofToLineGadget,
+        helpers::ToGUTAHeader, two_nca_state_transition::TwoNCAStateTransitionGadget, verify_guta_proof::VerifyGUTAProofGadget,
     },
-    proof_minifier::{pm_chain_dynamic::QEDProofMinifierDynamicChain, pm_core::get_circuit_fingerprint_generic},
+    proof_minifier::pm_core::get_circuit_fingerprint_generic,
     qstandard::{proof_store::QProofStoreReaderAsync, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync},
 };
 #[derive(Debug)]

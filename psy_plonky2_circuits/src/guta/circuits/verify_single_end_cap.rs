@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use plonky2::{
-    gates::{constant::ConstantGate, gate::GateRef}, hash::hash_types::{HashOut, HashOutTarget}, iop::
+    hash::hash_types::{HashOut, HashOutTarget}, iop::
         witness::{PartialWitness, WitnessWrite}, plonk::{
         circuit_builder::CircuitBuilder,
         circuit_data::{CircuitConfig, CircuitData, CommonCircuitData, VerifierOnlyCircuitData},
@@ -9,7 +9,7 @@ use plonky2::{
     }, field::types::Field
 };
 use parth_core::{
-    crypto::hash::{merkle_proof::MerkleProofCore, traits::MerkleZeroHasher},
+    crypto::hash::traits::MerkleZeroHasher,
     data::proof_input::CircuitInputWithDependencies,
     pgoldilocks::{QHashOut, QRichField},
 };
@@ -17,9 +17,7 @@ use psy_core::
     job::job_id::QProvingJobDataID
 ;
 use psy_data::{
-    guta::header::GlobalUserTreeAggregatorHeader,
-    proof_input::guta::{VerifyGUTAToCapCircuitInputSimple, 
-        VerifyGUTAToCapUpgradeCheckpointCircuitInputSimple, VerifyLeftEndCapRightGUTAInput, VerifyLeftEndCapRightGUTAInputSimple, VerifySingleEndCapInput}, v1::qdata::pm_jobs_completed_stats::PPMJobsCompletedStats
+    proof_input::guta::VerifySingleEndCapInput, v1::qdata::pm_jobs_completed_stats::PPMJobsCompletedStats
     ,
 };
 use psy_plonky2_basic_helpers::{
@@ -29,18 +27,15 @@ use psy_plonky2_basic_helpers::{
     },
     verifier::circuit_library::CircuitInfoLibrary,
 };
-use psy_plonky2_common_circuits::{hash::merkle::gadgets::historical_root_merkle_proof::HistoricalRootMerkleProofGadget, traits::ToTargets};
+use psy_plonky2_common_circuits::traits::ToTargets;
 
 use crate::{
     gadgets::qdata::pm_jobs_completed_stats::PMJobsCompletedStatsGadget,
-    guta::gadgets::
-        verify_guta_proof_to_line::VerifyGUTAProofToLineGadget
-    ,
     proof_minifier::pm_core::get_circuit_fingerprint_generic,
     qstandard::{proof_store::QProofStoreReaderAsync, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync},
 };
 
-use crate::{guta::gadgets::{helpers::ToGUTAHeader, two_nca_state_transition::TwoNCAStateTransitionGadget, verify_end_cap::VerifyEndCapProofGadget, verify_guta_proof::VerifyGUTAProofGadget}};
+use crate::guta::gadgets::verify_end_cap::VerifyEndCapProofGadget;
 
 
 #[derive(Debug)]
@@ -65,7 +60,7 @@ where
             end_cap_proof_verifier_data_cap_height: usize,
             known_end_cap_fingerprint: QHashOut<C::F>,
             global_user_tree_height: usize,
-            guta_circuit_whitelist_tree_height: u8,
+            _guta_circuit_whitelist_tree_height: u8,
             checkpoint_tree_height: usize,
         ) -> Self {
 

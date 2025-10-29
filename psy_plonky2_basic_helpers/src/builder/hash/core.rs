@@ -11,9 +11,6 @@ use plonky2::hash::hashing::PlonkyPermutation;
 
 use crate::builder::comparison::CircuitBuilderComparison;
 use crate::builder::core::CircuitBuilderHelpersCore;
-use crate::builder::select::CircuitBuilderSelectHelpers;
-use crate::u32::arithmetic_u32::U32Target;
-
 const NUM_HASH_OUT_ELEMENTS: usize = 4;
 pub trait CircuitBuilderHashCore<F: RichField + Extendable<D>, const D: usize> {
     fn ensure_hash_is_zero(&mut self, hash: HashOutTarget);
