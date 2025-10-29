@@ -6,3 +6,5 @@ pub mod treeprover;
 pub mod gadgets;
 pub mod user_id;
 pub mod utils;
+pub mod coordinator;
+pub mod agg;

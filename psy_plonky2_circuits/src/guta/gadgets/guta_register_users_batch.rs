@@ -36,6 +36,7 @@ impl<const D: usize> GUTARegisterUsersBatchGadget<D> {
     where
         <C as GenericConfig<D>>::Hasher: MerkleZeroHasher<HashOut<F>> +AlgebraicHasher<F>,
     {
+        println!("GUTARegisterUsersBatchGadget::add_virtual_to: verifier_data_cap_height: {}, global_user_tree_realm_height: {}, global_user_tree_height: {}, max_users: {}", verifier_data_cap_height, global_user_tree_realm_height, global_user_tree_height, max_users);
 
         assert!(global_user_tree_realm_height <= global_user_tree_height, "global_user_tree_realm_height cannot be taller than global_user_tree_height");
         let verify_to_line_gadget = VerifyGUTAProofToLineGadget::<D>::add_virtual_to::<C, F>(

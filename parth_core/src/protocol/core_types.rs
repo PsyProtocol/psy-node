@@ -86,7 +86,25 @@ pub trait QNetworkTreeConstants: Sized + Send + Sync + Copy + Clone {
     const MAX_USERS: u64; // = 2**GLOBAL_USER_TREE_HEIGHT
     const MAX_REALMS: u32; // = 2**COORDINATOR_GLOBAL_USER_TREE_HEIGHT
     const MAX_USERS_PER_REALM: u32; // = 2**REALM_GLOBAL_USER_TREE_HEIGHT
+
+
+
 }
+
+pub trait QNetworkTreeCircuitConstants: Sized + Send + Sync + Copy + Clone {
+    const GUTA_CIRCUIT_WHITELIST_TREE_HEIGHT: u8;
+    const MAX_USERS_TO_REGISTER_PER_PROOF: usize;
+    const ONLY_REGISTER_USERS_MAX_USERS_PER_PROOF: usize;
+    const BATCH_USER_REGISTRATION_SUB_TREE_HEIGHT: usize;
+    const BATCH_USER_REGISTRATION_MAX_SUB_TREES: usize;
+    const BATCH_DEPLOY_CONTRACT_SUB_TREE_HEIGHT: usize;
+}
+
+pub trait QNetworkCircuitConstants: QNetworkTreeCircuitConstants + QNetworkTreeConstants {
+}
+impl<T: QNetworkTreeCircuitConstants + QNetworkTreeConstants> QNetworkCircuitConstants for T {}
+
+
 pub trait QNetworkHashTypes{
     type QHash: QFHashBase<Self::F> + Q256BitHash + PsySerializeCanonicalAsyncSafe;
     type HasherBase: QFHasherU64<Self::F, Self::QHash> + Send + Sync;
@@ -100,7 +118,7 @@ pub trait QNetworkZKTypes: QNetworkHashTypes {
     type ZKVerifier: QZKProofVerifier<Self::QHash, Self::ZKProof> + Send + Sync;
 }
 
-pub trait QNetworkTypesConfig: QNetworkDatabaseTypes + QNetworkTreeConstants + QNetworkZKTypes + QJobIdBase + QJobPlanner<Self::JobId>  + Sized + Send + Sync + Copy + Clone + Default {
+pub trait QNetworkTypesConfig: QNetworkDatabaseTypes + QNetworkCircuitConstants + QNetworkZKTypes + QJobIdBase + QJobPlanner<Self::JobId>  + Sized + Send + Sync + Copy + Clone + Default {
     type JobId: QJobIdBase;
     type JobPlanner: QJobPlanner<Self::JobId> + Send + Sync;
 }

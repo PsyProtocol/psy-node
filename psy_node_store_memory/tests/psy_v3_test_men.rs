@@ -78,6 +78,7 @@ impl QNetworkTreeConstants for SimpleTestNetworkConfig {
     const MAX_USERS_PER_REALM: u32 = 1 << Self::REALM_GLOBAL_USER_TREE_HEIGHT;
 }
 
+
 impl QNetworkHashTypes for SimpleTestNetworkConfig {
     type QHash = ExHash;
 

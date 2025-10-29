@@ -110,6 +110,9 @@ pub fn get_default_worker_public_key<Hash: FromU64x4>() -> Hash {
     Hash::from_u64s(1,1,1,1)
 }
 
+pub const TODO_DEPOSIT_TREE_HEIGHT: u8 = 32;
+pub const TODO_WITHDRAWAL_TREE_HEIGHT: u8 = 32;
+
 #[cfg(test)]
 mod tests {
     use super::*;

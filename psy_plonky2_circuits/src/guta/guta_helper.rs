@@ -19,8 +19,7 @@ use super::circuits::{
     verify_single_end_cap::GUTAVerifySingleEndCapCircuit, verify_two_end_cap::GUTAVerifyTwoEndCapCircuit, verify_two_guta::GUTAVerifyTwoGUTACircuit,
 };
 use crate::{guta::circuits::{
-    verify_guta_to_cap,
-    verify_guta_to_cap_upgrade_checkpoint::{self, GUTAVerifyGUTAToCapUpgradeCheckpointCircuit},
+    verify_guta_to_cap_upgrade_checkpoint::GUTAVerifyGUTAToCapUpgradeCheckpointCircuit,
     verify_two_guta_upgrade_checkpoint::GUTAVerifyTwoGUTAUpgradeCheckpointCircuit,
 }, qstandard::{proof_store::QProofStoreReaderAsync, prover::QNextGenWorkerGenericProverAsyncMut, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync}};
 
@@ -72,6 +71,8 @@ where
         checkpoint_tree_height: usize,
         group_realm_height: usize,
         max_users_to_register_per_proof: usize,
+                only_register_max_users_per_proof: usize,
+
         default_user_state_tree_root: QHashOut<C::F>,
         public_key: QHashOut<C::F>,
     ) -> Self {
@@ -87,6 +88,7 @@ where
             checkpoint_tree_height,
             group_realm_height,
             max_users_to_register_per_proof,
+            only_register_max_users_per_proof,
             known_end_cap_fingerprint,
             default_user_state_tree_root,
             public_key,
@@ -102,6 +104,7 @@ where
         checkpoint_tree_height: usize,
         group_realm_height: usize,
         max_users_to_register_per_proof: usize,
+        only_register_max_users_per_proof: usize,
         known_end_cap_fingerprint: QHashOut<C::F>,
         default_user_state_tree_root: QHashOut<C::F>,
         public_key: QHashOut<C::F>,
@@ -170,7 +173,7 @@ where
         let verify_guta_to_cap_upgrade_checkpoint =
             GUTAVerifyGUTAToCapUpgradeCheckpointCircuit::<C, D>::new(guta_proof_common_data, guta_proof_verifier_data_cap_height, global_user_tree_realm_height, global_user_tree_height, guta_circuit_whitelist_tree_height, checkpoint_tree_height);
 
-        let only_register_users = GUTAOnlyRegisterUsersCircuit::<C, D>::new(64, global_user_tree_realm_height, global_user_tree_height, group_realm_height, default_user_state_tree_root);
+        let only_register_users = GUTAOnlyRegisterUsersCircuit::<C, D>::new(only_register_max_users_per_proof, global_user_tree_realm_height, global_user_tree_height, group_realm_height, default_user_state_tree_root);
 
         let no_change = GUTANoChangeCircuit::<C, D>::new(checkpoint_tree_height);
 
@@ -505,10 +508,8 @@ where
 }
 #[cfg(test)]
 mod tests {
-    use bincode::de;
     use parth_core::pgoldilocks::QHashOut;
     use plonky2::plonk::config::PoseidonGoldilocksConfig;
-    use psy_core::constants::protocol::GUTA_CIRCUIT_WHITELIST_TREE_HEIGHT;
     use psy_plonky2_basic_helpers::lookalike::{custom::get_lookalike_custom, types::QCircuitCommonGatesType};
     use super::QEDGUTACircuitManager;
 
@@ -523,6 +524,7 @@ mod tests {
         let checkpoint_tree_height = 32;
         let group_realm_height = 1;
         let max_users_to_register_per_proof = 32;
+        let only_register_max_users_per_proof = 64;
 
         let known_end_cap_fingerprint = QHashOut::rand();
         let default_user_state_tree_root = QHashOut::rand();
@@ -536,6 +538,7 @@ mod tests {
             checkpoint_tree_height,
             group_realm_height,
             max_users_to_register_per_proof,
+            only_register_max_users_per_proof,
             known_end_cap_fingerprint,
             default_user_state_tree_root,
             QHashOut::rand(), // public_key for testing

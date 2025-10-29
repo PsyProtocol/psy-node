@@ -48,6 +48,8 @@ where
         ) -> Self {
 
 
+            println!("GUTAVerifyGUTARegisterUsersCircuit: guta_proof_verifier_data_cap_height: {guta_proof_verifier_data_cap_height}, max_users: {max_users}, global_user_tree_realm_height: {global_user_tree_realm_height}, global_user_tree_height: {global_user_tree_height}, group_realm_height: {group_realm_height}, guta_circuit_whitelist_tree_height: {guta_circuit_whitelist_tree_height}");
+
         let config = CircuitConfig::standard_recursion_config();
         let mut builder = CircuitBuilder::<C::F, D>::new(config);
 

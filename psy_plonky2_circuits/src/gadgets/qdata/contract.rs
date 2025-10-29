@@ -27,7 +27,7 @@ impl AlgebraicHashableTarget for QEDContractLeafGadget {
     }
 }
 impl QEDContractLeafGadget {
-    fn add_virtual_to<F: RichField + Extendable<D>, const D: usize>(
+    pub fn add_virtual_to<F: RichField + Extendable<D>, const D: usize>(
         builder: &mut CircuitBuilder<F, D>,
         max_contract_state_tree_height: usize,
     ) -> Self {

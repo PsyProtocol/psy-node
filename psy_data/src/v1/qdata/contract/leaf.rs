@@ -26,6 +26,15 @@ pub struct PQEDContractLeaf<F, Hash> {
 }
 
 pser::impl_bytemuck_pod_and_zeroable!(PQEDContractLeaf, F, Hash);
+impl<F: Default, Hash: Default> Default for PQEDContractLeaf<F, Hash> {
+    fn default() -> Self {
+        PQEDContractLeaf {
+            deployer: Hash::default(),
+            function_tree_root: Hash::default(),
+            state_tree_height: F::default(),
+        }
+    }
+}
 
 impl_qpd_serialize_params!(
     PQEDContractLeaf,
