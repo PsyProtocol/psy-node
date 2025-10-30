@@ -9,13 +9,13 @@ use plonky2::{
         proof::ProofWithPublicInputs,
     }
 };
-use psy_core::{constants::protocol::get_default_worker_public_key, job::job_id::QProvingJobDataID};
+use psy_core::{constants::protocol::get_default_worker_public_key, job::job_id::{ProvingJobCircuitType, QProvingJobDataID}};
 use psy_data::protocol::circuit_inputs::append_user_registration_tree::QCAppendUserRegistrationTreeCircuitInput;
 use psy_plonky2_basic_helpers::{
     builder::{hash::core::CircuitBuilderHashCore, pad_circuit::CircuitBuilderQEDCommonGates}, verifier::circuit_library::CircuitInfoLibrary,
    
 };
-use crate::{proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{proof_store::{QProofStoreReaderAsync, QProofStoreReaderSync}, provable::QStandardCircuitProvable, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QStandardCircuitProvableWithProofStoreSync}};
+use crate::{proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{proof_store::{QProofStoreReaderAsync, QProofStoreReaderSync}, provable::QStandardCircuitProvable, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QStandardCircuitProvableWithProofStoreSync, QPsyNetworkCircuitWithType}};
 
 use crate::coordinator::gadgets::append_user_registration_tree::BatchAppendUserRegistrationTreeGadget;
 
@@ -31,6 +31,12 @@ pub struct AggDepositsWithdrawalsCircuit<C: GenericConfig<D>, const D: usize>
     pub fingerprint: QHashOut<C::F>,
 }
 
+impl<C: GenericConfig<D>, const D: usize> QPsyNetworkCircuitWithType for AggDepositsWithdrawalsCircuit<C, D>
+{
+    fn get_circuit_type(&self) -> ProvingJobCircuitType {
+        ProvingJobCircuitType::AggAddProcessL1WithdrawalAddL1Deposit
+    }
+}
 impl<C: GenericConfig<D>, const D: usize> AggDepositsWithdrawalsCircuit<C, D>
 where
     C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> {

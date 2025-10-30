@@ -12,7 +12,7 @@ use parth_core::{
     crypto::hash::traits::MerkleZeroHasher, data::proof_input::CircuitInputWithDependencies, pgoldilocks::{QHashOut, QRichField}
 };
 use psy_core::
-    job::job_id::QProvingJobDataID
+    job::job_id::{ProvingJobCircuitType, QProvingJobDataID}
 ;
 use psy_data::
     proof_input::guta::{VerifyLeftGUTARightEndCapInput, VerifyLeftGUTARightEndCapInputSimple}
@@ -30,7 +30,7 @@ use psy_plonky2_common_circuits::traits::ToTargets;
 use crate::{
     gadgets::qdata::pm_jobs_completed_stats::PMJobsCompletedStatsGadget,
     proof_minifier::pm_core::get_circuit_fingerprint_generic,
-    qstandard::{proof_store::QProofStoreReaderAsync, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync},
+    qstandard::{proof_store::QProofStoreReaderAsync, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QPsyNetworkCircuitWithType},
 };
 
 use crate::{guta::gadgets::{helpers::ToGUTAHeader, two_nca_state_transition::TwoNCAStateTransitionGadget, verify_end_cap::VerifyEndCapProofGadget, verify_guta_proof::VerifyGUTAProofGadget}};
@@ -50,6 +50,13 @@ where
     pub fingerprint: QHashOut<C::F>,
 }
 
+impl<C: GenericConfig<D>, const D: usize> QPsyNetworkCircuitWithType for GUTAVerifyLeftGUTARightEndCapCircuit<C, D> where
+    C::Hasher:AlgebraicHasher<C::F>,
+{
+    fn get_circuit_type(&self) -> ProvingJobCircuitType {
+        ProvingJobCircuitType::GUTALeftGUTARightEndCap
+    }
+}
 impl<C: GenericConfig<D> + 'static, const D: usize> GUTAVerifyLeftGUTARightEndCapCircuit<C, D>
 where
     C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>>, C::F: QRichField {

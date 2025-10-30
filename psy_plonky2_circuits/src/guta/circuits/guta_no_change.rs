@@ -18,7 +18,7 @@ use psy_plonky2_basic_helpers::{
 };
 use psy_plonky2_common_circuits::traits::ToTargets;
 
-use crate::{gadgets::qdata::pm_jobs_completed_stats::PMJobsCompletedStatsGadget, guta::gadgets::guta_no_change_gadget::GUTANoChangeGadget, proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{proof_store::QProofStoreReaderAsync, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync}};
+use crate::{gadgets::qdata::pm_jobs_completed_stats::PMJobsCompletedStatsGadget, guta::gadgets::guta_no_change_gadget::GUTANoChangeGadget, proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{proof_store::QProofStoreReaderAsync, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QPsyNetworkCircuitWithType}};
 
 #[derive(Debug)]
 pub struct GUTANoChangeCircuit<C: GenericConfig<D>, const D: usize> {
@@ -30,7 +30,12 @@ pub struct GUTANoChangeCircuit<C: GenericConfig<D>, const D: usize> {
     pub circuit_data: CircuitData<C::F, C, D>,
     pub fingerprint: QHashOut<C::F>,
 }
-
+impl<C: GenericConfig<D>, const D: usize> QPsyNetworkCircuitWithType for GUTANoChangeCircuit<C, D>
+{
+    fn get_circuit_type(&self) -> ProvingJobCircuitType {
+        ProvingJobCircuitType::GUTANoChange
+    }
+}
 impl<C: GenericConfig<D>, const D: usize> GUTANoChangeCircuit<C, D>
 where
     C::Hasher: AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>>,

@@ -9,14 +9,14 @@ use plonky2::{
         proof::ProofWithPublicInputs,
     }, field::types::Field
 };
-use psy_core::{constants::protocol::get_default_worker_public_key, job::job_id::QProvingJobDataID};
+use psy_core::{constants::protocol::get_default_worker_public_key, job::job_id::{ProvingJobCircuitType, QProvingJobDataID}};
 use psy_data::{protocol::circuit_inputs::append_user_registration_tree::QCAppendUserRegistrationTreeCircuitInput, v1::qdata::pm_jobs_completed_stats::PPMJobsCompletedStats};
 use psy_plonky2_basic_helpers::{
     builder::{hash::core::CircuitBuilderHashCore, pad_circuit::CircuitBuilderQEDCommonGates}, verifier::circuit_library::CircuitInfoLibrary,
    
 };
 use psy_plonky2_common_circuits::traits::ToTargets;
-use crate::{gadgets::qdata::pm_jobs_completed_stats::PMJobsCompletedStatsGadget, proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{proof_store::{QProofStoreReaderAsync, QProofStoreReaderSync}, provable::QStandardCircuitProvable, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QStandardCircuitProvableWithProofStoreSync}};
+use crate::{gadgets::qdata::pm_jobs_completed_stats::PMJobsCompletedStatsGadget, proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{proof_store::{QProofStoreReaderAsync, QProofStoreReaderSync}, provable::QStandardCircuitProvable, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QStandardCircuitProvableWithProofStoreSync, QPsyNetworkCircuitWithType}};
 
 use crate::coordinator::gadgets::append_user_registration_tree::BatchAppendUserRegistrationTreeGadget;
 
@@ -34,6 +34,13 @@ pub struct BatchAppendUserRegistrationTreeCircuit<C: GenericConfig<D>, const D: 
     pub fingerprint: QHashOut<C::F>,
 }
 
+
+impl<C: GenericConfig<D>, const D: usize> QPsyNetworkCircuitWithType for BatchAppendUserRegistrationTreeCircuit<C, D>
+{
+    fn get_circuit_type(&self) -> ProvingJobCircuitType {
+        ProvingJobCircuitType::AppendUserRegistrationTree
+    }
+}
 impl<C: GenericConfig<D>, const D: usize> BatchAppendUserRegistrationTreeCircuit<C, D>
 where
     C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> {

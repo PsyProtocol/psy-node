@@ -9,14 +9,14 @@ use plonky2::{
         proof::ProofWithPublicInputs,
     }
 };
-use psy_core::job::job_id::QProvingJobDataID;
+use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{guta::header::GlobalUserTreeAggregatorHeader, proof_input::guta::{GUTARegisterUserFullInput, VerifyGUTARegisterUsersCircuitInputSimple}};
 use psy_plonky2_basic_helpers::{
     builder::hash::core::CircuitBuilderHashCore, verifier::circuit_library::CircuitInfoLibrary,
    
 };
 use psy_plonky2_common_circuits::traits::ToTargets;
-use crate::{gadgets::qdata::pm_jobs_completed_stats::PMJobsCompletedStatsGadget, proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{proof_store::QProofStoreReaderAsync, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync}};
+use crate::{gadgets::qdata::pm_jobs_completed_stats::PMJobsCompletedStatsGadget, proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{proof_store::QProofStoreReaderAsync, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QPsyNetworkCircuitWithType}};
 
 use crate::{guta::gadgets::guta_register_users_batch::GUTARegisterUsersBatchGadget};
 
@@ -31,6 +31,14 @@ pub struct GUTAVerifyGUTARegisterUsersCircuit<C: GenericConfig<D>, const D: usiz
     pub circuit_data: CircuitData<C::F, C, D>,
     pub fingerprint: QHashOut<C::F>,
 
+}
+
+
+impl<C: GenericConfig<D>, const D: usize> QPsyNetworkCircuitWithType for GUTAVerifyGUTARegisterUsersCircuit<C, D>
+{
+    fn get_circuit_type(&self) -> ProvingJobCircuitType {
+        ProvingJobCircuitType::GUTARegisterUsers
+    }
 }
 
 impl<C: GenericConfig<D>, const D: usize> GUTAVerifyGUTARegisterUsersCircuit<C, D>

@@ -16,7 +16,7 @@ use plonky2::{
     },
 };
 use psy_core::
-    job::job_id::QProvingJobDataID
+    job::job_id::{ProvingJobCircuitType, QProvingJobDataID}
 ;
 use psy_data::{
     guta::header::GlobalUserTreeAggregatorHeader,
@@ -39,7 +39,7 @@ use crate::{
         verify_guta_proof_to_line::VerifyGUTAProofToLineGadget
     ,
     proof_minifier::pm_core::get_circuit_fingerprint_generic,
-    qstandard::{proof_store::QProofStoreReaderAsync, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync},
+    qstandard::{proof_store::QProofStoreReaderAsync, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QPsyNetworkCircuitWithType},
 };
 
 #[derive(Debug)]
@@ -51,6 +51,14 @@ pub struct GUTAVerifyGUTAToCapUpgradeCheckpointCircuit<C: GenericConfig<D>, cons
 
     pub circuit_data: CircuitData<C::F, C, D>,
     pub fingerprint: QHashOut<C::F>,
+}
+
+
+impl<C: GenericConfig<D>, const D: usize> QPsyNetworkCircuitWithType for GUTAVerifyGUTAToCapUpgradeCheckpointCircuit<C, D>
+{
+    fn get_circuit_type(&self) -> ProvingJobCircuitType {
+        ProvingJobCircuitType::GUTAVerifyToCapWithCheckpointUpgrade
+    }
 }
 
 impl<C: GenericConfig<D>, const D: usize> GUTAVerifyGUTAToCapUpgradeCheckpointCircuit<C, D>

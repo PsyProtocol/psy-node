@@ -15,7 +15,7 @@ use plonky2::{
         proof::ProofWithPublicInputs,
     },
 };
-use psy_core::job::job_id::QProvingJobDataID;
+use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::
     proof_input::guta::{
         VerifyTwoGUTAProofUpgradeCheckpointStandardInput,
@@ -34,7 +34,7 @@ use crate::{
         helpers::ToGUTAHeader, two_nca_state_transition::TwoNCAStateTransitionGadget, verify_guta_proof::VerifyGUTAProofGadget,
     },
     proof_minifier::{pm_chain_dynamic::QEDProofMinifierDynamicChain, pm_core::get_circuit_fingerprint_generic},
-    qstandard::{proof_store::QProofStoreReaderAsync, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync},
+    qstandard::{proof_store::QProofStoreReaderAsync, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QPsyNetworkCircuitWithType},
 };
 
 #[derive(Debug)]
@@ -57,6 +57,14 @@ where
     pub minifier_chain: QEDProofMinifierDynamicChain<D, C::F, C>,
 }
 
+
+impl<C: GenericConfig<D>, const D: usize> QPsyNetworkCircuitWithType for GUTAVerifyTwoGUTAUpgradeCheckpointCircuit<C, D> where
+    C::Hasher:AlgebraicHasher<C::F>,
+{
+    fn get_circuit_type(&self) -> ProvingJobCircuitType {
+        ProvingJobCircuitType::GUTATwoGUTAWithCheckpointUpgrade
+    }
+}
 impl<C: GenericConfig<D> + 'static, const D: usize> GUTAVerifyTwoGUTAUpgradeCheckpointCircuit<C, D>
 where
     C::Hasher: AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + MerkleZeroHasher<QHashOut<C::F>>, C::F: QRichField,

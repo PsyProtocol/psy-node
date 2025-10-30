@@ -5,12 +5,15 @@ use plonky2::plonk::{
     config::GenericConfig,
     proof::ProofWithPublicInputs,
 };
-use psy_core::job::job_id::QProvingJobDataID;
+use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_plonky2_basic_helpers::verifier::circuit_library::CircuitInfoLibrary;
 use serde::{de::DeserializeOwned, Serialize};
 
 use crate::qstandard::proof_store::{QProofStoreReaderAsync, QProofStoreReaderSync};
 
+pub trait QPsyNetworkCircuitWithType {
+    fn get_circuit_type(&self) -> ProvingJobCircuitType;
+}
 pub trait QStandardCircuit<C: GenericConfig<D>, const D: usize> {
     fn get_fingerprint(&self) -> QHashOut<C::F>;
     fn get_verifier_config_ref(&self) -> &VerifierOnlyCircuitData<C, D>;
@@ -64,7 +67,6 @@ pub trait QStandardCircuit<C: GenericConfig<D>, const D: usize> {
         )
     }
 }
-
 pub trait QStandardCircuitWithDefault {
     fn new_default(network_magic: u64) -> Self;
 }

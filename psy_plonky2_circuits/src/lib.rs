@@ -8,3 +8,5 @@ pub mod user_id;
 pub mod utils;
 pub mod coordinator;
 pub mod agg;
+pub mod index;
+pub mod end_cap;

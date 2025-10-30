@@ -15,7 +15,7 @@ use plonky2::{
         proof::ProofWithPublicInputs,
     },
 };
-use psy_core::job::job_id::QProvingJobDataID;
+use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::
     proof_input::guta::{
         VerifyTwoGUTAProofGadgetStandardInput,
@@ -34,7 +34,7 @@ use crate::{
         helpers::ToGUTAHeader, two_nca_state_transition::TwoNCAStateTransitionGadget, verify_guta_proof::VerifyGUTAProofGadget,
     },
     proof_minifier::pm_core::get_circuit_fingerprint_generic,
-    qstandard::{proof_store::QProofStoreReaderAsync, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync},
+    qstandard::{proof_store::QProofStoreReaderAsync, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QPsyNetworkCircuitWithType},
 };
 #[derive(Debug)]
 pub struct GUTAVerifyTwoGUTACircuit<C: GenericConfig<D> + 'static, const D: usize>
@@ -52,6 +52,14 @@ where
     pub fingerprint: QHashOut<C::F>,
 }
 
+
+impl<C: GenericConfig<D>, const D: usize> QPsyNetworkCircuitWithType for GUTAVerifyTwoGUTACircuit<C, D> where
+    C::Hasher:AlgebraicHasher<C::F>,
+{
+    fn get_circuit_type(&self) -> ProvingJobCircuitType {
+        ProvingJobCircuitType::GUTATwoGUTA
+    }
+}
 impl<C: GenericConfig<D> + 'static, const D: usize> GUTAVerifyTwoGUTACircuit<C, D>
 where
     C::Hasher: AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + MerkleZeroHasher<QHashOut<C::F>>, C::F: QRichField,

@@ -15,7 +15,7 @@ use parth_core::{
     pgoldilocks::{QHashOut, QRichField},
 };
 use psy_core::
-    job::job_id::QProvingJobDataID
+    job::job_id::{ProvingJobCircuitType, QProvingJobDataID}
 ;
 use psy_data::{
     proof_input::guta::VerifyTwoEndCapCircuitInput, v1::qdata::pm_jobs_completed_stats::PPMJobsCompletedStats
@@ -33,7 +33,7 @@ use psy_plonky2_common_circuits::traits::ToTargets;
 use crate::{
     gadgets::qdata::pm_jobs_completed_stats::PMJobsCompletedStatsGadget,
     proof_minifier::pm_core::get_circuit_fingerprint_generic,
-    qstandard::{proof_store::QProofStoreReaderAsync, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync},
+    qstandard::{proof_store::QProofStoreReaderAsync, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QPsyNetworkCircuitWithType},
 };
 
 use crate::guta::gadgets::{two_nca_state_transition::TwoNCAStateTransitionGadget, verify_end_cap::VerifyEndCapProofGadget};
@@ -54,6 +54,14 @@ where
     pub fingerprint: QHashOut<C::F>,
 }
 
+
+impl<C: GenericConfig<D>, const D: usize> QPsyNetworkCircuitWithType for GUTAVerifyTwoEndCapCircuit<C, D> where
+    C::Hasher:AlgebraicHasher<C::F>,
+{
+    fn get_circuit_type(&self) -> ProvingJobCircuitType {
+        ProvingJobCircuitType::GUTATwoEndCap
+    }
+}
 impl<C: GenericConfig<D>+ 'static, const D: usize> GUTAVerifyTwoEndCapCircuit<C, D>
 where
     C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>>, C::F: QRichField {

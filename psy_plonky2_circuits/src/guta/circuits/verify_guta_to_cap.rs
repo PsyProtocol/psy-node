@@ -14,7 +14,7 @@ use parth_core::{
     pgoldilocks::QHashOut,
 };
 use psy_core::
-    job::job_id::QProvingJobDataID
+    job::job_id::{ProvingJobCircuitType, QProvingJobDataID}
 ;
 use psy_data::{
     guta::header::GlobalUserTreeAggregatorHeader,
@@ -36,7 +36,7 @@ use crate::{
         verify_guta_proof_to_line::VerifyGUTAProofToLineGadget
     ,
     proof_minifier::pm_core::get_circuit_fingerprint_generic,
-    qstandard::{proof_store::QProofStoreReaderAsync, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync},
+    qstandard::{proof_store::QProofStoreReaderAsync, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QPsyNetworkCircuitWithType},
 };
 
 
@@ -49,6 +49,13 @@ pub struct GUTAVerifyGUTAToCapCircuit<C: GenericConfig<D>, const D: usize>
 
     pub circuit_data: CircuitData<C::F, C, D>,
     pub fingerprint: QHashOut<C::F>,
+}
+
+impl<C: GenericConfig<D>, const D: usize> QPsyNetworkCircuitWithType for GUTAVerifyGUTAToCapCircuit<C, D>
+{
+    fn get_circuit_type(&self) -> ProvingJobCircuitType {
+        ProvingJobCircuitType::GUTAVerifyToCap
+    }
 }
 
 impl<C: GenericConfig<D>, const D: usize> GUTAVerifyGUTAToCapCircuit<C, D>

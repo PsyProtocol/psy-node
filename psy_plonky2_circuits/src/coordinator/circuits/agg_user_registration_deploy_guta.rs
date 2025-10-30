@@ -16,7 +16,7 @@ use psy_plonky2_basic_helpers::{
    
 };
 use psy_plonky2_common_circuits::traits::ToTargets;
-use crate::{proof_minifier::{pm_chain_dynamic::QEDProofMinifierDynamicChain, pm_core::get_circuit_fingerprint_generic}, qstandard::{proof_store::QProofStoreReaderAsync, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync}};
+use crate::{proof_minifier::{pm_chain_dynamic::QEDProofMinifierDynamicChain, pm_core::get_circuit_fingerprint_generic}, qstandard::{proof_store::QProofStoreReaderAsync, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QPsyNetworkCircuitWithType}};
 
 
 use crate::{coordinator::gadgets::verify_agg_user_registration_deploy_guta::VerifyAggUserRegistartionDeployContractsGUTAGadget};
@@ -33,6 +33,13 @@ where C::Hasher:AlgebraicHasher<C::F>,
     pub enable_minifier: bool,
 }
 
+
+impl<C: GenericConfig<D>, const D: usize> QPsyNetworkCircuitWithType for VerifyAggUserRegistartionDeployContractsGUTACircuit<C, D> where C::Hasher:AlgebraicHasher<C::F>,
+{
+    fn get_circuit_type(&self) -> ProvingJobCircuitType {
+        ProvingJobCircuitType::AggUserRegisterDeployContractsGUTA
+    }
+}
 impl<C: GenericConfig<D>, const D: usize> VerifyAggUserRegistartionDeployContractsGUTACircuit<C, D>
 where
     C::Hasher: AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>>+ MerkleZeroHasher<QHashOut<C::F>>, C::F: QRichField,
