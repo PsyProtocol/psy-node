@@ -38,6 +38,10 @@ jsonrpsee = { workspace = true }
 rayon = { workspace = true }
 dashmap = { workspace = true }
 
+hyper = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+
 # start local packages
 pser = { workspace = true }
 psy_serialize = { workspace = true }

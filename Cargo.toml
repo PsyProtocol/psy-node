@@ -140,6 +140,17 @@ itertools = "0.14"
 
 bitflags = "2.5.0"
 
+# start server stuff
+
+tower-http = { version = "0.6", features = ["full"] }
+tower = { version = "0.5", features = ["full"] }
+http = "1"
+http-body = "1"
+http-body-util = "0.1.0"
+hyper = "1.5"
+hyper-rustls = { version = "0.27", default-features = false }
+hyper-util = "0.1"
+
 # Workspace Packages
 cf_utils = { path = "./cf_utils" }
 

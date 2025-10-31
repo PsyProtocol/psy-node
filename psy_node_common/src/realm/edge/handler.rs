@@ -4,12 +4,7 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use jsonrpsee::core::RpcResult;
 use parth_core::{
-    crypto::hash::{merkle_proof::{compute_historical_and_current_merkle_roots_core_gt, MerkleProofCore}, traits::MerkleZeroHasher},
-    felt::ToU64Value,
-    node::realm_identifier::QRealmIdentifier,
-    protocol::core_types::{QHasherBase, QNetworkDatabaseTypes, QNetworkTypesConfig},
-    store::tag_tree_store,
-    QProvingJobDataIDWithRewardPath,
+    crypto::hash::{merkle_proof::{compute_historical_and_current_merkle_roots_core_gt, MerkleProofCore}, traits::MerkleZeroHasher}, data::hash::merkle_node_key::SimpleMerkleNodeKey, felt::ToU64Value, node::realm_identifier::QRealmIdentifier, protocol::core_types::{QHasherBase, QNetworkDatabaseTypes, QNetworkTypesConfig}, store::tag_tree_store, QProvingJobDataIDWithRewardPath
 };
 use psy_core::job::job_id::ProvingJobCircuitType;
 use psy_data::{
@@ -124,6 +119,32 @@ impl<
         }
 
         Ok(())
+    }
+
+    pub async fn generate_batch_proof_miner_reward_proofs_internal(
+        &self,
+        unique_pending_id: u64,
+        job_ids: Vec<QProvingJobDataIDWithRewardPath<N::JobId>>,
+    ) -> anyhow::Result<Vec<PsyProoffMinerRewardProof<N::QHash, N::JobId>>> {
+
+        
+        //let top_proof = self.db_reader.get_top_global_user_rewards_tree_proof_to_realm_at_unique_pending_id(unique_pending_id).await?;
+
+        //let (unique_pending_id, proc_checkpoint_id) = self.temp_db.get_unique_pending_ids(&self.realm_identifier).await?;
+        let merkle_node_keys = job_ids
+            .iter()
+            .map(|job_id_with_path| SimpleMerkleNodeKey::from_reward_path_info(job_id_with_path.reward_path_info))
+            .collect::<Vec<_>>();
+
+        self.tag_tree_rewards_store.rewards_tag_tree_get_tag_tree_merkle_proof_at_unique_pending_id(
+            unique_pending_id,
+            &merkle_node_keys,
+        ).await?.into_iter().zip(job_ids.iter()).map(|(proof, job_id_with_path)| {
+            Ok(PsyProoffMinerRewardProof {
+                job_id: job_id_with_path.job_data_id.clone(),
+                tag_tree_proof: proof,
+            })
+        }).collect()
     }
 }
 
@@ -448,12 +469,12 @@ impl<
         res(self.db_reader.global_user_tree_get_merkle_proof(checkpoint_id, user_id).await)
     }
 
-    // do not implement this yet
+
     async fn generate_batch_proof_miner_reward_proofs(
         &self,
         unique_pending_id: u64,
         job_ids: Vec<QProvingJobDataIDWithRewardPath<N::JobId>>,
     ) -> QRpcResult<Vec<PsyProoffMinerRewardProof<N::QHash, N::JobId>>> {
-        todo!("not implemented yet");
+        res(self.generate_batch_proof_miner_reward_proofs_internal(unique_pending_id, job_ids).await)
     }
 }

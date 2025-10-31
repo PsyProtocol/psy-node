@@ -309,13 +309,14 @@ pub trait PsyNodeCoreRewardsTagTreeStoreReader<F, Hash> {
         &self,
         unique_pending_id: u64,
         nodes: &[SimpleMerkleNodeKey],
-    ) -> anyhow::Result<Vec<Option<Hash>>>;
+    ) -> anyhow::Result<Vec<TagTreeMerkleProof<Hash>>>;
 }
 
 #[async_trait]
 #[auto_impl(&, Arc)]
 pub trait PsyNodeCoreRewardsTagTreeStoreWriter<F, Hash> {
     async fn rewards_tag_tree_set_node_tag(&self, unique_pending_id: u64, key: SimpleMerkleNodeKey, tag: Hash, value: Hash) -> anyhow::Result<()>;
+    async fn rewards_tag_tree_set_node_tag_only(&self, unique_pending_id: u64, key: SimpleMerkleNodeKey, tag: Hash) -> anyhow::Result<()>;
 }
 
 pub trait PsyRealmEdgeAPIStoreReader<F, Hash>:

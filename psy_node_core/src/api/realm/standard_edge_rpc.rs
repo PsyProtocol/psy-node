@@ -15,6 +15,16 @@ use psy_data::{
 
 
 #[rpc(server, client, namespace = "qed")]
+pub trait RealmEdgeRpcTest {
+    #[method(name = "get_sum")]
+    async fn get_sum(
+        &self,
+        a: u64,
+        b: u64,
+    ) -> RpcResult<u64>;
+}
+
+#[rpc(server, client, namespace = "qed")]
 pub trait RealmEdgeRpc<F, Hash, JobId, ZKProof> {
     /// Check if a user id belongs to this realm
     #[method(name = "check_user_id_in_realm")]

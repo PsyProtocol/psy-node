@@ -687,9 +687,39 @@ impl<
         let retrieved_value = db.rewards_tag_tree_get_node_values_at_unique_pending_id(unique_pending_id, &[key]).await?;
         assert_eq!(retrieved_value, vec![Some(value)]);
 
-        // Test the misnamed proof function
-        let retrieved_misnamed = db.rewards_tag_tree_get_tag_tree_merkle_proof_at_unique_pending_id(unique_pending_id, &[key]).await?;
-        assert_eq!(retrieved_misnamed, vec![Some(value)]);
+
+
+        let unique_pending_id = 2;
+        let key_child_0 = SimpleMerkleNodeKey::new(1, 0);
+        let key_child_1 = SimpleMerkleNodeKey::new(1, 1);
+        let tag_child_0 = N::QHash::qp_rand_gen();
+        let tag_child_1 = N::QHash::qp_rand_gen();
+        db.rewards_tag_tree_set_node_tag_only(unique_pending_id, key_child_0, tag_child_0).await?;
+        db.rewards_tag_tree_set_node_tag_only(unique_pending_id, key_child_1, tag_child_1).await?;
+
+        let parent_key = SimpleMerkleNodeKey::new(0, 0);
+        let parent_tag = N::QHash::qp_rand_gen();
+        db.rewards_tag_tree_set_node_tag_only(unique_pending_id, parent_key, parent_tag).await?;
+
+
+        
+        let proofs = db.rewards_tag_tree_get_tag_tree_merkle_proof_at_unique_pending_id(unique_pending_id, &[key_child_0, key_child_1, parent_key]).await?;
+        assert_eq!(proofs.len(), 3);
+        for p in proofs.iter() {
+            assert!(p.verify::<N::HasherBase>());
+        }
+
+        assert!(proofs[0].root == proofs[1].root);
+        assert!(proofs[0].root == proofs[2].root);
+        assert!(proofs[0].leaf.left == N::QHash::default(),"for leaf child, left should be default");
+        assert!(proofs[0].leaf.right == N::QHash::default(),"for leaf child, right should be default");
+        assert!(proofs[1].leaf.left == N::QHash::default(),"for leaf child, left should be default");
+        assert!(proofs[1].leaf.right == N::QHash::default(),"for leaf child, right should be default");
+        assert!(proofs[0].leaf.tag == tag_child_0, "tag mismatch for child 0");
+        assert!(proofs[1].leaf.tag == tag_child_1, "tag mismatch for child 1");
+
+        assert!(proofs[2].leaf.tag == parent_tag, "tag mismatch for parent");
+
 
         Ok(())
     }

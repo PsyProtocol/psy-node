@@ -2473,14 +2473,17 @@ impl<
         &self,
         unique_pending_id: u64,
         nodes: &[SimpleMerkleNodeKey],
-    ) -> anyhow::Result<Vec<Option<N::QHash>>> {
+    ) -> anyhow::Result<Vec<TagTreeMerkleProof<N::QHash>>> {
         // The trait has get_tag_tree_merkle_proof_at_unique_pending_id, but param
         // nodes, but return Vec<Option<Hash>>, perhaps typo, probably for proof
         // Perhaps it's get node values or something.
         // To implement, assume get node values
-        self.store
-            .db_get_tag_tree_node_values(&self.guta_reward_tag_tree_table, unique_pending_id, nodes)
-            .await
+        let futures = nodes.iter().map(|n| {
+            self.store
+                .db_get_tag_tree_merkle_proof(&self.guta_reward_tag_tree_table, unique_pending_id, n)
+        });
+        let results = futures::future::join_all(futures).await;
+        results.into_iter().collect()
     }
 }
 
@@ -2540,6 +2543,11 @@ impl<
     ) -> anyhow::Result<()> {
         self.store
             .db_set_tag_tree_tag_value(&self.guta_reward_tag_tree_table, unique_pending_id, &key, &tag, &value)
+            .await
+    }
+    async fn rewards_tag_tree_set_node_tag_only(&self, unique_pending_id: u64, key: SimpleMerkleNodeKey, tag: N::QHash) -> anyhow::Result<()> {
+        self.store
+            .db_set_tag_tree_tag(&self.guta_reward_tag_tree_table, unique_pending_id, &key, &tag)
             .await
     }
 }
