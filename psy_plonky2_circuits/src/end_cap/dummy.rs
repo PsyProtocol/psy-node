@@ -1,4 +1,4 @@
-use parth_core::{crypto::hash::traits::MerkleZeroHasher, pgoldilocks::QHashOut};
+use parth_core::{crypto::hash::traits::{FieldQHasher, MerkleZeroHasher, QFieldHashable}, felt::QFelt64, pgoldilocks::QHashOut, protocol::core_types::QFHashBase};
 use plonky2::{
     hash::hash_types::{HashOut, HashOutTarget}, iop::witness::{PartialWitness, WitnessWrite}, plonk::{
         circuit_builder::CircuitBuilder,
@@ -7,9 +7,10 @@ use plonky2::{
         proof::ProofWithPublicInputs,
     }
 };
+use psy_data::{guta::stats::GUTAStats, v1::qdata::{user::PQEDUserLeaf, user_end_cap_result::PUPSEndCapResultCompact}};
 use psy_plonky2_basic_helpers::builder::pad_circuit::{pad_circuit_degree, CircuitBuilderQEDCommonGates};
 use crate::{proof_minifier::{pm_chain_dynamic::QEDProofMinifierDynamicChain, pm_core::get_circuit_fingerprint_generic}, qstandard::QStandardCircuit};
-
+use plonky2::field::types::Field;
 
 #[derive(Debug)]
 pub struct DummyUPSStandardEndCapCircuit<C: GenericConfig<D> + 'static, const D: usize>
@@ -121,6 +122,48 @@ where
             self.base_circuit_data.verify(proof_with_pis)
         }
     }
+
+    pub fn generate_proof_for_inputs(
+        &self,
+        start_user_leaf: &PQEDUserLeaf<C::F, QHashOut<C::F>>,
+        new_user_state_root: QHashOut<C::F>,
+        new_checkpoint_id: u64,
+        new_checkpoint_root: QHashOut<C::F>,
+        number_of_transactions: u64,
+        slots_modified: u64,
+        global_user_tree_height: u8,
+    ) -> anyhow::Result<(PQEDUserLeaf<C::F, QHashOut<C::F>>, QHashOut<C::F>, GUTAStats<C::F>, PUPSEndCapResultCompact<C::F, QHashOut<C::F>>,ProofWithPublicInputs<C::F, C, D>)> where C::Hasher: FieldQHasher<C::F, QHashOut<C::F>>, C::F: QFelt64, QHashOut<<C as GenericConfig<D>>::F>: QFHashBase<<C as GenericConfig<D>>::F>{
+
+
+        let old_user_leaf_hash = start_user_leaf.qfhash::<C::Hasher>();
+        let mut new_user_leaf = start_user_leaf.clone();
+        new_user_leaf.last_checkpoint_id = C::F::from_noncanonical_u64(new_checkpoint_id);
+        new_user_leaf.nonce = new_user_leaf.nonce + C::F::from_noncanonical_u64(1);
+        new_user_leaf.user_state_tree_root = new_user_state_root;
+        let new_user_leaf_hash = new_user_leaf.qfhash::<C::Hasher>();
+        let guta_stats = GUTAStats{
+            fees_collected: C::F::from_noncanonical_u64(1000),
+            user_ops_processed: C::F::from_noncanonical_u64(1),
+            total_transactions: C::F::from_noncanonical_u64(number_of_transactions),
+            slots_modified: C::F::from_noncanonical_u64(slots_modified),
+        };
+
+
+        let end_cap_result = PUPSEndCapResultCompact {
+            start_user_leaf_hash: old_user_leaf_hash,
+            end_user_leaf_hash: new_user_leaf_hash,
+            checkpoint_tree_root_hash: new_checkpoint_root,
+            user_id: new_user_leaf.user_id,
+        };
+
+        let guta_hash = end_cap_result.qfhash_with_guta_height::<C::Hasher>(global_user_tree_height);
+        let public_inputs_expected = C::Hasher::q_two_to_one(guta_hash, guta_stats.qfhash::<C::Hasher>());
+        let proof = self.prove_base(
+            public_inputs_expected,
+        )?;
+        Ok((new_user_leaf, public_inputs_expected, guta_stats, end_cap_result, proof))
+
+    }
 }
 impl<C: GenericConfig<D> + 'static, const D: usize> QStandardCircuit<C, D>
     for DummyUPSStandardEndCapCircuit<C, D>
@@ -184,6 +227,8 @@ where
     }
 }
 */
+
+
 
 
 #[cfg(test)]

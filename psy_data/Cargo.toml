@@ -7,13 +7,14 @@ version = "0.1.0"
 
 
 [features]
-default = ["std", "parth_core/serialize_rkyv", "parth_core/serialize_speedy", "parth_core/serialize_postcard", "serialize_speedy", "serialize_postcard", "serialize_rkyv", "serialize_bytemuck", "node"]
+default = ["std", "parth_core/serialize_rkyv", "parth_core/serialize_speedy", "parth_core/serialize_postcard", "serialize_speedy", "serialize_postcard", "serialize_rkyv", "serialize_bytemuck", "node", "testbed"]
 std = ["parth_core/std", "pser/std", "psy_serialize/std", "psy_io/std"]
 serialize_rkyv = ["dep:rkyv","pser/serialize_rkyv", "parth_core/serialize_rkyv"]
 serialize_speedy = ["dep:speedy", "pser/serialize_speedy", "parth_core/serialize_speedy", "psy_core/serialize_speedy"]
 serialize_postcard = ["dep:postcard", "pser/serialize_postcard", "parth_core/serialize_postcard"]
 serialize_bytemuck = ["dep:bytemuck", "parth_core/serialize_bytemuck", "psy_serialize/serialize_bytemuck"]
 node = ["serialize_bytemuck", "serialize_speedy", "dep:dashmap"]
+testbed = []
 [dependencies]
 postcard = { workspace = true, optional = true }
 rkyv = { workspace = true, optional = true }

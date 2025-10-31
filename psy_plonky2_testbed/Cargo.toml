@@ -1,6 +1,6 @@
 [package]
 edition = "2021"
-name    = "psy_plonky2_proof"
+name    = "psy_plonky2_testbed"
 version = "0.1.0"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -40,6 +40,9 @@ parth_core = { workspace = true }
 psy_plonky2_basic_helpers = { workspace = true }
 psy_plonky2_common_circuits = { workspace = true }
 psy_plonky2_circuits = { workspace = true }
+psy_node_core = { workspace = true }
+psy_node_common = { workspace = true }
+psy_node_store_memory = { workspace = true }
 parth_common = { workspace = true }
 psy_core = { workspace = true }
 psy_data = { workspace = true }

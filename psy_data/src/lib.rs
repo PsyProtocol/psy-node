@@ -5,3 +5,5 @@ pub mod proof_input;
 pub mod agg;
 pub mod tree_planner;
 pub mod protocol;
+#[cfg(feature = "testbed")]
+pub mod testbed;

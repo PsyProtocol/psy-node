@@ -10,3 +10,4 @@ pub mod coordinator;
 pub mod agg;
 pub mod index;
 pub mod end_cap;
+pub mod generated;

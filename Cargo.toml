@@ -23,7 +23,8 @@ members = [
     "psy_plonky2_worker",
     "psy_plonky2_basic_helpers",
     "psy_plonky2_common_circuits",
-    "psy_plonky2_circuits"
+    "psy_plonky2_circuits",
+    "psy_plonky2_testbed"
 ]
 resolver = "2"
 
@@ -167,6 +168,7 @@ psy_type_defaults = { path = "./psy_type_defaults" }
 
 psy_node_redis = { path = "./psy_node_redis" }
 psy_node_nats = { path = "./psy_node_nats" }
+psy_node_store_memory = { path = "./psy_node_store_memory" }
 
 
 # Dev dependencies
