@@ -1,11 +1,12 @@
 use parth_core::{
     crypto::hash::traits::{FieldQHasher, MerkleHasher, QFieldHashable},
-    data::serializable::{ QPDSerializable},
+    data::{queue::queue_key::PCoreQueueItemBase, serializable::QPDSerializable},
     felt::QFelt64,
     impl_qpd_serialize_params,
-    protocol::core_types::{Q256BitHash, QFHashBase, QHashBase}, utils::QPGenRandom,
+    protocol::core_types::{Q256BitHash, QFHashBase, QHashBase},
+    utils::QPGenRandom,
 };
-use pser::{QBytesSerialize, QBytesDeserialize};
+use pser::{QBytesDeserialize, QBytesSerialize};
 use psy_serialize::{AutoDatabaseSerializationUseFastFixedSerialize, FastFixedSerializable, PsyCanonicalSerializeMetadata};
 
 use crate::v1::qdata::ffs_sizes::PSY_OBJECT_FFS_SIZE_ZK_PUBLIC_KEY;
@@ -43,7 +44,6 @@ fn split_64_bytes_to_two_32_byte_hashes(data: [u8; 64]) -> ([u8; 32], [u8; 32]) 
     (first, second)
 }
 
-
 pser::impl_bytemuck_ffs_tests!(
     PZKPublicKeyInfo,
     // Note the use of concrete types here
@@ -54,7 +54,8 @@ pser::impl_bytemuck_ffs_tests!(
 // This function is never called, it is just to ensure at compile time
 //  PSY_OBJECT_FFS_SIZE_USER_LEAF matches the FFS implementation
 fn _ensure_compile_time_size_match() {
-    let _bytes_h256: [u8; PSY_OBJECT_FFS_SIZE_ZK_PUBLIC_KEY] = PZKPublicKeyInfo::<parth_core::data::hash::hash256::Hash256>::qp_rand_gen().ffs_into_bytes();
+    let _bytes_h256: [u8; PSY_OBJECT_FFS_SIZE_ZK_PUBLIC_KEY] =
+        PZKPublicKeyInfo::<parth_core::data::hash::hash256::Hash256>::qp_rand_gen().ffs_into_bytes();
     let _bytes_phash: [u8; PSY_OBJECT_FFS_SIZE_ZK_PUBLIC_KEY] = PZKPublicKeyInfo::<parth_core::PHash>::qp_rand_gen().ffs_into_bytes();
 }
 impl_qpd_serialize_params!(PZKPublicKeyInfo, { Hash: QHashBase } => { Hash });
@@ -103,13 +104,38 @@ impl<Hash: Q256BitHash> FastFixedSerializable<64> for PZKPublicKeyInfo<Hash> {
     }
 }
 
+impl<Hash: Q256BitHash> PCoreQueueItemBase for PZKPublicKeyInfo<Hash> {
+    fn is_queue_item(data: &[u8]) -> bool {
+        data.len() == PSY_OBJECT_FFS_SIZE_ZK_PUBLIC_KEY
+    }
+
+    fn decode_queue_item_ref(data: &[u8]) -> anyhow::Result<Self> {
+        Self::ffs_try_from_slice(data)
+    }
+
+    fn encode_queue_item_vec(&self) -> anyhow::Result<Vec<u8>> {
+        Ok(self.ffs_to_bytes().to_vec())
+    }
+
+    fn get_restorable_job_id(&self) -> Vec<u8> {
+        self.ffs_to_bytes().to_vec()
+    }
+
+    fn get_size_hint() -> usize {
+        64
+    }
+
+    fn has_fixed_size() -> bool {
+        true
+    }
+}
 impl<Hash: Q256BitHash> PsyCanonicalSerializeMetadata for PZKPublicKeyInfo<Hash> {
     const IS_FIXED_SIZE: bool = true;
     const FIXED_SIZE: usize = 64;
 }
 impl<Hash: Q256BitHash> AutoDatabaseSerializationUseFastFixedSerialize<64> for PZKPublicKeyInfo<Hash> {}
 psy_serialize::impl_psy_canonical_serialize_for_fixed_type!(
-    PZKPublicKeyInfo, 
-    {Hash: Q256BitHash} => {Hash}, 
+    PZKPublicKeyInfo,
+    {Hash: Q256BitHash} => {Hash},
     64
 );

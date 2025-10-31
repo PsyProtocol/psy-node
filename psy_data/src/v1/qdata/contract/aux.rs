@@ -258,7 +258,7 @@ impl_qpq_serialize_bincode!(ContractConfig);
 
 #[pderive::serialize_clone_hash_ts]
 #[ts(export, concrete(Hash = parth_core::PHash), rename = "QBCDeployContract")]
-pub struct PQBCDeployContract<Hash: Copy + PartialEq + Serialize> {
+pub struct PQBCDeployContract<Hash> {
     pub deployer: Hash,
     pub code_definition: ContractCodeDefinition,
     pub function_whitelist: Vec<Hash>,

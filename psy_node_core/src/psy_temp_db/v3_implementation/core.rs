@@ -5,7 +5,8 @@ use parth_core::{
 
 use crate::{
     psy_temp_db::{
-        tt_get_expected_public_inputs_key, tt_get_expected_public_inputs_key_from_job, tt_get_submit_status_key, tt_get_unique_pending_id_key,
+        tt_get_deploy_contract_code_definition_key, tt_get_expected_public_inputs_key, tt_get_expected_public_inputs_key_from_job,
+        tt_get_submit_status_key, tt_get_unique_pending_id_key, QTempDBDeployContractDataReader, QTempDBDeployContractDataWriter,
         QTempDBExpectedPublicInputsReader, QTempDBExpectedPublicInputsWriter, QTempDBPendingIdReader, QTempDBPendingIdWriter,
         QTempDBSubmitStatusReader, QTempDBSubmitStatusWriter, TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_VALUE_SIZE,
     },
@@ -236,5 +237,42 @@ impl<T: QTempDatabaseRawKVWriterBase + Sync> QTempDBSubmitStatusWriter for T {
         let key = tt_get_submit_status_key(rid.realm_id, rid.realm_sub_id, unique_pending_id, user_or_realm_id);
         let value = status.to_le_bytes();
         self.qtdb_raw_kv_put_value(&key, &value).await
+    }
+}
+
+#[async_trait]
+impl<T: QTempDatabaseRawKVReaderBase + Sync> QTempDBDeployContractDataReader for T {
+    async fn get_deploy_contract_code_definition_raw(
+        &self,
+        rid: &QRealmIdentifier,
+        unique_pending_id: u64,
+        rand_key: &[u8; 16],
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        let key = tt_get_deploy_contract_code_definition_key(rid.realm_id, rid.realm_sub_id, unique_pending_id, rand_key);
+        let value_bytes = self.qtdb_raw_kv_get_value(&key).await?;
+        if value_bytes.is_some() {
+            let value_bytes = value_bytes.unwrap();
+            if value_bytes.len() != 8 {
+                return Ok(None);
+            }
+            Ok(Some(value_bytes))
+        } else {
+            anyhow::bail!("deploy contract code definition not found");
+        }
+    }
+}
+
+#[async_trait]
+impl<T: QTempDatabaseRawKVWriterBase + Sync> QTempDBDeployContractDataWriter for T {
+    async fn set_deploy_contract_code_definition_raw(
+        &self,
+        rid: &QRealmIdentifier,
+        unique_pending_id: u64,
+        rand_key: &[u8; 16],
+        data: Vec<u8>,
+    ) -> anyhow::Result<()> {
+        let key = tt_get_deploy_contract_code_definition_key(rid.realm_id, rid.realm_sub_id, unique_pending_id, &rand_key);
+
+        self.qtdb_raw_kv_put_value(&key, &data).await
     }
 }

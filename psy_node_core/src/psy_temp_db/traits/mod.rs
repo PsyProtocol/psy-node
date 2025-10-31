@@ -3,6 +3,7 @@ mod submit_status;
 mod witness;
 mod expected_public_inputs;
 mod user_contract_tree_updates;
+mod deploy_contract_data;
 
 
 pub trait StandardEdgeAPITempDBStoreBase<JobId: QJobIdBase, Hash: QDBHashBase>: 
@@ -10,7 +11,8 @@ pub trait StandardEdgeAPITempDBStoreBase<JobId: QJobIdBase, Hash: QDBHashBase>:
     QTempDBSubmitStatusStore + 
     QTempDBProofWitnessStore<JobId> +
     QTempDBUserContractUpdatesStore + 
-    QTempDBExpectedPublicInputsStore<JobId, Hash>
+    QTempDBExpectedPublicInputsStore<JobId, Hash> +
+    QTempDBDeployContractDataStore
 {
 
 }
@@ -23,7 +25,8 @@ impl<
     QTempDBSubmitStatusStore + 
     QTempDBProofWitnessStore<JobId> +
     QTempDBUserContractUpdatesStore + 
-    QTempDBExpectedPublicInputsStore<JobId, Hash>,
+    QTempDBExpectedPublicInputsStore<JobId, Hash> +
+    QTempDBDeployContractDataStore,
 > StandardEdgeAPITempDBStoreBase<JobId, Hash> for T {
 }
 
@@ -35,3 +38,4 @@ pub use pending_id::*;
 pub use submit_status::*;
 pub use witness::*;
 pub use user_contract_tree_updates::*;
+pub use deploy_contract_data::*;

@@ -248,10 +248,7 @@ pub trait PsyNodeCoreDatabaseUserStoreWriter<F, Hash> {
 
     async fn set_zk_public_key(&self, checkpoint_id: u64, user_id: u64, public_key_info: &PZKPublicKeyInfo<Hash>) -> anyhow::Result<()>;
     async fn set_zk_public_keys_ffs(&self, checkpoint_id: u64, data: &[u8]) -> anyhow::Result<()>;
-
-
 }
-
 
 #[async_trait]
 #[auto_impl(&, Arc)]
@@ -344,5 +341,37 @@ impl<
         F,
         Hash,
     > PsyRealmEdgeAPIStoreReader<F, Hash> for T
+{
+}
+
+pub trait PsyCoordinatorEdgeAPIStoreReader<F, Hash>:
+    PsyNodeCheckpointTreeDatabaseReader<Hash>
+    + PsyNodeUserRegistrationTreeDatabaseWriter<Hash>
+    + PsyNodeGlobalUserTreeDatabaseReader<Hash>
+    + PsyNodeUserContractTreeDatabaseReader<Hash>
+    + PsyNodeCheckpointObjectDatabaseReader<F, Hash>
+    + PsyNodeCoreDatabaseUserStoreReader<F, Hash>
+    + PsyNodeCoreDatabaseContractObjectStoreReader<F, Hash>
+    + PsyNodeCoreDatabaseBasicContractInfoStoreReader<F, Hash>
+    + PsyNodeContractFunctionTreeDatabaseReader<Hash>
+    + PsyNodeGlobalContractTreeDatabaseReader<Hash>
+    + PsyNodeUserRegistrationTreeDatabaseReader<Hash>
+{
+}
+impl<
+        T: PsyNodeCheckpointTreeDatabaseReader<Hash>
+            + PsyNodeUserRegistrationTreeDatabaseWriter<Hash>
+            + PsyNodeGlobalUserTreeDatabaseReader<Hash>
+            + PsyNodeUserContractTreeDatabaseReader<Hash>
+            + PsyNodeCheckpointObjectDatabaseReader<F, Hash>
+            + PsyNodeCoreDatabaseUserStoreReader<F, Hash>
+            + PsyNodeCoreDatabaseContractObjectStoreReader<F, Hash>
+            + PsyNodeCoreDatabaseBasicContractInfoStoreReader<F, Hash>
+            + PsyNodeContractFunctionTreeDatabaseReader<Hash>
+            + PsyNodeGlobalContractTreeDatabaseReader<Hash>
+            + PsyNodeUserRegistrationTreeDatabaseReader<Hash>,
+        F,
+        Hash,
+    > PsyCoordinatorEdgeAPIStoreReader<F, Hash> for T
 {
 }
