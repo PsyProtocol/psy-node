@@ -651,7 +651,7 @@ pub struct SubmitGUTARealmResultAPINoProofInput<F, Hash> {
     pub realm_id: u64,
     pub checkpoint_id: u64,
     pub guta_stats: GUTAStats<F>,
-    pub top_line_proof: DeltaMerkleProofCore<Hash>,
+    //pub top_line_proof: DeltaMerkleProofCore<Hash>,
     pub checkpoint_tree_root: Hash,
     pub circuit_type: job_id::ProvingJobCircuitType,
 }

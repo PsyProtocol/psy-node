@@ -1,54 +1,34 @@
 use std::sync::Arc;
 
-use async_trait::async_trait;
-use dashmap::DashMap;
-use jsonrpsee::core::RpcResult;
 use parth_core::{
-    crypto::hash::{
-        merkle_proof::{compute_historical_and_current_merkle_roots_core_gt, MerkleProofCore},
-        traits::{MerkleZeroHasher, QFieldHashable},
-    },
     data::{hash::merkle_node_key::SimpleMerkleNodeKey, queue::queue_key::QPBaseQueueType},
-    felt::ToU64Value,
     node::realm_identifier::QRealmIdentifier,
-    protocol::core_types::{QHasherBase, QNetworkDatabaseTypes, QNetworkTypesConfig, QZKProofVerifier},
-    store::tag_tree_store,
+    protocol::core_types::QNetworkTypesConfig,
     QCoreProcCheckpointUniqueId, QProvingJobDataIDWithRewardPath,
 };
 use psy_core::job::job_id::ProvingJobCircuitType;
 use psy_data::{
-    proof_input::guta::{end_cap_input::SubmitUserEndCapNonProofInput, SubmitGUTARealmResultAPINoProofInput},
+    proof_input::guta::SubmitGUTARealmResultAPINoProofInput,
     v1::{
         common_api::PsyProoffMinerRewardProof,
         qdata::{
-            checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState},
-            contract::{ContractCodeDefinition, DashMapContractHeightCache, PQBCDeployContract, PQEDContractLeaf, PSimpleContractHeightCache},
+            contract::{DashMapContractHeightCache, PQBCDeployContract, PsyDeployContractQueueItem},
             public_key::PZKPublicKeyInfo,
-            user::{self, PQEDUserLeaf},
         },
     },
 };
 use psy_node_core::{
-    api::{coordinator::standard_edge_rpc::CoordinatorEdgeRpcServer, realm::standard_edge_rpc::RealmEdgeRpcServer},
-    psy_core_db::{
-        traits::full::{
-            PsyCoordinatorEdgeAPIStoreReader, PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmEdgeAPIStoreReader,
-        },
-        v3_implementation::full::PsyUnifiedCoreDatabaseStore,
-    },
+    psy_core_db::traits::full::{PsyCoordinatorEdgeAPIStoreReader, PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter},
     psy_temp_db::{QTempDBPendingIdReader, StandardEdgeAPITempDBStoreBase},
-    queue::{
-        ephemeral::{QStandardEphemeralQueuePublisher, QStandardEphemeralQueueSubscriber},
-        worker_queue::QStandardWorkerQueueSubscriber,
-    },
-    store::traits::{
-        core_db::{CoreDatabaseStoreComboImpl, CoreDatabaseTableConfig},
-        proof_store::QParthProofStore,
-    },
+    queue::{ephemeral::QStandardEphemeralQueuePublisher, worker_queue::QStandardWorkerQueueSubscriber},
+    store::traits::proof_store::QParthProofStore,
 };
 use psy_serialize::{FastFixedSerializable, PsyCanonicalDatabaseSerializeBaseSingle};
 
-use crate::{coordinator::queue_key::CoordinatorRegisterUserPublicKeyQueueKey, realm::edge::error::RpcError};
+use crate::{
+    coordinator::queue_key::{CoordinatorDeployContractQueueKey, CoordinatorRegisterUserPublicKeyQueueKey},
+    realm::edge::error::RpcError,
+};
 
 const END_CAP_PROOF_CIRCUIT_TYPE_U32: u32 = ProvingJobCircuitType::UserEndCap as u32;
 #[derive(Clone)]
@@ -226,6 +206,24 @@ impl<
             },
         ))
     }
+    pub async fn get_deploy_contract_queue_key(
+        &self,
+    ) -> anyhow::Result<(u64, QCoreProcCheckpointUniqueId, CoordinatorDeployContractQueueKey<N::QHash>)> {
+        let (unique_pending_id, unique_proc_checkpoint_id) = self.temp_db.get_unique_pending_ids(&self.realm_identifier).await?;
+
+        Ok((
+            unique_pending_id,
+            unique_proc_checkpoint_id,
+            CoordinatorDeployContractQueueKey::<N::QHash> {
+                realm_id: self.realm_id_u64,
+                realm_sub_id: self.realm_sub_id_u64,
+                unique_id: unique_proc_checkpoint_id,
+                task_group: 0,
+                queue_type: QPBaseQueueType::StandardEphemeral,
+                _phantom_queue_item: std::marker::PhantomData,
+            },
+        ))
+    }
 
     pub async fn register_user_internal(&self, public_key: PZKPublicKeyInfo<N::QHash>) -> anyhow::Result<String> {
         let (_, unique_proc_checkpoint_id, queue_key) = self.get_register_user_queue_key().await?;
@@ -240,10 +238,47 @@ impl<
             )
             .await?;
 
-            Ok("test".to_string())
+        Ok("ok".to_string())
     }
     pub async fn deploy_contract_internal(&self, deploy_contract: PQBCDeployContract<N::QHash>) -> anyhow::Result<String> {
-        todo!("todo")
+        if deploy_contract.code_definition.functions.len() == 0 {
+            anyhow::bail!("contracts with no functions are not supported");
+        } else if deploy_contract.code_definition.functions.len() > (1usize << N::CONTRACT_FUNCTION_TREE_HEIGHT) {
+            anyhow::bail!("contract has too many functions defined");
+        }
+
+        let (unique_pending_id, unique_proc_checkpoint_id, queue_key) = self.get_deploy_contract_queue_key().await?;
+
+        let (deployer, code_definition, function_leaves) = deploy_contract.split_into_tuple();
+        let queue_item = PsyDeployContractQueueItem::<N::F, N::QHash>::new_from_leaves_and_deployer::<N::HasherBase>(
+            deployer,
+            code_definition.state_tree_height,
+            function_leaves,
+            N::CONTRACT_FUNCTION_TREE_HEIGHT_USIZE,
+        )?;
+
+        self.temp_db
+            .set_deploy_contract_code_definition_raw(
+                &self.realm_identifier,
+                unique_pending_id,
+                &queue_item.rand_key_id,
+                code_definition.psy_ser_into_bytes_vec()?,
+            )
+            .await?;
+
+        self.deploy_contract_queue
+            .publish_ephemeral_queue_item_owned_bytes(
+                &queue_key,
+                self.realm_id_u64,
+                self.realm_sub_id_u64,
+                unique_proc_checkpoint_id,
+                0,
+                queue_item.psy_ser_into_bytes_vec()?,
+            )
+            .await?;
+
+
+            Ok("ok".to_string())
     }
     pub async fn submit_guta_internal(
         &self,

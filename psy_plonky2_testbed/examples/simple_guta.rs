@@ -205,7 +205,7 @@ impl SimpleChainTestbed {
         let worker_public_key = Hash::rand();
         timer.lap("start verify_two_end_cap.prove_base");
         let two_end_cap_proof = self.circuits.circuits.guta_circuits.verify_two_end_cap
-        .prove_base(
+        .provre_base(
             worker_public_key, &two_end_cap_input, &proof_0, &proof_1, self.circuits.dummy_end_cap_circuit.get_verifier_config_ref())?;
         timer.lap("end verify_two_end_cap.prove_base");
 

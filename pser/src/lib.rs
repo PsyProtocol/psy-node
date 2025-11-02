@@ -38,6 +38,8 @@ pub trait QBytesDeserialize {
     fn from_qbytes(bytes: &[u8]) -> anyhow::Result<Self> where for<'de> Self: Deserialize<'de>;
     fn from_qbytes_unwrap(bytes: &[u8]) -> Self;
 }
+pub trait QBytesSerializable: QBytesSerialize + QBytesDeserialize {}
+impl<T: QBytesSerialize + QBytesDeserialize> QBytesSerializable for T {}
 
 /* 
 impl<T> QBytesDeserialize for T where for<'de> T: Deserialize<'de>,{

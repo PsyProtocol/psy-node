@@ -9,7 +9,6 @@ use parth_core::{
 use pser::{QBytesDeserialize, QBytesSerialize};
 use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
 use psy_serialize::{PsyCanonicalDatabaseSerializeBaseSingle, PsyIOReadWrite, FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata};
-use serde::Serialize;
 use ts_rs::TS;
 
 #[pderive::serialize_clone]
@@ -48,7 +47,7 @@ impl QToCodeString for ContractFunctionCodeDefinition {
         )
     }
 }
-    
+
 impl FallbackPsySerializeCanonical for ContractFunctionCodeDefinition {
     fn fallback_pio_serialized_size(&self) -> usize {
         4 + 4 + 4 + 4 + 4 + self.code.len()
@@ -271,6 +270,9 @@ impl<Hash: QHashBase> PQBCDeployContract<Hash> {
             code_definition,
             function_whitelist,
         }
+    }
+    pub fn split_into_tuple(self) -> (Hash, ContractCodeDefinition, Vec<Hash>) {
+        (self.deployer, self.code_definition, self.function_whitelist)
     }
     pub fn into_with_whitelist_root<H: MerkleZeroHasher<Hash>>(
         self,
