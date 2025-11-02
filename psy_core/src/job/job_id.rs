@@ -350,7 +350,7 @@ impl QProvingJobDataIDSerializedWrapped {
     }
 }
 
-#[pderive::serialize_copy_ts_export]
+#[pderive::serialize_copy_ts_export_job_id]
 #[repr(C)]
 pub struct QProvingJobDataID {
     pub topic: QJobTopic,
@@ -1150,4 +1150,46 @@ impl QJobIdCreatable for QProvingJobDataID {
             data_index: 0,
         })
     }
-} 
+}
+
+
+
+#[cfg(feature = "serialize_speedy")]
+impl<'a, C: speedy::Context> speedy::Readable<'a, C> for QProvingJobDataID {
+    fn read_from<R: speedy::Reader<'a, C>>(reader: &mut R) -> Result<Self, C::Error> {
+        let topic = reader.read_u8()?;
+        let goal_id = reader.read_u64()?;
+        let circuit_type = reader.read_u8()?;
+        let group_id = reader.read_u32()?;
+        let sub_group_id = reader.read_u32()?;
+        let task_index = reader.read_u32()?;
+        let data_type = reader.read_u8()?;
+        let data_index = reader.read_u8()?;
+
+        Ok(QProvingJobDataID {
+            topic: QJobTopic::try_from(topic).map_err(speedy::Error::custom)?,
+            goal_id,
+            circuit_type: ProvingJobCircuitType::try_from(circuit_type).map_err(speedy::Error::custom)?,
+            group_id,
+            sub_group_id,
+            task_index,
+            data_type: ProvingJobDataType::try_from(data_type).map_err(speedy::Error::custom)?,
+            data_index,
+        })
+    }
+}
+
+#[cfg(feature = "serialize_speedy")]
+impl<C: speedy::Context> speedy::Writable<C> for QProvingJobDataID {
+    fn write_to<T: ?Sized + speedy::Writer<C>>(&self, writer: &mut T) -> Result<(), C::Error> {
+        writer.write_u8(self.topic.to_u8())?;
+        writer.write_u64(self.goal_id)?;
+        writer.write_u8(self.circuit_type.to_u8())?;
+        writer.write_u32(self.group_id)?;
+        writer.write_u32(self.sub_group_id)?;
+        writer.write_u32(self.task_index)?;
+        writer.write_u8(self.data_type.to_u8())?;
+        writer.write_u8(self.data_index)?;
+        Ok(())
+    }
+}

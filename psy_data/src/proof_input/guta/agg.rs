@@ -3,7 +3,7 @@ use std::{hash::Hash, ops::Add};
 use parth_core::{crypto::hash::{merkle_proof::{compute_historical_and_current_merkle_roots_core_gt, DeltaMerkleProofCore, MerkleProofCore}, nca::nca_proof::PartialUpdateNearestCommonAncestorProof, traits::{FieldQHasher, MerkleHasher, MerkleZeroHasher, QFieldHashable, ZeroableHash}}, felt::QFelt64, protocol::core_types::QFHashBase};
 use psy_core::job::job_id::{self, QProvingJobDataID};
 
-use crate::{guta::{header::GlobalUserTreeAggregatorHeader, stats::GUTAStats, sub_tree_transition::SubTreeNodeStateTransition}, v1::qdata::{checkpoint::PQEDCheckpointLeafCompactWithStateRoots, user::PQEDUserLeaf, user_end_cap_result::PUPSEndCapResultCompact}};
+use crate::{guta::{header::GlobalUserTreeAggregatorHeader, header_extended::GlobalUserTreeAggregatorHeaderWithTagValue, stats::GUTAStats, sub_tree_transition::SubTreeNodeStateTransition}, v1::qdata::{checkpoint::PQEDCheckpointLeafCompactWithStateRoots, user::PQEDUserLeaf, user_end_cap_result::PUPSEndCapResultCompact}};
 
 
 #[pderive::serialize_clone_f_hash_ts]
@@ -647,12 +647,9 @@ impl<F : QFelt64, Hash: QFHashBase<F>> SubmitUserEndCapNonProofCoreInput<F, Hash
 
 #[pderive::serialize_clone_f_hash_ts]
 #[ts(export, concrete(F = parth_core::PF, Hash = parth_core::PHash))]
+#[repr(C)]
 pub struct SubmitGUTARealmResultAPINoProofInput<F, Hash> {
-    pub realm_id: u64,
-    pub checkpoint_id: u64,
-    pub guta_stats: GUTAStats<F>,
-    //pub top_line_proof: DeltaMerkleProofCore<Hash>,
-    pub checkpoint_tree_root: Hash,
+    pub guta_header: GlobalUserTreeAggregatorHeaderWithTagValue<F, Hash>,
     pub circuit_type: job_id::ProvingJobCircuitType,
 }
 
