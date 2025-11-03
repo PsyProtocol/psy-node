@@ -34,21 +34,35 @@ pub trait QFHashBase<F: QFelt64>: QHashBase + HashTo4Felts<F> {}
 impl<T: QHashBase + HashTo4Felts<F>, F: QFelt64> QFHashBase<F> for T {}
 
 pub trait QProofBase: PartialEq + Clone + Serialize + DeserializeOwned + QPDSerializable {}
-
+/*
 pub trait QHasherBase<Hash: QHashBase, Proof: QProofBase>: MerkleZeroHasher<Hash> {
     fn get_proof_public_inputs(proof: &Proof) -> anyhow::Result<Hash>; // the public inputs of the proof is a hash which is the hash of the QParthProofPublicInputsPreimage
     fn hash_proof_public_inputs_preimage(preimage: &QParthProofPublicInputsPreimage<Hash>) -> Hash;
     fn hash_proof_public_inputs_preimage_with_rewards_hash(preimage: &QParthProofPublicInputsPreimageWithoutRewardsHash<Hash>, rewards_hash: &Hash) -> Hash;
 }
-
-pub trait QZKProofVerifier<Hash: QHashBase, Proof: QProofBase>: QHasherBase<Hash, Proof> {
-    fn verify_zk_proof(&self, circuit_type: u32, proof: &Proof) -> anyhow::Result<()>;
-    fn verify_zk_proof_and_check_public_inputs(&self, circuit_type: u32, proof: &Proof, public_inputs_preimage: &QParthProofPublicInputsPreimage<Hash>) -> anyhow::Result<()> {
-        let public_inputs = Self::get_proof_public_inputs(proof)?;
-        if public_inputs != Self::hash_proof_public_inputs_preimage(public_inputs_preimage) {
-            anyhow::bail!("Public inputs do not match expected value from preimage");
+*/
+pub trait QZKProofPublicInputsHasherReader<Hash, Proof> {
+    fn get_proof_public_inputs_hash(proof: &Proof) -> anyhow::Result<Hash>;
+    fn try_proof_from_slice(bytes: &[u8]) -> anyhow::Result<Proof>;
+}
+pub trait QZKProofVerifier<Hash: PartialEq, Proof>: QZKProofPublicInputsHasherReader<Hash, Proof> {
+    fn verify_zk_proof(&self, circuit_type: u32, proof: &Proof) -> anyhow::Result<Hash>;
+    fn verify_zk_proof_check_public_inputs_hash(&self, circuit_type: u32, proof: &Proof, expected_public_inputs_hash: Hash) -> anyhow::Result<()>{
+        if self.verify_zk_proof(circuit_type, proof)? != expected_public_inputs_hash {
+            return Err(anyhow::anyhow!("ZK Proof verification failed"));
         }
-        self.verify_zk_proof(circuit_type, proof)
+        Ok(())
+    }
+    fn verify_zk_proof_from_slice_check_public_inputs_hash(&self, circuit_type: u32, proof_bytes: &[u8], expected_public_inputs_hash: Hash) -> anyhow::Result<()>{
+        let proof = Self::try_proof_from_slice(proof_bytes)?;
+        if Self::get_proof_public_inputs_hash(&proof)? != expected_public_inputs_hash {
+            return Err(anyhow::anyhow!("ZK Proof verification failed"));
+        }
+
+        if self.verify_zk_proof(circuit_type, &proof)? != expected_public_inputs_hash {
+            return Err(anyhow::anyhow!("ZK Proof verification failed"));
+        }
+        Ok(())
     }
 }
 pub trait QJobPlanner<JobId: QJobIdBase> {
@@ -98,12 +112,12 @@ pub trait QNetworkTreeCircuitConstants: Sized + Send + Sync + Copy + Clone {
     const BATCH_USER_REGISTRATION_SUB_TREE_HEIGHT: usize;
     const BATCH_USER_REGISTRATION_MAX_SUB_TREES: usize;
     const BATCH_DEPLOY_CONTRACT_SUB_TREE_HEIGHT: usize;
+    const CHAIN_ID: u32;
 }
 
 pub trait QNetworkCircuitConstants: QNetworkTreeCircuitConstants + QNetworkTreeConstants {
 }
 impl<T: QNetworkTreeCircuitConstants + QNetworkTreeConstants> QNetworkCircuitConstants for T {}
-
 
 pub trait QNetworkHashTypes{
     type QHash: QFHashBase<Self::F> + Q256BitHash + PsySerializeCanonicalAsyncSafe;

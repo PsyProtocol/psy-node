@@ -7,3 +7,5 @@ pub mod tree_planner;
 pub mod protocol;
 #[cfg(feature = "testbed")]
 pub mod testbed;
+pub mod queue_items;
+pub mod worker;

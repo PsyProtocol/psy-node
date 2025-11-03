@@ -4,38 +4,33 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use jsonrpsee::core::RpcResult;
 use parth_core::{
-    crypto::hash::{merkle_proof::{compute_historical_and_current_merkle_roots_core_gt, MerkleProofCore}, traits::MerkleZeroHasher}, data::hash::merkle_node_key::SimpleMerkleNodeKey, felt::ToU64Value, node::realm_identifier::QRealmIdentifier, protocol::core_types::{QHasherBase, QNetworkDatabaseTypes, QNetworkTypesConfig}, store::tag_tree_store, QProvingJobDataIDWithRewardPath
+    QProvingJobDataIDWithRewardPath, crypto::hash::{merkle_proof::{MerkleProofCore, compute_historical_and_current_merkle_roots_core_gt}, traits::MerkleZeroHasher}, data::{hash::merkle_node_key::SimpleMerkleNodeKey, queue::queue_key::QPBaseQueueType}, felt::ToU64Value, node::realm_identifier::QRealmIdentifier, protocol::core_types::{QNetworkDatabaseTypes, QNetworkTypesConfig}, store::tag_tree_store
 };
-use psy_core::job::job_id::ProvingJobCircuitType;
+use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{
-    proof_input::guta::end_cap_input::SubmitUserEndCapNonProofInput,
-    v1::{
+    proof_input::guta::end_cap_input::SubmitUserEndCapNonProofInput, queue_items::realm_user_update::PsyRealmUserUpdatQueueItem, v1::{
         common_api::PsyProoffMinerRewardProof,
         qdata::{
             checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState},
             contract::{DashMapContractHeightCache, PSimpleContractHeightCache},
             user::{self, PQEDUserLeaf},
         },
-    },
+    }
 };
 use psy_node_core::{
-    api::realm::standard_edge_rpc::RealmEdgeRpcServer,
-    psy_core_db::{
+    api::realm::standard_edge_rpc::RealmEdgeRpcServer, psy_core_db::{
         traits::full::{PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmEdgeAPIStoreReader},
         v3_implementation::full::PsyUnifiedCoreDatabaseStore,
-    },
-    psy_temp_db::{QTempDBPendingIdReader, StandardEdgeAPITempDBStoreBase},
-    queue::{
+    }, psy_temp_db::{QTempDBPendingIdReader, StandardEdgeAPITempDBStoreBase}, qblob::structs::common::blob_metadata_header::QBlobWriterContextMetadataHeader, queue::{
         ephemeral::{QStandardEphemeralQueuePublisher, QStandardEphemeralQueueSubscriber},
         worker_queue::QStandardWorkerQueueSubscriber,
-    },
-    store::traits::{
+    }, store::traits::{
         core_db::{CoreDatabaseStoreComboImpl, CoreDatabaseTableConfig},
         proof_store::QParthProofStore,
-    },
+    }
 };
-use parth_core::protocol::core_types::QZKProofVerifier;
-use crate::realm::edge::error::RpcError;
+use parth_core::protocol::core_types::{QZKProofVerifier, QZKProofPublicInputsHasherReader};
+use crate::realm::{edge::{error::RpcError, utils::end_cap::validate_end_cap_and_generate_node_data_for_edge}, queue_key::RealmUserUpdateQueueKey};
 use parth_core::crypto::hash::traits::QFieldHashable;
 
 const END_CAP_PROOF_CIRCUIT_TYPE_U32: u32 = ProvingJobCircuitType::UserEndCap as u32;
@@ -60,6 +55,8 @@ pub struct RealmEdgeHandler<
     pub realm_identifier: QRealmIdentifier,
     pub realm_id_u64: u64,
     pub realm_sub_id_u64: u64,
+    pub chain_id: u32,
+    pub node_id: u32,
 
     pub proof_verifier: Arc<N::ZKVerifier>,
     pub contract_state_tree_height_cache: Arc<DashMapContractHeightCache<N::QHash>>,
@@ -83,6 +80,8 @@ impl<
         user_update_queue: Arc<UserUpdateQueue>,
         get_proof_work_queue: Arc<GetProofWorkQueue>,
         realm_identifier: QRealmIdentifier,
+        chain_id: u32,
+        node_id: u32,
         proof_verifier: Arc<N::ZKVerifier>,
     ) -> Self {
         let realm_id_u64 = realm_identifier.realm_id as u64;
@@ -97,6 +96,8 @@ impl<
             realm_identifier,
             realm_id_u64,
             realm_sub_id_u64,
+            chain_id,
+            node_id,
             proof_verifier,
             contract_state_tree_height_cache: Arc::new(DashMapContractHeightCache::new()),
         }
@@ -149,7 +150,7 @@ impl<
 }
 
 impl<
-        N: QNetworkTypesConfig,
+        N: QNetworkTypesConfig<JobId = QProvingJobDataID>,
         S: PsyRealmEdgeAPIStoreReader<N::F, N::QHash> + Send + Sync,
         STagTreeRewards: PsyNodeCoreRewardsTagTreeStoreWriter<N::F, N::QHash> + PsyNodeCoreRewardsTagTreeStoreReader<N::F, N::QHash> + Send + Sync,
         UserUpdateQueue: QStandardEphemeralQueuePublisher,
@@ -184,7 +185,7 @@ impl<
     pub async fn handle_user_end_cap_proof_submission(
         &self,
         user_end_cap_input: SubmitUserEndCapNonProofInput<N::F, N::QHash>,
-        proof: N::ZKProof,
+        proof_bytes: Vec<u8>,
     ) -> anyhow::Result<()> {
         let end_cap_checkpoint_id = user_end_cap_input.core.checkpoint_id.to_u64_value();
 
@@ -262,14 +263,17 @@ impl<
                 user_end_cap_input.core.state_transition.checkpoint_tree_root_hash
             );
         }
+        let job_id = QProvingJobDataID::try_get_realm_edge_proof_store_output_proof_id_for_end_cap(user_id, N::GLOBAL_USER_TREE_HEIGHT, unique_pending_id)?;
 
+        self.ensure_user_has_not_submitted(user_id, unique_pending_id).await?;
 
 
         let expected_public_inputs_hash: N::QHash = user_end_cap_input.core.get_proof_public_inputs_hash::<N::HasherBase>(
             N::GLOBAL_USER_TREE_HEIGHT,
         );
-        let public_inputs = N::ZKVerifier::get_proof_public_inputs(&proof)?;
-
+        let proof = N::ZKVerifier::try_proof_from_slice(&proof_bytes)?;
+        
+        let public_inputs = N::ZKVerifier::get_proof_public_inputs_hash(&proof)?;
         if public_inputs != expected_public_inputs_hash {
             anyhow::bail!(
                 "Public inputs hash mismatch: expected {:?}, got {:?}",
@@ -298,12 +302,57 @@ impl<
 
 
         self.proof_verifier.verify_zk_proof(END_CAP_PROOF_CIRCUIT_TYPE_U32, &proof)?;
+
+
+        
+        // TODO: maybe modify the job_id.sub_group_id
+        let rand_status = rand::random::<u64>();
+
+        let fake_checkpoint_id = rand_status;
+        let context = QBlobWriterContextMetadataHeader::new_at_now(self.chain_id, self.node_id, self.realm_id_u64, self.realm_sub_id_u64, unique_pending_id, fake_checkpoint_id, user_id);
+        let contract_update_data_for_user = validate_end_cap_and_generate_node_data_for_edge::<N::F, N::QHash, N::HasherBase>(&context, user_id,&user_end_cap_input)?;
         self.ensure_user_has_not_submitted(user_id, unique_pending_id).await?;
+        self.temp_db.set_submitted_status_for_pending(&self.realm_identifier, unique_pending_id, user_id, rand_status).await?;
+
+        if self.temp_db.get_submitted_status_for_pending(&self.realm_identifier, unique_pending_id, user_id).await? != rand_status {
+            // check for race condition
+            anyhow::bail!("end cap for user_id {} at unique_pending_id {} has already been submitted (race)", user_id, unique_pending_id);
+        }
 
 
-        //let proof_public_inputs = self.proof_verifier.publi(&proof);
-        //user_end_cap_input.ensure_simple_self_consistent(proof_public_inputs_hash,
-        // contract_helper, global_user_tree_height)
+
+        self.proof_store.put_proof_bytes_for_job_id(job_id, &proof_bytes).await?;
+        if self.temp_db.get_submitted_status_for_pending(&self.realm_identifier, unique_pending_id, user_id).await? != rand_status {
+            // check for race condition
+            anyhow::bail!("end cap for user_id {} at unique_pending_id {} has already been submitted (race)", user_id, unique_pending_id);
+        }
+
+        self.temp_db.set_contract_updates_for_user(
+            &self.realm_identifier,
+            unique_pending_id,
+            user_id,
+            contract_update_data_for_user,
+        ).await?;
+        let queue_key = RealmUserUpdateQueueKey {
+            realm_id: self.realm_id_u64,
+            realm_sub_id: self.realm_sub_id_u64,
+            unique_id: proc_checkpoint_id,
+            task_group: 0,
+            queue_type: QPBaseQueueType::StandardEphemeral,
+            _phantom_queue_item: std::marker::PhantomData,
+        };
+        let new_user_leaf = user_end_cap_input.core.new_user_leaf.clone();
+        let new_user_leaf_hash = new_user_leaf.qfhash::<N::HasherBase>();
+
+        let queue_item = PsyRealmUserUpdatQueueItem {
+            job_id,
+            expected_fake_checkpoint_id: fake_checkpoint_id,
+            old_user_leaf_hash: old_leaf_hash,
+            new_user_leaf_hash,
+            new_user_leaf,
+        };
+        self.user_update_queue.publish_ephemeral_queue_item_owned(&queue_key, self.realm_id_u64, self.realm_sub_id_u64, proc_checkpoint_id, 0, queue_item).await?;
+
 
         Ok(())
     }
@@ -318,7 +367,7 @@ const MAX_CHECKPOINT_ID: u64 = i64::MAX as u64;
 
 #[async_trait]
 impl<
-        N: QNetworkTypesConfig + 'static,
+        N: QNetworkTypesConfig<JobId = QProvingJobDataID> + 'static,
         S: PsyRealmEdgeAPIStoreReader<N::F, N::QHash> + Send + Sync + 'static,
         STagTreeRewards: PsyNodeCoreRewardsTagTreeStoreWriter<N::F, N::QHash> + PsyNodeCoreRewardsTagTreeStoreReader<N::F, N::QHash> + Send + Sync + 'static,
         UserUpdateQueue: QStandardEphemeralQueuePublisher + Send + Sync + 'static,
@@ -340,8 +389,9 @@ impl<
     /// Submit user end cap proof
 
     // do not implement this yet
-    async fn submit_user_end_cap(&self, user_ec_input: SubmitUserEndCapNonProofInput<N::F, N::QHash>, proof: N::ZKProof) -> QRpcResult<String> {
-        todo!("not implemented yet");
+    async fn submit_user_end_cap(&self, user_ec_input: SubmitUserEndCapNonProofInput<N::F, N::QHash>, proof: Vec<u8>) -> QRpcResult<String> {
+        res(self.handle_user_end_cap_proof_submission(user_ec_input, proof).await)?;
+        Ok("ok".to_string())
     }
 
     async fn get_checkpoint_leaf_data(&self, checkpoint_id: u64) -> QRpcResult<PQEDCheckpointLeaf<N::F, N::QHash>> {
@@ -442,10 +492,6 @@ impl<
     }
 
     async fn get_user_bottom_tree_merkle_proof(&self, root_level: u8, checkpoint_id: u64, user_id: u64) -> QRpcResult<MerkleProofCore<N::QHash>> {
-        // NOTE: Assumes N::GLOBAL_USER_TREE_HEIGHT is defined and represents the total
-        // height of the global user tree. This is required because the database
-        // function needs an explicit leaf level, which is implicitly the max height for
-        // a "bottom tree proof".
         res(self
             .db_reader
             .global_user_tree_get_merkle_proof_sub_tree(checkpoint_id, root_level, N::GLOBAL_USER_TREE_HEIGHT, user_id)

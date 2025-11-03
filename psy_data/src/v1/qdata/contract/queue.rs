@@ -1,9 +1,9 @@
 use parth_common::memory_stores::simple_memory_merkle_store::SimpleMemoryMerkleStore;
 use parth_core::{
-    crypto::hash::traits::MerkleZeroHasher, felt::QFelt64, protocol::core_types::Q256BitHash, utils::{QPGenRandom, math::log2_ceil}
+    crypto::hash::traits::MerkleZeroHasher, data::queue::queue_key::PCoreQueueItemBase, felt::QFelt64, protocol::core_types::Q256BitHash, utils::{QPGenRandom, math::log2_ceil}
 };
 use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
-use psy_serialize::{PsyIOReadWrite, FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata};
+use psy_serialize::{PsyIOReadWrite, PsyCanonicalDatabaseSerializeBaseSingle, FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata};
 
 use rand::RngCore;
 use crate::v1::qdata::{contract::PQEDContractLeaf, ffs_sizes::PSY_OBJECT_FFS_SIZE_CONTRACT_LEAF};
@@ -124,3 +124,39 @@ pser::impl_psy_ser_basic_tests_fallback!(
     { parth_core::PF, parth_core::PHash },
     psy_deploy_contract_queue_item
 );
+
+
+
+impl<F: QFelt64,Hash: Q256BitHash> PCoreQueueItemBase for PsyDeployContractQueueItem<F, Hash> {
+
+    #[inline]
+    fn is_queue_item(data: &[u8]) -> bool {
+        data.len() >= (16 + PQEDContractLeaf::<F, Hash>::FIXED_SIZE + 4 + 32)
+    }
+
+    #[inline]
+    fn decode_queue_item_ref(data: &[u8]) -> anyhow::Result<Self> {
+        Self::psy_ser_from_slice(data)
+    }
+
+    #[inline]
+    fn encode_queue_item_vec(&self) -> anyhow::Result<Vec<u8>> {
+        self.psy_ser_to_bytes_vec()
+    }
+
+    #[inline]
+    fn get_restorable_job_id(&self) -> Vec<u8> {
+        self.rand_key_id.to_vec()
+    }
+
+    #[inline]
+    fn get_size_hint() -> usize {
+        0 // make this 0 since size isn't fixed
+        //16 + PQEDContractLeaf::FIXED_SIZE + 4 + 32*16
+    }
+
+    #[inline]
+    fn has_fixed_size() -> bool {
+        false
+    }
+}

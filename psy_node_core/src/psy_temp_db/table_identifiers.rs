@@ -1,9 +1,9 @@
 use parth_core::{QJobIdBase, QJobIdSerialized};
 
-pub const TEMP_TABLE_ID_EXPECTED_PUBLIC_INPUTS: u16 = 0x5045; // 'EP'
-pub const TEMP_TABLE_ID_EXPECTED_PUBLIC_INPUTS_BYTES: [u8; 2] = [0x45, 0x50]; // 'EP'
-pub const TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_KEY_SIZE: usize = 40; // 4 + 2 + 2 + 8 + 24
-pub const TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_VALUE_SIZE: usize = 32; // Q256BitHash
+pub const TEMP_TABLE_ID_EXPECTED_PUBLIC_INPUTS_AND_DEPENDENCIES: u16 = 0x5045; // 'EP'
+pub const TEMP_TABLE_ID_EXPECTED_PUBLIC_INPUTS_AND_DEPENDENCIES_BYTES: [u8; 2] = [0x45, 0x50]; // 'EP'
+pub const TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_AND_DEPENDENCIES_KEY_SIZE: usize = 40; // 4 + 2 + 2 + 8 + 24
+//pub const TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_VALUE_SIZE: usize = 32; // Q256BitHash
 
 pub const TEMP_TABLE_ID_UNIQUE_PENDING_ID: u16 = 0x4950; // 'PI'
 pub const TEMP_TABLE_ID_UNIQUE_PENDING_ID_BYTES: [u8; 2] = [0x50, 0x49]; // 'PI'
@@ -32,11 +32,12 @@ pub const TEMP_TABLE_ID_DEPLOY_CONTRACT_CODE_DEFINITION: u16 = 0x4344; // 'DC'
 pub const TEMP_TABLE_ID_DEPLOY_CONTRACT_CODE_DEFINITION_BYTES: [u8; 2] = [0x44, 0x43]; // 'DC'
 pub const TEMP_TABLE_ID_DEPLOY_CONTRACT_KEY_SIZE: usize = 32; // 4 + 2 + 2 + 8 + 16
 
+
 // --- Expected Public Inputs ---
 
 // (realm_id = 4) + (realm_sub_id = 2) + (table id length = 2) + (unique_pending_id = 8) + (QJOB_ID_SERIALIZED_SIZE = 24) = 40
 #[inline(always)]
-pub fn tt_get_expected_public_inputs_key(
+pub fn tt_get_expected_public_inputs_hash_and_dependencies_key(
     realm_id: u32,
     realm_sub_id: u16,
     unique_pending_id: u64,
@@ -45,14 +46,14 @@ pub fn tt_get_expected_public_inputs_key(
     let mut key = [0u8; 40];
     key[0..4].copy_from_slice(&realm_id.to_le_bytes());
     key[4..6].copy_from_slice(&realm_sub_id.to_le_bytes());
-    key[6..8].copy_from_slice(&TEMP_TABLE_ID_EXPECTED_PUBLIC_INPUTS_BYTES);
+    key[6..8].copy_from_slice(&TEMP_TABLE_ID_EXPECTED_PUBLIC_INPUTS_AND_DEPENDENCIES_BYTES);
     key[8..16].copy_from_slice(&unique_pending_id.to_le_bytes());
     key[16..40].copy_from_slice(job_id_bytes);
     key
 }
 
 #[inline(always)]
-pub fn tt_write_expected_public_inputs_key<Writer: psy_io::Write>(
+pub fn tt_write_expected_public_inputs_hash_and_dependencies_key<Writer: psy_io::Write>(
     writer: &mut Writer,
     realm_id: u32,
     realm_sub_id: u16,
@@ -61,20 +62,20 @@ pub fn tt_write_expected_public_inputs_key<Writer: psy_io::Write>(
 ) -> anyhow::Result<()> {
     writer.write_all(&realm_id.to_le_bytes())?;
     writer.write_all(&realm_sub_id.to_le_bytes())?;
-    writer.write_all(&TEMP_TABLE_ID_EXPECTED_PUBLIC_INPUTS_BYTES)?;
+    writer.write_all(&TEMP_TABLE_ID_EXPECTED_PUBLIC_INPUTS_AND_DEPENDENCIES_BYTES)?;
     writer.write_all(&unique_pending_id.to_le_bytes())?;
     writer.write_all(job_id_bytes)?;
     Ok(())
 }
 
 #[inline(always)]
-pub fn tt_get_expected_public_inputs_key_from_job<JobId: QJobIdBase>(
+pub fn tt_get_expected_public_inputs_hash_and_dependencies_key_from_job<JobId: QJobIdBase>(
     realm_id: u32,
     realm_sub_id: u16,
     unique_pending_id: u64,
     job_id: &JobId,
 ) -> [u8; 40] {
-    tt_get_expected_public_inputs_key(realm_id, realm_sub_id, unique_pending_id, &job_id.to_bytes_fixed())
+    tt_get_expected_public_inputs_hash_and_dependencies_key(realm_id, realm_sub_id, unique_pending_id, &job_id.to_bytes_fixed())
 }
 
 // --- Unique Pending ID ---

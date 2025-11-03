@@ -1,13 +1,9 @@
 use std::sync::Arc;
 
 use parth_core::{
-    crypto::hash::traits::QFieldHashable,
-    data::{hash::merkle_node_key::SimpleMerkleNodeKey, queue::queue_key::QPBaseQueueType},
-    felt::ToU64Value,
-    node::{realm_identifier::QRealmIdentifier, traits::realm},
-    protocol::core_types::{QNetworkTypesConfig, QZKProofVerifier},
-    QCoreProcCheckpointUniqueId, QProvingJobDataIDWithRewardPath,
+    QCoreProcCheckpointUniqueId, QProvingJobDataIDWithRewardPath, crypto::{hash::traits::QFieldHashable, secp256k1::{QEDCompressedSecp256K1Signature, SimpleTimedRequest}}, data::{hash::merkle_node_key::SimpleMerkleNodeKey, queue::queue_key::QPBaseQueueType}, felt::ToU64Value, node::{realm_identifier::QRealmIdentifier, traits::realm}, protocol::core_types::{QNetworkTypesConfig, QZKProofVerifier}
 };
+use parth_crypto::hash::sha256::CoreSha256Hasher;
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{
     guta::header_extended::{GlobalUserTreeAggregatorHeaderWithTagValueAndJobID, GlobalUserTreeAggregatorHeaderWithTagValueAndJobType},
@@ -18,7 +14,7 @@ use psy_data::{
             contract::{DashMapContractHeightCache, PQBCDeployContract, PsyDeployContractQueueItem},
             public_key::PZKPublicKeyInfo,
         },
-    },
+    }, worker::api_response::{PsyWorkerGetProvingWorkAPIResponse, PsyWorkerGetProvingWorkWithChildProofsAPIResponse},
 };
 use psy_node_core::{
     psy_core_db::traits::full::{PsyCoordinatorEdgeAPIStoreReader, PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter},
@@ -308,8 +304,26 @@ impl<
         GetProofWorkQueue,
         TempDatabase,
         ProofStore,
-    >
-{
+    >{
+    pub async fn get_proving_work_internal(&self, signature:  QEDCompressedSecp256K1Signature, request: SimpleTimedRequest) -> anyhow::Result<PsyWorkerGetProvingWorkAPIResponse<N::JobId>>{
+        let sig_hash = request.get_sig_hash::<CoreSha256Hasher>();
+        todo!("not implemented yet")
+    }
+    pub async fn get_proving_work_with_child_proofs_internal(&self, signature:  QEDCompressedSecp256K1Signature, request: SimpleTimedRequest) -> anyhow::Result<PsyWorkerGetProvingWorkWithChildProofsAPIResponse<N::JobId>>{
+        todo!("not implemented yet")
+    }
+    pub async fn submit_proof_raw_internal(&self, job_id: QProvingJobDataIDWithRewardPath<N::JobId>, proof: Vec<u8>) -> anyhow::Result<()>{
+
+
+        let (unique_pending_id, unique_proc_id) = self.get_current_unique_pending_id_internal().await?;
+        let (expected_public_inputs_hash, dependencies) = self.temp_db.get_tdb_proof_expected_public_inputs_hash_raw_and_dependencies(&self.realm_identifier, unique_pending_id, job_id.job_data_id).await?;
+
+
+        self.proof_store.put_proof_bytes_for_job_id(&job_id.job_data_id.get_output_id(), &proof).await?;
+
+        todo!("not implemented yet")
+    }
+
     pub async fn submit_guta_internal(
         &self,
         input: GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<N::F, N::QHash>,

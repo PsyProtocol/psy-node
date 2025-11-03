@@ -8,9 +8,9 @@ use parth_core::{
     protocol::core_types::QNetworkTypesConfig,
     QProvingJobDataIDWithRewardPath,
 };
+use psy_core::job::job_id::QProvingJobDataID;
 use psy_data::{
-    proof_input::guta::SubmitGUTARealmResultAPINoProofInput,
-    v1::{
+    guta::header_extended::GlobalUserTreeAggregatorHeaderWithTagValueAndJobType, proof_input::guta::SubmitGUTARealmResultAPINoProofInput, v1::{
         common_api::PsyProoffMinerRewardProof,
         qdata::{
             checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState},
@@ -18,7 +18,7 @@ use psy_data::{
             public_key::PZKPublicKeyInfo,
             user::PQEDUserLeaf,
         },
-    },
+    }
 };
 use psy_node_core::{
     api::coordinator::standard_edge_rpc::CoordinatorEdgeRpcServer,
@@ -50,7 +50,7 @@ const MAX_CHECKPOINT_ID: u64 = i64::MAX as u64;
 
 #[async_trait]
 impl<
-        N: QNetworkTypesConfig + Send + Sync + 'static,
+        N: QNetworkTypesConfig<JobId =  QProvingJobDataID> + Send + Sync + 'static,
         S: PsyCoordinatorEdgeAPIStoreReader<N::F, N::QHash> + Send + Sync + 'static,
         STagTreeRewards: PsyNodeCoreRewardsTagTreeStoreWriter<N::F, N::QHash> + PsyNodeCoreRewardsTagTreeStoreReader<N::F, N::QHash> + Send + Sync + 'static,
         GUTAUpdateQueue: QStandardEphemeralQueuePublisher + Send + Sync + 'static,
@@ -74,13 +74,14 @@ impl<
 {
     
     async fn register_user(&self, public_key: PZKPublicKeyInfo<N::QHash>) -> QRpcResult<String> {
-        todo!("aa")
+        res(self.register_user_internal(public_key).await)
     }
     async fn deploy_contract(&self, deploy_contract: PQBCDeployContract<N::QHash>) -> QRpcResult<String> {
-        todo!("todo")
+        res(self.deploy_contract_internal(deploy_contract).await)
     }
-    async fn submit_guta(&self, input: SubmitGUTARealmResultAPINoProofInput<N::F, N::QHash>, proof: N::ZKProof, realm_id: u64) -> QRpcResult<String> {
-        todo!("aa")
+    async fn submit_guta(&self, input: GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<N::F, N::QHash>, proof: Vec<u8>, _realm_id: u64) -> QRpcResult<String> {
+        res(self.submit_guta_internal(input, proof).await)?;
+        Ok("ok".to_string())
     }
     async fn get_user_ids_for_public_key(&self, public_key: N::QHash, start_user_id: u64, count: u32) -> QRpcResult<Vec<u64>> {
         res(self

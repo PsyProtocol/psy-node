@@ -35,7 +35,7 @@ pub trait RealmEdgeRpc<F, Hash, JobId, ZKProof> {
     async fn submit_user_end_cap(
         &self,
         user_ec_input: SubmitUserEndCapNonProofInput<F, Hash>,
-        proof: ZKProof,
+        proof: Vec<u8>,
     ) -> RpcResult<String>;
 
     #[method(name = "get_checkpoint_leaf_data")]

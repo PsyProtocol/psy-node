@@ -69,6 +69,7 @@ impl QNetworkTreeCircuitConstants for QPsyRegtestNetworkConstants {
     const BATCH_USER_REGISTRATION_SUB_TREE_HEIGHT: usize = 8; 
     const BATCH_USER_REGISTRATION_MAX_SUB_TREES: usize = 4; 
     const BATCH_DEPLOY_CONTRACT_SUB_TREE_HEIGHT: usize = 8;
+    const CHAIN_ID: u32 = 0;
 }
 
 impl QNetworkTreeConstants for QPsyRegtestNetworkConstants {

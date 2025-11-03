@@ -50,7 +50,7 @@ pub trait QJobIdCreatable: QJobIdBase {
 }
 
 
-#[pderive::serialize_copy]
+#[pderive::serialize_copy_ts_export]
 pub struct QProvingJobDataIDWithRewardPath<T> {
     pub job_data_id: T,
     pub reward_path_info: u64,

@@ -5,8 +5,7 @@ use parth_core::{
 };
 
 use psy_data::{
-    proof_input::guta::SubmitGUTARealmResultAPINoProofInput,
-    v1::{
+    guta::header_extended::GlobalUserTreeAggregatorHeaderWithTagValueAndJobType, proof_input::guta::SubmitGUTARealmResultAPINoProofInput, v1::{
         common_api::{APILatestCheckpointResponse, PsyProoffMinerRewardProof},
         qdata::{
             checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState},
@@ -14,7 +13,7 @@ use psy_data::{
             public_key::PZKPublicKeyInfo,
             user::PQEDUserLeaf,
         },
-    },
+    }
 };
 
 
@@ -35,7 +34,7 @@ pub trait CoordinatorEdgeRpc<F, Hash, JobId, ZKProof> {
     //async fn build_block(&self) -> RpcResult<String>;
 
     #[method(name = "submit_guta")]
-    async fn submit_guta(&self, input: SubmitGUTARealmResultAPINoProofInput<F, Hash>, proof: ZKProof, realm_id: u64) -> RpcResult<String>;
+    async fn submit_guta(&self, input: GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<F, Hash>, proof: Vec<u8>, realm_id: u64) -> RpcResult<String>;
 
 
     #[method(name = "get_latest_checkpoint_id")]
@@ -150,3 +149,8 @@ pub trait CoordinatorEdgeRpc<F, Hash, JobId, ZKProof> {
     async fn generate_batch_proof_miner_reward_proofs(&self, unique_pending_id: u64, job_ids: Vec<QProvingJobDataIDWithRewardPath<JobId>>) -> RpcResult<Vec<PsyProoffMinerRewardProof<Hash, JobId>>>;
     
 }
+
+
+
+
+

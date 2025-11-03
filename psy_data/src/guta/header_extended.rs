@@ -1,9 +1,9 @@
 use parth_core::{
-    QJOB_ID_SERIALIZED_SIZE, QJobIdSerialized, crypto::hash::{tag_tree::TagTreeNodePreimage, traits::{FieldQHasher, QFieldHashable}}, felt::QFelt64, protocol::core_types::{Q256BitHash, QFHashBase}, utils::QPGenRandom
+    QJOB_ID_SERIALIZED_SIZE, QJobIdSerialized, crypto::hash::{tag_tree::TagTreeNodePreimage, traits::{FieldQHasher, QFieldHashable}}, data::queue::queue_key::PCoreQueueItemBase, felt::QFelt64, protocol::core_types::{Q256BitHash, QFHashBase}, utils::QPGenRandom
 };
 use psy_core::job::job_id::QProvingJobDataID;
 use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
-use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
+use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalDatabaseSerializeBaseSingle, PsyCanonicalSerializeMetadata, PsyIOReadWrite, PsySerializeCanonicalAsyncSafe};
 
 use crate::guta::header::GlobalUserTreeAggregatorHeader;
 #[pderive::serialize_copy_f_hash_ts]
@@ -506,3 +506,29 @@ pser::impl_psy_ser_basic_tests_fallback!(
     { parth_core::PF, parth_core::PHash },
     global_user_tree_agg_header_with_tag_value_and_job_id_tests
 );
+
+impl<F: QFelt64, Hash: Q256BitHash> PCoreQueueItemBase for GlobalUserTreeAggregatorHeaderWithTagValueAndJobID<F, Hash> {
+    fn is_queue_item(data: &[u8]) -> bool {
+        data.len() == Self::FIXED_SIZE
+    }
+
+    fn decode_queue_item_ref(data: &[u8]) -> anyhow::Result<Self> {
+        Self::psy_ser_from_slice(data)
+    }
+
+    fn encode_queue_item_vec(&self) -> anyhow::Result<Vec<u8>> {
+       self.psy_ser_to_bytes_vec()
+    }
+
+    fn get_restorable_job_id(&self) -> Vec<u8> {
+        self.job_id.to_fixed_bytes().to_vec()
+    }
+
+    fn get_size_hint() -> usize {
+        Self::FIXED_SIZE
+    }
+
+    fn has_fixed_size() -> bool {
+        true
+    }
+}

@@ -1,14 +1,12 @@
 use async_trait::async_trait;
 use parth_core::{
-    node::realm_identifier::QRealmIdentifier, protocol::core_types::QDBHashBase, QCoreProcCheckpointUniqueId, QJobIdBase, QJOB_ID_SERIALIZED_SIZE,
+    QCoreProcCheckpointUniqueId, QJOB_ID_SERIALIZED_SIZE, QJobIdBase, data::serializable::QProofWitnessSerializable, node::realm_identifier::QRealmIdentifier, protocol::core_types::QDBHashBase
 };
+use psy_data::worker::api_response::decode_expected_public_inputs_hash_and_dependencies;
 
 use crate::{
     psy_temp_db::{
-        tt_get_deploy_contract_code_definition_key, tt_get_expected_public_inputs_key, tt_get_expected_public_inputs_key_from_job,
-        tt_get_submit_status_key, tt_get_unique_pending_id_key, QTempDBDeployContractDataReader, QTempDBDeployContractDataWriter,
-        QTempDBExpectedPublicInputsReader, QTempDBExpectedPublicInputsWriter, QTempDBPendingIdReader, QTempDBPendingIdWriter,
-        QTempDBSubmitStatusReader, QTempDBSubmitStatusWriter, TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_VALUE_SIZE,
+        QTempDBDeployContractDataReader, QTempDBDeployContractDataWriter, QTempDBExpectedPublicInputsReader, QTempDBExpectedPublicInputsWriter, QTempDBPendingIdReader, QTempDBPendingIdWriter, QTempDBProofWitnessReader, QTempDBProofWitnessWriter, QTempDBSubmitStatusReader, QTempDBSubmitStatusWriter, tt_get_deploy_contract_code_definition_key, tt_get_expected_public_inputs_hash_and_dependencies_key, tt_get_expected_public_inputs_hash_and_dependencies_key_from_job, tt_get_proof_witness_data_key, tt_get_proof_witness_data_key_from_job, tt_get_submit_status_key, tt_get_unique_pending_id_key
     },
     store::traits::temp_db::{QTempDatabaseRawKVReaderBase, QTempDatabaseRawKVWriterBase},
 };
@@ -21,12 +19,14 @@ value[0..8].copy_from_slice(&unique_pending_id.to_le_bytes());
 value[8..24].copy_from_slice(&proc_checkpoint_unique_id.to_le_bytes());
 self.(&key, &value).await
 */
+
+/* 
 #[async_trait]
 impl<T: QTempDatabaseRawKVReaderBase + Sync + Send, JobId: QJobIdBase + Sync + Send + 'static, Hash: QDBHashBase + Sync + Send>
     QTempDBExpectedPublicInputsReader<JobId, Hash> for T
 {
     async fn get_expected_public_inputs_hash(&self, rid: &QRealmIdentifier, unique_pending_id: u64, job_id: JobId) -> anyhow::Result<Hash> {
-        let key = tt_get_expected_public_inputs_key_from_job(rid.realm_id as u32, rid.realm_sub_id as u16, unique_pending_id, &job_id);
+        let key = tt_get_expected_public_inputs_hash_and_dependencies_key_from_job(rid.realm_id as u32, rid.realm_sub_id as u16, unique_pending_id, &job_id);
         let value_bytes = self.qtdb_raw_kv_get_value(&key).await?;
         if value_bytes.is_some() {
             let value_bytes = value_bytes.unwrap();
@@ -39,14 +39,12 @@ impl<T: QTempDatabaseRawKVReaderBase + Sync + Send, JobId: QJobIdBase + Sync + S
         }
     }
 }
-
 #[async_trait]
-
 impl<T: QTempDatabaseRawKVWriterBase + Sync + Send, JobId: QJobIdBase + Sync + Send + 'static, Hash: QDBHashBase + Sync + Send>
     QTempDBExpectedPublicInputsWriter<JobId, Hash> for T
 {
     async fn set_expected_public_inputs_hash(&self, rid: &QRealmIdentifier, unique_pending_id: u64, job_id: JobId, hash: Hash) -> anyhow::Result<()> {
-        let key = tt_get_expected_public_inputs_key_from_job(rid.realm_id as u32, rid.realm_sub_id as u16, unique_pending_id, &job_id);
+        let key = tt_get_expected_public_inputs_hash_and_dependencies_key_from_job(rid.realm_id as u32, rid.realm_sub_id as u16, unique_pending_id, &job_id);
         self.qtdb_raw_kv_put_value(&key, &hash.into_owned_32bytes()).await
     }
     async fn set_expected_public_inputs_hash_batch_fast_serialized(
@@ -70,14 +68,14 @@ impl<T: QTempDatabaseRawKVWriterBase + Sync + Send, JobId: QJobIdBase + Sync + S
             let idx = i * ITEM_SIZE;
             let job_id_bytes = &data[idx..(idx + QJOB_ID_SERIALIZED_SIZE)];
             let value_bytes = &data[(idx + QJOB_ID_SERIALIZED_SIZE)..(idx + ITEM_SIZE)];
-            let key = tt_get_expected_public_inputs_key(rid.realm_id, rid.realm_sub_id, unique_pending_id, &job_id_bytes.try_into().unwrap());
+            let key = tt_get_expected_public_inputs_hash_and_dependencies_key_from_job(rid.realm_id, rid.realm_sub_id, unique_pending_id, &job_id_bytes.try_into().unwrap());
             entries.push((key.to_vec(), value_bytes.to_vec()));
         }
 
         self.qtdb_raw_kv_put_many_values_tuple(&entries).await?;
         /*
         let num_entries = data_len / combined_size;
-        let combined_size = TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_KEY_SIZE + TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_VALUE_SIZE;
+        let combined_size = TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_AND_DEPENDENCIES_KEY_SIZE + TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_VALUE_SIZE;
         let data_len = data.len();
         if data_len % combined_size != 0 {
             return Err(anyhow::anyhow!("Data length is not a multiple of combined key and value size"));
@@ -88,7 +86,7 @@ impl<T: QTempDatabaseRawKVWriterBase + Sync + Send, JobId: QJobIdBase + Sync + S
         let template = tt_get_expected_public_inputs_key(rid.realm_id, rid.realm_sub_id, unique_pending_id, &[0u8; QJOB_ID_SERIALIZED_SIZE]);
 
         const BATCH_SIZE: usize = 512;
-        const BUFFER_SIZE: usize = BATCH_SIZE * TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_KEY_SIZE;
+        const BUFFER_SIZE: usize = BATCH_SIZE * TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_AND_DEPENDENCIES_KEY_SIZE;
         const
 
         if num_entries < BATCH_SIZE {
@@ -98,10 +96,10 @@ impl<T: QTempDatabaseRawKVWriterBase + Sync + Send, JobId: QJobIdBase + Sync + S
             for i in 0..num_entries {
 
                 let idx = i * (QJOB_ID_SERIALIZED_SIZE + TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_VALUE_SIZE);
-                let job_id_bytes = &data[idx..(idx+TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_KEY_SIZE - 40 + QJOB_ID_SERIALIZED_SIZE)];
+                let job_id_bytes = &data[idx..(idx+TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_AND_DEPENDENCIES_KEY_SIZE - 40 + QJOB_ID_SERIALIZED_SIZE)];
                 let mut key = template;
                 key[16..40].copy_from_slice(job_id_bytes);
-                let value = &data[(idx+TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_KEY_SIZE)..(idx+TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_KEY_SIZE+TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_VALUE_SIZE)];
+                let value = &data[(idx+TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_AND_DEPENDENCIES_KEY_SIZE)..(idx+TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_AND_DEPENDENCIES_KEY_SIZE+TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_VALUE_SIZE)];
                 entries.push(((key.as_ref(),value)));
             }
             self.qtdb_raw_kv_put_many_values_tuple_ref(&entries).await?;
@@ -112,15 +110,15 @@ impl<T: QTempDatabaseRawKVWriterBase + Sync + Send, JobId: QJobIdBase + Sync + S
         let num_entries = data_len / combined_size;
         let mut entries = Vec::with_capacity(num_entries);
         for i in 0..num_entries {
-            let idx = i * (TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_KEY_SIZE + TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_VALUE_SIZE);
-            let key = &data[idx..(idx+TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_KEY_SIZE)];
-            let value = &data[(idx+TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_KEY_SIZE)..(idx+TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_KEY_SIZE+TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_VALUE_SIZE)];
+            let idx = i * (TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_AND_DEPENDENCIES_KEY_SIZE + TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_VALUE_SIZE);
+            let key = &data[idx..(idx+TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_AND_DEPENDENCIES_KEY_SIZE)];
+            let value = &data[(idx+TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_AND_DEPENDENCIES_KEY_SIZE)..(idx+TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_AND_DEPENDENCIES_KEY_SIZE+TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_VALUE_SIZE)];
             entries.push(((key,value)));
         }
         self.qtdb_raw_kv_put_many_values_tuple_ref(&entries).await?;
         */
         /*
-        let combined_size = TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_KEY_SIZE + TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_VALUE_SIZE;
+        let combined_size = TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_AND_DEPENDENCIES_KEY_SIZE + TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_VALUE_SIZE;
         let data_len = data.len();
         if data_len % combined_size != 0 {
             return Err(anyhow::anyhow!("Data length is not a multiple of combined key and value size"));
@@ -131,9 +129,9 @@ impl<T: QTempDatabaseRawKVWriterBase + Sync + Send, JobId: QJobIdBase + Sync + S
         let num_entries = data_len / combined_size;
         let mut entries = Vec::with_capacity(num_entries);
         for i in 0..num_entries {
-            let idx = i * (TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_KEY_SIZE + TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_VALUE_SIZE);
-            let key = &data[idx..(idx+TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_KEY_SIZE)];
-            let value = &data[(idx+TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_KEY_SIZE)..(idx+TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_KEY_SIZE+TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_VALUE_SIZE)];
+            let idx = i * (TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_AND_DEPENDENCIES_KEY_SIZE + TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_VALUE_SIZE);
+            let key = &data[idx..(idx+TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_AND_DEPENDENCIES_KEY_SIZE)];
+            let value = &data[(idx+TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_AND_DEPENDENCIES_KEY_SIZE)..(idx+TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_AND_DEPENDENCIES_KEY_SIZE+TEMP_TABLE_EXPECTED_PUBLIC_INPUTS_VALUE_SIZE)];
             entries.push(((key,value)));
         }
         self.qtdb_raw_kv_put_many_values_tuple_ref(&entries).await?;
@@ -143,7 +141,7 @@ impl<T: QTempDatabaseRawKVWriterBase + Sync + Send, JobId: QJobIdBase + Sync + S
         Ok(())
     }
 }
-
+*/
 #[async_trait]
 impl<T: QTempDatabaseRawKVReaderBase + Sync> QTempDBPendingIdReader for T {
     async fn get_unique_pending_id(&self, rid: &QRealmIdentifier) -> anyhow::Result<u64> {
@@ -225,6 +223,75 @@ impl<T: QTempDatabaseRawKVReaderBase + Sync> QTempDBSubmitStatusReader for T {
     }
 }
 
+/*
+
+
+#[async_trait]
+#[auto_impl(&, Arc)]
+pub trait QTempDBProofWitnessReader<JobId: QJobIdBase> {
+    async fn get_tdb_proof_witness<T: QProofWitnessSerializable>(&self, rid: &QRealmIdentifier, unique_pending_id: u64, job_id: JobId) -> anyhow::Result<T>;
+    async fn get_tdb_proof_witness_bytes(&self, rid: &QRealmIdentifier, unique_pending_id: u64, job_id: JobId) -> anyhow::Result<Vec<u8>>;
+    async fn get_tdb_proof_expected_public_inputs_hash_raw_and_dependencies(&self, rid: &QRealmIdentifier, unique_pending_id: u64, job_id: JobId) -> anyhow::Result<([u8; 32], Vec<JobId>)>;
+}
+
+#[async_trait]
+#[auto_impl(&, Arc)]
+pub trait QTempDBProofWitnessWriter<JobId: QJobIdBase> {
+    async fn set_tdb_proof_witness<T: QProofWitnessSerializable>(&self, rid: &QRealmIdentifier, unique_pending_id: u64, job_id: JobId, witness: &T) -> anyhow::Result<()>;
+    async fn set_tdb_proof_witnesses_tuple_owned<T: QProofWitnessSerializable>(&self, rid: &QRealmIdentifier, unique_pending_id: u64, job_witnesses: &[(JobId, T)]) -> anyhow::Result<()>;
+    async fn set_tdb_proof_expected_public_inputs_hash_and_dependencies_raw(&self, rid: &QRealmIdentifier, unique_pending_id: u64, job_id: JobId, expected_public_inputs_hash: [u8; 32], dependencies: &[JobId]) -> anyhow::Result<()>;
+    async fn set_tdb_proof_expected_public_inputs_many_tuple_owned_hash_raw(&self, rid: &QRealmIdentifier, unique_pending_id: u64, job_public_inputs: Vec<(JobId, ([u8; 32], Vec<JobId>))>) -> anyhow::Result<()>;
+
+*/
+
+#[async_trait]
+impl<JobId: QJobIdBase + 'static, D: QTempDatabaseRawKVReaderBase + Sync> QTempDBProofWitnessReader<JobId> for D {
+
+    async fn get_tdb_proof_witness<T: QProofWitnessSerializable>(&self, rid: &QRealmIdentifier, unique_pending_id: u64, job_id: JobId) -> anyhow::Result<T>{
+        let key = tt_get_proof_witness_data_key_from_job(rid.realm_id, rid.realm_sub_id , unique_pending_id, &job_id);
+        let value_bytes = self.qtdb_raw_kv_get_value(&key).await?;
+        if value_bytes.is_some() {
+            T::psy_ser_from_owned_bytes_vec(value_bytes.unwrap())
+        }else{
+            anyhow::bail!("Proof witness not found");
+        }
+    }
+    async fn get_tdb_proof_witness_bytes(&self, rid: &QRealmIdentifier, unique_pending_id: u64, job_id: JobId) -> anyhow::Result<Vec<u8>>{
+        let key = tt_get_proof_witness_data_key_from_job(rid.realm_id, rid.realm_sub_id , unique_pending_id, &job_id);
+        let value_bytes = self.qtdb_raw_kv_get_value(&key).await?;
+        if value_bytes.is_some() {
+            Ok(value_bytes.unwrap())
+        }else{
+            anyhow::bail!("Proof witness not found");
+        }
+    }
+    async fn get_tdb_proof_expected_public_inputs_hash_raw_and_dependencies(&self, rid: &QRealmIdentifier, unique_pending_id: u64, job_id: JobId) -> anyhow::Result<([u8; 32], Vec<JobId>)>{
+        let key = tt_get_expected_public_inputs_hash_and_dependencies_key_from_job(rid.realm_id, rid.realm_sub_id, unique_pending_id, &job_id);
+        let value_bytes = self.qtdb_raw_kv_get_value(&key).await?;
+        if value_bytes.is_some() {
+            decode_expected_public_inputs_hash_and_dependencies::<JobId>(&value_bytes.unwrap())
+        } else {
+            anyhow::bail!("Proof expected public inputs hash not found");
+        }
+    }
+}
+
+#[async_trait]
+impl<JobId: QJobIdBase + 'static, D: QTempDatabaseRawKVWriterBase + Sync> QTempDBProofWitnessWriter<JobId> for D {
+    async fn set_tdb_proof_witness<T: QProofWitnessSerializable>(&self, rid: &QRealmIdentifier, unique_pending_id: u64, job_id: JobId, witness: &T) -> anyhow::Result<()>{
+        todo!()
+    }
+    async fn set_tdb_proof_witnesses_tuple_owned<T: QProofWitnessSerializable>(&self, rid: &QRealmIdentifier, unique_pending_id: u64, job_witnesses: &[(JobId, T)]) -> anyhow::Result<()>{
+        todo!()
+    }
+    async fn set_tdb_proof_expected_public_inputs_hash_and_dependencies_raw(&self, rid: &QRealmIdentifier, unique_pending_id: u64, job_id: JobId, expected_public_inputs_hash: [u8; 32], dependencies: &[JobId]) -> anyhow::Result<()>{
+        todo!()
+    }
+    async fn set_tdb_proof_expected_public_inputs_many_tuple_owned_hash_raw(&self, rid: &QRealmIdentifier, unique_pending_id: u64, job_public_inputs: Vec<(JobId, ([u8; 32], Vec<JobId>))>) -> anyhow::Result<()>{
+        todo!()
+    }
+
+}
 #[async_trait]
 impl<T: QTempDatabaseRawKVWriterBase + Sync> QTempDBSubmitStatusWriter for T {
     async fn set_submitted_status_for_pending(

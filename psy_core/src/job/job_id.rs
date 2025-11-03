@@ -268,6 +268,13 @@ impl ProvingJobCircuitType {
         };
         Ok(leaf_type)
     }
+    pub fn try_from_u32(circuit_type_u32: u32) -> anyhow::Result<Self> {
+        if circuit_type_u32 > u8::MAX as u32 {
+            anyhow::bail!("invalid circuit type {}", circuit_type_u32);
+        }
+        let circuit_type = ProvingJobCircuitType::try_from(circuit_type_u32 as u8)?;
+        Ok(circuit_type)
+    }
 }
 
 impl TryFrom<u8> for ProvingJobCircuitType {
@@ -374,6 +381,58 @@ impl QPGenRandom for QProvingJobDataID {
             data_type: ProvingJobDataType::InputWitness,
             data_index: QPGenRandom::qp_rand_gen(),
         }
+    }
+}
+
+impl QProvingJobDataID {
+    pub fn try_get_coordinator_edge_proof_store_output_proof_id_for_realm_submit(realm_id: u32, realm_level: u8, unique_pending_id: u64, circuit_type: ProvingJobCircuitType) -> anyhow::Result<Self> {
+        match circuit_type {
+            ProvingJobCircuitType::GUTATwoEndCap |
+            ProvingJobCircuitType::GUTATwoGUTA |
+            ProvingJobCircuitType::GUTALeftEndCapRightGUTA |
+            ProvingJobCircuitType::GUTALeftGUTARightEndCap |
+            ProvingJobCircuitType::GUTASingleEndCap |
+            ProvingJobCircuitType::GUTARegisterUsers |
+            ProvingJobCircuitType::GUTAVerifyToCap |
+            ProvingJobCircuitType::GUTAOnlyRegisterUsers |
+            ProvingJobCircuitType::GUTANoChange |
+            ProvingJobCircuitType::GUTATwoGUTAWithCheckpointUpgrade |
+            ProvingJobCircuitType::GUTAVerifyToCapWithCheckpointUpgrade => {},
+            _ => anyhow::bail!("circuit type {:?} is not a GUTA circuit type", circuit_type),
+        };
+
+
+        let job_data_id = QProvingJobDataID {
+            topic: QJobTopic::GenerateStandardProof,
+            goal_id: unique_pending_id,
+            circuit_type,
+            group_id: realm_level as u32,
+            sub_group_id: 0,
+            task_index: realm_id,
+            data_type: ProvingJobDataType::OutputProof,
+            data_index: 0,
+        };
+        Ok(job_data_id)
+    }
+
+
+    pub fn try_get_realm_edge_proof_store_output_proof_id_for_end_cap(user_id: u64, global_user_tree_height: u8, unique_pending_id: u64) -> anyhow::Result<Self> {
+
+        if user_id > u32::MAX as u64 {
+            anyhow::bail!("user id {} is too large to fit in u32", user_id);
+        }
+
+        let job_data_id = QProvingJobDataID {
+            topic: QJobTopic::GenerateStandardProof,
+            goal_id: unique_pending_id,
+            circuit_type: ProvingJobCircuitType::UserEndCap,
+            group_id: global_user_tree_height as u32,
+            sub_group_id: 0,
+            task_index: user_id as u32,
+            data_type: ProvingJobDataType::OutputProof,
+            data_index: 0,
+        };
+        Ok(job_data_id)
     }
 }
 impl QProvingJobDataID {
