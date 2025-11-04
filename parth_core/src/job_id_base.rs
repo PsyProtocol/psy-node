@@ -1,6 +1,6 @@
 use serde::{de::DeserializeOwned, Serialize};
 
-use crate::data::{queue::queue_key::PCoreQueueItemBase, serializable::QPDSerializableFixed};
+use crate::data::{maybe_serialization::MaybeSpeedy, queue::queue_key::PCoreQueueItemBase, serializable::QPDSerializableFixed};
 
 pub const QJOB_ID_SERIALIZED_SIZE: usize = 24;
 pub const QJOB_ID_WITH_REALM_PREFIX_SERIALIZED_SIZE: usize = 32;
@@ -25,7 +25,7 @@ pub trait JobIDWithRewardPathSerializable: Sized + Copy + Send + Sync + Clone + 
     fn get_reward_path_info(&self) -> u64;
 }
 
-pub trait QJobIdBase: Copy + Send + Sync + Serialize + DeserializeOwned + Clone + PartialEq + Eq + std::fmt::Debug + QPDSerializableFixed + Sized + Into<QJobIdSerialized> + TryFrom<QJobIdSerialized> + PCoreQueueItemBase  {
+pub trait QJobIdBase: Copy + Send + Sync + Serialize + DeserializeOwned + Clone + PartialEq + Eq + std::fmt::Debug + QPDSerializableFixed + Sized + Into<QJobIdSerialized> + TryFrom<QJobIdSerialized> + PCoreQueueItemBase + MaybeSpeedy  {
     
     fn to_bytes_fixed(&self) -> QJobIdSerialized;
     fn from_bytes_fixed(bytes: &QJobIdSerialized) -> anyhow::Result<Self>;
@@ -87,10 +87,10 @@ impl<T: QJobIdBase> PCoreQueueItemBase for QProvingJobDataIDWithRewardPath<T> {
     }
 
     fn get_size_hint() -> usize {
-        todo!()
+        QJOB_ID_SERIALIZED_SIZE + 8
     }
 
     fn has_fixed_size() -> bool {
-        todo!()
+        true
     }
 }

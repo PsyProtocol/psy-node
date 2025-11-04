@@ -1,286 +1,44 @@
-use std::sync::Arc;
-
+use futures::future::try_join_all;
 use parth_core::{
-    QCoreProcCheckpointUniqueId, QProvingJobDataIDWithRewardPath, crypto::{hash::traits::QFieldHashable, secp256k1::{QEDCompressedSecp256K1Signature, SimpleTimedRequest}}, data::{hash::merkle_node_key::SimpleMerkleNodeKey, queue::queue_key::QPBaseQueueType}, felt::ToU64Value, node::{realm_identifier::QRealmIdentifier, traits::realm}, protocol::core_types::{QNetworkTypesConfig, QZKProofVerifier}
-};
-use parth_crypto::hash::sha256::CoreSha256Hasher;
-use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
-use psy_data::{
-    guta::header_extended::{GlobalUserTreeAggregatorHeaderWithTagValueAndJobID, GlobalUserTreeAggregatorHeaderWithTagValueAndJobType},
-    proof_input::guta::SubmitGUTARealmResultAPINoProofInput,
-    v1::{
-        common_api::PsyProoffMinerRewardProof,
-        qdata::{
-            contract::{DashMapContractHeightCache, PQBCDeployContract, PsyDeployContractQueueItem},
-            public_key::PZKPublicKeyInfo,
+    crypto::{
+        hash::{
+            tag_tree::hash_tag_tree_node,
+            traits::{MerkleHasher, ZeroableHash},
         },
-    }, worker::api_response::{PsyWorkerGetProvingWorkAPIResponse, PsyWorkerGetProvingWorkWithChildProofsAPIResponse},
+        secp256k1::{QEDCompressedSecp256K1Signature, Secp256K1Verifier, SimpleTimedRequest},
+    },
+    data::queue::queue_key::QPBaseQueueType,
+    protocol::core_types::{Q256BitHash, QNetworkTypesConfig, QZKProofVerifier},
+    QProvingJobDataIDWithRewardPath,
 };
+use psy_core::job::job_id::QProvingJobDataID;
+use psy_data::
+    worker::{
+        api_response::{PsyWorkerGetProvingWorkAPIResponse, PsyWorkerGetProvingWorkWithChildProofsAPIResponse},
+        metadata::{
+            PsyProvingJobMetadata, PROOF_REWARD_TREE_HASH_MODE_3_CHILDREN_DOUBLE_REWARD, PROOF_REWARD_TREE_HASH_MODE_LIFT_CHILD, PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN,
+        },
+        metadata_with_job_id::PsyProvingJobMetadataWithJobId,
+    }
+;
 use psy_node_core::{
     psy_core_db::traits::full::{PsyCoordinatorEdgeAPIStoreReader, PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter},
-    psy_temp_db::{QTempDBPendingIdReader, StandardEdgeAPITempDBStoreBase},
+    psy_temp_db::{QTempDBProvingJobMetadataReader, StandardEdgeAPITempDBStoreBase},
     queue::{ephemeral::QStandardEphemeralQueuePublisher, worker_queue::QStandardWorkerQueueSubscriber},
     store::traits::proof_store::QParthProofStore,
 };
-use psy_serialize::{FastFixedSerializable, PsyCanonicalDatabaseSerializeBaseSingle};
 
-use crate::{
-    coordinator::queue_key::{CoordinatorDeployContractQueueKey, CoordinatorRegisterUserPublicKeyQueueKey, CoordinatorSubmitRealmGUTAUpdateQueueKey},
-    realm::edge::error::RpcError,
-};
-
-const END_CAP_PROOF_CIRCUIT_TYPE_U32: u32 = ProvingJobCircuitType::UserEndCap as u32;
-#[derive(Clone)]
-pub struct CoordinatorEdgeHandler<
-    N: QNetworkTypesConfig,
-    S: PsyCoordinatorEdgeAPIStoreReader<N::F, N::QHash> + Send + Sync,
-    STagTreeRewards: PsyNodeCoreRewardsTagTreeStoreWriter<N::F, N::QHash> + PsyNodeCoreRewardsTagTreeStoreReader<N::F, N::QHash> + Send + Sync,
-    GUTAUpdateQueue: QStandardEphemeralQueuePublisher,
-    RegisterUserQueue: QStandardEphemeralQueuePublisher,
-    DeployContractQueue: QStandardEphemeralQueuePublisher,
-    GetProofWorkQueue: QStandardWorkerQueueSubscriber,
-    TempDatabase: StandardEdgeAPITempDBStoreBase<N::JobId, N::QHash>,
-    ProofStore: QParthProofStore,
-> {
-    pub db_reader: Arc<S>,
-    pub tag_tree_rewards_store: Arc<STagTreeRewards>,
-    pub temp_db: Arc<TempDatabase>,
-    pub proof_store: Arc<ProofStore>,
-
-    pub guta_update_queue: Arc<GUTAUpdateQueue>,
-    pub register_user_queue: Arc<RegisterUserQueue>,
-    pub deploy_contract_queue: Arc<DeployContractQueue>,
-    pub get_proof_work_queue: Arc<GetProofWorkQueue>,
-
-    pub realm_identifier: QRealmIdentifier,
-    pub realm_id_u64: u64,
-    pub realm_sub_id_u64: u64,
-
-    pub proof_verifier: Arc<N::ZKVerifier>,
-    pub contract_state_tree_height_cache: Arc<DashMapContractHeightCache<N::QHash>>,
-}
-
-impl<
-        N: QNetworkTypesConfig,
-        S: PsyCoordinatorEdgeAPIStoreReader<N::F, N::QHash> + Send + Sync,
-        STagTreeRewards: PsyNodeCoreRewardsTagTreeStoreWriter<N::F, N::QHash> + PsyNodeCoreRewardsTagTreeStoreReader<N::F, N::QHash> + Send + Sync,
-        GUTAUpdateQueue: QStandardEphemeralQueuePublisher,
-        RegisterUserQueue: QStandardEphemeralQueuePublisher,
-        DeployContractQueue: QStandardEphemeralQueuePublisher,
-        GetProofWorkQueue: QStandardWorkerQueueSubscriber,
-        TempDatabase: StandardEdgeAPITempDBStoreBase<N::JobId, N::QHash>,
-        ProofStore: QParthProofStore,
-    >
-    CoordinatorEdgeHandler<
-        N,
-        S,
-        STagTreeRewards,
-        GUTAUpdateQueue,
-        RegisterUserQueue,
-        DeployContractQueue,
-        GetProofWorkQueue,
-        TempDatabase,
-        ProofStore,
-    >
-{
-    pub fn new(
-        db: Arc<S>,
-        tag_tree_rewards_store: Arc<STagTreeRewards>,
-        temp_db: Arc<TempDatabase>,
-        proof_store: Arc<ProofStore>,
-        guta_update_queue: Arc<GUTAUpdateQueue>,
-        register_user_queue: Arc<RegisterUserQueue>,
-        deploy_contract_queue: Arc<DeployContractQueue>,
-        get_proof_work_queue: Arc<GetProofWorkQueue>,
-        realm_identifier: QRealmIdentifier,
-        proof_verifier: Arc<N::ZKVerifier>,
-    ) -> Self {
-        let realm_id_u64 = realm_identifier.realm_id as u64;
-        let realm_sub_id_u64 = realm_identifier.realm_sub_id as u64;
-        Self {
-            db_reader: db,
-            tag_tree_rewards_store,
-            temp_db,
-            proof_store,
-            guta_update_queue,
-            register_user_queue,
-            deploy_contract_queue,
-            get_proof_work_queue,
-            realm_identifier,
-            realm_id_u64,
-            realm_sub_id_u64,
-            proof_verifier,
-            contract_state_tree_height_cache: Arc::new(DashMapContractHeightCache::new()),
-        }
+use crate::
+    coordinator::{
+        edge::handler::CoordinatorEdgeHandler,
+        queue_key::
+            CoordinatorProvingWorkQueueKey
+        ,
     }
-    pub async fn get_latest_checkpoint_id_internal(&self) -> anyhow::Result<u64> {
-        self.db_reader.get_latest_checkpoint_id().await
-    }
-    pub async fn get_current_unique_pending_id_internal(&self) -> anyhow::Result<(u64, QCoreProcCheckpointUniqueId)> {
-        self.db_reader.get_current_unique_pending_id().await
-    }
-    pub async fn ensure_realm_has_not_submitted(&self, realm_id: u64, unique_pending_id: u64) -> anyhow::Result<()> {
-        let submitted_status = self
-            .temp_db
-            .get_submitted_status_for_pending(&self.realm_identifier, unique_pending_id, realm_id)
-            .await?;
-        if submitted_status != 0 {
-            anyhow::bail!(
-                "end cap for realm_id {} at unique_pending_id {} has already been submitted",
-                realm_id,
-                unique_pending_id
-            );
-        }
-
-        Ok(())
-    }
-
-    pub async fn generate_batch_proof_miner_reward_proofs_internal(
-        &self,
-        unique_pending_id: u64,
-        job_ids: Vec<QProvingJobDataIDWithRewardPath<N::JobId>>,
-    ) -> anyhow::Result<Vec<PsyProoffMinerRewardProof<N::QHash, N::JobId>>> {
-        //let top_proof =
-        // self.db_reader.
-        // get_top_global_user_rewards_tree_proof_to_realm_at_unique_pending_id(unique_pending_id).
-        // await?;
-
-        //let (unique_pending_id, proc_checkpoint_id) =
-        // self.temp_db.get_unique_pending_ids(&self.realm_identifier).await?;
-        let merkle_node_keys = job_ids
-            .iter()
-            .map(|job_id_with_path| SimpleMerkleNodeKey::from_reward_path_info(job_id_with_path.reward_path_info))
-            .collect::<Vec<_>>();
-
-        self.tag_tree_rewards_store
-            .rewards_tag_tree_get_tag_tree_merkle_proof_at_unique_pending_id(unique_pending_id, &merkle_node_keys)
-            .await?
-            .into_iter()
-            .zip(job_ids.iter())
-            .map(|(proof, job_id_with_path)| {
-                Ok(PsyProoffMinerRewardProof {
-                    job_id: job_id_with_path.job_data_id.clone(),
-                    tag_tree_proof: proof,
-                })
-            })
-            .collect()
-    }
-}
-
-impl<
-        N: QNetworkTypesConfig,
-        S: PsyCoordinatorEdgeAPIStoreReader<N::F, N::QHash> + Send + Sync,
-        STagTreeRewards: PsyNodeCoreRewardsTagTreeStoreWriter<N::F, N::QHash> + PsyNodeCoreRewardsTagTreeStoreReader<N::F, N::QHash> + Send + Sync,
-        GUTAUpdateQueue: QStandardEphemeralQueuePublisher,
-        RegisterUserQueue: QStandardEphemeralQueuePublisher,
-        DeployContractQueue: QStandardEphemeralQueuePublisher,
-        GetProofWorkQueue: QStandardWorkerQueueSubscriber,
-        TempDatabase: StandardEdgeAPITempDBStoreBase<N::JobId, N::QHash>,
-        ProofStore: QParthProofStore,
-    >
-    CoordinatorEdgeHandler<
-        N,
-        S,
-        STagTreeRewards,
-        GUTAUpdateQueue,
-        RegisterUserQueue,
-        DeployContractQueue,
-        GetProofWorkQueue,
-        TempDatabase,
-        ProofStore,
-    >
-{
-    pub async fn get_register_user_queue_key(
-        &self,
-    ) -> anyhow::Result<(u64, QCoreProcCheckpointUniqueId, CoordinatorRegisterUserPublicKeyQueueKey<N::QHash>)> {
-        let (unique_pending_id, unique_proc_checkpoint_id) = self.temp_db.get_unique_pending_ids(&self.realm_identifier).await?;
-
-        Ok((
-            unique_pending_id,
-            unique_proc_checkpoint_id,
-            CoordinatorRegisterUserPublicKeyQueueKey::<N::QHash> {
-                realm_id: self.realm_id_u64,
-                realm_sub_id: self.realm_sub_id_u64,
-                unique_id: unique_proc_checkpoint_id,
-                task_group: 0,
-                queue_type: QPBaseQueueType::StandardEphemeral,
-                _phantom_queue_item: std::marker::PhantomData,
-            },
-        ))
-    }
-    pub async fn get_deploy_contract_queue_key(
-        &self,
-    ) -> anyhow::Result<(u64, QCoreProcCheckpointUniqueId, CoordinatorDeployContractQueueKey<N::F, N::QHash>)> {
-        let (unique_pending_id, unique_proc_checkpoint_id) = self.temp_db.get_unique_pending_ids(&self.realm_identifier).await?;
-
-        Ok((
-            unique_pending_id,
-            unique_proc_checkpoint_id,
-            CoordinatorDeployContractQueueKey{
-                realm_id: self.realm_id_u64,
-                realm_sub_id: self.realm_sub_id_u64,
-                unique_id: unique_proc_checkpoint_id,
-                task_group: 0,
-                queue_type: QPBaseQueueType::StandardEphemeral,
-                _phantom_queue_item: std::marker::PhantomData,
-            },
-        ))
-    }
-
-    pub async fn register_user_internal(&self, public_key: PZKPublicKeyInfo<N::QHash>) -> anyhow::Result<String> {
-        let (_, unique_proc_checkpoint_id, queue_key) = self.get_register_user_queue_key().await?;
-        self.register_user_queue
-            .publish_ephemeral_queue_item_owned_bytes(
-                &queue_key,
-                self.realm_id_u64,
-                self.realm_sub_id_u64,
-                unique_proc_checkpoint_id,
-                0,
-                public_key.psy_ser_into_bytes_vec()?,
-            )
-            .await?;
-
-        Ok("ok".to_string())
-    }
-    pub async fn deploy_contract_internal(&self, deploy_contract: PQBCDeployContract<N::QHash>) -> anyhow::Result<String> {
-        if deploy_contract.code_definition.functions.len() == 0 {
-            anyhow::bail!("contracts with no functions are not supported");
-        } else if deploy_contract.code_definition.functions.len() > (1usize << N::CONTRACT_FUNCTION_TREE_HEIGHT) {
-            anyhow::bail!("contract has too many functions defined");
-        }
-
-        let (unique_pending_id, unique_proc_checkpoint_id, queue_key) = self.get_deploy_contract_queue_key().await?;
-
-        let (deployer, code_definition, function_leaves) = deploy_contract.split_into_tuple();
-        let queue_item = PsyDeployContractQueueItem::<N::F, N::QHash>::new_from_leaves_and_deployer::<N::HasherBase>(
-            deployer,
-            code_definition.state_tree_height,
-            function_leaves,
-            N::CONTRACT_FUNCTION_TREE_HEIGHT_USIZE,
-        )?;
-
-        self.temp_db
-            .set_deploy_contract_code_definition_raw(
-                &self.realm_identifier,
-                unique_pending_id,
-                &queue_item.rand_key_id,
-                code_definition.psy_ser_into_bytes_vec()?,
-            )
-            .await?;
-
-        self.deploy_contract_queue
-            .publish_ephemeral_queue_item_owned_bytes(
-                &queue_key,
-                self.realm_id_u64,
-                self.realm_sub_id_u64,
-                unique_proc_checkpoint_id,
-                0,
-                queue_item.psy_ser_into_bytes_vec()?,
-            )
-            .await?;
-
-        Ok("ok".to_string())
-    }
+;
+fn verify_api_signature(signature: &QEDCompressedSecp256K1Signature, request: &SimpleTimedRequest) -> bool {
+    request.get_sig_hash::<parth_crypto::hash::sha256::CoreSha256Hasher>() == signature.message
+        && parth_common::secp256k1::Secp256K1VerifierHelper::secp256k1_verify(signature).is_ok()
 }
 
 impl<
@@ -304,108 +62,271 @@ impl<
         GetProofWorkQueue,
         TempDatabase,
         ProofStore,
-    >{
-    pub async fn get_proving_work_internal(&self, signature:  QEDCompressedSecp256K1Signature, request: SimpleTimedRequest) -> anyhow::Result<PsyWorkerGetProvingWorkAPIResponse<N::JobId>>{
-        let sig_hash = request.get_sig_hash::<CoreSha256Hasher>();
-        todo!("not implemented yet")
+    >
+{
+    pub async fn has_job_id_already_been_submitted(&self, unique_pending_id: u64, job_id: N::JobId) -> anyhow::Result<bool> {
+        Ok(self
+            .temp_db
+            .get_proof_miner_rewards_tree_value_or_none(&self.realm_identifier, unique_pending_id, job_id)
+            .await?
+            .is_some())
     }
-    pub async fn get_proving_work_with_child_proofs_internal(&self, signature:  QEDCompressedSecp256K1Signature, request: SimpleTimedRequest) -> anyhow::Result<PsyWorkerGetProvingWorkWithChildProofsAPIResponse<N::JobId>>{
-        todo!("not implemented yet")
+    pub async fn get_job_id_submission_status(&self, unique_checkpoint_id: u64, job_id: &N::JobId) -> anyhow::Result<bool> {
+        Ok(false)
     }
-    pub async fn submit_proof_raw_internal(&self, job_id: QProvingJobDataIDWithRewardPath<N::JobId>, proof: Vec<u8>) -> anyhow::Result<()>{
+    pub async fn verify_miner_api_signature_and_check_reputation(
+        &self,
+        signature: &QEDCompressedSecp256K1Signature,
+        request: &SimpleTimedRequest,
+    ) -> anyhow::Result<()> {
+        if !verify_api_signature(&signature, &request) {
+            anyhow::bail!("invalid signature from miner");
+        }
 
+        // todo, check miner reputation here to prevent miners who request jobs but
+        // don't finish them in a reasonable amount of time
+
+        Ok(())
+    }
+    pub async fn get_proving_work_internal(
+        &self,
+        signature: QEDCompressedSecp256K1Signature,
+        request: SimpleTimedRequest,
+    ) -> anyhow::Result<PsyWorkerGetProvingWorkAPIResponse<N::QHash, N::JobId>> {
+        self.verify_miner_api_signature_and_check_reputation(&signature, &request).await?;
 
         let (unique_pending_id, unique_proc_id) = self.get_current_unique_pending_id_internal().await?;
-        let (expected_public_inputs_hash, dependencies) = self.temp_db.get_tdb_proof_expected_public_inputs_hash_raw_and_dependencies(&self.realm_identifier, unique_pending_id, job_id.job_data_id).await?;
 
-
-        self.proof_store.put_proof_bytes_for_job_id(&job_id.job_data_id.get_output_id(), &proof).await?;
-
-        todo!("not implemented yet")
-    }
-
-    pub async fn submit_guta_internal(
-        &self,
-        input: GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<N::F, N::QHash>,
-        proof_bytes: Vec<u8>,
-    ) -> anyhow::Result<()> {
-        let realm_level_u64 = input.header.header_with_stats.base_header.state_transition.node_level.to_u64_value();
-        if realm_level_u64 != N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT as u64 {
-            anyhow::bail!(
-                "invalid realm level {}, expected {}",
-                realm_level_u64,
-                N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT
-            );
-        }
-        let realm_id_u64 = input.header.header_with_stats.base_header.state_transition.node_index.to_u64_value();
-
-        let realm_level = realm_level_u64 as u8;
-        if realm_id_u64 > (1u64 << realm_level) || realm_id_u64 > u32::MAX as u64 {
-            anyhow::bail!("invalid realm id {}", realm_id_u64);
-        }
-
-        let realm_id = realm_id_u64 as u32;
-        let proving_circuit_type = ProvingJobCircuitType::try_from_u32(input.job_type_u32)?;
-
-        let (unique_pending_id, proc_checkpoint_id) = self.get_current_unique_pending_id_internal().await?;
-
-        let status = rand::random::<u64>() & 0x0fff_ffff_ffff_ffff;
-        if self
-            .temp_db
-            .get_submitted_status_for_pending(&self.realm_identifier, unique_pending_id, realm_id_u64)
-            .await?
-            != 0
-        {
-            anyhow::bail!(
-                "GUTA for realm_id {} at unique_pending_id {} has already been submitted",
-                realm_id,
-                unique_pending_id
-            );
-        }
-        self.temp_db
-            .set_submitted_status_for_pending(&self.realm_identifier, unique_pending_id, realm_id_u64, status)
+        let queue_key = CoordinatorProvingWorkQueueKey::<N::QHash, N::JobId> {
+            realm_id: self.realm_id_u64,
+            realm_sub_id: self.realm_id_u64,
+            unique_id: unique_proc_id,
+            task_group: 0,
+            queue_type: QPBaseQueueType::WorkerQueue,
+            _phantom_queue_item: std::marker::PhantomData,
+        };
+        let work_item: Option<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>> = self
+            .get_proof_work_queue
+            .get_next_worker_queue_item_or_none(&queue_key, self.realm_id_u64, self.realm_sub_id_u64, unique_proc_id, 0)
             .await?;
 
-        let output_proof_job_id = QProvingJobDataID::try_get_coordinator_edge_proof_store_output_proof_id_for_realm_submit(
-            realm_id,
-            realm_level,
-            unique_pending_id,
-            proving_circuit_type,
-        )?;
+        if work_item.is_none() {
+            anyhow::bail!("no proving work available");
+        }
+        let work_item = work_item.unwrap();
 
-        let expected_public_inputs_hash = input.qfhash::<N::HasherBase>();
-        self.proof_verifier
-            .verify_zk_proof_from_slice_check_public_inputs_hash(input.job_type_u32, &proof_bytes, expected_public_inputs_hash)?;
+        let witness_bytes: Vec<u8> = self
+            .temp_db
+            .get_tdb_proof_witness_bytes(&self.realm_identifier, unique_pending_id, work_item.job_id)
+            .await?;
+
+        let response = PsyWorkerGetProvingWorkAPIResponse {
+            job: work_item,
+            witness: witness_bytes,
+        };
+        Ok(response)
+    }
+    pub async fn get_proving_work_with_child_proofs_internal(
+        &self,
+        signature: QEDCompressedSecp256K1Signature,
+        request: SimpleTimedRequest,
+    ) -> anyhow::Result<PsyWorkerGetProvingWorkWithChildProofsAPIResponse<N::QHash, N::JobId>> {
+        self.verify_miner_api_signature_and_check_reputation(&signature, &request).await?;
+
+        let (unique_pending_id, unique_proc_id) = self.get_current_unique_pending_id_internal().await?;
+
+        let queue_key = CoordinatorProvingWorkQueueKey::<N::QHash, N::JobId> {
+            realm_id: self.realm_id_u64,
+            realm_sub_id: self.realm_id_u64,
+            unique_id: unique_proc_id,
+            task_group: 0,
+            queue_type: QPBaseQueueType::WorkerQueue,
+            _phantom_queue_item: std::marker::PhantomData,
+        };
+        let work_item: Option<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>> = self
+            .get_proof_work_queue
+            .get_next_worker_queue_item_or_none(&queue_key, self.realm_id_u64, self.realm_sub_id_u64, unique_proc_id, 0)
+            .await?;
+
+        if work_item.is_none() {
+            anyhow::bail!("no proving work available");
+        }
+        let work_item = work_item.unwrap();
+
+        let child_proofs = work_item
+            .metadata
+            .dependencies
+            .iter()
+            .map(|id| self.proof_store.get_proof_bytes_by_job_id(id))
+            .collect::<Vec<_>>()
+            .into_iter();
+        let res: Vec<Option<Vec<u8>>> = try_join_all(child_proofs).await?;
+        let mut final_child_proofs: Vec<Vec<u8>> = Vec::with_capacity(res.len());
+
+        for item in res {
+            if let Some(proof) = item {
+                final_child_proofs.push(proof);
+            } else {
+                anyhow::bail!("missing child proof for job id");
+            }
+        }
+
+        let witness_bytes: Vec<u8> = self
+            .temp_db
+            .get_tdb_proof_witness_bytes(&self.realm_identifier, unique_pending_id, work_item.job_id)
+            .await?;
+
+        let response = PsyWorkerGetProvingWorkAPIResponse {
+            job: work_item,
+            witness: witness_bytes,
+        };
+        self.temp_db
+            .set_proving_job_metadata(&self.realm_identifier, unique_pending_id, response.job.job_id, &response.job.metadata)
+            .await?;
+
+        // HACK: in the future we should create a new table for the expected proving
+        // tag, but for now this ok i guess, but a HACK HACK: for now we set
+        // self.temp_db.set_proof_miner_rewards_tree_value( with the expected proving
+        // tag and then update it later to the actual value once the proof is submitted
+        // this ensures the right person submits the proof AND the proof can only be
+        // submitted once
+        self.temp_db
+            .set_proof_miner_rewards_tree_value(
+                &self.realm_identifier,
+                unique_pending_id,
+                response.job.job_id,
+                N::QHash::from_ref_32bytes(&request.tag),
+            )
+            .await?;
+
+        Ok(PsyWorkerGetProvingWorkWithChildProofsAPIResponse {
+            base: response,
+            input_proofs: final_child_proofs,
+        })
+    }
+    pub async fn submit_proof_raw_internal(
+        &self,
+        job_id: QProvingJobDataIDWithRewardPath<N::JobId>,
+        proof_bytes: Vec<u8>,
+        tag: N::QHash,
+    ) -> anyhow::Result<()> {
+        let (unique_pending_id, unique_proc_id) = self.get_current_unique_pending_id_internal().await?;
+
+        //HACK: check to make sure the tag matches
         if self
             .temp_db
-            .get_submitted_status_for_pending(&self.realm_identifier, unique_pending_id, realm_id_u64)
+            .get_proof_miner_rewards_tree_value(&self.realm_identifier, unique_pending_id, job_id.job_data_id)
             .await?
-            != status
+            != tag
         {
-            anyhow::bail!(
-                "RACE: GUTA for realm_id {} at unique_pending_id {} has already been submitted",
-                realm_id,
-                unique_pending_id
-            );
+            anyhow::bail!("Submitted tag does not match expected tag for job id");
         }
-        self.proof_store.put_proof_bytes_for_job_id(&output_proof_job_id, &proof_bytes).await?;
 
-        let queue_item = GlobalUserTreeAggregatorHeaderWithTagValueAndJobID {
-            header: input.header,
-            job_id: output_proof_job_id,
+        let metadata: PsyProvingJobMetadata<N::QHash, N::JobId> = self
+            .temp_db
+            .get_proving_job_metadata(&self.realm_identifier, unique_pending_id, job_id.job_data_id)
+            .await?;
+
+        let children_reward_tree_values = {
+            if metadata.dependencies.len() == 0 || metadata.reward_tree_hash_mode == PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN {
+                vec![]
+            } else {
+                let mut values = Vec::with_capacity(metadata.dependencies.len());
+                for dependency in metadata.dependencies.iter() {
+                    let value: N::QHash = self
+                        .temp_db
+                        .get_proof_miner_rewards_tree_value(&self.realm_identifier, unique_pending_id, *dependency)
+                        .await?;
+                    values.push(value);
+                }
+                values
+            }
         };
 
-        let queue_key = CoordinatorSubmitRealmGUTAUpdateQueueKey::<N::F, N::QHash> {
+        let reward_tree_value = metadata.get_new_rewards_tag_tree_value::<N::HasherBase>(tag, &children_reward_tree_values)?;
+
+        let full_expected_public_inputs_hash = N::HasherBase::two_to_one(&metadata.expected_public_inputs_hash, &reward_tree_value);
+
+        self.proof_verifier.verify_zk_proof_from_slice_check_public_inputs_hash(
+            job_id.job_data_id.circuit_type.to_u8() as u32,
+            &proof_bytes,
+            full_expected_public_inputs_hash,
+        )?;
+
+        // HACK: now set the correct reward tree value
+        self.temp_db
+            .set_proof_miner_rewards_tree_value(&self.realm_identifier, unique_pending_id, job_id.job_data_id, reward_tree_value)
+            .await?;
+        if self
+            .temp_db
+            .get_proof_miner_rewards_tree_value(&self.realm_identifier, unique_pending_id, job_id.job_data_id)
+            .await?
+            != reward_tree_value
+        {
+            anyhow::bail!("Failed to set rewards tree value for job id");
+        }
+
+        self.proof_store.put_proof_bytes_for_job_id(job_id.job_data_id, &proof_bytes).await?;
+
+        self.tag_tree_rewards_store
+            .rewards_tag_tree_set_node_tag(unique_pending_id, metadata.get_reward_tree_node_key(), tag, reward_tree_value)
+            .await?;
+
+        // now update the tag tree
+
+        if metadata.reward_tree_hash_mode == PROOF_REWARD_TREE_HASH_MODE_3_CHILDREN_DOUBLE_REWARD {
+            // special case for 3 children
+            if metadata.dependencies.len() != 3 || children_reward_tree_values.len() != 3 {
+                anyhow::bail!(
+                    "Expected 3 children for 3-children double reward hash mode, got {}",
+                    metadata.dependencies.len()
+                );
+            }
+            let zero = N::QHash::get_zero_value();
+
+            let left_value = hash_tag_tree_node::<N::QHash, N::HasherBase>(&children_reward_tree_values[0], &children_reward_tree_values[1], &tag);
+            let right_value = hash_tag_tree_node::<N::QHash, N::HasherBase>(&children_reward_tree_values[2], &zero, &tag);
+            let top_value = hash_tag_tree_node::<N::QHash, N::HasherBase>(&left_value, &right_value, &tag);
+            if top_value != reward_tree_value {
+                anyhow::bail!("Computed top value does not match reward tree value for 3-children double reward hash mode");
+            }
+            let self_key = metadata.get_reward_tree_node_key();
+            let left_key = self_key.left_child();
+            let right_key = self_key.right_child();
+            self.tag_tree_rewards_store
+                .rewards_tag_tree_set_node_tag(unique_pending_id, left_key, tag, left_value)
+                .await?;
+            self.tag_tree_rewards_store
+                .rewards_tag_tree_set_node_tag(unique_pending_id, right_key, tag, right_value)
+                .await?;
+            self.tag_tree_rewards_store
+                .rewards_tag_tree_set_node_tag(unique_pending_id, self_key, tag, top_value)
+                .await?;
+        } else if metadata.reward_tree_hash_mode == PROOF_REWARD_TREE_HASH_MODE_LIFT_CHILD {
+            // do nothing
+        } else {
+            let self_key = metadata.get_reward_tree_node_key();
+            self.tag_tree_rewards_store
+                .rewards_tag_tree_set_node_tag(unique_pending_id, self_key, tag, reward_tree_value)
+                .await?;
+        }
+
+        // ack the queue item as completed
+        let queue_key = CoordinatorProvingWorkQueueKey::<N::QHash, N::JobId> {
             realm_id: self.realm_id_u64,
-            realm_sub_id: self.realm_sub_id_u64,
-            unique_id: proc_checkpoint_id,
+            realm_sub_id: self.realm_id_u64,
+            unique_id: unique_proc_id,
             task_group: 0,
-            queue_type: QPBaseQueueType::StandardEphemeral,
+            queue_type: QPBaseQueueType::WorkerQueue,
             _phantom_queue_item: std::marker::PhantomData,
         };
 
-        self.guta_update_queue
-            .publish_ephemeral_queue_item_owned(&queue_key, self.realm_id_u64, self.realm_sub_id_u64, proc_checkpoint_id, 0, queue_item)
+        let item = PsyProvingJobMetadataWithJobId {
+            job_id: job_id.job_data_id,
+            metadata,
+        };
+        self.get_proof_work_queue
+            .worker_queue_report_job_completed(&queue_key, self.realm_id_u64, self.realm_sub_id_u64, unique_proc_id, 0, &item)
             .await?;
 
         Ok(())

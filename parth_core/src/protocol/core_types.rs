@@ -4,7 +4,7 @@ use psy_serialize::PsySerializeCanonicalAsyncSafe;
 use serde::{de::DeserializeOwned, Serialize};
 use ts_rs::TS;
 
-use crate::{crypto::hash::traits::{FieldQHasher, FromU64x4, HashTo4Felts, MerkleZeroHasher, RandomHash, ZeroableHash}, data::{db::data_types::{CoreDatabaseValueDeserialize, QDatabasePrimitiveKey}, maybe_serialization::{MaybeBytemuck, MaybeSpeedy}, parth::public_preimage::{QParthProofPublicInputsPreimage, QParthProofPublicInputsPreimageWithoutRewardsHash}, serializable::{QPDSerializable, QPDSerializableFixed}}, felt::QFelt64, generic_traits::QNamedType, QJobIdBase};
+use crate::{crypto::hash::traits::{FieldQHasher, FromU64x4, HashTo4Felts, MerkleZeroHasher, RandomHash, ZeroableHash}, data::{db::data_types::{CoreDatabaseValueDeserialize, QDatabasePrimitiveKey}, maybe_serialization::{MaybeBytemuck, MaybeSpeedy}, serializable::{QPDSerializable, QPDSerializableFixed}}, felt::QFelt64, generic_traits::QNamedType, QJobIdBase};
 
 pub trait QStorableBase: Serialize + DeserializeOwned + Send + Sync + Clone + PartialEq + Eq {}
 pub trait QStorableSizedBase: QStorableBase + Sized {}

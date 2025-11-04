@@ -1,10 +1,12 @@
-use parth_core::{QJOB_ID_SERIALIZED_SIZE, QJobIdBase, QProvingJobDataIDWithRewardPath};
+use parth_core::{QJOB_ID_SERIALIZED_SIZE, QJobIdBase};
+use psy_core::job::job_id::QProvingJobDataID;
 
-#[pderive::serialize_clone_ts_export]
-pub struct PsyWorkerGetProvingWorkAPIResponse<JobId> {
-    pub job_id: QProvingJobDataIDWithRewardPath<JobId>,
-    pub expected_public_inputs_hash_raw: [u8; 32],
-    pub input_proof_ids: Vec<JobId>,
+use crate::worker::metadata_with_job_id::PsyProvingJobMetadataWithJobId;
+
+#[pderive::serialize_clone_hash_job_id_ts]
+#[ts(export, concrete(Hash = parth_core::PHash, JobId = QProvingJobDataID))]
+pub struct PsyWorkerGetProvingWorkAPIResponse<Hash, JobId> {
+    pub job: PsyProvingJobMetadataWithJobId<Hash, JobId>,
     pub witness: Vec<u8>,
 }
 
@@ -17,15 +19,13 @@ pub struct PsyRawProofWithJobId<JobId> {
 
 
 
-#[pderive::serialize_clone_ts_export]
-pub struct PsyWorkerGetProvingWorkWithChildProofsAPIResponse<JobId> {
-    pub job_id: QProvingJobDataIDWithRewardPath<JobId>,
-    pub expected_public_inputs_hash_raw: [u8; 32],
-    pub input_proofs: Vec<PsyRawProofWithJobId<JobId>>,
-    pub witness: Vec<u8>,
+#[pderive::serialize_clone_hash_job_id_ts]
+#[ts(export, concrete(Hash = parth_core::PHash, JobId = QProvingJobDataID))]
+pub struct PsyWorkerGetProvingWorkWithChildProofsAPIResponse<Hash, JobId> {
+    pub base: PsyWorkerGetProvingWorkAPIResponse<Hash, JobId>,
+    pub input_proofs: Vec<Vec<u8>>,
 }
-
-
+ 
 pub fn encode_expected_public_inputs_hash_and_dependencies<JobId: QJobIdBase>(hash: &[u8; 32], dependencies: &[JobId]) -> Vec<u8> {
     let mut result = Vec::with_capacity(32 + 4 + dependencies.len() * QJOB_ID_SERIALIZED_SIZE);
     let dependencies_len_u32 = dependencies.len() as u32;

@@ -3,7 +3,7 @@ use parth_core::{
 };
 use psy_core::job::job_id::QProvingJobDataID;
 use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
-use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalDatabaseSerializeBaseSingle, PsyCanonicalSerializeMetadata, PsyIOReadWrite, PsySerializeCanonicalAsyncSafe};
+use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalDatabaseSerializeBaseSingle, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
 
 use crate::guta::header::GlobalUserTreeAggregatorHeader;
 #[pderive::serialize_copy_f_hash_ts]
