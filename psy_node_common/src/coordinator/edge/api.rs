@@ -1,12 +1,8 @@
 use async_trait::async_trait;
 use jsonrpsee::core::RpcResult;
 use parth_core::{
-    crypto::hash::
-        merkle_proof::MerkleProofCore
-    ,
-    data::hash::merkle_node_key::SimpleMerkleNodeKey,
-    protocol::core_types::QNetworkTypesConfig,
-    QProvingJobDataIDWithRewardPath,
+    QProvingJobDataIDWithRewardPath, crypto::{hash::
+        merkle_proof::MerkleProofCore, secp256k1::{QEDCompressedSecp256K1Signature, SimpleTimedRequest}}, data::hash::merkle_node_key::SimpleMerkleNodeKey, protocol::core_types::QNetworkTypesConfig
 };
 use psy_core::job::job_id::QProvingJobDataID;
 use psy_data::{
@@ -18,10 +14,10 @@ use psy_data::{
             public_key::PZKPublicKeyInfo,
             user::PQEDUserLeaf,
         },
-    }
+    }, worker::api_response::{PsyWorkerGetProvingWorkAPIResponse, PsyWorkerGetProvingWorkWithChildProofsAPIResponse}
 };
 use psy_node_core::{
-    api::coordinator::standard_edge_rpc::CoordinatorEdgeRpcServer,
+    api::{coordinator::standard_edge_rpc::CoordinatorEdgeRpcServer, worker::standard_worker_rpc::NodeEdgeWorkerRpcServer},
     psy_core_db::
         traits::full::{
             PsyCoordinatorEdgeAPIStoreReader, PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter,
@@ -253,3 +249,40 @@ impl<
         res(self.db_reader.user_registration_tree_get_merkle_proof(checkpoint_id, leaf_index).await)
     }
 }
+
+
+#[async_trait]
+impl<
+        N: QNetworkTypesConfig<JobId =  QProvingJobDataID> + Send + Sync + 'static,
+        S: PsyCoordinatorEdgeAPIStoreReader<N::F, N::QHash> + Send + Sync + 'static,
+        STagTreeRewards: PsyNodeCoreRewardsTagTreeStoreWriter<N::F, N::QHash> + PsyNodeCoreRewardsTagTreeStoreReader<N::F, N::QHash> + Send + Sync + 'static,
+        GUTAUpdateQueue: QStandardEphemeralQueuePublisher + Send + Sync + 'static,
+        RegisterUserQueue: QStandardEphemeralQueuePublisher + Send + Sync + 'static,
+        DeployContractQueue: QStandardEphemeralQueuePublisher + Send + Sync + 'static,
+        GetProofWorkQueue: QStandardWorkerQueueSubscriber + Send + Sync + 'static,
+        TempDatabase: StandardEdgeAPITempDBStoreBase<N::JobId, N::QHash> + std::marker::Sync + std::marker::Send + 'static,
+        ProofStore: QParthProofStore + Send + Sync + 'static,
+    > NodeEdgeWorkerRpcServer<N::QHash, N::JobId>
+    for CoordinatorEdgeHandler<
+        N,
+        S,
+        STagTreeRewards,
+        GUTAUpdateQueue,
+        RegisterUserQueue,
+        DeployContractQueue,
+        GetProofWorkQueue,
+        TempDatabase,
+        ProofStore,
+    >
+{
+    async fn get_proving_work(&self, signature:  QEDCompressedSecp256K1Signature, request: SimpleTimedRequest) -> RpcResult<PsyWorkerGetProvingWorkAPIResponse<N::QHash, N::JobId>>{
+        res(self.get_proving_work_internal(signature, request).await)
+    }
+    async fn get_proving_work_with_child_proofs(&self, signature:  QEDCompressedSecp256K1Signature, request: SimpleTimedRequest) -> RpcResult<PsyWorkerGetProvingWorkWithChildProofsAPIResponse<N::QHash, N::JobId>>{
+        res(self.get_proving_work_with_child_proofs_internal(signature, request).await)
+    }
+    async fn submit_proof_raw(&self, job_id: N::JobId, tag: N::QHash, proof: Vec<u8>) -> RpcResult<()>{
+        res(self.submit_proof_raw_internal(job_id, tag, proof).await)
+    }
+}
+

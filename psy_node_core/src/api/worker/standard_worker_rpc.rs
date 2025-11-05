@@ -12,6 +12,6 @@ pub trait NodeEdgeWorkerRpc<Hash: QDBHashBase, JobId> {
     #[method(name = "get_proving_work_with_child_proofs")]
     async fn get_proving_work_with_child_proofs(&self, signature:  QEDCompressedSecp256K1Signature, request: SimpleTimedRequest) -> RpcResult<PsyWorkerGetProvingWorkWithChildProofsAPIResponse<Hash, JobId>>;
     #[method(name = "submit_proof_raw")]
-    async fn submit_proof_raw(&self, job_id: QProvingJobDataIDWithRewardPath<JobId>, proof: Vec<u8>) -> RpcResult<()>;
+    async fn submit_proof_raw(&self, job_id: JobId, tag: Hash, proof: Vec<u8>) -> RpcResult<()>;
 }
 

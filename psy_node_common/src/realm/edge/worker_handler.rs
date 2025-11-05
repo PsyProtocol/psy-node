@@ -1,15 +1,13 @@
 use futures::future::try_join_all;
+use jsonrpsee::core::RpcResult;
 use parth_core::{
-    crypto::{
+    QCoreProcCheckpointUniqueId, QProvingJobDataIDWithRewardPath, crypto::{
         hash::{
             tag_tree::hash_tag_tree_node,
             traits::{MerkleHasher, ZeroableHash},
         },
         secp256k1::{QEDCompressedSecp256K1Signature, Secp256K1Verifier, SimpleTimedRequest},
-    },
-    data::queue::queue_key::QPBaseQueueType,
-    protocol::core_types::{Q256BitHash, QNetworkTypesConfig, QZKProofVerifier},
-    QProvingJobDataIDWithRewardPath,
+    }, data::queue::queue_key::QPBaseQueueType, protocol::core_types::{Q256BitHash, QNetworkTypesConfig, QZKProofVerifier}
 };
 use psy_core::job::job_id::QProvingJobDataID;
 use psy_data::
@@ -22,19 +20,16 @@ use psy_data::
     }
 ;
 use psy_node_core::{
-    psy_core_db::traits::full::{PsyCoordinatorEdgeAPIStoreReader, PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter},
-    psy_temp_db::{QTempDBProvingJobMetadataReader, StandardEdgeAPITempDBStoreBase},
-    queue::{ephemeral::QStandardEphemeralQueuePublisher, worker_queue::QStandardWorkerQueueSubscriber},
-    store::traits::proof_store::QParthProofStore,
+    api::worker::standard_worker_rpc::NodeEdgeWorkerRpcServer, psy_core_db::traits::full::{PsyCoordinatorEdgeAPIStoreReader, PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmEdgeAPIStoreReader}, psy_temp_db::{QTempDBProvingJobMetadataReader, StandardEdgeAPITempDBStoreBase}, queue::{ephemeral::QStandardEphemeralQueuePublisher, worker_queue::QStandardWorkerQueueSubscriber}, store::traits::proof_store::QParthProofStore
 };
 
-use crate::
+use crate::{
     coordinator::{
         edge::handler::CoordinatorEdgeHandler,
         queue_key::
             CoordinatorProvingWorkQueueKey
         ,
-    }
+    }, realm::{edge::handler::RealmEdgeHandler, queue_key::RealmProvingWorkQueueKey}}
 ;
 fn verify_api_signature(signature: &QEDCompressedSecp256K1Signature, request: &SimpleTimedRequest) -> bool {
     request.get_sig_hash::<parth_crypto::hash::sha256::CoreSha256Hasher>() == signature.message
@@ -43,26 +38,13 @@ fn verify_api_signature(signature: &QEDCompressedSecp256K1Signature, request: &S
 
 impl<
         N: QNetworkTypesConfig<JobId = QProvingJobDataID>,
-        S: PsyCoordinatorEdgeAPIStoreReader<N::F, N::QHash> + Send + Sync,
+        S: PsyRealmEdgeAPIStoreReader<N::F, N::QHash> + Send + Sync,
         STagTreeRewards: PsyNodeCoreRewardsTagTreeStoreWriter<N::F, N::QHash> + PsyNodeCoreRewardsTagTreeStoreReader<N::F, N::QHash> + Send + Sync,
-        GUTAUpdateQueue: QStandardEphemeralQueuePublisher,
-        RegisterUserQueue: QStandardEphemeralQueuePublisher,
-        DeployContractQueue: QStandardEphemeralQueuePublisher,
+        UserUpdateQueue: QStandardEphemeralQueuePublisher,
         GetProofWorkQueue: QStandardWorkerQueueSubscriber,
         TempDatabase: StandardEdgeAPITempDBStoreBase<N::JobId, N::QHash>,
         ProofStore: QParthProofStore,
-    >
-    CoordinatorEdgeHandler<
-        N,
-        S,
-        STagTreeRewards,
-        GUTAUpdateQueue,
-        RegisterUserQueue,
-        DeployContractQueue,
-        GetProofWorkQueue,
-        TempDatabase,
-        ProofStore,
-    >
+    > RealmEdgeHandler<N, S, STagTreeRewards, UserUpdateQueue, GetProofWorkQueue, TempDatabase, ProofStore>
 {
     pub async fn has_job_id_already_been_submitted(&self, unique_pending_id: u64, job_id: N::JobId) -> anyhow::Result<bool> {
         Ok(self
@@ -87,6 +69,10 @@ impl<
         // don't finish them in a reasonable amount of time
 
         Ok(())
+    }
+
+    pub async fn get_current_unique_pending_id_internal(&self) -> anyhow::Result<(u64, QCoreProcCheckpointUniqueId)> {
+        self.db_reader.get_current_unique_pending_id().await
     }
     pub async fn get_proving_work_internal(
         &self,
@@ -157,7 +143,7 @@ impl<
             .metadata
             .dependencies
             .iter()
-            .map(|id| self.proof_store.get_proof_bytes_by_job_id(id))
+            .map(|id| self.proof_store.get_proof_bytes_by_job_id(*id))
             .collect::<Vec<_>>()
             .into_iter();
         let res: Vec<Option<Vec<u8>>> = try_join_all(child_proofs).await?;
@@ -312,7 +298,7 @@ impl<
         }
 
         // ack the queue item as completed
-        let queue_key = CoordinatorProvingWorkQueueKey::<N::QHash, N::JobId> {
+        let queue_key = RealmProvingWorkQueueKey::<N::QHash, N::JobId> {
             realm_id: self.realm_id_u64,
             realm_sub_id: self.realm_id_u64,
             unique_id: unique_proc_id,
@@ -332,3 +318,4 @@ impl<
         Ok(())
     }
 }
+
