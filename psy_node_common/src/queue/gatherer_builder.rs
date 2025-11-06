@@ -15,6 +15,46 @@ pub trait QueueGathererItemBuilder<C>: Sized {
     }
     async fn finalize(self) -> anyhow::Result<Self::Output>;
 }
+
+#[async_trait]
+pub trait QueueGathererItemBuilderWithTree<C, Tree>: Sized {
+    type Output: Sized + Send + Sync;
+    async fn create_new_with_tree(tree: &mut Tree, unique_id: u128, config: C) -> anyhow::Result<Self>;
+    async fn update_from_queue_item_with_tree(&mut self, tree: &mut Tree, item: Vec<u8>) -> anyhow::Result<()>;
+    async fn update_from_many_queue_items_with_tree(&mut self, tree: &mut Tree, item: Vec<Vec<u8>>) -> anyhow::Result<()>;
+    async fn finalize_with_tree(self, tree: &mut Tree) -> anyhow::Result<Self::Output>;
+}
+
+
+#[async_trait]
+pub trait QueueGathererItemBuilderWithTreeRef<C, Tree>: Sized {
+    type Output: Sized + Send + Sync;
+    async fn create_new_with_tree_ref(tree: &mut Tree, unique_id: u128, config: C) -> anyhow::Result<Self>;
+    async fn update_from_queue_item_with_tree_ref(&mut self, tree: &mut Tree, item: &[u8]) -> anyhow::Result<()>;
+    async fn update_from_many_queue_items_with_tree_ref(&mut self, tree: &mut Tree, item: &[Vec<u8>]) -> anyhow::Result<()>;
+    async fn finalize_with_tree_ref(self, tree: &mut Tree) -> anyhow::Result<Self::Output>;
+}
+#[async_trait]
+impl<C: Send + Sync + 'static, Tree: Send + Sync + 'static, T: QueueGathererItemBuilderWithTreeRef<C, Tree> + Send + Sync> QueueGathererItemBuilderWithTree<C, Tree> for T {
+    type Output = T::Output;
+
+    async fn create_new_with_tree(tree: &mut Tree, unique_id: u128, config: C) -> anyhow::Result<Self> {
+        T::create_new_with_tree_ref(tree, unique_id, config).await
+    }
+
+    async fn update_from_queue_item_with_tree(&mut self, tree: &mut Tree, item: Vec<u8>) -> anyhow::Result<()> {
+        self.update_from_queue_item_with_tree_ref(tree, &item).await
+    }
+
+    async fn update_from_many_queue_items_with_tree(&mut self, tree: &mut Tree, item: Vec<Vec<u8>>) -> anyhow::Result<()> {
+        self.update_from_many_queue_items_with_tree_ref(tree, &item).await
+    }
+
+    async fn finalize_with_tree(self, tree: &mut Tree) -> anyhow::Result<Self::Output> {
+        self.finalize_with_tree_ref(tree).await
+    }
+}
+
 #[async_trait]
 pub trait QueueGathererItemBuilderRef<C>: Sized {
     type Output: Sized + Send + Sync;

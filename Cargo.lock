@@ -2829,6 +2829,7 @@ dependencies = [
  "bytemuck",
  "cf_utils",
  "futures",
+ "hashbrown 0.14.5",
  "hex",
  "hex-literal",
  "jsonrpsee",

@@ -6,3 +6,4 @@ pub mod simple_merkle_tree;
 pub mod dash_tree;
 pub mod traits;
 pub mod dash_tree_recorder;
+pub mod mem_tree_recorder;

@@ -1,6 +1,10 @@
+use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
+use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
 use serde::{de::DeserializeOwned, Serialize};
 
-use crate::{crypto::hash::{merkle_proof::{DeltaMerkleProofCore, MerkleProofCore}, traits::{MerkleHasher, MerkleZeroHasher, ZeroableHash}}, data::serializable::QPDSerializable, utils::math::log2_strict};
+#[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
+use crate::protocol::core_types::Q256BitHash;
+use crate::{crypto::hash::{merkle_proof::{DeltaMerkleProofCore, MerkleProofCore}, traits::{MerkleHasher, MerkleZeroHasher, ZeroableHash}}, data::serializable::QPDSerializable, utils::{QPGenRandom, math::log2_strict}};
 use crate::crypto::hash::traits::MerkleLeafHasher;
 use pser::{QBytesSerialize, QBytesDeserialize};
 
@@ -201,3 +205,87 @@ impl<Hash: Copy + PartialEq +  Serialize + DeserializeOwned> QPDSerializable for
 
 
 
+
+
+
+
+
+
+#[cfg(feature = "rand")]
+impl<Hash: QPGenRandom> QPGenRandom for SpidermanUpdateProof<Hash> {
+    fn qp_rand_gen() -> Self where Self: Sized {
+        Self {
+            top_line_proof: DeltaMerkleProofCore::qp_rand_gen(),
+            web_proof_old_leaves: Hash::qp_rand_gen_vec(rand::random::<u8>() as usize + 1),
+            web_proof_new_leaves: Hash::qp_rand_gen_vec(rand::random::<u8>() as usize + 1),
+        }
+    }
+}
+
+
+
+
+
+impl<Hash: Q256BitHash> PsyCanonicalSerializeMetadata for SpidermanUpdateProof<Hash> {
+    const IS_FIXED_SIZE: bool = false;
+    const FIXED_SIZE: usize = 0;
+}
+impl<Hash: Q256BitHash> FallbackPsySerializeCanonical for SpidermanUpdateProof<Hash> {
+    fn fallback_pio_serialized_size(&self) -> usize {
+       self.top_line_proof.pio_serialized_size() + 4 + (self.web_proof_old_leaves.len() * 32) + 4 + (self.web_proof_new_leaves.len() * 32)
+    }
+    
+    fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
+        self.top_line_proof.pio_write_to_io(writer)?;
+        writer.psy_write_vec_length(self.web_proof_old_leaves.len())?;
+        for leaf in &self.web_proof_old_leaves {
+            writer.psy_write_bytes_fixed(&leaf.into_owned_32bytes())?;
+        }
+        writer.psy_write_vec_length(self.web_proof_new_leaves.len())?;
+        for leaf in &self.web_proof_new_leaves {
+            writer.psy_write_bytes_fixed(&leaf.into_owned_32bytes())?;
+        }
+        Ok(())
+    }
+    
+    fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
+        let top_line_proof = DeltaMerkleProofCore::<Hash>::pio_read_from_io(reader)?;
+        let old_leaves_len = reader.psy_read_vec_length()?;
+        let mut web_proof_old_leaves = Vec::with_capacity(old_leaves_len);
+        for _ in 0..old_leaves_len {
+            let hash_bytes = reader.psy_read_bytes_32()?;
+            let hash = Hash::from_owned_32bytes(hash_bytes);
+            web_proof_old_leaves.push(hash);
+        }
+        let new_leaves_len = reader.psy_read_vec_length()?;
+        let mut web_proof_new_leaves = Vec::with_capacity(new_leaves_len);
+        for _ in 0..new_leaves_len {
+            let hash_bytes = reader.psy_read_bytes_32()?;
+            let hash = Hash::from_owned_32bytes(hash_bytes);
+            web_proof_new_leaves.push(hash);
+        }
+        Ok(Self {
+            top_line_proof,
+            web_proof_old_leaves,
+            web_proof_new_leaves,
+        })
+    }
+
+}
+
+#[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
+psy_serialize::impl_psy_canonical_serialize_for_speedy!(
+    SpidermanUpdateProof,
+    { Hash: Q256BitHash } => { Hash }
+);
+#[cfg(not(all(feature = "serialize_speedy", target_endian = "little")))]
+impl<Hash: Q256BitHash> psy_serialize::AutoImplementFallbackPsySerializeCanonical for SpidermanUpdateProof<Hash> {}
+
+
+pser::impl_psy_ser_basic_tests!(
+    SpidermanUpdateProof,
+    // Note the use of concrete types here
+    {  crate::PHash },
+    spiderman_update_proof_basic_ser_tests,
+    true
+);

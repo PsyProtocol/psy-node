@@ -257,7 +257,6 @@ impl QBlobZeroIdMerkleRecorder {
         Self { map, blob }
     }
 
-
     pub fn record_and_compute_merkle_root_validate_delta_merkle_proof<Hash: Q256BitHash + Copy, Hasher: MerkleHasher<Hash>>(
         &mut self,
         leaf_level: u8,
