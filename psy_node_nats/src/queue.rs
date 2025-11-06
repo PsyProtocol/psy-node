@@ -129,6 +129,38 @@ impl NatsJetStreamClient {
 
         Ok(())
     }
+    pub async fn push_messages_dq_bytes_vec(&self, subject: &str, data: &[Vec<u8>]) -> anyhow::Result<()> {
+        self.ensure_stream().await?;
+
+        const BATCH_SIZE: usize = 1000; // Adjust based on testing; 1000-5000 is a good starting point
+        let subject = subject.to_string();
+
+        for chunk in data.chunks(BATCH_SIZE) {
+            let mut futs = Vec::with_capacity(chunk.len());
+            for job in chunk.iter() {
+                futs.push(self.jetstream.publish(subject.clone(), Bytes::copy_from_slice(&job)));
+            }
+            try_join_all(futs).await?;
+        }
+
+        Ok(())
+    }
+    pub async fn push_messages_dq_bytes_sized<const N: usize>(&self, subject: &str, data: &[[u8; N]]) -> anyhow::Result<()> {
+        self.ensure_stream().await?;
+
+        const BATCH_SIZE: usize = 1000; // Adjust based on testing; 1000-5000 is a good starting point
+        let subject = subject.to_string();
+
+        for chunk in data.chunks(BATCH_SIZE) {
+            let mut futs = Vec::with_capacity(chunk.len());
+            for job in chunk.iter() {
+                futs.push(self.jetstream.publish(subject.clone(), Bytes::copy_from_slice(&job[..])));
+            }
+            try_join_all(futs).await?;
+        }
+
+        Ok(())
+    }
 
     pub async fn push_messages_dq_qi_ref<QueueItem: PCoreQueueItemBase + Clone + Send + Sync>(&self, subject: &str, data: &[&QueueItem]) -> anyhow::Result<()> {
         self.ensure_stream().await?;
@@ -240,7 +272,7 @@ impl NatsJetStreamClient {
         max_messages_total_to_dump: usize,
         expected_size: Option<usize>,
         bytes_vec: &mut Vec<Vec<u8>>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<usize> {
         self.ensure_stream().await?;
         self.ensure_consumer(subject, &durable_name, QPBaseQueueType::StandardEphemeral).await?;
         let has_expected_size = expected_size.is_some();
@@ -253,7 +285,7 @@ impl NatsJetStreamClient {
         let mut messages = consumer.fetch().max_messages(max_messages_per_batch).messages().await?;
         let mut total_messages_dumped = 0;
         if max_messages_total_to_dump == 0 {
-            return Ok(());
+            return Ok(0);
         }
 
         let mut last_reply: Option<Subject> = None;
@@ -265,11 +297,11 @@ impl NatsJetStreamClient {
             }
             total_messages_dumped += 1;
             bytes_vec.push(jet_msg.payload.to_vec());
-                if jet_msg.reply.is_some() {
-                    if ack_mode == JetStreamAckMode::NoAck{ 
-                        // no-op
-                    }else if ack_mode == JetStreamAckMode::AckEach || (ack_mode == JetStreamAckMode::AckBatchLast && total_messages_dumped >= max_messages_per_batch && max_messages_per_batch != 0) {
-                        jet_msg.ack().await.map_err(|e| anyhow::anyhow!("Failed to ACK message: {}", e))?;
+            if jet_msg.reply.is_some() {
+                if ack_mode == JetStreamAckMode::NoAck {
+                    // no-op
+                } else if ack_mode == JetStreamAckMode::AckEach || (ack_mode == JetStreamAckMode::AckBatchLast && total_messages_dumped >= max_messages_per_batch && max_messages_per_batch != 0) {
+                    jet_msg.ack().await.map_err(|e| anyhow::anyhow!("Failed to ACK message: {}", e))?;
                         if ack_mode == JetStreamAckMode::AckBatchLast {
                             last_reply = None;
                         }
@@ -286,7 +318,7 @@ impl NatsJetStreamClient {
                 self.jetstream.publish(reply, Bytes::from_static(b"+ACK")).await?;
             }
         }
-        Ok(())
+        Ok(total_messages_dumped)
     }
 
 
@@ -610,7 +642,13 @@ impl QStandardEphemeralQueueSubscriber for NatsJetStreamClient {
         let subject = queue_key.get_queue_subject(&self.base_namespace, realm_id, realm_sub_id, unique_id, task_group);
         let durable_name = queue_key.get_durable_name(&self.base_namespace, realm_id, realm_sub_id, unique_id, task_group);
         let mut bytes_vec: Vec<Vec<u8>> = Vec::new();
-        self.dump_queue_dq_bytes_ephemeral(&subject, &durable_name, JetStreamAckMode::AckBatchLast, 1000, max_items, None, &mut bytes_vec).await?;
+        let mut total = self.dump_queue_dq_bytes_ephemeral(&subject, &durable_name, JetStreamAckMode::AckBatchLast, 1000, max_items, None, &mut bytes_vec).await?;
+
+        let mut total_dumped = total;
+        while total != 0 && total_dumped < max_items {
+            total = self.dump_queue_dq_bytes_ephemeral(&subject, &durable_name, JetStreamAckMode::AckBatchLast, 1000, max_items - total_dumped, None, &mut bytes_vec).await?;
+            total_dumped += total;
+        }
         Ok(bytes_vec)
     }
     async fn dump_entire_ephemeral_queue<QK: PCoreStandardQueueKeyForRealm>(

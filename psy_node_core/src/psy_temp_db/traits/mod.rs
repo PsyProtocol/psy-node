@@ -46,3 +46,30 @@ impl<
 > StandardEdgeAPITempDBStoreBase<JobId, Hash> for T {
 }
 
+
+pub trait StandardProcessorTempDBStoreBase<JobId: QJobIdBase, Hash: QDBHashBase>: 
+    QTempDBPendingIdStore + 
+    QTempDBSubmitStatusStore + 
+    QTempDBProofWitnessStore<JobId> +
+    QTempDBUserContractUpdatesStore + 
+    QTempDBProvingJobMetadataStore<Hash, JobId> +
+    QTempDBRewardsTreeStore<Hash, JobId> +
+    QTempDBDeployContractDataStore
+{
+
+}
+impl<
+
+    JobId: QJobIdBase,
+    Hash: QDBHashBase,
+    T: 
+    QTempDBPendingIdStore + 
+    QTempDBSubmitStatusStore + 
+    QTempDBProofWitnessStore<JobId> +
+    QTempDBUserContractUpdatesStore + 
+    QTempDBProvingJobMetadataStore<Hash, JobId> +
+    QTempDBRewardsTreeStore<Hash, JobId> +
+    QTempDBDeployContractDataStore,
+> StandardProcessorTempDBStoreBase<JobId, Hash> for T {
+}
+

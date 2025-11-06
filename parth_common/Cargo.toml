@@ -5,12 +5,13 @@ version = "0.1.0"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [features]
-default = ["std", "parth_core/serialize_rkyv", "parth_core/serialize_speedy", "parth_core/serialize_postcard", "k256_crypto"]
+default = ["std", "parth_core/serialize_rkyv", "parth_core/serialize_speedy", "parth_core/serialize_postcard", "k256_crypto", "async_tree"]
 std = ["parth_core/std", "pser/std"]
 serialize_rkyv = ["dep:rkyv","pser/serialize_rkyv", "parth_core/serialize_rkyv"]
 serialize_speedy = ["dep:speedy", "pser/serialize_speedy", "parth_core/serialize_speedy"]
 serialize_postcard = ["dep:postcard", "pser/serialize_postcard", "parth_core/serialize_postcard"]
 k256_crypto = ["dep:k256"]
+async_tree = ["dep:dashmap"]
 
 [dependencies]
 anyhow     = { workspace = true }
@@ -29,7 +30,9 @@ rkyv = { workspace = true, optional = true }
 speedy = { workspace = true, optional = true }
 pser = { workspace = true }
 ts-rs = { workspace = true }
+cf_utils = { workspace = true }
 k256 = { workspace = true, optional = true }
+dashmap = { workspace = true, optional = true }
 
 # start local packages
 parth_core = { workspace = true }

@@ -2233,6 +2233,8 @@ dependencies = [
  "async-trait",
  "auto_impl",
  "bincode",
+ "cf_utils",
+ "dashmap",
  "hashbrown 0.14.5",
  "hex",
  "hex-literal",

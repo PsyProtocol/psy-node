@@ -137,6 +137,9 @@ impl SimpleStoreEx {
         let pending_id_to_pending_proc_id_table = store
             .init_std_table::<ExBiDirectionalU64U128MappingTableIdentifier>("pending_id_to_pending_proc_id_table", get_rk(15))
             .await?;
+        let realm_rewards_tree_node_key_table = store
+            .init_std_table::<ExSingleIdTableIdentifier>("realm_rewards_tree_node_key_table", get_rk(27))
+            .await?;
         // mappings
         let public_key_hash_to_user_ids_table =
             store.init_std_table::<ExHashToManyIdsTableIdentifier>("public_key_hash_to_user_ids_table", get_rk(16)).await?;
@@ -198,6 +201,7 @@ impl SimpleStoreEx {
             Arc::new(checkpoint_id_to_pending_id_table),
             Arc::new(pending_id_to_checkpoint_id_table),
             Arc::new(pending_id_to_pending_proc_id_table),
+            Arc::new(realm_rewards_tree_node_key_table),
             // mappings
             Arc::new(public_key_hash_to_user_ids_table),
             // start trees

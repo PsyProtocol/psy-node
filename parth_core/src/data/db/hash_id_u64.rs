@@ -91,7 +91,8 @@ fn _ensure_compile_time_size_match_key() {
 pub fn get_data_buffer_for_hash256_and_u64s<Hash: Q256BitHash>(items: &[QHash256AndU64<Hash>]) -> Vec<u8> {
     let mut result = Vec::with_capacity(items.len()*40);
     for item in items {
-        result.extend_from_slice(&item.ffs_to_bytes());
+        result.extend_from_slice(&item.hash.into_owned_32bytes());
+        result.extend_from_slice(&item.value_u64.to_le_bytes());
     }
     result
 

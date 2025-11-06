@@ -1,22 +1,20 @@
 use async_trait::async_trait;
 use auto_impl::auto_impl;
 use parth_core::{
-    crypto::hash::{
+    QCoreProcCheckpointUniqueId, crypto::hash::{
         merkle_proof::{DeltaMerkleProofCore, MerkleProofCore},
         tag_tree::TagTreeMerkleProof,
-    },
-    data::{
-        db::row::QDatabaseSingleIdTableRow,
+    }, data::{
+        db::row::{QDatabaseSingleIdTableRow, QDatabaseSingleIdTableRowNoCheckpointId},
         hash::{
             merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey},
             merkle_store_key::{QMerkleStoreDoubleIdKey, QMerkleStoreDoubleIdNode, QMerkleStoreSingleIdKey, QMerkleStoreSingleIdNode},
         },
-    },
-    QCoreProcCheckpointUniqueId,
+    }, node::traits::realm
 };
 use psy_data::v1::qdata::{
     checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState},
-    contract::{ContractCodeDefinition, PQEDContractLeaf},
+    contract::{ContractCodeDefinition, ContractCodeDefinitionWithContractId, PQEDContractLeaf},
     public_key::PZKPublicKeyInfo,
     user::PQEDUserLeaf,
 };
@@ -204,6 +202,32 @@ pub trait PsyNodeCheckpointRealmSpecificDatabaseReader<F, Hash> {
     async fn get_top_global_user_tree_proof_to_realm_root_at_checkpoint_id(&self, checkpoint_id: u64) -> anyhow::Result<MerkleProofCore<Hash>>;
 }
 
+
+#[async_trait]
+#[auto_impl(&, Arc)]
+pub trait PsyNodeCoordinatorSpecificDatabaseReader<F, Hash> {
+    async fn get_realm_guta_reward_tree_node_key(
+        &self,
+        unique_pending_id: u64,
+        realm_id: u64,
+    ) -> anyhow::Result<Option<SimpleMerkleNodeKey>>;
+}
+#[async_trait]
+#[auto_impl(&, Arc)]
+pub trait PsyNodeCoordinatorSpecificDatabaseWriter<F, Hash> {
+    async fn set_realm_guta_reward_tree_node_key(
+        &self,
+        unique_pending_id: u64,
+        realm_id: u64,
+        node_key: SimpleMerkleNodeKey,
+    ) -> anyhow::Result<()>;
+    async fn set_realm_guta_reward_tree_node_keys_ffs(
+        &self,
+        unique_pending_id: u64,
+        data: &[u8],
+    ) -> anyhow::Result<()>;
+}
+
 #[async_trait]
 #[auto_impl(&, Arc)]
 pub trait PsyNodeCheckpointObjectDatabaseWriter<F, Hash> {
@@ -240,6 +264,7 @@ pub trait PsyNodeCoreDatabaseUserStoreReader<F, Hash> {
     async fn get_user_leaf(&self, checkpoint_id: u64, user_id: u64) -> anyhow::Result<PQEDUserLeaf<F, Hash>>;
     async fn get_user_ids_for_public_key(&self, public_key: Hash, start_user_id: u64, count: usize) -> anyhow::Result<Vec<u64>>;
 }
+
 #[async_trait]
 #[auto_impl(&, Arc)]
 pub trait PsyNodeCoreDatabaseUserStoreWriter<F, Hash> {
@@ -248,6 +273,9 @@ pub trait PsyNodeCoreDatabaseUserStoreWriter<F, Hash> {
 
     async fn set_zk_public_key(&self, checkpoint_id: u64, user_id: u64, public_key_info: &PZKPublicKeyInfo<Hash>) -> anyhow::Result<()>;
     async fn set_zk_public_keys_ffs(&self, checkpoint_id: u64, data: &[u8]) -> anyhow::Result<()>;
+
+    async fn set_public_key_for_user_id(&self, user_id: u64, public_key: Hash) -> anyhow::Result<()>;
+    async fn set_public_key_for_user_ids_ffs(&self, data: &[u8]) -> anyhow::Result<()>;
 }
 
 #[async_trait]
@@ -283,7 +311,7 @@ pub trait PsyNodeCoreDatabaseContractObjectStoreWriter<F, Hash>: PsyNodeCoreData
     async fn set_many_contract_code_definitions(
         &self,
         checkpoint_id: u64,
-        inserts: &[QDatabaseSingleIdTableRow<ContractCodeDefinition>],
+        inserts: &[ContractCodeDefinitionWithContractId],
     ) -> anyhow::Result<()>;
 }
 
@@ -373,5 +401,66 @@ impl<
         F,
         Hash,
     > PsyCoordinatorEdgeAPIStoreReader<F, Hash> for T
+{
+}
+pub trait PsyCoordinatorProcessorStore<F, Hash>:
+    // 1. Checkpoint Tree (R/W)
+    PsyNodeCheckpointTreeDatabaseReader<Hash>
+    + PsyNodeCheckpointTreeDatabaseWriter<Hash>
+    // 2. User Registration Tree (R/W)
+    + PsyNodeUserRegistrationTreeDatabaseReader<Hash>
+    + PsyNodeUserRegistrationTreeDatabaseWriter<Hash>
+    // 3. Global User Tree (R/W)
+    + PsyNodeGlobalUserTreeDatabaseReader<Hash>
+    + PsyNodeGlobalUserTreeDatabaseWriter<Hash>
+    // 4. Global Contract Tree (R/W)
+    + PsyNodeGlobalContractTreeDatabaseReader<Hash>
+    + PsyNodeGlobalContractTreeDatabaseWriter<Hash>
+    // 5. Contract Function Tree (R/W)
+    + PsyNodeContractFunctionTreeDatabaseReader<Hash>
+    + PsyNodeContractFunctionTreeDatabaseWriter<Hash>
+    // 6. Rewards Tag Tree (R/W)
+    + PsyNodeCoreRewardsTagTreeStoreReader<F, Hash>
+    + PsyNodeCoreRewardsTagTreeStoreWriter<F, Hash>
+    // 7. Object/Metadata (R/W)
+    + PsyNodeCheckpointObjectDatabaseReader<F, Hash>
+    + PsyNodeCheckpointObjectDatabaseWriter<F, Hash>
+    // 8. User Store (R/W)
+    + PsyNodeCoreDatabaseUserStoreReader<F, Hash>
+    + PsyNodeCoreDatabaseUserStoreWriter<F, Hash>
+    // 9. Contract Object Store (R/W) (includes Basic Info R/W)
+    + PsyNodeCoreDatabaseContractObjectStoreReader<F, Hash>
+    + PsyNodeCoreDatabaseContractObjectStoreWriter<F, Hash>
+{
+}
+
+impl<
+        T: PsyNodeCheckpointTreeDatabaseReader<Hash>
+            + PsyNodeCheckpointTreeDatabaseWriter<Hash>
+            + PsyNodeUserRegistrationTreeDatabaseReader<Hash>
+            + PsyNodeUserRegistrationTreeDatabaseWriter<Hash>
+            // All other traits needed for the processor
+            + PsyNodeGlobalUserTreeDatabaseReader<Hash>
+            + PsyNodeGlobalUserTreeDatabaseWriter<Hash>
+            + PsyNodeUserContractTreeDatabaseReader<Hash>
+            + PsyNodeUserContractTreeDatabaseWriter<Hash>
+            + PsyNodeContractStateTreeTreeDatabaseReader<Hash>
+            + PsyNodeContractStateTreeTreeDatabaseWriter<Hash>
+            + PsyNodeGlobalContractTreeDatabaseReader<Hash>
+            + PsyNodeGlobalContractTreeDatabaseWriter<Hash>
+            + PsyNodeContractFunctionTreeDatabaseReader<Hash>
+            + PsyNodeContractFunctionTreeDatabaseWriter<Hash>
+            + PsyNodeCoreRewardsTagTreeStoreReader<F, Hash>
+            + PsyNodeCoreRewardsTagTreeStoreWriter<F, Hash>
+            + PsyNodeCheckpointObjectDatabaseReader<F, Hash>
+            + PsyNodeCheckpointObjectDatabaseWriter<F, Hash>
+            + PsyNodeCheckpointRealmSpecificDatabaseReader<F, Hash>
+            + PsyNodeCoreDatabaseUserStoreReader<F, Hash>
+            + PsyNodeCoreDatabaseUserStoreWriter<F, Hash>
+            + PsyNodeCoreDatabaseContractObjectStoreReader<F, Hash>
+            + PsyNodeCoreDatabaseContractObjectStoreWriter<F, Hash>,
+        F,
+        Hash,
+    > PsyCoordinatorProcessorStore<F, Hash> for T
 {
 }

@@ -3,25 +3,21 @@ use std::sync::Arc;
 use anyhow::Ok;
 use async_trait::async_trait;
 use parth_core::{
-    crypto::hash::{
+    QCoreProcCheckpointUniqueId, crypto::hash::{
         merkle_proof::{DeltaMerkleProofCore, MerkleProofCore},
         tag_tree::TagTreeMerkleProof,
-    },
-    data::{
-        db::row::QDatabaseSingleIdTableRow,
+    }, data::{
+        db::row::{QDatabaseSingleIdTableRow, QDatabaseSingleIdTableRowNoCheckpointId},
         hash::{
-            merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey},
+            merkle_node_key::{PSY_OBJECT_FFS_SIZE_SIMPLE_MERKLE_NODE_KEY, SimpleMerkleNode, SimpleMerkleNodeKey},
             merkle_store_key::{QMerkleStoreDoubleIdKey, QMerkleStoreDoubleIdNode, QMerkleStoreSingleIdKey, QMerkleStoreSingleIdNode},
         },
-    },
-    felt::ToU64Value,
-    protocol::core_types::QNetworkDatabaseTypes,
-    QCoreProcCheckpointUniqueId,
+    }, felt::ToU64Value, protocol::core_types::QNetworkDatabaseTypes
 };
 use psy_data::v1::qdata::{
     checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState},
     checkpoint_sync::PQEDCheckpointSyncInfo,
-    contract::{ContractCodeDefinition, PQEDContractLeaf},
+    contract::{ContractCodeDefinition, ContractCodeDefinitionWithContractId, PQEDContractLeaf},
     ffs_sizes::{PSY_OBJECT_FFS_SIZE_CONTRACT_LEAF, PSY_OBJECT_FFS_SIZE_USER_LEAF, PSY_OBJECT_FFS_SIZE_ZK_PUBLIC_KEY},
     public_key::PZKPublicKeyInfo,
     user::PQEDUserLeaf,
@@ -94,6 +90,7 @@ pub struct PsyUnifiedCoreDatabaseStore<
     pub checkpoint_id_to_pending_id_table: Arc<U64TableIdentifier>,
     pub pending_id_to_checkpoint_id_table: Arc<U64TableIdentifier>,
     pub pending_id_to_pending_proc_id_table: Arc<BiDirectionalU64U128MappingTableIdentifier>,
+    pub realm_rewards_tree_node_key: Arc<SingleIdTableIdentifier>,
     // mappings
     pub public_key_hash_to_user_ids_table: Arc<HashToManyIdsTableIdentifier>,
     // start trees
@@ -179,6 +176,7 @@ impl<
         checkpoint_id_to_pending_id_table: Arc<U64TableIdentifier>,
         pending_id_to_checkpoint_id_table: Arc<U64TableIdentifier>,
         pending_id_to_pending_proc_id_table: Arc<BiDirectionalU64U128MappingTableIdentifier>,
+        realm_rewards_tree_node_key: Arc<SingleIdTableIdentifier>,
         // mappings
         public_key_hash_to_user_ids_table: Arc<HashToManyIdsTableIdentifier>,
         // start trees
@@ -212,6 +210,7 @@ impl<
             checkpoint_id_to_pending_id_table,
             pending_id_to_checkpoint_id_table,
             pending_id_to_pending_proc_id_table,
+            realm_rewards_tree_node_key,
             public_key_hash_to_user_ids_table,
             global_user_tree_table,
             user_contract_tree_table,
@@ -1726,6 +1725,151 @@ impl<
     }
 }
 
+
+#[async_trait]
+impl<
+        N: QNetworkDatabaseTypes,
+        BiDirectionalMappingTableIdentifier: Clone + Send + Sync,
+        BiDirectionalU64U128MappingTableIdentifier: Clone + Send + Sync,
+        U64TableIdentifier: Clone + Send + Sync,
+        SingleIdTableIdentifier: Clone + Send + Sync,
+        DoubleIdTableIdentifier: Clone + Send + Sync,
+        KivTableIdentifier: Clone + Send + Sync,
+        SingleIdMerkleTableIdentifier: Clone + Send + Sync,
+        DoubleIdMerkleTableIdentifier: Clone + Send + Sync,
+        ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
+        TagTreeTableIdentifier: Clone + Send + Sync,
+        HashToManyIdsTableIdentifier: Clone + Send + Sync,
+        S: CoreDatabaseStore<
+                N::QHash,
+                N::HasherBase,
+                BiDirectionalMappingTableIdentifier,
+                BiDirectionalU64U128MappingTableIdentifier,
+                U64TableIdentifier,
+                SingleIdTableIdentifier,
+                DoubleIdTableIdentifier,
+                KivTableIdentifier,
+                SingleIdMerkleTableIdentifier,
+                DoubleIdMerkleTableIdentifier,
+                ZeroIdMerkleTableIdentifier,
+                TagTreeTableIdentifier,
+                HashToManyIdsTableIdentifier,
+            > + Send
+            + Sync,
+    > PsyNodeCoordinatorSpecificDatabaseReader<N::F, N::QHash>
+    for PsyUnifiedCoreDatabaseStore<
+        N,
+        BiDirectionalMappingTableIdentifier,
+        BiDirectionalU64U128MappingTableIdentifier,
+        U64TableIdentifier,
+        SingleIdTableIdentifier,
+        DoubleIdTableIdentifier,
+        KivTableIdentifier,
+        SingleIdMerkleTableIdentifier,
+        DoubleIdMerkleTableIdentifier,
+        ZeroIdMerkleTableIdentifier,
+        TagTreeTableIdentifier,
+        HashToManyIdsTableIdentifier,
+        S,
+    >
+{
+    async fn get_realm_guta_reward_tree_node_key(
+        &self,
+        unique_pending_id: u64,
+        realm_id: u64,
+    ) -> anyhow::Result<Option<SimpleMerkleNodeKey>>{
+        let res: Option<QDatabaseSingleIdTableRow<SimpleMerkleNodeKey>> = self.store.db_select_one_single_checkpointed_object_value_and_ids(&self.realm_rewards_tree_node_key, realm_id, unique_pending_id).await?;
+        match res {
+            Some(row) => {
+                if row.checkpoint_id == unique_pending_id {
+                    Ok(Some(row.value))
+                } else {
+                    Ok(None)
+                }
+            },
+            None => Ok(None),
+        }
+
+
+    }
+}
+
+#[async_trait]
+impl<
+        N: QNetworkDatabaseTypes,
+        BiDirectionalMappingTableIdentifier: Clone + Send + Sync,
+        BiDirectionalU64U128MappingTableIdentifier: Clone + Send + Sync,
+        U64TableIdentifier: Clone + Send + Sync,
+        SingleIdTableIdentifier: Clone + Send + Sync,
+        DoubleIdTableIdentifier: Clone + Send + Sync,
+        KivTableIdentifier: Clone + Send + Sync,
+        SingleIdMerkleTableIdentifier: Clone + Send + Sync,
+        DoubleIdMerkleTableIdentifier: Clone + Send + Sync,
+        ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
+        TagTreeTableIdentifier: Clone + Send + Sync,
+        HashToManyIdsTableIdentifier: Clone + Send + Sync,
+        S: CoreDatabaseStore<
+                N::QHash,
+                N::HasherBase,
+                BiDirectionalMappingTableIdentifier,
+                BiDirectionalU64U128MappingTableIdentifier,
+                U64TableIdentifier,
+                SingleIdTableIdentifier,
+                DoubleIdTableIdentifier,
+                KivTableIdentifier,
+                SingleIdMerkleTableIdentifier,
+                DoubleIdMerkleTableIdentifier,
+                ZeroIdMerkleTableIdentifier,
+                TagTreeTableIdentifier,
+                HashToManyIdsTableIdentifier,
+            > + Send
+            + Sync,
+    > PsyNodeCoordinatorSpecificDatabaseWriter<N::F, N::QHash>
+    for PsyUnifiedCoreDatabaseStore<
+        N,
+        BiDirectionalMappingTableIdentifier,
+        BiDirectionalU64U128MappingTableIdentifier,
+        U64TableIdentifier,
+        SingleIdTableIdentifier,
+        DoubleIdTableIdentifier,
+        KivTableIdentifier,
+        SingleIdMerkleTableIdentifier,
+        DoubleIdMerkleTableIdentifier,
+        ZeroIdMerkleTableIdentifier,
+        TagTreeTableIdentifier,
+        HashToManyIdsTableIdentifier,
+        S,
+    >
+{
+
+    async fn set_realm_guta_reward_tree_node_key(
+        &self,
+        unique_pending_id: u64,
+        realm_id: u64,
+        node_key: SimpleMerkleNodeKey,
+    ) -> anyhow::Result<()>{
+        self.store.db_insert_one_single_checkpointed_object(
+            &self.realm_rewards_tree_node_key,
+            realm_id,
+            unique_pending_id,
+            &node_key,
+        ).await
+    }
+    async fn set_realm_guta_reward_tree_node_keys_ffs(
+        &self,
+        unique_pending_id: u64,
+        data: &[u8],
+    ) -> anyhow::Result<()>{
+        self.store.db_insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_start(
+            &self.realm_rewards_tree_node_key,
+            PSY_OBJECT_FFS_SIZE_SIMPLE_MERKLE_NODE_KEY,
+            unique_pending_id,
+            data,
+        ).await
+
+    }
+}
+
 #[async_trait]
 impl<
         N: QNetworkDatabaseTypes,
@@ -2096,7 +2240,6 @@ impl<
 
     async fn set_zk_public_keys_ffs(&self, checkpoint_id: u64, data: &[u8]) -> anyhow::Result<()> {
         let object_size = PSY_OBJECT_FFS_SIZE_ZK_PUBLIC_KEY;
-        let object_id_location = 0; // Assume
         self.store
             .db_insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_start(
                 &self.user_public_key_table,
@@ -2105,6 +2248,18 @@ impl<
                 data,
             )
             .await
+    }
+
+    async fn set_public_key_for_user_id(&self, user_id: u64, public_key: N::QHash) -> anyhow::Result<()>{
+        self.store
+            .db_insert_one_hash_to_u64(&self.public_key_hash_to_user_ids_table, public_key, user_id)
+            .await
+    }
+    async fn set_public_key_for_user_ids_ffs(&self, data: &[u8]) -> anyhow::Result<()>{
+        self.store
+            .db_set_hash_256_to_u64_pairs_from_fast_serialized_data(&self.public_key_hash_to_user_ids_table, data)
+            .await
+
     }
 }
 
@@ -2379,10 +2534,10 @@ impl<
     async fn set_many_contract_code_definitions(
         &self,
         checkpoint_id: u64,
-        inserts: &[QDatabaseSingleIdTableRow<ContractCodeDefinition>],
+        inserts: &[ContractCodeDefinitionWithContractId],
     ) -> anyhow::Result<()> {
         self.store
-            .db_insert_many_single_checkpointed_object_rows(&self.contract_code_definition_table, inserts)
+            .db_insert_many_single_checkpointed_objects_at_checkpoint_t(&self.contract_code_definition_table, checkpoint_id, inserts)
             .await
     }
 }

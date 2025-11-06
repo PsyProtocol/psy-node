@@ -1,10 +1,10 @@
 use parth_common::memory_stores::simple_memory_merkle_store::SimpleMemoryMerkleStore;
 use parth_core::{
     crypto::hash::traits::MerkleZeroHasher,
-    data::serializable::QPDSerializable,
+    data::{db::row::QDatabaseSingleIdTableRowNoCheckpointIdLike, serializable::QPDSerializable},
     impl_qpq_serialize_bincode,
     protocol::core_types::QHashBase,
-    utils::{debug_code_string::QToCodeString, qp_random_bytes_vec_in_range_insecure, QPGenRandom},
+    utils::{QPGenRandom, debug_code_string::QToCodeString, qp_random_bytes_vec_in_range_insecure},
 };
 use pser::{QBytesDeserialize, QBytesSerialize};
 use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
@@ -126,9 +126,7 @@ impl QPGenRandom for SimpleContractFunctionCodeDefinition {
 }
 impl_qpq_serialize_bincode!(SimpleContractFunctionCodeDefinition);
 
-#[pderive::serialize_clone]
-#[derive(TS)]
-#[ts(export)]
+#[pderive::serialize_clone_ts_export]
 #[repr(C)]
 pub struct ContractCodeDefinition {
     pub state_tree_height: u16,
@@ -192,6 +190,82 @@ impl QPGenRandom for ContractCodeDefinition {
         }
     }
 }
+
+
+#[pderive::serialize_clone_ts_export]
+#[repr(C)]
+pub struct ContractCodeDefinitionWithContractId {
+    pub contract_id: u64,
+    pub code_definition: ContractCodeDefinition,
+}
+impl ContractCodeDefinitionWithContractId {
+    pub fn new(contract_id: u64, code_definition: ContractCodeDefinition) -> Self {
+        Self {
+            contract_id,
+            code_definition,
+        }
+    }
+}
+impl PsyCanonicalSerializeMetadata for ContractCodeDefinitionWithContractId {
+    const IS_FIXED_SIZE: bool = false;
+    const FIXED_SIZE: usize = 0;
+}
+impl FallbackPsySerializeCanonical for ContractCodeDefinitionWithContractId {
+    fn fallback_pio_serialized_size(&self) -> usize {
+        8 + self.code_definition.pio_serialized_size()
+    }
+    
+    fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
+        writer.psy_write_u64(self.contract_id)?;
+        self.code_definition.pio_write_to_io(writer)?;
+        Ok(())
+    }
+    
+    fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
+        let contract_id = reader.psy_read_u64()?;
+        let code_definition = ContractCodeDefinition::pio_read_from_io(reader)?;
+        Ok(Self {
+            contract_id,
+            code_definition,
+        })
+    }
+
+}
+
+#[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
+psy_serialize::impl_psy_canonical_serialize_for_speedy!(ContractCodeDefinitionWithContractId);
+#[cfg(not(all(feature = "serialize_speedy", target_endian = "little")))]
+impl AutoImplementFallbackPsySerializeCanonical for ContractCodeDefinitionWithContractId {}
+
+
+
+
+pser::impl_psy_ser_basic_tests!(
+    ContractCodeDefinitionWithContractId,
+    { },
+    contract_code_definition_with_contract_id
+);
+impl_qpq_serialize_bincode!(ContractCodeDefinitionWithContractId);
+impl QPGenRandom for ContractCodeDefinitionWithContractId {
+    fn qp_rand_gen() -> Self {
+        Self {
+            contract_id: QPGenRandom::qp_rand_gen(),
+            code_definition: ContractCodeDefinition::qp_rand_gen(),
+        }
+    }
+}
+
+impl QDatabaseSingleIdTableRowNoCheckpointIdLike<ContractCodeDefinition> for ContractCodeDefinitionWithContractId {
+    
+    fn get_row_obj_id(&self) -> u64 {
+        self.contract_id
+    }
+
+    fn get_row_value_ref(&self) -> &ContractCodeDefinition {
+        &self.code_definition
+    }
+}
+
 
 #[pderive::serialize_clone]
 #[derive(TS)]

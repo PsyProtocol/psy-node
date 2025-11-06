@@ -131,6 +131,7 @@ impl SimpleStoreEx {
             &keyspace,
             "pending_id_to_pending_proc_id_table",
         ));
+        let realm_rewards_tree_node_key_table = Arc::new(InMemoryTableIdentifier::new_with_keyspace(&keyspace, "realm_rewards_tree_node_key_table"));
         // mappings
         let public_key_hash_to_user_ids_table = Arc::new(InMemoryTableIdentifier::new_with_keyspace(&keyspace, "public_key_hash_to_user_ids_table"));
         // start trees
@@ -163,6 +164,7 @@ impl SimpleStoreEx {
             checkpoint_id_to_pending_id_table,
             pending_id_to_checkpoint_id_table,
             pending_id_to_pending_proc_id_table,
+            realm_rewards_tree_node_key_table,
             // mappings
             public_key_hash_to_user_ids_table,
             // start trees

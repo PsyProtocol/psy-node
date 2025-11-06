@@ -11,7 +11,7 @@ use crate::psy_core_db::{
     },
     v3_implementation::full::PsyUnifiedCoreDatabaseStore,
 };
-use parth_core::crypto::hash::traits::MerkleZeroHasher;
+use parth_core::{crypto::hash::traits::MerkleZeroHasher, data::db::row::QDatabaseSingleIdTableRowNoCheckpointId};
 use anyhow::Ok;
 use parth_core::{
     crypto::hash::{
@@ -30,7 +30,7 @@ use parth_core::{
 };
 use psy_data::v1::qdata::{
     checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState},
-    contract::{ContractCodeDefinition, PQEDContractLeaf},
+    contract::{ContractCodeDefinition, ContractCodeDefinitionWithContractId, PQEDContractLeaf},
     public_key::PZKPublicKeyInfo,
     user::PQEDUserLeaf,
 };
@@ -472,11 +472,11 @@ impl<
         // Test batch insert for code definitions
         let mut inserts = Vec::new();
         for i in 2..12 {
-            inserts.push(QDatabaseSingleIdTableRow::new(i, checkpoint_id, ContractCodeDefinition::qp_rand_gen()));
+            inserts.push(ContractCodeDefinitionWithContractId::new(i, ContractCodeDefinition::qp_rand_gen()));
         }
         db.set_many_contract_code_definitions(checkpoint_id, &inserts).await?;
         for row in inserts {
-            assert_eq!(db.get_contract_code_definition(checkpoint_id, row.obj_id).await?, row.value);
+            assert_eq!(db.get_contract_code_definition(checkpoint_id, row.contract_id).await?, row.code_definition);
         }
 
         Ok(())
