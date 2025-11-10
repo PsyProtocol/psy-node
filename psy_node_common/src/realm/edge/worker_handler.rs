@@ -106,8 +106,24 @@ impl<
             .get_tdb_proof_witness_bytes(&self.realm_identifier, unique_pending_id, work_item.job_id)
             .await?;
 
+        let children_reward_tree_values = {
+            if work_item.metadata.dependencies.len() == 0 || work_item.metadata.reward_tree_hash_mode == PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN {
+                vec![]
+            } else {
+                let mut values = Vec::with_capacity(work_item.metadata.dependencies.len());
+                for dependency in work_item.metadata.dependencies.iter() {
+                    let value: N::QHash = self
+                        .temp_db
+                        .get_proof_miner_rewards_tree_value(&self.realm_identifier, unique_pending_id, *dependency)
+                        .await?;
+                    values.push(value);
+                }
+                values
+            }
+        };
         let response = PsyWorkerGetProvingWorkAPIResponse {
             job: work_item,
+            child_proof_tag_values: children_reward_tree_values,
             witness: witness_bytes,
         };
         Ok(response)
@@ -162,8 +178,24 @@ impl<
             .get_tdb_proof_witness_bytes(&self.realm_identifier, unique_pending_id, work_item.job_id)
             .await?;
 
+        let children_reward_tree_values = {
+            if work_item.metadata.dependencies.len() == 0 || work_item.metadata.reward_tree_hash_mode == PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN {
+                vec![]
+            } else {
+                let mut values = Vec::with_capacity(work_item.metadata.dependencies.len());
+                for dependency in work_item.metadata.dependencies.iter() {
+                    let value: N::QHash = self
+                        .temp_db
+                        .get_proof_miner_rewards_tree_value(&self.realm_identifier, unique_pending_id, *dependency)
+                        .await?;
+                    values.push(value);
+                }
+                values
+            }
+        };
         let response = PsyWorkerGetProvingWorkAPIResponse {
             job: work_item,
+            child_proof_tag_values: children_reward_tree_values,
             witness: witness_bytes,
         };
         self.temp_db

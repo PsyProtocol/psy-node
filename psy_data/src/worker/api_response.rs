@@ -7,6 +7,7 @@ use crate::worker::metadata_with_job_id::PsyProvingJobMetadataWithJobId;
 #[ts(export, concrete(Hash = parth_core::PHash, JobId = QProvingJobDataID))]
 pub struct PsyWorkerGetProvingWorkAPIResponse<Hash, JobId> {
     pub job: PsyProvingJobMetadataWithJobId<Hash, JobId>,
+    pub child_proof_tag_values: Vec<Hash>,
     pub witness: Vec<u8>,
 }
 

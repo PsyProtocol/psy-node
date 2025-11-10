@@ -1,4 +1,4 @@
-use parth_core::{crypto::hash::spiderman::SpidermanUpdateProof, protocol::core_types::Q256BitHash, utils::QPGenRandom};
+use parth_core::{crypto::hash::{spiderman::SpidermanUpdateProof, traits::{FieldQHasher, PCircuitWitness}}, felt::QFelt64, protocol::core_types::{Q256BitHash, QFHashBase}, utils::QPGenRandom};
 use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
 use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
 
@@ -40,6 +40,17 @@ impl<Hash: QPGenRandom> QPGenRandom for QCAppendUserRegistrationTreeCircuitInput
 }
 
 
+impl<F: QFelt64, Hash: QFHashBase<F>> PCircuitWitness<F, Hash>
+    for QCAppendUserRegistrationTreeCircuitInput<Hash>
+{
+    fn get_expected_public_inputs_hash<Hasher: FieldQHasher<F, Hash>>(&self) -> Hash {
+        let state_transition_hash = self.get_state_transition().get_combined_hash::<Hasher>();
+        Hasher::two_to_one(
+            &self.register_users_circuit_whitelist,
+            &state_transition_hash,
+        )
+    }
+}
 
 
 

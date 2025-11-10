@@ -1,4 +1,10 @@
-use parth_core::crypto::hash::traits::{MerkleHasher, ZeroableHash};
+use parth_core::crypto::hash::traits::{FieldQHasher, MerkleHasher, PCircuitWitness, ZeroableHash};
+#[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
+use parth_core::protocol::core_types::Q256BitHash;
+#[cfg(feature = "rand_gen")]
+use parth_core::utils::QPGenRandom;
+use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
+use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
 
 
 pub trait WithDummyStateTransition<Hash> {
@@ -16,25 +22,71 @@ pub trait AggStateTrackableInput<Hash> {
 }
 
 #[pderive::serialize_copy_hash]
-pub struct DummyAggStateTransition<Hash> {
-    pub state_transition_hash: Hash,
-    pub allowed_circuit_hashes_root: Hash,
-    pub is_deploy_contracts: bool,
-    pub is_register_users: bool,
-}
-
-#[pderive::serialize_copy_hash]
-pub struct DummyAggStateTransitionWithEvents<Hash> {
-    pub state_transition_hash: Hash,
-    pub event_transition_hash: Hash,
-    pub allowed_circuit_hashes_root: Hash,
-}
-
-#[pderive::serialize_copy_hash]
 pub struct AggStateTransition<Hash> {
     pub state_transition_start: Hash,
     pub state_transition_end: Hash,
 }
+
+
+
+#[cfg(feature = "rand_gen")]
+impl<Hash: QPGenRandom> QPGenRandom for AggStateTransition<Hash> {
+    fn qp_rand_gen() -> Self where Self: Sized {
+        Self {
+            state_transition_start: Hash::qp_rand_gen(),
+            state_transition_end: Hash::qp_rand_gen(),
+        }
+    }
+}
+
+
+
+
+impl<Hash: Q256BitHash> PsyCanonicalSerializeMetadata for AggStateTransition<Hash> {
+    const IS_FIXED_SIZE: bool = true;
+    const FIXED_SIZE: usize = 32*2;
+}
+impl<Hash: Q256BitHash> FallbackPsySerializeCanonical for AggStateTransition<Hash> {
+    fn fallback_pio_serialized_size(&self) -> usize {
+        32*2
+
+    }
+    
+    fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
+        writer.psy_write_bytes_fixed(&self.state_transition_start.into_owned_32bytes())?;
+        writer.psy_write_bytes_fixed(&self.state_transition_end.into_owned_32bytes())?;
+        Ok(())
+    }
+    
+    fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
+        let state_transition_start_bytes = Hash::from_owned_32bytes(reader.psy_read_bytes_fixed()?);
+        let state_transition_end_bytes = Hash::from_owned_32bytes(reader.psy_read_bytes_fixed()?);
+        Ok(Self {
+            state_transition_start: state_transition_start_bytes,
+            state_transition_end: state_transition_end_bytes,
+        })
+    }
+}
+
+#[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
+psy_serialize::impl_psy_canonical_serialize_for_speedy!(
+    AggStateTransition,
+    { Hash: Q256BitHash } => { Hash }
+);
+#[cfg(not(all(feature = "serialize_speedy", target_endian = "little")))]
+impl<Hash: Q256BitHash> psy_serialize::AutoImplementFallbackPsySerializeCanonical for AggStateTransition<Hash> {}
+
+
+pser::impl_psy_ser_basic_tests_fallback!(
+    AggStateTransition,
+    // Note the use of concrete types here
+    {  parth_core::PHash },
+    agg_state_transition_basic_ser_tests
+);
+
+
+
+
 impl<Hash> AggStateTransition<Hash> {
     pub fn new(state_transition_start: Hash, state_transition_end: Hash) -> Self {
         Self {
@@ -124,6 +176,81 @@ impl<Hash: Copy> AggStateTransitionInput<Hash> {
         }
     }
 }
+
+#[cfg(feature = "rand_gen")]
+impl<Hash: QPGenRandom> QPGenRandom for AggStateTransitionInput<Hash> {
+    fn qp_rand_gen() -> Self where Self: Sized {
+        Self {
+            left_input: AggStateTransition::<Hash>::qp_rand_gen(),
+            right_input: AggStateTransition::<Hash>::qp_rand_gen(),
+            left_proof_is_leaf: rand::random(),
+            right_proof_is_leaf: rand::random(),
+        }
+    }
+}
+
+impl<F, Hash> PCircuitWitness<F, Hash> for AggStateTransitionInput<Hash> {
+    fn get_expected_public_inputs_hash<Hasher: FieldQHasher<F, Hash>>(&self) -> Hash {
+        let left_hash = self.left_input.get_combined_hash::<Hasher>();
+        let right_hash = self.right_input.get_combined_hash::<Hasher>();
+
+        Hasher::two_to_one(
+            &left_hash,
+            &right_hash,
+        )
+    }
+}
+
+
+
+impl<Hash: Q256BitHash> PsyCanonicalSerializeMetadata for AggStateTransitionInput<Hash> {
+    const IS_FIXED_SIZE: bool = true;
+    const FIXED_SIZE: usize = AggStateTransition::<Hash>::FIXED_SIZE * 2 + 2;
+}
+impl<Hash: Q256BitHash> FallbackPsySerializeCanonical for AggStateTransitionInput<Hash> {
+    fn fallback_pio_serialized_size(&self) -> usize {
+        Self::FIXED_SIZE
+
+    }
+    
+    fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
+        self.left_input.pio_write_to_io(writer)?;
+        self.right_input.pio_write_to_io(writer)?;
+        writer.psy_write_u8(self.left_proof_is_leaf as u8)?;
+        writer.psy_write_u8(self.right_proof_is_leaf as u8)?;
+        Ok(())
+    }
+    
+    fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
+        let left_input = AggStateTransition::<Hash>::pio_read_from_io(reader)?;
+        let right_input = AggStateTransition::<Hash>::pio_read_from_io(reader)?;
+        let left_proof_is_leaf = reader.psy_read_u8()? != 0;
+        let right_proof_is_leaf = reader.psy_read_u8()? != 0;
+        Ok(Self {
+            left_input,
+            right_input,
+            left_proof_is_leaf,
+            right_proof_is_leaf,
+        })
+    }
+}
+
+#[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
+psy_serialize::impl_psy_canonical_serialize_for_speedy!(
+    AggStateTransitionInput,
+    { Hash: Q256BitHash } => { Hash }
+);
+#[cfg(not(all(feature = "serialize_speedy", target_endian = "little")))]
+impl<Hash: Q256BitHash> psy_serialize::AutoImplementFallbackPsySerializeCanonical for AggStateTransitionInput<Hash> {}
+
+
+pser::impl_psy_ser_basic_tests_fallback!(
+    AggStateTransitionInput,
+    // Note the use of concrete types here
+    {  parth_core::PHash },
+    agg_state_transition_input_basic_ser_tests
+);
+
 
 pub trait AggStateTrackableWithEventsInput<Hash> {
     fn get_state_transition_with_events<Hasher: MerkleHasher<Hash>>(&self) -> AggStateTransitionWithEvents<Hash>;
