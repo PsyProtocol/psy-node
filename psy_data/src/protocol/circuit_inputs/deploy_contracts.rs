@@ -1,4 +1,4 @@
-use parth_core::{crypto::hash::spiderman::SpidermanUpdateProof, felt::QFelt64, protocol::core_types::Q256BitHash};
+use parth_core::{crypto::hash::spiderman::SpidermanUpdateProof, felt::QFelt64, protocol::core_types::Q256BitHash, utils::QPGenRandom};
 use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
 use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
 
@@ -23,6 +23,16 @@ impl<F, Hash: Copy> AggStateTrackableInput<Hash> for QCBatchDeployContractsCircu
     }
 }
 
+#[cfg(feature = "rand_gen")]
+impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for QCBatchDeployContractsCircuitInput<F, Hash> {
+    fn qp_rand_gen() -> Self where Self: Sized {
+        Self {
+            deploy_contract_circuit_whitelist: Hash::qp_rand_gen(),
+            spiderman_append_proof: SpidermanUpdateProof::qp_rand_gen_vec(rand::random::<u8>() as usize).pop().unwrap(),
+            contract_leaves: PQEDContractLeaf::qp_rand_gen_vec(rand::random::<u8>() as usize),
+        }
+    }
+}
 
 
 impl<F: QFelt64, Hash: Q256BitHash> PsyCanonicalSerializeMetadata for QCBatchDeployContractsCircuitInput<F, Hash> {
