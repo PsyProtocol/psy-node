@@ -8,6 +8,7 @@ use crate::{agg::{AggStateTrackableInput, AggStateTransition}, v1::qdata::contra
 
 
 #[pderive::serialize_clone_f_hash]
+#[repr(C)]
 pub struct QCBatchDeployContractsCircuitInput<F, Hash> {
     pub deploy_contract_circuit_whitelist: Hash,
     pub spiderman_append_proof: SpidermanUpdateProof<Hash>,
@@ -28,7 +29,7 @@ impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for QCBatchDeployContractsCi
     fn qp_rand_gen() -> Self where Self: Sized {
         Self {
             deploy_contract_circuit_whitelist: Hash::qp_rand_gen(),
-            spiderman_append_proof: SpidermanUpdateProof::qp_rand_gen_vec(rand::random::<u8>() as usize).pop().unwrap(),
+            spiderman_append_proof: SpidermanUpdateProof::qp_rand_gen(),
             contract_leaves: PQEDContractLeaf::qp_rand_gen_vec(rand::random::<u8>() as usize),
         }
     }

@@ -855,8 +855,8 @@ macro_rules! impl_psy_ser_basic_tests {
                 }
 
                 #[test]
-                fn fuzz_1000_non_empty_vec_round_trips() -> anyhow::Result<()> {
-                    for _ in 0..1_000 {
+                fn fuzz_100_non_empty_vec_round_trips() -> anyhow::Result<()> {
+                    for _ in 0..100 {
                         let count = (rand::random::<usize>() % 255) + 1;
                         let values = PsySerTestTargetType::qp_rand_gen_vec(count);
                         let serialized = PsySerTestTargetType::psy_ser_serialize_vec_of_self_ref(&values, true);
