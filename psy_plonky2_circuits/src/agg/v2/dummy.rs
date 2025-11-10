@@ -19,7 +19,7 @@ use psy_data::{agg::DummyAggStateTransition, worker::api_response::PsyWorkerGetP
 use psy_plonky2_basic_helpers::{builder::{hash::core::CircuitBuilderHashCore, pad_circuit::{pad_circuit_degree, CircuitBuilderQEDCommonGates}}, verifier::circuit_library::CircuitInfoLibrary};
 use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 
-use crate::{agg::v2::core::compute_agg_state_trackable_final_public_inputs, proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{QStandardCircuit, QStandardCircuitProvableWithRawProofsAndRefLibraryAsync}};
+use crate::{agg::common::compute_agg_state_trackable_final_public_inputs_leaf, proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{QStandardCircuit, QStandardCircuitProvableWithRawProofsAndRefLibraryAsync}};
 
 
 #[derive(Debug)]
@@ -27,7 +27,7 @@ pub struct AggStateTransitionDummyCircuitV2<C: GenericConfig<D>, const D: usize>
 {
     pub allowed_circuit_hashes_root: HashOutTarget,
     pub unmodified_state_root: HashOutTarget,
-    pub reward_tree_value: HashOutTarget,
+    pub worker_reward_tag: HashOutTarget,
     // end circuit targets
     pub circuit_data: CircuitData<C::F, C, D>,
     pub fingerprint: QHashOut<C::F>,
@@ -43,16 +43,13 @@ where
         let allowed_circuit_hashes_root = builder.add_virtual_hash();
         let unmodified_state_root = builder.add_virtual_hash();
         let state_transition_hash = builder.hash_two_to_one::<C::Hasher>(unmodified_state_root, unmodified_state_root);
-        let reward_tree_value = builder.add_virtual_hash();
-        let total_proofs_generated = builder.one();
+        let worker_reward_tag = builder.add_virtual_hash();
 
-
-        let public_inputs_hash = compute_agg_state_trackable_final_public_inputs::<C::Hasher, C::F, D>(
+        let public_inputs_hash = compute_agg_state_trackable_final_public_inputs_leaf::<C::Hasher, C::F, D>(
             &mut builder,
             allowed_circuit_hashes_root,
             state_transition_hash,
-            reward_tree_value,
-            total_proofs_generated,
+            worker_reward_tag,
         );
 
         builder.register_public_inputs(&public_inputs_hash.elements);
@@ -68,14 +65,14 @@ where
             allowed_circuit_hashes_root,
             circuit_data,
             fingerprint,
-            reward_tree_value,
+            worker_reward_tag,
         }
     }
     pub fn prove_base(
         &self,
         allowed_circuit_hashes_root: QHashOut<C::F>,
         unmodified_state_root: QHashOut<C::F>,
-        reward_tree_value: QHashOut<C::F>,
+        worker_reward_tag: QHashOut<C::F>,
 
 
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
@@ -86,7 +83,7 @@ where
             self.allowed_circuit_hashes_root,
             allowed_circuit_hashes_root.0,
         )?;
-        pw.set_hash_target(self.reward_tree_value, reward_tree_value.0)?;
+        pw.set_hash_target(self.worker_reward_tag, worker_reward_tag.0)?;
 
         self.circuit_data.prove(pw)
     }

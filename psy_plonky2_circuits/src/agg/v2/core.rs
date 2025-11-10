@@ -22,36 +22,14 @@ use psy_data::{agg::AggStateTransitionInputV2, worker::api_response::PsyWorkerGe
 use psy_plonky2_basic_helpers::{builder::{hash::core::CircuitBuilderHashCore, pad_circuit::CircuitBuilderQEDCommonGates, verify::CircuitBuilderVerifyProofHelpers}, verifier::circuit_library::CircuitInfoLibrary};
 use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 
-use crate::{agg::circuits::core::AggStateTrackableCircuitHeaderGadget, proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{QStandardCircuit, QStandardCircuitProvableWithRawProofsAndRefLibraryAsync}};
+use crate::{agg::{circuits::core::AggStateTrackableCircuitHeaderGadget, common::compute_agg_state_trackable_final_public_inputs}, proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{QStandardCircuit, QStandardCircuitProvableWithRawProofsAndRefLibraryAsync}};
 
-pub fn compute_agg_state_trackable_final_public_inputs<H:AlgebraicHasher<F>, F: RichField + Extendable<D>, const D: usize>(
-    builder: &mut CircuitBuilder<F, D>,
-    allowed_circuit_hashes_root: HashOutTarget,
-    state_transition_hash: HashOutTarget,
-    tag_tree_value: HashOutTarget,
-    total_proofs_generated: Target,
-) -> HashOutTarget {
-    let allowed_and_state_transition_hash = builder.hash_two_to_one::<H>(
-        allowed_circuit_hashes_root,
-        state_transition_hash,
-    );
-    let public_inputs_without_reward_tag = builder.hash_n_to_hash_no_pad::<H>(
-        vec![
-            allowed_and_state_transition_hash.elements[0],
-            allowed_and_state_transition_hash.elements[1],
-            allowed_and_state_transition_hash.elements[2],
-            allowed_and_state_transition_hash.elements[3],
-            total_proofs_generated,
-        ]
-    );
-    builder.hash_two_to_one::<H>(public_inputs_without_reward_tag, tag_tree_value)
-}
 #[derive(Debug, Clone)]
 pub struct AggStateTrackableCircuitHeaderGadgetV2 {
     pub state_transition: AggStateTrackableCircuitHeaderGadget,
     pub left_proving_rewards_tag_value: HashOutTarget,
     pub right_proving_rewards_tag_value: HashOutTarget,
-    pub proving_rewards_tag: HashOutTarget,
+    pub worker_reward_tag: HashOutTarget,
 
     pub left_proofs_generated_total: Target,
     pub right_proofs_generated_total: Target,
@@ -72,7 +50,7 @@ impl AggStateTrackableCircuitHeaderGadgetV2 {
         let right_proofs_generated_total = builder.add_virtual_target();
         let left_proving_rewards_tag_value = builder.add_virtual_hash();
         let right_proving_rewards_tag_value = builder.add_virtual_hash();
-        let proving_rewards_tag = builder.add_virtual_hash();
+        let worker_reward_tag = builder.add_virtual_hash();
 
 
         let expected_left_public_inputs_hash = compute_agg_state_trackable_final_public_inputs::<H, F, D>(
@@ -97,7 +75,7 @@ impl AggStateTrackableCircuitHeaderGadgetV2 {
         );
         let rewards_tree_final_new_value = builder.hash_two_to_one::<H>(
             rewards_tree_value_combo,
-            proving_rewards_tag,
+            worker_reward_tag,
         );
 
         let child_total_proofs = builder.add(left_proofs_generated_total, right_proofs_generated_total);
@@ -116,7 +94,7 @@ impl AggStateTrackableCircuitHeaderGadgetV2 {
             state_transition: state_transition_gadget,
             left_proving_rewards_tag_value,
             right_proving_rewards_tag_value,
-            proving_rewards_tag,
+            worker_reward_tag,
             left_proofs_generated_total,
             right_proofs_generated_total,
             expected_left_public_inputs_hash,
@@ -132,7 +110,7 @@ impl AggStateTrackableCircuitHeaderGadgetV2 {
         input: &AggStateTransitionInputV2<QHashOut<F>>,
         left_proving_rewards_tag_value: QHashOut<F>,
         right_proving_rewards_tag_value: QHashOut<F>,
-        proving_rewards_tag: QHashOut<F>,
+        worker_reward_tag: QHashOut<F>,
     ) -> anyhow::Result<()> {
 
         let left_proofs_generated_total_f = F::from_noncanonical_u64(input.left_proofs_generated_total);
@@ -142,7 +120,7 @@ impl AggStateTrackableCircuitHeaderGadgetV2 {
 
         witness.set_hash_target(self.left_proving_rewards_tag_value, left_proving_rewards_tag_value.0)?;
         witness.set_hash_target(self.right_proving_rewards_tag_value, right_proving_rewards_tag_value.0)?;
-        witness.set_hash_target(self.proving_rewards_tag, proving_rewards_tag.0)?;
+        witness.set_hash_target(self.worker_reward_tag, worker_reward_tag.0)?;
         witness.set_target(self.left_proofs_generated_total, left_proofs_generated_total_f)?;
         witness.set_target(self.right_proofs_generated_total, right_proofs_generated_total_f)
     }
@@ -249,12 +227,12 @@ where
         input: &AggStateTransitionInputV2<QHashOut<C::F>>,
         left_proving_rewards_tag_value: QHashOut<C::F>,
         right_proving_rewards_tag_value: QHashOut<C::F>,
-        proving_rewards_tag: QHashOut<C::F>,
+        worker_reward_tag: QHashOut<C::F>,
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
         let mut pw = PartialWitness::<C::F>::new();
         
         self.header_gadget
-            .set_witness(&mut pw, agg_fingerprint, leaf_fingerprint, input, left_proving_rewards_tag_value, right_proving_rewards_tag_value, proving_rewards_tag)?;
+            .set_witness(&mut pw, agg_fingerprint, leaf_fingerprint, input, left_proving_rewards_tag_value, right_proving_rewards_tag_value, worker_reward_tag)?;
 
         pw.set_proof_with_pis_target(&self.left_proof, left_proof)?;
         pw.set_verifier_data_target(

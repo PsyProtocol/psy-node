@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use parth_core::{crypto::hash::{spiderman::SpidermanUpdateProof, traits::MerkleZeroHasher}, pgoldilocks::QHashOut};
+use parth_core::{crypto::hash::{spiderman::SpidermanUpdateProof, traits::MerkleZeroHasher}, pgoldilocks::QHashOut, protocol::core_types::Q256BitHash};
 use plonky2::{
     hash::hash_types::{HashOut, HashOutTarget}, iop::
         witness::{PartialWitness, WitnessWrite}, plonk::{
@@ -7,16 +7,16 @@ use plonky2::{
         circuit_data::{CircuitConfig, CircuitData, CommonCircuitData, VerifierOnlyCircuitData},
         config::{AlgebraicHasher, GenericConfig},
         proof::ProofWithPublicInputs,
-    }, field::types::Field
+    }
 };
 use psy_core::{constants::protocol::get_default_worker_public_key, job::job_id::{ProvingJobCircuitType, QProvingJobDataID}};
-use psy_data::{protocol::circuit_inputs::append_user_registration_tree::QCAppendUserRegistrationTreeCircuitInput, v1::qdata::pm_jobs_completed_stats::PPMJobsCompletedStats};
+use psy_data::{protocol::circuit_inputs::append_user_registration_tree::QCAppendUserRegistrationTreeCircuitInput, worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse};
 use psy_plonky2_basic_helpers::{
     builder::{hash::core::CircuitBuilderHashCore, pad_circuit::CircuitBuilderQEDCommonGates}, verifier::circuit_library::CircuitInfoLibrary,
    
 };
-use psy_plonky2_common_circuits::traits::ToTargets;
-use crate::{gadgets::qdata::pm_jobs_completed_stats::PMJobsCompletedStatsGadget, proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{proof_store::{QProofStoreReaderAsync, QProofStoreReaderSync}, provable::QStandardCircuitProvable, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QStandardCircuitProvableWithProofStoreSync, QPsyNetworkCircuitWithType}};
+use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
+use crate::{agg::common::compute_agg_state_trackable_final_public_inputs_leaf, proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{QPsyNetworkCircuitWithType, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QStandardCircuitProvableWithProofStoreSync, QStandardCircuitProvableWithRawProofsAndRefLibraryAsync, proof_store::{QProofStoreReaderAsync, QProofStoreReaderSync}, provable::QStandardCircuitProvable}};
 
 use crate::coordinator::gadgets::append_user_registration_tree::BatchAppendUserRegistrationTreeGadget;
 
@@ -26,9 +26,7 @@ pub struct BatchAppendUserRegistrationTreeCircuit<C: GenericConfig<D>, const D: 
 {
     pub batch_append_gadget: BatchAppendUserRegistrationTreeGadget,
     pub register_users_circuit_whitelist: HashOutTarget,
-    pub worker_public_key: HashOutTarget,
-    pub commitment: HashOutTarget,
-    pub pm_jobs_completed: PMJobsCompletedStatsGadget,
+    pub worker_reward_tag: HashOutTarget,
 
     pub circuit_data: CircuitData<C::F, C, D>,
     pub fingerprint: QHashOut<C::F>,
@@ -56,9 +54,10 @@ where
 
 
         let register_users_circuit_whitelist = builder.add_virtual_hash();
-        let worker_public_key = builder.add_virtual_hash();
+        let worker_reward_tag = builder.add_virtual_hash();
 
-        // builder.assert_non_zero_hash(worker_public_key);
+        
+
 
         let batch_append_gadget = BatchAppendUserRegistrationTreeGadget::add_virtual_to::<C::Hasher, C::F, D>(
             &mut builder,
@@ -66,22 +65,18 @@ where
             batch_sub_tree_height,
             max_sub_trees,
         );
+
         let state_transition_hash = builder.hash_two_to_one::<C::Hasher>(
             batch_append_gadget.old_root,
             batch_append_gadget.new_root,
         );
-
-        let zero_hash = builder.constant_hash(HashOut::ZERO);
-        let commitment = builder.hash_two_to_one::<C::Hasher>(zero_hash, zero_hash);
-
-        let one = builder.one();
-        let pm_jobs_completed = PMJobsCompletedStatsGadget::new_register_users(&mut builder, one);
-
-        builder.register_public_inputs(&commitment.elements);
-        builder.register_public_inputs(&worker_public_key.elements);
-        builder.register_public_inputs(&pm_jobs_completed.to_targets());
-        builder.register_public_inputs(&register_users_circuit_whitelist.elements);
-        builder.register_public_inputs(&state_transition_hash.elements);
+        let public_inputs_hash = compute_agg_state_trackable_final_public_inputs_leaf::<C::Hasher, C::F, D>(
+            &mut builder,
+            register_users_circuit_whitelist,
+            state_transition_hash,
+            worker_reward_tag,
+        );
+        builder.register_public_inputs(&public_inputs_hash.elements);
 
         builder.add_qed_type_d_common_gates();
         let circuit_data = builder.build::<C>();
@@ -92,9 +87,7 @@ where
 
         Self {
             register_users_circuit_whitelist,
-            worker_public_key,
-            pm_jobs_completed,
-            commitment,
+            worker_reward_tag,
             batch_append_gadget,
             circuit_data,
             fingerprint,
@@ -104,15 +97,12 @@ where
     pub fn prove_base(
         &self,
         register_users_circuit_whitelist: QHashOut<C::F>,
-        worker_public_key: QHashOut<C::F>,
+        worker_reward_tag: QHashOut<C::F>,
         spiderman_append_proofs: &[SpidermanUpdateProof<QHashOut<C::F>>],
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
         let mut pw = PartialWitness::<C::F>::new();
         pw.set_hash_target(self.register_users_circuit_whitelist, register_users_circuit_whitelist.0)?;
-        pw.set_hash_target(self.worker_public_key, worker_public_key.0)?;
-
-        let jobs_completed_stats = PPMJobsCompletedStats::new_register_users_with_zero(C::F::ZERO, C::F::ONE);
-        self.pm_jobs_completed.set_witness(&mut pw, &jobs_completed_stats)?;
+        pw.set_hash_target(self.worker_reward_tag, worker_reward_tag.0)?;
 
         self.batch_append_gadget.set_witness_params(
             &mut pw,
@@ -206,5 +196,38 @@ where
         )?;
 
         Ok(result)
+    }
+}
+
+
+
+
+
+
+#[async_trait]
+impl<
+        L: CircuitInfoLibrary<C, D> + Send + Sync,
+        C: GenericConfig<D>,
+        const D: usize,
+    > QStandardCircuitProvableWithRawProofsAndRefLibraryAsync<L, C, D>
+    for BatchAppendUserRegistrationTreeCircuit<C, D>
+where
+     C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>>, QHashOut<C::F>: Q256BitHash,
+{
+
+    async fn prove_with_raw_proofs_and_ref_library_async(
+        &self,
+        _library: &L,
+        input: PsyWorkerGetProvingWorkWithChildProofsAPIResponse<QHashOut<C::F>, QProvingJobDataID>,
+        worker_reward_tag: QHashOut<C::F>,
+    ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>>{
+
+        let witness = QCAppendUserRegistrationTreeCircuitInput::<QHashOut<C::F>>::psy_ser_from_slice(&input.base.witness)?;
+        self.prove_base(
+            witness.register_users_circuit_whitelist,
+            worker_reward_tag,
+            &witness.spiderman_append_proofs,
+        )
+
     }
 }
