@@ -3016,6 +3016,7 @@ dependencies = [
  "psy_data",
  "psy_plonky2_basic_helpers",
  "psy_plonky2_common_circuits",
+ "psy_serialize",
  "rand 0.8.5",
  "rkyv",
  "serde",

@@ -6,6 +6,7 @@ use plonky2::plonk::{
     proof::ProofWithPublicInputs,
 };
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
+use psy_data::worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse;
 use psy_plonky2_basic_helpers::verifier::circuit_library::CircuitInfoLibrary;
 use serde::{de::DeserializeOwned, Serialize};
 
@@ -134,6 +135,24 @@ pub trait QStandardCircuitProvableWithProofStoreAndRefLibraryAsync<
         library: &L,
         job_id: QProvingJobDataID,
         worker_public_key: QHashOut<C::F>,
+    ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>>;
+}
+
+
+
+
+#[async_trait]
+pub trait QStandardCircuitProvableWithRawProofsAndRefLibraryAsync<
+    L: CircuitInfoLibrary<C,D> + Send + Sync,
+    C: GenericConfig<D>,
+    const D: usize,
+>: QStandardCircuit<C, D>
+{
+    async fn prove_with_raw_proofs_and_ref_library_async(
+        &self,
+        library: &L,
+        input: PsyWorkerGetProvingWorkWithChildProofsAPIResponse<QHashOut<C::F>, QProvingJobDataID>,
+        worker_reward_tag: QHashOut<C::F>,
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>>;
 }
 

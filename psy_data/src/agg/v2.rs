@@ -1,10 +1,10 @@
-use parth_core::{crypto::hash::traits::{FieldQHasher, HashTo4Felts, PCircuitWitness, QFieldHashable}, felt::QFelt64, protocol::core_types::{Q256BitHash, QFHashBase}};
+use parth_core::{crypto::hash::traits::{FieldQHasher, HashTo4Felts}, felt::QFelt64, protocol::core_types::Q256BitHash};
 #[cfg(feature = "rand_gen")]
 use parth_core::utils::QPGenRandom;
 use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
 use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
 
-use crate::agg::{AggStateTrackableInput, AggStateTransition, WithDummyStateTransition};
+use crate::agg::{AggStateTrackableInput, AggStateTransition, AggStateTransitionInput, WithDummyStateTransition};
 
 
 
@@ -114,7 +114,6 @@ pser::impl_psy_ser_basic_tests_fallback!(
 
 #[pderive::serialize_copy_hash]
 pub struct AggStateTransitionInputV2<Hash> {
-    pub allowed_circuit_hashes_root: Hash,
     pub left_input: AggStateTransitionWithStats<Hash>,
     pub right_input: AggStateTransitionWithStats<Hash>,
     pub left_proofs_generated_total: u64,
@@ -125,7 +124,6 @@ pub struct AggStateTransitionInputV2<Hash> {
 impl<Hash: Copy> WithDummyStateTransition<Hash> for AggStateTransitionInputV2<Hash> {
     fn get_dummy_value(state_root: Hash) -> Self {
         Self {
-            allowed_circuit_hashes_root: state_root, // TODO: make this a proper value
             left_input: AggStateTransitionWithStats::<Hash>::get_dummy_value(state_root),
             right_input: AggStateTransitionWithStats::<Hash>::get_dummy_value(state_root),
             left_proofs_generated_total: 0,
@@ -151,8 +149,22 @@ impl<Hash: Copy> AggStateTransitionInputV2<Hash> {
             total_proofs_generated: self.left_proofs_generated_total + self.right_proofs_generated_total,
         }
     }
-    pub fn get_public_inputs_hash_no_tag_tree<H: FieldQHasher<F, Hash>, F: QFelt64>(&self) -> Hash where Hash: HashTo4Felts<F>{
-        self.condense().get_public_inputs_hash_no_tag_tree::<H, F>(self.allowed_circuit_hashes_root)
+    pub fn get_public_inputs_hash_no_tag_tree<H: FieldQHasher<F, Hash>, F: QFelt64>(&self, allowed_circuit_hashes_root: Hash) -> Hash where Hash: HashTo4Felts<F>{
+        self.condense().get_public_inputs_hash_no_tag_tree::<H, F>(allowed_circuit_hashes_root)
+    }
+    pub fn to_v1_input(&self) -> AggStateTransitionInput<Hash> {
+        AggStateTransitionInput {
+            left_input: AggStateTransition {
+                state_transition_start: self.left_input.state_transition_start,
+                state_transition_end: self.left_input.state_transition_end,
+            },
+            right_input: AggStateTransition {
+                state_transition_start: self.right_input.state_transition_start,
+                state_transition_end: self.right_input.state_transition_end,
+            },
+            left_proof_is_leaf: self.left_proof_is_leaf,
+            right_proof_is_leaf: self.right_proof_is_leaf,
+        }
     }
 }
 
@@ -160,7 +172,6 @@ impl<Hash: Copy> AggStateTransitionInputV2<Hash> {
 impl<Hash: QPGenRandom> QPGenRandom for AggStateTransitionInputV2<Hash> {
     fn qp_rand_gen() -> Self where Self: Sized {
         Self {
-            allowed_circuit_hashes_root: Hash::qp_rand_gen(),
             left_input: AggStateTransitionWithStats::<Hash>::qp_rand_gen(),
             right_input: AggStateTransitionWithStats::<Hash>::qp_rand_gen(),
             left_proofs_generated_total: rand::random(),
@@ -174,7 +185,7 @@ impl<Hash: QPGenRandom> QPGenRandom for AggStateTransitionInputV2<Hash> {
 
 impl<Hash: Q256BitHash> PsyCanonicalSerializeMetadata for AggStateTransitionInputV2<Hash> {
     const IS_FIXED_SIZE: bool = true;
-    const FIXED_SIZE: usize = 32 + AggStateTransitionWithStats::<Hash>::FIXED_SIZE * 2 + 8*2 + 2;
+    const FIXED_SIZE: usize = AggStateTransitionWithStats::<Hash>::FIXED_SIZE * 2 + 8*2 + 2;
 }
 impl<Hash: Q256BitHash> FallbackPsySerializeCanonical for AggStateTransitionInputV2<Hash> {
     fn fallback_pio_serialized_size(&self) -> usize {
@@ -183,7 +194,6 @@ impl<Hash: Q256BitHash> FallbackPsySerializeCanonical for AggStateTransitionInpu
     }
     
     fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
-        writer.psy_write_bytes_fixed(&self.allowed_circuit_hashes_root.into_owned_32bytes())?;
         self.left_input.pio_write_to_io(writer)?;
         self.right_input.pio_write_to_io(writer)?;
         writer.psy_write_u64(self.left_proofs_generated_total)?;
@@ -194,7 +204,6 @@ impl<Hash: Q256BitHash> FallbackPsySerializeCanonical for AggStateTransitionInpu
     }
     
     fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
-        let allowed_circuit_hashes_root = Hash::from_owned_32bytes(reader.psy_read_bytes_fixed()?);
         let left_input = AggStateTransitionWithStats::<Hash>::pio_read_from_io(reader)?;
         let right_input = AggStateTransitionWithStats::<Hash>::pio_read_from_io(reader)?;
         let left_proofs_generated_total = reader.psy_read_u64()?;
@@ -202,7 +211,6 @@ impl<Hash: Q256BitHash> FallbackPsySerializeCanonical for AggStateTransitionInpu
         let left_proof_is_leaf = reader.psy_read_u8()? != 0;
         let right_proof_is_leaf = reader.psy_read_u8()? != 0;
         Ok(Self {
-            allowed_circuit_hashes_root,
             left_input,
             right_input,
             left_proofs_generated_total,

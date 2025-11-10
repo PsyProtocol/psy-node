@@ -159,7 +159,7 @@ where
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
         self.prove_base(
             get_default_worker_public_key(),
-            input.state_transition_hash,
+            input.unmodified_state_tree_root,
             input.allowed_circuit_hashes_root,
             input.is_deploy_contracts,
             input.is_register_users,
@@ -205,7 +205,7 @@ where
                 .map_err(|e| anyhow::anyhow!(e))?;
         self.prove_base(
             worker_public_key,
-            r.state_transition_hash,
+            r.unmodified_state_tree_root,
             r.allowed_circuit_hashes_root,
             r.is_deploy_contracts,
             r.is_register_users,

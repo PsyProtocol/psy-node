@@ -3,9 +3,6 @@ use parth_core::{QCoreProcCheckpointUniqueId, crypto::hash::merkle_proof::DeltaM
 use crate::{prepared_block::common::PsyCoordinatorPendingCheckpointBase, v1::qdata::contract::ContractCodeDefinitionWithContractId};
 
 
-
-
-
 #[pderive::serialize_clone_f_hash_ts]
 #[ts(export, concrete(F = parth_core::PF, Hash = parth_core::PHash))]
 pub struct PsyPreparedCoordinatorBlockStateUpdates<F, Hash> {

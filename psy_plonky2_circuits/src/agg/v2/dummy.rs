@@ -1,10 +1,10 @@
 use async_trait::async_trait;
-use parth_core::pgoldilocks::QHashOut;
+use parth_core::{pgoldilocks::QHashOut, protocol::core_types::Q256BitHash};
 use plonky2::{
     hash::
-        hash_types::{HashOut, HashOutTarget}
+        hash_types::HashOutTarget
     ,
-    iop::{target::Target, witness::{PartialWitness, WitnessWrite}},
+    iop::witness::{PartialWitness, WitnessWrite},
     plonk::{
         circuit_builder::CircuitBuilder,
         circuit_data::{
@@ -14,24 +14,20 @@ use plonky2::{
         proof::ProofWithPublicInputs,
     },
 };
-use psy_core::{constants::protocol::get_default_worker_public_key, job::job_id::QProvingJobDataID};
-use psy_data::agg::DummyAggStateTransition;
+use psy_core::job::job_id::QProvingJobDataID;
+use psy_data::{agg::DummyAggStateTransition, worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse};
 use psy_plonky2_basic_helpers::{builder::{hash::core::CircuitBuilderHashCore, pad_circuit::{pad_circuit_degree, CircuitBuilderQEDCommonGates}}, verifier::circuit_library::CircuitInfoLibrary};
+use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 
-use crate::{proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{proof_store::{QProofStoreReaderAsync, QProofStoreReaderSync}, provable::QStandardCircuitProvable, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QStandardCircuitProvableWithProofStoreSync}};
-use plonky2::field::types::Field;
+use crate::{agg::v2::core::compute_agg_state_trackable_final_public_inputs, proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{QStandardCircuit, QStandardCircuitProvableWithRawProofsAndRefLibraryAsync}};
 
 
 #[derive(Debug)]
 pub struct AggStateTransitionDummyCircuitV2<C: GenericConfig<D>, const D: usize>
 {
-    pub state_transition_hash: HashOutTarget,
     pub allowed_circuit_hashes_root: HashOutTarget,
-    pub worker_public_key: HashOutTarget,
-    pub is_deploy_contracts: Target,
-    pub is_register_users: Target,
-    pub pm_jobs_completed: [Target; 3],
-
+    pub unmodified_state_root: HashOutTarget,
+    pub reward_tree_value: HashOutTarget,
     // end circuit targets
     pub circuit_data: CircuitData<C::F, C, D>,
     pub fingerprint: QHashOut<C::F>,
@@ -44,36 +40,22 @@ where
         let config = CircuitConfig::standard_recursion_config();
         let mut builder = CircuitBuilder::<C::F, D>::new(config);
 
-        let state_transition_hash = builder.add_virtual_hash();
         let allowed_circuit_hashes_root = builder.add_virtual_hash();
-        let worker_public_key = builder.add_virtual_hash();
-        let is_deploy_contracts = builder.add_virtual_target();
-        let is_register_users = builder.add_virtual_target();
+        let unmodified_state_root = builder.add_virtual_hash();
+        let state_transition_hash = builder.hash_two_to_one::<C::Hasher>(unmodified_state_root, unmodified_state_root);
+        let reward_tree_value = builder.add_virtual_hash();
+        let total_proofs_generated = builder.one();
 
-        let sum = builder.add(is_deploy_contracts, is_register_users);
-        let one = builder.one();
-        builder.connect(sum, one);
 
-        let zero = builder.zero();
-        let pm_jobs_completed = [
-            is_deploy_contracts,
-            is_register_users,
-            zero,
-        ];
+        let public_inputs_hash = compute_agg_state_trackable_final_public_inputs::<C::Hasher, C::F, D>(
+            &mut builder,
+            allowed_circuit_hashes_root,
+            state_transition_hash,
+            reward_tree_value,
+            total_proofs_generated,
+        );
 
-        // builder.assert_non_zero_hash(worker_public_key);
-
-        let zero_hash = builder.constant_hash(HashOut::ZERO);
-        let commitment = builder.hash_two_to_one::<C::Hasher>(zero_hash, zero_hash);
-
-        let transition =
-            builder.hash_two_to_one::<C::Hasher>(state_transition_hash, state_transition_hash);
-
-        builder.register_public_inputs(&commitment.elements);
-        builder.register_public_inputs(&worker_public_key.elements);
-        builder.register_public_inputs(&pm_jobs_completed);
-        builder.register_public_inputs(&allowed_circuit_hashes_root.elements);
-        builder.register_public_inputs(&transition.elements);
+        builder.register_public_inputs(&public_inputs_hash.elements);
 
         builder.add_qed_type_d_common_gates();
         pad_circuit_degree::<C::F, D>(&mut builder, 12);
@@ -82,33 +64,30 @@ where
         let fingerprint = QHashOut(get_circuit_fingerprint_generic(&circuit_data.verifier_only));
 
         Self {
-            state_transition_hash,
+            unmodified_state_root,
             allowed_circuit_hashes_root,
-            worker_public_key,
-            is_deploy_contracts,
-            is_register_users,
-            pm_jobs_completed,
             circuit_data,
             fingerprint,
+            reward_tree_value,
         }
     }
     pub fn prove_base(
         &self,
-        worker_public_key: QHashOut<C::F>,
-        state_transition_hash: QHashOut<C::F>,
         allowed_circuit_hashes_root: QHashOut<C::F>,
-        is_deploy_contracts: bool,
-        is_register_users: bool,
+        unmodified_state_root: QHashOut<C::F>,
+        reward_tree_value: QHashOut<C::F>,
+
+
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
         let mut pw = PartialWitness::<C::F>::new();
-        pw.set_hash_target(self.worker_public_key, worker_public_key.0)?;
-        pw.set_hash_target(self.state_transition_hash, state_transition_hash.0)?;
+        pw.set_hash_target(self.allowed_circuit_hashes_root, allowed_circuit_hashes_root.0)?;
+        pw.set_hash_target(self.unmodified_state_root, unmodified_state_root.0)?;
         pw.set_hash_target(
             self.allowed_circuit_hashes_root,
             allowed_circuit_hashes_root.0,
         )?;
-        pw.set_target(self.is_deploy_contracts, if is_deploy_contracts { C::F::ONE } else { C::F::ZERO })?;
-        pw.set_target(self.is_register_users, if is_register_users { C::F::ONE } else { C::F::ZERO })?;
+        pw.set_hash_target(self.reward_tree_value, reward_tree_value.0)?;
+
         self.circuit_data.prove(pw)
     }
 }
@@ -147,68 +126,26 @@ where
     }
 }
 
-impl<C: GenericConfig<D>, const D: usize>
-    QStandardCircuitProvable<DummyAggStateTransition<QHashOut<C::F>>, C, D>
-    for AggStateTransitionDummyCircuitV2<C, D>
-where
-    C::Hasher:AlgebraicHasher<C::F>,
-{
-    fn prove_standard(
-        &self,
-        input: &DummyAggStateTransition<QHashOut<C::F>>,
-    ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
-        self.prove_base(
-            get_default_worker_public_key(),
-            input.state_transition_hash,
-            input.allowed_circuit_hashes_root,
-            input.is_deploy_contracts,
-            input.is_register_users,
-        )
-    }
-}
-
-impl<S: QProofStoreReaderSync, C: GenericConfig<D>, const D: usize>
-    QStandardCircuitProvableWithProofStoreSync<S, DummyAggStateTransition<QHashOut<C::F>>, C, D>
-    for AggStateTransitionDummyCircuitV2<C, D>
-where
-    C::Hasher:AlgebraicHasher<C::F>,
-{
-    fn prove_with_proof_store_sync(
-        &self,
-        _store: &S,
-        input: &DummyAggStateTransition<QHashOut<C::F>>,
-    ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
-        self.prove_standard(input)
-    }
-}
-
 #[async_trait]
 impl<
-        S: QProofStoreReaderAsync + Send + Sync,
         L: CircuitInfoLibrary<C, D> + Send + Sync,
         C: GenericConfig<D>,
         const D: usize,
-    > QStandardCircuitProvableWithProofStoreAndRefLibraryAsync<S, L, C, D>
+    > QStandardCircuitProvableWithRawProofsAndRefLibraryAsync<L, C, D>
     for AggStateTransitionDummyCircuitV2<C, D>
 where
-    C::Hasher: AlgebraicHasher<C::F>
+    C::Hasher: AlgebraicHasher<C::F>, QHashOut<C::F>: Q256BitHash,
 {
-    async fn prove_with_proof_store_async(
+
+    async fn prove_with_raw_proofs_and_ref_library_async(
         &self,
-        store: &S,
         _library: &L,
-        job_id: QProvingJobDataID,
-        worker_public_key: QHashOut<C::F>,
-    ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
-        let r: DummyAggStateTransition<QHashOut<C::F>> =
-            bincode::deserialize(&store.get_bytes_by_id(job_id.get_input_witness_id()).await?)
-                .map_err(|e| anyhow::anyhow!(e))?;
-        self.prove_base(
-            worker_public_key,
-            r.state_transition_hash,
-            r.allowed_circuit_hashes_root,
-            r.is_deploy_contracts,
-            r.is_register_users,
-        )
+        input: PsyWorkerGetProvingWorkWithChildProofsAPIResponse<QHashOut<C::F>, QProvingJobDataID>,
+        worker_reward_tag: QHashOut<C::F>,
+    ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>>{
+        let witness = DummyAggStateTransition::<QHashOut<C::F>>::psy_ser_from_slice(&input.base.witness)?;
+        self.prove_base(witness.allowed_circuit_hashes_root, witness.unmodified_state_tree_root, worker_reward_tag)
+
     }
 }
+

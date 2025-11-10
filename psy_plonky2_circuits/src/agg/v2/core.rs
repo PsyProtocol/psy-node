@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use parth_core::{data::proof_input::CircuitInputWithDependencies, pgoldilocks::QHashOut};
+use parth_core::{pgoldilocks::QHashOut, protocol::core_types::Q256BitHash};
 use plonky2::{
     field::extension::Extendable,
     hash::{
@@ -18,10 +18,11 @@ use plonky2::{
     },
 };
 use psy_core::job::job_id::QProvingJobDataID;
-use psy_data::agg::AggStateTransitionInput;
+use psy_data::{agg::AggStateTransitionInputV2, worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse};
 use psy_plonky2_basic_helpers::{builder::{hash::core::CircuitBuilderHashCore, pad_circuit::CircuitBuilderQEDCommonGates, verify::CircuitBuilderVerifyProofHelpers}, verifier::circuit_library::CircuitInfoLibrary};
+use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 
-use crate::{agg::circuits::core::AggStateTrackableCircuitHeaderGadget, proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, proof_store::QProofStoreReaderAsync}};
+use crate::{agg::circuits::core::AggStateTrackableCircuitHeaderGadget, proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{QStandardCircuit, QStandardCircuitProvableWithRawProofsAndRefLibraryAsync}};
 
 pub fn compute_agg_state_trackable_final_public_inputs<H:AlgebraicHasher<F>, F: RichField + Extendable<D>, const D: usize>(
     builder: &mut CircuitBuilder<F, D>,
@@ -126,39 +127,30 @@ impl AggStateTrackableCircuitHeaderGadgetV2 {
     pub fn set_witness<W: Witness<F>, F: RichField>(
         &self,
         witness: &mut W,
-        input: &AggStateTransitionInput<QHashOut<F>>,
         agg_fingerprint: QHashOut<F>,
         leaf_fingerprint: QHashOut<F>,
+        input: &AggStateTransitionInputV2<QHashOut<F>>,
+        left_proving_rewards_tag_value: QHashOut<F>,
+        right_proving_rewards_tag_value: QHashOut<F>,
+        proving_rewards_tag: QHashOut<F>,
     ) -> anyhow::Result<()> {
-        //tracing::info!("set_witness: {}", serde_json::to_string(input).unwrap());
-        witness.set_hash_target(self.agg_fingerprint, agg_fingerprint.0)?;
-        witness.set_hash_target(self.leaf_fingerprint, leaf_fingerprint.0)?;
 
-        witness.set_hash_target(
-            self.left_state_transition_start,
-            input.left_input.state_transition_start.0,
-        )?;
-        witness.set_hash_target(
-            self.left_state_transition_end,
-            input.left_input.state_transition_end.0,
-        )?;
-        witness.set_hash_target(
-            self.right_state_transition_start,
-            input.right_input.state_transition_start.0,
-        )?;
-        witness.set_hash_target(
-            self.right_state_transition_end,
-            input.right_input.state_transition_end.0,
-        )
+        let left_proofs_generated_total_f = F::from_noncanonical_u64(input.left_proofs_generated_total);
+        let right_proofs_generated_total_f = F::from_noncanonical_u64(input.right_proofs_generated_total);
+        //tracing::info!("set_witness: {}", serde_json::to_string(input).unwrap());
+        self.state_transition.set_witness(witness, &input.to_v1_input(), agg_fingerprint, leaf_fingerprint)?;
+
+        witness.set_hash_target(self.left_proving_rewards_tag_value, left_proving_rewards_tag_value.0)?;
+        witness.set_hash_target(self.right_proving_rewards_tag_value, right_proving_rewards_tag_value.0)?;
+        witness.set_hash_target(self.proving_rewards_tag, proving_rewards_tag.0)?;
+        witness.set_target(self.left_proofs_generated_total, left_proofs_generated_total_f)?;
+        witness.set_target(self.right_proofs_generated_total, right_proofs_generated_total_f)
     }
 }
 
 #[derive(Debug)]
 pub struct AggStateTransitionCircuitV2<C: GenericConfig<D>, const D: usize> {
     pub header_gadget: AggStateTrackableCircuitHeaderGadgetV2,
-    pub worker_public_key: HashOutTarget,
-    pub commitment: HashOutTarget,
-    pub pm_jobs_completed: [Target; 3],
 
     pub left_proof: ProofWithPublicInputsTarget<D>,
     pub left_verifier_data: VerifierCircuitTarget,
@@ -204,7 +196,6 @@ where
                 &mut builder,
             );
 
-        let worker_public_key = builder.add_virtual_hash();
 
         let left_proof = builder.add_virtual_proof_with_pis(child_common_data);
         let left_verifier_data = builder.add_virtual_verifier_data(verifier_cap_height);
@@ -212,121 +203,13 @@ where
         let right_proof = builder.add_virtual_proof_with_pis(child_common_data);
         let right_verifier_data = builder.add_virtual_verifier_data(verifier_cap_height);
 
-        let left_child_commitment = HashOutTarget {
-            elements: [
-                left_proof.public_inputs[0],
-                left_proof.public_inputs[1],
-                left_proof.public_inputs[2],
-                left_proof.public_inputs[3],
-            ],
-        };
-        let left_child_worker_public_key = HashOutTarget {
-            elements: [
-                left_proof.public_inputs[4],
-                left_proof.public_inputs[5],
-                left_proof.public_inputs[6],
-                left_proof.public_inputs[7],
-            ],
-        };
-        let left_child_pm_jobs_completed = [
-            left_proof.public_inputs[8],
-            left_proof.public_inputs[9],
-            left_proof.public_inputs[10]
-        ];
-        let left_child_allowed_circuit_hashes_root = HashOutTarget {
-            elements: [
-                left_proof.public_inputs[11],
-                left_proof.public_inputs[12],
-                left_proof.public_inputs[13],
-                left_proof.public_inputs[14],
-            ],
-        };
-        let left_child_transition_hash = HashOutTarget {
-            elements: [
-                left_proof.public_inputs[15],
-                left_proof.public_inputs[16],
-                left_proof.public_inputs[17],
-                left_proof.public_inputs[18],
-            ],
-        };
-
-        let right_child_commitment = HashOutTarget {
-            elements: [
-                right_proof.public_inputs[0],
-                right_proof.public_inputs[1],
-                right_proof.public_inputs[2],
-                right_proof.public_inputs[3],
-            ],
-        };
-        let right_child_worker_public_key = HashOutTarget {
-            elements: [
-                right_proof.public_inputs[4],
-                right_proof.public_inputs[5],
-                right_proof.public_inputs[6],
-                right_proof.public_inputs[7],
-            ],
-        };
-        let right_child_pm_jobs_completed = [
-            right_proof.public_inputs[8],
-            right_proof.public_inputs[9],
-            right_proof.public_inputs[10]
-        ];
-        let right_child_allowed_circuit_hashes_root = HashOutTarget {
-            elements: [
-                right_proof.public_inputs[11],
-                right_proof.public_inputs[12],
-                right_proof.public_inputs[13],
-                right_proof.public_inputs[14],
-            ],
-        };
-        let right_child_transition_hash = HashOutTarget {
-            elements: [
-                right_proof.public_inputs[15],
-                right_proof.public_inputs[16],
-                right_proof.public_inputs[17],
-                right_proof.public_inputs[18],
-            ],
-        };
-
-        let final_deploy_contracts = builder.add(left_child_pm_jobs_completed[0], right_child_pm_jobs_completed[0]);
-        let final_register_users = builder.add(left_child_pm_jobs_completed[1], right_child_pm_jobs_completed[1]);
-        let final_gutas = builder.add(left_child_pm_jobs_completed[2], right_child_pm_jobs_completed[2]);
-
-        let pm_jobs_completed = [final_deploy_contracts, final_register_users, final_gutas];
-        let left_final_commitment = builder.hash_two_to_one::<C::Hasher>(left_child_commitment, left_child_worker_public_key);
-        let right_final_commitment = builder.hash_two_to_one::<C::Hasher>(right_child_commitment, right_child_worker_public_key);
-        let commitment = builder.hash_two_to_one::<C::Hasher>(left_final_commitment, right_final_commitment);
-        builder.connect_hashes(
-            left_child_allowed_circuit_hashes_root,
-            header_gadget.allowed_circuit_hashes_root,
-        );
-        builder.connect_hashes(
-            right_child_allowed_circuit_hashes_root,
-            header_gadget.allowed_circuit_hashes_root,
-        );
-        builder.connect_hashes(
-            left_child_transition_hash,
-            header_gadget.expected_left_child_transition_hash,
-        );
-        builder.connect_hashes(
-            right_child_transition_hash,
-            header_gadget.expected_right_child_transition_hash,
-        );
-        /*
-        let x = builder.constant(C::F::ONE);
-        let y = builder.constant(C::F::ZERO);
-        let is_geq = builder.is_greater_than(32, x, y);
-        builder.connect(is_geq.target, x);*/
-        //builder.verify_proof::<C>(&left_proof, &left_verifier_data, &child_common_data);
-        //builder.verify_proof::<C>(&right_proof, &right_verifier_data, &child_common_data);
-
         builder.verify_proof_with_fingerprint_enum::<C>(
             &left_proof,
             &left_verifier_data,
             child_common_data,
             &[
-                header_gadget.agg_fingerprint,
-                header_gadget.leaf_fingerprint,
+                header_gadget.state_transition.agg_fingerprint,
+                header_gadget.state_transition.leaf_fingerprint,
             ],
         );
         builder.verify_proof_with_fingerprint_enum::<C>(
@@ -334,17 +217,12 @@ where
             &right_verifier_data,
             child_common_data,
             &[
-                header_gadget.agg_fingerprint,
-                header_gadget.leaf_fingerprint,
+                header_gadget.state_transition.agg_fingerprint,
+                header_gadget.state_transition.leaf_fingerprint,
             ],
         );
 
-        builder.register_public_inputs(&commitment.elements);
-        builder.register_public_inputs(&worker_public_key.elements);
-        builder.register_public_inputs(&pm_jobs_completed);
-        builder.register_public_inputs(&header_gadget.allowed_circuit_hashes_root.elements);
-        builder.register_public_inputs(&header_gadget.state_transition_hash.elements);
-
+        builder.register_public_inputs(&header_gadget.new_public_inputs_hash.elements);
         builder.add_qed_type_d_common_gates();
         let circuit_data = builder.build::<C>();
 
@@ -352,9 +230,6 @@ where
 
         Self {
             header_gadget,
-            worker_public_key,
-            commitment,
-            pm_jobs_completed,
             left_proof,
             left_verifier_data,
             right_proof,
@@ -369,21 +244,17 @@ where
         agg_verifier_data: &VerifierOnlyCircuitData<C, D>,
         leaf_fingerprint: QHashOut<C::F>,
         leaf_verifier_data: &VerifierOnlyCircuitData<C, D>,
-        worker_public_key: QHashOut<C::F>,
         left_proof: &ProofWithPublicInputs<C::F, C, D>,
         right_proof: &ProofWithPublicInputs<C::F, C, D>,
-        input: &AggStateTransitionInput<QHashOut<C::F>>,
+        input: &AggStateTransitionInputV2<QHashOut<C::F>>,
+        left_proving_rewards_tag_value: QHashOut<C::F>,
+        right_proving_rewards_tag_value: QHashOut<C::F>,
+        proving_rewards_tag: QHashOut<C::F>,
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
         let mut pw = PartialWitness::<C::F>::new();
-        pw.set_hash_target(self.worker_public_key, worker_public_key.0)?;
-        /*
-        println!("agg_fingerprint: {} ({:?})", agg_fingerprint.to_string(), agg_fingerprint);
-        println!("leaf_fingerprint: {} ({:?})", leaf_fingerprint.to_string(), leaf_fingerprint);
-        println!("left_proof_public_inputs: {:?}", left_proof.public_inputs);
-        println!("right_proof_public_inputs: {:?}", right_proof.public_inputs);
-        println!("agg_input: {:?}",input);*/
+        
         self.header_gadget
-            .set_witness(&mut pw, input, agg_fingerprint, leaf_fingerprint)?;
+            .set_witness(&mut pw, agg_fingerprint, leaf_fingerprint, input, left_proving_rewards_tag_value, right_proving_rewards_tag_value, proving_rewards_tag)?;
 
         pw.set_proof_with_pis_target(&self.left_proof, left_proof)?;
         pw.set_verifier_data_target(
@@ -425,82 +296,52 @@ impl<C: GenericConfig<D>, const D: usize> QStandardCircuit<C, D>
     }
 }
 
-impl<C: GenericConfig<D>, const D: usize> AggStateTransitionCircuitV2<C, D>
-where
-    C::Hasher:AlgebraicHasher<C::F>,
-{
-    pub fn prove_full_with_key(
-        &self,
-        agg_fingerprint: QHashOut<C::F>,
-        agg_verifier_data: &VerifierOnlyCircuitData<C, D>,
-        leaf_fingerprint: QHashOut<C::F>,
-        leaf_verifier_data: &VerifierOnlyCircuitData<C, D>,
-        worker_public_key: QHashOut<C::F>,
-        left_proof: &ProofWithPublicInputs<C::F, C, D>,
-        right_proof: &ProofWithPublicInputs<C::F, C, D>,
-        input: &AggStateTransitionInput<QHashOut<C::F>>,
-    ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
-        self.prove_base(
-            agg_fingerprint,
-            agg_verifier_data,
-            leaf_fingerprint,
-            leaf_verifier_data,
-            worker_public_key,
-            left_proof,
-            right_proof,
-            input,
-        )
-    }
-}
+
+
 
 
 #[async_trait]
 impl<
-        S: QProofStoreReaderAsync + Send + Sync,
         L: CircuitInfoLibrary<C, D> + Send + Sync,
         C: GenericConfig<D>,
         const D: usize,
-    > QStandardCircuitProvableWithProofStoreAndRefLibraryAsync<S, L, C, D>
+    > QStandardCircuitProvableWithRawProofsAndRefLibraryAsync<L, C, D>
     for AggStateTransitionCircuitV2<C, D>
 where
-    C::Hasher: AlgebraicHasher<C::F>
+    C::Hasher: AlgebraicHasher<C::F>, QHashOut<C::F>: Q256BitHash,
 {
-    async fn prove_with_proof_store_async(
+
+    async fn prove_with_raw_proofs_and_ref_library_async(
         &self,
-        store: &S,
         library: &L,
-        job_id: QProvingJobDataID,
-        worker_public_key: QHashOut<C::F>,
-    ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
-        let r: CircuitInputWithDependencies<AggStateTransitionInput<QHashOut<C::F>>, QProvingJobDataID> =
-            bincode::deserialize(&store.get_bytes_by_id(job_id.get_input_witness_id()).await?)
-                .map_err(|e| anyhow::anyhow!(e))?;
-        if r.dependencies.len() != 2 {
-            anyhow::bail!("invalid dependency count in two end guta input");
-        }
+        input: PsyWorkerGetProvingWorkWithChildProofsAPIResponse<QHashOut<C::F>, QProvingJobDataID>,
+        worker_reward_tag: QHashOut<C::F>,
+    ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>>{
 
-        let child_a_proof = store.get_proof_by_id(r.dependencies[0]).await?;
-        let child_b_proof = store.get_proof_by_id(r.dependencies[1]).await?;
-
-        let leaf_circuit_type = job_id.circuit_type.get_agg_leaf_circuit_type_or_err()?;
+        let leaf_circuit_type = input.base.job.job_id.circuit_type.get_agg_leaf_circuit_type_or_err()?;
 
         let agg_verifier_data = self.get_verifier_config_ref();
         let leaf_verifier_data = library.get_verifier_data(leaf_circuit_type)?;
 
-        let leaf_fingerprint = library.get_fingerprint(job_id.circuit_type.get_agg_leaf_circuit_type_or_err()?)?;
+        let leaf_fingerprint = library.get_fingerprint(input.base.job.job_id.circuit_type.get_agg_leaf_circuit_type_or_err()?)?;
         let agg_fingerprint = self.get_fingerprint();
 
-        let result = self.prove_base(
-            agg_fingerprint,
-            agg_verifier_data,
-            leaf_fingerprint,
-            &leaf_verifier_data,
-            worker_public_key,
-            &child_a_proof,
-            &child_b_proof,
-            &r.input
-        )?;
+        if input.input_proofs.len() != 2 {
+            anyhow::bail!("invalid child proof tag values count in two end guta input");
+        }
+        if input.base.child_proof_tag_values.len() != 2 {
+            anyhow::bail!("invalid child proof tag values count in two end guta input");
+        }
 
-        Ok(result)
+        let left_proof =  bincode::deserialize::<ProofWithPublicInputs<C::F, C, D>>(&input.input_proofs[0])?;
+        let right_proof = bincode::deserialize::<ProofWithPublicInputs<C::F, C, D>>(&input.input_proofs[1])?;
+
+        let left_proving_rewards_tag_value = input.base.child_proof_tag_values[0];
+        let right_proving_rewards_tag_value = input.base.child_proof_tag_values[1];
+
+
+        let witness = AggStateTransitionInputV2::<QHashOut<C::F>>::psy_ser_from_slice(&input.base.witness)?;
+        self.prove_base(agg_fingerprint, agg_verifier_data, leaf_fingerprint, &leaf_verifier_data, &left_proof, &right_proof, &witness, left_proving_rewards_tag_value, right_proving_rewards_tag_value, worker_reward_tag)
+
     }
 }
