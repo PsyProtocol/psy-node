@@ -113,8 +113,8 @@ impl AggStateTrackableCircuitHeaderGadgetV2 {
         worker_reward_tag: QHashOut<F>,
     ) -> anyhow::Result<()> {
 
-        let left_proofs_generated_total_f = F::from_noncanonical_u64(input.left_proofs_generated_total);
-        let right_proofs_generated_total_f = F::from_noncanonical_u64(input.right_proofs_generated_total);
+        let left_proofs_generated_total_f = F::from_noncanonical_u64(input.left_input.total_proofs_generated);
+        let right_proofs_generated_total_f = F::from_noncanonical_u64(input.right_input.total_proofs_generated);
         //tracing::info!("set_witness: {}", serde_json::to_string(input).unwrap());
         self.state_transition.set_witness(witness, &input.to_v1_input(), agg_fingerprint, leaf_fingerprint)?;
 
