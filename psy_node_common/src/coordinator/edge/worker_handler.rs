@@ -117,7 +117,7 @@ impl<
 
         let witness_bytes: Vec<u8> = self
             .temp_db
-            .get_tdb_proof_witness_bytes(&self.realm_identifier, unique_pending_id, work_item.job_id)
+            .get_tdb_proof_witness_bytes(&self.realm_identifier, unique_pending_id, work_item.job_id.get_input_witness_id())
             .await?;
 
         let children_reward_tree_values = {
@@ -298,7 +298,7 @@ impl<
             anyhow::bail!("Failed to set rewards tree value for job id");
         }
 
-        self.proof_store.put_proof_bytes_for_job_id(job_id, &proof_bytes).await?;
+        self.proof_store.put_proof_bytes_for_job_id(job_id.get_output_id(), &proof_bytes).await?;
 
         self.tag_tree_rewards_store
             .rewards_tag_tree_set_node_tag(unique_pending_id, metadata.get_reward_tree_node_key(), tag, reward_tree_value)

@@ -1,11 +1,11 @@
-use std::{fmt::Debug, marker::PhantomData};
+use std::{collections::HashMap, fmt::Debug, marker::PhantomData};
 
 use parth_core::{crypto::hash::{merkle_proof::{DeltaMerkleProofCore, MerkleProofCore, compute_root_merkle_proof_generic}, spiderman::SpidermanUpdateProof, traits::MerkleZeroHasher}, data::hash::merkle_node_key::SimpleMerkleNodeKey, utils::math::ceil_div_usize};
 
 #[derive(Debug, Clone)]
 pub struct SimpleMemoryMerkleRecorderStore<Hasher, Hash: Copy + PartialEq + Default> {
-    nodes: hashbrown::HashMap<SimpleMerkleNodeKey, Hash>,
-    updated_nodes: hashbrown::HashMap<SimpleMerkleNodeKey, Hash>,
+    nodes: HashMap<SimpleMerkleNodeKey, Hash>,
+    updated_nodes: HashMap<SimpleMerkleNodeKey, Hash>,
     height: u8,
     _hasher: PhantomData<Hasher>,
 }
@@ -15,13 +15,13 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + PartialEq + Default>
 {
     pub fn new(height: u8) -> Self {
         Self {
-            nodes: hashbrown::HashMap::new(),
-            updated_nodes: hashbrown::HashMap::new(),
+            nodes: HashMap::new(),
+            updated_nodes: HashMap::new(),
             height,
             _hasher: PhantomData::default(),
         }
     }
-    pub fn get_changes(&self) -> &hashbrown::HashMap<SimpleMerkleNodeKey, Hash> {
+    pub fn get_changes(&self) -> &HashMap<SimpleMerkleNodeKey, Hash> {
         &self.updated_nodes
     }
 

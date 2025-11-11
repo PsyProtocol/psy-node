@@ -285,6 +285,15 @@ impl<JobId: QJobIdBase + 'static, D: QTempDatabaseRawKVWriterBase + Sync> QTempD
         self.qtdb_raw_kv_put_many_values_tuple(&entries).await?;
         Ok(())
     }
+    async fn set_tdb_proof_witnesses_tuple_owned_raw(&self, rid: &QRealmIdentifier, unique_pending_id: u64, job_witnesses: Vec<(JobId, Vec<u8>)>) -> anyhow::Result<()> {
+        let mut entries = Vec::with_capacity(job_witnesses.len());
+        for (job_id, witness) in job_witnesses {
+            let key = tt_get_proof_witness_data_key_from_job(rid.realm_id, rid.realm_sub_id, unique_pending_id, &job_id);
+            entries.push((key.to_vec(), witness));
+        }
+        self.qtdb_raw_kv_put_many_values_tuple(&entries).await?;
+        Ok(())
+    }
 
 }
 #[async_trait]

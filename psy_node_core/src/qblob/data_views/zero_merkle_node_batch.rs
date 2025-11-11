@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 
 use parth_core::{
-    crypto::hash::{merkle_proof::{compute_root_merkle_proof_generic, DeltaMerkleProofCore}, traits::MerkleHasher},
+    crypto::hash::{merkle_proof::{DeltaMerkleProofCore, compute_root_merkle_proof_generic}, traits::MerkleHasher},
     data::hash::{
-        fast_node_serializer::QMS_FAST_SERIALIZER_ZERO_ID_NODE_SIZE, merkle_node_key::SimpleMerkleNodeKey, merkle_store_key::QMerkleStoreZeroIdNode,
+        fast_node_serializer::QMS_FAST_SERIALIZER_ZERO_ID_NODE_SIZE, merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}, merkle_store_key::QMerkleStoreZeroIdNode,
     },
     protocol::core_types::Q256BitHash,
 };
@@ -231,6 +231,18 @@ impl QBlobZeroMerkleNodeBatchDataView {
     }
 }
 
+
+pub fn create_ffs_merkle_nodes_zero_id_from_hash_map<Hash: Q256BitHash>(map: &HashMap<SimpleMerkleNodeKey, Hash>) -> Vec<u8> {
+    let mut buffer = Vec::with_capacity(QMS_FAST_SERIALIZER_ZERO_ID_NODE_SIZE * map.len());
+
+    for (key, hash) in map.iter() {
+        buffer.extend_from_slice(&SimpleMerkleNode{
+            key: *key,
+            value: *hash,
+        }.ffs_into_bytes());
+    }
+    buffer
+}
 #[derive(Clone)]
 pub struct QBlobZeroIdMerkleRecorder {
     map: HashMap<SimpleMerkleNodeKey, bool>,

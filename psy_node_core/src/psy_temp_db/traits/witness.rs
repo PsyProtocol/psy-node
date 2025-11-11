@@ -13,6 +13,7 @@ pub trait QTempDBProofWitnessReader<JobId: QJobIdBase> {
 pub trait QTempDBProofWitnessWriter<JobId: QJobIdBase> {
     async fn set_tdb_proof_witness<T: QProofWitnessSerializable>(&self, rid: &QRealmIdentifier, unique_pending_id: u64, job_id: JobId, witness: &T) -> anyhow::Result<()>;
     async fn set_tdb_proof_witnesses_tuple_owned<T: QProofWitnessSerializable>(&self, rid: &QRealmIdentifier, unique_pending_id: u64, job_witnesses: &[(JobId, T)]) -> anyhow::Result<()>;
+    async fn set_tdb_proof_witnesses_tuple_owned_raw(&self, rid: &QRealmIdentifier, unique_pending_id: u64, job_witnesses: Vec<(JobId, Vec<u8>)>) -> anyhow::Result<()>;
 }
 
 pub trait QTempDBProofWitnessStore<JobId: QJobIdBase>: QTempDBProofWitnessReader<JobId> + QTempDBProofWitnessWriter<JobId> {}
