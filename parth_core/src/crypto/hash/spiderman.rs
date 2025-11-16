@@ -60,6 +60,29 @@ pub struct SpidermanUpdateProof<Hash> {
 }
 
 impl<Hash: PartialEq + Copy + ZeroableHash> SpidermanUpdateProof<Hash> {
+    pub fn get_non_zero_leaves_count(&self) -> usize {
+        let mut count = 0;
+        for leaf in &self.web_proof_new_leaves {
+            if *leaf != Hash::get_zero_value() {
+                count += 1;
+            } else {
+                break;
+            }
+        }
+        count
+    }
+    pub fn get_existing_prepended_leaves_count(&self) -> usize {
+        let mut count = 0;
+
+        while count < self.web_proof_old_leaves.len() && count < self.web_proof_new_leaves.len() {
+            if self.web_proof_old_leaves[count] == self.web_proof_new_leaves[count] && self.web_proof_old_leaves[count] != Hash::get_zero_value() {
+                count += 1;
+            } else {
+                break;
+            }
+        }
+        count
+    }
     pub fn append_from_from_old_new_values<H: MerkleHasher<Hash>>(
         old_proof_to_inside: &MerkleProofCore<Hash>,
         existing_leaves: &[Hash],

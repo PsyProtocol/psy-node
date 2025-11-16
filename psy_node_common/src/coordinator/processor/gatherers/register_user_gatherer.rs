@@ -121,12 +121,13 @@ pub async fn read_register_user_gatherer_backup_file<Hasher: MerkleZeroHasher<Ha
 
     let end_root = tree.get_root();
     let next_user_id = start_next_user_id + expected_count;
-    let mut update_user_registration_tree_nodes_ffs = Vec::with_capacity(tree.get_changes().len());
+    let mut update_user_registration_tree_nodes_ffs = Vec::with_capacity(tree.get_changes().len() * PSY_OBJECT_FFS_SIZE_SIMPLE_MERKLE_NODE);
 
     for (key, hash) in tree.get_changes().iter() {
         let node = SimpleMerkleNode { key: *key, value: *hash };
         node.pio_write_to_io(&mut update_user_registration_tree_nodes_ffs)?;
     }
+    tree.commit_changes();
     let output_db = RegisterUserGathererOutputDatabase {
         start_next_user_id,
         start_user_registration_tree_hash: start_root_hash,
@@ -252,6 +253,7 @@ impl<
         Ok(())
     }
     async fn finalize_with_tree(mut self, tree: &mut SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>) -> anyhow::Result<Self::Output> {
+        // ensure the new user public keys file is flushed to disk
         self.new_user_public_keys_file.flush().await?;
 
         let start_state_root = tree.get_root();
@@ -341,7 +343,7 @@ impl<Hash: Q256BitHash>
         QProvingJobDataID::new_proof_job_id(
             unique_checkpoint_id,
             node_key.level as u32,
-            ProvingJobCircuitType::DummyAppendUserRegistrationTreeAggregate,
+            ProvingJobCircuitType::AppendUserRegistrationTreeAggregate,
             0,
             node_key.index as u32,
         )
@@ -439,4 +441,649 @@ impl<Hash: Q256BitHash>
             right_proof_is_leaf: false,
         }
     }
+}
+
+
+
+#[cfg(test)]
+mod tests {
+    use parth_common::memory_stores::mem_tree_recorder::SimpleMemoryMerkleRecorderStore;
+    use parth_core::{crypto::hash::spiderman, pgoldilocks::PoseidonHasher, utils::QPGenRandom};
+    use psy_core::job::job_id::QProvingJobDataID;
+    use psy_data::gatherer_builders::register_user;
+    use super::*;
+
+    #[test]
+    fn test_fake_agg() -> anyhow::Result<()> {
+        type Hash = parth_core::PHash;
+        type F = parth_core::PF;
+        type JobId = QProvingJobDataID;
+        type Hasher = PoseidonHasher;
+        
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
+        let random_leaves = Hash::qp_rand_gen_vec(17);
+        let register_users_circuit_whitelist = Hash::qp_rand_gen();
+        let start_root= tree.get_root();
+        let spider_map_proofs = tree.append_leaves_spider_man(2, &random_leaves)?;
+        println!("Spiderman proofs len: {}", spider_map_proofs.len());
+
+
+        let spider_man_groups=spider_map_proofs
+                .chunks(2)
+                .map(|chunk| QCAppendUserRegistrationTreeCircuitInput {
+                    register_users_circuit_whitelist: register_users_circuit_whitelist,
+                    spiderman_append_proofs: chunk.to_vec(),
+                })
+                .collect::<Vec<_>>();
+        println!("spiderman groups len: {}", spider_man_groups.len());
+
+        let unique_pending_id = 1337u64;
+         let (jobs_for_queue, witneses) = plan_jobs_for_tree_agg::<
+            JobId,
+            F,
+            Hash,
+            Hasher,
+            QCAppendUserRegistrationTreeCircuitInput<Hash>,
+            AggRegisterUserHelper,
+        >(
+            unique_pending_id,
+            start_root,
+            register_users_circuit_whitelist,
+            &spider_man_groups,
+        )?;
+        println!("Jobs for queue len: {}", jobs_for_queue.len());
+        for row in jobs_for_queue.iter() {
+            for job in row.iter() {
+                println!("Job id: {:?}", job.job_id);
+                println!("Metadata: {:?}", job.metadata);
+            }
+        }
+
+
+
+        
+
+
+
+
+
+
+        Ok(())
+
+    }
+}
+
+
+/*
+
+
+
+
+running 1 test
+Spiderman proofs len: 5
+spiderman groups len: 3
+Jobs for queue len: 3
+Job id: QProvingJobDataID { topic: GenerateStandardProof, goal_id: 1337, circuit_type: AppendUserRegistrationTree, group_id: 2, sub_group_id: 0, task_index: 0, data_type: InputWitness, data_index: 0 }
+Metadata: PsyProvingJobMetadata { expected_public_inputs_hash: QHashOut(HashOut { elements: [12390451264743676018, 8304973432661659895, 3781840995643076068, 10132581250177410994] }), reward_tree_node_index: 0, reward_tree_node_level: 2, reward_tree_hash_mode: 1, reward_tree_node_children: 0, dependencies: [] }
+Job id: QProvingJobDataID { topic: GenerateStandardProof, goal_id: 1337, circuit_type: AppendUserRegistrationTree, group_id: 2, sub_group_id: 0, task_index: 1, data_type: InputWitness, data_index: 0 }
+Metadata: PsyProvingJobMetadata { expected_public_inputs_hash: QHashOut(HashOut { elements: [10334449205758273826, 12066373173403079634, 1053597563067968013, 6237065607049177422] }), reward_tree_node_index: 1, reward_tree_node_level: 2, reward_tree_hash_mode: 1, reward_tree_node_children: 0, dependencies: [] }
+Job id: QProvingJobDataID { topic: GenerateStandardProof, goal_id: 1337, circuit_type: DummyAppendUserRegistrationTreeAggregate, group_id: 1, sub_group_id: 0, task_index: 0, data_type: InputWitness, data_index: 0 }
+Metadata: PsyProvingJobMetadata { expected_public_inputs_hash: QHashOut(HashOut { elements: [7095128601763881389, 14640763668863926621, 6914635675784815755, 6508350705276371674] }), reward_tree_node_index: 0, reward_tree_node_level: 1, reward_tree_hash_mode: 0, reward_tree_node_children: 2, dependencies: [QProvingJobDataID { topic: GenerateStandardProof, goal_id: 1337, circuit_type: AppendUserRegistrationTree, group_id: 2, sub_group_id: 0, task_index: 0, data_type: InputWitness, data_index: 0 }, QProvingJobDataID { topic: GenerateStandardProof, goal_id: 1337, circuit_type: AppendUserRegistrationTree, group_id: 2, sub_group_id: 0, task_index: 1, data_type: InputWitness, data_index: 0 }] }
+Job id: QProvingJobDataID { topic: GenerateStandardProof, goal_id: 1337, circuit_type: AppendUserRegistrationTree, group_id: 1, sub_group_id: 0, task_index: 1, data_type: InputWitness, data_index: 0 }
+Metadata: PsyProvingJobMetadata { expected_public_inputs_hash: QHashOut(HashOut { elements: [1297856571266094013, 6684537187575756546, 15809828805894705281, 15948219461984833794] }), reward_tree_node_index: 1, reward_tree_node_level: 1, reward_tree_hash_mode: 1, reward_tree_node_children: 0, dependencies: [] }
+Job id: QProvingJobDataID { topic: GenerateStandardProof, goal_id: 1337, circuit_type: DummyAppendUserRegistrationTreeAggregate, group_id: 0, sub_group_id: 0, task_index: 0, data_type: InputWitness, data_index: 0 }
+Metadata: PsyProvingJobMetadata { expected_public_inputs_hash: QHashOut(HashOut { elements: [17884585634982125226, 6187098926797097119, 3004161071059206768, 6204218450729565222] }), reward_tree_node_index: 0, reward_tree_node_level: 0, reward_tree_hash_mode: 0, reward_tree_node_children: 2, dependencies: [QProvingJobDataID { topic: GenerateStandardProof, goal_id: 1337, circuit_type: DummyAppendUserRegistrationTreeAggregate, group_id: 1, sub_group_id: 0, task_index: 0, data_type: InputWitness, data_index: 0 }, QProvingJobDataID { topic: GenerateStandardProof, goal_id: 1337, circuit_type: AppendUserRegistrationTree, group_id: 1, sub_group_id: 0, task_index: 1, data_type: InputWitness, data_index: 0 }] }
+test coordinator::processor::gatherers::register_user_gatherer::tests::test_fake_agg ... ok
+
+
+
+*/
+#[cfg(test)]
+mod tests3 {
+    use super::*;
+    use anyhow::{anyhow, Result};
+    use parth_common::memory_stores::mem_tree_recorder::SimpleMemoryMerkleRecorderStore;
+    use parth_core::{crypto::hash::spiderman, pgoldilocks::PoseidonHasher, utils::QPGenRandom};
+    use parth_core::PF;
+    use parth_core::PHash;
+    use psy_core::job::job_id::QProvingJobDataID;
+    use psy_data::agg::tree_agg_v2::{ plan_jobs_for_tree_agg};
+    use psy_data::protocol::circuit_inputs::append_user_registration_tree::QCAppendUserRegistrationTreeCircuitInput;
+    use psy_data::worker::metadata::{PROOF_REWARD_TREE_HASH_MODE_HASH_CHILDREN_STANDARD, PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN};
+    use std::collections::{HashMap, HashSet};
+
+    fn validate_tree_structure(layers: &Vec<Vec<PsyProvingJobMetadataWithJobId<PHash, QProvingJobDataID>>>, expected_num_leaves: usize, unique_id: u64) -> Result<()> {
+        let mut key_to_info: HashMap<SimpleMerkleNodeKey, (QProvingJobDataID, u8, u16, Vec<QProvingJobDataID>)> = HashMap::new();
+        let mut leaf_count = 0;
+
+        for layer in layers {
+            for item in layer {
+                let key = SimpleMerkleNodeKey {
+                    level: item.metadata.reward_tree_node_level,
+                    index: item.metadata.reward_tree_node_index,
+                };
+                let hash_mode = item.metadata.reward_tree_hash_mode;
+                let num_children = item.metadata.reward_tree_node_children;
+                let deps = item.metadata.dependencies.clone();
+                key_to_info.insert(key, (item.job_id, hash_mode, num_children, deps));
+
+                if hash_mode == PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN {
+                    leaf_count += 1;
+                }
+            }
+        }
+
+        assert_eq!(leaf_count, expected_num_leaves);
+
+        let root_key = SimpleMerkleNodeKey { level: 0, index: 0 };
+        let mut visited: HashSet<SimpleMerkleNodeKey> = HashSet::new();
+
+        fn recurse(
+            key: SimpleMerkleNodeKey,
+            key_to_info: &HashMap<SimpleMerkleNodeKey, (QProvingJobDataID, u8, u16, Vec<QProvingJobDataID>)>,
+            visited: &mut HashSet<SimpleMerkleNodeKey>,
+            unique_id: u64,
+        ) -> Result<()> {
+            if !visited.insert(key) {
+                return Err(anyhow!("Duplicate visit to key {:?}", key));
+            }
+
+            let Some(&(job_id, hash_mode, num_children, ref deps)) = key_to_info.get(&key) else {
+                return Err(anyhow!("Missing key {:?}", key));
+            };
+
+            if hash_mode == PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN {
+                assert_eq!(num_children, 0);
+                assert_eq!(deps.len(), 0);
+                assert_eq!(job_id, <AggRegisterUserHelper as BasicTreePlannerHelper<QProvingJobDataID, PHash, QCAppendUserRegistrationTreeCircuitInput<PHash>, AggStateTransitionInputV2<PHash>, DummyAggStateTransition<PHash>>>::get_leaf_job_id(unique_id, key));
+            } else if hash_mode == PROOF_REWARD_TREE_HASH_MODE_HASH_CHILDREN_STANDARD {
+                assert_eq!(num_children, 2);
+                assert_eq!(deps.len(), 2);
+                assert_eq!(job_id, <AggRegisterUserHelper as BasicTreePlannerHelper<QProvingJobDataID, PHash, QCAppendUserRegistrationTreeCircuitInput<PHash>, AggStateTransitionInputV2<PHash>, DummyAggStateTransition<PHash>>>::get_agg_job_id(unique_id, key));
+
+                let left_key = SimpleMerkleNodeKey {
+                    level: key.level + 1,
+                    index: key.index * 2,
+                };
+                let right_key = SimpleMerkleNodeKey {
+                    level: key.level + 1,
+                    index: key.index * 2 + 1,
+                };
+
+                let left_info = key_to_info.get(&left_key).ok_or(anyhow!("Missing left child {:?}", left_key))?;
+                let right_info = key_to_info.get(&right_key).ok_or(anyhow!("Missing right child {:?}", right_key))?;
+
+                assert_eq!(deps[0], left_info.0);
+                assert_eq!(deps[1], right_info.0);
+
+                recurse(left_key, key_to_info, visited, unique_id)?;
+                recurse(right_key, key_to_info, visited, unique_id)?;
+            } else {
+                return Err(anyhow!("Unknown hash_mode {} for key {:?}", hash_mode, key));
+            }
+
+            Ok(())
+        }
+
+        recurse(root_key, &key_to_info, &mut visited, unique_id)?;
+
+        assert_eq!(visited.len(), key_to_info.len(), "Not all nodes were visited");
+
+        Ok(())
+    }
+
+    fn setup_and_plan_jobs(num_groups: usize) -> Result<Vec<Vec<PsyProvingJobMetadataWithJobId<PHash, QProvingJobDataID>>>> {
+        let mut tree = SimpleMemoryMerkleRecorderStore::<PoseidonHasher, PHash>::new(32);
+        let height = 0u8; // Use height=0 for single-leaf subtrees to control the number of proofs exactly
+        let num_raw_leaves = num_groups;
+        let random_leaves = PHash::qp_rand_gen_vec(num_raw_leaves);
+        let spider_map_proofs = tree.append_leaves_spider_man(height, &random_leaves)?;
+        assert_eq!(spider_map_proofs.len(), num_groups);
+
+        let whitelist = PHash::qp_rand_gen();
+        let spider_man_groups: Vec<QCAppendUserRegistrationTreeCircuitInput<PHash>> = spider_map_proofs
+            .into_iter()
+            .map(|proof| QCAppendUserRegistrationTreeCircuitInput {
+                register_users_circuit_whitelist: whitelist,
+                spiderman_append_proofs: vec![proof],
+            })
+            .collect();
+        assert_eq!(spider_man_groups.len(), num_groups);
+
+        let unique_checkpoint_id = 1337u64;
+        let start_tree_root = tree.get_root();
+        let (layers, _witnesses) = plan_jobs_for_tree_agg::<
+            QProvingJobDataID,
+            PF,
+            PHash,
+            PoseidonHasher,
+            QCAppendUserRegistrationTreeCircuitInput<PHash>,
+            AggRegisterUserHelper,
+        >(unique_checkpoint_id, start_tree_root, whitelist, &spider_man_groups)?;
+
+        Ok(layers)
+    }
+
+    #[test]
+    fn test_tree_agg_num_leaves_0() -> Result<()> {
+        let unique_id = 1337u64;
+        let start_root = PHash::qp_rand_gen();
+        let allowed = PHash::qp_rand_gen();
+        let leaves: &[QCAppendUserRegistrationTreeCircuitInput<PHash>] = &[];
+        let (layers, _witnesses) = plan_jobs_for_tree_agg::<
+            QProvingJobDataID,
+            PF,
+            PHash,
+            PoseidonHasher,
+            QCAppendUserRegistrationTreeCircuitInput<PHash>,
+            AggRegisterUserHelper,
+        >(unique_id, start_root, allowed, leaves)?;
+
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].len(), 1);
+        let item = &layers[0][0];
+        assert_eq!(item.job_id, <AggRegisterUserHelper as BasicTreePlannerHelper<QProvingJobDataID, PHash, QCAppendUserRegistrationTreeCircuitInput<PHash>, AggStateTransitionInputV2<PHash>, DummyAggStateTransition<PHash>>>::get_dummy_job_id(unique_id));
+        assert_eq!(item.metadata.reward_tree_node_level, 0);
+        assert_eq!(item.metadata.reward_tree_node_index, 0);
+        assert_eq!(item.metadata.reward_tree_hash_mode, PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN);
+        assert_eq!(item.metadata.reward_tree_node_children, 0);
+        assert_eq!(item.metadata.dependencies.len(), 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_tree_agg_num_leaves_1() -> Result<()> {
+        let layers = setup_and_plan_jobs(1)?;
+        validate_tree_structure(&layers, 1, 1337)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_tree_agg_num_leaves_2() -> Result<()> {
+        let layers = setup_and_plan_jobs(2)?;
+        validate_tree_structure(&layers, 2, 1337)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_tree_agg_num_leaves_3() -> Result<()> {
+        let layers = setup_and_plan_jobs(3)?;
+        validate_tree_structure(&layers, 3, 1337)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_tree_agg_num_leaves_4() -> Result<()> {
+        let layers = setup_and_plan_jobs(4)?;
+        validate_tree_structure(&layers, 4, 1337)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_tree_agg_num_leaves_5() -> Result<()> {
+        let layers = setup_and_plan_jobs(5)?;
+        validate_tree_structure(&layers, 5, 1337)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_tree_agg_num_leaves_6() -> Result<()> {
+        let layers = setup_and_plan_jobs(6)?;
+        validate_tree_structure(&layers, 6, 1337)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_tree_agg_num_leaves_7() -> Result<()> {
+        let layers = setup_and_plan_jobs(7)?;
+        validate_tree_structure(&layers, 7, 1337)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_tree_agg_num_leaves_8() -> Result<()> {
+        let layers = setup_and_plan_jobs(8)?;
+        validate_tree_structure(&layers, 8, 1337)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_tree_agg_large() -> Result<()> {
+        let layers = setup_and_plan_jobs(100)?;
+        validate_tree_structure(&layers, 100, 1337)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_fake_agg() -> anyhow::Result<()> {
+        type Hash = parth_core::PHash;
+        type F = parth_core::PF;
+        type JobId = QProvingJobDataID;
+        type Hasher = PoseidonHasher;
+        
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
+        let random_leaves = Hash::qp_rand_gen_vec(17);
+        let allowed_circuit_hashes_root = Hash::qp_rand_gen();
+        let start_root= tree.get_root();
+        let spider_map_proofs = tree.append_leaves_spider_man(2, &random_leaves)?;
+        println!("Spiderman proofs len: {}", spider_map_proofs.len());
+
+
+        let spider_man_groups=spider_map_proofs
+                .chunks(2)
+                .map(|chunk| QCAppendUserRegistrationTreeCircuitInput {
+                    register_users_circuit_whitelist: allowed_circuit_hashes_root,
+                    spiderman_append_proofs: chunk.to_vec(),
+                })
+                .collect::<Vec<_>>();
+        println!("spiderman groups len: {}", spider_man_groups.len());
+
+        let unique_pending_id = 1337u64;
+         let (jobs_for_queue, _witneses) = plan_jobs_for_tree_agg::<
+            JobId,
+            F,
+            Hash,
+            Hasher,
+            QCAppendUserRegistrationTreeCircuitInput<Hash>,
+            AggRegisterUserHelper,
+        >(
+            unique_pending_id,
+            start_root,
+            allowed_circuit_hashes_root,
+            &spider_man_groups,
+        )?;
+        println!("Jobs for queue len: {}", jobs_for_queue.len());
+        for row in jobs_for_queue.iter() {
+            for job in row.iter() {
+                println!("Job id: {:?}", job.job_id);
+                println!("Metadata: {:?}", job.metadata);
+            }
+        }
+
+        validate_tree_structure(&jobs_for_queue, spider_man_groups.len(), unique_pending_id)?;
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests2 {
+    use super::*;
+    use parth_core::{
+        crypto::hash::{spiderman::SpidermanUpdateProof, traits::MerkleZeroHasher, }, data::hash::merkle_node_key::SimpleMerkleNodeKey, felt::QFelt64, pgoldilocks::PoseidonHasher, protocol::core_types::{Q256BitHash, QFHashBase}, utils::QPGenRandom
+    };
+    use parth_common::memory_stores::mem_tree_recorder::SimpleMemoryMerkleRecorderStore;
+    use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
+    use psy_data::{agg::{
+        AggStateTransitionInputV2, DummyAggStateTransition, tree_agg_v2::{BasicTreePlannerHelper, plan_jobs_for_tree_agg}
+    }, worker::metadata::{PROOF_REWARD_TREE_HASH_MODE_HASH_CHILDREN_STANDARD, PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN}};
+    use psy_serialize::PsySerializeCanonicalAsyncSafe;
+
+    use anyhow::{anyhow, Result};
+fn compute_max_level(mut num: usize) -> u8 {
+    let mut h = 0u8;
+    while num > 1 {
+        num = (num + 1) / 2;
+        h += 1;
+    }
+    h
+}
+    type F = parth_core::PF; // Assuming QFelt64 is defined elsewhere, e.g., as u64 or a field element
+    type Hash = parth_core::PHash; // Assuming PHash is a 256-bit hash
+    type Hasher = PoseidonHasher; // Using PoseidonHasher as the FieldQHasher
+    type JobId = QProvingJobDataID;
+    type LeafWitness = QCAppendUserRegistrationTreeCircuitInput<Hash>;
+
+    // Helper function to generate dummy leaf witnesses
+    fn generate_dummy_leaves(num_leaves: usize, whitelist: Hash) -> Vec<LeafWitness> {
+        (0..num_leaves)
+            .map(|_| LeafWitness {
+                register_users_circuit_whitelist: whitelist,
+                spiderman_append_proofs: QPGenRandom::qp_rand_gen_vec(3), // Empty for dummy
+            })
+            .collect()
+    }
+
+    // Helper function to validate the tree structure programmatically
+    fn validate_tree_structure(
+        layers: &[Vec<PsyProvingJobMetadataWithJobId<Hash, JobId>>],
+        max_level: u8,
+        num_leaves: usize,
+    ) -> Result<()> {
+        // layers[0] is the leaves (highest level), layers[last] is the root (level 0)
+        if layers.len() != (max_level as usize) + 1 {
+            return Err(anyhow!("Incorrect number of layers: expected {}, got {}", max_level + 1, layers.len()));
+        }
+
+        // Check leaf layer
+        let leaf_layer = &layers[0];
+        if leaf_layer.len() != num_leaves {
+            return Err(anyhow!("Incorrect number of leaves: expected {}, got {}", num_leaves, leaf_layer.len()));
+        }
+        for (i, job) in leaf_layer.iter().enumerate() {
+            let expected_key = SimpleMerkleNodeKey {
+                level: max_level,
+                index: i as u64,
+            };
+            if job.metadata.reward_tree_node_level != max_level {
+                return Err(anyhow!("Leaf level mismatch: expected {}, got {}", max_level, job.metadata.reward_tree_node_level));
+            }
+            if job.metadata.reward_tree_node_index != i as u64 {
+                return Err(anyhow!("Leaf index mismatch: expected {}, got {}", i, job.metadata.reward_tree_node_index));
+            }
+            if job.metadata.reward_tree_hash_mode != PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN {
+                return Err(anyhow!("Leaf hash mode incorrect"));
+            }
+            if !job.metadata.dependencies.is_empty() {
+                return Err(anyhow!("Leaf should have no dependencies"));
+            }
+            // Check job_id is leaf type
+            if job.job_id.circuit_type != ProvingJobCircuitType::AppendUserRegistrationTree {
+                return Err(anyhow!("Incorrect circuit type for leaf"));
+            }
+            if job.job_id.group_id != max_level as u32 {
+                return Err(anyhow!("Job level mismatch for leaf"));
+            }
+            if job.job_id.task_index != i as u32 {
+                return Err(anyhow!("Job index mismatch for leaf"));
+            }
+        }
+
+        // Check intermediate layers up to root
+        for layer_idx in 1..layers.len() {
+            let current_level = (max_level as usize - layer_idx) as u8;
+            let current_layer = &layers[layer_idx];
+            let child_layer = &layers[layer_idx - 1];
+
+            // Expected number of nodes: ceil(child_layer.len() / 2)
+            let expected_nodes = (child_layer.len() + 1) / 2;
+            if current_layer.len() != expected_nodes {
+                return Err(anyhow!("Incorrect number of nodes at level {}: expected {}, got {}", current_level, expected_nodes, current_layer.len()));
+            }
+
+            for (i, job) in current_layer.iter().enumerate() {
+                let expected_key = SimpleMerkleNodeKey {
+                    level: current_level,
+                    index: i as u64,
+                };
+                if job.metadata.reward_tree_node_level != current_level {
+                    return Err(anyhow!("Level mismatch: expected {}, got {}", current_level, job.metadata.reward_tree_node_level));
+                }
+                if job.metadata.reward_tree_node_index != i as u64 {
+                    return Err(anyhow!("Index mismatch: expected {}, got {}", i, job.metadata.reward_tree_node_index));
+                }
+                if job.metadata.reward_tree_hash_mode != PROOF_REWARD_TREE_HASH_MODE_HASH_CHILDREN_STANDARD {
+                    return Err(anyhow!("Agg hash mode incorrect"));
+                }
+
+                // Check dependencies: should be 1 or 2 children
+                let left_child_idx = 2 * i;
+                let right_child_idx = left_child_idx + 1;
+                if left_child_idx >= child_layer.len() {
+                    return Err(anyhow!("Missing left child for node at level {}, index {}", current_level, i));
+                }
+                let left_child = &child_layer[left_child_idx];
+                let has_right = right_child_idx < child_layer.len();
+                if has_right {
+                    let right_child = &child_layer[right_child_idx];
+                    if job.metadata.dependencies != vec![left_child.job_id, right_child.job_id] {
+                        return Err(anyhow!("Dependency mismatch for node at level {}, index {}", current_level, i));
+                    }
+                    if job.metadata.reward_tree_node_children != 2 {
+                        return Err(anyhow!("Num children mismatch: expected 2, got {}", job.metadata.reward_tree_node_children));
+                    }
+                } else {
+                    if job.metadata.dependencies != vec![left_child.job_id] {
+                        return Err(anyhow!("Dependency mismatch for unbalanced node at level {}, index {}", current_level, i));
+                    }
+                    if job.metadata.reward_tree_node_children != 1 {
+                        return Err(anyhow!("Num children mismatch: expected 1, got {}", job.metadata.reward_tree_node_children));
+                    }
+                }
+
+                // Check job_id is agg type
+                if job.job_id.circuit_type != ProvingJobCircuitType::AppendUserRegistrationTreeAggregate {
+                    return Err(anyhow!("Incorrect circuit type for agg"));
+                }
+                if job.job_id.group_id != current_level as u32 {
+                    return Err(anyhow!("Job level mismatch for agg"));
+                }
+                if job.job_id.task_index != i as u32 {
+                    return Err(anyhow!("Job index mismatch for agg"));
+                }
+            }
+        }
+
+        // Root should be at last layer, single node
+        let root_layer = &layers[layers.len() - 1];
+        if root_layer.len() != 1 {
+            return Err(anyhow!("Root layer should have exactly 1 node"));
+        }
+        if root_layer[0].metadata.reward_tree_node_level != 0 {
+            return Err(anyhow!("Root level should be 0"));
+        }
+        if root_layer[0].metadata.reward_tree_node_index != 0 {
+            return Err(anyhow!("Root index should be 0"));
+        }
+
+        Ok(())
+    }
+
+    // Test for specific leaf counts
+    fn test_tree_agg_for_num_leaves(num_leaves: usize) -> anyhow::Result<()> {
+        let whitelist = Hash::qp_rand_gen();
+        let start_root = Hash::qp_rand_gen();
+        let unique_id = 1337u64;
+        let leaves = generate_dummy_leaves(num_leaves, whitelist);
+
+        let (layers, witnesses) = plan_jobs_for_tree_agg::<
+            JobId,
+            F,
+            Hash,
+            Hasher,
+            LeafWitness,
+            AggRegisterUserHelper,
+        >(unique_id, start_root, whitelist, &leaves)?;
+
+        let max_level = compute_max_level(num_leaves);
+        assert_eq!(layers.len(), (max_level as usize) + 1);
+
+        // Validate witnesses count
+        if witnesses.len() != layers.iter().map(|l| l.len()).sum::<usize>() {
+            return Err(anyhow!("Witness count mismatch: expected {}, got {}", layers.iter().map(|l| l.len()).sum::<usize>(), witnesses.len()));
+        }
+
+        // Programmatic validation
+        validate_tree_structure(&layers, max_level, num_leaves)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_tree_agg_1_leaf() -> anyhow::Result<()> {
+        test_tree_agg_for_num_leaves(1)
+    }
+
+    #[test]
+    fn test_tree_agg_2_leaves() -> anyhow::Result<()> {
+        test_tree_agg_for_num_leaves(2)
+    }
+
+    #[test]
+    fn test_tree_agg_3_leaves() -> anyhow::Result<()> {
+        test_tree_agg_for_num_leaves(3)
+    }
+
+    #[test]
+    fn test_tree_agg_4_leaves() -> anyhow::Result<()> {
+        test_tree_agg_for_num_leaves(4)
+    }
+
+    #[test]
+    fn test_tree_agg_5_leaves() -> anyhow::Result<()> {
+        test_tree_agg_for_num_leaves(5)
+    }
+
+    #[test]
+    fn test_tree_agg_6_leaves() -> anyhow::Result<()> {
+        test_tree_agg_for_num_leaves(6)
+    }
+
+    #[test]
+    fn test_tree_agg_7_leaves() -> anyhow::Result<()> {
+        test_tree_agg_for_num_leaves(7)
+    }
+
+    #[test]
+    fn test_tree_agg_8_leaves() -> anyhow::Result<()> {
+        test_tree_agg_for_num_leaves(8)
+    }
+
+    #[test]
+    fn test_tree_agg_large() -> anyhow::Result<()> {
+        // Test with a larger tree, e.g., 17 as in the original
+        test_tree_agg_for_num_leaves(17)?;
+
+        // Even larger, say 100
+        test_tree_agg_for_num_leaves(100)?;
+
+        // Power of 2 - 1
+        test_tree_agg_for_num_leaves(15)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_tree_agg_0_leaves() -> anyhow::Result<()> {
+        let whitelist = Hash::qp_rand_gen();
+        let start_root = Hash::qp_rand_gen();
+        let unique_id = 1337u64;
+        let leaves: Vec<LeafWitness> = vec![];
+
+        let (layers, witnesses) = plan_jobs_for_tree_agg::<
+            JobId,
+            F,
+            Hash,
+            Hasher,
+            LeafWitness,
+            AggRegisterUserHelper,
+        >(unique_id, start_root, whitelist, &leaves)?;
+
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].len(), 1);
+        let job = &layers[0][0];
+        assert_eq!(job.metadata.reward_tree_node_level, 0);
+        assert_eq!(job.metadata.reward_tree_node_index, 0);
+        assert_eq!(job.metadata.reward_tree_hash_mode, PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN);
+        assert_eq!(job.metadata.reward_tree_node_children, 0);
+        assert!(job.metadata.dependencies.is_empty());
+        assert_eq!(job.job_id.circuit_type, ProvingJobCircuitType::DummyAppendUserRegistrationTreeAggregate);
+        assert_eq!(witnesses.len(), 1);
+
+        Ok(())
+    }
+
+    // Additional test for expected public inputs hash, etc., if needed
+    // But focusing on structure as per the task
 }

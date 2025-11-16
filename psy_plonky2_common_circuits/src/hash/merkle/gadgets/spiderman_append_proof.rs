@@ -43,6 +43,31 @@ impl SpidermanAppendProofGadget {
             new_root,
         }
     }
+    // TODO: is this correctly implemented? I added this so we don't need to fetch old contract leaves for the is added checks
+    pub fn add_virtual_to_allow_existing<H:AlgebraicHasher<F>, F: RichField + Extendable<D>, const D: usize>(
+        builder: &mut CircuitBuilder<F, D>,
+        top_line_height: usize,
+        web_tree_height: usize,
+    ) -> Self {
+
+        let top_line_proof = DeltaMerkleProofGadget::add_virtual_to::<H, F, D>(builder, top_line_height);
+        let web_proof = FullMerkleTreeAppendGadget::add_virtual_to_allow_existing_leaves_prefix::<H, F, D>(builder, web_tree_height);
+        
+        // connect the node at the bottom of the top line to the root of the subtree
+        builder.connect_hashes(top_line_proof.old_value, web_proof.old_root);
+        builder.connect_hashes(top_line_proof.new_value, web_proof.new_root);
+
+
+        let old_root = top_line_proof.old_root;
+        let new_root = top_line_proof.new_root;
+
+        Self {
+            top_line_proof,
+            web_proof,
+            old_root,
+            new_root,
+        }
+    }
 
     pub fn set_witness_params<W: Witness<F>, F: Field>(
         &self,

@@ -27,7 +27,7 @@ impl BatchDeployContractsGadget {
         max_contract_state_tree_height: usize,
     ) -> Self {
         let top_line_height = contract_tree_height - batch_sub_tree_height;
-        let spiderman_gadget = SpidermanAppendProofGadget::add_virtual_to::<H, F, D>(builder, top_line_height, batch_sub_tree_height);
+        let spiderman_gadget = SpidermanAppendProofGadget::add_virtual_to_allow_existing::<H, F, D>(builder, top_line_height, batch_sub_tree_height);
 
         let total_leaves = 1usize << batch_sub_tree_height;
         let contract_leaves = (0..total_leaves)

@@ -699,7 +699,7 @@ pub fn get_merkle_proofs_for_compact<Hasher: MerkleZeroHasher<Hash>, Hash: Copy 
 mod tests {
     
 
-    use parth_core::{data::hash::{hash256::Hash256, merkle_node_key::SimpleMerkleNodeKey}};
+    use parth_core::{data::hash::{hash256::Hash256, merkle_node_key::SimpleMerkleNodeKey}, utils::QPGenRandom};
     
     use super::SimpleMemoryMerkleRecorderStore;
     use parth_crypto::hash::sha256::CoreSha256Hasher;
@@ -814,6 +814,19 @@ mod tests {
         test_append_spiderman_simple(12, 9, 1, 1);
         test_append_spiderman_simple(12, 9, 1, 0);
         test_append_spiderman_simple(5, 5, 59, 191);
+    }
+
+    #[test]
+    fn check_spiderman_odd_tree_size() {
+        let mut tree = SimpleMemoryMerkleRecorderStore::<CoreSha256Hasher, Hash256>::new(8);
+        let result_a = tree.append_leaves_spider_man(2, &Hash256::qp_rand_gen_vec(3)).unwrap();
+        let result_b = tree.append_leaves_spider_man(4, &Hash256::qp_rand_gen_vec(3)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2000));
+        println!("result_a: {}", serde_json::to_string(&result_a).unwrap());
+        println!("result_b: {}", serde_json::to_string(&result_b).unwrap());
+
+
+
     }
 }
 

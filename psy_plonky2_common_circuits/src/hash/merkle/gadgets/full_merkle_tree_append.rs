@@ -105,6 +105,91 @@ impl FullMerkleTreeAppendGadget {
             new_root,
         }
     }
+    // performs the same as add_virtual_to, but is_added_leaf is calculated by checking if old_leaf != new_leaf for prefixed nodes
+    pub fn add_virtual_to_allow_existing_leaves_prefix<H: AlgebraicHasher<F>, F: RichField + Extendable<D>, const D: usize>(
+        builder: &mut CircuitBuilder<F, D>,
+        height: usize,
+    ) -> Self {
+        let num_leaves = 1usize << height;
+
+        let mut old_leaves = Vec::with_capacity(num_leaves);
+        let mut new_leaves = Vec::with_capacity(num_leaves);
+        let mut added_leaves = Vec::with_capacity(num_leaves);
+
+        let mut leaf_must_be_zero = builder._false();
+
+        for _ in 0..num_leaves {
+            let old_leaf = builder.add_virtual_hash();
+            let new_leaf = builder.add_virtual_hash();
+
+            let is_old_leaf_zero = builder.is_zero_hash(old_leaf);
+            let is_new_leaf_zero = builder.is_zero_hash(new_leaf);
+            //let is_new_leaf_not_zero = builder.not(is_new_leaf_zero);
+            // REMOVED: let is_added_leaf = builder.and(is_old_leaf_zero, is_new_leaf_not_zero);
+
+            // CHANGED TO:
+            let is_added_leaf_allow_existing = builder.is_not_equal_hash(old_leaf, new_leaf);
+
+            // if the old leaf is non-zero, it is not allowed to be changed
+            builder.connect_hashes_if_false(is_old_leaf_zero, old_leaf, new_leaf);
+
+            // after we hit the first skipped hash, all future hashes should be zero
+            let encountered_end_of_results = builder.and(is_old_leaf_zero, is_new_leaf_zero);
+
+            // once we find a zero new leaf, all future new/old leaves must be zero
+            leaf_must_be_zero = builder.or(leaf_must_be_zero, encountered_end_of_results);
+
+            builder.connect_zero_if_true(leaf_must_be_zero, new_leaf.elements[0]);
+            builder.connect_zero_if_true(leaf_must_be_zero, new_leaf.elements[1]);
+            builder.connect_zero_if_true(leaf_must_be_zero, new_leaf.elements[2]);
+            builder.connect_zero_if_true(leaf_must_be_zero, new_leaf.elements[3]);
+
+            builder.connect_zero_if_true(leaf_must_be_zero, old_leaf.elements[0]);
+            builder.connect_zero_if_true(leaf_must_be_zero, old_leaf.elements[1]);
+            builder.connect_zero_if_true(leaf_must_be_zero, old_leaf.elements[2]);
+            builder.connect_zero_if_true(leaf_must_be_zero, old_leaf.elements[3]);
+
+            old_leaves.push(old_leaf);
+            new_leaves.push(new_leaf);
+            added_leaves.push(is_added_leaf_allow_existing);
+        }
+
+        let mut current_level_old_leaves = old_leaves.clone();
+        let mut current_level_new_leaves = new_leaves.clone();
+
+        let mut nodes_in_level = current_level_new_leaves.len();
+
+        while nodes_in_level > 1 {
+            let half = nodes_in_level / 2;
+            current_level_old_leaves = (0..half)
+                .map(|i| {
+                    builder.hash_two_to_one::<H>(
+                        current_level_old_leaves[i * 2],
+                        current_level_old_leaves[i * 2 + 1],
+                    )
+                })
+                .collect::<Vec<_>>();
+            current_level_new_leaves = (0..half)
+                .map(|i| {
+                    builder.hash_two_to_one::<H>(
+                        current_level_new_leaves[i * 2],
+                        current_level_new_leaves[i * 2 + 1],
+                    )
+                })
+                .collect::<Vec<_>>();
+            nodes_in_level = half;
+        }
+
+        let old_root = current_level_old_leaves[0];
+        let new_root = current_level_new_leaves[0];
+        Self {
+            old_leaves,
+            new_leaves,
+            added_leaves,
+            old_root,
+            new_root,
+        }
+    }
     pub fn set_witness<W: Witness<F>, F: Field>(
         &self,
         witness: &mut W,

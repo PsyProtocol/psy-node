@@ -1,4 +1,4 @@
-use parth_core::{crypto::hash::spiderman::SpidermanUpdateProof, felt::QFelt64, protocol::core_types::Q256BitHash, utils::QPGenRandom};
+use parth_core::{crypto::hash::{spiderman::SpidermanUpdateProof, traits::{FieldQHasher, PCircuitWitness, ZeroableHash}}, felt::{QFelt, QFelt64}, protocol::core_types::{Q256BitHash, QFHashBase, QHashBase}, utils::QPGenRandom};
 use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
 use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
 
@@ -14,6 +14,7 @@ pub struct QCBatchDeployContractsCircuitInput<F, Hash> {
     pub spiderman_append_proof: SpidermanUpdateProof<Hash>,
     pub contract_leaves: Vec<PQEDContractLeaf<F, Hash>>,
 }
+
 
 impl<F, Hash: Copy> AggStateTrackableInput<Hash> for QCBatchDeployContractsCircuitInput<F, Hash> {
     fn get_state_transition(&self) -> AggStateTransition<Hash> {
@@ -34,6 +35,22 @@ impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for QCBatchDeployContractsCi
         }
     }
 }
+
+
+
+
+impl<F: QFelt64, Hash: QFHashBase<F>> PCircuitWitness<F, Hash>
+    for QCBatchDeployContractsCircuitInput<F, Hash>
+{
+    fn get_expected_public_inputs_hash<Hasher: FieldQHasher<F, Hash>>(&self) -> Hash {
+        let state_transition_hash = self.get_state_transition().get_combined_hash::<Hasher>();
+        Hasher::two_to_one(
+            &self.deploy_contract_circuit_whitelist,
+            &state_transition_hash,
+        )
+    }
+}
+
 
 
 impl<F: QFelt64, Hash: Q256BitHash> PsyCanonicalSerializeMetadata for QCBatchDeployContractsCircuitInput<F, Hash> {
