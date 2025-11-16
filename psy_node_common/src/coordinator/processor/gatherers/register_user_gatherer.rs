@@ -37,6 +37,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::queue::gatherer_builder::QueueGathererItemBuilderWithTree;
 
+pub const REGISTER_USER_GATHERER_BACKUP_V1_MAGIC_BYTES: [u8; 4] = [0x52, 0x55, 0x42, 0x31]; // 'RUB1' in ASCII
+pub const REGISTER_USER_GATHERER_BACKUP_V1_MAGIC_U32: u32 = 0x31425552; // 'RUB1' in little-endian u32
+
 pub fn get_new_register_user_gatherer_backup_file_path(
     backup_file_directory: &str,
     realm_id_u64: u64,
@@ -63,11 +66,11 @@ pub async fn read_register_user_gatherer_backup_file<Hasher: MerkleZeroHasher<Ha
     let mut file = tokio::fs::File::open(file_path).await?;
     let metadata = file.metadata().await?;
     let file_len = metadata.len();
-    if file_len < 8 + 32 {
+    if file_len < 4 + 8 + 32 {
         return Err(anyhow::anyhow!("Backup file too small to be valid: {} bytes", metadata.len()));
     }
 
-    let file_len_without_metadata = file_len - 8 - 32;
+    let file_len_without_metadata = file_len - 4 - 8 - 32;
     if file_len_without_metadata % (64 as u64) != 0 {
         return Err(anyhow::anyhow!(
             "Backup file length without metadata is not a multiple of 64: {} bytes",
@@ -76,7 +79,15 @@ pub async fn read_register_user_gatherer_backup_file<Hasher: MerkleZeroHasher<Ha
     }
 
     let expected_count = file_len_without_metadata / (64 as u64);
-    let start_next_user_id = file.read_u64().await?;
+    let magic_u32 = file.read_u32_le().await?;
+    if magic_u32 != REGISTER_USER_GATHERER_BACKUP_V1_MAGIC_U32 {
+        return Err(anyhow::anyhow!(
+            "Backup file magic number mismatch: expected {:x}, got {:x}",
+            REGISTER_USER_GATHERER_BACKUP_V1_MAGIC_U32,
+            magic_u32
+        ));
+    }
+    let start_next_user_id = file.read_u64_le().await?;
     if tree.get_leaf_value(start_next_user_id) != Hasher::get_zero_hash(0) {
         return Err(anyhow::anyhow!(
             "Backup file start user id {} does not match tree zero hash {:?}",
@@ -197,7 +208,8 @@ impl<
         );
         let mut new_user_public_keys_file = tokio::fs::File::create(&new_user_public_keys_file_path).await?;
         let start_next_user_id = config.start_next_user_id.load(Ordering::Relaxed);
-        new_user_public_keys_file.write_u64(start_next_user_id).await?;
+        new_user_public_keys_file.write_u32_le(REGISTER_USER_GATHERER_BACKUP_V1_MAGIC_U32).await?;
+        new_user_public_keys_file.write_u64_le(start_next_user_id).await?;
         new_user_public_keys_file.write_all(&tree.get_root().into_owned_32bytes()).await?;
 
         Ok(Self {
@@ -224,6 +236,7 @@ impl<
                 item.len()
             ));
         }
+        self.new_user_public_keys_file.write_all(&item).await?;
         self.new_user_public_keys_ffs.extend_from_slice(&item);
         let hash = hash_two_from_slice::<N::QHash, N::HasherBase>(&item);
         let u64_hash_mapping_row = QHash256AndU64 {
