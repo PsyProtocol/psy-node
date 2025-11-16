@@ -30,18 +30,14 @@ use parth_core::{
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{
     agg::{
-        tree_agg_v2::{plan_jobs_for_tree_agg, BasicTreePlannerHelper},
-        AggStateTrackableInput, AggStateTransitionInputV2, AggStateTransitionWithStats, DummyAggStateTransition,
-    },
-    protocol::circuit_inputs::{
+        AggStateTrackableInput, AggStateTransitionInputV2, AggStateTransitionWithStats, DummyAggStateTransition, tree_agg_v2::{BasicTreePlannerHelper, plan_jobs_for_tree_agg, plan_jobs_for_tree_agg_offset_root}
+    }, protocol::circuit_inputs::{
         append_user_registration_tree::QCAppendUserRegistrationTreeCircuitInput, deploy_contracts::QCBatchDeployContractsCircuitInput,
-    },
-    v1::qdata::{
+    }, rewards_tree::offsets::{DEPLOY_CONTRACTS_REWARDS_TREE_OFFSET_ROOT_INDEX, DEPLOY_CONTRACTS_REWARDS_TREE_OFFSET_ROOT_LEVEL}, v1::qdata::{
         contract::{ContractCodeDefinition, ContractCodeDefinitionWithContractId, PQEDContractLeaf, PsyDeployContractQueueItem},
         ffs_sizes::PSY_OBJECT_FFS_SIZE_CONTRACT_LEAF,
         public_key::PZKPublicKeyInfo,
-    },
-    worker::{metadata::PsyProvingJobMetadata, metadata_with_job_id::PsyProvingJobMetadataWithJobId},
+    }, worker::{metadata::PsyProvingJobMetadata, metadata_with_job_id::PsyProvingJobMetadataWithJobId}
 };
 use psy_node_core::{
     psy_temp_db::StandardProcessorTempDBStoreBase,
@@ -485,7 +481,7 @@ impl<
             }
             inputs
         };
-        let (jobs_for_queue, job_temp_data) = plan_jobs_for_tree_agg::<
+        let (jobs_for_queue, job_temp_data) = plan_jobs_for_tree_agg_offset_root::<
             QProvingJobDataID,
             N::F,
             N::QHash,
@@ -497,6 +493,8 @@ impl<
             start_state_root,
             self.config.deploy_contract_circuit_whitelist,
             &deploy_contract_circuit_inputs,
+            DEPLOY_CONTRACTS_REWARDS_TREE_OFFSET_ROOT_INDEX,
+            DEPLOY_CONTRACTS_REWARDS_TREE_OFFSET_ROOT_LEVEL,
         )?;
 
         let update_global_contract_tree_nodes_ffs = create_ffs_merkle_nodes_zero_id_from_hash_map::<N::QHash>(tree.get_changes());

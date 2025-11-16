@@ -26,12 +26,8 @@ use parth_core::{
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{
     agg::{
-        tree_agg_v2::{plan_jobs_for_tree_agg, BasicTreePlannerHelper},
-        AggStateTrackableInput, AggStateTransitionInputV2, AggStateTransitionWithStats, DummyAggStateTransition,
-    },
-    protocol::circuit_inputs::append_user_registration_tree::QCAppendUserRegistrationTreeCircuitInput,
-    v1::qdata::public_key::PZKPublicKeyInfo,
-    worker::{metadata::PsyProvingJobMetadata, metadata_with_job_id::PsyProvingJobMetadataWithJobId},
+        AggStateTrackableInput, AggStateTransitionInputV2, AggStateTransitionWithStats, DummyAggStateTransition, tree_agg_v2::{BasicTreePlannerHelper, plan_jobs_for_tree_agg, plan_jobs_for_tree_agg_offset_root}
+    }, protocol::circuit_inputs::append_user_registration_tree::QCAppendUserRegistrationTreeCircuitInput, rewards_tree::offsets::{REGISTER_USERS_REWARDS_TREE_OFFSET_ROOT_INDEX, REGISTER_USERS_REWARDS_TREE_OFFSET_ROOT_LEVEL}, v1::qdata::public_key::PZKPublicKeyInfo, worker::{metadata::PsyProvingJobMetadata, metadata_with_job_id::PsyProvingJobMetadataWithJobId}
 };
 use psy_node_core::{
     psy_temp_db::StandardProcessorTempDBStoreBase, qblob::data_views::zero_merkle_node_batch::create_ffs_merkle_nodes_zero_id_from_hash_map,
@@ -277,7 +273,7 @@ impl<
                 })
                 .collect::<Vec<_>>()
         };
-        let (jobs_for_queue, job_temp_data) = plan_jobs_for_tree_agg::<
+        let (jobs_for_queue, job_temp_data) = plan_jobs_for_tree_agg_offset_root::<
             QProvingJobDataID,
             N::F,
             N::QHash,
@@ -289,6 +285,8 @@ impl<
             start_state_root,
             self.config.register_users_circuit_whitelist,
             &spider_man_groups,
+            REGISTER_USERS_REWARDS_TREE_OFFSET_ROOT_INDEX,
+            REGISTER_USERS_REWARDS_TREE_OFFSET_ROOT_LEVEL,
         )?;
 
         let update_user_registration_tree_nodes_ffs = create_ffs_merkle_nodes_zero_id_from_hash_map::<N::QHash>(tree.get_changes());
