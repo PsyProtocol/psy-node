@@ -72,8 +72,10 @@ impl<
         
         todo!()
     }
-    fn init_with_reward_tree_height(&mut self, reward_tree_height: u8) {
+    fn init_with_reward_tree_height(&mut self, total_jobs: usize, jobs_per_level: Vec<usize>, reward_tree_height: u8) {
         self.output_jobs = vec![vec![]; reward_tree_height as usize + 1];
+        self.job_witnesses = Vec::with_capacity(total_jobs);
+        self.output_jobs = jobs_per_level.iter().map(|&n| Vec::with_capacity(n)).collect();
     }
 }
 pub fn plan_guta_jobs_for_coordinator_nca_offset_root<
@@ -129,13 +131,15 @@ pub fn plan_guta_jobs_for_coordinator_nca_offset_root<
         new_leaves.push((node_key, input));
     }
 
+    
+
     let mut helper = CoordinatorGUTAPlannerHelper {
         last_checkpoint_id,
         last_checkpoint_root,
         last_checkpoint_merkle_proof: checkpoint_tree_store.get_merkle_proof_for_leaf(last_checkpoint_id),
         global_user_tree_height,
         guta_realm_level,
-        reward_tags: Vec::new(),
+        reward_tags: Vec::with_capacity(leaves.len()),
         leaf_tag_values,
         job_witnesses: Vec::new(),
         output_jobs: Vec::new(),

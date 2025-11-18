@@ -32,7 +32,7 @@ pub trait NCAMerklePlannerVisitorWithTreeStores<T, TreeReader, RWTreeStore> {
         nca_reward_tree_key: SimpleMerkleNodeKey,
         is_reward_root: bool,
     ) -> anyhow::Result<T>;
-    fn init_with_reward_tree_height(&mut self, _reward_tree_height: u8) {}
+    fn init_with_reward_tree_height(&mut self, _total_jobs: usize, _jobs_per_level: Vec<usize>, _reward_tree_height: u8) {}
 }
 
 #[async_trait]
@@ -101,6 +101,7 @@ pub fn run_merkle_planner_visitor_with_offset_root<T: Clone, V: NCAMerklePlanner
     }
     let group_levels = generate_nca_tree_groups_v1(&leaf_keys, merkle_tree_height);
     let reward_tree_height = group_levels.len() - 1;
+    visitor.init_with_reward_tree_height(reward_tree_height as u8);
     //let mut merkle_key_to_reward_key_map = HashMap::<SimpleMerkleNodeKey, SimpleMerkleNodeKey>::new();
     for (level, gl) in group_levels.iter().enumerate() {
         for (index, g) in gl.iter().enumerate() {
@@ -148,6 +149,10 @@ pub fn run_merkle_planner_visitor_with_offset_root_and_trees<T: Clone, V: NCAMer
     }
     let group_levels = generate_nca_tree_groups_v1(&leaf_keys, merkle_tree_height);
     let reward_tree_height = group_levels.len() - 1;
+
+    let group_level_lengths = group_levels.iter().map(|gl| gl.len()).collect::<Vec<usize>>();
+    let total_jobs = group_level_lengths.iter().sum::<usize>();
+    visitor.init_with_reward_tree_height(total_jobs, group_level_lengths, reward_tree_height as u8);
     //let mut merkle_key_to_reward_key_map = HashMap::<SimpleMerkleNodeKey, SimpleMerkleNodeKey>::new();
     for (level, gl) in group_levels.iter().enumerate() {
         for (index, g) in gl.iter().enumerate() {
