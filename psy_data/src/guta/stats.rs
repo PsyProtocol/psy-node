@@ -1,6 +1,6 @@
 use std::ops::Add;
 
-use parth_core::{crypto::hash::traits::{FieldQHasher, QFieldHashable}, felt::QFelt64, protocol::core_types::QFHashBase, utils::QPGenRandom};
+use parth_core::{crypto::hash::traits::{FieldQHasher, QFieldHashable}, felt::{QFelt64, ZeroableFelt}, protocol::core_types::QFHashBase, utils::QPGenRandom};
 use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
 use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata};
 
@@ -16,7 +16,24 @@ pub struct GUTAStats<F> {
 
     pub slots_modified: F,
 }
+
+impl<F: ZeroableFelt> GUTAStats<F> {
+    pub fn get_zero_value() -> Self {
+        Self {
+            fees_collected: F::ZERO_VALUE,
+            user_ops_processed: F::ZERO_VALUE,
+            total_transactions: F::ZERO_VALUE,
+            slots_modified: F::ZERO_VALUE,
+        }
+    }
+}
 impl<F: Add<Output = F> + Copy> GUTAStats<F> {
+    pub fn add_from_mut(&mut self, other: &GUTAStats<F>) {
+        self.fees_collected = self.fees_collected + other.fees_collected;
+        self.user_ops_processed = self.user_ops_processed + other.user_ops_processed;
+        self.total_transactions = self.total_transactions + other.total_transactions;
+        self.slots_modified = self.slots_modified + other.slots_modified;
+    }
     pub fn combine_with(&self, other: &GUTAStats<F>) -> Self {
         Self {
             fees_collected: self.fees_collected + other.fees_collected,

@@ -5,7 +5,9 @@ use psy_core::job::job_id::QProvingJobDataID;
 use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
 use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalDatabaseSerializeBaseSingle, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
 
-use crate::guta::header::GlobalUserTreeAggregatorHeader;
+use crate::{guta::header::GlobalUserTreeAggregatorHeader, worker::metadata_with_job_id::PsyProvingJobMetadataWithJobId};
+
+
 #[pderive::serialize_copy_f_hash_ts]
 #[ts(export, concrete(F = parth_core::PF, Hash = parth_core::PHash))]
 #[repr(C)]
@@ -429,6 +431,7 @@ pser::impl_psy_ser_basic_tests_fallback!(
 
 
 // with job id
+
 
 
 #[pderive::serialize_copy_f_hash_no_rkyv_ts]

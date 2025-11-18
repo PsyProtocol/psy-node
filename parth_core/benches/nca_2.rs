@@ -1,7 +1,7 @@
 // for benches, allow unused functions
 #![allow(dead_code)]
 use criterion::{black_box, BenchmarkId, Criterion};
-use parth_core::data::hash::merkle_node_key::{generate_nca_tree_groups_v1, generate_nca_tree_groups_naive, SimpleMerkleNodeKey};
+use parth_core::data::hash::merkle_node_key::{generate_nca_tree_groups_v1, generate_nca_tree_groups_v0, SimpleMerkleNodeKey};
 use std::collections::HashSet;
 
 fn get_unique_node_set(node_set: Vec<SimpleMerkleNodeKey>) -> Vec<SimpleMerkleNodeKey> {
@@ -39,7 +39,7 @@ pub fn benchmark_nca_group_generation(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("Naive", size), &leaves, |b, l| {
             // `b.iter` runs the closure multiple times to get a stable measurement.
             // `black_box` prevents the compiler from optimizing away the function call.
-            b.iter(|| generate_nca_tree_groups_naive(black_box(l), tree_height));
+            b.iter(|| generate_nca_tree_groups_v0(black_box(l), tree_height));
         });
 
         // Benchmark the efficient implementation

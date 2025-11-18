@@ -83,6 +83,32 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + PartialEq + Default>
             value,
         }
     }
+    pub fn get_historical_merkle_proof(&self, index: u64) -> MerkleProofCore<Hash> {
+        let leaf_key = SimpleMerkleNodeKey::new(self.height, index);
+        let value = self.get_leaf_value(index);
+
+        let mut current_sibling = leaf_key.sibling();
+        let mut siblings = Vec::with_capacity(self.height as usize);
+
+        while current_sibling.level > 0 {
+            let value = if current_sibling.index & 1 == 1 {
+                Hasher::get_zero_hash(self.height as usize - current_sibling.level as usize)
+            } else {
+                self.get_node_value(&current_sibling)
+            };
+            siblings.push(value);
+            current_sibling = current_sibling.parent().sibling();
+        }
+
+        let root = compute_root_merkle_proof_generic::<Hash, Hasher>(value, index, &siblings);
+
+        MerkleProofCore {
+            index,
+            siblings,
+            root,
+            value,
+        }
+    }
 
     pub fn get_historical_pivot_leaf(&self, index: u64) -> MerkleProofCore<Hash> {
         let leaf_key = SimpleMerkleNodeKey::new(self.height, index);

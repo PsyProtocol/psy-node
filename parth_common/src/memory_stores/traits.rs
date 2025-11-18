@@ -1,6 +1,43 @@
 use anyhow::bail;
-use parth_core::{crypto::hash::{merkle_proof::{DeltaMerkleProofCore, MerkleProofCore}, spiderman::SpidermanUpdateProof, traits::MerkleZeroHasher}, data::hash::merkle_node_key::SimpleMerkleNodeKey};
+use async_trait::async_trait;
+use auto_impl::auto_impl;
+use parth_core::{crypto::hash::{merkle_proof::{DeltaMerkleProofCore, MerkleProofCore, compute_root_merkle_proof_generic}, spiderman::SpidermanUpdateProof, traits::MerkleZeroHasher}, data::hash::merkle_node_key::SimpleMerkleNodeKey};
 
+#[async_trait]
+#[auto_impl(&, Box, Arc)]
+pub trait PsyMemoryMerkleStoreAppendOnlyReaderBaseAsync<Hash: Copy + PartialEq + Default> {
+
+    async fn get_merkle_proof_for_leaf_async(
+        &self,
+        leaf_index: u64,
+    ) -> anyhow::Result<MerkleProofCore<Hash>>;
+    async fn get_historical_merkle_proof_for_leaf_async(
+        &self,
+        leaf_index: u64,
+    ) -> anyhow::Result<MerkleProofCore<Hash>>;
+    async fn get_append_leaf_index_for_root_async(
+        &self,
+        checkpoint_tree_root: Hash,
+    ) -> anyhow::Result<u64>;
+}
+
+
+#[auto_impl(&, Box, Arc)]
+pub trait PsyMemoryMerkleStoreAppendOnlyReaderBase<Hash: Copy + PartialEq + Default> {
+
+    fn get_merkle_proof_for_leaf(
+        &self,
+        leaf_index: u64,
+    ) -> MerkleProofCore<Hash>;
+    fn get_historical_merkle_proof_for_leaf(
+        &self,
+        leaf_index: u64,
+    ) -> MerkleProofCore<Hash>;
+    fn get_append_leaf_index_for_root(
+        &self,
+        checkpoint_tree_root: Hash,
+    ) -> Option<u64>;
+}
 
 pub trait PsyMemoryMerkleStoreImm<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + PartialEq + Default>
 {
@@ -195,6 +232,35 @@ pub trait PsyMemoryMerkleStoreImm<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + P
         }
 
         Ok(self.rehash_sub_tree_dmp(sub_tree_height, sub_tree_index))
+    }
+
+    fn get_historical_merkle_proof(&self, index: u64) -> MerkleProofCore<Hash> {
+        let height = self.get_height();
+        let leaf_key = SimpleMerkleNodeKey::new(height, index);
+        let value = self.get_leaf_value(index);
+        let height_usize = height as usize;
+
+        let mut current_sibling = leaf_key.sibling();
+        let mut siblings = Vec::with_capacity(height_usize);
+
+        while current_sibling.level > 0 {
+            let value = if current_sibling.index & 1 == 1 {
+                Hasher::get_zero_hash(height_usize - current_sibling.level as usize)
+            } else {
+                self.get_node_value(&current_sibling)
+            };
+            siblings.push(value);
+            current_sibling = current_sibling.parent().sibling();
+        }
+
+        let root = compute_root_merkle_proof_generic::<Hash, Hasher>(value, index, &siblings);
+
+        MerkleProofCore {
+            index,
+            siblings,
+            root,
+            value,
+        }
     }
 
     /// REFACTOR & SIMPLIFICATION:

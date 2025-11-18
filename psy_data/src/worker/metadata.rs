@@ -22,6 +22,19 @@ pub struct PsyProvingJobMetadata<Hash, JobId> {
     pub dependencies: Vec<JobId>,
 }
 
+impl<Hash: Default, JobId: Default> Default for PsyProvingJobMetadata<Hash, JobId> {
+    fn default() -> Self {
+        Self {
+            expected_public_inputs_hash: Hash::default(),
+            reward_tree_node_index: 0,
+            reward_tree_node_level: 0,
+            reward_tree_hash_mode: PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN,
+            reward_tree_node_children: 0,
+            dependencies: Vec::new(),
+        }
+    }
+}
+
 impl<Hash, JobId> PsyProvingJobMetadata<Hash, JobId> {
     pub fn get_reward_tree_node_key(&self) -> SimpleMerkleNodeKey {
         SimpleMerkleNodeKey {

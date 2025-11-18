@@ -360,6 +360,48 @@ pub fn serialize_clone_hash_job_id_ts(_attr: TokenStream, input: TokenStream) ->
     TokenStream::from(item_struct.into_token_stream())
 }
 
+#[proc_macro_attribute]
+pub fn serialize_copy_hash_job_id_ts(_attr: TokenStream, input: TokenStream) -> TokenStream {
+    let mut item_struct = parse_macro_input!(input as ItemStruct);
+
+    let derive_serde: Attribute = syn::parse_quote!(
+        #[derive(
+            Debug,
+            Clone,
+            Copy,
+            PartialEq,
+            Eq,
+            Hash,
+            PartialOrd,
+            Ord,
+            serde::Serialize,
+            serde::Deserialize,
+            ts_rs::TS,
+        )]
+    );
+    let serde_bound: Attribute = syn::parse_quote!(
+        #[serde(bound = "for<'de2> Hash: serde::Deserialize<'de2> + serde::Serialize, for<'de2> JobId: serde::Deserialize<'de2> + serde::Serialize")]
+    );
+    let derive_rkyv: Attribute = syn::parse_quote!(
+        #[cfg_attr(feature = "serialize_rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
+    );
+    let derive_speedy: Attribute = syn::parse_quote!(
+        #[cfg_attr(feature = "serialize_speedy", derive(speedy::Readable, speedy::Writable))]
+    );
+    let ts_bound: Attribute = syn::parse_quote!(
+        #[ts(bound = "Hash: ts_rs::TS, JobId: ts_rs::TS")]
+    );
+
+    // Insert attributes in reverse order to maintain the desired output order
+    item_struct.attrs.insert(0, ts_bound);
+    item_struct.attrs.insert(0, serde_bound);
+    item_struct.attrs.insert(0, derive_speedy);
+    item_struct.attrs.insert(0, derive_rkyv);
+    item_struct.attrs.insert(0, derive_serde);
+
+    TokenStream::from(item_struct.into_token_stream())
+}
+
 
 #[proc_macro_attribute]
 pub fn serialize_copy_hash(_attr: TokenStream, input: TokenStream) -> TokenStream {

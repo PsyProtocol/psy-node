@@ -108,7 +108,7 @@ pub async fn read_register_user_gatherer_backup_file<Hasher: MerkleZeroHasher<Ha
         ));
     }
 
-    let mut new_user_public_keys_ffs = Vec::with_capacity(file_len_without_metadata as usize);
+    let mut new_user_public_keys_ffs = vec![0u8; file_len_without_metadata as usize];
     file.read_exact(&mut new_user_public_keys_ffs).await?;
     let mut new_public_key_hash_to_user_id_rows = Vec::with_capacity(expected_count as usize);
 

@@ -7,3 +7,4 @@ pub mod dash_tree;
 pub mod traits;
 pub mod dash_tree_recorder;
 pub mod mem_tree_recorder;
+pub mod dash_tree_append_only;
