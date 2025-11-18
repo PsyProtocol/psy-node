@@ -1,44 +1,44 @@
 use async_trait::async_trait;
+use parth_core::{
+    crypto::hash::traits::MerkleZeroHasher,
+    data::proof_input::CircuitInputWithDependencies,
+    pgoldilocks::{QHashOut, QRichField},
+};
 use plonky2::{
-    gates::{constant::ConstantGate, gate::GateRef}, hash::hash_types::{HashOut, HashOutTarget}, iop::
-        witness::{PartialWitness, WitnessWrite}, plonk::{
+    gates::{constant::ConstantGate, gate::GateRef},
+    hash::hash_types::{HashOut, HashOutTarget},
+    iop::witness::{PartialWitness, WitnessWrite},
+    plonk::{
         circuit_builder::CircuitBuilder,
         circuit_data::{CircuitConfig, CircuitData, CommonCircuitData, VerifierOnlyCircuitData},
         config::{AlgebraicHasher, GenericConfig},
         proof::ProofWithPublicInputs,
-    }
-};
-use parth_core::{
-    crypto::hash::traits::MerkleZeroHasher, data::proof_input::CircuitInputWithDependencies, pgoldilocks::{QHashOut, QRichField}
-};
-use psy_core::
-    job::job_id::{ProvingJobCircuitType, QProvingJobDataID}
-;
-use psy_data::
-    proof_input::guta::{VerifyLeftGUTARightEndCapInput, VerifyLeftGUTARightEndCapInputSimple}
-    
-;
-use psy_plonky2_basic_helpers::{
-    builder::{
-        hash::core::CircuitBuilderHashCore,
-        pad_circuit::pad_circuit_degree,
     },
+};
+use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
+use psy_data::proof_input::guta::{VerifyLeftGUTARightEndCapInput, VerifyLeftGUTARightEndCapInputSimple};
+use psy_plonky2_basic_helpers::{
+    builder::{hash::core::CircuitBuilderHashCore, pad_circuit::pad_circuit_degree},
     verifier::circuit_library::CircuitInfoLibrary,
 };
 use psy_plonky2_common_circuits::traits::ToTargets;
 
 use crate::{
     gadgets::qdata::pm_jobs_completed_stats::PMJobsCompletedStatsGadget,
+    guta::gadgets::{
+        helpers::ToGUTAHeader, two_nca_state_transition::TwoNCAStateTransitionGadget, verify_end_cap::VerifyEndCapProofGadget,
+        verify_guta_proof::VerifyGUTAProofGadget,
+    },
     proof_minifier::pm_core::get_circuit_fingerprint_generic,
-    qstandard::{proof_store::QProofStoreReaderAsync, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QPsyNetworkCircuitWithType},
+    qstandard::{
+        proof_store::QProofStoreReaderAsync, QPsyNetworkCircuitWithType, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync,
+    },
 };
-
-use crate::{guta::gadgets::{helpers::ToGUTAHeader, two_nca_state_transition::TwoNCAStateTransitionGadget, verify_end_cap::VerifyEndCapProofGadget, verify_guta_proof::VerifyGUTAProofGadget}};
 
 #[derive(Debug)]
 pub struct GUTAVerifyLeftGUTARightEndCapCircuit<C: GenericConfig<D> + 'static, const D: usize>
 where
-    C::Hasher:AlgebraicHasher<C::F>,
+    C::Hasher: AlgebraicHasher<C::F>,
 {
     pub a_guta_gadget: VerifyGUTAProofGadget<D>,
     pub b_end_cap_gadget: VerifyEndCapProofGadget<D>,
@@ -50,8 +50,9 @@ where
     pub fingerprint: QHashOut<C::F>,
 }
 
-impl<C: GenericConfig<D>, const D: usize> QPsyNetworkCircuitWithType for GUTAVerifyLeftGUTARightEndCapCircuit<C, D> where
-    C::Hasher:AlgebraicHasher<C::F>,
+impl<C: GenericConfig<D>, const D: usize> QPsyNetworkCircuitWithType for GUTAVerifyLeftGUTARightEndCapCircuit<C, D>
+where
+    C::Hasher: AlgebraicHasher<C::F>,
 {
     fn get_circuit_type(&self) -> ProvingJobCircuitType {
         ProvingJobCircuitType::GUTALeftGUTARightEndCap
@@ -59,17 +60,19 @@ impl<C: GenericConfig<D>, const D: usize> QPsyNetworkCircuitWithType for GUTAVer
 }
 impl<C: GenericConfig<D> + 'static, const D: usize> GUTAVerifyLeftGUTARightEndCapCircuit<C, D>
 where
-    C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>>, C::F: QRichField {
-        pub fn new(
-            guta_proof_common_data: &CommonCircuitData<C::F, D>,
-            guta_proof_verifier_data_cap_height: usize,
-            end_cap_proof_common_data: &CommonCircuitData<C::F, D>,
-            end_cap_proof_verifier_data_cap_height: usize,
-            known_end_cap_fingerprint: QHashOut<C::F>,
-            global_user_tree_height: usize,
-            guta_circuit_whitelist_tree_height: u8,
-            checkpoint_tree_height: usize,
-        ) -> Self {
+    C::Hasher: AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>>,
+    C::F: QRichField,
+{
+    pub fn new(
+        guta_proof_common_data: &CommonCircuitData<C::F, D>,
+        guta_proof_verifier_data_cap_height: usize,
+        end_cap_proof_common_data: &CommonCircuitData<C::F, D>,
+        end_cap_proof_verifier_data_cap_height: usize,
+        known_end_cap_fingerprint: QHashOut<C::F>,
+        global_user_tree_height: usize,
+        guta_circuit_whitelist_tree_height: u8,
+        checkpoint_tree_height: usize,
+    ) -> Self {
         let config = CircuitConfig::standard_recursion_config();
         let mut builder = CircuitBuilder::<C::F, D>::new(config);
 
@@ -91,10 +94,8 @@ where
             known_end_cap_fingerprint_hash,
         );
 
-        let a_guta_header = a_guta_gadget.get_guta_header::<C::Hasher, C::F>(
-            &mut builder,
-            a_guta_gadget.guta_proof_header_gadget.guta_circuit_whitelist,
-        );
+        let a_guta_header =
+            a_guta_gadget.get_guta_header::<C::Hasher, C::F>(&mut builder, a_guta_gadget.guta_proof_header_gadget.guta_circuit_whitelist);
         tracing::debug!("📊 a_guta_header: {:?}", a_guta_header);
 
         let b_guta_header = b_end_cap_gadget.get_guta_header::<C::Hasher, C::F>(
@@ -121,7 +122,7 @@ where
                 a_guta_gadget.proof_target.public_inputs[1],
                 a_guta_gadget.proof_target.public_inputs[2],
                 a_guta_gadget.proof_target.public_inputs[3],
-            ]
+            ],
         };
         let a_worker_public_key = HashOutTarget {
             elements: [
@@ -129,7 +130,7 @@ where
                 a_guta_gadget.proof_target.public_inputs[5],
                 a_guta_gadget.proof_target.public_inputs[6],
                 a_guta_gadget.proof_target.public_inputs[7],
-            ]
+            ],
         };
 
         let b_commitment = builder.constant_hash(HashOut::ZERO);
@@ -162,9 +163,7 @@ where
         pad_circuit_degree(&mut builder, 12);
         let circuit_data = builder.build::<C>();
 
-        let fingerprint = QHashOut(get_circuit_fingerprint_generic(
-            &circuit_data.verifier_only,
-        ));
+        let fingerprint = QHashOut(get_circuit_fingerprint_generic(&circuit_data.verifier_only));
         Self {
             a_guta_gadget,
             b_end_cap_gadget,
@@ -191,10 +190,9 @@ where
         self.a_guta_gadget.set_witness(
             &mut pw,
             &input.guta_inclusion_proof_a,
-
             &input.get_guta_header_a(),
             child_a_proof,
-            child_a_verifier_data
+            child_a_verifier_data,
         )?;
         self.b_end_cap_gadget.set_witness(
             &mut pw,
@@ -202,23 +200,18 @@ where
             &input.b_end_cap.guta_stats,
             &input.b_end_cap.checkpoint_historical_merkle_proof,
             child_b_proof,
-            end_cap_verifier_data
+            end_cap_verifier_data,
         )?;
 
-        self.nca_state_transition_gadget.set_witness_partial(
-            &mut pw,
-            &input.nca_proof
-        )?;
+        self.nca_state_transition_gadget.set_witness_partial(&mut pw, &input.nca_proof)?;
 
         self.circuit_data.prove(pw)
     }
 }
 
-
-impl<C: GenericConfig<D> + 'static, const D: usize> QStandardCircuit<C, D>
-    for GUTAVerifyLeftGUTARightEndCapCircuit<C, D>
+impl<C: GenericConfig<D> + 'static, const D: usize> QStandardCircuit<C, D> for GUTAVerifyLeftGUTARightEndCapCircuit<C, D>
 where
-    C::Hasher:AlgebraicHasher<C::F>,
+    C::Hasher: AlgebraicHasher<C::F>,
 {
     fn get_fingerprint(&self) -> QHashOut<C::F> {
         self.fingerprint
@@ -233,17 +226,12 @@ where
     }
 }
 
-
 #[async_trait]
-impl<
-        S: QProofStoreReaderAsync + Send + Sync,
-        L: CircuitInfoLibrary<C, D> + Send + Sync,
-        C: GenericConfig<D> + 'static,
-        const D: usize,
-    > QStandardCircuitProvableWithProofStoreAndRefLibraryAsync<S, L, C, D>
-    for GUTAVerifyLeftGUTARightEndCapCircuit<C, D>
+impl<S: QProofStoreReaderAsync + Send + Sync, L: CircuitInfoLibrary<C, D> + Send + Sync, C: GenericConfig<D> + 'static, const D: usize>
+    QStandardCircuitProvableWithProofStoreAndRefLibraryAsync<S, L, C, D> for GUTAVerifyLeftGUTARightEndCapCircuit<C, D>
 where
-    C::Hasher: AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>>, C::F: QRichField,
+    C::Hasher: AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>>,
+    C::F: QRichField,
 {
     async fn prove_with_proof_store_async(
         &self,
@@ -253,14 +241,12 @@ where
         worker_public_key: QHashOut<C::F>,
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
         let r: CircuitInputWithDependencies<VerifyLeftGUTARightEndCapInputSimple<C::F, QHashOut<C::F>>, QProvingJobDataID> =
-            bincode::deserialize(&store.get_bytes_by_id(job_id.get_input_witness_id()).await?)
-                .map_err(|e| anyhow::anyhow!(e))?;
+            bincode::deserialize(&store.get_bytes_by_id(job_id.get_input_witness_id()).await?).map_err(|e| anyhow::anyhow!(e))?;
         tracing::debug!("GUTAVerifyLeftGUTARightEndCapCircuitInput: {}", serde_json::to_string_pretty(&r)?);
 
         if r.dependencies.len() != 2 {
             anyhow::bail!("invalid dependency count in left guta right end cap input");
         }
-
 
         let child_a_proof = store.get_proof_by_id(r.dependencies[0]).await?;
         let child_b_proof = store.get_proof_by_id(r.dependencies[1]).await?;
@@ -269,19 +255,24 @@ where
         let dep_b_type = r.dependencies[1].circuit_type;
 
         let child_a_verifier_data = library.get_verifier_data(dep_a_type)?;
-        let guta_inclusion_proof_a =
-            library.get_group_inclusion_proof(job_id.circuit_type, dep_a_type)?;
+        let guta_inclusion_proof_a = library.get_group_inclusion_proof(job_id.circuit_type, dep_a_type)?;
         let child_b_verifier_data = library.get_verifier_data(dep_b_type)?;
-
-
 
         let result = self.prove_base(
             worker_public_key,
-            &VerifyLeftGUTARightEndCapInput { checkpoint_tree_root: r.input.checkpoint_tree_root, stats_a:r.input.stats_a, b_end_cap: r.input.b_end_cap, nca_proof: r.input.nca_proof, guta_inclusion_proof_a},
+            &VerifyLeftGUTARightEndCapInput {
+                checkpoint_tree_root: r.input.checkpoint_tree_root,
+                stats_a: r.input.stats_a,
+                b_end_cap: r.input.b_end_cap,
+                nca_proof: r.input.nca_proof,
+                guta_inclusion_proof_a,
+                total_aggregation_proofs_generated_a: r.input.total_aggregation_proofs_generated_a,
+
+            },
             &child_a_proof,
             &child_a_verifier_data,
             &child_b_proof,
-            &child_b_verifier_data
+            &child_b_verifier_data,
         )?;
 
         Ok(result)

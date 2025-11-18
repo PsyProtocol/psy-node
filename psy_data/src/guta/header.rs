@@ -13,6 +13,7 @@ pub struct GlobalUserTreeAggregatorHeader<F, Hash > {
     pub checkpoint_tree_root: Hash,
     pub state_transition: SubTreeNodeStateTransition<F, Hash>,
     pub stats: GUTAStats<F>,
+    pub total_aggregation_proofs_generated: F,
 }
 
 
@@ -34,10 +35,17 @@ impl<F: QFelt64, Hash: QFHashBase<F>> QFieldHashable<F, Hash> for GlobalUserTree
             state_transition_and_stats_hash,
         );
 
-        H::q_two_to_one(
+        let header_with_whitelist_hash_felts = H::q_two_to_one(
             self.guta_circuit_whitelist,
             state_stats_checkpoint_hash,
-        )
+        ).to_4_felts();
+        H::q_hash_many(&[
+            header_with_whitelist_hash_felts[0],
+            header_with_whitelist_hash_felts[1],
+            header_with_whitelist_hash_felts[2],
+            header_with_whitelist_hash_felts[3],
+            self.total_aggregation_proofs_generated,
+        ])
     }
 }
 
@@ -55,6 +63,7 @@ impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for GlobalUserTreeAggregator
             checkpoint_tree_root: Hash::qp_rand_gen(),
             state_transition: SubTreeNodeStateTransition::qp_rand_gen(),
             stats: GUTAStats::qp_rand_gen(),
+            total_aggregation_proofs_generated: F::qp_rand_gen(),
         }
     }
 }
@@ -62,18 +71,19 @@ impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for GlobalUserTreeAggregator
 
 impl<F: QFelt64, Hash: Q256BitHash> PsyCanonicalSerializeMetadata for GlobalUserTreeAggregatorHeader<F, Hash> {
     const IS_FIXED_SIZE: bool = true;
-    const FIXED_SIZE: usize = 32*2 + SubTreeNodeStateTransition::<F, Hash>::FIXED_SIZE + GUTAStats::<F>::FIXED_SIZE;
+    const FIXED_SIZE: usize = 32*2 + SubTreeNodeStateTransition::<F, Hash>::FIXED_SIZE + GUTAStats::<F>::FIXED_SIZE + 8;
 }
 impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for GlobalUserTreeAggregatorHeader<F, Hash> {
     fn fallback_pio_serialized_size(&self) -> usize {
-         32*2 + SubTreeNodeStateTransition::<F, Hash>::FIXED_SIZE + GUTAStats::<F>::FIXED_SIZE
+         Self::FIXED_SIZE
     }
     
     fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
         writer.psy_write_bytes_fixed(&self.guta_circuit_whitelist.into_owned_32bytes())?;
         writer.psy_write_bytes_fixed(&self.checkpoint_tree_root.into_owned_32bytes())?;
-            self.state_transition.pio_write_to_io(writer)?;
-            self.stats.pio_write_to_io(writer)?;
+        self.state_transition.pio_write_to_io(writer)?;
+        self.stats.pio_write_to_io(writer)?;
+        writer.psy_write_u64(self.total_aggregation_proofs_generated.to_u64_value())?;
         Ok(())
     }
     
@@ -82,11 +92,13 @@ impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for GlobalUser
         let checkpoint_tree_root = Hash::from_owned_32bytes(reader.psy_read_bytes_32()?);
         let state_transition = SubTreeNodeStateTransition::pio_read_from_io(reader)?;
         let stats = GUTAStats::<F>::pio_read_from_io(reader)?;
+        let total_aggregation_proofs_generated = F::from_u64_value(reader.psy_read_u64()?);
         Ok(Self {
             guta_circuit_whitelist,
             checkpoint_tree_root,
             state_transition,
             stats,
+            total_aggregation_proofs_generated,
         })
     }
 

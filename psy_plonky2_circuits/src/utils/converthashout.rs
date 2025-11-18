@@ -23,6 +23,7 @@ pub const fn convert_q_guta_header_to_hashout<F: RichField>(
         checkpoint_tree_root: header.checkpoint_tree_root.0,
         state_transition: convert_q_sub_tree_node_state_transition_to_hashout(header.state_transition),
         stats: header.stats,
+        total_aggregation_proofs_generated: header.total_aggregation_proofs_generated,
     }
 }
 
@@ -47,5 +48,6 @@ pub const fn convert_ho_guta_header_to_qhashout<F: RichField>(
         checkpoint_tree_root: QHashOut(header.checkpoint_tree_root),
         state_transition: convert_ho_sub_tree_node_state_transition_to_qhashout(header.state_transition),
         stats: header.stats,
+        total_aggregation_proofs_generated: header.total_aggregation_proofs_generated,
     }
 }

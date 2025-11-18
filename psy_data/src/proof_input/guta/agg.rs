@@ -14,6 +14,8 @@ pub struct VerifyTwoGUTAProofGadgetStandardInputSimple<F, Hash> {
     pub stats_a: GUTAStats<F>,
     pub stats_b: GUTAStats<F>,
     pub nca_proof: PartialUpdateNearestCommonAncestorProof<Hash>,
+    pub total_aggregation_proofs_generated_a: F,
+    pub total_aggregation_proofs_generated_b: F,
 }
 impl<F: Add<Output = F> + Copy, Hash> VerifyTwoGUTAProofGadgetStandardInputSimple<F, Hash> {
     pub fn get_combined_stats(&self) -> GUTAStats<F> {
@@ -37,6 +39,8 @@ pub struct VerifyTwoGUTAProofGadgetStandardInput<F, Hash> {
 
     pub guta_inclusion_proof_a: MerkleProofCore<Hash>,
     pub guta_inclusion_proof_b: MerkleProofCore<Hash>,
+    pub total_aggregation_proofs_generated_a: F,
+    pub total_aggregation_proofs_generated_b: F,
 }
 
 impl<F: QFelt64, Hash: Copy> VerifyTwoGUTAProofGadgetStandardInput<F, Hash> {
@@ -52,6 +56,7 @@ impl<F: QFelt64, Hash: Copy> VerifyTwoGUTAProofGadgetStandardInput<F, Hash> {
                 node_level: F::from_u8_value(self.nca_proof.get_level_a()),
             },
             stats: self.stats_a,
+            total_aggregation_proofs_generated: self.total_aggregation_proofs_generated_a,
         }
     }
     pub fn get_guta_header_b(&self) -> GlobalUserTreeAggregatorHeader<F, Hash> {
@@ -65,6 +70,7 @@ impl<F: QFelt64, Hash: Copy> VerifyTwoGUTAProofGadgetStandardInput<F, Hash> {
                 node_level: F::from_u8_value(self.nca_proof.get_level_b()),
             },
             stats: self.stats_b,
+            total_aggregation_proofs_generated: self.total_aggregation_proofs_generated_b,
         }
     }
 
@@ -78,6 +84,8 @@ pub struct VerifyTwoGUTAProofUpgradeCheckpointStandardInputSimple<F, Hash> {
     pub stats_a: GUTAStats<F>,
     pub stats_b: GUTAStats<F>,
     pub nca_proof: PartialUpdateNearestCommonAncestorProof<Hash>,
+    pub total_aggregation_proofs_generated_a: F,
+    pub total_aggregation_proofs_generated_b: F,
 }
 impl<F: Add<Output = F> + Copy, Hash> VerifyTwoGUTAProofUpgradeCheckpointStandardInputSimple<F, Hash> {
     pub fn get_combined_stats(&self) -> GUTAStats<F> {
@@ -113,6 +121,8 @@ pub struct VerifyTwoGUTAProofUpgradeCheckpointStandardInput<F, Hash> {
 
     pub guta_inclusion_proof_a: MerkleProofCore<Hash>,
     pub guta_inclusion_proof_b: MerkleProofCore<Hash>,
+    pub total_aggregation_proofs_generated_a: F,
+    pub total_aggregation_proofs_generated_b: F,
 }
 
 
@@ -131,6 +141,7 @@ impl<F: QFelt64, Hash: Copy> VerifyTwoGUTAProofUpgradeCheckpointStandardInput<F,
                 node_level: F::from_u8_value(self.nca_proof.get_level_a()),
             },
             stats: self.stats_a,
+            total_aggregation_proofs_generated: self.total_aggregation_proofs_generated_a,
         }
     }
     pub fn get_guta_header_b<H: MerkleZeroHasher<Hash>>(&self) -> GlobalUserTreeAggregatorHeader<F, Hash> {
@@ -146,6 +157,7 @@ impl<F: QFelt64, Hash: Copy> VerifyTwoGUTAProofUpgradeCheckpointStandardInput<F,
                 node_level: F::from_u8_value(self.nca_proof.get_level_b()),
             },
             stats: self.stats_b,
+            total_aggregation_proofs_generated: self.total_aggregation_proofs_generated_b,
         }
     }
 }
@@ -224,6 +236,7 @@ impl<F: QFelt64, Hash: Copy> VerifyTwoEndCapCircuitInput<F, Hash> {
                 node_level: F::from_u8_value(self.nca_proof.nearest_common_ancestor_level),
             },
             stats: self.a_end_cap.guta_stats.combine_with(&self.b_end_cap.guta_stats),
+            total_aggregation_proofs_generated: F::from_u64_value(1),
         }
     }
 
@@ -271,6 +284,7 @@ impl<F: QFelt64, Hash: Copy> VerifySingleEndCapInput<F, Hash> {
                 node_level: F::from_u8_value(global_user_tree_height),
             },
             stats: self.a_end_cap.guta_stats,
+            total_aggregation_proofs_generated: F::from_u64_value(0),
         }
     }
     pub fn get_new_guta_header(&self, global_user_tree_height: u8) -> GlobalUserTreeAggregatorHeader<F, Hash> {
@@ -284,6 +298,7 @@ impl<F: QFelt64, Hash: Copy> VerifySingleEndCapInput<F, Hash> {
                 node_level: F::from_u8_value(global_user_tree_height),
             },
             stats: self.a_end_cap.guta_stats,
+            total_aggregation_proofs_generated: F::from_u64_value(1),
         }
     }
 }
@@ -329,6 +344,7 @@ pub struct VerifyLeftGUTARightEndCapInputSimple<F, Hash> {
     pub stats_a: GUTAStats<F>,
     pub b_end_cap: VerifyEndCapSimpleStandardInput<F, Hash>,
     pub nca_proof: PartialUpdateNearestCommonAncestorProof<Hash>,
+    pub total_aggregation_proofs_generated_a: F,
 }
 
 impl<F, Hash: Copy + PartialEq> VerifyLeftGUTARightEndCapInputSimple<F, Hash> {
@@ -354,6 +370,7 @@ pub struct VerifyLeftGUTARightEndCapInput<F, Hash> {
     pub nca_proof: PartialUpdateNearestCommonAncestorProof<Hash>,
 
     pub guta_inclusion_proof_a: MerkleProofCore<Hash>,
+    pub total_aggregation_proofs_generated_a: F,
 }
 
 
@@ -371,6 +388,8 @@ impl<F: QFelt64, Hash: Copy> VerifyLeftGUTARightEndCapInput<F, Hash> {
                 node_level: F::from_u8_value(self.nca_proof.get_level_a()),
             },
             stats: self.stats_a,
+            total_aggregation_proofs_generated: self.total_aggregation_proofs_generated_a,
+
         }
     }
     pub fn get_end_result_b(&self) -> PUPSEndCapResultCompact<F, Hash> {
@@ -391,6 +410,7 @@ pub struct VerifyLeftEndCapRightGUTAInputSimple<F, Hash> {
     pub stats_b: GUTAStats<F>,
     pub a_end_cap: VerifyEndCapSimpleStandardInput<F, Hash>,
     pub nca_proof: PartialUpdateNearestCommonAncestorProof<Hash>,
+    pub total_aggregation_proofs_generated_b: F,
 
 }
 
@@ -421,6 +441,7 @@ pub struct VerifyLeftEndCapRightGUTAInput<F, Hash> {
     pub nca_proof: PartialUpdateNearestCommonAncestorProof<Hash>,
 
     pub guta_inclusion_proof_b: MerkleProofCore<Hash>,
+    pub total_aggregation_proofs_generated_b: F,
 }
 
 
@@ -437,6 +458,7 @@ impl<F: QFelt64, Hash: PartialEq + Copy> VerifyLeftEndCapRightGUTAInput<F, Hash>
                 node_level: F::from_u8_value(self.nca_proof.get_level_b()),
             },
             stats: self.stats_b,
+            total_aggregation_proofs_generated: self.total_aggregation_proofs_generated_b,
         }
     }
     pub fn get_end_result_a(&self) -> PUPSEndCapResultCompact<F, Hash> {
@@ -544,6 +566,7 @@ impl<F: QFelt64, Hash: PartialEq + Copy> VerifyGUTAToCapCircuitInputSimple<F, Ha
             checkpoint_tree_root: self.guta_proof_header.checkpoint_tree_root,
             state_transition: self.get_new_state_transition::<H>(),
             stats: self.guta_proof_header.stats,
+            total_aggregation_proofs_generated: self.guta_proof_header.total_aggregation_proofs_generated,
         }
 
     }
@@ -557,6 +580,7 @@ pub struct VerifyGUTAToCapUpgradeCheckpointCircuitInputSimple<F, Hash> {
     pub guta_proof_header: GlobalUserTreeAggregatorHeader<F, Hash>,
     pub top_line_siblings: Vec<Hash>,
     pub historical_checkpoint_proof: MerkleProofCore<Hash>,
+    pub total_aggregation_proofs_generated: F,
 }
 
 impl<F: QFelt64, Hash: PartialEq + Copy> VerifyGUTAToCapUpgradeCheckpointCircuitInputSimple<F, Hash> {
@@ -596,6 +620,7 @@ impl<F: QFelt64, Hash: PartialEq + Copy> VerifyGUTAToCapUpgradeCheckpointCircuit
             checkpoint_tree_root: self.historical_checkpoint_proof.root,
             state_transition: self.get_new_state_transition::<H>(),
             stats: self.guta_proof_header.stats,
+            total_aggregation_proofs_generated: self.total_aggregation_proofs_generated,
         }
 
     }

@@ -344,6 +344,8 @@ where
                 nca_proof: r.input.nca_proof,
                 guta_inclusion_proof_a,
                 guta_inclusion_proof_b,
+                total_aggregation_proofs_generated_a: r.input.total_aggregation_proofs_generated_a,
+                total_aggregation_proofs_generated_b: r.input.total_aggregation_proofs_generated_b,
             },
             &child_a_proof,
             &child_a_verifier_data,
