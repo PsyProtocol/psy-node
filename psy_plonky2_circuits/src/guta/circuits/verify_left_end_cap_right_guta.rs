@@ -1,8 +1,6 @@
 use async_trait::async_trait;
 use parth_core::{
-    crypto::hash::traits::MerkleZeroHasher,
-    data::proof_input::CircuitInputWithDependencies,
-    pgoldilocks::{QHashOut, QRichField},
+    crypto::hash::traits::MerkleZeroHasher, felt::QFelt64, pgoldilocks::{QHashOut, QRichField}, protocol::core_types::Q256BitHash
 };
 use plonky2::{
     gates::{constant::ConstantGate, gate::GateRef},
@@ -16,23 +14,22 @@ use plonky2::{
     },
 };
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
-use psy_data::proof_input::guta::{VerifyLeftEndCapRightGUTAInput, VerifyLeftEndCapRightGUTAInputSimple};
+use psy_data::{proof_input::guta::{VerifyLeftEndCapRightGUTAInput, VerifyLeftEndCapRightGUTAInputSimple}, worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse};
 use psy_plonky2_basic_helpers::{
     builder::{hash::core::CircuitBuilderHashCore, pad_circuit::pad_circuit_degree},
     verifier::circuit_library::CircuitInfoLibrary,
 };
-use psy_plonky2_common_circuits::traits::ToTargets;
+use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 
 use crate::{
-    gadgets::qdata::pm_jobs_completed_stats::PMJobsCompletedStatsGadget,
     guta::gadgets::{
         helpers::ToGUTAHeader, two_nca_state_transition::TwoNCAStateTransitionGadget, verify_end_cap::VerifyEndCapProofGadget,
         verify_guta_proof::VerifyGUTAProofGadget,
     },
     proof_minifier::pm_core::get_circuit_fingerprint_generic,
     qstandard::{
-        proof_store::QProofStoreReaderAsync, QPsyNetworkCircuitWithType, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync,
-    },
+        QPsyNetworkCircuitWithType, QStandardCircuit, QStandardCircuitProvableWithRawProofsAndRefLibraryAsync
+    }, utils::proof_llbrary::get_two_child_proofs_for_api_response_with_inclusion_proof,
 };
 
 #[derive(Debug)]
@@ -44,7 +41,6 @@ where
     pub b_guta_gadget: VerifyGUTAProofGadget<D>,
     pub nca_state_transition_gadget: TwoNCAStateTransitionGadget,
     pub worker_rewards_tree_tag_target: HashOutTarget,
-    pub pm_jobs_completed: PMJobsCompletedStatsGadget,
 
     pub circuit_data: CircuitData<C::F, C, D>,
     pub fingerprint: QHashOut<C::F>,
@@ -112,51 +108,16 @@ where
             global_user_tree_height as u8,
         );
 
-        let public_inputs_hash = nca_state_transition_gadget.new_guta_header.to_hash::<C::Hasher, C::F, D>(&mut builder);
-
-        let worker_rewards_tree_tag = builder.add_virtual_hash();
-
-        // builder.assert_non_zero_hash(worker_rewards_tree_tag);
-
-        let a_commitment = builder.constant_hash(HashOut::ZERO);
-
-        let b_commitment = HashOutTarget {
-            elements: [
-                b_guta_gadget.proof_target.public_inputs[0],
-                b_guta_gadget.proof_target.public_inputs[1],
-                b_guta_gadget.proof_target.public_inputs[2],
-                b_guta_gadget.proof_target.public_inputs[3],
-            ],
-        };
-        let b_worker_rewards_tree_tag = HashOutTarget {
-            elements: [
-                b_guta_gadget.proof_target.public_inputs[4],
-                b_guta_gadget.proof_target.public_inputs[5],
-                b_guta_gadget.proof_target.public_inputs[6],
-                b_guta_gadget.proof_target.public_inputs[7],
-            ],
-        };
-
-        let b_pm_jobs_completed = [
-            b_guta_gadget.proof_target.public_inputs[8],
-            b_guta_gadget.proof_target.public_inputs[9],
-            b_guta_gadget.proof_target.public_inputs[10],
-        ];
-
-        let one = builder.one();
-        let final_gutas = builder.add(b_pm_jobs_completed[2], one);
-        let pm_jobs_completed = PMJobsCompletedStatsGadget {
-            deploy_contracts_completed: b_pm_jobs_completed[0],
-            register_users_completed: b_pm_jobs_completed[1],
-            gutas_completed: final_gutas,
-        };
-
-        let b_final_commitment = builder.hash_two_to_one::<C::Hasher>(b_commitment, b_worker_rewards_tree_tag);
-        let commitment = builder.hash_two_to_one::<C::Hasher>(b_final_commitment, a_commitment);
-
-        builder.register_public_inputs(&commitment.elements);
-        builder.register_public_inputs(&worker_rewards_tree_tag.elements);
-        builder.register_public_inputs(&pm_jobs_completed.to_targets());
+        // compute public inputs hash from worker rewards tree tag and child rewards tree value
+        // left child rewards tree value => Zero Hash, because it is an end cap
+        // right child rewards tree value => The rewards tree value from the right hand proof verified in b_guta_gadget
+        let worker_rewards_tree_tag_target = builder.add_virtual_hash();
+        let right_child_proof_rewards_tree_value = b_guta_gadget.rewards_tree_value;
+        let public_inputs_hash = nca_state_transition_gadget.new_guta_header.get_public_inputs_hash_left_end_cap::<C::Hasher, C::F, D>(
+            &mut builder,
+            right_child_proof_rewards_tree_value,
+            worker_rewards_tree_tag_target
+        );
         builder.register_public_inputs(&public_inputs_hash.elements);
 
         builder.add_gate_to_gate_set(GateRef::new(ConstantGate::new(builder.config.num_constants)));
@@ -167,12 +128,11 @@ where
 
         Self {
             nca_state_transition_gadget,
-            pm_jobs_completed,
             circuit_data,
             fingerprint,
             a_end_cap_gadget,
             b_guta_gadget,
-            worker_rewards_tree_tag_target: worker_rewards_tree_tag,
+            worker_rewards_tree_tag_target,
         }
     }
 
@@ -184,6 +144,7 @@ where
         end_cap_verifier_data: &VerifierOnlyCircuitData<C, D>,
         child_b_proof: &ProofWithPublicInputs<C::F, C, D>,
         child_b_verifier_data: &VerifierOnlyCircuitData<C, D>,
+        right_child_proof_rewards_tree_value: QHashOut<C::F>,
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
         let mut pw = PartialWitness::<C::F>::new();
 
@@ -204,6 +165,7 @@ where
             &input.get_guta_header_b(),
             child_b_proof,
             child_b_verifier_data,
+            right_child_proof_rewards_tree_value,
         )?;
 
         self.nca_state_transition_gadget.set_witness_partial(&mut pw, &input.nca_proof)?;
@@ -229,54 +191,49 @@ where
     }
 }
 
+
+
 #[async_trait]
-impl<S: QProofStoreReaderAsync + Send + Sync, L: CircuitInfoLibrary<C, D> + Send + Sync, C: GenericConfig<D> + 'static, const D: usize>
-    QStandardCircuitProvableWithProofStoreAndRefLibraryAsync<S, L, C, D> for GUTAVerifyLeftEndCapRightGUTACircuit<C, D>
+impl<
+        L: CircuitInfoLibrary<C, D> + Send + Sync,
+        C: GenericConfig<D>,
+        const D: usize,
+    > QStandardCircuitProvableWithRawProofsAndRefLibraryAsync<L, C, D>
+    for GUTAVerifyLeftEndCapRightGUTACircuit<C, D>
 where
-    C::Hasher: AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>>,
-    C::F: QRichField,
+     C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>>, QHashOut<C::F>: Q256BitHash, C::F: QFelt64 + QRichField,
 {
-    async fn prove_with_proof_store_async(
+
+    async fn prove_with_raw_proofs_and_ref_library_async(
         &self,
-        store: &S,
         library: &L,
-        job_id: QProvingJobDataID,
-        worker_rewards_tree_tag: QHashOut<C::F>,
-    ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
-        let r: CircuitInputWithDependencies<VerifyLeftEndCapRightGUTAInputSimple<C::F, QHashOut<C::F>>, QProvingJobDataID> =
-            bincode::deserialize(&store.get_bytes_by_id(job_id.get_input_witness_id()).await?).map_err(|e| anyhow::anyhow!(e))?;
-        tracing::debug!("GUTAVerifyLeftEndCapRightGUTACircuitInput: {}", serde_json::to_string_pretty(&r)?);
+        input: PsyWorkerGetProvingWorkWithChildProofsAPIResponse<QHashOut<C::F>, QProvingJobDataID>,
+        worker_reward_tag: QHashOut<C::F>,
+    ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>>{
 
-        if r.dependencies.len() != 2 {
-            anyhow::bail!("invalid dependency count in left end cap right guta input");
-        }
-
-        let child_a_proof = store.get_proof_by_id(r.dependencies[0]).await?;
-        let child_b_proof = store.get_proof_by_id(r.dependencies[1]).await?;
-
-        let dep_a_type = r.dependencies[0].circuit_type;
-        let dep_b_type = r.dependencies[1].circuit_type;
-
-        let child_a_verifier_data = library.get_verifier_data(dep_a_type)?;
-        let child_b_verifier_data = library.get_verifier_data(dep_b_type)?;
-        let guta_inclusion_proof_b = library.get_group_inclusion_proof(job_id.circuit_type, dep_b_type)?;
-
-        let result = self.prove_base(
-            worker_rewards_tree_tag,
-            &VerifyLeftEndCapRightGUTAInput {
-                checkpoint_tree_root: r.input.checkpoint_tree_root,
-                stats_b: r.input.stats_b,
-                a_end_cap: r.input.a_end_cap,
-                nca_proof: r.input.nca_proof,
-                guta_inclusion_proof_b,
-                total_aggregation_proofs_generated_b: r.input.total_aggregation_proofs_generated_b,
-            },
-            &child_a_proof,
-            &child_a_verifier_data,
-            &child_b_proof,
-            &child_b_verifier_data,
+        let (left_child_end_cap_proof_result, right_child_guta_proof_result) = get_two_child_proofs_for_api_response_with_inclusion_proof::<L, C, D>(
+            library,
+            &input,
         )?;
 
-        Ok(result)
+
+        let witness = VerifyLeftEndCapRightGUTAInputSimple::<C::F, QHashOut<C::F>>::psy_ser_from_slice(&input.base.witness)?;
+        
+        self.prove_base(
+            worker_reward_tag,
+            &VerifyLeftEndCapRightGUTAInput {
+                checkpoint_tree_root: witness.checkpoint_tree_root,
+                stats_b: witness.stats_b,
+                a_end_cap: witness.a_end_cap,
+                nca_proof: witness.nca_proof,
+                guta_inclusion_proof_b: right_child_guta_proof_result.whitelist_inclusion_proof,
+                total_aggregation_proofs_generated_b: witness.total_aggregation_proofs_generated_b,
+            },
+            &left_child_end_cap_proof_result.zk_proof,
+            &left_child_end_cap_proof_result.verifier_data,
+            &right_child_guta_proof_result.zk_proof,
+            &right_child_guta_proof_result.verifier_data,
+            right_child_guta_proof_result.reward_tag_tree_value,
+        )
     }
 }

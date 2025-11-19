@@ -2,7 +2,7 @@ use parth_core::{crypto::hash::{spiderman::SpidermanUpdateProof, traits::{FieldQ
 use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
 use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
 
-use crate::agg::{AggStateTrackableInput, AggStateTransition, AggStateWitnessV2};
+use crate::agg::{AggStateTrackableInput, AggStateTransition};
 
 
 

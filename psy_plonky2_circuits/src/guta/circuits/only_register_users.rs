@@ -10,7 +10,7 @@ use plonky2::{
     }
 };
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
-use psy_data::{proof_input::guta::{GUTAOnlyRegisterUsersInput, GUTARegisterUserFullInput}, v1::qdata::pm_jobs_completed_stats::PPMJobsCompletedStats};
+use psy_data::proof_input::guta::{GUTAOnlyRegisterUsersInput, GUTARegisterUserFullInput};
 use psy_plonky2_basic_helpers::{
     builder::pad_circuit::CircuitBuilderQEDCommonGates, verifier::circuit_library::CircuitInfoLibrary,
    

@@ -1,13 +1,12 @@
 
 
-use std::{hash::Hash, ops::Add};
+use std::hash::Hash;
 
-use parth_core::{crypto::hash::{merkle_proof::{DeltaMerkleProofCore, MerkleProofCore, compute_historical_and_current_merkle_roots_core_gt}, nca::nca_proof::PartialUpdateNearestCommonAncestorProof, traits::{FieldQHasher, MerkleHasher, MerkleZeroHasher, QFieldHashable, ZeroableHash}}, felt::QFelt64, protocol::core_types::{Q256BitHash, QFHashBase}, utils::QPGenRandom};
-use psy_core::job::job_id::{self, QProvingJobDataID};
+use parth_core::{crypto::hash::{merkle_proof::{DeltaMerkleProofCore, MerkleProofCore}, traits::ZeroableHash}, felt::QFelt64, protocol::core_types::Q256BitHash, utils::QPGenRandom};
 use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
 use psy_serialize::{PsyCanonicalSerializeMetadata, PsyIOReadWrite};
 
-use crate::{guta::{header::GlobalUserTreeAggregatorHeader, header_extended::GlobalUserTreeAggregatorHeaderWithTagValue, stats::GUTAStats, sub_tree_transition::SubTreeNodeStateTransition}, v1::qdata::{checkpoint::{self, PQEDCheckpointLeafCompactWithStateRoots}, user::PQEDUserLeaf, user_end_cap_result::PUPSEndCapResultCompact}};
+use crate::{guta::header::GlobalUserTreeAggregatorHeader, v1::qdata::checkpoint::PQEDCheckpointLeafCompactWithStateRoots};
 use psy_serialize::FallbackPsySerializeCanonical;
 
 

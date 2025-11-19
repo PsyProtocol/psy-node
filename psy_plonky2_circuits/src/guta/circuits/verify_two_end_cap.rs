@@ -10,15 +10,13 @@ use plonky2::{
     }
 };
 use parth_core::{
-    crypto::hash::traits::MerkleZeroHasher,
-    data::proof_input::CircuitInputWithDependencies,
-    pgoldilocks::{QHashOut, QRichField},
+    crypto::hash::traits::MerkleZeroHasher, data::proof_input::CircuitInputWithDependencies, felt::QFelt64, pgoldilocks::{QHashOut, QRichField}, protocol::core_types::Q256BitHash
 };
 use psy_core::
     job::job_id::{ProvingJobCircuitType, QProvingJobDataID}
 ;
-use psy_data::
-    proof_input::guta::VerifyTwoEndCapCircuitInput;
+use psy_data::{
+    proof_input::guta::VerifyTwoEndCapCircuitInput, worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse};
 use psy_plonky2_basic_helpers::{
     builder::{
         hash::core::CircuitBuilderHashCore,
@@ -26,10 +24,11 @@ use psy_plonky2_basic_helpers::{
     },
     verifier::circuit_library::CircuitInfoLibrary,
 };
+use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 
 use crate::{
     proof_minifier::pm_core::get_circuit_fingerprint_generic,
-    qstandard::{proof_store::QProofStoreReaderAsync, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QPsyNetworkCircuitWithType},
+    qstandard::{QPsyNetworkCircuitWithType, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QStandardCircuitProvableWithRawProofsAndRefLibraryAsync, proof_store::QProofStoreReaderAsync}, utils::proof_llbrary::get_two_child_proofs_for_api_response_with_inclusion_proof,
 };
 
 use crate::guta::gadgets::{two_nca_state_transition::TwoNCAStateTransitionGadget, verify_end_cap::VerifyEndCapProofGadget};
@@ -252,3 +251,39 @@ C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>>, C::F: QRichFi
     }
 }
 
+
+#[async_trait]
+impl<
+        L: CircuitInfoLibrary<C, D> + Send + Sync,
+        C: GenericConfig<D>,
+        const D: usize,
+    > QStandardCircuitProvableWithRawProofsAndRefLibraryAsync<L, C, D>
+    for GUTAVerifyTwoEndCapCircuit<C, D>
+where
+     C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>>, QHashOut<C::F>: Q256BitHash, C::F: QFelt64 + QRichField,
+{
+
+    async fn prove_with_raw_proofs_and_ref_library_async(
+        &self,
+        library: &L,
+        input: PsyWorkerGetProvingWorkWithChildProofsAPIResponse<QHashOut<C::F>, QProvingJobDataID>,
+        worker_reward_tag: QHashOut<C::F>,
+    ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>>{
+
+        let (left_child_end_cap_proof_result, right_child_end_cap_proof_result) = get_two_child_proofs_for_api_response_with_inclusion_proof::<L, C, D>(
+            library,
+            &input,
+        )?;
+
+
+        let witness = VerifyTwoEndCapCircuitInput::<C::F, QHashOut<C::F>>::psy_ser_from_slice(&input.base.witness)?;
+        
+        self.prove_base(
+            worker_reward_tag,
+            &witness,
+            &left_child_end_cap_proof_result.zk_proof,
+            &right_child_end_cap_proof_result.zk_proof,
+            &left_child_end_cap_proof_result.verifier_data,
+        )
+    }
+}

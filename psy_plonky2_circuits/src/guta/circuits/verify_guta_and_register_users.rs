@@ -10,13 +10,13 @@ use plonky2::{
     }
 };
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
-use psy_data::{guta::header::GlobalUserTreeAggregatorHeader, proof_input::guta::{GUTARegisterUserFullInput, VerifyGUTARegisterUsersCircuitInputSimple}, protocol::circuit_inputs::deploy_contracts::QCBatchDeployContractsCircuitInput, rewards_tree, worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse};
-use psy_plonky2_basic_helpers::{
-    builder::hash::core::CircuitBuilderHashCore, verifier::circuit_library::CircuitInfoLibrary,
+use psy_data::{guta::header::GlobalUserTreeAggregatorHeader, proof_input::guta::{GUTARegisterUserFullInput, VerifyGUTARegisterUsersCircuitInputSimple}, worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse};
+use psy_plonky2_basic_helpers::
+    verifier::circuit_library::CircuitInfoLibrary
    
-};
-use psy_plonky2_common_circuits::traits::ToTargets;
-use crate::{gadgets::qdata::pm_jobs_completed_stats::PMJobsCompletedStatsGadget, proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{QPsyNetworkCircuitWithType, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QStandardCircuitProvableWithRawProofsAndRefLibraryAsync, proof_store::QProofStoreReaderAsync}};
+;
+use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
+use crate::{proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{QPsyNetworkCircuitWithType, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QStandardCircuitProvableWithRawProofsAndRefLibraryAsync, proof_store::QProofStoreReaderAsync}, utils::proof_llbrary::get_single_child_proof_for_api_response_with_inclusion_proof};
 
 use crate::{guta::gadgets::guta_register_users_batch::GUTARegisterUsersBatchGadget};
 
@@ -216,17 +216,28 @@ where
 
     async fn prove_with_raw_proofs_and_ref_library_async(
         &self,
-        _library: &L,
+        library: &L,
         input: PsyWorkerGetProvingWorkWithChildProofsAPIResponse<QHashOut<C::F>, QProvingJobDataID>,
         worker_reward_tag: QHashOut<C::F>,
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>>{
 
-        let witness = VerifyGUTARegisterUsersCircuitInputSimple::<C::F, QHashOut<C::F>>::psy_ser_from_slice(&input.base.witness)?;
+        let child_proof_result = get_single_child_proof_for_api_response_with_inclusion_proof::<L, C, D>(
+            library,
+            &input,
+        )?;
+
+
+        let witness:VerifyGUTARegisterUsersCircuitInputSimple<C::F, QHashOut<C::F>> = VerifyGUTARegisterUsersCircuitInputSimple::<C::F, QHashOut<C::F>>::psy_ser_from_slice(&input.base.witness)?;
+        
         self.prove_base(
-            witness.deploy_contract_circuit_whitelist,
             worker_reward_tag,
-            &witness.spiderman_append_proof,
-            &witness.contract_leaves,
+            &child_proof_result.whitelist_inclusion_proof,
+            &witness.guta_proof_header,
+            &child_proof_result.zk_proof,
+            &child_proof_result.verifier_data,
+            &witness.top_line_siblings,
+            &witness.guta_register_user_inputs,
+            child_proof_result.reward_tag_tree_value
         )
     }
 }

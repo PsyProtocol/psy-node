@@ -6,18 +6,16 @@ use plonky2::{
         circuit_data::{CircuitConfig, CircuitData, CommonCircuitData, VerifierOnlyCircuitData},
         config::{AlgebraicHasher, GenericConfig},
         proof::ProofWithPublicInputs,
-    }, field::types::Field
+    }
 };
 use parth_core::{
-    crypto::hash::traits::MerkleZeroHasher,
-    data::proof_input::CircuitInputWithDependencies,
-    pgoldilocks::{QHashOut, QRichField},
+    crypto::hash::traits::MerkleZeroHasher, data::proof_input::CircuitInputWithDependencies, felt::QFelt64, pgoldilocks::{QHashOut, QRichField}, protocol::core_types::Q256BitHash
 };
 use psy_core::
     job::job_id::{ProvingJobCircuitType, QProvingJobDataID}
 ;
 use psy_data::{
-    proof_input::guta::VerifySingleEndCapInput, v1::qdata::pm_jobs_completed_stats::PPMJobsCompletedStats
+    proof_input::guta::VerifySingleEndCapInput, worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse
     ,
 };
 use psy_plonky2_basic_helpers::{
@@ -27,12 +25,11 @@ use psy_plonky2_basic_helpers::{
     },
     verifier::circuit_library::CircuitInfoLibrary,
 };
-use psy_plonky2_common_circuits::traits::ToTargets;
+use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 
 use crate::{
-    gadgets::qdata::pm_jobs_completed_stats::PMJobsCompletedStatsGadget,
     proof_minifier::pm_core::get_circuit_fingerprint_generic,
-    qstandard::{proof_store::QProofStoreReaderAsync, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QPsyNetworkCircuitWithType},
+    qstandard::{QPsyNetworkCircuitWithType, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QStandardCircuitProvableWithRawProofsAndRefLibraryAsync, proof_store::QProofStoreReaderAsync}, utils::proof_llbrary::get_single_child_proof_for_api_response_with_inclusion_proof,
 };
 
 use crate::guta::gadgets::verify_end_cap::VerifyEndCapProofGadget;
@@ -98,7 +95,7 @@ where
 
         // because we are still generating a proof, it needs to be counted
         a_end_cap_guta_header.total_aggregation_proofs_generated = builder.one();
-        let public_inputs_hash = a_end_cap_guta_header.to_hash::<C::Hasher, C::F, D>(&mut builder);
+        let public_inputs_hash = a_end_cap_guta_header.get_public_inputs_hash_no_children::<C::Hasher, C::F, D>(&mut builder, worker_rewards_tree_tag);
 
         builder.register_public_inputs(&public_inputs_hash.elements);
 
@@ -204,5 +201,41 @@ where
         )?;
 
         Ok(result)
+    }
+}
+
+
+#[async_trait]
+impl<
+        L: CircuitInfoLibrary<C, D> + Send + Sync,
+        C: GenericConfig<D>,
+        const D: usize,
+    > QStandardCircuitProvableWithRawProofsAndRefLibraryAsync<L, C, D>
+    for GUTAVerifySingleEndCapCircuit<C, D>
+where
+     C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>>, QHashOut<C::F>: Q256BitHash, C::F: QFelt64 + QRichField,
+{
+
+    async fn prove_with_raw_proofs_and_ref_library_async(
+        &self,
+        library: &L,
+        input: PsyWorkerGetProvingWorkWithChildProofsAPIResponse<QHashOut<C::F>, QProvingJobDataID>,
+        worker_reward_tag: QHashOut<C::F>,
+    ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>>{
+
+        let child_proof_result = get_single_child_proof_for_api_response_with_inclusion_proof::<L, C, D>(
+            library,
+            &input,
+        )?;
+
+
+        let witness = VerifySingleEndCapInput::<C::F, QHashOut<C::F>>::psy_ser_from_slice(&input.base.witness)?;
+        
+        self.prove_base(
+            worker_reward_tag,
+            &witness,
+            &child_proof_result.zk_proof,
+            &child_proof_result.verifier_data,
+        )
     }
 }

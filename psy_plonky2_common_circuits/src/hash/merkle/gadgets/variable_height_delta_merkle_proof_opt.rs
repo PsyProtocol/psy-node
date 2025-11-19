@@ -1026,7 +1026,7 @@ mod tests {
 
         let circuit = builder.build::<C>();
 
-        let mut pw = PartialWitness::new();
+        let pw = PartialWitness::new();
         let proof = circuit.prove(pw)?;
 
         circuit.verify(proof.clone())?;

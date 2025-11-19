@@ -9,34 +9,30 @@ use plonky2::{
     }
 };
 use parth_core::{
-    crypto::hash::{merkle_proof::MerkleProofCore, traits::MerkleZeroHasher},
-    data::proof_input::CircuitInputWithDependencies,
-    pgoldilocks::QHashOut,
+    crypto::hash::{merkle_proof::MerkleProofCore, traits::MerkleZeroHasher}, felt::QFelt64, pgoldilocks::QHashOut, protocol::core_types::Q256BitHash
 };
 use psy_core::
     job::job_id::{ProvingJobCircuitType, QProvingJobDataID}
 ;
 use psy_data::{
     guta::header::GlobalUserTreeAggregatorHeader,
-    proof_input::guta::VerifyGUTAToCapCircuitInputSimple
+    proof_input::guta::VerifyGUTAToCapCircuitInputSimple, worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse
     ,
 };
 use psy_plonky2_basic_helpers::{
-    builder::{
-        hash::core::CircuitBuilderHashCore,
-        pad_circuit::pad_circuit_degree,
-    },
+    builder::
+        pad_circuit::pad_circuit_degree
+    ,
     verifier::circuit_library::CircuitInfoLibrary,
 };
-use psy_plonky2_common_circuits::traits::ToTargets;
+use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 
 use crate::{
-    gadgets::qdata::pm_jobs_completed_stats::PMJobsCompletedStatsGadget,
     guta::gadgets::
         verify_guta_proof_to_line::VerifyGUTAProofToLineGadget
     ,
     proof_minifier::pm_core::get_circuit_fingerprint_generic,
-    qstandard::{proof_store::QProofStoreReaderAsync, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QPsyNetworkCircuitWithType},
+    qstandard::{QPsyNetworkCircuitWithType, QStandardCircuit, QStandardCircuitProvableWithRawProofsAndRefLibraryAsync}, utils::proof_llbrary::get_single_child_proof_for_api_response_with_inclusion_proof,
 };
 
 
@@ -45,7 +41,6 @@ pub struct GUTAVerifyGUTAToCapCircuit<C: GenericConfig<D>, const D: usize>
 {
     pub verify_to_line_gadget: VerifyGUTAProofToLineGadget<D>,
     pub worker_rewards_tree_tag_target: HashOutTarget,
-    pub pm_jobs_completed: PMJobsCompletedStatsGadget,
 
     pub circuit_data: CircuitData<C::F, C, D>,
     pub fingerprint: QHashOut<C::F>,
@@ -83,50 +78,14 @@ where
             guta_circuit_whitelist_tree_height
         );
 
-        let public_inputs_hash = verify_to_line_gadget.get_guta_header_line().to_hash::<C::Hasher, C::F, D>(&mut builder);
-
-        let worker_rewards_tree_tag = builder.add_virtual_hash();
-
-        // builder.assert_non_zero_hash(worker_rewards_tree_tag);
-
-        let child_commitment = HashOutTarget {
-            elements: [
-                verify_to_line_gadget.verify_guta_proof_gadget.proof_target.public_inputs[0],
-                verify_to_line_gadget.verify_guta_proof_gadget.proof_target.public_inputs[1],
-                verify_to_line_gadget.verify_guta_proof_gadget.proof_target.public_inputs[2],
-                verify_to_line_gadget.verify_guta_proof_gadget.proof_target.public_inputs[3],
-            ]
-        };
-        let child_worker_rewards_tree_tag = HashOutTarget {
-            elements: [
-                verify_to_line_gadget.verify_guta_proof_gadget.proof_target.public_inputs[4],
-                verify_to_line_gadget.verify_guta_proof_gadget.proof_target.public_inputs[5],
-                verify_to_line_gadget.verify_guta_proof_gadget.proof_target.public_inputs[6],
-                verify_to_line_gadget.verify_guta_proof_gadget.proof_target.public_inputs[7],
-            ]
-        };
-
-        let child_pm_jobs_completed = [
-            verify_to_line_gadget.verify_guta_proof_gadget.proof_target.public_inputs[8],
-            verify_to_line_gadget.verify_guta_proof_gadget.proof_target.public_inputs[9],
-            verify_to_line_gadget.verify_guta_proof_gadget.proof_target.public_inputs[10],
-        ];
-
-        let one = builder.one();
-        let final_gutas = builder.add(child_pm_jobs_completed[2], one);
-        let pm_jobs_completed = PMJobsCompletedStatsGadget {
-            deploy_contracts_completed: child_pm_jobs_completed[0],
-            register_users_completed: child_pm_jobs_completed[1],
-            gutas_completed: final_gutas,
-        };
-
-        let zero_hash = builder.constant_hash(HashOut::ZERO);
-        let commitment = builder.hash_two_to_one::<C::Hasher>(child_commitment, child_worker_rewards_tree_tag);
-        let final_commitment = builder.hash_two_to_one::<C::Hasher>(commitment, zero_hash);
-
-        builder.register_public_inputs(&final_commitment.elements);
-        builder.register_public_inputs(&worker_rewards_tree_tag.elements);
-        builder.register_public_inputs(&pm_jobs_completed.to_targets());
+        // generate public inputs hash from worker rewards tree tag and child rewards tree value
+        let worker_rewards_tree_tag_target = builder.add_virtual_hash();
+        let child_proof_rewards_tree_value = verify_to_line_gadget.verify_guta_proof_gadget.rewards_tree_value;
+        let public_inputs_hash = verify_to_line_gadget.get_guta_header_line().get_public_inputs_hash_single_child::<C::Hasher, C::F, D>(
+            &mut builder, 
+            child_proof_rewards_tree_value,
+            worker_rewards_tree_tag_target
+        );
         builder.register_public_inputs(&public_inputs_hash.elements);
 
         builder.add_gate_to_gate_set(GateRef::new(ConstantGate::new(builder.config.num_constants)));
@@ -141,8 +100,7 @@ where
             circuit_data,
             fingerprint,
             verify_to_line_gadget,
-            worker_rewards_tree_tag_target: worker_rewards_tree_tag,
-            pm_jobs_completed,
+            worker_rewards_tree_tag_target,
         }
     }
 
@@ -154,6 +112,7 @@ where
         verifier_data: &VerifierOnlyCircuitData<C, D>,
         top_line_siblings: &[QHashOut<C::F>],
         worker_rewards_tree_tag: QHashOut<C::F>,
+        child_proof_rewards_tree_value: QHashOut<C::F>,
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
 
         let mut pw = PartialWitness::<C::F>::new();
@@ -165,6 +124,7 @@ where
             proof,
             verifier_data,
             top_line_siblings,
+            child_proof_rewards_tree_value,
         )?;
 
         pw.set_hash_target(self.worker_rewards_tree_tag_target, worker_rewards_tree_tag.0)?;
@@ -193,53 +153,40 @@ where
     }
 }
 
-
 #[async_trait]
 impl<
-        S: QProofStoreReaderAsync + Send + Sync,
         L: CircuitInfoLibrary<C, D> + Send + Sync,
-        C: GenericConfig<D> + 'static,
+        C: GenericConfig<D>,
         const D: usize,
-    > QStandardCircuitProvableWithProofStoreAndRefLibraryAsync<S, L, C, D>
+    > QStandardCircuitProvableWithRawProofsAndRefLibraryAsync<L, C, D>
     for GUTAVerifyGUTAToCapCircuit<C, D>
 where
-    C::Hasher: AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>>
+     C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>>, QHashOut<C::F>: Q256BitHash, C::F: QFelt64,
 {
-    async fn prove_with_proof_store_async(
+
+    async fn prove_with_raw_proofs_and_ref_library_async(
         &self,
-        store: &S,
         library: &L,
-        job_id: QProvingJobDataID,
-        worker_rewards_tree_tag: QHashOut<C::F>,
-    ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
-        let r: CircuitInputWithDependencies<VerifyGUTAToCapCircuitInputSimple<C::F, QHashOut<C::F>>, QProvingJobDataID> =
-            bincode::deserialize(&store.get_bytes_by_id(job_id.get_input_witness_id()).await?)
-                .map_err(|e| anyhow::anyhow!(e))?;
-        tracing::debug!("GUTAVerifyGUTAToCapCircuitInput: {}", serde_json::to_string_pretty(&r)?);
+        input: PsyWorkerGetProvingWorkWithChildProofsAPIResponse<QHashOut<C::F>, QProvingJobDataID>,
+        worker_reward_tag: QHashOut<C::F>,
+    ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>>{
 
-        if r.dependencies.len() != 1 {
-            anyhow::bail!("invalid dependency count in guta to cap input");
-        }
-
-
-        let child_a_proof = store.get_proof_by_id(r.dependencies[0]).await?;
-
-        let dep_a_type = r.dependencies[0].circuit_type;
-
-        let child_a_verifier_data = library.get_verifier_data(dep_a_type)?;
-
-        let guta_inclusion_proof_a =
-            library.get_group_inclusion_proof(job_id.circuit_type, dep_a_type)?;
-
-        let result = self.prove_base(
-            &guta_inclusion_proof_a,
-            &r.input.guta_proof_header,
-            &child_a_proof,
-            &child_a_verifier_data,
-            &r.input.top_line_siblings,
-            worker_rewards_tree_tag,
+        let child_proof_result = get_single_child_proof_for_api_response_with_inclusion_proof::<L, C, D>(
+            library,
+            &input,
         )?;
 
-        Ok(result)
+
+        let witness = VerifyGUTAToCapCircuitInputSimple::<C::F, QHashOut<C::F>>::psy_ser_from_slice(&input.base.witness)?;
+        
+        self.prove_base(
+            &child_proof_result.whitelist_inclusion_proof,
+            &witness.guta_proof_header,
+            &child_proof_result.zk_proof,
+            &child_proof_result.verifier_data,
+            &witness.top_line_siblings,
+            worker_reward_tag,
+            child_proof_result.reward_tag_tree_value
+        )
     }
 }

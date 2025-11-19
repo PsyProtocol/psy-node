@@ -176,10 +176,10 @@ impl GlobalUserTreeAggregatorHeaderGadget {
     pub fn get_public_inputs_hash_right_end_cap<H:AlgebraicHasher<F>, F: RichField + Extendable<D>, const D: usize>(
         &self,
         builder: &mut CircuitBuilder<F, D>,
-        right_child_rewards_tree_value: HashOutTarget,
+        left_child_rewards_tree_value: HashOutTarget,
         rewards_tree_tag: HashOutTarget,
     ) -> HashOutTarget {
-        let left_child_rewards_tree_value = builder.constant_qhash(QHashOut::ZERO);
+        let right_child_rewards_tree_value = builder.constant_qhash(QHashOut::ZERO);
         self.get_public_inputs_hash_two_children::<H, F, D>(builder, left_child_rewards_tree_value, right_child_rewards_tree_value, rewards_tree_tag)
     }
     pub fn get_public_inputs_hash_two_end_cap<H:AlgebraicHasher<F>, F: RichField + Extendable<D>, const D: usize>(

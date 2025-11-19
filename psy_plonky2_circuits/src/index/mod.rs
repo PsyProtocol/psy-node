@@ -1,5 +1,5 @@
 use parth_core::data::proof_input::CircuitInputWithDependencies;
-use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
+use psy_core::job::job_id::QProvingJobDataID;
 use psy_data::{agg::AggStateTransitionInput, proof_input::guta::{GUTAOnlyRegisterUsersInput, VerifyGUTARegisterUsersCircuitInputSimple, VerifyGUTAToCapCircuitInputSimple, VerifyGUTAToCapUpgradeCheckpointCircuitInputSimple, VerifyLeftEndCapRightGUTAInputSimple, VerifyLeftGUTARightEndCapInputSimple, VerifySingleEndCapInput, VerifyTwoEndCapCircuitInput, VerifyTwoGUTAProofGadgetStandardInputSimple, VerifyTwoGUTAProofUpgradeCheckpointStandardInputSimple}, protocol::circuit_inputs::{agg_part_1::QCAggUserRegistartionDeployContractsGUTAInput, append_user_registration_tree::QCAppendUserRegistrationTreeCircuitInput, checkpoint_transition::QCQEDCheckpointStateTransitionInput, deploy_contracts::QCBatchDeployContractsCircuitInput}};
 
 

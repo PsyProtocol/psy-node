@@ -1,4 +1,4 @@
-use parth_core::{crypto::hash::{spiderman::SpidermanUpdateProof, traits::{FieldQHasher, PCircuitWitness, ZeroableHash}}, felt::{QFelt, QFelt64}, protocol::core_types::{Q256BitHash, QFHashBase, QHashBase}, utils::QPGenRandom};
+use parth_core::{crypto::hash::{spiderman::SpidermanUpdateProof, traits::{FieldQHasher, PCircuitWitness}}, felt::QFelt64, protocol::core_types::{Q256BitHash, QFHashBase}, utils::QPGenRandom};
 use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
 use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
 

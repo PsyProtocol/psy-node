@@ -246,13 +246,11 @@ pub fn circuit_user_registration_tree_index_bits_to_user_id<H: AlgebraicHasher<F
 #[cfg(test)]
 mod tests {
     use plonky2::{
-        field::{
-            extension::Extendable,
-            types::{Field, PrimeField64},
-        },
-        hash::hash_types::RichField,
+        field::
+            types::{Field, PrimeField64}
+        ,
         iop::{
-            target::{BoolTarget, Target},
+            target::Target,
             witness::{PartialWitness, WitnessWrite},
         },
         plonk::{
