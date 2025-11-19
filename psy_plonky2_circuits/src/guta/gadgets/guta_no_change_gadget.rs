@@ -49,6 +49,7 @@ impl GUTANoChangeGadget {
 
         let zero = builder.zero();
 
+        let total_aggregation_proofs_generated = builder.one();
         // value does not change and node index is the root
         let new_guta_header = GlobalUserTreeAggregatorHeaderGadget {
             guta_circuit_whitelist: guta_circuit_whitelist,
@@ -65,6 +66,7 @@ impl GUTANoChangeGadget {
                 total_transactions: zero,
                 slots_modified: zero,
             },
+            total_aggregation_proofs_generated,
         };
 
         Self {

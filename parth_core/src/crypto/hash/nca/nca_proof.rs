@@ -1,6 +1,9 @@
 use std::collections::HashSet;
 
-use crate::{crypto::hash::{merkle_proof::DeltaMerkleProofCore, traits::MerkleHasher}, data::hash::merkle_node_key::SimpleMerkleNodeKey};
+use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
+use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
+
+use crate::{crypto::hash::{merkle_proof::DeltaMerkleProofCore, traits::MerkleHasher}, data::hash::merkle_node_key::SimpleMerkleNodeKey, protocol::core_types::Q256BitHash, utils::QPGenRandom};
 
 
 #[pderive::serialize_clone_hash_ts]
@@ -18,6 +21,79 @@ pub struct UpdateNearestCommonAncestorProof<Hash> {
     pub level_a: u8,
     pub level_b: u8,
 }
+#[cfg(feature = "rand")]
+impl<Hash: QPGenRandom> QPGenRandom for UpdateNearestCommonAncestorProof<Hash> {
+    fn qp_rand_gen() -> Self where Self: Sized {
+        Self {
+            old_nearest_common_ancestor_value: Hash::qp_rand_gen(),
+            new_nearest_common_ancestor_value: Hash::qp_rand_gen(),
+            child_a: DeltaMerkleProofCore::qp_rand_gen(),
+            child_b: DeltaMerkleProofCore::qp_rand_gen(),
+            nearest_common_ancestor_level: rand::random::<u8>(),
+            nearest_common_ancestor_index: rand::random::<u64>(),
+            level_a: rand::random::<u8>(),
+            level_b: rand::random::<u8>(),
+        }
+    }
+}
+
+impl< Hash: Q256BitHash> PsyCanonicalSerializeMetadata for UpdateNearestCommonAncestorProof<Hash> {
+    const IS_FIXED_SIZE: bool = false;
+    const FIXED_SIZE: usize = 0;
+}
+impl<Hash: Q256BitHash> FallbackPsySerializeCanonical for UpdateNearestCommonAncestorProof<Hash> {
+    fn fallback_pio_serialized_size(&self) -> usize {
+        32*2 + self.child_a.pio_serialized_size() + self.child_b.pio_serialized_size() + 1 + 8 + 1 + 1
+    }
+    
+    fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
+        writer.psy_write_bytes(&self.old_nearest_common_ancestor_value.into_owned_32bytes())?;
+        writer.psy_write_bytes(&self.new_nearest_common_ancestor_value.into_owned_32bytes())?;
+        self.child_a.pio_write_to_io(writer)?;
+        self.child_b.pio_write_to_io(writer)?;
+        writer.psy_write_u8(self.nearest_common_ancestor_level)?;
+        writer.psy_write_u64(self.nearest_common_ancestor_index)?;
+        writer.psy_write_u8(self.level_a)?;
+        writer.psy_write_u8(self.level_b)
+    }
+    
+    fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
+        let old_nearest_common_ancestor_value = Hash::from_owned_32bytes(reader.psy_read_bytes_32()?);
+        let new_nearest_common_ancestor_value = Hash::from_owned_32bytes(reader.psy_read_bytes_32()?);
+        let child_a = DeltaMerkleProofCore::pio_read_from_io(reader)?;
+        let child_b = DeltaMerkleProofCore::pio_read_from_io(reader)?;
+        let nearest_common_ancestor_level = reader.psy_read_u8()?;
+        let nearest_common_ancestor_index = reader.psy_read_u64()?;
+        let level_a = reader.psy_read_u8()?;
+        let level_b = reader.psy_read_u8()?;
+        Ok(Self {
+            old_nearest_common_ancestor_value,
+            new_nearest_common_ancestor_value,
+            child_a,
+            child_b,
+            nearest_common_ancestor_level,
+            nearest_common_ancestor_index,
+            level_a,
+            level_b,
+        })
+    }
+}
+#[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
+psy_serialize::impl_psy_canonical_serialize_for_speedy!(
+    UpdateNearestCommonAncestorProof,
+    { Hash: Q256BitHash } => { Hash }
+);
+#[cfg(not(all(feature = "serialize_speedy", target_endian = "little")))]
+impl<Hash: Q256BitHash> psy_serialize::AutoImplementFallbackPsySerializeCanonical for UpdateNearestCommonAncestorProof<Hash> {}
+
+
+pser::impl_psy_ser_basic_tests_fallback!(
+    UpdateNearestCommonAncestorProof,
+    { crate::PHash },
+    update_nearest_common_ancestor_proof_tests,
+    true
+);
+
 
 
 impl<Hash: PartialEq + Copy> UpdateNearestCommonAncestorProof<Hash> {
@@ -181,12 +257,131 @@ pub struct NCAProofsWithTopLine<Hash> {
     pub top_line_proof: DeltaMerkleProofCore<Hash>,
 }
 
+#[cfg(feature = "rand")]
+impl<Hash: QPGenRandom> QPGenRandom for NCAProofsWithTopLine<Hash> {
+    fn qp_rand_gen() -> Self where Self: Sized {
+        Self {
+            nca_proofs: QPGenRandom::qp_rand_gen_vec(rand::random::<u8>() as usize % 10 + 1),
+            top_line_proof: DeltaMerkleProofCore::qp_rand_gen(),
+        }
+    }
+}
+
+impl<Hash: Q256BitHash> PsyCanonicalSerializeMetadata for NCAProofsWithTopLine<Hash> {
+    const IS_FIXED_SIZE: bool = false;
+    const FIXED_SIZE: usize = 0;
+}
+
+impl<Hash: Q256BitHash> FallbackPsySerializeCanonical for NCAProofsWithTopLine<Hash> {
+    fn fallback_pio_serialized_size(&self) -> usize {
+        4 + self.nca_proofs.iter().map(|p| p.pio_serialized_size()).sum::<usize>()
+        + self.top_line_proof.pio_serialized_size()
+    }
+    
+    fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
+        writer.psy_write_vec_length(self.nca_proofs.len())?;
+        for proof in &self.nca_proofs {
+            proof.pio_write_to_io(writer)?;
+        }
+        self.top_line_proof.pio_write_to_io(writer)?;
+        Ok(())
+    }
+    
+    fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
+        let nca_proofs_len = reader.psy_read_vec_length()?;
+        let mut nca_proofs = Vec::with_capacity(nca_proofs_len);
+        for _ in 0..nca_proofs_len {
+            nca_proofs.push(UpdateNCAWithAdditionalLink::pio_read_from_io(reader)?);
+        }
+        let top_line_proof = DeltaMerkleProofCore::pio_read_from_io(reader)?;
+        Ok(Self {
+            nca_proofs,
+            top_line_proof,
+        })
+    }
+}
+
+#[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
+psy_serialize::impl_psy_canonical_serialize_for_speedy!(
+    NCAProofsWithTopLine,
+    { Hash: Q256BitHash } => { Hash }
+);
+#[cfg(not(all(feature = "serialize_speedy", target_endian = "little")))]
+impl<Hash: Q256BitHash> psy_serialize::AutoImplementFallbackPsySerializeCanonical for NCAProofsWithTopLine<Hash> {}
+
+pser::impl_psy_ser_basic_tests_fallback!(
+    NCAProofsWithTopLine,
+    { crate::PHash },
+    nca_proofs_with_top_line_ser_tests,
+    true
+);
+
 #[pderive::serialize_clone_hash_ts]
 #[ts(export, concrete(Hash = crate::PHash))]
 pub struct PartialNCAProofsWithTopLine<Hash> {
     pub nca_proofs: Vec<PartialUpdateNearestCommonAncestorProof<Hash>>,
     pub top_line_proof: DeltaMerkleProofCore<Hash>,
 }
+
+#[cfg(feature = "rand")]
+impl<Hash: QPGenRandom> QPGenRandom for PartialNCAProofsWithTopLine<Hash> {
+    fn qp_rand_gen() -> Self where Self: Sized {
+        Self {
+            nca_proofs: QPGenRandom::qp_rand_gen_vec(rand::random::<u8>() as usize % 10 + 1),
+            top_line_proof: DeltaMerkleProofCore::qp_rand_gen(),
+        }
+    }
+}
+
+impl<Hash: Q256BitHash> PsyCanonicalSerializeMetadata for PartialNCAProofsWithTopLine<Hash> {
+    const IS_FIXED_SIZE: bool = false;
+    const FIXED_SIZE: usize = 0;
+}
+
+impl<Hash: Q256BitHash> FallbackPsySerializeCanonical for PartialNCAProofsWithTopLine<Hash> {
+    fn fallback_pio_serialized_size(&self) -> usize {
+        4 + self.nca_proofs.iter().map(|p| p.pio_serialized_size()).sum::<usize>()
+        + self.top_line_proof.pio_serialized_size()
+    }
+    
+    fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
+        writer.psy_write_vec_length(self.nca_proofs.len())?;
+        for proof in &self.nca_proofs {
+            proof.pio_write_to_io(writer)?;
+        }
+        self.top_line_proof.pio_write_to_io(writer)?;
+        Ok(())
+    }
+    
+    fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
+        let nca_proofs_len = reader.psy_read_vec_length()?;
+        let mut nca_proofs = Vec::with_capacity(nca_proofs_len);
+        for _ in 0..nca_proofs_len {
+            nca_proofs.push(PartialUpdateNearestCommonAncestorProof::pio_read_from_io(reader)?);
+        }
+        let top_line_proof = DeltaMerkleProofCore::pio_read_from_io(reader)?;
+        Ok(Self {
+            nca_proofs,
+            top_line_proof,
+        })
+    }
+}
+
+#[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
+psy_serialize::impl_psy_canonical_serialize_for_speedy!(
+    PartialNCAProofsWithTopLine,
+    { Hash: Q256BitHash } => { Hash }
+);
+#[cfg(not(all(feature = "serialize_speedy", target_endian = "little")))]
+impl<Hash: Q256BitHash> psy_serialize::AutoImplementFallbackPsySerializeCanonical for PartialNCAProofsWithTopLine<Hash> {}
+
+pser::impl_psy_ser_basic_tests_fallback!(
+    PartialNCAProofsWithTopLine,
+    { crate::PHash },
+    partial_nca_proofs_with_top_line_ser_tests,
+    true
+);
+
 
 #[pderive::serialize_clone_hash_ts]
 #[ts(export, concrete(Hash = crate::PHash))]
@@ -196,6 +391,63 @@ pub struct PartialUpdateNearestCommonAncestorProof<Hash> {
 
     pub nearest_common_ancestor_level: u8,
 }
+
+
+impl<Hash: QPGenRandom> QPGenRandom for PartialUpdateNearestCommonAncestorProof<Hash> {
+    fn qp_rand_gen() -> Self where Self: Sized {
+        Self {
+            child_a: DeltaMerkleProofCore::qp_rand_gen(),
+            child_b: DeltaMerkleProofCore::qp_rand_gen(),
+            nearest_common_ancestor_level: rand::random::<u8>(),
+        }
+    }
+}
+
+impl<Hash: Q256BitHash> PsyCanonicalSerializeMetadata for PartialUpdateNearestCommonAncestorProof<Hash> {
+    const IS_FIXED_SIZE: bool = false;
+    const FIXED_SIZE: usize = 0;
+}
+
+impl<Hash: Q256BitHash> FallbackPsySerializeCanonical for PartialUpdateNearestCommonAncestorProof<Hash> {
+    fn fallback_pio_serialized_size(&self) -> usize {
+        self.child_a.pio_serialized_size()
+        + self.child_b.pio_serialized_size()
+        + 1
+    }
+    
+    fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
+        self.child_a.pio_write_to_io(writer)?;
+        self.child_b.pio_write_to_io(writer)?;
+        writer.psy_write_u8(self.nearest_common_ancestor_level)?;
+        Ok(())
+    }
+    
+    fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
+        let child_a = DeltaMerkleProofCore::pio_read_from_io(reader)?;
+        let child_b = DeltaMerkleProofCore::pio_read_from_io(reader)?;
+        let nearest_common_ancestor_level = reader.psy_read_u8()?;
+        Ok(Self {
+            child_a,
+            child_b,
+            nearest_common_ancestor_level,
+        })
+    }
+}
+
+#[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
+psy_serialize::impl_psy_canonical_serialize_for_speedy!(
+    PartialUpdateNearestCommonAncestorProof,
+    { Hash: Q256BitHash } => { Hash }
+);
+#[cfg(not(all(feature = "serialize_speedy", target_endian = "little")))]
+impl<Hash: Q256BitHash> psy_serialize::AutoImplementFallbackPsySerializeCanonical for PartialUpdateNearestCommonAncestorProof<Hash> {}
+
+pser::impl_psy_ser_basic_tests_fallback!(
+    PartialUpdateNearestCommonAncestorProof,
+    { crate::PHash },
+    partial_update_nearest_common_ancestor_proof_ser_tests,
+    true
+);
 
 
 impl<Hash> PartialUpdateNearestCommonAncestorProof<Hash> {
@@ -423,6 +675,59 @@ pub struct UpdateNCAWithAdditionalLink<Hash> {
     pub nca_proof: UpdateNearestCommonAncestorProof<Hash>,
     pub link_proof: DeltaMerkleProofCore<Hash>,
 }
+
+
+#[cfg(feature = "rand")]
+impl<Hash: QPGenRandom> QPGenRandom for UpdateNCAWithAdditionalLink<Hash> {
+    fn qp_rand_gen() -> Self where Self: Sized {
+        Self {
+            nca_proof: UpdateNearestCommonAncestorProof::<Hash>::qp_rand_gen(),
+            link_proof: DeltaMerkleProofCore::<Hash>::qp_rand_gen(),
+        }
+    }
+}
+
+impl<Hash: Q256BitHash> PsyCanonicalSerializeMetadata for UpdateNCAWithAdditionalLink<Hash> {
+    const IS_FIXED_SIZE: bool = false;
+    const FIXED_SIZE: usize = 0;
+}
+
+impl<Hash: Q256BitHash> FallbackPsySerializeCanonical for UpdateNCAWithAdditionalLink<Hash> {
+    fn fallback_pio_serialized_size(&self) -> usize {
+         self.nca_proof.pio_serialized_size() +
+         self.link_proof.pio_serialized_size() 
+    }
+    
+    fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
+        self.nca_proof.pio_write_to_io(writer)?;
+        self.link_proof.pio_write_to_io(writer)?;
+        Ok(())
+    }
+    
+    fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
+        let nca_proof = UpdateNearestCommonAncestorProof::pio_read_from_io(reader)?;
+        let link_proof = DeltaMerkleProofCore::pio_read_from_io(reader)?;
+        Ok(Self {
+            nca_proof,                                                            
+            link_proof,
+        })
+    }
+}
+
+#[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
+psy_serialize::impl_psy_canonical_serialize_for_speedy!(
+    UpdateNCAWithAdditionalLink,
+    { Hash: Q256BitHash } => { Hash }
+);
+#[cfg(not(all(feature = "serialize_speedy", target_endian = "little")))]
+impl<Hash: Q256BitHash> psy_serialize::AutoImplementFallbackPsySerializeCanonical for UpdateNCAWithAdditionalLink<Hash> {}
+
+pser::impl_psy_ser_basic_tests_fallback!(
+    UpdateNCAWithAdditionalLink,
+    { crate::PHash },
+    update_nca_with_additional_link_ser_tests,
+    true
+);
 
 impl<Hash: PartialEq + Copy> UpdateNCAWithAdditionalLink<Hash> {
     pub fn from_delta_merkle_proof_pair<H: MerkleHasher<Hash>>(

@@ -1,6 +1,6 @@
 use parth_core::{crypto::hash::{merkle_proof::MerkleProofCore, traits::MerkleZeroHasher}, pgoldilocks::QHashOut};
 use plonky2::{field::extension::Extendable, hash::hash_types::{HashOut, HashOutTarget, RichField}, iop::witness::Witness, plonk::{circuit_builder::CircuitBuilder, circuit_data::{CommonCircuitData, VerifierOnlyCircuitData}, config::{AlgebraicHasher, GenericConfig}, proof::ProofWithPublicInputs}};
-use psy_core::constants::protocol::get_default_worker_public_key;
+use psy_core::constants::protocol::get_default_worker_rewards_tree_tag;
 use psy_data::{guta::header::GlobalUserTreeAggregatorHeader, proof_input::guta::GUTARegisterUserFullInput, v1::qdata::user::PQEDUserLeaf};
 
 use crate::{treeprover::subtree::gadgets::subtree_core::SubTreeNodeStateTransitionGadget, utils::alghash::AlgHashable};
@@ -74,6 +74,8 @@ impl<const D: usize> GUTARegisterUsersBatchGadget<D> {
             register_users_state_transiton.old_node_value,
         );
 
+        let total_aggregation_proofs_generated = builder.one();
+
 
         let new_guta_header = GlobalUserTreeAggregatorHeaderGadget{
             guta_circuit_whitelist: line_guta_header.guta_circuit_whitelist,
@@ -85,6 +87,7 @@ impl<const D: usize> GUTARegisterUsersBatchGadget<D> {
                 node_level: line_state_transition.node_level,
             },
             stats: line_guta_header.stats,
+            total_aggregation_proofs_generated,
         };
 
 
@@ -105,10 +108,11 @@ impl<const D: usize> GUTARegisterUsersBatchGadget<D> {
         top_line_siblings: &[QHashOut<F>],
         guta_register_user_inputs: &[GUTARegisterUserFullInput<QHashOut<F>>],
         default_user_state_tree_root: QHashOut<F>,
+        rewards_tree_value: QHashOut<F>,
     ) -> anyhow::Result<()> where
     <C as GenericConfig<D>>::Hasher:AlgebraicHasher<F>, {
-        self.verify_to_line_gadget.set_witness(witness, guta_whitelist_merkle_proof, guta_proof_header, proof, verifier_data, top_line_siblings)?;
-        let dummy_public_key = get_default_worker_public_key();
+        self.verify_to_line_gadget.set_witness(witness, guta_whitelist_merkle_proof, guta_proof_header, proof, verifier_data, top_line_siblings, rewards_tree_value)?;
+        let dummy_public_key = get_default_worker_rewards_tree_tag();
         let dummy_user_leaf_hash = PQEDUserLeaf::new_user_default_with_zero(F::ZERO, F::ZERO, dummy_public_key, default_user_state_tree_root).p2_q_alghash::<C::Hasher>();
 
         self.register_users_gadget.set_witness_params(

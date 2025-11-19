@@ -202,11 +202,11 @@ impl SimpleChainTestbed {
             b_end_cap: end_cap_input_1,
             nca_proof: nca,
         };
-        let worker_public_key = Hash::rand();
+        let worker_rewards_tree_tag = Hash::rand();
         timer.lap("start verify_two_end_cap.prove_base");
         let two_end_cap_proof = self.circuits.circuits.guta_circuits.verify_two_end_cap
         .prove_base(
-            worker_public_key, &two_end_cap_input, &proof_0, &proof_1, self.circuits.dummy_end_cap_circuit.get_verifier_config_ref())?;
+            worker_rewards_tree_tag, &two_end_cap_input, &proof_0, &proof_1, self.circuits.dummy_end_cap_circuit.get_verifier_config_ref())?;
         timer.lap("end verify_two_end_cap.prove_base");
 
         if two_end_cap_proof.public_inputs.len() == 0 {

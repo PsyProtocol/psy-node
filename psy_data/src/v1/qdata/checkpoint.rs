@@ -12,7 +12,6 @@ use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata
 use ts_rs::TS;
 
 use psy_serialize::{AutoDatabaseSerializationUseFastFixedSerialize, FastFixedSerializable};
-
 use crate::v1::qdata::{checkpoint_sync::PQEDCheckpointSyncInfoCompact, ffs_sizes::PSY_OBJECT_FFS_SIZE_GLOBAL_STATE_ROOTS, pm_jobs_completed_stats::PPMJobsCompletedStats, pm_rewards_commitment::PPMRewardCommitment};
 
 #[pderive::serialize_copy_f_hash_ts]
@@ -498,6 +497,107 @@ pub struct PQEDCheckpointLeafCompact<Hash> {
     pub global_chain_root: Hash,
     pub stats_hash: Hash,
 }
+impl<Hash: QPGenRandom> QPGenRandom for PQEDCheckpointLeafCompact<Hash> {
+    fn qp_rand_gen() -> Self
+    where
+        Self: Sized,
+    {
+        PQEDCheckpointLeafCompact {
+            global_chain_root: Hash::qp_rand_gen(),
+            stats_hash: Hash::qp_rand_gen(),
+        }
+    }
+}
+pser::impl_bytemuck_pod_and_zeroable!(PQEDCheckpointLeafCompact, Hash);
+pser::impl_bytemuck_ffs!(
+    PQEDCheckpointLeafCompact,
+    { Hash: Q256BitHash },
+    64
+);
+/* 
+// commented out do to module name conflict, later just relocate to another file
+pser::impl_bytemuck_ffs_tests!(
+    PQEDCheckpointLeafCompact,
+    // Note the use of concrete types here
+    { parth_core::PHash },
+    64
+);
+*/
+
+impl<Hash: Q256BitHash> PsyCanonicalSerializeMetadata for PQEDCheckpointLeafCompact<Hash> {
+    const IS_FIXED_SIZE: bool = true;
+    const FIXED_SIZE: usize = 64;
+}
+impl<Hash: Q256BitHash> AutoDatabaseSerializationUseFastFixedSerialize<64> for PQEDCheckpointLeafCompact<Hash> {}
+psy_serialize::impl_psy_canonical_serialize_for_fixed_type!(
+    PQEDCheckpointLeafCompact,
+    { Hash: Q256BitHash } => { Hash },
+    64
+);
+// This function is never called, it is just to ensure at compile time∂
+fn _ensure_compile_time_size_match_pqed_checkpoint_leaf_compact() {
+    let _bytes_h256: [u8; 64] = PQEDCheckpointLeafCompact::<parth_core::data::hash::hash256::Hash256>::qp_rand_gen().ffs_into_bytes();
+    let _bytes_phash: [u8; 64] = PQEDCheckpointLeafCompact::<parth_core::PHash>::qp_rand_gen().ffs_into_bytes();
+}
+
+// fallback for big endian platforms, not zero copy
+#[cfg(not(all(target_endian = "little", feature = "serialize_bytemuck")))]
+impl<Hash: Q256BitHash> FastFixedSerializable<64> for PQEDCheckpointLeafCompact<F, Hash> {
+    fn ffs_from_owned_bytes(data: [u8; PSY_OBJECT_FFS_SIZE_CONTRACT_LEAF]) -> Self {
+        let global_chain_root = Hash::from_ref_32bytes(&data[0..32].try_into().unwrap());
+        let stats_hash = Hash::from_ref_32bytes(&data[32..64].try_into().unwrap());
+        PQEDCheckpointLeafCompact {
+            global_chain_root,
+            stats_hash,
+        }
+    }
+
+    fn ffs_from_slice_or_panic(data: &[u8]) -> Self {
+        if data.len() != 64 {
+            panic!("Invalid number of bytes for PQEDCheckpointLeafCompact");
+        }
+        let global_chain_root = Hash::from_ref_32bytes(&data[0..32].try_into().unwrap());
+        let stats_hash = Hash::from_ref_32bytes(&data[32..64].try_into().unwrap());
+        PQEDCheckpointLeafCompact {
+            global_chain_root,
+            stats_hash,
+        }
+    }
+
+    fn ffs_try_from_slice(data: &[u8]) -> anyhow::Result<Self> {
+        if data.len() != 64 {
+            anyhow::bail!("Invalid number of bytes for PQEDCheckpointLeafCompact");
+        }
+        let global_chain_root = Hash::from_ref_32bytes(&data[0..32].try_into().unwrap());
+        let stats_hash = Hash::from_ref_32bytes(&data[32..64].try_into().unwrap());
+        Ok(PQEDCheckpointLeafCompact {
+            global_chain_root,
+            stats_hash,
+        })
+    }
+
+    fn ffs_to_bytes(&self) -> [u8; 64] {
+        let mut bytes = [0u8; 64];
+        bytes[0..32].copy_from_slice(&self.global_chain_root.into_owned_32bytes());
+        bytes[32..64].copy_from_slice(&self.stats_hash.into_owned_32bytes());
+        bytes
+    }
+
+    fn ffs_into_bytes(self) -> [u8; 64] {
+        let mut bytes = [0u8; 64];
+        bytes[0..32].copy_from_slice(&self.global_chain_root.into_owned_32bytes());
+        bytes[32..64].copy_from_slice(&self.stats_hash.into_owned_32bytes());
+        bytes
+    }
+}
+
+pser::impl_psy_ser_basic_tests!(
+    PQEDCheckpointLeafCompact,
+    // Note the use of concrete types here
+    {  parth_core::PHash },
+    pqed_checkpoint_leaf_compact
+);
+
 impl_qpd_serialize_params!(
     PQEDCheckpointLeafCompact,
     { Hash: QHashBase } => { Hash }
@@ -647,6 +747,17 @@ pub struct PQEDCheckpointLeafCompactWithStateRoots<Hash> {
     pub checkpoint_leaf: PQEDCheckpointLeafCompact<Hash>,
     pub global_state_roots: PQEDCheckpointGlobalStateRoots<Hash>,
 }
+impl <Hash: QPGenRandom> QPGenRandom for PQEDCheckpointLeafCompactWithStateRoots<Hash> {
+    fn qp_rand_gen() -> Self
+    where
+        Self: Sized,
+    {
+        PQEDCheckpointLeafCompactWithStateRoots {
+            checkpoint_leaf: PQEDCheckpointLeafCompact::qp_rand_gen(),
+            global_state_roots: PQEDCheckpointGlobalStateRoots::qp_rand_gen(),
+        }
+    }
+}
 impl_qpd_serialize_params!(
     PQEDCheckpointLeafCompactWithStateRoots,
     { Hash: QHashBase } => { Hash }
@@ -687,6 +798,45 @@ impl<F: QFelt64, Hash: QFHashBase<F>> QFieldHashable<F, Hash>
         self.checkpoint_leaf.qfhash::<H>()
     }
 }
+
+impl< Hash: Q256BitHash> PsyCanonicalSerializeMetadata for PQEDCheckpointLeafCompactWithStateRoots<Hash> {
+    const IS_FIXED_SIZE: bool = true;
+    const FIXED_SIZE: usize = PQEDCheckpointLeafCompact::<Hash>::FIXED_SIZE + PQEDCheckpointGlobalStateRoots::<Hash>::FIXED_SIZE;
+}
+impl<Hash: Q256BitHash> FallbackPsySerializeCanonical for PQEDCheckpointLeafCompactWithStateRoots<Hash> {
+    fn fallback_pio_serialized_size(&self) -> usize {
+        Self::FIXED_SIZE
+    }
+    
+    fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
+        self.checkpoint_leaf.pio_write_to_io(writer)?;
+        self.global_state_roots.pio_write_to_io(writer)?;
+        Ok(())
+    }
+    
+    fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
+        let checkpoint_leaf = PQEDCheckpointLeafCompact::<Hash>::pio_read_from_io(reader)?;
+        let global_state_roots = PQEDCheckpointGlobalStateRoots::<Hash>::pio_read_from_io(reader)?;
+        Ok(Self {
+            checkpoint_leaf,                                                            
+            global_state_roots,
+        })
+    }
+}
+#[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
+psy_serialize::impl_psy_canonical_serialize_for_speedy!(
+    PQEDCheckpointLeafCompactWithStateRoots,
+    { Hash: Q256BitHash } => { Hash }
+);
+#[cfg(not(all(feature = "serialize_speedy", target_endian = "little")))]
+impl<Hash: Q256BitHash> psy_serialize::AutoImplementFallbackPsySerializeCanonical for PQEDCheckpointLeafCompactWithStateRoots<Hash> {}
+
+
+pser::impl_psy_ser_basic_tests_fallback!(
+    PQEDCheckpointLeafCompactWithStateRoots,
+    { parth_core::PHash },
+    pqed_checkpoint_leaf_compact_with_state_roots_tests
+);
 
 /// push the latest checkpoint sync info
 #[pderive::serialize_clone_f_hash_ts]

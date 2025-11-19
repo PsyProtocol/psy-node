@@ -110,7 +110,7 @@ impl AggStateTransitionGadget {
 #[derive(Debug, Copy, Clone)]
 pub struct AggStateTransitionProofPublicInputsGadget {
     pub commitment: HashOutTarget,
-    pub worker_public_key: HashOutTarget,
+    pub worker_rewards_tree_tag: HashOutTarget,
     pub pm_jobs_completed_stats: [Target; 3],
     pub allowed_circuit_hashes_root: HashOutTarget,
     pub state_transition_combined_hash: HashOutTarget,
@@ -131,7 +131,7 @@ impl AggStateTransitionProofPublicInputsGadget {
                 public_inputs[3],
             ],
         };
-        let worker_public_key = HashOutTarget {
+        let worker_rewards_tree_tag = HashOutTarget {
             elements: [
                 public_inputs[4],
                 public_inputs[5],
@@ -162,7 +162,7 @@ impl AggStateTransitionProofPublicInputsGadget {
         };
         Self {
             commitment,
-            worker_public_key,
+            worker_rewards_tree_tag,
             pm_jobs_completed_stats,
             state_transition_combined_hash,
             allowed_circuit_hashes_root,
@@ -174,10 +174,10 @@ impl AggStateTransitionProofPublicInputsGadget {
             self.commitment.elements[1],
             self.commitment.elements[2],
             self.commitment.elements[3],
-            self.worker_public_key.elements[0],
-            self.worker_public_key.elements[1],
-            self.worker_public_key.elements[2],
-            self.worker_public_key.elements[3],
+            self.worker_rewards_tree_tag.elements[0],
+            self.worker_rewards_tree_tag.elements[1],
+            self.worker_rewards_tree_tag.elements[2],
+            self.worker_rewards_tree_tag.elements[3],
             self.pm_jobs_completed_stats[0],
             self.pm_jobs_completed_stats[1],
             self.pm_jobs_completed_stats[2],

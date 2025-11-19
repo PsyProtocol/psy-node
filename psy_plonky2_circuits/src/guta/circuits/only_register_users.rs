@@ -7,16 +7,15 @@ use plonky2::{
         circuit_data::{CircuitConfig, CircuitData, CommonCircuitData, VerifierOnlyCircuitData},
         config::{AlgebraicHasher, GenericConfig},
         proof::ProofWithPublicInputs,
-    }, field::types::Field
+    }
 };
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{proof_input::guta::{GUTAOnlyRegisterUsersInput, GUTARegisterUserFullInput}, v1::qdata::pm_jobs_completed_stats::PPMJobsCompletedStats};
 use psy_plonky2_basic_helpers::{
-    builder::{hash::core::CircuitBuilderHashCore, pad_circuit::CircuitBuilderQEDCommonGates}, verifier::circuit_library::CircuitInfoLibrary,
+    builder::pad_circuit::CircuitBuilderQEDCommonGates, verifier::circuit_library::CircuitInfoLibrary,
    
 };
-use psy_plonky2_common_circuits::traits::ToTargets;
-use crate::{gadgets::qdata::pm_jobs_completed_stats::PMJobsCompletedStatsGadget, guta::gadgets::guta_only_register_users_gadget::GUTAOnlyRegisterUsersGadget, proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{proof_store::QProofStoreReaderAsync, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QPsyNetworkCircuitWithType}};
+use crate::{guta::gadgets::guta_only_register_users_gadget::GUTAOnlyRegisterUsersGadget, proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{proof_store::QProofStoreReaderAsync, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QPsyNetworkCircuitWithType}};
 
 #[derive(Debug)]
 pub struct GUTAOnlyRegisterUsersCircuit<C: GenericConfig<D>, const D: usize>
@@ -24,8 +23,7 @@ pub struct GUTAOnlyRegisterUsersCircuit<C: GenericConfig<D>, const D: usize>
     register_batch_gadget: GUTAOnlyRegisterUsersGadget,
     guta_circuit_whitelist: HashOutTarget,
     checkpoint_tree_root: HashOutTarget,
-    worker_public_key: HashOutTarget,
-    pm_jobs_completed: PMJobsCompletedStatsGadget,
+    worker_rewards_tree_tag: HashOutTarget,
 
     default_user_state_tree_root: QHashOut<C::F>,
 
@@ -72,22 +70,13 @@ where
             max_users,
         );
 
-        let worker_public_key = builder.add_virtual_hash();
+        let worker_rewards_tree_tag = builder.add_virtual_hash();
 
-        // builder.assert_non_zero_hash(worker_public_key);
+        // builder.assert_non_zero_hash(worker_rewards_tree_tag);
 
-        let zero_hash = builder.constant_hash(HashOut::ZERO);
-        let commitment = builder.hash_two_to_one::<C::Hasher>(zero_hash, zero_hash);
+        let public_inputs_hash = register_batch_gadget.new_guta_header.get_public_inputs_hash_no_children::<C::Hasher, C::F, D>(&mut builder, worker_rewards_tree_tag);
 
-        let count = builder.one();
-        let pm_jobs_completed = PMJobsCompletedStatsGadget::new_register_users(&mut builder, count);
 
-        let public_inputs_hash = register_batch_gadget.new_guta_header.to_hash::<C::Hasher, C::F, D>(&mut builder);
-
-        // Register 15 public inputs: commitment, worker_public_key, pm_jobs_completed_stats, header_hash
-        builder.register_public_inputs(&commitment.elements);
-        builder.register_public_inputs(&worker_public_key.elements);
-        builder.register_public_inputs(&pm_jobs_completed.to_targets());
         builder.register_public_inputs(&public_inputs_hash.elements);
         builder.add_qed_type_c_common_gates();
         //builder.add_gate_to_gate_set(GateRef::new(ConstantGate::new(builder.config.num_constants)));
@@ -101,8 +90,7 @@ where
             register_batch_gadget,
             guta_circuit_whitelist,
             checkpoint_tree_root,
-            worker_public_key,
-            pm_jobs_completed,
+            worker_rewards_tree_tag,
             default_user_state_tree_root,
 
             circuit_data,
@@ -112,7 +100,7 @@ where
 
     pub fn prove_base(
         &self,
-        worker_public_key: QHashOut<C::F>,
+        worker_rewards_tree_tag: QHashOut<C::F>,
         guta_circuit_whitelist_root: QHashOut<C::F>,
         checkpoint_tree_root: QHashOut<C::F>,
         guta_register_user_inputs: &[GUTARegisterUserFullInput<QHashOut<C::F>>],
@@ -131,8 +119,8 @@ where
             checkpoint_tree_root.0,
         )?;
         pw.set_hash_target(
-            self.worker_public_key,
-            worker_public_key.0,
+            self.worker_rewards_tree_tag,
+            worker_rewards_tree_tag.0,
         )?;
 
 
@@ -142,10 +130,8 @@ where
             default_user_state_tree_root,
         )?;
 
-        pw.set_hash_target(self.worker_public_key, worker_public_key.0)?;
+        pw.set_hash_target(self.worker_rewards_tree_tag, worker_rewards_tree_tag.0)?;
 
-        let pm_stats = PPMJobsCompletedStats::new_register_users_with_zero(C::F::ZERO, C::F::ONE);
-        self.pm_jobs_completed.set_witness(&mut pw, &pm_stats)?;
 
         let p = self.circuit_data.prove(pw)?;
         Ok(p)
@@ -189,7 +175,7 @@ where
         store: &S,
         library: &L,
         job_id: QProvingJobDataID,
-        worker_public_key: QHashOut<C::F>,
+        worker_rewards_tree_tag: QHashOut<C::F>,
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
         let r: GUTAOnlyRegisterUsersInput<QHashOut<C::F>> =
             bincode::deserialize(&store.get_bytes_by_id(job_id.get_input_witness_id()).await?)
@@ -203,7 +189,7 @@ where
 
 
         let result = self.prove_base(
-            worker_public_key,
+            worker_rewards_tree_tag,
             guta_whitelist_root,
             r.checkpoint_tree_root,
             &r.guta_register_user_inputs,

@@ -1,8 +1,12 @@
+#[cfg(feature = "rand_gen")]
+use parth_core::utils::QPGenRandom;
 use parth_core::{
     crypto::hash::traits::{FieldQHasher, QFieldHashable},
     felt::QFelt64,
-    protocol::core_types::QFHashBase,
+    protocol::core_types::{Q256BitHash, QFHashBase},
 };
+use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
+use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
 
 use crate::{
     proof_input::guta::SubmitUserEndCapNonProofCoreInput,
@@ -18,6 +22,63 @@ pub struct SubmitUserEndCapNonProofInput<F, Hash> {
     pub core: SubmitUserEndCapNonProofCoreInput<F, Hash>,
     pub contract_state_updates: Vec<QEDContractStateUpdateHistory<Hash>>,
 }
+#[cfg(feature = "rand_gen")]
+impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for SubmitUserEndCapNonProofInput<F, Hash> {
+    fn qp_rand_gen() -> Self where Self: Sized {
+        Self {
+            core: SubmitUserEndCapNonProofCoreInput::qp_rand_gen(),
+            contract_state_updates: QPGenRandom::qp_rand_gen_vec(rand::random::<u8>() as usize % 10 + 1),
+        }
+    }
+}
+
+impl<F: QFelt64, Hash: Q256BitHash> PsyCanonicalSerializeMetadata for SubmitUserEndCapNonProofInput<F, Hash> {
+    const IS_FIXED_SIZE: bool = false;
+    const FIXED_SIZE: usize = 0;
+}
+
+impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for SubmitUserEndCapNonProofInput<F, Hash> {
+    fn fallback_pio_serialized_size(&self) -> usize {
+        self.core.pio_serialized_size()
+        + 4 + self.contract_state_updates.iter().map(|u| u.pio_serialized_size()).sum::<usize>()
+    }
+    
+    fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
+        self.core.pio_write_to_io(writer)?;
+        writer.psy_write_vec_length(self.contract_state_updates.len())?;
+        for update in &self.contract_state_updates {
+            update.pio_write_to_io(writer)?;
+        }
+        Ok(())
+    }
+    
+    fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
+        let core = SubmitUserEndCapNonProofCoreInput::pio_read_from_io(reader)?;
+        let updates_len = reader.psy_read_vec_length()?;
+        let mut contract_state_updates = Vec::with_capacity(updates_len);
+        for _ in 0..updates_len {
+            contract_state_updates.push(QEDContractStateUpdateHistory::pio_read_from_io(reader)?);
+        }
+        Ok(Self {
+            core,
+            contract_state_updates,
+        })
+    }
+}
+
+#[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
+psy_serialize::impl_psy_canonical_serialize_for_speedy!(
+    SubmitUserEndCapNonProofInput,
+    { F: QFelt64, Hash: Q256BitHash } => { F, Hash }
+);
+#[cfg(not(all(feature = "serialize_speedy", target_endian = "little")))]
+impl<F: QFelt64, Hash: Q256BitHash> psy_serialize::AutoImplementFallbackPsySerializeCanonical for SubmitUserEndCapNonProofInput<F, Hash> {}
+
+pser::impl_psy_ser_basic_tests_fallback!(
+    SubmitUserEndCapNonProofInput,
+    { parth_core::PF, parth_core::PHash },
+    submit_user_end_cap_non_proof_input_ser_tests
+);
 
 impl<F: QFelt64, Hash: QFHashBase<F> + std::fmt::Debug> SubmitUserEndCapNonProofInput<F, Hash> {
     pub fn ensure_simple_self_consistent<Hasher: FieldQHasher<F, Hash>, C: PSimpleContractHeightCache<Hash>>(

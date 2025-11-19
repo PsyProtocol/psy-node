@@ -1,6 +1,6 @@
 use parth_core::pgoldilocks::QHashOut;
 use plonky2::{field::extension::Extendable, hash::hash_types::{HashOutTarget, RichField}, iop::witness::Witness, plonk::{circuit_builder::CircuitBuilder, config::AlgebraicHasher}};
-use psy_core::constants::protocol::get_default_worker_public_key;
+use psy_core::constants::protocol::get_default_worker_rewards_tree_tag;
 use psy_data::{proof_input::guta::GUTARegisterUserFullInput, v1::qdata::user::PQEDUserLeaf};
 
 use crate::{guta::gadgets::guta_stats::GUTAStatsGadget, utils::alghash::AlgHashable};
@@ -45,6 +45,8 @@ impl GUTAOnlyRegisterUsersGadget {
             max_users
         );
 
+        let total_aggregation_proofs_generated = builder.one();
+
 
 
         let new_guta_header = GlobalUserTreeAggregatorHeaderGadget{
@@ -52,6 +54,7 @@ impl GUTAOnlyRegisterUsersGadget {
             checkpoint_tree_root: checkpoint_tree_root,
             state_transition: register_users_gadget.get_state_transition(),
             stats: GUTAStatsGadget::add_virtual_to_zero(builder),
+            total_aggregation_proofs_generated,
         };
 
 
@@ -67,7 +70,7 @@ impl GUTAOnlyRegisterUsersGadget {
         guta_register_user_inputs: &[GUTARegisterUserFullInput<QHashOut<F>>],
         default_user_state_tree_root: QHashOut<F>,
     ) -> anyhow::Result<()> {
-        let dummy_public_key = get_default_worker_public_key();
+        let dummy_public_key = get_default_worker_rewards_tree_tag();
         let dummy_user_leaf_hash = PQEDUserLeaf::new_user_default_with_zero(F::ZERO, F::ZERO, dummy_public_key, default_user_state_tree_root).p2_q_alghash::<H>();
 
         self.register_users_gadget.set_witness_params(

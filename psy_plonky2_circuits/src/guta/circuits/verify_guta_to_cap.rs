@@ -44,7 +44,7 @@ use crate::{
 pub struct GUTAVerifyGUTAToCapCircuit<C: GenericConfig<D>, const D: usize>
 {
     pub verify_to_line_gadget: VerifyGUTAProofToLineGadget<D>,
-    pub worker_public_key_target: HashOutTarget,
+    pub worker_rewards_tree_tag_target: HashOutTarget,
     pub pm_jobs_completed: PMJobsCompletedStatsGadget,
 
     pub circuit_data: CircuitData<C::F, C, D>,
@@ -85,9 +85,9 @@ where
 
         let public_inputs_hash = verify_to_line_gadget.get_guta_header_line().to_hash::<C::Hasher, C::F, D>(&mut builder);
 
-        let worker_public_key = builder.add_virtual_hash();
+        let worker_rewards_tree_tag = builder.add_virtual_hash();
 
-        // builder.assert_non_zero_hash(worker_public_key);
+        // builder.assert_non_zero_hash(worker_rewards_tree_tag);
 
         let child_commitment = HashOutTarget {
             elements: [
@@ -97,7 +97,7 @@ where
                 verify_to_line_gadget.verify_guta_proof_gadget.proof_target.public_inputs[3],
             ]
         };
-        let child_worker_public_key = HashOutTarget {
+        let child_worker_rewards_tree_tag = HashOutTarget {
             elements: [
                 verify_to_line_gadget.verify_guta_proof_gadget.proof_target.public_inputs[4],
                 verify_to_line_gadget.verify_guta_proof_gadget.proof_target.public_inputs[5],
@@ -121,11 +121,11 @@ where
         };
 
         let zero_hash = builder.constant_hash(HashOut::ZERO);
-        let commitment = builder.hash_two_to_one::<C::Hasher>(child_commitment, child_worker_public_key);
+        let commitment = builder.hash_two_to_one::<C::Hasher>(child_commitment, child_worker_rewards_tree_tag);
         let final_commitment = builder.hash_two_to_one::<C::Hasher>(commitment, zero_hash);
 
         builder.register_public_inputs(&final_commitment.elements);
-        builder.register_public_inputs(&worker_public_key.elements);
+        builder.register_public_inputs(&worker_rewards_tree_tag.elements);
         builder.register_public_inputs(&pm_jobs_completed.to_targets());
         builder.register_public_inputs(&public_inputs_hash.elements);
 
@@ -141,7 +141,7 @@ where
             circuit_data,
             fingerprint,
             verify_to_line_gadget,
-            worker_public_key_target: worker_public_key,
+            worker_rewards_tree_tag_target: worker_rewards_tree_tag,
             pm_jobs_completed,
         }
     }
@@ -153,7 +153,7 @@ where
         proof: &ProofWithPublicInputs<C::F, C, D>,
         verifier_data: &VerifierOnlyCircuitData<C, D>,
         top_line_siblings: &[QHashOut<C::F>],
-        worker_public_key: QHashOut<C::F>,
+        worker_rewards_tree_tag: QHashOut<C::F>,
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
 
         let mut pw = PartialWitness::<C::F>::new();
@@ -167,7 +167,7 @@ where
             top_line_siblings,
         )?;
 
-        pw.set_hash_target(self.worker_public_key_target, worker_public_key.0)?;
+        pw.set_hash_target(self.worker_rewards_tree_tag_target, worker_rewards_tree_tag.0)?;
 
         self.circuit_data.prove(pw)
 
@@ -210,7 +210,7 @@ where
         store: &S,
         library: &L,
         job_id: QProvingJobDataID,
-        worker_public_key: QHashOut<C::F>,
+        worker_rewards_tree_tag: QHashOut<C::F>,
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
         let r: CircuitInputWithDependencies<VerifyGUTAToCapCircuitInputSimple<C::F, QHashOut<C::F>>, QProvingJobDataID> =
             bincode::deserialize(&store.get_bytes_by_id(job_id.get_input_witness_id()).await?)
@@ -237,7 +237,7 @@ where
             &child_a_proof,
             &child_a_verifier_data,
             &r.input.top_line_siblings,
-            worker_public_key,
+            worker_rewards_tree_tag,
         )?;
 
         Ok(result)

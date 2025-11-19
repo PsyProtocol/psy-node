@@ -43,7 +43,7 @@ where
     pub a_end_cap_gadget: VerifyEndCapProofGadget<D>,
     pub b_guta_gadget: VerifyGUTAProofGadget<D>,
     pub nca_state_transition_gadget: TwoNCAStateTransitionGadget,
-    pub worker_public_key_target: HashOutTarget,
+    pub worker_rewards_tree_tag_target: HashOutTarget,
     pub pm_jobs_completed: PMJobsCompletedStatsGadget,
 
     pub circuit_data: CircuitData<C::F, C, D>,
@@ -114,9 +114,9 @@ where
 
         let public_inputs_hash = nca_state_transition_gadget.new_guta_header.to_hash::<C::Hasher, C::F, D>(&mut builder);
 
-        let worker_public_key = builder.add_virtual_hash();
+        let worker_rewards_tree_tag = builder.add_virtual_hash();
 
-        // builder.assert_non_zero_hash(worker_public_key);
+        // builder.assert_non_zero_hash(worker_rewards_tree_tag);
 
         let a_commitment = builder.constant_hash(HashOut::ZERO);
 
@@ -128,7 +128,7 @@ where
                 b_guta_gadget.proof_target.public_inputs[3],
             ],
         };
-        let b_worker_public_key = HashOutTarget {
+        let b_worker_rewards_tree_tag = HashOutTarget {
             elements: [
                 b_guta_gadget.proof_target.public_inputs[4],
                 b_guta_gadget.proof_target.public_inputs[5],
@@ -151,11 +151,11 @@ where
             gutas_completed: final_gutas,
         };
 
-        let b_final_commitment = builder.hash_two_to_one::<C::Hasher>(b_commitment, b_worker_public_key);
+        let b_final_commitment = builder.hash_two_to_one::<C::Hasher>(b_commitment, b_worker_rewards_tree_tag);
         let commitment = builder.hash_two_to_one::<C::Hasher>(b_final_commitment, a_commitment);
 
         builder.register_public_inputs(&commitment.elements);
-        builder.register_public_inputs(&worker_public_key.elements);
+        builder.register_public_inputs(&worker_rewards_tree_tag.elements);
         builder.register_public_inputs(&pm_jobs_completed.to_targets());
         builder.register_public_inputs(&public_inputs_hash.elements);
 
@@ -172,13 +172,13 @@ where
             fingerprint,
             a_end_cap_gadget,
             b_guta_gadget,
-            worker_public_key_target: worker_public_key,
+            worker_rewards_tree_tag_target: worker_rewards_tree_tag,
         }
     }
 
     pub fn prove_base(
         &self,
-        worker_public_key: QHashOut<C::F>,
+        worker_rewards_tree_tag: QHashOut<C::F>,
         input: &VerifyLeftEndCapRightGUTAInput<C::F, QHashOut<C::F>>,
         child_a_proof: &ProofWithPublicInputs<C::F, C, D>,
         end_cap_verifier_data: &VerifierOnlyCircuitData<C, D>,
@@ -187,7 +187,7 @@ where
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
         let mut pw = PartialWitness::<C::F>::new();
 
-        pw.set_hash_target(self.worker_public_key_target, worker_public_key.0)?;
+        pw.set_hash_target(self.worker_rewards_tree_tag_target, worker_rewards_tree_tag.0)?;
 
         self.a_end_cap_gadget.set_witness(
             &mut pw,
@@ -241,7 +241,7 @@ where
         store: &S,
         library: &L,
         job_id: QProvingJobDataID,
-        worker_public_key: QHashOut<C::F>,
+        worker_rewards_tree_tag: QHashOut<C::F>,
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
         let r: CircuitInputWithDependencies<VerifyLeftEndCapRightGUTAInputSimple<C::F, QHashOut<C::F>>, QProvingJobDataID> =
             bincode::deserialize(&store.get_bytes_by_id(job_id.get_input_witness_id()).await?).map_err(|e| anyhow::anyhow!(e))?;
@@ -262,7 +262,7 @@ where
         let guta_inclusion_proof_b = library.get_group_inclusion_proof(job_id.circuit_type, dep_b_type)?;
 
         let result = self.prove_base(
-            worker_public_key,
+            worker_rewards_tree_tag,
             &VerifyLeftEndCapRightGUTAInput {
                 checkpoint_tree_root: r.input.checkpoint_tree_root,
                 stats_b: r.input.stats_b,

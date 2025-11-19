@@ -26,7 +26,7 @@ use crate::coordinator::gadgets::{
 pub struct QEDCheckpointStateTransitionCircuit<C: GenericConfig<D>, const D: usize> {
     pub child_proofs_gadget: CheckpointStateTransitionChildProofsGadget<D>,
     pub core_checkpoint_gadget: CheckpointStateTransitionCoreGadget,
-    pub worker_public_key: HashOutTarget,
+    pub worker_rewards_tree_tag: HashOutTarget,
 
     pub circuit_data: CircuitData<C::F, C, D>,
     pub fingerprint: QHashOut<C::F>,
@@ -91,7 +91,7 @@ where
         tracing::debug!("🏛️ Checkpoint State Transition - new_checkpoint_root: {:?}", new_checkpoint_root);
         //let combo_hash = builder.hash_two_to_one::<C::Hasher>(expected_old_checkpoint_root, new_checkpoint_root);
 
-        let worker_public_key = builder.add_virtual_hash();
+        let worker_rewards_tree_tag = builder.add_virtual_hash();
         let zero_hash = builder.constant_hash(HashOut::ZERO);
         let commitment = builder.hash_two_to_one::<C::Hasher>(zero_hash, zero_hash);
 
@@ -102,7 +102,7 @@ where
         ];
 
         builder.register_public_inputs(&commitment.elements);
-        builder.register_public_inputs(&worker_public_key.elements);
+        builder.register_public_inputs(&worker_rewards_tree_tag.elements);
         builder.register_public_inputs(&pm_stats_targets);
         builder.register_public_inputs(&core_checkpoint_gadget.old_checkpoint_tree_root.elements);
         builder.register_public_inputs(&new_checkpoint_root.elements);
@@ -115,23 +115,23 @@ where
             circuit_data,
             child_proofs_gadget,
             core_checkpoint_gadget,
-            worker_public_key,
+            worker_rewards_tree_tag,
             fingerprint,
         }
     }
 
     pub fn prove_base(
         &self,
-        worker_public_key: QHashOut<C::F>,
+        worker_rewards_tree_tag: QHashOut<C::F>,
         input: &QCQEDCheckpointStateTransitionInput<C::F, QHashOut<C::F>>,
         part_1_proof: &ProofWithPublicInputs<C::F, C, D>,
         part_1_verifier_data: &VerifierOnlyCircuitData<C, D>,
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
         let mut pw = PartialWitness::<C::F>::new();
-        pw.set_hash_target(self.worker_public_key, worker_public_key.0)?;
+        pw.set_hash_target(self.worker_rewards_tree_tag, worker_rewards_tree_tag.0)?;
 
-        tracing::debug!("🏛️ Checkpoint State Transition prove_base - worker_public_key: {:?}, append_checkpoint_proof (index: {}, siblings_len: {}), previous_checkpoint_proof (index: {}, siblings_len: {})",
-            worker_public_key, 
+        tracing::debug!("🏛️ Checkpoint State Transition prove_base - worker_rewards_tree_tag: {:?}, append_checkpoint_proof (index: {}, siblings_len: {}), previous_checkpoint_proof (index: {}, siblings_len: {})",
+            worker_rewards_tree_tag, 
             input.append_checkpoint_tree_proof.index, input.append_checkpoint_tree_proof.siblings.len(),
             input.previous_checkpoint_proof.index, input.previous_checkpoint_proof.siblings.len());
 
@@ -191,7 +191,7 @@ where
         store: &S,
         library: &L,
         job_id: QProvingJobDataID,
-        worker_public_key: QHashOut<C::F>,
+        worker_rewards_tree_tag: QHashOut<C::F>,
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
         let r: CircuitInputWithDependencies<QCQEDCheckpointStateTransitionInput<C::F, QHashOut<C::F>>, QProvingJobDataID> =
             bincode::deserialize(&store.get_bytes_by_id(job_id.get_input_witness_id()).await?)
@@ -210,7 +210,7 @@ where
         let part_1_verifier_data = library.get_verifier_data(part_1_proof_type)?;
 
         let result = self.prove_base(
-            worker_public_key,
+            worker_rewards_tree_tag,
             &r.input,
             &part_1_proof,
             &part_1_verifier_data,

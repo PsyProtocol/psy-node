@@ -63,6 +63,7 @@ impl<const D: usize> VerifyGUTAProofToLineGadget<D> {
         proof: &ProofWithPublicInputs<F, C, D>,
         verifier_data: &VerifierOnlyCircuitData<C, D>,
         top_line_siblings: &[QHashOut<F>],
+        rewards_tree_value: QHashOut<F>,
     ) -> anyhow::Result<()> where
     <C as GenericConfig<D>>::Hasher:AlgebraicHasher<F>, {
         self.verify_guta_proof_gadget.set_witness(
@@ -70,7 +71,8 @@ impl<const D: usize> VerifyGUTAProofToLineGadget<D> {
             guta_whitelist_merkle_proof,
             guta_proof_header,
             proof,
-            verifier_data
+            verifier_data,
+            rewards_tree_value,
         )?;
         self.header_line_gadget.set_witness_params(
             witness,

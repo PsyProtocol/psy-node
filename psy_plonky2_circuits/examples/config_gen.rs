@@ -3,7 +3,7 @@ use parth_core::protocol::core_types::{QNetworkCircuitConstants, QNetworkTreeCir
 use plonky2::field::goldilocks_field::GoldilocksField;
 use plonky2::hash::hash_types::HashOut;
 use plonky2::plonk::config::PoseidonGoldilocksConfig;
-use psy_core::constants::protocol::get_default_worker_public_key;
+use psy_core::constants::protocol::get_default_worker_rewards_tree_tag;
 use psy_core::job::job_id::ProvingJobCircuitType;
 use psy_plonky2_basic_helpers::lookalike::standard::{get_agg_state_transition_type_d_common_data, get_agg_user_registration_deploy_guta_type_f_common_data, get_end_cap_type_e_common_data, get_guta_type_c_common_data};
 use psy_plonky2_basic_helpers::verifier::alt::AltVerifierOnlyCircuitData;
@@ -193,7 +193,7 @@ fn run_gen_config<N: QNetworkCircuitConstants>(default_user_state_tree_root: QHa
         N::ONLY_REGISTER_USERS_MAX_USERS_PER_PROOF,
         end_cap_fingerprint,
         default_user_state_tree_root,
-        get_default_worker_public_key::<QHashOut<F>>(),
+        get_default_worker_rewards_tree_tag::<QHashOut<F>>(),
 
     );
 
@@ -256,7 +256,7 @@ fn run_gen_config<N: QNetworkCircuitConstants>(default_user_state_tree_root: QHa
         N::CHECKPOINT_TREE_HEIGHT_USIZE,
         N::MAX_CONTRACT_STATE_TREE_HEIGHT_USIZE,
 
-        get_default_worker_public_key::<QHashOut<F>>()
+        get_default_worker_rewards_tree_tag::<QHashOut<F>>()
     );
 
     coordinator_circuits.register_library(&mut gcv.library);

@@ -14,7 +14,7 @@ use plonky2::{
         proof::ProofWithPublicInputs,
     },
 };
-use psy_core::{constants::protocol::get_default_worker_public_key, job::job_id::QProvingJobDataID};
+use psy_core::{constants::protocol::get_default_worker_rewards_tree_tag, job::job_id::QProvingJobDataID};
 use psy_data::agg::DummyAggStateTransition;
 use psy_plonky2_basic_helpers::{builder::{hash::core::CircuitBuilderHashCore, pad_circuit::{pad_circuit_degree, CircuitBuilderQEDCommonGates}}, verifier::circuit_library::CircuitInfoLibrary};
 
@@ -27,7 +27,7 @@ pub struct AggStateTransitionDummyCircuit<C: GenericConfig<D>, const D: usize>
 {
     pub state_transition_hash: HashOutTarget,
     pub allowed_circuit_hashes_root: HashOutTarget,
-    pub worker_public_key: HashOutTarget,
+    pub worker_rewards_tree_tag: HashOutTarget,
     pub is_deploy_contracts: Target,
     pub is_register_users: Target,
     pub pm_jobs_completed: [Target; 3],
@@ -46,7 +46,7 @@ where
 
         let state_transition_hash = builder.add_virtual_hash();
         let allowed_circuit_hashes_root = builder.add_virtual_hash();
-        let worker_public_key = builder.add_virtual_hash();
+        let worker_rewards_tree_tag = builder.add_virtual_hash();
         let is_deploy_contracts = builder.add_virtual_target();
         let is_register_users = builder.add_virtual_target();
 
@@ -61,7 +61,7 @@ where
             zero,
         ];
 
-        // builder.assert_non_zero_hash(worker_public_key);
+        // builder.assert_non_zero_hash(worker_rewards_tree_tag);
 
         let zero_hash = builder.constant_hash(HashOut::ZERO);
         let commitment = builder.hash_two_to_one::<C::Hasher>(zero_hash, zero_hash);
@@ -70,7 +70,7 @@ where
             builder.hash_two_to_one::<C::Hasher>(state_transition_hash, state_transition_hash);
 
         builder.register_public_inputs(&commitment.elements);
-        builder.register_public_inputs(&worker_public_key.elements);
+        builder.register_public_inputs(&worker_rewards_tree_tag.elements);
         builder.register_public_inputs(&pm_jobs_completed);
         builder.register_public_inputs(&allowed_circuit_hashes_root.elements);
         builder.register_public_inputs(&transition.elements);
@@ -84,7 +84,7 @@ where
         Self {
             state_transition_hash,
             allowed_circuit_hashes_root,
-            worker_public_key,
+            worker_rewards_tree_tag,
             is_deploy_contracts,
             is_register_users,
             pm_jobs_completed,
@@ -94,14 +94,14 @@ where
     }
     pub fn prove_base(
         &self,
-        worker_public_key: QHashOut<C::F>,
+        worker_rewards_tree_tag: QHashOut<C::F>,
         state_transition_hash: QHashOut<C::F>,
         allowed_circuit_hashes_root: QHashOut<C::F>,
         is_deploy_contracts: bool,
         is_register_users: bool,
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
         let mut pw = PartialWitness::<C::F>::new();
-        pw.set_hash_target(self.worker_public_key, worker_public_key.0)?;
+        pw.set_hash_target(self.worker_rewards_tree_tag, worker_rewards_tree_tag.0)?;
         pw.set_hash_target(self.state_transition_hash, state_transition_hash.0)?;
         pw.set_hash_target(
             self.allowed_circuit_hashes_root,
@@ -158,7 +158,7 @@ where
         input: &DummyAggStateTransition<QHashOut<C::F>>,
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
         self.prove_base(
-            get_default_worker_public_key(),
+            get_default_worker_rewards_tree_tag(),
             input.unmodified_state_tree_root,
             input.allowed_circuit_hashes_root,
             input.is_deploy_contracts,
@@ -198,13 +198,13 @@ where
         store: &S,
         _library: &L,
         job_id: QProvingJobDataID,
-        worker_public_key: QHashOut<C::F>,
+        worker_rewards_tree_tag: QHashOut<C::F>,
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
         let r: DummyAggStateTransition<QHashOut<C::F>> =
             bincode::deserialize(&store.get_bytes_by_id(job_id.get_input_witness_id()).await?)
                 .map_err(|e| anyhow::anyhow!(e))?;
         self.prove_base(
-            worker_public_key,
+            worker_rewards_tree_tag,
             r.unmodified_state_tree_root,
             r.allowed_circuit_hashes_root,
             r.is_deploy_contracts,

@@ -9,7 +9,7 @@ use plonky2::{
         proof::ProofWithPublicInputs,
     }
 };
-use psy_core::{constants::protocol::get_default_worker_public_key, job::job_id::{ProvingJobCircuitType, QProvingJobDataID}};
+use psy_core::{constants::protocol::get_default_worker_rewards_tree_tag, job::job_id::{ProvingJobCircuitType, QProvingJobDataID}};
 use psy_data::{protocol::circuit_inputs::append_user_registration_tree::QCAppendUserRegistrationTreeCircuitInput, worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse};
 use psy_plonky2_basic_helpers::{
     builder::{hash::core::CircuitBuilderHashCore, pad_circuit::CircuitBuilderQEDCommonGates}, verifier::circuit_library::CircuitInfoLibrary,
@@ -144,7 +144,7 @@ where
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
         self.prove_base(
             input.register_users_circuit_whitelist,
-            get_default_worker_public_key(),
+            get_default_worker_rewards_tree_tag(),
             &input.spiderman_append_proofs,
         )
     }
@@ -183,7 +183,7 @@ where
         store: &S,
         _library: &L,
         job_id: QProvingJobDataID,
-        worker_public_key: QHashOut<C::F>,
+        worker_rewards_tree_tag: QHashOut<C::F>,
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
         let input: QCAppendUserRegistrationTreeCircuitInput<QHashOut<C::F>> = bincode::deserialize(&store.get_bytes_by_id(job_id.get_input_witness_id()).await?)
                 .map_err(|e| anyhow::anyhow!(e))?;
@@ -191,7 +191,7 @@ where
 
         let result = self.prove_base(
             input.register_users_circuit_whitelist,
-            worker_public_key,
+            worker_rewards_tree_tag,
             &input.spiderman_append_proofs,
         )?;
 

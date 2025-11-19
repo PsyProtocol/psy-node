@@ -47,7 +47,7 @@ where
     pub historical_checkpoint_proof_a: HistoricalRootMerkleProofGadget,
     pub historical_checkpoint_proof_b: HistoricalRootMerkleProofGadget,
     pub nca_state_transition_gadget: TwoNCAStateTransitionGadget,
-    pub worker_public_key: HashOutTarget,
+    pub worker_rewards_tree_tag: HashOutTarget,
     pub commitment: HashOutTarget,
     pub pm_jobs_completed: PMJobsCompletedStatsGadget,
 
@@ -141,9 +141,9 @@ where
             global_user_tree_height as u8,
         );
 
-        let worker_public_key = builder.add_virtual_hash();
+        let worker_rewards_tree_tag = builder.add_virtual_hash();
 
-        // builder.assert_non_zero_hash(worker_public_key);
+        // builder.assert_non_zero_hash(worker_rewards_tree_tag);
 
         let a_commitment = HashOutTarget {
             elements: [
@@ -153,7 +153,7 @@ where
                 a_guta_gadget.proof_target.public_inputs[3],
             ],
         };
-        let a_worker_public_key = HashOutTarget {
+        let a_worker_rewards_tree_tag = HashOutTarget {
             elements: [
                 a_guta_gadget.proof_target.public_inputs[4],
                 a_guta_gadget.proof_target.public_inputs[5],
@@ -175,7 +175,7 @@ where
                 b_guta_gadget.proof_target.public_inputs[3],
             ],
         };
-        let b_worker_public_key = HashOutTarget {
+        let b_worker_rewards_tree_tag = HashOutTarget {
             elements: [
                 b_guta_gadget.proof_target.public_inputs[4],
                 b_guta_gadget.proof_target.public_inputs[5],
@@ -201,14 +201,14 @@ where
             gutas_completed: final_gutas,
         };
 
-        let a_final_commitment = builder.hash_two_to_one::<C::Hasher>(a_commitment, a_worker_public_key);
-        let b_final_commitment = builder.hash_two_to_one::<C::Hasher>(b_commitment, b_worker_public_key);
+        let a_final_commitment = builder.hash_two_to_one::<C::Hasher>(a_commitment, a_worker_rewards_tree_tag);
+        let b_final_commitment = builder.hash_two_to_one::<C::Hasher>(b_commitment, b_worker_rewards_tree_tag);
         let commitment = builder.hash_two_to_one::<C::Hasher>(a_final_commitment, b_final_commitment);
 
         let public_inputs_hash = nca_state_transition_gadget.new_guta_header.to_hash::<C::Hasher, C::F, D>(&mut builder);
 
         builder.register_public_inputs(&commitment.elements);
-        builder.register_public_inputs(&worker_public_key.elements);
+        builder.register_public_inputs(&worker_rewards_tree_tag.elements);
         builder.register_public_inputs(&pm_jobs_completed.to_targets());
         builder.register_public_inputs(&public_inputs_hash.elements);
 
@@ -231,7 +231,7 @@ where
             historical_checkpoint_proof_b,
             nca_state_transition_gadget,
             pm_jobs_completed,
-            worker_public_key,
+            worker_rewards_tree_tag,
             commitment,
             circuit_data,
             fingerprint,
@@ -241,7 +241,7 @@ where
 
     pub fn prove_base(
         &self,
-        worker_public_key: QHashOut<C::F>,
+        worker_rewards_tree_tag: QHashOut<C::F>,
         input: &VerifyTwoGUTAProofUpgradeCheckpointStandardInput<C::F, QHashOut<C::F>>,
         child_a_proof: &ProofWithPublicInputs<C::F, C, D>,
         child_a_verifier_data: &VerifierOnlyCircuitData<C, D>,
@@ -249,11 +249,11 @@ where
         child_b_verifier_data: &VerifierOnlyCircuitData<C, D>,
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
         let mut pw = PartialWitness::<C::F>::new();
-        pw.set_hash_target(self.worker_public_key, worker_public_key.0)?;
+        pw.set_hash_target(self.worker_rewards_tree_tag, worker_rewards_tree_tag.0)?;
 
         tracing::debug!(
-            "🔄 Two GUTA Upgrade Checkpoint set_witness - worker_public_key: {}, checkpoint_proof_a: {}, checkpoint_proof_b: {}",
-            serde_json::to_string_pretty(&worker_public_key).unwrap(),
+            "🔄 Two GUTA Upgrade Checkpoint set_witness - worker_rewards_tree_tag: {}, checkpoint_proof_a: {}, checkpoint_proof_b: {}",
+            serde_json::to_string_pretty(&worker_rewards_tree_tag).unwrap(),
             serde_json::to_string_pretty(&input.historical_checkpoint_proof_a).unwrap(),
             serde_json::to_string_pretty(&input.historical_checkpoint_proof_b).unwrap()
         );
@@ -314,7 +314,7 @@ where
         store: &S,
         library: &L,
         job_id: QProvingJobDataID,
-        worker_public_key: QHashOut<C::F>,
+        worker_rewards_tree_tag: QHashOut<C::F>,
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
         let r: CircuitInputWithDependencies<VerifyTwoGUTAProofUpgradeCheckpointStandardInputSimple<C::F, QHashOut<C::F>>, QProvingJobDataID> =
             bincode::deserialize(&store.get_bytes_by_id(job_id.get_input_witness_id()).await?).map_err(|e| anyhow::anyhow!(e))?;
@@ -335,7 +335,7 @@ where
         let child_b_verifier_data = library.get_verifier_data(dep_b_type)?;
         let guta_inclusion_proof_b = library.get_group_inclusion_proof(job_id.circuit_type, dep_b_type)?;
         let result = self.prove_base(
-            worker_public_key,
+            worker_rewards_tree_tag,
             &VerifyTwoGUTAProofUpgradeCheckpointStandardInput {
                 historical_checkpoint_proof_a: r.input.historical_checkpoint_proof_a,
                 historical_checkpoint_proof_b: r.input.historical_checkpoint_proof_b,

@@ -21,6 +21,7 @@ pub struct VerifyGUTAProofGadget<const D: usize> {
     // start targets requiring witness
     pub guta_proof_header_gadget: GlobalUserTreeAggregatorHeaderGadget,
     pub guta_whitelist_merkle_proof: MerkleProofGadget,
+    pub rewards_tree_value: HashOutTarget,
     pub verifier_data: VerifierCircuitTarget,
     pub proof_target: ProofWithPublicInputsTarget<D>,
     // end targets requiring witness
@@ -37,6 +38,7 @@ impl<const D: usize> VerifyGUTAProofGadget<D> {
     where
         <C as GenericConfig<D>>::Hasher:AlgebraicHasher<F>,
     {
+        let rewards_tree_value = builder.add_virtual_hash();
         let verifier_data = builder.add_virtual_verifier_data(verifier_data_cap_height);
         let proof_target = builder.add_virtual_proof_with_pis(proof_common_data);
 
@@ -58,38 +60,36 @@ impl<const D: usize> VerifyGUTAProofGadget<D> {
 
 
         // start: check child proof public inputs
-        let expected_proof_public_inputs_hash = guta_proof_header_gadget.to_hash::<C::Hasher, C::F, D>(builder);
+        let expected_proof_public_inputs_hash = guta_proof_header_gadget.get_expected_public_inputs_hash::<C::Hasher, C::F, D>(builder, rewards_tree_value);
 
 
         assert_eq!(
             proof_target.public_inputs.len(),
-            15,
-            "GUTA proofs should have 15 public inputs"
+            4,
+            "GUTA proofs should have 4 public inputs"
         );
         let proof_public_input_hash = HashOutTarget {
             elements: [
-                proof_target.public_inputs[11],
-                proof_target.public_inputs[12],
-                proof_target.public_inputs[13],
-                proof_target.public_inputs[14],
+                proof_target.public_inputs[0],
+                proof_target.public_inputs[1],
+                proof_target.public_inputs[2],
+                proof_target.public_inputs[3],
             ],
         };
-
-        tracing::debug!("🎯 GUTA gadget - guta_proof_header_gadget: {:?}", guta_proof_header_gadget);
-        tracing::debug!("🎯 GUTA gadget - expected_proof_public_inputs_hash targets: {:?}", expected_proof_public_inputs_hash.elements);
-        tracing::debug!("🎯 GUTA gadget - proof_public_input_hash targets: {:?}", proof_public_input_hash.elements);
-
         // ensure the whitelist root and state transition is correct for the proof
         builder.connect_hashes(expected_proof_public_inputs_hash, proof_public_input_hash);
         // end: check child proof public inputs
 
         // ensure the leaf revealed in the whitelist merkle proof is actually the fingerprint of the proof
         builder.connect_hashes(guta_whitelist_merkle_proof.value, proof_fingerprint);
+
+
         Self {
             guta_proof_header_gadget,
             guta_whitelist_merkle_proof,
             verifier_data,
             proof_target,
+            rewards_tree_value,
         }
     }
 
@@ -100,6 +100,7 @@ impl<const D: usize> VerifyGUTAProofGadget<D> {
         guta_proof_header: &GlobalUserTreeAggregatorHeader<F, QHashOut<F>>,
         proof: &ProofWithPublicInputs<F, C, D>,
         verifier_data: &VerifierOnlyCircuitData<C, D>,
+        rewards_tree_value: QHashOut<F>,
     ) -> anyhow::Result<()> where
     <C as GenericConfig<D>>::Hasher:AlgebraicHasher<F>, {
         tracing::debug!("🎯 Verify GUTA Proof set_witness - guta_proof_header: {}, public_inputs: {}",
@@ -113,6 +114,7 @@ impl<const D: usize> VerifyGUTAProofGadget<D> {
         )?;
         self.guta_proof_header_gadget.set_witness(witness, guta_proof_header)?;
 
+        witness.set_hash_target(self.rewards_tree_value, rewards_tree_value.0)?;
         witness.set_proof_with_pis_target(&self.proof_target, &proof)?;
         witness.set_verifier_data_target(&self.verifier_data, &verifier_data)
     }
@@ -125,6 +127,7 @@ impl<const D: usize> VerifyGUTAProofGadget<D> {
         guta_proof_header: &GlobalUserTreeAggregatorHeader<F, HashOut<F>>,
         proof: &ProofWithPublicInputs<F, C, D>,
         verifier_data: &VerifierOnlyCircuitData<C, D>,
+        rewards_tree_value: HashOut<F>,
     ) -> anyhow::Result<()> where
     <C as GenericConfig<D>>::Hasher:AlgebraicHasher<F>, {
         tracing::debug!("🎯 Verify GUTA Proof set_witness - guta_proof_header: {}, public_inputs: {}",
@@ -138,6 +141,7 @@ impl<const D: usize> VerifyGUTAProofGadget<D> {
         )?;
         self.guta_proof_header_gadget.set_witness_ho(witness, guta_proof_header)?;
 
+        witness.set_hash_target(self.rewards_tree_value, rewards_tree_value)?;
         witness.set_proof_with_pis_target(&self.proof_target, &proof)?;
         witness.set_verifier_data_target(&self.verifier_data, &verifier_data)
     }

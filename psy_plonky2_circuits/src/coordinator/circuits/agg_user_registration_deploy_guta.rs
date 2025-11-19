@@ -102,7 +102,7 @@ where
                 verifier_gadget.verify_register_users_gadget.proof_target.public_inputs[3],
             ]
         };
-        let register_users_worker_public_key = HashOutTarget {
+        let register_users_worker_rewards_tree_tag = HashOutTarget {
             elements: [
                 verifier_gadget.verify_register_users_gadget.proof_target.public_inputs[4],
                 verifier_gadget.verify_register_users_gadget.proof_target.public_inputs[5],
@@ -110,7 +110,7 @@ where
                 verifier_gadget.verify_register_users_gadget.proof_target.public_inputs[7],
             ]
         };
-        let register_users_root = builder.hash_two_to_one::<C::Hasher>(register_users_commitment, register_users_worker_public_key);
+        let register_users_root = builder.hash_two_to_one::<C::Hasher>(register_users_commitment, register_users_worker_rewards_tree_tag);
 
         let deploy_contracts_commitment = HashOutTarget {
             elements: [
@@ -120,7 +120,7 @@ where
                 verifier_gadget.verify_deploy_contract_gadget.proof_target.public_inputs[3],
             ]
         };
-        let deploy_contracts_worker_public_key = HashOutTarget {
+        let deploy_contracts_worker_rewards_tree_tag = HashOutTarget {
             elements: [
                 verifier_gadget.verify_deploy_contract_gadget.proof_target.public_inputs[4],
                 verifier_gadget.verify_deploy_contract_gadget.proof_target.public_inputs[5],
@@ -128,7 +128,7 @@ where
                 verifier_gadget.verify_deploy_contract_gadget.proof_target.public_inputs[7],
             ]
         };
-        let deploy_contracts_root = builder.hash_two_to_one::<C::Hasher>(deploy_contracts_commitment, deploy_contracts_worker_public_key);
+        let deploy_contracts_root = builder.hash_two_to_one::<C::Hasher>(deploy_contracts_commitment, deploy_contracts_worker_rewards_tree_tag);
 
         let gutas_commitment = HashOutTarget {
             elements: [
@@ -138,7 +138,7 @@ where
                 verifier_gadget.verify_guta_gadget.proof_target.public_inputs[3],
             ]
         };
-        let gutas_worker_public_key = HashOutTarget {
+        let gutas_worker_rewards_tree_tag = HashOutTarget {
             elements: [
                 verifier_gadget.verify_guta_gadget.proof_target.public_inputs[4],
                 verifier_gadget.verify_guta_gadget.proof_target.public_inputs[5],
@@ -146,7 +146,7 @@ where
                 verifier_gadget.verify_guta_gadget.proof_target.public_inputs[7],
             ]
         };
-        let gutas_root = builder.hash_two_to_one::<C::Hasher>(gutas_commitment, gutas_worker_public_key);
+        let gutas_root = builder.hash_two_to_one::<C::Hasher>(gutas_commitment, gutas_worker_rewards_tree_tag);
 
         builder.register_public_inputs(&state_transition_hash.elements);
         builder.register_public_inputs(&register_users_root.elements);
@@ -277,7 +277,7 @@ where
         store: &S,
         library: &L,
         job_id: QProvingJobDataID,
-        worker_public_key: QHashOut<C::F>,
+        worker_rewards_tree_tag: QHashOut<C::F>,
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
         let r: CircuitInputWithDependencies<QCAggUserRegistartionDeployContractsGUTAInput<C::F, QHashOut<C::F>>, QProvingJobDataID> =
             bincode::deserialize(&store.get_bytes_by_id(job_id.get_input_witness_id()).await?)

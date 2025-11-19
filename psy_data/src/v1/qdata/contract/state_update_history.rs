@@ -1,6 +1,10 @@
 #[cfg(feature = "node")]
 use auto_impl::auto_impl;
-use parth_core::{crypto::hash::merkle_proof::DeltaMerkleProofCore, protocol::core_types::QHashBase};
+#[cfg(feature = "rand_gen")]
+use parth_core::utils::QPGenRandom;
+use parth_core::{crypto::hash::merkle_proof::DeltaMerkleProofCore, protocol::core_types::{Q256BitHash, QHashBase}};
+use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
+use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
 
 
 #[pderive::serialize_clone_hash_ts]
@@ -9,7 +13,63 @@ pub struct QEDContractStateUpdateHistory<Hash> {
     pub user_contract_tree_update_proof: DeltaMerkleProofCore<Hash>,
     pub contract_state_tree_updates: Vec<DeltaMerkleProofCore<Hash>>,
 }
+#[cfg(feature = "rand_gen")]
+impl<Hash: QPGenRandom> QPGenRandom for QEDContractStateUpdateHistory<Hash> {
+    fn qp_rand_gen() -> Self where Self: Sized {
+        Self {
+            user_contract_tree_update_proof: DeltaMerkleProofCore::<Hash>::qp_rand_gen(),
+            contract_state_tree_updates: QPGenRandom::qp_rand_gen_vec(rand::random::<u8>() as usize % 5 + 1),
+        }
+    }
+}
 
+impl<Hash: Q256BitHash> PsyCanonicalSerializeMetadata for QEDContractStateUpdateHistory<Hash> {
+    const IS_FIXED_SIZE: bool = false;
+    const FIXED_SIZE: usize = 0;
+}
+
+impl<Hash: Q256BitHash> FallbackPsySerializeCanonical for QEDContractStateUpdateHistory<Hash> {
+    fn fallback_pio_serialized_size(&self) -> usize {
+        self.user_contract_tree_update_proof.pio_serialized_size()
+        + 4 + self.contract_state_tree_updates.iter().map(|p| p.pio_serialized_size()).sum::<usize>()
+    }
+    
+    fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
+        self.user_contract_tree_update_proof.pio_write_to_io(writer)?;
+        writer.psy_write_vec_length(self.contract_state_tree_updates.len())?;
+        for proof in &self.contract_state_tree_updates {
+            proof.pio_write_to_io(writer)?;
+        }
+        Ok(())
+    }
+    
+    fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
+        let user_contract_tree_update_proof = DeltaMerkleProofCore::pio_read_from_io(reader)?;
+        let updates_len = reader.psy_read_vec_length()? as usize;
+        let mut contract_state_tree_updates = Vec::with_capacity(updates_len);
+        for _ in 0..updates_len {
+            contract_state_tree_updates.push(DeltaMerkleProofCore::pio_read_from_io(reader)?);
+        }
+        Ok(Self {
+            user_contract_tree_update_proof,
+            contract_state_tree_updates,
+        })
+    }
+}
+
+#[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
+psy_serialize::impl_psy_canonical_serialize_for_speedy!(
+    QEDContractStateUpdateHistory,
+    { Hash: Q256BitHash } => { Hash }
+);
+#[cfg(not(all(feature = "serialize_speedy", target_endian = "little")))]
+impl<Hash: Q256BitHash> psy_serialize::AutoImplementFallbackPsySerializeCanonical for QEDContractStateUpdateHistory<Hash> {}
+
+pser::impl_psy_ser_basic_tests_fallback!(
+    QEDContractStateUpdateHistory,
+    { parth_core::PHash },
+    qed_contract_state_update_history_ser_tests
+);
 impl<Hash: QHashBase> QEDContractStateUpdateHistory<Hash> {
     pub fn ensure_basic_consistency<C: PSimpleContractHeightCache<Hash>>(&self, contract_helper: &C, contract_tree_height: usize) -> anyhow::Result<()> {
         if self.contract_state_tree_updates.len() == 0 {

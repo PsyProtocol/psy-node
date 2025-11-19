@@ -696,6 +696,10 @@ macro_rules! impl_psy_ser_basic_tests_fallback {
                     for _ in 0..10_000 {
                         let value = PsySerTestTargetType::qp_rand_gen();
                         let serialized = value.psy_ser_to_bytes_vec()?;
+                        let expected_size = value.pio_serialized_size();
+                        assert_eq!(serialized.len(), expected_size, "Serialized size does not match expected size");
+                        let fallback_expected_size = value.fallback_pio_serialized_size();
+                        assert_eq!(serialized.len(), fallback_expected_size, "Serialized size does not match expected size from fallback size method");
                         let deserialized = PsySerTestTargetType::psy_ser_from_slice(&serialized)?;
                         assert!(value == deserialized, "Round trip serialization failed on fuzz test");
                     }

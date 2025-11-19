@@ -7,7 +7,7 @@ use plonky2::{
         circuit_data::{CircuitConfig, CircuitData, CommonCircuitData, VerifierOnlyCircuitData},
         config::{AlgebraicHasher, GenericConfig},
         proof::ProofWithPublicInputs,
-    }, field::types::Field
+    }
 };
 use parth_core::{
     crypto::hash::traits::MerkleZeroHasher,
@@ -17,10 +17,8 @@ use parth_core::{
 use psy_core::
     job::job_id::{ProvingJobCircuitType, QProvingJobDataID}
 ;
-use psy_data::{
-    proof_input::guta::VerifyTwoEndCapCircuitInput, v1::qdata::pm_jobs_completed_stats::PPMJobsCompletedStats
-    ,
-};
+use psy_data::
+    proof_input::guta::VerifyTwoEndCapCircuitInput;
 use psy_plonky2_basic_helpers::{
     builder::{
         hash::core::CircuitBuilderHashCore,
@@ -28,10 +26,8 @@ use psy_plonky2_basic_helpers::{
     },
     verifier::circuit_library::CircuitInfoLibrary,
 };
-use psy_plonky2_common_circuits::traits::ToTargets;
 
 use crate::{
-    gadgets::qdata::pm_jobs_completed_stats::PMJobsCompletedStatsGadget,
     proof_minifier::pm_core::get_circuit_fingerprint_generic,
     qstandard::{proof_store::QProofStoreReaderAsync, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QPsyNetworkCircuitWithType},
 };
@@ -47,9 +43,7 @@ where
     pub a_end_cap_gadget: VerifyEndCapProofGadget<D>,
     pub b_end_cap_gadget: VerifyEndCapProofGadget<D>,
     pub nca_state_transition_gadget: TwoNCAStateTransitionGadget,
-    pub worker_public_key: HashOutTarget,
-    pub pm_jobs_completed: PMJobsCompletedStatsGadget,
-
+    pub worker_rewards_tree_tag: HashOutTarget,
     pub circuit_data: CircuitData<C::F, C, D>,
     pub fingerprint: QHashOut<C::F>,
 }
@@ -122,21 +116,9 @@ where
             global_user_tree_height as u8,
         );
 
-        let worker_public_key = builder.add_virtual_hash();
+        let worker_rewards_tree_tag = builder.add_virtual_hash();
+        let public_inputs_hash = nca_state_transition_gadget.new_guta_header.get_public_inputs_hash_two_end_cap::<C::Hasher, C::F, D>(&mut builder, worker_rewards_tree_tag);
 
-        // builder.assert_non_zero_hash(worker_public_key);
-
-        let zero_hash = builder.constant_hash(HashOut::ZERO);
-        let commitment = builder.hash_two_to_one::<C::Hasher>(zero_hash, zero_hash);
-
-        let one = builder.one();
-        let pm_jobs_completed = PMJobsCompletedStatsGadget::new_gutas(&mut builder, one);
-
-        let public_inputs_hash = nca_state_transition_gadget.new_guta_header.to_hash::<C::Hasher, C::F, D>(&mut builder);
-
-        builder.register_public_inputs(&commitment.elements);
-        builder.register_public_inputs(&worker_public_key.elements);
-        builder.register_public_inputs(&pm_jobs_completed.to_targets());
         builder.register_public_inputs(&public_inputs_hash.elements);
         builder.add_gate_to_gate_set(GateRef::new(ConstantGate::new(builder.config.num_constants)));
         pad_circuit_degree(&mut builder, 12);
@@ -151,8 +133,7 @@ where
             a_end_cap_gadget,
             b_end_cap_gadget,
             nca_state_transition_gadget,
-            worker_public_key,
-            pm_jobs_completed,
+            worker_rewards_tree_tag,
             circuit_data,
             fingerprint,
         }
@@ -160,7 +141,7 @@ where
 
     pub fn prove_base(
         &self,
-        worker_public_key: QHashOut<C::F>,
+        worker_rewards_tree_tag: QHashOut<C::F>,
         input: &VerifyTwoEndCapCircuitInput<C::F, QHashOut<C::F>>,
         child_a_proof: &ProofWithPublicInputs<C::F, C, D>,
         child_b_proof: &ProofWithPublicInputs<C::F, C, D>,
@@ -169,7 +150,7 @@ where
         let mut pw = PartialWitness::<C::F>::new();
 
         pw.set_hash_target(self.guta_circuit_whitelist_root_hash, input.guta_circuit_whitelist.0)?;
-        pw.set_hash_target(self.worker_public_key, worker_public_key.0)?;
+        pw.set_hash_target(self.worker_rewards_tree_tag, worker_rewards_tree_tag.0)?;
 
         self.a_end_cap_gadget.set_witness(
             &mut pw,
@@ -194,9 +175,7 @@ where
         )?;
 
         // Set witness for pm_jobs_completed stats (leaf circuit adds 1 GUTA completion)
-        let pm_stats = PPMJobsCompletedStats::new_gutas(C::F::ONE);
-        self.pm_jobs_completed.set_witness(&mut pw, &pm_stats)?;
-
+        
         let mut dbgt = DebugTimer::new("prove end cap two");
         dbgt.lap("start");
 
@@ -244,7 +223,7 @@ C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>>, C::F: QRichFi
         store: &S,
         library: &L,
         job_id: QProvingJobDataID,
-        worker_public_key: QHashOut<C::F>,
+        worker_rewards_tree_tag: QHashOut<C::F>,
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
 
         let r: CircuitInputWithDependencies<VerifyTwoEndCapCircuitInput<C::F, QHashOut<C::F>>, QProvingJobDataID> = bincode::deserialize(&store.get_bytes_by_id(job_id.get_input_witness_id()).await?).map_err(|e| anyhow::anyhow!(e))?;
@@ -260,7 +239,7 @@ C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>>, C::F: QRichFi
         let dep_0_type = r.dependencies[0].circuit_type;
         let vd = library.get_verifier_data(dep_0_type)?;
         let result = self.prove_base(
-            worker_public_key,
+            worker_rewards_tree_tag,
             &r.input,
             &proof_a,
             &proof_b,

@@ -157,6 +157,7 @@ impl<const D: usize> VerifyEndCapProofGadget<D> {
 
             },
             stats: self.guta_stats.to_owned(),
+            total_aggregation_proofs_generated: builder.zero(),
         }
     }
 }

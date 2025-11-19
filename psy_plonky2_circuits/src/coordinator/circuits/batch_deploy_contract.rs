@@ -9,7 +9,7 @@ use plonky2::{
         proof::ProofWithPublicInputs,
     }
 };
-use psy_core::{constants::protocol::get_default_worker_public_key, job::job_id::{ProvingJobCircuitType, QProvingJobDataID}};
+use psy_core::{constants::protocol::get_default_worker_rewards_tree_tag, job::job_id::{ProvingJobCircuitType, QProvingJobDataID}};
 use psy_data::{protocol::circuit_inputs::deploy_contracts::QCBatchDeployContractsCircuitInput, v1::qdata::contract::PQEDContractLeaf, worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse};
 use psy_plonky2_basic_helpers::{
     builder::{hash::core::CircuitBuilderHashCore, pad_circuit::{pad_circuit_degree, CircuitBuilderQEDCommonGates}}, verifier::circuit_library::CircuitInfoLibrary,
@@ -143,7 +143,7 @@ where
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
         self.prove_base(
             input.deploy_contract_circuit_whitelist,
-            get_default_worker_public_key(),
+            get_default_worker_rewards_tree_tag(),
             &input.spiderman_append_proof,
             &input.contract_leaves,
         )

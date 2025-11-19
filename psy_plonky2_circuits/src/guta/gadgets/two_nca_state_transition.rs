@@ -80,6 +80,10 @@ impl TwoNCAStateTransitionGadget {
 
 
 
+        let total_aggregation_proofs_generated = builder.add(a_header.total_aggregation_proofs_generated, b_header.total_aggregation_proofs_generated);
+        let one = builder.one();
+        let total_aggregation_proofs_generated = builder.add(total_aggregation_proofs_generated, one);
+
         let new_guta_header = GlobalUserTreeAggregatorHeaderGadget{
             guta_circuit_whitelist: a_header.guta_circuit_whitelist,
             checkpoint_tree_root: a_header.checkpoint_tree_root,
@@ -90,6 +94,7 @@ impl TwoNCAStateTransitionGadget {
                 node_level: update_nca_proof_gadget.nearest_common_ancestor_level
             },
             stats: new_stats,
+            total_aggregation_proofs_generated,
         };
 
         tracing::debug!("📊 new_guta_header: {:?}", new_guta_header);

@@ -113,7 +113,7 @@ impl AggStateTrackableCircuitHeaderGadget {
 #[derive(Debug)]
 pub struct AggStateTransitionCircuit<C: GenericConfig<D>, const D: usize> {
     pub header_gadget: AggStateTrackableCircuitHeaderGadget,
-    pub worker_public_key: HashOutTarget,
+    pub worker_rewards_tree_tag: HashOutTarget,
     pub commitment: HashOutTarget,
     pub pm_jobs_completed: [Target; 3],
 
@@ -161,7 +161,7 @@ where
                 &mut builder,
             );
 
-        let worker_public_key = builder.add_virtual_hash();
+        let worker_rewards_tree_tag = builder.add_virtual_hash();
 
         let left_proof = builder.add_virtual_proof_with_pis(child_common_data);
         let left_verifier_data = builder.add_virtual_verifier_data(verifier_cap_height);
@@ -177,7 +177,7 @@ where
                 left_proof.public_inputs[3],
             ],
         };
-        let left_child_worker_public_key = HashOutTarget {
+        let left_child_worker_rewards_tree_tag = HashOutTarget {
             elements: [
                 left_proof.public_inputs[4],
                 left_proof.public_inputs[5],
@@ -215,7 +215,7 @@ where
                 right_proof.public_inputs[3],
             ],
         };
-        let right_child_worker_public_key = HashOutTarget {
+        let right_child_worker_rewards_tree_tag = HashOutTarget {
             elements: [
                 right_proof.public_inputs[4],
                 right_proof.public_inputs[5],
@@ -250,8 +250,8 @@ where
         let final_gutas = builder.add(left_child_pm_jobs_completed[2], right_child_pm_jobs_completed[2]);
 
         let pm_jobs_completed = [final_deploy_contracts, final_register_users, final_gutas];
-        let left_final_commitment = builder.hash_two_to_one::<C::Hasher>(left_child_commitment, left_child_worker_public_key);
-        let right_final_commitment = builder.hash_two_to_one::<C::Hasher>(right_child_commitment, right_child_worker_public_key);
+        let left_final_commitment = builder.hash_two_to_one::<C::Hasher>(left_child_commitment, left_child_worker_rewards_tree_tag);
+        let right_final_commitment = builder.hash_two_to_one::<C::Hasher>(right_child_commitment, right_child_worker_rewards_tree_tag);
         let commitment = builder.hash_two_to_one::<C::Hasher>(left_final_commitment, right_final_commitment);
         builder.connect_hashes(
             left_child_allowed_circuit_hashes_root,
@@ -297,7 +297,7 @@ where
         );
 
         builder.register_public_inputs(&commitment.elements);
-        builder.register_public_inputs(&worker_public_key.elements);
+        builder.register_public_inputs(&worker_rewards_tree_tag.elements);
         builder.register_public_inputs(&pm_jobs_completed);
         builder.register_public_inputs(&header_gadget.allowed_circuit_hashes_root.elements);
         builder.register_public_inputs(&header_gadget.state_transition_hash.elements);
@@ -309,7 +309,7 @@ where
 
         Self {
             header_gadget,
-            worker_public_key,
+            worker_rewards_tree_tag,
             commitment,
             pm_jobs_completed,
             left_proof,
@@ -326,13 +326,13 @@ where
         agg_verifier_data: &VerifierOnlyCircuitData<C, D>,
         leaf_fingerprint: QHashOut<C::F>,
         leaf_verifier_data: &VerifierOnlyCircuitData<C, D>,
-        worker_public_key: QHashOut<C::F>,
+        worker_rewards_tree_tag: QHashOut<C::F>,
         left_proof: &ProofWithPublicInputs<C::F, C, D>,
         right_proof: &ProofWithPublicInputs<C::F, C, D>,
         input: &AggStateTransitionInput<QHashOut<C::F>>,
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
         let mut pw = PartialWitness::<C::F>::new();
-        pw.set_hash_target(self.worker_public_key, worker_public_key.0)?;
+        pw.set_hash_target(self.worker_rewards_tree_tag, worker_rewards_tree_tag.0)?;
         /*
         println!("agg_fingerprint: {} ({:?})", agg_fingerprint.to_string(), agg_fingerprint);
         println!("leaf_fingerprint: {} ({:?})", leaf_fingerprint.to_string(), leaf_fingerprint);
@@ -392,7 +392,7 @@ where
         agg_verifier_data: &VerifierOnlyCircuitData<C, D>,
         leaf_fingerprint: QHashOut<C::F>,
         leaf_verifier_data: &VerifierOnlyCircuitData<C, D>,
-        worker_public_key: QHashOut<C::F>,
+        worker_rewards_tree_tag: QHashOut<C::F>,
         left_proof: &ProofWithPublicInputs<C::F, C, D>,
         right_proof: &ProofWithPublicInputs<C::F, C, D>,
         input: &AggStateTransitionInput<QHashOut<C::F>>,
@@ -402,7 +402,7 @@ where
             agg_verifier_data,
             leaf_fingerprint,
             leaf_verifier_data,
-            worker_public_key,
+            worker_rewards_tree_tag,
             left_proof,
             right_proof,
             input,
@@ -427,7 +427,7 @@ where
         store: &S,
         library: &L,
         job_id: QProvingJobDataID,
-        worker_public_key: QHashOut<C::F>,
+        worker_rewards_tree_tag: QHashOut<C::F>,
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
         let r: CircuitInputWithDependencies<AggStateTransitionInput<QHashOut<C::F>>, QProvingJobDataID> =
             bincode::deserialize(&store.get_bytes_by_id(job_id.get_input_witness_id()).await?)
@@ -452,7 +452,7 @@ where
             agg_verifier_data,
             leaf_fingerprint,
             &leaf_verifier_data,
-            worker_public_key,
+            worker_rewards_tree_tag,
             &child_a_proof,
             &child_b_proof,
             &r.input

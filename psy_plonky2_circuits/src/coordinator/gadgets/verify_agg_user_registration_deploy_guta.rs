@@ -181,6 +181,7 @@ impl<const D: usize> VerifyAggUserRegistartionDeployContractsGUTAGadget<D> {
         guta_proof_header: &GlobalUserTreeAggregatorHeader<F, QHashOut<F>>,
         guta_proof: &ProofWithPublicInputs<F, C, D>,
         guta_verifier_data: &VerifierOnlyCircuitData<C, D>,
+        child_proof_rewards_tree_value: QHashOut<F>,
     ) -> anyhow::Result<()>
     where
         C::Hasher: AlgebraicHasher<F>,
@@ -217,7 +218,7 @@ impl<const D: usize> VerifyAggUserRegistartionDeployContractsGUTAGadget<D> {
         )?;
 
         self.verify_guta_gadget
-            .set_witness(witness, guta_whitelist_merkle_proof, guta_proof_header, guta_proof, guta_verifier_data)?;
+            .set_witness(witness, guta_whitelist_merkle_proof, guta_proof_header, guta_proof, guta_verifier_data, child_proof_rewards_tree_value)?;
 
         Ok(())
     }

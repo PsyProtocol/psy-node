@@ -32,11 +32,14 @@ impl GUTAHeaderLineProofGadget {
             &child_proof_header.state_transition
         );
 
+        let one = builder.one();
+
         let new_guta_header = GlobalUserTreeAggregatorHeaderGadget{
             guta_circuit_whitelist: child_proof_header.guta_circuit_whitelist,
             checkpoint_tree_root: child_proof_header.checkpoint_tree_root,
             state_transition: top_line_gadget.new_state_transition,
             stats: child_proof_header.stats,
+            total_aggregation_proofs_generated: builder.add(child_proof_header.total_aggregation_proofs_generated, one),
         };
 
         tracing::debug!("📏 GUTA Line - new_guta_header: {:?}", new_guta_header);
