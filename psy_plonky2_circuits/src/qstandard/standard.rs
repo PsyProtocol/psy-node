@@ -156,3 +156,18 @@ pub trait QStandardCircuitProvableWithRawProofsAndRefLibraryAsync<
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>>;
 }
 
+
+pub trait QStandardCircuitProvableWithRawProofsAndRefLibrary<
+    L: CircuitInfoLibrary<C,D>,
+    C: GenericConfig<D>,
+    const D: usize,
+>: QStandardCircuit<C, D>
+{
+    fn prove_with_raw_proofs_and_ref_library(
+        &self,
+        library: &L,
+        input: PsyWorkerGetProvingWorkWithChildProofsAPIResponse<QHashOut<C::F>, QProvingJobDataID>,
+        worker_reward_tag: QHashOut<C::F>,
+    ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>>;
+}
+

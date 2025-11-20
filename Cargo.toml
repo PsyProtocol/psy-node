@@ -24,7 +24,9 @@ members = [
     "psy_plonky2_basic_helpers",
     "psy_plonky2_common_circuits",
     "psy_plonky2_circuits",
-    "psy_plonky2_testbed"
+    "psy_plonky2_testbed",
+    "psy_worker_core",
+    "psy_api_core",
 ]
 resolver = "2"
 
@@ -177,6 +179,8 @@ psy_node_core = { path = "./psy_node_core" }
 psy_node_common = { path = "./psy_node_common" }
 psy_scratchpad = { path = "./psy_scratchpad" }
 psy_type_defaults = { path = "./psy_type_defaults" }
+psy_worker_core = { path = "./psy_worker_core" }
+psy_api_core = { path = "./psy_api_core" }
 
 psy_node_redis = { path = "./psy_node_redis" }
 psy_node_nats = { path = "./psy_node_nats" }

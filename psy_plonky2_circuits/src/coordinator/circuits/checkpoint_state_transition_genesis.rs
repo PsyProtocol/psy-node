@@ -16,7 +16,7 @@ use psy_plonky2_basic_helpers::{
    
 };
 use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
-use crate::{proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{QPsyNetworkCircuitWithType, QStandardCircuit, QStandardCircuitProvableWithRawProofsAndRefLibraryAsync}};
+use crate::{proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{QPsyNetworkCircuitWithType, QStandardCircuit, QStandardCircuitProvableWithRawProofsAndRefLibrary}};
 
 
 #[derive(Debug)]
@@ -102,14 +102,14 @@ where
 }
 
 #[async_trait]
-impl<L: CircuitInfoLibrary<C, D> + Send + Sync, C: GenericConfig<D>, const D: usize> QStandardCircuitProvableWithRawProofsAndRefLibraryAsync<L, C, D>
+impl<L: CircuitInfoLibrary<C, D>, C: GenericConfig<D>, const D: usize> QStandardCircuitProvableWithRawProofsAndRefLibrary<L, C, D>
     for QEDCheckpointStateTransitionGenesisCircuit<C, D>
 where
     C::Hasher: AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + MerkleZeroHasher<QHashOut<C::F>>,
     QHashOut<C::F>: Q256BitHash,
     C::F: QFelt64,
 {
-    async fn prove_with_raw_proofs_and_ref_library_async(
+    fn prove_with_raw_proofs_and_ref_library(
         &self,
         _library: &L,
         input: PsyWorkerGetProvingWorkWithChildProofsAPIResponse<QHashOut<C::F>, QProvingJobDataID>,

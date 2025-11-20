@@ -14,9 +14,9 @@ use parth_core::{
 use psy_core::job::job_id::QProvingJobDataID;
 use psy_data::
     worker::{
-        api_response::{PsyWorkerGetProvingWorkAPIResponse, PsyWorkerGetProvingWorkWithChildProofsAPIResponse},
+        api_response::{PROVING_JOB_NODE_TYPE_COORDINATOR, PsyWorkerGetProvingWorkAPIResponse, PsyWorkerGetProvingWorkWithChildProofsAPIResponse},
         metadata::{
-            PsyProvingJobMetadata, PROOF_REWARD_TREE_HASH_MODE_3_CHILDREN_DOUBLE_REWARD, PROOF_REWARD_TREE_HASH_MODE_LIFT_CHILD, PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN,
+            PROOF_REWARD_TREE_HASH_MODE_3_CHILDREN_DOUBLE_REWARD, PROOF_REWARD_TREE_HASH_MODE_LIFT_CHILD, PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN, PsyProvingJobMetadata
         },
         metadata_with_job_id::PsyProvingJobMetadataWithJobId,
     }
@@ -139,6 +139,10 @@ impl<
             job: work_item,
             child_proof_tag_values: children_reward_tree_values,
             witness: witness_bytes,
+            realm_id: self.realm_id_u64,
+            realm_sub_id: self.realm_sub_id_u64,
+            unique_pending_id,
+            node_type: PROVING_JOB_NODE_TYPE_COORDINATOR,
         };
         Ok(response)
     }
@@ -211,6 +215,10 @@ impl<
             job: work_item,
             child_proof_tag_values: children_reward_tree_values,
             witness: witness_bytes,
+            realm_id: self.realm_id_u64,
+            realm_sub_id: self.realm_sub_id_u64,
+            unique_pending_id,
+            node_type: PROVING_JOB_NODE_TYPE_COORDINATOR,
         };
         self.temp_db
             .set_proving_job_metadata(&self.realm_identifier, unique_pending_id, response.job.job_id, &response.job.metadata)

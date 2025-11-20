@@ -16,7 +16,7 @@ use psy_plonky2_basic_helpers::{
    
 };
 use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
-use crate::{coordinator::gadgets::{checkpoint_state_transition::CheckpointStateTransitionPublicInputsGadget, recursive_checkpoint_state_transition_verify::VerifyRecursiveCheckpointStateTransitionProofGadget}, proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{QPsyNetworkCircuitWithType, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QStandardCircuitProvableWithRawProofsAndRefLibraryAsync, proof_store::QProofStoreReaderAsync}, utils::proof_serialization::deserialize_plonky2_proof};
+use crate::{coordinator::gadgets::{checkpoint_state_transition::CheckpointStateTransitionPublicInputsGadget, recursive_checkpoint_state_transition_verify::VerifyRecursiveCheckpointStateTransitionProofGadget}, proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{QPsyNetworkCircuitWithType, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QStandardCircuitProvableWithRawProofsAndRefLibrary, proof_store::QProofStoreReaderAsync}, utils::proof_serialization::deserialize_plonky2_proof};
 
 use crate::coordinator::gadgets::{
     checkpoint_state_transition::CheckpointStateTransitionCoreGadget,
@@ -208,14 +208,14 @@ where
 }
 
 #[async_trait]
-impl<L: CircuitInfoLibrary<C, D> + Send + Sync, C: GenericConfig<D>, const D: usize> QStandardCircuitProvableWithRawProofsAndRefLibraryAsync<L, C, D>
+impl<L: CircuitInfoLibrary<C, D>, C: GenericConfig<D>, const D: usize> QStandardCircuitProvableWithRawProofsAndRefLibrary<L, C, D>
     for QEDCheckpointStateTransitionCircuit<C, D>
 where
     C::Hasher: AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + MerkleZeroHasher<QHashOut<C::F>>,
     QHashOut<C::F>: Q256BitHash,
     C::F: QFelt64,
 {
-    async fn prove_with_raw_proofs_and_ref_library_async(
+    fn prove_with_raw_proofs_and_ref_library(
         &self,
         library: &L,
         input: PsyWorkerGetProvingWorkWithChildProofsAPIResponse<QHashOut<C::F>, QProvingJobDataID>,

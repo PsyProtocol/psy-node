@@ -9,7 +9,7 @@ pub mod qobjblob;
 pub mod processor_builders;
 pub mod node_data;
 pub mod nca_planner;
-pub mod api;
+//pub mod api;
 pub mod p2p;
 
 pub mod test_helpers;

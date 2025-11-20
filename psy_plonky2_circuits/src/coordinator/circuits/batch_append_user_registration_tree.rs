@@ -16,7 +16,7 @@ use psy_plonky2_basic_helpers::{
    
 };
 use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
-use crate::{agg::common::compute_agg_state_trackable_final_public_inputs_leaf, proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{QPsyNetworkCircuitWithType, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QStandardCircuitProvableWithProofStoreSync, QStandardCircuitProvableWithRawProofsAndRefLibraryAsync, proof_store::{QProofStoreReaderAsync, QProofStoreReaderSync}, provable::QStandardCircuitProvable}};
+use crate::{agg::common::compute_agg_state_trackable_final_public_inputs_leaf, proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{QPsyNetworkCircuitWithType, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QStandardCircuitProvableWithProofStoreSync, QStandardCircuitProvableWithRawProofsAndRefLibrary, proof_store::{QProofStoreReaderAsync, QProofStoreReaderSync}, provable::QStandardCircuitProvable}};
 
 use crate::coordinator::gadgets::append_user_registration_tree::BatchAppendUserRegistrationTreeGadget;
 
@@ -204,18 +204,17 @@ where
 
 
 
-#[async_trait]
 impl<
-        L: CircuitInfoLibrary<C, D> + Send + Sync,
+        L: CircuitInfoLibrary<C, D>,
         C: GenericConfig<D>,
         const D: usize,
-    > QStandardCircuitProvableWithRawProofsAndRefLibraryAsync<L, C, D>
+    > QStandardCircuitProvableWithRawProofsAndRefLibrary<L, C, D>
     for BatchAppendUserRegistrationTreeCircuit<C, D>
 where
      C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>>, QHashOut<C::F>: Q256BitHash,
 {
 
-    async fn prove_with_raw_proofs_and_ref_library_async(
+    fn prove_with_raw_proofs_and_ref_library(
         &self,
         _library: &L,
         input: PsyWorkerGetProvingWorkWithChildProofsAPIResponse<QHashOut<C::F>, QProvingJobDataID>,

@@ -28,7 +28,7 @@ use crate::{
     },
     proof_minifier::pm_core::get_circuit_fingerprint_generic,
     qstandard::{
-        QPsyNetworkCircuitWithType, QStandardCircuit, QStandardCircuitProvableWithRawProofsAndRefLibraryAsync
+        QPsyNetworkCircuitWithType, QStandardCircuit, QStandardCircuitProvableWithRawProofsAndRefLibrary
     }, utils::proof_llbrary::get_two_child_proofs_for_api_response_with_inclusion_proof,
 };
 
@@ -193,18 +193,17 @@ where
 
 
 
-#[async_trait]
 impl<
-        L: CircuitInfoLibrary<C, D> + Send + Sync,
+        L: CircuitInfoLibrary<C, D>,
         C: GenericConfig<D>,
         const D: usize,
-    > QStandardCircuitProvableWithRawProofsAndRefLibraryAsync<L, C, D>
+    > QStandardCircuitProvableWithRawProofsAndRefLibrary<L, C, D>
     for GUTAVerifyLeftEndCapRightGUTACircuit<C, D>
 where
      C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>>, QHashOut<C::F>: Q256BitHash, C::F: QFelt64 + QRichField,
 {
 
-    async fn prove_with_raw_proofs_and_ref_library_async(
+    fn prove_with_raw_proofs_and_ref_library(
         &self,
         library: &L,
         input: PsyWorkerGetProvingWorkWithChildProofsAPIResponse<QHashOut<C::F>, QProvingJobDataID>,

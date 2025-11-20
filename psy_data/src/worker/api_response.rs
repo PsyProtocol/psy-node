@@ -3,11 +3,18 @@ use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 
 use crate::worker::metadata_with_job_id::PsyProvingJobMetadataWithJobId;
 
+pub const PROVING_JOB_NODE_TYPE_REALM: u8 = 1;
+pub const PROVING_JOB_NODE_TYPE_COORDINATOR: u8 = 2;
+
 #[pderive::serialize_clone_hash_job_id_ts]
 #[ts(export, concrete(Hash = parth_core::PHash, JobId = QProvingJobDataID))]
 pub struct PsyWorkerGetProvingWorkAPIResponse<Hash, JobId> {
     pub job: PsyProvingJobMetadataWithJobId<Hash, JobId>,
     pub child_proof_tag_values: Vec<Hash>,
+    pub realm_id: u64,
+    pub realm_sub_id: u64,
+    pub unique_pending_id: u64,
+    pub node_type: u8,
     pub witness: Vec<u8>,
 }
 

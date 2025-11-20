@@ -2640,6 +2640,44 @@ dependencies = [
 ]
 
 [[package]]
+name = "psy_api_core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "auto_impl",
+ "bincode",
+ "bytemuck",
+ "cf_utils",
+ "futures",
+ "hex",
+ "hex-literal",
+ "jsonrpsee",
+ "parth_common",
+ "parth_core",
+ "parth_crypto",
+ "pderive",
+ "postcard",
+ "pser",
+ "psy_common",
+ "psy_core",
+ "psy_data",
+ "psy_io",
+ "psy_serialize",
+ "rand 0.8.5",
+ "rkyv",
+ "serde",
+ "serde_json",
+ "serde_repr",
+ "serde_with",
+ "speedy",
+ "strum",
+ "strum_macros",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "psy_common"
 version = "0.1.0"
 dependencies = [
@@ -2796,6 +2834,7 @@ dependencies = [
  "pderive",
  "postcard",
  "pser",
+ "psy_api_core",
  "psy_common",
  "psy_core",
  "psy_data",
@@ -3017,6 +3056,7 @@ dependencies = [
  "psy_plonky2_basic_helpers",
  "psy_plonky2_common_circuits",
  "psy_serialize",
+ "psy_worker_core",
  "rand 0.8.5",
  "rkyv",
  "serde",
@@ -3162,6 +3202,47 @@ name = "psy_type_defaults"
 version = "0.1.0"
 dependencies = [
  "plonky2",
+]
+
+[[package]]
+name = "psy_worker_core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "auto_impl",
+ "bincode",
+ "bytemuck",
+ "cf_utils",
+ "dashmap",
+ "futures",
+ "hashbrown 0.14.5",
+ "hex",
+ "hex-literal",
+ "jsonrpsee",
+ "parth_common",
+ "parth_core",
+ "parth_crypto",
+ "pderive",
+ "postcard",
+ "pser",
+ "psy_api_core",
+ "psy_common",
+ "psy_core",
+ "psy_data",
+ "psy_io",
+ "psy_serialize",
+ "rand 0.8.5",
+ "rkyv",
+ "serde",
+ "serde_json",
+ "serde_repr",
+ "serde_with",
+ "speedy",
+ "strum",
+ "strum_macros",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

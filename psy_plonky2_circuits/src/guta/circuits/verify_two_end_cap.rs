@@ -28,7 +28,7 @@ use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 
 use crate::{
     proof_minifier::pm_core::get_circuit_fingerprint_generic,
-    qstandard::{QPsyNetworkCircuitWithType, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QStandardCircuitProvableWithRawProofsAndRefLibraryAsync, proof_store::QProofStoreReaderAsync}, utils::proof_llbrary::get_two_child_proofs_for_api_response_with_inclusion_proof,
+    qstandard::{QPsyNetworkCircuitWithType, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QStandardCircuitProvableWithRawProofsAndRefLibrary, proof_store::QProofStoreReaderAsync}, utils::proof_llbrary::get_two_child_proofs_for_api_response_with_inclusion_proof,
 };
 
 use crate::guta::gadgets::{two_nca_state_transition::TwoNCAStateTransitionGadget, verify_end_cap::VerifyEndCapProofGadget};
@@ -252,18 +252,17 @@ C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>>, C::F: QRichFi
 }
 
 
-#[async_trait]
 impl<
-        L: CircuitInfoLibrary<C, D> + Send + Sync,
+        L: CircuitInfoLibrary<C, D>,
         C: GenericConfig<D>,
         const D: usize,
-    > QStandardCircuitProvableWithRawProofsAndRefLibraryAsync<L, C, D>
+    > QStandardCircuitProvableWithRawProofsAndRefLibrary<L, C, D>
     for GUTAVerifyTwoEndCapCircuit<C, D>
 where
      C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>>, QHashOut<C::F>: Q256BitHash, C::F: QFelt64 + QRichField,
 {
 
-    async fn prove_with_raw_proofs_and_ref_library_async(
+    fn prove_with_raw_proofs_and_ref_library(
         &self,
         library: &L,
         input: PsyWorkerGetProvingWorkWithChildProofsAPIResponse<QHashOut<C::F>, QProvingJobDataID>,

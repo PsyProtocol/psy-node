@@ -1,16 +1,16 @@
-use async_trait::async_trait;
 use parth_common::memory_stores::simple_merkle_tree::SimpleMerkleTree;
-use parth_core::{crypto::hash::{merkle_proof::MerkleProofCore, traits::MerkleZeroHasher}, pgoldilocks::{QHashOut, QRichField}};
+use parth_core::{crypto::hash::{merkle_proof::MerkleProofCore, traits::MerkleZeroHasher}, felt::QFelt64, pgoldilocks::{QHashOut, QRichField}, protocol::core_types::Q256BitHash};
 use plonky2::{
     hash::hash_types::HashOut,
     plonk::{
         circuit_data::CommonCircuitData,
         config::{AlgebraicHasher, GenericConfig},
-        proof::ProofWithPublicInputs,
     },
 };
 use psy_core::{job::job_id::{ProvingJobCircuitType, QProvingJobDataID}, worker::traits::QNextGenWorkerGenericInfo};
+use psy_data::worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse;
 use psy_plonky2_basic_helpers::{lookalike::standard::get_end_cap_type_e_common_data, verifier::circuit_library::{CircuitInfoLibrary, CircuitInfoLibraryBuilder}};
+use psy_worker_core::worker::prover_trait::{PsyWorkerGenericLibraryProver, PsyWorkerGenericLibraryProverInfoProvider};
 
 use super::circuits::{
     guta_no_change::GUTANoChangeCircuit, only_register_users::GUTAOnlyRegisterUsersCircuit,
@@ -21,7 +21,7 @@ use super::circuits::{
 use crate::{guta::circuits::{
     verify_guta_to_cap_upgrade_checkpoint::GUTAVerifyGUTAToCapUpgradeCheckpointCircuit,
     verify_two_guta_upgrade_checkpoint::GUTAVerifyTwoGUTAUpgradeCheckpointCircuit,
-}, qstandard::{proof_store::QProofStoreReaderAsync, prover::QNextGenWorkerGenericProverAsyncMut, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync}};
+}, qstandard::{QStandardCircuit, QStandardCircuitProvableWithRawProofsAndRefLibrary}, utils::proof_serialization::serialize_plonky2_proof};
 
 #[derive(Debug)]
 pub struct QEDGUTACircuitManager<C: GenericConfig<D> + 'static, const D: usize>
@@ -45,7 +45,7 @@ where
     pub verify_guta_to_cap_upgrade_checkpoint: GUTAVerifyGUTAToCapUpgradeCheckpointCircuit<C, D>,
 
     pub guta_circuit_whitelist_root: QHashOut<C::F>,
-    pub public_key: QHashOut<C::F>,
+    pub worker_reward_tag: QHashOut<C::F>,
     pub verify_single_end_cap_whitelist_proof: MerkleProofCore<QHashOut<C::F>>,
     pub verify_two_end_cap_whitelist_proof: MerkleProofCore<QHashOut<C::F>>,
     pub verify_two_guta_whitelist_proof: MerkleProofCore<QHashOut<C::F>>,
@@ -74,7 +74,7 @@ where
                 only_register_max_users_per_proof: usize,
 
         default_user_state_tree_root: QHashOut<C::F>,
-        public_key: QHashOut<C::F>,
+        worker_reward_tag: QHashOut<C::F>,
     ) -> Self {
         let end_cap_common = get_end_cap_type_e_common_data::<C, D>();
         let known_end_cap_fingerprint = library.get_fingerprint(ProvingJobCircuitType::UserEndCap).unwrap();
@@ -91,7 +91,7 @@ where
             only_register_max_users_per_proof,
             known_end_cap_fingerprint,
             default_user_state_tree_root,
-            public_key,
+            worker_reward_tag,
 
         )
     }
@@ -107,7 +107,7 @@ where
         only_register_max_users_per_proof: usize,
         known_end_cap_fingerprint: QHashOut<C::F>,
         default_user_state_tree_root: QHashOut<C::F>,
-        public_key: QHashOut<C::F>,
+        worker_reward_tag: QHashOut<C::F>,
     ) -> Self {
         let verify_single_end_cap = GUTAVerifySingleEndCapCircuit::<C, D>::new(
             end_cap_proof_common_data,
@@ -225,7 +225,7 @@ where
             verify_guta_to_cap_upgrade_checkpoint,
 
             guta_circuit_whitelist_root: verify_two_guta_whitelist_proof.root,
-            public_key,
+            worker_reward_tag,
             verify_single_end_cap_whitelist_proof,
             verify_two_end_cap_whitelist_proof,
             verify_two_guta_whitelist_proof,
@@ -443,6 +443,77 @@ where
         }
     }
 }
+
+
+impl<C: GenericConfig<D> + 'static, const D: usize> PsyWorkerGenericLibraryProverInfoProvider<QProvingJobDataID> for QEDGUTACircuitManager<C, D>
+where
+    C::Hasher: AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + MerkleZeroHasher<QHashOut<C::F>>,
+{
+    fn prover_can_process_job(&self, job_id: QProvingJobDataID) -> bool {
+        self.can_process_job(job_id)
+    }
+}
+
+
+
+impl<Library: CircuitInfoLibrary<C, D>, C: GenericConfig<D> + 'static, const D: usize> PsyWorkerGenericLibraryProver<QHashOut<C::F>,QProvingJobDataID, Library> for QEDGUTACircuitManager<C, D>
+where
+    C::Hasher: AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + MerkleZeroHasher<QHashOut<C::F>>, QHashOut<C::F>: Q256BitHash, C::F: QFelt64 + QRichField,
+{
+    fn prove_job_from_api(
+        &self,
+        library: &Library,
+        input: PsyWorkerGetProvingWorkWithChildProofsAPIResponse<QHashOut<C::F>, QProvingJobDataID>,
+        worker_reward_tag: QHashOut<C::F>,
+    ) -> anyhow::Result<Vec<u8>>{
+        let proof = match input.base.job.job_id.circuit_type {
+            ProvingJobCircuitType::GUTASingleEndCap => {
+                self.verify_single_end_cap
+                    .prove_with_raw_proofs_and_ref_library(library, input, worker_reward_tag)
+            }
+            ProvingJobCircuitType::GUTATwoEndCap => {
+                self.verify_two_end_cap
+                    .prove_with_raw_proofs_and_ref_library(library, input, worker_reward_tag)
+            }
+            ProvingJobCircuitType::GUTATwoGUTA => {
+                self.verify_two_guta
+                    .prove_with_raw_proofs_and_ref_library(library, input, worker_reward_tag)
+            }
+            ProvingJobCircuitType::GUTALeftGUTARightEndCap => {
+                self.verify_left_guta_right_end_cap
+                    .prove_with_raw_proofs_and_ref_library(library, input, worker_reward_tag)
+            }
+            ProvingJobCircuitType::GUTALeftEndCapRightGUTA => {
+                self.verify_left_end_cap_right_guta
+                    .prove_with_raw_proofs_and_ref_library(library, input, worker_reward_tag)
+            }
+            ProvingJobCircuitType::GUTARegisterUsers => {
+                self.verify_guta_register_users
+                    .prove_with_raw_proofs_and_ref_library(library, input, worker_reward_tag)
+            }
+            ProvingJobCircuitType::GUTAOnlyRegisterUsers => {
+                self.only_register_users
+                    .prove_with_raw_proofs_and_ref_library(library, input, worker_reward_tag)
+            }
+            ProvingJobCircuitType::GUTAVerifyToCap => {
+                self.verify_guta_to_cap
+                    .prove_with_raw_proofs_and_ref_library(library, input, worker_reward_tag)
+            }
+            ProvingJobCircuitType::GUTANoChange => self.no_change.prove_with_raw_proofs_and_ref_library(library, input, worker_reward_tag),
+            ProvingJobCircuitType::GUTATwoGUTAWithCheckpointUpgrade => {
+                self.verify_two_guta_upgrade_checkpoint
+                    .prove_with_raw_proofs_and_ref_library(library, input, worker_reward_tag)
+            }
+            ProvingJobCircuitType::GUTAVerifyToCapWithCheckpointUpgrade => {
+                self.verify_guta_to_cap_upgrade_checkpoint
+                    .prove_with_raw_proofs_and_ref_library(library, input, worker_reward_tag)
+            }
+            _ => anyhow::bail!("unsupported circuit: {:?}", input.base.job.job_id.circuit_type),
+        }?;
+        serialize_plonky2_proof::<C, D>(&proof)
+    }
+}
+
 
 /* 
 #[async_trait]

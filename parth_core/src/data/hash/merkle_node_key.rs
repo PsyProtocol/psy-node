@@ -12,7 +12,7 @@ pub const JOB_ID_EMPTY_REWARD_PATH_INFO: u64 = 0xFFFF_FFFF_FFFF_FFFFu64;
 
 pub const PSY_OBJECT_FFS_SIZE_SIMPLE_MERKLE_NODE_KEY: usize = 9;
 pub const PSY_OBJECT_FFS_SIZE_SIMPLE_MERKLE_NODE: usize = 41;
-#[pderive::serialize_copy_default_no_ord]
+#[pderive::serialize_copy_default_no_ord_ts]
 #[repr(C)]
 pub struct SimpleMerkleNodeKey {
     pub level: u8,

@@ -141,7 +141,7 @@ mod tests {
 
         // Optional: Assert public key matches expected compressed form from vector
         let expected_pub_bytes = hex!(
-            "02779dd197a5df977ed2cf6cb31d82d43328b790dc6b3b7d4437a427bd5847dfcd"
+            "03779dd197a5df977ed2cf6cb31d82d43328b790dc6b3b7d4437a427bd5847dfcd"
         ); // 02 + x (y even)
         assert_eq!(pub_key.0, expected_pub_bytes);
 

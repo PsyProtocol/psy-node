@@ -29,7 +29,7 @@ use crate::{
     coordinator::gadgets::verify_agg_user_registration_deploy_guta::VerifyAggUserRegistartionDeployContractsGUTAGadget,
     proof_minifier::{pm_chain_dynamic::QEDProofMinifierDynamicChain, pm_core::get_circuit_fingerprint_generic},
     qstandard::{
-        QPsyNetworkCircuitWithType, QStandardCircuit, QStandardCircuitProvableWithRawProofsAndRefLibraryAsync,
+        QPsyNetworkCircuitWithType, QStandardCircuit, QStandardCircuitProvableWithRawProofsAndRefLibrary,
     },
     utils::proof_serialization::deserialize_plonky2_proof,
 };
@@ -247,15 +247,14 @@ where
     }
 }
 
-#[async_trait]
-impl<L: CircuitInfoLibrary<C, D> + Send + Sync, C: GenericConfig<D>, const D: usize> QStandardCircuitProvableWithRawProofsAndRefLibraryAsync<L, C, D>
+impl<L: CircuitInfoLibrary<C, D>, C: GenericConfig<D>, const D: usize> QStandardCircuitProvableWithRawProofsAndRefLibrary<L, C, D>
     for VerifyAggUserRegistartionDeployContractsGUTACircuit<C, D>
 where
     C::Hasher: AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + MerkleZeroHasher<QHashOut<C::F>>,
     QHashOut<C::F>: Q256BitHash,
     C::F: QFelt64 + QRichField,
 {
-    async fn prove_with_raw_proofs_and_ref_library_async(
+    fn prove_with_raw_proofs_and_ref_library(
         &self,
         library: &L,
         input: PsyWorkerGetProvingWorkWithChildProofsAPIResponse<QHashOut<C::F>, QProvingJobDataID>,

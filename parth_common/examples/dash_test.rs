@@ -1,8 +1,7 @@
-use std::collections::HashMap;
 
 use cf_utils::timer::DebugTimer;
-use parth_common::memory_stores::{dash_tree::PsyDashMemoryMerkleStore, mem_tree_v3::SimpleMemoryMerkleStoreV3, traits::PsyMemoryMerkleStoreImm};
-use parth_core::{PHash, crypto::hash::traits::{MerkleHasher, MerkleZeroHasher, ZeroableHash}, data::hash::{hash256::Hash256, merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}}, node, pgoldilocks::PoseidonHasher, protocol::core_types::{Q256BitHash, QDBHashBase}, utils::{QPGenRandom, math::log2_ceil}};
+use parth_common::memory_stores::{dash_tree::PsyDashMemoryMerkleStore, traits::PsyMemoryMerkleStoreImm};
+use parth_core::{PHash, crypto::hash::traits::{MerkleHasher, MerkleZeroHasher, ZeroableHash}, data::hash::{hash256::Hash256, merkle_node_key::SimpleMerkleNodeKey}, pgoldilocks::PoseidonHasher, protocol::core_types::{Q256BitHash, QDBHashBase}, utils::{QPGenRandom, math::log2_ceil}};
 use parth_crypto::hash::sha256::CoreSha256Hasher;
 use parth_core::crypto::hash::traits::MerkleLeafHasher;
 pub fn dash_time_it<Hash: Copy + PartialEq + ZeroableHash + Default + QPGenRandom + QDBHashBase, Hasher: MerkleZeroHasher<Hash>>(height: u8) {

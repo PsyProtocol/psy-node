@@ -31,7 +31,7 @@ use crate::{
         helpers::ToGUTAHeader, two_nca_state_transition::TwoNCAStateTransitionGadget, verify_guta_proof::VerifyGUTAProofGadget,
     },
     proof_minifier::pm_core::get_circuit_fingerprint_generic,
-    qstandard::{QPsyNetworkCircuitWithType, QStandardCircuit, QStandardCircuitProvableWithRawProofsAndRefLibraryAsync}, utils::proof_llbrary::get_two_child_proofs_for_api_response_with_inclusion_proof,
+    qstandard::{QPsyNetworkCircuitWithType, QStandardCircuit, QStandardCircuitProvableWithRawProofsAndRefLibrary}, utils::proof_llbrary::get_two_child_proofs_for_api_response_with_inclusion_proof,
 };
 #[derive(Debug)]
 pub struct GUTAVerifyTwoGUTACircuit<C: GenericConfig<D> + 'static, const D: usize>
@@ -188,14 +188,14 @@ where
 }
 
 #[async_trait]
-impl<L: CircuitInfoLibrary<C, D> + Send + Sync, C: GenericConfig<D>, const D: usize> QStandardCircuitProvableWithRawProofsAndRefLibraryAsync<L, C, D>
+impl<L: CircuitInfoLibrary<C, D>, C: GenericConfig<D>, const D: usize> QStandardCircuitProvableWithRawProofsAndRefLibrary<L, C, D>
     for GUTAVerifyTwoGUTACircuit<C, D>
 where
     C::Hasher: AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + MerkleZeroHasher<QHashOut<C::F>>,
     QHashOut<C::F>: Q256BitHash,
     C::F: QFelt64 + QRichField,
 {
-    async fn prove_with_raw_proofs_and_ref_library_async(
+    fn prove_with_raw_proofs_and_ref_library(
         &self,
         library: &L,
         input: PsyWorkerGetProvingWorkWithChildProofsAPIResponse<QHashOut<C::F>, QProvingJobDataID>,

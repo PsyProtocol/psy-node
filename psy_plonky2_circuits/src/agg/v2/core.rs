@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use parth_core::{pgoldilocks::QHashOut, protocol::core_types::Q256BitHash};
 use plonky2::{
     field::extension::Extendable,
@@ -18,11 +17,98 @@ use plonky2::{
     },
 };
 use psy_core::job::job_id::QProvingJobDataID;
-use psy_data::{agg::AggStateTransitionInputV2, worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse};
+use psy_data::{agg::{AggStateTransitionInput, AggStateTransitionInputV2}, worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse};
 use psy_plonky2_basic_helpers::{builder::{hash::core::CircuitBuilderHashCore, pad_circuit::CircuitBuilderQEDCommonGates, verify::CircuitBuilderVerifyProofHelpers}, verifier::circuit_library::CircuitInfoLibrary};
 use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 
-use crate::{agg::{circuits::core::AggStateTrackableCircuitHeaderGadget, common::compute_agg_state_trackable_final_public_inputs}, proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{QStandardCircuit, QStandardCircuitProvableWithRawProofsAndRefLibraryAsync}, utils::proof_serialization::deserialize_plonky2_proof};
+use crate::{agg::{ common::compute_agg_state_trackable_final_public_inputs}, proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{QStandardCircuit, QStandardCircuitProvableWithRawProofsAndRefLibrary}, utils::proof_serialization::deserialize_plonky2_proof};
+
+#[derive(Debug, Clone)]
+pub struct AggStateTrackableCircuitHeaderGadget {
+    pub left_state_transition_start: HashOutTarget,
+    pub left_state_transition_end: HashOutTarget,
+    pub right_state_transition_start: HashOutTarget,
+    pub right_state_transition_end: HashOutTarget,
+    pub leaf_fingerprint: HashOutTarget,
+    pub agg_fingerprint: HashOutTarget,
+
+    // end inputs
+    // start outputs
+    pub expected_left_child_transition_hash: HashOutTarget,
+    pub expected_right_child_transition_hash: HashOutTarget,
+    pub allowed_circuit_hashes_root: HashOutTarget,
+    pub state_transition_hash: HashOutTarget,
+}
+impl AggStateTrackableCircuitHeaderGadget {
+    pub fn add_virtual_to<H:AlgebraicHasher<F>, F: RichField + Extendable<D>, const D: usize>(
+        builder: &mut CircuitBuilder<F, D>,
+    ) -> Self {
+        let left_state_transition_start = builder.add_virtual_hash();
+        let left_state_transition_end = builder.add_virtual_hash();
+        let right_state_transition_start = builder.add_virtual_hash();
+        let right_state_transition_end = builder.add_virtual_hash();
+        let leaf_fingerprint = builder.add_virtual_hash();
+        let agg_fingerprint = builder.add_virtual_hash();
+
+        let allowed_circuit_hashes_root =
+            builder.hash_two_to_one::<H>(leaf_fingerprint, agg_fingerprint);
+
+        let expected_left_child_transition_hash =
+            builder.hash_two_to_one::<H>(left_state_transition_start, left_state_transition_end);
+
+        let expected_right_child_transition_hash =
+            builder.hash_two_to_one::<H>(right_state_transition_start, right_state_transition_end);
+
+        let state_transition_hash =
+            builder.hash_two_to_one::<H>(left_state_transition_start, right_state_transition_end);
+
+        // start constraints
+        builder.connect_hashes(left_state_transition_end, right_state_transition_start);
+        // end constraints
+
+        Self {
+            left_state_transition_start,
+            left_state_transition_end,
+            right_state_transition_start,
+            right_state_transition_end,
+            leaf_fingerprint,
+            agg_fingerprint,
+
+            expected_left_child_transition_hash,
+            expected_right_child_transition_hash,
+            allowed_circuit_hashes_root,
+            state_transition_hash,
+        }
+    }
+    pub fn set_witness<W: Witness<F>, F: RichField>(
+        &self,
+        witness: &mut W,
+        input: &AggStateTransitionInput<QHashOut<F>>,
+        agg_fingerprint: QHashOut<F>,
+        leaf_fingerprint: QHashOut<F>,
+    ) -> anyhow::Result<()> {
+        //tracing::info!("set_witness: {}", serde_json::to_string(input).unwrap());
+        witness.set_hash_target(self.agg_fingerprint, agg_fingerprint.0)?;
+        witness.set_hash_target(self.leaf_fingerprint, leaf_fingerprint.0)?;
+
+        witness.set_hash_target(
+            self.left_state_transition_start,
+            input.left_input.state_transition_start.0,
+        )?;
+        witness.set_hash_target(
+            self.left_state_transition_end,
+            input.left_input.state_transition_end.0,
+        )?;
+        witness.set_hash_target(
+            self.right_state_transition_start,
+            input.right_input.state_transition_start.0,
+        )?;
+        witness.set_hash_target(
+            self.right_state_transition_end,
+            input.right_input.state_transition_end.0,
+        )
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct AggStateTrackableCircuitHeaderGadgetV2 {
@@ -278,18 +364,17 @@ impl<C: GenericConfig<D>, const D: usize> QStandardCircuit<C, D>
 
 
 
-#[async_trait]
 impl<
-        L: CircuitInfoLibrary<C, D> + Send + Sync,
+        L: CircuitInfoLibrary<C, D>,
         C: GenericConfig<D>,
         const D: usize,
-    > QStandardCircuitProvableWithRawProofsAndRefLibraryAsync<L, C, D>
+    > QStandardCircuitProvableWithRawProofsAndRefLibrary<L, C, D>
     for AggStateTransitionCircuitV2<C, D>
 where
     C::Hasher: AlgebraicHasher<C::F>, QHashOut<C::F>: Q256BitHash,
 {
 
-    async fn prove_with_raw_proofs_and_ref_library_async(
+    fn prove_with_raw_proofs_and_ref_library(
         &self,
         library: &L,
         input: PsyWorkerGetProvingWorkWithChildProofsAPIResponse<QHashOut<C::F>, QProvingJobDataID>,

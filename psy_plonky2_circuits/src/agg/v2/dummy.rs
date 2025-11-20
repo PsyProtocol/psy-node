@@ -19,7 +19,7 @@ use psy_data::{agg::DummyAggStateTransition, worker::api_response::PsyWorkerGetP
 use psy_plonky2_basic_helpers::{builder::{hash::core::CircuitBuilderHashCore, pad_circuit::{pad_circuit_degree, CircuitBuilderQEDCommonGates}}, verifier::circuit_library::CircuitInfoLibrary};
 use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 
-use crate::{agg::common::compute_agg_state_trackable_final_public_inputs_leaf, proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{QStandardCircuit, QStandardCircuitProvableWithRawProofsAndRefLibraryAsync}};
+use crate::{agg::common::compute_agg_state_trackable_final_public_inputs_leaf, proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{QStandardCircuit, QStandardCircuitProvableWithRawProofsAndRefLibrary}};
 
 
 #[derive(Debug)]
@@ -123,18 +123,17 @@ where
     }
 }
 
-#[async_trait]
 impl<
-        L: CircuitInfoLibrary<C, D> + Send + Sync,
+        L: CircuitInfoLibrary<C, D>,
         C: GenericConfig<D>,
         const D: usize,
-    > QStandardCircuitProvableWithRawProofsAndRefLibraryAsync<L, C, D>
+    > QStandardCircuitProvableWithRawProofsAndRefLibrary<L, C, D>
     for AggStateTransitionDummyCircuitV2<C, D>
 where
     C::Hasher: AlgebraicHasher<C::F>, QHashOut<C::F>: Q256BitHash,
 {
 
-    async fn prove_with_raw_proofs_and_ref_library_async(
+    fn prove_with_raw_proofs_and_ref_library(
         &self,
         _library: &L,
         input: PsyWorkerGetProvingWorkWithChildProofsAPIResponse<QHashOut<C::F>, QProvingJobDataID>,

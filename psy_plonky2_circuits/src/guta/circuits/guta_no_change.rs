@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use parth_core::{crypto::hash::{merkle_proof::MerkleProofCore, traits::MerkleZeroHasher}, pgoldilocks::QHashOut};
+use parth_core::{crypto::hash::{merkle_proof::MerkleProofCore, traits::MerkleZeroHasher}, felt::QFelt64, pgoldilocks::QHashOut, protocol::core_types::Q256BitHash};
 use plonky2::{
     hash::hash_types::{HashOut, HashOutTarget},
     iop::witness::{PartialWitness, WitnessWrite},
@@ -11,13 +11,14 @@ use plonky2::{
     },
 };
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
-use psy_data::{proof_input::guta::GUTANoChangeFullInput, v1::qdata::checkpoint::PQEDCheckpointLeafCompactWithStateRoots};
+use psy_data::{proof_input::guta::GUTANoChangeFullInput, v1::qdata::checkpoint::PQEDCheckpointLeafCompactWithStateRoots, worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse};
 use psy_plonky2_basic_helpers::{
     builder::pad_circuit::{pad_circuit_degree, CircuitBuilderQEDCommonGates}, verifier::circuit_library::CircuitInfoLibrary,
    
 };
+use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 
-use crate::{guta::gadgets::guta_no_change_gadget::GUTANoChangeGadget, proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{proof_store::QProofStoreReaderAsync, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QPsyNetworkCircuitWithType}};
+use crate::{guta::gadgets::guta_no_change_gadget::GUTANoChangeGadget, proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{QPsyNetworkCircuitWithType, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QStandardCircuitProvableWithRawProofsAndRefLibrary, proof_store::QProofStoreReaderAsync}};
 
 #[derive(Debug)]
 pub struct GUTANoChangeCircuit<C: GenericConfig<D>, const D: usize> {
@@ -151,5 +152,43 @@ where
         )?;
 
         Ok(result)
+    }
+}
+
+
+
+
+
+impl<
+        L: CircuitInfoLibrary<C, D>,
+        C: GenericConfig<D>,
+        const D: usize,
+    > QStandardCircuitProvableWithRawProofsAndRefLibrary<L, C, D>
+    for GUTANoChangeCircuit<C, D>
+where
+     C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>>, QHashOut<C::F>: Q256BitHash, C::F: QFelt64,
+{
+
+    fn prove_with_raw_proofs_and_ref_library(
+        &self,
+        library: &L,
+        input: PsyWorkerGetProvingWorkWithChildProofsAPIResponse<QHashOut<C::F>, QProvingJobDataID>,
+        worker_reward_tag: QHashOut<C::F>,
+    ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>>{
+
+
+        let witness = GUTANoChangeFullInput::<QHashOut<C::F>>::psy_ser_from_slice(&input.base.witness)?;
+        
+
+        let guta_whitelist_root: QHashOut<C::F> =
+            library.get_group_inclusion_proof(ProvingJobCircuitType::GUTATwoGUTA, ProvingJobCircuitType::GUTATwoGUTA)?.root;
+
+
+        self.prove_base(
+            worker_reward_tag,
+            guta_whitelist_root,
+            &witness.checkpoint_tree_proof,
+            &witness.checkpoint_leaf,
+        )
     }
 }

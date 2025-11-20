@@ -42,5 +42,6 @@ parth_common = { workspace = true }
 psy_core = { workspace = true }
 psy_data = { workspace = true }
 psy_serialize = { workspace = true }
+psy_worker_core = { workspace = true }
 
 pser = { workspace = true }

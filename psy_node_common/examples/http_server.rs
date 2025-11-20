@@ -65,7 +65,7 @@ async fn test_client(addr: SocketAddr) -> anyhow::Result<()> {
     let mut timer = DebugTimer::new("http");
     // Test HTTP client
     let http_url = format!("http://{}", addr);
-    let http_client = HttpClientBuilder::default().build(&http_url)?;
+    let http_client: HttpClient = HttpClientBuilder::default().build(&http_url)?;
     for _ in 0..10000 {
         let http_result: u64 = http_client.get_sum(a, b).await?;
         assert_eq!(http_result, expected_result);

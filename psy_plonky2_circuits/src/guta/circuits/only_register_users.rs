@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use parth_core::{crypto::hash::traits::MerkleZeroHasher, pgoldilocks::QHashOut};
+use parth_core::{crypto::hash::traits::MerkleZeroHasher, felt::QFelt64, pgoldilocks::QHashOut, protocol::core_types::Q256BitHash};
 use plonky2::{
     hash::hash_types::{HashOut, HashOutTarget}, iop::
         witness::{PartialWitness, WitnessWrite}, plonk::{
@@ -10,12 +10,13 @@ use plonky2::{
     }
 };
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
-use psy_data::proof_input::guta::{GUTAOnlyRegisterUsersInput, GUTARegisterUserFullInput};
+use psy_data::{proof_input::guta::{GUTAOnlyRegisterUsersInput, GUTARegisterUserFullInput}, worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse};
 use psy_plonky2_basic_helpers::{
     builder::pad_circuit::CircuitBuilderQEDCommonGates, verifier::circuit_library::CircuitInfoLibrary,
    
 };
-use crate::{guta::gadgets::guta_only_register_users_gadget::GUTAOnlyRegisterUsersGadget, proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{proof_store::QProofStoreReaderAsync, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QPsyNetworkCircuitWithType}};
+use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
+use crate::{guta::gadgets::guta_only_register_users_gadget::GUTAOnlyRegisterUsersGadget, proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{QPsyNetworkCircuitWithType, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QStandardCircuitProvableWithRawProofsAndRefLibrary, proof_store::QProofStoreReaderAsync}};
 
 #[derive(Debug)]
 pub struct GUTAOnlyRegisterUsersCircuit<C: GenericConfig<D>, const D: usize>
@@ -197,5 +198,44 @@ where
         )?;
 
         Ok(result)
+    }
+}
+
+
+
+
+
+impl<
+        L: CircuitInfoLibrary<C, D>,
+        C: GenericConfig<D>,
+        const D: usize,
+    > QStandardCircuitProvableWithRawProofsAndRefLibrary<L, C, D>
+    for GUTAOnlyRegisterUsersCircuit<C, D>
+where
+     C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>>, QHashOut<C::F>: Q256BitHash, C::F: QFelt64,
+{
+
+    fn prove_with_raw_proofs_and_ref_library(
+        &self,
+        library: &L,
+        input: PsyWorkerGetProvingWorkWithChildProofsAPIResponse<QHashOut<C::F>, QProvingJobDataID>,
+        worker_reward_tag: QHashOut<C::F>,
+    ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>>{
+
+
+        let witness = GUTAOnlyRegisterUsersInput::<QHashOut<C::F>>::psy_ser_from_slice(&input.base.witness)?;
+        
+
+        let guta_whitelist_root: QHashOut<C::F> =
+            library.get_group_inclusion_proof(ProvingJobCircuitType::GUTATwoGUTA, ProvingJobCircuitType::GUTATwoGUTA)?.root;
+
+
+        self.prove_base(
+            worker_reward_tag,
+            guta_whitelist_root,
+            witness.checkpoint_tree_root,
+            &witness.guta_register_user_inputs,
+            self.default_user_state_tree_root,
+        )
     }
 }

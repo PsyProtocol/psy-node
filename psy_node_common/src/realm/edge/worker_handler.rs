@@ -12,15 +12,15 @@ use parth_core::{
 use psy_core::job::job_id::QProvingJobDataID;
 use psy_data::
     worker::{
-        api_response::{PsyWorkerGetProvingWorkAPIResponse, PsyWorkerGetProvingWorkWithChildProofsAPIResponse},
+        api_response::{PROVING_JOB_NODE_TYPE_REALM, PsyWorkerGetProvingWorkAPIResponse, PsyWorkerGetProvingWorkWithChildProofsAPIResponse},
         metadata::{
-            PsyProvingJobMetadata, PROOF_REWARD_TREE_HASH_MODE_3_CHILDREN_DOUBLE_REWARD, PROOF_REWARD_TREE_HASH_MODE_LIFT_CHILD, PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN,
+            PROOF_REWARD_TREE_HASH_MODE_3_CHILDREN_DOUBLE_REWARD, PROOF_REWARD_TREE_HASH_MODE_LIFT_CHILD, PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN, PsyProvingJobMetadata
         },
         metadata_with_job_id::PsyProvingJobMetadataWithJobId,
     }
 ;
 use psy_node_core::{
-    api::worker::standard_worker_rpc::NodeEdgeWorkerRpcServer, psy_core_db::traits::full::{PsyCoordinatorEdgeAPIStoreReader, PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmEdgeAPIStoreReader}, psy_temp_db::{QTempDBProvingJobMetadataReader, StandardEdgeAPITempDBStoreBase}, queue::{ephemeral::QStandardEphemeralQueuePublisher, worker_queue::QStandardWorkerQueueSubscriber}, store::traits::proof_store::QParthProofStore
+ psy_core_db::traits::full::{PsyCoordinatorEdgeAPIStoreReader, PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmEdgeAPIStoreReader}, psy_temp_db::{QTempDBProvingJobMetadataReader, StandardEdgeAPITempDBStoreBase}, queue::{ephemeral::QStandardEphemeralQueuePublisher, worker_queue::QStandardWorkerQueueSubscriber}, store::traits::proof_store::QParthProofStore
 };
 
 use crate::{
@@ -125,7 +125,29 @@ impl<
             job: work_item,
             child_proof_tag_values: children_reward_tree_values,
             witness: witness_bytes,
+            realm_id: self.realm_id_u64,
+            realm_sub_id: self.realm_sub_id_u64,
+            unique_pending_id,
+            node_type: PROVING_JOB_NODE_TYPE_REALM,
         };
+        self.temp_db
+            .set_proving_job_metadata(&self.realm_identifier, unique_pending_id, response.job.job_id, &response.job.metadata)
+            .await?;
+
+        // HACK: in the future we should create a new table for the expected proving
+        // tag, but for now this ok i guess, but a HACK HACK: for now we set
+        // self.temp_db.set_proof_miner_rewards_tree_value( with the expected proving
+        // tag and then update it later to the actual value once the proof is submitted
+        // this ensures the right person submits the proof AND the proof can only be
+        // submitted once
+        self.temp_db
+            .set_proof_miner_rewards_tree_value(
+                &self.realm_identifier,
+                unique_pending_id,
+                response.job.job_id,
+                N::QHash::from_ref_32bytes(&request.tag),
+            )
+            .await?;
         Ok(response)
     }
     pub async fn get_proving_work_with_child_proofs_internal(
@@ -197,6 +219,10 @@ impl<
             job: work_item,
             child_proof_tag_values: children_reward_tree_values,
             witness: witness_bytes,
+            realm_id: self.realm_id_u64,
+            realm_sub_id: self.realm_sub_id_u64,
+            unique_pending_id,
+            node_type: PROVING_JOB_NODE_TYPE_REALM,
         };
         self.temp_db
             .set_proving_job_metadata(&self.realm_identifier, unique_pending_id, response.job.job_id, &response.job.metadata)

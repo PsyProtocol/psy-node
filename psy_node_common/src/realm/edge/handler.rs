@@ -6,6 +6,7 @@ use jsonrpsee::core::RpcResult;
 use parth_core::{
     QProvingJobDataIDWithRewardPath, crypto::{hash::{merkle_proof::{MerkleProofCore, compute_historical_and_current_merkle_roots_core_gt}, traits::MerkleZeroHasher}, secp256k1::{QEDCompressedSecp256K1Signature, SimpleTimedRequest}}, data::{hash::merkle_node_key::SimpleMerkleNodeKey, queue::queue_key::QPBaseQueueType}, felt::ToU64Value, node::realm_identifier::QRealmIdentifier, protocol::core_types::{QNetworkDatabaseTypes, QNetworkTypesConfig}, store::tag_tree_store
 };
+use psy_api_core::{realm::standard_edge_rpc::RealmEdgeRpcServer, worker::standard_worker_rpc::NodeEdgeWorkerRpcServer};
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{
     proof_input::guta::end_cap_input::SubmitUserEndCapNonProofInput, queue_items::realm_user_update::PsyRealmUserUpdatQueueItem, v1::{
@@ -18,7 +19,7 @@ use psy_data::{
     }, worker::api_response::{PsyWorkerGetProvingWorkAPIResponse, PsyWorkerGetProvingWorkWithChildProofsAPIResponse}
 };
 use psy_node_core::{
-    api::{realm::standard_edge_rpc::RealmEdgeRpcServer, worker::standard_worker_rpc::NodeEdgeWorkerRpcServer}, psy_core_db::{
+    psy_core_db::{
         traits::full::{PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmEdgeAPIStoreReader},
         v3_implementation::full::PsyUnifiedCoreDatabaseStore,
     }, psy_temp_db::{QTempDBPendingIdReader, StandardEdgeAPITempDBStoreBase}, qblob::structs::common::blob_metadata_header::QBlobWriterContextMetadataHeader, queue::{
@@ -545,6 +546,9 @@ impl<
     }
     async fn submit_proof_raw(&self, job_id: N::JobId, tag: N::QHash, proof: Vec<u8>) -> RpcResult<()>{
         res(self.submit_proof_raw_internal(job_id, tag, proof).await)
+    }
+    async fn get_realm_identifier_worker_api(&self) -> RpcResult<QRealmIdentifier>{
+        Ok(self.realm_identifier.clone())
     }
 }
 
