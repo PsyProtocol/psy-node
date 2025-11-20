@@ -1,5 +1,5 @@
 use parth_core::{
-    crypto::hash::traits::{FieldQHasher, QFieldHashable},
+    crypto::hash::{tag_tree::hash_tag_tree_node, traits::{FieldQHasher, MerkleHasher, QFieldHashable, ZeroableHash}},
     data::serializable::QPDSerializable,
     felt::{QFelt, QFelt64, QFeltSized, ToQFelts},
     impl_qpd_serialize_params, impl_qpq_serialize_bincode,
@@ -388,7 +388,15 @@ impl_qpd_serialize_params!(
     { F: QFelt, Hash: QHashBase } => { F, Hash }
 );
 
-
+impl<F, Hash: Copy + ZeroableHash> PQEDCheckpointLeaf<F, Hash> {
+    pub fn modify_with_final_reward_tag<Hasher: MerkleHasher<Hash>>(&mut self, final_worker_reward_tag: &Hash) {
+        let old_reward_tree_root = &self.stats.pm_rewards_commitment.register_users_root;
+        let new_reward_tree_root = hash_tag_tree_node::<Hash, Hasher>(old_reward_tree_root, &Hash::get_zero_value(), final_worker_reward_tag);
+        self.stats.pm_rewards_commitment.register_users_root = new_reward_tree_root;
+        self.stats.pm_rewards_commitment.gutas_root = new_reward_tree_root;
+        self.stats.pm_rewards_commitment.deploy_contracts_root = new_reward_tree_root;
+    }
+}
 impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for PQEDCheckpointLeaf<F, Hash> {
     fn qp_rand_gen() -> Self where Self: Sized {
         Self {

@@ -108,3 +108,4 @@ pub fn get_two_child_proofs_for_api_response_with_inclusion_proof<L: CircuitInfo
     let first_child = proof_results.pop().unwrap();
     Ok((first_child, second_child))
 }
+

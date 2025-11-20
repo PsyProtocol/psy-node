@@ -168,6 +168,7 @@ pub enum ProvingJobCircuitType {
     GenerateFinalSigHashProof = 34,
     GenerateFinalSigHashProofGroth16 = 35,
     WrapFinalSigHashProofBLS12381 = 36,
+    GenesisBlockCheckpointStateTransition = 37,
 
     AggUserRegisterDeployContractsGUTA = 40,
     AggAddProcessL1WithdrawalAddL1Deposit = 41,
@@ -308,6 +309,7 @@ impl TryFrom<u8> for ProvingJobCircuitType {
             34 => Ok(ProvingJobCircuitType::GenerateFinalSigHashProof),
             35 => Ok(ProvingJobCircuitType::GenerateFinalSigHashProofGroth16),
             36 => Ok(ProvingJobCircuitType::WrapFinalSigHashProofBLS12381),
+            37 => Ok(ProvingJobCircuitType::GenesisBlockCheckpointStateTransition),
             40 => Ok(ProvingJobCircuitType::AggUserRegisterDeployContractsGUTA),
             41 => Ok(ProvingJobCircuitType::AggAddProcessL1WithdrawalAddL1Deposit),
             48 => Ok(ProvingJobCircuitType::DummyAppendUserRegistrationTreeAggregate),

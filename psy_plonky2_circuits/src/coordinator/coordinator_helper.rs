@@ -5,7 +5,7 @@ use psy_core::{job::job_id::{ProvingJobCircuitType, QProvingJobDataID}, worker::
 use psy_data::agg::TPAltCircuitFingerprintConfig;
 use psy_plonky2_basic_helpers::verifier::circuit_library::{CircuitInfoLibrary, CircuitInfoLibraryBuilder};
 
-use crate::{agg::circuits::{core::AggStateTransitionCircuit, dummy::AggStateTransitionDummyCircuit}, guta::guta_helper::QEDGUTACircuitManager, qstandard::{proof_store::QProofStoreReaderAsync, prover::QNextGenWorkerGenericProverAsyncMut, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync}};
+use crate::{agg::circuits::{core::AggStateTransitionCircuit, dummy::AggStateTransitionDummyCircuit}, coordinator::circuits::checkpoint_state_transition_genesis::QEDCheckpointStateTransitionGenesisCircuit, guta::guta_helper::QEDGUTACircuitManager, qstandard::{QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, proof_store::QProofStoreReaderAsync, prover::QNextGenWorkerGenericProverAsyncMut}};
 
 use super::circuits::{agg_user_registration_deploy_guta::VerifyAggUserRegistartionDeployContractsGUTACircuit, batch_append_user_registration_tree::BatchAppendUserRegistrationTreeCircuit, batch_deploy_contract::BatchDeployContractsCircuit, checkpoint_state_transition::QEDCheckpointStateTransitionCircuit};
 
@@ -26,6 +26,7 @@ where
     pub agg_user_register_deploy_contracts_guta: VerifyAggUserRegistartionDeployContractsGUTACircuit<C, D>,
     pub guta_circuits: QEDGUTACircuitManager<C,D>,
     pub checkpoint_root_transition: QEDCheckpointStateTransitionCircuit<C,D>,
+    pub genesis_checkpoint_root_transition: QEDCheckpointStateTransitionGenesisCircuit<C,D>,
     pub public_key: QHashOut<C::F>,
 }
 
@@ -140,10 +141,15 @@ pub fn new_with_guta(
             guta_circuits.guta_circuit_whitelist_root,
         );
 
+        let genesis_checkpoint_root_transition = QEDCheckpointStateTransitionGenesisCircuit::<C,D>::new();
+
         let checkpoint_root_transition = QEDCheckpointStateTransitionCircuit::<C,D>::new(
             agg_user_register_deploy_contracts_guta.get_common_circuit_data_ref(),
             agg_user_register_deploy_contracts_guta.get_verifier_config_ref().constants_sigmas_cap.height(),
             agg_user_register_deploy_contracts_guta.get_fingerprint(),
+            genesis_checkpoint_root_transition.get_common_circuit_data_ref(),
+            genesis_checkpoint_root_transition.get_verifier_config_ref().constants_sigmas_cap.height(),
+            genesis_checkpoint_root_transition.get_fingerprint(),
             checkpoint_tree_height,
         );
 
@@ -154,6 +160,7 @@ pub fn new_with_guta(
             dummy_agg_state_transition,
             guta_circuits,
             checkpoint_root_transition,
+            genesis_checkpoint_root_transition,
             agg_user_register_deploy_contracts_guta,
             append_register_users_circuit_whitelist,
             batch_deploy_contracts_circuit_whitelist,
@@ -185,6 +192,10 @@ pub fn new_with_guta(
         println!(
             "================================\n[checkpoint_root_transition.common]:\n{:?}",
             self.checkpoint_root_transition.get_common_circuit_data_ref()
+        );
+        println!(
+            "================================\n[genesis_checkpoint_root_transition.common]:\n{:?}",
+            self.genesis_checkpoint_root_transition.get_common_circuit_data_ref()
         );
         println!("===============================\n\n\n\n");
         self.guta_circuits.print_common_config();
@@ -235,6 +246,17 @@ pub fn new_with_guta(
             self.checkpoint_root_transition.get_verifier_config_ref().into()
         );
 
+        library.register_circuit(
+            ProvingJobCircuitType::GenesisBlockCheckpointStateTransition,
+            self.genesis_checkpoint_root_transition.get_fingerprint(),
+            self.genesis_checkpoint_root_transition.get_verifier_config_ref().into()
+        );
+        library.register_circuit(
+            ProvingJobCircuitType::GenerateRollupStateTransitionProof, 
+            self.checkpoint_root_transition.get_fingerprint(), 
+            self.checkpoint_root_transition.get_verifier_config_ref().into()
+        );
+
 
         self.guta_circuits.register_library(library);
     }
@@ -259,10 +281,13 @@ where
             ProvingJobCircuitType::DummyBatchDeployContractsAggregate => true,
             ProvingJobCircuitType::AggUserRegisterDeployContractsGUTA => true,
             ProvingJobCircuitType::GenerateRollupStateTransitionProof => true,
+            ProvingJobCircuitType::GenesisBlockCheckpointStateTransition => true,
             _ => self.guta_circuits.can_process_job(job_id),
         }
     }
 }
+
+/* 
 #[async_trait]
 impl<
         S: QProofStoreReaderAsync + Send + Sync,
@@ -298,3 +323,4 @@ where
         }
     }
 }
+*/

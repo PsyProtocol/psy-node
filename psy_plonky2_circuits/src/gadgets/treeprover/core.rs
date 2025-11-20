@@ -10,11 +10,57 @@ use plonky2::{
         config::AlgebraicHasher, proof::ProofWithPublicInputsTarget,
     },
 };
-use psy_data::agg::{AggStateTransition, AggStateTransitionWithEvents, TPCircuitFingerprintConfig};
+use psy_data::{agg::{AggStateTransition, AggStateTransitionWithEvents, TPCircuitFingerprintConfig}, rewards_tree};
 use psy_plonky2_basic_helpers::builder::{
     connect::CircuitBuilderConnectHelpers, hash::core::CircuitBuilderHashCore,
     verify::CircuitBuilderVerifyProofHelpers,
 };
+
+use crate::agg::common::compute_agg_state_trackable_final_public_inputs;
+
+pub fn check_agg_state_transition_proof_validity<H:AlgebraicHasher<F>, F: RichField + Extendable<D>, const D: usize>(
+    builder: &mut CircuitBuilder<F, D>,
+    proof_target: &ProofWithPublicInputsTarget<D>,
+    verifier_data_target: &VerifierCircuitTarget,
+    state_transition_hash: HashOutTarget,
+    rewards_tree_value: HashOutTarget,
+    total_proofs_generated: Target,
+    fingerprint: &TPCircuitFingerprintConfig<QHashOut<F>>,
+) {
+    assert_eq!(
+        proof_target.public_inputs.len(),
+        4,
+        "state aggregation proofs should have 4 public inputs"
+    );
+    let allowed_fingerprints = [
+        builder.constant_qhash(fingerprint.aggregator_fingerprint),
+        builder.constant_qhash(fingerprint.leaf_fingerprint),
+        builder.constant_qhash(fingerprint.dummy_fingerprint),
+    ];
+    let actual_fingerprint = builder.get_circuit_fingerprint::<H>(verifier_data_target);
+    builder.connect_hashes_enum(actual_fingerprint, &allowed_fingerprints);
+    let allowed_circuit_hashes_root =
+        builder.constant_qhash(fingerprint.allowed_circuit_hashes_root);
+    let actual_proof_public_inputs_hash = HashOutTarget {
+        elements: [
+            proof_target.public_inputs[0],
+            proof_target.public_inputs[1],
+            proof_target.public_inputs[2],
+            proof_target.public_inputs[3],
+        ]
+    };
+    let expected_proof_public_inputs_hash = compute_agg_state_trackable_final_public_inputs::<H, F, D>(
+        builder,
+        allowed_circuit_hashes_root,
+        state_transition_hash,
+        rewards_tree_value,
+        total_proofs_generated,
+    );
+    builder.connect_hashes(
+        actual_proof_public_inputs_hash,
+        expected_proof_public_inputs_hash,
+    );
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct AggStateTransitionGadget {
@@ -104,224 +150,5 @@ impl AggStateTransitionGadget {
     ) -> anyhow::Result<()> {
         witness.set_hash_target(self.state_transition_start, state_transition_start.0)?;
         witness.set_hash_target(self.state_transition_end, state_transition_end.0)
-    }
-}
-
-#[derive(Debug, Copy, Clone)]
-pub struct AggStateTransitionProofPublicInputsGadget {
-    pub commitment: HashOutTarget,
-    pub worker_rewards_tree_tag: HashOutTarget,
-    pub pm_jobs_completed_stats: [Target; 3],
-    pub allowed_circuit_hashes_root: HashOutTarget,
-    pub state_transition_combined_hash: HashOutTarget,
-}
-
-impl AggStateTransitionProofPublicInputsGadget {
-    pub fn from_public_inputs(public_inputs: &[Target]) -> Self {
-        assert_eq!(
-            public_inputs.len(),
-            19,
-            "AggStateTransitionProof should have 19 public inputs"
-        );
-        let commitment = HashOutTarget {
-            elements: [
-                public_inputs[0],
-                public_inputs[1],
-                public_inputs[2],
-                public_inputs[3],
-            ],
-        };
-        let worker_rewards_tree_tag = HashOutTarget {
-            elements: [
-                public_inputs[4],
-                public_inputs[5],
-                public_inputs[6],
-                public_inputs[7],
-            ],
-        };
-        let pm_jobs_completed_stats = [
-            public_inputs[8],
-            public_inputs[9],
-            public_inputs[10],
-        ];
-        let allowed_circuit_hashes_root = HashOutTarget {
-            elements: [
-                public_inputs[11],
-                public_inputs[12],
-                public_inputs[13],
-                public_inputs[14],
-            ],
-        };
-        let state_transition_combined_hash = HashOutTarget {
-            elements: [
-                public_inputs[15],
-                public_inputs[16],
-                public_inputs[17],
-                public_inputs[18],
-            ],
-        };
-        Self {
-            commitment,
-            worker_rewards_tree_tag,
-            pm_jobs_completed_stats,
-            state_transition_combined_hash,
-            allowed_circuit_hashes_root,
-        }
-    }
-    pub fn to_public_inputs(&self) -> [Target; 19] {
-        [
-            self.commitment.elements[0],
-            self.commitment.elements[1],
-            self.commitment.elements[2],
-            self.commitment.elements[3],
-            self.worker_rewards_tree_tag.elements[0],
-            self.worker_rewards_tree_tag.elements[1],
-            self.worker_rewards_tree_tag.elements[2],
-            self.worker_rewards_tree_tag.elements[3],
-            self.pm_jobs_completed_stats[0],
-            self.pm_jobs_completed_stats[1],
-            self.pm_jobs_completed_stats[2],
-            self.allowed_circuit_hashes_root.elements[0],
-            self.allowed_circuit_hashes_root.elements[1],
-            self.allowed_circuit_hashes_root.elements[2],
-            self.allowed_circuit_hashes_root.elements[3],
-            self.state_transition_combined_hash.elements[0],
-            self.state_transition_combined_hash.elements[1],
-            self.state_transition_combined_hash.elements[2],
-            self.state_transition_combined_hash.elements[3],
-        ]
-    }
-}
-
-#[derive(Debug, Copy, Clone)]
-pub struct AggStateTransitionWithEventsProofPublicInputsGadget {
-    pub state_transition_combined_hash: HashOutTarget,
-    pub events_hash: HashOutTarget,
-    pub allowed_circuit_hashes_root: HashOutTarget,
-}
-
-impl AggStateTransitionWithEventsProofPublicInputsGadget {
-    pub fn from_public_inputs(public_inputs: &[Target]) -> Self {
-        assert_eq!(
-            public_inputs.len(),
-            12,
-            "AggStateTransitionWithEventsProof should have 12 public inputs"
-        );
-        let allowed_circuit_hashes_root = HashOutTarget {
-            elements: [
-                public_inputs[0],
-                public_inputs[1],
-                public_inputs[2],
-                public_inputs[3],
-            ],
-        };
-        let state_transition_combined_hash = HashOutTarget {
-            elements: [
-                public_inputs[4],
-                public_inputs[5],
-                public_inputs[6],
-                public_inputs[7],
-            ],
-        };
-        let events_hash = HashOutTarget {
-            elements: [
-                public_inputs[8],
-                public_inputs[9],
-                public_inputs[10],
-                public_inputs[11],
-            ],
-        };
-        Self {
-            state_transition_combined_hash,
-            events_hash,
-            allowed_circuit_hashes_root,
-        }
-    }
-    pub fn to_public_inputs(&self) -> [Target; 12] {
-        [
-            self.allowed_circuit_hashes_root.elements[0],
-            self.allowed_circuit_hashes_root.elements[1],
-            self.allowed_circuit_hashes_root.elements[2],
-            self.allowed_circuit_hashes_root.elements[3],
-            self.state_transition_combined_hash.elements[0],
-            self.state_transition_combined_hash.elements[1],
-            self.state_transition_combined_hash.elements[2],
-            self.state_transition_combined_hash.elements[3],
-            self.events_hash.elements[0],
-            self.events_hash.elements[1],
-            self.events_hash.elements[2],
-            self.events_hash.elements[3],
-        ]
-    }
-}
-
-pub struct AggStateTransitionProofValidityGadget {
-    pub state_transition_combined_hash: HashOutTarget,
-}
-
-impl AggStateTransitionProofValidityGadget {
-    pub fn add_virtual_to<H:AlgebraicHasher<F>, F: RichField + Extendable<D>, const D: usize>(
-        builder: &mut CircuitBuilder<F, D>,
-        proof_target: &ProofWithPublicInputsTarget<D>,
-        verifier_data_target: &VerifierCircuitTarget,
-        fingerprint: &TPCircuitFingerprintConfig<QHashOut<F>>,
-    ) -> HashOutTarget {
-        let allowed_fingerprints = [
-            builder.constant_qhash(fingerprint.aggregator_fingerprint),
-            builder.constant_qhash(fingerprint.leaf_fingerprint),
-            builder.constant_qhash(fingerprint.dummy_fingerprint),
-        ];
-        let actual_fingerprint = builder.get_circuit_fingerprint::<H>(verifier_data_target);
-        tracing::debug!("actual_fingerprint={:#?}", actual_fingerprint);
-        builder.connect_hashes_enum(actual_fingerprint, &allowed_fingerprints);
-        let allowed_circuit_hashes_root =
-            builder.constant_qhash(fingerprint.allowed_circuit_hashes_root);
-        let pub_gadget = AggStateTransitionProofPublicInputsGadget::from_public_inputs(
-            &proof_target.public_inputs,
-        );
-        tracing::debug!("pub_gadget={:#?}", pub_gadget);
-        builder.connect_hashes(
-            pub_gadget.allowed_circuit_hashes_root,
-            allowed_circuit_hashes_root,
-        );
-
-        pub_gadget.state_transition_combined_hash
-    }
-}
-
-pub struct AggStateTransitionWithEventsProofValidityGadget {
-    pub state_transition_combined_hash: HashOutTarget,
-    pub events_hash: HashOutTarget,
-}
-
-impl AggStateTransitionWithEventsProofValidityGadget {
-    pub fn add_virtual_to<H:AlgebraicHasher<F>, F: RichField + Extendable<D>, const D: usize>(
-        builder: &mut CircuitBuilder<F, D>,
-        proof_target: &ProofWithPublicInputsTarget<D>,
-        verifier_data_target: &VerifierCircuitTarget,
-        fingerprint: &TPCircuitFingerprintConfig<QHashOut<F>>,
-    ) -> Self {
-        let allowed_fingerprints = [
-            builder.constant_qhash(fingerprint.aggregator_fingerprint),
-            builder.constant_qhash(fingerprint.leaf_fingerprint),
-            builder.constant_qhash(fingerprint.dummy_fingerprint),
-        ];
-        let actual_fingerprint = builder.get_circuit_fingerprint::<H>(verifier_data_target);
-        builder.connect_hashes_enum(actual_fingerprint, &allowed_fingerprints);
-        let allowed_circuit_hashes_root =
-            builder.constant_qhash(fingerprint.allowed_circuit_hashes_root);
-        let pub_gadget = AggStateTransitionWithEventsProofPublicInputsGadget::from_public_inputs(
-            &proof_target.public_inputs,
-        );
-
-        builder.connect_hashes(
-            pub_gadget.allowed_circuit_hashes_root,
-            allowed_circuit_hashes_root,
-        );
-
-        Self {
-            state_transition_combined_hash: pub_gadget.state_transition_combined_hash,
-            events_hash: pub_gadget.events_hash,
-        }
     }
 }

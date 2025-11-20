@@ -1,31 +1,47 @@
 use async_trait::async_trait;
-use parth_core::{crypto::hash::{merkle_proof::MerkleProofCore, traits::MerkleZeroHasher}, data::proof_input::CircuitInputWithDependencies, pgoldilocks::{QHashOut, QRichField}};
+use parth_core::{
+    crypto::hash::{merkle_proof::MerkleProofCore, traits::MerkleZeroHasher},
+    felt::QFelt64,
+    pgoldilocks::{QHashOut, QRichField},
+    protocol::core_types::Q256BitHash,
+};
 use plonky2::{
-    hash::hash_types::{HashOut, HashOutTarget}, iop::
-        witness::PartialWitness, plonk::{
+    hash::hash_types::{HashOut, HashOutTarget},
+    iop::witness::{PartialWitness, WitnessWrite},
+    plonk::{
         circuit_builder::CircuitBuilder,
         circuit_data::{CircuitConfig, CircuitData, CommonCircuitData, VerifierOnlyCircuitData},
         config::{AlgebraicHasher, GenericConfig},
         proof::ProofWithPublicInputs,
-    }
+    },
 };
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
-use psy_data::{agg::{AggStateTransition, TPAltCircuitFingerprintConfig}, guta::header::GlobalUserTreeAggregatorHeader, protocol::circuit_inputs::agg_part_1::QCAggUserRegistartionDeployContractsGUTAInput};
-use psy_plonky2_basic_helpers::{
-    builder::hash::core::CircuitBuilderHashCore, verifier::circuit_library::CircuitInfoLibrary,
-   
+use psy_data::{
+    agg::{AggStateTransition, TPAltCircuitFingerprintConfig},
+    guta::header::GlobalUserTreeAggregatorHeader,
+    protocol::circuit_inputs::agg_part_1::QCAggUserRegistartionDeployContractsGUTAInput,
+    worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse,
 };
-use psy_plonky2_common_circuits::traits::ToTargets;
-use crate::{proof_minifier::{pm_chain_dynamic::QEDProofMinifierDynamicChain, pm_core::get_circuit_fingerprint_generic}, qstandard::{proof_store::QProofStoreReaderAsync, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QPsyNetworkCircuitWithType}};
+use psy_plonky2_basic_helpers::verifier::circuit_library::CircuitInfoLibrary;
+use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 
-
-use crate::{coordinator::gadgets::verify_agg_user_registration_deploy_guta::VerifyAggUserRegistartionDeployContractsGUTAGadget};
+use crate::{
+    coordinator::gadgets::verify_agg_user_registration_deploy_guta::VerifyAggUserRegistartionDeployContractsGUTAGadget,
+    proof_minifier::{pm_chain_dynamic::QEDProofMinifierDynamicChain, pm_core::get_circuit_fingerprint_generic},
+    qstandard::{
+        QPsyNetworkCircuitWithType, QStandardCircuit, QStandardCircuitProvableWithRawProofsAndRefLibraryAsync,
+    },
+    utils::proof_serialization::deserialize_plonky2_proof,
+};
 
 #[derive(Debug)]
 pub struct VerifyAggUserRegistartionDeployContractsGUTACircuit<C: GenericConfig<D>, const D: usize>
-where C::Hasher:AlgebraicHasher<C::F>,
+where
+    C::Hasher: AlgebraicHasher<C::F>,
 {
     pub verifier_gadget: VerifyAggUserRegistartionDeployContractsGUTAGadget<D>,
+
+    pub worker_rewards_tree_tag_target: HashOutTarget,
 
     pub base_circuit_data: CircuitData<C::F, C, D>,
     pub base_fingerprint: QHashOut<C::F>,
@@ -33,8 +49,9 @@ where C::Hasher:AlgebraicHasher<C::F>,
     pub enable_minifier: bool,
 }
 
-
-impl<C: GenericConfig<D>, const D: usize> QPsyNetworkCircuitWithType for VerifyAggUserRegistartionDeployContractsGUTACircuit<C, D> where C::Hasher:AlgebraicHasher<C::F>,
+impl<C: GenericConfig<D>, const D: usize> QPsyNetworkCircuitWithType for VerifyAggUserRegistartionDeployContractsGUTACircuit<C, D>
+where
+    C::Hasher: AlgebraicHasher<C::F>,
 {
     fn get_circuit_type(&self) -> ProvingJobCircuitType {
         ProvingJobCircuitType::AggUserRegisterDeployContractsGUTA
@@ -42,7 +59,8 @@ impl<C: GenericConfig<D>, const D: usize> QPsyNetworkCircuitWithType for VerifyA
 }
 impl<C: GenericConfig<D>, const D: usize> VerifyAggUserRegistartionDeployContractsGUTACircuit<C, D>
 where
-    C::Hasher: AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>>+ MerkleZeroHasher<QHashOut<C::F>>, C::F: QRichField,
+    C::Hasher: AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + MerkleZeroHasher<QHashOut<C::F>>,
+    C::F: QRichField,
 {
     pub fn new(
         user_reg_proof_common_data: &CommonCircuitData<C::F, D>,
@@ -56,8 +74,17 @@ where
         guta_circuit_whitelist_tree_height: u8,
         guta_circuit_whitelist_root: QHashOut<C::F>,
     ) -> Self {
-        Self::new_with_config(user_reg_proof_common_data, user_reg_transition_circuit_config, deploy_contracts_proof_common_data, deploy_contracts_transition_circuit_config, guta_proof_common_data, guta_verifier_data_cap_height, guta_circuit_whitelist_tree_height, guta_circuit_whitelist_root, true)
-
+        Self::new_with_config(
+            user_reg_proof_common_data,
+            user_reg_transition_circuit_config,
+            deploy_contracts_proof_common_data,
+            deploy_contracts_transition_circuit_config,
+            guta_proof_common_data,
+            guta_verifier_data_cap_height,
+            guta_circuit_whitelist_tree_height,
+            guta_circuit_whitelist_root,
+            true,
+        )
     }
     pub fn new_with_config(
         user_reg_proof_common_data: &CommonCircuitData<C::F, D>,
@@ -76,171 +103,129 @@ where
         let config = CircuitConfig::standard_recursion_config();
         let mut builder = CircuitBuilder::<C::F, D>::new(config);
 
-        let verifier_gadget =
-            VerifyAggUserRegistartionDeployContractsGUTAGadget::<D>::add_virtual_to::<C, C::F>(
-                &mut builder,
-                user_reg_proof_common_data,
-                user_reg_transition_circuit_config,
-                deploy_contracts_proof_common_data,
-                deploy_contracts_transition_circuit_config,
-                guta_proof_common_data,
-                guta_verifier_data_cap_height,
-                guta_circuit_whitelist_root,
-                guta_circuit_whitelist_tree_height,
+        let verifier_gadget = VerifyAggUserRegistartionDeployContractsGUTAGadget::<D>::add_virtual_to::<C, C::F>(
+            &mut builder,
+            user_reg_proof_common_data,
+            user_reg_transition_circuit_config,
+            deploy_contracts_proof_common_data,
+            deploy_contracts_transition_circuit_config,
+            guta_proof_common_data,
+            guta_verifier_data_cap_height,
+            guta_circuit_whitelist_root,
+            guta_circuit_whitelist_tree_height,
+        );
 
-            );
-        tracing::debug!("verifier_gadget={:#?}", verifier_gadget);
-        let state_transition_hash = verifier_gadget
-            .header
-            .get_combined_hash::<C::Hasher, C::F, D>(&mut builder);
-
-        let register_users_commitment = HashOutTarget {
-            elements: [
-                verifier_gadget.verify_register_users_gadget.proof_target.public_inputs[0],
-                verifier_gadget.verify_register_users_gadget.proof_target.public_inputs[1],
-                verifier_gadget.verify_register_users_gadget.proof_target.public_inputs[2],
-                verifier_gadget.verify_register_users_gadget.proof_target.public_inputs[3],
-            ]
-        };
-        let register_users_worker_rewards_tree_tag = HashOutTarget {
-            elements: [
-                verifier_gadget.verify_register_users_gadget.proof_target.public_inputs[4],
-                verifier_gadget.verify_register_users_gadget.proof_target.public_inputs[5],
-                verifier_gadget.verify_register_users_gadget.proof_target.public_inputs[6],
-                verifier_gadget.verify_register_users_gadget.proof_target.public_inputs[7],
-            ]
-        };
-        let register_users_root = builder.hash_two_to_one::<C::Hasher>(register_users_commitment, register_users_worker_rewards_tree_tag);
-
-        let deploy_contracts_commitment = HashOutTarget {
-            elements: [
-                verifier_gadget.verify_deploy_contract_gadget.proof_target.public_inputs[0],
-                verifier_gadget.verify_deploy_contract_gadget.proof_target.public_inputs[1],
-                verifier_gadget.verify_deploy_contract_gadget.proof_target.public_inputs[2],
-                verifier_gadget.verify_deploy_contract_gadget.proof_target.public_inputs[3],
-            ]
-        };
-        let deploy_contracts_worker_rewards_tree_tag = HashOutTarget {
-            elements: [
-                verifier_gadget.verify_deploy_contract_gadget.proof_target.public_inputs[4],
-                verifier_gadget.verify_deploy_contract_gadget.proof_target.public_inputs[5],
-                verifier_gadget.verify_deploy_contract_gadget.proof_target.public_inputs[6],
-                verifier_gadget.verify_deploy_contract_gadget.proof_target.public_inputs[7],
-            ]
-        };
-        let deploy_contracts_root = builder.hash_two_to_one::<C::Hasher>(deploy_contracts_commitment, deploy_contracts_worker_rewards_tree_tag);
-
-        let gutas_commitment = HashOutTarget {
-            elements: [
-                verifier_gadget.verify_guta_gadget.proof_target.public_inputs[0],
-                verifier_gadget.verify_guta_gadget.proof_target.public_inputs[1],
-                verifier_gadget.verify_guta_gadget.proof_target.public_inputs[2],
-                verifier_gadget.verify_guta_gadget.proof_target.public_inputs[3],
-            ]
-        };
-        let gutas_worker_rewards_tree_tag = HashOutTarget {
-            elements: [
-                verifier_gadget.verify_guta_gadget.proof_target.public_inputs[4],
-                verifier_gadget.verify_guta_gadget.proof_target.public_inputs[5],
-                verifier_gadget.verify_guta_gadget.proof_target.public_inputs[6],
-                verifier_gadget.verify_guta_gadget.proof_target.public_inputs[7],
-            ]
-        };
-        let gutas_root = builder.hash_two_to_one::<C::Hasher>(gutas_commitment, gutas_worker_rewards_tree_tag);
-
-        builder.register_public_inputs(&state_transition_hash.elements);
-        builder.register_public_inputs(&register_users_root.elements);
-        builder.register_public_inputs(&deploy_contracts_root.elements);
-        builder.register_public_inputs(&gutas_root.elements);
-        builder.register_public_inputs(&verifier_gadget.combined_pm_jobs_completed.to_targets());
-
-        tracing::debug!("🔧 state_transition_hash targets: {:?}", state_transition_hash.elements);
-        tracing::debug!("🔧 register_users_root targets: {:?}", register_users_root.elements);
-        tracing::debug!("🔧 deploy_contracts_root targets: {:?}", deploy_contracts_root.elements);
-        tracing::debug!("🔧 gutas_root targets: {:?}", gutas_root.elements);
+        // compute public inputs hash
+        let guta_proof_rewards_tree_value = verifier_gadget.verify_guta_gadget.rewards_tree_value;
+        let register_users_proof_rewards_tree_value = verifier_gadget.verify_register_users_gadget.rewards_tree_value;
+        let deploy_contracts_proof_rewards_tree_value = verifier_gadget.verify_deploy_contract_gadget.rewards_tree_value;
+        let worker_rewards_tree_tag_target = builder.add_virtual_hash();
+        let public_inputs_hash = verifier_gadget.header.get_public_inputs_hash::<C::Hasher, C::F, D>(
+            &mut builder,
+            worker_rewards_tree_tag_target,
+            guta_proof_rewards_tree_value,
+            register_users_proof_rewards_tree_value,
+            deploy_contracts_proof_rewards_tree_value,
+        );
+        
+        builder.register_public_inputs(&public_inputs_hash.elements);
 
         let base_circuit_data = builder.build::<C>();
 
-        let base_fingerprint = QHashOut(get_circuit_fingerprint_generic(
-            &base_circuit_data.verifier_only,
-        ));
+        let base_fingerprint = QHashOut(get_circuit_fingerprint_generic(&base_circuit_data.verifier_only));
         //println!("base_fingerprint: {:?}",base_fingerprint);
 
         let minifier_chain = if has_minifier {
-            Some(
-                QEDProofMinifierDynamicChain::<D, C::F, C>::new_with_dynamic_constant_verifier(
-                    &base_circuit_data.verifier_only,
-                    &base_circuit_data.common,
-                    &[false, false],
-                ),
-            )
+            Some(QEDProofMinifierDynamicChain::<D, C::F, C>::new_with_dynamic_constant_verifier(
+                &base_circuit_data.verifier_only,
+                &base_circuit_data.common,
+                &[false, false],
+            ))
         } else {
             None
         };
 
         Self {
+            verifier_gadget,
+            worker_rewards_tree_tag_target,
             base_circuit_data,
             base_fingerprint,
             minifier_chain,
-            verifier_gadget,
             enable_minifier: has_minifier,
         }
     }
 
     pub fn prove_base(
         &self,
+        worker_reward_tag: QHashOut<C::F>,
         register_users_state_transition: &AggStateTransition<QHashOut<C::F>>,
         register_users_proof: &ProofWithPublicInputs<C::F, C, D>,
         register_users_verifier_data: &VerifierOnlyCircuitData<C, D>,
+        register_users_proof_rewards_tree_value: QHashOut<C::F>,
+        register_users_total_proofs_generated: C::F,
 
         deploy_contracts_state_transition: &AggStateTransition<QHashOut<C::F>>,
         deploy_contracts_proof: &ProofWithPublicInputs<C::F, C, D>,
         deploy_contracts_verifier_data: &VerifierOnlyCircuitData<C, D>,
+        deploy_contracts_proof_rewards_tree_value: QHashOut<C::F>,
+        deploy_contracts_total_proofs_generated: C::F,
 
         guta_whitelist_merkle_proof: &MerkleProofCore<QHashOut<C::F>>,
         guta_proof_header: &GlobalUserTreeAggregatorHeader<C::F, QHashOut<C::F>>,
         guta_proof: &ProofWithPublicInputs<C::F, C, D>,
         guta_verifier_data: &VerifierOnlyCircuitData<C, D>,
+        guta_proof_rewards_tree_value: QHashOut<C::F>,
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
         let mut pw = PartialWitness::<C::F>::new();
 
-        tracing::debug!("register_users_state_transition: {}", register_users_state_transition.get_combined_hash::<C::Hasher>());
-        tracing::debug!("deploy_contracts_state_transition: {}", deploy_contracts_state_transition.get_combined_hash::<C::Hasher>());
+        tracing::debug!(
+            "register_users_state_transition: {}",
+            register_users_state_transition.get_combined_hash::<C::Hasher>()
+        );
+        tracing::debug!(
+            "deploy_contracts_state_transition: {}",
+            deploy_contracts_state_transition.get_combined_hash::<C::Hasher>()
+        );
+
+        pw.set_hash_target(self.worker_rewards_tree_tag_target, worker_reward_tag.0)?;
 
         self.verifier_gadget.set_witness_params(
             &mut pw,
             register_users_state_transition,
             register_users_proof,
             register_users_verifier_data,
+            register_users_proof_rewards_tree_value,
+            register_users_total_proofs_generated,
             deploy_contracts_state_transition,
             deploy_contracts_proof,
             deploy_contracts_verifier_data,
+            deploy_contracts_proof_rewards_tree_value,
+            deploy_contracts_total_proofs_generated,
             guta_whitelist_merkle_proof,
             guta_proof_header,
             guta_proof,
             guta_verifier_data,
+            guta_proof_rewards_tree_value,
         )?;
 
         let res = self.base_circuit_data.prove(pw)?;
 
         if self.enable_minifier {
             self.minifier_chain.as_ref().unwrap().prove(&res)
-        }else{
+        } else {
             Ok(res)
         }
-
     }
 }
 
-impl<C: GenericConfig<D>, const D: usize> QStandardCircuit<C, D>
-    for VerifyAggUserRegistartionDeployContractsGUTACircuit<C, D>
+impl<C: GenericConfig<D>, const D: usize> QStandardCircuit<C, D> for VerifyAggUserRegistartionDeployContractsGUTACircuit<C, D>
 where
     C::Hasher: AlgebraicHasher<C::F>,
 {
     fn get_fingerprint(&self) -> QHashOut<C::F> {
         if self.enable_minifier {
             QHashOut(self.minifier_chain.as_ref().unwrap().get_fingerprint())
-        }else{
+        } else {
             self.base_fingerprint
         }
     }
@@ -248,7 +233,7 @@ where
     fn get_verifier_config_ref(&self) -> &VerifierOnlyCircuitData<C, D> {
         if self.enable_minifier {
             self.minifier_chain.as_ref().unwrap().get_verifier_data()
-        }else{
+        } else {
             &self.base_circuit_data.verifier_only
         }
     }
@@ -256,65 +241,65 @@ where
     fn get_common_circuit_data_ref(&self) -> &CommonCircuitData<C::F, D> {
         if self.enable_minifier {
             self.minifier_chain.as_ref().unwrap().get_common_data()
-        }else{
+        } else {
             &self.base_circuit_data.common
         }
     }
 }
+
 #[async_trait]
-impl<
-        S: QProofStoreReaderAsync + Send + Sync,
-        L: CircuitInfoLibrary<C, D> + Send + Sync,
-        C: GenericConfig<D> + 'static,
-        const D: usize,
-    > QStandardCircuitProvableWithProofStoreAndRefLibraryAsync<S, L, C, D>
+impl<L: CircuitInfoLibrary<C, D> + Send + Sync, C: GenericConfig<D>, const D: usize> QStandardCircuitProvableWithRawProofsAndRefLibraryAsync<L, C, D>
     for VerifyAggUserRegistartionDeployContractsGUTACircuit<C, D>
 where
-    C::Hasher: AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>>+ MerkleZeroHasher<QHashOut<C::F>>, C::F: QRichField,
+    C::Hasher: AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + MerkleZeroHasher<QHashOut<C::F>>,
+    QHashOut<C::F>: Q256BitHash,
+    C::F: QFelt64 + QRichField,
 {
-    async fn prove_with_proof_store_async(
+    async fn prove_with_raw_proofs_and_ref_library_async(
         &self,
-        store: &S,
         library: &L,
-        job_id: QProvingJobDataID,
-        worker_rewards_tree_tag: QHashOut<C::F>,
+        input: PsyWorkerGetProvingWorkWithChildProofsAPIResponse<QHashOut<C::F>, QProvingJobDataID>,
+        worker_reward_tag: QHashOut<C::F>,
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
-        let r: CircuitInputWithDependencies<QCAggUserRegistartionDeployContractsGUTAInput<C::F, QHashOut<C::F>>, QProvingJobDataID> =
-            bincode::deserialize(&store.get_bytes_by_id(job_id.get_input_witness_id()).await?)
-                .map_err(|e| anyhow::anyhow!(e))?;
+        input.ensure_expected_child_proof_count_with_tags(3)?;
+        let witness = QCAggUserRegistartionDeployContractsGUTAInput::<C::F, QHashOut<C::F>>::psy_ser_from_slice(&input.base.witness)?;
 
-        if r.dependencies.len() != 3 {
-            anyhow::bail!("expected 3 dependencies");
-        }
+        let guta_zk_proof = deserialize_plonky2_proof::<C, D>(&input.input_proofs[0])?;
+        let guta_zk_proof_verifier_data = library.get_verifier_data(input.get_child_proof_circuit_type(0)?)?;
+        let guta_inclusion_proof = library.get_group_inclusion_proof(ProvingJobCircuitType::GUTATwoGUTA, input.get_child_proof_circuit_type(0)?)?;
+        let guta_proof_rewards_tree_value = input.base.child_proof_tag_values[0];
+
+        let user_registration_zk_proof = deserialize_plonky2_proof::<C, D>(&input.input_proofs[1])?;
+        let user_registration_zk_proof_verifier_data = library.get_verifier_data(input.get_child_proof_circuit_type(1)?)?;
+        let register_users_proof_rewards_tree_value = input.base.child_proof_tag_values[1];
+
+        let deploy_contracts_zk_proof = deserialize_plonky2_proof::<C, D>(&input.input_proofs[2])?;
+        let deploy_contracts_zk_proof_verifier_data = library.get_verifier_data(input.get_child_proof_circuit_type(2)?)?;
+        let deploy_contracts_proof_rewards_tree_value = input.base.child_proof_tag_values[2];
 
 
-        let user_registration_proof = store.get_proof_by_id(r.dependencies[0]).await?;
-        let deploy_contracts_proof = store.get_proof_by_id(r.dependencies[1]).await?;
-        let guta_proof = store.get_proof_by_id(r.dependencies[2]).await?;
+        let (register_users_state_transition, register_users_total_proofs_generated) =
+            witness.register_users_state_transition.get_agg_state_transition_and_f::<C::F>();
+        let (deploy_contracts_state_transition, deploy_contracts_total_proofs_generated) =
+            witness.deploy_contracts_state_transition.get_agg_state_transition_and_f::<C::F>();
 
-        let user_registration_type = r.dependencies[0].circuit_type;
-        let deploy_contracts_type = r.dependencies[1].circuit_type;
-        let guta_type = r.dependencies[2].circuit_type;
-
-        let user_registration_verifier_data = library.get_verifier_data(user_registration_type)?;
-        let deploy_contracts_verifier_data = library.get_verifier_data(deploy_contracts_type)?;
-        let guta_verifier_data = library.get_verifier_data(guta_type)?;
-
-        let guta_inclusion_proof =
-            library.get_group_inclusion_proof(ProvingJobCircuitType::GUTATwoGUTA, guta_type)?;
-
-        let result = self.prove_base(
-            &r.input.register_users_state_transition,
-            &user_registration_proof,
-            &user_registration_verifier_data,
-            &r.input.deploy_contracts_state_transition,
-            &deploy_contracts_proof,
-            &deploy_contracts_verifier_data,
+        self.prove_base(
+            worker_reward_tag,
+            &register_users_state_transition,
+            &user_registration_zk_proof,
+            &user_registration_zk_proof_verifier_data,
+            register_users_proof_rewards_tree_value,
+            register_users_total_proofs_generated,
+            &deploy_contracts_state_transition,
+            &deploy_contracts_zk_proof,
+            &deploy_contracts_zk_proof_verifier_data,
+            deploy_contracts_proof_rewards_tree_value,
+            deploy_contracts_total_proofs_generated,
             &guta_inclusion_proof,
-            &r.input.guta_proof_header,
-            &guta_proof,
-            &guta_verifier_data,
-        )?;
-        Ok(result)
+            &witness.guta_proof_header,
+            &guta_zk_proof,
+            &guta_zk_proof_verifier_data,
+            guta_proof_rewards_tree_value,
+        )
     }
 }

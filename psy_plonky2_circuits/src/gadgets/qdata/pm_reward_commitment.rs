@@ -32,13 +32,18 @@ impl CreatableTarget for PMRewardCommitmentGadget {
     fn create_virtual<F: RichField + Extendable<D>, const D: usize>(
         builder: &mut CircuitBuilder<F, D>,
     ) -> Self {
-        let register_users_root = builder.add_virtual_hash();
+        
+        // TODO: Replace PMRewardCommitmentGadget with a new gadget that is a single rewards tree hash, reflecting the new tag-tree based rewards tree commitment
+        
+        /*let register_users_root = builder.add_virtual_hash();
         let gutas_root = builder.add_virtual_hash();
-        let deploy_contracts_root = builder.add_virtual_hash();
+        let deploy_contracts_root = builder.add_virtual_hash();*/
+
+        let reward_tree_root = builder.add_virtual_hash();
         Self {
-            register_users_root,
-            gutas_root,
-            deploy_contracts_root,
+            register_users_root: reward_tree_root,
+            gutas_root: reward_tree_root,
+            deploy_contracts_root: reward_tree_root,
         }
     }
 }

@@ -60,8 +60,8 @@ impl<Hash: Q256BitHash> psy_serialize::AutoImplementFallbackPsySerializeCanonica
 
 
 impl<Hash: Q256BitHash> PsyCanonicalSerializeMetadata for PPMRewardCommitment<Hash> {
-    const IS_FIXED_SIZE: bool = false;
-    const FIXED_SIZE: usize = 0;
+    const IS_FIXED_SIZE: bool = true;
+    const FIXED_SIZE: usize =32 * 3;
 }
 
 

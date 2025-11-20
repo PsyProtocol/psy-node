@@ -2,7 +2,7 @@
 use parth_core::utils::QPGenRandom;
 use parth_core::{
     crypto::hash::traits::{FieldQHasher, HashTo4Felts},
-    felt::QFelt64,
+    felt::{FromPrimitiveValuesFelt, QFelt64},
     protocol::core_types::Q256BitHash,
 };
 use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
@@ -27,6 +27,20 @@ impl<Hash: Copy> WithDummyStateTransition<Hash> for AggStateTransitionWithStats<
             state_transition_end: state_root,
             total_proofs_generated: 0,
         }
+    }
+}
+impl<Hash: Copy> AggStateTransitionWithStats<Hash> {
+    pub fn get_agg_state_transition(&self) -> AggStateTransition<Hash> {
+        AggStateTransition {
+            state_transition_start: self.state_transition_start,
+            state_transition_end: self.state_transition_end,
+        }
+    }
+    pub fn get_agg_state_transition_and_f<F: FromPrimitiveValuesFelt>(&self) -> (AggStateTransition<Hash>, F) {
+        (
+            self.get_agg_state_transition(),
+            F::from_u64_value(self.total_proofs_generated),
+        )
     }
 }
 

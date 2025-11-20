@@ -12,6 +12,15 @@ pub struct PMJobsCompletedStatsGadget {
 }
 
 impl PMJobsCompletedStatsGadget {
+    pub fn add_virtual_to<F: RichField + Extendable<D>, const D: usize>(
+        builder: &mut CircuitBuilder<F, D>,
+    ) -> Self {
+        Self {
+            deploy_contracts_completed: builder.add_virtual_target(),
+            register_users_completed: builder.add_virtual_target(),
+            gutas_completed: builder.add_virtual_target(),
+        }
+    }
     pub fn set_witness<F: RichField>(&self, witness: &mut impl Witness<F>, target: &PPMJobsCompletedStats<F>) -> anyhow::Result<()> {
         witness.set_target(self.deploy_contracts_completed, target.deploy_contracts_completed)?;
         witness.set_target(self.register_users_completed, target.register_users_completed)?;

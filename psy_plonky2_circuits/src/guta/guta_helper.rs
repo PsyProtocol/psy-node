@@ -443,6 +443,8 @@ where
         }
     }
 }
+
+/* 
 #[async_trait]
 impl<S: QProofStoreReaderAsync + Send + Sync, L: CircuitInfoLibrary<C, D> + Send + Sync, C: GenericConfig<D> + 'static, const D: usize>
     QNextGenWorkerGenericProverAsyncMut<S, L, C, D> for QEDGUTACircuitManager<C, D>
@@ -506,6 +508,7 @@ where
         }
     }
 }
+    */
 #[cfg(test)]
 mod tests {
     use parth_core::pgoldilocks::QHashOut;

@@ -22,7 +22,7 @@ use psy_data::{agg::AggStateTransitionInputV2, worker::api_response::PsyWorkerGe
 use psy_plonky2_basic_helpers::{builder::{hash::core::CircuitBuilderHashCore, pad_circuit::CircuitBuilderQEDCommonGates, verify::CircuitBuilderVerifyProofHelpers}, verifier::circuit_library::CircuitInfoLibrary};
 use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 
-use crate::{agg::{circuits::core::AggStateTrackableCircuitHeaderGadget, common::compute_agg_state_trackable_final_public_inputs}, proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{QStandardCircuit, QStandardCircuitProvableWithRawProofsAndRefLibraryAsync}};
+use crate::{agg::{circuits::core::AggStateTrackableCircuitHeaderGadget, common::compute_agg_state_trackable_final_public_inputs}, proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{QStandardCircuit, QStandardCircuitProvableWithRawProofsAndRefLibraryAsync}, utils::proof_serialization::deserialize_plonky2_proof};
 
 #[derive(Debug, Clone)]
 pub struct AggStateTrackableCircuitHeaderGadgetV2 {
@@ -311,8 +311,8 @@ where
             anyhow::bail!("invalid child proof tag values count in two end guta input");
         }
 
-        let left_proof =  bincode::deserialize::<ProofWithPublicInputs<C::F, C, D>>(&input.input_proofs[0])?;
-        let right_proof = bincode::deserialize::<ProofWithPublicInputs<C::F, C, D>>(&input.input_proofs[1])?;
+        let left_proof =  deserialize_plonky2_proof::<C,D>(&input.input_proofs[0])?;
+        let right_proof = deserialize_plonky2_proof::<C,D>(&input.input_proofs[1])?;
 
         let left_proving_rewards_tag_value = input.base.child_proof_tag_values[0];
         let right_proving_rewards_tag_value = input.base.child_proof_tag_values[1];
