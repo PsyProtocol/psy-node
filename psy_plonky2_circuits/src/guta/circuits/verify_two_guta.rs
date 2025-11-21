@@ -63,6 +63,7 @@ where
         guta_proof_common_data: &CommonCircuitData<C::F, D>,
         guta_proof_verifier_data_cap_height: usize,
         global_user_tree_height: usize,
+        max_guta_nca_merkle_proof_height: usize,
 
         guta_circuit_whitelist_tree_height: u8,
     ) -> Self {
@@ -98,7 +99,8 @@ where
             &mut builder,
             a_guta_header,
             b_guta_header,
-            global_user_tree_height as u8,
+            max_guta_nca_merkle_proof_height,
+            global_user_tree_height,
         );
         // compute public inputs hash from worker rewards tree tag and child rewards tree value:
         // left child rewards tree value => The rewards tree value from the left hand proof verified in a_guta_gadget 
@@ -117,7 +119,6 @@ where
 
         builder.register_public_inputs(&public_inputs_hash.elements);
         builder.add_gate_to_gate_set(GateRef::new(ConstantGate::new(builder.config.num_constants)));
-        pad_circuit_degree(&mut builder, 12);
         let circuit_data = builder.build::<C>();
 
         let fingerprint = QHashOut(get_circuit_fingerprint_generic(&circuit_data.verifier_only));

@@ -12,12 +12,13 @@ use plonky2::{
 };
 use parth_core::{crypto::hash::{merkle_proof::DeltaMerkleProofCore, nca::nca_proof::{PartialUpdateNearestCommonAncestorProof, UpdateNearestCommonAncestorProof}}, pgoldilocks::QHashOut};
 
-use super::variable_height_delta_merkle_proof_opt::VariableHeightDeltaMerkleProofOptGadget;
+use crate::hash::merkle::gadgets::variable_height_delta_merkle_proof_sub_tree::VariableHeightDeltaMerkleProofInSubTreeGadget;
+
 
 #[derive(Debug, Clone)]
 pub struct UpdateNearestCommonAncestorProofOptGadget {
-    pub child_a: VariableHeightDeltaMerkleProofOptGadget,
-    pub child_b: VariableHeightDeltaMerkleProofOptGadget,
+    pub child_a: VariableHeightDeltaMerkleProofInSubTreeGadget,
+    pub child_b: VariableHeightDeltaMerkleProofInSubTreeGadget,
 
     pub nearest_common_ancestor_level: Target,
     pub height_a: Target,
@@ -26,7 +27,8 @@ pub struct UpdateNearestCommonAncestorProofOptGadget {
     pub nearest_common_ancestor_index: Target,
     pub old_nearest_common_ancestor_value: HashOutTarget,
     pub new_nearest_common_ancestor_value: HashOutTarget,
-    pub max_height: usize,
+    pub max_merkle_proof_height: usize,
+    pub tree_height: usize,
     pub level_a: Target,
     pub level_b: Target,
     has_witness_nearest_common_ancestor_level: bool,
@@ -40,7 +42,8 @@ impl UpdateNearestCommonAncestorProofOptGadget {
         const D: usize,
     >(
         builder: &mut CircuitBuilder<F, D>,
-        max_height: usize,
+        max_merkle_proof_height: usize,
+        tree_height: usize,
     ) -> Self {
         let height_a = builder.add_virtual_target();
         let height_b = builder.add_virtual_target();
@@ -48,7 +51,8 @@ impl UpdateNearestCommonAncestorProofOptGadget {
 
         let mut gadget = Self::add_virtual_to_full_with_params::<H, F, D>(
             builder,
-            max_height,
+            max_merkle_proof_height,
+            tree_height,
             height_a,
             height_b,
             nearest_common_ancestor_level,
@@ -64,7 +68,8 @@ impl UpdateNearestCommonAncestorProofOptGadget {
         const D: usize,
     >(
         builder: &mut CircuitBuilder<F, D>,
-        max_height: usize,
+        max_merkle_proof_height: usize,
+        tree_height: usize,
         height_a: Target,
         height_b: Target,
         nearest_common_ancestor_level: Target,
@@ -75,32 +80,29 @@ impl UpdateNearestCommonAncestorProofOptGadget {
         let level_b = builder.add_virtual_target();
         let level_a_diff  = builder.sub(level_a, nearest_common_ancestor_level);
         let level_b_diff  = builder.sub(level_b, nearest_common_ancestor_level);
-        builder.range_check(level_a, log2_ceil(max_height));
-        builder.range_check(level_b, log2_ceil(max_height));
-        builder.range_check(nearest_common_ancestor_level, log2_ceil(max_height));
+        builder.range_check(level_a, log2_ceil(tree_height));
+        builder.range_check(level_b, log2_ceil(tree_height));
+        builder.range_check(nearest_common_ancestor_level, log2_ceil(tree_height));
 
 
 
         let child_a =
-            VariableHeightDeltaMerkleProofOptGadget::add_virtual_to_full_with_subtree_root_index::<
+            VariableHeightDeltaMerkleProofInSubTreeGadget::add_virtual_to_full_with_subtree_root_index::<
                 H,
                 F,
                 D,
-            >(builder, max_height, Some(height_a));
+            >(builder, max_merkle_proof_height, tree_height, Some(height_a));
 
         let child_b =
-        VariableHeightDeltaMerkleProofOptGadget::add_virtual_to_full_with_subtree_root_index::<
+        VariableHeightDeltaMerkleProofInSubTreeGadget::add_virtual_to_full_with_subtree_root_index::<
                 H,
                 F,
                 D,
-            >(builder, max_height, Some(height_b));
-
+            >(builder, max_merkle_proof_height, tree_height, Some(height_b));
         let solo_mask = builder.is_not_equal_hash(child_a.new_root, child_b.new_root);
         let level_a_diff_sub_solo = builder.sub(level_a_diff, solo_mask.target);
         let level_b_diff_sub_solo = builder.sub(level_b_diff, solo_mask.target);
 
-        tracing::debug!("📏 level_a_diff_sub_solo: {:?}, height_a: {:?}, level_b_diff_sub_solo: {:?}, height_b: {:?}",
-            level_a_diff_sub_solo, height_a, level_b_diff_sub_solo, height_b);
 
         builder.connect(level_a_diff_sub_solo, height_a);
         builder.connect(level_b_diff_sub_solo, height_b);
@@ -150,7 +152,8 @@ impl UpdateNearestCommonAncestorProofOptGadget {
             nearest_common_ancestor_index: computed_root_index_a,
             old_nearest_common_ancestor_value: computed_old_root,
             new_nearest_common_ancestor_value: computed_new_root,
-            max_height,
+            max_merkle_proof_height,
+            tree_height,
             has_witness_nearest_common_ancestor_level: false,
             has_witness_height_a: false,
             has_witness_height_b: false,
@@ -249,13 +252,14 @@ mod tests {
     }
 
     impl TestUpdateNearestCommonAncestorProofCircuit {
-        pub fn new(max_height: usize) -> Self {
+        pub fn new(max_merkle_proof_height: usize, tree_height: usize) -> Self {
             let config = CircuitConfig::standard_recursion_config();
             let mut builder = CircuitBuilder::<F, D>::new(config);
             let update_nca_gadget =
             UpdateNearestCommonAncestorProofOptGadget::add_virtual_to_full::<PoseidonHash, F, D>(
                     &mut builder,
-                    max_height,
+                    max_merkle_proof_height,
+                    tree_height,
                 );
 
                 builder.register_public_inputs(&[
@@ -569,7 +573,7 @@ mod tests {
     }*/
     #[test]
     fn test_variable_merkle_proof_sub_tree_circuit() {
-        let circuit = TestUpdateNearestCommonAncestorProofCircuit::new(32);
+        let circuit = TestUpdateNearestCommonAncestorProofCircuit::new(32, 32);
         let nca_proofs = (1..32)
             .map(|level| {
                 let mut tree =SimpleMerkleTree::new(level);

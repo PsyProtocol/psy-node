@@ -66,6 +66,7 @@ where
         end_cap_proof_verifier_data_cap_height: usize,
         known_end_cap_fingerprint: QHashOut<C::F>,
         global_user_tree_height: usize,
+        max_guta_nca_merkle_proof_height: usize,
         guta_circuit_whitelist_tree_height: u8,
         checkpoint_tree_height: usize,
     ) -> Self {
@@ -105,7 +106,8 @@ where
             &mut builder,
             a_guta_header,
             b_guta_header,
-            global_user_tree_height as u8,
+            max_guta_nca_merkle_proof_height,
+            global_user_tree_height,
         );
 
         // compute public inputs hash from worker rewards tree tag and child rewards tree value

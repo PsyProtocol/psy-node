@@ -21,12 +21,12 @@ impl TwoNCAStateTransitionGadget {
         builder: &mut CircuitBuilder<F, D>,
         a_header: GlobalUserTreeAggregatorHeaderGadget,
         b_header: GlobalUserTreeAggregatorHeaderGadget,
-        global_user_tree_height: u8,
+        max_merkle_proof_height: usize,
+        tree_height: usize,
     ) -> Self {
         tracing::debug!("🔗 a_header: {:?}, b_header: {:?}", a_header, b_header);
 
-        let update_nca_proof_gadget = UpdateNearestCommonAncestorProofOptGadget::add_virtual_to_full::<H,F,D>(builder, global_user_tree_height as usize);
-
+        let update_nca_proof_gadget = UpdateNearestCommonAncestorProofOptGadget::add_virtual_to_full::<H,F,D>(builder, max_merkle_proof_height, tree_height);
         // TODO: WHY WAS THIS REMOVED, I am adding back!?!!, we need to make sure a and b have the same checkpoint root
         builder.connect_hashes(
             a_header.checkpoint_tree_root,

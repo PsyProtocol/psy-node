@@ -109,6 +109,14 @@ where
         default_user_state_tree_root: QHashOut<C::F>,
         worker_reward_tag: QHashOut<C::F>,
     ) -> Self {
+
+        assert!(global_user_tree_height >= global_user_tree_realm_height, "global_user_tree_height must be >= global_user_tree_realm_height");
+        let coordinator_global_user_tree_height = global_user_tree_height - global_user_tree_realm_height;
+        let max_guta_nca_merkle_proof_height = if global_user_tree_realm_height > coordinator_global_user_tree_height {
+            global_user_tree_realm_height
+        } else {
+            coordinator_global_user_tree_height
+        };
         let verify_single_end_cap = GUTAVerifySingleEndCapCircuit::<C, D>::new(
             end_cap_proof_common_data,
             end_cap_proof_verifier_data_cap_height,
@@ -123,6 +131,7 @@ where
             end_cap_proof_verifier_data_cap_height,
             known_end_cap_fingerprint,
             global_user_tree_height,
+            max_guta_nca_merkle_proof_height,
             guta_circuit_whitelist_tree_height,
             checkpoint_tree_height,
         );
@@ -130,7 +139,7 @@ where
         let guta_proof_common_data: &CommonCircuitData<C::F, D> = verify_two_end_cap.get_common_circuit_data_ref();
         let guta_proof_verifier_data_cap_height: usize = verify_single_end_cap.get_verifier_config_ref().constants_sigmas_cap.height();
 
-        let verify_two_guta = GUTAVerifyTwoGUTACircuit::<C, D>::new(guta_proof_common_data, guta_proof_verifier_data_cap_height, global_user_tree_height, guta_circuit_whitelist_tree_height);
+        let verify_two_guta = GUTAVerifyTwoGUTACircuit::<C, D>::new(guta_proof_common_data, guta_proof_verifier_data_cap_height, global_user_tree_height, max_guta_nca_merkle_proof_height, guta_circuit_whitelist_tree_height);
 
         let verify_left_guta_right_end_cap = GUTAVerifyLeftGUTARightEndCapCircuit::<C, D>::new(
             guta_proof_common_data,
@@ -138,7 +147,8 @@ where
             end_cap_proof_common_data,
             end_cap_proof_verifier_data_cap_height,
             known_end_cap_fingerprint,
-            global_user_tree_height,
+            global_user_tree_height, 
+            max_guta_nca_merkle_proof_height,
             guta_circuit_whitelist_tree_height,
             checkpoint_tree_height,
         );
@@ -149,7 +159,8 @@ where
             end_cap_proof_common_data,
             end_cap_proof_verifier_data_cap_height,
             known_end_cap_fingerprint,
-            global_user_tree_height,
+            global_user_tree_height, 
+            max_guta_nca_merkle_proof_height,
             guta_circuit_whitelist_tree_height,
             checkpoint_tree_height,
         );
@@ -168,7 +179,7 @@ where
         let verify_guta_to_cap = GUTAVerifyGUTAToCapCircuit::<C, D>::new(guta_proof_common_data, guta_proof_verifier_data_cap_height, global_user_tree_realm_height, global_user_tree_height, guta_circuit_whitelist_tree_height);
 
         let verify_two_guta_upgrade_checkpoint =
-            GUTAVerifyTwoGUTAUpgradeCheckpointCircuit::<C, D>::new(guta_proof_common_data, guta_proof_verifier_data_cap_height, global_user_tree_height, guta_circuit_whitelist_tree_height, checkpoint_tree_height);
+            GUTAVerifyTwoGUTAUpgradeCheckpointCircuit::<C, D>::new(guta_proof_common_data, guta_proof_verifier_data_cap_height, global_user_tree_height, max_guta_nca_merkle_proof_height, guta_circuit_whitelist_tree_height, checkpoint_tree_height);
 
         let verify_guta_to_cap_upgrade_checkpoint =
             GUTAVerifyGUTAToCapUpgradeCheckpointCircuit::<C, D>::new(guta_proof_common_data, guta_proof_verifier_data_cap_height, global_user_tree_realm_height, global_user_tree_height, guta_circuit_whitelist_tree_height, checkpoint_tree_height);

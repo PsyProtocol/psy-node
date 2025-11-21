@@ -1,3 +1,4 @@
+use parth_core::utils::math::log2_ceil;
 use plonky2::{
     field::{extension::Extendable, interpolation::barycentric_weights},
     gates::{
@@ -12,7 +13,25 @@ use plonky2::{
 };
 
 use crate::u32::gates::comparison::ComparisonGate;
+pub trait PsyCircuitBuilderGateCountPrinter {
+    fn print_gate_counts(&self);
+    fn print_gate_counts_with_message(&self, message: &str);
+}
 
+impl <C: RichField + Extendable<D>, const D: usize> PsyCircuitBuilderGateCountPrinter for CircuitBuilder<C, D> {
+    fn print_gate_counts(&self) {
+        let num_gates = self.num_gates();
+        let degree = log2_ceil(num_gates);
+        println!("total gate_count: {}, degree: {}", num_gates, degree);
+    }
+    
+    fn print_gate_counts_with_message(&self, message: &str) {
+        
+        let num_gates = self.num_gates();
+        let degree = log2_ceil(num_gates);
+        println!("{} - total gate_count: {}, degree: {}", message, num_gates, degree);
+    }
+}
 /*
 [Common Gate Types List]
 ======================================

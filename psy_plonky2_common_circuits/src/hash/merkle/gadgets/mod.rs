@@ -1,5 +1,6 @@
 pub mod delta_merkle_proof;
 pub mod generic;
+pub mod bits;
 pub mod merkle_proof;
 pub mod historical_root_merkle_proof;
 pub mod merkle_proof_bits;
@@ -14,3 +15,5 @@ pub mod sub_slot_delta_merkle_proof_batch;
 pub mod sub_slot_merkle_proof_batch;
 pub mod merkle_array_gen;
 pub mod variable_height_delta_merkle_proof_opt_v2;
+pub mod variable_height_delta_merkle_proof_sub_tree;
+pub mod variable_height_delta_merkle_proof_v3;

@@ -21,7 +21,7 @@ use psy_data::{
     proof_input::guta::{VerifyTwoGUTAProofUpgradeCheckpointStandardInput, VerifyTwoGUTAProofUpgradeCheckpointStandardInputSimple},
     worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse,
 };
-use psy_plonky2_basic_helpers::{builder::hash::core::CircuitBuilderHashCore, verifier::circuit_library::CircuitInfoLibrary};
+use psy_plonky2_basic_helpers::{builder::{hash::core::CircuitBuilderHashCore, pad_circuit::{PsyCircuitBuilderGateCountPrinter, pad_circuit_degree}}, verifier::circuit_library::CircuitInfoLibrary};
 use psy_plonky2_common_circuits::hash::merkle::gadgets::historical_root_merkle_proof::HistoricalRootMerkleProofGadget;
 use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 
@@ -67,6 +67,7 @@ where
         guta_proof_common_data: &CommonCircuitData<C::F, D>,
         guta_proof_verifier_data_cap_height: usize,
         global_user_tree_height: usize,
+        max_guta_nca_merkle_proof_height: usize,
 
         guta_circuit_whitelist_tree_height: u8,
         checkpoint_tree_height: usize,
@@ -74,12 +75,15 @@ where
         let config = CircuitConfig::standard_recursion_config();
         let mut builder = CircuitBuilder::<C::F, D>::new(config);
 
+        builder.print_gate_counts_with_message("G2GUpgrade start");
         let a_guta_gadget = VerifyGUTAProofGadget::<D>::add_virtual_to::<C, C::F>(
             &mut builder,
             guta_proof_common_data,
             guta_proof_verifier_data_cap_height,
             guta_circuit_whitelist_tree_height,
         );
+        builder.print_gate_counts_with_message("G2GUpgrade after a_guta_gadget");
+
 
         let b_guta_gadget = VerifyGUTAProofGadget::<D>::add_virtual_to::<C, C::F>(
             &mut builder,
@@ -87,18 +91,15 @@ where
             guta_proof_verifier_data_cap_height,
             guta_circuit_whitelist_tree_height,
         );
-
-        tracing::debug!(
-            "🔄 Two GUTA Upgrade Checkpoint - a_guta_gadget: {:?}, b_guta_gadget: {:?}",
-            a_guta_gadget,
-            b_guta_gadget
-        );
+        builder.print_gate_counts_with_message("G2GUpgrade after b_guta_gadget");
 
         let historical_checkpoint_proof_a =
             HistoricalRootMerkleProofGadget::add_virtual_to_zero_gt::<C::Hasher, C::F, D>(&mut builder, checkpoint_tree_height);
+        builder.print_gate_counts_with_message("G2GUpgrade after historical_checkpoint_proof_a");
 
         let historical_checkpoint_proof_b =
             HistoricalRootMerkleProofGadget::add_virtual_to_zero_gt::<C::Hasher, C::F, D>(&mut builder, checkpoint_tree_height);
+        builder.print_gate_counts_with_message("G2GUpgrade after historical_checkpoint_proof_b");
 
         // ensure we are syncing both proofs to the same checkpoint root
         builder.connect_hashes(historical_checkpoint_proof_a.current_root, historical_checkpoint_proof_b.current_root);
@@ -116,6 +117,7 @@ where
 
         let mut b_guta_header =
             b_guta_gadget.get_guta_header::<C::Hasher, C::F>(&mut builder, b_guta_gadget.guta_proof_header_gadget.guta_circuit_whitelist);
+        builder.print_gate_counts_with_message("G2GUpgrade after get_guta_headers");
 
         // ensure that the guta proof headers match our historical checkpoint tree
         // proofs historical roots
@@ -127,13 +129,17 @@ where
         // historical proofs
         a_guta_header.checkpoint_tree_root = historical_checkpoint_proof_a.current_root;
         b_guta_header.checkpoint_tree_root = historical_checkpoint_proof_b.current_root;
+        builder.print_gate_counts_with_message("G2GUpgrade before nca_state_transition_gadget");
 
         let nca_state_transition_gadget = TwoNCAStateTransitionGadget::add_virtual_to::<C::Hasher, C::F, D>(
             &mut builder,
             a_guta_header,
             b_guta_header,
-            global_user_tree_height as u8,
+            max_guta_nca_merkle_proof_height,
+            global_user_tree_height,
         );
+        builder.print_gate_counts_with_message("G2GUpgrade after nca_state_transition_gadget");
+
 
         // compute public inputs hash from worker rewards tree tag and child rewards tree value:
         // left child rewards tree value => The rewards tree value from the left hand proof verified in a_guta_gadget 
@@ -149,12 +155,15 @@ where
                 right_child_proof_rewards_tree_value,
                 worker_rewards_tree_tag_target,
             );
+        builder.print_gate_counts_with_message("G2GUpgrade after public_inputs_hash");
 
         builder.register_public_inputs(&public_inputs_hash.elements);
+        builder.print_gate_counts_with_message("G2GUpgrade after register_public_inputs");
 
         builder.add_gate_to_gate_set(GateRef::new(ConstantGate::new(builder.config.num_constants)));
-        // pad_circuit_degree(&mut builder, 12);
+        builder.print_gate_counts_with_message("G2GUpgrade before build");
         let circuit_data = builder.build::<C>();
+        println!("common_data_verify_two_guta_upgrade_checkpoint: {:?}", circuit_data.common);
 
         let fingerprint = QHashOut(get_circuit_fingerprint_generic(&circuit_data.verifier_only));
 
