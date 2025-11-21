@@ -6,7 +6,7 @@ use parth_core::{
     crypto::hash::{merkle_proof::DeltaMerkleProofCore, nca::nca_proof::PartialUpdateNearestCommonAncestorProof, traits::QFieldHashable},
     felt::ZeroableFelt,
     pgoldilocks::PoseidonHasher,
-    protocol::core_types::{QNetworkTreeCircuitConstants, QNetworkTreeConstants},
+    protocol::core_types::{QNetworkTreeCircuitSpecificConstants, QNetworkTreeConstants},
     PHash, PF,
 };
 use plonky2::{

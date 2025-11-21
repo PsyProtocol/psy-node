@@ -13,3 +13,4 @@ pub mod worker;
 pub mod gatherer_builders;
 pub mod prepared_block;
 pub mod rewards_tree;
+pub mod config;

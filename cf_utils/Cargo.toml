@@ -16,3 +16,5 @@ async-trait      = { workspace = true }
 hex = { workspace = true }
 hex-literal = { workspace = true }
 rand = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true }
+tracing = { workspace = true }

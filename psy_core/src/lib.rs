@@ -3,3 +3,4 @@ pub mod job;
 pub mod constants;
 pub mod user_id;
 pub mod worker;
+pub mod network_config;

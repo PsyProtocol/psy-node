@@ -48,6 +48,21 @@ impl Secp256K1WalletProvider for MemorySecp256K1Wallet {
 
 }
 
+pub fn get_public_key_for_secp256k1_private_key(private_key: Hash256) -> anyhow::Result<CompressedPublicKey> {
+    let signing_key = k256::ecdsa::SigningKey::from_slice(&private_key.0)?;
+    let public_key = signing_key
+        .verifying_key()
+        .to_encoded_point(true)
+        .to_bytes();
+    let mut compressed = [0u8; 33];
+    if public_key.len() == 33 {
+        compressed.copy_from_slice(&public_key);
+    } else {
+        anyhow::bail!("public key length is not 33")
+    }
+    let pub_compressed = CompressedPublicKey(compressed);
+    Ok(pub_compressed)
+}
 impl MemorySecp256K1Wallet {
     pub fn new() -> Self {
         Self {
@@ -56,27 +71,10 @@ impl MemorySecp256K1Wallet {
     }
     pub fn add_private_key(&mut self, private_key: Hash256) -> anyhow::Result<CompressedPublicKey> {
         let signing_key = k256::ecdsa::SigningKey::from_slice(&private_key.0)?;
-        let pub_compressed = self.get_public_key(private_key)?;
+        let pub_compressed = get_public_key_for_secp256k1_private_key(private_key)?;
         self.key_map.insert(pub_compressed, signing_key);
         Ok(pub_compressed)
     }
-
-    pub fn get_public_key(&self, private_key: Hash256) -> anyhow::Result<CompressedPublicKey> {
-        let signing_key = k256::ecdsa::SigningKey::from_slice(&private_key.0)?;
-        let public_key = signing_key
-            .verifying_key()
-            .to_encoded_point(true)
-            .to_bytes();
-        let mut compressed = [0u8; 33];
-        if public_key.len() == 33 {
-            compressed.copy_from_slice(&public_key);
-        } else {
-            anyhow::bail!("public key length is not 33")
-        }
-        let pub_compressed = CompressedPublicKey(compressed);
-        Ok(pub_compressed)
-    }
-
     pub fn get_private_key(&self, public_key: CompressedPublicKey) -> anyhow::Result<k256::ecdsa::SigningKey> {
         self.key_map.get(&public_key).cloned().ok_or(anyhow::format_err!("private key not found"))
     }

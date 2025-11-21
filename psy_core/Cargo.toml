@@ -10,6 +10,7 @@ serialize_rkyv = ["dep:rkyv","pser/serialize_rkyv", "parth_core/serialize_rkyv"]
 serialize_speedy = ["dep:speedy", "pser/serialize_speedy", "parth_core/serialize_speedy"]
 serialize_postcard = ["dep:postcard", "pser/serialize_postcard", "parth_core/serialize_postcard"]
 serialize_bytemuck = ["dep:bytemuck", "parth_core/serialize_bytemuck"]
+clap_cli = ["dep:clap"]
 
 [dependencies]
 postcard = { workspace = true, optional = true }
@@ -32,6 +33,7 @@ auto_impl = { workspace = true }
 strum = { workspace = true }
 strum_macros = { workspace = true }
 ts-rs = { workspace = true }
+clap = { workspace = true, optional = true }
 
 # start local packages
 parth_core = { workspace = true }

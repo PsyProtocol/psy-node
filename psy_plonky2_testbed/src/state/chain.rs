@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use parth_core::{
-    pgoldilocks::{PoseidonHasher, QHashOut}, protocol::core_types::{QNetworkDatabaseTypes, QNetworkHashTypes, QNetworkTreeCircuitConstants, QNetworkTreeConstants}, PHash, PF
+    pgoldilocks::{PoseidonHasher, QHashOut}, protocol::core_types::{QNetworkDatabaseTypes, QNetworkHashTypes, QNetworkTreeCircuitSpecificConstants, QNetworkTreeConstants}, PHash, PF
 };
 use plonky2::{field::goldilocks_field::GoldilocksField, hash::hash_types::HashOut};
 use psy_node_core::
@@ -47,14 +47,23 @@ type InMemoryTestStore = InMemoryCoreStore<ExHash, ExHasher>;
 
 #[derive(Debug, Copy, Clone)]
 pub struct SimpleTestNetworkConfig;
-impl QNetworkTreeCircuitConstants for SimpleTestNetworkConfig {
+impl QNetworkTreeCircuitSpecificConstants for SimpleTestNetworkConfig {
     const GUTA_CIRCUIT_WHITELIST_TREE_HEIGHT: u8 = 4;
     const MAX_USERS_TO_REGISTER_PER_PROOF: usize = 32;
     const ONLY_REGISTER_USERS_MAX_USERS_PER_PROOF: usize = 64;
     const BATCH_USER_REGISTRATION_SUB_TREE_HEIGHT: usize = 8; 
     const BATCH_USER_REGISTRATION_MAX_SUB_TREES: usize = 4; 
     const BATCH_DEPLOY_CONTRACT_SUB_TREE_HEIGHT: usize = 8;
-    const CHAIN_ID: u32 = 0;
+    const DEFAULT_USER_STATE_TREE_ROOT_HASH_U64_X4: [u64; 4] = [
+        3896366420105793420,
+        17410332186442776169,
+        7329967984378645716,
+        6310665049578686403,
+    ];
+    
+    const END_CAP_CIRCUIT_FINGERPRINT_HASH_U64_X4: [u64; 4] = [
+        12754715765406858642, 4612576616381317529, 4116425460980992551, 3077498283916326135
+    ];
 }
 
 impl QNetworkTreeConstants for SimpleTestNetworkConfig {
