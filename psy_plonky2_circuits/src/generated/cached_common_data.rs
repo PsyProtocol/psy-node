@@ -10,7 +10,7 @@ where
 {
     let serialized_library =
         serde_json::from_str::<SerializedGenericCircuitCommonDataLibraryInfo>(
-            r#"{"common_data_hashes":["12860115dfe70452b3f307ea1fe95b1bb5b307d48f5fc5f86a8ecc7001cb33b0","3b9a3c7259d1caf79e1cc42f1a04416b753b58cc85f4458ef8321dc3f3ad11b1","7ea492b556ffc919706ac50511cadc6c6b3b38afe4810c7b5ef3320652b50f0e","f565b4841e413ae2d56d01e977f1ec9c04ba1181437bf7be419f0db52fe3734f","acd2052c5f2d49c2a931d3c8545876e51ce9c42ca1f7713d46cdac5e2e0f7f19","eec4c6cb63b9ec4d6a77e8d9572689ee579e9e22dc2c6575e3101ce621649d6d"],"common_circuit_list":[[226],[227],[228,40,6],[229],[9,15,14,13,8,12,7,56,55,10,11],[54,48,32,19,0,1,37,18]]}"#
+            r#"{"common_data_hashes":["12860115dfe70452b3f307ea1fe95b1bb5b307d48f5fc5f86a8ecc7001cb33b0","3b9a3c7259d1caf79e1cc42f1a04416b753b58cc85f4458ef8321dc3f3ad11b1","7ea492b556ffc919706ac50511cadc6c6b3b38afe4810c7b5ef3320652b50f0e","f565b4841e413ae2d56d01e977f1ec9c04ba1181437bf7be419f0db52fe3734f","acd2052c5f2d49c2a931d3c8545876e51ce9c42ca1f7713d46cdac5e2e0f7f19","eec4c6cb63b9ec4d6a77e8d9572689ee579e9e22dc2c6575e3101ce621649d6d","b059680ec0b888ceb414f1f53083c524c512f98688de3d5bf8e7fbc1b6b5d008"],"common_circuit_list":[[226],[227],[32,228,37,6],[229],[8,7,11,14,9,56,10,15,12,13,55],[18,0,48,54,19,1],[40]]}"#
         ).unwrap();
 
     GenericCircuitCommonDataLibrary::<C, D>::from_serialized(

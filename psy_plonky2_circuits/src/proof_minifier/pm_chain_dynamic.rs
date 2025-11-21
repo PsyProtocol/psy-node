@@ -16,8 +16,7 @@ pub struct QEDProofMinifierDynamicChain<
     const D: usize,
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
-> where
-    <C as GenericConfig<D>>::Hasher:AlgebraicHasher<F>,
+>
 {
     pub minifiers: Vec<QEDProofMinifierDynamic<D, F, C>>,
 }

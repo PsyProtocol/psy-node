@@ -23,8 +23,7 @@ pub struct QEDProofMinifierDynamic<
     const D: usize,
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
-> where
-    <C as GenericConfig<D>>::Hasher:AlgebraicHasher<F>,
+> 
 {
     pub circuit_data: CircuitData<F, C, D>,
     pub circuit_fingerprint: HashOut<F>,

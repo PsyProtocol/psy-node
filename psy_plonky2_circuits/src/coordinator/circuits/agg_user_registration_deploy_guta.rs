@@ -83,7 +83,7 @@ where
             guta_verifier_data_cap_height,
             guta_circuit_whitelist_tree_height,
             guta_circuit_whitelist_root,
-            true,
+            false,
         )
     }
     pub fn new_with_config(

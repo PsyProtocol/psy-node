@@ -16,7 +16,7 @@ use psy_plonky2_basic_helpers::{
    
 };
 use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
-use crate::{coordinator::gadgets::{checkpoint_state_transition::CheckpointStateTransitionPublicInputsGadget, recursive_checkpoint_state_transition_verify::VerifyRecursiveCheckpointStateTransitionProofGadget}, proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{QPsyNetworkCircuitWithType, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QStandardCircuitProvableWithRawProofsAndRefLibrary, proof_store::QProofStoreReaderAsync}, utils::proof_serialization::deserialize_plonky2_proof};
+use crate::{coordinator::gadgets::{checkpoint_state_transition::CheckpointStateTransitionPublicInputsGadget, recursive_checkpoint_state_transition_verify::VerifyRecursiveCheckpointStateTransitionProofGadget}, proof_minifier::{pm_chain_dynamic::QEDProofMinifierDynamicChain, pm_core::get_circuit_fingerprint_generic}, qstandard::{QPsyNetworkCircuitWithType, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QStandardCircuitProvableWithRawProofsAndRefLibrary, proof_store::QProofStoreReaderAsync}, utils::proof_serialization::deserialize_plonky2_proof};
 
 use crate::coordinator::gadgets::{
     checkpoint_state_transition::CheckpointStateTransitionCoreGadget,
@@ -34,8 +34,11 @@ pub struct QEDCheckpointStateTransitionCircuit<C: GenericConfig<D>, const D: usi
 
     
 
-    pub circuit_data: CircuitData<C::F, C, D>,
-    pub fingerprint: QHashOut<C::F>,
+    pub base_circuit_data: CircuitData<C::F, C, D>,
+    pub base_fingerprint: QHashOut<C::F>,
+
+    pub minifier_chain: Option<QEDProofMinifierDynamicChain<D, C::F, C>>,
+    pub enable_minifier: bool,
 }
 
 impl<C: GenericConfig<D>, const D: usize> QPsyNetworkCircuitWithType for QEDCheckpointStateTransitionCircuit<C, D>
@@ -55,8 +58,20 @@ where
         checkpoint_state_transition_genesis_common_data: &CommonCircuitData<C::F, D>,
         checkpoint_state_transition_genesis_verifier_data_cap_height: usize,
         known_checkpoint_state_transition_genesis_fingerprint: QHashOut<C::F>,
-
         checkpoint_tree_height: usize,
+    ) -> Self {
+        Self::new_with_config(part_1_common_data, part_1_verifier_data_cap_height, known_part_1_fingerprint, checkpoint_state_transition_genesis_common_data, checkpoint_state_transition_genesis_verifier_data_cap_height, known_checkpoint_state_transition_genesis_fingerprint, checkpoint_tree_height, true)
+    }
+    pub fn new_with_config(
+        part_1_common_data: &CommonCircuitData<C::F, D>,
+        part_1_verifier_data_cap_height: usize,
+        known_part_1_fingerprint: QHashOut<C::F>,
+        checkpoint_state_transition_genesis_common_data: &CommonCircuitData<C::F, D>,
+        checkpoint_state_transition_genesis_verifier_data_cap_height: usize,
+        known_checkpoint_state_transition_genesis_fingerprint: QHashOut<C::F>,
+        checkpoint_tree_height: usize,
+
+        has_minifier: bool,
     ) -> Self {
         let config = CircuitConfig::standard_recursion_config();
         let mut builder = CircuitBuilder::<C::F, D>::new(config);
@@ -124,19 +139,30 @@ where
 
         builder.register_public_inputs(&public_inputs_hash.elements);
         builder.add_qed_type_d_common_gates();
-        let circuit_data = builder.build::<C>();
+        let base_circuit_data = builder.build::<C>();
 
-        let fingerprint = QHashOut(get_circuit_fingerprint_generic(&circuit_data.verifier_only));
+        let base_fingerprint = QHashOut(get_circuit_fingerprint_generic(&base_circuit_data.verifier_only));
 
+        let minifier_chain = if has_minifier {
+            Some(QEDProofMinifierDynamicChain::<D, C::F, C>::new_with_dynamic_constant_verifier(
+                &base_circuit_data.verifier_only,
+                &base_circuit_data.common,
+                &[false, false],
+            ))
+        } else {
+            None
+        };
         Self {
-            circuit_data,
+            base_circuit_data,
             child_proofs_gadget,
             verify_previous_checkpoint_proof_gadget,
             core_checkpoint_gadget,
             worker_rewards_tree_tag_target,
             genesis_checkpoint_state_transition_hash,
             checkpoint_state_transition_circuit_fingerprint,
-            fingerprint,
+            base_fingerprint,
+            minifier_chain,
+            enable_minifier: has_minifier,
         }
     }
 
@@ -185,7 +211,13 @@ where
             previous_checkpoint_state_transition_proof,
             previous_checkpoint_state_transition_verifier_data,
         )?;
-        self.circuit_data.prove(pw)
+        let base_proof = self.base_circuit_data.prove(pw)?;
+        
+        if self.enable_minifier {
+            self.minifier_chain.as_ref().unwrap().prove(&base_proof)
+        } else {
+            Ok(base_proof)
+        }
     }
 }
 
@@ -195,15 +227,27 @@ where
     C::Hasher: AlgebraicHasher<C::F>,
 {
     fn get_fingerprint(&self) -> QHashOut<C::F> {
-        self.fingerprint
+        if self.enable_minifier {
+            QHashOut(self.minifier_chain.as_ref().unwrap().get_fingerprint())
+        } else {
+            self.base_fingerprint
+        }
     }
 
     fn get_verifier_config_ref(&self) -> &VerifierOnlyCircuitData<C, D> {
-        &self.circuit_data.verifier_only
+        if self.enable_minifier {
+            self.minifier_chain.as_ref().unwrap().get_verifier_data()
+        } else {
+            &self.base_circuit_data.verifier_only
+        }
     }
 
     fn get_common_circuit_data_ref(&self) -> &CommonCircuitData<C::F, D> {
-        &self.circuit_data.common
+        if self.enable_minifier {
+            self.minifier_chain.as_ref().unwrap().get_common_data()
+        } else {
+            &self.base_circuit_data.common
+        }
     }
 }
 
