@@ -28,6 +28,7 @@ members = [
     "psy_worker_core",
     "psy_api_core",
     "psy_cli/psy_worker_cli",
+    "psy_cli/psy_node_cli",
 ]
 resolver = "2"
 

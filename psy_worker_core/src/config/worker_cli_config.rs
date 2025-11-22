@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkerCliConfig {
     pub user: Option<u64>,
+    pub completed_jobs_log_file: Option<String>,
     pub network: Option<PsyNetworkTypeInput>,
+    pub private_key: Option<String>,
     pub coordinator_api_urls: Vec<String>,
     pub realm_api_urls: Vec<String>,
 }
@@ -53,6 +55,8 @@ mod tests {
     fn test_worker_cli_config_serialization() {
         let config = WorkerCliConfig {
             user: Some(42),
+            private_key: None,
+            completed_jobs_log_file: None,
             network: Some(PsyNetworkTypeInput::LocalDevnet),
             coordinator_api_urls: vec!["http://localhost:8000".to_string()],
             realm_api_urls: vec!["http://localhost:9000".to_string()],

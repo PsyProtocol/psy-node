@@ -21,3 +21,8 @@ pub use psy_public_testnet::*;
 
 mod psy_mainnet;
 pub use psy_mainnet::*;
+
+
+
+mod circuit_config_gen;
+pub use circuit_config_gen::get_circuit_config_for_network;

@@ -13,3 +13,4 @@ pub mod nca_planner;
 pub mod p2p;
 
 pub mod test_helpers;
+pub mod config;

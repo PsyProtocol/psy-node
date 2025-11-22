@@ -1,24 +1,14 @@
-use std::{
-    fs,
-    path::{Path, PathBuf},
-    str::FromStr,
-    sync::Arc,
-    time::Duration,
-};
 
-use plonky2::{
-    field::{goldilocks_field::GoldilocksField, types::Field},
-    hash::hash_types::HashOut,
-    plonk::config::GenericHashOut,
-};
-use psy_core::constants::chain_id::PsyNetworkTypeInput;
-use tokio::{sync::Mutex, time::sleep};
+use cf_utils::option::resolve_one_of_two_options_or_error;
+use plonky2::
+    plonk::config::PoseidonGoldilocksConfig
+;
+use psy_core::constants::chain_id::{PsyChainNetworkType, PsyNetworkTypeInput};
+use psy_plonky2_circuits::circuit_library::get_simple_proof_miner_worker_for_network;
+use psy_worker_core::config::{worker_cli_config::WorkerCliConfig, worker_config::WorkerStartupConfig};
 use tracing::{error, info};
 
 
-type C = plonky2::plonk::config::PoseidonGoldilocksConfig;
-const D: usize = 2;
-type F = GoldilocksField;
 
 fn print_banner() {
     println!(
@@ -47,29 +37,54 @@ fn print_banner() {
     );
 }
 
-pub async fn run_worker_inner() -> anyhow::Result<()> {
+pub async fn run_worker_inner(network: PsyChainNetworkType, config: WorkerStartupConfig) -> anyhow::Result<()> {
     // Placeholder for actual worker logic
-    loop {
-        info!("Worker is running...");
-        sleep(Duration::from_secs(5)).await;
-    }
+    
+    type C = PoseidonGoldilocksConfig;
+    const D: usize = 2;
+    let worker = get_simple_proof_miner_worker_for_network::<C, D>(network, config).await?;
+
+    worker.run_worker_loop(100).await?;
     Ok(())
 }
 
 pub async fn run(
     config: String,
     private_key: Option<String>,
-    keystore_path: Option<String>,
-    wallet_password: Option<String>,
+    _keystore_path: Option<String>,
+    _wallet_password: Option<String>,
     recipient: Option<u64>,
     network: Option<PsyNetworkTypeInput>,
 ) -> anyhow::Result<()> {
     print_banner();
     info!("Worker starting...");
     info!("Loading config from: {}", config);
+    let config_data = WorkerCliConfig::load_from_file(&config).await?;
+
+    let network: PsyChainNetworkType = resolve_one_of_two_options_or_error::<PsyNetworkTypeInput>(&network, &config_data.network, "Network configuration is required")?.into();
+    let user_id = resolve_one_of_two_options_or_error::<u64>(&recipient, &config_data.user, "User ID of miner is required")?;
+    let private_key_string = resolve_one_of_two_options_or_error::<String>(&private_key, &config_data.private_key, "API Private key for miner is required")?;
+    let private_key_bytes = hex::decode(private_key_string.trim_start_matches("0x"))?;
+    if private_key_bytes.len() != 32 {
+        anyhow::bail!("Private key must be 32 bytes (64 hex characters)");
+    }
+    let private_key_bytes: [u8; 32] = private_key_bytes.try_into().map_err(|_| anyhow::anyhow!("private key must be 32 bytes (64 hex characters)"))?;
+    let config = WorkerStartupConfig {
+        miner_user_id: user_id,
+        network: network,
+        private_key: private_key_bytes,
+        worker_completed_jobs_log_file_path: config_data.completed_jobs_log_file.clone(),
+        coordinator_api_urls: config_data.coordinator_api_urls,
+        realm_api_urls: config_data.realm_api_urls,
+    };
+    info!("Using network: {:?}", network);
+
+
+
+
     let mut handles = Vec::new();
 
-    let handle = tokio::spawn(run_worker_inner());
+    let handle = tokio::spawn(run_worker_inner(network, config));
     handles.push(handle);
     /* 
 

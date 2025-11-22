@@ -62,6 +62,31 @@ impl<
             _phantom_hasher: std::marker::PhantomData,
         }
     }
+    pub async fn new_with_backup_file_path(api_signer: Signer, api_signer_public_key: CompressedPublicKey, user_id: u64, url_rotation_strategy: APIURLRotationStrategy, backup_file_path: Option<String>) -> Self {
+        let backup_file = if let Some(path) = backup_file_path {
+            match tokio::fs::OpenOptions::new().create(true).append(true).open(path).await {
+                Ok(file) => Some(file),
+                Err(e) => {
+                    println!("Failed to open backup file: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        Self {
+            realm_api_url_manager: PsyWorkerAPIURLManager::new(url_rotation_strategy),
+            coordinator_api_url_manager: PsyWorkerAPIURLManager::new(url_rotation_strategy),
+            is_in_realm_mode: AtomicBool::new(true),
+            completed_jobs: Arc::new(RwLock::new(Vec::new())),
+            reward_preimage_map: DashMap::new(),
+            backup_file,
+            api_signer: Arc::new(api_signer),
+            api_signer_public_key: api_signer_public_key,
+            user_id,
+            _phantom_hasher: std::marker::PhantomData,
+        }
+    }
     pub fn get_random_reward_tree_tag_for_job_id(&self) -> (Hash, Hash) {
         let random_a = rand::random::<u64>();
         let random_b = rand::random::<u64>();
