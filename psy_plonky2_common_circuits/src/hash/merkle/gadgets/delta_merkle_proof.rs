@@ -460,6 +460,50 @@ impl DeltaMerkleProofGadget {
         }
         Ok(())
     }
+    pub fn set_witness_pad_siblings<W: Witness<F>, F: Field>(
+        &self,
+        witness: &mut W,
+        index: F,
+        old_value: QHashOut<F>,
+        new_value: QHashOut<F>,
+        siblings: &[QHashOut<F>],
+    ) -> anyhow::Result<()> {
+        if !self
+            .option_flags
+            .contains(DeltaMerkleProofGadgetOptionFlags::index)
+        {
+            witness.set_target(self.index, index)?;
+        }
+        if !self
+            .option_flags
+            .contains(DeltaMerkleProofGadgetOptionFlags::old_value)
+        {
+            witness.set_hash_target(self.old_value, old_value.0)?;
+        }
+        if !self
+            .option_flags
+            .contains(DeltaMerkleProofGadgetOptionFlags::siblings)
+        {
+            assert!(siblings.len() <= self.siblings.len(), "Provided siblings length {} exceeds gadget siblings length {}", siblings.len(), self.siblings.len());
+            
+            for (i, sibling) in siblings.iter().enumerate() {
+                witness.set_hash_target(self.siblings[i], sibling.0)?;
+            }
+
+            let pad_len = self.siblings.len() - siblings.len();
+            let pad_start_index = siblings.len();
+            for i in 0..pad_len {
+                witness.set_hash_target(self.siblings[pad_start_index + i], HashOut::<F>::ZERO)?;
+            }
+        }
+        if !self
+            .option_flags
+            .contains(DeltaMerkleProofGadgetOptionFlags::new_value)
+        {
+            witness.set_hash_target(self.new_value, new_value.0)?;
+        }
+        Ok(())
+    }
 
     pub fn set_witness_hash_out<W: Witness<F>, F: Field>(
         &self,

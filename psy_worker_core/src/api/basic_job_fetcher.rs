@@ -17,8 +17,7 @@ use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 use tokio::{io::AsyncWriteExt, sync::RwLock};
 
 use crate::{
-    api::url_manager::{APIURLRotationStrategy, PsyWorkerAPIURLManager},
-    worker::prover_trait::PsyWorkerJobFetcher,
+    api::url_manager::{APIURLRotationStrategy, PsyWorkerAPIURLManager}, utils::time::get_current_time_ms, worker::prover_trait::PsyWorkerJobFetcher
 };
 
 const API_REQUEST_SIGNATURE_VALID_DURATION_MS: u64 = 30000; // 30 seconds
@@ -36,11 +35,6 @@ pub struct PsyWorkerBasicAPIJobFetcher<Hash, JobId: std::hash::Hash + Eq, Signer
     _phantom_hasher: std::marker::PhantomData<Hasher>,
 }
 
-pub fn get_current_time_ms() -> u64 {
-    let now = std::time::SystemTime::now();
-    let since_epoch = now.duration_since(std::time::UNIX_EPOCH).unwrap();
-    since_epoch.as_millis() as u64
-}
 
 impl<
         Hash: Q256BitHash + serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
@@ -128,6 +122,7 @@ impl<
                 let data = claim_metadata.psy_ser_to_bytes_vec()?;
                 let mut backup_file = self.backup_file.as_ref().unwrap().try_clone().await?;
                 backup_file.write_all(&data).await?;
+                backup_file.flush().await?;
             }
         }
         Ok(())

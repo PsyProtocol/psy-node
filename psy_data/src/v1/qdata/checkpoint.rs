@@ -50,8 +50,8 @@ impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for PQEDCheckpointLeafStats<
 }
 
 impl<F: QFelt64, Hash: Q256BitHash> PsyCanonicalSerializeMetadata for PQEDCheckpointLeafStats<F, Hash> {
-    const IS_FIXED_SIZE: bool = false;
-    const FIXED_SIZE: usize = 0; // 3 * 8 bytes for F = QFelt64
+    const IS_FIXED_SIZE: bool = true;
+    const FIXED_SIZE: usize = 4*8 + PPMJobsCompletedStats::<F>::FIXED_SIZE + 8 + 32 + PPMRewardCommitment::<Hash>::FIXED_SIZE + (DA_CHALLENGE_WINDOW * 8);
 }
 impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for PQEDCheckpointLeafStats<F, Hash> {
     fn fallback_pio_serialized_size(&self) -> usize {
@@ -254,7 +254,7 @@ pser::impl_bytemuck_ffs_tests!(
 
 impl<Hash: Q256BitHash> PsyCanonicalSerializeMetadata for PQEDCheckpointGlobalStateRoots<Hash> {
     const IS_FIXED_SIZE: bool = true;
-    const FIXED_SIZE: usize = 160;
+    const FIXED_SIZE: usize = 32*5;
 }
 impl<Hash: Q256BitHash> AutoDatabaseSerializationUseFastFixedSerialize<160> for PQEDCheckpointGlobalStateRoots<Hash> {}
 psy_serialize::impl_psy_canonical_serialize_for_fixed_type!(
@@ -407,8 +407,8 @@ impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for PQEDCheckpointLeaf<F, Ha
 }
 
 impl<F: QFelt64, Hash: Q256BitHash> PsyCanonicalSerializeMetadata for PQEDCheckpointLeaf<F, Hash> {
-    const IS_FIXED_SIZE: bool = false;
-    const FIXED_SIZE: usize = 0;
+    const IS_FIXED_SIZE: bool = true;
+    const FIXED_SIZE: usize = 32 + PQEDCheckpointLeafStats::<F, Hash>::FIXED_SIZE;
 }
 impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for PQEDCheckpointLeaf<F, Hash> {
     fn fallback_pio_serialized_size(&self) -> usize {
@@ -656,9 +656,11 @@ pub struct QEDL2BlockState {
     pub next_add_withdrawal_id: u64,
     pub next_process_withdrawal_id: u64,
     pub next_deposit_id: u64,
+
     pub total_deposits_claimed_epoch: u64,
     pub next_user_id: u64,
     pub end_balance: u64,
+
     pub next_contract_id: u32,
 }
 impl QPGenRandom for QEDL2BlockState {
@@ -679,7 +681,7 @@ impl_qpq_serialize_bincode!(QEDL2BlockState);
 
 impl FallbackPsySerializeCanonical for QEDL2BlockState {
     fn fallback_pio_serialized_size(&self) -> usize {
-        60
+        8*7 + 4
     }
     
     fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
@@ -720,8 +722,8 @@ impl FallbackPsySerializeCanonical for QEDL2BlockState {
 
 }
 impl PsyCanonicalSerializeMetadata for QEDL2BlockState {
-    const IS_FIXED_SIZE: bool = false;
-    const FIXED_SIZE: usize = 0;
+    const IS_FIXED_SIZE: bool = true;
+    const FIXED_SIZE: usize = 8*7 + 4;
     const MAX_VEC_LENGTH: usize = 16_777_216; // max ~16 million block headers in one sync message
     
 }

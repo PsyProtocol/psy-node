@@ -36,7 +36,7 @@ impl QNetworkTreeCircuitSpecificConstantsData {
         }
     }
 }
-pub trait QNetworkTreeCircuitSpecificConstants: Sized + Send + Sync + Copy + Clone {
+pub trait QNetworkTreeCircuitSpecificConstants: Sized + Send + Sync + Clone {
     const GUTA_CIRCUIT_WHITELIST_TREE_HEIGHT: u8;
     const MAX_USERS_TO_REGISTER_PER_PROOF: usize;
     const ONLY_REGISTER_USERS_MAX_USERS_PER_PROOF: usize;
@@ -97,7 +97,7 @@ impl QNetworkTreeConstantsData {
     }
 }
 
-pub trait QNetworkTreeConstants: Sized + Send + Sync + Copy + Clone {
+pub trait QNetworkTreeConstants: Sized + Send + Sync + Clone {
     
     const CHECKPOINT_TREE_HEIGHT_USIZE: usize;
     const CHECKPOINT_TREE_HEIGHT: u8;
@@ -131,9 +131,6 @@ pub trait QNetworkTreeConstants: Sized + Send + Sync + Copy + Clone {
 }
 
 
-pub trait QNetworkHashConstants: Sized + Send + Sync + Copy + Clone {
-    const DEFUALT_USER_STATE_TREE_ROOT_HASH_U64_X4: [u64; 4];
-}
 #[pderive::serialize_copy_ts_export]
 pub struct QNetworkCircuitConstantsData {
     pub tree_constants: QNetworkTreeConstantsData,
@@ -154,6 +151,55 @@ pub trait QNetworkCircuitConstants: QNetworkTreeCircuitSpecificConstants + QNetw
 impl<T: QNetworkTreeCircuitSpecificConstants + QNetworkTreeConstants> QNetworkCircuitConstants for T {}
 
 
-pub trait QNetworkConstants: QNetworkCircuitConstants + QNetworkHashConstants {
+pub trait QNetworkConstants: QNetworkCircuitConstants + QNetworkTreeCircuitSpecificConstants {
 }
-impl<T: QNetworkCircuitConstants + QNetworkHashConstants> QNetworkConstants for T {}
+impl<T: QNetworkCircuitConstants + QNetworkTreeCircuitSpecificConstants> QNetworkConstants for T {}
+
+pub trait QNetworkConstantsCopier: Sized + Send + Sync + Clone {
+    type CopySource: QNetworkConstants + 'static;
+
+}
+impl<T: QNetworkConstantsCopier> QNetworkTreeCircuitSpecificConstants for T {
+    const GUTA_CIRCUIT_WHITELIST_TREE_HEIGHT: u8 = T::CopySource::GUTA_CIRCUIT_WHITELIST_TREE_HEIGHT;
+
+    const MAX_USERS_TO_REGISTER_PER_PROOF: usize = T::CopySource::MAX_USERS_TO_REGISTER_PER_PROOF;
+
+    const ONLY_REGISTER_USERS_MAX_USERS_PER_PROOF: usize = T::CopySource::ONLY_REGISTER_USERS_MAX_USERS_PER_PROOF;
+
+    const BATCH_USER_REGISTRATION_SUB_TREE_HEIGHT: usize = T::CopySource::BATCH_USER_REGISTRATION_SUB_TREE_HEIGHT;
+    const BATCH_USER_REGISTRATION_MAX_SUB_TREES: usize = T::CopySource::BATCH_USER_REGISTRATION_MAX_SUB_TREES;
+
+    const BATCH_DEPLOY_CONTRACT_SUB_TREE_HEIGHT: usize = T::CopySource::BATCH_DEPLOY_CONTRACT_SUB_TREE_HEIGHT;
+
+    const DEFAULT_USER_STATE_TREE_ROOT_HASH_U64_X4: [u64; 4] = T::CopySource::DEFAULT_USER_STATE_TREE_ROOT_HASH_U64_X4;
+
+    const END_CAP_CIRCUIT_FINGERPRINT_HASH_U64_X4: [u64; 4] = T::CopySource::END_CAP_CIRCUIT_FINGERPRINT_HASH_U64_X4;
+}
+
+impl<T: QNetworkConstantsCopier> QNetworkTreeConstants for T {
+    const CHECKPOINT_TREE_HEIGHT_USIZE: usize = T::CopySource::CHECKPOINT_TREE_HEIGHT_USIZE;
+    const CHECKPOINT_TREE_HEIGHT: u8 = T::CopySource::CHECKPOINT_TREE_HEIGHT;
+
+    const GLOBAL_USER_TREE_HEIGHT_USIZE: usize = T::CopySource::GLOBAL_USER_TREE_HEIGHT_USIZE;
+    const GLOBAL_USER_TREE_HEIGHT: u8 = T::CopySource::GLOBAL_USER_TREE_HEIGHT;
+
+    const GLOBAL_CONTRACT_TREE_HEIGHT_USIZE: usize = T::CopySource::GLOBAL_CONTRACT_TREE_HEIGHT_USIZE;
+    const GLOBAL_CONTRACT_TREE_HEIGHT: u8 = T::CopySource::GLOBAL_CONTRACT_TREE_HEIGHT;
+
+    const CONTRACT_FUNCTION_TREE_HEIGHT_USIZE: usize = T::CopySource::CONTRACT_FUNCTION_TREE_HEIGHT_USIZE;
+    const CONTRACT_FUNCTION_TREE_HEIGHT: u8 = T::CopySource::CONTRACT_FUNCTION_TREE_HEIGHT;
+
+    const COORDINATOR_GLOBAL_USER_TREE_HEIGHT_USIZE: usize = T::CopySource::COORDINATOR_GLOBAL_USER_TREE_HEIGHT_USIZE;
+    const COORDINATOR_GLOBAL_USER_TREE_HEIGHT: u8 = T::CopySource::COORDINATOR_GLOBAL_USER_TREE_HEIGHT;
+
+    const REALM_GLOBAL_USER_TREE_HEIGHT_USIZE: usize = T::CopySource::REALM_GLOBAL_USER_TREE_HEIGHT_USIZE;
+    const REALM_GLOBAL_USER_TREE_HEIGHT: u8 = T::CopySource::REALM_GLOBAL_USER_TREE_HEIGHT;
+
+    const MAX_CONTRACT_STATE_TREE_HEIGHT_USIZE: usize = T::CopySource::MAX_CONTRACT_STATE_TREE_HEIGHT_USIZE;
+    const MAX_CONTRACT_STATE_TREE_HEIGHT: u8 = T::CopySource::MAX_CONTRACT_STATE_TREE_HEIGHT;
+
+    const GROUP_REALM_HEIGHT: u8 = T::CopySource::GROUP_REALM_HEIGHT;
+    const MAX_USERS: u64 = T::CopySource::MAX_USERS;
+    const MAX_REALMS: u32 = T::CopySource::MAX_REALMS;
+    const MAX_USERS_PER_REALM: u32 = T::CopySource::MAX_USERS_PER_REALM;
+}

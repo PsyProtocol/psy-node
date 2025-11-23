@@ -25,6 +25,14 @@ pub trait QPGenRandom {
         }
         vec
     }
+    fn qp_rand_gen_vec_in_range(min_len: usize, max_len: usize) -> Vec<Self> where Self: Sized {
+        let len = rand::thread_rng().gen_range(min_len..=max_len);
+        let mut vec = Vec::with_capacity(len);
+        for _ in 0..len {
+            vec.push(Self::qp_rand_gen());
+        }
+        vec
+    }
     fn qp_rand_gen() -> Self where Self: Sized;
 
 }

@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::{
     data::hash::
         merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}
@@ -53,6 +55,22 @@ impl QMerkleStoreFastZeroNodeSerializer {
         let index = i64::from_le_bytes(slice[1..9].try_into().unwrap());
         let hash: [u8; 32] = slice[9..41].try_into().unwrap();
         (level, index, checkpoint_id_i64, hash)
+    }
+    pub fn serialize_zero_id_hash_map_to_vec<Hash: Q256BitHash>(node_map: &HashMap<SimpleMerkleNodeKey, Hash>) -> Vec<u8> {
+        let mut serialized_bytes = Vec::with_capacity(node_map.len() * QMS_FAST_SERIALIZER_ZERO_ID_NODE_SIZE);
+        for (key, hash) in node_map {
+            serialized_bytes.push(key.level);
+            serialized_bytes.extend_from_slice(&key.index.to_le_bytes());
+            serialized_bytes.extend_from_slice(&hash.into_owned_32bytes());
+        }
+        serialized_bytes
+    }
+    pub fn serialize_zero_id_hash_map_with_common_tree_id_to_slice<Hash: Q256BitHash>(node_map: &HashMap<SimpleMerkleNodeKey, Hash>, serialized_bytes: &mut Vec<u8>) {
+        for (key, hash) in node_map {
+            serialized_bytes.push(key.level);
+            serialized_bytes.extend_from_slice(&key.index.to_le_bytes());
+            serialized_bytes.extend_from_slice(&hash.into_owned_32bytes());
+        }
     }
 }
 

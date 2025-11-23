@@ -1,7 +1,7 @@
 
 #[cfg(feature = "rand_gen")]
 use parth_core::utils::QPGenRandom;
-use parth_core::{crypto::hash::{merkle_proof::{DeltaMerkleProofCore, MerkleProofCore, compute_root_merkle_proof_generic}, tag_tree::hash_tag_tree_node, traits::{FieldQHasher, MerkleHasher, QFieldHashable}}, felt::{QFelt, QFelt64}, protocol::core_types::{Q256BitHash, QFHashBase}};
+use parth_core::{crypto::hash::{merkle_proof::{DeltaMerkleProofCore, MerkleProofCore, compute_root_merkle_proof_generic}, traits::{FieldQHasher, MerkleHasher, QFieldHashable}}, felt::QFelt64, protocol::core_types::{Q256BitHash, QFHashBase, QHashBase}};
 use psy_core::constants::protocol::{DA_CHALLENGE_WINDOW, TODO_DEPOSIT_TREE_HEIGHT, TODO_WITHDRAWAL_TREE_HEIGHT};
 use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
 use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
@@ -136,19 +136,11 @@ impl<F, Hash: Copy> QCQEDCheckpointStateTransitionInput<F, Hash> {
     }
 }
 
-impl<F: QFelt64, Hash: Q256BitHash> QCQEDCheckpointStateTransitionInput<F, Hash> {
-    pub fn get_public_inputs_hash_with_fingerprint_and_reward_tag<Hasher: FieldQHasher<F, Hash>>(&self, checkpoint_state_transition_circuit_fingerprint: Hash) -> Hash {
-        let data = CheckpointStateTransitionPublicInputs {
-            checkpoint_transition: CheckpointStateHashTransition{
-                old_checkpoint_tree_root: self.append_checkpoint_tree_proof.old_root,
-                new_checkpoint_tree_root: self.append_checkpoint_tree_proof.new_root,
-                old_checkpoint_leaf_hash: self.append_checkpoint_tree_proof.old_value,
-                new_checkpoint_leaf_hash: self.append_checkpoint_tree_proof.new_value,
-            },
-            genesis_checkpoint_state_transition_hash: self.genesis_checkpoint_state_transition_hash,
-            checkpoint_state_transition_circuit_fingerprint,
-        };
-        data.get_public_inputs_hash_no_rewards_tag::<Hasher>()
+impl<F: QFelt64, Hash: Q256BitHash + QHashBase + QFHashBase<F>> QCQEDCheckpointStateTransitionInput<F, Hash> {
+    pub fn get_public_inputs_hash_with_fingerprint_and_reward_tag<Hasher: FieldQHasher<F, Hash>>(&self, checkpoint_state_transition_circuit_fingerprint: Hash, reward_tag: Hash) -> Hash {
+        let mut modified = self.clone();
+        modified.update_with_new_reward_tree_root::<Hasher>(reward_tag);
+        modified.get_public_inputs_hash_with_fingerprint::<Hasher>(checkpoint_state_transition_circuit_fingerprint)
     }
 }
 impl<F: QFelt64, Hash: Q256BitHash> PsyCanonicalSerializeMetadata for QCQEDCheckpointStateTransitionInput<F, Hash> {

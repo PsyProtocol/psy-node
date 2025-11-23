@@ -27,7 +27,6 @@ impl TwoNCAStateTransitionGadget {
         tracing::debug!("🔗 a_header: {:?}, b_header: {:?}", a_header, b_header);
 
         let update_nca_proof_gadget = UpdateNearestCommonAncestorProofOptGadget::add_virtual_to_full::<H,F,D>(builder, max_merkle_proof_height, tree_height);
-        // TODO: WHY WAS THIS REMOVED, I am adding back!?!!, we need to make sure a and b have the same checkpoint root
         builder.connect_hashes(
             a_header.checkpoint_tree_root,
             b_header.checkpoint_tree_root,

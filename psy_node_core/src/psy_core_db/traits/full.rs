@@ -268,7 +268,7 @@ pub trait PsyNodeCoreDatabaseUserStoreReader<F, Hash> {
 #[async_trait]
 #[auto_impl(&, Arc)]
 pub trait PsyNodeCoreDatabaseUserStoreWriter<F, Hash> {
-    async fn set_user_leaf_(&self, checkpoint_id: u64, leaf_data: &PQEDUserLeaf<F, Hash>) -> anyhow::Result<()>;
+    async fn set_user_leaf(&self, checkpoint_id: u64, leaf_data: &PQEDUserLeaf<F, Hash>) -> anyhow::Result<()>;
     async fn set_user_leaves_ffs(&self, checkpoint_id: u64, data: &[u8]) -> anyhow::Result<()>;
 
     async fn set_zk_public_key(&self, checkpoint_id: u64, user_id: u64, public_key_info: &PZKPublicKeyInfo<Hash>) -> anyhow::Result<()>;

@@ -629,6 +629,28 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + PartialEq + Default>
             index: index,
         }
     }
+    pub fn set_leaf_no_proof(&mut self, index: u64, value: Hash) -> Hash {
+        let old_proof = self.get_leaf(index);
+        let mut current_value = value;
+        let mut current_key = SimpleMerkleNodeKey::new(self.height, index);
+
+        let height = self.height as usize;
+        for i in 0..height {
+            let new_key = current_key.parent();
+            let index = current_key.index;
+            self.set_node_value(current_key, current_value);
+
+            current_value = if index & 1 == 0 {
+                Hasher::two_to_one(&current_value, &old_proof.siblings[i])
+            } else {
+                Hasher::two_to_one(&old_proof.siblings[i], &current_value)
+            };
+            current_key = new_key;
+        }
+        self.set_node_value(current_key, current_value);
+        current_value
+
+    }
     pub fn get_subtree_merkle_proof(
         &self,
         root_level: u8,
@@ -667,6 +689,7 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + PartialEq + Default>
             value,
         }
     }
+
 
     pub fn get_leaf_in_subtree(
         &self,

@@ -29,7 +29,7 @@ use crate::{
     guta::gadgets::{helpers::ToGUTAHeader, two_nca_state_transition::TwoNCAStateTransitionGadget, verify_guta_proof::VerifyGUTAProofGadget},
     proof_minifier::{pm_chain_dynamic::QEDProofMinifierDynamicChain, pm_core::get_circuit_fingerprint_generic},
     qstandard::{QPsyNetworkCircuitWithType, QStandardCircuit, QStandardCircuitProvableWithRawProofsAndRefLibrary},
-    utils::proof_llbrary::get_two_child_proofs_for_api_response_with_inclusion_proof,
+    utils::proof_library::get_two_child_proofs_for_api_response_with_inclusion_proof,
 };
 
 #[derive(Debug)]

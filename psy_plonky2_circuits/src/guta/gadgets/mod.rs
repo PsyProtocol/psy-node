@@ -12,3 +12,4 @@ pub mod guta_register_users;
 pub mod guta_register_users_batch;
 pub mod guta_only_register_users_gadget;
 pub mod guta_no_change_gadget;
+pub mod dual_variable_height_state_transition;

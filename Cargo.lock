@@ -3188,6 +3188,8 @@ dependencies = [
  "pser",
  "psy_core",
  "psy_data",
+ "psy_node_core",
+ "psy_node_store_memory",
  "psy_plonky2_basic_helpers",
  "psy_plonky2_common_circuits",
  "psy_serialize",

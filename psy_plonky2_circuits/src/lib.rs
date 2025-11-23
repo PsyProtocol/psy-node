@@ -12,3 +12,6 @@ pub mod index;
 pub mod end_cap;
 pub mod generated;
 pub mod circuit_library;
+pub mod zk_verifier;
+pub mod protocol_types;
+pub mod guta_v2;

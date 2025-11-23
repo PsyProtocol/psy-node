@@ -13,7 +13,7 @@ use crate::{
     },
     felt::QFelt64,
     generic_traits::QNamedType,
-    protocol::core_types::{QNetworkCircuitConstants, QNetworkTreeConstants},
+    protocol::core_types::{QNetworkCircuitConstants, QNetworkConstants, QNetworkConstantsCopier, QNetworkTreeConstants},
     QJobIdBase,
 };
 
@@ -65,7 +65,8 @@ impl<T: QHashBase + Q256BitHash> QHash256Base for T {}
 pub trait QFHashBase<F: QFelt64>: QHashBase + HashTo4Felts<F> {}
 impl<T: QHashBase + HashTo4Felts<F>, F: QFelt64> QFHashBase<F> for T {}
 
-pub trait QProofBase: PartialEq + Clone + Serialize + DeserializeOwned + QPDSerializable {}
+pub trait QProofBase: PartialEq + Clone + Serialize + DeserializeOwned {}
+impl<T: PartialEq + Clone + Serialize + DeserializeOwned> QProofBase for T {}
 /*
 pub trait QHasherBase<Hash: QHashBase, Proof: QProofBase>: MerkleZeroHasher<Hash> {
     fn get_proof_public_inputs(proof: &Proof) -> anyhow::Result<Hash>; // the public inputs of the proof is a hash which is the hash of the QParthProofPublicInputsPreimage
@@ -118,28 +119,46 @@ pub trait QNetworkZKTypes: QNetworkHashTypes {
     type ZKVerifier: QZKProofVerifier<Self::QHash, Self::ZKProof> + Send + Sync;
 }
 
-pub trait QNetworkTypesConfig:
-    QNetworkDatabaseTypes
-    + QNetworkCircuitConstants
-    + QNetworkZKTypes
-    + QJobIdBase
-    + QJobPlanner<Self::JobId>
-    + Sized
-    + Send
-    + Sync
-    + Copy
-    + Clone
-    + Default
+pub trait QNetworkZKTypesCopier: Sized + Send + Sync + Clone {
+    type ZKTypesCopySource: QNetworkZKTypes + 'static;
+}
+impl<T: QNetworkZKTypesCopier> QNetworkHashTypes for T {
+    type QHash = <<T as QNetworkZKTypesCopier>::ZKTypesCopySource as QNetworkHashTypes>::QHash;
+
+    type HasherBase = <<T as QNetworkZKTypesCopier>::ZKTypesCopySource as QNetworkHashTypes>::HasherBase;
+
+    type F = <<T as QNetworkZKTypesCopier>::ZKTypesCopySource as QNetworkHashTypes>::F;
+}
+impl<T: QNetworkZKTypesCopier> QNetworkZKTypes for T {
+    type ZKProof = <<T as QNetworkZKTypesCopier>::ZKTypesCopySource as QNetworkZKTypes>::ZKProof;
+
+    type ZKVerifier = <<T as QNetworkZKTypesCopier>::ZKTypesCopySource as QNetworkZKTypes>::ZKVerifier;
+}
+pub trait QNetworkTypesConfig: QNetworkDatabaseTypes + QNetworkCircuitConstants + QNetworkZKTypes + Sized + Send + Sync + Clone + Default {
+    type JobId: QJobIdBase;
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct QNetworkTypesConfigHelper<JobId: QJobIdBase, ZKTypes: QNetworkZKTypes, NetworkConstants: QNetworkConstants> {
+    _marker_job_id: std::marker::PhantomData<JobId>,
+    _marker_zk_types: std::marker::PhantomData<ZKTypes::F>,
+    _marker_network_constants: std::marker::PhantomData<NetworkConstants>,
+}
+
+impl<
+        JobId: QJobIdBase + 'static,
+        ZKTypes: QNetworkZKTypes + 'static + Clone + Send + Sync,
+        NetworkConstants: QNetworkConstants + 'static + Send + Sync,
+    > QNetworkZKTypesCopier for QNetworkTypesConfigHelper<JobId, ZKTypes, NetworkConstants>
 {
-    type JobId: QJobIdBase;
-    type JobPlanner: QJobPlanner<Self::JobId> + Send + Sync;
+    type ZKTypesCopySource = ZKTypes;
 }
-/*
-pub trait QNetworkTypesConfigBase: QNetworkTreeConstants {
-    type QHash: QHashBase;
-    type ZKProof: QProofBase;
-    type HasherBase: QHasherBase<Self::QHash, Self::ZKProof>;
-    type JobId: QJobIdBase;
-    type F: QFelt64;
+
+impl<
+        JobId: QJobIdBase + 'static,
+        ZKTypes: QNetworkZKTypes + 'static + Clone + Send + Sync,
+        NetworkConstants: QNetworkConstants + 'static + Clone + Send + Sync,
+    > QNetworkConstantsCopier for QNetworkTypesConfigHelper<JobId, ZKTypes, NetworkConstants>
+{
+    type CopySource = NetworkConstants;
 }
-*/

@@ -35,7 +35,7 @@ pub fn get_reward_tags_ensure_expected_child_proof_count<F: RichField>(
     let mut child_reward_values = Vec::with_capacity(expected_child_proof_count);
     let actual_tags_length = input.base.child_proof_tag_values.len();
     for circuit_type in input_circuit_types {
-        if circuit_type == ProvingJobCircuitType::UserEndCap {
+        if circuit_type == ProvingJobCircuitType::UserEndCap || circuit_type == ProvingJobCircuitType::GenerateRollupStateTransitionProof || circuit_type == ProvingJobCircuitType::GenesisBlockCheckpointStateTransition {
             child_reward_values.push(QHashOut::ZERO);
         } else {
             if child_reward_tag_values_array_counter >= actual_tags_length {
@@ -60,7 +60,7 @@ pub fn get_proof_results_for_api_response_with_inclusion_proof<L: CircuitInfoLib
     for i in 0..expected_child_proof_count {
         let child_circuit_type = input.base.job.metadata.dependencies[i].circuit_type;
         let job_id = input.base.job.metadata.dependencies[i];
-        let whitelist_inclusion_proof = if child_circuit_type == ProvingJobCircuitType::UserEndCap {
+        let whitelist_inclusion_proof = if child_circuit_type == ProvingJobCircuitType::UserEndCap || child_circuit_type == ProvingJobCircuitType::GenerateRollupStateTransitionProof || child_circuit_type == ProvingJobCircuitType::GenesisBlockCheckpointStateTransition {
             MerkleProofCore{
                 siblings: vec![],
                 value: QHashOut::ZERO,

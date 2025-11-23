@@ -16,10 +16,15 @@ pub trait UserIdGeneratorStrategy {
         user_registration_tree_leaf_index: Target,
         user_registration_tree_leaf_index_bits: &[BoolTarget],
         coordinator_user_tree_height: u8,
-            realm_user_tree_height: u8,
-            group_realm_height: u8,
+        realm_user_tree_height: u8,
+        group_realm_height: u8,
     ) -> Target;
-    fn get_user_id_from_registration_id(registration_id: u64, coordinator_user_tree_height: u8, realm_user_tree_height: u8, group_realm_height: u8) -> u64;
+    fn get_user_id_from_registration_id(
+        registration_id: u64,
+        coordinator_user_tree_height: u8,
+        realm_user_tree_height: u8,
+        group_realm_height: u8,
+    ) -> u64;
 }
 pub struct UserIdBitsStrategy1;
 
@@ -40,8 +45,12 @@ impl UserIdGeneratorStrategy for UserIdBitsStrategy1 {
         reversed_bits_index
     }
 
-    fn get_user_id_from_registration_id(registration_id: u64, coordinator_user_tree_height: u8, realm_user_tree_height: u8,
-        _group_realm_height: u8) -> u64 {
+    fn get_user_id_from_registration_id(
+        registration_id: u64,
+        coordinator_user_tree_height: u8,
+        realm_user_tree_height: u8,
+        _group_realm_height: u8,
+    ) -> u64 {
         let global_user_tree_height = (coordinator_user_tree_height + realm_user_tree_height) as u64;
 
         let dif = 64 - global_user_tree_height;
@@ -72,8 +81,12 @@ impl UserIdGeneratorStrategy for UserIdBitsStrategy2 {
         reversed_bits_index
     }
 
-    fn get_user_id_from_registration_id(registration_id: u64, coordinator_user_tree_height: u8, realm_user_tree_height: u8, 
-        _group_realm_height: u8) -> u64 {
+    fn get_user_id_from_registration_id(
+        registration_id: u64,
+        coordinator_user_tree_height: u8,
+        realm_user_tree_height: u8,
+        _group_realm_height: u8,
+    ) -> u64 {
         // rotate realms on each index
         let new_top_bits = reverse_bits_in_limit(
             registration_id & ((1u64 << coordinator_user_tree_height) - 1u64),
@@ -112,8 +125,12 @@ impl UserIdGeneratorStrategy for UserIdBitsStrategy3 {
         reversed_bits_index
     }
 
-    fn get_user_id_from_registration_id(registration_id: u64, coordinator_user_tree_height: u8, realm_user_tree_height: u8, 
-        _group_realm_height: u8) -> u64 {
+    fn get_user_id_from_registration_id(
+        registration_id: u64,
+        coordinator_user_tree_height: u8,
+        realm_user_tree_height: u8,
+        _group_realm_height: u8,
+    ) -> u64 {
         let global_user_tree_height = (coordinator_user_tree_height + realm_user_tree_height) as usize;
 
         (reverse_bits_in_limit(registration_id >> 10u64, (global_user_tree_height - 10) as u8) << 10u64) | (registration_id & ((1u64 << 10) - 1u64))
@@ -150,8 +167,8 @@ impl UserIdGeneratorStrategy for UserIdBitsStrategy4 {
         _user_registration_tree_leaf_index: Target,
         user_registration_tree_leaf_index_bits: &[BoolTarget],
         coordinator_user_tree_height: u8,
-            realm_user_tree_height: u8,
-            group_realm_height: u8,
+        realm_user_tree_height: u8,
+        group_realm_height: u8,
     ) -> Target {
         let mut realm_index_bit = user_registration_tree_leaf_index_bits[0..(group_realm_height as usize)].to_vec();
         realm_index_bit.reverse();
@@ -175,7 +192,12 @@ impl UserIdGeneratorStrategy for UserIdBitsStrategy4 {
         user_id
     }
 
-    fn get_user_id_from_registration_id(registration_id: u64, coordinator_user_tree_height: u8, realm_user_tree_height: u8, group_realm_height: u8) -> u64 {
+    fn get_user_id_from_registration_id(
+        registration_id: u64,
+        coordinator_user_tree_height: u8,
+        realm_user_tree_height: u8,
+        group_realm_height: u8,
+    ) -> u64 {
         let realm_index = registration_id & ((1u64 << group_realm_height) - 1);
         let user_index = (registration_id >> group_realm_height) & ((1u64 << realm_user_tree_height) - 1);
         let group_id =
@@ -219,36 +241,36 @@ pub fn circuit_user_registration_tree_index_bits_to_user_id<H: AlgebraicHasher<F
 
 type UserIdBitsStrategy = UserIdBitsStrategy4;
 
-pub fn get_user_id_from_registration_id(registration_id: u64, 
-        coordinator_user_tree_height: u8,
-            realm_user_tree_height: u8,
-            group_realm_height: u8,) -> u64 {
+pub fn get_user_id_from_registration_id(
+    registration_id: u64,
+    coordinator_user_tree_height: u8,
+    realm_user_tree_height: u8,
+    group_realm_height: u8,
+) -> u64 {
     UserIdBitsStrategy::get_user_id_from_registration_id(registration_id, coordinator_user_tree_height, realm_user_tree_height, group_realm_height)
 }
 pub fn circuit_user_registration_tree_index_bits_to_user_id<H: AlgebraicHasher<F>, F: RichField + Extendable<D>, const D: usize>(
     builder: &mut CircuitBuilder<F, D>,
     user_registration_tree_leaf_index: Target,
     user_registration_tree_leaf_index_bits: &[BoolTarget],
-        coordinator_user_tree_height: u8,
-            realm_user_tree_height: u8,
-            group_realm_height: u8,
+    coordinator_user_tree_height: u8,
+    realm_user_tree_height: u8,
+    group_realm_height: u8,
 ) -> Target {
     UserIdBitsStrategy::circuit_user_registration_tree_index_bits_to_user_id::<H, F, D>(
         builder,
         user_registration_tree_leaf_index,
         user_registration_tree_leaf_index_bits,
         coordinator_user_tree_height,
-            realm_user_tree_height,
-            group_realm_height,
+        realm_user_tree_height,
+        group_realm_height,
     )
 }
 
 #[cfg(test)]
 mod tests {
     use plonky2::{
-        field::
-            types::{Field, PrimeField64}
-        ,
+        field::types::{Field, PrimeField64},
         iop::{
             target::Target,
             witness::{PartialWitness, WitnessWrite},
@@ -279,10 +301,12 @@ mod tests {
     where
         C::Hasher: AlgebraicHasher<C::F>,
     {
-        pub fn new<UIDGen: UserIdGeneratorStrategy>(count: usize, 
-        coordinator_user_tree_height: u8,
+        pub fn new<UIDGen: UserIdGeneratorStrategy>(
+            count: usize,
+            coordinator_user_tree_height: u8,
             realm_user_tree_height: u8,
-            group_realm_height: u8,) -> Self {
+            group_realm_height: u8,
+        ) -> Self {
             let config = CircuitConfig::standard_recursion_config();
             let mut builder = CircuitBuilder::<C::F, D>::new(config);
             let registration_ids = builder.add_virtual_targets(count);
@@ -299,8 +323,8 @@ mod tests {
                         user_registration_tree_leaf_index,
                         &user_registration_tree_leaf_index_bits,
                         coordinator_user_tree_height,
-                            realm_user_tree_height,
-                            group_realm_height,
+                        realm_user_tree_height,
+                        group_realm_height,
                     )
                 })
                 .collect::<Vec<_>>();
@@ -328,10 +352,13 @@ mod tests {
             self.minifier_chain.prove(&inner_proof)*/
             self.circuit_data.prove(pw)
         }
-        pub fn check_strategy<UIDGen: UserIdGeneratorStrategy>(&self, registration_ids: &[u64], 
-        coordinator_user_tree_height: u8,
+        pub fn check_strategy<UIDGen: UserIdGeneratorStrategy>(
+            &self,
+            registration_ids: &[u64],
+            coordinator_user_tree_height: u8,
             realm_user_tree_height: u8,
-            group_realm_height: u8,) -> anyhow::Result<()> {
+            group_realm_height: u8,
+        ) -> anyhow::Result<()> {
             for (user_id, reg_id) in self
                 .prove_base(registration_ids)?
                 .public_inputs
@@ -339,7 +366,8 @@ mod tests {
                 .map(|x| x.to_canonical_u64())
                 .zip(registration_ids.iter())
             {
-                let expected_user_id = UIDGen::get_user_id_from_registration_id(*reg_id, coordinator_user_tree_height, realm_user_tree_height, group_realm_height);
+                let expected_user_id =
+                    UIDGen::get_user_id_from_registration_id(*reg_id, coordinator_user_tree_height, realm_user_tree_height, group_realm_height);
                 if expected_user_id != user_id {
                     anyhow::bail!(
                         "expected registration_id {} to map to {}, but got {} from the circuit instead",
@@ -352,10 +380,14 @@ mod tests {
 
             Ok(())
         }
-        pub fn full_check<UIDGen: UserIdGeneratorStrategy>(batch_size: usize, count: usize, rand_count: usize, 
-        coordinator_user_tree_height: u8,
+        pub fn full_check<UIDGen: UserIdGeneratorStrategy>(
+            batch_size: usize,
+            count: usize,
+            rand_count: usize,
+            coordinator_user_tree_height: u8,
             realm_user_tree_height: u8,
-            group_realm_height: u8) -> anyhow::Result<()> {
+            group_realm_height: u8,
+        ) -> anyhow::Result<()> {
             type C = PoseidonGoldilocksConfig;
             let max_regions = (count / batch_size) as u64;
             let rand_regions = (rand_count / batch_size) as u64;

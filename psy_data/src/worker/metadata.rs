@@ -1,5 +1,5 @@
 use parth_core::{
-    QJOB_ID_SERIALIZED_SIZE, QJobIdBase, crypto::hash::{tag_tree::hash_tag_tree_node, traits::{MerkleHasher, ZeroableHash}}, data::hash::merkle_node_key::SimpleMerkleNodeKey, protocol::core_types::Q256BitHash, utils::QPGenRandom
+    QJOB_ID_SERIALIZED_SIZE, QJobIdBase, crypto::hash::{tag_tree::{TagTreeStorageNode, hash_tag_tree_node}, traits::{MerkleHasher, ZeroableHash}}, data::hash::merkle_node_key::SimpleMerkleNodeKey, protocol::core_types::Q256BitHash, utils::QPGenRandom
 };
 use psy_core::job::job_id::QProvingJobDataID;
 use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
@@ -76,6 +76,62 @@ impl<Hash: ZeroableHash + Copy, JobId> PsyProvingJobMetadata<Hash, JobId> {
             _ => anyhow::bail!("Unknown reward tree hash mode: {}", self.reward_tree_hash_mode),
         };
         Ok(res)
+    }
+    pub fn compute_reward_tagged_expected_public_inputs<Hasher: MerkleHasher<Hash>>(&self, tag: Hash, children_reward_tree_values: &[Hash]) -> anyhow::Result<Hash> {
+        let reward_tree_value = self.get_new_rewards_tag_tree_value::<Hasher>(tag, children_reward_tree_values)?;
+        Ok(Hasher::two_to_one(&self.expected_public_inputs_hash, &reward_tree_value))
+    }
+}
+impl<Hash: ZeroableHash + Copy + PartialEq, JobId> PsyProvingJobMetadata<Hash, JobId> {
+
+    pub fn get_new_rewards_tag_tree_updates<Hasher: MerkleHasher<Hash>>(&self, tag: Hash, children_reward_tree_values: &[Hash], reward_tree_value: Hash) -> anyhow::Result<Vec<(SimpleMerkleNodeKey, TagTreeStorageNode<Hash>)>>{
+        let mut updates = Vec::new();
+        if self.reward_tree_hash_mode == PROOF_REWARD_TREE_HASH_MODE_3_CHILDREN_DOUBLE_REWARD {
+            // special case for 3 children
+            if self.dependencies.len() != 3 || children_reward_tree_values.len() != 3 {
+                anyhow::bail!(
+                    "Expected 3 children for 3-children double reward hash mode, got {}",
+                    self.dependencies.len()
+                );
+            }
+            let zero = Hash::get_zero_value();
+
+            let left_value = hash_tag_tree_node::<Hash, Hasher>(&children_reward_tree_values[0], &children_reward_tree_values[1], &tag);
+            let right_value = hash_tag_tree_node::<Hash, Hasher>(&children_reward_tree_values[2], &zero, &tag);
+            let top_value = hash_tag_tree_node::<Hash, Hasher>(&left_value, &right_value, &tag);
+            if top_value != reward_tree_value {
+                anyhow::bail!("Computed top value does not match reward tree value for 3-children double reward hash mode");
+            }
+            let self_key = self.get_reward_tree_node_key();
+            let left_key = self_key.left_child();
+            let right_key = self_key.right_child();
+            updates.push((left_key, TagTreeStorageNode {
+                tag,
+                value: left_value,
+            }));
+            updates.push((right_key, TagTreeStorageNode {
+                tag,
+                value: right_value,
+            }));
+            updates.push((self_key, TagTreeStorageNode {
+                tag,
+                value: top_value,
+            }));
+        } else if self.reward_tree_hash_mode == PROOF_REWARD_TREE_HASH_MODE_LIFT_CHILD {
+            // do nothing
+        } else {
+            let self_key = self.get_reward_tree_node_key();
+            let computed_reward_tree_value = self.get_new_rewards_tag_tree_value::<Hasher>(tag, children_reward_tree_values)?;
+            if computed_reward_tree_value != reward_tree_value {
+                anyhow::bail!("Computed reward tree value does not match provided reward tree value");
+            }
+            updates.push((self_key, TagTreeStorageNode {
+                tag,
+                value: reward_tree_value,
+            }));
+        }
+
+        Ok(updates)
     }
 }
 impl<Hash: QPGenRandom, JobId: QPGenRandom> QPGenRandom for PsyProvingJobMetadata<Hash, JobId> {

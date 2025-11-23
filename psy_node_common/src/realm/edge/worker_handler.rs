@@ -312,6 +312,8 @@ impl<
 
         self.proof_store.put_proof_bytes_for_job_id(job_id, &proof_bytes).await?;
 
+
+        /*
         self.tag_tree_rewards_store
             .rewards_tag_tree_set_node_tag(unique_pending_id, metadata.get_reward_tree_node_key(), tag, reward_tree_value)
             .await?;
@@ -353,6 +355,16 @@ impl<
             self.tag_tree_rewards_store
                 .rewards_tag_tree_set_node_tag(unique_pending_id, self_key, tag, reward_tree_value)
                 .await?;
+        }
+        */
+        {
+            let expected_updates = metadata.get_new_rewards_tag_tree_updates::<N::HasherBase>(tag, &children_reward_tree_values, reward_tree_value)?;
+
+            for (key, node) in expected_updates {
+                self.tag_tree_rewards_store
+                    .rewards_tag_tree_set_node_tag(unique_pending_id, key, node.tag, node.value)
+                    .await?;
+            }
         }
 
         // ack the queue item as completed

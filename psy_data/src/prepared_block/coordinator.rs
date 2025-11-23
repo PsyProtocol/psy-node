@@ -24,8 +24,9 @@ pub struct PsyPreparedCoordinatorBlockStateUpdates<F, Hash> {
     pub update_global_user_tree_nodes_ffs: Vec<u8>,
     
     pub checkpoint_tree_update_proof: DeltaMerkleProofCore<Hash>,
-    pub registered_users_start_pivot_siblings: Vec<Hash>,
 }
+
+
 
 
 

@@ -2210,7 +2210,7 @@ impl<
         S,
     >
 {
-    async fn set_user_leaf_(&self, checkpoint_id: u64, leaf_data: &PQEDUserLeaf<N::F, N::QHash>) -> anyhow::Result<()> {
+    async fn set_user_leaf(&self, checkpoint_id: u64, leaf_data: &PQEDUserLeaf<N::F, N::QHash>) -> anyhow::Result<()> {
         self.store
             .db_insert_one_single_checkpointed_object(&self.user_leaf_table, leaf_data.user_id.to_u64_value(), checkpoint_id, leaf_data)
             .await

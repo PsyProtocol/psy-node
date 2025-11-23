@@ -2,10 +2,8 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
-use parth_core::{crypto::secp256k1::{CompressedPublicKey, Secp256K1WalletProvider}, node::realm_identifier::{self, QRealmIdentifier}, protocol::core_types::Q256BitHash};
+use parth_core::node::realm_identifier::QRealmIdentifier;
 use psy_api_core::worker::standard_worker_rpc::NodeEdgeWorkerRpcClient;
-use psy_core::job::job_id::QProvingJobDataID;
-use psy_data::worker::proving_work_history::PsyProvingJobClaimMetadata;
 use tokio::sync::RwLock;
 
 use crate::utils::api_url::hash_api_url_to_32_bytes;

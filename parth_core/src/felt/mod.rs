@@ -185,3 +185,12 @@ impl QPGenRandom for u64 {
         rand::random::<u64>()
     }
 }
+
+impl QPGenRandom for u128 {
+    fn qp_rand_gen() -> Self
+    where
+        Self: Sized,
+    {
+        rand::random::<u128>()
+    }
+}

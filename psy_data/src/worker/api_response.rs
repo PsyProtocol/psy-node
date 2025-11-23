@@ -1,5 +1,9 @@
-use parth_core::{QJOB_ID_SERIALIZED_SIZE, QJobIdBase};
+#[cfg(feature = "rand_gen")]
+use parth_core::utils::QPGenRandom;
+use parth_core::{QJOB_ID_SERIALIZED_SIZE, QJobIdBase, protocol::core_types::Q256BitHash};
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
+use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
+use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
 
 use crate::worker::metadata_with_job_id::PsyProvingJobMetadataWithJobId;
 
@@ -114,3 +118,192 @@ pub fn decode_expected_public_inputs_hash_and_dependencies<JobId: QJobIdBase>(da
     }
     Ok((hash, dependencies))
 }
+
+
+// ================================================================================================
+// PsyWorkerGetProvingWorkAPIResponse
+// ================================================================================================
+
+#[cfg(feature = "rand_gen")]
+impl<Hash: QPGenRandom, JobId: QPGenRandom> QPGenRandom for PsyWorkerGetProvingWorkAPIResponse<Hash, JobId> {
+    fn qp_rand_gen() -> Self
+    where
+        Self: Sized,
+    {
+        Self {
+            job: PsyProvingJobMetadataWithJobId::qp_rand_gen(),
+            child_proof_tag_values: QPGenRandom::qp_rand_gen_vec_in_range(0, 5),
+            realm_id: u64::qp_rand_gen(),
+            realm_sub_id: u64::qp_rand_gen(),
+            unique_pending_id: u64::qp_rand_gen(),
+            node_type: u8::qp_rand_gen(),
+            witness: QPGenRandom::qp_rand_gen_vec_in_range(0, 32),
+        }
+    }
+}
+
+impl<Hash: Q256BitHash, JobId: QJobIdBase> PsyCanonicalSerializeMetadata for PsyWorkerGetProvingWorkAPIResponse<Hash, JobId> {
+    const IS_FIXED_SIZE: bool = false;
+    const FIXED_SIZE: usize = 0;
+}
+
+impl<Hash: Q256BitHash, JobId: QJobIdBase> FallbackPsySerializeCanonical for PsyWorkerGetProvingWorkAPIResponse<Hash, JobId> {
+    fn fallback_pio_serialized_size(&self) -> usize {
+        let mut size = self.job.pio_serialized_size();
+        // child_proof_tag_values: vec len (4) + items * 32
+        size += 4 + (self.child_proof_tag_values.len() * 32);
+        // realm_id (8) + realm_sub_id (8) + unique_pending_id (8) + node_type (1)
+        size += 8 + 8 + 8 + 1;
+        // witness: vec len (4) + bytes
+        size += 4 + self.witness.len();
+        size
+    }
+
+    fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
+        self.job.pio_write_to_io(writer)?;
+        
+        writer.psy_write_vec_length(self.child_proof_tag_values.len())?;
+        for hash in &self.child_proof_tag_values {
+            writer.psy_write_bytes_fixed(&hash.into_owned_32bytes())?;
+        }
+
+        writer.psy_write_u64(self.realm_id)?;
+        writer.psy_write_u64(self.realm_sub_id)?;
+        writer.psy_write_u64(self.unique_pending_id)?;
+        writer.psy_write_u8(self.node_type)?;
+        
+        writer.psy_write_bytes_vec(&self.witness)?;
+        Ok(())
+    }
+
+    fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
+        let job = PsyProvingJobMetadataWithJobId::<Hash, JobId>::pio_read_from_io(reader)?;
+
+        let child_proof_len = reader.psy_read_vec_length()?;
+        let mut child_proof_tag_values = Vec::with_capacity(child_proof_len);
+        for _ in 0..child_proof_len {
+            let hash_bytes = reader.psy_read_bytes_32()?;
+            child_proof_tag_values.push(Hash::from_owned_32bytes(hash_bytes));
+        }
+
+        let realm_id = reader.psy_read_u64()?;
+        let realm_sub_id = reader.psy_read_u64()?;
+        let unique_pending_id = reader.psy_read_u64()?;
+        let node_type = reader.psy_read_u8()?;
+        let witness = reader.psy_read_bytes_vec()?;
+
+        Ok(Self {
+            job,
+            child_proof_tag_values,
+            realm_id,
+            realm_sub_id,
+            unique_pending_id,
+            node_type,
+            witness,
+        })
+    }
+}
+
+#[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
+psy_serialize::impl_psy_canonical_serialize_for_speedy!(
+    PsyWorkerGetProvingWorkAPIResponse,
+    { Hash: Q256BitHash, JobId: QJobIdBase } => { Hash, JobId }
+);
+
+#[cfg(not(all(feature = "serialize_speedy", target_endian = "little")))]
+impl<Hash: Q256BitHash, JobId: QJobIdBase> psy_serialize::AutoImplementFallbackPsySerializeCanonical
+    for PsyWorkerGetProvingWorkAPIResponse<Hash, JobId>
+{
+}
+
+pser::impl_psy_ser_basic_tests_fallback!(
+    PsyWorkerGetProvingWorkAPIResponse,
+    { parth_core::PHash, psy_core::job::job_id::QProvingJobDataID },
+    psy_worker_get_proving_work_api_response_tests
+);
+
+
+// ================================================================================================
+// PsyWorkerGetProvingWorkWithChildProofsAPIResponse
+// ================================================================================================
+
+#[cfg(feature = "rand_gen")]
+impl<Hash: QPGenRandom, JobId: QPGenRandom> QPGenRandom for PsyWorkerGetProvingWorkWithChildProofsAPIResponse<Hash, JobId> {
+    fn qp_rand_gen() -> Self
+    where
+        Self: Sized,
+    {
+        // Generate a few random proofs for the vec<vec<u8>>
+        let mut input_proofs = Vec::new();
+        let vec_len = u8::qp_rand_gen() as usize % 5; // limit to max 5 proofs
+        for _ in 0..vec_len {
+            input_proofs.push(QPGenRandom::qp_rand_gen_vec_in_range(0,32));
+        }
+
+        Self {
+            base: PsyWorkerGetProvingWorkAPIResponse::qp_rand_gen(),
+            input_proofs,
+        }
+    }
+}
+
+impl<Hash: Q256BitHash, JobId: QJobIdBase> PsyCanonicalSerializeMetadata for PsyWorkerGetProvingWorkWithChildProofsAPIResponse<Hash, JobId> {
+    const IS_FIXED_SIZE: bool = false;
+    const FIXED_SIZE: usize = 0;
+}
+
+impl<Hash: Q256BitHash, JobId: QJobIdBase> FallbackPsySerializeCanonical for PsyWorkerGetProvingWorkWithChildProofsAPIResponse<Hash, JobId> {
+    fn fallback_pio_serialized_size(&self) -> usize {
+        let mut size = self.base.pio_serialized_size();
+        // input_proofs: vec length (4)
+        size += 4;
+        // each proof: vec length (4) + bytes
+        for proof in &self.input_proofs {
+            size += 4 + proof.len();
+        }
+        size
+    }
+
+    fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
+        self.base.pio_write_to_io(writer)?;
+        
+        writer.psy_write_vec_length(self.input_proofs.len())?;
+        for proof in &self.input_proofs {
+            writer.psy_write_bytes_vec(proof)?;
+        }
+        Ok(())
+    }
+
+    fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
+        let base = PsyWorkerGetProvingWorkAPIResponse::<Hash, JobId>::pio_read_from_io(reader)?;
+
+        let proofs_len = reader.psy_read_vec_length()?;
+        let mut input_proofs = Vec::with_capacity(proofs_len);
+        for _ in 0..proofs_len {
+            input_proofs.push(reader.psy_read_bytes_vec()?);
+        }
+
+        Ok(Self {
+            base,
+            input_proofs,
+        })
+    }
+}
+
+#[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
+psy_serialize::impl_psy_canonical_serialize_for_speedy!(
+    PsyWorkerGetProvingWorkWithChildProofsAPIResponse,
+    { Hash: Q256BitHash, JobId: QJobIdBase } => { Hash, JobId }
+);
+
+#[cfg(not(all(feature = "serialize_speedy", target_endian = "little")))]
+impl<Hash: Q256BitHash, JobId: QJobIdBase> psy_serialize::AutoImplementFallbackPsySerializeCanonical
+    for PsyWorkerGetProvingWorkWithChildProofsAPIResponse<Hash, JobId>
+{
+}
+
+pser::impl_psy_ser_basic_tests_fallback!(
+    PsyWorkerGetProvingWorkWithChildProofsAPIResponse,
+    { parth_core::PHash, psy_core::job::job_id::QProvingJobDataID },
+    psy_worker_get_proving_work_with_child_proofs_api_response_tests
+);

@@ -1,7 +1,6 @@
 use anyhow::bail;
-use hashbrown::HashMap;
 use parth_core::{crypto::hash::{merkle_proof::{DeltaMerkleProofCore, MerkleProofCore}, spiderman::SpidermanUpdateProof, traits::MerkleZeroHasher}, data::hash::merkle_node_key::SimpleMerkleNodeKey};
-use std::marker::PhantomData;
+use std::{collections::HashMap, marker::PhantomData};
 // --- Start of Refactored Code ---
 
 #[derive(Debug, Clone)]
@@ -28,6 +27,10 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + PartialEq + Default + std::fmt
             zero_value_hashes,
             _hasher: PhantomData::default(),
         }
+    }
+
+    pub fn into_nodes(self) -> HashMap<SimpleMerkleNodeKey, Hash> {
+        self.nodes
     }
 
     #[inline]
@@ -392,6 +395,17 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + PartialEq + Default + std::fmt
             siblings,
             index,
         }
+    }
+
+    /// Update a single leaf without returning a delta merkle proof.
+    pub fn set_leaf_no_proof(&mut self, index: u64, value: Hash) {
+        let leaf_key = SimpleMerkleNodeKey::new(self.height, index);
+
+        // Set the new leaf value
+        self.set_node_value(leaf_key, value);
+        
+        // Re-hash up the tree from the changed leaf
+        self.rehash_from_node_to_level(leaf_key, 0);
     }
 }
 

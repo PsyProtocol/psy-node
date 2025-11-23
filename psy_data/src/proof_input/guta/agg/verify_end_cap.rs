@@ -223,8 +223,128 @@ impl<F: QFelt64, Hash: Copy + PartialEq> VerifyTwoEndCapCircuitInput<F, Hash> {
 }
 
 
+#[pderive::serialize_clone_f_hash_ts]
+#[ts(export, concrete(F = parth_core::PF, Hash = parth_core::PHash))]
+pub struct VerifySingleEndCapInputV2<F, Hash> {
+    pub guta_circuit_whitelist: Hash,
+    pub core: VerifyEndCapSimpleStandardInput<F, Hash>,
+    pub global_user_tree_sub_root_transition: DeltaMerkleProofCore<Hash>,
+    pub user_id: F,
+}
 
 
+impl<F: QFelt64, Hash: Copy> VerifySingleEndCapInputV2<F, Hash> {
+
+    pub fn get_guta_header_a(&self, global_user_tree_height: u8) -> GlobalUserTreeAggregatorHeader<F, Hash> {
+        GlobalUserTreeAggregatorHeader {
+            guta_circuit_whitelist: self.guta_circuit_whitelist,
+            checkpoint_tree_root: self.core.checkpoint_root,
+            state_transition: SubTreeNodeStateTransition {
+                old_node_value: self.global_user_tree_sub_root_transition.old_value,
+                new_node_value: self.global_user_tree_sub_root_transition.new_value,
+                node_index: self.user_id,
+                node_level: F::from_u8_value(global_user_tree_height),
+            },
+            stats: self.core.guta_stats,
+            total_aggregation_proofs_generated: F::from_u64_value(0),
+        }
+    }
+    pub fn get_new_guta_header(&self, global_user_tree_height: u8) -> GlobalUserTreeAggregatorHeader<F, Hash> {
+        GlobalUserTreeAggregatorHeader {
+            guta_circuit_whitelist: self.guta_circuit_whitelist,
+            checkpoint_tree_root: self.core.checkpoint_historical_merkle_proof.root,
+            state_transition: SubTreeNodeStateTransition {
+                old_node_value: self.global_user_tree_sub_root_transition.old_root,
+                new_node_value: self.global_user_tree_sub_root_transition.new_root,
+                node_index: F::from_u64_value(self.user_id.to_u64_value() >> self.global_user_tree_sub_root_transition.siblings.len()),
+                node_level: F::from_u64_value((global_user_tree_height as i64 - self.global_user_tree_sub_root_transition.siblings.len() as i64).max(0i64) as u64),
+            },
+            stats: self.core.guta_stats,
+            total_aggregation_proofs_generated: F::from_u64_value(1),
+        }
+    }
+    pub fn get_end_result_a(&self) -> PUPSEndCapResultCompact<F, Hash> {
+        PUPSEndCapResultCompact {
+            start_user_leaf_hash: self.global_user_tree_sub_root_transition.old_value,
+            end_user_leaf_hash: self.global_user_tree_sub_root_transition.new_value,
+            checkpoint_tree_root_hash: self.core.checkpoint_root,
+            user_id: self.user_id,
+        }
+    }
+}
+
+// ================================================================================================
+// VerifySingleEndCapInputV2
+// ================================================================================================
+
+#[cfg(feature = "rand_gen")]
+impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for VerifySingleEndCapInputV2<F, Hash> {
+    fn qp_rand_gen() -> Self
+    where
+        Self: Sized,
+    {
+        Self {
+            guta_circuit_whitelist: Hash::qp_rand_gen(),
+            core: VerifyEndCapSimpleStandardInput::qp_rand_gen(),
+            global_user_tree_sub_root_transition: DeltaMerkleProofCore::qp_rand_gen(),
+            user_id: F::qp_rand_gen(),
+        }
+    }
+}
+
+impl<F: QFelt64, Hash: Q256BitHash> PsyCanonicalSerializeMetadata for VerifySingleEndCapInputV2<F, Hash> {
+    const IS_FIXED_SIZE: bool = false;
+    const FIXED_SIZE: usize = 0;
+}
+
+impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for VerifySingleEndCapInputV2<F, Hash> {
+    fn fallback_pio_serialized_size(&self) -> usize {
+        32 + // guta_circuit_whitelist
+        self.core.pio_serialized_size() +
+        self.global_user_tree_sub_root_transition.pio_serialized_size() +
+        8 // user_id
+    }
+
+    fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
+        writer.psy_write_bytes_fixed(&self.guta_circuit_whitelist.into_owned_32bytes())?;
+        self.core.pio_write_to_io(writer)?;
+        self.global_user_tree_sub_root_transition.pio_write_to_io(writer)?;
+        writer.psy_write_u64(self.user_id.to_u64_value())?;
+        Ok(())
+    }
+
+    fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
+        let guta_circuit_whitelist = Hash::from_owned_32bytes(reader.psy_read_bytes_32()?);
+        let core = VerifyEndCapSimpleStandardInput::<F, Hash>::pio_read_from_io(reader)?;
+        let global_user_tree_sub_root_transition = DeltaMerkleProofCore::<Hash>::pio_read_from_io(reader)?;
+        let user_id = F::from_u64_value(reader.psy_read_u64()?);
+
+        Ok(Self {
+            guta_circuit_whitelist,
+            core,
+            global_user_tree_sub_root_transition,
+            user_id,
+        })
+    }
+}
+
+#[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
+psy_serialize::impl_psy_canonical_serialize_for_speedy!(
+    VerifySingleEndCapInputV2,
+    { F: QFelt64, Hash: Q256BitHash } => { F, Hash }
+);
+
+#[cfg(not(all(feature = "serialize_speedy", target_endian = "little")))]
+impl<F: QFelt64, Hash: Q256BitHash> psy_serialize::AutoImplementFallbackPsySerializeCanonical
+    for VerifySingleEndCapInputV2<F, Hash>
+{
+}
+
+pser::impl_psy_ser_basic_tests_fallback!(
+    VerifySingleEndCapInputV2,
+    { parth_core::PF, parth_core::PHash },
+    verify_single_end_cap_input_v2_tests
+);
 
 #[pderive::serialize_clone_f_hash_ts]
 #[ts(export, concrete(F = parth_core::PF, Hash = parth_core::PHash))]

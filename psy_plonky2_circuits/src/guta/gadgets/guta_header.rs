@@ -27,11 +27,6 @@ impl GlobalUserTreeAggregatorHeaderGadget {
         let stats = GUTAStatsGadget::add_virtual_to(builder);
         let total_aggregation_proofs_generated = builder.add_virtual_target();
         
-
-
-        
-
-
         Self {
             guta_circuit_whitelist,
             checkpoint_tree_root,
@@ -217,44 +212,3 @@ impl <const D: usize> ToGUTAHeader<D> for GlobalUserTreeAggregatorHeaderGadget {
         *self
     }
 }
-
-/* 
-impl CreatableWithHasherTarget for GlobalUserTreeAggregatorHeaderGadget {
-    fn create_virtual_with_hasher<H:AlgebraicHasher<F>, F: RichField + Extendable<D>, const D: usize>(
-        builder: &mut CircuitBuilder<F, D>,
-    ) -> Self {
-        Self::add_virtual_to::<H, F, D>(builder)
-    }
-}
-impl AlgebraicHashableTarget for GlobalUserTreeAggregatorHeaderGadget {
-    fn to_hash_target<H:AlgebraicHasher<F>, F: RichField + Extendable<D>, const D: usize>(
-        &self,
-        builder: &mut CircuitBuilder<F, D>,
-    ) -> HashOutTarget {
-        self.to_hash::<H, F, D>(builder)
-    }
-}
-impl<F: RichField> WitnessValueFor<GlobalUserTreeAggregatorHeaderGadget, F, true>
-    for UserProvingSessionHeader<F>
-{
-    fn set_for_witness(
-        &self,
-        witness: &mut impl Witness<F>,
-        target: &GlobalUserTreeAggregatorHeaderGadget,
-    ) {
-        target.set_witness(witness, self);
-    }
-}
-
-impl<F: RichField> WitnessValueFor<GlobalUserTreeAggregatorHeaderGadget, F, false>
-    for UserProvingSessionHeader<F>
-{
-    fn set_for_witness(
-        &self,
-        witness: &mut impl Witness<F>,
-        target: &GlobalUserTreeAggregatorHeaderGadget,
-    ) {
-        target.set_witness(witness, self);
-    }
-}
-*/

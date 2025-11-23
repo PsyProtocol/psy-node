@@ -29,7 +29,7 @@ use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 
 use crate::{
     proof_minifier::pm_core::get_circuit_fingerprint_generic,
-    qstandard::{QPsyNetworkCircuitWithType, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QStandardCircuitProvableWithRawProofsAndRefLibrary, proof_store::QProofStoreReaderAsync}, utils::proof_llbrary::get_single_child_proof_for_api_response_with_inclusion_proof,
+    qstandard::{QPsyNetworkCircuitWithType, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QStandardCircuitProvableWithRawProofsAndRefLibrary, proof_store::QProofStoreReaderAsync}, utils::proof_library::get_single_child_proof_for_api_response_with_inclusion_proof,
 };
 
 use crate::guta::gadgets::verify_end_cap::VerifyEndCapProofGadget;

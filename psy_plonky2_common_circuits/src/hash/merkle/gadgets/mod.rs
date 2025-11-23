@@ -17,3 +17,6 @@ pub mod merkle_array_gen;
 pub mod variable_height_delta_merkle_proof_opt_v2;
 pub mod variable_height_delta_merkle_proof_sub_tree;
 pub mod variable_height_delta_merkle_proof_v3;
+pub mod dual_variable_height_delta_merkle_proof;
+pub mod variable_height_delta_merkle_proof_index;
+pub mod q_variable_height_delta_merkle_proof;

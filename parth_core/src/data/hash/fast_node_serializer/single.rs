@@ -1,6 +1,8 @@
+use std::collections::HashMap;
+
 use crate::{
-    data::hash::
-        merkle_store_key::{QMerkleStoreSingleIdKey, QMerkleStoreSingleIdNode}
+    data::hash::{merkle_node_key::SimpleMerkleNodeKey, 
+        merkle_store_key::{QMerkleStoreSingleIdKey, QMerkleStoreSingleIdNode}}
     ,
     protocol::core_types::Q256BitHash, utils::signed_helpers::u8_to_i8_exact,
 };
@@ -66,6 +68,27 @@ impl QMerkleStoreFastSingleNodeSerializer {
         let index = i64::from_le_bytes(slice[9..17].try_into().unwrap());
         let value: [u8; 32] = slice[17..49].try_into().unwrap();
         (tree_id, level, index, checkpoint_id_i64, value)
+    }
+
+    pub fn serialize_single_id_hash_map_with_common_tree_id_to_vec<Hash: Q256BitHash>(tree_id: u64, node_map: &HashMap<SimpleMerkleNodeKey, Hash>) -> Vec<u8> {
+        let mut serialized_bytes = Vec::with_capacity(node_map.len() * QMS_FAST_SERIALIZER_SINGLE_ID_NODE_SIZE);
+        let tree_id_bytes = tree_id.to_le_bytes();
+        for (key, hash) in node_map {
+            serialized_bytes.extend_from_slice(&tree_id_bytes);
+            serialized_bytes.push(key.level);
+            serialized_bytes.extend_from_slice(&key.index.to_le_bytes());
+            serialized_bytes.extend_from_slice(&hash.into_owned_32bytes());
+        }
+        serialized_bytes
+    }
+    pub fn serialize_single_id_hash_map_with_common_tree_id_to_slice<Hash: Q256BitHash>(tree_id: u64, node_map: &HashMap<SimpleMerkleNodeKey, Hash>, serialized_bytes: &mut Vec<u8>) {
+        let tree_id_bytes = tree_id.to_le_bytes();
+        for (key, hash) in node_map {
+            serialized_bytes.extend_from_slice(&tree_id_bytes);
+            serialized_bytes.push(key.level);
+            serialized_bytes.extend_from_slice(&key.index.to_le_bytes());
+            serialized_bytes.extend_from_slice(&hash.into_owned_32bytes());
+        }
     }
 
 }

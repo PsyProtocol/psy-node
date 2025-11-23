@@ -404,13 +404,13 @@ impl<
         let user_leaf_10 = PQEDUserLeaf::<N::F, N::QHash>::random_with_user_id(user_id);
         assert!(db.get_user_leaf(checkpoint_10, user_id).await.is_err());
 
-        db.set_user_leaf_(checkpoint_10, &user_leaf_10).await?;
+        db.set_user_leaf(checkpoint_10, &user_leaf_10).await?;
         assert_eq!(db.get_user_leaf(checkpoint_10, user_id).await?, user_leaf_10);
         assert!(db.get_user_leaf(checkpoint_10 - 1, user_id).await.is_err());
         assert_eq!(db.get_user_leaf(checkpoint_10 + 1, user_id).await?, user_leaf_10);
 
         let user_leaf_12 = PQEDUserLeaf::<N::F, N::QHash>::random_with_user_id(user_id);
-        db.set_user_leaf_(checkpoint_12, &user_leaf_12).await?;
+        db.set_user_leaf(checkpoint_12, &user_leaf_12).await?;
         assert_eq!(db.get_user_leaf(checkpoint_10 + 1, user_id).await?, user_leaf_10);
         assert_eq!(db.get_user_leaf(checkpoint_12, user_id).await?, user_leaf_12);
 
