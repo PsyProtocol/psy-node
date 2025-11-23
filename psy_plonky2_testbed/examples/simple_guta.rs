@@ -204,14 +204,16 @@ impl SimpleChainTestbed {
         };
         let worker_rewards_tree_tag = Hash::rand();
         timer.lap("start verify_two_end_cap.prove_base");
-        let two_end_cap_proof = self.circuits.circuits.guta_circuits.verify_two_end_cap
+        /*let two_end_cap_proof = self.circuits.circuits.guta_circuits.verify_two_end_cap
         .prove_base(
             worker_rewards_tree_tag, &two_end_cap_input, &proof_0, &proof_1, self.circuits.dummy_end_cap_circuit.get_verifier_config_ref())?;
+            
         timer.lap("end verify_two_end_cap.prove_base");
 
         if two_end_cap_proof.public_inputs.len() == 0 {
             anyhow::bail!("two_end_cap_proof public inputs length mismatch");
         }
+        */
 
         Ok(())
     }

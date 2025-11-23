@@ -1,7 +1,7 @@
-use parth_core::{crypto::hash::merkle_proof::DeltaMerkleProofCore, pgoldilocks::QHashOut};
+use parth_core::{crypto::hash::merkle_proof::DeltaMerkleProofCore, pgoldilocks::QHashOut, utils::math::log2_ceil};
 use plonky2::{
     field::extension::Extendable,
-    hash::hash_types::{HashOutTarget, RichField},
+    hash::hash_types::{HashOut, HashOutTarget, RichField},
     iop::{
         target::{BoolTarget, Target},
         witness::Witness,
@@ -28,6 +28,7 @@ pub struct QVariableHeightDeltaMerkleProofGadget {
     pub index_bits: Vec<BoolTarget>,
     pub delta_merkle_proof_witness_flags: DeltaMerkleProofGadgetOptionFlags,
     pub has_known_height: bool,
+    tree_height: usize,
 }
 fn compute_merkle_root<H: AlgebraicHasher<F>, F: RichField + Extendable<D>, const D: usize>(
     builder: &mut CircuitBuilder<F, D>,
@@ -53,6 +54,17 @@ fn compute_merkle_root<H: AlgebraicHasher<F>, F: RichField + Extendable<D>, cons
     current_hash
 }
 impl QVariableHeightDeltaMerkleProofGadget {
+    pub fn get_parent_level<F: RichField + Extendable<D>, const D: usize>(
+        &self,
+        builder: &mut CircuitBuilder<F, D>,
+        child_level: Target,
+    ) -> Target {
+        // parent_level = child_level - height, we use the convention root is on level 0
+        let parent_level = builder.sub(child_level, self.height);
+        // range check to ensure parent level doesn't undeflow
+        builder.range_check(parent_level, log2_ceil(self.tree_height));
+        parent_level
+    }
     pub fn add_virtual_to<H: AlgebraicHasher<F>, F: RichField + Extendable<D>, const D: usize>(
         builder: &mut CircuitBuilder<F, D>,
         max_merkle_proof_height: usize,
@@ -123,6 +135,7 @@ impl QVariableHeightDeltaMerkleProofGadget {
             index_bits: index_bits,
             delta_merkle_proof_witness_flags,
             has_known_height,
+            tree_height,
         }
     }
     pub fn set_witness<W: Witness<F>, F: RichField>(
@@ -142,6 +155,32 @@ impl QVariableHeightDeltaMerkleProofGadget {
             witness.set_target(self.height, F::from_canonical_usize(delta_merkle_proof.siblings.len()))?;
         }
 
+        Ok(())
+    }
+    pub fn set_witness_siblings<W: Witness<F>, F: RichField>(
+        &self,
+        witness: &mut W,
+        siblings: &[QHashOut<F>],
+    ) -> anyhow::Result<()> {
+        if self.delta_merkle_proof.option_flags != DeltaMerkleProofGadgetOptionFlags::siblings {
+            return Err(anyhow::anyhow!("DeltaMerkleProofGadget was not created with only siblings as unknown"));
+        }
+        for (i, s) in self.delta_merkle_proof.siblings.iter().enumerate() {
+            if i < siblings.len() {
+                witness.set_hash_target(
+                    *s,
+                    siblings[i].0,
+                )?;
+            } else {
+                witness.set_hash_target(
+                    *s,
+                    HashOut::ZERO
+                )?;
+            }
+        }
+        if !self.has_known_height {
+            witness.set_target(self.height, F::from_canonical_usize(siblings.len()))?;
+        }
         Ok(())
     }
 }

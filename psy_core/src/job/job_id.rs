@@ -185,6 +185,12 @@ pub enum ProvingJobCircuitType {
     GUTATwoGUTAWithCheckpointUpgrade = 55,
     GUTAVerifyToCapWithCheckpointUpgrade = 56,
 
+    // ADDED NEW - For Linear Transitions
+    GUTATwoGUTALinear = 57,
+    GUTATwoGUTALinearUpgradeCheckpoint = 58,
+    GUTAVerifyLeftLinearRightLeafUpgradeCheckpoint = 59,
+    GUTAVerifyLeftLeafRightLinearUpgradeCheckpoint = 60,
+
     WrappedSignatureProof = 64,
     Secp256K1SignatureProof = 65,
 
@@ -321,6 +327,10 @@ impl TryFrom<u8> for ProvingJobCircuitType {
             54 => Ok(ProvingJobCircuitType::DummyBatchDeployContractsAggregate),
             55 => Ok(ProvingJobCircuitType::GUTATwoGUTAWithCheckpointUpgrade),
             56 => Ok(ProvingJobCircuitType::GUTAVerifyToCapWithCheckpointUpgrade),
+            57 => Ok(ProvingJobCircuitType::GUTATwoGUTALinear),
+            58 => Ok(ProvingJobCircuitType::GUTATwoGUTALinearUpgradeCheckpoint),
+            59 => Ok(ProvingJobCircuitType::GUTAVerifyLeftLinearRightLeafUpgradeCheckpoint),
+            60 => Ok(ProvingJobCircuitType::GUTAVerifyLeftLeafRightLinearUpgradeCheckpoint),
 
             64 => Ok(ProvingJobCircuitType::WrappedSignatureProof),
             65 => Ok(ProvingJobCircuitType::Secp256K1SignatureProof),
@@ -399,7 +409,11 @@ impl QProvingJobDataID {
             ProvingJobCircuitType::GUTAOnlyRegisterUsers |
             ProvingJobCircuitType::GUTANoChange |
             ProvingJobCircuitType::GUTATwoGUTAWithCheckpointUpgrade |
-            ProvingJobCircuitType::GUTAVerifyToCapWithCheckpointUpgrade => {},
+            ProvingJobCircuitType::GUTAVerifyToCapWithCheckpointUpgrade |
+            ProvingJobCircuitType::GUTATwoGUTALinear |
+            ProvingJobCircuitType::GUTATwoGUTALinearUpgradeCheckpoint |
+            ProvingJobCircuitType::GUTAVerifyLeftLinearRightLeafUpgradeCheckpoint |
+            ProvingJobCircuitType::GUTAVerifyLeftLeafRightLinearUpgradeCheckpoint => {},
             _ => anyhow::bail!("circuit type {:?} is not a GUTA circuit type", circuit_type),
         };
 

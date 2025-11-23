@@ -3,9 +3,9 @@ use std::{fs::File, io::prelude::*, path::PathBuf};
 use parth_core::{
     crypto::hash::traits::ToU64x4,
     pgoldilocks::QHashOut,
-    protocol::core_types::{QNetworkCircuitConstants, QNetworkTreeCircuitSpecificConstants, QNetworkTreeConstants},
+    protocol::core_types::{QNetworkCircuitConstants},
 };
-use plonky2::{field::goldilocks_field::GoldilocksField, hash::hash_types::HashOut, plonk::config::PoseidonGoldilocksConfig};
+use plonky2::{field::goldilocks_field::GoldilocksField, plonk::config::PoseidonGoldilocksConfig};
 use psy_core::{constants::protocol::get_default_worker_rewards_tree_tag, job::job_id::ProvingJobCircuitType, network_config::PsyNetworkLocalDevnetConstants};
 use psy_plonky2_basic_helpers::{
     lookalike::standard::{
@@ -15,7 +15,7 @@ use psy_plonky2_basic_helpers::{
     verifier::{alt::AltVerifierOnlyCircuitData, generic_circuit_library::GenericCircuitVerifier},
 };
 use psy_plonky2_circuits::{
-    coordinator::coordinator_helper::QEDCoordinatorCircuitManager, guta::guta_helper::QEDGUTACircuitManager, proof_minifier::pm_core::{get_circuit_fingerprint_generic, get_circuit_fingerprint_generic_q}, qstandard::QStandardCircuit
+    coordinator::coordinator_helper::QEDCoordinatorCircuitManager, guta::guta_helper::QEDGUTACircuitManager, proof_minifier::pm_core::{get_circuit_fingerprint_generic_q}, qstandard::QStandardCircuit
 };
 /*
 
@@ -172,20 +172,21 @@ fn run_gen_config<N: QNetworkCircuitConstants>() -> anyhow::Result<(String, Stri
         guta_circuits.verify_left_guta_right_end_cap.get_verifier_triplet(),
     );
     gcv.register_circuit_triplet(
-        ProvingJobCircuitType::GUTALeftEndCapRightGUTA,
-        guta_circuits.verify_left_end_cap_right_guta.get_verifier_triplet(),
+        ProvingJobCircuitType::GUTATwoGUTALinear,
+        guta_circuits.verify_two_guta_linear_transition.get_verifier_triplet(),
     );
     gcv.register_circuit_triplet(
-        ProvingJobCircuitType::GUTARegisterUsers,
-        guta_circuits.verify_guta_register_users.get_verifier_triplet(),
+        ProvingJobCircuitType::GUTATwoGUTALinearUpgradeCheckpoint,
+        guta_circuits.verify_two_guta_linear_transition_upgrade_checkpoint.get_verifier_triplet(),
+
     );
     gcv.register_circuit_triplet(
         ProvingJobCircuitType::GUTAVerifyToCap,
         guta_circuits.verify_guta_to_cap.get_verifier_triplet(),
     );
     gcv.register_circuit_triplet(
-        ProvingJobCircuitType::GUTAOnlyRegisterUsers,
-        guta_circuits.only_register_users.get_verifier_triplet(),
+        ProvingJobCircuitType::GUTAVerifyLeftLinearRightLeafUpgradeCheckpoint,
+        guta_circuits.verify_guta_left_linear_right_leaf_upgrade_checkpoint.get_verifier_triplet(),
     );
     gcv.register_circuit_triplet(ProvingJobCircuitType::GUTANoChange, guta_circuits.no_change.get_verifier_triplet());
     let coordinator_circuits = QEDCoordinatorCircuitManager::<C, D>::new_with_guta(

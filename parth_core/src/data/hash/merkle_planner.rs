@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use auto_impl::auto_impl;
 
 use crate::data::hash::merkle_node_key::{generate_nca_tree_groups_v1, SimpleMerkleNodeKey};
 

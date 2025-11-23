@@ -11,7 +11,7 @@ use plonky2::{
     },
 };
 use psy_data::guta::header::GlobalUserTreeAggregatorHeader;
-use psy_plonky2_basic_helpers::builder::{pad_circuit::PsyCircuitBuilderGateCountPrinter, verify::CircuitBuilderVerifyProofHelpers};
+use psy_plonky2_basic_helpers::builder::verify::CircuitBuilderVerifyProofHelpers;
 use psy_plonky2_common_circuits::hash::merkle::gadgets::merkle_proof::MerkleProofGadget;
 
 use super::{guta_header::GlobalUserTreeAggregatorHeaderGadget, helpers::ToGUTAHeader};

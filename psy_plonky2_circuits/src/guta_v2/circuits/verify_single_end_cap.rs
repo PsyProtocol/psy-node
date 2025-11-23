@@ -15,7 +15,7 @@ use psy_core::
     job::job_id::{ProvingJobCircuitType, QProvingJobDataID}
 ;
 use psy_data::{
-    proof_input::guta::{VerifySingleEndCapInput, VerifySingleEndCapInputV2}, worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse
+    proof_input::guta::VerifySingleEndCapInputV2, worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse
     ,
 };
 use psy_plonky2_basic_helpers::{
@@ -25,11 +25,10 @@ use psy_plonky2_basic_helpers::{
     },
     verifier::circuit_library::CircuitInfoLibrary,
 };
-use psy_plonky2_common_circuits::hash::merkle::gadgets::variable_height_delta_merkle_proof_sub_tree::VariableHeightDeltaMerkleProofInSubTreeGadget;
 use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 
 use crate::{
-    guta::gadgets::dual_variable_height_state_transition::DualVariableHeightStateTransitionGadget, proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{QPsyNetworkCircuitWithType, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QStandardCircuitProvableWithRawProofsAndRefLibrary, proof_store::QProofStoreReaderAsync}, utils::proof_library::get_single_child_proof_for_api_response_with_inclusion_proof
+    guta::gadgets::single_variable_height_state_transition::SingleVariableHeightStateTransitionGadget, proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{QPsyNetworkCircuitWithType, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QStandardCircuitProvableWithRawProofsAndRefLibrary, proof_store::QProofStoreReaderAsync}, utils::proof_library::get_single_child_proof_for_api_response_with_inclusion_proof
 };
 
 use crate::guta::gadgets::verify_end_cap::VerifyEndCapProofGadget;
@@ -42,7 +41,7 @@ where
 {
     pub guta_circuit_whitelist_root_hash: HashOutTarget,
     pub a_end_cap_gadget: VerifyEndCapProofGadget<D>,
-    pub dvh_state_transition_gadget: DualVariableHeightStateTransitionGadget,
+    pub svh_state_transition_gadget: SingleVariableHeightStateTransitionGadget,
     pub worker_rewards_tree_tag: HashOutTarget,
 
     pub circuit_data: CircuitData<C::F, C, D>,
@@ -64,6 +63,7 @@ where
             end_cap_proof_verifier_data_cap_height: usize,
             known_end_cap_fingerprint: QHashOut<C::F>,
             global_user_tree_height: usize,
+            realm_user_tree_height: usize,
             _guta_circuit_whitelist_tree_height: u8,
             checkpoint_tree_height: usize,
         ) -> Self {
@@ -84,19 +84,17 @@ where
             known_end_cap_fingerprint_hash,
         );
 
-        let mut a_end_cap_guta_header = a_end_cap_gadget.get_guta_header::<C::Hasher, C::F>(
+        let a_end_cap_guta_header = a_end_cap_gadget.get_guta_header::<C::Hasher, C::F>(
             &mut builder,
             guta_circuit_whitelist_root_hash,
             global_user_tree_height as u8,
         );
-        let dvh_state_transition_gadget =
-            VariableHeightDeltaMerkleProofInSubTreeGadget::add_virtual_to_full::<C, C::F>(
+        let svh_state_transition_gadget =
+            SingleVariableHeightStateTransitionGadget::add_virtual_to::<C::Hasher, C::F, D>(
                 &mut builder,
-                global_user_tree_height,
-                checkpoint_tree_height,
-                &a_end_cap_guta_header,
-                &a_end_cap_guta_header,
-                global_user_tree_height,
+                a_end_cap_guta_header,
+                realm_user_tree_height,
+                global_user_tree_height
             );
 
         tracing::debug!("📊 a_end_cap_guta_header: {:?}", a_end_cap_guta_header);
@@ -104,8 +102,8 @@ where
         let worker_rewards_tree_tag = builder.add_virtual_hash();
 
         // because we are still generating a proof, it needs to be counted
-        a_end_cap_guta_header.total_aggregation_proofs_generated = builder.one();
-        let public_inputs_hash = a_end_cap_guta_header.get_public_inputs_hash_no_children::<C::Hasher, C::F, D>(&mut builder, worker_rewards_tree_tag);
+        let final_guta_header = svh_state_transition_gadget.new_guta_header;
+        let public_inputs_hash = final_guta_header.get_public_inputs_hash_no_children::<C::Hasher, C::F, D>(&mut builder, worker_rewards_tree_tag);
 
         builder.register_public_inputs(&public_inputs_hash.elements);
 
@@ -119,6 +117,7 @@ where
         Self {
             guta_circuit_whitelist_root_hash,
             a_end_cap_gadget,
+            svh_state_transition_gadget,
             worker_rewards_tree_tag,
             circuit_data,
             fingerprint,
@@ -145,6 +144,8 @@ where
             child_a_proof,
             end_cap_verifier_data
         )?;
+
+        self.svh_state_transition_gadget.set_witness(&mut pw, &input.global_user_tree_sub_root_transition)?;
 
         self.circuit_data.prove(pw)
     }
@@ -188,7 +189,7 @@ where
         job_id: QProvingJobDataID,
         worker_rewards_tree_tag: QHashOut<C::F>,
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
-        let r: CircuitInputWithDependencies<VerifySingleEndCapInput<C::F, QHashOut<C::F>>, QProvingJobDataID> =
+        let r: CircuitInputWithDependencies<VerifySingleEndCapInputV2<C::F, QHashOut<C::F>>, QProvingJobDataID> =
             bincode::deserialize(&store.get_bytes_by_id(job_id.get_input_witness_id()).await?)
                 .map_err(|e| anyhow::anyhow!(e))?;
         tracing::debug!("GUTAVerifySingleEndCapCircuitV2Input: {}", serde_json::to_string_pretty(&r)?);

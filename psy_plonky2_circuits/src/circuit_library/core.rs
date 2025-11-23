@@ -86,20 +86,20 @@ where
         guta_circuits.verify_left_guta_right_end_cap.get_verifier_triplet(),
     );
     gcv.register_circuit_triplet(
-        ProvingJobCircuitType::GUTALeftEndCapRightGUTA,
-        guta_circuits.verify_left_end_cap_right_guta.get_verifier_triplet(),
+        ProvingJobCircuitType::GUTATwoGUTALinear,
+        guta_circuits.verify_two_guta_linear_transition.get_verifier_triplet(),
     );
     gcv.register_circuit_triplet(
-        ProvingJobCircuitType::GUTARegisterUsers,
-        guta_circuits.verify_guta_register_users.get_verifier_triplet(),
+        ProvingJobCircuitType::GUTATwoGUTALinearUpgradeCheckpoint,
+        guta_circuits.verify_two_guta_linear_transition_upgrade_checkpoint.get_verifier_triplet(),
     );
     gcv.register_circuit_triplet(
         ProvingJobCircuitType::GUTAVerifyToCap,
         guta_circuits.verify_guta_to_cap.get_verifier_triplet(),
     );
     gcv.register_circuit_triplet(
-        ProvingJobCircuitType::GUTAOnlyRegisterUsers,
-        guta_circuits.only_register_users.get_verifier_triplet(),
+        ProvingJobCircuitType::GUTAVerifyLeftLinearRightLeafUpgradeCheckpoint,
+        guta_circuits.verify_guta_left_linear_right_leaf_upgrade_checkpoint.get_verifier_triplet(),
     );
     gcv.register_circuit_triplet(ProvingJobCircuitType::GUTANoChange, guta_circuits.no_change.get_verifier_triplet());
     let coordinator_circuits = QEDCoordinatorCircuitManager::<C, D>::new_with_guta(

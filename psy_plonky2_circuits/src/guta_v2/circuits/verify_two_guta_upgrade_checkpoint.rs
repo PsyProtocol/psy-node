@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use parth_core::{
-    crypto::hash::traits::MerkleZeroHasher,
+    crypto::hash::{merkle_proof::MerkleProofCore, traits::MerkleZeroHasher},
     felt::QFelt64,
     pgoldilocks::{QHashOut, QRichField},
     protocol::core_types::Q256BitHash,
@@ -18,7 +18,7 @@ use plonky2::{
 };
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{
-    proof_input::guta::{VerifyTwoGUTAProofUpgradeCheckpointStandardInput, VerifyTwoGUTAProofUpgradeCheckpointStandardInputSimple},
+    proof_input::guta::GUTAVerifyTwoGUTAUpgradeCheckpointCircuitInputV2,
     worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse,
 };
 use psy_plonky2_basic_helpers::{builder::{hash::core::CircuitBuilderHashCore, pad_circuit::PsyCircuitBuilderGateCountPrinter}, verifier::circuit_library::CircuitInfoLibrary};
@@ -163,7 +163,6 @@ where
         builder.add_gate_to_gate_set(GateRef::new(ConstantGate::new(builder.config.num_constants)));
         builder.print_gate_counts_with_message("G2GUpgrade before build");
         let circuit_data = builder.build::<C>();
-        println!("common_data_verify_two_guta_upgrade_checkpoint: {:?}", circuit_data.common);
 
         let fingerprint = QHashOut(get_circuit_fingerprint_generic(&circuit_data.verifier_only));
 
@@ -189,7 +188,9 @@ where
     pub fn prove_base(
         &self,
         worker_rewards_tree_tag: QHashOut<C::F>,
-        input: &VerifyTwoGUTAProofUpgradeCheckpointStandardInput<C::F, QHashOut<C::F>>,
+        guta_inclusion_proof_a: &MerkleProofCore<QHashOut<C::F>>,
+        guta_inclusion_proof_b: &MerkleProofCore<QHashOut<C::F>>,
+        input: &GUTAVerifyTwoGUTAUpgradeCheckpointCircuitInputV2<C::F, QHashOut<C::F>>,
         child_a_proof: &ProofWithPublicInputs<C::F, C, D>,
         child_a_verifier_data: &VerifierOnlyCircuitData<C, D>,
         child_b_proof: &ProofWithPublicInputs<C::F, C, D>,
@@ -203,33 +204,33 @@ where
         tracing::debug!(
             "🔄 Two GUTA Upgrade Checkpoint set_witness - worker_rewards_tree_tag: {}, checkpoint_proof_a: {}, checkpoint_proof_b: {}",
             serde_json::to_string_pretty(&worker_rewards_tree_tag).unwrap(),
-            serde_json::to_string_pretty(&input.historical_checkpoint_proof_a).unwrap(),
-            serde_json::to_string_pretty(&input.historical_checkpoint_proof_b).unwrap()
+            serde_json::to_string_pretty(&input.left_historical_checkpoint_merkle_proof).unwrap(),
+            serde_json::to_string_pretty(&input.right_historical_checkpoint_merkle_proof).unwrap()
         );
 
         self.historical_checkpoint_proof_a
-            .set_witness_proof_core(&mut pw, &input.historical_checkpoint_proof_a)?;
+            .set_witness_proof_core(&mut pw, &input.left_historical_checkpoint_merkle_proof)?;
         self.historical_checkpoint_proof_b
-            .set_witness_proof_core(&mut pw, &input.historical_checkpoint_proof_b)?;
+            .set_witness_proof_core(&mut pw, &input.right_historical_checkpoint_merkle_proof)?;
 
         self.a_guta_gadget.set_witness(
             &mut pw,
-            &input.guta_inclusion_proof_a,
-            &input.get_guta_header_a::<C::Hasher>(),
+            guta_inclusion_proof_a,
+            &input.get_guta_header_a(),
             child_a_proof,
             child_a_verifier_data,
             left_child_proof_rewards_tree_value,
         )?;
         self.b_guta_gadget.set_witness(
             &mut pw,
-            &input.guta_inclusion_proof_b,
-            &input.get_guta_header_b::<C::Hasher>(),
+            guta_inclusion_proof_b,
+            &input.get_guta_header_b(),
             child_b_proof,
             child_b_verifier_data,
             right_child_proof_rewards_tree_value,
         )?;
 
-        self.dvh_state_transition_gadget.set_witness_partial(&mut pw, &input.nca_proof)?;
+        self.dvh_state_transition_gadget.set_witness_params(&mut pw, &input.left_global_user_tree_delta_merkle_proof, &input.right_global_user_tree_delta_merkle_proof)?;
 
         let base_proof = self.circuit_data.prove(pw)?;
         self.minifier_chain.prove(&base_proof)
@@ -270,21 +271,13 @@ where
         let (left_child_guta_proof_result, right_child_guta_proof_result) =
             get_two_child_proofs_for_api_response_with_inclusion_proof::<L, C, D>(library, &input)?;
 
-        let witness = VerifyTwoGUTAProofUpgradeCheckpointStandardInputSimple::<C::F, QHashOut<C::F>>::psy_ser_from_slice(&input.base.witness)?;
+        let witness = GUTAVerifyTwoGUTAUpgradeCheckpointCircuitInputV2::<C::F, QHashOut<C::F>>::psy_ser_from_slice(&input.base.witness)?;
 
         self.prove_base(
             worker_reward_tag,
-            &VerifyTwoGUTAProofUpgradeCheckpointStandardInput {
-                historical_checkpoint_proof_a: witness.historical_checkpoint_proof_a,
-                historical_checkpoint_proof_b: witness.historical_checkpoint_proof_b,
-                stats_a: witness.stats_a,
-                stats_b: witness.stats_b,
-                nca_proof: witness.nca_proof,
-                guta_inclusion_proof_a: left_child_guta_proof_result.whitelist_inclusion_proof,
-                guta_inclusion_proof_b: right_child_guta_proof_result.whitelist_inclusion_proof,
-                total_aggregation_proofs_generated_a: witness.total_aggregation_proofs_generated_a,
-                total_aggregation_proofs_generated_b: witness.total_aggregation_proofs_generated_b,
-            },
+            &left_child_guta_proof_result.whitelist_inclusion_proof,
+            &right_child_guta_proof_result.whitelist_inclusion_proof,
+            &witness,
             &left_child_guta_proof_result.zk_proof,
             &left_child_guta_proof_result.verifier_data,
             &right_child_guta_proof_result.zk_proof,

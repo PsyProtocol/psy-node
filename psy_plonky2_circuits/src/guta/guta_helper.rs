@@ -21,7 +21,7 @@ use super::circuits::{
 use crate::{guta::circuits::{
     verify_guta_to_cap_upgrade_checkpoint::GUTAVerifyGUTAToCapUpgradeCheckpointCircuit,
     verify_two_guta_upgrade_checkpoint::GUTAVerifyTwoGUTAUpgradeCheckpointCircuit,
-}, qstandard::{QStandardCircuit, QStandardCircuitProvableWithRawProofsAndRefLibrary}, utils::proof_serialization::serialize_plonky2_proof};
+}, guta_v2::circuits::{verify_guta_left_linear_right_leaf_upgrade_checkpoint::GUTAVerifyLeftLinearRightLeafUpgradeCheckpointCircuit, verify_guta_linear_transition::{self, GUTAVerifyTwoGUTALinearCircuit}, verify_guta_linear_transition_upgrade_checkpoint::{self, GUTAVerifyTwoGUTALinearUpgradeCheckpointCircuit}, verify_left_guta_right_end_cap::GUTAVerifyLeftGUTARightEndCapCircuitV2, verify_single_end_cap::GUTAVerifySingleEndCapCircuitV2, verify_two_end_cap::GUTAVerifyTwoEndCapCircuitV2, verify_two_guta::GUTAVerifyTwoGUTACircuitV2, verify_two_guta_upgrade_checkpoint::GUTAVerifyTwoGUTAUpgradeCheckpointCircuitV2}, qstandard::{QStandardCircuit, QStandardCircuitProvableWithRawProofsAndRefLibrary}, utils::proof_serialization::serialize_plonky2_proof};
 
 #[derive(Debug)]
 pub struct QEDGUTACircuitManager<C: GenericConfig<D> + 'static, const D: usize>
@@ -30,18 +30,18 @@ where
 {
     pub end_cap_fingerprint: QHashOut<C::F>,
 
-    pub verify_single_end_cap: GUTAVerifySingleEndCapCircuit<C, D>,
-    pub verify_two_end_cap: GUTAVerifyTwoEndCapCircuit<C, D>,
-    pub verify_two_guta: GUTAVerifyTwoGUTACircuit<C, D>,
-    pub verify_left_guta_right_end_cap: GUTAVerifyLeftGUTARightEndCapCircuit<C, D>,
+    pub verify_single_end_cap: GUTAVerifySingleEndCapCircuitV2<C, D>,
+    pub verify_two_end_cap: GUTAVerifyTwoEndCapCircuitV2<C, D>,
+    pub verify_two_guta: GUTAVerifyTwoGUTACircuitV2<C, D>,
+    pub verify_left_guta_right_end_cap: GUTAVerifyLeftGUTARightEndCapCircuitV2<C, D>,
 
-    pub verify_left_end_cap_right_guta: GUTAVerifyLeftEndCapRightGUTACircuit<C, D>,
-    pub verify_guta_register_users: GUTAVerifyGUTARegisterUsersCircuit<C, D>,
+    pub verify_two_guta_linear_transition_upgrade_checkpoint: GUTAVerifyTwoGUTALinearUpgradeCheckpointCircuit<C, D>,
+    pub verify_two_guta_linear_transition: GUTAVerifyTwoGUTALinearCircuit<C, D>,
     pub verify_guta_to_cap: GUTAVerifyGUTAToCapCircuit<C, D>,
-    pub only_register_users: GUTAOnlyRegisterUsersCircuit<C, D>,
+    pub verify_guta_left_linear_right_leaf_upgrade_checkpoint: GUTAVerifyLeftLinearRightLeafUpgradeCheckpointCircuit<C, D>,
     pub no_change: GUTANoChangeCircuit<C, D>,
 
-    pub verify_two_guta_upgrade_checkpoint: GUTAVerifyTwoGUTAUpgradeCheckpointCircuit<C, D>,
+    pub verify_two_guta_upgrade_checkpoint: GUTAVerifyTwoGUTAUpgradeCheckpointCircuitV2<C, D>,
     pub verify_guta_to_cap_upgrade_checkpoint: GUTAVerifyGUTAToCapUpgradeCheckpointCircuit<C, D>,
 
     pub guta_circuit_whitelist_root: QHashOut<C::F>,
@@ -50,12 +50,12 @@ where
     pub verify_two_end_cap_whitelist_proof: MerkleProofCore<QHashOut<C::F>>,
     pub verify_two_guta_whitelist_proof: MerkleProofCore<QHashOut<C::F>>,
     pub verify_left_guta_right_end_cap_whitelist_proof: MerkleProofCore<QHashOut<C::F>>,
-    pub verify_left_end_cap_right_guta_whitelist_proof: MerkleProofCore<QHashOut<C::F>>,
-    pub verify_guta_register_users_whitelist_proof: MerkleProofCore<QHashOut<C::F>>,
+    pub verify_two_guta_linear_transition_whitelist_proof: MerkleProofCore<QHashOut<C::F>>,
+    pub verify_two_guta_linear_transition_upgrade_checkpoint_whitelist_proof: MerkleProofCore<QHashOut<C::F>>,
     pub verify_guta_to_cap_whitelist_proof: MerkleProofCore<QHashOut<C::F>>,
     pub verify_two_guta_upgrade_checkpoint_whitelist_proof: MerkleProofCore<QHashOut<C::F>>,
     pub verify_guta_to_cap_upgrade_checkpoint_whitelist_proof: MerkleProofCore<QHashOut<C::F>>,
-    pub only_register_users_whitelist_proof: MerkleProofCore<QHashOut<C::F>>,
+    pub verify_guta_left_linear_right_leaf_upgrade_checkpoint_whitelist_proof: MerkleProofCore<QHashOut<C::F>>,
     pub no_change_whitelist_proof: MerkleProofCore<QHashOut<C::F>>,
 }
 
@@ -117,16 +117,17 @@ where
         } else {
             coordinator_global_user_tree_height
         };
-        let verify_single_end_cap = GUTAVerifySingleEndCapCircuit::<C, D>::new(
+        let verify_single_end_cap = GUTAVerifySingleEndCapCircuitV2::<C, D>::new(
             end_cap_proof_common_data,
             end_cap_proof_verifier_data_cap_height,
             known_end_cap_fingerprint,
             global_user_tree_height,
+            global_user_tree_realm_height,
             guta_circuit_whitelist_tree_height,
             checkpoint_tree_height,
         );
 
-        let verify_two_end_cap = GUTAVerifyTwoEndCapCircuit::<C, D>::new(
+        let verify_two_end_cap = GUTAVerifyTwoEndCapCircuitV2::<C, D>::new(
             end_cap_proof_common_data,
             end_cap_proof_verifier_data_cap_height,
             known_end_cap_fingerprint,
@@ -139,9 +140,9 @@ where
         let guta_proof_common_data: &CommonCircuitData<C::F, D> = verify_two_end_cap.get_common_circuit_data_ref();
         let guta_proof_verifier_data_cap_height: usize = verify_single_end_cap.get_verifier_config_ref().constants_sigmas_cap.height();
 
-        let verify_two_guta = GUTAVerifyTwoGUTACircuit::<C, D>::new(guta_proof_common_data, guta_proof_verifier_data_cap_height, global_user_tree_height, max_guta_nca_merkle_proof_height, guta_circuit_whitelist_tree_height);
+        let verify_two_guta = GUTAVerifyTwoGUTACircuitV2::<C, D>::new(guta_proof_common_data, guta_proof_verifier_data_cap_height, global_user_tree_height, max_guta_nca_merkle_proof_height, guta_circuit_whitelist_tree_height);
 
-        let verify_left_guta_right_end_cap = GUTAVerifyLeftGUTARightEndCapCircuit::<C, D>::new(
+        let verify_left_guta_right_end_cap = GUTAVerifyLeftGUTARightEndCapCircuitV2::<C, D>::new(
             guta_proof_common_data,
             guta_proof_verifier_data_cap_height,
             end_cap_proof_common_data,
@@ -153,38 +154,35 @@ where
             checkpoint_tree_height,
         );
 
-        let verify_left_end_cap_right_guta = GUTAVerifyLeftEndCapRightGUTACircuit::<C, D>::new(
+        let verify_guta_left_linear_right_leaf_upgrade_checkpoint = GUTAVerifyLeftLinearRightLeafUpgradeCheckpointCircuit::<C, D>::new(
             guta_proof_common_data,
             guta_proof_verifier_data_cap_height,
-            end_cap_proof_common_data,
-            end_cap_proof_verifier_data_cap_height,
-            known_end_cap_fingerprint,
-            global_user_tree_height, 
-            max_guta_nca_merkle_proof_height,
             guta_circuit_whitelist_tree_height,
             checkpoint_tree_height,
-        );
-
-        let verify_guta_register_users = GUTAVerifyGUTARegisterUsersCircuit::<C, D>::new(
-            guta_proof_common_data,
-            guta_proof_verifier_data_cap_height,
-            max_users_to_register_per_proof,
-            global_user_tree_realm_height,
             global_user_tree_height,
-            group_realm_height,
-            default_user_state_tree_root,
+            max_guta_nca_merkle_proof_height,
+        );
+
+        let verify_two_guta_linear_transition = GUTAVerifyTwoGUTALinearCircuit::<C, D>::new(
+            guta_proof_common_data,
+            guta_proof_verifier_data_cap_height,
             guta_circuit_whitelist_tree_height,
+        );
+
+        let verify_two_guta_linear_transition_upgrade_checkpoint = GUTAVerifyTwoGUTALinearUpgradeCheckpointCircuit::<C, D>::new(
+            guta_proof_common_data,
+            guta_proof_verifier_data_cap_height,
+            guta_circuit_whitelist_tree_height,
+            checkpoint_tree_height,
         );
 
         let verify_guta_to_cap = GUTAVerifyGUTAToCapCircuit::<C, D>::new(guta_proof_common_data, guta_proof_verifier_data_cap_height, global_user_tree_realm_height, global_user_tree_height, guta_circuit_whitelist_tree_height);
 
         let verify_two_guta_upgrade_checkpoint =
-            GUTAVerifyTwoGUTAUpgradeCheckpointCircuit::<C, D>::new(guta_proof_common_data, guta_proof_verifier_data_cap_height, global_user_tree_height, max_guta_nca_merkle_proof_height, guta_circuit_whitelist_tree_height, checkpoint_tree_height);
+            GUTAVerifyTwoGUTAUpgradeCheckpointCircuitV2::<C, D>::new(guta_proof_common_data, guta_proof_verifier_data_cap_height, global_user_tree_height, max_guta_nca_merkle_proof_height, guta_circuit_whitelist_tree_height, checkpoint_tree_height);
 
         let verify_guta_to_cap_upgrade_checkpoint =
             GUTAVerifyGUTAToCapUpgradeCheckpointCircuit::<C, D>::new(guta_proof_common_data, guta_proof_verifier_data_cap_height, global_user_tree_realm_height, global_user_tree_height, guta_circuit_whitelist_tree_height, checkpoint_tree_height);
-
-        let only_register_users = GUTAOnlyRegisterUsersCircuit::<C, D>::new(only_register_max_users_per_proof, global_user_tree_realm_height, global_user_tree_height, group_realm_height, default_user_state_tree_root);
 
         let no_change = GUTANoChangeCircuit::<C, D>::new(checkpoint_tree_height);
 
@@ -195,12 +193,12 @@ where
                 verify_two_end_cap.get_fingerprint(),
                 verify_two_guta.get_fingerprint(),
                 verify_left_guta_right_end_cap.get_fingerprint(),
-                verify_left_end_cap_right_guta.get_fingerprint(),
-                verify_guta_register_users.get_fingerprint(),
+                verify_two_guta_linear_transition.get_fingerprint(),
+                verify_two_guta_linear_transition_upgrade_checkpoint.get_fingerprint(),
                 verify_guta_to_cap.get_fingerprint(),
                 verify_two_guta_upgrade_checkpoint.get_fingerprint(),
                 verify_guta_to_cap_upgrade_checkpoint.get_fingerprint(),
-                only_register_users.get_fingerprint(),
+                verify_guta_left_linear_right_leaf_upgrade_checkpoint.get_fingerprint(),
                 no_change.get_fingerprint(),
             ],
         )
@@ -211,12 +209,12 @@ where
         let verify_two_end_cap_whitelist_proof = guta_circuit_whitelist_proofs.pop().unwrap();
         let verify_two_guta_whitelist_proof = guta_circuit_whitelist_proofs.pop().unwrap();
         let verify_left_guta_right_end_cap_whitelist_proof = guta_circuit_whitelist_proofs.pop().unwrap();
-        let verify_left_end_cap_right_guta_whitelist_proof = guta_circuit_whitelist_proofs.pop().unwrap();
-        let verify_guta_register_users_whitelist_proof = guta_circuit_whitelist_proofs.pop().unwrap();
+        let verify_two_guta_linear_transition_whitelist_proof = guta_circuit_whitelist_proofs.pop().unwrap();
+        let verify_two_guta_linear_transition_upgrade_checkpoint_whitelist_proof = guta_circuit_whitelist_proofs.pop().unwrap();
         let verify_guta_to_cap_whitelist_proof = guta_circuit_whitelist_proofs.pop().unwrap();
         let verify_two_guta_upgrade_checkpoint_whitelist_proof = guta_circuit_whitelist_proofs.pop().unwrap();
         let verify_guta_to_cap_upgrade_checkpoint_whitelist_proof = guta_circuit_whitelist_proofs.pop().unwrap();
-        let only_register_users_whitelist_proof = guta_circuit_whitelist_proofs.pop().unwrap();
+        let verify_guta_left_linear_right_leaf_upgrade_checkpoint_whitelist_proof = guta_circuit_whitelist_proofs.pop().unwrap();
         let no_change_whitelist_proof = guta_circuit_whitelist_proofs.pop().unwrap();
 
         Self {
@@ -226,11 +224,10 @@ where
             verify_two_end_cap,
             verify_two_guta,
             verify_left_guta_right_end_cap,
+            verify_two_guta_linear_transition_upgrade_checkpoint,
+            verify_two_guta_linear_transition,
 
-            verify_left_end_cap_right_guta,
-            verify_guta_register_users,
             verify_guta_to_cap,
-            only_register_users,
             no_change,
             verify_two_guta_upgrade_checkpoint,
             verify_guta_to_cap_upgrade_checkpoint,
@@ -241,13 +238,14 @@ where
             verify_two_end_cap_whitelist_proof,
             verify_two_guta_whitelist_proof,
             verify_left_guta_right_end_cap_whitelist_proof,
-            verify_left_end_cap_right_guta_whitelist_proof,
-            verify_guta_register_users_whitelist_proof,
+            verify_two_guta_linear_transition_whitelist_proof,
+            verify_two_guta_linear_transition_upgrade_checkpoint_whitelist_proof,
             verify_guta_to_cap_whitelist_proof,
             verify_two_guta_upgrade_checkpoint_whitelist_proof,
             verify_guta_to_cap_upgrade_checkpoint_whitelist_proof,
-            only_register_users_whitelist_proof,
             no_change_whitelist_proof,
+            verify_guta_left_linear_right_leaf_upgrade_checkpoint,
+            verify_guta_left_linear_right_leaf_upgrade_checkpoint_whitelist_proof,
         }
     }
 
@@ -269,12 +267,12 @@ where
             self.verify_left_guta_right_end_cap.get_common_circuit_data_ref()
         );
         println!(
-            "================================\n[verify_left_end_cap_right_guta.common]:\n{:?}",
-            self.verify_left_end_cap_right_guta.get_common_circuit_data_ref()
+            "================================\n[verify_two_guta_linear_transition.common]:\n{:?}",
+            self.verify_two_guta_linear_transition.get_common_circuit_data_ref()
         );
         println!(
-            "================================\n[verify_guta_register_users.common]:\n{:?}",
-            self.verify_guta_register_users.get_common_circuit_data_ref()
+            "================================\n[verify_two_guta_linear_transition_upgrade_checkpoint.common]:\n{:?}",
+            self.verify_two_guta_linear_transition_upgrade_checkpoint.get_common_circuit_data_ref()
         );
         println!(
             "================================\n[verify_guta_to_cap.common]:\n{:?}",
@@ -289,8 +287,8 @@ where
             self.verify_guta_to_cap_upgrade_checkpoint.get_common_circuit_data_ref()
         );
         println!(
-            "================================\n[only_register_users.common]:\n{:?}",
-            self.only_register_users.get_common_circuit_data_ref()
+            "================================\n[verify_guta_left_linear_right_leaf_upgrade_checkpoint.common]:\n{:?}",
+            self.verify_guta_left_linear_right_leaf_upgrade_checkpoint.get_common_circuit_data_ref()
         );
         println!(
             "================================\n[no_change.common]:\n{:?}",
@@ -320,14 +318,14 @@ where
             self.verify_left_guta_right_end_cap.get_verifier_config_ref().into(),
         );
         library.register_circuit(
-            ProvingJobCircuitType::GUTALeftEndCapRightGUTA.into(),
-            self.verify_left_end_cap_right_guta.get_fingerprint(),
-            self.verify_left_end_cap_right_guta.get_verifier_config_ref().into(),
+            ProvingJobCircuitType::GUTATwoGUTALinear.into(),
+            self.verify_two_guta_linear_transition.get_fingerprint(),
+            self.verify_two_guta_linear_transition.get_verifier_config_ref().into(),
         );
         library.register_circuit(
-            ProvingJobCircuitType::GUTARegisterUsers.into(),
-            self.verify_guta_register_users.get_fingerprint(),
-            self.verify_guta_register_users.get_verifier_config_ref().into(),
+            ProvingJobCircuitType::GUTATwoGUTALinearUpgradeCheckpoint.into(),
+            self.verify_two_guta_linear_transition_upgrade_checkpoint.get_fingerprint(),
+            self.verify_two_guta_linear_transition_upgrade_checkpoint.get_verifier_config_ref().into(),
         );
         library.register_circuit(
             ProvingJobCircuitType::GUTAVerifyToCap.into(),
@@ -345,14 +343,14 @@ where
             self.verify_guta_to_cap_upgrade_checkpoint.get_verifier_config_ref().into(),
         );
         library.register_circuit(
-            ProvingJobCircuitType::GUTAOnlyRegisterUsers.into(),
-            self.only_register_users.get_fingerprint(),
-            self.only_register_users.get_verifier_config_ref().into(),
-        );
-        library.register_circuit(
             ProvingJobCircuitType::GUTANoChange.into(),
             self.no_change.get_fingerprint(),
             self.no_change.get_verifier_config_ref().into(),
+        );
+        library.register_circuit(
+            ProvingJobCircuitType::GUTATwoGUTALinearUpgradeCheckpoint.into(),
+            self.verify_two_guta_linear_transition_upgrade_checkpoint.get_fingerprint(),
+            self.verify_two_guta_linear_transition_upgrade_checkpoint.get_verifier_config_ref().into(),
         );
 
         let all_group = [
@@ -361,11 +359,12 @@ where
             ProvingJobCircuitType::GUTATwoGUTA,
             ProvingJobCircuitType::GUTALeftGUTARightEndCap,
             ProvingJobCircuitType::GUTALeftEndCapRightGUTA,
-            ProvingJobCircuitType::GUTARegisterUsers,
-            ProvingJobCircuitType::GUTAOnlyRegisterUsers,
+            ProvingJobCircuitType::GUTATwoGUTALinear,
+            ProvingJobCircuitType::GUTATwoGUTALinearUpgradeCheckpoint,
             ProvingJobCircuitType::GUTAVerifyToCap,
             ProvingJobCircuitType::GUTATwoGUTAWithCheckpointUpgrade,
             ProvingJobCircuitType::GUTAVerifyToCapWithCheckpointUpgrade,
+            ProvingJobCircuitType::GUTAVerifyLeftLinearRightLeafUpgradeCheckpoint,
             ProvingJobCircuitType::GUTANoChange,
         ];
 
@@ -395,20 +394,20 @@ where
 
         library.add_inclusion_proof(
             &all_group,
-            ProvingJobCircuitType::GUTALeftEndCapRightGUTA,
-            self.verify_left_end_cap_right_guta_whitelist_proof.clone(),
+            ProvingJobCircuitType::GUTATwoGUTALinearUpgradeCheckpoint,
+            self.verify_two_guta_linear_transition_whitelist_proof.clone(),
         );
 
         library.add_inclusion_proof(
             &all_group,
-            ProvingJobCircuitType::GUTARegisterUsers,
-            self.verify_guta_register_users_whitelist_proof.clone(),
+            ProvingJobCircuitType::GUTATwoGUTALinearUpgradeCheckpoint,
+            self.verify_two_guta_linear_transition_upgrade_checkpoint_whitelist_proof.clone(),
         );
 
         library.add_inclusion_proof(
             &all_group,
-            ProvingJobCircuitType::GUTAOnlyRegisterUsers,
-            self.only_register_users_whitelist_proof.clone(),
+            ProvingJobCircuitType::GUTAVerifyLeftLinearRightLeafUpgradeCheckpoint,
+            self.verify_guta_left_linear_right_leaf_upgrade_checkpoint_whitelist_proof.clone(),
         );
 
         library.add_inclusion_proof(
@@ -443,13 +442,13 @@ where
             ProvingJobCircuitType::GUTATwoEndCap => true,
             ProvingJobCircuitType::GUTATwoGUTA => true,
             ProvingJobCircuitType::GUTALeftGUTARightEndCap => true,
-            ProvingJobCircuitType::GUTALeftEndCapRightGUTA => true,
-            ProvingJobCircuitType::GUTARegisterUsers => true,
-            ProvingJobCircuitType::GUTAOnlyRegisterUsers => true,
+            ProvingJobCircuitType::GUTATwoGUTALinear => true,
+            ProvingJobCircuitType::GUTATwoGUTALinearUpgradeCheckpoint => true,
             ProvingJobCircuitType::GUTAVerifyToCap => true,
             ProvingJobCircuitType::GUTANoChange => true,
             ProvingJobCircuitType::GUTATwoGUTAWithCheckpointUpgrade => true,
             ProvingJobCircuitType::GUTAVerifyToCapWithCheckpointUpgrade => true,
+            ProvingJobCircuitType::GUTAVerifyLeftLinearRightLeafUpgradeCheckpoint => true,
             _ => false,
         }
     }
@@ -494,16 +493,16 @@ where
                 self.verify_left_guta_right_end_cap
                     .prove_with_raw_proofs_and_ref_library(library, input, worker_reward_tag)
             }
-            ProvingJobCircuitType::GUTALeftEndCapRightGUTA => {
-                self.verify_left_end_cap_right_guta
+            ProvingJobCircuitType::GUTATwoGUTALinearUpgradeCheckpoint => {
+                self.verify_two_guta_linear_transition_upgrade_checkpoint
                     .prove_with_raw_proofs_and_ref_library(library, input, worker_reward_tag)
             }
-            ProvingJobCircuitType::GUTARegisterUsers => {
-                self.verify_guta_register_users
+            ProvingJobCircuitType::GUTATwoGUTALinear => {
+                self.verify_two_guta_linear_transition
                     .prove_with_raw_proofs_and_ref_library(library, input, worker_reward_tag)
             }
-            ProvingJobCircuitType::GUTAOnlyRegisterUsers => {
-                self.only_register_users
+            ProvingJobCircuitType::GUTAVerifyLeftLinearRightLeafUpgradeCheckpoint => {
+                self.verify_guta_left_linear_right_leaf_upgrade_checkpoint
                     .prove_with_raw_proofs_and_ref_library(library, input, worker_reward_tag)
             }
             ProvingJobCircuitType::GUTAVerifyToCap => {
@@ -596,6 +595,8 @@ mod tests {
     use parth_core::pgoldilocks::QHashOut;
     use plonky2::plonk::config::PoseidonGoldilocksConfig;
     use psy_plonky2_basic_helpers::lookalike::{custom::get_lookalike_custom, types::QCircuitCommonGatesType};
+    use crate::qstandard::QStandardCircuit;
+
     use super::QEDGUTACircuitManager;
 
     type C = PoseidonGoldilocksConfig;
@@ -638,15 +639,15 @@ mod tests {
         );
 
         assert_eq!(
-            mgr.verify_left_end_cap_right_guta.fingerprint,
-            mgr.verify_left_end_cap_right_guta_whitelist_proof.value,
+            mgr.verify_two_guta_linear_transition.fingerprint,
+            mgr.verify_two_guta_linear_transition_whitelist_proof.value,
         );
         assert_eq!(
-            mgr.verify_guta_register_users.fingerprint,
-            mgr.verify_guta_register_users_whitelist_proof.value,
+            mgr.verify_two_guta_linear_transition_upgrade_checkpoint.get_fingerprint(),
+            mgr.verify_two_guta_linear_transition_upgrade_checkpoint_whitelist_proof.value,
         );
         assert_eq!(mgr.verify_guta_to_cap.fingerprint, mgr.verify_guta_to_cap_whitelist_proof.value,);
-        assert_eq!(mgr.only_register_users.fingerprint, mgr.only_register_users_whitelist_proof.value,);
+        assert_eq!(mgr.verify_guta_left_linear_right_leaf_upgrade_checkpoint.get_fingerprint(), mgr.verify_guta_left_linear_right_leaf_upgrade_checkpoint_whitelist_proof.value,);
         assert_eq!(mgr.no_change.fingerprint, mgr.no_change_whitelist_proof.value,);
     }
 }

@@ -1,6 +1,6 @@
 use parth_core::pgoldilocks::QHashOut;
-use plonky2::{field::extension::Extendable, hash::hash_types::{HashOut, RichField}, iop::{target::Target, witness::Witness}, plonk::{circuit_builder::CircuitBuilder, config::AlgebraicHasher}, util::log2_ceil};
-use psy_plonky2_common_circuits::hash::merkle::gadgets::variable_height_delta_merkle_proof_opt::VariableHeightDeltaMerkleProofOptGadget;
+use plonky2::{field::extension::Extendable, hash::hash_types::RichField, iop::{target::Target, witness::Witness}, plonk::{circuit_builder::CircuitBuilder, config::AlgebraicHasher}, util::log2_ceil};
+use psy_plonky2_common_circuits::hash::merkle::gadgets::q_variable_height_delta_merkle_proof::QVariableHeightDeltaMerkleProofGadget;
 
 
 use super::subtree_core::SubTreeNodeStateTransitionGadget;
@@ -9,7 +9,7 @@ use super::subtree_core::SubTreeNodeStateTransitionGadget;
 #[derive(Debug, Clone)]
 pub struct SubTreeNodeTopLineGadget {
     pub top_line_height: Target,
-    pub top_line_proof: VariableHeightDeltaMerkleProofOptGadget,
+    pub top_line_proof: QVariableHeightDeltaMerkleProofGadget,
 
     // computed
     pub new_state_transition: SubTreeNodeStateTransitionGadget,
@@ -20,26 +20,28 @@ pub struct SubTreeNodeTopLineGadget {
 impl SubTreeNodeTopLineGadget {
     pub fn add_virtual_to_full<H:AlgebraicHasher<F>, F: RichField + Extendable<D>, const D: usize>(
         builder: &mut CircuitBuilder<F, D>,
-        max_height: usize,
-        max_level: usize,
+        max_merkle_proof_height: usize,
+        tree_height: usize,
         child_transition: &SubTreeNodeStateTransitionGadget,
     ) -> Self {
 
         let top_line_height = builder.add_virtual_target();
 
-        let top_line_proof = VariableHeightDeltaMerkleProofOptGadget::add_virtual_to_full_with_subtree_root_index_known::<H,F,D>(
+        let top_line_proof = QVariableHeightDeltaMerkleProofGadget::add_virtual_to::<H,F,D>(
             builder,
-            max_height,
+            max_merkle_proof_height,
+            tree_height,
             Some(top_line_height),
-            child_transition.node_index,
-            child_transition.old_node_value,
-            child_transition.new_node_value,
+            Some(child_transition.old_node_value),
+            Some(child_transition.new_node_value),
+            Some(child_transition.node_index),
         );
 
-        let node_index = top_line_proof.bit_info.get_root_parent_index(builder);
+        let node_index = top_line_proof.parent_index;
 
         let node_level = builder.sub(child_transition.node_level, top_line_height);
-        builder.range_check(node_level, log2_ceil(max_level));
+        // ensure node_level does not underflow by range checking
+        builder.range_check(node_level, log2_ceil(tree_height));
 
         let new_state_transition = SubTreeNodeStateTransitionGadget {
             old_node_value: top_line_proof.old_root,
@@ -62,20 +64,7 @@ impl SubTreeNodeTopLineGadget {
         witness: &mut W,
         siblings: &[QHashOut<F>],
     ) -> anyhow::Result<()> {
-        for (i, s) in self.top_line_proof.siblings.iter().enumerate() {
-            if i < siblings.len() {
-            witness.set_hash_target(
-                *s,
-                siblings[i].0,
-            )?;
-            }else{
-                witness.set_hash_target(
-                    *s,
-                    HashOut::ZERO
-                )?;
-            }
-        }
-
+        self.top_line_proof.set_witness_siblings(witness, siblings)?;
         witness.set_target(self.top_line_height, F::from_canonical_usize(siblings.len()))
     }
 }

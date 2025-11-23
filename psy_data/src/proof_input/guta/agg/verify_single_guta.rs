@@ -1,14 +1,13 @@
 
-use std::{hash::Hash, ops::Add};
+use std::hash::Hash;
 
 #[cfg(feature = "rand_gen")]
 use parth_core::utils::QPGenRandom;
-use parth_core::{crypto::hash::{merkle_proof::{DeltaMerkleProofCore, MerkleProofCore, compute_historical_and_current_merkle_roots_core_gt}, nca::nca_proof::PartialUpdateNearestCommonAncestorProof, traits::{FieldQHasher, MerkleHasher, MerkleZeroHasher, QFieldHashable, ZeroableHash}}, felt::QFelt64, protocol::core_types::{Q256BitHash, QFHashBase}};
-use psy_core::job::job_id::{self, QProvingJobDataID};
+use parth_core::{crypto::hash::{merkle_proof::{DeltaMerkleProofCore, MerkleProofCore}, traits::{FieldQHasher, MerkleHasher, QFieldHashable}}, felt::QFelt64, protocol::core_types::{Q256BitHash, QFHashBase}};
 use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
 use psy_serialize::{PsyCanonicalSerializeMetadata, PsyIOReadWrite};
 
-use crate::{guta::{header::GlobalUserTreeAggregatorHeader, header_extended::GlobalUserTreeAggregatorHeaderWithTagValue, stats::GUTAStats, sub_tree_transition::SubTreeNodeStateTransition}, v1::qdata::{checkpoint::PQEDCheckpointLeafCompactWithStateRoots, user::PQEDUserLeaf, user_end_cap_result::PUPSEndCapResultCompact}};
+use crate::guta::{header::GlobalUserTreeAggregatorHeader, sub_tree_transition::SubTreeNodeStateTransition};
 use psy_serialize::FallbackPsySerializeCanonical;
 
 
@@ -120,6 +119,13 @@ impl<F: QFelt64, Hash: PartialEq + Copy> VerifyGUTAToCapCircuitInputSimple<F, Ha
     }
 }
 
+impl<F: QFelt64, Hash: QFHashBase<F>> VerifyGUTAToCapCircuitInputSimple<F, Hash> {
+    pub fn get_public_inputs_hash_no_rewards_tag<Hasher: FieldQHasher<F, Hash>>(&self) -> Hash {
+        let new_guta_header = self.get_new_guta_header::<Hasher>();
+        new_guta_header.qfhash::<Hasher>()
+    }
+}
+
 
 
 #[pderive::serialize_clone_f_hash_ts]
@@ -130,7 +136,12 @@ pub struct VerifyGUTAToCapUpgradeCheckpointCircuitInputSimple<F, Hash> {
     pub historical_checkpoint_proof: MerkleProofCore<Hash>,
     pub total_aggregation_proofs_generated: F,
 }
-
+impl<F: QFelt64, Hash: QFHashBase<F>> VerifyGUTAToCapUpgradeCheckpointCircuitInputSimple<F, Hash> {
+    pub fn get_public_inputs_hash_no_rewards_tag<Hasher: FieldQHasher<F, Hash>>(&self) -> Hash {
+        let new_guta_header = self.get_new_guta_header::<Hasher>();
+        new_guta_header.qfhash::<Hasher>()
+    }
+}
 #[cfg(feature = "rand_gen")]
 impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for VerifyGUTAToCapUpgradeCheckpointCircuitInputSimple<F, Hash> {
     fn qp_rand_gen() -> Self where Self: Sized {
