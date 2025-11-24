@@ -1,7 +1,7 @@
 use hashbrown::HashMap;
 use parth_common::memory_stores::{
     mem_tree_recorder::SimpleMemoryMerkleRecorderStore,
-    traits::{PsyMemoryMerkleStoreAppendOnlyReaderBase, PsyMemoryMerkleStoreAppendOnlyReaderBaseAsync},
+    traits::PsyMemoryMerkleStoreAppendOnlyReaderBase,
 };
 use parth_core::{
     crypto::hash::{merkle_proof::MerkleProofCore, traits::FieldQHasher},
@@ -15,10 +15,9 @@ use parth_core::{
 use psy_core::job::job_id::QProvingJobDataID;
 use psy_data::{
     guta::{
-        header::GlobalUserTreeAggregatorHeader, header_extended::GlobalUserTreeAggregatorHeaderWithTagValueAndJobID,
+        header_extended::GlobalUserTreeAggregatorHeaderWithTagValueAndJobID,
         header_job_prep::GUTAHeaderWithJobMetadata,
     },
-    proof_input::guta::generic::GlobalUserTreeAggregatorHeaderWi,
     worker::{metadata::PsyProvingJobMetadata, metadata_with_job_id::PsyProvingJobMetadataWithJobId},
 };
 
@@ -104,17 +103,17 @@ pub fn plan_guta_jobs_for_coordinator_nca_offset_root<
     } else if leaves.len() == 1 {
         anyhow::bail!("Only one leaf provided for GUTA planning, not yet implemented");
     }
-    let guta_realm_level: u8 = leaves[0].header.header_with_stats.base_header.state_transition.node_level.to_u64_value() as u8;
+    let guta_realm_level: u8 = leaves[0].header.header.state_transition.node_level.to_u64_value() as u8;
 
     let mut leaf_tag_values = HashMap::<u64, Hash>::with_capacity(leaves.len());
     let mut new_leaves: Vec<(SimpleMerkleNodeKey, GUTAHeaderWithJobMetadata<F, Hash>)> = Vec::with_capacity(leaves.len());
     for leaf in leaves.iter() {
         let node_key = SimpleMerkleNodeKey::new(
-            leaf.header.header_with_stats.base_header.state_transition.node_level.to_u64_value() as u8,
-            leaf.header.header_with_stats.base_header.state_transition.node_index.to_u64_value(),
+            leaf.header.header.state_transition.node_level.to_u64_value() as u8,
+            leaf.header.header.state_transition.node_index.to_u64_value(),
         );
         let input = GUTAHeaderWithJobMetadata {
-            header: leaf.header.header_with_stats.clone(),
+            header: leaf.header.header.clone(),
             metadata: PsyProvingJobMetadataWithJobId {
                 job_id: leaf.job_id,
                 metadata: PsyProvingJobMetadata {

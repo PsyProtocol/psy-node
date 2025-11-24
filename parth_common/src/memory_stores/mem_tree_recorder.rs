@@ -53,6 +53,16 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + PartialEq + Default>
             Hasher::get_zero_hash((self.height - key.level) as usize)
         }
     }
+    pub fn get_last_commit_node(&self, key: &SimpleMerkleNodeKey) -> Hash {
+        if self.nodes.contains_key(key) {
+            self.nodes[key]
+        } else {
+            Hasher::get_zero_hash((self.height - key.level) as usize)
+        }
+    }
+    pub fn get_last_commit_root(&self) -> Hash {
+        self.get_last_commit_node(&SimpleMerkleNodeKey::new_root())
+    }
 
     pub fn get_root(&self) -> Hash {
         self.get_node_value(&SimpleMerkleNodeKey::new_root())

@@ -1,96 +1,12 @@
+use bincode::de;
 use parth_core::{
-    QJOB_ID_SERIALIZED_SIZE, QJobIdSerialized, crypto::hash::{tag_tree::TagTreeNodePreimage, traits::{FieldQHasher, QFieldHashable}}, data::queue::queue_key::PCoreQueueItemBase, felt::QFelt64, protocol::core_types::{Q256BitHash, QFHashBase}, utils::QPGenRandom
+    QJOB_ID_SERIALIZED_SIZE, QJobIdBase, QJobIdSerialized, crypto::hash::{tag_tree::TagTreeNodePreimage, traits::{FieldQHasher, QFieldHashable}}, data::queue::queue_key::PCoreQueueItemBase, felt::QFelt64, protocol::core_types::{Q256BitHash, QFHashBase}, utils::QPGenRandom
 };
 use psy_core::job::job_id::QProvingJobDataID;
 use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
 use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalDatabaseSerializeBaseSingle, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
 
-use crate::{guta::header::GlobalUserTreeAggregatorHeader, worker::metadata_with_job_id::PsyProvingJobMetadataWithJobId};
-
-
-#[pderive::serialize_copy_f_hash_ts]
-#[ts(export, concrete(F = parth_core::PF, Hash = parth_core::PHash))]
-#[repr(C)]
-pub struct GlobalUserTreeAggregatorHeaderWithProofStats<F, Hash > {
-    pub base_header: GlobalUserTreeAggregatorHeader<F, Hash>,
-    pub total_guta_proofs_generated: F,
-}
-
-
-
-impl<F: QFelt64, Hash: QFHashBase<F>> QFieldHashable<F, Hash> for GlobalUserTreeAggregatorHeaderWithProofStats<F, Hash> {
-    fn qfhash<H: FieldQHasher<F, Hash>>(&self) -> Hash {
-        let base_header_hash = self.base_header.qfhash::<H>();
-        let base_header_hash_elements = base_header_hash.to_4_felts();
-        H::q_hash_many(&[
-            base_header_hash_elements[0],
-            base_header_hash_elements[1],
-            base_header_hash_elements[2],
-            base_header_hash_elements[3],
-            self.total_guta_proofs_generated,
-        ])
-    }
-}
-
-
-
-
-
-impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for GlobalUserTreeAggregatorHeaderWithProofStats<F, Hash> {
-    fn qp_rand_gen() -> Self
-    where
-        Self: Sized,
-    {
-        GlobalUserTreeAggregatorHeaderWithProofStats {
-            base_header: GlobalUserTreeAggregatorHeader::qp_rand_gen(),
-            total_guta_proofs_generated: F::qp_rand_gen(),
-        }
-    }
-}
-
-
-impl<F: QFelt64, Hash: Q256BitHash> PsyCanonicalSerializeMetadata for GlobalUserTreeAggregatorHeaderWithProofStats<F, Hash> {
-    const IS_FIXED_SIZE: bool = true;
-    const FIXED_SIZE: usize = 8 + GlobalUserTreeAggregatorHeader::<F, Hash>::FIXED_SIZE;
-}
-impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for GlobalUserTreeAggregatorHeaderWithProofStats<F, Hash> {
-    fn fallback_pio_serialized_size(&self) -> usize {
-         8 + GlobalUserTreeAggregatorHeader::<F, Hash>::FIXED_SIZE
-    }
-    
-    fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
-        self.base_header.pio_write_to_io(writer)?;
-        writer.psy_write_u64(self.total_guta_proofs_generated.to_u64_value())?;
-        
-        Ok(())
-    }
-    
-    fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
-        let base_header = GlobalUserTreeAggregatorHeader::pio_read_from_io(reader)?;
-        let total_guta_proofs_generated = F::from_u64_value(reader.psy_read_u64()?);
-        Ok(Self {
-            base_header,
-            total_guta_proofs_generated,
-        })
-    }
-
-}
-
-#[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
-psy_serialize::impl_psy_canonical_serialize_for_speedy!(
-    GlobalUserTreeAggregatorHeaderWithProofStats,
-    { F: QFelt64, Hash: Q256BitHash } => { F, Hash }
-);
-#[cfg(not(all(feature = "serialize_speedy", target_endian = "little")))]
-impl<F: QFelt64, Hash: Q256BitHash> psy_serialize::AutoImplementFallbackPsySerializeCanonical for GlobalUserTreeAggregatorHeaderWithProofStats<F, Hash> {}
-
-
-pser::impl_psy_ser_basic_tests_fallback!(
-    GlobalUserTreeAggregatorHeaderWithProofStats,
-    { parth_core::PF, parth_core::PHash },
-    global_user_tree_agg_header_with_proof_stats_tests
-);
-
+use crate::{guta::header::GlobalUserTreeAggregatorHeader, proof_input::guta::generic::GlobalUserTreeAggregatorHeaderWi, worker::{metadata::{PROOF_REWARD_TREE_HASH_MODE_HASH_CHILDREN_STANDARD, PsyProvingJobMetadata}, metadata_with_job_id::PsyProvingJobMetadataWithJobId}};
 
 
 
@@ -102,7 +18,7 @@ pser::impl_psy_ser_basic_tests_fallback!(
 #[ts(export, concrete(F = parth_core::PF, Hash = parth_core::PHash))]
 #[repr(C)]
 pub struct GlobalUserTreeAggregatorHeaderWithTagValue<F, Hash > {
-    pub header_with_stats: GlobalUserTreeAggregatorHeaderWithProofStats<F, Hash>,
+    pub header: GlobalUserTreeAggregatorHeader<F, Hash>,
     pub new_tag_tree_node_value: Hash,
 }
 
@@ -110,10 +26,10 @@ pub struct GlobalUserTreeAggregatorHeaderWithTagValue<F, Hash > {
 
 impl<F: QFelt64, Hash: QFHashBase<F>> QFieldHashable<F, Hash> for GlobalUserTreeAggregatorHeaderWithTagValue<F, Hash> {
     fn qfhash<H: FieldQHasher<F, Hash>>(&self) -> Hash {
-        let header_with_stats_hash = self.header_with_stats.qfhash::<H>();
+        let header_hash = self.header.qfhash::<H>();
 
         H::q_two_to_one(
-            header_with_stats_hash,
+            header_hash,
             self.new_tag_tree_node_value,
         )
     }
@@ -129,7 +45,7 @@ impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for GlobalUserTreeAggregator
         Self: Sized,
     {
         GlobalUserTreeAggregatorHeaderWithTagValue {
-            header_with_stats: GlobalUserTreeAggregatorHeaderWithProofStats::qp_rand_gen(),
+            header: GlobalUserTreeAggregatorHeader::qp_rand_gen(),
             new_tag_tree_node_value: Hash::qp_rand_gen(),
         }
     }
@@ -138,25 +54,25 @@ impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for GlobalUserTreeAggregator
 
 impl<F: QFelt64, Hash: Q256BitHash> PsyCanonicalSerializeMetadata for GlobalUserTreeAggregatorHeaderWithTagValue<F, Hash> {
     const IS_FIXED_SIZE: bool = true;
-    const FIXED_SIZE: usize = 32 + GlobalUserTreeAggregatorHeaderWithProofStats::<F, Hash>::FIXED_SIZE;
+    const FIXED_SIZE: usize = 32 + GlobalUserTreeAggregatorHeader::<F, Hash>::FIXED_SIZE;
 }
 impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for GlobalUserTreeAggregatorHeaderWithTagValue<F, Hash> {
     fn fallback_pio_serialized_size(&self) -> usize {
-         32 + GlobalUserTreeAggregatorHeaderWithProofStats::<F, Hash>::FIXED_SIZE
+         32 + GlobalUserTreeAggregatorHeader::<F, Hash>::FIXED_SIZE
     }
     
     fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
-        self.header_with_stats.pio_write_to_io(writer)?;
+        self.header.pio_write_to_io(writer)?;
         writer.psy_write_bytes_fixed(&self.new_tag_tree_node_value.into_owned_32bytes())?;
         
         Ok(())
     }
     
     fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
-        let header_with_stats = GlobalUserTreeAggregatorHeaderWithProofStats::pio_read_from_io(reader)?;
+        let header = GlobalUserTreeAggregatorHeader::pio_read_from_io(reader)?;
         let new_tag_tree_node_value = Hash::from_owned_32bytes(reader.psy_read_bytes_fixed()?);
         Ok(Self {
-            header_with_stats,
+            header,
             new_tag_tree_node_value,
         })
     }
@@ -186,7 +102,7 @@ pser::impl_psy_ser_basic_tests_fallback!(
 #[ts(export, concrete(F = parth_core::PF, Hash = parth_core::PHash))]
 #[repr(C)]
 pub struct GlobalUserTreeAggregatorHeaderWithTagPreimage<F, Hash > {
-    pub header_with_stats: GlobalUserTreeAggregatorHeaderWithProofStats<F, Hash>,
+    pub header: GlobalUserTreeAggregatorHeader<F, Hash>,
     pub new_tag_tree_node_preimage: TagTreeNodePreimage<Hash>,
 }
 
@@ -194,12 +110,12 @@ pub struct GlobalUserTreeAggregatorHeaderWithTagPreimage<F, Hash > {
 
 impl<F: QFelt64, Hash: QFHashBase<F>> QFieldHashable<F, Hash> for GlobalUserTreeAggregatorHeaderWithTagPreimage<F, Hash> {
     fn qfhash<H: FieldQHasher<F, Hash>>(&self) -> Hash {
-        let header_with_stats_hash = self.header_with_stats.qfhash::<H>();
+        let header_hash = self.header.qfhash::<H>();
         let new_tag_tree_node_preimage_hash = self.new_tag_tree_node_preimage.get_node_hash::<H>();
 
 
         H::q_two_to_one(
-            header_with_stats_hash,
+            header_hash,
             new_tag_tree_node_preimage_hash,
         )
     }
@@ -215,7 +131,7 @@ impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for GlobalUserTreeAggregator
         Self: Sized,
     {
         GlobalUserTreeAggregatorHeaderWithTagPreimage {
-            header_with_stats: GlobalUserTreeAggregatorHeaderWithProofStats::qp_rand_gen(),
+            header: GlobalUserTreeAggregatorHeader::qp_rand_gen(),
             new_tag_tree_node_preimage: TagTreeNodePreimage::qp_rand_gen(),
         }
     }
@@ -224,15 +140,15 @@ impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for GlobalUserTreeAggregator
 
 impl<F: QFelt64, Hash: Q256BitHash> PsyCanonicalSerializeMetadata for GlobalUserTreeAggregatorHeaderWithTagPreimage<F, Hash> {
     const IS_FIXED_SIZE: bool = true;
-    const FIXED_SIZE: usize = 32*3 + GlobalUserTreeAggregatorHeaderWithProofStats::<F, Hash>::FIXED_SIZE;
+    const FIXED_SIZE: usize = 32*3 + GlobalUserTreeAggregatorHeader::<F, Hash>::FIXED_SIZE;
 }
 impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for GlobalUserTreeAggregatorHeaderWithTagPreimage<F, Hash> {
     fn fallback_pio_serialized_size(&self) -> usize {
-         32*3 + GlobalUserTreeAggregatorHeaderWithProofStats::<F, Hash>::FIXED_SIZE
+         32*3 + GlobalUserTreeAggregatorHeader::<F, Hash>::FIXED_SIZE
     }
     
     fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
-        self.header_with_stats.pio_write_to_io(writer)?;
+        self.header.pio_write_to_io(writer)?;
         writer.psy_write_bytes_fixed(&self.new_tag_tree_node_preimage.left.into_owned_32bytes())?;
         writer.psy_write_bytes_fixed(&self.new_tag_tree_node_preimage.right.into_owned_32bytes())?;
         writer.psy_write_bytes_fixed(&self.new_tag_tree_node_preimage.tag.into_owned_32bytes())?;
@@ -241,12 +157,12 @@ impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for GlobalUser
     }
     
     fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
-        let header_with_stats = GlobalUserTreeAggregatorHeaderWithProofStats::pio_read_from_io(reader)?;
+        let header = GlobalUserTreeAggregatorHeader::pio_read_from_io(reader)?;
         let new_tag_tree_node_preimage_left = Hash::from_owned_32bytes(reader.psy_read_bytes_fixed()?);
         let new_tag_tree_node_preimage_right = Hash::from_owned_32bytes(reader.psy_read_bytes_fixed()?);
         let new_tag_tree_node_preimage_tag = Hash::from_owned_32bytes(reader.psy_read_bytes_fixed()?);
         Ok(Self {
-            header_with_stats,
+            header,
             new_tag_tree_node_preimage: TagTreeNodePreimage {
                 left: new_tag_tree_node_preimage_left,
                 right: new_tag_tree_node_preimage_right,
@@ -535,3 +451,93 @@ impl<F: QFelt64, Hash: Q256BitHash> PCoreQueueItemBase for GlobalUserTreeAggrega
         true
     }
 }
+
+
+
+#[pderive::serialize_copy_f_hash_ts]
+#[ts(export, concrete(F = parth_core::PF, Hash = parth_core::PHash))]
+#[repr(C)]
+pub struct GlobalUserTreeAggregatorHeaderWithJobId<F, Hash> {
+    pub header: GlobalUserTreeAggregatorHeader<F, Hash>,
+    pub job_id: QProvingJobDataID,
+}
+impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> GlobalUserTreeAggregatorHeaderWithJobId<F, Hash> {
+    pub fn to_metadata_with_job_standard_children<Hasher: FieldQHasher<F, Hash>>(
+        &self,
+        dependencies: Vec<QProvingJobDataID>,
+    ) -> PsyProvingJobMetadataWithJobId<Hash, QProvingJobDataID> {
+        let public_inputs_hash = self.header.qfhash::<Hasher>();
+        PsyProvingJobMetadataWithJobId {
+            job_id: self.job_id,
+            metadata: PsyProvingJobMetadata {
+                expected_public_inputs_hash: public_inputs_hash,
+                reward_tree_node_index: 0,
+                reward_tree_node_level: 0,
+                reward_tree_hash_mode: PROOF_REWARD_TREE_HASH_MODE_HASH_CHILDREN_STANDARD,
+                reward_tree_node_children: dependencies.len() as u16,
+                dependencies: dependencies,
+            }
+        }
+    }
+}
+// ================================================================================================
+// GlobalUserTreeAggregatorHeaderWithJobId
+// ================================================================================================
+
+#[cfg(feature = "rand_gen")]
+impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for GlobalUserTreeAggregatorHeaderWithJobId<F, Hash> {
+    fn qp_rand_gen() -> Self
+    where
+        Self: Sized,
+    {
+        Self {
+            header: GlobalUserTreeAggregatorHeader::qp_rand_gen(),
+            job_id: QProvingJobDataID::qp_rand_gen(),
+        }
+    }
+}
+
+impl<F: QFelt64, Hash: Q256BitHash> PsyCanonicalSerializeMetadata for GlobalUserTreeAggregatorHeaderWithJobId<F, Hash> {
+    const IS_FIXED_SIZE: bool = true;
+    const FIXED_SIZE: usize = GlobalUserTreeAggregatorHeader::<F, Hash>::FIXED_SIZE + QJOB_ID_SERIALIZED_SIZE;
+}
+
+impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for GlobalUserTreeAggregatorHeaderWithJobId<F, Hash> {
+    fn fallback_pio_serialized_size(&self) -> usize {
+        Self::FIXED_SIZE
+    }
+
+    fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
+        self.header.pio_write_to_io(writer)?;
+        writer.psy_write_bytes_fixed(&self.job_id.to_fixed_bytes())?;
+        Ok(())
+    }
+
+    fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
+        let header = GlobalUserTreeAggregatorHeader::<F, Hash>::pio_read_from_io(reader)?;
+        let job_id = QProvingJobDataID::from_bytes_fixed(&reader.psy_read_bytes_fixed()?)?;
+
+        Ok(Self {
+            header,
+            job_id,
+        })
+    }
+}
+
+#[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
+psy_serialize::impl_psy_canonical_serialize_for_speedy!(
+    GlobalUserTreeAggregatorHeaderWithJobId,
+    { F: QFelt64, Hash: Q256BitHash } => { F, Hash }
+);
+
+#[cfg(not(all(feature = "serialize_speedy", target_endian = "little")))]
+impl<F: QFelt64, Hash: Q256BitHash> psy_serialize::AutoImplementFallbackPsySerializeCanonical
+    for GlobalUserTreeAggregatorHeaderWithJobId<F, Hash>
+{
+}
+
+pser::impl_psy_ser_basic_tests_fallback!(
+    GlobalUserTreeAggregatorHeaderWithJobId,
+    { parth_core::PF, parth_core::PHash },
+    global_user_tree_aggregator_header_with_job_id_tests
+);

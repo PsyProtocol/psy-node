@@ -213,6 +213,17 @@ impl ProvingJobCircuitType {
     pub fn to_circuit_group_id(&self) -> u32 {
         (self.to_u8() as u32) + 0xCF00u32
     }
+    pub fn needs_to_save_child_reward_tree_values_to_database(&self) -> bool {
+        match self {
+            | ProvingJobCircuitType::GUTATwoGUTA
+            | ProvingJobCircuitType::GUTAVerifyToCap
+            | ProvingJobCircuitType::GUTATwoGUTAWithCheckpointUpgrade
+            | ProvingJobCircuitType::GUTAVerifyToCapWithCheckpointUpgrade
+            | ProvingJobCircuitType::GUTAVerifyLeftLinearRightLeafUpgradeCheckpoint
+            | ProvingJobCircuitType::GUTAVerifyLeftLeafRightLinearUpgradeCheckpoint => true,
+            _ => false,
+        }
+    }
     pub fn get_agg_leaf_circuit_type_or_err(&self) -> anyhow::Result<Self> {
         let leaf_type = match self {
             ProvingJobCircuitType::AppendUserRegistrationTree => ProvingJobCircuitType::AppendUserRegistrationTree,

@@ -1,5 +1,5 @@
 use parth_core::{
-    QJOB_ID_SERIALIZED_SIZE, QJobIdBase, data::{hash::merkle_node_key::SimpleMerkleNodeKey, queue::queue_key::PCoreQueueItemBase}, protocol::core_types::Q256BitHash, utils::QPGenRandom
+    QJOB_ID_SERIALIZED_SIZE, QJobIdBase, data::{hash::merkle_node_key::SimpleMerkleNodeKey, queue::queue_key::PCoreQueueItemBase}, protocol::core_types::{Q256BitHash, QDBHashBase}, utils::QPGenRandom
 };
 use psy_core::job::job_id::QProvingJobDataID;
 use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
@@ -15,7 +15,6 @@ pub struct PsyProvingJobMetadataWithJobId<Hash, JobId> {
     pub job_id: JobId,
     pub metadata: PsyProvingJobMetadata<Hash, JobId>,
 }
-
 impl<Hash, JobId> PsyProvingJobMetadataWithJobId<Hash, JobId> {
     pub fn get_reward_tree_node_key(&self) -> SimpleMerkleNodeKey {
         self.metadata.get_reward_tree_node_key()

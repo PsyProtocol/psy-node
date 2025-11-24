@@ -1,4 +1,4 @@
-use parth_core::{crypto::hash::traits::{FieldQHasher, MerkleHasher, QFieldHashable}, felt::QFelt, protocol::core_types::QFHashBase};
+use parth_core::{crypto::hash::traits::{FieldQHasher, MerkleHasher, QFieldHashable}};
 #[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
 use parth_core::protocol::core_types::Q256BitHash;
 #[cfg(feature = "rand_gen")]

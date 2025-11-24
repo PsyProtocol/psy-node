@@ -7,7 +7,7 @@ use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 
 use crate::{
     psy_temp_db::{
-        QTempDBDeployContractDataReader, QTempDBDeployContractDataWriter, QTempDBPendingIdReader, QTempDBPendingIdWriter, QTempDBProofWitnessReader, QTempDBProofWitnessWriter, QTempDBProvingJobMetadataReader, QTempDBProvingJobMetadataWriter, QTempDBRewardsTreeReader, QTempDBRewardsTreeWriter, QTempDBSubmitStatusReader, QTempDBSubmitStatusWriter, tt_get_deploy_contract_code_definition_key, tt_get_proof_witness_data_key_from_job, tt_get_proving_job_metadata_key_from_job, tt_get_rewards_tag_tree_value_key_from_job, tt_get_submit_status_key, tt_get_unique_pending_id_key
+        QTempDBDeployContractDataReader, QTempDBDeployContractDataWriter, QTempDBPendingIdReader, QTempDBPendingIdWriter, QTempDBProofWitnessReader, QTempDBProofWitnessWriter, QTempDBProvingJobMetadataReader, QTempDBProvingJobMetadataWriter, QTempDBRewardsTreeReader, QTempDBRewardsTreeWriter, QTempDBSubmitStatusReader, QTempDBSubmitStatusWriter, QTempDBUserContractUpdatesReader, QTempDBUserContractUpdatesWriter, tt_get_contract_updates_key, tt_get_deploy_contract_code_definition_key, tt_get_proof_witness_data_key_from_job, tt_get_proving_job_metadata_key_from_job, tt_get_rewards_tag_tree_value_key_from_job, tt_get_submit_status_key, tt_get_unique_pending_id_key
     },
     store::traits::temp_db::{QTempDatabaseRawKVReaderBase, QTempDatabaseRawKVWriterBase},
 };
@@ -415,3 +415,42 @@ impl<Hash: Q256BitHash, JobId: QJobIdBase + 'static, D: QTempDatabaseRawKVWriter
     }
 }
 
+
+/*
+
+
+#[async_trait]
+pub trait QTempDBUserContractUpdatesReader {
+    async fn get_contract_updates_for_user(&self, rid: &QRealmIdentifier, unique_pending_id: u64, user_id: u64) -> anyhow::Result<Option<Vec<u8>>>;
+}
+
+#[async_trait]
+pub trait QTempDBUserContractUpdatesWriter {
+    async fn set_contract_updates_for_user(&self, rid: &QRealmIdentifier, unique_pending_id: u64, user_id: u64, data: Vec<u8>) -> anyhow::Result<()>;
+    async fn set_contract_updates_for_user_ref(&self, rid: &QRealmIdentifier, unique_pending_id: u64, user_id: u64, data: &[u8]) -> anyhow::Result<()>;
+}
+    
+    */
+
+
+#[async_trait]
+impl<T: QTempDatabaseRawKVReaderBase + Sync> QTempDBUserContractUpdatesReader for T {
+        async fn get_contract_updates_for_user(&self, rid: &QRealmIdentifier, unique_pending_id: u64, user_id: u64) -> anyhow::Result<Option<Vec<u8>>>{
+            let key = tt_get_contract_updates_key(rid.realm_id, rid.realm_sub_id, unique_pending_id, user_id);
+            let value_bytes = self.qtdb_raw_kv_get_value(&key).await?;
+            Ok(value_bytes)
+        }
+}
+
+#[async_trait]
+impl<T: QTempDatabaseRawKVWriterBase + Sync> QTempDBUserContractUpdatesWriter for T {
+
+    async fn set_contract_updates_for_user(&self, rid: &QRealmIdentifier, unique_pending_id: u64, user_id: u64, data: Vec<u8>) -> anyhow::Result<()>{
+        let key = tt_get_contract_updates_key(rid.realm_id, rid.realm_sub_id, unique_pending_id, user_id);
+        self.qtdb_raw_kv_put_value(&key, &data).await
+    }
+    async fn set_contract_updates_for_user_ref(&self, rid: &QRealmIdentifier, unique_pending_id: u64, user_id: u64, data: &[u8]) -> anyhow::Result<()> {
+        let key = tt_get_contract_updates_key(rid.realm_id, rid.realm_sub_id, unique_pending_id, user_id);
+        self.qtdb_raw_kv_put_value(&key, data).await
+    }
+}

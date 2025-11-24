@@ -12,7 +12,7 @@ use futures::{
     TryFutureExt,
 };
 use parth_core::felt::FromPrimitiveValuesFelt;
-use parth_common::memory_stores::mem_tree_recorder::SimpleMemoryMerkleRecorderStore;
+use parth_common::memory_stores::{dash_tree_append_only::PsyDashMemoryAppendOnlyMerkleStore, mem_tree_recorder::SimpleMemoryMerkleRecorderStore};
 use parth_core::{
     QCoreProcCheckpointUniqueId, crypto::hash::{spiderman::SpidermanUpdateProof, traits::MerkleZeroHasher}, data::{
         db::hash_id_u64::{QHash256AndU64, get_data_buffer_for_hash256_and_u64s},
@@ -40,6 +40,7 @@ use psy_node_core::{
 };
 use psy_serialize::{FastFixedSerializable, PsyCanonicalDatabaseSerializeBaseSingle, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tower_http::ServiceExt;
 
 use crate::queue::gatherer_builder::QueueGathererItemBuilderWithTree;
 pub const COORDINATOR_GUTA_UPDATE_GATHERER_BACKUP_V1_MAGIC_BYTES: [u8; 4] = [0x43, 0x47, 0x42, 0x31]; // 'CGB1' in ASCII
@@ -119,9 +120,9 @@ pub async fn read_coordinator_guta_update_gatherer_backup_file<Hasher: MerkleZer
         let mut header_bytes = vec![0u8; GlobalUserTreeAggregatorHeaderWithTagValueAndJobID::<F, Hash>::FIXED_SIZE];
         file.read_exact(&mut header_bytes).await?;
         let header = GlobalUserTreeAggregatorHeaderWithTagValueAndJobID::<F, Hash>::psy_ser_from_owned_bytes_vec(header_bytes)?;
-        cur_guta_stats.add_from_mut(&header.header.header_with_stats.base_header.stats);
-        total_guta_proofs_generated += header.header.header_with_stats.total_guta_proofs_generated;
-        let state_transition = header.header.header_with_stats.base_header.state_transition;
+        cur_guta_stats.add_from_mut(&header.header.header.stats);
+        total_guta_proofs_generated += header.header.header.total_aggregation_proofs_generated;
+        let state_transition = header.header.header.state_transition;
         changes.push((state_transition.node_index.to_u64_value(), state_transition.new_node_value));
     }
 
@@ -156,6 +157,7 @@ pub struct CoordinatorGUTAUpdateGathererConfig<N: QNetworkTypesConfig, TempDatab
     pub temp_db: Arc<TempDatabase>,
     pub backup_file_directory: String,
     pub coordinator_guta_updates_circuit_whitelist: N::QHash,
+    pub checkpoint_tree: Arc<PsyDashMemoryAppendOnlyMerkleStore<N::HasherBase, N::QHash>>,
 
     pub _phantom_n: std::marker::PhantomData<N>,
 }
@@ -238,18 +240,27 @@ impl<
             ));
         }
         let update_header = GlobalUserTreeAggregatorHeaderWithTagValueAndJobID::<N::F, N::QHash>::psy_ser_from_slice(&item)?;
+        
+        self.config.temp_db.set_proof_miner_rewards_tree_value(
+            &QRealmIdentifier {
+                realm_id: self.config.realm_id_u64 as u32,
+                realm_sub_id: self.config.realm_sub_id_u64 as u16,
+            },
+            self.config.pending_unique_id.load(Ordering::Relaxed),
+            update_header.job_id,
+            update_header.header.new_tag_tree_node_value,
+        ).await?;
         self.new_coordinator_guta_file.write_all(&item).await?;
-        self.guta_stats.add_from_mut(&update_header.header.header_with_stats.base_header.stats);
-        self.total_guta_proofs_generated += update_header.header.header_with_stats.total_guta_proofs_generated;
+        self.guta_stats.add_from_mut(&update_header.header.header.stats);
+        self.total_guta_proofs_generated += update_header.header.header.total_aggregation_proofs_generated;
         self.updated_realm_roots.push((
             update_header
                 .header
-                .header_with_stats
-                .base_header
+                .header
                 .state_transition
                 .node_index
                 .to_u64_value(),
-            update_header.header.header_with_stats.base_header.state_transition.new_node_value,
+            update_header.header.header.state_transition.new_node_value,
         ));
         Ok(())
     }

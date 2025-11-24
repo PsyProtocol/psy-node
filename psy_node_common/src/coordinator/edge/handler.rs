@@ -315,7 +315,7 @@ impl<
         input: GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<N::F, N::QHash>,
         proof_bytes: Vec<u8>,
     ) -> anyhow::Result<()> {
-        let realm_level_u64 = input.header.header_with_stats.base_header.state_transition.node_level.to_u64_value();
+        let realm_level_u64 = input.header.header.state_transition.node_level.to_u64_value();
         if realm_level_u64 != N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT as u64 {
             anyhow::bail!(
                 "invalid realm level {}, expected {}",
@@ -323,7 +323,7 @@ impl<
                 N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT
             );
         }
-        let realm_id_u64 = input.header.header_with_stats.base_header.state_transition.node_index.to_u64_value();
+        let realm_id_u64 = input.header.header.state_transition.node_index.to_u64_value();
 
         let realm_level = realm_level_u64 as u8;
         if realm_id_u64 > (1u64 << realm_level) || realm_id_u64 > u32::MAX as u64 {

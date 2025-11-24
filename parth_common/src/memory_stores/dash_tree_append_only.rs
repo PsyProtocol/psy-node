@@ -34,6 +34,18 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + Eq + PartialEq + Default + std
             _hasher: PhantomData::default(),
         }
     }
+    pub fn get_historical_append_only_merkle_proof_for_root(
+        &self,
+        checkpoint_tree_root: Hash,
+    ) -> anyhow::Result<MerkleProofCore<Hash>> {
+        match self.roots.get(&checkpoint_tree_root) {
+            Some(v) => {
+                let index = *v;
+                Ok(self.get_leaf(index))
+            },
+            None => anyhow::bail!("Root not found in append-only store"),
+        }
+    }
     pub fn recompute_entire_level(&self, level: u8) {
         if level >= self.height {
             return; // Nothing to rehash

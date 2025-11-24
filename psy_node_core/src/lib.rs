@@ -15,3 +15,4 @@ pub mod p2p;
 pub mod test_helpers;
 pub mod config;
 pub mod genesis;
+pub mod guta_planner;

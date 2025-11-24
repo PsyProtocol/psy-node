@@ -56,6 +56,7 @@ psy_data = { workspace = true }
 psy_node_core = { workspace = true }
 psy_api_core = { workspace = true }
 thiserror = { workspace = true }
+psy_node_store_memory = { workspace = true }
 
 
 

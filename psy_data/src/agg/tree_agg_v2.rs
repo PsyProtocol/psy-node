@@ -1,5 +1,5 @@
 use parth_core::{
-    crypto::hash::traits::{FieldQHasher, MerkleZeroHasher, PCircuitWitness}, data::hash::merkle_node_key::SimpleMerkleNodeKey, felt::QFelt64, protocol::core_types::{Q256BitHash, QFHashBase},
+    crypto::hash::traits::{FieldQHasher, PCircuitWitness}, data::hash::merkle_node_key::SimpleMerkleNodeKey, felt::QFelt64, protocol::core_types::{Q256BitHash, QFHashBase},
 };
 use psy_serialize::{PsyCanonicalDatabaseSerializeBaseSingle, PsySerializeCanonicalAsyncSafe};
 

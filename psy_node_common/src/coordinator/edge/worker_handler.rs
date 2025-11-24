@@ -11,7 +11,7 @@ use parth_core::{
     protocol::core_types::{Q256BitHash, QNetworkTypesConfig, QZKProofVerifier},
     QProvingJobDataIDWithRewardPath,
 };
-use psy_core::job::job_id::QProvingJobDataID;
+use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::
     worker::{
         api_response::{PROVING_JOB_NODE_TYPE_COORDINATOR, PsyWorkerGetProvingWorkAPIResponse, PsyWorkerGetProvingWorkWithChildProofsAPIResponse},
@@ -359,6 +359,25 @@ impl<
                 self.tag_tree_rewards_store
                     .rewards_tag_tree_set_node_tag(unique_pending_id, key, node.tag, node.value)
                     .await?;
+            }
+            if job_id.circuit_type.needs_to_save_child_reward_tree_values_to_database() {
+                let node_key = metadata.get_reward_tree_node_key();
+                let left_key = node_key.left_child();
+                let right_key = node_key.right_child();
+                if children_reward_tree_values.len() == 1 {
+                    self.tag_tree_rewards_store
+                        .rewards_tag_tree_set_node_tag( unique_pending_id, left_key, N::QHash::get_zero_value(), children_reward_tree_values[0])
+                        .await?;
+                }else if children_reward_tree_values.len() == 2 {
+                    self.tag_tree_rewards_store
+                        .rewards_tag_tree_set_node_tag(unique_pending_id, left_key, N::QHash::get_zero_value(), children_reward_tree_values[0])
+                        .await?;
+                    self.tag_tree_rewards_store
+                        .rewards_tag_tree_set_node_tag(unique_pending_id, right_key, N::QHash::get_zero_value(), children_reward_tree_values[1])
+                        .await?;
+                } else if children_reward_tree_values.len() != 0 {
+                    anyhow::bail!("Invalid number of children for saving tag tree values to database, this should never happen");
+                }
             }
         }
 

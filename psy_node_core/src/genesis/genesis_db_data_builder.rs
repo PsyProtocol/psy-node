@@ -8,7 +8,7 @@ use parth_common::{
 use parth_core::{
     crypto::hash::{
         merkle_proof::{DeltaMerkleProofCore, MerkleProofCore, compute_root_merkle_proof_generic},
-        traits::{FieldQHasher, MerkleZeroHasher, QFieldHashable},
+        traits::{FieldQHasher, QFieldHashable},
     },
     data::{
         db::hash_id_u64::{PSY_OBJECT_FFS_SIZE_HASH_256_AND_U64, QHash256AndU64},
@@ -20,7 +20,7 @@ use parth_core::{
 use psy_core::user_id::get_user_id_from_registration_id;
 use psy_data::{
     genesis::genesis_block_setup::PsyGenesisBlockSetupData,
-    prepared_block::{common::PsyCoordinatorPendingCheckpointBase, coordinator::PsyPreparedCoordinatorBlockStateUpdates, realm::PsyPreparedRealmBlockStateUpdatesWithCoordinatorUpdate},
+    prepared_block::{common::PsyCoordinatorPendingCheckpointBase, coordinator::PsyPreparedCoordinatorBlockStateUpdates},
     v1::qdata::{
         checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, PQEDCheckpointLeafStats, QEDL2BlockState},
         contract::{ContractCodeDefinitionWithContractId, PQEDContractLeaf},

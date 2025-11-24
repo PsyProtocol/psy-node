@@ -2,11 +2,11 @@
 
 use std::hash::Hash;
 
-use parth_core::{crypto::hash::{merkle_proof::{DeltaMerkleProofCore, MerkleProofCore}, traits::ZeroableHash}, felt::QFelt64, protocol::core_types::Q256BitHash, utils::QPGenRandom};
+use parth_core::{crypto::hash::{merkle_proof::{DeltaMerkleProofCore, MerkleProofCore}, traits::{FieldQHasher, QFieldHashable, ZeroableHash}}, felt::QFelt64, protocol::core_types::{Q256BitHash, QFHashBase}, utils::QPGenRandom};
 use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
 use psy_serialize::{PsyCanonicalSerializeMetadata, PsyIOReadWrite};
 
-use crate::{guta::header::GlobalUserTreeAggregatorHeader, v1::qdata::checkpoint::PQEDCheckpointLeafCompactWithStateRoots};
+use crate::{guta::{header::GlobalUserTreeAggregatorHeader, sub_tree_transition::SubTreeNodeStateTransition}, v1::qdata::checkpoint::PQEDCheckpointLeafCompactWithStateRoots};
 use psy_serialize::FallbackPsySerializeCanonical;
 
 
@@ -18,6 +18,39 @@ pub struct GUTANoChangeFullInput<Hash> {
     pub checkpoint_leaf: PQEDCheckpointLeafCompactWithStateRoots<Hash>,
 }
 
+
+impl<Hash> GUTANoChangeFullInput<Hash> {
+    pub fn get_public_inputs_hash_no_rewards_tag<F: QFelt64, Hasher: FieldQHasher<F, Hash>>(&self, guta_circuit_whitelist: Hash) -> Hash where Hash: QFHashBase<F>{
+        let state_transition = SubTreeNodeStateTransition::<F, Hash> {
+                old_node_value: self.checkpoint_leaf.global_state_roots.user_tree_root,
+                new_node_value: self.checkpoint_leaf.global_state_roots.user_tree_root,
+                node_index: F::ZERO_VALUE,
+                node_level: F::ZERO_VALUE,
+            };
+            let state_transition_hash = state_transition.qfhash::<Hasher>();
+        let state_transition_and_stats_hash = Hasher::q_two_to_one(
+            state_transition_hash,
+            self.checkpoint_leaf.checkpoint_leaf.stats_hash,
+        );
+
+        let state_stats_checkpoint_hash = Hasher::q_two_to_one(
+            self.checkpoint_tree_proof.root,
+            state_transition_and_stats_hash,
+        );
+
+        let header_with_whitelist_hash_felts = Hasher::q_two_to_one(
+            guta_circuit_whitelist,
+            state_stats_checkpoint_hash,
+        ).to_4_felts();
+        Hasher::q_hash_many(&[
+            header_with_whitelist_hash_felts[0],
+            header_with_whitelist_hash_felts[1],
+            header_with_whitelist_hash_felts[2],
+            header_with_whitelist_hash_felts[3],
+            F::from_u8_value(1),
+        ])
+    }
+}
 impl<Hash: QPGenRandom> QPGenRandom for GUTANoChangeFullInput<Hash> {
     fn qp_rand_gen() -> Self where Self: Sized {
         Self {
