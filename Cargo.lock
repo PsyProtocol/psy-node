@@ -2989,6 +2989,7 @@ dependencies = [
  "tower",
  "tower-http",
  "tracing",
+ "ts-rs",
 ]
 
 [[package]]

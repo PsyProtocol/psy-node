@@ -48,7 +48,7 @@ use psy_node_core::{
 use psy_serialize::{FastFixedSerializable, PsyCanonicalDatabaseSerializeBaseSingle, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
-use crate::queue::gatherer_builder::QueueGathererItemBuilderWithTree;
+use crate::{coordinator::processor::processor_shared_status::PsyCoordinatorProcessorSharedStatus, queue::gatherer_builder::QueueGathererItemBuilderWithTree};
 pub const DEPLOY_CONTRACT_GATHERER_BACKUP_V1_MAGIC_BYTES: [u8; 4] = [0x44, 0x43, 0x42, 0x31]; // 'DCB1' in ASCII
 pub const DEPLOY_CONTRACT_GATHERER_BACKUP_V1_MAGIC_U32: u32 = 0x31424344; // 'DCB1' in little-endian u32
 
@@ -227,6 +227,7 @@ pub async fn read_deploy_contract_gatherer_backup_file<Hasher: FieldQHasher<F, H
     Ok((output_db, tree))
 }
 
+#[derive(Debug, Clone)]
 pub struct DeployContractGathererOutputDatabase<Hash> {
     pub start_next_contract_id: u64,
     pub start_global_contract_tree_root: Hash,
@@ -242,6 +243,7 @@ pub struct DeployContractGathererOutputDatabase<Hash> {
     pub update_global_contract_tree_nodes_ffs: Vec<u8>,
 }
 
+#[derive(Debug, Clone)]
 pub struct DeployContractGathererOutput<Hash, JobId> {
     pub db_output: DeployContractGathererOutputDatabase<Hash>,
     pub job_ids: Vec<Vec<PsyProvingJobMetadataWithJobId<Hash, JobId>>>,
@@ -249,38 +251,27 @@ pub struct DeployContractGathererOutput<Hash, JobId> {
 pub struct DeployContractGathererConfig<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>> {
     pub realm_id_u64: u64,
     pub realm_sub_id_u64: u64,
-    pub start_next_contract_id: Arc<AtomicU64>,
-    pub pending_unique_id: Arc<AtomicU64>,
-    pub last_checkpoint_id: Arc<AtomicU64>,
+    pub shared_status: Arc<RwLock<PsyCoordinatorProcessorSharedStatus<N::F, N::QHash>>>,
     pub temp_db: Arc<TempDatabase>,
     pub backup_file_directory: String,
     pub deploy_contract_circuit_whitelist: N::QHash,
 
     pub _phantom_n: std::marker::PhantomData<N>,
 }
-impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>> DeployContractGathererConfig<N, TempDatabase> {
-    pub fn new(
-        realm_id_u64: u64,
-        realm_sub_id_u64: u64,
-        start_next_contract_id: Arc<AtomicU64>,
-        pending_unique_id: Arc<AtomicU64>,
-        last_checkpoint_id: Arc<AtomicU64>,
-        temp_db: Arc<TempDatabase>,
-        backup_file_directory: String,
-        deploy_contract_circuit_whitelist: N::QHash,
-    ) -> Self {
+impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>> Clone for DeployContractGathererConfig<N, TempDatabase> {
+    fn clone(&self) -> Self {
         Self {
-            realm_id_u64,
-            realm_sub_id_u64,
-            start_next_contract_id,
-            pending_unique_id,
-            last_checkpoint_id,
-            temp_db,
-            backup_file_directory,
-            deploy_contract_circuit_whitelist,
+            realm_id_u64: self.realm_id_u64,
+            realm_sub_id_u64: self.realm_sub_id_u64,
+            shared_status: self.shared_status.clone(),
+            temp_db: self.temp_db.clone(),
+            backup_file_directory: self.backup_file_directory.clone(),
+            deploy_contract_circuit_whitelist: self.deploy_contract_circuit_whitelist.clone(),
             _phantom_n: std::marker::PhantomData,
         }
     }
+}
+impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>> DeployContractGathererConfig<N, TempDatabase> {
     pub fn get_realm_identifier(&self) -> QRealmIdentifier {
         QRealmIdentifier {
             realm_id: self.realm_id_u64 as u32,
@@ -288,11 +279,12 @@ impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::J
         }
     }
     pub fn get_pending_unique_id(&self) -> u64 {
-        self.pending_unique_id.load(Ordering::Relaxed)
+        self.shared_status.read().unwrap().unique_pending_id
     }
 }
 pub struct DeployContractGatherer<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>> {
     pub config: DeployContractGathererConfig<N, TempDatabase>,
+    pub shared_status: PsyCoordinatorProcessorSharedStatus<N::F, N::QHash>,
     pub pending_core_proc_id: QCoreProcCheckpointUniqueId,
     pub new_contract_leaves_ffs: Vec<u8>,
     pub new_contract_leaves: Vec<PQEDContractLeaf<N::F, N::QHash>>,
@@ -319,14 +311,15 @@ impl<
         unique_id: QCoreProcCheckpointUniqueId,
         config: DeployContractGathererConfig<N, TempDatabase>,
     ) -> anyhow::Result<Self> {
+        let shared_status = config.shared_status.read().unwrap().clone();
         let new_deploy_contract_file_path = get_new_deploy_contract_gatherer_backup_file_path(
             &config.backup_file_directory,
             config.realm_id_u64,
             config.realm_sub_id_u64,
-            config.pending_unique_id.load(std::sync::atomic::Ordering::Relaxed),
+            shared_status.unique_pending_id,
         );
         let mut new_contracts_file = tokio::fs::File::create(&new_deploy_contract_file_path).await?;
-        let start_next_contract_id = config.start_next_contract_id.load(Ordering::Relaxed);
+        let start_next_contract_id = shared_status.block_state.next_contract_id as u64;
         new_contracts_file.write_u32_le(DEPLOY_CONTRACT_GATHERER_BACKUP_V1_MAGIC_U32).await?;
         new_contracts_file.write_u64_le(start_next_contract_id).await?;
         new_contracts_file.write_all(&tree.get_root().into_owned_32bytes()).await?;
@@ -334,6 +327,7 @@ impl<
 
         Ok(Self {
             config,
+            shared_status,
             pending_core_proc_id: unique_id,
             new_contract_leaves: Vec::new(),
             new_contract_leaves_ffs: Vec::new(),
@@ -453,7 +447,7 @@ impl<
 
         let start_state_root = tree.get_root();
 
-        let pending_unique_id = self.config.pending_unique_id.load(Ordering::Relaxed);
+        let pending_unique_id = self.shared_status.unique_pending_id;
         let realm_identifier = QRealmIdentifier {
             realm_id: self.config.realm_id_u64 as u32,
             realm_sub_id: self.config.realm_sub_id_u64 as u16,
@@ -507,7 +501,7 @@ impl<
             .set_tdb_proof_witnesses_tuple_owned_raw(&realm_identifier, pending_unique_id, job_temp_data)
             .await?;
 
-        let start_next_contract_id = self.config.start_next_contract_id.load(Ordering::Relaxed);
+        let start_next_contract_id = self.shared_status.block_state.next_contract_id as u64;
         let output_database = DeployContractGathererOutputDatabase {
             start_next_contract_id,
             start_global_contract_tree_root: start_state_root,

@@ -10,6 +10,12 @@ pub const TEMP_TABLE_ID_UNIQUE_PENDING_ID_BYTES: [u8; 2] = [0x50, 0x49]; // 'PI'
 pub const TEMP_TABLE_UNIQUE_PENDING_ID_KEY_SIZE: usize = 8; // 4 + 2 + 2
 pub const TEMP_TABLE_UNIQUE_PENDING_ID_VALUE_SIZE: usize = 24; // u64 + u128
 
+
+pub const TEMP_TABLE_ID_GATHERING_UNIQUE_PENDING_ID: u16 = 0x5047; // 'GP'
+pub const TEMP_TABLE_ID_GATHERING_UNIQUE_PENDING_ID_BYTES: [u8; 2] = [0x47, 0x50]; // 'GP'
+pub const TEMP_TABLE_GATHERING_UNIQUE_PENDING_ID_KEY_SIZE: usize = 8; // 4 + 2 + 2
+pub const TEMP_TABLE_GATHERING_UNIQUE_PENDING_ID_VALUE_SIZE: usize = 24; // u64 + u128
+
 pub const TEMP_TABLE_ID_PROOF_WITNESS_DATA: u16 = 0x5750; // 'PW'
 pub const TEMP_TABLE_ID_PROOF_WITNESS_DATA_BYTES: [u8; 2] = [0x50, 0x57]; // 'PW'
 pub const TEMP_TABLE_PROOF_WITNESS_DATA_KEY_SIZE: usize = 40; // 4 + 2 + 2 + 8 + 24
@@ -99,6 +105,30 @@ pub fn tt_write_unique_pending_id_key<Writer: psy_io::Write>(
     writer.write_all(&realm_id.to_le_bytes())?;
     writer.write_all(&realm_sub_id.to_le_bytes())?;
     writer.write_all(&TEMP_TABLE_ID_UNIQUE_PENDING_ID_BYTES)?;
+    Ok(())
+}
+
+// --- Gathering Unique Pending ID ---
+
+// (realm_id = 4) + (realm_sub_id = 2) + (table id length = 2) = 8
+#[inline(always)]
+pub fn tt_get_gathering_unique_pending_id_key(realm_id: u32, realm_sub_id: u16) -> [u8; 8] {
+    let mut key = [0u8; 8];
+    key[0..4].copy_from_slice(&realm_id.to_le_bytes());
+    key[4..6].copy_from_slice(&realm_sub_id.to_le_bytes());
+    key[6..8].copy_from_slice(&TEMP_TABLE_ID_GATHERING_UNIQUE_PENDING_ID_BYTES);
+    key
+}
+
+#[inline(always)]
+pub fn tt_write_gathering_unique_pending_id_key<Writer: psy_io::Write>(
+    writer: &mut Writer,
+    realm_id: u32,
+    realm_sub_id: u16,
+) -> anyhow::Result<()> {
+    writer.write_all(&realm_id.to_le_bytes())?;
+    writer.write_all(&realm_sub_id.to_le_bytes())?;
+    writer.write_all(&TEMP_TABLE_ID_GATHERING_UNIQUE_PENDING_ID_BYTES)?;
     Ok(())
 }
 

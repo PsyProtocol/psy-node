@@ -39,7 +39,7 @@ pub trait PsyMemoryMerkleStoreAppendOnlyReaderBase<Hash: Copy + PartialEq + Defa
     ) -> Option<u64>;
 }
 
-pub trait PsyMemoryMerkleStoreImm<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + PartialEq + Default>
+pub trait PsyMemoryMerkleStoreImm<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + PartialEq>
 {
 
     fn get_height(&self) -> u8;
@@ -369,5 +369,32 @@ pub trait PsyMemoryMerkleStoreImm<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + P
             siblings,
             index,
         }
+    }
+    /// Updates a single leaf and returns a proof of the change.
+    fn set_leaf_no_proof(&self, index: u64, value: Hash) {
+        let leaf_key = SimpleMerkleNodeKey::new(self.get_height(), index);
+        
+        // Set the new leaf value
+        self.set_node_value(leaf_key, value);
+        
+        // Re-hash up the tree from the changed leaf
+        self.rehash_from_node_to_level(leaf_key, 0);
+
+    }
+    fn injest_merkle_proof(&self, proof: &MerkleProofCore<Hash>) -> anyhow::Result<()> {
+        let mut current_key = SimpleMerkleNodeKey::new(self.get_height(), proof.index);
+        
+        if self.get_height() as usize != proof.siblings.len() {
+            bail!("proof height does not match tree height");
+        }
+        self.set_node_value(current_key, proof.value);
+
+        for sibling_hash in &proof.siblings {
+            let sibling_key = current_key.sibling();
+            self.set_node_value(sibling_key, *sibling_hash);
+            current_key = current_key.parent();
+        }
+        self.rehash_from_node_to_level(current_key, 0);
+        Ok(())
     }
 }

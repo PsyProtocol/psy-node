@@ -7,7 +7,7 @@ use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 
 use crate::{
     psy_temp_db::{
-        QTempDBDeployContractDataReader, QTempDBDeployContractDataWriter, QTempDBPendingIdReader, QTempDBPendingIdWriter, QTempDBProofWitnessReader, QTempDBProofWitnessWriter, QTempDBProvingJobMetadataReader, QTempDBProvingJobMetadataWriter, QTempDBRewardsTreeReader, QTempDBRewardsTreeWriter, QTempDBSubmitStatusReader, QTempDBSubmitStatusWriter, QTempDBUserContractUpdatesReader, QTempDBUserContractUpdatesWriter, tt_get_contract_updates_key, tt_get_deploy_contract_code_definition_key, tt_get_proof_witness_data_key_from_job, tt_get_proving_job_metadata_key_from_job, tt_get_rewards_tag_tree_value_key_from_job, tt_get_submit_status_key, tt_get_unique_pending_id_key
+        QTempDBDeployContractDataReader, QTempDBDeployContractDataWriter, QTempDBPendingIdReader, QTempDBPendingIdWriter, QTempDBProofWitnessReader, QTempDBProofWitnessWriter, QTempDBProvingJobMetadataReader, QTempDBProvingJobMetadataWriter, QTempDBRewardsTreeReader, QTempDBRewardsTreeWriter, QTempDBSubmitStatusReader, QTempDBSubmitStatusWriter, QTempDBUserContractUpdatesReader, QTempDBUserContractUpdatesWriter, tt_get_contract_updates_key, tt_get_deploy_contract_code_definition_key, tt_get_gathering_unique_pending_id_key, tt_get_proof_witness_data_key_from_job, tt_get_proving_job_metadata_key_from_job, tt_get_rewards_tag_tree_value_key_from_job, tt_get_submit_status_key, tt_get_unique_pending_id_key
     },
     store::traits::temp_db::{QTempDatabaseRawKVReaderBase, QTempDatabaseRawKVWriterBase},
 };
@@ -188,6 +188,21 @@ impl<T: QTempDatabaseRawKVReaderBase + Sync> QTempDBPendingIdReader for T {
             anyhow::bail!("Unique pending ids not found");
         }
     }
+    async fn get_gathering_unique_pending_ids(&self, rid: &QRealmIdentifier) -> anyhow::Result<(u64, QCoreProcCheckpointUniqueId)> {
+        let key = tt_get_gathering_unique_pending_id_key(rid.realm_id, rid.realm_sub_id);
+        let value_bytes = self.qtdb_raw_kv_get_value(&key).await?;
+        if value_bytes.is_some() {
+            let value_bytes = value_bytes.unwrap();
+            if value_bytes.len() != 24 {
+                return Err(anyhow::anyhow!("Invalid value length for unique pending ids"));
+            }
+            let unique_pending_id = u64::from_le_bytes(value_bytes[0..8].try_into().unwrap());
+            let proc_checkpoint_unique_id = QCoreProcCheckpointUniqueId::from_le_bytes(value_bytes[8..24].try_into().unwrap());
+            Ok((unique_pending_id, proc_checkpoint_unique_id))
+        } else {
+            anyhow::bail!("Unique pending ids not found");
+        }
+    }
 }
 
 #[async_trait]
@@ -199,6 +214,13 @@ impl<T: QTempDatabaseRawKVWriterBase + Sync> QTempDBPendingIdWriter for T {
         proc_checkpoint_unique_id: QCoreProcCheckpointUniqueId,
     ) -> anyhow::Result<()> {
         let key = tt_get_unique_pending_id_key(rid.realm_id, rid.realm_sub_id);
+        let mut data = [0u8; 24];
+        data[0..8].copy_from_slice(&unique_pending_id.to_le_bytes());
+        data[8..24].copy_from_slice(&proc_checkpoint_unique_id.to_le_bytes());
+        self.qtdb_raw_kv_put_value(&key, &data).await
+    }
+    async fn set_gathering_unique_pending_ids(&self, rid: &QRealmIdentifier, unique_pending_id: u64, proc_checkpoint_unique_id: QCoreProcCheckpointUniqueId) -> anyhow::Result<()> {
+        let key = tt_get_gathering_unique_pending_id_key(rid.realm_id, rid.realm_sub_id);
         let mut data = [0u8; 24];
         data[0..8].copy_from_slice(&unique_pending_id.to_le_bytes());
         data[8..24].copy_from_slice(&proc_checkpoint_unique_id.to_le_bytes());

@@ -70,13 +70,15 @@ impl<const QUEUE_TOPIC_ID: u32, QueueItem: PCoreQueueItemBase> QueueKeyStatusMan
         Ok(())
     }
 }
+
+#[derive(Clone)]
 pub struct EphemeralQueueGatherer<const QUEUE_TOPIC_ID: u32, QueueItem: PCoreQueueItemBase, Output: Sized + Send + Sync + 'static>
 {
     qk: QueueKeyStatusManager<QUEUE_TOPIC_ID, QueueItem>,
     trigger_tx: mpsc::Sender<oneshot::Sender<Output>>,
 }
 
-impl<const QUEUE_TOPIC_ID: u32, QueueItem: PCoreQueueItemBase + 'static, Output: Sized + Send + Sync>
+impl<const QUEUE_TOPIC_ID: u32, QueueItem: PCoreQueueItemBase + 'static, Output: Send + Sync>
     EphemeralQueueGatherer<QUEUE_TOPIC_ID, QueueItem, Output>
 {
     pub fn new<Sub: QStandardEphemeralQueueSubscriber + Send + Sync + 'static, C: Clone + Send + Sync + 'static, Builder: QueueGathererItemBuilder<C, Output = Output> + Send + Sync + 'static>(
@@ -120,6 +122,77 @@ impl<const QUEUE_TOPIC_ID: u32, QueueItem: PCoreQueueItemBase + 'static, Output:
     }
 }
 
+#[derive(Clone)]
+pub struct EphemeralQueueGathererWithTree<
+    const QUEUE_TOPIC_ID: u32,
+    QueueItem: PCoreQueueItemBase,
+    Output: Sized + Send + Sync + 'static,
+> {
+    qk: QueueKeyStatusManager<QUEUE_TOPIC_ID, QueueItem>,
+    trigger_tx: mpsc::Sender<oneshot::Sender<Output>>,
+}
+
+impl<const QUEUE_TOPIC_ID: u32, QueueItem: PCoreQueueItemBase + 'static, Output: Send + Sync>
+    EphemeralQueueGathererWithTree<QUEUE_TOPIC_ID, QueueItem, Output>
+{
+    pub fn new<
+        Sub: QStandardEphemeralQueueSubscriber + Send + Sync + 'static,
+        C: Clone + Send + Sync + 'static,
+        Hash: QHashBase + Send + Sync + 'static,
+        Hasher: MerkleZeroHasher<Hash> + Send + Sync + 'static,
+        Builder: QueueGathererItemBuilderWithTree<C, SimpleMemoryMerkleRecorderStore<Hasher, Hash>, Output = Output>
+            + Send
+            + Sync
+            + 'static,
+    >(
+        stream: Arc<Sub>,
+        create_builder_config: C,
+        base_queue_key: QPStandardUniqueIdQueueKey<QUEUE_TOPIC_ID, QueueItem>,
+        tree: SimpleMemoryMerkleRecorderStore<Hasher, Hash>,
+    ) -> (Self, tokio::task::JoinHandle<Result<(), anyhow::Error>>) {
+        let qk = QueueKeyStatusManager::new(base_queue_key.clone());
+        let (trigger_tx, trigger_rx) = mpsc::channel::<oneshot::Sender<Output>>(1);
+
+        let jh: tokio::task::JoinHandle<Result<(), anyhow::Error>> =
+            tokio::spawn(gatherer_runner_for_tree::<
+                QUEUE_TOPIC_ID,
+                QueueItem,
+                Sub,
+                Builder,
+                C,
+                Hash,
+                Hasher,
+            >(
+                stream,
+                create_builder_config,
+                base_queue_key.clone(),
+                tree,
+                qk.clone(),
+                trigger_rx,
+            ));
+
+        (Self { qk, trigger_tx }, jh)
+    }
+
+    pub async fn stop_gracefully(&mut self) -> anyhow::Result<()> {
+        self.qk.set_active(false)?;
+        let (response_tx, response_rx) = oneshot::channel();
+        self.trigger_tx.send(response_tx).await?;
+        let _result = response_rx.await?;
+        Ok(())
+    }
+
+    pub async fn finalize_gathering_and_update_queue_key(
+        &mut self,
+        unique_id: u128,
+    ) -> anyhow::Result<Output> {
+        self.qk.set_unique_id(unique_id)?;
+        let (response_tx, response_rx) = oneshot::channel();
+        self.trigger_tx.send(response_tx).await?;
+        let result = response_rx.await?;
+        Ok(result)
+    }
+}
 pub async fn gatherer_runner<
     const QUEUE_TOPIC_ID: u32,
     QueueItem: PCoreQueueItemBase,

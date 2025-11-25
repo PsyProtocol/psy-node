@@ -109,7 +109,7 @@ pub trait QJobPlanner<JobId: QJobIdBase> {
 
 pub trait QNetworkHashTypes {
     type QHash: QFHashBase<Self::F> + Q256BitHash + PsySerializeCanonicalAsyncSafe;
-    type HasherBase: QFHasherU64<Self::F, Self::QHash> + Send + Sync;
+    type HasherBase: QFHasherU64<Self::F, Self::QHash> + Clone + Send + Sync;
     type F: QFelt64;
 }
 pub trait QNetworkDatabaseTypes: QNetworkTreeConstants + QNetworkHashTypes {}

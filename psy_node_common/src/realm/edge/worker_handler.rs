@@ -72,7 +72,11 @@ impl<
     }
 
     pub async fn get_current_unique_pending_id_internal(&self) -> anyhow::Result<(u64, QCoreProcCheckpointUniqueId)> {
-        self.db_reader.get_current_unique_pending_id().await
+        self.temp_db.get_unique_pending_ids(&self.realm_identifier).await
+    }
+
+    pub async fn get_current_gathering_unique_pending_id_internal(&self) -> anyhow::Result<(u64, QCoreProcCheckpointUniqueId)> {
+        self.temp_db.get_gathering_unique_pending_ids(&self.realm_identifier).await
     }
     pub async fn get_proving_work_internal(
         &self,
@@ -254,7 +258,7 @@ impl<
         tag: N::QHash,
         proof_bytes: Vec<u8>,
     ) -> anyhow::Result<()> {
-        let (unique_pending_id, unique_proc_id) = self.get_current_unique_pending_id_internal().await?;
+        let (unique_pending_id, unique_proc_id) = self.get_current_gathering_unique_pending_id_internal().await?;
 
         //HACK: check to make sure the tag matches
         if self

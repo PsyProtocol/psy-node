@@ -21,6 +21,7 @@ impl QStaticNamedType for PoseidonHash {
         "PoseidonHash"
     }
 }
+#[derive(Debug, Clone, Copy)]
 pub struct PoseidonHasher;
 impl FieldQHasher<BF, BaseHashQ> for PoseidonHasher {
     #[inline]

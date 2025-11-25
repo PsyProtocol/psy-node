@@ -35,7 +35,7 @@ use psy_node_core::{
 use psy_serialize::{FastFixedSerializable, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::queue::gatherer_builder::QueueGathererItemBuilderWithTree;
+use crate::{coordinator::processor::processor_shared_status::PsyCoordinatorProcessorSharedStatus, queue::gatherer_builder::QueueGathererItemBuilderWithTree};
 
 pub const REGISTER_USER_GATHERER_BACKUP_V1_MAGIC_BYTES: [u8; 4] = [0x52, 0x55, 0x42, 0x31]; // 'RUB1' in ASCII
 pub const REGISTER_USER_GATHERER_BACKUP_V1_MAGIC_U32: u32 = 0x31425552; // 'RUB1' in little-endian u32
@@ -148,18 +148,35 @@ pub async fn read_register_user_gatherer_backup_file<Hasher: MerkleZeroHasher<Ha
     Ok((output_db, tree))
 }
 pub struct RegisterUserGathererConfig<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>> {
+    pub status: Arc<RwLock<PsyCoordinatorProcessorSharedStatus<N::F, N::QHash>>>,
+
     pub realm_id_u64: u64,
     pub realm_sub_id_u64: u64,
-    pub start_next_user_id: Arc<AtomicU64>,
-    pub pending_unique_id: Arc<AtomicU64>,
-    pub last_checkpoint_id: Arc<AtomicU64>,
     pub temp_db: Arc<TempDatabase>,
     pub backup_file_directory: String,
     pub register_users_circuit_whitelist: N::QHash,
 
     pub _phantom_n: std::marker::PhantomData<N>,
 }
+impl<
+    N: QNetworkTypesConfig,
+    TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>,
+> Clone for RegisterUserGathererConfig<N, TempDatabase> {
+    fn clone(&self) -> Self {
+        Self {
+            realm_id_u64: self.realm_id_u64,
+            realm_sub_id_u64: self.realm_sub_id_u64,
+            status: Arc::clone(&self.status),
+            temp_db: Arc::clone(&self.temp_db),
+            backup_file_directory: self.backup_file_directory.clone(),
+            register_users_circuit_whitelist: self.register_users_circuit_whitelist.clone(),
+            _phantom_n: std::marker::PhantomData,
+        }
+    }
+}
+
 pub struct RegisterUserGatherer<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>> {
+    pub shared_status: PsyCoordinatorProcessorSharedStatus<N::F, N::QHash>,
     pub config: RegisterUserGathererConfig<N, TempDatabase>,
     pub pending_core_proc_id: QCoreProcCheckpointUniqueId,
     pub new_user_public_keys_ffs: Vec<u8>,
@@ -170,6 +187,7 @@ pub struct RegisterUserGatherer<N: QNetworkTypesConfig, TempDatabase: StandardPr
     pub next_user_id: u64,
 }
 
+#[derive(Debug, Clone)]
 pub struct RegisterUserGathererOutputDatabase<Hash> {
     pub start_next_user_id: u64,
     pub start_user_registration_tree_hash: Hash,
@@ -181,7 +199,7 @@ pub struct RegisterUserGathererOutputDatabase<Hash> {
     pub new_public_key_hash_to_user_id_rows_ffs: Vec<u8>,
     pub update_user_registration_tree_nodes_ffs: Vec<u8>,
 }
-
+#[derive(Debug, Clone)]
 pub struct RegisterUserGathererOutput<Hash, JobId> {
     pub db_output: RegisterUserGathererOutputDatabase<Hash>,
     pub job_ids: Vec<Vec<PsyProvingJobMetadataWithJobId<Hash, JobId>>>,
@@ -200,20 +218,22 @@ impl<
         unique_id: QCoreProcCheckpointUniqueId,
         config: RegisterUserGathererConfig<N, TempDatabase>,
     ) -> anyhow::Result<Self> {
+        let shared_status = config.status.read().unwrap().clone();
         let new_user_public_keys_file_path = get_new_register_user_gatherer_backup_file_path(
             &config.backup_file_directory,
             config.realm_id_u64,
             config.realm_sub_id_u64,
-            config.pending_unique_id.load(std::sync::atomic::Ordering::Relaxed),
+            shared_status.unique_pending_id,
         );
         let mut new_user_public_keys_file = tokio::fs::File::create(&new_user_public_keys_file_path).await?;
-        let start_next_user_id = config.start_next_user_id.load(Ordering::Relaxed);
+        let start_next_user_id = shared_status.block_state.next_user_id;
         new_user_public_keys_file.write_u32_le(REGISTER_USER_GATHERER_BACKUP_V1_MAGIC_U32).await?;
         new_user_public_keys_file.write_u64_le(start_next_user_id).await?;
         new_user_public_keys_file.write_all(&tree.get_root().into_owned_32bytes()).await?;
 
         Ok(Self {
             config,
+            shared_status,
             pending_core_proc_id: unique_id,
             new_user_public_keys_ffs: Vec::new(),
             new_public_key_hash_to_user_id_rows_ffs: Vec::new(),
@@ -267,7 +287,7 @@ impl<
 
         let start_state_root = tree.get_root();
 
-        let pending_unique_id = self.config.pending_unique_id.load(Ordering::Relaxed);
+        let pending_unique_id = self.shared_status.unique_pending_id;
         let realm_identifier = QRealmIdentifier {
             realm_id: self.config.realm_id_u64 as u32,
             realm_sub_id: self.config.realm_sub_id_u64 as u16,
@@ -310,7 +330,7 @@ impl<
             .set_tdb_proof_witnesses_tuple_owned_raw(&realm_identifier, pending_unique_id, job_temp_data)
             .await?;
 
-        let start_next_user_id = self.config.start_next_user_id.load(Ordering::Relaxed);
+        let start_next_user_id = self.shared_status.block_state.next_user_id;
         let output_database = RegisterUserGathererOutputDatabase {
             start_next_user_id,
             start_user_registration_tree_hash: start_state_root,

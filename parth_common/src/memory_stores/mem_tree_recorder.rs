@@ -31,6 +31,9 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + PartialEq + Default>
         }
         self.updated_nodes.clear();
     }
+    pub fn revert_changes(&mut self) {
+        self.updated_nodes.clear();
+    }
     pub fn get_height(&self) -> u8 {
         self.height
     }

@@ -11,15 +11,26 @@ use futures::{
     stream::{self, StreamExt},
     TryFutureExt,
 };
-use parth_core::felt::FromPrimitiveValuesFelt;
-use parth_common::memory_stores::{dash_tree_append_only::PsyDashMemoryAppendOnlyMerkleStore, mem_tree_recorder::SimpleMemoryMerkleRecorderStore};
-use parth_core::{
-    QCoreProcCheckpointUniqueId, crypto::hash::{spiderman::SpidermanUpdateProof, traits::MerkleZeroHasher}, data::{
-        db::hash_id_u64::{QHash256AndU64, get_data_buffer_for_hash256_and_u64s},
-        hash::merkle_node_key::{PSY_OBJECT_FFS_SIZE_SIMPLE_MERKLE_NODE, SimpleMerkleNode, SimpleMerkleNodeKey},
-    }, felt::{QFelt64, ToU64Value, ZeroableFelt}, node::realm_identifier::QRealmIdentifier, protocol::{core_types::{Q256BitHash, QDBHashBase, QFHashBase, QNetworkTypesConfig}, provider::jobs}
+use parth_common::memory_stores::{
+    dash_tree_append_only::PsyDashMemoryAppendOnlyMerkleStore, mem_tree_recorder::SimpleMemoryMerkleRecorderStore, traits::PsyMemoryMerkleStoreImm,
 };
-use rand::RngCore;
+use parth_core::{
+    crypto::hash::{
+        spiderman::SpidermanUpdateProof,
+        traits::{MerkleZeroHasher, QFieldHashable},
+    },
+    data::{
+        db::hash_id_u64::{get_data_buffer_for_hash256_and_u64s, QHash256AndU64},
+        hash::merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey, PSY_OBJECT_FFS_SIZE_SIMPLE_MERKLE_NODE},
+    },
+    felt::{FromPrimitiveValuesFelt, QFelt64, ToU64Value, ZeroableFelt},
+    node::realm_identifier::QRealmIdentifier,
+    protocol::{
+        core_types::{Q256BitHash, QDBHashBase, QFHashBase, QNetworkTypesConfig},
+        provider::jobs,
+    },
+    QCoreProcCheckpointUniqueId,
+};
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{
     agg::{
@@ -36,15 +47,21 @@ use psy_data::{
     worker::{metadata::PsyProvingJobMetadata, metadata_with_job_id::PsyProvingJobMetadataWithJobId},
 };
 use psy_node_core::{
-    psy_temp_db::StandardProcessorTempDBStoreBase, qblob::data_views::zero_merkle_node_batch::create_ffs_merkle_nodes_zero_id_from_hash_map,
+    guta_planner, psy_temp_db::StandardProcessorTempDBStoreBase,
+    qblob::data_views::zero_merkle_node_batch::create_ffs_merkle_nodes_zero_id_from_hash_map,
 };
 use psy_serialize::{FastFixedSerializable, PsyCanonicalDatabaseSerializeBaseSingle, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
+use rand::RngCore;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower_http::ServiceExt;
 
-use crate::queue::gatherer_builder::QueueGathererItemBuilderWithTree;
+use crate::{
+    coordinator::processor::processor_shared_status::PsyCoordinatorProcessorSharedStatus,
+    guta_planner::coordinator_guta_planner::CoordinatorGUTAPlanner, queue::gatherer_builder::QueueGathererItemBuilderWithTree,
+};
 pub const COORDINATOR_GUTA_UPDATE_GATHERER_BACKUP_V1_MAGIC_BYTES: [u8; 4] = [0x43, 0x47, 0x42, 0x31]; // 'CGB1' in ASCII
 pub const COORDINATOR_GUTA_UPDATE_GATHERER_BACKUP_V1_MAGIC_U32: u32 = 0x31424743; // 'CGB1' in little-endian u32
+
 fn get_temp_guta_rand_seed<Hash: Q256BitHash>() -> Hash {
     let mut bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut bytes);
@@ -152,8 +169,7 @@ pub async fn read_coordinator_guta_update_gatherer_backup_file<Hasher: MerkleZer
 pub struct CoordinatorGUTAUpdateGathererConfig<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>> {
     pub realm_id_u64: u64,
     pub realm_sub_id_u64: u64,
-    pub pending_unique_id: Arc<AtomicU64>,
-    pub last_checkpoint_id: Arc<AtomicU64>,
+    pub status: Arc<RwLock<PsyCoordinatorProcessorSharedStatus<N::F, N::QHash>>>,
     pub temp_db: Arc<TempDatabase>,
     pub backup_file_directory: String,
     pub coordinator_guta_updates_circuit_whitelist: N::QHash,
@@ -161,8 +177,25 @@ pub struct CoordinatorGUTAUpdateGathererConfig<N: QNetworkTypesConfig, TempDatab
 
     pub _phantom_n: std::marker::PhantomData<N>,
 }
+impl <N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>> Clone for CoordinatorGUTAUpdateGathererConfig<N, TempDatabase> {
+    fn clone(&self) -> Self {
+        Self {
+            realm_id_u64: self.realm_id_u64,
+            realm_sub_id_u64: self.realm_sub_id_u64,
+            status: self.status.clone(),
+            temp_db: self.temp_db.clone(),
+            backup_file_directory: self.backup_file_directory.clone(),
+            coordinator_guta_updates_circuit_whitelist: self.coordinator_guta_updates_circuit_whitelist,
+            checkpoint_tree: self.checkpoint_tree.clone(),
+            _phantom_n: std::marker::PhantomData,
+        }
+    }
+}
 pub struct CoordinatorGUTAUpdateGatherer<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>> {
     pub config: CoordinatorGUTAUpdateGathererConfig<N, TempDatabase>,
+    pub last_committed_checkpoint_root: N::QHash,
+    pub guta_planner: CoordinatorGUTAPlanner<N::F, N::QHash>,
+    pub status: PsyCoordinatorProcessorSharedStatus<N::F, N::QHash>,
     pub pending_core_proc_id: QCoreProcCheckpointUniqueId,
     pub guta_stats: GUTAStats<N::F>,
     pub total_guta_proofs_generated: N::F,
@@ -171,7 +204,7 @@ pub struct CoordinatorGUTAUpdateGatherer<N: QNetworkTypesConfig, TempDatabase: S
     pub new_coordinator_guta_file: tokio::fs::File,
     pub pending_file_path: String,
 }
-
+#[derive(Clone)]
 pub struct CoordinatorGUTAUpdateGathererOutputDatabase<F, Hash> {
     pub update_global_user_tree_nodes_ffs: Vec<u8>,
     pub guta_stats: GUTAStats<F>,
@@ -182,7 +215,7 @@ pub struct CoordinatorGUTAUpdateGathererOutputDatabase<F, Hash> {
 
     pub random_seed_guta: Hash,
 }
-
+#[derive(Clone)]
 pub struct CoordinatorGUTAUpdateGathererOutput<F, Hash, JobId> {
     pub db_output: CoordinatorGUTAUpdateGathererOutputDatabase<F, Hash>,
     pub job_ids: Vec<Vec<PsyProvingJobMetadataWithJobId<Hash, JobId>>>,
@@ -201,11 +234,12 @@ impl<
         unique_id: QCoreProcCheckpointUniqueId,
         config: CoordinatorGUTAUpdateGathererConfig<N, TempDatabase>,
     ) -> anyhow::Result<Self> {
+        let status = config.status.read().unwrap().clone();
         let new_coordinator_guta_file_path = get_new_coordinator_guta_update_gatherer_backup_file_path(
             &config.backup_file_directory,
             config.realm_id_u64,
             config.realm_sub_id_u64,
-            config.pending_unique_id.load(std::sync::atomic::Ordering::Relaxed),
+            status.unique_pending_id,
         );
         let mut new_coordinator_guta_file = tokio::fs::File::create(&new_coordinator_guta_file_path).await?;
         new_coordinator_guta_file
@@ -213,10 +247,27 @@ impl<
             .await?;
         new_coordinator_guta_file.write_all(&tree.get_root().into_owned_32bytes()).await?;
         // ensure uncommited changes are committed
-        tree.commit_changes();
-
+        if tree.get_root() != status.last_committed_checkpoint_state_roots.user_tree_root || status.should_revert_last_changes {
+            tracing::info!(
+                "reverting uncommitted changes in coordinator GUTA update gatherer, abandoning root {:?}",
+                tree.get_root()
+            );
+            tree.revert_changes();
+            tracing::info!("reverted to root {:?}", tree.get_root());
+        } else {
+            tracing::info!(
+                "committing uncommitted changes in coordinator GUTA update gatherer, committing root {:?}",
+                tree.get_root()
+            );
+            tree.commit_changes();
+        }
+        let guta_planner = CoordinatorGUTAPlanner::new();
+        let last_committed_checkpoint_root = config.checkpoint_tree.get_root();
         Ok(Self {
             config,
+            status,
+            guta_planner,
+            last_committed_checkpoint_root,
             pending_core_proc_id: unique_id,
             updated_realm_roots: Vec::new(),
             guta_stats: GUTAStats::get_zero_value(),
@@ -240,28 +291,38 @@ impl<
             ));
         }
         let update_header = GlobalUserTreeAggregatorHeaderWithTagValueAndJobID::<N::F, N::QHash>::psy_ser_from_slice(&item)?;
-        
-        self.config.temp_db.set_proof_miner_rewards_tree_value(
-            &QRealmIdentifier {
-                realm_id: self.config.realm_id_u64 as u32,
-                realm_sub_id: self.config.realm_sub_id_u64 as u16,
-            },
-            self.config.pending_unique_id.load(Ordering::Relaxed),
-            update_header.job_id,
-            update_header.header.new_tag_tree_node_value,
-        ).await?;
+        let unique_pending_id = self.status.unique_pending_id;
+        let current_checkpoint_root = self.last_committed_checkpoint_root;
+
+        self.config
+            .temp_db
+            .set_proof_miner_rewards_tree_value(
+                &QRealmIdentifier {
+                    realm_id: self.config.realm_id_u64 as u32,
+                    realm_sub_id: self.config.realm_sub_id_u64 as u16,
+                },
+                self.status.unique_pending_id,
+                update_header.job_id,
+                update_header.header.new_tag_tree_node_value,
+            )
+            .await?;
         self.new_coordinator_guta_file.write_all(&item).await?;
         self.guta_stats.add_from_mut(&update_header.header.header.stats);
         self.total_guta_proofs_generated += update_header.header.header.total_aggregation_proofs_generated;
         self.updated_realm_roots.push((
-            update_header
-                .header
-                .header
-                .state_transition
-                .node_index
-                .to_u64_value(),
+            update_header.header.header.state_transition.node_index.to_u64_value(),
             update_header.header.header.state_transition.new_node_value,
         ));
+        self.guta_planner
+            .add_realm_job(
+                unique_pending_id,
+                &current_checkpoint_root,
+                &self.config.checkpoint_tree,
+                tree,
+                self.config.temp_db.clone(),
+                &update_header,
+            )
+            .await?;
         Ok(())
     }
     async fn update_from_many_queue_items_with_tree(
@@ -280,30 +341,34 @@ impl<
 
         let end_global_user_tree_root = tree.get_root();
 
-        let pending_unique_id = self.config.pending_unique_id.load(Ordering::Relaxed);
         let realm_identifier = QRealmIdentifier {
             realm_id: self.config.realm_id_u64 as u32,
             realm_sub_id: self.config.realm_sub_id_u64 as u16,
         };
 
-        // todo prepare job temp data
-        let job_temp_data = Vec::new();
 
-        let update_global_user_tree_nodes_ffs = create_ffs_merkle_nodes_zero_id_from_hash_map::<N::QHash>(tree.get_changes());
-        tree.commit_changes();
-
-        self.config
-            .temp_db
-            .set_tdb_proof_witnesses_tuple_owned_raw(&realm_identifier, pending_unique_id, job_temp_data)
+        let jobs_for_queue: Vec<Vec<PsyProvingJobMetadataWithJobId<N::QHash, QProvingJobDataID>>> = self
+            .guta_planner
+            .finalize_with_reward_ids(
+                &realm_identifier,
+                self.status.unique_pending_id,
+                &self.last_committed_checkpoint_root,
+                &self.config.checkpoint_tree,
+                tree,
+                self.config.temp_db.clone(),
+                GUTA_REWARDS_TREE_OFFSET_ROOT_LEVEL,
+                GUTA_REWARDS_TREE_OFFSET_ROOT_INDEX,
+                self.status.last_committed_checkpoint_state_roots,
+                self.status.last_committed_checkpoint_leaf.stats.qfhash::<N::HasherBase>(),
+                self.config.coordinator_guta_updates_circuit_whitelist,
+            )
             .await?;
-
-
-            //todo actually collect job ids
-        let jobs_for_queue: Vec<Vec<PsyProvingJobMetadataWithJobId<N::QHash, QProvingJobDataID>>> = Vec::new();
 
         let added_proofs = jobs_for_queue.iter().map(|v| v.len() as u64).sum::<u64>();
         let added_proofs_felt = N::F::from_u64_value(added_proofs);
         self.total_guta_proofs_generated += added_proofs_felt;
+
+        let update_global_user_tree_nodes_ffs = create_ffs_merkle_nodes_zero_id_from_hash_map::<N::QHash>(tree.get_changes());
 
         let output_database = CoordinatorGUTAUpdateGathererOutputDatabase {
             update_global_user_tree_nodes_ffs,

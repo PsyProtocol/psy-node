@@ -18,7 +18,7 @@ pub struct PsyDashMemoryAppendOnlyMerkleStore<Hasher, Hash: Eq + Copy + PartialE
     _hasher: PhantomData<Hasher>,
 }
 
-impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + Eq + PartialEq + Default + std::hash::Hash + std::fmt::Debug>
+impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + Eq + PartialEq + Default + std::hash::Hash>
     PsyDashMemoryAppendOnlyMerkleStore<Hasher, Hash>
 {
     pub fn new(height: u8) -> Self {
@@ -97,7 +97,7 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + Eq + PartialEq + Default + std
 
 }
 #[async_trait]
-impl<Hasher: MerkleZeroHasher<Hash> + Send + Sync, Hash: Copy + Eq + PartialEq + Default + std::hash::Hash + std::fmt::Debug + Send + Sync> PsyMemoryMerkleStoreAppendOnlyReaderBaseAsync<Hash> for PsyDashMemoryAppendOnlyMerkleStore<Hasher, Hash> {
+impl<Hasher: MerkleZeroHasher<Hash> + Send + Sync, Hash: Eq + Copy + PartialEq + Default + std::hash::Hash + Send + Sync> PsyMemoryMerkleStoreAppendOnlyReaderBaseAsync<Hash> for PsyDashMemoryAppendOnlyMerkleStore<Hasher, Hash> {
 
     async fn get_merkle_proof_for_leaf_async(
         &self,
@@ -122,7 +122,7 @@ impl<Hasher: MerkleZeroHasher<Hash> + Send + Sync, Hash: Copy + Eq + PartialEq +
     }
 }
 
-impl<Hasher: MerkleZeroHasher<Hash> + Send + Sync, Hash: Copy + Eq + PartialEq + Default + std::hash::Hash + std::fmt::Debug + Send + Sync> PsyMemoryMerkleStoreAppendOnlyReaderBase<Hash> for PsyDashMemoryAppendOnlyMerkleStore<Hasher, Hash> {
+impl<Hasher: MerkleZeroHasher<Hash> + Send + Sync, Hash: Eq + Copy + PartialEq + Default + std::hash::Hash + Send + Sync> PsyMemoryMerkleStoreAppendOnlyReaderBase<Hash> for PsyDashMemoryAppendOnlyMerkleStore<Hasher, Hash> {
 
     #[inline]
     fn get_merkle_proof_for_leaf(
@@ -153,7 +153,7 @@ impl<Hasher: MerkleZeroHasher<Hash> + Send + Sync, Hash: Copy + Eq + PartialEq +
 }
 
 
-impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + Eq + PartialEq + Default + std::hash::Hash + std::fmt::Debug> PsyMemoryMerkleStoreImm<Hasher, Hash> for PsyDashMemoryAppendOnlyMerkleStore<Hasher, Hash> {
+impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std::hash::Hash> PsyMemoryMerkleStoreImm<Hasher, Hash> for PsyDashMemoryAppendOnlyMerkleStore<Hasher, Hash> {
     #[inline]
     fn get_height(&self) -> u8 {
         self.height

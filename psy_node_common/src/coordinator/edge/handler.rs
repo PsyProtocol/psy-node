@@ -121,7 +121,10 @@ impl<
         self.db_reader.get_latest_checkpoint_id().await
     }
     pub async fn get_current_unique_pending_id_internal(&self) -> anyhow::Result<(u64, QCoreProcCheckpointUniqueId)> {
-        self.db_reader.get_current_unique_pending_id().await
+        self.temp_db.get_unique_pending_ids(&self.realm_identifier).await
+    }
+    pub async fn get_current_gathering_unique_pending_id_internal(&self) -> anyhow::Result<(u64, QCoreProcCheckpointUniqueId)> {
+        self.temp_db.get_gathering_unique_pending_ids(&self.realm_identifier).await
     }
     pub async fn ensure_realm_has_not_submitted(&self, realm_id: u64, unique_pending_id: u64) -> anyhow::Result<()> {
         let submitted_status = self
@@ -333,7 +336,7 @@ impl<
         let realm_id = realm_id_u64 as u32;
         let proving_circuit_type = ProvingJobCircuitType::try_from_u32(input.job_type_u32)?;
 
-        let (unique_pending_id, proc_checkpoint_id) = self.get_current_unique_pending_id_internal().await?;
+        let (unique_pending_id, proc_checkpoint_id) = self.get_current_gathering_unique_pending_id_internal().await?;
 
         let status = rand::random::<u64>() & 0x0fff_ffff_ffff_ffff;
         if self
