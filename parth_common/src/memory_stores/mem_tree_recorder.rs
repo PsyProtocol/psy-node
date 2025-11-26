@@ -21,10 +21,37 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + PartialEq + Default>
             _hasher: PhantomData::default(),
         }
     }
+    pub fn from_hash_map(
+        height: u8,
+        nodes: HashMap<SimpleMerkleNodeKey, Hash>,
+    ) -> Self {
+        Self {
+            nodes,
+            updated_nodes: HashMap::new(),
+            height,
+            _hasher: PhantomData::default(),
+        }
+    }
     pub fn get_changes(&self) -> &HashMap<SimpleMerkleNodeKey, Hash> {
         &self.updated_nodes
     }
 
+    pub fn injest_merkle_proof(&mut self, proof: &MerkleProofCore<Hash>) -> anyhow::Result<()> {
+        let mut current_key = SimpleMerkleNodeKey::new(self.get_height(), proof.index);
+        
+        if self.get_height() as usize != proof.siblings.len() {
+            anyhow::bail!("proof height does not match tree height");
+        }
+        self.set_node_value(current_key, proof.value);
+
+        for sibling_hash in &proof.siblings {
+            let sibling_key = current_key.sibling();
+            self.set_node_value(sibling_key, *sibling_hash);
+            current_key = current_key.parent();
+        }
+        self.rehash_from_node_to_level(current_key, 0);
+        Ok(())
+    }
     pub fn commit_changes(&mut self) {
         for entry in self.updated_nodes.iter() {
             self.nodes.insert(*entry.0, *entry.1);
@@ -42,6 +69,17 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + PartialEq + Default>
     }
     pub fn set_node_value(&mut self, key: SimpleMerkleNodeKey, value: Hash) {
         self.updated_nodes.insert(key, value);
+    }
+    pub fn clear_changes_remove_committed_leaves_and_rehash(&mut self, start_leaf_index: u64, end_leaf_index: u64) {
+        self.updated_nodes.clear();
+        for i in start_leaf_index..end_leaf_index {
+            self.nodes.remove(&SimpleMerkleNodeKey{
+                level: self.height,
+                index: i,
+            });
+        }
+        self.rehash_range_committed(self.height, start_leaf_index, end_leaf_index+1);
+
     }
     pub fn get_node_value(&self, key: &SimpleMerkleNodeKey) -> Hash {
         if self.updated_nodes.contains_key(key){
@@ -312,6 +350,131 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + PartialEq + Default>
         self.rehash_from_node_to_level(child_base_key, 0);
 
         child_values[0]
+    }
+pub fn rehash_range(
+        &mut self,
+        node_base_level: u8,
+        start_node_index_inclusive: u64,
+        end_node_index_exclusive: u64,
+    ) {
+        if start_node_index_inclusive >= end_node_index_exclusive {
+            return;
+        }
+
+        let mut current_level = node_base_level;
+        let mut start = start_node_index_inclusive;
+        let mut end = end_node_index_exclusive;
+
+        // Iterate upwards from the base level to the root (level 0)
+        while current_level > 0 {
+            let parent_level = current_level - 1;
+            
+            // Calculate the range of parent indices that cover the current range.
+            // Parent index i covers children indices 2*i and 2*i + 1.
+            // The range starts at floor(start / 2).
+            let parent_start = start >> 1;
+            // The range ends at floor((end - 1) / 2) + 1.
+            // We use (end-1) because end is exclusive.
+            let parent_end = ((end - 1) >> 1) + 1;
+
+            for parent_index in parent_start..parent_end {
+                let left_child_idx = parent_index << 1;
+                let right_child_idx = left_child_idx + 1;
+
+                let left_key = SimpleMerkleNodeKey::new(current_level, left_child_idx);
+                let right_key = SimpleMerkleNodeKey::new(current_level, right_child_idx);
+
+                // We use get_node_value here. 
+                // 1. If the node was just updated in the previous batch step, it's in updated_nodes.
+                // 2. If it's a sibling outside the batch range, it's retrieved from storage or calculated as zero hash.
+                let left_val = self.get_node_value(&left_key);
+                let right_val = self.get_node_value(&right_key);
+
+                let parent_val = Hasher::two_to_one(&left_val, &right_val);
+                
+                self.set_node_value(
+                    SimpleMerkleNodeKey::new(parent_level, parent_index),
+                    parent_val,
+                );
+            }
+
+            // Move coordinates up one level
+            start = parent_start;
+            end = parent_end;
+            current_level -= 1;
+        }
+    }
+
+    fn rehash_range_committed(
+        &mut self,
+        node_base_level: u8,
+        start_node_index_inclusive: u64,
+        end_node_index_exclusive: u64,
+    ) {
+        if start_node_index_inclusive >= end_node_index_exclusive {
+            return;
+        }
+
+        let mut current_level = node_base_level;
+        let mut start = start_node_index_inclusive;
+        let mut end = end_node_index_exclusive;
+
+        // Iterate upwards from the base level to the root (level 0)
+        while current_level > 0 {
+            let parent_level = current_level - 1;
+            
+            // Calculate the range of parent indices that cover the current range.
+            // Parent index i covers children indices 2*i and 2*i + 1.
+            // The range starts at floor(start / 2).
+            let parent_start = start >> 1;
+            // The range ends at floor((end - 1) / 2) + 1.
+            // We use (end-1) because end is exclusive.
+            let parent_end = ((end - 1) >> 1) + 1;
+
+            for parent_index in parent_start..parent_end {
+                let left_child_idx = parent_index << 1;
+                let right_child_idx = left_child_idx + 1;
+
+                let left_key = SimpleMerkleNodeKey::new(current_level, left_child_idx);
+                let right_key = SimpleMerkleNodeKey::new(current_level, right_child_idx);
+
+                // We use get_node_value here. 
+                // 1. If the node was just updated in the previous batch step, it's in updated_nodes.
+                // 2. If it's a sibling outside the batch range, it's retrieved from storage or calculated as zero hash.
+                let left_val = self.get_node_value(&left_key);
+                let right_val = self.get_node_value(&right_key);
+
+                let parent_val = Hasher::two_to_one(&left_val, &right_val);
+                
+                self.nodes.insert(
+                    SimpleMerkleNodeKey::new(parent_level, parent_index),
+                    parent_val,
+                );
+            }
+
+            // Move coordinates up one level
+            start = parent_start;
+            end = parent_end;
+            current_level -= 1;
+        }
+    }
+
+    pub fn fast_batch_set_leaves(
+        &mut self,
+        start_index: u64,
+        values: &[Hash],
+    ) {
+        for (i, v) in values.iter().enumerate() {
+            self.set_node_value(
+                SimpleMerkleNodeKey::new(self.height, start_index + i as u64),
+                *v,
+            );
+        }
+        self.rehash_range(
+            self.height,
+            start_index,
+            start_index + (values.len() as u64)
+        );
     }
 
     pub fn update_sub_tree(
@@ -761,10 +924,104 @@ pub fn get_merkle_proofs_for_compact<Hasher: MerkleZeroHasher<Hash>, Hash: Copy 
 mod tests {
     
 
-    use parth_core::{data::hash::{hash256::Hash256, merkle_node_key::SimpleMerkleNodeKey}, utils::QPGenRandom};
+    use cf_utils::timer::DebugTimer;
+    use parth_core::{PHash, crypto::hash::traits::RandomHash, data::hash::{hash256::Hash256, merkle_node_key::SimpleMerkleNodeKey}, pgoldilocks::PoseidonHasher, protocol::core_types::Q256BitHash, utils::QPGenRandom};
     
     use super::SimpleMemoryMerkleRecorderStore;
     use parth_crypto::hash::sha256::CoreSha256Hasher;
+
+    fn test_batch_set_leaves(tree_height: u8, count: u64) {
+        let total_leaves = 1u64 << (tree_height as u64);
+        if count > total_leaves {
+            panic!("cannot set more leaves than the tree can hold");
+        }
+        let leaves = (0..count)
+            .map(|_| Hash256::rand())
+            .collect::<Vec<_>>();
+        let ((first_start, first_count), (second_start, second_count)) = {
+            let start_index = rand::random::<u64>()&(total_leaves-1);
+            if start_index+count > total_leaves {
+                let first_count = total_leaves - start_index;
+                let second_count = count - first_count;
+                ( (start_index, first_count), (0, second_count) )
+            } else {
+                ( (start_index, count), (0, 0) )
+            }
+        };
+
+        let mut set_leaf_tree = SimpleMemoryMerkleRecorderStore::<CoreSha256Hasher, Hash256>::new(tree_height);
+        for i in first_start..(first_start+first_count) {
+            set_leaf_tree.set_leaf(i, leaves[(i - first_start) as usize]);
+        }
+        if second_count > 0 {
+            for i in second_start..(second_start+second_count) {
+                set_leaf_tree.set_leaf(i, leaves[(i - second_start + first_count) as usize]);
+            }
+        }
+        let expected_root = set_leaf_tree.get_root();
+        let expected_nodes = set_leaf_tree.updated_nodes.clone();
+        set_leaf_tree.updated_nodes.clear();
+        set_leaf_tree.nodes.clear();
+
+
+        set_leaf_tree.fast_batch_set_leaves(first_start, &leaves[0..(first_count as usize)]);
+        if second_count > 0 {
+            set_leaf_tree.fast_batch_set_leaves(second_start, &leaves[(first_count as usize)..]);
+        }
+        let actual_root = set_leaf_tree.get_root();
+        let actual_nodes = set_leaf_tree.updated_nodes.clone();
+        assert_eq!(expected_root, actual_root, "fast batch set leaves produced incorrect root");
+        assert_eq!(expected_nodes.len(), actual_nodes.len(), "fast batch set leaves updated nodes count mismatch");
+        for (k, v) in expected_nodes.iter() {
+            match actual_nodes.get(k) {
+                Some(av) => {
+                    assert_eq!(v, av, "fast batch set leaves updated node value mismatch");
+                },
+                None => {
+                    panic!("fast batch set leaves missing updated node");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn time_batch_set_leaves() {
+        type Hash = PHash;
+        type Hasher = PoseidonHasher;
+        let tree_height = 22;
+        let total_leaves = 1u64 << (tree_height as u64);
+        let count = 7 * total_leaves / 8 + 3;
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(tree_height as u8);
+        let leaves = (0..count)
+            .map(|_| Hash::from_owned_32bytes(Hash256::rand().0))
+            .collect::<Vec<_>>();
+        let mut timer = DebugTimer::new(&format!("tree (count={}, tree_height={})", count, tree_height));
+        tree.fast_batch_set_leaves(1, &leaves);
+        timer.lap_batch("fast_batch_set_leaves", "leaf", count as usize);
+        tree.updated_nodes.clear();
+        timer.lap("tree 2");
+        for i in 0..count {
+            tree.set_leaf_no_proof(i, leaves[i as usize]);
+        }
+        timer.lap_batch("set_leaf_no_proof", "leaf", count as usize);
+        tree.updated_nodes.clear();
+        timer.lap("tree 3");
+        for i in 0..count {
+            tree.set_leaf(i, leaves[i as usize]);
+        }
+        timer.lap_batch("set_leaf_naive", "leaf", count as usize);
+
+    }
+
+    #[test]
+    fn fuzz_test_batch_set_leaves() {
+        for _ in 0..20 {
+            let tree_height = (rand::random::<u8>() % 10) + 1;
+            let total_leaves = 1u64 << (tree_height as u64);
+            let count = (rand::random::<u64>() % total_leaves) + 1;
+            test_batch_set_leaves(tree_height, count);
+        }
+    }
 
     #[test]
     fn test_merkle_tree_sha256() {

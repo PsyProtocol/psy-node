@@ -8,6 +8,8 @@ extern crate alloc;
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 
+#[cfg(feature = "tokio_helper")]
+pub mod tokio;
 
 // Synchronous I/O re-exports: Use std::io when "std" feature is enabled, else embedded-io
 #[cfg(feature = "std")]

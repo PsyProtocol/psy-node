@@ -147,6 +147,8 @@ impl SimpleStoreEx {
         let contract_function_tree_table = Arc::new(InMemoryTableIdentifier::new_with_keyspace(&keyspace, "contract_function_tree_table"));
         let contract_leaf_table = Arc::new(InMemoryTableIdentifier::new_with_keyspace(&keyspace, "contract_leaf_table"));
         let contract_code_definition_table = Arc::new(InMemoryTableIdentifier::new_with_keyspace(&keyspace, "contract_code_definition_table"));
+        let checkpoint_zk_proof_and_transition_table = Arc::new(InMemoryTableIdentifier::new_with_keyspace(&keyspace, "checkpoint_zk_proof_and_transition_table"));
+
         let psy_db = PsyUnifiedCoreDatabaseStore::new(
             store.clone(),
             checkpoint_leaf_table,
@@ -180,6 +182,7 @@ impl SimpleStoreEx {
             contract_function_tree_table,
             contract_leaf_table,
             contract_code_definition_table,
+            checkpoint_zk_proof_and_transition_table,
         );
         let simple_store = ExPsyUnifiedStoreTestHelper::new(psy_db, 0, 0);
         Ok(Self { store: simple_store })

@@ -35,20 +35,36 @@ impl<F: QFelt, Hash: QHashBase> PsyCoordinatorProcessorSharedStatusWrapper<F, Ha
     }
     pub fn update_status(
         &self,
-        unique_pending_id: u64,
+        gathering_unique_pending_id: u64,
         checkpoint_id: u64,
         checkpoint_leaf: PQEDCheckpointLeaf<F, Hash>,
         checkpoint_state_roots: PQEDCheckpointGlobalStateRoots<Hash>,
         block_state: QEDL2BlockState,
+        should_revert_last_changes: bool,
     ) -> anyhow::Result<()> {
         {
             let mut status = self.inner.write().map_err(|e| anyhow::anyhow!("{:?}", e))?;
-            status.unique_pending_id = unique_pending_id;
+            status.unique_pending_id = gathering_unique_pending_id;
             status.last_committed_checkpoint_id = checkpoint_id;
             status.last_committed_checkpoint_leaf = checkpoint_leaf;
             status.last_committed_checkpoint_state_roots = checkpoint_state_roots;
             status.block_state = block_state;
-            status.should_revert_last_changes = false;
+            status.should_revert_last_changes = should_revert_last_changes;
+        }
+        Ok(())
+    }
+    pub fn update_status_from_shared_status(
+        &self,
+        shared_status: PsyCoordinatorProcessorSharedStatus<F, Hash>,
+    ) -> anyhow::Result<()> {
+        {
+            let mut status = self.inner.write().map_err(|e| anyhow::anyhow!("{:?}", e))?;
+            status.unique_pending_id = shared_status.unique_pending_id;
+            status.last_committed_checkpoint_id = shared_status.last_committed_checkpoint_id;
+            status.last_committed_checkpoint_leaf = shared_status.last_committed_checkpoint_leaf;
+            status.last_committed_checkpoint_state_roots = shared_status.last_committed_checkpoint_state_roots;
+            status.block_state = shared_status.block_state;
+            status.should_revert_last_changes = shared_status.should_revert_last_changes;
         }
         Ok(())
     }

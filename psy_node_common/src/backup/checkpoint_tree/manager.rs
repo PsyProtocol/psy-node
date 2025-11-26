@@ -7,20 +7,17 @@ use parth_core::{
     protocol::core_types::Q256BitHash,
 };
 use psy_core::constants::stale_checkpoint::STALE_CHECKPOINT_AGE_REALM_TO_COORDINATOR_PROOF;
-use psy_node_core::{
-    psy_core_db::traits::full::PsyNodeCheckpointTreeDatabaseReader,
-    utils::fragmented_split::{self, FragmentedSplits},
-};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use psy_io::tokio::TokioFileLike;
+use psy_node_core::{psy_core_db::traits::full::PsyNodeCheckpointTreeDatabaseReader, utils::fragmented_split::FragmentedSplits};
 
-pub struct CheckpointTreeBackupManager<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std::hash::Hash> {
+pub struct CheckpointTreeBackupManager<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std::hash::Hash, File: TokioFileLike> {
     pub checkpoint_tree: Arc<PsyDashMemoryAppendOnlyMerkleStore<Hasher, Hash>>,
     pub next_backup_index: u64,
     pub max_checkpoints_to_keep: u64,
     pub min_backed_up_checkpoint_id: u64,
     pub total_checkpoint_writes: u64,
     pub next_backup_checkpoint_id: u64,
-    pub backup_file: tokio::fs::File,
+    pub backup_file: File,
 }
 
 const CHECKPOINT_BACKUP_MAGIC_LEN: usize = 8;
@@ -28,11 +25,11 @@ const CHECKPOINT_BACKUP_MAGIC_BYTES: [u8; 8] = [0x50, 0x73, 0x79, 0x43, 0x68, 0x
 const CHECKPOINT_BACKUP_MAGIC_U64_LE: u64 = 0x74_70_6B_68_43_79_73_50; // "PsyChkpt" in little-endian u64
 const CHECKPOINT_BACKUP_ITEM_SIZE: usize = 8 + 32; // u64 checkpoint id + 32 bytes checkpoint hash
 
-async fn setup_checkpoint_backup_file_dashmap<Hash: Eq + Copy + PartialEq + Default + std::hash::Hash + Q256BitHash>(
-    file: &mut tokio::fs::File,
+async fn setup_checkpoint_backup_file_dashmap<Hash: Eq + Copy + PartialEq + Default + std::hash::Hash + Q256BitHash, File: TokioFileLike>(
+    file: &mut File,
     allow_new_file_creation: bool,
 ) -> anyhow::Result<(u64, u64, u64, u64, Vec<MerkleLeafNode<Hash>>)> {
-    let metadata = file.metadata().await?;
+    let metadata = file.file_like_metadata().await?;
     let mut file_size = metadata.len();
     let checkpoint_list_count = if file_size == 0 {
         if allow_new_file_creation {
@@ -110,8 +107,54 @@ async fn setup_checkpoint_backup_file_dashmap<Hash: Eq + Copy + PartialEq + Defa
     ))
 }
 
-impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std::hash::Hash + Q256BitHash>
-    CheckpointTreeBackupManager<Hasher, Hash>
+pub async fn create_new_checkpoint_backup_manager_from_file_path<
+    Hasher: MerkleZeroHasher<Hash>,
+    Hash: Eq + Copy + PartialEq + Default + std::hash::Hash + Q256BitHash,
+    CheckpointTreeStore: PsyNodeCheckpointTreeDatabaseReader<Hash>,
+>(
+    max_checkpoints_to_keep: u64,
+    checkpoint_tree_height: u8,
+    checkpoint_tree_store: &CheckpointTreeStore,
+    backup_file_path: &str,
+    allow_create_file: bool,
+) -> anyhow::Result<CheckpointTreeBackupManager<Hasher, Hash, tokio::fs::File>> {
+    let backup_file = if allow_create_file {
+        tokio::fs::File::create(backup_file_path).await?
+    } else {
+        tokio::fs::File::open(backup_file_path).await?
+    };
+    CheckpointTreeBackupManager::new_from_file(
+        max_checkpoints_to_keep,
+        checkpoint_tree_height,
+        checkpoint_tree_store,
+        backup_file,
+        allow_create_file,
+    )
+    .await
+}
+pub async fn create_new_checkpoint_backup_manager_from_buffer<
+    Hasher: MerkleZeroHasher<Hash>,
+    Hash: Eq + Copy + PartialEq + Default + std::hash::Hash + Q256BitHash,
+    CheckpointTreeStore: PsyNodeCheckpointTreeDatabaseReader<Hash>,
+>(
+    max_checkpoints_to_keep: u64,
+    checkpoint_tree_height: u8,
+    checkpoint_tree_store: &CheckpointTreeStore,
+    buffer: Vec<u8>,
+    allow_create_file: bool,
+) -> anyhow::Result<CheckpointTreeBackupManager<Hasher, Hash, std::io::Cursor<Vec<u8>>>> {
+    let backup_file = std::io::Cursor::new(buffer);
+    CheckpointTreeBackupManager::new_from_file(
+        max_checkpoints_to_keep,
+        checkpoint_tree_height,
+        checkpoint_tree_store,
+        backup_file,
+        allow_create_file,
+    )
+    .await
+}
+impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std::hash::Hash + Q256BitHash, File: TokioFileLike>
+    CheckpointTreeBackupManager<Hasher, Hash, File>
 {
     pub async fn new_from_file_path<CheckpointTreeStore: PsyNodeCheckpointTreeDatabaseReader<Hash>>(
         max_checkpoints_to_keep: u64,
@@ -120,9 +163,29 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std
         backup_file_path: &str,
         allow_create_file: bool,
     ) -> anyhow::Result<Self> {
-        let mut backup_file = tokio::fs::File::create(backup_file_path).await?;
+        let backup_file = if allow_create_file {
+            File::file_like_create(backup_file_path).await?
+        } else {
+            File::file_like_open(backup_file_path).await?
+        };
+        Self::new_from_file(
+            max_checkpoints_to_keep,
+            checkpoint_tree_height,
+            checkpoint_tree_store,
+            backup_file,
+            allow_create_file,
+        )
+        .await
+    }
+    pub async fn new_from_file<CheckpointTreeStore: PsyNodeCheckpointTreeDatabaseReader<Hash>>(
+        max_checkpoints_to_keep: u64,
+        checkpoint_tree_height: u8,
+        checkpoint_tree_store: &CheckpointTreeStore,
+        mut backup_file: File,
+        allow_create_file: bool,
+    ) -> anyhow::Result<Self> {
         let (checkpoint_tree_start, checkpoint_tree_end, hash_offset, file_size, leaf_nodes) =
-            setup_checkpoint_backup_file_dashmap::<Hash>(&mut backup_file, allow_create_file).await?;
+            setup_checkpoint_backup_file_dashmap::<Hash, File>(&mut backup_file, allow_create_file).await?;
         let file_size_minus_magic = if file_size >= CHECKPOINT_BACKUP_MAGIC_LEN as u64 {
             file_size - CHECKPOINT_BACKUP_MAGIC_LEN as u64
         } else {
@@ -257,7 +320,7 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std
         let start_merkle_proof = checkpoint_tree_reader
             .checkpoint_tree_get_merkle_proof(start_checkpoint_id, start_checkpoint_id)
             .await?;
-        self.checkpoint_tree.injest_merkle_proof(&start_merkle_proof);
+        self.checkpoint_tree.injest_merkle_proof(&start_merkle_proof)?;
         self.append_checkpoint_leaf_hash(start_checkpoint_id, start_merkle_proof.value).await?;
         let total_batches = count / batch_size + if count % batch_size == 0 { 0 } else { 1 };
         let end_checkpoiont_id = start_checkpoint_id + (count as u64) - 1;
@@ -298,16 +361,26 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std
         if fetch_missing_checkpoints_prefix_range.is_some() || fetch_missing_checkpoints_suffix_range.is_some() {
             tracing::warn!("The checkpoint tree backup manager is missing some checkpoint history for stale proofs. Filling in from the database (this may take a while)...");
             if let Some((start_checkpoint_id, end_checkpoint_id)) = fetch_missing_checkpoints_prefix_range {
-                self.populate_from_database::<CheckpointTreeReader>(checkpoint_tree_reader, sync_batch_size, start_checkpoint_id, (end_checkpoint_id - start_checkpoint_id) as usize)
-                    .await?;
+                self.populate_from_database::<CheckpointTreeReader>(
+                    checkpoint_tree_reader,
+                    sync_batch_size,
+                    start_checkpoint_id,
+                    (end_checkpoint_id - start_checkpoint_id) as usize,
+                )
+                .await?;
             }
             for i in min_backed_up_checkpoint_id..next_backup_checkpoint_id {
                 let leaf = self.checkpoint_tree.get_leaf_value(i);
                 self.append_checkpoint_leaf_hash(i, leaf).await?;
             }
             if let Some((start_checkpoint_id, end_checkpoint_id)) = fetch_missing_checkpoints_suffix_range {
-                self.populate_from_database::<CheckpointTreeReader>(checkpoint_tree_reader, sync_batch_size, start_checkpoint_id, (end_checkpoint_id - start_checkpoint_id) as usize)
-                    .await?;
+                self.populate_from_database::<CheckpointTreeReader>(
+                    checkpoint_tree_reader,
+                    sync_batch_size,
+                    start_checkpoint_id,
+                    (end_checkpoint_id - start_checkpoint_id) as usize,
+                )
+                .await?;
             }
         }
         if !self.has_appropriate_checkpoint_history_for_stale_proofs(STALE_CHECKPOINT_AGE_REALM_TO_COORDINATOR_PROOF, last_committed_checkpoint_id) {

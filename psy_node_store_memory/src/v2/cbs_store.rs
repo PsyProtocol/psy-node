@@ -37,15 +37,13 @@ use parth_core::{
     protocol::core_types::{QDBHashBase, QHashBase},
 };
 use psy_node_core::store::traits::core_db::{
-    CoreDatabaseBidirectionalMappingReader, CoreDatabaseBidirectionalMappingWriter, CoreDatabaseBidirectionalU64U128MappingReader, CoreDatabaseBidirectionalU64U128MappingWriter, CoreDatabaseDoubleIdCheckpointedReader, CoreDatabaseDoubleIdCheckpointedWriter, CoreDatabaseDoubleIdMerkleReader, CoreDatabaseDoubleIdMerkleWriter, CoreDatabaseHashToManyIdsReader, CoreDatabaseHashToManyIdsWriter, CoreDatabaseKivReader, CoreDatabaseKivWriter, CoreDatabaseSingleIdCheckpointedReader, CoreDatabaseSingleIdCheckpointedWriter, CoreDatabaseSingleIdMerkleReader, CoreDatabaseSingleIdMerkleWriter, CoreDatabaseTagTreeReader, CoreDatabaseTagTreeWriter, CoreDatabaseU64Reader, CoreDatabaseU64Store, CoreDatabaseU64Writer, CoreDatabaseZeroIdMerkleReader, CoreDatabaseZeroIdMerkleWriter
+    CoreDatabaseBidirectionalMappingReader, CoreDatabaseBidirectionalMappingWriter, CoreDatabaseBidirectionalU64U128MappingReader, CoreDatabaseBidirectionalU64U128MappingWriter, CoreDatabaseDoubleIdCheckpointedReader, CoreDatabaseDoubleIdCheckpointedWriter, CoreDatabaseDoubleIdMerkleReader, CoreDatabaseDoubleIdMerkleWriter, CoreDatabaseHashToManyIdsReader, CoreDatabaseHashToManyIdsWriter, CoreDatabaseKivReader, CoreDatabaseKivWriter, CoreDatabaseSingleIdCheckpointedReader, CoreDatabaseSingleIdCheckpointedWriter, CoreDatabaseSingleIdMerkleReader, CoreDatabaseSingleIdMerkleWriter, CoreDatabaseTagTreeReader, CoreDatabaseTagTreeWriter, CoreDatabaseU64Reader, CoreDatabaseU64Store, CoreDatabaseU64Writer, CoreDatabaseZeroIdMerkleDumpReader, CoreDatabaseZeroIdMerkleReader, CoreDatabaseZeroIdMerkleWriter, MerkleTreeDumpStrategy
 };
 use psy_serialize::{PsyCanonicalDatabaseSerializeBaseSingle, PsySerializeCanonicalAsyncSafe};
 use std::{
-    marker::PhantomData,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
+    collections::HashMap, marker::PhantomData, sync::{
+        Arc, atomic::{AtomicU64, Ordering}
+    }
 };
 
 #[cfg(feature = "parallel_rayon")]
@@ -1064,6 +1062,62 @@ where
 
 // --- Merkle Tree Stores ---
 
+#[async_trait]
+impl<Hash, Hasher> CoreDatabaseZeroIdMerkleDumpReader<Hash, Hasher, InMemoryTableIdentifier>
+    for InMemoryCoreStore<Hash, Hasher>
+where
+    Hash: QHashBase,
+    Hasher: MerkleZeroHasher<Hash> + Send + Sync,
+{
+
+    async fn db_dump_all_zero_id_merkle_node_leaves_chunked(
+        &self,
+        table: &InMemoryTableIdentifier,
+        max_checkpoint_id: u64,
+    ) -> anyhow::Result<HashMap<u64, Hash>>{
+        let db = self.get_or_create_table(&table.to_string());
+        let mut result_map = HashMap::new();
+        let tree_height = table.tree_height;
+
+        let start_key = key_helpers::key_merkle_zero_id(&SimpleMerkleNodeKey { level: tree_height, index: 0 }, 0);
+        let end_key = key_helpers::key_merkle_zero_id(&SimpleMerkleNodeKey { level: tree_height, index: (1<< tree_height)-1 }, max_checkpoint_id);
+
+        for entry in db.range(start_key..=end_key) {
+            let key_bytes = entry.key();
+            let index = u64::from_be_bytes(key_bytes[1..9].try_into()?);
+            let value = Hash::from_bytes(entry.value())?;
+            result_map.insert(index, value);
+        }
+
+        Ok(result_map)
+    }
+    async fn db_dump_all_zero_id_merkle_node_leaves_vec(
+        &self,
+        table: &InMemoryTableIdentifier,
+        max_checkpoint_id: u64,
+        _strategy: MerkleTreeDumpStrategy,
+    ) -> anyhow::Result<Vec<SimpleMerkleNode<Hash>>>{
+
+
+        let db = self.get_or_create_table(&table.to_string());
+        let mut results  = Vec::new();
+        let tree_height = table.tree_height;
+
+        let start_key = key_helpers::key_merkle_zero_id(&SimpleMerkleNodeKey { level: tree_height, index: 0 }, 0);
+        let end_key = key_helpers::key_merkle_zero_id(&SimpleMerkleNodeKey { level: tree_height, index: (1<< tree_height)-1 }, max_checkpoint_id);
+
+        for entry in db.range(start_key..=end_key) {
+            let key_bytes = entry.key();
+            let index = u64::from_be_bytes(key_bytes[1..9].try_into()?);
+            let value = Hash::from_bytes(entry.value())?;
+            results.push(SimpleMerkleNode { key: SimpleMerkleNodeKey { level: tree_height, index }, value });
+        }
+
+        Ok(results)
+        
+
+    }
+}
 #[async_trait]
 impl<Hash, Hasher> CoreDatabaseZeroIdMerkleReader<Hash, Hasher, InMemoryTableIdentifier>
     for InMemoryCoreStore<Hash, Hasher>

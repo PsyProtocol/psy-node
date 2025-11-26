@@ -1,41 +1,41 @@
 use std::{
     path::PathBuf,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, RwLock,
-    },
+    sync::{Arc, RwLock},
 };
 
 use async_trait::async_trait;
-use futures::{
-    stream::{self, StreamExt},
-    TryFutureExt,
-};
 use parth_common::memory_stores::mem_tree_recorder::SimpleMemoryMerkleRecorderStore;
 use parth_core::{
-    crypto::hash::{spiderman::SpidermanUpdateProof, traits::MerkleZeroHasher},
+    crypto::hash::traits::MerkleZeroHasher,
     data::{
         db::hash_id_u64::{get_data_buffer_for_hash256_and_u64s, QHash256AndU64},
         hash::merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey, PSY_OBJECT_FFS_SIZE_SIMPLE_MERKLE_NODE},
     },
-    felt::QFelt64,
     node::realm_identifier::QRealmIdentifier,
-    protocol::core_types::{Q256BitHash, QDBHashBase, QFHashBase, QNetworkTypesConfig},
+    protocol::core_types::{Q256BitHash, QDBHashBase, QNetworkTypesConfig},
     QCoreProcCheckpointUniqueId,
 };
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{
     agg::{
-        AggStateTrackableInput, AggStateTransitionInputV2, AggStateTransitionWithStats, DummyAggStateTransition, tree_agg_v2::{BasicTreePlannerHelper, plan_jobs_for_tree_agg, plan_jobs_for_tree_agg_offset_root}
-    }, protocol::circuit_inputs::append_user_registration_tree::QCAppendUserRegistrationTreeCircuitInput, rewards_tree::offsets::{REGISTER_USERS_REWARDS_TREE_OFFSET_ROOT_INDEX, REGISTER_USERS_REWARDS_TREE_OFFSET_ROOT_LEVEL}, v1::qdata::public_key::PZKPublicKeyInfo, worker::{metadata::PsyProvingJobMetadata, metadata_with_job_id::PsyProvingJobMetadataWithJobId}
+        tree_agg_v2::{plan_jobs_for_tree_agg, plan_jobs_for_tree_agg_offset_root, BasicTreePlannerHelper},
+        AggStateTrackableInput, AggStateTransitionInputV2, AggStateTransitionWithStats, DummyAggStateTransition,
+    },
+    protocol::circuit_inputs::append_user_registration_tree::QCAppendUserRegistrationTreeCircuitInput,
+    rewards_tree::offsets::{REGISTER_USERS_REWARDS_TREE_OFFSET_ROOT_INDEX, REGISTER_USERS_REWARDS_TREE_OFFSET_ROOT_LEVEL},
+    v1::qdata::public_key::PZKPublicKeyInfo,
+    worker::{metadata::PsyProvingJobMetadata, metadata_with_job_id::PsyProvingJobMetadataWithJobId},
 };
+use psy_io::tokio::{TokioFileLike, TokioLikeFileSystem};
 use psy_node_core::{
     psy_temp_db::StandardProcessorTempDBStoreBase, qblob::data_views::zero_merkle_node_batch::create_ffs_merkle_nodes_zero_id_from_hash_map,
 };
 use psy_serialize::{FastFixedSerializable, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::{coordinator::processor::processor_shared_status::PsyCoordinatorProcessorSharedStatus, queue::gatherer_builder::QueueGathererItemBuilderWithTree};
+use crate::{
+    coordinator::processor::processor_shared_status::PsyCoordinatorProcessorSharedStatus, queue::gatherer_builder::QueueGathererItemBuilderWithTree,
+};
 
 pub const REGISTER_USER_GATHERER_BACKUP_V1_MAGIC_BYTES: [u8; 4] = [0x52, 0x55, 0x42, 0x31]; // 'RUB1' in ASCII
 pub const REGISTER_USER_GATHERER_BACKUP_V1_MAGIC_U32: u32 = 0x31425552; // 'RUB1' in little-endian u32
@@ -59,12 +59,20 @@ fn hash_two_from_slice<Hash: Q256BitHash, Hasher: MerkleZeroHasher<Hash>>(data: 
     Hasher::two_to_one(&left, &right)
 }
 
-pub async fn read_register_user_gatherer_backup_file<Hasher: MerkleZeroHasher<Hash>, Hash: QDBHashBase>(
-    file_path: &PathBuf,
-    mut tree: SimpleMemoryMerkleRecorderStore<Hasher, Hash>,
-) -> anyhow::Result<(RegisterUserGathererOutputDatabase<Hash>, SimpleMemoryMerkleRecorderStore<Hasher, Hash>)> {
-    let mut file = tokio::fs::File::open(file_path).await?;
-    let metadata = file.metadata().await?;
+pub async fn read_register_user_gatherer_backup_file_path<Hasher: MerkleZeroHasher<Hash>, Hash: QDBHashBase, FileSystem: TokioLikeFileSystem>(
+    file_system: &FileSystem,
+    file_path: &str,
+    tree: &mut SimpleMemoryMerkleRecorderStore<Hasher, Hash>,
+) -> anyhow::Result<RegisterUserGathererOutputDatabase<Hash>> {
+    tracing::info!("Reading register user gatherer backup file from path: {}", file_path);
+    let file: FileSystem::File = file_system.file_like_fs_open(file_path).await?;
+    read_register_user_gatherer_backup_file::<Hasher, Hash, FileSystem::File>(file, tree).await
+}
+pub async fn read_register_user_gatherer_backup_file<Hasher: MerkleZeroHasher<Hash>, Hash: QDBHashBase, File: TokioFileLike>(
+    mut file: File,
+    tree: &mut SimpleMemoryMerkleRecorderStore<Hasher, Hash>,
+) -> anyhow::Result<RegisterUserGathererOutputDatabase<Hash>> {
+    let metadata = file.file_like_metadata().await?;
     let file_len = metadata.len();
     if file_len < 4 + 8 + 32 {
         return Err(anyhow::anyhow!("Backup file too small to be valid: {} bytes", metadata.len()));
@@ -145,23 +153,29 @@ pub async fn read_register_user_gatherer_backup_file<Hasher: MerkleZeroHasher<Ha
         new_public_key_hash_to_user_id_rows_ffs,
         update_user_registration_tree_nodes_ffs,
     };
-    Ok((output_db, tree))
+    Ok(output_db)
 }
-pub struct RegisterUserGathererConfig<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>> {
+pub struct RegisterUserGathererConfig<
+    N: QNetworkTypesConfig,
+    TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>,
+    FileSystem: TokioLikeFileSystem,
+> {
     pub status: Arc<RwLock<PsyCoordinatorProcessorSharedStatus<N::F, N::QHash>>>,
 
     pub realm_id_u64: u64,
     pub realm_sub_id_u64: u64,
+
     pub temp_db: Arc<TempDatabase>,
     pub backup_file_directory: String,
     pub register_users_circuit_whitelist: N::QHash,
+    pub last_job_next_user_id: Arc<RwLock<u64>>,
+    pub file_system: Arc<FileSystem>,
 
     pub _phantom_n: std::marker::PhantomData<N>,
 }
-impl<
-    N: QNetworkTypesConfig,
-    TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>,
-> Clone for RegisterUserGathererConfig<N, TempDatabase> {
+impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>, FileSystem: TokioLikeFileSystem> Clone
+    for RegisterUserGathererConfig<N, TempDatabase, FileSystem>
+{
     fn clone(&self) -> Self {
         Self {
             realm_id_u64: self.realm_id_u64,
@@ -170,21 +184,49 @@ impl<
             temp_db: Arc::clone(&self.temp_db),
             backup_file_directory: self.backup_file_directory.clone(),
             register_users_circuit_whitelist: self.register_users_circuit_whitelist.clone(),
+            last_job_next_user_id: Arc::clone(&self.last_job_next_user_id),
+            file_system: Arc::clone(&self.file_system),
             _phantom_n: std::marker::PhantomData,
         }
     }
 }
 
-pub struct RegisterUserGatherer<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>> {
+pub struct RegisterUserGatherer<
+    N: QNetworkTypesConfig,
+    TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>,
+    FileSystem: TokioLikeFileSystem,
+> {
     pub shared_status: PsyCoordinatorProcessorSharedStatus<N::F, N::QHash>,
-    pub config: RegisterUserGathererConfig<N, TempDatabase>,
+    pub config: RegisterUserGathererConfig<N, TempDatabase, FileSystem>,
     pub pending_core_proc_id: QCoreProcCheckpointUniqueId,
     pub new_user_public_keys_ffs: Vec<u8>,
     pub new_public_key_hash_to_user_id_rows_ffs: Vec<u8>,
     pub new_user_registration_tree_leaves: Vec<N::QHash>,
-    pub new_user_public_keys_file: tokio::fs::File,
+    pub new_user_public_keys_file: FileSystem::File,
     pub pending_file_path: String,
     pub next_user_id: u64,
+}
+impl<
+        N: QNetworkTypesConfig,
+        TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>,
+        FileSystem: TokioLikeFileSystem,
+    >
+    RegisterUserGatherer<N, TempDatabase, FileSystem>
+{
+    pub fn reset_for_revert(&mut self) -> anyhow::Result<()> {
+        self.new_user_public_keys_ffs.clear();
+        self.new_public_key_hash_to_user_id_rows_ffs.clear();
+        self.new_user_registration_tree_leaves.clear();
+        self.next_user_id = self.shared_status.block_state.next_user_id;
+
+        self.config
+            .last_job_next_user_id
+            .write()
+            .map_err(|e| anyhow::anyhow!("error writing last job next user id {:?}", e))?
+            .clone_from(&self.shared_status.block_state.next_user_id);
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -206,17 +248,21 @@ pub struct RegisterUserGathererOutput<Hash, JobId> {
 }
 #[async_trait]
 impl<
+        FileSystem: TokioLikeFileSystem,
         N: QNetworkTypesConfig<JobId = QProvingJobDataID>,
         TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash> + Send + Sync + 'static,
-    > QueueGathererItemBuilderWithTree<RegisterUserGathererConfig<N, TempDatabase>, SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>>
-    for RegisterUserGatherer<N, TempDatabase>
+    >
+    QueueGathererItemBuilderWithTree<
+        RegisterUserGathererConfig<N, TempDatabase, FileSystem>,
+        SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>,
+    > for RegisterUserGatherer<N, TempDatabase, FileSystem>
 {
     type Output = RegisterUserGathererOutput<N::QHash, N::JobId>;
 
     async fn create_new_with_tree(
         tree: &mut SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>,
         unique_id: QCoreProcCheckpointUniqueId,
-        config: RegisterUserGathererConfig<N, TempDatabase>,
+        config: RegisterUserGathererConfig<N, TempDatabase, FileSystem>,
     ) -> anyhow::Result<Self> {
         let shared_status = config.status.read().unwrap().clone();
         let new_user_public_keys_file_path = get_new_register_user_gatherer_backup_file_path(
@@ -225,8 +271,26 @@ impl<
             config.realm_sub_id_u64,
             shared_status.unique_pending_id,
         );
-        let mut new_user_public_keys_file = tokio::fs::File::create(&new_user_public_keys_file_path).await?;
-        let start_next_user_id = shared_status.block_state.next_user_id;
+        let mut new_user_public_keys_file = config
+            .file_system
+            .file_like_fs_create(&new_user_public_keys_file_path.to_string_lossy())
+            .await?;
+        let start_next_user_id = config.last_job_next_user_id.read().unwrap().clone();
+        if tree.get_leaf_value(start_next_user_id) != N::HasherBase::get_zero_hash(0) {
+            return Err(anyhow::anyhow!(
+                "Starting next user id {} does not match tree zero hash {:?}",
+                start_next_user_id,
+                tree.get_leaf_value(start_next_user_id)
+            ));
+        }
+        if start_next_user_id != 0 {
+            if tree.get_leaf_value(start_next_user_id - 1) == N::HasherBase::get_zero_hash(0) {
+                return Err(anyhow::anyhow!(
+                    "The leaf before the next user id {} minus one does not exist in tree, cannot continue",
+                    start_next_user_id - 1
+                ));
+            }
+        }
         new_user_public_keys_file.write_u32_le(REGISTER_USER_GATHERER_BACKUP_V1_MAGIC_U32).await?;
         new_user_public_keys_file.write_u64_le(start_next_user_id).await?;
         new_user_public_keys_file.write_all(&tree.get_root().into_owned_32bytes()).await?;
@@ -282,8 +346,45 @@ impl<
         Ok(())
     }
     async fn finalize_with_tree(mut self, tree: &mut SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>) -> anyhow::Result<Self::Output> {
+        let needs_revert = {
+            self.config
+                .status
+                .read()
+                .map_err(|e| anyhow::anyhow!("error reading status {:?}", e))?
+                .should_revert_last_changes
+        };
+
+        if needs_revert {
+            {
+                self.config
+                    .last_job_next_user_id
+                    .write()
+                    .map_err(|e| anyhow::anyhow!("error writing last job next user id {:?}", e))?
+                    .clone_from(&self.shared_status.block_state.next_user_id);
+            }
+            self.reset_for_revert()?;
+            
+
+            // TODO: maybe we regenerate the job witnesses if we need to revert instead of
+            // making the users resubmit
+            tree.revert_changes();
+            tree.clear_changes_remove_committed_leaves_and_rehash(self.shared_status.block_state.next_user_id, self.next_user_id);
+            if tree.get_root() != self.shared_status.last_committed_checkpoint_state_roots.user_tree_root {
+                return Err(anyhow::anyhow!(
+                    "After revert, user registration tree root mismatch: expected {:?}, got {:?}",
+                    self.shared_status.last_committed_checkpoint_state_roots.user_tree_root,
+                    tree.get_root()
+                ));
+            }
+            // remove the backup file since we are reverting
+            //tokio::fs::remove_file(&self.pending_file_path).await?;
+            
+        }
         // ensure the new user public keys file is flushed to disk
-        self.new_user_public_keys_file.flush().await?;
+        self.config
+            .file_system
+            .file_like_fs_flush_file_with_path(&self.pending_file_path, &mut self.new_user_public_keys_file)
+            .await?;
 
         let start_state_root = tree.get_root();
 
@@ -323,7 +424,6 @@ impl<
         )?;
 
         let update_user_registration_tree_nodes_ffs = create_ffs_merkle_nodes_zero_id_from_hash_map::<N::QHash>(tree.get_changes());
-        tree.commit_changes();
 
         self.config
             .temp_db
@@ -345,6 +445,14 @@ impl<
             db_output: output_database,
             job_ids: jobs_for_queue,
         };
+
+        {
+            self.config
+                .last_job_next_user_id
+                .write()
+                .map_err(|e| anyhow::anyhow!("error writing last job next user id {:?}", e))?
+                .clone_from(&self.next_user_id);
+        }
         Ok(output)
     }
 }
@@ -474,14 +582,13 @@ impl<Hash: Q256BitHash>
     }
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use parth_common::memory_stores::mem_tree_recorder::SimpleMemoryMerkleRecorderStore;
     use parth_core::{crypto::hash::spiderman, pgoldilocks::PoseidonHasher, utils::QPGenRandom};
     use psy_core::job::job_id::QProvingJobDataID;
     use psy_data::gatherer_builders::register_user;
+
     use super::*;
 
     #[test]
@@ -490,38 +597,31 @@ mod tests {
         type F = parth_core::PF;
         type JobId = QProvingJobDataID;
         type Hasher = PoseidonHasher;
-        
+
         let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
         let random_leaves = Hash::qp_rand_gen_vec(17);
         let register_users_circuit_whitelist = Hash::qp_rand_gen();
-        let start_root= tree.get_root();
+        let start_root = tree.get_root();
         let spider_map_proofs = tree.append_leaves_spider_man(2, &random_leaves)?;
         println!("Spiderman proofs len: {}", spider_map_proofs.len());
 
-
-        let spider_man_groups=spider_map_proofs
-                .chunks(2)
-                .map(|chunk| QCAppendUserRegistrationTreeCircuitInput {
-                    register_users_circuit_whitelist: register_users_circuit_whitelist,
-                    spiderman_append_proofs: chunk.to_vec(),
-                })
-                .collect::<Vec<_>>();
+        let spider_man_groups = spider_map_proofs
+            .chunks(2)
+            .map(|chunk| QCAppendUserRegistrationTreeCircuitInput {
+                register_users_circuit_whitelist: register_users_circuit_whitelist,
+                spiderman_append_proofs: chunk.to_vec(),
+            })
+            .collect::<Vec<_>>();
         println!("spiderman groups len: {}", spider_man_groups.len());
 
         let unique_pending_id = 1337u64;
-         let (jobs_for_queue, witneses) = plan_jobs_for_tree_agg::<
-            JobId,
-            F,
-            Hash,
-            Hasher,
-            QCAppendUserRegistrationTreeCircuitInput<Hash>,
-            AggRegisterUserHelper,
-        >(
-            unique_pending_id,
-            start_root,
-            register_users_circuit_whitelist,
-            &spider_man_groups,
-        )?;
+        let (jobs_for_queue, witneses) =
+            plan_jobs_for_tree_agg::<JobId, F, Hash, Hasher, QCAppendUserRegistrationTreeCircuitInput<Hash>, AggRegisterUserHelper>(
+                unique_pending_id,
+                start_root,
+                register_users_circuit_whitelist,
+                &spider_man_groups,
+            )?;
         println!("Jobs for queue len: {}", jobs_for_queue.len());
         for row in jobs_for_queue.iter() {
             for job in row.iter() {
@@ -530,20 +630,9 @@ mod tests {
             }
         }
 
-
-
-        
-
-
-
-
-
-
         Ok(())
-
     }
 }
-
 
 /*
 
@@ -571,19 +660,25 @@ test coordinator::processor::gatherers::register_user_gatherer::tests::test_fake
 */
 #[cfg(test)]
 mod tests3 {
-    use super::*;
-    use anyhow::{anyhow, Result};
-    use parth_common::memory_stores::mem_tree_recorder::SimpleMemoryMerkleRecorderStore;
-    use parth_core::{crypto::hash::spiderman, pgoldilocks::PoseidonHasher, utils::QPGenRandom};
-    use parth_core::PF;
-    use parth_core::PHash;
-    use psy_core::job::job_id::QProvingJobDataID;
-    use psy_data::agg::tree_agg_v2::{ plan_jobs_for_tree_agg};
-    use psy_data::protocol::circuit_inputs::append_user_registration_tree::QCAppendUserRegistrationTreeCircuitInput;
-    use psy_data::worker::metadata::{PROOF_REWARD_TREE_HASH_MODE_HASH_CHILDREN_STANDARD, PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN};
     use std::collections::{HashMap, HashSet};
 
-    fn validate_tree_structure(layers: &Vec<Vec<PsyProvingJobMetadataWithJobId<PHash, QProvingJobDataID>>>, expected_num_leaves: usize, unique_id: u64) -> Result<()> {
+    use anyhow::{anyhow, Result};
+    use parth_common::memory_stores::mem_tree_recorder::SimpleMemoryMerkleRecorderStore;
+    use parth_core::{crypto::hash::spiderman, pgoldilocks::PoseidonHasher, utils::QPGenRandom, PHash, PF};
+    use psy_core::job::job_id::QProvingJobDataID;
+    use psy_data::{
+        agg::tree_agg_v2::plan_jobs_for_tree_agg,
+        protocol::circuit_inputs::append_user_registration_tree::QCAppendUserRegistrationTreeCircuitInput,
+        worker::metadata::{PROOF_REWARD_TREE_HASH_MODE_HASH_CHILDREN_STANDARD, PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN},
+    };
+
+    use super::*;
+
+    fn validate_tree_structure(
+        layers: &Vec<Vec<PsyProvingJobMetadataWithJobId<PHash, QProvingJobDataID>>>,
+        expected_num_leaves: usize,
+        unique_id: u64,
+    ) -> Result<()> {
         let mut key_to_info: HashMap<SimpleMerkleNodeKey, (QProvingJobDataID, u8, u16, Vec<QProvingJobDataID>)> = HashMap::new();
         let mut leaf_count = 0;
 
@@ -626,11 +721,29 @@ mod tests3 {
             if hash_mode == PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN {
                 assert_eq!(num_children, 0);
                 assert_eq!(deps.len(), 0);
-                assert_eq!(job_id, <AggRegisterUserHelper as BasicTreePlannerHelper<QProvingJobDataID, PHash, QCAppendUserRegistrationTreeCircuitInput<PHash>, AggStateTransitionInputV2<PHash>, DummyAggStateTransition<PHash>>>::get_leaf_job_id(unique_id, key));
+                assert_eq!(
+                    job_id,
+                    <AggRegisterUserHelper as BasicTreePlannerHelper<
+                        QProvingJobDataID,
+                        PHash,
+                        QCAppendUserRegistrationTreeCircuitInput<PHash>,
+                        AggStateTransitionInputV2<PHash>,
+                        DummyAggStateTransition<PHash>,
+                    >>::get_leaf_job_id(unique_id, key)
+                );
             } else if hash_mode == PROOF_REWARD_TREE_HASH_MODE_HASH_CHILDREN_STANDARD {
                 assert_eq!(num_children, 2);
                 assert_eq!(deps.len(), 2);
-                assert_eq!(job_id, <AggRegisterUserHelper as BasicTreePlannerHelper<QProvingJobDataID, PHash, QCAppendUserRegistrationTreeCircuitInput<PHash>, AggStateTransitionInputV2<PHash>, DummyAggStateTransition<PHash>>>::get_agg_job_id(unique_id, key));
+                assert_eq!(
+                    job_id,
+                    <AggRegisterUserHelper as BasicTreePlannerHelper<
+                        QProvingJobDataID,
+                        PHash,
+                        QCAppendUserRegistrationTreeCircuitInput<PHash>,
+                        AggStateTransitionInputV2<PHash>,
+                        DummyAggStateTransition<PHash>,
+                    >>::get_agg_job_id(unique_id, key)
+                );
 
                 let left_key = SimpleMerkleNodeKey {
                     level: key.level + 1,
@@ -713,7 +826,16 @@ mod tests3 {
         assert_eq!(layers.len(), 1);
         assert_eq!(layers[0].len(), 1);
         let item = &layers[0][0];
-        assert_eq!(item.job_id, <AggRegisterUserHelper as BasicTreePlannerHelper<QProvingJobDataID, PHash, QCAppendUserRegistrationTreeCircuitInput<PHash>, AggStateTransitionInputV2<PHash>, DummyAggStateTransition<PHash>>>::get_dummy_job_id(unique_id));
+        assert_eq!(
+            item.job_id,
+            <AggRegisterUserHelper as BasicTreePlannerHelper<
+                QProvingJobDataID,
+                PHash,
+                QCAppendUserRegistrationTreeCircuitInput<PHash>,
+                AggStateTransitionInputV2<PHash>,
+                DummyAggStateTransition<PHash>,
+            >>::get_dummy_job_id(unique_id)
+        );
         assert_eq!(item.metadata.reward_tree_node_level, 0);
         assert_eq!(item.metadata.reward_tree_node_index, 0);
         assert_eq!(item.metadata.reward_tree_hash_mode, PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN);
@@ -792,38 +914,31 @@ mod tests3 {
         type F = parth_core::PF;
         type JobId = QProvingJobDataID;
         type Hasher = PoseidonHasher;
-        
+
         let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
         let random_leaves = Hash::qp_rand_gen_vec(17);
         let allowed_circuit_hashes_root = Hash::qp_rand_gen();
-        let start_root= tree.get_root();
+        let start_root = tree.get_root();
         let spider_map_proofs = tree.append_leaves_spider_man(2, &random_leaves)?;
         println!("Spiderman proofs len: {}", spider_map_proofs.len());
 
-
-        let spider_man_groups=spider_map_proofs
-                .chunks(2)
-                .map(|chunk| QCAppendUserRegistrationTreeCircuitInput {
-                    register_users_circuit_whitelist: allowed_circuit_hashes_root,
-                    spiderman_append_proofs: chunk.to_vec(),
-                })
-                .collect::<Vec<_>>();
+        let spider_man_groups = spider_map_proofs
+            .chunks(2)
+            .map(|chunk| QCAppendUserRegistrationTreeCircuitInput {
+                register_users_circuit_whitelist: allowed_circuit_hashes_root,
+                spiderman_append_proofs: chunk.to_vec(),
+            })
+            .collect::<Vec<_>>();
         println!("spiderman groups len: {}", spider_man_groups.len());
 
         let unique_pending_id = 1337u64;
-         let (jobs_for_queue, _witneses) = plan_jobs_for_tree_agg::<
-            JobId,
-            F,
-            Hash,
-            Hasher,
-            QCAppendUserRegistrationTreeCircuitInput<Hash>,
-            AggRegisterUserHelper,
-        >(
-            unique_pending_id,
-            start_root,
-            allowed_circuit_hashes_root,
-            &spider_man_groups,
-        )?;
+        let (jobs_for_queue, _witneses) =
+            plan_jobs_for_tree_agg::<JobId, F, Hash, Hasher, QCAppendUserRegistrationTreeCircuitInput<Hash>, AggRegisterUserHelper>(
+                unique_pending_id,
+                start_root,
+                allowed_circuit_hashes_root,
+                &spider_man_groups,
+            )?;
         println!("Jobs for queue len: {}", jobs_for_queue.len());
         for row in jobs_for_queue.iter() {
             for job in row.iter() {
@@ -840,26 +955,35 @@ mod tests3 {
 
 #[cfg(test)]
 mod tests2 {
-    use super::*;
-    use parth_core::{
-        crypto::hash::{spiderman::SpidermanUpdateProof, traits::MerkleZeroHasher, }, data::hash::merkle_node_key::SimpleMerkleNodeKey, felt::QFelt64, pgoldilocks::PoseidonHasher, protocol::core_types::{Q256BitHash, QFHashBase}, utils::QPGenRandom
-    };
+    use anyhow::{anyhow, Result};
     use parth_common::memory_stores::mem_tree_recorder::SimpleMemoryMerkleRecorderStore;
+    use parth_core::{
+        crypto::hash::{spiderman::SpidermanUpdateProof, traits::MerkleZeroHasher},
+        data::hash::merkle_node_key::SimpleMerkleNodeKey,
+        felt::QFelt64,
+        pgoldilocks::PoseidonHasher,
+        protocol::core_types::{Q256BitHash, QFHashBase},
+        utils::QPGenRandom,
+    };
     use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
-    use psy_data::{agg::{
-        AggStateTransitionInputV2, DummyAggStateTransition, tree_agg_v2::{BasicTreePlannerHelper, plan_jobs_for_tree_agg}
-    }, worker::metadata::{PROOF_REWARD_TREE_HASH_MODE_HASH_CHILDREN_STANDARD, PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN}};
+    use psy_data::{
+        agg::{
+            tree_agg_v2::{plan_jobs_for_tree_agg, BasicTreePlannerHelper},
+            AggStateTransitionInputV2, DummyAggStateTransition,
+        },
+        worker::metadata::{PROOF_REWARD_TREE_HASH_MODE_HASH_CHILDREN_STANDARD, PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN},
+    };
     use psy_serialize::PsySerializeCanonicalAsyncSafe;
 
-    use anyhow::{anyhow, Result};
-fn compute_max_level(mut num: usize) -> u8 {
-    let mut h = 0u8;
-    while num > 1 {
-        num = (num + 1) / 2;
-        h += 1;
+    use super::*;
+    fn compute_max_level(mut num: usize) -> u8 {
+        let mut h = 0u8;
+        while num > 1 {
+            num = (num + 1) / 2;
+            h += 1;
+        }
+        h
     }
-    h
-}
     type F = parth_core::PF; // Assuming QFelt64 is defined elsewhere, e.g., as u64 or a field element
     type Hash = parth_core::PHash; // Assuming PHash is a 256-bit hash
     type Hasher = PoseidonHasher; // Using PoseidonHasher as the FieldQHasher
@@ -877,11 +1001,7 @@ fn compute_max_level(mut num: usize) -> u8 {
     }
 
     // Helper function to validate the tree structure programmatically
-    fn validate_tree_structure(
-        layers: &[Vec<PsyProvingJobMetadataWithJobId<Hash, JobId>>],
-        max_level: u8,
-        num_leaves: usize,
-    ) -> Result<()> {
+    fn validate_tree_structure(layers: &[Vec<PsyProvingJobMetadataWithJobId<Hash, JobId>>], max_level: u8, num_leaves: usize) -> Result<()> {
         // layers[0] is the leaves (highest level), layers[last] is the root (level 0)
         if layers.len() != (max_level as usize) + 1 {
             return Err(anyhow!("Incorrect number of layers: expected {}, got {}", max_level + 1, layers.len()));
@@ -898,10 +1018,18 @@ fn compute_max_level(mut num: usize) -> u8 {
                 index: i as u64,
             };
             if job.metadata.reward_tree_node_level != max_level {
-                return Err(anyhow!("Leaf level mismatch: expected {}, got {}", max_level, job.metadata.reward_tree_node_level));
+                return Err(anyhow!(
+                    "Leaf level mismatch: expected {}, got {}",
+                    max_level,
+                    job.metadata.reward_tree_node_level
+                ));
             }
             if job.metadata.reward_tree_node_index != i as u64 {
-                return Err(anyhow!("Leaf index mismatch: expected {}, got {}", i, job.metadata.reward_tree_node_index));
+                return Err(anyhow!(
+                    "Leaf index mismatch: expected {}, got {}",
+                    i,
+                    job.metadata.reward_tree_node_index
+                ));
             }
             if job.metadata.reward_tree_hash_mode != PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN {
                 return Err(anyhow!("Leaf hash mode incorrect"));
@@ -930,7 +1058,12 @@ fn compute_max_level(mut num: usize) -> u8 {
             // Expected number of nodes: ceil(child_layer.len() / 2)
             let expected_nodes = (child_layer.len() + 1) / 2;
             if current_layer.len() != expected_nodes {
-                return Err(anyhow!("Incorrect number of nodes at level {}: expected {}, got {}", current_level, expected_nodes, current_layer.len()));
+                return Err(anyhow!(
+                    "Incorrect number of nodes at level {}: expected {}, got {}",
+                    current_level,
+                    expected_nodes,
+                    current_layer.len()
+                ));
             }
 
             for (i, job) in current_layer.iter().enumerate() {
@@ -939,7 +1072,11 @@ fn compute_max_level(mut num: usize) -> u8 {
                     index: i as u64,
                 };
                 if job.metadata.reward_tree_node_level != current_level {
-                    return Err(anyhow!("Level mismatch: expected {}, got {}", current_level, job.metadata.reward_tree_node_level));
+                    return Err(anyhow!(
+                        "Level mismatch: expected {}, got {}",
+                        current_level,
+                        job.metadata.reward_tree_node_level
+                    ));
                 }
                 if job.metadata.reward_tree_node_index != i as u64 {
                     return Err(anyhow!("Index mismatch: expected {}, got {}", i, job.metadata.reward_tree_node_index));
@@ -962,14 +1099,20 @@ fn compute_max_level(mut num: usize) -> u8 {
                         return Err(anyhow!("Dependency mismatch for node at level {}, index {}", current_level, i));
                     }
                     if job.metadata.reward_tree_node_children != 2 {
-                        return Err(anyhow!("Num children mismatch: expected 2, got {}", job.metadata.reward_tree_node_children));
+                        return Err(anyhow!(
+                            "Num children mismatch: expected 2, got {}",
+                            job.metadata.reward_tree_node_children
+                        ));
                     }
                 } else {
                     if job.metadata.dependencies != vec![left_child.job_id] {
                         return Err(anyhow!("Dependency mismatch for unbalanced node at level {}, index {}", current_level, i));
                     }
                     if job.metadata.reward_tree_node_children != 1 {
-                        return Err(anyhow!("Num children mismatch: expected 1, got {}", job.metadata.reward_tree_node_children));
+                        return Err(anyhow!(
+                            "Num children mismatch: expected 1, got {}",
+                            job.metadata.reward_tree_node_children
+                        ));
                     }
                 }
 
@@ -1008,21 +1151,19 @@ fn compute_max_level(mut num: usize) -> u8 {
         let unique_id = 1337u64;
         let leaves = generate_dummy_leaves(num_leaves, whitelist);
 
-        let (layers, witnesses) = plan_jobs_for_tree_agg::<
-            JobId,
-            F,
-            Hash,
-            Hasher,
-            LeafWitness,
-            AggRegisterUserHelper,
-        >(unique_id, start_root, whitelist, &leaves)?;
+        let (layers, witnesses) =
+            plan_jobs_for_tree_agg::<JobId, F, Hash, Hasher, LeafWitness, AggRegisterUserHelper>(unique_id, start_root, whitelist, &leaves)?;
 
         let max_level = compute_max_level(num_leaves);
         assert_eq!(layers.len(), (max_level as usize) + 1);
 
         // Validate witnesses count
         if witnesses.len() != layers.iter().map(|l| l.len()).sum::<usize>() {
-            return Err(anyhow!("Witness count mismatch: expected {}, got {}", layers.iter().map(|l| l.len()).sum::<usize>(), witnesses.len()));
+            return Err(anyhow!(
+                "Witness count mismatch: expected {}, got {}",
+                layers.iter().map(|l| l.len()).sum::<usize>(),
+                witnesses.len()
+            ));
         }
 
         // Programmatic validation
@@ -1092,14 +1233,8 @@ fn compute_max_level(mut num: usize) -> u8 {
         let unique_id = 1337u64;
         let leaves: Vec<LeafWitness> = vec![];
 
-        let (layers, witnesses) = plan_jobs_for_tree_agg::<
-            JobId,
-            F,
-            Hash,
-            Hasher,
-            LeafWitness,
-            AggRegisterUserHelper,
-        >(unique_id, start_root, whitelist, &leaves)?;
+        let (layers, witnesses) =
+            plan_jobs_for_tree_agg::<JobId, F, Hash, Hasher, LeafWitness, AggRegisterUserHelper>(unique_id, start_root, whitelist, &leaves)?;
 
         assert_eq!(layers.len(), 1);
         assert_eq!(layers[0].len(), 1);

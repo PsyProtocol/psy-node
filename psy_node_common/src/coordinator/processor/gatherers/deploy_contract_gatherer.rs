@@ -30,15 +30,21 @@ use parth_core::{
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{
     agg::{
-        AggStateTrackableInput, AggStateTransitionInputV2, AggStateTransitionWithStats, DummyAggStateTransition, tree_agg_v2::{BasicTreePlannerHelper, plan_jobs_for_tree_agg, plan_jobs_for_tree_agg_offset_root}
-    }, protocol::circuit_inputs::{
+        tree_agg_v2::{plan_jobs_for_tree_agg, plan_jobs_for_tree_agg_offset_root, BasicTreePlannerHelper},
+        AggStateTrackableInput, AggStateTransitionInputV2, AggStateTransitionWithStats, DummyAggStateTransition,
+    },
+    protocol::circuit_inputs::{
         append_user_registration_tree::QCAppendUserRegistrationTreeCircuitInput, deploy_contracts::QCBatchDeployContractsCircuitInput,
-    }, rewards_tree::offsets::{DEPLOY_CONTRACTS_REWARDS_TREE_OFFSET_ROOT_INDEX, DEPLOY_CONTRACTS_REWARDS_TREE_OFFSET_ROOT_LEVEL}, v1::qdata::{
+    },
+    rewards_tree::offsets::{DEPLOY_CONTRACTS_REWARDS_TREE_OFFSET_ROOT_INDEX, DEPLOY_CONTRACTS_REWARDS_TREE_OFFSET_ROOT_LEVEL},
+    v1::qdata::{
         contract::{ContractCodeDefinition, ContractCodeDefinitionWithContractId, PQEDContractLeaf, PsyDeployContractQueueItem},
         ffs_sizes::PSY_OBJECT_FFS_SIZE_CONTRACT_LEAF,
         public_key::PZKPublicKeyInfo,
-    }, worker::{metadata::PsyProvingJobMetadata, metadata_with_job_id::PsyProvingJobMetadataWithJobId}
+    },
+    worker::{metadata::PsyProvingJobMetadata, metadata_with_job_id::PsyProvingJobMetadataWithJobId},
 };
+use psy_io::tokio::{TokioFileLike, TokioLikeFileSystem};
 use psy_node_core::{
     psy_temp_db::StandardProcessorTempDBStoreBase,
     qblob::data_views::{
@@ -48,7 +54,9 @@ use psy_node_core::{
 use psy_serialize::{FastFixedSerializable, PsyCanonicalDatabaseSerializeBaseSingle, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
-use crate::{coordinator::processor::processor_shared_status::PsyCoordinatorProcessorSharedStatus, queue::gatherer_builder::QueueGathererItemBuilderWithTree};
+use crate::{
+    coordinator::processor::processor_shared_status::PsyCoordinatorProcessorSharedStatus, queue::gatherer_builder::QueueGathererItemBuilderWithTree,
+};
 pub const DEPLOY_CONTRACT_GATHERER_BACKUP_V1_MAGIC_BYTES: [u8; 4] = [0x44, 0x43, 0x42, 0x31]; // 'DCB1' in ASCII
 pub const DEPLOY_CONTRACT_GATHERER_BACKUP_V1_MAGIC_U32: u32 = 0x31424344; // 'DCB1' in little-endian u32
 
@@ -67,13 +75,19 @@ pub fn get_new_deploy_contract_gatherer_backup_file_path(
     ))
 }
 
-pub async fn read_deploy_contract_gatherer_backup_file<Hasher: FieldQHasher<F, Hash>, Hash: QFHashBase<F> + QDBHashBase, F: QFelt64>(
-    file_path: &PathBuf,
+pub async fn read_deploy_contract_gatherer_backup_file_path<
+    Hasher: FieldQHasher<F, Hash>,
+    Hash: QFHashBase<F> + QDBHashBase,
+    F: QFelt64,
+    FileSystem: TokioLikeFileSystem,
+>(
+    file_system: &FileSystem,
+    file_path: &str,
     max_contract_function_tree_leaves: usize,
     mut tree: SimpleMemoryMerkleRecorderStore<Hasher, Hash>,
 ) -> anyhow::Result<(DeployContractGathererOutputDatabase<Hash>, SimpleMemoryMerkleRecorderStore<Hasher, Hash>)> {
-    let mut file = tokio::fs::File::open(file_path).await?;
-    let metadata = file.metadata().await?;
+    let mut file: FileSystem::File = file_system.file_like_fs_open(file_path).await?;
+    let metadata = file.file_like_metadata().await?;
     let file_len = metadata.len();
 
     // ensure tree is up to date and pending changes are clean
@@ -248,17 +262,26 @@ pub struct DeployContractGathererOutput<Hash, JobId> {
     pub db_output: DeployContractGathererOutputDatabase<Hash>,
     pub job_ids: Vec<Vec<PsyProvingJobMetadataWithJobId<Hash, JobId>>>,
 }
-pub struct DeployContractGathererConfig<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>> {
+pub struct DeployContractGathererConfig<
+    N: QNetworkTypesConfig,
+    TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>,
+    FileSystem: TokioLikeFileSystem,
+> {
     pub realm_id_u64: u64,
     pub realm_sub_id_u64: u64,
+
     pub shared_status: Arc<RwLock<PsyCoordinatorProcessorSharedStatus<N::F, N::QHash>>>,
     pub temp_db: Arc<TempDatabase>,
     pub backup_file_directory: String,
     pub deploy_contract_circuit_whitelist: N::QHash,
+    pub last_job_next_contract_id: Arc<RwLock<u64>>,
+    pub file_system: Arc<FileSystem>,
 
     pub _phantom_n: std::marker::PhantomData<N>,
 }
-impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>> Clone for DeployContractGathererConfig<N, TempDatabase> {
+impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>, FileSystem: TokioLikeFileSystem> Clone
+    for DeployContractGathererConfig<N, TempDatabase, FileSystem>
+{
     fn clone(&self) -> Self {
         Self {
             realm_id_u64: self.realm_id_u64,
@@ -267,11 +290,15 @@ impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::J
             temp_db: self.temp_db.clone(),
             backup_file_directory: self.backup_file_directory.clone(),
             deploy_contract_circuit_whitelist: self.deploy_contract_circuit_whitelist.clone(),
+            last_job_next_contract_id: self.last_job_next_contract_id.clone(),
+            file_system: self.file_system.clone(),
             _phantom_n: std::marker::PhantomData,
         }
     }
 }
-impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>> DeployContractGathererConfig<N, TempDatabase> {
+impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>, FileSystem: TokioLikeFileSystem>
+    DeployContractGathererConfig<N, TempDatabase, FileSystem>
+{
     pub fn get_realm_identifier(&self) -> QRealmIdentifier {
         QRealmIdentifier {
             realm_id: self.realm_id_u64 as u32,
@@ -282,8 +309,12 @@ impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::J
         self.shared_status.read().unwrap().unique_pending_id
     }
 }
-pub struct DeployContractGatherer<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>> {
-    pub config: DeployContractGathererConfig<N, TempDatabase>,
+pub struct DeployContractGatherer<
+    N: QNetworkTypesConfig,
+    TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>,
+    FileSystem: TokioLikeFileSystem,
+> {
+    pub config: DeployContractGathererConfig<N, TempDatabase, FileSystem>,
     pub shared_status: PsyCoordinatorProcessorSharedStatus<N::F, N::QHash>,
     pub pending_core_proc_id: QCoreProcCheckpointUniqueId,
     pub new_contract_leaves_ffs: Vec<u8>,
@@ -292,24 +323,48 @@ pub struct DeployContractGatherer<N: QNetworkTypesConfig, TempDatabase: Standard
     pub new_contract_code_definitions: Vec<ContractCodeDefinitionWithContractId>,
 
     pub new_global_contract_tree_leaves: Vec<N::QHash>,
-    pub new_contracts_file: tokio::fs::File,
+    pub new_contracts_file: FileSystem::File,
     pub pending_file_path: String,
     pub next_contract_id: u64,
 }
 
+impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>, FileSystem: TokioLikeFileSystem>
+    DeployContractGatherer<N, TempDatabase, FileSystem>
+{
+    pub fn reset_for_revert(&mut self) -> anyhow::Result<()> {
+        self.new_contract_leaves_ffs.clear();
+        self.new_contract_leaves.clear();
+        self.update_contract_function_tree_nodes_ffs.clear();
+        self.new_contract_code_definitions.clear();
+        self.new_global_contract_tree_leaves.clear();
+        self.next_contract_id = self.shared_status.block_state.next_contract_id as u64;
+
+        self.config
+            .last_job_next_contract_id
+            .write()
+            .map_err(|e| anyhow::anyhow!("error writing last job next contract id {:?}", e))?
+            .clone_from(&self.next_contract_id);
+
+        Ok(())
+    }
+}
 #[async_trait]
 impl<
         N: QNetworkTypesConfig<JobId = QProvingJobDataID>,
         TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash> + Send + Sync + 'static,
-    > QueueGathererItemBuilderWithTree<DeployContractGathererConfig<N, TempDatabase>, SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>>
-    for DeployContractGatherer<N, TempDatabase>
+        FileSystem: TokioLikeFileSystem,
+    >
+    QueueGathererItemBuilderWithTree<
+        DeployContractGathererConfig<N, TempDatabase, FileSystem>,
+        SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>,
+    > for DeployContractGatherer<N, TempDatabase, FileSystem>
 {
     type Output = DeployContractGathererOutput<N::QHash, N::JobId>;
 
     async fn create_new_with_tree(
         tree: &mut SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>,
         unique_id: QCoreProcCheckpointUniqueId,
-        config: DeployContractGathererConfig<N, TempDatabase>,
+        config: DeployContractGathererConfig<N, TempDatabase, FileSystem>,
     ) -> anyhow::Result<Self> {
         let shared_status = config.shared_status.read().unwrap().clone();
         let new_deploy_contract_file_path = get_new_deploy_contract_gatherer_backup_file_path(
@@ -318,8 +373,26 @@ impl<
             config.realm_sub_id_u64,
             shared_status.unique_pending_id,
         );
-        let mut new_contracts_file = tokio::fs::File::create(&new_deploy_contract_file_path).await?;
-        let start_next_contract_id = shared_status.block_state.next_contract_id as u64;
+        let mut new_contracts_file: FileSystem::File = config
+            .file_system
+            .file_like_fs_create(&new_deploy_contract_file_path.to_string_lossy())
+            .await?;
+        let start_next_contract_id = config.last_job_next_contract_id.read().unwrap().clone();
+        if tree.get_leaf_value(start_next_contract_id) != N::HasherBase::get_zero_hash(0) {
+            return Err(anyhow::anyhow!(
+                "Starting next contract id {} does not match tree zero hash {:?}",
+                start_next_contract_id,
+                tree.get_leaf_value(start_next_contract_id)
+            ));
+        }
+        if start_next_contract_id != 0 {
+            if tree.get_leaf_value(start_next_contract_id - 1) == N::HasherBase::get_zero_hash(0) {
+                return Err(anyhow::anyhow!(
+                    "The leaf before the next contract id {} minus one does not exist in tree, cannot continue",
+                    start_next_contract_id - 1
+                ));
+            }
+        }
         new_contracts_file.write_u32_le(DEPLOY_CONTRACT_GATHERER_BACKUP_V1_MAGIC_U32).await?;
         new_contracts_file.write_u64_le(start_next_contract_id).await?;
         new_contracts_file.write_all(&tree.get_root().into_owned_32bytes()).await?;
@@ -436,14 +509,49 @@ impl<
         Ok(())
     }
     async fn finalize_with_tree(mut self, tree: &mut SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>) -> anyhow::Result<Self::Output> {
+        let needs_revert = {
+            self.config
+                .shared_status
+                .read()
+                .map_err(|e| anyhow::anyhow!("error reading status {:?}", e))?
+                .should_revert_last_changes
+        };
+        if needs_revert {
+            let new_next_contract_id = self.shared_status.block_state.next_contract_id as u64;
+            {
+                self.config
+                    .last_job_next_contract_id
+                    .write()
+                    .map_err(|e| anyhow::anyhow!("error writing last job next contract id {:?}", e))?
+                    .clone_from(&new_next_contract_id);
+            }
+            self.reset_for_revert()?;
+
+            // TODO: maybe we regenerate the job witnesses if we need to revert instead of
+            // making the users resubmit
+            tree.revert_changes();
+            tree.clear_changes_remove_committed_leaves_and_rehash(new_next_contract_id, self.next_contract_id);
+            if tree.get_root() != self.shared_status.last_committed_checkpoint_state_roots.contract_tree_root {
+                return Err(anyhow::anyhow!(
+                    "After revert, contract registration tree root mismatch: expected {:?}, got {:?}",
+                    self.shared_status.last_committed_checkpoint_state_roots.contract_tree_root,
+                    tree.get_root()
+                ));
+            }
+            // remove the backup file since we are reverting
+            //tokio::fs::remove_file(&self.pending_file_path).await?;
+        }
         // flush before seeking to update num new contracts
-        self.new_contracts_file.flush().await?;
+        //self.new_contracts_file.flush().await?;
 
         let total_new_contracts = self.new_global_contract_tree_leaves.len() as u32;
         self.new_contracts_file.seek(SeekFrom::Start(4 + 8 + 32)).await?;
         self.new_contracts_file.write_u32(total_new_contracts).await?;
         // ensure the new total contracts length is flushed correctly
-        self.new_contracts_file.flush().await?;
+        self.config
+            .file_system
+            .file_like_fs_flush_file_with_path(&self.pending_file_path, &mut self.new_contracts_file)
+            .await?;
 
         let start_state_root = tree.get_root();
 
@@ -458,14 +566,18 @@ impl<
         } else {
             let spider_map_proofs =
                 tree.append_leaves_spider_man(N::BATCH_DEPLOY_CONTRACT_SUB_TREE_HEIGHT as u8, &self.new_global_contract_tree_leaves)?;
-            // NOTE: I made a change in the DeployContractCircuit so we don't have to provide the old contract leaves in the append proof, can just make them anything
+            // NOTE: I made a change in the DeployContractCircuit so we don't have to
+            // provide the old contract leaves in the append proof, can just make them
+            // anything
             let dummy_leaf = self.new_contract_leaves[0].clone();
 
             let mut inputs = Vec::with_capacity(spider_map_proofs.len());
             let mut contract_leaf_data_ind = 0;
             for proof in spider_map_proofs {
                 let leaf_count = proof.get_non_zero_leaves_count();
-                let prepend_leaves = (0..proof.get_existing_prepended_leaves_count()).map(|_| dummy_leaf.clone()).collect::<Vec<_>>();
+                let prepend_leaves = (0..proof.get_existing_prepended_leaves_count())
+                    .map(|_| dummy_leaf.clone())
+                    .collect::<Vec<_>>();
                 let new_contract_leaves = self.new_contract_leaves[contract_leaf_data_ind..(contract_leaf_data_ind + leaf_count)].to_vec();
                 let contract_leaves = [prepend_leaves, new_contract_leaves].concat();
                 contract_leaf_data_ind += leaf_count;
@@ -494,7 +606,7 @@ impl<
         )?;
 
         let update_global_contract_tree_nodes_ffs = create_ffs_merkle_nodes_zero_id_from_hash_map::<N::QHash>(tree.get_changes());
-        tree.commit_changes();
+        //tree.commit_changes();
 
         self.config
             .temp_db
@@ -517,6 +629,14 @@ impl<
             db_output: output_database,
             job_ids: jobs_for_queue,
         };
+
+        {
+            self.config
+                .last_job_next_contract_id
+                .write()
+                .map_err(|e| anyhow::anyhow!("error writing last job next contract id {:?}", e))?
+                .clone_from(&self.next_contract_id);
+        }
         Ok(output)
     }
 }
@@ -532,14 +652,8 @@ impl<F: Copy, Hash: Q256BitHash>
     > for AggDeployContractHelper
 {
     fn get_dummy_job_id(unique_checkpoint_id: u64) -> QProvingJobDataID {
-        QProvingJobDataID::new_proof_job_id(
-            unique_checkpoint_id,
-            0,
-            ProvingJobCircuitType::DummyBatchDeployContractsAggregate,
-            0,
-            0,
-        )
-        .get_input_witness_id()
+        QProvingJobDataID::new_proof_job_id(unique_checkpoint_id, 0, ProvingJobCircuitType::DummyBatchDeployContractsAggregate, 0, 0)
+            .get_input_witness_id()
     }
 
     fn get_agg_job_id(unique_checkpoint_id: u64, node_key: SimpleMerkleNodeKey) -> QProvingJobDataID {

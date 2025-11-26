@@ -1,9 +1,9 @@
-use parth_core::{crypto::hash::traits::{FieldQHasher, PCircuitWitness}, felt::QFelt64, protocol::core_types::{Q256BitHash, QFHashBase}};
+use parth_core::{crypto::hash::traits::{FieldQHasher, PCircuitWitness, QFieldHashable}, felt::QFelt64, protocol::core_types::{Q256BitHash, QFHashBase}};
 #[cfg(feature = "rand_gen")]
 use parth_core::utils::QPGenRandom;
 use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
 
-use crate::{agg::AggStateTransitionWithStats, guta::header::GlobalUserTreeAggregatorHeader};
+use crate::{agg::AggStateTransitionWithStats, guta::{self, header::GlobalUserTreeAggregatorHeader}};
 
 
 
@@ -14,7 +14,68 @@ pub struct QCAggUserRegistartionDeployContractsGUTAInput<F, Hash> {
     pub deploy_contracts_state_transition: AggStateTransitionWithStats<Hash>,
     pub guta_proof_header: GlobalUserTreeAggregatorHeader<F, Hash>,
 }
+/*
 
+
+
+    pub fn get_combined_hash<H: AlgebraicHasher<F>, F: RichField + Extendable<D>, const D: usize>(
+        &self,
+        builder: &mut CircuitBuilder<F, D>,
+    ) -> HashOutTarget {
+        let user_regsitration_deploy_contract_start = builder.hash_two_to_one::<H>(
+            self.user_registration_tree_delta.state_transition_start,
+            self.global_contract_tree_delta.state_transition_start,
+        );
+        let user_regsitration_deploy_contract_end = builder.hash_two_to_one::<H>(
+            self.user_registration_tree_delta.state_transition_end,
+            self.global_contract_tree_delta.state_transition_end,
+        );
+        let user_regsitration_deploy_contract_combo =
+            builder.hash_two_to_one::<H>(user_regsitration_deploy_contract_start, user_regsitration_deploy_contract_end);
+
+        let guta_hash = self.global_user_tree_delta.to_hash::<H, F, D>(builder);
+        
+
+        let combo_without_stats = builder.hash_two_to_one::<H>(user_regsitration_deploy_contract_combo, guta_hash);
+        let stats_hash = HashOutTarget {
+            elements: [
+                self.combined_pm_jobs_completed.deploy_contracts_completed,
+                self.combined_pm_jobs_completed.register_users_completed,
+                self.combined_pm_jobs_completed.gutas_completed,
+                builder.zero(),
+            ]
+        };
+        builder.hash_two_to_one::<H>(combo_without_stats, stats_hash)
+    }
+    
+*/
+impl<F: QFelt64, Hash: QFHashBase<F>> QCAggUserRegistartionDeployContractsGUTAInput<F, Hash> {
+    pub fn get_public_inputs_hash_no_rewards_tag<Hasher: FieldQHasher<F, Hash>>(&self) -> Hash {
+
+        let user_registration_deploy_contracts_start = Hasher::two_to_one(
+            &self.register_users_state_transition.state_transition_start,
+            &self.deploy_contracts_state_transition.state_transition_start,
+        );
+        let user_registration_deploy_contracts_end = Hasher::two_to_one(
+            &self.register_users_state_transition.state_transition_end,
+            &self.deploy_contracts_state_transition.state_transition_end,
+        );
+        let user_registration_deploy_contracts_combo = Hasher::two_to_one(
+            &user_registration_deploy_contracts_start,
+            &user_registration_deploy_contracts_end,
+        );
+
+        let guta_hash = self.guta_proof_header.qfhash::<Hasher>();
+        let combo_without_stats = Hasher::two_to_one(&user_registration_deploy_contracts_combo, &guta_hash);
+        let stats_hash = Hash::from_u64x4([
+            self.register_users_state_transition.total_proofs_generated,
+            self.deploy_contracts_state_transition.total_proofs_generated,
+            self.guta_proof_header.total_aggregation_proofs_generated.to_u64_value(),
+            0,
+        ]);
+        Hasher::two_to_one(&combo_without_stats, &stats_hash)
+    }
+}
 
 #[cfg(feature = "rand_gen")]
 impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for QCAggUserRegistartionDeployContractsGUTAInput<F, Hash> {

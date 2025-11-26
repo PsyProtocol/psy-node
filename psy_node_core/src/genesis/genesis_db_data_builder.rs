@@ -8,7 +8,7 @@ use parth_common::{
 use parth_core::{
     crypto::hash::{
         merkle_proof::{DeltaMerkleProofCore, MerkleProofCore, compute_root_merkle_proof_generic},
-        traits::{FieldQHasher, QFieldHashable},
+        traits::{FieldQHasher, MerkleHasher, QFieldHashable},
     },
     data::{
         db::hash_id_u64::{PSY_OBJECT_FFS_SIZE_HASH_256_AND_U64, QHash256AndU64},
@@ -19,14 +19,13 @@ use parth_core::{
 };
 use psy_core::user_id::get_user_id_from_registration_id;
 use psy_data::{
-    genesis::genesis_block_setup::PsyGenesisBlockSetupData,
-    prepared_block::{common::PsyCoordinatorPendingCheckpointBase, coordinator::PsyPreparedCoordinatorBlockStateUpdates},
-    v1::qdata::{
+    genesis::genesis_block_setup::PsyGenesisBlockSetupData, prepared_block::{common::PsyCoordinatorPendingCheckpointBase, coordinator::PsyPreparedCoordinatorBlockStateUpdates}, protocol::checkpoint_transition_hash::CheckpointStateHashTransition, v1::qdata::{
         checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, PQEDCheckpointLeafStats, QEDL2BlockState},
         contract::{ContractCodeDefinitionWithContractId, PQEDContractLeaf},
         ffs_sizes::{PSY_OBJECT_FFS_SIZE_CONTRACT_LEAF, PSY_OBJECT_FFS_SIZE_USER_LEAF, PSY_OBJECT_FFS_SIZE_ZK_PUBLIC_KEY},
+        populated_checkpoint::PsyCheckpointLeafPopulated,
         user::PQEDUserLeaf,
-    },
+    }
 };
 use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingleFixedTemplate;
 pub const GENESIS_INJEST_ALL_USERS_REALM_ID: u64 = 0xFFFFFFFFFFFFFFFF;
@@ -327,23 +326,48 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
             stats: self.checkpoint_stats.clone(),
         }
     }
-    pub fn get_coordinator_pending_checkpoint_base<Hasher: FieldQHasher<F, Hash>, N: QNetworkConstants>(
+    pub fn get_populated_checkpoint_leaf(&self) -> PsyCheckpointLeafPopulated<F, Hash> {
+        PsyCheckpointLeafPopulated {
+            global_state_roots: self.get_checkpoint_state_roots(),
+            stats: self.checkpoint_stats,
+        }
+    }
+    pub fn get_coordinator_pending_checkpoint_base<Hasher: FieldQHasher<F, Hash>>(
         &self,
+        checkpoint_tree_height: u8,
     ) -> PsyCoordinatorPendingCheckpointBase<F, Hash> {
-        
-        let siblings = (0..N::CHECKPOINT_TREE_HEIGHT_USIZE).map(|i| Hasher::get_zero_hash(i)).collect::<Vec<Hash>>();
-        let checkpoint_leaf = self.get_checkpoint_leaf::<Hasher>();
+        let siblings = (0..(checkpoint_tree_height as usize))
+            .map(|i| Hasher::get_zero_hash(i))
+            .collect::<Vec<Hash>>();
+        let checkpoint_leaf = self.get_populated_checkpoint_leaf();
         let checkpoint_leaf_hash = checkpoint_leaf.qfhash::<Hasher>();
         let checkpoint_tree_root = compute_root_merkle_proof_generic::<Hash, Hasher>(checkpoint_leaf_hash, 0, &siblings);
-        
 
         PsyCoordinatorPendingCheckpointBase {
             block_state: self.get_core_block_state(),
-            state_roots: self.get_checkpoint_state_roots(),
             checkpoint_leaf,
             checkpoint_leaf_hash,
             checkpoint_tree_root,
         }
+    }
+    pub fn get_genesis_state_transition<Hasher: FieldQHasher<F, Hash>>(
+        &self,
+        checkpoint_tree_height: u8,
+    ) -> CheckpointStateHashTransition<Hash> {
+        let pending_checkpoint_base = self.get_coordinator_pending_checkpoint_base::<Hasher>(checkpoint_tree_height);
+
+        CheckpointStateHashTransition {
+            old_checkpoint_tree_root: pending_checkpoint_base.checkpoint_tree_root,
+            new_checkpoint_tree_root: pending_checkpoint_base.checkpoint_tree_root,
+            old_checkpoint_leaf_hash: pending_checkpoint_base.checkpoint_leaf_hash,
+            new_checkpoint_leaf_hash: pending_checkpoint_base.checkpoint_leaf_hash,
+        }
+    }
+    pub fn get_genesis_state_transition_hash<Hasher: FieldQHasher<F, Hash>>(
+        &self,
+        checkpoint_tree_height: u8,
+    ) -> Hash {
+        self.get_genesis_state_transition::<Hasher>(checkpoint_tree_height).get_hash::<Hasher>()
     }
 
     pub fn setup_for_coordinator<Hasher: FieldQHasher<F, Hash>, N: QNetworkConstants>(
@@ -356,11 +380,13 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
         );
         builder.setup_contracts::<Hasher, N>(genesis_block, true)?;
         builder.setup_users::<Hasher, N>(genesis_block, None, true, false)?;
-    
-        let pending_checkpoint_base = builder.get_coordinator_pending_checkpoint_base::<Hasher, N>();
 
-        let siblings = (0..N::CHECKPOINT_TREE_HEIGHT_USIZE).map(|i| Hasher::get_zero_hash(i)).collect::<Vec<Hash>>();
-    
+        let pending_checkpoint_base = builder.get_coordinator_pending_checkpoint_base::<Hasher>(N::CHECKPOINT_TREE_HEIGHT);
+
+        let siblings = (0..N::CHECKPOINT_TREE_HEIGHT_USIZE)
+            .map(|i| Hasher::get_zero_hash(i))
+            .collect::<Vec<Hash>>();
+
         let checkpoint_leaf_hash = pending_checkpoint_base.checkpoint_leaf_hash;
         let checkpoint_tree_update_proof = DeltaMerkleProofCore {
             old_root: pending_checkpoint_base.checkpoint_tree_root,
@@ -372,6 +398,7 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
         };
         Ok(PsyPreparedCoordinatorBlockStateUpdates {
             coordinator_id: 0,
+            checkpoint_id: 0,
             unique_pending_id: 0,
             proc_checkpoint_unique_id: 0,
             old_base: pending_checkpoint_base.clone(),

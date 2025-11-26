@@ -589,7 +589,7 @@ pub trait CoreDatabaseZeroIdMerkleReader<
     Hash: QHashBase + Send + Sync,
     Hasher: MerkleZeroHasher<Hash> + Send + Sync,
     TableIdentifier: Clone + Send + Sync,
->
+>: CoreDatabaseZeroIdMerkleDumpReader<Hash, Hasher, TableIdentifier>
 {
     async fn db_select_zero_id_merkle_node_max_checkpoint(
         &self,

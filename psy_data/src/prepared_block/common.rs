@@ -5,15 +5,14 @@ use parth_core::{felt::QFelt64, protocol::core_types::Q256BitHash};
 use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
 use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
 
-use crate::{v1::qdata::checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState}, worker::metadata_with_job_id::PsyProvingJobMetadataWithJobId};
+use crate::{v1::qdata::{checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState}, populated_checkpoint::PsyCheckpointLeafPopulated}, worker::metadata_with_job_id::PsyProvingJobMetadataWithJobId};
 
 
 #[pderive::serialize_copy_f_hash_ts]
 #[ts(export, concrete(F = parth_core::PF, Hash = parth_core::PHash))]
 pub struct PsyCoordinatorPendingCheckpointBase<F, Hash> {
     pub block_state: QEDL2BlockState,
-    pub state_roots: PQEDCheckpointGlobalStateRoots<Hash>,
-    pub checkpoint_leaf: PQEDCheckpointLeaf<F, Hash>,
+    pub checkpoint_leaf: PsyCheckpointLeafPopulated<F, Hash>,
     pub checkpoint_leaf_hash: Hash,
     pub checkpoint_tree_root: Hash,
 }
@@ -26,8 +25,7 @@ impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for PsyCoordinatorPendingChe
     {
         Self {
             block_state: QEDL2BlockState::qp_rand_gen(),
-            state_roots: PQEDCheckpointGlobalStateRoots::qp_rand_gen(),
-            checkpoint_leaf: PQEDCheckpointLeaf::qp_rand_gen(),
+            checkpoint_leaf: PsyCheckpointLeafPopulated::qp_rand_gen(),
             checkpoint_leaf_hash: Hash::qp_rand_gen(),
             checkpoint_tree_root: Hash::qp_rand_gen(),
         }
@@ -38,8 +36,7 @@ impl<F: QFelt64, Hash: Q256BitHash> PsyCanonicalSerializeMetadata for PsyCoordin
     const IS_FIXED_SIZE: bool = true;
     const FIXED_SIZE: usize = 
         QEDL2BlockState::FIXED_SIZE +
-        PQEDCheckpointGlobalStateRoots::<Hash>::FIXED_SIZE +
-        PQEDCheckpointLeaf::<F, Hash>::FIXED_SIZE +
+        PsyCheckpointLeafPopulated::<F, Hash>::FIXED_SIZE +
         32 + // checkpoint_leaf_hash
         32;  // checkpoint_tree_root
 }
@@ -51,7 +48,6 @@ impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for PsyCoordin
 
     fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
         self.block_state.pio_write_to_io(writer)?;
-        self.state_roots.pio_write_to_io(writer)?;
         self.checkpoint_leaf.pio_write_to_io(writer)?;
         writer.psy_write_bytes_fixed(&self.checkpoint_leaf_hash.into_owned_32bytes())?;
         writer.psy_write_bytes_fixed(&self.checkpoint_tree_root.into_owned_32bytes())?;
@@ -60,14 +56,12 @@ impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for PsyCoordin
 
     fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
         let block_state = QEDL2BlockState::pio_read_from_io(reader)?;
-        let state_roots = PQEDCheckpointGlobalStateRoots::<Hash>::pio_read_from_io(reader)?;
-        let checkpoint_leaf = PQEDCheckpointLeaf::<F, Hash>::pio_read_from_io(reader)?;
+        let checkpoint_leaf = PsyCheckpointLeafPopulated::<F, Hash>::pio_read_from_io(reader)?;
         let checkpoint_leaf_hash = Hash::from_owned_32bytes(reader.psy_read_bytes_32()?);
         let checkpoint_tree_root = Hash::from_owned_32bytes(reader.psy_read_bytes_32()?);
 
         Ok(Self {
             block_state,
-            state_roots,
             checkpoint_leaf,
             checkpoint_leaf_hash,
             checkpoint_tree_root,

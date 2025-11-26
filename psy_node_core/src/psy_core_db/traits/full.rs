@@ -1,23 +1,24 @@
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use auto_impl::auto_impl;
 use parth_core::{
     QCoreProcCheckpointUniqueId, crypto::hash::{
         merkle_proof::{DeltaMerkleProofCore, MerkleProofCore},
         tag_tree::TagTreeMerkleProof,
-    }, data::{
-        db::row::{QDatabaseSingleIdTableRow, QDatabaseSingleIdTableRowNoCheckpointId},
+    }, data::
         hash::{
             merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey},
             merkle_store_key::{QMerkleStoreDoubleIdKey, QMerkleStoreDoubleIdNode, QMerkleStoreSingleIdKey, QMerkleStoreSingleIdNode},
-        },
-    }, node::traits::realm
+        }
+    
 };
-use psy_data::v1::qdata::{
+use psy_data::{protocol::verifiable_checkpoint_transition::PsyVerifiableCheckpointTransitionWithProof, v1::qdata::{
     checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState},
     contract::{ContractCodeDefinition, ContractCodeDefinitionWithContractId, PQEDContractLeaf},
     public_key::PZKPublicKeyInfo,
     user::PQEDUserLeaf,
-};
+}};
 
 #[async_trait]
 #[auto_impl(&, Arc)]
@@ -67,6 +68,7 @@ pub trait PsyNodeGlobalUserTreeDatabaseReader<Hash> {
     ) -> anyhow::Result<MerkleProofCore<Hash>>;
     async fn global_user_tree_get_nodes(&self, checkpoint_id: u64, keys: &[SimpleMerkleNodeKey]) -> anyhow::Result<Vec<Hash>>;
     async fn global_user_tree_get_node(&self, checkpoint_id: u64, key: SimpleMerkleNodeKey) -> anyhow::Result<Hash>;
+    async fn global_user_tree_dump_all_leaves(&self, checkpoint_id: u64) -> anyhow::Result<HashMap<u64, Hash>>;
 }
 
 #[async_trait]
@@ -344,6 +346,19 @@ pub trait PsyNodeCoreRewardsTagTreeStoreWriter<F, Hash> {
     async fn rewards_tag_tree_set_node_tag_only(&self, unique_pending_id: u64, key: SimpleMerkleNodeKey, tag: Hash) -> anyhow::Result<()>;
 }
 
+
+#[async_trait]
+#[auto_impl(&, Arc)]
+pub trait PsyNodeCheckpointTransitionZKProofDatabaseReader<F, Hash> {
+    async fn get_verifiable_checkpoint_state_transition_and_zkp(&self, checkpoint_id: u64) -> anyhow::Result<PsyVerifiableCheckpointTransitionWithProof<F, Hash>>;
+}
+
+#[async_trait]
+#[auto_impl(&, Arc)]
+pub trait PsyNodeCheckpointTransitionZKProofDatabaseWriter<F, Hash> {
+    async fn set_verifiable_checkpoint_state_transition_and_zkp(&self, checkpoint_id: u64, verifiable_transition_and_proof: &PsyVerifiableCheckpointTransitionWithProof<F, Hash>) -> anyhow::Result<()>;
+}
+
 pub trait PsyRealmEdgeAPIStoreReader<F, Hash>:
     PsyNodeCheckpointTreeDatabaseReader<Hash>
     + PsyNodeGlobalUserTreeDatabaseReader<Hash>
@@ -384,6 +399,7 @@ pub trait PsyCoordinatorEdgeAPIStoreReader<F, Hash>:
     + PsyNodeContractFunctionTreeDatabaseReader<Hash>
     + PsyNodeGlobalContractTreeDatabaseReader<Hash>
     + PsyNodeUserRegistrationTreeDatabaseReader<Hash>
+    + PsyNodeCheckpointTransitionZKProofDatabaseReader<F, Hash>
 {
 }
 impl<
@@ -397,7 +413,8 @@ impl<
             + PsyNodeCoreDatabaseBasicContractInfoStoreReader<F, Hash>
             + PsyNodeContractFunctionTreeDatabaseReader<Hash>
             + PsyNodeGlobalContractTreeDatabaseReader<Hash>
-            + PsyNodeUserRegistrationTreeDatabaseReader<Hash>,
+            + PsyNodeUserRegistrationTreeDatabaseReader<Hash>
+        + PsyNodeCheckpointTransitionZKProofDatabaseReader<F, Hash>,
         F,
         Hash,
     > PsyCoordinatorEdgeAPIStoreReader<F, Hash> for T
@@ -431,6 +448,10 @@ pub trait PsyCoordinatorProcessorStore<F, Hash>:
     // 9. Contract Object Store (R/W) (includes Basic Info R/W)
     + PsyNodeCoreDatabaseContractObjectStoreReader<F, Hash>
     + PsyNodeCoreDatabaseContractObjectStoreWriter<F, Hash>
+
+    // 10. Proof store for checkpoint proofs
+    + PsyNodeCheckpointTransitionZKProofDatabaseReader<F, Hash>
+    + PsyNodeCheckpointTransitionZKProofDatabaseWriter<F, Hash>
 {
 }
 
@@ -458,7 +479,9 @@ impl<
             + PsyNodeCoreDatabaseUserStoreReader<F, Hash>
             + PsyNodeCoreDatabaseUserStoreWriter<F, Hash>
             + PsyNodeCoreDatabaseContractObjectStoreReader<F, Hash>
-            + PsyNodeCoreDatabaseContractObjectStoreWriter<F, Hash>,
+            + PsyNodeCoreDatabaseContractObjectStoreWriter<F, Hash>
+            + PsyNodeCheckpointTransitionZKProofDatabaseReader<F, Hash>
+            + PsyNodeCheckpointTransitionZKProofDatabaseWriter<F, Hash>,
         F,
         Hash,
     > PsyCoordinatorProcessorStore<F, Hash> for T

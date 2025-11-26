@@ -2891,10 +2891,12 @@ name = "psy_io"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "embedded-io 0.7.1",
  "embedded-io-async",
  "hex",
  "hex-literal",
+ "tokio",
 ]
 
 [[package]]
@@ -2971,6 +2973,7 @@ dependencies = [
  "psy_common",
  "psy_core",
  "psy_data",
+ "psy_io",
  "psy_node_core",
  "psy_node_store_memory",
  "psy_serialize",
@@ -3003,6 +3006,7 @@ dependencies = [
  "bytemuck",
  "cf_utils",
  "clap",
+ "dashmap",
  "futures",
  "hashbrown 0.14.5",
  "hex",

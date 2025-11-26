@@ -1,7 +1,7 @@
 use parth_core::{
     crypto::hash::{tag_tree::hash_tag_tree_node, traits::{FieldQHasher, MerkleHasher, QFieldHashable, ZeroableHash}},
     data::serializable::QPDSerializable,
-    felt::{QFelt, QFelt64, QFeltSized, ToQFelts},
+    felt::{QFelt, QFelt64, QFeltSized, ToQFelts, ZeroableFelt},
     impl_qpd_serialize_params, impl_qpq_serialize_bincode,
     protocol::core_types::{Q256BitHash, QFHashBase, QHashBase}, utils::QPGenRandom,
 };
@@ -32,7 +32,26 @@ impl_qpd_serialize_params!(
     { F: QFelt, Hash: QHashBase } => { F, Hash }
 );
 
-
+impl<F: ZeroableFelt, Hash: ZeroableHash> PQEDCheckpointLeafStats<F, Hash> {
+    pub fn get_empty_stats() -> Self {
+        Self {
+            fees_collected: F::ZERO_VALUE,
+            user_ops_processed: F::ZERO_VALUE,
+            total_transactions: F::ZERO_VALUE,
+            slots_modified: F::ZERO_VALUE,
+            pm_jobs_completed: PPMJobsCompletedStats{
+                deploy_contracts_completed: F::ZERO_VALUE,
+                register_users_completed: F::ZERO_VALUE,
+                gutas_completed: F::ZERO_VALUE,
+            },
+            block_time: F::ZERO_VALUE,
+            random_seed: Hash::get_zero_value(),
+            pm_rewards_commitment: PPMRewardCommitment { register_users_root: Hash::get_zero_value(), gutas_root: Hash::get_zero_value(), deploy_contracts_root: Hash::get_zero_value() },
+            da_challenges_claimed: [F::ZERO_VALUE; DA_CHALLENGE_WINDOW],
+        }
+        
+    }
+}
 impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for PQEDCheckpointLeafStats<F, Hash> {
     fn qp_rand_gen() -> Self where Self: Sized {
         Self {

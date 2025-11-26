@@ -176,6 +176,7 @@ impl<N: QNetworkDatabaseTypes> P2TestbedChainStateStore<N> {
         let contract_function_tree_table = Arc::new(InMemoryTableIdentifier::new_with_keyspace(&keyspace, "contract_function_tree_table"));
         let contract_leaf_table = Arc::new(InMemoryTableIdentifier::new_with_keyspace(&keyspace, "contract_leaf_table"));
         let contract_code_definition_table = Arc::new(InMemoryTableIdentifier::new_with_keyspace(&keyspace, "contract_code_definition_table"));
+        let checkpoint_zk_proof_and_transition_table = Arc::new(InMemoryTableIdentifier::new_with_keyspace(&keyspace, "checkpoint_zk_proof_and_transition_table"));
         let psy_db = PsyUnifiedCoreDatabaseStore::new(
             store.clone(),
             checkpoint_leaf_table,
@@ -209,6 +210,7 @@ impl<N: QNetworkDatabaseTypes> P2TestbedChainStateStore<N> {
             contract_function_tree_table,
             contract_leaf_table,
             contract_code_definition_table,
+            checkpoint_zk_proof_and_transition_table,
         );
         Ok(Self { db: psy_db })
     }

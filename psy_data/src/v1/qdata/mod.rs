@@ -8,3 +8,4 @@ pub mod checkpoint;
 pub mod public_key;
 pub mod checkpoint_sync;
 pub mod ffs_sizes;
+pub mod populated_checkpoint;

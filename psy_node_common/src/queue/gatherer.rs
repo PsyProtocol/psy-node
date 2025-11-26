@@ -1,5 +1,5 @@
 use std::{
-    sync::{Arc, RwLock},
+    sync::{Arc, RwLock, atomic::{AtomicBool, Ordering}},
     time::Duration,
 };
 
@@ -38,13 +38,21 @@ impl<T: Clone> GathererValue<T> {
 #[derive(Clone)]
 pub struct QueueKeyStatusManager<const QUEUE_TOPIC_ID: u32, QueueItem: PCoreQueueItemBase> {
     queue_key: Arc<RwLock<QPStandardUniqueIdQueueKey<QUEUE_TOPIC_ID, QueueItem>>>,
-    is_active: Arc<RwLock<bool>>,
+    is_active: Arc<AtomicBool>,
 }
 
 impl<const QUEUE_TOPIC_ID: u32, QueueItem: PCoreQueueItemBase> QueueKeyStatusManager<QUEUE_TOPIC_ID, QueueItem> {
     pub fn new(base_queue_key: QPStandardUniqueIdQueueKey<QUEUE_TOPIC_ID, QueueItem>) -> Self {
         let queue_key = Arc::new(RwLock::new(base_queue_key));
-        let is_active = Arc::new(RwLock::new(true));
+        let is_active = Arc::new(AtomicBool::new(true));
+
+        Self {
+            queue_key,
+            is_active,
+        }
+    }
+    pub fn new_with_is_active(base_queue_key: QPStandardUniqueIdQueueKey<QUEUE_TOPIC_ID, QueueItem>, is_active: Arc<AtomicBool>) -> Self {
+        let queue_key = Arc::new(RwLock::new(base_queue_key));
 
         Self {
             queue_key,
@@ -56,12 +64,11 @@ impl<const QUEUE_TOPIC_ID: u32, QueueItem: PCoreQueueItemBase> QueueKeyStatusMan
         Ok(key.clone())
     }
     pub fn is_active(&self) -> anyhow::Result<bool> {
-        let active = self.is_active.read().unwrap();
-        Ok(*active)
+        let active = self.is_active.load(Ordering::SeqCst);
+        Ok(active)
     }
     pub fn set_active(&self, active: bool) -> anyhow::Result<()> {
-        let mut is_active = self.is_active.write().unwrap();
-        *is_active = active;
+        self.is_active.store(active, Ordering::SeqCst);
         Ok(())
     }
     pub fn set_unique_id(&self, unique_id: u128) -> anyhow::Result<()> {
@@ -150,7 +157,25 @@ impl<const QUEUE_TOPIC_ID: u32, QueueItem: PCoreQueueItemBase + 'static, Output:
         base_queue_key: QPStandardUniqueIdQueueKey<QUEUE_TOPIC_ID, QueueItem>,
         tree: SimpleMemoryMerkleRecorderStore<Hasher, Hash>,
     ) -> (Self, tokio::task::JoinHandle<Result<(), anyhow::Error>>) {
-        let qk = QueueKeyStatusManager::new(base_queue_key.clone());
+        Self::new_with_is_active::<Sub, C, Hash, Hasher, Builder>(stream, create_builder_config, base_queue_key, tree, Arc::new(AtomicBool::new(true)))
+    }
+    pub fn new_with_is_active<
+        Sub: QStandardEphemeralQueueSubscriber + Send + Sync + 'static,
+        C: Clone + Send + Sync + 'static,
+        Hash: QHashBase + Send + Sync + 'static,
+        Hasher: MerkleZeroHasher<Hash> + Send + Sync + 'static,
+        Builder: QueueGathererItemBuilderWithTree<C, SimpleMemoryMerkleRecorderStore<Hasher, Hash>, Output = Output>
+            + Send
+            + Sync
+            + 'static,
+    >(
+        stream: Arc<Sub>,
+        create_builder_config: C,
+        base_queue_key: QPStandardUniqueIdQueueKey<QUEUE_TOPIC_ID, QueueItem>,
+        tree: SimpleMemoryMerkleRecorderStore<Hasher, Hash>,
+        is_active: Arc<AtomicBool>,
+    ) -> (Self, tokio::task::JoinHandle<Result<(), anyhow::Error>>) {
+        let qk = QueueKeyStatusManager::new_with_is_active(base_queue_key.clone(), is_active);
         let (trigger_tx, trigger_rx) = mpsc::channel::<oneshot::Sender<Output>>(1);
 
         let jh: tokio::task::JoinHandle<Result<(), anyhow::Error>> =

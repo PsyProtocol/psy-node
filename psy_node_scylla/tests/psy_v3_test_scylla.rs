@@ -184,6 +184,7 @@ impl SimpleStoreEx {
         let contract_code_definition_table =
             store.init_std_table::<ExSingleIdTableIdentifier>("contract_code_definition_table", get_rk(26)).await?;
 
+        let checkpoint_zk_proof_and_transition_table = store.init_std_table::<ExKivTableIdentifier>("checkpoint_zk_proof_and_transition_table", get_rk(27)).await?;
         let psy_db = PsyUnifiedCoreDatabaseStore::new(
             store.clone(),
             Arc::new(checkpoint_leaf_table),
@@ -217,6 +218,7 @@ impl SimpleStoreEx {
             Arc::new(contract_function_tree_table),
             Arc::new(contract_leaf_table),
             Arc::new(contract_code_definition_table),
+            Arc::new(checkpoint_zk_proof_and_transition_table),
         );
         let simple_store = ExPsyUnifiedStoreTestHelper::new(psy_db, 0, 0);
         Ok(Self { store: simple_store })

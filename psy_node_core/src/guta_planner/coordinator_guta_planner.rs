@@ -27,9 +27,6 @@ pub struct CoordinatorGUTAPlanner<F, Hash> {
     pub job_guta_headers: [Vec<GlobalUserTreeAggregatorHeaderWithJobId<F, Hash>>; MAX_COORDINATOR_HEIGHT],
     pub job_count: usize,
 }
-pub trait CoordinatorTagTreeHelper<Hash> {
-    async fn set_reward_tree_tags(&mut self, realm_identifier: &QRealmIdentifier, unique_pending_id: u64, tags: ()) -> anyhow::Result<()>;
-}
 impl<F, Hash> CoordinatorGUTAPlanner<F, Hash> {
     pub fn new() -> Self {
         Self {

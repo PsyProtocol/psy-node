@@ -96,7 +96,7 @@ pub struct QCQEDCheckpointStateTransitionInput<F, Hash> {
     // two blocks ago, what was the last leaf hash and root hash of the old checkpoint tree
     // block 1, this is the genesis checkpoint tree leaf and root hash
     pub last_old_checkpoint_tree_leaf_hash: Hash,
-    pub last_old_checkpoint_tree_root_hash:Hash,
+    pub last_old_checkpoint_tree_root_hash: Hash,
 }
 impl<F: QFelt64, Hash: QFHashBase<F>> QCQEDCheckpointStateTransitionInput<F, Hash> {
     pub fn update_with_new_reward_tree_root<Hasher: FieldQHasher<F, Hash>>(&mut self, reward_tree_root: Hash) {

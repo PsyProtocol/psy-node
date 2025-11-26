@@ -39,6 +39,7 @@ futures = { workspace = true }
 jsonrpsee = { workspace = true }
 hashbrown = { workspace = true }
 clap = { workspace = true, optional = true }
+dashmap = { workspace = true }
 
 
 # start local packages
