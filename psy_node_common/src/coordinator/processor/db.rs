@@ -13,9 +13,9 @@ use psy_data::{
     config::network_config::PsyNodeCircuitFingerprintConfig,
     guta::header_extended::GlobalUserTreeAggregatorHeaderWithTagValueAndJobID,
     prepared_block::coordinator::PsyPreparedCoordinatorBlockStateUpdates,
-    protocol::verifiable_checkpoint_transition::{PsyVerifiableCheckpointTransition, PsyVerifiableCheckpointTransitionWithProof},
+    protocol::{checkpoint_transition_hash::CheckpointStateHashTransition, verifiable_checkpoint_transition::{PsyVerifiableCheckpointTransition, PsyVerifiableCheckpointTransitionWithProof}},
     v1::qdata::{
-        checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState},
+        checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, PQEDCheckpointLeafStats, QEDL2BlockState},
         contract::PsyDeployContractQueueItem,
         public_key::PZKPublicKeyInfo,
     },
@@ -80,9 +80,11 @@ pub struct PsyCoordinatorDatabaseProcessor<
     pub current_unique_pending_id: u64,
     pub pending_checkpoint_id: u64,
     pub last_committed_l2_state: QEDL2BlockState,
+    pub last_committed_checkpoint_leaf_stats: PQEDCheckpointLeafStats<N::F, N::QHash>,
     pub last_committed_checkpoint_leaf: PQEDCheckpointLeaf<N::F, N::QHash>,
     pub last_committed_checkpoint_root: N::QHash,
     pub last_committed_checkpoint_state_roots: PQEDCheckpointGlobalStateRoots<N::QHash>,
+    pub last_committed_checkpoint_state_transition: CheckpointStateHashTransition<N::QHash>,
     pub gathering_unique_pending_id: u64,
 
 
@@ -212,7 +214,18 @@ impl<
         let last_committed_checkpoint_leaf = shared_status.last_committed_checkpoint_leaf.clone();
         let last_committed_checkpoint_root = db.checkpoint_tree_get_root_hash(last_committed_checkpoint_id).await?;
         let last_committed_checkpoint_state_roots = shared_status.last_committed_checkpoint_state_roots.clone();
-
+        let last_committed_checkpoint_leaf_stats = last_committed_checkpoint_leaf.stats.clone();
+        let last_committed_checkpoint_state_transition = if last_committed_checkpoint_id == 0 {
+            genesis_verifiable_state_transition.state_transition.checkpoint_transition.clone()
+        } else {
+            
+        CheckpointStateHashTransition {
+            old_checkpoint_tree_root: db.checkpoint_tree_get_root_hash(last_committed_checkpoint_id - 1).await?,
+            new_checkpoint_tree_root: last_committed_checkpoint_root,
+            old_checkpoint_leaf_hash: db.checkpoint_tree_get_leaf_hash(last_committed_checkpoint_id, last_committed_checkpoint_id - 1).await?,
+            new_checkpoint_leaf_hash: last_committed_checkpoint_leaf_stats.qfhash::<N::HasherBase>(),
+        }
+    };
         Ok(Self {
             db,
             is_active: Arc::new(AtomicBool::new(true)),
@@ -268,9 +281,11 @@ impl<
             }),
             pending_checkpoint_id,
             last_committed_l2_state,
+            last_committed_checkpoint_leaf_stats,
             last_committed_checkpoint_leaf,
             last_committed_checkpoint_root,
             last_committed_checkpoint_state_roots,
+            last_committed_checkpoint_state_transition,
             gathering_unique_pending_id: current_unique_pending_id,
             gathering_core_proc_unique_pending_id: current_core_proc_unique_pending_id,
             needs_revert: false,
@@ -322,6 +337,7 @@ impl<
         self.last_committed_checkpoint_id = self.pending_checkpoint_id;
         self.pending_checkpoint_id += 1;
         self.last_committed_checkpoint_leaf = new_checkpoint_leaf;
+        self.last_committed_checkpoint_leaf_stats = new_checkpoint_leaf.stats.clone();
         self.last_committed_checkpoint_state_roots = new_checkpoint_state_roots;
         self.last_committed_l2_state = new_l2_block_state;
 
@@ -455,11 +471,19 @@ impl<
         // from disk SO LONG AS THE checkpoint_id is not set!!!!
         self.db.set_latest_checkpoint_id(checkpoint_id).await?;
 
+        self.last_committed_checkpoint_state_transition = CheckpointStateHashTransition {
+            old_checkpoint_tree_root: coordinator_update.old_base.checkpoint_tree_root,
+            new_checkpoint_tree_root: coordinator_update.new_base.checkpoint_tree_root,
+            old_checkpoint_leaf_hash: coordinator_update.old_base.checkpoint_leaf_hash,
+            new_checkpoint_leaf_hash: coordinator_update.new_base.checkpoint_leaf_hash,
+        };
         self.last_committed_checkpoint_id = checkpoint_id;
         self.last_committed_checkpoint_leaf = checkpoint_leaf_standard;
+        self.last_committed_checkpoint_leaf_stats = coordinator_update.new_base.checkpoint_leaf.stats.clone();
         self.last_committed_checkpoint_state_roots = coordinator_update.new_base.checkpoint_leaf.global_state_roots;
         self.last_committed_l2_state = coordinator_update.new_base.block_state;
         self.last_committed_checkpoint_root = checkpoint_delta_merkle_proof.new_root;
+
         // This just updates the RwLock protected shared status, this is ok because we only read when we dump/create the queue builder
         self.shared_status.update_status(
             self.gathering_unique_pending_id,

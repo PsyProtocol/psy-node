@@ -1,54 +1,16 @@
-use parth_common::memory_stores::mem_tree_recorder::SimpleMemoryMerkleRecorderStore;
-use parth_core::{
-    data::hash::merkle_node_key::SimpleMerkleNodeKey, node::realm_identifier::QRealmIdentifier, protocol::core_types::QNetworkTypesConfig,
-    QCoreProcCheckpointUniqueId, QProvingJobDataIDWithRewardPath,
-};
+use parth_core::protocol::core_types::QNetworkTypesConfig;
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
-use psy_data::{
-    genesis::genesis_block_setup::PsyGenesisBlockSetupData,
-    guta::header_extended::GlobalUserTreeAggregatorHeaderWithTagValueAndJobID,
-    v1::{
-        common_api::PsyProoffMinerRewardProof,
-        qdata::{
-            contract::{DashMapContractHeightCache, PsyDeployContractQueueItem},
-            public_key::PZKPublicKeyInfo,
-        },
-    },
-};
-use psy_io::tokio::{TokioFileLike, TokioLikeFileSystem};
+use psy_data::genesis::genesis_block_setup::PsyGenesisBlockSetupData;
+use psy_io::tokio::TokioLikeFileSystem;
 use psy_node_core::{
     genesis::genesis_db_data_builder::GenesisDatabaseDataBuilder,
-    psy_core_db::traits::full::{
-        PsyCoordinatorEdgeAPIStoreReader, PsyCoordinatorProcessorStore, PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter,
-    },
-    psy_temp_db::{StandardEdgeAPITempDBStoreBase, StandardProcessorTempDBStoreBase},
-    queue::{
-        ephemeral::{QStandardEphemeralQueuePublisher, QStandardEphemeralQueueSubscriber},
-        worker_queue::{QStandardWorkerQueuePublisher, QStandardWorkerQueueSubscriber},
-    },
+    psy_core_db::traits::full::{PsyCoordinatorProcessorStore, PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter},
+    psy_temp_db::StandardProcessorTempDBStoreBase,
+    queue::{ephemeral::QStandardEphemeralQueueSubscriber, worker_queue::QStandardWorkerQueuePublisher},
     store::traits::proof_store::QParthProofStore,
 };
 
-use crate::{
-    backup::coordinator::load_coordinator_memory_trees_from_db,
-    constants::queue::{
-        PQ_COORDINATOR_DEPLOY_CONTRACT_QUEUE_TOPIC_ID, PQ_COORDINATOR_REGISTER_USER_PUBLIC_KEY_QUEUE_TOPIC_ID,
-        PQ_COORDINATOR_SUBMIT_REALM_GUTA_UPDATE_QUEUE_TOPIC_ID,
-    },
-    coordinator::processor::{
-        data::CoordinatorProcessorInitData,
-        db::{DatabaseCheckState, PsyCoordinatorDatabaseProcessor},
-        gatherers::{
-            coordinator_guta_update_gatherer::{
-                CoordinatorGUTAUpdateGatherer, CoordinatorGUTAUpdateGathererConfig, CoordinatorGUTAUpdateGathererOutput,
-            },
-            deploy_contract_gatherer::{DeployContractGatherer, DeployContractGathererConfig, DeployContractGathererOutput},
-            register_user_gatherer::{RegisterUserGatherer, RegisterUserGathererConfig, RegisterUserGathererOutput},
-        },
-        PsyCoordinatorProcessor,
-    },
-    queue::gatherer::EphemeralQueueGathererWithTree,
-};
+use crate::coordinator::processor::{db::DatabaseCheckState, PsyCoordinatorProcessor};
 
 impl<
         N: QNetworkTypesConfig<JobId = QProvingJobDataID>,
