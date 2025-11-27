@@ -28,10 +28,7 @@ pub trait TokioLikeFileSystem: Send + Sync {
     async fn file_like_fs_create_dir_all(&self, path: &str) -> tokio::io::Result<()>;
     async fn file_like_fs_create(&self, path: &str) -> tokio::io::Result<Self::File>;
     async fn file_like_fs_open(&self, path: &str) -> tokio::io::Result<Self::File>;
-    async fn file_like_fs_flush_file_with_path(&self, _path: &str, file: &mut Self::File) -> tokio::io::Result<()> {
-        file.flush().await
-    }
-
+    async fn file_like_fs_flush_file_with_path(&self, _path: &str, file: &mut Self::File) -> tokio::io::Result<()>;
 }
 #[derive(Debug, Clone, Copy)]
 pub struct TokioStdFileSystem;
@@ -43,13 +40,15 @@ impl TokioLikeFileSystem for TokioStdFileSystem {
         tokio::fs::create_dir_all(path).await
     }
     async fn file_like_fs_create(&self, path: &str) -> tokio::io::Result<Self::File> {
-        tokio::fs::File::create(path).await
+        tokio::fs::File::options().create(true).truncate(false).read(true).write(true).open(path).await
     }
     async fn file_like_fs_open(&self, path: &str) -> tokio::io::Result<Self::File> {
         tokio::fs::File::open(path).await
     }
+    async fn file_like_fs_flush_file_with_path(&self, _path: &str, file: &mut Self::File) -> tokio::io::Result<()> {
+        file.flush().await
+    }
 }
-
 
 #[async_trait]
 pub trait TokioFileLike: AsyncWriteExt + AsyncReadExt + AsyncSeekExt + Unpin + Send {

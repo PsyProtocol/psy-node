@@ -22,7 +22,7 @@ use psy_data::{
     protocol::circuit_inputs::agg_part_1::QCAggUserRegistartionDeployContractsGUTAInput,
     worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse,
 };
-use psy_plonky2_basic_helpers::verifier::circuit_library::CircuitInfoLibrary;
+use psy_plonky2_basic_helpers::{builder::pad_circuit::CircuitBuilderQEDCommonGates, verifier::circuit_library::CircuitInfoLibrary};
 use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 
 use crate::{
@@ -127,6 +127,7 @@ where
             register_users_proof_rewards_tree_value,
             deploy_contracts_proof_rewards_tree_value,
         );
+        builder.add_qed_type_f_common_gates();
         
         builder.register_public_inputs(&public_inputs_hash.elements);
 

@@ -165,12 +165,18 @@ impl<
         &self,
     ) -> anyhow::Result<Option<([u8; 32], Hash, PsyWorkerGetProvingWorkWithChildProofsAPIResponse<Hash, QProvingJobDataID>)>> {
         let is_in_realm_mode = self.is_in_realm_mode.load(std::sync::atomic::Ordering::SeqCst);
+        println!("is_in_realm_mode: {}", is_in_realm_mode);
         let result = if is_in_realm_mode {
-            self.realm_api_url_manager.get_next_api_url_hash()
+            self.realm_api_url_manager.get_next_api_url_hash().await
         } else {
-            self.coordinator_api_url_manager.get_next_api_url_hash()
+            self.coordinator_api_url_manager.get_next_api_url_hash().await
         };
         if result.is_none() {
+            if is_in_realm_mode && self.coordinator_api_url_manager.has_urls() {
+                self.is_in_realm_mode.store(false, std::sync::atomic::Ordering::SeqCst);
+            } else if !is_in_realm_mode && self.realm_api_url_manager.has_urls() {
+                self.is_in_realm_mode.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             anyhow::bail!("No API URLs available to fetch new job");
         }
         let api_url_hash = result.unwrap();

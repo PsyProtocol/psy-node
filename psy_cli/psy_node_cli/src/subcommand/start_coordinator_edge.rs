@@ -1,6 +1,7 @@
 
+use psy_node_cli::node::startup_edge_plonky2_scylla::run_startup_plonky2_scylla_edge_node;
 use psy_node_core::config::node_start_config::CoordinatorEdgeStartConfig;
-use tracing::{error, info};
+use tracing::info;
 
 
 
@@ -28,20 +29,13 @@ fn print_banner() {
     );
 }
 
-pub async fn run_coordinator_edge_inner(config: CoordinatorEdgeStartConfig) -> anyhow::Result<()> {
-    // Placeholder for actual worker logic
-    println!("Starting Coordinator Edge with config: {:?}", config);
-    loop {
-        info!("Coordinator Edge is running...");
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    }
-}
 
 pub async fn run(
     config: CoordinatorEdgeStartConfig,
 ) -> anyhow::Result<()> {
     print_banner();
     info!("Using network: {:?}", config.network);
-    
+    run_startup_plonky2_scylla_edge_node(&config).await?;
+    info!("Coordinator Edge exit.");
     Ok(())
 }

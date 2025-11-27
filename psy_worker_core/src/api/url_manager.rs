@@ -46,28 +46,28 @@ impl PsyWorkerAPIURLManager {
     pub fn has_urls(&self) -> bool {
         !self.api_url_hash_to_string.is_empty()
     }
-    pub fn remove_api_url_by_hash(&self, api_url_hash: &[u8; 32]) -> anyhow::Result<()> {
+    pub async fn remove_api_url_by_hash(&self, api_url_hash: &[u8; 32]) -> anyhow::Result<()> {
         if let Some(api_url) = self.api_url_hash_to_string.get(api_url_hash) {
             let api_url = api_url.value().clone();
             self.api_url_hash_to_string.remove(api_url_hash);
             self.api_url_string_to_hash.remove(&api_url);
             self.api_url_hash_to_client.remove(api_url_hash);
             self.api_url_realm_identifiers.remove(api_url_hash);
-            let mut api_url_list = self.api_url_list.blocking_write();
+            let mut api_url_list = self.api_url_list.write().await;
             if let Some(pos) = api_url_list.iter().position(|x| x == &api_url) {
                 api_url_list.remove(pos);
             }
         }
         Ok(())
     }
-    pub fn remove_api_url(&self, api_url: &str) -> anyhow::Result<()> {
+    pub async fn remove_api_url(&self, api_url: &str) -> anyhow::Result<()> {
         if let Some(api_url_hash) = self.api_url_string_to_hash.get(api_url) {
             let api_url_hash = *api_url_hash;
             self.api_url_hash_to_string.remove(&api_url_hash);
             self.api_url_string_to_hash.remove(api_url);
             self.api_url_hash_to_client.remove(&api_url_hash);
             self.api_url_realm_identifiers.remove(&api_url_hash);
-            let mut api_url_list = self.api_url_list.blocking_write();
+            let mut api_url_list = self.api_url_list.write().await;
             if let Some(pos) = api_url_list.iter().position(|x| x == api_url) {
                 api_url_list.remove(pos);
             }
@@ -89,7 +89,7 @@ impl PsyWorkerAPIURLManager {
             self.api_url_string_to_hash.insert(api_url.as_ref().to_string(), api_url_hash);
             self.api_url_realm_identifiers.insert(api_url_hash, realm_identifier);
             self.api_url_hash_to_client.insert(api_url_hash, client);
-            self.api_url_list.blocking_write().push(api_url.as_ref().to_string());
+            self.api_url_list.write().await.push(api_url.as_ref().to_string());
         }
         Ok(())
     }
@@ -101,14 +101,14 @@ impl PsyWorkerAPIURLManager {
         // reset the failure count on success
         self.api_url_failed_attempts.remove(api_url_hash);
     }
-    pub fn get_next_api_url_hash(&self) -> Option<[u8; 32]> {
-        let api_url_list = self.api_url_list.blocking_read();
+    pub async fn get_next_api_url_hash(&self) -> Option<[u8; 32]> {
+        let api_url_list = self.api_url_list.read().await;
         if api_url_list.is_empty() {
             return None;
         }
         match self.rotation_strategy {
             APIURLRotationStrategy::RoundRobin => {
-                let mut index = self.current_api_url_index.blocking_write();
+                let mut index = self.current_api_url_index.write().await;
                 let api_url = &api_url_list[*index % api_url_list.len()];
                 *index += 1;
                 self.api_url_string_to_hash.get(api_url).map(|h| *h)
@@ -121,7 +121,7 @@ impl PsyWorkerAPIURLManager {
                 self.api_url_string_to_hash.get(api_url).map(|h| *h)
             }
             APIURLRotationStrategy::ContinueUntilFailure => {
-                let current_index = *self.current_api_url_index.blocking_read();
+                let current_index = *self.current_api_url_index.read().await;
                 let api_url = &api_url_list[current_index % api_url_list.len()];
                 let api_url_hash = match self.api_url_string_to_hash.get(api_url) {
                     Some(h) => *h,
@@ -130,7 +130,7 @@ impl PsyWorkerAPIURLManager {
 
                 if self.api_url_failed_attempts.get(&api_url_hash).is_some() {
                     // If there was a failure reported, move to the next URL
-                    let mut index = self.current_api_url_index.blocking_write();
+                    let mut index = self.current_api_url_index.write().await;
                     *index += 1;
                     let next_api_url = &api_url_list[*index % api_url_list.len()];
                     self.api_url_string_to_hash.get(next_api_url).map(|h| *h)

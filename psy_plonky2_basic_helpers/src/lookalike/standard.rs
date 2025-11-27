@@ -7,7 +7,7 @@ pub fn get_guta_type_c_lookalike_circuit_data<C: GenericConfig<D>, const D: usiz
 where
     C::Hasher: AlgebraicHasher<C::F>,
 {
-    get_lookalike_custom::<C, D>(QCircuitCommonGatesType::C, 13, 15)
+    get_lookalike_custom::<C, D>(QCircuitCommonGatesType::C, 13, 4)
 }
 
 pub fn get_guta_type_c_common_data<C: GenericConfig<D>, const D: usize>(
@@ -23,7 +23,7 @@ pub fn get_agg_state_transition_type_d_lookalike_circuit_data<C: GenericConfig<D
 where
     C::Hasher: AlgebraicHasher<C::F>,
 {
-    get_lookalike_custom::<C, D>(QCircuitCommonGatesType::D, 13, 19)
+    get_lookalike_custom::<C, D>(QCircuitCommonGatesType::D, 13, 4)
 }
 
 pub fn get_agg_state_transition_type_d_common_data<C: GenericConfig<D>, const D: usize>(
@@ -39,7 +39,7 @@ pub fn get_agg_user_registration_deploy_guta_type_f_lookalike_circuit_data<C: Ge
 where
     C::Hasher: AlgebraicHasher<C::F>,
 {
-    get_lookalike_custom::<C, D>(QCircuitCommonGatesType::F, 12, 19)
+    get_lookalike_custom::<C, D>(QCircuitCommonGatesType::F, 14, 4)
 }
 
 pub fn get_agg_user_registration_deploy_guta_type_f_common_data<C: GenericConfig<D>, const D: usize>(

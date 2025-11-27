@@ -369,7 +369,13 @@ impl<
             realm_sub_id: self.config.realm_sub_id_u64 as u16,
         };
 
-        let jobs_for_queue: Vec<Vec<PsyProvingJobMetadataWithJobId<N::QHash, QProvingJobDataID>>> = self
+        tracing::info!(
+            "Finalizing GUTA updates gatherer for pending id {}, start root {:?}, end root {:?}",
+            self.status.unique_pending_id,
+            self.start_global_user_tree_root,
+            end_global_user_tree_root
+        );
+        let jobs_for_queue: anyhow::Result<Vec<Vec<PsyProvingJobMetadataWithJobId<N::QHash, QProvingJobDataID>>>> = self
             .guta_planner
             .finalize_with_reward_ids(
                 &realm_identifier,
@@ -384,7 +390,21 @@ impl<
                 self.status.last_committed_checkpoint_leaf.stats.qfhash::<N::HasherBase>(),
                 self.config.coordinator_guta_updates_circuit_whitelist,
             )
-            .await?;
+            .await;
+        if jobs_for_queue.is_err() {
+            tracing::error!(
+                "Error finalizing GUTA updates gatherer for pending id {}: {:?}",
+                self.status.unique_pending_id,
+                jobs_for_queue.as_ref().err()
+            );
+            anyhow::bail!("Error finalizing GUTA updates gatherer: {:?}", jobs_for_queue.err());
+        }
+        let jobs_for_queue = jobs_for_queue?;
+        tracing::info!(
+            "Finalized GUTA updates gatherer for pending id {}, total jobs created: {}",
+            self.status.unique_pending_id,
+            jobs_for_queue.iter().map(|v| v.len()).sum::<usize>()
+        );
 
         let added_proofs = jobs_for_queue.iter().map(|v| v.len() as u64).sum::<u64>();
         let added_proofs_felt = N::F::from_u64_value(added_proofs);
@@ -413,6 +433,10 @@ impl<
                 .map_err(|e| anyhow::anyhow!("error writing last old realm roots {:?}", e))?;
             *last_old_roots = self.old_realm_roots;
         }
+        tracing::info!(
+            "GUTA updates gatherer for pending id {} finalized successfully.",
+            self.status.unique_pending_id
+        );
         Ok(output)
     }
 }

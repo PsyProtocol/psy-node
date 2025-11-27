@@ -198,7 +198,7 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std
         mut backup_file: FileSystem::File,
         allow_create_file: bool,
     ) -> anyhow::Result<Self> {
-        let (checkpoint_tree_start, checkpoint_tree_end, hash_offset, file_size, leaf_nodes) =
+        let (checkpoint_tree_start, checkpoint_tree_end, hash_offset, file_size, mut leaf_nodes) =
             setup_checkpoint_backup_file_dashmap::<Hash, FileSystem::File>(&mut backup_file, allow_create_file).await?;
         let file_size_minus_magic = if file_size >= CHECKPOINT_BACKUP_MAGIC_LEN as u64 {
             file_size - CHECKPOINT_BACKUP_MAGIC_LEN as u64
@@ -209,12 +209,13 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std
         let next_backup_index = hash_offset;
         let checkpoint_tree = Arc::new(PsyDashMemoryAppendOnlyMerkleStore::<Hasher, Hash>::new(checkpoint_tree_height));
 
+        leaf_nodes.sort_by_key(|f| f.index);
         let merkle_proof = checkpoint_tree_store
             .checkpoint_tree_get_merkle_proof(checkpoint_tree_start, checkpoint_tree_start)
             .await?;
         checkpoint_tree.injest_merkle_proof(&merkle_proof)?;
         for leaf in leaf_nodes.iter() {
-            checkpoint_tree.set_leaf_no_proof(leaf.index, leaf.value);
+            checkpoint_tree.append_leaf(leaf.index, leaf.value)?;
         }
         let is_empty = checkpoint_tree_end == checkpoint_tree_start;
         if !is_empty {
@@ -298,16 +299,29 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std
     }
     pub async fn append_checkpoint_leaf_hash(&mut self, checkpoint_id: u64, checkpoint_hash: Hash) -> anyhow::Result<DeltaMerkleProofCore<Hash>> {
         if checkpoint_id != self.next_backup_checkpoint_id {
+
+            if checkpoint_id == 0 && checkpoint_hash == self.checkpoint_tree.get_leaf_value(checkpoint_id) {
+                tracing::info!(
+                    "Skipping appending checkpoint id {} to checkpoint tree backup file at path {} since it is already present",
+                    checkpoint_id,
+                    self.backup_file_path
+                );
+                return Ok(self.checkpoint_tree.set_leaf(checkpoint_id, checkpoint_hash));
+            }
             anyhow::bail!(
-                "Can only append checkpoint ids in sequential order. Expected {}, got {}",
+                "Can only append checkpoint ids in sequential order. Expected {}, got {} (old_leaf: {:?}, new_leaf: {:?})",
                 self.next_backup_checkpoint_id,
-                checkpoint_id
+                checkpoint_id,
+                self.checkpoint_tree.get_leaf_value(checkpoint_id),
+                checkpoint_hash
             );
         }
         self.backup_file.write_u64_le(checkpoint_id).await?;
         let checkpoint_hash_bytes = checkpoint_hash.into_owned_32bytes();
         self.backup_file.write_all(&checkpoint_hash_bytes).await?;
         self.file_system.file_like_fs_flush_file_with_path(&self.backup_file_path, &mut self.backup_file).await?;
+        tracing::info!("Appended checkpoint id {} to checkpoint tree backup file at path {}", checkpoint_id, self.backup_file_path);
+        self.backup_file.flush().await?;
         self.next_backup_index += 1;
         if self.next_backup_index >= self.max_checkpoints_to_keep {
             self.next_backup_index = 0;
@@ -320,7 +334,7 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std
             self.min_backed_up_checkpoint_id += 1;
         }
         self.next_backup_checkpoint_id = checkpoint_id + 1;
-        Ok(self.checkpoint_tree.set_leaf(checkpoint_id, checkpoint_hash))
+        Ok(self.checkpoint_tree.append_leaf(checkpoint_id, checkpoint_hash)?)
     }
 
     pub async fn populate_from_database<CheckpointTreeReader: PsyNodeCheckpointTreeDatabaseReader<Hash>>(
@@ -330,8 +344,17 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std
         start_checkpoint_id: u64,
         count: usize,
     ) -> anyhow::Result<()> {
+        tracing::info!(
+            "Populating checkpoint tree backup manager from database, starting at checkpoint id {}, count {}, batch size {}",
+            start_checkpoint_id,
+            count,
+            batch_size
+        );
         if batch_size == 0 {
             return Err(anyhow::anyhow!("Batch size cannot be zero"));
+        }
+        if count == 0 {
+            return Ok(());
         }
         let checkpoint_tree_height = self.checkpoint_tree.get_height();
         let start_merkle_proof = checkpoint_tree_reader

@@ -248,6 +248,8 @@ pub async fn gatherer_runner<
 
                     if responder.send(builder.finalize().await?).is_err() {
                         tracing::error!("GATHERER: Failed to send data to processor. The receiver was dropped.");
+                    }else{
+                        tracing::info!("GATHERER: Successfully handed over data to processor.");
                     }
                     if is_stopped == false {
                         tracing::info!("GATHERER: Stopping as requested.");
@@ -299,7 +301,7 @@ pub async fn gatherer_runner_for_tree<
 ) -> anyhow::Result<()> {
     loop {
         let mut builder = Builder::create_new_with_tree(&mut tree, queue_key.unique_id, create_builder_config.clone()).await?;
-        tracing::info!("GATHERER: Starting new gathering phase.");
+        tracing::info!("GATHERER_{QUEUE_TOPIC_ID}: Starting new gathering phase.");
         'gathering: loop {
             tokio::select! {
                 // Biased ensures we check for a processor trigger first for better responsiveness.
@@ -307,16 +309,20 @@ pub async fn gatherer_runner_for_tree<
 
                 // A trigger from the Processor was received.
                 Some(responder) = trigger_rx.recv() => {
-                    tracing::info!("GATHERER: Interrupted by Processor. Preparing to hand over");
+                    tracing::info!("GATHERER_{QUEUE_TOPIC_ID}: Interrupted by Processor. Preparing to hand over");
                     queue_key = queue_key_helper.get_queue_key()?;
                     let is_stopped = queue_key_helper.is_active()?;
-                    tracing::info!("GATHERER: Current unique ID: {}, is_active: {}", queue_key.unique_id, is_stopped);
+                    tracing::info!("GATHERER_{QUEUE_TOPIC_ID}: Current unique ID: {}, is_active: {}", queue_key.unique_id, is_stopped);
 
-                    if responder.send(builder.finalize_with_tree(&mut tree).await?).is_err() {
-                        tracing::error!("GATHERER: Failed to send data to processor. The receiver was dropped.");
+                    let finalized_output = builder.finalize_with_tree(&mut tree).await?;
+                    tracing::info!("GATHERER_{QUEUE_TOPIC_ID}: Finalized output prepared, sending to processor.");
+                    if responder.send(finalized_output).is_err() {
+                        tracing::error!("GATHERER_{QUEUE_TOPIC_ID}: Failed to send data to processor. The receiver was dropped.");
+                    }else{
+                        tracing::info!("GATHERER_{QUEUE_TOPIC_ID}: Successfully handed over data to processor.");
                     }
                     if is_stopped == false {
-                        tracing::info!("GATHERER: Stopping as requested.");
+                        tracing::info!("GATHERER_{QUEUE_TOPIC_ID}: Stopping as requested.");
                         return Ok(());
                     }
 
@@ -328,14 +334,14 @@ pub async fn gatherer_runner_for_tree<
                     match msgs {
                         Ok(d) => {
                             if d.len() != 0 {
-                                tracing::info!("GATHERER: Received {} items from queue.", d.len());
+                                tracing::info!("GATHERER_{QUEUE_TOPIC_ID}: Received {} items from queue.", d.len());
                                 builder.update_from_many_queue_items_with_tree(&mut tree, d).await?;
                             }
                             tokio::time::sleep(Duration::from_millis(10)).await;
                             //builder.update_from_queue_item(d).await?;
                         },
                         Err(err) => {
-                            tracing::error!("GATHERER: Error receiving message: {}", err);
+                            tracing::error!("GATHERER_{QUEUE_TOPIC_ID}: Error receiving message: {}", err);
                             // Potentially break or sleep before retrying
                             tokio::time::sleep(Duration::from_secs(1)).await;
                         },
@@ -343,6 +349,6 @@ pub async fn gatherer_runner_for_tree<
                 }
             }
         }
-        tracing::info!("GATHERER: Handoff complete. Cycle restarting.");
+        tracing::info!("GATHERER_{QUEUE_TOPIC_ID}: Handoff complete. Cycle restarting.");
     }
 }

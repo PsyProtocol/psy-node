@@ -6,7 +6,7 @@ use parth_core::data::db::{row::{QDatabaseDoubleIdTableRow, QDatabaseDoubleIdTab
 use psy_serialize::PsySerializeCanonicalAsyncSafe;
 use scylla::{client::session::Session, statement::{batch::Batch, prepared::PreparedStatement, Statement}};
 
-use crate::{constants::{INSERT_DOUBLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE, SELECT_DOUBLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE}, tables::traits::ScyllaStandardPreparedTableStatements, utils::{convert_checkpoint_id_to_i64, convert_i64_to_checkpoint_id, i64_to_u64_exact, u64_to_i64_exact}};
+use crate::{constants::{INSERT_DOUBLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE, SELECT_DOUBLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE}, table_creator::create_table_if_not_exists, tables::traits::ScyllaStandardPreparedTableStatements, utils::{convert_checkpoint_id_to_i64, convert_i64_to_checkpoint_id, i64_to_u64_exact, u64_to_i64_exact}};
 
 
 
@@ -59,18 +59,18 @@ impl ScyllaGenericObjectDoubleIdTablePreparedStatements {
         })
     }
     pub async fn create_table(session: Arc<Session>, keyspace: &str, table_name: &str, _table_key: QDatabaseTableRoutingKey) -> anyhow::Result<()> {
-        session
-            .query_unpaged(
-                format!("CREATE TABLE IF NOT EXISTS {}.{} (
+       create_table_if_not_exists(
+                &session,
+                keyspace,
+                table_name,
+                &format!("CREATE TABLE IF NOT EXISTS {}.{} (
                     obj_id BIGINT,
                     secondary_id BIGINT,
                     checkpoint_id BIGINT,
                     value BLOB,
                     PRIMARY KEY ((obj_id, secondary_id), checkpoint_id)
                 ) WITH CLUSTERING ORDER BY (checkpoint_id DESC)", keyspace, table_name),
-                &[],
             ).await?;
-        session.await_schema_agreement().await?;
         Ok(())
     }
     pub async fn new_create_from_session(session: Arc<Session>, keyspace: &str, table_name: &str, table_key: QDatabaseTableRoutingKey) -> anyhow::Result<Self> {

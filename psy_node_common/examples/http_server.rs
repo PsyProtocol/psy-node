@@ -1,26 +1,34 @@
 use cf_utils::timer::DebugTimer;
 use jsonrpsee::{
-    core::RpcResult,
-    proc_macros::rpc,
-    server::{ServerBuilder, ServerHandle},
-    ws_client::{WsClient, WsClientBuilder},
-    http_client::{HttpClient, HttpClientBuilder},
+    RpcModule, core::RpcResult, http_client::{HttpClient, HttpClientBuilder}, proc_macros::rpc, server::{ServerBuilder, ServerHandle}, ws_client::{WsClient, WsClientBuilder}
 };
 use std::net::SocketAddr;
 use tower_http::cors::{Any, CorsLayer};
 
 #[rpc(server, client, namespace = "qed")]
-pub trait ExampleRPCTrait {
+pub trait ExampleRPCTrait1 {
     #[method(name = "get_sum")]
     async fn get_sum(&self, a: u64, b: u64) -> RpcResult<u64>;
+}
+
+#[rpc(server, client, namespace = "zpd")]
+pub trait ExampleRPCTrait2 {
+    #[method(name = "get_sub")]
+    async fn get_sub(&self, a: u64, b: u64) -> RpcResult<u64>;
 }
 
 pub struct ExampleServer;
 
 #[async_trait::async_trait]
-impl ExampleRPCTraitServer for ExampleServer {
+impl ExampleRPCTrait1Server for ExampleServer {
     async fn get_sum(&self, a: u64, b: u64) -> RpcResult<u64> {
         Ok(a + b)
+    }
+}
+#[async_trait::async_trait]
+impl ExampleRPCTrait2Server for ExampleServer {
+    async fn get_sub(&self, a: u64, b: u64) -> RpcResult<u64> {
+        Ok(a - b)
     }
 }
 
@@ -36,7 +44,10 @@ async fn run_server() -> anyhow::Result<SocketAddr> {
         .await?;
 
     let addr = server.local_addr()?;
-    let handle = server.start(ExampleServer.into_rpc());
+    let mut rpc_module = RpcModule::new(ExampleServer);
+    rpc_module.merge(ExampleRPCTrait1Server::into_rpc(ExampleServer))?;
+    rpc_module.merge(ExampleRPCTrait2Server::into_rpc(ExampleServer))?;
+    let handle = server.start(rpc_module);
 
     tokio::spawn(handle.stopped());
 
@@ -68,6 +79,8 @@ async fn test_client(addr: SocketAddr) -> anyhow::Result<()> {
     let http_client: HttpClient = HttpClientBuilder::default().build(&http_url)?;
     for _ in 0..10000 {
         let http_result: u64 = http_client.get_sum(a, b).await?;
+        let result_2 = http_client.get_sub(expected_result, b).await?;
+        assert_eq!(result_2, a);
         assert_eq!(http_result, expected_result);
     }
     timer.lap_batch("http", "get_sum", 10000);

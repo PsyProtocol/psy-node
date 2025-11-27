@@ -16,9 +16,11 @@ use psy_data::{
     }
 };
 
+use crate::worker::standard_worker_rpc::NodeEdgeWorkerRpcServer;
+
 
 #[rpc(server, client, namespace = "psy")]
-pub trait CoordinatorEdgeRpc<F, Hash, JobId, ZKProof> {
+pub trait CoordinatorEdgeRpc<F, Hash, JobId, ZKProof>: NodeEdgeWorkerRpcServer<Hash, JobId> {
     // Basic methods
     #[method(name = "register_user")]
     async fn register_user(&self, public_key: PZKPublicKeyInfo<Hash>) -> RpcResult<String>;

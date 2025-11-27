@@ -15,9 +15,7 @@ use scylla::{
 
 // Assuming these utility and constant modules exist in your project
 use crate::{
-    constants::INSERT_HASH_ID_TO_U64_VALUE_BATCH_SIZE,
-    tables::traits::ScyllaStandardPreparedTableStatements,
-    utils::{generate_batch_pre_prepared_statements, i64_to_u64_exact, u64_to_i64_exact},
+    constants::INSERT_HASH_ID_TO_U64_VALUE_BATCH_SIZE, table_creator::create_table_if_not_exists, tables::traits::ScyllaStandardPreparedTableStatements, utils::{generate_batch_pre_prepared_statements, i64_to_u64_exact, u64_to_i64_exact}
 };
 
 pub trait DatabaseHashId: PsySerializeCanonicalAsyncSafe + Q256BitHash + Sized {
@@ -78,9 +76,11 @@ impl ScyllaHashToManyIdsTablePreparedStatements {
     }
 
     pub async fn create_table(session: Arc<Session>, keyspace: &str, table_name: &str, _table_key: QDatabaseTableRoutingKey) -> anyhow::Result<()> {
-        session
-            .query_unpaged(
-                format!(
+        create_table_if_not_exists(
+                &session,
+                keyspace,
+                table_name,
+                &format!(
                     "CREATE TABLE IF NOT EXISTS {}.{} (
                     hash_id BLOB,
                     value_u64 BIGINT,
@@ -88,7 +88,6 @@ impl ScyllaHashToManyIdsTablePreparedStatements {
                 ) WITH CLUSTERING ORDER BY (value_u64 ASC)",
                     keyspace, table_name
                 ),
-                &[],
             )
             .await?;
         session.await_schema_agreement().await?;

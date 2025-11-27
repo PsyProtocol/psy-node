@@ -1,0 +1,12 @@
+coordinator_id: 0
+coordinator_sub_id: 0
+network: local-devnet
+verbose: true
+
+db_namespace: test123
+scylla_db_url: 127.0.0.1:9042
+nats_jetstream_url: nats://127.0.0.1:4222
+redis_url: redis://127.0.0.1:6379
+
+port: 1337
+listen: 127.0.0.1

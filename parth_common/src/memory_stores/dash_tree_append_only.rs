@@ -81,13 +81,14 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + Eq + PartialEq + Default + std
         if index >= max_leaves {
             anyhow::bail!("Tree is full, cannot append more leaves");
         }
-        if self.nodes.contains_key(&SimpleMerkleNodeKey::new(self.height, index)) {
-            anyhow::bail!("Leaf at index {} already exists", index);
+        if self.nodes.contains_key(&SimpleMerkleNodeKey::new(self.height, index+1)) {
+            anyhow::bail!("Leaf at index {} already exists, so we cannot append at the index before it", index+1);
         }
         let proof = self.set_leaf(index, leaf);
         self.roots.insert(proof.new_root, index);
         Ok(proof)
     }
+
     pub fn get_leaf_index_for_root(&self, root: Hash) -> Option<u64> {
         match self.roots.get(&root) {
             Some(v) => Some(*v),

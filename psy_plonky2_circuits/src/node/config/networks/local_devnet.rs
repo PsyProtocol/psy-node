@@ -1,16 +1,34 @@
-use parth_core::{crypto::hash::traits::{MerkleZeroHasher, ZeroableHash}, felt::{FromPrimitiveValuesFelt, ZeroableFelt}, pgoldilocks::{PoseidonHasher, QHashOut}};
+use parth_core::{
+    crypto::hash::traits::{MerkleHasher, MerkleZeroHasher, ZeroableHash},
+    felt::{FromPrimitiveValuesFelt, ZeroableFelt},
+    pgoldilocks::{PoseidonHasher, QHashOut},
+};
 use psy_core::{constants::protocol::DA_CHALLENGE_WINDOW, job::job_id::ProvingJobCircuitType};
-use psy_data::{config::network_config::{PsyNetworkChainConfig, PsyNodeCircuitFingerprintConfig}, genesis::genesis_block_setup::PsyGenesisBlockSetupData, v1::qdata::{checkpoint::PQEDCheckpointLeafStats, pm_jobs_completed_stats::PPMJobsCompletedStats, pm_rewards_commitment::PPMRewardCommitment}};
+use psy_data::{
+    config::network_config::PsyNodeCircuitFingerprintConfig,
+    genesis::genesis_block_setup::PsyGenesisBlockSetupData,
+    v1::qdata::{checkpoint::PQEDCheckpointLeafStats, pm_jobs_completed_stats::PPMJobsCompletedStats, pm_rewards_commitment::PPMRewardCommitment},
+};
 use psy_plonky2_basic_helpers::verifier::circuit_library::CircuitInfoLibraryCore;
 
 use crate::generated::cached_circuit_library::get_cached_circuit_library;
 type F = parth_core::PF;
 type Hash = parth_core::PHash;
+type Hasher = PoseidonHasher;
 pub fn get_psy_node_circuit_config_for_local_devnet() -> anyhow::Result<PsyNodeCircuitFingerprintConfig<Hash>> {
     let lib = get_cached_circuit_library::<F>();
-    let guta_circuit_whitelist_root = lib.get_group_inclusion_proof(ProvingJobCircuitType::GUTATwoGUTA, ProvingJobCircuitType::GUTATwoGUTA)?.root;
-    let register_users_circuit_whitelist_root = lib.get_group_inclusion_proof(ProvingJobCircuitType::AppendUserRegistrationTreeAggregate, ProvingJobCircuitType::AppendUserRegistrationTreeAggregate)?.root;
-    let deploy_contracts_circuit_whitelist_root = lib.get_group_inclusion_proof(ProvingJobCircuitType::BatchDeployContractsAggregate, ProvingJobCircuitType::BatchDeployContractsAggregate)?.root;
+    let guta_circuit_whitelist_root = lib
+        .get_group_inclusion_proof(ProvingJobCircuitType::GUTATwoGUTA, ProvingJobCircuitType::GUTATwoGUTA)?
+        .root;
+
+    let append_user_registration_tree_fingerprint = lib.get_fingerprint(ProvingJobCircuitType::AppendUserRegistrationTree)?;
+    let batch_deploy_contracts_fingerprint = lib.get_fingerprint(ProvingJobCircuitType::BatchDeployContracts)?;
+    let agg_state_transition_fingerprint = lib.get_fingerprint(ProvingJobCircuitType::BatchDeployContractsAggregate)?;
+
+    let register_users_circuit_whitelist_root = Hasher::two_to_one(&append_user_registration_tree_fingerprint, &agg_state_transition_fingerprint);
+
+    let deploy_contracts_circuit_whitelist_root = Hasher::two_to_one(&batch_deploy_contracts_fingerprint, &agg_state_transition_fingerprint);
+
     let checkpoint_state_transition_circuit_fingerprint = lib.get_fingerprint(ProvingJobCircuitType::GenerateRollupStateTransitionProof)?;
 
     Ok(PsyNodeCircuitFingerprintConfig {
@@ -20,7 +38,6 @@ pub fn get_psy_node_circuit_config_for_local_devnet() -> anyhow::Result<PsyNodeC
         checkpoint_state_transition_circuit_fingerprint,
     })
 }
-
 
 pub fn get_genesis_block_setup_data_for_local_devnet() -> anyhow::Result<PsyGenesisBlockSetupData<F, Hash>> {
     Ok(PsyGenesisBlockSetupData {
@@ -38,12 +55,12 @@ pub fn get_genesis_block_setup_data_for_local_devnet() -> anyhow::Result<PsyGene
             },
             block_time: F::from_u64_value(1764248609350u64),
             random_seed: QHashOut::from_values(1, 2, 3, 4),
-            pm_rewards_commitment: PPMRewardCommitment{
+            pm_rewards_commitment: PPMRewardCommitment {
                 register_users_root: Hash::get_zero_value(),
                 gutas_root: Hash::get_zero_value(),
                 deploy_contracts_root: Hash::get_zero_value(),
             },
-            da_challenges_claimed:[ F::ZERO_VALUE; DA_CHALLENGE_WINDOW],
+            da_challenges_claimed: [F::ZERO_VALUE; DA_CHALLENGE_WINDOW],
         },
         deposit_tree_root: PoseidonHasher::get_zero_hash(32),
         withdrawal_tree_root: PoseidonHasher::get_zero_hash(32),

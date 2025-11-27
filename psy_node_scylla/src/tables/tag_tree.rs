@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use futures::future::join_all;
 use parth_core::{
     crypto::hash::{
-        tag_tree::{hash_tag_tree_node, TagTreeMerkleProof, TagTreeNodePreimage, TagTreeStorageNode, TagTreeProofNode},
+        tag_tree::{hash_tag_tree_node, TagTreeMerkleProof, TagTreeNodePreimage, TagTreeProofNode, TagTreeStorageNode},
         traits::MerkleHasher,
     },
     data::{
@@ -20,9 +20,7 @@ use scylla::{
 };
 
 use crate::{
-    constants::{INSERT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE, SELECT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE},
-    tables::traits::ScyllaStandardPreparedTableStatements,
-    utils::{u64_to_i64_exact, u8_to_i8_exact},
+    constants::{INSERT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE, SELECT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE}, table_creator::create_table_if_not_exists, tables::traits::ScyllaStandardPreparedTableStatements, utils::{u8_to_i8_exact, u64_to_i64_exact}
 };
 
 #[derive(Clone)]
@@ -79,10 +77,12 @@ impl ScyllaTagTreeNodesPreparedStatements {
         })
     }
     pub async fn create_table(session: &Session, keyspace: &str, table_name: &str, _table_key: QDatabaseTableRoutingKey) -> anyhow::Result<()> {
-        session
-            .query_unpaged(
-                format!(
-                    "CREATE TABLE IF NOT EXISTS {}.{} (
+        create_table_if_not_exists(
+                &session,
+                keyspace,
+                table_name,
+                &format!(
+                        "CREATE TABLE IF NOT EXISTS {}.{} (
                     unique_pending_id BIGINT,
                     level TINYINT,
                     node_index BIGINT,
@@ -90,12 +90,10 @@ impl ScyllaTagTreeNodesPreparedStatements {
                     node_tag BLOB,
                     PRIMARY KEY ((unique_pending_id), level, node_index)
                 ) WITH CLUSTERING ORDER BY (level ASC, node_index ASC)",
-                    keyspace, table_name
-                ),
-                &[],
-            )
-            .await?;
-        session.await_schema_agreement().await?;
+                        keyspace, table_name
+                    ),
+                )
+                .await?;
         Ok(())
     }
     pub async fn new_create_from_session(

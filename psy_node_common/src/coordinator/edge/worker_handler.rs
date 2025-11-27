@@ -7,7 +7,7 @@ use parth_core::{
         secp256k1::{QEDCompressedSecp256K1Signature, Secp256K1Verifier, SimpleTimedRequest},
     },
     data::queue::queue_key::QPBaseQueueType,
-    protocol::core_types::{Q256BitHash, QNetworkTypesConfig, QZKProofVerifier},
+    protocol::core_types::{Q256BitHash, QNetworkTypesConfig, QZKProofPublicInputsHasherReader, QZKProofVerifier},
 };
 use psy_core::job::job_id::QProvingJobDataID;
 use psy_data::
@@ -281,9 +281,26 @@ impl<
             }
         };
 
+        let simple_value = N::HasherBase::two_to_one(&metadata.expected_public_inputs_hash, &tag);
+        tracing::info!(
+            "Simple value (two_to_one of expected_public_inputs_hash and tag): {:?}",
+            hex::encode(&simple_value.into_owned_32bytes())
+        );
+
         let reward_tree_value = metadata.get_new_rewards_tag_tree_value::<N::HasherBase>(tag, &children_reward_tree_values)?;
 
         let full_expected_public_inputs_hash = N::HasherBase::two_to_one(&metadata.expected_public_inputs_hash, &reward_tree_value);
+        tracing::info!(
+            "Verifying proof for job id: {:?} with expected public inputs hash: {:?} (from metadata: {:?})",
+            job_id,
+            hex::encode(&full_expected_public_inputs_hash.into_owned_32bytes()),
+            hex::encode(&metadata.expected_public_inputs_hash.into_owned_32bytes())
+        );
+        let debug_public_inputs = N::ZKVerifier::get_proof_public_inputs_hash(&N::ZKVerifier::try_proof_from_slice(&proof_bytes)?)?;
+        tracing::info!(
+            "Debug: extracted public inputs hash from proof: {:?}",
+            hex::encode(&debug_public_inputs.into_owned_32bytes())
+        );
 
         self.proof_verifier.verify_zk_proof_from_slice_check_public_inputs_hash(
             job_id.circuit_type.to_u8() as u32,

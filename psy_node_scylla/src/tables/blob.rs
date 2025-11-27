@@ -6,7 +6,7 @@ use futures::future::join_all;
 use parth_core::data::db::{data_types::{BiDirectionalMappingRow, QDatabasePrimitiveKey}, table::QDatabaseTableRoutingKey};
 use scylla::{client::session::Session, statement::{batch::Batch, prepared::PreparedStatement, Statement}};
 
-use crate::{constants::{INSERT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE, SELECT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE}, tables::traits::ScyllaStandardPreparedTableStatements};
+use crate::{constants::{INSERT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE, SELECT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE}, table_creator::create_table_if_not_exists, tables::traits::ScyllaStandardPreparedTableStatements};
 
 
 #[derive(Clone)]
@@ -61,9 +61,11 @@ impl ScyllaBlobToBlobTablePreparedStatements {
         })
     }
     pub async fn create_table(session: Arc<Session>, keyspace: &str, table_name: &str, _table_key: QDatabaseTableRoutingKey) -> anyhow::Result<()> {
-        session
-            .query_unpaged(
-                format!(
+        create_table_if_not_exists(
+                &session,
+                keyspace,
+                table_name,
+                &format!(
                     "CREATE TABLE IF NOT EXISTS {}.{} (
                     obj_id blob,
                     value blob,
@@ -71,7 +73,6 @@ impl ScyllaBlobToBlobTablePreparedStatements {
                 )",
                     keyspace, table_name
                 ),
-                &[],
             )
             .await?;
         session.await_schema_agreement().await?;

@@ -3,6 +3,8 @@ use plonky2::{hash::hash_types::HashOut, plonk::{config::{AlgebraicHasher, Gener
 use psy_core::job::job_id::ProvingJobCircuitType;
 use psy_plonky2_basic_helpers::verifier::generic_circuit_library::GenericCircuitVerifier;
 
+use crate::generated::{cached_circuit_library::get_cached_circuit_library, cached_common_data::get_cached_common_data_library};
+
 #[derive(Clone, Debug)]
 pub struct PsyPlonky2ZKVerifier<C: GenericConfig<D>, const D: usize> {
     pub gcv: GenericCircuitVerifier<C, D>,
@@ -12,6 +14,18 @@ impl<C: GenericConfig<D>, const D: usize> PsyPlonky2ZKVerifier<C, D> {
         Self {
             gcv,
         }
+    }
+    pub fn from_cached() -> Self 
+    where
+        C::Hasher: AlgebraicHasher<C::F>,
+    {
+        let a = get_cached_circuit_library();
+        let b = get_cached_common_data_library();
+        let gcv = GenericCircuitVerifier::<C, D>{
+            library: a,
+            common: b
+        };
+        Self::new(gcv)
     }
 }
 impl<C: GenericConfig<D>, const D: usize> QZKProofPublicInputsHasherReader<QHashOut<C::F>, ProofWithPublicInputs<C::F, C, D>> for PsyPlonky2ZKVerifier<C, D> 

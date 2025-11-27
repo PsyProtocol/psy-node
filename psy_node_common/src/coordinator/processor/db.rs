@@ -26,7 +26,7 @@ use psy_data::{
         checkpoint_transition_hash::CheckpointStateHashTransition,
         verifiable_checkpoint_transition::{PsyVerifiableCheckpointTransition, PsyVerifiableCheckpointTransitionWithProof},
     },
-    v1::qdata::{contract::PsyDeployContractQueueItem, public_key::PZKPublicKeyInfo},
+    v1::qdata::{checkpoint::QEDL2BlockState, contract::PsyDeployContractQueueItem, public_key::PZKPublicKeyInfo},
 };
 use psy_io::tokio::TokioLikeFileSystem;
 use psy_node_core::{
@@ -40,7 +40,7 @@ use psy_node_core::{
 };
 
 use crate::{
-    backup::{checkpoint_tree::CheckpointTreeBackupManager, coordinator::generate_coordinator_output_from_backups},
+    backup::{checkpoint_tree::{CheckpointTreeBackupManager, create_new_checkpoint_backup_manager_from_file_path}, coordinator::generate_coordinator_output_from_backups},
     constants::queue::{
         PQ_COORDINATOR_DEPLOY_CONTRACT_QUEUE_TOPIC_ID, PQ_COORDINATOR_REGISTER_USER_PUBLIC_KEY_QUEUE_TOPIC_ID,
         PQ_COORDINATOR_SUBMIT_REALM_GUTA_UPDATE_QUEUE_TOPIC_ID,
@@ -140,6 +140,7 @@ impl<
         let actual_latest_applied_checkpoint_id: u64 = self.db.get_latest_checkpoint_id().await?;
         let (last_unique_pending_id, _last_unique_proc_checkpoint_id): (u64, QCoreProcCheckpointUniqueId) =
             self.db.get_current_unique_pending_id().await?;
+            
         let expected_checkpoint_id: Option<u64> = self.db.get_checkpoint_id_for_unique_pending_id(last_unique_pending_id).await?;
         let database_check_state = if expected_checkpoint_id.is_none() {
             // needs genesis
@@ -199,7 +200,7 @@ impl<
             gathering_proc_checkpoint_unique_id: current_core_proc_unique_pending_id,
         };
 
-        let mut checkpoint_tree_backup_manager = CheckpointTreeBackupManager::new_from_file_path(
+        let mut checkpoint_tree_backup_manager = create_new_checkpoint_backup_manager_from_file_path(
             file_system.clone(),
             STALE_CHECKPOINT_AGE_REALM_TO_COORDINATOR_PROOF,
             N::CHECKPOINT_TREE_HEIGHT,
@@ -212,13 +213,33 @@ impl<
             .sync_from_database::<S>(&db, 1000, last_committed_checkpoint_id)
             .await?;
 
-        let shared_status = PsyCoordinatorProcessorSharedStatus {
-            last_committed_checkpoint_id,
-            unique_pending_id: current_unique_pending_id,
-            last_committed_checkpoint_leaf: db.get_checkpoint_leaf_data(last_committed_checkpoint_id).await?,
-            last_committed_checkpoint_state_roots: db.get_checkpoint_global_state_roots(last_committed_checkpoint_id).await?,
-            should_revert_last_changes: false,
-            block_state: db.get_l2_block_state(last_committed_checkpoint_id).await?,
+        let shared_status = if last_committed_checkpoint_id == 0 {
+            PsyCoordinatorProcessorSharedStatus {
+                last_committed_checkpoint_id,
+                unique_pending_id: current_unique_pending_id,
+                last_committed_checkpoint_leaf: genesis_verifiable_state_transition.checkpoint_leaf.to_checkpoint_leaf::<N::HasherBase>(),
+                last_committed_checkpoint_state_roots: genesis_verifiable_state_transition.checkpoint_leaf.global_state_roots.clone(),
+                should_revert_last_changes: false,
+                block_state: QEDL2BlockState {
+                    checkpoint_id: 0,
+                    next_add_withdrawal_id: 0,
+                    next_process_withdrawal_id: 0,
+                    next_deposit_id: 0,
+                    total_deposits_claimed_epoch: 0,
+                    next_user_id: 0,
+                    end_balance: 0,
+                    next_contract_id: 0,
+                },
+            }
+        } else {
+            PsyCoordinatorProcessorSharedStatus {
+                last_committed_checkpoint_id,
+                unique_pending_id: current_unique_pending_id,
+                last_committed_checkpoint_leaf: db.get_checkpoint_leaf_data(last_committed_checkpoint_id).await?,
+                last_committed_checkpoint_state_roots: db.get_checkpoint_global_state_roots(last_committed_checkpoint_id).await?,
+                should_revert_last_changes: false,
+                block_state: db.get_l2_block_state(last_committed_checkpoint_id).await?,
+            }
         };
 
         temp_db
@@ -308,8 +329,10 @@ impl<
         })
     }
 
-
-    pub async fn ensure_genesis_applied(&mut self, genesis_block_update: PsyPreparedCoordinatorBlockStateUpdates<N::F, N::QHash>) -> anyhow::Result<()> {
+    pub async fn ensure_genesis_applied(
+        &mut self,
+        genesis_block_update: PsyPreparedCoordinatorBlockStateUpdates<N::F, N::QHash>,
+    ) -> anyhow::Result<()> {
         // Check if genesis has already been applied
         let database_check_state = self.get_database_check_state().await?;
         if database_check_state == DatabaseCheckState::NeedsGenesis {
@@ -326,7 +349,10 @@ impl<
         let database_check_state = self.get_database_check_state().await?;
         if database_check_state == DatabaseCheckState::NeedsGenesis {
             tracing::info!("Applying genesis block setup data to coordinator processor database...");
-            let (_, genesis_block_update) = GenesisDatabaseDataBuilder::setup_for_coordinator::<N::HasherBase, N>(&genesis_data, self.circuit_fingerprint_config.checkpoint_state_transition_circuit_fingerprint)?;
+            let (_, genesis_block_update) = GenesisDatabaseDataBuilder::setup_for_coordinator::<N::HasherBase, N>(
+                &genesis_data,
+                self.circuit_fingerprint_config.checkpoint_state_transition_circuit_fingerprint,
+            )?;
             self.commit_state(genesis_block_update, ProvingJobCircuitType::GenesisBlockCheckpointStateTransition, vec![])
                 .await?;
             tracing::info!("Genesis block setup data applied to coordinator processor database.");
@@ -394,7 +420,7 @@ impl<
         }
 
         let old_checkpoint_root = self.db.checkpoint_tree_get_root_hash(checkpoint_id).await?;
-        if old_checkpoint_root != coordinator_update.old_base.checkpoint_tree_root {
+        if checkpoint_id != 0 && old_checkpoint_root != coordinator_update.old_base.checkpoint_tree_root {
             anyhow::bail!("Old checkpoint tree root hash mismatch when committing coordinator state update to database. Computed hash: {:?}, expected hash: {:?}", old_checkpoint_root, coordinator_update.old_base.checkpoint_tree_root);
         }
 
@@ -431,6 +457,8 @@ impl<
         self.db
             .set_unique_pending_id_checkpoint_id_mapping(unique_pending_id, checkpoint_id)
             .await?;
+        self.db.set_checkpoint_id_to_unique_pending_id_mapping(checkpoint_id, unique_pending_id, &self.ids.proc_checkpoint_unique_id).await?;
+        
         // START STANDARD STATE UPDATES (technically these can be done in any order
         // after the above two are done) start contract updates
         self.db
@@ -500,7 +528,7 @@ impl<
         self.last_committed.update_for_block::<N::HasherBase>(
             coordinator_update.new_base.block_state,
             verifiable_checkpoint_transition.checkpoint_leaf,
-            verifiable_checkpoint_transition.state_transition.checkpoint_transition
+            verifiable_checkpoint_transition.state_transition.checkpoint_transition,
         )?;
 
         // This just updates the RwLock protected shared status, this is ok because we
@@ -513,7 +541,6 @@ impl<
             coordinator_update.new_base.block_state,
             false,
         )?;
-
 
         Ok(())
     }

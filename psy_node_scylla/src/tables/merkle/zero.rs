@@ -21,9 +21,9 @@ use scylla::{
     statement::{batch::Batch, prepared::PreparedStatement, Statement},
 };
 
-use crate::utils::{
-    calc_best_batch_size, convert_checkpoint_id_to_i64, generate_batch_prepared_statement, i64_to_u64_exact, u64_to_i64_exact, u8_to_i8_exact,
-};
+use crate::{table_creator::create_table_if_not_exists, utils::{
+    calc_best_batch_size, convert_checkpoint_id_to_i64, generate_batch_prepared_statement, i64_to_u64_exact, u8_to_i8_exact, u64_to_i64_exact
+}};
 
 #[derive(Clone)]
 pub struct ScyllaMerkleNodesZeroPreparedStatements {
@@ -84,9 +84,11 @@ impl ScyllaMerkleNodesZeroPreparedStatements {
     /// Creates the table if it doesn't exist.
     /// No changes needed; schema is optimal for operations.
     pub async fn create_table(session: Arc<Session>, keyspace: &str, table_name: &str, _table_key: QDatabaseTableRoutingKey) -> anyhow::Result<()> {
-        session
-            .query_unpaged(
-                format!(
+        create_table_if_not_exists(
+                &session,
+                keyspace,
+                table_name,
+                &format!(
                     "CREATE TABLE IF NOT EXISTS {}.{} (
                     level TINYINT,
                     node_index BIGINT,
@@ -96,10 +98,8 @@ impl ScyllaMerkleNodesZeroPreparedStatements {
                 ) WITH CLUSTERING ORDER BY (node_index ASC, checkpoint_id DESC)",
                     keyspace, table_name
                 ),
-                &[],
             )
             .await?;
-        session.await_schema_agreement().await?;
         Ok(())
     }
 

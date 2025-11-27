@@ -29,8 +29,7 @@ use scylla::{
 };
 
 use crate::{
-    tables::traits::ScyllaStandardPreparedTableStatements,
-    utils::{calc_best_batch_size, convert_checkpoint_id_to_i64, generate_batch_prepared_statement, u64_to_i64_exact, u8_to_i8_exact},
+    table_creator::create_table_if_not_exists, tables::traits::ScyllaStandardPreparedTableStatements, utils::{calc_best_batch_size, convert_checkpoint_id_to_i64, generate_batch_prepared_statement, u8_to_i8_exact, u64_to_i64_exact}
 };
 
 
@@ -84,9 +83,11 @@ impl ScyllaDoubleMerkleNodesPreparedStatements {
         })
     }
     pub async fn create_table(session: Arc<Session>, keyspace: &str, table_name: &str, _table_key: QDatabaseTableRoutingKey) -> anyhow::Result<()> {
-        session
-            .query_unpaged(
-                format!(
+        create_table_if_not_exists(
+                &session,
+                keyspace,
+                table_name,
+                &format!(
                     "CREATE TABLE IF NOT EXISTS {}.{} (
                     tree_id BIGINT,
                     tree_sub_id BIGINT,
@@ -98,7 +99,6 @@ impl ScyllaDoubleMerkleNodesPreparedStatements {
                 ) WITH CLUSTERING ORDER BY (level ASC, node_index ASC, checkpoint_id DESC)",
                     keyspace, table_name
                 ),
-                &[],
             )
             .await?;
         session.await_schema_agreement().await?;

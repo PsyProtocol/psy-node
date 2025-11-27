@@ -78,7 +78,7 @@ pub trait QZKProofVerifier<Hash: PartialEq, Proof>: QZKProofPublicInputsHasherRe
     fn verify_zk_proof(&self, circuit_type: u32, proof: &Proof) -> anyhow::Result<Hash>;
     fn verify_zk_proof_check_public_inputs_hash(&self, circuit_type: u32, proof: &Proof, expected_public_inputs_hash: Hash) -> anyhow::Result<()> {
         if self.verify_zk_proof(circuit_type, proof)? != expected_public_inputs_hash {
-            return Err(anyhow::anyhow!("ZK Proof verification failed"));
+            return Err(anyhow::anyhow!("ZK Proof verification failed: invalid expected public inputs hash"));
         }
         Ok(())
     }
@@ -90,11 +90,11 @@ pub trait QZKProofVerifier<Hash: PartialEq, Proof>: QZKProofPublicInputsHasherRe
     ) -> anyhow::Result<()> {
         let proof = Self::try_proof_from_slice(proof_bytes)?;
         if Self::get_proof_public_inputs_hash(&proof)? != expected_public_inputs_hash {
-            return Err(anyhow::anyhow!("ZK Proof verification failed"));
+            return Err(anyhow::anyhow!("ZK Proof verification failed: invalid expected public inputs hash"));
         }
 
         if self.verify_zk_proof(circuit_type, &proof)? != expected_public_inputs_hash {
-            return Err(anyhow::anyhow!("ZK Proof verification failed"));
+            return Err(anyhow::anyhow!("ZK Proof verification failed: invalid proof"));
         }
         Ok(())
     }

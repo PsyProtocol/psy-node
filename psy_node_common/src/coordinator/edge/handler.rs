@@ -27,12 +27,11 @@ use psy_node_core::{
 };
 use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 
-use crate::
-    coordinator::queue_key::{CoordinatorDeployContractQueueKey, CoordinatorRegisterUserPublicKeyQueueKey, CoordinatorSubmitRealmGUTAUpdateQueueKey}
-;
+use crate::coordinator::queue_key::{
+    CoordinatorDeployContractQueueKey, CoordinatorRegisterUserPublicKeyQueueKey, CoordinatorSubmitRealmGUTAUpdateQueueKey,
+};
 
 const END_CAP_PROOF_CIRCUIT_TYPE_U32: u32 = ProvingJobCircuitType::UserEndCap as u32;
-#[derive(Clone)]
 pub struct CoordinatorEdgeHandler<
     N: QNetworkTypesConfig,
     S: PsyCoordinatorEdgeAPIStoreReader<N::F, N::QHash> + Send + Sync,
@@ -61,7 +60,47 @@ pub struct CoordinatorEdgeHandler<
     pub proof_verifier: Arc<N::ZKVerifier>,
     pub contract_state_tree_height_cache: Arc<DashMapContractHeightCache<N::QHash>>,
 }
-
+impl<
+        N: QNetworkTypesConfig,
+        S: PsyCoordinatorEdgeAPIStoreReader<N::F, N::QHash> + Send + Sync,
+        STagTreeRewards: PsyNodeCoreRewardsTagTreeStoreWriter<N::F, N::QHash> + PsyNodeCoreRewardsTagTreeStoreReader<N::F, N::QHash> + Send + Sync,
+        GUTAUpdateQueue: QStandardEphemeralQueuePublisher,
+        RegisterUserQueue: QStandardEphemeralQueuePublisher,
+        DeployContractQueue: QStandardEphemeralQueuePublisher,
+        GetProofWorkQueue: QStandardWorkerQueueSubscriber,
+        TempDatabase: StandardEdgeAPITempDBStoreBase<N::JobId, N::QHash>,
+        ProofStore: QParthProofStore,
+    > Clone
+    for CoordinatorEdgeHandler<
+        N,
+        S,
+        STagTreeRewards,
+        GUTAUpdateQueue,
+        RegisterUserQueue,
+        DeployContractQueue,
+        GetProofWorkQueue,
+        TempDatabase,
+        ProofStore,
+    >
+{
+    fn clone(&self) -> Self {
+        Self {
+            db_reader: self.db_reader.clone(),
+            tag_tree_rewards_store: self.tag_tree_rewards_store.clone(),
+            temp_db: self.temp_db.clone(),
+            proof_store: self.proof_store.clone(),
+            guta_update_queue: self.guta_update_queue.clone(),
+            register_user_queue: self.register_user_queue.clone(),
+            deploy_contract_queue: self.deploy_contract_queue.clone(),
+            get_proof_work_queue: self.get_proof_work_queue.clone(),
+            realm_identifier: self.realm_identifier.clone(),
+            realm_id_u64: self.realm_id_u64.clone(),
+            realm_sub_id_u64: self.realm_sub_id_u64.clone(),
+            proof_verifier: self.proof_verifier.clone(),
+            contract_state_tree_height_cache: self.contract_state_tree_height_cache.clone(),
+        }
+    }
+}
 impl<
         N: QNetworkTypesConfig,
         S: PsyCoordinatorEdgeAPIStoreReader<N::F, N::QHash> + Send + Sync,
@@ -221,7 +260,7 @@ impl<
         Ok((
             unique_pending_id,
             unique_proc_checkpoint_id,
-            CoordinatorDeployContractQueueKey{
+            CoordinatorDeployContractQueueKey {
                 realm_id: self.realm_id_u64,
                 realm_sub_id: self.realm_sub_id_u64,
                 unique_id: unique_proc_checkpoint_id,
