@@ -627,6 +627,18 @@ impl QProvingJobDataID {
             data_index,
         }
     }
+    pub fn get_checkpoint_state_transition_job_id(checkpoint_id: u64) -> Self {
+        Self::new(
+            QJobTopic::GenerateStandardProof,
+            checkpoint_id,
+            0,
+            0,
+            0,
+            ProvingJobCircuitType::GenesisBlockCheckpointStateTransition,
+            ProvingJobDataType::OutputProof,
+            0,
+        )
+    }
     pub fn guta_two_end_cap_witness(checkpoint_id: u64, group_id: u32, sub_group_id: u32, task_index: u32) -> Self {
         Self::new(
             QJobTopic::GenerateStandardProof,

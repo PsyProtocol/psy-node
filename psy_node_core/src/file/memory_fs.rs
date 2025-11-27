@@ -40,5 +40,9 @@ impl TokioLikeFileSystem for SimpleMockMemoryFileSystem {
         self.files.insert(path.to_string(), data);
         Ok(())
     }
+        async fn file_like_fs_create_dir_all(&self, _path: &str) -> tokio::io::Result<()> {
+            // No-op for in-memory filesystem
+            Ok(())
+        }
 }
 

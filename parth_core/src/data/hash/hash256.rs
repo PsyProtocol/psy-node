@@ -7,7 +7,7 @@ use serde_with::serde_as;
 use ts_rs::TS;
 
 use crate::{
-    crypto::hash::traits::{CodeSerializableHash, FromU64x4, HashTo4Felts, RandomHash, ToU64x4, ZeroableHash}, data::serializable::{QPDSerializable, QPDSerializableFixed}, generic_traits::QStaticNamedType, protocol::core_types::{Q256BitHash, Q256BitHashTransparent, QHashBase}, utils::debug_code_string::QToCodeString
+    crypto::hash::traits::{CodeSerializableHash, FromU64x4, HashTo4Felts, RandomHash, ToU64x4, ZeroableHash}, data::serializable::{QPDSerializable, QPDSerializableFixed}, generic_traits::{QStaticNamedType, psy_debug_printable::PsyDebugPrintable}, protocol::core_types::{Q256BitHash, Q256BitHashTransparent, QHashBase}, utils::debug_code_string::QToCodeString
 };
 
 #[serde_as]
@@ -36,6 +36,15 @@ impl RandomHash for Hash256 {
         Self::rand()
     }
 }
+
+
+
+impl PsyDebugPrintable for Hash256 {
+    fn psy_debug_print(&self) -> String {
+        format!("{}", hex::encode(&self.0))
+    }
+}
+
 impl Hash256 {
     pub const ZERO: Self = Self([0u8; 32]);
     pub fn from_hex_string(s: &str) -> Result<Self, FromHexError> {

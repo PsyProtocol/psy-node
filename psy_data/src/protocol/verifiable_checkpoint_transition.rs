@@ -149,3 +149,9 @@ impl<F: QFelt64, Hash: QFHashBase<F>> PsyVerifiableCheckpointTransitionWithProof
         self.info.state_transition.get_public_inputs_hash_no_rewards_tag::<H>()
     }
 }
+
+impl<F, Hash> PsyVerifiableCheckpointTransitionWithProof<F, Hash> {
+    pub fn into_tuple(self) -> (PsyVerifiableCheckpointTransition<F, Hash>, u32, Vec<u8>) {
+        (self.info, self.circuit_type, self.zk_proof)
+    }
+}

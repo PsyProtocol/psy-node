@@ -1,18 +1,28 @@
 use parth_core::{
-    crypto::hash::{tag_tree::hash_tag_tree_node, traits::{FieldQHasher, MerkleHasher, QFieldHashable, ZeroableHash}},
+    crypto::hash::{
+        tag_tree::hash_tag_tree_node,
+        traits::{FieldQHasher, MerkleHasher, QFieldHashable, ZeroableHash},
+    },
     data::serializable::QPDSerializable,
     felt::{QFelt, QFelt64, QFeltSized, ToQFelts, ZeroableFelt},
+    generic_traits::psy_debug_printable::PsyDebugPrintable,
     impl_qpd_serialize_params, impl_qpq_serialize_bincode,
-    protocol::core_types::{Q256BitHash, QFHashBase, QHashBase}, utils::QPGenRandom,
+    protocol::core_types::{Q256BitHash, QFHashBase, QHashBase},
+    utils::QPGenRandom,
 };
 use pser::{QBytesDeserialize, QBytesSerialize};
 use psy_core::constants::protocol::DA_CHALLENGE_WINDOW;
 use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
-use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
+use psy_serialize::{
+    AutoDatabaseSerializationUseFastFixedSerialize, FallbackPsySerializeCanonical, FastFixedSerializable, PsyCanonicalSerializeMetadata,
+    PsyIOReadWrite,
+};
 use ts_rs::TS;
 
-use psy_serialize::{AutoDatabaseSerializationUseFastFixedSerialize, FastFixedSerializable};
-use crate::v1::qdata::{checkpoint_sync::PQEDCheckpointSyncInfoCompact, ffs_sizes::PSY_OBJECT_FFS_SIZE_GLOBAL_STATE_ROOTS, pm_jobs_completed_stats::PPMJobsCompletedStats, pm_rewards_commitment::PPMRewardCommitment};
+use crate::v1::qdata::{
+    checkpoint_sync::PQEDCheckpointSyncInfoCompact, ffs_sizes::PSY_OBJECT_FFS_SIZE_GLOBAL_STATE_ROOTS,
+    pm_jobs_completed_stats::PPMJobsCompletedStats, pm_rewards_commitment::PPMRewardCommitment,
+};
 
 #[pderive::serialize_copy_f_hash_ts]
 #[ts(export, concrete(F = parth_core::PF, Hash = parth_core::PHash), rename = "QEDCheckpointLeafStats")]
@@ -27,6 +37,82 @@ pub struct PQEDCheckpointLeafStats<F, Hash> {
     pub pm_rewards_commitment: PPMRewardCommitment<Hash>,
     pub da_challenges_claimed: [F; DA_CHALLENGE_WINDOW],
 }
+
+impl<F: QFelt, Hash: QHashBase> PsyDebugPrintable for PQEDCheckpointLeafStats<F, Hash> {
+    fn psy_debug_print(&self) -> String {
+        /*
+
+
+        print:
+
+        PQEDCheckpointLeafStats {
+            fees_collected: {},
+            user_ops_processed: {},
+            total_transactions: {},
+            slots_modified: {},
+            pm_jobs_completed: PPMJobsCompletedStats{
+                deploy_contracts_completed: {},
+                register_users_completed: {},
+                gutas_completed: {},
+            },
+            block_time: {},
+            random_seed: {hex::encode(&self.random_seed)},
+            pm_rewards_commitment: PPMRewardCommitment {
+                register_users_root: {hex::encode(&self.pm_rewards_commitment.register_users_root)},
+                gutas_root: {hex::encode(&self.pm_rewards_commitment.gutas_root)},
+                deploy_contracts_root: {hex::encode(&self.pm_rewards_commitment.deploy_contracts_root)},
+            },
+            da_challenges_claimed: {da_challenges_claimed.iter().map(|c| format!("{}", c.to_u64_value())).collect::<Vec<String>>().join(", ")},
+        }
+        */
+        format!(
+            r#"PQEDCheckpointLeafStats {{
+    fees_collected: {},
+    user_ops_processed: {},
+    total_transactions: {},
+    slots_modified: {},
+    pm_jobs_completed: {},
+    block_time: {},
+    random_seed: {},
+    pm_rewards_commitment: {},
+    da_challenges_claimed: [{}],
+}}"#,
+            self.fees_collected.psy_debug_print(),
+            self.user_ops_processed.psy_debug_print(),
+            self.total_transactions.psy_debug_print(),
+            self.slots_modified.psy_debug_print(),
+            format!(
+                r#"
+PPMJobsCompletedStats{{
+        deploy_contracts_completed: {},
+        register_users_completed: {},
+        gutas_completed: {},
+    }}"#,
+                self.pm_jobs_completed.deploy_contracts_completed.psy_debug_print(),
+                self.pm_jobs_completed.register_users_completed.psy_debug_print(),
+                self.pm_jobs_completed.gutas_completed.psy_debug_print(),
+            ),
+            self.block_time.psy_debug_print(),
+            hex::encode(&self.random_seed.psy_debug_print()),
+            format!(
+                r#"
+PPMRewardCommitment {{
+        register_users_root: {},
+        gutas_root: {},
+        deploy_contracts_root: {},
+    }}"#,
+                hex::encode(&self.pm_rewards_commitment.register_users_root.psy_debug_print()),
+                hex::encode(&self.pm_rewards_commitment.gutas_root.psy_debug_print()),
+                hex::encode(&self.pm_rewards_commitment.deploy_contracts_root.psy_debug_print()),
+            ),
+            self.da_challenges_claimed
+                .iter()
+                .map(|c| c.psy_debug_print())
+                .collect::<Vec<String>>()
+                .join(", ")
+        )
+    }
+}
 impl_qpd_serialize_params!(
     PQEDCheckpointLeafStats,
     { F: QFelt, Hash: QHashBase } => { F, Hash }
@@ -39,21 +125,27 @@ impl<F: ZeroableFelt, Hash: ZeroableHash> PQEDCheckpointLeafStats<F, Hash> {
             user_ops_processed: F::ZERO_VALUE,
             total_transactions: F::ZERO_VALUE,
             slots_modified: F::ZERO_VALUE,
-            pm_jobs_completed: PPMJobsCompletedStats{
+            pm_jobs_completed: PPMJobsCompletedStats {
                 deploy_contracts_completed: F::ZERO_VALUE,
                 register_users_completed: F::ZERO_VALUE,
                 gutas_completed: F::ZERO_VALUE,
             },
             block_time: F::ZERO_VALUE,
             random_seed: Hash::get_zero_value(),
-            pm_rewards_commitment: PPMRewardCommitment { register_users_root: Hash::get_zero_value(), gutas_root: Hash::get_zero_value(), deploy_contracts_root: Hash::get_zero_value() },
+            pm_rewards_commitment: PPMRewardCommitment {
+                register_users_root: Hash::get_zero_value(),
+                gutas_root: Hash::get_zero_value(),
+                deploy_contracts_root: Hash::get_zero_value(),
+            },
             da_challenges_claimed: [F::ZERO_VALUE; DA_CHALLENGE_WINDOW],
         }
-        
     }
 }
 impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for PQEDCheckpointLeafStats<F, Hash> {
-    fn qp_rand_gen() -> Self where Self: Sized {
+    fn qp_rand_gen() -> Self
+    where
+        Self: Sized,
+    {
         Self {
             fees_collected: F::qp_rand_gen(),
             user_ops_processed: F::qp_rand_gen(),
@@ -63,20 +155,24 @@ impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for PQEDCheckpointLeafStats<
             block_time: F::qp_rand_gen(),
             random_seed: Hash::qp_rand_gen(),
             pm_rewards_commitment: PPMRewardCommitment::qp_rand_gen(),
-            da_challenges_claimed: F::qp_rand_gen_vec(DA_CHALLENGE_WINDOW).try_into().map_err(|_| anyhow::anyhow!("failed to alloc fixed length value")).unwrap(),
+            da_challenges_claimed: F::qp_rand_gen_vec(DA_CHALLENGE_WINDOW)
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("failed to alloc fixed length value"))
+                .unwrap(),
         }
     }
 }
 
 impl<F: QFelt64, Hash: Q256BitHash> PsyCanonicalSerializeMetadata for PQEDCheckpointLeafStats<F, Hash> {
     const IS_FIXED_SIZE: bool = true;
-    const FIXED_SIZE: usize = 4*8 + PPMJobsCompletedStats::<F>::FIXED_SIZE + 8 + 32 + PPMRewardCommitment::<Hash>::FIXED_SIZE + (DA_CHALLENGE_WINDOW * 8);
+    const FIXED_SIZE: usize =
+        4 * 8 + PPMJobsCompletedStats::<F>::FIXED_SIZE + 8 + 32 + PPMRewardCommitment::<Hash>::FIXED_SIZE + (DA_CHALLENGE_WINDOW * 8);
 }
 impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for PQEDCheckpointLeafStats<F, Hash> {
     fn fallback_pio_serialized_size(&self) -> usize {
-        4*8 + self.pm_jobs_completed.pio_serialized_size() + 8 + 32 + self.pm_rewards_commitment.pio_serialized_size() + (DA_CHALLENGE_WINDOW * 8)
+        4 * 8 + self.pm_jobs_completed.pio_serialized_size() + 8 + 32 + self.pm_rewards_commitment.pio_serialized_size() + (DA_CHALLENGE_WINDOW * 8)
     }
-    
+
     fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
         writer.psy_write_u64(self.fees_collected.to_u64_value())?;
         writer.psy_write_u64(self.user_ops_processed.to_u64_value())?;
@@ -90,12 +186,10 @@ impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for PQEDCheckp
             writer.psy_write_u64(challenge.to_u64_value())?;
         }
 
-
         Ok(())
     }
-    
+
     fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
-        
         let fees_collected = F::from_u64_value(reader.psy_read_u64()?);
         let user_ops_processed = F::from_u64_value(reader.psy_read_u64()?);
         let total_transactions = F::from_u64_value(reader.psy_read_u64()?);
@@ -121,7 +215,6 @@ impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for PQEDCheckp
             da_challenges_claimed,
         })
     }
-
 }
 
 #[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
@@ -132,12 +225,7 @@ psy_serialize::impl_psy_canonical_serialize_for_speedy!(
 #[cfg(not(all(feature = "serialize_speedy", target_endian = "little")))]
 impl<F: QFelt64, Hash: Q256BitHash> psy_serialize::AutoImplementFallbackPsySerializeCanonical for PQEDCheckpointLeafStats<F> {}
 
-
-pser::impl_psy_ser_basic_tests_fallback!(
-    PPMJobsCompletedStats,
-    { parth_core::PF },
-    test_ser_ppm_jobs_completed_stats
-);
+pser::impl_psy_ser_basic_tests_fallback!(PPMJobsCompletedStats, { parth_core::PF }, test_ser_ppm_jobs_completed_stats);
 
 impl<F: QFelt, Hash: QHashBase> PQEDCheckpointLeafStats<F, Hash> {
     pub fn new_empty() -> Self {
@@ -161,20 +249,13 @@ impl<F: QFelt, Hash: QHashBase> PQEDCheckpointLeafStats<F, Hash> {
 
 impl<F: QFelt, Hash: QHashBase> QFeltSized for PQEDCheckpointLeafStats<F, Hash> {
     fn q_felt_size() -> usize {
-        4 + PPMJobsCompletedStats::<F>::q_felt_size() + 1 + 4
-            + PPMRewardCommitment::<Hash>::q_felt_size()
-            + DA_CHALLENGE_WINDOW
+        4 + PPMJobsCompletedStats::<F>::q_felt_size() + 1 + 4 + PPMRewardCommitment::<Hash>::q_felt_size() + DA_CHALLENGE_WINDOW
     }
 }
 
 impl<F: QFelt64, Hash: QFHashBase<F>> ToQFelts<F> for PQEDCheckpointLeafStats<F, Hash> {
     fn to_qfelts(&self) -> Vec<F> {
-        let mut result = vec![
-            self.fees_collected,
-            self.user_ops_processed,
-            self.total_transactions,
-            self.slots_modified,
-        ];
+        let mut result = vec![self.fees_collected, self.user_ops_processed, self.total_transactions, self.slots_modified];
         result.extend_from_slice(&self.pm_jobs_completed.to_qfelts());
         result.push(self.block_time);
         result.extend_from_slice(&self.random_seed.to_4_felts());
@@ -209,17 +290,13 @@ impl<F: QFelt64, Hash: QFHashBase<F>> ToQFelts<F> for PQEDCheckpointLeafStats<F,
             pm_jobs_completed: PPMJobsCompletedStats::from_qfelts(&felts[pm_jobs_start..pm_jobs_end]),
             block_time: felts[block_time_index],
             random_seed: Hash::from_4_felts_slice(&felts[random_seed_start..random_seed_end]),
-            pm_rewards_commitment: PPMRewardCommitment::from_qfelts(
-                &felts[pm_rewards_start..pm_rewards_end],
-            ),
+            pm_rewards_commitment: PPMRewardCommitment::from_qfelts(&felts[pm_rewards_start..pm_rewards_end]),
             da_challenges_claimed: felts[da_challenges_start..].try_into().unwrap(),
         }
     }
 }
 
-impl<F: QFelt64, Hash: QFHashBase<F>> QFieldHashable<F, Hash>
-    for PQEDCheckpointLeafStats<F, Hash>
-{
+impl<F: QFelt64, Hash: QFHashBase<F>> QFieldHashable<F, Hash> for PQEDCheckpointLeafStats<F, Hash> {
     fn qfhash<H: FieldQHasher<F, Hash>>(&self) -> Hash {
         H::q_hash_many(&self.to_qfelts())
     }
@@ -239,8 +316,6 @@ impl_qpd_serialize_params!(
     PQEDCheckpointGlobalStateRoots,
     { Hash: QHashBase } => { Hash }
 );
-
-
 
 impl<Hash: QPGenRandom> QPGenRandom for PQEDCheckpointGlobalStateRoots<Hash> {
     fn qp_rand_gen() -> Self
@@ -270,10 +345,9 @@ pser::impl_bytemuck_ffs_tests!(
     160
 );
 
-
 impl<Hash: Q256BitHash> PsyCanonicalSerializeMetadata for PQEDCheckpointGlobalStateRoots<Hash> {
     const IS_FIXED_SIZE: bool = true;
-    const FIXED_SIZE: usize = 32*5;
+    const FIXED_SIZE: usize = 32 * 5;
 }
 impl<Hash: Q256BitHash> AutoDatabaseSerializationUseFastFixedSerialize<160> for PQEDCheckpointGlobalStateRoots<Hash> {}
 psy_serialize::impl_psy_canonical_serialize_for_fixed_type!(
@@ -284,8 +358,10 @@ psy_serialize::impl_psy_canonical_serialize_for_fixed_type!(
 // This function is never called, it is just to ensure at compile time
 //  PSY_OBJECT_FFS_SIZE_CONTRACT_LEAF matches the FFS implementation
 fn _ensure_compile_time_size_match() {
-    let _bytes_h256: [u8; PSY_OBJECT_FFS_SIZE_GLOBAL_STATE_ROOTS] = PQEDCheckpointGlobalStateRoots::<parth_core::data::hash::hash256::Hash256>::qp_rand_gen().ffs_into_bytes();
-    let _bytes_phash: [u8; PSY_OBJECT_FFS_SIZE_GLOBAL_STATE_ROOTS] = PQEDCheckpointGlobalStateRoots::<parth_core::PHash>::qp_rand_gen().ffs_into_bytes();
+    let _bytes_h256: [u8; PSY_OBJECT_FFS_SIZE_GLOBAL_STATE_ROOTS] =
+        PQEDCheckpointGlobalStateRoots::<parth_core::data::hash::hash256::Hash256>::qp_rand_gen().ffs_into_bytes();
+    let _bytes_phash: [u8; PSY_OBJECT_FFS_SIZE_GLOBAL_STATE_ROOTS] =
+        PQEDCheckpointGlobalStateRoots::<parth_core::PHash>::qp_rand_gen().ffs_into_bytes();
 }
 
 // fallback for big endian platforms, not zero copy
@@ -350,10 +426,9 @@ impl<F: QFelt64, Hash: Q256BitHash> FastFixedSerializable<72> for PQEDContractLe
 pser::impl_psy_ser_basic_tests!(
     PQEDCheckpointGlobalStateRoots,
     // Note the use of concrete types here
-    {  parth_core::PHash },
+    { parth_core::PHash },
     qed_global_state_roots_tests
 );
-
 
 impl<Hash: QHashBase> QFeltSized for PQEDCheckpointGlobalStateRoots<Hash> {
     fn q_felt_size() -> usize {
@@ -385,9 +460,7 @@ impl<F: QFelt64, Hash: QFHashBase<F>> ToQFelts<F> for PQEDCheckpointGlobalStateR
     }
 }
 
-impl<F: QFelt64, Hash: QFHashBase<F>> QFieldHashable<F, Hash>
-    for PQEDCheckpointGlobalStateRoots<Hash>
-{
+impl<F: QFelt64, Hash: QFHashBase<F>> QFieldHashable<F, Hash> for PQEDCheckpointGlobalStateRoots<Hash> {
     fn qfhash<H: FieldQHasher<F, Hash>>(&self) -> Hash {
         let contract_and_deposit = H::q_two_to_one(self.contract_tree_root, self.deposit_tree_root);
         let user_and_withdrawal = H::q_two_to_one(self.user_tree_root, self.withdrawal_tree_root);
@@ -402,6 +475,8 @@ pub struct PQEDCheckpointLeaf<F, Hash> {
     pub global_chain_root: Hash,
     pub stats: PQEDCheckpointLeafStats<F, Hash>,
 }
+
+
 impl_qpd_serialize_params!(
     PQEDCheckpointLeaf,
     { F: QFelt, Hash: QHashBase } => { F, Hash }
@@ -417,7 +492,10 @@ impl<F, Hash: Copy + ZeroableHash> PQEDCheckpointLeaf<F, Hash> {
     }
 }
 impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for PQEDCheckpointLeaf<F, Hash> {
-    fn qp_rand_gen() -> Self where Self: Sized {
+    fn qp_rand_gen() -> Self
+    where
+        Self: Sized,
+    {
         Self {
             global_chain_root: Hash::qp_rand_gen(),
             stats: PQEDCheckpointLeafStats::qp_rand_gen(),
@@ -433,21 +511,17 @@ impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for PQEDCheckp
     fn fallback_pio_serialized_size(&self) -> usize {
         32 + self.stats.pio_serialized_size()
     }
-    
+
     fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
         writer.psy_write_bytes_fixed(&self.global_chain_root.into_owned_32bytes())?;
         self.stats.pio_write_to_io(writer)
     }
-    
+
     fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
         let global_chain_root = Hash::from_owned_32bytes(reader.psy_read_bytes_32()?);
         let stats = PQEDCheckpointLeafStats::<F, Hash>::pio_read_from_io(reader)?;
-        Ok(Self {
-            global_chain_root,
-            stats,
-        })
+        Ok(Self { global_chain_root, stats })
     }
-
 }
 
 #[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
@@ -457,7 +531,6 @@ psy_serialize::impl_psy_canonical_serialize_for_speedy!(
 );
 #[cfg(not(all(feature = "serialize_speedy", target_endian = "little")))]
 impl<F: QFelt64, Hash: Q256BitHash> psy_serialize::AutoImplementFallbackPsySerializeCanonical for PQEDCheckpointLeaf<F, Hash> {}
-
 
 pser::impl_psy_ser_basic_tests_fallback!(
     PQEDCheckpointLeaf,
@@ -541,7 +614,7 @@ pser::impl_bytemuck_ffs!(
     { Hash: Q256BitHash },
     64
 );
-/* 
+/*
 // commented out do to module name conflict, later just relocate to another file
 pser::impl_bytemuck_ffs_tests!(
     PQEDCheckpointLeafCompact,
@@ -621,7 +694,7 @@ impl<Hash: Q256BitHash> FastFixedSerializable<64> for PQEDCheckpointLeafCompact<
 pser::impl_psy_ser_basic_tests!(
     PQEDCheckpointLeafCompact,
     // Note the use of concrete types here
-    {  parth_core::PHash },
+    { parth_core::PHash },
     pqed_checkpoint_leaf_compact
 );
 
@@ -655,9 +728,7 @@ impl<F: QFelt64, Hash: QFHashBase<F>> ToQFelts<F> for PQEDCheckpointLeafCompact<
     }
 }
 
-impl<F: QFelt64, Hash: QFHashBase<F>> QFieldHashable<F, Hash>
-    for PQEDCheckpointLeafCompact<Hash>
-{
+impl<F: QFelt64, Hash: QFHashBase<F>> QFieldHashable<F, Hash> for PQEDCheckpointLeafCompact<Hash> {
     fn qfhash<H: FieldQHasher<F, Hash>>(&self) -> Hash {
         H::q_two_to_one(self.global_chain_root, self.stats_hash)
     }
@@ -671,7 +742,7 @@ impl<F: QFelt64, Hash: QFHashBase<F>> QFieldHashable<F, Hash>
 #[ts(export)]
 #[repr(C)]
 pub struct QEDL2BlockState {
-    pub checkpoint_id: u64, 
+    pub checkpoint_id: u64,
     pub next_add_withdrawal_id: u64,
     pub next_process_withdrawal_id: u64,
     pub next_deposit_id: u64,
@@ -681,6 +752,21 @@ pub struct QEDL2BlockState {
     pub end_balance: u64,
 
     pub next_contract_id: u32,
+}
+impl PsyDebugPrintable for QEDL2BlockState {
+    fn psy_debug_print(&self) -> String {
+        format!(
+            "QEDL2BlockState {{ \ncheckpoint_id: {},\n     next_add_withdrawal_id: {},\n     next_process_withdrawal_id: {},\n     next_deposit_id: {},\n     total_deposits_claimed_epoch: {},\n     next_user_id: {},\n     end_balance: {},\n     next_contract_id: {}\n }}",
+            self.checkpoint_id,
+            self.next_add_withdrawal_id,
+            self.next_process_withdrawal_id,
+            self.next_deposit_id,
+            self.total_deposits_claimed_epoch,
+            self.next_user_id,
+            self.end_balance,
+            self.next_contract_id,
+        )
+    }
 }
 impl QPGenRandom for QEDL2BlockState {
     fn qp_rand_gen() -> Self {
@@ -700,9 +786,9 @@ impl_qpq_serialize_bincode!(QEDL2BlockState);
 
 impl FallbackPsySerializeCanonical for QEDL2BlockState {
     fn fallback_pio_serialized_size(&self) -> usize {
-        8*7 + 4
+        8 * 7 + 4
     }
-    
+
     fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
         writer.psy_write_u64(self.checkpoint_id)?;
         writer.psy_write_u64(self.next_add_withdrawal_id)?;
@@ -715,9 +801,8 @@ impl FallbackPsySerializeCanonical for QEDL2BlockState {
 
         Ok(())
     }
-    
-    fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
 
+    fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
         let checkpoint_id = reader.psy_read_u64()?;
         let next_add_withdrawal_id = reader.psy_read_u64()?;
         let next_process_withdrawal_id = reader.psy_read_u64()?;
@@ -738,22 +823,17 @@ impl FallbackPsySerializeCanonical for QEDL2BlockState {
             next_contract_id,
         })
     }
-
 }
 impl PsyCanonicalSerializeMetadata for QEDL2BlockState {
     const IS_FIXED_SIZE: bool = true;
-    const FIXED_SIZE: usize = 8*7 + 4;
+    const FIXED_SIZE: usize = 8 * 7 + 4;
     const MAX_VEC_LENGTH: usize = 16_777_216; // max ~16 million block headers in one sync message
-    
 }
 
 #[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
 psy_serialize::impl_psy_canonical_serialize_for_speedy!(QEDL2BlockState);
 #[cfg(not(all(feature = "serialize_speedy", target_endian = "little")))]
 impl AutoImplementFallbackPsySerializeCanonical for QEDL2BlockState {}
-
-
-
 
 impl QEDL2BlockState {
     pub fn get_genesis_value() -> Self {
@@ -776,7 +856,7 @@ pub struct PQEDCheckpointLeafCompactWithStateRoots<Hash> {
     pub checkpoint_leaf: PQEDCheckpointLeafCompact<Hash>,
     pub global_state_roots: PQEDCheckpointGlobalStateRoots<Hash>,
 }
-impl <Hash: QPGenRandom> QPGenRandom for PQEDCheckpointLeafCompactWithStateRoots<Hash> {
+impl<Hash: QPGenRandom> QPGenRandom for PQEDCheckpointLeafCompactWithStateRoots<Hash> {
     fn qp_rand_gen() -> Self
     where
         Self: Sized,
@@ -794,8 +874,7 @@ impl_qpd_serialize_params!(
 
 impl<Hash: QHashBase> QFeltSized for PQEDCheckpointLeafCompactWithStateRoots<Hash> {
     fn q_felt_size() -> usize {
-        PQEDCheckpointLeafCompact::<Hash>::q_felt_size()
-            + PQEDCheckpointGlobalStateRoots::<Hash>::q_felt_size()
+        PQEDCheckpointLeafCompact::<Hash>::q_felt_size() + PQEDCheckpointGlobalStateRoots::<Hash>::q_felt_size()
     }
 }
 impl<F: QFelt64, Hash: QFHashBase<F>> ToQFelts<F> for PQEDCheckpointLeafCompactWithStateRoots<Hash> {
@@ -813,22 +892,18 @@ impl<F: QFelt64, Hash: QFHashBase<F>> ToQFelts<F> for PQEDCheckpointLeafCompactW
         let checkpoint_part_size = PQEDCheckpointLeafCompact::<Hash>::q_felt_size();
         Self {
             checkpoint_leaf: PQEDCheckpointLeafCompact::from_qfelts(&felts[0..checkpoint_part_size]),
-            global_state_roots: PQEDCheckpointGlobalStateRoots::from_qfelts(
-                &felts[checkpoint_part_size..],
-            ),
+            global_state_roots: PQEDCheckpointGlobalStateRoots::from_qfelts(&felts[checkpoint_part_size..]),
         }
     }
 }
 
-impl<F: QFelt64, Hash: QFHashBase<F>> QFieldHashable<F, Hash>
-    for PQEDCheckpointLeafCompactWithStateRoots<Hash>
-{
+impl<F: QFelt64, Hash: QFHashBase<F>> QFieldHashable<F, Hash> for PQEDCheckpointLeafCompactWithStateRoots<Hash> {
     fn qfhash<H: FieldQHasher<F, Hash>>(&self) -> Hash {
         self.checkpoint_leaf.qfhash::<H>()
     }
 }
 
-impl< Hash: Q256BitHash> PsyCanonicalSerializeMetadata for PQEDCheckpointLeafCompactWithStateRoots<Hash> {
+impl<Hash: Q256BitHash> PsyCanonicalSerializeMetadata for PQEDCheckpointLeafCompactWithStateRoots<Hash> {
     const IS_FIXED_SIZE: bool = true;
     const FIXED_SIZE: usize = PQEDCheckpointLeafCompact::<Hash>::FIXED_SIZE + PQEDCheckpointGlobalStateRoots::<Hash>::FIXED_SIZE;
 }
@@ -836,18 +911,18 @@ impl<Hash: Q256BitHash> FallbackPsySerializeCanonical for PQEDCheckpointLeafComp
     fn fallback_pio_serialized_size(&self) -> usize {
         Self::FIXED_SIZE
     }
-    
+
     fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
         self.checkpoint_leaf.pio_write_to_io(writer)?;
         self.global_state_roots.pio_write_to_io(writer)?;
         Ok(())
     }
-    
+
     fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
         let checkpoint_leaf = PQEDCheckpointLeafCompact::<Hash>::pio_read_from_io(reader)?;
         let global_state_roots = PQEDCheckpointGlobalStateRoots::<Hash>::pio_read_from_io(reader)?;
         Ok(Self {
-            checkpoint_leaf,                                                            
+            checkpoint_leaf,
             global_state_roots,
         })
     }
@@ -859,7 +934,6 @@ psy_serialize::impl_psy_canonical_serialize_for_speedy!(
 );
 #[cfg(not(all(feature = "serialize_speedy", target_endian = "little")))]
 impl<Hash: Q256BitHash> psy_serialize::AutoImplementFallbackPsySerializeCanonical for PQEDCheckpointLeafCompactWithStateRoots<Hash> {}
-
 
 pser::impl_psy_ser_basic_tests_fallback!(
     PQEDCheckpointLeafCompactWithStateRoots,

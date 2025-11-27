@@ -5,16 +5,11 @@ use serde::{de::DeserializeOwned, Serialize};
 use ts_rs::TS;
 
 use crate::{
-    crypto::hash::traits::{FieldQHasher, FromU64x4, HashTo4Felts, MerkleZeroHasher, RandomHash, ZeroableHash},
-    data::{
+    QJobIdBase, crypto::hash::traits::{FieldQHasher, FromU64x4, HashTo4Felts, MerkleZeroHasher, RandomHash, ZeroableHash}, data::{
         db::data_types::{CoreDatabaseValueDeserialize, QDatabasePrimitiveKey},
         maybe_serialization::{MaybeBytemuck, MaybeSpeedy},
         serializable::{QPDSerializable, QPDSerializableFixed},
-    },
-    felt::QFelt64,
-    generic_traits::QNamedType,
-    protocol::core_types::{QNetworkCircuitConstants, QNetworkConstants, QNetworkConstantsCopier, QNetworkTreeConstants},
-    QJobIdBase,
+    }, felt::QFelt64, generic_traits::{QNamedType, psy_debug_printable::PsyDebugPrintable}, protocol::core_types::{QNetworkCircuitConstants, QNetworkConstants, QNetworkConstantsCopier, QNetworkTreeConstants}
 };
 
 pub trait QStorableBase: Serialize + DeserializeOwned + Send + Sync + Clone + PartialEq + Eq {}
@@ -58,6 +53,7 @@ pub trait QHashBase:
     + MaybeSpeedy
     + MaybeBytemuck
     + std::fmt::Debug
+    + PsyDebugPrintable
 {
 }
 pub trait QHash256Base: QHashBase + Q256BitHash {}

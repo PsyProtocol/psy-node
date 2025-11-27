@@ -74,11 +74,11 @@ pub async fn read_register_user_gatherer_backup_file<Hasher: MerkleZeroHasher<Ha
 ) -> anyhow::Result<RegisterUserGathererOutputDatabase<Hash>> {
     let metadata = file.file_like_metadata().await?;
     let file_len = metadata.len();
-    if file_len < 4 + 8 + 32 {
+    if file_len < 4 + 8 + 32 + 8{
         return Err(anyhow::anyhow!("Backup file too small to be valid: {} bytes", metadata.len()));
     }
 
-    let file_len_without_metadata = file_len - 4 - 8 - 32;
+    let file_len_without_metadata = file_len - 4 - 8 - 32 - 8;
     if file_len_without_metadata % (64 as u64) != 0 {
         return Err(anyhow::anyhow!(
             "Backup file length without metadata is not a multiple of 64: {} bytes",
@@ -142,6 +142,7 @@ pub async fn read_register_user_gatherer_backup_file<Hasher: MerkleZeroHasher<Ha
         let node = SimpleMerkleNode { key: *key, value: *hash };
         node.pio_write_to_io(&mut update_user_registration_tree_nodes_ffs)?;
     }
+    let total_jobs = file.read_u64_le().await?;
     tree.commit_changes();
     let output_db = RegisterUserGathererOutputDatabase {
         start_next_user_id,
@@ -152,6 +153,7 @@ pub async fn read_register_user_gatherer_backup_file<Hasher: MerkleZeroHasher<Ha
         user_registration_tree_update_pivot_siblings: pivot_proof.siblings,
         new_public_key_hash_to_user_id_rows_ffs,
         update_user_registration_tree_nodes_ffs,
+        total_jobs,
     };
     Ok(output_db)
 }
@@ -240,6 +242,7 @@ pub struct RegisterUserGathererOutputDatabase<Hash> {
     pub user_registration_tree_update_pivot_siblings: Vec<Hash>,
     pub new_public_key_hash_to_user_id_rows_ffs: Vec<u8>,
     pub update_user_registration_tree_nodes_ffs: Vec<u8>,
+    pub total_jobs: u64,
 }
 #[derive(Debug, Clone)]
 pub struct RegisterUserGathererOutput<Hash, JobId> {
@@ -422,6 +425,13 @@ impl<
             REGISTER_USERS_REWARDS_TREE_OFFSET_ROOT_INDEX,
             REGISTER_USERS_REWARDS_TREE_OFFSET_ROOT_LEVEL,
         )?;
+        let total_jobs = jobs_for_queue.iter().map(|v| v.len()).sum::<usize>() as u64;
+        self.new_user_public_keys_file.write_u64_le(total_jobs).await?;
+
+        self.config
+            .file_system
+            .file_like_fs_flush_file_with_path(&self.pending_file_path, &mut self.new_user_public_keys_file)
+            .await?;
 
         let update_user_registration_tree_nodes_ffs = create_ffs_merkle_nodes_zero_id_from_hash_map::<N::QHash>(tree.get_changes());
 
@@ -440,6 +450,7 @@ impl<
             user_registration_tree_update_pivot_siblings: tree.get_historical_pivot_leaf(start_next_user_id).siblings,
             new_public_key_hash_to_user_id_rows_ffs: self.new_public_key_hash_to_user_id_rows_ffs,
             update_user_registration_tree_nodes_ffs,
+            total_jobs,
         };
         let output = RegisterUserGathererOutput {
             db_output: output_database,

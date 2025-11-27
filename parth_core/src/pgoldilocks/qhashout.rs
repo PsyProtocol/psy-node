@@ -3,7 +3,7 @@ use std::{fmt::Display, str::FromStr};
 use anyhow::ensure;
 use psy_serialize::{AutoDatabaseSerializationUseFastFixedSerialize, FastFixedSerializable, PsyCanonicalSerializeMetadata};
 use ts_rs::TS;
-use crate::{crypto::hash::traits::{FromU64x4, HashTo4Felts, RandomHash, ToU64x4, ZeroableHash}, data::{hash::hash256::Hash256, serializable::{QPDSerializable, QPDSerializableFixed}}, felt::{QFelt64, ToQFelts}, generic_traits::QNamedType, protocol::core_types::{Q256BitHash, QHashBase}, utils::QPGenRandom};
+use crate::{crypto::hash::traits::{FromU64x4, HashTo4Felts, RandomHash, ToU64x4, ZeroableHash}, data::{hash::hash256::Hash256, serializable::{QPDSerializable, QPDSerializableFixed}}, felt::{QFelt64, ToQFelts}, generic_traits::{QNamedType, psy_debug_printable::PsyDebugPrintable}, protocol::core_types::{Q256BitHash, QHashBase}, utils::QPGenRandom};
 use plonky2::{
     field::{
         goldilocks_field::GoldilocksField,
@@ -21,6 +21,15 @@ use serde_with::serde_as;
 #[ts(export, concrete(F = GoldilocksField))]
 #[repr(transparent)]
 pub struct QHashOut<F: Field>(pub HashOut<F>);
+
+
+
+impl<F: RichField> PsyDebugPrintable for QHashOut<F> {
+    fn psy_debug_print(&self) -> String {
+        format!("{}", self.to_string_le())
+    }
+}
+
 
 impl<F: QFelt64 + Field> PartialOrd for QHashOut<F> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {

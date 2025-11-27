@@ -25,6 +25,7 @@ impl FileLikeMetadata {
 #[async_trait]
 pub trait TokioLikeFileSystem: Send + Sync {
     type File: TokioFileLike;
+    async fn file_like_fs_create_dir_all(&self, path: &str) -> tokio::io::Result<()>;
     async fn file_like_fs_create(&self, path: &str) -> tokio::io::Result<Self::File>;
     async fn file_like_fs_open(&self, path: &str) -> tokio::io::Result<Self::File>;
     async fn file_like_fs_flush_file_with_path(&self, _path: &str, file: &mut Self::File) -> tokio::io::Result<()> {
@@ -38,6 +39,9 @@ pub struct TokioStdFileSystem;
 #[async_trait]
 impl TokioLikeFileSystem for TokioStdFileSystem {
     type File = tokio::fs::File;
+    async fn file_like_fs_create_dir_all(&self, path: &str) -> tokio::io::Result<()> {
+        tokio::fs::create_dir_all(path).await
+    }
     async fn file_like_fs_create(&self, path: &str) -> tokio::io::Result<Self::File> {
         tokio::fs::File::create(path).await
     }

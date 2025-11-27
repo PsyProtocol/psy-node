@@ -61,11 +61,8 @@ pub async fn read_coordinator_guta_update_gatherer_backup_file<
 >(
     file_system: &FileSystem,
     file_path: &str,
-    mut tree: SimpleMemoryMerkleRecorderStore<Hasher, Hash>,
-) -> anyhow::Result<(
-    CoordinatorGUTAUpdateGathererOutputDatabase<F, Hash>,
-    SimpleMemoryMerkleRecorderStore<Hasher, Hash>,
-)> {
+    tree: &mut SimpleMemoryMerkleRecorderStore<Hasher, Hash>,
+) -> anyhow::Result<CoordinatorGUTAUpdateGathererOutputDatabase<F, Hash>> {
     let mut file: FileSystem::File = file_system.file_like_fs_open(&file_path).await?;
     let metadata = file.file_like_metadata().await?;
     let file_len = metadata.len();
@@ -144,7 +141,7 @@ pub async fn read_coordinator_guta_update_gatherer_backup_file<
         end_global_user_tree_root,
         random_seed_guta,
     };
-    Ok((output_db, tree))
+    Ok(output_db)
 }
 pub struct CoordinatorGUTAUpdateGathererConfig<
     N: QNetworkTypesConfig,

@@ -68,8 +68,8 @@ pub async fn read_deploy_contract_gatherer_backup_file_path<
     file_system: &FileSystem,
     file_path: &str,
     max_contract_function_tree_leaves: usize,
-    mut tree: SimpleMemoryMerkleRecorderStore<Hasher, Hash>,
-) -> anyhow::Result<(DeployContractGathererOutputDatabase<Hash>, SimpleMemoryMerkleRecorderStore<Hasher, Hash>)> {
+    tree: &mut SimpleMemoryMerkleRecorderStore<Hasher, Hash>,
+) -> anyhow::Result<DeployContractGathererOutputDatabase<Hash>> {
     let mut file: FileSystem::File = file_system.file_like_fs_open(file_path).await?;
     let metadata = file.file_like_metadata().await?;
     let file_len = metadata.len();
@@ -77,7 +77,7 @@ pub async fn read_deploy_contract_gatherer_backup_file_path<
     // ensure tree is up to date and pending changes are clean
     tree.commit_changes();
 
-    if file_len < 4 + 8 + 32 + 4 {
+    if file_len < 4 + 8 + 32 + 4 + 8 {
         return Err(anyhow::anyhow!("Backup file too small to be valid: {} bytes", metadata.len()));
     }
     let magic = file.read_u32_le().await?;
@@ -208,6 +208,7 @@ pub async fn read_deploy_contract_gatherer_backup_file_path<
         let node = SimpleMerkleNode { key: *key, value: *hash };
         node.pio_write_to_io(&mut update_global_contract_tree_nodes_ffs)?;
     }
+    let total_jobs = file.read_u64_le().await?;
     tree.commit_changes();
 
     let output_db = DeployContractGathererOutputDatabase {
@@ -216,13 +217,14 @@ pub async fn read_deploy_contract_gatherer_backup_file_path<
         new_contract_leaves_ffs,
         update_contract_function_tree_nodes_ffs,
         new_contract_code_definitions,
+        total_jobs,
         next_contract_id,
         end_global_contract_tree_root: end_root,
         global_contract_tree_update_pivot_siblings: pivot_proof.siblings,
         update_global_contract_tree_nodes_ffs,
     };
 
-    Ok((output_db, tree))
+    Ok(output_db)
 }
 
 #[derive(Debug, Clone)]
@@ -232,6 +234,7 @@ pub struct DeployContractGathererOutputDatabase<Hash> {
     pub new_contract_leaves_ffs: Vec<u8>,
     pub update_contract_function_tree_nodes_ffs: Vec<u8>,
     pub new_contract_code_definitions: Vec<ContractCodeDefinitionWithContractId>,
+    pub total_jobs: u64,
 
     // end backup format
     pub next_contract_id: u64,
@@ -529,14 +532,7 @@ impl<
         //self.new_contracts_file.flush().await?;
 
         let total_new_contracts = self.new_global_contract_tree_leaves.len() as u32;
-        self.new_contracts_file.seek(SeekFrom::Start(4 + 8 + 32)).await?;
-        self.new_contracts_file.write_u32(total_new_contracts).await?;
-        // ensure the new total contracts length is flushed correctly
-        self.config
-            .file_system
-            .file_like_fs_flush_file_with_path(&self.pending_file_path, &mut self.new_contracts_file)
-            .await?;
-
+      
         let start_state_root = tree.get_root();
 
         let pending_unique_id = self.shared_status.unique_pending_id;
@@ -588,6 +584,15 @@ impl<
             DEPLOY_CONTRACTS_REWARDS_TREE_OFFSET_ROOT_INDEX,
             DEPLOY_CONTRACTS_REWARDS_TREE_OFFSET_ROOT_LEVEL,
         )?;
+        let total_jobs = jobs_for_queue.iter().map(|v| v.len()).sum::<usize>() as u64;
+        self.new_contracts_file.write_u64_le(total_jobs).await?;
+        self.new_contracts_file.seek(SeekFrom::Start(4 + 8 + 32)).await?;
+        self.new_contracts_file.write_u32(total_new_contracts).await?;
+        // ensure the new total contracts length is flushed correctly
+        self.config
+            .file_system
+            .file_like_fs_flush_file_with_path(&self.pending_file_path, &mut self.new_contracts_file)
+            .await?;
 
         let update_global_contract_tree_nodes_ffs = create_ffs_merkle_nodes_zero_id_from_hash_map::<N::QHash>(tree.get_changes());
         //tree.commit_changes();
@@ -604,6 +609,7 @@ impl<
             new_contract_leaves_ffs: self.new_contract_leaves_ffs,
             update_contract_function_tree_nodes_ffs: self.update_contract_function_tree_nodes_ffs,
             new_contract_code_definitions: self.new_contract_code_definitions,
+            total_jobs,
             next_contract_id: self.next_contract_id,
             end_global_contract_tree_root: tree.get_root(),
             global_contract_tree_update_pivot_siblings: tree.get_historical_pivot_leaf(start_next_contract_id).siblings,

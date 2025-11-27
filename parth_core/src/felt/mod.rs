@@ -9,7 +9,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use ts_rs::TS;
 
 use crate::{
-    data::maybe_serialization::{MaybeBytemuck, MaybeSpeedy}, generic_traits::QNamedType, utils::QPGenRandom
+    data::maybe_serialization::{MaybeBytemuck, MaybeSpeedy}, generic_traits::{QNamedType, psy_debug_printable::PsyDebugPrintable}, utils::QPGenRandom
 };
 
 pub trait ToU64Value {
@@ -76,6 +76,7 @@ pub trait QFelt:
     + SimpleRandFelt
     + QPGenRandom
     + QNamedType
+    + PsyDebugPrintable
 {
 }
 impl<
@@ -107,6 +108,7 @@ impl<
             + QNamedType
             + MaybeSpeedy
             + MaybeBytemuck 
+            + PsyDebugPrintable,
     > QFelt for T
 {
 }

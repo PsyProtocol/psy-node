@@ -27,6 +27,10 @@ impl<F, Hash: Copy + ZeroableHash> PsyCheckpointLeafPopulated<F, Hash> {
         self.stats.pm_rewards_commitment.gutas_root = new_reward_tree_root;
         self.stats.pm_rewards_commitment.deploy_contracts_root = new_reward_tree_root;
     }
+    pub fn get_rewards_tree_root(&self) -> Hash {
+        // HACK: if we change the pm_rewards_commitment structure, we may need to adjust this
+        self.stats.pm_rewards_commitment.register_users_root
+    }
 }
 impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for PsyCheckpointLeafPopulated<F, Hash> {
     fn qp_rand_gen() -> Self
