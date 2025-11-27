@@ -29,8 +29,8 @@ mod genesis;
 mod init;
 mod process_block;
 mod recover_from_backup;
-mod runner;
-mod startup;
+pub mod runner;
+pub mod startup;
 
 pub struct PsyCoordinatorProcessor<
     N: QNetworkTypesConfig,

@@ -66,3 +66,8 @@ psy_io = { workspace = true }
 psy_api_core = { workspace = true }
 psy_node_core = { workspace = true, features = ["clap_cli"] }
 psy_node_common = { workspace = true }
+psy_plonky2_circuits = { workspace = true }
+psy_node_store_memory = { workspace = true }
+psy_node_scylla = { workspace = true }
+psy_node_redis = { workspace = true }
+psy_node_nats = { workspace = true }

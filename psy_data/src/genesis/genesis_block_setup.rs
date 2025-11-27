@@ -1,3 +1,5 @@
+use psy_core::constants::chain_id::PsyChainNetworkType;
+
 use crate::v1::qdata::checkpoint::PQEDCheckpointLeafStats;
 use crate::v1::qdata::contract::PQBCDeployContract;
 use crate::user::complete_user_record::PsyCompactUserDefinition;
@@ -25,4 +27,8 @@ impl<F, Hash> PsyGenesisBlockSetupData<F, Hash> {
             anyhow::bail!("Attempted to get state tree height for an undefined Contract ID {}, which is not defined in the genesis block setup (max defined contract id {})", contract_id, self.contracts.len());
         }
     }
+}
+
+pub trait PsyGenesisBlockSetupDataProvider<F, Hash> {
+    fn get_genesis_block_setup_data_for_network(&self, network: PsyChainNetworkType) -> anyhow::Result<PsyGenesisBlockSetupData<F, Hash>>;
 }

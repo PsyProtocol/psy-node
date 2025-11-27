@@ -11,7 +11,7 @@ use parth_core::
     }
 ;
 use parth_crypto::hash::sha256::CoreSha256Hasher;
-use parth_node_scylla::{
+use psy_node_scylla::{
     core::ScyllaCoreStore,
     tables::{
         blob::ScyllaBiDirectionalBlobToBlobTablePreparedStatements, hash_to_many_ids::ScyllaHashToManyIdsTablePreparedStatements, merkle::{ScyllaDoubleMerkleNodesPreparedStatements, ScyllaMerkleNodesPreparedStatements, ScyllaMerkleNodesZeroPreparedStatements}, object::{

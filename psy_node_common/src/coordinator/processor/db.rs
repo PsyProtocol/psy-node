@@ -82,7 +82,7 @@ pub struct PsyCoordinatorDatabaseProcessor<
     pub proof_work_queue: Arc<ProofWorkQueue>,
 
     //checkpoint tree
-    pub checkpoint_tree_backup_manager: CheckpointTreeBackupManager<N::HasherBase, N::QHash, FileSystem::File>,
+    pub checkpoint_tree_backup_manager: CheckpointTreeBackupManager<N::HasherBase, N::QHash, FileSystem>,
 
     // status
     pub is_active: Arc<AtomicBool>,
@@ -178,6 +178,7 @@ impl<
         realm_identifier: QRealmIdentifier,
         circuit_fingerprint_config: PsyNodeCircuitFingerprintConfig<N::QHash>,
         genesis_verifiable_state_transition: PsyVerifiableCheckpointTransition<N::F, N::QHash>,
+        file_system: Arc<FileSystem>,
         checkpoint_tree_root_backup_file_path: String,
     ) -> anyhow::Result<Self> {
         let realm_id_u64 = realm_identifier.realm_id as u64;
@@ -199,6 +200,7 @@ impl<
         };
 
         let mut checkpoint_tree_backup_manager = CheckpointTreeBackupManager::new_from_file_path(
+            file_system.clone(),
             STALE_CHECKPOINT_AGE_REALM_TO_COORDINATOR_PROOF,
             N::CHECKPOINT_TREE_HEIGHT,
             &db,
@@ -306,12 +308,25 @@ impl<
         })
     }
 
-    pub async fn ensure_genesis_applied(&mut self, genesis_data: &PsyGenesisBlockSetupData<N::F, N::QHash>) -> anyhow::Result<()> {
+
+    pub async fn ensure_genesis_applied(&mut self, genesis_block_update: PsyPreparedCoordinatorBlockStateUpdates<N::F, N::QHash>) -> anyhow::Result<()> {
         // Check if genesis has already been applied
         let database_check_state = self.get_database_check_state().await?;
         if database_check_state == DatabaseCheckState::NeedsGenesis {
             tracing::info!("Applying genesis block setup data to coordinator processor database...");
-            let genesis_block_update = GenesisDatabaseDataBuilder::setup_for_coordinator::<N::HasherBase, N>(&genesis_data)?;
+            self.commit_state(genesis_block_update, ProvingJobCircuitType::GenesisBlockCheckpointStateTransition, vec![])
+                .await?;
+            tracing::info!("Genesis block setup data applied to coordinator processor database.");
+        }
+        Ok(())
+    }
+
+    pub async fn ensure_genesis_applied_from_setup_data(&mut self, genesis_data: &PsyGenesisBlockSetupData<N::F, N::QHash>) -> anyhow::Result<()> {
+        // Check if genesis has already been applied
+        let database_check_state = self.get_database_check_state().await?;
+        if database_check_state == DatabaseCheckState::NeedsGenesis {
+            tracing::info!("Applying genesis block setup data to coordinator processor database...");
+            let (_, genesis_block_update) = GenesisDatabaseDataBuilder::setup_for_coordinator::<N::HasherBase, N>(&genesis_data, self.circuit_fingerprint_config.checkpoint_state_transition_circuit_fingerprint)?;
             self.commit_state(genesis_block_update, ProvingJobCircuitType::GenesisBlockCheckpointStateTransition, vec![])
                 .await?;
             tracing::info!("Genesis block setup data applied to coordinator processor database.");
@@ -739,12 +754,12 @@ Checkpoint Root Hash: {}
         deploy_contract_gatherer_backup_directory: &str,
         register_user_gatherer_backup_directory: &str,
         guta_gatherer_backup_directory: &str,
-        genesis_data: &PsyGenesisBlockSetupData<N::F, N::QHash>,
+        genesis_block_update: PsyPreparedCoordinatorBlockStateUpdates<N::F, N::QHash>,
         global_user_tree: &mut SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>,
         global_contract_tree: &mut SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>,
         user_registration_tree: &mut SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>,
     ) -> anyhow::Result<()> {
-        self.ensure_genesis_applied(genesis_data).await?;
+        self.ensure_genesis_applied(genesis_block_update).await?;
         self.ensure_backup_restored_if_necessary(
             file_system,
             deploy_contract_gatherer_backup_directory,

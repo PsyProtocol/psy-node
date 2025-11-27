@@ -1,7 +1,7 @@
 use anyhow::Result;
 use cf_utils::timer::DebugTimer;
 use parth_core::utils::signed_helpers::u64_to_i64_exact;
-use parth_node_scylla::utils::{convert_checkpoint_id_to_i64, u8_to_i8_exact};
+use psy_node_scylla::utils::{convert_checkpoint_id_to_i64, u8_to_i8_exact};
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
 use std::env;

@@ -18,3 +18,7 @@ pub struct PsyNodeCircuitFingerprintConfig<Hash>{
     pub deploy_contracts_circuit_whitelist_root: Hash,
     pub checkpoint_state_transition_circuit_fingerprint: Hash,
 }
+
+pub trait PsyNodeCircuitFingerprintConfigProvider<Hash> {
+    fn get_circuit_fingerprint_config_for_network(&self, network: PsyChainNetworkType) -> anyhow::Result<PsyNodeCircuitFingerprintConfig<Hash>>;
+}

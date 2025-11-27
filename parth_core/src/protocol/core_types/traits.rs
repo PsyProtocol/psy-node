@@ -130,7 +130,7 @@ impl<T: QNetworkZKTypesCopier> QNetworkZKTypes for T {
 
     type ZKVerifier = <<T as QNetworkZKTypesCopier>::ZKTypesCopySource as QNetworkZKTypes>::ZKVerifier;
 }
-pub trait QNetworkTypesConfig: QNetworkDatabaseTypes + QNetworkCircuitConstants + QNetworkZKTypes + Sized + Send + Sync + Clone + Default {
+pub trait QNetworkTypesConfig: QNetworkDatabaseTypes + QNetworkCircuitConstants + QNetworkZKTypes + Sized + Send + Sync + Clone {
     type JobId: QJobIdBase;
 }
 
@@ -157,4 +157,13 @@ impl<
     > QNetworkConstantsCopier for QNetworkTypesConfigHelper<JobId, ZKTypes, NetworkConstants>
 {
     type CopySource = NetworkConstants;
+}
+
+impl<
+        JobId: QJobIdBase + 'static,
+        ZKTypes: QNetworkZKTypes + 'static + Clone + Send + Sync,
+        NetworkConstants: QNetworkConstants + 'static + Clone + Send + Sync,
+    > QNetworkTypesConfig for QNetworkTypesConfigHelper<JobId, ZKTypes, NetworkConstants>
+{
+    type JobId = JobId;
 }

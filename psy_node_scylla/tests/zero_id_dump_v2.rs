@@ -5,7 +5,7 @@ use std::{collections::HashMap, hash::Hash, sync::{Arc, RwLock}};
 use dashmap::DashMap;
 use parth_core::{crypto::hash::traits::MerkleZeroHasher, data::{db::table::QDatabaseTableRoutingKey, hash::{hash256::Hash256, merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}}, serializable::QPDPair}, protocol::core_types::{QDBHashBase}};
 use parth_crypto::hash::sha256::CoreSha256Hasher;
-use parth_node_scylla::{core::ScyllaCoreStore, tables::merkle::ScyllaMerkleNodesZeroPreparedStatements};
+use psy_node_scylla::{core::ScyllaCoreStore, tables::merkle::ScyllaMerkleNodesZeroPreparedStatements};
 use psy_node_core::store::traits::{core_db::{CoreDatabaseZeroIdMerkleDumpReader, CoreDatabaseZeroIdMerkleReader, CoreDatabaseZeroIdMerkleStore}, helpers::db_helper_zero_id_merkle_node_simple_set_leaves};
 
 use serde::Serialize;

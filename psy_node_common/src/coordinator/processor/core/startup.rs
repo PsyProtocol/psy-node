@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use parth_core::{protocol::core_types::QNetworkTypesConfig, QCoreProcCheckpointUniqueId};
 use psy_core::job::job_id::QProvingJobDataID;
-use psy_data::genesis::genesis_block_setup::PsyGenesisBlockSetupData;
+use psy_data::{genesis::genesis_block_setup::PsyGenesisBlockSetupData, prepared_block::coordinator::PsyPreparedCoordinatorBlockStateUpdates};
 use psy_io::tokio::TokioLikeFileSystem;
 use psy_node_core::{
     psy_core_db::traits::full::{PsyCoordinatorProcessorStore, PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter},
@@ -65,7 +65,7 @@ where
             ProofStore,
             FileSystem,
         >,
-        genesis_data: &PsyGenesisBlockSetupData<N::F, N::QHash>,
+        genesis_block_update: PsyPreparedCoordinatorBlockStateUpdates<N::F, N::QHash>,
         file_system: Arc<FileSystem>,
         deploy_contract_gatherer_backup_directory: String,
         register_user_gatherer_backup_directory: String,
@@ -90,7 +90,7 @@ where
             &deploy_contract_gatherer_backup_directory,
             &register_user_gatherer_backup_directory,
             &guta_gatherer_backup_directory,
-            genesis_data,
+            genesis_block_update,
             &mut global_user_tree,
             &mut global_contract_tree,
             &mut user_registration_tree,

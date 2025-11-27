@@ -18,7 +18,7 @@ use parth_core::{
     data::queue::queue_key::{PCoreQueueItemBase, PCoreStandardQueueKeyForRealm, QPBaseQueueType, QPStandardUniqueIdQueueKey},
     QCoreProcCheckpointUniqueId,
 };
-use parth_node_nats::queue::NatsJetStreamClient;
+use psy_node_nats::queue::NatsJetStreamClient;
 use psy_core::job::job_id::QProvingJobDataID;
 use psy_node_core::queue::{
     ephemeral::{QStandardEphemeralQueuePublisher, QStandardEphemeralQueueSubscriber},

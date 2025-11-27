@@ -4,7 +4,7 @@ use parth_core::data::hash::hash256::Hash256;
 use parth_core::data::hash::merkle_node_key::SimpleMerkleNode;
 use parth_core::utils::signed_helpers::u64_to_i64_exact;
 use parth_core::utils::QPGenRandom;
-use parth_node_scylla::utils::{convert_checkpoint_id_to_i64};
+use psy_node_scylla::utils::{convert_checkpoint_id_to_i64};
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
 use std::env;

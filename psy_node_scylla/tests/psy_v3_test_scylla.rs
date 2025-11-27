@@ -8,7 +8,7 @@ use parth_core::{
     protocol::core_types::{QNetworkHashTypes, QNetworkTreeConstants},
 };
 use parth_crypto::hash::sha256::CoreSha256Hasher;
-use parth_node_scylla::{
+use psy_node_scylla::{
     core::ScyllaCoreStore,
     tables::{
         blob::ScyllaBiDirectionalBlobToBlobTablePreparedStatements,
@@ -111,7 +111,7 @@ fn get_rk(table_id: u64) -> QDatabaseTableRoutingKey {
 }
 
 impl SimpleStoreEx {
-    pub async fn setup(store: Arc<ScyllaTestStore>) -> anyhow::Result<Self> {
+    pub async fn setup(store: Arc<ScyllaCoreStore<ExHash, ExHasher>>) -> anyhow::Result<Self> {
         let checkpoint_leaf_table = store.init_std_table::<ExKivTableIdentifier>("checkpoint_leaf_table", get_rk(1)).await?;
         let checkpoint_root_to_checkpoint_id_table = store
             .init_std_table::<ExBiDirectionalMappingTableIdentifier>("checkpoint_root_to_checkpoint_id_table", get_rk(2))

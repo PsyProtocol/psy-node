@@ -15,7 +15,7 @@ use parth_core::{
     protocol::core_types::QDBHashBase,
     utils::QPGenRandom,
 };
-use parth_node_scylla::{core::ScyllaCoreStore, tables::merkle::ScyllaDoubleMerkleNodesPreparedStatements};
+use psy_node_scylla::{core::ScyllaCoreStore, tables::merkle::ScyllaDoubleMerkleNodesPreparedStatements};
 use psy_node_core::qblob::{
     data_views::double_merkle_node_batch::QBlobDoubleMerkleNodeBatchDataView,
     structs::common::{blob_metadata_header::QBlobWriterContextMetadataHeader, tree_node_batch_header::QBLOB_TREE_NODE_BATCH_HEADER_SIZE},

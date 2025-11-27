@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{fs::File, sync::Arc};
 
 use parth_common::memory_stores::{dash_tree_append_only::PsyDashMemoryAppendOnlyMerkleStore, traits::PsyMemoryMerkleStoreImm};
 use parth_core::{
@@ -7,17 +7,20 @@ use parth_core::{
     protocol::core_types::Q256BitHash,
 };
 use psy_core::constants::stale_checkpoint::STALE_CHECKPOINT_AGE_REALM_TO_COORDINATOR_PROOF;
-use psy_io::tokio::TokioFileLike;
+use psy_io::tokio::{TokioFileLike, TokioLikeFileSystem};
 use psy_node_core::{psy_core_db::traits::full::PsyNodeCheckpointTreeDatabaseReader, utils::fragmented_split::FragmentedSplits};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
-pub struct CheckpointTreeBackupManager<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std::hash::Hash, File: TokioFileLike> {
+pub struct CheckpointTreeBackupManager<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std::hash::Hash, FileSystem: TokioLikeFileSystem> {
     pub checkpoint_tree: Arc<PsyDashMemoryAppendOnlyMerkleStore<Hasher, Hash>>,
     pub next_backup_index: u64,
     pub max_checkpoints_to_keep: u64,
     pub min_backed_up_checkpoint_id: u64,
     pub total_checkpoint_writes: u64,
     pub next_backup_checkpoint_id: u64,
-    pub backup_file: File,
+    pub backup_file_path: String,
+    pub backup_file: FileSystem::File,
+    pub file_system: Arc<FileSystem>,
 }
 
 const CHECKPOINT_BACKUP_MAGIC_LEN: usize = 8;
@@ -111,19 +114,23 @@ pub async fn create_new_checkpoint_backup_manager_from_file_path<
     Hasher: MerkleZeroHasher<Hash>,
     Hash: Eq + Copy + PartialEq + Default + std::hash::Hash + Q256BitHash,
     CheckpointTreeStore: PsyNodeCheckpointTreeDatabaseReader<Hash>,
+    FileSystem: TokioLikeFileSystem,
 >(
+    file_system: Arc<FileSystem>,
     max_checkpoints_to_keep: u64,
     checkpoint_tree_height: u8,
     checkpoint_tree_store: &CheckpointTreeStore,
     backup_file_path: &str,
     allow_create_file: bool,
-) -> anyhow::Result<CheckpointTreeBackupManager<Hasher, Hash, tokio::fs::File>> {
+) -> anyhow::Result<CheckpointTreeBackupManager<Hasher, Hash, FileSystem>> {
     let backup_file = if allow_create_file {
-        tokio::fs::File::create(backup_file_path).await?
+        file_system.file_like_fs_create(backup_file_path).await?
     } else {
-        tokio::fs::File::open(backup_file_path).await?
+        file_system.file_like_fs_open(backup_file_path).await?
     };
     CheckpointTreeBackupManager::new_from_file(
+        file_system,
+        backup_file_path.to_string(),
         max_checkpoints_to_keep,
         checkpoint_tree_height,
         checkpoint_tree_store,
@@ -132,6 +139,8 @@ pub async fn create_new_checkpoint_backup_manager_from_file_path<
     )
     .await
 }
+
+/*
 pub async fn create_new_checkpoint_backup_manager_from_buffer<
     Hasher: MerkleZeroHasher<Hash>,
     Hash: Eq + Copy + PartialEq + Default + std::hash::Hash + Q256BitHash,
@@ -152,11 +161,12 @@ pub async fn create_new_checkpoint_backup_manager_from_buffer<
         allow_create_file,
     )
     .await
-}
-impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std::hash::Hash + Q256BitHash, File: TokioFileLike>
-    CheckpointTreeBackupManager<Hasher, Hash, File>
+}*/
+impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std::hash::Hash + Q256BitHash, FileSystem: TokioLikeFileSystem>
+    CheckpointTreeBackupManager<Hasher, Hash, FileSystem>
 {
     pub async fn new_from_file_path<CheckpointTreeStore: PsyNodeCheckpointTreeDatabaseReader<Hash>>(
+        file_system: Arc<FileSystem>,
         max_checkpoints_to_keep: u64,
         checkpoint_tree_height: u8,
         checkpoint_tree_store: &CheckpointTreeStore,
@@ -164,11 +174,13 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std
         allow_create_file: bool,
     ) -> anyhow::Result<Self> {
         let backup_file = if allow_create_file {
-            File::file_like_create(backup_file_path).await?
+            file_system.file_like_fs_create(backup_file_path).await?
         } else {
-            File::file_like_open(backup_file_path).await?
+            file_system.file_like_fs_open(backup_file_path).await?
         };
         Self::new_from_file(
+            file_system,
+            backup_file_path.to_string(),
             max_checkpoints_to_keep,
             checkpoint_tree_height,
             checkpoint_tree_store,
@@ -178,14 +190,16 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std
         .await
     }
     pub async fn new_from_file<CheckpointTreeStore: PsyNodeCheckpointTreeDatabaseReader<Hash>>(
+        file_system: Arc<FileSystem>,
+        backup_file_path: String,
         max_checkpoints_to_keep: u64,
         checkpoint_tree_height: u8,
         checkpoint_tree_store: &CheckpointTreeStore,
-        mut backup_file: File,
+        mut backup_file: FileSystem::File,
         allow_create_file: bool,
     ) -> anyhow::Result<Self> {
         let (checkpoint_tree_start, checkpoint_tree_end, hash_offset, file_size, leaf_nodes) =
-            setup_checkpoint_backup_file_dashmap::<Hash, File>(&mut backup_file, allow_create_file).await?;
+            setup_checkpoint_backup_file_dashmap::<Hash, FileSystem::File>(&mut backup_file, allow_create_file).await?;
         let file_size_minus_magic = if file_size >= CHECKPOINT_BACKUP_MAGIC_LEN as u64 {
             file_size - CHECKPOINT_BACKUP_MAGIC_LEN as u64
         } else {
@@ -233,6 +247,8 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std
             .await?;
 
         Ok(Self {
+            backup_file_path,
+            file_system: file_system,
             checkpoint_tree,
             next_backup_index: next_backup_index,
             min_backed_up_checkpoint_id: checkpoint_tree_start,
@@ -291,6 +307,7 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std
         self.backup_file.write_u64_le(checkpoint_id).await?;
         let checkpoint_hash_bytes = checkpoint_hash.into_owned_32bytes();
         self.backup_file.write_all(&checkpoint_hash_bytes).await?;
+        self.file_system.file_like_fs_flush_file_with_path(&self.backup_file_path, &mut self.backup_file).await?;
         self.next_backup_index += 1;
         if self.next_backup_index >= self.max_checkpoints_to_keep {
             self.next_backup_index = 0;

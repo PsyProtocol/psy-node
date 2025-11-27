@@ -15,7 +15,7 @@ use parth_core::{
         QPGenRandom,
     },
 };
-use parth_node_scylla::utils::{convert_checkpoint_id_to_i64, i8_to_u8_exact};
+use psy_node_scylla::utils::{convert_checkpoint_id_to_i64, i8_to_u8_exact};
 use scylla::{
     client::{session::Session, session_builder::SessionBuilder},
     response::PagingState,

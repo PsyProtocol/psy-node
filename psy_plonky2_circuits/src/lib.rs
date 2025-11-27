@@ -15,3 +15,4 @@ pub mod circuit_library;
 pub mod zk_verifier;
 pub mod protocol_types;
 pub mod guta_v2;
+pub mod node;

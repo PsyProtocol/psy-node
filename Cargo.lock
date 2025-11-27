@@ -2393,85 +2393,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "parth_node_nats"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-nats",
- "async-trait",
- "auto_impl",
- "bincode",
- "bytes",
- "criterion",
- "dashmap",
- "futures",
- "hex",
- "hex-literal",
- "parth_common",
- "parth_core",
- "parth_crypto",
- "postcard",
- "pser",
- "psy_common",
- "psy_core",
- "psy_data",
- "psy_node_core",
- "rand 0.8.5",
- "rkyv",
- "serde",
- "serde_json",
- "serde_repr",
- "serde_with",
- "speedy",
- "strum",
- "strum_macros",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "parth_node_scylla"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "auto_impl",
- "bincode",
- "bytes",
- "cf_utils",
- "criterion",
- "dashmap",
- "futures",
- "hex",
- "hex-literal",
- "parth_common",
- "parth_core",
- "parth_crypto",
- "pderive",
- "postcard",
- "pser",
- "psy_data",
- "psy_node_core",
- "psy_serialize",
- "rand 0.8.5",
- "rand_chacha 0.3.1",
- "rayon",
- "rkyv",
- "scylla",
- "serde",
- "serde_json",
- "serde_repr",
- "serde_with",
- "speedy",
- "strum",
- "strum_macros",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2931,6 +2852,11 @@ dependencies = [
  "psy_io",
  "psy_node_common",
  "psy_node_core",
+ "psy_node_nats",
+ "psy_node_redis",
+ "psy_node_scylla",
+ "psy_node_store_memory",
+ "psy_plonky2_circuits",
  "psy_serialize",
  "rand 0.8.5",
  "rkyv",
@@ -3038,6 +2964,44 @@ dependencies = [
 ]
 
 [[package]]
+name = "psy_node_nats"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-nats",
+ "async-trait",
+ "auto_impl",
+ "bincode",
+ "bytes",
+ "criterion",
+ "dashmap",
+ "futures",
+ "hex",
+ "hex-literal",
+ "parth_common",
+ "parth_core",
+ "parth_crypto",
+ "postcard",
+ "pser",
+ "psy_common",
+ "psy_core",
+ "psy_data",
+ "psy_node_core",
+ "rand 0.8.5",
+ "rkyv",
+ "serde",
+ "serde_json",
+ "serde_repr",
+ "serde_with",
+ "speedy",
+ "strum",
+ "strum_macros",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "psy_node_redis"
 version = "0.1.0"
 dependencies = [
@@ -3071,6 +3035,47 @@ dependencies = [
  "strum_macros",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "psy_node_scylla"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "auto_impl",
+ "bincode",
+ "bytes",
+ "cf_utils",
+ "criterion",
+ "dashmap",
+ "futures",
+ "hex",
+ "hex-literal",
+ "parth_common",
+ "parth_core",
+ "parth_crypto",
+ "pderive",
+ "postcard",
+ "pser",
+ "psy_data",
+ "psy_node_core",
+ "psy_serialize",
+ "rand 0.8.5",
+ "rand_chacha 0.3.1",
+ "rayon",
+ "rkyv",
+ "scylla",
+ "serde",
+ "serde_json",
+ "serde_repr",
+ "serde_with",
+ "speedy",
+ "strum",
+ "strum_macros",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

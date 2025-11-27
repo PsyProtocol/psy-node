@@ -7,11 +7,11 @@ use parth_common::{
 };
 use parth_core::{
     crypto::hash::{
-        merkle_proof::{DeltaMerkleProofCore, MerkleProofCore, compute_root_merkle_proof_generic},
-        traits::{FieldQHasher, MerkleHasher, QFieldHashable},
+        merkle_proof::{compute_root_merkle_proof_generic, DeltaMerkleProofCore, MerkleProofCore},
+        traits::{FieldQHasher, QFieldHashable},
     },
     data::{
-        db::hash_id_u64::{PSY_OBJECT_FFS_SIZE_HASH_256_AND_U64, QHash256AndU64},
+        db::hash_id_u64::{QHash256AndU64, PSY_OBJECT_FFS_SIZE_HASH_256_AND_U64},
         hash::{fast_node_serializer::QMerkleStoreFastZeroNodeSerializer, merkle_node_nest::MerkleLeafNode},
     },
     felt::QFelt64,
@@ -19,13 +19,19 @@ use parth_core::{
 };
 use psy_core::user_id::get_user_id_from_registration_id;
 use psy_data::{
-    genesis::genesis_block_setup::PsyGenesisBlockSetupData, prepared_block::{common::PsyCoordinatorPendingCheckpointBase, coordinator::PsyPreparedCoordinatorBlockStateUpdates}, protocol::checkpoint_transition_hash::CheckpointStateHashTransition, v1::qdata::{
+    genesis::genesis_block_setup::PsyGenesisBlockSetupData,
+    prepared_block::{common::PsyCoordinatorPendingCheckpointBase, coordinator::PsyPreparedCoordinatorBlockStateUpdates},
+    protocol::{
+        checkpoint_transition_hash::{CheckpointStateHashTransition, CheckpointStateTransitionPublicInputs},
+        verifiable_checkpoint_transition::PsyVerifiableCheckpointTransition,
+    },
+    v1::qdata::{
         checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, PQEDCheckpointLeafStats, QEDL2BlockState},
         contract::{ContractCodeDefinitionWithContractId, PQEDContractLeaf},
         ffs_sizes::{PSY_OBJECT_FFS_SIZE_CONTRACT_LEAF, PSY_OBJECT_FFS_SIZE_USER_LEAF, PSY_OBJECT_FFS_SIZE_ZK_PUBLIC_KEY},
         populated_checkpoint::PsyCheckpointLeafPopulated,
         user::PQEDUserLeaf,
-    }
+    },
 };
 use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingleFixedTemplate;
 pub const GENESIS_INJEST_ALL_USERS_REALM_ID: u64 = 0xFFFFFFFFFFFFFFFF;
@@ -350,10 +356,7 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
             checkpoint_tree_root,
         }
     }
-    pub fn get_genesis_state_transition<Hasher: FieldQHasher<F, Hash>>(
-        &self,
-        checkpoint_tree_height: u8,
-    ) -> CheckpointStateHashTransition<Hash> {
+    pub fn get_genesis_state_transition<Hasher: FieldQHasher<F, Hash>>(&self, checkpoint_tree_height: u8) -> CheckpointStateHashTransition<Hash> {
         let pending_checkpoint_base = self.get_coordinator_pending_checkpoint_base::<Hasher>(checkpoint_tree_height);
 
         CheckpointStateHashTransition {
@@ -363,16 +366,17 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
             new_checkpoint_leaf_hash: pending_checkpoint_base.checkpoint_leaf_hash,
         }
     }
-    pub fn get_genesis_state_transition_hash<Hasher: FieldQHasher<F, Hash>>(
-        &self,
-        checkpoint_tree_height: u8,
-    ) -> Hash {
+    pub fn get_genesis_state_transition_hash<Hasher: FieldQHasher<F, Hash>>(&self, checkpoint_tree_height: u8) -> Hash {
         self.get_genesis_state_transition::<Hasher>(checkpoint_tree_height).get_hash::<Hasher>()
     }
 
     pub fn setup_for_coordinator<Hasher: FieldQHasher<F, Hash>, N: QNetworkConstants>(
         genesis_block: &PsyGenesisBlockSetupData<F, Hash>,
-    ) -> anyhow::Result<PsyPreparedCoordinatorBlockStateUpdates<F, Hash>> {
+        checkpoint_state_transition_circuit_fingerprint: Hash,
+    ) -> anyhow::Result<(
+        PsyVerifiableCheckpointTransition<F, Hash>,
+        PsyPreparedCoordinatorBlockStateUpdates<F, Hash>,
+    )> {
         let mut builder = GenesisDatabaseDataBuilder::new(
             genesis_block.deposit_tree_root,
             genesis_block.withdrawal_tree_root,
@@ -396,22 +400,33 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
             siblings,
             index: 0,
         };
-        Ok(PsyPreparedCoordinatorBlockStateUpdates {
-            coordinator_id: 0,
-            checkpoint_id: 0,
-            unique_pending_id: 0,
-            proc_checkpoint_unique_id: 0,
-            old_base: pending_checkpoint_base.clone(),
-            new_base: pending_checkpoint_base,
-            update_global_contract_tree_nodes_ffs: builder.global_contract_tree_nodes_ffs,
-            update_contract_function_tree_nodes_ffs: builder.contract_function_tree_nodes_ffs,
-            new_contract_leaves_ffs: builder.contract_leaves_ffs,
-            new_contract_code_definitions: builder.contract_code_definitions,
-            update_user_registration_tree_nodes_ffs: builder.user_registration_tree_nodes_ffs,
-            new_user_public_keys_ffs: builder.public_keys_ffs,
-            new_public_key_hash_to_user_id_rows_ffs: builder.public_key_hash_to_user_id_rows_ffs,
-            update_global_user_tree_nodes_ffs: builder.global_user_tree_nodes_ffs,
-            checkpoint_tree_update_proof: checkpoint_tree_update_proof,
-        })
+        let verifiable_checkpoint_transition = PsyVerifiableCheckpointTransition {
+            state_transition: CheckpointStateTransitionPublicInputs {
+                checkpoint_transition: builder.get_genesis_state_transition::<Hasher>(N::CHECKPOINT_TREE_HEIGHT),
+                genesis_checkpoint_state_transition_hash: builder.get_genesis_state_transition_hash::<Hasher>(N::CHECKPOINT_TREE_HEIGHT),
+                checkpoint_state_transition_circuit_fingerprint,
+            },
+            checkpoint_leaf: builder.get_populated_checkpoint_leaf(),
+        };
+        Ok((
+            verifiable_checkpoint_transition,
+            PsyPreparedCoordinatorBlockStateUpdates {
+                coordinator_id: 0,
+                checkpoint_id: 0,
+                unique_pending_id: 0,
+                proc_checkpoint_unique_id: 0,
+                old_base: pending_checkpoint_base.clone(),
+                new_base: pending_checkpoint_base,
+                update_global_contract_tree_nodes_ffs: builder.global_contract_tree_nodes_ffs,
+                update_contract_function_tree_nodes_ffs: builder.contract_function_tree_nodes_ffs,
+                new_contract_leaves_ffs: builder.contract_leaves_ffs,
+                new_contract_code_definitions: builder.contract_code_definitions,
+                update_user_registration_tree_nodes_ffs: builder.user_registration_tree_nodes_ffs,
+                new_user_public_keys_ffs: builder.public_keys_ffs,
+                new_public_key_hash_to_user_id_rows_ffs: builder.public_key_hash_to_user_id_rows_ffs,
+                update_global_user_tree_nodes_ffs: builder.global_user_tree_nodes_ffs,
+                checkpoint_tree_update_proof: checkpoint_tree_update_proof,
+            },
+        ))
     }
 }

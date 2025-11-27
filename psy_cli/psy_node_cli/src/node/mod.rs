@@ -1,3 +1,3 @@
-pub fn print_message(config_path: &str) {
-    println!("Worker CLI started with config path: {}", config_path);
-}
+pub mod coordinator_edge;
+pub mod startup_plonky2_scylla;
+pub mod scylla_helper;

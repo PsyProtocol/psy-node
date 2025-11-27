@@ -42,6 +42,34 @@ pub struct CoordinatorProcessorStartConfig {
     pub verbose: bool,
     pub checkpoint_backup_path: String,
 }
+impl CoordinatorProcessorStartConfig {
+    pub fn get_checkpoint_tree_backup_file_path(&self) -> String {
+        format!(
+            "{}/coordinator_{}_{}/checkpoint_tree.bin",
+            self.checkpoint_backup_path, self.coordinator_id, self.coordinator_sub_id
+        )
+    }
+    pub fn get_register_users_backup_path(&self) -> String {
+        format!(
+            "{}/coordinator_{}_{}/register_users_backup",
+            self.checkpoint_backup_path, self.coordinator_id, self.coordinator_sub_id
+        )
+    }
+    pub fn get_deploy_contracts_backup_path(&self) -> String {
+        format!(
+            "{}/coordinator_{}_{}/deploy_contracts_backup",
+            self.checkpoint_backup_path, self.coordinator_id, self.coordinator_sub_id
+        )
+    }
+    pub fn get_guta_updates_backup_path(&self) -> String {
+        format!(
+            "{}/coordinator_{}_{}/guta_updates_backup",
+            self.checkpoint_backup_path, self.coordinator_id, self.coordinator_sub_id
+        )
+    }
+}
+
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CoordinatorEdgeStartConfig {
     pub scylla_db_url: String,

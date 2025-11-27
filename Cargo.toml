@@ -191,6 +191,7 @@ psy_api_core = { path = "./psy_api_core" }
 
 psy_node_redis = { path = "./psy_node_redis" }
 psy_node_nats = { path = "./psy_node_nats" }
+psy_node_scylla = { path = "./psy_node_scylla" }
 psy_node_store_memory = { path = "./psy_node_store_memory" }
 
 

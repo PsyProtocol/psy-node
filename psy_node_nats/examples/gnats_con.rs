@@ -14,7 +14,7 @@ use async_nats::{
 use bytes::Bytes;
 use futures::{stream::FuturesUnordered, StreamExt};
 use parth_core::data::queue::queue_key::{PCoreSubjectQueueBase, QPBaseQueueType, QPStandardUniqueIdQueueKey};
-use parth_node_nats::queue::{JetStreamAckMode, NatsJetStreamClient};
+use psy_node_nats::queue::{JetStreamAckMode, NatsJetStreamClient};
 use psy_core::job::job_id::QProvingJobDataID;
 use tokio::task::JoinSet;
 

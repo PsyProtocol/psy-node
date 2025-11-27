@@ -1,6 +1,6 @@
 use criterion::Criterion;
 use parth_core::{crypto::hash::traits::MerkleZeroHasher, data::{db::table::QDatabaseTableRoutingKey, hash::{hash256::Hash256, merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}, merkle_store_key::{QMerkleStoreDoubleIdKey, QMerkleStoreDoubleIdNode, QMerkleStoreSingleIdKey, QMerkleStoreSingleIdNode}}}, pgoldilocks::{PGoldilocksHash, PoseidonHasher}, protocol::core_types::QDBHashBase, utils::QPGenRandom};
-use parth_node_scylla::{core::ScyllaCoreStore, tables::merkle::{ScyllaDoubleMerkleNodesPreparedStatements, ScyllaMerkleNodesPreparedStatements, ScyllaMerkleNodesZeroPreparedStatements}};
+use psy_node_scylla::{core::ScyllaCoreStore, tables::merkle::{ScyllaDoubleMerkleNodesPreparedStatements, ScyllaMerkleNodesPreparedStatements, ScyllaMerkleNodesZeroPreparedStatements}};
 use psy_node_core::{qblob::{blob_type::QBlobMerkleNodeTreeType, data_views::{double_merkle_node_batch::QBlobDoubleMerkleNodeBatchDataView, single_merkle_node_batch::QBlobSingleMerkleNodeBatchDataView, zero_merkle_node_batch::QBlobZeroMerkleNodeBatchDataView}, structs::common::{blob_metadata_header::QBlobWriterContextMetadataHeader, tree_node_batch_header::QBLOB_TREE_NODE_BATCH_HEADER_SIZE}}, store::traits::core_db::{CoreDatabaseDoubleIdMerkleWriter, CoreDatabaseSingleIdMerkleWriter, CoreDatabaseZeroIdMerkleWriter}};
 
 
