@@ -11,7 +11,6 @@ use parth_core::{
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{
     guta::header_extended::{GlobalUserTreeAggregatorHeaderWithTagValueAndJobID, GlobalUserTreeAggregatorHeaderWithTagValueAndJobType},
-    proof_input::guta::SubmitGUTARealmResultAPINoProofInput,
     v1::{
         common_api::PsyProoffMinerRewardProof,
         qdata::{
@@ -26,12 +25,11 @@ use psy_node_core::{
     queue::{ephemeral::QStandardEphemeralQueuePublisher, worker_queue::QStandardWorkerQueueSubscriber},
     store::traits::proof_store::QParthProofStore,
 };
-use psy_serialize::{FastFixedSerializable, PsyCanonicalDatabaseSerializeBaseSingle};
+use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 
-use crate::{
-    coordinator::queue_key::{CoordinatorDeployContractQueueKey, CoordinatorRegisterUserPublicKeyQueueKey, CoordinatorSubmitRealmGUTAUpdateQueueKey},
-    realm::edge::error::RpcError,
-};
+use crate::
+    coordinator::queue_key::{CoordinatorDeployContractQueueKey, CoordinatorRegisterUserPublicKeyQueueKey, CoordinatorSubmitRealmGUTAUpdateQueueKey}
+;
 
 const END_CAP_PROOF_CIRCUIT_TYPE_U32: u32 = ProvingJobCircuitType::UserEndCap as u32;
 #[derive(Clone)]

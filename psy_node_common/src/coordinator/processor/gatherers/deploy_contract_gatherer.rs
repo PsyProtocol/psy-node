@@ -1,27 +1,14 @@
 use std::{
     io::SeekFrom,
     path::PathBuf,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, RwLock,
-    },
+    sync::{Arc, RwLock},
 };
 
 use async_trait::async_trait;
-use futures::{
-    stream::{self, StreamExt},
-    TryFutureExt,
-};
 use parth_common::memory_stores::mem_tree_recorder::SimpleMemoryMerkleRecorderStore;
 use parth_core::{
-    crypto::hash::{
-        spiderman::SpidermanUpdateProof,
-        traits::{FieldQHasher, MerkleZeroHasher, QFieldHashable},
-    },
-    data::{
-        db::hash_id_u64::{get_data_buffer_for_hash256_and_u64s, QHash256AndU64},
-        hash::merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey, PSY_OBJECT_FFS_SIZE_SIMPLE_MERKLE_NODE},
-    },
+    crypto::hash::traits::{FieldQHasher, MerkleZeroHasher, QFieldHashable},
+    data::hash::merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey, PSY_OBJECT_FFS_SIZE_SIMPLE_MERKLE_NODE},
     felt::QFelt64,
     node::realm_identifier::QRealmIdentifier,
     protocol::core_types::{Q256BitHash, QDBHashBase, QFHashBase, QNetworkTypesConfig},
@@ -30,19 +17,16 @@ use parth_core::{
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{
     agg::{
-        tree_agg_v2::{plan_jobs_for_tree_agg, plan_jobs_for_tree_agg_offset_root, BasicTreePlannerHelper},
+        tree_agg_v2::{plan_jobs_for_tree_agg_offset_root, BasicTreePlannerHelper},
         AggStateTrackableInput, AggStateTransitionInputV2, AggStateTransitionWithStats, DummyAggStateTransition,
     },
-    protocol::circuit_inputs::{
-        append_user_registration_tree::QCAppendUserRegistrationTreeCircuitInput, deploy_contracts::QCBatchDeployContractsCircuitInput,
-    },
+    protocol::circuit_inputs::deploy_contracts::QCBatchDeployContractsCircuitInput,
     rewards_tree::offsets::{DEPLOY_CONTRACTS_REWARDS_TREE_OFFSET_ROOT_INDEX, DEPLOY_CONTRACTS_REWARDS_TREE_OFFSET_ROOT_LEVEL},
     v1::qdata::{
         contract::{ContractCodeDefinition, ContractCodeDefinitionWithContractId, PQEDContractLeaf, PsyDeployContractQueueItem},
         ffs_sizes::PSY_OBJECT_FFS_SIZE_CONTRACT_LEAF,
-        public_key::PZKPublicKeyInfo,
     },
-    worker::{metadata::PsyProvingJobMetadata, metadata_with_job_id::PsyProvingJobMetadataWithJobId},
+    worker::metadata_with_job_id::PsyProvingJobMetadataWithJobId,
 };
 use psy_io::tokio::{TokioFileLike, TokioLikeFileSystem};
 use psy_node_core::{
@@ -68,11 +52,11 @@ pub fn get_new_deploy_contract_gatherer_backup_file_path(
     realm_id_u64: u64,
     realm_sub_id_u64: u64,
     pending_unique_id: u64,
-) -> PathBuf {
+) -> String {
     PathBuf::from(backup_file_directory).join(format!(
         "deploy_contract_gatherer_realm_{}_sub_{}_pending_{}.backup",
         realm_id_u64, realm_sub_id_u64, pending_unique_id
-    ))
+    )).to_string_lossy().to_string()
 }
 
 pub async fn read_deploy_contract_gatherer_backup_file_path<
@@ -375,7 +359,7 @@ impl<
         );
         let mut new_contracts_file: FileSystem::File = config
             .file_system
-            .file_like_fs_create(&new_deploy_contract_file_path.to_string_lossy())
+            .file_like_fs_create(&new_deploy_contract_file_path)
             .await?;
         let start_next_contract_id = config.last_job_next_contract_id.read().unwrap().clone();
         if tree.get_leaf_value(start_next_contract_id) != N::HasherBase::get_zero_hash(0) {
@@ -409,13 +393,13 @@ impl<
             new_global_contract_tree_leaves: Vec::new(),
 
             new_contracts_file,
-            pending_file_path: new_deploy_contract_file_path.to_string_lossy().to_string(),
+            pending_file_path: new_deploy_contract_file_path,
             next_contract_id: start_next_contract_id,
         })
     }
     async fn update_from_queue_item_with_tree(
         &mut self,
-        tree: &mut SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>,
+        _tree: &mut SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>,
         item: Vec<u8>,
     ) -> anyhow::Result<()> {
         if item.len() <= PQEDContractLeaf::<N::F, N::QHash>::FIXED_SIZE + 16 + 4 + 32 {

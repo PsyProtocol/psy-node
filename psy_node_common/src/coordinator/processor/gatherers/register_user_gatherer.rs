@@ -18,20 +18,20 @@ use parth_core::{
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{
     agg::{
-        tree_agg_v2::{plan_jobs_for_tree_agg, plan_jobs_for_tree_agg_offset_root, BasicTreePlannerHelper},
+        tree_agg_v2::{plan_jobs_for_tree_agg_offset_root, BasicTreePlannerHelper},
         AggStateTrackableInput, AggStateTransitionInputV2, AggStateTransitionWithStats, DummyAggStateTransition,
     },
     protocol::circuit_inputs::append_user_registration_tree::QCAppendUserRegistrationTreeCircuitInput,
     rewards_tree::offsets::{REGISTER_USERS_REWARDS_TREE_OFFSET_ROOT_INDEX, REGISTER_USERS_REWARDS_TREE_OFFSET_ROOT_LEVEL},
     v1::qdata::public_key::PZKPublicKeyInfo,
-    worker::{metadata::PsyProvingJobMetadata, metadata_with_job_id::PsyProvingJobMetadataWithJobId},
+    worker::metadata_with_job_id::PsyProvingJobMetadataWithJobId,
 };
 use psy_io::tokio::{TokioFileLike, TokioLikeFileSystem};
 use psy_node_core::{
     psy_temp_db::StandardProcessorTempDBStoreBase, qblob::data_views::zero_merkle_node_batch::create_ffs_merkle_nodes_zero_id_from_hash_map,
 };
 use psy_serialize::{FastFixedSerializable, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 
 use crate::{
     coordinator::processor::processor_shared_status::PsyCoordinatorProcessorSharedStatus, queue::gatherer_builder::QueueGathererItemBuilderWithTree,
@@ -45,11 +45,11 @@ pub fn get_new_register_user_gatherer_backup_file_path(
     realm_id_u64: u64,
     realm_sub_id_u64: u64,
     pending_unique_id: u64,
-) -> PathBuf {
+) -> String {
     PathBuf::from(backup_file_directory).join(format!(
         "register_user_gatherer_realm_{}_sub_{}_pending_{}.backup",
         realm_id_u64, realm_sub_id_u64, pending_unique_id
-    ))
+    )).to_string_lossy().to_string()
 }
 
 fn hash_two_from_slice<Hash: Q256BitHash, Hasher: MerkleZeroHasher<Hash>>(data: &[u8]) -> Hash {
@@ -273,7 +273,7 @@ impl<
         );
         let mut new_user_public_keys_file = config
             .file_system
-            .file_like_fs_create(&new_user_public_keys_file_path.to_string_lossy())
+            .file_like_fs_create(&new_user_public_keys_file_path)
             .await?;
         let start_next_user_id = config.last_job_next_user_id.read().unwrap().clone();
         if tree.get_leaf_value(start_next_user_id) != N::HasherBase::get_zero_hash(0) {
@@ -303,13 +303,13 @@ impl<
             new_public_key_hash_to_user_id_rows_ffs: Vec::new(),
             new_user_registration_tree_leaves: Vec::new(),
             new_user_public_keys_file,
-            pending_file_path: new_user_public_keys_file_path.to_string_lossy().to_string(),
+            pending_file_path: new_user_public_keys_file_path,
             next_user_id: start_next_user_id,
         })
     }
     async fn update_from_queue_item_with_tree(
         &mut self,
-        tree: &mut SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>,
+        _tree: &mut SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>,
         item: Vec<u8>,
     ) -> anyhow::Result<()> {
         if item.len() != PZKPublicKeyInfo::<N::QHash>::FIXED_SIZE || PZKPublicKeyInfo::<N::QHash>::FIXED_SIZE != 64 {
@@ -585,9 +585,9 @@ impl<Hash: Q256BitHash>
 #[cfg(test)]
 mod tests {
     use parth_common::memory_stores::mem_tree_recorder::SimpleMemoryMerkleRecorderStore;
-    use parth_core::{crypto::hash::spiderman, pgoldilocks::PoseidonHasher, utils::QPGenRandom};
+    use parth_core::{pgoldilocks::PoseidonHasher, utils::QPGenRandom};
     use psy_core::job::job_id::QProvingJobDataID;
-    use psy_data::gatherer_builders::register_user;
+    use psy_data::agg::tree_agg_v2::plan_jobs_for_tree_agg;
 
     use super::*;
 
@@ -615,7 +615,7 @@ mod tests {
         println!("spiderman groups len: {}", spider_man_groups.len());
 
         let unique_pending_id = 1337u64;
-        let (jobs_for_queue, witneses) =
+        let (jobs_for_queue, _witneses) =
             plan_jobs_for_tree_agg::<JobId, F, Hash, Hasher, QCAppendUserRegistrationTreeCircuitInput<Hash>, AggRegisterUserHelper>(
                 unique_pending_id,
                 start_root,
@@ -664,7 +664,7 @@ mod tests3 {
 
     use anyhow::{anyhow, Result};
     use parth_common::memory_stores::mem_tree_recorder::SimpleMemoryMerkleRecorderStore;
-    use parth_core::{crypto::hash::spiderman, pgoldilocks::PoseidonHasher, utils::QPGenRandom, PHash, PF};
+    use parth_core::{pgoldilocks::PoseidonHasher, utils::QPGenRandom, PHash, PF};
     use psy_core::job::job_id::QProvingJobDataID;
     use psy_data::{
         agg::tree_agg_v2::plan_jobs_for_tree_agg,
@@ -956,24 +956,18 @@ mod tests3 {
 #[cfg(test)]
 mod tests2 {
     use anyhow::{anyhow, Result};
-    use parth_common::memory_stores::mem_tree_recorder::SimpleMemoryMerkleRecorderStore;
     use parth_core::{
-        crypto::hash::{spiderman::SpidermanUpdateProof, traits::MerkleZeroHasher},
         data::hash::merkle_node_key::SimpleMerkleNodeKey,
-        felt::QFelt64,
         pgoldilocks::PoseidonHasher,
-        protocol::core_types::{Q256BitHash, QFHashBase},
         utils::QPGenRandom,
     };
     use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
     use psy_data::{
-        agg::{
-            tree_agg_v2::{plan_jobs_for_tree_agg, BasicTreePlannerHelper},
-            AggStateTransitionInputV2, DummyAggStateTransition,
-        },
+        agg::
+            tree_agg_v2::plan_jobs_for_tree_agg
+        ,
         worker::metadata::{PROOF_REWARD_TREE_HASH_MODE_HASH_CHILDREN_STANDARD, PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN},
     };
-    use psy_serialize::PsySerializeCanonicalAsyncSafe;
 
     use super::*;
     fn compute_max_level(mut num: usize) -> u8 {
@@ -1013,7 +1007,7 @@ mod tests2 {
             return Err(anyhow!("Incorrect number of leaves: expected {}, got {}", num_leaves, leaf_layer.len()));
         }
         for (i, job) in leaf_layer.iter().enumerate() {
-            let expected_key = SimpleMerkleNodeKey {
+            let _expected_key = SimpleMerkleNodeKey {
                 level: max_level,
                 index: i as u64,
             };
@@ -1067,7 +1061,7 @@ mod tests2 {
             }
 
             for (i, job) in current_layer.iter().enumerate() {
-                let expected_key = SimpleMerkleNodeKey {
+                let _expected_key = SimpleMerkleNodeKey {
                     level: current_level,
                     index: i as u64,
                 };

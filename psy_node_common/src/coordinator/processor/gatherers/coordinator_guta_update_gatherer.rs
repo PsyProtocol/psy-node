@@ -1,59 +1,33 @@
 use std::{
     path::PathBuf,
-    sync::{
-        Arc, RwLock, atomic::{AtomicU64, Ordering}
-    },
+    sync::{Arc, RwLock},
 };
 
 use async_trait::async_trait;
-use futures::{
-    stream::{self, StreamExt},
-    TryFutureExt,
-};
 use parth_common::memory_stores::{
     dash_tree_append_only::PsyDashMemoryAppendOnlyMerkleStore, mem_tree_recorder::SimpleMemoryMerkleRecorderStore, traits::PsyMemoryMerkleStoreImm,
 };
 use parth_core::{
-    crypto::hash::{
-        spiderman::SpidermanUpdateProof,
-        traits::{MerkleZeroHasher, QFieldHashable},
-    },
-    data::{
-        db::hash_id_u64::{get_data_buffer_for_hash256_and_u64s, QHash256AndU64},
-        hash::merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey, PSY_OBJECT_FFS_SIZE_SIMPLE_MERKLE_NODE},
-    },
+    crypto::hash::traits::{MerkleZeroHasher, QFieldHashable},
+    data::hash::merkle_node_key::{SimpleMerkleNode, PSY_OBJECT_FFS_SIZE_SIMPLE_MERKLE_NODE},
     felt::{FromPrimitiveValuesFelt, QFelt64, ToU64Value, ZeroableFelt},
     node::realm_identifier::QRealmIdentifier,
-    protocol::{
-        core_types::{Q256BitHash, QDBHashBase, QFHashBase, QNetworkTypesConfig},
-        provider::jobs,
-    },
+    protocol::core_types::{Q256BitHash, QDBHashBase, QFHashBase, QNetworkTypesConfig},
     QCoreProcCheckpointUniqueId,
 };
-use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
+use psy_core::job::job_id::QProvingJobDataID;
 use psy_data::{
-    agg::{
-        tree_agg_v2::{plan_jobs_for_tree_agg, plan_jobs_for_tree_agg_offset_root, BasicTreePlannerHelper},
-        AggStateTrackableInput, AggStateTransitionInputV2, AggStateTransitionWithStats, DummyAggStateTransition,
-    },
-    guta::{
-        header_extended::{GlobalUserTreeAggregatorHeaderWithTagValue, GlobalUserTreeAggregatorHeaderWithTagValueAndJobID},
-        stats::GUTAStats,
-    },
-    protocol::circuit_inputs::append_user_registration_tree::QCAppendUserRegistrationTreeCircuitInput,
+    guta::{header_extended::GlobalUserTreeAggregatorHeaderWithTagValueAndJobID, stats::GUTAStats},
     rewards_tree::offsets::{GUTA_REWARDS_TREE_OFFSET_ROOT_INDEX, GUTA_REWARDS_TREE_OFFSET_ROOT_LEVEL},
-    v1::qdata::public_key::PZKPublicKeyInfo,
-    worker::{metadata::PsyProvingJobMetadata, metadata_with_job_id::PsyProvingJobMetadataWithJobId},
+    worker::metadata_with_job_id::PsyProvingJobMetadataWithJobId,
 };
 use psy_io::tokio::{TokioFileLike, TokioLikeFileSystem};
 use psy_node_core::{
-    guta_planner, psy_temp_db::StandardProcessorTempDBStoreBase,
-    qblob::data_views::zero_merkle_node_batch::create_ffs_merkle_nodes_zero_id_from_hash_map,
+    psy_temp_db::StandardProcessorTempDBStoreBase, qblob::data_views::zero_merkle_node_batch::create_ffs_merkle_nodes_zero_id_from_hash_map,
 };
-use psy_serialize::{FastFixedSerializable, PsyCanonicalDatabaseSerializeBaseSingle, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
+use psy_serialize::{PsyCanonicalDatabaseSerializeBaseSingle, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
 use rand::RngCore;
-use tokio::{io::{AsyncReadExt, AsyncWriteExt}, sync::Mutex};
-use tower_http::ServiceExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::{
     coordinator::processor::processor_shared_status::PsyCoordinatorProcessorSharedStatus,
@@ -79,15 +53,20 @@ pub fn get_new_coordinator_guta_update_gatherer_backup_file_path(
     ))
 }
 
-pub async fn read_coordinator_guta_update_gatherer_backup_file<Hasher: MerkleZeroHasher<Hash>, Hash: QDBHashBase + QFHashBase<F>, F: QFelt64, FileSystem: TokioLikeFileSystem>(
+pub async fn read_coordinator_guta_update_gatherer_backup_file<
+    Hasher: MerkleZeroHasher<Hash>,
+    Hash: QDBHashBase + QFHashBase<F>,
+    F: QFelt64,
+    FileSystem: TokioLikeFileSystem,
+>(
     file_system: &FileSystem,
-    file_path: &PathBuf,
+    file_path: &str,
     mut tree: SimpleMemoryMerkleRecorderStore<Hasher, Hash>,
 ) -> anyhow::Result<(
     CoordinatorGUTAUpdateGathererOutputDatabase<F, Hash>,
     SimpleMemoryMerkleRecorderStore<Hasher, Hash>,
 )> {
-    let mut file: FileSystem::File = file_system.file_like_fs_open(&file_path.to_string_lossy()).await?;
+    let mut file: FileSystem::File = file_system.file_like_fs_open(&file_path).await?;
     let metadata = file.file_like_metadata().await?;
     let file_len = metadata.len();
     let const_size_len = 4 + 32 + 32;
@@ -167,7 +146,11 @@ pub async fn read_coordinator_guta_update_gatherer_backup_file<Hasher: MerkleZer
     };
     Ok((output_db, tree))
 }
-pub struct CoordinatorGUTAUpdateGathererConfig<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>, FileSystem: TokioLikeFileSystem> {
+pub struct CoordinatorGUTAUpdateGathererConfig<
+    N: QNetworkTypesConfig,
+    TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>,
+    FileSystem: TokioLikeFileSystem,
+> {
     pub realm_id_u64: u64,
     pub realm_sub_id_u64: u64,
     pub status: Arc<RwLock<PsyCoordinatorProcessorSharedStatus<N::F, N::QHash>>>,
@@ -180,7 +163,9 @@ pub struct CoordinatorGUTAUpdateGathererConfig<N: QNetworkTypesConfig, TempDatab
 
     pub _phantom_n: std::marker::PhantomData<N>,
 }
-impl <N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>, FileSystem: TokioLikeFileSystem> Clone for CoordinatorGUTAUpdateGathererConfig<N, TempDatabase, FileSystem> {
+impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>, FileSystem: TokioLikeFileSystem> Clone
+    for CoordinatorGUTAUpdateGathererConfig<N, TempDatabase, FileSystem>
+{
     fn clone(&self) -> Self {
         Self {
             realm_id_u64: self.realm_id_u64,
@@ -196,7 +181,11 @@ impl <N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::
         }
     }
 }
-pub struct CoordinatorGUTAUpdateGatherer<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>, FileSystem: TokioLikeFileSystem> {
+pub struct CoordinatorGUTAUpdateGatherer<
+    N: QNetworkTypesConfig,
+    TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>,
+    FileSystem: TokioLikeFileSystem,
+> {
     pub config: CoordinatorGUTAUpdateGathererConfig<N, TempDatabase, FileSystem>,
     pub last_committed_checkpoint_root: N::QHash,
     pub guta_planner: CoordinatorGUTAPlanner<N::F, N::QHash>,
@@ -230,8 +219,11 @@ impl<
         FileSystem: TokioLikeFileSystem,
         N: QNetworkTypesConfig<JobId = QProvingJobDataID>,
         TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash> + Send + Sync + 'static,
-    > QueueGathererItemBuilderWithTree<CoordinatorGUTAUpdateGathererConfig<N, TempDatabase, FileSystem>, SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>>
-    for CoordinatorGUTAUpdateGatherer<N, TempDatabase, FileSystem>
+    >
+    QueueGathererItemBuilderWithTree<
+        CoordinatorGUTAUpdateGathererConfig<N, TempDatabase, FileSystem>,
+        SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>,
+    > for CoordinatorGUTAUpdateGatherer<N, TempDatabase, FileSystem>
 {
     type Output = CoordinatorGUTAUpdateGathererOutput<N::F, N::QHash, N::JobId>;
 
@@ -247,12 +239,15 @@ impl<
             config.realm_sub_id_u64,
             status.unique_pending_id,
         );
-        let mut new_coordinator_guta_file = config.file_system.file_like_fs_create(&new_coordinator_guta_file_path.to_string_lossy()).await?;
+        let mut new_coordinator_guta_file = config
+            .file_system
+            .file_like_fs_create(&new_coordinator_guta_file_path.to_string_lossy())
+            .await?;
         new_coordinator_guta_file
             .write_u32_le(COORDINATOR_GUTA_UPDATE_GATHERER_BACKUP_V1_MAGIC_U32)
             .await?;
         new_coordinator_guta_file.write_all(&tree.get_root().into_owned_32bytes()).await?;
-        
+
         let guta_planner = CoordinatorGUTAPlanner::new();
         let last_committed_checkpoint_root = config.checkpoint_tree.get_root();
         Ok(Self {
@@ -344,9 +339,12 @@ impl<
             );
             tree.revert_changes();
             {
-                let tree_height = tree.get_height();
-                let last_old_realm_roots = self.config.last_old_realm_roots.read().map_err(|e| anyhow::anyhow!("error reading last old realm roots {:?}", e))?;
-                for (index, old_root) in self.old_realm_roots.iter() {
+                let last_old_realm_roots = self
+                    .config
+                    .last_old_realm_roots
+                    .read()
+                    .map_err(|e| anyhow::anyhow!("error reading last old realm roots {:?}", e))?;
+                for (index, old_root) in last_old_realm_roots.iter() {
                     tree.set_leaf_no_proof(*index, *old_root);
                 }
             }
@@ -362,7 +360,10 @@ impl<
         }
 
         // ensure the new user public keys file is flushed to disk
-        self.config.file_system.file_like_fs_flush_file_with_path(&self.pending_file_path, &mut self.new_coordinator_guta_file).await?;
+        self.config
+            .file_system
+            .file_like_fs_flush_file_with_path(&self.pending_file_path, &mut self.new_coordinator_guta_file)
+            .await?;
 
         let end_global_user_tree_root = tree.get_root();
 
@@ -370,7 +371,6 @@ impl<
             realm_id: self.config.realm_id_u64 as u32,
             realm_sub_id: self.config.realm_sub_id_u64 as u16,
         };
-
 
         let jobs_for_queue: Vec<Vec<PsyProvingJobMetadataWithJobId<N::QHash, QProvingJobDataID>>> = self
             .guta_planner
@@ -411,7 +411,9 @@ impl<
 
         let last_old_realm_roots = Arc::clone(&self.config.last_old_realm_roots);
         {
-            let mut last_old_roots = last_old_realm_roots.write().map_err(|e| anyhow::anyhow!("error writing last old realm roots {:?}", e))?;
+            let mut last_old_roots = last_old_realm_roots
+                .write()
+                .map_err(|e| anyhow::anyhow!("error writing last old realm roots {:?}", e))?;
             *last_old_roots = self.old_realm_roots;
         }
         Ok(output)

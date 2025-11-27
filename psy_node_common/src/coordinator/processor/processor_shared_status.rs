@@ -1,4 +1,4 @@
-use std::{os::macos::raw::stat, sync::{Arc, RwLock}};
+use std::sync::{Arc, RwLock};
 
 use parth_core::{felt::QFelt, protocol::core_types::QHashBase};
 use psy_data::v1::qdata::checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState};

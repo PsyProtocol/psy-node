@@ -1,13 +1,20 @@
 use async_trait::async_trait;
 use jsonrpsee::core::RpcResult;
 use parth_core::{
-    QProvingJobDataIDWithRewardPath, crypto::{hash::
-        merkle_proof::MerkleProofCore, secp256k1::{QEDCompressedSecp256K1Signature, SimpleTimedRequest}}, data::hash::merkle_node_key::SimpleMerkleNodeKey, node::realm_identifier::QRealmIdentifier, protocol::core_types::QNetworkTypesConfig
+    crypto::{
+        hash::merkle_proof::MerkleProofCore,
+        secp256k1::{QEDCompressedSecp256K1Signature, SimpleTimedRequest},
+    },
+    data::hash::merkle_node_key::SimpleMerkleNodeKey,
+    node::realm_identifier::QRealmIdentifier,
+    protocol::core_types::QNetworkTypesConfig,
+    QProvingJobDataIDWithRewardPath,
 };
 use psy_api_core::{coordinator::standard_edge_rpc::CoordinatorEdgeRpcServer, worker::standard_worker_rpc::NodeEdgeWorkerRpcServer};
 use psy_core::job::job_id::QProvingJobDataID;
 use psy_data::{
-    guta::header_extended::GlobalUserTreeAggregatorHeaderWithTagValueAndJobType, proof_input::guta::SubmitGUTARealmResultAPINoProofInput, v1::{
+    guta::header_extended::GlobalUserTreeAggregatorHeaderWithTagValueAndJobType,
+    v1::{
         common_api::PsyProoffMinerRewardProof,
         qdata::{
             checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState},
@@ -15,27 +22,17 @@ use psy_data::{
             public_key::PZKPublicKeyInfo,
             user::PQEDUserLeaf,
         },
-    }, worker::api_response::{PsyWorkerGetProvingWorkAPIResponse, PsyWorkerGetProvingWorkWithChildProofsAPIResponse}
+    },
+    worker::api_response::{PsyWorkerGetProvingWorkAPIResponse, PsyWorkerGetProvingWorkWithChildProofsAPIResponse},
 };
 use psy_node_core::{
-    
-    psy_core_db::
-        traits::full::{
-            PsyCoordinatorEdgeAPIStoreReader, PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter,
-        }
-    ,
+    psy_core_db::traits::full::{PsyCoordinatorEdgeAPIStoreReader, PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter},
     psy_temp_db::StandardEdgeAPITempDBStoreBase,
-    queue::{
-        ephemeral::QStandardEphemeralQueuePublisher,
-        worker_queue::QStandardWorkerQueueSubscriber,
-    },
-    store::traits::
-        proof_store::QParthProofStore
-    ,
+    queue::{ephemeral::QStandardEphemeralQueuePublisher, worker_queue::QStandardWorkerQueueSubscriber},
+    store::traits::proof_store::QParthProofStore,
 };
 
 use crate::{coordinator::edge::handler::CoordinatorEdgeHandler, realm::edge::error::RpcError};
-
 
 type QRpcResult<T> = RpcResult<T>;
 
@@ -47,7 +44,7 @@ const MAX_CHECKPOINT_ID: u64 = i64::MAX as u64;
 
 #[async_trait]
 impl<
-        N: QNetworkTypesConfig<JobId =  QProvingJobDataID> + Send + Sync + 'static,
+        N: QNetworkTypesConfig<JobId = QProvingJobDataID> + Send + Sync + 'static,
         S: PsyCoordinatorEdgeAPIStoreReader<N::F, N::QHash> + Send + Sync + 'static,
         STagTreeRewards: PsyNodeCoreRewardsTagTreeStoreWriter<N::F, N::QHash> + PsyNodeCoreRewardsTagTreeStoreReader<N::F, N::QHash> + Send + Sync + 'static,
         GUTAUpdateQueue: QStandardEphemeralQueuePublisher + Send + Sync + 'static,
@@ -69,14 +66,18 @@ impl<
         ProofStore,
     >
 {
-    
     async fn register_user(&self, public_key: PZKPublicKeyInfo<N::QHash>) -> QRpcResult<String> {
         res(self.register_user_internal(public_key).await)
     }
     async fn deploy_contract(&self, deploy_contract: PQBCDeployContract<N::QHash>) -> QRpcResult<String> {
         res(self.deploy_contract_internal(deploy_contract).await)
     }
-    async fn submit_guta(&self, input: GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<N::F, N::QHash>, proof: Vec<u8>, _realm_id: u64) -> QRpcResult<String> {
+    async fn submit_guta(
+        &self,
+        input: GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<N::F, N::QHash>,
+        proof: Vec<u8>,
+        _realm_id: u64,
+    ) -> QRpcResult<String> {
         res(self.submit_guta_internal(input, proof).await)?;
         Ok("ok".to_string())
     }
@@ -251,10 +252,9 @@ impl<
     }
 }
 
-
 #[async_trait]
 impl<
-        N: QNetworkTypesConfig<JobId =  QProvingJobDataID> + Send + Sync + 'static,
+        N: QNetworkTypesConfig<JobId = QProvingJobDataID> + Send + Sync + 'static,
         S: PsyCoordinatorEdgeAPIStoreReader<N::F, N::QHash> + Send + Sync + 'static,
         STagTreeRewards: PsyNodeCoreRewardsTagTreeStoreWriter<N::F, N::QHash> + PsyNodeCoreRewardsTagTreeStoreReader<N::F, N::QHash> + Send + Sync + 'static,
         GUTAUpdateQueue: QStandardEphemeralQueuePublisher + Send + Sync + 'static,
@@ -276,17 +276,24 @@ impl<
         ProofStore,
     >
 {
-    async fn get_proving_work(&self, signature:  QEDCompressedSecp256K1Signature, request: SimpleTimedRequest) -> RpcResult<PsyWorkerGetProvingWorkAPIResponse<N::QHash, N::JobId>>{
+    async fn get_proving_work(
+        &self,
+        signature: QEDCompressedSecp256K1Signature,
+        request: SimpleTimedRequest,
+    ) -> RpcResult<PsyWorkerGetProvingWorkAPIResponse<N::QHash, N::JobId>> {
         res(self.get_proving_work_internal(signature, request).await)
     }
-    async fn get_proving_work_with_child_proofs(&self, signature:  QEDCompressedSecp256K1Signature, request: SimpleTimedRequest) -> RpcResult<PsyWorkerGetProvingWorkWithChildProofsAPIResponse<N::QHash, N::JobId>>{
+    async fn get_proving_work_with_child_proofs(
+        &self,
+        signature: QEDCompressedSecp256K1Signature,
+        request: SimpleTimedRequest,
+    ) -> RpcResult<PsyWorkerGetProvingWorkWithChildProofsAPIResponse<N::QHash, N::JobId>> {
         res(self.get_proving_work_with_child_proofs_internal(signature, request).await)
     }
-    async fn submit_proof_raw(&self, job_id: N::JobId, tag: N::QHash, proof: Vec<u8>) -> RpcResult<()>{
+    async fn submit_proof_raw(&self, job_id: N::JobId, tag: N::QHash, proof: Vec<u8>) -> RpcResult<()> {
         res(self.submit_proof_raw_internal(job_id, tag, proof).await)
     }
-    async fn get_realm_identifier_worker_api(&self) -> RpcResult<QRealmIdentifier>{
+    async fn get_realm_identifier_worker_api(&self) -> RpcResult<QRealmIdentifier> {
         Ok(self.realm_identifier.clone())
     }
 }
-

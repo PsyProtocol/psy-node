@@ -16,3 +16,4 @@ pub mod rewards_tree;
 pub mod config;
 pub mod genesis;
 pub mod user;
+pub mod node;

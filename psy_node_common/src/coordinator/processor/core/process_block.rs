@@ -101,9 +101,9 @@ impl<
                 .proof_work_queue
                 .publish_many_worker_queue_items(
                     queue_key,
-                    self.db.realm_id_u64,
-                    self.db.realm_sub_id_u64,
-                    self.db.current_core_proc_unique_pending_id,
+                    self.db.ids.realm_id_u64,
+                    self.db.ids.realm_sub_id_u64,
+                    self.db.ids.proc_checkpoint_unique_id,
                     0,
                     &jobs[level],
                 )
@@ -172,9 +172,9 @@ impl<
                     .proof_work_queue
                     .wait_until_all_jobs_complete_or_timeout_worker(
                         &queue_key,
-                        self.db.realm_id_u64,
-                        self.db.realm_sub_id_u64,
-                        self.db.current_core_proc_unique_pending_id,
+                        self.db.ids.realm_id_u64,
+                        self.db.ids.realm_sub_id_u64,
+                        self.db.ids.proc_checkpoint_unique_id,
                         0,
                         self.proof_worker_queue_max_time_ms,
                     )
@@ -190,9 +190,9 @@ impl<
             .proof_work_queue
             .wait_until_all_jobs_complete_or_timeout_worker(
                 &queue_key,
-                self.db.realm_id_u64,
-                self.db.realm_sub_id_u64,
-                self.db.current_core_proc_unique_pending_id,
+                self.db.ids.realm_id_u64,
+                self.db.ids.realm_sub_id_u64,
+                self.db.ids.proc_checkpoint_unique_id,
                 0,
                 self.proof_worker_queue_max_time_ms,
             )
@@ -205,9 +205,9 @@ impl<
             .proof_work_queue
             .publish_worker_queue_item_ref(
                 &queue_key,
-                self.db.realm_id_u64,
-                self.db.realm_sub_id_u64,
-                self.db.current_core_proc_unique_pending_id,
+                self.db.ids.realm_id_u64,
+                self.db.ids.realm_sub_id_u64,
+                self.db.ids.proc_checkpoint_unique_id,
                 0,
                 job,
             )
@@ -216,9 +216,9 @@ impl<
             .proof_work_queue
             .wait_until_all_jobs_complete_or_timeout_worker(
                 &queue_key,
-                self.db.realm_id_u64,
-                self.db.realm_sub_id_u64,
-                self.db.current_core_proc_unique_pending_id,
+                self.db.ids.realm_id_u64,
+                self.db.ids.realm_sub_id_u64,
+                self.db.ids.proc_checkpoint_unique_id,
                 0,
                 self.proof_worker_queue_max_time_ms,
             )
@@ -235,11 +235,11 @@ impl<
     )> {
         self.db.set_new_unique_ids().await?;
         self.db.shared_status.update_status(
-            self.db.gathering_unique_pending_id,
-            self.db.last_committed_checkpoint_id,
-            self.db.last_committed_checkpoint_leaf.clone(),
-            self.db.last_committed_checkpoint_state_roots.clone(),
-            self.db.last_committed_l2_state.clone(),
+            self.db.ids.gathering_unique_pending_id,
+            self.db.ids.checkpoint_id,
+            self.db.last_committed.checkpoint_leaf.clone(),
+            self.db.last_committed.checkpoint_state_roots.clone(),
+            self.db.last_committed.l2_state.clone(),
             self.db.needs_revert,
         )?;
         if self.db.needs_revert {
@@ -248,11 +248,11 @@ impl<
 
         let (guta_result, register_users_result, deploy_contract_result) = tokio::try_join!(
             self.guta_queue_gatherer
-                .finalize_gathering_and_update_queue_key(self.db.gathering_core_proc_unique_pending_id),
+                .finalize_gathering_and_update_queue_key(self.db.ids.gathering_proc_checkpoint_unique_id),
             self.register_user_queue_gatherer
-                .finalize_gathering_and_update_queue_key(self.db.gathering_core_proc_unique_pending_id),
+                .finalize_gathering_and_update_queue_key(self.db.ids.gathering_proc_checkpoint_unique_id),
             self.deploy_contract_queue_gatherer
-                .finalize_gathering_and_update_queue_key(self.db.gathering_core_proc_unique_pending_id),
+                .finalize_gathering_and_update_queue_key(self.db.ids.gathering_proc_checkpoint_unique_id),
         )?;
         Ok((guta_result, register_users_result, deploy_contract_result))
     }
@@ -281,8 +281,8 @@ impl<
                 total_proofs_generated: total_deploy_contract_jobs as u64,
             },
             guta_proof_header: GlobalUserTreeAggregatorHeader {
-                guta_circuit_whitelist: self.coordinator_guta_updates_circuit_whitelist,
-                checkpoint_tree_root: self.db.last_committed_checkpoint_root,
+                guta_circuit_whitelist: self.db.circuit_fingerprint_config.guta_circuit_whitelist_root,
+                checkpoint_tree_root: self.db.last_committed.checkpoint_root,
                 stats: guta_gatherer_result.db_output.guta_stats,
                 total_aggregation_proofs_generated: N::F::from_u64_value(total_guta_jobs as u64),
                 state_transition: SubTreeNodeStateTransition {
@@ -313,7 +313,7 @@ impl<
             .first()
             .ok_or_else(|| anyhow::anyhow!("No Deploy Contract jobs found at last level"))?;
 
-        let job_id = QProvingJobDataID::block_agg_state_part_1_input_witness(self.db.current_unique_pending_id, 0).get_output_id();
+        let job_id = QProvingJobDataID::block_agg_state_part_1_input_witness(self.db.ids.unique_pending_id, 0).get_output_id();
         let job_metadata = PsyProvingJobMetadataWithJobId {
             job_id,
             metadata: PsyProvingJobMetadata {
@@ -328,7 +328,7 @@ impl<
         let witness_data = witness.psy_ser_to_bytes_vec()?;
         self.db
             .temp_db
-            .set_tdb_proof_witnesses_tuple_owned_raw(&self.db.realm_identifier, self.db.current_unique_pending_id, vec![(job_id, witness_data)])
+            .set_tdb_proof_witnesses_tuple_owned_raw(&self.db.ids.realm_identifier, self.db.ids.unique_pending_id, vec![(job_id, witness_data)])
             .await?;
         Ok((job_metadata, witness))
     }
@@ -342,10 +342,10 @@ impl<
     ) -> anyhow::Result<(PsyPreparedCoordinatorBlockStateUpdates<N::F, N::QHash>, Vec<u8>)> {
         let checkpoint_state_roots = PQEDCheckpointGlobalStateRoots {
             contract_tree_root: deploy_contract_gatherer_result.db_output.end_global_contract_tree_root,
-            deposit_tree_root: self.db.last_committed_checkpoint_state_roots.deposit_tree_root,
+            deposit_tree_root: self.db.last_committed.checkpoint_state_roots.deposit_tree_root,
             user_tree_root: guta_gatherer_result.db_output.end_global_user_tree_root,
-            withdrawal_tree_root: self.db.last_committed_checkpoint_state_roots.withdrawal_tree_root,
-            user_registration_tree_root: self.db.last_committed_checkpoint_state_roots.user_registration_tree_root,
+            withdrawal_tree_root: self.db.last_committed.checkpoint_state_roots.withdrawal_tree_root,
+            user_registration_tree_root: self.db.last_committed.checkpoint_state_roots.user_registration_tree_root,
         };
         let agg_part_1_job_id =
             QProvingJobDataID::new_proof_job_id(0, 0, ProvingJobCircuitType::GenesisBlockCheckpointStateTransition, 0, 0).get_output_id();
@@ -353,7 +353,7 @@ impl<
         let agg_part_1_reward_tree_value = self
             .db
             .temp_db
-            .get_proof_miner_rewards_tree_value_or_none(&self.db.realm_identifier, self.db.current_unique_pending_id, agg_part_1_job_id)
+            .get_proof_miner_rewards_tree_value_or_none(&self.db.ids.realm_identifier, self.db.ids.unique_pending_id, agg_part_1_job_id)
             .await?;
         if agg_part_1_reward_tree_value.is_none() {
             anyhow::bail!("Missing reward tree value for agg part 1 job");
@@ -388,15 +388,15 @@ impl<
             .db
             .checkpoint_tree_backup_manager
             .checkpoint_tree
-            .get_leaf(self.db.last_committed_checkpoint_id);
+            .get_leaf(self.db.ids.checkpoint_id);
         let current_checkpoint_proof = self
             .db
             .checkpoint_tree_backup_manager
             .checkpoint_tree
-            .get_leaf(self.db.last_committed_checkpoint_id + 1);
+            .get_leaf(self.db.ids.next_checkpoint_id);
         let new_checkpoint_tree_root = compute_root_merkle_proof_generic::<N::QHash, N::HasherBase>(
             new_checkpoint_leaf_hash,
-            self.db.last_committed_checkpoint_id + 1,
+            self.db.ids.next_checkpoint_id,
             &current_checkpoint_proof.siblings,
         );
 
@@ -406,7 +406,7 @@ impl<
             new_root: new_checkpoint_tree_root,
             old_value: N::QHash::get_zero_value(),
             new_value: new_checkpoint_leaf_hash,
-            index: self.db.last_committed_checkpoint_id + 1,
+            index: self.db.ids.next_checkpoint_id,
         };
         let witness = QCQEDCheckpointStateTransitionInput::<N::F, N::QHash> {
             partial: QCQEDCheckpointStateTransitionInputPartial {
@@ -416,36 +416,36 @@ impl<
                     gutas_completed: part_1_header.guta_proof_header.total_aggregation_proofs_generated,
                 },
                 part_1_header: part_1_header,
-                old_stats: self.db.last_committed_checkpoint_leaf_stats.clone(),
+                old_stats: self.db.last_committed.checkpoint_leaf_stats.clone(),
                 block_time: N::F::from_u64_value(get_current_block_time()),
                 final_random_seed_contribution: guta_gatherer_result.db_output.random_seed_guta,
             },
             append_checkpoint_tree_proof,
             previous_checkpoint_proof,
-            last_old_checkpoint_tree_leaf_hash: self.db.last_committed_checkpoint_state_transition.old_checkpoint_leaf_hash,
-            last_old_checkpoint_tree_root_hash: self.db.last_committed_checkpoint_state_transition.old_checkpoint_tree_root,
+            last_old_checkpoint_tree_leaf_hash: self.db.last_committed.checkpoint_state_transition.old_checkpoint_leaf_hash,
+            last_old_checkpoint_tree_root_hash: self.db.last_committed.checkpoint_state_transition.old_checkpoint_tree_root,
             genesis_checkpoint_state_transition_hash: self.db.genesis_checkpoint_state_transition_hash,
         };
         let witness_bytes = witness.psy_ser_to_bytes_vec()?;
         let expected_public_inputs = witness.get_public_inputs_hash_with_fingerprint::<N::HasherBase>(
             self.db.circuit_fingerprint_config.checkpoint_state_transition_circuit_fingerprint,
         );
-        let last_checkpoint_state_transition_proof_job_id = if self.db.last_committed_checkpoint_id == 0 {
+        let last_checkpoint_state_transition_proof_job_id = if self.db.ids.checkpoint_id == 0 {
             QProvingJobDataID::new_proof_job_id(0, 0, ProvingJobCircuitType::GenesisBlockCheckpointStateTransition, 0, 0)
         } else {
             QProvingJobDataID::new_proof_job_id(
-                self.db.current_unique_pending_id,
+                self.db.ids.unique_pending_id,
                 0,
                 ProvingJobCircuitType::GenerateRollupStateTransitionProof,
                 0,
                 0,
             )
         };
-        if self.db.last_committed_checkpoint_id != 0 {
+        if self.db.ids.checkpoint_id != 0 {
             let proof: PsyVerifiableCheckpointTransitionWithProof<N::F, N::QHash> = self
                 .db
                 .db
-                .get_verifiable_checkpoint_state_transition_and_zkp(self.db.last_committed_checkpoint_id)
+                .get_verifiable_checkpoint_state_transition_and_zkp(self.db.ids.checkpoint_id)
                 .await?;
             self.db
                 .proof_store
@@ -453,7 +453,7 @@ impl<
                 .await?;
         }
         let job_id = QProvingJobDataID::new_proof_job_id(
-            self.db.current_unique_pending_id,
+            self.db.ids.unique_pending_id,
             0,
             ProvingJobCircuitType::GenerateRollupStateTransitionProof,
             0,
@@ -474,8 +474,8 @@ impl<
         self.db
             .temp_db
             .set_tdb_proof_witnesses_tuple_owned_raw(
-                &self.db.realm_identifier,
-                self.db.current_unique_pending_id,
+                &self.db.ids.realm_identifier,
+                self.db.ids.unique_pending_id,
                 vec![(job_id, witness_bytes)],
             )
             .await?;
@@ -484,7 +484,7 @@ impl<
         let reward_root: Option<N::QHash> = self
             .db
             .temp_db
-            .get_proof_miner_rewards_tree_value_or_none(&self.db.realm_identifier, self.db.current_unique_pending_id, job_id)
+            .get_proof_miner_rewards_tree_value_or_none(&self.db.ids.realm_identifier, self.db.ids.unique_pending_id, job_id)
             .await?;
         if reward_root.is_none() {
             anyhow::bail!("Missing reward tree value for checkpoint state transition job");
@@ -503,7 +503,7 @@ impl<
         let new_checkpoint_leaf_hash = new_checkpoint_leaf.qfhash::<N::HasherBase>();
         let new_checkpoint_tree_root = compute_root_merkle_proof_generic::<N::QHash, N::HasherBase>(
             new_checkpoint_leaf_hash,
-            self.db.last_committed_checkpoint_id + 1,
+            self.db.ids.checkpoint_id + 1,
             &witness.append_checkpoint_tree_proof.siblings,
         );
 
@@ -513,7 +513,7 @@ impl<
             new_root: new_checkpoint_tree_root,
             old_value: N::QHash::get_zero_value(),
             new_value: new_checkpoint_leaf_hash,
-            index: self.db.last_committed_checkpoint_id + 1,
+            index: self.db.ids.checkpoint_id + 1,
         };
         let checkpoint_zk_proof: Option<Vec<u8>> = self.db.proof_store.get_proof_bytes_by_job_id(job_id).await?;
         if checkpoint_zk_proof.is_none() {
@@ -521,29 +521,29 @@ impl<
         }
         let checkpoint_zk_proof = checkpoint_zk_proof.unwrap();
         let output = PsyPreparedCoordinatorBlockStateUpdates {
-            coordinator_id: self.db.realm_id_u64,
-            checkpoint_id: self.db.last_committed_checkpoint_id + 1,
-            unique_pending_id: self.db.current_unique_pending_id,
-            proc_checkpoint_unique_id: self.db.current_core_proc_unique_pending_id,
+            coordinator_id: self.db.ids.realm_id_u64,
+            checkpoint_id: self.db.ids.checkpoint_id + 1,
+            unique_pending_id: self.db.ids.unique_pending_id,
+            proc_checkpoint_unique_id: self.db.ids.proc_checkpoint_unique_id,
             old_base: PsyCoordinatorPendingCheckpointBase {
-                block_state: self.db.last_committed_l2_state.clone(),
+                block_state: self.db.last_committed.l2_state.clone(),
                 checkpoint_leaf: PsyCheckpointLeafPopulated {
-                    global_state_roots: self.db.last_committed_checkpoint_state_roots,
-                    stats: self.db.last_committed_checkpoint_leaf_stats.clone(),
+                    global_state_roots: self.db.last_committed.checkpoint_state_roots,
+                    stats: self.db.last_committed.checkpoint_leaf_stats.clone(),
                 },
-                checkpoint_leaf_hash: self.db.last_committed_checkpoint_leaf.qfhash::<N::HasherBase>(),
-                checkpoint_tree_root: self.db.last_committed_checkpoint_root,
+                checkpoint_leaf_hash: self.db.last_committed.checkpoint_leaf.qfhash::<N::HasherBase>(),
+                checkpoint_tree_root: self.db.last_committed.checkpoint_root,
             },
             new_base: PsyCoordinatorPendingCheckpointBase {
                 block_state: QEDL2BlockState {
-                    checkpoint_id: self.db.last_committed_checkpoint_id + 1,
-                    next_add_withdrawal_id: self.db.last_committed_l2_state.next_add_withdrawal_id,
-                    next_process_withdrawal_id: self.db.last_committed_l2_state.next_process_withdrawal_id,
-                    next_deposit_id: self.db.last_committed_l2_state.next_deposit_id,
-                    total_deposits_claimed_epoch: self.db.last_committed_l2_state.total_deposits_claimed_epoch,
+                    checkpoint_id: self.db.ids.checkpoint_id + 1,
+                    next_add_withdrawal_id: self.db.last_committed.l2_state.next_add_withdrawal_id,
+                    next_process_withdrawal_id: self.db.last_committed.l2_state.next_process_withdrawal_id,
+                    next_deposit_id: self.db.last_committed.l2_state.next_deposit_id,
+                    total_deposits_claimed_epoch: self.db.last_committed.l2_state.total_deposits_claimed_epoch,
 
                     next_user_id: register_users_gatherer_result.db_output.next_user_id,
-                    end_balance: self.db.last_committed_l2_state.end_balance,
+                    end_balance: self.db.last_committed.l2_state.end_balance,
                     next_contract_id: deploy_contract_gatherer_result.db_output.next_contract_id as u32,
                 },
                 checkpoint_leaf: PsyCheckpointLeafPopulated {
@@ -591,15 +591,15 @@ impl<
         let witness_data = witness.psy_ser_into_bytes_vec()?;
         self.db
             .temp_db
-            .set_tdb_proof_witnesses_tuple_owned_raw(&self.db.realm_identifier, self.db.current_unique_pending_id, vec![(job_id, witness_data)])
+            .set_tdb_proof_witnesses_tuple_owned_raw(&self.db.ids.realm_identifier, self.db.ids.unique_pending_id, vec![(job_id, witness_data)])
             .await?;
         self.db
             .proof_work_queue
             .publish_worker_queue_item_ref(
                 &self.db.get_proof_worker_queue_key(),
-                self.db.realm_id_u64,
-                self.db.realm_sub_id_u64,
-                self.db.current_core_proc_unique_pending_id,
+                self.db.ids.realm_id_u64,
+                self.db.ids.realm_sub_id_u64,
+                self.db.ids.proc_checkpoint_unique_id,
                 0,
                 &job_metadata,
             )
@@ -631,7 +631,7 @@ impl<
             false,
         )
         .await?;
-        if self.db.last_committed_checkpoint_id == 0 {
+        if self.db.ids.checkpoint_id == 0 {
             self.plan_genesis_checkpoint_state_transition_proof().await?;
         }
 

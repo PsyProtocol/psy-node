@@ -95,8 +95,7 @@ mod tests {
         guta::stats::GUTAStats,
         proof_input::guta::{end_cap_input::SubmitUserEndCapNonProofInput, SubmitUserEndCapNonProofCoreInput},
         v1::qdata::{
-            checkpoint,
-            contract::{self, DashMapContractHeightCache, PSimpleContractHeightCache, QEDContractStateUpdateHistory},
+            contract::{DashMapContractHeightCache, PSimpleContractHeightCache, QEDContractStateUpdateHistory},
             user::PQEDUserLeaf,
             user_end_cap_result::PUPSEndCapResultCompact,
         },
@@ -105,7 +104,7 @@ mod tests {
         blob_type::QBlobMerkleNodeTreeType,
         data_views::{
             double_merkle_node_batch::QBlobDoubleMerkleNodeBatchDataView,
-            single_merkle_node_batch::{QBlobSingleIdMerkleRecorder, QBlobSingleMerkleNodeBatchDataView},
+            single_merkle_node_batch::QBlobSingleMerkleNodeBatchDataView,
         },
         structs::common::blob_metadata_header::QBlobWriterContextMetadataHeader,
     };

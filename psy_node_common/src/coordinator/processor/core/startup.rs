@@ -74,9 +74,6 @@ impl<
             FileSystem,
         >,
         file_system: Arc<FileSystem>,
-        coordinator_guta_updates_circuit_whitelist: N::QHash,
-        register_users_circuit_whitelist: N::QHash,
-        deploy_contract_circuit_whitelist: N::QHash,
         deploy_contract_gatherer_backup_directory: String,
         register_user_gatherer_backup_directory: String,
         guta_gatherer_backup_directory: String,
@@ -87,12 +84,12 @@ impl<
         tokio::task::JoinHandle<Result<(), anyhow::Error>>,
     )> {
         let guta_create_builder_config = CoordinatorGUTAUpdateGathererConfig::<N, TempDatabase, FileSystem> {
-            realm_id_u64: db.realm_id_u64,
-            realm_sub_id_u64: db.realm_sub_id_u64,
+            realm_id_u64: db.ids.realm_id_u64,
+            realm_sub_id_u64: db.ids.realm_sub_id_u64,
             status: db.shared_status.inner.clone(),
             temp_db: db.temp_db.clone(),
             backup_file_directory: guta_gatherer_backup_directory,
-            coordinator_guta_updates_circuit_whitelist,
+            coordinator_guta_updates_circuit_whitelist: db.circuit_fingerprint_config.guta_circuit_whitelist_root,
             checkpoint_tree: db.checkpoint_tree_backup_manager.checkpoint_tree.clone(),
             file_system: file_system.clone(),
             last_old_realm_roots: Arc::new(std::sync::RwLock::new(Vec::new())),
@@ -100,21 +97,21 @@ impl<
         };
 
         let (db_tree_next_user_registration_id, db_tree_next_contract_id, user_registration_tree, global_user_tree, global_contract_tree) =
-            load_coordinator_memory_trees_from_db::<N, _>(&db.db, db.last_committed_checkpoint_id + 1)
+            load_coordinator_memory_trees_from_db::<N, _>(&db.db, db.ids.checkpoint_id + 1)
                 .await?
                 .into_tuple();
 
-        if db.last_committed_l2_state.next_contract_id as u64 != db_tree_next_contract_id {
+        if db.last_committed.l2_state.next_contract_id as u64 != db_tree_next_contract_id {
             return Err(anyhow::anyhow!(
                 "Inconsistent next contract id between db last committed l2 state {} and loaded tree next contract id {}",
-                db.last_committed_l2_state.next_contract_id,
+                db.last_committed.l2_state.next_contract_id,
                 db_tree_next_contract_id
             ));
         }
-        if db.last_committed_l2_state.next_user_id != db_tree_next_user_registration_id {
+        if db.last_committed.l2_state.next_user_id != db_tree_next_user_registration_id {
             return Err(anyhow::anyhow!(
                 "Inconsistent next user registration id between db last committed l2 state {} and loaded tree next user registration id {}",
-                db.last_committed_l2_state.next_user_id,
+                db.last_committed.l2_state.next_user_id,
                 db_tree_next_user_registration_id
             ));
         }
@@ -145,14 +142,14 @@ impl<
         >(
             db.register_user_queue.clone(),
             RegisterUserGathererConfig {
-                realm_id_u64: db.realm_id_u64,
-                realm_sub_id_u64: db.realm_sub_id_u64,
+                realm_id_u64: db.ids.realm_id_u64,
+                realm_sub_id_u64: db.ids.realm_sub_id_u64,
                 temp_db: db.temp_db.clone(),
                 
                 backup_file_directory: register_user_gatherer_backup_directory,
                 _phantom_n: std::marker::PhantomData,
                 status: db.shared_status.inner.clone(),
-                register_users_circuit_whitelist,
+                register_users_circuit_whitelist: db.circuit_fingerprint_config.register_users_circuit_whitelist_root,
                 last_job_next_user_id: Arc::new(std::sync::RwLock::new(init_data.db_tree_next_user_registration_id)),
                 file_system: file_system.clone(),
             },
@@ -170,13 +167,13 @@ impl<
             >(
                 db.deploy_contract_queue.clone(),
                 DeployContractGathererConfig {
-                    realm_id_u64: db.realm_id_u64,
-                    realm_sub_id_u64: db.realm_sub_id_u64,
+                    realm_id_u64: db.ids.realm_id_u64,
+                    realm_sub_id_u64: db.ids.realm_sub_id_u64,
                     temp_db: db.temp_db.clone(),
                     backup_file_directory: deploy_contract_gatherer_backup_directory,
                     _phantom_n: std::marker::PhantomData,
                     shared_status: db.shared_status.inner.clone(),
-                    deploy_contract_circuit_whitelist,
+                    deploy_contract_circuit_whitelist: db.circuit_fingerprint_config.deploy_contracts_circuit_whitelist_root,
                     last_job_next_contract_id: Arc::new(std::sync::RwLock::new(init_data.db_tree_next_contract_id)),
                     file_system: file_system.clone(),
                     
@@ -193,10 +190,6 @@ impl<
                 register_user_queue_gatherer: register_user_queue_gatherer,
                 deploy_contract_queue_gatherer: deploy_contract_queue_gatherer,
                 proof_worker_queue_max_time_ms: 1000*6*10,
-                coordinator_guta_updates_circuit_whitelist,
-                register_users_circuit_whitelist,
-                deploy_contract_circuit_whitelist,
-
             },
             guta_join_handle,
             register_user_join_handle,

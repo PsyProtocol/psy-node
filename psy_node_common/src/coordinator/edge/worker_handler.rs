@@ -1,22 +1,20 @@
 use futures::future::try_join_all;
 use parth_core::{
     crypto::{
-        hash::{
-            tag_tree::hash_tag_tree_node,
-            traits::{MerkleHasher, ZeroableHash},
-        },
+        hash::
+            traits::{MerkleHasher, ZeroableHash}
+        ,
         secp256k1::{QEDCompressedSecp256K1Signature, Secp256K1Verifier, SimpleTimedRequest},
     },
     data::queue::queue_key::QPBaseQueueType,
     protocol::core_types::{Q256BitHash, QNetworkTypesConfig, QZKProofVerifier},
-    QProvingJobDataIDWithRewardPath,
 };
-use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
+use psy_core::job::job_id::QProvingJobDataID;
 use psy_data::
     worker::{
         api_response::{PROVING_JOB_NODE_TYPE_COORDINATOR, PsyWorkerGetProvingWorkAPIResponse, PsyWorkerGetProvingWorkWithChildProofsAPIResponse},
         metadata::{
-            PROOF_REWARD_TREE_HASH_MODE_3_CHILDREN_DOUBLE_REWARD, PROOF_REWARD_TREE_HASH_MODE_LIFT_CHILD, PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN, PsyProvingJobMetadata
+            PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN, PsyProvingJobMetadata
         },
         metadata_with_job_id::PsyProvingJobMetadataWithJobId,
     }
