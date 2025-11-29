@@ -125,6 +125,7 @@ impl<C: GenericConfig<D>, const D: usize> GenericCircuitCommonDataLibrary<C, D> 
                 common_circuit_list[*v].push(*k);
             }
         });
+        common_circuit_list.iter_mut().for_each(|l| l.sort());
 
         let result = SerializedGenericCircuitCommonDataLibraryInfo {
             common_data_hashes: self.common_data_hashes.clone(),

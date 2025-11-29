@@ -61,7 +61,13 @@ impl<
     pub async fn run_worker_loop(&self, poll_interval_ms: u64) -> anyhow::Result<()> {
         loop {
             if let Err(e) = self.process_job().await {
-                tracing::error!("Error processing job: {:?}", e);
+                let error = format!("Error processing job: {:?}", e);
+                if error.contains("no proving work available") {
+                    //tracing::debug!("{}", error);
+                } else {
+                    tracing::error!("{}", error);
+                }
+                //tracing::error!("Error processing job: {:?}", e);
             }
             tokio::time::sleep(std::time::Duration::from_millis(poll_interval_ms)).await;
         }

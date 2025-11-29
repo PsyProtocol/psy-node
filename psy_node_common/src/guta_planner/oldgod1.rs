@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use parth_common::memory_stores::{
     dash_tree_append_only::PsyDashMemoryAppendOnlyMerkleStore,
-    mem_tree_recorder::SimpleMemoryMerkleRecorderStore, traits::PsyMemoryMerkleStoreImm,
+    mem_tree_recorder::{SimpleMemoryMerkleRecorderStore},
 };
 use parth_core::{
     crypto::hash::traits::{FieldQHasher, QFieldHashable},
@@ -67,20 +67,14 @@ pub struct CoordinatorGUTAPlanner<F, Hash> {
     pub job_levels: Vec<Vec<PsyProvingJobMetadataWithJobId<Hash, QProvingJobDataID>>>,
     /// MMR-style waiting buffer. `waiting_nodes[i]` stores a pending tree of logical height `i`.
     waiting_nodes: Vec<Option<PlannerNode<F, Hash>>>,
-    queued_updates: Vec<PlannerNode<F, Hash>>,
-    has_committed_updates: bool,
-    current_synced_checkpoint_root: Hash,
 }
 
 impl<F, Hash> CoordinatorGUTAPlanner<F, Hash> {
-    pub fn new(current_synced_checkpoint_root: Hash) -> Self {
+    pub fn new() -> Self {
         Self {
             job_witnesses: Vec::new(),
             job_levels: Vec::new(),
             waiting_nodes: Vec::new(),
-            queued_updates: Vec::new(),
-            has_committed_updates: false,
-            current_synced_checkpoint_root,
         }
     }
 }
@@ -89,15 +83,22 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> CoordinatorGUTAPlanner<F, Ha
     
     /// Adds a realm job and immediately performs any possible aggregations.
     /// This builds perfect binary subtrees on the fly, minimizing work for finalize.
-    async fn add_realm_job_internal<Hasher: FieldQHasher<F, Hash>>(
+    pub async fn add_realm_job<Hasher: FieldQHasher<F, Hash>, TempStore: StandardProcessorTempDBStoreBase<QProvingJobDataID, Hash>>(
         &mut self,
         unique_pending_id: u64,
         current_checkpoint_root: &Hash,
         checkpoint_tree: &PsyDashMemoryAppendOnlyMerkleStore<Hasher, Hash>,
         global_user_tree: &mut SimpleMemoryMerkleRecorderStore<Hasher, Hash>,
-        mut current_node: PlannerNode<F, Hash>,
+        _temp_store: Arc<TempStore>,
+        job: GlobalUserTreeAggregatorHeaderWithTagValueAndJobID<F, Hash>,
     ) -> anyhow::Result<()> {
         
+        let mut current_node = PlannerNode {
+            job_id: job.job_id,
+            header: job.header.header.clone(),
+            node_type: PlannerNodeType::InputLeaf,
+            logical_level: 0,
+        };
 
         let mut level_idx = 0;
 
@@ -128,44 +129,6 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> CoordinatorGUTAPlanner<F, Ha
                 break;
             }
         }
-
-        Ok(())
-    }
-
-    pub async fn add_realm_job<Hasher: FieldQHasher<F, Hash>, TempStore: StandardProcessorTempDBStoreBase<QProvingJobDataID, Hash>>(
-        &mut self,
-        unique_pending_id: u64,
-        current_checkpoint_root: &Hash,
-        checkpoint_tree: &PsyDashMemoryAppendOnlyMerkleStore<Hasher, Hash>,
-        global_user_tree: &mut SimpleMemoryMerkleRecorderStore<Hasher, Hash>,
-        _temp_store: Arc<TempStore>,
-        job: GlobalUserTreeAggregatorHeaderWithTagValueAndJobID<F, Hash>,
-    ) -> anyhow::Result<()> {
-        let current_node = PlannerNode {
-            job_id: job.job_id,
-            header: job.header.header,
-            node_type: PlannerNodeType::InputLeaf,
-            logical_level: 0,
-        };
-        if self.has_committed_updates {
-            self.add_realm_job_internal::<Hasher>(unique_pending_id, current_checkpoint_root, checkpoint_tree, global_user_tree, current_node).await?;
-        }else{
-            if current_checkpoint_root != &self.current_synced_checkpoint_root {
-                // we are ready for committing updates
-                self.has_committed_updates = true;
-                let queued_updates = {
-                    std::mem::take(&mut self.queued_updates)
-                };  
-                for queued_update in queued_updates {
-                    self.add_realm_job_internal::<Hasher>(unique_pending_id, current_checkpoint_root, checkpoint_tree, global_user_tree, queued_update).await?;
-                }
-            }else{
-                // queue the update
-                self.queued_updates.push(current_node);
-            }
-        }
-
-        
 
         Ok(())
     }
@@ -411,15 +374,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> CoordinatorGUTAPlanner<F, Ha
         most_recent_checkpoint_stats_hash: Hash,
         guta_circuit_whitelist: Hash,
     ) -> anyhow::Result<Vec<Vec<PsyProvingJobMetadataWithJobId<Hash, QProvingJobDataID>>>> {
-        if !self.has_committed_updates {
-            // No updates were committed yet, so we need to process queued updates now.
-            let queued_updates = {
-                std::mem::take(&mut self.queued_updates)
-            };
-            for queued_update in queued_updates {
-                self.add_realm_job_internal::<Hasher>(unique_pending_id, current_checkpoint_root, checkpoint_tree, global_user_tree, queued_update).await?;
-            }
-        }
+        
         // 1. Gather all pending subtrees.
         // We use std::mem::take to satisfy borrow checker rules, allowing us to mutate self later.
         // The waiting_nodes are ordered by power-of-2 size (index 0 = height 0, index 1 = height 1).
@@ -1210,7 +1165,7 @@ mod tests {
         let total_input_jobs = jobs.len();
 
         let mut timer = DebugTimer::new("CoordinatorGUTAPlanner Test");
-        let mut planner = CoordinatorGUTAPlanner::<F, Hash>::new(checkpoint_1_root);
+        let mut planner = CoordinatorGUTAPlanner::<F, Hash>::new();
         for job in &jobs {
             planner
                 .add_realm_job::<Hasher, SimpleMemoryTempStore>(

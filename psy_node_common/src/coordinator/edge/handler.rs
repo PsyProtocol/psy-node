@@ -242,7 +242,7 @@ impl<
     pub async fn get_register_user_queue_key(
         &self,
     ) -> anyhow::Result<(u64, QCoreProcCheckpointUniqueId, CoordinatorRegisterUserPublicKeyQueueKey<N::QHash>)> {
-        let (unique_pending_id, unique_proc_checkpoint_id) = self.temp_db.get_unique_pending_ids(&self.realm_identifier).await?;
+        let (unique_pending_id, unique_proc_checkpoint_id) = self.temp_db.get_gathering_unique_pending_ids(&self.realm_identifier).await?;
 
         Ok((
             unique_pending_id,
@@ -260,7 +260,7 @@ impl<
     pub async fn get_deploy_contract_queue_key(
         &self,
     ) -> anyhow::Result<(u64, QCoreProcCheckpointUniqueId, CoordinatorDeployContractQueueKey<N::F, N::QHash>)> {
-        let (unique_pending_id, unique_proc_checkpoint_id) = self.temp_db.get_unique_pending_ids(&self.realm_identifier).await?;
+        let (unique_pending_id, unique_proc_checkpoint_id) = self.temp_db.get_gathering_unique_pending_ids(&self.realm_identifier).await?;
 
         Ok((
             unique_pending_id,

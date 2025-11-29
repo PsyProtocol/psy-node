@@ -381,7 +381,7 @@ impl<Hash: Q256BitHash, JobId: QJobIdBase + 'static, D: QTempDatabaseRawKVReader
         if value_bytes.is_some() {
             PsyProvingJobMetadata::<Hash, JobId>::psy_ser_from_owned_bytes_vec(value_bytes.unwrap())
         }else{
-            anyhow::bail!("Proving job metadata not found");
+            anyhow::bail!("Proving job metadata not found for job {:?} at unique_pending_id {}", job_id, unique_pending_id);
         }
     }
 }
@@ -414,7 +414,7 @@ impl<Hash: Q256BitHash, JobId: QJobIdBase + 'static, D: QTempDatabaseRawKVReader
         if value_bytes.is_some() {
             Hash::from_slice_32bytes(&value_bytes.unwrap())
         }else{
-            anyhow::bail!("Proving job metadata not found");
+            anyhow::bail!("get_proof_miner_rewards_tree_value not found for job {:?} at unique_pending_id {}", job_id, unique_pending_id);
         }
     }
     async fn get_proof_miner_rewards_tree_value_or_none(&self, rid: &QRealmIdentifier, unique_pending_id: u64, job_id: JobId) -> anyhow::Result<Option<Hash>>{

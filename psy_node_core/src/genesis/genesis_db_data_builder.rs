@@ -200,7 +200,7 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
             self.user_leaves_ffs = Vec::with_capacity(total_user_ids_in_realm * PSY_OBJECT_FFS_SIZE_USER_LEAF);
         }
         if collect_public_keys {
-            self.public_keys_ffs = Vec::with_capacity(user_ids.len() * PSY_OBJECT_FFS_SIZE_ZK_PUBLIC_KEY);
+            self.public_keys_ffs = Vec::with_capacity(user_ids.len() * (8 + PSY_OBJECT_FFS_SIZE_ZK_PUBLIC_KEY));
         }
         if collect_public_keys {
             self.public_key_hash_to_user_id_rows_ffs = Vec::with_capacity(user_ids.len() * PSY_OBJECT_FFS_SIZE_HASH_256_AND_U64);
@@ -230,6 +230,8 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
                 };
                 self.public_key_hash_to_user_id_rows_ffs
                     .extend_from_slice(&u64_hash_mapping_row.fx_tpl_psy_ser_into_bytes_vec()?);
+                self.public_keys_ffs
+                    .extend_from_slice(&(registration_id as  u64).to_le_bytes());
                 self.public_keys_ffs
                     .extend_from_slice(&user.public_key_info.fx_tpl_psy_ser_into_bytes_vec()?);
             }

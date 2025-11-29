@@ -440,7 +440,7 @@ impl<
             0,
             2 * N::CHECKPOINT_TREE_HEIGHT as usize,
             &[SimpleMerkleNode {
-                key: SimpleMerkleNodeKey::new(N::CHECKPOINT_TREE_HEIGHT, 0),
+                key: SimpleMerkleNodeKey::new(N::CHECKPOINT_TREE_HEIGHT, checkpoint_id),
                 value,
             }],
         )

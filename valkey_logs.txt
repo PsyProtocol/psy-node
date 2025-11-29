@@ -1,0 +1,23 @@
+1:M 29 Nov 2025 15:57:37.210 * oO0OoO0OoO0Oo Valkey is starting oO0OoO0OoO0Oo
+1:M 29 Nov 2025 15:57:37.210 * Valkey version=9.0.0, bits=64, commit=00000000, modified=0, pid=1, just started
+1:M 29 Nov 2025 15:57:37.210 # Warning: no config file specified, using the default config. In order to specify a config file use valkey-server /path/to/valkey.conf
+1:M 29 Nov 2025 15:57:37.210 * monotonic clock: POSIX clock_gettime
+1:M 29 Nov 2025 15:57:37.210 * Running mode=standalone, port=6379.
+1:M 29 Nov 2025 15:57:37.211 * Server initialized
+1:M 29 Nov 2025 15:57:37.211 * Ready to accept connections tcp
+1:M 29 Nov 2025 16:02:38.028 * 100 changes in 300 seconds. Saving...
+1:M 29 Nov 2025 16:02:38.029 * Background saving started by pid 17
+17:C 29 Nov 2025 16:02:38.202 * DB saved on disk
+17:C 29 Nov 2025 16:02:38.202 * Fork CoW for RDB: current 1 MB, peak 1 MB, average 1 MB
+1:M 29 Nov 2025 16:02:38.233 * Background saving terminated with success
+1:M 29 Nov 2025 16:07:39.005 * 100 changes in 300 seconds. Saving...
+1:M 29 Nov 2025 16:07:39.006 * Background saving started by pid 18
+18:C 29 Nov 2025 16:07:39.210 * DB saved on disk
+18:C 29 Nov 2025 16:07:39.210 * Fork CoW for RDB: current 1 MB, peak 1 MB, average 1 MB
+1:M 29 Nov 2025 16:07:39.312 * Background saving terminated with success
+1:signal-handler (1764432595) Received SIGINT scheduling shutdown...
+1:M 29 Nov 2025 16:09:55.233 * User requested shutdown...
+1:M 29 Nov 2025 16:09:55.234 * Saving the final RDB snapshot before exiting.
+1:signal-handler (1764432595) Received SIGTERM scheduling shutdown...
+1:M 29 Nov 2025 16:09:55.458 * DB saved on disk
+1:M 29 Nov 2025 16:09:55.458 # Valkey is now ready to exit, bye bye...

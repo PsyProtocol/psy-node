@@ -76,6 +76,8 @@ pub async fn generate_coordinator_output_from_backups<
     )
     .await?;
 
+    let block_time = register_user_gatherer_result.block_time;
+
     let final_output = CoordinatorOutputBuilder::<N>::get_output_for_backup(
         coordinator_ids,
         last_committed,
@@ -84,6 +86,7 @@ pub async fn generate_coordinator_output_from_backups<
         register_user_gatherer_result,
         deploy_contract_gatherer_result,
         append_checkpoint_tree_siblings,
+        block_time,
     )?;
     Ok(final_output)
 }

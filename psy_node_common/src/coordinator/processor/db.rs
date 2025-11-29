@@ -1,4 +1,4 @@
-use std::sync::{atomic::AtomicBool, Arc};
+use std::sync::{Arc, atomic::AtomicBool};
 
 use parth_common::memory_stores::{mem_tree_recorder::SimpleMemoryMerkleRecorderStore, traits::PsyMemoryMerkleStoreImm};
 use parth_core::{
@@ -19,7 +19,7 @@ use psy_data::{
     prepared_block::coordinator::PsyPreparedCoordinatorBlockStateUpdates,
     protocol::{
         checkpoint_transition_hash::CheckpointStateHashTransition,
-        verifiable_checkpoint_transition::{PsyVerifiableCheckpointTransition, PsyVerifiableCheckpointTransitionWithProof},
+        verifiable_checkpoint_transition::{self, PsyVerifiableCheckpointTransition, PsyVerifiableCheckpointTransitionWithProof},
     },
     v1::qdata::{checkpoint::QEDL2BlockState, contract::PsyDeployContractQueueItem, public_key::PZKPublicKeyInfo},
 };
@@ -162,10 +162,13 @@ impl<
             self.db.get_current_unique_pending_id().await?;
             
         let expected_checkpoint_id: Option<u64> = self.db.get_checkpoint_id_for_unique_pending_id(last_unique_pending_id).await?;
-        let database_check_state = if expected_checkpoint_id.is_none() {
+        let database_check_state = if expected_checkpoint_id.is_none() && actual_latest_applied_checkpoint_id == 0 {
             // needs genesis
             DatabaseCheckState::NeedsGenesis
-        } else {
+        } else if expected_checkpoint_id.is_none(){
+            // died before setting anything in the database, we don't need to recover
+            DatabaseCheckState::Ready 
+        }else{
             let expected_checkpoint_id = expected_checkpoint_id.unwrap();
             if expected_checkpoint_id != actual_latest_applied_checkpoint_id {
                 if expected_checkpoint_id < actual_latest_applied_checkpoint_id {
@@ -423,8 +426,14 @@ impl<
         zk_proof: Vec<u8>,
     ) -> anyhow::Result<()> {
         let checkpoint_id = coordinator_update.checkpoint_id;
+        tracing::info!("vaidation -> Committing coordinator state update to database for checkpoint_id: {}", checkpoint_id);
         let checkpoint_leaf_hash = coordinator_update.new_base.checkpoint_leaf.qfhash::<N::HasherBase>();
         if checkpoint_leaf_hash != coordinator_update.new_base.checkpoint_leaf_hash {
+            tracing::error!(
+                "Computed checkpoint leaf hash: {:?}, expected checkpoint leaf hash: {:?}",
+                checkpoint_leaf_hash,
+                coordinator_update.new_base.checkpoint_leaf_hash
+            );
             anyhow::bail!(
                 "Checkpoint leaf hash mismatch when committing coordinator state update to database. Computed hash: {:?}, expected hash: {:?}",
                 checkpoint_leaf_hash,
@@ -434,6 +443,11 @@ impl<
 
         let old_checkpoint_leaf_hash = coordinator_update.old_base.checkpoint_leaf_hash;
         if old_checkpoint_leaf_hash != self.last_committed.checkpoint_leaf_hash {
+            tracing::error!(
+                "Computed old checkpoint leaf hash: {:?}, expected old checkpoint leaf hash: {:?}",
+                self.last_committed.checkpoint_leaf_hash,
+                old_checkpoint_leaf_hash
+            );
             anyhow::bail!(
                 "Old checkpoint leaf hash mismatch when committing coordinator state update to database. Computed hash: {:?}, expected hash: {:?}",
                 self.last_committed.checkpoint_leaf_hash,
@@ -443,13 +457,26 @@ impl<
 
         let old_checkpoint_root = self.db.checkpoint_tree_get_root_hash(checkpoint_id).await?;
         if checkpoint_id != 0 && old_checkpoint_root != coordinator_update.old_base.checkpoint_tree_root {
+            let actual_checkpoint_root = self.checkpoint_tree_backup_manager.checkpoint_tree.get_root();
+            tracing::error!(
+                "Computed old checkpoint tree root hash: {:?}, expected old checkpoint tree root hash: {:?}, actual root from backup manager: {:?}",
+                old_checkpoint_root,
+                coordinator_update.old_base.checkpoint_tree_root,
+                actual_checkpoint_root
+            );
             anyhow::bail!("Old checkpoint tree root hash mismatch when committing coordinator state update to database. Computed hash: {:?}, expected hash: {:?}", old_checkpoint_root, coordinator_update.old_base.checkpoint_tree_root);
         }
 
-        let verifiable_checkpoint_transition = coordinator_update.get_public_inputs_verifiable_state_transition(
+        tracing::info!("start -> Committing coordinator state update to database for checkpoint_id: {}", checkpoint_id);
+
+        let mut verifiable_checkpoint_transition = coordinator_update.get_public_inputs_verifiable_state_transition(
             self.genesis_checkpoint_state_transition_hash,
             self.circuit_fingerprint_config.checkpoint_state_transition_circuit_fingerprint,
         );
+        if checkpoint_id == 0 {
+            verifiable_checkpoint_transition.state_transition.checkpoint_transition.old_checkpoint_tree_root = verifiable_checkpoint_transition.state_transition.checkpoint_transition.new_checkpoint_tree_root;
+            verifiable_checkpoint_transition.state_transition.checkpoint_transition.old_checkpoint_leaf_hash = verifiable_checkpoint_transition.state_transition.checkpoint_transition.new_checkpoint_leaf_hash;
+        }
 
         let verifiable_checkpoint_transition_with_proof = PsyVerifiableCheckpointTransitionWithProof {
             info: verifiable_checkpoint_transition,
@@ -474,45 +501,56 @@ impl<
         self.db
             .set_verifiable_checkpoint_state_transition_and_zkp(checkpoint_id, &verifiable_checkpoint_transition_with_proof)
             .await?;
+        tracing::info!("Saved verifiable checkpoint state transition and ZKP for checkpoint ID: {}", checkpoint_id);
         // CRITICAL: set unique_pending_id to checkpoint_id mapping BEFORE ANY OTHER
         // STATE UPDATES so we can recover if something goes wrong
         self.db
             .set_unique_pending_id_checkpoint_id_mapping(unique_pending_id, checkpoint_id)
             .await?;
         self.db.set_checkpoint_id_to_unique_pending_id_mapping(checkpoint_id, unique_pending_id, &self.ids.proc_checkpoint_unique_id).await?;
-        
+        tracing::info!("Set unique pending ID to checkpoint ID mapping for checkpoint ID: {}", checkpoint_id);
         // START STANDARD STATE UPDATES (technically these can be done in any order
         // after the above two are done) start contract updates
-        self.db
-            .set_contract_leaves_ffs(checkpoint_id, &coordinator_update.new_contract_leaves_ffs)
-            .await?;
-        self.db
-            .set_many_contract_code_definitions(checkpoint_id, &coordinator_update.new_contract_code_definitions)
-            .await?;
-        self.db.set_contract_tree_heights(checkpoint_id, &contract_tree_heights).await?;
-        self.db
-            .contract_function_tree_set_nodes_ffs(checkpoint_id, &coordinator_update.update_contract_function_tree_nodes_ffs)
-            .await?;
-        self.db
-            .global_contract_tree_set_nodes_ffs(checkpoint_id, &coordinator_update.update_global_contract_tree_nodes_ffs)
-            .await?;
-
+        if !coordinator_update.new_contract_leaves_ffs.is_empty() {
+            self.db
+                .set_contract_leaves_ffs(checkpoint_id, &coordinator_update.new_contract_leaves_ffs)
+                .await?;
+            self.db
+                .set_many_contract_code_definitions(checkpoint_id, &coordinator_update.new_contract_code_definitions)
+                .await?;
+            self.db.set_contract_tree_heights(checkpoint_id, &contract_tree_heights).await?;
+            self.db
+                .contract_function_tree_set_nodes_ffs(checkpoint_id, &coordinator_update.update_contract_function_tree_nodes_ffs)
+                .await?;
+            self.db
+                .global_contract_tree_set_nodes_ffs(checkpoint_id, &coordinator_update.update_global_contract_tree_nodes_ffs)
+                .await?;
+        }
+        tracing::info!("Committed contract state updates for checkpoint ID: {}", checkpoint_id);
         // start user registraion updates
-        self.db
-            .set_zk_public_keys_ffs(checkpoint_id, &coordinator_update.new_user_public_keys_ffs)
-            .await?;
-        self.db
-            .set_public_key_for_user_ids_ffs(&coordinator_update.new_public_key_hash_to_user_id_rows_ffs)
-            .await?;
-        self.db
-            .user_registration_tree_set_nodes_ffs(checkpoint_id, &coordinator_update.update_user_registration_tree_nodes_ffs)
-            .await?;
+        if !coordinator_update.new_user_public_keys_ffs.is_empty() {
+            println!("committing new user public keys ffs (len: {}) for checkpoint ID: {}", coordinator_update.new_user_public_keys_ffs.len(), checkpoint_id);
+            self.db
+                .set_zk_public_keys_ffs(checkpoint_id, &coordinator_update.new_user_public_keys_ffs)
+                .await?;
+            println!("set_public_key_for_user_ids_ffs  (len: {}) for checkpoint ID: {}", coordinator_update.new_public_key_hash_to_user_id_rows_ffs.len(), checkpoint_id);
+            self.db
+                .set_public_key_for_user_ids_ffs(&coordinator_update.new_public_key_hash_to_user_id_rows_ffs)
+                .await?;
+                        println!("user_registration_tree_set_nodes_ffs  (len: {}) for checkpoint ID: {}", coordinator_update.update_user_registration_tree_nodes_ffs.len(), checkpoint_id);
 
+            self.db
+                .user_registration_tree_set_nodes_ffs(checkpoint_id, &coordinator_update.update_user_registration_tree_nodes_ffs)
+                .await?;
+        }
+        tracing::info!("Committed user registration state updates for checkpoint ID: {}", checkpoint_id);
         // start global user tree updates
-        self.db
+        if !coordinator_update.update_global_user_tree_nodes_ffs.is_empty() {
+            self.db
             .global_user_tree_set_nodes_ffs(checkpoint_id, &coordinator_update.update_global_user_tree_nodes_ffs)
             .await?;
-
+        }
+        tracing::info!("Committed global user tree state updates for checkpoint ID: {}", checkpoint_id);
         // set l2 block state
         self.db
             .set_checkpoint_global_state_roots(checkpoint_id, &coordinator_update.new_base.checkpoint_leaf.global_state_roots)
@@ -527,6 +565,7 @@ impl<
         self.db
             .set_checkpoint_root_hash_to_id_mapping(checkpoint_delta_merkle_proof.new_root, checkpoint_id)
             .await?;
+        tracing::info!("Set checkpoint root hash to ID mapping for checkpoint ID: {}\n{:#?}", checkpoint_id, checkpoint_delta_merkle_proof);
         // END STANDARD STATE UPDATES (technically these can be done in any order after
         // the above two are done)
 
@@ -535,16 +574,28 @@ impl<
         // commits, since if the node dies during this process, it will load the backups
         // from disk SO LONG AS THE checkpoint_id is not set!!!!
         self.db.set_latest_checkpoint_id(checkpoint_id).await?;
+        tracing::info!("Committed coordinator processor state for checkpoint ID: {}", checkpoint_id);
         self.checkpoint_tree_backup_manager
             .append_checkpoint_leaf_hash(checkpoint_id, checkpoint_leaf_hash)
             .await?;
+        tracing::info!("Backed up checkpoint tree root for checkpoint ID: {}", checkpoint_id);
 
-        self.last_committed.checkpoint_state_transition = CheckpointStateHashTransition {
-            old_checkpoint_tree_root: coordinator_update.old_base.checkpoint_tree_root,
-            new_checkpoint_tree_root: coordinator_update.new_base.checkpoint_tree_root,
-            old_checkpoint_leaf_hash: coordinator_update.old_base.checkpoint_leaf_hash,
-            new_checkpoint_leaf_hash: coordinator_update.new_base.checkpoint_leaf_hash,
-        };
+        if checkpoint_id != 0 {
+
+            self.last_committed.checkpoint_state_transition = CheckpointStateHashTransition {
+                old_checkpoint_tree_root: coordinator_update.old_base.checkpoint_tree_root,
+                new_checkpoint_tree_root: coordinator_update.new_base.checkpoint_tree_root,
+                old_checkpoint_leaf_hash: coordinator_update.old_base.checkpoint_leaf_hash,
+                new_checkpoint_leaf_hash: coordinator_update.new_base.checkpoint_leaf_hash,
+            };
+        }else{
+            self.last_committed.checkpoint_state_transition = CheckpointStateHashTransition {
+                old_checkpoint_tree_root: coordinator_update.new_base.checkpoint_tree_root,
+                new_checkpoint_tree_root: coordinator_update.new_base.checkpoint_tree_root,
+                old_checkpoint_leaf_hash: coordinator_update.new_base.checkpoint_leaf_hash,
+                new_checkpoint_leaf_hash: coordinator_update.new_base.checkpoint_leaf_hash,
+            };
+        }
         self.ids.checkpoint_id = checkpoint_id;
         self.ids.next_checkpoint_id = checkpoint_id + 1;
         self.last_committed.update_for_block::<N::HasherBase>(
@@ -553,16 +604,18 @@ impl<
             verifiable_checkpoint_transition.state_transition.checkpoint_transition,
         )?;
 
+        tracing::info!("Updated last committed state for checkpoint ID: {}", checkpoint_id);
         // This just updates the RwLock protected shared status, this is ok because we
         // only read when we dump/create the queue builder
         self.shared_status.update_status(
-            self.ids.gathering_unique_pending_id,
+            self.ids.unique_pending_id,
             checkpoint_id,
             checkpoint_leaf_standard,
             coordinator_update.new_base.checkpoint_leaf.global_state_roots,
             coordinator_update.new_base.block_state,
             false,
         )?;
+        tracing::info!("Updated shared status for checkpoint ID: {}", checkpoint_id);
 
         Ok(())
     }

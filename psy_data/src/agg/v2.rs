@@ -150,10 +150,17 @@ impl<Hash: Copy> AggStateTrackableInput<Hash> for AggStateTransitionInputV2<Hash
 
 impl<F: QFelt64, Hash: Copy + HashTo4Felts<F>> AggStateWitnessV2<F, Hash> for AggStateTransitionInputV2<Hash> {
     fn get_public_inputs_hash_no_tag_tree<H: FieldQHasher<F, Hash>>(&self, allowed_circuit_hashes_root: Hash) -> Hash {
-        self.condense().get_public_inputs_hash_no_tag_tree::<H, F>(allowed_circuit_hashes_root)
+        self.condense_add_one().get_public_inputs_hash_no_tag_tree::<H, F>(allowed_circuit_hashes_root)
     }
 }
 impl<Hash: Copy> AggStateTransitionInputV2<Hash> {
+    pub fn condense_add_one(&self) -> AggStateTransitionWithStats<Hash> {
+        AggStateTransitionWithStats {
+            state_transition_start: self.left_input.state_transition_start,
+            state_transition_end: self.right_input.state_transition_end,
+            total_proofs_generated: self.left_input.total_proofs_generated + self.right_input.total_proofs_generated + 1,
+        }
+    }
     pub fn condense(&self) -> AggStateTransitionWithStats<Hash> {
         AggStateTransitionWithStats {
             state_transition_start: self.left_input.state_transition_start,

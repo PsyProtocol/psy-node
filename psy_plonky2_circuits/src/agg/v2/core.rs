@@ -1,4 +1,4 @@
-use parth_core::{pgoldilocks::QHashOut, protocol::core_types::Q256BitHash};
+use parth_core::{crypto::hash::{tag_tree::hash_tag_tree_node, traits::{FieldQHasher, MerkleHasher}}, felt::QFelt64, pgoldilocks::QHashOut, protocol::core_types::{Q256BitHash, QFHashBase}};
 use plonky2::{
     field::extension::Extendable,
     hash::{
@@ -17,7 +17,7 @@ use plonky2::{
     },
 };
 use psy_core::job::job_id::QProvingJobDataID;
-use psy_data::{agg::{AggStateTransitionInput, AggStateTransitionInputV2}, worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse};
+use psy_data::{agg::{AggStateTransitionInput, AggStateTransitionInputV2, AggStateWitnessV2}, worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse};
 use psy_plonky2_basic_helpers::{builder::{hash::core::CircuitBuilderHashCore, pad_circuit::CircuitBuilderQEDCommonGates, verify::CircuitBuilderVerifyProofHelpers}, verifier::circuit_library::CircuitInfoLibrary};
 use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 
@@ -371,7 +371,7 @@ impl<
     > QStandardCircuitProvableWithRawProofsAndRefLibrary<L, C, D>
     for AggStateTransitionCircuitV2<C, D>
 where
-    C::Hasher: AlgebraicHasher<C::F>, QHashOut<C::F>: Q256BitHash,
+    C::Hasher: FieldQHasher<C::F, QHashOut<C::F>> + AlgebraicHasher<C::F>, QHashOut<C::F>: Q256BitHash + QFHashBase<C::F>, C::F: QFelt64,
 {
 
     fn prove_with_raw_proofs_and_ref_library(
@@ -404,7 +404,37 @@ where
 
 
         let witness = AggStateTransitionInputV2::<QHashOut<C::F>>::psy_ser_from_slice(&input.base.witness)?;
-        self.prove_base(agg_fingerprint, agg_verifier_data, leaf_fingerprint, &leaf_verifier_data, &left_proof, &right_proof, &witness, left_proving_rewards_tag_value, right_proving_rewards_tag_value, worker_reward_tag)
+
+
+        let new_rewards_root = hash_tag_tree_node::<QHashOut<C::F>, C::Hasher>(&left_proving_rewards_tag_value, &right_proving_rewards_tag_value, &worker_reward_tag);
+
+        println!("witness: {:#?}", witness); 
+
+
+        
+        let whitelist = C::Hasher::two_to_one(
+            &leaf_fingerprint,
+            &agg_fingerprint
+        );
+    
+        let expected_public_inputs_hash_before_reward_tag = witness.get_public_inputs_hash_no_tag_tree::<C::Hasher>(whitelist);
+        println!("expected_public_inputs_hash_before_reward_tag: {:#?}", expected_public_inputs_hash_before_reward_tag);
+        let metadata_expected_public_inputs_hash_before_reward_tag = input.base.job.metadata.expected_public_inputs_hash;
+        println!("metadata_expected_public_inputs_hash_before_reward_tag: {:#?}", metadata_expected_public_inputs_hash_before_reward_tag);
+        if expected_public_inputs_hash_before_reward_tag != metadata_expected_public_inputs_hash_before_reward_tag {
+            tracing::error!("expected_public_inputs_hash_before_reward_tag does not match metadata! expected: {:#?}, got: {:#?}", metadata_expected_public_inputs_hash_before_reward_tag, expected_public_inputs_hash_before_reward_tag);
+        }
+        println!("new_rewards_root: {:#?}", new_rewards_root);
+        let expected_public_inputs_hash = C::Hasher::two_to_one(
+            &expected_public_inputs_hash_before_reward_tag,
+            &new_rewards_root,
+        );
+        println!("expected_public_inputs_hash: {:#?}", expected_public_inputs_hash);
+        let result = self.prove_base(agg_fingerprint, agg_verifier_data, leaf_fingerprint, &leaf_verifier_data, &left_proof, &right_proof, &witness, left_proving_rewards_tag_value, right_proving_rewards_tag_value, worker_reward_tag)?;
+
+
+        println!("got_public_inputs: {:#?}", result.public_inputs);
+        Ok(result)
 
     }
 }

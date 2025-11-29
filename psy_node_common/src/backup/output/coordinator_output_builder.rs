@@ -37,12 +37,6 @@ use crate::coordinator::processor::gatherers::{
     register_user_gatherer::{RegisterUserGathererOutput, RegisterUserGathererOutputDatabase},
 };
 
-fn get_current_block_time() -> u64 {
-    let start = std::time::SystemTime::UNIX_EPOCH;
-    let now = std::time::SystemTime::now();
-    let duration = now.duration_since(start).expect("Time went backwards");
-    duration.as_millis() as u64
-}
 pub struct CoordinatorOutputBuilder<N: QNetworkTypesConfig<JobId = QProvingJobDataID>> {
     pub guta_gatherer_result: CoordinatorGUTAUpdateGathererOutputDatabase<N::F, N::QHash>,
     pub register_users_gatherer_result: RegisterUserGathererOutputDatabase<N::QHash>,
@@ -72,6 +66,7 @@ impl<N: QNetworkTypesConfig<JobId = QProvingJobDataID>> CoordinatorOutputBuilder
         register_users_gatherer_result: RegisterUserGathererOutputDatabase<N::QHash>,
         deploy_contract_gatherer_result: DeployContractGathererOutputDatabase<N::QHash>,
         append_checkpoint_tree_siblings: Vec<N::QHash>,
+        block_time: u64,
     ) -> anyhow::Result<PsyPreparedCoordinatorBlockStateUpdates<N::F, N::QHash>> {
 let root_guta_job = QProvingJobDataID::new_invalid_job_id();
         let root_register_user_job = QProvingJobDataID::new_invalid_job_id();
@@ -112,6 +107,7 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
             coordinator_ids,
             last_committed,
             reward_tree_root,
+            block_time,
         )
     }
     pub fn new(
@@ -248,6 +244,7 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
         circuit_fingerprint_config: &PsyNodeCircuitFingerprintConfig<N::QHash>,
         reward_tree_root: N::QHash,
         genesis_checkpoint_state_transition_hash: N::QHash,
+        block_time: u64,
     ) -> anyhow::Result<QCQEDCheckpointStateTransitionInput<N::F, N::QHash>> {
         tracing::info!("last committed checkpoint leaf: {:?} ", last_committed.checkpoint_leaf);
         tracing::info!("last committed checkpoint leaf hash: {:?} ({})", last_committed.checkpoint_leaf_hash, hex::encode(&last_committed.checkpoint_leaf_hash.into_owned_32bytes()));
@@ -272,7 +269,7 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
                 register_users_completed: N::F::from_u64_value(self.total_register_user_jobs as u64),
                 gutas_completed: N::F::from_u64_value(self.total_guta_jobs as u64),
             },
-            block_time: N::F::from_u64_value(get_current_block_time()),
+            block_time: N::F::from_u64_value(block_time),
             random_seed: self.guta_gatherer_result.random_seed_guta,
             pm_rewards_commitment: PPMRewardCommitment {
                 register_users_root: reward_tree_root,
@@ -311,7 +308,7 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
                 },
                 part_1_header: self.get_part_1_header(last_committed, circuit_fingerprint_config),
                 old_stats: last_committed.checkpoint_leaf_stats.clone(),
-                block_time: N::F::from_u64_value(get_current_block_time()),
+                block_time: N::F::from_u64_value(block_time),
                 final_random_seed_contribution: self.guta_gatherer_result.random_seed_guta,
             },
             append_checkpoint_tree_proof,
@@ -332,6 +329,7 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
         circuit_fingerprint_config: &PsyNodeCircuitFingerprintConfig<N::QHash>,
         agg_part_1_reward_tree_value: N::QHash,
         genesis_checkpoint_state_transition_hash: N::QHash,
+        block_time: u64,
     ) -> anyhow::Result<(PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>, (N::JobId, Vec<u8>))> {
         let witness = self.get_checkpoint_state_transition_witness(
             checkpoint_id,
@@ -341,6 +339,7 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
             circuit_fingerprint_config,
             agg_part_1_reward_tree_value,
             genesis_checkpoint_state_transition_hash,
+            block_time,
         )?;
         let witness_bytes = witness.psy_ser_to_bytes_vec()?;
         println!("circuit_fingerprint_config.checkpoint_state_transition_circuit_fingerprint: {:?}", circuit_fingerprint_config.checkpoint_state_transition_circuit_fingerprint);
@@ -374,6 +373,7 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
         coordinator_ids: &CoordinatorProcessorIdState,
         last_committed: &CoordinatorProcessorLastCommittedState<N::F, N::QHash>,
         reward_tree_root: N::QHash,
+        block_time: u64,
     ) -> anyhow::Result<PsyPreparedCoordinatorBlockStateUpdates<N::F, N::QHash>> {
         let checkpoint_state_roots = PQEDCheckpointGlobalStateRoots {
             contract_tree_root: self.deploy_contract_gatherer_result.end_global_contract_tree_root,
@@ -392,7 +392,7 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
                 register_users_completed: N::F::from_u64_value(self.total_register_user_jobs as u64),
                 gutas_completed: N::F::from_u64_value(self.total_guta_jobs as u64),
             },
-            block_time: N::F::from_u64_value(get_current_block_time()),
+            block_time: N::F::from_u64_value(block_time),
             random_seed: self.guta_gatherer_result.random_seed_guta,
             pm_rewards_commitment: PPMRewardCommitment {
                 register_users_root: reward_tree_root,

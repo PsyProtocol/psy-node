@@ -437,7 +437,7 @@ impl NatsJetStreamClient {
         self.ensure_stream().await?;
 
         self.ensure_consumer(subject, durable_name, queue_key.get_queue_type()).await?;
-        tracing::info!("Getting message for worker queue, subject: {}, durable_name: {}", subject, durable_name);
+        /*tracing::info!("Getting message for worker queue, subject: {}, durable_name: {}", subject, durable_name);*/
         let consumer: PullConsumer = self
             .jetstream
             .get_consumer_from_stream::<PullConfig, _, _>(&durable_name, &self.stream_name)
@@ -454,19 +454,19 @@ impl NatsJetStreamClient {
         if let Some(Ok(jet_msg)) = messages.next().await {
             let job = QK::QueueItem::decode_queue_item_ref(jet_msg.payload.as_ref())?;
             let kv_key = format!("{}.{}", subject, hex::encode(job.get_restorable_job_id()));
-            tracing::info!(
+            /*tracing::info!(
                 "Got job from worker queue, subject: {}, durable_name: {}, kv_key: {}",
                 subject,
                 durable_name,
                 kv_key
-            );
+            );*/
 
             self.kv
                 .put(&kv_key, Bytes::copy_from_slice(jet_msg.reply.as_deref().unwrap().as_bytes()))
                 .await?;
             Ok(Some(job))
         } else {
-            tracing::info!("No messages in worker queue found, subject: {}, durable_name: {}", subject, durable_name);
+            //tracing::info!("No messages in worker queue found, subject: {}, durable_name: {}", subject, durable_name);
 
             Ok(None)
         }
@@ -510,18 +510,36 @@ impl NatsJetStreamClient {
         let max_wait: Duration = Duration::from_millis(timeout_ms);
 
         loop {
-            let mut consumer: PullConsumer = self
+            let mut consumer: PullConsumer = match self
                 .jetstream
                 .get_consumer_from_stream::<PullConfig, _, _>(&durable_name, &self.stream_name)
-                .await?;
-            let info = consumer.info().await?;
+                .await {
+                Ok(c) => anyhow::Ok(c),
+                Err(e) => {
+                    tracing::error!("Failed to get consumer: {}", e);
+                    anyhow::bail!("Failed to get consumer for subject: {}, durable_name: {} {:?}", subject, durable_name,e );
+                }
+            }?;
+            let info = match consumer.info().await {
+                Ok(i) => anyhow::Ok(i),
+                Err(e) => {
+                    tracing::error!("Failed to get consumer info: {}", e);
+                    anyhow::bail!("Failed to get consumer info for subject: {}, durable_name: {} {:?}", subject, durable_name,e );
+                }
+            }?;
             if info.num_pending == 0 && info.num_ack_pending == 0 {
+                println!("all jobs complete for subject: {}, durable_name: {}", subject, durable_name);
                 return Ok(());
+            }else{
+                /*println!(
+                    "still waiting... pending: {}, ack_pending: {}",
+                    info.num_pending, info.num_ack_pending
+                );*/
             }
             if start.elapsed() > max_wait {
                 return Err(anyhow::anyhow!("Timeout waiting for all jobs to complete"));
             }
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
 }
@@ -1034,7 +1052,7 @@ impl QStandardWorkerQueueSubscriber for NatsJetStreamClient {
     ) -> anyhow::Result<Option<QK::QueueItem>> {
         let subject = queue_key.get_queue_subject(&self.base_namespace, realm_id, realm_sub_id, unique_id, task_group);
         let durable_name = queue_key.get_durable_name(&self.base_namespace, realm_id, realm_sub_id, unique_id, task_group);
-        println!("Getting next worker queue item for subject: {}, durable_name: {}", subject, durable_name);
+        //println!("Getting next worker queue item for subject: {}, durable_name: {}", subject, durable_name);
         self.get_message_if_exists_dqi_worker(queue_key, &subject, &durable_name).await
     }
     async fn wait_until_all_jobs_complete_or_timeout_worker<QK: PCoreStandardQueueKeyForRealm>(

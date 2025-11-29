@@ -49,7 +49,12 @@ where
         if is_active {
             let start_processing_at = std::time::Instant::now();
             tracing::debug!("[COORDINATOR] Process block starting...");
-            processor.process_block().await?;
+            let result = processor.process_block().await;
+            if let Err(e) = result {
+                tracing::error!("[COORDINATOR] Error processing block: {:?}", e);
+                // fatal, exit process
+                std::process::exit(1);
+            }
             tracing::debug!("[COORDINATOR] Process block finished.");
             let elapsed = start_processing_at.elapsed();
             let duration_ms = elapsed.as_millis();

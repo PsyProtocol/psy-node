@@ -196,6 +196,15 @@ pub struct CoordinatorGUTAUpdateGatherer<
     pub new_coordinator_guta_file: FileSystem::File,
     pub pending_file_path: String,
 }
+impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>, FileSystem: TokioLikeFileSystem> CoordinatorGUTAUpdateGatherer<N, TempDatabase, FileSystem>
+{
+    fn update_status(&mut self) -> anyhow::Result<()> {
+
+        let status = self.config.status.read().map_err(|e| anyhow::anyhow!("{:?}", e))?.clone();
+        self.status = status;
+        Ok(())
+    }
+}
 #[derive(Clone)]
 pub struct CoordinatorGUTAUpdateGathererOutputDatabase<F, Hash> {
     pub update_global_user_tree_nodes_ffs: Vec<u8>,
@@ -246,7 +255,7 @@ impl<
             .await?;
         new_coordinator_guta_file.write_all(&tree.get_root().into_owned_32bytes()).await?;
 
-        let guta_planner = CoordinatorGUTAPlanner::new();
+        let guta_planner = CoordinatorGUTAPlanner::new(config.checkpoint_tree.get_root());
         let last_committed_checkpoint_root = config.checkpoint_tree.get_root();
         Ok(Self {
             config,
@@ -276,8 +285,12 @@ impl<
             ));
         }
         let update_header = GlobalUserTreeAggregatorHeaderWithTagValueAndJobID::<N::F, N::QHash>::psy_ser_from_slice(&item)?;
+        let current_checkpoint_root = self.config.checkpoint_tree.get_root();
+        if self.last_committed_checkpoint_root != current_checkpoint_root {
+            //self.update_status()?;
+            self.last_committed_checkpoint_root = current_checkpoint_root;
+        }
         let unique_pending_id = self.status.unique_pending_id;
-        let current_checkpoint_root = self.last_committed_checkpoint_root;
 
         self.config
             .temp_db
@@ -305,7 +318,7 @@ impl<
                 &self.config.checkpoint_tree,
                 tree,
                 self.config.temp_db.clone(),
-                &update_header,
+                update_header,
             )
             .await?;
         Ok(())
@@ -347,7 +360,7 @@ impl<
                 }
             }
             tracing::info!("Reverted to root {:?}", tree.get_root());
-            self.guta_planner = CoordinatorGUTAPlanner::new();
+            self.guta_planner = CoordinatorGUTAPlanner::new(self.config.checkpoint_tree.get_root());
         } else {
             tracing::info!(
                 "Committing GUTA updates gatherer changes for pending id {}, committing root {:?}",
@@ -357,11 +370,16 @@ impl<
             tree.commit_changes();
         }
 
-        // ensure the new user public keys file is flushed to disk
         self.config
             .file_system
             .file_like_fs_flush_file_with_path(&self.pending_file_path, &mut self.new_coordinator_guta_file)
             .await?;
+
+        let current_checkpoint_root = self.config.checkpoint_tree.get_root();
+        if self.last_committed_checkpoint_root != current_checkpoint_root {
+            //self.update_status()?;
+            self.last_committed_checkpoint_root = current_checkpoint_root;
+        }
 
         let end_global_user_tree_root = tree.get_root();
 
@@ -376,6 +394,9 @@ impl<
             self.start_global_user_tree_root,
             end_global_user_tree_root
         );
+
+
+        let new_status = self.config.status.read().map_err(|e| anyhow::anyhow!("error reading status {:?}", e))?.clone();
         let jobs_for_queue: anyhow::Result<Vec<Vec<PsyProvingJobMetadataWithJobId<N::QHash, QProvingJobDataID>>>> = self
             .guta_planner
             .finalize_with_reward_ids(
@@ -387,8 +408,8 @@ impl<
                 self.config.temp_db.clone(),
                 GUTA_REWARDS_TREE_OFFSET_ROOT_LEVEL,
                 GUTA_REWARDS_TREE_OFFSET_ROOT_INDEX,
-                self.status.last_committed_checkpoint_state_roots,
-                self.status.last_committed_checkpoint_leaf.stats.qfhash::<N::HasherBase>(),
+                new_status.last_committed_checkpoint_state_roots,
+                new_status.last_committed_checkpoint_leaf.stats.qfhash::<N::HasherBase>(),
                 self.config.coordinator_guta_updates_circuit_whitelist,
             )
             .await;

@@ -9,6 +9,8 @@ VALKEY_LOGS="valkey_logs.txt"
 NATS_LOGS="nats_logs.txt"
 SCYLLA_LOGS="scylla_logs.txt"
 
+docker stop "$VALKEY_NAME" "$NATS_NAME" "$SCYLLA_NAME" 2>/dev/null
+
 # Function to handle Ctrl+C (SIGINT)
 cleanup() {
     echo ""
@@ -52,3 +54,4 @@ docker run --rm --name "$SCYLLA_NAME" -p 9042:9042 scylladb/scylla 2>&1 \
 # Wait implies the script stays running until the background processes finish
 # or untill the user hits Ctrl+C
 wait
+

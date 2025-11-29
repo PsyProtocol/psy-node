@@ -1,3 +1,4 @@
+use cf_utils::timer::TraceTimer;
 use parth_core::protocol::core_types::QNetworkTypesConfig;
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{
@@ -268,6 +269,7 @@ impl<
         &self,
         mut output_builder: CoordinatorOutputBuilder<N>,
     ) -> anyhow::Result<(PsyPreparedCoordinatorBlockStateUpdates<N::F, N::QHash>, Vec<u8>)> {
+        let block_time = output_builder.register_users_gatherer_result.block_time;
         let agg_part_1_reward_root: Option<N::QHash> = self
             .db
             .temp_db
@@ -289,6 +291,7 @@ impl<
             &self.db.circuit_fingerprint_config,
             agg_part_1_reward_root,
             self.db.genesis_checkpoint_state_transition_hash,
+            block_time,
         )?;
 
         self.db
@@ -296,6 +299,7 @@ impl<
             .set_tdb_proof_witnesses_tuple_owned_raw(&self.db.ids.realm_identifier, self.db.ids.unique_pending_id, vec![job_and_witness_bytes])
             .await?;
         self.publish_and_wait_for_job_completion(&job_metadata).await?;
+        tracing::info!("Checkpoint State Transition Proof job completed, retrieving results...");
 
         let reward_root: Option<N::QHash> = self
             .db
@@ -307,16 +311,19 @@ impl<
             )
             .await?;
         if reward_root.is_none() {
+            tracing::error!("Failed to retrieve reward root for checkpoint state transition job id: {:?}", job_metadata.job_id);
             anyhow::bail!("Missing reward tree value for checkpoint state transition job");
         }
         let reward_root = reward_root.unwrap();
         let checkpoint_zk_proof: Option<Vec<u8>> = self.db.proof_store.get_proof_bytes_by_job_id(job_metadata.job_id.get_output_id()).await?;
         if checkpoint_zk_proof.is_none() {
+            tracing::error!("Failed to retrieve zk proof for checkpoint state transition job id: {:?}", job_metadata.job_id);
             anyhow::bail!("Missing zk proof for checkpoint state transition job");
         }
         let checkpoint_zk_proof = checkpoint_zk_proof.unwrap();
-        let output = output_builder.finalize(&self.db.ids, &self.db.last_committed, reward_root)?;
-
+        tracing::info!("Retrieved checkpoint zk proof of size: {} bytes", checkpoint_zk_proof.len());
+        let output = output_builder.finalize(&self.db.ids, &self.db.last_committed, reward_root, block_time)?;
+        tracing::info!("Finalized coordinator block state updates.");
         Ok((output, checkpoint_zk_proof))
     }
     pub async fn plan_genesis_checkpoint_state_transition_proof(&self) -> anyhow::Result<()> {
@@ -358,14 +365,17 @@ impl<
     }
 
     pub async fn process_block(&mut self) -> anyhow::Result<()> {
+        let mut timer = TraceTimer::new("process_block");
         tracing::info!("Starting to process new coordinator block with checkpoint_id = {}...", self.db.ids.next_checkpoint_id);
         let (guta_jobs, register_user_jobs, deploy_contract_jobs, mut output_builder) = self.get_results_from_gatherers().await?;
 
+        timer.lap("get_results_from_gatherers");
         let has_jobs = self.get_root_job_ids(
             &guta_jobs,
             &register_user_jobs,
             &deploy_contract_jobs,
         )?;
+        timer.lap("get_root_job_ids");
         if has_jobs.is_none() {
             //tracing::info!("No jobs to process in this block, skipping.");
             //return Ok(());
@@ -382,16 +392,19 @@ impl<
             false,
         )
         .await?;
+        timer.lap("publish_jobs_first_level");
         if self.db.ids.checkpoint_id == 0 {
             self.plan_genesis_checkpoint_state_transition_proof().await?;
+            timer.lap("plan_genesis_checkpoint_state_transition_proof");
         }
 
         // while the first level of jobs are processing, plan the agg job
         let agg_job_metadata = self.plan_agg_guta_register_users_deploy_contracts_job(&mut output_builder).await?;
-
+        timer.lap("plan_agg_guta_register_users_deploy_contracts_job");
         tracing::info!("Waiting for first level of jobs to complete...");
         // wait for the first level of jobs to finish
         self.wait_for_jobs_completion().await?;
+        timer.lap("wait_for_jobs_completion_first_level");
         tracing::info!("First level of jobs completed!");
 
         // publish the rest of the jobs and wait for them to finish
@@ -404,17 +417,22 @@ impl<
             true,
         )
         .await?;
-
+        timer.lap("publish_jobs_rest_levels");
         tracing::info!("Pre-agg jobs completed!");
 
         // wait for the Aggregate GUTA, User Registation and Deploy Contracts Proof to
         // finish being proved
         self.publish_and_wait_for_job_completion(&agg_job_metadata).await?;
+        timer.lap("publish_and_wait_for_job_completion_agg");
+        println!("Aggregate GUTA, User Registration and Deploy Contracts Proof completed!");
         let (coordinator_update, zk_proof) = self.plan_checkpoint_state_transition(output_builder).await?;
-
+        timer.lap("plan_checkpoint_state_transition");
+        tracing::info!("Checkpoint State Transition Proof completed!");
         self.db
             .commit_state(coordinator_update, ProvingJobCircuitType::GenerateRollupStateTransitionProof, zk_proof)
             .await?;
+        timer.lap("commit_state");
+        tracing::info!("Committed new coordinator block with checkpoint_id = {}.", self.db.ids.checkpoint_id);
         self.db.print_coordinator_processor_state();
 
         Ok(())

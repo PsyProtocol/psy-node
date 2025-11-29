@@ -40,6 +40,12 @@ use crate::{
 pub const REGISTER_USER_GATHERER_BACKUP_V1_MAGIC_BYTES: [u8; 4] = [0x52, 0x55, 0x42, 0x31]; // 'RUB1' in ASCII
 pub const REGISTER_USER_GATHERER_BACKUP_V1_MAGIC_U32: u32 = 0x31425552; // 'RUB1' in little-endian u32
 
+fn get_current_block_time() -> u64 {
+    let start = std::time::SystemTime::UNIX_EPOCH;
+    let now = std::time::SystemTime::now();
+    let duration = now.duration_since(start).expect("Time went backwards");
+    duration.as_millis() as u64
+}
 pub fn get_new_register_user_gatherer_backup_file_path(
     backup_file_directory: &str,
     realm_id_u64: u64,
@@ -74,11 +80,11 @@ pub async fn read_register_user_gatherer_backup_file<Hasher: MerkleZeroHasher<Ha
 ) -> anyhow::Result<RegisterUserGathererOutputDatabase<Hash>> {
     let metadata = file.file_like_metadata().await?;
     let file_len = metadata.len();
-    if file_len < 4 + 8 + 32 + 8{
+    if file_len < 4 + 8 + 32 + 8 + 8{
         return Err(anyhow::anyhow!("Backup file too small to be valid: {} bytes", metadata.len()));
     }
 
-    let file_len_without_metadata = file_len - 4 - 8 - 32 - 8;
+    let file_len_without_metadata = file_len - 4 - 8 - 32 - 8 - 8;
     if file_len_without_metadata % (64 as u64) != 0 {
         return Err(anyhow::anyhow!(
             "Backup file length without metadata is not a multiple of 64: {} bytes",
@@ -116,14 +122,17 @@ pub async fn read_register_user_gatherer_backup_file<Hasher: MerkleZeroHasher<Ha
         ));
     }
 
-    let mut new_user_public_keys_ffs = vec![0u8; file_len_without_metadata as usize];
-    file.read_exact(&mut new_user_public_keys_ffs).await?;
+    let mut public_keys_no_id = vec![0u8; file_len_without_metadata as usize];
+    let mut new_user_public_keys_ffs = Vec::with_capacity(expected_count as usize * 72);
+    file.read_exact(&mut public_keys_no_id).await?;
     let mut new_public_key_hash_to_user_id_rows = Vec::with_capacity(expected_count as usize);
 
     let mut new_leaf_hashes = Vec::with_capacity(expected_count as usize);
     for i in 0..expected_count {
         let offset = (i * 64) as usize;
-        let leaf_hash = hash_two_from_slice::<Hash, Hasher>(&new_user_public_keys_ffs[offset..offset + 64]);
+        new_user_public_keys_ffs.extend_from_slice(&(start_next_user_id + i).to_le_bytes());
+        new_user_public_keys_ffs.extend_from_slice(&public_keys_no_id[offset..offset + 64]);
+        let leaf_hash = hash_two_from_slice::<Hash, Hasher>(&public_keys_no_id[offset..offset + 64]);
         new_public_key_hash_to_user_id_rows.push(QHash256AndU64 {
             hash: leaf_hash,
             value_u64: start_next_user_id + i,
@@ -143,6 +152,7 @@ pub async fn read_register_user_gatherer_backup_file<Hasher: MerkleZeroHasher<Ha
         node.pio_write_to_io(&mut update_user_registration_tree_nodes_ffs)?;
     }
     let total_jobs = file.read_u64_le().await?;
+    let block_time = file.read_u64_le().await?;
     tree.commit_changes();
     let output_db = RegisterUserGathererOutputDatabase {
         start_next_user_id,
@@ -154,6 +164,7 @@ pub async fn read_register_user_gatherer_backup_file<Hasher: MerkleZeroHasher<Ha
         new_public_key_hash_to_user_id_rows_ffs,
         update_user_registration_tree_nodes_ffs,
         total_jobs,
+        block_time,
     };
     Ok(output_db)
 }
@@ -243,6 +254,7 @@ pub struct RegisterUserGathererOutputDatabase<Hash> {
     pub new_public_key_hash_to_user_id_rows_ffs: Vec<u8>,
     pub update_user_registration_tree_nodes_ffs: Vec<u8>,
     pub total_jobs: u64,
+    pub block_time: u64,
 }
 #[derive(Debug, Clone)]
 pub struct RegisterUserGathererOutput<Hash, JobId> {
@@ -324,12 +336,16 @@ impl<
             ));
         }
         self.new_user_public_keys_file.write_all(&item).await?;
+        self.new_user_public_keys_ffs
+            .extend_from_slice(self.next_user_id.to_le_bytes().as_slice());
         self.new_user_public_keys_ffs.extend_from_slice(&item);
         let hash = hash_two_from_slice::<N::QHash, N::HasherBase>(&item);
         let u64_hash_mapping_row = QHash256AndU64 {
             hash,
             value_u64: self.next_user_id,
         };
+        self.new_public_key_hash_to_user_id_rows_ffs
+            .extend_from_slice(self.next_user_id.to_le_bytes().as_slice());
         self.new_public_key_hash_to_user_id_rows_ffs
             .extend_from_slice(&u64_hash_mapping_row.ffs_to_bytes());
 
@@ -427,6 +443,8 @@ impl<
         )?;
         let total_jobs = jobs_for_queue.iter().map(|v| v.len()).sum::<usize>() as u64;
         self.new_user_public_keys_file.write_u64_le(total_jobs).await?;
+        let block_time =get_current_block_time();
+        self.new_user_public_keys_file.write_u64_le(block_time).await?;
 
         self.config
             .file_system
@@ -451,6 +469,7 @@ impl<
             new_public_key_hash_to_user_id_rows_ffs: self.new_public_key_hash_to_user_id_rows_ffs,
             update_user_registration_tree_nodes_ffs,
             total_jobs,
+            block_time,
         };
         let output = RegisterUserGathererOutput {
             db_output: output_database,

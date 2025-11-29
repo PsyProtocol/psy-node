@@ -50,6 +50,7 @@ fn get_rk(table_id: u64) -> QDatabaseTableRoutingKey {
 pub async fn setup_psy_scylla_database_store<N: QNetworkDatabaseTypes>(
     store: Arc<ScyllaCoreStore<N::QHash, N::HasherBase>>,
 ) -> anyhow::Result<ScyllaUnifiedPsyStore<N, N::QHash, N::HasherBase>> {
+    /*
     let checkpoint_leaf_table = store.init_std_table::<ExKivTableIdentifier>("checkpoint_leaf_table", get_rk(1)).await?;
     let checkpoint_root_to_checkpoint_id_table = store
         .init_std_table::<ExBiDirectionalMappingTableIdentifier>("checkpoint_root_to_checkpoint_id_table", get_rk(2))
@@ -129,6 +130,71 @@ pub async fn setup_psy_scylla_database_store<N: QNetworkDatabaseTypes>(
     let checkpoint_zk_proof_and_transition_table = store
         .init_std_table::<ExKivTableIdentifier>("checkpoint_zk_proof_and_transition_table", get_rk(27))
         .await?;
+    */
+
+    let (
+        checkpoint_leaf_table,
+        checkpoint_root_to_checkpoint_id_table,
+        checkpoint_leaf_to_checkpoint_id_table,
+        l2_block_state_table,
+        checkpoint_id_to_realm_root_table,
+        latest_info_table,
+        checkpointed_object_table,
+        checkpoint_state_roots_table,
+        user_leaf_table,
+        user_public_key_table,
+        u64_singleton_table,
+        contract_state_tree_height_table,
+        checkpoint_id_to_pending_id_table,
+        pending_id_to_checkpoint_id_table,
+        pending_id_to_pending_proc_id_table,
+        realm_rewards_tree_node_key_table,
+        public_key_hash_to_user_ids_table,
+        global_user_tree_table,
+        user_contract_tree_table,
+        contract_state_tree_table,
+        global_checkpoint_tree_table,
+        guta_reward_tag_tree_table,
+        user_registration_tree_table,
+        global_contract_tree_table,
+        contract_function_tree_table,
+        contract_leaf_table,
+        contract_code_definition_table,
+        checkpoint_zk_proof_and_transition_table,
+    ) = tokio::try_join!(
+        store.init_std_table::<ExKivTableIdentifier>("checkpoint_leaf_table", get_rk(1)),
+        store.init_std_table::<ExBiDirectionalMappingTableIdentifier>("checkpoint_root_to_checkpoint_id_table", get_rk(2)),
+        store.init_std_table::<ExBiDirectionalMappingTableIdentifier>("checkpoint_leaf_to_checkpoint_id_table", get_rk(3)),
+        store.init_std_table::<ExKivTableIdentifier>("l2_block_state_table", get_rk(4)),
+        store.init_std_table::<ExKivTableIdentifier>("checkpoint_id_to_realm_root_table", get_rk(5)),
+        store.init_std_table::<ExKivTableIdentifier>("latest_info_table", get_rk(6)),
+        store.init_std_table::<ExSingleIdTableIdentifier>("checkpointed_object_table", get_rk(7)),
+        store.init_std_table::<ExKivTableIdentifier>("checkpoint_state_roots_table", get_rk(8)),
+        store.init_std_table::<ExSingleIdTableIdentifier>("user_leaf_table", get_rk(9)),
+        store.init_std_table::<ExSingleIdTableIdentifier>("user_public_key_table", get_rk(10)),
+        store.init_std_table::<ExU64TableIdentifier>("u64_singleton_table", get_rk(11)),
+        store.init_std_table::<ExSingleIdTableIdentifier>("contract_state_tree_height_table", get_rk(12)),
+        store.init_std_table::<ExU64TableIdentifier>("checkpoint_id_to_pending_id_table", get_rk(13)),
+        store.init_std_table::<ExU64TableIdentifier>("pending_id_to_checkpoint_id_table", get_rk(14)),
+        store.init_std_table::<ExBiDirectionalU64U128MappingTableIdentifier>("pending_id_to_pending_proc_id_table", get_rk(15)),
+        store.init_std_table::<ExSingleIdTableIdentifier>("realm_rewards_tree_node_key_table", get_rk(27)),
+        // mappings
+        store.init_std_table::<ExHashToManyIdsTableIdentifier>("public_key_hash_to_user_ids_table", get_rk(16)),
+        // start trees
+        store.init_zero_id_merkle_table("global_user_tree_table", get_rk(17), N::GLOBAL_USER_TREE_HEIGHT),
+        store.init_std_table::<ExSingleIdMerkleTableIdentifier>("user_contract_tree_table", get_rk(18)),
+        store.init_std_table::<ExDoubleIdMerkleTableIdentifier>("contract_state_tree_table", get_rk(19)),
+        store.init_zero_id_merkle_table("global_checkpoint_tree_table", get_rk(20), N::CHECKPOINT_TREE_HEIGHT),
+        // start reward tree table
+        store.init_std_table::<ExTagTreeTableIdentifier>("guta_reward_tag_tree_table", get_rk(21)),
+        // added tables for completeness
+        store.init_zero_id_merkle_table("user_registration_tree_table", get_rk(22), N::GLOBAL_USER_TREE_HEIGHT),
+        store.init_zero_id_merkle_table("global_contract_tree_table", get_rk(23), N::GLOBAL_CONTRACT_TREE_HEIGHT),
+        store.init_std_table::<ExSingleIdMerkleTableIdentifier>("contract_function_tree_table", get_rk(24)),
+        store.init_std_table::<ExSingleIdTableIdentifier>("contract_leaf_table", get_rk(25)),
+        store.init_std_table::<ExSingleIdTableIdentifier>("contract_code_definition_table", get_rk(26)),
+        store.init_std_table::<ExKivTableIdentifier>("checkpoint_zk_proof_and_transition_table", get_rk(27))
+    )?;
     let psy_db = PsyUnifiedCoreDatabaseStore::new(
         store.clone(),
         Arc::new(checkpoint_leaf_table),

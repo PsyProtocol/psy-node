@@ -76,6 +76,11 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + Eq + PartialEq + Default + std
             self.recompute_entire_level(level);
         }
     }
+    pub fn ensure_leaf_root_recorded(&self, index: u64) {
+        let leaf_proof = self.get_leaf(index);
+        let root = leaf_proof.get_append_root::<Hasher>();
+        self.roots.insert(root, index);
+    }
     pub fn append_leaf(&self, index: u64, leaf: Hash) -> anyhow::Result<DeltaMerkleProofCore<Hash>> {
         let max_leaves = 1u64 << self.height;
         if index >= max_leaves {

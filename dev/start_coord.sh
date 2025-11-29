@@ -1,5 +1,7 @@
 #!/bin/bash
+cargo run --release --package psy_plonky2_circuits --example config_gen_v2
 cargo build --release
+
 ./target/release/psy_node_cli start-coordinator-processor --config ./psy_cli/example_node_configs/coordinator_processor_1.yaml > logs/coordinator_processor_1_logs.txt 2>&1 &
 sleep 5
 ./target/release/psy_node_cli start-coordinator-edge --config ./psy_cli/example_node_configs/coordinator_edge_1.yaml > logs/coordinator_edge_1_logs.txt 2>&1 &

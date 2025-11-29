@@ -125,6 +125,39 @@ pub fn compute_historical_and_current_merkle_roots_core<Hash: PartialEq + Copy, 
     (historical, current)
 }
 
+
+pub fn compute_historical_append_root_core<Hash: PartialEq + Copy, Hasher: MerkleZeroHasher<Hash>>(
+    proof: &MerkleProofCore<Hash>,
+) -> Hash {
+    let mut current = proof.value;
+    for (i, sibling) in proof.siblings.iter().enumerate() {
+        if proof.index & (1 << i) == 0 {
+            current = Hasher::two_to_one(&current, &Hasher::get_zero_hash(i));
+        } else {
+            current = Hasher::two_to_one(sibling, &current);
+        }
+    }
+    current
+}
+
+
+
+pub fn compute_historical_append_root<Hash: PartialEq + Copy, Hasher: MerkleZeroHasher<Hash>>(
+    value: &Hash,
+    index: u64,
+    siblings: &[Hash],
+) -> Hash {
+    let mut current = *value;
+    for (i, sibling) in siblings.iter().enumerate() {
+        if index & (1 << i) == 0 {
+            current = Hasher::two_to_one(&current, &Hasher::get_zero_hash(i));
+        } else {
+            current = Hasher::two_to_one(sibling, &current);
+        }
+    }
+    current
+}
+
 pub fn verify_delta_merkle_proof_core<Hash: PartialEq + Copy, Hasher: MerkleHasher<Hash>>(proof: &DeltaMerkleProofCore<Hash>) -> bool {
     if proof.siblings.len() > 64 {
         return false;
@@ -414,6 +447,12 @@ impl<Hash: Default> Default for MerkleProofCore<Hash> {
     }
 }
 impl<Hash: PartialEq + Copy> MerkleProofCore<Hash> {
+    pub fn get_append_root<Hasher: MerkleZeroHasher<Hash>>(&self) -> Hash {
+        compute_historical_append_root_core::<Hash, Hasher>(&self)
+
+    }
+}
+impl<Hash: PartialEq + Copy> MerkleProofCore<Hash> {
     pub fn new_from_params<Hasher: MerkleHasher<Hash>>(index: u64, value: Hash, siblings: Vec<Hash>) -> Self {
         let root = compute_root_merkle_proof_generic::<Hash, Hasher>(value, index, &siblings);
         Self {
@@ -493,6 +532,12 @@ pub struct DeltaMerkleProofCore<Hash> {
     pub siblings: Vec<Hash>,
 }
 
+impl<Hash: PartialEq + Copy> DeltaMerkleProofCore<Hash> {
+    pub fn get_append_root<Hasher: MerkleZeroHasher<Hash>>(&self) -> Hash {
+        compute_historical_append_root::<Hash, Hasher>(&self.new_value, self.index, &self.siblings)
+
+    }
+}
 #[cfg(feature = "std")]
 impl<Hash: QToCodeString> QToCodeString for DeltaMerkleProofCore<Hash> {
     fn to_debug_code_string(&self) -> String {

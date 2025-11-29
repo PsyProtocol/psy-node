@@ -92,11 +92,11 @@ where
         )?;
 
         let proof = self.circuit_data.prove(pw)?;
-        println!(
+        /*println!(
             "GUTANoChangeCircuit generated public inputs hash: {}",
             hex::encode(&QHashOut::from_felt_slice(&proof.public_inputs).to_le_bytes())
-        );
-        println!("GUTANoChangeCircuit proof generated with public inputs {:?}", proof.public_inputs);
+        );*/
+        //println!("GUTANoChangeCircuit proof generated with public inputs {:?}", proof.public_inputs);
         Ok(proof)
     }
 }
@@ -181,15 +181,14 @@ where
 
 
         let witness = GUTANoChangeFullInput::<QHashOut<C::F>>::psy_ser_from_slice(&input.base.witness)?;
-        
-
+        //println!("GUTANoChangeCircuit witness loaded: {:#?}", witness);
         let guta_whitelist_root: QHashOut<C::F> =
             library.get_group_inclusion_proof(ProvingJobCircuitType::GUTATwoGUTA, ProvingJobCircuitType::GUTATwoGUTA)?.root;
         let expected_public_inputs_hash = witness.get_public_inputs_hash_no_rewards_tag::<C::F, C::Hasher>(guta_whitelist_root);
-        println!(
+        /*println!(
             "GUTANoChangeCircuit expected public inputs hash: {:?}",
             hex::encode(&expected_public_inputs_hash.into_owned_32bytes())
-        );
+        );*/
 
         let guta_header = GlobalUserTreeAggregatorHeader::<C::F, QHashOut<C::F>> {
             guta_circuit_whitelist: guta_whitelist_root,
@@ -208,18 +207,18 @@ where
             },
             total_aggregation_proofs_generated: C::F::from_noncanonical_u64(1),
         };
-        println!("guta_header: {:#?}", guta_header);
+        //println!("guta_header: {:#?}", guta_header);
 
         
         let expected_guta_header_hash = guta_header.qfhash::<C::Hasher>();
-        println!("expected_guta_header_hash: {:?} ({})", expected_guta_header_hash, hex::encode(&expected_guta_header_hash.to_le_bytes()));
+        //println!("expected_guta_header_hash: {:?} ({})", expected_guta_header_hash, hex::encode(&expected_guta_header_hash.to_le_bytes()));
 
         let reward_tree_value = hash_tag_tree_node::<QHashOut<C::F>, C::Hasher>(&QHashOut::ZERO, &QHashOut::ZERO, &worker_reward_tag);
 
-        println!("worker_reward_tag: {:?} ({})", worker_reward_tag, hex::encode(&worker_reward_tag.to_le_bytes()));
-        println!("reward_tree_value: {:?} ({})", reward_tree_value, hex::encode(&reward_tree_value.to_le_bytes()));
+        //println!("worker_reward_tag: {:?} ({})", worker_reward_tag, hex::encode(&worker_reward_tag.to_le_bytes()));
+        //println!("reward_tree_value: {:?} ({})", reward_tree_value, hex::encode(&reward_tree_value.to_le_bytes()));
         let expected_final_public_inputs_hash = C::Hasher::q_two_to_one(expected_public_inputs_hash, reward_tree_value);
-        println!("expected_final_public_inputs_hash: {:?} ({})", expected_final_public_inputs_hash, hex::encode(&expected_final_public_inputs_hash.to_le_bytes()));
+        //println!("expected_final_public_inputs_hash: {:?} ({})", expected_final_public_inputs_hash, hex::encode(&expected_final_public_inputs_hash.to_le_bytes()));
 
         self.prove_base(
             worker_reward_tag,

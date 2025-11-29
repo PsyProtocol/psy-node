@@ -8,6 +8,38 @@ use crate::agg::{AggStateTrackableInput, AggStateTransition};
 
 
 
+pub fn compute_agg_state_trackable_final_public_inputs_no_rewards_tag_leaf<Hasher: FieldQHasher<F, Hash>, F: QFelt64, Hash: QFHashBase<F>>(
+    allowed_circuit_hashes_root: Hash,
+    state_transition_hash: Hash,
+) -> Hash {
+    let total_proofs_generated = F::from_u8_value(1);
+
+    let allowed_and_state_transition_hash = Hasher::two_to_one(&allowed_circuit_hashes_root, &state_transition_hash).to_4_felts();
+
+    let public_inputs_without_reward_tag = Hasher::q_hash_many(&[
+        allowed_and_state_transition_hash[0],
+        allowed_and_state_transition_hash[1],
+        allowed_and_state_transition_hash[2],
+        allowed_and_state_transition_hash[3],
+        total_proofs_generated,
+    ]);
+    public_inputs_without_reward_tag
+}
+
+pub fn compute_agg_state_trackable_final_public_inputs_leaf<Hasher: FieldQHasher<F, Hash>, F: QFelt64, Hash: QFHashBase<F>>(
+    allowed_circuit_hashes_root: Hash,
+    state_transition_hash: Hash,
+    worker_reward_tag: Hash,
+) -> Hash {
+    let zero_hash = Hash::get_zero_value();
+
+    let rewards_tree_value_combo = Hasher::two_to_one(&zero_hash, &zero_hash);
+    let rewards_tree_final_new_value = Hasher::two_to_one(&rewards_tree_value_combo, &worker_reward_tag);
+
+    let public_inputs_without_reward_tag =
+        compute_agg_state_trackable_final_public_inputs_no_rewards_tag_leaf::<Hasher, F, Hash>(allowed_circuit_hashes_root, state_transition_hash);
+    Hasher::two_to_one(&public_inputs_without_reward_tag, &rewards_tree_final_new_value)
+}
 
 #[pderive::serialize_clone_hash]
 pub struct QCAppendUserRegistrationTreeCircuitInput<Hash> {
@@ -43,9 +75,9 @@ impl<F: QFelt64, Hash: QFHashBase<F>> PCircuitWitness<F, Hash>
 {
     fn get_expected_public_inputs_hash<Hasher: FieldQHasher<F, Hash>>(&self) -> Hash {
         let state_transition_hash = self.get_state_transition().get_combined_hash::<Hasher>();
-        Hasher::two_to_one(
-            &self.register_users_circuit_whitelist,
-            &state_transition_hash,
+        compute_agg_state_trackable_final_public_inputs_no_rewards_tag_leaf::<Hasher, F, Hash>(
+            self.register_users_circuit_whitelist,
+            state_transition_hash,
         )
     }
 }

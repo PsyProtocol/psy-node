@@ -127,10 +127,12 @@ where
             register_users_proof_rewards_tree_value,
             deploy_contracts_proof_rewards_tree_value,
         );
+        //let alt_public_inputs_hash = verifier_gadget.header.get_combined_hash::<C::Hasher, C::F, D>(&mut builder);
         builder.add_qed_type_f_common_gates();
 
-        builder.register_public_inputs(&public_inputs_hash.elements);
+        //builder.register_public_inputs(&alt_public_inputs_hash.elements);
 
+        builder.register_public_inputs(&public_inputs_hash.elements);
         let base_circuit_data = builder.build::<C>();
 
         let base_fingerprint = QHashOut(get_circuit_fingerprint_generic(&base_circuit_data.verifier_only));
@@ -264,6 +266,7 @@ where
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
         input.ensure_expected_child_proof_count_with_tags(3)?;
         let witness = QCAggUserRegistartionDeployContractsGUTAInput::<C::F, QHashOut<C::F>>::psy_ser_from_slice(&input.base.witness)?;
+        println!("witness: {:#?}", witness);
 
         let guta_zk_proof = deserialize_plonky2_proof::<C, D>(&input.input_proofs[0])?;
         let guta_zk_proof_verifier_data = library.get_verifier_data(input.get_child_proof_circuit_type(0)?)?;
