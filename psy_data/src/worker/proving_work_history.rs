@@ -72,7 +72,7 @@ impl<Hash: ZeroableHash + Copy, JobId> PsyProvingJobClaimMetadata<Hash, JobId> {
                 if children.len() == 0 {
                     anyhow::bail!("Expected at least 1 child for lift child hash mode, got 0");
                 }
-                children[0]
+                hash_tag_tree_node::<Hash, Hasher>(&children[0], &Hash::get_zero_value(), &tag)
             }
             _ => anyhow::bail!("Unknown reward tree hash mode: {}", self.reward_tree_hash_mode),
         };

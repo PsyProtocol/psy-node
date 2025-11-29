@@ -117,6 +117,7 @@ pub async fn read_coordinator_guta_update_gatherer_backup_file<
         cur_guta_stats.add_from_mut(&header.header.header.stats);
         total_guta_proofs_generated += header.header.header.total_aggregation_proofs_generated;
         let state_transition = header.header.header.state_transition;
+        tree.set_e_leaf(state_transition.node_index.to_u64_value(), state_transition.new_node_value);
         changes.push((state_transition.node_index.to_u64_value(), state_transition.new_node_value));
     }
 
@@ -342,7 +343,7 @@ impl<
                     .read()
                     .map_err(|e| anyhow::anyhow!("error reading last old realm roots {:?}", e))?;
                 for (index, old_root) in last_old_realm_roots.iter() {
-                    tree.set_leaf_no_proof(*index, *old_root);
+                    tree.set_e_leaf_no_proof(*index, *old_root);
                 }
             }
             tracing::info!("Reverted to root {:?}", tree.get_root());

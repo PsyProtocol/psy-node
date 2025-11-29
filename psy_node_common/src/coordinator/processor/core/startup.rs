@@ -96,6 +96,7 @@ where
             &mut user_registration_tree,
         )
         .await?;
+        //db.set_new_unique_ids().await?;
         tracing::info!("intialized coordinator processor database, building gatherers...");
 
         let guta_create_builder_config = CoordinatorGUTAUpdateGathererConfig::<N, TempDatabase, FileSystem> {

@@ -73,6 +73,9 @@ where
             circuit_fingerprint_config.checkpoint_state_transition_circuit_fingerprint,
         )?;
 
+    println!("genesis verifiable_checkpoint_transition: {:#?}", genesis_verifiable_checkpoint_transition);
+;
+
     /*
 
 

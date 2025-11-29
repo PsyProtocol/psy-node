@@ -13,6 +13,7 @@ pub async fn fetch_global_user_tree_from_db<
     user_db_reader: &Store,
 
     tree_height: u8,
+    effective_tree_height: u8,
     checkpoint_id: u64,
     min_user_id_inclusive: u64,
     max_user_id_exclusive: u64,
@@ -21,9 +22,10 @@ pub async fn fetch_global_user_tree_from_db<
     let mut timer = TraceTimer::new("fetch_global_user_tree_from_db");
 
     tracing::info!(
-        "Fetching global user tree nodes from DB (checkpoint_id={}, tree_height={}, user_id_range=[{}, {}), fetch_batch_size={})",
+        "Fetching global user tree nodes from DB (checkpoint_id={}, tree_height={}, effective_tree_height={}, user_id_range=[{}, {}), fetch_batch_size={})",
         checkpoint_id,
         tree_height,
+        effective_tree_height,
         min_user_id_inclusive,
         max_user_id_exclusive,
         fetch_batch_size
@@ -36,7 +38,7 @@ pub async fn fetch_global_user_tree_from_db<
     let mut keys = if full_batches > 0 {
         vec![
             SimpleMerkleNodeKey {
-                level: tree_height,
+                level: effective_tree_height,
                 index: 0,
             };
             fetch_batch_size
@@ -44,7 +46,7 @@ pub async fn fetch_global_user_tree_from_db<
     } else {
         vec![
             SimpleMerkleNodeKey {
-                level: tree_height,
+                level: effective_tree_height,
                 index: 0,
             };
             remainder as usize
@@ -98,8 +100,9 @@ pub async fn fetch_global_user_tree_from_db<
 
     let mut tree = SimpleMemoryMerkleRecorderStore::from_hash_map(tree_height, node_hash_map);
 
+    tree.set_effective_height(effective_tree_height);
     timer.start();
-    tree.rehash_range(tree_height, min_user_id_inclusive, max_user_id_exclusive);
+    tree.rehash_range(effective_tree_height, min_user_id_inclusive, max_user_id_exclusive);
     timer.lap_batch("rehashed global user tree nodes", "node", (max_user_id_exclusive - min_user_id_inclusive) as usize);
     tree.commit_changes();
     timer.lap("committed changes to memory global user tree");
@@ -114,12 +117,14 @@ pub async fn load_global_user_tree_from_db<
 >(
     user_db_reader: &Store,
     tree_height: u8,
+    effective_tree_height: u8,
     checkpoint_id: u64,
     fetch_batch_size: usize,
 ) -> anyhow::Result<SimpleMemoryMerkleRecorderStore<Hasher, Hash>> {
+    assert!(effective_tree_height <= tree_height, "effective_tree_height must be less than or equal to tree_height");
     let mut current_key = SimpleMerkleNodeKey::new_root();
     let mut current_value = user_db_reader.global_user_tree_get_node(checkpoint_id, current_key).await?;
-    if current_value == Hasher::get_zero_hash(0) {
+    if current_value == Hasher::get_zero_hash(tree_height as usize) {
         // Tree is empty
         return Ok(SimpleMemoryMerkleRecorderStore::new(tree_height));
     }
@@ -151,14 +156,15 @@ pub async fn load_global_user_tree_from_db<
     }
     // SANITY CHECK: ensure the leaf node is not zero hash, as we already checked to
     // ensure the root is not a zero hash
-    if current_value == Hasher::get_zero_hash(tree_height as usize) {
+    if current_value == Hasher::get_zero_hash(0) {
         // Tree is empty
         anyhow::bail!("Failed to load global user tree from DB: reached leaf node with zero hash, but root is not zero hash");
     }
-    let max_user_id_exclusive = current_key.index + 1;
+    let max_user_id_exclusive = current_key.index>>(tree_height - effective_tree_height) + 1;
     fetch_global_user_tree_from_db::<Hasher, Store, Hash>(
         user_db_reader,
         tree_height,
+        effective_tree_height,
         checkpoint_id,
         0,
         max_user_id_exclusive,

@@ -300,7 +300,7 @@ impl<
                     anyhow::bail!("Witness not found for state transition job ID {:?}", job_id);
                 }
                 let witness = QCQEDCheckpointStateTransitionInput::psy_ser_from_slice(&self.witness_map.get(&job_id).unwrap())?;
-                witness.get_public_inputs_hash_with_fingerprint_and_reward_tag::<Hasher>(self.checkpoint_state_transition_circuit_fingerprint, tag)
+                witness.get_public_inputs_hash_with_fingerprint_and_reward_root::<Hasher>(self.checkpoint_state_transition_circuit_fingerprint, tag)
             }
             ProvingJobCircuitType::GenesisBlockCheckpointStateTransition | ProvingJobCircuitType::UserEndCap => metadata.expected_public_inputs_hash,
             _ => metadata.compute_reward_tagged_expected_public_inputs::<Hasher>(tag, &child_proof_tag_values)?,

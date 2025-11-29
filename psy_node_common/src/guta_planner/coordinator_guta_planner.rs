@@ -167,11 +167,11 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> CoordinatorGUTAPlanner<F, Ha
         let (witness_bytes, new_header, circuit_type) = if left_is_leaf && right_is_leaf {
             // Level R -> Level 0 Promotion
             
-            let left_dmp = global_user_tree.set_leaf(
+            let left_dmp = global_user_tree.set_e_leaf(
                 left.header.state_transition.node_index.to_u64_value(),
                 left.header.state_transition.new_node_value,
             );
-            let right_dmp = global_user_tree.set_leaf(
+            let right_dmp = global_user_tree.set_e_leaf(
                 right.header.state_transition.node_index.to_u64_value(),
                 right.header.state_transition.new_node_value,
             );
@@ -216,7 +216,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> CoordinatorGUTAPlanner<F, Ha
             )
         } else if !left_is_leaf && right_is_leaf {
             // Mixed: Aggregated (Left) + Leaf (Right)
-            let right_dmp = global_user_tree.set_leaf(
+            let right_dmp = global_user_tree.set_e_leaf(
                 right.header.state_transition.node_index.to_u64_value(),
                 right.header.state_transition.new_node_value,
             );
@@ -280,7 +280,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> CoordinatorGUTAPlanner<F, Ha
              return Ok(());
         }
 
-        let dmp = global_user_tree.set_leaf(
+        let dmp = global_user_tree.set_e_leaf(
             node.header.state_transition.node_index.to_u64_value(),
             node.header.state_transition.new_node_value,
         );
@@ -452,10 +452,10 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> CoordinatorGUTAPlanner<F, Ha
                 0,
             );
             
-            self.job_witnesses.push((new_job_id, witness_bytes));
+            self.job_witnesses.push((new_job_id.get_input_witness_id(), witness_bytes));
 
             let metadata = PsyProvingJobMetadataWithJobId {
-                job_id: new_job_id,
+                job_id: new_job_id.get_output_id(),
                 metadata: PsyProvingJobMetadata {
                     expected_public_inputs_hash,
                     reward_tree_hash_mode: PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN,
@@ -1102,7 +1102,7 @@ mod tests {
                 u32::qp_rand_gen(),
                 index as u32,
                 ProvingJobCircuitType::GUTATwoEndCap,
-                ProvingJobDataType::OutputProof,
+                ProvingJobDataType::StandardProof,
                 0,
             ),
         }

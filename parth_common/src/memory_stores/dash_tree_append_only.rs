@@ -9,8 +9,8 @@ use crate::memory_stores::traits::{PsyMemoryMerkleStoreAppendOnlyReaderBase, Psy
 
 #[derive(Debug, Clone)]
 pub struct PsyDashMemoryAppendOnlyMerkleStore<Hasher, Hash: Eq + Copy + PartialEq + Default + std::hash::Hash> {
-    nodes: DashMap<SimpleMerkleNodeKey, Hash>,
-    roots: DashMap<Hash, u64>,
+    pub nodes: DashMap<SimpleMerkleNodeKey, Hash>,
+    pub roots: DashMap<Hash, u64>,
     height: u8,
     /// Pre-computed hashes for empty subtrees of a given height.
     /// `zero_value_hashes[h]` is the hash of an empty tree of height `h`.

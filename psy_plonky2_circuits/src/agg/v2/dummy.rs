@@ -1,18 +1,15 @@
 use async_trait::async_trait;
-use parth_core::{pgoldilocks::QHashOut, protocol::core_types::Q256BitHash};
+use parth_core::{crypto::hash::{tag_tree::hash_tag_tree_node, traits::{FieldQHasher, MerkleHasher, PCircuitWitness}}, felt::QFelt64, pgoldilocks::QHashOut, protocol::core_types::{Q256BitHash, QFHashBase}};
 use plonky2::{
-    hash::
-        hash_types::HashOutTarget
-    ,
-    iop::witness::{PartialWitness, WitnessWrite},
-    plonk::{
+    gates::public_input, hash::
+        hash_types::HashOutTarget, iop::witness::{PartialWitness, WitnessWrite}, plonk::{
         circuit_builder::CircuitBuilder,
         circuit_data::{
             CircuitConfig, CircuitData, CommonCircuitData, VerifierOnlyCircuitData,
         },
         config::{AlgebraicHasher, GenericConfig},
         proof::ProofWithPublicInputs,
-    },
+    }
 };
 use psy_core::job::job_id::QProvingJobDataID;
 use psy_data::{agg::DummyAggStateTransition, worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse};
@@ -130,7 +127,7 @@ impl<
     > QStandardCircuitProvableWithRawProofsAndRefLibrary<L, C, D>
     for AggStateTransitionDummyCircuitV2<C, D>
 where
-    C::Hasher: AlgebraicHasher<C::F>, QHashOut<C::F>: Q256BitHash,
+    C::Hasher: AlgebraicHasher<C::F> + FieldQHasher<C::F, QHashOut<C::F>>, QHashOut<C::F>: Q256BitHash + QFHashBase<C::F>, C::F: QFelt64,
 {
 
     fn prove_with_raw_proofs_and_ref_library(
@@ -140,7 +137,17 @@ where
         worker_reward_tag: QHashOut<C::F>,
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>>{
         let witness = DummyAggStateTransition::<QHashOut<C::F>>::psy_ser_from_slice(&input.base.witness)?;
-        self.prove_base(witness.allowed_circuit_hashes_root, witness.unmodified_state_tree_root, worker_reward_tag)
+        let hash = witness.get_expected_public_inputs_hash::<C::Hasher>();
+        println!("DummyAggStateTransition expected public inputs hash: {:?}", hex::encode(&hash.into_owned_32bytes()));
+
+        let reward_hash = hash_tag_tree_node::<QHashOut<C::F>, C::Hasher>(&QHashOut::<C::F>::ZERO, &QHashOut::<C::F>::ZERO, &worker_reward_tag);
+        let computed_public_inputs_hash = <C::Hasher as MerkleHasher<QHashOut<C::F>>>::two_to_one(&hash, &reward_hash);
+        println!("Computed public inputs hash with worker reward tag: {:?}", hex::encode(&computed_public_inputs_hash.into_owned_32bytes()));
+
+        let proof = self.prove_base(witness.allowed_circuit_hashes_root, witness.unmodified_state_tree_root, worker_reward_tag)?;
+        let public_input_hash = QHashOut::from_felt_slice(&proof.public_inputs);
+        println!("Proof public inputs hash: {:?}", hex::encode(&public_input_hash.to_le_bytes()));
+        Ok(proof)
 
     }
 }

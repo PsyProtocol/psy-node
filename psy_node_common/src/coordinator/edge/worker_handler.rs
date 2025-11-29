@@ -9,15 +9,15 @@ use parth_core::{
     data::queue::queue_key::QPBaseQueueType,
     protocol::core_types::{Q256BitHash, QNetworkTypesConfig, QZKProofPublicInputsHasherReader, QZKProofVerifier},
 };
-use psy_core::job::job_id::QProvingJobDataID;
-use psy_data::
+use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
+use psy_data::{protocol::circuit_inputs::checkpoint_transition::QCQEDCheckpointStateTransitionInput, 
     worker::{
         api_response::{PROVING_JOB_NODE_TYPE_COORDINATOR, PsyWorkerGetProvingWorkAPIResponse, PsyWorkerGetProvingWorkWithChildProofsAPIResponse},
         metadata::{
             PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN, PsyProvingJobMetadata
         },
         metadata_with_job_id::PsyProvingJobMetadataWithJobId,
-    }
+    }}
 ;
 use psy_node_core::{
     psy_core_db::traits::full::{PsyCoordinatorEdgeAPIStoreReader, PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter},
@@ -25,6 +25,7 @@ use psy_node_core::{
     queue::{ephemeral::QStandardEphemeralQueuePublisher, worker_queue::QStandardWorkerQueueSubscriber},
     store::traits::proof_store::QParthProofStore,
 };
+use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 
 use crate::
     coordinator::{
@@ -153,6 +154,8 @@ impl<
 
         let (unique_pending_id, unique_proc_id) = self.get_current_unique_pending_id_internal().await?;
 
+        println!("unique_pending_id: {:?}", unique_pending_id);
+        println!("unique_proc_id: {:?}", unique_proc_id);
         let queue_key = CoordinatorProvingWorkQueueKey::<N::QHash, N::JobId> {
             realm_id: self.realm_id_u64,
             realm_sub_id: self.realm_id_u64,
@@ -170,28 +173,30 @@ impl<
             anyhow::bail!("no proving work available");
         }
         let work_item = work_item.unwrap();
-
+        println!("work_item.job_id: {:?}", work_item.job_id);
+        tracing::info!("work item dependencies: {:?}", work_item.metadata.dependencies);
         let child_proofs = work_item
             .metadata
             .dependencies
             .iter()
-            .map(|id| self.proof_store.get_proof_bytes_by_job_id(id))
+            .map(|id| self.proof_store.get_proof_bytes_by_job_id(id.get_output_id()))
             .collect::<Vec<_>>()
             .into_iter();
         let res: Vec<Option<Vec<u8>>> = try_join_all(child_proofs).await?;
         let mut final_child_proofs: Vec<Vec<u8>> = Vec::with_capacity(res.len());
 
-        for item in res {
+        for (index, item) in res.into_iter().enumerate() {
             if let Some(proof) = item {
                 final_child_proofs.push(proof);
             } else {
+                tracing::error!("missing dependency proof for job id: {:?}", work_item.metadata.dependencies[index]);
                 anyhow::bail!("missing child proof for job id");
             }
         }
 
         let witness_bytes: Vec<u8> = self
             .temp_db
-            .get_tdb_proof_witness_bytes(&self.realm_identifier, unique_pending_id, work_item.job_id)
+            .get_tdb_proof_witness_bytes(&self.realm_identifier, unique_pending_id, work_item.job_id.get_input_witness_id())
             .await?;
 
         let children_reward_tree_values = {
@@ -219,7 +224,7 @@ impl<
             node_type: PROVING_JOB_NODE_TYPE_COORDINATOR,
         };
         self.temp_db
-            .set_proving_job_metadata(&self.realm_identifier, unique_pending_id, response.job.job_id, &response.job.metadata)
+            .set_proving_job_metadata(&self.realm_identifier, unique_pending_id, response.job.job_id.get_output_id(), &response.job.metadata)
             .await?;
 
         // HACK: in the future we should create a new table for the expected proving
@@ -232,7 +237,7 @@ impl<
             .set_proof_miner_rewards_tree_value(
                 &self.realm_identifier,
                 unique_pending_id,
-                response.job.job_id,
+                response.job.job_id.get_output_id(),
                 N::QHash::from_ref_32bytes(&request.tag),
             )
             .await?;
@@ -242,18 +247,34 @@ impl<
             input_proofs: final_child_proofs,
         })
     }
-    pub async fn submit_proof_raw_internal(
+    pub async fn get_root_state_transition_expected_public_inputs_hash_internal(
         &self,
         job_id: N::JobId,
+        unique_pending_id: u64,
+        new_reward_root: N::QHash,
+    ) -> anyhow::Result<N::QHash> {
+        let witness_bytes: Vec<u8> = self.temp_db.get_tdb_proof_witness_bytes(&self.realm_identifier, unique_pending_id, job_id.get_input_witness_id()).await?;
+        let witness: QCQEDCheckpointStateTransitionInput<N::F, N::QHash> = QCQEDCheckpointStateTransitionInput::<N::F, N::QHash>::psy_ser_from_owned_bytes_vec(witness_bytes)?;
+        let expected_public_inputs_hash = witness.get_public_inputs_hash_with_fingerprint_and_reward_root::<N::HasherBase>(
+            self.checkpoint_state_transition_circuit_fingerprint,
+            new_reward_root,
+        );
+
+        Ok(expected_public_inputs_hash)
+    }
+    pub async fn submit_proof_raw_internal(
+        &self,
+        mut job_id: N::JobId,
         tag: N::QHash,
         proof_bytes: Vec<u8>,
     ) -> anyhow::Result<()> {
+        job_id = job_id.get_output_id();
         let (unique_pending_id, unique_proc_id) = self.get_current_unique_pending_id_internal().await?;
 
         //HACK: check to make sure the tag matches
         if self
             .temp_db
-            .get_proof_miner_rewards_tree_value(&self.realm_identifier, unique_pending_id, job_id)
+            .get_proof_miner_rewards_tree_value(&self.realm_identifier, unique_pending_id, job_id.get_output_id())
             .await?
             != tag
         {
@@ -262,7 +283,7 @@ impl<
 
         let metadata: PsyProvingJobMetadata<N::QHash, N::JobId> = self
             .temp_db
-            .get_proving_job_metadata(&self.realm_identifier, unique_pending_id, job_id)
+            .get_proving_job_metadata(&self.realm_identifier, unique_pending_id, job_id.get_output_id())
             .await?;
 
         let children_reward_tree_values = {
@@ -273,7 +294,7 @@ impl<
                 for dependency in metadata.dependencies.iter() {
                     let value: N::QHash = self
                         .temp_db
-                        .get_proof_miner_rewards_tree_value(&self.realm_identifier, unique_pending_id, *dependency)
+                        .get_proof_miner_rewards_tree_value(&self.realm_identifier, unique_pending_id, dependency.get_output_id())
                         .await?;
                     values.push(value);
                 }
@@ -281,15 +302,17 @@ impl<
             }
         };
 
-        let simple_value = N::HasherBase::two_to_one(&metadata.expected_public_inputs_hash, &tag);
-        tracing::info!(
-            "Simple value (two_to_one of expected_public_inputs_hash and tag): {:?}",
-            hex::encode(&simple_value.into_owned_32bytes())
-        );
 
         let reward_tree_value = metadata.get_new_rewards_tag_tree_value::<N::HasherBase>(tag, &children_reward_tree_values)?;
 
-        let full_expected_public_inputs_hash = N::HasherBase::two_to_one(&metadata.expected_public_inputs_hash, &reward_tree_value);
+        tracing::info!("reward_tree_value: {:?}", hex::encode(&reward_tree_value.into_owned_32bytes()));
+        let full_expected_public_inputs_hash = if job_id.circuit_type == ProvingJobCircuitType::GenesisBlockCheckpointStateTransition {
+            metadata.expected_public_inputs_hash
+        }else if job_id.circuit_type == ProvingJobCircuitType::GenerateRollupStateTransitionProof {
+            self.get_root_state_transition_expected_public_inputs_hash_internal(job_id, unique_pending_id, reward_tree_value).await?
+        }else{
+            N::HasherBase::two_to_one(&metadata.expected_public_inputs_hash, &reward_tree_value)
+        };
         tracing::info!(
             "Verifying proof for job id: {:?} with expected public inputs hash: {:?} (from metadata: {:?})",
             job_id,
@@ -407,7 +430,7 @@ impl<
         };
 
         let item = PsyProvingJobMetadataWithJobId {
-            job_id: job_id,
+            job_id: job_id.get_output_id(),
             metadata,
         };
         self.get_proof_work_queue

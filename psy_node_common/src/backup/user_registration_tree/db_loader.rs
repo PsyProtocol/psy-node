@@ -2,10 +2,10 @@ use parth_common::memory_stores::mem_tree_recorder::SimpleMemoryMerkleRecorderSt
 use parth_core::{crypto::hash::traits::MerkleZeroHasher, data::hash::merkle_node_key::SimpleMerkleNodeKey};
 use psy_node_core::psy_core_db::traits::full::PsyNodeUserRegistrationTreeDatabaseReader;
 
-pub async fn load_global_user_tree_append_only_pivot_from_db<
+pub async fn load_global_user_registration_tree_append_only_pivot_from_db<
     Hasher: MerkleZeroHasher<Hash>,
     Store: PsyNodeUserRegistrationTreeDatabaseReader<Hash>,
-    Hash: Copy + PartialEq + Default,
+    Hash: Copy + PartialEq + Default + std::fmt::Debug,
 >(
     user_db_reader: &Store,
     tree_height: u8,
@@ -56,5 +56,6 @@ pub async fn load_global_user_tree_append_only_pivot_from_db<
     let mut tree = SimpleMemoryMerkleRecorderStore::new(tree_height);
     tree.injest_merkle_proof(&merkle_proof_a)?;
     tree.injest_merkle_proof(&merkle_proof_b)?;
+    println!("Loaded user registration tree up to user ID {}, with root hash {:?}", next_user_id, tree.get_root());
     Ok((next_user_id, tree))
 }

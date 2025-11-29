@@ -26,6 +26,9 @@ const D: usize = 2;
 
 pub async fn run_startup_plonky2_scylla_edge_node(config: &CoordinatorEdgeStartConfig) -> anyhow::Result<()> {
 
+    let fingerprint_config = PsyPlonky2NodeConfigResolver::new().get_circuit_fingerprint_config_for_network(config.network)?;
+    let checkpoint_state_transition_circuit_fingerprint =fingerprint_config.checkpoint_state_transition_circuit_fingerprint;
+
     let pool = new_redis_async_pool(&config.redis_url, 10).await?;
 
     let temp_store = StandardRedisStore::new(
@@ -81,6 +84,7 @@ pub async fn run_startup_plonky2_scylla_edge_node(config: &CoordinatorEdgeStartC
                 proof_work_queue,
                 realm_identifier,
                 proof_verifier,
+                checkpoint_state_transition_circuit_fingerprint,
             );
             start_coordinator_edge_rpc_server::<N, _, _, _, _, _, _, _, _>(
                 handler,

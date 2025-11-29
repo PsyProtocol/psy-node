@@ -1,4 +1,4 @@
-use parth_core::{crypto::hash::traits::{FieldQHasher, PCircuitWitness}, protocol::core_types::Q256BitHash};
+use parth_core::{crypto::hash::traits::{FieldQHasher, PCircuitWitness}, felt::QFelt64, protocol::core_types::{Q256BitHash, QFHashBase}};
 #[cfg(feature = "rand_gen")]
 use parth_core::utils::QPGenRandom;
 use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
@@ -36,12 +36,20 @@ impl<Hash: QPGenRandom> QPGenRandom for DummyAggStateTransition<Hash> {
 
 
 
-impl<F, Hash> PCircuitWitness<F, Hash> for DummyAggStateTransition<Hash> {
+impl<F: QFelt64, Hash: QFHashBase<F>> PCircuitWitness<F, Hash> for DummyAggStateTransition<Hash> {
     fn get_expected_public_inputs_hash<Hasher: FieldQHasher<F, Hash>>(&self) -> Hash {
-        Hasher::two_to_one(
+        let allowed_and_state_transition_hash = Hasher::two_to_one(
             &self.allowed_circuit_hashes_root,
-            &self.unmodified_state_tree_root,
-        )
+            &Hasher::two_to_one(&self.unmodified_state_tree_root, &self.unmodified_state_tree_root),
+        ).to_4_felts();
+
+        Hasher::q_hash_many(&[
+            allowed_and_state_transition_hash[0],
+            allowed_and_state_transition_hash[1],
+            allowed_and_state_transition_hash[2],
+            allowed_and_state_transition_hash[3],
+            F::from_u8_value(1),
+        ])
     }
 }
 

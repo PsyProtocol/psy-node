@@ -1,6 +1,6 @@
 use anyhow::Ok;
 use parth_common::secp256k1::MemorySecp256K1Wallet;
-use parth_core::{crypto::hash::traits::MerkleZeroHasher, data::hash::hash256::Hash256, pgoldilocks::{PoseidonHasher, QHashOut, QRichField}, protocol::core_types::Q256BitHash};
+use parth_core::{crypto::hash::traits::{FieldQHasher, MerkleZeroHasher}, data::hash::hash256::Hash256, felt::QFelt64, pgoldilocks::{PoseidonHasher, QHashOut, QRichField}, protocol::core_types::{Q256BitHash, QFHashBase}};
 use plonky2::{hash::hash_types::{HashOut, RichField}, plonk::config::{AlgebraicHasher, GenericConfig}};
 use psy_core::{constants::chain_id::PsyChainNetworkType, job::job_id::QProvingJobDataID};
 use psy_plonky2_basic_helpers::verifier::simple_circuit_library::SimpleCircuitLibrary;
@@ -13,8 +13,7 @@ pub async fn get_simple_proof_miner_worker_for_network<C: GenericConfig<D> + 'st
     network: PsyChainNetworkType,
     config: WorkerStartupConfig,
 ) -> anyhow::Result<PsyProofMinerWorkerManager<QHashOut<C::F>, QProvingJobDataID, PsyWorkerBasicAPIJobFetcher<QHashOut<C::F>, QProvingJobDataID, MemorySecp256K1Wallet, PoseidonHasher>, SimpleCircuitLibrary<C::F>, QEDCoordinatorCircuitManager<C,D>>> 
-where
-    C::Hasher: AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + MerkleZeroHasher<QHashOut<C::F>>, C::F: RichField + QRichField, QHashOut<C::F>: Q256BitHash,
+where     C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + FieldQHasher<C::F, QHashOut<C::F>>, QHashOut<C::F>: Q256BitHash + QFHashBase<C::F>, C::F: QFelt64 + QRichField,
 {
     let (gcv, coordinator_circuits) = get_plonky2_circuit_library_and_prover_for_network::<C, D>(network)?;
 

@@ -6,7 +6,7 @@ use parth_core::{crypto::hash::{merkle_proof::{DeltaMerkleProofCore, MerkleProof
 use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
 use psy_serialize::{PsyCanonicalSerializeMetadata, PsyIOReadWrite};
 
-use crate::{guta::{header::GlobalUserTreeAggregatorHeader, sub_tree_transition::SubTreeNodeStateTransition}, v1::qdata::checkpoint::PQEDCheckpointLeafCompactWithStateRoots};
+use crate::{guta::{header::GlobalUserTreeAggregatorHeader, stats::GUTAStats, sub_tree_transition::SubTreeNodeStateTransition}, v1::qdata::checkpoint::PQEDCheckpointLeafCompactWithStateRoots};
 use psy_serialize::FallbackPsySerializeCanonical;
 
 
@@ -26,29 +26,21 @@ impl<Hash> GUTANoChangeFullInput<Hash> {
                 new_node_value: self.checkpoint_leaf.global_state_roots.user_tree_root,
                 node_index: F::ZERO_VALUE,
                 node_level: F::ZERO_VALUE,
-            };
-            let state_transition_hash = state_transition.qfhash::<Hasher>();
-        let state_transition_and_stats_hash = Hasher::q_two_to_one(
-            state_transition_hash,
-            self.checkpoint_leaf.checkpoint_leaf.stats_hash,
-        );
-
-        let state_stats_checkpoint_hash = Hasher::q_two_to_one(
-            self.checkpoint_tree_proof.root,
-            state_transition_and_stats_hash,
-        );
-
-        let header_with_whitelist_hash_felts = Hasher::q_two_to_one(
+        };
+        let guta_header = GlobalUserTreeAggregatorHeader::<F, Hash> {
             guta_circuit_whitelist,
-            state_stats_checkpoint_hash,
-        ).to_4_felts();
-        Hasher::q_hash_many(&[
-            header_with_whitelist_hash_felts[0],
-            header_with_whitelist_hash_felts[1],
-            header_with_whitelist_hash_felts[2],
-            header_with_whitelist_hash_felts[3],
-            F::from_u8_value(1),
-        ])
+            checkpoint_tree_root: self.checkpoint_tree_proof.root,
+            state_transition,
+            stats: GUTAStats {
+                fees_collected: F::ZERO_VALUE,
+                user_ops_processed: F::ZERO_VALUE,
+                total_transactions: F::ZERO_VALUE,
+                slots_modified: F::ZERO_VALUE,
+            },
+            total_aggregation_proofs_generated: F::from_u8_value(1),
+        };
+        let guta_header_hash = guta_header.qfhash::<Hasher>();
+        guta_header_hash
     }
 }
 impl<Hash: QPGenRandom> QPGenRandom for GUTANoChangeFullInput<Hash> {

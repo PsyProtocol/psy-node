@@ -1,5 +1,5 @@
 use parth_core::{
-    crypto::hash::traits::{FieldQHasher, PCircuitWitness}, data::hash::merkle_node_key::SimpleMerkleNodeKey, felt::QFelt64, protocol::core_types::{Q256BitHash, QFHashBase},
+    QJobIdBase, crypto::hash::traits::{FieldQHasher, PCircuitWitness}, data::hash::merkle_node_key::SimpleMerkleNodeKey, felt::QFelt64, protocol::core_types::{Q256BitHash, QFHashBase}
 };
 use psy_serialize::{PsyCanonicalDatabaseSerializeBaseSingle, PsySerializeCanonicalAsyncSafe};
 
@@ -40,7 +40,7 @@ pub struct PsyProvingJobMetadata<Hash, JobId> {
 */
 
 fn plan_jobs_for_tree_agg_old<
-    JobId: Copy,
+    JobId: QJobIdBase,
     F: QFelt64,
     Hash: QFHashBase<F> + Q256BitHash,
     Hasher: FieldQHasher<F, Hash>,
@@ -64,13 +64,13 @@ fn plan_jobs_for_tree_agg_old<
             dependencies: vec![]
         };
         let queue_item = PsyProvingJobMetadataWithJobId{
-            job_id: dummy_job_id,
+            job_id: dummy_job_id.output_proof_id(),
             metadata,
         };
         let dummy_witness_bytes = dummy_witness.psy_ser_into_bytes_vec()?;
         return Ok((
             vec![vec![queue_item]],
-            vec![(dummy_job_id, dummy_witness_bytes)]
+            vec![(dummy_job_id.input_witness_id(), dummy_witness_bytes)]
         ))
     }
 
@@ -103,7 +103,7 @@ fn compute_max_level(mut num: usize) -> u8 {
     h
 }
 
-fn build_subtree<'a, JobId: Copy, F: QFelt64, Hash: QFHashBase<F> + Q256BitHash, Hasher: FieldQHasher<F, Hash>, LeafWitness: PCircuitWitness<F, Hash> + PsySerializeCanonicalAsyncSafe, PlannerHelper: BasicTreePlannerHelper<JobId, Hash, LeafWitness, AggStateTransitionInputV2<Hash>, DummyAggStateTransition<Hash>>>(
+fn build_subtree<'a, JobId: QJobIdBase, F: QFelt64, Hash: QFHashBase<F> + Q256BitHash, Hasher: FieldQHasher<F, Hash>, LeafWitness: PCircuitWitness<F, Hash> + PsySerializeCanonicalAsyncSafe, PlannerHelper: BasicTreePlannerHelper<JobId, Hash, LeafWitness, AggStateTransitionInputV2<Hash>, DummyAggStateTransition<Hash>>>(
     start: usize,
     num: usize,
     level: u8,
@@ -138,7 +138,7 @@ fn build_subtree<'a, JobId: Copy, F: QFelt64, Hash: QFHashBase<F> + Q256BitHash,
         let (left_id, left_wit) = build_subtree::<JobId, F, Hash, Hasher, LeafWitness, PlannerHelper>(start, left_num, child_level, left_index, leaves, unique_checkpoint_id, allowed_circuit_hashes_root, layers, all_witnesses, max_level)?;
         let (right_id, right_wit) = build_subtree::<JobId, F, Hash, Hasher, LeafWitness, PlannerHelper>(start + left_num, right_num, child_level, right_index, leaves, unique_checkpoint_id, allowed_circuit_hashes_root, layers, all_witnesses, max_level)?;
 
-        deps = vec![left_id, right_id];
+        deps = vec![left_id.output_proof_id(), right_id.output_proof_id()];
         let agg_wit = match (left_wit, right_wit) {
             (Wit::Leaf(l), Wit::Leaf(r)) => PlannerHelper::create_agg_two_leaf_witness(l, r),
             (Wit::Leaf(l), Wit::Agg(r)) => PlannerHelper::create_agg_left_leaf_right_agg_witness(l, &r),
@@ -183,7 +183,7 @@ fn build_subtree<'a, JobId: Copy, F: QFelt64, Hash: QFHashBase<F> + Q256BitHash,
 }
 
 pub fn plan_jobs_for_tree_agg<
-    JobId: Copy,
+    JobId: QJobIdBase,
     F: QFelt64,
     Hash: QFHashBase<F> + Q256BitHash,
     Hasher: FieldQHasher<F, Hash>,
@@ -207,13 +207,13 @@ pub fn plan_jobs_for_tree_agg<
             dependencies: vec![]
         };
         let queue_item = PsyProvingJobMetadataWithJobId{
-            job_id: dummy_job_id,
+            job_id: dummy_job_id.output_proof_id(),
             metadata,
         };
         let dummy_witness_bytes = dummy_witness.psy_ser_into_bytes_vec()?;
         return Ok((
             vec![vec![queue_item]],
-            vec![(dummy_job_id, dummy_witness_bytes)]
+            vec![(dummy_job_id.input_witness_id(), dummy_witness_bytes)]
         ))
     }
 
@@ -231,7 +231,7 @@ pub fn plan_jobs_for_tree_agg<
 
 
 
-fn build_subtree_with_offset_root<'a, JobId: Copy, F: QFelt64, Hash: QFHashBase<F> + Q256BitHash, Hasher: FieldQHasher<F, Hash>, LeafWitness: PCircuitWitness<F, Hash> + PsySerializeCanonicalAsyncSafe, PlannerHelper: BasicTreePlannerHelper<JobId, Hash, LeafWitness, AggStateTransitionInputV2<Hash>, DummyAggStateTransition<Hash>>>(
+fn build_subtree_with_offset_root<'a, JobId: QJobIdBase, F: QFelt64, Hash: QFHashBase<F> + Q256BitHash, Hasher: FieldQHasher<F, Hash>, LeafWitness: PCircuitWitness<F, Hash> + PsySerializeCanonicalAsyncSafe, PlannerHelper: BasicTreePlannerHelper<JobId, Hash, LeafWitness, AggStateTransitionInputV2<Hash>, DummyAggStateTransition<Hash>>>(
     start: usize,
     num: usize,
     level: u8,
@@ -268,7 +268,7 @@ fn build_subtree_with_offset_root<'a, JobId: Copy, F: QFelt64, Hash: QFHashBase<
         let (left_id, left_wit) = build_subtree_with_offset_root::<JobId, F, Hash, Hasher, LeafWitness, PlannerHelper>(start, left_num, child_level, left_index, leaves, unique_checkpoint_id, allowed_circuit_hashes_root, layers, all_witnesses, max_level, reward_tree_root_index, reward_tree_root_level)?;
         let (right_id, right_wit) = build_subtree_with_offset_root::<JobId, F, Hash, Hasher, LeafWitness, PlannerHelper>(start + left_num, right_num, child_level, right_index, leaves, unique_checkpoint_id, allowed_circuit_hashes_root, layers, all_witnesses, max_level, reward_tree_root_index, reward_tree_root_level)?;
 
-        deps = vec![left_id, right_id];
+        deps = vec![left_id.output_proof_id(), right_id.output_proof_id()];
         let agg_wit = match (left_wit, right_wit) {
             (Wit::Leaf(l), Wit::Leaf(r)) => PlannerHelper::create_agg_two_leaf_witness(l, r),
             (Wit::Leaf(l), Wit::Agg(r)) => PlannerHelper::create_agg_left_leaf_right_agg_witness(l, &r),
@@ -315,7 +315,7 @@ fn build_subtree_with_offset_root<'a, JobId: Copy, F: QFelt64, Hash: QFHashBase<
 
 
 pub fn plan_jobs_for_tree_agg_offset_root<
-    JobId: Copy,
+    JobId: QJobIdBase,
     F: QFelt64,
     Hash: QFHashBase<F> + Q256BitHash,
     Hasher: FieldQHasher<F, Hash>,
@@ -341,13 +341,13 @@ pub fn plan_jobs_for_tree_agg_offset_root<
             dependencies: vec![]
         };
         let queue_item = PsyProvingJobMetadataWithJobId{
-            job_id: dummy_job_id,
+            job_id: dummy_job_id.output_proof_id(),
             metadata,
         };
         let dummy_witness_bytes = dummy_witness.psy_ser_into_bytes_vec()?;
         return Ok((
             vec![vec![queue_item]],
-            vec![(dummy_job_id, dummy_witness_bytes)]
+            vec![(dummy_job_id.input_witness_id(), dummy_witness_bytes)]
         ))
     }
 

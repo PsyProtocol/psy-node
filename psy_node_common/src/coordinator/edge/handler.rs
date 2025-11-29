@@ -59,6 +59,8 @@ pub struct CoordinatorEdgeHandler<
 
     pub proof_verifier: Arc<N::ZKVerifier>,
     pub contract_state_tree_height_cache: Arc<DashMapContractHeightCache<N::QHash>>,
+
+    pub checkpoint_state_transition_circuit_fingerprint: N::QHash,
 }
 impl<
         N: QNetworkTypesConfig,
@@ -98,6 +100,7 @@ impl<
             realm_sub_id_u64: self.realm_sub_id_u64.clone(),
             proof_verifier: self.proof_verifier.clone(),
             contract_state_tree_height_cache: self.contract_state_tree_height_cache.clone(),
+            checkpoint_state_transition_circuit_fingerprint: self.checkpoint_state_transition_circuit_fingerprint.clone(),
         }
     }
 }
@@ -135,6 +138,7 @@ impl<
         get_proof_work_queue: Arc<GetProofWorkQueue>,
         realm_identifier: QRealmIdentifier,
         proof_verifier: Arc<N::ZKVerifier>,
+        checkpoint_state_transition_circuit_fingerprint: N::QHash,
     ) -> Self {
         let realm_id_u64 = realm_identifier.realm_id as u64;
         let realm_sub_id_u64 = realm_identifier.realm_sub_id as u64;
@@ -152,6 +156,7 @@ impl<
             realm_sub_id_u64,
             proof_verifier,
             contract_state_tree_height_cache: Arc::new(DashMapContractHeightCache::new()),
+            checkpoint_state_transition_circuit_fingerprint,
         }
     }
     pub async fn get_latest_checkpoint_id_internal(&self) -> anyhow::Result<u64> {

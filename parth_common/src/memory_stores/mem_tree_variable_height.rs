@@ -7,7 +7,6 @@ pub struct SimpleMemoryMerkleRecorderStore<Hasher, Hash: Copy + PartialEq + Defa
     nodes: HashMap<SimpleMerkleNodeKey, Hash>,
     updated_nodes: HashMap<SimpleMerkleNodeKey, Hash>,
     height: u8,
-    effective_height: u8,
     _hasher: PhantomData<Hasher>,
 }
 
@@ -19,12 +18,8 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + PartialEq + Default>
             nodes: HashMap::new(),
             updated_nodes: HashMap::new(),
             height,
-            effective_height: height,
             _hasher: PhantomData::default(),
         }
-    }
-    pub fn set_effective_height(&mut self, effective_height: u8) {
-        self.effective_height = effective_height;
     }
     pub fn from_hash_map(
         height: u8,
@@ -34,7 +29,6 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + PartialEq + Default>
             nodes,
             updated_nodes: HashMap::new(),
             height,
-            effective_height: height,
             _hasher: PhantomData::default(),
         }
     }
@@ -113,31 +107,6 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + PartialEq + Default>
 
     pub fn get_root(&self) -> Hash {
         self.get_node_value(&SimpleMerkleNodeKey::new_root())
-    }
-
-    pub fn get_e_leaf_value(&self, index: u64) -> Hash {
-        self.get_node_value(&SimpleMerkleNodeKey::new(self.effective_height, index))
-    }
-    pub fn get_e_leaf(&self, index: u64) -> MerkleProofCore<Hash> {
-        let leaf_key = SimpleMerkleNodeKey::new(self.effective_height, index);
-        let value = self.get_e_leaf_value(index);
-
-        let mut current_sibling = leaf_key.sibling();
-        let mut siblings = Vec::with_capacity(self.effective_height as usize);
-
-        while current_sibling.level > 0 {
-            siblings.push(self.get_node_value(&current_sibling));
-            current_sibling = current_sibling.parent().sibling();
-        }
-
-        let root = self.get_root();
-
-        MerkleProofCore {
-            index,
-            siblings,
-            root,
-            value,
-        }
     }
 
     pub fn get_leaf_value(&self, index: u64) -> Hash {
@@ -806,36 +775,6 @@ pub fn rehash_range(
         Ok(results)
     }
 
-    pub fn set_e_leaf(&mut self, index: u64, value: Hash) -> DeltaMerkleProofCore<Hash> {
-        let old_proof = self.get_e_leaf(index);
-        let mut current_value = value;
-        let mut current_key = SimpleMerkleNodeKey::new(self.effective_height, index);
-
-        let height = self.effective_height as usize;
-        for i in 0..height {
-            let new_key = current_key.parent();
-            let index = current_key.index;
-            self.set_node_value(current_key, current_value);
-
-            current_value = if index & 1 == 0 {
-                Hasher::two_to_one(&current_value, &old_proof.siblings[i])
-            } else {
-                Hasher::two_to_one(&old_proof.siblings[i], &current_value)
-            };
-            current_key = new_key;
-        }
-        self.set_node_value(current_key, current_value);
-        DeltaMerkleProofCore {
-            old_root: old_proof.root,
-            old_value: old_proof.value,
-
-            new_root: current_value,
-            new_value: value,
-
-            siblings: old_proof.siblings,
-            index: index,
-        }
-    }
     pub fn set_leaf(&mut self, index: u64, value: Hash) -> DeltaMerkleProofCore<Hash> {
         let old_proof = self.get_leaf(index);
         let mut current_value = value;
@@ -865,28 +804,6 @@ pub fn rehash_range(
             siblings: old_proof.siblings,
             index: index,
         }
-    }
-    pub fn set_e_leaf_no_proof(&mut self, index: u64, value: Hash) -> Hash {
-        let old_proof = self.get_e_leaf(index);
-        let mut current_value = value;
-        let mut current_key = SimpleMerkleNodeKey::new(self.effective_height, index);
-
-        let height = self.effective_height as usize;
-        for i in 0..height {
-            let new_key = current_key.parent();
-            let index = current_key.index;
-            self.set_node_value(current_key, current_value);
-
-            current_value = if index & 1 == 0 {
-                Hasher::two_to_one(&current_value, &old_proof.siblings[i])
-            } else {
-                Hasher::two_to_one(&old_proof.siblings[i], &current_value)
-            };
-            current_key = new_key;
-        }
-        self.set_node_value(current_key, current_value);
-        current_value
-
     }
     pub fn set_leaf_no_proof(&mut self, index: u64, value: Hash) -> Hash {
         let old_proof = self.get_leaf(index);

@@ -219,7 +219,7 @@ impl<const D: usize> VerifyAggUserRegistartionDeployContractsGUTAGadget<D> {
 
         let deploy_contracts_completed = verify_deploy_contract_gadget.total_proofs_generated;
         let register_users_completed = verify_register_users_gadget.total_proofs_generated;
-        let header = VerifyAggUserRegistartionDeployContractsGUTAHeaderGadget {
+        let header: VerifyAggUserRegistartionDeployContractsGUTAHeaderGadget = VerifyAggUserRegistartionDeployContractsGUTAHeaderGadget {
             user_registration_tree_delta: verify_register_users_gadget.state_transition,
             global_contract_tree_delta: verify_deploy_contract_gadget.state_transition,
             global_user_tree_delta: verify_guta_gadget.guta_proof_header_gadget,
@@ -262,17 +262,17 @@ impl<const D: usize> VerifyAggUserRegistartionDeployContractsGUTAGadget<D> {
     where
         C::Hasher: AlgebraicHasher<F>,
     {
-        tracing::debug!("🏭 Agg User Registration Deploy Contracts GUTA set_witness - register_users public_inputs: {}, deploy_contracts public_inputs: {}, guta_proof public_inputs: {}",
+        tracing::info!("🏭 Agg User Registration Deploy Contracts GUTA set_witness - register_users public_inputs: {}, deploy_contracts public_inputs: {}, guta_proof public_inputs: {}",
             serde_json::to_string_pretty(&register_users_proof.public_inputs).unwrap(),
             serde_json::to_string_pretty(&deploy_contracts_proof.public_inputs).unwrap(),
             serde_json::to_string_pretty(&guta_proof.public_inputs).unwrap());
 
-        tracing::debug!(
+        tracing::info!(
             "🏭 Agg User Registration Deploy Contracts GUTA set_witness - guta_proof_header: {}",
             serde_json::to_string_pretty(guta_proof_header).unwrap()
         );
 
-        tracing::debug!(
+        tracing::info!(
             "register_users_state_transition={}",
             serde_json::to_string_pretty(&register_users_state_transition).unwrap()
         );
@@ -284,7 +284,7 @@ impl<const D: usize> VerifyAggUserRegistartionDeployContractsGUTAGadget<D> {
             register_users_proof,
             register_users_verifier_data,
         )?;
-        tracing::debug!(
+        tracing::info!(
             "deploy_contracts_state_transition={}",
             serde_json::to_string_pretty(&deploy_contracts_state_transition).unwrap()
         );

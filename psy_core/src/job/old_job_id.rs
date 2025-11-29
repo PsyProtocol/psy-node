@@ -102,7 +102,10 @@ impl TryFrom<u8> for QJobTopic {
 #[pderive::serialize_enum_repr_strum]
 #[repr(u8)]
 pub enum ProvingJobDataType {
-    StandardProof = 0,
+    InputWitness = 0,
+    BaseInputProof = 1,
+    OutputProof = 8,
+    Counter = 16,
 }
 impl ProvingJobDataType {
     pub fn to_u8(&self) -> u8 {
@@ -113,7 +116,10 @@ impl TryFrom<u8> for ProvingJobDataType {
     type Error = anyhow::Error;
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            0 => Ok(ProvingJobDataType::StandardProof),
+            0 => Ok(ProvingJobDataType::InputWitness),
+            1 => Ok(ProvingJobDataType::BaseInputProof),
+            8 => Ok(ProvingJobDataType::OutputProof),
+            16 => Ok(ProvingJobDataType::Counter),
             _ => Err(anyhow::format_err!("Invalid ProvingJobDataType value: {}", value)),
         }
     }
@@ -395,7 +401,7 @@ impl QPGenRandom for QProvingJobDataID {
             group_id: QPGenRandom::qp_rand_gen(),
             sub_group_id: QPGenRandom::qp_rand_gen(),
             task_index: QPGenRandom::qp_rand_gen(),
-            data_type: ProvingJobDataType::StandardProof,
+            data_type: ProvingJobDataType::InputWitness,
             data_index: QPGenRandom::qp_rand_gen(),
         }
     }
@@ -430,7 +436,7 @@ impl QProvingJobDataID {
             group_id: realm_level as u32,
             sub_group_id: 0,
             task_index: realm_id,
-            data_type: ProvingJobDataType::StandardProof,
+            data_type: ProvingJobDataType::OutputProof,
             data_index: 0,
         };
         Ok(job_data_id)
@@ -450,7 +456,7 @@ impl QProvingJobDataID {
             group_id: global_user_tree_height as u32,
             sub_group_id: 0,
             task_index: user_id as u32,
-            data_type: ProvingJobDataType::StandardProof,
+            data_type: ProvingJobDataType::OutputProof,
             data_index: 0,
         };
         Ok(job_data_id)
@@ -484,7 +490,7 @@ impl QProvingJobDataID {
             circuit_type: ProvingJobCircuitType::Unknown,
             sub_group_id: 0,
             task_index: 0,
-            data_type: ProvingJobDataType::StandardProof,
+            data_type: ProvingJobDataType::InputWitness,
             data_index: 0,
         }
     }
@@ -496,7 +502,7 @@ impl QProvingJobDataID {
             circuit_type: ProvingJobCircuitType::Unknown,
             sub_group_id: 0,
             task_index: 0,
-            data_type: ProvingJobDataType::StandardProof,
+            data_type: ProvingJobDataType::InputWitness,
             data_index: 0,
         }
     }
@@ -628,8 +634,8 @@ impl QProvingJobDataID {
             0,
             0,
             0,
-            ProvingJobCircuitType::GenerateRollupStateTransitionProof,
-            ProvingJobDataType::StandardProof,
+            ProvingJobCircuitType::GenesisBlockCheckpointStateTransition,
+            ProvingJobDataType::OutputProof,
             0,
         )
     }
@@ -641,7 +647,7 @@ impl QProvingJobDataID {
             sub_group_id,
             task_index,
             ProvingJobCircuitType::GUTATwoEndCap,
-            ProvingJobDataType::StandardProof,
+            ProvingJobDataType::InputWitness,
             0,
         )
     }
@@ -653,7 +659,7 @@ impl QProvingJobDataID {
             sub_group_id,
             task_index,
             ProvingJobCircuitType::GUTATwoGUTA,
-            ProvingJobDataType::StandardProof,
+            ProvingJobDataType::InputWitness,
             0,
         )
     }
@@ -665,7 +671,7 @@ impl QProvingJobDataID {
             sub_group_id,
             task_index,
             ProvingJobCircuitType::GUTATwoGUTAWithCheckpointUpgrade,
-            ProvingJobDataType::StandardProof,
+            ProvingJobDataType::InputWitness,
             0,
         )
     }
@@ -677,7 +683,7 @@ impl QProvingJobDataID {
             sub_group_id,
             task_index,
             ProvingJobCircuitType::GUTALeftEndCapRightGUTA,
-            ProvingJobDataType::StandardProof,
+            ProvingJobDataType::InputWitness,
             0,
         )
     }
@@ -689,7 +695,7 @@ impl QProvingJobDataID {
             sub_group_id,
             task_index,
             ProvingJobCircuitType::GUTALeftGUTARightEndCap,
-            ProvingJobDataType::StandardProof,
+            ProvingJobDataType::InputWitness,
             0,
         )
     }
@@ -701,7 +707,7 @@ impl QProvingJobDataID {
             sub_group_id,
             task_index,
             ProvingJobCircuitType::GUTASingleEndCap,
-            ProvingJobDataType::StandardProof,
+            ProvingJobDataType::InputWitness,
             0,
         )
     }
@@ -713,7 +719,7 @@ impl QProvingJobDataID {
             sub_group_id,
             task_index,
             circuit_type,
-            ProvingJobDataType::StandardProof,
+            ProvingJobDataType::InputWitness,
             0,
         )
     }
@@ -725,7 +731,7 @@ impl QProvingJobDataID {
             circuit_type: ProvingJobCircuitType::WrappedSignatureProof,
             sub_group_id: 0,
             task_index: transfer_id,
-            data_type: ProvingJobDataType::StandardProof,
+            data_type: ProvingJobDataType::BaseInputProof,
             data_index: 0,
         }
     }
@@ -737,7 +743,7 @@ impl QProvingJobDataID {
             circuit_type: ProvingJobCircuitType::UserEndCap,
             sub_group_id: 1,
             task_index: user_id,
-            data_type: ProvingJobDataType::StandardProof,
+            data_type: ProvingJobDataType::BaseInputProof,
             data_index: 0,
         }
     }
@@ -749,7 +755,7 @@ impl QProvingJobDataID {
             circuit_type: ProvingJobCircuitType::WrappedSignatureProof,
             sub_group_id: 2,
             task_index: withdrawal_id,
-            data_type: ProvingJobDataType::StandardProof,
+            data_type: ProvingJobDataType::BaseInputProof,
             data_index: 0,
         }
     }
@@ -761,7 +767,7 @@ impl QProvingJobDataID {
             circuit_type: ProvingJobCircuitType::Secp256K1SignatureProof,
             sub_group_id: 3,
             task_index: deposit_id,
-            data_type: ProvingJobDataType::StandardProof,
+            data_type: ProvingJobDataType::BaseInputProof,
             data_index: 0,
         }
     }
@@ -773,7 +779,7 @@ impl QProvingJobDataID {
             circuit_type,
             sub_group_id,
             task_index,
-            data_type: ProvingJobDataType::StandardProof,
+            data_type: ProvingJobDataType::OutputProof,
             data_index: 0,
         }
     }
@@ -785,7 +791,7 @@ impl QProvingJobDataID {
             group_id,
             sub_group_id,
             task_index,
-            data_type: ProvingJobDataType::StandardProof,
+            data_type: ProvingJobDataType::InputWitness,
             data_index: 0,
         }
     }
@@ -797,7 +803,7 @@ impl QProvingJobDataID {
             circuit_type: ProvingJobCircuitType::Unknown,
             sub_group_id: 0,
             task_index,
-            data_type: ProvingJobDataType::StandardProof,
+            data_type: ProvingJobDataType::InputWitness,
             data_index: 0,
         }
     }
@@ -809,7 +815,7 @@ impl QProvingJobDataID {
             circuit_type: ProvingJobCircuitType::AggUserRegisterDeployContractsGUTA,
             sub_group_id: 0,
             task_index: 0,
-            data_type: ProvingJobDataType::StandardProof,
+            data_type: ProvingJobDataType::InputWitness,
             data_index: 0,
         }
     }
@@ -821,7 +827,7 @@ impl QProvingJobDataID {
             circuit_type: ProvingJobCircuitType::AggAddProcessL1WithdrawalAddL1Deposit,
             sub_group_id: 0,
             task_index: 0,
-            data_type: ProvingJobDataType::StandardProof,
+            data_type: ProvingJobDataType::InputWitness,
             data_index: 0,
         }
     }
@@ -833,7 +839,7 @@ impl QProvingJobDataID {
             circuit_type: ProvingJobCircuitType::GenerateRollupStateTransitionProof,
             sub_group_id: 0,
             task_index: 0,
-            data_type: ProvingJobDataType::StandardProof,
+            data_type: ProvingJobDataType::InputWitness,
             data_index: 0,
         }
     }
@@ -845,7 +851,7 @@ impl QProvingJobDataID {
             circuit_type: ProvingJobCircuitType::GenerateSigHashIntrospectionProof,
             sub_group_id: 0,
             task_index: input_id as u32,
-            data_type: ProvingJobDataType::StandardProof,
+            data_type: ProvingJobDataType::InputWitness,
             data_index: 0,
         }
     }
@@ -857,7 +863,7 @@ impl QProvingJobDataID {
             circuit_type: ProvingJobCircuitType::GenerateFinalSigHashProof,
             sub_group_id: input_id as u32,
             task_index: input_id as u32,
-            data_type: ProvingJobDataType::StandardProof,
+            data_type: ProvingJobDataType::InputWitness,
             data_index: 0,
         }
     }
@@ -869,13 +875,13 @@ impl QProvingJobDataID {
             circuit_type: ProvingJobCircuitType::WrapFinalSigHashProofBLS12381,
             sub_group_id: input_id as u32,
             task_index: input_id as u32,
-            data_type: ProvingJobDataType::StandardProof,
+            data_type: ProvingJobDataType::InputWitness,
             data_index: 0,
         }
     }
     pub fn get_input_proof_id(&self, data_index: u8) -> Self {
         Self {
-            data_type: ProvingJobDataType::StandardProof,
+            data_type: ProvingJobDataType::BaseInputProof,
             data_index,
             ..*self
         }
@@ -919,7 +925,7 @@ impl QProvingJobDataID {
             _ => self.circuit_type,
         };
         Self {
-            data_type: ProvingJobDataType::StandardProof,
+            data_type: ProvingJobDataType::InputWitness,
             data_index: 0,
             circuit_type: parent_type,
             sub_group_id: self.sub_group_id + 1,
@@ -929,21 +935,21 @@ impl QProvingJobDataID {
     }
     pub fn get_output_id(&self) -> Self {
         Self {
-            data_type: ProvingJobDataType::StandardProof,
+            data_type: ProvingJobDataType::OutputProof,
             data_index: 0,
             ..*self
         }
     }
     pub fn get_input_witness_id(&self) -> Self {
         Self {
-            data_type: ProvingJobDataType::StandardProof,
+            data_type: ProvingJobDataType::InputWitness,
             data_index: 0,
             ..*self
         }
     }
     pub fn get_sub_group_counter_id(&self) -> Self {
         Self {
-            data_type: ProvingJobDataType::StandardProof,
+            data_type: ProvingJobDataType::Counter,
             task_index: 0,
             data_index: 0,
             ..*self
@@ -951,7 +957,7 @@ impl QProvingJobDataID {
     }
     pub fn get_sub_group_counter_goal_id(&self) -> Self {
         Self {
-            data_type: ProvingJobDataType::StandardProof,
+            data_type: ProvingJobDataType::Counter,
             task_index: 0,
             data_index: 1,
             ..*self
@@ -959,7 +965,7 @@ impl QProvingJobDataID {
     }
     pub fn get_sub_group_counter_goal_next_jobs_id(&self) -> Self {
         Self {
-            data_type: ProvingJobDataType::StandardProof,
+            data_type: ProvingJobDataType::Counter,
             task_index: 0,
             data_index: 2,
             ..*self
@@ -1108,7 +1114,7 @@ impl QJobIdBase for QProvingJobDataID{
             group_id: 0,
             sub_group_id: 0,
             task_index: 0,
-            data_type: ProvingJobDataType::StandardProof,
+            data_type: ProvingJobDataType::BaseInputProof,
             data_index: 0,
         }
     }
@@ -1149,7 +1155,7 @@ impl QJobIdCreatable for QProvingJobDataID {
             circuit_type: ProvingJobCircuitType::UserEndCap,
             sub_group_id: global_user_tree_height as u32,
             task_index: user_id as u32,
-            data_type: ProvingJobDataType::StandardProof,
+            data_type: ProvingJobDataType::BaseInputProof,
             data_index: 0,
         }
     }
@@ -1165,7 +1171,7 @@ impl QJobIdCreatable for QProvingJobDataID {
                 circuit_type: ProvingJobCircuitType::UserEndCap,
                 sub_group_id: global_user_tree_height as u32,
                 task_index: user_id as u32,
-                data_type: ProvingJobDataType::StandardProof,
+                data_type: ProvingJobDataType::BaseInputProof,
                 data_index: 0,
             }
         }
@@ -1174,7 +1180,7 @@ impl QJobIdCreatable for QProvingJobDataID {
     
     fn new_two_to_one_proof_id_or_invalid(target_checkpoint_id: u64, left_proof_id: &Self, right_proof_id: &Self, parth_index: u64, parth_level: u8, reverse_aggregation_level: u8) -> Self {
         Self::new_two_to_one_proof_id(target_checkpoint_id, left_proof_id, right_proof_id, parth_index, parth_level, reverse_aggregation_level)
-            .unwrap_or_else(|_| Self::new_invalid_job_id().get_output_id()) // Return invalid proof with StandardProof type for consistency
+            .unwrap_or_else(|_| Self::new_invalid_job_id().get_output_id()) // Return invalid proof with OutputProof type for consistency
     }
     
     // TODO: should we use parth level and encode it in the job id?
@@ -1238,7 +1244,7 @@ impl QJobIdCreatable for QProvingJobDataID {
             circuit_type,
             sub_group_id: reverse_aggregation_level as u32,
             task_index: parth_index as u32,
-            data_type: ProvingJobDataType::StandardProof, // The result of aggregation is a proof
+            data_type: ProvingJobDataType::BaseInputProof, // The result of aggregation is a proof
             data_index: 0,
         })
     }

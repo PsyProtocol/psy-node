@@ -169,5 +169,16 @@ pub trait QStandardCircuitProvableWithRawProofsAndRefLibrary<
         input: PsyWorkerGetProvingWorkWithChildProofsAPIResponse<QHashOut<C::F>, QProvingJobDataID>,
         worker_reward_tag: QHashOut<C::F>,
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>>;
+
+    fn compute_verify_witness_with_raw_proofs_and_ref_library(
+        &self,
+        library: &L,
+        input: PsyWorkerGetProvingWorkWithChildProofsAPIResponse<QHashOut<C::F>, QProvingJobDataID>,
+        worker_reward_tag: QHashOut<C::F>,
+    ) -> anyhow::Result<Vec<C::F>> {
+        let _lib = library;
+        let _worker_reward_tag = worker_reward_tag;
+        anyhow::bail!("compute_verify_witness_with_raw_proofs_and_ref_library not for job implemented: {:?}", input.base.job.job_id);
+    }
 }
 

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "std")]
 use crate::generic_traits::QNamedType;
-use crate::{crypto::hash::traits::MerkleHasher, data::serializable::{QPDSerializable, QPDSerializableFixed}, protocol::core_types::Q256BitHash, utils::{debug_code_string::QToCodeString, QPGenRandom}};
+use crate::{crypto::hash::traits::{MerkleHasher, ZeroableHash}, data::serializable::{QPDSerializable, QPDSerializableFixed}, protocol::core_types::Q256BitHash, utils::{QPGenRandom, debug_code_string::QToCodeString}};
 
 
 
@@ -31,6 +31,17 @@ Level[n][i] = hash(hash(Level[n-1][2*i], Level[n-1][2*i+1]), Tag[n][i])
 pub fn hash_tag_tree_node<Hash, Hasher: MerkleHasher<Hash>>(left: &Hash, right: &Hash, tag: &Hash) -> Hash {
     Hasher::two_to_one(&Hasher::two_to_one(left, right), tag)
 }
+#[inline]
+pub fn hash_tag_tree_node_single<Hash: ZeroableHash, Hasher: MerkleHasher<Hash>>(left: &Hash, tag: &Hash) -> Hash {
+    Hasher::two_to_one(&Hasher::two_to_one(left, &Hash::get_zero_value()), tag)
+}
+
+#[inline]
+pub fn hash_tag_tree_node_three<Hash: ZeroableHash, Hasher: MerkleHasher<Hash>>(first_tag_tree_value: &Hash, second_tag_tree_value: &Hash, third_tag_tree_value: &Hash, tag: &Hash) -> Hash {
+    let last_two = hash_tag_tree_node::<Hash, Hasher>(second_tag_tree_value, third_tag_tree_value, tag);
+    hash_tag_tree_node::<Hash, Hasher>(first_tag_tree_value, &last_two, tag)
+}
+
 
 #[inline]
 pub fn hash_tag_tree_node_owned<Hash, Hasher: MerkleHasher<Hash>>(left: Hash, right: Hash, tag: Hash) -> Hash {

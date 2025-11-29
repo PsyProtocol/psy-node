@@ -1,8 +1,8 @@
 use parth_core::{
-    crypto::hash::traits::{MerkleHasher, MerkleZeroHasher},
+    crypto::hash::traits::{FieldQHasher, MerkleHasher, MerkleZeroHasher},
     felt::QFelt64,
     pgoldilocks::{QHashOut, QRichField},
-    protocol::core_types::Q256BitHash,
+    protocol::core_types::{Q256BitHash, QFHashBase},
 };
 use plonky2::{
     hash::hash_types::HashOut,
@@ -54,9 +54,8 @@ where
 }
 
 impl<C: GenericConfig<D> + 'static, const D: usize> QEDCoordinatorCircuitManager<C, D>
-where
-    C::Hasher: AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + MerkleZeroHasher<QHashOut<C::F>>,
-    C::F: QRichField,
+where     C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + FieldQHasher<C::F, QHashOut<C::F>>, QHashOut<C::F>: Q256BitHash + QFHashBase<C::F>, C::F: QFelt64 + QRichField,
+
 {
     pub fn new_with_library<T: CircuitInfoLibrary<C, D>>(
         library: &T,
@@ -315,8 +314,8 @@ where
 impl<Library: CircuitInfoLibrary<C, D>, C: GenericConfig<D> + 'static, const D: usize>
     PsyWorkerGenericLibraryProver<QHashOut<C::F>, QProvingJobDataID, Library> for QEDCoordinatorCircuitManager<C, D>
 where
-    C::Hasher: AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + MerkleZeroHasher<QHashOut<C::F>>,
-    QHashOut<C::F>: Q256BitHash,
+    C::Hasher: AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + FieldQHasher<C::F, QHashOut<C::F>>,
+    QHashOut<C::F>: Q256BitHash + QFHashBase<C::F>,
     C::F: QFelt64 + QRichField,
 {
     fn prove_job_from_api(
@@ -358,6 +357,10 @@ where
                 .prove_with_raw_proofs_and_ref_library(library, input, worker_reward_tag),
             ProvingJobCircuitType::GenerateRollupStateTransitionProof => {
                 self.checkpoint_root_transition
+                    .prove_with_raw_proofs_and_ref_library(library, input, worker_reward_tag)
+            }
+            ProvingJobCircuitType::GenesisBlockCheckpointStateTransition => {
+                self.genesis_checkpoint_root_transition
                     .prove_with_raw_proofs_and_ref_library(library, input, worker_reward_tag)
             }
 

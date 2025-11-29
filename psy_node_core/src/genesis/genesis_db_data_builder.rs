@@ -282,7 +282,7 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
         self.contract_state_tree_nodes_ffs = contract_state_tree_nodes_serializer.serialize_into_bytes();
 
         let (user_registration_tree_root, user_registration_tree_nodes_hash_map) =
-            zero_id_merkle_tree_nodes_hash_map_from_leaves::<Hasher, Hash>(N::GLOBAL_CONTRACT_TREE_HEIGHT, &user_registration_tree_leaves);
+            zero_id_merkle_tree_nodes_hash_map_from_leaves::<Hasher, Hash>(N::GLOBAL_USER_TREE_HEIGHT, &user_registration_tree_leaves);
         self.user_registration_tree_root = user_registration_tree_root;
         self.user_registration_tree_nodes_ffs =
             QMerkleStoreFastZeroNodeSerializer::serialize_zero_id_hash_map_to_vec(&user_registration_tree_nodes_hash_map);
@@ -408,6 +408,7 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
             },
             checkpoint_leaf: builder.get_populated_checkpoint_leaf(),
         };
+        println!("builder_state_roots: {:#?}", builder.get_checkpoint_state_roots());
         Ok((
             verifiable_checkpoint_transition,
             PsyPreparedCoordinatorBlockStateUpdates {

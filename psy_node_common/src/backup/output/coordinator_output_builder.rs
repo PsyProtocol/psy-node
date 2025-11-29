@@ -3,7 +3,7 @@ use parth_core::{
     QJobIdBase, crypto::hash::{
         merkle_proof::{DeltaMerkleProofCore, compute_root_merkle_proof_generic},
         traits::{QFieldHashable, ZeroableHash},
-    }, felt::{FromPrimitiveValuesFelt, ToU64Value, ZeroableFelt}, protocol::core_types::QNetworkTypesConfig
+    }, felt::{FromPrimitiveValuesFelt, ToU64Value, ZeroableFelt}, protocol::core_types::{Q256BitHash, QNetworkTypesConfig}
 };
 use psy_core::{
     constants::protocol::DA_CHALLENGE_WINDOW,
@@ -26,7 +26,7 @@ use psy_data::{
         populated_checkpoint::PsyCheckpointLeafPopulated,
     },
     worker::{
-        metadata::{PsyProvingJobMetadata, PROOF_REWARD_TREE_HASH_MODE_3_CHILDREN_DOUBLE_REWARD, PROOF_REWARD_TREE_HASH_MODE_HASH_CHILDREN_STANDARD},
+        metadata::{PROOF_REWARD_TREE_HASH_MODE_3_CHILDREN_DOUBLE_REWARD, PROOF_REWARD_TREE_HASH_MODE_HASH_CHILDREN_STANDARD, PROOF_REWARD_TREE_HASH_MODE_LIFT_CHILD, PsyProvingJobMetadata},
         metadata_with_job_id::PsyProvingJobMetadataWithJobId,
     },
 };
@@ -41,7 +41,7 @@ fn get_current_block_time() -> u64 {
     let start = std::time::SystemTime::UNIX_EPOCH;
     let now = std::time::SystemTime::now();
     let duration = now.duration_since(start).expect("Time went backwards");
-    duration.as_secs()
+    duration.as_millis() as u64
 }
 pub struct CoordinatorOutputBuilder<N: QNetworkTypesConfig<JobId = QProvingJobDataID>> {
     pub guta_gatherer_result: CoordinatorGUTAUpdateGathererOutputDatabase<N::F, N::QHash>,
@@ -91,7 +91,7 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
             coordinator_ids.next_checkpoint_id
         )
         .get_output_id();
-
+        
         let builder = Self {
             total_guta_jobs: total_guta_jobs as usize,
             total_register_user_jobs: total_register_user_jobs as usize,
@@ -125,29 +125,29 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
             .last()
             .ok_or_else(|| anyhow::anyhow!("No GUTA jobs found"))?
             .first()
-            .ok_or_else(|| anyhow::anyhow!("No GUTA jobs found at last level"))?.job_id;
+            .ok_or_else(|| anyhow::anyhow!("No GUTA jobs found at last level"))?.job_id.get_output_id();
         let root_register_user_job = register_users_gatherer_result
             .job_ids
             .last()
             .ok_or_else(|| anyhow::anyhow!("No Register User jobs found"))?
             .first()
-            .ok_or_else(|| anyhow::anyhow!("No Register User jobs found at last level"))?.job_id;
+            .ok_or_else(|| anyhow::anyhow!("No Register User jobs found at last level"))?.job_id.get_output_id();
         let root_deploy_contract_job = deploy_contract_gatherer_result
             .job_ids
             .last()
             .ok_or_else(|| anyhow::anyhow!("No Deploy Contract jobs found"))?
             .first()
-            .ok_or_else(|| anyhow::anyhow!("No Deploy Contract jobs found at last level"))?.job_id;
+            .ok_or_else(|| anyhow::anyhow!("No Deploy Contract jobs found at last level"))?.job_id.get_output_id();
         let total_guta_jobs = guta_gatherer_result.db_output.total_guta_proofs_generated.to_u64_value();//guta_gatherer_result.job_ids.iter().map(|level| level.len()).sum();
         let total_register_user_jobs = register_users_gatherer_result.db_output.total_jobs;//register_users_gatherer_result.job_ids.iter().map(|level| level.len()).sum();
         let total_deploy_contract_jobs = deploy_contract_gatherer_result.db_output.total_jobs;//deploy_contract_gatherer_result.job_ids.iter().map(|level| level.len()).sum();
 
         let last_checkpoint_state_transition_job_id = if coordinator_ids.checkpoint_id == 0 {
-            QProvingJobDataID::new_proof_job_id(0, 0, ProvingJobCircuitType::GenesisBlockCheckpointStateTransition, 0, 0)
+            QProvingJobDataID::new_proof_job_id(0, 0, ProvingJobCircuitType::GenesisBlockCheckpointStateTransition, 0, 0).get_output_id()
         } else {
             QProvingJobDataID::get_checkpoint_state_transition_job_id(
                 coordinator_ids.checkpoint_id
-            )
+            ).get_output_id()
         }
         .get_output_id();
         let agg_state_part_1_job_id = QProvingJobDataID::block_agg_state_part_1_input_witness(coordinator_ids.unique_pending_id, 0).get_output_id();
@@ -169,9 +169,9 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
             total_guta_jobs: total_guta_jobs as usize,
             total_register_user_jobs: total_register_user_jobs as usize,
             total_deploy_contract_jobs: total_deploy_contract_jobs as usize,
-            root_guta_job_id: root_guta_job,
-            root_register_user_job_id: root_register_user_job,
-            root_deploy_contract_job_id: root_deploy_contract_job,
+            root_guta_job_id: root_guta_job.get_output_id(),
+            root_register_user_job_id: root_register_user_job.get_output_id(),
+            root_deploy_contract_job_id: root_deploy_contract_job.get_output_id(),
             agg_state_part_1_job_id,
             checkpoint_state_transition_job_id,
             last_checkpoint_state_transition_job_id,
@@ -229,7 +229,7 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
                 reward_tree_node_level: 1,
                 reward_tree_hash_mode: PROOF_REWARD_TREE_HASH_MODE_3_CHILDREN_DOUBLE_REWARD,
                 reward_tree_node_children: 3,
-                dependencies: vec![self.root_guta_job_id, self.root_register_user_job_id, self.root_deploy_contract_job_id],
+                dependencies: vec![self.root_guta_job_id.get_output_id(), self.root_register_user_job_id.get_output_id(), self.root_deploy_contract_job_id.get_output_id()],
             },
         };
 
@@ -249,6 +249,12 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
         reward_tree_root: N::QHash,
         genesis_checkpoint_state_transition_hash: N::QHash,
     ) -> anyhow::Result<QCQEDCheckpointStateTransitionInput<N::F, N::QHash>> {
+        tracing::info!("last committed checkpoint leaf: {:?} ", last_committed.checkpoint_leaf);
+        tracing::info!("last committed checkpoint leaf hash: {:?} ({})", last_committed.checkpoint_leaf_hash, hex::encode(&last_committed.checkpoint_leaf_hash.into_owned_32bytes()));
+        tracing::info!("last committed checkpoint leaf hash (computed) : {:?} ({})", last_committed.checkpoint_leaf.qfhash::<N::HasherBase>(), hex::encode(&last_committed.checkpoint_leaf.qfhash::<N::HasherBase>().into_owned_32bytes()));
+        tracing::info!("last committed checkpoint leaf hash (computed) : {:?} ({})", last_committed.checkpoint_leaf.qfhash::<N::HasherBase>(), hex::encode(&last_committed.checkpoint_leaf.qfhash::<N::HasherBase>().into_owned_32bytes()));
+        tracing::info!("last committed global_chain_root: {:?} ({})", last_committed.checkpoint_leaf.global_chain_root, hex::encode(&last_committed.checkpoint_leaf.global_chain_root.into_owned_32bytes()));
+
         let checkpoint_state_roots = PQEDCheckpointGlobalStateRoots {
             contract_tree_root: self.deploy_contract_gatherer_result.end_global_contract_tree_root,
             deposit_tree_root: last_committed.checkpoint_state_roots.deposit_tree_root,
@@ -280,6 +286,7 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
             stats: checkpoint_leaf_stats.clone(),
         };
         let new_checkpoint_leaf_hash = new_checkpoint_leaf.qfhash::<N::HasherBase>();
+        tracing::info!("New checkpoint leaf hash: {:?} ({})", new_checkpoint_leaf_hash, hex::encode(&new_checkpoint_leaf_hash.into_owned_32bytes()));
         let previous_checkpoint_proof = checkpoint_tree.get_leaf(checkpoint_id);
         let current_checkpoint_proof = checkpoint_tree.get_leaf(next_checkpoint_id);
         let new_checkpoint_tree_root = compute_root_merkle_proof_generic::<N::QHash, N::HasherBase>(
@@ -336,6 +343,7 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
             genesis_checkpoint_state_transition_hash,
         )?;
         let witness_bytes = witness.psy_ser_to_bytes_vec()?;
+        println!("circuit_fingerprint_config.checkpoint_state_transition_circuit_fingerprint: {:?}", circuit_fingerprint_config.checkpoint_state_transition_circuit_fingerprint);
         let expected_public_inputs = witness
             .get_public_inputs_hash_with_fingerprint::<N::HasherBase>(circuit_fingerprint_config.checkpoint_state_transition_circuit_fingerprint);
         self.append_checkpoint_tree_siblings = witness.append_checkpoint_tree_proof.siblings;
@@ -346,7 +354,7 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
                 expected_public_inputs_hash: expected_public_inputs,
                 reward_tree_node_index: 0,
                 reward_tree_node_level: 0,
-                reward_tree_hash_mode: PROOF_REWARD_TREE_HASH_MODE_HASH_CHILDREN_STANDARD,
+                reward_tree_hash_mode: PROOF_REWARD_TREE_HASH_MODE_LIFT_CHILD,
                 reward_tree_node_children: 2,
                 dependencies: vec![
                     self.agg_state_part_1_job_id.get_output_id(),

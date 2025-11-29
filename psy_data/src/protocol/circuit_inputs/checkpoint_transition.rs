@@ -19,7 +19,6 @@ pub struct QCQEDCheckpointStateTransitionInputPartial<F, Hash> {
     pub final_random_seed_contribution: Hash,
     pub pm_jobs_completed: PPMJobsCompletedStats<F>,
 }
-
 #[cfg(feature = "rand_gen")]
 impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for QCQEDCheckpointStateTransitionInputPartial<F, Hash> {
     fn qp_rand_gen() -> Self where Self: Sized {
@@ -106,6 +105,13 @@ impl<F: QFelt64, Hash: QFHashBase<F>> QCQEDCheckpointStateTransitionInput<F, Has
         let new_checkpoint_tree_root = compute_root_merkle_proof_generic::<Hash, Hasher>(checkpoint_leaf_hash, self.append_checkpoint_tree_proof.index, &self.append_checkpoint_tree_proof.siblings);
         self.append_checkpoint_tree_proof.new_root = new_checkpoint_tree_root;
     }
+    pub fn update_for_prover<Hasher: FieldQHasher<F, Hash>>(&mut self, reward_tree_root: Hash) {
+        let checkpoint_leaf = self.partial.get_new_checkpoint_leaf::<Hasher>(reward_tree_root);
+        let checkpoint_leaf_hash = checkpoint_leaf.qfhash::<Hasher>();
+        self.append_checkpoint_tree_proof.new_value = checkpoint_leaf_hash;
+        let new_checkpoint_tree_root = compute_root_merkle_proof_generic::<Hash, Hasher>(checkpoint_leaf_hash, self.append_checkpoint_tree_proof.index, &self.append_checkpoint_tree_proof.siblings);
+        self.append_checkpoint_tree_proof.new_root = new_checkpoint_tree_root;
+    }
 }
 #[cfg(feature = "rand_gen")]
 impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for QCQEDCheckpointStateTransitionInput<F, Hash> {
@@ -126,8 +132,21 @@ impl<F, Hash: Copy> QCQEDCheckpointStateTransitionInput<F, Hash> {
             checkpoint_transition: CheckpointStateHashTransition{
                 old_checkpoint_tree_root: self.append_checkpoint_tree_proof.old_root,
                 new_checkpoint_tree_root: self.append_checkpoint_tree_proof.new_root,
-                old_checkpoint_leaf_hash: self.append_checkpoint_tree_proof.old_value,
+                old_checkpoint_leaf_hash: self.previous_checkpoint_proof.value,
                 new_checkpoint_leaf_hash: self.append_checkpoint_tree_proof.new_value,
+            },
+            genesis_checkpoint_state_transition_hash: self.genesis_checkpoint_state_transition_hash,
+            checkpoint_state_transition_circuit_fingerprint,
+        };
+        data.get_public_inputs_hash_no_rewards_tag::<Hasher>()
+    }
+    pub fn get_previous_proof_expected_public_inputs_hash_with_fingerprint<Hasher: MerkleHasher<Hash>>(&self, checkpoint_state_transition_circuit_fingerprint: Hash) -> Hash {
+        let data = CheckpointStateTransitionPublicInputs {
+            checkpoint_transition: CheckpointStateHashTransition{
+                old_checkpoint_tree_root: self.last_old_checkpoint_tree_root_hash,
+                new_checkpoint_tree_root: self.previous_checkpoint_proof.root,
+                old_checkpoint_leaf_hash: self.last_old_checkpoint_tree_leaf_hash,
+                new_checkpoint_leaf_hash: self.previous_checkpoint_proof.value,
             },
             genesis_checkpoint_state_transition_hash: self.genesis_checkpoint_state_transition_hash,
             checkpoint_state_transition_circuit_fingerprint,
@@ -137,9 +156,9 @@ impl<F, Hash: Copy> QCQEDCheckpointStateTransitionInput<F, Hash> {
 }
 
 impl<F: QFelt64, Hash: Q256BitHash + QHashBase + QFHashBase<F>> QCQEDCheckpointStateTransitionInput<F, Hash> {
-    pub fn get_public_inputs_hash_with_fingerprint_and_reward_tag<Hasher: FieldQHasher<F, Hash>>(&self, checkpoint_state_transition_circuit_fingerprint: Hash, reward_tag: Hash) -> Hash {
+    pub fn get_public_inputs_hash_with_fingerprint_and_reward_root<Hasher: FieldQHasher<F, Hash>>(&self, checkpoint_state_transition_circuit_fingerprint: Hash, reward_root: Hash) -> Hash {
         let mut modified = self.clone();
-        modified.update_with_new_reward_tree_root::<Hasher>(reward_tag);
+        modified.update_with_new_reward_tree_root::<Hasher>(reward_root);
         modified.get_public_inputs_hash_with_fingerprint::<Hasher>(checkpoint_state_transition_circuit_fingerprint)
     }
 }
@@ -215,7 +234,7 @@ impl<F: QFelt64, Hash: QFHashBase<F>> QCQEDCheckpointStateTransitionInputPartial
                 slots_modified: self.part_1_header.guta_proof_header.stats.slots_modified,
                 pm_jobs_completed: self.pm_jobs_completed,
                 block_time: self.block_time,
-                random_seed: Hasher::two_to_one(&self.old_stats.random_seed, &self.final_random_seed_contribution),
+                random_seed: self.final_random_seed_contribution,//Hasher::two_to_one(&self.old_stats.random_seed, &self.final_random_seed_contribution),
                 pm_rewards_commitment: PPMRewardCommitment {  // TODO: update this reward commitment to reflect the new tag-tree based commitment
                     register_users_root: reward_tree_root,
                     gutas_root: reward_tree_root,

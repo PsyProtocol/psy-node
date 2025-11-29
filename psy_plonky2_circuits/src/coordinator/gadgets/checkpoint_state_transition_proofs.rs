@@ -91,7 +91,7 @@ impl QEDPart1StateDeltaResultGadget {
             slots_modified: part_1_header.global_user_tree_delta.stats.slots_modified,
             pm_jobs_completed: part_1_header.combined_pm_jobs_completed,
             block_time,
-            random_seed: builder.hash_two_to_one::<H>(old_stats.random_seed, final_random_seed_contribution),
+            random_seed: final_random_seed_contribution,//builder.hash_two_to_one::<H>(old_stats.random_seed, final_random_seed_contribution),
             pm_rewards_commitment: PMRewardCommitmentGadget {
                 register_users_root: rewards_tree_tag_tree_root,
                 gutas_root: rewards_tree_tag_tree_root,

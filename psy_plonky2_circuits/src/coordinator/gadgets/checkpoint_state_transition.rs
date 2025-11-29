@@ -138,6 +138,7 @@ impl CheckpointStateHashTransitionGadget {
         let checkpoint_transition_hash = self.get_hash::<H, F, D>(builder);
         let config_hash = builder.hash_two_to_one::<H>(genesis_checkpoint_state_transition_hash, checkpoint_state_transition_circuit_fingerprint);
         builder.hash_two_to_one::<H>(checkpoint_transition_hash, config_hash)
+        
     }
     pub fn set_witness_params<F: RichField>(
         &self,
@@ -147,10 +148,10 @@ impl CheckpointStateHashTransitionGadget {
         old_checkpoint_leaf_hash: QHashOut<F>,
         new_checkpoint_leaf_hash: QHashOut<F>,
     ) -> anyhow::Result<()> {
-        witness.set_hash_target(self.old_checkpoint_tree_root, old_checkpoint_tree_root.0);
-        witness.set_hash_target(self.new_checkpoint_tree_root, new_checkpoint_tree_root.0);
-        witness.set_hash_target(self.old_checkpoint_leaf_hash, old_checkpoint_leaf_hash.0);
-        witness.set_hash_target(self.new_checkpoint_leaf_hash, new_checkpoint_leaf_hash.0);
+        witness.set_hash_target(self.old_checkpoint_tree_root, old_checkpoint_tree_root.0)?;
+        witness.set_hash_target(self.new_checkpoint_tree_root, new_checkpoint_tree_root.0)?;
+        witness.set_hash_target(self.old_checkpoint_leaf_hash, old_checkpoint_leaf_hash.0)?;
+        witness.set_hash_target(self.new_checkpoint_leaf_hash, new_checkpoint_leaf_hash.0)?;
         Ok(())
     }
     pub fn set_witness<F: RichField>(&self, witness: &mut impl Witness<F>, input: &CheckpointStateHashTransition<QHashOut<F>>) -> anyhow::Result<()> {
@@ -224,3 +225,5 @@ impl CheckpointStateTransitionCoreGadget {
         Ok(())
     }
 }
+
+

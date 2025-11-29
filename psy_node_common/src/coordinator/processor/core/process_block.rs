@@ -56,6 +56,7 @@ impl<
         jobs: &[Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>],
     ) -> anyhow::Result<()> {
         if level < jobs.len() {
+            println!("Publishing {} jobs at level {}", jobs[level].len(), level);
             self.db
                 .proof_work_queue
                 .publish_many_worker_queue_items(
@@ -114,6 +115,10 @@ impl<
         max_level: Option<usize>,
         wait_for_jobs_completion: bool,
     ) -> anyhow::Result<()> {
+        println!("Publishing worker jobs...");
+        println!("guta_jobs: {:?}", guta_jobs);
+        println!("register_user_jobs: {:?}", register_user_jobs);
+        println!("deploy_contract_jobs: {:?}", deploy_contract_jobs);
         let queue_key = self.db.get_proof_worker_queue_key();
         let max_level = guta_jobs
             .len()
@@ -160,6 +165,8 @@ impl<
     }
     pub async fn publish_and_wait_for_job_completion(&self, job: &PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>) -> anyhow::Result<()> {
         let queue_key = self.db.get_proof_worker_queue_key();
+        println!("Publishing job id: {:?}", job.job_id);
+        println!("self.db.ids.proc_checkpoint_unique_id: {:?}", self.db.ids.proc_checkpoint_unique_id);
         self.db
             .proof_work_queue
             .publish_worker_queue_item_ref(
@@ -191,6 +198,31 @@ impl<
         Vec<Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>>,
         CoordinatorOutputBuilder<N>
     )> {
+        if self.db.ids.gathering_proc_checkpoint_unique_id == self.db.ids.proc_checkpoint_unique_id || self.db.ids.gathering_unique_pending_id == self.db.ids.unique_pending_id {
+            tracing::info!("detected gathering unique ids: gathering_proc_checkpoint_unique_id = {}, current proc_checkpoint_unique_id = {}, gathering_unique_pending_id = {}, current unique_pending_id = {}. Updating unique ids before gathering results.", self.db.ids.gathering_proc_checkpoint_unique_id, self.db.ids.proc_checkpoint_unique_id, self.db.ids.gathering_unique_pending_id, self.db.ids.unique_pending_id);
+            if self.db.ids.checkpoint_id == 0 {
+                tracing::info!("At genesis checkpoint, setting unique ids ahead of genesis.");
+                self.db.set_new_unique_ids().await?;
+                self.db.shared_status.update_status(
+                    self.db.ids.gathering_unique_pending_id,
+                    self.db.ids.checkpoint_id,
+                    self.db.last_committed.checkpoint_leaf.clone(),
+                    self.db.last_committed.checkpoint_state_roots.clone(),
+                    self.db.last_committed.l2_state.clone(),
+                    self.db.needs_revert,
+                )?;
+                let (_, _, _) = tokio::try_join!(
+                    self.guta_queue_gatherer
+                        .finalize_gathering_and_update_queue_key(self.db.ids.gathering_proc_checkpoint_unique_id),
+                    self.register_user_queue_gatherer
+                        .finalize_gathering_and_update_queue_key(self.db.ids.gathering_proc_checkpoint_unique_id),
+                    self.deploy_contract_queue_gatherer
+                        .finalize_gathering_and_update_queue_key(self.db.ids.gathering_proc_checkpoint_unique_id),
+                )?;
+            }else{
+                anyhow::bail!("Cannot gather results when unique ids have not been updated.");
+            }
+        }
         self.db.set_new_unique_ids().await?;
         self.db.shared_status.update_status(
             self.db.ids.gathering_unique_pending_id,
@@ -357,8 +389,10 @@ impl<
         // while the first level of jobs are processing, plan the agg job
         let agg_job_metadata = self.plan_agg_guta_register_users_deploy_contracts_job(&mut output_builder).await?;
 
+        tracing::info!("Waiting for first level of jobs to complete...");
         // wait for the first level of jobs to finish
         self.wait_for_jobs_completion().await?;
+        tracing::info!("First level of jobs completed!");
 
         // publish the rest of the jobs and wait for them to finish
         self.publish_jobs(
@@ -370,6 +404,8 @@ impl<
             true,
         )
         .await?;
+
+        tracing::info!("Pre-agg jobs completed!");
 
         // wait for the Aggregate GUTA, User Registation and Deploy Contracts Proof to
         // finish being proved

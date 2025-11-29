@@ -70,8 +70,8 @@ impl<const D: usize> VerifyRecursiveCheckpointStateTransitionProofGadget<D> {
 
         let expected_previous_proof_public_inputs_gadget = CheckpointStateTransitionPublicInputsGadget {
             checkpoint_transition: previous_checkpoint_state_transition,
-            genesis_checkpoint_state_transition_hash: genesis_checkpoint_transition_proof_fingerprint,
-            checkpoint_state_transition_circuit_fingerprint: previous_proof_fingerprint,
+            genesis_checkpoint_state_transition_hash: current_public_inputs_gadget.genesis_checkpoint_state_transition_hash,
+            checkpoint_state_transition_circuit_fingerprint: current_public_inputs_gadget.checkpoint_state_transition_circuit_fingerprint,
         }.get_public_inputs_hash_no_rewards_tag::<C::Hasher, F, D>(builder);
 
 

@@ -1,9 +1,11 @@
 use async_trait::async_trait;
 use parth_core::{
-    crypto::hash::{merkle_proof::MerkleProofCore, traits::MerkleZeroHasher},
+    crypto::hash::{
+        merkle_proof::MerkleProofCore, tag_tree::{hash_tag_tree_node, hash_tag_tree_node_three}, traits::{FieldQHasher, MerkleHasher, MerkleZeroHasher, QFieldHashable}
+    },
     felt::QFelt64,
     pgoldilocks::{QHashOut, QRichField},
-    protocol::core_types::Q256BitHash,
+    protocol::core_types::{Q256BitHash, QFHashBase},
 };
 use plonky2::{
     hash::hash_types::{HashOut, HashOutTarget},
@@ -28,9 +30,7 @@ use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 use crate::{
     coordinator::gadgets::verify_agg_user_registration_deploy_guta::VerifyAggUserRegistartionDeployContractsGUTAGadget,
     proof_minifier::{pm_chain_dynamic::QEDProofMinifierDynamicChain, pm_core::get_circuit_fingerprint_generic},
-    qstandard::{
-        QPsyNetworkCircuitWithType, QStandardCircuit, QStandardCircuitProvableWithRawProofsAndRefLibrary,
-    },
+    qstandard::{QPsyNetworkCircuitWithType, QStandardCircuit, QStandardCircuitProvableWithRawProofsAndRefLibrary},
     utils::proof_serialization::deserialize_plonky2_proof,
 };
 
@@ -128,7 +128,7 @@ where
             deploy_contracts_proof_rewards_tree_value,
         );
         builder.add_qed_type_f_common_gates();
-        
+
         builder.register_public_inputs(&public_inputs_hash.elements);
 
         let base_circuit_data = builder.build::<C>();
@@ -189,6 +189,7 @@ where
         );
 
         pw.set_hash_target(self.worker_rewards_tree_tag_target, worker_reward_tag.0)?;
+
 
         self.verifier_gadget.set_witness_params(
             &mut pw,
@@ -251,8 +252,8 @@ where
 impl<L: CircuitInfoLibrary<C, D>, C: GenericConfig<D>, const D: usize> QStandardCircuitProvableWithRawProofsAndRefLibrary<L, C, D>
     for VerifyAggUserRegistartionDeployContractsGUTACircuit<C, D>
 where
-    C::Hasher: AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + MerkleZeroHasher<QHashOut<C::F>>,
-    QHashOut<C::F>: Q256BitHash,
+    C::Hasher: AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + MerkleZeroHasher<QHashOut<C::F>> + FieldQHasher<C::F, QHashOut<C::F>>,
+    QHashOut<C::F>: Q256BitHash + QFHashBase<C::F>,
     C::F: QFelt64 + QRichField,
 {
     fn prove_with_raw_proofs_and_ref_library(
@@ -277,13 +278,49 @@ where
         let deploy_contracts_zk_proof_verifier_data = library.get_verifier_data(input.get_child_proof_circuit_type(2)?)?;
         let deploy_contracts_proof_rewards_tree_value = input.base.child_proof_tag_values[2];
 
-
         let (register_users_state_transition, register_users_total_proofs_generated) =
             witness.register_users_state_transition.get_agg_state_transition_and_f::<C::F>();
         let (deploy_contracts_state_transition, deploy_contracts_total_proofs_generated) =
             witness.deploy_contracts_state_transition.get_agg_state_transition_and_f::<C::F>();
 
-        self.prove_base(
+        println!("guta_header: {:#?}", witness.guta_proof_header);
+        let guta_proof_header_hash = witness.guta_proof_header.qfhash::<C::Hasher>();
+        println!("guta_proof_header_hash: {:?} ({})", guta_proof_header_hash, hex::encode(&guta_proof_header_hash.to_le_bytes()));
+
+        let guta_public_inputs_expected = <C::Hasher as MerkleHasher<QHashOut<C::F>>>::two_to_one(&guta_proof_header_hash, &guta_proof_rewards_tree_value);
+        let guta_proof_public_inputs = QHashOut::<C::F>::from_felt_slice(&guta_zk_proof.public_inputs[..4]);
+        println!("guta_proof_public_inputs: {:?}", guta_proof_public_inputs);
+        println!("guta_public_inputs_expected: {:?} ({})", guta_public_inputs_expected, hex::encode(&guta_public_inputs_expected.to_le_bytes()));
+        println!("guta_rewards_tree_value: {:?} ({})", guta_proof_rewards_tree_value, hex::encode(&guta_proof_rewards_tree_value.to_le_bytes()));
+
+        let expected_public_inputs_hash_no_rewards = witness.get_public_inputs_hash_no_rewards_tag::<C::Hasher>();
+        println!("expected_public_inputs_hash_no_rewards: {:?} ({})", expected_public_inputs_hash_no_rewards, hex::encode(&expected_public_inputs_hash_no_rewards.to_le_bytes()));
+        let metadata_public_inputs_hash_no_rewards = input.base.job.metadata.expected_public_inputs_hash;
+        println!("metadata_public_inputs_hash_no_rewards: {:?} ({})", metadata_public_inputs_hash_no_rewards, hex::encode(&metadata_public_inputs_hash_no_rewards.to_le_bytes()));
+
+        let expected_rewards_value = hash_tag_tree_node_three::<QHashOut<C::F>, C::Hasher>(
+            &guta_proof_rewards_tree_value,
+            &register_users_proof_rewards_tree_value,
+            &deploy_contracts_proof_rewards_tree_value,
+            &worker_reward_tag,
+        );
+        println!("expected_rewards_value: {:?} ({})", expected_rewards_value, hex::encode(&expected_rewards_value.to_le_bytes()));
+        let expected_public_inputs_1 = C::Hasher::two_to_one(&expected_public_inputs_hash_no_rewards, &expected_rewards_value);
+
+        println!("expected_public_inputs_1: {:?} ({})", expected_public_inputs_1, hex::encode(&expected_public_inputs_1.to_le_bytes()));
+        
+
+        let metadata_with_expected_rewards = input.base.job.metadata.compute_reward_tagged_expected_public_inputs::<C::Hasher>(
+            worker_reward_tag,
+            &[
+                guta_proof_rewards_tree_value,
+                register_users_proof_rewards_tree_value,
+                deploy_contracts_proof_rewards_tree_value,
+            ],
+        )?;
+        println!("metadata_with_expected_rewards: {:?} ({})", metadata_with_expected_rewards, hex::encode(&metadata_with_expected_rewards.to_le_bytes()));
+
+        let proof = self.prove_base(
             worker_reward_tag,
             &register_users_state_transition,
             &user_registration_zk_proof,
@@ -300,6 +337,47 @@ where
             &guta_zk_proof,
             &guta_zk_proof_verifier_data,
             guta_proof_rewards_tree_value,
-        )
+        )?;
+        let got_public_inputs = QHashOut::<C::F>::from_felt_slice(&proof.public_inputs[0..4]);
+        println!("got_public_inputs: {:?} ({})", got_public_inputs, hex::encode(&got_public_inputs.to_le_bytes()));
+        Ok(proof)
+    }
+
+    fn compute_verify_witness_with_raw_proofs_and_ref_library(
+        &self,
+        library: &L,
+        input: PsyWorkerGetProvingWorkWithChildProofsAPIResponse<QHashOut<C::F>, QProvingJobDataID>,
+        worker_reward_tag: QHashOut<C::F>,
+    ) -> anyhow::Result<Vec<C::F>> {
+        input.ensure_expected_child_proof_count_with_tags(3)?;
+        let witness = QCAggUserRegistartionDeployContractsGUTAInput::<C::F, QHashOut<C::F>>::psy_ser_from_slice(&input.base.witness)?;
+
+        let guta_zk_proof = deserialize_plonky2_proof::<C, D>(&input.input_proofs[0])?;
+        let guta_zk_proof_verifier_data = library.get_verifier_data(input.get_child_proof_circuit_type(0)?)?;
+        let guta_inclusion_proof = library.get_group_inclusion_proof(ProvingJobCircuitType::GUTATwoGUTA, input.get_child_proof_circuit_type(0)?)?;
+        let guta_proof_rewards_tree_value = input.base.child_proof_tag_values[0];
+
+        let user_registration_zk_proof = deserialize_plonky2_proof::<C, D>(&input.input_proofs[1])?;
+        let user_registration_zk_proof_verifier_data = library.get_verifier_data(input.get_child_proof_circuit_type(1)?)?;
+        let register_users_proof_rewards_tree_value = input.base.child_proof_tag_values[1];
+
+        let deploy_contracts_zk_proof = deserialize_plonky2_proof::<C, D>(&input.input_proofs[2])?;
+        let deploy_contracts_zk_proof_verifier_data = library.get_verifier_data(input.get_child_proof_circuit_type(2)?)?;
+        let deploy_contracts_proof_rewards_tree_value = input.base.child_proof_tag_values[2];
+
+        let (register_users_state_transition, register_users_total_proofs_generated) =
+            witness.register_users_state_transition.get_agg_state_transition_and_f::<C::F>();
+        let (deploy_contracts_state_transition, deploy_contracts_total_proofs_generated) =
+            witness.deploy_contracts_state_transition.get_agg_state_transition_and_f::<C::F>();
+
+        let public_inputs_hash_no_rewards_tag = input.base.job.metadata.compute_reward_tagged_expected_public_inputs::<C::Hasher>(
+            worker_reward_tag,
+            &[
+                guta_proof_rewards_tree_value,
+                register_users_proof_rewards_tree_value,
+                deploy_contracts_proof_rewards_tree_value,
+            ],
+        )?;
+        Ok(public_inputs_hash_no_rewards_tag.0.elements.to_vec())
     }
 }

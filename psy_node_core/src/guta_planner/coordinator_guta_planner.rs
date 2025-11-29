@@ -393,6 +393,9 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> CoordinatorGUTAPlanner<F, Ha
                         global_state_roots: most_recent_checkpoint_global_state_roots,
                     },
                 };
+                if no_change_input.checkpoint_tree_proof.value == Hash::get_zero_value() {
+                    anyhow::bail!("Cannot create GUTA no change proof when there is no checkpoint tree proof");
+                }
                 let expected_public_inputs_hash = no_change_input.get_public_inputs_hash_no_rewards_tag::<F, Hasher>(guta_circuit_whitelist);
 
                 let witness_bytes = no_change_input.psy_ser_into_bytes_vec()?;

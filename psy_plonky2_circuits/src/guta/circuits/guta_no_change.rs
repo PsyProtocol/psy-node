@@ -1,19 +1,17 @@
 use async_trait::async_trait;
-use parth_core::{crypto::hash::{merkle_proof::MerkleProofCore, traits::MerkleZeroHasher}, felt::QFelt64, pgoldilocks::QHashOut, protocol::core_types::Q256BitHash};
+use parth_core::{crypto::hash::{merkle_proof::MerkleProofCore, tag_tree::hash_tag_tree_node, traits::{FieldQHasher, MerkleZeroHasher, QFieldHashable}}, felt::{QFelt64, ZeroableFelt}, pgoldilocks::QHashOut, protocol::core_types::{Q256BitHash, QFHashBase}};
 use plonky2::{
-    hash::hash_types::{HashOut, HashOutTarget},
-    iop::witness::{PartialWitness, WitnessWrite},
-    plonk::{
+    field::types::Field, hash::hash_types::{HashOut, HashOutTarget}, iop::witness::{PartialWitness, WitnessWrite}, plonk::{
         circuit_builder::CircuitBuilder,
         circuit_data::{CircuitConfig, CircuitData, CommonCircuitData, VerifierOnlyCircuitData},
         config::{AlgebraicHasher, GenericConfig},
         proof::ProofWithPublicInputs,
-    },
+    }
 };
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
-use psy_data::{proof_input::guta::GUTANoChangeFullInput, v1::qdata::checkpoint::PQEDCheckpointLeafCompactWithStateRoots, worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse};
+use psy_data::{guta::{header::GlobalUserTreeAggregatorHeader, stats::GUTAStats, sub_tree_transition::SubTreeNodeStateTransition}, proof_input::guta::GUTANoChangeFullInput, v1::qdata::checkpoint::PQEDCheckpointLeafCompactWithStateRoots, worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse};
 use psy_plonky2_basic_helpers::{
-    builder::pad_circuit::{pad_circuit_degree, CircuitBuilderQEDCommonGates}, verifier::circuit_library::CircuitInfoLibrary,
+    builder::{hash::core::CircuitBuilderHashCore, pad_circuit::{CircuitBuilderQEDCommonGates, pad_circuit_degree}}, verifier::circuit_library::CircuitInfoLibrary,
    
 };
 use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
@@ -53,8 +51,7 @@ where
 
         let worker_rewards_tree_tag = builder.add_virtual_hash();
         let public_inputs_hash = no_change_gadget
-            .new_guta_header
-            .get_public_inputs_hash_no_children::<C::Hasher, C::F, D>(&mut builder, worker_rewards_tree_tag);
+            .new_guta_header.get_public_inputs_hash_no_children::<C::Hasher, C::F, D>(&mut builder, worker_rewards_tree_tag);
 
         builder.register_public_inputs(&public_inputs_hash.elements);
         builder.add_qed_type_c_common_gates();
@@ -94,7 +91,13 @@ where
             checkpoint_leaf,
         )?;
 
-        self.circuit_data.prove(pw)
+        let proof = self.circuit_data.prove(pw)?;
+        println!(
+            "GUTANoChangeCircuit generated public inputs hash: {}",
+            hex::encode(&QHashOut::from_felt_slice(&proof.public_inputs).to_le_bytes())
+        );
+        println!("GUTANoChangeCircuit proof generated with public inputs {:?}", proof.public_inputs);
+        Ok(proof)
     }
 }
 
@@ -166,7 +169,7 @@ impl<
     > QStandardCircuitProvableWithRawProofsAndRefLibrary<L, C, D>
     for GUTANoChangeCircuit<C, D>
 where
-     C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>>, QHashOut<C::F>: Q256BitHash, C::F: QFelt64,
+     C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + FieldQHasher<C::F, QHashOut<C::F>>, QHashOut<C::F>: Q256BitHash + QFHashBase<C::F>, C::F: QFelt64,
 {
 
     fn prove_with_raw_proofs_and_ref_library(
@@ -182,7 +185,41 @@ where
 
         let guta_whitelist_root: QHashOut<C::F> =
             library.get_group_inclusion_proof(ProvingJobCircuitType::GUTATwoGUTA, ProvingJobCircuitType::GUTATwoGUTA)?.root;
+        let expected_public_inputs_hash = witness.get_public_inputs_hash_no_rewards_tag::<C::F, C::Hasher>(guta_whitelist_root);
+        println!(
+            "GUTANoChangeCircuit expected public inputs hash: {:?}",
+            hex::encode(&expected_public_inputs_hash.into_owned_32bytes())
+        );
 
+        let guta_header = GlobalUserTreeAggregatorHeader::<C::F, QHashOut<C::F>> {
+            guta_circuit_whitelist: guta_whitelist_root,
+            checkpoint_tree_root: witness.checkpoint_tree_proof.root,
+            state_transition: SubTreeNodeStateTransition{
+                old_node_value: witness.checkpoint_leaf.global_state_roots.user_tree_root,
+                new_node_value: witness.checkpoint_leaf.global_state_roots.user_tree_root,
+                node_index: C::F::ZERO_VALUE,
+                node_level: C::F::ZERO_VALUE,
+            },
+            stats: GUTAStats {
+                fees_collected: C::F::ZERO_VALUE,
+                user_ops_processed: C::F::ZERO_VALUE,
+                total_transactions: C::F::ZERO_VALUE,
+                slots_modified: C::F::ZERO_VALUE,
+            },
+            total_aggregation_proofs_generated: C::F::from_noncanonical_u64(1),
+        };
+        println!("guta_header: {:#?}", guta_header);
+
+        
+        let expected_guta_header_hash = guta_header.qfhash::<C::Hasher>();
+        println!("expected_guta_header_hash: {:?} ({})", expected_guta_header_hash, hex::encode(&expected_guta_header_hash.to_le_bytes()));
+
+        let reward_tree_value = hash_tag_tree_node::<QHashOut<C::F>, C::Hasher>(&QHashOut::ZERO, &QHashOut::ZERO, &worker_reward_tag);
+
+        println!("worker_reward_tag: {:?} ({})", worker_reward_tag, hex::encode(&worker_reward_tag.to_le_bytes()));
+        println!("reward_tree_value: {:?} ({})", reward_tree_value, hex::encode(&reward_tree_value.to_le_bytes()));
+        let expected_final_public_inputs_hash = C::Hasher::q_two_to_one(expected_public_inputs_hash, reward_tree_value);
+        println!("expected_final_public_inputs_hash: {:?} ({})", expected_final_public_inputs_hash, hex::encode(&expected_final_public_inputs_hash.to_le_bytes()));
 
         self.prove_base(
             worker_reward_tag,

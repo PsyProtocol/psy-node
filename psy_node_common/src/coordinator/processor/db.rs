@@ -2,15 +2,10 @@ use std::sync::{atomic::AtomicBool, Arc};
 
 use parth_common::memory_stores::{mem_tree_recorder::SimpleMemoryMerkleRecorderStore, traits::PsyMemoryMerkleStoreImm};
 use parth_core::{
-    crypto::hash::{
+    QCoreProcCheckpointUniqueId, crypto::hash::{
         merkle_proof::{DeltaMerkleProofCore, MerkleProofCore},
-        traits::{QFieldHashable, ZeroableHash},
-    },
-    data::queue::queue_key::{QPBaseQueueType, QPStandardUniqueIdQueueKey},
-    generic_traits::psy_debug_printable::PsyDebugPrintable,
-    node::realm_identifier::QRealmIdentifier,
-    protocol::core_types::QNetworkTypesConfig,
-    QCoreProcCheckpointUniqueId,
+        traits::{MerkleZeroHasher, QFieldHashable, ZeroableHash},
+    }, data::queue::queue_key::{QPBaseQueueType, QPStandardUniqueIdQueueKey}, generic_traits::psy_debug_printable::PsyDebugPrintable, node::realm_identifier::QRealmIdentifier, protocol::core_types::{Q256BitHash, QNetworkTypesConfig}
 };
 use psy_core::{
     constants::stale_checkpoint::STALE_CHECKPOINT_AGE_REALM_TO_COORDINATOR_PROOF,
@@ -40,7 +35,7 @@ use psy_node_core::{
 };
 
 use crate::{
-    backup::{checkpoint_tree::{CheckpointTreeBackupManager, create_new_checkpoint_backup_manager_from_file_path}, coordinator::generate_coordinator_output_from_backups},
+    backup::{checkpoint_tree::{CheckpointTreeBackupManager}, coordinator::generate_coordinator_output_from_backups},
     constants::queue::{
         PQ_COORDINATOR_DEPLOY_CONTRACT_QUEUE_TOPIC_ID, PQ_COORDINATOR_REGISTER_USER_PUBLIC_KEY_QUEUE_TOPIC_ID,
         PQ_COORDINATOR_SUBMIT_REALM_GUTA_UPDATE_QUEUE_TOPIC_ID,
@@ -57,6 +52,31 @@ pub enum DatabaseCheckState {
     NeedsRecovery = 1,
     Ready = 2,
 }
+
+pub async fn create_new_checkpoint_backup_manager_from_file_path<
+    Hasher: MerkleZeroHasher<Hash> + 'static + Send + Sync,
+    Hash: Eq + Copy + PartialEq + Default + std::hash::Hash + Q256BitHash,
+    CheckpointTreeStore: PsyNodeCheckpointTreeDatabaseReader<Hash>,
+    FileSystem: TokioLikeFileSystem,
+>(
+    file_system: Arc<FileSystem>,
+    max_checkpoints_to_keep: u64,
+    checkpoint_tree_height: u8,
+    checkpoint_tree_store: &CheckpointTreeStore,
+    backup_file_path: &str,
+    allow_create_file: bool,
+) -> anyhow::Result<CheckpointTreeBackupManager<Hasher, Hash, FileSystem>> {
+    CheckpointTreeBackupManager::<Hasher, Hash, FileSystem>::new_from_file_path(
+        file_system,
+        max_checkpoints_to_keep,
+        checkpoint_tree_height,
+        checkpoint_tree_store,
+        backup_file_path,
+        allow_create_file,
+    )
+    .await
+}
+
 pub struct PsyCoordinatorDatabaseProcessor<
     N: QNetworkTypesConfig,
     S: PsyCoordinatorProcessorStore<N::F, N::QHash> + Send + Sync,
@@ -130,7 +150,7 @@ impl<
         TempDatabase,
         ProofStore,
         FileSystem,
-    >
+    > where N::HasherBase: 'static + Send + Sync
 {
     pub async fn get_next_checkpoint_id(&self) -> anyhow::Result<u64> {
         let latest_checkpoint_id = self.db.get_latest_checkpoint_id().await?;
@@ -384,7 +404,9 @@ impl<
 
         Ok(())
     }
-    pub fn get_proof_worker_queue_key(&self) -> CoordinatorProvingWorkQueueKey<N::QHash, N::JobId> {
+    pub fn get_proof_worker_queue_key(&self) -> CoordinatorProvingWorkQueueKey<N::QHash, N::JobId> { 
+        println!("get_proof_worker_queue_key: self.db.ids.proc_checkpoint_unique_id: {:?}", self.ids.proc_checkpoint_unique_id);
+       
         CoordinatorProvingWorkQueueKey {
             realm_id: self.ids.realm_id_u64,
             realm_sub_id: self.ids.realm_sub_id_u64,
@@ -639,7 +661,7 @@ impl<
         TempDatabase,
         ProofStore,
         FileSystem,
-    >
+    > where N::HasherBase: 'static + Send + Sync
 {
     pub async fn get_reward_tree_root(&self, checkpoint_id: u64, unique_pending_id: u64) -> anyhow::Result<N::QHash> {
         let temp_store_reward_tree_root: Option<N::QHash> = self
@@ -797,6 +819,17 @@ Checkpoint Root Hash: {}
             user_registration_tree,
         )
         .await?;
+        self.set_new_unique_ids().await?;
+
+        self.shared_status.update_status(
+            self.ids.gathering_unique_pending_id,
+            self.ids.checkpoint_id,
+            self.last_committed.checkpoint_leaf.clone(),
+            self.last_committed.checkpoint_state_roots.clone(),
+            self.last_committed.l2_state.clone(),
+            false,
+        )?;
+
         tracing::info!(
             "[COORDINATOR] Started with checkpoint ID: {}, unique pending ID: {}",
             self.ids.checkpoint_id,
