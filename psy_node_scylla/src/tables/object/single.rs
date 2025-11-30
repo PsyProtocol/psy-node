@@ -1,35 +1,43 @@
-use futures::{future::join_all, stream, StreamExt, TryStreamExt};
-
-use psy_serialize::PsySerializeCanonicalAsyncSafe;
-use rayon::slice::{ParallelSlice};
-use rayon::iter::ParallelIterator;
 use std::sync::Arc;
+
 use anyhow::Context;
 use async_trait::async_trait;
-use parth_core::data::db::{row::{QDatabaseSingleIdTableRow, QDatabaseSingleIdTableRowCreatable, QDatabaseSingleIdTableRowLike, QDatabaseSingleIdTableRowNoCheckpointId, QDatabaseSingleIdTableRowNoCheckpointIdLike}, table::QDatabaseTableRoutingKey};
-use scylla::{client::session::Session, statement::{batch::Batch, prepared::PreparedStatement, Statement}};
+use futures::{future::join_all, stream, StreamExt, TryStreamExt};
+use parth_core::data::db::{
+    row::{
+        QDatabaseSingleIdTableRow, QDatabaseSingleIdTableRowCreatable, QDatabaseSingleIdTableRowLike, QDatabaseSingleIdTableRowNoCheckpointId,
+        QDatabaseSingleIdTableRowNoCheckpointIdLike,
+    },
+    table::QDatabaseTableRoutingKey,
+};
+use psy_serialize::PsySerializeCanonicalAsyncSafe;
+use rayon::{iter::ParallelIterator, slice::ParallelSlice};
+use scylla::{
+    client::session::Session,
+    statement::{batch::Batch, prepared::PreparedStatement, Statement},
+};
 
-use crate::table_creator::create_table_if_not_exists;
-use crate::utils::calc_best_batch_size;
-use crate::{constants::{INSERT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE, SELECT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE}, tables::traits::ScyllaStandardPreparedTableStatements, utils::{convert_checkpoint_id_to_i64, convert_i64_to_checkpoint_id, generate_batch_prepared_statement, i64_to_u64_exact, u64_to_i64_exact}};
-
-
-
-
-
+use crate::{
+    constants::{INSERT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE, SELECT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE},
+    table_creator::create_table_if_not_exists,
+    tables::traits::ScyllaStandardPreparedTableStatements,
+    utils::{
+        calc_best_batch_size, convert_checkpoint_id_to_i64, convert_i64_to_checkpoint_id, generate_batch_prepared_statement, i64_to_u64_exact,
+        u64_to_i64_exact,
+    },
+};
 
 #[derive(Clone)]
 pub struct ScyllaGenericObjectSingleIdTablePreparedStatements {
     pub insert_1_statement: Statement,
     pub insert_1_prepared: Arc<PreparedStatement>,
-    
+
     pub select_value_1_statement: Statement,
     pub select_value_1_prepared: Arc<PreparedStatement>,
 
     pub select_value_checkpoint_id_obj_id_1_statement: Statement,
     pub select_value_checkpoint_id_obj_id_1_prepared: Arc<PreparedStatement>,
 
-    
     pub insert_batch_serialized_256_prepared: Arc<Batch>,
     pub insert_batch_serialized_128_prepared: Arc<Batch>,
     pub insert_batch_serialized_64_prepared: Arc<Batch>,
@@ -43,24 +51,37 @@ pub struct ScyllaGenericObjectSingleIdTablePreparedStatements {
 }
 
 impl ScyllaGenericObjectSingleIdTablePreparedStatements {
-    pub async fn new_from_session(session: Arc<Session>, keyspace: &str, table_name: &str, table_key: QDatabaseTableRoutingKey) -> anyhow::Result<Self> {
-        let insert_1_statement = Statement::new(format!("INSERT INTO {}.{} (obj_id, checkpoint_id, value) VALUES (?, ?, ?)", keyspace, table_name));
+    pub async fn new_from_session(
+        session: Arc<Session>,
+        keyspace: &str,
+        table_name: &str,
+        table_key: QDatabaseTableRoutingKey,
+    ) -> anyhow::Result<Self> {
+        let insert_1_statement = Statement::new(format!(
+            "INSERT INTO {}.{} (obj_id, checkpoint_id, value) VALUES (?, ?, ?)",
+            keyspace, table_name
+        ));
         let insert_1_prepared = session.prepare(insert_1_statement.clone()).await?;
-        
-        let select_value_1_statement = Statement::new(format!("SELECT value FROM {}.{} WHERE obj_id = ? AND checkpoint_id <= ? LIMIT 1", keyspace, table_name));
+
+        let select_value_1_statement = Statement::new(format!(
+            "SELECT value FROM {}.{} WHERE obj_id = ? AND checkpoint_id <= ? LIMIT 1",
+            keyspace, table_name
+        ));
         let select_value_1_prepared = session.prepare(select_value_1_statement.clone()).await?;
-        
-        let select_value_checkpoint_id_obj_id_1_statement = Statement::new(format!("SELECT obj_id, checkpoint_id, value FROM {}.{} WHERE obj_id = ? AND checkpoint_id <= ? LIMIT 1", keyspace, table_name));
+
+        let select_value_checkpoint_id_obj_id_1_statement = Statement::new(format!(
+            "SELECT obj_id, checkpoint_id, value FROM {}.{} WHERE obj_id = ? AND checkpoint_id <= ? LIMIT 1",
+            keyspace, table_name
+        ));
         let select_value_checkpoint_id_obj_id_1_prepared = session.prepare(select_value_checkpoint_id_obj_id_1_statement.clone()).await?;
 
         let select_all_statement = Statement::new(format!("SELECT obj_id, checkpoint_id, value FROM {}.{}", keyspace, table_name));
         let select_all_prepared = session.prepare(select_all_statement.clone()).await?;
 
         Ok(Self {
-
-            insert_batch_serialized_256_prepared: Arc::new(generate_batch_prepared_statement(&session, &insert_1_prepared, 512).await?),
+            insert_batch_serialized_256_prepared: Arc::new(generate_batch_prepared_statement(&session, &insert_1_prepared, 256).await?),
             insert_batch_serialized_128_prepared: Arc::new(generate_batch_prepared_statement(&session, &insert_1_prepared, 128).await?),
-            insert_batch_serialized_64_prepared: Arc::new(generate_batch_prepared_statement(&session, &insert_1_prepared, 64).await?),  
+            insert_batch_serialized_64_prepared: Arc::new(generate_batch_prepared_statement(&session, &insert_1_prepared, 64).await?),
             insert_1_statement: insert_1_statement,
             insert_1_prepared: Arc::new(insert_1_prepared),
             select_value_1_statement: select_value_1_statement,
@@ -76,43 +97,54 @@ impl ScyllaGenericObjectSingleIdTablePreparedStatements {
     }
     pub async fn create_table(session: Arc<Session>, keyspace: &str, table_name: &str, _table_key: QDatabaseTableRoutingKey) -> anyhow::Result<()> {
         create_table_if_not_exists(
-                &session,
-                keyspace,
-                table_name,
-                &format!("CREATE TABLE IF NOT EXISTS {}.{} (
+            &session,
+            keyspace,
+            table_name,
+            &format!(
+                "CREATE TABLE IF NOT EXISTS {}.{} (
                     obj_id BIGINT,
                     checkpoint_id BIGINT,
                     value BLOB,
                     PRIMARY KEY ((obj_id), checkpoint_id)
-                ) WITH CLUSTERING ORDER BY (checkpoint_id DESC)", keyspace, table_name),
-            ).await?;
+                ) WITH CLUSTERING ORDER BY (checkpoint_id DESC)",
+                keyspace, table_name
+            ),
+        )
+        .await?;
         Ok(())
     }
-    pub async fn new_create_from_session(session: Arc<Session>, keyspace: &str, table_name: &str, table_key: QDatabaseTableRoutingKey) -> anyhow::Result<Self> {
+    pub async fn new_create_from_session(
+        session: Arc<Session>,
+        keyspace: &str,
+        table_name: &str,
+        table_key: QDatabaseTableRoutingKey,
+    ) -> anyhow::Result<Self> {
         Self::create_table(session.clone(), keyspace, table_name, table_key).await?;
         Self::new_from_session(session, keyspace, table_name, table_key).await
     }
 }
 
-
-
 #[async_trait]
 impl ScyllaStandardPreparedTableStatements for ScyllaGenericObjectSingleIdTablePreparedStatements {
-    async fn create_table_standard(session: Arc<Session>, keyspace: &str, table_name: &str, table_key: QDatabaseTableRoutingKey) -> anyhow::Result<Self> {
+    async fn create_table_standard(
+        session: Arc<Session>,
+        keyspace: &str,
+        table_name: &str,
+        table_key: QDatabaseTableRoutingKey,
+    ) -> anyhow::Result<Self> {
         Self::new_create_from_session(session, keyspace, table_name, table_key).await
     }
 }
 
-
 impl ScyllaGenericObjectSingleIdTablePreparedStatements {
-async fn insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_start_internal(
+    async fn insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_start_internal(
         &self,
-        session: &Session, 
+        session: &Session,
         object_size_without_id: usize,
         checkpoint_id: u64,
         data: &[u8],
         batch_size: usize,
-    ) -> anyhow::Result<()>{
+    ) -> anyhow::Result<()> {
         let object_size_with_id = object_size_without_id + 8;
 
         let checkpoint_i64 = convert_checkpoint_id_to_i64(checkpoint_id);
@@ -126,7 +158,6 @@ async fn insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_st
         }
 
         const CONCURRENCY_LIMIT: usize = 64; // Tuned for typical Scylla clusters
-
 
         // Parallel deserialization using rayon
         let values: Vec<(i64, i64, &[u8])> = data
@@ -173,20 +204,19 @@ async fn insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_st
 
         Ok(())
     }
-    
+
     async fn insert_many_single_checkpointed_objects_at_checkpoint_ffs_with_id_at_index_internal(
         &self,
-        session: &Session, 
+        session: &Session,
         object_size: usize,
         object_id_location: usize,
         checkpoint_id: u64,
         data: &[u8],
         batch_size: usize,
-    ) -> anyhow::Result<()>{
+    ) -> anyhow::Result<()> {
         if object_id_location + 8 > object_size {
             anyhow::bail!("Object ID location is out of bounds");
         }
-
 
         let checkpoint_i64 = convert_checkpoint_id_to_i64(checkpoint_id);
         if data.len() < object_size || data.len() % object_size != 0 {
@@ -200,13 +230,12 @@ async fn insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_st
 
         const CONCURRENCY_LIMIT: usize = 64; // Tuned for typical Scylla clusters
 
-
         // Parallel deserialization using rayon
         let values: Vec<(i64, i64, &[u8])> = data
             .par_chunks(object_size)
             .map(|slice| {
                 (
-                    i64::from_le_bytes(slice[object_id_location..object_id_location+8].try_into().unwrap()),
+                    i64::from_le_bytes(slice[object_id_location..object_id_location + 8].try_into().unwrap()),
                     checkpoint_i64,
                     &slice[..],
                 )
@@ -246,36 +275,43 @@ async fn insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_st
 
         Ok(())
     }
-    // first 8 bytes are the object_id, last_8 bytes 
+    // first 8 bytes are the object_id, last_8 bytes
     pub async fn insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_start<'a>(
         &self,
-        session: &Session, 
+        session: &Session,
         object_size_without_id: usize,
         checkpoint_id: u64,
         data: &[u8],
-    ) -> anyhow::Result<()>{
-        if data.len() % (object_size_without_id+8) != 0 {
+    ) -> anyhow::Result<()> {
+        if data.len() % (object_size_without_id + 8) != 0 {
             anyhow::bail!("Data length is not a multiple of object size with id");
         }
         let num_nodes = data.len() / (object_size_without_id + 8);
         if num_nodes == 0 {
             return Ok(());
         }
-        
+
         let batch_size = calc_best_batch_size(num_nodes, &[256, 128, 64]);
-        self.insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_start_internal(session, object_size_without_id, checkpoint_id, data, batch_size).await
-        
+        self.insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_start_internal(
+            session,
+            object_size_without_id,
+            checkpoint_id,
+            data,
+            batch_size,
+        )
+        .await
     }
 
-    // for user leafs and similar, where we want to insert many objects at a checkpoint, but the id is at the end of the row
+    // for user leafs and similar, where we want to insert many objects at a
+    // checkpoint, but the id is at the end of the row
     pub async fn insert_many_single_checkpointed_objects_at_checkpoint_ffs_with_id_at_index(
         &self,
-        session: &Session, 
+        session: &Session,
         object_size: usize,
         object_id_location: usize,
         checkpoint_id: u64,
         rows: &[u8],
-    ) -> anyhow::Result<()>{
+    ) -> anyhow::Result<()> {
         if rows.len() % object_size != 0 {
             anyhow::bail!("Data length is not a multiple of object size with id");
         }
@@ -283,19 +319,30 @@ async fn insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_st
         if num_nodes == 0 {
             return Ok(());
         }
-        
+
         let batch_size = calc_best_batch_size(num_nodes, &[256, 128, 64]);
-        self.insert_many_single_checkpointed_objects_at_checkpoint_ffs_with_id_at_index_internal(session, object_size, object_id_location, checkpoint_id, rows, batch_size).await
-
-
+        self.insert_many_single_checkpointed_objects_at_checkpoint_ffs_with_id_at_index_internal(
+            session,
+            object_size,
+            object_id_location,
+            checkpoint_id,
+            rows,
+            batch_size,
+        )
+        .await
     }
     pub async fn select_one_single_checkpointed_object_value<V: PsySerializeCanonicalAsyncSafe>(
-        &self, 
-        session: &Session, 
-        obj_id: u64, 
-        max_checkpoint_id: u64
+        &self,
+        session: &Session,
+        obj_id: u64,
+        max_checkpoint_id: u64,
     ) -> anyhow::Result<Option<V>> {
-        let res = session.execute_unpaged(&self.select_value_1_prepared, (u64_to_i64_exact(obj_id), convert_checkpoint_id_to_i64(max_checkpoint_id))).await?;
+        let res = session
+            .execute_unpaged(
+                &self.select_value_1_prepared,
+                (u64_to_i64_exact(obj_id), convert_checkpoint_id_to_i64(max_checkpoint_id)),
+            )
+            .await?;
         let rows = res.into_rows_result()?;
         match rows.maybe_first_row::<(Vec<u8>,)>()? {
             Some(row) => Ok(Some(V::psy_ser_from_owned_bytes_vec(row.0)?)),
@@ -303,16 +350,20 @@ async fn insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_st
         }
     }
     pub async fn select_one_single_checkpointed_object_value_and_ids<V: PsySerializeCanonicalAsyncSafe>(
-        &self, 
-        session: &Session, 
-        obj_id: u64, 
-        max_checkpoint_id: u64
+        &self,
+        session: &Session,
+        obj_id: u64,
+        max_checkpoint_id: u64,
     ) -> anyhow::Result<Option<QDatabaseSingleIdTableRow<V>>> {
-        let res = session.execute_unpaged(&self.select_value_checkpoint_id_obj_id_1_prepared, (u64_to_i64_exact(obj_id), convert_checkpoint_id_to_i64(max_checkpoint_id))).await?;
+        let res = session
+            .execute_unpaged(
+                &self.select_value_checkpoint_id_obj_id_1_prepared,
+                (u64_to_i64_exact(obj_id), convert_checkpoint_id_to_i64(max_checkpoint_id)),
+            )
+            .await?;
         let rows = res.into_rows_result()?;
         match rows.maybe_first_row::<(i64, i64, Vec<u8>)>()? {
-
-            Some(row) => Ok(Some(QDatabaseSingleIdTableRow{
+            Some(row) => Ok(Some(QDatabaseSingleIdTableRow {
                 obj_id: i64_to_u64_exact(row.0),
                 checkpoint_id: convert_i64_to_checkpoint_id(row.1),
                 value: V::psy_ser_from_owned_bytes_vec(row.2)?,
@@ -320,31 +371,39 @@ async fn insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_st
             None => Ok(None), // Return zero hash if not found
         }
     }
-    pub async fn select_one_single_checkpointed_object_value_and_ids_t<V: PsySerializeCanonicalAsyncSafe, R: QDatabaseSingleIdTableRowCreatable<V>>(
-        &self, 
-        session: &Session, 
-        obj_id: u64, 
-        max_checkpoint_id: u64
+    pub async fn select_one_single_checkpointed_object_value_and_ids_t<
+        V: PsySerializeCanonicalAsyncSafe,
+        R: QDatabaseSingleIdTableRowCreatable<V>,
+    >(
+        &self,
+        session: &Session,
+        obj_id: u64,
+        max_checkpoint_id: u64,
     ) -> anyhow::Result<Option<R>> {
-        let res = session.execute_unpaged(&self.select_value_checkpoint_id_obj_id_1_prepared, (u64_to_i64_exact(obj_id), convert_checkpoint_id_to_i64(max_checkpoint_id))).await?;
+        let res = session
+            .execute_unpaged(
+                &self.select_value_checkpoint_id_obj_id_1_prepared,
+                (u64_to_i64_exact(obj_id), convert_checkpoint_id_to_i64(max_checkpoint_id)),
+            )
+            .await?;
         let rows = res.into_rows_result()?;
         match rows.maybe_first_row::<(i64, i64, Vec<u8>)>()? {
-            Some(row) => {
-                Ok(Some(R::create_from_single_row(i64_to_u64_exact(row.0), convert_i64_to_checkpoint_id(row.1), V::psy_ser_from_owned_bytes_vec(row.2)?)))
-            },
+            Some(row) => Ok(Some(R::create_from_single_row(
+                i64_to_u64_exact(row.0),
+                convert_i64_to_checkpoint_id(row.1),
+                V::psy_ser_from_owned_bytes_vec(row.2)?,
+            ))),
             None => Ok(None), // Return zero hash if not found
         }
     }
 
-
-    
     pub async fn select_all_single_checkpointed_object<V: PsySerializeCanonicalAsyncSafe>(
-        &self, 
-        session: &Session, 
+        &self,
+        session: &Session,
     ) -> anyhow::Result<Vec<QDatabaseSingleIdTableRow<V>>> {
         let res = session.execute_unpaged(&self.select_all_prepared, ()).await?;
         let rows_result = res.into_rows_result()?;
-        let rows_iter = rows_result.rows::<(i64,i64,Vec<u8>)>()?;
+        let rows_iter = rows_result.rows::<(i64, i64, Vec<u8>)>()?;
         let rows_vec: Vec<_> = rows_iter.collect();
         let mut results = Vec::with_capacity(rows_vec.len());
 
@@ -359,22 +418,26 @@ async fn insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_st
         Ok(results)
     }
 
-
     pub async fn insert_one_single_checkpointed_object<V: PsySerializeCanonicalAsyncSafe>(
-        &self, 
-        session: &Session, 
-        obj_id: u64, 
-        checkpoint_id: u64, 
-        value: &V
+        &self,
+        session: &Session,
+        obj_id: u64,
+        checkpoint_id: u64,
+        value: &V,
     ) -> anyhow::Result<()> {
         let value_bytes = value.psy_ser_to_bytes_vec()?;
-        session.execute_unpaged(&self.insert_1_prepared, (u64_to_i64_exact(obj_id), u64_to_i64_exact(checkpoint_id), value_bytes)).await?;
+        session
+            .execute_unpaged(
+                &self.insert_1_prepared,
+                (u64_to_i64_exact(obj_id), u64_to_i64_exact(checkpoint_id), value_bytes),
+            )
+            .await?;
         Ok(())
     }
     pub async fn insert_many_single_checkpointed_object_rows<V: PsySerializeCanonicalAsyncSafe>(
-        &self, 
-        session: &Session, 
-        rows: &[QDatabaseSingleIdTableRow<V>]
+        &self,
+        session: &Session,
+        rows: &[QDatabaseSingleIdTableRow<V>],
     ) -> anyhow::Result<()> {
         let mut batch_list: Vec<Batch> = Vec::new();
         //tree_id, tree_sub_id, level, node_index, checkpoint_id, value
@@ -387,13 +450,21 @@ async fn insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_st
             let values: Vec<_> = chunk
                 .iter()
                 .map(|n| {
-                    Ok((u64_to_i64_exact(n.obj_id), convert_checkpoint_id_to_i64(n.checkpoint_id), n.value.psy_ser_to_bytes_vec()?))
+                    Ok((
+                        u64_to_i64_exact(n.obj_id),
+                        convert_checkpoint_id_to_i64(n.checkpoint_id),
+                        n.value.psy_ser_to_bytes_vec()?,
+                    ))
                 })
                 .collect::<anyhow::Result<_>>()?;
             batch_list.push(batch);
             value_list.push(values);
         }
-        let batches: Vec<_> = batch_list.iter().zip(value_list.into_iter()).map(|(batch, values)| session.batch(batch, values)).collect();
+        let batches: Vec<_> = batch_list
+            .iter()
+            .zip(value_list.into_iter())
+            .map(|(batch, values)| session.batch(batch, values))
+            .collect();
         let results = join_all(batches).await;
         for res in results {
             res.context("Batch insert failed")?;
@@ -402,9 +473,9 @@ async fn insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_st
     }
 
     pub async fn insert_many_single_checkpointed_object_rows_t<V: PsySerializeCanonicalAsyncSafe, R: QDatabaseSingleIdTableRowLike<V>>(
-        &self, 
-        session: &Session, 
-        rows: &[R]
+        &self,
+        session: &Session,
+        rows: &[R],
     ) -> anyhow::Result<()> {
         let mut batch_list: Vec<Batch> = Vec::new();
         //tree_id, tree_sub_id, level, node_index, checkpoint_id, value
@@ -417,13 +488,21 @@ async fn insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_st
             let values: Vec<_> = chunk
                 .iter()
                 .map(|n| {
-                    Ok((u64_to_i64_exact(n.get_row_obj_id()), convert_checkpoint_id_to_i64(n.get_row_checkpoint_id()), n.get_row_value_ref().psy_ser_to_bytes_vec()?))
+                    Ok((
+                        u64_to_i64_exact(n.get_row_obj_id()),
+                        convert_checkpoint_id_to_i64(n.get_row_checkpoint_id()),
+                        n.get_row_value_ref().psy_ser_to_bytes_vec()?,
+                    ))
                 })
                 .collect::<anyhow::Result<_>>()?;
             batch_list.push(batch);
             value_list.push(values);
         }
-        let batches: Vec<_> = batch_list.iter().zip(value_list.into_iter()).map(|(batch, values)| session.batch(batch, values)).collect();
+        let batches: Vec<_> = batch_list
+            .iter()
+            .zip(value_list.into_iter())
+            .map(|(batch, values)| session.batch(batch, values))
+            .collect();
         let results = join_all(batches).await;
         for res in results {
             res.context("Batch insert failed")?;
@@ -431,10 +510,10 @@ async fn insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_st
         Ok(())
     }
     pub async fn insert_many_single_checkpointed_objects_at_checkpoint<V: PsySerializeCanonicalAsyncSafe>(
-        &self, 
-        session: &Session, 
+        &self,
+        session: &Session,
         checkpoint_id: u64,
-        rows: &[QDatabaseSingleIdTableRowNoCheckpointId<V>]
+        rows: &[QDatabaseSingleIdTableRowNoCheckpointId<V>],
     ) -> anyhow::Result<()> {
         let mut batch_list: Vec<Batch> = Vec::new();
         //tree_id, tree_sub_id, level, node_index, checkpoint_id, value
@@ -447,25 +526,71 @@ async fn insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_st
             let values: Vec<_> = chunk
                 .iter()
                 .map(|n| {
-                    Ok((u64_to_i64_exact(n.obj_id), convert_checkpoint_id_to_i64(checkpoint_id), n.value.psy_ser_to_bytes_vec()?))
+                    Ok((
+                        u64_to_i64_exact(n.obj_id),
+                        convert_checkpoint_id_to_i64(checkpoint_id),
+                        n.value.psy_ser_to_bytes_vec()?,
+                    ))
                 })
                 .collect::<anyhow::Result<_>>()?;
             batch_list.push(batch);
             value_list.push(values);
         }
-        let batches: Vec<_> = batch_list.iter().zip(value_list.into_iter()).map(|(batch, values)| session.batch(batch, values)).collect();
+        let batches: Vec<_> = batch_list
+            .iter()
+            .zip(value_list.into_iter())
+            .map(|(batch, values)| session.batch(batch, values))
+            .collect();
         let results = join_all(batches).await;
         for res in results {
             res.context("Batch insert failed")?;
         }
         Ok(())
     }
-    pub async fn insert_many_single_checkpointed_objects_at_checkpoint_t<V: PsySerializeCanonicalAsyncSafe, R: QDatabaseSingleIdTableRowNoCheckpointIdLike<V>>(
-        &self, 
-        session: &Session, 
+    pub async fn insert_many_single_checkpointed_objects_at_checkpoint_t_single_insert_chunks<
+        V: PsySerializeCanonicalAsyncSafe,
+        R: QDatabaseSingleIdTableRowNoCheckpointIdLike<V>,
+    >(
+        &self,
+        session: &Session,
         checkpoint_id: u64,
-        rows: &[R]
+        rows: &[R],
     ) -> anyhow::Result<()> {
+        for chunk in rows.chunks(32) {
+            let futures = chunk
+                .iter()
+                .map(|r| self.insert_one_single_checkpointed_object(session, r.get_row_obj_id(), checkpoint_id, r.get_row_value_ref()));
+            let results = join_all(futures).await;
+            for res in results {
+                res?;
+            }
+        }
+        Ok(())
+    }
+    pub async fn insert_many_single_checkpointed_objects_at_checkpoint_t<
+        V: PsySerializeCanonicalAsyncSafe,
+        R: QDatabaseSingleIdTableRowNoCheckpointIdLike<V>,
+    >(
+        &self,
+        session: &Session,
+        checkpoint_id: u64,
+        rows: &[R],
+    ) -> anyhow::Result<()> {
+        if rows.len() == 0 {
+            return Ok(());
+        } else {
+            if V::IS_FIXED_SIZE == true && V::FIXED_SIZE > 1024 && V::FIXED_SIZE != 0 {
+                if V::FIXED_SIZE > (1024 * 256 / INSERT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE) || V::FIXED_SIZE == 0 {
+                    self.insert_many_single_checkpointed_objects_at_checkpoint_t_single_insert_chunks(session, checkpoint_id, rows)
+                        .await?;
+                    return Ok(());
+                }
+            } else {
+                self.insert_many_single_checkpointed_objects_at_checkpoint_t_single_insert_chunks(session, checkpoint_id, rows)
+                    .await?;
+                return Ok(());
+            }
+        }
         let mut batch_list: Vec<Batch> = Vec::new();
         //tree_id, tree_sub_id, level, node_index, checkpoint_id, value
         let mut value_list: Vec<Vec<(i64, i64, Vec<u8>)>> = Vec::new();
@@ -477,13 +602,63 @@ async fn insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_st
             let values: Vec<_> = chunk
                 .iter()
                 .map(|n| {
-                    Ok((u64_to_i64_exact(n.get_row_obj_id()), convert_checkpoint_id_to_i64(checkpoint_id), n.get_row_value_ref().psy_ser_to_bytes_vec()?))
+                    Ok((
+                        u64_to_i64_exact(n.get_row_obj_id()),
+                        convert_checkpoint_id_to_i64(checkpoint_id),
+                        n.get_row_value_ref().psy_ser_to_bytes_vec()?,
+                    ))
                 })
                 .collect::<anyhow::Result<_>>()?;
             batch_list.push(batch);
             value_list.push(values);
         }
-        let batches: Vec<_> = batch_list.iter().zip(value_list.into_iter()).map(|(batch, values)| session.batch(batch, values)).collect();
+        let batches: Vec<_> = batch_list
+            .iter()
+            .zip(value_list.into_iter())
+            .map(|(batch, values)| session.batch(batch, values))
+            .collect();
+        let results = join_all(batches).await;
+        for res in results {
+            res.context("Batch insert failed")?;
+        }
+        Ok(())
+    }
+    pub async fn insert_many_single_checkpointed_objects_at_checkpoint_t_with_batch_size<
+        V: PsySerializeCanonicalAsyncSafe,
+        R: QDatabaseSingleIdTableRowNoCheckpointIdLike<V>,
+    >(
+        &self,
+        session: &Session,
+        checkpoint_id: u64,
+        batch_size: usize,
+        rows: &[R],
+    ) -> anyhow::Result<()> {
+        let mut batch_list: Vec<Batch> = Vec::new();
+        //tree_id, tree_sub_id, level, node_index, checkpoint_id, value
+        let mut value_list: Vec<Vec<(i64, i64, Vec<u8>)>> = Vec::new();
+        for chunk in rows.chunks(batch_size) {
+            let mut batch: Batch = Default::default();
+            for _node in chunk {
+                batch.append_statement(self.insert_1_statement.clone());
+            }
+            let values: Vec<_> = chunk
+                .iter()
+                .map(|n| {
+                    Ok((
+                        u64_to_i64_exact(n.get_row_obj_id()),
+                        convert_checkpoint_id_to_i64(checkpoint_id),
+                        n.get_row_value_ref().psy_ser_to_bytes_vec()?,
+                    ))
+                })
+                .collect::<anyhow::Result<_>>()?;
+            batch_list.push(batch);
+            value_list.push(values);
+        }
+        let batches: Vec<_> = batch_list
+            .iter()
+            .zip(value_list.into_iter())
+            .map(|(batch, values)| session.batch(batch, values))
+            .collect();
         let results = join_all(batches).await;
         for res in results {
             res.context("Batch insert failed")?;
@@ -491,10 +666,10 @@ async fn insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_st
         Ok(())
     }
     pub async fn select_many_single_checkpointed_object_values<V: PsySerializeCanonicalAsyncSafe>(
-        &self, 
-        session: &Session, 
-        obj_ids: &[u64], 
-        max_checkpoint_id: u64
+        &self,
+        session: &Session,
+        obj_ids: &[u64],
+        max_checkpoint_id: u64,
     ) -> anyhow::Result<Vec<Option<V>>> {
         let mut results = Vec::with_capacity(obj_ids.len());
         let max_cp_i64 = convert_checkpoint_id_to_i64(max_checkpoint_id);
@@ -503,7 +678,6 @@ async fn insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_st
             let futures: Vec<_> = chunk
                 .iter()
                 .map(|key| {
-                    
                     let prep = self.select_value_1_prepared.clone();
                     async move {
                         let res = session.execute_unpaged(&prep, (*key, max_cp_i64)).await?;
@@ -524,11 +698,14 @@ async fn insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_st
         }
         Ok(results)
     }
-    pub async fn select_many_single_checkpointed_object_keys_and_values<V: PsySerializeCanonicalAsyncSafe, R: QDatabaseSingleIdTableRowCreatable<V>>(
-        &self, 
-        session: &Session, 
-        obj_ids: &[u64], 
-        max_checkpoint_id: u64
+    pub async fn select_many_single_checkpointed_object_keys_and_values<
+        V: PsySerializeCanonicalAsyncSafe,
+        R: QDatabaseSingleIdTableRowCreatable<V>,
+    >(
+        &self,
+        session: &Session,
+        obj_ids: &[u64],
+        max_checkpoint_id: u64,
     ) -> anyhow::Result<Vec<R>> {
         let mut results = Vec::with_capacity(obj_ids.len());
         let max_cp_i64 = convert_checkpoint_id_to_i64(max_checkpoint_id);
@@ -537,13 +714,16 @@ async fn insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_st
             let futures: Vec<_> = chunk
                 .iter()
                 .map(|key| {
-                    
                     let prep = self.select_value_checkpoint_id_obj_id_1_prepared.clone();
                     async move {
                         let res = session.execute_unpaged(&prep, (*key, max_cp_i64)).await?;
                         let rows = res.into_rows_result()?;
                         if let Some(row) = rows.maybe_first_row::<(i64, i64, Vec<u8>)>()? {
-                            anyhow::Ok(Some(R::create_from_single_row(i64_to_u64_exact(row.0), convert_i64_to_checkpoint_id(row.1), V::psy_ser_from_owned_bytes_vec(row.2)?)))
+                            anyhow::Ok(Some(R::create_from_single_row(
+                                i64_to_u64_exact(row.0),
+                                convert_i64_to_checkpoint_id(row.1),
+                                V::psy_ser_from_owned_bytes_vec(row.2)?,
+                            )))
                         } else {
                             // Assume reverse_level = level for simplicity; adjust if tree height known
                             Ok(None)
@@ -561,5 +741,4 @@ async fn insert_many_single_checkpointed_objects_at_checkpoint_ffs_clip_id_at_st
         }
         Ok(results)
     }
-
 }

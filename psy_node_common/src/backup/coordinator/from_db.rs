@@ -44,6 +44,7 @@ pub async fn load_coordinator_memory_trees_from_db<
             db_reader,
             N::GLOBAL_USER_TREE_HEIGHT,
             checkpoint_id,
+            (1u64<<N::BATCH_USER_REGISTRATION_SUB_TREE_HEIGHT) as usize,
         )
         .await?;
     let global_user_tree=
@@ -60,6 +61,7 @@ pub async fn load_coordinator_memory_trees_from_db<
             db_reader,
             N::GLOBAL_CONTRACT_TREE_HEIGHT,
             checkpoint_id,
+            (1u64<<N::BATCH_DEPLOY_CONTRACT_SUB_TREE_HEIGHT) as usize,
         )
         .await?;
     Ok(CoordinatorMemoryTrees {

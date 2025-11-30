@@ -5,9 +5,9 @@ VALKEY_NAME="valkey-server"
 NATS_NAME="nats-server"
 SCYLLA_NAME="scylla-server"
 
-VALKEY_LOGS="valkey_logs.txt"
-NATS_LOGS="nats_logs.txt"
-SCYLLA_LOGS="scylla_logs.txt"
+VALKEY_LOGS="./logs/valkey_logs.txt"
+NATS_LOGS="./logs/nats_logs.txt"
+SCYLLA_LOGS="./logs/scylla_logs.txt"
 
 docker stop "$VALKEY_NAME" "$NATS_NAME" "$SCYLLA_NAME" 2>/dev/null
 

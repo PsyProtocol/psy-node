@@ -268,6 +268,10 @@ impl<
         temp_db
             .set_unique_pending_ids(&realm_identifier, current_unique_pending_id, current_core_proc_unique_pending_id)
             .await?;
+
+        temp_db
+            .set_gathering_unique_pending_ids(&realm_identifier, current_unique_pending_id, current_core_proc_unique_pending_id)
+            .await?;
         let last_committed_l2_state = shared_status.block_state.clone();
         let last_committed_checkpoint_leaf = shared_status.last_committed_checkpoint_leaf.clone();
         let last_committed_checkpoint_root = db.checkpoint_tree_get_root_hash(last_committed_checkpoint_id).await?;
@@ -389,6 +393,8 @@ impl<
         self.db.get_current_unique_pending_id().await
     }
     pub async fn set_new_unique_ids(&mut self) -> anyhow::Result<()> {
+        println!("old_unique_pending_id: {}, old_proc_checkpoint_unique_id: {}", self.ids.unique_pending_id, self.ids.proc_checkpoint_unique_id);
+        println!("old_gathering_unique_pending_id: {}, old_gathering_proc_checkpoint_unique_id: {}", self.ids.gathering_unique_pending_id, self.ids.gathering_proc_checkpoint_unique_id);
         let (new_unique_pending_id, new_core_proc_unique_pending_id) = self.db.inc_unique_pending_id(1).await?;
         self.ids.unique_pending_id = self.ids.gathering_unique_pending_id;
         self.ids.proc_checkpoint_unique_id = self.ids.gathering_proc_checkpoint_unique_id;
@@ -404,6 +410,8 @@ impl<
         self.temp_db
             .set_unique_pending_ids(&self.ids.realm_identifier, self.ids.unique_pending_id, self.ids.proc_checkpoint_unique_id)
             .await?;
+        println!("new_unique_pending_id: {}, new_proc_checkpoint_unique_id: {}", self.ids.unique_pending_id, self.ids.proc_checkpoint_unique_id);
+        println!("new_gathering_unique_pending_id: {}, new_gathering_proc_checkpoint_unique_id: {}", self.ids.gathering_unique_pending_id, self.ids.gathering_proc_checkpoint_unique_id);
 
         Ok(())
     }
@@ -515,16 +523,21 @@ impl<
             self.db
                 .set_contract_leaves_ffs(checkpoint_id, &coordinator_update.new_contract_leaves_ffs)
                 .await?;
+            tracing::info!("Committed contract leaves ffs for checkpoint ID: {}", checkpoint_id);
             self.db
                 .set_many_contract_code_definitions(checkpoint_id, &coordinator_update.new_contract_code_definitions)
                 .await?;
+            tracing::info!("Committed contract code definitions for checkpoint ID: {}", checkpoint_id);
             self.db.set_contract_tree_heights(checkpoint_id, &contract_tree_heights).await?;
+            tracing::info!("Committed contract tree heights for checkpoint ID: {}", checkpoint_id);
             self.db
                 .contract_function_tree_set_nodes_ffs(checkpoint_id, &coordinator_update.update_contract_function_tree_nodes_ffs)
                 .await?;
+            tracing::info!("Committed contract function tree updates for checkpoint ID: {}", checkpoint_id);
             self.db
                 .global_contract_tree_set_nodes_ffs(checkpoint_id, &coordinator_update.update_global_contract_tree_nodes_ffs)
                 .await?;
+            tracing::info!("Committed global contract tree updates for checkpoint ID: {}", checkpoint_id);
         }
         tracing::info!("Committed contract state updates for checkpoint ID: {}", checkpoint_id);
         // start user registraion updates
@@ -538,7 +551,7 @@ impl<
                 .set_public_key_for_user_ids_ffs(&coordinator_update.new_public_key_hash_to_user_id_rows_ffs)
                 .await?;
                         println!("user_registration_tree_set_nodes_ffs  (len: {}) for checkpoint ID: {}", coordinator_update.update_user_registration_tree_nodes_ffs.len(), checkpoint_id);
-
+            println!("coordinator_update.update_user_registration_tree_nodes_ffs len: {}", coordinator_update.update_user_registration_tree_nodes_ffs.len());
             self.db
                 .user_registration_tree_set_nodes_ffs(checkpoint_id, &coordinator_update.update_user_registration_tree_nodes_ffs)
                 .await?;

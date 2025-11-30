@@ -213,8 +213,15 @@ impl<const QUEUE_TOPIC_ID: u32, QueueItem: PCoreQueueItemBase + 'static, Output:
     ) -> anyhow::Result<Output> {
         self.qk.set_unique_id(unique_id)?;
         let (response_tx, response_rx) = oneshot::channel();
+        if response_rx.is_terminated() {
+            anyhow::bail!("GATHERER_{QUEUE_TOPIC_ID}: Response channel was terminated before sending.");
+        }else if response_tx.is_closed() {
+            anyhow::bail!("GATHERER_{QUEUE_TOPIC_ID}: Response channel was closed before sending.");
+        }
+        tracing::info!("start finish finalize_gathering_and_update_queue_key for GATHERER_{QUEUE_TOPIC_ID}");
         self.trigger_tx.send(response_tx).await?;
         let result = response_rx.await?;
+        tracing::info!("end finish finalize_gathering_and_update_queue_key for GATHERER_{QUEUE_TOPIC_ID}");
         Ok(result)
     }
 }
@@ -232,9 +239,23 @@ pub async fn gatherer_runner<
     mut trigger_rx: mpsc::Receiver<oneshot::Sender<Builder::Output>>,
 ) -> anyhow::Result<()> {
     loop {
-        let mut builder = Builder::create_new(queue_key.unique_id, create_builder_config.clone()).await?;
+        let builder = Builder::create_new(queue_key.unique_id, create_builder_config.clone()).await;
+        if builder.is_err() {
+            tracing::error!("GATHERER: Error creating new builder for queue topic ID {QUEUE_TOPIC_ID}: {:?}", builder.err());
+            anyhow::bail!("GATHERER: Error creating new builder for queue topic ID {QUEUE_TOPIC_ID}");
+        }
+        let mut builder = builder.unwrap();
         tracing::info!("GATHERER: Starting new gathering phase.");
+        if trigger_rx.is_closed() {
+            tracing::info!("GATHERER_{QUEUE_TOPIC_ID}: Trigger channel closed before gathering started, stopping gatherer.");
+            return Ok(());
+        }
         'gathering: loop {
+            if trigger_rx.is_closed() {
+                tracing::info!("GATHERER_{QUEUE_TOPIC_ID}: Trigger channel closed, shutting down gatherer.");
+                return Ok(());
+            }
+            //tracing::info!("GATHERER_{QUEUE_TOPIC_ID}: Waiting for messages or trigger...");
             tokio::select! {
                 // Biased ensures we check for a processor trigger first for better responsiveness.
                 biased;
@@ -246,13 +267,24 @@ pub async fn gatherer_runner<
                     let is_stopped = queue_key_helper.is_active()?;
                     tracing::info!("GATHERER: Current unique ID: {}, is_active: {}", queue_key.unique_id, is_stopped);
 
-                    if responder.send(builder.finalize().await?).is_err() {
+                    let finalize_result = builder.finalize().await;
+                    if finalize_result.is_err() {
+                        tracing::error!("GATHERER: Error during finalize for queue topic ID {QUEUE_TOPIC_ID}: {:?}", finalize_result.err());
+                        anyhow::bail!("GATHERER: Error during finalize for queue topic ID {QUEUE_TOPIC_ID}");
+                    }
+                    let finalized_output = finalize_result?;
+                    tracing::info!("GATHERER: Finalized output prepared, sending to processor.");
+                    if responder.send(finalized_output).is_err() {
                         tracing::error!("GATHERER: Failed to send data to processor. The receiver was dropped.");
                     }else{
                         tracing::info!("GATHERER: Successfully handed over data to processor.");
                     }
                     if is_stopped == false {
                         tracing::info!("GATHERER: Stopping as requested.");
+                        return Ok(());
+                    }
+                    if trigger_rx.is_closed() {
+                        tracing::info!("GATHERER_{QUEUE_TOPIC_ID}: Trigger channel closed after handing over, stopping gatherer.");
                         return Ok(());
                     }
 
@@ -300,9 +332,26 @@ pub async fn gatherer_runner_for_tree<
     mut trigger_rx: mpsc::Receiver<oneshot::Sender<Builder::Output>>,
 ) -> anyhow::Result<()> {
     loop {
-        let mut builder = Builder::create_new_with_tree(&mut tree, queue_key.unique_id, create_builder_config.clone()).await?;
+        let builder = Builder::create_new_with_tree(&mut tree, queue_key.unique_id, create_builder_config.clone()).await;
+        if builder.is_err() {
+            tracing::error!("GATHERER_{QUEUE_TOPIC_ID}: Error creating new builder: {:?}", builder.err());
+            anyhow::bail!("GATHERER_{QUEUE_TOPIC_ID}: Error creating new builder");
+        }
+        let mut builder = builder.unwrap();
         tracing::info!("GATHERER_{QUEUE_TOPIC_ID}: Starting new gathering phase.");
+        if trigger_rx.is_closed() {
+            tracing::info!("GATHERER_{QUEUE_TOPIC_ID}: Trigger channel closed before gathering started, stopping gatherer.");
+            return Ok(());
+        }
         'gathering: loop {
+            /* 
+            if trigger_rx.is_closed() {
+                tracing::info!("GATHERER_{QUEUE_TOPIC_ID}: Trigger channel closed, stopping gatherer.");
+                return Ok(());
+            }
+            */
+            //tracing::info!("GATHERER_{QUEUE_TOPIC_ID}: Waiting for messages or trigger...");
+            
             tokio::select! {
                 // Biased ensures we check for a processor trigger first for better responsiveness.
                 biased;
@@ -335,7 +384,12 @@ pub async fn gatherer_runner_for_tree<
                         Ok(d) => {
                             if d.len() != 0 {
                                 tracing::info!("GATHERER_{QUEUE_TOPIC_ID}: Received {} items from queue.", d.len());
-                                builder.update_from_many_queue_items_with_tree(&mut tree, d).await?;
+                                let res = builder.update_from_many_queue_items_with_tree(&mut tree, d).await;
+                                if res.is_err() {
+                                    tracing::error!("GATHERER_{QUEUE_TOPIC_ID}: Error updating from queue items: {:?}", res.err());
+                                    anyhow::bail!("GATHERER_{QUEUE_TOPIC_ID}: Error updating from queue items");
+                                }
+
                             }
                             tokio::time::sleep(Duration::from_millis(10)).await;
                             //builder.update_from_queue_item(d).await?;

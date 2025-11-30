@@ -29,7 +29,9 @@ fn verify_api_signature(signature: &QEDCompressedSecp256K1Signature, request: &S
     request.get_sig_hash::<parth_crypto::hash::sha256::CoreSha256Hasher>() == signature.message
         && parth_common::secp256k1::Secp256K1VerifierHelper::secp256k1_verify(signature).is_ok()
 }
-
+fn print_hash<H: Q256BitHash + std::fmt::Debug>(label: &str, hash: &H) {
+    tracing::info!("{}: {:?} ({})", label, hash, hex::encode(&hash.into_owned_32bytes()));
+}
 impl<
         N: QNetworkTypesConfig<JobId = QProvingJobDataID>,
         S: PsyCoordinatorEdgeAPIStoreReader<N::F, N::QHash> + Send + Sync,
@@ -313,7 +315,7 @@ impl<
 
         let reward_tree_value = metadata.get_new_rewards_tag_tree_value::<N::HasherBase>(tag, &children_reward_tree_values)?;
 
-        tracing::info!("reward_tree_value: {:?}", hex::encode(&reward_tree_value.into_owned_32bytes()));
+        print_hash("reward_tree_value", &reward_tree_value);
         let full_expected_public_inputs_hash = if job_id.circuit_type == ProvingJobCircuitType::GenesisBlockCheckpointStateTransition {
             metadata.expected_public_inputs_hash
         } else if job_id.circuit_type == ProvingJobCircuitType::GenerateRollupStateTransitionProof {
@@ -322,6 +324,11 @@ impl<
         } else {
             N::HasherBase::two_to_one(&metadata.expected_public_inputs_hash, &reward_tree_value)
         };
+
+
+        print_hash("full_expected_public_inputs_hash", &full_expected_public_inputs_hash);
+        print_hash("metadata.expected_public_inputs_hash", &metadata.expected_public_inputs_hash);
+        
         tracing::info!(
             "Verifying proof for job id: {:?} with expected public inputs hash: {:?} (from metadata: {:?})",
             job_id,
@@ -333,6 +340,7 @@ impl<
             "Debug: extracted public inputs hash from proof: {:?}",
             hex::encode(&debug_public_inputs.into_owned_32bytes())
         );
+        print_hash("debug_public_inputs", &debug_public_inputs);
 
         self.proof_verifier.verify_zk_proof_from_slice_check_public_inputs_hash(
             job_id.circuit_type.to_u8() as u32,

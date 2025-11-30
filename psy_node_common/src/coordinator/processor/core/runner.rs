@@ -51,7 +51,7 @@ where
             tracing::debug!("[COORDINATOR] Process block starting...");
             let result = processor.process_block().await;
             if let Err(e) = result {
-                tracing::error!("[COORDINATOR] Error processing block: {:?}", e);
+                eprintln!("[COORDINATOR] Error processing block: {:?}", e);
                 // fatal, exit process
                 std::process::exit(1);
             }

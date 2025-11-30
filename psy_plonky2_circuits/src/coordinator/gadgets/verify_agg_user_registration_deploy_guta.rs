@@ -23,7 +23,6 @@ use crate::{
     },
     guta::gadgets::{guta_header::GlobalUserTreeAggregatorHeaderGadget, verify_guta_proof::VerifyGUTAProofGadget},
 };
-
 #[derive(Debug, Clone)]
 pub struct VerifyAggUserRegistartionDeployContractsGUTAHeaderGadget {
     pub user_registration_tree_delta: AggStateTransitionGadget,

@@ -250,6 +250,10 @@ where
         }
     }
 }
+fn print_hash<H: Q256BitHash + std::fmt::Debug>(label: &str, hash: &H) {
+    tracing::info!("{}: {:?} ({})", label, hash, hex::encode(&hash.into_owned_32bytes()));
+}
+
 
 impl<L: CircuitInfoLibrary<C, D>, C: GenericConfig<D>, const D: usize> QStandardCircuitProvableWithRawProofsAndRefLibrary<L, C, D>
     for VerifyAggUserRegistartionDeployContractsGUTACircuit<C, D>
@@ -267,6 +271,7 @@ where
         input.ensure_expected_child_proof_count_with_tags(3)?;
         let witness = QCAggUserRegistartionDeployContractsGUTAInput::<C::F, QHashOut<C::F>>::psy_ser_from_slice(&input.base.witness)?;
         println!("witness: {:#?}", witness);
+        println!("metadata: {:#?}", input.base.job);
 
         let guta_zk_proof = deserialize_plonky2_proof::<C, D>(&input.input_proofs[0])?;
         let guta_zk_proof_verifier_data = library.get_verifier_data(input.get_child_proof_circuit_type(0)?)?;
@@ -286,15 +291,39 @@ where
         let (deploy_contracts_state_transition, deploy_contracts_total_proofs_generated) =
             witness.deploy_contracts_state_transition.get_agg_state_transition_and_f::<C::F>();
 
-        println!("guta_header: {:#?}", witness.guta_proof_header);
+        //println!("guta_header: {:#?}", witness.guta_proof_header);
         let guta_proof_header_hash = witness.guta_proof_header.qfhash::<C::Hasher>();
-        println!("guta_proof_header_hash: {:?} ({})", guta_proof_header_hash, hex::encode(&guta_proof_header_hash.to_le_bytes()));
+        //println!("guta_proof_header_hash: {:?} ({})", guta_proof_header_hash, hex::encode(&guta_proof_header_hash.to_le_bytes()));
 
         let guta_public_inputs_expected = <C::Hasher as MerkleHasher<QHashOut<C::F>>>::two_to_one(&guta_proof_header_hash, &guta_proof_rewards_tree_value);
         let guta_proof_public_inputs = QHashOut::<C::F>::from_felt_slice(&guta_zk_proof.public_inputs[..4]);
-        println!("guta_proof_public_inputs: {:?}", guta_proof_public_inputs);
-        println!("guta_public_inputs_expected: {:?} ({})", guta_public_inputs_expected, hex::encode(&guta_public_inputs_expected.to_le_bytes()));
-        println!("guta_rewards_tree_value: {:?} ({})", guta_proof_rewards_tree_value, hex::encode(&guta_proof_rewards_tree_value.to_le_bytes()));
+        //println!("guta_proof_public_inputs: {:?}", guta_proof_public_inputs);
+        //println!("guta_public_inputs_expected: {:?} ({})", guta_public_inputs_expected, hex::encode(&guta_public_inputs_expected.to_le_bytes()));
+        //println!("guta_rewards_tree_value: {:?} ({})", guta_proof_rewards_tree_value, hex::encode(&guta_proof_rewards_tree_value.to_le_bytes()));
+
+        println!("witness.register_users_state_transition: {:?}", witness.register_users_state_transition);
+
+        let register_users_state_transition_hash = register_users_state_transition.get_combined_hash::<C::Hasher>();
+        let register_users_whitelist = C::Hasher::q_two_to_one(
+            library.get_fingerprint(ProvingJobCircuitType::AppendUserRegistrationTree)?,
+            library.get_fingerprint(ProvingJobCircuitType::AppendUserRegistrationTreeAggregate)?,
+        );
+        print_hash("register_users_whitelist", &register_users_whitelist);
+        print_hash("register_users_state_transition_hash", &register_users_state_transition_hash);
+
+        let register_users_expected_public_inputs_hash_no_reward = witness.register_users_state_transition.get_public_inputs_hash_no_tag_tree::<C::Hasher, C::F>(
+            register_users_whitelist,
+        );
+        print_hash("register_users_expected_public_inputs_hash_no_reward", &register_users_expected_public_inputs_hash_no_reward);
+
+        let register_users_expected_public_inputs_hash = C::Hasher::q_two_to_one(register_users_expected_public_inputs_hash_no_reward, register_users_proof_rewards_tree_value);
+        print_hash("register_users_expected_public_inputs_hash", &register_users_expected_public_inputs_hash);
+
+
+
+
+        println!("deploy_contracts_state_transition: {:?}", deploy_contracts_state_transition);
+
 
         let expected_public_inputs_hash_no_rewards = witness.get_public_inputs_hash_no_rewards_tag::<C::Hasher>();
         println!("expected_public_inputs_hash_no_rewards: {:?} ({})", expected_public_inputs_hash_no_rewards, hex::encode(&expected_public_inputs_hash_no_rewards.to_le_bytes()));

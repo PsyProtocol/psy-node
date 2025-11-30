@@ -116,10 +116,6 @@ impl<
         max_level: Option<usize>,
         wait_for_jobs_completion: bool,
     ) -> anyhow::Result<()> {
-        println!("Publishing worker jobs...");
-        println!("guta_jobs: {:?}", guta_jobs);
-        println!("register_user_jobs: {:?}", register_user_jobs);
-        println!("deploy_contract_jobs: {:?}", deploy_contract_jobs);
         let queue_key = self.db.get_proof_worker_queue_key();
         let max_level = guta_jobs
             .len()
@@ -236,7 +232,6 @@ impl<
         if self.db.needs_revert {
             self.db.needs_revert = false;
         }
-
         let (guta_result, register_users_result, deploy_contract_result) = tokio::try_join!(
             self.guta_queue_gatherer
                 .finalize_gathering_and_update_queue_key(self.db.ids.gathering_proc_checkpoint_unique_id),
@@ -245,6 +240,23 @@ impl<
             self.deploy_contract_queue_gatherer
                 .finalize_gathering_and_update_queue_key(self.db.ids.gathering_proc_checkpoint_unique_id),
         )?;
+
+        /* 
+        tracing::info!("Gathering results from GUTA, Register Users, and Deploy Contracts gatherers...");
+        let guta_result = self.guta_queue_gatherer
+            .finalize_gathering_and_update_queue_key(self.db.ids.gathering_proc_checkpoint_unique_id)
+            .await?;
+        tracing::info!("GUTA gatherer results obtained.");
+        let deploy_contract_result = self.deploy_contract_queue_gatherer
+            .finalize_gathering_and_update_queue_key(self.db.ids.gathering_proc_checkpoint_unique_id)
+            .await?;
+        tracing::info!("Deploy Contracts gatherer results obtained.");
+        let register_users_result = self.register_user_queue_gatherer
+            .finalize_gathering_and_update_queue_key(self.db.ids.gathering_proc_checkpoint_unique_id)
+            .await?;
+        tracing::info!("Register Users gatherer results obtained.");
+        */
+        
         Ok(CoordinatorOutputBuilder::new(
             &self.db.ids,
             guta_result,

@@ -416,6 +416,9 @@ where
             &leaf_fingerprint,
             &agg_fingerprint
         );
+
+        let agg_state_transition_combined = witness.condense_add_one();
+        println!("agg_state_transition_combined: {:#?}", agg_state_transition_combined);
     
         let expected_public_inputs_hash_before_reward_tag = witness.get_public_inputs_hash_no_tag_tree::<C::Hasher>(whitelist);
         println!("expected_public_inputs_hash_before_reward_tag: {:#?}", expected_public_inputs_hash_before_reward_tag);

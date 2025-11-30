@@ -43,6 +43,7 @@ pub trait PsyNodeUserRegistrationTreeDatabaseReader<Hash> {
     async fn user_registration_tree_get_root_hash(&self, checkpoint_id: u64) -> anyhow::Result<Hash>;
     async fn user_registration_tree_get_merkle_proof(&self, checkpoint_id: u64, leaf_index: u64) -> anyhow::Result<MerkleProofCore<Hash>>;
     async fn user_registration_tree_get_nodes(&self, checkpoint_id: u64, keys: &[SimpleMerkleNodeKey]) -> anyhow::Result<Vec<Hash>>;
+    async fn user_registration_tree_get_node(&self, checkpoint_id: u64, key: SimpleMerkleNodeKey) -> anyhow::Result<Hash>;
 }
 
 #[async_trait]
@@ -141,6 +142,7 @@ pub trait PsyNodeGlobalContractTreeDatabaseReader<Hash> {
     async fn global_contract_tree_get_root_hash(&self, checkpoint_id: u64) -> anyhow::Result<Hash>;
     async fn global_contract_tree_get_merkle_proof(&self, checkpoint_id: u64, leaf_index: u64) -> anyhow::Result<MerkleProofCore<Hash>>;
     async fn global_contract_tree_get_nodes(&self, checkpoint_id: u64, keys: &[SimpleMerkleNodeKey]) -> anyhow::Result<Vec<Hash>>;
+    async fn global_contract_tree_get_node(&self, checkpoint_id: u64, key: SimpleMerkleNodeKey) -> anyhow::Result<Hash>;
 }
 
 #[async_trait]

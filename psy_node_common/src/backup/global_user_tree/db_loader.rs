@@ -113,7 +113,7 @@ pub async fn fetch_global_user_tree_from_db<
 pub async fn load_global_user_tree_from_db<
     Hasher: MerkleZeroHasher<Hash>,
     Store: PsyNodeGlobalUserTreeDatabaseReader<Hash>,
-    Hash: Copy + PartialEq + Default,
+    Hash: Copy + PartialEq + Default + std::fmt::Debug,
 >(
     user_db_reader: &Store,
     tree_height: u8,
@@ -124,13 +124,17 @@ pub async fn load_global_user_tree_from_db<
     assert!(effective_tree_height <= tree_height, "effective_tree_height must be less than or equal to tree_height");
     let mut current_key = SimpleMerkleNodeKey::new_root();
     let mut current_value = user_db_reader.global_user_tree_get_node(checkpoint_id, current_key).await?;
+    println!("Current root hash: {:?}", current_value);
+    println!("Zero hash at root level: {:?}", Hasher::get_zero_hash(tree_height as usize));
+    println!("zero hash of effective tree height: {:?}", Hasher::get_zero_hash((effective_tree_height) as usize));
+    println!("zero hash of at leaves: {:?}", Hasher::get_zero_hash((effective_tree_height) as usize));
     if current_value == Hasher::get_zero_hash(tree_height as usize) {
         // Tree is empty
         return Ok(SimpleMemoryMerkleRecorderStore::new(tree_height));
     }
-    while current_key.level < tree_height {
+    while current_key.level < effective_tree_height {
         let right_child_key = current_key.right_child();
-        let zero_hash_at_level = Hasher::get_zero_hash(right_child_key.level as usize);
+        let zero_hash_at_level = Hasher::get_zero_hash((tree_height - right_child_key.level) as usize);
 
         let right_child_value = user_db_reader.global_user_tree_get_node(checkpoint_id, right_child_key).await?;
         let right_is_empty = right_child_value == zero_hash_at_level;
@@ -156,7 +160,7 @@ pub async fn load_global_user_tree_from_db<
     }
     // SANITY CHECK: ensure the leaf node is not zero hash, as we already checked to
     // ensure the root is not a zero hash
-    if current_value == Hasher::get_zero_hash(0) {
+    if current_value == Hasher::get_zero_hash((tree_height - effective_tree_height) as usize) {
         // Tree is empty
         anyhow::bail!("Failed to load global user tree from DB: reached leaf node with zero hash, but root is not zero hash");
     }

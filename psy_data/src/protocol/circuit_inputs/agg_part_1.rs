@@ -68,8 +68,8 @@ impl<F: QFelt64, Hash: QFHashBase<F>> QCAggUserRegistartionDeployContractsGUTAIn
         let guta_hash = self.guta_proof_header.qfhash::<Hasher>();
         let combo_without_stats = Hasher::two_to_one(&user_registration_deploy_contracts_combo, &guta_hash);
         let stats_hash = Hash::from_u64x4([
-            self.register_users_state_transition.total_proofs_generated,
             self.deploy_contracts_state_transition.total_proofs_generated,
+            self.register_users_state_transition.total_proofs_generated,
             self.guta_proof_header.total_aggregation_proofs_generated.to_u64_value(),
             0,
         ]);

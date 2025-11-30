@@ -2,7 +2,7 @@ use parth_core::{crypto::hash::{spiderman::SpidermanUpdateProof, traits::{FieldQ
 use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
 use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
 
-use crate::{agg::{AggStateTrackableInput, AggStateTransition}, v1::qdata::contract::PQEDContractLeaf};
+use crate::{agg::{AggStateTrackableInput, AggStateTransition}, protocol::circuit_inputs::append_user_registration_tree::compute_agg_state_trackable_final_public_inputs_no_rewards_tag_leaf, v1::qdata::contract::PQEDContractLeaf};
 
 
 
@@ -44,9 +44,9 @@ impl<F: QFelt64, Hash: QFHashBase<F>> PCircuitWitness<F, Hash>
 {
     fn get_expected_public_inputs_hash<Hasher: FieldQHasher<F, Hash>>(&self) -> Hash {
         let state_transition_hash = self.get_state_transition().get_combined_hash::<Hasher>();
-        Hasher::two_to_one(
-            &self.deploy_contract_circuit_whitelist,
-            &state_transition_hash,
+        compute_agg_state_trackable_final_public_inputs_no_rewards_tag_leaf::<Hasher, F, Hash>(
+            self.deploy_contract_circuit_whitelist,
+            state_transition_hash,
         )
     }
 }

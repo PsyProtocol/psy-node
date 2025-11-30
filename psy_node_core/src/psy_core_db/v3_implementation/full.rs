@@ -527,6 +527,13 @@ impl<
             .db_select_many_zero_id_merkle_nodes_max_checkpoint(&self.user_registration_tree_table, checkpoint_id, keys)
             .await
     }
+    
+    async fn user_registration_tree_get_node(&self, checkpoint_id: u64, key: SimpleMerkleNodeKey) -> anyhow::Result<N::QHash> {
+        self.store
+            .db_select_zero_id_merkle_node_max_checkpoint(&self.user_registration_tree_table, checkpoint_id, &key)
+            .await
+    }
+    
 }
 
 #[async_trait]
@@ -1324,6 +1331,12 @@ impl<
     async fn global_contract_tree_get_nodes(&self, checkpoint_id: u64, keys: &[SimpleMerkleNodeKey]) -> anyhow::Result<Vec<N::QHash>> {
         self.store
             .db_select_many_zero_id_merkle_nodes_max_checkpoint(&self.global_contract_tree_table, checkpoint_id, keys)
+            .await
+    }
+
+    async fn global_contract_tree_get_node(&self, checkpoint_id: u64, key: SimpleMerkleNodeKey) -> anyhow::Result<N::QHash> {
+        self.store
+            .db_select_zero_id_merkle_node_max_checkpoint(&self.global_contract_tree_table, checkpoint_id, &key)
             .await
     }
 }

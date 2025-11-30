@@ -189,6 +189,8 @@ where
                 .map_err(|e| anyhow::anyhow!(e))?;
         tracing::debug!("QCAppendUserRegistrationTreeCircuitInput: {}", serde_json::to_string_pretty(&input).unwrap());
 
+        tracing::info!("Proving BatchAppendUserRegistrationTreeCircuit for job id {:?}", job_id);
+
         let result = self.prove_base(
             input.register_users_circuit_whitelist,
             worker_rewards_tree_tag,
@@ -222,6 +224,7 @@ where
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>>{
 
         let witness = QCAppendUserRegistrationTreeCircuitInput::<QHashOut<C::F>>::psy_ser_from_slice(&input.base.witness)?;
+        tracing::info!("append_users_witness: {:#?}", witness);
         self.prove_base(
             witness.register_users_circuit_whitelist,
             worker_reward_tag,

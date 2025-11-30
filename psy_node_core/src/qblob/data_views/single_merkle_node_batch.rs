@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 
+use parth_common::memory_stores::{mem_tree_recorder::SimpleMemoryMerkleRecorderStore, mem_tree_v3::SimpleMemoryMerkleStoreV3};
 use parth_core::{
     crypto::hash::{
-        merkle_proof::{compute_root_merkle_proof_generic, DeltaMerkleProofCore},
+        merkle_proof::{DeltaMerkleProofCore, compute_root_merkle_proof_generic},
         traits::{MerkleHasher, MerkleZeroHasher},
     },
     data::hash::{
-        fast_node_serializer::{QMS_FAST_SERIALIZER_DOUBLE_ID_NODE_SIZE, QMS_FAST_SERIALIZER_SINGLE_ID_NODE_SIZE},
-        merkle_store_key::{QMerkleStoreSingleIdKey, QMerkleStoreSingleIdNode},
+        fast_node_serializer::{QMS_FAST_SERIALIZER_DOUBLE_ID_NODE_SIZE, QMS_FAST_SERIALIZER_SINGLE_ID_NODE_SIZE, QMerkleStoreFastSingleNodeSerializer}, merkle_node_key::SimpleMerkleNodeKey, merkle_store_key::{QMerkleStoreSingleIdKey, QMerkleStoreSingleIdNode}
     },
     protocol::core_types::Q256BitHash,
     utils::math::{ceil_div_usize, log2_ceil},
@@ -485,6 +485,51 @@ pub fn generate_single_merkle_node_blob_from_leaves<Hash: Q256BitHash, Hasher: M
     };
     buffer.extend_from_slice(&root_node.ffs_into_bytes());
     (root_hash, buffer)
+}
+
+pub fn generate_single_merkle_node_blob_from_leaves_with_tree_height<Hash: Q256BitHash + Default, Hasher: MerkleZeroHasher<Hash>>(
+    tree_id: u64,
+    leaves: &[Hash],
+    tree_height: u8,
+) -> (Hash, Vec<u8>) {
+    if leaves.len() == 0 {
+        return (Hasher::get_zero_hash(tree_height as usize), Vec::new());
+    } else if leaves.len() == 1 {
+        let mut buffer = Vec::<u8>::with_capacity(QMS_FAST_SERIALIZER_SINGLE_ID_NODE_SIZE * (tree_height as usize + 1));
+        let mut current = leaves[0].to_owned();
+        buffer.extend_from_slice(
+            &QMerkleStoreSingleIdNode {
+                key: QMerkleStoreSingleIdKey {
+                    tree_id,
+                    level: tree_height,
+                    index: 0,
+                },
+                value: current,
+            }
+            .ffs_into_bytes(),
+        );
+        for i in 0..tree_height {
+            current = Hasher::two_to_one(&current, &Hasher::get_zero_hash(i as usize));
+            buffer.extend_from_slice(
+                &QMerkleStoreSingleIdNode {
+                    key: QMerkleStoreSingleIdKey {
+                        tree_id,
+                        level: tree_height - (i + 1),
+                        index: 0,
+                    },
+                    value: current,
+                }
+                .ffs_into_bytes(),
+            );
+        }
+        return (current, buffer);
+    }
+    let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(tree_height);
+    tree.fast_batch_set_leaves(0, leaves);
+    let root = tree.get_root();
+    let result = QMerkleStoreFastSingleNodeSerializer::serialize_single_id_hash_map_with_common_tree_id_to_vec(tree_id, tree.get_changes());
+
+    (root, result)
 }
 
 #[cfg(test)]

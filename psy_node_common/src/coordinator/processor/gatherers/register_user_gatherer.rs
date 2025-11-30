@@ -279,6 +279,7 @@ impl<
         unique_id: QCoreProcCheckpointUniqueId,
         config: RegisterUserGathererConfig<N, TempDatabase, FileSystem>,
     ) -> anyhow::Result<Self> {
+        tracing::info!("Creating new RegisterUserGatherer with pending unique id {:?}", unique_id);
         let shared_status = config.status.read().unwrap().clone();
         let new_user_public_keys_file_path = get_new_register_user_gatherer_backup_file_path(
             &config.backup_file_directory,
@@ -299,17 +300,23 @@ impl<
             ));
         }
         if start_next_user_id != 0 {
+            tracing::info!("tree: root: {:?}", tree.get_root());
+            tracing::info!("zero hash for tree_root: {:?}", N::HasherBase::get_zero_hash(tree.get_height() as usize));
             if tree.get_leaf_value(start_next_user_id - 1) == N::HasherBase::get_zero_hash(0) {
                 return Err(anyhow::anyhow!(
                     "The leaf before the next user id {} minus one does not exist in tree, cannot continue",
-                    start_next_user_id - 1
+                    start_next_user_id
                 ));
             }
         }
         new_user_public_keys_file.write_u32_le(REGISTER_USER_GATHERER_BACKUP_V1_MAGIC_U32).await?;
         new_user_public_keys_file.write_u64_le(start_next_user_id).await?;
         new_user_public_keys_file.write_all(&tree.get_root().into_owned_32bytes()).await?;
-
+        tracing::info!(
+            "Created new RegisterUserGatherer with starting next user id {} and tree root {:?}",
+            start_next_user_id,
+            tree.get_root()
+        );
         Ok(Self {
             config,
             shared_status,
@@ -345,10 +352,9 @@ impl<
             value_u64: self.next_user_id,
         };
         self.new_public_key_hash_to_user_id_rows_ffs
-            .extend_from_slice(self.next_user_id.to_le_bytes().as_slice());
-        self.new_public_key_hash_to_user_id_rows_ffs
             .extend_from_slice(&u64_hash_mapping_row.ffs_to_bytes());
 
+        tracing::info!("new user registered with user id {}", self.next_user_id);
         self.next_user_id += 1;
         self.new_user_registration_tree_leaves.push(hash);
 
@@ -359,12 +365,14 @@ impl<
         tree: &mut SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>,
         items: Vec<Vec<u8>>,
     ) -> anyhow::Result<()> {
+        tracing::info!("Updating RegisterUserGatherer with {} new users", items.len());
         for item in items {
             self.update_from_queue_item_with_tree(tree, item).await?;
         }
         Ok(())
     }
     async fn finalize_with_tree(mut self, tree: &mut SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>) -> anyhow::Result<Self::Output> {
+        tracing::info!("Finalizing RegisterUserGatherer with {} new users", self.new_user_registration_tree_leaves.len());
         let needs_revert = {
             self.config
                 .status
@@ -398,7 +406,16 @@ impl<
             // remove the backup file since we are reverting
             //tokio::fs::remove_file(&self.pending_file_path).await?;
             
+        }else{
+            tree.commit_changes();
         }
+        let last_job_next_user_id = {
+            self.config
+                .last_job_next_user_id
+                .read()
+                .map_err(|e| anyhow::anyhow!("error reading last job next user id {:?}", e))?
+                .clone()
+        };
         // ensure the new user public keys file is flushed to disk
         self.config
             .file_system
@@ -416,8 +433,9 @@ impl<
         let spider_man_groups = if self.new_user_registration_tree_leaves.len() == 0 {
             vec![]
         } else {
+            let append_index = self.next_user_id - self.new_user_registration_tree_leaves.len() as u64;
             let spider_map_proofs =
-                tree.append_leaves_spider_man(N::BATCH_USER_REGISTRATION_SUB_TREE_HEIGHT as u8, &self.new_user_registration_tree_leaves)?;
+                tree.append_leaves_spider_man_at_index(N::BATCH_USER_REGISTRATION_SUB_TREE_HEIGHT as u8, append_index, &self.new_user_registration_tree_leaves)?;
             spider_map_proofs
                 .chunks(N::BATCH_USER_REGISTRATION_MAX_SUB_TREES)
                 .map(|chunk| QCAppendUserRegistrationTreeCircuitInput {
@@ -426,6 +444,16 @@ impl<
                 })
                 .collect::<Vec<_>>()
         };
+        for i in last_job_next_user_id..self.next_user_id {
+            if tree.get_leaf_value(i) == N::HasherBase::get_zero_hash(0) {
+                tracing::error!("After finalize, user registration tree leaf for user id {} is zero hash, expected non-zero hash", i);
+                return Err(anyhow::anyhow!(
+                    "After finalize, user registration tree leaf for user id {} is zero hash, expected non-zero hash",
+                    i
+                ));
+            }
+        }
+        
         let (jobs_for_queue, job_temp_data) = plan_jobs_for_tree_agg_offset_root::<
             QProvingJobDataID,
             N::F,
@@ -483,6 +511,7 @@ impl<
                 .map_err(|e| anyhow::anyhow!("error writing last job next user id {:?}", e))?
                 .clone_from(&self.next_user_id);
         }
+        tracing::info!("Finished finalizing RegisterUserGatherer with {} new users", self.new_user_registration_tree_leaves.len());
         Ok(output)
     }
 }
@@ -566,7 +595,7 @@ impl<Hash: Q256BitHash>
         right: &AggStateTransitionInputV2<Hash>,
     ) -> AggStateTransitionInputV2<Hash> {
         let left_state_transition = left.get_state_transition();
-        let right_state_transition = right.condense();
+        let right_state_transition = right.condense_add_one();
 
         AggStateTransitionInputV2 {
             left_input: AggStateTransitionWithStats {
@@ -585,7 +614,7 @@ impl<Hash: Q256BitHash>
         right: &QCAppendUserRegistrationTreeCircuitInput<Hash>,
     ) -> AggStateTransitionInputV2<Hash> {
         let right_state_transition = right.get_state_transition();
-        let left_state_transition = left.condense();
+        let left_state_transition = left.condense_add_one();
 
         AggStateTransitionInputV2 {
             left_input: left_state_transition,
@@ -600,8 +629,8 @@ impl<Hash: Q256BitHash>
     }
 
     fn create_agg_to_agg_witness(left: &AggStateTransitionInputV2<Hash>, right: &AggStateTransitionInputV2<Hash>) -> AggStateTransitionInputV2<Hash> {
-        let left_state_transition = left.condense();
-        let right_state_transition = right.condense();
+        let left_state_transition = left.condense_add_one();
+        let right_state_transition = right.condense_add_one();
 
         AggStateTransitionInputV2 {
             left_input: left_state_transition,

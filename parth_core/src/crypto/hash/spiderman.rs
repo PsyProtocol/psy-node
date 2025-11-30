@@ -71,11 +71,33 @@ impl<Hash: PartialEq + Copy + ZeroableHash> SpidermanUpdateProof<Hash> {
         }
         count
     }
+    pub fn get_modified_leaves_count(&self) -> usize {
+        let max_len = std::cmp::min(self.web_proof_old_leaves.len(), self.web_proof_new_leaves.len());
+        let mut count = 0;
+        for i in 0..max_len {
+            if self.web_proof_old_leaves[i] != self.web_proof_new_leaves[i] {
+                count += 1;
+            }
+        }
+        count
+    }
     pub fn get_existing_prepended_leaves_count(&self) -> usize {
         let mut count = 0;
 
         while count < self.web_proof_old_leaves.len() && count < self.web_proof_new_leaves.len() {
             if self.web_proof_old_leaves[count] == self.web_proof_new_leaves[count] && self.web_proof_old_leaves[count] != Hash::get_zero_value() {
+                count += 1;
+            } else {
+                break;
+            }
+        }
+        count
+    }
+    pub fn get_existing_prepended_leaves_count_including_non_zero(&self) -> usize {
+        let mut count = 0;
+
+        while count < self.web_proof_old_leaves.len() && count < self.web_proof_new_leaves.len() {
+            if self.web_proof_old_leaves[count] == self.web_proof_new_leaves[count] {
                 count += 1;
             } else {
                 break;

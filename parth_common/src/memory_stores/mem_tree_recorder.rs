@@ -43,7 +43,8 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + PartialEq + Default>
     }
 
     pub fn injest_merkle_proof(&mut self, proof: &MerkleProofCore<Hash>) -> anyhow::Result<()> {
-        let mut current_key = SimpleMerkleNodeKey::new(self.get_height(), proof.index);
+        let base_key = SimpleMerkleNodeKey::new(proof.siblings.len() as u8, proof.index);
+        let mut current_key = base_key;
         
         if self.get_height() as usize != proof.siblings.len() {
             anyhow::bail!("proof height does not match tree height");
@@ -55,7 +56,7 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + PartialEq + Default>
             self.set_node_value(sibling_key, *sibling_hash);
             current_key = current_key.parent();
         }
-        self.rehash_from_node_to_level(current_key, 0);
+        self.rehash_from_node_to_level(base_key, 0);
         Ok(())
     }
     pub fn commit_changes(&mut self) {
@@ -660,6 +661,160 @@ pub fn rehash_range(
         let leaves_per_subtree = 1usize << sub_tree_height;
         let max_leaves = 1u64 << self.height;
         let append_index = self.find_next_append_index()?;
+        if (append_index) + (leaves.len() as u64) > max_leaves {
+            anyhow::bail!("tree cannot fit an additional {} leaves", leaves.len());
+        }
+        let cur_sub_tree_id = append_index / (leaves_per_subtree as u64);
+        let cur_sub_tree_leaf_index =
+            ((append_index as u64) & ((leaves_per_subtree as u64) - 1u64)) as u64;
+
+        let subtree_count =
+            ceil_div_usize((append_index as usize) + leaves.len(), leaves_per_subtree)
+                - (cur_sub_tree_id as usize);
+
+        let mut results = Vec::with_capacity(subtree_count);
+        if subtree_count == 0 {
+            return Ok(results);
+        }
+
+        let mut old_leaves = Vec::with_capacity(leaves_per_subtree);
+        let mut new_leaves = Vec::with_capacity(leaves_per_subtree);
+
+        let start_existing_index = cur_sub_tree_id * (leaves_per_subtree as u64);
+        let start_added_index = start_existing_index + cur_sub_tree_leaf_index;
+
+        for i in start_existing_index..start_added_index {
+            let v = self.get_leaf_value(i);
+            old_leaves.push(v);
+            new_leaves.push(v);
+        }
+        let first_tree_new_slots = leaves_per_subtree - new_leaves.len();
+
+        new_leaves.extend_from_slice(&leaves[0..first_tree_new_slots.min(leaves.len())]);
+
+        let first_tree_zero_hashes = leaves_per_subtree - new_leaves.len();
+
+        let zero_hash = Hasher::get_zero_hash(0);
+        let mut leaves_used = leaves_per_subtree - (cur_sub_tree_leaf_index as usize);
+        for _ in 0..leaves_used {
+            old_leaves.push(zero_hash);
+        }
+        for _ in 0..first_tree_zero_hashes {
+            new_leaves.push(zero_hash);
+        }
+
+        for (i, l) in leaves[0..leaves_used.min(leaves.len())].iter().enumerate() {
+            self.set_node_value(
+                SimpleMerkleNodeKey::new(self.height, i as u64 + start_added_index),
+                *l,
+            );
+        }
+        let dmp = self.rehash_sub_tree_dmp(sub_tree_height, cur_sub_tree_id);
+
+        results.push(SpidermanUpdateProof {
+            top_line_proof: dmp,
+            web_proof_old_leaves: old_leaves,
+            web_proof_new_leaves: new_leaves,
+        });
+
+        if subtree_count > 2 {
+            let ll = leaves_used;
+            let old_leaves = (0..leaves_per_subtree)
+                .map(|_| zero_hash)
+                .collect::<Vec<_>>();
+
+            for t in 0..(subtree_count - 3) {
+                let base_ind = ll + t * leaves_per_subtree;
+                let new_leaves = leaves[base_ind..(base_ind + leaves_per_subtree)].to_vec();
+                let bb1 = (cur_sub_tree_id as usize + t + 1) * leaves_per_subtree;
+                for (i, l) in new_leaves.iter().enumerate() {
+                    self.set_node_value(
+                        SimpleMerkleNodeKey::new(self.height, (bb1 + i) as u64),
+                        *l,
+                    );
+                }
+
+                results.push(SpidermanUpdateProof {
+                    top_line_proof: self
+                        .rehash_sub_tree_dmp(sub_tree_height, 1 + cur_sub_tree_id + t as u64),
+                    web_proof_old_leaves: old_leaves.clone(),
+                    web_proof_new_leaves: new_leaves,
+                });
+            }
+
+            // OPT: don't waste the old_leaves.clone()
+
+            let t = (subtree_count as usize)-3;
+            let base_ind = ll + t * leaves_per_subtree;
+            let new_leaves = leaves[base_ind..(base_ind + leaves_per_subtree)].to_vec();
+            let bb1 = (cur_sub_tree_id as usize + t + 1) * leaves_per_subtree;
+            for (i, l) in new_leaves.iter().enumerate() {
+                self.set_node_value(
+                    SimpleMerkleNodeKey::new(self.height, (bb1 + i) as u64),
+                    *l,
+                );
+            }
+
+            results.push(SpidermanUpdateProof {
+                top_line_proof: self
+                    .rehash_sub_tree_dmp(sub_tree_height, 1 + cur_sub_tree_id + t as u64),
+                web_proof_old_leaves: old_leaves,
+                web_proof_new_leaves: new_leaves,
+            });
+
+            leaves_used += (subtree_count - 2) * leaves_per_subtree;
+        }
+
+        if subtree_count > 1 {
+            let zero_hash = Hasher::get_zero_hash(0);
+
+            let old_leaves = (0..leaves_per_subtree)
+                .map(|_| zero_hash)
+                .collect::<Vec<_>>();
+
+            let mut new_leaves = Vec::with_capacity(leaves_per_subtree);
+            new_leaves.extend_from_slice(&leaves[leaves_used..]);
+            let remaining = leaves_per_subtree - new_leaves.len();
+            for _ in 0..remaining {
+                new_leaves.push(zero_hash);
+            }
+            let bb1 = ((cur_sub_tree_id as usize + subtree_count - 1) * leaves_per_subtree) as u64;
+
+            
+            for (i, l) in leaves[leaves_used..].iter().enumerate() {
+                self.set_node_value(
+                    SimpleMerkleNodeKey::new(self.height, bb1+i as u64),
+                    *l,
+                );
+            }
+
+            /*
+            // OPT: no need to set the zero leaves
+            for (i, l) in new_leaves.iter().enumerate() {
+                self.set_node_value(SimpleMerkleNodeKey::new(self.height, bb1 + i as u64), *l);
+            }*/
+            let top_line_proof = self.rehash_sub_tree_dmp(
+                sub_tree_height,
+                cur_sub_tree_id + (subtree_count - 1) as u64,
+            );
+            results.push(SpidermanUpdateProof {
+                top_line_proof: top_line_proof,
+                web_proof_old_leaves: old_leaves.clone(),
+                web_proof_new_leaves: new_leaves,
+            });
+        }
+
+        Ok(results)
+    }
+
+    pub fn append_leaves_spider_man_at_index(
+        &mut self,
+        sub_tree_height: u8,
+        append_index: u64,
+        leaves: &[Hash],
+    ) -> anyhow::Result<Vec<SpidermanUpdateProof<Hash>>> {
+        let leaves_per_subtree = 1usize << sub_tree_height;
+        let max_leaves = 1u64 << self.height;
         if (append_index) + (leaves.len() as u64) > max_leaves {
             anyhow::bail!("tree cannot fit an additional {} leaves", leaves.len());
         }

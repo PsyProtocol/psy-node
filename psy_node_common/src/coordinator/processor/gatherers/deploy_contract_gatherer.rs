@@ -32,7 +32,7 @@ use psy_io::tokio::{TokioFileLike, TokioLikeFileSystem};
 use psy_node_core::{
     psy_temp_db::StandardProcessorTempDBStoreBase,
     qblob::data_views::{
-        single_merkle_node_batch::generate_single_merkle_node_blob_from_leaves, zero_merkle_node_batch::create_ffs_merkle_nodes_zero_id_from_hash_map,
+        single_merkle_node_batch::{generate_single_merkle_node_blob_from_leaves, generate_single_merkle_node_blob_from_leaves_with_tree_height}, zero_merkle_node_batch::create_ffs_merkle_nodes_zero_id_from_hash_map,
     },
 };
 use psy_serialize::{FastFixedSerializable, PsyCanonicalDatabaseSerializeBaseSingle, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
@@ -121,7 +121,7 @@ pub async fn read_deploy_contract_gatherer_backup_file_path<
     let mut update_contract_function_tree_nodes_ffs = Vec::<u8>::new();
     //let mut contract_function_leaves =
     // Vec::<Vec::<Hash>>::with_capacity(num_new_contracts);
-    let mut new_contract_leaves_ffs = Vec::<u8>::with_capacity((num_new_contracts) * PSY_OBJECT_FFS_SIZE_CONTRACT_LEAF);
+    let mut new_contract_leaves_ffs = Vec::<u8>::with_capacity((num_new_contracts) * (PSY_OBJECT_FFS_SIZE_CONTRACT_LEAF + 8));
     let mut new_contract_code_definitions = Vec::<ContractCodeDefinitionWithContractId>::with_capacity(num_new_contracts as usize);
     let mut contract_leaf_bytes: [u8; PSY_OBJECT_FFS_SIZE_CONTRACT_LEAF] = [0u8; PSY_OBJECT_FFS_SIZE_CONTRACT_LEAF];
 
@@ -133,6 +133,7 @@ pub async fn read_deploy_contract_gatherer_backup_file_path<
         let leaf: PQEDContractLeaf<F, Hash> = PQEDContractLeaf::<F, Hash>::pio_read_from_io(&mut &contract_leaf_bytes[..])?;
         let leaf_hash = leaf.qfhash::<Hasher>();
         tree.set_leaf(contract_id, leaf_hash);
+        new_contract_leaves_ffs.extend_from_slice(&contract_id.to_le_bytes());
         new_contract_leaves_ffs.extend_from_slice(&contract_leaf_bytes);
 
         // contract function leaves
@@ -292,9 +293,6 @@ impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::J
             realm_sub_id: self.realm_sub_id_u64 as u16,
         }
     }
-    pub fn get_pending_unique_id(&self) -> u64 {
-        self.shared_status.read().unwrap().unique_pending_id
-    }
 }
 pub struct DeployContractGatherer<
     N: QNetworkTypesConfig,
@@ -309,6 +307,7 @@ pub struct DeployContractGatherer<
     pub update_contract_function_tree_nodes_ffs: Vec<u8>,
     pub new_contract_code_definitions: Vec<ContractCodeDefinitionWithContractId>,
 
+    pub unique_pending_id: u64,
     pub new_global_contract_tree_leaves: Vec<N::QHash>,
     pub new_contracts_file: FileSystem::File,
     pub pending_file_path: String,
@@ -360,6 +359,8 @@ impl<
             config.realm_sub_id_u64,
             shared_status.unique_pending_id,
         );
+
+        println!("created contract gatherer with unique_pending_id: {}, proc_id: {}", shared_status.unique_pending_id, unique_id);
         let mut new_contracts_file: FileSystem::File = config
             .file_system
             .file_like_fs_create(&new_deploy_contract_file_path)
@@ -387,6 +388,7 @@ impl<
 
         Ok(Self {
             config,
+            unique_pending_id: shared_status.unique_pending_id,
             shared_status,
             pending_core_proc_id: unique_id,
             new_contract_leaves: Vec::new(),
@@ -405,7 +407,9 @@ impl<
         _tree: &mut SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>,
         item: Vec<u8>,
     ) -> anyhow::Result<()> {
-        if item.len() <= PQEDContractLeaf::<N::F, N::QHash>::FIXED_SIZE + 16 + 4 + 32 {
+                println!("update_from_queue_item_with_tree with unique_pending_id: {}, proc_id: {}", self.unique_pending_id, self.pending_core_proc_id);
+
+        if item.len() < PQEDContractLeaf::<N::F, N::QHash>::FIXED_SIZE + 16 + 4 + 32 {
             // min size for a deploy with one leaf
             // added sanity check
             return Err(anyhow::anyhow!(
@@ -423,10 +427,10 @@ impl<
         let contract_leaf_data_bytes = deploy_contract_item.contract_leaf.ffs_to_bytes();
 
         let realm_identifier = self.config.get_realm_identifier();
-        let unique_pending_id = self.config.get_pending_unique_id();
+        let unique_pending_id = self.unique_pending_id;
 
         let (cfc_tree_root, contract_function_tree_leaves_ffs) =
-            generate_single_merkle_node_blob_from_leaves::<N::QHash, N::HasherBase>(contract_id, &deploy_contract_item.function_leaves);
+            generate_single_merkle_node_blob_from_leaves_with_tree_height::<N::QHash, N::HasherBase>(contract_id, &deploy_contract_item.function_leaves, N::CONTRACT_FUNCTION_TREE_HEIGHT);
         if cfc_tree_root != deploy_contract_item.contract_leaf.function_tree_root {
             return Err(anyhow::anyhow!(
                 "DeployContractGatherer function tree root mismatch for contract id {}: expected {:?}, got {:?}",
@@ -435,6 +439,8 @@ impl<
                 cfc_tree_root
             ));
         }
+
+        tracing::info!("getting deploy contract code definition from temp db for pending id {} with rand key {:?}", unique_pending_id, &deploy_contract_item.rand_key_id);
 
         let contract_code_defintion_bytes: Option<Vec<u8>> = self
             .config
@@ -476,6 +482,7 @@ impl<
 
         // START: update in-memory state
         self.new_contract_leaves.push(deploy_contract_item.contract_leaf);
+        self.new_contract_leaves_ffs.extend_from_slice(&contract_id.to_le_bytes());
         self.new_contract_leaves_ffs.extend_from_slice(&contract_leaf_data_bytes);
         self.new_global_contract_tree_leaves.push(leaf_hash);
         self.update_contract_function_tree_nodes_ffs
@@ -554,8 +561,8 @@ impl<
             let mut inputs = Vec::with_capacity(spider_map_proofs.len());
             let mut contract_leaf_data_ind = 0;
             for proof in spider_map_proofs {
-                let leaf_count = proof.get_non_zero_leaves_count();
-                let prepend_leaves = (0..proof.get_existing_prepended_leaves_count())
+                let leaf_count = proof.get_modified_leaves_count();
+                let prepend_leaves = (0..proof.get_existing_prepended_leaves_count_including_non_zero())
                     .map(|_| dummy_leaf.clone())
                     .collect::<Vec<_>>();
                 let new_contract_leaves = self.new_contract_leaves[contract_leaf_data_ind..(contract_leaf_data_ind + leaf_count)].to_vec();
@@ -704,7 +711,7 @@ impl<F: Copy, Hash: Q256BitHash>
         right: &AggStateTransitionInputV2<Hash>,
     ) -> AggStateTransitionInputV2<Hash> {
         let left_state_transition = left.get_state_transition();
-        let right_state_transition = right.condense();
+        let right_state_transition = right.condense_add_one();
 
         AggStateTransitionInputV2 {
             left_input: AggStateTransitionWithStats {
@@ -723,7 +730,7 @@ impl<F: Copy, Hash: Q256BitHash>
         right: &QCBatchDeployContractsCircuitInput<F, Hash>,
     ) -> AggStateTransitionInputV2<Hash> {
         let right_state_transition = right.get_state_transition();
-        let left_state_transition = left.condense();
+        let left_state_transition = left.condense_add_one();
 
         AggStateTransitionInputV2 {
             left_input: left_state_transition,
@@ -738,8 +745,8 @@ impl<F: Copy, Hash: Q256BitHash>
     }
 
     fn create_agg_to_agg_witness(left: &AggStateTransitionInputV2<Hash>, right: &AggStateTransitionInputV2<Hash>) -> AggStateTransitionInputV2<Hash> {
-        let left_state_transition = left.condense();
-        let right_state_transition = right.condense();
+        let left_state_transition = left.condense_add_one();
+        let right_state_transition = right.condense_add_one();
 
         AggStateTransitionInputV2 {
             left_input: left_state_transition,

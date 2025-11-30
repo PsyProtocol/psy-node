@@ -83,58 +83,17 @@ async fn test_client() -> anyhow::Result<()> {
     type Hasher = PoseidonHasher;
     type Hash = parth_core::PHash;
     type ZKProof = ProofWithPublicInputs<GoldilocksField, PoseidonGoldilocksConfig, 2>;
-
-    // Test WebSocket client
-    let ws_url = format!("ws://127.0.0.1:1337");
-    let ws_client = WsClientBuilder::default().build(&ws_url).await?;
-    let mut timer = DebugTimer::new("ws");
-    let batch_size = 1000;
-    for i in 0..batch_size {
-        let public_key_param = Hash::from_values(i,i, i, i);
-        let fingerprint = Hasher::q_two_to_one(public_key_param, public_key_param);
-        let zk_key = PZKPublicKeyInfo {
-            public_key_param,
-            fingerprint,
-        };
-        CoordinatorEdgeRpcClient::<
-            F,
-            Hash,
-            QProvingJobDataID,
-            ZKProof,
-        >::register_user(&ws_client, zk_key).await?;
-    }
-    
-
-    timer.lap_batch("ws", "register_user", batch_size as usize);
-
-           
-    println!("WebSocket client test passed.");
-
-    let mut timer = DebugTimer::new("http");
-
     // Test HTTP client
     let http_url = format!("http://127.0.0.1:1337");
     let http_client: HttpClient = HttpClientBuilder::default().build(&http_url)?;
-    for i in 0..batch_size {
-        let public_key_param = Hash::from_values(i,i, i, i);
-        let fingerprint = Hasher::q_two_to_one(public_key_param, public_key_param);
-        let zk_key = PZKPublicKeyInfo {
-            public_key_param,
-            fingerprint,
-        };
-        let http_result: String = CoordinatorEdgeRpcClient::<
-            F,
-            Hash,
-            QProvingJobDataID,
-            ZKProof,
-        >::register_user(&http_client, zk_key).await?;
-        println!("Registered user with fingerprint: {}", http_result);
-    }
-    timer.lap_batch("http", "register_user", batch_size as usize);
-    
-    println!("HTTP client test passed.");
+    let client = PsyCoordinatorHTTPClient::<F, Hash, Hasher, QProvingJobDataID, ZKProof, HttpClient>::new(http_client);
 
-    let h_client = PsyCoordinatorHTTPClient::<F, Hash, Hasher, QProvingJobDataID, ZKProof, HttpClient>::new(http_client);
+    // Test WebSocket client
+    let mut timer = DebugTimer::new("http");
+    timer.lap("init");
+    client.deploy_random_contracts(100, 10).await?;
+    timer.lap_batch("http", "deploy_random_contracts", 100);
+    
 
 
     Ok(())

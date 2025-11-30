@@ -243,6 +243,7 @@ impl<
         &self,
     ) -> anyhow::Result<(u64, QCoreProcCheckpointUniqueId, CoordinatorRegisterUserPublicKeyQueueKey<N::QHash>)> {
         let (unique_pending_id, unique_proc_checkpoint_id) = self.temp_db.get_gathering_unique_pending_ids(&self.realm_identifier).await?;
+        println!("got gathering unique pending id {} and gathering proc checkpoint id {}", unique_pending_id, unique_proc_checkpoint_id);
 
         Ok((
             unique_pending_id,
@@ -262,6 +263,7 @@ impl<
     ) -> anyhow::Result<(u64, QCoreProcCheckpointUniqueId, CoordinatorDeployContractQueueKey<N::F, N::QHash>)> {
         let (unique_pending_id, unique_proc_checkpoint_id) = self.temp_db.get_gathering_unique_pending_ids(&self.realm_identifier).await?;
 
+        println!("got gathering unique pending id {} and gathering proc checkpoint id {}", unique_pending_id, unique_proc_checkpoint_id);
         Ok((
             unique_pending_id,
             unique_proc_checkpoint_id,
@@ -316,6 +318,7 @@ impl<
                 code_definition.psy_ser_into_bytes_vec()?,
             )
             .await?;
+        tracing::info!("Stored deploy contract code definition raw in temp DB for pending id {} with rand key {:?}", unique_pending_id, &queue_item.rand_key_id);
 
         self.deploy_contract_queue
             .publish_ephemeral_queue_item_owned_bytes(

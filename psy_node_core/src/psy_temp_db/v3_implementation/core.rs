@@ -345,12 +345,12 @@ impl<T: QTempDatabaseRawKVReaderBase + Sync> QTempDBDeployContractDataReader for
         let value_bytes = self.qtdb_raw_kv_get_value(&key).await?;
         if value_bytes.is_some() {
             let value_bytes = value_bytes.unwrap();
-            if value_bytes.len() != 8 {
+            if value_bytes.len() == 0 {
                 return Ok(None);
             }
             Ok(Some(value_bytes))
         } else {
-            anyhow::bail!("deploy contract code definition not found");
+            anyhow::bail!("deploy contract code definition not found (key: {})", hex::encode(&key));
         }
     }
 }
@@ -365,7 +365,6 @@ impl<T: QTempDatabaseRawKVWriterBase + Sync> QTempDBDeployContractDataWriter for
         data: Vec<u8>,
     ) -> anyhow::Result<()> {
         let key = tt_get_deploy_contract_code_definition_key(rid.realm_id, rid.realm_sub_id, unique_pending_id, &rand_key);
-
         self.qtdb_raw_kv_put_value(&key, &data).await
     }
 }

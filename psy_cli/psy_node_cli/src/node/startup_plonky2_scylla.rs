@@ -92,6 +92,10 @@ pub async fn run_startup_plonky2_scylla_processor_node(config: &CoordinatorProce
             )
             .await?;
         }
+        _ => {
+            anyhow::bail!("Unsupported network type '{:?}' for Plonky2 Scylla coordinator processor node", config.network );
+        }
+        /*
         psy_core::constants::chain_id::PsyChainNetworkType::PsyTeamDevnet => {
             type N = QNetworkTypesConfigHelper<QProvingJobDataID, ZKTypesPlonky2GoldilocksPoseidon, PsyNetworkLocalDevnetConstants>;
             let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url).await?;
@@ -266,7 +270,7 @@ pub async fn run_startup_plonky2_scylla_processor_node(config: &CoordinatorProce
                 realm_identifier,
             )
             .await?;
-        }
+        }*/
     }
 
 
