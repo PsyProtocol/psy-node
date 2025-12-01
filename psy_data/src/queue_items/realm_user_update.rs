@@ -3,25 +3,27 @@ use psy_core::job::job_id::QProvingJobDataID;
 use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
 use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalDatabaseSerializeBaseSingle, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
 
-use crate::v1::qdata::user::PQEDUserLeaf;
+use crate::{guta::stats::GUTAStats, v1::qdata::user::PQEDUserLeaf};
 
 #[pderive::serialize_copy_f_hash_ts]
 #[ts(export, concrete(F = parth_core::PF, Hash = parth_core::PHash))]
-pub struct PsyRealmUserUpdatQueueItem<F, Hash> {
+pub struct PsyRealmUserUpdateQueueItem<F, Hash> {
     pub job_id: QProvingJobDataID,
     pub expected_fake_checkpoint_id: u64,
     pub old_user_leaf_hash: Hash,
     pub new_user_leaf_hash: Hash,
     pub new_user_leaf: PQEDUserLeaf<F, Hash>,
+    pub stats: GUTAStats<F>,
 }
 
-impl<F, Hash> PsyRealmUserUpdatQueueItem<F, Hash> {
+impl<F, Hash> PsyRealmUserUpdateQueueItem<F, Hash> {
     pub fn new(
         job_id: QProvingJobDataID,
         expected_fake_checkpoint_id: u64,
         old_user_leaf_hash: Hash,
         new_user_leaf_hash: Hash,
         new_user_leaf: PQEDUserLeaf<F, Hash>,
+        stats: GUTAStats<F>,
     ) -> Self {
         Self {
             job_id,
@@ -29,6 +31,7 @@ impl<F, Hash> PsyRealmUserUpdatQueueItem<F, Hash> {
             old_user_leaf_hash,
             new_user_leaf_hash,
             new_user_leaf,
+            stats,
         }
     }
 }
@@ -37,29 +40,30 @@ impl<F, Hash> PsyRealmUserUpdatQueueItem<F, Hash> {
 
 
 
-impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for PsyRealmUserUpdatQueueItem<F, Hash> {
+impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for PsyRealmUserUpdateQueueItem<F, Hash> {
     fn qp_rand_gen() -> Self
     where
         Self: Sized,
     {
-        PsyRealmUserUpdatQueueItem {
+        PsyRealmUserUpdateQueueItem {
             job_id: QProvingJobDataID::qp_rand_gen(),
             expected_fake_checkpoint_id: u64::qp_rand_gen(),
             old_user_leaf_hash: Hash::qp_rand_gen(),
             new_user_leaf_hash: Hash::qp_rand_gen(),
             new_user_leaf: PQEDUserLeaf::qp_rand_gen(),
+            stats: GUTAStats::qp_rand_gen(),
         }
     }
 }
 
 
-impl<F: QFelt64, Hash: Q256BitHash> PsyCanonicalSerializeMetadata for PsyRealmUserUpdatQueueItem<F, Hash> {
+impl<F: QFelt64, Hash: Q256BitHash> PsyCanonicalSerializeMetadata for PsyRealmUserUpdateQueueItem<F, Hash> {
     const IS_FIXED_SIZE: bool = true;
-    const FIXED_SIZE: usize = QJOB_ID_SERIALIZED_SIZE + 8 + 32 + 32 + PQEDUserLeaf::<F, Hash>::FIXED_SIZE;
+    const FIXED_SIZE: usize = QJOB_ID_SERIALIZED_SIZE + 8 + 32 + 32 + PQEDUserLeaf::<F, Hash>::FIXED_SIZE + GUTAStats::<F>::FIXED_SIZE;
 }
-impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for PsyRealmUserUpdatQueueItem<F, Hash> {
+impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for PsyRealmUserUpdateQueueItem<F, Hash> {
     fn fallback_pio_serialized_size(&self) -> usize {
-            PsyRealmUserUpdatQueueItem::<F, Hash>::FIXED_SIZE
+            Self::FIXED_SIZE
     }
     
     fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
@@ -68,6 +72,7 @@ impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for PsyRealmUs
         writer.psy_write_bytes_fixed(&self.old_user_leaf_hash.into_owned_32bytes())?;
         writer.psy_write_bytes_fixed(&self.new_user_leaf_hash.into_owned_32bytes())?;
         self.new_user_leaf.pio_write_to_io(writer)?;
+        self.stats.pio_write_to_io(writer)?;
 
         Ok(())
     }
@@ -78,12 +83,14 @@ impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for PsyRealmUs
         let old_user_leaf_hash = Hash::from_owned_32bytes(reader.psy_read_bytes_fixed()?);
         let new_user_leaf_hash = Hash::from_owned_32bytes(reader.psy_read_bytes_fixed()?);
         let new_user_leaf = PQEDUserLeaf::<F, Hash>::pio_read_from_io(reader)?;
+        let stats = GUTAStats::<F>::pio_read_from_io(reader)?;
         Ok(Self {
             job_id,
             expected_fake_checkpoint_id,
             old_user_leaf_hash,
             new_user_leaf_hash,
             new_user_leaf,
+            stats,
         })
     }
 
@@ -91,21 +98,21 @@ impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for PsyRealmUs
 
 #[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
 psy_serialize::impl_psy_canonical_serialize_for_speedy!(
-    PsyRealmUserUpdatQueueItem,
+    PsyRealmUserUpdateQueueItem,
     { F: QFelt64, Hash: Q256BitHash } => { F, Hash }
 );
 #[cfg(not(all(feature = "serialize_speedy", target_endian = "little")))]
-impl<F: QFelt64, Hash: Q256BitHash> psy_serialize::AutoImplementFallbackPsySerializeCanonical for PsyRealmUserUpdatQueueItem<F, Hash> {}
+impl<F: QFelt64, Hash: Q256BitHash> psy_serialize::AutoImplementFallbackPsySerializeCanonical for PsyRealmUserUpdateQueueItem<F, Hash> {}
 
 
 
 pser::impl_psy_ser_basic_tests_fallback!(
-    PsyRealmUserUpdatQueueItem,
+    PsyRealmUserUpdateQueueItem,
     { parth_core::PF, parth_core::PHash },
     global_user_tree_agg_header_with_tag_value_and_job_id_tests
 );
 
-impl<F: QFelt64, Hash: Q256BitHash> PCoreQueueItemBase for PsyRealmUserUpdatQueueItem<F, Hash> {
+impl<F: QFelt64, Hash: Q256BitHash> PCoreQueueItemBase for PsyRealmUserUpdateQueueItem<F, Hash> {
     fn is_queue_item(data: &[u8]) -> bool {
         data.len() == Self::FIXED_SIZE
     }

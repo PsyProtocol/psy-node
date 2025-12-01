@@ -52,6 +52,26 @@ impl QBlobDoubleMerkleNodeBatchDataView {
         }
         Ok((header, payload_data))
     }
+    pub fn validate_cst_nodes_batch_header_for_realm_context_get_clipped_any_unique_pending_id(
+        data: Vec<u8>,
+        chain_id: u32,
+        realm_id: u64,
+        realm_sub_id: u64,
+    ) -> anyhow::Result<(QBlobMerkleTreeNodeBatchHeaderV1, Vec<u8>)> {
+        let (header, payload_data) = QBlobMerkleTreeNodeBatchHeaderV1::clip_header_get_payload_for_blob_type_and_tree(
+            data,
+            QBlobDataType::GenericDoubleIdMerkleNodeBatch,
+            QBlobMerkleNodeTreeType::UserContractStateTree,
+            true,
+        )?;
+        if header.chain_id != chain_id
+            || header.realm_id != realm_id
+            || header.realm_sub_id != realm_sub_id
+        {
+            return Err(anyhow::anyhow!("Header context does not match expected context"));
+        }
+        Ok((header, payload_data))
+    }
     pub fn validate_uct_nodes_batch_header_for_realm_context_get_clipped_ref(
         data: &[u8],
         chain_id: u32,
@@ -69,6 +89,26 @@ impl QBlobDoubleMerkleNodeBatchDataView {
             || header.realm_id != realm_id
             || header.realm_sub_id != realm_sub_id
             || header.unique_pending_id != unique_pending_id
+        {
+            return Err(anyhow::anyhow!("Header context does not match expected context"));
+        }
+        Ok((header, payload_data))
+    }
+    pub fn validate_cst_nodes_batch_header_for_realm_context_get_clipped_ref_any_unique_pending_id(
+        data: &[u8],
+        chain_id: u32,
+        realm_id: u64,
+        realm_sub_id: u64,
+    ) -> anyhow::Result<(QBlobMerkleTreeNodeBatchHeaderV1, &[u8])> {
+        let (header, payload_data) = QBlobMerkleTreeNodeBatchHeaderV1::clip_header_get_payload_for_blob_type_and_tree_ref(
+            data,
+            QBlobDataType::GenericDoubleIdMerkleNodeBatch,
+            QBlobMerkleNodeTreeType::UserContractStateTree,
+            true,
+        )?;
+        if header.chain_id != chain_id
+            || header.realm_id != realm_id
+            || header.realm_sub_id != realm_sub_id
         {
             return Err(anyhow::anyhow!("Header context does not match expected context"));
         }

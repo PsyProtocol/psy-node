@@ -3,20 +3,15 @@ use std::{collections::HashMap, sync::Arc};
 use anyhow::Ok;
 use async_trait::async_trait;
 use parth_core::{
-    crypto::hash::{
+    QCoreProcCheckpointUniqueId, crypto::hash::{
         merkle_proof::{DeltaMerkleProofCore, MerkleProofCore},
         tag_tree::TagTreeMerkleProof,
-    },
-    data::{
+    }, data::{
         db::row::QDatabaseSingleIdTableRow,
         hash::{
-            merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey, PSY_OBJECT_FFS_SIZE_SIMPLE_MERKLE_NODE_KEY},
-            merkle_store_key::{QMerkleStoreDoubleIdKey, QMerkleStoreDoubleIdNode, QMerkleStoreSingleIdKey, QMerkleStoreSingleIdNode},
+            checkpointed_merkle_node::CheckpointedMerkleHash, merkle_node_key::{PSY_OBJECT_FFS_SIZE_SIMPLE_MERKLE_NODE_KEY, SimpleMerkleNode, SimpleMerkleNodeKey}, merkle_store_key::{QMerkleStoreDoubleIdKey, QMerkleStoreDoubleIdNode, QMerkleStoreSingleIdKey, QMerkleStoreSingleIdNode}
         },
-    },
-    felt::ToU64Value,
-    protocol::core_types::QNetworkDatabaseTypes,
-    QCoreProcCheckpointUniqueId,
+    }, felt::ToU64Value, protocol::core_types::QNetworkDatabaseTypes
 };
 use psy_data::{
     protocol::verifiable_checkpoint_transition::PsyVerifiableCheckpointTransitionWithProof,
@@ -705,6 +700,16 @@ impl<
     async fn global_user_tree_dump_all_leaves(&self, checkpoint_id: u64) -> anyhow::Result<HashMap<u64, N::QHash>> {
         self.store
             .db_dump_all_zero_id_merkle_node_leaves_chunked(&self.global_user_tree_table, checkpoint_id)
+            .await
+    }
+
+    async fn global_user_tree_get_node_and_checkpoint_id_max_checkpoint(
+        &self,
+        max_checkpoint_id: u64,
+        key: &SimpleMerkleNodeKey,
+    ) -> anyhow::Result<CheckpointedMerkleHash<N::QHash>> {
+        self.store
+            .db_select_zero_id_merkle_node_and_checkpoint_max_checkpoint(&self.global_user_tree_table, max_checkpoint_id, key)
             .await
     }
 }

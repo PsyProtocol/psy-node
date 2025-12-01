@@ -6,8 +6,7 @@ use futures::future;
 use parth_core::{
     crypto::hash::{
         tag_tree::{
-            hash_tag_tree_node, TagTreeMerkleProof,
-            TagTreeNodePreimage, TagTreeProofNode, TagTreeStorageNode,
+            TagTreeMerkleProof, TagTreeNodePreimage, TagTreeProofNode, TagTreeStorageNode, hash_tag_tree_node
         },
         traits::MerkleZeroHasher,
     },
@@ -25,12 +24,9 @@ use parth_core::{
             },
         },
         hash::{
-            fast_node_serializer::{
-                QMerkleStoreFastDoubleNodeSerializer, QMerkleStoreFastSingleNodeSerializer,
-                QMerkleStoreFastZeroNodeSerializer, QMS_FAST_SERIALIZER_DOUBLE_ID_NODE_SIZE,
-                QMS_FAST_SERIALIZER_SINGLE_ID_NODE_SIZE, QMS_FAST_SERIALIZER_ZERO_ID_NODE_SIZE,
-            },
-            merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey},
+            checkpointed_merkle_node::CheckpointedMerkleHash, fast_node_serializer::{
+                QMS_FAST_SERIALIZER_DOUBLE_ID_NODE_SIZE, QMS_FAST_SERIALIZER_SINGLE_ID_NODE_SIZE, QMS_FAST_SERIALIZER_ZERO_ID_NODE_SIZE, QMerkleStoreFastDoubleNodeSerializer, QMerkleStoreFastSingleNodeSerializer, QMerkleStoreFastZeroNodeSerializer
+            }, merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}
         },
         serializable::QPDPair,
     },
@@ -1145,6 +1141,26 @@ where
         }
     }
 
+    async fn db_select_zero_id_merkle_node_and_checkpoint_max_checkpoint(
+        &self,
+        table: &InMemoryTableIdentifier,
+        max_checkpoint_id: u64,
+        key: &SimpleMerkleNodeKey,
+    ) -> anyhow::Result<CheckpointedMerkleHash<Hash>> {
+        let db = self.get_or_create_table(&table.to_string());
+        let start_key = key_helpers::key_merkle_zero_id(key, 0);
+        let end_key = key_helpers::key_merkle_zero_id(key, max_checkpoint_id);
+        assert_ne!(table.tree_height, 0, "Tree height cannot be zero for table {}", table.to_string());
+        let entry = db.range(start_key..=end_key).next_back();
+        if let Some(e) = entry {
+            let key_bytes = e.key();
+            let checkpoint_id = u64::from_be_bytes(key_bytes[9..17].try_into()?);
+            let value = Hash::from_bytes(e.value())?;
+            Ok(CheckpointedMerkleHash { checkpoint_id, value: value })
+        } else {
+            Ok(CheckpointedMerkleHash { checkpoint_id: 0, value: Hasher::get_zero_hash((table.tree_height - key.level) as usize) })
+        }
+    }
     async fn db_select_many_zero_id_merkle_nodes_max_checkpoint(
         &self,
         table: &InMemoryTableIdentifier,

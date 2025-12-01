@@ -1,23 +1,16 @@
 use std::sync::Arc;
 
 use parth_core::{
-    crypto::hash::traits::QFieldHashable,
-    data::{hash::merkle_node_key::SimpleMerkleNodeKey, queue::queue_key::QPBaseQueueType},
-    felt::ToU64Value,
-    node::{realm_identifier::QRealmIdentifier, traits::realm},
-    protocol::core_types::{QNetworkTypesConfig, QZKProofVerifier},
-    QCoreProcCheckpointUniqueId, QProvingJobDataIDWithRewardPath,
+    QCoreProcCheckpointUniqueId, QProvingJobDataIDWithRewardPath, crypto::hash::{merkle_proof::MerkleProofCore, tag_tree::TagTreeMerkleProof, traits::QFieldHashable}, data::{hash::merkle_node_key::SimpleMerkleNodeKey, queue::queue_key::QPBaseQueueType}, felt::ToU64Value, node::{realm_identifier::QRealmIdentifier, traits::realm}, protocol::core_types::{QNetworkTypesConfig, QZKProofVerifier}
 };
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{
-    guta::header_extended::{GlobalUserTreeAggregatorHeaderWithTagValueAndJobID, GlobalUserTreeAggregatorHeaderWithTagValueAndJobType},
-    v1::{
+    guta::header_extended::{GlobalUserTreeAggregatorHeaderWithTagValueAndJobID, GlobalUserTreeAggregatorHeaderWithTagValueAndJobType}, prepared_block::realm::PsyRealmCoordinatorUpdate, v1::{
         common_api::PsyProoffMinerRewardProof,
         qdata::{
-            contract::{DashMapContractHeightCache, PQBCDeployContract, PsyDeployContractQueueItem},
-            public_key::PZKPublicKeyInfo,
+            checkpoint::PQEDCheckpointGlobalStateRoots, checkpoint_sync::{PQEDCheckpointCoreSyncInfo, PQEDCheckpointSyncInfoCompact}, contract::{DashMapContractHeightCache, PQBCDeployContract, PsyDeployContractQueueItem}, public_key::PZKPublicKeyInfo
         },
-    },
+    }
 };
 use psy_node_core::{
     psy_core_db::traits::full::{PsyCoordinatorEdgeAPIStoreReader, PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter},
@@ -25,7 +18,7 @@ use psy_node_core::{
     queue::{ephemeral::QStandardEphemeralQueuePublisher, worker_queue::QStandardWorkerQueueSubscriber},
     store::traits::proof_store::QParthProofStore,
 };
-use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
+use psy_serialize::{FastFixedSerializable, PsyCanonicalDatabaseSerializeBaseMulti, PsyCanonicalDatabaseSerializeBaseSingle};
 
 use crate::coordinator::queue_key::{
     CoordinatorDeployContractQueueKey, CoordinatorRegisterUserPublicKeyQueueKey, CoordinatorSubmitRealmGUTAUpdateQueueKey,
@@ -158,6 +151,72 @@ impl<
             contract_state_tree_height_cache: Arc::new(DashMapContractHeightCache::new()),
             checkpoint_state_transition_circuit_fingerprint,
         }
+    }
+    pub async fn get_checkpoint_leaves_batch_raw_internal(&self, start_checkpoint_id: u64, count: u32) -> anyhow::Result<Vec<u8>>{
+        let latest_checkpoint_id = self.get_latest_checkpoint_id_internal().await?;
+        if count > 10000 {
+            anyhow::bail!("requested count {} exceeds maximum of 10000", count);
+        }
+        let end_checkpoint = std::cmp::min(start_checkpoint_id + count as u64 - 1, latest_checkpoint_id);
+        let mut keys = Vec::with_capacity((end_checkpoint - start_checkpoint_id + 1) as usize);
+        for cid in start_checkpoint_id..=end_checkpoint {
+            keys.push(SimpleMerkleNodeKey{
+                level: 0,
+                index: cid,
+            });
+        }
+        let results: Vec<N::QHash> = self.db_reader.checkpoint_tree_get_nodes(latest_checkpoint_id, &keys).await?;
+
+        Ok(N::QHash::psy_ser_serialize_vec_of_self(results, false))
+
+    }
+
+    pub async fn get_realm_sync_info_internal(&self, realm_id: u64, checkpoint_id: u64) -> anyhow::Result<PsyRealmCoordinatorUpdate<N::F, N::QHash>> {
+        //let checkpoint_id = self.get_latest_checkpoint_id_internal().await?;
+        let l2_block_state = self.db_reader.get_l2_block_state(checkpoint_id).await?;
+        let checkpoint_leaf = self.db_reader.get_checkpoint_leaf_data(checkpoint_id).await?;
+        let state_roots:PQEDCheckpointGlobalStateRoots<N::QHash> = self.db_reader.get_checkpoint_global_state_roots(checkpoint_id).await?;
+        let checkpoint_tree_proof: MerkleProofCore<N::QHash> = self.db_reader.checkpoint_tree_get_merkle_proof(checkpoint_id, checkpoint_id).await?;
+
+        let upd: Option<(u64, u128)> = self.db_reader.get_unique_pending_id_for_checkpoint_id(checkpoint_id).await?;
+        if upd.is_none() {
+            anyhow::bail!("no unique pending id found for checkpoint id {}", checkpoint_id);
+        }
+        let (unique_pending_id, _) = upd.unwrap();
+
+        let merkle_proof_to_realm_root = self.db_reader.global_user_tree_get_merkle_proof_sub_tree(checkpoint_id, 0, N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT, realm_id).await?;
+
+
+        let reward_tree_top_proof_key: Option<SimpleMerkleNodeKey> = self.db_reader.get_realm_guta_reward_tree_node_key(realm_id, checkpoint_id).await?;
+
+        let reward_tree_top_proof = if let Some(proof_key) = reward_tree_top_proof_key {
+            let mut res = self.tag_tree_rewards_store.rewards_tag_tree_get_tag_tree_merkle_proof_at_unique_pending_id(unique_pending_id, &vec![proof_key]).await?;
+            if res.len() == 0 {
+                anyhow::bail!("no reward tree top proof found for realm id {} at checkpoint id {}", realm_id, checkpoint_id);
+            }
+            res.pop().unwrap()
+        } else {
+            TagTreeMerkleProof::<N::QHash>::new_empty()
+        };
+        Ok(PsyRealmCoordinatorUpdate {
+            checkpoint_sync_info: PQEDCheckpointSyncInfoCompact {
+                checkpoint_tree_root: checkpoint_tree_proof.root,
+                checkpoint_leaf_hash: checkpoint_tree_proof.value,
+                checkpoint_leaf: checkpoint_leaf,
+                state_roots: state_roots,
+                checkpoint_id,
+                coordinator_id: self.realm_id_u64,
+                coordinator_sub_id: self.realm_sub_id_u64,
+                coordinator_unique_pending_id: unique_pending_id,
+                block_state: l2_block_state,
+            },
+            merkle_proof_to_realm_root,
+            reward_tree_top_proof,
+        })
+
+
+
+        //self.db_reader.get_realm_coordinator_update_at_checkpoint_id(self.realm_id_u64 as u32, checkpoint_id).await
     }
     pub async fn get_latest_checkpoint_id_internal(&self) -> anyhow::Result<u64> {
         self.db_reader.get_latest_checkpoint_id().await

@@ -7,7 +7,7 @@ use parth_core::{
 };
 use psy_core::constants::stale_checkpoint::STALE_CHECKPOINT_AGE_REALM_TO_COORDINATOR_PROOF;
 use psy_io::tokio::{TokioFileLike, TokioLikeFileSystem};
-use psy_node_core::{psy_core_db::traits::full::PsyNodeCheckpointTreeDatabaseReader};
+use psy_node_core::{p2p::traits::realm_coordinantor::RealmCoordinatorClient, psy_core_db::traits::full::PsyNodeCheckpointTreeDatabaseReader};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 const CHECKPOINT_BACKUP_MAGIC_LEN: usize = 8;
@@ -36,6 +36,16 @@ pub struct CheckpointTreeBackupManager<
 impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std::hash::Hash + Q256BitHash, FileSystem: TokioLikeFileSystem>
     CheckpointTreeBackupManager<Hasher, Hash, FileSystem>
 {
+    pub fn get_current_checkpoint_id_head(&self) -> u64 {
+        if self.next_backup_checkpoint_id == 0 {
+            0
+        } else {
+            self.next_backup_checkpoint_id - 1
+        }
+    }
+    pub fn get_current_checkpoint_tree_root_head(&self) -> Hash {
+        self.checkpoint_tree.get_root()
+    }
     pub async fn new_from_file_path<CheckpointTreeStore: PsyNodeCheckpointTreeDatabaseReader<Hash>>(
         file_system: Arc<FileSystem>,
         max_checkpoints_to_keep: u64,
@@ -269,6 +279,97 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std
         self.min_backed_up_checkpoint_id = start_checkpoint_id;
         self.next_backup_checkpoint_id = start_checkpoint_id;
         Ok(())
+    }
+    pub async fn sync_from_coordinator_client<CoordinatorClient: RealmCoordinatorClient<F, Hash>, F>(
+        &mut self,
+        coordinator_client: &CoordinatorClient,
+        sync_batch_size: usize,
+    ) -> anyhow::Result<()> {
+        let latest_checkpoint_id: u64 = coordinator_client.rc_get_latest_checkpoint_id().await?;
+        let min_checkpoint = if latest_checkpoint_id >= STALE_CHECKPOINT_AGE_REALM_TO_COORDINATOR_PROOF {
+            latest_checkpoint_id - STALE_CHECKPOINT_AGE_REALM_TO_COORDINATOR_PROOF
+        } else {
+            0
+        };
+        let max_needed_checkpoint_id = latest_checkpoint_id;
+        if self.min_backed_up_checkpoint_id <= min_checkpoint && self.next_backup_checkpoint_id > max_needed_checkpoint_id {
+            tracing::info!("Checkpoint Backup Manager already up-to-date with coordinator. Current: {}, Latest: {}", self.next_backup_checkpoint_id - 1, latest_checkpoint_id);
+            return Ok(());
+        }
+        if self.min_backed_up_checkpoint_id > min_checkpoint {
+            let num_full_batches = (self.min_backed_up_checkpoint_id -min_checkpoint) / sync_batch_size as u64;
+            let partial_batch_size = (self.min_backed_up_checkpoint_id -min_checkpoint) % sync_batch_size as u64;
+            
+            let suffix_leaves = if self.next_backup_checkpoint_id > min_checkpoint {
+                let mut leaves = Vec::with_capacity((self.next_backup_checkpoint_id - min_checkpoint) as usize);
+
+                for i in min_checkpoint..self.next_backup_checkpoint_id {
+                    let hash = self.checkpoint_tree.get_leaf_value(i);
+                    leaves.push(hash);
+                }
+                leaves
+            }else{
+                Vec::new()
+            };
+            self.hard_reset_and_truncate(min_checkpoint).await?;
+            for i in 0..num_full_batches {
+                let start_id = min_checkpoint + i * sync_batch_size as u64;
+                let leaves = coordinator_client.rc_get_checkpoint_leaves_batch(start_id, sync_batch_size as u32).await?;
+                if leaves.len() != sync_batch_size {
+                    anyhow::bail!("Coordinator returned insufficient leaves for batch starting at {}", start_id);
+                }
+                for (i, hash) in leaves.into_iter().enumerate() {
+                    let checkpoint_id = start_id + i as u64;
+                    self.append_checkpoint_leaf_hash(checkpoint_id, hash).await?;
+                }
+            }
+            if partial_batch_size > 0 {
+                let start_id = min_checkpoint + num_full_batches * sync_batch_size as u64;
+                let leaves = coordinator_client.rc_get_checkpoint_leaves_batch(start_id, partial_batch_size as u32).await?;
+                if leaves.len() != partial_batch_size as usize {
+                    anyhow::bail!("Coordinator returned insufficient leaves for partial batch at {}", start_id);
+                }
+                for (i, hash) in leaves.into_iter().enumerate() {
+                    let checkpoint_id = start_id + i as u64;
+                    self.append_checkpoint_leaf_hash(checkpoint_id, hash).await?;
+                }
+            }
+            for (i, hash) in suffix_leaves.into_iter().enumerate() {
+                let checkpoint_id = min_checkpoint + num_full_batches * sync_batch_size as u64 + partial_batch_size + i as u64;
+                self.append_checkpoint_leaf_hash(checkpoint_id, hash).await?;
+            }
+        }
+        if self.next_backup_checkpoint_id <= max_needed_checkpoint_id {
+            let start_id = self.next_backup_checkpoint_id;
+            let total_to_fetch = max_needed_checkpoint_id - self.next_backup_checkpoint_id + 1;
+            let num_full_batches = total_to_fetch / sync_batch_size as u64;
+            let partial_batch_size = total_to_fetch % sync_batch_size as u64;
+
+            for i in 0..num_full_batches {
+                let batch_start_id = start_id + i * sync_batch_size as u64;
+                let leaves = coordinator_client.rc_get_checkpoint_leaves_batch(batch_start_id, sync_batch_size as u32).await?;
+                if leaves.len() != sync_batch_size {
+                    anyhow::bail!("Coordinator returned insufficient leaves for batch starting at {}", batch_start_id);
+                }
+                for (j, hash) in leaves.into_iter().enumerate() {
+                    let checkpoint_id = batch_start_id + j as u64;
+                    self.append_checkpoint_leaf_hash(checkpoint_id, hash).await?;
+                }
+            }
+            if partial_batch_size > 0 {
+                let batch_start_id = start_id + num_full_batches * sync_batch_size as u64;
+                let leaves = coordinator_client.rc_get_checkpoint_leaves_batch(batch_start_id, partial_batch_size as u32).await?;
+                if leaves.len() != partial_batch_size as usize {
+                    anyhow::bail!("Coordinator returned insufficient leaves for partial batch at {}", batch_start_id);
+                }
+                for (j, hash) in leaves.into_iter().enumerate() {
+                    let checkpoint_id = batch_start_id + j as u64;
+                    self.append_checkpoint_leaf_hash(checkpoint_id, hash).await?;
+                }
+            }
+        }
+        Ok(())
+
     }
 pub async fn sync_from_database<CheckpointTreeReader: PsyNodeCheckpointTreeDatabaseReader<Hash>>(
         &mut self,

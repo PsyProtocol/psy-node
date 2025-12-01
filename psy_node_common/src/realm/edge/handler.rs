@@ -9,7 +9,7 @@ use parth_core::{
 use psy_api_core::{realm::standard_edge_rpc::RealmEdgeRpcServer, worker::standard_worker_rpc::NodeEdgeWorkerRpcServer};
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{
-    proof_input::guta::end_cap_input::SubmitUserEndCapNonProofInput, queue_items::realm_user_update::PsyRealmUserUpdatQueueItem, v1::{
+    proof_input::guta::end_cap_input::SubmitUserEndCapNonProofInput, queue_items::realm_user_update::PsyRealmUserUpdateQueueItem, v1::{
         common_api::PsyProoffMinerRewardProof,
         qdata::{
             checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState},
@@ -345,12 +345,13 @@ impl<
         let new_user_leaf = user_end_cap_input.core.new_user_leaf.clone();
         let new_user_leaf_hash = new_user_leaf.qfhash::<N::HasherBase>();
 
-        let queue_item = PsyRealmUserUpdatQueueItem {
+        let queue_item = PsyRealmUserUpdateQueueItem {
             job_id,
             expected_fake_checkpoint_id: fake_checkpoint_id,
             old_user_leaf_hash: old_leaf_hash,
             new_user_leaf_hash,
             new_user_leaf,
+            stats: user_end_cap_input.core.stats,
         };
         self.user_update_queue.publish_ephemeral_queue_item_owned(&queue_key, self.realm_id_u64, self.realm_sub_id_u64, proc_checkpoint_id, 0, queue_item).await?;
 

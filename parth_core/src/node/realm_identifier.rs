@@ -1,11 +1,22 @@
-use crate::data::serializable::{QPDSerializable, QPDSerializableFixed};
+use crate::data::{hash::merkle_node_key::SimpleMerkleNodeKey, serializable::{QPDSerializable, QPDSerializableFixed}};
 
 #[pderive::serialize_copy_default]
 pub struct QRealmIdentifier {
     pub realm_id: u32,
     pub realm_sub_id: u16,
 }
-
+impl QRealmIdentifier {
+    pub fn new(realm_id: u32, realm_sub_id: u16) -> Self {
+        QRealmIdentifier { realm_id, realm_sub_id }
+    }
+    #[inline(always)]
+    pub fn get_root_merkle_node_key<const COORDINATOR_GLOBAL_USER_TREE_HEIGHT: u8>(&self) -> SimpleMerkleNodeKey {
+        SimpleMerkleNodeKey {
+            level: COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
+            index: (self.realm_id as u64) << COORDINATOR_GLOBAL_USER_TREE_HEIGHT
+        }
+    }
+}
 impl QPDSerializable for QRealmIdentifier {
     fn to_bytes(&self) -> anyhow::Result<Vec<u8>> {
         let mut bytes = Vec::with_capacity(6);

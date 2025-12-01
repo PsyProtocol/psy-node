@@ -1,11 +1,10 @@
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
 use parth_core::{
-    crypto::hash::merkle_proof::MerkleProofCore,
-    QProvingJobDataIDWithRewardPath,
+    QProvingJobDataIDWithRewardPath, crypto::hash::merkle_proof::MerkleProofCore, data::hash::checkpointed_merkle_node::CheckpointedMerkleHash
 };
 
 use psy_data::{
-    guta::header_extended::GlobalUserTreeAggregatorHeaderWithTagValueAndJobType, proof_input::guta::SubmitGUTARealmResultAPINoProofInput, v1::{
+    guta::header_extended::GlobalUserTreeAggregatorHeaderWithTagValueAndJobType, prepared_block::realm::PsyRealmCoordinatorUpdate, proof_input::guta::SubmitGUTARealmResultAPINoProofInput, v1::{
         common_api::{APILatestCheckpointResponse, PsyProoffMinerRewardProof},
         qdata::{
             checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState},
@@ -109,6 +108,14 @@ pub trait CoordinatorEdgeRpc<F, Hash, JobId, ZKProof>: NodeEdgeWorkerRpcServer<H
     #[method(name = "get_user_tree_merkle_proof")]
     async fn get_user_tree_merkle_proof(&self, checkpoint_id: u64, user_id: u64) -> RpcResult<MerkleProofCore<Hash>>;
 
+
+    #[method(name = "get_realm_root_and_last_modified_checkpoint")]
+    async fn get_realm_root_and_last_modified_checkpoint(
+        &self,
+        checkpoint_id: u64,
+        realm_id: u64,
+    ) -> RpcResult<CheckpointedMerkleHash<Hash>>;
+
     // Contract function tree
     #[method(name = "get_contract_function_tree_root")]
     async fn get_contract_function_tree_root(&self, checkpoint_id: u64, contract_id: u32) -> RpcResult<Hash>;
@@ -150,6 +157,14 @@ pub trait CoordinatorEdgeRpc<F, Hash, JobId, ZKProof>: NodeEdgeWorkerRpcServer<H
     #[method(name = "generate_batch_proof_miner_reward_proofs")]
     async fn generate_batch_proof_miner_reward_proofs(&self, unique_pending_id: u64, job_ids: Vec<QProvingJobDataIDWithRewardPath<JobId>>) -> RpcResult<Vec<PsyProoffMinerRewardProof<Hash, JobId>>>;
     
+
+    #[method(name = "get_realm_sync_info")]
+    async fn get_realm_sync_info(&self, checkpoint_id: u64) -> RpcResult<PsyRealmCoordinatorUpdate<F, Hash>>;
+
+    #[method(name = "get_checkpoint_leaves_batch_raw")]
+    async fn get_checkpoint_leaves_batch_raw(&self, start_checkpoint_id: u64, count: u32) -> RpcResult<Vec<u8>>;
+
+
 }
 
 

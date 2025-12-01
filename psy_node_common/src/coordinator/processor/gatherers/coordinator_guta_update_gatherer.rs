@@ -141,6 +141,8 @@ pub async fn read_coordinator_guta_update_gatherer_backup_file<
         start_global_user_tree_root,
         end_global_user_tree_root,
         random_seed_guta,
+        new_realm_guta_reward_tree_node_keys_ffs: vec![],
+        
     };
     Ok(output_db)
 }
@@ -208,6 +210,7 @@ impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::J
 #[derive(Clone)]
 pub struct CoordinatorGUTAUpdateGathererOutputDatabase<F, Hash> {
     pub update_global_user_tree_nodes_ffs: Vec<u8>,
+    pub new_realm_guta_reward_tree_node_keys_ffs: Vec<u8>,
     pub guta_stats: GUTAStats<F>,
     pub total_guta_proofs_generated: F,
 
@@ -441,6 +444,7 @@ impl<
             start_global_user_tree_root: self.start_global_user_tree_root,
             end_global_user_tree_root,
             random_seed_guta: get_temp_guta_rand_seed::<N::QHash>(),
+            new_realm_guta_reward_tree_node_keys_ffs: vec![],
         };
 
         let output = CoordinatorGUTAUpdateGathererOutput {

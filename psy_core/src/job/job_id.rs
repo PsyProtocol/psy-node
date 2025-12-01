@@ -633,13 +633,37 @@ impl QProvingJobDataID {
             0,
         )
     }
-    pub fn guta_two_end_cap_witness(checkpoint_id: u64, group_id: u32, sub_group_id: u32, task_index: u32) -> Self {
+    pub fn guta_two_linear_proof(unique_pending_id: u64, group_id: u32, task_index: u64) -> Self {
+        Self::new(
+            QJobTopic::GenerateStandardProof,
+            unique_pending_id,
+            group_id,
+            (task_index>>32) as u32,
+            (task_index&0xFFFF_FFFFu64) as u32,
+            ProvingJobCircuitType::GUTATwoGUTALinear,
+            ProvingJobDataType::StandardProof,
+            0,
+        )
+    }
+    pub fn guta_left_linear_right_end_cap_proof(unique_pending_id: u64, group_id: u32, task_index: u64) -> Self {
+        Self::new(
+            QJobTopic::GenerateStandardProof,
+            unique_pending_id,
+            group_id,
+            (task_index>>32) as u32,
+            (task_index&0xFFFF_FFFFu64) as u32,
+            ProvingJobCircuitType::GUTALeftGUTARightEndCap,
+            ProvingJobDataType::StandardProof,
+            0,
+        )
+    }
+    pub fn guta_two_end_cap_witness(checkpoint_id: u64, group_id: u32, task_index: u64) -> Self {
         Self::new(
             QJobTopic::GenerateStandardProof,
             checkpoint_id,
             group_id,
-            sub_group_id,
-            task_index,
+            (task_index>>32) as u32,
+            (task_index&0xFFFF_FFFFu64) as u32,
             ProvingJobCircuitType::GUTATwoEndCap,
             ProvingJobDataType::StandardProof,
             0,

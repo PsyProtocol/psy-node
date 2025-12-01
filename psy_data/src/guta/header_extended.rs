@@ -6,7 +6,7 @@ use psy_core::job::job_id::QProvingJobDataID;
 use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
 use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalDatabaseSerializeBaseSingle, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
 
-use crate::{guta::header::GlobalUserTreeAggregatorHeader, proof_input::guta::generic::GlobalUserTreeAggregatorHeaderWi, worker::{metadata::{PROOF_REWARD_TREE_HASH_MODE_HASH_CHILDREN_STANDARD, PsyProvingJobMetadata}, metadata_with_job_id::PsyProvingJobMetadataWithJobId}};
+use crate::{guta::{header::GlobalUserTreeAggregatorHeader, sub_tree_transition::SubTreeNodeStateTransition}, proof_input::guta::generic::GlobalUserTreeAggregatorHeaderWi, worker::{metadata::{PROOF_REWARD_TREE_HASH_MODE_HASH_CHILDREN_STANDARD, PsyProvingJobMetadata}, metadata_with_job_id::PsyProvingJobMetadataWithJobId}};
 
 
 

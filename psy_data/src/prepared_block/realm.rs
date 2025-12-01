@@ -2,7 +2,7 @@
 use parth_core::utils::QPGenRandom;
 #[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
 use parth_core::{felt::QFelt64, protocol::core_types::Q256BitHash};
-use parth_core::{QCoreProcCheckpointUniqueId, crypto::hash::merkle_proof::MerkleProofCore};
+use parth_core::{QCoreProcCheckpointUniqueId, crypto::hash::{merkle_proof::MerkleProofCore, tag_tree::TagTreeMerkleProof}};
 use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
 use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
 
@@ -141,9 +141,8 @@ pser::impl_psy_ser_basic_tests_fallback!(
 #[pderive::serialize_clone_f_hash_ts]
 #[ts(export, concrete(F = parth_core::PF, Hash = parth_core::PHash))]
 pub struct PsyPreparedRealmBlockStateUpdatesWithCoordinatorUpdate<F, Hash> {
-    pub checkpoint_sync_info: PQEDCheckpointSyncInfoCompact<F, Hash>,
-    pub merkle_proof_to_realm_root: MerkleProofCore<Hash>,
-    pub prepared_core: PsyPreparedRealmBlockStateUpdates<Hash>,
+    pub prepared_updates: PsyPreparedRealmBlockStateUpdates<Hash>,
+    pub coordinator_update: PsyRealmCoordinatorUpdate<F, Hash>,
 }
 
 
@@ -157,9 +156,8 @@ impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for PsyPreparedRealmBlockSta
         Self: Sized,
     {
         Self {
-            checkpoint_sync_info: PQEDCheckpointSyncInfoCompact::qp_rand_gen(),
-            merkle_proof_to_realm_root: MerkleProofCore::qp_rand_gen(),
-            prepared_core: PsyPreparedRealmBlockStateUpdates::qp_rand_gen(),
+            prepared_updates: PsyPreparedRealmBlockStateUpdates::qp_rand_gen(),
+            coordinator_update: PsyRealmCoordinatorUpdate::qp_rand_gen(),
         }
     }
 }
@@ -171,27 +169,23 @@ impl<F: QFelt64, Hash: Q256BitHash> PsyCanonicalSerializeMetadata for PsyPrepare
 
 impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for PsyPreparedRealmBlockStateUpdatesWithCoordinatorUpdate<F, Hash> {
     fn fallback_pio_serialized_size(&self) -> usize {
-        self.checkpoint_sync_info.pio_serialized_size() +
-        self.merkle_proof_to_realm_root.pio_serialized_size() +
-        self.prepared_core.pio_serialized_size()
+        self.prepared_updates.pio_serialized_size() +
+        self.coordinator_update.pio_serialized_size()
     }
 
     fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
-        self.checkpoint_sync_info.pio_write_to_io(writer)?;
-        self.merkle_proof_to_realm_root.pio_write_to_io(writer)?;
-        self.prepared_core.pio_write_to_io(writer)?;
+        self.prepared_updates.pio_write_to_io(writer)?;
+        self.coordinator_update.pio_write_to_io(writer)?;
         Ok(())
     }
 
     fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
-        let checkpoint_sync_info = PQEDCheckpointSyncInfoCompact::<F, Hash>::pio_read_from_io(reader)?;
-        let merkle_proof_to_realm_root = MerkleProofCore::<Hash>::pio_read_from_io(reader)?;
-        let prepared_core = PsyPreparedRealmBlockStateUpdates::<Hash>::pio_read_from_io(reader)?;
+        let prepared_updates = PsyPreparedRealmBlockStateUpdates::<Hash>::pio_read_from_io(reader)?;
+        let coordinator_update = PsyRealmCoordinatorUpdate::<F, Hash>::pio_read_from_io(reader)?;
 
         Ok(Self {
-            checkpoint_sync_info,
-            merkle_proof_to_realm_root,
-            prepared_core,
+            prepared_updates,
+            coordinator_update,
         })
     }
 }
@@ -212,4 +206,85 @@ pser::impl_psy_ser_basic_tests_fallback!(
     PsyPreparedRealmBlockStateUpdatesWithCoordinatorUpdate,
     { parth_core::PF, parth_core::PHash },
     psy_prepared_realm_block_state_updates_with_coordinator_update_tests
+);
+
+
+
+
+
+
+#[pderive::serialize_clone_f_hash_ts]
+#[ts(export, concrete(F = parth_core::PF, Hash = parth_core::PHash))]
+pub struct PsyRealmCoordinatorUpdate<F, Hash> {
+    pub checkpoint_sync_info: PQEDCheckpointSyncInfoCompact<F, Hash>,
+    pub merkle_proof_to_realm_root: MerkleProofCore<Hash>,
+    pub reward_tree_top_proof: TagTreeMerkleProof<Hash>,
+}
+
+
+
+
+
+#[cfg(feature = "rand_gen")]
+impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for PsyRealmCoordinatorUpdate<F, Hash> {
+    fn qp_rand_gen() -> Self
+    where
+        Self: Sized,
+    {
+        Self {
+            checkpoint_sync_info: PQEDCheckpointSyncInfoCompact::qp_rand_gen(),
+            merkle_proof_to_realm_root: MerkleProofCore::qp_rand_gen(),
+            reward_tree_top_proof: TagTreeMerkleProof::qp_rand_gen(),
+        }
+    }
+}
+
+impl<F: QFelt64, Hash: Q256BitHash> PsyCanonicalSerializeMetadata for PsyRealmCoordinatorUpdate<F, Hash> {
+    const IS_FIXED_SIZE: bool = false;
+    const FIXED_SIZE: usize = 0;
+}
+
+impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for PsyRealmCoordinatorUpdate<F, Hash> {
+    fn fallback_pio_serialized_size(&self) -> usize {
+        self.checkpoint_sync_info.pio_serialized_size() +
+        self.merkle_proof_to_realm_root.pio_serialized_size() +
+        self.reward_tree_top_proof.pio_serialized_size()
+    }
+
+    fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
+        self.checkpoint_sync_info.pio_write_to_io(writer)?;
+        self.merkle_proof_to_realm_root.pio_write_to_io(writer)?;
+        self.reward_tree_top_proof.pio_write_to_io(writer)?;
+        Ok(())
+    }
+
+    fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
+        let checkpoint_sync_info = PQEDCheckpointSyncInfoCompact::<F, Hash>::pio_read_from_io(reader)?;
+        let merkle_proof_to_realm_root = MerkleProofCore::<Hash>::pio_read_from_io(reader)?;
+        let reward_tree_top_proof = TagTreeMerkleProof::<Hash>::pio_read_from_io(reader)?;
+
+        Ok(Self {
+            checkpoint_sync_info,
+            merkle_proof_to_realm_root,
+            reward_tree_top_proof,
+        })
+    }
+}
+
+#[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
+psy_serialize::impl_psy_canonical_serialize_for_speedy!(
+    PsyRealmCoordinatorUpdate,
+    { F: QFelt64, Hash: Q256BitHash } => { F, Hash }
+);
+
+#[cfg(not(all(feature = "serialize_speedy", target_endian = "little")))]
+impl<F: QFelt64, Hash: Q256BitHash> psy_serialize::AutoImplementFallbackPsySerializeCanonical
+    for PsyRealmCoordinatorUpdate<F, Hash>
+{
+}
+
+pser::impl_psy_ser_basic_tests_fallback!(
+    PsyRealmCoordinatorUpdate,
+    { parth_core::PF, parth_core::PHash },
+    psy_realm_coordinator_update_tests
 );

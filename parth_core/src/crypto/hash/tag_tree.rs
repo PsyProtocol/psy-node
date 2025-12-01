@@ -268,6 +268,29 @@ pub struct TagTreeMerkleProof<Hash> {
     pub siblings: Vec<TagTreeProofNode<Hash>>,
 }
 
+impl<Hash: Copy + ZeroableHash + PartialEq> TagTreeMerkleProof<Hash> {
+    pub fn new_empty() -> Self {
+        Self {
+            root: Hash::get_zero_value(),
+            leaf: TagTreeNodePreimage {
+                left: Hash::get_zero_value(),
+                right: Hash::get_zero_value(),
+                tag: Hash::get_zero_value(),
+            },
+            index: 0,
+            siblings: Vec::new(),
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.siblings.len() == 0
+            && self.index == 0
+            && self.leaf.left == Hash::get_zero_value()
+            && self.leaf.right == Hash::get_zero_value()
+            && self.leaf.tag == Hash::get_zero_value()
+            && self.root == Hash::get_zero_value()
+    }
+}
+
 #[cfg(feature = "std")]
 impl<Hash: QNamedType> QNamedType for TagTreeMerkleProof<Hash> {
     fn q_type_name() -> String {

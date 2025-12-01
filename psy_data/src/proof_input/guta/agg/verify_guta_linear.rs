@@ -2,12 +2,27 @@ use std::hash::Hash;
 
 #[cfg(feature = "rand_gen")]
 use parth_core::utils::QPGenRandom;
-use parth_core::{crypto::hash::{merkle_proof::{DeltaMerkleProofCore, MerkleProofCore}, traits::{FieldQHasher, QFieldHashable}}, felt::{QFelt, QFelt64}, protocol::core_types::{Q256BitHash, QFHashBase}};
-use psy_serialize::{PsyCanonicalSerializeMetadata, PsyIOReadWrite};
+use parth_core::{
+    crypto::hash::{
+        merkle_proof::{DeltaMerkleProofCore, MerkleProofCore},
+        traits::{FieldQHasher, QFieldHashable},
+    },
+    felt::{QFelt, QFelt64},
+    protocol::core_types::{Q256BitHash, QFHashBase},
+};
+use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
+use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
 
-use crate::guta::{header::GlobalUserTreeAggregatorHeader, sub_tree_transition::SubTreeNodeStateTransition};
-use psy_serialize::FallbackPsySerializeCanonical;
-
+use crate::{
+    guta::{
+        header::GlobalUserTreeAggregatorHeader, header_extended::GlobalUserTreeAggregatorHeaderWithJobId,
+        sub_tree_transition::SubTreeNodeStateTransition,
+    },
+    worker::{
+        metadata::{PsyProvingJobMetadata, PROOF_REWARD_TREE_HASH_MODE_HASH_CHILDREN_STANDARD},
+        metadata_with_job_id::PsyProvingJobMetadataWithJobId,
+    },
+};
 
 #[pderive::serialize_copy_f_hash_ts]
 #[ts(export, concrete(F = parth_core::PF, Hash = parth_core::PHash))]
@@ -33,7 +48,9 @@ impl<F: QFelt, Hash: Copy> GUTAVerifyTwoGUTALinearCircuitInput<F, Hash> {
                 node_level: self.left_header.state_transition.node_level,
             },
             stats: self.left_header.stats.combine_with(&self.right_header.stats),
-            total_aggregation_proofs_generated: self.left_header.total_aggregation_proofs_generated + self.right_header.total_aggregation_proofs_generated + F::from_u8_value(1),
+            total_aggregation_proofs_generated: self.left_header.total_aggregation_proofs_generated
+                + self.right_header.total_aggregation_proofs_generated
+                + F::from_u8_value(1),
         }
     }
 }
@@ -41,6 +58,40 @@ impl<F: QFelt64, Hash: QFHashBase<F>> GUTAVerifyTwoGUTALinearCircuitInput<F, Has
     pub fn get_public_inputs_hash_no_rewards_tag<Hasher: FieldQHasher<F, Hash>>(&self) -> Hash {
         let new_guta_header = self.get_new_guta_header();
         new_guta_header.qfhash::<Hasher>()
+    }
+
+    pub fn get_job_witness_and_new_guta<Hasher: FieldQHasher<F, Hash>>(
+        &self,
+        unique_pending_id: u64,
+        level: u8,
+        index: u64,
+        left_job_id: QProvingJobDataID,
+        right_job_id: QProvingJobDataID,
+    ) -> (
+        PsyProvingJobMetadataWithJobId<Hash, QProvingJobDataID>,
+        GlobalUserTreeAggregatorHeaderWithJobId<F, Hash>,
+    ) {
+        let job_id = QProvingJobDataID::guta_two_linear_proof(
+            unique_pending_id,
+            level as u32,
+            index,
+        );
+        let new_guta_header = GlobalUserTreeAggregatorHeaderWithJobId {
+            job_id,
+            header: self.get_new_guta_header(),
+        };
+        let job_metadata = PsyProvingJobMetadataWithJobId {
+            job_id: job_id,
+            metadata: PsyProvingJobMetadata {
+                expected_public_inputs_hash: self.get_public_inputs_hash_no_rewards_tag::<Hasher>(),
+                reward_tree_node_index: index,
+                reward_tree_node_level: 0,
+                reward_tree_hash_mode: PROOF_REWARD_TREE_HASH_MODE_HASH_CHILDREN_STANDARD,
+                reward_tree_node_children: 2,
+                dependencies: vec![left_job_id, right_job_id],
+            },
+        };
+        (job_metadata, new_guta_header)
     }
 }
 
@@ -71,7 +122,9 @@ impl<F: QFelt, Hash: Copy> GUTAVerifyTwoGUTALinearUpgradeCheckpointCircuitInput<
                 node_level: self.left_header.state_transition.node_level,
             },
             stats: self.left_header.stats.combine_with(&self.right_header.stats),
-            total_aggregation_proofs_generated: self.left_header.total_aggregation_proofs_generated + self.right_header.total_aggregation_proofs_generated + F::from_u8_value(1),
+            total_aggregation_proofs_generated: self.left_header.total_aggregation_proofs_generated
+                + self.right_header.total_aggregation_proofs_generated
+                + F::from_u8_value(1),
         }
     }
 }
@@ -109,11 +162,12 @@ impl<F: QFelt, Hash: Copy> GUTAVerifyLeftLinearRightLeafUpgradeCheckpointCircuit
                 node_level: self.left_header.state_transition.node_level,
             },
             stats: self.left_header.stats.combine_with(&self.right_header.stats),
-            total_aggregation_proofs_generated: self.left_header.total_aggregation_proofs_generated + self.right_header.total_aggregation_proofs_generated + F::from_u8_value(1),
+            total_aggregation_proofs_generated: self.left_header.total_aggregation_proofs_generated
+                + self.right_header.total_aggregation_proofs_generated
+                + F::from_u8_value(1),
         }
     }
 }
-
 
 impl<F: QFelt64, Hash: QFHashBase<F>> GUTAVerifyLeftLinearRightLeafUpgradeCheckpointCircuitInput<F, Hash> {
     pub fn get_public_inputs_hash_no_rewards_tag<Hasher: FieldQHasher<F, Hash>>(&self) -> Hash {
@@ -158,10 +212,7 @@ impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for GUTAVerify
         let left_header = GlobalUserTreeAggregatorHeader::<F, Hash>::pio_read_from_io(reader)?;
         let right_header = GlobalUserTreeAggregatorHeader::<F, Hash>::pio_read_from_io(reader)?;
 
-        Ok(Self {
-            left_header,
-            right_header,
-        })
+        Ok(Self { left_header, right_header })
     }
 }
 
@@ -172,17 +223,13 @@ psy_serialize::impl_psy_canonical_serialize_for_speedy!(
 );
 
 #[cfg(not(all(feature = "serialize_speedy", target_endian = "little")))]
-impl<F: QFelt64, Hash: Q256BitHash> psy_serialize::AutoImplementFallbackPsySerializeCanonical
-    for GUTAVerifyTwoGUTALinearCircuitInput<F, Hash>
-{
-}
+impl<F: QFelt64, Hash: Q256BitHash> psy_serialize::AutoImplementFallbackPsySerializeCanonical for GUTAVerifyTwoGUTALinearCircuitInput<F, Hash> {}
 
 pser::impl_psy_ser_basic_tests_fallback!(
     GUTAVerifyTwoGUTALinearCircuitInput,
     { parth_core::PF, parth_core::PHash },
     guta_verify_two_guta_linear_circuit_input_tests
 );
-
 
 // ================================================================================================
 // GUTAVerifyTwoGUTALinearUpgradeCheckpointCircuitInput
@@ -210,10 +257,10 @@ impl<F: QFelt64, Hash: Q256BitHash> PsyCanonicalSerializeMetadata for GUTAVerify
 
 impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for GUTAVerifyTwoGUTALinearUpgradeCheckpointCircuitInput<F, Hash> {
     fn fallback_pio_serialized_size(&self) -> usize {
-        self.left_header.pio_serialized_size() +
-        self.right_header.pio_serialized_size() +
-        self.left_historical_checkpoint_proof.pio_serialized_size() +
-        self.right_historical_checkpoint_proof.pio_serialized_size()
+        self.left_header.pio_serialized_size()
+            + self.right_header.pio_serialized_size()
+            + self.left_historical_checkpoint_proof.pio_serialized_size()
+            + self.right_historical_checkpoint_proof.pio_serialized_size()
     }
 
     fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
@@ -257,7 +304,6 @@ pser::impl_psy_ser_basic_tests_fallback!(
     guta_verify_two_guta_linear_upgrade_checkpoint_circuit_input_tests
 );
 
-
 // ================================================================================================
 // GUTAVerifyLeftLinearRightLeafUpgradeCheckpointCircuitInput
 // ================================================================================================
@@ -284,10 +330,10 @@ impl<F: QFelt64, Hash: Q256BitHash> PsyCanonicalSerializeMetadata for GUTAVerify
 
 impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for GUTAVerifyLeftLinearRightLeafUpgradeCheckpointCircuitInput<F, Hash> {
     fn fallback_pio_serialized_size(&self) -> usize {
-        self.left_header.pio_serialized_size() +
-        self.right_header.pio_serialized_size() +
-        self.right_global_user_tree_delta_merkle_proof.pio_serialized_size() +
-        self.right_historical_checkpoint_proof.pio_serialized_size()
+        self.left_header.pio_serialized_size()
+            + self.right_header.pio_serialized_size()
+            + self.right_global_user_tree_delta_merkle_proof.pio_serialized_size()
+            + self.right_historical_checkpoint_proof.pio_serialized_size()
     }
 
     fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {

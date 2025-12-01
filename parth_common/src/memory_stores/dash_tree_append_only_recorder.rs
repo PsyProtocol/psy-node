@@ -6,18 +6,13 @@ use std::marker::PhantomData;
 use crate::memory_stores::traits::{PsyMemoryMerkleStoreAppendOnlyReaderBase, PsyMemoryMerkleStoreAppendOnlyReaderBaseAsync, PsyMemoryMerkleStoreImm};
 
 // --- Start of Refactored Code ---
-#[inline(always)]
-const fn is_key_contained_in_historical_store(
-    tree_height: u8,
-    historical_index: u64,
-    key: &SimpleMerkleNodeKey,
-) -> bool {
-    key.index <= historical_index >> (tree_height - key.level)
-}
+
 #[derive(Debug, Clone)]
-pub struct PsyDashMemoryAppendOnlyMerkleStore<Hasher, Hash: Eq + Copy + PartialEq + Default + std::hash::Hash> {
+pub struct PsyDashMemoryAppendOnlyMerkleRecorderStore<Hasher, Hash: Eq + Copy + PartialEq + Default + std::hash::Hash> {
     pub nodes: DashMap<SimpleMerkleNodeKey, Hash>,
+    pub updated_nodes: DashMap<SimpleMerkleNodeKey, Hash>,
     pub roots: DashMap<Hash, u64>,
+
     height: u8,
     /// Pre-computed hashes for empty subtrees of a given height.
     /// `zero_value_hashes[h]` is the hash of an empty tree of height `h`.
@@ -26,7 +21,7 @@ pub struct PsyDashMemoryAppendOnlyMerkleStore<Hasher, Hash: Eq + Copy + PartialE
 }
 
 impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + Eq + PartialEq + Default + std::hash::Hash>
-    PsyDashMemoryAppendOnlyMerkleStore<Hasher, Hash>
+    PsyDashMemoryAppendOnlyMerkleRecorderStore<Hasher, Hash>
 {
     pub fn new(height: u8) -> Self {
         let zero_value_hashes = (0..=height)
@@ -35,6 +30,7 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + Eq + PartialEq + Default + std
 
         Self {
             nodes: DashMap::new(),
+            updated_nodes: DashMap::new(),
             roots: DashMap::new(),
             height,
             zero_value_hashes,
@@ -49,19 +45,6 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + Eq + PartialEq + Default + std
             Some(v) => {
                 let index = *v;
                 Ok(self.get_leaf(index))
-            },
-            None => anyhow::bail!("Root not found in append-only store"),
-        }
-    }
-    pub fn get_historical_index_append_only_merkle_proof_for_root(
-        &self,
-        checkpoint_tree_root: Hash,
-        historical_index: u64,
-    ) -> anyhow::Result<MerkleProofCore<Hash>> {
-        match self.roots.get(&checkpoint_tree_root) {
-            Some(v) => {
-                let index = *v;
-                Ok(self.get_historical_merkle_proof_at_historical_index(index, historical_index))
             },
             None => anyhow::bail!("Root not found in append-only store"),
         }
@@ -108,6 +91,8 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + Eq + PartialEq + Default + std
         }
         if self.nodes.contains_key(&SimpleMerkleNodeKey::new(self.height, index+1)) {
             anyhow::bail!("Leaf at index {} already exists, so we cannot append at the index before it", index+1);
+        }else if self.updated_nodes.contains_key(&SimpleMerkleNodeKey::new(self.height, index+1)) {
+            anyhow::bail!("Leaf at index {} already exists in updated nodes, so we cannot append at the index before it", index+1);
         }
         let proof = self.set_leaf(index, leaf);
         self.roots.insert(proof.new_root, index);
@@ -120,42 +105,25 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + Eq + PartialEq + Default + std
             None => None,
         }
     }
-    pub fn get_historical_node_value(&self, key: &SimpleMerkleNodeKey, historical_index: u64) -> Hash {
-        
-        if is_key_contained_in_historical_store(self.height, historical_index, key) {
-            match self.nodes.get(key) {
-                Some(v) => *v,
-                None => self.get_zero_hash_for_level(key.level),
+    pub fn commit_changes(&self) {
+        for entry in self.updated_nodes.iter() {
+            let key = *entry.key();
+            let value = *entry.value();
+            if value == self.get_zero_hash_for_level(key.level) {
+                self.nodes.remove(&key);
+            } else {
+                self.nodes.insert(key, value);
             }
-        } else {
-            self.get_zero_hash_for_level(key.level)
         }
+        self.updated_nodes.clear();
     }
-    pub fn get_historical_merkle_proof_at_historical_index(
-        &self,
-        index: u64,
-        historical_index: u64,
-    ) -> MerkleProofCore<Hash> {
-        // get the merkle proof showing the inclusion of a leaf, at the point in time where the leaf at historical index is the last non-zero leaf
-        
-        let leaf_key = SimpleMerkleNodeKey::new(self.get_height(), index);
-        let value = self.get_historical_node_value(&leaf_key, historical_index);
-
-        let mut siblings = Vec::with_capacity(self.get_height() as usize);
-        let mut current_key = leaf_key;
-
-        while current_key.level > 0 {
-            siblings.push(self.get_historical_node_value(&current_key.sibling(), historical_index));
-            current_key = current_key.parent();
-        }
-
-        let root = self.get_historical_node_value(&current_key, historical_index);
-        MerkleProofCore { index, siblings, root, value }
+    pub fn revert_changes(&self) {
+        self.updated_nodes.clear();
     }
 
 }
 #[async_trait]
-impl<Hasher: MerkleZeroHasher<Hash> + Send + Sync, Hash: Eq + Copy + PartialEq + Default + std::hash::Hash + Send + Sync> PsyMemoryMerkleStoreAppendOnlyReaderBaseAsync<Hash> for PsyDashMemoryAppendOnlyMerkleStore<Hasher, Hash> {
+impl<Hasher: MerkleZeroHasher<Hash> + Send + Sync, Hash: Eq + Copy + PartialEq + Default + std::hash::Hash + Send + Sync> PsyMemoryMerkleStoreAppendOnlyReaderBaseAsync<Hash> for PsyDashMemoryAppendOnlyMerkleRecorderStore<Hasher, Hash> {
 
     async fn get_merkle_proof_for_leaf_async(
         &self,
@@ -180,7 +148,7 @@ impl<Hasher: MerkleZeroHasher<Hash> + Send + Sync, Hash: Eq + Copy + PartialEq +
     }
 }
 
-impl<Hasher: MerkleZeroHasher<Hash> + Send + Sync, Hash: Eq + Copy + PartialEq + Default + std::hash::Hash + Send + Sync> PsyMemoryMerkleStoreAppendOnlyReaderBase<Hash> for PsyDashMemoryAppendOnlyMerkleStore<Hasher, Hash> {
+impl<Hasher: MerkleZeroHasher<Hash> + Send + Sync, Hash: Eq + Copy + PartialEq + Default + std::hash::Hash + Send + Sync> PsyMemoryMerkleStoreAppendOnlyReaderBase<Hash> for PsyDashMemoryAppendOnlyMerkleRecorderStore<Hasher, Hash> {
 
     #[inline]
     fn get_merkle_proof_for_leaf(
@@ -211,7 +179,7 @@ impl<Hasher: MerkleZeroHasher<Hash> + Send + Sync, Hash: Eq + Copy + PartialEq +
 }
 
 
-impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std::hash::Hash> PsyMemoryMerkleStoreImm<Hasher, Hash> for PsyDashMemoryAppendOnlyMerkleStore<Hasher, Hash> {
+impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std::hash::Hash> PsyMemoryMerkleStoreImm<Hasher, Hash> for PsyDashMemoryAppendOnlyMerkleRecorderStore<Hasher, Hash> {
     #[inline]
     fn get_height(&self) -> u8 {
         self.height
@@ -227,20 +195,17 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std
     
     #[inline]
     fn set_node_value(&self, key: SimpleMerkleNodeKey, value: Hash) {
-        // Optimization: If a node's value is the default for its level (i.e., it represents
-        // an empty subtree), we can remove it from the map to save space.
-        if value.eq(&self.get_zero_hash_for_level(key.level)) {
-            self.nodes.remove(&key);
-        } else {
-            self.nodes.insert(key, value);
-        }
+        self.updated_nodes.insert(key, value);
     }
     
     #[inline]
     fn get_node_value(&self, key: &SimpleMerkleNodeKey) -> Hash {
         match self.nodes.get(key) {
             Some(v) => *v,
-            None => self.get_zero_hash_for_level(key.level),
+            None => match self.updated_nodes.get(key) {
+                Some(v) => *v,
+                None => self.get_zero_hash_for_level(key.level),
+            },
         }
     }
 
@@ -259,7 +224,7 @@ mod tests {
     // Concrete types for testing
     type TestHash = Hash256;
     type TestHasher = CoreSha256Hasher;
-    type TestMerkleStore = PsyDashMemoryAppendOnlyMerkleStore<TestHasher, TestHash>;
+    type TestMerkleStore = PsyDashMemoryAppendOnlyMerkleRecorderStore<TestHasher, TestHash>;
 
     // Helper functions for generating test data
     fn gen_random_hash() -> TestHash {

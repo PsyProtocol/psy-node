@@ -1,20 +1,15 @@
 use async_trait::async_trait;
 use jsonrpsee::core::RpcResult;
 use parth_core::{
-    crypto::{
+    QProvingJobDataIDWithRewardPath, crypto::{
         hash::merkle_proof::MerkleProofCore,
         secp256k1::{QEDCompressedSecp256K1Signature, SimpleTimedRequest},
-    },
-    data::hash::merkle_node_key::SimpleMerkleNodeKey,
-    node::realm_identifier::QRealmIdentifier,
-    protocol::core_types::QNetworkTypesConfig,
-    QProvingJobDataIDWithRewardPath,
+    }, data::hash::{checkpointed_merkle_node::CheckpointedMerkleHash, merkle_node_key::SimpleMerkleNodeKey}, node::realm_identifier::QRealmIdentifier, protocol::core_types::QNetworkTypesConfig
 };
 use psy_api_core::{coordinator::standard_edge_rpc::CoordinatorEdgeRpcServer, worker::standard_worker_rpc::NodeEdgeWorkerRpcServer};
 use psy_core::job::job_id::QProvingJobDataID;
 use psy_data::{
-    guta::header_extended::GlobalUserTreeAggregatorHeaderWithTagValueAndJobType,
-    v1::{
+    guta::header_extended::GlobalUserTreeAggregatorHeaderWithTagValueAndJobType, prepared_block::realm::PsyRealmCoordinatorUpdate, v1::{
         common_api::PsyProoffMinerRewardProof,
         qdata::{
             checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState},
@@ -22,8 +17,7 @@ use psy_data::{
             public_key::PZKPublicKeyInfo,
             user::PQEDUserLeaf,
         },
-    },
-    worker::api_response::{PsyWorkerGetProvingWorkAPIResponse, PsyWorkerGetProvingWorkWithChildProofsAPIResponse},
+    }, worker::api_response::{PsyWorkerGetProvingWorkAPIResponse, PsyWorkerGetProvingWorkWithChildProofsAPIResponse}
 };
 use psy_node_core::{
     psy_core_db::traits::full::{PsyCoordinatorEdgeAPIStoreReader, PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter},
@@ -250,6 +244,24 @@ impl<
     async fn get_user_registration_tree_merkle_proof(&self, checkpoint_id: u64, leaf_index: u64) -> QRpcResult<MerkleProofCore<N::QHash>> {
         res(self.db_reader.user_registration_tree_get_merkle_proof(checkpoint_id, leaf_index).await)
     }
+
+    async fn get_realm_sync_info(&self, checkpoint_id: u64) -> RpcResult<PsyRealmCoordinatorUpdate<N::F, N::QHash>> {
+        
+        res(self.get_realm_sync_info_internal(self.realm_id_u64, checkpoint_id).await)
+    }
+    async fn get_checkpoint_leaves_batch_raw(&self, start_checkpoint_id: u64, count: u32) -> RpcResult<Vec<u8>>{
+
+        res(self.get_checkpoint_leaves_batch_raw_internal(start_checkpoint_id, count).await)
+    }
+
+    async fn get_realm_root_and_last_modified_checkpoint(
+        &self,
+        checkpoint_id: u64,
+        realm_id: u64,
+    ) -> RpcResult<CheckpointedMerkleHash<N::QHash>> {
+        res(self.db_reader.global_user_tree_get_node_and_checkpoint_id_max_checkpoint(checkpoint_id, &SimpleMerkleNodeKey { level: N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT, index: realm_id }).await)
+    }
+
 }
 
 #[async_trait]

@@ -6,3 +6,4 @@ pub mod tag_tree_node_key;
 pub mod fast_node_serializer;
 mod mnk1;
 pub mod merkle_node_nest;
+pub mod checkpointed_merkle_node;

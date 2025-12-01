@@ -4,12 +4,12 @@ use std::hash::Hash;
 use parth_core::utils::QPGenRandom;
 use parth_core::{
     crypto::hash::{
-        merkle_proof::{compute_historical_and_current_merkle_roots_core_gt, DeltaMerkleProofCore, MerkleProofCore},
+        merkle_proof::{DeltaMerkleProofCore, MerkleProofCore, compute_historical_and_current_merkle_roots_core_gt},
         nca::nca_proof::PartialUpdateNearestCommonAncestorProof,
-        traits::{MerkleHasher, MerkleZeroHasher},
+        traits::{FieldQHasher, MerkleHasher, MerkleZeroHasher, QFieldHashable},
     },
     felt::QFelt64,
-    protocol::core_types::Q256BitHash,
+    protocol::core_types::{Q256BitHash, QFHashBase},
 };
 use psy_core::job::job_id::QProvingJobDataID;
 use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
@@ -273,6 +273,12 @@ impl<F: QFelt64, Hash: Copy> VerifySingleEndCapInputV2<F, Hash> {
             checkpoint_tree_root_hash: self.core.checkpoint_root,
             user_id: self.user_id,
         }
+    }
+}
+impl<F: QFelt64, Hash: QFHashBase<F>> VerifySingleEndCapInputV2<F, Hash> {
+    pub fn get_public_inputs_hash_no_rewards_tag<Hasher: FieldQHasher<F, Hash>>(&self, global_user_tree_height: u8) -> Hash {
+        let new_guta_header = self.get_new_guta_header(global_user_tree_height);
+        new_guta_header.qfhash::<Hasher>()
     }
 }
 

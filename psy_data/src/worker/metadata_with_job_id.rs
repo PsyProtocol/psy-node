@@ -15,9 +15,14 @@ pub struct PsyProvingJobMetadataWithJobId<Hash, JobId> {
     pub job_id: JobId,
     pub metadata: PsyProvingJobMetadata<Hash, JobId>,
 }
-impl<Hash, JobId> PsyProvingJobMetadataWithJobId<Hash, JobId> {
+impl<Hash, JobId: Copy> PsyProvingJobMetadataWithJobId<Hash, JobId> {
     pub fn get_reward_tree_node_key(&self) -> SimpleMerkleNodeKey {
         self.metadata.get_reward_tree_node_key()
+    }
+    pub fn update_level_and_index(&mut self, level: u8, index: u64) -> &[JobId]{
+        self.metadata.reward_tree_node_level = level;
+        self.metadata.reward_tree_node_index = index;
+        &self.metadata.dependencies
     }
 }
 impl<Hash: QPGenRandom, JobId: QPGenRandom> QPGenRandom for PsyProvingJobMetadataWithJobId<Hash, JobId> {

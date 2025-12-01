@@ -8,8 +8,7 @@ use parth_core::{
         tag_tree::TagTreeMerkleProof,
     }, data::
         hash::{
-            merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey},
-            merkle_store_key::{QMerkleStoreDoubleIdKey, QMerkleStoreDoubleIdNode, QMerkleStoreSingleIdKey, QMerkleStoreSingleIdNode},
+            checkpointed_merkle_node::CheckpointedMerkleHash, merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}, merkle_store_key::{QMerkleStoreDoubleIdKey, QMerkleStoreDoubleIdNode, QMerkleStoreSingleIdKey, QMerkleStoreSingleIdNode}
         }
     
 };
@@ -70,6 +69,11 @@ pub trait PsyNodeGlobalUserTreeDatabaseReader<Hash> {
     async fn global_user_tree_get_nodes(&self, checkpoint_id: u64, keys: &[SimpleMerkleNodeKey]) -> anyhow::Result<Vec<Hash>>;
     async fn global_user_tree_get_node(&self, checkpoint_id: u64, key: SimpleMerkleNodeKey) -> anyhow::Result<Hash>;
     async fn global_user_tree_dump_all_leaves(&self, checkpoint_id: u64) -> anyhow::Result<HashMap<u64, Hash>>;
+    async fn global_user_tree_get_node_and_checkpoint_id_max_checkpoint(
+        &self,
+        max_checkpoint_id: u64,
+        key: &SimpleMerkleNodeKey,
+    ) -> anyhow::Result<CheckpointedMerkleHash<Hash>>;
 }
 
 #[async_trait]
@@ -402,6 +406,7 @@ pub trait PsyCoordinatorEdgeAPIStoreReader<F, Hash>:
     + PsyNodeGlobalContractTreeDatabaseReader<Hash>
     + PsyNodeUserRegistrationTreeDatabaseReader<Hash>
     + PsyNodeCheckpointTransitionZKProofDatabaseReader<F, Hash>
+    + PsyNodeCoordinatorSpecificDatabaseReader<F, Hash>
 {
 }
 impl<
@@ -416,7 +421,8 @@ impl<
             + PsyNodeContractFunctionTreeDatabaseReader<Hash>
             + PsyNodeGlobalContractTreeDatabaseReader<Hash>
             + PsyNodeUserRegistrationTreeDatabaseReader<Hash>
-        + PsyNodeCheckpointTransitionZKProofDatabaseReader<F, Hash>,
+        + PsyNodeCheckpointTransitionZKProofDatabaseReader<F, Hash>
+        + PsyNodeCoordinatorSpecificDatabaseReader<F, Hash>,
         F,
         Hash,
     > PsyCoordinatorEdgeAPIStoreReader<F, Hash> for T
@@ -454,6 +460,10 @@ pub trait PsyCoordinatorProcessorStore<F, Hash>:
     // 10. Proof store for checkpoint proofs
     + PsyNodeCheckpointTransitionZKProofDatabaseReader<F, Hash>
     + PsyNodeCheckpointTransitionZKProofDatabaseWriter<F, Hash>
+
+    //11. Coordinator Specific Data (R/W)
+    + PsyNodeCoordinatorSpecificDatabaseReader<F, Hash>
+    + PsyNodeCoordinatorSpecificDatabaseWriter<F, Hash>
 {
 }
 
@@ -483,9 +493,63 @@ impl<
             + PsyNodeCoreDatabaseContractObjectStoreReader<F, Hash>
             + PsyNodeCoreDatabaseContractObjectStoreWriter<F, Hash>
             + PsyNodeCheckpointTransitionZKProofDatabaseReader<F, Hash>
-            + PsyNodeCheckpointTransitionZKProofDatabaseWriter<F, Hash>,
+            + PsyNodeCheckpointTransitionZKProofDatabaseWriter<F, Hash>            
+            + PsyNodeCoordinatorSpecificDatabaseReader<F, Hash>
+            + PsyNodeCoordinatorSpecificDatabaseWriter<F, Hash>,
         F,
         Hash,
     > PsyCoordinatorProcessorStore<F, Hash> for T
+{
+}
+
+
+pub trait PsyRealmProcessorStore<F, Hash>:
+    // 1. Checkpoint Tree (R/W)
+    PsyNodeCheckpointTreeDatabaseReader<Hash>
+    + PsyNodeCheckpointTreeDatabaseWriter<Hash>
+    
+    + PsyNodeGlobalUserTreeDatabaseReader<Hash>
+    + PsyNodeGlobalUserTreeDatabaseWriter<Hash>
+
+    // 6. Rewards Tag Tree (R/W)
+    + PsyNodeCoreRewardsTagTreeStoreReader<F, Hash>
+    + PsyNodeCoreRewardsTagTreeStoreWriter<F, Hash>
+    // 7. Object/Metadata (R/W)
+    + PsyNodeCheckpointObjectDatabaseReader<F, Hash>
+    + PsyNodeCheckpointObjectDatabaseWriter<F, Hash>
+    // 8. User Store (R/W)
+    + PsyNodeCoreDatabaseUserStoreReader<F, Hash>
+    + PsyNodeCoreDatabaseUserStoreWriter<F, Hash>
+    + PsyNodeUserContractTreeDatabaseReader<Hash>
+    + PsyNodeUserContractTreeDatabaseWriter<Hash>
+    + PsyNodeContractStateTreeTreeDatabaseReader<Hash>
+    + PsyNodeContractStateTreeTreeDatabaseWriter<Hash>
+
+{
+}
+
+impl<
+        T: PsyNodeCheckpointTreeDatabaseReader<Hash>
+        + PsyNodeCheckpointTreeDatabaseWriter<Hash>
+        
+        + PsyNodeGlobalUserTreeDatabaseReader<Hash>
+        + PsyNodeGlobalUserTreeDatabaseWriter<Hash>
+
+        // 6. Rewards Tag Tree (R/W)
+        + PsyNodeCoreRewardsTagTreeStoreReader<F, Hash>
+        + PsyNodeCoreRewardsTagTreeStoreWriter<F, Hash>
+        // 7. Object/Metadata (R/W)
+        + PsyNodeCheckpointObjectDatabaseReader<F, Hash>
+        + PsyNodeCheckpointObjectDatabaseWriter<F, Hash>
+        // 8. User Store (R/W)
+        + PsyNodeCoreDatabaseUserStoreReader<F, Hash>
+        + PsyNodeCoreDatabaseUserStoreWriter<F, Hash>
+        + PsyNodeUserContractTreeDatabaseReader<Hash>
+        + PsyNodeUserContractTreeDatabaseWriter<Hash>
+        + PsyNodeContractStateTreeTreeDatabaseReader<Hash>
+        + PsyNodeContractStateTreeTreeDatabaseWriter<Hash>,
+        F,
+        Hash,
+    > PsyRealmProcessorStore<F, Hash> for T
 {
 }

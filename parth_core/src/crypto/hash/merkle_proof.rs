@@ -451,6 +451,9 @@ impl<Hash: PartialEq + Copy> MerkleProofCore<Hash> {
         compute_historical_append_root_core::<Hash, Hasher>(&self)
 
     }
+    pub fn compute_root_with_value<Hasher: MerkleHasher<Hash>>(&self, new_value: Hash) -> Hash {
+        compute_root_merkle_proof_generic::<Hash, Hasher>(new_value, self.index, &self.siblings)
+    }
 }
 impl<Hash: PartialEq + Copy> MerkleProofCore<Hash> {
     pub fn new_from_params<Hasher: MerkleHasher<Hash>>(index: u64, value: Hash, siblings: Vec<Hash>) -> Self {

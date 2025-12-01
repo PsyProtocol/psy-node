@@ -7,11 +7,10 @@ use parth_common::{
 };
 use parth_core::{
     crypto::hash::{
-        merkle_proof::{compute_root_merkle_proof_generic, DeltaMerkleProofCore, MerkleProofCore},
-        traits::{FieldQHasher, QFieldHashable},
+        merkle_proof::{DeltaMerkleProofCore, MerkleProofCore, compute_root_merkle_proof_generic}, tag_tree::TagTreeMerkleProof, traits::{FieldQHasher, QFieldHashable}
     },
     data::{
-        db::hash_id_u64::{QHash256AndU64, PSY_OBJECT_FFS_SIZE_HASH_256_AND_U64},
+        db::hash_id_u64::{PSY_OBJECT_FFS_SIZE_HASH_256_AND_U64, QHash256AndU64},
         hash::{fast_node_serializer::QMerkleStoreFastZeroNodeSerializer, merkle_node_nest::MerkleLeafNode},
     },
     felt::QFelt64,
@@ -20,17 +19,13 @@ use parth_core::{
 use psy_core::user_id::get_user_id_from_registration_id;
 use psy_data::{
     genesis::genesis_block_setup::PsyGenesisBlockSetupData,
-    prepared_block::{common::PsyCoordinatorPendingCheckpointBase, coordinator::PsyPreparedCoordinatorBlockStateUpdates},
+    prepared_block::{common::PsyCoordinatorPendingCheckpointBase, coordinator::PsyPreparedCoordinatorBlockStateUpdates, realm::{PsyPreparedRealmBlockStateUpdates, PsyPreparedRealmBlockStateUpdatesWithCoordinatorUpdate, PsyRealmCoordinatorUpdate}},
     protocol::{
         checkpoint_transition_hash::{CheckpointStateHashTransition, CheckpointStateTransitionPublicInputs},
         verifiable_checkpoint_transition::PsyVerifiableCheckpointTransition,
     },
     v1::qdata::{
-        checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, PQEDCheckpointLeafStats, QEDL2BlockState},
-        contract::{ContractCodeDefinitionWithContractId, PQEDContractLeaf},
-        ffs_sizes::{PSY_OBJECT_FFS_SIZE_CONTRACT_LEAF, PSY_OBJECT_FFS_SIZE_USER_LEAF, PSY_OBJECT_FFS_SIZE_ZK_PUBLIC_KEY},
-        populated_checkpoint::PsyCheckpointLeafPopulated,
-        user::PQEDUserLeaf,
+        checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, PQEDCheckpointLeafStats, QEDL2BlockState}, checkpoint_sync::PQEDCheckpointSyncInfoCompact, contract::{ContractCodeDefinitionWithContractId, PQEDContractLeaf}, ffs_sizes::{PSY_OBJECT_FFS_SIZE_CONTRACT_LEAF, PSY_OBJECT_FFS_SIZE_USER_LEAF, PSY_OBJECT_FFS_SIZE_ZK_PUBLIC_KEY}, populated_checkpoint::PsyCheckpointLeafPopulated, user::PQEDUserLeaf
     },
 };
 use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingleFixedTemplate;
@@ -370,6 +365,71 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
     }
     pub fn get_genesis_state_transition_hash<Hasher: FieldQHasher<F, Hash>>(&self, checkpoint_tree_height: u8) -> Hash {
         self.get_genesis_state_transition::<Hasher>(checkpoint_tree_height).get_hash::<Hasher>()
+    }
+
+    pub fn setup_for_realm<Hasher: FieldQHasher<F, Hash>, N: QNetworkConstants>(
+        genesis_block: &PsyGenesisBlockSetupData<F, Hash>,
+        realm_id: u64,
+        realm_sub_id: u64,
+    ) -> anyhow::Result<
+        PsyPreparedRealmBlockStateUpdatesWithCoordinatorUpdate<F, Hash>,
+    > {
+        let mut builder = GenesisDatabaseDataBuilder::new(
+            genesis_block.deposit_tree_root,
+            genesis_block.withdrawal_tree_root,
+            genesis_block.checkpoint_stats.clone(),
+        );
+        let merkle_proof_to_realm_root = builder.setup_users::<Hasher, N>(
+            genesis_block,
+            Some(realm_id),
+            false,
+            true,
+        )?.unwrap();
+        let reward_tree_proof = TagTreeMerkleProof::new_empty();
+        let state_roots = builder.get_checkpoint_state_roots();
+
+        let checkpoint_leaf = builder.get_populated_checkpoint_leaf().to_checkpoint_leaf::<Hasher>();
+
+        let checkpoint_leaf_hash = checkpoint_leaf.qfhash::<Hasher>();
+        let siblings = (0..N::CHECKPOINT_TREE_HEIGHT_USIZE)
+            .map(|i| Hasher::get_zero_hash(i))
+            .collect::<Vec<Hash>>();
+        let checkpoint_tree_root = compute_root_merkle_proof_generic::<Hash, Hasher>(checkpoint_leaf_hash, 0, &siblings);
+
+        let coordinator_update = PsyRealmCoordinatorUpdate {
+            checkpoint_sync_info: PQEDCheckpointSyncInfoCompact{ 
+                state_roots,
+                checkpoint_id: 0,
+                coordinator_id: 0,
+                coordinator_sub_id: 0,
+                coordinator_unique_pending_id: 0,
+                block_state: builder.get_core_block_state(),
+                checkpoint_leaf: checkpoint_leaf,
+                checkpoint_leaf_hash: checkpoint_leaf_hash,
+                checkpoint_tree_root: checkpoint_tree_root,
+            },
+            merkle_proof_to_realm_root,
+            reward_tree_top_proof: reward_tree_proof,
+        };
+        let prepared_updates = PsyPreparedRealmBlockStateUpdates {
+            realm_id,
+            realm_sub_id,
+            unique_pending_id: 0,
+            proc_checkpoint_unique_id: 0,
+            update_user_contract_tree_nodes_ffs: builder.user_contract_tree_nodes_ffs,
+            update_contract_state_tree_nodes_ffs: builder.contract_state_tree_nodes_ffs,
+            update_user_leaves_ffs: builder.user_leaves_ffs,
+            old_realm_root: coordinator_update.merkle_proof_to_realm_root.root,
+            new_realm_root: coordinator_update.merkle_proof_to_realm_root.root,
+            update_global_user_tree_nodes_ffs: builder.global_user_tree_nodes_ffs,
+        };
+
+        let prepared_updates_with_coordinator = PsyPreparedRealmBlockStateUpdatesWithCoordinatorUpdate {
+            prepared_updates,
+            coordinator_update,
+        };
+
+        Ok(prepared_updates_with_coordinator)
     }
 
     pub fn setup_for_coordinator<Hasher: FieldQHasher<F, Hash>, N: QNetworkConstants>(

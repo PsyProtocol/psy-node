@@ -14,7 +14,7 @@ use parth_core::{
                 QDatabaseSingleIdTableRowLike, QDatabaseSingleIdTableRowNoCheckpointId, QDatabaseSingleIdTableRowNoCheckpointIdLike, QDoubleIdKey,
             },
         },
-        hash::merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey},
+        hash::{checkpointed_merkle_node::CheckpointedMerkleHash, merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}},
         serializable::QPDPair,
     },
     protocol::core_types::QHashBase,
@@ -597,6 +597,12 @@ pub trait CoreDatabaseZeroIdMerkleReader<
         max_checkpoint_id: u64,
         key: &SimpleMerkleNodeKey,
     ) -> anyhow::Result<Hash>;
+    async fn db_select_zero_id_merkle_node_and_checkpoint_max_checkpoint(
+        &self,
+        table: &TableIdentifier,
+        max_checkpoint_id: u64,
+        key: &SimpleMerkleNodeKey,
+    ) -> anyhow::Result<CheckpointedMerkleHash<Hash>>;
     async fn db_select_many_zero_id_merkle_nodes_max_checkpoint(
         &self,
         table: &TableIdentifier,

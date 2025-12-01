@@ -7,8 +7,7 @@ use parth_core::{
     data::{
         db::table::QDatabaseTableRoutingKey,
         hash::{
-            fast_node_serializer::{QMerkleStoreFastZeroNodeSerializer, QMS_FAST_SERIALIZER_ZERO_ID_NODE_SIZE},
-            merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey},
+            checkpointed_merkle_node::CheckpointedMerkleHash, fast_node_serializer::{QMS_FAST_SERIALIZER_ZERO_ID_NODE_SIZE, QMerkleStoreFastZeroNodeSerializer}, merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}
         },
     },
     protocol::core_types::{QDBHashBase, QHash256Base, QHashBase},
@@ -31,6 +30,8 @@ pub struct ScyllaMerkleNodesZeroPreparedStatements {
     pub insert_1_prepared: Arc<PreparedStatement>,
     pub select_1_statement: Statement,
     pub select_1_prepared: Arc<PreparedStatement>,
+    pub select_1_and_checkpoint_statement: Statement,
+    pub select_1_and_checkpoint_prepared: Arc<PreparedStatement>,
 
     //pub insert_batch_serialized_512_prepared: Arc<Batch>,
     pub insert_batch_serialized_256_prepared: Arc<Batch>,
@@ -63,6 +64,11 @@ impl ScyllaMerkleNodesZeroPreparedStatements {
             keyspace, table_name
         ));
         let select_1_prepared = session.prepare(select_1_statement.clone()).await?;
+        let select_1_and_checkpoint_statement = Statement::new(&format!(
+            "SELECT value, checkpoint_id FROM {}.{} WHERE level = ? AND node_index = ? AND checkpoint_id <= ? LIMIT 1",
+            keyspace, table_name
+        ));
+        let select_1_and_checkpoint_prepared = session.prepare(select_1_and_checkpoint_statement.clone()).await?;
         // Prepare the dump-specific select: fetches node_index and value, ordered by
         // clustering (node_index ASC, checkpoint_id DESC).
 
@@ -72,8 +78,10 @@ impl ScyllaMerkleNodesZeroPreparedStatements {
             insert_batch_serialized_64_prepared: Arc::new(generate_batch_prepared_statement(&session, &insert_prepared, 64).await?),
             insert_1_prepared: Arc::new(insert_prepared),
             select_1_prepared: Arc::new(select_1_prepared),
+            select_1_and_checkpoint_prepared: Arc::new(select_1_and_checkpoint_prepared),
             insert_1_statement: insert_1_statement,
             select_1_statement: select_1_statement,
+            select_1_and_checkpoint_statement: select_1_and_checkpoint_statement,
             keyspace: keyspace.to_string(),
             table_name: table_name.to_string(),
             table_key,
@@ -140,6 +148,34 @@ impl ScyllaMerkleNodesZeroPreparedStatements {
         match rows.maybe_first_row::<(Vec<u8>,)>()? {
             Some(row) => Ok(Hash::from_bytes(&row.0)?),
             None => Ok(Hasher::get_zero_hash((self.tree_height - key.level) as usize)), // Return zero hash if not found
+        }
+    }
+    pub async fn select_zero_id_merkle_node_and_checkpoint_max_checkpoint_internal<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>(
+        &self,
+        session: &Session,
+        checkpoint_id: u64,
+        key: SimpleMerkleNodeKey,
+    ) -> anyhow::Result<CheckpointedMerkleHash<Hash>> {
+        let res = session
+            .execute_unpaged(
+                &self.select_1_prepared,
+                (
+                    u8_to_i8_exact(key.level),
+                    u64_to_i64_exact(key.index),
+                    convert_checkpoint_id_to_i64(checkpoint_id),
+                ),
+            )
+            .await?;
+        let rows = res.into_rows_result()?;
+        match rows.maybe_first_row::<(Vec<u8>, i64)>()? {
+            Some(row) => Ok(CheckpointedMerkleHash{
+                checkpoint_id: i64_to_u64_exact(row.1),
+                value: Hash::from_bytes(&row.0)?, 
+            }),
+            None => Ok(CheckpointedMerkleHash{
+                checkpoint_id,
+                value: Hasher::get_zero_hash((self.tree_height - key.level) as usize), 
+            }),
         }
     }
     // In `impl ScyllaMerkleNodesZeroPreparedStatements`

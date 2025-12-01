@@ -2,10 +2,11 @@
 use parth_core::protocol::core_types::Q256BitHash;
 #[cfg(feature = "rand_gen")]
 use parth_core::utils::QPGenRandom;
-use parth_core::{crypto::hash::{merkle_proof::{DeltaMerkleProofCore, MerkleProofCore}, traits::{FieldQHasher, QFieldHashable}}, felt::{QFelt, QFelt64}, protocol::core_types::QFHashBase};
+use parth_core::{crypto::hash::{merkle_proof::{DeltaMerkleProofCore, MerkleProofCore}, traits::{FieldQHasher, MerkleZeroHasher, QFieldHashable}}, felt::{QFelt, QFelt64}, protocol::core_types::QFHashBase};
+use psy_core::job::job_id::QProvingJobDataID;
 use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
 
-use crate::{guta::{header::GlobalUserTreeAggregatorHeader, sub_tree_transition::SubTreeNodeStateTransition}, proof_input::guta::VerifyEndCapSimpleStandardInput, v1::qdata::user_end_cap_result::PUPSEndCapResultCompact};
+use crate::{guta::{header::GlobalUserTreeAggregatorHeader, header_extended::GlobalUserTreeAggregatorHeaderWithJobId, sub_tree_transition::SubTreeNodeStateTransition}, proof_input::guta::VerifyEndCapSimpleStandardInput, v1::qdata::user_end_cap_result::PUPSEndCapResultCompact, worker::{metadata::{PROOF_REWARD_TREE_HASH_MODE_HASH_CHILDREN_STANDARD, PROOF_REWARD_TREE_HASH_MODE_LIFT_CHILD, PsyProvingJobMetadata}, metadata_with_job_id::PsyProvingJobMetadataWithJobId}};
 
 
 #[pderive::serialize_clone_f_hash_ts]
@@ -14,15 +15,15 @@ pub struct GUTAVerifyLeftGUTARightEndCapCircuitInputV2<F, Hash> {
     pub left_header: GlobalUserTreeAggregatorHeader<F, Hash>,
     pub right_end_cap: VerifyEndCapSimpleStandardInput<F, Hash>,
     pub right_global_user_tree_delta_merkle_proof: DeltaMerkleProofCore<Hash>,
-    pub right_historical_checkpoint_merkle_proof: MerkleProofCore<Hash>,
 }
 
 impl<F: QFelt, Hash: Copy> GUTAVerifyLeftGUTARightEndCapCircuitInputV2<F, Hash> {
+
     pub fn get_end_cap_result_b(&self) -> PUPSEndCapResultCompact<F, Hash> {
         PUPSEndCapResultCompact {
             start_user_leaf_hash: self.right_global_user_tree_delta_merkle_proof.old_value,
             end_user_leaf_hash: self.right_global_user_tree_delta_merkle_proof.new_value,
-            checkpoint_tree_root_hash: self.right_historical_checkpoint_merkle_proof.root,
+            checkpoint_tree_root_hash: self.right_end_cap.checkpoint_root,
             user_id: F::from_u64_value(self.right_global_user_tree_delta_merkle_proof.index),
         }
     }
@@ -63,6 +64,40 @@ impl<F: QFelt64, Hash: QFHashBase<F>> GUTAVerifyLeftGUTARightEndCapCircuitInputV
     pub fn get_public_inputs_hash_no_rewards_tag<Hasher: FieldQHasher<F, Hash>>(&self) -> Hash {
         let new_guta_header = self.get_new_guta_header();
         new_guta_header.qfhash::<Hasher>()
+    }
+
+    pub fn get_job_witness_and_new_guta<Hasher: FieldQHasher<F, Hash>>(
+        &self,
+        unique_pending_id: u64,
+        level: u8,
+        index: u64,
+        left_job_id: QProvingJobDataID,
+        right_job_id: QProvingJobDataID,
+    ) -> (
+        PsyProvingJobMetadataWithJobId<Hash, QProvingJobDataID>,
+        GlobalUserTreeAggregatorHeaderWithJobId<F, Hash>,
+    ) {
+        let job_id = QProvingJobDataID::guta_left_linear_right_end_cap_proof(
+            unique_pending_id,
+            level as u32,
+            index,
+        );
+        let new_guta_header = GlobalUserTreeAggregatorHeaderWithJobId {
+            job_id,
+            header: self.get_new_guta_header(),
+        };
+        let job_metadata = PsyProvingJobMetadataWithJobId {
+            job_id: job_id,
+            metadata: PsyProvingJobMetadata {
+                expected_public_inputs_hash: self.get_public_inputs_hash_no_rewards_tag::<Hasher>(),
+                reward_tree_node_index: index,
+                reward_tree_node_level: 0,
+                reward_tree_hash_mode: PROOF_REWARD_TREE_HASH_MODE_LIFT_CHILD,
+                reward_tree_node_children: 1,
+                dependencies: vec![left_job_id, right_job_id],
+            },
+        };
+        (job_metadata, new_guta_header)
     }
 }
 
@@ -129,11 +164,8 @@ impl<F: QFelt64, Hash: QFHashBase<F>> GUTAVerifyRightGUTALeftEndCapCircuitInputV
 pub struct GUTAVerifyTwoEndCapCircuitInputV2<F, Hash> {
     pub left_end_cap: VerifyEndCapSimpleStandardInput<F, Hash>,
     pub left_global_user_tree_delta_merkle_proof: DeltaMerkleProofCore<Hash>,
-    pub left_historical_checkpoint_merkle_proof: MerkleProofCore<Hash>,
-    
     pub right_end_cap: VerifyEndCapSimpleStandardInput<F, Hash>,
     pub right_global_user_tree_delta_merkle_proof: DeltaMerkleProofCore<Hash>,
-    pub right_historical_checkpoint_merkle_proof: MerkleProofCore<Hash>,
 }
 
 
@@ -143,7 +175,7 @@ impl<F: QFelt, Hash: Copy> GUTAVerifyTwoEndCapCircuitInputV2<F, Hash> {
         PUPSEndCapResultCompact {
             start_user_leaf_hash: self.left_global_user_tree_delta_merkle_proof.old_value,
             end_user_leaf_hash: self.left_global_user_tree_delta_merkle_proof.new_value,
-            checkpoint_tree_root_hash: self.left_historical_checkpoint_merkle_proof.root,
+            checkpoint_tree_root_hash: self.left_end_cap.checkpoint_historical_merkle_proof.root,
             user_id: F::from_u64_value(self.left_global_user_tree_delta_merkle_proof.index),
         }
     }
@@ -151,13 +183,13 @@ impl<F: QFelt, Hash: Copy> GUTAVerifyTwoEndCapCircuitInputV2<F, Hash> {
         PUPSEndCapResultCompact {
             start_user_leaf_hash: self.right_global_user_tree_delta_merkle_proof.old_value,
             end_user_leaf_hash: self.right_global_user_tree_delta_merkle_proof.new_value,
-            checkpoint_tree_root_hash: self.right_historical_checkpoint_merkle_proof.root,
+            checkpoint_tree_root_hash: self.right_end_cap.checkpoint_historical_merkle_proof.root,
             user_id: F::from_u64_value(self.right_global_user_tree_delta_merkle_proof.index),
         }
     }
     pub fn get_guta_header_a(&self, global_user_tree_height: usize, guta_circuit_whitelist: Hash) -> GlobalUserTreeAggregatorHeader<F, Hash> {
         GlobalUserTreeAggregatorHeader {
-            checkpoint_tree_root: self.left_historical_checkpoint_merkle_proof.root,
+            checkpoint_tree_root: self.left_end_cap.checkpoint_historical_merkle_proof.root,
             guta_circuit_whitelist,
             state_transition: SubTreeNodeStateTransition {
                 old_node_value: self.left_global_user_tree_delta_merkle_proof.old_value,
@@ -171,7 +203,7 @@ impl<F: QFelt, Hash: Copy> GUTAVerifyTwoEndCapCircuitInputV2<F, Hash> {
     }
     pub fn get_guta_header_b(&self, global_user_tree_height: usize, guta_circuit_whitelist: Hash) -> GlobalUserTreeAggregatorHeader<F, Hash> {
         GlobalUserTreeAggregatorHeader {
-            checkpoint_tree_root: self.right_historical_checkpoint_merkle_proof.root,
+            checkpoint_tree_root: self.right_end_cap.checkpoint_historical_merkle_proof.root,
             guta_circuit_whitelist,
             state_transition: SubTreeNodeStateTransition {
                 old_node_value: self.right_global_user_tree_delta_merkle_proof.old_value,
@@ -185,7 +217,7 @@ impl<F: QFelt, Hash: Copy> GUTAVerifyTwoEndCapCircuitInputV2<F, Hash> {
     }
     pub fn get_new_guta_header(&self, global_user_tree_height: usize, guta_circuit_whitelist: Hash) -> GlobalUserTreeAggregatorHeader<F, Hash> {
         GlobalUserTreeAggregatorHeader {
-            checkpoint_tree_root: self.right_historical_checkpoint_merkle_proof.root,
+            checkpoint_tree_root: self.right_end_cap.checkpoint_historical_merkle_proof.root,
             guta_circuit_whitelist,
             state_transition: SubTreeNodeStateTransition {
                 old_node_value: self.left_global_user_tree_delta_merkle_proof.old_root,
@@ -223,7 +255,6 @@ impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for GUTAVerifyLeftGUTARightE
             left_header: GlobalUserTreeAggregatorHeader::qp_rand_gen(),
             right_end_cap: VerifyEndCapSimpleStandardInput::qp_rand_gen(),
             right_global_user_tree_delta_merkle_proof: DeltaMerkleProofCore::qp_rand_gen(),
-            right_historical_checkpoint_merkle_proof: MerkleProofCore::qp_rand_gen(),
         }
     }
 }
@@ -237,15 +268,13 @@ impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for GUTAVerify
     fn fallback_pio_serialized_size(&self) -> usize {
         self.left_header.pio_serialized_size() +
         self.right_end_cap.pio_serialized_size() +
-        self.right_global_user_tree_delta_merkle_proof.pio_serialized_size() +
-        self.right_historical_checkpoint_merkle_proof.pio_serialized_size()
+        self.right_global_user_tree_delta_merkle_proof.pio_serialized_size()
     }
 
     fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
         self.left_header.pio_write_to_io(writer)?;
         self.right_end_cap.pio_write_to_io(writer)?;
         self.right_global_user_tree_delta_merkle_proof.pio_write_to_io(writer)?;
-        self.right_historical_checkpoint_merkle_proof.pio_write_to_io(writer)?;
         Ok(())
     }
 
@@ -253,13 +282,11 @@ impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for GUTAVerify
         let left_header = GlobalUserTreeAggregatorHeader::<F, Hash>::pio_read_from_io(reader)?;
         let right_end_cap = VerifyEndCapSimpleStandardInput::<F, Hash>::pio_read_from_io(reader)?;
         let right_global_user_tree_delta_merkle_proof = DeltaMerkleProofCore::<Hash>::pio_read_from_io(reader)?;
-        let right_historical_checkpoint_merkle_proof = MerkleProofCore::<Hash>::pio_read_from_io(reader)?;
 
         Ok(Self {
             left_header,
             right_end_cap,
             right_global_user_tree_delta_merkle_proof,
-            right_historical_checkpoint_merkle_proof,
         })
     }
 }
@@ -370,10 +397,8 @@ impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for GUTAVerifyTwoEndCapCircu
         Self {
             left_end_cap: VerifyEndCapSimpleStandardInput::qp_rand_gen(),
             left_global_user_tree_delta_merkle_proof: DeltaMerkleProofCore::qp_rand_gen(),
-            left_historical_checkpoint_merkle_proof: MerkleProofCore::qp_rand_gen(),
             right_end_cap: VerifyEndCapSimpleStandardInput::qp_rand_gen(),
             right_global_user_tree_delta_merkle_proof: DeltaMerkleProofCore::qp_rand_gen(),
-            right_historical_checkpoint_merkle_proof: MerkleProofCore::qp_rand_gen(),
         }
     }
 }
@@ -387,37 +412,29 @@ impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for GUTAVerify
     fn fallback_pio_serialized_size(&self) -> usize {
         self.left_end_cap.pio_serialized_size() +
         self.left_global_user_tree_delta_merkle_proof.pio_serialized_size() +
-        self.left_historical_checkpoint_merkle_proof.pio_serialized_size() +
         self.right_end_cap.pio_serialized_size() +
-        self.right_global_user_tree_delta_merkle_proof.pio_serialized_size() +
-        self.right_historical_checkpoint_merkle_proof.pio_serialized_size()
+        self.right_global_user_tree_delta_merkle_proof.pio_serialized_size()
     }
 
     fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
         self.left_end_cap.pio_write_to_io(writer)?;
         self.left_global_user_tree_delta_merkle_proof.pio_write_to_io(writer)?;
-        self.left_historical_checkpoint_merkle_proof.pio_write_to_io(writer)?;
         self.right_end_cap.pio_write_to_io(writer)?;
         self.right_global_user_tree_delta_merkle_proof.pio_write_to_io(writer)?;
-        self.right_historical_checkpoint_merkle_proof.pio_write_to_io(writer)?;
         Ok(())
     }
 
     fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
         let left_end_cap = VerifyEndCapSimpleStandardInput::<F, Hash>::pio_read_from_io(reader)?;
         let left_global_user_tree_delta_merkle_proof = DeltaMerkleProofCore::<Hash>::pio_read_from_io(reader)?;
-        let left_historical_checkpoint_merkle_proof = MerkleProofCore::<Hash>::pio_read_from_io(reader)?;
         let right_end_cap = VerifyEndCapSimpleStandardInput::<F, Hash>::pio_read_from_io(reader)?;
         let right_global_user_tree_delta_merkle_proof = DeltaMerkleProofCore::<Hash>::pio_read_from_io(reader)?;
-        let right_historical_checkpoint_merkle_proof = MerkleProofCore::<Hash>::pio_read_from_io(reader)?;
 
         Ok(Self {
             left_end_cap,
             left_global_user_tree_delta_merkle_proof,
-            left_historical_checkpoint_merkle_proof,
             right_end_cap,
             right_global_user_tree_delta_merkle_proof,
-            right_historical_checkpoint_merkle_proof,
         })
     }
 }
