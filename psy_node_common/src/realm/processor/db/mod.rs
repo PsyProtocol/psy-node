@@ -358,7 +358,7 @@ where
             self.checkpoint_tree_backup_manager.get_current_checkpoint_tree_root_head(),
             new_gathering_unique_pending_id,
             new_gathering_proc_checkpoint_unique_id,
-        );
+        )?;
         self.shared_state.update_from_core_state(&self.state).await?;
         self.temp_db
             .set_gathering_unique_pending_ids(
@@ -554,13 +554,13 @@ impl<
 where
     N::HasherBase: 'static + Send + Sync,
 {
-    pub async fn get_reward_tree_root(&self, checkpoint_id: u64, unique_pending_id: u64) -> anyhow::Result<N::QHash> {
+    pub async fn get_reward_tree_root(&self, checkpoint_id: u64, unique_pending_id: u64, job_id: N::JobId) -> anyhow::Result<N::QHash> {
         let temp_store_reward_tree_root: Option<N::QHash> = self
             .temp_db
             .get_proof_miner_rewards_tree_value_or_none(
                 &self.state.realm_identifier,
                 unique_pending_id,
-                QProvingJobDataID::get_checkpoint_state_transition_job_id(checkpoint_id),
+                job_id,
             )
             .await?;
         if temp_store_reward_tree_root.is_some() {
@@ -610,6 +610,64 @@ where
             todo!("Implement restore from backup logic here");
         }
         Ok(())
+    }
+
+    pub async fn sync_with_coordinator(&mut self) -> anyhow::Result<()> {
+        let coordinator_latest_checkpoint_id: u64 = self.coordinator_client.rc_get_latest_checkpoint_id().await?;
+        let last_synced_checkpoint_id = self.checkpoint_tree_backup_manager.get_current_checkpoint_id_head();
+        if coordinator_latest_checkpoint_id < last_synced_checkpoint_id {
+            anyhow::bail!("Local checkpoint ID ({}) is ahead of coordinator's latest checkpoint ID ({}). This indicates an inconsistency between the local database and the coordinator.",
+                last_synced_checkpoint_id, coordinator_latest_checkpoint_id);
+        }
+        self.checkpoint_tree_backup_manager.sync_from_coordinator_client::<CoordinatorClient, N::F>(&self.coordinator_client, 2000).await?;
+        self.state.coordinator_head_synced_checkpoint_id = self.checkpoint_tree_backup_manager.get_current_checkpoint_id_head();
+        self.state.coordinator_head_synced_checkpoint_root = self.checkpoint_tree_backup_manager.get_current_checkpoint_tree_root_head();
+
+        self.state.processing_checkpoint_root = self.checkpoint_tree_backup_manager.get_current_checkpoint_tree_root_head();
+        self.state.gathering_checkpoint_root = self.checkpoint_tree_backup_manager.get_current_checkpoint_tree_root_head();
+        self.state.processing_checkpoint_id = self.state.coordinator_head_synced_checkpoint_id;
+        self.state.gathering_checkpoint_id = self.state.coordinator_head_synced_checkpoint_id;
+        
+        Ok(())
+    }
+
+    pub async fn wait_for_realm_update_sync_with_coordinator(&mut self, new_realm_root: N::QHash) -> anyhow::Result<PsyRealmCoordinatorUpdate<N::F, N::QHash>> {
+        loop {
+            tracing::info!("Checking for realm root update to new value: {:?}...", new_realm_root);
+            let coordinator_latest_checkpoint_id: u64 = self.coordinator_client.rc_get_latest_checkpoint_id().await?;
+            let last_synced_checkpoint_id = self.checkpoint_tree_backup_manager.get_current_checkpoint_id_head();
+            if coordinator_latest_checkpoint_id < last_synced_checkpoint_id {
+            anyhow::bail!("Local checkpoint ID ({}) is ahead of coordinator's latest checkpoint ID ({}). This indicates an inconsistency between the local database and the coordinator.",
+                last_synced_checkpoint_id, coordinator_latest_checkpoint_id);
+            }
+            self.checkpoint_tree_backup_manager.sync_from_coordinator_client::<CoordinatorClient, N::F>(&self.coordinator_client, 2000).await?;
+            self.state.coordinator_head_synced_checkpoint_id = self.checkpoint_tree_backup_manager.get_current_checkpoint_id_head();
+            self.state.coordinator_head_synced_checkpoint_root = self.checkpoint_tree_backup_manager.get_current_checkpoint_tree_root_head();
+
+            let latest_realm_root: CheckpointedMerkleHash<N::QHash> = self
+                .coordinator_client
+                .rc_get_realm_root_and_last_modified_checkpoint(self.state.coordinator_head_synced_checkpoint_id, self.state.realm_id_u64)
+                .await?;
+            if latest_realm_root.value == new_realm_root {
+                tracing::info!("Realm root has been updated to the new value: {:?} at checkpoint ID: {}", new_realm_root, latest_realm_root.checkpoint_id);
+                self.state.last_committed_checkpoint_id = latest_realm_root.checkpoint_id;
+                self.state.last_committed_realm_end_root = latest_realm_root.value;
+                self.state.last_committed_proc_checkpoint_unique_id = self.state.processing_proc_checkpoint_unique_id;
+                self.state.last_committed_unique_pending_id = self.state.processing_unique_pending_id;
+                let sync_info : PsyRealmCoordinatorUpdate<N::F, N::QHash> = self.coordinator_client.rc_get_realm_sync_info(latest_realm_root.checkpoint_id).await?;
+                self.db.set_realm_rewards_tag_tree_top_proof_at_checkpoint_id(latest_realm_root.checkpoint_id, &sync_info.reward_tree_top_proof).await?;
+                self.db.global_user_tree_set_top_tree_merkle_proof(latest_realm_root.checkpoint_id, &sync_info.merkle_proof_to_realm_root).await?;
+                self.db.set_realm_rewards_tag_tree_top_proof_at_unique_pending_id(self.state.last_committed_unique_pending_id, &sync_info.reward_tree_top_proof).await?;
+                self.db.set_l2_block_state(latest_realm_root.checkpoint_id, &sync_info.checkpoint_sync_info.block_state).await?;
+                self.db.set_checkpoint_global_state_roots(latest_realm_root.checkpoint_id, &sync_info.checkpoint_sync_info.state_roots).await?;
+                self.db.set_checkpoint_leaf_data(latest_realm_root.checkpoint_id, &sync_info.checkpoint_sync_info.checkpoint_leaf).await?;    
+                return Ok(sync_info);
+            }else{
+                tracing::info!("Waiting for realm root to be updated to the new value: {:?}. Current realm root at checkpoint ID {} is {:?}. Retrying...", new_realm_root, latest_realm_root.checkpoint_id, latest_realm_root.value);
+                self.coordinator_client.rc_wait_for_next_checkpoint().await?;
+            }
+        }
+        
     }
 
     pub fn print_coordinator_processor_state(&self) {

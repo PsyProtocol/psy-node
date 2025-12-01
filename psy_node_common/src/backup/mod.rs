@@ -5,3 +5,4 @@ pub mod coordinator;
 pub mod global_contract_tree;
 pub mod output;
 pub mod utils;
+pub mod realm;

@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use parth_core::{data::hash::checkpointed_merkle_node::CheckpointedMerkleHash, protocol::core_types::QNetworkTypesConfig};
 use psy_api_core::coordinator::standard_edge_rpc::CoordinatorEdgeRpcClient;
-use psy_data::prepared_block::realm::PsyRealmCoordinatorUpdate;
+use psy_data::{guta::header_extended::GlobalUserTreeAggregatorHeaderWithTagValueAndJobType, prepared_block::realm::PsyRealmCoordinatorUpdate};
 use psy_node_core::p2p::traits::realm_coordinantor::RealmCoordinatorClient;
 use psy_serialize::PsyCanonicalDatabaseSerializeBaseMulti;
 
@@ -63,5 +63,17 @@ impl<N: QNetworkTypesConfig + 'static, C: CoordinatorEdgeRpcClient<N::F, N::QHas
             .get_realm_root_and_last_modified_checkpoint(checkpoint_id, realm_id)
             .await
             .map_err(|e| anyhow::anyhow!("{:?}", e))
+    }
+    async fn rc_submit_guta_proof(
+        &self,
+        input: GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<N::F, N::QHash>,
+        proof: Vec<u8>,
+        realm_id: u64,
+    ) -> anyhow::Result<()> {
+        self.client
+            .submit_guta(input, proof, realm_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        Ok(())
     }
 }

@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use parth_core::{
     crypto::hash::traits::{FieldQHasher, QFieldHashable},
@@ -8,7 +8,6 @@ use parth_core::{
     protocol::core_types::{QFHashBase, QHashBase},
     QCoreProcCheckpointUniqueId,
 };
-use tokio::sync::RwLock;
 
 use crate::{
     protocol::checkpoint_transition_hash::CheckpointStateHashTransition,
@@ -198,13 +197,13 @@ impl<Hash: QHashBase> RealmProcessorCoreStateWrapper<Hash> {
     }
     pub async fn update_from_core_state(&self, source: &RealmProcessorCoreState<Hash>) -> anyhow::Result<()> {
         {
-            self.inner.write().await.copy_from(source);
+            self.inner.write().map_err(|e| anyhow::anyhow!("error writing to core state rwlock"))?.copy_from(source);
         }
         Ok(())
     }
     pub async fn load_core_state(&self) -> anyhow::Result<RealmProcessorCoreState<Hash>> {
         let state = {
-            self.inner.read().await.clone()
+            self.inner.read().map_err(|e| anyhow::anyhow!("error reading from core state rwlock"))?.clone()
         };
         Ok(state)
     }
