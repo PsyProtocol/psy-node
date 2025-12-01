@@ -243,6 +243,19 @@ pub fn create_ffs_merkle_nodes_zero_id_from_hash_map<Hash: Q256BitHash>(map: &Ha
     }
     buffer
 }
+
+pub fn create_ffs_merkle_nodes_zero_id_from_hash_map_with_offset<Hash: Q256BitHash>(map: &HashMap<SimpleMerkleNodeKey, Hash>, root_key: SimpleMerkleNodeKey) -> Vec<u8> {
+    let mut buffer = Vec::with_capacity(QMS_FAST_SERIALIZER_ZERO_ID_NODE_SIZE * map.len());
+
+    
+    for (key, hash) in map.iter() {
+        buffer.extend_from_slice(&SimpleMerkleNode{
+            key: SimpleMerkleNodeKey { level: key.level + root_key.level, index: key.index | (root_key.index << key.level) },
+            value: *hash,
+        }.ffs_into_bytes());
+    }
+    buffer
+}
 #[derive(Clone)]
 pub struct QBlobZeroIdMerkleRecorder {
     map: HashMap<SimpleMerkleNodeKey, bool>,

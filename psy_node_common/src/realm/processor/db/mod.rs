@@ -193,6 +193,7 @@ where
         guta_update_queue: Arc<GUTAUpdateQueue>,
         proof_work_queue: Arc<ProofWorkQueue>,
         coordinator_client: Arc<CoordinatorClient>,
+        chain_id: u32,
         realm_identifier: QRealmIdentifier,
         circuit_fingerprint_config: PsyNodeCircuitFingerprintConfig<N::QHash>,
         file_system: Arc<FileSystem>,
@@ -235,6 +236,7 @@ where
         };
 
         let state = RealmProcessorCoreState::new_basic(
+            chain_id,
             realm_identifier,
             last_committed_checkpoint_id,
             last_committed_unique_pending_id,

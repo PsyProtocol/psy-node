@@ -20,6 +20,7 @@ use crate::{
 
 #[pderive::serialize_copy_hash]
 pub struct RealmProcessorCoreState<Hash> {
+    pub chain_id: u32,
     pub realm_identifier: QRealmIdentifier,
     pub realm_id_u64: u64,
     pub realm_sub_id_u64: u64,
@@ -81,6 +82,7 @@ impl<Hash: Copy> RealmProcessorCoreState<Hash> {
         self.should_revert_processing_changes = source.should_revert_processing_changes;
     }
     pub fn new_basic(
+        chain_id: u32,
         realm_identifier: QRealmIdentifier,
         last_committed_checkpoint_id: u64,
         last_committed_unique_pending_id: u64,
@@ -89,6 +91,7 @@ impl<Hash: Copy> RealmProcessorCoreState<Hash> {
         last_committed_realm_root: Hash,
     ) -> Self {
         Self {
+            chain_id,
             realm_identifier,
             realm_id_u64: realm_identifier.realm_id as u64,
             realm_sub_id_u64: realm_identifier.realm_sub_id as u64,
