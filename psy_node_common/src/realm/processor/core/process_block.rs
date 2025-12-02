@@ -1,20 +1,18 @@
 use cf_utils::timer::TraceTimer;
 use parth_core::protocol::core_types::QNetworkTypesConfig;
-use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
+use psy_core::job::job_id::QProvingJobDataID;
 use psy_data::{
     guta::header_extended::{GlobalUserTreeAggregatorHeaderWithTagValue, GlobalUserTreeAggregatorHeaderWithTagValueAndJobType},
-    prepared_block::{coordinator::PsyPreparedCoordinatorBlockStateUpdates, realm::PsyPreparedRealmBlockStateUpdates},
-    proof_input::genesis::PsyCheckpointStateTransitionGenesisCircuitInput,
-    worker::{
-        metadata::{PsyProvingJobMetadata, PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN},
-        metadata_with_job_id::PsyProvingJobMetadataWithJobId,
-    },
+    prepared_block::realm::PsyPreparedRealmBlockStateUpdates,
+    worker::
+        metadata_with_job_id::PsyProvingJobMetadataWithJobId
+    ,
 };
 use psy_io::tokio::TokioLikeFileSystem;
 use psy_node_core::{
     p2p::traits::realm_coordinantor::RealmCoordinatorClient,
     psy_core_db::traits::full::{
-        PsyCoordinatorProcessorStore, PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmProcessorStore,
+        PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmProcessorStore,
     },
     psy_temp_db::StandardProcessorTempDBStoreBase,
     queue::{
@@ -23,16 +21,13 @@ use psy_node_core::{
     },
     store::traits::proof_store::QParthProofStore,
 };
-use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 
-use crate::{
-    backup::output::coordinator_output_builder::CoordinatorOutputBuilder,
-    coordinator::{processor::PsyCoordinatorProcessor, queue_key::CoordinatorProvingWorkQueueKey},
+use crate::
     realm::{
         processor::{core::PsyRealmProcessor, gatherers::realm_end_cap_gatherer::RealmGUTAEndCapGathererOutput},
         queue_key::RealmProvingWorkQueueKey,
-    },
-};
+    }
+;
 impl<
         N: QNetworkTypesConfig<JobId = QProvingJobDataID>,
         S: PsyRealmProcessorStore<N::F, N::QHash> + Send + Sync,
@@ -227,6 +222,8 @@ where
             self.db.state.processing_checkpoint_id
         );
         self.db.print_coordinator_processor_state();
+        self.db.sync_to_coordinator_set_checkpoint_id().await?;
+        timer.lap("sync_to_coordinator_set_checkpoint_id");
 
         Ok(())
     }

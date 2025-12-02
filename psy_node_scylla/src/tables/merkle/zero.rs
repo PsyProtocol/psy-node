@@ -323,6 +323,48 @@ impl ScyllaMerkleNodesZeroPreparedStatements {
         }
         Ok(())
     }
+
+    /// Batch inserts multiple nodes at checkpoint_id.
+    /// Optimized: increased batch size to 512 for higher throughput; streams
+    /// batches concurrently via join_all.
+    pub async fn set_zero_id_merkle_nodes_batch_internal_checkpoint_is_index<Hash: QHashBase>(
+        &self,
+        session: &Session,
+        nodes: &[SimpleMerkleNode<Hash>],
+    ) -> anyhow::Result<()> {
+        const BATCH_SIZE: usize = 512; // Increased for performance; safe assuming typical node sizes.
+        let mut batch_list: Vec<Batch> = Vec::new();
+        let mut value_list: Vec<Vec<(i8, i64, i64, Vec<u8>)>> = Vec::new();
+        for chunk in nodes.chunks(BATCH_SIZE) {
+            let mut batch: Batch = Default::default();
+            for _ in chunk {
+                batch.append_statement(self.insert_1_statement.clone());
+            }
+            let values: Vec<_> = chunk
+                .iter()
+                .map(|n| {
+                    Ok((
+                        u8_to_i8_exact(n.key.level),
+                        u64_to_i64_exact(n.key.index),
+                        u64_to_i64_exact(n.key.index),
+                        n.value.to_bytes()?,
+                    ))
+                })
+                .collect::<anyhow::Result<_>>()?;
+            batch_list.push(batch);
+            value_list.push(values);
+        }
+        let batches: Vec<_> = batch_list
+            .iter()
+            .zip(value_list.into_iter())
+            .map(|(batch, values)| session.batch(batch, values))
+            .collect();
+        let results = join_all(batches).await;
+        for res in results {
+            res.context("Batch insert failed")?;
+        }
+        Ok(())
+    }
 }
 
 impl ScyllaMerkleNodesZeroPreparedStatements {

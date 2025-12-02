@@ -15,6 +15,21 @@ pub struct RealmProcessorStartConfig {
     pub checkpoint_backup_path: String,
     pub coordinator_api_urls: Vec<String>,
 }
+impl RealmProcessorStartConfig {
+    pub fn get_checkpoint_tree_backup_file_path(&self) -> String {
+        format!(
+            "{}/realm_{}_{}/checkpoint_tree.bin",
+            self.checkpoint_backup_path, self.realm_id, self.realm_sub_id
+        )
+    }
+    pub fn get_guta_updates_backup_path(&self) -> String {
+        format!(
+            "{}/realm_{}_{}/guta_updates_backup",
+            self.checkpoint_backup_path, self.realm_id, self.realm_sub_id
+        )
+    }
+}
+
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RealmEdgeStartConfig {

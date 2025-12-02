@@ -632,6 +632,11 @@ pub trait CoreDatabaseZeroIdMerkleWriter<
         checkpoint_id: u64,
         nodes: &[SimpleMerkleNode<Hash>],
     ) -> anyhow::Result<()>;
+    async fn db_set_zero_id_merkle_nodes_batch_checkpoint_is_index(
+        &self,
+        table: &TableIdentifier,
+        nodes: &[SimpleMerkleNode<Hash>],
+    ) -> anyhow::Result<()>;
     async fn db_set_zero_id_merkle_nodes_from_fast_serialized(&self, table: &TableIdentifier, checkpoint_id: u64, nodes: &[u8])
         -> anyhow::Result<()>;
 }

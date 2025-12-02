@@ -4,38 +4,58 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use jsonrpsee::core::RpcResult;
 use parth_core::{
-    QProvingJobDataIDWithRewardPath, crypto::{hash::{merkle_proof::{MerkleProofCore, compute_historical_and_current_merkle_roots_core_gt}, traits::MerkleZeroHasher}, secp256k1::{QEDCompressedSecp256K1Signature, SimpleTimedRequest}}, data::{hash::merkle_node_key::SimpleMerkleNodeKey, queue::queue_key::QPBaseQueueType}, felt::ToU64Value, node::realm_identifier::QRealmIdentifier, protocol::core_types::{QNetworkDatabaseTypes, QNetworkTypesConfig}, store::tag_tree_store
+    crypto::{
+        hash::{
+            merkle_proof::{compute_historical_and_current_merkle_roots_core_gt, MerkleProofCore},
+            traits::{MerkleZeroHasher, QFieldHashable},
+        },
+        secp256k1::{QEDCompressedSecp256K1Signature, SimpleTimedRequest},
+    },
+    data::{hash::merkle_node_key::SimpleMerkleNodeKey, queue::queue_key::QPBaseQueueType},
+    felt::ToU64Value,
+    node::realm_identifier::QRealmIdentifier,
+    protocol::core_types::{QNetworkDatabaseTypes, QNetworkTypesConfig, QZKProofPublicInputsHasherReader, QZKProofVerifier},
+    store::tag_tree_store,
+    QProvingJobDataIDWithRewardPath,
 };
 use psy_api_core::{realm::standard_edge_rpc::RealmEdgeRpcServer, worker::standard_worker_rpc::NodeEdgeWorkerRpcServer};
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{
-    proof_input::guta::end_cap_input::SubmitUserEndCapNonProofInput, queue_items::realm_user_update::PsyRealmUserUpdateQueueItem, v1::{
+    proof_input::guta::end_cap_input::SubmitUserEndCapNonProofInput,
+    queue_items::realm_user_update::PsyRealmUserUpdateQueueItem,
+    v1::{
         common_api::PsyProoffMinerRewardProof,
         qdata::{
             checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState},
             contract::{DashMapContractHeightCache, PSimpleContractHeightCache},
             user::{self, PQEDUserLeaf},
         },
-    }, worker::api_response::{PsyWorkerGetProvingWorkAPIResponse, PsyWorkerGetProvingWorkWithChildProofsAPIResponse}
+    },
+    worker::api_response::{PsyWorkerGetProvingWorkAPIResponse, PsyWorkerGetProvingWorkWithChildProofsAPIResponse},
 };
 use psy_node_core::{
     psy_core_db::{
         traits::full::{PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmEdgeAPIStoreReader},
         v3_implementation::full::PsyUnifiedCoreDatabaseStore,
-    }, psy_temp_db::{QTempDBPendingIdReader, StandardEdgeAPITempDBStoreBase}, qblob::structs::common::blob_metadata_header::QBlobWriterContextMetadataHeader, queue::{
+    },
+    psy_temp_db::{QTempDBPendingIdReader, StandardEdgeAPITempDBStoreBase},
+    qblob::structs::common::blob_metadata_header::QBlobWriterContextMetadataHeader,
+    queue::{
         ephemeral::{QStandardEphemeralQueuePublisher, QStandardEphemeralQueueSubscriber},
         worker_queue::QStandardWorkerQueueSubscriber,
-    }, store::traits::{
+    },
+    store::traits::{
         core_db::{CoreDatabaseStoreComboImpl, CoreDatabaseTableConfig},
         proof_store::QParthProofStore,
-    }
+    },
 };
-use parth_core::protocol::core_types::{QZKProofVerifier, QZKProofPublicInputsHasherReader};
-use crate::realm::{edge::{error::RpcError, utils::end_cap::validate_end_cap_and_generate_node_data_for_edge}, queue_key::RealmUserUpdateQueueKey};
-use parth_core::crypto::hash::traits::QFieldHashable;
+
+use crate::realm::{
+    edge::{error::RpcError, utils::end_cap::validate_end_cap_and_generate_node_data_for_edge},
+    queue_key::RealmUserUpdateQueueKey,
+};
 
 const END_CAP_PROOF_CIRCUIT_TYPE_U32: u32 = ProvingJobCircuitType::UserEndCap as u32;
-#[derive(Clone)]
 pub struct RealmEdgeHandler<
     N: QNetworkTypesConfig,
     S: PsyRealmEdgeAPIStoreReader<N::F, N::QHash> + Send + Sync,
@@ -62,7 +82,34 @@ pub struct RealmEdgeHandler<
     pub proof_verifier: Arc<N::ZKVerifier>,
     pub contract_state_tree_height_cache: Arc<DashMapContractHeightCache<N::QHash>>,
 }
-
+impl<
+        N: QNetworkTypesConfig,
+        S: PsyRealmEdgeAPIStoreReader<N::F, N::QHash> + Send + Sync,
+        STagTreeRewards: PsyNodeCoreRewardsTagTreeStoreWriter<N::F, N::QHash> + PsyNodeCoreRewardsTagTreeStoreReader<N::F, N::QHash> + Send + Sync,
+        UserUpdateQueue: QStandardEphemeralQueuePublisher,
+        GetProofWorkQueue: QStandardWorkerQueueSubscriber,
+        TempDatabase: StandardEdgeAPITempDBStoreBase<N::JobId, N::QHash>,
+        ProofStore: QParthProofStore,
+    > Clone for RealmEdgeHandler<N, S, STagTreeRewards, UserUpdateQueue, GetProofWorkQueue, TempDatabase, ProofStore>
+{
+    fn clone(&self) -> Self {
+        Self {
+            db_reader: self.db_reader.clone(),
+            tag_tree_rewards_store: self.tag_tree_rewards_store.clone(),
+            temp_db: self.temp_db.clone(),
+            proof_store: self.proof_store.clone(),
+            user_update_queue: self.user_update_queue.clone(),
+            get_proof_work_queue: self.get_proof_work_queue.clone(),
+            realm_identifier: self.realm_identifier.clone(),
+            realm_id_u64: self.realm_id_u64.clone(),
+            realm_sub_id_u64: self.realm_sub_id_u64.clone(),
+            chain_id: self.chain_id.clone(),
+            node_id: self.node_id.clone(),
+            proof_verifier: self.proof_verifier.clone(),
+            contract_state_tree_height_cache: self.contract_state_tree_height_cache.clone(),
+        }
+    }
+}
 impl<
         N: QNetworkTypesConfig,
         S: PsyRealmEdgeAPIStoreReader<N::F, N::QHash> + Send + Sync,
@@ -111,13 +158,18 @@ impl<
     }
     pub async fn get_latest_checkpoint_id(&self) -> anyhow::Result<u64> {
         self.db_reader.get_latest_checkpoint_id().await
-
     }
     pub async fn ensure_user_has_not_submitted(&self, user_id: u64, unique_pending_id: u64) -> anyhow::Result<()> {
-
-        let submitted_status =  self.temp_db.get_submitted_status_for_pending(&self.realm_identifier, unique_pending_id, user_id).await?;
+        let submitted_status = self
+            .temp_db
+            .get_submitted_status_for_pending(&self.realm_identifier, unique_pending_id, user_id)
+            .await?;
         if submitted_status != 0 {
-            anyhow::bail!("end cap for user_id {} at unique_pending_id {} has already been submitted", user_id, unique_pending_id);
+            anyhow::bail!(
+                "end cap for user_id {} at unique_pending_id {} has already been submitted",
+                user_id,
+                unique_pending_id
+            );
         }
 
         Ok(())
@@ -128,25 +180,30 @@ impl<
         unique_pending_id: u64,
         job_ids: Vec<QProvingJobDataIDWithRewardPath<N::JobId>>,
     ) -> anyhow::Result<Vec<PsyProoffMinerRewardProof<N::QHash, N::JobId>>> {
+        //let top_proof =
+        // self.db_reader.
+        // get_top_global_user_rewards_tree_proof_to_realm_at_unique_pending_id(unique_pending_id).
+        // await?;
 
-        
-        //let top_proof = self.db_reader.get_top_global_user_rewards_tree_proof_to_realm_at_unique_pending_id(unique_pending_id).await?;
-
-        //let (unique_pending_id, proc_checkpoint_id) = self.temp_db.get_unique_pending_ids(&self.realm_identifier).await?;
+        //let (unique_pending_id, proc_checkpoint_id) =
+        // self.temp_db.get_unique_pending_ids(&self.realm_identifier).await?;
         let merkle_node_keys = job_ids
             .iter()
             .map(|job_id_with_path| SimpleMerkleNodeKey::from_reward_path_info(job_id_with_path.reward_path_info))
             .collect::<Vec<_>>();
 
-        self.tag_tree_rewards_store.rewards_tag_tree_get_tag_tree_merkle_proof_at_unique_pending_id(
-            unique_pending_id,
-            &merkle_node_keys,
-        ).await?.into_iter().zip(job_ids.iter()).map(|(proof, job_id_with_path)| {
-            Ok(PsyProoffMinerRewardProof {
-                job_id: job_id_with_path.job_data_id.clone(),
-                tag_tree_proof: proof,
+        self.tag_tree_rewards_store
+            .rewards_tag_tree_get_tag_tree_merkle_proof_at_unique_pending_id(unique_pending_id, &merkle_node_keys)
+            .await?
+            .into_iter()
+            .zip(job_ids.iter())
+            .map(|(proof, job_id_with_path)| {
+                Ok(PsyProoffMinerRewardProof {
+                    job_id: job_id_with_path.job_data_id.clone(),
+                    tag_tree_proof: proof,
+                })
             })
-        }).collect()
+            .collect()
     }
 }
 
@@ -209,7 +266,6 @@ impl<
         let (unique_pending_id, proc_checkpoint_id) = self.temp_db.get_unique_pending_ids(&self.realm_identifier).await?;
         self.ensure_user_has_not_submitted(user_id, unique_pending_id).await?;
 
-        
         let current_checkpoint_id = self.get_latest_checkpoint_id().await?;
         let old_user_leaf = self.db_reader.get_user_leaf(current_checkpoint_id, user_id).await?;
         let user_last_checkpoint_id = old_user_leaf.last_checkpoint_id.to_u64_value();
@@ -230,11 +286,6 @@ impl<
             );
         }
 
-
-
-        
-
-
         let old_leaf_hash = old_user_leaf.qfhash::<N::HasherBase>();
         if user_end_cap_input.core.state_transition.start_user_leaf_hash != old_leaf_hash {
             anyhow::bail!(
@@ -244,12 +295,11 @@ impl<
             );
         }
 
-
-         let checkpoint_tree_proof = self
+        let checkpoint_tree_proof = self
             .db_reader
             .checkpoint_tree_get_merkle_proof(current_checkpoint_id, end_cap_checkpoint_id)
             .await?;
-        
+
         let (historical_root, current_root) = compute_historical_and_current_merkle_roots_core_gt::<N::QHash, N::HasherBase>(&checkpoint_tree_proof);
         if current_root != checkpoint_tree_proof.root {
             anyhow::bail!(
@@ -264,16 +314,16 @@ impl<
                 user_end_cap_input.core.state_transition.checkpoint_tree_root_hash
             );
         }
-        let job_id = QProvingJobDataID::try_get_realm_edge_proof_store_output_proof_id_for_end_cap(user_id, N::GLOBAL_USER_TREE_HEIGHT, unique_pending_id)?;
+        let job_id =
+            QProvingJobDataID::try_get_realm_edge_proof_store_output_proof_id_for_end_cap(user_id, N::GLOBAL_USER_TREE_HEIGHT, unique_pending_id)?;
 
         self.ensure_user_has_not_submitted(user_id, unique_pending_id).await?;
 
-
-        let expected_public_inputs_hash: N::QHash = user_end_cap_input.core.get_proof_public_inputs_hash::<N::HasherBase>(
-            N::GLOBAL_USER_TREE_HEIGHT,
-        );
+        let expected_public_inputs_hash: N::QHash = user_end_cap_input
+            .core
+            .get_proof_public_inputs_hash::<N::HasherBase>(N::GLOBAL_USER_TREE_HEIGHT);
         let proof = N::ZKVerifier::try_proof_from_slice(&proof_bytes)?;
-        
+
         let public_inputs = N::ZKVerifier::get_proof_public_inputs_hash(&proof)?;
         if public_inputs != expected_public_inputs_hash {
             anyhow::bail!(
@@ -299,41 +349,60 @@ impl<
             N::GLOBAL_CONTRACT_TREE_HEIGHT_USIZE,
         )?;
 
-
-
-
         self.proof_verifier.verify_zk_proof(END_CAP_PROOF_CIRCUIT_TYPE_U32, &proof)?;
 
-
-        
         // TODO: maybe modify the job_id.sub_group_id
         let rand_status = rand::random::<u64>();
 
         let fake_checkpoint_id = rand_status;
-        let context = QBlobWriterContextMetadataHeader::new_at_now(self.chain_id, self.node_id, self.realm_id_u64, self.realm_sub_id_u64, unique_pending_id, fake_checkpoint_id, user_id);
-        let contract_update_data_for_user = validate_end_cap_and_generate_node_data_for_edge::<N::F, N::QHash, N::HasherBase>(&context, user_id,&user_end_cap_input)?;
+        let context = QBlobWriterContextMetadataHeader::new_at_now(
+            self.chain_id,
+            self.node_id,
+            self.realm_id_u64,
+            self.realm_sub_id_u64,
+            unique_pending_id,
+            fake_checkpoint_id,
+            user_id,
+        );
+        let contract_update_data_for_user =
+            validate_end_cap_and_generate_node_data_for_edge::<N::F, N::QHash, N::HasherBase>(&context, user_id, &user_end_cap_input)?;
         self.ensure_user_has_not_submitted(user_id, unique_pending_id).await?;
-        self.temp_db.set_submitted_status_for_pending(&self.realm_identifier, unique_pending_id, user_id, rand_status).await?;
+        self.temp_db
+            .set_submitted_status_for_pending(&self.realm_identifier, unique_pending_id, user_id, rand_status)
+            .await?;
 
-        if self.temp_db.get_submitted_status_for_pending(&self.realm_identifier, unique_pending_id, user_id).await? != rand_status {
+        if self
+            .temp_db
+            .get_submitted_status_for_pending(&self.realm_identifier, unique_pending_id, user_id)
+            .await?
+            != rand_status
+        {
             // check for race condition
-            anyhow::bail!("end cap for user_id {} at unique_pending_id {} has already been submitted (race)", user_id, unique_pending_id);
+            anyhow::bail!(
+                "end cap for user_id {} at unique_pending_id {} has already been submitted (race)",
+                user_id,
+                unique_pending_id
+            );
         }
-
-
 
         self.proof_store.put_proof_bytes_for_job_id(job_id, &proof_bytes).await?;
-        if self.temp_db.get_submitted_status_for_pending(&self.realm_identifier, unique_pending_id, user_id).await? != rand_status {
+        if self
+            .temp_db
+            .get_submitted_status_for_pending(&self.realm_identifier, unique_pending_id, user_id)
+            .await?
+            != rand_status
+        {
             // check for race condition
-            anyhow::bail!("end cap for user_id {} at unique_pending_id {} has already been submitted (race)", user_id, unique_pending_id);
+            anyhow::bail!(
+                "end cap for user_id {} at unique_pending_id {} has already been submitted (race)",
+                user_id,
+                unique_pending_id
+            );
         }
 
-        self.temp_db.set_contract_updates_for_user(
-            &self.realm_identifier,
-            unique_pending_id,
-            user_id,
-            contract_update_data_for_user,
-        ).await?;
+        self.temp_db
+            .set_contract_updates_for_user(&self.realm_identifier, unique_pending_id, user_id, contract_update_data_for_user)
+            .await?;
         let queue_key = RealmUserUpdateQueueKey {
             realm_id: self.realm_id_u64,
             realm_sub_id: self.realm_sub_id_u64,
@@ -353,8 +422,9 @@ impl<
             new_user_leaf,
             stats: user_end_cap_input.core.stats,
         };
-        self.user_update_queue.publish_ephemeral_queue_item_owned(&queue_key, self.realm_id_u64, self.realm_sub_id_u64, proc_checkpoint_id, 0, queue_item).await?;
-
+        self.user_update_queue
+            .publish_ephemeral_queue_item_owned(&queue_key, self.realm_id_u64, self.realm_sub_id_u64, proc_checkpoint_id, 0, queue_item)
+            .await?;
 
         Ok(())
     }
@@ -517,7 +587,6 @@ impl<
         res(self.db_reader.global_user_tree_get_merkle_proof(checkpoint_id, user_id).await)
     }
 
-
     async fn generate_batch_proof_miner_reward_proofs(
         &self,
         unique_pending_id: u64,
@@ -527,29 +596,36 @@ impl<
     }
 }
 
-
 #[async_trait]
 impl<
         N: QNetworkTypesConfig<JobId = QProvingJobDataID> + Send + Sync + 'static,
-        S: PsyRealmEdgeAPIStoreReader<N::F, N::QHash> + Send + Sync +'static,
-        STagTreeRewards: PsyNodeCoreRewardsTagTreeStoreWriter<N::F, N::QHash> + PsyNodeCoreRewardsTagTreeStoreReader<N::F, N::QHash> + Send + Sync +'static,
+        S: PsyRealmEdgeAPIStoreReader<N::F, N::QHash> + Send + Sync + 'static,
+        STagTreeRewards: PsyNodeCoreRewardsTagTreeStoreWriter<N::F, N::QHash> + PsyNodeCoreRewardsTagTreeStoreReader<N::F, N::QHash> + Send + Sync + 'static,
         UserUpdateQueue: QStandardEphemeralQueuePublisher + Send + Sync + 'static,
         GetProofWorkQueue: QStandardWorkerQueueSubscriber + Send + Sync + 'static,
         TempDatabase: StandardEdgeAPITempDBStoreBase<N::JobId, N::QHash> + Send + Sync + 'static,
         ProofStore: QParthProofStore + Send + Sync + 'static,
-    > NodeEdgeWorkerRpcServer<N::QHash, N::JobId> for RealmEdgeHandler<N, S, STagTreeRewards, UserUpdateQueue, GetProofWorkQueue, TempDatabase, ProofStore> {
-    
-    async fn get_proving_work(&self, signature:  QEDCompressedSecp256K1Signature, request: SimpleTimedRequest) -> RpcResult<PsyWorkerGetProvingWorkAPIResponse<N::QHash, N::JobId>>{
+    > NodeEdgeWorkerRpcServer<N::QHash, N::JobId>
+    for RealmEdgeHandler<N, S, STagTreeRewards, UserUpdateQueue, GetProofWorkQueue, TempDatabase, ProofStore>
+{
+    async fn get_proving_work(
+        &self,
+        signature: QEDCompressedSecp256K1Signature,
+        request: SimpleTimedRequest,
+    ) -> RpcResult<PsyWorkerGetProvingWorkAPIResponse<N::QHash, N::JobId>> {
         res(self.get_proving_work_internal(signature, request).await)
     }
-    async fn get_proving_work_with_child_proofs(&self, signature:  QEDCompressedSecp256K1Signature, request: SimpleTimedRequest) -> RpcResult<PsyWorkerGetProvingWorkWithChildProofsAPIResponse<N::QHash, N::JobId>>{
+    async fn get_proving_work_with_child_proofs(
+        &self,
+        signature: QEDCompressedSecp256K1Signature,
+        request: SimpleTimedRequest,
+    ) -> RpcResult<PsyWorkerGetProvingWorkWithChildProofsAPIResponse<N::QHash, N::JobId>> {
         res(self.get_proving_work_with_child_proofs_internal(signature, request).await)
     }
-    async fn submit_proof_raw(&self, job_id: N::JobId, tag: N::QHash, proof: Vec<u8>) -> RpcResult<()>{
+    async fn submit_proof_raw(&self, job_id: N::JobId, tag: N::QHash, proof: Vec<u8>) -> RpcResult<()> {
         res(self.submit_proof_raw_internal(job_id, tag, proof).await)
     }
-    async fn get_realm_identifier_worker_api(&self) -> RpcResult<QRealmIdentifier>{
+    async fn get_realm_identifier_worker_api(&self) -> RpcResult<QRealmIdentifier> {
         Ok(self.realm_identifier.clone())
     }
 }
-

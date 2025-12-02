@@ -4,14 +4,14 @@ use parth_core::protocol::core_types::QNetworkTypesConfig;
 use psy_core::job::job_id::QProvingJobDataID;
 use psy_io::tokio::TokioLikeFileSystem;
 use psy_node_core::{
-    p2p::traits::realm_coordinantor::RealmCoordinatorClient, psy_core_db::traits::full::{PsyCoordinatorProcessorStore, PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmProcessorStore}, psy_temp_db::StandardProcessorTempDBStoreBase, queue::{
+    p2p::traits::realm_coordinantor::RealmCoordinatorClient, psy_core_db::traits::full::{PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmProcessorStore}, psy_temp_db::StandardProcessorTempDBStoreBase, queue::{
         ephemeral::QStandardEphemeralQueueSubscriber,
         worker_queue::{QStandardWorkerQueuePublisher, QStandardWorkerQueueSubscriber},
     }, store::traits::proof_store::QParthProofStore
 };
 use tokio::time::sleep;
 
-use crate::{coordinator::processor::PsyCoordinatorProcessor, realm::processor::core::PsyRealmProcessor};
+use crate::realm::processor::core::PsyRealmProcessor;
 
 pub async fn run_realm_processor_loop<
     N: QNetworkTypesConfig<JobId = QProvingJobDataID>,

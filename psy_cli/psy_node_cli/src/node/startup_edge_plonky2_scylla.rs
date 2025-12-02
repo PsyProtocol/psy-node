@@ -3,23 +3,19 @@ use std::sync::Arc;
 use parth_core::{node::realm_identifier::QRealmIdentifier, protocol::core_types::QNetworkTypesConfigHelper};
 use plonky2::plonk::config::PoseidonGoldilocksConfig;
 use psy_core::{job::job_id::QProvingJobDataID, network_config::PsyNetworkLocalDevnetConstants};
-use psy_data::{
-    config::network_config::PsyNodeCircuitFingerprintConfigProvider, gatherer_builders::deploy_contract,
-    genesis::genesis_block_setup::PsyGenesisBlockSetupDataProvider,
-};
-use psy_io::tokio::{TokioLikeFileSystem, TokioStdFileSystem};
-use psy_node_common::coordinator::{edge::{handler::CoordinatorEdgeHandler, server::start_coordinator_edge_rpc_server}, processor::create::create_coordinator_processor_and_run};
-use psy_node_core::config::node_start_config::{CoordinatorEdgeStartConfig, CoordinatorProcessorStartConfig};
+use psy_data::
+    config::network_config::PsyNodeCircuitFingerprintConfigProvider
+;
+use psy_node_common::{coordinator::edge::{handler::CoordinatorEdgeHandler, server::start_coordinator_edge_rpc_server}, realm::edge::{handler::RealmEdgeHandler, server::start_realm_edge_rpc_server}};
+use psy_node_core::config::node_start_config::{CoordinatorEdgeStartConfig, RealmEdgeStartConfig};
 use psy_node_nats::psy_queue::setup_nats_psy_queue_from_connection_str;
 use psy_node_redis::store::{new_redis_async_pool, StandardRedisStore};
 use psy_node_scylla::psy_setup::setup_psy_scylla_database_store_from_connection_string;
 use psy_plonky2_circuits::{
-    circuit_library::get_plonky2_circuit_library_and_prover_for_network, node::config::networks::resolver::PsyPlonky2NodeConfigResolver,
+    node::config::networks::resolver::PsyPlonky2NodeConfigResolver,
     protocol_types::ZKTypesPlonky2GoldilocksPoseidon, zk_verifier::PsyPlonky2ZKVerifier,
 };
 
-type F = parth_core::PF;
-type Hash = parth_core::pgoldilocks::QHashOut<F>;
 type C = PoseidonGoldilocksConfig;
 
 const D: usize = 2;
@@ -87,6 +83,82 @@ pub async fn run_startup_plonky2_scylla_edge_node(config: &CoordinatorEdgeStartC
                 checkpoint_state_transition_circuit_fingerprint,
             );
             start_coordinator_edge_rpc_server::<N, _, _, _, _, _, _, _, _>(
+                handler,
+                &config.listen,
+                config.port,
+            ).await?;
+        }
+        _ => {
+            anyhow::bail!("Unsupported network type for plonky2 scylla edge node");
+        }
+    }
+
+
+    Ok(())
+}
+
+
+
+pub async fn run_startup_plonky2_scylla_realm_edge_node(config: &RealmEdgeStartConfig) -> anyhow::Result<()> {
+
+
+    let pool = new_redis_async_pool(&config.redis_url, 10).await?;
+
+    let temp_store = StandardRedisStore::new(
+        pool,
+        config.db_namespace.to_string(),
+        config.realm_id,
+        config.realm_sub_id as u64,
+    );
+    let nats_queue = setup_nats_psy_queue_from_connection_str(&config.nats_jetstream_url, &config.db_namespace).await?;
+
+    let nats_queue = Arc::new(nats_queue);
+    let temp_db = Arc::new(temp_store);
+    let proof_store = temp_db.clone();
+    let guta_update_queue = nats_queue.clone();
+    let proof_work_queue = nats_queue.clone();
+
+    let realm_identifier = QRealmIdentifier {
+        realm_id: config.realm_id as u32,
+        realm_sub_id: config.realm_sub_id,
+    };
+    let proof_verifier = Arc::new(PsyPlonky2ZKVerifier::<C, D>::from_cached());
+    let chain_id = config.network.get_chain_id();
+/*
+
+    pub fn new(
+        db: Arc<S>,
+        tag_tree_rewards_store: Arc<STagTreeRewards>,
+        temp_db: Arc<TempDatabase>,
+        proof_store: Arc<ProofStore>,
+        guta_update_queue: Arc<GUTAUpdateQueue>,
+        register_user_queue: Arc<RegisterUserQueue>,
+        deploy_contract_queue: Arc<DeployContractQueue>,
+        get_proof_work_queue: Arc<GetProofWorkQueue>,
+        realm_identifier: QRealmIdentifier,
+        proof_verifier: Arc<N::ZKVerifier>,
+    ) -> Self {
+      */
+    match config.network {
+        psy_core::constants::chain_id::PsyChainNetworkType::LocalDevnet => {
+            type N = QNetworkTypesConfigHelper<QProvingJobDataID, ZKTypesPlonky2GoldilocksPoseidon, PsyNetworkLocalDevnetConstants>;
+            let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url).await?;
+            let db = Arc::new(db);
+            let tag_tree_rewards_store = db.clone();
+            
+            let handler = RealmEdgeHandler::<N, _, _, _, _, _, _>::new(
+                db,
+                tag_tree_rewards_store,
+                temp_db,
+                proof_store,
+                guta_update_queue,
+                proof_work_queue,
+                realm_identifier,
+                chain_id,
+                0,
+                proof_verifier,
+            );
+            start_realm_edge_rpc_server::<N, _, _, _, _, _, _>(
                 handler,
                 &config.listen,
                 config.port,

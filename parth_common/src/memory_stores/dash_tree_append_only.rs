@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use dashmap::DashMap;
-use parth_core::{crypto::hash::{merkle_proof::{DeltaMerkleProofCore, MerkleProofCore}, traits::MerkleZeroHasher}, data::hash::merkle_node_key::SimpleMerkleNodeKey};
+use parth_core::{crypto::hash::{merkle_proof::{DeltaMerkleProofCore, MerkleProofCore}, traits::MerkleZeroHasher}, data::hash::merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}};
 use std::marker::PhantomData;
 
 use crate::memory_stores::traits::{PsyMemoryMerkleStoreAppendOnlyReaderBase, PsyMemoryMerkleStoreAppendOnlyReaderBaseAsync, PsyMemoryMerkleStoreImm};
@@ -40,6 +40,42 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + Eq + PartialEq + Default + std
             zero_value_hashes,
             _hasher: PhantomData::default(),
         }
+    }
+    pub fn get_nodes_between_leaves(&self, min_include_leaf_index: u64, max_include_leaf_index: u64) -> Vec<SimpleMerkleNode<Hash>> {
+        let mut result = Vec::new();
+
+        let tree_height = self.get_height();
+        for level in 0..=tree_height {
+            let start_index = min_include_leaf_index >> (tree_height - level);
+            let end_index = max_include_leaf_index >> (tree_height - level);
+
+            for index in start_index..=end_index {
+                let key = SimpleMerkleNodeKey::new(level, index);
+                if let Some(node) = self.nodes.get(&key) {
+                    result.push(SimpleMerkleNode {
+                        key,
+                        value: *node.value(),
+                    });
+                }
+            }
+        }
+/* 
+        for node in self.nodes.iter() {
+            let key = node.key();
+            let level = key.level;
+            let index = key.index;
+
+            let start_index = min_include_leaf_index >> (tree_height - level);
+            let end_index = max_include_leaf_index >> (tree_height - level);
+
+            if index >= start_index && index <= end_index {
+                result.push(SimpleMerkleNode {
+                    key: *key,
+                    value: *node.value(),
+                });
+            }
+        }*/
+        result
     }
     pub fn get_historical_append_only_merkle_proof_for_root(
         &self,

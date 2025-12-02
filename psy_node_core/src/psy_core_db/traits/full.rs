@@ -524,6 +524,8 @@ pub trait PsyRealmProcessorStore<F, Hash>:
     + PsyNodeUserContractTreeDatabaseWriter<Hash>
     + PsyNodeContractStateTreeTreeDatabaseReader<Hash>
     + PsyNodeContractStateTreeTreeDatabaseWriter<Hash>
+    + PsyNodeCoreDatabaseBasicContractInfoStoreWriter<F, Hash>
+    + PsyNodeCoreDatabaseBasicContractInfoStoreReader<F, Hash>
 
 {
 }
@@ -547,7 +549,9 @@ impl<
         + PsyNodeUserContractTreeDatabaseReader<Hash>
         + PsyNodeUserContractTreeDatabaseWriter<Hash>
         + PsyNodeContractStateTreeTreeDatabaseReader<Hash>
-        + PsyNodeContractStateTreeTreeDatabaseWriter<Hash>,
+        + PsyNodeContractStateTreeTreeDatabaseWriter<Hash>
+        + PsyNodeCoreDatabaseBasicContractInfoStoreWriter<F, Hash>
+        + PsyNodeCoreDatabaseBasicContractInfoStoreReader<F, Hash>,
         F,
         Hash,
     > PsyRealmProcessorStore<F, Hash> for T

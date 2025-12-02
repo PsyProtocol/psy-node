@@ -427,6 +427,13 @@ impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sy
 impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
     CoreDatabaseZeroIdMerkleWriter<Hash, Hasher, ScyllaMerkleNodesZeroPreparedStatements> for ScyllaCoreStore<Hash, Hasher>
 {
+    async fn db_set_zero_id_merkle_nodes_batch_checkpoint_is_index(
+        &self,
+        table: &ScyllaMerkleNodesZeroPreparedStatements,
+        nodes: &[SimpleMerkleNode<Hash>],
+    ) -> anyhow::Result<()>{
+        table.set_zero_id_merkle_nodes_batch_internal_checkpoint_is_index::<Hash>(&self.session, nodes).await
+    }
     async fn db_insert_zero_id_merkle_node(
         &self,
         table: &ScyllaMerkleNodesZeroPreparedStatements,

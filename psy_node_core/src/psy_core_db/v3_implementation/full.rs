@@ -443,9 +443,9 @@ impl<
         Ok(res.pop().ok_or_else(|| anyhow::anyhow!("No delta merkle proof found"))?)
     }
 
-    async fn checkpoint_tree_set_nodes(&self, checkpoint_id: u64, nodes: &[SimpleMerkleNode<N::QHash>]) -> anyhow::Result<()> {
+    async fn checkpoint_tree_set_nodes(&self, _checkpoint_id: u64, nodes: &[SimpleMerkleNode<N::QHash>]) -> anyhow::Result<()> {
         self.store
-            .db_set_zero_id_merkle_nodes_batch(&self.global_checkpoint_tree_table, checkpoint_id, nodes)
+            .db_set_zero_id_merkle_nodes_batch_checkpoint_is_index(&self.global_checkpoint_tree_table, nodes)
             .await
     }
 }

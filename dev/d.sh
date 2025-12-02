@@ -47,6 +47,18 @@ start_edge() {
     ./target/release/psy_node_cli start-coordinator-edge --config ./psy_cli/example_node_configs/coordinator_edge_1.yaml 2>&1 | tee logs/coordinator_edge_1_logs.txt
 }
 
+start_realm_edge() {
+    build_if_needed $1
+    ./target/release/psy_node_cli start-realm-edge --config ./psy_cli/example_node_configs/realm_edge_1.yaml 2>&1 | tee logs/realm_edge_1_logs.txt
+}
+
+start_realm_processor() {
+    build_if_needed $1
+    # 2>&1 redirects stderr to stdout so errors are captured too
+    # | tee writes to the file AND displays to console
+    ./target/release/psy_node_cli start-realm-processor --config ./psy_cli/example_node_configs/realm_processor_1.yaml 2>&1 | tee logs/realm_processor_1_logs.txt
+}
+
 start_worker() {
     build_if_needed $1
     ./target/release/psy_worker_cli worker --user 0 --network local-devnet --config ./psy_cli/example_node_configs/worker_1.yml 2>&1 | tee logs/worker_1_logs.txt
@@ -72,6 +84,21 @@ sub_processor() {
 sub_p() {
   start_processor $1
 }
+
+
+sub_re() {
+    start_realm_edge $1
+}
+sub_realm_edge() {
+    start_realm_edge $1
+}
+
+sub_realm_processor() {
+  start_realm_processor $1
+}
+sub_rp() {
+  start_realm_processor $1
+}
 sub_help() {
     echo "Usage: $BASH_FILE_ME <subcommand> [options]"
     echo ""
@@ -85,8 +112,10 @@ sub_help() {
     echo "  -c                 Run config_gen_v2 and build before starting"
     echo ""
     echo "Examples:"
-    echo "  $BASH_FILE_ME [processor|edge|worker] -b   # Build and start"
-    echo "  $BASH_FILE_ME [processor|edge|worker] -c   # Run config_gen_v2 and build before starting"
+    echo "  $BASH_FILE_ME [realm_processor|realm_edge|processor|edge|worker] -b   # Build and start"
+    echo "  $BASH_FILE_ME [realm_processor|realm_edge|processor|edge|worker] -c   # Run config_gen_v2 and build before starting"
+    echo "  $BASH_FILE_ME realm_edge           # Start the realm edge"
+    echo "  $BASH_FILE_ME realm_processor      # Start the realm processor"
     echo "  $BASH_FILE_ME edge           # Start the edge"
     echo "  $BASH_FILE_ME worker         # Start the worker"
     echo "  $BASH_FILE_ME processor      # Start the processor"

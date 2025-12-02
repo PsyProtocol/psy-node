@@ -63,6 +63,9 @@ pub trait CoordinatorEdgeRpc<F, Hash, JobId, ZKProof>: NodeEdgeWorkerRpcServer<H
     #[method(name = "get_checkpoint_global_state_roots")]
     async fn get_checkpoint_global_state_roots(&self, checkpoint_id: u64) -> RpcResult<PQEDCheckpointGlobalStateRoots<Hash>>;
 
+    #[method(name = "get_contract_tree_state_heights")]
+    async fn get_contract_tree_state_heights(&self, checkpoint_id: u64, contract_ids: Vec<u64>) -> RpcResult<Vec<u8>>;
+
     // L2 block state
     #[method(name = "get_latest_l2_block_state")]
     async fn get_latest_l2_block_state(&self) -> RpcResult<QEDL2BlockState>;

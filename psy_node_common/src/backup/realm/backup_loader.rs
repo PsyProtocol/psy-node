@@ -1,14 +1,15 @@
 use parth_common::memory_stores::mem_tree_recorder::SimpleMemoryMerkleRecorderStore;
-use parth_core::protocol::core_types::QNetworkTypesConfig;
+use parth_core::{node::traits::coordinator, protocol::core_types::QNetworkTypesConfig};
 use psy_core::job::job_id::QProvingJobDataID;
 use psy_data::{
     node::realm_processor::RealmProcessorCoreState,
-    prepared_block::realm::PsyPreparedRealmBlockStateUpdates,
+    prepared_block::realm::{PsyPreparedRealmBlockStateUpdates, PsyPreparedRealmBlockStateUpdatesWithCoordinatorUpdate},
 };
 use psy_io::tokio::TokioLikeFileSystem;
+use psy_node_core::{p2p::traits::realm_coordinantor::RealmCoordinatorClient, psy_core_db::traits::full::PsyRealmProcessorStore};
 
-use crate::
-    realm::processor::gatherers::realm_end_cap_gatherer::{get_new_realm_end_cap_gatherer_backup_file_path, read_realm_end_cap_gatherer_backup_file}
+use crate::{backup::checkpoint_tree::CheckpointTreeBackupManager, 
+    realm::processor::gatherers::realm_end_cap_gatherer::{get_new_realm_end_cap_gatherer_backup_file_path, read_realm_end_cap_gatherer_backup_file}}
 ;
 
 pub async fn generate_realm_output_from_backups<
@@ -49,3 +50,4 @@ pub async fn generate_realm_output_from_backups<
     };
     Ok(updates)
 }
+

@@ -5,71 +5,58 @@ use psy_core::job::job_id::QProvingJobDataID;
 use psy_data::prepared_block::realm::PsyPreparedRealmBlockStateUpdatesWithCoordinatorUpdate;
 use psy_io::tokio::TokioLikeFileSystem;
 use psy_node_core::{
-    p2p::traits::realm_coordinantor::RealmCoordinatorClient, psy_core_db::traits::full::{PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmProcessorStore}, psy_temp_db::StandardProcessorTempDBStoreBase, queue::{ephemeral::QStandardEphemeralQueueSubscriber, worker_queue::QStandardWorkerQueuePublisher}, store::traits::proof_store::QParthProofStore
+    p2p::traits::realm_coordinantor::RealmCoordinatorClient,
+    psy_core_db::traits::full::{PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmProcessorStore},
+    psy_temp_db::StandardProcessorTempDBStoreBase,
+    queue::{ephemeral::QStandardEphemeralQueueSubscriber, worker_queue::QStandardWorkerQueuePublisher},
+    store::traits::proof_store::QParthProofStore,
 };
 
 use crate::{
     backup::realm::load_realm_memory_trees_from_db,
-    queue::gatherer::EphemeralQueueGathererWithTree, realm::processor::{core::PsyRealmProcessor, db::PsyRealmDatabaseProcessor, gatherers::realm_end_cap_gatherer::{RealmGUTAEndCapGatherer, RealmGUTAEndCapGathererConfig}},
+    queue::gatherer::EphemeralQueueGathererWithTree,
+    realm::processor::{
+        core::PsyRealmProcessor,
+        db::PsyRealmDatabaseProcessor,
+        gatherers::realm_end_cap_gatherer::{RealmGUTAEndCapGatherer, RealmGUTAEndCapGathererConfig},
+    },
 };
 
 impl<
-    N: QNetworkTypesConfig<JobId = QProvingJobDataID>,
-    S: PsyRealmProcessorStore<N::F, N::QHash> + Send + Sync,
-    STagTreeRewards: PsyNodeCoreRewardsTagTreeStoreWriter<N::F, N::QHash> + PsyNodeCoreRewardsTagTreeStoreReader<N::F, N::QHash> + Send + Sync,
-    GUTAUpdateQueue: QStandardEphemeralQueueSubscriber + Send + Sync + 'static,
-    ProofWorkQueue: QStandardWorkerQueuePublisher,
-    TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>+ Send + Sync + 'static,
-    ProofStore: QParthProofStore,
-    FileSystem: TokioLikeFileSystem+ Send + Sync + 'static,
-    CoordinatorClient: RealmCoordinatorClient<N::F, N::QHash> + Send + Sync,
-    >
-    PsyRealmProcessor<
-        N,
-        S,
-        STagTreeRewards,
-        GUTAUpdateQueue,
-        ProofWorkQueue,
-        TempDatabase,
-        ProofStore,
-        FileSystem,
-        CoordinatorClient,
-    >
+        N: QNetworkTypesConfig<JobId = QProvingJobDataID>,
+        S: PsyRealmProcessorStore<N::F, N::QHash> + Send + Sync,
+        STagTreeRewards: PsyNodeCoreRewardsTagTreeStoreWriter<N::F, N::QHash> + PsyNodeCoreRewardsTagTreeStoreReader<N::F, N::QHash> + Send + Sync,
+        GUTAUpdateQueue: QStandardEphemeralQueueSubscriber + Send + Sync + 'static,
+        ProofWorkQueue: QStandardWorkerQueuePublisher,
+        TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash> + Send + Sync + 'static,
+        ProofStore: QParthProofStore,
+        FileSystem: TokioLikeFileSystem + Send + Sync + 'static,
+        CoordinatorClient: RealmCoordinatorClient<N::F, N::QHash> + Send + Sync,
+    > PsyRealmProcessor<N, S, STagTreeRewards, GUTAUpdateQueue, ProofWorkQueue, TempDatabase, ProofStore, FileSystem, CoordinatorClient>
 where
     FileSystem::File: Send + Sync,
 {
     pub async fn new(
         mut db: PsyRealmDatabaseProcessor<
-        N,
-        S,
-        STagTreeRewards,
-        GUTAUpdateQueue,
-        ProofWorkQueue,
-        TempDatabase,
-        ProofStore,
-        FileSystem,
-        CoordinatorClient,
+            N,
+            S,
+            STagTreeRewards,
+            GUTAUpdateQueue,
+            ProofWorkQueue,
+            TempDatabase,
+            ProofStore,
+            FileSystem,
+            CoordinatorClient,
         >,
         genesis_block_update: PsyPreparedRealmBlockStateUpdatesWithCoordinatorUpdate<N::F, N::QHash>,
         file_system: Arc<FileSystem>,
         guta_gatherer_backup_directory: String,
-    ) -> anyhow::Result<(
-        Self,
-        tokio::task::JoinHandle<Result<(), anyhow::Error>>,
-    )> {
-
-        let (
-            mut global_user_tree,
-        ) = load_realm_memory_trees_from_db::<N, _>(&db.db, db.state.gathering_checkpoint_id + 1, db.state.realm_id_u64)
+    ) -> anyhow::Result<(Self, tokio::task::JoinHandle<Result<(), anyhow::Error>>)> {
+        let (mut global_user_tree,) = load_realm_memory_trees_from_db::<N, _>(&db.db, db.state.gathering_checkpoint_id + 1, db.state.realm_id_u64)
             .await?
             .into_tuple();
-        db.init_with_setup_and_genesis(
-            &file_system,
-            &guta_gatherer_backup_directory,
-            genesis_block_update,
-            &mut global_user_tree,
-        )
-        .await?;
+        db.init_with_setup_and_genesis(&file_system, &guta_gatherer_backup_directory, genesis_block_update, &mut global_user_tree)
+            .await?;
         //db.set_new_unique_ids().await?;
         tracing::info!("intialized coordinator processor database, building gatherers...");
 

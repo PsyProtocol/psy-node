@@ -13,5 +13,6 @@ pub trait RealmCoordinatorClient<F, Hash> {
     async fn rc_get_checkpoint_leaves_batch(&self, start_checkpoint_id: u64, count: u32) -> anyhow::Result<Vec<Hash>>;
     async fn rc_get_realm_root_and_last_modified_checkpoint(&self, checkpoint_id: u64, realm_id: u64) -> anyhow::Result<CheckpointedMerkleHash<Hash>>;
     async fn rc_submit_guta_proof(&self, input: GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<F, Hash>, proof: Vec<u8>, realm_id: u64) -> anyhow::Result<()>;
+    async fn rc_get_contract_tree_state_heights(&self, checkpoint_id: u64, contract_ids: Vec<u64>) -> anyhow::Result<Vec<u8>>;
 }
 

@@ -76,4 +76,10 @@ impl<N: QNetworkTypesConfig + 'static, C: CoordinatorEdgeRpcClient<N::F, N::QHas
             .map_err(|e| anyhow::anyhow!("{:?}", e))?;
         Ok(())
     }
+    async fn rc_get_contract_tree_state_heights(&self, checkpoint_id: u64, contract_ids: Vec<u64>) -> anyhow::Result<Vec<u8>> {
+        self.client
+            .get_contract_tree_state_heights(checkpoint_id, contract_ids)
+            .await
+            .map_err(|e| anyhow::anyhow!("{:?}", e))
+    }
 }

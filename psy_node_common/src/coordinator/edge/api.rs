@@ -261,6 +261,9 @@ impl<
     ) -> RpcResult<CheckpointedMerkleHash<N::QHash>> {
         res(self.db_reader.global_user_tree_get_node_and_checkpoint_id_max_checkpoint(checkpoint_id, &SimpleMerkleNodeKey { level: N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT, index: realm_id }).await)
     }
+    async fn get_contract_tree_state_heights(&self, checkpoint_id: u64, contract_ids: Vec<u64>) -> RpcResult<Vec<u8>> {
+        res(self.db_reader.get_contract_tree_heights(checkpoint_id, &contract_ids).await)
+    }
 
 }
 

@@ -1179,6 +1179,12 @@ where
     Hash: QDBHashBase,
     Hasher: MerkleZeroHasher<Hash> + Send + Sync,
 {
+
+    async fn db_set_zero_id_merkle_nodes_batch_checkpoint_is_index(&self, table: &InMemoryTableIdentifier, nodes: &[SimpleMerkleNode<Hash>]) -> anyhow::Result<()> {
+        let futures = nodes.iter().map(|node| self.db_insert_zero_id_merkle_node(table, node.key.index, &node.key, &node.value));
+        future::try_join_all(futures).await?;
+        Ok(())
+    }
     async fn db_insert_zero_id_merkle_node( &self, table: &InMemoryTableIdentifier, checkpoint_id: u64, key: &SimpleMerkleNodeKey, value: &Hash) -> anyhow::Result<()> {
         let db = self.get_or_create_table(&table.to_string());
         let db_key = key_helpers::key_merkle_zero_id(key, checkpoint_id);
