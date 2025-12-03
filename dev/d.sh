@@ -145,8 +145,10 @@ sub_rp() {
 }
 
 sub_dummy_prover() {
-    ./target/release/psy_worker_cli dummy-end-cap-prover --url http://127.0.0.1:1338 --user 0 > logs/dummy_end_cap_prover_logs.txt 2>&1 & | tee logs/dummy_end_cap_prover_logs.txt
+    ./target/release/psy_worker_cli dummy-end-cap-prover --url http://127.0.0.1:1338 --user 0 2>&1 | tee logs/dummy_end_cap_prover_logs.txt
 }
+
+
 sub_help() {
     echo "Usage: $BASH_FILE_ME <subcommand> [options]"
     echo ""

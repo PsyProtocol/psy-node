@@ -9,7 +9,7 @@ use plonky2::{
     }
 };
 use parth_core::{
-    crypto::hash::traits::{FieldQHasher, MerkleZeroHasher, QFieldHashable}, data::proof_input::CircuitInputWithDependencies, felt::QFelt64, pgoldilocks::{QHashOut, QRichField}, protocol::core_types::{Q256BitHash, QFHashBase, QHashBase}
+    crypto::hash::{tag_tree::{hash_tag_tree_node, hash_tag_tree_node_single}, traits::{FieldQHasher, MerkleZeroHasher, QFieldHashable}}, data::proof_input::CircuitInputWithDependencies, felt::QFelt64, pgoldilocks::{QHashOut, QRichField}, protocol::core_types::{Q256BitHash, QFHashBase, QHashBase}
 };
 use psy_core::
     job::job_id::{ProvingJobCircuitType, QProvingJobDataID}
@@ -27,7 +27,7 @@ use psy_plonky2_basic_helpers::{
 use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 
 use crate::{
-    guta::gadgets::single_variable_height_state_transition::SingleVariableHeightStateTransitionGadget, proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{QPsyNetworkCircuitWithType, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QStandardCircuitProvableWithRawProofsAndRefLibrary, proof_store::QProofStoreReaderAsync}, utils::proof_library::get_single_child_proof_for_api_response_with_inclusion_proof
+    guta::gadgets::{helpers::ToGUTAHeader, single_variable_height_state_transition::SingleVariableHeightStateTransitionGadget}, proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{QPsyNetworkCircuitWithType, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QStandardCircuitProvableWithRawProofsAndRefLibrary, proof_store::QProofStoreReaderAsync}, utils::proof_library::get_single_child_proof_for_api_response_with_inclusion_proof
 };
 
 use crate::guta::gadgets::verify_end_cap::VerifyEndCapProofGadget;
@@ -104,8 +104,14 @@ where
         let final_guta_header = svh_state_transition_gadget.new_guta_header;
         let public_inputs_hash = final_guta_header.get_public_inputs_hash_no_children::<C::Hasher, C::F, D>(&mut builder, worker_rewards_tree_tag);
 
-        builder.register_public_inputs(&public_inputs_hash.elements);
-
+        let guta_hash =final_guta_header.to_hash::<C::Hasher, C::F, D>(&mut builder);
+        //builder.register_public_inputs(&public_inputs_hash.elements);
+        builder.register_public_inputs(&[
+        public_inputs_hash.elements[0],
+        public_inputs_hash.elements[1],
+        public_inputs_hash.elements[2],
+        public_inputs_hash.elements[3],
+        ]);
         pad_circuit_degree(&mut builder, 12);
         let circuit_data = builder.build::<C>();
 
@@ -238,6 +244,12 @@ where
         )?;
 
 
+
+        let metadata_expected_public_inputs = input.base.job.metadata.expected_public_inputs_hash;
+        println!("GUTAVerifySingleEndCapCircuitV2 metadata_expected_public_inputs: {:#?}", metadata_expected_public_inputs);
+
+
+
         let witness = VerifySingleEndCapInputV2::<C::F, QHashOut<C::F>>::psy_ser_from_slice(&input.base.witness)?;
 
         let expected_compact = witness.get_end_result_a();
@@ -260,7 +272,17 @@ where
         let expecteed_new_guta = witness.get_new_guta_header(32);
         println!("expecteed_new_guta: {:#?}", expecteed_new_guta);
         let expected_new_public_inputs = witness.get_public_inputs_hash_no_rewards_tag::<C::Hasher>(32);
-        println!("expected_new_public_inputs: {:#?}", expected_new_public_inputs);
+
+        let new_tag_root = hash_tag_tree_node::<QHashOut<C::F>, C::Hasher>(&QHashOut::<C::F>::ZERO, &QHashOut::<C::F>::ZERO, &worker_reward_tag);
+
+
+        println!("expected_new_public_inputs_no_tag: {:#?}", expected_new_public_inputs);
+
+        let expected_new_public_inputs_with_tag = C::Hasher::q_two_to_one(
+            expected_new_public_inputs,
+            new_tag_root,
+        );
+        println!("expected_new_public_inputs_with_tag: {:#?}", expected_new_public_inputs_with_tag);
         let proof = self.prove_base(
             worker_reward_tag,
             &witness,
