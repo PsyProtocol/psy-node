@@ -155,6 +155,8 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std
             let mut init_proof = checkpoint_tree_store
                 .checkpoint_tree_get_merkle_proof(start_id, start_id)
                 .await?;
+
+            println!("Init proof for checkpoint {}: {:?}", start_id, init_proof);
             
             // FIX: Sanitize the proof.
             // The DB might return a proof based on the *current* state (e.g., tip at 100),

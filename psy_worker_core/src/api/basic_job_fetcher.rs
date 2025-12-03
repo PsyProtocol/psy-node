@@ -165,6 +165,7 @@ impl<
         &self,
     ) -> anyhow::Result<Option<([u8; 32], Hash, PsyWorkerGetProvingWorkWithChildProofsAPIResponse<Hash, QProvingJobDataID>)>> {
         let is_in_realm_mode = self.is_in_realm_mode.load(std::sync::atomic::Ordering::SeqCst);
+        println!("Fetching next job. Current mode: {}", if is_in_realm_mode { "Realm" } else { "Coordinator" });
         let result = if is_in_realm_mode {
             self.realm_api_url_manager.get_next_api_url_hash().await
         } else {

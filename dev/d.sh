@@ -34,6 +34,36 @@ build_if_needed() {
         fi
     fi
 }
+build_if_needed_realm() {
+    # if -c flag is passed, run config_gen_v2 and build
+    if [ "$1" = "-b" ]; then
+        echo "Building project..."
+        cargo build --release
+        if [ $? -ne 0 ]; then
+            echo "Build failed"
+            exit 1
+        fi
+    fi
+    # if -c flag is passed, run config_gen_v2 and build
+    if [ "$1" = "-g" ]; then
+        echo "Building project..."
+        cargo build --release
+        rm -rf ./local_checkpoints/realm_0_1
+        if [ $? -ne 0 ]; then
+            echo "Build failed"
+            exit 1
+        fi
+    fi
+    if [ "$1" = "-c" ]; then
+        echo "Running config gen and building the project..."
+        cargo run --release --package psy_plonky2_circuits --example config_gen_v2
+        cargo build --release
+        if [ $? -ne 0 ]; then
+            echo "Build failed"
+            exit 1
+        fi
+    fi
+}
 
 start_processor() {
     build_if_needed $1
@@ -48,12 +78,12 @@ start_edge() {
 }
 
 start_realm_edge() {
-    build_if_needed $1
+    build_if_needed_realm $1
     ./target/release/psy_node_cli start-realm-edge --config ./psy_cli/example_node_configs/realm_edge_1.yaml 2>&1 | tee logs/realm_edge_1_logs.txt
 }
 
 start_realm_processor() {
-    build_if_needed $1
+    build_if_needed_realm $1
     # 2>&1 redirects stderr to stdout so errors are captured too
     # | tee writes to the file AND displays to console
     ./target/release/psy_node_cli start-realm-processor --config ./psy_cli/example_node_configs/realm_processor_1.yaml 2>&1 | tee logs/realm_processor_1_logs.txt
@@ -63,7 +93,10 @@ start_worker() {
     build_if_needed $1
     ./target/release/psy_worker_cli worker --user 0 --network local-devnet --config ./psy_cli/example_node_configs/worker_1.yml 2>&1 | tee logs/worker_1_logs.txt
 }
-
+start_dummy_prover() {
+    build_if_needed $1
+    ./target/release/psy_worker_cli dummy-prover --user 0 --network local-devnet --config ./psy_cli/example_node_configs/dummy_prover_1.yml 2>&1 | tee logs/dummy_prover_1_logs.txt
+}
 sub_worker() {
     start_worker $1
 }

@@ -459,7 +459,7 @@ impl<
             contract_id,
             code_definition: contract_code_definition,
         };
-
+        println!("DeployContractGatherer adding contract id {} with code state tree height {}", contract_id, contract_code_definition_with_id.code_definition.state_tree_height);
         // START: write contract leaf data to file
         self.new_contracts_file.write_all(&contract_leaf_data_bytes).await?;
         // END: write contract leaf data to file

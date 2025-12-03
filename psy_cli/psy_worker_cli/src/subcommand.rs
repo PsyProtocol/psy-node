@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 pub mod worker;
 pub mod worker_test;
 pub mod keypair_helper;
+pub mod dummy_end_cap_prover;
 
 #[derive(Parser)]
 pub struct Cli {
@@ -61,5 +62,26 @@ pub enum Commands {
     GetPublicKey {
         #[arg(long = "private-key", env = "PRIVATE_KEY", help = "Private key hex string")]
         private_key: String,
+    },
+
+    #[command(about = "Run a proof mining worker")]
+    DummyEndCapProver {
+        #[arg(long = "url",  help = "Realm RPC URL to submit end caps to")]
+        api_url: String,
+
+        #[arg(long = "min-state-updates", help = "Minimum number of state updates to include per transaction in end cap", default_value_t = 1)]
+        min_state_updates: u32,
+
+        #[arg(long = "max-state-updates", help = "Maximum number of state updates to include per transaction in end cap", default_value_t = 100)]
+        max_state_updates: u32,
+
+        #[arg(long = "max-contract-calls", help = "Maximum number of contract calls to include in end cap", default_value_t = 3)]
+        max_contract_calls: u32,
+
+        #[arg(long = "user", help = "The user id to submit end caps for")]
+        user_id: u64,
+
+        #[arg(long = "network", help = "The network id to connect to")]
+        network: Option<PsyNetworkTypeInput>,
     },
 }

@@ -433,7 +433,7 @@ impl<
         state_transition_circuit_type: ProvingJobCircuitType,
         zk_proof: Vec<u8>,
     ) -> anyhow::Result<()> {
-        let checkpoint_id = coordinator_update.checkpoint_id;
+        let checkpoint_id: u64 = coordinator_update.checkpoint_id;
         tracing::info!("vaidation -> Committing coordinator state update to database for checkpoint_id: {}", checkpoint_id);
         let checkpoint_leaf_hash = coordinator_update.new_base.checkpoint_leaf.qfhash::<N::HasherBase>();
         if checkpoint_leaf_hash != coordinator_update.new_base.checkpoint_leaf_hash {
@@ -529,7 +529,7 @@ impl<
                 .await?;
             tracing::info!("Committed contract code definitions for checkpoint ID: {}", checkpoint_id);
             self.db.set_contract_tree_heights(checkpoint_id, &contract_tree_heights).await?;
-            tracing::info!("Committed contract tree heights for checkpoint ID: {}", checkpoint_id);
+            tracing::info!("Committed contract tree heights for checkpoint ID: {}, {:?}", checkpoint_id, contract_tree_heights);
             self.db
                 .contract_function_tree_set_nodes_ffs(checkpoint_id, &coordinator_update.update_contract_function_tree_nodes_ffs)
                 .await?;

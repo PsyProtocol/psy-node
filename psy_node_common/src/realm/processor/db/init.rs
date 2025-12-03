@@ -168,14 +168,35 @@ where
         let (current_unique_pending_id, current_core_proc_unique_pending_id) = db.get_current_unique_pending_id().await?;
         let last_committed_checkpoint_id = db.get_latest_checkpoint_id().await?;
 
-        let get_unique_pending_ids_result = db.get_unique_pending_id_for_checkpoint_id(last_committed_checkpoint_id).await;
+        let get_unique_pending_ids_result: anyhow::Result<Option<(u64, u128)>> = db.get_unique_pending_id_for_checkpoint_id(last_committed_checkpoint_id).await;
         if last_committed_checkpoint_id > 0 && get_unique_pending_ids_result.is_err() {
             tracing::error!("Inconsistent database state detected: unable to retrieve unique pending IDs for last committed checkpoint ID ({}). This indicates a serious inconsistency in the database state.", last_committed_checkpoint_id);
             anyhow::bail!("Inconsistent database state detected: unable to retrieve unique pending IDs for last committed checkpoint ID ({}). This indicates a serious inconsistency in the database state.", last_committed_checkpoint_id);
         }
+        let get_unique_pending_ids_result: (u64, u128) = if get_unique_pending_ids_result.is_err() {
+            if last_committed_checkpoint_id == 0 {
+                (0, 0u128)
+            } else {
+                tracing::error!("Inconsistent database state detected: unable to retrieve unique pending IDs for last committed checkpoint ID ({}). This indicates a serious inconsistency in the database state.", last_committed_checkpoint_id);
+                anyhow::bail!("Inconsistent database state detected: unable to retrieve unique pending IDs for last committed checkpoint ID ({}). This indicates a serious inconsistency in the database state.", last_committed_checkpoint_id);
+            }
+        }else{
+            let x = get_unique_pending_ids_result?;
+            if x.is_none() {
+                if last_committed_checkpoint_id == 0 {
+                    (0, 0u128)
+                } else {
+                    tracing::error!("Inconsistent database state detected: unable to retrieve unique pending IDs for last committed checkpoint ID ({}). This indicates a serious inconsistency in the database state.", last_committed_checkpoint_id);
+                    anyhow::bail!("Inconsistent database state detected: unable to retrieve unique pending IDs for last committed checkpoint ID ({}). This indicates a serious inconsistency in the database state.", last_committed_checkpoint_id);
+                }
+            } else {
+                x.unwrap()
+            }
+        };
 
-        let (last_committed_unique_pending_id, last_committed_proc_checkpoint_unique_id) =
-            get_unique_pending_ids_result.unwrap_or(Some((0, 0u128))).unwrap();
+
+        let (last_committed_unique_pending_id, last_committed_proc_checkpoint_unique_id) = get_unique_pending_ids_result;
+
         let last_committed_checkpoint_root = db.checkpoint_tree_get_root_hash(last_committed_checkpoint_id).await;
         if last_committed_checkpoint_root.is_err() {
             if last_committed_checkpoint_id == 0 && current_unique_pending_id == 0 {
@@ -211,13 +232,6 @@ where
             true,
         )
         .await?;
-        checkpoint_tree_backup_manager
-            .sync_from_database::<S>(&db, 1000, last_committed_checkpoint_id)
-            .await?;
-        checkpoint_tree_backup_manager
-            .sync_from_coordinator_client::<CoordinatorClient, N::F>(&coordinator_client, 10000)
-            .await?;
-
         temp_db
             .set_unique_pending_ids(&realm_identifier, current_unique_pending_id, current_core_proc_unique_pending_id)
             .await?;
@@ -411,6 +425,12 @@ where
         self.ensure_genesis_applied(genesis_block_update).await?;
         self.ensure_backup_restored_if_necessary(file_system, guta_gatherer_backup_directory, global_user_tree)
             .await?;
+        if self.state.last_committed_checkpoint_id > 0 {
+            self.checkpoint_tree_backup_manager
+                .sync_from_database::<S>(&self.db, 1000, self.state.last_committed_checkpoint_id)
+                .await?;
+        }
+
         self.sync_to_coordinator_set_checkpoint_id().await?;
 
         let global_user_tree_root = self.db.global_user_tree_get_root_hash(0xffffffffffffff00u64).await?;

@@ -1,5 +1,5 @@
-coordinator_id: 0
-coordinator_sub_id: 1
+realm_id: 0
+realm_sub_id: 1
 network: local-devnet
 verbose: true
 

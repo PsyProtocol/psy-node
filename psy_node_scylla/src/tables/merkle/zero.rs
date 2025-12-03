@@ -158,7 +158,7 @@ impl ScyllaMerkleNodesZeroPreparedStatements {
     ) -> anyhow::Result<CheckpointedMerkleHash<Hash>> {
         let res = session
             .execute_unpaged(
-                &self.select_1_prepared,
+                &self.select_1_and_checkpoint_prepared,
                 (
                     u8_to_i8_exact(key.level),
                     u64_to_i64_exact(key.index),

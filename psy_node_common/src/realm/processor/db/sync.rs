@@ -114,13 +114,14 @@ where
         if latest_db_l2_info.next_contract_id != new_sync_info.checkpoint_sync_info.block_state.next_contract_id {
             tracing::warn!("Next contract ID mismatch when syncing to coordinator. Latest DB L2 info next contract ID: {}, New sync info next contract ID: {}. Updating to new sync info value.",
                 latest_db_l2_info.next_contract_id, new_sync_info.checkpoint_sync_info.block_state.next_contract_id);
-            let batch_size = 5000u64;
+            let batch_size = 1000u64;
             let full_batches = (new_sync_info.checkpoint_sync_info.block_state.next_contract_id - latest_db_l2_info.next_contract_id) / (batch_size as u32);
             let remainder = (new_sync_info.checkpoint_sync_info.block_state.next_contract_id - latest_db_l2_info.next_contract_id) % (batch_size as u32);
             for i in 0..(full_batches as u64) {
                 let start_id = latest_db_l2_info.next_contract_id as u64 + i * batch_size;
                 let end_id = start_id + batch_size;
                 let heights:Vec<(u64, u8)> = self.coordinator_client.rc_get_contract_tree_state_heights(latest_checkpoint_id, (start_id..end_id).collect()).await?.into_iter().enumerate().map(|(i,b)| (i as u64 + start_id, b)).collect();
+                println!("Fetched contract tree heights for contract IDs {} to {} during sync to coordinator {:?}.", start_id, end_id, heights);
 
 
 
@@ -129,15 +130,24 @@ where
                     .await?;
                 tracing::info!("Initialized contract state tree leaves for contract IDs {} to {} during sync to coordinator.", start_id, end_id);
             }
-            for i in 0..(remainder as u64) {
-                let contract_id = latest_db_l2_info.next_contract_id as u64 + (full_batches as u64) * batch_size + i;
-                let heights:Vec<(u64, u8)> = self.coordinator_client.rc_get_contract_tree_state_heights(latest_checkpoint_id, vec![contract_id]).await?.into_iter().enumerate().map(|(j,b)| (j as u64 + contract_id, b)).collect();
 
+            if remainder != 0 {
+                let start_id = latest_db_l2_info.next_contract_id as u64 + full_batches as u64 * batch_size;
+                let end_id = start_id + remainder as u64;
+                let heights:Vec<(u64, u8)> = self.coordinator_client.rc_get_contract_tree_state_heights(latest_checkpoint_id, (start_id..end_id).collect()).await?.into_iter().enumerate().map(|(i,b)| (i as u64 + start_id, b)).collect();
+                println!("Fetched contract tree heights for contract IDs {} to {} during sync to coordinator {:?}.", start_id, end_id, heights);
                 self.db
                     .set_contract_tree_heights(latest_checkpoint_id, &heights)
                     .await?;
             }
+
         }
+
+        self.db
+            .set_unique_pending_id_checkpoint_id_mapping(self.state.processing_unique_pending_id, latest_checkpoint_id)
+            .await?;
+        self.db.set_checkpoint_id_to_unique_pending_id_mapping(latest_checkpoint_id, self.state.processing_unique_pending_id, &self.state.processing_proc_checkpoint_unique_id).await?;
+        self.db.set_latest_checkpoint_id(latest_checkpoint_id).await?;
 
         self.state.coordinator_head_synced_checkpoint_id = latest_checkpoint_id;
         self.state.coordinator_head_synced_checkpoint_root = self.checkpoint_tree_backup_manager.get_current_checkpoint_tree_root_head();

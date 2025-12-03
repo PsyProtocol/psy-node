@@ -270,6 +270,12 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
             return Ok(());
         }
         if user_last_checkpoint_id > self.current_checkpoint_id {
+            tracing::info!(
+                "Skipping end-cap job population due to user last checkpoint ID {} being greater than current checkpoint ID {} for user ID {}.",
+                user_last_checkpoint_id,
+                self.current_checkpoint_id,
+                user_id
+            );
             let result = RealmGUTAPlanner::populate_future_end_cap_job(
                 self.chain_id,
                 &self.realm_identifier,
@@ -295,6 +301,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
             tracing::info!("Skipping end-cap job population due to missing contract updates for user ID {}.", user_id);
             return Ok(());
         }
+        tracing::info!("Populating end-cap job for user ID {} at checkpoint ID {}.", user_id, user_last_checkpoint_id);
         let data = data.unwrap();
         file.write_all(&queue_item_bytes).await?;
         file.write_all(&data).await?;
@@ -388,6 +395,8 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
                 .await?;
             self.insert_job_at_level::<Hasher, TempStore>(parent_guta, &temp_store, 0, parent_job)
                 .await?;
+        }else{
+            self.end_cap_straggler = Some(queue_item);
         }
 
         Ok(())
@@ -452,6 +461,12 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
             self.future_pending_end_cap_jobs.push(future_end_cap_job);
             return Ok(());
         }
+
+        tracing::info!(
+            "Populating deferred end-cap job for user ID {} at checkpoint ID {}.",
+            user_id,
+            user_last_checkpoint_id
+        );
         
         file.write_all(&queue_item.psy_ser_to_bytes_vec()?).await?;
         file.write_all(&future_end_cap_job.contract_updates).await?;
@@ -545,6 +560,8 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
                 .await?;
             self.insert_job_at_level::<Hasher, TempStore>(parent_guta, &temp_store, 0, parent_job)
                 .await?;
+        }else{
+            self.end_cap_straggler = Some(queue_item);
         }
 
         Ok(())
@@ -682,6 +699,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
     ) -> anyhow::Result<Option<RealmGUTAEndCapGathererOutput<F, Hash, QProvingJobDataID>>> {
         if self.total_jobs == 0 && self.end_cap_straggler.is_none() {
             // No jobs were added.
+            tracing::info!("No jobs were added during GUTA planning. Nothing to finalize.");
             return Ok(None);
         } else if self.end_cap_straggler.is_some() {
             let end_cap_straggler = self

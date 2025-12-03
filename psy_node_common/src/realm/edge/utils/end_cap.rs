@@ -4,11 +4,9 @@ use parth_core::{
 };
 use psy_data::proof_input::guta::end_cap_input::SubmitUserEndCapNonProofInput;
 use psy_node_core::qblob::{
-    blob_type::QBlobMerkleNodeTreeType,
-    data_views::{single_merkle_node_batch::QBlobSingleIdMerkleRecorder},
+    blob_type::QBlobMerkleNodeTreeType, data_views::single_merkle_node_batch::QBlobSingleIdMerkleRecorder,
     structs::common::blob_metadata_header::QBlobWriterContextMetadataHeader,
 };
-
 
 pub fn validate_end_cap_and_generate_node_data_for_edge<F: QFelt64, Hash: QDBHashBase + QFHashBase<F>, Hasher: QFHasherU64<F, Hash>>(
     context: &QBlobWriterContextMetadataHeader,
@@ -18,8 +16,8 @@ pub fn validate_end_cap_and_generate_node_data_for_edge<F: QFelt64, Hash: QDBHas
     if end_cap.contract_state_updates.len() == 0 {
         anyhow::bail!("End cap must have at least one contract state update");
     }
-    let contract_tree_height = end_cap.contract_state_updates[0].user_contract_tree_update_proof.siblings.len();
-    let single_size_hint = end_cap.single_id_nodes_size_hint_in_nodes_modified(contract_tree_height);
+    let user_contract_tree_height = end_cap.contract_state_updates[0].user_contract_tree_update_proof.siblings.len();
+    let single_size_hint = end_cap.single_id_nodes_size_hint_in_nodes_modified(user_contract_tree_height);
     let double_size_hint = end_cap.double_id_nodes_size_hint_in_nodes_modified();
     let mut single_id_recorder = QBlobSingleIdMerkleRecorder::new_with_multi_size_hints_with_header(single_size_hint, double_size_hint);
 
@@ -27,10 +25,16 @@ pub fn validate_end_cap_and_generate_node_data_for_edge<F: QFelt64, Hash: QDBHas
         .user_contract_tree_update_proof
         .new_root;
 
+    let null_hash = Hasher::get_zero_hash(0);
+
     for csu in end_cap.contract_state_updates.iter().rev() {
+        if csu.contract_state_tree_updates.is_empty() {
+            anyhow::bail!("Contract state updates cannot be empty");
+        }
+
         let computed_end_root = single_id_recorder.record_and_compute_merkle_root_validate_delta_merkle_proof::<Hash, Hasher>(
             user_id,
-            contract_tree_height as u8,
+            user_contract_tree_height as u8,
             &csu.user_contract_tree_update_proof,
         )?;
         if computed_end_root != next_uct_end_root {
@@ -46,8 +50,19 @@ pub fn validate_end_cap_and_generate_node_data_for_edge<F: QFelt64, Hash: QDBHas
         }
 
         if csu.user_contract_tree_update_proof.old_value != csu.contract_state_tree_updates[0].old_root {
-            anyhow::bail!("User contract tree update proof old value does not match first contract state tree update old root");
-        } else if csu.user_contract_tree_update_proof.new_value != csu.contract_state_tree_updates.last().unwrap().new_root {
+            let contract_empty_zero_hash = Hasher::get_zero_hash(csu.contract_state_tree_updates[0].siblings.len());
+
+            if csu.user_contract_tree_update_proof.old_value == null_hash && csu.contract_state_tree_updates[0].old_root == contract_empty_zero_hash {
+                // allow this special case where we are updating from an empty
+                // tree it means a user never tried the contract
+                // before, and we initialize it to an empty merkle tree with the
+                // correct height
+            } else {
+                anyhow::bail!("User contract tree update proof old value does not match first contract state tree update old root");
+            }
+        }
+
+        if csu.user_contract_tree_update_proof.new_value != csu.contract_state_tree_updates.last().unwrap().new_root {
             anyhow::bail!("User contract tree update proof new value does not match last contract state tree update new root");
         }
     }
@@ -71,7 +86,24 @@ pub fn validate_end_cap_and_generate_node_data_for_edge<F: QFelt64, Hash: QDBHas
             next_cst_root = cst_update.old_root;
         }
         if next_cst_root != csu.user_contract_tree_update_proof.old_value {
-            anyhow::bail!("Computed contract state tree update overall old root does not match expected old root");
+            if csu.user_contract_tree_update_proof.old_value == null_hash {
+                let contract_empty_zero_hash = Hasher::get_zero_hash(csu.contract_state_tree_updates[0].siblings.len());
+                if next_cst_root == contract_empty_zero_hash {
+                    // allow this special case where we are updating from an
+                    // empty tree it means a user never
+                    // tried the contract before, and we
+                    // initialize it to an empty merkle tree with the
+                    // correct height
+                } else {
+                    anyhow::bail!("Computed contract state tree update overall old root does not match expected old root, next_cst_root = {:?}, expected = {:?}", next_cst_root, csu.user_contract_tree_update_proof.old_value);
+                }
+            } else {
+                anyhow::bail!(
+                    "Computed contract state tree update overall old root does not match expected old root, next_cst_root = {:?}, expected = {:?}",
+                    next_cst_root,
+                    csu.user_contract_tree_update_proof.old_value
+                );
+            }
         }
     }
 
@@ -102,10 +134,7 @@ mod tests {
     };
     use psy_node_core::qblob::{
         blob_type::QBlobMerkleNodeTreeType,
-        data_views::{
-            double_merkle_node_batch::QBlobDoubleMerkleNodeBatchDataView,
-            single_merkle_node_batch::QBlobSingleMerkleNodeBatchDataView,
-        },
+        data_views::{double_merkle_node_batch::QBlobDoubleMerkleNodeBatchDataView, single_merkle_node_batch::QBlobSingleMerkleNodeBatchDataView},
         structs::common::blob_metadata_header::QBlobWriterContextMetadataHeader,
     };
 

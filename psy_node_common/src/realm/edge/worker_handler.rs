@@ -4,20 +4,20 @@ use parth_core::{
     QCoreProcCheckpointUniqueId, QProvingJobDataIDWithRewardPath, crypto::{
         hash::{
             tag_tree::hash_tag_tree_node,
-            traits::{MerkleHasher, ZeroableHash},
+            traits::{MerkleHasher, MerkleZeroHasher, ZeroableHash},
         },
         secp256k1::{QEDCompressedSecp256K1Signature, Secp256K1Verifier, SimpleTimedRequest},
-    }, data::queue::queue_key::QPBaseQueueType, protocol::core_types::{Q256BitHash, QNetworkTypesConfig, QZKProofVerifier}
+    }, data::queue::queue_key::QPBaseQueueType, felt::{FromPrimitiveValuesFelt, ZeroableFelt}, protocol::core_types::{Q256BitHash, QNetworkTypesConfig, QZKProofVerifier}
 };
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
-use psy_data::
+use psy_data::{v1::qdata::user::PQEDUserLeaf, 
     worker::{
         api_response::{PROVING_JOB_NODE_TYPE_REALM, PsyWorkerGetProvingWorkAPIResponse, PsyWorkerGetProvingWorkWithChildProofsAPIResponse},
         metadata::{
             PROOF_REWARD_TREE_HASH_MODE_3_CHILDREN_DOUBLE_REWARD, PROOF_REWARD_TREE_HASH_MODE_LIFT_CHILD, PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN, PsyProvingJobMetadata
         },
         metadata_with_job_id::PsyProvingJobMetadataWithJobId,
-    }
+    }}
 ;
 use psy_node_core::{
  psy_core_db::traits::full::{PsyCoordinatorEdgeAPIStoreReader, PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmEdgeAPIStoreReader}, psy_temp_db::{QTempDBProvingJobMetadataReader, StandardEdgeAPITempDBStoreBase}, queue::{ephemeral::QStandardEphemeralQueuePublisher, worker_queue::QStandardWorkerQueueSubscriber}, store::traits::proof_store::QParthProofStore
@@ -83,6 +83,33 @@ impl<
         // don't finish them in a reasonable amount of time
 
         Ok(())
+    }
+    
+    pub async fn get_user_leaf_data_internal(&self, checkpoint_id: u64, user_id: u64) -> anyhow::Result<PQEDUserLeaf<N::F, N::QHash>> {
+        tracing::info!("get_user_leaf_data_internal: checkpoint_id={}, user_id={}", checkpoint_id, user_id);
+        let leaf = self
+            .db_reader
+            .get_user_leaf(checkpoint_id, user_id)
+            .await;
+        
+        if leaf.is_err(){
+            let err = leaf.err().unwrap();
+            let err_msg  = format!("{:?}", err);
+            if err_msg.contains("User leaf not found for"){
+                return Ok(PQEDUserLeaf {
+                    public_key: N::QHash::get_zero_value(),
+                    user_state_tree_root: N::HasherBase::get_zero_hash(N::GLOBAL_CONTRACT_TREE_HEIGHT_USIZE),
+                    balance: N::F::ZERO_VALUE,
+                    nonce: N::F::ZERO_VALUE,
+                    last_checkpoint_id: N::F::ZERO_VALUE,
+                    event_index: N::F::ZERO_VALUE,
+                    user_id: N::F::from_u64_value(user_id),
+                })
+            }else{
+                return Err(err);
+            }
+        }
+        Ok(leaf.unwrap())
     }
     pub async fn get_proving_work_internal(
         &self,

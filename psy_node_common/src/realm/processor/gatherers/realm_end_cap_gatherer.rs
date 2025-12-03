@@ -389,6 +389,7 @@ impl<
         tree: &mut SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>,
         item: Vec<u8>,
     ) -> anyhow::Result<()> {
+        tracing::info!("RealmGUTAEndCapGatherer processing queue item of size {}", item.len());
         if item.len() != PsyRealmUserUpdateQueueItem::<N::F, N::QHash>::FIXED_SIZE {
             // added sanity check
             return Err(anyhow::anyhow!(
@@ -398,6 +399,7 @@ impl<
             ));
         }
         let update_header = PsyRealmUserUpdateQueueItem::<N::F, N::QHash>::psy_ser_from_slice(&item)?;
+        tracing::info!("RealmGUTAEndCapGatherer processing queue item update_header {:?}", update_header);
         self.guta_planner
             .add_end_cap_job(
                 &self.config.checkpoint_tree,
@@ -408,10 +410,12 @@ impl<
                 update_header,
             )
             .await?;
+        tracing::info!("RealmGUTAEndCapGatherer finished processing queue item");
         self.config
             .file_system
             .file_like_fs_flush_file_with_path(&self.pending_file_path, &mut self.new_realm_end_cap_gatherer_file)
             .await?;
+        tracing::info!("RealmGUTAEndCapGatherer flushed changes to disk for pending file path {}", self.pending_file_path);
         Ok(())
     }
     async fn update_from_many_queue_items_with_tree(
@@ -425,6 +429,11 @@ impl<
         Ok(())
     }
     async fn finalize_with_tree(mut self, tree: &mut SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>) -> anyhow::Result<Self::Output> {
+        tracing::info!(
+            "Finalizing RealmGUTAEndCapGatherer for pending id {} with tree root {:?}",
+            self.status.gathering_unique_pending_id,
+            tree.get_root()
+        );
         let needs_revert = {
             self.config
                 .status
@@ -444,14 +453,27 @@ impl<
             tree.revert_changes();
             todo!("Handle revert properly in GUTA end cap gatherer by reading from the previous backup file");
         } else {
+            tracing::info!(
+                "Committing GUTA updates gatherer changes for pending id {}, finalizing root {:?}",
+                self.status.gathering_unique_pending_id,
+                tree.get_root()
+            );
             self.config
                 .file_system
                 .file_like_fs_flush_file_with_path(&self.pending_file_path, &mut self.new_realm_end_cap_gatherer_file)
                 .await?;
+            tracing::info!(
+                "GUTA updates gatherer for pending id {} flushed to disk before finalize.",
+                self.status.gathering_unique_pending_id
+            );
             let result = self
                 .guta_planner
                 .finalize_with_reward_ids(&self.config.checkpoint_tree, tree, self.config.temp_db.clone(), 0, 0)
                 .await?;
+            tracing::info!(
+                "GUTA updates gatherer for pending id {} finalized planner.",
+                self.status.gathering_unique_pending_id
+            );
             if result.is_some() {
                 let result = result.unwrap();
                 self.new_realm_end_cap_gatherer_file

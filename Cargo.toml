@@ -27,6 +27,7 @@ members = [
     "psy_plonky2_testbed",
     "psy_worker_core",
     "psy_api_core",
+    "psy_dummy_prover",
     "psy_cli/psy_worker_cli",
     "psy_cli/psy_node_cli",
 ]
@@ -47,7 +48,9 @@ quote = "1.0"
 paste = "1.0.15"
 const_format = "0.2.35"
 crossbeam-skiplist = "0.1"
+rustyline-derive = "0.11.1"
 
+shell-words = "1.1"
 colored = "2"
 serde = { version = "1.0.193", features = ["derive"] }
 serde_json = "1.0"
@@ -55,7 +58,7 @@ serde_with = { version = "3.4.0", features = ["hex", "macros"] }
 serde_repr = "0.1.19"
 serde_yaml = "0.9"
 dotenv = "0.15"
-
+rustyline = "=5.0.2"
 hex = "0.4.3"
 hex-literal = "0.4.1"
 anyhow = "1.0.75"
@@ -188,7 +191,7 @@ psy_scratchpad = { path = "./psy_scratchpad" }
 psy_type_defaults = { path = "./psy_type_defaults" }
 psy_worker_core = { path = "./psy_worker_core" }
 psy_api_core = { path = "./psy_api_core" }
-
+psy_dummy_prover = { path = "./psy_dummy_prover" }
 psy_node_redis = { path = "./psy_node_redis" }
 psy_node_nats = { path = "./psy_node_nats" }
 psy_node_scylla = { path = "./psy_node_scylla" }

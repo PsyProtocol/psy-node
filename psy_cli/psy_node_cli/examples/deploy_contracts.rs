@@ -1,3 +1,5 @@
+use std::u64;
+
 use cf_utils::timer::DebugTimer;
 use jsonrpsee::{
     http_client::{HttpClient, HttpClientBuilder}, ws_client::WsClientBuilder
@@ -13,7 +15,7 @@ pub fn gen_random_contract<Hash: QPGenRandom + QHashBase>(max_functions: usize) 
     let contract = PQBCDeployContract {
         deployer: Hash::qp_rand_gen(),
         code_definition: ContractCodeDefinition {
-            state_tree_height: u16::qp_rand_gen() % 31 + 1,
+            state_tree_height: 4,//u16::qp_rand_gen() % 31 + 1,
             functions: (0..function_whitelist.len())
                 .map(|i| {
                     ContractFunctionCodeDefinition{
@@ -28,6 +30,8 @@ pub fn gen_random_contract<Hash: QPGenRandom + QHashBase>(max_functions: usize) 
         },
         function_whitelist,
     };
+
+    println!("generated contract_state_Tree_height: {}", contract.code_definition.state_tree_height);
 
     contract
 }
@@ -76,6 +80,14 @@ impl<F: QFelt64, Hash: QFHashBase<F> + QDBHashBase + QPGenRandom, Hasher: FieldQ
         }
         Ok(())
     }
+    pub async fn get_contract_tree_state_heights(&self, min_contract_id: u64, max_contract_id: u64) -> anyhow::Result<Vec<u8>> {
+        let ids = (min_contract_id..=max_contract_id).collect();
+        let heights: Vec<u8> = self.client.get_contract_tree_state_heights(u64::MAX, ids).await?;
+        let code = self.client.get_contract_code_definition(0).await?;
+        println!("code.state_tree_height: {}", code.state_tree_height);
+
+        Ok(heights)
+    }
 }
 
 async fn test_client() -> anyhow::Result<()> {
@@ -90,6 +102,13 @@ async fn test_client() -> anyhow::Result<()> {
 
     // Test WebSocket client
     let mut timer = DebugTimer::new("http");
+
+
+
+    //let heights = client.get_contract_tree_state_heights(0,2000).await?;
+
+    //println!("Contract tree state heights for contract IDs 0 to 2000: {:?}", heights);
+
     timer.lap("init");
     client.deploy_random_contracts(100, 10).await?;
     timer.lap_batch("http", "deploy_random_contracts", 100);

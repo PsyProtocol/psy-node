@@ -96,7 +96,7 @@ impl<Hash: QHashBase> QEDContractStateUpdateHistory<Hash> {
                 anyhow::bail!("invalid tree height in siblings");
             }
             if self.contract_state_tree_updates[i].old_root != self.contract_state_tree_updates[i-1].new_root {
-                anyhow::bail!("invalid cst transition proof: current old_root != last new_root");
+                anyhow::bail!("invalid cst transition proof: current old_root != last new_root, {:?} != {:?}", self.contract_state_tree_updates[i].old_root, self.contract_state_tree_updates[i-1].new_root);
             }
         }
 

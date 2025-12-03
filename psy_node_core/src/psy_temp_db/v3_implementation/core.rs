@@ -241,7 +241,8 @@ impl<T: QTempDatabaseRawKVReaderBase + Sync> QTempDBSubmitStatusReader for T {
             let submitted_status = u64::from_le_bytes(value_bytes[0..8].try_into().unwrap());
             Ok(submitted_status)
         } else {
-            anyhow::bail!("Submitted status not found");
+            Ok(0)
+            //anyhow::bail!("Submitted status not found");
         }
     }
 }

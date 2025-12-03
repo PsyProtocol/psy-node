@@ -622,7 +622,7 @@ impl<
         assert_eq!(new_root, delta.new_root);
         assert_eq!(db.contract_state_tree_get_leaf_hash(checkpoint_id, user_id, contract_id, state_slot_id).await?, leaf_val);
         
-        let proof = db.contract_state_tree_get_merkle_proof(checkpoint_id, user_id, contract_id, state_slot_id).await?;
+        let proof = db.contract_state_tree_get_merkle_proof(checkpoint_id, user_id, contract_id, tree_height, state_slot_id).await?;
         assert!(proof.verify::<N::HasherBase>());
         assert_eq!(proof.root, new_root);
         

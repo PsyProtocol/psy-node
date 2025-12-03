@@ -119,6 +119,7 @@ pub trait PsyNodeContractStateTreeTreeDatabaseReader<Hash> {
         checkpoint_id: u64,
         user_id: u64,
         contract_id: u64,
+        tree_height: u8,
         state_slot_id: u64,
     ) -> anyhow::Result<MerkleProofCore<Hash>>;
     async fn contract_state_tree_get_nodes(&self, checkpoint_id: u64, keys: &[QMerkleStoreDoubleIdKey]) -> anyhow::Result<Vec<Hash>>;

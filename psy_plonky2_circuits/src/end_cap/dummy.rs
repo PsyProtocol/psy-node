@@ -7,9 +7,10 @@ use plonky2::{
         proof::ProofWithPublicInputs,
     }
 };
-use psy_data::{guta::stats::GUTAStats, v1::qdata::{user::PQEDUserLeaf, user_end_cap_result::PUPSEndCapResultCompact}};
+use psy_data::{guta::stats::GUTAStats, proof_input::guta::end_cap_input::SubmitUserEndCapNonProofInput, v1::qdata::{user::PQEDUserLeaf, user_end_cap_result::PUPSEndCapResultCompact}};
+use psy_dummy_prover::traits::DummyUPSProver;
 use psy_plonky2_basic_helpers::builder::pad_circuit::{pad_circuit_degree, CircuitBuilderQEDCommonGates};
-use crate::{proof_minifier::{pm_chain_dynamic::QEDProofMinifierDynamicChain, pm_core::get_circuit_fingerprint_generic}, qstandard::QStandardCircuit};
+use crate::{proof_minifier::{pm_chain_dynamic::QEDProofMinifierDynamicChain, pm_core::get_circuit_fingerprint_generic}, qstandard::QStandardCircuit, utils::proof_serialization::serialize_plonky2_proof};
 use plonky2::field::types::Field;
 
 #[derive(Debug)]
@@ -229,7 +230,25 @@ where
 */
 
 
+impl<C: GenericConfig<D> + 'static, const D: usize> DummyUPSProver<C::F, QHashOut<C::F>> for DummyUPSStandardEndCapCircuit<C, D>
+where
+    C::Hasher: AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + FieldQHasher<C::F,QHashOut<C::F>>, C::F: QFelt64, QHashOut<C::F>: QFHashBase<C::F>,{
+        fn prove_end_cap_dummy_ups(
+        &self,
+        global_user_tree_height: u8,
+        input: &SubmitUserEndCapNonProofInput<C::F, QHashOut<C::F>>,
+    ) -> anyhow::Result<Vec<u8>> {
+                let guta_hash = input.core.state_transition.qfhash_with_guta_height::<C::Hasher>(global_user_tree_height);
 
+        let proof = self.prove_base(
+            C::Hasher::q_two_to_one(
+                guta_hash,
+                input.core.stats.qfhash::<C::Hasher>(),
+            ),
+        )?;
+        serialize_plonky2_proof(&proof)
+    }
+    }
 
 #[cfg(test)]
 mod tests {

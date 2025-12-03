@@ -4,19 +4,13 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use jsonrpsee::core::RpcResult;
 use parth_core::{
-    crypto::{
+    QProvingJobDataIDWithRewardPath, crypto::{
         hash::{
-            merkle_proof::{compute_historical_and_current_merkle_roots_core_gt, MerkleProofCore},
+            merkle_proof::{MerkleProofCore, compute_historical_and_current_merkle_roots_core_gt},
             traits::{MerkleZeroHasher, QFieldHashable},
         },
         secp256k1::{QEDCompressedSecp256K1Signature, SimpleTimedRequest},
-    },
-    data::{hash::merkle_node_key::SimpleMerkleNodeKey, queue::queue_key::QPBaseQueueType},
-    felt::ToU64Value,
-    node::realm_identifier::QRealmIdentifier,
-    protocol::core_types::{QNetworkDatabaseTypes, QNetworkTypesConfig, QZKProofPublicInputsHasherReader, QZKProofVerifier},
-    store::tag_tree_store,
-    QProvingJobDataIDWithRewardPath,
+    }, data::{hash::{merkle_node_key::SimpleMerkleNodeKey, merkle_store_key::{QMerkleStoreDoubleIdKey, QMerkleStoreSingleIdKey}}, queue::queue_key::QPBaseQueueType}, felt::ToU64Value, node::realm_identifier::QRealmIdentifier, protocol::core_types::{QNetworkDatabaseTypes, QNetworkTypesConfig, QZKProofPublicInputsHasherReader, QZKProofVerifier}, store::tag_tree_store
 };
 use psy_api_core::{realm::standard_edge_rpc::RealmEdgeRpcServer, worker::standard_worker_rpc::NodeEdgeWorkerRpcServer};
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
@@ -160,10 +154,12 @@ impl<
         self.db_reader.get_latest_checkpoint_id().await
     }
     pub async fn ensure_user_has_not_submitted(&self, user_id: u64, unique_pending_id: u64) -> anyhow::Result<()> {
+        tracing::info!("here");
         let submitted_status = self
             .temp_db
             .get_submitted_status_for_pending(&self.realm_identifier, unique_pending_id, user_id)
             .await?;
+        tracing::info!("submitted_status: {}", submitted_status);
         if submitted_status != 0 {
             anyhow::bail!(
                 "end cap for user_id {} at unique_pending_id {} has already been submitted",
@@ -263,11 +259,11 @@ impl<
             anyhow::bail!("invalid contract_state_updates: cannot be empty");
         }
 
-        let (unique_pending_id, proc_checkpoint_id) = self.temp_db.get_unique_pending_ids(&self.realm_identifier).await?;
+        let (unique_pending_id, proc_checkpoint_id) = self.temp_db.get_gathering_unique_pending_ids(&self.realm_identifier).await?;
         self.ensure_user_has_not_submitted(user_id, unique_pending_id).await?;
 
         let current_checkpoint_id = self.get_latest_checkpoint_id().await?;
-        let old_user_leaf = self.db_reader.get_user_leaf(current_checkpoint_id, user_id).await?;
+        let old_user_leaf = self.get_user_leaf_data_internal(current_checkpoint_id, user_id).await?;
         let user_last_checkpoint_id = old_user_leaf.last_checkpoint_id.to_u64_value();
 
         if user_last_checkpoint_id > secondary_end_cap_checkpoint_id {
@@ -300,14 +296,10 @@ impl<
             .checkpoint_tree_get_merkle_proof(current_checkpoint_id, end_cap_checkpoint_id)
             .await?;
 
-        let (historical_root, current_root) = compute_historical_and_current_merkle_roots_core_gt::<N::QHash, N::HasherBase>(&checkpoint_tree_proof);
-        if current_root != checkpoint_tree_proof.root {
-            anyhow::bail!(
-                "Invalid checkpoint tree proof current root, left: {:?}, right: {:?}",
-                current_root,
-                checkpoint_tree_proof.root
-            );
-        } else if historical_root != user_end_cap_input.core.state_transition.checkpoint_tree_root_hash {
+        println!("checkpoint_tree_proof: {:?}", checkpoint_tree_proof);
+        let historical_root = checkpoint_tree_proof.get_append_root::<N::HasherBase>();
+        //let (historical_root, current_root) = compute_historical_and_current_merkle_roots_core_gt::<N::QHash, N::HasherBase>(&checkpoint_tree_proof);
+        if historical_root != user_end_cap_input.core.state_transition.checkpoint_tree_root_hash {
             anyhow::bail!(
                 "Invalid checkpoint tree proof historical root, left: {:?}, right: {:?}",
                 historical_root,
@@ -451,6 +443,25 @@ impl<
 {
     /// Check if a user id belongs to this realm
 
+    async fn get_latest_checkpoint_id(&self) -> RpcResult<u64> {
+        res(self.get_latest_checkpoint_id().await)
+    }
+    
+    async fn get_contract_tree_state_heights(&self, checkpoint_id: u64, contract_ids: Vec<u64>) -> RpcResult<Vec<u8>>{
+        let result = self
+            .db_reader
+            .get_contract_tree_heights(checkpoint_id, &contract_ids)
+            .await;
+        if result.is_err() {
+            tracing::error!("Error getting contract tree state heights");
+
+        } else {
+            println!("Got contract tree state heights for checkpoint_id {}: {:?}", checkpoint_id, result.as_ref().unwrap());
+            tracing::info!("Got contract tree state heights for checkpoint_id {}", checkpoint_id);
+        }
+        res(result)
+
+    }
     async fn check_user_id_in_realm(&self, user_id: u64) -> QRpcResult<bool> {
         let users_per_realm = 1u64 << N::REALM_GLOBAL_USER_TREE_HEIGHT;
         let min_user_id = self.realm_id_u64 * users_per_realm;
@@ -459,6 +470,30 @@ impl<
     }
 
     /// Submit user end cap proof
+
+    async fn get_user_contract_state_tree_nodes(
+        &self,
+        checkpoint_id: u64,
+        keys: Vec<QMerkleStoreDoubleIdKey>,
+    ) -> RpcResult<Vec<N::QHash>>{
+        res(self
+            .db_reader
+            .contract_state_tree_get_nodes(checkpoint_id, &keys)
+            .await  )
+    }
+
+    async fn get_user_contract_tree_nodes(
+        &self,
+        checkpoint_id: u64,
+        keys: Vec<QMerkleStoreSingleIdKey>,
+    ) -> RpcResult<Vec<N::QHash>>{
+        res(self
+            .db_reader
+            .user_contract_tree_get_nodes(checkpoint_id, &keys)
+            .await
+        )
+
+    }
 
     // do not implement this yet
     async fn submit_user_end_cap(&self, user_ec_input: SubmitUserEndCapNonProofInput<N::F, N::QHash>, proof: Vec<u8>) -> QRpcResult<String> {
@@ -499,7 +534,7 @@ impl<
     }
 
     async fn get_user_leaf_data(&self, checkpoint_id: u64, user_id: u64) -> QRpcResult<PQEDUserLeaf<N::F, N::QHash>> {
-        res(self.db_reader.get_user_leaf(checkpoint_id, user_id).await)
+        res(self.get_user_leaf_data_internal(checkpoint_id, user_id).await)
     }
 
     async fn get_user_contract_state_tree_root(&self, checkpoint_id: u64, user_id: u64, contract_id: u32) -> QRpcResult<N::QHash> {
@@ -528,12 +563,12 @@ impl<
         checkpoint_id: u64,
         user_id: u64,
         contract_id: u32,
-        _height: u8, // height is not used in the db call
+        height: u8, // height is not used in the db call
         leaf_id: u64,
     ) -> QRpcResult<MerkleProofCore<N::QHash>> {
         res(self
             .db_reader
-            .contract_state_tree_get_merkle_proof(checkpoint_id, user_id, contract_id as u64, leaf_id)
+            .contract_state_tree_get_merkle_proof(checkpoint_id, user_id, contract_id as u64, height, leaf_id)
             .await)
     }
 

@@ -40,6 +40,23 @@ async fn main() -> anyhow::Result<()> {
         Commands::GetPublicKey { private_key } => {
             keypair_helper::get_public_key_for_private_key(&private_key)?;
         },
+        Commands::DummyEndCapProver {
+            api_url,
+            min_state_updates,
+            max_state_updates,
+            max_contract_calls,
+            user_id,
+            network,
+        } => {
+            subcommand::dummy_end_cap_prover::run(
+                api_url,
+                min_state_updates,
+                max_state_updates,
+                max_contract_calls,
+                user_id,
+                network,
+            ).await?;
+        },
     };
     Ok::<_, anyhow::Error>(())
 }

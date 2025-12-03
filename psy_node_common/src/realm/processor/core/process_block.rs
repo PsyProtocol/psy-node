@@ -160,6 +160,7 @@ where
         let root_job_id = self.get_root_job_id(&guta_jobs)?;
         if root_job_id.is_none() {
             tracing::info!("No GUTA jobs to process in this block, skipping.");
+            self.db.sync_to_coordinator_set_checkpoint_id().await?;
             return Ok(());
         }
         let root_job_id = root_job_id.unwrap();

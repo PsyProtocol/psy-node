@@ -1,7 +1,6 @@
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
 use parth_core::{
-    crypto::hash::merkle_proof::MerkleProofCore,
-    QProvingJobDataIDWithRewardPath,
+    QProvingJobDataIDWithRewardPath, crypto::hash::merkle_proof::MerkleProofCore, data::{db::row::QDoubleIdKey, hash::{merkle_node_key::SimpleMerkleNodeKey, merkle_store_key::{QMerkleStoreDoubleIdKey, QMerkleStoreSingleIdKey}}}
 };
 use psy_data::{
     proof_input::guta::end_cap_input::SubmitUserEndCapNonProofInput,
@@ -43,6 +42,9 @@ pub trait RealmEdgeRpc<F, Hash, JobId, ZKProof> {
         -> RpcResult<PQEDCheckpointLeaf<F, Hash>>;
 
         
+    #[method(name = "get_latest_checkpoint_id")]
+    async fn get_latest_checkpoint_id(&self) -> RpcResult<u64>;
+    
     #[method(name = "get_latest_l2_block_state")]
     async fn get_latest_l2_block_state(&self) -> RpcResult<QEDL2BlockState>;
 
@@ -58,6 +60,9 @@ pub trait RealmEdgeRpc<F, Hash, JobId, ZKProof> {
 
     #[method(name = "get_checkpoint_tree_root")]
     async fn get_checkpoint_tree_root(&self, checkpoint_id: u64) -> RpcResult<Hash>;
+
+    #[method(name = "get_contract_tree_state_heights")]
+    async fn get_contract_tree_state_heights(&self, checkpoint_id: u64, contract_ids: Vec<u64>) -> RpcResult<Vec<u8>>;
 
 
     #[method(name = "get_checkpoint_tree_leaf_hash")]
@@ -104,6 +109,20 @@ pub trait RealmEdgeRpc<F, Hash, JobId, ZKProof> {
         height: u8,
         leaf_id: u64,
     ) -> RpcResult<Hash>;
+
+    #[method(name = "get_user_contract_state_tree_nodes")]
+    async fn get_user_contract_state_tree_nodes(
+        &self,
+        checkpoint_id: u64,
+        keys: Vec<QMerkleStoreDoubleIdKey>,
+    ) -> RpcResult<Vec<Hash>>;
+
+    #[method(name = "get_user_contract_tree_nodes")]
+    async fn get_user_contract_tree_nodes(
+        &self,
+        checkpoint_id: u64,
+        keys: Vec<QMerkleStoreSingleIdKey>,
+    ) -> RpcResult<Vec<Hash>>;
 
     #[method(name = "get_user_contract_state_tree_merkle_proof")]
     async fn get_user_contract_state_tree_merkle_proof(

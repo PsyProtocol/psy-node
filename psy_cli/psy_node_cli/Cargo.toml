@@ -48,7 +48,8 @@ hashbrown = { workspace = true }
 dashmap = { workspace = true }
 jsonrpsee = { workspace = true }
 dotenv = { workspace = true }
-
+rustyline = { workspace = true }
+rustyline-derive = { workspace = true }
 plonky2 = { workspace = true }
 
 # start local packages

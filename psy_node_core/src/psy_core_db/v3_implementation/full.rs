@@ -1105,15 +1105,16 @@ impl<
         checkpoint_id: u64,
         user_id: u64,
         contract_id: u64,
+        tree_height: u8,
         state_slot_id: u64,
     ) -> anyhow::Result<MerkleProofCore<N::QHash>> {
-        let key = SimpleMerkleNodeKey::new(N::MAX_CONTRACT_STATE_TREE_HEIGHT, state_slot_id);
+        let key = SimpleMerkleNodeKey::new(tree_height, state_slot_id);
         self.db_select_double_id_merkle_proof_max_checkpoint(
             &self.contract_state_tree_table,
             checkpoint_id,
             user_id,
             contract_id,
-            N::MAX_CONTRACT_STATE_TREE_HEIGHT,
+            tree_height,
             &key,
         )
         .await

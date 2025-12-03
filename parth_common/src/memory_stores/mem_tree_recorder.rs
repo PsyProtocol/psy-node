@@ -26,6 +26,45 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + PartialEq + Default>
     pub fn set_effective_height(&mut self, effective_height: u8) {
         self.effective_height = effective_height;
     }
+    pub fn get_old_root(&self) -> Hash {
+        self.get_last_commit_root()
+    }
+    pub fn injest_commit_delta_merkle_proof_old_nodes_new_update(&mut self, dmp: &DeltaMerkleProofCore<Hash>) -> anyhow::Result<()> {
+
+        let base_key = SimpleMerkleNodeKey::new(self.height, dmp.index);
+
+        if self.get_height() as usize != dmp.siblings.len() {
+            anyhow::bail!("proof height does not match tree height");
+        }
+
+        let mut current_key = base_key;
+        let mut current_old_hash = dmp.old_value;
+        let mut current_new_hash = dmp.new_value;
+            self.nodes.insert(current_key, current_old_hash);
+            self.updated_nodes.insert(base_key, current_new_hash);
+
+        for sibling_hash in &dmp.siblings {
+
+            let sibling_key = current_key.sibling();
+            self.nodes.insert(sibling_key, *sibling_hash);
+            current_old_hash = if (current_key.index & 1) == 1 {
+                Hasher::two_to_one(sibling_hash, &current_old_hash)
+            } else {
+                Hasher::two_to_one(&current_old_hash, sibling_hash)
+            };
+
+            current_new_hash = if (current_key.index & 1) == 1 {
+                Hasher::two_to_one(sibling_hash, &current_new_hash)
+            } else {
+                Hasher::two_to_one(&current_new_hash, sibling_hash)
+            };
+
+            self.nodes.insert(current_key, current_old_hash);
+            self.updated_nodes.insert(base_key, current_new_hash);
+            current_key = current_key.parent();
+        }
+        Ok(())
+    }
     pub fn from_hash_map(
         height: u8,
         nodes: HashMap<SimpleMerkleNodeKey, Hash>,
@@ -43,6 +82,42 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + PartialEq + Default>
     }
 
     pub fn injest_merkle_proof(&mut self, proof: &MerkleProofCore<Hash>) -> anyhow::Result<()> {
+        let base_key = SimpleMerkleNodeKey::new(proof.siblings.len() as u8, proof.index);
+        let mut current_key = base_key;
+        
+        if self.get_height() as usize != proof.siblings.len() {
+            anyhow::bail!("proof height does not match tree height");
+        }
+        self.set_node_value(current_key, proof.value);
+
+        for sibling_hash in &proof.siblings {
+            let sibling_key = current_key.sibling();
+            self.set_node_value(sibling_key, *sibling_hash);
+            current_key = current_key.parent();
+        }
+        self.rehash_from_node_to_level(base_key, 0);
+        Ok(())
+    }
+
+    pub fn injest_merkle_proof_into_nodes(&mut self, proof: &MerkleProofCore<Hash>) -> anyhow::Result<()> {
+        let base_key = SimpleMerkleNodeKey::new(proof.siblings.len() as u8, proof.index);
+        let mut current_key = base_key;
+        
+        if self.get_height() as usize != proof.siblings.len() {
+            anyhow::bail!("proof height does not match tree height");
+        }
+        self.set_node_value_nodes_no_updated(current_key, proof.value);
+
+        for sibling_hash in &proof.siblings {
+            let sibling_key = current_key.sibling();
+            self.set_node_value_nodes_no_updated(sibling_key, *sibling_hash);
+            current_key = current_key.parent();
+        }
+        self.rehash_from_node_to_level_no_updated(base_key, 0);
+        Ok(())
+    }
+
+    pub fn injest_merkle_proof_(&mut self, proof: &MerkleProofCore<Hash>) -> anyhow::Result<()> {
         let base_key = SimpleMerkleNodeKey::new(proof.siblings.len() as u8, proof.index);
         let mut current_key = base_key;
         
@@ -77,6 +152,9 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + PartialEq + Default>
     pub fn set_node_value(&mut self, key: SimpleMerkleNodeKey, value: Hash) {
         self.updated_nodes.insert(key, value);
     }
+    pub fn set_node_value_nodes_no_updated(&mut self, key: SimpleMerkleNodeKey, value: Hash) {
+        self.nodes.insert(key, value);
+    }
     pub fn clear_changes_remove_committed_leaves_and_rehash(&mut self, start_leaf_index: u64, end_leaf_index: u64) {
         self.updated_nodes.clear();
         for i in start_leaf_index..end_leaf_index {
@@ -92,6 +170,17 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + PartialEq + Default>
         if self.updated_nodes.contains_key(key){
             self.updated_nodes[key]
         }else if self.nodes.contains_key(key) {
+            self.nodes[key]
+        } else {
+            assert!(
+                self.height >= key.level,
+                "requested node value of invalid key level for this tree"
+            );
+            Hasher::get_zero_hash((self.height - key.level) as usize)
+        }
+    }
+    pub fn get_node_value_no_updated(&self, key: &SimpleMerkleNodeKey) -> Hash {
+        if self.nodes.contains_key(key) {
             self.nodes[key]
         } else {
             assert!(
@@ -287,6 +376,23 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + PartialEq + Default>
                 Hasher::two_to_one(&current_value, &sibling_value)
             };
             self.set_node_value(parent_key, parent_value);
+            current = parent_key;
+            current_value = parent_value;
+        }
+    }
+    pub fn rehash_from_node_to_level_no_updated(&mut self, node: SimpleMerkleNodeKey, root_level: u8) {
+        let mut current = node;
+        let mut current_value = self.get_node_value_no_updated(&current);
+        while current.level > root_level {
+            let parent_key = current.parent();
+            let sibling_value = self.get_node_value_no_updated(&current.sibling());
+
+            let parent_value = if (current.index & 1) == 1 {
+                Hasher::two_to_one(&sibling_value, &current_value)
+            } else {
+                Hasher::two_to_one(&current_value, &sibling_value)
+            };
+            self.set_node_value_nodes_no_updated(parent_key, parent_value);
             current = parent_key;
             current_value = parent_value;
         }

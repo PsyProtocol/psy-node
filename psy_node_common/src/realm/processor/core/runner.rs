@@ -53,7 +53,7 @@ where
             tracing::debug!("[REALM] Process block finished.");
             let elapsed = start_processing_at.elapsed();
             let duration_ms = elapsed.as_millis();
-            let sleep_duration = if duration_ms < 6000 { 6000 - duration_ms } else { 0 };
+            let sleep_duration = if duration_ms < 2500 { 2500 - duration_ms } else { 0 };
             tracing::info!("Generated GUTA Realm update in {}ms, sleeping for {}ms", duration_ms, sleep_duration);
             sleep(std::time::Duration::from_millis(sleep_duration as u64)).await;
         } else {

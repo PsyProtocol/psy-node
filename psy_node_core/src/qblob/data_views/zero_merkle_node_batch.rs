@@ -288,7 +288,7 @@ impl QBlobZeroIdMerkleRecorder {
         proof: &DeltaMerkleProofCore<Hash>,
     ) -> anyhow::Result<Hash> {
         if (leaf_level as usize) < proof.siblings.len() {
-            anyhow::bail!("leaf level is less than siblings length");
+            anyhow::bail!("leaf level is less than siblings length, leaf level: {}, siblings length: {}", leaf_level, proof.siblings.len());
         }
         let old_proof_computed_root = compute_root_merkle_proof_generic::<Hash, Hasher>(
             proof.old_value,
