@@ -18,6 +18,7 @@ pub struct DummyUPSStateBuilder<F: QFelt64, Hash: QDBHashBase + QFHashBase<F>, F
     pub start_user_leaf: PQEDUserLeaf<F, Hash>,
     pub slots_modified: u64,
     pub pending_writes: Vec<(u32, u64, Hash)>,
+    pub is_first_tx: bool,
 }
 
 impl <F: QFelt64, Hash: QDBHashBase + QFHashBase<F>, Fetcher: PsyUserContractDataFetcher<F, Hash>, Hasher: FieldQHasher<F, Hash>>
@@ -30,11 +31,21 @@ impl <F: QFelt64, Hash: QDBHashBase + QFHashBase<F>, Fetcher: PsyUserContractDat
         checkpoint_id: u64,
     ) -> anyhow::Result<Self> {
 
+        let global_user_tree_proof: MerkleProofCore<Hash> = data_fetcher.df_get_global_user_tree_proof(u64::MAX-0xffff, user_id).await?;
+
+        let is_first_tx = global_user_tree_proof.value == Hash::get_zero_value();
+        println!("is_first_tx: {}", is_first_tx);
+
+
         let checkpoint_proof: MerkleProofCore<Hash> = data_fetcher
             .df_get_checkpoint_tree_merkle_proof(checkpoint_id)
-            .await?;
-        println!("checkpoint_proof: {:?}", checkpoint_proof);
-        let checkpoint_root = checkpoint_proof.root;
+            .await?.to_append_proof::<Hasher>();
+        println!("verify checkpoint proof: {:?}", checkpoint_proof.verify::<Hasher>());
+        println!("append root: {:?}", checkpoint_proof.get_append_root::<Hasher>());
+        println!("checkpoint_proof: {:#?}", checkpoint_proof);
+
+        
+        let checkpoint_root = checkpoint_proof.get_append_root::<Hasher>();
 
 
         let start_user_leaf = data_fetcher
@@ -55,6 +66,7 @@ impl <F: QFelt64, Hash: QDBHashBase + QFHashBase<F>, Fetcher: PsyUserContractDat
             pending_writes: vec![],
             contract_state_dmps: HashMap::new(),
             contract_state_tree_heights: HashMap::new(),
+            is_first_tx,
         })
     }
     pub async fn populate_user_contract_tree(&mut self) -> anyhow::Result<()> {
@@ -194,7 +206,7 @@ let height = self.get_state_tree_height(contract_id).await?;
         };
 
         let ups_end = PUPSEndCapResultCompact {
-            start_user_leaf_hash: self.start_user_leaf.qfhash::<Hasher>(),
+            start_user_leaf_hash: if self.is_first_tx { Hash::get_zero_value() } else { self.start_user_leaf.qfhash::<Hasher>() },
             end_user_leaf_hash: new_user_leaf.qfhash::<Hasher>(),
             checkpoint_tree_root_hash: self.checkpoint_root_hash,
             user_id: self.start_user_leaf.user_id,

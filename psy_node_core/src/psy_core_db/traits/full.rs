@@ -33,6 +33,7 @@ pub trait PsyNodeCheckpointTreeDatabaseReader<Hash> {
 pub trait PsyNodeCheckpointTreeDatabaseWriter<Hash> {
     async fn checkpoint_tree_set_leaf_hash(&self, checkpoint_id: u64, value: Hash) -> anyhow::Result<DeltaMerkleProofCore<Hash>>;
     async fn checkpoint_tree_set_nodes(&self, checkpoint_id: u64, nodes: &[SimpleMerkleNode<Hash>]) -> anyhow::Result<()>;
+    async fn checkpoint_tree_injest_merkle_proof(&self, checkpoint_id: u64, merkle_proof: &MerkleProofCore<Hash>) -> anyhow::Result<()>;
 }
 
 #[async_trait]

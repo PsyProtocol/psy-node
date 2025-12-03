@@ -422,6 +422,7 @@ impl<
         input: GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<N::F, N::QHash>,
         proof_bytes: Vec<u8>,
     ) -> anyhow::Result<()> {
+        println!("Submitting GUTA for realm_id {}\n{:?}", self.realm_id_u64, input);
         let realm_level_u64 = input.header.header.state_transition.node_level.to_u64_value();
         if realm_level_u64 != N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT as u64 {
             anyhow::bail!(

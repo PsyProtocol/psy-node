@@ -448,6 +448,34 @@ impl<
             .db_set_zero_id_merkle_nodes_batch_checkpoint_is_index(&self.global_checkpoint_tree_table, nodes)
             .await
     }
+        async fn checkpoint_tree_injest_merkle_proof(&self, checkpoint_id: u64, merkle_proof: &MerkleProofCore<N::QHash>) -> anyhow::Result<()>{
+            let mut siblings = Vec::with_capacity(merkle_proof.siblings.len());
+            let leaf_key = SimpleMerkleNodeKey::new(N::CHECKPOINT_TREE_HEIGHT, merkle_proof.index);
+            let siblings_keys = leaf_key.get_siblings_keys_to_height(0);
+            for (i, sibling_hash) in merkle_proof.siblings.iter().enumerate() {
+                siblings.push(SimpleMerkleNode{
+                    key: siblings_keys[i].clone(),
+                    value: *sibling_hash,
+                });
+            }
+            self.store
+                .db_set_zero_id_merkle_nodes_batch_checkpoint_is_index(&self.global_checkpoint_tree_table, &siblings)
+                .await?;
+         db_helper_zero_id_merkle_node_simple_set_leaves_fast_serialize::<N::QHash, N::HasherBase, _, _>(
+            &*self.store,
+            &self.global_checkpoint_tree_table,
+            checkpoint_id,
+            0,
+            2 * N::CHECKPOINT_TREE_HEIGHT as usize,
+            &[SimpleMerkleNode {
+                key: SimpleMerkleNodeKey::new(N::CHECKPOINT_TREE_HEIGHT, checkpoint_id),
+                value: merkle_proof.value,
+            }],
+        )
+        .await?;
+        Ok(())
+
+        }
 }
 
 #[async_trait]

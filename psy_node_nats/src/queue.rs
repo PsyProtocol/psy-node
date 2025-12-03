@@ -1052,7 +1052,7 @@ impl QStandardWorkerQueueSubscriber for NatsJetStreamClient {
     ) -> anyhow::Result<Option<QK::QueueItem>> {
         let subject = queue_key.get_queue_subject(&self.base_namespace, realm_id, realm_sub_id, unique_id, task_group);
         let durable_name = queue_key.get_durable_name(&self.base_namespace, realm_id, realm_sub_id, unique_id, task_group);
-        //println!("Getting next worker queue item for subject: {}, durable_name: {}", subject, durable_name);
+        println!("Getting next worker queue item for subject: {}, durable_name: {}", subject, durable_name);
         self.get_message_if_exists_dqi_worker(queue_key, &subject, &durable_name).await
     }
     async fn wait_until_all_jobs_complete_or_timeout_worker<QK: PCoreStandardQueueKeyForRealm>(

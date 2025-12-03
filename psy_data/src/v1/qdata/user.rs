@@ -1,4 +1,4 @@
-use parth_core::{crypto::hash::traits::{FieldQHasher, QFieldHashable}, data::serializable::{QPDSerializable}, felt::{QFelt, QFelt64, QFeltSized, ToQFelts, ZeroableFelt}, impl_qpd_serialize_params, protocol::core_types::{Q256BitHash, QFHashBase, QHashBase}, utils::QPGenRandom};
+use parth_core::{crypto::hash::traits::{FieldQHasher, QFieldHashable, ZeroableHash}, data::serializable::QPDSerializable, felt::{QFelt, QFelt64, QFeltSized, ToQFelts, ZeroableFelt}, impl_qpd_serialize_params, protocol::core_types::{Q256BitHash, QFHashBase, QHashBase}, utils::QPGenRandom};
 use pser::{QBytesDeserialize, QBytesSerialize};
 use psy_serialize::{AutoDatabaseSerializationUseFastFixedSerialize, PsyCanonicalSerializeMetadata, PsySerializeCanonicalAsyncSafe};
 #[cfg(all(feature = "serialize_bytemuck", target_endian = "little"))]
@@ -60,6 +60,15 @@ impl<F: ZeroableFelt, Hash> PQEDUserLeaf<F, Hash> {
             event_index: F::ZERO_VALUE,
             user_id,
         }
+    }
+}
+impl<F: ZeroableFelt + PartialEq + Copy, Hash: ZeroableHash + PartialEq + Copy> PQEDUserLeaf<F, Hash> {
+    pub fn is_first_transaction_old_user_leaf(&self) -> bool {
+        self.public_key == Hash::get_zero_value()
+            && self.balance == F::ZERO_VALUE
+            && self.nonce == F::ZERO_VALUE
+            && self.last_checkpoint_id == F::ZERO_VALUE
+            && self.event_index == F::ZERO_VALUE
     }
 }
 impl<F: Copy, Hash> PQEDUserLeaf<F, Hash> {

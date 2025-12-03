@@ -238,13 +238,18 @@ where
         global_user_tree_height: u8,
         input: &SubmitUserEndCapNonProofInput<C::F, QHashOut<C::F>>,
     ) -> anyhow::Result<Vec<u8>> {
+        println!("DummyUPSStandardEndCapCircuit::prove_end_cap_dummy_ups - input: {:#?}", input);
                 let guta_hash = input.core.state_transition.qfhash_with_guta_height::<C::Hasher>(global_user_tree_height);
 
+                let dummy_public_inputs = C::Hasher::q_two_to_one(
+            guta_hash,
+            input.core.stats.qfhash::<C::Hasher>(),
+        );
+
+        println!("DummyUPSStandardEndCapCircuit::prove_end_cap_dummy_ups - dummy_public_inputs: {:#?}", dummy_public_inputs);
+
         let proof = self.prove_base(
-            C::Hasher::q_two_to_one(
-                guta_hash,
-                input.core.stats.qfhash::<C::Hasher>(),
-            ),
+            dummy_public_inputs,
         )?;
         serialize_plonky2_proof(&proof)
     }

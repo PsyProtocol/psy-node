@@ -454,6 +454,22 @@ impl<Hash: PartialEq + Copy> MerkleProofCore<Hash> {
     pub fn compute_root_with_value<Hasher: MerkleHasher<Hash>>(&self, new_value: Hash) -> Hash {
         compute_root_merkle_proof_generic::<Hash, Hasher>(new_value, self.index, &self.siblings)
     }
+    pub fn to_append_proof<Hasher: MerkleZeroHasher<Hash>>(&self) -> MerkleProofCore<Hash> {
+        let mut siblings = Vec::with_capacity(self.siblings.len());
+        for i in 0..self.siblings.len() {
+            if self.index & (1 << i) == 0 {
+                siblings.push(Hasher::get_zero_hash(i));
+            } else {
+                siblings.push(self.siblings[i]);
+            }
+        }
+        MerkleProofCore {
+            root: self.get_append_root::<Hasher>(),
+            value: self.value,
+            index: self.index,
+            siblings,
+        }
+    }
 }
 impl<Hash: PartialEq + Copy> MerkleProofCore<Hash> {
     pub fn new_from_params<Hasher: MerkleHasher<Hash>>(index: u64, value: Hash, siblings: Vec<Hash>) -> Self {

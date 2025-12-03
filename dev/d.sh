@@ -93,6 +93,10 @@ start_worker() {
     build_if_needed $1
     ./target/release/psy_worker_cli worker --user 0 --network local-devnet --config ./psy_cli/example_node_configs/worker_1.yml 2>&1 | tee logs/worker_1_logs.txt
 }
+start_worker_realm() {
+    build_if_needed_realm $1
+    ./target/release/psy_worker_cli worker --user 0 --network local-devnet --config ./psy_cli/example_node_configs/worker_realm_1.yml 2>&1 | tee logs/worker_realm_1_logs.txt
+}
 start_dummy_prover() {
     build_if_needed $1
     ./target/release/psy_worker_cli dummy-prover --user 0 --network local-devnet --config ./psy_cli/example_node_configs/dummy_prover_1.yml 2>&1 | tee logs/dummy_prover_1_logs.txt
@@ -102,6 +106,13 @@ sub_worker() {
 }
 sub_w() {
     start_worker $1
+}
+
+sub_realm_worker() {
+    start_worker_realm $1
+}
+sub_rw() {
+    start_worker_realm $1
 }
 
 sub_e() {
@@ -132,6 +143,10 @@ sub_realm_processor() {
 sub_rp() {
   start_realm_processor $1
 }
+
+sub_dummy_prover() {
+    ./target/release/psy_worker_cli dummy-end-cap-prover --url http://127.0.0.1:1338 --user 0 > logs/dummy_end_cap_prover_logs.txt 2>&1 & | tee logs/dummy_end_cap_prover_logs.txt
+}
 sub_help() {
     echo "Usage: $BASH_FILE_ME <subcommand> [options]"
     echo ""
@@ -145,12 +160,13 @@ sub_help() {
     echo "  -c                 Run config_gen_v2 and build before starting"
     echo ""
     echo "Examples:"
-    echo "  $BASH_FILE_ME [realm_processor|realm_edge|processor|edge|worker] -b   # Build and start"
-    echo "  $BASH_FILE_ME [realm_processor|realm_edge|processor|edge|worker] -c   # Run config_gen_v2 and build before starting"
+    echo "  $BASH_FILE_ME [realm_processor|realm_edge|processor|edge|worker|realm_worker] -b   # Build and start"
+    echo "  $BASH_FILE_ME [realm_processor|realm_edge|processor|edge|worker|realm_worker] -c   # Run config_gen_v2 and build before starting"
     echo "  $BASH_FILE_ME realm_edge           # Start the realm edge"
     echo "  $BASH_FILE_ME realm_processor      # Start the realm processor"
     echo "  $BASH_FILE_ME edge           # Start the edge"
-    echo "  $BASH_FILE_ME worker         # Start the worker"
+    echo "  $BASH_FILE_ME worker         # Start the coordinator worker"
+    echo "  $BASH_FILE_ME realm_worker   # Start the realm worker"
     echo "  $BASH_FILE_ME processor      # Start the processor"
 }
 subcommand=$1

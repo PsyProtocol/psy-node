@@ -1,11 +1,9 @@
 use futures::future::try_join_all;
-use jsonrpsee::core::RpcResult;
 use parth_core::{
-    QCoreProcCheckpointUniqueId, QProvingJobDataIDWithRewardPath, crypto::{
-        hash::{
-            tag_tree::hash_tag_tree_node,
-            traits::{MerkleHasher, MerkleZeroHasher, ZeroableHash},
-        },
+    QCoreProcCheckpointUniqueId, crypto::{
+        hash::
+            traits::{MerkleHasher, MerkleZeroHasher, ZeroableHash}
+        ,
         secp256k1::{QEDCompressedSecp256K1Signature, Secp256K1Verifier, SimpleTimedRequest},
     }, data::queue::queue_key::QPBaseQueueType, felt::{FromPrimitiveValuesFelt, ZeroableFelt}, protocol::core_types::{Q256BitHash, QNetworkTypesConfig, QZKProofVerifier}
 };
@@ -14,22 +12,17 @@ use psy_data::{v1::qdata::user::PQEDUserLeaf,
     worker::{
         api_response::{PROVING_JOB_NODE_TYPE_REALM, PsyWorkerGetProvingWorkAPIResponse, PsyWorkerGetProvingWorkWithChildProofsAPIResponse},
         metadata::{
-            PROOF_REWARD_TREE_HASH_MODE_3_CHILDREN_DOUBLE_REWARD, PROOF_REWARD_TREE_HASH_MODE_LIFT_CHILD, PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN, PsyProvingJobMetadata
+            PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN, PsyProvingJobMetadata
         },
         metadata_with_job_id::PsyProvingJobMetadataWithJobId,
     }}
 ;
 use psy_node_core::{
- psy_core_db::traits::full::{PsyCoordinatorEdgeAPIStoreReader, PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmEdgeAPIStoreReader}, psy_temp_db::{QTempDBProvingJobMetadataReader, StandardEdgeAPITempDBStoreBase}, queue::{ephemeral::QStandardEphemeralQueuePublisher, worker_queue::QStandardWorkerQueueSubscriber}, store::traits::proof_store::QParthProofStore
+ psy_core_db::traits::full::{PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmEdgeAPIStoreReader}, psy_temp_db::{QTempDBProvingJobMetadataReader, StandardEdgeAPITempDBStoreBase}, queue::{ephemeral::QStandardEphemeralQueuePublisher, worker_queue::QStandardWorkerQueueSubscriber}, store::traits::proof_store::QParthProofStore
 };
 
-use crate::{
-    coordinator::{
-        edge::handler::CoordinatorEdgeHandler,
-        queue_key::
-            CoordinatorProvingWorkQueueKey
-        ,
-    }, realm::{edge::handler::RealmEdgeHandler, queue_key::RealmProvingWorkQueueKey}}
+use crate::
+    realm::{edge::handler::RealmEdgeHandler, queue_key::RealmProvingWorkQueueKey}
 ;
 
 use parth_core::protocol::core_types::QZKProofPublicInputsHasherReader;
@@ -120,7 +113,7 @@ impl<
 
         let (unique_pending_id, unique_proc_id) = self.get_current_unique_pending_id_internal().await?;
 
-        let queue_key = CoordinatorProvingWorkQueueKey::<N::QHash, N::JobId> {
+        let queue_key = RealmProvingWorkQueueKey::<N::QHash, N::JobId> {
             realm_id: self.realm_id_u64,
             realm_sub_id: self.realm_id_u64,
             unique_id: unique_proc_id,
@@ -179,11 +172,12 @@ impl<
         signature: QEDCompressedSecp256K1Signature,
         request: SimpleTimedRequest,
     ) -> anyhow::Result<PsyWorkerGetProvingWorkWithChildProofsAPIResponse<N::QHash, N::JobId>> {
+        tracing::info!("get_proving_work_with_child_proofs_internal called");
         self.verify_miner_api_signature_and_check_reputation(&signature, &request).await?;
 
         let (unique_pending_id, unique_proc_id) = self.get_current_unique_pending_id_internal().await?;
 
-        let queue_key = CoordinatorProvingWorkQueueKey::<N::QHash, N::JobId> {
+        let queue_key = RealmProvingWorkQueueKey::<N::QHash, N::JobId> {
             realm_id: self.realm_id_u64,
             realm_sub_id: self.realm_id_u64,
             unique_id: unique_proc_id,
@@ -444,7 +438,7 @@ impl<
         }
 
         // ack the queue item as completed
-        let queue_key = CoordinatorProvingWorkQueueKey::<N::QHash, N::JobId> {
+        let queue_key = RealmProvingWorkQueueKey::<N::QHash, N::JobId> {
             realm_id: self.realm_id_u64,
             realm_sub_id: self.realm_id_u64,
             unique_id: unique_proc_id,

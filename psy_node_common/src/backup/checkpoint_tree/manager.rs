@@ -7,7 +7,7 @@ use parth_core::{
 };
 use psy_core::constants::stale_checkpoint::STALE_CHECKPOINT_AGE_REALM_TO_COORDINATOR_PROOF;
 use psy_io::tokio::{TokioFileLike, TokioLikeFileSystem};
-use psy_node_core::{p2p::traits::realm_coordinantor::RealmCoordinatorClient, psy_core_db::traits::full::PsyNodeCheckpointTreeDatabaseReader};
+use psy_node_core::{p2p::traits::realm_coordinantor::RealmCoordinatorClient, psy_core_db::traits::full::{PsyNodeCheckpointTreeDatabaseReader, PsyNodeCheckpointTreeDatabaseWriter}};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 const CHECKPOINT_BACKUP_MAGIC_LEN: usize = 8;
@@ -372,6 +372,14 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std
         }
         Ok(())
 
+    }
+pub async fn sync_to_database<CheckpointTreeReader: PsyNodeCheckpointTreeDatabaseReader<Hash> + PsyNodeCheckpointTreeDatabaseWriter<Hash>>(
+        &mut self,
+        checkpoint_tree_reader: &CheckpointTreeReader,
+        sync_batch_size: usize,
+        last_committed_checkpoint_id: u64,
+    ) -> anyhow::Result<()> {
+        todo!()
     }
 pub async fn sync_from_database<CheckpointTreeReader: PsyNodeCheckpointTreeDatabaseReader<Hash>>(
         &mut self,

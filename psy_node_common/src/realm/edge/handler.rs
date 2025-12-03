@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, u64};
 
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -7,7 +7,7 @@ use parth_core::{
     QProvingJobDataIDWithRewardPath, crypto::{
         hash::{
             merkle_proof::{MerkleProofCore, compute_historical_and_current_merkle_roots_core_gt},
-            traits::{MerkleZeroHasher, QFieldHashable},
+            traits::{MerkleZeroHasher, QFieldHashable, ZeroableHash},
         },
         secp256k1::{QEDCompressedSecp256K1Signature, SimpleTimedRequest},
     }, data::{hash::{merkle_node_key::SimpleMerkleNodeKey, merkle_store_key::{QMerkleStoreDoubleIdKey, QMerkleStoreSingleIdKey}}, queue::queue_key::QPBaseQueueType}, felt::ToU64Value, node::realm_identifier::QRealmIdentifier, protocol::core_types::{QNetworkDatabaseTypes, QNetworkTypesConfig, QZKProofPublicInputsHasherReader, QZKProofVerifier}, store::tag_tree_store
@@ -282,7 +282,13 @@ impl<
             );
         }
 
-        let old_leaf_hash = old_user_leaf.qfhash::<N::HasherBase>();
+        let old_leaf_hash = if 
+            old_user_leaf.public_key == N::QHash::get_zero_value()
+        {
+            N::QHash::get_zero_value()
+        }else{
+            old_user_leaf.qfhash::<N::HasherBase>()
+        };
         if user_end_cap_input.core.state_transition.start_user_leaf_hash != old_leaf_hash {
             anyhow::bail!(
                 "Invalid start_user_leaf_hash, left: {:?}, right: {:?}",
@@ -291,12 +297,13 @@ impl<
             );
         }
 
-        let checkpoint_tree_proof = self
+        let checkpoint_tree_proof: MerkleProofCore<N::QHash> = self
             .db_reader
-            .checkpoint_tree_get_merkle_proof(current_checkpoint_id, end_cap_checkpoint_id)
+            .checkpoint_tree_get_merkle_proof(u64::MAX-0xFFFF, end_cap_checkpoint_id)
             .await?;
 
-        println!("checkpoint_tree_proof: {:?}", checkpoint_tree_proof);
+        println!("checkpoint_tree_proof: {:#?}", checkpoint_tree_proof);
+        println!("verify_checkpoint_tree_proof: {}", checkpoint_tree_proof.verify::<N::HasherBase>());
         let historical_root = checkpoint_tree_proof.get_append_root::<N::HasherBase>();
         //let (historical_root, current_root) = compute_historical_and_current_merkle_roots_core_gt::<N::QHash, N::HasherBase>(&checkpoint_tree_proof);
         if historical_root != user_end_cap_input.core.state_transition.checkpoint_tree_root_hash {

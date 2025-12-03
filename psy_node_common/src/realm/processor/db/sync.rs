@@ -89,7 +89,16 @@ where
         }
         let latest_db_l2_info: QEDL2BlockState = self.db.get_l2_block_state(latest_db_checkpoint_id).await?;
         let nodes = self.checkpoint_tree_backup_manager.checkpoint_tree.get_nodes_between_leaves(latest_checkpoint_id, latest_checkpoint_id+1);
+        let checkpoint_tree_start_proof = self.checkpoint_tree_backup_manager.checkpoint_tree.get_leaf(latest_db_checkpoint_id);
+        let checkpoint_tree_end_proof = self.checkpoint_tree_backup_manager.checkpoint_tree.get_leaf(latest_checkpoint_id);
+        println!("Syncing to coordinator. Latest DB checkpoint ID: {}, Latest coordinator checkpoint ID: {}.", latest_db_checkpoint_id, latest_checkpoint_id);
+        println!("checkpoint_tree_start_proof verify: {:?}", checkpoint_tree_start_proof.verify::<N::HasherBase>());
+        println!("checkpoint_tree_end_proof verify: {:?}", checkpoint_tree_end_proof.verify::<N::HasherBase>());
+        self.db.checkpoint_tree_injest_merkle_proof(latest_db_checkpoint_id, &checkpoint_tree_start_proof).await?;
+        self.db.checkpoint_tree_injest_merkle_proof(latest_checkpoint_id, &checkpoint_tree_end_proof).await?;
         self.db.checkpoint_tree_set_nodes(latest_checkpoint_id, &nodes).await?;
+        self.db.checkpoint_tree_injest_merkle_proof(latest_db_checkpoint_id, &checkpoint_tree_start_proof).await?;
+        self.db.checkpoint_tree_injest_merkle_proof(latest_checkpoint_id, &checkpoint_tree_end_proof).await?;
         let old_sync_info: PsyRealmCoordinatorUpdate<N::F, N::QHash> = self
             .coordinator_client
             .rc_get_realm_sync_info(latest_checkpoint_id)

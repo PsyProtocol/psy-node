@@ -13,6 +13,7 @@ pub trait PsyUserContractDataFetcher<F, Hash> {
     async fn df_get_checkpoint_tree_merkle_proof(&self, checkpoint_id: u64) -> anyhow::Result<MerkleProofCore<Hash>>;
     async fn df_get_latest_checkpoint(&self) -> anyhow::Result<u64>;
     async fn df_get_user_leaf(&self, checkpoint_id: u64, user_id: u64) -> anyhow::Result<PQEDUserLeaf<F, Hash>>;
+    async fn df_get_global_user_tree_proof(&self, checkpoint_id: u64, user_id: u64) -> anyhow::Result<MerkleProofCore<Hash>>;
     async fn df_get_contract_state_heights(&self, checkpoint_id: u64, contract_ids: Vec<u64>) -> anyhow::Result<Vec<u8>>;
     async fn df_get_contract_state_tree_nodes(&self, checkpoint_id: u64, node_keys: Vec<QMerkleStoreDoubleIdKey>) -> anyhow::Result<Vec<Hash>>;
     async fn df_get_contract_state_tree_merkle_proof(&self, checkpoint_id: u64, user_id: u64, contract_id: u64, height: u8, slot_id: u64) -> anyhow::Result<MerkleProofCore<Hash>>;
@@ -62,6 +63,10 @@ impl<N: QNetworkTypesConfig + 'static, C: RealmEdgeRpcClient<N::F, N::QHash, N::
             self.client.get_user_contract_state_tree_merkle_proof(checkpoint_id, user_id, contract_id as u32, height, slot_id).await
             .map_err(|e| anyhow::anyhow!("{:?}", e))
         }
+            async fn df_get_global_user_tree_proof(&self, checkpoint_id: u64, user_id: u64) -> anyhow::Result<MerkleProofCore<N::QHash>>{
+        self.client.get_user_bottom_tree_merkle_proof(N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT, checkpoint_id, user_id).await.map_err(|e| anyhow::anyhow!("{:?}", e))
+
+            }
     async fn df_get_contract_state_heights(&self, checkpoint_id: u64, contract_ids: Vec<u64>) -> anyhow::Result<Vec<u8>> {
        self.client.get_contract_tree_state_heights(
             checkpoint_id,
@@ -91,10 +96,10 @@ impl<N: QNetworkTypesConfig + 'static, C: RealmEdgeRpcClient<N::F, N::QHash, N::
     }
 
     async fn df_get_checkpoint_tree_merkle_proof(&self, checkpoint_id: u64) -> anyhow::Result<MerkleProofCore<N::QHash>> {
-        self.client
-            .get_checkpoint_tree_merkle_proof(checkpoint_id, checkpoint_id)
+        Ok(self.client
+            .get_checkpoint_tree_merkle_proof(u64::MAX-0xFF, checkpoint_id)
             .await
-            .map_err(|e| anyhow::anyhow!("{:?}", e))
+            .map_err(|e| anyhow::anyhow!("{:?}", e))?.to_append_proof::<N::HasherBase>())
     }
 
     async fn df_get_latest_checkpoint(&self) -> anyhow::Result<u64> {

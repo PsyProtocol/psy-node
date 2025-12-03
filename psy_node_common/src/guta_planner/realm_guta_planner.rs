@@ -371,6 +371,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
 
             let expected_public_inputs_hash =
                 parent_witness.get_public_inputs_hash_no_rewards_tag::<Hasher>(self.global_user_tree_height as usize, self.guta_circuit_whitelist);
+            
             let parent_job = PsyProvingJobMetadataWithJobId {
                 job_id: parent_witness_job_id,
                 metadata: PsyProvingJobMetadata {
@@ -718,6 +719,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
                     checkpoint_tree.get_historical_merkle_proof_at_historical_index(checkpoint_id, self.current_checkpoint_id);
                 let mut global_user_tree_delta_merkle_proof = global_user_tree.set_leaf(effective_user_id, end_cap_straggler.new_user_leaf_hash);
                 global_user_tree_delta_merkle_proof.index += self.realm_user_min_id;
+                println!("global_user_tree_delta_merkle_proof: {:?}", global_user_tree_delta_merkle_proof);
 
                 let witness = VerifySingleEndCapInputV2 {
                     guta_circuit_whitelist: self.guta_circuit_whitelist,
@@ -746,6 +748,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
                     header: witness.get_new_guta_header(self.global_user_tree_height),
                     job_id: job_id.clone(),
                 };
+                println!("new_guta_header: {:?}", new_guta_header);
                 temp_store
                     .set_tdb_proof_witnesses_tuple_owned_raw(
                         &self.realm_identifier,

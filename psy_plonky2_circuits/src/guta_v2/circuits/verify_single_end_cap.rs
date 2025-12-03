@@ -9,14 +9,13 @@ use plonky2::{
     }
 };
 use parth_core::{
-    crypto::hash::traits::MerkleZeroHasher, data::proof_input::CircuitInputWithDependencies, felt::QFelt64, pgoldilocks::{QHashOut, QRichField}, protocol::core_types::Q256BitHash
+    crypto::hash::traits::{FieldQHasher, MerkleZeroHasher, QFieldHashable}, data::proof_input::CircuitInputWithDependencies, felt::QFelt64, pgoldilocks::{QHashOut, QRichField}, protocol::core_types::{Q256BitHash, QFHashBase, QHashBase}
 };
 use psy_core::
     job::job_id::{ProvingJobCircuitType, QProvingJobDataID}
 ;
 use psy_data::{
-    proof_input::guta::VerifySingleEndCapInputV2, worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse
-    ,
+    proof_input::guta::VerifySingleEndCapInputV2, v1::qdata::user_end_cap_result::PUPSEndCapResultCompact, worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse
 };
 use psy_plonky2_basic_helpers::{
     builder::{
@@ -223,7 +222,7 @@ impl<
     > QStandardCircuitProvableWithRawProofsAndRefLibrary<L, C, D>
     for GUTAVerifySingleEndCapCircuitV2<C, D>
 where
-     C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>>, QHashOut<C::F>: Q256BitHash, C::F: QFelt64 + QRichField,
+     C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + FieldQHasher<C::F,QHashOut<C::F>>, QHashOut<C::F>: Q256BitHash + QFHashBase<C::F>, C::F: QFelt64 + QRichField,
 {
 
     fn prove_with_raw_proofs_and_ref_library(
@@ -240,12 +239,36 @@ where
 
 
         let witness = VerifySingleEndCapInputV2::<C::F, QHashOut<C::F>>::psy_ser_from_slice(&input.base.witness)?;
+
+        let expected_compact = witness.get_end_result_a();
+
         
-        self.prove_base(
+        let expected_stats_hash = witness.core.guta_stats.qfhash::<C::Hasher>();
+        let expected_guta_hash = expected_compact.qfhash_with_guta_height::<C::Hasher>(32);
+
+        let expected_dummy_public_inputs = C::Hasher::q_two_to_one(
+            expected_guta_hash,
+            expected_stats_hash,
+        );
+        println!("GUTAVerifySingleEndCapCircuitV2 witness: {:#?}", witness);
+        println!("expected_compact: {:#?}", expected_compact);
+        println!("expected_stats_hash: {:#?}", expected_stats_hash);
+        println!("expected_guta_hash: {:#?}", expected_guta_hash);
+        println!("expected_dummy_public_inputs: {:#?}", expected_dummy_public_inputs);
+        println!("child proof pubs: {:#?}", child_proof_result.zk_proof.public_inputs);
+
+        let expecteed_new_guta = witness.get_new_guta_header(32);
+        println!("expecteed_new_guta: {:#?}", expecteed_new_guta);
+        let expected_new_public_inputs = witness.get_public_inputs_hash_no_rewards_tag::<C::Hasher>(32);
+        println!("expected_new_public_inputs: {:#?}", expected_new_public_inputs);
+        let proof = self.prove_base(
             worker_reward_tag,
             &witness,
             &child_proof_result.zk_proof,
             &child_proof_result.verifier_data,
-        )
+        )?;
+        println!("GUTAVerifySingleEndCapCircuitV2 proof pubs: {:#?}", proof.public_inputs);
+        Ok(proof)
+
     }
 }

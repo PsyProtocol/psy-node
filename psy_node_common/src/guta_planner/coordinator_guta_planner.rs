@@ -322,6 +322,8 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> CoordinatorGUTAPlanner<F, Ha
             node.header.state_transition.new_node_value,
         );
 
+        println!("node.header.checkpoint_tree_root: {:?}", node.header.checkpoint_tree_root);
+        println!("roots: {:?}", checkpoint_tree.roots);
         let input = VerifyGUTAToCapUpgradeCheckpointCircuitInputSimple {
             guta_proof_header: node.header,
             top_line_siblings: dmp.siblings,

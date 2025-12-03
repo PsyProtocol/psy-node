@@ -22,6 +22,9 @@ pub async fn fetch_global_user_tree_from_db_with_sub_root<
 ) -> anyhow::Result<SimpleMemoryMerkleRecorderStore<Hasher, Hash>> {
     let mut timer = TraceTimer::new("fetch_global_user_tree_from_db");
 
+    let leaf_level = tree_height - sub_root.level;
+    let total_user_ids = 1u64 << leaf_level;
+
 
     tracing::info!(
         "Fetching global user tree nodes from DB (checkpoint_id={}, tree_height={}, sub_root={:?}, user_id_range=[{}, {}), fetch_batch_size={})",
@@ -68,6 +71,7 @@ pub async fn fetch_global_user_tree_from_db_with_sub_root<
         let batch_results = user_db_reader.global_user_tree_get_nodes(checkpoint_id, &keys).await?;
         for (i, hash) in batch_results.iter().enumerate() {
             keys[i].index -= leaf_min_index;
+            keys[i].level -= sub_root.level;
             if hash != &zero_hash {
                 node_hash_map.insert(keys[i], *hash);
             }
@@ -84,6 +88,7 @@ pub async fn fetch_global_user_tree_from_db_with_sub_root<
             .await?;
         for (i, hash) in batch_results.iter().enumerate() {
             keys[i].index -= leaf_min_index;
+            keys[i].level -= sub_root.level;
             if hash != &zero_hash {
                 node_hash_map.insert(keys[i], *hash);
             }
@@ -137,7 +142,7 @@ pub async fn load_global_user_tree_from_db_with_sub_root<
 
     if current_value == Hasher::get_zero_hash((tree_height-sub_root.level) as usize) {
         // Tree is empty
-        return Ok(SimpleMemoryMerkleRecorderStore::new(tree_height));
+        return Ok(SimpleMemoryMerkleRecorderStore::new(tree_height-sub_root.level));
     }
     while current_key.level < tree_height {
         let right_child_key = current_key.right_child();
