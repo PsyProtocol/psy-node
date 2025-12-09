@@ -1,6 +1,6 @@
 # Makefile for Psy project
 
-.PHONY: all build clean test deploy-contracts register-users query-chain-info run-all
+.PHONY: all build clean test deploy-contracts register-users query-chain-info run-all shutdown clean-db init run-coordinator-processor run-coordinator-edge run-realm-0-processor run-realm-0-edge run-realm-1-processor run-realm-1-edge run-worker-coordinator run-worker-realm-0 run-worker-realm-1 run-dummy-prover
 
 all: build
 
@@ -26,3 +26,49 @@ all: build
 
 run-all:
 	./run_all.sh
+
+init:
+	docker run --rm --name valkey-server -p 6379:6379 -d valkey/valkey
+	docker run --rm --name nats-server -p 4222:4222 -d nats -js
+	docker run --rm --name scylla-server -p 9042:9042 -d scylladb/scylla
+
+run-coordinator-processor:
+	./target/release/psy_node_cli start-coordinator-processor --config ./psy_cli/example_node_configs/coordinator_processor_1.yaml
+
+run-coordinator-edge:
+	./target/release/psy_node_cli start-coordinator-edge --config ./psy_cli/example_node_configs/coordinator_edge_1.yaml
+
+run-realm-0-processor:
+	./target/release/psy_node_cli start-realm-processor --config ./psy_cli/example_node_configs/realm_processor_1.yaml
+
+run-realm-0-edge:
+	./target/release/psy_node_cli start-realm-edge --config ./psy_cli/example_node_configs/realm_edge_1.yaml
+
+run-realm-1-processor:
+	./target/release/psy_node_cli start-realm-processor --config ./psy_cli/example_node_configs/realm_processor_2.yaml
+
+run-realm-1-edge:
+	./target/release/psy_node_cli start-realm-edge --config ./psy_cli/example_node_configs/realm_edge_2.yaml
+
+run-worker-coordinator:
+	./target/release/psy_worker_cli worker --user 0 --network local-devnet --config ./psy_cli/example_node_configs/worker_1.yml
+
+run-worker-realm-0:
+	./target/release/psy_worker_cli worker --user 0 --network local-devnet --config ./psy_cli/example_node_configs/worker_realm_1.yml
+
+run-worker-realm-1:
+	./target/release/psy_worker_cli worker --user 0 --network local-devnet --config ./psy_cli/example_node_configs/worker_realm_2.yml
+
+run-dummy-prover:
+	./target/release/psy_worker_cli dummy-end-cap-prover --url http://127.0.0.1:1338 --user 0
+
+shutdown:
+	pkill -f "psy_node_cli" || true
+	pkill -f "psy_worker_cli" || true
+	docker stop scylla-server || true
+	docker stop nats-server || true
+	docker stop valkey-server  || true
+	docker rm scylla-server || true
+	docker rm nats-server || true
+	docker rm valkey-server || true
+	rm -fr local_checkpoints logs || true

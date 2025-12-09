@@ -90,7 +90,7 @@ impl<
 
         let queue_key = CoordinatorProvingWorkQueueKey::<N::QHash, N::JobId> {
             realm_id: self.realm_id_u64,
-            realm_sub_id: self.realm_id_u64,
+            realm_sub_id: self.realm_sub_id_u64,
             unique_id: unique_proc_id,
             task_group: 0,
             queue_type: QPBaseQueueType::WorkerQueue,
@@ -153,7 +153,7 @@ impl<
 
         let queue_key = CoordinatorProvingWorkQueueKey::<N::QHash, N::JobId> {
             realm_id: self.realm_id_u64,
-            realm_sub_id: self.realm_id_u64,
+            realm_sub_id: self.realm_sub_id_u64,
             unique_id: unique_proc_id,
             task_group: 0,
             queue_type: QPBaseQueueType::WorkerQueue,
@@ -440,7 +440,7 @@ impl<
         // ack the queue item as completed
         let queue_key = CoordinatorProvingWorkQueueKey::<N::QHash, N::JobId> {
             realm_id: self.realm_id_u64,
-            realm_sub_id: self.realm_id_u64,
+            realm_sub_id: self.realm_sub_id_u64,
             unique_id: unique_proc_id,
             task_group: 0,
             queue_type: QPBaseQueueType::WorkerQueue,
