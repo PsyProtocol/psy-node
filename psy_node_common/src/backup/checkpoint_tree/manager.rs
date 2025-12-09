@@ -311,10 +311,11 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std
                 Vec::new()
             };
 
+            let num_full_batches = (self.min_backed_up_checkpoint_id - min_checkpoint) / sync_batch_size as u64;
+            let partial_batch_size = (self.min_backed_up_checkpoint_id - min_checkpoint) % sync_batch_size as u64;
+
             self.hard_reset_and_truncate(min_checkpoint).await?;
 
-            let num_full_batches = (self.min_backed_up_checkpoint_id -min_checkpoint) / sync_batch_size as u64;
-            let partial_batch_size = (self.min_backed_up_checkpoint_id -min_checkpoint) % sync_batch_size as u64;
             for i in 0..num_full_batches {
                 let start_id = min_checkpoint + i * sync_batch_size as u64;
                 let leaves = coordinator_client.rc_get_checkpoint_leaves_batch(start_id, sync_batch_size as u32).await?;
