@@ -160,14 +160,14 @@ impl<
         let actual_latest_applied_checkpoint_id: u64 = self.db.get_latest_checkpoint_id().await?;
         let (last_unique_pending_id, _last_unique_proc_checkpoint_id): (u64, QCoreProcCheckpointUniqueId) =
             self.db.get_current_unique_pending_id().await?;
-            
+
         let expected_checkpoint_id: Option<u64> = self.db.get_checkpoint_id_for_unique_pending_id(last_unique_pending_id).await?;
         let database_check_state = if expected_checkpoint_id.is_none() && actual_latest_applied_checkpoint_id == 0 {
             // needs genesis
             DatabaseCheckState::NeedsGenesis
         } else if expected_checkpoint_id.is_none(){
             // died before setting anything in the database, we don't need to recover
-            DatabaseCheckState::Ready 
+            DatabaseCheckState::Ready
         }else{
             let expected_checkpoint_id = expected_checkpoint_id.unwrap();
             if expected_checkpoint_id != actual_latest_applied_checkpoint_id {
@@ -415,9 +415,9 @@ impl<
 
         Ok(())
     }
-    pub fn get_proof_worker_queue_key(&self) -> CoordinatorProvingWorkQueueKey<N::QHash, N::JobId> { 
+    pub fn get_proof_worker_queue_key(&self) -> CoordinatorProvingWorkQueueKey<N::QHash, N::JobId> {
         println!("get_proof_worker_queue_key: self.db.ids.proc_checkpoint_unique_id: {:?}", self.ids.proc_checkpoint_unique_id);
-       
+
         CoordinatorProvingWorkQueueKey {
             realm_id: self.ids.realm_id_u64,
             realm_sub_id: self.ids.realm_sub_id_u64,

@@ -164,22 +164,31 @@ impl<
     pub async fn fetch_next_job(
         &self,
     ) -> anyhow::Result<Option<([u8; 32], Hash, PsyWorkerGetProvingWorkWithChildProofsAPIResponse<Hash, QProvingJobDataID>)>> {
-        let is_in_realm_mode = self.is_in_realm_mode.load(std::sync::atomic::Ordering::SeqCst);
+        if !self.realm_api_url_manager.has_urls() && !self.coordinator_api_url_manager.has_urls() {
+            anyhow::bail!("No API URLs available to fetch new job (realm and coordinator URL lists are empty)");
+        }
+
+        // println!("realm_api_urls_len: {}", self.realm_api_url_manager.get_total_api_urls());
+        // println!("coordinator_api_urls_len: {}", self.coordinator_api_url_manager.get_total_api_urls());
+
+        let realm_has_urls = self.realm_api_url_manager.has_urls();
+        let coord_has_urls = self.coordinator_api_url_manager.has_urls();
+        let mut is_in_realm_mode = match (realm_has_urls, coord_has_urls) {
+            (true, false) => true,
+            (false, true) => false,
+            (true, true) => self.is_in_realm_mode.load(std::sync::atomic::Ordering::SeqCst),
+            (false, false) => unreachable!(),
+        };
+        self.is_in_realm_mode
+            .store(is_in_realm_mode, std::sync::atomic::Ordering::SeqCst);
         println!("Fetching next job. Current mode: {}", if is_in_realm_mode { "Realm" } else { "Coordinator" });
+
         let result = if is_in_realm_mode {
             self.realm_api_url_manager.get_next_api_url_hash().await
         } else {
             self.coordinator_api_url_manager.get_next_api_url_hash().await
         };
-        if result.is_none() {
-            if is_in_realm_mode && self.coordinator_api_url_manager.has_urls() {
-                self.is_in_realm_mode.store(false, std::sync::atomic::Ordering::SeqCst);
-            } else if !is_in_realm_mode && self.realm_api_url_manager.has_urls() {
-                self.is_in_realm_mode.store(true, std::sync::atomic::Ordering::SeqCst);
-            }
-            anyhow::bail!("No API URLs available to fetch new job");
-        }
-        let api_url_hash = result.unwrap();
+        let api_url_hash = result.ok_or_else(|| anyhow::anyhow!("No API URLs available to fetch new job"))?;
         let api_client = if is_in_realm_mode {
             self.realm_api_url_manager.api_url_hash_to_client.get(&api_url_hash)
         } else {
