@@ -14,7 +14,7 @@ pub fn setup_logging() -> anyhow::Result<()> {
             .with_file(true)
             .with_line_number(true)
             .with_target(false)
-            .with_ansi(true);
+            .with_ansi(false);
 
         tracing_subscriber::registry().with(env_filter).with(fmt_layer).init();
     });

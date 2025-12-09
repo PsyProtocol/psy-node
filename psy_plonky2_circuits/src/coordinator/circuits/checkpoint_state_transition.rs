@@ -13,7 +13,7 @@ use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{protocol::{checkpoint_transition_hash::{CheckpointStateHashTransition, CheckpointStateTransitionPublicInputs}, circuit_inputs::checkpoint_transition::QCQEDCheckpointStateTransitionInput}, v1::qdata::checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf}, worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse};
 use psy_plonky2_basic_helpers::{
     builder::{hash::core::CircuitBuilderHashCore, pad_circuit::CircuitBuilderQEDCommonGates}, verifier::circuit_library::CircuitInfoLibrary,
-   
+
 };
 use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 use crate::{coordinator::gadgets::{checkpoint_state_transition::CheckpointStateTransitionPublicInputsGadget, recursive_checkpoint_state_transition_verify::VerifyRecursiveCheckpointStateTransitionProofGadget}, proof_minifier::{pm_chain_dynamic::QEDProofMinifierDynamicChain, pm_core::get_circuit_fingerprint_generic}, qstandard::{QPsyNetworkCircuitWithType, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QStandardCircuitProvableWithRawProofsAndRefLibrary, proof_store::QProofStoreReaderAsync}, utils::proof_serialization::deserialize_plonky2_proof};
@@ -31,8 +31,6 @@ pub struct QEDCheckpointStateTransitionCircuit<C: GenericConfig<D>, const D: usi
     pub worker_rewards_tree_tag_target: HashOutTarget,
     pub genesis_checkpoint_state_transition_hash: HashOutTarget,
     pub checkpoint_state_transition_circuit_fingerprint: HashOutTarget,
-
-    
 
     pub base_circuit_data: CircuitData<C::F, C, D>,
     pub base_fingerprint: QHashOut<C::F>,
@@ -127,11 +125,11 @@ where
         let checkpoint_id = core_checkpoint_gadget.append_checkpoint_tree_proof.index;
 
         let verify_previous_checkpoint_proof_gadget = VerifyRecursiveCheckpointStateTransitionProofGadget::<D>::add_virtual_to::<C, C::F>(
-            &mut builder, 
-            checkpoint_state_transition_genesis_common_data, 
-            checkpoint_state_transition_genesis_verifier_data_cap_height, 
+            &mut builder,
+            checkpoint_state_transition_genesis_common_data,
+            checkpoint_state_transition_genesis_verifier_data_cap_height,
             known_checkpoint_state_transition_genesis_fingerprint,
-            public_inputs_gadget, 
+            public_inputs_gadget,
             checkpoint_id
         );
         let public_inputs_hash = public_inputs_gadget.get_public_inputs_hash_no_rewards_tag::<C::Hasher, C::F, D>(&mut builder);
@@ -184,7 +182,7 @@ where
         pw.set_hash_target(self.genesis_checkpoint_state_transition_hash, input.genesis_checkpoint_state_transition_hash.0)?;
         pw.set_hash_target(self.checkpoint_state_transition_circuit_fingerprint, self.get_fingerprint().0)?;
         tracing::debug!("🏛️ Checkpoint State Transition prove_base - worker_rewards_tree_tag: {:?}, append_checkpoint_proof (index: {}, siblings_len: {}), previous_checkpoint_proof (index: {}, siblings_len: {})",
-            worker_rewards_tree_tag, 
+            worker_rewards_tree_tag,
             input.append_checkpoint_tree_proof.index, input.append_checkpoint_tree_proof.siblings.len(),
             input.previous_checkpoint_proof.index, input.previous_checkpoint_proof.siblings.len());
 
@@ -216,7 +214,7 @@ where
             previous_checkpoint_state_transition_verifier_data,
         )?;
         let base_proof = self.base_circuit_data.prove(pw)?;
-        
+
         if self.enable_minifier {
             self.minifier_chain.as_ref().unwrap().prove(&base_proof)
         } else {
@@ -290,8 +288,8 @@ where
 
         /*
         let transition_circuit_fingerprint =self.get_fingerprint();
-        
-        let last_checkpoint_hash_transition = CheckpointStateHashTransition{ 
+
+        let last_checkpoint_hash_transition = CheckpointStateHashTransition{
             old_checkpoint_tree_root: witness.last_old_checkpoint_tree_root_hash,
             new_checkpoint_tree_root: witness.previous_checkpoint_proof.root,
             old_checkpoint_leaf_hash: witness.last_old_checkpoint_tree_leaf_hash,
@@ -307,7 +305,7 @@ where
         let last_checkpoint_transition_publics_hash = last_checkpoint_transition_hash_publics.qfhash::<C::Hasher>();
 
         //println!("last_checkpoint_transition_publics_hash: {:?} ({})", last_checkpoint_transition_publics_hash.0.elements, hex::encode(&last_checkpoint_transition_publics_hash.into_owned_32bytes()));
-        let checkpoint_hash_transition = CheckpointStateHashTransition{ 
+        let checkpoint_hash_transition = CheckpointStateHashTransition{
             old_checkpoint_tree_root: witness.previous_checkpoint_proof.root,
             new_checkpoint_tree_root: witness.append_checkpoint_tree_proof.new_root,
             old_checkpoint_leaf_hash: witness.previous_checkpoint_proof.value,
@@ -324,8 +322,8 @@ where
         //println!("genesis_checkpoint_state_transition_hash: {:?} ({})", witness.genesis_checkpoint_state_transition_hash.0.elements, hex::encode(&witness.genesis_checkpoint_state_transition_hash.into_owned_32bytes()));
         let expected_prev_pubs = witness.get_previous_proof_expected_public_inputs_hash_with_fingerprint::<C::Hasher>(transition_circuit_fingerprint);
         //println!("transition_circuit_fingerprint: {:?} ({})", transition_circuit_fingerprint.0.elements, hex::encode(&transition_circuit_fingerprint.into_owned_32bytes()));
-        //println!("expected_previous_checkpoint_state_transition_proof_public_inputs: {:?} ({})", expected_prev_pubs.0.elements, hex::encode(&expected_prev_pubs.into_owned_32bytes()));    
-        //println!("previous_checkpoint_state_transition_proof_public_inputs: {:?} ({})", previous_checkpoint_state_transition_proof.public_inputs, hex::encode(&QHashOut::<C::F>::from_felt_slice(&previous_checkpoint_state_transition_proof.public_inputs).into_owned_32bytes())); 
+        //println!("expected_previous_checkpoint_state_transition_proof_public_inputs: {:?} ({})", expected_prev_pubs.0.elements, hex::encode(&expected_prev_pubs.into_owned_32bytes()));
+        //println!("previous_checkpoint_state_transition_proof_public_inputs: {:?} ({})", previous_checkpoint_state_transition_proof.public_inputs, hex::encode(&QHashOut::<C::F>::from_felt_slice(&previous_checkpoint_state_transition_proof.public_inputs).into_owned_32bytes()));
 
         */
         //println!("[updadting reward root]...");
@@ -361,13 +359,13 @@ where
         //println!("old_state_roots: {:#?}", old_state_roots);
 
         //println!("new_state_roots: {:#?}", new_state_roots);
-        
+
         let old_global_chain_root = old_state_roots.qfhash::<C::Hasher>();
         let new_global_chain_root = new_state_roots.qfhash::<C::Hasher>();
         //println!("old_global_chain_root: {:?} ({})", old_global_chain_root.0.elements, hex::encode(&old_global_chain_root.into_owned_32bytes()));
         //println!("new_global_chain_root: {:?} ({})", new_global_chain_root.0.elements, hex::encode(&new_global_chain_root.into_owned_32bytes()));
         let old_stats = witness.partial.old_stats.clone();
-        let old_checkpoint_leaf = PQEDCheckpointLeaf { 
+        let old_checkpoint_leaf = PQEDCheckpointLeaf {
             global_chain_root: old_global_chain_root,
             stats: old_stats,
         };
@@ -375,34 +373,34 @@ where
         let old_checkpoint_leaf_hash = old_checkpoint_leaf.qfhash::<C::Hasher>();
 
         if old_checkpoint_leaf_hash != witness.previous_checkpoint_proof.value {
-            tracing::error!("Error: old_checkpoint_leaf_hash does not match previous_checkpoint_proof value:\n old_checkpoint_leaf_hash: {:?} ({})\n  previous_checkpoint_proof.value: {:?} ({})\nExpected Old Checkpoint Leaf: {:#?}", 
+            tracing::error!("Error: old_checkpoint_leaf_hash does not match previous_checkpoint_proof value:\n old_checkpoint_leaf_hash: {:?} ({})\n  previous_checkpoint_proof.value: {:?} ({})\nExpected Old Checkpoint Leaf: {:#?}",
                 old_checkpoint_leaf_hash.0.elements, hex::encode(&old_checkpoint_leaf_hash.into_owned_32bytes()),
                 witness.previous_checkpoint_proof.value.0.elements, hex::encode(&witness.previous_checkpoint_proof.value.into_owned_32bytes()),
                 old_checkpoint_leaf,
             );
         }
 
-        let expected_old_public_inputs = CheckpointStateTransitionPublicInputs { 
-            checkpoint_transition: CheckpointStateHashTransition { 
-                old_checkpoint_tree_root: witness.last_old_checkpoint_tree_root_hash, 
-                new_checkpoint_tree_root: witness.append_checkpoint_tree_proof.old_root, 
-                old_checkpoint_leaf_hash: witness.previous_checkpoint_proof.value, 
-                new_checkpoint_leaf_hash: witness.append_checkpoint_tree_proof.new_value 
-            }, 
-                
-            genesis_checkpoint_state_transition_hash: witness.genesis_checkpoint_state_transition_hash, 
+        let expected_old_public_inputs = CheckpointStateTransitionPublicInputs {
+            checkpoint_transition: CheckpointStateHashTransition {
+                old_checkpoint_tree_root: witness.last_old_checkpoint_tree_root_hash,
+                new_checkpoint_tree_root: witness.previous_checkpoint_proof.root,
+                old_checkpoint_leaf_hash: witness.last_old_checkpoint_tree_leaf_hash,
+                new_checkpoint_leaf_hash: witness.previous_checkpoint_proof.value
+            },
+
+            genesis_checkpoint_state_transition_hash: witness.genesis_checkpoint_state_transition_hash,
             checkpoint_state_transition_circuit_fingerprint: self.get_fingerprint()
         };
 
-        let expected_new_public_inputs = CheckpointStateTransitionPublicInputs { 
-            checkpoint_transition: CheckpointStateHashTransition { 
-                old_checkpoint_tree_root: witness.last_old_checkpoint_tree_root_hash, 
-                new_checkpoint_tree_root: witness.append_checkpoint_tree_proof.old_root, 
-                old_checkpoint_leaf_hash: witness.previous_checkpoint_proof.value, 
-                new_checkpoint_leaf_hash: witness.append_checkpoint_tree_proof.new_value 
-            }, 
-                
-            genesis_checkpoint_state_transition_hash: witness.genesis_checkpoint_state_transition_hash, 
+        let expected_new_public_inputs = CheckpointStateTransitionPublicInputs {
+            checkpoint_transition: CheckpointStateHashTransition {
+                old_checkpoint_tree_root: witness.previous_checkpoint_proof.root,
+                new_checkpoint_tree_root: witness.append_checkpoint_tree_proof.new_root,
+                old_checkpoint_leaf_hash: witness.previous_checkpoint_proof.value,
+                new_checkpoint_leaf_hash: witness.append_checkpoint_tree_proof.new_value
+            },
+
+            genesis_checkpoint_state_transition_hash: witness.genesis_checkpoint_state_transition_hash,
             checkpoint_state_transition_circuit_fingerprint: self.get_fingerprint()
         };
         println!("expected_old_public_inputs_preimage: {:#?}", expected_old_public_inputs);
@@ -413,7 +411,7 @@ where
         //println!("old_checkpoint_leaf: {:#?}", old_checkpoint_leaf);
         println!("expected public inputs for the last checkpoint transition proof:\n{:?} ({})", expected_old_public_inputs_hash.0.elements, hex::encode(&expected_old_public_inputs_hash.into_owned_32bytes()));
         if expected_old_public_inputs_hash != actual_old_public_inputs_hash {
-            tracing::error!("Error: expected_old_public_inputs does not match previous_checkpoint_state_transition_proof public inputs:\n expected_old_public_inputs: {:?} ({})\n  previous_checkpoint_state_transition_proof.public_inputs: {:?} ({})\nExpected Old Checkpoint Leaf: {:#?}", 
+            tracing::error!("Error: expected_old_public_inputs does not match previous_checkpoint_state_transition_proof public inputs:\n expected_old_public_inputs: {:?} ({})\n  previous_checkpoint_state_transition_proof.public_inputs: {:?} ({})\nExpected Old Checkpoint Leaf: {:#?}",
                 expected_old_public_inputs_hash.0.elements, hex::encode(&expected_old_public_inputs_hash.into_owned_32bytes()),
                 actual_old_public_inputs_hash.0.elements, hex::encode(&actual_old_public_inputs_hash.into_owned_32bytes()),
                 old_checkpoint_leaf,
@@ -422,7 +420,7 @@ where
 
         //println!("last_merkle_proof_checkpoint_leaf_hash: {:?} ({})", witness.previous_checkpoint_proof.value.0.elements, hex::encode(&witness.previous_checkpoint_proof.value.into_owned_32bytes()));
 
-        
+
         let expected_public_inputs_after = witness.get_public_inputs_hash_with_fingerprint_and_reward_root::<C::Hasher>(
             self.get_fingerprint(),
             reward_tree_root,
@@ -433,7 +431,7 @@ where
         //println!("upd_expected_public_inputs_metadata: {:?} ({})", input.base.job.metadata.expected_public_inputs_hash.0.elements, hex::encode(&input.base.job.metadata.expected_public_inputs_hash.into_owned_32bytes()));
 
         //println!("pub_test_hash: {:?} ({})", pub_test_hash.0.elements, hex::encode(&pub_test_hash.into_owned_32bytes()));
-        
+
         let proof = self.prove_base(
             worker_reward_tag,
             &witness,
@@ -443,9 +441,9 @@ where
             &previous_checkpoint_state_transition_proof,
             &previous_checkpoint_state_transition_verifier_data,
         )?;
-        
+
         let got_public_inputs = QHashOut::<C::F>::from_felt_slice(&proof.public_inputs);
-        
+
         println!("🏛️ Checkpoint State Transition - got_public_inputs: {:?} ({})", got_public_inputs.0.elements, hex::encode(&got_public_inputs.into_owned_32bytes()));
         Ok(proof)
     }
