@@ -571,6 +571,9 @@ impl<
         self.db
             .set_l2_block_state(checkpoint_id, &coordinator_update.new_base.block_state)
             .await?;
+        self.db
+            .set_l2_latest_block_state(&coordinator_update.new_base.block_state)
+            .await?;
         let checkpoint_leaf_standard = coordinator_update.new_base.checkpoint_leaf.to_checkpoint_leaf::<N::HasherBase>();
         self.db.set_checkpoint_leaf_data(checkpoint_id, &checkpoint_leaf_standard).await?;
         let checkpoint_delta_merkle_proof: DeltaMerkleProofCore<N::QHash> =

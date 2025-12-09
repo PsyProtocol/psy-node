@@ -136,6 +136,9 @@ where
             .set_l2_block_state(checkpoint_sync_info.checkpoint_id, &checkpoint_sync_info.block_state)
             .await?;
         self.db
+            .set_l2_latest_block_state(&checkpoint_sync_info.block_state)
+            .await?;
+        self.db
             .set_checkpoint_global_state_roots(checkpoint_sync_info.checkpoint_id, &checkpoint_sync_info.state_roots)
             .await?;
         self.db

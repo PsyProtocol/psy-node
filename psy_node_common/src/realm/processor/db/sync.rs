@@ -108,6 +108,9 @@ where
         self.db
             .set_l2_block_state(latest_checkpoint_id, &new_sync_info.checkpoint_sync_info.block_state)
             .await?;
+        self.db
+            .set_l2_latest_block_state(&new_sync_info.checkpoint_sync_info.block_state)
+            .await?;
 
         self.db
             .set_l2_block_state(latest_db_checkpoint_id, &old_sync_info.checkpoint_sync_info.block_state)
@@ -230,6 +233,7 @@ where
                 self.db.global_user_tree_set_top_tree_merkle_proof(latest_realm_root.checkpoint_id, &sync_info.merkle_proof_to_realm_root).await?;
                 self.db.set_realm_rewards_tag_tree_top_proof_at_unique_pending_id(self.state.last_committed_unique_pending_id, &sync_info.reward_tree_top_proof).await?;
                 self.db.set_l2_block_state(latest_realm_root.checkpoint_id, &sync_info.checkpoint_sync_info.block_state).await?;
+                self.db.set_l2_latest_block_state(&sync_info.checkpoint_sync_info.block_state).await?;
                 self.db.set_checkpoint_global_state_roots(latest_realm_root.checkpoint_id, &sync_info.checkpoint_sync_info.state_roots).await?;
                 self.db.set_checkpoint_leaf_data(latest_realm_root.checkpoint_id, &sync_info.checkpoint_sync_info.checkpoint_leaf).await?;    
                 return Ok(sync_info);
