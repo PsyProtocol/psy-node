@@ -39,6 +39,12 @@ impl<N: QNetworkTypesConfig + 'static, C: RealmEdgeRpcClient<N::F, N::QHash, N::
         N::QHash::from_owned_32bytes(bytes)
     }
     pub async fn plan_random_contract_calls(&self, max_contract_calls: u32, max_updates_per_call: u32, min_updates_per_call: u32) -> anyhow::Result<Vec<(u32, u64, N::QHash)>> {
+        // If no contracts exist, return empty vec instead of panicking
+        if self.known_contract_state_heights.is_empty() {
+            println!("No contracts available yet, skipping contract calls");
+            return Ok(Vec::new());
+        }
+
         let num_contract_calls = rand::thread_rng().gen_range(1u32..=max_contract_calls);
         let mut planned_calls = Vec::new();
         println!("known contracts: {:?}", self.known_contract_state_heights);
@@ -84,9 +90,13 @@ impl<N: QNetworkTypesConfig + 'static, C: RealmEdgeRpcClient<N::F, N::QHash, N::
         user_id: u64,
         updates: &[(u32, u64, N::QHash)],
     ) -> anyhow::Result<()> {
+        if updates.is_empty() {
+            println!("No updates to prove, skipping submission");
+            return Ok(());
+        }
 
         let checkpoint_id = self.client.df_get_latest_checkpoint().await?;
-        
+
         println!("Generating proof for user_id: {}, checkpoint_id: {}", user_id, checkpoint_id);
 
     let mut state_builder = DummyUPSStateBuilder::<N::F, N::QHash, _, N::HasherBase>::new_init(self.client.clone(), N::GLOBAL_CONTRACT_TREE_HEIGHT, user_id, checkpoint_id).await?;

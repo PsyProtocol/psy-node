@@ -46,8 +46,10 @@ pub async fn start_realm_edge_rpc_server<
     rpc_module.merge(RealmEdgeRpcServer::into_rpc(handler.clone()))?;
     let handle = server.start(rpc_module);
 
-    tokio::spawn(handle.stopped()).await?;
+    tracing::info!("Realm Edge RPC Server started on {}", addr);
 
-    tracing::info!("Coordinator Edge RPC Server running on {}", addr);
+    handle.stopped().await;
+
+    tracing::info!("Realm Edge RPC Server stopped");
     Ok(())
 }

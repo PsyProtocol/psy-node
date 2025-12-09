@@ -50,8 +50,10 @@ pub async fn start_coordinator_edge_rpc_server<
     rpc_module.merge(CoordinatorEdgeRpcServer::into_rpc(handler.clone()))?;
     let handle = server.start(rpc_module);
 
-    tokio::spawn(handle.stopped()).await?;
+    tracing::info!("Coordinator Edge RPC Server started on {}", addr);
 
-    tracing::info!("Coordinator Edge RPC Server running on {}", addr);
+    handle.stopped().await;
+
+    tracing::info!("Coordinator Edge RPC Server stopped");
     Ok(())
 }

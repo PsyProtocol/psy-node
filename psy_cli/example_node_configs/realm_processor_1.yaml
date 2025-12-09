@@ -13,4 +13,3 @@ checkpoint_backup_path: ./local_checkpoints
 coordinator_api_urls:
   - http://127.0.0.1:1337
 
-  

@@ -22,12 +22,12 @@ pub struct CheckpointTreeBackupManager<
 > {
     pub checkpoint_tree: Arc<PsyDashMemoryAppendOnlyMerkleStore<Hasher, Hash>>,
     pub max_checkpoints_to_keep: u64,
-    
+
     // The range of checkpoint IDs currently held in memory/file.
     // Range is [min_backed_up_checkpoint_id, next_backup_checkpoint_id)
     pub min_backed_up_checkpoint_id: u64,
     pub next_backup_checkpoint_id: u64,
-    
+
     pub backup_file_path: String,
     pub backup_file: FileSystem::File,
     pub file_system: Arc<FileSystem>,
@@ -59,7 +59,7 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std
         } else {
             file_system.file_like_fs_open(backup_file_path).await?
         };
-        
+
         Self::new_from_initialized_file(
             file_system,
             backup_file_path.to_string(),
@@ -82,7 +82,7 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std
     ) -> anyhow::Result<Self> {
         // 1. Validate or Initialize File Header
         let file_len = backup_file.file_like_metadata().await?.len();
-        
+
         if file_len == 0 {
             if !allow_create_file {
                 anyhow::bail!("Checkpoint backup file is empty and creation not allowed");
@@ -108,7 +108,7 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std
         let num_entries = data_len / CHECKPOINT_BACKUP_ITEM_SIZE as u64;
 
         let mut entries: Vec<MerkleLeafNode<Hash>> = Vec::with_capacity(num_entries as usize);
-        
+
         backup_file.seek(std::io::SeekFrom::Start(CHECKPOINT_BACKUP_MAGIC_LEN as u64)).await?;
         for _ in 0..num_entries {
             let id = backup_file.read_u64_le().await?;
@@ -139,7 +139,7 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std
                     break;
                 }
             }
-            
+
             let chain = entries[best_chain_start_idx..=best_chain_end_idx].to_vec();
             let start = chain.first().map(|e| e.index).unwrap_or(0);
             let end = chain.last().map(|e| e.index + 1).unwrap_or(0);
@@ -157,7 +157,7 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std
                 .await?;
 
             println!("Init proof for checkpoint {}: {:?}", start_id, init_proof);
-            
+
             // FIX: Sanitize the proof.
             // The DB might return a proof based on the *current* state (e.g., tip at 100),
             // containing right-side siblings for indices > start_id.
@@ -171,14 +171,14 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std
                     *sibling = Hasher::get_zero_hash(layer_idx);
                 }
             }
-            
+
             if init_proof.value != valid_leaves[0].value {
                 anyhow::bail!("Integrity Error: DB proof for checkpoint {} differs from backup file", start_id);
             }
 
             checkpoint_tree.injest_merkle_proof(&init_proof)?;
 
-            
+
             // Populate subsequent leaves using set_leaf to verify/update and register roots
             for leaf in valid_leaves.iter() {
                 let p = checkpoint_tree.set_leaf(leaf.index, leaf.value);
@@ -223,13 +223,13 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std
         }
 
         // Calculate Ring Buffer Offset
-        let offset = CHECKPOINT_BACKUP_MAGIC_LEN as u64 + 
+        let offset = CHECKPOINT_BACKUP_MAGIC_LEN as u64 +
             (checkpoint_id % self.max_checkpoints_to_keep) * CHECKPOINT_BACKUP_ITEM_SIZE as u64;
 
         self.backup_file.seek(std::io::SeekFrom::Start(offset)).await?;
         self.backup_file.write_u64_le(checkpoint_id).await?;
         self.backup_file.write_all(&checkpoint_hash.into_owned_32bytes()).await?;
-        
+
         // Critical: Flush via FileSystem trait
         self.file_system.file_like_fs_flush_file_with_path(&self.backup_file_path, &mut self.backup_file).await?;
 
@@ -240,7 +240,7 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std
         self.checkpoint_tree.roots.insert(p.new_root, checkpoint_id);
 
         self.next_backup_checkpoint_id = checkpoint_id + 1;
-        
+
         let count = self.next_backup_checkpoint_id - self.min_backed_up_checkpoint_id;
         if count > self.max_checkpoints_to_keep {
             self.min_backed_up_checkpoint_id += 1;
@@ -260,7 +260,7 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std
 
     pub fn has_appropriate_checkpoint_history_for_stale_proofs(&self, max_stale_checkpoint_age: u64, current_checkpoint_id: u64) -> bool {
         let required_min = current_checkpoint_id.saturating_sub(max_stale_checkpoint_age);
-        self.next_backup_checkpoint_id > current_checkpoint_id && 
+        self.next_backup_checkpoint_id > current_checkpoint_id &&
         self.min_backed_up_checkpoint_id <= required_min
     }
 
@@ -268,13 +268,13 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std
         tracing::warn!("Hard reset of Checkpoint Backup Manager at ID {}", start_checkpoint_id);
         let height = self.checkpoint_tree.get_height();
         self.checkpoint_tree = Arc::new(PsyDashMemoryAppendOnlyMerkleStore::new(height));
-        
+
         // Use file_like_set_len for truncation
         self.backup_file.file_like_set_len(CHECKPOINT_BACKUP_MAGIC_LEN as u64).await?;
-        
+
         self.backup_file.seek(std::io::SeekFrom::Start(0)).await?;
         self.backup_file.write_u64_le(CHECKPOINT_BACKUP_MAGIC_U64_LE).await?;
-        
+
         // Flush via FileSystem trait
         self.file_system.file_like_fs_flush_file_with_path(&self.backup_file_path, &mut self.backup_file).await?;
 
@@ -299,13 +299,10 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std
             return Ok(());
         }
         if self.min_backed_up_checkpoint_id > min_checkpoint {
-            let num_full_batches = (self.min_backed_up_checkpoint_id -min_checkpoint) / sync_batch_size as u64;
-            let partial_batch_size = (self.min_backed_up_checkpoint_id -min_checkpoint) % sync_batch_size as u64;
-            
-            let suffix_leaves = if self.next_backup_checkpoint_id > min_checkpoint {
-                let mut leaves = Vec::with_capacity((self.next_backup_checkpoint_id - min_checkpoint) as usize);
+            let suffix_leaves = if self.next_backup_checkpoint_id > self.min_backed_up_checkpoint_id {
+                let mut leaves = Vec::with_capacity((self.next_backup_checkpoint_id - self.min_backed_up_checkpoint_id) as usize);
 
-                for i in min_checkpoint..self.next_backup_checkpoint_id {
+                for i in self.min_backed_up_checkpoint_id..self.next_backup_checkpoint_id {
                     let hash = self.checkpoint_tree.get_leaf_value(i);
                     leaves.push(hash);
                 }
@@ -313,7 +310,11 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std
             }else{
                 Vec::new()
             };
+
             self.hard_reset_and_truncate(min_checkpoint).await?;
+
+            let num_full_batches = (self.min_backed_up_checkpoint_id -min_checkpoint) / sync_batch_size as u64;
+            let partial_batch_size = (self.min_backed_up_checkpoint_id -min_checkpoint) % sync_batch_size as u64;
             for i in 0..num_full_batches {
                 let start_id = min_checkpoint + i * sync_batch_size as u64;
                 let leaves = coordinator_client.rc_get_checkpoint_leaves_batch(start_id, sync_batch_size as u32).await?;
@@ -389,10 +390,10 @@ pub async fn sync_from_database<CheckpointTreeReader: PsyNodeCheckpointTreeDatab
     ) -> anyhow::Result<()> {
         // 1. Determine the start based on Protocol Rules (Stale proofs)
         let protocol_start = last_committed_checkpoint_id.saturating_sub(STALE_CHECKPOINT_AGE_REALM_TO_COORDINATOR_PROOF);
-        
+
         // 2. Determine the start based on Capacity Rules (Max items to keep)
         // If we want to keep 500 items ending at 9999, we start at 9500.
-        // Formula: (Target - Max + 1). 
+        // Formula: (Target - Max + 1).
         let capacity_start = if last_committed_checkpoint_id >= self.max_checkpoints_to_keep {
             last_committed_checkpoint_id - self.max_checkpoints_to_keep + 1
         } else {
@@ -400,10 +401,10 @@ pub async fn sync_from_database<CheckpointTreeReader: PsyNodeCheckpointTreeDatab
         };
 
         // 3. The effective start is the maximum of the two.
-        // We cannot start earlier than allowed by capacity, even if protocol desires it 
+        // We cannot start earlier than allowed by capacity, even if protocol desires it
         // (assuming configuration intends to limit memory usage).
         let required_history_start = std::cmp::max(protocol_start, capacity_start);
-        
+
         tracing::info!(
             "Syncing Checkpoint Manager. Target: {}. ReqStart: {}. Local: [{}, {})",
             last_committed_checkpoint_id, required_history_start,
@@ -411,7 +412,7 @@ pub async fn sync_from_database<CheckpointTreeReader: PsyNodeCheckpointTreeDatab
         );
 
         // 4. Determine if a Hard Reset is needed.
-        let needs_reset = 
+        let needs_reset =
             // Case A: Manager is empty/uninitialized.
             (self.next_backup_checkpoint_id == 0 && self.min_backed_up_checkpoint_id == 0) ||
             // Case B: Our current history starts *after* the required start (we are missing historical data).
@@ -428,10 +429,10 @@ pub async fn sync_from_database<CheckpointTreeReader: PsyNodeCheckpointTreeDatab
         if needs_reset {
              self.hard_reset_and_truncate(required_history_start).await?;
         }
-        
+
         // Check if tree is empty using root hash check
         let is_tree_empty = self.checkpoint_tree.get_root() == Hasher::get_zero_hash(self.checkpoint_tree.get_height() as usize);
-        
+
         if is_tree_empty || self.next_backup_checkpoint_id == required_history_start {
             let start = self.next_backup_checkpoint_id;
             let mut init_proof = checkpoint_tree_reader
@@ -462,12 +463,12 @@ pub async fn sync_from_database<CheckpointTreeReader: PsyNodeCheckpointTreeDatab
         while current_sync_idx <= last_committed_checkpoint_id {
             let batch_end = std::cmp::min(current_sync_idx + sync_batch_size as u64 - 1, last_committed_checkpoint_id);
             let count = (batch_end - current_sync_idx + 1) as usize;
-            
+
             let height = self.checkpoint_tree.get_height();
             let keys: Vec<SimpleMerkleNodeKey> = (current_sync_idx..=batch_end)
                 .map(|idx| SimpleMerkleNodeKey::new(height, idx))
                 .collect();
-            
+
             let hashes = checkpoint_tree_reader.checkpoint_tree_get_nodes(last_committed_checkpoint_id, &keys).await?;
             if hashes.len() != count {
                 anyhow::bail!("DB sync mismatch");
@@ -563,7 +564,7 @@ mod test {
         assert_eq!(manager2.next_backup_checkpoint_id, 7);
         assert_eq!(manager2.checkpoint_tree.get_leaf_value(2), hashes[2]);
         assert_eq!(manager2.checkpoint_tree.get_leaf_value(6), hashes[6]);
-        
+
         Ok(())
     }
 
@@ -572,7 +573,7 @@ mod test {
         let fs = Arc::new(SimpleMockMemoryFileSystem::new());
         let db = SimpleMockDBProvider::new(20);
         let path = "sync.dat";
-        
+
         let mut db_hashes = Vec::new();
         for i in 0..2000 {
             let h = Hash::qp_rand_gen();
@@ -593,7 +594,7 @@ mod test {
         assert_eq!(manager.next_backup_checkpoint_id, 1501);
         assert_eq!(manager.min_backed_up_checkpoint_id, 1401);
         assert_eq!(manager.checkpoint_tree.get_leaf_value(1500), db_hashes[1500]);
-        
+
         Ok(())
     }
 
@@ -612,7 +613,7 @@ mod test {
         let start_proof = db.checkpoint_tree_get_merkle_proof(1300, 1300).await?;
         manager.checkpoint_tree.injest_merkle_proof(&start_proof)?;
         manager.min_backed_up_checkpoint_id = 1300;
-        manager.next_backup_checkpoint_id = 1300; 
+        manager.next_backup_checkpoint_id = 1300;
         for i in 1300..1350 {
             manager.append_checkpoint_leaf_hash(i, db.tree.get_leaf_value(i)).await?;
         }
@@ -623,7 +624,7 @@ mod test {
 
         assert_eq!(manager.next_backup_checkpoint_id, 1801);
         assert_eq!(manager.min_backed_up_checkpoint_id, 1701);
-        
+
         Ok(())
     }
 
@@ -663,7 +664,7 @@ mod test {
                 assert_eq!(proof_for_root.get_append_root::<Hasher>(), proof.old_root, "Root mismatch for root {:?}", start_root);
                 assert_eq!(proof_for_root.index, proof.index - 1, "Index mismatch in proof for root {:?}", start_root);
             }
-    
+
         }
         Ok(())
     }
