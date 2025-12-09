@@ -10,6 +10,9 @@ build:
 clean:
 	cargo clean
 
+check:
+	@cargo check --workspace --all-targets --tests --benches --examples --bins
+
 test:
 	cargo test
 

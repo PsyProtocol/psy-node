@@ -26,6 +26,8 @@ impl<N: QNetworkTypesConfig + 'static, C: RealmEdgeRpcClient<N::F, N::QHash, N::
         let ids = (min_contract_id..=max_contract_id).collect();
         let heights: Vec<u8> = self.client.df_get_contract_state_heights(u64::MAX, ids).await?;
 
+        self.known_contract_state_heights.clear();
+
         heights.iter().zip(min_contract_id..).for_each(|( height, contract_id)| {
             if *height > 0 {
                 self.known_contract_state_heights.push((contract_id, *height));
