@@ -50,7 +50,20 @@ pub async fn run_worker_inner(
     prover.query_contract_state_heights(0, 100).await?;
     info!("Queried contract state heights");
 
+    let initial_checkpoint = prover.client.df_get_latest_checkpoint().await?;
+    info!("Initial checkpoint: {}", initial_checkpoint);
+
     prover.prove_random_contract_calls_and_submit(user_id, max_contract_calls, max_state_updates, min_state_updates).await?;
+    info!("Proof submitted, waiting for new block...");
+
+    loop {
+        let current_checkpoint = prover.client.df_get_latest_checkpoint().await?;
+        if current_checkpoint > initial_checkpoint {
+            info!("New block generated, checkpoint: {}", current_checkpoint);
+            break;
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
 
     Ok(())
 }
@@ -77,9 +90,9 @@ pub async fn run(
         ).await;
         if let Err(e) = res {
             error!("Error in worker loop: {:?}", e);
+            sleep(Duration::from_secs(6)).await;
         } else {
             info!("Proof submitted successfully, sleeping...");
         }
-        sleep(Duration::from_secs(5)).await;
     }
 }
