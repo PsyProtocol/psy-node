@@ -61,7 +61,7 @@ echo -e "${YELLOW}Starting coordinator processor...${NC}"
 
 ./target/release/psy_node_cli start-coordinator-processor \
     --config ./psy_cli/example_node_configs/coordinator_processor_1.yaml \
-    > >(tee "$LOG_DIR/coordinator_0_1_processor_logs.txt" | sed -u 's/^/[COORD-PROC] /') 2>&1 &
+    > >(tee -a "$LOG_DIR/coordinator_0_1_processor_logs.txt" | sed -u 's/^/[COORD-PROC] /') 2>&1 &
 
 echo "Started Coordinator Processor"
 
@@ -74,7 +74,7 @@ echo -e "${YELLOW}Starting coordinator edge...${NC}"
 
 ./target/release/psy_node_cli start-coordinator-edge \
     --config ./psy_cli/example_node_configs/coordinator_edge_1.yaml \
-    > >(tee "$LOG_DIR/coordinator_0_1_edge_logs.txt" | sed -u 's/^/[COORD-EDGE] /') 2>&1 &
+    > >(tee -a "$LOG_DIR/coordinator_0_1_edge_logs.txt" | sed -u 's/^/[COORD-EDGE] /') 2>&1 &
 
 echo "Started Coordinator Edge"
 
@@ -88,7 +88,7 @@ echo -e "${YELLOW}Starting coordinator worker...${NC}"
 ./target/release/psy_worker_cli worker \
     --user 0 --network local-devnet \
     --config ./psy_cli/example_node_configs/worker_1.yml \
-    > >(tee "$LOG_DIR/worker_coordinator_logs.txt" | sed -u 's/^/[WORKER-COORD] /') 2>&1 &
+    > >(tee -a "$LOG_DIR/worker_coordinator_logs.txt" | sed -u 's/^/[WORKER-COORD] /') 2>&1 &
 
 echo "Started Coordinator Worker"
 
@@ -101,7 +101,7 @@ echo -e "${YELLOW}Starting realm 0 processor...${NC}"
 
 ./target/release/psy_node_cli start-realm-processor \
     --config ./psy_cli/example_node_configs/realm_processor_1.yaml \
-    > >(tee "$LOG_DIR/realm_0_1_processor_logs.txt" | sed -u 's/^/[REALM0-PROC] /') 2>&1 &
+    > >(tee -a "$LOG_DIR/realm_0_1_processor_logs.txt" | sed -u 's/^/[REALM0-PROC] /') 2>&1 &
 
 echo "Started Realm 0 Processor"
 
@@ -114,7 +114,7 @@ echo -e "${YELLOW}Starting realm 0 edge...${NC}"
 
 ./target/release/psy_node_cli start-realm-edge \
     --config ./psy_cli/example_node_configs/realm_edge_1.yaml \
-    > >(tee "$LOG_DIR/realm_0_1_edge_logs.txt" | sed -u 's/^/[REALM0-EDGE] /') 2>&1 &
+    > >(tee -a "$LOG_DIR/realm_0_1_edge_logs.txt" | sed -u 's/^/[REALM0-EDGE] /') 2>&1 &
 
 echo "Started Realm 0 Edge"
 
@@ -128,7 +128,7 @@ echo -e "${YELLOW}Starting realm 0 worker...${NC}"
 ./target/release/psy_worker_cli worker \
     --user 0 --network local-devnet \
     --config ./psy_cli/example_node_configs/worker_realm_1.yml \
-    > >(tee "$LOG_DIR/worker_realm_0_logs.txt" | sed -u 's/^/[WORKER-R0] /') 2>&1 &
+    > >(tee -a "$LOG_DIR/worker_realm_0_logs.txt" | sed -u 's/^/[WORKER-R0] /') 2>&1 &
 
 echo "Started Realm 0 Worker"
 
@@ -141,7 +141,7 @@ echo -e "${YELLOW}Starting realm 1 processor...${NC}"
 
 ./target/release/psy_node_cli start-realm-processor \
     --config ./psy_cli/example_node_configs/realm_processor_2.yaml \
-    > >(tee "$LOG_DIR/realm_1_1_processor_logs.txt" | sed -u 's/^/[REALM1-PROC] /') 2>&1 &
+    > >(tee -a "$LOG_DIR/realm_1_1_processor_logs.txt" | sed -u 's/^/[REALM1-PROC] /') 2>&1 &
 
 echo "Started Realm 1 Processor"
 
@@ -154,7 +154,7 @@ echo -e "${YELLOW}Starting realm 1 edge...${NC}"
 
 ./target/release/psy_node_cli start-realm-edge \
     --config ./psy_cli/example_node_configs/realm_edge_2.yaml \
-    > >(tee "$LOG_DIR/realm_1_1_edge_logs.txt" | sed -u 's/^/[REALM1-EDGE] /') 2>&1 &
+    > >(tee -a "$LOG_DIR/realm_1_1_edge_logs.txt" | sed -u 's/^/[REALM1-EDGE] /') 2>&1 &
 
 echo "Started Realm 1 Edge"
 
@@ -168,7 +168,7 @@ echo -e "${YELLOW}Starting realm 1 worker...${NC}"
 ./target/release/psy_worker_cli worker \
     --user 0 --network local-devnet \
     --config ./psy_cli/example_node_configs/worker_realm_2.yml \
-    > >(tee "$LOG_DIR/worker_realm_1_logs.txt" | sed -u 's/^/[WORKER-R1] /') 2>&1 &
+    > >(tee -a "$LOG_DIR/worker_realm_1_logs.txt" | sed -u 's/^/[WORKER-R1] /') 2>&1 &
 
 echo "Started Realm 1 Worker"
 
@@ -187,7 +187,7 @@ sleep 20
 
 ./target/release/psy_worker_cli dummy-end-cap-prover \
     --url http://127.0.0.1:1338 --user 0 \
-    > >(tee "$LOG_DIR/dummy_end_cap_prover_logs.txt" | sed -u 's/^/[DUMMY-PROVER] /') 2>&1 &
+    > >(tee -a "$LOG_DIR/dummy_end_cap_prover_logs.txt" | sed -u 's/^/[DUMMY-PROVER] /') 2>&1 &
 
 echo "Started Dummy End Cap Prover"
 
