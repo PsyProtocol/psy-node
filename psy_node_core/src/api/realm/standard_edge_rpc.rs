@@ -5,7 +5,7 @@ use parth_core::{
 };
 use psy_data::{
     proof_input::guta::end_cap_input::SubmitUserEndCapNonProofInput,
-    v1::{common_api::PsyProoffMinerRewardProof, 
+    v1::{common_api::PsyProoffMinerRewardProof,
         qdata::{
             checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState},
             user::PQEDUserLeaf,
@@ -14,7 +14,7 @@ use psy_data::{
 };
 
 
-#[rpc(server, client, namespace = "qed")]
+#[rpc(server, client, namespace = "psy")]
 pub trait RealmEdgeRpcTest {
     #[method(name = "get_sum")]
     async fn get_sum(
@@ -24,7 +24,7 @@ pub trait RealmEdgeRpcTest {
     ) -> RpcResult<u64>;
 }
 
-#[rpc(server, client, namespace = "qed")]
+#[rpc(server, client, namespace = "psy")]
 pub trait RealmEdgeRpc<F, Hash, JobId, ZKProof> {
     /// Check if a user id belongs to this realm
     #[method(name = "check_user_id_in_realm")]
@@ -42,7 +42,7 @@ pub trait RealmEdgeRpc<F, Hash, JobId, ZKProof> {
     async fn get_checkpoint_leaf_data(&self, checkpoint_id: u64)
         -> RpcResult<PQEDCheckpointLeaf<F, Hash>>;
 
-        
+
     #[method(name = "get_latest_l2_block_state")]
     async fn get_latest_l2_block_state(&self) -> RpcResult<QEDL2BlockState>;
 
@@ -175,5 +175,5 @@ pub trait RealmEdgeRpc<F, Hash, JobId, ZKProof> {
 
     #[method(name = "generate_batch_proof_miner_reward_proofs")]
     async fn generate_batch_proof_miner_reward_proofs(&self, unique_pending_id: u64, job_ids: Vec<QProvingJobDataIDWithRewardPath<JobId>>) -> RpcResult<Vec<PsyProoffMinerRewardProof<Hash, JobId>>>;
-    
+
 }

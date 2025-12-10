@@ -5,7 +5,7 @@ use jsonrpsee::{
 use std::net::SocketAddr;
 use tower_http::cors::{Any, CorsLayer};
 
-#[rpc(server, client, namespace = "qed")]
+#[rpc(server, client, namespace = "psy")]
 pub trait ExampleRPCTrait1 {
     #[method(name = "get_sum")]
     async fn get_sum(&self, a: u64, b: u64) -> RpcResult<u64>;
@@ -70,7 +70,7 @@ async fn test_client(addr: SocketAddr) -> anyhow::Result<()> {
     }
 
     timer.lap_batch("ws", "get_sum", 10000);
-    
+
     println!("WebSocket client test passed.");
 
     let mut timer = DebugTimer::new("http");
@@ -84,7 +84,7 @@ async fn test_client(addr: SocketAddr) -> anyhow::Result<()> {
         assert_eq!(http_result, expected_result);
     }
     timer.lap_batch("http", "get_sum", 10000);
-    
+
     println!("HTTP client test passed.");
 
 
