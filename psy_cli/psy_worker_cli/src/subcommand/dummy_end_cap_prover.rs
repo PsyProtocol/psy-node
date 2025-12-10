@@ -47,23 +47,11 @@ pub async fn run_worker_inner(
     type N = QNetworkTypesConfigHelper<QProvingJobDataID, ZKTypesPlonky2GoldilocksPoseidon, PsyNetworkLocalDevnetConstants>;
     let mut prover = create_plonky2_dummy_end_cap_prover::<N, C, D>(&api_url)?;
 
+    prover.query_contract_state_heights(0, 100).await?;
+    info!("Queried contract state heights");
 
+    prover.prove_random_contract_calls_and_submit(user_id, max_contract_calls, max_state_updates, min_state_updates).await?;
 
-    
-
-
-        let res = prover.query_contract_state_heights(0, 100).await;
-        if res.is_err() {
-            tracing::error!("Error querying contract state heights: {:?}", res.err());
-        } else {
-            info!("Queried contract state heights");
-        }
-
-    loop {
-        info!("Worker is running...");
-        prover.prove_random_contract_calls_and_submit(user_id, 1, 2, 1).await?;
-        sleep(Duration::from_secs(5)).await;
-    }
     Ok(())
 }
 
@@ -78,13 +66,20 @@ pub async fn run(
     print_banner();
     info!("Dummy end cap prover starting...");
     info!("api url: {}", api_url);
-run_worker_inner(
-        api_url,
-        min_state_updates,
-        max_state_updates,
-        max_contract_calls,
-        user_id,
-    ).await?;
-    info!("Worker exit.");
-    Ok(())
+
+    loop {
+        let res = run_worker_inner(
+            api_url.clone(),
+            min_state_updates,
+            max_state_updates,
+            max_contract_calls,
+            user_id,
+        ).await;
+        if let Err(e) = res {
+            error!("Error in worker loop: {:?}", e);
+        } else {
+            info!("Proof submitted successfully, sleeping...");
+        }
+        sleep(Duration::from_secs(5)).await;
+    }
 }

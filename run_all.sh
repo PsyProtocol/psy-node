@@ -186,7 +186,7 @@ echo -e "${YELLOW}Note: Waiting for system to fully initialize before starting d
 sleep 20
 
 ./target/release/psy_worker_cli dummy-end-cap-prover \
-    --url http://127.0.0.1:1338 --user 0 \
+    --url http://127.0.0.1:1338 --user 0 --min-state-updates 1 --max-state-updates 2 --max-contract-calls 1 \
     > >(tee -a "$LOG_DIR/dummy_end_cap_prover_logs.txt" | sed -u 's/^/[DUMMY-PROVER] /') 2>&1 &
 
 echo "Started Dummy End Cap Prover"

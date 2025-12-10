@@ -67,7 +67,7 @@ run-worker-realm-1:
 	./target/release/psy_worker_cli worker --user 0 --network local-devnet --config ./psy_cli/example_node_configs/worker_realm_2.yml
 
 run-dummy-prover:
-	./target/release/psy_worker_cli dummy-end-cap-prover --url http://127.0.0.1:1338 --user 0
+	./target/release/psy_worker_cli dummy-end-cap-prover --url http://127.0.0.1:1338 --user 0 --min-state-updates 1 --max-state-updates 2 --max-contract-calls 1
 
 shutdown:
 	pkill -f "psy_node_cli" || true
@@ -81,3 +81,6 @@ clean-db:
 	docker rm nats-server || true
 	docker rm valkey-server || true
 	rm -fr local_checkpoints logs || true
+
+config_gen_v2:
+	cargo run --release --package psy_plonky2_circuits --example config_gen_v2
