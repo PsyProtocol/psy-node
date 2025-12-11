@@ -254,7 +254,7 @@ where
 
         let expected_compact = witness.get_end_result_a();
 
-        
+
         let expected_stats_hash = witness.core.guta_stats.qfhash::<C::Hasher>();
         let expected_guta_hash = expected_compact.qfhash_with_guta_height::<C::Hasher>(32);
 
@@ -269,8 +269,8 @@ where
         println!("expected_dummy_public_inputs: {:#?}", expected_dummy_public_inputs);
         println!("child proof pubs: {:#?}", child_proof_result.zk_proof.public_inputs);
 
-        let expecteed_new_guta = witness.get_new_guta_header(32);
-        println!("expecteed_new_guta: {:#?}", expecteed_new_guta);
+        let expected_new_guta = witness.get_new_guta_header(32);
+        println!("expected_new_guta: {:#?}", expected_new_guta);
         let expected_new_public_inputs = witness.get_public_inputs_hash_no_rewards_tag::<C::Hasher>(32);
 
         let new_tag_root = hash_tag_tree_node::<QHashOut<C::F>, C::Hasher>(&QHashOut::<C::F>::ZERO, &QHashOut::<C::F>::ZERO, &worker_reward_tag);

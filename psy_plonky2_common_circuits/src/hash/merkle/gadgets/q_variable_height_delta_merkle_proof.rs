@@ -162,7 +162,7 @@ impl QVariableHeightDeltaMerkleProofGadget {
         witness: &mut W,
         siblings: &[QHashOut<F>],
     ) -> anyhow::Result<()> {
-        if self.delta_merkle_proof.option_flags != DeltaMerkleProofGadgetOptionFlags::siblings {
+        if self.delta_merkle_proof.option_flags.contains(DeltaMerkleProofGadgetOptionFlags::siblings) {
             return Err(anyhow::anyhow!("DeltaMerkleProofGadget was not created with only siblings as unknown"));
         }
         for (i, s) in self.delta_merkle_proof.siblings.iter().enumerate() {
