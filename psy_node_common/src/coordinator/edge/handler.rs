@@ -161,7 +161,7 @@ impl<
         let mut keys = Vec::with_capacity((end_checkpoint - start_checkpoint_id + 1) as usize);
         for cid in start_checkpoint_id..=end_checkpoint {
             keys.push(SimpleMerkleNodeKey{
-                level: 0,
+                level: N::CHECKPOINT_TREE_HEIGHT,
                 index: cid,
             });
         }

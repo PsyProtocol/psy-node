@@ -391,15 +391,13 @@ where
             )
             .await?;
 
-
             self.commit_state(
                 &coordinator_update,
                 &prepared_updates,
                 ProvingJobCircuitType::GUTANoChange,
                 vec![],
             ).await?;
-            tracing::info!("Restored database state from backups up to checkpoint ID: {}",
-                restore_checkpoint_id);
+            tracing::info!("Restored database state from backups up to checkpoint ID: {}", restore_checkpoint_id);
 
             let latest_realm_root = self.get_realm_root_from_db().await?;
             if latest_realm_root != realm_root_with_id.value {
@@ -408,7 +406,6 @@ where
                 anyhow::bail!("Post-recovery realm root ({:?}) does not match expected realm root from coordinator ({:?}) at checkpoint ID: {}. This indicates an inconsistency after recovery.",
                     latest_realm_root, realm_root_with_id.value, restore_checkpoint_id);
             }
-
         }
         Ok(())
     }

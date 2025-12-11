@@ -74,12 +74,9 @@ shutdown:
 	pkill -f "psy_worker_cli" || true
 
 clean-db:
-	docker stop scylla-server || true
-	docker stop nats-server || true
-	docker stop valkey-server  || true
-	docker rm scylla-server || true
-	docker rm nats-server || true
-	docker rm valkey-server || true
+	docker rm -f scylla-server || true
+	docker rm -f nats-server || true
+	docker rm -f valkey-server || true
 	rm -fr local_checkpoints logs || true
 
 config_gen_v2:
