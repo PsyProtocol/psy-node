@@ -379,6 +379,7 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
             genesis_block.withdrawal_tree_root,
             genesis_block.checkpoint_stats.clone(),
         );
+        builder.setup_contracts::<Hasher, N>(genesis_block, false)?;
         let merkle_proof_to_realm_root = builder.setup_users::<Hasher, N>(
             genesis_block,
             Some(realm_id),
@@ -397,7 +398,7 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
         let checkpoint_tree_root = compute_root_merkle_proof_generic::<Hash, Hasher>(checkpoint_leaf_hash, 0, &siblings);
 
         let coordinator_update = PsyRealmCoordinatorUpdate {
-            checkpoint_sync_info: PQEDCheckpointSyncInfoCompact{ 
+            checkpoint_sync_info: PQEDCheckpointSyncInfoCompact{
                 state_roots,
                 checkpoint_id: 0,
                 coordinator_id: 0,
