@@ -83,59 +83,58 @@ where
         let latest_checkpoint_id = self.checkpoint_tree_backup_manager.get_current_checkpoint_id_head();
         let latest_checkpoint_root = self.checkpoint_tree_backup_manager.get_current_checkpoint_tree_root_head();
 
-        if latest_checkpoint_id == latest_db_checkpoint_id {
-            tracing::info!("Coordinator processor database is already synced to latest checkpoint ID: {}", latest_checkpoint_id);
+        let db_root = self.db.checkpoint_tree_get_root_hash(latest_db_checkpoint_id).await?;
+        if latest_checkpoint_id == latest_db_checkpoint_id && latest_checkpoint_root == db_root {
+            tracing::info!("Coordinator processor database is already synced to latest checkpoint ID: {} and root: {:?}", latest_checkpoint_id, latest_checkpoint_root);
             return Ok(());
         }
         let latest_db_l2_info: QEDL2BlockState = self.db.get_l2_block_state(latest_db_checkpoint_id).await?;
-        let nodes = self.checkpoint_tree_backup_manager.checkpoint_tree.get_nodes_between_leaves(latest_checkpoint_id, latest_checkpoint_id+1);
-        let checkpoint_tree_start_proof = self.checkpoint_tree_backup_manager.checkpoint_tree.get_leaf(latest_db_checkpoint_id);
-        let checkpoint_tree_end_proof = self.checkpoint_tree_backup_manager.checkpoint_tree.get_leaf(latest_checkpoint_id);
-        println!("Syncing to coordinator. Latest DB checkpoint ID: {}, Latest coordinator checkpoint ID: {}.", latest_db_checkpoint_id, latest_checkpoint_id);
-        println!("checkpoint_tree_start_proof verify: {:?}", checkpoint_tree_start_proof.verify::<N::HasherBase>());
-        println!("checkpoint_tree_end_proof verify: {:?}", checkpoint_tree_end_proof.verify::<N::HasherBase>());
-        self.db.checkpoint_tree_injest_merkle_proof(latest_db_checkpoint_id, &checkpoint_tree_start_proof).await?;
-        self.db.checkpoint_tree_injest_merkle_proof(latest_checkpoint_id, &checkpoint_tree_end_proof).await?;
-        self.db.checkpoint_tree_set_nodes(latest_checkpoint_id, &nodes).await?;
-        self.db.checkpoint_tree_injest_merkle_proof(latest_db_checkpoint_id, &checkpoint_tree_start_proof).await?;
-        self.db.checkpoint_tree_injest_merkle_proof(latest_checkpoint_id, &checkpoint_tree_end_proof).await?;
-        let old_sync_info: PsyRealmCoordinatorUpdate<N::F, N::QHash> = self
+
+        tracing::info!("Syncing checkpoint metadata from checkpoint ID {} to {}.", latest_db_checkpoint_id, latest_checkpoint_id);
+        for checkpoint_id in latest_db_checkpoint_id..=latest_checkpoint_id {
+            let sync_info: PsyRealmCoordinatorUpdate<N::F, N::QHash> = self
+                .coordinator_client
+                .rc_get_realm_sync_info(checkpoint_id)
+                .await?;
+
+            self.db
+                .set_l2_block_state(checkpoint_id, &sync_info.checkpoint_sync_info.block_state)
+                .await?;
+            self.db
+                .set_checkpoint_global_state_roots(checkpoint_id, &sync_info.checkpoint_sync_info.state_roots)
+                .await?;
+            self.db
+                .set_checkpoint_leaf_data(checkpoint_id, &sync_info.checkpoint_sync_info.checkpoint_leaf)
+                .await?;
+            self.db
+                .checkpoint_tree_set_leaf_hash(checkpoint_id, sync_info.checkpoint_sync_info.checkpoint_leaf_hash)
+                .await?;
+            self.db
+                .set_checkpoint_root_hash_to_id_mapping(sync_info.checkpoint_sync_info.checkpoint_tree_root, sync_info.checkpoint_sync_info.checkpoint_id)
+                .await?;
+
+            tracing::debug!("Synced metadata for checkpoint ID: {}", checkpoint_id);
+        }
+
+        // Update the latest block state to the newest checkpoint
+        let latest_sync_info: PsyRealmCoordinatorUpdate<N::F, N::QHash> = self
             .coordinator_client
             .rc_get_realm_sync_info(latest_checkpoint_id)
             .await?;
-        let new_sync_info: PsyRealmCoordinatorUpdate<N::F, N::QHash> = self.coordinator_client.rc_get_realm_sync_info(latest_checkpoint_id).await?;
-
         self.db
-            .set_l2_block_state(latest_checkpoint_id, &new_sync_info.checkpoint_sync_info.block_state)
+            .set_l2_latest_block_state(&latest_sync_info.checkpoint_sync_info.block_state)
             .await?;
-        self.db
-            .set_l2_latest_block_state(&new_sync_info.checkpoint_sync_info.block_state)
-            .await?;
-
-        self.db
-            .set_l2_block_state(latest_db_checkpoint_id, &old_sync_info.checkpoint_sync_info.block_state)
-            .await?;
-        // todo: update the checkpoints in-between in some reasonable manner
-        self.db
-            .set_checkpoint_leaf_data(latest_checkpoint_id, &new_sync_info.checkpoint_sync_info.checkpoint_leaf)
-            .await?;
-
-        self.db
-            .set_checkpoint_leaf_data(latest_db_checkpoint_id, &old_sync_info.checkpoint_sync_info.checkpoint_leaf)
-            .await?;
-        if latest_db_l2_info.next_contract_id != new_sync_info.checkpoint_sync_info.block_state.next_contract_id {
+        if latest_db_l2_info.next_contract_id != latest_sync_info.checkpoint_sync_info.block_state.next_contract_id {
             tracing::warn!("Next contract ID mismatch when syncing to coordinator. Latest DB L2 info next contract ID: {}, New sync info next contract ID: {}. Updating to new sync info value.",
-                latest_db_l2_info.next_contract_id, new_sync_info.checkpoint_sync_info.block_state.next_contract_id);
+                latest_db_l2_info.next_contract_id, latest_sync_info.checkpoint_sync_info.block_state.next_contract_id);
             let batch_size = 1000u64;
-            let full_batches = (new_sync_info.checkpoint_sync_info.block_state.next_contract_id - latest_db_l2_info.next_contract_id) / (batch_size as u32);
-            let remainder = (new_sync_info.checkpoint_sync_info.block_state.next_contract_id - latest_db_l2_info.next_contract_id) % (batch_size as u32);
+            let full_batches = (latest_sync_info.checkpoint_sync_info.block_state.next_contract_id - latest_db_l2_info.next_contract_id) / (batch_size as u32);
+            let remainder = (latest_sync_info.checkpoint_sync_info.block_state.next_contract_id - latest_db_l2_info.next_contract_id) % (batch_size as u32);
             for i in 0..(full_batches as u64) {
                 let start_id = latest_db_l2_info.next_contract_id as u64 + i * batch_size;
                 let end_id = start_id + batch_size;
                 let heights:Vec<(u64, u8)> = self.coordinator_client.rc_get_contract_tree_state_heights(latest_checkpoint_id, (start_id..end_id).collect()).await?.into_iter().enumerate().map(|(i,b)| (i as u64 + start_id, b)).collect();
                 println!("Fetched contract tree heights for contract IDs {} to {} during sync to coordinator {:?}.", start_id, end_id, heights);
-
-
 
                 self.db
                     .set_contract_tree_heights(latest_checkpoint_id, &heights)
@@ -152,7 +151,6 @@ where
                     .set_contract_tree_heights(latest_checkpoint_id, &heights)
                     .await?;
             }
-
         }
 
         self.db
@@ -201,7 +199,7 @@ where
         self.state.gathering_checkpoint_root = self.checkpoint_tree_backup_manager.get_current_checkpoint_tree_root_head();
         self.state.processing_checkpoint_id = self.state.coordinator_head_synced_checkpoint_id;
         self.state.gathering_checkpoint_id = self.state.coordinator_head_synced_checkpoint_id;
-        
+
         Ok(())
     }
 
@@ -235,13 +233,13 @@ where
                 self.db.set_l2_block_state(latest_realm_root.checkpoint_id, &sync_info.checkpoint_sync_info.block_state).await?;
                 self.db.set_l2_latest_block_state(&sync_info.checkpoint_sync_info.block_state).await?;
                 self.db.set_checkpoint_global_state_roots(latest_realm_root.checkpoint_id, &sync_info.checkpoint_sync_info.state_roots).await?;
-                self.db.set_checkpoint_leaf_data(latest_realm_root.checkpoint_id, &sync_info.checkpoint_sync_info.checkpoint_leaf).await?;    
+                self.db.set_checkpoint_leaf_data(latest_realm_root.checkpoint_id, &sync_info.checkpoint_sync_info.checkpoint_leaf).await?;
                 return Ok(sync_info);
             }else{
                 tracing::info!("Waiting for realm root to be updated to the new value: {:?}. Current realm root at checkpoint ID {} is {:?}. Retrying...", new_realm_root, latest_realm_root.checkpoint_id, latest_realm_root.value);
                 self.coordinator_client.rc_wait_for_next_checkpoint().await?;
             }
         }
-        
+
     }
 }
