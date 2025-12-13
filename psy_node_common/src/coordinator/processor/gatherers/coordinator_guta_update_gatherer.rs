@@ -391,14 +391,6 @@ impl<
             realm_sub_id: self.config.realm_sub_id_u64 as u16,
         };
 
-        tracing::info!(
-            "Finalizing GUTA updates gatherer for pending id {}, start root {:?}, end root {:?}",
-            self.status.unique_pending_id,
-            self.start_global_user_tree_root,
-            end_global_user_tree_root
-        );
-
-
         let new_status = self.config.status.read().map_err(|e| anyhow::anyhow!("error reading status {:?}", e))?.clone();
         let jobs_for_queue: anyhow::Result<Vec<Vec<PsyProvingJobMetadataWithJobId<N::QHash, QProvingJobDataID>>>> = self
             .guta_planner
@@ -429,6 +421,15 @@ impl<
             "Finalized GUTA updates gatherer for pending id {}, total jobs created: {}",
             self.status.unique_pending_id,
             jobs_for_queue.iter().map(|v| v.len()).sum::<usize>()
+        );
+
+        let end_global_user_tree_root = tree.get_root();
+
+        tracing::info!(
+            "Finalizing GUTA updates gatherer for pending id {}, start root {:?}, end root {:?}",
+            self.status.unique_pending_id,
+            self.start_global_user_tree_root,
+            end_global_user_tree_root
         );
 
         let added_proofs = jobs_for_queue.iter().map(|v| v.len() as u64).sum::<u64>();
