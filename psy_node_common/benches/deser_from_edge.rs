@@ -1,4 +1,4 @@
-use criterion::{black_box, BatchSize, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box};
 use parth_common::memory_stores::mem_tree_v3::SimpleMemoryMerkleStoreV3;
 use parth_core::{
     crypto::hash::traits::{MerkleZeroHasher, QFieldHashable}, data::hash::merkle_store_key::{QMerkleStoreDoubleIdNode, QMerkleStoreSingleIdNode}, felt::{QFelt64, ToU64Value}, pgoldilocks::PoseidonHasher, protocol::core_types::{Q256BitHash, QFHashBase, QFHasherU64}, utils::QPGenRandom, PHash
@@ -7,22 +7,19 @@ use psy_data::{
     guta::stats::GUTAStats,
     proof_input::guta::{end_cap_input::SubmitUserEndCapNonProofInput, SubmitUserEndCapNonProofCoreInput},
     v1::qdata::{
-        checkpoint,
-        contract::{self, DashMapContractHeightCache, PSimpleContractHeightCache, QEDContractStateUpdateHistory},
+        contract::{DashMapContractHeightCache, PSimpleContractHeightCache, QEDContractStateUpdateHistory},
         user::PQEDUserLeaf,
         user_end_cap_result::PUPSEndCapResultCompact,
     },
 };
 use psy_node_common::realm::edge::utils::end_cap::validate_end_cap_and_generate_node_data_for_edge;
-use psy_node_core::{
+use psy_node_core::
     qblob::{
         blob_type::QBlobMerkleNodeTreeType,
         data_views::{double_merkle_node_batch::QBlobDoubleMerkleNodeBatchDataView, single_merkle_node_batch::QBlobSingleMerkleNodeBatchDataView},
         structs::common::blob_metadata_header::QBlobWriterContextMetadataHeader,
-    },
-    store::traits::temp_db::{QTempDatabaseRawKVReaderBase, QTempDatabaseRawKVWriterBase},
-};
-use tokio::runtime::Runtime;
+    }
+;
 
 pub fn gen_fake_valid_submit_user_end_cap_non_proof_input<F, Hash, Hasher>(
     global_user_tree_height: u8,
@@ -47,7 +44,7 @@ where
             let max_leaf_id = 1u64 << contract_state_tree_height;
             contract_helper.add_contract(0, contract_state_tree_height, tree.get_root());
 
-            for i in 0..1000 {
+            for _ in 0..1000 {
                 let rand_leaf_id = rand::random::<u64>() % max_leaf_id;
                 tree.set_leaf(rand_leaf_id, Hash::qp_rand_gen());
             }
@@ -203,8 +200,8 @@ fn deserialize_data_from_edge_and_nodes<Hash: Q256BitHash>(
     unique_pending_id: u64,
     data: &[u8],
 ) -> anyhow::Result<(Vec<QMerkleStoreSingleIdNode<Hash>>, Vec<QMerkleStoreDoubleIdNode<Hash>>)> {
-        let (single_header, single_payload, double_full) = QBlobSingleMerkleNodeBatchDataView::validate_single_tree_nodes_batch_header_for_realm_context_get_clipped_ref_no_exact_size(&data, chain_id, realm_id, realm_sub_id, unique_pending_id, QBlobMerkleNodeTreeType::UserContractTree)?;
-        let (double_header, double_payload) = QBlobDoubleMerkleNodeBatchDataView::validate_uct_nodes_batch_header_for_realm_context_get_clipped_ref(&double_full, chain_id, realm_id, realm_sub_id, unique_pending_id)?;
+        let (_single_header, single_payload, double_full) = QBlobSingleMerkleNodeBatchDataView::validate_single_tree_nodes_batch_header_for_realm_context_get_clipped_ref_no_exact_size(&data, chain_id, realm_id, realm_sub_id, unique_pending_id, QBlobMerkleNodeTreeType::UserContractTree)?;
+        let (_double_header, double_payload) = QBlobDoubleMerkleNodeBatchDataView::validate_uct_nodes_batch_header_for_realm_context_get_clipped_ref(&double_full, chain_id, realm_id, realm_sub_id, unique_pending_id)?;
 
 
         let single_nodes: Vec<QMerkleStoreSingleIdNode<Hash>> = QBlobSingleMerkleNodeBatchDataView::read_batch_single_nodes_from_checked_payload::<Hash>(single_payload)?;
@@ -250,8 +247,8 @@ pub fn criterion_benchmark_dser_edge(c: &mut Criterion) {
     let unique_pending_id = context.unique_pending_id;
 
 
-        let (single_header, single_payload, double_full) = QBlobSingleMerkleNodeBatchDataView::validate_single_tree_nodes_batch_header_for_realm_context_get_clipped_ref_no_exact_size(&res, context.chain_id, context.realm_id, context.realm_sub_id, context.unique_pending_id, QBlobMerkleNodeTreeType::UserContractTree).unwrap();
-        let (double_header, double_payload) = QBlobDoubleMerkleNodeBatchDataView::validate_uct_nodes_batch_header_for_realm_context_get_clipped_ref(&double_full, context.chain_id, context.realm_id, context.realm_sub_id, context.unique_pending_id).unwrap();
+        let (_single_header, single_payload, double_full) = QBlobSingleMerkleNodeBatchDataView::validate_single_tree_nodes_batch_header_for_realm_context_get_clipped_ref_no_exact_size(&res, context.chain_id, context.realm_id, context.realm_sub_id, context.unique_pending_id, QBlobMerkleNodeTreeType::UserContractTree).unwrap();
+        let (_double_header, double_payload) = QBlobDoubleMerkleNodeBatchDataView::validate_uct_nodes_batch_header_for_realm_context_get_clipped_ref(&double_full, context.chain_id, context.realm_id, context.realm_sub_id, context.unique_pending_id).unwrap();
 
         let single_nodes = QBlobSingleMerkleNodeBatchDataView::read_batch_single_nodes_from_checked_payload::<Hash>(single_payload).unwrap();
         let double_nodes = QBlobDoubleMerkleNodeBatchDataView::read_batch_double_nodes_from_checked_payload::<Hash>(double_payload).unwrap();

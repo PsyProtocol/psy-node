@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use plonky2::{
     gates::{constant::ConstantGate, gate::GateRef}, hash::hash_types::{HashOut, HashOutTarget}, iop::
         witness::{PartialWitness, WitnessWrite}, plonk::{

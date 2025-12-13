@@ -2,12 +2,29 @@
 use parth_core::protocol::core_types::Q256BitHash;
 #[cfg(feature = "rand_gen")]
 use parth_core::utils::QPGenRandom;
-use parth_core::{crypto::hash::{merkle_proof::{DeltaMerkleProofCore, MerkleProofCore}, traits::{FieldQHasher, MerkleZeroHasher, QFieldHashable}}, felt::{QFelt, QFelt64}, protocol::core_types::QFHashBase};
+use parth_core::{
+    crypto::hash::{
+        merkle_proof::{DeltaMerkleProofCore, MerkleProofCore},
+        traits::{FieldQHasher, QFieldHashable},
+    },
+    felt::{QFelt, QFelt64},
+    protocol::core_types::QFHashBase,
+};
 use psy_core::job::job_id::QProvingJobDataID;
 use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
 
-use crate::{guta::{header::GlobalUserTreeAggregatorHeader, header_extended::GlobalUserTreeAggregatorHeaderWithJobId, sub_tree_transition::SubTreeNodeStateTransition}, proof_input::guta::VerifyEndCapSimpleStandardInput, v1::qdata::user_end_cap_result::PUPSEndCapResultCompact, worker::{metadata::{PROOF_REWARD_TREE_HASH_MODE_HASH_CHILDREN_STANDARD, PROOF_REWARD_TREE_HASH_MODE_LIFT_CHILD, PsyProvingJobMetadata}, metadata_with_job_id::PsyProvingJobMetadataWithJobId}};
-
+use crate::{
+    guta::{
+        header::GlobalUserTreeAggregatorHeader, header_extended::GlobalUserTreeAggregatorHeaderWithJobId,
+        sub_tree_transition::SubTreeNodeStateTransition,
+    },
+    proof_input::guta::VerifyEndCapSimpleStandardInput,
+    v1::qdata::user_end_cap_result::PUPSEndCapResultCompact,
+    worker::{
+        metadata::{PsyProvingJobMetadata, PROOF_REWARD_TREE_HASH_MODE_LIFT_CHILD},
+        metadata_with_job_id::PsyProvingJobMetadataWithJobId,
+    },
+};
 
 #[pderive::serialize_clone_f_hash_ts]
 #[ts(export, concrete(F = parth_core::PF, Hash = parth_core::PHash))]
@@ -18,7 +35,6 @@ pub struct GUTAVerifyLeftGUTARightEndCapCircuitInputV2<F, Hash> {
 }
 
 impl<F: QFelt, Hash: Copy> GUTAVerifyLeftGUTARightEndCapCircuitInputV2<F, Hash> {
-
     pub fn get_end_cap_result_b(&self) -> PUPSEndCapResultCompact<F, Hash> {
         PUPSEndCapResultCompact {
             start_user_leaf_hash: self.right_global_user_tree_delta_merkle_proof.old_value,
@@ -77,11 +93,7 @@ impl<F: QFelt64, Hash: QFHashBase<F>> GUTAVerifyLeftGUTARightEndCapCircuitInputV
         PsyProvingJobMetadataWithJobId<Hash, QProvingJobDataID>,
         GlobalUserTreeAggregatorHeaderWithJobId<F, Hash>,
     ) {
-        let job_id = QProvingJobDataID::guta_left_linear_right_end_cap_proof(
-            unique_pending_id,
-            level as u32,
-            index,
-        );
+        let job_id = QProvingJobDataID::guta_left_linear_right_end_cap_proof(unique_pending_id, level as u32, index);
         let new_guta_header = GlobalUserTreeAggregatorHeaderWithJobId {
             job_id,
             header: self.get_new_guta_header(),
@@ -109,7 +121,6 @@ pub struct GUTAVerifyRightGUTALeftEndCapCircuitInputV2<F, Hash> {
     pub left_historical_checkpoint_merkle_proof: MerkleProofCore<Hash>,
     pub right_header: GlobalUserTreeAggregatorHeader<F, Hash>,
 }
-
 
 impl<F: QFelt, Hash: Copy> GUTAVerifyRightGUTALeftEndCapCircuitInputV2<F, Hash> {
     pub fn get_guta_header_b(&self) -> GlobalUserTreeAggregatorHeader<F, Hash> {
@@ -168,9 +179,7 @@ pub struct GUTAVerifyTwoEndCapCircuitInputV2<F, Hash> {
     pub right_global_user_tree_delta_merkle_proof: DeltaMerkleProofCore<Hash>,
 }
 
-
 impl<F: QFelt, Hash: Copy> GUTAVerifyTwoEndCapCircuitInputV2<F, Hash> {
-
     pub fn get_end_cap_result_a(&self) -> PUPSEndCapResultCompact<F, Hash> {
         PUPSEndCapResultCompact {
             start_user_leaf_hash: self.left_global_user_tree_delta_merkle_proof.old_value,
@@ -231,14 +240,16 @@ impl<F: QFelt, Hash: Copy> GUTAVerifyTwoEndCapCircuitInputV2<F, Hash> {
     }
 }
 
-
 impl<F: QFelt64, Hash: QFHashBase<F>> GUTAVerifyTwoEndCapCircuitInputV2<F, Hash> {
-    pub fn get_public_inputs_hash_no_rewards_tag<Hasher: FieldQHasher<F, Hash>>(&self, global_user_tree_height: usize, guta_circuit_whitelist: Hash) -> Hash {
+    pub fn get_public_inputs_hash_no_rewards_tag<Hasher: FieldQHasher<F, Hash>>(
+        &self,
+        global_user_tree_height: usize,
+        guta_circuit_whitelist: Hash,
+    ) -> Hash {
         let new_guta_header = self.get_new_guta_header(global_user_tree_height, guta_circuit_whitelist);
         new_guta_header.qfhash::<Hasher>()
     }
 }
-
 
 // START SERIALIZATION HELPERS
 // ================================================================================================
@@ -266,9 +277,9 @@ impl<F: QFelt64, Hash: Q256BitHash> PsyCanonicalSerializeMetadata for GUTAVerify
 
 impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for GUTAVerifyLeftGUTARightEndCapCircuitInputV2<F, Hash> {
     fn fallback_pio_serialized_size(&self) -> usize {
-        self.left_header.pio_serialized_size() +
-        self.right_end_cap.pio_serialized_size() +
-        self.right_global_user_tree_delta_merkle_proof.pio_serialized_size()
+        self.left_header.pio_serialized_size()
+            + self.right_end_cap.pio_serialized_size()
+            + self.right_global_user_tree_delta_merkle_proof.pio_serialized_size()
     }
 
     fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
@@ -309,7 +320,6 @@ pser::impl_psy_ser_basic_tests_fallback!(
     guta_verify_left_guta_right_end_cap_circuit_input_v2_tests
 );
 
-
 // ================================================================================================
 // GUTAVerifyRightGUTALeftEndCapCircuitInputV2
 // ================================================================================================
@@ -336,10 +346,10 @@ impl<F: QFelt64, Hash: Q256BitHash> PsyCanonicalSerializeMetadata for GUTAVerify
 
 impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for GUTAVerifyRightGUTALeftEndCapCircuitInputV2<F, Hash> {
     fn fallback_pio_serialized_size(&self) -> usize {
-        self.left_end_cap.pio_serialized_size() +
-        self.left_global_user_tree_delta_merkle_proof.pio_serialized_size() +
-        self.left_historical_checkpoint_merkle_proof.pio_serialized_size() +
-        self.right_header.pio_serialized_size()
+        self.left_end_cap.pio_serialized_size()
+            + self.left_global_user_tree_delta_merkle_proof.pio_serialized_size()
+            + self.left_historical_checkpoint_merkle_proof.pio_serialized_size()
+            + self.right_header.pio_serialized_size()
     }
 
     fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
@@ -383,7 +393,6 @@ pser::impl_psy_ser_basic_tests_fallback!(
     guta_verify_right_guta_left_end_cap_circuit_input_v2_tests
 );
 
-
 // ================================================================================================
 // GUTAVerifyTwoEndCapCircuitInputV2
 // ================================================================================================
@@ -410,10 +419,10 @@ impl<F: QFelt64, Hash: Q256BitHash> PsyCanonicalSerializeMetadata for GUTAVerify
 
 impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for GUTAVerifyTwoEndCapCircuitInputV2<F, Hash> {
     fn fallback_pio_serialized_size(&self) -> usize {
-        self.left_end_cap.pio_serialized_size() +
-        self.left_global_user_tree_delta_merkle_proof.pio_serialized_size() +
-        self.right_end_cap.pio_serialized_size() +
-        self.right_global_user_tree_delta_merkle_proof.pio_serialized_size()
+        self.left_end_cap.pio_serialized_size()
+            + self.left_global_user_tree_delta_merkle_proof.pio_serialized_size()
+            + self.right_end_cap.pio_serialized_size()
+            + self.right_global_user_tree_delta_merkle_proof.pio_serialized_size()
     }
 
     fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
@@ -446,10 +455,7 @@ psy_serialize::impl_psy_canonical_serialize_for_speedy!(
 );
 
 #[cfg(not(all(feature = "serialize_speedy", target_endian = "little")))]
-impl<F: QFelt64, Hash: Q256BitHash> psy_serialize::AutoImplementFallbackPsySerializeCanonical
-    for GUTAVerifyTwoEndCapCircuitInputV2<F, Hash>
-{
-}
+impl<F: QFelt64, Hash: Q256BitHash> psy_serialize::AutoImplementFallbackPsySerializeCanonical for GUTAVerifyTwoEndCapCircuitInputV2<F, Hash> {}
 
 pser::impl_psy_ser_basic_tests_fallback!(
     GUTAVerifyTwoEndCapCircuitInputV2,

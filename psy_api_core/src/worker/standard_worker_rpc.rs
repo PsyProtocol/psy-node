@@ -1,5 +1,5 @@
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
-use parth_core::{crypto::secp256k1::{QEDCompressedSecp256K1Signature, SimpleTimedRequest}, node::realm_identifier::QRealmIdentifier, protocol::core_types::QDBHashBase};
+use parth_core::{crypto::secp256k1::{QEDCompressedSecp256K1Signature, SimpleTimedRequest}, node::realm_identifier::QRealmIdentifier};
 use psy_data::worker::api_response::{PsyWorkerGetProvingWorkAPIResponse, PsyWorkerGetProvingWorkWithChildProofsAPIResponse};
 
 

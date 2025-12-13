@@ -76,6 +76,6 @@ coordinator_api_urls:
 realm_api_urls:
 - http://localhost:9000
         "#;
-        let deserialized_config: WorkerCliConfig = serde_yaml::from_str(&allowed_ok).unwrap();
+        let _deserialized_config: WorkerCliConfig = serde_yaml::from_str(&allowed_ok).unwrap();
     }
 }

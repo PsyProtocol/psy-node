@@ -2,12 +2,9 @@ use std::sync::Arc;
 
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use parth_core::{node::realm_identifier::QRealmIdentifier, protocol::core_types::QNetworkTypesConfigHelper};
-use plonky2::plonk::config::PoseidonGoldilocksConfig;
-use psy_api_core::coordinator::standard_edge_rpc::CoordinatorEdgeRpcClient;
 use psy_core::{job::job_id::QProvingJobDataID, network_config::PsyNetworkLocalDevnetConstants};
 use psy_data::{
-    config::network_config::PsyNodeCircuitFingerprintConfigProvider, gatherer_builders::deploy_contract,
-    genesis::genesis_block_setup::PsyGenesisBlockSetupDataProvider,
+    config::network_config::PsyNodeCircuitFingerprintConfigProvider, genesis::genesis_block_setup::PsyGenesisBlockSetupDataProvider,
 };
 use psy_io::tokio::{TokioLikeFileSystem, TokioStdFileSystem};
 use psy_node_common::{coordinator::processor::create::create_coordinator_processor_and_run, p2p::realm_coordinator::PsyRealmCoordinatorClientAPI, realm::processor::create::create_realm_processor_and_run};
@@ -16,15 +13,9 @@ use psy_node_nats::psy_queue::setup_nats_psy_queue_from_connection_str;
 use psy_node_redis::store::{new_redis_async_pool, StandardRedisStore};
 use psy_node_scylla::psy_setup::setup_psy_scylla_database_store_from_connection_string;
 use psy_plonky2_circuits::{
-    circuit_library::get_plonky2_circuit_library_and_prover_for_network, node::config::networks::resolver::PsyPlonky2NodeConfigResolver,
+    node::config::networks::resolver::PsyPlonky2NodeConfigResolver,
     protocol_types::ZKTypesPlonky2GoldilocksPoseidon,
 };
-
-type F = parth_core::PF;
-type Hash = parth_core::pgoldilocks::QHashOut<F>;
-type C = PoseidonGoldilocksConfig;
-
-const D: usize = 2;
 
 pub async fn run_startup_plonky2_scylla_coordinator_processor_node(config: &CoordinatorProcessorStartConfig) -> anyhow::Result<()> {
     let resolver = PsyPlonky2NodeConfigResolver {};

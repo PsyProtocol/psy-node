@@ -1,18 +1,13 @@
-use std::{
-    env,
-    time::{Duration, Instant},
-};
+use std::
+    time::{Duration, Instant}
+;
 
-use async_nats::{
+use async_nats::
     jetstream::{
         self,
-        consumer::{pull::Config as PullConfig, PullConsumer},
-        kv::Store,
-    },
-    Subject, ToServerAddrs,
-};
-use bytes::Bytes;
-use futures::{stream::FuturesUnordered, StreamExt};
+        consumer::pull::Config as PullConfig,
+    }
+;
 use parth_core::data::queue::queue_key::{PCoreSubjectQueueBase, QPBaseQueueType, QPStandardUniqueIdQueueKey};
 use psy_node_nats::queue::{JetStreamAckMode, NatsJetStreamClient};
 use psy_core::job::job_id::QProvingJobDataID;
@@ -24,7 +19,7 @@ async fn main() -> Result<(), async_nats::Error> {
     let base_namespace = "EX_JOB_STREAM".to_string();
     let realm_id = 1u64;
     let realm_sub_id = 1u64;
-    let ex_queue_type = 1337u32;
+    //let ex_queue_type = 1337u32;
     let task_group = 1u64;
 
     let timeout_ms = 5000u64;
@@ -60,7 +55,7 @@ async fn main() -> Result<(), async_nats::Error> {
     let subject = qk.get_queue_subject(&base_namespace, realm_id, realm_sub_id, unique_id, task_group as u32);
     let durable_name = qk.get_durable_name(&base_namespace, realm_id, realm_sub_id, unique_id, task_group as u32);
 
-    for i in 0..=4 {
+    for _ in 0..=4 {
         let client = NatsJetStreamClient::new_connection(
             base_namespace.clone(),
             "localhost:4222".to_string(),
@@ -86,7 +81,7 @@ async fn main() -> Result<(), async_nats::Error> {
 
     */
 
-    let payload = Bytes::from(vec![0; 1000]);
+    //let payload = Bytes::from(vec![0; 1000]);
 
     let mut join_set = JoinSet::new();
 

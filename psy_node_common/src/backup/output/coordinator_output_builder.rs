@@ -26,7 +26,7 @@ use psy_data::{
         populated_checkpoint::PsyCheckpointLeafPopulated,
     },
     worker::{
-        metadata::{PROOF_REWARD_TREE_HASH_MODE_3_CHILDREN_DOUBLE_REWARD, PROOF_REWARD_TREE_HASH_MODE_HASH_CHILDREN_STANDARD, PROOF_REWARD_TREE_HASH_MODE_LIFT_CHILD, PsyProvingJobMetadata},
+        metadata::{PROOF_REWARD_TREE_HASH_MODE_3_CHILDREN_DOUBLE_REWARD, PROOF_REWARD_TREE_HASH_MODE_LIFT_CHILD, PsyProvingJobMetadata},
         metadata_with_job_id::PsyProvingJobMetadataWithJobId,
     },
 };

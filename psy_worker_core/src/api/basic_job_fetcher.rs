@@ -173,7 +173,7 @@ impl<
 
         let realm_has_urls = self.realm_api_url_manager.has_urls();
         let coord_has_urls = self.coordinator_api_url_manager.has_urls();
-        let mut is_in_realm_mode = match (realm_has_urls, coord_has_urls) {
+        let is_in_realm_mode = match (realm_has_urls, coord_has_urls) {
             (true, false) => true,
             (false, true) => false,
             (true, true) => self.is_in_realm_mode.load(std::sync::atomic::Ordering::SeqCst),

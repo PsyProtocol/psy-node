@@ -1,6 +1,6 @@
 use cf_utils::timer::DebugTimer;
 use parth_core::pgoldilocks::QHashOut;
-use plonky2::{field::goldilocks_field::GoldilocksField, hash::poseidon::Poseidon, plonk::{config::{GenericConfig, PoseidonGoldilocksConfig}, proof::ProofWithPublicInputs}};
+use plonky2::{field::goldilocks_field::GoldilocksField, plonk::{config::{GenericConfig, PoseidonGoldilocksConfig}, proof::ProofWithPublicInputs}};
 use psy_plonky2_circuits::end_cap::dummy::DummyUPSStandardEndCapCircuit;
 
 fn serialize_deserialize_round_trip_bincode<C: GenericConfig<D>, const D: usize>(proof: &ProofWithPublicInputs<C::F, C, D>) -> anyhow::Result<()>{

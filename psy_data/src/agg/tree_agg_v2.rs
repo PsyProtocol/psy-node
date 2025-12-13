@@ -16,74 +16,6 @@ pub trait BasicTreePlannerHelper<JobId, Hash, LeafWitness, AggWitness, DummyWitn
     fn create_agg_to_agg_witness(left: &AggWitness, right: &AggWitness) -> AggWitness;
 }
 
-/*
-
-
-pub const PROOF_REWARD_TREE_HASH_MODE_HASH_CHILDREN_STANDARD: u8 = 0;
-pub const PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN: u8 = 1;
-pub const PROOF_REWARD_TREE_HASH_MODE_3_CHILDREN_DOUBLE_REWARD: u8 = 2;
-pub const PROOF_REWARD_TREE_HASH_MODE_LIFT_CHILD: u8 = 3;
-
-#[pderive::serialize_clone_hash_job_id_ts]
-#[ts(export, concrete(Hash = parth_core::PHash, JobId = QProvingJobDataID))]
-#[repr(C)]
-pub struct PsyProvingJobMetadata<Hash, JobId> {
-    pub expected_public_inputs_hash: Hash,
-    pub reward_tree_node_index: u64,
-    pub reward_tree_node_level: u8,
-    pub reward_tree_hash_mode: u8,      // How to hash this node's children when computing the reward tree hash
-    pub reward_tree_node_children: u16, // Number of children this node has in the reward tree, used to hint at how to hash
-    pub dependencies: Vec<JobId>,
-}
-
-
-*/
-
-fn plan_jobs_for_tree_agg_old<
-    JobId: QJobIdBase,
-    F: QFelt64,
-    Hash: QFHashBase<F> + Q256BitHash,
-    Hasher: FieldQHasher<F, Hash>,
-    LeafWitness: PCircuitWitness<F, Hash> + PsySerializeCanonicalAsyncSafe,
-    PlannerHelper: BasicTreePlannerHelper<JobId, Hash, LeafWitness, AggStateTransitionInputV2<Hash>, DummyAggStateTransition<Hash>>,
->(
-    unique_checkpoint_id: u64,
-    start_tree_root: Hash,
-    allowed_circuit_hashes_root: Hash,
-    leaves: &[LeafWitness],
-) -> anyhow::Result<(Vec<Vec<PsyProvingJobMetadataWithJobId<Hash, JobId>>>, Vec<(JobId, Vec<u8>)>)> {
-    if leaves.len() == 0{
-        let dummy_job_id = PlannerHelper::get_dummy_job_id(unique_checkpoint_id);
-        let dummy_witness = PlannerHelper::create_dummy_witness(allowed_circuit_hashes_root, start_tree_root);
-        let metadata = PsyProvingJobMetadata {
-            expected_public_inputs_hash: dummy_witness.get_expected_public_inputs_hash::<Hasher>(),
-            reward_tree_node_index: 0,
-            reward_tree_node_level: 0,
-            reward_tree_hash_mode: PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN,
-            reward_tree_node_children: 0,
-            dependencies: vec![]
-        };
-        let queue_item = PsyProvingJobMetadataWithJobId{
-            job_id: dummy_job_id.output_proof_id(),
-            metadata,
-        };
-        let dummy_witness_bytes = dummy_witness.psy_ser_into_bytes_vec()?;
-        return Ok((
-            vec![vec![queue_item]],
-            vec![(dummy_job_id.input_witness_id(), dummy_witness_bytes)]
-        ))
-    }
-
-
-    /*
-    
-    
-     */
-
-
-
-    todo!()
-}
 
 
 use anyhow::{anyhow, Result};
@@ -117,9 +49,9 @@ fn build_subtree<'a, JobId: QJobIdBase, F: QFelt64, Hash: QFHashBase<F> + Q256Bi
 ) -> Result<(JobId, Wit<'a, Hash, LeafWitness>)> {
     let node_key = SimpleMerkleNodeKey { level, index };
     let mut deps = vec![];
-    let mut hash_mode: u8 = 0;
-    let mut num_children: u16 = 0;
-    let mut job_id: JobId;
+    let hash_mode: u8;
+    let num_children: u16;
+    let job_id: JobId;
     let wit: Wit<'a, Hash, LeafWitness>;
 
     if num == 1 {
@@ -247,9 +179,9 @@ fn build_subtree_with_offset_root<'a, JobId: QJobIdBase, F: QFelt64, Hash: QFHas
 ) -> Result<(JobId, Wit<'a, Hash, LeafWitness>)> {
     let node_key = SimpleMerkleNodeKey { level, index };
     let mut deps = vec![];
-    let mut hash_mode: u8 = 0;
-    let mut num_children: u16 = 0;
-    let mut job_id: JobId;
+    let hash_mode: u8;
+    let num_children: u16;
+    let job_id: JobId;
     let wit: Wit<'a, Hash, LeafWitness>;
 
     if num == 1 {

@@ -21,7 +21,7 @@ use psy_data::{
     proof_input::guta::{VerifyTwoGUTAProofUpgradeCheckpointStandardInput, VerifyTwoGUTAProofUpgradeCheckpointStandardInputSimple},
     worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse,
 };
-use psy_plonky2_basic_helpers::{builder::{hash::core::CircuitBuilderHashCore, pad_circuit::{PsyCircuitBuilderGateCountPrinter, pad_circuit_degree}}, verifier::circuit_library::CircuitInfoLibrary};
+use psy_plonky2_basic_helpers::{builder::{hash::core::CircuitBuilderHashCore, pad_circuit::PsyCircuitBuilderGateCountPrinter}, verifier::circuit_library::CircuitInfoLibrary};
 use psy_plonky2_common_circuits::hash::merkle::gadgets::historical_root_merkle_proof::HistoricalRootMerkleProofGadget;
 use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 

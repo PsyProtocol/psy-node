@@ -1,6 +1,6 @@
 use cf_utils::timer::DebugTimer;
 use jsonrpsee::{
-    RpcModule, core::RpcResult, http_client::{HttpClient, HttpClientBuilder}, proc_macros::rpc, server::{ServerBuilder, ServerHandle}, ws_client::{WsClient, WsClientBuilder}
+    RpcModule, core::RpcResult, http_client::{HttpClient, HttpClientBuilder}, proc_macros::rpc, server::ServerBuilder, ws_client::WsClientBuilder
 };
 use std::net::SocketAddr;
 use tower_http::cors::{Any, CorsLayer};

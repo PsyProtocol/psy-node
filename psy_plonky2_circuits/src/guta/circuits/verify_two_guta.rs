@@ -20,10 +20,9 @@ use psy_data::{
         VerifyTwoGUTAProofGadgetStandardInputSimple,
     }, worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse}
 ;
-use psy_plonky2_basic_helpers::{
-    builder::pad_circuit::pad_circuit_degree,
-    verifier::circuit_library::CircuitInfoLibrary,
-};
+use psy_plonky2_basic_helpers::
+    verifier::circuit_library::CircuitInfoLibrary
+;
 use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 
 use crate::{

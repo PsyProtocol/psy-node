@@ -13,15 +13,11 @@ use psy_plonky2_basic_helpers::{lookalike::standard::get_end_cap_type_e_common_d
 use psy_worker_core::worker::prover_trait::{PsyWorkerGenericLibraryProver, PsyWorkerGenericLibraryProverInfoProvider};
 
 use super::circuits::{
-    guta_no_change::GUTANoChangeCircuit, only_register_users::GUTAOnlyRegisterUsersCircuit,
-    verify_guta_and_register_users::GUTAVerifyGUTARegisterUsersCircuit, verify_guta_to_cap::GUTAVerifyGUTAToCapCircuit,
-    verify_left_end_cap_right_guta::GUTAVerifyLeftEndCapRightGUTACircuit, verify_left_guta_right_end_cap::GUTAVerifyLeftGUTARightEndCapCircuit,
-    verify_single_end_cap::GUTAVerifySingleEndCapCircuit, verify_two_end_cap::GUTAVerifyTwoEndCapCircuit, verify_two_guta::GUTAVerifyTwoGUTACircuit,
+    guta_no_change::GUTANoChangeCircuit, verify_guta_to_cap::GUTAVerifyGUTAToCapCircuit,
 };
-use crate::{guta::circuits::{
-    verify_guta_to_cap_upgrade_checkpoint::GUTAVerifyGUTAToCapUpgradeCheckpointCircuit,
-    verify_two_guta_upgrade_checkpoint::GUTAVerifyTwoGUTAUpgradeCheckpointCircuit,
-}, guta_v2::circuits::{verify_guta_left_linear_right_leaf_upgrade_checkpoint::GUTAVerifyLeftLinearRightLeafUpgradeCheckpointCircuit, verify_guta_linear_transition::{self, GUTAVerifyTwoGUTALinearCircuit}, verify_guta_linear_transition_upgrade_checkpoint::{self, GUTAVerifyTwoGUTALinearUpgradeCheckpointCircuit}, verify_left_guta_right_end_cap::GUTAVerifyLeftGUTARightEndCapCircuitV2, verify_single_end_cap::GUTAVerifySingleEndCapCircuitV2, verify_two_end_cap::GUTAVerifyTwoEndCapCircuitV2, verify_two_guta::GUTAVerifyTwoGUTACircuitV2, verify_two_guta_upgrade_checkpoint::GUTAVerifyTwoGUTAUpgradeCheckpointCircuitV2}, qstandard::{QStandardCircuit, QStandardCircuitProvableWithRawProofsAndRefLibrary}, utils::proof_serialization::serialize_plonky2_proof};
+use crate::{guta::circuits::
+    verify_guta_to_cap_upgrade_checkpoint::GUTAVerifyGUTAToCapUpgradeCheckpointCircuit
+, guta_v2::circuits::{verify_guta_left_linear_right_leaf_upgrade_checkpoint::GUTAVerifyLeftLinearRightLeafUpgradeCheckpointCircuit, verify_guta_linear_transition::GUTAVerifyTwoGUTALinearCircuit, verify_guta_linear_transition_upgrade_checkpoint::GUTAVerifyTwoGUTALinearUpgradeCheckpointCircuit, verify_left_guta_right_end_cap::GUTAVerifyLeftGUTARightEndCapCircuitV2, verify_single_end_cap::GUTAVerifySingleEndCapCircuitV2, verify_two_end_cap::GUTAVerifyTwoEndCapCircuitV2, verify_two_guta::GUTAVerifyTwoGUTACircuitV2, verify_two_guta_upgrade_checkpoint::GUTAVerifyTwoGUTAUpgradeCheckpointCircuitV2}, qstandard::{QStandardCircuit, QStandardCircuitProvableWithRawProofsAndRefLibrary}, utils::proof_serialization::serialize_plonky2_proof};
 
 #[derive(Debug)]
 pub struct QEDGUTACircuitManager<C: GenericConfig<D> + 'static, const D: usize>
@@ -102,11 +98,11 @@ where
         global_user_tree_height: usize,
         guta_circuit_whitelist_tree_height: u8,
         checkpoint_tree_height: usize,
-        group_realm_height: usize,
-        max_users_to_register_per_proof: usize,
-        only_register_max_users_per_proof: usize,
+        _group_realm_height: usize,
+        _max_users_to_register_per_proof: usize,
+        _only_register_max_users_per_proof: usize,
         known_end_cap_fingerprint: QHashOut<C::F>,
-        default_user_state_tree_root: QHashOut<C::F>,
+        _default_user_state_tree_root: QHashOut<C::F>,
         worker_reward_tag: QHashOut<C::F>,
     ) -> Self {
 

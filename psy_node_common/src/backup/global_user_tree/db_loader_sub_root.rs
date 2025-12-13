@@ -22,10 +22,6 @@ pub async fn fetch_global_user_tree_from_db_with_sub_root<
 ) -> anyhow::Result<SimpleMemoryMerkleRecorderStore<Hasher, Hash>> {
     let mut timer = TraceTimer::new("fetch_global_user_tree_from_db");
 
-    let leaf_level = tree_height - sub_root.level;
-    let total_user_ids = 1u64 << leaf_level;
-
-
     tracing::info!(
         "Fetching global user tree nodes from DB (checkpoint_id={}, tree_height={}, sub_root={:?}, user_id_range=[{}, {}), fetch_batch_size={})",
         checkpoint_id,

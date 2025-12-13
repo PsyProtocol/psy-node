@@ -1,7 +1,7 @@
 
-use psy_node_cli::node::startup_plonky2_scylla::{run_startup_plonky2_scylla_coordinator_processor_node, run_startup_plonky2_scylla_realm_processor_node};
-use psy_node_core::config::node_start_config::{CoordinatorProcessorStartConfig, RealmProcessorStartConfig};
-use tracing::{error, info};
+use psy_node_cli::node::startup_plonky2_scylla::run_startup_plonky2_scylla_realm_processor_node;
+use psy_node_core::config::node_start_config::RealmProcessorStartConfig;
+use tracing::info;
 
 fn print_banner() {
     println!(

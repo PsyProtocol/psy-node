@@ -1,5 +1,4 @@
 use core::marker::PhantomData;
-use itertools::unfold;
 use plonky2::util::serialization::{Buffer, IoResult, Read, Write};
 
 use plonky2::field::extension::Extendable;
@@ -339,7 +338,7 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
         let limb_base = 1 << U32AddManyGate::<F, D>::limb_bits();
 
         let split_to_limbs = |mut val, num| {
-            unfold((), move |_| {
+            core::iter::from_fn(move || {
                 let ret = val % limb_base;
                 val /= limb_base;
                 Some(ret)
@@ -443,7 +442,7 @@ mod tests {
                 let output_carry = output >> 32;
 
                 let split_to_limbs = |mut val, num| {
-                    unfold((), move |_| {
+                    core::iter::from_fn(move || {
                         let ret = val % limb_base;
                         val /= limb_base;
                         Some(ret)

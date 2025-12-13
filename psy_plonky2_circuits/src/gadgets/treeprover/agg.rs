@@ -10,7 +10,7 @@ use plonky2::{
         proof::{ProofWithPublicInputs, ProofWithPublicInputsTarget},
     },
 };
-use psy_data::{agg::{AggStateTransition, TPAltCircuitFingerprintConfig, TPCircuitFingerprintConfig}, rewards_tree};
+use psy_data::agg::{AggStateTransition, TPAltCircuitFingerprintConfig, TPCircuitFingerprintConfig};
 
 use crate::gadgets::treeprover::{AggStateTransitionGadget, check_agg_state_transition_proof_validity};
 #[derive(Debug, Clone)]

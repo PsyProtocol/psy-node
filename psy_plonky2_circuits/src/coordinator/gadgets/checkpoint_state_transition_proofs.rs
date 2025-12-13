@@ -1,4 +1,4 @@
-use parth_core::{node::traits::worker, pgoldilocks::QHashOut};
+use parth_core::pgoldilocks::QHashOut;
 use plonky2::{
     field::extension::Extendable,
     hash::hash_types::{HashOutTarget, RichField},
@@ -14,7 +14,7 @@ use psy_core::constants::protocol::DA_CHALLENGE_WINDOW;
 use psy_data::{
     agg::AggStateTransition,
     guta::header::GlobalUserTreeAggregatorHeader,
-    v1::qdata::{checkpoint::PQEDCheckpointLeafStats, pm_rewards_commitment::PPMRewardCommitment},
+    v1::qdata::checkpoint::PQEDCheckpointLeafStats,
 };
 use psy_plonky2_basic_helpers::builder::{
     comparison::CircuitBuilderComparison, hash::core::CircuitBuilderHashCore, verify::CircuitBuilderVerifyProofHelpers,
@@ -27,7 +27,7 @@ use crate::{
         checkpoint::QEDCheckpointLeafGadget, checkpoint_state_roots::QEDCheckpointGlobalStateRootsGadget,
         checkpoint_stats::QEDCheckpointLeafStatsGadget, pm_jobs_completed_stats::PMJobsCompletedStatsGadget,
         pm_reward_commitment::PMRewardCommitmentGadget,
-    }, tag_tree::{hash_tag_tree_node_circuit, hash_tag_tree_node_single_circuit}},
+    }, tag_tree::hash_tag_tree_node_single_circuit},
 };
 
 #[derive(Debug, Clone)]

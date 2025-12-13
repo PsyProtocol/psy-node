@@ -142,7 +142,7 @@ mod tests {
         let guta_height = 1u8;
         let leaf_1 = SimpleMerkleNodeKey::new(guta_height, 0);
         let leaf_2 = SimpleMerkleNodeKey::new(guta_height, 1);
-        let mut tree = SimpleDashTagTreeStore::<Hasher, Hash>::new(guta_height);
+        let tree = SimpleDashTagTreeStore::<Hasher, Hash>::new(guta_height);
         let tag_1 = Hash::from_u64_le_values(1, 2, 3, 4);
         let tag_2 = Hash::from_u64_le_values(5, 6, 7, 8);
         let tag_root = Hash::from_u64_le_values(9, 10, 11, 12);
@@ -182,7 +182,7 @@ mod tests {
         let group_levels = generate_nca_tree_groups_v1(&leaves, guta_height);
         assert_eq!(group_levels.len(), 3);
         let tree_height = group_levels.len()-1;
-        let mut simple_tree = SimpleDashTagTreeStore::<Hasher, Hash>::new(tree_height as u8);
+        let simple_tree = SimpleDashTagTreeStore::<Hasher, Hash>::new(tree_height as u8);
         let mut hash_map_dat = HashMap::<SimpleMerkleNodeKey, SimpleMerkleNodeKey>::new();
         for (level, gl) in group_levels.iter().enumerate() {    
             for (index, g) in gl.iter().enumerate() {
@@ -218,7 +218,7 @@ mod tests {
         let tree_height = group_levels.len()-1;
         assert_eq!(e_group_levels, group_levels);
         assert_eq!(group_levels.len(), 3);
-        let mut simple_tree = SimpleDashTagTreeStore::<Hasher, Hash>::new(tree_height as u8);
+        let simple_tree = SimpleDashTagTreeStore::<Hasher, Hash>::new(tree_height as u8);
         let mut hash_map_dat = HashMap::<SimpleMerkleNodeKey, SimpleMerkleNodeKey>::new();
         for (level, gl) in group_levels.iter().enumerate() {    
             for (index, g) in gl.iter().enumerate() {
@@ -245,7 +245,7 @@ mod tests {
         let group_levels = generate_nca_tree_groups_v1(&leaves, guta_height);
 
         let tree_height = group_levels.len() - 1;
-        let mut simple_tree = SimpleDashTagTreeStore::<Hasher, Hash>::new(tree_height as u8);
+        let simple_tree = SimpleDashTagTreeStore::<Hasher, Hash>::new(tree_height as u8);
 
         let mut hash_map_dat = HashMap::<SimpleMerkleNodeKey, SimpleMerkleNodeKey>::new();
 

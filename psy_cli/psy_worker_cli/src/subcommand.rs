@@ -1,6 +1,5 @@
-use clap::{Parser, Subcommand, ValueEnum, command};
+use clap::{Parser, Subcommand};
 use psy_core::constants::chain_id::PsyNetworkTypeInput;
-use serde::{Deserialize, Serialize};
 
 pub mod worker;
 pub mod worker_test;

@@ -1,7 +1,7 @@
 use anyhow::Ok;
 use parth_common::secp256k1::MemorySecp256K1Wallet;
 use parth_core::{crypto::hash::traits::{FieldQHasher, MerkleZeroHasher}, data::hash::hash256::Hash256, felt::QFelt64, pgoldilocks::{PoseidonHasher, QHashOut, QRichField}, protocol::core_types::{Q256BitHash, QFHashBase}};
-use plonky2::{hash::hash_types::{HashOut, RichField}, plonk::config::{AlgebraicHasher, GenericConfig}};
+use plonky2::{hash::hash_types::HashOut, plonk::config::{AlgebraicHasher, GenericConfig}};
 use psy_core::{constants::chain_id::PsyChainNetworkType, job::job_id::QProvingJobDataID};
 use psy_plonky2_basic_helpers::verifier::simple_circuit_library::SimpleCircuitLibrary;
 use psy_worker_core::{api::{basic_job_fetcher::PsyWorkerBasicAPIJobFetcher, url_manager::APIURLRotationStrategy}, config::worker_config::WorkerStartupConfig, worker::manager::PsyProofMinerWorkerManager};

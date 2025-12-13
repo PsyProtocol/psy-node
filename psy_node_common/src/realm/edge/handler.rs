@@ -1,16 +1,15 @@
 use std::{sync::Arc, u64};
 
 use async_trait::async_trait;
-use dashmap::DashMap;
 use jsonrpsee::core::RpcResult;
 use parth_core::{
     QProvingJobDataIDWithRewardPath, crypto::{
         hash::{
-            merkle_proof::{MerkleProofCore, compute_historical_and_current_merkle_roots_core_gt},
+            merkle_proof::MerkleProofCore,
             traits::{MerkleZeroHasher, QFieldHashable, ZeroableHash},
         },
         secp256k1::{QEDCompressedSecp256K1Signature, SimpleTimedRequest},
-    }, data::{hash::{merkle_node_key::SimpleMerkleNodeKey, merkle_store_key::{QMerkleStoreDoubleIdKey, QMerkleStoreSingleIdKey}}, queue::queue_key::QPBaseQueueType}, felt::ToU64Value, node::realm_identifier::QRealmIdentifier, protocol::core_types::{QNetworkDatabaseTypes, QNetworkTypesConfig, QZKProofPublicInputsHasherReader, QZKProofVerifier}, store::tag_tree_store
+    }, data::{hash::{merkle_node_key::SimpleMerkleNodeKey, merkle_store_key::{QMerkleStoreDoubleIdKey, QMerkleStoreSingleIdKey}}, queue::queue_key::QPBaseQueueType}, felt::ToU64Value, node::realm_identifier::QRealmIdentifier, protocol::core_types::{QNetworkTypesConfig, QZKProofPublicInputsHasherReader, QZKProofVerifier}
 };
 use psy_api_core::{realm::standard_edge_rpc::RealmEdgeRpcServer, worker::standard_worker_rpc::NodeEdgeWorkerRpcServer};
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
@@ -22,26 +21,24 @@ use psy_data::{
         qdata::{
             checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState},
             contract::{DashMapContractHeightCache, PSimpleContractHeightCache},
-            user::{self, PQEDUserLeaf},
+            user::PQEDUserLeaf,
         },
     },
     worker::api_response::{PsyWorkerGetProvingWorkAPIResponse, PsyWorkerGetProvingWorkWithChildProofsAPIResponse},
 };
 use psy_node_core::{
-    psy_core_db::{
-        traits::full::{PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmEdgeAPIStoreReader},
-        v3_implementation::full::PsyUnifiedCoreDatabaseStore,
-    },
-    psy_temp_db::{QTempDBPendingIdReader, StandardEdgeAPITempDBStoreBase},
+    psy_core_db::
+        traits::full::{PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmEdgeAPIStoreReader}
+    ,
+    psy_temp_db::StandardEdgeAPITempDBStoreBase,
     qblob::structs::common::blob_metadata_header::QBlobWriterContextMetadataHeader,
     queue::{
-        ephemeral::{QStandardEphemeralQueuePublisher, QStandardEphemeralQueueSubscriber},
+        ephemeral::QStandardEphemeralQueuePublisher,
         worker_queue::QStandardWorkerQueueSubscriber,
     },
-    store::traits::{
-        core_db::{CoreDatabaseStoreComboImpl, CoreDatabaseTableConfig},
-        proof_store::QParthProofStore,
-    },
+    store::traits::
+        proof_store::QParthProofStore
+    ,
 };
 
 use crate::realm::{

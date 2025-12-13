@@ -1,6 +1,5 @@
 use parth_common::memory_stores::mem_tree_recorder::SimpleMemoryMerkleRecorderStore;
 use parth_core::{crypto::hash::traits::MerkleZeroHasher, data::hash::merkle_node_key::SimpleMerkleNodeKey};
-use psy_common::store::psy_db::user;
 use psy_node_core::psy_core_db::traits::full::PsyNodeUserRegistrationTreeDatabaseReader;
 
 pub async fn load_append_only_user_registration_tree_into_memory<
@@ -16,7 +15,7 @@ pub async fn load_append_only_user_registration_tree_into_memory<
     fetch_batch_size: usize,
 ) -> anyhow::Result<()> {
     let first = user_db_reader.user_registration_tree_get_merkle_proof(checkpoint_id, start_index).await?;
-    tree.injest_merkle_proof(&first);
+    tree.injest_merkle_proof(&first)?;
 
     let tree_height = tree.get_height();
     let complete_batches = (end_index - start_index) / fetch_batch_size as u64;
@@ -62,7 +61,7 @@ pub async fn load_append_only_user_registration_tree_into_memory<
             tree.set_leaf(keys[i].index, *node);
         }
     }
-    tree.injest_merkle_proof(&first);
+    tree.injest_merkle_proof(&first)?;
     let last = user_db_reader.user_registration_tree_get_merkle_proof(checkpoint_id, end_index).await?;
     tree.injest_merkle_proof(&last)?;
 

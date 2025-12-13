@@ -159,14 +159,15 @@ mod tests {
         let mut contract_trees = (0..5)
             .map(|i| {
                 let contract_state_tree_height = 24 + i as u8;
-                let mut tree = SimpleMemoryMerkleStoreV3::<Hasher, Hash>::new(contract_state_tree_height);
-                let max_leaf_id = 1u64 << contract_state_tree_height;
+                let tree = SimpleMemoryMerkleStoreV3::<Hasher, Hash>::new(contract_state_tree_height);
+                //let max_leaf_id = 1u64 << contract_state_tree_height;
                 contract_helper.add_contract(0, contract_state_tree_height, tree.get_root());
 
-                for i in 0..1000 {
+                /* 
+                for _ in 0..1000 {
                     let rand_leaf_id = rand::random::<u64>() % max_leaf_id;
                     //tree.set_leaf(rand_leaf_id, Hash::qp_rand_gen());
-                }
+                }*/
                 user_contract_tree.set_leaf(i as u64, tree.get_root());
                 tree
             })
@@ -301,7 +302,7 @@ mod tests {
 
         let res = validate_end_cap_and_generate_node_data_for_edge::<F, Hash, Hasher>(&context, user_id, &end_cap)?;
 
-        let (single_header, single_payload, double_full) =
+        let (_single_header, single_payload, double_full) =
             QBlobSingleMerkleNodeBatchDataView::validate_single_tree_nodes_batch_header_for_realm_context_get_clipped_ref_no_exact_size(
                 &res,
                 context.chain_id,
@@ -310,7 +311,7 @@ mod tests {
                 context.unique_pending_id,
                 QBlobMerkleNodeTreeType::UserContractTree,
             )?;
-        let (double_header, double_payload) = QBlobDoubleMerkleNodeBatchDataView::validate_uct_nodes_batch_header_for_realm_context_get_clipped_ref(
+        let (_double_header, double_payload) = QBlobDoubleMerkleNodeBatchDataView::validate_uct_nodes_batch_header_for_realm_context_get_clipped_ref(
             &double_full,
             context.chain_id,
             context.realm_id,
@@ -325,7 +326,7 @@ mod tests {
             .filter(|x| x.key.level == contract_tree_height)
             .map(|x| *x)
             .collect::<Vec<_>>();
-        let single_leaf_hashes = single_leaf_nodes.iter().map(|x| x.value).collect::<Vec<_>>();
+        let _single_leaf_hashes = single_leaf_nodes.iter().map(|x| x.value).collect::<Vec<_>>();
         assert_eq!(single_leaf_nodes.len(), end_cap.contract_state_updates.len());
 
         let double_nodes = QBlobDoubleMerkleNodeBatchDataView::read_batch_double_nodes_from_checked_payload::<Hash>(double_payload)?;

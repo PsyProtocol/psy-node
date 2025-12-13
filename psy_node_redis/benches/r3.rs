@@ -37,7 +37,7 @@ impl QKVStore {
 impl QKVStoreBase for QKVStore {
     async fn put_owned(&self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
         let mut conn = self.conn.clone();
-        conn.set(key, value).await?;
+        conn.set::<Vec<u8>, Vec<u8>, ()>(key, value).await?;
         Ok(())
     }
 
@@ -45,19 +45,19 @@ impl QKVStoreBase for QKVStore {
         let mut conn = self.conn.clone();
         let item_slices: Vec<(&[u8], &[u8])> =
             items.iter().map(|(k, v)| (k.as_slice(), v.as_slice())).collect();
-        redis::pipe().mset(&item_slices).query_async(&mut conn).await?;
+        redis::pipe().mset::<_, _>(&item_slices).query_async::<()>(&mut conn).await?;
         Ok(())
     }
 
     async fn get_owned(&self, key: Vec<u8>) -> Result<Option<Vec<u8>>> {
         let mut conn = self.conn.clone();
-        let value: Option<Vec<u8>> = conn.get(key).await?;
+        let value: Option<Vec<u8>> = conn.get::<_, _>(key).await?;
         Ok(value)
     }
 
     async fn get_many_owned(&self, keys: Vec<Vec<u8>>) -> Result<Vec<Option<Vec<u8>>>> {
         let mut conn = self.conn.clone();
-        let values: Vec<Option<Vec<u8>>> = conn.get(keys).await?;
+        let values: Vec<Option<Vec<u8>>> = conn.get::<_, _>(keys).await?;
         Ok(values)
     }
 }
@@ -93,6 +93,7 @@ fn generate_kv_data(count: usize, key_len: usize, val_len: usize) -> Vec<(Vec<u8
 }
 
 /// Defines the benchmark suite.
+#[allow(dead_code)]
 pub fn kv_store_benches(c: &mut Criterion) {
     // --- Setup ---
     const CONNECTION_STRING: &str = "redis://127.0.0.1:6379/";
@@ -105,7 +106,7 @@ pub fn kv_store_benches(c: &mut Criterion) {
     // --- Single Operation Benchmarks (Latency-Bound) ---
     let mut group = c.benchmark_group("Single Operations");
 
-    let rt = tokio::runtime::Runtime::new().unwrap();
+    //let rt = tokio::runtime::Runtime::new().unwrap();
     // Benchmark a single PUT operation
     group.bench_function("put_single", |b| {
         b.to_async(tokio::runtime::Runtime::new().unwrap()  ).iter_batched(

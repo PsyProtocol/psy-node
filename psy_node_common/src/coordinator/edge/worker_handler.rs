@@ -18,7 +18,7 @@ use psy_data::{
 };
 use psy_node_core::{
     psy_core_db::traits::full::{PsyCoordinatorEdgeAPIStoreReader, PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter},
-    psy_temp_db::{QTempDBProvingJobMetadataReader, StandardEdgeAPITempDBStoreBase},
+    psy_temp_db::StandardEdgeAPITempDBStoreBase,
     queue::{ephemeral::QStandardEphemeralQueuePublisher, worker_queue::QStandardWorkerQueueSubscriber},
     store::traits::proof_store::QParthProofStore,
 };
@@ -62,7 +62,7 @@ impl<
             .await?
             .is_some())
     }
-    pub async fn get_job_id_submission_status(&self, unique_checkpoint_id: u64, job_id: &N::JobId) -> anyhow::Result<bool> {
+    pub async fn get_job_id_submission_status(&self, _unique_checkpoint_id: u64, _job_id: &N::JobId) -> anyhow::Result<bool> {
         Ok(false)
     }
     pub async fn verify_miner_api_signature_and_check_reputation(

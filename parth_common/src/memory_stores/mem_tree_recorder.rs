@@ -1272,7 +1272,7 @@ mod tests {
     
 
     use cf_utils::timer::DebugTimer;
-    use parth_core::{PHash, crypto::hash::traits::RandomHash, data::hash::{hash256::Hash256, merkle_node_key::SimpleMerkleNodeKey}, pgoldilocks::PoseidonHasher, protocol::core_types::Q256BitHash, utils::QPGenRandom};
+    use parth_core::{PHash, data::hash::{hash256::Hash256, merkle_node_key::SimpleMerkleNodeKey}, pgoldilocks::PoseidonHasher, protocol::core_types::Q256BitHash, utils::QPGenRandom};
     
     use super::SimpleMemoryMerkleRecorderStore;
     use parth_crypto::hash::sha256::CoreSha256Hasher;

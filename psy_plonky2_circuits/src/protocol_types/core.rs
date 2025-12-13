@@ -1,4 +1,4 @@
-use parth_core::{pgoldilocks::{PoseidonHasher, QHashOut}, protocol::core_types::{QNetworkHashTypes, QNetworkZKTypes, QNetworkZKTypesCopier}};
+use parth_core::{pgoldilocks::{PoseidonHasher, QHashOut}, protocol::core_types::{QNetworkHashTypes, QNetworkZKTypes}};
 use plonky2::{field::goldilocks_field::GoldilocksField, plonk::{config::PoseidonGoldilocksConfig, proof::ProofWithPublicInputs}};
 
 use crate::zk_verifier::PsyPlonky2ZKVerifier;

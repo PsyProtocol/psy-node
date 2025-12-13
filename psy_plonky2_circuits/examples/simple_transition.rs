@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
-use parth_core::{pgoldilocks::{PoseidonHasher, QHashOut}, protocol::core_types::{QNetworkHashTypes, QNetworkTreeConstants, QNetworkTypesConfigHelper}};
+use parth_core::{pgoldilocks::{PoseidonHasher, QHashOut}, protocol::core_types::{QNetworkTreeConstants, QNetworkTypesConfigHelper}};
 use plonky2::{field::goldilocks_field::GoldilocksField, plonk::config::PoseidonGoldilocksConfig};
 use psy_core::{constants::chain_id::PsyChainNetworkType, job::job_id::QProvingJobDataID, network_config::PsyNetworkLocalDevnetConstants};
-use psy_node_core::psy_core_db::v3_implementation::{full::PsyUnifiedCoreDatabaseStore, test_helper::ExPsyUnifiedStoreTestHelper};
+use psy_node_core::psy_core_db::v3_implementation::full::PsyUnifiedCoreDatabaseStore;
 use psy_node_store_memory::cbs_store::{InMemoryCoreStore, InMemoryTableIdentifier};
 use psy_plonky2_circuits::{circuit_library::get_plonky2_circuit_library_and_prover_for_network, protocol_types::ZKTypesPlonky2GoldilocksPoseidon};
 
@@ -134,12 +134,12 @@ fn get_psy_db(store: Arc<InMemoryTestStore>) -> PsyDBStore {
 async fn main() -> anyhow::Result<()> {
     cf_utils::logging::setup_logging()?;
 
-    let (gcv, coordinator_circuits) = get_plonky2_circuit_library_and_prover_for_network::<C, D>(NETWORK)?;
+    let (_gcv, _coordinator_circuits) = get_plonky2_circuit_library_and_prover_for_network::<C, D>(NETWORK)?;
 
     let psy_db = get_psy_db(Arc::new(InMemoryTestStore::new()));
 
 
-    let checkpoint_id = psy_db.get_latest_checkpoint_id().await?;
+    let _checkpoint_id = psy_db.get_latest_checkpoint_id().await?;
 
     
     

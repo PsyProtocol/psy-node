@@ -3,7 +3,7 @@ use parth_core::{crypto::hash::traits::{FieldQHasher, PCircuitWitness, QFieldHas
 use parth_core::utils::QPGenRandom;
 use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
 
-use crate::{agg::AggStateTransitionWithStats, guta::{self, header::GlobalUserTreeAggregatorHeader}};
+use crate::{agg::AggStateTransitionWithStats, guta::header::GlobalUserTreeAggregatorHeader};
 
 
 

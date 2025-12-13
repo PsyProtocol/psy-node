@@ -26,7 +26,6 @@ use crate::{
     queue::gatherer::EphemeralQueueGathererWithTree,
 };
 mod genesis;
-mod init;
 mod process_block;
 mod recover_from_backup;
 pub mod runner;

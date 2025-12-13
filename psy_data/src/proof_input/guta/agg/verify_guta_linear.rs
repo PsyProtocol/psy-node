@@ -10,7 +10,7 @@ use parth_core::{
     felt::{QFelt, QFelt64},
     protocol::core_types::{Q256BitHash, QFHashBase},
 };
-use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
+use psy_core::job::job_id::QProvingJobDataID;
 use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
 
 use crate::{
