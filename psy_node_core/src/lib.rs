@@ -8,13 +8,12 @@ pub mod qblob;
 pub mod qobjblob;
 pub mod processor_builders;
 pub mod node_data;
-pub mod nca_planner;
 //pub mod api;
 pub mod p2p;
 
 pub mod test_helpers;
 pub mod config;
 pub mod genesis;
-pub mod guta_planner;
+//pub mod guta_planner;
 pub mod utils;
 pub mod file;

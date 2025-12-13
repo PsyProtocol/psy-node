@@ -4,6 +4,7 @@ use redis::{self, AsyncCommands, RedisResult};
 use tokio::runtime::Runtime;
 
 #[async_trait::async_trait]
+#[allow(dead_code)]
 pub trait QKVStoreBase {
     async fn put_ref(&self, key: &[u8], value: &[u8]) -> Result<(), redis::RedisError>;
     async fn put_owned(&self, key: Vec<u8>, value: Vec<u8>) -> Result<(), redis::RedisError>;
@@ -84,7 +85,7 @@ impl QKVStoreBase for QKVStore {
         self.get_many_ref(&keys_ref).await
     }
 }
-
+#[allow(dead_code)]
 pub fn criterion_benchmark(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
 

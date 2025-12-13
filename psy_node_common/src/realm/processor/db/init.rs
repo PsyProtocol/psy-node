@@ -15,24 +15,15 @@ use parth_core::{
     QCoreProcCheckpointUniqueId,
 };
 use psy_core::{
-    constants::stale_checkpoint::{STALE_CHECKPOINT_AGE_REALM_TO_COORDINATOR_PROOF, STALE_CHECKPOINT_AGE_USER_END_CAP_TO_REALM_PROOF},
+    constants::stale_checkpoint::STALE_CHECKPOINT_AGE_USER_END_CAP_TO_REALM_PROOF,
     job::job_id::{ProvingJobCircuitType, QProvingJobDataID},
 };
 use psy_data::{
     config::network_config::PsyNodeCircuitFingerprintConfig,
     genesis::genesis_block_setup::PsyGenesisBlockSetupData,
-    guta::header_extended::GlobalUserTreeAggregatorHeaderWithTagValueAndJobID,
     node::realm_processor::{RealmProcessorCoreState, RealmProcessorCoreStateWrapper},
-    prepared_block::realm::{PsyPreparedRealmBlockStateUpdates, PsyPreparedRealmBlockStateUpdatesWithCoordinatorUpdate, PsyRealmCoordinatorUpdate},
-    protocol::{
-        checkpoint_transition_hash::CheckpointStateHashTransition,
-        verifiable_checkpoint_transition::{self, PsyVerifiableCheckpointTransition, PsyVerifiableCheckpointTransitionWithProof},
-    },
+    prepared_block::realm::{PsyPreparedRealmBlockStateUpdatesWithCoordinatorUpdate, PsyRealmCoordinatorUpdate},
     queue_items::realm_user_update::PsyRealmUserUpdateQueueItem,
-    v1::qdata::{
-        checkpoint::QEDL2BlockState, checkpoint_sync::PQEDCheckpointSyncInfoCompact, contract::PsyDeployContractQueueItem,
-        public_key::PZKPublicKeyInfo,
-    },
 };
 use psy_io::tokio::TokioLikeFileSystem;
 use psy_node_core::{
@@ -47,16 +38,14 @@ use psy_node_core::{
 };
 
 use crate::{
-    backup::{checkpoint_tree::CheckpointTreeBackupManager, coordinator::generate_coordinator_output_from_backups, realm::generate_realm_output_from_backups},
-    constants::queue::{
-        PQ_COORDINATOR_DEPLOY_CONTRACT_QUEUE_TOPIC_ID, PQ_COORDINATOR_REGISTER_USER_PUBLIC_KEY_QUEUE_TOPIC_ID,
-        PQ_COORDINATOR_SUBMIT_REALM_GUTA_UPDATE_QUEUE_TOPIC_ID, PQ_REALM_SUBMIT_USER_UPDATE_QUEUE_TOPIC_ID,
-    },
+    backup::{checkpoint_tree::CheckpointTreeBackupManager, realm::generate_realm_output_from_backups},
+    constants::queue::
+        PQ_REALM_SUBMIT_USER_UPDATE_QUEUE_TOPIC_ID
+    ,
     queue::gatherer::QueueKeyStatusManager,
-    realm::{
-        processor::{db::{DatabaseCheckState, PsyRealmDatabaseProcessor}, processor_shared_status::{PsyRealmProcessorSharedStatus, PsyRealmProcessorSharedStatusWrapper}},
-        queue_key::RealmProvingWorkQueueKey,
-    },
+    realm::
+        processor::db::{DatabaseCheckState, PsyRealmDatabaseProcessor}
+    ,
 };
 
 pub async fn create_new_checkpoint_backup_manager_from_file_path<
@@ -223,7 +212,7 @@ where
             last_committed_realm_root,
         );
 
-        let mut checkpoint_tree_backup_manager = create_new_checkpoint_backup_manager_from_file_path(
+        let checkpoint_tree_backup_manager = create_new_checkpoint_backup_manager_from_file_path(
             file_system.clone(),
             STALE_CHECKPOINT_AGE_USER_END_CAP_TO_REALM_PROOF,
             N::CHECKPOINT_TREE_HEIGHT,
@@ -379,6 +368,8 @@ where
                 .await?;
             let (local_latest_unique_pending_id, _): (u64, _) = self.db.get_current_unique_pending_id().await?;
 
+            tracing::info!("Restoring database state from backups to match coordinator's realm root ({:?}) at checkpoint ID: {}. Local unique pending ID before restore: {}",
+                realm_root_with_id.value, realm_root_with_id.checkpoint_id, local_latest_unique_pending_id);
             let restore_checkpoint_id = realm_root_with_id.checkpoint_id;
 
             let coordinator_update: PsyRealmCoordinatorUpdate<N::F, N::QHash> = self.coordinator_client.rc_get_realm_sync_info(restore_checkpoint_id).await?;

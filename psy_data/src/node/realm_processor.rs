@@ -1,21 +1,12 @@
 use std::sync::{Arc, RwLock};
 
 use parth_core::{
-    crypto::hash::traits::{FieldQHasher, QFieldHashable},
-    felt::{QFelt, QFelt64},
     generic_traits::psy_debug_printable::PsyDebugPrintable,
     node::realm_identifier::QRealmIdentifier,
-    protocol::core_types::{QFHashBase, QHashBase},
+    protocol::core_types::QHashBase,
     QCoreProcCheckpointUniqueId,
 };
 
-use crate::{
-    protocol::checkpoint_transition_hash::CheckpointStateHashTransition,
-    v1::qdata::{
-        checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, PQEDCheckpointLeafStats, QEDL2BlockState},
-        populated_checkpoint::PsyCheckpointLeafPopulated,
-    },
-};
 
 #[pderive::serialize_copy_hash]
 pub struct RealmProcessorCoreState<Hash> {
@@ -197,13 +188,13 @@ impl<Hash: QHashBase> RealmProcessorCoreStateWrapper<Hash> {
     }
     pub async fn update_from_core_state(&self, source: &RealmProcessorCoreState<Hash>) -> anyhow::Result<()> {
         {
-            self.inner.write().map_err(|e| anyhow::anyhow!("error writing to core state rwlock"))?.copy_from(source);
+            self.inner.write().map_err(|_| anyhow::anyhow!("error writing to core state rwlock"))?.copy_from(source);
         }
         Ok(())
     }
     pub async fn load_core_state(&self) -> anyhow::Result<RealmProcessorCoreState<Hash>> {
         let state = {
-            self.inner.read().map_err(|e| anyhow::anyhow!("error reading from core state rwlock"))?.clone()
+            self.inner.read().map_err(|_| anyhow::anyhow!("error reading from core state rwlock"))?.clone()
         };
         Ok(state)
     }

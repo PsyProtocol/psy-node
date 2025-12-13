@@ -34,7 +34,7 @@ use psy_node_core::{
 };
 use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 
-use crate::{constants::queue, realm::processor::gatherers::realm_end_cap_gatherer::{RealmGUTAEndCapGathererOutput, RealmGUTAEndCapGathererOutputDatabase}};
+use crate::realm::processor::gatherers::realm_end_cap_gatherer::{RealmGUTAEndCapGathererOutput, RealmGUTAEndCapGathererOutputDatabase};
 
 const MAX_REALM_PROVING_LEVELS: usize = 32;
 
@@ -122,7 +122,7 @@ impl<F, Hash> RealmGUTAPlanner<F, Hash> {
 
 impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
     pub async fn populate_future_end_cap_job<TempStore: StandardProcessorTempDBStoreBase<QProvingJobDataID, Hash>>(
-        chain_id: u32,
+        _chain_id: u32,
         realm_identifier: &QRealmIdentifier,
         unique_pending_id: u64,
         temp_store: Arc<TempStore>,

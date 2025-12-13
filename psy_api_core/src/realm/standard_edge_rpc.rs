@@ -1,6 +1,6 @@
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
 use parth_core::{
-    QProvingJobDataIDWithRewardPath, crypto::hash::merkle_proof::MerkleProofCore, data::{db::row::QDoubleIdKey, hash::{merkle_node_key::SimpleMerkleNodeKey, merkle_store_key::{QMerkleStoreDoubleIdKey, QMerkleStoreSingleIdKey}}}
+    QProvingJobDataIDWithRewardPath, crypto::hash::merkle_proof::MerkleProofCore, data::hash::merkle_store_key::{QMerkleStoreDoubleIdKey, QMerkleStoreSingleIdKey}
 };
 use psy_data::{
     proof_input::guta::end_cap_input::SubmitUserEndCapNonProofInput,

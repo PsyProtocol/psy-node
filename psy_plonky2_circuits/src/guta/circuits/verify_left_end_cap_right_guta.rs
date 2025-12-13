@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use parth_core::{
     crypto::hash::traits::MerkleZeroHasher, felt::QFelt64, pgoldilocks::{QHashOut, QRichField}, protocol::core_types::Q256BitHash
 };

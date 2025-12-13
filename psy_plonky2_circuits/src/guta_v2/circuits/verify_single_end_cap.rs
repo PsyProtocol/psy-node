@@ -9,13 +9,13 @@ use plonky2::{
     }
 };
 use parth_core::{
-    crypto::hash::{tag_tree::{hash_tag_tree_node, hash_tag_tree_node_single}, traits::{FieldQHasher, MerkleZeroHasher, QFieldHashable}}, data::proof_input::CircuitInputWithDependencies, felt::QFelt64, pgoldilocks::{QHashOut, QRichField}, protocol::core_types::{Q256BitHash, QFHashBase, QHashBase}
+    crypto::hash::{tag_tree::hash_tag_tree_node, traits::{FieldQHasher, MerkleZeroHasher, QFieldHashable}}, data::proof_input::CircuitInputWithDependencies, felt::QFelt64, pgoldilocks::{QHashOut, QRichField}, protocol::core_types::{Q256BitHash, QFHashBase}
 };
 use psy_core::
     job::job_id::{ProvingJobCircuitType, QProvingJobDataID}
 ;
 use psy_data::{
-    proof_input::guta::VerifySingleEndCapInputV2, v1::qdata::user_end_cap_result::PUPSEndCapResultCompact, worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse
+    proof_input::guta::VerifySingleEndCapInputV2, worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse
 };
 use psy_plonky2_basic_helpers::{
     builder::{
@@ -27,7 +27,7 @@ use psy_plonky2_basic_helpers::{
 use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 
 use crate::{
-    guta::gadgets::{helpers::ToGUTAHeader, single_variable_height_state_transition::SingleVariableHeightStateTransitionGadget}, proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{QPsyNetworkCircuitWithType, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QStandardCircuitProvableWithRawProofsAndRefLibrary, proof_store::QProofStoreReaderAsync}, utils::proof_library::get_single_child_proof_for_api_response_with_inclusion_proof
+    guta::gadgets::single_variable_height_state_transition::SingleVariableHeightStateTransitionGadget, proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{QPsyNetworkCircuitWithType, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QStandardCircuitProvableWithRawProofsAndRefLibrary, proof_store::QProofStoreReaderAsync}, utils::proof_library::get_single_child_proof_for_api_response_with_inclusion_proof
 };
 
 use crate::guta::gadgets::verify_end_cap::VerifyEndCapProofGadget;
@@ -104,14 +104,9 @@ where
         let final_guta_header = svh_state_transition_gadget.new_guta_header;
         let public_inputs_hash = final_guta_header.get_public_inputs_hash_no_children::<C::Hasher, C::F, D>(&mut builder, worker_rewards_tree_tag);
 
-        let guta_hash =final_guta_header.to_hash::<C::Hasher, C::F, D>(&mut builder);
+        // let guta_hash =final_guta_header.to_hash::<C::Hasher, C::F, D>(&mut builder);
         //builder.register_public_inputs(&public_inputs_hash.elements);
-        builder.register_public_inputs(&[
-        public_inputs_hash.elements[0],
-        public_inputs_hash.elements[1],
-        public_inputs_hash.elements[2],
-        public_inputs_hash.elements[3],
-        ]);
+        builder.register_public_inputs(&public_inputs_hash.elements);
         pad_circuit_degree(&mut builder, 12);
         let circuit_data = builder.build::<C>();
 

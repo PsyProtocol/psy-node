@@ -1,28 +1,16 @@
-use std::{
-    fs,
-    path::{Path, PathBuf},
-    str::FromStr,
-    sync::Arc,
-    time::Duration,
-};
+use std::
+    time::Duration
+;
 
-use parth_core::{pgoldilocks::{PoseidonHasher, QHashOut}, protocol::core_types::{QNetworkConstantsCopier, QNetworkTreeConstants, QNetworkTypesConfigHelper, QNetworkZKTypesCopier}};
-use plonky2::{
-    field::{goldilocks_field::GoldilocksField, types::Field},
-    hash::hash_types::HashOut,
-    plonk::config::GenericHashOut,
-};
-use psy_api_core::coordinator::standard_edge_rpc::CoordinatorEdgeRpcClient;
+use parth_core::protocol::core_types::QNetworkTypesConfigHelper;
 use psy_core::{constants::chain_id::PsyNetworkTypeInput, job::job_id::QProvingJobDataID, network_config::PsyNetworkLocalDevnetConstants};
-use psy_dummy_prover::{api::data_fetcher::PsyUserContractDataFetcher, dummy_ups_state::state::DummyUPSStateBuilder, traits::DummyUPSProver};
+use psy_dummy_prover::api::data_fetcher::PsyUserContractDataFetcher;
 use psy_plonky2_circuits::{end_cap::dummy_prover::create_plonky2_dummy_end_cap_prover, protocol_types::ZKTypesPlonky2GoldilocksPoseidon};
-use tokio::{sync::Mutex, time::sleep};
+use tokio::time::sleep;
 use tracing::{error, info};
 
 type C = plonky2::plonk::config::PoseidonGoldilocksConfig;
 const D: usize = 2;
-type F = GoldilocksField;
-type Hash = QHashOut<F>;
 
 fn print_banner() {
     println!(
@@ -74,7 +62,7 @@ pub async fn run(
     max_state_updates: u32,
     max_contract_calls: u32,
     user_id: u64,
-    network: Option<PsyNetworkTypeInput>,
+    _network: Option<PsyNetworkTypeInput>,
 ) -> anyhow::Result<()> {
     print_banner();
     info!("Dummy end cap prover starting...");

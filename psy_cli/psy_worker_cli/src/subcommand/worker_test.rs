@@ -1,24 +1,12 @@
-use std::{
-    fs,
-    path::{Path, PathBuf},
-    str::FromStr,
-    sync::Arc,
-    time::Duration,
-};
+use std::
+    time::Duration
+;
 
-use plonky2::{
-    field::{goldilocks_field::GoldilocksField, types::Field},
-    hash::hash_types::HashOut,
-    plonk::config::GenericHashOut,
-};
 use psy_core::constants::chain_id::PsyNetworkTypeInput;
-use tokio::{sync::Mutex, time::sleep};
+use tokio::time::sleep;
 use tracing::{error, info};
 
 
-type C = plonky2::plonk::config::PoseidonGoldilocksConfig;
-const D: usize = 2;
-type F = GoldilocksField;
 
 fn print_banner() {
     println!(
@@ -39,16 +27,15 @@ pub async fn run_worker_inner() -> anyhow::Result<()> {
         info!("Worker is running...");
         sleep(Duration::from_secs(5)).await;
     }
-    Ok(())
 }
 
 pub async fn run(
     config: String,
-    private_key: Option<String>,
-    keystore_path: Option<String>,
-    wallet_password: Option<String>,
-    recipient: Option<u64>,
-    network: Option<PsyNetworkTypeInput>,
+    _private_key: Option<String>,
+    _keystore_path: Option<String>,
+    _wallet_password: Option<String>,
+    _recipient: Option<u64>,
+    _network: Option<PsyNetworkTypeInput>,
 ) -> anyhow::Result<()> {
     print_banner();
     info!("Worker starting...");

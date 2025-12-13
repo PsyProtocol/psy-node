@@ -1,37 +1,30 @@
 use std::{
-    sync::{Arc, RwLock},
-    time::{Duration, Instant},
+    sync::Arc,
+    time::Duration,
 };
 
-use async_nats::{
+use async_nats::
     jetstream::{
         self,
-        consumer::{pull::Config as PullConfig, PullConsumer},
-        kv::Store,
-    },
-    Subject, ToServerAddrs,
-};
-use async_trait::async_trait;
-use bytes::Bytes;
+        consumer::pull::Config as PullConfig,
+    }
+;
 use dashmap::DashMap;
-use futures::{future::try_join_all, stream::StreamExt};
-use parth_core::{
-    data::queue::queue_key::{PCoreQueueItemBase, PCoreStandardQueueKeyForRealm, QPBaseQueueType, QPStandardUniqueIdQueueKey},
-    QCoreProcCheckpointUniqueId,
-};
+use parth_core::
+    data::queue::queue_key::{PCoreQueueItemBase, QPBaseQueueType, QPStandardUniqueIdQueueKey}
+;
 use psy_node_nats::queue::NatsJetStreamClient;
 use psy_core::job::job_id::QProvingJobDataID;
-use psy_node_core::queue::{
-    ephemeral::{QStandardEphemeralQueuePublisher, QStandardEphemeralQueueSubscriber},
-    worker_queue::{QStandardWorkerQueuePublisher, QStandardWorkerQueueSubscriber},
-};
+use psy_node_core::queue::
+    ephemeral::{QStandardEphemeralQueuePublisher, QStandardEphemeralQueueSubscriber}
+;
 use rand::RngCore;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
 // Type alias for the signal from Processor to Gatherer
-type TriggerMessage = oneshot::Sender<(Vec<u8>, Vec<u8>, Vec<u8>)>;
+//type TriggerMessage = oneshot::Sender<(Vec<u8>, Vec<u8>, Vec<u8>)>;
 const USER_INFO_TEST_QUEUE_TOPIC_ID: u32 = 13337;
 type QueueKey = QPStandardUniqueIdQueueKey<USER_INFO_TEST_QUEUE_TOPIC_ID, QProvingJobDataID>;
 
@@ -183,7 +176,7 @@ async fn processor<const QUEUE_TOPIC_ID: u32, QueueItem: PCoreQueueItemBase, Bui
         }
 
         match response_rx.await {
-            Ok(builder_result) => {
+            Ok(_builder_result) => {
                     info!("PROCESSOR: Received items. Starting heavy computation...");
                     // --- Heavy Computation Step ---
                     info!("PROCESSOR: Heavy computation finished.");
@@ -256,7 +249,7 @@ async fn main() -> anyhow::Result<()> {
     let base_namespace = "EX_JOB_STREAM".to_string();
     let realm_id = 1u64;
     let realm_sub_id = 1u64;
-    let ex_queue_type = 1337u32;
+    // let ex_queue_type = 1337u32;
     let task_group = 1u64;
 
     let timeout_ms = 5000u64;

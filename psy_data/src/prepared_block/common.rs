@@ -5,7 +5,7 @@ use parth_core::{felt::QFelt64, protocol::core_types::Q256BitHash};
 use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
 use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
 
-use crate::{v1::qdata::{checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState}, populated_checkpoint::PsyCheckpointLeafPopulated}, worker::metadata_with_job_id::PsyProvingJobMetadataWithJobId};
+use crate::{v1::qdata::{checkpoint::QEDL2BlockState, populated_checkpoint::PsyCheckpointLeafPopulated}, worker::metadata_with_job_id::PsyProvingJobMetadataWithJobId};
 
 
 #[pderive::serialize_copy_f_hash_ts]

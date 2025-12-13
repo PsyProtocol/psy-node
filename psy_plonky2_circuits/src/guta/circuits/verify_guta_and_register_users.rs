@@ -1,5 +1,4 @@
-use async_trait::async_trait;
-use parth_core::{crypto::hash::{merkle_proof::MerkleProofCore, traits::MerkleZeroHasher}, data::proof_input::CircuitInputWithDependencies, felt::QFelt64, pgoldilocks::QHashOut, protocol::core_types::Q256BitHash};
+use parth_core::{crypto::hash::{merkle_proof::MerkleProofCore, traits::MerkleZeroHasher}, felt::QFelt64, pgoldilocks::QHashOut, protocol::core_types::Q256BitHash};
 use plonky2::{
     gates::{constant::ConstantGate, gate::GateRef}, hash::hash_types::{HashOut, HashOutTarget}, iop::
         witness::{PartialWitness, WitnessWrite}, plonk::{
@@ -16,7 +15,7 @@ use psy_plonky2_basic_helpers::
    
 ;
 use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
-use crate::{proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{QPsyNetworkCircuitWithType, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QStandardCircuitProvableWithRawProofsAndRefLibrary, proof_store::QProofStoreReaderAsync}, utils::proof_library::get_single_child_proof_for_api_response_with_inclusion_proof};
+use crate::{proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard::{QPsyNetworkCircuitWithType, QStandardCircuit, QStandardCircuitProvableWithRawProofsAndRefLibrary}, utils::proof_library::get_single_child_proof_for_api_response_with_inclusion_proof};
 
 use crate::{guta::gadgets::guta_register_users_batch::GUTARegisterUsersBatchGadget};
 
@@ -151,56 +150,6 @@ where
 }
 
 
-
-#[async_trait]
-impl<
-        S: QProofStoreReaderAsync + Send + Sync,
-        L: CircuitInfoLibrary<C, D> + Send + Sync,
-        C: GenericConfig<D> + 'static,
-        const D: usize,
-    > QStandardCircuitProvableWithProofStoreAndRefLibraryAsync<S, L, C, D>
-    for GUTAVerifyGUTARegisterUsersCircuit<C, D>
-where
-    C::Hasher: AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>>,
-{
-    async fn prove_with_proof_store_async(
-        &self,
-        store: &S,
-        library: &L,
-        job_id: QProvingJobDataID,
-        worker_rewards_tree_tag: QHashOut<C::F>,
-    ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
-        let r: CircuitInputWithDependencies<VerifyGUTARegisterUsersCircuitInputSimple<C::F, QHashOut<C::F>>, QProvingJobDataID> =
-            bincode::deserialize(&store.get_bytes_by_id(job_id.get_input_witness_id()).await?)
-                .map_err(|e| anyhow::anyhow!(e))?;
-        tracing::debug!("GUTAVerifyGUTARegisterUsersInput: {}", serde_json::to_string_pretty(&r)?);
-
-        if r.dependencies.len() != 1 {
-            anyhow::bail!("invalid dependency count in two end guta input");
-        }
-
-        let child_a_proof = store.get_proof_by_id(r.dependencies[0]).await?;
-
-        let dep_a_type = r.dependencies[0].circuit_type;
-
-        let child_a_verifier_data = library.get_verifier_data(dep_a_type)?;
-        let guta_inclusion_proof_a =
-            library.get_group_inclusion_proof(job_id.circuit_type, dep_a_type)?;
-
-        let result = self.prove_base(
-            worker_rewards_tree_tag,
-            &guta_inclusion_proof_a,
-            &r.input.guta_proof_header,
-            &child_a_proof,
-            &child_a_verifier_data,
-            &r.input.top_line_siblings,
-            &r.input.guta_register_user_inputs,
-            todo!(), // child_proof_rewards_tree_value
-        )?;
-
-        Ok(result)
-    }
-}
 
 
 impl<

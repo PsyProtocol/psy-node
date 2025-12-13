@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use parth_common::memory_stores::{
     dash_tree_append_only::PsyDashMemoryAppendOnlyMerkleStore,
-    mem_tree_recorder::SimpleMemoryMerkleRecorderStore, traits::PsyMemoryMerkleStoreImm,
+    mem_tree_recorder::SimpleMemoryMerkleRecorderStore,
 };
 use parth_core::{
     crypto::hash::traits::{FieldQHasher, QFieldHashable},
@@ -30,7 +30,6 @@ use psy_data::{
     },
     worker::{
         metadata::{
-            PROOF_REWARD_TREE_HASH_MODE_HASH_CHILDREN_STANDARD,
             PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN,
             PROOF_REWARD_TREE_HASH_MODE_LIFT_CHILD,
             PsyProvingJobMetadata,

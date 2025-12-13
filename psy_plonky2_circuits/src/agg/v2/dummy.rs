@@ -1,7 +1,6 @@
-use async_trait::async_trait;
 use parth_core::{crypto::hash::{tag_tree::hash_tag_tree_node, traits::{FieldQHasher, MerkleHasher, PCircuitWitness}}, felt::QFelt64, pgoldilocks::QHashOut, protocol::core_types::{Q256BitHash, QFHashBase}};
 use plonky2::{
-    gates::public_input, hash::
+    hash::
         hash_types::HashOutTarget, iop::witness::{PartialWitness, WitnessWrite}, plonk::{
         circuit_builder::CircuitBuilder,
         circuit_data::{

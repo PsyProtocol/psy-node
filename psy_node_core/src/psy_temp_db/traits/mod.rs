@@ -18,7 +18,6 @@ pub use user_contract_tree_updates::*;
 pub use deploy_contract_data::*;
 pub use rewards_tree::*;
 
-use crate::psy_temp_db::traits::rewards_tree::QTempDBRewardsTreeStore;
 
 pub trait StandardEdgeAPITempDBStoreBase<JobId: QJobIdBase, Hash: QDBHashBase>: 
     QTempDBPendingIdStore + 

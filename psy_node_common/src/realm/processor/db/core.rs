@@ -1,48 +1,29 @@
 use std::sync::{atomic::AtomicBool, Arc};
 
 use anyhow::Ok;
-use parth_common::memory_stores::{mem_tree_recorder::SimpleMemoryMerkleRecorderStore, traits::PsyMemoryMerkleStoreImm};
 use parth_core::{
-    crypto::hash::{
-        merkle_proof::{DeltaMerkleProofCore, MerkleProofCore},
-        tag_tree::TagTreeMerkleProof,
-        traits::{MerkleZeroHasher, QFieldHashable, ZeroableHash},
-    },
+    crypto::hash::
+        traits::ZeroableHash
+    ,
     data::{
-        hash::{checkpointed_merkle_node::CheckpointedMerkleHash, merkle_node_key::SimpleMerkleNodeKey},
-        queue::queue_key::{QPBaseQueueType, QPStandardUniqueIdQueueKey},
+        hash::merkle_node_key::SimpleMerkleNodeKey,
+        queue::queue_key::QPBaseQueueType,
     },
-    generic_traits::psy_debug_printable::PsyDebugPrintable,
-    node::realm_identifier::QRealmIdentifier,
-    protocol::core_types::{Q256BitHash, QNetworkTypesConfig},
-    QCoreProcCheckpointUniqueId,
+    protocol::core_types::QNetworkTypesConfig,
 };
-use psy_core::{
-    constants::stale_checkpoint::{STALE_CHECKPOINT_AGE_REALM_TO_COORDINATOR_PROOF, STALE_CHECKPOINT_AGE_USER_END_CAP_TO_REALM_PROOF},
-    job::job_id::{ProvingJobCircuitType, QProvingJobDataID},
-};
+use psy_core::
+    job::job_id::QProvingJobDataID
+;
 use psy_data::{
     config::network_config::PsyNodeCircuitFingerprintConfig,
-    genesis::genesis_block_setup::PsyGenesisBlockSetupData,
-    guta::header_extended::GlobalUserTreeAggregatorHeaderWithTagValueAndJobID,
     node::realm_processor::{RealmProcessorCoreState, RealmProcessorCoreStateWrapper},
-    prepared_block::realm::{PsyPreparedRealmBlockStateUpdates, PsyPreparedRealmBlockStateUpdatesWithCoordinatorUpdate, PsyRealmCoordinatorUpdate},
-    protocol::{
-        checkpoint_transition_hash::CheckpointStateHashTransition,
-        verifiable_checkpoint_transition::{self, PsyVerifiableCheckpointTransition, PsyVerifiableCheckpointTransitionWithProof},
-    },
     queue_items::realm_user_update::PsyRealmUserUpdateQueueItem,
-    v1::qdata::{
-        checkpoint::QEDL2BlockState, checkpoint_sync::PQEDCheckpointSyncInfoCompact, contract::PsyDeployContractQueueItem,
-        public_key::PZKPublicKeyInfo,
-    },
 };
 use psy_io::tokio::TokioLikeFileSystem;
 use psy_node_core::{
-    genesis::genesis_db_data_builder::GenesisDatabaseDataBuilder,
     p2p::traits::realm_coordinantor::RealmCoordinatorClient,
     psy_core_db::traits::full::{
-        PsyNodeCheckpointTreeDatabaseReader, PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmProcessorStore,
+        PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmProcessorStore,
     },
     psy_temp_db::StandardProcessorTempDBStoreBase,
     queue::{ephemeral::QStandardEphemeralQueueSubscriber, worker_queue::QStandardWorkerQueuePublisher},
@@ -50,16 +31,14 @@ use psy_node_core::{
 };
 
 use crate::{
-    backup::{checkpoint_tree::CheckpointTreeBackupManager, coordinator::generate_coordinator_output_from_backups},
-    constants::queue::{
-        PQ_COORDINATOR_DEPLOY_CONTRACT_QUEUE_TOPIC_ID, PQ_COORDINATOR_REGISTER_USER_PUBLIC_KEY_QUEUE_TOPIC_ID,
-        PQ_COORDINATOR_SUBMIT_REALM_GUTA_UPDATE_QUEUE_TOPIC_ID, PQ_REALM_SUBMIT_USER_UPDATE_QUEUE_TOPIC_ID,
-    },
+    backup::checkpoint_tree::CheckpointTreeBackupManager,
+    constants::queue::
+        PQ_REALM_SUBMIT_USER_UPDATE_QUEUE_TOPIC_ID
+    ,
     queue::gatherer::QueueKeyStatusManager,
-    realm::{
-        processor::processor_shared_status::{PsyRealmProcessorSharedStatus, PsyRealmProcessorSharedStatusWrapper},
-        queue_key::RealmProvingWorkQueueKey,
-    },
+    realm::
+        queue_key::RealmProvingWorkQueueKey
+    ,
 };
 #[derive(Debug, Clone, PartialEq, Eq, Copy)]
 pub enum DatabaseCheckState {
@@ -165,7 +144,7 @@ impl<
 where
     N::HasherBase: 'static + Send + Sync,
 {
-    pub async fn get_reward_tree_root(&self, checkpoint_id: u64, unique_pending_id: u64, job_id: N::JobId) -> anyhow::Result<N::QHash> {
+    pub async fn get_reward_tree_root(&self, _checkpoint_id: u64, unique_pending_id: u64, job_id: N::JobId) -> anyhow::Result<N::QHash> {
         let temp_store_reward_tree_root: Option<N::QHash> = self
             .temp_db
             .get_proof_miner_rewards_tree_value_or_none(

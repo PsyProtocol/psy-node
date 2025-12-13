@@ -1,16 +1,14 @@
 use parth_core::protocol::core_types::QNetworkTypesConfig;
-use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
-use psy_data::genesis::genesis_block_setup::PsyGenesisBlockSetupData;
+use psy_core::job::job_id::QProvingJobDataID;
 use psy_io::tokio::TokioLikeFileSystem;
 use psy_node_core::{
-    genesis::genesis_db_data_builder::GenesisDatabaseDataBuilder,
     psy_core_db::traits::full::{PsyCoordinatorProcessorStore, PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter},
     psy_temp_db::StandardProcessorTempDBStoreBase,
     queue::{ephemeral::QStandardEphemeralQueueSubscriber, worker_queue::QStandardWorkerQueuePublisher},
     store::traits::proof_store::QParthProofStore,
 };
 
-use crate::coordinator::processor::{db::DatabaseCheckState, PsyCoordinatorProcessor};
+use crate::coordinator::processor::PsyCoordinatorProcessor;
 
 impl<
         N: QNetworkTypesConfig<JobId = QProvingJobDataID>,

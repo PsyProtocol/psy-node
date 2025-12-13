@@ -43,7 +43,6 @@ type ExZeroIdMerkleTableIdentifier = InMemoryTableIdentifier;
 type ExTagTreeTableIdentifier = InMemoryTableIdentifier;
 type ExHashToManyIdsTableIdentifier = InMemoryTableIdentifier;
 
-type InMemoryTestStore = InMemoryCoreStore<ExHash, ExHasher>;
 
 #[derive(Debug, Copy, Clone)]
 pub struct SimpleTestNetworkConfig;
@@ -219,8 +218,10 @@ impl<N: QNetworkDatabaseTypes> P2TestbedChainStateStore<N> {
 
 #[tokio::test]
 async fn simple_store_basic_test_1() -> anyhow::Result<()> {
+    type InMemoryTestStore = InMemoryCoreStore<ExHash, ExHasher>;
+
     let db = Arc::new(InMemoryTestStore::new());
-    let simple_store = P2TestbedChainStateStore::<SimpleTestNetworkConfig>::setup(db).await?;
+    let _simple_store = P2TestbedChainStateStore::<SimpleTestNetworkConfig>::setup(db).await?;
     println!("setup simple store");
     Ok(())
 }

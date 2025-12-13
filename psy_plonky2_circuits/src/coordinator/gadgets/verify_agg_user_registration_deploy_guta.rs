@@ -12,7 +12,6 @@ use plonky2::{
 };
 use psy_data::{
     agg::{AggStateTransition, TPAltCircuitFingerprintConfig},
-    gatherer_builders::register_user,
     guta::header::GlobalUserTreeAggregatorHeader,
 };
 use psy_plonky2_basic_helpers::builder::hash::core::CircuitBuilderHashCore;

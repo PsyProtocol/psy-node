@@ -1,4 +1,3 @@
-use bincode::de;
 use parth_core::{
     QJOB_ID_SERIALIZED_SIZE, QJobIdBase, QJobIdSerialized, crypto::hash::{tag_tree::TagTreeNodePreimage, traits::{FieldQHasher, QFieldHashable}}, data::queue::queue_key::PCoreQueueItemBase, felt::QFelt64, protocol::core_types::{Q256BitHash, QFHashBase}, utils::QPGenRandom
 };
@@ -6,7 +5,7 @@ use psy_core::job::job_id::QProvingJobDataID;
 use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
 use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalDatabaseSerializeBaseSingle, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
 
-use crate::{guta::{header::GlobalUserTreeAggregatorHeader, sub_tree_transition::SubTreeNodeStateTransition}, proof_input::guta::generic::GlobalUserTreeAggregatorHeaderWi, worker::{metadata::{PROOF_REWARD_TREE_HASH_MODE_HASH_CHILDREN_STANDARD, PsyProvingJobMetadata}, metadata_with_job_id::PsyProvingJobMetadataWithJobId}};
+use crate::{guta::header::GlobalUserTreeAggregatorHeader, worker::{metadata::{PROOF_REWARD_TREE_HASH_MODE_HASH_CHILDREN_STANDARD, PsyProvingJobMetadata}, metadata_with_job_id::PsyProvingJobMetadataWithJobId}};
 
 
 
