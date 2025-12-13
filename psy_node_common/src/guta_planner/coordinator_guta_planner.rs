@@ -32,6 +32,7 @@ use psy_data::{
         metadata::{
             PROOF_REWARD_TREE_HASH_MODE_HASH_CHILDREN_STANDARD,
             PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN,
+            PROOF_REWARD_TREE_HASH_MODE_LIFT_CHILD,
             PsyProvingJobMetadata,
         },
         metadata_with_job_id::PsyProvingJobMetadataWithJobId,
@@ -349,7 +350,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> CoordinatorGUTAPlanner<F, Ha
             job_id: new_job_id,
             metadata: PsyProvingJobMetadata {
                 expected_public_inputs_hash: expected_hash,
-                reward_tree_hash_mode: PROOF_REWARD_TREE_HASH_MODE_HASH_CHILDREN_STANDARD,
+                reward_tree_hash_mode: PROOF_REWARD_TREE_HASH_MODE_LIFT_CHILD,
                 reward_tree_node_index: 0,
                 reward_tree_node_level: 0,
                 reward_tree_node_children: 1,

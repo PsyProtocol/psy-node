@@ -146,6 +146,9 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + PartialEq + Default>
     pub fn get_height(&self) -> u8 {
         self.height
     }
+    pub fn get_effective_height(&self) -> u8 {
+        self.effective_height
+    }
     pub fn get_max_leaf_index(&self) -> u64 {
         (1u64 << (self.height as u64)) - 1u64
     }

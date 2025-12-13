@@ -176,7 +176,7 @@ pub async fn load_global_user_tree_from_db_with_sub_root<
         // Tree is empty
         anyhow::bail!("Failed to load global user tree from DB: reached leaf node with zero hash, but root is not zero hash");
     }
-    let max_user_id_exclusive = current_key.index>>(tree_height - sub_root.level) + 1;
+    let max_user_id_exclusive = current_key.index + 1;
     fetch_global_user_tree_from_db_with_sub_root::<Hasher, Store, Hash>(
         user_db_reader,
         tree_height,

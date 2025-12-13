@@ -65,7 +65,7 @@ where
     pub fn new(
         guta_proof_common_data: &CommonCircuitData<C::F, D>,
         guta_proof_verifier_data_cap_height: usize,
-        global_user_tree_realm_height: usize,
+        global_user_tree_coordinator_height: usize,
         global_user_tree_height: usize,
         guta_circuit_whitelist_tree_height: u8,
         checkpoint_tree_height: usize,
@@ -77,7 +77,7 @@ where
             &mut builder,
             guta_proof_common_data,
             guta_proof_verifier_data_cap_height,
-            global_user_tree_realm_height,
+            global_user_tree_coordinator_height,
             global_user_tree_height,
             guta_circuit_whitelist_tree_height,
         );
@@ -105,7 +105,7 @@ where
         let worker_rewards_tree_tag_target = builder.add_virtual_hash();
         let child_proof_rewards_tree_value = verify_to_line_gadget.verify_guta_proof_gadget.rewards_tree_value;
         let public_inputs_hash = computed_header_line.get_public_inputs_hash_single_child::<C::Hasher, C::F, D>(
-            &mut builder, 
+            &mut builder,
             child_proof_rewards_tree_value,
             worker_rewards_tree_tag_target
         );
@@ -139,7 +139,7 @@ where
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
         let mut pw = PartialWitness::<C::F>::new();
 
-        tracing::debug!(
+        tracing::info!(
             "📈 GUTA To Cap Upgrade Checkpoint set_witness - guta_proof_header: {}, checkpoint_historical_proof: {}",
             serde_json::to_string_pretty(guta_proof_header).unwrap(),
             serde_json::to_string_pretty(checkpoint_historical_merkle_proof).unwrap()

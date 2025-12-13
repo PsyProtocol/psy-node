@@ -130,7 +130,9 @@ pub async fn load_global_user_tree_from_db<
     println!("zero hash of at leaves: {:?}", Hasher::get_zero_hash((effective_tree_height) as usize));
     if current_value == Hasher::get_zero_hash(tree_height as usize) {
         // Tree is empty
-        return Ok(SimpleMemoryMerkleRecorderStore::new(tree_height));
+        let mut tree = SimpleMemoryMerkleRecorderStore::new(tree_height);
+        tree.set_effective_height(effective_tree_height);
+        return Ok(tree);
     }
     while current_key.level < effective_tree_height {
         let right_child_key = current_key.right_child();
@@ -164,7 +166,7 @@ pub async fn load_global_user_tree_from_db<
         // Tree is empty
         anyhow::bail!("Failed to load global user tree from DB: reached leaf node with zero hash, but root is not zero hash");
     }
-    let max_user_id_exclusive = current_key.index>>(tree_height - effective_tree_height) + 1;
+    let max_user_id_exclusive = (current_key.index + 1) << (tree_height - effective_tree_height);
     fetch_global_user_tree_from_db::<Hasher, Store, Hash>(
         user_db_reader,
         tree_height,

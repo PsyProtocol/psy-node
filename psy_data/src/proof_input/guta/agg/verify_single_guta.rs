@@ -239,15 +239,13 @@ impl<F: QFelt64, Hash: PartialEq + Copy> VerifyGUTAToCapUpgradeCheckpointCircuit
 
     }
     pub fn get_new_guta_header<H: MerkleHasher<Hash>>(&self) -> GlobalUserTreeAggregatorHeader<F, Hash> {
-
-
         GlobalUserTreeAggregatorHeader{
             guta_circuit_whitelist: self.guta_proof_header.guta_circuit_whitelist,
             // upgraded to the new root for the new header
             checkpoint_tree_root: self.historical_checkpoint_proof.root,
             state_transition: self.get_new_state_transition::<H>(),
             stats: self.guta_proof_header.stats,
-            total_aggregation_proofs_generated: self.total_aggregation_proofs_generated + F::from_u64_value(0),
+            total_aggregation_proofs_generated: self.total_aggregation_proofs_generated + F::from_u64_value(1),
         }
 
     }
