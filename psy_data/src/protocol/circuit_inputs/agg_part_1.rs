@@ -14,41 +14,6 @@ pub struct QCAggUserRegistartionDeployContractsGUTAInput<F, Hash> {
     pub deploy_contracts_state_transition: AggStateTransitionWithStats<Hash>,
     pub guta_proof_header: GlobalUserTreeAggregatorHeader<F, Hash>,
 }
-/*
-
-
-
-    pub fn get_combined_hash<H: AlgebraicHasher<F>, F: RichField + Extendable<D>, const D: usize>(
-        &self,
-        builder: &mut CircuitBuilder<F, D>,
-    ) -> HashOutTarget {
-        let user_regsitration_deploy_contract_start = builder.hash_two_to_one::<H>(
-            self.user_registration_tree_delta.state_transition_start,
-            self.global_contract_tree_delta.state_transition_start,
-        );
-        let user_regsitration_deploy_contract_end = builder.hash_two_to_one::<H>(
-            self.user_registration_tree_delta.state_transition_end,
-            self.global_contract_tree_delta.state_transition_end,
-        );
-        let user_regsitration_deploy_contract_combo =
-            builder.hash_two_to_one::<H>(user_regsitration_deploy_contract_start, user_regsitration_deploy_contract_end);
-
-        let guta_hash = self.global_user_tree_delta.to_hash::<H, F, D>(builder);
-        
-
-        let combo_without_stats = builder.hash_two_to_one::<H>(user_regsitration_deploy_contract_combo, guta_hash);
-        let stats_hash = HashOutTarget {
-            elements: [
-                self.combined_pm_jobs_completed.deploy_contracts_completed,
-                self.combined_pm_jobs_completed.register_users_completed,
-                self.combined_pm_jobs_completed.gutas_completed,
-                builder.zero(),
-            ]
-        };
-        builder.hash_two_to_one::<H>(combo_without_stats, stats_hash)
-    }
-    
-*/
 impl<F: QFelt64, Hash: QFHashBase<F>> QCAggUserRegistartionDeployContractsGUTAInput<F, Hash> {
     pub fn get_public_inputs_hash_no_rewards_tag<Hasher: FieldQHasher<F, Hash>>(&self) -> Hash {
 
