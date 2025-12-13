@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use auto_impl::auto_impl;
-use parth_common::memory_stores::{dash_tree_append_only::PsyDashMemoryAppendOnlyMerkleStore, mem_tree_recorder::SimpleMemoryMerkleRecorderStore};
+use parth_common::memory_stores::mem_tree_recorder::SimpleMemoryMerkleRecorderStore;
 use parth_core::crypto::hash::{merkle_proof::MerkleProofCore, traits::MerkleZeroHasher};
 
 #[async_trait]

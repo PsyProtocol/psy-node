@@ -1,7 +1,7 @@
 use parth_core::pgoldilocks::QHashOut;
 use psy_core::constants::chain_id::PsyChainNetworkType;
 use psy_data::{
-    config::network_config::{PsyNetworkChainConfig, PsyNodeCircuitFingerprintConfig, PsyNodeCircuitFingerprintConfigProvider},
+    config::network_config::{PsyNodeCircuitFingerprintConfig, PsyNodeCircuitFingerprintConfigProvider},
     genesis::genesis_block_setup::{PsyGenesisBlockSetupData, PsyGenesisBlockSetupDataProvider},
 };
 

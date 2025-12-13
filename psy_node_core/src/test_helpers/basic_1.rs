@@ -10,10 +10,8 @@ use parth_core::{
         serializable::{QPDPair, QPDSerializable},
     },
     utils::QPGenRandom,
-    QCoreProcCheckpointUniqueId,
 };
 use psy_core::job::job_id::QProvingJobDataID;
-use rand::{distributions::Alphanumeric, Rng};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -359,7 +357,7 @@ Stack backtrace:
     assert_eq!(consumed, Some(item1));
 
     // Test publish many, dump all
-    let mut items = vec![
+    let items = vec![
         TestQueueItem {
             job_id: 2,
             payload: "two".into(),

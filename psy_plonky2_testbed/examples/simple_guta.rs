@@ -10,17 +10,16 @@ use parth_core::{
     PHash, PF,
 };
 use plonky2::{
-    field::{
-        goldilocks_field::GoldilocksField,
-        types::{Field, PrimeField64},
-    }, hash::poseidon::PoseidonHash, plonk::config::PoseidonGoldilocksConfig
+    field::
+        types::{Field, PrimeField64}
+    , plonk::config::PoseidonGoldilocksConfig
 };
 use psy_core::job::job_id::ProvingJobCircuitType;
 use psy_data::{proof_input::guta::{VerifyEndCapSimpleStandardInput, VerifyTwoEndCapCircuitInput}, v1::qdata::user::PQEDUserLeaf};
 use psy_plonky2_basic_helpers::verifier::{circuit_library::CircuitInfoLibraryCore, simple_circuit_library::SimpleCircuitLibrary};
 use psy_plonky2_circuits::{
     coordinator::coordinator_helper::QEDCoordinatorCircuitManager, end_cap::dummy::DummyUPSStandardEndCapCircuit,
-    generated::cached_circuit_library::get_cached_circuit_library, qstandard::QStandardCircuit,
+    generated::cached_circuit_library::get_cached_circuit_library,
 };
 use psy_plonky2_testbed::state::chain::{SimpleTestNetworkConfig, SIMPLE_TESTNET_DEFAULT_USER_STATE_TREE_ROOT};
 type F = PF;
@@ -30,7 +29,7 @@ type C = PoseidonGoldilocksConfig;
 const D: usize = 2;
 
 type N = SimpleTestNetworkConfig;
-
+#[allow(dead_code)]
 struct SimpleChainState {
     pub checkpoint_tree: SimpleMemoryMerkleStoreV3<Hasher, Hash>,
     pub global_user_tree: SimpleMemoryMerkleStoreV3<Hasher, Hash>,
@@ -50,11 +49,8 @@ impl SimpleChainState {
             simple_proof_store: HashMap::new(),
         }
     }
-    pub fn insert_users_base(count: usize) -> anyhow::Result<()> {
-        Ok(())
-    }
 }
-
+#[allow(dead_code)]
 struct SimpleChainTestbedCircuits {
     pub circuits: QEDCoordinatorCircuitManager<C, D>,
     pub dummy_end_cap_circuit: DummyUPSStandardEndCapCircuit<C, D>,
@@ -124,7 +120,7 @@ impl SimpleChainTestbed {
         self.state.checkpoint_tree.set_leaf(1, checkpoint_1_hash);
         self.state.checkpoint_tree.set_leaf(2, checkpoint_2_hash);
 
-        let mut user_0 = PQEDUserLeaf {
+        let user_0 = PQEDUserLeaf {
             user_id: F::from_noncanonical_u64(0),
             public_key: Hash::rand(),
             nonce: F::ZERO_VALUE,
@@ -136,7 +132,7 @@ impl SimpleChainTestbed {
 
         self.set_user_leaf(user_0.clone());
 
-        let mut user_1 = PQEDUserLeaf {
+        let user_1 = PQEDUserLeaf {
             user_id: F::from_noncanonical_u64(1),
             public_key: Hash::rand(),
             nonce: F::ZERO_VALUE,
@@ -158,7 +154,7 @@ impl SimpleChainTestbed {
             .get_leaf(new_checkpoint_id);
 
         let mut timer = DebugTimer::new("test_simple_guta_proofs");
-        let (new_user_leaf_0, public_inputs_expected_0, guta_stats_0, end_cap_result_0, proof_0) =
+        let (new_user_leaf_0, _public_inputs_expected_0, guta_stats_0, _end_cap_result_0, _proof_0) =
             self.circuits.dummy_end_cap_circuit.generate_proof_for_inputs(
                 &user_0,
                 user_0_new_state_root,
@@ -170,7 +166,7 @@ impl SimpleChainTestbed {
             )?;
         timer.lap("end generate_proof_for_inputs user 0");
 
-        let (new_user_leaf_1, public_inputs_expected_1, guta_stats_1, end_cap_result_1, proof_1) =
+        let (new_user_leaf_1, _public_inputs_expected_1, guta_stats_1, _end_cap_result_1, _proof_1) =
             self.circuits.dummy_end_cap_circuit.generate_proof_for_inputs(
                 &user_1,
                 user_1_new_state_root,
@@ -196,13 +192,13 @@ impl SimpleChainTestbed {
             checkpoint_historical_merkle_proof: new_checkpoint_merkle_proof.clone(),
         };
 
-        let two_end_cap_input = VerifyTwoEndCapCircuitInput::<F, Hash> {
+        let _two_end_cap_input = VerifyTwoEndCapCircuitInput::<F, Hash> {
             guta_circuit_whitelist: self.circuits.circuit_library.get_group_inclusion_proof(ProvingJobCircuitType::GUTATwoGUTA, ProvingJobCircuitType::GUTATwoGUTA)?.root,
             a_end_cap: end_cap_input_0,
             b_end_cap: end_cap_input_1,
             nca_proof: nca,
         };
-        let worker_rewards_tree_tag = Hash::rand();
+        let _worker_rewards_tree_tag = Hash::rand();
         timer.lap("start verify_two_end_cap.prove_base");
         /*let two_end_cap_proof = self.circuits.circuits.guta_circuits.verify_two_end_cap
         .prove_base(

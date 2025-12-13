@@ -10,7 +10,7 @@ use plonky2::{
         config::AlgebraicHasher, proof::ProofWithPublicInputsTarget,
     },
 };
-use psy_data::{agg::{AggStateTransition, AggStateTransitionWithEvents, TPCircuitFingerprintConfig}, rewards_tree};
+use psy_data::agg::{AggStateTransition, AggStateTransitionWithEvents, TPCircuitFingerprintConfig};
 use psy_plonky2_basic_helpers::builder::{
     connect::CircuitBuilderConnectHelpers, hash::core::CircuitBuilderHashCore,
     verify::CircuitBuilderVerifyProofHelpers,

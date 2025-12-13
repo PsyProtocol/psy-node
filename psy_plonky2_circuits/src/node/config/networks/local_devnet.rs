@@ -7,7 +7,6 @@ use psy_core::{constants::protocol::DA_CHALLENGE_WINDOW, job::job_id::ProvingJob
 use psy_data::{
     config::network_config::PsyNodeCircuitFingerprintConfig,
     genesis::genesis_block_setup::PsyGenesisBlockSetupData,
-    user::complete_user_record::PsyCompactUserDefinition,
     v1::qdata::{checkpoint::PQEDCheckpointLeafStats, pm_jobs_completed_stats::PPMJobsCompletedStats, pm_rewards_commitment::PPMRewardCommitment},
 };
 use psy_plonky2_basic_helpers::verifier::circuit_library::CircuitInfoLibraryCore;

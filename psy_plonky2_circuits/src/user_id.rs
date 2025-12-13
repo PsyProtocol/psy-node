@@ -66,7 +66,7 @@ impl UserIdGeneratorStrategy for UserIdBitsStrategy2 {
         _user_registration_tree_leaf_index: Target,
         user_registration_tree_leaf_index_bits: &[BoolTarget],
         coordinator_user_tree_height: u8,
-        realm_user_tree_height: u8,
+        _realm_user_tree_height: u8,
 
         _group_realm_height: u8,
     ) -> Target {
@@ -107,12 +107,12 @@ impl UserIdGeneratorStrategy for UserIdBitsStrategy3 {
         builder: &mut CircuitBuilder<F, D>,
         _user_registration_tree_leaf_index: Target,
         user_registration_tree_leaf_index_bits: &[BoolTarget],
-        coordinator_user_tree_height: u8,
-        realm_user_tree_height: u8,
+        _coordinator_user_tree_height: u8,
+        _realm_user_tree_height: u8,
 
         _group_realm_height: u8,
     ) -> Target {
-        let global_user_tree_height = (coordinator_user_tree_height + realm_user_tree_height) as usize;
+        //let global_user_tree_height = (coordinator_user_tree_height + realm_user_tree_height) as usize;
 
         let mut new_top_bits = user_registration_tree_leaf_index_bits[10..].to_vec();
         new_top_bits.reverse();
@@ -166,14 +166,14 @@ impl UserIdGeneratorStrategy for UserIdBitsStrategy4 {
         builder: &mut CircuitBuilder<F, D>,
         _user_registration_tree_leaf_index: Target,
         user_registration_tree_leaf_index_bits: &[BoolTarget],
-        coordinator_user_tree_height: u8,
+        _coordinator_user_tree_height: u8,
         realm_user_tree_height: u8,
         group_realm_height: u8,
     ) -> Target {
         let mut realm_index_bit = user_registration_tree_leaf_index_bits[0..(group_realm_height as usize)].to_vec();
         realm_index_bit.reverse();
 
-        let global_user_tree_height = (coordinator_user_tree_height + realm_user_tree_height) as usize;
+        //let global_user_tree_height = (coordinator_user_tree_height + realm_user_tree_height) as usize;
         let user_index_bits =
             user_registration_tree_leaf_index_bits[(group_realm_height as usize)..((group_realm_height + realm_user_tree_height) as usize)].to_vec();
         let group_id_bits = user_registration_tree_leaf_index_bits[((group_realm_height + realm_user_tree_height) as usize)..].to_vec();
@@ -284,11 +284,6 @@ mod tests {
     };
     use rand::{thread_rng, RngCore};
 
-    const REALM_GLOBAL_USER_TREE_HEIGHT: u8 = 14;
-    const COORDINATOR_GLOBAL_USER_TREE_HEIGHT: u8 = 10;
-    const GROUP_REALM_HEIGHT: u8 = 1;
-    const GLOBAL_USER_TREE_HEIGHT: u8 = REALM_GLOBAL_USER_TREE_HEIGHT + COORDINATOR_GLOBAL_USER_TREE_HEIGHT;
-
     use super::{UserIdBitsStrategy1, UserIdBitsStrategy2, UserIdBitsStrategy3, UserIdBitsStrategy4, UserIdGeneratorStrategy};
 
     struct SimpleBitsTester<C: GenericConfig<D>, const D: usize> {
@@ -388,7 +383,6 @@ mod tests {
             realm_user_tree_height: u8,
             group_realm_height: u8,
         ) -> anyhow::Result<()> {
-            type C = PoseidonGoldilocksConfig;
             let max_regions = (count / batch_size) as u64;
             let rand_regions = (rand_count / batch_size) as u64;
             let b_size = batch_size as u64;

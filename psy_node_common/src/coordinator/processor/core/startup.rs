@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use parth_core::{protocol::core_types::QNetworkTypesConfig, QCoreProcCheckpointUniqueId};
 use psy_core::job::job_id::QProvingJobDataID;
-use psy_data::{genesis::genesis_block_setup::PsyGenesisBlockSetupData, prepared_block::coordinator::PsyPreparedCoordinatorBlockStateUpdates};
+use psy_data::prepared_block::coordinator::PsyPreparedCoordinatorBlockStateUpdates;
 use psy_io::tokio::TokioLikeFileSystem;
 use psy_node_core::{
     psy_core_db::traits::full::{PsyCoordinatorProcessorStore, PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter},

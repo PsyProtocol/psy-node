@@ -1,8 +1,8 @@
 use async_trait::async_trait;
-use parth_core::{crypto::hash::{tag_tree::hash_tag_tree_node_single, traits::{FieldQHasher, MerkleZeroHasher, QFieldHashable}}, data::proof_input::CircuitInputWithDependencies, felt::QFelt64, pgoldilocks::QHashOut, protocol::core_types::{Q256BitHash, QFHashBase}};
+use parth_core::{crypto::hash::{tag_tree::hash_tag_tree_node_single, traits::{FieldQHasher, MerkleZeroHasher, QFieldHashable}}, felt::QFelt64, pgoldilocks::QHashOut, protocol::core_types::{Q256BitHash, QFHashBase}};
 use plonky2::{
     hash::hash_types::{HashOut, HashOutTarget}, iop::
-        witness::{self, PartialWitness, WitnessWrite}, plonk::{
+        witness::{PartialWitness, WitnessWrite}, plonk::{
         circuit_builder::CircuitBuilder,
         circuit_data::{CircuitConfig, CircuitData, CommonCircuitData, VerifierOnlyCircuitData},
         config::{AlgebraicHasher, GenericConfig},
@@ -12,11 +12,11 @@ use plonky2::{
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{protocol::{checkpoint_transition_hash::{CheckpointStateHashTransition, CheckpointStateTransitionPublicInputs}, circuit_inputs::checkpoint_transition::QCQEDCheckpointStateTransitionInput}, v1::qdata::checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf}, worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse};
 use psy_plonky2_basic_helpers::{
-    builder::{hash::core::CircuitBuilderHashCore, pad_circuit::CircuitBuilderQEDCommonGates}, verifier::circuit_library::CircuitInfoLibrary,
+    builder::pad_circuit::CircuitBuilderQEDCommonGates, verifier::circuit_library::CircuitInfoLibrary,
 
 };
 use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
-use crate::{coordinator::gadgets::{checkpoint_state_transition::CheckpointStateTransitionPublicInputsGadget, recursive_checkpoint_state_transition_verify::VerifyRecursiveCheckpointStateTransitionProofGadget}, proof_minifier::{pm_chain_dynamic::QEDProofMinifierDynamicChain, pm_core::get_circuit_fingerprint_generic}, qstandard::{QPsyNetworkCircuitWithType, QStandardCircuit, QStandardCircuitProvableWithProofStoreAndRefLibraryAsync, QStandardCircuitProvableWithRawProofsAndRefLibrary, proof_store::QProofStoreReaderAsync}, utils::proof_serialization::deserialize_plonky2_proof};
+use crate::{coordinator::gadgets::{checkpoint_state_transition::CheckpointStateTransitionPublicInputsGadget, recursive_checkpoint_state_transition_verify::VerifyRecursiveCheckpointStateTransitionProofGadget}, proof_minifier::{pm_chain_dynamic::QEDProofMinifierDynamicChain, pm_core::get_circuit_fingerprint_generic}, qstandard::{QPsyNetworkCircuitWithType, QStandardCircuit, QStandardCircuitProvableWithRawProofsAndRefLibrary}, utils::proof_serialization::deserialize_plonky2_proof};
 
 use crate::coordinator::gadgets::{
     checkpoint_state_transition::CheckpointStateTransitionCoreGadget,
@@ -348,20 +348,20 @@ where
             withdrawal_tree_root: todo_add_withdrawals_root,
             user_registration_tree_root: witness.partial.part_1_header.register_users_state_transition.state_transition_start,
         };
-        let new_state_roots = PQEDCheckpointGlobalStateRoots {
+        /*let new_state_roots = PQEDCheckpointGlobalStateRoots {
             contract_tree_root: witness.partial.part_1_header.deploy_contracts_state_transition.state_transition_end,
             deposit_tree_root: todo_add_deposits_root,
             user_tree_root: witness.partial.part_1_header.guta_proof_header.state_transition.new_node_value,
             withdrawal_tree_root: todo_add_withdrawals_root,
             user_registration_tree_root: witness.partial.part_1_header.register_users_state_transition.state_transition_end,
-        };
+        };*/
 
         //println!("old_state_roots: {:#?}", old_state_roots);
 
         //println!("new_state_roots: {:#?}", new_state_roots);
 
         let old_global_chain_root = old_state_roots.qfhash::<C::Hasher>();
-        let new_global_chain_root = new_state_roots.qfhash::<C::Hasher>();
+        //let new_global_chain_root = new_state_roots.qfhash::<C::Hasher>();
         //println!("old_global_chain_root: {:?} ({})", old_global_chain_root.0.elements, hex::encode(&old_global_chain_root.into_owned_32bytes()));
         //println!("new_global_chain_root: {:?} ({})", new_global_chain_root.0.elements, hex::encode(&new_global_chain_root.into_owned_32bytes()));
         let old_stats = witness.partial.old_stats.clone();
@@ -406,7 +406,7 @@ where
         println!("expected_old_public_inputs_preimage: {:#?}", expected_old_public_inputs);
         println!("expected_new_public_inputs_preimage: {:#?}", expected_new_public_inputs);
         let expected_old_public_inputs_hash = expected_old_public_inputs.qfhash::<C::Hasher>();
-        let expected_new_public_inputs_hash = expected_new_public_inputs.qfhash::<C::Hasher>();
+        //let expected_new_public_inputs_hash = expected_new_public_inputs.qfhash::<C::Hasher>();
         let actual_old_public_inputs_hash = QHashOut::<C::F>::from_felt_slice(&previous_checkpoint_state_transition_proof.public_inputs);
         //println!("old_checkpoint_leaf: {:#?}", old_checkpoint_leaf);
         println!("expected public inputs for the last checkpoint transition proof:\n{:?} ({})", expected_old_public_inputs_hash.0.elements, hex::encode(&expected_old_public_inputs_hash.into_owned_32bytes()));
@@ -421,10 +421,10 @@ where
         //println!("last_merkle_proof_checkpoint_leaf_hash: {:?} ({})", witness.previous_checkpoint_proof.value.0.elements, hex::encode(&witness.previous_checkpoint_proof.value.into_owned_32bytes()));
 
 
-        let expected_public_inputs_after = witness.get_public_inputs_hash_with_fingerprint_and_reward_root::<C::Hasher>(
+        /*let expected_public_inputs_after = witness.get_public_inputs_hash_with_fingerprint_and_reward_root::<C::Hasher>(
             self.get_fingerprint(),
             reward_tree_root,
-        );
+        );*/
         //println!("expected new state transition proof public inputs after updating reward root:\n{:?} ({})", expected_public_inputs_after.0.elements, hex::encode(&expected_public_inputs_after.into_owned_32bytes()));
 
         //println!("expected_new_pubs: {:?} ({})", expected_new_pubs.0.elements, hex::encode(&expected_new_pubs.into_owned_32bytes()));

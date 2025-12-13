@@ -1,45 +1,22 @@
-use std::sync::{atomic::AtomicBool, Arc};
 
 use anyhow::Ok;
-use parth_common::memory_stores::{mem_tree_recorder::SimpleMemoryMerkleRecorderStore, traits::PsyMemoryMerkleStoreImm};
 use parth_core::{
-    crypto::hash::{
-        merkle_proof::{DeltaMerkleProofCore, MerkleProofCore},
-        tag_tree::TagTreeMerkleProof,
-        traits::{MerkleZeroHasher, QFieldHashable, ZeroableHash},
-    },
-    data::{
-        hash::{checkpointed_merkle_node::CheckpointedMerkleHash, merkle_node_key::SimpleMerkleNodeKey},
-        queue::queue_key::{QPBaseQueueType, QPStandardUniqueIdQueueKey},
-    },
-    generic_traits::psy_debug_printable::PsyDebugPrintable,
-    node::realm_identifier::QRealmIdentifier,
-    protocol::core_types::{Q256BitHash, QNetworkTypesConfig},
-    QCoreProcCheckpointUniqueId,
+    crypto::hash::
+        merkle_proof::MerkleProofCore
+    ,
+    protocol::core_types::QNetworkTypesConfig,
 };
-use psy_core::{
-    constants::stale_checkpoint::{STALE_CHECKPOINT_AGE_REALM_TO_COORDINATOR_PROOF, STALE_CHECKPOINT_AGE_USER_END_CAP_TO_REALM_PROOF},
-    job::job_id::{ProvingJobCircuitType, QProvingJobDataID},
-};
+use psy_core::
+    job::job_id::ProvingJobCircuitType
+;
 use psy_data::{
-    config::network_config::PsyNodeCircuitFingerprintConfig,
-    genesis::genesis_block_setup::PsyGenesisBlockSetupData,
-    guta::header_extended::GlobalUserTreeAggregatorHeaderWithTagValueAndJobID,
-    node::realm_processor::{RealmProcessorCoreState, RealmProcessorCoreStateWrapper},
-    prepared_block::realm::{PsyPreparedRealmBlockStateUpdates, PsyPreparedRealmBlockStateUpdatesWithCoordinatorUpdate, PsyRealmCoordinatorUpdate},
-    protocol::{
-        checkpoint_transition_hash::CheckpointStateHashTransition,
-        verifiable_checkpoint_transition::{self, PsyVerifiableCheckpointTransition, PsyVerifiableCheckpointTransitionWithProof},
-    },
-    queue_items::realm_user_update::PsyRealmUserUpdateQueueItem,
-    v1::qdata::{
-        checkpoint::QEDL2BlockState, checkpoint_sync::PQEDCheckpointSyncInfoCompact, contract::PsyDeployContractQueueItem,
-        public_key::PZKPublicKeyInfo,
-    },
+    prepared_block::realm::{PsyPreparedRealmBlockStateUpdates, PsyRealmCoordinatorUpdate},
+    v1::qdata::
+        checkpoint_sync::PQEDCheckpointSyncInfoCompact
+    ,
 };
 use psy_io::tokio::TokioLikeFileSystem;
 use psy_node_core::{
-    genesis::genesis_db_data_builder::GenesisDatabaseDataBuilder,
     p2p::traits::realm_coordinantor::RealmCoordinatorClient,
     psy_core_db::traits::full::{
         PsyNodeCheckpointTreeDatabaseReader, PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmProcessorStore,
@@ -49,18 +26,11 @@ use psy_node_core::{
     store::traits::proof_store::QParthProofStore,
 };
 
-use crate::{
-    backup::{checkpoint_tree::CheckpointTreeBackupManager, coordinator::generate_coordinator_output_from_backups},
-    constants::queue::{
-        PQ_COORDINATOR_DEPLOY_CONTRACT_QUEUE_TOPIC_ID, PQ_COORDINATOR_REGISTER_USER_PUBLIC_KEY_QUEUE_TOPIC_ID,
-        PQ_COORDINATOR_SUBMIT_REALM_GUTA_UPDATE_QUEUE_TOPIC_ID, PQ_REALM_SUBMIT_USER_UPDATE_QUEUE_TOPIC_ID,
-    },
-    queue::gatherer::QueueKeyStatusManager,
-    realm::{
-        processor::{db::PsyRealmDatabaseProcessor, processor_shared_status::{PsyRealmProcessorSharedStatus, PsyRealmProcessorSharedStatusWrapper}},
-        queue_key::RealmProvingWorkQueueKey,
-    },
-};
+use crate::
+    realm::
+        processor::db::PsyRealmDatabaseProcessor
+    
+;
 impl<
         N: QNetworkTypesConfig,
         S: PsyRealmProcessorStore<N::F, N::QHash> + Send + Sync,
@@ -163,8 +133,8 @@ where
         &mut self,
         coordinator_update: &PsyRealmCoordinatorUpdate<N::F, N::QHash>,
         realm_update: &PsyPreparedRealmBlockStateUpdates<N::QHash>,
-        state_transition_circuit_type: ProvingJobCircuitType,
-        zk_proof: Vec<u8>,
+        _state_transition_circuit_type: ProvingJobCircuitType,
+        _zk_proof: Vec<u8>,
     ) -> anyhow::Result<()> {
         let checkpoint_id = coordinator_update.checkpoint_sync_info.checkpoint_id;
         let unique_pending_id = self.state.processing_unique_pending_id;

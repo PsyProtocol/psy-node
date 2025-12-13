@@ -160,7 +160,7 @@ fn run_gen_config<N: QNetworkCircuitConstants>(default_user_state_tree_root: QHa
     let end_cap_fingerprint_serialized = r#""5944cd3dbd0eb2246547ece6f2fdd2ff0b0a1e448826cd910b8b4ea53a1fc05e""#;
 
     println!("end_cap_alt_verifier_data: {}", end_cap_alt_verifier_data_serialized);
-    let end_cap_alt_verifier_data: AltVerifierOnlyCircuitData<F> = serde_json::from_str(&end_cap_alt_verifier_data_serialized)?;
+    //let end_cap_alt_verifier_data: AltVerifierOnlyCircuitData<F> = serde_json::from_str(&end_cap_alt_verifier_data_serialized)?;
     
     println!("end_cap_fingerprint: {}", end_cap_fingerprint_serialized);
     let end_cap_fingerprint: QHashOut<F> = serde_json::from_str(&end_cap_fingerprint_serialized)?;

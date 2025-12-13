@@ -1,30 +1,23 @@
 use std::{
-    sync::{Arc, RwLock},
-    time::{Duration, Instant},
+    sync::Arc,
+    time::Duration,
 };
 
-use async_nats::{
+use async_nats::
     jetstream::{
         self,
-        consumer::{pull::Config as PullConfig, PullConsumer},
-        kv::Store,
-    },
-    Subject, ToServerAddrs,
-};
-use async_trait::async_trait;
-use bytes::Bytes;
+        consumer::pull::Config as PullConfig,
+    }
+;
 use dashmap::DashMap;
-use futures::{future::try_join_all, stream::StreamExt};
-use parth_core::{
-    data::queue::queue_key::{PCoreQueueItemBase, PCoreStandardQueueKeyForRealm, QPBaseQueueType, QPStandardUniqueIdQueueKey},
-    QCoreProcCheckpointUniqueId,
-};
+use parth_core::
+    data::queue::queue_key::{QPBaseQueueType, QPStandardUniqueIdQueueKey}
+;
 use psy_node_nats::queue::NatsJetStreamClient;
 use psy_core::job::job_id::QProvingJobDataID;
-use psy_node_core::queue::{
-    ephemeral::{QStandardEphemeralQueuePublisher, QStandardEphemeralQueueSubscriber},
-    worker_queue::{QStandardWorkerQueuePublisher, QStandardWorkerQueueSubscriber},
-};
+use psy_node_core::queue::
+    ephemeral::{QStandardEphemeralQueuePublisher, QStandardEphemeralQueueSubscriber}
+;
 use rand::RngCore;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn, Level};
@@ -123,7 +116,7 @@ async fn processor(trigger_tx: mpsc::Sender<TriggerMessage>, queue_key_helper: A
         }
 
         match response_rx.await {
-            Ok((gathered_users, gathered_user_contract_tree_updates, gathered_contract_state_tree_updates)) => {
+            Ok((gathered_users, _gathered_user_contract_tree_updates, _gathered_contract_state_tree_updates)) => {
                 if gathered_users.is_empty() {
                     info!("PROCESSOR: Received 0 items from gatherer. Nothing to process.");
                 } else {
@@ -170,6 +163,7 @@ struct QueueKeyHelper {
     base_queue_key: QueueKey,
     queue_key_map: DashMap<u32, QueueKey>,
 }
+#[allow(dead_code)]
 impl QueueKeyHelper {
     pub fn set_queue_key_unique_id(&self, unique_id: u128) {
         let mut new_queue_key = self.base_queue_key.clone();
@@ -206,7 +200,7 @@ async fn main() -> anyhow::Result<()> {
     let base_namespace = "EX_JOB_STREAM".to_string();
     let realm_id = 1u64;
     let realm_sub_id = 1u64;
-    let ex_queue_type = 1337u32;
+    // let ex_queue_type = 1337u32;
     let task_group = 1u64;
 
     let timeout_ms = 5000u64;

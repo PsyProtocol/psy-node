@@ -129,7 +129,7 @@ where
         builder.ensure_hash_is_non_zero(a_guta_gadget.guta_proof_header_gadget.checkpoint_tree_root);
         builder.ensure_hash_is_non_zero(historical_checkpoint_proof_b.current_value);
 
-        let mut a_guta_header = a_guta_gadget.get_guta_header::<C::Hasher, C::F>(
+        let a_guta_header = a_guta_gadget.get_guta_header::<C::Hasher, C::F>(
             &mut builder,
             a_guta_gadget.guta_proof_header_gadget.guta_circuit_whitelist,
             //a_guta_gadget.guta_whitelist_merkle_proof.root,

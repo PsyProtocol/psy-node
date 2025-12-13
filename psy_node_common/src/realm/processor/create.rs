@@ -7,13 +7,13 @@ use psy_data::{
 };
 use psy_io::tokio::TokioLikeFileSystem;
 use psy_node_core::{
-    genesis::genesis_db_data_builder::GenesisDatabaseDataBuilder, p2p::traits::realm_coordinantor::RealmCoordinatorClient, psy_core_db::traits::full::{PsyCoordinatorProcessorStore, PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmProcessorStore}, psy_temp_db::StandardProcessorTempDBStoreBase, queue::{
+    genesis::genesis_db_data_builder::GenesisDatabaseDataBuilder, p2p::traits::realm_coordinantor::RealmCoordinatorClient, psy_core_db::traits::full::{PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmProcessorStore}, psy_temp_db::StandardProcessorTempDBStoreBase, queue::{
         ephemeral::QStandardEphemeralQueueSubscriber,
         worker_queue::{QStandardWorkerQueuePublisher, QStandardWorkerQueueSubscriber},
     }, store::traits::proof_store::QParthProofStore
 };
 
-use crate::{coordinator::processor::{PsyCoordinatorProcessor, db::PsyCoordinatorDatabaseProcessor, runner::run_coordinator_processor}, realm::processor::{core::{PsyRealmProcessor, runner::run_realm_processor}, db::PsyRealmDatabaseProcessor}};
+use crate::realm::processor::{core::{PsyRealmProcessor, runner::run_realm_processor}, db::PsyRealmDatabaseProcessor};
 
 pub async fn create_realm_processor<
     N: QNetworkTypesConfig<JobId = QProvingJobDataID> + 'static,

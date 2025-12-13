@@ -1,7 +1,6 @@
-use async_trait::async_trait;
 use parth_core::{
     crypto::hash::{
-        merkle_proof::MerkleProofCore, tag_tree::{hash_tag_tree_node, hash_tag_tree_node_three}, traits::{FieldQHasher, MerkleHasher, MerkleZeroHasher, QFieldHashable}
+        merkle_proof::MerkleProofCore, tag_tree::hash_tag_tree_node_three, traits::{FieldQHasher, MerkleHasher, MerkleZeroHasher}
     },
     felt::QFelt64,
     pgoldilocks::{QHashOut, QRichField},
@@ -292,11 +291,11 @@ where
             witness.deploy_contracts_state_transition.get_agg_state_transition_and_f::<C::F>();
 
         //println!("guta_header: {:#?}", witness.guta_proof_header);
-        let guta_proof_header_hash = witness.guta_proof_header.qfhash::<C::Hasher>();
+        //let guta_proof_header_hash = witness.guta_proof_header.qfhash::<C::Hasher>();
         //println!("guta_proof_header_hash: {:?} ({})", guta_proof_header_hash, hex::encode(&guta_proof_header_hash.to_le_bytes()));
 
-        let guta_public_inputs_expected = <C::Hasher as MerkleHasher<QHashOut<C::F>>>::two_to_one(&guta_proof_header_hash, &guta_proof_rewards_tree_value);
-        let guta_proof_public_inputs = QHashOut::<C::F>::from_felt_slice(&guta_zk_proof.public_inputs[..4]);
+        //let guta_public_inputs_expected = <C::Hasher as MerkleHasher<QHashOut<C::F>>>::two_to_one(&guta_proof_header_hash, &guta_proof_rewards_tree_value);
+        //let guta_proof_public_inputs = QHashOut::<C::F>::from_felt_slice(&guta_zk_proof.public_inputs[..4]);
         //println!("guta_proof_public_inputs: {:?}", guta_proof_public_inputs);
         //println!("guta_public_inputs_expected: {:?} ({})", guta_public_inputs_expected, hex::encode(&guta_public_inputs_expected.to_le_bytes()));
         //println!("guta_rewards_tree_value: {:?} ({})", guta_proof_rewards_tree_value, hex::encode(&guta_proof_rewards_tree_value.to_le_bytes()));
@@ -384,22 +383,22 @@ where
         input.ensure_expected_child_proof_count_with_tags(3)?;
         let witness = QCAggUserRegistartionDeployContractsGUTAInput::<C::F, QHashOut<C::F>>::psy_ser_from_slice(&input.base.witness)?;
 
-        let guta_zk_proof = deserialize_plonky2_proof::<C, D>(&input.input_proofs[0])?;
-        let guta_zk_proof_verifier_data = library.get_verifier_data(input.get_child_proof_circuit_type(0)?)?;
-        let guta_inclusion_proof = library.get_group_inclusion_proof(ProvingJobCircuitType::GUTATwoGUTA, input.get_child_proof_circuit_type(0)?)?;
+        let _guta_zk_proof = deserialize_plonky2_proof::<C, D>(&input.input_proofs[0])?;
+        let _guta_zk_proof_verifier_data = library.get_verifier_data(input.get_child_proof_circuit_type(0)?)?;
+        let _guta_inclusion_proof = library.get_group_inclusion_proof(ProvingJobCircuitType::GUTATwoGUTA, input.get_child_proof_circuit_type(0)?)?;
         let guta_proof_rewards_tree_value = input.base.child_proof_tag_values[0];
 
-        let user_registration_zk_proof = deserialize_plonky2_proof::<C, D>(&input.input_proofs[1])?;
-        let user_registration_zk_proof_verifier_data = library.get_verifier_data(input.get_child_proof_circuit_type(1)?)?;
+        let _user_registration_zk_proof = deserialize_plonky2_proof::<C, D>(&input.input_proofs[1])?;
+        let _user_registration_zk_proof_verifier_data = library.get_verifier_data(input.get_child_proof_circuit_type(1)?)?;
         let register_users_proof_rewards_tree_value = input.base.child_proof_tag_values[1];
 
-        let deploy_contracts_zk_proof = deserialize_plonky2_proof::<C, D>(&input.input_proofs[2])?;
-        let deploy_contracts_zk_proof_verifier_data = library.get_verifier_data(input.get_child_proof_circuit_type(2)?)?;
+        let _deploy_contracts_zk_proof = deserialize_plonky2_proof::<C, D>(&input.input_proofs[2])?;
+        let _deploy_contracts_zk_proof_verifier_data = library.get_verifier_data(input.get_child_proof_circuit_type(2)?)?;
         let deploy_contracts_proof_rewards_tree_value = input.base.child_proof_tag_values[2];
 
-        let (register_users_state_transition, register_users_total_proofs_generated) =
+        let (_register_users_state_transition, _register_users_total_proofs_generated) =
             witness.register_users_state_transition.get_agg_state_transition_and_f::<C::F>();
-        let (deploy_contracts_state_transition, deploy_contracts_total_proofs_generated) =
+        let (_deploy_contracts_state_transition, _deploy_contracts_total_proofs_generated) =
             witness.deploy_contracts_state_transition.get_agg_state_transition_and_f::<C::F>();
 
         let public_inputs_hash_no_rewards_tag = input.base.job.metadata.compute_reward_tagged_expected_public_inputs::<C::Hasher>(

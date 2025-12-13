@@ -1,10 +1,8 @@
 use parth_common::memory_stores::traits::PsyMemoryMerkleStoreAppendOnlyReaderBaseAsync;
-use parth_core::{crypto::hash::traits::{FieldQHasher, PCircuitWitness}, data::hash::merkle_node_key::SimpleMerkleNodeKey, felt::QFelt64, protocol::core_types::{Q256BitHash, QFHashBase, QNetworkTypesConfig}};
+use parth_core::{crypto::hash::traits::FieldQHasher, data::hash::merkle_node_key::SimpleMerkleNodeKey, felt::QFelt64, protocol::core_types::{Q256BitHash, QFHashBase, QNetworkTypesConfig}};
 use psy_core::job::job_id::QProvingJobDataID;
-use psy_data::{agg::AggStateTransitionInputV2, guta::header_extended::GlobalUserTreeAggregatorHeaderWithTagValueAndJobID, worker::metadata_with_job_id::PsyProvingJobMetadataWithJobId};
-use psy_serialize::PsySerializeCanonicalAsyncSafe;
+use psy_data::{guta::header_extended::GlobalUserTreeAggregatorHeaderWithTagValueAndJobID, worker::metadata_with_job_id::PsyProvingJobMetadataWithJobId};
 
-use crate::store::traits::checkpoint_fetcher::PsyAppendOnlyTreeFetcher;
 
 
 pub trait NCATreePlannerHelper<JobId, Hash, LeafWitness, AggWitness, DummyWitness> {

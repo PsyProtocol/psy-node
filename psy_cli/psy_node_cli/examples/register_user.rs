@@ -2,7 +2,7 @@ use cf_utils::timer::DebugTimer;
 use jsonrpsee::{
     http_client::{HttpClient, HttpClientBuilder}, ws_client::WsClientBuilder
 };
-use parth_core::{QJobIdBase, crypto::hash::traits::FieldQHasher, felt::QFelt64, pgoldilocks::PoseidonHasher, protocol::core_types::{Q256BitHash, QDBHashBase, QFHashBase, QHashBase}, utils::QPGenRandom};
+use parth_core::{QJobIdBase, crypto::hash::traits::FieldQHasher, felt::QFelt64, pgoldilocks::PoseidonHasher, protocol::core_types::{QDBHashBase, QFHashBase, QHashBase}, utils::QPGenRandom};
 use plonky2::{field::goldilocks_field::GoldilocksField, plonk::{config::PoseidonGoldilocksConfig, proof::ProofWithPublicInputs}};
 use psy_api_core::coordinator::standard_edge_rpc::CoordinatorEdgeRpcClient;
 use psy_core::job::job_id::QProvingJobDataID;
@@ -41,6 +41,7 @@ struct PsyCoordinatorHTTPClient<F: QFelt64, Hash: QFHashBase<F> + QDBHashBase + 
     _phantom_hasher: std::marker::PhantomData<Hasher>,
 }
 
+#[allow(dead_code)] 
 impl<F: QFelt64, Hash: QFHashBase<F> + QDBHashBase + QPGenRandom, Hasher: FieldQHasher<F, Hash>, JobId: QJobIdBase + Send + Sync + 'static, ZKProof: Send + Sync + 'static, C: CoordinatorEdgeRpcClient<F, Hash, JobId, ZKProof>> PsyCoordinatorHTTPClient<F, Hash, Hasher, JobId, ZKProof, C> {
     pub fn new(client: C) -> Self {
         Self {
@@ -69,7 +70,7 @@ impl<F: QFelt64, Hash: QFHashBase<F> + QDBHashBase + QPGenRandom, Hasher: FieldQ
         Ok(())
     }
     pub async fn deploy_random_contracts(&self, count: usize, max_functions: usize) -> anyhow::Result<()> {
-        for i in 0..count {
+        for _ in 0..count {
             let contract = gen_random_contract::<Hash>(max_functions);
             let result: String = self.client.deploy_contract(contract).await?;
             println!("Deployed contract with result hash: {}", result);
@@ -134,7 +135,7 @@ async fn test_client() -> anyhow::Result<()> {
     
     println!("HTTP client test passed.");
 
-    let h_client = PsyCoordinatorHTTPClient::<F, Hash, Hasher, QProvingJobDataID, ZKProof, HttpClient>::new(http_client);
+    let _h_client = PsyCoordinatorHTTPClient::<F, Hash, Hasher, QProvingJobDataID, ZKProof, HttpClient>::new(http_client);
 
 
     Ok(())

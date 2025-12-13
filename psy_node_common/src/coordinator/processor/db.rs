@@ -19,7 +19,7 @@ use psy_data::{
     prepared_block::coordinator::PsyPreparedCoordinatorBlockStateUpdates,
     protocol::{
         checkpoint_transition_hash::CheckpointStateHashTransition,
-        verifiable_checkpoint_transition::{self, PsyVerifiableCheckpointTransition, PsyVerifiableCheckpointTransitionWithProof},
+        verifiable_checkpoint_transition::{PsyVerifiableCheckpointTransition, PsyVerifiableCheckpointTransitionWithProof},
     },
     v1::qdata::{checkpoint::QEDL2BlockState, contract::PsyDeployContractQueueItem, public_key::PZKPublicKeyInfo},
 };

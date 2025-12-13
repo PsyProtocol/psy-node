@@ -3,9 +3,8 @@ use parth_core::{
         tag_tree::hash_tag_tree_node,
         traits::{FieldQHasher, MerkleHasher, QFieldHashable, ZeroableHash},
     },
-    felt::{QFelt, QFelt64},
-    impl_qpd_serialize_params,
-    protocol::core_types::{Q256BitHash, QFHashBase, QHashBase},
+    felt::QFelt64,
+    protocol::core_types::{Q256BitHash, QFHashBase},
     utils::QPGenRandom,
 };
 use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata, PsyIOReadWrite};

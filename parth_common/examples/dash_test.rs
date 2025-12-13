@@ -8,7 +8,7 @@ pub fn dash_time_it<Hash: Copy + PartialEq + ZeroableHash + Default + QPGenRando
     let mut timer = DebugTimer::new(&format!("dash_time_it height {}", height));
 
     let max_leaves = 1u64 << height;
-    let mut tree = PsyDashMemoryMerkleStore::<Hasher, Hash>::new(height);
+    let tree = PsyDashMemoryMerkleStore::<Hasher, Hash>::new(height);
     timer.lap("starting generate random leaves");
     let mut leaves = Vec::with_capacity(max_leaves as usize);
     for _ in 0..max_leaves {

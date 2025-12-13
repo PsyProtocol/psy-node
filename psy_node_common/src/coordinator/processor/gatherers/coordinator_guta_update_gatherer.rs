@@ -198,6 +198,7 @@ pub struct CoordinatorGUTAUpdateGatherer<
     pub new_coordinator_guta_file: FileSystem::File,
     pub pending_file_path: String,
 }
+/*
 impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>, FileSystem: TokioLikeFileSystem> CoordinatorGUTAUpdateGatherer<N, TempDatabase, FileSystem>
 {
     fn update_status(&mut self) -> anyhow::Result<()> {
@@ -207,6 +208,7 @@ impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::J
         Ok(())
     }
 }
+*/
 #[derive(Clone)]
 pub struct CoordinatorGUTAUpdateGathererOutputDatabase<F, Hash> {
     pub update_global_user_tree_nodes_ffs: Vec<u8>,
