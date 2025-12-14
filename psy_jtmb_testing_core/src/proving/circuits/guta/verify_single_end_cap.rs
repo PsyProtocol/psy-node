@@ -11,7 +11,7 @@ use crate::{
         }
     ,
     utils::{
-        circuit_info_library::PsyJTMBCircuitInfoLibrary, jtmb_standard_circuit::{JTMBCircuitConfig, QJTMBProofCircuit, QJTMBProofCircuitBase}, proof_library::get_single_child_proof_for_api_response_with_inclusion_proof
+        circuit_info_library::PsyJTMBCircuitInfoLibrary, jtmb_standard_circuit::{JTMBCircuitConfig, QJTMBProofCircuit, QJTMBProofCircuitBase}, proof_library::get_single_child_proof_for_api_response_with_inclusion_proof, proof_serialization::deserialize_jtmb_proof
     },
 };
 use parth_common::secp256k1::MemorySecp256K1SinglePrivateKeyWallet;
@@ -115,6 +115,10 @@ impl<L: PsyJTMBCircuitInfoLibrary<C::Hash>, C: JTMBCircuitConfig> QJTMBProofCirc
         input: PsyWorkerGetProvingWorkWithChildProofsAPIResponse<C::Hash, QProvingJobDataID>,
         worker_reward_tag: C::Hash,
     ) -> anyhow::Result<PsyTestJTMBProof<C::Hash>> {
+        let proof = input.input_proofs[0].clone();
+        println!("proof: {:?}", hex::encode(&proof));
+        let decoded = deserialize_jtmb_proof::<C::Hash>(&proof)?;
+        println!("decoded proof: {:?}", decoded);
         let child = get_single_child_proof_for_api_response_with_inclusion_proof::<L, C::Hash, C::Hasher>(library, &input)?;
         let witness = VerifySingleEndCapInputV2::<C::F, C::Hash>::psy_ser_from_slice(&input.base.witness)?;
 

@@ -43,8 +43,8 @@ pub async fn run_worker_inner(
     proving_backend: PsyChainProvingBackendType,
     network: PsyChainNetworkType,
 ) -> anyhow::Result<()> {
-    if proving_backend == PsyChainProvingBackendType::JTMBPoseidonGoldilocks {
-        info!("Using JTMB Poseidon Goldilocks proving backend for dummy end cap prover");
+    if proving_backend == PsyChainProvingBackendType::Plonky2PoseidonGoldilocks {
+        info!("Using Plonky2 Poseidon Goldilocks proving backend for dummy end cap prover");
         type N = QNetworkTypesConfigHelper<QProvingJobDataID, ZKTypesPlonky2GoldilocksPoseidon, PsyNetworkLocalDevnetConstants>;
         let mut prover = create_plonky2_dummy_end_cap_prover::<N, C, D>(&api_url)?;
 
@@ -68,6 +68,7 @@ pub async fn run_worker_inner(
             sleep(Duration::from_secs(1)).await;
         }
     } else if proving_backend == PsyChainProvingBackendType::JTMBPoseidonGoldilocks {
+        info!("Using JTMB Poseidon Goldilocks proving backend for dummy end cap prover");
         type N = QNetworkTypesConfigHelper<QProvingJobDataID, ZKTypesJTMBGoldilocksPoseidon, PsyNetworkLocalDevnetConstants>;
         let mut prover = create_jtmb_dummy_end_cap_prover::<N, JTMBPoseidonGoldilocksConfig>(&api_url, network)?;
 

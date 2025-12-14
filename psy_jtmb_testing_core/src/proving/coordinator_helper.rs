@@ -20,7 +20,7 @@ use crate::{
             batch_append_user_registration_tree::BatchAppendUserRegistrationTreeCircuit,
             batch_deploy_contract::BatchDeployContractsCircuit,
             checkpoint_state_transition::QEDCheckpointStateTransitionCircuit,
-            checkpoint_state_transition_genesis::QEDCheckpointStateTransitionGenesisCircuit,
+            checkpoint_state_transition_genesis::QEDCheckpointStateTransitionGenesisCircuit, dummy_agg_state_transition::AggStateTransitionDummyCircuitV2,
         },
         guta_helper::QEDGUTACircuitManager,
     },
@@ -35,7 +35,7 @@ pub struct QEDCoordinatorCircuitManager<C: JTMBCircuitConfig> {
     pub append_user_registration_tree: BatchAppendUserRegistrationTreeCircuit<C>,
     pub batch_deploy_contracts: BatchDeployContractsCircuit<C>,
     pub agg_state_transition: AggStateTransitionCircuitV2<C>,
-    pub dummy_agg_state_transition: AggStateTransitionCircuitV2<C>,
+    pub dummy_agg_state_transition: AggStateTransitionDummyCircuitV2<C>,
     pub agg_user_register_deploy_contracts_guta: VerifyAggUserRegistartionDeployContractsGUTACircuit<C>,
     pub checkpoint_root_transition: QEDCheckpointStateTransitionCircuit<C>,
     pub genesis_checkpoint_root_transition: QEDCheckpointStateTransitionGenesisCircuit<C>,
@@ -89,14 +89,10 @@ impl<C: JTMBCircuitConfig> QEDCoordinatorCircuitManager<C> {
 
         let agg_state_transition = AggStateTransitionCircuitV2::new(
             private_key,
-            false,
-            ProvingJobCircuitType::AppendUserRegistrationTreeAggregate,
         );
 
-        let dummy_agg_state_transition = AggStateTransitionCircuitV2::new(
+        let dummy_agg_state_transition = AggStateTransitionDummyCircuitV2::new(
             private_key,
-            true,
-            ProvingJobCircuitType::DummyBatchDeployContractsAggregate,
         );
 
         let user_reg_conf = TPAltCircuitFingerprintConfig {
@@ -170,7 +166,7 @@ impl<C: JTMBCircuitConfig> QEDCoordinatorCircuitManager<C> {
         }
 
         library.register_circuit(ProvingJobCircuitType::BatchDeployContractsAggregate, self.agg_state_transition.get_fingerprint(), self.agg_state_transition.get_verifier_data().clone());
-        library.register_circuit(ProvingJobCircuitType::DummyAppendUserRegistrationTreeAggregate, self.dummy_agg_state_transition.get_fingerprint(), self.dummy_agg_state_transition.get_verifier_data().clone());
+        library.register_circuit(ProvingJobCircuitType::DummyBatchDeployContractsAggregate, self.dummy_agg_state_transition.get_fingerprint(), self.dummy_agg_state_transition.get_verifier_data().clone());
 
         self.guta_circuits.register_library(library);
     }

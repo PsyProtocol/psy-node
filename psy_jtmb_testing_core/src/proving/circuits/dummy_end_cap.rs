@@ -118,6 +118,9 @@ impl<C: JTMBCircuitConfig> DummyUPSProver<C::F, C::Hash> for DummyUPSStandardEnd
         let proof = self.prove_base(
             dummy_public_inputs,
         )?;
-        serialize_jtmb_proof(&proof)
+        println!("DummyUPSStandardEndCapCircuit::prove_end_cap_dummy_ups - proof: {:#?}", proof);
+        let result = serialize_jtmb_proof(&proof)?;
+        println!("DummyUPSStandardEndCapCircuit::prove_end_cap_dummy_ups - serialized proof: {:?}", hex::encode(&result));
+        Ok(result)
     }
 }

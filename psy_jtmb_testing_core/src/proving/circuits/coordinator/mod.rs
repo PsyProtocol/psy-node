@@ -4,3 +4,4 @@ pub mod agg_state_transition;
 pub mod agg_user_registration_deploy_guta;
 pub mod checkpoint_state_transition;
 pub mod checkpoint_state_transition_genesis;
+pub mod dummy_agg_state_transition;

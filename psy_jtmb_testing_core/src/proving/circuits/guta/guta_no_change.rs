@@ -114,12 +114,13 @@ impl<L: PsyJTMBCircuitInfoLibrary<C::Hash>, C: JTMBCircuitConfig> QJTMBProofCirc
         input: PsyWorkerGetProvingWorkWithChildProofsAPIResponse<C::Hash, QProvingJobDataID>,
         worker_reward_tag: C::Hash,
     ) -> anyhow::Result<PsyTestJTMBProof<C::Hash>> {
-        let whitelist_root = library.get_agg_whitelist::<C::Hasher>(ProvingJobCircuitType::GUTANoChange)?; 
+        let guta_whitelist_root=
+            library.get_group_inclusion_proof(ProvingJobCircuitType::GUTATwoGUTA, ProvingJobCircuitType::GUTATwoGUTA)?.root;
         let witness = GUTANoChangeFullInput::<C::Hash>::psy_ser_from_slice(&input.base.witness)?;
 
         self.prove_base(
             worker_reward_tag,
-            whitelist_root,
+            guta_whitelist_root,
             &witness,
         )
     }

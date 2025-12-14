@@ -1,7 +1,7 @@
 use parth_core::protocol::core_types::{QZKProofPublicInputsHasherReader, QZKProofVerifier};
 use psy_core::job::job_id::ProvingJobCircuitType;
 
-use crate::{proof::PsyTestJTMBProof, utils::{generic_circuit_library::JTMBGenericCircuitVerifier, jtmb_standard_circuit::JTMBCircuitConfig}};
+use crate::{proof::PsyTestJTMBProof, utils::{generic_circuit_library::JTMBGenericCircuitVerifier, jtmb_standard_circuit::JTMBCircuitConfig, proof_serialization::deserialize_jtmb_proof}};
 
 
 #[derive(Clone, Debug)]
@@ -21,9 +21,7 @@ impl<C: JTMBCircuitConfig> QZKProofPublicInputsHasherReader<C::Hash, PsyTestJTMB
         Ok(proof.public_inputs_hash)
     }
     fn try_proof_from_slice(bytes: &[u8]) -> anyhow::Result<PsyTestJTMBProof<C::Hash>> {
-        let proof: PsyTestJTMBProof<C::Hash> = bincode::deserialize(bytes)
-            .map_err(|e| anyhow::anyhow!("Failed to deserialize proof: {}", e))?;
-        Ok(proof)
+        deserialize_jtmb_proof(bytes)
     }
 }
 impl<C: JTMBCircuitConfig> QZKProofVerifier<C::Hash, PsyTestJTMBProof<C::Hash>> for PsyJTMBZKVerifier<C> {

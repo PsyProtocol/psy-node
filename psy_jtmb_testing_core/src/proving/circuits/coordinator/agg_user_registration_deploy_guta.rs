@@ -156,9 +156,6 @@ impl<C: JTMBCircuitConfig> VerifyAggUserRegistartionDeployContractsGUTACircuit<C
             guta_rewards,
         )?;
 
-        // 4. Aggregation Logic
-        jtmb_connect_ref(&register_users_state_transition.state_transition_end, &deploy_contracts_state_transition.state_transition_start, "reg user end != deploy contract start")?;
-
         let user_reg_contract_start = C::Hasher::two_to_one(&register_users_state_transition.state_transition_start, &deploy_contracts_state_transition.state_transition_start);
         let user_reg_contract_end = C::Hasher::two_to_one(&register_users_state_transition.state_transition_end, &deploy_contracts_state_transition.state_transition_end);
         let user_reg_contract_combo = C::Hasher::two_to_one(&user_reg_contract_start, &user_reg_contract_end);

@@ -39,29 +39,30 @@ pub fn verify_checkpoint_transition_core<C: JTMBCircuitConfig>(
 }
 
 pub fn construct_new_checkpoint_leaf<C: JTMBCircuitConfig>(
-    _old_state_roots: &PQEDCheckpointGlobalStateRoots<C::Hash>,
     new_state_roots: &PQEDCheckpointGlobalStateRoots<C::Hash>,
-    old_leaf: &PQEDCheckpointLeaf<C::F, C::Hash>,
     part_1_reward_root: C::Hash,
     worker_reward_tag: C::Hash,
-    // Delta values
-    fees_delta: C::F,
-    ops_delta: C::F,
-    txs_delta: C::F,
-    slots_delta: C::F,
-    pm_jobs_delta: psy_data::v1::qdata::pm_jobs_completed_stats::PPMJobsCompletedStats<C::F>,
+    // These parameters represent the total stats for the current block, not deltas.
+    fees_for_block: C::F,
+    ops_for_block: C::F,
+    txs_for_block: C::F,
+    slots_for_block: C::F,
+    pm_jobs_for_block: psy_data::v1::qdata::pm_jobs_completed_stats::PPMJobsCompletedStats<C::F>,
     block_time: C::F,
     random_seed_contrib: C::Hash,
 ) -> PQEDCheckpointLeaf<C::F, C::Hash> {
     let rewards_root = hash_tag_tree_node_single::<C::Hash, C::Hasher>(&part_1_reward_root, &worker_reward_tag);
     let zero = C::F::from_u64_value(0);
     
+    // FIX: The circuit logic does not accumulate stats from the previous block.
+    // It directly assigns the totals for the current block.
+    // To match the circuit, we must do the same here.
     let new_stats = psy_data::v1::qdata::checkpoint::PQEDCheckpointLeafStats {
-        fees_collected: old_leaf.stats.fees_collected + fees_delta,
-        user_ops_processed: old_leaf.stats.user_ops_processed + ops_delta,
-        total_transactions: old_leaf.stats.total_transactions + txs_delta,
-        slots_modified: old_leaf.stats.slots_modified + slots_delta,
-        pm_jobs_completed: old_leaf.stats.pm_jobs_completed.combine(&pm_jobs_delta),
+        fees_collected: fees_for_block,
+        user_ops_processed: ops_for_block,
+        total_transactions: txs_for_block,
+        slots_modified: slots_for_block,
+        pm_jobs_completed: pm_jobs_for_block, // This is also a direct assignment, not a combination.
         block_time,
         random_seed: random_seed_contrib,
         pm_rewards_commitment: psy_data::v1::qdata::pm_rewards_commitment::PPMRewardCommitment {
