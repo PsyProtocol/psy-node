@@ -66,4 +66,6 @@ psy_io = { workspace = true }
 psy_api_core = { workspace = true }
 psy_worker_core = { workspace = true, features = ["clap_cli"] }
 psy_plonky2_circuits = { workspace = true }
+psy_jtmb_testing_core = { workspace = true }
+
 psy_dummy_prover = { workspace = true }

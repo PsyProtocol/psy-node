@@ -30,6 +30,7 @@ members = [
     "psy_dummy_prover",
     "psy_cli/psy_worker_cli",
     "psy_cli/psy_node_cli",
+    "psy_jtmb_testing_core",
 ]
 resolver = "2"
 
@@ -196,7 +197,7 @@ psy_node_redis = { path = "./psy_node_redis" }
 psy_node_nats = { path = "./psy_node_nats" }
 psy_node_scylla = { path = "./psy_node_scylla" }
 psy_node_store_memory = { path = "./psy_node_store_memory" }
-
+psy_jtmb_testing_core = { path = "./psy_jtmb_testing_core" }
 
 # Dev dependencies
 criterion = { version = "0.5.1", features = ["async_tokio", "async_futures"] }

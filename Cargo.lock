@@ -2920,6 +2920,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "psy_jtmb_testing_core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "auto_impl",
+ "bincode",
+ "cf_utils",
+ "hashbrown 0.14.5",
+ "hex",
+ "hex-literal",
+ "jsonrpsee",
+ "parth_common",
+ "parth_core",
+ "parth_crypto",
+ "pderive",
+ "postcard",
+ "pser",
+ "psy_core",
+ "psy_data",
+ "psy_dummy_prover",
+ "psy_io",
+ "psy_node_core",
+ "psy_node_store_memory",
+ "psy_serialize",
+ "psy_worker_core",
+ "rand 0.8.5",
+ "rkyv",
+ "serde",
+ "serde_json",
+ "serde_repr",
+ "serde_with",
+ "speedy",
+ "strum",
+ "strum_macros",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "psy_node_cli"
 version = "0.1.0"
 dependencies = [
@@ -2949,6 +2989,7 @@ dependencies = [
  "psy_core",
  "psy_data",
  "psy_io",
+ "psy_jtmb_testing_core",
  "psy_node_common",
  "psy_node_core",
  "psy_node_nats",
@@ -3486,6 +3527,7 @@ dependencies = [
  "psy_data",
  "psy_dummy_prover",
  "psy_io",
+ "psy_jtmb_testing_core",
  "psy_plonky2_circuits",
  "psy_serialize",
  "psy_worker_core",

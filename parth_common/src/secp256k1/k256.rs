@@ -109,6 +109,69 @@ impl Secp256K1Verifier for Secp256K1VerifierHelper {
     }
 }
 
+
+#[derive(Debug, Clone)]
+pub struct MemorySecp256K1SinglePrivateKeyWallet {
+    private_key: k256::ecdsa::SigningKey,
+    public_key: CompressedPublicKey,
+}
+impl MemorySecp256K1SinglePrivateKeyWallet {
+    pub fn new(private_key: Hash256) -> anyhow::Result<Self> {
+        let signing_key = k256::ecdsa::SigningKey::from_slice(&private_key.0)?;
+        let public_key = get_public_key_for_secp256k1_private_key(private_key)?;
+        Ok(Self {
+            private_key: signing_key,
+            public_key,
+        })
+    }
+    pub fn new_from_private_key_bytes(private_key_bytes: &[u8;32]) -> anyhow::Result<Self> {
+        let signing_key = k256::ecdsa::SigningKey::from_slice(private_key_bytes)?;
+        let mut pk_array = [0u8;32];
+        pk_array.copy_from_slice(private_key_bytes);
+        let private_key = Hash256(pk_array);
+        let public_key = get_public_key_for_secp256k1_private_key(private_key)?;
+        Ok(Self {
+            private_key: signing_key,
+            public_key,
+        })
+    }
+    pub fn get_public_key(&self) -> CompressedPublicKey {
+        self.public_key.clone()
+    }
+}
+impl Secp256K1WalletProvider for MemorySecp256K1SinglePrivateKeyWallet {
+    fn sign(
+        &self,
+        public_key: &CompressedPublicKey,
+        message: Hash256,
+    ) -> anyhow::Result<QEDCompressedSecp256K1Signature> {
+        if &self.public_key != public_key {
+            anyhow::bail!("public key not found in wallet")
+        }
+        let result: k256::ecdsa::Signature =
+            self.private_key.sign_prehash(&message.0)?;
+        let mut rs_bytes = [0u8; 64];
+
+        let r_bytes = result.r().to_bytes();
+        let s_bytes = result.s().to_bytes();
+        rs_bytes[0..32].copy_from_slice(&r_bytes);
+        rs_bytes[32..64].copy_from_slice(&s_bytes);
+
+        Ok(QEDCompressedSecp256K1Signature {
+            public_key: public_key.0,
+            signature: rs_bytes,
+            message: message,
+        })
+    }
+
+    fn contains_public_key(&self, public_key: &CompressedPublicKey) -> bool {
+        &self.public_key == public_key
+    }
+
+    fn get_public_keys(&self) -> Vec<CompressedPublicKey> {
+        vec![self.public_key.clone()]
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

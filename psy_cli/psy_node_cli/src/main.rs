@@ -1,10 +1,17 @@
 mod subcommand;
 
 use clap::Parser;
+use psy_core::constants::proving_backends::{PsyChainProvingBackendType, PsyChainProvingBackendTypeInput};
 use psy_node_core::config::node_cli_config::{CoordinatorEdgeCliConfig, CoordinatorProcessorCliConfig, RealmEdgeCliConfig, RealmProcessorCliConfig};
 
 use crate::subcommand::{Cli, Commands, start_coordinator_edge, start_coordinator_processor, start_realm_edge, start_realm_processor};
 
+
+fn get_proving_backend_from_input(
+    input: Option<PsyChainProvingBackendTypeInput>,
+) -> PsyChainProvingBackendType {
+   input.unwrap_or(PsyChainProvingBackendTypeInput::Plonky2PoseidonGoldilocks).into()
+}
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
@@ -25,6 +32,7 @@ async fn main() -> anyhow::Result<()> {
             verbose,
             checkpoint_backup_path,
             coordinator_api_urls,
+            proving_backend,
         } => {
             let config = RealmProcessorCliConfig::get_start_config(
                 config,
@@ -40,7 +48,7 @@ async fn main() -> anyhow::Result<()> {
                 coordinator_api_urls,
             )
             .await?;
-            start_realm_processor::run(config).await?;
+            start_realm_processor::run(config, get_proving_backend_from_input(proving_backend)).await?;
         }
         Commands::StartRealmEdge {
             config,
@@ -54,6 +62,7 @@ async fn main() -> anyhow::Result<()> {
             verbose,
             port,
             listen,
+            proving_backend,
         } => {
             let config = RealmEdgeCliConfig::get_start_config(
                 config,
@@ -69,7 +78,7 @@ async fn main() -> anyhow::Result<()> {
                 listen,
             )
             .await?;
-            start_realm_edge::run(config).await?;
+            start_realm_edge::run(config, get_proving_backend_from_input(proving_backend)).await?;
         }
         Commands::StartCoordinatorProcessor {
             config,
@@ -82,6 +91,7 @@ async fn main() -> anyhow::Result<()> {
             network,
             verbose,
             checkpoint_backup_path,
+            proving_backend,
         } => {
             let config = CoordinatorProcessorCliConfig::get_start_config(
                 config,
@@ -96,7 +106,7 @@ async fn main() -> anyhow::Result<()> {
                 checkpoint_backup_path,
             )
             .await?;
-            start_coordinator_processor::run(config).await?;
+            start_coordinator_processor::run(config, get_proving_backend_from_input(proving_backend)).await?;
         }
         Commands::StartCoordinatorEdge {
             config,
@@ -110,6 +120,7 @@ async fn main() -> anyhow::Result<()> {
             verbose,
             port,
             listen,
+            proving_backend,
         } => {
             let config = CoordinatorEdgeCliConfig::get_start_config(
                 config,
@@ -125,7 +136,7 @@ async fn main() -> anyhow::Result<()> {
                 listen,
             )
             .await?;
-            start_coordinator_edge::run(config).await?;
+            start_coordinator_edge::run(config, get_proving_backend_from_input(proving_backend)).await?;
         }
     };
     Ok::<_, anyhow::Error>(())

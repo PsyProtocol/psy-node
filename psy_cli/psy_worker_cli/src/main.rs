@@ -21,8 +21,9 @@ async fn main() -> anyhow::Result<()> {
             wallet_password,
             user,
             network,
+            proving_backend,
         } => {
-            worker::run(config, private_key, keystore_path, wallet_password, user, network).await?;
+            worker::run(config, private_key, keystore_path, wallet_password, user, network, proving_backend).await?;
         }
         Commands::WorkerTest {
             config,
@@ -31,8 +32,9 @@ async fn main() -> anyhow::Result<()> {
             wallet_password,
             user,
             network,
+            proving_backend,
         } => {
-            worker_test::run(config, private_key, keystore_path, wallet_password, user, network).await?;
+            worker_test::run(config, private_key, keystore_path, wallet_password, user, network, proving_backend).await?;
         },
         Commands::GenerateKeypair => {
             keypair_helper::generate_keypair()?;
@@ -47,6 +49,7 @@ async fn main() -> anyhow::Result<()> {
             max_contract_calls,
             user_id,
             network,
+            proving_backend,
         } => {
             subcommand::dummy_end_cap_prover::run(
                 api_url,
@@ -55,6 +58,7 @@ async fn main() -> anyhow::Result<()> {
                 max_contract_calls,
                 user_id,
                 network,
+                proving_backend,
             ).await?;
         },
     };

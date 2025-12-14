@@ -2,7 +2,7 @@ use std::
     time::Duration
 ;
 
-use psy_core::constants::chain_id::PsyNetworkTypeInput;
+use psy_core::constants::{chain_id::PsyNetworkTypeInput, proving_backends::PsyChainProvingBackendTypeInput};
 use tokio::time::sleep;
 use tracing::{error, info};
 
@@ -36,6 +36,7 @@ pub async fn run(
     _wallet_password: Option<String>,
     _recipient: Option<u64>,
     _network: Option<PsyNetworkTypeInput>,
+    _proving_backend: Option<PsyChainProvingBackendTypeInput>,
 ) -> anyhow::Result<()> {
     print_banner();
     info!("Worker starting...");
