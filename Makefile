@@ -25,8 +25,6 @@ register-users:
 query-chain-info:
 	./target/release/examples/query_chain_info
 
-all: build
-
 run-all: shutdown clean-db init-db
 	./run_all.sh
 
@@ -70,8 +68,8 @@ run-dummy-prover:
 	./target/release/psy_worker_cli dummy-end-cap-prover --url http://127.0.0.1:1338 --user 0 --min-state-updates 1 --max-state-updates 2 --max-contract-calls 1
 
 shutdown:
-	pkill -f "psy_node_cli" || true
-	pkill -f "psy_worker_cli" || true
+	-ps aux | grep "[p]sy_node_cli" | awk '{print $$2}' | xargs kill -KILL 2>/dev/null || true
+	-ps aux | grep "[p]sy_worker_cli" | awk '{print $$2}' | xargs kill -KILL 2>/dev/null || true
 
 clean-db:
 	docker rm -f scylla-server || true

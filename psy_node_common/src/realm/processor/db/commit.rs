@@ -25,12 +25,10 @@ use psy_node_core::{
     queue::{ephemeral::QStandardEphemeralQueueSubscriber, worker_queue::QStandardWorkerQueuePublisher},
     store::traits::proof_store::QParthProofStore,
 };
+use parth_common::memory_stores::traits::PsyMemoryMerkleStoreImm;
 
-use crate::
-    realm::
-        processor::db::PsyRealmDatabaseProcessor
-    
-;
+use crate::realm:: processor::db::PsyRealmDatabaseProcessor;
+
 impl<
         N: QNetworkTypesConfig,
         S: PsyRealmProcessorStore<N::F, N::QHash> + Send + Sync,
@@ -93,9 +91,9 @@ where
         checkpoint_sync_info: &PQEDCheckpointSyncInfoCompact<N::F, N::QHash>,
     ) -> anyhow::Result<()> {
         let previous: MerkleProofCore<N::QHash> = self
-            .db
-            .checkpoint_tree_get_merkle_proof(checkpoint_sync_info.checkpoint_id, checkpoint_sync_info.checkpoint_id)
-            .await?;
+            .checkpoint_tree_backup_manager
+            .checkpoint_tree
+            .get_leaf(checkpoint_sync_info.checkpoint_id);
         let expected_new_checkpoint_root = previous.compute_root_with_value::<N::HasherBase>(checkpoint_sync_info.checkpoint_leaf_hash);
         if expected_new_checkpoint_root != checkpoint_sync_info.checkpoint_tree_root {
             anyhow::bail!("Inconsistent checkpoint tree root detected when committing checkpoint ID: {}. Expected root: {:?}, but got: {:?}. This indicates a serious inconsistency in the checkpoint tree state.",
