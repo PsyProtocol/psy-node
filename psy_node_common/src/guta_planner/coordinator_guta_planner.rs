@@ -141,6 +141,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> CoordinatorGUTAPlanner<F, Ha
         _temp_store: Arc<TempStore>,
         job: GlobalUserTreeAggregatorHeaderWithTagValueAndJobID<F, Hash>,
     ) -> anyhow::Result<()> {
+        tracing::info!("adding realm job: {:?}", job.job_id);
         let current_node = PlannerNode {
             job_id: job.job_id,
             header: job.header.header,
@@ -151,6 +152,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> CoordinatorGUTAPlanner<F, Ha
             self.add_realm_job_internal::<Hasher>(unique_pending_id, current_checkpoint_root, checkpoint_tree, global_user_tree, current_node).await?;
         }else{
             if current_checkpoint_root != &self.current_synced_checkpoint_root {
+                tracing::info!("committing queued updates, checkpoint root changed from {:?} to {:?}", self.current_synced_checkpoint_root, current_checkpoint_root);
                 // we are ready for committing updates
                 self.has_committed_updates = true;
                 let queued_updates = {
@@ -159,7 +161,9 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> CoordinatorGUTAPlanner<F, Ha
                 for queued_update in queued_updates {
                     self.add_realm_job_internal::<Hasher>(unique_pending_id, current_checkpoint_root, checkpoint_tree, global_user_tree, queued_update).await?;
                 }
+                self.add_realm_job_internal::<Hasher>(unique_pending_id, current_checkpoint_root, checkpoint_tree, global_user_tree, current_node).await?;
             }else{
+                tracing::info!("queuing update, checkpoint root unchanged {:?}", current_checkpoint_root);
                 // queue the update
                 self.queued_updates.push(current_node);
             }
@@ -460,12 +464,15 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> CoordinatorGUTAPlanner<F, Ha
         if let Some(root_node) = active_nodes.pop() {
             // If single node remains, promote if it's a leaf.
             if root_node.node_type == PlannerNodeType::InputLeaf {
+            tracing::info!("No GUTA updates to process, generating singlet root promotion job proof.");
                 self.create_singlet_root_promotion_job::<Hasher>(
                     root_node, 
                     unique_pending_id, 
                     checkpoint_tree, 
                     global_user_tree
                 )?;
+            }else{
+                tracing::info!("GUTA updates processed, root proof is already linear.");
             }
             
             // Note: If root_node was already Linear, it is the root proof.
@@ -478,6 +485,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> CoordinatorGUTAPlanner<F, Ha
 
         } else {
             // No inputs -> No Change Proof
+            tracing::info!("No GUTA updates to process, generating No-Change proof.");
             let checkpoint_state_roots_hash = most_recent_checkpoint_global_state_roots.qfhash::<Hasher>();
             let no_change_input = GUTANoChangeFullInput {
                 checkpoint_tree_proof: checkpoint_tree.get_historical_append_only_merkle_proof_for_root(*current_checkpoint_root)?,

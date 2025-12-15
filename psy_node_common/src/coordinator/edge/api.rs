@@ -66,6 +66,11 @@ impl<
     async fn deploy_contract(&self, deploy_contract: PQBCDeployContract<N::QHash>) -> QRpcResult<String> {
         res(self.deploy_contract_internal(deploy_contract).await)
     }
+
+    async fn get_public_key_for_user_id(&self, user_id: u64) -> RpcResult<PZKPublicKeyInfo<N::QHash>> {
+        res(self.db_reader.get_zk_public_key(MAX_CHECKPOINT_ID, user_id).await)
+    }
+
     async fn submit_guta(
         &self,
         input: GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<N::F, N::QHash>,

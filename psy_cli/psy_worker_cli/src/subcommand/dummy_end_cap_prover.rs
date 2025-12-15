@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use cf_utils::log_indicator::print_cf_log_indicator;
 use parth_core::protocol::core_types::QNetworkTypesConfigHelper;
 use psy_core::{
     constants::{
@@ -35,7 +36,8 @@ fn print_banner() {
 }
 
 pub async fn run_worker_inner(
-    api_url: String,
+    coordinator_api_url: String,
+    realm_api_url: String,
     min_state_updates: u32,
     max_state_updates: u32,
     max_contract_calls: u32,
@@ -46,7 +48,7 @@ pub async fn run_worker_inner(
     if proving_backend == PsyChainProvingBackendType::Plonky2PoseidonGoldilocks {
         info!("Using Plonky2 Poseidon Goldilocks proving backend for dummy end cap prover");
         type N = QNetworkTypesConfigHelper<QProvingJobDataID, ZKTypesPlonky2GoldilocksPoseidon, PsyNetworkLocalDevnetConstants>;
-        let mut prover = create_plonky2_dummy_end_cap_prover::<N, C, D>(&api_url)?;
+        let mut prover = create_plonky2_dummy_end_cap_prover::<N, C, D>(&coordinator_api_url, &realm_api_url)?;
 
         prover.query_contract_state_heights(0, 100).await?;
         info!("Queried contract state heights");
@@ -70,7 +72,7 @@ pub async fn run_worker_inner(
     } else if proving_backend == PsyChainProvingBackendType::JTMBPoseidonGoldilocks {
         info!("Using JTMB Poseidon Goldilocks proving backend for dummy end cap prover");
         type N = QNetworkTypesConfigHelper<QProvingJobDataID, ZKTypesJTMBGoldilocksPoseidon, PsyNetworkLocalDevnetConstants>;
-        let mut prover = create_jtmb_dummy_end_cap_prover::<N, JTMBPoseidonGoldilocksConfig>(&api_url, network)?;
+        let mut prover = create_jtmb_dummy_end_cap_prover::<N, JTMBPoseidonGoldilocksConfig>(&coordinator_api_url, &realm_api_url, network)?;
 
         prover.query_contract_state_heights(0, 100).await?;
         info!("Queried contract state heights");
@@ -98,23 +100,30 @@ pub async fn run_worker_inner(
     Ok(())
 }
 
+
+
 pub async fn run(
-    api_url: String,
+    coordinator_api_url: String,
+    realm_api_url: String,
     min_state_updates: u32,
     max_state_updates: u32,
     max_contract_calls: u32,
     user_id: u64,
+    end_cap_count: u32,
     network: Option<PsyNetworkTypeInput>,
     proving_backend: Option<PsyChainProvingBackendTypeInput>,
 ) -> anyhow::Result<()> {
     print_banner();
     info!("Dummy end cap prover starting...");
-    info!("api url: {}", api_url);
+    info!("realm api url: {} | coordinator api url: {}", realm_api_url, coordinator_api_url);
     let network = network.unwrap_or(PsyNetworkTypeInput::LocalDevnet).into();
 
+    let mut end_caps_submitted = 0;
+    print_cf_log_indicator("DUMMY_END_CAP_PROVER_STARTED", &format!("U{}",user_id));
     loop {
         let res = run_worker_inner(
-            api_url.clone(),
+            coordinator_api_url.clone(),
+            realm_api_url.clone(),
             min_state_updates,
             max_state_updates,
             max_contract_calls,
@@ -129,5 +138,12 @@ pub async fn run(
         } else {
             info!("Proof submitted successfully, sleeping...");
         }
+        end_caps_submitted += 1;
+        if end_cap_count > 0 && end_caps_submitted >= end_cap_count {
+            info!("Submitted {} end caps, exiting.", end_caps_submitted);
+            break;
+        }
     }
+    print_cf_log_indicator("DUMMY_END_CAP_PROVER_STOPPED", &format!("U{}",user_id));
+    Ok(())
 }

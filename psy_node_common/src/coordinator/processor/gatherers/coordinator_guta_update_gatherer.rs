@@ -290,6 +290,7 @@ impl<
             ));
         }
         let update_header = GlobalUserTreeAggregatorHeaderWithTagValueAndJobID::<N::F, N::QHash>::psy_ser_from_slice(&item)?;
+        tracing::info!("[CoordinatorGUTAUpdateGatherer] got update_header: {:#?}", update_header);
         let current_checkpoint_root = self.config.checkpoint_tree.get_root();
         if self.last_committed_checkpoint_root != current_checkpoint_root {
             //self.update_status()?;

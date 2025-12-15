@@ -2,11 +2,11 @@ use std::{collections::HashMap, sync::Arc};
 
 use parth_common::memory_stores::mem_tree_recorder::SimpleMemoryMerkleRecorderStore;
 use parth_core::{crypto::hash::{merkle_proof::{DeltaMerkleProofCore, MerkleProofCore, compute_root_merkle_proof_generic}, traits::{FieldQHasher, QFieldHashable}}, data::hash::{merkle_node_key::SimpleMerkleNodeKey, merkle_store_key::QMerkleStoreSingleIdKey}, felt::QFelt64, protocol::core_types::{QDBHashBase, QFHashBase}};
-use psy_data::{guta::stats::GUTAStats, proof_input::guta::{SubmitUserEndCapNonProofCoreInput, end_cap_input::SubmitUserEndCapNonProofInput}, v1::qdata::{contract::QEDContractStateUpdateHistory, user::PQEDUserLeaf, user_end_cap_result::PUPSEndCapResultCompact}};
+use psy_data::{guta::stats::GUTAStats, proof_input::guta::{SubmitUserEndCapNonProofCoreInput, end_cap_input::SubmitUserEndCapNonProofInput}, v1::qdata::{contract::QEDContractStateUpdateHistory, public_key::PZKPublicKeyInfo, user::PQEDUserLeaf, user_end_cap_result::PUPSEndCapResultCompact}};
 
-use crate::api::data_fetcher::PsyUserContractDataFetcher;
+use crate::api::combo_dummy_fetcher::PsyDummyProverComboFetcher;
 #[derive(Clone)]
-pub struct DummyUPSStateBuilder<F: QFelt64, Hash: QDBHashBase + QFHashBase<F>, Fetcher: PsyUserContractDataFetcher<F, Hash>, Hasher: FieldQHasher<F, Hash>> {
+pub struct DummyUPSStateBuilder<F: QFelt64, Hash: QDBHashBase + QFHashBase<F>, Fetcher: PsyDummyProverComboFetcher<F, Hash>, Hasher: FieldQHasher<F, Hash>> {
     pub user_contract_tree: SimpleMemoryMerkleRecorderStore<Hasher, Hash>,
     pub data_fetcher: Arc<Fetcher>,
     pub user_id: u64,
@@ -16,12 +16,13 @@ pub struct DummyUPSStateBuilder<F: QFelt64, Hash: QDBHashBase + QFHashBase<F>, F
     pub contract_state_tree_heights: HashMap<u32, u8>,
     pub contract_state_dmps: HashMap<u32, Vec<DeltaMerkleProofCore<Hash>>>,
     pub start_user_leaf: PQEDUserLeaf<F, Hash>,
+    pub public_key: PZKPublicKeyInfo<Hash>,
     pub slots_modified: u64,
     pub pending_writes: Vec<(u32, u64, Hash)>,
     pub is_first_tx: bool,
 }
 
-impl <F: QFelt64, Hash: QDBHashBase + QFHashBase<F>, Fetcher: PsyUserContractDataFetcher<F, Hash>, Hasher: FieldQHasher<F, Hash>>
+impl <F: QFelt64, Hash: QDBHashBase + QFHashBase<F>, Fetcher: PsyDummyProverComboFetcher<F, Hash>, Hasher: FieldQHasher<F, Hash>>
     DummyUPSStateBuilder<F, Hash, Fetcher, Hasher>
 {
     pub async fn new_init(
@@ -35,6 +36,10 @@ impl <F: QFelt64, Hash: QDBHashBase + QFHashBase<F>, Fetcher: PsyUserContractDat
 
         let is_first_tx = global_user_tree_proof.value == Hash::get_zero_value();
         println!("is_first_tx: {}", is_first_tx);
+
+        let public_key: PZKPublicKeyInfo<Hash> = data_fetcher.cf_get_user_public_key(user_id).await?;
+        println!("public_key: {:?}", public_key);
+
 
 
         let checkpoint_proof: MerkleProofCore<Hash> = data_fetcher
@@ -66,6 +71,7 @@ impl <F: QFelt64, Hash: QDBHashBase + QFHashBase<F>, Fetcher: PsyUserContractDat
             pending_writes: vec![],
             contract_state_dmps: HashMap::new(),
             contract_state_tree_heights: HashMap::new(),
+            public_key,
             is_first_tx,
         })
     }
@@ -199,7 +205,7 @@ let height = self.get_state_tree_height(contract_id).await?;
             user_id: self.start_user_leaf.user_id,
             balance: self.start_user_leaf.balance,
             nonce: self.start_user_leaf.nonce + F::from_u64_value(1),
-            public_key: self.start_user_leaf.public_key,
+            public_key: self.public_key.qfhash::<Hasher>(),
             user_state_tree_root: self.user_contract_tree.get_root(),
             last_checkpoint_id: F::from_u64_value(self.checkpoint_id),
             event_index: self.start_user_leaf.event_index,

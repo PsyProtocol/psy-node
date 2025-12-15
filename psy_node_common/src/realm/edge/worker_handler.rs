@@ -172,7 +172,7 @@ impl<
         signature: QEDCompressedSecp256K1Signature,
         request: SimpleTimedRequest,
     ) -> anyhow::Result<PsyWorkerGetProvingWorkWithChildProofsAPIResponse<N::QHash, N::JobId>> {
-        tracing::info!("get_proving_work_with_child_proofs_internal called");
+        //tracing::info!("get_proving_work_with_child_proofs_internal called");
         self.verify_miner_api_signature_and_check_reputation(&signature, &request).await?;
 
         let (unique_pending_id, unique_proc_id) = self.get_current_unique_pending_id_internal().await?;

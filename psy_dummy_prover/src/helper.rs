@@ -3,24 +3,24 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use jsonrpsee::http_client::HttpClient;
 use parth_core::protocol::core_types::{Q256BitHash, QNetworkTypesConfig};
-use psy_api_core::realm::standard_edge_rpc::RealmEdgeRpcClient;
+use psy_api_core::{coordinator::standard_edge_rpc::CoordinatorEdgeRpcClient, realm::standard_edge_rpc::RealmEdgeRpcClient};
 use rand::{Rng, RngCore};
 
-use crate::{api::data_fetcher::{PsyRealmAPIUserContractDataFetcher, PsyUserContractDataFetcher, new_contract_data_fetcher_from_url}, dummy_ups_state::state::DummyUPSStateBuilder, traits::{DummyUPSEndCapProverHelper, DummyUPSProver}};
+use crate::{api::{combo_dummy_fetcher::{PsyDummyComboAPIFetcher, new_combo_fetcher_from_urls}, coordinator_fetcher::PsyCoordinatorAPIFetcher, data_fetcher::{PsyRealmAPIUserContractDataFetcher, PsyUserContractDataFetcher}}, dummy_ups_state::state::DummyUPSStateBuilder, traits::{DummyUPSEndCapProverHelper, DummyUPSProver}};
 
 #[derive(Clone)]
-pub struct PsyUPSDummyProverHelper<N: QNetworkTypesConfig + 'static, C: RealmEdgeRpcClient<N::F, N::QHash, N::JobId, N::ZKProof>, Prover: DummyUPSProver<N::F, N::QHash>> {
-    pub client: Arc<PsyRealmAPIUserContractDataFetcher<N, C>>,
+pub struct PsyUPSDummyProverHelper<N: QNetworkTypesConfig + 'static, RC: RealmEdgeRpcClient<N::F, N::QHash, N::JobId, N::ZKProof>+ Send + Sync + 'static,CC: CoordinatorEdgeRpcClient<N::F, N::QHash, N::JobId, N::ZKProof> + Send + Sync + 'static, Prover: DummyUPSProver<N::F, N::QHash>> {
+    pub client: Arc<PsyDummyComboAPIFetcher<N, PsyCoordinatorAPIFetcher<N, CC>, PsyRealmAPIUserContractDataFetcher<N, RC>>>,
     pub prover: Prover,
     pub known_contract_state_heights: Vec<(u64, u8)>,
 }
 
-impl<N: QNetworkTypesConfig + 'static, C: RealmEdgeRpcClient<N::F, N::QHash, N::JobId, N::ZKProof>, Prover: DummyUPSProver<N::F, N::QHash>> PsyUPSDummyProverHelper<N, C, Prover> {
-    pub fn new(client: PsyRealmAPIUserContractDataFetcher<N, C>, prover: Prover) -> Self {
+impl<N: QNetworkTypesConfig + 'static, RC: RealmEdgeRpcClient<N::F, N::QHash, N::JobId, N::ZKProof>+ Send + Sync + 'static, CC: CoordinatorEdgeRpcClient<N::F, N::QHash, N::JobId, N::ZKProof> + Send + Sync + 'static, Prover: DummyUPSProver<N::F, N::QHash>> PsyUPSDummyProverHelper<N, RC, CC, Prover> {
+    pub fn new(client: PsyDummyComboAPIFetcher<N, PsyCoordinatorAPIFetcher<N, CC>, PsyRealmAPIUserContractDataFetcher<N, RC>>, prover: Prover) -> Self {
         Self { client: Arc::new(client), prover, known_contract_state_heights: Vec::new() }
     }
 }
-impl<N: QNetworkTypesConfig + 'static, C: RealmEdgeRpcClient<N::F, N::QHash, N::JobId, N::ZKProof> + Send + Sync + 'static, Prover: DummyUPSProver<N::F, N::QHash> + Send + Sync> PsyUPSDummyProverHelper<N, C, Prover> {
+impl<N: QNetworkTypesConfig + 'static, RC: RealmEdgeRpcClient<N::F, N::QHash, N::JobId, N::ZKProof>+ Send + Sync + 'static, CC: CoordinatorEdgeRpcClient<N::F, N::QHash, N::JobId, N::ZKProof> + Send + Sync + 'static, Prover: DummyUPSProver<N::F, N::QHash> + Send + Sync> PsyUPSDummyProverHelper<N, RC, CC, Prover> {
 
     pub async fn query_contract_state_heights(&mut self, min_contract_id: u64, max_contract_id: u64) -> anyhow::Result<()> {
         let ids = (min_contract_id..=max_contract_id).collect();
@@ -76,17 +76,19 @@ pub fn create_dummy_prover_helper<
     N: QNetworkTypesConfig + 'static,
     Prover: DummyUPSProver<N::F, N::QHash>,
 >(
-    api_url: &str,
+    coordinator_api_url: &str,
+    realm_api_url: &str,
+
     prover: Prover,
-) -> anyhow::Result<PsyUPSDummyProverHelper<N, HttpClient, Prover>> {
-    let client = new_contract_data_fetcher_from_url::<N>(api_url)?;
+) -> anyhow::Result<PsyUPSDummyProverHelper<N, HttpClient, HttpClient, Prover>> {
+    let client = new_combo_fetcher_from_urls::<N>(coordinator_api_url, realm_api_url)?;
 
     Ok(PsyUPSDummyProverHelper::new(client, prover))
 }
 
 
 #[async_trait]
-impl<N: QNetworkTypesConfig + 'static, C: RealmEdgeRpcClient<N::F, N::QHash, N::JobId, N::ZKProof> + Send + Sync + 'static, Prover: DummyUPSProver<N::F, N::QHash> + Send + Sync > DummyUPSEndCapProverHelper<N::F, N::QHash> for PsyUPSDummyProverHelper<N, C, Prover> {
+impl<N: QNetworkTypesConfig + 'static, RC: RealmEdgeRpcClient<N::F, N::QHash, N::JobId, N::ZKProof>+ Send + Sync + 'static, CC: CoordinatorEdgeRpcClient<N::F, N::QHash, N::JobId, N::ZKProof> + Send + Sync + 'static, Prover: DummyUPSProver<N::F, N::QHash> + Send + Sync> DummyUPSEndCapProverHelper<N::F, N::QHash> for PsyUPSDummyProverHelper<N, RC, CC, Prover> {
     async fn generate_proof_for_updates_and_submit(
         &self,
         user_id: u64,

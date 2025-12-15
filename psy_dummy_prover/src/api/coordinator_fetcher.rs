@@ -1,0 +1,49 @@
+use async_trait::async_trait;
+use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
+use parth_core::
+    protocol::core_types::QNetworkTypesConfig
+;
+use psy_api_core::{coordinator::standard_edge_rpc::CoordinatorEdgeRpcClient};
+use psy_data::v1::qdata::public_key::PZKPublicKeyInfo;
+
+#[async_trait]
+pub trait PsyCoordinatorFetcher<Hash> {
+    async fn cf_get_user_public_key(&self, user_id: u64) -> anyhow::Result<PZKPublicKeyInfo<Hash>>;
+}
+
+
+#[derive(Clone)]
+pub struct PsyCoordinatorAPIFetcher<N: QNetworkTypesConfig + 'static, C: CoordinatorEdgeRpcClient<N::F, N::QHash, N::JobId, N::ZKProof>> {
+    pub client: C,
+    _phantom_f: std::marker::PhantomData<N::F>,
+}
+
+pub fn new_coordinator_fetcher_from_url<
+    N: QNetworkTypesConfig + 'static,
+>(api_url: &str) -> anyhow::Result<PsyCoordinatorAPIFetcher<N, HttpClient>> {
+    let http_client: HttpClient = HttpClientBuilder::default().build(&api_url)?;
+    Ok(PsyCoordinatorAPIFetcher::new(http_client))
+}
+
+impl<N: QNetworkTypesConfig + 'static, C: CoordinatorEdgeRpcClient<N::F, N::QHash, N::JobId, N::ZKProof> + Send + Sync + 'static>
+    PsyCoordinatorAPIFetcher<N, C>
+{
+    pub fn new(client: C) -> Self {
+        Self {
+            client,
+            _phantom_f: std::marker::PhantomData,
+        }
+    }
+    pub fn get_client(&self) -> &C {
+        &self.client
+    }
+}
+
+#[async_trait]
+impl<N: QNetworkTypesConfig + 'static, C: CoordinatorEdgeRpcClient<N::F, N::QHash, N::JobId, N::ZKProof> + Send + Sync + 'static>
+    PsyCoordinatorFetcher<N::QHash> for PsyCoordinatorAPIFetcher<N, C>
+{
+    async fn cf_get_user_public_key(&self, user_id: u64) -> anyhow::Result<PZKPublicKeyInfo<N::QHash>> {
+        self.client.get_public_key_for_user_id(user_id).await.map_err(|e| anyhow::anyhow!("{:?}", e))
+    }
+}

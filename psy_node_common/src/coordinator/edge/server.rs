@@ -1,3 +1,4 @@
+use cf_utils::log_indicator::print_cf_log_indicator;
 use jsonrpsee::{RpcModule, server::ServerBuilder};
 use parth_core::protocol::core_types::QNetworkTypesConfig;
 use psy_api_core::{coordinator::standard_edge_rpc::CoordinatorEdgeRpcServer, worker::standard_worker_rpc::NodeEdgeWorkerRpcServer};
@@ -33,6 +34,8 @@ pub async fn start_coordinator_edge_rpc_server<
     port: u16, // port
 ) -> anyhow::Result<()> {
 
+    let realm_id = handler.realm_id_u64;
+    let realm_sub_id = handler.realm_sub_id_u64;
 
     let cors = CorsLayer::new()
         .allow_methods(Any)
@@ -49,10 +52,11 @@ pub async fn start_coordinator_edge_rpc_server<
     rpc_module.merge(NodeEdgeWorkerRpcServer::into_rpc(handler.clone()))?;
     rpc_module.merge(CoordinatorEdgeRpcServer::into_rpc(handler.clone()))?;
     let handle = server.start(rpc_module);
-
+    print_cf_log_indicator("PSY_COORDINATOR_EDGE_RPC_STARTED", &format!("R{}_{}", realm_id, realm_sub_id));
     tracing::info!("Coordinator Edge RPC Server started on {}", addr);
 
     handle.stopped().await;
+    print_cf_log_indicator("PSY_COORDINATOR_EDGE_RPC_STOPPED", &format!("R{}_{}", realm_id, realm_sub_id));
 
     tracing::info!("Coordinator Edge RPC Server stopped");
     Ok(())

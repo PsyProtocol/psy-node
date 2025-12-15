@@ -14,13 +14,14 @@ use psy_dummy_prover::helper::{create_dummy_prover_helper, PsyUPSDummyProverHelp
 use crate::end_cap::dummy::DummyUPSStandardEndCapCircuit;
 
 pub fn create_plonky2_dummy_end_cap_prover<N: QNetworkTypesConfig<QHash = QHashOut<C::F>, F = C::F>, C: GenericConfig<D> + 'static, const D: usize>(
-    api_url: &str,
-) -> anyhow::Result<PsyUPSDummyProverHelper<N, HttpClient, DummyUPSStandardEndCapCircuit<C, D>>>
+    coordinator_api_url: &str,
+    realm_api_url: &str,
+) -> anyhow::Result<PsyUPSDummyProverHelper<N, HttpClient, HttpClient, DummyUPSStandardEndCapCircuit<C, D>>>
 where
     C::Hasher: AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + FieldQHasher<C::F, QHashOut<C::F>>,
     C::F: QFelt64,
     QHashOut<C::F>: QFHashBase<C::F>,
 {
     let prover = DummyUPSStandardEndCapCircuit::<C, D>::new_with_config(false);
-    create_dummy_prover_helper::<N, DummyUPSStandardEndCapCircuit<C, D>>(api_url, prover)
+    create_dummy_prover_helper::<N, DummyUPSStandardEndCapCircuit<C, D>>(coordinator_api_url, realm_api_url, prover)
 }

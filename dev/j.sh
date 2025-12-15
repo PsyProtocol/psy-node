@@ -99,7 +99,7 @@ start_worker_realm() {
 }
 start_dummy_prover() {
     build_if_needed $1
-    ./target/release/psy_worker_cli dummy-prover --user 0 --network local-devnet --proving-backend jtmb-poseidon-goldilocks --config ./psy_cli/example_node_configs/dummy_prover_1.yml 2>&1 | tee logs/dummy_prover_1_logs.txt
+    ./target/release/psy_worker_cli dummy-prover --user 0 --network local-devnet --proving-backend jtmb-poseidon-goldilocks --realm-url "http://127.0.0.1:1338" --coordinator-url "http://127.0.0.1:1337" --config ./psy_cli/example_node_configs/dummy_prover_1.yml 2>&1 | tee logs/dummy_prover_1_logs.txt
 }
 sub_worker() {
     start_worker $1
@@ -145,7 +145,7 @@ sub_rp() {
 }
 
 sub_dummy_prover() {
-    ./target/release/psy_worker_cli dummy-end-cap-prover --proving-backend jtmb-poseidon-goldilocks --url http://127.0.0.1:1338 --user 0 2>&1 | tee logs/dummy_end_cap_prover_logs.txt
+    ./target/release/psy_worker_cli dummy-end-cap-prover --proving-backend jtmb-poseidon-goldilocks --coordinator-url http://127.0.0.1:1337 --url http://127.0.0.1:1338 --user 0 2>&1 | tee logs/dummy_end_cap_prover_logs.txt
 }
 
 

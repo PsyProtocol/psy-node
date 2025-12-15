@@ -347,6 +347,8 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
             let right_checkpoint_merkle_proof =
                 checkpoint_tree.get_historical_merkle_proof_at_historical_index(right_checkpoint_id, self.current_checkpoint_id);
 
+            
+
             let mut left_global_user_tree_delta_merkle_proof = global_user_tree.set_leaf(left_effective_user_id, left.new_user_leaf_hash);
             let mut right_global_user_tree_delta_merkle_proof = global_user_tree.set_leaf(right_effective_user_id, right.new_user_leaf_hash);
             left_global_user_tree_delta_merkle_proof.index += self.realm_user_min_id;
@@ -720,6 +722,11 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
                 let mut global_user_tree_delta_merkle_proof = global_user_tree.set_leaf(effective_user_id, end_cap_straggler.new_user_leaf_hash);
                 global_user_tree_delta_merkle_proof.index += self.realm_user_min_id;
                 println!("global_user_tree_delta_merkle_proof: {:?}", global_user_tree_delta_merkle_proof);
+                if checkpoint_merkle_proof.verify::<Hasher>() {
+                    tracing::info!("Checkpoint merkle proof verified successfully.");
+                } else {
+                    tracing::error!("Checkpoint merkle proof verification failed: {:?}", checkpoint_merkle_proof);
+                }
 
                 let witness = VerifySingleEndCapInputV2 {
                     guta_circuit_whitelist: self.guta_circuit_whitelist,
@@ -731,6 +738,11 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
                     global_user_tree_sub_root_transition: global_user_tree_delta_merkle_proof,
                     user_id: end_cap_straggler.new_user_leaf.user_id,
                 };
+                if witness.core.checkpoint_historical_merkle_proof.verify::<Hasher>() {
+                    tracing::info!("witness.core.checkpoint_historical_merkle_proof verified successfully.");
+                } else {
+                    tracing::error!("witness.core.checkpoint_historical_merkle_proof merkle proof verification failed: {:?}", witness.core.checkpoint_historical_merkle_proof);
+                }
                 let job_id = QProvingJobDataID::guta_single_end_cap_witness(self.unique_pending_id, 0, 0, 0);
                 let expected_public_inputs_hash = witness.get_public_inputs_hash_no_rewards_tag::<Hasher>(self.global_user_tree_height);
                 let job = PsyProvingJobMetadataWithJobId {

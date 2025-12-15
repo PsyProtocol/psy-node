@@ -23,6 +23,9 @@ pub trait CoordinatorEdgeRpc<F, Hash, JobId, ZKProof>: NodeEdgeWorkerRpcServer<H
     #[method(name = "register_user")]
     async fn register_user(&self, public_key: PZKPublicKeyInfo<Hash>) -> RpcResult<String>;
 
+    #[method(name = "get_public_key_for_user_id")]
+    async fn get_public_key_for_user_id(&self, user_id: u64) -> RpcResult<PZKPublicKeyInfo<Hash>>;
+
 
     #[method(name = "get_user_ids_for_public_key")]
     async fn get_user_ids_for_public_key(&self, public_key: Hash, start_user_id: u64, count: u32) -> RpcResult<Vec<u64>>;

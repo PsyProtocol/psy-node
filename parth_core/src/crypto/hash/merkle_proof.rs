@@ -265,6 +265,23 @@ pub fn compute_historical_and_current_merkle_roots_core_gt<Hash: Copy, Hasher: M
     (historical, current)
 }
 
+pub fn compute_historical_and_current_merkle_roots_core_gt_alt<Hash: Copy, Hasher: MerkleZeroHasher<Hash>>(
+    proof: &MerkleProofCore<Hash>,
+) -> (Hash, Hash) {
+    let mut current = proof.value;
+    let mut historical = Hasher::get_zero_hash(0);
+    for (i, sibling) in proof.siblings.iter().enumerate() {
+        if proof.index & (1 << i) == 0 {
+            current = Hasher::two_to_one(&current, sibling);
+            historical = Hasher::two_to_one(&historical, &Hasher::get_zero_hash(i));
+        } else {
+            current = Hasher::two_to_one(sibling, &current);
+            historical = Hasher::two_to_one(sibling, &historical);
+        }
+    }
+    (historical, current)
+}
+
 // Start Merkle Proof
 #[pderive::serialize_clone]
 #[derive(ts_rs::TS)]

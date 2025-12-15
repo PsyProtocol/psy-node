@@ -1,3 +1,5 @@
+use cf_utils::log_indicator::print_cf_log_indicator;
+
 use crate::worker::prover_trait::{PsyWorkerGenericLibraryProver, PsyWorkerJobFetcher};
 
 pub struct PsyProofMinerWorkerManager<
@@ -59,6 +61,7 @@ impl<
         Ok(())
     }
     pub async fn run_worker_loop(&self, poll_interval_ms: u64) -> anyhow::Result<()> {
+        print_cf_log_indicator("PSY_PROOF_MINER_WORKER_STARTED", "");
         loop {
             if let Err(e) = self.process_job().await {
                 let error = format!("Error processing job: {:?}", e);

@@ -72,8 +72,11 @@ pub enum Commands {
     #[command(about = "Run a proof mining worker")]
     DummyEndCapProver {
         #[arg(long = "url",  help = "Realm RPC URL to submit end caps to")]
-        api_url: String,
+        realm_api_url: String,
 
+        #[arg(long = "coordinator-url",  help = "Coordinator RPC URL to fetch user public keys from")]
+        coordinator_api_url: String,
+        
         #[arg(long = "min-state-updates", help = "Minimum number of state updates to include per transaction in end cap", default_value_t = 1)]
         min_state_updates: u32,
 
@@ -85,6 +88,9 @@ pub enum Commands {
 
         #[arg(long = "user", help = "The user id to submit end caps for")]
         user_id: u64,
+        
+        #[arg(long = "end-cap-count", help = "Number of end caps to submit before exiting (0 = forever)", default_value_t = 0)]
+        end_cap_count: u32,
 
         #[arg(long = "network", help = "The network id to connect to")]
         network: Option<PsyNetworkTypeInput>,

@@ -1,5 +1,6 @@
 use std::sync::atomic::Ordering;
 
+use cf_utils::log_indicator::print_cf_log_indicator;
 use parth_core::protocol::core_types::QNetworkTypesConfig;
 use psy_core::job::job_id::QProvingJobDataID;
 use psy_io::tokio::TokioLikeFileSystem;
@@ -44,6 +45,11 @@ pub async fn run_coordinator_processor_loop<
 where
     N: 'static,
 {
+
+    let realm_id = processor.db.ids.realm_id_u64;
+    let realm_sub_id = processor.db.ids.realm_sub_id_u64;
+    print_cf_log_indicator("PSY_COORDINATOR_PROCESSOR_STARTED", &format!("R{}_{}", realm_id, realm_sub_id));
+
     loop {
         let is_active = processor.db.is_active.load(Ordering::SeqCst);
         if is_active {
@@ -66,6 +72,8 @@ where
             break;
         }
     }
+    
+    print_cf_log_indicator("PSY_COORDINATOR_PROCESSOR_STOPPED", &format!("R{}_{}", realm_id, realm_sub_id));
 
     Ok(())
 }
@@ -101,6 +109,7 @@ where
     N: 'static,
     FileSystem::File: Send + Sync + 'static,
 {
+
     let is_active = processor.db.is_active.clone();
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::select! {

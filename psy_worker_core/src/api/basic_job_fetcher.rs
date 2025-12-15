@@ -183,7 +183,7 @@ impl<
         };
         self.is_in_realm_mode
             .store(is_in_realm_mode, std::sync::atomic::Ordering::SeqCst);
-        println!("Fetching next job. Current mode: {}", if is_in_realm_mode { "Realm" } else { "Coordinator" });
+        //println!("Fetching next job. Current mode: {}", if is_in_realm_mode { "Realm" } else { "Coordinator" });
 
         let result = if is_in_realm_mode {
             self.realm_api_url_manager.get_next_api_url_hash().await

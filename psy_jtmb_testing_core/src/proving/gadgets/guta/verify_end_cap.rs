@@ -52,6 +52,9 @@ pub fn verify_end_cap_proof<C: JTMBCircuitConfig>(
     let calculated_fingerprint = verifier_data.get_fingerprint::<C::Hash, C::Hasher, C::F>();
     jtmb_connect_ref(&calculated_fingerprint, &known_end_cap_fingerprint, "end cap circuit fingerprint mismatch")?;
 
+    if !checkpoint_historical_merkle_proof.verify::<C::Hasher>() {
+        anyhow::bail!("checkpoint historical merkle proof verification failed");
+    }
     // 6. Constraint: The User's claimed Checkpoint Root must exist in history
     let (computed_historical_root, computed_current_root) =
         parth_core::crypto::hash::merkle_proof::compute_historical_and_current_merkle_roots_core_gt::<C::Hash, C::Hasher>(
@@ -80,12 +83,14 @@ pub fn verify_end_cap_proof<C: JTMBCircuitConfig>(
         node_index: end_cap_result.user_id,
         node_level: C::F::from_u8_value(global_user_tree_height),
     };
-
-    Ok(GlobalUserTreeAggregatorHeader {
+    let guta_header = GlobalUserTreeAggregatorHeader {
         guta_circuit_whitelist: C::Hash::get_zero_value(), // Initialized to zero, updated by parent circuit
         checkpoint_tree_root: checkpoint_historical_merkle_proof.root, // The current global checkpoint root
         state_transition,
         stats: guta_stats.clone(),
         total_aggregation_proofs_generated: C::F::from_u64_value(0),
-    })
+    };
+    println!("GUTA Header constructed: {:#?}", guta_header);
+
+    Ok(guta_header)
 }

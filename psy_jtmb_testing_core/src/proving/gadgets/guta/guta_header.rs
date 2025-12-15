@@ -11,6 +11,7 @@ pub fn compute_guta_public_inputs_hash<F: QFelt64, Hash: Q256BitHash + QFHashBas
     header: &GlobalUserTreeAggregatorHeader<F, Hash>,
     rewards_tree_value: Hash,
 ) -> Hash {
+    println!("computing guta public inputs hash with header: {:#?} and rewards_tree_value: {:?}", header, rewards_tree_value);
     // 1. Hash the header fields
     let header_hash = header.qfhash::<Hasher>();
     
