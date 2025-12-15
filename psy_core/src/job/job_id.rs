@@ -199,7 +199,12 @@ pub enum ProvingJobCircuitType {
     Invalid = 254,
     Unknown = 255,
 }
-
+impl QPGenRandom for ProvingJobCircuitType {
+    fn qp_rand_gen() -> Self where Self: Sized {
+        let circuit_type_u8: u8 = rand::random::<u8>() % 22; // only up to 21 for now
+        ProvingJobCircuitType::try_from(circuit_type_u8).unwrap_or(ProvingJobCircuitType::Invalid)
+    }
+}
 impl ProvingJobCircuitType {
     pub fn to_u8(&self) -> u8 {
         *self as u8
