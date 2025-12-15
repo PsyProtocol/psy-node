@@ -4,19 +4,13 @@ use dashmap::DashMap;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use parth_core::node::realm_identifier::QRealmIdentifier;
 use psy_api_core::worker::standard_worker_rpc::NodeEdgeWorkerRpcClient;
+use psy_core::constants::url_rotation::PsyAPIURLRotationStrategy;
 use tokio::sync::RwLock;
 
 use crate::utils::api_url::hash_api_url_to_32_bytes;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum APIURLRotationStrategy {
-    RoundRobin,
-    Random,
-    ContinueUntilFailure,
-}
-
 #[derive(Debug, Clone)]
-pub struct PsyWorkerAPIURLManager{
+pub struct PsyWorkerAPIURLManager {
     pub api_url_hash_to_string: DashMap<[u8; 32], String>,
     pub api_url_string_to_hash: DashMap<String, [u8; 32]>,
     pub api_url_hash_to_client: DashMap<[u8; 32], HttpClient>,
@@ -24,11 +18,17 @@ pub struct PsyWorkerAPIURLManager{
     pub api_url_realm_identifiers: DashMap<[u8; 32], QRealmIdentifier>,
     pub api_url_list: Arc<RwLock<Vec<String>>>,
     pub current_api_url_index: Arc<RwLock<usize>>,
-    pub rotation_strategy: APIURLRotationStrategy,
+    pub last_seen_job_for_current_api_url_at: Arc<RwLock<u64>>,
+    pub rotation_strategy: PsyAPIURLRotationStrategy,
 }
-
+fn get_current_unix_timestamp_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let start = SystemTime::now();
+    let since_the_epoch = start.duration_since(UNIX_EPOCH).expect("Time went backwards");
+    since_the_epoch.as_millis() as u64
+}
 impl PsyWorkerAPIURLManager {
-    pub fn new(rotation_strategy: APIURLRotationStrategy) -> Self {
+    pub fn new(rotation_strategy: PsyAPIURLRotationStrategy) -> Self {
         Self {
             api_url_hash_to_string: DashMap::new(),
             api_url_string_to_hash: DashMap::new(),
@@ -37,6 +37,7 @@ impl PsyWorkerAPIURLManager {
             api_url_realm_identifiers: DashMap::new(),
             api_url_list: Arc::new(RwLock::new(Vec::new())),
             current_api_url_index: Arc::new(RwLock::new(0)),
+            last_seen_job_for_current_api_url_at: Arc::new(RwLock::new(0)),
             rotation_strategy,
         }
     }
@@ -74,12 +75,22 @@ impl PsyWorkerAPIURLManager {
         }
         Ok(())
     }
-    pub async fn add_api_urls<Hash: Send + Sync + serde::Serialize + serde::de::DeserializeOwned + 'static, JobId: Send + Sync + serde::Serialize + serde::de::DeserializeOwned + 'static>(&self, api_urls: &[impl AsRef<str>]) -> anyhow::Result<()> {
+    pub async fn add_api_urls<
+        Hash: Send + Sync + serde::Serialize + serde::de::DeserializeOwned + 'static,
+        JobId: Send + Sync + serde::Serialize + serde::de::DeserializeOwned + 'static,
+    >(
+        &self,
+        api_urls: &[impl AsRef<str>],
+    ) -> anyhow::Result<()> {
         for api_url in api_urls {
             let client = HttpClientBuilder::default().build(api_url.as_ref())?;
             let realm_identifier = <HttpClient as NodeEdgeWorkerRpcClient<Hash, JobId>>::get_realm_identifier_worker_api(&client).await;
             if realm_identifier.is_err() {
-                tracing::error!("Failed to get realm identifier from API URL: {} ({:?})", api_url.as_ref(), realm_identifier.err());
+                tracing::error!(
+                    "Failed to get realm identifier from API URL: {} ({:?})",
+                    api_url.as_ref(),
+                    realm_identifier.err()
+                );
                 continue;
             }
             let realm_identifier = realm_identifier.unwrap();
@@ -92,6 +103,10 @@ impl PsyWorkerAPIURLManager {
             self.api_url_list.write().await.push(api_url.as_ref().to_string());
         }
         Ok(())
+    }
+    pub async fn report_seen_job_for_current_api_url(&self) {
+        let mut last_seen_job_time = self.last_seen_job_for_current_api_url_at.write().await;
+        *last_seen_job_time = get_current_unix_timestamp_ms();
     }
     pub fn report_api_url_failure(&self, api_url_hash: &[u8; 32]) {
         let mut entry = self.api_url_failed_attempts.entry(*api_url_hash).or_insert(0);
@@ -107,20 +122,22 @@ impl PsyWorkerAPIURLManager {
             return None;
         }
         match self.rotation_strategy {
-            APIURLRotationStrategy::RoundRobin => {
+            PsyAPIURLRotationStrategy::RoundRobin => {
+                let list_len = api_url_list.len();
                 let mut index = self.current_api_url_index.write().await;
-                let api_url = &api_url_list[*index % api_url_list.len()];
-                *index += 1;
+                let index_current = *index;
+                *index = (*index + 1) % list_len;
+                let api_url = &api_url_list[index_current];
                 self.api_url_string_to_hash.get(api_url).map(|h| *h)
             }
-            APIURLRotationStrategy::Random => {
+            PsyAPIURLRotationStrategy::Random => {
                 use rand::Rng;
                 let mut rng = rand::thread_rng();
                 let random_index = rng.gen_range(0..api_url_list.len());
                 let api_url = &api_url_list[random_index];
                 self.api_url_string_to_hash.get(api_url).map(|h| *h)
             }
-            APIURLRotationStrategy::ContinueUntilFailure => {
+            PsyAPIURLRotationStrategy::ContinueUntilFailure => {
                 let current_index = *self.current_api_url_index.read().await;
                 let api_url = &api_url_list[current_index % api_url_list.len()];
                 let api_url_hash = match self.api_url_string_to_hash.get(api_url) {
@@ -129,16 +146,67 @@ impl PsyWorkerAPIURLManager {
                 };
 
                 if self.api_url_failed_attempts.get(&api_url_hash).is_some() {
+                    let list_len = api_url_list.len();
                     // If there was a failure reported, move to the next URL
                     let mut index = self.current_api_url_index.write().await;
-                    *index += 1;
-                    let next_api_url = &api_url_list[*index % api_url_list.len()];
+                    let index_current = *index;
+                    *index = (*index + 1) % list_len;
+                    let next_api_url = &api_url_list[index_current];
+                    let mut last_seen_job_time = self.last_seen_job_for_current_api_url_at.write().await;
+                    *last_seen_job_time = get_current_unix_timestamp_ms();
                     self.api_url_string_to_hash.get(next_api_url).map(|h| *h)
                 } else {
                     Some(api_url_hash)
                 }
-            },
+            }
+            PsyAPIURLRotationStrategy::ContinueUntilFailureOrNoWorkFor3Seconds => {
+                let current_index = *self.current_api_url_index.read().await;
+                let api_url = &api_url_list[current_index % api_url_list.len()];
+                let api_url_hash = match self.api_url_string_to_hash.get(api_url) {
+                    Some(h) => *h,
+                    None => return None,
+                };
+                let last_seen = {
+                    self.last_seen_job_for_current_api_url_at.read().await.clone()
+                };
+                if self.api_url_failed_attempts.get(&api_url_hash).is_some() ||  (last_seen + 3000) < get_current_unix_timestamp_ms() {
+                    let list_len = api_url_list.len();
+                    // If there was a failure reported, move to the next URL
+                    let mut index = self.current_api_url_index.write().await;
+                    let index_current = *index;
+                    *index = (*index + 1) % list_len;
+                    let next_api_url = &api_url_list[index_current];
+                    let mut last_seen_job_time = self.last_seen_job_for_current_api_url_at.write().await;
+                    *last_seen_job_time = get_current_unix_timestamp_ms();
+                    self.api_url_string_to_hash.get(next_api_url).map(|h| *h)
+                } else {
+                    Some(api_url_hash)
+                }
+            }
+            PsyAPIURLRotationStrategy::SmartSwapV1 => {
+                let current_index = *self.current_api_url_index.read().await;
+                let api_url = &api_url_list[current_index % api_url_list.len()];
+                let api_url_hash = match self.api_url_string_to_hash.get(api_url) {
+                    Some(h) => *h,
+                    None => return None,
+                };
+                let last_seen = {
+                    self.last_seen_job_for_current_api_url_at.read().await.clone()
+                };
+                if self.api_url_failed_attempts.get(&api_url_hash).is_some() ||  (last_seen + 3000) < get_current_unix_timestamp_ms() {
+                    let list_len = api_url_list.len();
+                    // If there was a failure reported, move to the next URL
+                    let mut index = self.current_api_url_index.write().await;
+                    let index_current = *index;
+                    *index = (*index + 1) % list_len;
+                    let next_api_url = &api_url_list[index_current];
+                    let mut last_seen_job_time = self.last_seen_job_for_current_api_url_at.write().await;
+                    *last_seen_job_time = get_current_unix_timestamp_ms();
+                    self.api_url_string_to_hash.get(next_api_url).map(|h| *h)
+                } else {
+                    Some(api_url_hash)
+                }
+            }
         }
     }
-
 }

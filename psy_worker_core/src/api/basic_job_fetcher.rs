@@ -11,13 +11,13 @@ use parth_core::{
 };
 use parth_crypto::hash::sha256::CoreSha256Hasher;
 use psy_api_core::worker::standard_worker_rpc::NodeEdgeWorkerRpcClient;
-use psy_core::job::job_id::QProvingJobDataID;
+use psy_core::{constants::url_rotation::PsyAPIURLRotationStrategy, job::job_id::QProvingJobDataID};
 use psy_data::worker::{api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse, proving_work_history::PsyProvingJobClaimMetadata};
 use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 use tokio::{io::AsyncWriteExt, sync::RwLock};
 
 use crate::{
-    api::url_manager::{APIURLRotationStrategy, PsyWorkerAPIURLManager}, utils::time::get_current_time_ms, worker::prover_trait::PsyWorkerJobFetcher
+    api::url_manager::{PsyWorkerAPIURLManager}, utils::time::get_current_time_ms, worker::prover_trait::PsyWorkerJobFetcher
 };
 
 const API_REQUEST_SIGNATURE_VALID_DURATION_MS: u64 = 30000; // 30 seconds
@@ -42,7 +42,7 @@ impl<
         Hasher: MerkleHasher<Hash>,
     > PsyWorkerBasicAPIJobFetcher<Hash, QProvingJobDataID, Signer, Hasher>
 {
-    pub fn new(api_signer: Signer, api_signer_public_key: CompressedPublicKey, user_id: u64, url_rotation_strategy: APIURLRotationStrategy) -> Self {
+    pub fn new(api_signer: Signer, api_signer_public_key: CompressedPublicKey, user_id: u64, url_rotation_strategy: PsyAPIURLRotationStrategy) -> Self {
         Self {
             realm_api_url_manager: PsyWorkerAPIURLManager::new(url_rotation_strategy),
             coordinator_api_url_manager: PsyWorkerAPIURLManager::new(url_rotation_strategy),
@@ -56,7 +56,7 @@ impl<
             _phantom_hasher: std::marker::PhantomData,
         }
     }
-    pub async fn new_with_backup_file_path(api_signer: Signer, api_signer_public_key: CompressedPublicKey, user_id: u64, url_rotation_strategy: APIURLRotationStrategy, backup_file_path: Option<String>) -> Self {
+    pub async fn new_with_backup_file_path(api_signer: Signer, api_signer_public_key: CompressedPublicKey, user_id: u64, url_rotation_strategy: PsyAPIURLRotationStrategy, backup_file_path: Option<String>) -> Self {
         let backup_file = if let Some(path) = backup_file_path {
             match tokio::fs::OpenOptions::new().create(true).append(true).open(path).await {
                 Ok(file) => Some(file),
@@ -112,9 +112,11 @@ impl<
         }
         {
             if self.is_in_realm_mode.load(std::sync::atomic::Ordering::SeqCst) {
-                self.realm_api_url_manager.report_api_url_success(&api_url_hash)
+                self.realm_api_url_manager.report_api_url_success(&api_url_hash);
+                self.realm_api_url_manager.report_seen_job_for_current_api_url().await;
             } else {
-                self.coordinator_api_url_manager.report_api_url_success(&api_url_hash)
+                self.coordinator_api_url_manager.report_api_url_success(&api_url_hash);
+                self.coordinator_api_url_manager.report_seen_job_for_current_api_url().await;
             }
         }
         {
