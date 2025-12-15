@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand, command};
-use psy_core::constants::chain_id::PsyNetworkTypeInput;
+use psy_core::constants::{chain_id::PsyNetworkTypeInput, proving_backends::PsyChainProvingBackendTypeInput};
 
 pub mod start_realm_processor;
 pub mod start_realm_edge;
@@ -49,6 +49,9 @@ pub enum Commands {
 
         #[arg(long = "coordinator-api-urls", value_parser, num_args = 1.., value_delimiter = ' ', help = "Coordinator Edge API URLs for the realm processor to connect to")]
         coordinator_api_urls: Vec<String>,
+
+        #[arg(long = "proving-backend", help = "The proving backend to use (plonky2-poseidon-goldilocks, jtmb-poseidon-goldilocks, jtmb-sha256-u64, etc.)")]
+        proving_backend: Option<PsyChainProvingBackendTypeInput>,
     },
     #[command(about = "Start a realm edge node")]
     StartRealmEdge {
@@ -84,6 +87,9 @@ pub enum Commands {
 
         #[arg(long = "listen", help = "The listen address to run the edge server's HTTP API on (default: 0.0.0.0)")]
         listen: Option<String>,
+
+        #[arg(long = "proving-backend", help = "The proving backend to use (plonky2-poseidon-goldilocks, jtmb-poseidon-goldilocks, jtmb-sha256-u64, etc.)")]
+        proving_backend: Option<PsyChainProvingBackendTypeInput>,
     },
     #[command(about = "Start a coordinator processor node")]
     StartCoordinatorProcessor {
@@ -116,6 +122,9 @@ pub enum Commands {
 
         #[arg(long = "checkpoint-backup-path", help = "Path to store checkpoint backups")]
         checkpoint_backup_path: Option<String>,
+
+        #[arg(long = "proving-backend", help = "The proving backend to use (plonky2-poseidon-goldilocks, jtmb-poseidon-goldilocks, jtmb-sha256-u64, etc.)")]
+        proving_backend: Option<PsyChainProvingBackendTypeInput>,
     },
     #[command(about = "Start a coordinator edge node")]
     StartCoordinatorEdge {
@@ -151,5 +160,8 @@ pub enum Commands {
 
         #[arg(long = "listen", help = "The listen address to run the edge server's HTTP API on (default: 0.0.0.0)")]
         listen: Option<String>,
+
+        #[arg(long = "proving-backend", help = "The proving backend to use (plonky2-poseidon-goldilocks, jtmb-poseidon-goldilocks, jtmb-sha256-u64, etc.)")]
+        proving_backend: Option<PsyChainProvingBackendTypeInput>,
     },
 }

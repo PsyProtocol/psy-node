@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use psy_core::constants::chain_id::PsyNetworkTypeInput;
+use psy_core::constants::{chain_id::PsyNetworkTypeInput, proving_backends::PsyChainProvingBackendTypeInput};
 
 pub mod worker;
 pub mod worker_test;
@@ -34,6 +34,9 @@ pub enum Commands {
 
         #[arg(long = "network", help = "The network id to connect to")]
         network: Option<PsyNetworkTypeInput>,
+
+        #[arg(long = "proving-backend", help = "The proving backend to use (plonky2-poseidon-goldilocks, jtmb-poseidon-goldilocks, jtmb-sha256-u64, etc.)")]
+        proving_backend: Option<PsyChainProvingBackendTypeInput>,
     },
     #[command(about = "Run a proof mining worker in test mode")]
     WorkerTest {
@@ -54,6 +57,9 @@ pub enum Commands {
 
         #[arg(long = "network", help = "The network id to connect to")]
         network: Option<PsyNetworkTypeInput>,
+
+        #[arg(long = "proving-backend", help = "The proving backend to use (plonky2-poseidon-goldilocks, jtmb-poseidon-goldilocks, jtmb-sha256-u64, etc.)")]
+        proving_backend: Option<PsyChainProvingBackendTypeInput>,
     },
     #[command(about = "Generate a new secp256k1 keypair")]
     GenerateKeypair,
@@ -82,5 +88,8 @@ pub enum Commands {
 
         #[arg(long = "network", help = "The network id to connect to")]
         network: Option<PsyNetworkTypeInput>,
+
+        #[arg(long = "proving-backend", help = "The proving backend to use (plonky2-poseidon-goldilocks, jtmb-poseidon-goldilocks, jtmb-sha256-u64, etc.)")]
+        proving_backend: Option<PsyChainProvingBackendTypeInput>,
     },
 }

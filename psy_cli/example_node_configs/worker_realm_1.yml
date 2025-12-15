@@ -4,4 +4,3 @@ user: 0
 coordinator_api_urls: []
 realm_api_urls:
   - http://127.0.0.1:1338
-  - http://127.0.0.1:1339

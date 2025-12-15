@@ -1,14 +1,13 @@
-
 use cf_utils::option::resolve_one_of_two_options_or_error;
-use plonky2::
-    plonk::config::PoseidonGoldilocksConfig
-;
-use psy_core::constants::chain_id::{PsyChainNetworkType, PsyNetworkTypeInput};
+use plonky2::plonk::config::PoseidonGoldilocksConfig;
+use psy_core::constants::{
+    chain_id::{PsyChainNetworkType, PsyNetworkTypeInput},
+    proving_backends::{PsyChainProvingBackendType, PsyChainProvingBackendTypeInput},
+};
+use psy_jtmb_testing_core::{circuit_library::worker::get_simple_proof_miner_worker_for_network_jtmb, protocol_types::JTMBPoseidonGoldilocksConfig};
 use psy_plonky2_circuits::circuit_library::get_simple_proof_miner_worker_for_network;
 use psy_worker_core::config::{worker_cli_config::WorkerCliConfig, worker_config::WorkerStartupConfig};
 use tracing::{error, info};
-
-
 
 fn print_banner() {
     println!(
@@ -37,14 +36,23 @@ fn print_banner() {
     );
 }
 
-pub async fn run_worker_inner(network: PsyChainNetworkType, config: WorkerStartupConfig) -> anyhow::Result<()> {
+pub async fn run_worker_inner(
+    network: PsyChainNetworkType,
+    config: WorkerStartupConfig,
+    proving_backend: PsyChainProvingBackendType,
+) -> anyhow::Result<()> {
     // Placeholder for actual worker logic
-    
-    type C = PoseidonGoldilocksConfig;
-    const D: usize = 2;
-    let worker = get_simple_proof_miner_worker_for_network::<C, D>(network, config).await?;
 
-    worker.run_worker_loop(100).await?;
+    if proving_backend == PsyChainProvingBackendType::Plonky2PoseidonGoldilocks {
+        type C = PoseidonGoldilocksConfig;
+        const D: usize = 2;
+        let worker = get_simple_proof_miner_worker_for_network::<C, D>(network, config).await?;
+
+        worker.run_worker_loop(100).await?;
+    } else if proving_backend == PsyChainProvingBackendType::JTMBPoseidonGoldilocks {
+        let worker = get_simple_proof_miner_worker_for_network_jtmb::<JTMBPoseidonGoldilocksConfig>(network, config).await?;
+        worker.run_worker_loop(100).await?;
+    }
     Ok(())
 }
 
@@ -55,20 +63,25 @@ pub async fn run(
     _wallet_password: Option<String>,
     recipient: Option<u64>,
     network: Option<PsyNetworkTypeInput>,
+    proving_backend: Option<PsyChainProvingBackendTypeInput>,
 ) -> anyhow::Result<()> {
     print_banner();
     info!("Worker starting...");
     info!("Loading config from: {}", config);
     let config_data = WorkerCliConfig::load_from_file(&config).await?;
 
-    let network: PsyChainNetworkType = resolve_one_of_two_options_or_error::<PsyNetworkTypeInput>(&network, &config_data.network, "Network configuration is required")?.into();
+    let network: PsyChainNetworkType =
+        resolve_one_of_two_options_or_error::<PsyNetworkTypeInput>(&network, &config_data.network, "Network configuration is required")?.into();
     let user_id = resolve_one_of_two_options_or_error::<u64>(&recipient, &config_data.user, "User ID of miner is required")?;
-    let private_key_string = resolve_one_of_two_options_or_error::<String>(&private_key, &config_data.private_key, "API Private key for miner is required")?;
+    let private_key_string =
+        resolve_one_of_two_options_or_error::<String>(&private_key, &config_data.private_key, "API Private key for miner is required")?;
     let private_key_bytes = hex::decode(private_key_string.trim_start_matches("0x"))?;
     if private_key_bytes.len() != 32 {
         anyhow::bail!("Private key must be 32 bytes (64 hex characters)");
     }
-    let private_key_bytes: [u8; 32] = private_key_bytes.try_into().map_err(|_| anyhow::anyhow!("private key must be 32 bytes (64 hex characters)"))?;
+    let private_key_bytes: [u8; 32] = private_key_bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("private key must be 32 bytes (64 hex characters)"))?;
     let config = WorkerStartupConfig {
         miner_user_id: user_id,
         network: network,
@@ -79,14 +92,18 @@ pub async fn run(
     };
     info!("Using network: {:?}", network);
 
-
-
-
     let mut handles = Vec::new();
 
-    let handle = tokio::spawn(run_worker_inner(network, config));
+    let proving_backend = proving_backend
+            .unwrap_or(PsyChainProvingBackendTypeInput::Plonky2PoseidonGoldilocks)
+            .into();
+    let handle = tokio::spawn(run_worker_inner(
+        network,
+        config,
+        proving_backend,
+    ));
     handles.push(handle);
-    /* 
+    /*
 
     for coordinator_config in &network.coordinator_configs {
         for rpc_url in &coordinator_config.rpc_url {
