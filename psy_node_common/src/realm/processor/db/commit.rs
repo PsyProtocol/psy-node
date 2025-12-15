@@ -19,7 +19,7 @@ use psy_io::tokio::TokioLikeFileSystem;
 use psy_node_core::{
     p2p::traits::realm_coordinantor::RealmCoordinatorClient,
     psy_core_db::traits::full::{
-        PsyNodeCheckpointTreeDatabaseReader, PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmProcessorStore,
+        PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmProcessorStore,
     },
     psy_temp_db::StandardProcessorTempDBStoreBase,
     queue::{ephemeral::QStandardEphemeralQueueSubscriber, worker_queue::QStandardWorkerQueuePublisher},

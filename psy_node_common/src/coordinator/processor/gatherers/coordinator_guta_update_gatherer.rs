@@ -386,7 +386,7 @@ impl<
             self.last_committed_checkpoint_root = current_checkpoint_root;
         }
 
-        let end_global_user_tree_root = tree.get_root();
+        //let end_global_user_tree_root = tree.get_root();
 
         let realm_identifier = QRealmIdentifier {
             realm_id: self.config.realm_id_u64 as u32,
