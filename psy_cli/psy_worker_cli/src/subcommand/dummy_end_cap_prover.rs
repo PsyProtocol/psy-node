@@ -119,7 +119,7 @@ pub async fn run(
             max_state_updates,
             max_contract_calls,
             user_id,
-            proving_backend.unwrap_or(PsyChainProvingBackendTypeInput::JTMBPoseidonGoldilocks).into(),
+            proving_backend.unwrap_or(PsyChainProvingBackendTypeInput::Plonky2PoseidonGoldilocks).into(),
             network,
         )
         .await;

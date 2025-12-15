@@ -47,3 +47,7 @@ parth_common = { workspace = true }
 psy_core = { workspace = true }
 psy_data = { workspace = true }
 pser = { workspace = true }
+psy_serialize = { workspace = true }
+pderive = { workspace = true }
+parth_crypto = { workspace = true }
+psy_io = { workspace = true }
