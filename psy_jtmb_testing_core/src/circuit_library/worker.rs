@@ -3,11 +3,11 @@ use parth_core::
     data::hash::hash256::Hash256
 ;
 use psy_core::{
-    constants::chain_id::PsyChainNetworkType,
+    constants::{chain_id::PsyChainNetworkType, url_rotation::PsyAPIURLRotationStrategy},
     job::job_id::QProvingJobDataID,
 };
 use psy_worker_core::{
-    api::{basic_job_fetcher::PsyWorkerBasicAPIJobFetcher, url_manager::APIURLRotationStrategy},
+    api::{basic_job_fetcher::PsyWorkerBasicAPIJobFetcher},
     config::worker_config::WorkerStartupConfig,
     worker::manager::PsyProofMinerWorkerManager,
 };
@@ -42,7 +42,7 @@ pub async fn get_simple_proof_miner_worker_for_network_jtmb<C: JTMBCircuitConfig
         signer,
         public_key,
         config.miner_user_id,
-        APIURLRotationStrategy::ContinueUntilFailure,
+        PsyAPIURLRotationStrategy::ContinueUntilFailure,
     );
 
     job_fetcher.coordinator_api_url_manager.add_api_urls::<C::Hash, QProvingJobDataID>(&config.coordinator_api_urls).await?;
