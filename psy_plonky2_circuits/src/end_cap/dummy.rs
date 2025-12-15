@@ -157,7 +157,11 @@ where
             user_id: new_user_leaf.user_id,
         };
 
+        println!("end_cap_result: {:#?}", end_cap_result);
+
         let guta_hash = end_cap_result.qfhash_with_guta_height::<C::Hasher>(global_user_tree_height);
+            println!("guta_hash: {:#?}", guta_hash);
+            println!("guta stats: {:#?}", guta_stats);
         let public_inputs_expected = C::Hasher::q_two_to_one(guta_hash, guta_stats.qfhash::<C::Hasher>());
         let proof = self.prove_base(
             public_inputs_expected,

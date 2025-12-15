@@ -8,7 +8,7 @@ use parth_core::{
     node::realm_identifier::QRealmIdentifier,
     protocol::core_types::{Q256BitHash, QFHashBase},
 };
-use psy_core::job::job_id::QProvingJobDataID;
+use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{
     guta::header_extended::GlobalUserTreeAggregatorHeaderWithJobId,
     proof_input::guta::{
@@ -570,15 +570,18 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
         Ok(())
     }
     fn update_reward_tree_config(&mut self, job_id: &QProvingJobDataID, level: u8, index: u64) -> anyhow::Result<()> {
+        if job_id.circuit_type == ProvingJobCircuitType::UserEndCap {
+            return Ok(());
+        }
         let position = self
             .job_level_map
             .get(job_id)
             .ok_or_else(|| anyhow::anyhow!("Job ID {:?} not found in job level map.", job_id))?;
         let child_jobs = self.planned_jobs[position.0][position.1].update_level_and_index(level, index).to_vec();
-        if child_jobs.len() > 0 {
+        if child_jobs.len() > 0 && child_jobs[0].circuit_type != ProvingJobCircuitType::UserEndCap {
             self.update_reward_tree_config(&child_jobs[0], level + 1, index * 2)?;
         }
-        if child_jobs.len() > 1 {
+        if child_jobs.len() > 1  && child_jobs[1].circuit_type != ProvingJobCircuitType::UserEndCap {
             self.update_reward_tree_config(&child_jobs[1], level + 1, index * 2 + 1)?;
         }
         Ok(())

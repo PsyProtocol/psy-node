@@ -469,7 +469,16 @@ impl<
             let result = self
                 .guta_planner
                 .finalize_with_reward_ids(&self.config.checkpoint_tree, tree, self.config.temp_db.clone(), 0, 0)
-                .await?;
+                .await;
+            if result.is_err() {
+                tracing::error!(
+                    "GUTA updates gatherer for pending id {} finalize failed: {:?}",
+                    self.status.gathering_unique_pending_id,
+                    result.err()
+                );
+                anyhow::bail!("GUTA updates gatherer finalize failed");
+            }
+            let result = result?;
             tracing::info!(
                 "GUTA updates gatherer for pending id {} finalized planner.",
                 self.status.gathering_unique_pending_id

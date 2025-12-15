@@ -481,7 +481,7 @@ impl<Hash: PartialEq + Copy> MerkleProofCore<Hash> {
             }
         }
         MerkleProofCore {
-            root: self.get_append_root::<Hasher>(),
+            root: compute_root_merkle_proof_generic::<Hash, Hasher>(self.value, self.index, &siblings),
             value: self.value,
             index: self.index,
             siblings,

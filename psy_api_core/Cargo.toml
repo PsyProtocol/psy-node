@@ -47,3 +47,10 @@ psy_core = { workspace = true }
 psy_common = { workspace = true }
 psy_data = { workspace = true }
 psy_io = { workspace = true }
+
+
+[dev-dependencies]
+clap = { workspace = true }
+
+rustyline = { workspace = true }
+rustyline-derive = { workspace = true }

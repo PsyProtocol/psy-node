@@ -35,7 +35,10 @@ pub fn verify_end_cap_proof<C: JTMBCircuitConfig>(
 
     // 2. Compute End Cap Public Inputs (Hash(StateTransition, Stats))
     let state_transition_pi_hash = end_cap_result.qfhash_with_guta_height::<C::Hasher>(global_user_tree_height);
+
+    println!("state_transition_pi_hash: {:?} (end cap result: {:#?})", state_transition_pi_hash, end_cap_result);
     let guta_stats_pi_hash = guta_stats.qfhash::<C::Hasher>();
+    println!("guta_stats_pi_hash: {:?} (guta stats: {:?})", guta_stats_pi_hash, guta_stats);
     let expected_public_inputs_hash = C::Hasher::two_to_one(&state_transition_pi_hash, &guta_stats_pi_hash);
 
     // 3. Constraint: Proof Public Inputs must match computed inputs

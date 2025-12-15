@@ -185,6 +185,12 @@ impl SimpleMerkleNodeKey {
     pub fn is_right_sibling(&self) -> bool {
         self.index % 2 == 1
     }
+    pub fn is_left_node(&self) -> bool {
+        self.index % 2 == 0
+    }
+    pub fn is_right_node(&self) -> bool {
+        self.index % 2 == 1
+    }
     pub fn find_nearest_common_ancestor(&self, other: &SimpleMerkleNodeKey) -> SimpleMerkleNodeKey {
         let start_level = u8::min(other.level, self.level);
         let mut self_current = self.parent_at_level(start_level);

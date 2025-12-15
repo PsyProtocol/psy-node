@@ -149,6 +149,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> CoordinatorGUTAPlanner<F, Ha
             logical_level: 0,
         };
         if self.has_committed_updates {
+            tracing::info!("adding update directly, already committed updates");
             self.add_realm_job_internal::<Hasher>(unique_pending_id, current_checkpoint_root, checkpoint_tree, global_user_tree, current_node).await?;
         }else{
             if current_checkpoint_root != &self.current_synced_checkpoint_root {
@@ -426,6 +427,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> CoordinatorGUTAPlanner<F, Ha
                 self.add_realm_job_internal::<Hasher>(unique_pending_id, current_checkpoint_root, checkpoint_tree, global_user_tree, queued_update).await?;
             }
         }
+        tracing::info!("Finalizing GUTA Planner with {} waiting nodes.", self.waiting_nodes.len());
         // 1. Gather all pending subtrees.
         // We use std::mem::take to satisfy borrow checker rules, allowing us to mutate self later.
         // The waiting_nodes are ordered by power-of-2 size (index 0 = height 0, index 1 = height 1).

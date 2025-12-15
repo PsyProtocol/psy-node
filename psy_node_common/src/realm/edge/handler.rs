@@ -418,6 +418,7 @@ impl<
             new_user_leaf,
             stats: user_end_cap_input.core.stats,
         };
+        println!("Publishing to user update queue: {:?}", queue_item);
         self.user_update_queue
             .publish_ephemeral_queue_item_owned(&queue_key, self.realm_id_u64, self.realm_sub_id_u64, proc_checkpoint_id, 0, queue_item)
             .await?;

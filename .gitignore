@@ -19,3 +19,8 @@ local_checkpoints/
 logs/
 
 index.scip
+
+**/.coordinator_edge_repl_history
+**/.realm_edge_repl_history
+.realm_edge_repl_history
+.coordinator_edge_repl_history

@@ -1,16 +1,14 @@
 use async_trait::async_trait;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
-use parth_core::
-    protocol::core_types::QNetworkTypesConfig
-;
-use psy_api_core::{coordinator::standard_edge_rpc::CoordinatorEdgeRpcClient};
+use parth_core::{crypto::hash::merkle_proof::MerkleProofCore, protocol::core_types::QNetworkTypesConfig};
+use psy_api_core::coordinator::standard_edge_rpc::CoordinatorEdgeRpcClient;
 use psy_data::v1::qdata::public_key::PZKPublicKeyInfo;
 
 #[async_trait]
 pub trait PsyCoordinatorFetcher<Hash> {
     async fn cf_get_user_public_key(&self, user_id: u64) -> anyhow::Result<PZKPublicKeyInfo<Hash>>;
+    async fn cf_get_checkpoint_tree_merkle_proof(&self, checkpoint_id: u64) -> anyhow::Result<MerkleProofCore<Hash>>;
 }
-
 
 #[derive(Clone)]
 pub struct PsyCoordinatorAPIFetcher<N: QNetworkTypesConfig + 'static, C: CoordinatorEdgeRpcClient<N::F, N::QHash, N::JobId, N::ZKProof>> {
@@ -18,9 +16,7 @@ pub struct PsyCoordinatorAPIFetcher<N: QNetworkTypesConfig + 'static, C: Coordin
     _phantom_f: std::marker::PhantomData<N::F>,
 }
 
-pub fn new_coordinator_fetcher_from_url<
-    N: QNetworkTypesConfig + 'static,
->(api_url: &str) -> anyhow::Result<PsyCoordinatorAPIFetcher<N, HttpClient>> {
+pub fn new_coordinator_fetcher_from_url<N: QNetworkTypesConfig + 'static>(api_url: &str) -> anyhow::Result<PsyCoordinatorAPIFetcher<N, HttpClient>> {
     let http_client: HttpClient = HttpClientBuilder::default().build(&api_url)?;
     Ok(PsyCoordinatorAPIFetcher::new(http_client))
 }
@@ -44,6 +40,15 @@ impl<N: QNetworkTypesConfig + 'static, C: CoordinatorEdgeRpcClient<N::F, N::QHas
     PsyCoordinatorFetcher<N::QHash> for PsyCoordinatorAPIFetcher<N, C>
 {
     async fn cf_get_user_public_key(&self, user_id: u64) -> anyhow::Result<PZKPublicKeyInfo<N::QHash>> {
-        self.client.get_public_key_for_user_id(user_id).await.map_err(|e| anyhow::anyhow!("{:?}", e))
+        self.client
+            .get_public_key_for_user_id(user_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("{:?}", e))
+    }
+    async fn cf_get_checkpoint_tree_merkle_proof(&self, checkpoint_id: u64) -> anyhow::Result<MerkleProofCore<N::QHash>> {
+        self.client
+            .get_checkpoint_tree_merkle_proof(checkpoint_id + 10, checkpoint_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("{:?}", e))
     }
 }

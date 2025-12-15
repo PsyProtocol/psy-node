@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use dashmap::DashMap;
-use parth_core::{crypto::hash::{merkle_proof::{DeltaMerkleProofCore, MerkleProofCore}, traits::MerkleZeroHasher}, data::hash::merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}};
+use parth_core::{crypto::hash::{merkle_proof::{DeltaMerkleProofCore, MerkleProofCore, compute_root_merkle_proof_generic}, traits::MerkleZeroHasher}, data::hash::merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}};
 use std::marker::PhantomData;
 
 use crate::memory_stores::traits::{PsyMemoryMerkleStoreAppendOnlyReaderBase, PsyMemoryMerkleStoreAppendOnlyReaderBaseAsync, PsyMemoryMerkleStoreImm};
@@ -172,9 +172,31 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + Eq + PartialEq + Default + std
         index: u64,
         historical_index: u64,
     ) -> MerkleProofCore<Hash> {
-        // get the merkle proof showing the inclusion of a leaf, at the point in time where the leaf at historical index is the last non-zero leaf
+        // get the merkle proof showing the inclusion of a leaf at index n, at the point in time where the leaf at historical index is the last non-zero leaf
         
         let leaf_key = SimpleMerkleNodeKey::new(self.get_height(), index);
+        let siblings = leaf_key.siblings();
+        let mut sibling_values = Vec::with_capacity(siblings.len());
+        let mut h_index = historical_index;
+        for sibling_key in &siblings {
+            if sibling_key.index > h_index {
+                sibling_values.push(self.get_zero_hash_for_level(sibling_key.level));
+            } else {
+                sibling_values.push(self.get_node_value(sibling_key));
+            }
+            h_index >>= 1;
+        }
+        let value = self.get_node_value(&leaf_key);
+        let root = compute_root_merkle_proof_generic::<Hash, Hasher>(value, index, &sibling_values);
+        MerkleProofCore {
+            index,
+            siblings: sibling_values,
+            root,
+            value,
+        }
+
+        /*
+
         let value = self.get_historical_node_value(&leaf_key, historical_index);
 
         let mut siblings = Vec::with_capacity(self.get_height() as usize);
@@ -187,6 +209,7 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + Eq + PartialEq + Default + std
 
         let root = self.get_historical_node_value(&current_key, historical_index);
         MerkleProofCore { index, siblings, root, value }
+        */
     }
 
 }
@@ -531,6 +554,33 @@ mod tests {
         Ok(())
     }
 
+
+    #[test]
+    fn test_historical_append() -> anyhow::Result<()> {
+        let height = 32;
+        let store = TestMerkleStore::new(height);
+        let count = 100;
+        let leaves_to_append = gen_random_hashes(count);
+        for (i, leaf) in leaves_to_append.iter().enumerate() {
+            for n in 0..i {
+                let historical_proof = store.get_historical_merkle_proof_at_historical_index(n as u64, i as u64);
+                assert_eq!(historical_proof.verify::<TestHasher>(), true, "Failed to verify historical proof for leaf index {} at historical index {}", n, i);
+            }
+            let res = store.append_leaf(i as u64, *leaf)?;
+            assert_eq!(res.verify::<TestHasher>(), true, "Failed to verify delta merkle proof for appended leaf at index {}", i);
+            for n in 0..i {
+                let historical_proof = store.get_historical_merkle_proof_at_historical_index(n as u64, i as u64);
+                assert_eq!(historical_proof.verify::<TestHasher>(), true, "Failed to verify historical proof for leaf index {} at historical index {}", n, i);
+            }
+        }
+        for i in 0..count {
+            for n in 0..i {
+                let historical_proof = store.get_historical_merkle_proof_at_historical_index(n as u64, i as u64);
+                assert_eq!(historical_proof.verify::<TestHasher>(), true, "Failed to verify historical proof for leaf index {} at historical index {}", n, i);
+            }
+        }
+        Ok(())
+    }
     // --- Scenario Test ---
 
     #[test]
