@@ -62,7 +62,7 @@ impl<C: JTMBCircuitConfig> QEDCoordinatorCircuitManager<C> {
         batch_deploy_contract_sub_tree_height: usize,
         max_contract_state_tree_height: usize,
     ) -> Self {
-        let max_guta_nca_merkle_proof_height = global_user_tree_height - global_user_tree_realm_height;
+        let max_guta_nca_merkle_proof_height = (global_user_tree_height - global_user_tree_realm_height).max(global_user_tree_realm_height);
 
         let guta_circuits = QEDGUTACircuitManager::new(
             private_key,

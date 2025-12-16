@@ -1,6 +1,5 @@
 use std::sync::{atomic::AtomicBool, Arc};
 
-use anyhow::Ok;
 use parth_common::memory_stores::{mem_tree_recorder::SimpleMemoryMerkleRecorderStore, traits::PsyMemoryMerkleStoreImm};
 use parth_core::{
     crypto::hash::
@@ -12,7 +11,6 @@ use parth_core::{
     },
     node::realm_identifier::QRealmIdentifier,
     protocol::core_types::{Q256BitHash, QNetworkTypesConfig},
-    QCoreProcCheckpointUniqueId,
 };
 use psy_core::{
     constants::stale_checkpoint::STALE_CHECKPOINT_AGE_USER_END_CAP_TO_REALM_PROOF,
@@ -22,7 +20,7 @@ use psy_data::{
     config::network_config::PsyNodeCircuitFingerprintConfig,
     genesis::genesis_block_setup::PsyGenesisBlockSetupData,
     node::realm_processor::{RealmProcessorCoreState, RealmProcessorCoreStateWrapper},
-    prepared_block::realm::{PsyPreparedRealmBlockStateUpdatesWithCoordinatorUpdate, PsyRealmCoordinatorUpdate},
+    prepared_block::realm::PsyPreparedRealmBlockStateUpdatesWithCoordinatorUpdate,
     queue_items::realm_user_update::PsyRealmUserUpdateQueueItem,
 };
 use psy_io::tokio::TokioLikeFileSystem;
@@ -39,13 +37,9 @@ use psy_node_core::{
 
 use crate::{
     backup::{checkpoint_tree::CheckpointTreeBackupManager, realm::generate_realm_output_from_backups},
-    constants::queue::
-        PQ_REALM_SUBMIT_USER_UPDATE_QUEUE_TOPIC_ID
-    ,
+    constants::queue::PQ_REALM_SUBMIT_USER_UPDATE_QUEUE_TOPIC_ID,
     queue::gatherer::QueueKeyStatusManager,
-    realm::
-        processor::db::{DatabaseCheckState, PsyRealmDatabaseProcessor}
-    ,
+    realm::processor::db::{DatabaseCheckState, PsyRealmDatabaseProcessor},
 };
 
 pub async fn create_new_checkpoint_backup_manager_from_file_path<
@@ -87,50 +81,72 @@ where
     N::HasherBase: 'static + Send + Sync,
 {
     pub async fn get_database_check_state(&self) -> anyhow::Result<DatabaseCheckState> {
-        let realm_root = self.get_realm_root_from_db().await?;
-        let coordinator_realm_root: CheckpointedMerkleHash<N::QHash> = self
+        let local_latest_checkpoint_id: u64 = self.db.get_latest_checkpoint_id().await?;
+        
+        // 1. Check for Genesis requirement
+        if local_latest_checkpoint_id == 0 {
+            // Check if we actually have genesis applied (unique IDs > 0 usually implies initialization)
+            let (last_unique_pending_id, _) = self.db.get_current_unique_pending_id().await?;
+            if last_unique_pending_id == 0 {
+                // Completely empty
+                return Ok(DatabaseCheckState::NeedsGenesis);
+            }
+        }
+
+        // 2. Check Consistency against Coordinator
+        // We get the coordinator's view of *our* realm root.
+        // u64::MAX-0xffff is a convention for "latest checkpoint known to coordinator"
+        let coordinator_realm_state: CheckpointedMerkleHash<N::QHash> = self
             .coordinator_client
-            .rc_get_realm_root_and_last_modified_checkpoint(u64::MAX-0xffff, self.state.realm_id_u64)
+            .rc_get_realm_root_and_last_modified_checkpoint(u64::MAX - 0xffff, self.state.realm_id_u64)
             .await?;
-        if coordinator_realm_root.value != realm_root {
-            tracing::info!("Realm root in database ({:?}) does not match coordinator's realm root ({:?}) for realm ID: {}. Database needs recovery.",
-                realm_root, coordinator_realm_root.value, self.state.realm_id_u64);
+
+        // Get our local root at the checkpoint the coordinator claims we are at.
+        // If we don't have this checkpoint locally, we are definitely behind/broken.
+        if coordinator_realm_state.checkpoint_id > local_latest_checkpoint_id {
+            tracing::info!(
+                "Coordinator indicates Realm updated at checkpoint {}, but local DB only at {}. Needs Recovery.",
+                coordinator_realm_state.checkpoint_id,
+                local_latest_checkpoint_id
+            );
             return Ok(DatabaseCheckState::NeedsRecovery);
         }
 
-        let actual_latest_applied_checkpoint_id: u64 = self.db.get_latest_checkpoint_id().await?;
-        let (last_unique_pending_id, _last_unique_proc_checkpoint_id): (u64, QCoreProcCheckpointUniqueId) =
-            self.db.get_current_unique_pending_id().await?;
+        // We have the checkpoint ID locally. Let's compare roots.
+        let local_realm_root = self
+            .db
+            .global_user_tree_get_node_and_checkpoint_id_max_checkpoint(coordinator_realm_state.checkpoint_id, &self.realm_root_node)
+            .await?;
 
-        let expected_checkpoint_id: Option<u64> = self.db.get_checkpoint_id_for_unique_pending_id(last_unique_pending_id).await?;
-        let database_check_state = if expected_checkpoint_id.is_none() && actual_latest_applied_checkpoint_id == 0 {
-            // needs genesis
-            DatabaseCheckState::NeedsGenesis
-        } else if expected_checkpoint_id.is_none() {
-            // died before setting anything in the database, we don't need to recover
-            DatabaseCheckState::Ready
-        } else {
-            let expected_checkpoint_id = expected_checkpoint_id.unwrap();
-            if expected_checkpoint_id != actual_latest_applied_checkpoint_id {
-                if expected_checkpoint_id < actual_latest_applied_checkpoint_id {
-                    anyhow::bail!("Inconsistent database state detected: expected checkpoint ID ({}) for unique pending ID ({}) is less than actual latest applied checkpoint ID ({}). This indicates a serious inconsistency in the database state.",
-                        expected_checkpoint_id, last_unique_pending_id, actual_latest_applied_checkpoint_id);
-                } else if expected_checkpoint_id > actual_latest_applied_checkpoint_id + 1 {
-                    anyhow::bail!("Inconsistent database state detected: expected checkpoint ID ({}) for unique pending ID ({}) is greater than actual latest applied checkpoint ID + 1 ({}). This indicates a serious inconsistency in the database state.",
-                        expected_checkpoint_id, last_unique_pending_id, actual_latest_applied_checkpoint_id + 1);
-                } else if expected_checkpoint_id == 0 {
-                    // needs genesis
-                    DatabaseCheckState::NeedsGenesis
-                } else {
-                    // needs recovery
-                    DatabaseCheckState::NeedsRecovery
+        if local_realm_root.value != coordinator_realm_state.value {
+            tracing::warn!(
+                "Realm Root Mismatch at Checkpoint {}. Local: {:?}, Remote: {:?}. Needs Recovery.",
+                coordinator_realm_state.checkpoint_id,
+                local_realm_root.value,
+                coordinator_realm_state.value
+            );
+            return Ok(DatabaseCheckState::NeedsRecovery);
+        }
+
+        // 3. Check internal DB consistency (Pending ID vs Checkpoint ID mapping)
+        let (last_unique_pending_id, _) = self.db.get_current_unique_pending_id().await?;
+        let expected_checkpoint_id_opt = self.db.get_checkpoint_id_for_unique_pending_id(last_unique_pending_id).await?;
+
+        if let Some(expected_checkpoint_id) = expected_checkpoint_id_opt {
+            if expected_checkpoint_id != local_latest_checkpoint_id {
+                // If the mapping says we should be at X, but we are at Y.
+                // Assuming mapping is set on commit.
+                if expected_checkpoint_id > local_latest_checkpoint_id {
+                     tracing::error!("DB Inconsistency: PendingID {} maps to Checkpoint {}, but latest is {}.", 
+                        last_unique_pending_id, expected_checkpoint_id, local_latest_checkpoint_id);
+                     return Ok(DatabaseCheckState::NeedsRecovery);
                 }
-            } else {
-                DatabaseCheckState::Ready
             }
-        };
-        Ok(database_check_state)
+        }
+
+        Ok(DatabaseCheckState::Ready)
     }
+
     pub async fn new_init(
         db: Arc<S>,
         tag_tree_rewards_store: Arc<STagTreeRewards>,
@@ -154,48 +170,37 @@ where
             index: realm_id_u64 << N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
         };
 
+        // 1. Recover basic state from DB
         let (current_unique_pending_id, current_core_proc_unique_pending_id) = db.get_current_unique_pending_id().await?;
         let last_committed_checkpoint_id = db.get_latest_checkpoint_id().await?;
 
-        let get_unique_pending_ids_result: anyhow::Result<Option<(u64, u128)>> = db.get_unique_pending_id_for_checkpoint_id(last_committed_checkpoint_id).await;
-        if last_committed_checkpoint_id > 0 && get_unique_pending_ids_result.is_err() {
-            tracing::error!("Inconsistent database state detected: unable to retrieve unique pending IDs for last committed checkpoint ID ({}). This indicates a serious inconsistency in the database state.", last_committed_checkpoint_id);
-            anyhow::bail!("Inconsistent database state detected: unable to retrieve unique pending IDs for last committed checkpoint ID ({}). This indicates a serious inconsistency in the database state.", last_committed_checkpoint_id);
-        }
-        let get_unique_pending_ids_result: (u64, u128) = if get_unique_pending_ids_result.is_err() {
-            if last_committed_checkpoint_id == 0 {
-                (0, 0u128)
-            } else {
-                tracing::error!("Inconsistent database state detected: unable to retrieve unique pending IDs for last committed checkpoint ID ({}). This indicates a serious inconsistency in the database state.", last_committed_checkpoint_id);
-                anyhow::bail!("Inconsistent database state detected: unable to retrieve unique pending IDs for last committed checkpoint ID ({}). This indicates a serious inconsistency in the database state.", last_committed_checkpoint_id);
+        // 2. Validate consistency of unique pending IDs
+        let get_unique_pending_ids_result = db.get_unique_pending_id_for_checkpoint_id(last_committed_checkpoint_id).await;
+        
+        let (last_committed_unique_pending_id, last_committed_proc_checkpoint_unique_id) = match get_unique_pending_ids_result {
+            Ok(Some(res)) => res,
+            Ok(None) if last_committed_checkpoint_id == 0 => (0, 0u128),
+            Ok(None) => {
+                tracing::error!("DB Inconsistency: No unique pending ID for last committed checkpoint {}", last_committed_checkpoint_id);
+                anyhow::bail!("DB Inconsistency: No unique pending ID for last committed checkpoint");
             }
-        }else{
-            let x = get_unique_pending_ids_result?;
-            if x.is_none() {
+            Err(e) => {
                 if last_committed_checkpoint_id == 0 {
                     (0, 0u128)
                 } else {
-                    tracing::error!("Inconsistent database state detected: unable to retrieve unique pending IDs for last committed checkpoint ID ({}). This indicates a serious inconsistency in the database state.", last_committed_checkpoint_id);
-                    anyhow::bail!("Inconsistent database state detected: unable to retrieve unique pending IDs for last committed checkpoint ID ({}). This indicates a serious inconsistency in the database state.", last_committed_checkpoint_id);
+                    return Err(e);
                 }
-            } else {
-                x.unwrap()
             }
         };
 
+        // 3. Get Checkpoint Root
+        let last_committed_checkpoint_root = match db.checkpoint_tree_get_root_hash(last_committed_checkpoint_id).await {
+            Ok(root) => root,
+            Err(_) if last_committed_checkpoint_id == 0 => genesis_checkpoint_root,
+            Err(e) => return Err(e),
+        };
 
-        let (last_committed_unique_pending_id, last_committed_proc_checkpoint_unique_id) = get_unique_pending_ids_result;
-
-        let last_committed_checkpoint_root = db.checkpoint_tree_get_root_hash(last_committed_checkpoint_id).await;
-        if last_committed_checkpoint_root.is_err() {
-            if last_committed_checkpoint_id == 0 && current_unique_pending_id == 0 {
-                // genesis case
-            } else {
-                tracing::error!("Inconsistent database state detected: unable to retrieve checkpoint tree root hash for last committed checkpoint ID ({}). This indicates a serious inconsistency in the database state.", last_committed_checkpoint_id);
-                anyhow::bail!("Inconsistent database state detected: unable to retrieve checkpoint tree root hash for last committed checkpoint ID ({}). This indicates a serious inconsistency in the database state.", last_committed_checkpoint_id);
-            }
-        }
-        let last_committed_checkpoint_root = last_committed_checkpoint_root.unwrap_or(genesis_checkpoint_root);
+        // 4. Get Realm Root
         let last_committed_realm_root = if last_committed_checkpoint_id == 0 {
             genesis_realm_root
         } else {
@@ -212,6 +217,7 @@ where
             last_committed_realm_root,
         );
 
+        // 5. Initialize Backup Manager
         let checkpoint_tree_backup_manager = create_new_checkpoint_backup_manager_from_file_path(
             file_system.clone(),
             STALE_CHECKPOINT_AGE_USER_END_CAP_TO_REALM_PROOF,
@@ -221,6 +227,8 @@ where
             true,
         )
         .await?;
+
+        // Initialize unique ID tracking in temp DB
         temp_db
             .set_unique_pending_ids(&realm_identifier, current_unique_pending_id, current_core_proc_unique_pending_id)
             .await?;
@@ -262,10 +270,10 @@ where
         &mut self,
         genesis_block_update: PsyPreparedRealmBlockStateUpdatesWithCoordinatorUpdate<N::F, N::QHash>,
     ) -> anyhow::Result<()> {
-        // Check if genesis has already been applied
         let database_check_state = self.get_database_check_state().await?;
         if database_check_state == DatabaseCheckState::NeedsGenesis {
-            tracing::info!("Applying genesis block setup data to coordinator processor database...");
+            tracing::info!("Applying genesis block setup data to realm processor database...");
+            println!("genesis_block_update.coordinator_update: {:?}", genesis_block_update.coordinator_update);
             self.commit_state(
                 &genesis_block_update.coordinator_update,
                 &genesis_block_update.prepared_updates,
@@ -273,16 +281,15 @@ where
                 vec![],
             )
             .await?;
-            tracing::info!("Genesis block setup data applied to coordinator processor database.");
+            tracing::info!("Genesis block setup data applied.");
         }
         Ok(())
     }
 
     pub async fn ensure_genesis_applied_from_setup_data(&mut self, genesis_data: &PsyGenesisBlockSetupData<N::F, N::QHash>) -> anyhow::Result<()> {
-        // Check if genesis has already been applied
         let database_check_state = self.get_database_check_state().await?;
         if database_check_state == DatabaseCheckState::NeedsGenesis {
-            tracing::info!("Applying genesis block setup data to coordinator processor database...");
+            tracing::info!("Applying genesis block setup data to realm processor database...");
             let genesis_block_update =
                 GenesisDatabaseDataBuilder::setup_for_realm::<N::HasherBase, N>(&genesis_data, self.state.realm_id_u64, self.state.realm_sub_id_u64)?;
             self.commit_state(
@@ -292,7 +299,7 @@ where
                 vec![],
             )
             .await?;
-            tracing::info!("Genesis block setup data applied to coordinator processor database.");
+            tracing::info!("Genesis block setup data applied.");
         }
         Ok(())
     }
@@ -300,32 +307,32 @@ where
     pub async fn ensure_db_matches_coordinator_head(&self) -> anyhow::Result<()> {
         let coordinator_latest_checkpoint_id: u64 = self.coordinator_client.rc_get_latest_checkpoint_id().await?;
         let local_latest_checkpoint_id: u64 = self.db.get_latest_checkpoint_id().await?;
+        
         if coordinator_latest_checkpoint_id < local_latest_checkpoint_id {
-            anyhow::bail!("Local database checkpoint ID ({}) is ahead of coordinator's latest checkpoint ID ({}). This indicates an inconsistency between the local database and the coordinator.",
+            anyhow::bail!("Local database checkpoint ID ({}) is ahead of coordinator ({}). Inconsistency detected.",
                 local_latest_checkpoint_id, coordinator_latest_checkpoint_id);
         }
 
-        let coordinator_last_realm_root: CheckpointedMerkleHash<N::QHash> = self
+        let coordinator_realm_root_state = self
             .coordinator_client
             .rc_get_realm_root_and_last_modified_checkpoint(coordinator_latest_checkpoint_id, self.state.realm_id_u64)
             .await?;
-        let local_last_realm_root = self
+            
+        let local_realm_root_state = self
             .db
             .global_user_tree_get_node_and_checkpoint_id_max_checkpoint(coordinator_latest_checkpoint_id, &self.realm_root_node)
             .await?;
-        if coordinator_last_realm_root != local_last_realm_root {
-            anyhow::bail!("Local database realm root ({:?}) does not match coordinator's realm root ({:?}) at checkpoint ID: {}. This indicates an inconsistency between the local database and the coordinator.",
-                local_last_realm_root, coordinator_last_realm_root, coordinator_latest_checkpoint_id);
-        }
-        if local_latest_checkpoint_id < coordinator_last_realm_root.checkpoint_id {
-            anyhow::bail!("Local database checkpoint ID ({}) is behind the coordinator's realm root last modified checkpoint ID ({}). This indicates an inconsistency between the local database and the coordinator.",
-                local_latest_checkpoint_id, coordinator_last_realm_root.checkpoint_id);
+
+        // If local latest checkpoint is older than what coordinator thinks we modified last
+        if local_latest_checkpoint_id < coordinator_realm_root_state.checkpoint_id {
+             anyhow::bail!("Local database is stale. Coordinator sees update at {}, local head is {}.", 
+                coordinator_realm_root_state.checkpoint_id, local_latest_checkpoint_id);
         }
 
-        if coordinator_latest_checkpoint_id > local_latest_checkpoint_id {
-            tracing::info!("realm root is correctly synced with coordinator, but we need to sync checkpooint data from coordinator. Local checkpoint ID: {}, Coordinator checkpoint ID: {}",
-                local_latest_checkpoint_id, coordinator_latest_checkpoint_id);
-            // we need to sync data from coordinator
+        // Compare roots
+        if coordinator_realm_root_state != local_realm_root_state {
+            anyhow::bail!("Realm Root mismatch. Coordinator: {:?}, Local: {:?}.",
+                coordinator_realm_root_state, local_realm_root_state);
         }
 
         Ok(())
@@ -354,54 +361,55 @@ where
     ) -> anyhow::Result<()> {
         let database_check_state = self.get_database_check_state().await?;
         if database_check_state == DatabaseCheckState::NeedsRecovery {
-            // wait for two checkpoints to ensure the coordinator has progressed
-            self.coordinator_client.rc_wait_for_next_checkpoint().await?;
-            self.coordinator_client.rc_wait_for_next_checkpoint().await?;
-            let coordinator_latest_checkpoint_id: u64 = self.coordinator_client.rc_get_latest_checkpoint_id().await?;
+            tracing::warn!("Inconsistent Realm Processor State detected. Initiating Recovery.");
+
+            // 1. Fetch correct state from Coordinator
+            let coordinator_latest_checkpoint_id = self.coordinator_client.rc_get_latest_checkpoint_id().await?;
+            
+            // Sync checkpoints first to ensure we have the proof data
             self.checkpoint_tree_backup_manager
-                .sync_from_coordinator_client::<_, N::F>(&self.coordinator_client, 2000)
+                .sync_from_coordinator_client::<CoordinatorClient, N::F>(&self.coordinator_client, 2000)
                 .await?;
 
-            let realm_root_with_id: CheckpointedMerkleHash<N::QHash> = self
+            // 2. Identify the target checkpoint for restoration
+            let target_realm_state = self
                 .coordinator_client
                 .rc_get_realm_root_and_last_modified_checkpoint(coordinator_latest_checkpoint_id, self.state.realm_id_u64)
                 .await?;
-            let (local_latest_unique_pending_id, _): (u64, _) = self.db.get_current_unique_pending_id().await?;
+            
+            let restore_checkpoint_id = target_realm_state.checkpoint_id;
+            tracing::info!("Restoring to Coordinator Realm Root at Checkpoint {}", restore_checkpoint_id);
 
-            tracing::info!("Restoring database state from backups to match coordinator's realm root ({:?}) at checkpoint ID: {}. Local unique pending ID before restore: {}",
-                realm_root_with_id.value, realm_root_with_id.checkpoint_id, local_latest_unique_pending_id);
-            let restore_checkpoint_id = realm_root_with_id.checkpoint_id;
+            // 3. Fetch Full Coordinator Update Data for that checkpoint
+            let coordinator_update = self.coordinator_client.rc_get_realm_sync_info(restore_checkpoint_id).await?;
 
-            let coordinator_update: PsyRealmCoordinatorUpdate<N::F, N::QHash> = self.coordinator_client.rc_get_realm_sync_info(restore_checkpoint_id).await?;
-
+            // 4. Generate local updates from backup files corresponding to that state
             let prepared_updates = generate_realm_output_from_backups::<N, FileSystem>(
                 file_system,
                 guta_gatherer_backup_directory,
-                &self.state,
+                &self.state, // Note: verify if self.state has correct pending IDs for finding the file?
                 global_user_tree,
             )
             .await?;
 
+            // 5. Commit state to DB
             self.commit_state(
                 &coordinator_update,
                 &prepared_updates,
-                ProvingJobCircuitType::GUTANoChange,
+                ProvingJobCircuitType::GUTANoChange, // Dummy type for recovery
                 vec![],
             ).await?;
-            tracing::info!("Restored database state from backups up to checkpoint ID: {}", restore_checkpoint_id);
 
+            tracing::info!("Recovery Complete. Restored to Checkpoint {}.", restore_checkpoint_id);
+
+            // 6. Verify Post-Recovery
             let latest_realm_root = self.get_realm_root_from_db().await?;
-            if latest_realm_root != realm_root_with_id.value {
-                tracing::error!("Post-recovery realm root ({:?}) does not match expected realm root from coordinator ({:?}) at checkpoint ID: {}. This indicates an inconsistency after recovery.",
-                    latest_realm_root, realm_root_with_id.value, restore_checkpoint_id);
-                anyhow::bail!("Post-recovery realm root ({:?}) does not match expected realm root from coordinator ({:?}) at checkpoint ID: {}. This indicates an inconsistency after recovery.",
-                    latest_realm_root, realm_root_with_id.value, restore_checkpoint_id);
+            if latest_realm_root != target_realm_state.value {
+                anyhow::bail!("Post-recovery root mismatch! Local: {:?}, Target: {:?}", latest_realm_root, target_realm_state.value);
             }
         }
         Ok(())
     }
-
-
 
     pub async fn init_with_setup_and_genesis(
         &mut self,
@@ -410,56 +418,73 @@ where
         genesis_block_update: PsyPreparedRealmBlockStateUpdatesWithCoordinatorUpdate<N::F, N::QHash>,
         global_user_tree: &mut SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>,
     ) -> anyhow::Result<()> {
+        let genesis_checkpoint_root = genesis_block_update.coordinator_update.checkpoint_sync_info.checkpoint_tree_root;
+
+        // 1. Genesis Check
         self.ensure_genesis_applied(genesis_block_update).await?;
+
+        // 2. Recovery Check
         self.ensure_backup_restored_if_necessary(file_system, guta_gatherer_backup_directory, global_user_tree)
             .await?;
+
+        // 3. Hydrate Checkpoint Manager from Local DB (if we have data)
         if self.state.last_committed_checkpoint_id > 0 {
             self.checkpoint_tree_backup_manager
                 .sync_from_database::<S>(&self.db, 1000, self.state.last_committed_checkpoint_id)
                 .await?;
         }
 
+        // 4. Fast Forward / Sync with Coordinator
         self.sync_to_coordinator_set_checkpoint_id().await?;
 
-        let global_user_tree_root = self.db.global_user_tree_get_root_hash(0xffffffffffffff00u64).await?;
-        let last_commited_realm_root: CheckpointedMerkleHash<N::QHash> = self
-            .coordinator_client
-            .rc_get_realm_root_and_last_modified_checkpoint(0xffffffffffffff00u64, self.state.realm_id_u64)
-            .await?;
+        // 5. Refresh Internal State
+        let current_realm_root = self.db.global_user_tree_get_node(self.state.last_committed_checkpoint_id, self.realm_root_node).await?;
+        
+        self.state.last_committed_realm_end_root = current_realm_root;
+        self.state.last_committed_realm_start_root = current_realm_root;
+        self.state.processing_realm_start_root = current_realm_root;
+        self.state.processing_realm_end_root = current_realm_root;
+        self.state.gathering_realm_start_root = current_realm_root;
 
-        self.state.last_committed_checkpoint_id = last_commited_realm_root.checkpoint_id;
-        self.state.last_committed_realm_end_root = last_commited_realm_root.value;
-
-        self.state.last_committed_realm_end_root = global_user_tree_root;
-        self.state.last_committed_realm_start_root = global_user_tree_root;
-        self.state.processing_realm_start_root = global_user_tree_root;
-        self.state.processing_realm_end_root = global_user_tree_root;
-        self.state.gathering_realm_start_root = global_user_tree_root;
-
+        // 6. Final Sync of Checkpoint Manager (Tip Verification)
         self.checkpoint_tree_backup_manager
             .sync_from_coordinator_client::<CoordinatorClient, N::F>(&self.coordinator_client, 2000)
             .await?;
 
-        self.state.coordinator_head_synced_checkpoint_id = self.checkpoint_tree_backup_manager.get_current_checkpoint_id_head();
-        let checkpoint_root = self.checkpoint_tree_backup_manager.checkpoint_tree.get_root();
-        self.state.processing_checkpoint_root = checkpoint_root;
-        self.state.gathering_checkpoint_root = checkpoint_root;
-        self.state.processing_checkpoint_id = self.state.coordinator_head_synced_checkpoint_id;
-        self.state.gathering_checkpoint_id = self.state.coordinator_head_synced_checkpoint_id;
-        let last_committed_checkpoint_root = self
-            .checkpoint_tree_backup_manager
-            .checkpoint_tree
-            .get_leaf(self.state.last_committed_checkpoint_id)
-            .get_append_root::<N::HasherBase>();
+        let head_checkpoint_id = self.checkpoint_tree_backup_manager.get_current_checkpoint_id_head();
+        let head_checkpoint_root = self.checkpoint_tree_backup_manager.get_current_checkpoint_tree_root_head();
+
+        self.state.coordinator_head_synced_checkpoint_id = head_checkpoint_id;
+        self.state.coordinator_head_synced_checkpoint_root = head_checkpoint_root;
+        
+        // Update processing pointers
+        self.state.processing_checkpoint_root = head_checkpoint_root;
+        self.state.gathering_checkpoint_root = head_checkpoint_root;
+        self.state.processing_checkpoint_id = head_checkpoint_id;
+        self.state.gathering_checkpoint_id = head_checkpoint_id;
+
+        // Get the root of the *last committed* checkpoint for historical consistency
+        let last_committed_checkpoint_root = if self.state.last_committed_checkpoint_id == 0 {
+            genesis_checkpoint_root 
+        } else {
+            self.checkpoint_tree_backup_manager
+                .checkpoint_tree
+                .get_leaf(self.state.last_committed_checkpoint_id)
+                .get_append_root::<N::HasherBase>()
+        };
         self.state.last_committed_checkpoint_root = last_committed_checkpoint_root;
 
-        self.set_new_unique_ids(Some(global_user_tree_root)).await?;
+        // 7. Initialize Unique IDs for new work
+        self.set_new_unique_ids(Some(current_realm_root)).await?;
+        
+        // 8. Publish state to shared wrapper
         self.shared_state.update_from_core_state(&self.state).await?;
 
         tracing::info!(
-            "[COORDINATOR] Started with checkpoint ID: {}, unique pending ID: {}",
+            "[REALM] Initialized. Checkpoint: {}, Pending ID: {}, Realm Root: {:?}",
             self.state.coordinator_head_synced_checkpoint_id,
             self.state.gathering_unique_pending_id,
+            current_realm_root
         );
         self.print_coordinator_processor_state();
         Ok(())

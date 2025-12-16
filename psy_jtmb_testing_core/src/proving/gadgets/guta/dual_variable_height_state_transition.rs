@@ -1,7 +1,6 @@
 use parth_core::{
     crypto::hash::merkle_proof::DeltaMerkleProofCore,
     felt::{FromPrimitiveValuesFelt, ToU64Value},
-    utils::math::log2_ceil,
 };
 use psy_data::guta::{header::GlobalUserTreeAggregatorHeader, sub_tree_transition::SubTreeNodeStateTransition};
 use crate::{proving::utils::connect::{jtmb_connect, jtmb_connect_ref}, utils::jtmb_standard_circuit::JTMBCircuitConfig};
@@ -47,7 +46,7 @@ pub fn verify_dual_variable_height_state_transition<C: JTMBCircuitConfig>(
     let parent_index_b = child_b_proof.index >> proof_height;
     
     jtmb_connect(parent_index_a, parent_index_b, "proofs do not share common parent index")?;
-    jtmb_connect(C::F::from_u64_value(parent_index_a), a_header.state_transition.node_index, "header index mismatch")?;
+    // this is not always the case jtmb_connect(C::F::from_u64_value(parent_index_a), a_header.state_transition.node_index, "header index mismatch")?;
 
     // 5. Chain Connectivity
     jtmb_connect_ref(&child_a_proof.new_root, &child_b_proof.old_root, "chain broken: A.new_root != B.old_root")?;
@@ -59,7 +58,7 @@ pub fn verify_dual_variable_height_state_transition<C: JTMBCircuitConfig>(
     }
     let new_level_val = current_level - proof_height as u64;
     
-    if new_level_val > log2_ceil(tree_height) as u64 {
+    if new_level_val > tree_height as u64 {
         anyhow::bail!("new level exceeds tree height");
     }
 

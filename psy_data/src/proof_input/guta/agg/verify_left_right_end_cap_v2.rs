@@ -231,7 +231,7 @@ impl<F: QFelt, Hash: Copy> GUTAVerifyTwoEndCapCircuitInputV2<F, Hash> {
             state_transition: SubTreeNodeStateTransition {
                 old_node_value: self.left_global_user_tree_delta_merkle_proof.old_root,
                 new_node_value: self.right_global_user_tree_delta_merkle_proof.new_root,
-                node_index: F::from_u64_value(self.right_global_user_tree_delta_merkle_proof.index),
+                node_index: F::from_u64_value(self.right_global_user_tree_delta_merkle_proof.index >> self.right_global_user_tree_delta_merkle_proof.siblings.len()),
                 node_level: F::from_u64_value((global_user_tree_height - self.right_global_user_tree_delta_merkle_proof.siblings.len()) as u64),
             },
             stats: self.left_end_cap.guta_stats.combine_with(&self.right_end_cap.guta_stats),

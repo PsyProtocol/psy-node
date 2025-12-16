@@ -1,3 +1,7 @@
+import { parseArgs } from "util";
+
+
+
 type ProcessLineVisitor = (line: string, process: RunningProcess) => void;
 
 
@@ -248,7 +252,23 @@ async function runSetupLocalDevnet(options?: {cwd?: string, jtmb?: boolean}) {
 
 
 async function runMain() {
-    const manager = await runSetupLocalDevnet({jtmb: true});
+
+    const { values, positionals } = parseArgs({
+        args: Bun.argv,
+        options: {
+            jtmb: {
+                type: "boolean",
+            },
+        },
+        allowPositionals: true,
+    });
+    const jtmbEnabled = !!values.jtmb;
+
+
+    const mode = jtmbEnabled ? 'JTMB DevNet' : 'Standard Plonky2';
+
+    console.log("Starting Local DevNet in mode:", mode);
+    const manager = await runSetupLocalDevnet({jtmb: jtmbEnabled});
 }
 
 runMain().then(()=>{

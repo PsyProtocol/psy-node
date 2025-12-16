@@ -269,6 +269,16 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
             );
             return Ok(());
         }
+        let last_user_leaf_value = global_user_tree.get_leaf_value(user_id - self.realm_user_min_id);
+        if last_user_leaf_value != queue_item.old_user_leaf_hash {
+            tracing::info!(
+                "Skipping end-cap job population due to user leaf hash mismatch for user ID {}. Expected {:?}, found {:?}. Likely got overwritten due to a race condition. Gracefully skipping.",
+                user_id,
+                last_user_leaf_value,
+                queue_item.old_user_leaf_hash
+            );
+            return Ok(());
+        }
         if user_last_checkpoint_id > self.current_checkpoint_id {
             tracing::info!(
                 "Skipping end-cap job population due to user last checkpoint ID {} being greater than current checkpoint ID {} for user ID {}.",

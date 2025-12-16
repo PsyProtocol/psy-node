@@ -20,8 +20,9 @@ pub fn get_psy_node_jtmb_poseidon_goldilocks_config_for_network(network: PsyChai
 
     let lib = verifier.library;
     let guta_circuit_whitelist_root = lib
-        .get_group_inclusion_proof(ProvingJobCircuitType::GUTATwoGUTA, ProvingJobCircuitType::GUTATwoGUTA)?
+        .get_group_inclusion_proof(ProvingJobCircuitType::GUTATwoGUTALinearUpgradeCheckpoint, ProvingJobCircuitType::GUTATwoGUTALinear)?
         .root;
+    println!("get_psy_node_jtmb_poseidon_goldilocks_config_for_network: guta_circuit_whitelist_root: {:?}", guta_circuit_whitelist_root);
 
     let append_user_registration_tree_fingerprint = lib.get_fingerprint(ProvingJobCircuitType::AppendUserRegistrationTree)?;
     let batch_deploy_contracts_fingerprint = lib.get_fingerprint(ProvingJobCircuitType::BatchDeployContracts)?;

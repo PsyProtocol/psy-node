@@ -3,15 +3,21 @@ use std::{collections::HashMap, sync::Arc};
 use anyhow::Ok;
 use async_trait::async_trait;
 use parth_core::{
-    QCoreProcCheckpointUniqueId, crypto::hash::{
+    crypto::hash::{
         merkle_proof::{DeltaMerkleProofCore, MerkleProofCore},
         tag_tree::TagTreeMerkleProof,
-    }, data::{
+    },
+    data::{
         db::row::QDatabaseSingleIdTableRow,
         hash::{
-            checkpointed_merkle_node::CheckpointedMerkleHash, merkle_node_key::{PSY_OBJECT_FFS_SIZE_SIMPLE_MERKLE_NODE_KEY, SimpleMerkleNode, SimpleMerkleNodeKey}, merkle_store_key::{QMerkleStoreDoubleIdKey, QMerkleStoreDoubleIdNode, QMerkleStoreSingleIdKey, QMerkleStoreSingleIdNode}
+            checkpointed_merkle_node::CheckpointedMerkleHash,
+            merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey, PSY_OBJECT_FFS_SIZE_SIMPLE_MERKLE_NODE_KEY},
+            merkle_store_key::{QMerkleStoreDoubleIdKey, QMerkleStoreDoubleIdNode, QMerkleStoreSingleIdKey, QMerkleStoreSingleIdNode},
         },
-    }, felt::ToU64Value, protocol::core_types::QNetworkDatabaseTypes
+    },
+    felt::ToU64Value,
+    protocol::core_types::QNetworkDatabaseTypes,
+    QCoreProcCheckpointUniqueId,
 };
 use psy_data::{
     protocol::verifiable_checkpoint_transition::PsyVerifiableCheckpointTransitionWithProof,
@@ -448,7 +454,8 @@ impl<
             .db_set_zero_id_merkle_nodes_batch_checkpoint_is_index(&self.global_checkpoint_tree_table, nodes)
             .await
     }
-        async fn checkpoint_tree_injest_merkle_proof(&self, checkpoint_id: u64, merkle_proof: &MerkleProofCore<N::QHash>) -> anyhow::Result<()>{
+    async fn checkpoint_tree_injest_merkle_proof(&self, checkpoint_id: u64, merkle_proof: &MerkleProofCore<N::QHash>) -> anyhow::Result<()> {
+        /*
             let mut siblings = Vec::with_capacity(merkle_proof.siblings.len());
             let leaf_key = SimpleMerkleNodeKey::new(N::CHECKPOINT_TREE_HEIGHT, merkle_proof.index);
             let siblings_keys = leaf_key.get_siblings_keys_to_height(0);
@@ -458,6 +465,7 @@ impl<
                     value: *sibling_hash,
                 });
             }
+            let path_nodes = merkle_proof.get_append_root(&leaf_key);
             self.store
                 .db_set_zero_id_merkle_nodes_batch_checkpoint_is_index(&self.global_checkpoint_tree_table, &siblings)
                 .await?;
@@ -473,9 +481,13 @@ impl<
             }],
         )
         .await?;
-        Ok(())
+        Ok(())*/
 
-        }
+        let nodes: Vec<SimpleMerkleNode<N::QHash>> = merkle_proof.get_all_merkle_nodes_and_verify::<N::HasherBase>()?;
+        self.store
+            .db_set_zero_id_merkle_nodes_batch(&self.global_checkpoint_tree_table, checkpoint_id, &nodes)
+            .await
+    }
 }
 
 #[async_trait]
@@ -550,13 +562,12 @@ impl<
             .db_select_many_zero_id_merkle_nodes_max_checkpoint(&self.user_registration_tree_table, checkpoint_id, keys)
             .await
     }
-    
+
     async fn user_registration_tree_get_node(&self, checkpoint_id: u64, key: SimpleMerkleNodeKey) -> anyhow::Result<N::QHash> {
         self.store
             .db_select_zero_id_merkle_node_max_checkpoint(&self.user_registration_tree_table, checkpoint_id, &key)
             .await
     }
-    
 }
 
 #[async_trait]
@@ -1137,15 +1148,8 @@ impl<
         state_slot_id: u64,
     ) -> anyhow::Result<MerkleProofCore<N::QHash>> {
         let key = SimpleMerkleNodeKey::new(tree_height, state_slot_id);
-        self.db_select_double_id_merkle_proof_max_checkpoint(
-            &self.contract_state_tree_table,
-            checkpoint_id,
-            user_id,
-            contract_id,
-            tree_height,
-            &key,
-        )
-        .await
+        self.db_select_double_id_merkle_proof_max_checkpoint(&self.contract_state_tree_table, checkpoint_id, user_id, contract_id, tree_height, &key)
+            .await
     }
 
     async fn contract_state_tree_get_nodes(&self, checkpoint_id: u64, keys: &[QMerkleStoreDoubleIdKey]) -> anyhow::Result<Vec<N::QHash>> {
@@ -1780,7 +1784,7 @@ impl<
     async fn get_current_unique_pending_id(&self) -> anyhow::Result<(u64, QCoreProcCheckpointUniqueId)> {
         let pending_id = self.get_latest_pending_id().await?;
         if pending_id == 0 {
-            return Ok((0,0));
+            return Ok((0, 0));
         }
         let uid = self
             .store
@@ -2869,6 +2873,12 @@ impl<
         checkpoint_id: u64,
         verifiable_transition_and_proof: &PsyVerifiableCheckpointTransitionWithProof<N::F, N::QHash>,
     ) -> anyhow::Result<()> {
-        self.store.db_insert_one_kiv(&self.checkpoint_zk_proof_and_transition_table, checkpoint_id, verifiable_transition_and_proof).await
+        self.store
+            .db_insert_one_kiv(
+                &self.checkpoint_zk_proof_and_transition_table,
+                checkpoint_id,
+                verifiable_transition_and_proof,
+            )
+            .await
     }
 }

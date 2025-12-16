@@ -102,6 +102,24 @@ impl<
 where
     N::HasherBase: 'static + Send + Sync,
 {
+    pub async fn print_last_10_checkpoint_roots_and_leaves(&self, location: &str) -> anyhow::Result<()> {
+        let latest_checkpoint_id = self.db.get_latest_checkpoint_id().await?;
+        let start_checkpoint_id = if latest_checkpoint_id >= 10 {
+            latest_checkpoint_id - 9
+        } else {
+            0
+        };
+        tracing::info!("[{}] Printing last 10 checkpoint roots and leaves from ID {} to {}", start_checkpoint_id, latest_checkpoint_id, location);
+        for checkpoint_id in start_checkpoint_id..=latest_checkpoint_id {
+            let root_hash = self.db.checkpoint_tree_get_root_hash(checkpoint_id).await?;
+            let leaf_hash = self.db.checkpoint_tree_get_leaf_hash(checkpoint_id, checkpoint_id).await?;
+            println!(
+                "Checkpoint ID: {}, Root Hash: {:?}, Leaf Hash: {:?}",
+                checkpoint_id, root_hash, leaf_hash
+            );
+        }
+        Ok(())
+    }
     pub async fn get_next_checkpoint_id(&self) -> anyhow::Result<u64> {
         let latest_checkpoint_id = self.db.get_latest_checkpoint_id().await?;
         Ok(latest_checkpoint_id + 1)

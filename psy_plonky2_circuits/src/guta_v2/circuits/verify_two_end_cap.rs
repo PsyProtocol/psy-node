@@ -232,6 +232,7 @@ where
             library,
             &input,
         )?;
+        let whitelist_root = library.get_group_inclusion_proof(ProvingJobCircuitType::GUTATwoGUTA, ProvingJobCircuitType::GUTATwoGUTA)?.root;
 
 
         let witness = GUTAVerifyTwoEndCapCircuitInputV2::<C::F, QHashOut<C::F>>::psy_ser_from_slice(&input.base.witness)?;
@@ -239,7 +240,7 @@ where
         self.prove_base(
             worker_reward_tag,
             &witness,
-            left_child_end_cap_proof_result.whitelist_inclusion_proof.root,
+            whitelist_root,
             &left_child_end_cap_proof_result.zk_proof,
             &right_child_end_cap_proof_result.zk_proof,
             &left_child_end_cap_proof_result.verifier_data,

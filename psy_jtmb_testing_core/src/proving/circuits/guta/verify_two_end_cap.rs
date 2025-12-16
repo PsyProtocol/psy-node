@@ -1,4 +1,4 @@
-use parth_core::crypto::hash::traits::ZeroableHash;
+use parth_core::crypto::hash::traits::{MerkleHasher, ZeroableHash};
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{
     proof_input::guta::GUTAVerifyTwoEndCapCircuitInputV2,
@@ -113,6 +113,7 @@ impl<C: JTMBCircuitConfig> GUTAVerifyTwoEndCapCircuitV2<C> {
             self.max_guta_nca_merkle_proof_height,
             self.global_user_tree_height,
         )?;
+        println!("new_header computed: {:#?}", new_header);
 
         let zero = C::Hash::get_zero_value();
         let public_inputs_hash = compute_guta_public_inputs_hash_two_children::<C::F, C::Hash, C::Hasher>(
@@ -137,11 +138,15 @@ impl<L: PsyJTMBCircuitInfoLibrary<C::Hash>, C: JTMBCircuitConfig> QJTMBProofCirc
         worker_reward_tag: C::Hash,
     ) -> anyhow::Result<PsyTestJTMBProof<C::Hash>> {
         let (left_child, right_child) = get_two_child_proofs_for_api_response_with_inclusion_proof::<L, C::Hash, C::Hasher>(library, &input)?;
-        let witness = GUTAVerifyTwoEndCapCircuitInputV2::<C::F, C::Hash>::psy_ser_from_slice(&input.base.witness)?;
-        
-        let whitelist_root = left_child.whitelist_inclusion_proof.root; // Whitelist root should be same for both
 
-        self.prove_base(
+        let whitelist_root = library.get_group_inclusion_proof(ProvingJobCircuitType::GUTATwoGUTA, ProvingJobCircuitType::GUTATwoGUTA)?.root;
+
+        let witness = GUTAVerifyTwoEndCapCircuitInputV2::<C::F, C::Hash>::psy_ser_from_slice(&input.base.witness)?;
+
+        let expected_public_inputs_hash_no_tag = witness.get_public_inputs_hash_no_rewards_tag::<C::Hasher>(32, whitelist_root);
+        let expected_public_inputs_hash = C::Hasher::two_to_one(&expected_public_inputs_hash_no_tag, &worker_reward_tag);
+
+        let proof = self.prove_base(
             worker_reward_tag,
             &witness,
             whitelist_root,
@@ -149,6 +154,16 @@ impl<L: PsyJTMBCircuitInfoLibrary<C::Hash>, C: JTMBCircuitConfig> QJTMBProofCirc
             &left_child.verifier_data,
             &right_child.zk_proof,
             &right_child.verifier_data,
-        )
+        )?;
+        println!("metadata: {:?}", input.base.job.metadata);
+        println!("input_pubs: {:?}", input.base.job.metadata.expected_public_inputs_hash);
+        println!("got witness: {:?}", witness);
+        println!("get_new_guta_header: witness: {:#?}", witness.get_new_guta_header(32, whitelist_root));
+        println!("expected_public_inputs_hash: {:?}", expected_public_inputs_hash);
+        println!("expected_public_inputs_hash_no_tag: {:?}", expected_public_inputs_hash_no_tag);
+        let metadata_final_tag = input.base.job.metadata.compute_reward_tagged_expected_public_inputs::<C::Hasher>(worker_reward_tag, &[]);
+        println!("metadata_final_tag: {:?}", metadata_final_tag);
+        println!("generated proof public inputs hash: {:?}", proof.public_inputs_hash);
+        Ok(proof)
     }
 }

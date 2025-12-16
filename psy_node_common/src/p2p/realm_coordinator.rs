@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use parth_core::{data::hash::checkpointed_merkle_node::CheckpointedMerkleHash, protocol::core_types::QNetworkTypesConfig};
+use parth_core::{crypto::hash::merkle_proof::MerkleProofCore, data::hash::checkpointed_merkle_node::CheckpointedMerkleHash, protocol::core_types::QNetworkTypesConfig};
 use psy_api_core::coordinator::standard_edge_rpc::CoordinatorEdgeRpcClient;
 use psy_data::{guta::header_extended::GlobalUserTreeAggregatorHeaderWithTagValueAndJobType, prepared_block::realm::PsyRealmCoordinatorUpdate};
 use psy_node_core::p2p::traits::realm_coordinantor::RealmCoordinatorClient;
@@ -26,6 +26,9 @@ impl<N: QNetworkTypesConfig + 'static, C: CoordinatorEdgeRpcClient<N::F, N::QHas
 impl<N: QNetworkTypesConfig + 'static, C: CoordinatorEdgeRpcClient<N::F, N::QHash, N::JobId, N::ZKProof> + Send + Sync>
     RealmCoordinatorClient<N::F, N::QHash> for PsyRealmCoordinatorClientAPI<N, C>
 {
+        async fn rc_get_checkpoint_tree_merkle_proof(&self, checkpoint_id: u64) -> anyhow::Result<MerkleProofCore<N::QHash>>{
+            self.client.get_checkpoint_tree_merkle_proof(checkpoint_id, checkpoint_id).await.map_err(|e| anyhow::anyhow!("{:?}", e))
+        }
     async fn rc_get_latest_checkpoint_id(&self) -> anyhow::Result<u64> {
         self.client.get_latest_checkpoint_id().await.map_err(|e| anyhow::anyhow!("{:?}", e))
     }

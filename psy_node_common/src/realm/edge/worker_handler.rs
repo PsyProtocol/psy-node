@@ -231,7 +231,7 @@ impl<
             } else {
                 let mut values = Vec::with_capacity(work_item.metadata.dependencies.len());
                 for dependency in work_item.metadata.dependencies.iter() {
-                    if dependency.circuit_type == ProvingJobCircuitType::GenerateRollupStateTransitionProof {
+                    if dependency.circuit_type == ProvingJobCircuitType::GenerateRollupStateTransitionProof || dependency.circuit_type == ProvingJobCircuitType::UserEndCap {
                         values.push(N::QHash::get_zero_value());
                     } else {
                         let value: N::QHash = self
@@ -307,7 +307,7 @@ impl<
             } else {
                 let mut values = Vec::with_capacity(metadata.dependencies.len());
                 for dependency in metadata.dependencies.iter() {
-                    let value: N::QHash = if dependency.circuit_type == ProvingJobCircuitType::GenerateRollupStateTransitionProof {
+                    let value: N::QHash = if dependency.circuit_type == ProvingJobCircuitType::GenerateRollupStateTransitionProof || dependency.circuit_type == ProvingJobCircuitType::UserEndCap {
                         N::QHash::get_zero_value()
                     } else {
                         self.temp_db

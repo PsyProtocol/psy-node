@@ -1,4 +1,3 @@
-
 use anyhow::Ok;
 use parth_core::{
     crypto::hash::
@@ -43,6 +42,7 @@ impl<
 where
     N::HasherBase: 'static + Send + Sync,
 {
+    // ... (set_new_unique_ids function is unchanged) ...
     pub async fn set_new_unique_ids(&mut self, gathering_realm_end_root: Option<N::QHash>) -> anyhow::Result<()> {
         println!(
             "old_unique_pending_id: {}, old_proc_checkpoint_unique_id: {}",
@@ -86,6 +86,7 @@ where
 
         Ok(())
     }
+
     pub async fn commit_checkpoint_state_no_guta_update(
         &mut self,
         checkpoint_sync_info: &PQEDCheckpointSyncInfoCompact<N::F, N::QHash>,
@@ -112,9 +113,16 @@ where
         self.db
             .set_checkpoint_leaf_data(checkpoint_sync_info.checkpoint_id, &checkpoint_sync_info.checkpoint_leaf)
             .await?;
+        
+        println!("committing checkpoint proof: {:?}", &previous.to_append_proof::<N::HasherBase>());
+        // --- START FIX ---
+        // Instead of just setting the leaf hash, ingest the full proof from the correct in-memory tree.
+        // This ensures the database's internal tree structure is updated correctly.
         self.db
-            .checkpoint_tree_set_leaf_hash(checkpoint_sync_info.checkpoint_id, checkpoint_sync_info.checkpoint_leaf_hash)
+            .checkpoint_tree_injest_merkle_proof(checkpoint_sync_info.checkpoint_id, &previous.to_append_proof::<N::HasherBase>())
             .await?;
+        // --- END FIX ---
+        
         self.db
             .set_checkpoint_root_hash_to_id_mapping(checkpoint_sync_info.checkpoint_tree_root, checkpoint_sync_info.checkpoint_id)
             .await?;
@@ -127,6 +135,7 @@ where
 
         Ok(())
     }
+
     pub async fn commit_state(
         &mut self,
         coordinator_update: &PsyRealmCoordinatorUpdate<N::F, N::QHash>,

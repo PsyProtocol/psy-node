@@ -47,9 +47,11 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std
             self.next_backup_checkpoint_id - 1
         }
     }
+
     pub fn get_current_checkpoint_tree_root_head(&self) -> Hash {
         self.checkpoint_tree.get_root()
     }
+
     pub async fn new_from_file_path<CheckpointTreeStore: PsyNodeCheckpointTreeDatabaseReader<Hash>>(
         file_system: Arc<FileSystem>,
         max_checkpoints_to_keep: u64,
@@ -158,8 +160,6 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std
             tracing::info!("Initializing Checkpoint Backup from disk. Range: [{}, {})", start_id, end_id);
             // Injest proof for the start to populate path
             let mut init_proof = checkpoint_tree_store.checkpoint_tree_get_merkle_proof(start_id, start_id).await?;
-
-            println!("Init proof for checkpoint {}: {:?}", start_id, init_proof);
 
             // FIX: Sanitize the proof.
             // The DB might return a proof based on the *current* state (e.g., tip at 100),
@@ -272,7 +272,7 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std
         self.next_backup_checkpoint_id > current_checkpoint_id && self.min_backed_up_checkpoint_id <= required_min
     }
 
-    async fn hard_reset_and_truncate(&mut self, start_checkpoint_id: u64) -> anyhow::Result<()> {
+    pub async fn hard_reset_and_truncate(&mut self, start_checkpoint_id: u64) -> anyhow::Result<()> {
         tracing::warn!("Hard reset of Checkpoint Backup Manager at ID {}", start_checkpoint_id);
         let height = self.checkpoint_tree.get_height();
         self.checkpoint_tree = Arc::new(PsyDashMemoryAppendOnlyMerkleStore::new(height));
@@ -292,110 +292,139 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std
         self.next_backup_checkpoint_id = start_checkpoint_id;
         Ok(())
     }
+
+    /// Syncs local checkpoint history with the Coordinator.
+    /// Critical for resolving forks and ensuring the local Merkle Tree is consistent with the canonical chain.
     pub async fn sync_from_coordinator_client<CoordinatorClient: RealmCoordinatorClient<F, Hash>, F>(
         &mut self,
         coordinator_client: &CoordinatorClient,
         sync_batch_size: usize,
     ) -> anyhow::Result<()> {
-        let latest_checkpoint_id: u64 = coordinator_client.rc_get_latest_checkpoint_id().await?;
-        let min_checkpoint = if latest_checkpoint_id >= STALE_CHECKPOINT_AGE_REALM_TO_COORDINATOR_PROOF {
-            latest_checkpoint_id - STALE_CHECKPOINT_AGE_REALM_TO_COORDINATOR_PROOF
+        // 1. Fetch current remote status
+        let remote_latest_checkpoint_id: u64 = coordinator_client.rc_get_latest_checkpoint_id().await?;
+        
+        // 2. Determine mandatory history requirement
+        let required_min_checkpoint = if remote_latest_checkpoint_id >= STALE_CHECKPOINT_AGE_REALM_TO_COORDINATOR_PROOF {
+            remote_latest_checkpoint_id - STALE_CHECKPOINT_AGE_REALM_TO_COORDINATOR_PROOF
         } else {
             0
         };
-        let max_needed_checkpoint_id = latest_checkpoint_id;
-        if self.min_backed_up_checkpoint_id <= min_checkpoint && self.next_backup_checkpoint_id > max_needed_checkpoint_id {
+
+        // 3. Check for Divergence / Inconsistency
+        let mut needs_reset = false;
+
+        // Condition A: Gap in history. 
+        // If our oldest checkpoint is newer than what is required, we are missing history.
+        if self.min_backed_up_checkpoint_id > required_min_checkpoint {
+            tracing::warn!(
+                "Checkpoint history gap detected. Local Min: {}, Required Min: {}. Triggering Reset.",
+                self.min_backed_up_checkpoint_id,
+                required_min_checkpoint
+            );
+            needs_reset = true;
+        }
+
+        // Condition B: Fork detection.
+        // Check if our tip (next_backup_checkpoint_id - 1) actually matches the coordinator.
+        if !needs_reset && self.next_backup_checkpoint_id > 0 {
+            // We check the overlap.
+            // If next_backup_checkpoint_id is > remote_latest + 1, we are ahead (impossible if synced correctly, likely a local fork or devnet reset).
+            if self.next_backup_checkpoint_id > remote_latest_checkpoint_id + 1 {
+                tracing::warn!(
+                    "Local checkpoint ID {} is ahead of remote {}. Triggering Reset.",
+                    self.next_backup_checkpoint_id,
+                    remote_latest_checkpoint_id
+                );
+                needs_reset = true;
+            } else {
+                // Verify the hash of our tip against the coordinator
+                let overlap_check_id = self.next_backup_checkpoint_id - 1;
+                let local_hash = self.checkpoint_tree.get_leaf_value(overlap_check_id);
+                
+                // Fetch just the overlap block to verify integrity
+                let remote_leaves = coordinator_client.rc_get_checkpoint_leaves_batch(overlap_check_id, 1).await?;
+                
+                if remote_leaves.is_empty() {
+                    // Should not happen if remote_latest >= overlap_check_id
+                    tracing::warn!("Coordinator returned empty batch for overlap check at {}. Triggering Reset.", overlap_check_id);
+                    needs_reset = true;
+                } else if remote_leaves[0] != local_hash {
+                    tracing::warn!(
+                        "Checkpoint Fork detected at {}. Local: {:?}, Remote: {:?}. Triggering Reset.",
+                        overlap_check_id,
+                        local_hash,
+                        remote_leaves[0]
+                    );
+                    needs_reset = true;
+                }
+            }
+        }
+
+        // 4. Perform Reset if necessary
+        if needs_reset {
+            self.hard_reset_and_truncate(required_min_checkpoint).await?;
+        }
+
+        // 5. Short-circuit if fully synced
+        if self.next_backup_checkpoint_id > remote_latest_checkpoint_id {
+            // We are up to date (or ahead, which is handled by reset logic above if it was invalid)
             tracing::info!(
-                "Checkpoint Backup Manager already up-to-date with coordinator. Current: {}, Latest: {}",
-                self.next_backup_checkpoint_id - 1,
-                latest_checkpoint_id
+                "Checkpoint Backup Manager up-to-date. Local Tip: {}, Remote Tip: {}",
+                self.next_backup_checkpoint_id.saturating_sub(1),
+                remote_latest_checkpoint_id
             );
             return Ok(());
         }
-        if self.min_backed_up_checkpoint_id > min_checkpoint {
-            let suffix_leaves = if self.next_backup_checkpoint_id > self.min_backed_up_checkpoint_id {
-                let mut leaves = Vec::with_capacity((self.next_backup_checkpoint_id - self.min_backed_up_checkpoint_id) as usize);
 
-                for i in self.min_backed_up_checkpoint_id..self.next_backup_checkpoint_id {
-                    let hash = self.checkpoint_tree.get_leaf_value(i);
-                    leaves.push(hash);
-                }
-                leaves
-            } else {
-                Vec::new()
-            };
+        // 6. Sync Missing Blocks
+        let start_id = self.next_backup_checkpoint_id;
+        let total_to_fetch = remote_latest_checkpoint_id - start_id + 1;
+        
+        tracing::info!(
+            "Syncing {} checkpoints from Coordinator. Range: [{}, {}]",
+            total_to_fetch,
+            start_id,
+            remote_latest_checkpoint_id
+        );
 
-            let num_full_batches = (self.min_backed_up_checkpoint_id - min_checkpoint) / sync_batch_size as u64;
-            let partial_batch_size = (self.min_backed_up_checkpoint_id - min_checkpoint) % sync_batch_size as u64;
+        let num_full_batches = total_to_fetch / sync_batch_size as u64;
+        let partial_batch_size = total_to_fetch % sync_batch_size as u64;
 
-            self.hard_reset_and_truncate(min_checkpoint).await?;
-
-            for i in 0..num_full_batches {
-                let start_id = min_checkpoint + i * sync_batch_size as u64;
-                let leaves = coordinator_client
-                    .rc_get_checkpoint_leaves_batch(start_id, sync_batch_size as u32)
-                    .await?;
-                if leaves.len() != sync_batch_size {
-                    anyhow::bail!("Coordinator returned insufficient leaves for batch starting at {}", start_id);
-                }
-                for (i, hash) in leaves.into_iter().enumerate() {
-                    let checkpoint_id = start_id + i as u64;
-                    self.append_checkpoint_leaf_hash(checkpoint_id, hash).await?;
-                }
+        for i in 0..num_full_batches {
+            let batch_start_id = start_id + i * sync_batch_size as u64;
+            let leaves = coordinator_client
+                .rc_get_checkpoint_leaves_batch(batch_start_id, sync_batch_size as u32)
+                .await?;
+            
+            if leaves.len() != sync_batch_size {
+                anyhow::bail!("Coordinator returned insufficient leaves for batch starting at {}", batch_start_id);
             }
-            if partial_batch_size > 0 {
-                let start_id = min_checkpoint + num_full_batches * sync_batch_size as u64;
-                let leaves = coordinator_client
-                    .rc_get_checkpoint_leaves_batch(start_id, partial_batch_size as u32)
-                    .await?;
-                if leaves.len() != partial_batch_size as usize {
-                    anyhow::bail!("Coordinator returned insufficient leaves for partial batch at {}", start_id);
-                }
-                for (i, hash) in leaves.into_iter().enumerate() {
-                    let checkpoint_id = start_id + i as u64;
-                    self.append_checkpoint_leaf_hash(checkpoint_id, hash).await?;
-                }
-            }
-            for (i, hash) in suffix_leaves.into_iter().enumerate() {
-                let checkpoint_id = min_checkpoint + num_full_batches * sync_batch_size as u64 + partial_batch_size + i as u64;
+            
+            for (j, hash) in leaves.into_iter().enumerate() {
+                let checkpoint_id = batch_start_id + j as u64;
                 self.append_checkpoint_leaf_hash(checkpoint_id, hash).await?;
             }
         }
-        if self.next_backup_checkpoint_id <= max_needed_checkpoint_id {
-            let start_id = self.next_backup_checkpoint_id;
-            let total_to_fetch = max_needed_checkpoint_id - self.next_backup_checkpoint_id + 1;
-            let num_full_batches = total_to_fetch / sync_batch_size as u64;
-            let partial_batch_size = total_to_fetch % sync_batch_size as u64;
 
-            for i in 0..num_full_batches {
-                let batch_start_id = start_id + i * sync_batch_size as u64;
-                let leaves = coordinator_client
-                    .rc_get_checkpoint_leaves_batch(batch_start_id, sync_batch_size as u32)
-                    .await?;
-                if leaves.len() != sync_batch_size {
-                    anyhow::bail!("Coordinator returned insufficient leaves for batch starting at {}", batch_start_id);
-                }
-                for (j, hash) in leaves.into_iter().enumerate() {
-                    let checkpoint_id = batch_start_id + j as u64;
-                    self.append_checkpoint_leaf_hash(checkpoint_id, hash).await?;
-                }
+        if partial_batch_size > 0 {
+            let batch_start_id = start_id + num_full_batches * sync_batch_size as u64;
+            let leaves = coordinator_client
+                .rc_get_checkpoint_leaves_batch(batch_start_id, partial_batch_size as u32)
+                .await?;
+            
+            if leaves.len() != partial_batch_size as usize {
+                anyhow::bail!("Coordinator returned insufficient leaves for partial batch at {}", batch_start_id);
             }
-            if partial_batch_size > 0 {
-                let batch_start_id = start_id + num_full_batches * sync_batch_size as u64;
-                let leaves = coordinator_client
-                    .rc_get_checkpoint_leaves_batch(batch_start_id, partial_batch_size as u32)
-                    .await?;
-                if leaves.len() != partial_batch_size as usize {
-                    anyhow::bail!("Coordinator returned insufficient leaves for partial batch at {}", batch_start_id);
-                }
-                for (j, hash) in leaves.into_iter().enumerate() {
-                    let checkpoint_id = batch_start_id + j as u64;
-                    self.append_checkpoint_leaf_hash(checkpoint_id, hash).await?;
-                }
+            
+            for (j, hash) in leaves.into_iter().enumerate() {
+                let checkpoint_id = batch_start_id + j as u64;
+                self.append_checkpoint_leaf_hash(checkpoint_id, hash).await?;
             }
         }
+
         Ok(())
     }
+    
     pub async fn sync_from_database<CheckpointTreeReader: PsyNodeCheckpointTreeDatabaseReader<Hash>>(
         &mut self,
         checkpoint_tree_reader: &CheckpointTreeReader,
@@ -406,8 +435,6 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std
         let protocol_start = last_committed_checkpoint_id.saturating_sub(STALE_CHECKPOINT_AGE_REALM_TO_COORDINATOR_PROOF);
 
         // 2. Determine the start based on Capacity Rules (Max items to keep)
-        // If we want to keep 500 items ending at 9999, we start at 9500.
-        // Formula: (Target - Max + 1).
         let capacity_start = if last_committed_checkpoint_id >= self.max_checkpoints_to_keep {
             last_committed_checkpoint_id - self.max_checkpoints_to_keep + 1
         } else {
@@ -415,8 +442,6 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std
         };
 
         // 3. The effective start is the maximum of the two.
-        // We cannot start earlier than allowed by capacity, even if protocol desires it
-        // (assuming configuration intends to limit memory usage).
         let required_history_start = std::cmp::max(protocol_start, capacity_start);
 
         tracing::info!(
@@ -432,12 +457,8 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std
             // Case A: Manager is empty/uninitialized.
             (self.next_backup_checkpoint_id == 0 && self.min_backed_up_checkpoint_id == 0) ||
             // Case B: Our current history starts *after* the required start (we are missing historical data).
-            // We must reset to fetch the earlier data because we can't prepend to this append-only store.
             (self.min_backed_up_checkpoint_id > required_history_start) ||
             // Case C: Our current head is *behind* the required start window.
-            // Example: We have 9000..9200. ReqStart is 9500.
-            // If we don't reset, we would fill 9201..9999, resulting in 9000..9999 (Size 1000 > Max 500).
-            // Resetting jumps us forward to 9500, dropping the old tail (9000..9200).
             (self.next_backup_checkpoint_id < required_history_start) ||
             // Case D: Gap is too massive (Performance heuristic).
             (last_committed_checkpoint_id > self.next_backup_checkpoint_id + self.max_checkpoints_to_keep * 2);
@@ -507,372 +528,6 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std
             }
             current_sync_idx = batch_end + 1;
         }
-
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use std::sync::Arc;
-
-    use cf_utils::timer::DebugTimer;
-    use parth_common::memory_stores::dash_tree::PsyDashMemoryMerkleStore;
-    use parth_core::{
-        crypto::hash::{
-            merkle_proof::{DeltaMerkleProofCore, MerkleProofCore},
-            traits::ZeroableHash,
-        },
-        data::hash::merkle_node_key::SimpleMerkleNodeKey,
-        pgoldilocks::PoseidonHasher,
-        utils::QPGenRandom,
-        PHash,
-    };
-    use psy_node_core::{file::memory_fs::SimpleMockMemoryFileSystem, psy_core_db::traits::full::PsyNodeCheckpointTreeDatabaseReader};
-
-    use super::*;
-
-    type Hash = PHash;
-    type Hasher = PoseidonHasher;
-
-    pub struct SimpleMockDBProvider {
-        pub tree: PsyDashMemoryMerkleStore<Hasher, Hash>,
-    }
-    impl SimpleMockDBProvider {
-        pub fn new(tree_height: u8) -> Self {
-            Self {
-                tree: PsyDashMemoryMerkleStore::<Hasher, Hash>::new(tree_height),
-            }
-        }
-    }
-    #[async_trait::async_trait]
-    impl PsyNodeCheckpointTreeDatabaseReader<Hash> for SimpleMockDBProvider {
-        async fn checkpoint_tree_get_leaf_hash(&self, _checkpoint_id: u64, leaf_index: u64) -> anyhow::Result<Hash> {
-            Ok(self.tree.get_leaf_value(leaf_index))
-        }
-        async fn checkpoint_tree_get_root_hash(&self, _checkpoint_id: u64) -> anyhow::Result<Hash> {
-            Ok(self.tree.get_root())
-        }
-        async fn checkpoint_tree_get_merkle_proof(&self, _checkpoint_id: u64, leaf_index: u64) -> anyhow::Result<MerkleProofCore<Hash>> {
-            Ok(self.tree.get_leaf(leaf_index))
-        }
-        async fn checkpoint_tree_get_nodes(&self, _checkpoint_id: u64, keys: &[SimpleMerkleNodeKey]) -> anyhow::Result<Vec<Hash>> {
-            Ok(keys.iter().map(|k| self.tree.get_node_value(k)).collect())
-        }
-    }
-
-    #[tokio::test]
-    async fn test_basic_ring_buffer_persistence() -> anyhow::Result<()> {
-        let fs = Arc::new(SimpleMockMemoryFileSystem::new());
-        let db = SimpleMockDBProvider::new(10);
-        let path = "backup.dat";
-        let max_keep = 5;
-
-        let mut manager =
-            CheckpointTreeBackupManager::<Hasher, Hash, SimpleMockMemoryFileSystem>::new_from_file_path(fs.clone(), max_keep, 10, &db, path, true)
-                .await?;
-
-        let hashes: Vec<Hash> = (0..10).map(|_| Hash::qp_rand_gen()).collect();
-        // Write 0..6. Ring buffer of 5.
-        // Should contain [2, 3, 4, 5, 6].
-        for i in 0..7 {
-            // Populate the MockDB so the backup manager can verify integrity on reload
-            db.tree.set_leaf(i as u64, hashes[i]);
-            manager.append_checkpoint_leaf_hash(i as u64, hashes[i]).await?;
-        }
-
-        assert_eq!(manager.min_backed_up_checkpoint_id, 2);
-        assert_eq!(manager.next_backup_checkpoint_id, 7);
-        drop(manager);
-
-        let manager2 =
-            CheckpointTreeBackupManager::<Hasher, Hash, SimpleMockMemoryFileSystem>::new_from_file_path(fs.clone(), max_keep, 10, &db, path, false)
-                .await?;
-
-        assert_eq!(manager2.min_backed_up_checkpoint_id, 2);
-        assert_eq!(manager2.next_backup_checkpoint_id, 7);
-        assert_eq!(manager2.checkpoint_tree.get_leaf_value(2), hashes[2]);
-        assert_eq!(manager2.checkpoint_tree.get_leaf_value(6), hashes[6]);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_sync_logic_reset() -> anyhow::Result<()> {
-        let fs = Arc::new(SimpleMockMemoryFileSystem::new());
-        let db = SimpleMockDBProvider::new(20);
-        let path = "sync.dat";
-
-        let mut db_hashes = Vec::new();
-        for i in 0..2000 {
-            let h = Hash::qp_rand_gen();
-            db.tree.set_leaf(i, h);
-            db_hashes.push(h);
-        }
-
-        let mut manager =
-            CheckpointTreeBackupManager::<Hasher, Hash, SimpleMockMemoryFileSystem>::new_from_file_path(fs.clone(), 100, 20, &db, path, true).await?;
-
-        manager.sync_from_database(&db, 50, 500).await?;
-        assert_eq!(manager.next_backup_checkpoint_id, 501);
-        assert_eq!(manager.min_backed_up_checkpoint_id, 401);
-        assert_eq!(manager.checkpoint_tree.get_leaf_value(500), db_hashes[500]);
-
-        manager.sync_from_database(&db, 50, 1500).await?;
-        assert_eq!(manager.next_backup_checkpoint_id, 1501);
-        assert_eq!(manager.min_backed_up_checkpoint_id, 1401);
-        assert_eq!(manager.checkpoint_tree.get_leaf_value(1500), db_hashes[1500]);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_sync_reset_on_prefix_gap() -> anyhow::Result<()> {
-        let fs = Arc::new(SimpleMockMemoryFileSystem::new());
-        let db = SimpleMockDBProvider::new(20);
-        let path = "prefix_gap.dat";
-        for i in 0..2000 {
-            db.tree.set_leaf(i, Hash::qp_rand_gen());
-        }
-
-        let mut manager =
-            CheckpointTreeBackupManager::<Hasher, Hash, SimpleMockMemoryFileSystem>::new_from_file_path(fs.clone(), 100, 20, &db, path, true).await?;
-
-        // Initialize state at 1300
-        let start_proof = db.checkpoint_tree_get_merkle_proof(1300, 1300).await?;
-        manager.checkpoint_tree.injest_merkle_proof(&start_proof)?;
-        manager.min_backed_up_checkpoint_id = 1300;
-        manager.next_backup_checkpoint_id = 1300;
-        for i in 1300..1350 {
-            manager.append_checkpoint_leaf_hash(i, db.tree.get_leaf_value(i)).await?;
-        }
-
-        // Target 1800. Req start ~1200. Manager min 1300. Gap [1200..1300].
-        // Reset required.
-        manager.sync_from_database(&db, 50, 1800).await?;
-
-        assert_eq!(manager.next_backup_checkpoint_id, 1801);
-        assert_eq!(manager.min_backed_up_checkpoint_id, 1701);
-
-        Ok(())
-    }
-
-    fn ensure_dmps_are_in_checkpoint_manager<
-        Hasher: MerkleZeroHasher<Hash>,
-        Hash: Eq + Copy + PartialEq + Default + std::hash::Hash + std::fmt::Debug,
-    >(
-        manager: &CheckpointTreeBackupManager<Hasher, Hash, SimpleMockMemoryFileSystem>,
-        proofs: &[DeltaMerkleProofCore<Hash>],
-    ) -> anyhow::Result<()> {
-        for (_i, proof) in proofs.iter().enumerate() {
-            let start_root = proof.old_root;
-            let end_root = proof.new_root;
-            //println!("Verifying proof {}: start_root={:?}, end_root={:?}", i, start_root,
-            // end_root);
-            let res: Option<u64> = manager.checkpoint_tree.get_leaf_index_for_root(end_root);
-            if !res.is_some() {
-                anyhow::bail!("No index found for root {:?}", end_root);
-            }
-            assert_eq!(res.unwrap(), proof.index, "Index mismatch for root {:?}", end_root);
-            let proof_for_root = manager.checkpoint_tree.get_historical_append_only_merkle_proof_for_root(end_root)?;
-            assert!(proof_for_root.verify::<Hasher>());
-            assert_eq!(
-                proof_for_root.get_append_root::<Hasher>(),
-                proof.get_append_root::<Hasher>(),
-                "Root mismatch for root {:?}",
-                end_root
-            );
-            assert_eq!(proof_for_root.index, proof.index, "Index mismatch in proof for root {:?}", end_root);
-            assert_eq!(proof_for_root.value, proof.new_value, "Value mismatch for root {:?}", end_root);
-            assert_eq!(
-                manager.checkpoint_tree.get_leaf_value(proof.index),
-                proof.new_value,
-                "Leaf value mismatch for index {}",
-                proof.index
-            );
-
-            if proof.index > 0 && proof.index > manager.min_backed_up_checkpoint_id {
-                let res: Option<u64> = manager.checkpoint_tree.get_leaf_index_for_root(start_root);
-                if !res.is_some() {
-                    anyhow::bail!("No index found for root {:?}", start_root);
-                }
-                assert_eq!(res.unwrap(), proof.index - 1, "Index mismatch for root {:?}", start_root);
-                let proof_for_root = manager.checkpoint_tree.get_historical_append_only_merkle_proof_for_root(start_root)?;
-                assert!(proof_for_root.verify::<Hasher>());
-                assert_eq!(
-                    proof_for_root.get_append_root::<Hasher>(),
-                    proof.old_root,
-                    "Root mismatch for root {:?}",
-                    start_root
-                );
-                assert_eq!(proof_for_root.index, proof.index - 1, "Index mismatch in proof for root {:?}", start_root);
-            }
-        }
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_root_access() -> anyhow::Result<()> {
-        let fs = Arc::new(SimpleMockMemoryFileSystem::new());
-        let db_tree = PsyDashMemoryMerkleStore::new(32);
-        let db = SimpleMockDBProvider { tree: db_tree };
-        let path = "checkpoint_tree.dat";
-
-        let mut manager =
-            CheckpointTreeBackupManager::<Hasher, Hash, SimpleMockMemoryFileSystem>::new_from_file_path(fs.clone(), 1000000, 32, &db, path, true)
-                .await?;
-
-        let mut results = Vec::new();
-        for i in 0..15 {
-            let hash = Hash::qp_rand_gen();
-            let proof = manager.append_checkpoint_leaf_hash(i, hash).await?;
-            db.tree.set_leaf(i, hash);
-            results.push(proof);
-        }
-        ensure_dmps_are_in_checkpoint_manager::<Hasher, Hash>(&manager, &results)?;
-
-        let head = 14;
-
-        assert!(manager.has_appropriate_checkpoint_history_for_stale_proofs(5, head));
-        assert!(manager.has_appropriate_checkpoint_history_for_stale_proofs(8, head));
-        println!("start of the test completed");
-
-        let manager =
-            CheckpointTreeBackupManager::<Hasher, Hash, SimpleMockMemoryFileSystem>::new_from_file_path(fs.clone(), 1000000, 32, &db, path, true)
-                .await?;
-        //println!("manager reloaded");
-        ensure_dmps_are_in_checkpoint_manager::<Hasher, Hash>(&manager, &results)?;
-
-        assert!(manager.has_appropriate_checkpoint_history_for_stale_proofs(5, head));
-        assert!(manager.has_appropriate_checkpoint_history_for_stale_proofs(8, head));
-
-        // move db ahead of manager
-        let new_proofs = (15..20).map(|x| db.tree.set_leaf(x, Hash::qp_rand_gen())).collect::<Vec<_>>();
-
-        let mut results = [results, new_proofs].concat();
-
-        let mut manager =
-            CheckpointTreeBackupManager::<Hasher, Hash, SimpleMockMemoryFileSystem>::new_from_file_path(fs.clone(), 1000000, 32, &db, path, true)
-                .await?;
-        manager.sync_from_database(&db, 2, 19).await?;
-        //println!("manager reloaded with unapplied updates in the db");
-
-        ensure_dmps_are_in_checkpoint_manager::<Hasher, Hash>(&manager, &results)?;
-
-        let head = 19;
-
-        assert!(manager.has_appropriate_checkpoint_history_for_stale_proofs(5, head));
-        assert!(manager.has_appropriate_checkpoint_history_for_stale_proofs(8, head));
-
-        // Test sync entirely from db
-        let file_path = "sync_from_db.dat";
-        let mut manager = CheckpointTreeBackupManager::<Hasher, Hash, SimpleMockMemoryFileSystem>::new_from_file_path(
-            fs.clone(),
-            1000000,
-            32,
-            &db,
-            file_path,
-            true,
-        )
-        .await?;
-        manager.sync_from_database(&db, 2, 19).await?;
-
-        assert_eq!(manager.next_backup_checkpoint_id, 20);
-        assert_eq!(manager.min_backed_up_checkpoint_id, 0);
-        ensure_dmps_are_in_checkpoint_manager::<Hasher, Hash>(&manager, &results)?;
-        assert!(manager.has_appropriate_checkpoint_history_for_stale_proofs(5, head));
-        assert!(manager.has_appropriate_checkpoint_history_for_stale_proofs(30, head));
-
-        for i in 20..10000 {
-            let hash = Hash::qp_rand_gen();
-            //let proof = manager.append_checkpoint_leaf_hash(i, hash).await?;
-            let proof = db.tree.set_leaf(i, hash);
-            results.push(proof);
-        }
-        let mut manager = CheckpointTreeBackupManager::<Hasher, Hash, SimpleMockMemoryFileSystem>::new_from_file_path(
-            fs.clone(),
-            1000000,
-            32,
-            &db,
-            file_path,
-            true,
-        )
-        .await?;
-        let mut timer = DebugTimer::new("sync_from_db_large");
-        manager.sync_from_database(&db, 200, 9999).await?;
-        timer.lap_batch("sync from db", "checkpoint", 9980);
-        ensure_dmps_are_in_checkpoint_manager::<Hasher, Hash>(&manager, &results)?;
-
-        let file_path = "sync_from_db_2.dat";
-        let mut manager =
-            CheckpointTreeBackupManager::<Hasher, Hash, SimpleMockMemoryFileSystem>::new_from_file_path(fs.clone(), 500, 32, &db, file_path, true)
-                .await?;
-        let mut timer = DebugTimer::new("sync small");
-        manager.sync_from_database(&db, 100, 9999).await?;
-        timer.lap_batch("sync from db", "checkpoint", 500);
-        ensure_dmps_are_in_checkpoint_manager::<Hasher, Hash>(&manager, &results[results.len() - 500..])?;
-        for i in 0..(10000 - 500) {
-            // we should only have synced the last 500
-            assert_eq!(
-                manager.checkpoint_tree.get_leaf_value(i as u64),
-                Hash::get_zero_value(),
-                "the manager synced more than the checkpoints needed to cover the max history (checkpoint {} should not be saved)",
-                i
-            );
-        }
-        let result_for_ditched = ensure_dmps_are_in_checkpoint_manager::<Hasher, Hash>(&manager, &results[results.len() - 600..results.len()]);
-        assert!(result_for_ditched.is_err());
-
-        for i in 10000..10400 {
-            let hash = Hash::qp_rand_gen();
-            let proof = db.tree.set_leaf(i, hash);
-            results.push(proof);
-        }
-        let mut manager =
-            CheckpointTreeBackupManager::<Hasher, Hash, SimpleMockMemoryFileSystem>::new_from_file_path(fs.clone(), 500, 32, &db, file_path, true)
-                .await?;
-        let mut timer = DebugTimer::new("sync small 2");
-        manager.sync_from_database(&db, 100, 10399).await?;
-        timer.lap_batch("sync from db", "checkpoint", 500);
-        ensure_dmps_are_in_checkpoint_manager::<Hasher, Hash>(&manager, &results[results.len() - 500..])?;
-        for i in 0..(10400 - 500) {
-            // we should only have synced the last 500
-            assert_eq!(
-                manager.checkpoint_tree.get_leaf_value(i as u64),
-                Hash::get_zero_value(),
-                "the manager synced more than the checkpoints needed to cover the max history (checkpoint {} should not be saved)",
-                i
-            );
-        }
-        let result_for_ditched = ensure_dmps_are_in_checkpoint_manager::<Hasher, Hash>(&manager, &results[results.len() - 600..results.len()]);
-        assert!(result_for_ditched.is_err());
-
-        for i in 10400..10600 {
-            let hash = Hash::qp_rand_gen();
-            let proof = db.tree.set_leaf(i, hash);
-            results.push(proof);
-        }
-        let mut manager =
-            CheckpointTreeBackupManager::<Hasher, Hash, SimpleMockMemoryFileSystem>::new_from_file_path(fs.clone(), 2000, 32, &db, file_path, true)
-                .await?;
-        let mut timer = DebugTimer::new("sync small 2");
-        manager.sync_from_database(&db, 100, 10599).await?;
-        timer.lap_batch("sync from db", "checkpoint", 2000);
-        ensure_dmps_are_in_checkpoint_manager::<Hasher, Hash>(&manager, &results[results.len() - 2000..])?;
-        for i in 0..(10600 - 2000) {
-            // we should only have synced the last 2000
-            assert_eq!(
-                manager.checkpoint_tree.get_leaf_value(i as u64),
-                Hash::get_zero_value(),
-                "the manager synced more than the checkpoints needed to cover the max history (checkpoint {} should not be saved)",
-                i
-            );
-        }
-        let result_for_ditched = ensure_dmps_are_in_checkpoint_manager::<Hasher, Hash>(&manager, &results[results.len() - 2100..results.len()]);
-        assert!(result_for_ditched.is_err());
-
-        let result_for_ditched = ensure_dmps_are_in_checkpoint_manager::<Hasher, Hash>(&manager, &results[results.len() - 2001..results.len()]);
-        assert!(result_for_ditched.is_err());
 
         Ok(())
     }

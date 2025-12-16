@@ -5,9 +5,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     crypto::hash::traits::{CodeSerializableHash, MerkleHasher, MerkleZeroHasher, ZeroableHash},
-    data::serializable::QPDSerializable,
+    data::{hash::merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}, serializable::QPDSerializable},
     protocol::core_types::Q256BitHash,
-    utils::{debug_code_string::QToCodeString, QPGenRandom},
+    utils::{QPGenRandom, debug_code_string::QToCodeString},
 };
 
 pub const ZERO_HASH_CACHE_SIZE: usize = 128;
@@ -486,6 +486,36 @@ impl<Hash: PartialEq + Copy> MerkleProofCore<Hash> {
             index: self.index,
             siblings,
         }
+    }
+    pub fn get_all_merkle_nodes_and_verify<Hasher: MerkleHasher<Hash>>(&self) -> anyhow::Result<Vec<SimpleMerkleNode<Hash>>> {
+        let mut key = SimpleMerkleNodeKey{
+            index: self.index,
+            level: self.siblings.len() as u8,
+        };
+        let mut current = self.value;
+        let mut nodes = Vec::with_capacity(self.siblings.len() * 2 + 1);
+        let mut index = self.index;
+        for sibling in &self.siblings {
+            nodes.push(SimpleMerkleNode{
+                key: key.sibling(),
+                value: *sibling
+            });
+            nodes.push(SimpleMerkleNode{
+                key: key.clone(),
+                value: current
+            });
+            current = Hasher::two_to_one_swap(index & 1 == 1, &current, sibling);
+            key = key.parent();
+            index >>= 1;
+        }
+        nodes.push(SimpleMerkleNode{
+            key,
+            value: current
+        });
+        if current != self.root {
+            anyhow::bail!("Computed root does not match proof root");
+        }
+        Ok(nodes)
     }
 }
 impl<Hash: PartialEq + Copy> MerkleProofCore<Hash> {
