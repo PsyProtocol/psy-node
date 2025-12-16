@@ -1,6 +1,6 @@
 use std::{collections::HashMap, fmt::Debug, marker::PhantomData};
 
-use parth_core::{crypto::hash::{merkle_proof::{DeltaMerkleProofCore, MerkleProofCore, compute_root_merkle_proof_generic}, spiderman::SpidermanUpdateProof, traits::MerkleZeroHasher}, data::hash::merkle_node_key::SimpleMerkleNodeKey, utils::math::ceil_div_usize};
+use parth_core::{crypto::hash::{merkle_proof::{DeltaMerkleProofCore, MerkleProofCore, compute_root_merkle_proof_generic}, spiderman::SpidermanUpdateProof, traits::MerkleZeroHasher}, data::hash::merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}, utils::math::ceil_div_usize};
 
 #[derive(Debug, Clone)]
 pub struct SimpleMemoryMerkleRecorderStore<Hasher, Hash: Copy + PartialEq + Default> {
@@ -76,6 +76,46 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + PartialEq + Default>
             effective_height: height,
             _hasher: PhantomData::default(),
         }
+    }
+    pub fn get_all_non_zero_nodes_not_including_changes(&self) -> Vec<SimpleMerkleNode<Hash>> {
+        self.nodes.iter().filter_map(|entry| {
+            let zero_hash = Hasher::get_zero_hash((self.height - entry.0.level) as usize);
+            if !entry.1.eq(&zero_hash) {
+                Some(SimpleMerkleNode{
+                    key: *entry.0,
+                    value: *entry.1,
+                })
+            } else {
+                None
+            }
+        }).collect()
+    }
+    pub fn get_all_non_zero_nodes_including_changes(&self) -> Vec<SimpleMerkleNode<Hash>> {
+        self.nodes.iter().filter_map(|entry| {
+            if self.updated_nodes.contains_key(entry.0) {
+                None
+            } else {
+                let zero_hash = Hasher::get_zero_hash((self.height - entry.0.level) as usize);
+                if !entry.1.eq(&zero_hash) {
+                    Some(SimpleMerkleNode{
+                        key: *entry.0,
+                        value: *entry.1,
+                    })
+                } else {
+                    None
+                }
+            }
+        }).chain(self.updated_nodes.iter().filter_map(|entry| {
+            let zero_hash = Hasher::get_zero_hash((self.height - entry.0.level) as usize);
+            if !entry.1.eq(&zero_hash) {
+                Some(SimpleMerkleNode{
+                    key: *entry.0,
+                    value: *entry.1,
+                })
+            } else {
+                None
+            }
+        })).collect()
     }
     pub fn get_changes(&self) -> &HashMap<SimpleMerkleNodeKey, Hash> {
         &self.updated_nodes

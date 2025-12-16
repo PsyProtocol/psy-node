@@ -49,16 +49,16 @@ impl<N: QNetworkTypesConfig + 'static, RC: RealmEdgeRpcClient<N::F, N::QHash, N:
 
         let num_contract_calls = rand::thread_rng().gen_range(1u32..=max_contract_calls);
         let mut planned_calls = Vec::new();
-        println!("known contracts: {:?}", self.known_contract_state_heights);
+        //println!("known contracts: {:?}", self.known_contract_state_heights);
 
-        print!("max_contract_calls: {}, num_contract_calls: {}\n", max_contract_calls, num_contract_calls);
-        println!("max_updates_per_call: {}, min_updates_per_call: {}", max_updates_per_call, min_updates_per_call);
+        //print!("max_contract_calls: {}, num_contract_calls: {}\n", max_contract_calls, num_contract_calls);
+        //println!("max_updates_per_call: {}, min_updates_per_call: {}", max_updates_per_call, min_updates_per_call);
 
         for _ in 0..num_contract_calls {
             let contract_index = rand::thread_rng().gen_range(0..self.known_contract_state_heights.len());
             let (contract_id, contract_height) = self.known_contract_state_heights[contract_index];
             let num_updates = rand::thread_rng().gen_range(min_updates_per_call..=max_updates_per_call);
-            println!("contract_height: {}, contract_id: {}, num_updates: {}", contract_height, contract_id, num_updates);
+            //println!("contract_height: {}, contract_id: {}, num_updates: {}", contract_height, contract_id, num_updates);
             for _ in 0..num_updates {
                 let slot_index = rand::thread_rng().gen_range(0..(1u64 << contract_height));
                 let value = Self::rand_hash();

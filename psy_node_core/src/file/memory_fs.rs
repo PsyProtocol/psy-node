@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use dashmap::DashMap;
 use psy_io::tokio::{FileLikeMetadata, TokioLikeFileSystem};
-
+#[derive(Clone)]
 pub struct SimpleMockMemoryFileSystem {
     pub files: DashMap<String, Vec<u8>>,
 }

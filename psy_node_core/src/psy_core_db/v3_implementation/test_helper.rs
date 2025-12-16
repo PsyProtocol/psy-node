@@ -544,7 +544,7 @@ impl<
         assert_eq!(initial_root, N::HasherBase::get_zero_hash(tree_height as usize));
         
         let leaf_val = N::QHash::qp_rand_gen();
-        let delta_proof = db.user_registration_tree_set_leaf_hash(1, leaf_val).await?;
+        let delta_proof = db.user_registration_tree_set_leaf_hash(1, leaf_index, leaf_val).await?;
         assert!(delta_proof.verify::<N::HasherBase>());
         
         let new_root = db.user_registration_tree_get_root_hash(1).await?;
@@ -566,7 +566,7 @@ impl<
 
         assert_eq!(db.global_user_tree_get_root_hash(0).await?, N::HasherBase::get_zero_hash(tree_height as usize));
         let leaf_val = N::QHash::qp_rand_gen();
-        let delta = db.global_user_tree_set_leaf_hash(1, leaf_val).await?;
+        let delta = db.global_user_tree_set_leaf_hash(1, leaf_index, leaf_val).await?;
         
         let proof = db.global_user_tree_get_merkle_proof(1, leaf_index).await?;
         assert!(proof.verify::<N::HasherBase>());
@@ -634,7 +634,7 @@ impl<
         assert_eq!(db.global_contract_tree_get_root_hash(0).await?, N::HasherBase::get_zero_hash(tree_height as usize));
         
         let leaf_val = N::QHash::qp_rand_gen();
-        let delta = db.global_contract_tree_set_leaf_hash(1, leaf_val).await?;
+        let delta = db.global_contract_tree_set_leaf_hash(1, leaf_index, leaf_val).await?;
         
         let new_root = db.global_contract_tree_get_root_hash(1).await?;
         assert_eq!(new_root, delta.new_root);

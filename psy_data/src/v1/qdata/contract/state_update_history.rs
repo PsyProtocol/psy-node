@@ -139,6 +139,7 @@ pub trait PSimpleContractHeightCache<Hash> {
 }
 
 #[cfg(feature = "node")]
+#[derive(Clone)]
 pub struct DashMapContractHeightCache<Hash> {
     pub mapping: dashmap::DashMap<u32, (u8, Hash)>
 }

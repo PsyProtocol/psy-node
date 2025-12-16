@@ -49,7 +49,7 @@ pub trait PsyNodeUserRegistrationTreeDatabaseReader<Hash> {
 #[async_trait]
 #[auto_impl(&, Arc)]
 pub trait PsyNodeUserRegistrationTreeDatabaseWriter<Hash> {
-    async fn user_registration_tree_set_leaf_hash(&self, checkpoint_id: u64, value: Hash) -> anyhow::Result<DeltaMerkleProofCore<Hash>>;
+    async fn user_registration_tree_set_leaf_hash(&self, checkpoint_id: u64, leaf_index: u64, value: Hash) -> anyhow::Result<DeltaMerkleProofCore<Hash>>;
     async fn user_registration_tree_set_nodes(&self, checkpoint_id: u64, nodes: &[SimpleMerkleNode<Hash>]) -> anyhow::Result<()>;
     async fn user_registration_tree_set_nodes_ffs(&self, checkpoint_id: u64, data: &[u8]) -> anyhow::Result<()>;
 }
@@ -81,7 +81,7 @@ pub trait PsyNodeGlobalUserTreeDatabaseReader<Hash> {
 #[auto_impl(&, Arc)]
 pub trait PsyNodeGlobalUserTreeDatabaseWriter<Hash> {
     async fn global_user_tree_set_top_tree_merkle_proof(&self, checkpoint_id: u64, merkle_proof: &MerkleProofCore<Hash>) -> anyhow::Result<()>;
-    async fn global_user_tree_set_leaf_hash(&self, checkpoint_id: u64, value: Hash) -> anyhow::Result<DeltaMerkleProofCore<Hash>>;
+    async fn global_user_tree_set_leaf_hash(&self, checkpoint_id: u64, leaf_index: u64, value: Hash) -> anyhow::Result<DeltaMerkleProofCore<Hash>>;
     async fn global_user_tree_set_nodes(&self, checkpoint_id: u64, nodes: &[SimpleMerkleNode<Hash>]) -> anyhow::Result<()>;
     async fn global_user_tree_set_nodes_ffs(&self, checkpoint_id: u64, data: &[u8]) -> anyhow::Result<()>;
 }
@@ -154,7 +154,7 @@ pub trait PsyNodeGlobalContractTreeDatabaseReader<Hash> {
 #[async_trait]
 #[auto_impl(&, Arc)]
 pub trait PsyNodeGlobalContractTreeDatabaseWriter<Hash> {
-    async fn global_contract_tree_set_leaf_hash(&self, checkpoint_id: u64, value: Hash) -> anyhow::Result<DeltaMerkleProofCore<Hash>>;
+    async fn global_contract_tree_set_leaf_hash(&self, checkpoint_id: u64, leaf_index: u64, value: Hash) -> anyhow::Result<DeltaMerkleProofCore<Hash>>;
     async fn global_contract_tree_set_nodes(&self, checkpoint_id: u64, nodes: &[SimpleMerkleNode<Hash>]) -> anyhow::Result<()>;
     async fn global_contract_tree_set_nodes_ffs(&self, checkpoint_id: u64, data: &[u8]) -> anyhow::Result<()>;
 }

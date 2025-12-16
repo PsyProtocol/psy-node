@@ -56,12 +56,12 @@ impl<F: QFelt64, Hash: QDBHashBase + QFHashBase<F>, Fetcher: PsyDummyProverCombo
         let checkpoint_proof: MerkleProofCore<Hash> = data_fetcher
             .cf_get_checkpoint_tree_merkle_proof(checkpoint_id)
             .await?;
-        println!("first checkpoint proof (valid={}): {:?}", checkpoint_proof.verify::<Hasher>(), checkpoint_proof);
+        //println!("first checkpoint proof (valid={}): {:?}", checkpoint_proof.verify::<Hasher>(), checkpoint_proof);
         let checkpoint_proof = checkpoint_proof
             .to_append_proof::<Hasher>();
-        println!("append proof (valid= {}): {:#?}", checkpoint_proof.verify::<Hasher>(), checkpoint_proof);
-        println!("verify checkpoint proof: {:?}", checkpoint_proof.verify::<Hasher>());
-        println!("append root: {:?}", checkpoint_proof.get_append_root::<Hasher>());
+        //println!("append proof (valid= {}): {:#?}", checkpoint_proof.verify::<Hasher>(), checkpoint_proof);
+        //println!("verify checkpoint proof: {:?}", checkpoint_proof.verify::<Hasher>());
+        //println!("append root: {:?}", checkpoint_proof.get_append_root::<Hasher>());
 
         let checkpoint_root = checkpoint_proof.get_append_root::<Hasher>();
 
@@ -108,7 +108,7 @@ impl<F: QFelt64, Hash: QDBHashBase + QFHashBase<F>, Fetcher: PsyDummyProverCombo
                 root: root,
                 index: *contract_id as u64,
             };
-            println!("Injesting user contract tree merkle proof for contract_id {}: {:?}", contract_id, mp);
+            //println!("Injesting user contract tree merkle proof for contract_id {}: {:?}", contract_id, mp);
             self.user_contract_tree.injest_merkle_proof_into_nodes(&mp)?;
         }
         Ok(())
@@ -130,12 +130,13 @@ impl<F: QFelt64, Hash: QDBHashBase + QFHashBase<F>, Fetcher: PsyDummyProverCombo
         self.contract_state_tree_heights.insert(contract_id, height);
         self.contract_state_dmps.insert(contract_id, Vec::new());
         let tree = SimpleMemoryMerkleRecorderStore::new(height);
-        println!(
+        /*println!(
             "initialized tree with root {:?} and height {} for contract {}",
             tree.get_root(),
             height,
             contract_id
         );
+        */
         self.contract_state_trees.insert(contract_id, tree);
         Ok(height)
     }
@@ -155,7 +156,7 @@ impl<F: QFelt64, Hash: QDBHashBase + QFHashBase<F>, Fetcher: PsyDummyProverCombo
     }
     pub async fn write_to_contract(&mut self, contract_id: u32, slot_id: u64, value_hash: Hash) -> anyhow::Result<()> {
         let state_height = self.get_state_tree_height(contract_id).await?;
-        println!("state_height for contract {}: {}", contract_id, state_height);
+        //println!("state_height for contract {}: {}", contract_id, state_height);
         if slot_id >= (1u64 << state_height) {
             return Err(anyhow::anyhow!(
                 "Slot ID {} is out of bounds for contract {} with state tree height {}",
@@ -172,7 +173,7 @@ impl<F: QFelt64, Hash: QDBHashBase + QFHashBase<F>, Fetcher: PsyDummyProverCombo
             .get_mut(&contract_id)
             .ok_or_else(|| anyhow::anyhow!("Contract tree not found"))?
             .set_leaf(slot_id, value_hash);
-        println!("old root for contract {}: {:?}", contract_id, dmp.old_root);
+        //println!("old root for contract {}: {:?}", contract_id, dmp.old_root);
         let rt = self
             .contract_state_trees
             .get_mut(&contract_id)
@@ -183,10 +184,10 @@ impl<F: QFelt64, Hash: QDBHashBase + QFHashBase<F>, Fetcher: PsyDummyProverCombo
             println!("Computed root: {:?}, DMP new root: {:?}", rt, dmp.new_root);
             return Err(anyhow::anyhow!("Computed new root does not match DMP new root"));
         } else {
-            println!("Roots match: {:?}", rt);
+            //println!("Roots match: {:?}", rt);
         }
 
-        println!("dmp for contract {} slot {}: {:?}", contract_id, slot_id, dmp);
+        //println!("dmp for contract {} slot {}: {:?}", contract_id, slot_id, dmp);
         self.contract_state_dmps
             .get_mut(&contract_id)
             .ok_or_else(|| anyhow::anyhow!("No DMPs found for contract"))?

@@ -272,7 +272,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
         let last_user_leaf_value = global_user_tree.get_leaf_value(user_id - self.realm_user_min_id);
         if last_user_leaf_value != queue_item.old_user_leaf_hash {
             tracing::info!(
-                "Skipping end-cap job population due to user leaf hash mismatch for user ID {}. Expected {:?}, found {:?}. Likely got overwritten due to a race condition. Gracefully skipping.",
+                "Skipping end-cap job population due to user leaf hash mismatch for user ID {}. Expected last_user_leaf_value={:?}, found {:?}. Likely got overwritten due to a race condition. Gracefully skipping.",
                 user_id,
                 last_user_leaf_value,
                 queue_item.old_user_leaf_hash
@@ -356,6 +356,24 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
                 checkpoint_tree.get_historical_merkle_proof_at_historical_index(left_checkpoint_id, self.current_checkpoint_id);
             let right_checkpoint_merkle_proof =
                 checkpoint_tree.get_historical_merkle_proof_at_historical_index(right_checkpoint_id, self.current_checkpoint_id);
+
+                
+            tracing::info!("[{:?}] left_checkpoint_merkle_proof ({left_checkpoint_id} @ {}) (append_root: {:?}): {:?}", left.job_id, self.current_checkpoint_id, left_checkpoint_merkle_proof.get_append_root::<Hasher>(), left_checkpoint_merkle_proof);
+            tracing::info!("[{:?}] right_checkpoint_merkle_proof ({right_checkpoint_id} @ {}) (append_root: {:?}): {:?}", right.job_id, self.current_checkpoint_id, right_checkpoint_merkle_proof.get_append_root::<Hasher>(), right_checkpoint_merkle_proof);
+            if !left_checkpoint_merkle_proof.verify::<Hasher>() {
+                tracing::error!(
+                    "Left checkpoint merkle proof verification failed for user ID {} at checkpoint ID {}.",
+                    left.new_user_leaf.user_id.to_u64_value(),
+                    left_checkpoint_id
+                );
+            }
+            if !right_checkpoint_merkle_proof.verify::<Hasher>() {
+                tracing::error!(
+                    "Right checkpoint merkle proof verification failed for user ID {} at checkpoint ID {}.",
+                    right.new_user_leaf.user_id.to_u64_value(),
+                    right_checkpoint_id
+                );
+            }
 
             
 
@@ -679,8 +697,23 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
                 Some(level) => level,
                 None => return Ok(Some(first_straggler_level)),
             };
-            let left_straggler = self.job_stragglers[first_straggler_level].take().unwrap();
-            let right_straggler = self.job_stragglers[next_straggler_level].take().unwrap();
+
+            // ---- START OF FIX ----
+
+            // The straggler from the HIGHER level (next_straggler_level) represents an
+            // earlier, larger, already-aggregated sub-tree. It must be the LEFT child.
+            let left_straggler = self.job_stragglers[next_straggler_level].take().unwrap();
+
+            // The straggler from the LOWER level (first_straggler_level) represents a
+            // later, smaller sub-tree. It must be the RIGHT child.
+            let right_straggler = self.job_stragglers[first_straggler_level].take().unwrap();
+            
+            // ---- END OF FIX ----
+
+            // The original incorrect code was:
+            // let left_straggler = self.job_stragglers[first_straggler_level].take().unwrap();
+            // let right_straggler = self.job_stragglers[next_straggler_level].take().unwrap();
+
             let left_job_id = left_straggler.job_id;
             let right_job_id = right_straggler.job_id;
             let witness = GUTAVerifyTwoGUTALinearCircuitInput {

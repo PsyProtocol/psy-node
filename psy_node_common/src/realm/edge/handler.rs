@@ -299,6 +299,8 @@ impl<
             .checkpoint_tree_get_merkle_proof(u64::MAX-0xFFFF, end_cap_checkpoint_id)
             .await?;
 
+        let job_id =
+            QProvingJobDataID::try_get_realm_edge_proof_store_output_proof_id_for_end_cap(user_id, N::GLOBAL_USER_TREE_HEIGHT, unique_pending_id)?;
         println!("checkpoint_tree_proof: {:#?}", checkpoint_tree_proof);
         println!("verify_checkpoint_tree_proof: {}", checkpoint_tree_proof.verify::<N::HasherBase>());
         let historical_root = checkpoint_tree_proof.get_append_root::<N::HasherBase>();
@@ -310,8 +312,9 @@ impl<
                 user_end_cap_input.core.state_transition.checkpoint_tree_root_hash
             );
         }
-        let job_id =
-            QProvingJobDataID::try_get_realm_edge_proof_store_output_proof_id_for_end_cap(user_id, N::GLOBAL_USER_TREE_HEIGHT, unique_pending_id)?;
+        tracing::info!("[{:?}] checkpoint_tree_proof ({} @ LATEST) (append_root: {:?}): {:?}", job_id, end_cap_checkpoint_id, checkpoint_tree_proof.get_append_root::<N::HasherBase>(), checkpoint_tree_proof);
+
+
 
         self.ensure_user_has_not_submitted(user_id, unique_pending_id).await?;
 

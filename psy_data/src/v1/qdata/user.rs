@@ -70,6 +70,11 @@ impl<F: ZeroableFelt + PartialEq + Copy, Hash: ZeroableHash + PartialEq + Copy> 
             && self.last_checkpoint_id == F::ZERO_VALUE
             && self.event_index == F::ZERO_VALUE
     }
+    pub fn is_first_transaction_old_user_leaf_with_state(&self, default_user_state_root: Hash) -> bool {
+        self.is_first_transaction_old_user_leaf() || (
+            self.nonce == F::ZERO_VALUE && self.last_checkpoint_id == F::ZERO_VALUE && self.event_index == F::ZERO_VALUE && self.user_state_tree_root == default_user_state_root
+        )
+    }
 }
 impl<F: Copy, Hash> PQEDUserLeaf<F, Hash> {
 

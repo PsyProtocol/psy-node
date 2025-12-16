@@ -184,7 +184,7 @@ impl<F: QFelt, Hash: Copy> GUTAVerifyTwoEndCapCircuitInputV2<F, Hash> {
         PUPSEndCapResultCompact {
             start_user_leaf_hash: self.left_global_user_tree_delta_merkle_proof.old_value,
             end_user_leaf_hash: self.left_global_user_tree_delta_merkle_proof.new_value,
-            checkpoint_tree_root_hash: self.left_end_cap.checkpoint_historical_merkle_proof.root,
+            checkpoint_tree_root_hash: self.left_end_cap.checkpoint_root,
             user_id: F::from_u64_value(self.left_global_user_tree_delta_merkle_proof.index),
         }
     }
@@ -192,7 +192,7 @@ impl<F: QFelt, Hash: Copy> GUTAVerifyTwoEndCapCircuitInputV2<F, Hash> {
         PUPSEndCapResultCompact {
             start_user_leaf_hash: self.right_global_user_tree_delta_merkle_proof.old_value,
             end_user_leaf_hash: self.right_global_user_tree_delta_merkle_proof.new_value,
-            checkpoint_tree_root_hash: self.right_end_cap.checkpoint_historical_merkle_proof.root,
+            checkpoint_tree_root_hash: self.right_end_cap.checkpoint_root,
             user_id: F::from_u64_value(self.right_global_user_tree_delta_merkle_proof.index),
         }
     }

@@ -105,7 +105,7 @@ impl<C: JTMBCircuitConfig> DummyUPSProver<C::F, C::Hash> for DummyUPSStandardEnd
         global_user_tree_height: u8,
         input: &SubmitUserEndCapNonProofInput<C::F, C::Hash>,
     ) -> anyhow::Result<Vec<u8>> {
-        println!("DummyUPSStandardEndCapCircuit::prove_end_cap_dummy_ups - input: {:#?}", input);
+        //println!("DummyUPSStandardEndCapCircuit::prove_end_cap_dummy_ups - input: {:#?}", input);
                 let guta_hash = input.core.state_transition.qfhash_with_guta_height::<C::Hasher>(global_user_tree_height);
 
                 let dummy_public_inputs = C::Hasher::q_two_to_one(
@@ -113,14 +113,14 @@ impl<C: JTMBCircuitConfig> DummyUPSProver<C::F, C::Hash> for DummyUPSStandardEnd
             input.core.stats.qfhash::<C::Hasher>(),
         );
 
-        println!("DummyUPSStandardEndCapCircuit::prove_end_cap_dummy_ups - dummy_public_inputs: {:#?}", dummy_public_inputs);
+        //println!("DummyUPSStandardEndCapCircuit::prove_end_cap_dummy_ups - dummy_public_inputs: {:#?}", dummy_public_inputs);
 
         let proof = self.prove_base(
             dummy_public_inputs,
         )?;
-        println!("DummyUPSStandardEndCapCircuit::prove_end_cap_dummy_ups - proof: {:#?}", proof);
+        //println!("DummyUPSStandardEndCapCircuit::prove_end_cap_dummy_ups - proof: {:#?}", proof);
         let result = serialize_jtmb_proof(&proof)?;
-        println!("DummyUPSStandardEndCapCircuit::prove_end_cap_dummy_ups - serialized proof: {:?}", hex::encode(&result));
+        //println!("DummyUPSStandardEndCapCircuit::prove_end_cap_dummy_ups - serialized proof: {:?}", hex::encode(&result));
         Ok(result)
     }
 }

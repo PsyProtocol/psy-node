@@ -143,6 +143,7 @@ impl<L: PsyJTMBCircuitInfoLibrary<C::Hash>, C: JTMBCircuitConfig> QJTMBProofCirc
 
         let witness = GUTAVerifyTwoEndCapCircuitInputV2::<C::F, C::Hash>::psy_ser_from_slice(&input.base.witness)?;
 
+        println!("got witness: {:?}", witness);
         let expected_public_inputs_hash_no_tag = witness.get_public_inputs_hash_no_rewards_tag::<C::Hasher>(32, whitelist_root);
         let expected_public_inputs_hash = C::Hasher::two_to_one(&expected_public_inputs_hash_no_tag, &worker_reward_tag);
 
@@ -157,7 +158,6 @@ impl<L: PsyJTMBCircuitInfoLibrary<C::Hash>, C: JTMBCircuitConfig> QJTMBProofCirc
         )?;
         println!("metadata: {:?}", input.base.job.metadata);
         println!("input_pubs: {:?}", input.base.job.metadata.expected_public_inputs_hash);
-        println!("got witness: {:?}", witness);
         println!("get_new_guta_header: witness: {:#?}", witness.get_new_guta_header(32, whitelist_root));
         println!("expected_public_inputs_hash: {:?}", expected_public_inputs_hash);
         println!("expected_public_inputs_hash_no_tag: {:?}", expected_public_inputs_hash_no_tag);

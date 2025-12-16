@@ -72,6 +72,17 @@ impl QMerkleStoreFastZeroNodeSerializer {
             serialized_bytes.extend_from_slice(&hash.into_owned_32bytes());
         }
     }
+    pub fn deserialize_zero_id_nodes_from_slice<Hash: Q256BitHash>(slice: &[u8]) -> Vec<SimpleMerkleNode<Hash>> {
+        assert!(slice.len() % QMS_FAST_SERIALIZER_ZERO_ID_NODE_SIZE == 0);
+        let mut nodes = Vec::with_capacity(slice.len() / QMS_FAST_SERIALIZER_ZERO_ID_NODE_SIZE);
+        let mut offset = 0;
+        while offset < slice.len() {
+            let node = Self::deserialize_zero_id_node_from_slice(&slice[offset..offset + QMS_FAST_SERIALIZER_ZERO_ID_NODE_SIZE]);
+            nodes.push(node);
+            offset += QMS_FAST_SERIALIZER_ZERO_ID_NODE_SIZE;
+        }
+        nodes
+    }
 }
 
 #[cfg(test)]

@@ -99,6 +99,24 @@ run_and_prefix_prover() {
         --coordinator-url "${COORDINATOR_URL}" \
         --url "${WORKER_URL}" \
         --user "${user_id}" \
+        --end-cap-count "${END_CAP_COUNT}" 2>&1 | while IFS= read -r line; do
+            echo "[USER_ID: ${user_id}] $line"
+        done
+}
+# Function to run a prover and prefix its output for parallel execution
+run_and_prefix_prover_old() {
+    local user_id=$1
+    local proving_backend=$2
+    local log_file="${LOG_DIR}/dummy_end_cap_prover_logs_${user_id}.txt"
+
+    # Execute the command, redirect stderr to stdout, and pipe it.
+    # The first `tee` writes the raw, unprefixed output to the log file.
+    # The `while` loop reads the output from `tee` line-by-line and prefixes it for console display.
+    "${CLI_EXECUTABLE}" dummy-end-cap-prover \
+        --proving-backend "${proving_backend}" \
+        --coordinator-url "${COORDINATOR_URL}" \
+        --url "${WORKER_URL}" \
+        --user "${user_id}" \
         --end-cap-count "${END_CAP_COUNT}" 2>&1 | tee "${log_file}" | while IFS= read -r line; do
             echo "[USER_ID: ${user_id}] $line"
         done
