@@ -107,6 +107,7 @@ impl<F: QFelt64, Hash: Copy> GUTAVerifyTwoGUTAUpgradeCheckpointCircuitInputV2<F,
 impl<F: QFelt64, Hash: QFHashBase<F>> GUTAVerifyTwoGUTAUpgradeCheckpointCircuitInputV2<F, Hash> {
     pub fn get_public_inputs_hash_no_rewards_tag<Hasher: FieldQHasher<F, Hash>>(&self) -> Hash {
         let new_guta_header = self.get_new_guta_header();
+        println!("GUTAVerifyTwoGUTAUpgradeCheckpointCircuitInputV2 new_guta_header: {:?}", new_guta_header);
         new_guta_header.qfhash::<Hasher>()
     }
 }

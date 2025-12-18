@@ -278,6 +278,7 @@ impl<F: QFelt64, Hash: Copy> VerifySingleEndCapInputV2<F, Hash> {
 impl<F: QFelt64, Hash: QFHashBase<F>> VerifySingleEndCapInputV2<F, Hash> {
     pub fn get_public_inputs_hash_no_rewards_tag<Hasher: FieldQHasher<F, Hash>>(&self, global_user_tree_height: u8) -> Hash {
         let new_guta_header = self.get_new_guta_header(global_user_tree_height);
+        println!("VerifySingleEndCapInputV2 new_guta_header: {:?}", new_guta_header);
         new_guta_header.qfhash::<Hasher>()
     }
 }

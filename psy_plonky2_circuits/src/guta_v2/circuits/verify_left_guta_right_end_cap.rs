@@ -1,5 +1,5 @@
 use parth_core::{
-    crypto::hash::{merkle_proof::MerkleProofCore, traits::MerkleZeroHasher}, felt::QFelt64, pgoldilocks::{QHashOut, QRichField}, protocol::core_types::Q256BitHash
+    crypto::hash::{merkle_proof::MerkleProofCore, traits::{FieldQHasher, MerkleHasher, MerkleZeroHasher}}, felt::QFelt64, pgoldilocks::{QHashOut, QRichField}, protocol::core_types::{Q256BitHash, QFHashBase}
 };
 use plonky2::{
     gates::{constant::ConstantGate, gate::GateRef},
@@ -197,7 +197,7 @@ impl<
     > QStandardCircuitProvableWithRawProofsAndRefLibrary<L, C, D>
     for GUTAVerifyLeftGUTARightEndCapCircuitV2<C, D>
 where
-     C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>>, QHashOut<C::F>: Q256BitHash, C::F: QFelt64 + QRichField,
+     C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + FieldQHasher<C::F, QHashOut<C::F>>, QHashOut<C::F>: Q256BitHash + QFHashBase<C::F>, C::F: QFelt64 + QRichField,
 {
 
     fn prove_with_raw_proofs_and_ref_library(
@@ -206,16 +206,24 @@ where
         input: PsyWorkerGetProvingWorkWithChildProofsAPIResponse<QHashOut<C::F>, QProvingJobDataID>,
         worker_reward_tag: QHashOut<C::F>,
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>>{
-
         let (left_child_guta_proof_result, right_child_end_cap_proof_result) = get_two_child_proofs_for_api_response_with_inclusion_proof::<L, C, D>(
             library,
             &input,
         )?;
 
-
         let witness = GUTAVerifyLeftGUTARightEndCapCircuitInputV2::<C::F, QHashOut<C::F>>::psy_ser_from_slice(&input.base.witness)?;
-        
-        self.prove_base(
+        let expected_public_inputs_hash_no_tag = witness.get_public_inputs_hash_no_rewards_tag::<C::Hasher>();
+        let expected_public_inputs_hash = C::Hasher::two_to_one(&expected_public_inputs_hash_no_tag, &worker_reward_tag);
+        println!("witness: {:?}", witness);
+        println!("left_child_guta_proof_result.whitelist_inclusion_proof: {:?}", left_child_guta_proof_result.whitelist_inclusion_proof);
+
+        println!("metadata: {:?}", input.base.job.metadata);
+        println!("input_pubs: {:?}", input.base.job.metadata.expected_public_inputs_hash);
+        println!("get_new_guta_header: witness: {:#?}", witness.get_new_guta_header());
+        println!("expected_public_inputs_hash: {:?}", expected_public_inputs_hash);
+        println!("expected_public_inputs_hash_no_tag: {:?}", expected_public_inputs_hash_no_tag);
+
+        let proof = self.prove_base(
             worker_reward_tag,
             &witness,
             &left_child_guta_proof_result.whitelist_inclusion_proof,
@@ -224,6 +232,9 @@ where
             &right_child_end_cap_proof_result.zk_proof,
             &right_child_end_cap_proof_result.verifier_data,
             left_child_guta_proof_result.reward_tag_tree_value,
-        )
+        )?;
+        println!("generated proof public inputs hash: {:?}", proof.public_inputs);
+
+        Ok(proof)
     }
 }

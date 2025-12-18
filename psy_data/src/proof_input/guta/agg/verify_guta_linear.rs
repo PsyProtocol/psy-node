@@ -57,6 +57,7 @@ impl<F: QFelt, Hash: Copy> GUTAVerifyTwoGUTALinearCircuitInput<F, Hash> {
 impl<F: QFelt64, Hash: QFHashBase<F>> GUTAVerifyTwoGUTALinearCircuitInput<F, Hash> {
     pub fn get_public_inputs_hash_no_rewards_tag<Hasher: FieldQHasher<F, Hash>>(&self) -> Hash {
         let new_guta_header = self.get_new_guta_header();
+        println!("GUTAVerifyTwoGUTALinearCircuitInput new_guta_header {:?}", new_guta_header);
         new_guta_header.qfhash::<Hasher>()
     }
 

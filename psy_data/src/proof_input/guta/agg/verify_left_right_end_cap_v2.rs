@@ -79,6 +79,7 @@ impl<F: QFelt, Hash: Copy> GUTAVerifyLeftGUTARightEndCapCircuitInputV2<F, Hash> 
 impl<F: QFelt64, Hash: QFHashBase<F>> GUTAVerifyLeftGUTARightEndCapCircuitInputV2<F, Hash> {
     pub fn get_public_inputs_hash_no_rewards_tag<Hasher: FieldQHasher<F, Hash>>(&self) -> Hash {
         let new_guta_header = self.get_new_guta_header();
+        println!("GUTAVerifyLeftGUTARightEndCapCircuitInputV2 new_guta_header: {:?}", new_guta_header);
         new_guta_header.qfhash::<Hasher>()
     }
 
