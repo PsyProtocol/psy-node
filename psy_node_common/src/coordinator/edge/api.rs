@@ -245,6 +245,9 @@ impl<
     async fn get_user_registration_tree_leaf_hash(&self, checkpoint_id: u64, leaf_index: u64) -> QRpcResult<N::QHash> {
         res(self.db_reader.user_registration_tree_get_leaf_hash(checkpoint_id, leaf_index).await)
     }
+        async fn get_user_registration_tree_leaf_hashes(&self, checkpoint_id: u64, indices: Vec<u64>) -> RpcResult<Vec<N::QHash>>{
+        res(self.db_reader.user_registration_tree_get_nodes(checkpoint_id, &SimpleMerkleNodeKey::from_inds_at_level(N::GLOBAL_USER_TREE_HEIGHT, &indices)).await)
+        }
 
     async fn get_user_registration_tree_merkle_proof(&self, checkpoint_id: u64, leaf_index: u64) -> QRpcResult<MerkleProofCore<N::QHash>> {
         res(self.db_reader.user_registration_tree_get_merkle_proof(checkpoint_id, leaf_index).await)

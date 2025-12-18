@@ -393,8 +393,8 @@ impl<
         self.db.get_current_unique_pending_id().await
     }
     pub async fn set_new_unique_ids(&mut self) -> anyhow::Result<()> {
-        println!("old_unique_pending_id: {}, old_proc_checkpoint_unique_id: {}", self.ids.unique_pending_id, self.ids.proc_checkpoint_unique_id);
-        println!("old_gathering_unique_pending_id: {}, old_gathering_proc_checkpoint_unique_id: {}", self.ids.gathering_unique_pending_id, self.ids.gathering_proc_checkpoint_unique_id);
+        //println!("old_unique_pending_id: {}, old_proc_checkpoint_unique_id: {}", self.ids.unique_pending_id, self.ids.proc_checkpoint_unique_id);
+        //println!("old_gathering_unique_pending_id: {}, old_gathering_proc_checkpoint_unique_id: {}", self.ids.gathering_unique_pending_id, self.ids.gathering_proc_checkpoint_unique_id);
         let (new_unique_pending_id, new_core_proc_unique_pending_id) = self.db.inc_unique_pending_id(1).await?;
         self.ids.unique_pending_id = self.ids.gathering_unique_pending_id;
         self.ids.proc_checkpoint_unique_id = self.ids.gathering_proc_checkpoint_unique_id;
@@ -410,13 +410,13 @@ impl<
         self.temp_db
             .set_unique_pending_ids(&self.ids.realm_identifier, self.ids.unique_pending_id, self.ids.proc_checkpoint_unique_id)
             .await?;
-        println!("new_unique_pending_id: {}, new_proc_checkpoint_unique_id: {}", self.ids.unique_pending_id, self.ids.proc_checkpoint_unique_id);
-        println!("new_gathering_unique_pending_id: {}, new_gathering_proc_checkpoint_unique_id: {}", self.ids.gathering_unique_pending_id, self.ids.gathering_proc_checkpoint_unique_id);
+        //println!("new_unique_pending_id: {}, new_proc_checkpoint_unique_id: {}", self.ids.unique_pending_id, self.ids.proc_checkpoint_unique_id);
+        //println!("new_gathering_unique_pending_id: {}, new_gathering_proc_checkpoint_unique_id: {}", self.ids.gathering_unique_pending_id, self.ids.gathering_proc_checkpoint_unique_id);
 
         Ok(())
     }
     pub fn get_proof_worker_queue_key(&self) -> CoordinatorProvingWorkQueueKey<N::QHash, N::JobId> {
-        println!("get_proof_worker_queue_key: self.db.ids.proc_checkpoint_unique_id: {:?}", self.ids.proc_checkpoint_unique_id);
+        //println!("get_proof_worker_queue_key: self.db.ids.proc_checkpoint_unique_id: {:?}", self.ids.proc_checkpoint_unique_id);
 
         CoordinatorProvingWorkQueueKey {
             realm_id: self.ids.realm_id_u64,

@@ -1,8 +1,10 @@
 use criterion::{criterion_group, criterion_main};
-mod raw;
-mod r2;
-mod r1;
-mod r3;
+//mod raw;
+//mod r2;
+//mod r1;
+//mod r3;
+mod get_basic;
 
-criterion_group!(benches, raw::criterion_benchmark_g);
+//raw::criterion_benchmark_g,
+criterion_group!(benches, get_basic::criterion_benchmark_g);
 criterion_main!(benches);

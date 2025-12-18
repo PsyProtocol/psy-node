@@ -358,8 +358,8 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
                 checkpoint_tree.get_historical_merkle_proof_at_historical_index(right_checkpoint_id, self.current_checkpoint_id);
 
                 
-            tracing::info!("[{:?}] left_checkpoint_merkle_proof ({left_checkpoint_id} @ {}) (append_root: {:?}): {:?}", left.job_id, self.current_checkpoint_id, left_checkpoint_merkle_proof.get_append_root::<Hasher>(), left_checkpoint_merkle_proof);
-            tracing::info!("[{:?}] right_checkpoint_merkle_proof ({right_checkpoint_id} @ {}) (append_root: {:?}): {:?}", right.job_id, self.current_checkpoint_id, right_checkpoint_merkle_proof.get_append_root::<Hasher>(), right_checkpoint_merkle_proof);
+            tracing::debug!("[{:?}] left_checkpoint_merkle_proof ({left_checkpoint_id} @ {}) (append_root: {:?}): {:?}", left.job_id, self.current_checkpoint_id, left_checkpoint_merkle_proof.get_append_root::<Hasher>(), left_checkpoint_merkle_proof);
+            tracing::debug!("[{:?}] right_checkpoint_merkle_proof ({right_checkpoint_id} @ {}) (append_root: {:?}): {:?}", right.job_id, self.current_checkpoint_id, right_checkpoint_merkle_proof.get_append_root::<Hasher>(), right_checkpoint_merkle_proof);
             if !left_checkpoint_merkle_proof.verify::<Hasher>() {
                 tracing::error!(
                     "Left checkpoint merkle proof verification failed for user ID {} at checkpoint ID {}.",

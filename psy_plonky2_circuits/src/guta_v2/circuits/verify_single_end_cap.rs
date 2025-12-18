@@ -9,7 +9,7 @@ use plonky2::{
     }
 };
 use parth_core::{
-    crypto::hash::{tag_tree::hash_tag_tree_node, traits::{FieldQHasher, MerkleZeroHasher, QFieldHashable}}, data::proof_input::CircuitInputWithDependencies, felt::QFelt64, pgoldilocks::{QHashOut, QRichField}, protocol::core_types::{Q256BitHash, QFHashBase}
+    crypto::hash::traits::{FieldQHasher, MerkleZeroHasher}, data::proof_input::CircuitInputWithDependencies, felt::QFelt64, pgoldilocks::{QHashOut, QRichField}, protocol::core_types::{Q256BitHash, QFHashBase}
 };
 use psy_core::
     job::job_id::{ProvingJobCircuitType, QProvingJobDataID}
@@ -240,13 +240,13 @@ where
 
 
 
-        let metadata_expected_public_inputs = input.base.job.metadata.expected_public_inputs_hash;
-        println!("GUTAVerifySingleEndCapCircuitV2 metadata_expected_public_inputs: {:#?}", metadata_expected_public_inputs);
+        //let metadata_expected_public_inputs = input.base.job.metadata.expected_public_inputs_hash;
+        //println!("GUTAVerifySingleEndCapCircuitV2 metadata_expected_public_inputs: {:#?}", metadata_expected_public_inputs);
 
 
 
         let witness = VerifySingleEndCapInputV2::<C::F, QHashOut<C::F>>::psy_ser_from_slice(&input.base.witness)?;
-
+/* 
         let expected_compact = witness.get_end_result_a();
 
 
@@ -278,6 +278,7 @@ where
             new_tag_root,
         );
         println!("expected_new_public_inputs_with_tag: {:#?}", expected_new_public_inputs_with_tag);
+        */
         let proof = self.prove_base(
             worker_reward_tag,
             &witness,

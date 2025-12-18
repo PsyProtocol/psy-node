@@ -44,6 +44,7 @@ where
         queue_key: &RealmProvingWorkQueueKey<N::QHash, N::JobId>,
         jobs: &[Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>],
     ) -> anyhow::Result<()> {
+        let mut timer = TraceTimer::new("publish_all_worker_jobs");
         for level in 0..jobs.len() {
             if jobs[level].is_empty() {
                 continue;
@@ -60,6 +61,8 @@ where
                     &jobs[level],
                 )
                 .await?;
+            timer.lap("published jobs");
+            tracing::info!("Published all jobs at level {}", level);
             
             // We wait level-by-level because higher levels usually depend on the output of lower levels.
             self.db
@@ -73,6 +76,8 @@ where
                     self.proof_worker_queue_max_time_ms,
                 )
                 .await?;
+            timer.lap("waited for jobs to complete");
+            tracing::info!("All jobs at level {} completed", level);
         }
         Ok(())
     }

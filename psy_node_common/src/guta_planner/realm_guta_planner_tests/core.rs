@@ -84,6 +84,7 @@ pub type PsyRGPTestDatabase = PsyUnifiedCoreDatabaseStore<
     InMemoryTableIdentifier,
     InMemoryTableIdentifier,
     InMemoryTableIdentifier,
+    InMemoryTableIdentifier,
     InMemoryCoreStore<Hash, Hasher>,
 >;
 
@@ -110,6 +111,7 @@ pub async fn setup_rgp_test_db(store: Arc<InMemoryTestStore>) -> anyhow::Result<
     let user_leaf_table = Arc::new(InMemoryTableIdentifier::new_with_keyspace(&keyspace, "user_leaf_table"));
     let user_public_key_table = Arc::new(InMemoryTableIdentifier::new_with_keyspace(&keyspace, "user_public_key_table"));
     let u64_singleton_table = Arc::new(InMemoryTableIdentifier::new_with_keyspace(&keyspace, "u64_singleton_table"));
+    let u64_counter_singleton_table = Arc::new(InMemoryTableIdentifier::new_with_keyspace(&keyspace, "u64_counter_singleton_table"));
     let contract_state_tree_height_table = Arc::new(InMemoryTableIdentifier::new_with_keyspace(&keyspace, "contract_state_tree_height_table"));
     let checkpoint_id_to_pending_id_table = Arc::new(InMemoryTableIdentifier::new_with_keyspace(&keyspace, "checkpoint_id_to_pending_id_table"));
     let pending_id_to_checkpoint_id_table = Arc::new(InMemoryTableIdentifier::new_with_keyspace(&keyspace, "pending_id_to_checkpoint_id_table"));
@@ -171,6 +173,7 @@ pub async fn setup_rgp_test_db(store: Arc<InMemoryTestStore>) -> anyhow::Result<
         user_leaf_table,
         user_public_key_table,
         u64_singleton_table,
+        u64_counter_singleton_table,
         contract_state_tree_height_table,
         checkpoint_id_to_pending_id_table,
         pending_id_to_checkpoint_id_table,

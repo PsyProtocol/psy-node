@@ -1,7 +1,7 @@
 use crate::crypto::hash::traits::{MerkleHasher, MerkleZeroHasher};
 
 
-pub trait FieldQHasher<F, Hash>: Sized + MerkleHasher<Hash> + MerkleZeroHasher<Hash> {
+pub trait FieldQHasher<F, Hash>: Sized + MerkleHasher<Hash> + MerkleZeroHasher<Hash> + Send + Sync{
     fn q_hash_many(elements: &[F]) -> Hash;
     fn q_hash_many_pad(elements: &[F]) -> Hash;
     fn q_two_to_one(left: Hash, right: Hash) -> Hash;

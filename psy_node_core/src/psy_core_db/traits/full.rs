@@ -272,6 +272,7 @@ pub trait PsyNodeCheckpointObjectDatabaseWriter<F, Hash> {
 pub trait PsyNodeCoreDatabaseUserStoreReader<F, Hash> {
     async fn get_zk_public_key(&self, checkpoint_id: u64, user_id: u64) -> anyhow::Result<PZKPublicKeyInfo<Hash>>;
     async fn get_user_leaf(&self, checkpoint_id: u64, user_id: u64) -> anyhow::Result<PQEDUserLeaf<F, Hash>>;
+    async fn get_user_leaves_batch(&self, checkpoint_id: u64, user_ids: &[u64]) -> anyhow::Result<Vec<Option<PQEDUserLeaf<F, Hash>>>>;
     async fn get_user_ids_for_public_key(&self, public_key: Hash, start_user_id: u64, count: usize) -> anyhow::Result<Vec<u64>>;
 }
 

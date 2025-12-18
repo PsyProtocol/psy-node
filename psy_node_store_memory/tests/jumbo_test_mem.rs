@@ -65,6 +65,7 @@ pub struct SimpleStoreEx {
         InMemoryTableIdentifier,
         InMemoryTableIdentifier,
         InMemoryTableIdentifier,
+        InMemoryTableIdentifier,
         InMemoryTestStore,
     >,
 }
@@ -84,6 +85,7 @@ impl SimpleStoreEx {
             Arc::new(InMemoryTableIdentifier::new_with_keyspace(&keyspace, "ObjDoubleIdTableB")),
             Arc::new(InMemoryTableIdentifier::new_with_keyspace(&keyspace, "U64TableA")),
             Arc::new(InMemoryTableIdentifier::new_with_keyspace(&keyspace, "U64TableB")),
+            Arc::new(InMemoryTableIdentifier::new_with_keyspace(&keyspace, "U64CounterTableA")),
             Arc::new(InMemoryTableIdentifier::new_with_keyspace(&keyspace, "U64U128BiDirectionalMappingTableA")),
             Arc::new(InMemoryTableIdentifier::new_with_keyspace(&keyspace, "U64U128BiDirectionalMappingTableB")),
             Arc::new(InMemoryTableIdentifier::new_treee_with_keyspace(&keyspace, "MerkleNodeZeroIdTableA", EX_ZERO_ID_TREE_A_HEIGHT as u8)),

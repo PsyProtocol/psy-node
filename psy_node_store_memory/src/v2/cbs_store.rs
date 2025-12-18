@@ -33,7 +33,7 @@ use parth_core::{
     protocol::core_types::{QDBHashBase, QHashBase},
 };
 use psy_node_core::store::traits::core_db::{
-    CoreDatabaseBidirectionalMappingReader, CoreDatabaseBidirectionalMappingWriter, CoreDatabaseBidirectionalU64U128MappingReader, CoreDatabaseBidirectionalU64U128MappingWriter, CoreDatabaseDoubleIdCheckpointedReader, CoreDatabaseDoubleIdCheckpointedWriter, CoreDatabaseDoubleIdMerkleReader, CoreDatabaseDoubleIdMerkleWriter, CoreDatabaseHashToManyIdsReader, CoreDatabaseHashToManyIdsWriter, CoreDatabaseKivReader, CoreDatabaseKivWriter, CoreDatabaseSingleIdCheckpointedReader, CoreDatabaseSingleIdCheckpointedWriter, CoreDatabaseSingleIdMerkleReader, CoreDatabaseSingleIdMerkleWriter, CoreDatabaseTagTreeReader, CoreDatabaseTagTreeWriter, CoreDatabaseU64Reader, CoreDatabaseU64Store, CoreDatabaseU64Writer, CoreDatabaseZeroIdMerkleDumpReader, CoreDatabaseZeroIdMerkleReader, CoreDatabaseZeroIdMerkleWriter, MerkleTreeDumpStrategy
+    CoreDatabaseBidirectionalMappingReader, CoreDatabaseBidirectionalMappingWriter, CoreDatabaseBidirectionalU64U128MappingReader, CoreDatabaseBidirectionalU64U128MappingWriter, CoreDatabaseDoubleIdCheckpointedReader, CoreDatabaseDoubleIdCheckpointedWriter, CoreDatabaseDoubleIdMerkleReader, CoreDatabaseDoubleIdMerkleWriter, CoreDatabaseHashToManyIdsReader, CoreDatabaseHashToManyIdsWriter, CoreDatabaseKivReader, CoreDatabaseKivWriter, CoreDatabaseSingleIdCheckpointedReader, CoreDatabaseSingleIdCheckpointedWriter, CoreDatabaseSingleIdMerkleReader, CoreDatabaseSingleIdMerkleWriter, CoreDatabaseTagTreeReader, CoreDatabaseTagTreeWriter, CoreDatabaseU64CounterReader, CoreDatabaseU64CounterStore, CoreDatabaseU64CounterWriter, CoreDatabaseU64Reader, CoreDatabaseU64Store, CoreDatabaseU64Writer, CoreDatabaseZeroIdMerkleDumpReader, CoreDatabaseZeroIdMerkleReader, CoreDatabaseZeroIdMerkleWriter, MerkleTreeDumpStrategy
 };
 use psy_serialize::{PsyCanonicalDatabaseSerializeBaseSingle, PsySerializeCanonicalAsyncSafe};
 use std::{
@@ -587,21 +587,6 @@ where
     Hash: QHashBase,
     Hasher: MerkleZeroHasher<Hash> + Send + Sync,
 {
-    async fn db_inc_counter(&self, table: &InMemoryTableIdentifier, obj_id: u64, amount: i64) -> anyhow::Result<u64> {
-        let db = self.get_or_create_u64_table(&table.to_string());
-        let entry = db.entry(obj_id).or_insert_with(|| AtomicU64::new(0));
-        let new_val = if amount.is_negative() {
-            let abs_amount = amount.wrapping_abs() as u64;
-            entry.fetch_sub(abs_amount, Ordering::Relaxed)
-                 .saturating_sub(abs_amount)
-        } else {
-            let abs_amount = amount as u64;
-            entry.fetch_add(abs_amount, Ordering::Relaxed)
-                 .saturating_add(abs_amount)
-        };
-        Ok(new_val)
-    }
-
     async fn db_set_u64_value(&self, table: &InMemoryTableIdentifier, obj_id: u64, value: u64) -> anyhow::Result<()> {
         let db = self.get_or_create_u64_table(&table.to_string());
         db.entry(obj_id).or_insert_with(|| AtomicU64::new(0)).store(value, Ordering::Relaxed);
@@ -616,6 +601,57 @@ where
 }
 
 impl<Hash, Hasher> CoreDatabaseU64Store<InMemoryTableIdentifier> for InMemoryCoreStore<Hash, Hasher>
+where
+    Hash: QHashBase,
+    Hasher: MerkleZeroHasher<Hash> + Send + Sync,
+{
+}
+
+
+
+
+
+
+#[async_trait]
+impl<Hash, Hasher> CoreDatabaseU64CounterReader<InMemoryTableIdentifier> for InMemoryCoreStore<Hash, Hasher>
+where
+    Hash: QHashBase,
+    Hasher: MerkleZeroHasher<Hash> + Send + Sync,
+{
+    async fn db_select_u64_counter_value(&self, table: &InMemoryTableIdentifier, obj_id: u64) -> anyhow::Result<Option<u64>> {
+        let db = self.get_or_create_u64_table(&table.to_string());
+        Ok(db.get(&obj_id).map(|v| v.load(Ordering::Relaxed)))
+    }
+
+    async fn db_select_u64_counter_values(&self, table: &InMemoryTableIdentifier, obj_ids: &[u64]) -> anyhow::Result<Vec<Option<u64>>> {
+        let futures = obj_ids.iter().map(|&id| self.db_select_u64_counter_value(table, id));
+        future::try_join_all(futures).await
+    }
+}
+
+#[async_trait]
+impl<Hash, Hasher> CoreDatabaseU64CounterWriter<InMemoryTableIdentifier> for InMemoryCoreStore<Hash, Hasher>
+where
+    Hash: QHashBase,
+    Hasher: MerkleZeroHasher<Hash> + Send + Sync,
+{
+    async fn db_inc_u64_counter(&self, table: &InMemoryTableIdentifier, obj_id: u64, amount: i64) -> anyhow::Result<u64> {
+        let db = self.get_or_create_u64_table(&table.to_string());
+        let entry = db.entry(obj_id).or_insert_with(|| AtomicU64::new(0));
+        let new_val = if amount.is_negative() {
+            let abs_amount = amount.wrapping_abs() as u64;
+            entry.fetch_sub(abs_amount, Ordering::Relaxed)
+                 .saturating_sub(abs_amount)
+        } else {
+            let abs_amount = amount as u64;
+            entry.fetch_add(abs_amount, Ordering::Relaxed)
+                 .saturating_add(abs_amount)
+        };
+        Ok(new_val)
+    }
+}
+
+impl<Hash, Hasher> CoreDatabaseU64CounterStore<InMemoryTableIdentifier> for InMemoryCoreStore<Hash, Hasher>
 where
     Hash: QHashBase,
     Hasher: MerkleZeroHasher<Hash> + Send + Sync,

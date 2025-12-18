@@ -159,7 +159,7 @@ impl ScyllaHashToManyIdsTablePreparedStatements {
         }
         Ok(())
     }
-
+    
     pub async fn set_hash_256_to_u64_pairs_from_fast_serialized_data(&self, session: &Session, data: &[u8]) -> anyhow::Result<()> {
         if data.len() % 40 != 0 {
             anyhow::bail!(
@@ -196,9 +196,16 @@ impl ScyllaHashToManyIdsTablePreparedStatements {
                 } else {
                     full_batch.clone()
                 };
-                let group_size = if ind == num_of_batches - 1 { count_remainder } else { BATCH_SIZE };
+                
+                let group_size = if ind == num_of_batches - 1 && count_remainder != 0 { 
+                    count_remainder 
+                } else { 
+                    BATCH_SIZE 
+                };
+                
                 let start_index = ind * BATCH_SIZE * 40;
                 let end_index = start_index + group_size * 40;
+                
                 async move {
                     let rows = read_hash256_refs_and_i64s_from_buffer(&data[start_index..end_index])?;
 

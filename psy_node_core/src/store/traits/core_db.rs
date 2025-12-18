@@ -132,12 +132,29 @@ pub trait CoreDatabaseU64Reader<TableIdentifier: Clone + Send + Sync> {
 #[async_trait]
 #[auto_impl(&, Arc)]
 pub trait CoreDatabaseU64Writer<TableIdentifier: Clone + Send + Sync> {
-    async fn db_inc_counter(&self, table: &TableIdentifier, obj_id: u64, amount: i64) -> anyhow::Result<u64>;
     async fn db_set_u64_value(&self, table: &TableIdentifier, obj_id: u64, value: u64) -> anyhow::Result<()>;
     async fn db_set_many_u64_values(&self, table: &TableIdentifier, rows: &[QPDPair<u64, u64>]) -> anyhow::Result<()>;
 }
 pub trait CoreDatabaseU64Store<TableIdentifier: Clone + Send + Sync>:
     CoreDatabaseU64Reader<TableIdentifier> + CoreDatabaseU64Writer<TableIdentifier>
+{
+}
+
+
+#[async_trait]
+#[auto_impl(&, Arc)]
+pub trait CoreDatabaseU64CounterReader<TableIdentifier: Clone + Send + Sync> {
+    async fn db_select_u64_counter_value(&self, table: &TableIdentifier, obj_id: u64) -> anyhow::Result<Option<u64>>;
+    async fn db_select_u64_counter_values(&self, table: &TableIdentifier, obj_ids: &[u64]) -> anyhow::Result<Vec<Option<u64>>>;
+}
+
+#[async_trait]
+#[auto_impl(&, Arc)]
+pub trait CoreDatabaseU64CounterWriter<TableIdentifier: Clone + Send + Sync> {
+    async fn db_inc_u64_counter(&self, table: &TableIdentifier, obj_id: u64, amount: i64) -> anyhow::Result<u64>;
+}
+pub trait CoreDatabaseU64CounterStore<TableIdentifier: Clone + Send + Sync>:
+    CoreDatabaseU64CounterReader<TableIdentifier> + CoreDatabaseU64CounterWriter<TableIdentifier>
 {
 }
 
@@ -775,6 +792,7 @@ pub trait CoreDatabaseReader<
     BiDirectionalMappingTableIdentifier: Clone + Send + Sync,
     BiDirectionalU64U128MappingTableIdentifier: Clone + Send + Sync,
     U64TableIdentifier: Clone + Send + Sync,
+    U64CounterTableIdentifier: Clone + Send + Sync,
     SingleIdTableIdentifier: Clone + Send + Sync,
     DoubleIdTableIdentifier: Clone + Send + Sync,
     KivTableIdentifier: Clone + Send + Sync,
@@ -787,6 +805,7 @@ pub trait CoreDatabaseReader<
     CoreDatabaseBidirectionalMappingReader<BiDirectionalMappingTableIdentifier>
     + CoreDatabaseBidirectionalU64U128MappingReader<BiDirectionalU64U128MappingTableIdentifier>
     + CoreDatabaseU64Reader<U64TableIdentifier>
+    + CoreDatabaseU64CounterReader<U64CounterTableIdentifier>
     + CoreDatabaseSingleIdCheckpointedReader<SingleIdTableIdentifier>
     + CoreDatabaseDoubleIdCheckpointedReader<DoubleIdTableIdentifier>
     + CoreDatabaseKivReader<KivTableIdentifier>
@@ -803,6 +822,7 @@ impl<
         BiDirectionalMappingTableIdentifier: Clone + Send + Sync,
         BiDirectionalU64U128MappingTableIdentifier: Clone + Send + Sync,
         U64TableIdentifier: Clone + Send + Sync,
+        U64CounterTableIdentifier: Clone + Send + Sync,
         SingleIdTableIdentifier: Clone + Send + Sync,
         DoubleIdTableIdentifier: Clone + Send + Sync,
         KivTableIdentifier: Clone + Send + Sync,
@@ -814,6 +834,7 @@ impl<
         T: CoreDatabaseBidirectionalMappingReader<BiDirectionalMappingTableIdentifier>
             + CoreDatabaseBidirectionalU64U128MappingReader<BiDirectionalU64U128MappingTableIdentifier>
             + CoreDatabaseU64Reader<U64TableIdentifier>
+            + CoreDatabaseU64CounterReader<U64CounterTableIdentifier>
             + CoreDatabaseSingleIdCheckpointedReader<SingleIdTableIdentifier>
             + CoreDatabaseDoubleIdCheckpointedReader<DoubleIdTableIdentifier>
             + CoreDatabaseKivReader<KivTableIdentifier>
@@ -829,6 +850,7 @@ impl<
         BiDirectionalMappingTableIdentifier,
         BiDirectionalU64U128MappingTableIdentifier,
         U64TableIdentifier,
+        U64CounterTableIdentifier,
         SingleIdTableIdentifier,
         DoubleIdTableIdentifier,
         KivTableIdentifier,
@@ -847,6 +869,7 @@ pub trait CoreDatabaseWriter<
     BiDirectionalMappingTableIdentifier: Clone + Send + Sync,
     BiDirectionalU64U128MappingTableIdentifier: Clone + Send + Sync,
     U64TableIdentifier: Clone + Send + Sync,
+    U64CounterTableIdentifier: Clone + Send + Sync,
     SingleIdTableIdentifier: Clone + Send + Sync,
     DoubleIdTableIdentifier: Clone + Send + Sync,
     KivTableIdentifier: Clone + Send + Sync,
@@ -859,6 +882,7 @@ pub trait CoreDatabaseWriter<
     CoreDatabaseBidirectionalMappingWriter<BiDirectionalMappingTableIdentifier>
     + CoreDatabaseBidirectionalU64U128MappingWriter<BiDirectionalU64U128MappingTableIdentifier>
     + CoreDatabaseU64Writer<U64TableIdentifier>
+    + CoreDatabaseU64CounterWriter<U64CounterTableIdentifier>
     + CoreDatabaseSingleIdCheckpointedWriter<SingleIdTableIdentifier>
     + CoreDatabaseDoubleIdCheckpointedWriter<DoubleIdTableIdentifier>
     + CoreDatabaseKivWriter<KivTableIdentifier>
@@ -875,6 +899,7 @@ impl<
         BiDirectionalMappingTableIdentifier: Clone + Send + Sync,
         BiDirectionalU64U128MappingTableIdentifier: Clone + Send + Sync,
         U64TableIdentifier: Clone + Send + Sync,
+        U64CounterTableIdentifier: Clone + Send + Sync,
         SingleIdTableIdentifier: Clone + Send + Sync,
         DoubleIdTableIdentifier: Clone + Send + Sync,
         KivTableIdentifier: Clone + Send + Sync,
@@ -886,6 +911,7 @@ impl<
         T: CoreDatabaseBidirectionalMappingWriter<BiDirectionalMappingTableIdentifier>
             + CoreDatabaseBidirectionalU64U128MappingWriter<BiDirectionalU64U128MappingTableIdentifier>
             + CoreDatabaseU64Writer<U64TableIdentifier>
+            + CoreDatabaseU64CounterWriter<U64CounterTableIdentifier>
             + CoreDatabaseSingleIdCheckpointedWriter<SingleIdTableIdentifier>
             + CoreDatabaseDoubleIdCheckpointedWriter<DoubleIdTableIdentifier>
             + CoreDatabaseKivWriter<KivTableIdentifier>
@@ -901,6 +927,7 @@ impl<
         BiDirectionalMappingTableIdentifier,
         BiDirectionalU64U128MappingTableIdentifier,
         U64TableIdentifier,
+        U64CounterTableIdentifier,
         SingleIdTableIdentifier,
         DoubleIdTableIdentifier,
         KivTableIdentifier,
@@ -917,6 +944,7 @@ pub trait CoreDatabaseTableConfig: Copy + Send + Sync + Clone + Sized {
     type BiDirectionalMappingTableIdentifier: Clone + Send + Sync;
     type BiDirectionalU64U128MappingTableIdentifier: Clone + Send + Sync;
     type U64TableIdentifier: Clone + Send + Sync;
+    type U64CounterTableIdentifier: Clone + Send + Sync;
     type SingleIdTableIdentifier: Clone + Send + Sync;
     type DoubleIdTableIdentifier: Clone + Send + Sync;
     type KivTableIdentifier: Clone + Send + Sync;
@@ -937,6 +965,7 @@ pub trait CoreDatabaseStoreComboImpl<
         T::BiDirectionalMappingTableIdentifier,
         T::BiDirectionalU64U128MappingTableIdentifier,
         T::U64TableIdentifier,
+        T::U64CounterTableIdentifier,
         T::SingleIdTableIdentifier,
         T::DoubleIdTableIdentifier,
         T::KivTableIdentifier,
@@ -972,6 +1001,7 @@ pub trait CoreDatabaseStore<
     BiDirectionalMappingTableIdentifier: Clone + Send + Sync,
     BiDirectionalU64U128MappingTableIdentifier: Clone + Send + Sync,
     U64TableIdentifier: Clone + Send + Sync,
+    U64CounterTableIdentifier: Clone + Send + Sync,
     SingleIdTableIdentifier: Clone + Send + Sync,
     DoubleIdTableIdentifier: Clone + Send + Sync,
     KivTableIdentifier: Clone + Send + Sync,
@@ -987,6 +1017,7 @@ pub trait CoreDatabaseStore<
         BiDirectionalMappingTableIdentifier,
         BiDirectionalU64U128MappingTableIdentifier,
         U64TableIdentifier,
+        U64CounterTableIdentifier,
         SingleIdTableIdentifier,
         DoubleIdTableIdentifier,
         KivTableIdentifier,
@@ -1001,6 +1032,7 @@ pub trait CoreDatabaseStore<
         BiDirectionalMappingTableIdentifier,
         BiDirectionalU64U128MappingTableIdentifier,
         U64TableIdentifier,
+        U64CounterTableIdentifier,
         SingleIdTableIdentifier,
         DoubleIdTableIdentifier,
         KivTableIdentifier,
@@ -1018,6 +1050,7 @@ impl<
         BiDirectionalMappingTableIdentifier: Clone + Send + Sync,
         BiDirectionalU64U128MappingTableIdentifier: Clone + Send + Sync,
         U64TableIdentifier: Clone + Send + Sync,
+        U64CounterTableIdentifier: Clone + Send + Sync,
         SingleIdTableIdentifier: Clone + Send + Sync,
         DoubleIdTableIdentifier: Clone + Send + Sync,
         KivTableIdentifier: Clone + Send + Sync,
@@ -1032,6 +1065,7 @@ impl<
                 BiDirectionalMappingTableIdentifier,
                 BiDirectionalU64U128MappingTableIdentifier,
                 U64TableIdentifier,
+                U64CounterTableIdentifier,
                 SingleIdTableIdentifier,
                 DoubleIdTableIdentifier,
                 KivTableIdentifier,
@@ -1046,6 +1080,7 @@ impl<
                 BiDirectionalMappingTableIdentifier,
                 BiDirectionalU64U128MappingTableIdentifier,
                 U64TableIdentifier,
+                U64CounterTableIdentifier,
                 SingleIdTableIdentifier,
                 DoubleIdTableIdentifier,
                 KivTableIdentifier,
@@ -1062,6 +1097,7 @@ impl<
         BiDirectionalMappingTableIdentifier,
         BiDirectionalU64U128MappingTableIdentifier,
         U64TableIdentifier,
+        U64CounterTableIdentifier,
         SingleIdTableIdentifier,
         DoubleIdTableIdentifier,
         KivTableIdentifier,

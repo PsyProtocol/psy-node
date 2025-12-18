@@ -66,6 +66,9 @@ impl<
     async fn df_get_contract_state_tree_nodes(&self, checkpoint_id: u64, node_keys: Vec<QMerkleStoreDoubleIdKey>) -> anyhow::Result<Vec<N::QHash>> {
         self.rc.df_get_contract_state_tree_nodes(checkpoint_id, node_keys).await
     }
+        async fn df_get_user_leaves_batch(&self, checkpoint_id: u64, user_ids: Vec<u64>) -> anyhow::Result<Vec<PQEDUserLeaf<N::F, N::QHash>>>{
+        self.rc.df_get_user_leaves_batch(checkpoint_id, user_ids).await
+        }
     async fn df_get_contract_state_tree_merkle_proof(
         &self,
         checkpoint_id: u64,
@@ -92,6 +95,9 @@ impl<
         RC: PsyUserContractDataFetcher<N::F, N::QHash> + Send + Sync + 'static,
     > PsyCoordinatorFetcher<N::QHash> for PsyDummyComboAPIFetcher<N, CC, RC>
 {
+    async fn cf_get_user_public_key_hashes(&self, user_ids: &[u64]) -> anyhow::Result<Vec<N::QHash>> {
+        self.cc.cf_get_user_public_key_hashes(user_ids).await
+    }
     async fn cf_get_user_public_key(&self, user_id: u64) -> anyhow::Result<PZKPublicKeyInfo<N::QHash>> {
         self.cc.cf_get_user_public_key(user_id).await
     }
@@ -104,6 +110,8 @@ pub fn new_combo_fetcher_from_urls<N: QNetworkTypesConfig + 'static>(
     coordinator_api_url: &str,
     realm_api_url: &str,
 ) -> anyhow::Result<PsyDummyComboAPIFetcher<N, PsyCoordinatorAPIFetcher<N, HttpClient>, PsyRealmAPIUserContractDataFetcher<N, HttpClient>>> {
+    println!("coordinator api url: {}", coordinator_api_url);
+    println!("realm api url: {}", realm_api_url);
     let cc = new_coordinator_fetcher_from_url::<N>(coordinator_api_url)?;
     let rc = new_contract_data_fetcher_from_url::<N>(realm_api_url)?;
     Ok(PsyDummyComboAPIFetcher::new(cc, rc))

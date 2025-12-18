@@ -105,8 +105,8 @@ impl<C: JTMBCircuitConfig> VerifyAggUserRegistartionDeployContractsGUTACircuit<C
         guta_rewards: C::Hash,
 
     ) -> anyhow::Result<PsyTestJTMBProof<C::Hash>> {
-        println!("input guta header: {:#?}", guta_proof_header);
-        println!("input guta rewards: {:?}", guta_rewards);
+        //println!("input guta header: {:#?}", guta_proof_header);
+        //println!("input guta rewards: {:?}", guta_rewards);
         
         // 1. Verify Register Users
         let reg_whitelist = C::Hasher::two_to_one(&self.user_reg_transition_circuit_config.leaf_fingerprint, &self.user_reg_transition_circuit_config.aggregator_fingerprint);

@@ -6,29 +6,60 @@ use parth_core::protocol::core_types::{Q256BitHash, QNetworkTypesConfig};
 use psy_api_core::{coordinator::standard_edge_rpc::CoordinatorEdgeRpcClient, realm::standard_edge_rpc::RealmEdgeRpcClient};
 use rand::{Rng, RngCore};
 
-use crate::{api::{combo_dummy_fetcher::{PsyDummyComboAPIFetcher, new_combo_fetcher_from_urls}, coordinator_fetcher::PsyCoordinatorAPIFetcher, data_fetcher::{PsyRealmAPIUserContractDataFetcher, PsyUserContractDataFetcher}}, dummy_ups_state::state::DummyUPSStateBuilder, traits::{DummyUPSEndCapProverHelper, DummyUPSProver}};
+use crate::{
+    api::{
+        combo_dummy_fetcher::{new_combo_fetcher_from_urls, PsyDummyComboAPIFetcher},
+        coordinator_fetcher::PsyCoordinatorAPIFetcher,
+        data_fetcher::{PsyRealmAPIUserContractDataFetcher, PsyUserContractDataFetcher},
+    },
+    dummy_ups_state::state::DummyUPSStateBuilder,
+    traits::{DummyUPSEndCapProverHelper, DummyUPSProver},
+};
 
 #[derive(Clone)]
-pub struct PsyUPSDummyProverHelper<N: QNetworkTypesConfig + 'static, RC: RealmEdgeRpcClient<N::F, N::QHash, N::JobId, N::ZKProof>+ Send + Sync + 'static,CC: CoordinatorEdgeRpcClient<N::F, N::QHash, N::JobId, N::ZKProof> + Send + Sync + 'static, Prover: DummyUPSProver<N::F, N::QHash>> {
+pub struct PsyUPSDummyProverHelper<
+    N: QNetworkTypesConfig + 'static,
+    RC: RealmEdgeRpcClient<N::F, N::QHash, N::JobId, N::ZKProof> + Send + Sync + 'static,
+    CC: CoordinatorEdgeRpcClient<N::F, N::QHash, N::JobId, N::ZKProof> + Send + Sync + 'static,
+    Prover: DummyUPSProver<N::F, N::QHash>,
+> {
     pub client: Arc<PsyDummyComboAPIFetcher<N, PsyCoordinatorAPIFetcher<N, CC>, PsyRealmAPIUserContractDataFetcher<N, RC>>>,
     pub prover: Prover,
     pub known_contract_state_heights: Vec<(u64, u8)>,
 }
 
-impl<N: QNetworkTypesConfig + 'static, RC: RealmEdgeRpcClient<N::F, N::QHash, N::JobId, N::ZKProof>+ Send + Sync + 'static, CC: CoordinatorEdgeRpcClient<N::F, N::QHash, N::JobId, N::ZKProof> + Send + Sync + 'static, Prover: DummyUPSProver<N::F, N::QHash>> PsyUPSDummyProverHelper<N, RC, CC, Prover> {
-    pub fn new(client: PsyDummyComboAPIFetcher<N, PsyCoordinatorAPIFetcher<N, CC>, PsyRealmAPIUserContractDataFetcher<N, RC>>, prover: Prover) -> Self {
-        Self { client: Arc::new(client), prover, known_contract_state_heights: Vec::new() }
+impl<
+        N: QNetworkTypesConfig + 'static,
+        RC: RealmEdgeRpcClient<N::F, N::QHash, N::JobId, N::ZKProof> + Send + Sync + 'static,
+        CC: CoordinatorEdgeRpcClient<N::F, N::QHash, N::JobId, N::ZKProof> + Send + Sync + 'static,
+        Prover: DummyUPSProver<N::F, N::QHash>,
+    > PsyUPSDummyProverHelper<N, RC, CC, Prover>
+{
+    pub fn new(
+        client: PsyDummyComboAPIFetcher<N, PsyCoordinatorAPIFetcher<N, CC>, PsyRealmAPIUserContractDataFetcher<N, RC>>,
+        prover: Prover,
+    ) -> Self {
+        Self {
+            client: Arc::new(client),
+            prover,
+            known_contract_state_heights: Vec::new(),
+        }
     }
 }
-impl<N: QNetworkTypesConfig + 'static, RC: RealmEdgeRpcClient<N::F, N::QHash, N::JobId, N::ZKProof>+ Send + Sync + 'static, CC: CoordinatorEdgeRpcClient<N::F, N::QHash, N::JobId, N::ZKProof> + Send + Sync + 'static, Prover: DummyUPSProver<N::F, N::QHash> + Send + Sync> PsyUPSDummyProverHelper<N, RC, CC, Prover> {
-
+impl<
+        N: QNetworkTypesConfig + 'static,
+        RC: RealmEdgeRpcClient<N::F, N::QHash, N::JobId, N::ZKProof> + Send + Sync + 'static,
+        CC: CoordinatorEdgeRpcClient<N::F, N::QHash, N::JobId, N::ZKProof> + Send + Sync + 'static,
+        Prover: DummyUPSProver<N::F, N::QHash> + Send + Sync,
+    > PsyUPSDummyProverHelper<N, RC, CC, Prover>
+{
     pub async fn query_contract_state_heights(&mut self, min_contract_id: u64, max_contract_id: u64) -> anyhow::Result<()> {
         let ids = (min_contract_id..=max_contract_id).collect();
         let heights: Vec<u8> = self.client.df_get_contract_state_heights(u64::MAX, ids).await?;
 
         self.known_contract_state_heights.clear();
 
-        heights.iter().zip(min_contract_id..).for_each(|( height, contract_id)| {
+        heights.iter().zip(min_contract_id..).for_each(|(height, contract_id)| {
             if *height > 0 {
                 self.known_contract_state_heights.push((contract_id, *height));
             }
@@ -40,7 +71,12 @@ impl<N: QNetworkTypesConfig + 'static, RC: RealmEdgeRpcClient<N::F, N::QHash, N:
         rand::thread_rng().fill_bytes(&mut bytes);
         N::QHash::from_owned_32bytes(bytes)
     }
-    pub async fn plan_random_contract_calls(&self, max_contract_calls: u32, max_updates_per_call: u32, min_updates_per_call: u32) -> anyhow::Result<Vec<(u32, u64, N::QHash)>> {
+    pub async fn plan_random_contract_calls(
+        &self,
+        max_contract_calls: u32,
+        max_updates_per_call: u32,
+        min_updates_per_call: u32,
+    ) -> anyhow::Result<Vec<(u32, u64, N::QHash)>> {
         // If no contracts exist, return empty vec instead of panicking
         if self.known_contract_state_heights.is_empty() {
             println!("No contracts available yet, skipping contract calls");
@@ -51,14 +87,17 @@ impl<N: QNetworkTypesConfig + 'static, RC: RealmEdgeRpcClient<N::F, N::QHash, N:
         let mut planned_calls = Vec::new();
         //println!("known contracts: {:?}", self.known_contract_state_heights);
 
-        //print!("max_contract_calls: {}, num_contract_calls: {}\n", max_contract_calls, num_contract_calls);
-        //println!("max_updates_per_call: {}, min_updates_per_call: {}", max_updates_per_call, min_updates_per_call);
+        //print!("max_contract_calls: {}, num_contract_calls: {}\n",
+        // max_contract_calls, num_contract_calls);
+        // println!("max_updates_per_call: {}, min_updates_per_call: {}",
+        // max_updates_per_call, min_updates_per_call);
 
         for _ in 0..num_contract_calls {
             let contract_index = rand::thread_rng().gen_range(0..self.known_contract_state_heights.len());
             let (contract_id, contract_height) = self.known_contract_state_heights[contract_index];
             let num_updates = rand::thread_rng().gen_range(min_updates_per_call..=max_updates_per_call);
-            //println!("contract_height: {}, contract_id: {}, num_updates: {}", contract_height, contract_id, num_updates);
+            //println!("contract_height: {}, contract_id: {}, num_updates: {}",
+            // contract_height, contract_id, num_updates);
             for _ in 0..num_updates {
                 let slot_index = rand::thread_rng().gen_range(0..(1u64 << contract_height));
                 let value = Self::rand_hash();
@@ -67,15 +106,20 @@ impl<N: QNetworkTypesConfig + 'static, RC: RealmEdgeRpcClient<N::F, N::QHash, N:
         }
         Ok(planned_calls)
     }
-    pub async fn prove_random_contract_calls_and_submit(&self, user_id: u64, max_contract_calls: u32, max_updates_per_call: u32, min_updates_per_call: u32) -> anyhow::Result<()> {
-        let calls = self.plan_random_contract_calls(max_contract_calls, max_updates_per_call, min_updates_per_call).await?;
+    pub async fn prove_random_contract_calls_and_submit(
+        &self,
+        user_id: u64,
+        max_contract_calls: u32,
+        max_updates_per_call: u32,
+        min_updates_per_call: u32,
+    ) -> anyhow::Result<()> {
+        let calls = self
+            .plan_random_contract_calls(max_contract_calls, max_updates_per_call, min_updates_per_call)
+            .await?;
         self.generate_proof_for_updates_and_submit(user_id, &calls).await
     }
 }
-pub fn create_dummy_prover_helper<
-    N: QNetworkTypesConfig + 'static,
-    Prover: DummyUPSProver<N::F, N::QHash>,
->(
+pub fn create_dummy_prover_helper<N: QNetworkTypesConfig + 'static, Prover: DummyUPSProver<N::F, N::QHash>>(
     coordinator_api_url: &str,
     realm_api_url: &str,
 
@@ -85,15 +129,15 @@ pub fn create_dummy_prover_helper<
 
     Ok(PsyUPSDummyProverHelper::new(client, prover))
 }
-
-
 #[async_trait]
-impl<N: QNetworkTypesConfig + 'static, RC: RealmEdgeRpcClient<N::F, N::QHash, N::JobId, N::ZKProof>+ Send + Sync + 'static, CC: CoordinatorEdgeRpcClient<N::F, N::QHash, N::JobId, N::ZKProof> + Send + Sync + 'static, Prover: DummyUPSProver<N::F, N::QHash> + Send + Sync> DummyUPSEndCapProverHelper<N::F, N::QHash> for PsyUPSDummyProverHelper<N, RC, CC, Prover> {
-    async fn generate_proof_for_updates_and_submit(
-        &self,
-        user_id: u64,
-        updates: &[(u32, u64, N::QHash)],
-    ) -> anyhow::Result<()> {
+impl<
+        N: QNetworkTypesConfig + 'static,
+        RC: RealmEdgeRpcClient<N::F, N::QHash, N::JobId, N::ZKProof> + Send + Sync + 'static,
+        CC: CoordinatorEdgeRpcClient<N::F, N::QHash, N::JobId, N::ZKProof> + Send + Sync + 'static,
+        Prover: DummyUPSProver<N::F, N::QHash> + Send + Sync,
+    > DummyUPSEndCapProverHelper<N::F, N::QHash> for PsyUPSDummyProverHelper<N, RC, CC, Prover>
+{
+    async fn generate_proof_for_updates_and_submit(&self, user_id: u64, updates: &[(u32, u64, N::QHash)]) -> anyhow::Result<()> {
         if updates.is_empty() {
             println!("No updates to prove, skipping submission");
             return Ok(());
@@ -103,11 +147,17 @@ impl<N: QNetworkTypesConfig + 'static, RC: RealmEdgeRpcClient<N::F, N::QHash, N:
 
         println!("Generating proof for user_id: {}, checkpoint_id: {}", user_id, checkpoint_id);
 
-    let mut state_builder = DummyUPSStateBuilder::<N::F, N::QHash, _, N::HasherBase>::new_init(self.client.clone(), N::GLOBAL_CONTRACT_TREE_HEIGHT, user_id, checkpoint_id).await?;
+        let mut state_builder = DummyUPSStateBuilder::<N::F, N::QHash, _, N::HasherBase>::new_init(
+            self.client.clone(),
+            N::GLOBAL_CONTRACT_TREE_HEIGHT,
+            user_id,
+            checkpoint_id,
+        )
+        .await?;
 
-    for call in updates {
-        state_builder.write_to_contract(call.0, call.1, call.2).await?;
-    }
+        for call in updates {
+            state_builder.write_to_contract(call.0, call.1, call.2).await?;
+        }
 
         let finalized = state_builder.finalize_and_build().await?;
         println!("finalized state built for user_id: {}, checkpoint_id: {}", user_id, checkpoint_id);

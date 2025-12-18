@@ -60,6 +60,8 @@ fn get_time_text(duration: Duration) -> String {
 /// ```
 pub struct DebugTimer {
     #[cfg(not(target_arch = "wasm32"))]
+    init_time: Instant,
+    #[cfg(not(target_arch = "wasm32"))]
     start_time: Instant,
     name: String,
 }
@@ -68,8 +70,10 @@ pub struct DebugTimer {
 impl DebugTimer {
     /// Creates a new `DebugTimer` with a given name and starts the timer.
     pub fn new(name: &str) -> Self {
+        let start_time = Instant::now();
         Self {
-            start_time: Instant::now(),
+            init_time: start_time,
+            start_time,
             name: name.to_string(),
         }
     }
@@ -204,6 +208,14 @@ impl DebugTimer {
     ) -> (Duration, Duration) {
         self.lap_batch(&event_name, item_type, batch_size)
     }
+    pub fn lap_group(&mut self, event_name: &str) -> u64 {
+        let elapsed = self.init_time.elapsed();
+        self.print_lap(&format!("total time {}", event_name), elapsed);
+        let time = Instant::now();
+        self.start_time = time;
+        self.init_time = time;
+        elapsed.as_millis() as u64
+    }
 }
 
 // Dummy struct and functions for wasm32 to allow code to compile.
@@ -212,6 +224,53 @@ impl DebugTimer {
     pub fn new(_name: &str) -> Self { Self }
     pub fn lap(&mut self, _event_name: &str) -> u64 { 0 }
     pub fn lap_micros(&mut self, _event_name: &str) -> u128 { 0 }
+    pub fn event(&mut self, _event_name: String) -> u64 { 0 }
+    pub fn event_micros(&mut self, _event_name: String) -> u128 { 0 }
+    pub fn lap_group(&mut self, _event_name: &str) -> u64 { 0 }
+    pub fn event_batch(
+        &mut self,
+        _event_name: String,
+        _item_type: String,
+        _batch_size: usize,
+    ) -> (Duration, Duration) {
+        (Duration::new(0,0), Duration::new(0,0))
+    }
+    pub fn event_batch_event_ref(
+        &mut self,
+        _event_name: &str,
+        _item_type: String,
+        _batch_size: usize,
+    ) -> (Duration, Duration) {
+        (Duration::new(0,0), Duration::new(0,0))
+    }
+    pub fn event_batch_item_ref(
+        &mut self,
+        _event_name: String,
+        _item_type: &str,
+        _batch_size: usize,
+    ) -> (Duration, Duration) {
+        (Duration::new(0,0), Duration::new(0,0))
+    }
+    pub fn event_batch_ref(
+        &mut self,
+        _event_name: &str,
+        _item_type: &str,
+        _batch_size: usize,
+    ) -> (Duration, Duration) {
+        (Duration::new(0,0), Duration::new(0,0))
+    }
+    pub fn lap_micros_batch(&mut self, _event_name: &str, _item_type: &str, _batch_size: usize) -> (Duration, Duration) {
+        (Duration::new(0,0), Duration::new(0,0))
+    }
+    pub fn event_micros_batch(&mut self, _event_name: &str, _item_type: &str, _batch_size: usize) -> (Duration, Duration) {
+        (Duration::new(0,0), Duration::new(0,0))
+    }
+    pub fn lap_batch_micros(&mut self, _event_name: &str, _item_type: &str, _batch_size: usize) -> (Duration, Duration) {
+        (Duration::new(0,0), Duration::new(0,0))
+    }
+    pub fn event_batch_micros(&mut self, _event_name: &str, _item_type: &str, _batch_size: usize) -> (Duration, Duration) {
+        (Duration::new(0,0), Duration::new(0,0))
+    }
     pub fn lap_batch(&mut self, _event_name: &str, _item_type: &str, _batch_size: usize) -> (Duration, Duration) {
         (Duration::new(0,0), Duration::new(0,0))
     }

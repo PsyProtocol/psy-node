@@ -4,15 +4,13 @@ use std::{
 };
 
 use async_nats::{
-    jetstream::{
-        self,
-        consumer::{pull::Config as PullConfig, PullConsumer},
-        kv::Store,
-    },
-    Subject, ToServerAddrs,
+    Subject, ToServerAddrs, jetstream::{
+        self, consumer::{PullConsumer, pull::Config as PullConfig}, kv::Store
+    }
 };
 use async_trait::async_trait;
 use bytes::Bytes;
+use cf_utils::timer::DebugTimer;
 use futures::{future::try_join_all, stream::StreamExt};
 use parth_core::{
     data::queue::queue_key::{PCoreQueueItemBase, PCoreStandardQueueKeyForRealm, QPBaseQueueType},
@@ -434,17 +432,23 @@ impl NatsJetStreamClient {
         subject: &str,
         durable_name: &str,
     ) -> anyhow::Result<Option<QK::QueueItem>> {
+
+        let mut timer = DebugTimer::new("get_next_worker_queue_item_or_none");
+
         self.ensure_stream().await?;
 
+        timer.lap("ensure_stream");
         self.ensure_consumer(subject, durable_name, queue_key.get_queue_type()).await?;
+        timer.lap("ensure_consumer");
         /*tracing::info!("Getting message for worker queue, subject: {}, durable_name: {}", subject, durable_name);*/
         let consumer: PullConsumer = self
             .jetstream
             .get_consumer_from_stream::<PullConfig, _, _>(&durable_name, &self.stream_name)
             .await?;
-
+        timer.lap("get_consumer_from_stream");
         let request = consumer.fetch().max_messages(1);
         let mut messages = request.messages().await?;
+        timer.lap("consumer.fetch.messages");
 
         let base_queue_type = queue_key.get_queue_type();
         if base_queue_type != QPBaseQueueType::WorkerQueue {
@@ -452,6 +456,7 @@ impl NatsJetStreamClient {
         }
 
         if let Some(Ok(jet_msg)) = messages.next().await {
+            timer.lap("messages.next()");
             let job = QK::QueueItem::decode_queue_item_ref(jet_msg.payload.as_ref())?;
             let kv_key = format!("{}.{}", subject, hex::encode(job.get_restorable_job_id()));
             /*tracing::info!(
@@ -464,8 +469,11 @@ impl NatsJetStreamClient {
             self.kv
                 .put(&kv_key, Bytes::copy_from_slice(jet_msg.reply.as_deref().unwrap().as_bytes()))
                 .await?;
+
+            timer.lap("kv.put");
             Ok(Some(job))
         } else {
+            timer.lap("messages.next()");
             //tracing::info!("No messages in worker queue found, subject: {}, durable_name: {}", subject, durable_name);
 
             Ok(None)
@@ -482,8 +490,16 @@ impl NatsJetStreamClient {
                 hex::encode(report_id),
                 reply
             );
-            self.jetstream.publish(reply, Bytes::from_static(b"+ACK")).await?;
-            self.kv.delete(&kv_key).await?;
+
+            let a = self.jetstream.publish(reply.clone(), Bytes::from_static(b"+ACK"));
+            let b = self.kv.delete(&kv_key);
+            let (a,b) = tokio::join!(a, b);
+
+            a.map_err(|e| anyhow::anyhow!("Failed to ACK message: {}", e))?;
+            b.map_err(|e| anyhow::anyhow!("Failed to delete kv key: {}", e))?;
+
+
+
             return Ok(true);
         } else {
             tracing::info!(
@@ -539,7 +555,7 @@ impl NatsJetStreamClient {
             if start.elapsed() > max_wait {
                 return Err(anyhow::anyhow!("Timeout waiting for all jobs to complete"));
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 }

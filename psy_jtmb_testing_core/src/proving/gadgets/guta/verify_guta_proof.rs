@@ -49,8 +49,8 @@ pub fn verify_guta_proof<C: JTMBCircuitConfig>(
         "child proof fingerprint not found in whitelist",
     )?;
 
-    println!("input guta header: {:#?}", guta_proof_header);
-    println!("input child rewards tree value: {:?}", child_rewards_tree_value);
+    //println!("input guta header: {:#?}", guta_proof_header);
+    //println!("input child rewards tree value: {:?}", child_rewards_tree_value);
 
     // Constraint: The Child Proof's Public Inputs must match Hash(Header, Rewards)
     let guta_header_hash = guta_proof_header.qfhash::<C::Hasher>();

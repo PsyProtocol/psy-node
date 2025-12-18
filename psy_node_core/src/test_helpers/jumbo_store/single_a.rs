@@ -46,6 +46,7 @@ impl<
         BiDirectionalMappingTableIdentifier: THStandardTableIdentifier,
         BiDirectionalU64U128MappingTableIdentifier: THStandardTableIdentifier,
         U64TableIdentifier: THStandardTableIdentifier,
+        U64CounterTableIdentifier: THStandardTableIdentifier,
         SingleIdTableIdentifier: THStandardTableIdentifier,
         DoubleIdTableIdentifier: THStandardTableIdentifier,
         KivTableIdentifier: THStandardTableIdentifier,
@@ -60,6 +61,7 @@ impl<
                 BiDirectionalMappingTableIdentifier,
                 BiDirectionalU64U128MappingTableIdentifier,
                 U64TableIdentifier,
+                U64CounterTableIdentifier,
                 SingleIdTableIdentifier,
                 DoubleIdTableIdentifier,
                 KivTableIdentifier,
@@ -91,6 +93,7 @@ impl<
         BiDirectionalMappingTableIdentifier,
         BiDirectionalU64U128MappingTableIdentifier,
         U64TableIdentifier,
+        U64CounterTableIdentifier,
         SingleIdTableIdentifier,
         DoubleIdTableIdentifier,
         KivTableIdentifier,
@@ -149,6 +152,71 @@ impl<
         Ok(())
     }
 
+    pub async fn th_test_u64_counter_table_1(&self, table: &U64CounterTableIdentifier) -> anyhow::Result<()> {
+        let test_ids = vec![1u64, 2u64, 3u64, 4u64, 5u64];
+        for id in test_ids.iter() {
+            let selected = self.th_util_select_u64_counter_value(table, *id).await?;
+            assert!(selected.is_none(), "Value should not be found before insert");
+        }
+
+
+        for id in test_ids.iter() {
+            let incremented_value = self.th_util_inc_counter(table, *id, (*id * 10) as i64).await?;
+            assert!(
+                incremented_value == *id * 10,
+                "Incremented value does not match expected value"
+            );
+            let incremented_value = self.th_util_inc_counter(table, *id, 5).await?;
+            assert!(
+                incremented_value == *id * 10 + 5,
+                "Incremented value does not match expected value"
+            );
+            let selected = self.th_util_select_u64_counter_value(table, *id).await?;
+            assert!(selected.is_some(), "Value not found after increment");
+            let selected_unwrapped = selected.unwrap();
+            assert!(
+                selected_unwrapped == incremented_value,
+                "Incremented value does not match retrieved value"
+            );
+        }
+
+        for id in test_ids.iter() {
+            let current_value = self.store.db_select_u64_counter_value(table, *id).await?;
+            if current_value.is_none() || current_value.unwrap() < 3 {
+                continue;
+            }
+            let incremented_value = self.th_util_inc_counter(table, *id, -3).await?;
+            assert!(
+                incremented_value == ((*id as u64 * 10) + 5).saturating_sub(3),
+                "Decremented value does not match expected value"
+            );
+            let selected = self.store.db_select_u64_counter_value(table, *id).await?;
+            assert!(selected.is_some(), "Value not found after decrement");
+            let selected_unwrapped = selected.unwrap();
+            assert!(
+                selected_unwrapped == incremented_value,
+                "Decremented value does not match retrieved value"
+            );
+        }
+
+        // test incrementing a non-existing value
+        let non_existing_id = 999u64;
+        let incremented_value = self.th_util_inc_counter(table, non_existing_id, 7).await?;
+        assert!(
+            incremented_value == 7,
+            "Incremented value of non-existing id does not match expected value"
+        );
+        let selected = self.th_util_select_u64_counter_value(table, non_existing_id).await?;
+        assert!(selected.is_some(), "Value not found after incrementing non-existing id");
+        let selected_unwrapped = selected.unwrap();
+        assert!(
+            selected_unwrapped == incremented_value,
+            "Incremented value of non-existing id does not match retrieved value"
+        );
+        
+        Ok(())
+    }
+
     pub async fn th_test_u64_table_1(&self, table: &U64TableIdentifier) -> anyhow::Result<()> {
         let test_ids = vec![1u64, 2u64, 3u64, 4u64, 5u64];
         for id in test_ids.iter() {
@@ -173,55 +241,7 @@ impl<
             let selected_unwrapped = selected.unwrap();
             assert!(selected_unwrapped == *id as u64 * 10, "Inserted value does not match retrieved value");
         }
-
-        for id in test_ids.iter() {
-            let incremented_value = self.th_util_inc_counter(table, *id, 5).await?;
-            assert!(
-                incremented_value == (*id as u64 * 10) + 5,
-                "Incremented value does not match expected value"
-            );
-            let selected = self.th_util_select_u64_value(table, *id).await?;
-            assert!(selected.is_some(), "Value not found after increment");
-            let selected_unwrapped = selected.unwrap();
-            assert!(
-                selected_unwrapped == incremented_value,
-                "Incremented value does not match retrieved value"
-            );
-        }
-
-        for id in test_ids.iter() {
-            let current_value = self.store.db_select_u64_value(table, *id).await?;
-            if current_value.is_none() || current_value.unwrap() < 3 {
-                continue;
-            }
-            let incremented_value = self.th_util_inc_counter(table, *id, -3).await?;
-            assert!(
-                incremented_value == ((*id as u64 * 10) + 5).saturating_sub(3),
-                "Decremented value does not match expected value"
-            );
-            let selected = self.th_util_select_u64_value(table, *id).await?;
-            assert!(selected.is_some(), "Value not found after decrement");
-            let selected_unwrapped = selected.unwrap();
-            assert!(
-                selected_unwrapped == incremented_value,
-                "Decremented value does not match retrieved value"
-            );
-        }
-
-        // test incrementing a non-existing value
-        let non_existing_id = 999u64;
-        let incremented_value = self.th_util_inc_counter(table, non_existing_id, 7).await?;
-        assert!(
-            incremented_value == 7,
-            "Incremented value of non-existing id does not match expected value"
-        );
-        let selected = self.th_util_select_u64_value(table, non_existing_id).await?;
-        assert!(selected.is_some(), "Value not found after incrementing non-existing id");
-        let selected_unwrapped = selected.unwrap();
-        assert!(
-            selected_unwrapped == incremented_value,
-            "Incremented value of non-existing id does not match retrieved value"
-        );
+        
 
         // test batches
         let batch_ids = vec![10u64, 20u64, 30u64, 40u64, 50u64];

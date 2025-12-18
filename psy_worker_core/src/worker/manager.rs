@@ -1,4 +1,4 @@
-use cf_utils::log_indicator::print_cf_log_indicator;
+use cf_utils::{log_indicator::print_cf_log_indicator, timer::DebugTimer};
 
 use crate::worker::prover_trait::{PsyWorkerGenericLibraryProver, PsyWorkerJobFetcher};
 
@@ -44,7 +44,9 @@ impl<
     }
 
     pub async fn process_job(&self) -> anyhow::Result<()> {
+        let mut timer = DebugTimer::new("process_job");
         if let Some((api_url_hash, tag, job_response)) = self.job_fetcher.fetch_new_job().await? {
+            timer.lap("fetched job");
             let job_id = job_response.base.job.job_id;
             tracing::info!("Fetched new job: {:?} from API URL hash: {:?}", job_id, api_url_hash);
             let start_time = std::time::Instant::now();
@@ -53,9 +55,11 @@ impl<
                 job_response,
                 tag,
             )?;
+            timer.lap("proved job");
             let proving_time = start_time.elapsed();
             tracing::info!("Proved job: {:?} in {:?}, submitting proof to API", job_id, proving_time);
             self.job_fetcher.submit_proof_raw_to_api(api_url_hash, job_id, tag, proof).await?;
+            timer.lap("submitted proof");
             tracing::info!("Submitted proof for job: {:?} to API URL hash: {}", job_id, hex::encode(api_url_hash));
         }
         Ok(())

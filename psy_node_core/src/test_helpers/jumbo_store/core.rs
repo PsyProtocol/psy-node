@@ -31,6 +31,7 @@ pub struct QJumboStore<
     BiDirectionalMappingTableIdentifier: THStandardTableIdentifier,
     BiDirectionalU64U128MappingTableIdentifier: THStandardTableIdentifier,
     U64TableIdentifier: THStandardTableIdentifier,
+    U64CounterTableIdentifier: THStandardTableIdentifier,
     SingleIdTableIdentifier: THStandardTableIdentifier,
     DoubleIdTableIdentifier: THStandardTableIdentifier,
     KivTableIdentifier: THStandardTableIdentifier,
@@ -45,6 +46,7 @@ pub struct QJumboStore<
             BiDirectionalMappingTableIdentifier,
             BiDirectionalU64U128MappingTableIdentifier,
             U64TableIdentifier,
+            U64CounterTableIdentifier,
             SingleIdTableIdentifier,
             DoubleIdTableIdentifier,
             KivTableIdentifier,
@@ -70,6 +72,7 @@ pub struct QJumboStore<
 
     pub u64_table_a: Arc<U64TableIdentifier>,
     pub u64_table_b: Arc<U64TableIdentifier>,
+    pub u64_counter_table_a: Arc<U64CounterTableIdentifier>,
     pub u64_u128_bi_directional_mapping_table_a: Arc<BiDirectionalU64U128MappingTableIdentifier>,
     pub u64_u128_bi_directional_mapping_table_b: Arc<BiDirectionalU64U128MappingTableIdentifier>,
     // start trees
@@ -124,6 +127,7 @@ impl<
         BiDirectionalMappingTableIdentifier: THStandardTableIdentifier,
         BiDirectionalU64U128MappingTableIdentifier: THStandardTableIdentifier,
         U64TableIdentifier: THStandardTableIdentifier,
+        U64CounterTableIdentifier: THStandardTableIdentifier,
         SingleIdTableIdentifier: THStandardTableIdentifier,
         DoubleIdTableIdentifier: THStandardTableIdentifier,
         KivTableIdentifier: THStandardTableIdentifier,
@@ -138,6 +142,7 @@ impl<
                 BiDirectionalMappingTableIdentifier,
                 BiDirectionalU64U128MappingTableIdentifier,
                 U64TableIdentifier,
+                U64CounterTableIdentifier,
                 SingleIdTableIdentifier,
                 DoubleIdTableIdentifier,
                 KivTableIdentifier,
@@ -170,6 +175,7 @@ impl<
         BiDirectionalMappingTableIdentifier,
         BiDirectionalU64U128MappingTableIdentifier,
         U64TableIdentifier,
+        U64CounterTableIdentifier,
         SingleIdTableIdentifier,
         DoubleIdTableIdentifier,
         KivTableIdentifier,
@@ -196,6 +202,7 @@ impl<
 
         u64_table_a: Arc<U64TableIdentifier>,
         u64_table_b: Arc<U64TableIdentifier>,
+        u64_counter_table_a: Arc<U64CounterTableIdentifier>,
         u64_u128_bi_directional_mapping_table_a: Arc<BiDirectionalU64U128MappingTableIdentifier>,
         u64_u128_bi_directional_mapping_table_b: Arc<BiDirectionalU64U128MappingTableIdentifier>,
         // start trees
@@ -223,6 +230,7 @@ impl<
             obj_double_id_table_b,
             u64_table_a,
             u64_table_b,
+            u64_counter_table_a,
             u64_u128_bi_directional_mapping_table_a,
             u64_u128_bi_directional_mapping_table_b,
             merkle_node_zero_id_table_a,

@@ -1,5 +1,4 @@
-use parth_common::memory_stores::traits::PsyMemoryMerkleStoreAppendOnlyReaderBase;
-use parth_core::{crypto::hash::merkle_proof::MerkleProofCore, protocol::core_types::QNetworkTypesConfig};
+use parth_core::protocol::core_types::QNetworkTypesConfig;
 use psy_io::tokio::TokioLikeFileSystem;
 use psy_node_core::{
     p2p::traits::realm_coordinantor::RealmCoordinatorClient,
@@ -25,7 +24,8 @@ impl<
 where
     N::HasherBase: 'static + Send + Sync,
 {
-    pub async fn run_sanity_check(&self, location: &str) -> anyhow::Result<()> {
+    pub async fn run_sanity_check(&self, _location: &str) -> anyhow::Result<()> {
+        /*
         let latest_checkpoint_id = self.db.get_latest_checkpoint_id().await?;
         let start_checkpoint_id = if latest_checkpoint_id >= 5 { latest_checkpoint_id - 4 } else { 0 };
         tracing::info!(
@@ -56,6 +56,7 @@ where
                 tracing::error!("[SANITY_CHECK: {}] CRITICAL: Checkpoint Tree Root Mismatch at checkpoint ID {}: local_checkpoint_tree_merkle_proof.root: {:?} vs coordinator_merkle_proof.root: {:?}", location, checkpoint_id, local_checkpoint_tree_merkle_proof.root, coordinator_merkle_proof.root);
             }
         }
+        */
         Ok(())
     }
 }

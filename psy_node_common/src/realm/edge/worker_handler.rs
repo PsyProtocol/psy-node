@@ -1,3 +1,4 @@
+use cf_utils::timer::DebugTimer;
 use futures::future::try_join_all;
 use parth_core::{
     QCoreProcCheckpointUniqueId, crypto::{
@@ -31,7 +32,7 @@ fn verify_api_signature(signature: &QEDCompressedSecp256K1Signature, request: &S
         && parth_common::secp256k1::Secp256K1VerifierHelper::secp256k1_verify(signature).is_ok()
 }
 fn print_hash<H: Q256BitHash + std::fmt::Debug>(label: &str, hash: &H) {
-    tracing::info!("{}: {:?} ({})", label, hash, hex::encode(&hash.into_owned_32bytes()));
+    tracing::debug!("{}: {:?} ({})", label, hash, hex::encode(&hash.into_owned_32bytes()));
 }
 
 impl<
@@ -79,7 +80,7 @@ impl<
     }
     
     pub async fn get_user_leaf_data_internal(&self, checkpoint_id: u64, user_id: u64) -> anyhow::Result<PQEDUserLeaf<N::F, N::QHash>> {
-        tracing::info!("get_user_leaf_data_internal: checkpoint_id={}, user_id={}", checkpoint_id, user_id);
+        tracing::debug!("get_user_leaf_data_internal: checkpoint_id={}, user_id={}", checkpoint_id, user_id);
         let leaf = self
             .db_reader
             .get_user_leaf(checkpoint_id, user_id)
@@ -103,6 +104,32 @@ impl<
             }
         }
         Ok(leaf.unwrap())
+    }
+    
+    pub async fn get_user_leaves_data_internal(&self, checkpoint_id: u64, user_ids: &[u64]) -> anyhow::Result<Vec<PQEDUserLeaf<N::F, N::QHash>>> {
+        if user_ids.len() == 0 {
+            anyhow::bail!("user_ids cannot be empty");
+        }else if user_ids.len() > 10000 {
+            anyhow::bail!("user_ids length greater than 10000 not supported in get_user_leaves");
+        }
+        let leaves = self
+            .db_reader
+            .get_user_leaves_batch(checkpoint_id, user_ids)
+            .await?;
+        Ok(leaves.into_iter().enumerate().map(|(index, l)| {
+            match l {
+                Some(leaf) => leaf,
+                None => PQEDUserLeaf {
+                    public_key: N::QHash::get_zero_value(),
+                    user_state_tree_root: N::HasherBase::get_zero_hash(N::GLOBAL_CONTRACT_TREE_HEIGHT_USIZE),
+                    balance: N::F::ZERO_VALUE,
+                    nonce: N::F::ZERO_VALUE,
+                    last_checkpoint_id: N::F::ZERO_VALUE,
+                    event_index: N::F::ZERO_VALUE,
+                    user_id: N::F::from_u64_value(user_ids[index]),
+                }
+            }
+        }).collect())
     }
     pub async fn get_proving_work_internal(
         &self,
@@ -172,11 +199,15 @@ impl<
         signature: QEDCompressedSecp256K1Signature,
         request: SimpleTimedRequest,
     ) -> anyhow::Result<PsyWorkerGetProvingWorkWithChildProofsAPIResponse<N::QHash, N::JobId>> {
-        //tracing::info!("get_proving_work_with_child_proofs_internal called");
+        let mut timer = DebugTimer::new("get_proving_work_with_child_proofs_internal");
+        //tracing::debug!("get_proving_work_with_child_proofs_internal called");
         self.verify_miner_api_signature_and_check_reputation(&signature, &request).await?;
+        timer.lap_micros("verify_miner_api_signature_and_check_reputation");
+
 
         let (unique_pending_id, unique_proc_id) = self.get_current_unique_pending_id_internal().await?;
-
+        timer.lap_micros("get_current_unique_pending_id_internal");
+        
         let queue_key = RealmProvingWorkQueueKey::<N::QHash, N::JobId> {
             realm_id: self.realm_id_u64,
             realm_sub_id: self.realm_sub_id_u64,
@@ -190,15 +221,16 @@ impl<
             .get_next_worker_queue_item_or_none(&queue_key, self.realm_id_u64, self.realm_sub_id_u64, unique_proc_id, 0)
             .await?;
 
+        timer.lap_micros("get_next_worker_queue_item_or_none");
         if work_item.is_none() {
             anyhow::bail!("no proving work available");
         } else {
-            println!("unique_pending_id: {:?}", unique_pending_id);
-            println!("unique_proc_id: {:?}", unique_proc_id);
+            //println!("unique_pending_id: {:?}", unique_pending_id);
+            //println!("unique_proc_id: {:?}", unique_proc_id);
         }
         let work_item = work_item.unwrap();
-        println!("work_item.job_id: {:?}", work_item.job_id);
-        tracing::info!("work item dependencies: {:?}", work_item.metadata.dependencies);
+        //println!("work_item.job_id: {:?}", work_item.job_id);
+        //tracing::debug!("work item dependencies: {:?}", work_item.metadata.dependencies);
         let child_proofs = work_item
             .metadata
             .dependencies
@@ -206,7 +238,9 @@ impl<
             .map(|id| self.proof_store.get_proof_bytes_by_job_id(id.get_output_id()))
             .collect::<Vec<_>>()
             .into_iter();
+        timer.lap_micros("collect get_proof_bytes_by_job_id futures");
         let res: Vec<Option<Vec<u8>>> = try_join_all(child_proofs).await?;
+        timer.lap_micros("try_join_all get_proof_bytes_by_job_id futures");
         let mut final_child_proofs: Vec<Vec<u8>> = Vec::with_capacity(res.len());
 
         for (index, item) in res.into_iter().enumerate() {
@@ -218,12 +252,13 @@ impl<
             }
         }
 
-        println!("getting proof witness bytes: {:?}", work_item.job_id.get_input_witness_id());
+        //println!("getting proof witness bytes: {:?}", work_item.job_id.get_input_witness_id());
         let witness_bytes: Vec<u8> = self
             .temp_db
             .get_tdb_proof_witness_bytes(&self.realm_identifier, unique_pending_id, work_item.job_id.get_input_witness_id())
             .await?;
-        println!("got proof witness bytes, len: {}", witness_bytes.len());
+        timer.lap_micros("get_tdb_proof_witness_bytes");
+        //println!("got proof witness bytes, len: {}", witness_bytes.len());
         let children_reward_tree_values = {
             if work_item.metadata.dependencies.len() == 0 || work_item.metadata.reward_tree_hash_mode == PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN
             {
@@ -244,6 +279,7 @@ impl<
                 values
             }
         };
+        timer.lap_micros("children_reward_tree_values");
         let response = PsyWorkerGetProvingWorkAPIResponse {
             job: work_item,
             child_proof_tag_values: children_reward_tree_values,
@@ -262,6 +298,8 @@ impl<
             )
             .await?;
 
+        timer.lap_micros("set_proving_job_metadata");
+
         // HACK: in the future we should create a new table for the expected proving
         // tag, but for now this ok i guess, but a HACK HACK: for now we set
         // self.temp_db.set_proof_miner_rewards_tree_value( with the expected proving
@@ -276,6 +314,8 @@ impl<
                 N::QHash::from_ref_32bytes(&request.tag),
             )
             .await?;
+        timer.lap_micros("set_proof_miner_rewards_tree_value");
+        timer.lap_group("get_proving_work_with_child_proofs_internal");
 
         Ok(PsyWorkerGetProvingWorkWithChildProofsAPIResponse {
             base: response,
@@ -284,7 +324,9 @@ impl<
     }
     pub async fn submit_proof_raw_internal(&self, mut job_id: N::JobId, tag: N::QHash, proof_bytes: Vec<u8>) -> anyhow::Result<()> {
         job_id = job_id.get_output_id();
+        let mut timer = DebugTimer::new("submit_proof_raw_internal");
         let (unique_pending_id, unique_proc_id) = self.get_current_unique_pending_id_internal().await?;
+        timer.lap_micros("get_current_unique_pending_id_internal");
 
         //HACK: check to make sure the tag matches
         if self
@@ -295,12 +337,14 @@ impl<
         {
             anyhow::bail!("Submitted tag does not match expected tag for job id");
         }
+        timer.lap_micros("get_proof_miner_rewards_tree_value");
 
         let metadata: PsyProvingJobMetadata<N::QHash, N::JobId> = self
             .temp_db
             .get_proving_job_metadata(&self.realm_identifier, unique_pending_id, job_id.get_output_id())
             .await?;
 
+        timer.lap_micros("get_proving_job_metadata");
         let children_reward_tree_values = {
             if metadata.dependencies.len() == 0 || metadata.reward_tree_hash_mode == PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN {
                 vec![]
@@ -319,24 +363,26 @@ impl<
                 values
             }
         };
+        timer.lap_micros("children_reward_tree_values");
 
         let reward_tree_value = metadata.get_new_rewards_tag_tree_value::<N::HasherBase>(tag, &children_reward_tree_values)?;
 
-        print_hash("reward_tree_value", &reward_tree_value);
+        //print_hash("reward_tree_value", &reward_tree_value);
         let full_expected_public_inputs_hash = 
             N::HasherBase::two_to_one(&metadata.expected_public_inputs_hash, &reward_tree_value);
 
-        print_hash("full_expected_public_inputs_hash", &full_expected_public_inputs_hash);
-        print_hash("metadata.expected_public_inputs_hash", &metadata.expected_public_inputs_hash);
+        //print_hash("full_expected_public_inputs_hash", &full_expected_public_inputs_hash);
+        //print_hash("metadata.expected_public_inputs_hash", &metadata.expected_public_inputs_hash);
         
-        tracing::info!(
+        tracing::debug!(
             "Verifying proof for job id: {:?} with expected public inputs hash: {:?} (from metadata: {:?})",
             job_id,
             hex::encode(&full_expected_public_inputs_hash.into_owned_32bytes()),
             hex::encode(&metadata.expected_public_inputs_hash.into_owned_32bytes())
         );
         let debug_public_inputs = N::ZKVerifier::get_proof_public_inputs_hash(&N::ZKVerifier::try_proof_from_slice(&proof_bytes)?)?;
-        tracing::info!(
+        timer.lap_micros("get_proof_public_inputs_hash");
+        tracing::debug!(
             "Debug: extracted public inputs hash from proof: {:?}",
             hex::encode(&debug_public_inputs.into_owned_32bytes())
         );
@@ -347,11 +393,14 @@ impl<
             &proof_bytes,
             full_expected_public_inputs_hash,
         )?;
+        timer.lap_micros("verify_zk_proof_from_slice_check_public_inputs_hash");
 
         // HACK: now set the correct reward tree value
         self.temp_db
             .set_proof_miner_rewards_tree_value(&self.realm_identifier, unique_pending_id, job_id, reward_tree_value)
             .await?;
+
+        timer.lap_micros("set_proof_miner_rewards_tree_value");
         if self
             .temp_db
             .get_proof_miner_rewards_tree_value(&self.realm_identifier, unique_pending_id, job_id)
@@ -361,7 +410,9 @@ impl<
             anyhow::bail!("Failed to set rewards tree value for job id");
         }
 
+        timer.lap_micros("get_proof_miner_rewards_tree_value");
         self.proof_store.put_proof_bytes_for_job_id(job_id.get_output_id(), &proof_bytes).await?;
+        timer.lap_micros("put_proof_bytes_for_job_id");
         /*
         self.tag_tree_rewards_store
             .rewards_tag_tree_set_node_tag(unique_pending_id, metadata.get_reward_tree_node_key(), tag, reward_tree_value)
@@ -416,6 +467,8 @@ impl<
                     .rewards_tag_tree_set_node_tag(unique_pending_id, key, node.tag, node.value)
                     .await?;
             }
+
+            timer.lap_micros("rewards_tag_tree_set_node_tag for all updates");
             if job_id.circuit_type.needs_to_save_child_reward_tree_values_to_database() {
                 let node_key = metadata.get_reward_tree_node_key();
                 let left_key = node_key.left_child();
@@ -434,6 +487,7 @@ impl<
                 } else if children_reward_tree_values.len() != 0 {
                     anyhow::bail!("Invalid number of children for saving tag tree values to database, this should never happen");
                 }
+                timer.lap_micros("rewards_tag_tree_set_node_tag for child values");
             }
         }
 
@@ -454,6 +508,8 @@ impl<
         self.get_proof_work_queue
             .worker_queue_report_job_completed(&queue_key, self.realm_id_u64, self.realm_sub_id_u64, unique_proc_id, 0, &item)
             .await?;
+        timer.lap_micros("worker_queue_report_job_completed");
+        timer.lap_group("submit_proof_raw_internal");
 
         Ok(())
     }

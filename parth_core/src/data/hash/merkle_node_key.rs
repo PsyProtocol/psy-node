@@ -12,6 +12,24 @@ pub const JOB_ID_EMPTY_REWARD_PATH_INFO: u64 = 0xFFFF_FFFF_FFFF_FFFFu64;
 
 pub const PSY_OBJECT_FFS_SIZE_SIMPLE_MERKLE_NODE_KEY: usize = 9;
 pub const PSY_OBJECT_FFS_SIZE_SIMPLE_MERKLE_NODE: usize = 41;
+
+pub struct MerkleNodeKeyRange<const N: usize> {
+    pub keys: [SimpleMerkleNodeKey; N],
+}
+impl<const N: usize> MerkleNodeKeyRange<N> {
+    pub fn new(level: u8, start_index: u64) -> Self {
+        Self { keys: core::array::from_fn(|i| SimpleMerkleNodeKey { level: level, index: i as u64 + start_index }) }
+    }
+    #[inline]
+    pub const fn as_slice(&self) -> &[SimpleMerkleNodeKey] {
+        &self.keys
+    }
+    #[inline]
+    pub const fn as_mut_slice(&mut self) -> &mut [SimpleMerkleNodeKey] {
+        &mut self.keys
+    }
+}
+
 #[pderive::serialize_copy_default_no_ord_ts]
 #[repr(C)]
 pub struct SimpleMerkleNodeKey {
@@ -19,6 +37,59 @@ pub struct SimpleMerkleNodeKey {
     pub index: u64,
 }
 impl SimpleMerkleNodeKey {
+    pub fn from_inds_at_level(level: u8, indices: &[u64]) -> Vec<Self> {
+        let mut result = Vec::with_capacity(indices.len());
+        for &index in indices {
+            result.push(Self { level, index });
+        }
+        result
+    }
+    pub fn get_range_at_level(level: u8, start_index: u64, count: usize) -> Vec<Self> {
+        let mut result = Vec::with_capacity(count);
+        for i in 0..count {
+            result.push(Self {
+                level,
+                index: start_index + (i as u64),
+            });
+        }
+        result
+    }
+    pub fn get_even_nodes_in_range_at_level(level: u8, start_index: u64, count: usize) -> Vec<Self> {
+        let mut result = Vec::with_capacity(count);
+        for i in 0..count {
+            result.push(Self {
+                level,
+                index: start_index + 2 * (i as u64),
+            });
+        }
+        result
+    }
+    pub fn get_odd_nodes_in_range_at_level(level: u8, start_index: u64, count: usize) -> Vec<Self> {
+        let mut result = Vec::with_capacity(count);
+        for i in 0..count {
+            result.push(Self {
+                level,
+                index: start_index + 2 * (i as u64) + 1,
+            });
+        }
+        result
+    }
+    pub fn populate_range_at_level_fixed<const N: usize>(buf: &mut [Self; N], level: u8, start_index: u64) {
+        for i in 0..N {
+            buf[i] = Self {
+                level,
+                index: start_index + (i as u64),
+            };
+        }
+    }
+    pub fn populate_range_at_level_fixed_with_max<const N: usize>(buf: &mut [Self; N], level: u8, start_index: u64, count: usize) {
+        for i in 0..(N.min(count)) {
+            buf[i] = Self {
+                level,
+                index: start_index + (i as u64),
+            };
+        }
+    }
     pub fn random_simple_merkle_node_in_tree(tree_height: u8) -> Self {
         let mut rng = rand::thread_rng();
         let level = rng.gen_range(0..=tree_height);

@@ -49,6 +49,7 @@ impl<
         BiDirectionalMappingTableIdentifier: THStandardTableIdentifier,
         BiDirectionalU64U128MappingTableIdentifier: THStandardTableIdentifier,
         U64TableIdentifier: THStandardTableIdentifier,
+        U64CounterTableIdentifier: THStandardTableIdentifier,
         SingleIdTableIdentifier: THStandardTableIdentifier,
         DoubleIdTableIdentifier: THStandardTableIdentifier,
         KivTableIdentifier: THStandardTableIdentifier,
@@ -63,6 +64,7 @@ impl<
                 BiDirectionalMappingTableIdentifier,
                 BiDirectionalU64U128MappingTableIdentifier,
                 U64TableIdentifier,
+                U64CounterTableIdentifier,
                 SingleIdTableIdentifier,
                 DoubleIdTableIdentifier,
                 KivTableIdentifier,
@@ -94,6 +96,7 @@ impl<
         BiDirectionalMappingTableIdentifier,
         BiDirectionalU64U128MappingTableIdentifier,
         U64TableIdentifier,
+        U64CounterTableIdentifier,
         SingleIdTableIdentifier,
         DoubleIdTableIdentifier,
         KivTableIdentifier,
@@ -280,6 +283,7 @@ impl<
         BiDirectionalMappingTableIdentifier: THStandardTableIdentifier,
         BiDirectionalU64U128MappingTableIdentifier: THStandardTableIdentifier,
         U64TableIdentifier: THStandardTableIdentifier,
+        U64CounterTableIdentifier: THStandardTableIdentifier,
         SingleIdTableIdentifier: THStandardTableIdentifier,
         DoubleIdTableIdentifier: THStandardTableIdentifier,
         KivTableIdentifier: THStandardTableIdentifier,
@@ -294,6 +298,7 @@ impl<
                 BiDirectionalMappingTableIdentifier,
                 BiDirectionalU64U128MappingTableIdentifier,
                 U64TableIdentifier,
+                U64CounterTableIdentifier,
                 SingleIdTableIdentifier,
                 DoubleIdTableIdentifier,
                 KivTableIdentifier,
@@ -325,6 +330,7 @@ impl<
         BiDirectionalMappingTableIdentifier,
         BiDirectionalU64U128MappingTableIdentifier,
         U64TableIdentifier,
+        U64CounterTableIdentifier,
         SingleIdTableIdentifier,
         DoubleIdTableIdentifier,
         KivTableIdentifier,
@@ -380,10 +386,23 @@ impl<
         Ok(())
     }
 
-    pub async fn th_util_inc_counter(&self, table: &U64TableIdentifier, obj_id: u64, inc_amount: i64) -> anyhow::Result<u64> {
-        let before = self.th_util_select_u64_value(table, obj_id).await?;
-        let result = self.store.db_inc_counter(table, obj_id, inc_amount).await?;
-        let after = self.th_util_select_u64_value(table, obj_id).await?;
+    pub async fn th_util_select_u64_counter_value(&self, table: &U64CounterTableIdentifier, obj_id: u64) -> anyhow::Result<Option<u64>> {
+        let result = self.store.db_select_u64_counter_value(table, obj_id).await?;
+        let multi_result = self
+            .store
+            .db_select_u64_counter_values(table, &[obj_id, DEFINITELY_MISSING_U64_VALUE, obj_id])
+            .await?;
+        assert!(multi_result.len() == 3, "Multi select did not return correct number of results");
+        assert!(multi_result[0] == result, "Multi select first result does not match single select result");
+        assert!(multi_result[1].is_none(), "Multi select second result should be None");
+        assert!(multi_result[2] == result, "Multi select third result does not match single select result");
+
+        Ok(result)
+    }
+    pub async fn th_util_inc_counter(&self, table: &U64CounterTableIdentifier, obj_id: u64, inc_amount: i64) -> anyhow::Result<u64> {
+        let before = self.th_util_select_u64_counter_value(table, obj_id).await?;
+        let result = self.store.db_inc_u64_counter(table, obj_id, inc_amount).await?;
+        let after = self.th_util_select_u64_counter_value(table, obj_id).await?;
         if before.is_none() {
             assert!(result == inc_amount as u64, "Increment result does not match expected value");
             assert!(after.is_some(), "Value not found after increment");

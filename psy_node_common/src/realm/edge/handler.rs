@@ -1,6 +1,7 @@
 use std::{sync::Arc, u64};
 
 use async_trait::async_trait;
+use cf_utils::timer::DebugTimer;
 use jsonrpsee::core::RpcResult;
 use parth_core::{
     QProvingJobDataIDWithRewardPath, crypto::{
@@ -151,12 +152,12 @@ impl<
         self.db_reader.get_latest_checkpoint_id().await
     }
     pub async fn ensure_user_has_not_submitted(&self, user_id: u64, unique_pending_id: u64) -> anyhow::Result<()> {
-        tracing::info!("here");
+        //tracing::info!("here");
         let submitted_status = self
             .temp_db
             .get_submitted_status_for_pending(&self.realm_identifier, unique_pending_id, user_id)
             .await?;
-        tracing::info!("submitted_status: {}", submitted_status);
+        //tracing::info!("submitted_status: {}", submitted_status);
         if submitted_status != 0 {
             anyhow::bail!(
                 "end cap for user_id {} at unique_pending_id {} has already been submitted",
@@ -238,6 +239,7 @@ impl<
         user_end_cap_input: SubmitUserEndCapNonProofInput<N::F, N::QHash>,
         proof_bytes: Vec<u8>,
     ) -> anyhow::Result<()> {
+        let mut timer = DebugTimer::new("handle_user_end_cap_proof_submission");
         let end_cap_checkpoint_id = user_end_cap_input.core.checkpoint_id.to_u64_value();
 
         let secondary_end_cap_checkpoint_id = user_end_cap_input.core.new_user_leaf.last_checkpoint_id.to_u64_value();
@@ -257,10 +259,14 @@ impl<
         }
 
         let (unique_pending_id, proc_checkpoint_id) = self.temp_db.get_gathering_unique_pending_ids(&self.realm_identifier).await?;
+        timer.lap_micros("get_gathering_unique_pending_ids");
         self.ensure_user_has_not_submitted(user_id, unique_pending_id).await?;
+        timer.lap_micros("ensure_user_has_not_submitted");
 
         let current_checkpoint_id = self.get_latest_checkpoint_id().await?;
+        timer.lap_micros("get_latest_checkpoint_id");
         let old_user_leaf = self.get_user_leaf_data_internal(current_checkpoint_id, user_id).await?;
+        timer.lap_micros("get_user_leaf_data_internal");
         let user_last_checkpoint_id = old_user_leaf.last_checkpoint_id.to_u64_value();
 
         if user_last_checkpoint_id > secondary_end_cap_checkpoint_id {
@@ -298,11 +304,12 @@ impl<
             .db_reader
             .checkpoint_tree_get_merkle_proof(u64::MAX-0xFFFF, end_cap_checkpoint_id)
             .await?;
+        timer.lap_micros("checkpoint_tree_get_merkle_proof");
 
         let job_id =
             QProvingJobDataID::try_get_realm_edge_proof_store_output_proof_id_for_end_cap(user_id, N::GLOBAL_USER_TREE_HEIGHT, unique_pending_id)?;
-        println!("checkpoint_tree_proof: {:#?}", checkpoint_tree_proof);
-        println!("verify_checkpoint_tree_proof: {}", checkpoint_tree_proof.verify::<N::HasherBase>());
+        //println!("checkpoint_tree_proof: {:#?}", checkpoint_tree_proof);
+        //println!("verify_checkpoint_tree_proof: {}", checkpoint_tree_proof.verify::<N::HasherBase>());
         let historical_root = checkpoint_tree_proof.get_append_root::<N::HasherBase>();
         //let (historical_root, current_root) = compute_historical_and_current_merkle_roots_core_gt::<N::QHash, N::HasherBase>(&checkpoint_tree_proof);
         if historical_root != user_end_cap_input.core.state_transition.checkpoint_tree_root_hash {
@@ -312,11 +319,12 @@ impl<
                 user_end_cap_input.core.state_transition.checkpoint_tree_root_hash
             );
         }
-        tracing::info!("[{:?}] checkpoint_tree_proof ({} @ LATEST) (append_root: {:?}): {:?}", job_id, end_cap_checkpoint_id, checkpoint_tree_proof.get_append_root::<N::HasherBase>(), checkpoint_tree_proof);
+        //tracing::info!("[{:?}] checkpoint_tree_proof ({} @ LATEST) (append_root: {:?}): {:?}", job_id, end_cap_checkpoint_id, checkpoint_tree_proof.get_append_root::<N::HasherBase>(), checkpoint_tree_proof);
 
 
 
         self.ensure_user_has_not_submitted(user_id, unique_pending_id).await?;
+        timer.lap_micros("ensure_user_has_not_submitted (2)");
 
         let expected_public_inputs_hash: N::QHash = user_end_cap_input
             .core
@@ -339,6 +347,8 @@ impl<
         contract_ids.sort_unstable();
         contract_ids.dedup();
         self.ensure_contract_heights_in_cache(&contract_ids).await?;
+        timer.lap_micros("ensure_contract_heights_in_cache");
+        //println!("old_user_leaf: {:?}", old_user_leaf);
 
         user_end_cap_input.ensure_simple_self_consistent::<N::HasherBase, _>(
             &old_user_leaf,
@@ -347,8 +357,10 @@ impl<
             N::GLOBAL_USER_TREE_HEIGHT,
             N::GLOBAL_CONTRACT_TREE_HEIGHT_USIZE,
         )?;
+        timer.lap_micros("ensure_simple_self_consistent");
 
         self.proof_verifier.verify_zk_proof(END_CAP_PROOF_CIRCUIT_TYPE_U32, &proof)?;
+        timer.lap_micros("verify_zk_proof");
 
         // TODO: maybe modify the job_id.sub_group_id
         let rand_status = rand::random::<u64>();
@@ -366,9 +378,11 @@ impl<
         let contract_update_data_for_user =
             validate_end_cap_and_generate_node_data_for_edge::<N::F, N::QHash, N::HasherBase>(&context, user_id, &user_end_cap_input)?;
         self.ensure_user_has_not_submitted(user_id, unique_pending_id).await?;
+        timer.lap_micros("ensure_user_has_not_submitted (3)");
         self.temp_db
             .set_submitted_status_for_pending(&self.realm_identifier, unique_pending_id, user_id, rand_status)
             .await?;
+        timer.lap_micros("set_submitted_status_for_pending");
 
         if self
             .temp_db
@@ -384,7 +398,9 @@ impl<
             );
         }
 
+        timer.lap_micros("get_submitted_status_for_pending (final)");
         self.proof_store.put_proof_bytes_for_job_id(job_id, &proof_bytes).await?;
+        timer.lap_micros("put_proof_bytes_for_job_id");
         if self
             .temp_db
             .get_submitted_status_for_pending(&self.realm_identifier, unique_pending_id, user_id)
@@ -398,10 +414,12 @@ impl<
                 unique_pending_id
             );
         }
+        timer.lap_micros("get_submitted_status_for_pending (final 2)");
 
         self.temp_db
             .set_contract_updates_for_user(&self.realm_identifier, unique_pending_id, user_id, contract_update_data_for_user)
             .await?;
+        timer.lap_micros("set_contract_updates_for_user");
         let queue_key = RealmUserUpdateQueueKey {
             realm_id: self.realm_id_u64,
             realm_sub_id: self.realm_sub_id_u64,
@@ -421,10 +439,12 @@ impl<
             new_user_leaf,
             stats: user_end_cap_input.core.stats,
         };
-        println!("Publishing to user update queue: {:?}", queue_item);
+        //println!("Publishing to user update queue: {:?}", queue_item);
         self.user_update_queue
             .publish_ephemeral_queue_item_owned(&queue_key, self.realm_id_u64, self.realm_sub_id_u64, proc_checkpoint_id, 0, queue_item)
             .await?;
+        timer.lap_micros("publish_ephemeral_queue_item_owned");
+        timer.lap_group("handle_user_end_cap_proof_submission total");
 
         Ok(())
     }
@@ -464,8 +484,8 @@ impl<
             tracing::error!("Error getting contract tree state heights");
 
         } else {
-            println!("Got contract tree state heights for checkpoint_id {}: {:?}", checkpoint_id, result.as_ref().unwrap());
-            tracing::info!("Got contract tree state heights for checkpoint_id {}", checkpoint_id);
+            //println!("Got contract tree state heights for checkpoint_id {}: {:?}", checkpoint_id, result.as_ref().unwrap());
+            //tracing::info!("Got contract tree state heights for checkpoint_id {}", checkpoint_id);
         }
         res(result)
 
@@ -544,7 +564,23 @@ impl<
     async fn get_user_leaf_data(&self, checkpoint_id: u64, user_id: u64) -> QRpcResult<PQEDUserLeaf<N::F, N::QHash>> {
         res(self.get_user_leaf_data_internal(checkpoint_id, user_id).await)
     }
-
+    async fn get_user_leaves_batch(
+        &self,
+        checkpoint_id: u64,
+        user_ids: Vec<u64>,
+    ) -> RpcResult<Vec<PQEDUserLeaf<N::F, N::QHash>>>{
+        res(self.get_user_leaves_data_internal(checkpoint_id, &user_ids).await)
+    }
+    async fn get_user_tree_leaf_hashes(
+        &self,
+        checkpoint_id: u64,
+        user_ids: Vec<u64>,
+    ) -> RpcResult<Vec<N::QHash>>{
+        res(self
+            .db_reader
+            .global_user_tree_get_nodes(checkpoint_id, &user_ids.into_iter().map(|id| SimpleMerkleNodeKey::new(N::GLOBAL_USER_TREE_HEIGHT, id)).collect::<Vec<_>>())
+            .await)
+    }
     async fn get_user_contract_state_tree_root(&self, checkpoint_id: u64, user_id: u64, contract_id: u32) -> QRpcResult<N::QHash> {
         res(self
             .db_reader

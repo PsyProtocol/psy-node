@@ -2,9 +2,7 @@ mod subcommand;
 
 use clap::Parser;
 
-use crate::subcommand::{
-    Cli, Commands, keypair_helper, worker, worker_test
-};
+use crate::subcommand::{keypair_helper, worker, worker_test, Cli, Commands};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -61,6 +59,20 @@ async fn main() -> anyhow::Result<()> {
                 max_contract_calls,
                 user_id,
                 end_cap_count,
+                network,
+                proving_backend,
+            ).await?;
+        },
+        Commands::DummyEndCapProverLite { realm_api_url, coordinator_api_url, min_state_updates, max_state_updates, max_contract_calls, start_user_id, count, batches, network, proving_backend } => {
+            subcommand::dummy_end_cap_prover_lite::run(
+                realm_api_url,
+                coordinator_api_url,
+                min_state_updates,
+                max_state_updates,
+                max_contract_calls,
+                start_user_id,
+                count,
+                batches,
                 network,
                 proving_backend,
             ).await?;

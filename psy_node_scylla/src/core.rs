@@ -3,12 +3,13 @@ use std::sync::Arc;
 use parth_core::{crypto::hash::traits::MerkleZeroHasher, data::db::table::QDatabaseTableRoutingKey, protocol::core_types::QHashBase};
 use scylla::client::session::{Session, SessionConfig};
 
-use crate::tables::{merkle::ScyllaMerkleNodesZeroPreparedStatements, traits::ScyllaStandardPreparedTableStatements};
+use crate::tables::{merkle::ScyllaMerkleNodesZeroPreparedStatements, traits::{ScyllaNoTabletPreparedTableStatements, ScyllaStandardPreparedTableStatements}};
 
 #[derive(Clone)]
 pub struct ScyllaCoreStore<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> {
     pub session: Arc<Session>,
     pub keyspace: String,
+    pub no_tablet_keyspace: String,
     pub realm_id: u64,
     pub realm_sub_id: u64,
     _phantom_hash: std::marker::PhantomData<Hash>,
@@ -21,20 +22,36 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
         config.add_known_nodes(known_nodes.iter());
         let session = Arc::new(Session::connect(config).await?);
 
+        let no_tablet_keyspace = format!("{}_no_tablet", keyspace);
+
         // Create keyspace and table if not exists
-        session
+
+        let create_standard_keyspace = session
             .query_unpaged(
                 format!(
-                    "CREATE KEYSPACE IF NOT EXISTS {} WITH replication = {{'class': 'SimpleStrategy', 'replication_factor': 1}}",
+                    "CREATE KEYSPACE IF NOT EXISTS {} WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': 1}}",
                     &keyspace
                 ),
                 &[],
-            )
-            .await?;
+            );
+        let create_no_tablet_keyspace = session
+            .query_unpaged(
+                format!(
+                    "CREATE KEYSPACE IF NOT EXISTS {} WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': 1}} AND tablets = {{ 'enabled': false }}",
+                    &no_tablet_keyspace
+                ),
+                &[],
+            );
+
+        let (res_std, res_no_tablet) = tokio::join!(create_standard_keyspace, create_no_tablet_keyspace);
+
+        let _ = res_std?;
+        let _ = res_no_tablet?;
         session.await_schema_agreement().await?;
         Ok(Self {
             session,
             keyspace,
+            no_tablet_keyspace,
             realm_id,
             realm_sub_id,
             _phantom_hash: std::marker::PhantomData,
@@ -48,6 +65,14 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
     ) -> anyhow::Result<T> {
         println!("intializing table: {}", table_name);
         T::create_table_standard(self.session.clone(), &self.keyspace, table_name, table_key).await
+    }
+    pub async fn init_no_tablet_table<T: ScyllaNoTabletPreparedTableStatements>(
+        &self,
+        table_name: &str,
+        table_key: QDatabaseTableRoutingKey,
+    ) -> anyhow::Result<T> {
+        println!("intializing no-tablet table: {}", table_name);
+        T::create_table_no_tablet(self.session.clone(), &self.no_tablet_keyspace, table_name, table_key).await
     }
     pub async fn init_zero_id_merkle_table(
         &self,

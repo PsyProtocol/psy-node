@@ -7,6 +7,7 @@ use psy_data::v1::qdata::public_key::PZKPublicKeyInfo;
 #[async_trait]
 pub trait PsyCoordinatorFetcher<Hash> {
     async fn cf_get_user_public_key(&self, user_id: u64) -> anyhow::Result<PZKPublicKeyInfo<Hash>>;
+    async fn cf_get_user_public_key_hashes(&self, user_ids: &[u64]) -> anyhow::Result<Vec<Hash>>;
     async fn cf_get_checkpoint_tree_merkle_proof(&self, checkpoint_id: u64) -> anyhow::Result<MerkleProofCore<Hash>>;
 }
 
@@ -45,6 +46,13 @@ impl<N: QNetworkTypesConfig + 'static, C: CoordinatorEdgeRpcClient<N::F, N::QHas
             .await
             .map_err(|e| anyhow::anyhow!("{:?}", e))
     }
+        async fn cf_get_user_public_key_hashes(&self, user_ids: &[u64]) -> anyhow::Result<Vec<N::QHash>>{
+            // TODO: convert these to registration ids
+            let ids = user_ids.iter().map(|user_id| *user_id).collect::<Vec<u64>>();
+            println!("cf_get_user_public_key_hashes called with user_ids: {:?}, converted to registration ids: {:?}", user_ids, ids);
+            self.client.get_user_registration_tree_leaf_hashes(u64::MAX-0xffff, ids).await.map_err(|e| anyhow::anyhow!("{:?}", e))
+
+        }
     async fn cf_get_checkpoint_tree_merkle_proof(&self, checkpoint_id: u64) -> anyhow::Result<MerkleProofCore<N::QHash>> {
         self.client
             .get_checkpoint_tree_merkle_proof(checkpoint_id + 10, checkpoint_id)

@@ -42,6 +42,7 @@ impl<
     }
 
     pub async fn process_job(&self) -> anyhow::Result<()> {
+        let mut timer = DebugTimer::new("process_job");
         if let Some((api_url_hash, tag, job_response)) = self.job_fetcher.fetch_new_job().await? {
             let job_id = job_response.base.job.job_id;
             tracing::info!("Fetched new job: {:?} from API URL hash: {:?}", job_id, api_url_hash);

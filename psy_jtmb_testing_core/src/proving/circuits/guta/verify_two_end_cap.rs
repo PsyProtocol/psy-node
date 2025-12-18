@@ -1,4 +1,4 @@
-use parth_core::crypto::hash::traits::{MerkleHasher, ZeroableHash};
+use parth_core::crypto::hash::traits::ZeroableHash;
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{
     proof_input::guta::GUTAVerifyTwoEndCapCircuitInputV2,
@@ -143,10 +143,10 @@ impl<L: PsyJTMBCircuitInfoLibrary<C::Hash>, C: JTMBCircuitConfig> QJTMBProofCirc
 
         let witness = GUTAVerifyTwoEndCapCircuitInputV2::<C::F, C::Hash>::psy_ser_from_slice(&input.base.witness)?;
 
-        println!("got witness: {:?}", witness);
+/*         println!("got witness: {:?}", witness);
         let expected_public_inputs_hash_no_tag = witness.get_public_inputs_hash_no_rewards_tag::<C::Hasher>(32, whitelist_root);
         let expected_public_inputs_hash = C::Hasher::two_to_one(&expected_public_inputs_hash_no_tag, &worker_reward_tag);
-
+*/
         let proof = self.prove_base(
             worker_reward_tag,
             &witness,
@@ -156,6 +156,7 @@ impl<L: PsyJTMBCircuitInfoLibrary<C::Hash>, C: JTMBCircuitConfig> QJTMBProofCirc
             &right_child.zk_proof,
             &right_child.verifier_data,
         )?;
+        /* 
         println!("metadata: {:?}", input.base.job.metadata);
         println!("input_pubs: {:?}", input.base.job.metadata.expected_public_inputs_hash);
         println!("get_new_guta_header: witness: {:#?}", witness.get_new_guta_header(32, whitelist_root));
@@ -164,6 +165,7 @@ impl<L: PsyJTMBCircuitInfoLibrary<C::Hash>, C: JTMBCircuitConfig> QJTMBProofCirc
         let metadata_final_tag = input.base.job.metadata.compute_reward_tagged_expected_public_inputs::<C::Hasher>(worker_reward_tag, &[]);
         println!("metadata_final_tag: {:?}", metadata_final_tag);
         println!("generated proof public inputs hash: {:?}", proof.public_inputs_hash);
+        */
         Ok(proof)
     }
 }

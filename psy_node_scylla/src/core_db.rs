@@ -19,17 +19,17 @@ use parth_core::{
     protocol::core_types::QDBHashBase,
 };
 use psy_node_core::store::traits::core_db::{
-    CoreDatabaseBidirectionalMappingReader, CoreDatabaseBidirectionalMappingWriter, CoreDatabaseBidirectionalU64U128MappingReader, CoreDatabaseBidirectionalU64U128MappingWriter, CoreDatabaseDoubleIdCheckpointedReader, CoreDatabaseDoubleIdCheckpointedWriter, CoreDatabaseDoubleIdMerkleReader, CoreDatabaseDoubleIdMerkleWriter, CoreDatabaseHashToManyIdsReader, CoreDatabaseHashToManyIdsWriter, CoreDatabaseKivReader, CoreDatabaseKivWriter, CoreDatabaseSingleIdCheckpointedReader, CoreDatabaseSingleIdCheckpointedWriter, CoreDatabaseSingleIdMerkleReader, CoreDatabaseSingleIdMerkleWriter, CoreDatabaseTagTreeReader, CoreDatabaseTagTreeWriter, CoreDatabaseU64Reader, CoreDatabaseU64Writer, CoreDatabaseZeroIdMerkleDumpReader, CoreDatabaseZeroIdMerkleReader, CoreDatabaseZeroIdMerkleWriter, MerkleTreeDumpStrategy
+    CoreDatabaseBidirectionalMappingReader, CoreDatabaseBidirectionalMappingWriter, CoreDatabaseBidirectionalU64U128MappingReader, CoreDatabaseBidirectionalU64U128MappingWriter, CoreDatabaseDoubleIdCheckpointedReader, CoreDatabaseDoubleIdCheckpointedWriter, CoreDatabaseDoubleIdMerkleReader, CoreDatabaseDoubleIdMerkleWriter, CoreDatabaseHashToManyIdsReader, CoreDatabaseHashToManyIdsWriter, CoreDatabaseKivReader, CoreDatabaseKivWriter, CoreDatabaseSingleIdCheckpointedReader, CoreDatabaseSingleIdCheckpointedWriter, CoreDatabaseSingleIdMerkleReader, CoreDatabaseSingleIdMerkleWriter, CoreDatabaseTagTreeReader, CoreDatabaseTagTreeWriter, CoreDatabaseU64CounterReader, CoreDatabaseU64CounterWriter, CoreDatabaseU64Reader, CoreDatabaseU64Writer, CoreDatabaseZeroIdMerkleDumpReader, CoreDatabaseZeroIdMerkleReader, CoreDatabaseZeroIdMerkleWriter, MerkleTreeDumpStrategy
 };
 use psy_serialize::PsySerializeCanonicalAsyncSafe;
 
 use crate::{
     core::ScyllaCoreStore,
     tables::{
-        blob::ScyllaBiDirectionalBlobToBlobTablePreparedStatements, hash_to_many_ids::ScyllaHashToManyIdsTablePreparedStatements, merkle::{ScyllaDoubleMerkleNodesPreparedStatements, ScyllaMerkleNodesPreparedStatements, ScyllaMerkleNodesZeroPreparedStatements}, object::{
+        blob::ScyllaBiDirectionalBlobToBlobTablePreparedStatements, counter::u64_counter::ScyllaU64ToU64CounterTablePreparedStatements, hash_to_many_ids::ScyllaHashToManyIdsTablePreparedStatements, merkle::{ScyllaDoubleMerkleNodesPreparedStatements, ScyllaMerkleNodesPreparedStatements, ScyllaMerkleNodesZeroPreparedStatements}, object::{
             ScyllaGenericKeyIdValueTablePreparedStatements, ScyllaGenericObjectDoubleIdTablePreparedStatements,
             ScyllaGenericObjectSingleIdTablePreparedStatements,
-        }, tag_tree::ScyllaTagTreeNodesPreparedStatements, u64_tbl::{ScyllaBidirectionalU64U128MappingPreparedStatements, ScyllaU64ToU64TablePreparedStatements}
+        }, tag_tree::ScyllaTagTreeNodesPreparedStatements, u64_table::{ScyllaBidirectionalU64U128MappingPreparedStatements, ScyllaU64ToU64TablePreparedStatements}
     },
 };
 
@@ -745,14 +745,32 @@ impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sy
 impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync> CoreDatabaseU64Writer<ScyllaU64ToU64TablePreparedStatements>
     for ScyllaCoreStore<Hash, Hasher>
 {
-    async fn db_inc_counter(&self, table: &ScyllaU64ToU64TablePreparedStatements, obj_id: u64, amount: i64) -> anyhow::Result<u64> {
-        table.atomic_increment(&self.session, obj_id, amount as u64).await
-    }
     async fn db_set_u64_value(&self, table: &ScyllaU64ToU64TablePreparedStatements, obj_id: u64, value: u64) -> anyhow::Result<()> {
         table.set_or_insert_one(&self.session, obj_id, value).await
     }
     async fn db_set_many_u64_values(&self, table: &ScyllaU64ToU64TablePreparedStatements, rows: &[QPDPair<u64, u64>]) -> anyhow::Result<()> {
         table.set_or_insert_many_qpd_pair(&self.session, rows).await
+    }
+}
+
+#[async_trait]
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync> CoreDatabaseU64CounterReader<ScyllaU64ToU64CounterTablePreparedStatements>
+    for ScyllaCoreStore<Hash, Hasher>
+{
+    async fn db_select_u64_counter_value(&self, table: &ScyllaU64ToU64CounterTablePreparedStatements, obj_id: u64) -> anyhow::Result<Option<u64>> {
+        table.select_one_single(&self.session, obj_id).await
+    }
+    async fn db_select_u64_counter_values(&self, table: &ScyllaU64ToU64CounterTablePreparedStatements, obj_ids: &[u64]) -> anyhow::Result<Vec<Option<u64>>> {
+        table.select_many_values(self.session.clone(), obj_ids).await
+    }
+}
+
+#[async_trait]
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync> CoreDatabaseU64CounterWriter<ScyllaU64ToU64CounterTablePreparedStatements>
+    for ScyllaCoreStore<Hash, Hasher>
+{
+    async fn db_inc_u64_counter(&self, table: &ScyllaU64ToU64CounterTablePreparedStatements, obj_id: u64, amount: i64) -> anyhow::Result<u64> {
+        table.atomic_increment(&self.session, obj_id, amount as u64).await
     }
 }
 

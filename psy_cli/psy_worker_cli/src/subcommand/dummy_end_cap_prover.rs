@@ -70,8 +70,11 @@ pub async fn run_worker_inner(
             sleep(Duration::from_secs(1)).await;
         }
     } else if proving_backend == PsyChainProvingBackendType::JTMBPoseidonGoldilocks {
+
         info!("Using JTMB Poseidon Goldilocks proving backend for dummy end cap prover");
         type N = QNetworkTypesConfigHelper<QProvingJobDataID, ZKTypesJTMBGoldilocksPoseidon, PsyNetworkLocalDevnetConstants>;
+        
+        
         let mut prover = create_jtmb_dummy_end_cap_prover::<N, JTMBPoseidonGoldilocksConfig>(&coordinator_api_url, &realm_api_url, network)?;
 
         prover.query_contract_state_heights(0, 100).await?;

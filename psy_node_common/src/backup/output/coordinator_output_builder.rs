@@ -246,11 +246,11 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
         genesis_checkpoint_state_transition_hash: N::QHash,
         block_time: u64,
     ) -> anyhow::Result<QCQEDCheckpointStateTransitionInput<N::F, N::QHash>> {
-        tracing::info!("last committed checkpoint leaf: {:?} ", last_committed.checkpoint_leaf);
-        tracing::info!("last committed checkpoint leaf hash: {:?} ({})", last_committed.checkpoint_leaf_hash, hex::encode(&last_committed.checkpoint_leaf_hash.into_owned_32bytes()));
-        tracing::info!("last committed checkpoint leaf hash (computed) : {:?} ({})", last_committed.checkpoint_leaf.qfhash::<N::HasherBase>(), hex::encode(&last_committed.checkpoint_leaf.qfhash::<N::HasherBase>().into_owned_32bytes()));
-        tracing::info!("last committed checkpoint leaf hash (computed) : {:?} ({})", last_committed.checkpoint_leaf.qfhash::<N::HasherBase>(), hex::encode(&last_committed.checkpoint_leaf.qfhash::<N::HasherBase>().into_owned_32bytes()));
-        tracing::info!("last committed global_chain_root: {:?} ({})", last_committed.checkpoint_leaf.global_chain_root, hex::encode(&last_committed.checkpoint_leaf.global_chain_root.into_owned_32bytes()));
+        //tracing::info!("last committed checkpoint leaf: {:?} ", last_committed.checkpoint_leaf);
+        //tracing::info!("last committed checkpoint leaf hash: {:?} ({})", last_committed.checkpoint_leaf_hash, hex::encode(&last_committed.checkpoint_leaf_hash.into_owned_32bytes()));
+        //tracing::info!("last committed checkpoint leaf hash (computed) : {:?} ({})", last_committed.checkpoint_leaf.qfhash::<N::HasherBase>(), hex::encode(&last_committed.checkpoint_leaf.qfhash::<N::HasherBase>().into_owned_32bytes()));
+        //tracing::info!("last committed checkpoint leaf hash (computed) : {:?} ({})", last_committed.checkpoint_leaf.qfhash::<N::HasherBase>(), hex::encode(&last_committed.checkpoint_leaf.qfhash::<N::HasherBase>().into_owned_32bytes()));
+        //tracing::info!("last committed global_chain_root: {:?} ({})", last_committed.checkpoint_leaf.global_chain_root, hex::encode(&last_committed.checkpoint_leaf.global_chain_root.into_owned_32bytes()));
 
         let checkpoint_state_roots = PQEDCheckpointGlobalStateRoots {
             contract_tree_root: self.deploy_contract_gatherer_result.end_global_contract_tree_root,

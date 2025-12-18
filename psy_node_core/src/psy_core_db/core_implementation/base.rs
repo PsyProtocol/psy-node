@@ -28,6 +28,7 @@ pub struct QRealmStoreBase<
     BiDirectionalMappingTableIdentifier: Clone + Send + Sync,
     BiDirectionalU64U128MappingTableIdentifier: Clone + Send + Sync,
     U64TableIdentifier: Clone + Send + Sync,
+    U64CounterTableIdentifier: Clone + Send + Sync,
     SingleIdTableIdentifier: Clone + Send + Sync,
     DoubleIdTableIdentifier: Clone + Send + Sync,
     KivTableIdentifier: Clone + Send + Sync,
@@ -42,6 +43,7 @@ pub struct QRealmStoreBase<
             BiDirectionalMappingTableIdentifier,
             BiDirectionalU64U128MappingTableIdentifier,
             U64TableIdentifier,
+            U64CounterTableIdentifier,
             SingleIdTableIdentifier,
             DoubleIdTableIdentifier,
             KivTableIdentifier,
@@ -65,6 +67,7 @@ pub struct QRealmStoreBase<
     pub user_leaf_table: Arc<SingleIdTableIdentifier>,
     pub user_public_key_table: Arc<SingleIdTableIdentifier>,
     pub u64_singleton_table: Arc<U64TableIdentifier>,
+    pub u64_counter_singleton_table: Arc<U64CounterTableIdentifier>,
     pub checkpoint_id_to_pending_id_table: Arc<U64TableIdentifier>,
     pub pending_id_to_checkpoint_id_table: Arc<U64TableIdentifier>,
     pub pending_id_to_pending_proc_id_table: Arc<BiDirectionalU64U128MappingTableIdentifier>,
@@ -95,6 +98,7 @@ impl<
         BiDirectionalMappingTableIdentifier: Clone + Send + Sync,
         BiDirectionalU64U128MappingTableIdentifier: Clone + Send + Sync,
         U64TableIdentifier: Clone + Send + Sync,
+        U64CounterTableIdentifier: Clone + Send + Sync,
         SingleIdTableIdentifier: Clone + Send + Sync,
         DoubleIdTableIdentifier: Clone + Send + Sync,
         KivTableIdentifier: Clone + Send + Sync,
@@ -109,6 +113,7 @@ impl<
                 BiDirectionalMappingTableIdentifier,
                 BiDirectionalU64U128MappingTableIdentifier,
                 U64TableIdentifier,
+                U64CounterTableIdentifier,
                 SingleIdTableIdentifier,
                 DoubleIdTableIdentifier,
                 KivTableIdentifier,
@@ -124,6 +129,7 @@ impl<
         BiDirectionalMappingTableIdentifier,
         BiDirectionalU64U128MappingTableIdentifier,
         U64TableIdentifier,
+        U64CounterTableIdentifier,
         SingleIdTableIdentifier,
         DoubleIdTableIdentifier,
         KivTableIdentifier,
@@ -246,7 +252,7 @@ impl<
     async fn get_latest_pending_id(&self) -> anyhow::Result<u64> {
         let v = self
             .store
-            .db_select_u64_value(&self.u64_singleton_table, U64_SINGLETON_TABLE_OBJ_ID_PENDING_ID)
+            .db_select_u64_counter_value(&self.u64_counter_singleton_table, U64_SINGLETON_TABLE_OBJ_ID_PENDING_ID)
             .await?;
         match v {
             Some(id) => Ok(id),
@@ -279,6 +285,7 @@ impl<
         BiDirectionalMappingTableIdentifier: Clone + Send + Sync,
         BiDirectionalU64U128MappingTableIdentifier: Clone + Send + Sync,
         U64TableIdentifier: Clone + Send + Sync,
+        U64CounterTableIdentifier: Clone + Send + Sync,
         SingleIdTableIdentifier: Clone + Send + Sync,
         DoubleIdTableIdentifier: Clone + Send + Sync,
         KivTableIdentifier: Clone + Send + Sync,
@@ -293,6 +300,7 @@ impl<
                 BiDirectionalMappingTableIdentifier,
                 BiDirectionalU64U128MappingTableIdentifier,
                 U64TableIdentifier,
+                U64CounterTableIdentifier,
                 SingleIdTableIdentifier,
                 DoubleIdTableIdentifier,
                 KivTableIdentifier,
@@ -309,6 +317,7 @@ impl<
         BiDirectionalMappingTableIdentifier,
         BiDirectionalU64U128MappingTableIdentifier,
         U64TableIdentifier,
+        U64CounterTableIdentifier,
         SingleIdTableIdentifier,
         DoubleIdTableIdentifier,
         KivTableIdentifier,
@@ -616,6 +625,7 @@ impl<
         BiDirectionalMappingTableIdentifier: Clone + Send + Sync,
         BiDirectionalU64U128MappingTableIdentifier: Clone + Send + Sync,
         U64TableIdentifier: Clone + Send + Sync,
+        U64CounterTableIdentifier: Clone + Send + Sync,
         SingleIdTableIdentifier: Clone + Send + Sync,
         DoubleIdTableIdentifier: Clone + Send + Sync,
         KivTableIdentifier: Clone + Send + Sync,
@@ -630,6 +640,7 @@ impl<
                 BiDirectionalMappingTableIdentifier,
                 BiDirectionalU64U128MappingTableIdentifier,
                 U64TableIdentifier,
+                U64CounterTableIdentifier,
                 SingleIdTableIdentifier,
                 DoubleIdTableIdentifier,
                 KivTableIdentifier,
@@ -646,6 +657,7 @@ impl<
         BiDirectionalMappingTableIdentifier,
         BiDirectionalU64U128MappingTableIdentifier,
         U64TableIdentifier,
+        U64CounterTableIdentifier,
         SingleIdTableIdentifier,
         DoubleIdTableIdentifier,
         KivTableIdentifier,
@@ -667,7 +679,7 @@ impl<
     async fn inc_unique_pending_id(&self, amount: u64) -> anyhow::Result<(u64, QCoreProcCheckpointUniqueId)> {
         let new_pending_id = self
             .store
-            .db_inc_counter(&self.u64_singleton_table, U64_SINGLETON_TABLE_OBJ_ID_PENDING_ID, amount as i64)
+            .db_inc_u64_counter(&self.u64_counter_singleton_table, U64_SINGLETON_TABLE_OBJ_ID_PENDING_ID, amount as i64)
             .await?;
         let unique_id = rand::random::<u128>();
         self.store

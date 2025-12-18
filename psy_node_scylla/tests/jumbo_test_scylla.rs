@@ -14,10 +14,10 @@ use parth_crypto::hash::sha256::CoreSha256Hasher;
 use psy_node_scylla::{
     core::ScyllaCoreStore,
     tables::{
-        blob::ScyllaBiDirectionalBlobToBlobTablePreparedStatements, hash_to_many_ids::ScyllaHashToManyIdsTablePreparedStatements, merkle::{ScyllaDoubleMerkleNodesPreparedStatements, ScyllaMerkleNodesPreparedStatements, ScyllaMerkleNodesZeroPreparedStatements}, object::{
+        blob::ScyllaBiDirectionalBlobToBlobTablePreparedStatements, counter::u64_counter::ScyllaU64ToU64CounterTablePreparedStatements, hash_to_many_ids::ScyllaHashToManyIdsTablePreparedStatements, merkle::{ScyllaDoubleMerkleNodesPreparedStatements, ScyllaMerkleNodesPreparedStatements, ScyllaMerkleNodesZeroPreparedStatements}, object::{
             ScyllaGenericKeyIdValueTablePreparedStatements, ScyllaGenericObjectDoubleIdTablePreparedStatements,
             ScyllaGenericObjectSingleIdTablePreparedStatements,
-        }, tag_tree::ScyllaTagTreeNodesPreparedStatements, u64_tbl::{ScyllaBidirectionalU64U128MappingPreparedStatements, ScyllaU64ToU64TablePreparedStatements}
+        }, tag_tree::ScyllaTagTreeNodesPreparedStatements, u64_table::{ScyllaBidirectionalU64U128MappingPreparedStatements, ScyllaU64ToU64TablePreparedStatements}
     },
 };
 use psy_data::v1::qdata::user::PQEDUserLeaf;
@@ -62,6 +62,7 @@ pub struct SimpleStoreEx {
         ScyllaBiDirectionalBlobToBlobTablePreparedStatements,
         ScyllaBidirectionalU64U128MappingPreparedStatements,
         ScyllaU64ToU64TablePreparedStatements,
+        ScyllaU64ToU64CounterTablePreparedStatements,
         ScyllaGenericObjectSingleIdTablePreparedStatements,
         ScyllaGenericObjectDoubleIdTablePreparedStatements,
         ScyllaGenericKeyIdValueTablePreparedStatements,
@@ -109,6 +110,9 @@ impl SimpleStoreEx {
             .await?;
         let u64_table_b = store
             .init_std_table::<ScyllaU64ToU64TablePreparedStatements>("u64_table_b", get_rk(10))
+            .await?;
+        let u64_counter_table_a = store
+            .init_no_tablet_table::<ScyllaU64ToU64CounterTablePreparedStatements>("u64_counter_table_a", get_rk(22))
             .await?;
         let u64_u128_bi_directional_mapping_table_a = store
             .init_std_table::<ScyllaBidirectionalU64U128MappingPreparedStatements>("u64_u128_bi_directional_mapping_table_a", get_rk(11))
@@ -166,6 +170,7 @@ impl SimpleStoreEx {
             Arc::new(obj_double_id_table_b),
             Arc::new(u64_table_a),
             Arc::new(u64_table_b),
+            Arc::new(u64_counter_table_a),
             Arc::new(u64_u128_bi_directional_mapping_table_a),
             Arc::new(u64_u128_bi_directional_mapping_table_b),
             Arc::new(merkle_node_zero_id_table_a),
@@ -200,6 +205,7 @@ impl SimpleStoreEx {
 
         // u64 value table tests
         self.store.th_test_u64_table_1(&self.store.u64_table_a).await?;
+        self.store.th_test_u64_counter_table_1(&self.store.u64_counter_table_a).await?;
 
         // single checkpointed object id tests
         self.store.th_test_single_checkpointed_object_1_full_history_1::<ExObjSingleIdTableAValue>(&self.store.obj_single_id_table_a).await?;

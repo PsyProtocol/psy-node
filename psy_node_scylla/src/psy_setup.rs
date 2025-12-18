@@ -6,15 +6,10 @@ use psy_node_core::psy_core_db::v3_implementation::full::PsyUnifiedCoreDatabaseS
 use crate::{
     core::ScyllaCoreStore,
     tables::{
-        blob::ScyllaBiDirectionalBlobToBlobTablePreparedStatements,
-        hash_to_many_ids::ScyllaHashToManyIdsTablePreparedStatements,
-        merkle::{ScyllaDoubleMerkleNodesPreparedStatements, ScyllaMerkleNodesPreparedStatements, ScyllaMerkleNodesZeroPreparedStatements},
-        object::{
+        blob::ScyllaBiDirectionalBlobToBlobTablePreparedStatements, counter::u64_counter::ScyllaU64ToU64CounterTablePreparedStatements, hash_to_many_ids::ScyllaHashToManyIdsTablePreparedStatements, merkle::{ScyllaDoubleMerkleNodesPreparedStatements, ScyllaMerkleNodesPreparedStatements, ScyllaMerkleNodesZeroPreparedStatements}, object::{
             ScyllaGenericKeyIdValueTablePreparedStatements, ScyllaGenericObjectDoubleIdTablePreparedStatements,
             ScyllaGenericObjectSingleIdTablePreparedStatements,
-        },
-        tag_tree::ScyllaTagTreeNodesPreparedStatements,
-        u64_tbl::{ScyllaBidirectionalU64U128MappingPreparedStatements, ScyllaU64ToU64TablePreparedStatements},
+        }, tag_tree::ScyllaTagTreeNodesPreparedStatements, u64_table::{ScyllaBidirectionalU64U128MappingPreparedStatements, ScyllaU64ToU64TablePreparedStatements}
     },
 };
 
@@ -27,12 +22,13 @@ type ExSingleIdMerkleTableIdentifier = ScyllaMerkleNodesPreparedStatements;
 type ExDoubleIdMerkleTableIdentifier = ScyllaDoubleMerkleNodesPreparedStatements;
 type ExTagTreeTableIdentifier = ScyllaTagTreeNodesPreparedStatements;
 type ExHashToManyIdsTableIdentifier = ScyllaHashToManyIdsTablePreparedStatements;
-
+type ExU64CounterTableIdentifier = ScyllaU64ToU64CounterTablePreparedStatements;
 pub type ScyllaUnifiedPsyStore<N, Hash, Hasher> = PsyUnifiedCoreDatabaseStore<
     N,
     ScyllaBiDirectionalBlobToBlobTablePreparedStatements,
     ScyllaBidirectionalU64U128MappingPreparedStatements,
     ScyllaU64ToU64TablePreparedStatements,
+    ScyllaU64ToU64CounterTablePreparedStatements,
     ScyllaGenericObjectSingleIdTablePreparedStatements,
     ScyllaGenericObjectDoubleIdTablePreparedStatements,
     ScyllaGenericKeyIdValueTablePreparedStatements,
@@ -144,6 +140,7 @@ pub async fn setup_psy_scylla_database_store<N: QNetworkDatabaseTypes>(
         user_leaf_table,
         user_public_key_table,
         u64_singleton_table,
+        u64_counter_singleton_table,
         contract_state_tree_height_table,
         checkpoint_id_to_pending_id_table,
         pending_id_to_checkpoint_id_table,
@@ -173,27 +170,28 @@ pub async fn setup_psy_scylla_database_store<N: QNetworkDatabaseTypes>(
         store.init_std_table::<ExSingleIdTableIdentifier>("user_leaf_table", get_rk(9)),
         store.init_std_table::<ExSingleIdTableIdentifier>("user_public_key_table", get_rk(10)),
         store.init_std_table::<ExU64TableIdentifier>("u64_singleton_table", get_rk(11)),
-        store.init_std_table::<ExSingleIdTableIdentifier>("contract_state_tree_height_table", get_rk(12)),
-        store.init_std_table::<ExU64TableIdentifier>("checkpoint_id_to_pending_id_table", get_rk(13)),
-        store.init_std_table::<ExU64TableIdentifier>("pending_id_to_checkpoint_id_table", get_rk(14)),
-        store.init_std_table::<ExBiDirectionalU64U128MappingTableIdentifier>("pending_id_to_pending_proc_id_table", get_rk(15)),
-        store.init_std_table::<ExSingleIdTableIdentifier>("realm_rewards_tree_node_key_table", get_rk(27)),
+        store.init_no_tablet_table::<ExU64CounterTableIdentifier>("u64_counter_singleton_table", get_rk(12)),
+        store.init_std_table::<ExSingleIdTableIdentifier>("contract_state_tree_height_table", get_rk(13)),
+        store.init_std_table::<ExU64TableIdentifier>("checkpoint_id_to_pending_id_table", get_rk(14)),
+        store.init_std_table::<ExU64TableIdentifier>("pending_id_to_checkpoint_id_table", get_rk(15)),
+        store.init_std_table::<ExBiDirectionalU64U128MappingTableIdentifier>("pending_id_to_pending_proc_id_table", get_rk(16)),
+        store.init_std_table::<ExSingleIdTableIdentifier>("realm_rewards_tree_node_key_table", get_rk(17)),
         // mappings
-        store.init_std_table::<ExHashToManyIdsTableIdentifier>("public_key_hash_to_user_ids_table", get_rk(16)),
+        store.init_std_table::<ExHashToManyIdsTableIdentifier>("public_key_hash_to_user_ids_table", get_rk(18)),
         // start trees
-        store.init_zero_id_merkle_table("global_user_tree_table", get_rk(17), N::GLOBAL_USER_TREE_HEIGHT),
-        store.init_std_table::<ExSingleIdMerkleTableIdentifier>("user_contract_tree_table", get_rk(18)),
-        store.init_std_table::<ExDoubleIdMerkleTableIdentifier>("contract_state_tree_table", get_rk(19)),
-        store.init_zero_id_merkle_table("global_checkpoint_tree_table", get_rk(20), N::CHECKPOINT_TREE_HEIGHT),
+        store.init_zero_id_merkle_table("global_user_tree_table", get_rk(19), N::GLOBAL_USER_TREE_HEIGHT),
+        store.init_std_table::<ExSingleIdMerkleTableIdentifier>("user_contract_tree_table", get_rk(20)),
+        store.init_std_table::<ExDoubleIdMerkleTableIdentifier>("contract_state_tree_table", get_rk(21)),
+        store.init_zero_id_merkle_table("global_checkpoint_tree_table", get_rk(22), N::CHECKPOINT_TREE_HEIGHT),
         // start reward tree table
-        store.init_std_table::<ExTagTreeTableIdentifier>("guta_reward_tag_tree_table", get_rk(21)),
+        store.init_std_table::<ExTagTreeTableIdentifier>("guta_reward_tag_tree_table", get_rk(23)),
         // added tables for completeness
-        store.init_zero_id_merkle_table("user_registration_tree_table", get_rk(22), N::GLOBAL_USER_TREE_HEIGHT),
-        store.init_zero_id_merkle_table("global_contract_tree_table", get_rk(23), N::GLOBAL_CONTRACT_TREE_HEIGHT),
-        store.init_std_table::<ExSingleIdMerkleTableIdentifier>("contract_function_tree_table", get_rk(24)),
-        store.init_std_table::<ExSingleIdTableIdentifier>("contract_leaf_table", get_rk(25)),
-        store.init_std_table::<ExSingleIdTableIdentifier>("contract_code_definition_table", get_rk(26)),
-        store.init_std_table::<ExKivTableIdentifier>("checkpoint_zk_proof_and_transition_table", get_rk(27))
+        store.init_zero_id_merkle_table("user_registration_tree_table", get_rk(24), N::GLOBAL_USER_TREE_HEIGHT),
+        store.init_zero_id_merkle_table("global_contract_tree_table", get_rk(25), N::GLOBAL_CONTRACT_TREE_HEIGHT),
+        store.init_std_table::<ExSingleIdMerkleTableIdentifier>("contract_function_tree_table", get_rk(26)),
+        store.init_std_table::<ExSingleIdTableIdentifier>("contract_leaf_table", get_rk(27)),
+        store.init_std_table::<ExSingleIdTableIdentifier>("contract_code_definition_table", get_rk(28)),
+        store.init_std_table::<ExKivTableIdentifier>("checkpoint_zk_proof_and_transition_table", get_rk(29))
     )?;
     let psy_db = PsyUnifiedCoreDatabaseStore::new(
         store.clone(),
@@ -208,6 +206,7 @@ pub async fn setup_psy_scylla_database_store<N: QNetworkDatabaseTypes>(
         Arc::new(user_leaf_table),
         Arc::new(user_public_key_table),
         Arc::new(u64_singleton_table),
+        Arc::new(u64_counter_singleton_table),
         Arc::new(contract_state_tree_height_table),
         Arc::new(checkpoint_id_to_pending_id_table),
         Arc::new(pending_id_to_checkpoint_id_table),

@@ -134,6 +134,12 @@ impl<Hash: QHashBase> QEDContractStateUpdateHistory<Hash> {
 #[auto_impl(&, Arc)]
 pub trait PSimpleContractHeightCache<Hash> {
     fn add_contract(&self, contract_id: u32, height: u8, zero_hash: Hash);
+    fn contains_key(&self, contract_id: u32) -> bool {
+        match self.get_contract_height(contract_id) {
+            Ok(_) => true,
+            Err(_) => false,
+        }
+    }
     fn get_contract_height(&self, contract_id: u32) -> anyhow::Result<u8>;
     fn get_contract_zero_hash(&self, contract_id: u32) -> anyhow::Result<Hash>;
 }
@@ -155,6 +161,9 @@ impl<Hash: Copy> DashMapContractHeightCache<Hash> {
 impl<Hash: Eq + Copy> PSimpleContractHeightCache<Hash> for DashMapContractHeightCache<Hash> {
     fn add_contract(&self, contract_id: u32, height: u8, zero_hash: Hash) {
         self.mapping.insert(contract_id, (height, zero_hash));
+    }
+    fn contains_key(&self, contract_id: u32) -> bool {
+        self.mapping.contains_key(&contract_id)
     }
 
     fn get_contract_height(&self, contract_id: u32) -> anyhow::Result<u8> {

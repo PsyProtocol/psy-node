@@ -82,6 +82,9 @@ pub trait CoordinatorEdgeRpc<F, Hash, JobId, ZKProof>: NodeEdgeWorkerRpcServer<H
     #[method(name = "get_user_registration_tree_leaf_hash")]
     async fn get_user_registration_tree_leaf_hash(&self, checkpoint_id: u64, leaf_index: u64) -> RpcResult<Hash>;
 
+    #[method(name = "get_user_registration_tree_leaf_hashes")]
+    async fn get_user_registration_tree_leaf_hashes(&self, checkpoint_id: u64, indices: Vec<u64>) -> RpcResult<Vec<Hash>>;
+
     #[method(name = "get_user_registration_tree_merkle_proof")]
     async fn get_user_registration_tree_merkle_proof(&self, checkpoint_id: u64, leaf_index: u64) -> RpcResult<MerkleProofCore<Hash>>;
 

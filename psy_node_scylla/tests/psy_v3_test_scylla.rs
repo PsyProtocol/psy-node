@@ -11,17 +11,12 @@ use parth_crypto::hash::sha256::CoreSha256Hasher;
 use psy_node_scylla::{
     core::ScyllaCoreStore,
     tables::{
-        blob::ScyllaBiDirectionalBlobToBlobTablePreparedStatements,
-        hash_to_many_ids::ScyllaHashToManyIdsTablePreparedStatements,
-        merkle::{
+        blob::ScyllaBiDirectionalBlobToBlobTablePreparedStatements, counter::u64_counter::ScyllaU64ToU64CounterTablePreparedStatements, hash_to_many_ids::ScyllaHashToManyIdsTablePreparedStatements, merkle::{
             ScyllaDoubleMerkleNodesPreparedStatements, ScyllaMerkleNodesPreparedStatements, ScyllaMerkleNodesZeroPreparedStatements,
-        },
-        object::{
+        }, object::{
             ScyllaGenericKeyIdValueTablePreparedStatements, ScyllaGenericObjectDoubleIdTablePreparedStatements,
             ScyllaGenericObjectSingleIdTablePreparedStatements,
-        },
-        tag_tree::ScyllaTagTreeNodesPreparedStatements,
-        u64_tbl::{ScyllaBidirectionalU64U128MappingPreparedStatements, ScyllaU64ToU64TablePreparedStatements},
+        }, tag_tree::ScyllaTagTreeNodesPreparedStatements, u64_table::{ScyllaBidirectionalU64U128MappingPreparedStatements, ScyllaU64ToU64TablePreparedStatements}
     },
 };
 use psy_node_core::{
@@ -39,6 +34,7 @@ type ExHasher = CoreSha256Hasher;
 type ExBiDirectionalMappingTableIdentifier = ScyllaBiDirectionalBlobToBlobTablePreparedStatements;
 type ExBiDirectionalU64U128MappingTableIdentifier = ScyllaBidirectionalU64U128MappingPreparedStatements;
 type ExU64TableIdentifier = ScyllaU64ToU64TablePreparedStatements;
+type ExU64CounterTableIdentifier = ScyllaU64ToU64CounterTablePreparedStatements;
 type ExSingleIdTableIdentifier = ScyllaGenericObjectSingleIdTablePreparedStatements;
 type ExDoubleIdTableIdentifier = ScyllaGenericObjectDoubleIdTablePreparedStatements;
 type ExKivTableIdentifier = ScyllaGenericKeyIdValueTablePreparedStatements;
@@ -47,6 +43,7 @@ type ExDoubleIdMerkleTableIdentifier = ScyllaDoubleMerkleNodesPreparedStatements
 type ExZeroIdMerkleTableIdentifier = ScyllaMerkleNodesZeroPreparedStatements;
 type ExTagTreeTableIdentifier = ScyllaTagTreeNodesPreparedStatements;
 type ExHashToManyIdsTableIdentifier = ScyllaHashToManyIdsTablePreparedStatements;
+
 
 type ScyllaTestStore = ScyllaCoreStore<ExHash, ExHasher>;
 
@@ -94,6 +91,7 @@ pub struct SimpleStoreEx {
         ExBiDirectionalMappingTableIdentifier,
         ExBiDirectionalU64U128MappingTableIdentifier,
         ExU64TableIdentifier,
+        ExU64CounterTableIdentifier,
         ExSingleIdTableIdentifier,
         ExDoubleIdTableIdentifier,
         ExKivTableIdentifier,
@@ -128,63 +126,64 @@ impl SimpleStoreEx {
         let user_leaf_table = store.init_std_table::<ExSingleIdTableIdentifier>("user_leaf_table", get_rk(9)).await?;
         let user_public_key_table = store.init_std_table::<ExSingleIdTableIdentifier>("user_public_key_table", get_rk(10)).await?;
         let u64_singleton_table = store.init_std_table::<ExU64TableIdentifier>("u64_singleton_table", get_rk(11)).await?;
+        let u64_counter_singleton_table = store.init_no_tablet_table::<ExU64CounterTableIdentifier>("u64_counter_singleton_table", get_rk(12)).await?;
         let contract_state_tree_height_table =
-            store.init_std_table::<ExSingleIdTableIdentifier>("contract_state_tree_height_table", get_rk(12)).await?;
+            store.init_std_table::<ExSingleIdTableIdentifier>("contract_state_tree_height_table", get_rk(13)).await?;
         let checkpoint_id_to_pending_id_table =
-            store.init_std_table::<ExU64TableIdentifier>("checkpoint_id_to_pending_id_table", get_rk(13)).await?;
+            store.init_std_table::<ExU64TableIdentifier>("checkpoint_id_to_pending_id_table", get_rk(14)).await?;
         let pending_id_to_checkpoint_id_table =
-            store.init_std_table::<ExU64TableIdentifier>("pending_id_to_checkpoint_id_table", get_rk(14)).await?;
+            store.init_std_table::<ExU64TableIdentifier>("pending_id_to_checkpoint_id_table", get_rk(15)).await?;
         let pending_id_to_pending_proc_id_table = store
-            .init_std_table::<ExBiDirectionalU64U128MappingTableIdentifier>("pending_id_to_pending_proc_id_table", get_rk(15))
+            .init_std_table::<ExBiDirectionalU64U128MappingTableIdentifier>("pending_id_to_pending_proc_id_table", get_rk(16))
             .await?;
         let realm_rewards_tree_node_key_table = store
-            .init_std_table::<ExSingleIdTableIdentifier>("realm_rewards_tree_node_key_table", get_rk(27))
+            .init_std_table::<ExSingleIdTableIdentifier>("realm_rewards_tree_node_key_table", get_rk(17))
             .await?;
         // mappings
         let public_key_hash_to_user_ids_table =
-            store.init_std_table::<ExHashToManyIdsTableIdentifier>("public_key_hash_to_user_ids_table", get_rk(16)).await?;
+            store.init_std_table::<ExHashToManyIdsTableIdentifier>("public_key_hash_to_user_ids_table", get_rk(18)).await?;
         // start trees
         let global_user_tree_table = store
             .init_zero_id_merkle_table(
                 "global_user_tree_table",
-                get_rk(17),
+                get_rk(19),
                 SimpleTestNetworkConfig::GLOBAL_USER_TREE_HEIGHT,
             )
             .await?;
-        let user_contract_tree_table = store.init_std_table::<ExSingleIdMerkleTableIdentifier>("user_contract_tree_table", get_rk(18)).await?;
+        let user_contract_tree_table = store.init_std_table::<ExSingleIdMerkleTableIdentifier>("user_contract_tree_table", get_rk(20)).await?;
         let contract_state_tree_table =
-            store.init_std_table::<ExDoubleIdMerkleTableIdentifier>("contract_state_tree_table", get_rk(19)).await?;
+            store.init_std_table::<ExDoubleIdMerkleTableIdentifier>("contract_state_tree_table", get_rk(21)).await?;
         let global_checkpoint_tree_table = store
             .init_zero_id_merkle_table(
                 "global_checkpoint_tree_table",
-                get_rk(20),
+                get_rk(22),
                 SimpleTestNetworkConfig::CHECKPOINT_TREE_HEIGHT,
             )
             .await?;
         // start reward tree table
-        let guta_reward_tag_tree_table = store.init_std_table::<ExTagTreeTableIdentifier>("guta_reward_tag_tree_table", get_rk(21)).await?;
+        let guta_reward_tag_tree_table = store.init_std_table::<ExTagTreeTableIdentifier>("guta_reward_tag_tree_table", get_rk(23)).await?;
         // added tables for completeness
         let user_registration_tree_table = store
             .init_zero_id_merkle_table(
                 "user_registration_tree_table",
-                get_rk(22),
+                get_rk(24),
                 SimpleTestNetworkConfig::GLOBAL_USER_TREE_HEIGHT,
             )
             .await?;
         let global_contract_tree_table = store
             .init_zero_id_merkle_table(
                 "global_contract_tree_table",
-                get_rk(23),
+                get_rk(25),
                 SimpleTestNetworkConfig::GLOBAL_CONTRACT_TREE_HEIGHT,
             )
             .await?;
         let contract_function_tree_table =
-            store.init_std_table::<ExSingleIdMerkleTableIdentifier>("contract_function_tree_table", get_rk(24)).await?;
-        let contract_leaf_table = store.init_std_table::<ExSingleIdTableIdentifier>("contract_leaf_table", get_rk(25)).await?;
+            store.init_std_table::<ExSingleIdMerkleTableIdentifier>("contract_function_tree_table", get_rk(26)).await?;
+        let contract_leaf_table = store.init_std_table::<ExSingleIdTableIdentifier>("contract_leaf_table", get_rk(27)).await?;
         let contract_code_definition_table =
-            store.init_std_table::<ExSingleIdTableIdentifier>("contract_code_definition_table", get_rk(26)).await?;
+            store.init_std_table::<ExSingleIdTableIdentifier>("contract_code_definition_table", get_rk(28)).await?;
 
-        let checkpoint_zk_proof_and_transition_table = store.init_std_table::<ExKivTableIdentifier>("checkpoint_zk_proof_and_transition_table", get_rk(27)).await?;
+        let checkpoint_zk_proof_and_transition_table = store.init_std_table::<ExKivTableIdentifier>("checkpoint_zk_proof_and_transition_table", get_rk(29)).await?;
         let psy_db = PsyUnifiedCoreDatabaseStore::new(
             store.clone(),
             Arc::new(checkpoint_leaf_table),
@@ -198,6 +197,7 @@ impl SimpleStoreEx {
             Arc::new(user_leaf_table),
             Arc::new(user_public_key_table),
             Arc::new(u64_singleton_table),
+            Arc::new(u64_counter_singleton_table),
             Arc::new(contract_state_tree_height_table),
             Arc::new(checkpoint_id_to_pending_id_table),
             Arc::new(pending_id_to_checkpoint_id_table),

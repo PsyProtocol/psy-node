@@ -33,10 +33,11 @@ ts-rs = { workspace = true }
 cf_utils = { workspace = true }
 k256 = { workspace = true, optional = true }
 dashmap = { workspace = true, optional = true }
-
+futures = { workspace = true }
 # start local packages
 parth_core = { workspace = true }
 
 [dev-dependencies]
 parth_crypto = { workspace = true }
 rand = { workspace = true }
+tokio = { workspace = true }

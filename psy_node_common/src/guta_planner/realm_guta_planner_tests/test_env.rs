@@ -3,12 +3,12 @@ use std::{collections::HashMap, sync::Arc};
 use parth_common::memory_stores::{dash_tree_append_only::PsyDashMemoryAppendOnlyMerkleStore, traits::PsyMemoryMerkleStoreImm};
 use parth_core::{
     QCoreProcCheckpointUniqueId, QJobIdBase, crypto::hash::traits::{FromU64x4, MerkleZeroHasher, QFieldHashable, ZeroableHash}, data::
-        hash::merkle_store_key::{QMerkleStoreDoubleIdKey, QMerkleStoreSingleIdKey}, felt::{FromPrimitiveValuesFelt, ToU64Value, ZeroableFelt}, node::realm_identifier::QRealmIdentifier, protocol::core_types::{QNetworkTreeCircuitSpecificConstants, QNetworkTreeConstants}, utils::{QPGenRandom, math::{ceil_div_usize, log2_ceil}}
+        hash::merkle_store_key::{QMerkleStoreDoubleIdKey, QMerkleStoreSingleIdKey}, felt::{FromPrimitiveValuesFelt, ToU64Value, ZeroableFelt}, node::realm_identifier::QRealmIdentifier, protocol::core_types::{QNetworkTreeCircuitSpecificConstants, QNetworkTreeConstants}, utils::{QPGenRandom, math::log2_ceil}
 };
-use psy_core::{job::{self, job_id::{ProvingJobCircuitType, QProvingJobDataID}}, user_id};
+use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{
     guta::{header::GlobalUserTreeAggregatorHeader, stats::GUTAStats},
-    proof_input::guta::{GUTAVerifyLeftGUTARightEndCapCircuitInputV2, GUTAVerifyTwoEndCapCircuitInputV2, GUTAVerifyTwoGUTALinearCircuitInput, SubmitUserEndCapNonProofCoreInput, VerifySingleEndCapInputV2, VerifyTwoEndCapCircuitInput, end_cap_input::SubmitUserEndCapNonProofInput},
+    proof_input::guta::{GUTAVerifyLeftGUTARightEndCapCircuitInputV2, GUTAVerifyTwoEndCapCircuitInputV2, GUTAVerifyTwoGUTALinearCircuitInput, SubmitUserEndCapNonProofCoreInput, VerifySingleEndCapInputV2, end_cap_input::SubmitUserEndCapNonProofInput},
     queue_items::realm_user_update::PsyRealmUserUpdateQueueItem,
     v1::qdata::{
         contract::{DashMapContractHeightCache, PSimpleContractHeightCache, QEDContractStateUpdateHistory},
@@ -562,13 +562,13 @@ impl RGPTestChainState {
 
 
         let mut outputs = Vec::with_capacity(job_levels.len());
-        for (level_index, level) in job_levels.iter().enumerate() {
+        for level in job_levels.iter() {
             let mut level_outputs = Vec::with_capacity(level.len());
-            for (job_index, j) in level.iter().enumerate() {
+            for j in level.iter() {
                 let raw_witness = self.temp_db.get_tdb_proof_witness_bytes(&self.realm_identifier, self.unique_pending_id, j.job_id).await.map_err(|e|{
                     anyhow::anyhow!("error fetching witness for job: {:?}: {:?}", j.job_id, e)
                 })?;
-                let info = RGPJobInfo::new_from_metadata_and_raw_witness(j, level_index, job_index, &raw_witness).map_err(|e|{
+                let info = RGPJobInfo::new_from_metadata_and_raw_witness(j, &raw_witness).map_err(|e|{
                     anyhow::anyhow!("error deserializing witness for job: {:?}: {:?}", j.job_id, e)
                 })?;
                 level_outputs.push(info);
@@ -678,8 +678,6 @@ impl RGPJobWitness {
 #[derive(Clone, Debug)]
 pub struct RGPJobInfo {
     pub job_id: QProvingJobDataID,
-    pub job_level: usize,
-    pub job_index_in_level: usize,
     pub parent_job_id: QProvingJobDataID, // if none, then use invalid job
     pub metadata: PsyProvingJobMetadata<Hash, QProvingJobDataID>,
     pub witness: RGPJobWitness,
@@ -688,8 +686,6 @@ pub struct RGPJobInfo {
 impl RGPJobInfo {
     pub fn new_from_metadata_and_raw_witness(
         job_with_metadata: &PsyProvingJobMetadataWithJobId<Hash, QProvingJobDataID>,
-        job_level: usize,
-        job_index_in_level: usize,
         witness_bytes: &[u8],
     ) -> anyhow::Result<Self> {
         let witness = RGPJobWitness::from_witness_bytes_for_circuit_type(job_with_metadata.job_id.circuit_type, witness_bytes)?;
@@ -700,11 +696,9 @@ impl RGPJobInfo {
             parent_job_id,
             metadata: job_with_metadata.metadata.clone(),
             witness,
-            job_level,
-            job_index_in_level,
         })
     }
-    pub fn test_basic_continuity_check(&self, guta_circuit_whitelist: Hash) -> anyhow::Result<()> {
+    pub fn test_basic_continuity_check(&self) -> anyhow::Result<()> {
 
         if self.metadata.dependencies.len() == 1 {
             let w = match &self.witness {
@@ -836,19 +830,6 @@ impl RGPJobInfo {
     }
 }
 
-
-// Helper function to make Rust Debug strings safe for DOT IDs
-fn sanitize_dot_id(id: &str) -> String {
-    id.replace(" ", "")
-      .replace("(", "_")
-      .replace(")", "_")
-      .replace("[", "_")
-      .replace("]", "_")
-      .replace(",", "_")
-      .replace(":", "")
-      .replace("\"", "")
-}
-
 #[derive(Clone)]
 pub struct RGPTestResultValidator {
     pub end_cap_job_ids: Vec<QProvingJobDataID>,
@@ -859,15 +840,6 @@ pub struct RGPTestResultValidator {
     pub guta_circuit_whitelist: Hash,
 }
 
-// Simple sanitizer for the unique leaf IDs
-fn sanitize_dot_id_simple(id: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    // Hashing is safer/shorter for generated leaf IDs than sanitizing arbitrary strings
-    let mut hasher = DefaultHasher::new();
-    id.hash(&mut hasher);
-    format!("{:x}", hasher.finish())
-}
 impl RGPTestResultValidator {
     pub fn new(
         guta_circuit_whitelist: Hash,
@@ -886,7 +858,7 @@ impl RGPTestResultValidator {
         for l in rgp_job_info.iter() {
             for job_info in l.iter() {
                 job_info.basic_dependency_type_verify()?;
-                job_info.test_basic_continuity_check(guta_circuit_whitelist)?;
+                job_info.test_basic_continuity_check()?;
                 if job_info.metadata.dependencies.len() == 2 {
                     if child_to_parent_map.contains_key(&job_info.metadata.dependencies[0]) {
                         anyhow::bail!("Job {:?} dependency {:?} already has a parent assigned", job_info.job_id, job_info.metadata.dependencies[0]);
@@ -1146,5 +1118,21 @@ async fn check_many_and_print_errors() -> anyhow::Result<()> {
 
 
 
+    Ok(())
+}
+
+
+#[tokio::test]
+async fn test_guta_planner_print_graphviz() -> anyhow::Result<()> {
+    cf_utils::logging::setup_logging()?;
+    let guta_circuit_whitelist = Hash::from_u64x4([1337, 69, 420, 9696]);
+    let mut chain_state = RGPTestChainState::create_for_tests().await?;
+    let (db_output, job_info, end_cap_jobs) = chain_state.run_random_test_checkpoint_get_dbg_info(20, 3, 2, 5).await?;
+    let validation_results = RGPTestResultValidator::new(guta_circuit_whitelist, db_output, job_info, end_cap_jobs)?;
+    if validation_results.child_to_parent_map.is_empty() || validation_results.job_map.is_empty() || validation_results.output_database.is_noop() {
+        anyhow::bail!("Validation results maps are empty, cannot generate graph viz");
+    }
+    
+    println!("{}", validation_results.generate_graph_viz());
     Ok(())
 }

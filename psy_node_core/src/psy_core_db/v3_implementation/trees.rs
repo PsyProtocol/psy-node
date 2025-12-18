@@ -249,7 +249,7 @@ impl<
     async fn get_latest_pending_id(&self) -> anyhow::Result<u64> {
         let v = self
             .store
-            .db_select_u64_value(&self.u64_singleton_table, U64_SINGLETON_TABLE_OBJ_ID_PENDING_ID)
+            .db_select_u64_counter_value(&self.u64_counter_singleton_table, U64_SINGLETON_TABLE_OBJ_ID_PENDING_ID)
             .await?;
         match v {
             Some(id) => Ok(id),

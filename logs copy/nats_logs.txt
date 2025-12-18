@@ -1,0 +1,27 @@
+[1] 2025/12/18 05:06:45.138589 [INF] Starting nats-server
+[1] 2025/12/18 05:06:45.138606 [INF]   Version:  2.12.0
+[1] 2025/12/18 05:06:45.138607 [INF]   Git:      [fc6ec64]
+[1] 2025/12/18 05:06:45.138608 [INF]   Name:     NBTR5U55UCLKZXVXVMYMJHNI7GSDDTOMTBOZPPOLL5KYPIWNLUZFSEEG
+[1] 2025/12/18 05:06:45.138610 [INF]   Node:     ViF2miH5
+[1] 2025/12/18 05:06:45.138611 [INF]   ID:       NBTR5U55UCLKZXVXVMYMJHNI7GSDDTOMTBOZPPOLL5KYPIWNLUZFSEEG
+[1] 2025/12/18 05:06:45.138973 [INF] Starting JetStream
+[1] 2025/12/18 05:06:45.138981 [WRN] Temporary storage directory used, data could be lost on system reboot
+[1] 2025/12/18 05:06:45.139729 [INF]     _ ___ _____ ___ _____ ___ ___   _   __  __
+[1] 2025/12/18 05:06:45.139737 [INF]  _ | | __|_   _/ __|_   _| _ \ __| /_\ |  \/  |
+[1] 2025/12/18 05:06:45.139737 [INF] | || | _|  | | \__ \ | | |   / _| / _ \| |\/| |
+[1] 2025/12/18 05:06:45.139738 [INF]  \__/|___| |_| |___/ |_| |_|_\___/_/ \_\_|  |_|
+[1] 2025/12/18 05:06:45.139738 [INF] 
+[1] 2025/12/18 05:06:45.139739 [INF]          https://docs.nats.io/jetstream
+[1] 2025/12/18 05:06:45.139739 [INF] 
+[1] 2025/12/18 05:06:45.139740 [INF] ---------------- JETSTREAM ----------------
+[1] 2025/12/18 05:06:45.139740 [INF]   Strict:          true
+[1] 2025/12/18 05:06:45.139742 [INF]   Max Memory:      36.33 GB
+[1] 2025/12/18 05:06:45.139744 [INF]   Max Storage:     687.54 GB
+[1] 2025/12/18 05:06:45.139744 [INF]   Store Directory: "/tmp/nats/jetstream"
+[1] 2025/12/18 05:06:45.139745 [INF]   API Level:       2
+[1] 2025/12/18 05:06:45.139745 [INF] -------------------------------------------
+[1] 2025/12/18 05:06:45.141446 [INF] Listening for client connections on 0.0.0.0:4222
+[1] 2025/12/18 05:06:45.141598 [INF] Server is ready
+[1] 2025/12/18 05:16:00.364459 [INF] Trapped "interrupt" signal
+[1] 2025/12/18 05:16:00.364839 [INF] Initiating Shutdown...
+[1] 2025/12/18 05:16:00.364862 [INF] Initiating JetStream Shutdown...

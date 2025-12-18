@@ -92,6 +92,13 @@ pub trait RealmEdgeRpc<F, Hash, JobId, ZKProof> {
         user_id: u64,
     ) -> RpcResult<PQEDUserLeaf<F, Hash>>;
 
+    #[method(name = "get_user_leaves_batch")]
+    async fn get_user_leaves_batch(
+        &self,
+        checkpoint_id: u64,
+        user_ids: Vec<u64>,
+    ) -> RpcResult<Vec<PQEDUserLeaf<F, Hash>>>;
+
     #[method(name = "get_user_contract_state_tree_root")]
     async fn get_user_contract_state_tree_root(
         &self,
@@ -167,6 +174,14 @@ pub trait RealmEdgeRpc<F, Hash, JobId, ZKProof> {
         checkpoint_id: u64,
         user_id: u64,
     ) -> RpcResult<Hash>;
+
+
+    #[method(name = "get_user_tree_leaf_hashes")]
+    async fn get_user_tree_leaf_hashes(
+        &self,
+        checkpoint_id: u64,
+        user_ids: Vec<u64>,
+    ) -> RpcResult<Vec<Hash>>;
 
     #[method(name = "get_user_bottom_tree_merkle_proof")]
     async fn get_user_bottom_tree_merkle_proof(

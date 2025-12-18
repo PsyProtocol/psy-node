@@ -44,7 +44,7 @@ parth_crypto = { workspace = true }
 psy_common = { workspace = true }
 psy_node_core = { workspace = true }
 psy_data = { workspace = true }
-
+cf_utils = { workspace = true }
 [dev-dependencies]
 criterion = { workspace = true }
 dashmap = { workspace = true }

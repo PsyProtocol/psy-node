@@ -5,6 +5,7 @@ pub mod worker;
 pub mod worker_test;
 pub mod keypair_helper;
 pub mod dummy_end_cap_prover;
+pub mod dummy_end_cap_prover_lite;
 
 #[derive(Parser)]
 pub struct Cli {
@@ -71,7 +72,7 @@ pub enum Commands {
 
     #[command(about = "Run a proof mining worker")]
     DummyEndCapProver {
-        #[arg(long = "url",  help = "Realm RPC URL to submit end caps to")]
+        #[arg(long = "realm-api-url", alias = "url",  help = "Realm RPC URL to submit end caps to")]
         realm_api_url: String,
 
         #[arg(long = "coordinator-url",  help = "Coordinator RPC URL to fetch user public keys from")]
@@ -80,10 +81,10 @@ pub enum Commands {
         #[arg(long = "min-state-updates", help = "Minimum number of state updates to include per transaction in end cap", default_value_t = 1)]
         min_state_updates: u32,
 
-        #[arg(long = "max-state-updates", help = "Maximum number of state updates to include per transaction in end cap", default_value_t = 100)]
+        #[arg(long = "max-state-updates", help = "Maximum number of state updates to include per transaction in end cap", default_value_t = 2)]
         max_state_updates: u32,
 
-        #[arg(long = "max-contract-calls", help = "Maximum number of contract calls to include in end cap", default_value_t = 3)]
+        #[arg(long = "max-contract-calls", help = "Maximum number of contract calls to include in end cap", default_value_t = 1)]
         max_contract_calls: u32,
 
         #[arg(long = "user", help = "The user id to submit end caps for")]
@@ -91,6 +92,39 @@ pub enum Commands {
         
         #[arg(long = "end-cap-count", help = "Number of end caps to submit before exiting (0 = forever)", default_value_t = 0)]
         end_cap_count: u32,
+
+        #[arg(long = "network", help = "The network id to connect to")]
+        network: Option<PsyNetworkTypeInput>,
+
+        #[arg(long = "proving-backend", help = "The proving backend to use (plonky2-poseidon-goldilocks, jtmb-poseidon-goldilocks, jtmb-sha256-u64, etc.)")]
+        proving_backend: Option<PsyChainProvingBackendTypeInput>,
+    },
+
+    #[command(about = "Run a prover that generates non-ups end cap proofs using the dummy prover")]
+    DummyEndCapProverLite {
+        #[arg(long = "realm-api-url", alias = "url", help = "Realm RPC URL to submit end caps to")]
+        realm_api_url: String,
+
+        #[arg(long = "coordinator-url",  help = "Coordinator RPC URL to fetch user public keys from")]
+        coordinator_api_url: String,
+        
+        #[arg(long = "min-state-updates", help = "Minimum number of state updates to include per transaction in end cap", default_value_t = 1)]
+        min_state_updates: u32,
+
+        #[arg(long = "max-state-updates", help = "Maximum number of state updates to include per transaction in end cap", default_value_t = 2)]
+        max_state_updates: u32,
+
+        #[arg(long = "max-contract-calls", help = "Maximum number of contract calls to include in end cap", default_value_t = 1)]
+        max_contract_calls: u32,
+
+        #[arg(long = "start-user-id", help = "The start user id to submit end caps for", default_value_t = 0)]
+        start_user_id: u64,
+        
+        #[arg(long = "count", help = "How many users to submit end caps for, starting from start-user-id", default_value_t = 1)]
+        count: u64,
+        
+        #[arg(long = "batches", help = "Number of batches to submit before exiting (0 = forever)", default_value_t = 0)]
+        batches: u32,
 
         #[arg(long = "network", help = "The network id to connect to")]
         network: Option<PsyNetworkTypeInput>,
