@@ -1,9 +1,11 @@
 use std::sync::Arc;
-
+use std::time::Duration;
+use scylla::client::execution_profile::ExecutionProfile;
 use parth_core::{crypto::hash::traits::MerkleZeroHasher, data::db::table::QDatabaseTableRoutingKey, protocol::core_types::QHashBase};
-use scylla::client::session::{Session, SessionConfig};
-
-use crate::tables::{merkle::ScyllaMerkleNodesZeroPreparedStatements, traits::{ScyllaNoTabletPreparedTableStatements, ScyllaStandardPreparedTableStatements}};
+use scylla::client::session::Session;
+use scylla::client::session_builder::SessionBuilder;
+use crate::tables::{merkle::ScyllaMerkleNodesZeroPreparedStatements, traits::ScyllaStandardPreparedTableStatements};
+use crate::tables::traits::ScyllaNoTabletPreparedTableStatements;
 
 #[derive(Clone)]
 pub struct ScyllaCoreStore<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> {
@@ -18,9 +20,18 @@ pub struct ScyllaCoreStore<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> {
 
 impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hasher> {
     pub async fn new(realm_id: u64, realm_sub_id: u64, keyspace: String, known_nodes: &[String]) -> anyhow::Result<Self> {
-        let mut config = SessionConfig::new();
-        config.add_known_nodes(known_nodes.iter());
-        let session = Arc::new(Session::connect(config).await?);
+        let execution_profile = ExecutionProfile::builder()
+            .request_timeout(Some(Duration::from_secs(120)))
+            .build();
+        let session = SessionBuilder::new()
+            .known_nodes(known_nodes.iter())
+            .default_execution_profile_handle(execution_profile.into_handle())
+            .connection_timeout(Duration::from_secs(30))
+            .keepalive_timeout(Duration::from_secs(60))
+            .keepalive_interval(Duration::from_secs(30))
+            .build()
+            .await?;
+        let session = Arc::new(session);
 
         let no_tablet_keyspace = format!("{}_no_tablet", keyspace);
 
