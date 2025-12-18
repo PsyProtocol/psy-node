@@ -1,3 +1,6 @@
+
+use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
+use psy_serialize::FallbackPsySerializeCanonical;
 use std::hash::Hash;
 
 use psy_serialize::{AutoDatabaseSerializationUseFastFixedSerialize, FastFixedSerializable, PsyCanonicalSerializeMetadata};
@@ -807,3 +810,80 @@ pub fn convert_ffs_array_to_vec<const N: usize, T: FastFixedSerializable<N>>(dat
     }
     result
 }
+
+
+
+
+#[pderive::serialize_copy_default]
+#[repr(C)]
+pub struct QMerkleStoreDoubleIdKeyWithHeight {
+    pub tree_id: u64,
+    pub tree_sub_id: u64,
+    pub index: u64, 
+    pub level: u8,
+    pub tree_height: u8,
+}
+
+
+
+
+
+impl QPGenRandom for QMerkleStoreDoubleIdKeyWithHeight {
+    fn qp_rand_gen() -> Self
+    where
+        Self: Sized,
+    {
+        Self {
+            tree_id: u64::qp_rand_gen(),
+            tree_sub_id: u64::qp_rand_gen(),
+            index: u64::qp_rand_gen(),
+            level: u8::qp_rand_gen(),
+            tree_height: u8::qp_rand_gen(),
+        }
+    }
+}
+
+impl PsyCanonicalSerializeMetadata for QMerkleStoreDoubleIdKeyWithHeight {
+    const IS_FIXED_SIZE: bool = true;
+    const FIXED_SIZE: usize = 26;
+}
+
+impl FallbackPsySerializeCanonical for QMerkleStoreDoubleIdKeyWithHeight {
+    fn fallback_pio_serialized_size(&self) -> usize {
+        Self::FIXED_SIZE
+    }
+
+    fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
+        writer.psy_write_u64(self.tree_id)?;
+        writer.psy_write_u64(self.tree_sub_id)?;
+        writer.psy_write_u64(self.index)?;
+        writer.psy_write_u8(self.level)?;
+        writer.psy_write_u8(self.tree_height)?;
+        Ok(())
+    }
+
+    fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
+        let tree_id = reader.psy_read_u64()?;
+        let tree_sub_id = reader.psy_read_u64()?;
+        let index = reader.psy_read_u64()?;
+        let level = reader.psy_read_u8()?;
+        let tree_height = reader.psy_read_u8()?;
+        Ok(Self { tree_id, tree_sub_id, index, level, tree_height })
+    }
+}
+
+#[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
+psy_serialize::impl_psy_canonical_serialize_for_speedy!(QMerkleStoreDoubleIdKeyWithHeight);
+
+#[cfg(not(all(feature = "serialize_speedy", target_endian = "little")))]
+impl psy_serialize::AutoImplementFallbackPsySerializeCanonical for QMerkleStoreDoubleIdKeyWithHeight {}
+
+pser::impl_psy_ser_basic_tests_fallback!(
+    QMerkleStoreDoubleIdKeyWithHeight,
+    {  },
+    merkle_store_double_id_key_with_height,
+    true
+);
+
+
+

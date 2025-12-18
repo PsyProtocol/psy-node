@@ -18,8 +18,8 @@ pub struct Cli {
 pub enum Commands {
     #[command(about = "Run a proof mining worker")]
     Worker {
-        #[arg(long = "config", default_value = "./config.yaml", help = "Path to config.yaml/config.json file")]
-        config: String,
+        #[arg(long = "config", help = "Path to config.yaml/config.json file")]
+        config: Option<String>,
 
         #[arg(long = "private-key", env = "PRIVATE_KEY", help = "Private key hex string")]
         private_key: Option<String>,
@@ -38,6 +38,12 @@ pub enum Commands {
 
         #[arg(long = "proving-backend", help = "The proving backend to use (plonky2-poseidon-goldilocks, jtmb-poseidon-goldilocks, jtmb-sha256-u64, etc.)")]
         proving_backend: Option<PsyChainProvingBackendTypeInput>,
+
+        #[arg(long = "coordinator-api-url", help = "Coordinator Edge API URLs for the worker to connect to (supports many)")]
+        coordinator_api_urls: Vec<String>,
+
+        #[arg(long = "realm-api-url", help = "Realm Edge API URLs for the worker to connect to (supports many)")]
+        realm_api_urls: Vec<String>,
     },
     #[command(about = "Run a proof mining worker in test mode")]
     WorkerTest {

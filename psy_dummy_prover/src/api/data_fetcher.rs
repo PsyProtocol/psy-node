@@ -7,7 +7,7 @@ use parth_core::{
     crypto::hash::merkle_proof::MerkleProofCore,
     data::hash::{
         merkle_node_key::SimpleMerkleNodeKey,
-        merkle_store_key::{QMerkleStoreDoubleIdKey, QMerkleStoreSingleIdKey},
+        merkle_store_key::{QMerkleStoreDoubleIdKeyWithHeight, QMerkleStoreSingleIdKey},
     },
     protocol::core_types::{Q256BitHash, QNetworkTypesConfig},
 };
@@ -22,7 +22,11 @@ pub trait PsyUserContractDataFetcher<F, Hash> {
     async fn df_get_user_leaves_batch(&self, checkpoint_id: u64, user_ids: Vec<u64>) -> anyhow::Result<Vec<PQEDUserLeaf<F, Hash>>>;
     async fn df_get_global_user_tree_proof(&self, checkpoint_id: u64, user_id: u64) -> anyhow::Result<MerkleProofCore<Hash>>;
     async fn df_get_contract_state_heights(&self, checkpoint_id: u64, contract_ids: Vec<u64>) -> anyhow::Result<Vec<u8>>;
-    async fn df_get_contract_state_tree_nodes(&self, checkpoint_id: u64, node_keys: Vec<QMerkleStoreDoubleIdKey>) -> anyhow::Result<Vec<Hash>>;
+    async fn df_get_contract_state_tree_nodes(
+        &self,
+        checkpoint_id: u64,
+        node_keys: Vec<QMerkleStoreDoubleIdKeyWithHeight>,
+    ) -> anyhow::Result<Vec<Hash>>;
     async fn df_get_contract_state_tree_merkle_proof(
         &self,
         checkpoint_id: u64,
@@ -94,16 +98,18 @@ pub struct PsyContractStateTreeDataSyncHelper<F, Hash, Fetcher> {
     pub user_id: u64,
     pub contract_id: u64,
     pub checkpoint_id: u64,
+    pub state_tree_height: u8,
     pub fetcher: Arc<Fetcher>,
     pub _phantom_f: std::marker::PhantomData<F>,
     pub _phantom_hash: std::marker::PhantomData<Hash>,
 }
 impl<F, Hash, Fetcher> PsyContractStateTreeDataSyncHelper<F, Hash, Fetcher> {
-    pub fn new(user_id: u64, contract_id: u64, checkpoint_id: u64, fetcher: Fetcher) -> Self {
+    pub fn new(user_id: u64, contract_id: u64, checkpoint_id: u64, state_tree_height: u8, fetcher: Fetcher) -> Self {
         Self {
             user_id,
             contract_id,
             checkpoint_id,
+            state_tree_height,
             fetcher: Arc::new(fetcher),
             _phantom_f: std::marker::PhantomData,
             _phantom_hash: std::marker::PhantomData,
@@ -119,11 +125,12 @@ impl<Hash: Q256BitHash + Send + Sync + 'static, F: Send + Sync + 'static, Fetche
             .fetcher
             .df_get_contract_state_tree_nodes(
                 self.checkpoint_id,
-                vec![QMerkleStoreDoubleIdKey {
+                vec![QMerkleStoreDoubleIdKeyWithHeight {
                     tree_id: self.user_id,
                     tree_sub_id: self.contract_id,
                     level: key.level,
                     index: key.index,
+                    tree_height: self.state_tree_height,
                 }],
             )
             .await?;
@@ -137,16 +144,17 @@ impl<Hash: Q256BitHash + Send + Sync + 'static, F: Send + Sync + 'static, Fetche
         Ok(nodes[0])
     }
     async fn fts_get_merkle_nodes_async(&self, keys: &[SimpleMerkleNodeKey]) -> anyhow::Result<Vec<Hash>> {
-        let node_keys: Vec<QMerkleStoreDoubleIdKey> = keys
+        let node_keys: Vec<QMerkleStoreDoubleIdKeyWithHeight> = keys
             .iter()
-            .map(|key| QMerkleStoreDoubleIdKey {
+            .map(|key| QMerkleStoreDoubleIdKeyWithHeight {
                 tree_id: self.user_id,
                 tree_sub_id: self.contract_id,
                 level: key.level,
                 index: key.index,
+                tree_height: self.state_tree_height,
             })
             .collect();
-        self.fetcher.df_get_contract_state_tree_nodes(self.checkpoint_id, node_keys).await
+        self.fetcher.df_get_contract_state_tree_nodes(self.checkpoint_id, node_keys).await.map_err(|e| anyhow::anyhow!("{:?}", e))
     }
 }
 
@@ -188,13 +196,11 @@ impl<N: QNetworkTypesConfig + 'static, C: RealmEdgeRpcClient<N::F, N::QHash, N::
             .map_err(|e| anyhow::anyhow!("{:?}", e))
     }
     async fn df_get_user_leaves_batch(&self, checkpoint_id: u64, user_ids: Vec<u64>) -> anyhow::Result<Vec<PQEDUserLeaf<N::F, N::QHash>>> {
-        println!("df_get_user_leaves_batch");
         let result = self
             .client
             .get_user_leaves_batch(checkpoint_id, user_ids)
             .await
             .map_err(|e| anyhow::anyhow!("{:?}", e))?;
-        println!("fetched {} user leaves", result.len());
         Ok(result)
     }
     async fn df_get_contract_state_tree_merkle_proof(
@@ -228,7 +234,11 @@ impl<N: QNetworkTypesConfig + 'static, C: RealmEdgeRpcClient<N::F, N::QHash, N::
             .await
             .map_err(|e| anyhow::anyhow!("{:?}", e))
     }
-    async fn df_get_contract_state_tree_nodes(&self, checkpoint_id: u64, node_keys: Vec<QMerkleStoreDoubleIdKey>) -> anyhow::Result<Vec<N::QHash>> {
+    async fn df_get_contract_state_tree_nodes(
+        &self,
+        checkpoint_id: u64,
+        node_keys: Vec<QMerkleStoreDoubleIdKeyWithHeight>,
+    ) -> anyhow::Result<Vec<N::QHash>> {
         self.client
             .get_user_contract_state_tree_nodes(checkpoint_id, node_keys)
             .await

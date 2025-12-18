@@ -587,13 +587,13 @@ pub async fn sync_local_tree_from_remote_serial<
 
 
 // --- Configuration ---
+const FTS_SMALL_TREE_THRESHOLD: u8 = 6;
 const MAX_CONCURRENT_REQUESTS: usize = 32;
 const REMOTE_BATCH_SIZE: usize = 32;
-const SMART_REHASH_SUBTREE_DEPTH: u8 = 6;
 const DENSE_UPDATE_THRESHOLD_RATIO: f64 = 0.125;
 
-pub async fn sync_local_tree_from_remote<
-    Hash: Copy + PartialEq + Send + Sync + 'static,
+pub async fn sync_local_tree_from_remote_parallel<
+    Hash: Copy + PartialEq + Send + Sync + 'static + std::fmt::Debug,
     Destination: FastTreeSyncLocalDestination<Hash> + Send + Sync,
     Source: FastTreeSyncAsyncSource<Hash> + Sync,
 >(
@@ -610,11 +610,23 @@ pub async fn sync_local_tree_from_remote<
         return Ok(());
     }
 
+    // Handle tiny trees (height 0)
     if tree_height == 0 {
-        local_tree.fts_set_merkle_node(SimpleMerkleNode {
-            key: root_key,
-            value: remote_root,
-        });
+        local_tree.fts_set_merkle_node(SimpleMerkleNode { key: root_key, value: remote_root });
+        return Ok(());
+    }else if tree_height <= FTS_SMALL_TREE_THRESHOLD {
+        // For small trees, we can fetch all nodes in one go.
+        let total_leaves = 1u64 << tree_height;
+        let total_leaves_usize = total_leaves as usize;
+        let range = SimpleMerkleNodeKey::get_range_at_level(tree_height, 0, total_leaves_usize);
+        let remote_nodes = remote_tree.fts_get_merkle_nodes_async(&range).await?;
+        let nodes = combine_keys_and_hashes(&range, &remote_nodes);
+        local_tree.fts_set_merkle_nodes(&nodes);
+        local_tree.fts_rehash_sub_tree(root_key);
+        let new_local_root = local_tree.fts_get_merkle_node(root_key);
+        if new_local_root != remote_root {
+            anyhow::bail!("Sync failed: root mismatch after rehash. Expected {:?}, got {:?}", remote_root, new_local_root);
+        }
         return Ok(());
     }
 
@@ -623,12 +635,10 @@ pub async fn sync_local_tree_from_remote<
     let mut leaf_updates = Vec::new();
 
     while !divergent_nodes.is_empty() {
-        // Calculate child keys for the next level
-        let next_level = divergent_nodes[0].level + 1;
+        let current_level = divergent_nodes[0].level;
+        let next_level = current_level + 1;
         
-        if next_level > tree_height {
-            break;
-        }
+        if next_level > tree_height { break; }
 
         let child_keys: Vec<SimpleMerkleNodeKey> = divergent_nodes
             .iter()
@@ -643,32 +653,22 @@ pub async fn sync_local_tree_from_remote<
 
         divergent_nodes.clear();
 
-        // 1. Chunk keys into Vecs (owned data) so they can be moved into async blocks
         let chunks: Vec<Vec<SimpleMerkleNodeKey>> = child_keys
             .chunks(REMOTE_BATCH_SIZE)
             .map(|c| c.to_vec())
             .collect();
 
-        // 2. Create the stream
         let mut fetch_stream = stream::iter(chunks)
             .map(|chunk| async move {
-                // Return tuple (Keys, Hashes)
-                // We use explicit typing here to help the compiler if needed, 
-                // though usually inferred correctly.
                 let hashes = remote_tree.fts_get_merkle_nodes_async(&chunk).await?;
                 Ok::<_, anyhow::Error>((chunk, hashes))
             })
-            // 3. Buffer execution (requires StreamExt)
             .buffer_unordered(MAX_CONCURRENT_REQUESTS);
 
-        // 4. Consume the stream (requires StreamExt for next())
         while let Some(result) = fetch_stream.next().await {
             let (keys, remote_hashes) = result?;
-
-            // Compare synchronously
             for (key, remote_val) in keys.into_iter().zip(remote_hashes.into_iter()) {
                 let local_val = local_tree.fts_get_merkle_node(key);
-
                 if local_val != remote_val {
                     if key.level == tree_height {
                         leaf_updates.push(SimpleMerkleNode { key, value: remote_val });
@@ -688,7 +688,20 @@ pub async fn sync_local_tree_from_remote<
     local_tree.fts_set_merkle_nodes(&leaf_updates);
 
     // --- Rehash Phase ---
-    perform_smart_rehash(local_tree, &leaf_updates)?;
+
+    if tree_height <= FTS_SMALL_TREE_THRESHOLD {
+        // For small trees, we can rehash the whole tree directly.
+        local_tree.fts_rehash_sub_tree(root_key);
+    }else{
+        perform_smart_rehash(local_tree, &leaf_updates)?;
+
+    }
+
+    // Final Sanity Check
+    let new_local_root = local_tree.fts_get_merkle_node(root_key);
+    if new_local_root != remote_root {
+        anyhow::bail!("Sync failed: root mismatch after rehash. Expected {:?}, got {:?}", remote_root, new_local_root);
+    }
 
     Ok(())
 }
@@ -697,41 +710,40 @@ fn perform_smart_rehash<Hash: Copy + PartialEq, Destination: FastTreeSyncLocalDe
     local_tree: &mut Destination,
     updated_leaves: &[SimpleMerkleNode<Hash>],
 ) -> anyhow::Result<()> {
-    if updated_leaves.is_empty() {
-        return Ok(());
-    }
-
     let tree_height = local_tree.fts_get_tree_height();
-
-    if tree_height <= SMART_REHASH_SUBTREE_DEPTH {
+    
+    // If the tree is small, just rehash the whole thing from the root down.
+    if tree_height <= FTS_SMALL_TREE_THRESHOLD {
         local_tree.fts_rehash_sub_tree(SimpleMerkleNodeKey::new(0, 0));
         return Ok(());
     }
 
-    let sub_root_level = tree_height - SMART_REHASH_SUBTREE_DEPTH;
-    let leaves_per_subtree = 1u64 << SMART_REHASH_SUBTREE_DEPTH;
+    let sub_root_level = tree_height - FTS_SMALL_TREE_THRESHOLD;
+    let leaves_per_subtree = 1u64 << FTS_SMALL_TREE_THRESHOLD;
     let threshold_count = (leaves_per_subtree as f64 * DENSE_UPDATE_THRESHOLD_RATIO) as usize;
 
     let mut updates_by_sub_root: HashMap<u64, Vec<SimpleMerkleNodeKey>> = HashMap::new();
     for node in updated_leaves {
-        let sub_root_idx = node.key.index >> SMART_REHASH_SUBTREE_DEPTH;
+        let sub_root_idx = node.key.index >> FTS_SMALL_TREE_THRESHOLD;
         updates_by_sub_root.entry(sub_root_idx).or_default().push(node.key);
     }
 
-    let mut dirty_sub_roots = Vec::with_capacity(updates_by_sub_root.len());
+    let mut dirty_sub_roots = Vec::new();
 
     for (sub_root_idx, keys) in updates_by_sub_root {
         let sub_root_key = SimpleMerkleNodeKey::new(sub_root_level, sub_root_idx);
 
         if keys.len() >= threshold_count {
+            // Optimization: If many leaves changed in this chunk, full rehash of this subtree
             local_tree.fts_rehash_sub_tree(sub_root_key);
         } else {
+            // Sparse rehash from leaves up to the sub_root_level
             rehash_sparse_paths(local_tree, &keys, sub_root_level);
         }
-        
         dirty_sub_roots.push(sub_root_key);
     }
 
+    // Finally, rehash from the sub-roots up to the actual root (level 0)
     rehash_sparse_paths(local_tree, &dirty_sub_roots, 0);
 
     Ok(())
@@ -749,14 +761,17 @@ fn rehash_sparse_paths<Hash: Copy, Destination: FastTreeSyncLocalDestination<Has
 
     let mut current_indices: HashSet<u64> = nodes.iter().map(|n| n.index).collect();
 
-    for current_lvl in (target_level + 1..=start_level).rev() {
+    // Iterate from the level of the nodes provided up to the target level
+    for current_lvl in (target_level..start_level).rev() {
         let mut parent_indices = HashSet::with_capacity(current_indices.len());
+        let child_lvl = current_lvl + 1;
 
         for idx in current_indices {
             let parent_idx = idx >> 1;
             if parent_indices.insert(parent_idx) {
-                let left_child = SimpleMerkleNodeKey::new(current_lvl, parent_idx << 1);
-                local_tree.fts_rehash_from_node_to_level(left_child, current_lvl - 1);
+                // Rehash parent at current_lvl using its children at child_lvl
+                let left_child = SimpleMerkleNodeKey::new(child_lvl, parent_idx << 1);
+                local_tree.fts_rehash_from_node_to_level(left_child, current_lvl);
             }
         }
         current_indices = parent_indices;
@@ -817,20 +832,30 @@ impl<Hash: Copy + PartialEq + Default, Hasher: MerkleZeroHasher<Hash>> FastTreeS
     }
 
     fn fts_rehash_sub_tree(&mut self, sub_root_cap: SimpleMerkleNodeKey) -> Hash {
-        self.rehash_sub_tree(sub_root_cap.level, sub_root_cap.index)
+        self.rehash_sub_tree(self.get_height() - sub_root_cap.level, sub_root_cap.index)
     }
     fn fts_hash_two_to_one(left: &Hash, right: &Hash) -> Hash {
         Hasher::two_to_one(left, right)
     }
 }
 
+pub async fn sync_local_tree_from_remote<
+    Hash: Copy + PartialEq + Send + Sync + 'static + std::fmt::Debug,
+    Destination: FastTreeSyncLocalDestination<Hash> + Send + Sync,
+    Source: FastTreeSyncAsyncSource<Hash> + Sync,
+>(
+    local_tree: &mut Destination,
+    remote_tree: &Source,
+) -> anyhow::Result<()> {
+    sync_local_tree_from_remote_parallel(local_tree, remote_tree).await
+}
 #[cfg(test)]
 mod tests {
     use std::{sync::{Arc, atomic::AtomicUsize}, time::Duration};
 
     use cf_utils::{rand_utils::unique_random_u64_array_in_range, timer::DebugTimer};
     use dashmap::DashMap;
-    use parth_core::{pgoldilocks::PoseidonHasher, utils::QPGenRandom};
+    use parth_core::{crypto::hash::traits::FromU64x4, pgoldilocks::PoseidonHasher, utils::QPGenRandom};
     use tokio::time::sleep;
 
     use super::*;
@@ -958,13 +983,67 @@ mod tests {
         sync_local_tree_from_remote_serial(&mut local_tree_1, &remote_tree_1).await?;
         println!("remote tree 1 stats:");
         remote_tree_1.print_stats();
-        timer.lap("sync_local_tree_from_remote");
-        sync_local_tree_from_remote(&mut local_tree_2, &remote_tree_2).await?;
+        timer.lap("sync_local_tree_from_remote_serial");
+        sync_local_tree_from_remote_parallel(&mut local_tree_2, &remote_tree_2).await?;
         println!("remote tree 2 stats:");
         remote_tree_2.print_stats();
-        timer.lap("sync_local_tree_from_remote_5");
+        timer.lap("sync_local_tree_from_remote_parallel");
         assert_eq!(local_tree_1.get_root(), remote_tree_1.local_tree.get_root());
         assert_eq!(local_tree_2.get_root(), remote_tree_2.local_tree.get_root());
+        Ok(())
+    }
+
+    async fn test_tree_with_n_leaves(tree_height: u8, modified_leaves: usize) -> anyhow::Result<()> {
+        let mut local_tree_1 = random_tree_with_n_modified_leaves(tree_height, 10000);
+        local_tree_1.commit_changes();
+        let mut local_tree_2 = local_tree_1.clone();
+
+        
+        let mut remote_tree = local_tree_1.clone();
+        modify_tree_with_sequential_leaves(&mut remote_tree, modified_leaves);
+        remote_tree.commit_changes();
+        let mut expected_nodes = remote_tree.get_all_non_zero_nodes_including_changes();
+        expected_nodes.sort();
+
+        remote_tree.verify_root_slow()?;
+        
+        let remote_tree_1 = LocalTreeSourceAsyncAdapterCounter::new(remote_tree.clone());
+        let remote_tree_2 = LocalTreeSourceAsyncAdapterCounter::new(remote_tree.clone());
+
+
+
+        let mut timer = DebugTimer::new("test_tree_with_n_leaves");
+        
+        sync_local_tree_from_remote_serial(&mut local_tree_1, &remote_tree_1).await?;
+        println!("remote tree 1 stats:");
+        remote_tree_1.print_stats();
+        local_tree_1.commit_changes();
+        local_tree_1.verify_root_slow()?;
+        let mut l_nodes_1 = local_tree_1.get_all_non_zero_nodes_including_changes();
+        l_nodes_1.sort();
+        assert_eq!(expected_nodes, l_nodes_1);
+        timer.lap("sync_local_tree_from_remote_serial");
+        sync_local_tree_from_remote_parallel(&mut local_tree_2, &remote_tree_2).await?;
+        println!("remote tree 2 stats:");
+        remote_tree_2.print_stats();
+        local_tree_2.commit_changes();
+        local_tree_2.verify_root_slow()?;
+        let mut l_nodes_2 = local_tree_2.get_all_non_zero_nodes_including_changes();
+        l_nodes_2.sort();
+        assert_eq!(expected_nodes, l_nodes_2);
+        timer.lap("sync_local_tree_from_remote_parallel");
+        assert_eq!(local_tree_1.get_root(), remote_tree_1.local_tree.get_root());
+        assert_eq!(local_tree_2.get_root(), remote_tree_2.local_tree.get_root());
+        Ok(())
+    }
+    #[tokio::test]
+    async fn test_small_trees_zero_through_four_leaves() -> anyhow::Result<()> {
+        for i in (0..10).rev() {
+            for j in 0..(1 << i).min(5) {
+                println!("testing tree height {}, modified leaves {}", i, j);
+                test_tree_with_n_leaves(i, j).await?;
+            }
+        }
         Ok(())
     }
     #[tokio::test]
@@ -978,6 +1057,55 @@ mod tests {
         let remote_tree = LocalTreeSourceAsyncAdapterCounter::new(remote_tree);
         sync_local_tree_from_remote(&mut local_tree, &remote_tree).await?;
         remote_tree.print_stats();
+
+        local_tree.verify_root_slow()?;
+        remote_tree.local_tree.verify_root_slow()?;
+
+        assert_eq!(local_tree.get_root(), remote_tree.local_tree.get_root());
+        Ok(())
+    }
+    #[tokio::test]
+    async fn test_simple_tree_change() -> anyhow::Result<()> {
+        let tree_height = 24;
+        let mut local_tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(tree_height);
+
+        local_tree.commit_changes();
+        let mut remote_tree = local_tree.clone();
+        let res = remote_tree.set_leaf(0, Hash::from_u64s(
+                16704634758078785427,
+                3079133732809502003,
+                11524985806763553013,
+                6946341379493811756,
+        ));
+        let expected_root = Hash::from_u64s(
+                1619220428794454652,
+                455605370924774441,
+                752311024673143156,
+                12274833379856076453,
+        );
+        assert_eq!(res.old_root, local_tree.get_root());
+        assert_eq!(expected_root, res.new_root);
+        remote_tree.commit_changes();
+        let mut nodes = remote_tree.get_nodes().iter().map(|(k,h)| SimpleMerkleNode{
+            key: *k,
+            value: *h,
+        }).collect::<Vec<SimpleMerkleNode<Hash>>>();
+        nodes.sort();
+
+        remote_tree.verify_root_slow()?;
+        let remote_tree = LocalTreeSourceAsyncAdapterCounter::new(remote_tree);
+        sync_local_tree_from_remote(&mut local_tree, &remote_tree).await?;
+        remote_tree.print_stats();
+        local_tree.commit_changes();
+        let mut l_nodes = local_tree.get_nodes().iter().map(|(k,h)| SimpleMerkleNode{
+            key: *k,
+            value: *h,
+        }).collect::<Vec<SimpleMerkleNode<Hash>>>();
+        l_nodes.sort();
+        assert_eq!(nodes, l_nodes);
+
+        local_tree.verify_root_slow()?;
+        remote_tree.local_tree.verify_root_slow()?;
 
         assert_eq!(local_tree.get_root(), remote_tree.local_tree.get_root());
         Ok(())

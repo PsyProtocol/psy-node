@@ -298,6 +298,8 @@ class DevNetProcessManager {
         const workerCli = './target/release/psy_worker_cli';
         const backendArgs = jtmb ? ['--proving-backend', 'jtmb-poseidon-goldilocks'] : [];
 
+        const configBasePath = './psy_cli/example_node_configs/perf_test';
+
         // 3. Coordinator Processor
         await cleanCheckpoint('./local_checkpoints/coordinator_0_0', cwd);
         this.coordinatorProcessor = this.track(await RunningProcess.spawnWithInitializationHint(
@@ -305,12 +307,12 @@ class DevNetProcessManager {
                 nodeCli, 
                 'start-coordinator-processor', 
                 ...backendArgs,
-                '--config', './psy_cli/example_node_configs/coordinator_processor_1.yaml'
+                '--config', `${configBasePath}/coordinator_processor.yaml`
             ],
             coordinatorProcessorStartedDetector,
             { 
                 cwd,
-                ...getLogPaths("coordinator_processor_1", false)
+                ...getLogPaths("coordinator_processor", false)
             },
         ));
         console.log(`Coordinator Processor started with PID: ${this.coordinatorProcessor.pid}`);
@@ -321,12 +323,12 @@ class DevNetProcessManager {
                 nodeCli,
                 'start-coordinator-edge',
                 ...backendArgs,
-                '--config', './psy_cli/example_node_configs/coordinator_edge_1.yaml'
+                '--config', `${configBasePath}/coordinator_edge_0.yaml`
             ],
             coordinatorEdgeProcessorStartedDetector,
             { 
                 cwd,
-                ...getLogPaths("coordinator_edge_1", true)
+                ...getLogPaths("coordinator_edge_0", true)
             },
         ));
         console.log(`Coordinator Edge RPC started with PID: ${this.coordinatorEdge.pid}`);
@@ -339,12 +341,12 @@ class DevNetProcessManager {
                 '--user', '0',
                 '--network', 'local-devnet',
                 ...backendArgs,
-                '--config', './psy_cli/example_node_configs/worker_1.yml'
+                '--config', `${configBasePath}/coordinator_worker_0.yml`
             ],
             workerStartedDetector,
             { 
                 cwd,
-                ...getLogPaths("worker_1", true)
+                ...getLogPaths("coordinator_worker_0", true)
             },
         ));
         console.log(`Coordinator Worker started with PID: ${this.coordinatorWorker.pid}`);
@@ -356,24 +358,20 @@ class DevNetProcessManager {
                 nodeCli,
                 'start-realm-processor',
                 ...backendArgs,
-                '--config', './psy_cli/example_node_configs/realm_processor_1.yaml'
+                '--config', `${configBasePath}/realm_0_processor.yaml`
             ],
             realmProcessorStartedDetector,
             { 
                 cwd,
-                ...getLogPaths("realm_processor_1", false)
+                ...getLogPaths("realm_0_processor", false)
             },
         ));
         console.log(`Realm Processor started with PID: ${this.realmProcessor.pid}`);
 
         // 7. Realm Edges (Scalable)
         for (let i = 0; i < workerEdgeCount; i++) {
-            let configPath = '';
-            if (i === 0) {
-                 configPath = './psy_cli/example_node_configs/realm_edge_1.yaml';
-            } else {
-                 configPath = `./psy_cli/example_node_configs/perf_test/realm_0_edge_${i}.yaml`;
-            }
+            let configPath = `${configBasePath}/realm_0_edge_${i}.yaml`;
+            
 
             const logPrefix = `realm_edge_${i}`;
             console.log(`Starting Realm Edge ${i} using config ${configPath}...`);
@@ -396,12 +394,8 @@ class DevNetProcessManager {
 
         // 8. Realm Workers (Scalable)
         for (let i = 0; i < workerRealmCount; i++) {
-            let configPath = '';
-            if (i === 0) {
-                 configPath = './psy_cli/example_node_configs/worker_realm_1.yml';
-            } else {
-                 configPath = `./psy_cli/example_node_configs/perf_test/realm_0_worker_${i}.yml`;
-            }
+            let configPath = `${configBasePath}/realm_0_worker_${i}.yml`;
+        
 
             const logPrefix = `realm_worker_${i}`;
             console.log(`Starting Realm Worker ${i} using config ${configPath}...`);

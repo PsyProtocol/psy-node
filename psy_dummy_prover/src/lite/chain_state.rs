@@ -77,7 +77,6 @@ impl<
         data_fetcher: Arc<DF>,
         contract_height_cache: DashMapContractHeightCache<Hash>,
     ) -> Self {
-        println!("global contract tree height: {}", global_contract_tree_height);
         let allowed_contracts = contract_height_cache.mapping.iter().map(|dm| *dm.key()).collect();
         Self {
             checkpoint_id: 0,
@@ -114,10 +113,7 @@ impl<
             .data_fetcher
             .df_get_user_leaves_batch(self.checkpoint_id, self.user_ids.clone())
             .await?;
-        println!("user_leaves[0]: {:?}", user_leaves[0]);
-        println!("fetched {} user leaves from remote", user_leaves.len());
         let public_key_hashes = self.data_fetcher.cf_get_user_public_key_hashes(&self.user_ids).await?;
-        println!("got {} public key hashes", public_key_hashes.len());
         for (leaf, pk_hash) in user_leaves.iter_mut().zip(public_key_hashes.iter()) {
             leaf.public_key = *pk_hash;
         }
@@ -134,7 +130,6 @@ impl<
                 .map(|(local_user, remote_leaf)| local_user.sync_to_latest(data_fetcher.clone(), &self.contract_height_cache, checkpoint_id, *remote_leaf));
 
             futures::future::try_join_all(futs).await?;
-            println!("got chunk");
         }
         Ok(())
     }

@@ -8,9 +8,9 @@ use parth_core::{
     data::{
         db::table::QDatabaseTableRoutingKey,
         hash::{
-            fast_node_serializer::{QMerkleStoreFastDoubleNodeSerializer, QMS_FAST_SERIALIZER_DOUBLE_ID_NODE_SIZE},
+            fast_node_serializer::{QMS_FAST_SERIALIZER_DOUBLE_ID_NODE_SIZE, QMerkleStoreFastDoubleNodeSerializer},
             merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey},
-            merkle_store_key::QMerkleStoreDoubleIdNode,
+            merkle_store_key::{QMerkleStoreDoubleIdKeyWithHeight, QMerkleStoreDoubleIdNode},
         },
     },
     protocol::core_types::{Q256BitHash, QHash256Base, QHashBase},
@@ -482,6 +482,44 @@ impl ScyllaDoubleMerkleNodesPreparedStatements {
             None => Ok(Hasher::get_zero_hash((tree_height - key.level) as usize)),
         }
     }
+    pub async fn select_many_double_id_merkle_nodes_with_height_max_checkpoint<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>(
+        &self,
+        session: &Session,
+        max_checkpoint_id: u64,
+        keys: &[QMerkleStoreDoubleIdKeyWithHeight],
+    ) -> anyhow::Result<Vec<Hash>> {
+        const CONCURRENT_LIMIT: usize = 512; // Batch concurrent queries
+        let mut results = Vec::with_capacity(keys.len());
+        for chunk in keys.chunks(CONCURRENT_LIMIT) {
+            let futures: Vec<_> = chunk
+                .iter()
+                .map(|key| {
+                    let prep = self.select_1_prepared.clone();
+                    let tree_id_i64 = u64_to_i64_exact(key.tree_id);
+                    let tree_sub_id_i64 = u64_to_i64_exact(key.tree_sub_id);
+                    let level_i8 = u8_to_i8_exact(key.level);
+                    let index_i64 = u64_to_i64_exact(key.index);
+                    let max_cp_i64 = convert_checkpoint_id_to_i64(max_checkpoint_id);
+                    async move {
+                        let res = session
+                            .execute_unpaged(&prep, (tree_id_i64, tree_sub_id_i64, level_i8, index_i64, max_cp_i64))
+                            .await?;
+                        let rows = res.into_rows_result()?;
+                        if let Some(row) = rows.maybe_first_row::<(Vec<u8>,)>()? {
+                            Hash::from_bytes(&row.0)
+                        } else {
+                            Ok(Hasher::get_zero_hash((key.tree_height.max(key.level) - key.level) as usize))
+                        }
+                    }
+                })
+                .collect();
+            let chunk_results = join_all(futures).await;
+            for res in chunk_results {
+                results.push(res?);
+            }
+        }
+        Ok(results)
+    }
 
     pub async fn select_many_double_id_merkle_nodes_max_checkpoint_internal<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>>(
         &self,
@@ -512,7 +550,6 @@ impl ScyllaDoubleMerkleNodesPreparedStatements {
                         if let Some(row) = rows.maybe_first_row::<(Vec<u8>,)>()? {
                             Hash::from_bytes(&row.0)
                         } else {
-                            // Assume reverse_level = level for simplicity; adjust if tree height known
                             Ok(Hasher::get_zero_hash((tree_height - key.level) as usize))
                         }
                     }

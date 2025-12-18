@@ -1,6 +1,6 @@
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
 use parth_core::{
-    QProvingJobDataIDWithRewardPath, crypto::hash::merkle_proof::MerkleProofCore, data::hash::merkle_store_key::{QMerkleStoreDoubleIdKey, QMerkleStoreSingleIdKey}
+    QProvingJobDataIDWithRewardPath, crypto::hash::merkle_proof::MerkleProofCore, data::hash::merkle_store_key::{QMerkleStoreDoubleIdKeyWithHeight, QMerkleStoreSingleIdKey}
 };
 use psy_data::{
     proof_input::guta::end_cap_input::SubmitUserEndCapNonProofInput,
@@ -121,7 +121,7 @@ pub trait RealmEdgeRpc<F, Hash, JobId, ZKProof> {
     async fn get_user_contract_state_tree_nodes(
         &self,
         checkpoint_id: u64,
-        keys: Vec<QMerkleStoreDoubleIdKey>,
+        keys: Vec<QMerkleStoreDoubleIdKeyWithHeight>,
     ) -> RpcResult<Vec<Hash>>;
 
     #[method(name = "get_user_contract_tree_nodes")]

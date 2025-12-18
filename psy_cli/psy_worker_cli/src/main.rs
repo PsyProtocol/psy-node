@@ -20,8 +20,10 @@ async fn main() -> anyhow::Result<()> {
             user,
             network,
             proving_backend,
+            realm_api_urls,
+            coordinator_api_urls,
         } => {
-            worker::run(config, private_key, keystore_path, wallet_password, user, network, proving_backend).await?;
+            worker::run(config, private_key, keystore_path, wallet_password, user, network, proving_backend, realm_api_urls, coordinator_api_urls).await?;
         }
         Commands::WorkerTest {
             config,

@@ -1,4 +1,3 @@
-use cf_utils::option::resolve_one_of_two_options_or_error;
 use plonky2::plonk::config::PoseidonGoldilocksConfig;
 use psy_core::constants::{
     chain_id::{PsyChainNetworkType, PsyNetworkTypeInput},
@@ -57,40 +56,30 @@ pub async fn run_worker_inner(
 }
 
 pub async fn run(
-    config: String,
+    config: Option<String>,
     private_key: Option<String>,
     _keystore_path: Option<String>,
     _wallet_password: Option<String>,
     recipient: Option<u64>,
     network: Option<PsyNetworkTypeInput>,
     proving_backend: Option<PsyChainProvingBackendTypeInput>,
+    realm_api_urls: Vec<String>,
+    coordinator_api_urls: Vec<String>,
 ) -> anyhow::Result<()> {
     print_banner();
     info!("Worker starting...");
-    info!("Loading config from: {}", config);
-    let config_data = WorkerCliConfig::load_from_file(&config).await?;
-
-    let network: PsyChainNetworkType =
-        resolve_one_of_two_options_or_error::<PsyNetworkTypeInput>(&network, &config_data.network, "Network configuration is required")?.into();
-    let user_id = resolve_one_of_two_options_or_error::<u64>(&recipient, &config_data.user, "User ID of miner is required")?;
-    let private_key_string =
-        resolve_one_of_two_options_or_error::<String>(&private_key, &config_data.private_key, "API Private key for miner is required")?;
-    let private_key_bytes = hex::decode(private_key_string.trim_start_matches("0x"))?;
-    if private_key_bytes.len() != 32 {
-        anyhow::bail!("Private key must be 32 bytes (64 hex characters)");
-    }
-    let private_key_bytes: [u8; 32] = private_key_bytes
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("private key must be 32 bytes (64 hex characters)"))?;
-    let config = WorkerStartupConfig {
-        miner_user_id: user_id,
-        network: network,
-        private_key: private_key_bytes,
-        worker_completed_jobs_log_file_path: config_data.completed_jobs_log_file.clone(),
-        coordinator_api_urls: config_data.coordinator_api_urls,
-        realm_api_urls: config_data.realm_api_urls,
-    };
-    info!("Using network: {:?}", network);
+    let config = WorkerCliConfig::get_start_config(
+        config,
+        private_key,
+        _keystore_path,
+        _wallet_password,
+        recipient,
+        network,
+        coordinator_api_urls,
+        realm_api_urls,
+    )
+    .await?.with_unique_api_urls();
+    let network = config.network.clone();
 
     let mut handles = Vec::new();
 

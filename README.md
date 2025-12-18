@@ -1,88 +1,54 @@
 # Psy V3
 
-## Running
+## Dependencies
+- docker
+- modern rust version
+- bun
 
-### 1. Database/Queue/Cache
-First, in one terminal run the command:
+
+### Spinning up a local development cluster
 ```bash
-./dev/start_db.sh
+cargo build --release
+bun run ./dev/locSetupV3.ts --realm-workers 32 --realm-edges 8
+# or for JTMB (dev only) mode
+bun run ./dev/locSetupV3.ts --jtmb --realm-workers 32 --realm-edges 8
 ```
 
-This starts nats, scylla and valkey (aka. redis).
-You can delete the nats, scylla and valkey instances at any time by using CTRL+C to exit the script, and the nats/scylla/valkey stores will gracefully exit and clear any data (docker --rm). This is useful for testing
+You now have realm edges listening on ports 13370 -> realm_edges + 13370
+You will find the logs for the workers/edges/processors in the ./logs directory
 
-
-
-### 2. Coordinator Processor
-Then, in another terminal tab, run the command below to start the coordinator processor
+To run some example transactions first run:
 ```bash
-./dev/d.sh p -g
+cargo run --release --package psy_node_cli --example register_users_deploy_contracts
+```
+This registers 1000 users and deploys 100 contracts.
+Repeat this command for however many users you need.
+
+
+Then, if you want to submit some end caps run:
+```bash
+./dev/dummy.sh --realm-edge-nodes 8 --groups 8 --group-size 200 --max-contract-calls 10
 ```
 
-The -g flag means the coordinator will start from genesis and delete the local_checkpoints backups in ./local/checkpoints_0_0 for the coordinator.
-
-
-If you don't want to delete the backups, you can run:
-```bash
-./dev/d.sh p -b
-```
-to just rebuild the latest processor and start it leaving off from the most recent checkpoint.
-
-### 3. Coordinator Edge
-Once the coordinator processor is started, you can start the coordinator edge by running:
-```bash
-./dev/d.sh edge -b
-```
-
-
-### 4. Coordinator Worker
-To allow the coordinator to start working, we need to start a proof miner.
-It is possible to run a miner which does jobs for both realms and coordinators, but for debugging it is recommended to run a worker which talks just to the coordinator and a worker which just talks to the realms as they have different circuits.
-
-To run the coordinator worker run the command:
-```bash
-./dev/d.sh worker -b
-```
-
-Great! Now the coordinator is all setup, let's setup our first realm.
-
-
-### 5. Realm Processor
-To start the realm processor, run:
-```bash
-./dev/d.sh rp -g
-```
-
-Similar to the coordinator, the realm has a genesis flag -g and also a just build flag -b.
-
-### 6. Realm Edge
-To start the realm edge, run:
-```bash
-./dev/d.sh re -b
-```
-
-### 7. Realm Worker
-To start a realm worker, run the command:
-```bash
-./dev/d.sh realm_worker -b
-```
+This will start up 12 end cap provers each of which submits 200 user proofs at a time (8*200 = 1600 users), each of which call on average 5 txs = 8000 txs.
 
 
 
-## Testing
-To test registering some users, run:
-```bash
-cargo run --release --package psy_node_cli --example register_user
-```
+### FAQ
+
+Q:
+I got an invalid user leaf hash message in the dummy prover, what is wrong?
+
+A:
+Right now, validate every user leaf's user contract tree against the canonical value in the database, which does not get set until the block containing your new leaf is committed to the database, which can sometimes take a few seconds depending on how the coordinator/realm cycle is synchronized and how long it takes the realm to prove to their block. Since we already also check if a user contract tree root is correct for a user in the gatherer and gracefully discard the submission if the user leaf containing the root doesn't match the canonical value in the in-memory global user tree, in the future we might want to store the last submitted user leaf in redis along with the submitted gathering unique pending id. If the current proving (standard unique pending id) is the same as the gathering one, we may allow the user to submit an end cap which starts from the root they last submitted at, and which would be discarded if the block that gathered the tx is reverted. If we do not store the latest submitted user state root in redis, during the time between when the unique pending id is changed to the previous gathering unique pending id and when the state is committed, it is of course possible for the user to submit an end-cap which proves from the state root which is currently in the database but will be soon overwritten. This is an OK behavior for now, as the GUTA gatherer just discards it, but again the redis thing would be nice.
 
 
-To test deploy contracts, run:
-```bash
-cargo run --release --package psy_node_cli --example deploy_contracts
-```
 
-Once you have registered some users and deployed some contracts, you can prove some dummy end caps with the dummy end cap prover.
-To test the dummy end cap prover, run:
-```bash
-./dev/d.sh dummy_prover
-```
+
+### Performance
+Right now the endcap/request proof/submit proof API endpoints take ~3-5ms per request on my Macbook. 
+These are the PERFORMANCE CRITICAL endpoints, and the perf can be significantly improved by a few things, most notably caching the nats connection/queue consumer for the latest unique pending id. For now I have not done that because I need to first phase out the QProcCheckpointId from all of the codebase. In the future, the logic will be that we have an RWLock'd <(u64, Consumer)> for each topic which gets updated when it encounters a queue key with the corresponding topic and a unique pending id greater than the current value (again soon there will be no more random u128, just the unique pending id, so it is sequential). As of recent performance testing, the time to ensure_consumer/etc is a whopping 2ms -- nearly half of the entire API call processing time on the server, which can be reduced in this fashion to something like ~90µs. This will also significantly improve the performance of the gatherers, which constantly try to consume from the queue. Their is an unavoidable task of verifying plonky2 proofs which takes ~2ms for a single hardware thread. This is CPU bound, so for getting around this issue we will just need to spin up more edges per realm to compensate. The eventual goal is for each realm to be able to handle ~100k UOPS with ~150 edge api node instances (think 1 edge API = 2 vCPU). This way, if we had 1000 realms, we could handle 100,000,000 UOPS (think over 1 billion TPS), able to support the full payment load of the internet. 
+
+
+
+

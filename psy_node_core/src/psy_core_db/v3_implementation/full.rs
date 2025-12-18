@@ -3,21 +3,17 @@ use std::{collections::HashMap, sync::Arc};
 use anyhow::Ok;
 use async_trait::async_trait;
 use parth_core::{
-    crypto::hash::{
+    QCoreProcCheckpointUniqueId, crypto::hash::{
         merkle_proof::{DeltaMerkleProofCore, MerkleProofCore},
         tag_tree::TagTreeMerkleProof,
-    },
-    data::{
+    }, data::{
         db::row::QDatabaseSingleIdTableRow,
         hash::{
             checkpointed_merkle_node::CheckpointedMerkleHash,
-            merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey, PSY_OBJECT_FFS_SIZE_SIMPLE_MERKLE_NODE_KEY},
-            merkle_store_key::{QMerkleStoreDoubleIdKey, QMerkleStoreDoubleIdNode, QMerkleStoreSingleIdKey, QMerkleStoreSingleIdNode},
+            merkle_node_key::{PSY_OBJECT_FFS_SIZE_SIMPLE_MERKLE_NODE_KEY, SimpleMerkleNode, SimpleMerkleNodeKey},
+            merkle_store_key::{QMerkleStoreDoubleIdKeyWithHeight, QMerkleStoreDoubleIdNode, QMerkleStoreSingleIdKey, QMerkleStoreSingleIdNode},
         },
-    },
-    felt::ToU64Value,
-    protocol::core_types::QNetworkDatabaseTypes,
-    QCoreProcCheckpointUniqueId,
+    }, felt::ToU64Value, protocol::core_types::QNetworkDatabaseTypes
 };
 use psy_data::{
     protocol::verifiable_checkpoint_transition::PsyVerifiableCheckpointTransitionWithProof,
@@ -637,7 +633,12 @@ impl<
         S,
     >
 {
-    async fn user_registration_tree_set_leaf_hash(&self, checkpoint_id: u64, leaf_index: u64, value: N::QHash) -> anyhow::Result<DeltaMerkleProofCore<N::QHash>> {
+    async fn user_registration_tree_set_leaf_hash(
+        &self,
+        checkpoint_id: u64,
+        leaf_index: u64,
+        value: N::QHash,
+    ) -> anyhow::Result<DeltaMerkleProofCore<N::QHash>> {
         let mut res = db_helper_zero_id_merkle_node_simple_set_leaves_fast_serialize::<N::QHash, N::HasherBase, _, _>(
             &*self.store,
             &self.user_registration_tree_table,
@@ -837,7 +838,12 @@ impl<
             .await
     }
 
-    async fn global_user_tree_set_leaf_hash(&self, checkpoint_id: u64, leaf_index: u64, value: N::QHash) -> anyhow::Result<DeltaMerkleProofCore<N::QHash>> {
+    async fn global_user_tree_set_leaf_hash(
+        &self,
+        checkpoint_id: u64,
+        leaf_index: u64,
+        value: N::QHash,
+    ) -> anyhow::Result<DeltaMerkleProofCore<N::QHash>> {
         let mut res = db_helper_zero_id_merkle_node_simple_set_leaves_fast_serialize::<N::QHash, N::HasherBase, _, _>(
             &*self.store,
             &self.global_user_tree_table,
@@ -1187,30 +1193,15 @@ impl<
             .await
     }
 
-    async fn contract_state_tree_get_nodes(&self, checkpoint_id: u64, keys: &[QMerkleStoreDoubleIdKey]) -> anyhow::Result<Vec<N::QHash>> {
+    async fn contract_state_tree_get_nodes(&self, checkpoint_id: u64, keys: &[QMerkleStoreDoubleIdKeyWithHeight]) -> anyhow::Result<Vec<N::QHash>> {
         if keys.is_empty() {
             return Ok(vec![]);
         }
-        let tree_id = keys[0].tree_id;
-        let tree_sub_id = keys[0].tree_sub_id;
-        if keys.iter().any(|k| k.tree_id != tree_id || k.tree_sub_id != tree_sub_id) {
-            anyhow::bail!("All keys must have the same tree_id and tree_sub_id");
-        }
-        let simple_keys: Vec<SimpleMerkleNodeKey> = keys
-            .iter()
-            .map(|k| SimpleMerkleNodeKey {
-                level: k.level,
-                index: k.index,
-            })
-            .collect();
         self.store
-            .db_select_many_double_id_merkle_nodes_max_checkpoint(
+            .db_select_many_double_id_merkle_nodes_with_height_max_checkpoint(
                 &self.contract_state_tree_table,
                 checkpoint_id,
-                tree_id,
-                tree_sub_id,
-                N::MAX_CONTRACT_STATE_TREE_HEIGHT,
-                &simple_keys,
+                keys,
             )
             .await
     }
@@ -1470,7 +1461,12 @@ impl<
         S,
     >
 {
-    async fn global_contract_tree_set_leaf_hash(&self, checkpoint_id: u64, leaf_index: u64, value: N::QHash) -> anyhow::Result<DeltaMerkleProofCore<N::QHash>> {
+    async fn global_contract_tree_set_leaf_hash(
+        &self,
+        checkpoint_id: u64,
+        leaf_index: u64,
+        value: N::QHash,
+    ) -> anyhow::Result<DeltaMerkleProofCore<N::QHash>> {
         let mut res = db_helper_zero_id_merkle_node_simple_set_leaves_fast_serialize::<N::QHash, N::HasherBase, _, _>(
             &*self.store,
             &self.global_contract_tree_table,

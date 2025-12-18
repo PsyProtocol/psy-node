@@ -10,7 +10,7 @@ use parth_core::{
             traits::{MerkleZeroHasher, QFieldHashable, ZeroableHash},
         },
         secp256k1::{QEDCompressedSecp256K1Signature, SimpleTimedRequest},
-    }, data::{hash::{merkle_node_key::SimpleMerkleNodeKey, merkle_store_key::{QMerkleStoreDoubleIdKey, QMerkleStoreSingleIdKey}}, queue::queue_key::QPBaseQueueType}, felt::ToU64Value, node::realm_identifier::QRealmIdentifier, protocol::core_types::{QNetworkTypesConfig, QZKProofPublicInputsHasherReader, QZKProofVerifier}
+    }, data::{hash::{merkle_node_key::SimpleMerkleNodeKey, merkle_store_key::{QMerkleStoreDoubleIdKeyWithHeight, QMerkleStoreSingleIdKey}}, queue::queue_key::QPBaseQueueType}, felt::ToU64Value, node::realm_identifier::QRealmIdentifier, protocol::core_types::{QNetworkTypesConfig, QZKProofPublicInputsHasherReader, QZKProofVerifier}
 };
 use psy_api_core::{realm::standard_edge_rpc::RealmEdgeRpcServer, worker::standard_worker_rpc::NodeEdgeWorkerRpcServer};
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
@@ -292,7 +292,13 @@ impl<
         }else{
             old_user_leaf.qfhash::<N::HasherBase>()
         };
+        
         if user_end_cap_input.core.state_transition.start_user_leaf_hash != old_leaf_hash {
+            tracing::error!(
+                "Invalid start_user_leaf_hash, left: {:?}, right: {:?}",
+                user_end_cap_input.core.state_transition.start_user_leaf_hash,
+                old_leaf_hash
+            );
             anyhow::bail!(
                 "Invalid start_user_leaf_hash, left: {:?}, right: {:?}",
                 user_end_cap_input.core.state_transition.start_user_leaf_hash,
@@ -502,7 +508,7 @@ impl<
     async fn get_user_contract_state_tree_nodes(
         &self,
         checkpoint_id: u64,
-        keys: Vec<QMerkleStoreDoubleIdKey>,
+        keys: Vec<QMerkleStoreDoubleIdKeyWithHeight>,
     ) -> RpcResult<Vec<N::QHash>>{
         res(self
             .db_reader

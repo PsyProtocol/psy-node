@@ -1,5 +1,8 @@
+use cf_utils::option::resolve_one_of_two_hex_32_byte_options_or_error;
 use psy_core::constants::chain_id::PsyNetworkTypeInput;
 use serde::{Deserialize, Serialize};
+
+use crate::config::worker_config::WorkerStartupConfig;
 
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -11,8 +14,74 @@ pub struct WorkerCliConfig {
     pub coordinator_api_urls: Vec<String>,
     pub realm_api_urls: Vec<String>,
 }
-
+fn resolve_one_of_options_or_error<T: Clone>(
+    cli_option: Option<T>,
+    config_option: Option<T>,
+    error_message: &str,
+) -> anyhow::Result<T> {
+    if let Some(value) = cli_option {
+        Ok(value.clone())
+    } else if let Some(value) = config_option {
+        Ok(value.clone())
+    } else {
+        anyhow::bail!("{}", error_message);
+    }
+}
 impl WorkerCliConfig {
+    pub fn get_default_empty() -> Self {
+        WorkerCliConfig {
+            user: None,
+            private_key: None,
+            completed_jobs_log_file: None,
+            network: None,
+            coordinator_api_urls: Vec::new(),
+            realm_api_urls: Vec::new(),
+        }
+    }
+    pub fn into_start_config_with_cli_args(
+        self,
+        private_key: Option<String>,
+        user: Option<u64>,
+        network: Option<PsyNetworkTypeInput>,
+        coordinator_api_urls: Vec<String>,
+        realm_api_urls: Vec<String>,
+    ) -> anyhow::Result<WorkerStartupConfig> {
+        Ok(WorkerStartupConfig {
+            private_key: resolve_one_of_two_hex_32_byte_options_or_error(
+                private_key,
+                self.private_key,
+                "API Private key for miner is required",
+            )?,
+            miner_user_id: resolve_one_of_options_or_error::<u64>(user, self.user, "User ID of miner is required")?,
+            network: resolve_one_of_options_or_error::<PsyNetworkTypeInput>(network, self.network, "Network configuration is required")?.into(),
+            worker_completed_jobs_log_file_path: self.completed_jobs_log_file,
+            coordinator_api_urls: [coordinator_api_urls, self.coordinator_api_urls].concat(),
+            realm_api_urls: [realm_api_urls, self.realm_api_urls].concat(),
+        })
+    }
+    pub async fn get_start_config(
+        config: Option<String>,
+        private_key: Option<String>,
+        _keystore_path: Option<String>,
+        _wallet_password: Option<String>,
+        user: Option<u64>,
+        network: Option<PsyNetworkTypeInput>,
+        coordinator_api_urls: Vec<String>,
+        realm_api_urls: Vec<String>,
+    ) -> anyhow::Result<WorkerStartupConfig> {
+        let cli_config = if let Some(config_path) = config {
+            Self::load_from_file(&config_path).await?
+        } else {
+            Self::get_default_empty()
+        };
+        cli_config.into_start_config_with_cli_args(
+            private_key,
+            user,
+            network,
+            coordinator_api_urls,
+            realm_api_urls,
+        )
+    }
     pub fn ensure_unique_api_urls(&mut self) {
         let mut unique_coordinator_urls = Vec::new();
         for url in &self.coordinator_api_urls {

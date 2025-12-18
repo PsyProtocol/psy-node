@@ -15,7 +15,7 @@ pub fn gen_random_contract<Hash: QPGenRandom + QHashBase>(max_functions: usize) 
     let contract = PQBCDeployContract {
         deployer: Hash::qp_rand_gen(),
         code_definition: ContractCodeDefinition {
-            state_tree_height: 4,//u16::qp_rand_gen() % 31 + 1,
+            state_tree_height: u16::qp_rand_gen() % 31 + 1,
             functions: (0..function_whitelist.len())
                 .map(|i| {
                     ContractFunctionCodeDefinition{

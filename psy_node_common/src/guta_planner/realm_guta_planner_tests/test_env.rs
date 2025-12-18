@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 use parth_common::memory_stores::{dash_tree_append_only::PsyDashMemoryAppendOnlyMerkleStore, traits::PsyMemoryMerkleStoreImm};
 use parth_core::{
     QCoreProcCheckpointUniqueId, QJobIdBase, crypto::hash::traits::{FromU64x4, MerkleZeroHasher, QFieldHashable, ZeroableHash}, data::
-        hash::merkle_store_key::{QMerkleStoreDoubleIdKey, QMerkleStoreSingleIdKey}, felt::{FromPrimitiveValuesFelt, ToU64Value, ZeroableFelt}, node::realm_identifier::QRealmIdentifier, protocol::core_types::{QNetworkTreeCircuitSpecificConstants, QNetworkTreeConstants}, utils::{QPGenRandom, math::log2_ceil}
+        hash::merkle_store_key::{QMerkleStoreDoubleIdKeyWithHeight, QMerkleStoreSingleIdKey}, felt::{FromPrimitiveValuesFelt, ToU64Value, ZeroableFelt}, node::realm_identifier::QRealmIdentifier, protocol::core_types::{QNetworkTreeCircuitSpecificConstants, QNetworkTreeConstants}, utils::{QPGenRandom, math::log2_ceil}
 };
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{
@@ -273,10 +273,11 @@ impl RGPTestChainState {
             let contract_state_tree = ct.get_all_non_zero_nodes_including_changes();
             let contract_state_tree_keys = contract_state_tree
                 .iter()
-                .map(|x| QMerkleStoreDoubleIdKey {
+                .map(|x| QMerkleStoreDoubleIdKeyWithHeight {
                     tree_id: user_id,
                     level: x.key.level,
                     index: x.key.index,
+                    tree_height: ct.get_height(),
                     tree_sub_id: contract_id as u64,
                 })
                 .collect::<Vec<_>>();

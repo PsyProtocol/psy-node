@@ -13,7 +13,7 @@ use parth_core::{
                 QDatabaseSingleIdTableRowLike, QDatabaseSingleIdTableRowNoCheckpointId, QDatabaseSingleIdTableRowNoCheckpointIdLike, QDoubleIdKey,
             },
         },
-        hash::{checkpointed_merkle_node::CheckpointedMerkleHash, merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}},
+        hash::{checkpointed_merkle_node::CheckpointedMerkleHash, merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}, merkle_store_key::QMerkleStoreDoubleIdKeyWithHeight},
         serializable::QPDPair,
     },
     protocol::core_types::QDBHashBase,
@@ -597,6 +597,21 @@ impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sy
                 tree_id,
                 tree_sub_id,
                 tree_height,
+                keys,
+            )
+            .await
+    }
+
+    async fn db_select_many_double_id_merkle_nodes_with_height_max_checkpoint(
+        &self,
+        table: &ScyllaDoubleMerkleNodesPreparedStatements,
+        max_checkpoint_id: u64,
+        keys: &[QMerkleStoreDoubleIdKeyWithHeight],
+    ) -> anyhow::Result<Vec<Hash>>{
+        table
+            .select_many_double_id_merkle_nodes_with_height_max_checkpoint::<Hash, Hasher>(
+                &self.session,
+                max_checkpoint_id,
                 keys,
             )
             .await

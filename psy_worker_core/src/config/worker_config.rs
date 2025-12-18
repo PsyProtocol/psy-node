@@ -12,3 +12,24 @@ pub struct WorkerStartupConfig {
     pub coordinator_api_urls: Vec<String>,
     pub realm_api_urls: Vec<String>,
 }
+
+impl WorkerStartupConfig {
+    pub fn with_unique_api_urls(mut self) -> Self {
+        let mut unique_coordinator_urls = Vec::new();
+        for url in &self.coordinator_api_urls {
+            if !unique_coordinator_urls.contains(url) {
+                unique_coordinator_urls.push(url.clone());
+            }
+        }
+        self.coordinator_api_urls = unique_coordinator_urls;
+
+        let mut unique_realm_urls = Vec::new();
+        for url in &self.realm_api_urls {
+            if !unique_realm_urls.contains(url) {
+                unique_realm_urls.push(url.clone());
+            }
+        }
+        self.realm_api_urls = unique_realm_urls;
+        self
+    }
+}

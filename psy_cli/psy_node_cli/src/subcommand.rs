@@ -17,7 +17,7 @@ pub struct Cli {
 pub enum Commands {
     #[command(about = "Start a realm processor node")]
     StartRealmProcessor {
-        #[arg(long = "config", short = 'c', default_value = "./config.yaml", help = "Path to config.yaml/config.json file")]
+        #[arg(long = "config", short = 'c', help = "Path to config.yaml/config.json file")]
         config: Option<String>,
 
         #[arg(long = "scylla-db-url", env = "SCYLLA_DB_URL", help = "Scylla DB URL/Connection string")]
@@ -55,7 +55,7 @@ pub enum Commands {
     },
     #[command(about = "Start a realm edge node")]
     StartRealmEdge {
-        #[arg(long = "config", short = 'c', default_value = "./config.yaml", help = "Path to config.yaml/config.json file")]
+        #[arg(long = "config", short = 'c', help = "Path to config.yaml/config.json file")]
         config: Option<String>,
 
         #[arg(long = "scylla-db-url", env = "SCYLLA_DB_URL", help = "Scylla DB URL/Connection string")]
@@ -93,7 +93,7 @@ pub enum Commands {
     },
     #[command(about = "Start a coordinator processor node")]
     StartCoordinatorProcessor {
-        #[arg(long = "config", short = 'c', default_value = "./config.yaml", help = "Path to config.yaml/config.json file")]
+        #[arg(long = "config", short = 'c', help = "Path to config.yaml/config.json file")]
         config: Option<String>,
 
         #[arg(long = "scylla-db-url", env = "SCYLLA_DB_URL", help = "Scylla DB URL/Connection string")]
@@ -128,7 +128,7 @@ pub enum Commands {
     },
     #[command(about = "Start a coordinator edge node")]
     StartCoordinatorEdge {
-        #[arg(long = "config", short = 'c', default_value = "./config.yaml", help = "Path to config.yaml/config.json file")]
+        #[arg(long = "config", short = 'c', help = "Path to config.yaml/config.json file")]
         config: Option<String>,
 
         #[arg(long = "scylla-db-url", env = "SCYLLA_DB_URL", help = "Scylla DB URL/Connection string")]

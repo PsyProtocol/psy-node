@@ -26,7 +26,7 @@ use parth_core::{
         hash::{
             checkpointed_merkle_node::CheckpointedMerkleHash, fast_node_serializer::{
                 QMS_FAST_SERIALIZER_DOUBLE_ID_NODE_SIZE, QMS_FAST_SERIALIZER_SINGLE_ID_NODE_SIZE, QMS_FAST_SERIALIZER_ZERO_ID_NODE_SIZE, QMerkleStoreFastDoubleNodeSerializer, QMerkleStoreFastSingleNodeSerializer, QMerkleStoreFastZeroNodeSerializer
-            }, merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}
+            }, merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}, merkle_store_key::QMerkleStoreDoubleIdKeyWithHeight
         },
         serializable::QPDPair,
     },
@@ -1338,6 +1338,16 @@ where
         } else {
             Ok(Hasher::get_zero_hash((tree_height - key.level) as usize))
         }
+    }
+
+    async fn db_select_many_double_id_merkle_nodes_with_height_max_checkpoint(
+        &self,
+        table: &InMemoryTableIdentifier,
+        max_checkpoint_id: u64,
+        keys: &[QMerkleStoreDoubleIdKeyWithHeight],
+    ) -> anyhow::Result<Vec<Hash>>{
+        let futures = keys.iter().map(|&key| self.db_select_double_id_merkle_node_max_checkpoint(table, max_checkpoint_id, key.tree_id, key.tree_sub_id, key.tree_height.max(key.level), SimpleMerkleNodeKey { level: key.level, index: key.index }));
+        future::try_join_all(futures).await
     }
     async fn db_select_many_double_id_merkle_nodes_max_checkpoint(&self, table: &InMemoryTableIdentifier, max_checkpoint_id: u64, tree_id: u64, tree_sub_id: u64, tree_height: u8, keys: &[SimpleMerkleNodeKey]) -> anyhow::Result<Vec<Hash>> {
         let futures = keys.iter().map(|&key| self.db_select_double_id_merkle_node_max_checkpoint(table, max_checkpoint_id, tree_id, tree_sub_id, tree_height, key));

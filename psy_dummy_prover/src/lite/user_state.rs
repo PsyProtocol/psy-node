@@ -2,9 +2,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use parth_common::{memory_stores::mem_tree_recorder::SimpleMemoryMerkleRecorderStore, tree_sync::traits::sync_local_tree_from_remote};
 use parth_core::{
-    crypto::hash::traits::{FieldQHasher, QFieldHashable},
-    felt::QFelt64,
-    protocol::core_types::{Q256BitHash, QFHashBase},
+    crypto::hash::traits::{FieldQHasher, QFieldHashable}, felt::QFelt64, protocol::core_types::{Q256BitHash, QFHashBase}
 };
 use psy_data::{
     guta::stats::GUTAStats,
@@ -16,7 +14,7 @@ use psy_data::{
     },
 };
 
-use crate::api::data_fetcher::{PsyUserContractDataFetcher, PsyUserContractTreeDataSyncHelper};
+use crate::api::data_fetcher::{PsyContractStateTreeDataSyncHelper, PsyUserContractDataFetcher, PsyUserContractTreeDataSyncHelper};
 
 #[derive(Clone)]
 pub struct DPContractUpdate<Hash> {
@@ -70,6 +68,7 @@ impl<Hasher: FieldQHasher<F, Hash>, Hash: Q256BitHash + QFHashBase<F>, F: QFelt6
             let fetched_heights: Vec<u8> = data_fetcher
                 .df_get_contract_state_heights(u64::MAX, missing_heights.iter().map(|x| *x as u64).collect())
                 .await?;
+            //println!("Fetched missing contract heights for contracts: {:?} heights: {:?}", missing_heights, fetched_heights);
             for (contract_id, height) in missing_heights.iter().zip(fetched_heights.iter()) {
                 contract_height_cache.add_contract(*contract_id, *height, Hasher::get_zero_hash(*height as usize));
             }
@@ -91,15 +90,13 @@ impl<Hasher: FieldQHasher<F, Hash>, Hash: Q256BitHash + QFHashBase<F>, F: QFelt6
             ));
         }
         if self.user_leaf.qfhash::<Hasher>() == user_leaf.qfhash::<Hasher>() {
-            println!("User leaf hash matches, no sync needed");
+            //println!("User leaf hash matches, no sync needed");
             return Ok(());
         }
-        println!("uct root: {:?}", self.uct.get_root());
-        println!("remote user leaf root: {:?}", user_leaf.user_state_tree_root);
         let needs_state_sync = user_leaf.user_state_tree_root != self.uct.get_root();
         self.user_leaf = user_leaf;
         if !needs_state_sync {
-            println!("User state tree root matches, no state sync needed");
+            //println!("User state tree root matches, no state sync needed");
             return Ok(());
         }
         self.uct.commit_changes();
@@ -111,22 +108,38 @@ impl<Hasher: FieldQHasher<F, Hash>, Hash: Q256BitHash + QFHashBase<F>, F: QFelt6
             _phantom_hash: std::marker::PhantomData,
         };
         sync_local_tree_from_remote(&mut self.uct, &remote_tree).await?;
-        let tree_height = self.uct.get_height();
+        /* 
+
+        self.uct_commit_changes();
         let modified_contract_ids = self
             .uct
-            .get_changes()
-            .iter()
-            .filter_map(|x| if x.0.level == tree_height { Some(x.0.index as u32) } else { None })
+            .get_leaves_slow_all()
+            .iter().filter_map(|(index, root)|  {
+                let index_u32 = *index as u32;
+                let tree = self.contract_trees.get(&index_u32);
+                if tree.is_none() {
+                    Some(index_u32)
+                }else if tree.unwrap().get_root() != *root {
+                    println!("Contract tree root mismatch for contract id {}, local: {:?}, remote: {:?}, syncing to remote...", index_u32, tree.unwrap().get_root(), *root);
+                    Some(index_u32)
+                } else {
+                    None
+                }
+            })
             .collect::<Vec<u32>>();
+        */
+        let modified_contract_ids = self.uct.get_changed_leaves().iter().map(|(ind, _)| *ind as u32).collect::<Vec<u32>>();
+        self.uct.commit_changes();
 
         Self::ensure_contract_heights_in_cache_or_fetch::<DF>(data_fetcher.clone(), contract_height_cache, &modified_contract_ids).await?;
-        self.uct.commit_changes();
         for contract_id in modified_contract_ids {
             if let Some(contract_tree) = self.contract_trees.get_mut(&contract_id) {
                 sync_local_tree_from_remote(
                     contract_tree,
-                    &PsyUserContractTreeDataSyncHelper {
+                    &PsyContractStateTreeDataSyncHelper {
                         user_id: self.user_id,
+                        contract_id: contract_id as u64,
+                        state_tree_height: contract_height_cache.get_contract_height(contract_id)?,
                         checkpoint_id,
                         fetcher: data_fetcher.clone(),
                         _phantom_f: std::marker::PhantomData,
@@ -137,11 +150,14 @@ impl<Hasher: FieldQHasher<F, Hash>, Hash: Q256BitHash + QFHashBase<F>, F: QFelt6
                 contract_tree.commit_changes();
                 self.uct.set_leaf(contract_id as u64, contract_tree.get_root());
             } else {
-                let mut new_contract_tree = SimpleMemoryMerkleRecorderStore::new(contract_height_cache.get_contract_height(contract_id)?);
+                let height = contract_height_cache.get_contract_height(contract_id)?;
+                let mut new_contract_tree = SimpleMemoryMerkleRecorderStore::new(height);
                 sync_local_tree_from_remote(
                     &mut new_contract_tree,
-                    &PsyUserContractTreeDataSyncHelper {
+                    &PsyContractStateTreeDataSyncHelper {
                         user_id: self.user_id,
+                        contract_id: contract_id as u64,
+                        state_tree_height: height,
                         checkpoint_id,
                         fetcher: data_fetcher.clone(),
                         _phantom_f: std::marker::PhantomData,

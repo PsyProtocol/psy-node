@@ -8,7 +8,7 @@ use parth_core::{
         tag_tree::TagTreeMerkleProof,
     }, data::
         hash::{
-            checkpointed_merkle_node::CheckpointedMerkleHash, merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}, merkle_store_key::{QMerkleStoreDoubleIdKey, QMerkleStoreDoubleIdNode, QMerkleStoreSingleIdKey, QMerkleStoreSingleIdNode}
+            checkpointed_merkle_node::CheckpointedMerkleHash, merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}, merkle_store_key::{QMerkleStoreDoubleIdKeyWithHeight, QMerkleStoreDoubleIdNode, QMerkleStoreSingleIdKey, QMerkleStoreSingleIdNode}
         }
     
 };
@@ -123,7 +123,7 @@ pub trait PsyNodeContractStateTreeTreeDatabaseReader<Hash> {
         tree_height: u8,
         state_slot_id: u64,
     ) -> anyhow::Result<MerkleProofCore<Hash>>;
-    async fn contract_state_tree_get_nodes(&self, checkpoint_id: u64, keys: &[QMerkleStoreDoubleIdKey]) -> anyhow::Result<Vec<Hash>>;
+    async fn contract_state_tree_get_nodes(&self, checkpoint_id: u64, keys: &[QMerkleStoreDoubleIdKeyWithHeight]) -> anyhow::Result<Vec<Hash>>;
 }
 
 #[async_trait]

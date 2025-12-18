@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use jsonrpsee::http_client::HttpClient;
 use parth_core::{
     crypto::hash::merkle_proof::MerkleProofCore,
-    data::hash::merkle_store_key::{QMerkleStoreDoubleIdKey, QMerkleStoreSingleIdKey},
+    data::hash::merkle_store_key::{QMerkleStoreDoubleIdKeyWithHeight, QMerkleStoreSingleIdKey},
     protocol::core_types::QNetworkTypesConfig,
 };
 use psy_data::{
@@ -63,7 +63,7 @@ impl<
     async fn df_get_contract_state_heights(&self, checkpoint_id: u64, contract_ids: Vec<u64>) -> anyhow::Result<Vec<u8>> {
         self.rc.df_get_contract_state_heights(checkpoint_id, contract_ids).await
     }
-    async fn df_get_contract_state_tree_nodes(&self, checkpoint_id: u64, node_keys: Vec<QMerkleStoreDoubleIdKey>) -> anyhow::Result<Vec<N::QHash>> {
+    async fn df_get_contract_state_tree_nodes(&self, checkpoint_id: u64, node_keys: Vec<QMerkleStoreDoubleIdKeyWithHeight>) -> anyhow::Result<Vec<N::QHash>> {
         self.rc.df_get_contract_state_tree_nodes(checkpoint_id, node_keys).await
     }
         async fn df_get_user_leaves_batch(&self, checkpoint_id: u64, user_ids: Vec<u64>) -> anyhow::Result<Vec<PQEDUserLeaf<N::F, N::QHash>>>{
