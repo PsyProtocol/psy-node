@@ -91,7 +91,7 @@ start_realm_processor() {
 
 start_worker() {
     build_if_needed $1
-    ./target/release/psy_worker_cli worker --user 0 --network local-devnet --proving-backend jtmb-poseidon-goldilocks --config ./psy_cli/example_node_configs/worker_1.yml 2>&1 | tee logs/worker_1_logs.txt
+    ./target/release/psy_worker_cli worker --user 0 --network local-devnet --proving-backend jtmb-poseidon-goldilocks --config ./psy_cli/example_node_configs/worker_coordinator.yml 2>&1 | tee logs/worker_coordinator_logs.txt
 }
 start_worker_realm() {
     build_if_needed_realm $1

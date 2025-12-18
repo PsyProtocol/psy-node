@@ -1,6 +1,7 @@
 network: local-devnet
 private_key: 56562aa2be2f1e5150d128599ed3bd75a8df890ccbcf3fe7418b77df51cc40c0
 user: 0
-coordinator_api_urls:
+coordinator_api_urls: []
 realm_api_urls:
-  - http://127.0.0.1:1338
+  - http://127.0.0.1:1341
+

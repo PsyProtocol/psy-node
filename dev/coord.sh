@@ -77,8 +77,8 @@ echo "Started Coordinator Edge (PID: $PID_2)"
 # -----------------------------------------------------
 ./target/release/psy_worker_cli worker \
     --user 0 --network local-devnet \
-    --config ./psy_cli/example_node_configs/worker_1.yml \
-    > >(tee "$LOG_DIR/worker_1_logs.txt" | sed -u 's/^/[WORKER-1]   /') 2>&1 &
+    --config ./psy_cli/example_node_configs/worker_coordinator.yml \
+    > >(tee "$LOG_DIR/worker_coordinator_logs.txt" | sed -u 's/^/[WORKER-COORD]   /') 2>&1 &
 
 PID_3=$!
 PIDS+=($PID_3)
