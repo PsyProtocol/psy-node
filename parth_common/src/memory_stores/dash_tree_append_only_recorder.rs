@@ -44,7 +44,9 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + Eq + PartialEq + Default + std
         match self.roots.get(&checkpoint_tree_root) {
             Some(v) => {
                 let index = *v;
-                Ok(self.get_leaf(index))
+                // FIX: Use historical merkle proof to get the correct root at the time
+                // when `index` was the last leaf, instead of the current root
+                Ok(self.get_historical_merkle_proof(index))
             },
             None => anyhow::bail!("Root not found in append-only store"),
         }
