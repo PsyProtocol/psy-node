@@ -6,14 +6,6 @@ use std::marker::PhantomData;
 use crate::memory_stores::traits::{PsyMemoryMerkleStoreAppendOnlyReaderBase, PsyMemoryMerkleStoreAppendOnlyReaderBaseAsync, PsyMemoryMerkleStoreImm};
 
 // --- Start of Refactored Code ---
-#[inline(always)]
-const fn is_key_contained_in_historical_store(
-    tree_height: u8,
-    historical_index: u64,
-    key: &SimpleMerkleNodeKey,
-) -> bool {
-    key.index <= historical_index >> (tree_height - key.level)
-}
 #[derive(Debug, Clone)]
 pub struct PsyDashMemoryAppendOnlyMerkleStore<Hasher, Hash: Eq + Copy + PartialEq + Default + std::hash::Hash> {
     pub nodes: DashMap<SimpleMerkleNodeKey, Hash>,
@@ -157,14 +149,30 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + Eq + PartialEq + Default + std
         }
     }
     pub fn get_historical_node_value(&self, key: &SimpleMerkleNodeKey, historical_index: u64) -> Hash {
-        
-        if is_key_contained_in_historical_store(self.height, historical_index, key) {
+        let level_offset = self.height - key.level;
+        let node_first_leaf = key.index << level_offset;
+        let node_last_leaf = ((key.index + 1) << level_offset) - 1;
+
+        if node_last_leaf <= historical_index {
+            // Node is fully contained in historical state - all leaves existed, use current value
             match self.nodes.get(key) {
                 Some(v) => *v,
                 None => self.get_zero_hash_for_level(key.level),
             }
-        } else {
+        } else if node_first_leaf > historical_index {
+            // Node is fully outside historical state - no leaves existed yet, return zero hash
             self.get_zero_hash_for_level(key.level)
+        } else {
+            // Node straddles the boundary - some leaves existed, some didn't
+            // We need to recursively compute the historical value
+            if key.level >= self.height {
+                // Leaf level - this specific leaf is beyond historical_index
+                self.get_zero_hash_for_level(key.level)
+            } else {
+                let left = self.get_historical_node_value(&key.left_child(), historical_index);
+                let right = self.get_historical_node_value(&key.right_child(), historical_index);
+                Hasher::two_to_one(&left, &right)
+            }
         }
     }
     pub fn get_historical_merkle_proof_at_historical_index(
@@ -173,20 +181,20 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + Eq + PartialEq + Default + std
         historical_index: u64,
     ) -> MerkleProofCore<Hash> {
         // get the merkle proof showing the inclusion of a leaf at index n, at the point in time where the leaf at historical index is the last non-zero leaf
-        
+
         let leaf_key = SimpleMerkleNodeKey::new(self.get_height(), index);
         let siblings = leaf_key.siblings();
         let mut sibling_values = Vec::with_capacity(siblings.len());
-        let mut h_index = historical_index;
+
         for sibling_key in &siblings {
-            if sibling_key.index > h_index {
-                sibling_values.push(self.get_zero_hash_for_level(sibling_key.level));
-            } else {
-                sibling_values.push(self.get_node_value(sibling_key));
-            }
-            h_index >>= 1;
+            // Use get_historical_node_value which correctly handles:
+            // 1. Fully contained nodes (all leaves <= historical_index) -> current value
+            // 2. Fully outside nodes (all leaves > historical_index) -> zero hash
+            // 3. Straddling nodes (some leaves <= historical_index, some >) -> recursive computation
+            sibling_values.push(self.get_historical_node_value(sibling_key, historical_index));
         }
-        let value = self.get_node_value(&leaf_key);
+
+        let value = self.get_historical_node_value(&leaf_key, historical_index);
         let root = compute_root_merkle_proof_generic::<Hash, Hasher>(value, index, &sibling_values);
         MerkleProofCore {
             index,
@@ -194,22 +202,6 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + Eq + PartialEq + Default + std
             root,
             value,
         }
-
-        /*
-
-        let value = self.get_historical_node_value(&leaf_key, historical_index);
-
-        let mut siblings = Vec::with_capacity(self.get_height() as usize);
-        let mut current_key = leaf_key;
-
-        while current_key.level > 0 {
-            siblings.push(self.get_historical_node_value(&current_key.sibling(), historical_index));
-            current_key = current_key.parent();
-        }
-
-        let root = self.get_historical_node_value(&current_key, historical_index);
-        MerkleProofCore { index, siblings, root, value }
-        */
     }
 
 }
