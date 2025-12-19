@@ -646,4 +646,86 @@ mod tests {
         println!("Scenario test completed successfully!");
         Ok(())
     }
+
+    #[test]
+    fn test_historical_merkle_proof_full_consistency() -> Result<()> {
+        let height = 16;
+        let store = TestMerkleStore::new(height);
+        let count = 1000u64;
+
+        // Generate random leaf
+        let leaves = gen_random_hashes(count as usize);
+        for (i, leaf) in leaves.iter().enumerate() {
+            store.append_leaf(i as u64, *leaf)?;
+        }
+
+        // ========================
+        // 1. Basic consistency
+        // ========================
+        let checkpoint = count - 2;
+        let base_root = store.get_historical_merkle_proof_at_historical_index(0, checkpoint).root;
+
+        for i in 0..=checkpoint {
+            let p = store.get_historical_merkle_proof_at_historical_index(i, checkpoint);
+            assert_eq!(p.root, base_root, "Base consistency mismatch at i={}", i);
+        }
+
+        // ========================
+        // 2. Boundary index test
+        // ========================
+        let checkpoints = [0, 1, 2, 3, 7, 15, 31, 63, 86, 128, 511, 999, count - 1];
+        for &cp in &checkpoints {
+            let root = store.get_historical_merkle_proof_at_historical_index(cp, cp).root;
+            // leftmost
+            assert_eq!(store.get_historical_merkle_proof_at_historical_index(0, cp).root, root);
+            // rightmost
+            assert_eq!(store.get_historical_merkle_proof_at_historical_index(cp, cp).root, root);
+        }
+
+        // ========================
+        // 3. Check root changes across checkpoints
+        // ========================
+        let root1 = store.get_historical_merkle_proof_at_historical_index(0, 40).root;
+        let root2 = store.get_historical_merkle_proof_at_historical_index(0, 60).root;
+        assert_ne!(root1, root2, "Roots should differ across checkpoints");
+
+        // ========================
+        // 4. Replay Oracle comparison
+        // ========================
+        let replay_checkpoints = [10, 20, 33, 64, 89, 299, 512, 999];   
+        for &cp in &replay_checkpoints {
+            let replay = TestMerkleStore::new(height);
+            for i in 0..=cp {
+                replay.append_leaf(i, leaves[i as usize])?;
+            }
+            let replay_root = replay.get_root();
+            for i in 0..=cp {
+                let p = store.get_historical_merkle_proof_at_historical_index(i, cp);
+                assert_eq!(p.root, replay_root, "Replay root mismatch at checkpoint={}, index={}", cp, i);
+            }
+        }
+
+        // ========================
+        // 5. Random fuzz testing
+        // ========================
+        for _ in 0..5000 {
+            let checkpoint = rand::random::<u64>() % count;
+            let index = rand::random::<u64>() % (checkpoint + 1);
+            let p = store.get_historical_merkle_proof_at_historical_index(index, checkpoint);
+
+            let replay = TestMerkleStore::new(height);
+            for i in 0..=checkpoint {
+                replay.append_leaf(i, leaves[i as usize])?;
+            }
+            assert_eq!(
+                p.root,
+                replay.get_root(),
+                "Fuzz root mismatch at checkpoint={}, index={}",
+                checkpoint,
+                index
+            );
+        }
+
+        Ok(())
+    }
 }
