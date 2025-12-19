@@ -24,6 +24,8 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
 
         let no_tablet_keyspace = format!("{}_no_tablet", keyspace);
 
+        println!("creating keyspaces: {} and {}", &keyspace, &no_tablet_keyspace);
+
         // Create keyspace and table if not exists
 
         let create_standard_keyspace = session

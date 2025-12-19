@@ -167,7 +167,7 @@ where
         let realm_sub_id_u64 = realm_identifier.realm_sub_id as u64;
         let realm_root_node = SimpleMerkleNodeKey {
             level: N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
-            index: realm_id_u64 << N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
+            index: realm_id_u64,
         };
 
         // 1. Recover basic state from DB

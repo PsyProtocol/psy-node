@@ -12,6 +12,7 @@ NETWORK="local-devnet"
 MAX_CONTRACT_CALLS=1
 GROUP_SIZE=100
 DUMMY_GROUPS=1
+BASE_START_USER_ID=0
 
 show_help() {
     echo "Usage: $0 [options]"
@@ -28,6 +29,7 @@ show_help() {
     echo "  --max-contract-calls VAL     (Default: $MAX_CONTRACT_CALLS)"
     echo "  --group-size VAL             (Default: $GROUP_SIZE)"
     echo "  --groups VAL                 (Default: $DUMMY_GROUPS)"
+    echo "  --start-user-id VAL          (Default: $BASE_START_USER_ID)"
     echo "  -h, --help                   Show this help message"
     echo ""
     exit 0
@@ -47,6 +49,7 @@ while [[ $# -gt 0 ]]; do
         --max-contract-calls)  MAX_CONTRACT_CALLS="$2"; shift 2 ;;
         --group-size)          GROUP_SIZE="$2"; shift 2 ;;
         --groups)              DUMMY_GROUPS="$2"; shift 2 ;;
+        --start-user-id)       BASE_START_USER_ID="$2"; shift 2 ;;
         -h|--help)             show_help ;;
         *)                     echo "Unknown option: $1"; show_help ;;
     esac
@@ -59,7 +62,7 @@ pids=()
 
 for (( i=0; i<$DUMMY_GROUPS; i++ )); do
     # Calculate values for this group
-    START_USER_ID=$(( i * GROUP_SIZE ))
+    START_USER_ID=$(( BASE_START_USER_ID + i * GROUP_SIZE ))
     END_USER_ID=$(( START_USER_ID + GROUP_SIZE - 1 ))
     
     # Port wraps around based on edge nodes
