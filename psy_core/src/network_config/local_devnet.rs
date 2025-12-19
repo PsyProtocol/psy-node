@@ -21,7 +21,7 @@ impl QNetworkTreeConstants for PsyNetworkLocalDevnetConstants {
     const CHECKPOINT_TREE_HEIGHT_USIZE: usize = 32;
     const CHECKPOINT_TREE_HEIGHT: u8 = Self::CHECKPOINT_TREE_HEIGHT_USIZE as u8;
 
-    const GLOBAL_USER_TREE_HEIGHT_USIZE: usize = 25;
+    const GLOBAL_USER_TREE_HEIGHT_USIZE: usize = 32;
     const GLOBAL_USER_TREE_HEIGHT: u8 = Self::GLOBAL_USER_TREE_HEIGHT_USIZE as u8;
 
     const GLOBAL_CONTRACT_TREE_HEIGHT_USIZE: usize = 24;
@@ -33,7 +33,7 @@ impl QNetworkTreeConstants for PsyNetworkLocalDevnetConstants {
     const COORDINATOR_GLOBAL_USER_TREE_HEIGHT_USIZE: usize = 12;
     const COORDINATOR_GLOBAL_USER_TREE_HEIGHT: u8 = Self::COORDINATOR_GLOBAL_USER_TREE_HEIGHT_USIZE as u8;
 
-    const REALM_GLOBAL_USER_TREE_HEIGHT_USIZE: usize = 13; // reduced for multi realm testing
+    const REALM_GLOBAL_USER_TREE_HEIGHT_USIZE: usize = 20;
     const REALM_GLOBAL_USER_TREE_HEIGHT: u8 = Self::REALM_GLOBAL_USER_TREE_HEIGHT_USIZE as u8;
 
     const MAX_CONTRACT_STATE_TREE_HEIGHT_USIZE: usize = 32;
