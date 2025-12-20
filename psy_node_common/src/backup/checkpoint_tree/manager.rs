@@ -177,7 +177,7 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std
             }
 
             if init_proof.value != valid_leaves[0].value {
-                anyhow::bail!("Integrity Error: DB proof for checkpoint {} differs from backup file", start_id);
+                anyhow::bail!("Integrity Error: DB proof {:?} for checkpoint {} differs from backup file proof {:?}", init_proof.value, start_id, valid_leaves[0].value);
             }
 
             checkpoint_tree.injest_merkle_proof(&init_proof)?;

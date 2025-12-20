@@ -82,14 +82,6 @@ pub async fn read_realm_end_cap_gatherer_backup_file<
         return Err(anyhow::anyhow!("Backup file too small to be valid: {} bytes", metadata.len()));
     }
 
-    let file_len_without_metadata = file_len as usize - const_size_len;
-    if file_len_without_metadata % (GlobalUserTreeAggregatorHeaderWithTagValueAndJobID::<F, Hash>::FIXED_SIZE) != 0 {
-        return Err(anyhow::anyhow!(
-            "Backup file length without metadata is not a multiple of 64: {} bytes",
-            file_len_without_metadata
-        ));
-    }
-
     let magic_u32 = file.read_u32_le().await?;
     if magic_u32 != REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_U32 {
         return Err(anyhow::anyhow!(
@@ -111,22 +103,26 @@ pub async fn read_realm_end_cap_gatherer_backup_file<
     }
     let mut end_root_hash_bytes = [0u8; 32];
     file.read_exact(&mut end_root_hash_bytes).await?;
-    let end_global_user_tree_root = Hash::from_owned_32bytes(end_root_hash_bytes);
+    let mut expected_end_global_user_tree_root = Hash::from_owned_32bytes(end_root_hash_bytes);
 
-    let total_end_caps_processed = file.read_u64_le().await?;
+    let expected_end_caps_processed = file.read_u64_le().await?;
 
     let mut queue_item_buf = [0u8; 232];
-    let total_end_caps_processed = total_end_caps_processed as usize;
-    let mut update_user_leaves_ffs = Vec::with_capacity(total_end_caps_processed * PSY_OBJECT_FFS_SIZE_USER_LEAF);
+    let mut actual_end_caps_processed = 0usize;
+    let mut update_user_leaves_ffs = Vec::new();
     let mut update_user_contract_tree_nodes_ffs = Vec::new();
     let mut update_contract_state_tree_nodes_ffs = Vec::new();
 
     let min_user_id = realm_id_u64 << (realm_global_user_tree_height as u64);
     let max_user_id = ((realm_id_u64 + 1) << (realm_global_user_tree_height as u64)) - 1;
     let mut merkle_header = [0u8; QBLOB_TREE_NODE_BATCH_HEADER_SIZE];
-    for _ in 0..total_end_caps_processed {
+
+    for i in 0..expected_end_caps_processed {
+        // A. Read Fixed Queue Item
         file.read_exact(&mut queue_item_buf).await?;
+
         let queue_item = PsyRealmUserUpdateQueueItem::<F, Hash>::psy_ser_from_slice(&queue_item_buf)?;
+
         let user_leaf_node = queue_item.new_user_leaf;
         let user_id = user_leaf_node.user_id.to_u64_value();
         if user_id < min_user_id || user_id > max_user_id {
@@ -138,33 +134,56 @@ pub async fn read_realm_end_cap_gatherer_backup_file<
                 max_user_id
             ));
         }
-        user_leaf_node.pio_write_to_io(&mut update_user_leaves_ffs)?;
-        file.read_exact(&mut merkle_header).await?;
-        let tree_node_batch_header = QBlobSingleMerkleNodeBatchDataView::try_read_single_node_blob_header(&merkle_header)?;
-        let user_contract_tree_nodes_size = tree_node_batch_header.total_size as usize - QBLOB_TREE_NODE_BATCH_HEADER_SIZE;
-        let mut user_contract_tree_nodes_ffs = vec![0u8; user_contract_tree_nodes_size];
-        file.read_exact(&mut user_contract_tree_nodes_ffs).await?;
-        update_user_contract_tree_nodes_ffs.extend_from_slice(&user_contract_tree_nodes_ffs);
 
+        // B. Read Variable Contract Blobs
+        // 1. Single Tree Nodes (User Contract Tree)
         file.read_exact(&mut merkle_header).await?;
-        let tree_node_batch_header = QBlobDoubleMerkleNodeBatchDataView::try_read_double_node_blob_header(&merkle_header)?;
-        let contract_state_tree_nodes_size = tree_node_batch_header.total_size as usize - QBLOB_TREE_NODE_BATCH_HEADER_SIZE;
-        let mut contract_state_tree_nodes_ffs = vec![0u8; contract_state_tree_nodes_size];
-        file.read_exact(&mut contract_state_tree_nodes_ffs).await?;
-        update_contract_state_tree_nodes_ffs.extend_from_slice(&contract_state_tree_nodes_ffs);
+
+        let single_header_parsed = QBlobSingleMerkleNodeBatchDataView::try_read_single_node_blob_header(&merkle_header)?;
+
+        let user_contract_tree_nodes_size = single_header_parsed.total_size as usize - QBLOB_TREE_NODE_BATCH_HEADER_SIZE;
+        let mut user_contract_tree_nodes = vec![0u8; user_contract_tree_nodes_size];
+        file.read_exact(&mut user_contract_tree_nodes).await?;
+
+        // 2. Double Tree Nodes (Contract State Tree)
+        file.read_exact(&mut merkle_header).await?;
+
+        let double_header_parsed = QBlobDoubleMerkleNodeBatchDataView::try_read_double_node_blob_header(&merkle_header)?;
+
+        let contract_state_tree_nodes_size = double_header_parsed.total_size as usize - QBLOB_TREE_NODE_BATCH_HEADER_SIZE;
+        let mut contract_state_tree_nodes = vec![0u8; contract_state_tree_nodes_size];
+        file.read_exact(&mut contract_state_tree_nodes).await?;
+
+        // C. Apply Logic
+        user_leaf_node.pio_write_to_io(&mut update_user_leaves_ffs)?;
+        update_user_contract_tree_nodes_ffs.extend_from_slice(&user_contract_tree_nodes);
+        update_contract_state_tree_nodes_ffs.extend_from_slice(&contract_state_tree_nodes);
 
         if insert_old_leaves {
             tree.set_leaf(user_id - min_user_id, queue_item.old_user_leaf_hash);
         } else {
             tree.set_leaf(user_id - min_user_id, queue_item.new_user_leaf_hash);
         }
+        actual_end_caps_processed += 1;
     }
 
-    let guta_header = {
-        let mut header_bytes = vec![0u8; GlobalUserTreeAggregatorHeaderWithJobId::<F, Hash>::FIXED_SIZE];
-        file.read_exact(&mut header_bytes).await?;
-        GlobalUserTreeAggregatorHeaderWithJobId::<F, Hash>::psy_ser_from_owned_bytes_vec(header_bytes)?
-    };
+    if actual_end_caps_processed != expected_end_caps_processed as usize {
+        anyhow::bail!(
+            "Backup file corruption: expected {} end caps, but recovered {}. This indicates file corruption or incomplete write.",
+            expected_end_caps_processed,
+            actual_end_caps_processed
+        );
+    }
+
+    tracing::info!(
+        "Expected end_global_user_tree_root: {:?},  actual end_global_user_tree_root: {:?}",
+        expected_end_global_user_tree_root,
+        tree.get_root(),
+    );
+
+    let mut header_bytes = vec![0u8; GlobalUserTreeAggregatorHeaderWithJobId::<F, Hash>::FIXED_SIZE];
+    file.read_exact(&mut header_bytes).await?;
+    let guta_header = GlobalUserTreeAggregatorHeaderWithJobId::<F, Hash>::psy_ser_from_owned_bytes_vec(header_bytes)?;
 
     let update_global_user_tree_nodes_ffs = create_ffs_merkle_nodes_zero_id_from_hash_map_with_offset::<Hash>(
         tree.get_changes(),
@@ -176,7 +195,7 @@ pub async fn read_realm_end_cap_gatherer_backup_file<
 
     Ok(RealmGUTAEndCapGathererOutputDatabase {
         old_realm_root: start_global_user_tree_root,
-        new_realm_root: end_global_user_tree_root,
+        new_realm_root: expected_end_global_user_tree_root,
         update_global_user_tree_nodes_ffs,
         update_user_contract_tree_nodes_ffs,
         update_contract_state_tree_nodes_ffs,
