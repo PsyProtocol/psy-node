@@ -134,7 +134,6 @@ pub async fn load_global_user_tree_from_db_with_sub_root<
     println!("Current root hash: {:?}", current_value);
     println!("Zero hash at root level: {:?}", Hasher::get_zero_hash((tree_height-sub_root.level) as usize));
     println!("zero hash of at leaves: {:?}", Hasher::get_zero_hash(0));
-    let zero_hash_reverse_level = tree_height-sub_root.level;
 
     if current_value == Hasher::get_zero_hash((tree_height-sub_root.level) as usize) {
         // Tree is empty
@@ -142,7 +141,7 @@ pub async fn load_global_user_tree_from_db_with_sub_root<
     }
     while current_key.level < tree_height {
         let right_child_key = current_key.right_child();
-        let zero_hash_at_level = Hasher::get_zero_hash((zero_hash_reverse_level - right_child_key.level) as usize);
+        let zero_hash_at_level = Hasher::get_zero_hash((tree_height - right_child_key.level) as usize);
 
         let right_child_value = user_db_reader.global_user_tree_get_node(checkpoint_id, right_child_key).await?;
         let right_is_empty = right_child_value == zero_hash_at_level;

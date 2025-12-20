@@ -1,6 +1,6 @@
 use parth_common::memory_stores::mem_tree_recorder::SimpleMemoryMerkleRecorderStore;
 use parth_core::{crypto::hash::traits::MerkleZeroHasher, data::hash::merkle_node_key::SimpleMerkleNodeKey};
-use psy_node_core::psy_core_db::traits::full::{PsyNodeGlobalContractTreeDatabaseReader};
+use psy_node_core::psy_core_db::traits::full::PsyNodeGlobalContractTreeDatabaseReader;
 
 pub async fn load_append_only_global_contract_tree_into_memory<
     Hasher: MerkleZeroHasher<Hash>,

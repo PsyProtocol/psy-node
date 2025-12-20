@@ -52,13 +52,13 @@ where
         file_system: Arc<FileSystem>,
         guta_gatherer_backup_directory: String,
     ) -> anyhow::Result<(Self, tokio::task::JoinHandle<Result<(), anyhow::Error>>)> {
-        let (mut global_user_tree,) = load_realm_memory_trees_from_db::<N, _>(&db.db, db.state.gathering_checkpoint_id + 1, db.state.realm_id_u64)
+        let (mut global_user_tree,) = load_realm_memory_trees_from_db::<N, _>(&db.db, db.state.gathering_checkpoint_id, db.state.realm_id_u64)
             .await?
             .into_tuple();
         db.init_with_setup_and_genesis(&file_system, &guta_gatherer_backup_directory, genesis_block_update, &mut global_user_tree)
             .await?;
         //db.set_new_unique_ids().await?;
-        tracing::info!("intialized coordinator processor database, building gatherers...");
+        tracing::info!("intialized realm processor database, building gatherers...");
 
         let guta_create_builder_config = RealmGUTAEndCapGathererConfig::<N, TempDatabase, FileSystem> {
             realm_id_u64: db.state.realm_id_u64,
