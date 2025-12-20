@@ -23,14 +23,14 @@ pub struct DPContractUpdate<Hash> {
 }
 
 #[derive(Clone)]
-pub struct DPLocalUser<Hasher, Hash: Copy + PartialEq + Default, F> {
+pub struct DPLocalUser<Hasher, Hash: Copy + PartialEq + Default + std::fmt::Debug, F> {
     pub user_id: u64,
     pub uct: SimpleMemoryMerkleRecorderStore<Hasher, Hash>,
     pub contract_trees: HashMap<u32, SimpleMemoryMerkleRecorderStore<Hasher, Hash>>,
     pub user_leaf: PQEDUserLeaf<F, Hash>,
 }
 
-impl<Hasher: FieldQHasher<F, Hash>, Hash: Q256BitHash + QFHashBase<F>, F: QFelt64> DPLocalUser<Hasher, Hash, F> {
+impl<Hasher: FieldQHasher<F, Hash>, Hash: Q256BitHash + QFHashBase<F> + std::fmt::Debug, F: QFelt64> DPLocalUser<Hasher, Hash, F> {
     pub fn new(global_contract_tree_height: u8, user_leaf: PQEDUserLeaf<F, Hash>) -> Self {
         Self {
             user_id: user_leaf.user_id.to_u64_value(),

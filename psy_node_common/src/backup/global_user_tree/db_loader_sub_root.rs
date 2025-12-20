@@ -9,7 +9,7 @@ use psy_node_core::psy_core_db::traits::full::PsyNodeGlobalUserTreeDatabaseReade
 pub async fn fetch_global_user_tree_from_db_with_sub_root<
     Hasher: MerkleZeroHasher<Hash>,
     Store: PsyNodeGlobalUserTreeDatabaseReader<Hash>,
-    Hash: Copy + PartialEq + Default,
+    Hash: Copy + PartialEq + Default + std::fmt::Debug,
 >(
     user_db_reader: &Store,
 
@@ -173,6 +173,7 @@ pub async fn load_global_user_tree_from_db_with_sub_root<
         anyhow::bail!("Failed to load global user tree from DB: reached leaf node with zero hash, but root is not zero hash");
     }
     let max_user_id_exclusive = current_key.index + 1;
+    println!("max_user_id_exclusive: {}", max_user_id_exclusive);
     fetch_global_user_tree_from_db_with_sub_root::<Hasher, Store, Hash>(
         user_db_reader,
         tree_height,

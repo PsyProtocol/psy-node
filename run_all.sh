@@ -11,6 +11,7 @@ set -e  # Exit on any error
 # Configuration
 LOG_DIR="logs"
 PROVING_BACKEND="plonky2-poseidon-goldilocks"
+BIN_PREFIX="./target/release/"
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -88,7 +89,7 @@ fi
 # -----------------------------------------------------
 echo -e "${YELLOW}Starting coordinator processor...${NC}"
 
-./target/release/psy_node_cli start-coordinator-processor \
+RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/psy_node_cli start-coordinator-processor \
     --proving-backend $PROVING_BACKEND \
     --config ./psy_cli/example_node_configs/coordinator_processor_1.yaml \
     > >(tee -a "$LOG_DIR/coordinator_0_1_processor_logs.txt" | sed -u 's/^/[COORD-PROC] /') 2>&1 &
@@ -102,7 +103,7 @@ sleep 5
 # -----------------------------------------------------
 echo -e "${YELLOW}Starting coordinator edge...${NC}"
 
-./target/release/psy_node_cli start-coordinator-edge \
+RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/psy_node_cli start-coordinator-edge \
     --proving-backend $PROVING_BACKEND \
     --config ./psy_cli/example_node_configs/coordinator_edge_1.yaml \
     > >(tee -a "$LOG_DIR/coordinator_0_1_edge_logs.txt" | sed -u 's/^/[COORD-EDGE] /') 2>&1 &
@@ -116,7 +117,7 @@ sleep 2
 # -----------------------------------------------------
 echo -e "${YELLOW}Starting coordinator worker...${NC}"
 
-./target/release/psy_worker_cli worker \
+RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/psy_worker_cli worker \
     --user 0 --network local-devnet \
     --proving-backend $PROVING_BACKEND \
     --config ./psy_cli/example_node_configs/worker_coordinator.yml \
@@ -131,7 +132,7 @@ sleep 2
 # -----------------------------------------------------
 echo -e "${YELLOW}Starting realm 0 processor...${NC}"
 
-./target/release/psy_node_cli start-realm-processor \
+RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/psy_node_cli start-realm-processor \
     --proving-backend $PROVING_BACKEND \
     --config ./psy_cli/example_node_configs/realm_0_processor.yaml \
     > >(tee -a "$LOG_DIR/realm_0_processor_logs.txt" | sed -u 's/^/[REALM0-PROC] /') 2>&1 &
@@ -145,7 +146,7 @@ sleep 2
 # -----------------------------------------------------
 echo -e "${YELLOW}Starting realm 0 edge...${NC}"
 
-./target/release/psy_node_cli start-realm-edge \
+RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/psy_node_cli start-realm-edge \
     --proving-backend $PROVING_BACKEND \
     --config ./psy_cli/example_node_configs/realm_0_edge.yaml \
     > >(tee -a "$LOG_DIR/realm_0_edge_logs.txt" | sed -u 's/^/[REALM0-EDGE] /') 2>&1 &
@@ -159,7 +160,7 @@ sleep 2
 # -----------------------------------------------------
 echo -e "${YELLOW}Starting realm 0 worker...${NC}"
 
-./target/release/psy_worker_cli worker \
+RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/psy_worker_cli worker \
     --user 0 --network local-devnet \
     --proving-backend $PROVING_BACKEND \
     --config ./psy_cli/example_node_configs/worker_realm_0.yml \
@@ -174,7 +175,7 @@ sleep 2
 # -----------------------------------------------------
 echo -e "${YELLOW}Starting realm 1 processor...${NC}"
 
-./target/release/psy_node_cli start-realm-processor \
+RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/psy_node_cli start-realm-processor \
     --proving-backend $PROVING_BACKEND \
     --config ./psy_cli/example_node_configs/realm_1_processor.yaml \
     > >(tee -a "$LOG_DIR/realm_1_processor_logs.txt" | sed -u 's/^/[REALM1-PROC] /') 2>&1 &
@@ -188,7 +189,7 @@ sleep 3
 # -----------------------------------------------------
 echo -e "${YELLOW}Starting realm 1 edge...${NC}"
 
-./target/release/psy_node_cli start-realm-edge \
+RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/psy_node_cli start-realm-edge \
     --proving-backend $PROVING_BACKEND \
     --config ./psy_cli/example_node_configs/realm_1_edge.yaml \
     > >(tee -a "$LOG_DIR/realm_1_edge_logs.txt" | sed -u 's/^/[REALM1-EDGE] /') 2>&1 &
@@ -202,7 +203,7 @@ sleep 2
 # -----------------------------------------------------
 echo -e "${YELLOW}Starting realm 1 worker...${NC}"
 
-./target/release/psy_worker_cli worker \
+RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/psy_worker_cli worker \
     --user 0 --network local-devnet \
     --proving-backend $PROVING_BACKEND \
     --config ./psy_cli/example_node_configs/worker_realm_1.yml \
@@ -217,7 +218,7 @@ sleep 3
 # -----------------------------------------------------
 echo -e "${YELLOW}Starting realm 2 processor...${NC}"
 
-./target/release/psy_node_cli start-realm-processor \
+RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/psy_node_cli start-realm-processor \
     --proving-backend $PROVING_BACKEND \
     --config ./psy_cli/example_node_configs/realm_2_processor.yaml \
     > >(tee -a "$LOG_DIR/realm_2_processor_logs.txt" | sed -u 's/^/[REALM2-PROC] /') 2>&1 &
@@ -231,7 +232,7 @@ sleep 3
 # -----------------------------------------------------
 echo -e "${YELLOW}Starting realm 2 edge...${NC}"
 
-./target/release/psy_node_cli start-realm-edge \
+RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/psy_node_cli start-realm-edge \
     --proving-backend $PROVING_BACKEND \
     --config ./psy_cli/example_node_configs/realm_2_edge.yaml \
     > >(tee -a "$LOG_DIR/realm_2_edge_logs.txt" | sed -u 's/^/[REALM2-EDGE] /') 2>&1 &
@@ -245,7 +246,7 @@ sleep 5
 # -----------------------------------------------------
 echo -e "${YELLOW}Starting realm 2 worker...${NC}"
 
-./target/release/psy_worker_cli worker \
+RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/psy_worker_cli worker \
     --user 0 --network local-devnet \
     --proving-backend $PROVING_BACKEND \
     --config ./psy_cli/example_node_configs/worker_realm_2.yml \
@@ -260,7 +261,7 @@ sleep 3
 # -----------------------------------------------------
 echo -e "${YELLOW}Starting realm 3 processor...${NC}"
 
-./target/release/psy_node_cli start-realm-processor \
+RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/psy_node_cli start-realm-processor \
     --proving-backend $PROVING_BACKEND \
     --config ./psy_cli/example_node_configs/realm_3_processor.yaml \
     > >(tee -a "$LOG_DIR/realm_3_processor_logs.txt" | sed -u 's/^/[REALM3-PROC] /') 2>&1 &
@@ -274,7 +275,7 @@ sleep 3
 # -----------------------------------------------------
 echo -e "${YELLOW}Starting realm 3 edge...${NC}"
 
-./target/release/psy_node_cli start-realm-edge \
+RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/psy_node_cli start-realm-edge \
     --proving-backend $PROVING_BACKEND \
     --config ./psy_cli/example_node_configs/realm_3_edge.yaml \
     > >(tee -a "$LOG_DIR/realm_3_edge_logs.txt" | sed -u 's/^/[REALM3-EDGE] /') 2>&1 &
@@ -288,7 +289,7 @@ sleep 5
 # -----------------------------------------------------
 echo -e "${YELLOW}Starting realm 3 worker...${NC}"
 
-./target/release/psy_worker_cli worker \
+RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/psy_worker_cli worker \
     --user 0 --network local-devnet \
     --proving-backend $PROVING_BACKEND \
     --config ./psy_cli/example_node_configs/worker_realm_3.yml \
@@ -310,7 +311,7 @@ echo -e "${YELLOW}Note: Waiting for system to fully initialize before starting d
 sleep 20
 
 # Dummy prover for Realm 0 (user 0)
-./target/release/psy_worker_cli dummy-end-cap-prover \
+RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/psy_worker_cli dummy-end-cap-prover \
     --proving-backend $PROVING_BACKEND \
     --coordinator-url http://127.0.0.1:1337 \
     --url http://127.0.0.1:1338 --user 0 --min-state-updates 1 --max-state-updates 2 --max-contract-calls 1 \
@@ -321,7 +322,7 @@ echo "Started Dummy End Cap Prover for Realm 0 (User 0)"
 sleep 2
 
 # Dummy prover for Realm 0 (user 1024)
-./target/release/psy_worker_cli dummy-end-cap-prover \
+RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/psy_worker_cli dummy-end-cap-prover \
     --proving-backend $PROVING_BACKEND \
     --coordinator-url http://127.0.0.1:1337 \
     --url http://127.0.0.1:1338 --user 1024 --min-state-updates 1 --max-state-updates 2 --max-contract-calls 1 \
@@ -332,7 +333,7 @@ echo "Started Dummy End Cap Prover for Realm 0 (User 1024)"
 sleep 2
 
 # Dummy prover for Realm 0 (user 2048)
-./target/release/psy_worker_cli dummy-end-cap-prover \
+RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/psy_worker_cli dummy-end-cap-prover \
     --proving-backend $PROVING_BACKEND \
     --coordinator-url http://127.0.0.1:1337 \
     --url http://127.0.0.1:1338 --user 2048 --min-state-updates 1 --max-state-updates 2 --max-contract-calls 1 \
@@ -343,7 +344,7 @@ echo "Started Dummy End Cap Prover for Realm 0 (User 2048)"
 sleep 2
 
 # Dummy prover for Realm 1 (user 1048576)
-./target/release/psy_worker_cli dummy-end-cap-prover \
+RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/psy_worker_cli dummy-end-cap-prover \
     --proving-backend $PROVING_BACKEND \
     --coordinator-url http://127.0.0.1:1337 \
     --url http://127.0.0.1:1339 --user 1048576 --min-state-updates 1 --max-state-updates 2 --max-contract-calls 1 \
@@ -354,7 +355,7 @@ echo "Started Dummy End Cap Prover for Realm 1 (User 1048576)"
 sleep 2
 
 # Dummy prover for Realm 1 (user 1049600)
-./target/release/psy_worker_cli dummy-end-cap-prover \
+RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/psy_worker_cli dummy-end-cap-prover \
     --proving-backend $PROVING_BACKEND \
     --coordinator-url http://127.0.0.1:1337 \
     --url http://127.0.0.1:1339 --user 1049600 --min-state-updates 1 --max-state-updates 2 --max-contract-calls 1 \
@@ -365,7 +366,7 @@ echo "Started Dummy End Cap Prover for Realm 1 (User 1049600)"
 sleep 2
 
 # Dummy prover for Realm 1 (user 1050624)
-./target/release/psy_worker_cli dummy-end-cap-prover \
+RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/psy_worker_cli dummy-end-cap-prover \
     --proving-backend $PROVING_BACKEND \
     --coordinator-url http://127.0.0.1:1337 \
     --url http://127.0.0.1:1339 --user 1050624 --min-state-updates 1 --max-state-updates 2 --max-contract-calls 1 \
@@ -376,7 +377,7 @@ echo "Started Dummy End Cap Prover for Realm 1 (User 1050624)"
 sleep 2
 
 # Dummy prover for Realm 2 (user 2097152)
-./target/release/psy_worker_cli dummy-end-cap-prover \
+RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/psy_worker_cli dummy-end-cap-prover \
     --proving-backend $PROVING_BACKEND \
     --coordinator-url http://127.0.0.1:1337 \
     --url http://127.0.0.1:1340 --user 2097152 --min-state-updates 1 --max-state-updates 2 --max-contract-calls 1 \
@@ -387,7 +388,7 @@ echo "Started Dummy End Cap Prover for Realm 2 (User 2097152)"
 sleep 2
 
 # Dummy prover for Realm 2 (user 2098176)
-./target/release/psy_worker_cli dummy-end-cap-prover \
+RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/psy_worker_cli dummy-end-cap-prover \
     --proving-backend $PROVING_BACKEND \
     --coordinator-url http://127.0.0.1:1337 \
     --url http://127.0.0.1:1340 --user 2098176 --min-state-updates 1 --max-state-updates 2 --max-contract-calls 1 \
@@ -398,7 +399,7 @@ echo "Started Dummy End Cap Prover for Realm 2 (User 2098176)"
 sleep 2
 
 # Dummy prover for Realm 2 (user 2099200)
-./target/release/psy_worker_cli dummy-end-cap-prover \
+RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/psy_worker_cli dummy-end-cap-prover \
     --proving-backend $PROVING_BACKEND \
     --coordinator-url http://127.0.0.1:1337 \
     --url http://127.0.0.1:1340 --user 2099200 --min-state-updates 1 --max-state-updates 2 --max-contract-calls 1 \
@@ -409,7 +410,7 @@ echo "Started Dummy End Cap Prover for Realm 2 (User 2099200)"
 sleep 2
 
 # Dummy prover for Realm 3 (user 3145728)
-./target/release/psy_worker_cli dummy-end-cap-prover \
+RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/psy_worker_cli dummy-end-cap-prover \
     --proving-backend $PROVING_BACKEND \
     --coordinator-url http://127.0.0.1:1337 \
     --url http://127.0.0.1:1341 --user 3145728 --min-state-updates 1 --max-state-updates 2 --max-contract-calls 1 \
@@ -420,7 +421,7 @@ echo "Started Dummy End Cap Prover for Realm 3 (User 3145728)"
 sleep 2
 
 # Dummy prover for Realm 3 (user 3146752)
-./target/release/psy_worker_cli dummy-end-cap-prover \
+RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/psy_worker_cli dummy-end-cap-prover \
     --proving-backend $PROVING_BACKEND \
     --coordinator-url http://127.0.0.1:1337 \
     --url http://127.0.0.1:1341 --user 3146752 --min-state-updates 1 --max-state-updates 2 --max-contract-calls 1 \
@@ -431,7 +432,7 @@ echo "Started Dummy End Cap Prover for Realm 3 (User 3146752)"
 sleep 2
 
 # Dummy prover for Realm 3 (user 3147776)
-./target/release/psy_worker_cli dummy-end-cap-prover \
+RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/psy_worker_cli dummy-end-cap-prover \
     --proving-backend $PROVING_BACKEND \
     --coordinator-url http://127.0.0.1:1337 \
     --url http://127.0.0.1:1341 --user 3147776 --min-state-updates 1 --max-state-updates 2 --max-contract-calls 1 \

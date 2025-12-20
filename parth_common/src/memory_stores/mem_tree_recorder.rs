@@ -11,7 +11,7 @@ use parth_core::{
 };
 
 #[derive(Debug, Clone)]
-pub struct SimpleMemoryMerkleRecorderStore<Hasher, Hash: Copy + PartialEq + Default> {
+pub struct SimpleMemoryMerkleRecorderStore<Hasher, Hash: Copy + PartialEq + Default + Debug> {
     nodes: HashMap<SimpleMerkleNodeKey, Hash>,
     updated_nodes: HashMap<SimpleMerkleNodeKey, Hash>,
     height: u8,
@@ -19,7 +19,8 @@ pub struct SimpleMemoryMerkleRecorderStore<Hasher, Hash: Copy + PartialEq + Defa
     _hasher: PhantomData<Hasher>,
 }
 
-impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + PartialEq + Default> SimpleMemoryMerkleRecorderStore<Hasher, Hash> {
+impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + PartialEq + Default + Debug>
+    SimpleMemoryMerkleRecorderStore<Hasher, Hash> {
     pub fn new(height: u8) -> Self {
         Self {
             nodes: HashMap::new(),
@@ -240,6 +241,7 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + PartialEq + Default> SimpleMem
         (1u64 << (self.height as u64)) - 1u64
     }
     pub fn set_node_value(&mut self, key: SimpleMerkleNodeKey, value: Hash) {
+        println!("key: {:?}, value : {:?}", key, value);
         self.updated_nodes.insert(key, value);
     }
     pub fn set_node_value_nodes_no_updated(&mut self, key: SimpleMerkleNodeKey, value: Hash) {
@@ -1241,7 +1243,7 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + PartialEq + Default> SimpleMem
     }
 }
 
-pub fn get_merkle_proofs_for_compact<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + PartialEq + Default>(
+pub fn get_merkle_proofs_for_compact<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + PartialEq + Default + Debug>(
     from_index: u64,
     siblings: &[Hash],
     values: &[Hash],

@@ -26,7 +26,7 @@ pub trait PsyAppendOnlyTreeFetcher<Hash>: PsyAppendOnlyTreeFetcherBase<Hash> {
 }
 
 #[async_trait]
-impl<Hasher: MerkleZeroHasher<Hash> + Send + Sync, Hash: Copy + PartialEq + Default + Send + Sync>  PsyAppendOnlyTreeFetcherBase<Hash> for SimpleMemoryMerkleRecorderStore<Hasher, Hash> {
+impl<Hasher: MerkleZeroHasher<Hash> + Send + Sync, Hash: Copy + PartialEq + Default + Send + Sync + std::fmt::Debug>  PsyAppendOnlyTreeFetcherBase<Hash> for SimpleMemoryMerkleRecorderStore<Hasher, Hash> {
     async fn get_merkle_proof_for_leaf(
         &self,
         leaf_index: u64,

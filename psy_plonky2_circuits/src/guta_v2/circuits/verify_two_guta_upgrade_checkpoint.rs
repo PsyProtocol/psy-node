@@ -272,6 +272,7 @@ where
             get_two_child_proofs_for_api_response_with_inclusion_proof::<L, C, D>(library, &input)?;
 
         let witness = GUTAVerifyTwoGUTAUpgradeCheckpointCircuitInputV2::<C::F, QHashOut<C::F>>::psy_ser_from_slice(&input.base.witness)?;
+        println!("GUTAVerifyTwoGUTAUpgradeCheckpointCircuitInputV2: {:?}", witness);
 
         self.prove_base(
             worker_reward_tag,

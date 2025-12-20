@@ -777,13 +777,13 @@ fn rehash_sparse_paths<Hash: Copy, Destination: FastTreeSyncLocalDestination<Has
         current_indices = parent_indices;
     }
 }
-impl<Hash: Copy + PartialEq + Default, Hasher: MerkleZeroHasher<Hash>> FastTreeSyncBasicMetadata for SimpleMemoryMerkleRecorderStore<Hasher, Hash> {
+impl<Hash: Copy + PartialEq + Default + std::fmt::Debug, Hasher: MerkleZeroHasher<Hash>> FastTreeSyncBasicMetadata for SimpleMemoryMerkleRecorderStore<Hasher, Hash> {
     fn fts_get_tree_height(&self) -> u8 {
         self.get_height()
     }
 }
 
-impl<Hash: Copy + PartialEq + Default, Hasher: MerkleZeroHasher<Hash>> FastTreeSyncLocalSource<Hash>
+impl<Hash: Copy + PartialEq + Default + std::fmt::Debug, Hasher: MerkleZeroHasher<Hash>> FastTreeSyncLocalSource<Hash>
     for SimpleMemoryMerkleRecorderStore<Hasher, Hash>
 {
     fn fts_get_merkle_node(&self, key: SimpleMerkleNodeKey) -> Hash {
@@ -796,7 +796,7 @@ impl<Hash: Copy + PartialEq + Default, Hasher: MerkleZeroHasher<Hash>> FastTreeS
 }
 
 #[async_trait]
-impl<Hash: Copy + PartialEq + Default + Send + Sync + 'static, Hasher: MerkleZeroHasher<Hash> + Send + Sync + 'static> FastTreeSyncAsyncSource<Hash>
+impl<Hash: Copy + PartialEq + Default + Send + Sync + 'static + std::fmt::Debug, Hasher: MerkleZeroHasher<Hash> + Send + Sync + 'static> FastTreeSyncAsyncSource<Hash>
     for SimpleMemoryMerkleRecorderStore<Hasher, Hash>
 {
     async fn fts_get_merkle_node_async(&self, key: SimpleMerkleNodeKey) -> anyhow::Result<Hash> {
@@ -808,7 +808,7 @@ impl<Hash: Copy + PartialEq + Default + Send + Sync + 'static, Hasher: MerkleZer
     }
 }
 
-impl<Hash: Copy + PartialEq + Default, Hasher: MerkleZeroHasher<Hash>> FastTreeSyncLocalDestination<Hash>
+impl<Hash: Copy + PartialEq + Default + std::fmt::Debug, Hasher: MerkleZeroHasher<Hash>> FastTreeSyncLocalDestination<Hash>
     for SimpleMemoryMerkleRecorderStore<Hasher, Hash>
 {
     fn fts_set_merkle_node(&mut self, node: SimpleMerkleNode<Hash>) {

@@ -19,7 +19,7 @@ use crate::{
     lite::user_state::{DPContractUpdate, DPLocalUser},
 };
 
-pub struct DPUserSimulationChainState<Hasher, Hash: Copy + PartialEq + Default, F, DF: PsyDummyProverComboFetcher<F, Hash> + Send + Sync + 'static> {
+pub struct DPUserSimulationChainState<Hasher, Hash: Copy + PartialEq + Default + std::fmt::Debug, F, DF: PsyDummyProverComboFetcher<F, Hash> + Send + Sync + 'static> {
     pub checkpoint_id: u64,
     pub checkpoint_root: Hash,
     pub user_ids: Vec<u64>,
