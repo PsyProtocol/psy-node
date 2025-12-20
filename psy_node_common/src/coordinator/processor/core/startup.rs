@@ -195,7 +195,7 @@ where
                 guta_queue_gatherer: guta_queue_gatherer,
                 register_user_queue_gatherer: register_user_queue_gatherer,
                 deploy_contract_queue_gatherer: deploy_contract_queue_gatherer,
-                proof_worker_queue_max_time_ms: 1000 * 6 * 10,
+                proof_worker_queue_max_time_ms: 1000 * 6 * 10 * 10,
             },
             guta_join_handle,
             register_user_join_handle,

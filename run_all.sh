@@ -309,11 +309,69 @@ echo -e "${YELLOW}Note: Waiting for system to fully initialize before starting d
 # Wait for all services to be fully initialized
 sleep 20
 
+# Dummy prover for Realm 0 (user 0)
 ./target/release/psy_worker_cli dummy-end-cap-prover \
+    --proving-backend $PROVING_BACKEND \
+    --coordinator-url http://127.0.0.1:1337 \
     --url http://127.0.0.1:1338 --user 0 --min-state-updates 1 --max-state-updates 2 --max-contract-calls 1 \
-    > >(tee -a "$LOG_DIR/dummy_end_cap_prover_logs.txt" | sed -u 's/^/[DUMMY-PROVER] /') 2>&1 &
+    > >(tee -a "$LOG_DIR/dummy_prover_realm0_user0_logs.txt" | sed -u 's/^/[DUMMY-R0-U0] /') 2>&1 &
 
-echo "Started Dummy End Cap Prover"
+echo "Started Dummy End Cap Prover for Realm 0 (User 0)"
+
+sleep 2
+
+# Dummy prover for Realm 0 (user 1024)
+./target/release/psy_worker_cli dummy-end-cap-prover \
+    --proving-backend $PROVING_BACKEND \
+    --coordinator-url http://127.0.0.1:1337 \
+    --url http://127.0.0.1:1338 --user 1024 --min-state-updates 1 --max-state-updates 2 --max-contract-calls 1 \
+    > >(tee -a "$LOG_DIR/dummy_prover_realm0_user1024_logs.txt" | sed -u 's/^/[DUMMY-R0-U1024] /') 2>&1 &
+
+echo "Started Dummy End Cap Prover for Realm 0 (User 1024)"
+
+sleep 2
+
+# Dummy prover for Realm 0 (user 2048)
+./target/release/psy_worker_cli dummy-end-cap-prover \
+    --proving-backend $PROVING_BACKEND \
+    --coordinator-url http://127.0.0.1:1337 \
+    --url http://127.0.0.1:1338 --user 2048 --min-state-updates 1 --max-state-updates 2 --max-contract-calls 1 \
+    > >(tee -a "$LOG_DIR/dummy_prover_realm0_user2048_logs.txt" | sed -u 's/^/[DUMMY-R0-U2048] /') 2>&1 &
+
+echo "Started Dummy End Cap Prover for Realm 0 (User 2048)"
+
+sleep 2
+
+# Dummy prover for Realm 1 (user 1048576)
+./target/release/psy_worker_cli dummy-end-cap-prover \
+    --proving-backend $PROVING_BACKEND \
+    --coordinator-url http://127.0.0.1:1337 \
+    --url http://127.0.0.1:1339 --user 1048576 --min-state-updates 1 --max-state-updates 2 --max-contract-calls 1 \
+    > >(tee -a "$LOG_DIR/dummy_prover_realm1_user1048576_logs.txt" | sed -u 's/^/[DUMMY-R1-U1048576] /') 2>&1 &
+
+echo "Started Dummy End Cap Prover for Realm 1 (User 1048576)"
+
+sleep 2
+
+# Dummy prover for Realm 1 (user 1049600)
+./target/release/psy_worker_cli dummy-end-cap-prover \
+    --proving-backend $PROVING_BACKEND \
+    --coordinator-url http://127.0.0.1:1337 \
+    --url http://127.0.0.1:1339 --user 1049600 --min-state-updates 1 --max-state-updates 2 --max-contract-calls 1 \
+    > >(tee -a "$LOG_DIR/dummy_prover_realm1_user1049600_logs.txt" | sed -u 's/^/[DUMMY-R1-U1049600] /') 2>&1 &
+
+echo "Started Dummy End Cap Prover for Realm 1 (User 1049600)"
+
+sleep 2
+
+# Dummy prover for Realm 1 (user 1050624)
+./target/release/psy_worker_cli dummy-end-cap-prover \
+    --proving-backend $PROVING_BACKEND \
+    --coordinator-url http://127.0.0.1:1337 \
+    --url http://127.0.0.1:1339 --user 1050624 --min-state-updates 1 --max-state-updates 2 --max-contract-calls 1 \
+    > >(tee -a "$LOG_DIR/dummy_prover_realm1_user1050624_logs.txt" | sed -u 's/^/[DUMMY-R1-U1050624] /') 2>&1 &
+
+echo "Started Dummy End Cap Prover for Realm 1 (User 1050624)"
 
 sleep 2
 

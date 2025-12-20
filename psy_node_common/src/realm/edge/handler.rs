@@ -264,6 +264,9 @@ impl<
         timer.lap_micros("ensure_user_has_not_submitted");
 
         let current_checkpoint_id = self.get_latest_checkpoint_id().await?;
+        let global_user_tree_proof = self.db_reader.global_user_tree_get_merkle_proof(current_checkpoint_id, user_id)
+.await?;
+
         timer.lap_micros("get_latest_checkpoint_id");
         let old_user_leaf = self.get_user_leaf_data_internal(current_checkpoint_id, user_id).await?;
         timer.lap_micros("get_user_leaf_data_internal");
@@ -286,7 +289,7 @@ impl<
         }
 
         let old_leaf_hash = if 
-            old_user_leaf.public_key == N::QHash::get_zero_value()
+            global_user_tree_proof.value == N::QHash::get_zero_value()
         {
             N::QHash::get_zero_value()
         }else{

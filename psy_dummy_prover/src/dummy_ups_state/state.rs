@@ -50,7 +50,11 @@ impl<F: QFelt64, Hash: QDBHashBase + QFHashBase<F>, Fetcher: PsyDummyProverCombo
         let is_first_tx = global_user_tree_proof.value == Hash::get_zero_value();
         println!("is_first_tx: {}", is_first_tx);
 
-        let public_key: PZKPublicKeyInfo<Hash> = data_fetcher.cf_get_user_public_key(user_id).await?;
+        let public_key: PZKPublicKeyInfo<Hash> = data_fetcher.cf_get_user_public_key(user_id).await.unwrap_or(PZKPublicKeyInfo {
+            fingerprint: Hash::get_zero_value(),
+            public_key_param: Hash::get_zero_value()
+        });
+
         println!("public_key: {:?}", public_key);
 
         let checkpoint_proof: MerkleProofCore<Hash> = data_fetcher

@@ -106,7 +106,7 @@ where
             Self {
                 db,
                 guta_queue_gatherer: guta_queue_gatherer,
-                proof_worker_queue_max_time_ms: 1000 * 6 * 10,
+                proof_worker_queue_max_time_ms: 1000 * 6 * 10 * 10,
             },
             guta_join_handle,
         ))
