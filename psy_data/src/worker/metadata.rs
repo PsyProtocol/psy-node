@@ -108,9 +108,9 @@ impl<Hash: ZeroableHash + Copy + PartialEq, JobId> PsyProvingJobMetadata<Hash, J
                 value: last_two,
             }));
         } else if self.reward_tree_hash_mode == PROOF_REWARD_TREE_HASH_MODE_LIFT_CHILD {
-                if children_reward_tree_values.len() < 1 {
-                    anyhow::bail!("Expected at least 1 child for lift child hash mode, got {}", children_reward_tree_values.len());
-                }
+            if children_reward_tree_values.len() < 1 {
+                anyhow::bail!("Expected at least 1 child for lift child hash mode, got {}", children_reward_tree_values.len());
+            }
             let self_key = self.get_reward_tree_node_key();
             let computed_reward_tree_value = self.get_new_rewards_tag_tree_value::<Hasher>(tag, &children_reward_tree_values[0..1])?;
             if computed_reward_tree_value != reward_tree_value {

@@ -219,13 +219,21 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> CoordinatorGUTAPlanner<F, Ha
             );
 
             if left_needs_cp_upgrade || right_needs_cp_upgrade {
+                // Get the current checkpoint index to build upgrade proofs with the CURRENT root
+                let current_checkpoint_index = checkpoint_tree
+                    .get_leaf_index_for_root(*current_checkpoint_root)
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "Current checkpoint root {:?} not found in checkpoint tree",
+                        current_checkpoint_root
+                    ))?;
+
                 let input = GUTAVerifyTwoGUTAUpgradeCheckpointCircuitInputV2 {
                     left_header: left.header,
                     left_global_user_tree_delta_merkle_proof: left_dmp,
-                    left_historical_checkpoint_merkle_proof: checkpoint_tree.get_historical_append_only_merkle_proof_for_root(left_cp)?,
+                    left_historical_checkpoint_merkle_proof: checkpoint_tree.get_historical_index_append_only_merkle_proof_for_root(left_cp, current_checkpoint_index)?,
                     right_header: right.header,
                     right_global_user_tree_delta_merkle_proof: right_dmp,
-                    right_historical_checkpoint_merkle_proof: checkpoint_tree.get_historical_append_only_merkle_proof_for_root(right_cp)?,
+                    right_historical_checkpoint_merkle_proof: checkpoint_tree.get_historical_index_append_only_merkle_proof_for_root(right_cp, current_checkpoint_index)?,
                 };
                 (
                     input.psy_ser_to_bytes_vec()?,
@@ -262,12 +270,21 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> CoordinatorGUTAPlanner<F, Ha
                 right.header.state_transition.node_index.to_u64_value(),
                 right.header.state_transition.new_node_value,
             );
-            
+
+            // Get the current checkpoint index to build upgrade proof with the CURRENT root
+            // Note: left is already at current checkpoint (validated above), so we use left_cp's index
+            let current_checkpoint_index = checkpoint_tree
+                .get_leaf_index_for_root(*current_checkpoint_root)
+                .ok_or_else(|| anyhow::anyhow!(
+                    "Current checkpoint root {:?} not found in checkpoint tree",
+                    current_checkpoint_root
+                ))?;
+
             let input = GUTAVerifyLeftLinearRightLeafUpgradeCheckpointCircuitInput {
                 left_header: left.header,
                 right_header: right.header,
                 right_global_user_tree_delta_merkle_proof: right_dmp,
-                right_historical_checkpoint_proof: checkpoint_tree.get_historical_append_only_merkle_proof_for_root(right_cp)?,
+                right_historical_checkpoint_proof: checkpoint_tree.get_historical_index_append_only_merkle_proof_for_root(right_cp, current_checkpoint_index)?,
             };
             
             (
@@ -314,6 +331,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> CoordinatorGUTAPlanner<F, Ha
         &mut self,
         node: PlannerNode<F, Hash>,
         unique_pending_id: u64,
+        current_checkpoint_root: &Hash,
         checkpoint_tree: &PsyDashMemoryAppendOnlyMerkleStore<Hasher, Hash>,
         global_user_tree: &mut SimpleMemoryMerkleRecorderStore<Hasher, Hash>,
     ) -> anyhow::Result<()> {
@@ -327,12 +345,19 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> CoordinatorGUTAPlanner<F, Ha
             node.header.state_transition.new_node_value,
         );
 
+        let current_checkpoint_index = checkpoint_tree
+            .get_leaf_index_for_root(*current_checkpoint_root)
+            .ok_or_else(|| anyhow::anyhow!(
+                "Current checkpoint root {:?} not found in checkpoint tree",
+                current_checkpoint_root
+            ))?;
+
         println!("node.header.checkpoint_tree_root: {:?}", node.header.checkpoint_tree_root);
         println!("roots: {:?}", checkpoint_tree.roots);
         let input = VerifyGUTAToCapUpgradeCheckpointCircuitInputSimple {
             guta_proof_header: node.header,
             top_line_siblings: dmp.siblings,
-            historical_checkpoint_proof: checkpoint_tree.get_historical_append_only_merkle_proof_for_root(node.header.checkpoint_tree_root)?,
+            historical_checkpoint_proof: checkpoint_tree.get_historical_index_append_only_merkle_proof_for_root(node.header.checkpoint_tree_root, current_checkpoint_index)?,
             total_aggregation_proofs_generated: node.header.total_aggregation_proofs_generated,
         };
 
@@ -470,6 +495,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> CoordinatorGUTAPlanner<F, Ha
                 self.create_singlet_root_promotion_job::<Hasher>(
                     root_node, 
                     unique_pending_id, 
+                    current_checkpoint_root,
                     checkpoint_tree, 
                     global_user_tree
                 )?;
@@ -489,8 +515,14 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> CoordinatorGUTAPlanner<F, Ha
             // No inputs -> No Change Proof
             tracing::info!("No GUTA updates to process, generating No-Change proof.");
             let checkpoint_state_roots_hash = most_recent_checkpoint_global_state_roots.qfhash::<Hasher>();
+            let current_checkpoint_index = checkpoint_tree
+                .get_leaf_index_for_root(*current_checkpoint_root)
+                .ok_or_else(|| anyhow::anyhow!(
+                    "Current checkpoint root {:?} not found in checkpoint tree",
+                    current_checkpoint_root
+                ))?;
             let no_change_input = GUTANoChangeFullInput {
-                checkpoint_tree_proof: checkpoint_tree.get_historical_append_only_merkle_proof_for_root(*current_checkpoint_root)?,
+                checkpoint_tree_proof: checkpoint_tree.get_historical_index_append_only_merkle_proof_for_root(*current_checkpoint_root, current_checkpoint_index)?,
                 checkpoint_leaf: PQEDCheckpointLeafCompactWithStateRoots {
                     checkpoint_leaf: PQEDCheckpointLeafCompact {
                         global_chain_root: checkpoint_state_roots_hash,

@@ -57,6 +57,7 @@ impl<F: QFelt, Hash: Copy> GUTAVerifyTwoGUTALinearCircuitInput<F, Hash> {
 impl<F: QFelt64, Hash: QFHashBase<F>> GUTAVerifyTwoGUTALinearCircuitInput<F, Hash> {
     pub fn get_public_inputs_hash_no_rewards_tag<Hasher: FieldQHasher<F, Hash>>(&self) -> Hash {
         let new_guta_header = self.get_new_guta_header();
+        println!("GUTAVerifyTwoGUTALinearCircuitInput new_guta_header {:?}", new_guta_header);
         new_guta_header.qfhash::<Hasher>()
     }
 
@@ -157,7 +158,9 @@ impl<F: QFelt, Hash: Copy> GUTAVerifyLeftLinearRightLeafUpgradeCheckpointCircuit
             checkpoint_tree_root: self.left_header.checkpoint_tree_root,
             state_transition: SubTreeNodeStateTransition {
                 old_node_value: self.left_header.state_transition.old_node_value,
-                new_node_value: self.right_header.state_transition.new_node_value,
+                // Use the delta merkle proof's new_root, not right_header.new_node_value
+                // The circuit computes new_root from the delta proof gadget
+                new_node_value: self.right_global_user_tree_delta_merkle_proof.new_root,
                 node_index: self.left_header.state_transition.node_index,
                 node_level: self.left_header.state_transition.node_level,
             },

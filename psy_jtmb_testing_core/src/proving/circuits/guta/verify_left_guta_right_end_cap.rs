@@ -1,4 +1,4 @@
-use parth_core::crypto::hash::{merkle_proof::MerkleProofCore, traits::ZeroableHash};
+use parth_core::crypto::hash::{merkle_proof::MerkleProofCore, traits::{ZeroableHash, FieldQHasher, MerkleHasher}};
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{proof_input::guta::GUTAVerifyLeftGUTARightEndCapCircuitInputV2, worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse};
 use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
@@ -137,6 +137,14 @@ impl<L: PsyJTMBCircuitInfoLibrary<C::Hash>, C: JTMBCircuitConfig> QJTMBProofCirc
     ) -> anyhow::Result<PsyTestJTMBProof<C::Hash>> {
         let (left, right) = get_two_child_proofs_for_api_response_with_inclusion_proof::<L, C::Hash, C::Hasher>(library, &input)?;
         let witness = GUTAVerifyLeftGUTARightEndCapCircuitInputV2::<C::F, C::Hash>::psy_ser_from_slice(&input.base.witness)?;
+        let expected_public_inputs_hash_no_tag = witness.get_public_inputs_hash_no_rewards_tag::<C::Hasher>();
+        let expected_public_inputs_hash = C::Hasher::two_to_one(&expected_public_inputs_hash_no_tag, &worker_reward_tag);
+
+        println!("metadata: {:?}", input.base.job.metadata);
+        println!("input_pubs: {:?}", input.base.job.metadata.expected_public_inputs_hash);
+        println!("get_new_guta_header: witness: {:#?}", witness.get_new_guta_header());
+        println!("expected_public_inputs_hash: {:?}", expected_public_inputs_hash);
+        println!("expected_public_inputs_hash_no_tag: {:?}", expected_public_inputs_hash_no_tag);
 
         self.prove_base(
             worker_reward_tag,

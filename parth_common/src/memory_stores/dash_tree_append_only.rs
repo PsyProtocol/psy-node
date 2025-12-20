@@ -6,14 +6,6 @@ use std::marker::PhantomData;
 use crate::memory_stores::traits::{PsyMemoryMerkleStoreAppendOnlyReaderBase, PsyMemoryMerkleStoreAppendOnlyReaderBaseAsync, PsyMemoryMerkleStoreImm};
 
 // --- Start of Refactored Code ---
-#[inline(always)]
-const fn is_key_contained_in_historical_store(
-    tree_height: u8,
-    historical_index: u64,
-    key: &SimpleMerkleNodeKey,
-) -> bool {
-    key.index <= historical_index >> (tree_height - key.level)
-}
 #[derive(Debug, Clone)]
 pub struct PsyDashMemoryAppendOnlyMerkleStore<Hasher, Hash: Eq + Copy + PartialEq + Default + std::hash::Hash> {
     pub nodes: DashMap<SimpleMerkleNodeKey, Hash>,
@@ -84,7 +76,9 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + Eq + PartialEq + Default + std
         match self.roots.get(&checkpoint_tree_root) {
             Some(v) => {
                 let index = *v;
-                Ok(self.get_leaf(index))
+                // FIX: Use historical merkle proof to get the correct root at the time
+                // when `index` was the last leaf, instead of the current root
+                Ok(self.get_historical_merkle_proof_at_historical_index(index, index))
             },
             None => anyhow::bail!("Root not found in append-only store"),
         }
@@ -157,14 +151,30 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + Eq + PartialEq + Default + std
         }
     }
     pub fn get_historical_node_value(&self, key: &SimpleMerkleNodeKey, historical_index: u64) -> Hash {
-        
-        if is_key_contained_in_historical_store(self.height, historical_index, key) {
+        let level_offset = self.height - key.level;
+        let node_first_leaf = key.index << level_offset;
+        let node_last_leaf = ((key.index + 1) << level_offset) - 1;
+
+        if node_last_leaf <= historical_index {
+            // Node is fully contained in historical state - all leaves existed, use current value
             match self.nodes.get(key) {
                 Some(v) => *v,
                 None => self.get_zero_hash_for_level(key.level),
             }
-        } else {
+        } else if node_first_leaf > historical_index {
+            // Node is fully outside historical state - no leaves existed yet, return zero hash
             self.get_zero_hash_for_level(key.level)
+        } else {
+            // Node straddles the boundary - some leaves existed, some didn't
+            // We need to recursively compute the historical value
+            if key.level >= self.height {
+                // Leaf level - this specific leaf is beyond historical_index
+                self.get_zero_hash_for_level(key.level)
+            } else {
+                let left = self.get_historical_node_value(&key.left_child(), historical_index);
+                let right = self.get_historical_node_value(&key.right_child(), historical_index);
+                Hasher::two_to_one(&left, &right)
+            }
         }
     }
     pub fn get_historical_merkle_proof_at_historical_index(
@@ -173,20 +183,20 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + Eq + PartialEq + Default + std
         historical_index: u64,
     ) -> MerkleProofCore<Hash> {
         // get the merkle proof showing the inclusion of a leaf at index n, at the point in time where the leaf at historical index is the last non-zero leaf
-        
+
         let leaf_key = SimpleMerkleNodeKey::new(self.get_height(), index);
         let siblings = leaf_key.siblings();
         let mut sibling_values = Vec::with_capacity(siblings.len());
-        let mut h_index = historical_index;
+
         for sibling_key in &siblings {
-            if sibling_key.index > h_index {
-                sibling_values.push(self.get_zero_hash_for_level(sibling_key.level));
-            } else {
-                sibling_values.push(self.get_node_value(sibling_key));
-            }
-            h_index >>= 1;
+            // Use get_historical_node_value which correctly handles:
+            // 1. Fully contained nodes (all leaves <= historical_index) -> current value
+            // 2. Fully outside nodes (all leaves > historical_index) -> zero hash
+            // 3. Straddling nodes (some leaves <= historical_index, some >) -> recursive computation
+            sibling_values.push(self.get_historical_node_value(sibling_key, historical_index));
         }
-        let value = self.get_node_value(&leaf_key);
+
+        let value = self.get_historical_node_value(&leaf_key, historical_index);
         let root = compute_root_merkle_proof_generic::<Hash, Hasher>(value, index, &sibling_values);
         MerkleProofCore {
             index,
@@ -194,22 +204,6 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + Eq + PartialEq + Default + std
             root,
             value,
         }
-
-        /*
-
-        let value = self.get_historical_node_value(&leaf_key, historical_index);
-
-        let mut siblings = Vec::with_capacity(self.get_height() as usize);
-        let mut current_key = leaf_key;
-
-        while current_key.level > 0 {
-            siblings.push(self.get_historical_node_value(&current_key.sibling(), historical_index));
-            current_key = current_key.parent();
-        }
-
-        let root = self.get_historical_node_value(&current_key, historical_index);
-        MerkleProofCore { index, siblings, root, value }
-        */
     }
 
 }
@@ -652,6 +646,88 @@ mod tests {
         assert_eq!(store.get_leaf_value(24), *more_leaves.last().unwrap());
 
         println!("Scenario test completed successfully!");
+        Ok(())
+    }
+
+    #[test]
+    fn test_historical_merkle_proof_full_consistency() -> Result<()> {
+        let height = 16;
+        let store = TestMerkleStore::new(height);
+        let count = 1000u64;
+
+        // Generate random leaf
+        let leaves = gen_random_hashes(count as usize);
+        for (i, leaf) in leaves.iter().enumerate() {
+            store.append_leaf(i as u64, *leaf)?;
+        }
+
+        // ========================
+        // 1. Basic consistency
+        // ========================
+        let checkpoint = count - 2;
+        let base_root = store.get_historical_merkle_proof_at_historical_index(0, checkpoint).root;
+
+        for i in 0..=checkpoint {
+            let p = store.get_historical_merkle_proof_at_historical_index(i, checkpoint);
+            assert_eq!(p.root, base_root, "Base consistency mismatch at i={}", i);
+        }
+
+        // ========================
+        // 2. Boundary index test
+        // ========================
+        let checkpoints = [0, 1, 2, 3, 7, 15, 31, 63, 86, 128, 511, 999, count - 1];
+        for &cp in &checkpoints {
+            let root = store.get_historical_merkle_proof_at_historical_index(cp, cp).root;
+            // leftmost
+            assert_eq!(store.get_historical_merkle_proof_at_historical_index(0, cp).root, root);
+            // rightmost
+            assert_eq!(store.get_historical_merkle_proof_at_historical_index(cp, cp).root, root);
+        }
+
+        // ========================
+        // 3. Check root changes across checkpoints
+        // ========================
+        let root1 = store.get_historical_merkle_proof_at_historical_index(0, 40).root;
+        let root2 = store.get_historical_merkle_proof_at_historical_index(0, 60).root;
+        assert_ne!(root1, root2, "Roots should differ across checkpoints");
+
+        // ========================
+        // 4. Replay Oracle comparison
+        // ========================
+        let replay_checkpoints = [10, 20, 33, 64, 89, 299, 512, 999];   
+        for &cp in &replay_checkpoints {
+            let replay = TestMerkleStore::new(height);
+            for i in 0..=cp {
+                replay.append_leaf(i, leaves[i as usize])?;
+            }
+            let replay_root = replay.get_root();
+            for i in 0..=cp {
+                let p = store.get_historical_merkle_proof_at_historical_index(i, cp);
+                assert_eq!(p.root, replay_root, "Replay root mismatch at checkpoint={}, index={}", cp, i);
+            }
+        }
+
+        // ========================
+        // 5. Random fuzz testing
+        // ========================
+        for _ in 0..5000 {
+            let checkpoint = rand::random::<u64>() % count;
+            let index = rand::random::<u64>() % (checkpoint + 1);
+            let p = store.get_historical_merkle_proof_at_historical_index(index, checkpoint);
+
+            let replay = TestMerkleStore::new(height);
+            for i in 0..=checkpoint {
+                replay.append_leaf(i, leaves[i as usize])?;
+            }
+            assert_eq!(
+                p.root,
+                replay.get_root(),
+                "Fuzz root mismatch at checkpoint={}, index={}",
+                checkpoint,
+                index
+            );
+        }
+
         Ok(())
     }
 }

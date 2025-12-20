@@ -339,14 +339,14 @@ where
             self.verify_guta_to_cap_upgrade_checkpoint.get_verifier_config_ref().into(),
         );
         library.register_circuit(
+            ProvingJobCircuitType::GUTAVerifyLeftLinearRightLeafUpgradeCheckpoint.into(),
+            self.verify_guta_left_linear_right_leaf_upgrade_checkpoint.get_fingerprint(),
+            self.verify_guta_left_linear_right_leaf_upgrade_checkpoint.get_verifier_config_ref().into(),
+        );
+        library.register_circuit(
             ProvingJobCircuitType::GUTANoChange.into(),
             self.no_change.get_fingerprint(),
             self.no_change.get_verifier_config_ref().into(),
-        );
-        library.register_circuit(
-            ProvingJobCircuitType::GUTATwoGUTALinearUpgradeCheckpoint.into(),
-            self.verify_two_guta_linear_transition_upgrade_checkpoint.get_fingerprint(),
-            self.verify_two_guta_linear_transition_upgrade_checkpoint.get_verifier_config_ref().into(),
         );
 
         let all_group = [
@@ -354,7 +354,6 @@ where
             ProvingJobCircuitType::GUTATwoEndCap,
             ProvingJobCircuitType::GUTATwoGUTA,
             ProvingJobCircuitType::GUTALeftGUTARightEndCap,
-            ProvingJobCircuitType::GUTALeftEndCapRightGUTA,
             ProvingJobCircuitType::GUTATwoGUTALinear,
             ProvingJobCircuitType::GUTATwoGUTALinearUpgradeCheckpoint,
             ProvingJobCircuitType::GUTAVerifyToCap,
@@ -390,7 +389,7 @@ where
 
         library.add_inclusion_proof(
             &all_group,
-            ProvingJobCircuitType::GUTATwoGUTALinearUpgradeCheckpoint,
+            ProvingJobCircuitType::GUTATwoGUTALinear,
             self.verify_two_guta_linear_transition_whitelist_proof.clone(),
         );
 

@@ -141,7 +141,7 @@ where
 
         // ensure that the guta proof headers match our historical checkpoint tree
         // proofs historical roots
-        builder.connect_hashes(a_guta_header.checkpoint_tree_root, historical_checkpoint_proof_b.historical_root);
+        builder.connect_hashes(a_guta_header.checkpoint_tree_root, historical_checkpoint_proof_b.current_root);
         builder.connect_hashes(b_guta_header.checkpoint_tree_root, historical_checkpoint_proof_b.historical_root);
 
         // AFTER we have connected the historical roots, we can now override the
