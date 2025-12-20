@@ -358,7 +358,11 @@ async fn execute_command<
             let ids = parse_json_arg(&mut args, "job_ids")?;
             format!("{:#?}", client.generate_batch_proof_miner_reward_proofs(id1, ids).await?)
         }
-        "get_realm_sync_info" => format!("{:#?}", client.get_realm_sync_info(parse_arg(&mut args, "checkpoint_id")?).await?),
+        "get_realm_sync_info" => {
+            let id1 = parse_arg(&mut args, "checkpoint_id")?;
+            let id2 = parse_arg(&mut args, "realm_id")?;
+            format!("{:#?}", client.get_realm_sync_info(id1, id2).await?)
+        }
         "get_checkpoint_leaves_batch_raw" => {
             let id1 = parse_arg(&mut args, "start_checkpoint_id")?;
             let id2 = parse_arg(&mut args, "count")?;

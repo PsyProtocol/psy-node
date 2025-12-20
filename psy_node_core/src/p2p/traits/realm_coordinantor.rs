@@ -9,7 +9,7 @@ use psy_data::{guta::header_extended::GlobalUserTreeAggregatorHeaderWithTagValue
 pub trait RealmCoordinatorClient<F, Hash> {
     async fn rc_get_latest_checkpoint_id(&self) -> anyhow::Result<u64>;
     async fn rc_wait_for_next_checkpoint(&self) -> anyhow::Result<u64>;
-    async fn rc_get_realm_sync_info(&self, checkpoint_id: u64) -> anyhow::Result<PsyRealmCoordinatorUpdate<F, Hash>>;
+    async fn rc_get_realm_sync_info(&self, checkpoint_id: u64, realm_id: u64) -> anyhow::Result<PsyRealmCoordinatorUpdate<F, Hash>>;
     async fn rc_get_checkpoint_leaves_batch(&self, start_checkpoint_id: u64, count: u32) -> anyhow::Result<Vec<Hash>>;
     async fn rc_get_checkpoint_tree_merkle_proof(&self, checkpoint_id: u64) -> anyhow::Result<MerkleProofCore<Hash>>;
     async fn rc_get_realm_root_and_last_modified_checkpoint(&self, checkpoint_id: u64, realm_id: u64) -> anyhow::Result<CheckpointedMerkleHash<Hash>>;

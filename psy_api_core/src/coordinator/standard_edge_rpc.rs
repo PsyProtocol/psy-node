@@ -167,7 +167,7 @@ pub trait CoordinatorEdgeRpc<F, Hash, JobId, ZKProof>: NodeEdgeWorkerRpcServer<H
     
 
     #[method(name = "get_realm_sync_info")]
-    async fn get_realm_sync_info(&self, checkpoint_id: u64) -> RpcResult<PsyRealmCoordinatorUpdate<F, Hash>>;
+    async fn get_realm_sync_info(&self, checkpoint_id: u64, realm_id: u64) -> RpcResult<PsyRealmCoordinatorUpdate<F, Hash>>;
 
     #[method(name = "get_checkpoint_leaves_batch_raw")]
     async fn get_checkpoint_leaves_batch_raw(&self, start_checkpoint_id: u64, count: u32) -> RpcResult<Vec<u8>>;

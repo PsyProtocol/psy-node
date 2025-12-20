@@ -41,9 +41,9 @@ impl<N: QNetworkTypesConfig + 'static, C: CoordinatorEdgeRpcClient<N::F, N::QHas
         }
         Ok(current)
     }
-    async fn rc_get_realm_sync_info(&self, checkpoint_id: u64) -> anyhow::Result<PsyRealmCoordinatorUpdate<N::F, N::QHash>> {
+    async fn rc_get_realm_sync_info(&self, checkpoint_id: u64, realm_id: u64) -> anyhow::Result<PsyRealmCoordinatorUpdate<N::F, N::QHash>> {
         self.client
-            .get_realm_sync_info(checkpoint_id)
+            .get_realm_sync_info(checkpoint_id, realm_id)
             .await
             .map_err(|e| anyhow::anyhow!("{:?}", e))
     }

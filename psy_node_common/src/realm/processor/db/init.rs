@@ -331,7 +331,7 @@ where
         }
 
         // Compare roots
-        if coordinator_realm_root_state != local_realm_root_state {
+        if coordinator_realm_root_state.value != local_realm_root_state.value || coordinator_realm_root_state.checkpoint_id > local_realm_root_state.checkpoint_id {
             anyhow::bail!("Realm Root mismatch. Coordinator: {:?}, Local: {:?}.",
                 coordinator_realm_root_state, local_realm_root_state);
         }
@@ -382,7 +382,7 @@ where
             tracing::info!("Restoring to Coordinator Realm Root at Checkpoint {}", restore_checkpoint_id);
 
             // 3. Fetch Full Coordinator Update Data for that checkpoint
-            let coordinator_update = self.coordinator_client.rc_get_realm_sync_info(restore_checkpoint_id).await?;
+            let coordinator_update = self.coordinator_client.rc_get_realm_sync_info(restore_checkpoint_id, self.state.realm_id_u64).await?;
 
             // 4. Generate local updates from backup files corresponding to that state
             let prepared_updates = generate_realm_output_from_backups::<N, FileSystem>(

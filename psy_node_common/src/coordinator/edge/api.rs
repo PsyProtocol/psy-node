@@ -253,9 +253,9 @@ impl<
         res(self.db_reader.user_registration_tree_get_merkle_proof(checkpoint_id, leaf_index).await)
     }
 
-    async fn get_realm_sync_info(&self, checkpoint_id: u64) -> RpcResult<PsyRealmCoordinatorUpdate<N::F, N::QHash>> {
+    async fn get_realm_sync_info(&self, checkpoint_id: u64, realm_id : u64) -> RpcResult<PsyRealmCoordinatorUpdate<N::F, N::QHash>> {
         
-        res(self.get_realm_sync_info_internal(self.realm_id_u64, checkpoint_id).await)
+        res(self.get_realm_sync_info_internal(realm_id, checkpoint_id).await)
     }
     async fn get_checkpoint_leaves_batch_raw(&self, start_checkpoint_id: u64, count: u32) -> RpcResult<Vec<u8>>{
 

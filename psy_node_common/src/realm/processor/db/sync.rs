@@ -54,7 +54,7 @@ where
 
         // 2. Fetch and persist metadata for missing checkpoints
         for checkpoint_id in (latest_db_checkpoint_id + 1)..=latest_synced_checkpoint_id {
-            let sync_info: PsyRealmCoordinatorUpdate<N::F, N::QHash> = self.coordinator_client.rc_get_realm_sync_info(checkpoint_id).await?;
+            let sync_info: PsyRealmCoordinatorUpdate<N::F, N::QHash> = self.coordinator_client.rc_get_realm_sync_info(checkpoint_id, self.state.realm_id_u64).await?;
             
 
             // CRITICAL VALIDATION: Ensure the local in-memory tree matches the Coordinator's canonical root for this checkpoint.
@@ -78,12 +78,15 @@ where
                 anyhow::bail!("Checkpoint Tree Divergence detected at checkpoint {}. Local state reset. Please retry sync.", checkpoint_id);
             }
 
+            tracing::info!("sync checkpoint id {} {}", checkpoint_id, serde_json::to_string_pretty(&sync_info)?);
             self.db
                 .set_l2_block_state(checkpoint_id, &sync_info.checkpoint_sync_info.block_state)
                 .await?;
+            tracing::info!("set checkpoint global state roots {} {}", checkpoint_id, serde_json::to_string_pretty(&sync_info.checkpoint_sync_info.state_roots)?);
             self.db
                 .set_checkpoint_global_state_roots(checkpoint_id, &sync_info.checkpoint_sync_info.state_roots)
                 .await?;
+            tracing::info!("get checkpoint global state roots {} {}", checkpoint_id, serde_json::to_string_pretty(&self.db.get_checkpoint_global_state_roots(checkpoint_id).await?)?);
             self.db
                 .set_checkpoint_leaf_data(checkpoint_id, &sync_info.checkpoint_sync_info.checkpoint_leaf)
                 .await?;
@@ -98,11 +101,46 @@ where
                     sync_info.checkpoint_sync_info.checkpoint_id,
                 )
                 .await?;
+
+            // May need to update Realm user tree here
+            tracing::info!(
+                "local realm user tree root: {}",
+                serde_json::to_string_pretty(
+                    &self
+                        .db
+                        .global_user_tree_get_merkle_proof_sub_tree(
+                            checkpoint_id,
+                            N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
+                            N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
+                            self.state.realm_id_u64
+                        )
+                        .await?
+                )?
+            );
+            tracing::info!(
+                "set global user tree top tree merkle proof at checkpoint id {} {}",
+                checkpoint_id,
+                serde_json::to_string_pretty(&sync_info.merkle_proof_to_realm_root)?
+            );
+            self.db
+                .global_user_tree_set_top_tree_merkle_proof(checkpoint_id, &sync_info.merkle_proof_to_realm_root)
+                .await?;
+
+            tracing::info!(
+                "get global user tree tree merkle proof at checkpoint id {} {}",
+                checkpoint_id,
+                serde_json::to_string_pretty(
+                    &self
+                        .db
+                        .global_user_tree_get_merkle_proof(checkpoint_id, self.state.realm_id_u64 * (N::MAX_USERS_PER_REALM as u64))
+                        .await?
+                )?
+            );
         }
 
         // 3. Update Latest Block State
         let latest_sync_info: PsyRealmCoordinatorUpdate<N::F, N::QHash> =
-            self.coordinator_client.rc_get_realm_sync_info(latest_synced_checkpoint_id).await?;
+            self.coordinator_client.rc_get_realm_sync_info(latest_synced_checkpoint_id, self.state.realm_id_u64).await?;
         
         self.db
             .set_l2_latest_block_state(&latest_sync_info.checkpoint_sync_info.block_state)
@@ -218,6 +256,7 @@ where
             let realm_state = self.coordinator_client
                 .rc_get_realm_root_and_last_modified_checkpoint(latest_synced_checkpoint_id, self.state.realm_id_u64)
                 .await?;
+            tracing::info!("realm state {}", serde_json::to_string_pretty(&realm_state)?);
 
             // 3. Evaluate State
             if realm_state.value == new_realm_root {
@@ -228,10 +267,11 @@ where
 
                 // Fetch the full block info for the *specific* checkpoint where the update happened
                 let sync_info: PsyRealmCoordinatorUpdate<N::F, N::QHash> =
-                    self.coordinator_client.rc_get_realm_sync_info(realm_state.checkpoint_id).await?;
+                    self.coordinator_client.rc_get_realm_sync_info(realm_state.checkpoint_id, self.state.realm_id_u64).await?;
 
                 // Persist auxiliary proofs to DB
                 self.db.set_realm_rewards_tag_tree_top_proof_at_checkpoint_id(realm_state.checkpoint_id, &sync_info.reward_tree_top_proof).await?;
+                tracing::info!("set global user tree top tree merkle proof at checkpoint id {} {}", realm_state.checkpoint_id, serde_json::to_string_pretty(&sync_info.merkle_proof_to_realm_root)?);
                 self.db.global_user_tree_set_top_tree_merkle_proof(realm_state.checkpoint_id, &sync_info.merkle_proof_to_realm_root).await?;
                 
                 // Update mappings for the unique pending ID
