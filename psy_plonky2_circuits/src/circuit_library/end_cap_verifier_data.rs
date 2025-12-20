@@ -24,16 +24,38 @@ const DUMMY_END_CAP_ALT_VERIFIER_DATA_SERIALIZED: &'static str = r#" {
   "circuit_digest": "b2947f9dc3f006c6a26242b11ea186e8443a2243955a648e53075346be800782"
 }"#;
 
+const END_CAP_ALT_VERIFIER_DATA_SERIALIZED: &'static str = r#"{
+    "constants_sigmas_cap": [
+        "50355d42412d2fdc7d504e117f599b399cd2252d028ed40bf031c0dcb1d69a0c",
+        "0ad44d9e835f9a91a87d4c265d854cd2624ccfb00d2bb11b2908cbbc42adc293",
+        "c49b206f82c7c2edf4b133c0488f59687d96f8221a2ed3353b4c6c6f2ed6757b",
+        "01412a65156c4de3dfc6430e6652009da4d35f936cf8704f13ab2883a5047b12",
+        "6bce2bf53d08e18ad1fae6c50b7992a1d20a6b1bc670a8cb485abadced180908",
+        "27b0faf556e9bb754b7761d40c403170a859d5384e94a3b3a6613b2d41bc9a70",
+        "0d8773f92825ebfedf189c6ab847dc21cf21a2e34ea1ae078d0b61db57cbd8f2",
+        "83d707d0de1f043ad3e1c54916642955f0708fa55787abe03f02f6662b7e9680",
+        "551d710902d24d05503e8c4bca28a9d7b56e41b3c6fda18bcda4c2aee363277d",
+        "790f002eae60fe658b1d3a44b51a549c8e7cd68ed9a579f9b1209e8cad42fee1",
+        "7582e5a5426749d8c44036f681029887f6528b4735161a4559f54f329e5cece3",
+        "0888ff6f911382353a16d9d7d5c96ef456cb3e9b59c7b2a649454c0316ce737b",
+        "554646ef7fb976fa77cda9eef8fad7a8849db3f4f3c2c0b8ac166ae2608b20ab",
+        "bbf247f5182b0633674007e3d6ccffd99e50bdb24bf220e6e25b7fa6a5891234",
+        "b6af55400fb4447719173f2cb24ff836b3e1ce2e1e72bfd9c352d8274229bc35",
+        "2d437fb73225e3a4df333baacebf4e2d43c058b7fc4c88a0f0441b48b13292df"
+    ],
+    "circuit_digest": "9a5071a3236d4dcd9fead2d6f994061efaa0a86c5ffbe65c6eb444a26303c968"
+}"#;
+
 pub fn get_end_cap_alt_verifier_data_for_network<F: RichField>(network: PsyChainNetworkType) -> anyhow::Result<AltVerifierOnlyCircuitData<F>> {
     let end_cap_alt_verifier_data_serialized = match network {
-        PsyChainNetworkType::LocalDevnet => DUMMY_END_CAP_ALT_VERIFIER_DATA_SERIALIZED,
-        PsyChainNetworkType::PsyTeamDevnet => DUMMY_END_CAP_ALT_VERIFIER_DATA_SERIALIZED,
-        PsyChainNetworkType::InternalDevnet => DUMMY_END_CAP_ALT_VERIFIER_DATA_SERIALIZED,
-        PsyChainNetworkType::InternalTestnet => DUMMY_END_CAP_ALT_VERIFIER_DATA_SERIALIZED,
-        PsyChainNetworkType::InternalPreProduction => DUMMY_END_CAP_ALT_VERIFIER_DATA_SERIALIZED,
-        PsyChainNetworkType::PsyPublicCanary => DUMMY_END_CAP_ALT_VERIFIER_DATA_SERIALIZED,
-        PsyChainNetworkType::PsyPublicTestnet => DUMMY_END_CAP_ALT_VERIFIER_DATA_SERIALIZED,
-        PsyChainNetworkType::PsyMainnet => DUMMY_END_CAP_ALT_VERIFIER_DATA_SERIALIZED,
+        PsyChainNetworkType::LocalDevnet => END_CAP_ALT_VERIFIER_DATA_SERIALIZED,
+        PsyChainNetworkType::PsyTeamDevnet => END_CAP_ALT_VERIFIER_DATA_SERIALIZED,
+        PsyChainNetworkType::InternalDevnet => END_CAP_ALT_VERIFIER_DATA_SERIALIZED,
+        PsyChainNetworkType::InternalTestnet => END_CAP_ALT_VERIFIER_DATA_SERIALIZED,
+        PsyChainNetworkType::InternalPreProduction => END_CAP_ALT_VERIFIER_DATA_SERIALIZED,
+        PsyChainNetworkType::PsyPublicCanary => END_CAP_ALT_VERIFIER_DATA_SERIALIZED,
+        PsyChainNetworkType::PsyPublicTestnet => END_CAP_ALT_VERIFIER_DATA_SERIALIZED,
+        PsyChainNetworkType::PsyMainnet => END_CAP_ALT_VERIFIER_DATA_SERIALIZED,
     };
     serde_json::from_str(end_cap_alt_verifier_data_serialized).map_err(|e| anyhow::anyhow!(e))
 }
