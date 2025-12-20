@@ -367,13 +367,6 @@ impl<
             }
             tracing::info!("Reverted to root {:?}", tree.get_root());
             self.guta_planner = CoordinatorGUTAPlanner::new(self.config.checkpoint_tree.get_root());
-        } else {
-            tracing::info!(
-                "Committing GUTA updates gatherer changes for pending id {}, committing root {:?}",
-                self.status.unique_pending_id,
-                tree.get_root()
-            );
-            tree.commit_changes();
         }
 
         self.config
@@ -440,6 +433,12 @@ impl<
         self.total_guta_proofs_generated += added_proofs_felt;
 
         let update_global_user_tree_nodes_ffs = create_ffs_merkle_nodes_zero_id_from_hash_map::<N::QHash>(tree.get_changes());
+        tracing::info!(
+            "Committing GUTA updates gatherer changes for pending id {}, committing root {:?}",
+            self.status.unique_pending_id,
+            tree.get_root()
+        );
+        tree.commit_changes();
 
         let output_database = CoordinatorGUTAUpdateGathererOutputDatabase {
             update_global_user_tree_nodes_ffs,
