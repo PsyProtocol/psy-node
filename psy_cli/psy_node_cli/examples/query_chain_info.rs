@@ -13,9 +13,13 @@ use parth_core::{
 };
 use std::collections::HashMap;
 
+fn reverse_bytes(bytes: [u8; 32]) -> Vec<u8> {
+    bytes.iter().rev().cloned().collect()
+}
+
 fn print_hash<H: Q256BitHash>(label: &str, hash: &H) {
     let bytes = hash.into_owned_32bytes();
-    let reversed_bytes: Vec<u8> = bytes.iter().rev().cloned().collect();
+    let reversed_bytes = reverse_bytes(bytes);
     println!("{}: {}", label, hex::encode(&reversed_bytes));
 }
 
@@ -202,8 +206,8 @@ async fn query_service_info(
                     user_leaf.nonce.to_canonical_u64(),
                     user_leaf.last_checkpoint_id,
                     user_leaf.event_index,
-                    hex::encode(&user_leaf.public_key.into_owned_32bytes()),
-                    hex::encode(&user_leaf.user_state_tree_root.into_owned_32bytes()));
+                    hex::encode(&reverse_bytes(user_leaf.public_key.into_owned_32bytes())),
+                    hex::encode(&reverse_bytes(user_leaf.user_state_tree_root.into_owned_32bytes())));
                 info.user_leaves.push((user_id, leaf_info));
             }
         }
@@ -281,7 +285,7 @@ fn analyze_sync_status(services: &[ServiceInfo]) -> Vec<String> {
                 sync_statuses.push(format!("│   🎯 DIVERGENCE POINT found at checkpoint {}", checkpoint_id));
                 sync_statuses.push(format!("│   ❌ Checkpoint {}: Services have different roots!", checkpoint_id));
                 for (service_name, root) in roots {
-                    sync_statuses.push(format!("│      {}: {}", service_name, hex::encode(&root.into_owned_32bytes())));
+                        sync_statuses.push(format!("│      {}: {}", service_name, hex::encode(&reverse_bytes(root.into_owned_32bytes()))));
                 }
                 break; // Stop at first divergence
             }
@@ -331,7 +335,7 @@ fn analyze_sync_status(services: &[ServiceInfo]) -> Vec<String> {
                 } else {
                     sync_statuses.push(format!("│   ❌ Checkpoint {}: Partial sync failed", checkpoint_id));
                     for (service_name, root) in roots {
-                        sync_statuses.push(format!("│      {}: {}", service_name, hex::encode(&root.into_owned_32bytes())));
+                    sync_statuses.push(format!("│      {}: {}", service_name, hex::encode(&reverse_bytes(root.into_owned_32bytes()))));
                     }
                 }
             }
@@ -497,7 +501,7 @@ async fn main() -> anyhow::Result<()> {
                             Ok(realm_data) => {
                                 service.realm_root = Some(realm_data.value);
                                 service.realm_last_modified_checkpoint = Some(realm_data.checkpoint_id);
-                                println!("    ✅ Got realm root: {}", hex::encode(&realm_data.value.into_owned_32bytes()));
+                                println!("    ✅ Got realm root: {}", hex::encode(&reverse_bytes(realm_data.value.into_owned_32bytes())));
                                 println!("    📅 Last modified checkpoint: {}", realm_data.checkpoint_id);
                             }
                             Err(e) => {
