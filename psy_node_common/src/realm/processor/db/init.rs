@@ -274,6 +274,7 @@ where
         if database_check_state == DatabaseCheckState::NeedsGenesis {
             tracing::info!("Applying genesis block setup data to realm processor database...");
             println!("genesis_block_update.coordinator_update: {:?}", genesis_block_update.coordinator_update);
+            self.checkpoint_tree_backup_manager.append_checkpoint_leaf_hash(0, genesis_block_update.coordinator_update.checkpoint_sync_info.checkpoint_leaf_hash).await?;
             self.commit_state(
                 &genesis_block_update.coordinator_update,
                 &genesis_block_update.prepared_updates,
