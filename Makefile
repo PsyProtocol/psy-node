@@ -1,4 +1,5 @@
-# Makefile for Psy project
+PROVING_BACKEND := plonky2-poseidon-goldilocks
+# PROVING_BACKEND := jtmb-poseidon-goldilocks
 
 .PHONY: all build clean test deploy-contracts register-users query-chain-info run-all restart shutdown clean-db init-db run-coordinator-processor run-coordinator-edge run-realm-0-processor run-realm-0-edge run-realm-1-processor run-realm-1-edge run-realm-2-processor run-realm-2-edge run-realm-3-processor run-realm-3-edge run-worker-coordinator run-worker-realm-0 run-worker-realm-1 run-worker-realm-2 run-worker-realm-3 run-dummy-prover-realm0-user0 run-dummy-prover-realm0-user1024 run-dummy-prover-realm0-user2048 run-dummy-prover-realm1-user1048576 run-dummy-prover-realm1-user1049600 run-dummy-prover-realm1-user1050624 run-dummy-prover-realm2-user2097152 run-dummy-prover-realm2-user2098176 run-dummy-prover-realm2-user2099200 run-dummy-prover-realm3-user3145728 run-dummy-prover-realm3-user3146752 run-dummy-prover-realm3-user3147776 run-dummy-provers
 

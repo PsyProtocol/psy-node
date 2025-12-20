@@ -3,13 +3,42 @@
 # Comprehensive startup script for all services
 # Based on existing dev scripts, starts all components in proper order
 #
-# Usage: ./run_all.sh [--rebuild]
-#   --rebuild: Force rebuild even if binaries exist
+# Usage: ./run_all.sh [--proving-backend BACKEND]
+#   --proving-backend BACKEND: Specify proving backend (default: jtmb-poseidon-goldilocks)
 
 set -e  # Exit on any error
 
 # Configuration
 LOG_DIR="logs"
+PROVING_BACKEND="plonky2-poseidon-goldilocks"
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --proving-backend)
+            PROVING_BACKEND="$2"
+            shift 2
+            ;;
+        --help|-h)
+            echo "Usage: $0 [--proving-backend BACKEND]"
+            echo ""
+            echo "Options:"
+            echo "  --proving-backend BACKEND Specify proving backend (default: jtmb-poseidon-goldilocks)"
+            echo ""
+            echo "Available proving backends:"
+            echo "  jtmb-poseidon-goldilocks  JTMB Poseidon Goldilocks (default)"
+            echo "  plonky2-poseidon-goldilocks Plonky2 Poseidon Goldilocks"
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1"
+            echo "Usage: $0 [--proving-backend BACKEND]"
+            exit 1
+            ;;
+    esac
+done
+
+
 mkdir -p "$LOG_DIR"
 
 # Colors for output
@@ -43,7 +72,7 @@ cleanup() {
 # Register the trap
 trap cleanup SIGINT
 
-# Build the project (skip if binaries exist and no rebuild requested)
+# Build the project (skip if binaries exist)
 if [ ! -f "target/release/psy_node_cli" ] || [ ! -f "target/release/psy_worker_cli" ]; then
     echo -e "${YELLOW}Building project...${NC}"
     cargo build --release --bin psy_node_cli --bin psy_worker_cli
@@ -60,6 +89,7 @@ fi
 echo -e "${YELLOW}Starting coordinator processor...${NC}"
 
 ./target/release/psy_node_cli start-coordinator-processor \
+    --proving-backend $PROVING_BACKEND \
     --config ./psy_cli/example_node_configs/coordinator_processor_1.yaml \
     > >(tee -a "$LOG_DIR/coordinator_0_1_processor_logs.txt" | sed -u 's/^/[COORD-PROC] /') 2>&1 &
 
@@ -73,6 +103,7 @@ sleep 5
 echo -e "${YELLOW}Starting coordinator edge...${NC}"
 
 ./target/release/psy_node_cli start-coordinator-edge \
+    --proving-backend $PROVING_BACKEND \
     --config ./psy_cli/example_node_configs/coordinator_edge_1.yaml \
     > >(tee -a "$LOG_DIR/coordinator_0_1_edge_logs.txt" | sed -u 's/^/[COORD-EDGE] /') 2>&1 &
 
@@ -87,12 +118,8 @@ echo -e "${YELLOW}Starting coordinator worker...${NC}"
 
 ./target/release/psy_worker_cli worker \
     --user 0 --network local-devnet \
-<<<<<<< HEAD
-    --config ./psy_cli/example_node_configs/worker_1.yml \
-=======
     --proving-backend $PROVING_BACKEND \
     --config ./psy_cli/example_node_configs/worker_coordinator.yml \
->>>>>>> c561a1b (add two more realms with each 3 users)
     > >(tee -a "$LOG_DIR/worker_coordinator_logs.txt" | sed -u 's/^/[WORKER-COORD] /') 2>&1 &
 
 echo "Started Coordinator Worker"
@@ -105,14 +132,9 @@ sleep 2
 echo -e "${YELLOW}Starting realm 0 processor...${NC}"
 
 ./target/release/psy_node_cli start-realm-processor \
-<<<<<<< HEAD
-    --config ./psy_cli/example_node_configs/realm_processor_1.yaml \
-    > >(tee -a "$LOG_DIR/realm_0_1_processor_logs.txt" | sed -u 's/^/[REALM0-PROC] /') 2>&1 &
-=======
     --proving-backend $PROVING_BACKEND \
     --config ./psy_cli/example_node_configs/realm_0_processor.yaml \
     > >(tee -a "$LOG_DIR/realm_0_processor_logs.txt" | sed -u 's/^/[REALM0-PROC] /') 2>&1 &
->>>>>>> c561a1b (add two more realms with each 3 users)
 
 echo "Started Realm 0 Processor"
 
@@ -124,14 +146,9 @@ sleep 2
 echo -e "${YELLOW}Starting realm 0 edge...${NC}"
 
 ./target/release/psy_node_cli start-realm-edge \
-<<<<<<< HEAD
-    --config ./psy_cli/example_node_configs/realm_edge_1.yaml \
-    > >(tee -a "$LOG_DIR/realm_0_1_edge_logs.txt" | sed -u 's/^/[REALM0-EDGE] /') 2>&1 &
-=======
     --proving-backend $PROVING_BACKEND \
     --config ./psy_cli/example_node_configs/realm_0_edge.yaml \
     > >(tee -a "$LOG_DIR/realm_0_edge_logs.txt" | sed -u 's/^/[REALM0-EDGE] /') 2>&1 &
->>>>>>> c561a1b (add two more realms with each 3 users)
 
 echo "Started Realm 0 Edge"
 
@@ -144,12 +161,8 @@ echo -e "${YELLOW}Starting realm 0 worker...${NC}"
 
 ./target/release/psy_worker_cli worker \
     --user 0 --network local-devnet \
-<<<<<<< HEAD
-    --config ./psy_cli/example_node_configs/worker_realm_1.yml \
-=======
     --proving-backend $PROVING_BACKEND \
     --config ./psy_cli/example_node_configs/worker_realm_0.yml \
->>>>>>> c561a1b (add two more realms with each 3 users)
     > >(tee -a "$LOG_DIR/worker_realm_0_logs.txt" | sed -u 's/^/[WORKER-R0] /') 2>&1 &
 
 echo "Started Realm 0 Worker"
@@ -162,14 +175,9 @@ sleep 2
 echo -e "${YELLOW}Starting realm 1 processor...${NC}"
 
 ./target/release/psy_node_cli start-realm-processor \
-<<<<<<< HEAD
-    --config ./psy_cli/example_node_configs/realm_processor_2.yaml \
-    > >(tee -a "$LOG_DIR/realm_1_1_processor_logs.txt" | sed -u 's/^/[REALM1-PROC] /') 2>&1 &
-=======
     --proving-backend $PROVING_BACKEND \
     --config ./psy_cli/example_node_configs/realm_1_processor.yaml \
     > >(tee -a "$LOG_DIR/realm_1_processor_logs.txt" | sed -u 's/^/[REALM1-PROC] /') 2>&1 &
->>>>>>> c561a1b (add two more realms with each 3 users)
 
 echo "Started Realm 1 Processor"
 
@@ -181,14 +189,9 @@ sleep 3
 echo -e "${YELLOW}Starting realm 1 edge...${NC}"
 
 ./target/release/psy_node_cli start-realm-edge \
-<<<<<<< HEAD
-    --config ./psy_cli/example_node_configs/realm_edge_2.yaml \
-    > >(tee -a "$LOG_DIR/realm_1_1_edge_logs.txt" | sed -u 's/^/[REALM1-EDGE] /') 2>&1 &
-=======
     --proving-backend $PROVING_BACKEND \
     --config ./psy_cli/example_node_configs/realm_1_edge.yaml \
     > >(tee -a "$LOG_DIR/realm_1_edge_logs.txt" | sed -u 's/^/[REALM1-EDGE] /') 2>&1 &
->>>>>>> c561a1b (add two more realms with each 3 users)
 
 echo "Started Realm 1 Edge"
 
@@ -201,12 +204,8 @@ echo -e "${YELLOW}Starting realm 1 worker...${NC}"
 
 ./target/release/psy_worker_cli worker \
     --user 0 --network local-devnet \
-<<<<<<< HEAD
-    --config ./psy_cli/example_node_configs/worker_realm_2.yml \
-=======
     --proving-backend $PROVING_BACKEND \
     --config ./psy_cli/example_node_configs/worker_realm_1.yml \
->>>>>>> c561a1b (add two more realms with each 3 users)
     > >(tee -a "$LOG_DIR/worker_realm_1_logs.txt" | sed -u 's/^/[WORKER-R1] /') 2>&1 &
 
 echo "Started Realm 1 Worker"
