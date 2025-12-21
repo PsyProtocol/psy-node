@@ -343,102 +343,102 @@ echo "Started Dummy End Cap Prover for Realm 0 (User 2048)"
 
 sleep 2
 
-# Dummy prover for Realm 1 (user 1048576)
+# Dummy prover for Realm 1 (user 524288)
 RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/psy_worker_cli dummy-end-cap-prover \
     --proving-backend $PROVING_BACKEND \
     --coordinator-url http://127.0.0.1:1337 \
-    --url http://127.0.0.1:1339 --user 1048576 --min-state-updates 1 --max-state-updates 2 --max-contract-calls 1 \
-    > >(tee -a "$LOG_DIR/dummy_prover_realm1_user1048576_logs.txt" | sed -u 's/^/[DUMMY-R1-U1048576] /') 2>&1 &
+    --url http://127.0.0.1:1339 --user 524288 --min-state-updates 1 --max-state-updates 2 --max-contract-calls 1 \
+    > >(tee -a "$LOG_DIR/dummy_prover_realm1_user524288_logs.txt" | sed -u 's/^/[DUMMY-R1-U524288] /') 2>&1 &
 
-echo "Started Dummy End Cap Prover for Realm 1 (User 1048576)"
+echo "Started Dummy End Cap Prover for Realm 1 (User 524288)"
 
 sleep 2
 
-# Dummy prover for Realm 1 (user 1049600)
+# Dummy prover for Realm 1 (user 525312)
 RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/psy_worker_cli dummy-end-cap-prover \
     --proving-backend $PROVING_BACKEND \
     --coordinator-url http://127.0.0.1:1337 \
-    --url http://127.0.0.1:1339 --user 1049600 --min-state-updates 1 --max-state-updates 2 --max-contract-calls 1 \
-    > >(tee -a "$LOG_DIR/dummy_prover_realm1_user1049600_logs.txt" | sed -u 's/^/[DUMMY-R1-U1049600] /') 2>&1 &
+    --url http://127.0.0.1:1339 --user 525312 --min-state-updates 1 --max-state-updates 2 --max-contract-calls 1 \
+    > >(tee -a "$LOG_DIR/dummy_prover_realm1_user525312_logs.txt" | sed -u 's/^/[DUMMY-R1-U525312] /') 2>&1 &
 
-echo "Started Dummy End Cap Prover for Realm 1 (User 1049600)"
+echo "Started Dummy End Cap Prover for Realm 1 (User 525312)"
 
 sleep 2
 
-# Dummy prover for Realm 1 (user 1050624)
+# Dummy prover for Realm 1 (user 526336)
 RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/psy_worker_cli dummy-end-cap-prover \
     --proving-backend $PROVING_BACKEND \
     --coordinator-url http://127.0.0.1:1337 \
-    --url http://127.0.0.1:1339 --user 1050624 --min-state-updates 1 --max-state-updates 2 --max-contract-calls 1 \
-    > >(tee -a "$LOG_DIR/dummy_prover_realm1_user1050624_logs.txt" | sed -u 's/^/[DUMMY-R1-U1050624] /') 2>&1 &
+    --url http://127.0.0.1:1339 --user 526336 --min-state-updates 1 --max-state-updates 2 --max-contract-calls 1 \
+    > >(tee -a "$LOG_DIR/dummy_prover_realm1_user526336_logs.txt" | sed -u 's/^/[DUMMY-R1-U526336] /') 2>&1 &
 
-echo "Started Dummy End Cap Prover for Realm 1 (User 1050624)"
+echo "Started Dummy End Cap Prover for Realm 1 (User 526336)"
 
 sleep 2
 
-# Dummy prover for Realm 2 (user 2097152)
+# Dummy prover for Realm 2 (user 262144)
 RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/psy_worker_cli dummy-end-cap-prover \
     --proving-backend $PROVING_BACKEND \
     --coordinator-url http://127.0.0.1:1337 \
-    --url http://127.0.0.1:1340 --user 2097152 --min-state-updates 1 --max-state-updates 2 --max-contract-calls 1 \
-    > >(tee -a "$LOG_DIR/dummy_prover_realm2_user2097152_logs.txt" | sed -u 's/^/[DUMMY-R2-U2097152] /') 2>&1 &
+    --url http://127.0.0.1:1340 --user 262144 --min-state-updates 1 --max-state-updates 2 --max-contract-calls 1 \
+    > >(tee -a "$LOG_DIR/dummy_prover_realm2_user262144_logs.txt" | sed -u 's/^/[DUMMY-R2-U262144] /') 2>&1 &
 
-echo "Started Dummy End Cap Prover for Realm 2 (User 2097152)"
+echo "Started Dummy End Cap Prover for Realm 2 (User 262144)"
 
 sleep 2
 
-# Dummy prover for Realm 2 (user 2098176)
+# Dummy prover for Realm 2 (user 263168)
 RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/psy_worker_cli dummy-end-cap-prover \
     --proving-backend $PROVING_BACKEND \
     --coordinator-url http://127.0.0.1:1337 \
-    --url http://127.0.0.1:1340 --user 2098176 --min-state-updates 1 --max-state-updates 2 --max-contract-calls 1 \
-    > >(tee -a "$LOG_DIR/dummy_prover_realm2_user2098176_logs.txt" | sed -u 's/^/[DUMMY-R2-U2098176] /') 2>&1 &
+    --url http://127.0.0.1:1340 --user 263168 --min-state-updates 1 --max-state-updates 2 --max-contract-calls 1 \
+    > >(tee -a "$LOG_DIR/dummy_prover_realm2_user263168_logs.txt" | sed -u 's/^/[DUMMY-R2-U263168] /') 2>&1 &
 
-echo "Started Dummy End Cap Prover for Realm 2 (User 2098176)"
+echo "Started Dummy End Cap Prover for Realm 2 (User 263168)"
 
 sleep 2
 
-# Dummy prover for Realm 2 (user 2099200)
+# Dummy prover for Realm 2 (user 264192)
 RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/psy_worker_cli dummy-end-cap-prover \
     --proving-backend $PROVING_BACKEND \
     --coordinator-url http://127.0.0.1:1337 \
-    --url http://127.0.0.1:1340 --user 2099200 --min-state-updates 1 --max-state-updates 2 --max-contract-calls 1 \
-    > >(tee -a "$LOG_DIR/dummy_prover_realm2_user2099200_logs.txt" | sed -u 's/^/[DUMMY-R2-U2099200] /') 2>&1 &
+    --url http://127.0.0.1:1340 --user 264192 --min-state-updates 1 --max-state-updates 2 --max-contract-calls 1 \
+    > >(tee -a "$LOG_DIR/dummy_prover_realm2_user264192_logs.txt" | sed -u 's/^/[DUMMY-R2-U264192] /') 2>&1 &
 
-echo "Started Dummy End Cap Prover for Realm 2 (User 2099200)"
+echo "Started Dummy End Cap Prover for Realm 2 (User 264192)"
 
 sleep 2
 
-# Dummy prover for Realm 3 (user 3145728)
+# Dummy prover for Realm 3 (user 786432)
 RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/psy_worker_cli dummy-end-cap-prover \
     --proving-backend $PROVING_BACKEND \
     --coordinator-url http://127.0.0.1:1337 \
-    --url http://127.0.0.1:1341 --user 3145728 --min-state-updates 1 --max-state-updates 2 --max-contract-calls 1 \
-    > >(tee -a "$LOG_DIR/dummy_prover_realm3_user3145728_logs.txt" | sed -u 's/^/[DUMMY-R3-U3145728] /') 2>&1 &
+    --url http://127.0.0.1:1341 --user 786432 --min-state-updates 1 --max-state-updates 2 --max-contract-calls 1 \
+    > >(tee -a "$LOG_DIR/dummy_prover_realm3_user786432_logs.txt" | sed -u 's/^/[DUMMY-R3-U786432] /') 2>&1 &
 
-echo "Started Dummy End Cap Prover for Realm 3 (User 3145728)"
+echo "Started Dummy End Cap Prover for Realm 3 (User 786432)"
 
 sleep 2
 
-# Dummy prover for Realm 3 (user 3146752)
+# Dummy prover for Realm 3 (user 787456)
 RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/psy_worker_cli dummy-end-cap-prover \
     --proving-backend $PROVING_BACKEND \
     --coordinator-url http://127.0.0.1:1337 \
-    --url http://127.0.0.1:1341 --user 3146752 --min-state-updates 1 --max-state-updates 2 --max-contract-calls 1 \
-    > >(tee -a "$LOG_DIR/dummy_prover_realm3_user3146752_logs.txt" | sed -u 's/^/[DUMMY-R3-U3146752] /') 2>&1 &
+    --url http://127.0.0.1:1341 --user 787456 --min-state-updates 1 --max-state-updates 2 --max-contract-calls 1 \
+    > >(tee -a "$LOG_DIR/dummy_prover_realm3_user787456_logs.txt" | sed -u 's/^/[DUMMY-R3-U787456] /') 2>&1 &
 
-echo "Started Dummy End Cap Prover for Realm 3 (User 3146752)"
+echo "Started Dummy End Cap Prover for Realm 3 (User 787456)"
 
 sleep 2
 
-# Dummy prover for Realm 3 (user 3147776)
+# Dummy prover for Realm 3 (user 788480)
 RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/psy_worker_cli dummy-end-cap-prover \
     --proving-backend $PROVING_BACKEND \
     --coordinator-url http://127.0.0.1:1337 \
-    --url http://127.0.0.1:1341 --user 3147776 --min-state-updates 1 --max-state-updates 2 --max-contract-calls 1 \
-    > >(tee -a "$LOG_DIR/dummy_prover_realm3_user3147776_logs.txt" | sed -u 's/^/[DUMMY-R3-U3147776] /') 2>&1 &
+    --url http://127.0.0.1:1341 --user 788480 --min-state-updates 1 --max-state-updates 2 --max-contract-calls 1 \
+    > >(tee -a "$LOG_DIR/dummy_prover_realm3_user788480_logs.txt" | sed -u 's/^/[DUMMY-R3-U788480] /') 2>&1 &
 
-echo "Started Dummy End Cap Prover for Realm 3 (User 3147776)"
+echo "Started Dummy End Cap Prover for Realm 3 (User 788480)"
 
 # Give it time to run or fail gracefully
 sleep 5
