@@ -228,7 +228,6 @@ async fn main() -> anyhow::Result<()> {
         standard_ephemeral_queue_pull_config,
         worker_queue_pull_config,
         standard_jet_stream_config,
-        timeout_ms,
     )
     .await?;
 

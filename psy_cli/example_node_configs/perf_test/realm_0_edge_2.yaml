@@ -9,7 +9,7 @@ nats_jetstream_url: nats://127.0.0.1:4222
 redis_url: redis://127.0.0.1:6379
 
 port: 13372
-listen: 127.0.0.1
+listen: 0.0.0.0
 
 coordinator_api_urls:
   - http://127.0.0.1:1337

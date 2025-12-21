@@ -66,7 +66,6 @@ async fn main() -> Result<(), async_nats::Error> {
             standard_ephemeral_queue_pull_config.clone(),
             worker_queue_pull_config.clone(),
             standard_jet_stream_config.clone(),
-            timeout_ms,
         )
         .await?;
 
