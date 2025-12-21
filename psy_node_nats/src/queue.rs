@@ -30,7 +30,6 @@ pub enum JetStreamAckMode {
 pub struct NatsJetStreamClient {
     pub base_namespace: String,
     pub jetstream: Arc<jetstream::Context>,
-    pub timeout_ms: u64,
     pub stream_name: String,
     pub standard_ephemeral_queue_pull_config: PullConfig,
     pub worker_queue_pull_config: PullConfig,
@@ -45,7 +44,6 @@ impl NatsJetStreamClient {
         standard_ephemeral_queue_pull_config: PullConfig,
         worker_queue_pull_config: PullConfig,
         standard_jet_stream_config: jetstream::stream::Config,
-        timeout_ms: u64,
     ) -> anyhow::Result<Self> {
         let client = async_nats::connect(nats_urls).await?;
         let jetstream_ctx = jetstream::new(client);
@@ -69,7 +67,6 @@ impl NatsJetStreamClient {
         Ok(Self {
             base_namespace,
             jetstream,
-            timeout_ms,
             stream_name,
             standard_ephemeral_queue_pull_config,
             worker_queue_pull_config,
