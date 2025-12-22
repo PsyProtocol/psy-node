@@ -127,6 +127,7 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
             });
 
             if collect_contracts {
+                self.contract_leaves_ffs.extend_from_slice(&contract_id.to_le_bytes());
                 self.contract_leaves_ffs
                     .extend_from_slice(&contract_leaf.fx_tpl_psy_ser_into_bytes_vec()?);
 
@@ -353,6 +354,34 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
             checkpoint_tree_root,
         }
     }
+
+    pub fn get_coordinator_genesis_checkpoint_base<Hasher: FieldQHasher<F, Hash>>(
+        &self,
+        checkpoint_tree_height: u8,
+    ) -> PsyCoordinatorPendingCheckpointBase<F, Hash> {
+        let siblings = (0..(checkpoint_tree_height as usize))
+            .map(|i| Hasher::get_zero_hash(i))
+            .collect::<Vec<Hash>>();
+        let checkpoint_leaf = self.get_populated_checkpoint_leaf();
+        let checkpoint_leaf_hash = checkpoint_leaf.qfhash::<Hasher>();
+        let checkpoint_tree_root = compute_root_merkle_proof_generic::<Hash, Hasher>(checkpoint_leaf_hash, 0, &siblings);
+
+        PsyCoordinatorPendingCheckpointBase {
+            block_state: QEDL2BlockState {
+                checkpoint_id: 0,
+                next_add_withdrawal_id: 0,
+                next_process_withdrawal_id: 0,
+                next_deposit_id: 0,
+                total_deposits_claimed_epoch: 0,
+                next_user_id: 0,
+                end_balance: 0,
+                next_contract_id: 0,
+            },
+            checkpoint_leaf,
+            checkpoint_leaf_hash,
+            checkpoint_tree_root,
+        }
+    }
     pub fn get_genesis_state_transition<Hasher: FieldQHasher<F, Hash>>(&self, checkpoint_tree_height: u8) -> CheckpointStateHashTransition<Hash> {
         let pending_checkpoint_base = self.get_coordinator_pending_checkpoint_base::<Hasher>(checkpoint_tree_height);
 
@@ -479,7 +508,7 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
                 checkpoint_id: 0,
                 unique_pending_id: 0,
                 proc_checkpoint_unique_id: 0,
-                old_base: pending_checkpoint_base.clone(),
+                old_base: builder.get_coordinator_genesis_checkpoint_base::<Hasher>(N::CHECKPOINT_TREE_HEIGHT),
                 new_base: pending_checkpoint_base,
                 update_global_contract_tree_nodes_ffs: builder.global_contract_tree_nodes_ffs,
                 update_contract_function_tree_nodes_ffs: builder.contract_function_tree_nodes_ffs,
