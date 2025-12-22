@@ -39,7 +39,7 @@ impl QNetworkTreeConstants for PsyNetworkLocalDevnetConstants {
     const MAX_CONTRACT_STATE_TREE_HEIGHT_USIZE: usize = 32;
     const MAX_CONTRACT_STATE_TREE_HEIGHT: u8 = Self::MAX_CONTRACT_STATE_TREE_HEIGHT_USIZE as u8;
 
-    const GROUP_REALM_HEIGHT: u8 = 1;
+    const GROUP_REALM_HEIGHT: u8 = 1; // changed for testing many realms
 
     const MAX_USERS: u64 = 1 << Self::GLOBAL_USER_TREE_HEIGHT;
 

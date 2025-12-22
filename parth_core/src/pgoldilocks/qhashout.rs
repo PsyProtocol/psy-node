@@ -18,6 +18,7 @@ use serde_with::serde_as;
 #[derive(Clone, Debug, PartialEq, Eq, Copy, Hash, TS)]
 #[cfg_attr(feature = "serialize_bytemuck", derive(bytemuck::Pod, bytemuck::Zeroable))]
 #[cfg_attr(feature = "serialize_rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
+#[cfg_attr(feature = "serialize_speedy", derive(speedy::Readable, speedy::Writable))]
 #[ts(export, concrete(F = GoldilocksField))]
 #[repr(transparent)]
 pub struct QHashOut<F: Field>(pub HashOut<F>);
@@ -436,40 +437,6 @@ impl<F: QNamedType + Field> QNamedType for QHashOut<F> {
         format!("QHashOut<{}>", F::q_type_name())
     }
 }
-
-#[cfg(feature = "serialize_speedy")]
-use speedy::{Readable, Writable, LittleEndian, Reader, Writer};
-
-// ... (Your existing imports and code remain unchanged)
-
-
-// Updated speedy implementations for QHashOut<F>
-#[cfg(feature = "serialize_speedy")]
-impl<'a, F: Field> Readable<'a, LittleEndian> for QHashOut<F>
-where
-    F: for<'b> Readable<'b, LittleEndian> + Writable<LittleEndian>,
-{
-    fn read_from<R: Reader<'a, LittleEndian>>(reader: &mut R) -> Result<Self, speedy::Error> {
-        let elements = [
-            F::read_from(reader)?,
-            F::read_from(reader)?,
-            F::read_from(reader)?,
-            F::read_from(reader)?,
-        ];
-        Ok(QHashOut(HashOut { elements }))
-    }
-}
-
-#[cfg(feature = "serialize_speedy")]
-impl<F: Writable<LittleEndian> + Field> Writable<LittleEndian> for QHashOut<F> {
-    fn write_to<T: ?Sized + Writer<LittleEndian>>(&self, writer: &mut T) -> Result<(), speedy::Error> {
-        for element in self.0.elements.iter() {
-            element.write_to(writer)?;
-        }
-        Ok(())
-    }
-}
-
 
 impl FastFixedSerializable<32> for QHashOut<GoldilocksField> {
     fn ffs_from_owned_bytes(data: [u8; 32]) -> Self {

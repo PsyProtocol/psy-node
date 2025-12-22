@@ -1,4 +1,4 @@
-use parth_core::{crypto::hash::{tag_tree::hash_tag_tree_node, traits::{FieldQHasher, MerkleHasher}}, felt::QFelt64, pgoldilocks::QHashOut, protocol::core_types::{Q256BitHash, QFHashBase}};
+use parth_core::{crypto::hash::{tag_tree::hash_tag_tree_node, traits::{FieldQHasher, MerkleHasher}}, felt::QFelt64, pgoldilocks::{QGenericConfig, QHashOut}, protocol::core_types::{Q256BitHash, QFHashBase}};
 use plonky2::{
     field::extension::Extendable,
     hash::{
@@ -366,7 +366,7 @@ impl<C: GenericConfig<D>, const D: usize> QStandardCircuit<C, D>
 
 impl<
         L: CircuitInfoLibrary<C, D>,
-        C: GenericConfig<D>,
+        C: QGenericConfig<D>,
         const D: usize,
     > QStandardCircuitProvableWithRawProofsAndRefLibrary<L, C, D>
     for AggStateTransitionCircuitV2<C, D>

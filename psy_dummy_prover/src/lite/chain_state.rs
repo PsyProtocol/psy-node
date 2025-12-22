@@ -5,6 +5,7 @@ use parth_core::{
     felt::QFelt64,
     protocol::core_types::{Q256BitHash, QFHashBase},
 };
+use psy_core::user_id::get_user_registration_id_from_user_id;
 use psy_data::{
     proof_input::guta::end_cap_input::SubmitUserEndCapNonProofInput,
     v1::qdata::contract::{DashMapContractHeightCache, PSimpleContractHeightCache},
@@ -25,6 +26,10 @@ pub struct DPUserSimulationChainState<Hasher, Hash: Copy + PartialEq + Default, 
     pub user_ids: Vec<u64>,
     pub users: Vec<DPLocalUser<Hasher, Hash, F>>,
     pub global_contract_tree_height: u8,
+    pub coordinator_global_user_tree_height: u8,
+    pub realm_global_user_tree_height: u8,
+    pub group_realm_height: u8,
+    pub global_user_tree_height: u8,
     pub min_state_updates_per_call: u32,
     pub max_state_updates_per_call: u32,
     pub max_contract_calls_per_uop: u32,
@@ -43,6 +48,9 @@ impl<
     pub async fn new_populate_first_100_contract_ids(
         user_ids: Vec<u64>,
         global_contract_tree_height: u8,
+        coordinator_global_user_tree_height: u8,
+        realm_global_user_tree_height: u8,
+        group_realm_height: u8,
         min_state_updates_per_call: u32,
         max_state_updates_per_call: u32,
         max_contract_calls_per_uop: u32,
@@ -61,6 +69,9 @@ impl<
         Ok(Self::new(
             user_ids,
             global_contract_tree_height,
+            coordinator_global_user_tree_height,
+            realm_global_user_tree_height,
+            group_realm_height,
             min_state_updates_per_call,
             max_state_updates_per_call,
             max_contract_calls_per_uop,
@@ -71,6 +82,9 @@ impl<
     pub fn new(
         user_ids: Vec<u64>,
         global_contract_tree_height: u8,
+        coordinator_global_user_tree_height: u8,
+        realm_global_user_tree_height: u8,
+        group_realm_height: u8,
         min_state_updates_per_call: u32,
         max_state_updates_per_call: u32,
         max_contract_calls_per_uop: u32,
@@ -79,6 +93,10 @@ impl<
     ) -> Self {
         let allowed_contracts = contract_height_cache.mapping.iter().map(|dm| *dm.key()).collect();
         Self {
+            global_user_tree_height: coordinator_global_user_tree_height + realm_global_user_tree_height,
+            coordinator_global_user_tree_height,
+            realm_global_user_tree_height,
+            group_realm_height,
             checkpoint_id: 0,
             checkpoint_root: Hash::default(),
             users: user_ids
@@ -113,9 +131,26 @@ impl<
             .data_fetcher
             .df_get_user_leaves_batch(self.checkpoint_id, self.user_ids.clone())
             .await?;
-        let public_key_hashes = self.data_fetcher.cf_get_user_public_key_hashes(&self.user_ids).await?;
-        for (leaf, pk_hash) in user_leaves.iter_mut().zip(public_key_hashes.iter()) {
+        let user_registration_ids = self
+            .user_ids
+            .iter()
+            .map(|&uid| {
+                get_user_registration_id_from_user_id(
+                    uid,
+                    self.coordinator_global_user_tree_height,
+                    self.realm_global_user_tree_height,
+                    self.group_realm_height,
+                )
+            })
+            .collect::<Vec<_>>();
+        let public_key_hashes = self.data_fetcher.cf_get_user_public_key_hashes(&user_registration_ids).await?;
+        let hash_zero_value = Hash::get_zero_value();
+        for (i, (leaf, pk_hash)) in user_leaves.iter_mut().zip(public_key_hashes.iter()).enumerate() {
+            if pk_hash == &hash_zero_value{
+                anyhow::bail!("user {} (user registration id {}) has not been registered and has a zero public key hash, cannot proceed", i, user_registration_ids[i]);
+            }
             leaf.public_key = *pk_hash;
+
         }
         println!("fetched all user leaves from remote");
         let chunk_size = 16;
@@ -127,7 +162,9 @@ impl<
             let futs = self.users[start_index..end_index]
                 .iter_mut()
                 .zip(chunk.iter())
-                .map(|(local_user, remote_leaf)| local_user.sync_to_latest(data_fetcher.clone(), &self.contract_height_cache, checkpoint_id, *remote_leaf));
+                .map(|(local_user, remote_leaf)| {
+                    local_user.sync_to_latest(data_fetcher.clone(), &self.contract_height_cache, checkpoint_id, *remote_leaf)
+                });
 
             futures::future::try_join_all(futs).await?;
         }

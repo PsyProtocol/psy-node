@@ -1,5 +1,5 @@
 use parth_core::{
-    crypto::hash::{merkle_proof::MerkleProofCore, traits::MerkleZeroHasher}, felt::QFelt64, pgoldilocks::QHashOut, protocol::core_types::Q256BitHash
+    crypto::hash::{merkle_proof::MerkleProofCore, traits::MerkleZeroHasher}, felt::QFelt64, pgoldilocks::{QGenericConfig, QHashOut}, protocol::core_types::Q256BitHash
 };
 use plonky2::{
     gates::{constant::ConstantGate, gate::GateRef},
@@ -182,7 +182,7 @@ where
 
 impl<
         L: CircuitInfoLibrary<C, D>,
-        C: GenericConfig<D>,
+        C: QGenericConfig<D>,
         const D: usize,
     > QStandardCircuitProvableWithRawProofsAndRefLibrary<L, C, D>
     for GUTAVerifyGUTAToCapUpgradeCheckpointCircuit<C, D>

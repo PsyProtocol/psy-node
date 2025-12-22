@@ -9,7 +9,7 @@ use plonky2::{
     }
 };
 use parth_core::{
-    crypto::hash::traits::MerkleZeroHasher, felt::QFelt64, pgoldilocks::{QHashOut, QRichField}, protocol::core_types::Q256BitHash
+    crypto::hash::traits::MerkleZeroHasher, felt::QFelt64, pgoldilocks::{QGenericConfig, QHashOut, QRichField}, protocol::core_types::Q256BitHash
 };
 use psy_core::
     job::job_id::{ProvingJobCircuitType, QProvingJobDataID}
@@ -213,7 +213,7 @@ where
 
 impl<
         L: CircuitInfoLibrary<C, D>,
-        C: GenericConfig<D>,
+        C: QGenericConfig<D>,
         const D: usize,
     > QStandardCircuitProvableWithRawProofsAndRefLibrary<L, C, D>
     for GUTAVerifyTwoEndCapCircuitV2<C, D>

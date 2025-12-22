@@ -50,7 +50,9 @@ pub async fn run_jtmb_dummy_prover_lite<N: QNetworkTypesConfig<QHash = C::Hash, 
         max_state_updates_per_call,
         max_contract_calls_per_uop,
         N::GLOBAL_CONTRACT_TREE_HEIGHT,
-        N::GLOBAL_USER_TREE_HEIGHT,
+        N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
+        N::REALM_GLOBAL_USER_TREE_HEIGHT,
+        N::GROUP_REALM_HEIGHT,
         batches as usize,
     )
     .await?;

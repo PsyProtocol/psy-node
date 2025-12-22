@@ -353,7 +353,7 @@ impl<
                 config
                     .future_pending_end_cap_jobs
                     .write()
-                    .map_err(|_| anyhow::anyhow!("error wrriting to future pending end cap jobs"))?
+                    .map_err(|_| anyhow::anyhow!("error writing to future pending end cap jobs"))?
                     .as_mut(),
             )
         };

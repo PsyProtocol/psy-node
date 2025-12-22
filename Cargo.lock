@@ -2566,6 +2566,7 @@ dependencies = [
  "paste",
  "pderive",
  "plonky2",
+ "plonky2_field",
  "postcard",
  "pser",
  "psy_io",
@@ -2681,8 +2682,7 @@ checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
 
 [[package]]
 name = "plonky2"
-version = "1.0.2"
-source = "git+https://github.com/PsyRepoForks/plonky2-hwa?rev=8d5b56f42fe87942312f270a5dc26c0059f973fb#8d5b56f42fe87942312f270a5dc26c0059f973fb"
+version = "1.1.0"
 dependencies = [
  "ahash",
  "anyhow",
@@ -2710,7 +2710,6 @@ dependencies = [
 [[package]]
 name = "plonky2_field"
 version = "1.0.0"
-source = "git+https://github.com/PsyRepoForks/plonky2-hwa?rev=8d5b56f42fe87942312f270a5dc26c0059f973fb#8d5b56f42fe87942312f270a5dc26c0059f973fb"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -2729,7 +2728,6 @@ dependencies = [
 [[package]]
 name = "plonky2_maybe_rayon"
 version = "1.0.0"
-source = "git+https://github.com/PsyRepoForks/plonky2-hwa?rev=8d5b56f42fe87942312f270a5dc26c0059f973fb#8d5b56f42fe87942312f270a5dc26c0059f973fb"
 dependencies = [
  "rayon",
 ]
@@ -2737,7 +2735,6 @@ dependencies = [
 [[package]]
 name = "plonky2_util"
 version = "1.0.0"
-source = "git+https://github.com/PsyRepoForks/plonky2-hwa?rev=8d5b56f42fe87942312f270a5dc26c0059f973fb#8d5b56f42fe87942312f270a5dc26c0059f973fb"
 
 [[package]]
 name = "plotters"

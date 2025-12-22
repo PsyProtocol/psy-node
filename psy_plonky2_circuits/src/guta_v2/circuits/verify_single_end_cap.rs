@@ -9,7 +9,7 @@ use plonky2::{
     }
 };
 use parth_core::{
-    crypto::hash::traits::{FieldQHasher, MerkleZeroHasher}, data::proof_input::CircuitInputWithDependencies, felt::QFelt64, pgoldilocks::{QHashOut, QRichField}, protocol::core_types::{Q256BitHash, QFHashBase}
+    crypto::hash::traits::{FieldQHasher, MerkleZeroHasher}, data::proof_input::CircuitInputWithDependencies, felt::QFelt64, pgoldilocks::{QGenericConfig, QHashOut, QRichField}, protocol::core_types::{Q256BitHash, QFHashBase}
 };
 use psy_core::
     job::job_id::{ProvingJobCircuitType, QProvingJobDataID}
@@ -175,7 +175,7 @@ where
 impl<
         S: QProofStoreReaderAsync + Send + Sync,
         L: CircuitInfoLibrary<C, D> + Send + Sync,
-        C: GenericConfig<D> + 'static,
+        C: QGenericConfig<D> + 'static,
         const D: usize,
     > QStandardCircuitProvableWithProofStoreAndRefLibraryAsync<S, L, C, D>
     for GUTAVerifySingleEndCapCircuitV2<C, D>
@@ -218,7 +218,7 @@ where
 
 impl<
         L: CircuitInfoLibrary<C, D>,
-        C: GenericConfig<D>,
+        C: QGenericConfig<D>,
         const D: usize,
     > QStandardCircuitProvableWithRawProofsAndRefLibrary<L, C, D>
     for GUTAVerifySingleEndCapCircuitV2<C, D>

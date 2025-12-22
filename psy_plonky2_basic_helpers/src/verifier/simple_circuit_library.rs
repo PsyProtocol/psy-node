@@ -7,7 +7,7 @@ use plonky2::{
         circuit_data::{CommonCircuitData, VerifierOnlyCircuitData},
         config::{AlgebraicHasher, GenericConfig},
         proof::ProofWithPublicInputs,
-        verifier_v2::verify_standard_proof,
+        verifier_helper::verify_proof_borrowed,
     },
 };
 use psy_core::job::job_id::ProvingJobCircuitType;
@@ -237,7 +237,7 @@ where
         proof: &ProofWithPublicInputs<C::F, C, D>,
     ) -> anyhow::Result<()> {
         let verifier_data = self.internal_get_basic_info(circuit_type)?.verifier_data.to_verifier_data::<C, D>();
-        verify_standard_proof(proof, &verifier_data, common_data)?;
+        verify_proof_borrowed(proof, &verifier_data, common_data)?;
         Ok(())
     }
 }

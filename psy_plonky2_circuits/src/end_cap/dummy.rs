@@ -1,4 +1,4 @@
-use parth_core::{crypto::hash::traits::{FieldQHasher, MerkleZeroHasher, QFieldHashable}, felt::QFelt64, pgoldilocks::QHashOut, protocol::core_types::QFHashBase};
+use parth_core::{crypto::hash::traits::{FieldQHasher, MerkleZeroHasher, QFieldHashable}, felt::QFelt64, pgoldilocks::{QGenericConfig, QHashOut}, protocol::core_types::QFHashBase};
 use plonky2::{
     hash::hash_types::{HashOut, HashOutTarget}, iop::witness::{PartialWitness, WitnessWrite}, plonk::{
         circuit_builder::CircuitBuilder,
@@ -234,7 +234,7 @@ where
 */
 
 
-impl<C: GenericConfig<D> + 'static, const D: usize> DummyUPSProver<C::F, QHashOut<C::F>> for DummyUPSStandardEndCapCircuit<C, D>
+impl<C: QGenericConfig<D> + 'static, const D: usize> DummyUPSProver<C::F, QHashOut<C::F>> for DummyUPSStandardEndCapCircuit<C, D>
 where
     C::Hasher: AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + FieldQHasher<C::F,QHashOut<C::F>>, C::F: QFelt64, QHashOut<C::F>: QFHashBase<C::F>,{
         fn prove_end_cap_dummy_ups(
@@ -261,7 +261,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use plonky2::{field::goldilocks_field::GoldilocksField, plonk::{config::PoseidonGoldilocksConfig, verifier_v2::verify_standard_proof}};
+    use plonky2::{field::goldilocks_field::GoldilocksField, plonk::{config::PoseidonGoldilocksConfig, verifier_helper::verify_proof_borrowed}};
     use psy_plonky2_basic_helpers::{lookalike::standard::get_end_cap_type_e_common_data, verifier::alt::AltVerifierOnlyCircuitData};
 
     use super::*;
@@ -282,7 +282,7 @@ mod tests {
         println!("alt_verifier_data: {}", serde_json::to_string(&alt_verifier_data).unwrap());
         let common_data_gen = get_end_cap_type_e_common_data::<C,D>();
         //println!("common_data_gen: {:#?}", common_data_gen);
-        verify_standard_proof(
+        verify_proof_borrowed(
             &proof,
             &circuit.get_verifier_config_ref(),
             &common_data_gen,
