@@ -2,12 +2,12 @@ use async_trait::async_trait;
 use parth_core::{
     QCoreProcCheckpointUniqueId, QJobIdBase, data::serializable::QProofWitnessSerializable, node::realm_identifier::QRealmIdentifier, protocol::core_types::Q256BitHash
 };
-use psy_data::worker::metadata::PsyProvingJobMetadata;
+use psy_data::{node::node_proving_state::PsyNodeProvingState, worker::metadata::PsyProvingJobMetadata};
 use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 
 use crate::{
     psy_temp_db::{
-        QTempDBDeployContractDataReader, QTempDBDeployContractDataWriter, QTempDBPendingIdReader, QTempDBPendingIdWriter, QTempDBProofWitnessReader, QTempDBProofWitnessWriter, QTempDBProvingJobMetadataReader, QTempDBProvingJobMetadataWriter, QTempDBRewardsTreeReader, QTempDBRewardsTreeWriter, QTempDBSubmitStatusReader, QTempDBSubmitStatusWriter, QTempDBUserContractUpdatesReader, QTempDBUserContractUpdatesWriter, tt_get_contract_updates_key, tt_get_deploy_contract_code_definition_key, tt_get_gathering_unique_pending_id_key, tt_get_proof_witness_data_key_from_job, tt_get_proving_job_metadata_key_from_job, tt_get_rewards_tag_tree_value_key_from_job, tt_get_submit_status_key, tt_get_unique_pending_id_key
+        QTempDBDeployContractDataReader, QTempDBDeployContractDataWriter, QTempDBNodeProvingStateReader, QTempDBNodeProvingStateWriter, QTempDBPendingIdReader, QTempDBPendingIdWriter, QTempDBProofWitnessReader, QTempDBProofWitnessWriter, QTempDBProvingJobMetadataReader, QTempDBProvingJobMetadataWriter, QTempDBRewardsTreeReader, QTempDBRewardsTreeWriter, QTempDBSubmitStatusReader, QTempDBSubmitStatusWriter, QTempDBUserContractUpdatesReader, QTempDBUserContractUpdatesWriter, tt_get_contract_updates_key, tt_get_deploy_contract_code_definition_key, tt_get_gathering_unique_pending_id_key, tt_get_node_proving_state_key, tt_get_proof_witness_data_key_from_job, tt_get_proving_job_metadata_key_from_job, tt_get_rewards_tag_tree_value_key_from_job, tt_get_submit_status_key, tt_get_unique_pending_id_key
     },
     store::traits::temp_db::{QTempDatabaseRawKVReaderBase, QTempDatabaseRawKVWriterBase},
 };
@@ -225,6 +225,35 @@ impl<T: QTempDatabaseRawKVWriterBase + Sync> QTempDBPendingIdWriter for T {
         data[0..8].copy_from_slice(&unique_pending_id.to_le_bytes());
         data[8..24].copy_from_slice(&proc_checkpoint_unique_id.to_le_bytes());
         self.qtdb_raw_kv_put_value(&key, &data).await
+    }
+}
+
+
+
+
+
+#[async_trait]
+impl<T: QTempDatabaseRawKVReaderBase + Sync> QTempDBNodeProvingStateReader for T {
+    async fn get_psy_node_proving_state(&self, rid: &QRealmIdentifier) -> anyhow::Result<PsyNodeProvingState>{
+        let key = tt_get_node_proving_state_key(rid.realm_id, rid.realm_sub_id);
+        let value_bytes = self.qtdb_raw_kv_get_value(&key).await?;
+        if value_bytes.is_some() {
+            let value_bytes = value_bytes.unwrap();
+            Ok(PsyNodeProvingState::psy_ser_from_owned_bytes_vec(value_bytes)?)
+        }else{
+            Ok(PsyNodeProvingState { realm_id: 0, realm_sub_id: 0, node_type: 0, plan_variant: 0, current_proving_level: 0, has_remaining_proving_jobs: 0, unique_pending_id: 0, last_committed_checkpoint_id: 0, guta_input_proofs: 0, total_guta_jobs: 0, new_user_registrations: 0, total_user_registration_jobs: 0, new_contracts_deployed: 0, total_deploy_contract_jobs: 0 })
+        }
+        
+
+    }
+}
+
+#[async_trait]
+impl<T: QTempDatabaseRawKVWriterBase + Sync> QTempDBNodeProvingStateWriter for T {
+    async fn set_psy_node_proving_state(&self, rid: &QRealmIdentifier, state: &PsyNodeProvingState) -> anyhow::Result<()>{
+        let key = tt_get_node_proving_state_key(rid.realm_id, rid.realm_sub_id);
+        let value_bytes = state.psy_ser_to_bytes_vec()?;
+        self.qtdb_raw_kv_put_value(&key, &value_bytes).await
     }
 }
 

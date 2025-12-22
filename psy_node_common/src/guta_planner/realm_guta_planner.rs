@@ -240,7 +240,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
         temp_store: Arc<TempStore>,
         queue_item_bytes: &[u8],
         queue_item: PsyRealmUserUpdateQueueItem<F, Hash>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<usize> {
         self.add_end_cap_job_internal::<Hasher, TempStore, File>(checkpoint_tree, global_user_tree, file, temp_store, queue_item_bytes, queue_item)
             .await
     }
@@ -256,7 +256,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
         temp_store: Arc<TempStore>,
         queue_item_bytes: &[u8],
         queue_item: PsyRealmUserUpdateQueueItem<F, Hash>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<usize> {
         let user_last_checkpoint_id = queue_item.new_user_leaf.last_checkpoint_id.to_u64_value();
         let user_id = queue_item.new_user_leaf.user_id.to_u64_value();
         if user_id < self.realm_user_min_id || user_id > self.realm_user_max_id {
@@ -267,7 +267,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
                 user_id,
                 self.realm_identifier.realm_id
             );
-            return Ok(());
+            return Ok(0);
         }
         let last_user_leaf_value = global_user_tree.get_leaf_value(user_id - self.realm_user_min_id);
         if last_user_leaf_value != queue_item.old_user_leaf_hash {
@@ -277,7 +277,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
                 last_user_leaf_value,
                 queue_item.old_user_leaf_hash
             );
-            return Ok(());
+            return Ok(0);
         }
         if user_last_checkpoint_id > self.current_checkpoint_id {
             tracing::info!(
@@ -302,14 +302,14 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
             } else {
                 self.future_pending_end_cap_jobs.push(result.unwrap());
             }
-            return Ok(());
+            return Ok(0);
         }
         let data: Option<Vec<u8>> = temp_store
             .get_contract_updates_for_user(&self.realm_identifier, self.unique_pending_id, user_id)
             .await?;
         if data.is_none() {
             tracing::info!("Skipping end-cap job population due to missing contract updates for user ID {}.", user_id);
-            return Ok(());
+            return Ok(0);
         }
         tracing::info!("Populating end-cap job for user ID {} at checkpoint ID {}.", user_id, user_last_checkpoint_id);
         let data = data.unwrap();
@@ -337,7 +337,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
                 queue_item.expected_fake_checkpoint_id,
                 single_header.checkpoint_id
             );
-            return Ok(());
+            return Ok(0);
         }
 
         self.user_contract_tree_updates_ffs.extend_from_slice(&single_payload);
@@ -430,7 +430,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
             self.end_cap_straggler = Some(queue_item);
         }
 
-        Ok(())
+        Ok(1)
     }
 
 
@@ -445,9 +445,10 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
         file: &mut File,
         temp_store: Arc<TempStore>,
         future_end_cap_jobs: Vec<PlannedFutureEndCapJob<F, Hash>>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<usize> {
+        let mut count = 0;
         for future_end_cap_job in future_end_cap_jobs {
-            self.add_future_end_cap_job::<Hasher, TempStore, File>(
+            count += self.add_future_end_cap_job::<Hasher, TempStore, File>(
                 checkpoint_tree,
                 global_user_tree,
                 file,
@@ -456,7 +457,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
             )
             .await?;
         }
-        Ok(())
+        Ok(count)
     }
     async fn add_future_end_cap_job<
         Hasher: FieldQHasher<F, Hash>,
@@ -469,7 +470,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
         file: &mut File,
         temp_store: Arc<TempStore>,
         future_end_cap_job: PlannedFutureEndCapJob<F, Hash>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<usize> {
         let queue_item = future_end_cap_job.queue_item;
         let user_last_checkpoint_id = queue_item.new_user_leaf.last_checkpoint_id.to_u64_value();
         let user_id = queue_item.new_user_leaf.user_id.to_u64_value();
@@ -481,7 +482,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
                 user_id,
                 self.realm_identifier.realm_id
             );
-            return Ok(());
+            return Ok(0);
         }
         if user_last_checkpoint_id > self.current_checkpoint_id {
             tracing::info!(
@@ -490,7 +491,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
                 user_id
             );
             self.future_pending_end_cap_jobs.push(future_end_cap_job);
-            return Ok(());
+            return Ok(0);
         }
 
         tracing::info!(
@@ -523,7 +524,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
                 queue_item.expected_fake_checkpoint_id,
                 single_header.checkpoint_id
             );
-            return Ok(());
+            return Ok(0);
         }
 
         self.user_contract_tree_updates_ffs.extend_from_slice(&single_payload);
@@ -595,7 +596,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
             self.end_cap_straggler = Some(queue_item);
         }
 
-        Ok(())
+        Ok(1)
     }
     fn update_reward_tree_config(&mut self, job_id: &QProvingJobDataID, level: u8, index: u64) -> anyhow::Result<()> {
         if job_id.circuit_type == ProvingJobCircuitType::UserEndCap {
@@ -816,6 +817,8 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
                     .await?;
                 return Ok(Some(RealmGUTAEndCapGathererOutput {
                     db_output: RealmGUTAEndCapGathererOutputDatabase {
+                        total_users_updated: self.total_end_caps_processed as u64,
+                        total_proofs_generated: self.total_jobs as u64,
                         old_realm_root: self.start_realm_root,
                         new_realm_root: global_user_tree.get_root(),
                         update_global_user_tree_nodes_ffs: create_ffs_merkle_nodes_zero_id_from_hash_map_with_offset::<Hash>(
@@ -840,12 +843,14 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
 
             Ok(Some(RealmGUTAEndCapGathererOutput {
                 db_output: RealmGUTAEndCapGathererOutputDatabase {
+                    total_users_updated: self.total_end_caps_processed as u64,
                     old_realm_root: self.start_realm_root,
                     new_realm_root: global_user_tree.get_root(),
                     update_global_user_tree_nodes_ffs: create_ffs_merkle_nodes_zero_id_from_hash_map_with_offset::<Hash>(
                         global_user_tree.get_changes(),
                         self.realm_root_key,
                     ),
+                    total_proofs_generated: self.total_jobs as u64,
                     update_user_contract_tree_nodes_ffs: self.user_contract_tree_updates_ffs,
                     update_contract_state_tree_nodes_ffs: self.contract_state_tree_updates_ffs,
                     update_user_leaves_ffs: self.user_leaf_updates_ffs,

@@ -141,6 +141,7 @@ pub async fn read_coordinator_guta_update_gatherer_backup_file<
         start_global_user_tree_root,
         end_global_user_tree_root,
         random_seed_guta,
+        total_guta_inputs: changes.len() as u64,
         new_realm_guta_reward_tree_node_keys_ffs: vec![],
         
     };
@@ -197,6 +198,7 @@ pub struct CoordinatorGUTAUpdateGatherer<
     pub start_global_user_tree_root: N::QHash,
     pub new_coordinator_guta_file: FileSystem::File,
     pub pending_file_path: String,
+    pub total_guta_inputs: u64,
 }
 /*
 impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>, FileSystem: TokioLikeFileSystem> CoordinatorGUTAUpdateGatherer<N, TempDatabase, FileSystem>
@@ -215,6 +217,7 @@ pub struct CoordinatorGUTAUpdateGathererOutputDatabase<F, Hash> {
     pub new_realm_guta_reward_tree_node_keys_ffs: Vec<u8>,
     pub guta_stats: GUTAStats<F>,
     pub total_guta_proofs_generated: F,
+    pub total_guta_inputs: u64,
 
     pub start_global_user_tree_root: Hash,
     pub end_global_user_tree_root: Hash,
@@ -268,6 +271,7 @@ impl<
             guta_planner,
             last_committed_checkpoint_root,
             pending_core_proc_id: unique_id,
+            total_guta_inputs: 0,
             old_realm_roots: Vec::new(),
             guta_stats: GUTAStats::get_zero_value(),
             total_guta_proofs_generated: N::F::ZERO_VALUE,
@@ -327,6 +331,7 @@ impl<
                 update_header,
             )
             .await?;
+        self.total_guta_inputs += 1;
         Ok(())
     }
     async fn update_from_many_queue_items_with_tree(
@@ -449,6 +454,7 @@ impl<
             end_global_user_tree_root,
             random_seed_guta: get_temp_guta_rand_seed::<N::QHash>(),
             new_realm_guta_reward_tree_node_keys_ffs: vec![],
+            total_guta_inputs: self.total_guta_inputs,
         };
 
         let output = CoordinatorGUTAUpdateGathererOutput {

@@ -6,7 +6,7 @@ mod user_contract_tree_updates;
 mod deploy_contract_data;
 mod proof_metadata;
 mod rewards_tree;
-
+mod node_proving_state;
 
 use parth_core::{protocol::core_types::QDBHashBase, QJobIdBase};
 pub use proof_metadata::*;
@@ -17,6 +17,7 @@ pub use witness::*;
 pub use user_contract_tree_updates::*;
 pub use deploy_contract_data::*;
 pub use rewards_tree::*;
+pub use node_proving_state::*;
 
 
 pub trait StandardEdgeAPITempDBStoreBase<JobId: QJobIdBase, Hash: QDBHashBase>: 
@@ -26,7 +27,8 @@ pub trait StandardEdgeAPITempDBStoreBase<JobId: QJobIdBase, Hash: QDBHashBase>:
     QTempDBUserContractUpdatesStore + 
     QTempDBProvingJobMetadataStore<Hash, JobId> +
     QTempDBRewardsTreeStore<Hash, JobId> +
-    QTempDBDeployContractDataStore
+    QTempDBDeployContractDataStore + 
+    QTempDBNodeProvingStateStore
 {
 
 }
@@ -41,7 +43,8 @@ impl<
     QTempDBUserContractUpdatesStore + 
     QTempDBProvingJobMetadataStore<Hash, JobId> +
     QTempDBRewardsTreeStore<Hash, JobId> +
-    QTempDBDeployContractDataStore,
+    QTempDBDeployContractDataStore +
+    QTempDBNodeProvingStateStore,
 > StandardEdgeAPITempDBStoreBase<JobId, Hash> for T {
 }
 
@@ -53,7 +56,8 @@ pub trait StandardProcessorTempDBStoreBase<JobId: QJobIdBase, Hash: QDBHashBase>
     QTempDBUserContractUpdatesStore + 
     QTempDBProvingJobMetadataStore<Hash, JobId> +
     QTempDBRewardsTreeStore<Hash, JobId> +
-    QTempDBDeployContractDataStore
+    QTempDBDeployContractDataStore +
+    QTempDBNodeProvingStateStore
 {
 
 }
@@ -68,7 +72,8 @@ impl<
     QTempDBUserContractUpdatesStore + 
     QTempDBProvingJobMetadataStore<Hash, JobId> +
     QTempDBRewardsTreeStore<Hash, JobId> +
-    QTempDBDeployContractDataStore,
+    QTempDBDeployContractDataStore +
+    QTempDBNodeProvingStateStore,
 > StandardProcessorTempDBStoreBase<JobId, Hash> for T {
 }
 

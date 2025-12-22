@@ -1,6 +1,4 @@
-use cf_utils::timer::DebugTimer;
-use parth_core::utils::math::log2_strict;
-use plonky2::{field::{extension::quadratic::QuadraticExtension, fft::FftRootTable, goldilocks_field::GoldilocksField, polynomial::PolynomialCoeffs}, hash::{hash_types::RichField, merkle_tree::MerkleTree, poseidon::PoseidonHash}, plonk::config::{CpuProverCompute, GenericConfig, Hasher, ProverCompute}};
+use plonky2::plonk::config::PoseidonGoldilocksConfig;
 use psy_core::constants::{
     chain_id::{PsyChainNetworkType, PsyNetworkTypeInput},
     proving_backends::{PsyChainProvingBackendType, PsyChainProvingBackendTypeInput},
@@ -8,7 +6,6 @@ use psy_core::constants::{
 use psy_jtmb_testing_core::{circuit_library::worker::get_simple_proof_miner_worker_for_network_jtmb, protocol_types::JTMBPoseidonGoldilocksConfig};
 use psy_plonky2_circuits::circuit_library::get_simple_proof_miner_worker_for_network;
 use psy_worker_core::config::{worker_cli_config::WorkerCliConfig, worker_config::WorkerStartupConfig};
-use serde::Serialize;
 use tracing::{error, info};
 
 fn print_banner() {
@@ -38,54 +35,6 @@ fn print_banner() {
     );
 }
 
-/// Default CPU implementation of `ProverCompute`.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub struct CpuProverComputeLog;
-impl<F: RichField, H: Hasher<F>> ProverCompute<F, H> for CpuProverComputeLog {
-    fn commit_polynomials(
-        polynomials: &[PolynomialCoeffs<F>],
-        cap_height: usize,
-        rate_bits: usize,
-        blinding: bool,
-        fft_root_table: Option<&FftRootTable<F>>,
-    ) -> MerkleTree<F, H> {
-        let mut timer = DebugTimer::new("CpuProverCompute::commit_polynomials");
-
-        println!("cap_height: {}", cap_height);
-        println!("rate_bits: {}", rate_bits);
-        println!("blinding: {}", blinding);
-        println!("fft_root_table is some: {}", fft_root_table.is_some());
-        println!("polynomials len: {}", polynomials.len());
-        let polys = polynomials.iter().map(|x| x.len()).collect::<Vec<_>>();
-        println!("polynomial lengths: {:?}", polys);
-        let degree = polynomials[0].len();
-        println!("degree: {}", degree);
-        let degree_bits = log2_strict(degree);
-        println!("degree_bits: {}", degree_bits);
-        let result = CpuProverCompute::commit_polynomials(
-            polynomials,
-            cap_height,
-            rate_bits,
-            blinding,
-            fft_root_table,
-        );
-        timer.lap_micros("commit_polynomials");
-        result
-    }
-}
-
-
-/// Configuration using Poseidon over the Goldilocks field.
-#[derive(Debug, Copy, Clone, Default, Eq, PartialEq, Serialize)]
-pub struct PoseidonGoldilocksLogConfig;
-impl GenericConfig<2> for PoseidonGoldilocksLogConfig {
-    type F = GoldilocksField;
-    type FE = QuadraticExtension<Self::F>;
-    type Hasher = PoseidonHash;
-    type InnerHasher = PoseidonHash;
-    type Compute = CpuProverComputeLog;
-}
-
 pub async fn run_worker_inner(
     network: PsyChainNetworkType,
     config: WorkerStartupConfig,
@@ -94,7 +43,7 @@ pub async fn run_worker_inner(
     // Placeholder for actual worker logic
 
     if proving_backend == PsyChainProvingBackendType::Plonky2PoseidonGoldilocks {
-        type C = PoseidonGoldilocksLogConfig;
+        type C = PoseidonGoldilocksConfig;
         const D: usize = 2;
         let worker = get_simple_proof_miner_worker_for_network::<C, D>(network, config).await?;
 

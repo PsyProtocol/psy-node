@@ -9,7 +9,7 @@ use parth_core::{
 use psy_api_core::{coordinator::standard_edge_rpc::CoordinatorEdgeRpcServer, worker::standard_worker_rpc::NodeEdgeWorkerRpcServer};
 use psy_core::job::job_id::QProvingJobDataID;
 use psy_data::{
-    guta::header_extended::GlobalUserTreeAggregatorHeaderWithTagValueAndJobType, prepared_block::realm::PsyRealmCoordinatorUpdate, v1::{
+    guta::header_extended::GlobalUserTreeAggregatorHeaderWithTagValueAndJobType, node::node_proving_state::PsyNodeProvingState, prepared_block::realm::PsyRealmCoordinatorUpdate, v1::{
         common_api::PsyProoffMinerRewardProof,
         qdata::{
             checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState},
@@ -299,6 +299,9 @@ impl<
         ProofStore,
     >
 {
+    async fn get_node_proving_state(&self) -> RpcResult<PsyNodeProvingState>{
+        res(self.temp_db.get_psy_node_proving_state(&self.realm_identifier).await)
+    }
     async fn get_proving_work(
         &self,
         signature: QEDCompressedSecp256K1Signature,

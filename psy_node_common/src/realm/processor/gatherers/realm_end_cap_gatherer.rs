@@ -181,6 +181,8 @@ pub async fn read_realm_end_cap_gatherer_backup_file<
         update_user_contract_tree_nodes_ffs,
         update_contract_state_tree_nodes_ffs,
         update_user_leaves_ffs,
+        total_proofs_generated: 0,
+        total_users_updated: total_end_caps_processed as u64,
         guta_header,
     })
 }
@@ -229,6 +231,7 @@ pub struct RealmGUTAEndCapGatherer<
     pub guta_planner: RealmGUTAPlanner<N::F, N::QHash>,
     pub status: RealmProcessorCoreState<N::QHash>,
     pub start_global_user_tree_root: N::QHash,
+    pub total_users_updated: u64,
     pub new_realm_end_cap_gatherer_file: FileSystem::File,
     pub pending_file_path: String,
 }
@@ -251,6 +254,8 @@ pub struct RealmGUTAEndCapGathererOutputDatabase<F, Hash> {
     pub update_user_contract_tree_nodes_ffs: Vec<u8>,
     pub update_contract_state_tree_nodes_ffs: Vec<u8>,
     pub update_user_leaves_ffs: Vec<u8>,
+    pub total_users_updated: u64,
+    pub total_proofs_generated: u64,
     pub guta_header: GlobalUserTreeAggregatorHeaderWithJobId<F, Hash>,
 }
 
@@ -262,6 +267,8 @@ impl<F: QFelt64, Hash: QDBHashBase> RealmGUTAEndCapGathererOutputDatabase<F, Has
         Self {
             old_realm_root: realm_root,
             new_realm_root: realm_root,
+            total_users_updated: 0,
+            total_proofs_generated: 0,
             update_global_user_tree_nodes_ffs: vec![],
             update_user_contract_tree_nodes_ffs: vec![],
             update_contract_state_tree_nodes_ffs: vec![],
@@ -357,7 +364,7 @@ impl<
                     .as_mut(),
             )
         };
-        guta_planner
+        let end_cap_jobs_added = guta_planner
             .add_future_end_cap_jobs(
                 &config.checkpoint_tree,
                 tree,
@@ -379,6 +386,7 @@ impl<
             status,
             guta_planner,
             last_committed_checkpoint_root,
+            total_users_updated:end_cap_jobs_added as u64,
             new_realm_end_cap_gatherer_file,
             start_global_user_tree_root: tree.get_root(),
             pending_file_path: new_realm_end_cap_gatherer_file_path.to_string_lossy().to_string(),
