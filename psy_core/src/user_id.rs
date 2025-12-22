@@ -379,7 +379,7 @@ impl UserIdGeneratorStrategy for UserIdBitsStrategy5 {
 // =================================================================================
 
 // Default to Strategy 5 for maximum distance and load balancing
-type UserIdBitsStrategy = UserIdBitsStrategy0;
+type UserIdBitsStrategy = UserIdBitsStrategy5;
 
 pub fn get_user_id_from_user_registration_id(
     user_registration_id: u64,
