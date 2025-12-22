@@ -76,6 +76,7 @@ where
         tokio::task::JoinHandle<Result<(), anyhow::Error>>,
         tokio::task::JoinHandle<Result<(), anyhow::Error>>,
     )> {
+        db.ensure_genesis_applied(genesis_block_update.clone()).await?;
         let (
             _db_tree_next_user_registration_id,
             _db_tree_next_contract_id,

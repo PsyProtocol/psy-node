@@ -52,6 +52,7 @@ where
         file_system: Arc<FileSystem>,
         guta_gatherer_backup_directory: String,
     ) -> anyhow::Result<(Self, tokio::task::JoinHandle<Result<(), anyhow::Error>>)> {
+        db.ensure_genesis_applied(genesis_block_update.clone()).await?;
         let (mut global_user_tree,) = load_realm_memory_trees_from_db::<N, _>(&db.db, db.state.gathering_checkpoint_id, db.state.realm_id_u64)
             .await?
             .into_tuple();

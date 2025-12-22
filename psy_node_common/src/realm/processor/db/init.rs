@@ -422,7 +422,7 @@ where
         let genesis_checkpoint_root = genesis_block_update.coordinator_update.checkpoint_sync_info.checkpoint_tree_root;
 
         // 1. Genesis Check
-        self.ensure_genesis_applied(genesis_block_update).await?;
+        // self.ensure_genesis_applied(genesis_block_update).await?;
 
         // 2. Recovery Check
         self.ensure_backup_restored_if_necessary(file_system, guta_gatherer_backup_directory, global_user_tree)

@@ -877,7 +877,7 @@ Checkpoint Root Hash: {}
         global_contract_tree: &mut SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>,
         user_registration_tree: &mut SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>,
     ) -> anyhow::Result<()> {
-        self.ensure_genesis_applied(genesis_block_update).await?;
+        // self.ensure_genesis_applied(genesis_block_update).await?;
         self.ensure_backup_restored_if_necessary(
             file_system,
             deploy_contract_gatherer_backup_directory,
