@@ -149,6 +149,9 @@ pub trait CoordinatorEdgeRpc<F, Hash, JobId, ZKProof>: NodeEdgeWorkerRpcServer<H
     #[method(name = "get_contract_tree_merkle_proof")]
     async fn get_contract_tree_merkle_proof(&self, checkpoint_id: u64, contract_id: u32) -> RpcResult<MerkleProofCore<Hash>>;
 
+    #[method(name = "get_contract_tree_heights")]
+    async fn get_contract_tree_heights(&self, checkpoint_id: u64, contract_ids: Vec<u64>) -> RpcResult<Vec<u8>>;
+
     // Checkpoint tree
     #[method(name = "get_latest_checkpoint_tree_root")]
     async fn get_latest_checkpoint_tree_root(&self) -> RpcResult<Hash>;

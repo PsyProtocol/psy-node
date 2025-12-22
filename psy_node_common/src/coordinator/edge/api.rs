@@ -203,6 +203,13 @@ impl<
             .await)
     }
 
+    async fn get_contract_tree_heights(&self, checkpoint_id: u64, contract_ids: Vec<u64>) -> QRpcResult<Vec<u8>> {
+        res(self
+            .db_reader
+            .get_contract_tree_heights(checkpoint_id, &contract_ids)
+            .await)
+    }
+
     async fn get_user_top_tree_merkle_proof(&self, checkpoint_id: u64, leaf_level: u8, leaf_index: u64) -> QRpcResult<MerkleProofCore<N::QHash>> {
         res(self
             .db_reader
