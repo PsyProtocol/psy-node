@@ -14,6 +14,7 @@ pub struct RealmProcessorStartConfig {
     pub verbose: bool,
     pub checkpoint_backup_path: String,
     pub coordinator_api_urls: Vec<String>,
+    pub genesis_data_path: Option<String>,
 }
 impl RealmProcessorStartConfig {
     pub fn get_checkpoint_tree_backup_file_path(&self) -> String {
@@ -56,6 +57,7 @@ pub struct CoordinatorProcessorStartConfig {
     pub network: PsyChainNetworkType,
     pub verbose: bool,
     pub checkpoint_backup_path: String,
+    pub genesis_data_path: Option<String>,
 }
 impl CoordinatorProcessorStartConfig {
     pub fn get_checkpoint_tree_backup_file_path(&self) -> String {

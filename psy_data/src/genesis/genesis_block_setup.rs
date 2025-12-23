@@ -30,5 +30,5 @@ impl<F, Hash> PsyGenesisBlockSetupData<F, Hash> {
 }
 
 pub trait PsyGenesisBlockSetupDataProvider<F, Hash> {
-    fn get_genesis_block_setup_data_for_network(&self, network: PsyChainNetworkType) -> anyhow::Result<PsyGenesisBlockSetupData<F, Hash>>;
+    fn get_genesis_block_setup_data_for_network(&self, network: PsyChainNetworkType, genesis_data_path: Option<String>) -> anyhow::Result<PsyGenesisBlockSetupData<F, Hash>>;
 }

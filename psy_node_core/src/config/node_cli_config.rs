@@ -45,6 +45,7 @@ pub struct RealmProcessorCliConfig {
     pub verbose: Option<bool>,
     pub checkpoint_backup_path: Option<String>,
     pub coordinator_api_urls: Vec<String>,
+    pub genesis_data_path: Option<String>,
 }
 impl RealmProcessorCliConfig {
     pub fn get_default_empty() -> Self {
@@ -59,6 +60,7 @@ impl RealmProcessorCliConfig {
             verbose: None,
             checkpoint_backup_path: None,
             coordinator_api_urls: Vec::new(),
+            genesis_data_path: None,
         }
     }
     pub fn into_start_config_with_cli_args(
@@ -73,6 +75,7 @@ impl RealmProcessorCliConfig {
         verbose: bool,
         checkpoint_backup_path: Option<String>,
         coordinator_api_urls: Vec<String>,
+        genesis_data_path: Option<String>,
     ) -> anyhow::Result<RealmProcessorStartConfig> {
         Ok(RealmProcessorStartConfig {
             scylla_db_url: scylla_db_url.or(self.scylla_db_url).ok_or_else(|| anyhow::anyhow!("scylla_db_url is required"))?,
@@ -85,6 +88,7 @@ impl RealmProcessorCliConfig {
             verbose: verbose || self.verbose.unwrap_or(false),
             checkpoint_backup_path: checkpoint_backup_path.or(self.checkpoint_backup_path).ok_or_else(|| anyhow::anyhow!("checkpoint_backup_path is required"))?,
             coordinator_api_urls: if !coordinator_api_urls.is_empty() { coordinator_api_urls } else { self.coordinator_api_urls },
+            genesis_data_path: genesis_data_path.or(self.genesis_data_path),
         })
     }
     pub async fn get_start_config(
@@ -99,6 +103,7 @@ impl RealmProcessorCliConfig {
         verbose: bool,
         checkpoint_backup_path: Option<String>,
         coordinator_api_urls: Vec<String>,
+        genesis_data_path: Option<String>,
     ) -> anyhow::Result<RealmProcessorStartConfig> {
         let cli_config = if let Some(config_path) = config {
             load_cli_config_from_file::<Self>(&config_path).await?
@@ -116,6 +121,7 @@ impl RealmProcessorCliConfig {
             verbose,
             checkpoint_backup_path,
             coordinator_api_urls,
+            genesis_data_path,
         )
     }
 }
@@ -218,6 +224,7 @@ pub struct CoordinatorProcessorCliConfig {
     pub network: Option<PsyNetworkTypeInput>,
     pub verbose: Option<bool>,
     pub checkpoint_backup_path: Option<String>,
+    pub genesis_data_path: Option<String>,
 }
 impl CoordinatorProcessorCliConfig {
     pub fn get_default_empty() -> Self {
@@ -231,6 +238,7 @@ impl CoordinatorProcessorCliConfig {
             network: None,
             verbose: None,
             checkpoint_backup_path: None,
+            genesis_data_path: None,
         }
     }
     pub fn into_start_config_with_cli_args(
@@ -244,6 +252,7 @@ impl CoordinatorProcessorCliConfig {
         network: Option<PsyNetworkTypeInput>,
         verbose: bool,
         checkpoint_backup_path: Option<String>,
+        genesis_data_path: Option<String>,
     ) -> anyhow::Result<CoordinatorProcessorStartConfig> {
         Ok(CoordinatorProcessorStartConfig {
             scylla_db_url: scylla_db_url.or(self.scylla_db_url).ok_or_else(|| anyhow::anyhow!("scylla_db_url is required"))?,
@@ -255,6 +264,7 @@ impl CoordinatorProcessorCliConfig {
             network: network.or(self.network).ok_or_else(|| anyhow::anyhow!("network is required"))?.into(),
             verbose: verbose || self.verbose.unwrap_or(false),
             checkpoint_backup_path: checkpoint_backup_path.or(self.checkpoint_backup_path).ok_or_else(|| anyhow::anyhow!("checkpoint_backup_path is required"))?,
+            genesis_data_path: genesis_data_path.or(self.genesis_data_path),
         })
     }
     pub async fn get_start_config(
@@ -268,6 +278,7 @@ impl CoordinatorProcessorCliConfig {
         network: Option<PsyNetworkTypeInput>,
         verbose: bool,
         checkpoint_backup_path: Option<String>,
+        genesis_data_path: Option<String>,
     ) -> anyhow::Result<CoordinatorProcessorStartConfig> {
         let cli_config = if let Some(config_path) = config {
             load_cli_config_from_file::<Self>(&config_path).await?
@@ -284,6 +295,7 @@ impl CoordinatorProcessorCliConfig {
             network,
             verbose,
             checkpoint_backup_path,
+            genesis_data_path,
         )
     }
 }

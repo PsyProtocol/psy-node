@@ -39,7 +39,7 @@ pub fn get_psy_node_circuit_config_for_local_devnet() -> anyhow::Result<PsyNodeC
     })
 }
 
-pub fn get_genesis_block_setup_data_for_local_devnet() -> anyhow::Result<PsyGenesisBlockSetupData<F, Hash>> {
+pub fn get_genesis_block_setup_data_for_local_devnet_default() -> anyhow::Result<PsyGenesisBlockSetupData<F, Hash>> {
     Ok(PsyGenesisBlockSetupData {
         contracts: vec![],
         users: vec![],
@@ -65,4 +65,14 @@ pub fn get_genesis_block_setup_data_for_local_devnet() -> anyhow::Result<PsyGene
         deposit_tree_root: PoseidonHasher::get_zero_hash(32),
         withdrawal_tree_root: PoseidonHasher::get_zero_hash(32),
     })
+}
+
+pub fn get_genesis_block_setup_data_for_local_devnet(genesis_data_path: Option<String>) -> anyhow::Result<PsyGenesisBlockSetupData<F, Hash>> {
+    match genesis_data_path {
+        None => get_genesis_block_setup_data_for_local_devnet_default(),
+        Some(path) => {
+            let genesis_data = serde_json::from_str::<PsyGenesisBlockSetupData<F, Hash>>(&std::fs::read_to_string(path)?)?;
+            Ok(genesis_data)
+        }
+    }
 }

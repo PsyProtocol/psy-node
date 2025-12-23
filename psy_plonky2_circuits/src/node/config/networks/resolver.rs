@@ -26,9 +26,9 @@ impl PsyNodeCircuitFingerprintConfigProvider<Hash> for PsyPlonky2NodeConfigResol
     }
 }
 impl PsyGenesisBlockSetupDataProvider<F, Hash> for PsyPlonky2NodeConfigResolver {
-    fn get_genesis_block_setup_data_for_network(&self, network: PsyChainNetworkType) -> anyhow::Result<PsyGenesisBlockSetupData<F, Hash>> {
+    fn get_genesis_block_setup_data_for_network(&self, network: PsyChainNetworkType, genesis_data_path: Option<String>) -> anyhow::Result<PsyGenesisBlockSetupData<F, Hash>> {
         match network {
-            PsyChainNetworkType::LocalDevnet => get_genesis_block_setup_data_for_local_devnet(),
+            PsyChainNetworkType::LocalDevnet => get_genesis_block_setup_data_for_local_devnet(genesis_data_path),
             _ => Err(anyhow::anyhow!("Unsupported network type for genesis block setup data: {:?}", network)),
         }
     }

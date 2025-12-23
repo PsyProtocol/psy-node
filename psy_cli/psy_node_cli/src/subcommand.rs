@@ -50,6 +50,9 @@ pub enum Commands {
         #[arg(long = "coordinator-api-urls", value_parser, num_args = 1.., value_delimiter = ' ', help = "Coordinator Edge API URLs for the realm processor to connect to")]
         coordinator_api_urls: Vec<String>,
 
+        #[arg(long = "genesis-data-path", help = "Path to store genesis data")]
+        genesis_data_path: Option<String>,
+
         #[arg(long = "proving-backend", help = "The proving backend to use (plonky2-poseidon-goldilocks, jtmb-poseidon-goldilocks, jtmb-sha256-u64, etc.)")]
         proving_backend: Option<PsyChainProvingBackendTypeInput>,
     },
@@ -122,6 +125,9 @@ pub enum Commands {
 
         #[arg(long = "checkpoint-backup-path", help = "Path to store checkpoint backups")]
         checkpoint_backup_path: Option<String>,
+
+        #[arg(long = "genesis-data-path", help = "Path to store genesis data")]
+        genesis_data_path: Option<String>,
 
         #[arg(long = "proving-backend", help = "The proving backend to use (plonky2-poseidon-goldilocks, jtmb-poseidon-goldilocks, jtmb-sha256-u64, etc.)")]
         proving_backend: Option<PsyChainProvingBackendTypeInput>,

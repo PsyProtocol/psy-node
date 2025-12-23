@@ -20,7 +20,7 @@ use psy_plonky2_circuits::{
 pub async fn run_startup_plonky2_scylla_coordinator_processor_node(config: &CoordinatorProcessorStartConfig) -> anyhow::Result<()> {
     let resolver = PsyPlonky2NodeConfigResolver {};
     let circuit_fingerprint_config = resolver.get_circuit_fingerprint_config_for_network(config.network)?;
-    let genesis_data = resolver.get_genesis_block_setup_data_for_network(config.network)?;
+    let genesis_data = resolver.get_genesis_block_setup_data_for_network(config.network, config.genesis_data_path.clone())?;
 
     let pool = new_redis_async_pool(&config.redis_url, 2).await?;
 
@@ -273,7 +273,7 @@ pub async fn run_startup_plonky2_scylla_coordinator_processor_node(config: &Coor
 pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProcessorStartConfig) -> anyhow::Result<()> {
     let resolver = PsyPlonky2NodeConfigResolver {};
     let circuit_fingerprint_config = resolver.get_circuit_fingerprint_config_for_network(config.network)?;
-    let genesis_data = resolver.get_genesis_block_setup_data_for_network(config.network)?;
+    let genesis_data = resolver.get_genesis_block_setup_data_for_network(config.network, config.genesis_data_path.clone())?;
 
     let pool = new_redis_async_pool(&config.redis_url, 2).await?;
 

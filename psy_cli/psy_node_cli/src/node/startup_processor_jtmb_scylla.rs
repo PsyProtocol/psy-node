@@ -17,7 +17,7 @@ use psy_node_scylla::psy_setup::setup_psy_scylla_database_store_from_connection_
 pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_coordinator_processor_node(config: &CoordinatorProcessorStartConfig) -> anyhow::Result<()> {
     let resolver = PsyJTMBPoseidonGoldilocksNodeConfigResolver {};
     let circuit_fingerprint_config = resolver.get_circuit_fingerprint_config_for_network(config.network)?;
-    let genesis_data = resolver.get_genesis_block_setup_data_for_network(config.network)?;
+    let genesis_data = resolver.get_genesis_block_setup_data_for_network(config.network, config.genesis_data_path.clone())?;
 
     let pool = new_redis_async_pool(&config.redis_url, 2).await?;
 
@@ -100,7 +100,7 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_realm_processor_node(co
 
     let resolver = PsyJTMBPoseidonGoldilocksNodeConfigResolver {};
     let circuit_fingerprint_config = resolver.get_circuit_fingerprint_config_for_network(config.network)?;
-    let genesis_data = resolver.get_genesis_block_setup_data_for_network(config.network)?;
+    let genesis_data = resolver.get_genesis_block_setup_data_for_network(config.network, config.genesis_data_path.clone())?;
 
     let pool = new_redis_async_pool(&config.redis_url, 2).await?;
 

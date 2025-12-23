@@ -32,6 +32,7 @@ async fn main() -> anyhow::Result<()> {
             verbose,
             checkpoint_backup_path,
             coordinator_api_urls,
+            genesis_data_path,
             proving_backend,
         } => {
             let config = RealmProcessorCliConfig::get_start_config(
@@ -46,6 +47,7 @@ async fn main() -> anyhow::Result<()> {
                 verbose,
                 checkpoint_backup_path,
                 coordinator_api_urls,
+                genesis_data_path,
             )
             .await?;
             start_realm_processor::run(config, get_proving_backend_from_input(proving_backend)).await?;
@@ -91,6 +93,7 @@ async fn main() -> anyhow::Result<()> {
             network,
             verbose,
             checkpoint_backup_path,
+            genesis_data_path,
             proving_backend,
         } => {
             let config = CoordinatorProcessorCliConfig::get_start_config(
@@ -104,6 +107,7 @@ async fn main() -> anyhow::Result<()> {
                 network,
                 verbose,
                 checkpoint_backup_path,
+                genesis_data_path,
             )
             .await?;
             start_coordinator_processor::run(config, get_proving_backend_from_input(proving_backend)).await?;
