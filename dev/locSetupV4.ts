@@ -192,7 +192,7 @@ function realmEdgeProcessorStartedDetector(line: string): boolean { return line.
 
 async function buildProject(cwd?: string) {
     console.log("Building project...");
-    const proc = Bun.spawn(["cargo", "build", "--release"], { cwd, stdout: "inherit", stderr: "inherit" });
+    const proc = Bun.spawn(["cargo", "build", "--release", "--bin", "psy_node_cli", "--bin", "psy_worker_cli"], { cwd, stdout: "inherit", stderr: "inherit" });
     if (await proc.exited !== 0) throw new Error(`Build failed`);
 }
 
@@ -216,7 +216,6 @@ interface ProcessOptions {
     coordinatorOnly?: boolean;
     dbOnly?: boolean;
     workersOnly?: boolean;
-    all?: boolean;
 }
 
 class DevNetProcessManager {
@@ -255,8 +254,6 @@ class DevNetProcessManager {
         const disableWorkerEdgeLogs = !!options.disableWorkerEdgeLogs;
         // Determine what components to start
         const hasOnlyOptions = !!options.dbOnly || !!options.coordinatorOnly || !!options.realmOnly || !!options.workersOnly;
-        const isDefaultMode = !hasOnlyOptions && !options.all;
-        const isAllMode = !!options.all;
         const startAll = !hasOnlyOptions;
 
         const startCoordinatorProcessor = startAll || !!options.coordinatorOnly;
@@ -264,11 +261,9 @@ class DevNetProcessManager {
         const startRealmProcessor = startAll || !!options.realmOnly;
         const startRealmWorkers = (workerRealmCount > 0) || !!options.realmOnly || !!options.workersOnly;
 
-
-
-        const needsStartDb = isDefaultMode || isAllMode || !!options.dbOnly || startCoordinatorProcessor || startCoordinatorWorkers || startRealmProcessor || startRealmWorkers;
+        const needsStartDb = !hasOnlyOptions || !!options.dbOnly;
         const startRealmId = options.startRealmId || 0;
-        const endRealmId = options.endRealmId !== undefined ? options.endRealmId : (isDefaultMode ? 3 : startRealmId);
+        const endRealmId = options.endRealmId !== undefined ? options.endRealmId : (startAll ? 3 : startRealmId);
         const realmsCount = Math.max(0, endRealmId - startRealmId + 1);
 
         this.needsStartDb = needsStartDb;
@@ -286,16 +281,19 @@ class DevNetProcessManager {
 
         const backend = jtmb ? 'jtmb-poseidon-goldilocks' : 'plonky2-poseidon-goldilocks';
 
-        // 1. Build
-        await buildProject(cwd);
-
-        if (needsStartDb) {
-            console.log("[DevNet] Killing existing docker containers...");
-            await killDocker();
+        // 1. Build (skip if binaries exist)
+        const psyNodeCliPath = path.join(cwd || '.', 'target/release/psy_node_cli');
+        const psyWorkerCliPath = path.join(cwd || '.', 'target/release/psy_worker_cli');
+        if (!(await exists(psyNodeCliPath)) || !(await exists(psyWorkerCliPath))) {
+            await buildProject(cwd);
+        } else {
+            console.log("Binaries already exist, skipping build...");
         }
 
         // 2. Start Database
         if (this.needsStartDb) {
+            console.log("[DevNet] Killing existing docker containers...");
+            await killDocker();
             await this.track(await RunningProcess.spawnWithInitializationHint(
                 ['./dev/start_db.sh'], scyllaStartedDetector, { cwd, ...getLogPaths("scylla", false) }
             ));
@@ -366,7 +364,8 @@ class DevNetProcessManager {
             }
         }
 
-        if (startRealmProcessor || startRealmWorkers) {
+        if (startRealmProcessor) {
+            // 6. Realm Processor
             for (let i = 0; i < realmsCount; i++) {
                 const realmId = startRealmId + i;
                 const realmEdgeStartPort = 13380 + realmId * 10;
@@ -377,14 +376,34 @@ class DevNetProcessManager {
                     await new Promise(resolve => setTimeout(resolve, 500));
                 }
 
-                if (startRealmProcessor) {
-                    console.log(`[DevNet] Starting Realm Processor ${realmId}...`);
+                console.log(`[DevNet] Starting Realm Processor ${realmId}...`);
 
-                    // 6. Realm Processor
-                    await cleanCheckpoint('./local_checkpoints/realm_' + realmId + '_1', cwd);
+                await cleanCheckpoint('./local_checkpoints/realm_' + realmId + '_1', cwd);
+                await this.track(await RunningProcess.spawnWithInitializationHint(
+                    [
+                        nodeCli, 'start-realm-processor',
+                        '--realm-id', realmId.toString(),
+                        '--realm-sub-id', '1',
+                        '--network', this.NETWORK,
+                        '--db-namespace', 'realm_' + realmId,
+                        '--scylla-db-url', this.SCYLLA_URL,
+                        '--nats-jetstream-url', this.NATS_URL,
+                        '--redis-url', this.REDIS_URL,
+                        '--checkpoint-backup-path', './local_checkpoints',
+                        '--coordinator-api-urls', this.COORD_API_URL,
+                        '--proving-backend', backend,
+                        '--verbose'
+                    ],
+                    realmProcessorStartedDetector,
+                    { cwd, ...getLogPaths(`realm_${realmId}_processor`, false) }
+                ));
+
+                // 7. Realm Edges (Scalable)
+                for (let j = 0; j < workerEdgeCount; j++) {
+                    const port = realmEdgeStartPort + j;
                     await this.track(await RunningProcess.spawnWithInitializationHint(
                         [
-                            nodeCli, 'start-realm-processor',
+                            nodeCli, 'start-realm-edge',
                             '--realm-id', realmId.toString(),
                             '--realm-sub-id', '1',
                             '--network', this.NETWORK,
@@ -392,59 +411,47 @@ class DevNetProcessManager {
                             '--scylla-db-url', this.SCYLLA_URL,
                             '--nats-jetstream-url', this.NATS_URL,
                             '--redis-url', this.REDIS_URL,
-                            '--checkpoint-backup-path', './local_checkpoints',
-                            '--coordinator-api-urls', this.COORD_API_URL,
+                            '--port', port.toString(),
+                            '--listen', '0.0.0.0',
                             '--proving-backend', backend,
                             '--verbose'
                         ],
-                        realmProcessorStartedDetector,
-                        { cwd, ...getLogPaths(`realm_${realmId}_processor`, false) }
+                        realmEdgeProcessorStartedDetector,
+                        { cwd, ...getLogPaths(`realm_edge_${realmId}_${j}`, true) }
                     ));
+                }
+            }
+        }
 
-                    // 7. Realm Edges (Scalable)
-                    for (let j = 0; j < workerEdgeCount; j++) {
-                        const port = realmEdgeStartPort + j;
-                        await this.track(await RunningProcess.spawnWithInitializationHint(
-                            [
-                                nodeCli, 'start-realm-edge',
-                                '--realm-id', realmId.toString(),
-                                '--realm-sub-id', '1',
-                                '--network', this.NETWORK,
-                                '--db-namespace', 'realm_' + realmId,
-                                '--scylla-db-url', this.SCYLLA_URL,
-                                '--nats-jetstream-url', this.NATS_URL,
-                                '--redis-url', this.REDIS_URL,
-                                '--port', port.toString(),
-                                '--listen', '0.0.0.0',
-                                '--proving-backend', backend,
-                                '--verbose'
-                            ],
-                            realmEdgeProcessorStartedDetector,
-                            { cwd, ...getLogPaths(`realm_edge_${realmId}_${j}`, true) }
-                        ));
-                    }
+        if (startRealmWorkers) {
+            for (let i = 0; i < realmsCount; i++) {
+                const realmId = startRealmId + i;
+                const realmEdgeStartPort = 13380 + realmId * 10;
+
+                // Add a small delay between starting realms to prevent DB connection storms
+                if (i > 0) {
+                    console.log(`[DevNet] Waiting for 0.5 seconds before starting next realm workers...`);
+                    await new Promise(resolve => setTimeout(resolve, 500));
                 }
 
-                if (workerRealmCount > 0) {
-                    // 8. Realm Workers (Load Balanced)
-                    for (let k = 0; k < workerRealmCount; k++) {
-                        // Round robin selection of edge port
-                        const edgePort = realmEdgeStartPort + (k % workerEdgeCount);
-                        const realmUrl = `http://${this.host}:${edgePort}`;
+                // 8. Realm Workers (Load Balanced)
+                for (let k = 0; k < workerRealmCount; k++) {
+                    // Round robin selection of edge port
+                    const edgePort = realmEdgeStartPort + (k % workerEdgeCount);
+                    const realmUrl = `http://${this.host}:${edgePort}`;
 
-                        await this.track(await RunningProcess.spawnWithInitializationHint(
-                            [
-                                workerCli, 'worker',
-                                '--user', '0',
-                                '--network', this.NETWORK,
-                                '--proving-backend', backend,
-                                '--realm-api-url', realmUrl,
-                                '--private-key', FAKE_MINER_PRIVATE_KEY,
-                            ],
-                            workerStartedDetector,
-                            { cwd, ...getLogPaths(`realm_worker_${realmId}_${k}`, true) }
-                        ));
-                    }
+                    await this.track(await RunningProcess.spawnWithInitializationHint(
+                        [
+                            workerCli, 'worker',
+                            '--user', '0',
+                            '--network', this.NETWORK,
+                            '--proving-backend', backend,
+                            '--realm-api-url', realmUrl,
+                            '--private-key', FAKE_MINER_PRIVATE_KEY,
+                        ],
+                        workerStartedDetector,
+                        { cwd, ...getLogPaths(`realm_worker_${realmId}_${k}`, true) }
+                    ));
                 }
             }
         }
@@ -489,7 +496,7 @@ async function runMain() {
     const hasOnlyOptions = !!values["db-only"] || !!values["coordinator-only"] || !!values["realm-only"] || !!values["workers-only"];
     const workerRealmCount = values["realm-workers"] ? parseInt(values["realm-workers"], 10) : 0;
     const workerEdgeCount = parseInt(values["realm-edge-nodes"] || "1", 10);
-    const coordinatorWorkersCount = values["coordinator-workers"] ? parseInt(values["coordinator-workers"], 10) : 0;
+    const coordinatorWorkersCount = values["coordinator-workers"] ? parseInt(values["coordinator-workers"], 10) : (!hasOnlyOptions ? 1 : 0);
     const startRealmId = parseInt(values["start-realm-id"] || "0", 10);
     const endRealmId = values["end-realm-id"] ? parseInt(values["end-realm-id"], 10) : startRealmId;
     const host = values["host"] || "127.0.0.1";
@@ -497,7 +504,6 @@ async function runMain() {
     const coordinatorOnly = !!values["coordinator-only"];
     const dbOnly = !!values["db-only"];
     const workersOnly = !!values["workers-only"];
-    const all = !!values["all"];
     const help = !!values["help"];
 
     // Show help if requested
@@ -507,39 +513,42 @@ Psy Network DevNet Setup Tool
 
 Usage: bun run dev/locSetupV4.ts [options]
 
-Options:
-  --host <ip>                     Target host IP (default: 127.0.0.1)
-  --jtmb                          Use JTMB proving backend instead of Plonky2
-  --disable-worker-edge-logs      Disable logging for worker and edge processes
-  --realm-workers <count>         Number of workers per realm (default: 1 in full mode, 0 in only modes)
-  --realm-edge-nodes <count>      Number of edge nodes per realm (default: 1)
-  --coordinator-workers <count>   Number of coordinator workers (default: 1 in full mode, 0 in only modes)
-  --start-realm-id <id>           Starting realm ID (default: 0)
-  --end-realm-id <id>             Ending realm ID (inclusive)
-  --realm-only                    Start only realms (requires database and coordinator to be running)
-  --coordinator-only              Start only coordinator (requires database to be running)
-  --db-only                       Start only database services
-  --workers-only                  Start only workers (requires database to be running)
-  --help, -h                      Show this help message
+ Options:
+   --host <ip>                     Target host IP (default: 127.0.0.1)
+   --jtmb                          Use JTMB proving backend instead of Plonky2
+   --disable-worker-edge-logs      Disable logging for worker and edge processes
+   --realm-workers <count>         Number of workers per realm (default: 1 when starting realms, 0 in only modes)
+   --realm-edge-nodes <count>      Number of edge nodes per realm (default: 1)
+   --coordinator-workers <count>   Number of coordinator workers (default: 1 when starting coordinator, 0 in only modes)
+   --start-realm-id <id>           Starting realm ID (default: 0)
+   --end-realm-id <id>             Ending realm ID (inclusive, default: 127 when starting full system)
+   --realm-only                    Start only realms (requires database and coordinator to be running)
+   --coordinator-only              Start only coordinator (requires database to be running)
+   --db-only                       Start only database services
+   --workers-only                  Start only workers (requires database to be running)
+   --help, -h                      Show this help message
 
 Examples:
-  # Start full system (recommended)
-  bun run dev/locSetupV4.ts --end-realm-id 3  # realms 0,1,2,3
+   # Start full system (default when no options specified)
+   bun run dev/locSetupV4.ts  # starts all components with realms 0-127
 
-  # Start with workers
-  bun run dev/locSetupV4.ts --coordinator-workers 2 --realm-workers 1  # coordinator + realms with workers
+   # Start full system with specific realm range
+   bun run dev/locSetupV4.ts --end-realm-id 3  # realms 0,1,2,3
 
-  # Start components separately
-  bun run dev/locSetupV4.ts --db-only
-  bun run dev/locSetupV4.ts --coordinator-only
-  bun run dev/locSetupV4.ts --coordinator-only --realm-only  # coordinator + realms
-  bun run dev/locSetupV4.ts --workers-only --coordinator-workers 3 --realm-workers 2  # only workers
+   # Start with workers
+   bun run dev/locSetupV4.ts --coordinator-workers 2 --realm-workers 1  # coordinator + realms with workers
+
+   # Start components separately
+   bun run dev/locSetupV4.ts --db-only
+   bun run dev/locSetupV4.ts --coordinator-only
+   bun run dev/locSetupV4.ts --coordinator-only --realm-only  # coordinator + realms
+   bun run dev/locSetupV4.ts --workers-only --coordinator-workers 3 --realm-workers 2  # only workers
 
 Notes:
-  - Database services are automatically started when needed
-  - Only modes can be combined (e.g., --coordinator-only --realm-only)
-  - Workers are started when --*-workers options are specified
-  - Default mode starts all components with default worker counts
+   - Database services are automatically started in full system mode or when --db-only is specified
+   - Only modes can be combined (e.g., --coordinator-only --realm-only)
+   - Workers are started when --*-workers options are specified
+   - No options specified starts the full system (all components)
         `);
         process.exit(0);
     }
@@ -567,7 +576,6 @@ Notes:
             coordinatorOnly,
             dbOnly,
             workersOnly,
-            all,
         });
         console.log('DevNet started. Press Ctrl+C to stop.');
         setInterval(() => { }, 1000 * 60);

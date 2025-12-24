@@ -2,7 +2,7 @@ PROVING_BACKEND := plonky2-poseidon-goldilocks
 BIN_PREFIX      := ./target/release/
 # PROVING_BACKEND := jtmb-poseidon-goldilocks
 
-.PHONY: all build clean test deploy-contracts register-users query-chain-info run-all restart shutdown clean-db init-db run-coordinator-processor run-coordinator-edge run-realm-0-processor run-realm-0-edge run-realm-1-processor run-realm-1-edge run-realm-2-processor run-realm-2-edge run-realm-3-processor run-realm-3-edge run-worker-coordinator run-worker-realm-0 run-worker-realm-1 run-worker-realm-2 run-worker-realm-3 run-dummy-prover-realm0-user0 run-dummy-prover-realm0-user1024 run-dummy-prover-realm0-user2048 run-dummy-prover-realm1-user524288 run-dummy-prover-realm1-user525312 run-dummy-prover-realm1-user526336 run-dummy-prover-realm2-user262144 run-dummy-prover-realm2-user263168 run-dummy-prover-realm2-user264192 run-dummy-prover-realm3-user786432 run-dummy-prover-realm3-user787456 run-dummy-prover-realm3-user788480 run-dummy-provers
+.PHONY: all build clean test deploy-contracts register-users query-chain-info run-all restart shutdown clean-db init-db run-coordinator-processor run-coordinator-edge run-realm-0-processor run-realm-0-edge run-realm-1-processor run-realm-1-edge run-realm-2-processor run-realm-2-edge run-realm-3-processor run-realm-3-edge run-worker-coordinator run-worker-realm-0 run-worker-realm-1 run-worker-realm-2 run-worker-realm-3
 
 all: build
 
@@ -84,43 +84,6 @@ run-worker-realm-2:
 run-worker-realm-3:
 	RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/psy_worker_cli worker --user 0 --network local-devnet --proving-backend ${PROVING_BACKEND} --config ./psy_cli/example_node_configs/worker_realm_3.yml
 
-run-dummy-prover-realm0-user0:
-	RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/psy_worker_cli dummy-end-cap-prover --proving-backend ${PROVING_BACKEND} --coordinator-url http://127.0.0.1:1337 --url http://127.0.0.1:1338 --user 0 --min-state-updates 1 --max-state-updates 2 --max-contract-calls 1
-
-run-dummy-prover-realm0-user1024:
-	RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/psy_worker_cli dummy-end-cap-prover --proving-backend ${PROVING_BACKEND} --coordinator-url http://127.0.0.1:1337 --url http://127.0.0.1:1338 --user 1024 --min-state-updates 1 --max-state-updates 2 --max-contract-calls 1
-
-run-dummy-prover-realm0-user2048:
-	RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/psy_worker_cli dummy-end-cap-prover --proving-backend ${PROVING_BACKEND} --coordinator-url http://127.0.0.1:1337 --url http://127.0.0.1:1338 --user 2048 --min-state-updates 1 --max-state-updates 2 --max-contract-calls 1
-
-run-dummy-prover-realm1-user524288:
-	RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/psy_worker_cli dummy-end-cap-prover --proving-backend ${PROVING_BACKEND} --coordinator-url http://127.0.0.1:1337 --url http://127.0.0.1:1339 --user 524288 --min-state-updates 1 --max-state-updates 2 --max-contract-calls 1
-
-run-dummy-prover-realm1-user525312:
-	RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/psy_worker_cli dummy-end-cap-prover --proving-backend ${PROVING_BACKEND} --coordinator-url http://127.0.0.1:1337 --url http://127.0.0.1:1339 --user 525312 --min-state-updates 1 --max-state-updates 2 --max-contract-calls 1
-
-run-dummy-prover-realm1-user526336:
-	RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/psy_worker_cli dummy-end-cap-prover --proving-backend ${PROVING_BACKEND} --coordinator-url http://127.0.0.1:1337 --url http://127.0.0.1:1339 --user 526336 --min-state-updates 1 --max-state-updates 2 --max-contract-calls 1
-
-run-dummy-prover-realm2-user262144:
-	RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/psy_worker_cli dummy-end-cap-prover --proving-backend ${PROVING_BACKEND} --coordinator-url http://127.0.0.1:1337 --url http://127.0.0.1:1340 --user 262144 --min-state-updates 1 --max-state-updates 2 --max-contract-calls 1
-
-run-dummy-prover-realm2-user263168:
-	RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/psy_worker_cli dummy-end-cap-prover --proving-backend ${PROVING_BACKEND} --coordinator-url http://127.0.0.1:1337 --url http://127.0.0.1:1340 --user 263168 --min-state-updates 1 --max-state-updates 2 --max-contract-calls 1
-
-run-dummy-prover-realm2-user264192:
-	RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/psy_worker_cli dummy-end-cap-prover --proving-backend ${PROVING_BACKEND} --coordinator-url http://127.0.0.1:1337 --url http://127.0.0.1:1340 --user 264192 --min-state-updates 1 --max-state-updates 2 --max-contract-calls 1
-
-run-dummy-prover-realm3-user786432:
-	RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/psy_worker_cli dummy-end-cap-prover --proving-backend ${PROVING_BACKEND} --coordinator-url http://127.0.0.1:1337 --url http://127.0.0.1:1341 --user 786432 --min-state-updates 1 --max-state-updates 2 --max-contract-calls 1
-
-run-dummy-prover-realm3-user787456:
-	RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/psy_worker_cli dummy-end-cap-prover --proving-backend ${PROVING_BACKEND} --coordinator-url http://127.0.0.1:1337 --url http://127.0.0.1:1341 --user 787456 --min-state-updates 1 --max-state-updates 2 --max-contract-calls 1
-
-run-dummy-prover-realm3-user788480:
-	RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/psy_worker_cli dummy-end-cap-prover --proving-backend ${PROVING_BACKEND} --coordinator-url http://127.0.0.1:1337 --url http://127.0.0.1:1341 --user 788480 --min-state-updates 1 --max-state-updates 2 --max-contract-calls 1
-
-run-dummy-provers: run-dummy-prover-realm0-user0 run-dummy-prover-realm0-user1024 run-dummy-prover-realm0-user2048 run-dummy-prover-realm1-user524288 run-dummy-prover-realm1-user525312 run-dummy-prover-realm1-user526336 run-dummy-prover-realm2-user262144 run-dummy-prover-realm2-user263168 run-dummy-prover-realm2-user264192 run-dummy-prover-realm3-user786432 run-dummy-prover-realm3-user787456 run-dummy-prover-realm3-user788480
 
 shutdown:
 	-ps aux | grep "[p]sy_node_cli" | awk '{print $$2}' | xargs kill -KILL 2>/dev/null || true
