@@ -434,10 +434,10 @@ class DevNetProcessManager {
 
                 workerArgs.push('--private-key', FAKE_MINER_PRIVATE_KEY);
 
-                await this.track(await RunningProcess.spawnWithInitializationHint(
+                await this.track(await RunningProcess.spawnWithInitializationHintWithRetry(
                     workerArgs,
                     workerStartedDetector,
-                    { cwd, ...getLogPaths(`coordinator_worker_${i}`, true) }
+                    { cwd, ...getLogPaths(`coordinator_worker_${i}`, true), maxRetries: 3, retryDelayMs: 2000 }
                 ));
             }
         }
@@ -549,10 +549,10 @@ class DevNetProcessManager {
 
                 workerArgs.push('--private-key', FAKE_MINER_PRIVATE_KEY);
 
-                const workerPromise = RunningProcess.spawnWithInitializationHint(
+                const workerPromise = RunningProcess.spawnWithInitializationHintWithRetry(
                     workerArgs,
                     workerStartedDetector,
-                    { cwd, ...getLogPaths(`worker_${workerId}`, true) }
+                    { cwd, ...getLogPaths(`worker_${workerId}`, true), maxRetries: 3, retryDelayMs: 2000 }
                 ).then(proc => this.track(proc));
                 workerPromises.push(workerPromise);
             }
@@ -569,7 +569,7 @@ class DevNetProcessManager {
 
             const dummyPromises: Promise<RunningProcess>[] = [];
             for (let i = 0; i < dummyProversCount; i++) {
-                const dummyPromise = RunningProcess.spawnWithInitializationHint(
+                const dummyPromise = RunningProcess.spawnWithInitializationHintWithRetry(
                     [
                         './dev/dummy_prover.sh', 'prove_random',
                         '-p', backend,
@@ -578,7 +578,7 @@ class DevNetProcessManager {
                         '--end-realm-id', endRealmId.toString()
                     ],
                     dummyProverStartedDetector,
-                    { cwd, ...getLogPaths(`dummy_prover_${i}`, true) }
+                    { cwd, ...getLogPaths(`dummy_prover_${i}`, true), maxRetries: 3, retryDelayMs: 2000 }
                 ).then(proc => this.track(proc));
                 dummyPromises.push(dummyPromise);
             }

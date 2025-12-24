@@ -4,7 +4,7 @@ use parth_core::{crypto::hash::traits::{FieldQHasher, MerkleZeroHasher}, data::h
 use plonky2::{hash::hash_types::HashOut, plonk::config::{AlgebraicHasher, GenericConfig}};
 use psy_core::{constants::{chain_id::PsyChainNetworkType, url_rotation::PsyAPIURLRotationStrategy}, job::job_id::QProvingJobDataID};
 use psy_plonky2_basic_helpers::verifier::simple_circuit_library::SimpleCircuitLibrary;
-use psy_worker_core::{api::{basic_job_fetcher::PsyWorkerBasicAPIJobFetcher}, config::worker_config::WorkerStartupConfig, worker::manager::PsyProofMinerWorkerManager};
+use psy_worker_core::{api::basic_job_fetcher::PsyWorkerBasicAPIJobFetcher, config::worker_config::WorkerStartupConfig, worker::manager::PsyProofMinerWorkerManager};
 
 use crate::{circuit_library::get_plonky2_circuit_library_and_prover_for_network, coordinator::coordinator_helper::QEDCoordinatorCircuitManager};
 
@@ -26,7 +26,7 @@ where     C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + Fi
         signer,
         public_key,
         config.miner_user_id,
-        PsyAPIURLRotationStrategy::Random,
+        PsyAPIURLRotationStrategy::ContinueUntilFailure,
     );
 
     job_fetcher.coordinator_api_url_manager.add_api_urls::<QHashOut<C::F>, QProvingJobDataID>(&config.coordinator_api_urls).await?;
