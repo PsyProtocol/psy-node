@@ -453,39 +453,48 @@ class DevNetProcessManager {
         }
 
         if (startRealmWorkers) {
-            console.log(`[DevNet] Starting realm workers for ${realmsCount} realms...`);
+            const realmsPerWorker = Math.ceil(realmsCount / workerRealmCount);
+            console.log(`[DevNet] Starting ${workerRealmCount} workers, ${realmsPerWorker} per each realm (${realmsCount} total realms)...`);
 
-            // Start all realm workers in parallel
             const workerPromises: Promise<RunningProcess>[] = [];
-            for (let i = 0; i < realmsCount; i++) {
-                const realmId = startRealmId + i;
-                const realmEdgeStartPort = 13380 + realmId * 10;
 
-                // 8. Realm Workers (Load Balanced)
-                for (let k = 0; k < workerRealmCount; k++) {
-                    // Round robin selection of edge port
-                    const edgePort = realmEdgeStartPort + (k % realmEdgeCount);
+            for (let workerId = 0; workerId < workerRealmCount; workerId++) {
+                const startRealmForWorker = workerId * realmsPerWorker;
+                const endRealmForWorker = Math.min((workerId + 1) * realmsPerWorker, realmsCount);
+
+                const realmUrls: string[] = [];
+                for (let realmIndex = startRealmForWorker; realmIndex < endRealmForWorker; realmIndex++) {
+                    const realmId = startRealmId + realmIndex;
+                    const realmEdgeStartPort = 13380 + realmId * 10;
+                    const edgePort = realmEdgeStartPort + workerId % realmEdgeCount;
                     const realmUrl = `http://${this.host}:${edgePort}`;
-
-                    const workerPromise = RunningProcess.spawnWithInitializationHint(
-                        [
-                            workerCli, 'worker',
-                            '--user', '0',
-                            '--network', this.NETWORK,
-                            '--proving-backend', backend,
-                            '--realm-api-url', realmUrl,
-                            '--private-key', FAKE_MINER_PRIVATE_KEY,
-                        ],
-                        workerStartedDetector,
-                        { cwd, ...getLogPaths(`realm_worker_${realmId}_${k}`, true) }
-                    ).then(proc => this.track(proc));
-                    workerPromises.push(workerPromise);
+                    realmUrls.push(realmUrl);
                 }
+
+                const workerArgs = [
+                    workerCli, 'worker',
+                    '--user', `${workerId}`,
+                    '--network', this.NETWORK,
+                    '--proving-backend', backend,
+                ];
+
+                for (const realmUrl of realmUrls) {
+                    workerArgs.push('--realm-api-url', realmUrl);
+                }
+
+                workerArgs.push('--private-key', FAKE_MINER_PRIVATE_KEY);
+
+                const workerPromise = RunningProcess.spawnWithInitializationHint(
+                    workerArgs,
+                    workerStartedDetector,
+                    { cwd, ...getLogPaths(`worker_${workerId}`, true) }
+                ).then(proc => this.track(proc));
+                workerPromises.push(workerPromise);
             }
 
             // Wait for all worker processes to start
             await Promise.all(workerPromises);
-            console.log(`[DevNet] All realm workers started`);
+            console.log(`[DevNet] All ${workerRealmCount} shared workers started (${workerPromises.length} connections total)`);
         }
     }
 
@@ -551,7 +560,7 @@ Usage: bun run dev/locSetupV4.ts [options]
    --host <ip>                     Target host IP (default: 127.0.0.1)
    --jtmb                          Use JTMB proving backend instead of Plonky2
    --disable-worker-edge-logs      Disable logging for worker and edge processes
-   --realm-workers <count>         Number of workers per realm (default: 1 when starting realms, 0 in only modes)
+   --realm-workers <count>         Number of shared workers distributed across all realms (default: 1 when starting full system)
    --realm-edge-nodes <count>      Number of edge nodes per realm (default: 1)
    --coordinator-edge-nodes <count> Number of edge nodes for coordinator (default: 1)
    --coordinator-workers <count>   Number of coordinator workers (default: 1 when starting coordinator, 0 in only modes)
