@@ -45,6 +45,8 @@ Global options:
 
 'prove_random' options:
   -p, --proving-backend <backend>    The proving backend to use. (Required)
+  --start-realm-id <id>             Starting realm ID for random user selection (default: 0)
+  --end-realm-id <id>               Ending realm ID for random user selection (default: 3)
 
 Available Proving Backends:
   - plonky2-poseidon-goldilocks
@@ -61,7 +63,8 @@ Example for 'prove_many':
 
 Example for 'prove_random':
   $0 prove_random -p jtmb-poseidon-goldilocks
-  $0 -H 192.168.1.100 prove_random -p jtmb-poseidon-goldilocks
+  $0 prove_random -p jtmb-poseidon-goldilocks --start-realm-id 1 --end-realm-id 2
+  $0 -H 192.168.1.100 prove_random -p jtmb-poseidon-goldilocks --start-realm-id 0 --end-realm-id 3
 EOF
   exit 1
 }
@@ -284,6 +287,8 @@ case "$SUBCOMMAND" in
   prove_random)
     # --- Handle 'prove_random' subcommand ---
     PROVING_BACKEND=""
+    START_REALM_ID="0"
+    END_REALM_ID="3"
 
     # Parse arguments for 'prove_random'
     while [[ $# -gt 0 ]]; do
@@ -296,6 +301,14 @@ case "$SUBCOMMAND" in
           ;;
         -p|--proving-backend)
           PROVING_BACKEND="$2"
+          shift 2
+          ;;
+        --start-realm-id)
+          START_REALM_ID="$2"
+          shift 2
+          ;;
+        --end-realm-id)
+          END_REALM_ID="$2"
           shift 2
           ;;
         *)
@@ -312,10 +325,17 @@ case "$SUBCOMMAND" in
     fi
     validate_backend "$PROVING_BACKEND"
 
-    # Generate random user ID between 0 and 4194303 (2^22 - 1)
-    RANDOM_USER_ID=$((RANDOM * 32768 + RANDOM))
-    RANDOM_USER_ID=$((RANDOM_USER_ID % 4194304))
+    # Calculate user ID range based on realm IDs
+    START_USER_ID=$((START_REALM_ID * REALM_ID_DIVISOR))
+    END_USER_ID=$(((END_REALM_ID + 1) * REALM_ID_DIVISOR))
+    USER_ID_RANGE=$((END_USER_ID - START_USER_ID))
 
+    # Generate random user ID within the realm range
+    RANDOM_OFFSET=$((RANDOM * 32768 + RANDOM))
+    RANDOM_OFFSET=$((RANDOM_OFFSET % USER_ID_RANGE))
+    RANDOM_USER_ID=$((START_USER_ID + RANDOM_OFFSET))
+
+    echo "Realm range: ${START_REALM_ID}-${END_REALM_ID}, User ID range: ${START_USER_ID}-${END_USER_ID}"
     echo "Generated random user ID: ${RANDOM_USER_ID}"
 
     # Execute continuous random prover - each iteration picks a new random user

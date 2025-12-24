@@ -456,7 +456,7 @@ class DevNetProcessManager {
 
         if (startRealmWorkers) {
             const realmsPerWorker = Math.ceil(realmsCount / workerRealmCount);
-            console.log(`[DevNet] Starting ${workerRealmCount} workers, ${realmsPerWorker} per each realm (${realmsCount} total realms)...`);
+            console.log(`[DevNet] Starting ${workerRealmCount} workers, ${realmsPerWorker} realms per each worker (${realmsCount} total realms)...`);
 
             const workerPromises: Promise<RunningProcess>[] = [];
 
@@ -502,7 +502,7 @@ class DevNetProcessManager {
         // 8. Dummy Provers (if requested)
         const dummyProversCount = options.dummyProversCount || 0;
         if (dummyProversCount > 0) {
-            console.log(`[DevNet] Starting ${dummyProversCount} dummy provers...`);
+            console.log(`[DevNet] Starting ${dummyProversCount} dummy provers (realms ${startRealmId}-${endRealmId})...`);
 
             const dummyPromises: Promise<RunningProcess>[] = [];
             for (let i = 0; i < dummyProversCount; i++) {
@@ -510,7 +510,9 @@ class DevNetProcessManager {
                     [
                         './dev/dummy_prover.sh', 'prove_random',
                         '-p', backend,
-                        '-H', this.host
+                        '-H', this.host,
+                        '--start-realm-id', startRealmId.toString(),
+                        '--end-realm-id', endRealmId.toString()
                     ],
                     dummyProverStartedDetector,
                     { cwd, ...getLogPaths(`dummy_prover_${i}`, true) }
@@ -598,7 +600,7 @@ Usage: bun run dev/locSetupV4.ts [options]
    --coordinator-only              Start only coordinator (requires database to be running)
    --db-only                       Start only database services
    --workers-only                  Start only workers (requires database to be running)
-   --dummy-provers-only <count>    Start only dummy provers (requires database, coordinator, and realms to be running)
+   --dummy-provers-only <count>    Start only dummy provers within the specified realm range (requires database, coordinator, and realms to be running)
    --help, -h                      Show this help message
 
 Examples:
@@ -616,7 +618,7 @@ Examples:
    bun run dev/locSetupV4.ts --coordinator-only
    bun run dev/locSetupV4.ts --coordinator-only --realm-only  # coordinator + realms
    bun run dev/locSetupV4.ts --workers-only --coordinator-workers 3 --realm-workers 2  # only workers
-   bun run dev/locSetupV4.ts --dummy-provers-only 4  # start 4 dummy provers
+   bun run dev/locSetupV4.ts --dummy-provers-only 4 --start-realm-id 1 --end-realm-id 2  # start 4 dummy provers in realms 1-2
 
 Notes:
    - Database services are automatically started in full system mode or when --db-only is specified

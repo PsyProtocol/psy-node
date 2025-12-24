@@ -17,6 +17,7 @@ Thumbs.db
 
 local_checkpoints/
 logs/
+db/
 
 index.scip
 
