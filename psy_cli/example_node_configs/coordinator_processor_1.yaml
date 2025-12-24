@@ -9,3 +9,4 @@ nats_jetstream_url: nats://127.0.0.1:4222
 redis_url: redis://127.0.0.1:6379
 
 checkpoint_backup_path: ./local_checkpoints
+genesis_data_path: ./genesis.json
