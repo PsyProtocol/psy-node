@@ -509,6 +509,8 @@ class DevNetProcessManager {
 
                 // Wait for all realm processes to start
                 await Promise.all(realmPromises);
+                console.log(`[DevNet] Waiting 2 seconds before starting next batch...`);
+                await new Promise(resolve => setTimeout(resolve, 2000));
             }
             console.log(`[DevNet] All realm processors and edges started`);
         }

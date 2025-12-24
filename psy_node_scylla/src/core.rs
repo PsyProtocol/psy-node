@@ -24,7 +24,7 @@ pub struct ScyllaCoreStore<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> {
 impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hasher> {
     pub async fn new(realm_id: u64, realm_sub_id: u64, keyspace: String, known_nodes: &[String]) -> anyhow::Result<Self> {
         let mut execution_profile = ExecutionProfile::builder()
-            .request_timeout(Some(Duration::from_secs(120)));
+            .request_timeout(Some(Duration::from_secs(300)));
         if known_nodes.len() == 1 {
                 execution_profile = execution_profile.consistency(scylla::statement::Consistency::One)
         };
@@ -35,7 +35,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
             .connection_timeout(Duration::from_secs(120))
             .keepalive_timeout(Duration::from_secs(60))
             .keepalive_interval(Duration::from_secs(30))
-            .pool_size(PoolSize::PerHost(NonZeroUsize::new(2).unwrap()))
+            .pool_size(PoolSize::PerHost(NonZeroUsize::new(1).unwrap()))
             .build()
             .await?;
         let session = Arc::new(session);
