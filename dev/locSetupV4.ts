@@ -259,7 +259,7 @@ class DevNetProcessManager {
         const startAll = !hasOnlyOptions;
 
         const startCoordinatorProcessor = startAll || !!options.coordinatorOnly;
-        const startCoordinatorWorkers = (coordinatorWorkersCount > 0) || !!options.coordinatorOnly || !!options.workersOnly;
+        const startCoordinatorWorkers = (coordinatorWorkersCount > 0) || !!options.workersOnly;
         const startRealmProcessor = startAll || !!options.realmOnly;
         const startRealmWorkers = (workerRealmCount > 0) || !!options.workersOnly;
 
@@ -336,7 +336,7 @@ class DevNetProcessManager {
             const coordEdgePromises: Promise<RunningProcess>[] = [];
             for (let j = 0; j < coordinatorEdgeCount; j++) {
                 const port = 1337 + j;
-                const edgePromise = RunningProcess.spawn(
+                const edgePromise = RunningProcess.spawnWithInitializationHint(
                     [
                         nodeCli, 'start-coordinator-edge',
                         '--coordinator-id', '0',
@@ -351,6 +351,7 @@ class DevNetProcessManager {
                         '--proving-backend', backend,
                         '--verbose'
                     ],
+                    coordinatorEdgeProcessorStartedDetector,
                     { cwd, ...getLogPaths(`coordinator_edge_${j}`, true) }
                 ).then(proc => this.track(proc));
                 coordEdgePromises.push(edgePromise);
@@ -391,37 +392,18 @@ class DevNetProcessManager {
             }
 
             // Start all realm processors and edges in parallel
-            const realmPromises: Promise<RunningProcess>[] = [];
-            for (let i = 0; i < realmsCount; i++) {
-                const realmId = startRealmId + i;
-                const realmEdgeStartPort = 13380 + realmId * 10;
+            const numBatches = Math.floor(realmsCount / 4);
+            for (let b = 0; b < numBatches; b++) {
+                const realmPromises: Promise<RunningProcess>[] = [];
 
-                // Start realm processor
-                const processorPromise = RunningProcess.spawn(
-                    [
-                        nodeCli, 'start-realm-processor',
-                        '--realm-id', realmId.toString(),
-                        '--realm-sub-id', '1',
-                        '--network', this.NETWORK,
-                        '--db-namespace', 'realm_' + realmId,
-                        '--scylla-db-url', this.SCYLLA_URL,
-                        '--nats-jetstream-url', this.NATS_URL,
-                        '--redis-url', this.REDIS_URL,
-                        '--checkpoint-backup-path', './local_checkpoints',
-                        '--coordinator-api-urls', this.COORD_API_URL,
-                        '--proving-backend', backend,
-                        '--verbose'
-                    ],
-                    { cwd, ...getLogPaths(`realm_${realmId}_processor`, false) }
-                ).then(proc => this.track(proc));
-                realmPromises.push(processorPromise);
+                for (let i = 0; i < 4; i++) {
+                    const realmId = startRealmId + 4 * b + i;
+                    const realmEdgeStartPort = 13380 + realmId * 10;
 
-                // Start realm edges
-                for (let j = 0; j < realmEdgeCount; j++) {
-                    const port = realmEdgeStartPort + j;
-                    const edgePromise = RunningProcess.spawn(
+                    // Start realm processor
+                    const processorPromise = RunningProcess.spawnWithInitializationHint(
                         [
-                            nodeCli, 'start-realm-edge',
+                            nodeCli, 'start-realm-processor',
                             '--realm-id', realmId.toString(),
                             '--realm-sub-id', '1',
                             '--network', this.NETWORK,
@@ -429,19 +411,44 @@ class DevNetProcessManager {
                             '--scylla-db-url', this.SCYLLA_URL,
                             '--nats-jetstream-url', this.NATS_URL,
                             '--redis-url', this.REDIS_URL,
-                            '--port', port.toString(),
-                            '--listen', '0.0.0.0',
+                            '--checkpoint-backup-path', './local_checkpoints',
+                            '--coordinator-api-urls', this.COORD_API_URL,
                             '--proving-backend', backend,
                             '--verbose'
                         ],
-                        { cwd, ...getLogPaths(`realm_edge_${realmId}_${j}`, true) }
+                        realmProcessorStartedDetector,
+                        { cwd, ...getLogPaths(`realm_${realmId}_processor`, false) }
                     ).then(proc => this.track(proc));
-                    realmPromises.push(edgePromise);
-                }
-            }
+                    realmPromises.push(processorPromise);
 
-            // Wait for all realm processes to start
-            await Promise.all(realmPromises);
+                    // Start realm edges
+                    for (let j = 0; j < realmEdgeCount; j++) {
+                        const port = realmEdgeStartPort + j;
+                        const edgePromise = RunningProcess.spawnWithInitializationHint(
+                            [
+                                nodeCli, 'start-realm-edge',
+                                '--realm-id', realmId.toString(),
+                                '--realm-sub-id', '1',
+                                '--network', this.NETWORK,
+                                '--db-namespace', 'realm_' + realmId,
+                                '--scylla-db-url', this.SCYLLA_URL,
+                                '--nats-jetstream-url', this.NATS_URL,
+                                '--redis-url', this.REDIS_URL,
+                                '--port', port.toString(),
+                                '--listen', '0.0.0.0',
+                                '--proving-backend', backend,
+                                '--verbose'
+                            ],
+                            realmEdgeProcessorStartedDetector,
+                            { cwd, ...getLogPaths(`realm_edge_${realmId}_${j}`, true) }
+                        ).then(proc => this.track(proc));
+                        realmPromises.push(edgePromise);
+                    }
+                }
+
+                // Wait for all realm processes to start
+                await Promise.all(realmPromises);
+            }
             console.log(`[DevNet] All realm processors and edges started`);
         }
 
@@ -460,7 +467,7 @@ class DevNetProcessManager {
                     const edgePort = realmEdgeStartPort + (k % realmEdgeCount);
                     const realmUrl = `http://${this.host}:${edgePort}`;
 
-                    const workerPromise = RunningProcess.spawn(
+                    const workerPromise = RunningProcess.spawnWithInitializationHint(
                         [
                             workerCli, 'worker',
                             '--user', '0',
@@ -469,6 +476,7 @@ class DevNetProcessManager {
                             '--realm-api-url', realmUrl,
                             '--private-key', FAKE_MINER_PRIVATE_KEY,
                         ],
+                        workerStartedDetector,
                         { cwd, ...getLogPaths(`realm_worker_${realmId}_${k}`, true) }
                     ).then(proc => this.track(proc));
                     workerPromises.push(workerPromise);

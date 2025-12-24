@@ -93,7 +93,7 @@ clean-db:
 	docker rm -f scylla-server || true
 	docker rm -f nats-server || true
 	docker rm -f valkey-server || true
-	rm -fr local_checkpoints logs || true
+	sudo rm -fr local_checkpoints logs db || true
 
 config_gen_v2:
 	cargo run --release --package psy_plonky2_circuits --example config_gen_v2
