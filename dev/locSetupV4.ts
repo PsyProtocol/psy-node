@@ -207,7 +207,8 @@ interface ProcessOptions {
     cwd?: string;
     jtmb?: boolean;
     workerRealmCount: number;
-    workerEdgeCount: number;
+    realmEdgeCount: number;
+    coordinatorEdgeCount: number;
     coordinatorWorkersCount: number;
     disableWorkerEdgeLogs?: boolean;
     startRealmId?: number;
@@ -247,7 +248,8 @@ class DevNetProcessManager {
         const cwd = options?.cwd || ".";
         const jtmb = !!options?.jtmb;
         const workerRealmCount = options.workerRealmCount;
-        const workerEdgeCount = options.workerEdgeCount;
+        const realmEdgeCount = options.realmEdgeCount;
+        const coordinatorEdgeCount = options.coordinatorEdgeCount;
         const coordinatorWorkersCount = options.coordinatorWorkersCount;
 
 
@@ -325,37 +327,44 @@ class DevNetProcessManager {
                 { cwd, ...getLogPaths("coordinator_processor", false) }
             ));
 
-            // 4. Coordinator Edge
-            await this.track(await RunningProcess.spawnWithInitializationHint(
-                [
-                    nodeCli, 'start-coordinator-edge',
-                    '--coordinator-id', '0',
-                    '--coordinator-sub-id', '0',
-                    '--network', this.NETWORK,
-                    '--db-namespace', 'coordinator',
-                    '--scylla-db-url', this.SCYLLA_URL,
-                    '--nats-jetstream-url', this.NATS_URL,
-                    '--redis-url', this.REDIS_URL,
-                    '--port', '1337',
-                    '--listen', '0.0.0.0',
-                    '--proving-backend', backend,
-                    '--verbose'
-                ],
-                coordinatorEdgeProcessorStartedDetector,
-                { cwd, ...getLogPaths("coordinator_edge_0", true) }
-            ));
+            // 4. Coordinator Edges (Scalable)
+            for (let j = 0; j < coordinatorEdgeCount; j++) {
+                const port = 1337 + j;
+                await this.track(await RunningProcess.spawnWithInitializationHint(
+                    [
+                        nodeCli, 'start-coordinator-edge',
+                        '--coordinator-id', '0',
+                        '--coordinator-sub-id', j.toString(),
+                        '--network', this.NETWORK,
+                        '--db-namespace', 'coordinator',
+                        '--scylla-db-url', this.SCYLLA_URL,
+                        '--nats-jetstream-url', this.NATS_URL,
+                        '--redis-url', this.REDIS_URL,
+                        '--port', port.toString(),
+                        '--listen', '0.0.0.0',
+                        '--proving-backend', backend,
+                        '--verbose'
+                    ],
+                    coordinatorEdgeProcessorStartedDetector,
+                    { cwd, ...getLogPaths(`coordinator_edge_${j}`, true) }
+                ));
+            }
         }
 
         // 5. Coordinator Workers
         if (startCoordinatorWorkers && coordinatorWorkersCount > 0) {
             for (let i = 0; i < coordinatorWorkersCount; i++) {
+                // Round robin selection of coordinator edge port
+                const coordEdgePort = 1337 + (i % coordinatorEdgeCount);
+                const coordUrl = `http://${this.host}:${coordEdgePort}`;
+
                 await this.track(await RunningProcess.spawnWithInitializationHint(
                     [
                         workerCli, 'worker',
                         '--user', i.toString(),
                         '--network', this.NETWORK,
                         '--proving-backend', backend,
-                        '--coordinator-api-url', this.COORD_API_URL,
+                        '--coordinator-api-url', coordUrl,
                         '--private-key', FAKE_MINER_PRIVATE_KEY,
                     ],
                     workerStartedDetector,
@@ -399,7 +408,7 @@ class DevNetProcessManager {
                 ));
 
                 // 7. Realm Edges (Scalable)
-                for (let j = 0; j < workerEdgeCount; j++) {
+                for (let j = 0; j < realmEdgeCount; j++) {
                     const port = realmEdgeStartPort + j;
                     await this.track(await RunningProcess.spawnWithInitializationHint(
                         [
@@ -437,7 +446,7 @@ class DevNetProcessManager {
                 // 8. Realm Workers (Load Balanced)
                 for (let k = 0; k < workerRealmCount; k++) {
                     // Round robin selection of edge port
-                    const edgePort = realmEdgeStartPort + (k % workerEdgeCount);
+                    const edgePort = realmEdgeStartPort + (k % realmEdgeCount);
                     const realmUrl = `http://${this.host}:${edgePort}`;
 
                     await this.track(await RunningProcess.spawnWithInitializationHint(
@@ -480,6 +489,7 @@ async function runMain() {
             "disable-worker-edge-logs": { type: "boolean" },
             "realm-workers": { type: "string" },
             "realm-edge-nodes": { type: "string", default: "1" },
+            "coordinator-edge-nodes": { type: "string", default: "1" },
             "coordinator-workers": { type: "string" },
             "start-realm-id": { type: "string", default: "0" },
             "end-realm-id": { type: "string" },
@@ -495,7 +505,8 @@ async function runMain() {
 
     const hasOnlyOptions = !!values["db-only"] || !!values["coordinator-only"] || !!values["realm-only"] || !!values["workers-only"];
     const workerRealmCount = values["realm-workers"] ? parseInt(values["realm-workers"], 10) : 0;
-    const workerEdgeCount = parseInt(values["realm-edge-nodes"] || "1", 10);
+    const realmEdgeCount = parseInt(values["realm-edge-nodes"] || "1", 10);
+    const coordinatorEdgeCount = parseInt(values["coordinator-edge-nodes"] || "1", 10);
     const coordinatorWorkersCount = values["coordinator-workers"] ? parseInt(values["coordinator-workers"], 10) : (!hasOnlyOptions ? 1 : 0);
     const startRealmId = parseInt(values["start-realm-id"] || "0", 10);
     const endRealmId = values["end-realm-id"] ? parseInt(values["end-realm-id"], 10) : startRealmId;
@@ -519,6 +530,7 @@ Usage: bun run dev/locSetupV4.ts [options]
    --disable-worker-edge-logs      Disable logging for worker and edge processes
    --realm-workers <count>         Number of workers per realm (default: 1 when starting realms, 0 in only modes)
    --realm-edge-nodes <count>      Number of edge nodes per realm (default: 1)
+   --coordinator-edge-nodes <count> Number of edge nodes for coordinator (default: 1)
    --coordinator-workers <count>   Number of coordinator workers (default: 1 when starting coordinator, 0 in only modes)
    --start-realm-id <id>           Starting realm ID (default: 0)
    --end-realm-id <id>             Ending realm ID (inclusive, default: 127 when starting full system)
@@ -567,7 +579,8 @@ Notes:
         await globalManager.setupProcesses({
             jtmb: !!values.jtmb,
             workerRealmCount,
-            workerEdgeCount,
+            realmEdgeCount,
+            coordinatorEdgeCount,
             coordinatorWorkersCount,
             disableWorkerEdgeLogs: !!values["disable-worker-edge-logs"],
             startRealmId,
