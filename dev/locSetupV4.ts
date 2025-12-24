@@ -178,6 +178,54 @@ class RunningProcess {
             };
         });
     }
+
+    static spawnWithInitializationHintWithRetry(
+        cmds: string[],
+        hintDetector: (line: string) => boolean,
+        options: {
+            cwd?: string,
+            stdOutVisitor?: ProcessLineVisitor,
+            stdErrVisitor?: ProcessLineVisitor,
+            allOutputVisitor?: ProcessLineVisitor,
+            stdoutLogFile?: string,
+            stderrLogFile?: string,
+            maxRetries?: number,
+            retryDelayMs?: number
+        }
+    ): Promise<RunningProcess> {
+        return new Promise<RunningProcess>(async (resolve, reject) => {
+            let attempt = 0;
+            const maxRetries = options.maxRetries || 3;
+            const retryDelayMs = options.retryDelayMs || 2000;
+
+            const trySpawn = async () => {
+                attempt++;
+                console.log(`[DevNet] Starting process (attempt ${attempt}/${maxRetries + 1}): ${cmds.join(" ")}`);
+
+                try {
+                    const proc = await this.spawnWithInitializationHint(cmds, hintDetector, {
+                        cwd: options.cwd,
+                        stdOutVisitor: options.stdOutVisitor,
+                        stdErrVisitor: options.stdErrVisitor,
+                        allOutputVisitor: options.allOutputVisitor,
+                        stdoutLogFile: options.stdoutLogFile,
+                        stderrLogFile: options.stderrLogFile
+                    });
+                    console.log(`[DevNet] Process initialized successfully`);
+                    resolve(proc);
+                } catch (error) {
+                    if (attempt <= maxRetries) {
+                        console.warn(`[DevNet] Process failed (attempt ${attempt}/${maxRetries + 1}), retrying in ${retryDelayMs}ms...`);
+                        setTimeout(trySpawn, retryDelayMs);
+                    } else {
+                        reject(error);
+                    }
+                }
+            };
+
+            trySpawn();
+        });
+    }
 }
 
 // --- Log Detectors ---
@@ -316,7 +364,7 @@ class DevNetProcessManager {
         // 3. Coordinator Processor
         if (startCoordinatorProcessor) {
             await cleanCheckpoint('./local_checkpoints/coordinator_0_0', cwd);
-            await this.track(await RunningProcess.spawnWithInitializationHint(
+            await this.track(await RunningProcess.spawnWithInitializationHintWithRetry(
                 [
                     nodeCli, 'start-coordinator-processor',
                     '--coordinator-id', '0',
@@ -331,14 +379,14 @@ class DevNetProcessManager {
                     '--verbose'
                 ],
                 coordinatorProcessorStartedDetector,
-                { cwd, ...getLogPaths("coordinator_processor", false) }
+                { cwd, ...getLogPaths("coordinator_processor", false), maxRetries: 3, retryDelayMs: 2000 }
             ));
 
             // 4. Coordinator Edges (Scalable)
             const coordEdgePromises: Promise<RunningProcess>[] = [];
             for (let j = 0; j < coordinatorEdgeCount; j++) {
                 const port = 1337 + j;
-                const edgePromise = RunningProcess.spawnWithInitializationHint(
+                const edgePromise = RunningProcess.spawnWithInitializationHintWithRetry(
                     [
                         nodeCli, 'start-coordinator-edge',
                         '--coordinator-id', '0',
@@ -354,7 +402,7 @@ class DevNetProcessManager {
                         '--verbose'
                     ],
                     coordinatorEdgeProcessorStartedDetector,
-                    { cwd, ...getLogPaths(`coordinator_edge_${j}`, true) }
+                    { cwd, ...getLogPaths(`coordinator_edge_${j}`, true), maxRetries: 3, retryDelayMs: 2000 }
                 ).then(proc => this.track(proc));
                 coordEdgePromises.push(edgePromise);
             }
@@ -414,7 +462,7 @@ class DevNetProcessManager {
                     const realmEdgeStartPort = 13380 + realmId * 10;
 
                     // Start realm processor
-                    const processorPromise = RunningProcess.spawnWithInitializationHint(
+                    const processorPromise = RunningProcess.spawnWithInitializationHintWithRetry(
                         [
                             nodeCli, 'start-realm-processor',
                             '--realm-id', realmId.toString(),
@@ -430,14 +478,14 @@ class DevNetProcessManager {
                             '--verbose'
                         ],
                         realmProcessorStartedDetector,
-                        { cwd, ...getLogPaths(`realm_${realmId}_processor`, false) }
+                        { cwd, ...getLogPaths(`realm_${realmId}_processor`, false), maxRetries: 3, retryDelayMs: 2000 }
                     ).then(proc => this.track(proc));
                     realmPromises.push(processorPromise);
 
                     // Start realm edges
                     for (let j = 0; j < realmEdgeCount; j++) {
                         const port = realmEdgeStartPort + j;
-                        const edgePromise = RunningProcess.spawnWithInitializationHint(
+                        const edgePromise = RunningProcess.spawnWithInitializationHintWithRetry(
                             [
                                 nodeCli, 'start-realm-edge',
                                 '--realm-id', realmId.toString(),
@@ -453,7 +501,7 @@ class DevNetProcessManager {
                                 '--verbose'
                             ],
                             realmEdgeProcessorStartedDetector,
-                            { cwd, ...getLogPaths(`realm_edge_${realmId}_${j}`, true) }
+                            { cwd, ...getLogPaths(`realm_edge_${realmId}_${j}`, true), maxRetries: 3, retryDelayMs: 2000 }
                         ).then(proc => this.track(proc));
                         realmPromises.push(edgePromise);
                     }
