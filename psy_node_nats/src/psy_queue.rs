@@ -34,7 +34,7 @@ pub async fn setup_nats_psy_queue_from_connection_str(
     let worker_queue_pull_config = PullConfig {
         ack_policy: jetstream::consumer::AckPolicy::Explicit,
         ack_wait: Duration::from_millis(worker_timeout_ms),
-        max_deliver: 20,
+        max_deliver: 2400,
         replay_policy: jetstream::consumer::ReplayPolicy::Instant,
         deliver_policy: jetstream::consumer::DeliverPolicy::All,
         max_ack_pending: 100000,
