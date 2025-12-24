@@ -17,7 +17,7 @@ use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 use tokio::{io::AsyncWriteExt, sync::RwLock};
 
 use crate::{
-    api::url_manager::{PsyWorkerAPIURLManager}, utils::time::get_current_time_ms, worker::prover_trait::PsyWorkerJobFetcher
+    api::url_manager::PsyWorkerAPIURLManager, utils::time::get_current_time_ms, worker::prover_trait::PsyWorkerJobFetcher
 };
 
 const API_REQUEST_SIGNATURE_VALID_DURATION_MS: u64 = 30000; // 30 seconds
@@ -132,27 +132,37 @@ impl<
     pub async fn report_fetch_job_failure(&self, api_url_hash: [u8; 32]) {
         let is_in_realm_mode = self.is_in_realm_mode.load(std::sync::atomic::Ordering::SeqCst);
         if is_in_realm_mode {
-            self.realm_api_url_manager.report_api_url_failure(&api_url_hash)
+            self.realm_api_url_manager.report_api_url_failure(&api_url_hash);
+            let total = self.realm_api_url_manager.get_total_api_urls();
+            let failed = self.realm_api_url_manager.api_url_failed_attempts.len();
+            if failed >= total && self.coordinator_api_url_manager.has_urls() {
+                self.is_in_realm_mode.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
         } else {
-            self.coordinator_api_url_manager.report_api_url_failure(&api_url_hash)
-        }
-        if is_in_realm_mode && self.coordinator_api_url_manager.has_urls() {
-            self.is_in_realm_mode.store(false, std::sync::atomic::Ordering::SeqCst);
-        } else if !is_in_realm_mode && self.realm_api_url_manager.has_urls() {
-            self.is_in_realm_mode.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.coordinator_api_url_manager.report_api_url_failure(&api_url_hash);
+            let total = self.coordinator_api_url_manager.get_total_api_urls();
+            let failed = self.coordinator_api_url_manager.api_url_failed_attempts.len();
+            if failed >= total && self.realm_api_url_manager.has_urls() {
+                self.is_in_realm_mode.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
         }
     }
     pub async fn report_submit_proof_failure(&self, api_url_hash: [u8; 32]) {
         let is_in_realm_mode = self.is_in_realm_mode.load(std::sync::atomic::Ordering::SeqCst);
         if is_in_realm_mode {
-            self.realm_api_url_manager.report_api_url_failure(&api_url_hash)
+            self.realm_api_url_manager.report_api_url_failure(&api_url_hash);
+            let total = self.realm_api_url_manager.get_total_api_urls();
+            let failed = self.realm_api_url_manager.api_url_failed_attempts.len();
+            if failed >= total && self.coordinator_api_url_manager.has_urls() {
+                self.is_in_realm_mode.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
         } else {
-            self.coordinator_api_url_manager.report_api_url_failure(&api_url_hash)
-        }
-        if is_in_realm_mode && self.coordinator_api_url_manager.has_urls() {
-            self.is_in_realm_mode.store(false, std::sync::atomic::Ordering::SeqCst);
-        } else if !is_in_realm_mode && self.realm_api_url_manager.has_urls() {
-            self.is_in_realm_mode.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.coordinator_api_url_manager.report_api_url_failure(&api_url_hash);
+            let total = self.coordinator_api_url_manager.get_total_api_urls();
+            let failed = self.coordinator_api_url_manager.api_url_failed_attempts.len();
+            if failed >= total && self.realm_api_url_manager.has_urls() {
+                self.is_in_realm_mode.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
         }
     }
     pub async fn report_fetch_job_success(&self, api_url_hash: [u8; 32]) {

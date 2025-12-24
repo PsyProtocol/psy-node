@@ -364,19 +364,30 @@ class DevNetProcessManager {
         // 5. Coordinator Workers
         if (startCoordinatorWorkers && coordinatorWorkersCount > 0) {
             for (let i = 0; i < coordinatorWorkersCount; i++) {
-                // Round robin selection of coordinator edge port
-                const coordEdgePort = 1337 + (i % coordinatorEdgeCount);
-                const coordUrl = `http://${this.host}:${coordEdgePort}`;
+                const coordUrls: string[] = [];
+
+                // Connect to all coordinator edges for better load distribution
+                for (let edgeIndex = 0; edgeIndex < coordinatorEdgeCount; edgeIndex++) {
+                    const coordEdgePort = 1337 + edgeIndex;
+                    const coordUrl = `http://${this.host}:${coordEdgePort}`;
+                    coordUrls.push(coordUrl);
+                }
+
+                const workerArgs = [
+                    workerCli, 'worker',
+                    '--user', i.toString(),
+                    '--network', this.NETWORK,
+                    '--proving-backend', backend,
+                ];
+
+                for (const coordUrl of coordUrls) {
+                    workerArgs.push('--coordinator-api-url', coordUrl);
+                }
+
+                workerArgs.push('--private-key', FAKE_MINER_PRIVATE_KEY);
 
                 await this.track(await RunningProcess.spawnWithInitializationHint(
-                    [
-                        workerCli, 'worker',
-                        '--user', i.toString(),
-                        '--network', this.NETWORK,
-                        '--proving-backend', backend,
-                        '--coordinator-api-url', coordUrl,
-                        '--private-key', FAKE_MINER_PRIVATE_KEY,
-                    ],
+                    workerArgs,
                     workerStartedDetector,
                     { cwd, ...getLogPaths(`coordinator_worker_${i}`, true) }
                 ));
@@ -468,9 +479,13 @@ class DevNetProcessManager {
                 for (let realmIndex = startRealmForWorker; realmIndex < endRealmForWorker; realmIndex++) {
                     const realmId = startRealmId + realmIndex;
                     const realmEdgeStartPort = 13380 + realmId * 10;
-                    const edgePort = realmEdgeStartPort + workerId % realmEdgeCount;
-                    const realmUrl = `http://${this.host}:${edgePort}`;
-                    realmUrls.push(realmUrl);
+
+                    // Connect to all edges of this realm for better load distribution
+                    for (let edgeIndex = 0; edgeIndex < realmEdgeCount; edgeIndex++) {
+                        const edgePort = realmEdgeStartPort + edgeIndex;
+                        const realmUrl = `http://${this.host}:${edgePort}`;
+                        realmUrls.push(realmUrl);
+                    }
                 }
 
                 const workerArgs = [

@@ -149,8 +149,8 @@ impl PsyWorkerAPIURLManager {
                     let list_len = api_url_list.len();
                     // If there was a failure reported, move to the next URL
                     let mut index = self.current_api_url_index.write().await;
-                    let index_current = *index;
                     *index = (*index + 1) % list_len;
+                    let index_current = *index;
                     let next_api_url = &api_url_list[index_current];
                     let mut last_seen_job_time = self.last_seen_job_for_current_api_url_at.write().await;
                     *last_seen_job_time = get_current_unix_timestamp_ms();
@@ -173,8 +173,8 @@ impl PsyWorkerAPIURLManager {
                     let list_len = api_url_list.len();
                     // If there was a failure reported, move to the next URL
                     let mut index = self.current_api_url_index.write().await;
-                    let index_current = *index;
                     *index = (*index + 1) % list_len;
+                    let index_current = *index;
                     let next_api_url = &api_url_list[index_current];
                     let mut last_seen_job_time = self.last_seen_job_for_current_api_url_at.write().await;
                     *last_seen_job_time = get_current_unix_timestamp_ms();

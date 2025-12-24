@@ -26,7 +26,7 @@ where     C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + Fi
         signer,
         public_key,
         config.miner_user_id,
-        PsyAPIURLRotationStrategy::ContinueUntilFailure,
+        PsyAPIURLRotationStrategy::Random,
     );
 
     job_fetcher.coordinator_api_url_manager.add_api_urls::<QHashOut<C::F>, QProvingJobDataID>(&config.coordinator_api_urls).await?;
