@@ -296,6 +296,11 @@ class DevNetProcessManager {
         if (this.needsStartDb) {
             console.log("[DevNet] Killing existing docker containers...");
             await killDocker();
+
+            // Clean checkpoints when resetting database
+            console.log("[DevNet] Cleaning local checkpoints...");
+            await cleanCheckpoint('./local_checkpoints', cwd);
+
             await this.track(await RunningProcess.spawnWithInitializationHint(
                 ['./dev/start_db.sh'], scyllaStartedDetector, { cwd, ...getLogPaths("scylla", false) }
             ));
@@ -379,12 +384,6 @@ class DevNetProcessManager {
                 const realmId = startRealmId + i;
                 const realmEdgeStartPort = 13380 + realmId * 10;
 
-                // Add a small delay between starting realms to prevent DB connection storms
-                if (i > 0) {
-                    console.log(`[DevNet] Waiting for 0.5 seconds before starting next realm...`);
-                    await new Promise(resolve => setTimeout(resolve, 500));
-                }
-
                 console.log(`[DevNet] Starting Realm Processor ${realmId}...`);
 
                 await cleanCheckpoint('./local_checkpoints/realm_' + realmId + '_1', cwd);
@@ -436,12 +435,6 @@ class DevNetProcessManager {
             for (let i = 0; i < realmsCount; i++) {
                 const realmId = startRealmId + i;
                 const realmEdgeStartPort = 13380 + realmId * 10;
-
-                // Add a small delay between starting realms to prevent DB connection storms
-                if (i > 0) {
-                    console.log(`[DevNet] Waiting for 0.5 seconds before starting next realm workers...`);
-                    await new Promise(resolve => setTimeout(resolve, 500));
-                }
 
                 // 8. Realm Workers (Load Balanced)
                 for (let k = 0; k < workerRealmCount; k++) {
