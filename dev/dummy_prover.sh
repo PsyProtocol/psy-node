@@ -29,6 +29,7 @@ A script to run dummy provers for psy_worker_cli.
 Commands:
   prove         Run a single dummy prover instance.
   prove_many    Run multiple dummy prover instances in parallel.
+  prove_random  Run a dummy prover instance with a random user ID.
 
 Global options:
   -H, --host <host>                  The host address to connect to. (Default: 127.0.0.1)
@@ -42,6 +43,9 @@ Global options:
   --end-user-id <id>               The ending user ID for the range (inclusive). (Required)
   -p, --proving-backend <backend>    The proving backend to use for all instances. (Required)
 
+'prove_random' options:
+  -p, --proving-backend <backend>    The proving backend to use. (Required)
+
 Available Proving Backends:
   - plonky2-poseidon-goldilocks
   - jtmb-poseidon-goldilocks
@@ -54,6 +58,10 @@ Example for 'prove':
 Example for 'prove_many':
   $0 prove_many --start-user-id 1 --end-user-id 5 -p plonky2-poseidon-goldilocks
   $0 -H 192.168.1.100 prove_many --start-user-id 1 --end-user-id 5 -p plonky2-poseidon-goldilocks
+
+Example for 'prove_random':
+  $0 prove_random -p jtmb-poseidon-goldilocks
+  $0 -H 192.168.1.100 prove_random -p jtmb-poseidon-goldilocks
 EOF
   exit 1
 }
@@ -272,6 +280,56 @@ case "$SUBCOMMAND" in
     wait
     echo "All prover processes have finished."
     ;;
+
+  prove_random)
+    # --- Handle 'prove_random' subcommand ---
+    PROVING_BACKEND=""
+
+    # Parse arguments for 'prove_random'
+    while [[ $# -gt 0 ]]; do
+      key="$1"
+      case $key in
+        -p|--proving-backend)
+          PROVING_BACKEND="$2"
+          shift 2
+          ;;
+        *)
+          echo "Error: Unknown option '$1' for 'prove_random' command."
+          usage
+          ;;
+      esac
+    done
+
+    # Validate arguments
+    if [[ -z "$PROVING_BACKEND" ]]; then
+      echo "Error: Missing required arguments for 'prove_random' command."
+      usage
+    fi
+    validate_backend "$PROVING_BACKEND"
+
+    # Generate random user ID between 0 and 4194303 (2^22 - 1)
+    RANDOM_USER_ID=$((RANDOM * 32768 + RANDOM))
+    RANDOM_USER_ID=$((RANDOM_USER_ID % 4194304))
+
+    echo "Generated random user ID: ${RANDOM_USER_ID}"
+
+    # Execute continuous random prover - each iteration picks a new random user
+    echo "Starting continuous random proving... (Ctrl+C to stop)"
+    while true; do
+      # Generate new random user ID for each iteration
+      RANDOM_USER_ID=$((RANDOM * 32768 + RANDOM))
+      RANDOM_USER_ID=$((RANDOM_USER_ID % 4194304))
+
+      echo "Selected random user ID: ${RANDOM_USER_ID}"
+
+      # Execute single proof with END_CAP_COUNT=1
+      END_CAP_COUNT=1 run_single_prover "$RANDOM_USER_ID" "$PROVING_BACKEND"
+
+      echo "Proof completed. Selecting new random user..."
+      sleep 1  # Brief pause before next random selection
+    done
+    ;;
+
   --help|-h)
     usage
     ;;

@@ -2,7 +2,7 @@ PROVING_BACKEND := plonky2-poseidon-goldilocks
 BIN_PREFIX      := ./target/release/
 # PROVING_BACKEND := jtmb-poseidon-goldilocks
 
-.PHONY: all build clean test deploy-contracts register-users query-chain-info run-all restart shutdown clean-db init-db run-coordinator-processor run-coordinator-edge run-realm-0-processor run-realm-0-edge run-realm-1-processor run-realm-1-edge run-realm-2-processor run-realm-2-edge run-realm-3-processor run-realm-3-edge run-worker-coordinator run-worker-realm-0 run-worker-realm-1 run-worker-realm-2 run-worker-realm-3 run-dummy-provers
+.PHONY: all build clean test deploy-contracts register-users query-chain-info run-all restart shutdown clean-db init-db run-coordinator-processor run-coordinator-edge run-realm-0-processor run-realm-0-edge run-realm-1-processor run-realm-1-edge run-realm-2-processor run-realm-2-edge run-realm-3-processor run-realm-3-edge run-worker-coordinator run-worker-realm-0 run-worker-realm-1 run-worker-realm-2 run-worker-realm-3 run-dummy-prover
 
 all: build
 
@@ -81,17 +81,9 @@ run-worker-realm-2:
 run-worker-realm-3:
 	RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/psy_worker_cli worker --user 0 --network local-devnet --proving-backend ${PROVING_BACKEND} --config ./psy_cli/example_node_configs/worker_realm_3.yml
 
-run-dummy-provers:
-	@echo "Starting dummy provers for all realms (one user per realm)..."
-	@echo "User 0 -> Realm 0 (port 13380)"
-	@./dev/dummy_prover.sh prove -u 0 -p ${PROVING_BACKEND} &
-	@echo "User 1048576 -> Realm 1 (port 13390)"
-	@./dev/dummy_prover.sh prove -u 1048576 -p ${PROVING_BACKEND} &
-	@echo "User 2097152 -> Realm 2 (port 13400)"
-	@./dev/dummy_prover.sh prove -u 2097152 -p ${PROVING_BACKEND} &
-	@echo "User 3145728 -> Realm 3 (port 13410)"
-	@./dev/dummy_prover.sh prove -u 3145728 -p ${PROVING_BACKEND} &
-	@echo "All dummy provers started in background"
+run-dummy-prover:
+	@echo "Starting dummy prover for all realms using random users..."
+	@./dev/dummy_prover.sh prove_random -p ${PROVING_BACKEND}
 
 shutdown:
 	-ps aux | grep "[p]sy_node_cli" | awk '{print $$2}' | xargs kill -KILL 2>/dev/null || true
