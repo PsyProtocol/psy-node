@@ -15,7 +15,7 @@ use parth_core::{
     protocol::core_types::{Q256BitHash, QDBHashBase, QNetworkTypesConfig},
     QCoreProcCheckpointUniqueId,
 };
-use psy_core::{job::job_id::{ProvingJobCircuitType, QProvingJobDataID}, user_id::get_user_id_from_registration_id};
+use psy_core::{job::job_id::{ProvingJobCircuitType, QProvingJobDataID}, user_id::get_user_id_from_user_registration_id};
 use psy_data::{
     agg::{
         tree_agg_v2::{plan_jobs_for_tree_agg_offset_root, BasicTreePlannerHelper},
@@ -349,7 +349,7 @@ impl<
         let hash = hash_two_from_slice::<N::QHash, N::HasherBase>(&item);
         let u64_hash_mapping_row = QHash256AndU64 {
             hash,
-            value_u64: get_user_id_from_registration_id(
+            value_u64: get_user_id_from_user_registration_id(
                 self.next_user_id,
                 N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
                 N::REALM_GLOBAL_USER_TREE_HEIGHT,
