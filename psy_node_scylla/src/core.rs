@@ -32,10 +32,10 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
         let session = SessionBuilder::new()
             .known_nodes(known_nodes.iter())
             .default_execution_profile_handle(execution_profile.into_handle())
-            .connection_timeout(Duration::from_secs(30))
+            .connection_timeout(Duration::from_secs(60))
             .keepalive_timeout(Duration::from_secs(60))
             .keepalive_interval(Duration::from_secs(30))
-            .pool_size(PoolSize::PerHost(NonZeroUsize::new(50).unwrap()))
+            .pool_size(PoolSize::PerHost(NonZeroUsize::new(5).unwrap()))
             .build()
             .await?;
         let session = Arc::new(session);

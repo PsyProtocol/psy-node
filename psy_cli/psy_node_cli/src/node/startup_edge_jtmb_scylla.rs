@@ -22,7 +22,7 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_edge_node(config: &Coor
     let fingerprint_config = PsyJTMBPoseidonGoldilocksNodeConfigResolver::new().get_circuit_fingerprint_config_for_network(config.network)?;
     let checkpoint_state_transition_circuit_fingerprint =fingerprint_config.checkpoint_state_transition_circuit_fingerprint;
 
-    let pool = new_redis_async_pool(&config.redis_url, 10).await?;
+    let pool = new_redis_async_pool(&config.redis_url, 2).await?;
 
     let temp_store = StandardRedisStore::new(
         pool,
@@ -103,7 +103,7 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_realm_edge_node(config:
 
     
 
-    let pool = new_redis_async_pool(&config.redis_url, 10).await?;
+    let pool = new_redis_async_pool(&config.redis_url, 2).await?;
 
     let temp_store = StandardRedisStore::new(
         pool,

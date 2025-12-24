@@ -19,7 +19,7 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_coordinator_processor_n
     let circuit_fingerprint_config = resolver.get_circuit_fingerprint_config_for_network(config.network)?;
     let genesis_data = resolver.get_genesis_block_setup_data_for_network(config.network)?;
 
-    let pool = new_redis_async_pool(&config.redis_url, 10).await?;
+    let pool = new_redis_async_pool(&config.redis_url, 2).await?;
 
     let temp_store = StandardRedisStore::new(
         pool,
@@ -102,7 +102,7 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_realm_processor_node(co
     let circuit_fingerprint_config = resolver.get_circuit_fingerprint_config_for_network(config.network)?;
     let genesis_data = resolver.get_genesis_block_setup_data_for_network(config.network)?;
 
-    let pool = new_redis_async_pool(&config.redis_url, 10).await?;
+    let pool = new_redis_async_pool(&config.redis_url, 2).await?;
 
     let temp_store = StandardRedisStore::new(
         pool,

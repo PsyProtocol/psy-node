@@ -20,7 +20,7 @@ impl RedisStoreFactory {
 impl StoreFactory for RedisStoreFactory {
     type Store = StandardRedisStore;
     async fn new_store(&self) -> Self::Store {
-        let pool = new_redis_async_pool(&self.redis_url, 10).await.unwrap();
+        let pool = new_redis_async_pool(&self.redis_url, 2).await.unwrap();
         let rng = rand::thread_rng();
         // Use a random prefix and IDs to ensure test isolation
         let prefix: String = rng.sample_iter(&Alphanumeric).take(8).map(char::from).collect();
