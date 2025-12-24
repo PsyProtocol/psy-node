@@ -9,11 +9,13 @@ set -o pipefail
 
 # --- Configuration ---
 CLI_EXECUTABLE="./target/release/psy_worker_cli"
-COORDINATOR_URL="http://127.0.0.1:1337"
+HOST="127.0.0.1"  # Default host
+COORDINATOR_URL="http://${HOST}:1337"
 LOG_DIR="./logs"
-END_CAP_COUNT=1
+END_CAP_COUNT=0
 REALM_ID_DIVISOR=1048576
-REALM_PORT_BASE=1338
+REALM_PORT_BASE=13380
+REALM_PORT_MULTIPLIER=10
 
 # --- Helper Functions ---
 
@@ -27,6 +29,9 @@ A script to run dummy provers for psy_worker_cli.
 Commands:
   prove         Run a single dummy prover instance.
   prove_many    Run multiple dummy prover instances in parallel.
+
+Global options:
+  -H, --host <host>                  The host address to connect to. (Default: 127.0.0.1)
 
 'prove' options:
   -u, --user-id <id>                 The user ID to run the prover for. (Required)
@@ -44,9 +49,11 @@ Available Proving Backends:
 
 Example for 'prove':
   $0 prove -u 101 -p jtmb-poseidon-goldilocks
+  $0 -H 192.168.1.100 prove -u 101 -p jtmb-poseidon-goldilocks
 
 Example for 'prove_many':
   $0 prove_many --start-user-id 1 --end-user-id 5 -p plonky2-poseidon-goldilocks
+  $0 -H 192.168.1.100 prove_many --start-user-id 1 --end-user-id 5 -p plonky2-poseidon-goldilocks
 EOF
   exit 1
 }
@@ -73,8 +80,8 @@ run_single_prover() {
     local proving_backend=$2
     local log_file="${LOG_DIR}/dummy_end_cap_prover_logs_${user_id}.txt"
     local realm_id=$((user_id / REALM_ID_DIVISOR))
-    local realm_port=$((REALM_PORT_BASE + realm_id))
-    local worker_url="http://127.0.0.1:${realm_port}"
+    local realm_port=$((REALM_PORT_BASE + realm_id * REALM_PORT_MULTIPLIER))
+    local worker_url="http://${HOST}:${realm_port}"
 
     echo "Starting prover for USER_ID: ${user_id} (realm_id=${realm_id}, port=${realm_port}). Logging to ${log_file}"
 
@@ -95,8 +102,8 @@ run_and_prefix_prover() {
     local proving_backend=$2
     local log_file="${LOG_DIR}/dummy_end_cap_prover_logs_${user_id}.txt"
     local realm_id=$((user_id / REALM_ID_DIVISOR))
-    local realm_port=$((REALM_PORT_BASE + realm_id))
-    local worker_url="http://127.0.0.1:${realm_port}"
+    local realm_port=$((REALM_PORT_BASE + realm_id * REALM_PORT_MULTIPLIER))
+    local worker_url="http://${HOST}:${realm_port}"
 
     # Execute the command, redirect stderr to stdout, and pipe it.
     # The first `tee` writes the raw, unprefixed output to the log file.
@@ -116,8 +123,8 @@ run_and_prefix_prover_old() {
     local proving_backend=$2
     local log_file="${LOG_DIR}/dummy_end_cap_prover_logs_${user_id}.txt"
     local realm_id=$((user_id / REALM_ID_DIVISOR))
-    local realm_port=$((REALM_PORT_BASE + realm_id))
-    local worker_url="http://127.0.0.1:${realm_port}"
+    local realm_port=$((REALM_PORT_BASE + realm_id * REALM_PORT_MULTIPLIER))
+    local worker_url="http://${HOST}:${realm_port}"
 
     # Execute the command, redirect stderr to stdout, and pipe it.
     # The first `tee` writes the raw, unprefixed output to the log file.
@@ -134,6 +141,27 @@ run_and_prefix_prover_old() {
 
 
 # --- Main Logic ---
+
+# Parse global options first
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -H|--host)
+      HOST="$2"
+      COORDINATOR_URL="http://${HOST}:1337"
+      shift 2
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      break
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
 
 # Check if at least a subcommand is provided
 if [[ $# -lt 1 ]]; then
