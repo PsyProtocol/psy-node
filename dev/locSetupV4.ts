@@ -189,6 +189,7 @@ function coordinatorEdgeProcessorStartedDetector(line: string): boolean { return
 function workerStartedDetector(line: string): boolean { return line.startsWith('[CFLI:PSY_PROOF_MINER_WORKER_STARTED]'); }
 function realmProcessorStartedDetector(line: string): boolean { return line.startsWith('[CFLI:PSY_REALM_PROCESSOR_STARTED]'); }
 function realmEdgeProcessorStartedDetector(line: string): boolean { return line.startsWith('[CFLI:PSY_REALM_EDGE_RPC_STARTED]'); }
+function dummyProverStartedDetector(line: string): boolean { return line.startsWith('[CFLI:DUMMY_END_CAP_PROVER_STARTED]'); }
 
 async function buildProject(cwd?: string) {
     console.log("Building project...");
@@ -217,6 +218,7 @@ interface ProcessOptions {
     coordinatorOnly?: boolean;
     dbOnly?: boolean;
     workersOnly?: boolean;
+    dummyProversCount?: number;
 }
 
 class DevNetProcessManager {
@@ -255,7 +257,7 @@ class DevNetProcessManager {
 
         const disableWorkerEdgeLogs = !!options.disableWorkerEdgeLogs;
         // Determine what components to start
-        const hasOnlyOptions = !!options.dbOnly || !!options.coordinatorOnly || !!options.realmOnly || !!options.workersOnly;
+        const hasOnlyOptions = !!options.dbOnly || !!options.coordinatorOnly || !!options.realmOnly || !!options.workersOnly || (options.dummyProversCount || 0) > 0;
         const startAll = !hasOnlyOptions;
 
         const startCoordinatorProcessor = startAll || !!options.coordinatorOnly;
@@ -496,6 +498,30 @@ class DevNetProcessManager {
             await Promise.all(workerPromises);
             console.log(`[DevNet] All ${workerRealmCount} shared workers started (${workerPromises.length} connections total)`);
         }
+
+        // 8. Dummy Provers (if requested)
+        const dummyProversCount = options.dummyProversCount || 0;
+        if (dummyProversCount > 0) {
+            console.log(`[DevNet] Starting ${dummyProversCount} dummy provers...`);
+
+            const dummyPromises: Promise<RunningProcess>[] = [];
+            for (let i = 0; i < dummyProversCount; i++) {
+                const dummyPromise = RunningProcess.spawnWithInitializationHint(
+                    [
+                        './dev/dummy_prover.sh', 'prove_random',
+                        '-p', backend,
+                        '-H', this.host
+                    ],
+                    dummyProverStartedDetector,
+                    { cwd, ...getLogPaths(`dummy_prover_${i}`, true) }
+                ).then(proc => this.track(proc));
+                dummyPromises.push(dummyPromise);
+            }
+
+            // Wait for all dummy provers to start
+            await Promise.all(dummyPromises);
+            console.log(`[DevNet] All ${dummyProversCount} dummy provers started`);
+        }
     }
 
     teardown(): void {
@@ -530,12 +556,13 @@ async function runMain() {
             "db-only": { type: "boolean" },
             "realm-only": { type: "boolean" },
             "workers-only": { type: "boolean" },
+            "dummy-provers-only": { type: "string" },
             "help": { type: "boolean", short: "h" },
         },
         allowPositionals: true,
     });
 
-    const hasOnlyOptions = !!values["db-only"] || !!values["coordinator-only"] || !!values["realm-only"] || !!values["workers-only"];
+    const hasOnlyOptions = !!values["db-only"] || !!values["coordinator-only"] || !!values["realm-only"] || !!values["workers-only"] || !!values["dummy-provers-only"];
     const workerRealmCount = values["realm-workers"] ? parseInt(values["realm-workers"], 10) : 0;
     const realmEdgeCount = parseInt(values["realm-edge-nodes"] || "1", 10);
     const coordinatorEdgeCount = parseInt(values["coordinator-edge-nodes"] || "1", 10);
@@ -547,6 +574,7 @@ async function runMain() {
     const coordinatorOnly = !!values["coordinator-only"];
     const dbOnly = !!values["db-only"];
     const workersOnly = !!values["workers-only"];
+    const dummyProversCount = values["dummy-provers-only"] ? parseInt(values["dummy-provers-only"], 10) : 0;
     const help = !!values["help"];
 
     // Show help if requested
@@ -570,6 +598,7 @@ Usage: bun run dev/locSetupV4.ts [options]
    --coordinator-only              Start only coordinator (requires database to be running)
    --db-only                       Start only database services
    --workers-only                  Start only workers (requires database to be running)
+   --dummy-provers-only <count>    Start only dummy provers (requires database, coordinator, and realms to be running)
    --help, -h                      Show this help message
 
 Examples:
@@ -587,6 +616,7 @@ Examples:
    bun run dev/locSetupV4.ts --coordinator-only
    bun run dev/locSetupV4.ts --coordinator-only --realm-only  # coordinator + realms
    bun run dev/locSetupV4.ts --workers-only --coordinator-workers 3 --realm-workers 2  # only workers
+   bun run dev/locSetupV4.ts --dummy-provers-only 4  # start 4 dummy provers
 
 Notes:
    - Database services are automatically started in full system mode or when --db-only is specified
@@ -621,6 +651,7 @@ Notes:
             coordinatorOnly,
             dbOnly,
             workersOnly,
+            dummyProversCount,
         });
         console.log('DevNet started. Press Ctrl+C to stop.');
         setInterval(() => { }, 1000 * 60);

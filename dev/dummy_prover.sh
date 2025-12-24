@@ -289,6 +289,11 @@ case "$SUBCOMMAND" in
     while [[ $# -gt 0 ]]; do
       key="$1"
       case $key in
+        -H|--host)
+          HOST="$2"
+          COORDINATOR_URL="http://${HOST}:1337"
+          shift 2
+          ;;
         -p|--proving-backend)
           PROVING_BACKEND="$2"
           shift 2
