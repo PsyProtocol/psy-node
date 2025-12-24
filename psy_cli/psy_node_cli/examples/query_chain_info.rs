@@ -31,16 +31,16 @@ type ZKProof = ProofWithPublicInputs<GoldilocksField, PoseidonGoldilocksConfig, 
 struct Args {
     #[arg(long, default_value = "http://127.0.0.1:1337")]
     coordinator_url: String,
-    #[arg(long, default_value = "http://127.0.0.1:1338")]
-    realm0_url: String,
-    #[arg(long, default_value = "http://127.0.0.1:1339")]
-    realm1_url: String,
-    #[arg(long, default_value = "http://127.0.0.1:1340")]
-    realm2_url: String,
-    #[arg(long, default_value = "http://127.0.0.1:1341")]
-    realm3_url: String,
+    #[arg(long, default_value = "0")]
+    start_realm_id: u64,
+    #[arg(long, default_value = "127")]
+    end_realm_id: u64,
     #[arg(long, default_value = "5")]
     recent_checkpoints: usize,
+    #[arg(long, default_value = "2")]
+    users_per_realm: usize,
+    #[arg(long, default_value = "2000")]
+    connect_timeout_ms: u64,
 }
 
 #[derive(Clone)]
@@ -83,6 +83,7 @@ async fn query_service_info(
     service_name: &str,
     service_type: &str,
     recent_count: usize,
+    users_per_realm: usize,
     service_url: &str,
 ) -> anyhow::Result<ServiceInfo> {
     let mut info = ServiceInfo::new(service_name.to_string(), service_url.to_string());
@@ -190,13 +191,18 @@ async fn query_service_info(
             info.contract_heights = heights;
         }
 
-        let user_ids = match service_name {
-            "Realm 0" => vec![0, 1024],
-            "Realm 1" => vec![1048576, 1049600],
-            "Realm 2" => vec![2097152, 2098176],
-            "Realm 3" => vec![3145728, 3146752],
-            _ => vec![],
+        // Calculate user IDs based on realm ID and user tree height
+        let realm_id = match service_name {
+            name if name.starts_with("Realm ") => {
+                name.strip_prefix("Realm ").unwrap().parse::<u64>().unwrap_or(0)
+            }
+            _ => 0,
         };
+
+        // With user_tree_height = 20, each realm gets 2^20 users
+        // User IDs: [realm_id << 20, (realm_id << 20) + 1, ...]
+        let base_user_id = realm_id << 20;
+        let user_ids: Vec<u64> = (0..users_per_realm).map(|i| base_user_id + i as u64).collect();
 
         for user_id in user_ids {
             if let Ok(user_leaf) = RealmEdgeRpcClient::<F, Hash, QProvingJobDataID, ZKProof>::get_user_leaf_data(client, info.checkpoint_id, user_id).await {
@@ -422,18 +428,20 @@ async fn main() -> anyhow::Result<()> {
     println!("🔍 Psy Network Chain Information Query");
     println!("=====================================");
     println!("Coordinator URL: {}", args.coordinator_url);
-    println!("Realm 0 URL: {}", args.realm0_url);
-    println!("Realm 1 URL: {}", args.realm1_url);
-    println!("Realm 2 URL: {}", args.realm2_url);
-    println!("Realm 3 URL: {}", args.realm3_url);
+    println!("Realm range: {}-{}", args.start_realm_id, args.end_realm_id);
     println!("Recent checkpoints to show: {}", args.recent_checkpoints);
+    println!("Users per realm to show: {}", args.users_per_realm);
+    println!("Connect timeout: {}ms", args.connect_timeout_ms);
     println!();
 
     let mut services = Vec::new();
 
-    match HttpClientBuilder::default().build(&args.coordinator_url) {
+    // Query coordinator
+    match HttpClientBuilder::default()
+        .request_timeout(std::time::Duration::from_millis(args.connect_timeout_ms))
+        .build(&args.coordinator_url) {
         Ok(client) => {
-            match query_service_info(&client, "Coordinator", "coordinator", args.recent_checkpoints, &args.coordinator_url).await {
+            match query_service_info(&client, "Coordinator", "coordinator", args.recent_checkpoints, args.users_per_realm, &args.coordinator_url).await {
                 Ok(info) => services.push(info),
                 Err(e) => println!("❌ Failed to query Coordinator: {}", e),
             }
@@ -441,44 +449,27 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => println!("❌ Failed to connect to Coordinator: {}", e),
     }
 
-    match HttpClientBuilder::default().build(&args.realm0_url) {
-        Ok(client) => {
-            match query_service_info(&client, "Realm 0", "realm", args.recent_checkpoints, &args.realm0_url).await {
-                Ok(info) => services.push(info),
-                Err(e) => println!("❌ Failed to query Realm 0: {}", e),
-            }
-        }
-        Err(e) => println!("❌ Failed to connect to Realm 0: {}", e),
-    }
+    // Query realms dynamically
+    for realm_id in args.start_realm_id..=args.end_realm_id {
+        let realm_url = format!("http://127.0.0.1:{}", 13380 + realm_id * 10);
+        let realm_name = format!("Realm {}", realm_id);
 
-    match HttpClientBuilder::default().build(&args.realm1_url) {
-        Ok(client) => {
-            match query_service_info(&client, "Realm 1", "realm", args.recent_checkpoints, &args.realm1_url).await {
-                Ok(info) => services.push(info),
-                Err(e) => println!("❌ Failed to query Realm 1: {}", e),
-            }
-        }
-        Err(e) => println!("❌ Failed to connect to Realm 1: {}", e),
-    }
+        println!("🔍 Querying {} at {}...", realm_name, realm_url);
 
-    match HttpClientBuilder::default().build(&args.realm2_url) {
-        Ok(client) => {
-            match query_service_info(&client, "Realm 2", "realm", args.recent_checkpoints, &args.realm2_url).await {
-                Ok(info) => services.push(info),
-                Err(e) => println!("❌ Failed to query Realm 2: {}", e),
+        match HttpClientBuilder::default()
+            .request_timeout(std::time::Duration::from_millis(args.connect_timeout_ms))
+            .build(&realm_url) {
+            Ok(client) => {
+                match query_service_info(&client, &realm_name, "realm", args.recent_checkpoints, args.users_per_realm, &realm_url).await {
+                    Ok(info) => {
+                        services.push(info);
+                        println!("✅ Successfully queried {}", realm_name);
+                    }
+                    Err(e) => println!("❌ Failed to query {}: {}", realm_name, e),
+                }
             }
+            Err(e) => println!("❌ Failed to connect to {}: {}", realm_name, e),
         }
-        Err(e) => println!("❌ Failed to connect to Realm 2: {}", e),
-    }
-
-    match HttpClientBuilder::default().build(&args.realm3_url) {
-        Ok(client) => {
-            match query_service_info(&client, "Realm 3", "realm", args.recent_checkpoints, &args.realm3_url).await {
-                Ok(info) => services.push(info),
-                Err(e) => println!("❌ Failed to query Realm 3: {}", e),
-            }
-        }
-        Err(e) => println!("❌ Failed to connect to Realm 3: {}", e),
     }
 
     // Get realm root information from coordinator
@@ -488,12 +479,10 @@ async fn main() -> anyhow::Result<()> {
             Ok(coord_client) => {
                 for service in &mut services {
                     if service.name.starts_with("Realm ") {
-                        let realm_id = match service.name.as_str() {
-                            "Realm 0" => 0,
-                            "Realm 1" => 1,
-                            "Realm 2" => 2,
-                            "Realm 3" => 3,
-                            _ => continue,
+                        let realm_id_str = service.name.strip_prefix("Realm ").unwrap();
+                        let realm_id = match realm_id_str.parse::<u64>() {
+                            Ok(id) => id,
+                            Err(_) => continue,
                         };
 
                         println!("  🔍 Getting realm {} root for checkpoint {}", realm_id, service.checkpoint_id);
