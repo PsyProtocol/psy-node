@@ -261,7 +261,7 @@ class DevNetProcessManager {
         const startCoordinatorProcessor = startAll || !!options.coordinatorOnly;
         const startCoordinatorWorkers = (coordinatorWorkersCount > 0) || !!options.coordinatorOnly || !!options.workersOnly;
         const startRealmProcessor = startAll || !!options.realmOnly;
-        const startRealmWorkers = (workerRealmCount > 0) || !!options.realmOnly || !!options.workersOnly;
+        const startRealmWorkers = (workerRealmCount > 0) || !!options.workersOnly;
 
         const needsStartDb = !hasOnlyOptions || !!options.dbOnly;
         const startRealmId = options.startRealmId || 0;
@@ -333,9 +333,10 @@ class DevNetProcessManager {
             ));
 
             // 4. Coordinator Edges (Scalable)
+            const coordEdgePromises: Promise<RunningProcess>[] = [];
             for (let j = 0; j < coordinatorEdgeCount; j++) {
                 const port = 1337 + j;
-                await this.track(await RunningProcess.spawnWithInitializationHint(
+                const edgePromise = RunningProcess.spawn(
                     [
                         nodeCli, 'start-coordinator-edge',
                         '--coordinator-id', '0',
@@ -350,10 +351,11 @@ class DevNetProcessManager {
                         '--proving-backend', backend,
                         '--verbose'
                     ],
-                    coordinatorEdgeProcessorStartedDetector,
                     { cwd, ...getLogPaths(`coordinator_edge_${j}`, true) }
-                ));
+                ).then(proc => this.track(proc));
+                coordEdgePromises.push(edgePromise);
             }
+            await Promise.all(coordEdgePromises);
         }
 
         // 5. Coordinator Workers
@@ -379,15 +381,23 @@ class DevNetProcessManager {
         }
 
         if (startRealmProcessor) {
-            // 6. Realm Processor
+            console.log(`[DevNet] Starting ${realmsCount} realm processors and edges in parallel...`);
+
+            // Clean all checkpoints first
+            console.log(`[DevNet] Cleaning checkpoints for ${realmsCount} realms...`);
+            for (let i = 0; i < realmsCount; i++) {
+                const realmId = startRealmId + i;
+                await cleanCheckpoint('./local_checkpoints/realm_' + realmId + '_1', cwd);
+            }
+
+            // Start all realm processors and edges in parallel
+            const realmPromises: Promise<RunningProcess>[] = [];
             for (let i = 0; i < realmsCount; i++) {
                 const realmId = startRealmId + i;
                 const realmEdgeStartPort = 13380 + realmId * 10;
 
-                console.log(`[DevNet] Starting Realm Processor ${realmId}...`);
-
-                await cleanCheckpoint('./local_checkpoints/realm_' + realmId + '_1', cwd);
-                await this.track(await RunningProcess.spawnWithInitializationHint(
+                // Start realm processor
+                const processorPromise = RunningProcess.spawn(
                     [
                         nodeCli, 'start-realm-processor',
                         '--realm-id', realmId.toString(),
@@ -402,14 +412,14 @@ class DevNetProcessManager {
                         '--proving-backend', backend,
                         '--verbose'
                     ],
-                    realmProcessorStartedDetector,
                     { cwd, ...getLogPaths(`realm_${realmId}_processor`, false) }
-                ));
+                ).then(proc => this.track(proc));
+                realmPromises.push(processorPromise);
 
-                // 7. Realm Edges (Scalable)
+                // Start realm edges
                 for (let j = 0; j < realmEdgeCount; j++) {
                     const port = realmEdgeStartPort + j;
-                    await this.track(await RunningProcess.spawnWithInitializationHint(
+                    const edgePromise = RunningProcess.spawn(
                         [
                             nodeCli, 'start-realm-edge',
                             '--realm-id', realmId.toString(),
@@ -424,14 +434,22 @@ class DevNetProcessManager {
                             '--proving-backend', backend,
                             '--verbose'
                         ],
-                        realmEdgeProcessorStartedDetector,
                         { cwd, ...getLogPaths(`realm_edge_${realmId}_${j}`, true) }
-                    ));
+                    ).then(proc => this.track(proc));
+                    realmPromises.push(edgePromise);
                 }
             }
+
+            // Wait for all realm processes to start
+            await Promise.all(realmPromises);
+            console.log(`[DevNet] All realm processors and edges started`);
         }
 
         if (startRealmWorkers) {
+            console.log(`[DevNet] Starting realm workers for ${realmsCount} realms...`);
+
+            // Start all realm workers in parallel
+            const workerPromises: Promise<RunningProcess>[] = [];
             for (let i = 0; i < realmsCount; i++) {
                 const realmId = startRealmId + i;
                 const realmEdgeStartPort = 13380 + realmId * 10;
@@ -442,7 +460,7 @@ class DevNetProcessManager {
                     const edgePort = realmEdgeStartPort + (k % realmEdgeCount);
                     const realmUrl = `http://${this.host}:${edgePort}`;
 
-                    await this.track(await RunningProcess.spawnWithInitializationHint(
+                    const workerPromise = RunningProcess.spawn(
                         [
                             workerCli, 'worker',
                             '--user', '0',
@@ -451,11 +469,15 @@ class DevNetProcessManager {
                             '--realm-api-url', realmUrl,
                             '--private-key', FAKE_MINER_PRIVATE_KEY,
                         ],
-                        workerStartedDetector,
                         { cwd, ...getLogPaths(`realm_worker_${realmId}_${k}`, true) }
-                    ));
+                    ).then(proc => this.track(proc));
+                    workerPromises.push(workerPromise);
                 }
             }
+
+            // Wait for all worker processes to start
+            await Promise.all(workerPromises);
+            console.log(`[DevNet] All realm workers started`);
         }
     }
 
@@ -527,7 +549,7 @@ Usage: bun run dev/locSetupV4.ts [options]
    --coordinator-workers <count>   Number of coordinator workers (default: 1 when starting coordinator, 0 in only modes)
    --start-realm-id <id>           Starting realm ID (default: 0)
    --end-realm-id <id>             Ending realm ID (inclusive, default: 127 when starting full system)
-   --realm-only                    Start only realms (requires database and coordinator to be running)
+   --realm-only                    Start only realm processors and edges (requires database and coordinator to be running)
    --coordinator-only              Start only coordinator (requires database to be running)
    --db-only                       Start only database services
    --workers-only                  Start only workers (requires database to be running)
