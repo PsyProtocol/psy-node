@@ -50,12 +50,20 @@ use rayon::{iter::ParallelIterator, slice::ParallelSlice};
 // ================================================================================================
 
 /// An in-memory, concurrent database implementation using `crossbeam-skiplist` and `dashmap`.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct InMemoryCoreStore<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash> + Send + Sync> {
     /// Stores most tables as SkipMaps of byte vectors. The String key is the table name.
-    tables: DashMap<String, Arc<SkipMap<Vec<u8>, Vec<u8>>>>,
+    tables: Arc<DashMap<String, Arc<SkipMap<Vec<u8>, Vec<u8>>>>>,
     /// Stores U64-keyed tables for atomic operations.
-    u64_tables: DashMap<String, Arc<DashMap<u64, AtomicU64>>>,
+    u64_tables: Arc<DashMap<String, Arc<DashMap<u64, AtomicU64>>>>,
+    /// Keyspace name for table naming (similar to ScyllaDB keyspace)
+    pub keyspace: String,
+    /// No-tablet keyspace name (for compatibility with ScyllaDB interface)
+    pub no_tablet_keyspace: String,
+    /// Realm ID (for compatibility with ScyllaDB interface)
+    pub realm_id: u64,
+    /// Realm Sub ID (for compatibility with ScyllaDB interface)
+    pub realm_sub_id: u64,
     _phantom_hash: PhantomData<Hash>,
     _phantom_hasher: PhantomData<Hasher>,
 }
@@ -70,8 +78,27 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash> + Send + Sync> InMemoryCore
     /// Creates a new, empty in-memory store.
     pub fn new() -> Self {
         Self {
-            tables: DashMap::new(),
-            u64_tables: DashMap::new(),
+            tables: Arc::new(DashMap::new()),
+            u64_tables: Arc::new(DashMap::new()),
+            keyspace: String::new(),
+            no_tablet_keyspace: String::new(),
+            realm_id: 0,
+            realm_sub_id: 0,
+            _phantom_hash: PhantomData,
+            _phantom_hasher: PhantomData,
+        }
+    }
+
+    /// Creates a new in-memory store with keyspace (for compatibility with ScyllaDB interface).
+    pub fn new_with_keyspace(realm_id: u64, realm_sub_id: u64, keyspace: String) -> Self {
+        let no_tablet_keyspace = format!("{}_no_tablet", keyspace);
+        Self {
+            tables: Arc::new(DashMap::new()),
+            u64_tables: Arc::new(DashMap::new()),
+            keyspace,
+            no_tablet_keyspace,
+            realm_id,
+            realm_sub_id,
             _phantom_hash: PhantomData,
             _phantom_hasher: PhantomData,
         }
@@ -91,6 +118,73 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash> + Send + Sync> InMemoryCore
             .entry(name.to_string())
             .or_insert_with(|| Arc::new(DashMap::new()))
             .clone()
+    }
+
+    /// Initialize a standard table (for compatibility with ScyllaDB interface).
+    /// In memory DB, this just creates and returns a table identifier.
+    /// The generic type T is always InMemoryTableIdentifier for memory DB.
+    pub async fn init_std_table<T>(
+        &self,
+        table_name: &str,
+        _table_key: parth_core::data::db::table::QDatabaseTableRoutingKey,
+    ) -> anyhow::Result<T>
+    where
+        T: From<InMemoryTableIdentifier>,
+    {
+        let full_name = if self.keyspace.is_empty() {
+            table_name.to_string()
+        } else {
+            format!("{}-{}", self.keyspace, table_name)
+        };
+        let identifier = InMemoryTableIdentifier {
+            full_name,
+            tree_height: 0,
+        };
+        Ok(T::from(identifier))
+    }
+
+    /// Initialize a no-tablet table (for compatibility with ScyllaDB interface).
+    /// In memory DB, this uses the no_tablet_keyspace for naming.
+    pub async fn init_no_tablet_table<T>(
+        &self,
+        table_name: &str,
+        _table_key: parth_core::data::db::table::QDatabaseTableRoutingKey,
+    ) -> anyhow::Result<T>
+    where
+        T: From<InMemoryTableIdentifier>,
+    {
+        let full_name = if self.no_tablet_keyspace.is_empty() {
+            format!("{}_no_tablet-{}", self.keyspace, table_name)
+        } else {
+            format!("{}-{}", self.no_tablet_keyspace, table_name)
+        };
+        let identifier = InMemoryTableIdentifier {
+            full_name,
+            tree_height: 0,
+        };
+        Ok(T::from(identifier))
+    }
+
+    /// Initialize a zero-id merkle table (for compatibility with ScyllaDB interface).
+    pub async fn init_zero_id_merkle_table<T>(
+        &self,
+        table_name: &str,
+        _table_key: parth_core::data::db::table::QDatabaseTableRoutingKey,
+        tree_height: u8,
+    ) -> anyhow::Result<T>
+    where
+        T: From<InMemoryTableIdentifier>,
+    {
+        let full_name = if self.keyspace.is_empty() {
+            table_name.to_string()
+        } else {
+            format!("{}-{}", self.keyspace, table_name)
+        };
+        let identifier = InMemoryTableIdentifier {
+            full_name,
+            tree_height,
+        };
+        Ok(T::from(identifier))
     }
 
 }

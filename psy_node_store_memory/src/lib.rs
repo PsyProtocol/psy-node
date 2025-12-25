@@ -5,3 +5,5 @@ pub use v2::*;
 pub mod utils;
 
 pub mod temp_store;
+pub mod psy_setup;
+pub use psy_setup::{MemoryUnifiedPsyStore, setup_psy_memory_database_store, setup_psy_memory_database_store_from_keyspace};
