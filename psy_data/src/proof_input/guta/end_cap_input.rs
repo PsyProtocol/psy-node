@@ -116,7 +116,7 @@ impl<F: QFelt64, Hash: QFHashBase<F> + std::fmt::Debug> SubmitUserEndCapNonProof
         if !old_user_leaf.is_first_transaction_old_user_leaf() && old_leaf_hash != self.core.state_transition.start_user_leaf_hash {
             anyhow::bail!("invalid old_user_leaf");
         }
-        if old_user_leaf.last_checkpoint_id.to_u64_value() >= self.core.checkpoint_id.to_u64_value() {
+        if old_user_leaf.last_checkpoint_id.to_u64_value() != 0 && old_user_leaf.last_checkpoint_id.to_u64_value() >= self.core.checkpoint_id.to_u64_value() {
             anyhow::bail!(
                 "old_user_leaf last_checkpoint_id {} is not less than end cap checkpoint_id {}",
                 old_user_leaf.last_checkpoint_id.to_u64_value(),

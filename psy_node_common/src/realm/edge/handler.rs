@@ -272,7 +272,7 @@ impl<
         timer.lap_micros("get_user_leaf_data_internal");
         let user_last_checkpoint_id = old_user_leaf.last_checkpoint_id.to_u64_value();
 
-        if user_last_checkpoint_id > secondary_end_cap_checkpoint_id {
+        if user_last_checkpoint_id!= 0 && user_last_checkpoint_id > secondary_end_cap_checkpoint_id {
             anyhow::bail!(
                 "Submitted end cap for checkpoint {}, but user's last checkpoint is {}",
                 end_cap_checkpoint_id,
