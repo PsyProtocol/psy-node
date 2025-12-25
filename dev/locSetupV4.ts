@@ -267,6 +267,7 @@ interface ProcessOptions {
     dbOnly?: boolean;
     workersOnly?: boolean;
     dummyProversCount?: number;
+    genesisDataPath?: string;
 }
 
 class DevNetProcessManager {
@@ -280,6 +281,7 @@ class DevNetProcessManager {
     private readonly NATS_URL: string;
     private readonly REDIS_URL: string;
     private readonly COORD_API_URL: string;
+    private genesisDataPath: string = "genesis.json";
 
     constructor(host: string = "127.0.0.1") {
         this.host = host;
@@ -301,6 +303,7 @@ class DevNetProcessManager {
         const realmEdgeCount = options.realmEdgeCount;
         const coordinatorEdgeCount = options.coordinatorEdgeCount;
         const coordinatorWorkersCount = options.coordinatorWorkersCount;
+        this.genesisDataPath = options.genesisDataPath || "genesis.json";
 
 
         const disableWorkerEdgeLogs = !!options.disableWorkerEdgeLogs;
@@ -374,6 +377,7 @@ class DevNetProcessManager {
                     '--scylla-db-url', this.SCYLLA_URL,
                     '--nats-jetstream-url', this.NATS_URL,
                     '--redis-url', this.REDIS_URL,
+                            '--genesis-data-path', this.genesisDataPath,
                     '--checkpoint-backup-path', './local_checkpoints',
                     '--proving-backend', backend,
                     '--verbose'
@@ -472,6 +476,7 @@ class DevNetProcessManager {
                             '--scylla-db-url', this.SCYLLA_URL,
                             '--nats-jetstream-url', this.NATS_URL,
                             '--redis-url', this.REDIS_URL,
+                    '--genesis-data-path', this.genesisDataPath,
                             '--checkpoint-backup-path', './local_checkpoints',
                             '--coordinator-api-urls', this.COORD_API_URL,
                             '--proving-backend', backend,
@@ -619,6 +624,7 @@ async function runMain() {
             "start-realm-id": { type: "string", default: "0" },
             "end-realm-id": { type: "string" },
             "host": { type: "string", default: "127.0.0.1" },
+            "genesis-data-path": { type: "string", default: "genesis.json" },
             "coordinator-only": { type: "boolean" },
             "db-only": { type: "boolean" },
             "realm-only": { type: "boolean" },
@@ -637,6 +643,7 @@ async function runMain() {
     const startRealmId = parseInt(values["start-realm-id"] || "0", 10);
     const endRealmId = values["end-realm-id"] ? parseInt(values["end-realm-id"], 10) : startRealmId;
     const host = values["host"] || "127.0.0.1";
+    const genesisDataPath = values["genesis-data-path"] || "genesis.json";
     const realmOnly = !!values["realm-only"];
     const coordinatorOnly = !!values["coordinator-only"];
     const dbOnly = !!values["db-only"];
@@ -653,6 +660,7 @@ Usage: bun run dev/locSetupV4.ts [options]
 
  Options:
    --host <ip>                     Target host IP (default: 127.0.0.1)
+   --genesis-data-path <path>      Path to genesis data JSON file for processor nodes (default: genesis.json)
    --jtmb                          Use JTMB proving backend instead of Plonky2
    --disable-worker-edge-logs      Disable logging for worker and edge processes
    --realm-workers <count>         Number of shared workers distributed across all realms (default: 1 when starting full system)
@@ -668,12 +676,15 @@ Usage: bun run dev/locSetupV4.ts [options]
    --dummy-provers-only <count>    Start only dummy provers within the specified realm range (requires database, coordinator, and realms to be running)
    --help, -h                      Show this help message
 
-Examples:
+ Examples:
    # Start full system (default when no options specified)
    bun run dev/locSetupV4.ts  # starts all components with realms 0-127
 
    # Start full system with specific realm range
    bun run dev/locSetupV4.ts --end-realm-id 3  # realms 0,1,2,3
+
+   # Start with custom genesis data
+   bun run dev/locSetupV4.ts --genesis-data-path ./my-genesis.json  # use custom genesis file
 
    # Start with workers
    bun run dev/locSetupV4.ts --coordinator-workers 2 --realm-workers 1  # coordinator + realms with workers
@@ -719,6 +730,7 @@ Notes:
             dbOnly,
             workersOnly,
             dummyProversCount,
+            genesisDataPath,
         });
         console.log('DevNet started. Press Ctrl+C to stop.');
         setInterval(() => { }, 1000 * 60);
