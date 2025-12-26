@@ -11,8 +11,6 @@ use psy_data::{
         }}
     ,
 };
-
-
 #[rpc(server, client, namespace = "psy")]
 pub trait RealmEdgeRpcTest {
     #[method(name = "get_sum")]
@@ -36,6 +34,13 @@ pub trait RealmEdgeRpc<F, Hash, JobId, ZKProof> {
         user_ec_input: SubmitUserEndCapNonProofInput<F, Hash>,
         proof: Vec<u8>,
     ) -> RpcResult<String>;
+
+    /// Submit user end cap proofs in batch
+    #[method(name = "submit_user_end_cap_batch")]
+    async fn submit_user_end_cap_batch(
+        &self,
+        requests: Vec<(SubmitUserEndCapNonProofInput<F, Hash>, Vec<u8>)>,
+    ) -> RpcResult<Vec<u64>>;
 
     #[method(name = "get_checkpoint_leaf_data")]
     async fn get_checkpoint_leaf_data(&self, checkpoint_id: u64)

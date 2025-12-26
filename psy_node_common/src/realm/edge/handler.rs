@@ -532,10 +532,20 @@ impl<
 
     }
 
-    // do not implement this yet
     async fn submit_user_end_cap(&self, user_ec_input: SubmitUserEndCapNonProofInput<N::F, N::QHash>, proof: Vec<u8>) -> QRpcResult<String> {
         res(self.handle_user_end_cap_proof_submission(user_ec_input, proof).await)?;
         Ok("ok".to_string())
+    }
+
+    async fn submit_user_end_cap_batch(&self, requests: Vec<(SubmitUserEndCapNonProofInput<N::F, N::QHash>, Vec<u8>)>) -> QRpcResult<Vec<u64>> {
+        let mut failed_user_ids = Vec::new();
+        for (user_ec_input, proof) in requests {
+            let user_id: u64 = user_ec_input.core.state_transition.user_id.to_u64_value();
+            if let Err(_) = self.handle_user_end_cap_proof_submission(user_ec_input, proof).await {
+                failed_user_ids.push(user_id);
+            }
+        }
+        Ok(failed_user_ids)
     }
 
     async fn get_checkpoint_leaf_data(&self, checkpoint_id: u64) -> QRpcResult<PQEDCheckpointLeaf<N::F, N::QHash>> {
