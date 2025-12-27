@@ -815,6 +815,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
                         vec![(job_id, witness.psy_ser_into_bytes_vec()?)],
                     )
                     .await?;
+                self.total_jobs += 1;
                 return Ok(Some(RealmGUTAEndCapGathererOutput {
                     db_output: RealmGUTAEndCapGathererOutputDatabase {
                         total_users_updated: self.total_end_caps_processed as u64,

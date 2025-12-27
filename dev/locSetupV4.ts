@@ -79,14 +79,15 @@ class RunningProcess {
         this.proc.kill(signal);
     }
 
-    static async spawn(cmds: string[], options: { cwd?: string, stdOutVisitor?: ProcessLineVisitor, stdErrVisitor?: ProcessLineVisitor, allOutputVisitor?: ProcessLineVisitor, stdoutLogFile?: string, stderrLogFile?: string }): Promise<RunningProcess> {
+    static async spawn(cmds: string[], options: { cwd?: string, stdOutVisitor?: ProcessLineVisitor, stdErrVisitor?: ProcessLineVisitor, allOutputVisitor?: ProcessLineVisitor, stdoutLogFile?: string, stderrLogFile?: string, env?: { [key: string]: string } }): Promise<RunningProcess> {
         if (options.stdoutLogFile) await Bun.write(options.stdoutLogFile, "");
         if (options.stderrLogFile) await Bun.write(options.stderrLogFile, "");
 
         const proc = Bun.spawn(cmds, {
             cwd: options.cwd || undefined,
             stdout: "pipe",
-            stderr: "pipe"
+            stderr: "pipe",
+            env: options.env || undefined
         });
 
         const runningProcess = new RunningProcess(proc, options.stdOutVisitor, options.stdErrVisitor, options.allOutputVisitor);
@@ -116,11 +117,13 @@ class RunningProcess {
         if (proc.stderr) {
             let readableStream = proc.stderr;
             if (options.stderrLogFile) {
-                const [fileBranch, logicBranch] = proc.stderr.tee();
+                const [fileBranch, logicBranch] = readableStream.tee();
                 readableStream = logicBranch as any;
                 (async () => {
                     const sink = Bun.file(options.stderrLogFile!).writer();
-                    for await (const chunk of fileBranch) { sink.write(chunk); }
+                    for await (const chunk of fileBranch) {
+                        sink.write(chunk);
+                    }
                     sink.end();
                 })();
             }
@@ -144,7 +147,7 @@ class RunningProcess {
     }
 
 
-    static spawnWithInitializationHint(cmds: string[], hintDetector: (line: string) => boolean, options: { cwd?: string, stdOutVisitor?: ProcessLineVisitor, stdErrVisitor?: ProcessLineVisitor, allOutputVisitor?: ProcessLineVisitor, stdoutLogFile?: string, stderrLogFile?: string }): Promise<RunningProcess> {
+    static spawnWithInitializationHint(cmds: string[], hintDetector: (line: string) => boolean, options: { cwd?: string, stdOutVisitor?: ProcessLineVisitor, stdErrVisitor?: ProcessLineVisitor, allOutputVisitor?: ProcessLineVisitor, stdoutLogFile?: string, stderrLogFile?: string, env?: { [key: string]: string } }): Promise<RunningProcess> {
         return new Promise<RunningProcess>(async (resolve, reject) => {
             let initialized = false;
             const allOutputVisitor: ProcessLineVisitor = (line: string, process: RunningProcess) => {
@@ -162,7 +165,8 @@ class RunningProcess {
                 stdErrVisitor: options.stdErrVisitor,
                 allOutputVisitor: allOutputVisitor,
                 stdoutLogFile: options.stdoutLogFile,
-                stderrLogFile: options.stderrLogFile
+                stderrLogFile: options.stderrLogFile,
+                env: options.env
             });
             proc.onExit = (code: number | null, signal: number | null) => {
                 if (!initialized) {
@@ -190,7 +194,8 @@ class RunningProcess {
             stdoutLogFile?: string,
             stderrLogFile?: string,
             maxRetries?: number,
-            retryDelayMs?: number
+            retryDelayMs?: number,
+            env?: { [key: string]: string }
         }
     ): Promise<RunningProcess> {
         return new Promise<RunningProcess>(async (resolve, reject) => {
@@ -209,7 +214,8 @@ class RunningProcess {
                         stdErrVisitor: options.stdErrVisitor,
                         allOutputVisitor: options.allOutputVisitor,
                         stdoutLogFile: options.stdoutLogFile,
-                        stderrLogFile: options.stderrLogFile
+                        stderrLogFile: options.stderrLogFile,
+                        env: options.env
                     });
                     console.log(`[DevNet] Process initialized successfully`);
                     resolve(proc);
@@ -282,18 +288,27 @@ class DevNetProcessManager {
     private readonly REDIS_URL: string;
     private readonly COORD_API_URL: string;
     private genesisDataPath: string = "genesis.json";
+    private envVars: { [key: string]: string } | undefined;
 
-    constructor(host: string = "127.0.0.1") {
+    constructor(host: string = "127.0.0.1", envVars?: { [key: string]: string }) {
         this.host = host;
         this.SCYLLA_URL = `${host}:9042`;
         this.NATS_URL = `nats://${host}:4222`;
         this.REDIS_URL = `redis://${host}:6379`;
         this.COORD_API_URL = `http://${host}:1337`;
+        this.envVars = envVars;
     }
 
     private track(p: RunningProcess): RunningProcess {
         this.spawnedProcesses.push(p);
         return p;
+    }
+
+    private getEnv(): { [key: string]: string } | undefined {
+        if (this.envVars) {
+            return { ...process.env, ...this.envVars };
+        }
+        return undefined;
     }
 
     async setupProcesses(options: ProcessOptions): Promise<void> {
@@ -383,7 +398,7 @@ class DevNetProcessManager {
                     '--verbose'
                 ],
                 coordinatorProcessorStartedDetector,
-                { cwd, ...getLogPaths("coordinator_processor", false), maxRetries: 3, retryDelayMs: 2000 }
+                { cwd, ...getLogPaths("coordinator_processor", false), maxRetries: 3, retryDelayMs: 2000, env: this.getEnv() }
             ));
 
             // 4. Coordinator Edges (Scalable)
@@ -406,7 +421,7 @@ class DevNetProcessManager {
                         '--verbose'
                     ],
                     coordinatorEdgeProcessorStartedDetector,
-                    { cwd, ...getLogPaths(`coordinator_edge_${j}`, true), maxRetries: 3, retryDelayMs: 2000 }
+                    { cwd, ...getLogPaths(`coordinator_edge_${j}`, true), maxRetries: 3, retryDelayMs: 2000, env: this.getEnv() }
                 ).then(proc => this.track(proc));
                 coordEdgePromises.push(edgePromise);
             }
@@ -441,7 +456,7 @@ class DevNetProcessManager {
                 await this.track(await RunningProcess.spawnWithInitializationHintWithRetry(
                     workerArgs,
                     workerStartedDetector,
-                    { cwd, ...getLogPaths(`coordinator_worker_${i}`, true), maxRetries: 3, retryDelayMs: 2000 }
+                    { cwd, ...getLogPaths(`coordinator_worker_${i}`, true), maxRetries: 3, retryDelayMs: 2000, env: this.getEnv() }
                 ));
             }
         }
@@ -483,7 +498,7 @@ class DevNetProcessManager {
                             '--verbose'
                         ],
                         realmProcessorStartedDetector,
-                        { cwd, ...getLogPaths(`realm_${realmId}_processor`, false), maxRetries: 3, retryDelayMs: 2000 }
+                        { cwd, ...getLogPaths(`realm_${realmId}_processor`, false), maxRetries: 3, retryDelayMs: 2000, env: this.getEnv() }
                     ).then(proc => this.track(proc));
                     realmPromises.push(processorPromise);
 
@@ -506,7 +521,7 @@ class DevNetProcessManager {
                                 '--verbose'
                             ],
                             realmEdgeProcessorStartedDetector,
-                            { cwd, ...getLogPaths(`realm_edge_${realmId}_${j}`, true), maxRetries: 3, retryDelayMs: 2000 }
+                            { cwd, ...getLogPaths(`realm_edge_${realmId}_${j}`, true), maxRetries: 3, retryDelayMs: 2000, env: this.getEnv() }
                         ).then(proc => this.track(proc));
                         realmPromises.push(edgePromise);
                     }
@@ -559,7 +574,7 @@ class DevNetProcessManager {
                 const workerPromise = RunningProcess.spawnWithInitializationHintWithRetry(
                     workerArgs,
                     workerStartedDetector,
-                    { cwd, ...getLogPaths(`worker_${workerId}`, true), maxRetries: 3, retryDelayMs: 2000 }
+                    { cwd, ...getLogPaths(`worker_${workerId}`, true), maxRetries: 3, retryDelayMs: 2000, env: this.getEnv() }
                 ).then(proc => this.track(proc));
                 workerPromises.push(workerPromise);
             }
@@ -585,7 +600,7 @@ class DevNetProcessManager {
                         '--end-realm-id', endRealmId.toString()
                     ],
                     dummyProverStartedDetector,
-                    { cwd, ...getLogPaths(`dummy_prover_${i}`, true), maxRetries: 3, retryDelayMs: 2000 }
+                    { cwd, ...getLogPaths(`dummy_prover_${i}`, true), maxRetries: 3, retryDelayMs: 2000, env: this.getEnv() }
                 ).then(proc => this.track(proc));
                 dummyPromises.push(dummyPromise);
             }
@@ -630,6 +645,7 @@ async function runMain() {
             "realm-only": { type: "boolean" },
             "workers-only": { type: "boolean" },
             "dummy-provers-only": { type: "string" },
+            env: { type: "string" },
             "help": { type: "boolean", short: "h" },
         },
         allowPositionals: true,
@@ -649,7 +665,21 @@ async function runMain() {
     const dbOnly = !!values["db-only"];
     const workersOnly = !!values["workers-only"];
     const dummyProversCount = values["dummy-provers-only"] ? parseInt(values["dummy-provers-only"], 10) : 0;
+    const envString = values["env"];
     const help = !!values["help"];
+
+    // Parse environment variables
+    let envVars: { [key: string]: string } | undefined;
+    if (envString) {
+        envVars = {};
+        const pairs = envString.split(',');
+        for (const pair of pairs) {
+            const [key, value] = pair.split('=');
+            if (key && value) {
+                envVars[key.trim()] = value.trim();
+            }
+        }
+    }
 
     // Show help if requested
     if (help) {
@@ -659,9 +689,10 @@ Psy Network DevNet Setup Tool
 Usage: bun run dev/locSetupV4.ts [options]
 
  Options:
-   --host <ip>                     Target host IP (default: 127.0.0.1)
-   --genesis-data-path <path>      Path to genesis data JSON file for processor nodes (default: genesis.json)
-   --jtmb                          Use JTMB proving backend instead of Plonky2
+    --host <ip>                     Target host IP (default: 127.0.0.1)
+    --genesis-data-path <path>      Path to genesis data JSON file for processor nodes (default: genesis.json)
+    --env <vars>                    Environment variables to pass to processes (format: KEY1=VALUE1,KEY2=VALUE2)
+    --jtmb                          Use JTMB proving backend instead of Plonky2
    --disable-worker-edge-logs      Disable logging for worker and edge processes
    --realm-workers <count>         Number of shared workers distributed across all realms (default: 1 when starting full system)
    --realm-edge-nodes <count>      Number of edge nodes per realm (default: 1)
@@ -705,7 +736,7 @@ Notes:
         process.exit(0);
     }
 
-    globalManager = DevNetProcessManager.create(host);
+    globalManager = DevNetProcessManager.create(host, envVars);
 
     const shutdown = () => {
         if (globalManager) globalManager.teardown();
