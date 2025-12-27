@@ -25,7 +25,9 @@ pub async fn run_dummy_prover_lite<
     max_state_updates_per_call: u32,
     max_contract_calls_per_uop: u32,
     global_contract_tree_height: u8,
-    global_user_tree_height: u8,
+    coordinator_global_user_tree_height: u8,
+    realm_global_user_tree_height: u8,
+    group_realm_height: u8,
     mut run_count: usize,
 ) -> anyhow::Result<()> {
     let mut timer = TraceTimer::new("dp_lite");
@@ -34,12 +36,16 @@ pub async fn run_dummy_prover_lite<
     let mut chain = DPUserSimulationChainState::<Hasher, Hash, F, DF>::new_populate_first_100_contract_ids(
         (start_user_id..end_user_id).collect::<Vec<_>>(),
         global_contract_tree_height,
+        coordinator_global_user_tree_height,
+        realm_global_user_tree_height,
+        group_realm_height,
         min_state_updates_per_call,
         max_state_updates_per_call,
         max_contract_calls_per_uop,
         data_fetcher.clone(),
     )
     .await?;
+let global_user_tree_height = coordinator_global_user_tree_height + realm_global_user_tree_height;
     timer.lap("create simulation chain state");
     chain.init_first().await?;
     timer.lap_batch("init_first", "user", total_users as usize);

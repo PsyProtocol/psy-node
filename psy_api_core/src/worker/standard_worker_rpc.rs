@@ -1,6 +1,6 @@
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
 use parth_core::{crypto::secp256k1::{QEDCompressedSecp256K1Signature, SimpleTimedRequest}, node::realm_identifier::QRealmIdentifier};
-use psy_data::worker::api_response::{PsyWorkerGetProvingWorkAPIResponse, PsyWorkerGetProvingWorkWithChildProofsAPIResponse};
+use psy_data::{node::node_proving_state::PsyNodeProvingState, worker::api_response::{PsyWorkerGetProvingWorkAPIResponse, PsyWorkerGetProvingWorkWithChildProofsAPIResponse}};
 
 
 
@@ -16,5 +16,8 @@ pub trait NodeEdgeWorkerRpc<Hash, JobId> {
     
     #[method(name = "get_realm_identifier_worker_api")]
     async fn get_realm_identifier_worker_api(&self) -> RpcResult<QRealmIdentifier>;
+
+    #[method(name = "get_node_proving_state")]
+    async fn get_node_proving_state(&self) -> RpcResult<PsyNodeProvingState>;
 }
 

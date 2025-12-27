@@ -1,5 +1,5 @@
 use parth_common::memory_stores::simple_merkle_tree::SimpleMerkleTree;
-use parth_core::{crypto::hash::{merkle_proof::MerkleProofCore, traits::{FieldQHasher, MerkleZeroHasher}}, felt::QFelt64, pgoldilocks::{QHashOut, QRichField}, protocol::core_types::{Q256BitHash, QFHashBase}};
+use parth_core::{crypto::hash::{merkle_proof::MerkleProofCore, traits::{FieldQHasher, MerkleZeroHasher}}, felt::QFelt64, pgoldilocks::{QGenericConfig, QHashOut, QRichField}, protocol::core_types::{Q256BitHash, QFHashBase}};
 use plonky2::{
     hash::hash_types::HashOut,
     plonk::{
@@ -55,7 +55,7 @@ where
     pub no_change_whitelist_proof: MerkleProofCore<QHashOut<C::F>>,
 }
 
-impl<C: GenericConfig<D> + 'static, const D: usize> QEDGUTACircuitManager<C, D>
+impl<C: QGenericConfig<D> + 'static, const D: usize> QEDGUTACircuitManager<C, D>
 where
     C::Hasher: AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + MerkleZeroHasher<QHashOut<C::F>>, C::F: QRichField,
 {
@@ -461,7 +461,7 @@ where
 
 
 
-impl<Library: CircuitInfoLibrary<C, D>, C: GenericConfig<D> + 'static, const D: usize> PsyWorkerGenericLibraryProver<QHashOut<C::F>,QProvingJobDataID, Library> for QEDGUTACircuitManager<C, D>
+impl<Library: CircuitInfoLibrary<C, D>, C: QGenericConfig<D> + 'static, const D: usize> PsyWorkerGenericLibraryProver<QHashOut<C::F>,QProvingJobDataID, Library> for QEDGUTACircuitManager<C, D>
 where
      C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + FieldQHasher<C::F, QHashOut<C::F>>, QHashOut<C::F>: Q256BitHash + QFHashBase<C::F>, C::F: QFelt64 + QRichField,
 {

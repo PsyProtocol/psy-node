@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use parth_core::{
     crypto::hash::{merkle_proof::MerkleProofCore, traits::MerkleZeroHasher},
     felt::QFelt64,
-    pgoldilocks::{QHashOut, QRichField},
+    pgoldilocks::{QGenericConfig, QHashOut, QRichField},
     protocol::core_types::Q256BitHash,
 };
 use plonky2::{
@@ -255,7 +255,7 @@ where
 }
 
 #[async_trait]
-impl<L: CircuitInfoLibrary<C, D>, C: GenericConfig<D>, const D: usize> QStandardCircuitProvableWithRawProofsAndRefLibrary<L, C, D>
+impl<L: CircuitInfoLibrary<C, D>, C: QGenericConfig<D>, const D: usize> QStandardCircuitProvableWithRawProofsAndRefLibrary<L, C, D>
     for GUTAVerifyTwoGUTAUpgradeCheckpointCircuitV2<C, D>
 where
     C::Hasher: AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + MerkleZeroHasher<QHashOut<C::F>>,

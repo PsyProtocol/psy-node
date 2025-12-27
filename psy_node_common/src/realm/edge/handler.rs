@@ -15,17 +15,14 @@ use parth_core::{
 use psy_api_core::{realm::standard_edge_rpc::RealmEdgeRpcServer, worker::standard_worker_rpc::NodeEdgeWorkerRpcServer};
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{
-    proof_input::guta::end_cap_input::SubmitUserEndCapNonProofInput,
-    queue_items::realm_user_update::PsyRealmUserUpdateQueueItem,
-    v1::{
+    node::node_proving_state::PsyNodeProvingState, proof_input::guta::end_cap_input::SubmitUserEndCapNonProofInput, queue_items::realm_user_update::PsyRealmUserUpdateQueueItem, v1::{
         common_api::PsyProoffMinerRewardProof,
         qdata::{
             checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState},
             contract::{DashMapContractHeightCache, PSimpleContractHeightCache},
             user::PQEDUserLeaf,
         },
-    },
-    worker::api_response::{PsyWorkerGetProvingWorkAPIResponse, PsyWorkerGetProvingWorkWithChildProofsAPIResponse},
+    }, worker::api_response::{PsyWorkerGetProvingWorkAPIResponse, PsyWorkerGetProvingWorkWithChildProofsAPIResponse}
 };
 use psy_node_core::{
     psy_core_db::
@@ -725,5 +722,9 @@ impl<
     }
     async fn get_realm_identifier_worker_api(&self) -> RpcResult<QRealmIdentifier> {
         Ok(self.realm_identifier.clone())
+    }
+
+    async fn get_node_proving_state(&self) -> RpcResult<PsyNodeProvingState>{
+        res(self.temp_db.get_psy_node_proving_state(&self.realm_identifier).await)
     }
 }

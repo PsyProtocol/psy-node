@@ -1,7 +1,7 @@
 
 use cf_utils::timer::DebugTimer;
 use parth_core::pgoldilocks::QHashOut;
-use plonky2::{field::goldilocks_field::GoldilocksField, plonk::{config::PoseidonGoldilocksConfig, proof::ProofWithPublicInputs, verifier_v2::verify_standard_proof}};
+use plonky2::{field::goldilocks_field::GoldilocksField, plonk::{config::PoseidonGoldilocksConfig, proof::ProofWithPublicInputs, verifier_helper::verify_proof_borrowed}};
 use psy_plonky2_basic_helpers::{lookalike::standard::get_end_cap_type_e_common_data, verifier::alt::AltVerifierOnlyCircuitData};
 use psy_plonky2_circuits::{end_cap::dummy::DummyUPSStandardEndCapCircuit, qstandard::QStandardCircuit};
 
@@ -44,7 +44,7 @@ impl DummyProofBenchHelper {
         for i in 0..100{
             for j in 0..len {
                 let proof = &self.proofs[(i + j)% len];
-                let res = verify_standard_proof(
+                let res = verify_proof_borrowed(
                     proof,
                     &verifier_data,
                     &common_circuit_data,

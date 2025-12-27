@@ -16,7 +16,7 @@ use parth_core::{
     felt::QFelt64,
     protocol::core_types::{Q256BitHash, QFHashBase, QNetworkConstants},
 };
-use psy_core::user_id::get_user_id_from_registration_id;
+use psy_core::user_id::get_user_id_from_user_registration_id;
 use psy_data::{
     genesis::genesis_block_setup::PsyGenesisBlockSetupData,
     prepared_block::{common::PsyCoordinatorPendingCheckpointBase, coordinator::PsyPreparedCoordinatorBlockStateUpdates, realm::{PsyPreparedRealmBlockStateUpdates, PsyPreparedRealmBlockStateUpdatesWithCoordinatorUpdate, PsyRealmCoordinatorUpdate}},
@@ -175,7 +175,7 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
         self.total_users_registered = genesis_block.users.len();
         let user_ids = (0..(genesis_block.users.len() as u64))
             .map(|registration_id| {
-                get_user_id_from_registration_id(
+                get_user_id_from_user_registration_id(
                     registration_id,
                     N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
                     N::REALM_GLOBAL_USER_TREE_HEIGHT,

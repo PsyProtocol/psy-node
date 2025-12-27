@@ -1,5 +1,5 @@
-use parth_core::{crypto::hash::traits::{FieldQHasher, FromU64x4, MerkleZeroHasher}, felt::QFelt64, pgoldilocks::{QHashOut, QRichField}, protocol::core_types::{Q256BitHash, QFHashBase}};
-use plonky2::{hash::hash_types::HashOut, plonk::config::{AlgebraicHasher, GenericConfig}};
+use parth_core::{crypto::hash::traits::{FieldQHasher, FromU64x4, MerkleZeroHasher}, felt::QFelt64, pgoldilocks::{QGenericConfig, QHashOut, QRichField}, protocol::core_types::{Q256BitHash, QFHashBase}};
+use plonky2::{hash::hash_types::HashOut, plonk::config::AlgebraicHasher};
 use psy_core::{constants::{chain_id::PsyChainNetworkType, protocol::get_default_worker_rewards_tree_tag}, job::job_id::ProvingJobCircuitType, network_config::get_circuit_config_for_network};
 use psy_plonky2_basic_helpers::{lookalike::standard::{get_agg_state_transition_type_d_common_data, get_agg_user_registration_deploy_guta_type_f_common_data, get_end_cap_type_e_common_data, get_guta_type_c_common_data}, verifier::{alt::AltVerifierOnlyCircuitData, generic_circuit_library::GenericCircuitVerifier}};
 
@@ -7,7 +7,7 @@ use crate::{circuit_library::end_cap_verifier_data::get_end_cap_alt_verifier_dat
 
 
 
-pub fn get_plonky2_circuit_library_and_prover_for_network<C: GenericConfig<D> + 'static, const D: usize>(
+pub fn get_plonky2_circuit_library_and_prover_for_network<C: QGenericConfig<D> + 'static, const D: usize>(
     network: PsyChainNetworkType,
 ) -> anyhow::Result<(GenericCircuitVerifier<C, D>, QEDCoordinatorCircuitManager<C, D>)> 
 where     C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + FieldQHasher<C::F, QHashOut<C::F>>, QHashOut<C::F>: Q256BitHash + QFHashBase<C::F>, C::F: QFelt64 + QRichField,

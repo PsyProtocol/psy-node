@@ -1,4 +1,4 @@
-use parth_core::{crypto::hash::merkle_proof::MerkleProofCore, pgoldilocks::QHashOut};
+use parth_core::{crypto::hash::merkle_proof::MerkleProofCore, pgoldilocks::{QGenericConfig, QHashOut}};
 use plonky2::{
     hash::hash_types::RichField,
     plonk::{circuit_data::VerifierOnlyCircuitData, config::GenericConfig, proof::ProofWithPublicInputs},
@@ -48,7 +48,7 @@ pub fn get_reward_tags_ensure_expected_child_proof_count<F: RichField>(
     Ok(child_reward_values)
 }
 
-pub fn get_proof_results_for_api_response_with_inclusion_proof<L: CircuitInfoLibrary<C, D>, C: GenericConfig<D>, const D: usize>(
+pub fn get_proof_results_for_api_response_with_inclusion_proof<L: CircuitInfoLibrary<C, D>, C: QGenericConfig<D>, const D: usize>(
     library: &L,
     expected_child_proof_count: usize,
     input: &PsyWorkerGetProvingWorkWithChildProofsAPIResponse<QHashOut<C::F>, QProvingJobDataID>,
@@ -86,7 +86,7 @@ pub fn get_proof_results_for_api_response_with_inclusion_proof<L: CircuitInfoLib
 
 pub fn get_single_child_proof_for_api_response_with_inclusion_proof<
     L: CircuitInfoLibrary<C, D>,
-    C: GenericConfig<D>,
+    C: QGenericConfig<D>,
     const D: usize,
 >(
     library: &L,
@@ -96,7 +96,7 @@ pub fn get_single_child_proof_for_api_response_with_inclusion_proof<
     Ok(proof_results.into_iter().next().unwrap())
 }
 
-pub fn get_two_child_proofs_for_api_response_with_inclusion_proof<L: CircuitInfoLibrary<C, D>, C: GenericConfig<D>, const D: usize>(
+pub fn get_two_child_proofs_for_api_response_with_inclusion_proof<L: CircuitInfoLibrary<C, D>, C: QGenericConfig<D>, const D: usize>(
     library: &L,
     input: &PsyWorkerGetProvingWorkWithChildProofsAPIResponse<QHashOut<C::F>, QProvingJobDataID>,
 ) -> anyhow::Result<(

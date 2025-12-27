@@ -3,7 +3,7 @@ use parth_core::{
         merkle_proof::MerkleProofCore, tag_tree::hash_tag_tree_node_three, traits::{FieldQHasher, MerkleHasher, MerkleZeroHasher}
     },
     felt::QFelt64,
-    pgoldilocks::{QHashOut, QRichField},
+    pgoldilocks::{QGenericConfig, QHashOut, QRichField},
     protocol::core_types::{Q256BitHash, QFHashBase},
 };
 use plonky2::{
@@ -48,7 +48,7 @@ where
     pub enable_minifier: bool,
 }
 
-impl<C: GenericConfig<D>, const D: usize> QPsyNetworkCircuitWithType for VerifyAggUserRegistartionDeployContractsGUTACircuit<C, D>
+impl<C: QGenericConfig<D>, const D: usize> QPsyNetworkCircuitWithType for VerifyAggUserRegistartionDeployContractsGUTACircuit<C, D>
 where
     C::Hasher: AlgebraicHasher<C::F>,
 {
@@ -221,7 +221,7 @@ where
     }
 }
 
-impl<C: GenericConfig<D>, const D: usize> QStandardCircuit<C, D> for VerifyAggUserRegistartionDeployContractsGUTACircuit<C, D>
+impl<C: QGenericConfig<D>, const D: usize> QStandardCircuit<C, D> for VerifyAggUserRegistartionDeployContractsGUTACircuit<C, D>
 where
     C::Hasher: AlgebraicHasher<C::F>,
 {
@@ -254,7 +254,7 @@ fn print_hash<H: Q256BitHash + std::fmt::Debug>(label: &str, hash: &H) {
 }
 
 
-impl<L: CircuitInfoLibrary<C, D>, C: GenericConfig<D>, const D: usize> QStandardCircuitProvableWithRawProofsAndRefLibrary<L, C, D>
+impl<L: CircuitInfoLibrary<C, D>, C: QGenericConfig<D>, const D: usize> QStandardCircuitProvableWithRawProofsAndRefLibrary<L, C, D>
     for VerifyAggUserRegistartionDeployContractsGUTACircuit<C, D>
 where
     C::Hasher: AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + MerkleZeroHasher<QHashOut<C::F>> + FieldQHasher<C::F, QHashOut<C::F>>,

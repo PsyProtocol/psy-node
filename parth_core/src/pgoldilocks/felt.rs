@@ -91,3 +91,6 @@ impl QStaticNamedType for PGoldilocksFelt {
 
 pub trait QRichField: RichField + QFelt64 {}
 impl QRichField for GoldilocksField {}
+
+
+

@@ -3,15 +3,14 @@ use parth_core::protocol::core_types::QNetworkTypesConfig;
 use psy_core::job::job_id::QProvingJobDataID;
 use psy_data::{
     guta::header_extended::{GlobalUserTreeAggregatorHeaderWithTagValue, GlobalUserTreeAggregatorHeaderWithTagValueAndJobType},
+    node::node_proving_state::PsyNodeProvingState,
     prepared_block::realm::PsyPreparedRealmBlockStateUpdates,
     worker::metadata_with_job_id::PsyProvingJobMetadataWithJobId,
 };
 use psy_io::tokio::TokioLikeFileSystem;
 use psy_node_core::{
     p2p::traits::realm_coordinantor::RealmCoordinatorClient,
-    psy_core_db::traits::full::{
-        PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmProcessorStore,
-    },
+    psy_core_db::traits::full::{PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmProcessorStore},
     psy_temp_db::StandardProcessorTempDBStoreBase,
     queue::{
         ephemeral::QStandardEphemeralQueueSubscriber,
@@ -41,14 +40,22 @@ where
 {
     pub async fn publish_all_worker_jobs(
         &self,
+        mut proving_state: PsyNodeProvingState,
         queue_key: &RealmProvingWorkQueueKey<N::QHash, N::JobId>,
         jobs: &[Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>],
     ) -> anyhow::Result<()> {
         let mut timer = TraceTimer::new("publish_all_worker_jobs");
+
+        let mut non_empty_levels = 0usize;
         for level in 0..jobs.len() {
             if jobs[level].is_empty() {
                 continue;
             }
+
+            proving_state.set_current_proving_level(non_empty_levels as u8);
+            self.db.temp_db.set_psy_node_proving_state(&self.db.state.realm_identifier, &proving_state).await?;
+            non_empty_levels+=1;
+
             tracing::info!("Publishing {} jobs at level {}", jobs[level].len(), level);
             self.db
                 .proof_work_queue
@@ -63,8 +70,9 @@ where
                 .await?;
             timer.lap("published jobs");
             tracing::info!("Published all jobs at level {}", level);
-            
-            // We wait level-by-level because higher levels usually depend on the output of lower levels.
+
+            // We wait level-by-level because higher levels usually depend on the output of
+            // lower levels.
             self.db
                 .proof_work_queue
                 .wait_until_all_jobs_complete_or_timeout_worker(
@@ -79,6 +87,8 @@ where
             timer.lap("waited for jobs to complete");
             tracing::info!("All jobs at level {} completed", level);
         }
+        proving_state.finish();
+        self.db.temp_db.set_psy_node_proving_state(&self.db.state.realm_identifier, &proving_state).await?;
         Ok(())
     }
 
@@ -92,7 +102,8 @@ where
     }
 
     pub async fn get_results_from_gatherers(&mut self) -> anyhow::Result<RealmGUTAEndCapGathererOutput<N::F, N::QHash, N::JobId>> {
-        // Ensure unique IDs are rotated correctly before gathering to prevent overwriting pending state
+        // Ensure unique IDs are rotated correctly before gathering to prevent
+        // overwriting pending state
         if self.db.state.gathering_proc_checkpoint_unique_id == self.db.state.processing_proc_checkpoint_unique_id
             || self.db.state.gathering_unique_pending_id == self.db.state.processing_unique_pending_id
         {
@@ -109,10 +120,10 @@ where
                 anyhow::bail!("Cannot gather results: unique IDs match processing IDs, but we are not at genesis.");
             }
         }
-        
+
         // Standard rotation for a new block
         self.db.set_new_unique_ids(None).await?;
-        
+
         // Reset revert flag if it was set, as we are starting a fresh attempt
         if self.db.needs_revert {
             self.db.needs_revert = false;
@@ -134,25 +145,28 @@ where
             self.db.state.last_committed_checkpoint_id
         );
 
-        //self.db.print_last_10_checkpoint_roots_and_leaves("process_block before sync_with_coordinator").await?;
+        //self.db.print_last_10_checkpoint_roots_and_leaves("process_block before
+        // sync_with_coordinator").await?;
 
         // 1. Sync & Verify Consistency
         // We attempt to ensure we are consistent. If we are behind, we catch up.
         self.db.sync_with_coordinator().await?;
-        //self.db.print_last_10_checkpoint_roots_and_leaves("process_block after sync_with_coordinator").await?;
-        
+        //self.db.print_last_10_checkpoint_roots_and_leaves("process_block after
+        // sync_with_coordinator").await?;
+
         match self.db.ensure_db_matches_coordinator_head().await {
             Ok(_) => {
                 // Consistent, proceed
-            },
+            }
             Err(e) => {
                 let err_str = e.to_string();
                 if err_str.contains("Local database is stale") || err_str.contains("Realm Root mismatch") {
                     tracing::warn!("Coordinator is ahead of local DB ({}), attempting to fast-forward sync...", err_str);
-                    // We are behind. The coordinator has processed updates we missed (perhaps while we were down).
-                    // We must sync to the latest state before doing anything else.
+                    // We are behind. The coordinator has processed updates we missed (perhaps while
+                    // we were down). We must sync to the latest state before
+                    // doing anything else.
                     self.db.sync_to_coordinator_set_checkpoint_id().await?;
-                    
+
                     // Re-verify after sync
                     self.db.ensure_db_matches_coordinator_head().await?;
                     timer.lap("recovery_sync");
@@ -161,8 +175,9 @@ where
                     return Err(e);
                 }
             }
-        }        
-        //self.db.print_last_10_checkpoint_roots_and_leaves("process_block after ensure_db_matches_coordinator_head").await?;
+        }
+        //self.db.print_last_10_checkpoint_roots_and_leaves("process_block after
+        // ensure_db_matches_coordinator_head").await?;
 
         timer.lap("sync_and_verify_coordinator");
 
@@ -170,11 +185,14 @@ where
         let guta_output = self.get_results_from_gatherers().await?;
         let guta_jobs = guta_output.job_ids;
         let guta_update = guta_output.db_output;
+
+
         timer.lap("get_results_from_gatherers");
 
-        // CRITICAL FIX: Update the processing end root state with the new root from the gatherer.
-        // This ensures that when `commit_state` calls `state.commit_processing()`, it propagates
-        // the correct new realm root to `last_committed`, rather than carrying over the old root.
+        // CRITICAL FIX: Update the processing end root state with the new root from the
+        // gatherer. This ensures that when `commit_state` calls
+        // `state.commit_processing()`, it propagates the correct new realm root
+        // to `last_committed`, rather than carrying over the old root.
         self.db.state.processing_realm_end_root = guta_update.new_realm_root;
 
         // 3. Check for work
@@ -187,8 +205,30 @@ where
         let root_job_id = root_job_id.unwrap();
         timer.lap("get_root_job_ids");
 
+        let proving_state = PsyNodeProvingState::new_standard_realm(
+            self.db.state.realm_id_u64,
+            self.db.state.realm_identifier.realm_sub_id as u32,
+            self.db.state.processing_checkpoint_id,
+            self.db.state.last_committed_checkpoint_id,
+            guta_update.total_users_updated,
+            guta_update.total_proofs_generated,
+        );
+        // sanity check for dev
+        let actual_guta_jobs_total = guta_jobs.iter().map(|level_jobs| level_jobs.len()).sum::<usize>();
+        if actual_guta_jobs_total as u64 != proving_state.total_guta_jobs {
+            tracing::error!(
+                "GUTA jobs total ({}) does not match expected total from proving state ({}).",
+                actual_guta_jobs_total,
+                proving_state.total_guta_jobs
+            );
+            anyhow::bail!(
+                "GUTA jobs total ({}) does not match expected total from proving state ({}).",
+                actual_guta_jobs_total,
+                proving_state.total_guta_jobs
+            );
+        }
         // 4. Proving Work
-        self.publish_all_worker_jobs(&self.db.get_proof_worker_queue_key(), &guta_jobs).await?;
+        self.publish_all_worker_jobs(proving_state, &self.db.get_proof_worker_queue_key(), &guta_jobs).await?;
         timer.lap("publish_all_worker_jobs");
         tracing::info!("GUTA jobs completed!");
 
@@ -209,7 +249,7 @@ where
                 root_job_id,
             )
             .await?;
-        
+
         let submission_header = GlobalUserTreeAggregatorHeaderWithTagValueAndJobType {
             header: GlobalUserTreeAggregatorHeaderWithTagValue {
                 header: guta_update.guta_header.header,
@@ -248,24 +288,25 @@ where
 
         self.db.run_sanity_check("before commit").await?;
 
-        //self.db.print_last_10_checkpoint_roots_and_leaves("process_block before commit_state").await?;
+        //self.db.print_last_10_checkpoint_roots_and_leaves("process_block before
+        // commit_state").await?;
 
-        
         self.db
             .commit_state(&sync_info, &db_output, root_job_id.circuit_type, root_job_proof)
             .await?;
         timer.lap("commit_state");
         self.db.run_sanity_check("after commit").await?;
-        
+
         tracing::info!(
             "Committed new realm block with checkpoint_id = {}.",
             self.db.state.processing_checkpoint_id
         );
         self.db.print_coordinator_processor_state();
-        
+
         // Final sync
         self.db.sync_to_coordinator_set_checkpoint_id().await?;
-        //self.db.print_last_10_checkpoint_roots_and_leaves("process_block after sync_to_coordinator_set_checkpoint_id").await?;
+        //self.db.print_last_10_checkpoint_roots_and_leaves("process_block after
+        // sync_to_coordinator_set_checkpoint_id").await?;
 
         timer.lap("sync_to_coordinator_set_checkpoint_id");
         self.db.run_sanity_check("after sync_to_coordinator_set_checkpoint_id").await?;

@@ -34,9 +34,37 @@ pub const TEMP_TABLE_ID_TAG_TREE_VALUES_BYTES: [u8; 2] = [0x54, 0x56]; // 'TV'
 pub const TEMP_TABLE_TAG_TREE_VALUES_KEY_SIZE: usize = 40; // 4 + 2 + 2 + 8 + 24
 pub const TEMP_TABLE_TAG_TREE_VALUES_VALUE_SIZE: usize = 32; // Q256BitHash
 
+pub const TEMP_TABLE_ID_NODE_PROVING_STATE: u16 = 0x5350; // 'PS'
+pub const TEMP_TABLE_ID_NODE_PROVING_STATE_BYTES: [u8; 2] = [0x50, 0x53]; // 'PS'
+pub const TEMP_TABLE_NODE_PROVING_STATE_KEY_SIZE: usize = 8; // 4 + 2 + 2
+pub const TEMP_TABLE_NODE_PROVING_STATE_VALUE_SIZE: usize = 80; // PsyNodeProvingState
+
 pub const TEMP_TABLE_ID_DEPLOY_CONTRACT_CODE_DEFINITION: u16 = 0x4344; // 'DC'
 pub const TEMP_TABLE_ID_DEPLOY_CONTRACT_CODE_DEFINITION_BYTES: [u8; 2] = [0x44, 0x43]; // 'DC'
 pub const TEMP_TABLE_ID_DEPLOY_CONTRACT_KEY_SIZE: usize = 32; // 4 + 2 + 2 + 8 + 16
+
+// --- Psy Node Proving State ---
+#[inline(always)]
+pub fn tt_get_node_proving_state_key(realm_id: u32, realm_sub_id: u16) -> [u8; 8] {
+    let mut key = [0u8; 8];
+    key[0..4].copy_from_slice(&realm_id.to_le_bytes());
+    key[4..6].copy_from_slice(&realm_sub_id.to_le_bytes());
+    key[6..8].copy_from_slice(&TEMP_TABLE_ID_NODE_PROVING_STATE_BYTES);
+    key
+}
+#[inline(always)]
+pub fn tt_write_node_proving_state_key<Writer: psy_io::Write>(
+    writer: &mut Writer,
+    realm_id: u32,
+    realm_sub_id: u16,
+) -> anyhow::Result<()> {
+    writer.write_all(&realm_id.to_le_bytes())?;
+    writer.write_all(&realm_sub_id.to_le_bytes())?;
+    writer.write_all(&TEMP_TABLE_ID_NODE_PROVING_STATE_BYTES)?;
+    Ok(())
+}
+
+
 
 
 // --- Expected Public Inputs ---

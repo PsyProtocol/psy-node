@@ -13,7 +13,7 @@ use psy_data::{
     agg::AggStateTransitionWithStats,
     config::network_config::PsyNodeCircuitFingerprintConfig,
     guta::{header::GlobalUserTreeAggregatorHeader, sub_tree_transition::SubTreeNodeStateTransition},
-    node::coordinator_processor::{CoordinatorProcessorIdState, CoordinatorProcessorLastCommittedState},
+    node::{coordinator_processor::{CoordinatorProcessorIdState, CoordinatorProcessorLastCommittedState}, node_proving_state::PsyNodeProvingState},
     prepared_block::{common::PsyCoordinatorPendingCheckpointBase, coordinator::PsyPreparedCoordinatorBlockStateUpdates},
     protocol::circuit_inputs::{
         agg_part_1::QCAggUserRegistartionDeployContractsGUTAInput,
@@ -115,7 +115,7 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
         guta_gatherer_result: CoordinatorGUTAUpdateGathererOutput<N::F, N::QHash, N::JobId>,
         register_users_gatherer_result: RegisterUserGathererOutput<N::QHash, N::JobId>,
         deploy_contract_gatherer_result: DeployContractGathererOutput<N::QHash, N::JobId>,
-    ) -> anyhow::Result<(Vec<Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>>, Vec<Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>>, Vec<Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>>, Self)> {
+    ) -> anyhow::Result<(PsyNodeProvingState, Vec<Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>>, Vec<Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>>, Vec<Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>>, Self)> {
         let root_guta_job = guta_gatherer_result
             .job_ids
             .last()
@@ -138,6 +138,19 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
         let total_register_user_jobs = register_users_gatherer_result.db_output.total_jobs;//register_users_gatherer_result.job_ids.iter().map(|level| level.len()).sum();
         let total_deploy_contract_jobs = deploy_contract_gatherer_result.db_output.total_jobs;//deploy_contract_gatherer_result.job_ids.iter().map(|level| level.len()).sum();
 
+
+        let proving_state = PsyNodeProvingState::new_standard_coordinator(
+            coordinator_ids.realm_id_u64,
+            coordinator_ids.realm_sub_id_u64 as u32,
+            coordinator_ids.unique_pending_id,
+            coordinator_ids.checkpoint_id,
+            guta_gatherer_result.db_output.total_guta_inputs,
+            total_guta_jobs,
+            register_users_gatherer_result.db_output.next_user_id-register_users_gatherer_result.db_output.start_next_user_id,
+            total_register_user_jobs,
+            deploy_contract_gatherer_result.db_output.next_contract_id-deploy_contract_gatherer_result.db_output.start_next_contract_id,
+            total_deploy_contract_jobs,
+        );
         let last_checkpoint_state_transition_job_id = if coordinator_ids.checkpoint_id == 0 {
             QProvingJobDataID::new_proof_job_id(0, 0, ProvingJobCircuitType::GenesisBlockCheckpointStateTransition, 0, 0).get_output_id()
         } else {
@@ -161,7 +174,7 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
     let (deploy_contract_gatherer_result, deploy_contract_jobs) = {
         (deploy_contract_gatherer_result.db_output, deploy_contract_gatherer_result.job_ids)
     };
-        Ok((guta_jobs, register_user_jobs, deploy_contract_jobs, Self {
+        Ok((proving_state,guta_jobs, register_user_jobs, deploy_contract_jobs, Self {
             total_guta_jobs: total_guta_jobs as usize,
             total_register_user_jobs: total_register_user_jobs as usize,
             total_deploy_contract_jobs: total_deploy_contract_jobs as usize,

@@ -1,5 +1,6 @@
 use cf_utils::log_indicator::print_cf_log_indicator;
 use parth_core::protocol::core_types::QNetworkTypesConfigHelper;
+use plonky2::plonk::config::PoseidonGoldilocksConfig;
 use psy_core::{
     constants::{
         chain_id::{PsyChainNetworkType, PsyNetworkTypeInput},
@@ -12,6 +13,7 @@ use psy_jtmb_testing_core::{
     end_cap::dummy_prover::run_jtmb_dummy_prover_lite,
     protocol_types::{JTMBPoseidonGoldilocksConfig, ZKTypesJTMBGoldilocksPoseidon},
 };
+use psy_plonky2_circuits::{end_cap::dummy_prover::run_plonky2_dummy_prover_lite, protocol_types::ZKTypesPlonky2GoldilocksPoseidon};
 // use psy_plonky2_circuits::protocol_types::ZKTypesPlonky2GoldilocksPoseidon;
 
 
@@ -42,8 +44,17 @@ pub async fn run_worker_inner(
 ) -> anyhow::Result<()> {
     if proving_backend == PsyChainProvingBackendType::Plonky2PoseidonGoldilocks {
         tracing::info!("Using Plonky2 Poseidon Goldilocks proving backend for lite dummy end cap prover");
-        // type N = QNetworkTypesConfigHelper<QProvingJobDataID, ZKTypesPlonky2GoldilocksPoseidon, PsyNetworkLocalDevnetConstants>;
-        todo!("implement plonky2 lite dummy end cap prover");
+        type N = QNetworkTypesConfigHelper<QProvingJobDataID, ZKTypesPlonky2GoldilocksPoseidon, PsyNetworkLocalDevnetConstants>;
+        run_plonky2_dummy_prover_lite::<N, PoseidonGoldilocksConfig, 2>(
+            &realm_api_url,
+            &coordinator_api_url,
+            min_state_updates,
+            max_state_updates,
+            max_contract_calls,
+            start_user_id,
+            count,
+            batches,
+        ).await?;
         
     } else if proving_backend == PsyChainProvingBackendType::JTMBPoseidonGoldilocks {
         tracing::info!("Using JTMB Poseidon Goldilocks proving backend for lite dummy end cap prover");

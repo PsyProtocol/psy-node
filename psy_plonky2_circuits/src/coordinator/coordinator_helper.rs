@@ -1,13 +1,13 @@
 use parth_core::{
     crypto::hash::traits::{FieldQHasher, MerkleHasher, MerkleZeroHasher},
     felt::QFelt64,
-    pgoldilocks::{QHashOut, QRichField},
+    pgoldilocks::{QGenericConfig, QHashOut, QRichField},
     protocol::core_types::{Q256BitHash, QFHashBase},
 };
 use plonky2::{
     hash::hash_types::HashOut,
     plonk::
-        config::{AlgebraicHasher, GenericConfig}
+        config::AlgebraicHasher
     ,
 };
 use psy_core::{
@@ -35,7 +35,7 @@ use crate::{
 };
 
 #[derive(Debug)]
-pub struct QEDCoordinatorCircuitManager<C: GenericConfig<D> + 'static, const D: usize>
+pub struct QEDCoordinatorCircuitManager<C: QGenericConfig<D> + 'static, const D: usize>
 where
     C::Hasher: AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + MerkleZeroHasher<QHashOut<C::F>>,
 {
@@ -53,7 +53,7 @@ where
     pub public_key: QHashOut<C::F>,
 }
 
-impl<C: GenericConfig<D> + 'static, const D: usize> QEDCoordinatorCircuitManager<C, D>
+impl<C: QGenericConfig<D> + 'static, const D: usize> QEDCoordinatorCircuitManager<C, D>
 where     C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + FieldQHasher<C::F, QHashOut<C::F>>, QHashOut<C::F>: Q256BitHash + QFHashBase<C::F>, C::F: QFelt64 + QRichField,
 
 {
@@ -281,7 +281,7 @@ where     C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + Fi
     }
 }
 
-impl<C: GenericConfig<D> + 'static, const D: usize> QNextGenWorkerGenericInfo<QProvingJobDataID> for QEDCoordinatorCircuitManager<C, D>
+impl<C: QGenericConfig<D> + 'static, const D: usize> QNextGenWorkerGenericInfo<QProvingJobDataID> for QEDCoordinatorCircuitManager<C, D>
 where
     C::Hasher: AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + MerkleZeroHasher<QHashOut<C::F>>,
 {
@@ -301,7 +301,7 @@ where
     }
 }
 
-impl<C: GenericConfig<D> + 'static, const D: usize> PsyWorkerGenericLibraryProverInfoProvider<QProvingJobDataID>
+impl<C: QGenericConfig<D> + 'static, const D: usize> PsyWorkerGenericLibraryProverInfoProvider<QProvingJobDataID>
     for QEDCoordinatorCircuitManager<C, D>
 where
     C::Hasher: AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + MerkleZeroHasher<QHashOut<C::F>>,
@@ -311,7 +311,7 @@ where
     }
 }
 
-impl<Library: CircuitInfoLibrary<C, D>, C: GenericConfig<D> + 'static, const D: usize>
+impl<Library: CircuitInfoLibrary<C, D>, C: QGenericConfig<D> + 'static, const D: usize>
     PsyWorkerGenericLibraryProver<QHashOut<C::F>, QProvingJobDataID, Library> for QEDCoordinatorCircuitManager<C, D>
 where
     C::Hasher: AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>> + FieldQHasher<C::F, QHashOut<C::F>>,

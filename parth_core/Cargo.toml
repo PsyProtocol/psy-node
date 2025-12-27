@@ -9,7 +9,7 @@ default = ["rand", "std", "parth_node", "ptypes_goldilocks_qhashout", "serialize
 std = ["psy_io/std"]
 proof_hasher_plonky2_goldilocks = ["ptypes_goldilocks_qhashout"]
 ptypes_goldilocks_qhashout = ["goldilocks"]
-goldilocks = ["plonky2"]
+goldilocks = ["plonky2", "plonky2_field"]
 ptypes_u64_hash256 = []
 rand = ["dep:rand"]
 parth_node = []
@@ -42,7 +42,8 @@ postcard = { workspace = true, optional = true }
 rkyv = { workspace = true, optional = true }
 speedy = { workspace = true, optional = true }
 bytemuck = { workspace = true, optional = true }
-plonky2 = { workspace = true, optional = true }
+plonky2 = { workspace = true, optional = true, features = ["ts-rs"] }
+plonky2_field = { workspace = true, optional = true, features = ["ts-rs"] }
 
 # start local packages
 pser = { workspace = true }

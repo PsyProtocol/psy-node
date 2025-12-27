@@ -2,12 +2,10 @@ use cf_utils::timer::TraceTimer;
 use parth_core::protocol::core_types::QNetworkTypesConfig;
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{
-    prepared_block::coordinator::PsyPreparedCoordinatorBlockStateUpdates,
-    proof_input::genesis::PsyCheckpointStateTransitionGenesisCircuitInput,
-    worker::{
-        metadata::{PsyProvingJobMetadata, PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN},
+    node::node_proving_state::PsyNodeProvingState, prepared_block::coordinator::PsyPreparedCoordinatorBlockStateUpdates, proof_input::genesis::PsyCheckpointStateTransitionGenesisCircuitInput, worker::{
+        metadata::{PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN, PsyProvingJobMetadata},
         metadata_with_job_id::PsyProvingJobMetadataWithJobId,
-    },
+    }
 };
 use psy_io::tokio::TokioLikeFileSystem;
 use psy_node_core::{
@@ -109,6 +107,7 @@ impl<
     }
     pub async fn publish_jobs(
         &self,
+        proving_state: &mut PsyNodeProvingState,
         guta_jobs: &[Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>],
         register_user_jobs: &[Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>],
         deploy_contract_jobs: &[Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>],
@@ -125,6 +124,8 @@ impl<
         let min_level = min_level.unwrap_or(0).min(max_level);
 
         for i in min_level..max_level {
+            proving_state.set_current_proving_level(i as u8);
+            self.db.temp_db.set_psy_node_proving_state(&self.db.ids.realm_identifier, &proving_state).await?;
             self.publish_worker_jobs_if_exists(&queue_key, i, guta_jobs).await?;
             self.publish_worker_jobs_if_exists(&queue_key, i, register_user_jobs).await?;
             self.publish_worker_jobs_if_exists(&queue_key, i, deploy_contract_jobs).await?;
@@ -190,6 +191,7 @@ impl<
     }
 
     pub async fn get_results_from_gatherers(&mut self) -> anyhow::Result<(
+        PsyNodeProvingState,
         Vec<Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>>, 
         Vec<Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>>, 
         Vec<Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>>,
@@ -379,7 +381,7 @@ impl<
     pub async fn process_block(&mut self) -> anyhow::Result<()> {
         let mut timer = TraceTimer::new("process_block");
         tracing::info!("Starting to process new coordinator block with checkpoint_id = {}...", self.db.ids.next_checkpoint_id);
-        let (guta_jobs, register_user_jobs, deploy_contract_jobs, mut output_builder) = self.get_results_from_gatherers().await?;
+        let (mut proving_state, guta_jobs, register_user_jobs, deploy_contract_jobs, mut output_builder) = self.get_results_from_gatherers().await?;
 
         timer.lap("get_results_from_gatherers");
         let has_jobs = self.get_root_job_ids(
@@ -394,8 +396,10 @@ impl<
             tracing::info!("No jobs to process in this block, but proceeding to create empty checkpoint state transition.");
         }
 
+
         // publish the first level of jobs
         self.publish_jobs(
+            &mut proving_state,
             &guta_jobs,
             &register_user_jobs,
             &deploy_contract_jobs,
@@ -421,6 +425,7 @@ impl<
 
         // publish the rest of the jobs and wait for them to finish
         self.publish_jobs(
+            &mut proving_state,
             &guta_jobs,
             &register_user_jobs,
             &deploy_contract_jobs,
@@ -437,9 +442,13 @@ impl<
         self.publish_and_wait_for_job_completion(&agg_job_metadata).await?;
         timer.lap("publish_and_wait_for_job_completion_agg");
         println!("Aggregate GUTA, User Registration and Deploy Contracts Proof completed!");
+        proving_state.inc_current_proving_level();
+        self.db.temp_db.set_psy_node_proving_state(&self.db.ids.realm_identifier, &proving_state).await?;
         let (coordinator_update, zk_proof) = self.plan_checkpoint_state_transition(output_builder).await?;
         timer.lap("plan_checkpoint_state_transition");
         tracing::info!("Checkpoint State Transition Proof completed!");
+        proving_state.finish();
+        self.db.temp_db.set_psy_node_proving_state(&self.db.ids.realm_identifier, &proving_state).await?;
         self.db
             .commit_state(coordinator_update, ProvingJobCircuitType::GenerateRollupStateTransitionProof, zk_proof)
             .await?;
