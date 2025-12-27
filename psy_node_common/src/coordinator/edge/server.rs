@@ -1,5 +1,6 @@
 use cf_utils::log_indicator::print_cf_log_indicator;
 use jsonrpsee::{RpcModule, server::ServerBuilder};
+use jsonrpsee::server::{BatchRequestConfig, ServerConfig};
 use parth_core::protocol::core_types::QNetworkTypesConfig;
 use psy_api_core::{coordinator::standard_edge_rpc::CoordinatorEdgeRpcServer, worker::standard_worker_rpc::NodeEdgeWorkerRpcServer};
 use psy_core::job::job_id::QProvingJobDataID;
@@ -44,10 +45,15 @@ pub async fn start_coordinator_edge_rpc_server<
         .allow_headers(Any);
 
     let server = ServerBuilder::default()
+        .set_config(
+            ServerConfig::builder()
+                .max_connections(100000)
+                .max_request_body_size(100 * 1024 * 1024)// 100MB
+                .build()
+        )
         .set_http_middleware(
             tower::ServiceBuilder::new()
                 .layer(cors)
-                .layer(ConcurrencyLimitLayer::new(100000))
         )
         .build(format!("{}:{}", listen, port))
         .await?;

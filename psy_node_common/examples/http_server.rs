@@ -3,6 +3,7 @@ use jsonrpsee::{
     RpcModule, core::RpcResult, http_client::{HttpClient, HttpClientBuilder}, proc_macros::rpc, server::ServerBuilder, ws_client::WsClientBuilder
 };
 use std::net::SocketAddr;
+use jsonrpsee::server::{BatchRequestConfig, ServerConfig};
 use tower::limit::ConcurrencyLimitLayer;
 use tower_http::cors::{Any, CorsLayer};
 
@@ -40,9 +41,15 @@ async fn run_server() -> anyhow::Result<SocketAddr> {
         .allow_headers(Any);
 
     let server = ServerBuilder::default()
-        .set_http_middleware(            tower::ServiceBuilder::new()
+        .set_config(
+            ServerConfig::builder()
+                .max_connections(100000)
+                .max_request_body_size(100 * 1024 * 1024)// 100MB
+                .build()
+        )
+        .set_http_middleware(
+            tower::ServiceBuilder::new()
             .layer(cors)
-            .layer(ConcurrencyLimitLayer::new(100000))
         )
         .build("127.0.0.1:0")
         .await?;
