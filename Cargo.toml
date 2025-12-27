@@ -134,9 +134,9 @@ async-nats = "0.43.1"
 
 jsonrpsee = { version = "0.26", features = ["server", "client", "macros"] }
 config = "0.15"
-plonky2 = { git = "https://github.com/PsyRepoForks/plonky2", rev = "6e3a5273e9346b4d06fb6f804fd9ad359a614eed", features = ["ts-rs"]}
-plonky2_maybe_rayon = { git = "https://github.com/PsyRepoForks/plonky2", rev = "6e3a5273e9346b4d06fb6f804fd9ad359a614eed" }
-plonky2_field = { git = "https://github.com/PsyRepoForks/plonky2", rev = "6e3a5273e9346b4d06fb6f804fd9ad359a614eed", features = ["ts-rs"] }
+plonky2 = { git = "https://github.com/PsyProtocol/plonky2-hwa", rev = "1dfe6112c3eca3668c15820755371a8a3e75f934", features = ["ts-rs"]}
+plonky2_maybe_rayon = { git = "https://github.com/PsyProtocol/plonky2-hwa", rev = "1dfe6112c3eca3668c15820755371a8a3e75f934" }
+plonky2_field = { git = "https://github.com/PsyProtocol/plonky2-hwa", rev = "1dfe6112c3eca3668c15820755371a8a3e75f934", features = ["ts-rs"] }
 # plonky2 = { path = "../p2new/plonky2/plonky2", features = ["ts-rs"] }
 # plonky2_field = { path = "../p2new/plonky2/field", features = ["ts-rs"] }
 # plonky2_maybe_rayon = { path = "../p2new/plonky2/maybe_rayon" }

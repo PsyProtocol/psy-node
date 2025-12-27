@@ -218,7 +218,7 @@ impl<F: RichField> QHashOut<F> {
     fn from_values_no_canonical_conversion(a: u64, b: u64, c: u64, d: u64) -> Self {
         // TODO: For goldilocks, this is the same as from_values, but for other fields it might not be
         // If we directly do from_canonical_u64 on non-canonical values, it trigger a panic in debug_assert
-        // See debug_assert and plonky2 code at https://github.com/PsyRepoForks/plonky2-hwa/blob/8d5b56f42fe87942312f270a5dc26c0059f973fb/field/src/goldilocks_field.rs#L183
+        // See debug_assert and plonky2 code at https://github.com/PsyProtocol/plonky2-hwa-hwa/blob/8d5b56f42fe87942312f270a5dc26c0059f973fb/field/src/goldilocks_field.rs#L183
         /*
             impl Field for GoldilocksField {
                 // ...
