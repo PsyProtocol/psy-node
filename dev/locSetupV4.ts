@@ -289,14 +289,16 @@ class DevNetProcessManager {
     private readonly COORD_API_URL: string;
     private genesisDataPath: string = "genesis.json";
     private envVars: { [key: string]: string } | undefined;
+    private provingBackend: string | undefined;
 
-    constructor(host: string = "127.0.0.1", envVars?: { [key: string]: string }) {
+    constructor(host: string = "127.0.0.1", envVars?: { [key: string]: string }, provingBackend?: string) {
         this.host = host;
         this.SCYLLA_URL = `${host}:9042`;
         this.NATS_URL = `nats://${host}:4222`;
         this.REDIS_URL = `redis://${host}:6379`;
         this.COORD_API_URL = `http://${host}:1337`;
         this.envVars = envVars;
+        this.provingBackend = provingBackend;
     }
 
     private track(p: RunningProcess): RunningProcess {
@@ -349,7 +351,7 @@ class DevNetProcessManager {
             };
         };
 
-        const backend = jtmb ? 'jtmb-poseidon-goldilocks' : 'plonky2-poseidon-goldilocks';
+        const backend = this.provingBackend || (jtmb ? 'jtmb-poseidon-goldilocks' : 'plonky2-poseidon-goldilocks');
 
         // 1. Build (skip if binaries exist)
         const psyNodeCliPath = path.join(cwd || '.', 'target/release/psy_node_cli');
@@ -621,7 +623,7 @@ class DevNetProcessManager {
         }
     }
 
-    static create(host?: string, envVars?: { [key: string]: string }): DevNetProcessManager { return new DevNetProcessManager(host, envVars); }
+    static create(host?: string, envVars?: { [key: string]: string }, provingBackend?: string): DevNetProcessManager { return new DevNetProcessManager(host, envVars, provingBackend); }
 }
 
 let globalManager: DevNetProcessManager | null = null;
@@ -632,6 +634,7 @@ async function runMain() {
         args: Bun.argv,
         options: {
             jtmb: { type: "boolean" },
+            "proving-backend": { type: "string" },
             "disable-worker-edge-logs": { type: "boolean" },
             "realm-workers": { type: "string" },
             "realm-edge-nodes": { type: "string", default: "1" },
@@ -668,6 +671,7 @@ async function runMain() {
     const dbOnly = !!values["db-only"];
     const workersOnly = !!values["workers-only"];
     const dummyProversCount = values["dummy-provers-only"] ? parseInt(values["dummy-provers-only"], 10) : 0;
+    const provingBackend = values["proving-backend"];
     const envString = values["env"];
     const help = !!values["help"];
 
@@ -695,6 +699,7 @@ Usage: bun run dev/locSetupV4.ts [options]
  Options:
     --host <ip>                     Target host IP (default: 127.0.0.1)
     --genesis-data-path <path>      Path to genesis data JSON file for processor nodes (default: genesis.json)
+    --proving-backend <backend>     Proving backend to use (default: plonky2-poseidon-goldilocks)
     --env <vars>                    Environment variables to pass to processes (format: KEY1=VALUE1,KEY2=VALUE2)
     --jtmb                          Use JTMB proving backend instead of Plonky2
    --disable-worker-edge-logs      Disable logging for worker and edge processes
@@ -711,15 +716,18 @@ Usage: bun run dev/locSetupV4.ts [options]
    --dummy-provers-only <count>    Start only dummy provers within the specified realm range (requires database, coordinator, and realms to be running)
    --help, -h                      Show this help message
 
- Examples:
-   # Start full system (default when no options specified)
-   bun run dev/locSetupV4.ts  # starts all components with realms 0-127
+  Examples:
+    # Start full system (default when no options specified)
+    bun run dev/locSetupV4.ts  # starts all components with realms 0-127
 
-   # Start full system with specific realm range
-   bun run dev/locSetupV4.ts --end-realm-id 3  # realms 0,1,2,3
+    # Start full system with specific realm range
+    bun run dev/locSetupV4.ts --end-realm-id 3  # realms 0,1,2,3
 
-   # Start with custom genesis data
-   bun run dev/locSetupV4.ts --genesis-data-path ./my-genesis.json  # use custom genesis file
+    # Start with custom genesis data
+    bun run dev/locSetupV4.ts --genesis-data-path ./my-genesis.json  # use custom genesis file
+
+    # Start with specific proving backend
+    bun run dev/locSetupV4.ts --proving-backend jtmb-sha256-u64  # use JTMB SHA256 backend
 
    # Start with workers
    bun run dev/locSetupV4.ts --coordinator-workers 2 --realm-workers 1  # coordinator + realms with workers
@@ -741,7 +749,7 @@ Notes:
     }
 
 
-    globalManager = DevNetProcessManager.create(host, envVars);
+    globalManager = DevNetProcessManager.create(host, envVars, provingBackend);
 
     const shutdown = () => {
         if (globalManager) globalManager.teardown();
