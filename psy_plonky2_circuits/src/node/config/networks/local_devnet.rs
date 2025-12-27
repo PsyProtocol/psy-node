@@ -156,12 +156,14 @@ mod tests {
     #[test]
     fn test_generate_genesis_block_setup_data_for_local_devnet() -> anyhow::Result<()> {
         let contracts = serde_json::from_str::<Vec<PQBCDeployContract<QHashOut<F>>>>(include_str!("../../../../../token.deploy.json"))?;
-        let mut users = Vec::new();
+        let mut users = Vec::with_capacity(1<<19);
+        let mut private_keys = Vec::with_capacity(1<<19);
 
         let zk_fingerprint = QHashOut::<F>::from_values(ZK_FINGERPRINT_U64[0], ZK_FINGERPRINT_U64[1], ZK_FINGERPRINT_U64[2], ZK_FINGERPRINT_U64[3]);
 
         for i in 0..1 << 19 {
             let private_key = QHashOut(PoseidonHash::hash_no_pad(&[F::from_canonical_u64(i)]));
+            private_keys.push(private_key);
             let public_key_param = get_public_key_param::<F, PoseidonHash>(private_key);
             users.push(PsyCompactUserDefinition {
                 public_key_info: PZKPublicKeyInfo {
@@ -205,6 +207,7 @@ mod tests {
         let project_dir = env!("CARGO_MANIFEST_DIR");
 
         std::fs::write(&format!("{}/../genesis.json", project_dir), serde_json::to_string_pretty(&genesis_data)?)?;
+        std::fs::write(&format!("{}/../private_keys.json", project_dir), serde_json::to_string_pretty(&private_keys)?)?;
 
         Ok(())
     }

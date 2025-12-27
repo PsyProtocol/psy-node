@@ -19,6 +19,7 @@ local_checkpoints/
 logs/
 db/
 genesis.json
+private_keys.json
 
 index.scip
 
