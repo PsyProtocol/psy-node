@@ -508,7 +508,7 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
                 checkpoint_id: 0,
                 unique_pending_id: 0,
                 proc_checkpoint_unique_id: 0,
-                old_base: builder.get_coordinator_genesis_checkpoint_base::<Hasher>(N::CHECKPOINT_TREE_HEIGHT),
+                old_base: pending_checkpoint_base,
                 new_base: pending_checkpoint_base,
                 update_global_contract_tree_nodes_ffs: builder.global_contract_tree_nodes_ffs,
                 update_contract_function_tree_nodes_ffs: builder.contract_function_tree_nodes_ffs,
