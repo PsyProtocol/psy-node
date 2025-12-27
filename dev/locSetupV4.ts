@@ -621,12 +621,13 @@ class DevNetProcessManager {
         }
     }
 
-    static create(host?: string): DevNetProcessManager { return new DevNetProcessManager(host); }
+    static create(host?: string, envVars?: { [key: string]: string }): DevNetProcessManager { return new DevNetProcessManager(host, envVars); }
 }
 
 let globalManager: DevNetProcessManager | null = null;
 
 async function runMain() {
+
     const { values } = parseArgs({
         args: Bun.argv,
         options: {
@@ -650,6 +651,8 @@ async function runMain() {
         },
         allowPositionals: true,
     });
+
+
 
     const hasOnlyOptions = !!values["db-only"] || !!values["coordinator-only"] || !!values["realm-only"] || !!values["workers-only"] || !!values["dummy-provers-only"];
     const workerRealmCount = values["realm-workers"] ? parseInt(values["realm-workers"], 10) : 0;
@@ -679,6 +682,7 @@ async function runMain() {
                 envVars[key.trim()] = value.trim();
             }
         }
+
     }
 
     // Show help if requested
@@ -735,6 +739,7 @@ Notes:
         `);
         process.exit(0);
     }
+
 
     globalManager = DevNetProcessManager.create(host, envVars);
 

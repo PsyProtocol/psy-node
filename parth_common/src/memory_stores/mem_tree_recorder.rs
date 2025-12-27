@@ -241,7 +241,6 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Copy + PartialEq + Default + Debug>
         (1u64 << (self.height as u64)) - 1u64
     }
     pub fn set_node_value(&mut self, key: SimpleMerkleNodeKey, value: Hash) {
-        println!("key: {:?}, value : {:?}", key, value);
         self.updated_nodes.insert(key, value);
     }
     pub fn set_node_value_nodes_no_updated(&mut self, key: SimpleMerkleNodeKey, value: Hash) {

@@ -45,10 +45,11 @@ pub async fn run_coordinator_processor_loop<
 where
     N: 'static,
 {
-
     let realm_id = processor.db.ids.realm_id_u64;
     let realm_sub_id = processor.db.ids.realm_sub_id_u64;
     print_cf_log_indicator("PSY_COORDINATOR_PROCESSOR_STARTED", &format!("R{}_{}", realm_id, realm_sub_id));
+
+    let mut last_slot: u128 = 0;
 
     loop {
         let is_active = processor.db.is_active.load(Ordering::SeqCst);
@@ -57,10 +58,10 @@ where
             let since_epoch = now.duration_since(std::time::UNIX_EPOCH).unwrap();
             let current_ms = since_epoch.as_millis();
 
-            let cycle_position = current_ms % 6000;
-            let should_execute = cycle_position <= 50 || cycle_position >= 5950;
+            let current_slot = current_ms / 100;
 
-            if should_execute {
+            if current_slot != last_slot && current_slot % 60 == 0 {
+                last_slot = current_slot;
                 let start_processing_at = std::time::Instant::now();
                 tracing::debug!("[COORDINATOR] Process block starting...");
                 let result = processor.process_block().await;
@@ -70,12 +71,14 @@ where
                 match result {
                     Ok(_) => {
                         tracing::debug!("[COORDINATOR] Process block finished.");
-                        tracing::info!("Generated block in {}ms at cycle position {}", duration_ms, cycle_position);
+                        tracing::info!("Generated block in {}ms at slot {}", duration_ms, current_slot);
                     }
                     Err(e) => {
-                        tracing::error!("[COORDINATOR] Error processing block: {:?}, took {}ms at cycle position {}", e, duration_ms, cycle_position);
+                        tracing::error!("[COORDINATOR] Error processing block: {:?}, took {}ms at slot {}", e, duration_ms, current_slot);
                     }
                 }
+            } else {
+                sleep(std::time::Duration::from_millis(50)).await;
             }
         } else {
             tracing::info!("Coordinator Processor is shutting down gracefully.");
