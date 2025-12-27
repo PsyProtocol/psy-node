@@ -38,7 +38,7 @@ pub async fn run_realm_processor_loop<
     >,
 ) -> anyhow::Result<()>
 where
-    N: 'static, FileSystem::File: Send + Sync + 'static,    
+    N: 'static, FileSystem::File: Send + Sync + 'static,
 {
     let realm_id = processor.db.state.realm_id_u64;
     let realm_sub_id = processor.db.state.realm_sub_id_u64;
@@ -47,20 +47,30 @@ where
     loop {
         let is_active = processor.db.is_active.load(Ordering::SeqCst);
         if is_active {
-            let start_processing_at = std::time::Instant::now();
-            tracing::debug!("[REALM] Process block starting...");
-            let result = processor.process_block().await;
-            if let Err(e) = result {
-                eprintln!("[REALM] Error processing block: {:?}", e);
-                // fatal, exit process
-                std::process::exit(1);
+            let now = std::time::SystemTime::now();
+            let since_epoch = now.duration_since(std::time::UNIX_EPOCH).unwrap();
+            let current_ms = since_epoch.as_millis();
+
+            let cycle_position = current_ms % 3000;
+            let should_execute = cycle_position <= 50 || cycle_position >= 2950;
+
+            if should_execute {
+                let start_processing_at = std::time::Instant::now();
+                tracing::debug!("[REALM] Process block starting...");
+                let result = processor.process_block().await;
+                let elapsed = start_processing_at.elapsed();
+                let duration_ms = elapsed.as_millis();
+
+                match result {
+                    Ok(_) => {
+                        tracing::debug!("[REALM] Process block finished.");
+                        tracing::info!("Generated GUTA Realm update in {}ms at cycle position {}", duration_ms, cycle_position);
+                    }
+                    Err(e) => {
+                        tracing::error!("[REALM] Error processing block: {:?}, took {}ms at cycle position {}", e, duration_ms, cycle_position);
+                    }
+                }
             }
-            tracing::debug!("[REALM] Process block finished.");
-            let elapsed = start_processing_at.elapsed();
-            let duration_ms = elapsed.as_millis();
-            let sleep_duration = if duration_ms < 2500 { 2500 - duration_ms } else { 0 };
-            tracing::info!("Generated GUTA Realm update in {}ms, sleeping for {}ms", duration_ms, sleep_duration);
-            sleep(std::time::Duration::from_millis(sleep_duration as u64)).await;
         } else {
             tracing::info!("Realm Processor is shutting down gracefully.");
             break;

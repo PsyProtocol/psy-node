@@ -53,26 +53,36 @@ where
     loop {
         let is_active = processor.db.is_active.load(Ordering::SeqCst);
         if is_active {
-            let start_processing_at = std::time::Instant::now();
-            tracing::debug!("[COORDINATOR] Process block starting...");
-            let result = processor.process_block().await;
-            if let Err(e) = result {
-                eprintln!("[COORDINATOR] Error processing block: {:?}", e);
-                // fatal, exit process
-                std::process::exit(1);
+            let now = std::time::SystemTime::now();
+            let since_epoch = now.duration_since(std::time::UNIX_EPOCH).unwrap();
+            let current_ms = since_epoch.as_millis();
+
+            let cycle_position = current_ms % 6000;
+            let should_execute = cycle_position <= 50 || cycle_position >= 5950;
+
+            if should_execute {
+                let start_processing_at = std::time::Instant::now();
+                tracing::debug!("[COORDINATOR] Process block starting...");
+                let result = processor.process_block().await;
+                let elapsed = start_processing_at.elapsed();
+                let duration_ms = elapsed.as_millis();
+
+                match result {
+                    Ok(_) => {
+                        tracing::debug!("[COORDINATOR] Process block finished.");
+                        tracing::info!("Generated block in {}ms at cycle position {}", duration_ms, cycle_position);
+                    }
+                    Err(e) => {
+                        tracing::error!("[COORDINATOR] Error processing block: {:?}, took {}ms at cycle position {}", e, duration_ms, cycle_position);
+                    }
+                }
             }
-            tracing::debug!("[COORDINATOR] Process block finished.");
-            let elapsed = start_processing_at.elapsed();
-            let duration_ms = elapsed.as_millis();
-            let sleep_duration = if duration_ms < 6000 { 6000 - duration_ms } else { 0 };
-            tracing::info!("Generated block in {}ms, sleeping for {}ms", duration_ms, sleep_duration);
-            sleep(std::time::Duration::from_millis(sleep_duration as u64)).await;
         } else {
             tracing::info!("Coordinator Processor is shutting down gracefully.");
             break;
         }
     }
-    
+
     print_cf_log_indicator("PSY_COORDINATOR_PROCESSOR_STOPPED", &format!("R{}_{}", realm_id, realm_sub_id));
 
     Ok(())
