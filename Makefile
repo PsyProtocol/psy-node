@@ -46,3 +46,6 @@ clean-db:
 
 config_gen_v2:
 	cargo run --release --package psy_plonky2_circuits --example config_gen_v2
+
+generate-genesis-data: 
+	cargo test --package psy_plonky2_circuits --lib -- node::config::networks::local_devnet::tests --nocapture 
