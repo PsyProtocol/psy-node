@@ -134,9 +134,9 @@ async-nats = "0.43.1"
 
 jsonrpsee = { version = "0.26", features = ["server", "client", "macros"] }
 config = "0.15"
-plonky2 = { git = "https://github.com/PsyRepoForks/plonky2", rev = "6e3a5273e9346b4d06fb6f804fd9ad359a614eed", features = ["ts-rs"] }
-plonky2_field = {git = "https://github.com/PsyRepoForks/plonky2", rev = "6e3a5273e9346b4d06fb6f804fd9ad359a614eed", features = ["ts-rs"] }
-plonky2_maybe_rayon = { git = "https://github.com/PsyRepoForks/plonky2", rev = "6e3a5273e9346b4d06fb6f804fd9ad359a614eed" }
+plonky2 = { git = "https://github.com/PsyRepoForks/plonky2", rev = "7ce93ac9e5b0f7940bdc8b8d5c50f10912c3c095", features = ["ts-rs"] }
+plonky2_field = {git = "https://github.com/PsyRepoForks/plonky2", rev = "7ce93ac9e5b0f7940bdc8b8d5c50f10912c3c095", features = ["ts-rs"] }
+plonky2_maybe_rayon = { git = "https://github.com/PsyRepoForks/plonky2", rev = "7ce93ac9e5b0f7940bdc8b8d5c50f10912c3c095" }
 redis = { version = "0.30.0", default-features = false, features = [
     "acl",
     "keep-alive",
