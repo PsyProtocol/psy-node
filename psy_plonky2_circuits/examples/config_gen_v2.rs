@@ -3,7 +3,7 @@ use std::{fs::File, io::prelude::*, path::PathBuf};
 use parth_core::{crypto::hash::traits::ToU64x4, pgoldilocks::QHashOut, protocol::core_types::QNetworkCircuitConstants};
 use plonky2::{field::goldilocks_field::GoldilocksField, plonk::config::PoseidonGoldilocksConfig};
 use psy_core::{
-    constants::protocol::get_default_worker_rewards_tree_tag, job::job_id::ProvingJobCircuitType, network_config::PsyNetworkLocalDevnetConstants,
+    constants::{chain_id::PsyChainNetworkType, protocol::get_default_worker_rewards_tree_tag}, job::job_id::ProvingJobCircuitType, network_config::PsyNetworkLocalDevnetConstants,
 };
 use psy_plonky2_basic_helpers::{
     lookalike::standard::{
@@ -13,7 +13,7 @@ use psy_plonky2_basic_helpers::{
     verifier::{alt::AltVerifierOnlyCircuitData, generic_circuit_library::GenericCircuitVerifier},
 };
 use psy_plonky2_circuits::{
-    coordinator::coordinator_helper::QEDCoordinatorCircuitManager, guta::guta_helper::QEDGUTACircuitManager,
+    circuit_library::end_cap_verifier_data::get_end_cap_alt_verifier_data_for_network, coordinator::coordinator_helper::QEDCoordinatorCircuitManager, guta::guta_helper::QEDGUTACircuitManager,
     proof_minifier::pm_core::get_circuit_fingerprint_generic_q, qstandard::QStandardCircuit,
 };
 /*
@@ -90,11 +90,7 @@ fn run_gen_config<N: QNetworkCircuitConstants>() -> anyhow::Result<(String, Stri
     println!("end_cap_alt_verifier_data_serialized: {}", end_cap_alt_verifier_data_serialized);
     */
 
-    let end_cap_alt_verifier_data_serialized = r#"{"constants_sigmas_cap":["1b5856de6801c92bb0ad2fd11368056a9a5d0dad82aff9945c5bae6897565b27","1d244fedb2f6501cb68a99df5790ead882cd9dbf00dc10f01014a19878e5f13d","a91d9395232831406551ea542996f10df9323493bb9a622ca172f9a08b33420d","ddec529e5c0eda0802893f88ee339b4ddbe91159054d7cc452087d96a25a720d","b1fe8e8aa32f722753a7138fa7c50ddc131e3f69e794df655e72ab05c27132b6","24d48a0e67b1379268ff20367f208ceaf2050f4ac0d71539b79528e7ed21d816","b0a24455f824e7521022f21da1ed16678ad4b0e4f38223fb3029e2e70df9f1f8","f4ee0801387a8601ebd6cf9fa1286f323cea556be58203be1e03a4cb789fa2db","906d34ee2421a469caabd07ba347ab60879ecb2e2fe6792a41b46ffdf5cbece0","1ba3bb0b9afff4cd09899de1fd4143fca5f2a20ef452a8dfd13e0588c5991c61","0537f4536348db599b5b7ff80d30ab511a7cfb11d7e6b9279a479f02e3a184a0","3ed832defddf3cc38d484ee6f9e8349330b5784d54fae75b92e30bcda9552634","1f1fa9c1c3a517fc172488989d0102ba7ef1ed6504922ef3f2a927c14b8cf353","85bf989c4979c5fe13ff5c771d643a0a761a350189eb402223abfffacdb4bc82","8081f52d148499ddb3c33fa96af8dd8144fa03178cea5c0c63bacb27f66f9254","edc979c7efa9df07e9084d01e4e5b4e5d585f0987495c12e29913ba26ce5de68"],"circuit_digest":"c81b3e7dd47fc105d031515c373a22ef4876723c41781fe5849f76a6614aa25f"}"#;
-
-
-    // use dummy for now
-    let end_cap_alt_verifier_data: AltVerifierOnlyCircuitData<F> = serde_json::from_str(&end_cap_alt_verifier_data_serialized)?;
+    let end_cap_alt_verifier_data = get_end_cap_alt_verifier_data_for_network(PsyChainNetworkType::LocalDevnet)?;
 
     let end_cap_verifier_data = end_cap_alt_verifier_data.to_verifier_data::<C, D>();
     let end_cap_fingerprint = get_circuit_fingerprint_generic_q::<D, F, C>(&end_cap_verifier_data);
