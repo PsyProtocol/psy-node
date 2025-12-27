@@ -18,6 +18,7 @@ Thumbs.db
 local_checkpoints/
 logs/
 db/
+genesis.json
 
 index.scip
 
