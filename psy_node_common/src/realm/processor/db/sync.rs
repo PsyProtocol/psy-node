@@ -102,40 +102,9 @@ where
                 )
                 .await?;
 
-            // May need to update Realm user tree here
-            tracing::info!(
-                "local realm user tree root: {}",
-                serde_json::to_string_pretty(
-                    &self
-                        .db
-                        .global_user_tree_get_merkle_proof_sub_tree(
-                            checkpoint_id,
-                            N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
-                            N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
-                            self.state.realm_id_u64
-                        )
-                        .await?
-                )?
-            );
-            tracing::info!(
-                "set global user tree top tree merkle proof at checkpoint id {} {}",
-                checkpoint_id,
-                serde_json::to_string_pretty(&sync_info.merkle_proof_to_realm_root)?
-            );
             self.db
                 .global_user_tree_set_top_tree_merkle_proof(checkpoint_id, &sync_info.merkle_proof_to_realm_root)
                 .await?;
-
-            tracing::info!(
-                "get global user tree tree merkle proof at checkpoint id {} {}",
-                checkpoint_id,
-                serde_json::to_string_pretty(
-                    &self
-                        .db
-                        .global_user_tree_get_merkle_proof(checkpoint_id, self.state.realm_id_u64 * (N::MAX_USERS_PER_REALM as u64))
-                        .await?
-                )?
-            );
         }
 
         // 3. Update Latest Block State

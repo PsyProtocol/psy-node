@@ -474,12 +474,12 @@ class DevNetProcessManager {
             }
 
             // Start all realm processors and edges in parallel
-            const numBatches = Math.floor(realmsCount / 4);
-            for (let b = 0; b < numBatches; b++) {
+            for (let b = 0; b < realmsCount; b += 4) {
                 const realmPromises: Promise<RunningProcess>[] = [];
+                const batchSize = Math.min(4, realmsCount - b);
 
-                for (let i = 0; i < 4; i++) {
-                    const realmId = startRealmId + 4 * b + i;
+                for (let i = 0; i < batchSize; i++) {
+                    const realmId = startRealmId + b + i;
                     const realmEdgeStartPort = 13380 + realmId * 10;
 
                     // Start realm processor
