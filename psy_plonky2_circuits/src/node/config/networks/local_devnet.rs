@@ -72,7 +72,10 @@ pub fn get_genesis_block_setup_data_for_local_devnet(genesis_data_path: Option<S
     match genesis_data_path {
         None => get_genesis_block_setup_data_for_local_devnet_default(),
         Some(path) => {
-            let genesis_data = serde_json::from_str::<PsyGenesisBlockSetupData<F, Hash>>(&std::fs::read_to_string(path)?)?;
+            let genesis_data = serde_json::from_str::<PsyGenesisBlockSetupData<F, Hash>>(
+                &std::fs::read_to_string(path).map_err(|err| anyhow::format_err!("reading genesis file error: {}", err))?,
+            )
+            .map_err(|err| anyhow::format_err!("parsing genesis file error: {}", err))?;
             Ok(genesis_data)
         }
     }
