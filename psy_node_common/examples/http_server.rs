@@ -44,7 +44,7 @@ async fn run_server() -> anyhow::Result<SocketAddr> {
         .set_config(
             ServerConfig::builder()
                 .max_connections(100000)
-                .max_request_body_size(100 * 1024 * 1024)// 100MB
+                .max_request_body_size(512 * 1024 * 1024)// 512MB
                 .build()
         )
         .set_http_middleware(
