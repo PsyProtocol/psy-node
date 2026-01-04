@@ -83,24 +83,30 @@ impl PsyWorkerAPIURLManager {
         api_urls: &[impl AsRef<str>],
     ) -> anyhow::Result<()> {
         for api_url in api_urls {
-            let client = HttpClientBuilder::default().build(api_url.as_ref())?;
-            let realm_identifier = <HttpClient as NodeEdgeWorkerRpcClient<Hash, JobId>>::get_realm_identifier_worker_api(&client).await;
-            if realm_identifier.is_err() {
-                tracing::error!(
-                    "Failed to get realm identifier from API URL: {} ({:?})",
-                    api_url.as_ref(),
-                    realm_identifier.err()
-                );
-                continue;
-            }
-            let realm_identifier = realm_identifier.unwrap();
+            loop {
+                let client = HttpClientBuilder::default().build(api_url.as_ref())?;
+                let realm_identifier = <HttpClient as NodeEdgeWorkerRpcClient<Hash, JobId>>::get_realm_identifier_worker_api(&client).await;
 
-            let api_url_hash = hash_api_url_to_32_bytes(api_url.as_ref());
-            self.api_url_hash_to_string.insert(api_url_hash, api_url.as_ref().to_string());
-            self.api_url_string_to_hash.insert(api_url.as_ref().to_string(), api_url_hash);
-            self.api_url_realm_identifiers.insert(api_url_hash, realm_identifier);
-            self.api_url_hash_to_client.insert(api_url_hash, client);
-            self.api_url_list.write().await.push(api_url.as_ref().to_string());
+                match realm_identifier {
+                    Ok(realm_identifier) => {
+                        let api_url_hash = hash_api_url_to_32_bytes(api_url.as_ref());
+                        self.api_url_hash_to_string.insert(api_url_hash, api_url.as_ref().to_string());
+                        self.api_url_string_to_hash.insert(api_url.as_ref().to_string(), api_url_hash);
+                        self.api_url_realm_identifiers.insert(api_url_hash, realm_identifier);
+                        self.api_url_hash_to_client.insert(api_url_hash, client);
+                        self.api_url_list.write().await.push(api_url.as_ref().to_string());
+                        break;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "Failed to get realm identifier from API URL: {}, retrying in 100ms: {:?}",
+                            api_url.as_ref(),
+                            err
+                        );
+                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    }
+                }
+            }
         }
         Ok(())
     }
