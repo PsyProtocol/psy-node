@@ -132,6 +132,14 @@ impl<F: QFelt64, Hash: QFHashBase<F> + std::fmt::Debug> SubmitUserEndCapNonProof
             anyhow::bail!("contract_state_updates cannot be empty");
         }
 
+        let expected_total_slots_modified = self
+            .contract_state_updates
+            .iter()
+            .map(|u| u.contract_state_tree_updates.len())
+            .sum::<usize>() as u64;
+        if self.core.stats.slots_modified.to_u64_value() != expected_total_slots_modified {
+            anyhow::bail!("slots_modified does not match the sum of contract_state_tree_updates");
+        }
         for i in 1..self.contract_state_updates.len() {
             if self.contract_state_updates[i - 1].user_contract_tree_update_proof.new_root
                 != self.contract_state_updates[i].user_contract_tree_update_proof.old_root
