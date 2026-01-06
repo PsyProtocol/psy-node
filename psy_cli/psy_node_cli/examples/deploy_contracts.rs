@@ -11,6 +11,7 @@ use psy_core::job::job_id::QProvingJobDataID;
 use psy_data::v1::qdata::{contract::{ContractCodeDefinition, ContractFunctionCodeDefinition, PQBCDeployContract}, public_key::PZKPublicKeyInfo};
 pub fn gen_random_contract<Hash: QPGenRandom + QHashBase>(max_functions: usize) -> PQBCDeployContract<Hash> {
     let function_whitelist = Hash::qp_rand_gen_vec_in_range(1, max_functions);
+    let code_root = Hash::qp_rand_gen();
 
     let contract = PQBCDeployContract {
         deployer: Hash::qp_rand_gen(),
@@ -29,6 +30,7 @@ pub fn gen_random_contract<Hash: QPGenRandom + QHashBase>(max_functions: usize) 
                 .collect(),
         },
         function_whitelist,
+        code_root,
     };
 
     println!("generated contract_state_Tree_height: {}", contract.code_definition.state_tree_height);

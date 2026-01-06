@@ -368,11 +368,12 @@ impl<
 
         let (unique_pending_id, unique_proc_checkpoint_id, queue_key) = self.get_deploy_contract_queue_key().await?;
 
-        let (deployer, code_definition, function_leaves) = deploy_contract.split_into_tuple();
+        let (deployer, code_definition, function_leaves, code_root) = deploy_contract.split_into_tuple();
         let queue_item = PsyDeployContractQueueItem::<N::F, N::QHash>::new_from_leaves_and_deployer::<N::HasherBase>(
             deployer,
             code_definition.state_tree_height,
             function_leaves,
+            code_root,
             N::CONTRACT_FUNCTION_TREE_HEIGHT_USIZE,
         )?;
 

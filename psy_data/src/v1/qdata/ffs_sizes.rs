@@ -8,8 +8,8 @@ pub const PSY_OBJECT_FFS_SIZE_ZK_PUBLIC_KEY: usize = 64;
 
 
 // PQEDContractLeaf size in bytes
-// deployer(32 bytes) + function_tree_root(32 bytes) + state_tree_height(8 bytes) = 72 bytes
-pub const PSY_OBJECT_FFS_SIZE_CONTRACT_LEAF: usize = 72;
+// deployer(32 bytes) + function_tree_root(32 bytes) + state_tree_height(8 bytes) + code_root(32 bytes) = 104 bytes
+pub const PSY_OBJECT_FFS_SIZE_CONTRACT_LEAF: usize = 104;
 
 // PUPSEndCapResultCompact size in bytes
 // start_user_leaf_hash(32 bytes) + end_user_leaf_hash(32 bytes) + checkpoint_tree_root_hash(32 bytes) + user_id(8 bytes) = 104 bytes

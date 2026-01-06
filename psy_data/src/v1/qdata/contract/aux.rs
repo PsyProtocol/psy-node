@@ -335,18 +335,20 @@ pub struct PQBCDeployContract<Hash> {
     pub deployer: Hash,
     pub code_definition: ContractCodeDefinition,
     pub function_whitelist: Vec<Hash>,
+    pub code_root: Hash,
 }
 
 impl<Hash: QHashBase> PQBCDeployContract<Hash> {
-    pub fn new(deployer: Hash, code_definition: ContractCodeDefinition, function_whitelist: Vec<Hash>) -> Self {
+    pub fn new(deployer: Hash, code_definition: ContractCodeDefinition, function_whitelist: Vec<Hash>, code_root: Hash) -> Self {
         Self {
             deployer,
             code_definition,
             function_whitelist,
+            code_root,
         }
     }
-    pub fn split_into_tuple(self) -> (Hash, ContractCodeDefinition, Vec<Hash>) {
-        (self.deployer, self.code_definition, self.function_whitelist)
+    pub fn split_into_tuple(self) -> (Hash, ContractCodeDefinition, Vec<Hash>, Hash) {
+        (self.deployer, self.code_definition, self.function_whitelist, self.code_root)
     }
     pub fn into_with_whitelist_root<H: MerkleZeroHasher<Hash>>(
         self,
@@ -357,6 +359,7 @@ impl<Hash: QHashBase> PQBCDeployContract<Hash> {
             self.code_definition,
             self.function_whitelist,
             contract_function_tree_height,
+            self.code_root,
         )
     }
 }
@@ -368,6 +371,7 @@ pub struct PQBCDeployContractWithRoot<Hash> {
     pub code_definition: ContractCodeDefinition,
     pub function_whitelist: Vec<Hash>,
     pub function_whitelist_root: Hash,
+    pub code_root: Hash,
 }
 
 impl<Hash: QHashBase> PQBCDeployContractWithRoot<Hash> {
@@ -376,6 +380,7 @@ impl<Hash: QHashBase> PQBCDeployContractWithRoot<Hash> {
         code_definition: ContractCodeDefinition,
         function_whitelist: Vec<Hash>,
         contract_function_tree_height: u8,
+        code_root: Hash,
     ) -> anyhow::Result<Self> {
         let mut t = SimpleMemoryMerkleStore::<H, Hash>::new(contract_function_tree_height);
         for (i, l) in function_whitelist.iter().enumerate() {
@@ -388,6 +393,7 @@ impl<Hash: QHashBase> PQBCDeployContractWithRoot<Hash> {
             code_definition,
             function_whitelist,
             function_whitelist_root,
+            code_root,
         })
     }
 }

@@ -17,7 +17,7 @@ pub struct PsyDeployContractQueueItem<F, Hash> {
 }
 impl<F: QFelt64, Hash: Q256BitHash + Default> PsyDeployContractQueueItem<F, Hash> {
 
-    pub fn new_from_leaves_and_deployer<Hasher: MerkleZeroHasher<Hash>>(deployer: Hash, state_tree_height: u16, function_leaves: Vec<Hash>, contract_function_tree_height: usize) -> anyhow::Result<Self> {
+    pub fn new_from_leaves_and_deployer<Hasher: MerkleZeroHasher<Hash>>(deployer: Hash, state_tree_height: u16, function_leaves: Vec<Hash>, code_root: Hash, contract_function_tree_height: usize) -> anyhow::Result<Self> {
         let m2_height = log2_ceil(function_leaves.len());
         if m2_height > contract_function_tree_height {
             anyhow::bail!("more leaves than the contract function tree can support");
@@ -34,6 +34,7 @@ impl<F: QFelt64, Hash: Q256BitHash + Default> PsyDeployContractQueueItem<F, Hash
         let contract_leaf = PQEDContractLeaf {
             deployer,
             function_tree_root,
+            code_root,
             state_tree_height: F::from_u16_value(state_tree_height),
         };
 

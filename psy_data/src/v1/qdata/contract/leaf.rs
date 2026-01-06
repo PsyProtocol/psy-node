@@ -23,6 +23,7 @@ pub struct PQEDContractLeaf<F, Hash> {
     pub deployer: Hash,
     pub function_tree_root: Hash,
     pub state_tree_height: F,
+    pub code_root: Hash,
 }
 
 pser::impl_bytemuck_pod_and_zeroable!(PQEDContractLeaf, F, Hash);
@@ -32,6 +33,7 @@ impl<F: Default, Hash: Default> Default for PQEDContractLeaf<F, Hash> {
             deployer: Hash::default(),
             function_tree_root: Hash::default(),
             state_tree_height: F::default(),
+            code_root: Hash::default(),
         }
     }
 }
@@ -50,13 +52,14 @@ impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for PQEDContractLeaf<F, Hash
             deployer: Hash::qp_rand_gen(),
             function_tree_root: Hash::qp_rand_gen(),
             state_tree_height: F::qp_rand_gen(),
+            code_root: Hash::qp_rand_gen(),
         }
     }
 }
 
 impl<F: QFelt, Hash: QHashBase> QFeltSized for PQEDContractLeaf<F, Hash> {
     fn q_felt_size() -> usize {
-        9
+        13
     }
 
     fn self_qsize(&self) -> usize {
@@ -67,6 +70,7 @@ impl<F: QFelt64, Hash: QFHashBase<F>> ToQFelts<F> for PQEDContractLeaf<F, Hash> 
     fn to_qfelts(&self) -> Vec<F> {
         let deployer = self.deployer.to_4_felts();
         let function_tree_root = self.function_tree_root.to_4_felts();
+        let code_root = self.code_root.to_4_felts();
 
         vec![
             deployer[0],
@@ -77,20 +81,26 @@ impl<F: QFelt64, Hash: QFHashBase<F>> ToQFelts<F> for PQEDContractLeaf<F, Hash> 
             function_tree_root[1],
             function_tree_root[2],
             function_tree_root[3],
+            code_root[0],
+            code_root[1],
+            code_root[2],
+            code_root[3],
             self.state_tree_height,
         ]
     }
 
     fn from_qfelts(felts: &[F]) -> Self {
-        if felts.len() != 9 {
+        if felts.len() != 13 {
             panic!("Invalid number of elements for QEDContractLeaf");
         }
         let deployer = Hash::from_4_felts_slice(&felts[0..4]);
         let function_tree_root = Hash::from_4_felts_slice(&felts[4..8]);
-        let state_tree_height = felts[8];
+        let code_root = Hash::from_4_felts_slice(&felts[8..12]);
+        let state_tree_height = felts[12];
         PQEDContractLeaf {
             deployer,
             function_tree_root,
+            code_root,
             state_tree_height,
         }
     }
@@ -100,6 +110,7 @@ impl<F: QFelt64, Hash: QFHashBase<F>> QFieldHashable<F, Hash> for PQEDContractLe
     fn qfhash<H: FieldQHasher<F, Hash>>(&self) -> Hash {
         let deployer = self.deployer.to_4_felts();
         let function_tree_root = self.function_tree_root.to_4_felts();
+        let code_root = self.code_root.to_4_felts();
 
         H::q_hash_many(&[
             deployer[0],
@@ -110,6 +121,10 @@ impl<F: QFelt64, Hash: QFHashBase<F>> QFieldHashable<F, Hash> for PQEDContractLe
             function_tree_root[1],
             function_tree_root[2],
             function_tree_root[3],
+            code_root[0],
+            code_root[1],
+            code_root[2],
+            code_root[3],
             self.state_tree_height,
         ])
     }
@@ -118,26 +133,26 @@ impl<F: QFelt64, Hash: QFHashBase<F>> QFieldHashable<F, Hash> for PQEDContractLe
 pser::impl_bytemuck_ffs!(
     PQEDContractLeaf,
     { F: QFelt64, Hash: Q256BitHash },
-    72
+    104
 );
 
 pser::impl_bytemuck_ffs_tests!(
     PQEDContractLeaf,
     // Note the use of concrete types here
     { parth_core::PF, parth_core::PHash },
-    72
+    104
 );
 
 
 impl<F: QFelt64, Hash: Q256BitHash> PsyCanonicalSerializeMetadata for PQEDContractLeaf<F, Hash> {
     const IS_FIXED_SIZE: bool = true;
-    const FIXED_SIZE: usize = 72;
+    const FIXED_SIZE: usize = 104;
 }
-impl<F: QFelt64, Hash: Q256BitHash> AutoDatabaseSerializationUseFastFixedSerialize<72> for PQEDContractLeaf<F, Hash> {}
+impl<F: QFelt64, Hash: Q256BitHash> AutoDatabaseSerializationUseFastFixedSerialize<104> for PQEDContractLeaf<F, Hash> {}
 psy_serialize::impl_psy_canonical_serialize_for_fixed_type!(
     PQEDContractLeaf, 
     {F: QFelt64, Hash: Q256BitHash} => {F, Hash}, 
-    72
+    104
 );
 
 
@@ -150,14 +165,16 @@ fn _ensure_compile_time_size_match() {
 
 // fallback for big endian platforms, not zero copy
 #[cfg(not(all(target_endian = "little", feature = "serialize_bytemuck")))]
-impl<F: QFelt64, Hash: Q256BitHash> FastFixedSerializable<72> for PQEDContractLeaf<F, Hash> {
+impl<F: QFelt64, Hash: Q256BitHash> FastFixedSerializable<104> for PQEDContractLeaf<F, Hash> {
     fn ffs_from_owned_bytes(data: [u8; PSY_OBJECT_FFS_SIZE_CONTRACT_LEAF]) -> Self {
         let deployer = Hash::from_ref_32bytes(&data[0..32].try_into().unwrap());
         let function_tree_root = Hash::from_ref_32bytes(&data[32..64].try_into().unwrap());
-        let state_tree_height = F::from_u64_value(u64::from_le_bytes(data[64..72].try_into().unwrap()));
+        let code_root = Hash::from_ref_32bytes(&data[64..96].try_into().unwrap());
+        let state_tree_height = F::from_u64_value(u64::from_le_bytes(data[96..104].try_into().unwrap()));
         PQEDContractLeaf {
             deployer,
             function_tree_root,
+            code_root,
             state_tree_height,
         }
     }
@@ -168,10 +185,12 @@ impl<F: QFelt64, Hash: Q256BitHash> FastFixedSerializable<72> for PQEDContractLe
         }
         let deployer = Hash::from_ref_32bytes(&data[0..32].try_into().unwrap());
         let function_tree_root = Hash::from_ref_32bytes(&data[32..64].try_into().unwrap());
-        let state_tree_height = F::from_u64_value(u64::from_le_bytes(data[64..72].try_into().unwrap()));
+        let code_root = Hash::from_ref_32bytes(&data[64..96].try_into().unwrap());
+        let state_tree_height = F::from_u64_value(u64::from_le_bytes(data[96..104].try_into().unwrap()));
         PQEDContractLeaf {
             deployer,
             function_tree_root,
+            code_root,
             state_tree_height,
         }
     }
@@ -182,7 +201,8 @@ impl<F: QFelt64, Hash: Q256BitHash> FastFixedSerializable<72> for PQEDContractLe
         }
         let deployer = Hash::from_ref_32bytes(&data[0..32].try_into().unwrap());
         let function_tree_root = Hash::from_ref_32bytes(&data[32..64].try_into().unwrap());
-        let state_tree_height = F::from_u64_value(u64::from_le_bytes(data[64..72].try_into().unwrap()));
+        let code_root = Hash::from_ref_32bytes(&data[64..96].try_into().unwrap());
+        let state_tree_height = F::from_u64_value(u64::from_le_bytes(data[96..104].try_into().unwrap()));
         Ok(PQEDContractLeaf {
             deployer,
             function_tree_root,
@@ -194,7 +214,8 @@ impl<F: QFelt64, Hash: Q256BitHash> FastFixedSerializable<72> for PQEDContractLe
         let mut bytes = [0u8; PSY_OBJECT_FFS_SIZE_CONTRACT_LEAF];
         bytes[0..32].copy_from_slice(&self.deployer.into_owned_32bytes());
         bytes[32..64].copy_from_slice(&self.function_tree_root.into_owned_32bytes());
-        bytes[64..72].copy_from_slice(&self.state_tree_height.to_u64_value().to_le_bytes());
+        bytes[64..96].copy_from_slice(&self.code_root.into_owned_32bytes());
+        bytes[96..104].copy_from_slice(&self.state_tree_height.to_u64_value().to_le_bytes());
         bytes
     }
 
@@ -202,7 +223,8 @@ impl<F: QFelt64, Hash: Q256BitHash> FastFixedSerializable<72> for PQEDContractLe
         let mut bytes = [0u8; PSY_OBJECT_FFS_SIZE_CONTRACT_LEAF];
         bytes[0..32].copy_from_slice(&self.deployer.into_owned_32bytes());
         bytes[32..64].copy_from_slice(&self.function_tree_root.into_owned_32bytes());
-        bytes[64..72].copy_from_slice(&self.state_tree_height.to_u64_value().to_le_bytes());
+        bytes[64..96].copy_from_slice(&self.code_root.into_owned_32bytes());
+        bytes[96..104].copy_from_slice(&self.state_tree_height.to_u64_value().to_le_bytes());
         bytes
     }
 }

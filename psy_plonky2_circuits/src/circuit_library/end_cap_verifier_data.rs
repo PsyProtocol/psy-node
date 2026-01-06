@@ -25,25 +25,25 @@ const DUMMY_END_CAP_ALT_VERIFIER_DATA_SERIALIZED: &'static str = r#" {
 }"#;
 
 const END_CAP_ALT_VERIFIER_DATA_SERIALIZED: &'static str = r#"{
-    "constants_sigmas_cap":[
-        "66a089b85c53a76a7dc5811d25d893ad5638e88b1517968e2cfc2d636e262db6",
-        "3fba88f3d8bc860b21c0eba984c16e2fe27091e3c202858ab034c84150980a6a",
-        "aee6684c997bc2fde21f7e8ee9f7fe66a41e30b8f7c194c6aee1af70b621bc31",
-        "e41c993238b31cc778b0168c604a9b3f060f877f92ff5bc75636ed1fe3728ac1",
-        "b4e843b5e96bd4c9da58eb9f3d2d9bf0ce0ea95fdddbaf3f2ac507fe178da7d9",
-        "50d0642c3fb0be4c59056acadcb2baae1c7383116e79ef9e9710ca390f6259ed",
-        "9be2b042ed57704d663ae92affd56b5ee5f778a02e6bc11ad1c0422763407060",
-        "cfe04ff776141dc334601e235a8cfd7fa10516ae76763a7521ce9570ea53514e",
-        "2a48afc424b1b148bfa9593871d6627dc2eded0b67d0a3fcf94aa90c7b4a6bfd",
-        "17184bf0d05d8ca7abb677acc64cd36190df68ffd94a4cc1040dbebfcc2a94f0",
-        "415a85cfa5bd9c5bce60f3f424f44d323ff84206266c9dfc5140c7fd27974839",
-        "b0563c8c1c99586c046a5c1124202e7efb63d98e4cd68c0c0c039119750ebde3",
-        "668d2c064b184db7432a7cef806d8dddb38079a685d04f254537200b9ab6ab33",
-        "a11b1a0b4cc7a720d60fbf6b5a0f7289d0a1bad36e86248a03198e659487266f",
-        "4336fbdad171bc6d4599d413e4defacb4646dc0e3eedbef23791d555c24ac08e",
-        "b6b99af8fe93004fdcc1bf693bb11b4e7b60c1cea5dc6793730d2c02fcbac1a3"
+    "constants_sigmas_cap": [
+        "f01aa6f5b3f67c2eabb8bd10c6df95faa3f7af6ca4dafdc16939a233eb905fff",
+        "8fa6f872593f21dcbba69515d49e4960b8e1609d0b25e49e1fc803bcc21c2ffb",
+        "4048c45dbfdf8fabc2628597a65979307172b695ffeeec0aaa2ceec904c86206",
+        "5483c557cb0bf2792af3f91eaee906e2679d8a1b67db90a2b7f5175617a5d979",
+        "150c63864846e801d4b3c12e07110d51efd3311e8afbc0aa3bc28c284d62619f",
+        "941ba5e05fa601e5e8d7321225102b9e6a8d9aa1ad6920307cf92f55d26d3ccc",
+        "2761897b377c63bd57447c332093fdacf91684f73ce52be2668b94b0bb6a34df",
+        "b5aa78a1a832f5c682788a9fa0f1bd1fb47bbf3f8b8f5bbc25ee8aae5691e3b3",
+        "7751d0d2b3ad142998ee58e29452b4da0136deb2ee92ace9d2cb9d45c3c5297d",
+        "7a540bbd302502f67d92c7c9ba4d1af5f171ed8eb9d0f2b0feb28a886591d677",
+        "34886637994aeca328d027e1c2bf7b9335b236358158a24d97d707084db5bd50",
+        "2f358dc739df2765e728c600c055ce1a04d80ee01f419eae0e2eb97e155f25e4",
+        "a4f28d5748a4d084385cd51ed0726a50ece61639a2c0a1bc1e729d0a49e0b863",
+        "b168565254e1db89dc36e822873c2c2a27cc7c464d542a769403470af340fc33",
+        "7cbe7916052af1bf3023590979ba21d893bac838f64b654568574944728c315a",
+        "33d532ab79250dd3e40fe0b2d0f219ac1425841daa56ca517cfdf7f3cecabafa"
     ],
-    "circuit_digest":"155a537127883b716afcbb8c4bd37946ad7c92dc96e84a9f63767a8e15baff8f"
+    "circuit_digest": "6185847e276388deaf9b47e73fefc41abb6240a13372c736b1b66c373a69afa8"
 }"#;
 
 pub fn get_end_cap_alt_verifier_data_for_network<F: RichField>(network: PsyChainNetworkType) -> anyhow::Result<AltVerifierOnlyCircuitData<F>> {

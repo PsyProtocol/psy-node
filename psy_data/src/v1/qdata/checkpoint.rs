@@ -366,14 +366,16 @@ fn _ensure_compile_time_size_match() {
 
 // fallback for big endian platforms, not zero copy
 #[cfg(not(all(target_endian = "little", feature = "serialize_bytemuck")))]
-impl<F: QFelt64, Hash: Q256BitHash> FastFixedSerializable<72> for PQEDContractLeaf<F, Hash> {
+impl<F: QFelt64, Hash: Q256BitHash> FastFixedSerializable<104> for PQEDContractLeaf<F, Hash> {
     fn ffs_from_owned_bytes(data: [u8; PSY_OBJECT_FFS_SIZE_CONTRACT_LEAF]) -> Self {
         let deployer = Hash::from_ref_32bytes(&data[0..32].try_into().unwrap());
         let function_tree_root = Hash::from_ref_32bytes(&data[32..64].try_into().unwrap());
-        let state_tree_height = F::from_u64_value(u64::from_le_bytes(data[64..72].try_into().unwrap()));
+        let code_root = Hash::from_ref_32bytes(&data[64..96].try_into().unwrap());
+        let state_tree_height = F::from_u64_value(u64::from_le_bytes(data[96..104].try_into().unwrap()));
         PQEDContractLeaf {
             deployer,
             function_tree_root,
+            code_root,
             state_tree_height,
         }
     }
@@ -384,10 +386,12 @@ impl<F: QFelt64, Hash: Q256BitHash> FastFixedSerializable<72> for PQEDContractLe
         }
         let deployer = Hash::from_ref_32bytes(&data[0..32].try_into().unwrap());
         let function_tree_root = Hash::from_ref_32bytes(&data[32..64].try_into().unwrap());
-        let state_tree_height = F::from_u64_value(u64::from_le_bytes(data[64..72].try_into().unwrap()));
+        let code_root = Hash::from_ref_32bytes(&data[64..96].try_into().unwrap());
+        let state_tree_height = F::from_u64_value(u64::from_le_bytes(data[96..104].try_into().unwrap()));
         PQEDContractLeaf {
             deployer,
             function_tree_root,
+            code_root,
             state_tree_height,
         }
     }
@@ -398,10 +402,12 @@ impl<F: QFelt64, Hash: Q256BitHash> FastFixedSerializable<72> for PQEDContractLe
         }
         let deployer = Hash::from_ref_32bytes(&data[0..32].try_into().unwrap());
         let function_tree_root = Hash::from_ref_32bytes(&data[32..64].try_into().unwrap());
-        let state_tree_height = F::from_u64_value(u64::from_le_bytes(data[64..72].try_into().unwrap()));
+        let code_root = Hash::from_ref_32bytes(&data[64..96].try_into().unwrap());
+        let state_tree_height = F::from_u64_value(u64::from_le_bytes(data[96..104].try_into().unwrap()));
         Ok(PQEDContractLeaf {
             deployer,
             function_tree_root,
+            code_root,
             state_tree_height,
         })
     }
@@ -410,7 +416,8 @@ impl<F: QFelt64, Hash: Q256BitHash> FastFixedSerializable<72> for PQEDContractLe
         let mut bytes = [0u8; PSY_OBJECT_FFS_SIZE_CONTRACT_LEAF];
         bytes[0..32].copy_from_slice(&self.deployer.into_owned_32bytes());
         bytes[32..64].copy_from_slice(&self.function_tree_root.into_owned_32bytes());
-        bytes[64..72].copy_from_slice(&self.state_tree_height.to_u64_value().to_le_bytes());
+        bytes[64..96].copy_from_slice(&self.code_root.into_owned_32bytes());
+        bytes[96..104].copy_from_slice(&self.state_tree_height.to_u64_value().to_le_bytes());
         bytes
     }
 
@@ -418,7 +425,8 @@ impl<F: QFelt64, Hash: Q256BitHash> FastFixedSerializable<72> for PQEDContractLe
         let mut bytes = [0u8; PSY_OBJECT_FFS_SIZE_CONTRACT_LEAF];
         bytes[0..32].copy_from_slice(&self.deployer.into_owned_32bytes());
         bytes[32..64].copy_from_slice(&self.function_tree_root.into_owned_32bytes());
-        bytes[64..72].copy_from_slice(&self.state_tree_height.to_u64_value().to_le_bytes());
+        bytes[64..96].copy_from_slice(&self.code_root.into_owned_32bytes());
+        bytes[96..104].copy_from_slice(&self.state_tree_height.to_u64_value().to_le_bytes());
         bytes
     }
 }

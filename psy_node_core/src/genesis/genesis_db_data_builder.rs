@@ -117,6 +117,7 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
             let contract_leaf = PQEDContractLeaf::<F, Hash> {
                 deployer: contract.deployer,
                 function_tree_root,
+                code_root: contract.code_root,
                 state_tree_height: F::from_u16_value(contract.code_definition.state_tree_height),
             };
 
