@@ -358,10 +358,18 @@ pub async fn gatherer_runner_for_tree<
 
                 // A trigger from the Processor was received.
                 Some(responder) = trigger_rx.recv() => {
+                    let old_unique_id = queue_key.unique_id;
+                    let old_queue_key = queue_key.clone();
                     tracing::info!("GATHERER_{QUEUE_TOPIC_ID}: Interrupted by Processor. Preparing to hand over");
                     queue_key = queue_key_helper.get_queue_key()?;
+                    let new_unique_id = queue_key.unique_id;
+                    tracing::info!("GATHERER_{QUEUE_TOPIC_ID}: Switching from old unique_id {} to new unique_id {}", old_unique_id, new_unique_id);
                     let is_stopped = queue_key_helper.is_active()?;
-                    tracing::info!("GATHERER_{QUEUE_TOPIC_ID}: Current unique ID: {}, is_active: {}", queue_key.unique_id, is_stopped);
+                    let remaining_items_bytes = stream.dump_entire_ephemeral_queue_bytes(&old_queue_key, old_queue_key.realm_id, old_queue_key.realm_sub_id, old_unique_id, old_queue_key.task_group as u32, usize::MAX).await?;
+                    tracing::info!("GATHERER_{QUEUE_TOPIC_ID}: Processing {} remaining items from old unique_id {} before finalize", remaining_items_bytes.len(), old_unique_id);
+                    if !remaining_items_bytes.is_empty() {
+                        builder.update_from_many_queue_items_with_tree(&mut tree, remaining_items_bytes).await?;
+                    }
 
                     let finalized_output = builder.finalize_with_tree(&mut tree).await?;
                     tracing::info!("GATHERER_{QUEUE_TOPIC_ID}: Finalized output prepared, sending to processor.");
