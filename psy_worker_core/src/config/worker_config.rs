@@ -11,7 +11,7 @@ pub struct WorkerStartupConfig {
     pub worker_completed_jobs_log_file_path: Option<String>,
     pub coordinator_api_urls: Vec<String>,
     pub realm_api_urls: Vec<String>,
-    pub url_rotation_strategy: Option<PsyAPIURLRotationStrategy>,
+    pub url_rotation_strategy: PsyAPIURLRotationStrategy,
 }
 
 impl WorkerStartupConfig {

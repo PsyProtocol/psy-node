@@ -40,6 +40,7 @@ pub async fn run_worker_inner(
     network: PsyChainNetworkType,
     config: WorkerStartupConfig,
     proving_backend: PsyChainProvingBackendType,
+    batch_size: usize,
 ) -> anyhow::Result<()> {
     // Placeholder for actual worker logic
 
@@ -48,10 +49,10 @@ pub async fn run_worker_inner(
         const D: usize = 2;
         let worker = get_simple_proof_miner_worker_for_network::<C, D>(network, config).await?;
 
-        worker.run_worker_loop(100).await?;
+        worker.run_worker_loop(100, batch_size).await?;
     } else if proving_backend == PsyChainProvingBackendType::JTMBPoseidonGoldilocks {
         let worker = get_simple_proof_miner_worker_for_network_jtmb::<JTMBPoseidonGoldilocksConfig>(network, config).await?;
-        worker.run_worker_loop(100).await?;
+        worker.run_worker_loop(100, batch_size).await?;
     }
     Ok(())
 }
@@ -66,7 +67,8 @@ pub async fn run(
     proving_backend: Option<PsyChainProvingBackendTypeInput>,
     realm_api_urls: Vec<String>,
     coordinator_api_urls: Vec<String>,
-    url_rotation_strategy: Option<PsyAPIURLRotationStrategyInput>,
+    url_rotation_strategy: PsyAPIURLRotationStrategyInput,
+    batch_size: usize,
 ) -> anyhow::Result<()> {
     print_banner();
     info!("Worker starting...");
@@ -93,6 +95,7 @@ pub async fn run(
         network,
         config,
         proving_backend,
+        batch_size,
     ));
     handles.push(handle);
     /*

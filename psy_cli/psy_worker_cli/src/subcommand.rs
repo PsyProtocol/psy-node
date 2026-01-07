@@ -45,8 +45,11 @@ pub enum Commands {
         #[arg(long = "realm-api-url", help = "Realm Edge API URLs for the worker to connect to (supports many)")]
         realm_api_urls: Vec<String>,
 
-        #[arg(long = "url-rotation-strategy", help = "URL rotation strategy (round-robin, random, continue-until-failure, continue-until-failure-or-no-work-for-3-seconds, smart-swap-v1)")]
-        url_rotation_strategy: Option<PsyAPIURLRotationStrategyInput>,
+        #[arg(long = "url-rotation-strategy", default_value = "continue-until-failure", help = "URL rotation strategy (round-robin, random, continue-until-failure, continue-until-failure-or-no-work-for-3-seconds, smart-swap-v1)")]
+        url_rotation_strategy: PsyAPIURLRotationStrategyInput,
+
+        #[arg(long = "batch-size", default_value = "8", help = "Number of jobs to fetch and process concurrently")]
+        batch_size: usize,
     },
     #[command(about = "Run a proof mining worker in test mode")]
     WorkerTest {

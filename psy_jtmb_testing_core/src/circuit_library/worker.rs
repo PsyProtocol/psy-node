@@ -1,4 +1,5 @@
 use parth_common::secp256k1::MemorySecp256K1Wallet;
+use std::sync::Arc;
 use parth_core::
     data::hash::hash256::Hash256
 ;
@@ -21,7 +22,7 @@ use crate::{
     },
 };
 
-pub async fn get_simple_proof_miner_worker_for_network_jtmb<C: JTMBCircuitConfig + Send + Sync>(
+pub async fn get_simple_proof_miner_worker_for_network_jtmb<C: JTMBCircuitConfig + Send + Sync + 'static>(
     network: PsyChainNetworkType,
     config: WorkerStartupConfig,
 ) -> anyhow::Result<
@@ -50,8 +51,8 @@ pub async fn get_simple_proof_miner_worker_for_network_jtmb<C: JTMBCircuitConfig
 
     let worker = PsyProofMinerWorkerManager::new(
         job_fetcher,
-        verifier.library,
-        manager,
+        Arc::new(verifier.library),
+        Arc::new(manager),
     );
 
     Ok(worker)

@@ -1,5 +1,6 @@
 use anyhow::Ok;
 use parth_common::secp256k1::MemorySecp256K1Wallet;
+use std::sync::Arc;
 use parth_core::{
     crypto::hash::traits::{FieldQHasher, MerkleZeroHasher},
     data::hash::hash256::Hash256,
@@ -45,7 +46,7 @@ where
         signer,
         public_key,
         config.miner_user_id,
-        config.url_rotation_strategy.unwrap_or(PsyAPIURLRotationStrategy::ContinueUntilFailure),
+        config.url_rotation_strategy,
     );
 
     job_fetcher
@@ -56,6 +57,6 @@ where
         .realm_api_url_manager
         .add_api_urls::<QHashOut<C::F>, QProvingJobDataID>(&config.realm_api_urls)
         .await?;
-    let manager = PsyProofMinerWorkerManager::new(job_fetcher, gcv.library, coordinator_circuits);
+    let manager = PsyProofMinerWorkerManager::new(job_fetcher, Arc::new(gcv.library), Arc::new(coordinator_circuits));
     Ok(manager)
 }

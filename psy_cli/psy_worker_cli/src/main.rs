@@ -23,8 +23,9 @@ async fn main() -> anyhow::Result<()> {
             realm_api_urls,
             coordinator_api_urls,
             url_rotation_strategy,
+            batch_size,
         } => {
-            worker::run(config, private_key, keystore_path, wallet_password, user, network, proving_backend, realm_api_urls, coordinator_api_urls, url_rotation_strategy).await?;
+            worker::run(config, private_key, keystore_path, wallet_password, user, network, proving_backend, realm_api_urls, coordinator_api_urls, url_rotation_strategy, batch_size).await?;
         }
         Commands::WorkerTest {
             config,

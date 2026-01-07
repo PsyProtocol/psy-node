@@ -47,7 +47,7 @@ impl WorkerCliConfig {
         network: Option<PsyNetworkTypeInput>,
         coordinator_api_urls: Vec<String>,
         realm_api_urls: Vec<String>,
-        url_rotation_strategy: Option<PsyAPIURLRotationStrategyInput>,
+        url_rotation_strategy: PsyAPIURLRotationStrategyInput,
     ) -> anyhow::Result<WorkerStartupConfig> {
         Ok(WorkerStartupConfig {
             private_key: resolve_one_of_two_hex_32_byte_options_or_error(
@@ -60,7 +60,7 @@ impl WorkerCliConfig {
             worker_completed_jobs_log_file_path: self.completed_jobs_log_file,
             coordinator_api_urls: [coordinator_api_urls, self.coordinator_api_urls].concat(),
             realm_api_urls: [realm_api_urls, self.realm_api_urls].concat(),
-            url_rotation_strategy: url_rotation_strategy.or(self.url_rotation_strategy).map(|s| s.into()),
+            url_rotation_strategy: url_rotation_strategy.into(),
         })
     }
     pub async fn get_start_config(
@@ -72,7 +72,7 @@ impl WorkerCliConfig {
         network: Option<PsyNetworkTypeInput>,
         coordinator_api_urls: Vec<String>,
         realm_api_urls: Vec<String>,
-        url_rotation_strategy: Option<PsyAPIURLRotationStrategyInput>,
+        url_rotation_strategy: PsyAPIURLRotationStrategyInput,
     ) -> anyhow::Result<WorkerStartupConfig> {
         let cli_config = if let Some(config_path) = config {
             Self::load_from_file(&config_path).await?
