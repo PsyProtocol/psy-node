@@ -223,7 +223,8 @@ impl<Hasher: FieldQHasher<F, Hash>, Hash: Q256BitHash + QFHashBase<F> + std::fmt
         let core_input = SubmitUserEndCapNonProofCoreInput {
             checkpoint_id: F::from_u64_value(latest_checkpoint_id),
             stats: GUTAStats {
-                fees_collected: F::from_u64_value(1000 * total_slots_modified + 1000),
+                guta_fees_collected: F::from_u64_value(1000),
+                da_fees_collected: F::from_u64_value(1000 * total_slots_modified),
                 user_ops_processed: F::from_u8_value(1),
                 total_transactions: F::from_u64_value(txs.len() as u64),
                 slots_modified: F::from_u64_value(total_slots_modified as u64),

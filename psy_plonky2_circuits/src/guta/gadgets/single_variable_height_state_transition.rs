@@ -60,7 +60,8 @@ impl SingleVariableHeightStateTransitionGadget {
 
         // no change
         let new_stats = GUTAStatsGadget {
-            fees_collected: child_header.stats.fees_collected,
+            guta_fees_collected: child_header.stats.guta_fees_collected,
+            da_fees_collected: child_header.stats.da_fees_collected,
             user_ops_processed: child_header.stats.user_ops_processed,
             total_transactions: child_header.stats.total_transactions,
             slots_modified: child_header.stats.slots_modified,

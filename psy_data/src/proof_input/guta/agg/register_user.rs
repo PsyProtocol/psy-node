@@ -31,12 +31,7 @@ impl<Hash> GUTANoChangeFullInput<Hash> {
             guta_circuit_whitelist,
             checkpoint_tree_root: self.checkpoint_tree_proof.root,
             state_transition,
-            stats: GUTAStats {
-                fees_collected: F::ZERO_VALUE,
-                user_ops_processed: F::ZERO_VALUE,
-                total_transactions: F::ZERO_VALUE,
-                slots_modified: F::ZERO_VALUE,
-            },
+            stats: GUTAStats::<F>::get_zero_value(),
             total_aggregation_proofs_generated: F::from_u8_value(1),
         };
         let guta_header_hash = guta_header.qfhash::<Hasher>();

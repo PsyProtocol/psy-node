@@ -43,7 +43,8 @@ pub fn construct_new_checkpoint_leaf<C: JTMBCircuitConfig>(
     part_1_reward_root: C::Hash,
     worker_reward_tag: C::Hash,
     // These parameters represent the total stats for the current block, not deltas.
-    fees_for_block: C::F,
+    guta_fees_for_block: C::F,
+    da_fees_for_block: C::F,
     ops_for_block: C::F,
     txs_for_block: C::F,
     slots_for_block: C::F,
@@ -58,7 +59,8 @@ pub fn construct_new_checkpoint_leaf<C: JTMBCircuitConfig>(
     // It directly assigns the totals for the current block.
     // To match the circuit, we must do the same here.
     let new_stats = psy_data::v1::qdata::checkpoint::PQEDCheckpointLeafStats {
-        fees_collected: fees_for_block,
+        guta_fees_collected: guta_fees_for_block,
+        da_fees_collected: da_fees_for_block,
         user_ops_processed: ops_for_block,
         total_transactions: txs_for_block,
         slots_modified: slots_for_block,

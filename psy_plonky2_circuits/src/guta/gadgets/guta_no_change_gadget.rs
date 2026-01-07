@@ -60,12 +60,7 @@ impl GUTANoChangeGadget {
                 node_index: zero,
                 node_level: zero,
             },
-            stats: GUTAStatsGadget {
-                fees_collected: zero,
-                user_ops_processed: zero,
-                total_transactions: zero,
-                slots_modified: zero,
-            },
+            stats: GUTAStatsGadget::add_virtual_to_zero(builder),
             total_aggregation_proofs_generated,
         };
 

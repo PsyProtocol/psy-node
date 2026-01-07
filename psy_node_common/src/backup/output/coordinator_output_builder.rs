@@ -273,7 +273,8 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
             user_registration_tree_root: self.register_users_gatherer_result.end_user_registration_tree_hash,
         };
         let checkpoint_leaf_stats = PQEDCheckpointLeafStats {
-            fees_collected: self.guta_gatherer_result.guta_stats.fees_collected,
+            guta_fees_collected: self.guta_gatherer_result.guta_stats.guta_fees_collected,
+            da_fees_collected: self.guta_gatherer_result.guta_stats.da_fees_collected,
             user_ops_processed: self.guta_gatherer_result.guta_stats.user_ops_processed,
             total_transactions: self.guta_gatherer_result.guta_stats.total_transactions,
             slots_modified: self.guta_gatherer_result.guta_stats.slots_modified,
@@ -396,7 +397,8 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
             user_registration_tree_root: self.register_users_gatherer_result.end_user_registration_tree_hash,
         };
         let checkpoint_leaf_stats = PQEDCheckpointLeafStats {
-            fees_collected: self.guta_gatherer_result.guta_stats.fees_collected,
+            guta_fees_collected: self.guta_gatherer_result.guta_stats.guta_fees_collected,
+            da_fees_collected: self.guta_gatherer_result.guta_stats.da_fees_collected,
             user_ops_processed: self.guta_gatherer_result.guta_stats.user_ops_processed,
             total_transactions: self.guta_gatherer_result.guta_stats.total_transactions,
             slots_modified: self.guta_gatherer_result.guta_stats.slots_modified,

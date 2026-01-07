@@ -202,12 +202,7 @@ use parth_core::crypto::hash::traits::QFieldHashable;
                 node_index: C::F::ZERO_VALUE,
                 node_level: C::F::ZERO_VALUE,
             },
-            stats: GUTAStats {
-                fees_collected: C::F::ZERO_VALUE,
-                user_ops_processed: C::F::ZERO_VALUE,
-                total_transactions: C::F::ZERO_VALUE,
-                slots_modified: C::F::ZERO_VALUE,
-            },
+            stats: GUTAStats::<C::F>::get_zero_value(),
             total_aggregation_proofs_generated: C::F::from_noncanonical_u64(1),
         };
         println!("guta_header: {:#?}", guta_header);

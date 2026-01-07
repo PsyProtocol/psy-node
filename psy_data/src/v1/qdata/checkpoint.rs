@@ -27,7 +27,8 @@ use crate::v1::qdata::{
 #[pderive::serialize_copy_f_hash_ts]
 #[ts(export, concrete(F = parth_core::PF, Hash = parth_core::PHash), rename = "QEDCheckpointLeafStats")]
 pub struct PQEDCheckpointLeafStats<F, Hash> {
-    pub fees_collected: F,
+    pub guta_fees_collected: F,
+    pub da_fees_collected: F,
     pub user_ops_processed: F,
     pub total_transactions: F,
     pub slots_modified: F,
@@ -67,7 +68,8 @@ impl<F: QFelt, Hash: QHashBase> PsyDebugPrintable for PQEDCheckpointLeafStats<F,
         */
         format!(
             r#"PQEDCheckpointLeafStats {{
-    fees_collected: {},
+    guta_fees_collected: {},
+    da_fees_collected: {},
     user_ops_processed: {},
     total_transactions: {},
     slots_modified: {},
@@ -77,7 +79,8 @@ impl<F: QFelt, Hash: QHashBase> PsyDebugPrintable for PQEDCheckpointLeafStats<F,
     pm_rewards_commitment: {},
     da_challenges_claimed: [{}],
 }}"#,
-            self.fees_collected.psy_debug_print(),
+            self.guta_fees_collected.psy_debug_print(),
+            self.da_fees_collected.psy_debug_print(),
             self.user_ops_processed.psy_debug_print(),
             self.total_transactions.psy_debug_print(),
             self.slots_modified.psy_debug_print(),
@@ -121,7 +124,8 @@ impl_qpd_serialize_params!(
 impl<F: ZeroableFelt, Hash: ZeroableHash> PQEDCheckpointLeafStats<F, Hash> {
     pub fn get_empty_stats() -> Self {
         Self {
-            fees_collected: F::ZERO_VALUE,
+            guta_fees_collected: F::ZERO_VALUE,
+            da_fees_collected: F::ZERO_VALUE,
             user_ops_processed: F::ZERO_VALUE,
             total_transactions: F::ZERO_VALUE,
             slots_modified: F::ZERO_VALUE,
@@ -147,7 +151,8 @@ impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for PQEDCheckpointLeafStats<
         Self: Sized,
     {
         Self {
-            fees_collected: F::qp_rand_gen(),
+            guta_fees_collected: F::qp_rand_gen(),
+            da_fees_collected: F::qp_rand_gen(),
             user_ops_processed: F::qp_rand_gen(),
             total_transactions: F::qp_rand_gen(),
             slots_modified: F::qp_rand_gen(),
@@ -166,15 +171,16 @@ impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for PQEDCheckpointLeafStats<
 impl<F: QFelt64, Hash: Q256BitHash> PsyCanonicalSerializeMetadata for PQEDCheckpointLeafStats<F, Hash> {
     const IS_FIXED_SIZE: bool = true;
     const FIXED_SIZE: usize =
-        4 * 8 + PPMJobsCompletedStats::<F>::FIXED_SIZE + 8 + 32 + PPMRewardCommitment::<Hash>::FIXED_SIZE + (DA_CHALLENGE_WINDOW * 8);
+        5 * 8 + PPMJobsCompletedStats::<F>::FIXED_SIZE + 8 + 32 + PPMRewardCommitment::<Hash>::FIXED_SIZE + (DA_CHALLENGE_WINDOW * 8);
 }
 impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for PQEDCheckpointLeafStats<F, Hash> {
     fn fallback_pio_serialized_size(&self) -> usize {
-        4 * 8 + self.pm_jobs_completed.pio_serialized_size() + 8 + 32 + self.pm_rewards_commitment.pio_serialized_size() + (DA_CHALLENGE_WINDOW * 8)
+        5 * 8 + self.pm_jobs_completed.pio_serialized_size() + 8 + 32 + self.pm_rewards_commitment.pio_serialized_size() + (DA_CHALLENGE_WINDOW * 8)
     }
 
     fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
-        writer.psy_write_u64(self.fees_collected.to_u64_value())?;
+        writer.psy_write_u64(self.guta_fees_collected.to_u64_value())?;
+        writer.psy_write_u64(self.da_fees_collected.to_u64_value())?;
         writer.psy_write_u64(self.user_ops_processed.to_u64_value())?;
         writer.psy_write_u64(self.total_transactions.to_u64_value())?;
         writer.psy_write_u64(self.slots_modified.to_u64_value())?;
@@ -190,7 +196,8 @@ impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for PQEDCheckp
     }
 
     fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
-        let fees_collected = F::from_u64_value(reader.psy_read_u64()?);
+        let guta_fees_collected = F::from_u64_value(reader.psy_read_u64()?);
+        let da_fees_collected = F::from_u64_value(reader.psy_read_u64()?);
         let user_ops_processed = F::from_u64_value(reader.psy_read_u64()?);
         let total_transactions = F::from_u64_value(reader.psy_read_u64()?);
         let slots_modified = F::from_u64_value(reader.psy_read_u64()?);
@@ -204,7 +211,8 @@ impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for PQEDCheckp
         }
 
         Ok(Self {
-            fees_collected,
+            guta_fees_collected,
+            da_fees_collected,
             user_ops_processed,
             total_transactions,
             slots_modified,
@@ -230,7 +238,8 @@ pser::impl_psy_ser_basic_tests_fallback!(PPMJobsCompletedStats, { parth_core::PF
 impl<F: QFelt, Hash: QHashBase> PQEDCheckpointLeafStats<F, Hash> {
     pub fn new_empty() -> Self {
         Self {
-            fees_collected: F::ZERO_VALUE,
+            guta_fees_collected: F::ZERO_VALUE,
+            da_fees_collected: F::ZERO_VALUE,
             user_ops_processed: F::ZERO_VALUE,
             total_transactions: F::ZERO_VALUE,
             slots_modified: F::ZERO_VALUE,
@@ -249,13 +258,13 @@ impl<F: QFelt, Hash: QHashBase> PQEDCheckpointLeafStats<F, Hash> {
 
 impl<F: QFelt, Hash: QHashBase> QFeltSized for PQEDCheckpointLeafStats<F, Hash> {
     fn q_felt_size() -> usize {
-        4 + PPMJobsCompletedStats::<F>::q_felt_size() + 1 + 4 + PPMRewardCommitment::<Hash>::q_felt_size() + DA_CHALLENGE_WINDOW
+        5 + PPMJobsCompletedStats::<F>::q_felt_size() + 1 + 4 + PPMRewardCommitment::<Hash>::q_felt_size() + DA_CHALLENGE_WINDOW
     }
 }
 
 impl<F: QFelt64, Hash: QFHashBase<F>> ToQFelts<F> for PQEDCheckpointLeafStats<F, Hash> {
     fn to_qfelts(&self) -> Vec<F> {
-        let mut result = vec![self.fees_collected, self.user_ops_processed, self.total_transactions, self.slots_modified];
+        let mut result = vec![self.guta_fees_collected, self.da_fees_collected, self.user_ops_processed, self.total_transactions, self.slots_modified];
         result.extend_from_slice(&self.pm_jobs_completed.to_qfelts());
         result.push(self.block_time);
         result.extend_from_slice(&self.random_seed.to_4_felts());
@@ -273,7 +282,7 @@ impl<F: QFelt64, Hash: QFHashBase<F>> ToQFelts<F> for PQEDCheckpointLeafStats<F,
             );
         }
 
-        let pm_jobs_start = 4;
+        let pm_jobs_start = 5;
         let pm_jobs_end = pm_jobs_start + PPMJobsCompletedStats::<F>::q_felt_size();
         let block_time_index = pm_jobs_end;
         let random_seed_start = block_time_index + 1;
@@ -283,10 +292,11 @@ impl<F: QFelt64, Hash: QFHashBase<F>> ToQFelts<F> for PQEDCheckpointLeafStats<F,
         let da_challenges_start = pm_rewards_end;
 
         Self {
-            fees_collected: felts[0],
-            user_ops_processed: felts[1],
-            total_transactions: felts[2],
-            slots_modified: felts[3],
+            guta_fees_collected: felts[0],
+            da_fees_collected: felts[1],
+            user_ops_processed: felts[2],
+            total_transactions: felts[3],
+            slots_modified: felts[4],
             pm_jobs_completed: PPMJobsCompletedStats::from_qfelts(&felts[pm_jobs_start..pm_jobs_end]),
             block_time: felts[block_time_index],
             random_seed: Hash::from_4_felts_slice(&felts[random_seed_start..random_seed_end]),

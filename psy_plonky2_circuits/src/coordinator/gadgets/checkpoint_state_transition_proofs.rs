@@ -85,7 +85,8 @@ impl QEDPart1StateDeltaResultGadget {
         let rewards_tree_tag_tree_root = hash_tag_tree_node_single_circuit::<H, F, D>(builder, part_1_worker_reward_tree_value, worker_rewards_tree_tag);
 
         let new_stats = QEDCheckpointLeafStatsGadget {
-            fees_collected: part_1_header.global_user_tree_delta.stats.fees_collected,
+            guta_fees_collected: part_1_header.global_user_tree_delta.stats.guta_fees_collected,
+            da_fees_collected: part_1_header.global_user_tree_delta.stats.da_fees_collected,
             user_ops_processed: part_1_header.global_user_tree_delta.stats.user_ops_processed,
             total_transactions: part_1_header.global_user_tree_delta.stats.total_transactions,
             slots_modified: part_1_header.global_user_tree_delta.stats.slots_modified,

@@ -84,12 +84,7 @@ impl<C: JTMBCircuitConfig> GUTANoChangeCircuit<C> {
                 node_index: zero,
                 node_level: zero,
             },
-            stats: GUTAStats {
-                fees_collected: zero,
-                user_ops_processed: zero,
-                total_transactions: zero,
-                slots_modified: zero,
-            },
+            stats: GUTAStats::<C::F>::get_zero_value(),
             total_aggregation_proofs_generated: one,
         };
 

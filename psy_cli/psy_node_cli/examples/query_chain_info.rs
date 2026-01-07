@@ -50,7 +50,7 @@ struct ServiceInfo {
     checkpoint_id: u64,
     recent_roots: Vec<(u64, Hash)>,
     global_chain_roots: Vec<(u64, Hash)>,
-    leaf_stats: Option<(u64, u64, u64, u64, u64)>,
+    leaf_stats: Option<(u64, u64, u64, u64, u64, u64)>,
     l2_state: Option<String>,
     contract_heights: Vec<u8>,
     user_leaves: Vec<(u64, String)>,
@@ -173,7 +173,8 @@ async fn query_service_info(
     if service_type == "realm" {
         if let Ok(leaf) = RealmEdgeRpcClient::<F, Hash, QProvingJobDataID, ZKProof>::get_checkpoint_leaf_data(client, info.checkpoint_id).await {
             info.leaf_stats = Some((
-                leaf.stats.fees_collected.to_canonical_u64(),
+                leaf.stats.guta_fees_collected.to_canonical_u64(),
+                leaf.stats.da_fees_collected.to_canonical_u64(),
                 leaf.stats.total_transactions.to_canonical_u64(),
                 leaf.stats.user_ops_processed.to_canonical_u64(),
                 leaf.stats.slots_modified.to_canonical_u64(),
@@ -391,9 +392,9 @@ fn display_service_info(info: &ServiceInfo) {
         }
     }
 
-    if let Some((fees, txns, user_ops, slots, block_time)) = info.leaf_stats {
-        println!("Checkpoint Stats: fees={}, transactions={}, user_ops={}, slots_modified={}, block_time={}",
-            fees, txns, user_ops, slots, block_time);
+    if let Some((guta_fees, da_fees, txns, user_ops, slots, block_time)) = info.leaf_stats {
+        println!("Checkpoint Stats: guta_fees={}, da_fees={}, transactions={}, user_ops={}, slots_modified={}, block_time={}",
+            guta_fees, da_fees, txns, user_ops, slots, block_time);
     }
 
     if let (Some(realm_root), Some(last_modified)) = (info.realm_root.as_ref(), info.realm_last_modified_checkpoint) {

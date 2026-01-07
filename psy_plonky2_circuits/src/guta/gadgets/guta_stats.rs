@@ -10,7 +10,8 @@ use psy_plonky2_common_circuits::traits::{AlgebraicHashableTarget, WitnessValueF
 #[derive(Clone, Debug, Copy)]
 pub struct GUTAStatsGadget {
     // start require witness
-    pub fees_collected: Target,
+    pub guta_fees_collected: Target,
+    pub da_fees_collected: Target,
 
     pub user_ops_processed: Target,
     pub total_transactions: Target,
@@ -19,10 +20,9 @@ pub struct GUTAStatsGadget {
     // start computed
 }
 impl GUTAStatsGadget {
-    pub fn add_virtual_to_zero<F: RichField + Extendable<D>, const D: usize>(
-        builder: &mut CircuitBuilder<F, D>,
-    ) -> Self {
-        let fees_collected = builder.zero();
+    pub fn add_virtual_to_zero<F: RichField + Extendable<D>, const D: usize>(builder: &mut CircuitBuilder<F, D>) -> Self {
+        let guta_fees_collected = builder.zero();
+        let da_fees_collected = builder.zero();
 
         let user_ops_processed = builder.zero();
         let total_transactions = builder.zero();
@@ -30,16 +30,16 @@ impl GUTAStatsGadget {
         let slots_modified = builder.zero();
 
         Self {
-            fees_collected,
+            guta_fees_collected,
+            da_fees_collected,
             user_ops_processed,
             total_transactions,
             slots_modified,
         }
     }
-    pub fn add_virtual_to<F: RichField + Extendable<D>, const D: usize>(
-        builder: &mut CircuitBuilder<F, D>,
-    ) -> Self {
-        let fees_collected = builder.add_virtual_target();
+    pub fn add_virtual_to<F: RichField + Extendable<D>, const D: usize>(builder: &mut CircuitBuilder<F, D>) -> Self {
+        let guta_fees_collected = builder.add_virtual_target();
+        let da_fees_collected = builder.add_virtual_target();
 
         let user_ops_processed = builder.add_virtual_target();
         let total_transactions = builder.add_virtual_target();
@@ -47,7 +47,8 @@ impl GUTAStatsGadget {
         let slots_modified = builder.add_virtual_target();
 
         Self {
-            fees_collected,
+            guta_fees_collected,
+            da_fees_collected,
             user_ops_processed,
             total_transactions,
             slots_modified,
@@ -58,38 +59,40 @@ impl GUTAStatsGadget {
         builder: &mut CircuitBuilder<F, D>,
         other: &GUTAStatsGadget,
     ) -> GUTAStatsGadget {
+        let guta_fees_collected = builder.add(self.guta_fees_collected, other.guta_fees_collected);
+        let da_fees_collected = builder.add(self.da_fees_collected, other.da_fees_collected);
 
-        let fees_collected = builder.add(self.fees_collected, other.fees_collected);
         let user_ops_processed = builder.add(self.user_ops_processed, other.user_ops_processed);
         let total_transactions = builder.add(self.total_transactions, other.total_transactions);
         let slots_modified = builder.add(self.slots_modified, other.slots_modified);
-        
+
         Self {
-            fees_collected,
+            guta_fees_collected,
+            da_fees_collected,
             user_ops_processed,
             total_transactions,
             slots_modified,
         }
     }
     pub fn set_witness<F: RichField>(&self, witness: &mut impl Witness<F>, target: &GUTAStats<F>) -> anyhow::Result<()> {
-        witness.set_target(self.fees_collected, target.fees_collected)?;
+        witness.set_target(self.guta_fees_collected, target.guta_fees_collected)?;
+        witness.set_target(self.da_fees_collected, target.da_fees_collected)?;
         witness.set_target(self.user_ops_processed, target.user_ops_processed)?;
         witness.set_target(self.total_transactions, target.total_transactions)?;
         witness.set_target(self.slots_modified, target.slots_modified)
     }
 
-    pub fn to_hash<H: AlgebraicHasher<F>, F: RichField + Extendable<D>, const D: usize>(
-        &self,
-        _builder: &mut CircuitBuilder<F, D>,
-    ) -> HashOutTarget {
-        HashOutTarget {
-            elements: [
-                self.fees_collected,
+    pub fn to_hash<H: AlgebraicHasher<F>, F: RichField + Extendable<D>, const D: usize>(&self, builder: &mut CircuitBuilder<F, D>) -> HashOutTarget {
+        builder.hash_n_to_hash_no_pad::<H>(
+            [
+                self.guta_fees_collected,
+                self.da_fees_collected,
                 self.user_ops_processed,
                 self.total_transactions,
                 self.slots_modified,
-            ],
-        }
+            ]
+            .to_vec(),
+        )
     }
 }
 impl AlgebraicHashableTarget for GUTAStatsGadget {

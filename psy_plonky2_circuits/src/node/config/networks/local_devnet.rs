@@ -45,7 +45,8 @@ pub fn get_genesis_block_setup_data_for_local_devnet_default() -> anyhow::Result
         contracts: vec![],
         users: vec![],
         checkpoint_stats: PQEDCheckpointLeafStats {
-            fees_collected: F::ZERO_VALUE,
+            guta_fees_collected: F::ZERO_VALUE,
+            da_fees_collected: F::ZERO_VALUE,
             user_ops_processed: F::ZERO_VALUE,
             total_transactions: F::ZERO_VALUE,
             slots_modified: F::ZERO_VALUE,
@@ -185,7 +186,8 @@ mod tests {
             contracts,
             users,
             checkpoint_stats: PQEDCheckpointLeafStats {
-                fees_collected: F::ZERO_VALUE,
+                guta_fees_collected: F::ZERO_VALUE,
+                da_fees_collected: F::ZERO_VALUE,
                 user_ops_processed: F::ZERO_VALUE,
                 total_transactions: F::ZERO_VALUE,
                 slots_modified: F::ZERO_VALUE,

@@ -303,12 +303,7 @@ impl<F: QFelt64, Hash: QDBHashBase> RealmGUTAEndCapGathererOutputDatabase<F, Has
                         node_index: F::ZERO_VALUE,
                         node_level: F::ZERO_VALUE,
                     },
-                    stats: GUTAStats {
-                        fees_collected: F::ZERO_VALUE,
-                        user_ops_processed: F::ZERO_VALUE,
-                        total_transactions: F::ZERO_VALUE,
-                        slots_modified: F::ZERO_VALUE,
-                    },
+                    stats: GUTAStats::<F>::get_zero_value(),
                     total_aggregation_proofs_generated: F::ZERO_VALUE,
                 },
             },
@@ -550,12 +545,7 @@ impl<
                     node_index: N::F::ZERO_VALUE,
                     node_level: N::F::ZERO_VALUE,
                 },
-                stats: GUTAStats {
-                    fees_collected: N::F::ZERO_VALUE,
-                    user_ops_processed: N::F::ZERO_VALUE,
-                    total_transactions: N::F::ZERO_VALUE,
-                    slots_modified: N::F::ZERO_VALUE,
-                },
+                stats: GUTAStats::<N::F>::get_zero_value(),
                 total_aggregation_proofs_generated: N::F::ZERO_VALUE,
             },
         };

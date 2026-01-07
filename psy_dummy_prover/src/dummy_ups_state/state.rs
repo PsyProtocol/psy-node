@@ -263,7 +263,8 @@ impl<F: QFelt64, Hash: QDBHashBase + QFHashBase<F>, Fetcher: PsyDummyProverCombo
             user_id: self.start_user_leaf.user_id,
         };
         let stats = GUTAStats {
-            fees_collected: F::from_u64_value(1000),
+            guta_fees_collected: F::from_u64_value(1000),
+            da_fees_collected: F::from_u64_value(1000 * self.slots_modified),
             user_ops_processed: F::from_u64_value(1),
             total_transactions: F::from_u64_value(1),
             slots_modified: F::from_u64_value(self.slots_modified),

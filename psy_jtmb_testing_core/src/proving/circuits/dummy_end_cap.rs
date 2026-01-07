@@ -73,7 +73,8 @@ impl<C: JTMBCircuitConfig> DummyUPSStandardEndCapCircuit<C>{
         new_user_leaf.user_state_tree_root = new_user_state_root;
         let new_user_leaf_hash = new_user_leaf.qfhash::<C::Hasher>();
         let guta_stats = GUTAStats{
-            fees_collected: C::F::from_u64_value(1000),
+            guta_fees_collected: C::F::from_u64_value(1000),
+            da_fees_collected: C::F::from_u64_value(1000 * slots_modified),
             user_ops_processed: C::F::from_u64_value(1),
             total_transactions: C::F::from_u64_value(number_of_transactions),
             slots_modified: C::F::from_u64_value(slots_modified),
