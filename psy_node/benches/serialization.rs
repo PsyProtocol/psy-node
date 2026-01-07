@@ -79,7 +79,8 @@ impl<F: RichField> SubmitUserEndCapNonProofCoreInput<F> {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Copy, Default, rkyv::Serialize, rkyv::Deserialize, rkyv::Archive, speedy::Readable, speedy::Writable)]
 #[serde(bound = "for<'de2> F: Deserialize<'de2>")]
 pub struct GUTAStats<F: RichField> {
-    pub fees_collected: F,
+    pub guta_fees_collected: F,
+    pub da_fees_collected: F,
 
     pub user_ops_processed: F,
     pub total_transactions: F,
@@ -89,7 +90,8 @@ pub struct GUTAStats<F: RichField> {
 impl<F: RichField> GUTAStats<F> {
     pub fn new_empty() -> Self {
         Self {
-            fees_collected: F::ZERO,
+            guta_fees_collected: F::ZERO,
+            da_fees_collected: F::ZERO,
             user_ops_processed: F::ZERO,
             total_transactions: F::ZERO,
             slots_modified: F::ZERO,
@@ -98,7 +100,8 @@ impl<F: RichField> GUTAStats<F> {
     pub fn new_random() -> Self {
         let mut rng = thread_rng();
         Self {
-            fees_collected: F::rand(),
+            guta_fees_collected: F::rand(),
+            da_fees_collected: F::rand(),
             user_ops_processed: F::rand(),
             total_transactions: F::rand(),
             slots_modified: F::rand(),

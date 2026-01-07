@@ -235,7 +235,8 @@ mod tests {
         };
 
         let guta_stats = GUTAStats {
-            fees_collected: F::from_owned_u64(1000),
+            guta_fees_collected: F::from_owned_u64(1000),
+            da_fees_collected: F::from_owned_u64(1000 * 50 * contract_trees.len() as u64),
             user_ops_processed: F::from_owned_u64(1),
             total_transactions: F::from_owned_u64(contract_trees.len() as u64),
             slots_modified: F::from_owned_u64(50 * contract_trees.len() as u64),

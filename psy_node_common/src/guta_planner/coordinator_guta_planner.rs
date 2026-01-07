@@ -1128,7 +1128,8 @@ mod tests {
         PQEDCheckpointLeafCompact<Hash>,
     ) {
         let stats = PQEDCheckpointLeafStats::<F, Hash> {
-            fees_collected: F::from_u64_value(u64::qp_rand_gen()),
+            guta_fees_collected: F::from_u64_value(u64::qp_rand_gen()),
+            da_fees_collected: F::from_u64_value(u64::qp_rand_gen()),
             user_ops_processed: F::from_u64_value(u64::qp_rand_gen()),
             total_transactions: F::from_u64_value(u64::qp_rand_gen()),
             slots_modified: F::from_u64_value(u64::qp_rand_gen()),
@@ -1190,7 +1191,8 @@ mod tests {
                         node_level: F::from_u8_value(REALM_LEVEL_U8),
                     },
                     stats: GUTAStats {
-                        fees_collected: F::from_u64_value(u64::qp_rand_gen()),
+                        guta_fees_collected: F::from_u64_value(u64::qp_rand_gen()),
+                        da_fees_collected: F::from_u64_value(u64::qp_rand_gen()),
                         user_ops_processed: F::from_u64_value(u64::qp_rand_gen()),
                         total_transactions: F::from_u64_value(u64::qp_rand_gen()),
                         slots_modified: F::from_u64_value(u64::qp_rand_gen()),

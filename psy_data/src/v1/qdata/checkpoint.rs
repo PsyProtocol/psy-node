@@ -47,7 +47,8 @@ impl<F: QFelt, Hash: QHashBase> PsyDebugPrintable for PQEDCheckpointLeafStats<F,
         print:
 
         PQEDCheckpointLeafStats {
-            fees_collected: {},
+            guta_fees_collected: {},
+            da_fees_collected: {},
             user_ops_processed: {},
             total_transactions: {},
             slots_modified: {},
