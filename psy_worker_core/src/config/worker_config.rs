@@ -1,4 +1,4 @@
-use psy_core::constants::chain_id::PsyChainNetworkType;
+use psy_core::constants::{chain_id::PsyChainNetworkType, url_rotation::PsyAPIURLRotationStrategy};
 use serde::{Deserialize, Serialize};
 
 
@@ -11,6 +11,7 @@ pub struct WorkerStartupConfig {
     pub worker_completed_jobs_log_file_path: Option<String>,
     pub coordinator_api_urls: Vec<String>,
     pub realm_api_urls: Vec<String>,
+    pub url_rotation_strategy: Option<PsyAPIURLRotationStrategy>,
 }
 
 impl WorkerStartupConfig {

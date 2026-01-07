@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use psy_core::constants::{chain_id::PsyNetworkTypeInput, proving_backends::PsyChainProvingBackendTypeInput};
+use psy_core::constants::{chain_id::PsyNetworkTypeInput, proving_backends::PsyChainProvingBackendTypeInput, url_rotation::PsyAPIURLRotationStrategyInput};
 
 pub mod worker;
 pub mod worker_test;
@@ -44,6 +44,9 @@ pub enum Commands {
 
         #[arg(long = "realm-api-url", help = "Realm Edge API URLs for the worker to connect to (supports many)")]
         realm_api_urls: Vec<String>,
+
+        #[arg(long = "url-rotation-strategy", help = "URL rotation strategy (round-robin, random, continue-until-failure, continue-until-failure-or-no-work-for-3-seconds, smart-swap-v1)")]
+        url_rotation_strategy: Option<PsyAPIURLRotationStrategyInput>,
     },
     #[command(about = "Run a proof mining worker in test mode")]
     WorkerTest {

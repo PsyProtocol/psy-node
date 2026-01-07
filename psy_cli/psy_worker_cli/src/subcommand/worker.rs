@@ -2,6 +2,7 @@ use plonky2::plonk::config::PoseidonGoldilocksConfig;
 use psy_core::constants::{
     chain_id::{PsyChainNetworkType, PsyNetworkTypeInput},
     proving_backends::{PsyChainProvingBackendType, PsyChainProvingBackendTypeInput},
+    url_rotation::PsyAPIURLRotationStrategyInput,
 };
 use psy_jtmb_testing_core::{circuit_library::worker::get_simple_proof_miner_worker_for_network_jtmb, protocol_types::JTMBPoseidonGoldilocksConfig};
 use psy_plonky2_circuits::circuit_library::get_simple_proof_miner_worker_for_network;
@@ -65,6 +66,7 @@ pub async fn run(
     proving_backend: Option<PsyChainProvingBackendTypeInput>,
     realm_api_urls: Vec<String>,
     coordinator_api_urls: Vec<String>,
+    url_rotation_strategy: Option<PsyAPIURLRotationStrategyInput>,
 ) -> anyhow::Result<()> {
     print_banner();
     info!("Worker starting...");
@@ -77,6 +79,7 @@ pub async fn run(
         network,
         coordinator_api_urls,
         realm_api_urls,
+        url_rotation_strategy,
     )
     .await?.with_unique_api_urls();
     let network = config.network.clone();

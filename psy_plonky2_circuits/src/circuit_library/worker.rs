@@ -45,7 +45,7 @@ where
         signer,
         public_key,
         config.miner_user_id,
-        PsyAPIURLRotationStrategy::ContinueUntilFailure,
+        config.url_rotation_strategy.unwrap_or(PsyAPIURLRotationStrategy::ContinueUntilFailure),
     );
 
     job_fetcher

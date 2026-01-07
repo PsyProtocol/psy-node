@@ -22,8 +22,9 @@ async fn main() -> anyhow::Result<()> {
             proving_backend,
             realm_api_urls,
             coordinator_api_urls,
+            url_rotation_strategy,
         } => {
-            worker::run(config, private_key, keystore_path, wallet_password, user, network, proving_backend, realm_api_urls, coordinator_api_urls).await?;
+            worker::run(config, private_key, keystore_path, wallet_password, user, network, proving_backend, realm_api_urls, coordinator_api_urls, url_rotation_strategy).await?;
         }
         Commands::WorkerTest {
             config,

@@ -1,5 +1,5 @@
 use cf_utils::option::resolve_one_of_two_hex_32_byte_options_or_error;
-use psy_core::constants::chain_id::PsyNetworkTypeInput;
+use psy_core::constants::{chain_id::PsyNetworkTypeInput, url_rotation::PsyAPIURLRotationStrategyInput};
 use serde::{Deserialize, Serialize};
 
 use crate::config::worker_config::WorkerStartupConfig;
@@ -13,6 +13,7 @@ pub struct WorkerCliConfig {
     pub private_key: Option<String>,
     pub coordinator_api_urls: Vec<String>,
     pub realm_api_urls: Vec<String>,
+    pub url_rotation_strategy: Option<PsyAPIURLRotationStrategyInput>,
 }
 fn resolve_one_of_options_or_error<T: Clone>(
     cli_option: Option<T>,
@@ -36,6 +37,7 @@ impl WorkerCliConfig {
             network: None,
             coordinator_api_urls: Vec::new(),
             realm_api_urls: Vec::new(),
+            url_rotation_strategy: None,
         }
     }
     pub fn into_start_config_with_cli_args(
@@ -45,6 +47,7 @@ impl WorkerCliConfig {
         network: Option<PsyNetworkTypeInput>,
         coordinator_api_urls: Vec<String>,
         realm_api_urls: Vec<String>,
+        url_rotation_strategy: Option<PsyAPIURLRotationStrategyInput>,
     ) -> anyhow::Result<WorkerStartupConfig> {
         Ok(WorkerStartupConfig {
             private_key: resolve_one_of_two_hex_32_byte_options_or_error(
@@ -57,6 +60,7 @@ impl WorkerCliConfig {
             worker_completed_jobs_log_file_path: self.completed_jobs_log_file,
             coordinator_api_urls: [coordinator_api_urls, self.coordinator_api_urls].concat(),
             realm_api_urls: [realm_api_urls, self.realm_api_urls].concat(),
+            url_rotation_strategy: url_rotation_strategy.or(self.url_rotation_strategy).map(|s| s.into()),
         })
     }
     pub async fn get_start_config(
@@ -68,6 +72,7 @@ impl WorkerCliConfig {
         network: Option<PsyNetworkTypeInput>,
         coordinator_api_urls: Vec<String>,
         realm_api_urls: Vec<String>,
+        url_rotation_strategy: Option<PsyAPIURLRotationStrategyInput>,
     ) -> anyhow::Result<WorkerStartupConfig> {
         let cli_config = if let Some(config_path) = config {
             Self::load_from_file(&config_path).await?
@@ -80,6 +85,7 @@ impl WorkerCliConfig {
             network,
             coordinator_api_urls,
             realm_api_urls,
+            url_rotation_strategy,
         )
     }
     pub fn ensure_unique_api_urls(&mut self) {
@@ -129,6 +135,7 @@ mod tests {
             network: Some(PsyNetworkTypeInput::LocalDevnet),
             coordinator_api_urls: vec!["http://localhost:8000".to_string()],
             realm_api_urls: vec!["http://localhost:9000".to_string()],
+            url_rotation_strategy: None,
         };
         let yaml_str = serde_yaml::to_string(&config).unwrap();
         let deserialized_config: WorkerCliConfig = serde_yaml::from_str(&yaml_str).unwrap();

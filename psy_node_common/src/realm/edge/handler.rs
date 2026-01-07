@@ -261,8 +261,7 @@ impl<
         timer.lap_micros("ensure_user_has_not_submitted");
 
         let current_checkpoint_id = self.get_latest_checkpoint_id().await?;
-        let global_user_tree_proof = self.db_reader.global_user_tree_get_merkle_proof(current_checkpoint_id, user_id)
-.await?;
+        let global_user_tree_proof = self.db_reader.global_user_tree_get_merkle_proof(current_checkpoint_id, user_id).await?;
 
         timer.lap_micros("get_latest_checkpoint_id");
         let old_user_leaf = self.get_user_leaf_data_internal(current_checkpoint_id, user_id).await?;
