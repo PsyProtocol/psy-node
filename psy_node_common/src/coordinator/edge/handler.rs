@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use tokio::task;
 use parth_core::{
     QCoreProcCheckpointUniqueId, QProvingJobDataIDWithRewardPath, crypto::hash::{merkle_proof::MerkleProofCore, tag_tree::TagTreeMerkleProof, traits::QFieldHashable}, data::{hash::merkle_node_key::SimpleMerkleNodeKey, queue::queue_key::QPBaseQueueType}, felt::ToU64Value, node::realm_identifier::QRealmIdentifier, protocol::core_types::{QNetworkTypesConfig, QZKProofVerifier}
 };
@@ -337,7 +338,10 @@ impl<
         ))
     }
 
-    pub async fn register_user_internal(&self, public_key: PZKPublicKeyInfo<N::QHash>) -> anyhow::Result<String> {
+    pub async fn register_user_internal(&self, public_key: PZKPublicKeyInfo<N::QHash>) -> anyhow::Result<String>
+    where
+        N::ZKVerifier: 'static,
+    {
         let (_, unique_proc_checkpoint_id, queue_key) = self.get_register_user_queue_key().await?;
         self.register_user_queue
             .publish_ephemeral_queue_item_owned_bytes(
@@ -421,7 +425,10 @@ impl<
         &self,
         input: GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<N::F, N::QHash>,
         proof_bytes: Vec<u8>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<()>
+    where
+        N::ZKVerifier: 'static,
+    {
         let realm_id_u64 = input.header.header.state_transition.node_index.to_u64_value();
         println!("Submitting GUTA for realm_id {}\n{:?}", realm_id_u64, input);
 
@@ -441,6 +448,7 @@ impl<
 
         let realm_id = realm_id_u64 as u32;
         let proving_circuit_type = ProvingJobCircuitType::try_from_u32(input.job_type_u32)?;
+        let proof_bytes = Arc::new(proof_bytes);
 
         let (unique_pending_id, proc_checkpoint_id) = self.get_current_gathering_unique_pending_id_internal().await?;
 
@@ -469,8 +477,13 @@ impl<
         )?;
 
         let expected_public_inputs_hash = input.qfhash::<N::HasherBase>();
-        self.proof_verifier
-            .verify_zk_proof_from_slice_check_public_inputs_hash(input.job_type_u32, &proof_bytes, expected_public_inputs_hash)?;
+        let proof_verifier = self.proof_verifier.clone();
+        task::spawn_blocking({
+            let proof_bytes = proof_bytes.clone();
+            move || {
+                proof_verifier.verify_zk_proof_from_slice_check_public_inputs_hash(input.job_type_u32, &proof_bytes, expected_public_inputs_hash)
+            }
+        }).await??;
         if self
             .temp_db
             .get_submitted_status_for_pending(&self.realm_identifier, unique_pending_id, realm_id_u64)

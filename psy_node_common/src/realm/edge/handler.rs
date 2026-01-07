@@ -1,4 +1,6 @@
 use std::{sync::Arc, u64};
+use tokio::task;
+use futures::stream::{self, StreamExt};
 
 use async_trait::async_trait;
 use cf_utils::timer::DebugTimer;
@@ -235,7 +237,11 @@ impl<
         &self,
         user_end_cap_input: SubmitUserEndCapNonProofInput<N::F, N::QHash>,
         proof_bytes: Vec<u8>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<()>
+    where
+        N::ZKVerifier: 'static,
+        N::ZKProof: 'static,
+    {
         let mut timer = DebugTimer::new("handle_user_end_cap_proof_submission");
         let end_cap_checkpoint_id = user_end_cap_input.core.checkpoint_id.to_u64_value();
 
@@ -364,7 +370,10 @@ impl<
         )?;
         timer.lap_micros("ensure_simple_self_consistent");
 
-        self.proof_verifier.verify_zk_proof(END_CAP_PROOF_CIRCUIT_TYPE_U32, &proof)?;
+        let proof_verifier = self.proof_verifier.clone();
+        task::spawn_blocking(move || {
+            proof_verifier.verify_zk_proof(END_CAP_PROOF_CIRCUIT_TYPE_U32, &proof)
+        }).await??;
         timer.lap_micros("verify_zk_proof");
 
         // TODO: maybe modify the job_id.sub_group_id
@@ -534,18 +543,30 @@ impl<
     }
 
     async fn submit_user_end_cap_batch(&self, requests: Vec<(SubmitUserEndCapNonProofInput<N::F, N::QHash>, Vec<u8>)>) -> QRpcResult<(Vec<u64>,Vec<u64>)> {
+        let results: Vec<(u64, bool)> = stream::iter(requests.into_iter().map(|(user_ec_input, proof)| async move {
+            let user_id: u64 = user_ec_input.core.state_transition.user_id.to_u64_value();
+            match self.handle_user_end_cap_proof_submission(user_ec_input, proof).await {
+                Ok(_) => (user_id, true),
+                Err(err) => {
+                    tracing::warn!("Failed to handle user end cap proof submission for user_id {}: {}", user_id, err);
+                    (user_id, false)
+                }
+            }
+        }))
+        .buffered(16)
+        .collect()
+        .await;
+
         let mut failed_user_ids = vec![];
         let mut success_user_ids = vec![];
-        for (user_ec_input, proof) in requests {
-            let user_id: u64 = user_ec_input.core.state_transition.user_id.to_u64_value();
-            if let Err(err) = self.handle_user_end_cap_proof_submission(user_ec_input, proof).await {
-                failed_user_ids.push(user_id);
-                tracing::warn!("Failed to handle user end cap proof submission for user_id {}: {}", user_id, err);
-            }else {
+        for (user_id, success) in results {
+            if success {
                 success_user_ids.push(user_id);
+            } else {
+                failed_user_ids.push(user_id);
             }
         }
-        Ok((success_user_ids,failed_user_ids))
+        Ok((success_user_ids, failed_user_ids))
     }
 
     async fn get_checkpoint_leaf_data(&self, checkpoint_id: u64) -> QRpcResult<PQEDCheckpointLeaf<N::F, N::QHash>> {

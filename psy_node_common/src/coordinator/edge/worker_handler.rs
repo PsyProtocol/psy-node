@@ -1,4 +1,6 @@
 use futures::future::try_join_all;
+use std::sync::Arc;
+use tokio::task;
 use parth_core::{
     crypto::{
         hash::traits::{MerkleHasher, ZeroableHash},
@@ -275,9 +277,13 @@ impl<
 
         Ok(expected_public_inputs_hash)
     }
-    pub async fn submit_proof_raw_internal(&self, mut job_id: N::JobId, tag: N::QHash, proof_bytes: Vec<u8>) -> anyhow::Result<()> {
+    pub async fn submit_proof_raw_internal(&self, mut job_id: N::JobId, tag: N::QHash, proof_bytes: Vec<u8>) -> anyhow::Result<()>
+    where
+        N::ZKVerifier: 'static,
+    {
         job_id = job_id.get_output_id();
         let (unique_pending_id, unique_proc_id) = self.get_current_unique_pending_id_internal().await?;
+        let proof_bytes = Arc::new(proof_bytes);
 
         //HACK: check to make sure the tag matches
         if self
@@ -328,7 +334,7 @@ impl<
 
         print_hash("full_expected_public_inputs_hash", &full_expected_public_inputs_hash);
         print_hash("metadata.expected_public_inputs_hash", &metadata.expected_public_inputs_hash);
-        
+
         tracing::info!(
             "Verifying proof for job id: {:?} with expected public inputs hash: {:?} (from metadata: {:?})",
             job_id,
@@ -342,11 +348,17 @@ impl<
         );
         print_hash("debug_public_inputs", &debug_public_inputs);
 
-        self.proof_verifier.verify_zk_proof_from_slice_check_public_inputs_hash(
-            job_id.circuit_type.to_u8() as u32,
-            &proof_bytes,
-            full_expected_public_inputs_hash,
-        )?;
+        let proof_verifier = self.proof_verifier.clone();
+        task::spawn_blocking({
+            let proof_bytes = proof_bytes.clone();
+            move || {
+                proof_verifier.verify_zk_proof_from_slice_check_public_inputs_hash(
+                    job_id.circuit_type.to_u8() as u32,
+                    &proof_bytes,
+                    full_expected_public_inputs_hash,
+                )
+            }
+        }).await??;
 
         // HACK: now set the correct reward tree value
         self.temp_db

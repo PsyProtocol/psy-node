@@ -1,5 +1,7 @@
 use cf_utils::timer::DebugTimer;
 use futures::future::try_join_all;
+use std::sync::Arc;
+use tokio::task;
 use parth_core::{
     QCoreProcCheckpointUniqueId, crypto::{
         hash::
@@ -9,7 +11,7 @@ use parth_core::{
     }, data::queue::queue_key::QPBaseQueueType, felt::{FromPrimitiveValuesFelt, ZeroableFelt}, protocol::core_types::{Q256BitHash, QNetworkTypesConfig, QZKProofVerifier}
 };
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
-use psy_data::{v1::qdata::user::PQEDUserLeaf, 
+use psy_data::{v1::qdata::user::PQEDUserLeaf,
     worker::{
         api_response::{PROVING_JOB_NODE_TYPE_REALM, PsyWorkerGetProvingWorkAPIResponse, PsyWorkerGetProvingWorkWithChildProofsAPIResponse},
         metadata::{
@@ -78,14 +80,14 @@ impl<
 
         Ok(())
     }
-    
+
     pub async fn get_user_leaf_data_internal(&self, checkpoint_id: u64, user_id: u64) -> anyhow::Result<PQEDUserLeaf<N::F, N::QHash>> {
         tracing::debug!("get_user_leaf_data_internal: checkpoint_id={}, user_id={}", checkpoint_id, user_id);
         let leaf = self
             .db_reader
             .get_user_leaf(checkpoint_id, user_id)
             .await;
-        
+
         if leaf.is_err(){
             let err = leaf.err().unwrap();
             let err_msg  = format!("{:?}", err);
@@ -105,7 +107,7 @@ impl<
         }
         Ok(leaf.unwrap())
     }
-    
+
     pub async fn get_user_leaves_data_internal(&self, checkpoint_id: u64, user_ids: &[u64]) -> anyhow::Result<Vec<PQEDUserLeaf<N::F, N::QHash>>> {
         if user_ids.len() == 0 {
             anyhow::bail!("user_ids cannot be empty");
@@ -207,7 +209,7 @@ impl<
 
         let (unique_pending_id, unique_proc_id) = self.get_current_unique_pending_id_internal().await?;
         timer.lap_micros("get_current_unique_pending_id_internal");
-        
+
         let queue_key = RealmProvingWorkQueueKey::<N::QHash, N::JobId> {
             realm_id: self.realm_id_u64,
             realm_sub_id: self.realm_sub_id_u64,
@@ -322,11 +324,15 @@ impl<
             input_proofs: final_child_proofs,
         })
     }
-    pub async fn submit_proof_raw_internal(&self, mut job_id: N::JobId, tag: N::QHash, proof_bytes: Vec<u8>) -> anyhow::Result<()> {
+    pub async fn submit_proof_raw_internal(&self, mut job_id: N::JobId, tag: N::QHash, proof_bytes: Vec<u8>) -> anyhow::Result<()>
+    where
+        N::ZKVerifier: 'static,
+    {
         job_id = job_id.get_output_id();
         let mut timer = DebugTimer::new("submit_proof_raw_internal");
         let (unique_pending_id, unique_proc_id) = self.get_current_unique_pending_id_internal().await?;
         timer.lap_micros("get_current_unique_pending_id_internal");
+        let proof_bytes = Arc::new(proof_bytes);
 
         //HACK: check to make sure the tag matches
         if self
@@ -368,12 +374,12 @@ impl<
         let reward_tree_value = metadata.get_new_rewards_tag_tree_value::<N::HasherBase>(tag, &children_reward_tree_values)?;
 
         //print_hash("reward_tree_value", &reward_tree_value);
-        let full_expected_public_inputs_hash = 
+        let full_expected_public_inputs_hash =
             N::HasherBase::two_to_one(&metadata.expected_public_inputs_hash, &reward_tree_value);
 
         //print_hash("full_expected_public_inputs_hash", &full_expected_public_inputs_hash);
         //print_hash("metadata.expected_public_inputs_hash", &metadata.expected_public_inputs_hash);
-        
+
         tracing::debug!(
             "Verifying proof for job id: {:?} with expected public inputs hash: {:?} (from metadata: {:?})",
             job_id,
@@ -388,11 +394,17 @@ impl<
         );
         print_hash("debug_public_inputs", &debug_public_inputs);
 
-        self.proof_verifier.verify_zk_proof_from_slice_check_public_inputs_hash(
-            job_id.circuit_type.to_u8() as u32,
-            &proof_bytes,
-            full_expected_public_inputs_hash,
-        )?;
+        let proof_verifier = self.proof_verifier.clone();
+        task::spawn_blocking({
+            let proof_bytes = proof_bytes.clone();
+            move || {
+                proof_verifier.verify_zk_proof_from_slice_check_public_inputs_hash(
+                    job_id.circuit_type.to_u8() as u32,
+                    &proof_bytes,
+                    full_expected_public_inputs_hash,
+                )
+            }
+        }).await??;
         timer.lap_micros("verify_zk_proof_from_slice_check_public_inputs_hash");
 
         // HACK: now set the correct reward tree value
@@ -513,7 +525,7 @@ impl<
 
         Ok(())
     }
-    /* 
+    /*
     pub async fn get_proving_work_internal(
         &self,
         signature: QEDCompressedSecp256K1Signature,
