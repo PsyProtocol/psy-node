@@ -278,6 +278,7 @@ impl<F: QFelt64, Hash: QDBHashBase + QFHashBase<F>, Fetcher: PsyDummyProverCombo
                 new_user_leaf,
             },
             contract_state_updates,
+            events: vec![],
         })
     }
 }

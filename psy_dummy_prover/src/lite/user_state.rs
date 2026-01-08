@@ -241,6 +241,7 @@ impl<Hasher: FieldQHasher<F, Hash>, Hash: Q256BitHash + QFHashBase<F> + std::fmt
         Ok(SubmitUserEndCapNonProofInput {
             core: core_input,
             contract_state_updates: state_history,
+            events: vec![],
         })
     }
 }

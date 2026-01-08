@@ -412,7 +412,7 @@ impl<
         item: Vec<u8>,
     ) -> anyhow::Result<()> {
         tracing::info!("RealmGUTAEndCapGatherer processing queue item of size {}", item.len());
-        if item.len() != PsyRealmUserUpdateQueueItem::<N::F, N::QHash>::FIXED_SIZE {
+        if PsyRealmUserUpdateQueueItem::<N::F, N::QHash>::IS_FIXED_SIZE && item.len() != PsyRealmUserUpdateQueueItem::<N::F, N::QHash>::FIXED_SIZE {
             // added sanity check
             return Err(anyhow::anyhow!(
                 "Invalid queue item size for RealmGUTAEndCapGatherer: expected {}, got {}",

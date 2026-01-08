@@ -295,10 +295,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
             )
             .await?;
             if result.is_none() {
-                tracing::info!(
-                    "Skipping end-cap job population due to missing contract updates for user ID {}.",
-                    queue_item.new_user_leaf.user_id.to_u64_value()
-                );
+                tracing::info!("Skipping end-cap job population due to missing contract updates for user ID {}.", user_id);
             } else {
                 self.future_pending_end_cap_jobs.push(result.unwrap());
             }
@@ -471,7 +468,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
         temp_store: Arc<TempStore>,
         future_end_cap_job: PlannedFutureEndCapJob<F, Hash>,
     ) -> anyhow::Result<usize> {
-        let queue_item = future_end_cap_job.queue_item;
+        let queue_item = future_end_cap_job.queue_item.clone();
         let user_last_checkpoint_id = queue_item.new_user_leaf.last_checkpoint_id.to_u64_value();
         let user_id = queue_item.new_user_leaf.user_id.to_u64_value();
         if user_id < self.realm_user_min_id || user_id > self.realm_user_max_id {

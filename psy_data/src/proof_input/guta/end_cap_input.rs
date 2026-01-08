@@ -21,13 +21,19 @@ use crate::{
 pub struct SubmitUserEndCapNonProofInput<F, Hash> {
     pub core: SubmitUserEndCapNonProofCoreInput<F, Hash>,
     pub contract_state_updates: Vec<QEDContractStateUpdateHistory<Hash>>,
+    #[serde(default)]
+    pub events: Vec<PsyUserEventRecord<F>>,
 }
 #[cfg(feature = "rand_gen")]
 impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for SubmitUserEndCapNonProofInput<F, Hash> {
-    fn qp_rand_gen() -> Self where Self: Sized {
+    fn qp_rand_gen() -> Self
+    where
+        Self: Sized,
+    {
         Self {
             core: SubmitUserEndCapNonProofCoreInput::qp_rand_gen(),
             contract_state_updates: QPGenRandom::qp_rand_gen_vec(rand::random::<u8>() as usize % 10 + 1),
+            events: Vec::new(),
         }
     }
 }
@@ -40,18 +46,26 @@ impl<F: QFelt64, Hash: Q256BitHash> PsyCanonicalSerializeMetadata for SubmitUser
 impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for SubmitUserEndCapNonProofInput<F, Hash> {
     fn fallback_pio_serialized_size(&self) -> usize {
         self.core.pio_serialized_size()
-        + 4 + self.contract_state_updates.iter().map(|u| u.pio_serialized_size()).sum::<usize>()
+            + 4
+            + self.contract_state_updates.iter().map(|u| u.pio_serialized_size()).sum::<usize>()
+            + 4
+            + self.events.iter().map(|e| e.pio_serialized_size()).sum::<usize>()
     }
-    
+
     fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
         self.core.pio_write_to_io(writer)?;
         writer.psy_write_vec_length(self.contract_state_updates.len())?;
         for update in &self.contract_state_updates {
             update.pio_write_to_io(writer)?;
         }
+        writer.psy_write_vec_length(self.events.len())?;
+        for event in &self.events {
+            event.pio_write_to_io(writer)?;
+        }
+
         Ok(())
     }
-    
+
     fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
         let core = SubmitUserEndCapNonProofCoreInput::pio_read_from_io(reader)?;
         let updates_len = reader.psy_read_vec_length()?;
@@ -59,9 +73,15 @@ impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for SubmitUser
         for _ in 0..updates_len {
             contract_state_updates.push(QEDContractStateUpdateHistory::pio_read_from_io(reader)?);
         }
+        let events_len = reader.psy_read_vec_length()?;
+        let mut events = Vec::with_capacity(events_len);
+        for _ in 0..events_len {
+            events.push(PsyUserEventRecord::pio_read_from_io(reader)?);
+        }
         Ok(Self {
             core,
             contract_state_updates,
+            events,
         })
     }
 }
@@ -116,7 +136,9 @@ impl<F: QFelt64, Hash: QFHashBase<F> + std::fmt::Debug> SubmitUserEndCapNonProof
         if !old_user_leaf.is_first_transaction_old_user_leaf() && old_leaf_hash != self.core.state_transition.start_user_leaf_hash {
             anyhow::bail!("invalid old_user_leaf");
         }
-        if old_user_leaf.last_checkpoint_id.to_u64_value() != 0 && old_user_leaf.last_checkpoint_id.to_u64_value() >= self.core.checkpoint_id.to_u64_value() {
+        if old_user_leaf.last_checkpoint_id.to_u64_value() != 0
+            && old_user_leaf.last_checkpoint_id.to_u64_value() >= self.core.checkpoint_id.to_u64_value()
+        {
             anyhow::bail!(
                 "old_user_leaf last_checkpoint_id {} is not less than end cap checkpoint_id {}",
                 old_user_leaf.last_checkpoint_id.to_u64_value(),
@@ -239,6 +261,70 @@ impl<F: QFelt64, Hash: QFHashBase<F> + std::fmt::Debug> SubmitUserEndCapNonProof
     */
 }
 
+#[pderive::serialize_clone_f_ts]
+#[ts(export, concrete(F = parth_core::PF))]
+pub struct PsyUserEventRecord<F> {
+    pub checkpoint_id: F,
+    pub user_id: F,
+    pub contract_id: F,
+    pub method_id: F,
+    pub event_index: F,
+    pub data: Vec<F>,
+}
+
+impl<F: QFelt64> PsyCanonicalSerializeMetadata for PsyUserEventRecord<F> {
+    const IS_FIXED_SIZE: bool = false;
+    const FIXED_SIZE: usize = 0;
+}
+
+impl<F: QFelt64> FallbackPsySerializeCanonical for PsyUserEventRecord<F> {
+    fn fallback_pio_serialized_size(&self) -> usize {
+        5 + 4 + self.data.len()
+    }
+
+    fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
+        writer.psy_write_u64(self.checkpoint_id.to_u64_value())?;
+        writer.psy_write_u64(self.user_id.to_u64_value())?;
+        writer.psy_write_u64(self.contract_id.to_u64_value())?;
+        writer.psy_write_u64(self.method_id.to_u64_value())?;
+        writer.psy_write_u64(self.event_index.to_u64_value())?;
+        writer.psy_write_vec_length(self.data.len())?;
+        for data in &self.data {
+            writer.psy_write_u64(data.to_u64_value())?;
+        }
+        Ok(())
+    }
+
+    fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
+        let checkpoint_id = F::from_u64_value(reader.psy_read_u64()?);
+        let user_id = F::from_u64_value(reader.psy_read_u64()?);
+        let contract_id = F::from_u64_value(reader.psy_read_u64()?);
+        let method_id = F::from_u64_value(reader.psy_read_u64()?);
+        let event_index = F::from_u64_value(reader.psy_read_u64()?);
+        let data_len = reader.psy_read_vec_length()?;
+        let mut data = Vec::with_capacity(data_len);
+        for _ in 0..data_len {
+            data.push(F::from_u64_value(reader.psy_read_u64()?));
+        }
+        Ok(Self {
+            checkpoint_id,
+            user_id,
+            contract_id,
+            method_id,
+            event_index,
+            data,
+        })
+    }
+}
+
+#[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
+psy_serialize::impl_psy_canonical_serialize_for_speedy!(
+    PsyUserEventRecord,
+    { F: QFelt64 } => { F }
+);
+#[cfg(not(all(feature = "serialize_speedy", target_endian = "little")))]
+impl<F: QFelt64> psy_serialize::AutoImplementFallbackPsySerializeCanonical for PsyUserEventRecord<F> {}
+
 #[cfg(test)]
 pub mod gen_fake_data {
     use parth_common::memory_stores::mem_tree_v3::SimpleMemoryMerkleStoreV3;
@@ -353,7 +439,8 @@ pub mod gen_fake_data {
         };
 
         let guta_stats = GUTAStats {
-            fees_collected: F::from_owned_u64(1000),
+            guta_fees_collected: F::from_owned_u64(1000 * 50 * contract_trees.len() as u64),
+            da_fees_collected: F::from_owned_u64(1000),
             user_ops_processed: F::from_owned_u64(1),
             total_transactions: F::from_owned_u64(contract_trees.len() as u64),
             slots_modified: F::from_owned_u64(50 * contract_trees.len() as u64),
@@ -369,6 +456,7 @@ pub mod gen_fake_data {
         let input = SubmitUserEndCapNonProofInput {
             core,
             contract_state_updates,
+            events: vec![],
         };
 
         let public_inputs_hash = input.core.get_proof_public_inputs_hash::<Hasher>(global_user_tree_height);
@@ -378,7 +466,7 @@ pub mod gen_fake_data {
                 public_inputs_hash,
                 &contract_helper,
                 global_user_tree_height,
-                contract_tree_height as usize
+                contract_tree_height as usize,
             )
             .unwrap();
         assert!(input
@@ -395,13 +483,11 @@ pub mod gen_fake_data {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use parth_core::{pgoldilocks::PoseidonHasher, PHash};
 
-    use crate::proof_input::guta::end_cap_input::gen_fake_data::{gen_fake_valid_submit_user_end_cap_non_proof_input};
-
+    use crate::proof_input::guta::end_cap_input::gen_fake_data::gen_fake_valid_submit_user_end_cap_non_proof_input;
 
     #[test]
     fn generate_simple_input() {
@@ -412,10 +498,8 @@ mod tests {
 
         let proof_public_inputs_hash = input.core.get_proof_public_inputs_hash::<Hasher>(32);
 
-        assert!(input.ensure_simple_self_consistent::<Hasher, _>(&old_user_leaf, proof_public_inputs_hash, &contract_helper, 32, 30).is_ok());
-
-
-
-
+        assert!(input
+            .ensure_simple_self_consistent::<Hasher, _>(&old_user_leaf, proof_public_inputs_hash, &contract_helper, 32, 30)
+            .is_ok());
     }
 }

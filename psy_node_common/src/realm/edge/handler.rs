@@ -463,6 +463,7 @@ impl<
             new_user_leaf_hash,
             new_user_leaf,
             stats: user_end_cap_input.core.stats,
+            events: user_end_cap_input.events,
         };
         //println!("Publishing to user update queue: {:?}", queue_item);
         self.user_update_queue

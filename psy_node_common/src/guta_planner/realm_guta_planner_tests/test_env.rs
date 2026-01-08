@@ -144,6 +144,7 @@ impl RGPUser {
         Ok(SubmitUserEndCapNonProofInput {
             core: core_input,
             contract_state_updates: state_history,
+            events: vec![],
         })
     }
 }
@@ -398,6 +399,7 @@ impl RGPTestChainState {
             new_user_leaf_hash,
             new_user_leaf,
             stats: end_cap_input.core.stats,
+            events: end_cap_input.events,
         };
         Ok(queue_item)
     }

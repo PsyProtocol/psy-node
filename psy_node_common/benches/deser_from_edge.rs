@@ -132,6 +132,7 @@ where
     let input = SubmitUserEndCapNonProofInput {
         core,
         contract_state_updates,
+        events: vec![],
     };
 
     let public_inputs_hash = input.core.get_proof_public_inputs_hash::<Hasher>(global_user_tree_height);
