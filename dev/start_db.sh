@@ -8,6 +8,7 @@ SCYLLA_NAME="scylla-server"
 # Create directories for persistent data storage
 mkdir -p ./db/scylla || true
 mkdir -p ./db/redis || true
+mkdir -p ./db/scylla-data || true
 
 # Get absolute path for volume mounts
 PARENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && cd .. && pwd)"
@@ -62,8 +63,10 @@ docker run --rm --name "$NATS_NAME" -p 4222:4222 nats -js 2>&1 \
 # 3. Start Scylla in Developer Mode with 2 CPU cores and persistent data
 echo "[SYSTEM] Starting ScyllaDB. This may take a minute..."
 docker run --rm --name "$SCYLLA_NAME" \
+    --cap-add=PERFMON \
     -p 9042:9042 \
     -v "$PARENT_DIR/db/scylla:/var/lib/scylla" \
+    -v "$PARENT_DIR/db/scylla-data:/run/udev/data" \
     scylladb/scylla:latest \
     --smp 2 --developer-mode 1 --overprovisioned 1 \
     --experimental-features=lwt 2>&1 \
