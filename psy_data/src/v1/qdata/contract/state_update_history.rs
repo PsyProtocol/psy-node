@@ -2,9 +2,11 @@
 use auto_impl::auto_impl;
 #[cfg(feature = "rand_gen")]
 use parth_core::utils::QPGenRandom;
-use parth_core::{crypto::hash::merkle_proof::DeltaMerkleProofCore, protocol::core_types::{Q256BitHash, QHashBase}};
+use parth_core::{crypto::hash::merkle_proof::DeltaMerkleProofCore, felt::QFelt64, protocol::core_types::{Q256BitHash, QFHashBase, QHashBase}};
 use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
 use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
+
+use crate::v1::qdata::contract::{PsyContractSlotUpdates, PsySlotUpdate};
 
 
 #[pderive::serialize_clone_hash_ts]
@@ -110,6 +112,35 @@ impl<Hash: QHashBase> QEDContractStateUpdateHistory<Hash> {
         }else{
             self.contract_state_tree_updates.len() * self.contract_state_tree_updates[0].siblings.len() + 2
         }
+    }
+
+    pub fn get_slot_updates<F>(&self) -> anyhow::Result<PsyContractSlotUpdates<F>>
+    where
+        F: QFelt64,
+        Hash: QFHashBase<F>,
+    {
+        let slot_updates = self
+            .contract_state_tree_updates
+            .iter()
+            .flat_map(|update| {
+                let old_elements = &update.old_value.to_4_felts().to_vec();
+                let new_elements = &update.new_value.to_4_felts().to_vec();
+                old_elements
+                    .iter()
+                    .zip(new_elements.iter())
+                    .enumerate()
+                    .filter(|(_, (old, new))| old != new)
+                    .map(|(offset, (old, new))| PsySlotUpdate {
+                        slot: update.index * 4 + offset as u64,
+                        old_value: *old,
+                        new_value: *new,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let contract_id = self.user_contract_tree_update_proof.index as u32;
+        let contract_update = PsyContractSlotUpdates { contract_id, slot_updates };
+        Ok(contract_update)
     }
     /*
     pub fn verify_generate_cst_delta<H: FieldQHasher<F, Hash>>(&self, injestor: &mut CSTUserUpdateStore<Hash>) -> anyhow::Result<()> {

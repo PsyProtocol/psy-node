@@ -11,7 +11,7 @@ use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata
 use crate::{
     proof_input::guta::SubmitUserEndCapNonProofCoreInput,
     v1::qdata::{
-        contract::{PSimpleContractHeightCache, QEDContractStateUpdateHistory},
+        contract::{PSimpleContractHeightCache, PsyContractSlotUpdates, QEDContractStateUpdateHistory},
         user::PQEDUserLeaf,
     },
 };
@@ -233,6 +233,15 @@ impl<F: QFelt64, Hash: QFHashBase<F> + std::fmt::Debug> SubmitUserEndCapNonProof
             count += csu.get_double_id_nodes_size_hint();
         }
         count
+    }
+
+    pub fn get_slot_updates(&self) -> anyhow::Result<Vec<PsyContractSlotUpdates<F>>> {
+        let contract_updates = self
+            .contract_state_updates
+            .iter()
+            .map(|x| x.get_slot_updates())
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(contract_updates)
     }
     /*
     pub fn verify_and_generate_cst_updates<H: FieldQHasher<F, Hash>>(&self, checkpoint_id: u64, old_user_state_tree_root: Hash) -> anyhow::Result<CSTUserUpdate<Hash>> {

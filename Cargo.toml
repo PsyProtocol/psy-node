@@ -153,6 +153,7 @@ bb8-redis = "0.22.0"
 bb8 = "0.9"
 rsmq = { git = "https://github.com/PsyRepoForks/rsmq-async-rs", package = "rsmq_async", features = ["break-js-comp", "sync", "tokio"] }
 dashmap = "6.1.0"
+lru = "0.12"
 parking_lot = "0.12.5"
 itertools = "0.14"
 
