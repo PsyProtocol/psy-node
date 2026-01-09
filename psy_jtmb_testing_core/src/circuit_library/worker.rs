@@ -39,12 +39,13 @@ pub async fn get_simple_proof_miner_worker_for_network_jtmb<C: JTMBCircuitConfig
     let mut signer = MemorySecp256K1Wallet::new();
     let public_key = signer.add_private_key(Hash256(config.private_key))?;
 
-    let job_fetcher = PsyWorkerBasicAPIJobFetcher::<C::Hash, QProvingJobDataID, MemorySecp256K1Wallet, C::Hasher>::new(
+    let job_fetcher = PsyWorkerBasicAPIJobFetcher::<C::Hash, QProvingJobDataID, MemorySecp256K1Wallet, C::Hasher>::new_with_backup_file_path(
         signer,
         public_key,
         config.miner_user_id,
         PsyAPIURLRotationStrategy::ContinueUntilFailure,
-    );
+        config.worker_completed_jobs_log_file_path,
+    ).await;
 
     job_fetcher.coordinator_api_url_manager.add_api_urls::<C::Hash, QProvingJobDataID>(&config.coordinator_api_urls).await?;
     job_fetcher.realm_api_url_manager.add_api_urls::<C::Hash, QProvingJobDataID>(&config.realm_api_urls).await?;

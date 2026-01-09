@@ -39,6 +39,9 @@ pub enum Commands {
         #[arg(long = "proving-backend", help = "The proving backend to use (plonky2-poseidon-goldilocks, jtmb-poseidon-goldilocks, jtmb-sha256-u64, etc.)")]
         proving_backend: Option<PsyChainProvingBackendTypeInput>,
 
+        #[arg(long = "completed-jobs-log-file", help = "Path to file for logging completed jobs (for reward claiming)")]
+        completed_jobs_log_file: Option<String>,
+
         #[arg(long = "coordinator-api-url", help = "Coordinator Edge API URLs for the worker to connect to (supports many)")]
         coordinator_api_urls: Vec<String>,
 

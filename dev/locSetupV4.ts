@@ -447,6 +447,7 @@ class DevNetProcessManager {
                     '--user', i.toString(),
                     '--network', this.NETWORK,
                     '--proving-backend', backend,
+                    '--completed-jobs-log-file', `./local_checkpoints/coordinator_worker_${i}.backup`,
                 ];
 
                 for (const coordUrl of coordUrls) {
@@ -567,6 +568,7 @@ class DevNetProcessManager {
                         '--user', '0',  // shared user id
                         '--network', this.NETWORK,
                         '--proving-backend', backend,
+                        '--completed-jobs-log-file', `./local_checkpoints/realm_worker_${workerId}.backup`,
                     ];
 
                     for (const realmUrl of realmUrls) {
@@ -608,6 +610,7 @@ class DevNetProcessManager {
                             '--user', '0',  // shared user id
                             '--network', this.NETWORK,
                             '--proving-backend', backend,
+                            '--completed-jobs-log-file', `./local_checkpoints/realm_worker_${workerId}.backup`,
                         ];
 
                         for (const realmUrl of realmUrls) {
