@@ -40,6 +40,7 @@ strum_macros = { workspace = true }
 ts-rs = { workspace = true }
 dashmap = { workspace = true, optional = true }
 lru = { workspace = true }
+fastbloom-rs = { workspace = true, features = ["serde"] }
 
 # start local packages
 parth_core = { workspace = true }

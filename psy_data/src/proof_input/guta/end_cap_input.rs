@@ -281,6 +281,23 @@ pub struct PsyUserEventRecord<F> {
     pub data: Vec<F>,
 }
 
+#[cfg(feature = "rand_gen")]
+impl<F: QPGenRandom> QPGenRandom for PsyUserEventRecord<F> {
+    fn qp_rand_gen() -> Self
+    where
+        Self: Sized,
+    {
+        Self {
+            checkpoint_id: F::qp_rand_gen(),
+            user_id: F::qp_rand_gen(),
+            contract_id: F::qp_rand_gen(),
+            method_id: F::qp_rand_gen(),
+            event_index: F::qp_rand_gen(),
+            data: QPGenRandom::qp_rand_gen_vec(rand::random::<u8>() as usize % 10 + 1),
+        }
+    }
+}
+
 impl<F: QFelt64> PsyCanonicalSerializeMetadata for PsyUserEventRecord<F> {
     const IS_FIXED_SIZE: bool = false;
     const FIXED_SIZE: usize = 0;

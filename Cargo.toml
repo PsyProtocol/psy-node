@@ -156,6 +156,7 @@ dashmap = "6.1.0"
 lru = "0.12"
 parking_lot = "0.12.5"
 itertools = "0.14"
+fastbloom-rs = { version = "0.5.10" }
 
 bitflags = "2.5.0"
 
