@@ -222,6 +222,9 @@ impl<
     pub async fn get_latest_checkpoint_id_internal(&self) -> anyhow::Result<u64> {
         self.db_reader.get_latest_checkpoint_id().await
     }
+    pub async fn get_checkpoint_id_for_unique_pending_id_internal(&self, unique_pending_id: u64) -> anyhow::Result<Option<u64>> {
+        self.db_reader.get_checkpoint_id_for_unique_pending_id(unique_pending_id).await
+    }
     pub async fn get_current_unique_pending_id_internal(&self) -> anyhow::Result<(u64, QCoreProcCheckpointUniqueId)> {
         self.temp_db.get_unique_pending_ids(&self.realm_identifier).await
     }

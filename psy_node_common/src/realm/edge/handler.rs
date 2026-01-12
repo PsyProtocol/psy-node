@@ -150,6 +150,9 @@ impl<
     pub async fn get_latest_checkpoint_id(&self) -> anyhow::Result<u64> {
         self.db_reader.get_latest_checkpoint_id().await
     }
+    pub async fn get_checkpoint_id_for_unique_pending_id_internal(&self, unique_pending_id: u64) -> anyhow::Result<Option<u64>> {
+        self.db_reader.get_checkpoint_id_for_unique_pending_id(unique_pending_id).await
+    }
     pub async fn ensure_user_has_not_submitted(&self, user_id: u64, unique_pending_id: u64) -> anyhow::Result<()> {
         //tracing::info!("here");
         let submitted_status = self
@@ -489,7 +492,9 @@ impl<
     async fn get_latest_checkpoint_id(&self) -> RpcResult<u64> {
         res(self.get_latest_checkpoint_id().await)
     }
-    
+    async fn get_checkpoint_id_for_unique_pending_id(&self, unique_pending_id: u64) -> RpcResult<Option<u64>> {
+        res(self.get_checkpoint_id_for_unique_pending_id_internal(unique_pending_id).await)
+    }
     async fn get_contract_tree_state_heights(&self, checkpoint_id: u64, contract_ids: Vec<u64>) -> RpcResult<Vec<u8>>{
         let result = self
             .db_reader

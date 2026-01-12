@@ -50,6 +50,9 @@ pub trait RealmEdgeRpc<F, Hash, JobId, ZKProof> {
     #[method(name = "get_latest_checkpoint_id")]
     async fn get_latest_checkpoint_id(&self) -> RpcResult<u64>;
 
+    #[method(name = "get_checkpoint_id_for_unique_pending_id")]
+    async fn get_checkpoint_id_for_unique_pending_id(&self, unique_pending_id: u64) -> RpcResult<Option<u64>>;
+
     #[method(name = "get_latest_l2_block_state")]
     async fn get_latest_l2_block_state(&self) -> RpcResult<QEDL2BlockState>;
 

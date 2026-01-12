@@ -43,6 +43,9 @@ pub trait CoordinatorEdgeRpc<F, Hash, JobId, ZKProof>: NodeEdgeWorkerRpcServer<H
     #[method(name = "get_latest_checkpoint_id")]
     async fn get_latest_checkpoint_id(&self) -> RpcResult<u64>;
 
+    #[method(name = "get_checkpoint_id_for_unique_pending_id")]
+    async fn get_checkpoint_id_for_unique_pending_id(&self, unique_pending_id: u64) -> RpcResult<Option<u64>>;
+
     /*
     // Checkpoint sync info
     #[method(name = "get_checkpoint_sync_info")]

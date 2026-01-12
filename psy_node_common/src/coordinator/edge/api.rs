@@ -93,6 +93,9 @@ impl<
     async fn get_latest_checkpoint_id(&self) -> QRpcResult<u64> {
         res(self.get_latest_checkpoint_id_internal().await)
     }
+    async fn get_checkpoint_id_for_unique_pending_id(&self, unique_pending_id: u64) -> QRpcResult<Option<u64>> {
+        res(self.get_checkpoint_id_for_unique_pending_id_internal(unique_pending_id).await)
+    }
     async fn get_contract_leaf_data(&self, contract_id: u64) -> QRpcResult<PQEDContractLeaf<N::F, N::QHash>> {
         res(self.db_reader.get_contract_leaf(MAX_CHECKPOINT_ID, contract_id).await)
     }
