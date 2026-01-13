@@ -5,23 +5,25 @@ VALKEY_NAME="valkey-server"
 NATS_NAME="nats-server"
 SCYLLA_NAME="scylla-server"
 
-# Create directories for persistent data storage
-mkdir -p ./db/scylla || true
-mkdir -p ./db/redis || true
-mkdir -p ./db/scylla-data || true
-
 # Get absolute path for volume mounts
 PARENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && cd .. && pwd)"
 
-# Set permissions to allow Docker access
-chmod -R 777 ./db ./local_checkpoints 2>/dev/null || true
+# Create directories for persistent data storage
+mkdir -p "$PARENT_DIR/db/scylla" || true
+mkdir -p "$PARENT_DIR/db/redis" || true
 
-VALKEY_LOGS="./logs/valkey_logs.txt"
-NATS_LOGS="./logs/nats_logs.txt"
-SCYLLA_LOGS="./logs/scylla_logs.txt"
+# Ensure logs directory exists
+mkdir -p "$PARENT_DIR/logs" || true
+
+# Set permissions to allow Docker access
+chmod -R 777 "$PARENT_DIR/db" "$PARENT_DIR/local_checkpoints" 2>/dev/null || true
+
+VALKEY_LOGS="$PARENT_DIR/logs/valkey_logs.txt"
+NATS_LOGS="$PARENT_DIR/logs/nats_logs.txt"
+SCYLLA_LOGS="$PARENT_DIR/logs/scylla_logs.txt"
 
 # Clean up any previous runs
-docker stop "$VALKEY_NAME" "$NATS_NAME" "$SCYLLA_NAME" 2>/dev/null
+docker stop -t 15 "$VALKEY_NAME" "$NATS_NAME" "$SCYLLA_NAME" 2>/dev/null
 
 # Function to handle Ctrl+C (SIGINT)
 cleanup() {
@@ -30,7 +32,7 @@ cleanup() {
     echo "Stopping containers (Graceful Shutdown)..."
     echo "-----------------------------------------------------"
     
-    docker stop "$VALKEY_NAME" "$NATS_NAME" "$SCYLLA_NAME" 2>/dev/null
+    docker stop -t 15 "$VALKEY_NAME" "$NATS_NAME" "$SCYLLA_NAME" 2>/dev/null
     
     echo "All services stopped."
     exit 0
@@ -47,11 +49,20 @@ echo "-----------------------------------------------------"
 
 # 1. Start Valkey with persistent data
 echo "Redis data will be stored in: $PARENT_DIR/db/redis/"
-echo "Note: Redis persists data to dump.rdb file when conditions are met"
+echo "Valkey persistence: AOF enabled + RDB snapshots to /data (host-mounted)"
 docker run --rm --name "$VALKEY_NAME" \
     -p 6379:6379 \
     -v "$PARENT_DIR/db/redis:/data" \
-    valkey/valkey 2>&1 \
+    valkey/valkey \
+    valkey-server \
+        --dir /data \
+        --dbfilename dump.rdb \
+        --appendonly yes \
+        --appendfilename appendonly.aof \
+        --appendfsync everysec \
+        --save 60 1 \
+        --save 300 10 \
+        --save 900 1 2>&1 \
     | tee "$VALKEY_LOGS" \
     | sed -u 's/^/[VALKEY] /' &
 
