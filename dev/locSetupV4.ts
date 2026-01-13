@@ -493,7 +493,7 @@ class DevNetProcessManager {
                             '--scylla-db-url', this.SCYLLA_URL,
                             '--nats-jetstream-url', this.NATS_URL,
                             '--redis-url', this.REDIS_URL,
-                    '--genesis-data-path', this.genesisDataPath,
+                            '--genesis-data-path', this.genesisDataPath,
                             '--checkpoint-backup-path', './local_checkpoints',
                             '--coordinator-api-urls', this.COORD_API_URL,
                             '--proving-backend', backend,
@@ -538,47 +538,93 @@ class DevNetProcessManager {
         }
 
         if (startRealmWorkers) {
-            const realmsPerWorker = Math.ceil(realmsCount / workerRealmCount);
-            console.log(`[DevNet] Starting ${workerRealmCount} workers, ${realmsPerWorker} realms per each worker (${realmsCount} total realms)...`);
-
             const workerPromises: Promise<RunningProcess>[] = [];
 
-            for (let workerId = 0; workerId < workerRealmCount; workerId++) {
-                const startRealmForWorker = workerId * realmsPerWorker;
-                const endRealmForWorker = Math.min((workerId + 1) * realmsPerWorker, realmsCount);
+            if (workerRealmCount <= realmsCount) {
+                // Workers <= realms: distribute realms across workers using ranges
+                const realmsPerWorker = Math.ceil(realmsCount / workerRealmCount);
+                console.log(`[DevNet] Starting ${workerRealmCount} workers, ${realmsPerWorker} realms per each worker (${realmsCount} total realms)...`);
 
-                const realmUrls: string[] = [];
-                for (let realmIndex = startRealmForWorker; realmIndex < endRealmForWorker; realmIndex++) {
+                for (let workerId = 0; workerId < workerRealmCount; workerId++) {
+                    const startRealmForWorker = workerId * realmsPerWorker;
+                    const endRealmForWorker = Math.min((workerId + 1) * realmsPerWorker, realmsCount);
+
+                    const realmUrls: string[] = [];
+                    for (let realmIndex = startRealmForWorker; realmIndex < endRealmForWorker; realmIndex++) {
+                        const realmId = startRealmId + realmIndex;
+                        const realmEdgeStartPort = 13380 + realmId * 10;
+
+                        // Connect to all edges of this realm for better load distribution
+                        for (let edgeIndex = 0; edgeIndex < realmEdgeCount; edgeIndex++) {
+                            const edgePort = realmEdgeStartPort + edgeIndex;
+                            const realmUrl = `http://${this.host}:${edgePort}`;
+                            realmUrls.push(realmUrl);
+                        }
+                    }
+
+                    const workerArgs = [
+                        workerCli, 'worker',
+                        '--user', '0',  // shared user id
+                        '--network', this.NETWORK,
+                        '--proving-backend', backend,
+                    ];
+
+                    for (const realmUrl of realmUrls) {
+                        workerArgs.push('--realm-api-url', realmUrl);
+                    }
+
+                    workerArgs.push('--private-key', FAKE_MINER_PRIVATE_KEY);
+
+                    const workerPromise = RunningProcess.spawnWithInitializationHintWithRetry(
+                        workerArgs,
+                        workerStartedDetector,
+                        { cwd, ...getLogPaths(`worker_${workerId}`, true), maxRetries: 3, retryDelayMs: 2000, env: this.getEnv() }
+                    ).then(proc => this.track(proc));
+                    workerPromises.push(workerPromise);
+                }
+            } else {
+                // Workers > realms: distribute workers across realms, outer loop realm, inner loop worker
+                const workersPerRealm = Math.floor(workerRealmCount / realmsCount);
+                const extraWorkers = workerRealmCount % realmsCount;
+                console.log(`[DevNet] Starting ${workerRealmCount} workers distributed across ${realmsCount} realms (${workersPerRealm}-${workersPerRealm + 1} workers per realm)...`);
+
+                let workerId = 0;
+                for (let realmIndex = 0; realmIndex < realmsCount; realmIndex++) {
                     const realmId = startRealmId + realmIndex;
                     const realmEdgeStartPort = 13380 + realmId * 10;
 
-                    // Connect to all edges of this realm for better load distribution
+                    const realmUrls: string[] = [];
+                    // Connect to all edges of this realm
                     for (let edgeIndex = 0; edgeIndex < realmEdgeCount; edgeIndex++) {
                         const edgePort = realmEdgeStartPort + edgeIndex;
                         const realmUrl = `http://${this.host}:${edgePort}`;
                         realmUrls.push(realmUrl);
                     }
+
+                    const numWorkersForRealm = workersPerRealm + (realmIndex < extraWorkers ? 1 : 0);
+                    for (let i = 0; i < numWorkersForRealm; i++) {
+                        const workerArgs = [
+                            workerCli, 'worker',
+                            '--user', '0',  // shared user id
+                            '--network', this.NETWORK,
+                            '--proving-backend', backend,
+                        ];
+
+                        for (const realmUrl of realmUrls) {
+                            workerArgs.push('--realm-api-url', realmUrl);
+                        }
+
+                        workerArgs.push('--private-key', FAKE_MINER_PRIVATE_KEY);
+
+                        const workerPromise = RunningProcess.spawnWithInitializationHintWithRetry(
+                            workerArgs,
+                            workerStartedDetector,
+                            { cwd, ...getLogPaths(`worker_${workerId}`, true), maxRetries: 3, retryDelayMs: 2000, env: this.getEnv() }
+                        ).then(proc => this.track(proc));
+                        workerPromises.push(workerPromise);
+                        workerId++;
+                    }
                 }
-
-                const workerArgs = [
-                    workerCli, 'worker',
-                    '--user', `${workerId}`,
-                    '--network', this.NETWORK,
-                    '--proving-backend', backend,
-                ];
-
-                for (const realmUrl of realmUrls) {
-                    workerArgs.push('--realm-api-url', realmUrl);
-                }
-
-                workerArgs.push('--private-key', FAKE_MINER_PRIVATE_KEY);
-
-                const workerPromise = RunningProcess.spawnWithInitializationHintWithRetry(
-                    workerArgs,
-                    workerStartedDetector,
-                    { cwd, ...getLogPaths(`worker_${workerId}`, true), maxRetries: 3, retryDelayMs: 2000, env: this.getEnv() }
-                ).then(proc => this.track(proc));
-                workerPromises.push(workerPromise);
             }
 
             // Wait for all worker processes to start
