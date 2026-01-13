@@ -444,7 +444,7 @@ class DevNetProcessManager {
 
                 const workerArgs = [
                     workerCli, 'worker',
-                    '--user', i.toString(),
+                    '--user', '0',
                     '--network', this.NETWORK,
                     '--proving-backend', backend,
                     '--completed-jobs-log-file', `./local_checkpoints/coordinator_worker_${i}.backup`,
