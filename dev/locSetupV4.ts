@@ -411,7 +411,7 @@ class DevNetProcessManager {
                     [
                         nodeCli, 'start-coordinator-edge',
                         '--coordinator-id', '0',
-                        '--coordinator-sub-id', j.toString(),
+                        '--coordinator-sub-id', '0',
                         '--network', this.NETWORK,
                         '--db-namespace', 'coordinator',
                         '--scylla-db-url', this.SCYLLA_URL,
