@@ -9,7 +9,7 @@ use parth_common::memory_stores::{
 };
 use parth_core::{
     crypto::hash::traits::{MerkleZeroHasher, QFieldHashable},
-    data::hash::merkle_node_key::{SimpleMerkleNode, PSY_OBJECT_FFS_SIZE_SIMPLE_MERKLE_NODE},
+    data::hash::merkle_node_key::{SimpleMerkleNode, PSY_OBJECT_FFS_SIZE_SIMPLE_MERKLE_NODE, PSY_OBJECT_FFS_SIZE_SIMPLE_MERKLE_NODE_KEY},
     felt::{FromPrimitiveValuesFelt, QFelt64, ToU64Value, ZeroableFelt},
     node::realm_identifier::QRealmIdentifier,
     protocol::core_types::{Q256BitHash, QDBHashBase, QFHashBase, QNetworkTypesConfig},
@@ -143,7 +143,6 @@ pub async fn read_coordinator_guta_update_gatherer_backup_file<
         random_seed_guta,
         total_guta_inputs: changes.len() as u64,
         new_realm_guta_reward_tree_node_keys_ffs: vec![],
-        
     };
     Ok(output_db)
 }
@@ -393,7 +392,10 @@ impl<
         };
 
         let new_status = self.config.status.read().map_err(|e| anyhow::anyhow!("error reading status {:?}", e))?.clone();
-        let jobs_for_queue: anyhow::Result<Vec<Vec<PsyProvingJobMetadataWithJobId<N::QHash, QProvingJobDataID>>>> = self
+        use std::collections::HashMap;
+        use parth_core::data::hash::merkle_node_key::SimpleMerkleNodeKey;
+
+        let jobs_for_queue_result: anyhow::Result<(Vec<Vec<PsyProvingJobMetadataWithJobId<N::QHash, QProvingJobDataID>>>, HashMap<u64, SimpleMerkleNodeKey>)> = self
             .guta_planner
             .finalize_with_reward_ids(
                 &realm_identifier,
@@ -409,15 +411,15 @@ impl<
                 self.config.coordinator_guta_updates_circuit_whitelist,
             )
             .await;
-        if jobs_for_queue.is_err() {
+        if jobs_for_queue_result.is_err() {
             tracing::error!(
                 "Error finalizing GUTA updates gatherer for pending id {}: {:?}",
                 self.status.unique_pending_id,
-                jobs_for_queue.as_ref().err()
+                jobs_for_queue_result.as_ref().err()
             );
-            anyhow::bail!("Error finalizing GUTA updates gatherer: {:?}", jobs_for_queue.err());
+            anyhow::bail!("Error finalizing GUTA updates gatherer: {:?}", jobs_for_queue_result.err());
         }
-        let jobs_for_queue = jobs_for_queue?;
+        let (jobs_for_queue, input_realm_reward_keys) = jobs_for_queue_result?;
         tracing::info!(
             "Finalized GUTA updates gatherer for pending id {}, total jobs created: {}",
             self.status.unique_pending_id,
@@ -445,6 +447,12 @@ impl<
         );
         tree.commit_changes();
 
+        let mut new_realm_guta_reward_tree_node_keys_ffs = Vec::with_capacity(input_realm_reward_keys.len() * (8 + PSY_OBJECT_FFS_SIZE_SIMPLE_MERKLE_NODE_KEY));
+        for (realm_id, key) in input_realm_reward_keys.iter() {
+            new_realm_guta_reward_tree_node_keys_ffs.extend_from_slice(&realm_id.to_le_bytes());
+            key.pio_write_to_io(&mut new_realm_guta_reward_tree_node_keys_ffs)?;
+        }
+
         let output_database = CoordinatorGUTAUpdateGathererOutputDatabase {
             update_global_user_tree_nodes_ffs,
             guta_stats: self.guta_stats,
@@ -452,7 +460,7 @@ impl<
             start_global_user_tree_root: self.start_global_user_tree_root,
             end_global_user_tree_root,
             random_seed_guta: get_temp_guta_rand_seed::<N::QHash>(),
-            new_realm_guta_reward_tree_node_keys_ffs: vec![],
+            new_realm_guta_reward_tree_node_keys_ffs,
             total_guta_inputs: self.total_guta_inputs,
         };
 

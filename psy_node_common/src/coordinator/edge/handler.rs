@@ -188,7 +188,7 @@ impl<
         let merkle_proof_to_realm_root = self.db_reader.global_user_tree_get_merkle_proof_sub_tree(checkpoint_id, 0, N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT, realm_id).await?;
 
 
-        let reward_tree_top_proof_key: Option<SimpleMerkleNodeKey> = self.db_reader.get_realm_guta_reward_tree_node_key(realm_id, checkpoint_id).await?;
+        let reward_tree_top_proof_key: Option<SimpleMerkleNodeKey> = self.db_reader.get_realm_guta_reward_tree_node_key(unique_pending_id, realm_id).await?;
 
         let reward_tree_top_proof = if let Some(proof_key) = reward_tree_top_proof_key {
             let mut res = self.tag_tree_rewards_store.rewards_tag_tree_get_tag_tree_merkle_proof_at_unique_pending_id(unique_pending_id, &vec![proof_key]).await?;

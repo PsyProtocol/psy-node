@@ -636,6 +636,13 @@ impl<
             .await?;
         }
         tracing::info!("Committed global user tree state updates for checkpoint ID: {}", checkpoint_id);
+        // start realm guta reward tree node keys updates
+        if !coordinator_update.new_realm_guta_reward_tree_node_keys_ffs.is_empty() {
+            self.db
+                .set_realm_guta_reward_tree_node_keys_ffs(unique_pending_id, &coordinator_update.new_realm_guta_reward_tree_node_keys_ffs)
+                .await?;
+        }
+        tracing::info!("Committed realm guta reward tree node keys for checkpoint ID: {}", checkpoint_id);
         // set l2 block state
         self.db
             .set_checkpoint_global_state_roots(checkpoint_id, &coordinator_update.new_base.checkpoint_leaf.global_state_roots)

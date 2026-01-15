@@ -518,6 +518,7 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
                 new_user_public_keys_ffs: builder.public_keys_ffs,
                 new_public_key_hash_to_user_id_rows_ffs: builder.public_key_hash_to_user_id_rows_ffs,
                 update_global_user_tree_nodes_ffs: builder.global_user_tree_nodes_ffs,
+                new_realm_guta_reward_tree_node_keys_ffs: vec![],
                 checkpoint_tree_update_proof: checkpoint_tree_update_proof,
             },
         ))

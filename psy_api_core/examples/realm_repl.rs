@@ -16,7 +16,7 @@ use strum_macros::{AsRefStr, EnumIter};
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    #[arg(help = "The URL of the RealmEdgeRpc server (e.g., http://127.0.0.1:1338)", default_value = "http://127.0.0.1:1338")]
+    #[arg(help = "The URL of the RealmEdgeRpc server (e.g., http://127.0.0.1:13380)", default_value = "http://127.0.0.1:13380")]
     api_url: String,
 }
 

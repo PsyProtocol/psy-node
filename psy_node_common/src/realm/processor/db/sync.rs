@@ -239,10 +239,9 @@ where
                     self.coordinator_client.rc_get_realm_sync_info(realm_state.checkpoint_id, self.state.realm_id_u64).await?;
 
                 // Persist auxiliary proofs to DB
-                self.db.set_realm_rewards_tag_tree_top_proof_at_checkpoint_id(realm_state.checkpoint_id, &sync_info.reward_tree_top_proof).await?;
                 tracing::info!("set global user tree top tree merkle proof at checkpoint id {} {}", realm_state.checkpoint_id, serde_json::to_string_pretty(&sync_info.merkle_proof_to_realm_root)?);
                 self.db.global_user_tree_set_top_tree_merkle_proof(realm_state.checkpoint_id, &sync_info.merkle_proof_to_realm_root).await?;
-                
+
                 // Update mappings for the unique pending ID
                 self.db.set_realm_rewards_tag_tree_top_proof_at_unique_pending_id(
                     self.state.processing_unique_pending_id,

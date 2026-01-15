@@ -1,6 +1,6 @@
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
 use parth_core::{
-    QProvingJobDataIDWithRewardPath, crypto::hash::merkle_proof::MerkleProofCore, data::hash::merkle_store_key::{QMerkleStoreDoubleIdKeyWithHeight, QMerkleStoreSingleIdKey}
+    QProvingJobDataIDWithRewardPath, crypto::hash::{tag_tree::TagTreeMerkleProof, merkle_proof::MerkleProofCore}, data::hash::merkle_store_key::{QMerkleStoreDoubleIdKeyWithHeight, QMerkleStoreSingleIdKey}
 };
 use psy_data::{
     proof_input::guta::end_cap_input::SubmitUserEndCapNonProofInput,
@@ -217,5 +217,8 @@ pub trait RealmEdgeRpc<F, Hash, JobId, ZKProof> {
 
     #[method(name = "generate_batch_proof_miner_reward_proofs")]
     async fn generate_batch_proof_miner_reward_proofs(&self, unique_pending_id: u64, job_ids: Vec<QProvingJobDataIDWithRewardPath<JobId>>) -> RpcResult<Vec<PsyProoffMinerRewardProof<Hash, JobId>>>;
+
+    #[method(name = "get_top_global_user_rewards_tree_proof_to_realm_at_checkpoint_id")]
+    async fn get_top_global_user_rewards_tree_proof_to_realm_at_checkpoint_id(&self, checkpoint_id: u64) -> RpcResult<TagTreeMerkleProof<Hash>>;
 
 }

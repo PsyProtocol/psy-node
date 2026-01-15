@@ -351,7 +351,7 @@ case "$SUBCOMMAND" in
       END_CAP_COUNT=1 run_single_prover "$RANDOM_USER_ID" "$PROVING_BACKEND"
 
       echo "Proof completed. Selecting new random user..."
-      sleep 1  # Brief pause before next random selection
+      sleep 0.35  # Brief pause before next random selection
     done
     ;;
 

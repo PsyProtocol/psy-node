@@ -204,9 +204,6 @@ where
         tracing::info!("Set unique pending ID to checkpoint ID mapping for checkpoint ID: {}", checkpoint_id);
 
         self.db
-            .set_realm_rewards_tag_tree_top_proof_at_checkpoint_id(checkpoint_id, &coordinator_update.reward_tree_top_proof)
-            .await?;
-        self.db
             .global_user_tree_set_top_tree_merkle_proof(checkpoint_id, &coordinator_update.merkle_proof_to_realm_root)
             .await?;
         self.commit_checkpoint_state_no_guta_update(&coordinator_update.checkpoint_sync_info)

@@ -465,6 +465,7 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
             new_contract_code_definitions: self.deploy_contract_gatherer_result.new_contract_code_definitions,
 
             update_global_user_tree_nodes_ffs: self.guta_gatherer_result.update_global_user_tree_nodes_ffs,
+            new_realm_guta_reward_tree_node_keys_ffs: self.guta_gatherer_result.new_realm_guta_reward_tree_node_keys_ffs,
 
             update_user_registration_tree_nodes_ffs: self.register_users_gatherer_result.update_user_registration_tree_nodes_ffs,
             new_user_public_keys_ffs: self.register_users_gatherer_result.new_user_public_keys_ffs,

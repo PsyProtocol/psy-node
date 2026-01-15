@@ -9,6 +9,7 @@ use parth_core::{
     QProvingJobDataIDWithRewardPath, crypto::{
         hash::{
             merkle_proof::MerkleProofCore,
+            tag_tree::TagTreeMerkleProof,
             traits::{MerkleZeroHasher, QFieldHashable, ZeroableHash},
         },
         secp256k1::{QEDCompressedSecp256K1Signature, SimpleTimedRequest},
@@ -153,6 +154,10 @@ impl<
     pub async fn get_checkpoint_id_for_unique_pending_id_internal(&self, unique_pending_id: u64) -> anyhow::Result<Option<u64>> {
         self.db_reader.get_checkpoint_id_for_unique_pending_id(unique_pending_id).await
     }
+
+    pub async fn get_top_global_user_rewards_tree_proof_to_realm_at_checkpoint_id_internal(&self, checkpoint_id: u64) -> anyhow::Result<TagTreeMerkleProof<N::QHash>> {
+        self.db_reader.get_top_global_user_rewards_tree_proof_to_realm_at_checkpoint_id(checkpoint_id).await
+    }
     pub async fn ensure_user_has_not_submitted(&self, user_id: u64, unique_pending_id: u64) -> anyhow::Result<()> {
         //tracing::info!("here");
         let submitted_status = self
@@ -176,30 +181,31 @@ impl<
         unique_pending_id: u64,
         job_ids: Vec<QProvingJobDataIDWithRewardPath<N::JobId>>,
     ) -> anyhow::Result<Vec<PsyProoffMinerRewardProof<N::QHash, N::JobId>>> {
-        //let top_proof =
-        // self.db_reader.
-        // get_top_global_user_rewards_tree_proof_to_realm_at_unique_pending_id(unique_pending_id).
-        // await?;
-
-        //let (unique_pending_id, proc_checkpoint_id) =
-        // self.temp_db.get_unique_pending_ids(&self.realm_identifier).await?;
         let merkle_node_keys = job_ids
             .iter()
             .map(|job_id_with_path| SimpleMerkleNodeKey::from_reward_path_info(job_id_with_path.reward_path_info))
             .collect::<Vec<_>>();
 
-        self.tag_tree_rewards_store
-            .rewards_tag_tree_get_tag_tree_merkle_proof_at_unique_pending_id(unique_pending_id, &merkle_node_keys)
-            .await?
-            .into_iter()
-            .zip(job_ids.iter())
-            .map(|(proof, job_id_with_path)| {
-                Ok(PsyProoffMinerRewardProof {
-                    job_id: job_id_with_path.job_data_id.clone(),
-                    tag_tree_proof: proof,
-                })
-            })
-            .collect()
+        let mut tag_proofs = self.tag_tree_rewards_store
+            .rewards_tag_tree_get_tag_tree_merkle_proof_at_unique_pending_id(unique_pending_id, &merkle_node_keys).await?;
+
+        // Merge with top proof
+        let top_proof = self.get_top_global_user_rewards_tree_proof_to_realm_at_checkpoint_id_internal(unique_pending_id).await?;
+        let checkpoint_id = self.get_checkpoint_id_for_unique_pending_id_internal(unique_pending_id).await?;
+        for proof in &mut tag_proofs {
+            proof.siblings.extend(top_proof.siblings.clone());
+            proof.root = top_proof.root;
+        }
+
+        // Wrap into PsyProoffMinerRewardProof
+        let miner_proofs = job_ids.into_iter().zip(tag_proofs.into_iter()).map(|(job_id_with_path, tag_proof)| {
+            PsyProoffMinerRewardProof {
+                job_id: job_id_with_path.job_data_id,
+                tag_tree_proof: tag_proof,
+            }
+        }).collect::<Vec<_>>();
+
+        Ok(miner_proofs)
     }
 }
 
@@ -494,6 +500,9 @@ impl<
     }
     async fn get_checkpoint_id_for_unique_pending_id(&self, unique_pending_id: u64) -> RpcResult<Option<u64>> {
         res(self.get_checkpoint_id_for_unique_pending_id_internal(unique_pending_id).await)
+    }
+    async fn get_top_global_user_rewards_tree_proof_to_realm_at_checkpoint_id(&self, checkpoint_id: u64) -> RpcResult<TagTreeMerkleProof<N::QHash>> {
+        res(self.get_top_global_user_rewards_tree_proof_to_realm_at_checkpoint_id_internal(checkpoint_id).await)
     }
     async fn get_contract_tree_state_heights(&self, checkpoint_id: u64, contract_ids: Vec<u64>) -> RpcResult<Vec<u8>>{
         let result = self

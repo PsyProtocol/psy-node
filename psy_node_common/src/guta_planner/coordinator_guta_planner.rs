@@ -1,13 +1,15 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 use parth_common::memory_stores::{
     dash_tree_append_only::PsyDashMemoryAppendOnlyMerkleStore,
     mem_tree_recorder::SimpleMemoryMerkleRecorderStore,
 };
 use parth_core::{
     crypto::hash::traits::{FieldQHasher, QFieldHashable},
+    data::hash::merkle_node_key::SimpleMerkleNodeKey,
     felt::QFelt64,
     node::realm_identifier::QRealmIdentifier,
     protocol::core_types::{Q256BitHash, QFHashBase},
+    QJobIdBase,
 };
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{
@@ -70,6 +72,10 @@ pub struct CoordinatorGUTAPlanner<F, Hash> {
     queued_updates: Vec<PlannerNode<F, Hash>>,
     has_committed_updates: bool,
     current_synced_checkpoint_root: Hash,
+    /// Maps input leaf job_id to realm_id (from header.state_transition.node_index)
+    input_job_to_realm: HashMap<QProvingJobDataID, u64>,
+    /// Collected realm reward keys after finalize (realm_id -> reward tree position)
+    pub input_realm_reward_keys: HashMap<u64, SimpleMerkleNodeKey>,
 }
 
 impl<F, Hash> CoordinatorGUTAPlanner<F, Hash> {
@@ -81,6 +87,8 @@ impl<F, Hash> CoordinatorGUTAPlanner<F, Hash> {
             queued_updates: Vec::new(),
             has_committed_updates: false,
             current_synced_checkpoint_root,
+            input_job_to_realm: HashMap::new(),
+            input_realm_reward_keys: HashMap::new(),
         }
     }
 }
@@ -142,6 +150,10 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> CoordinatorGUTAPlanner<F, Ha
         job: GlobalUserTreeAggregatorHeaderWithTagValueAndJobID<F, Hash>,
     ) -> anyhow::Result<()> {
         tracing::info!("adding realm job: {:?}", job.job_id);
+        // Record job_id -> realm_id mapping for later use in update_reward_tree_config
+        let realm_id = job.header.header.state_transition.node_index.to_u64_value();
+        self.input_job_to_realm.insert(job.job_id, realm_id);
+
         let current_node = PlannerNode {
             job_id: job.job_id,
             header: job.header.header,
@@ -418,6 +430,9 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> CoordinatorGUTAPlanner<F, Ha
         }
 
         if !found_in_levels {
+            if let Some(realm_id) = self.input_job_to_realm.get(job_id) {
+                self.input_realm_reward_keys.insert(*realm_id, SimpleMerkleNodeKey { level, index });
+            }
             return Ok(());
         }
 
@@ -442,7 +457,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> CoordinatorGUTAPlanner<F, Ha
         most_recent_checkpoint_global_state_roots: PQEDCheckpointGlobalStateRoots<Hash>,
         most_recent_checkpoint_stats_hash: Hash,
         guta_circuit_whitelist: Hash,
-    ) -> anyhow::Result<Vec<Vec<PsyProvingJobMetadataWithJobId<Hash, QProvingJobDataID>>>> {
+    ) -> anyhow::Result<(Vec<Vec<PsyProvingJobMetadataWithJobId<Hash, QProvingJobDataID>>>, HashMap<u64, SimpleMerkleNodeKey>)> {
         if !self.has_committed_updates {
             // No updates were committed yet, so we need to process queued updates now.
             let queued_updates = {
@@ -564,7 +579,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> CoordinatorGUTAPlanner<F, Ha
             .await?;
         }
 
-        Ok(self.job_levels)
+        Ok((self.job_levels, self.input_realm_reward_keys))
     }
 }
 
@@ -1277,7 +1292,7 @@ mod tests {
         let guta_circuit_whitelist = Hash::from_values(1, 2, 3, 4);
 
         
-        let result = planner
+        let (result, _) = planner
             .finalize_with_reward_ids(
                 &realm_identifier,
                 unique_pending_id,
