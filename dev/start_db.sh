@@ -73,6 +73,16 @@ docker run --rm --name "$NATS_NAME" -p 4222:4222 nats -js 2>&1 \
 
 # 3. Start Scylla in Developer Mode with 2 CPU cores and persistent data
 echo "[SYSTEM] Starting ScyllaDB. This may take a minute..."
+# Commitlog Sync Options:
+# - periodic (default): Flush every commitlog-sync-period-in-ms (10000ms default)
+# - batch: Flush after commitlog-sync-batch-window-in-ms (2ms default)
+# For high durability, use batch mode with short window
+COMMITLOG_SYNC="${SCYLLA_COMMITLOG_SYNC:-batch}"
+COMMITLOG_BATCH_WINDOW="${SCYLLA_COMMITLOG_BATCH_WINDOW:-2}"
+COMMITLOG_PERIOD="${SCYLLA_COMMITLOG_PERIOD:-10}"
+
+echo "[SYSTEM] ScyllaDB Commitlog Config: sync=$COMMITLOG_SYNC, batch_window=${COMMITLOG_BATCH_WINDOW}ms, period=${COMMITLOG_PERIOD}ms"
+
 docker run --rm --name "$SCYLLA_NAME" \
     --cap-add=PERFMON \
     -p 9042:9042 \
@@ -80,7 +90,10 @@ docker run --rm --name "$SCYLLA_NAME" \
     -v "$PARENT_DIR/db/scylla-data:/run/udev/data" \
     scylladb/scylla:latest \
     --smp 2 --developer-mode 1 --overprovisioned 1 \
-    --experimental-features=lwt 2>&1 \
+    --experimental-features=lwt \
+    --commitlog-sync="$COMMITLOG_SYNC" \
+    --commitlog-sync-batch-window-in-ms="$COMMITLOG_BATCH_WINDOW" \
+    --commitlog-sync-period-in-ms="$COMMITLOG_PERIOD" 2>&1 \
     | tee "$SCYLLA_LOGS" \
     | sed -u 's/^/[SCYLLA] /' &
 
