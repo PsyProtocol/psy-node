@@ -7,12 +7,14 @@ type ProcessLineVisitor = (line: string, process: RunningProcess) => void;
 const FAKE_MINER_PRIVATE_KEY = "691337BADFACE067320cb499a730fa6c81a756ed912f181f0f20a6b1fa5c1337";
 async function killDocker() {
     try {
-        const proc = Bun.spawn(['docker', 'kill', 'valkey-server', 'scylla-server', 'nats-server'], {
+        const proc = Bun.spawn(['docker', 'stop', 'valkey-server', 'scylla-server', 'nats-server'], {
             stderr: "ignore",
             stdout: "ignore"
         });
         await proc.exited;
-    } catch (e) { }
+    } catch (e) {
+        console.log("[DevNet] Failed to kill docker", e);
+    }
 }
 
 class RunningProcess {
@@ -365,15 +367,16 @@ class DevNetProcessManager {
         // 2. Start Database
         if (this.needsStartDb) {
             console.log("[DevNet] Killing existing docker containers...");
-            await killDocker();
 
             // Clean checkpoints when resetting database
-            console.log("[DevNet] Cleaning local checkpoints...");
-            await cleanCheckpoint('./local_checkpoints', cwd);
-
-            await this.track(await RunningProcess.spawnWithInitializationHint(
-                ['./dev/start_db.sh'], scyllaStartedDetector, { cwd, ...getLogPaths("scylla", false) }
-            ));
+            // console.log("[DevNet] Cleaning local checkpoints...");
+            // await cleanCheckpoint('./local_checkpoints', cwd);
+            if (this.needsStartDb) {
+                killDocker();
+                await this.track(await RunningProcess.spawnWithInitializationHint(
+                    ['./dev/start_db.sh'], scyllaStartedDetector, { cwd, ...getLogPaths("scylla", false) }
+                ));
+            }
             console.log("[DevNet] Waiting additional 1 second for ScyllaDB to be fully ready...");
             await new Promise(resolve => setTimeout(resolve, 1000));
         }
@@ -668,7 +671,7 @@ class DevNetProcessManager {
             if (process?.isRunning()) process.kill();
         }
         if (this.needsStartDb) {
-            killDocker().catch(() => { });
+            killDocker();
         }
     }
 
