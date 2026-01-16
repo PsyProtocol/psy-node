@@ -266,8 +266,8 @@ pub fn plan_jobs_for_tree_agg_offset_root<
         let dummy_witness = PlannerHelper::create_dummy_witness(allowed_circuit_hashes_root, start_tree_root);
         let metadata = PsyProvingJobMetadata {
             expected_public_inputs_hash: dummy_witness.get_expected_public_inputs_hash::<Hasher>(),
-            reward_tree_node_index: 0,
-            reward_tree_node_level: 0,
+            reward_tree_node_index: reward_tree_root_index,
+            reward_tree_node_level: reward_tree_root_level,
             reward_tree_hash_mode: PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN,
             reward_tree_node_children: 0,
             dependencies: vec![]

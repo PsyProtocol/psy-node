@@ -195,6 +195,7 @@ impl<
         for proof in &mut tag_proofs {
             proof.siblings.extend(top_proof.siblings.clone());
             proof.root = top_proof.root;
+            proof.index = proof.index | (top_proof.index << proof.siblings.len());
         }
 
         // Wrap into PsyProoffMinerRewardProof
