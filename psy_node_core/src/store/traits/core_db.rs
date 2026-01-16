@@ -550,6 +550,13 @@ pub trait CoreDatabaseTagTreeWriter<Hash: QHashBase + Send + Sync, Hasher: Merkl
         key: &SimpleMerkleNodeKey,
         tag: &Hash,
     ) -> anyhow::Result<()>;
+    async fn db_set_tag_tree_value_only(
+        &self,
+        table: &TableIdentifier,
+        unique_pending_id: u64,
+        key: &SimpleMerkleNodeKey,
+        value: &Hash,
+    ) -> anyhow::Result<()>;
 }
 pub trait CoreDatabaseTagTreeStore<Hash: QHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync, TableIdentifier: Clone + Send + Sync>:
     CoreDatabaseTagTreeReader<Hash, Hasher, TableIdentifier> + CoreDatabaseTagTreeWriter<Hash, Hasher, TableIdentifier>

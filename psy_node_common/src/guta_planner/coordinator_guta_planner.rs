@@ -75,7 +75,7 @@ pub struct CoordinatorGUTAPlanner<F, Hash> {
     /// Maps input leaf job_id to realm_id (from header.state_transition.node_index)
     input_job_to_realm: HashMap<QProvingJobDataID, u64>,
     /// Collected realm reward keys after finalize (realm_id -> reward tree position)
-    pub input_realm_reward_keys: HashMap<u64, SimpleMerkleNodeKey>,
+    input_realm_reward_keys: HashMap<u64, SimpleMerkleNodeKey>,
 }
 
 impl<F, Hash> CoordinatorGUTAPlanner<F, Hash> {

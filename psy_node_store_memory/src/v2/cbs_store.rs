@@ -1623,6 +1623,22 @@ where
         // Height is not needed for this implementation, just call the base method
         self.db_set_tag_tree_tag(table, unique_pending_id, key, tag).await
     }
+
+    async fn db_set_tag_tree_value_only(
+        &self,
+        table: &InMemoryTableIdentifier,
+        unique_pending_id: u64,
+        key: &SimpleMerkleNodeKey,
+        value: &Hash,
+    ) -> anyhow::Result<()> {
+        let db = self.get_or_create_table(&table.to_string());
+        let db_key = key_helpers::key_tag_tree(unique_pending_id, key);
+        let existing_tag = self.db_get_tag_tree_node_tag(table, unique_pending_id, key).await?.unwrap_or_default();
+        let node = TagTreeStorageNode { value: *value, tag: existing_tag };
+        let val_bytes = node.psy_ser_to_bytes_vec()?;
+        db.insert(db_key, val_bytes);
+        Ok(())
+    }
 }
 
 

@@ -353,6 +353,7 @@ pub trait PsyNodeCoreRewardsTagTreeStoreReader<F, Hash> {
 pub trait PsyNodeCoreRewardsTagTreeStoreWriter<F, Hash> {
     async fn rewards_tag_tree_set_node_tag(&self, unique_pending_id: u64, key: SimpleMerkleNodeKey, tag: Hash, value: Hash) -> anyhow::Result<()>;
     async fn rewards_tag_tree_set_node_tag_only(&self, unique_pending_id: u64, key: SimpleMerkleNodeKey, tag: Hash) -> anyhow::Result<()>;
+    async fn rewards_tag_tree_set_node_value_only(&self, unique_pending_id: u64, key: SimpleMerkleNodeKey, value: Hash) -> anyhow::Result<()>;
 }
 
 

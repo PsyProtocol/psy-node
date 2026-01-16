@@ -1929,7 +1929,7 @@ impl<
             .await?;
         match res {
             Some(row) => {
-                if row.checkpoint_id == unique_pending_id {
+                if row.checkpoint_id <= unique_pending_id {
                     Ok(Some(row.value))
                 } else {
                     Ok(None)
@@ -2872,6 +2872,11 @@ impl<
     async fn rewards_tag_tree_set_node_tag_only(&self, unique_pending_id: u64, key: SimpleMerkleNodeKey, tag: N::QHash) -> anyhow::Result<()> {
         self.store
             .db_set_tag_tree_tag(&self.guta_reward_tag_tree_table, unique_pending_id, &key, &tag)
+            .await
+    }
+    async fn rewards_tag_tree_set_node_value_only(&self, unique_pending_id: u64, key: SimpleMerkleNodeKey, value: N::QHash) -> anyhow::Result<()> {
+        self.store
+            .db_set_tag_tree_value_only(&self.guta_reward_tag_tree_table, unique_pending_id, &key, &value)
             .await
     }
 }

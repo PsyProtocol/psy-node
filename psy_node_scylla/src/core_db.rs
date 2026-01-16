@@ -940,6 +940,16 @@ impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sy
             .set_tag_only_computed::<Hash, Hasher>(&self.session, unique_pending_id, *key, None, tag)
             .await
     }
+    async fn db_set_tag_tree_value_only(
+        &self,
+        table: &ScyllaTagTreeNodesPreparedStatements,
+        unique_pending_id: u64,
+        key: &SimpleMerkleNodeKey,
+        value: &Hash,
+    ) -> anyhow::Result<()> {
+        let value_vec = value.to_bytes()?;
+        table.update_value_only(&self.session, unique_pending_id, key, &value_vec).await
+    }
 }
 
 

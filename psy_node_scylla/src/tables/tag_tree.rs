@@ -33,6 +33,8 @@ pub struct ScyllaTagTreeNodesPreparedStatements {
     pub select_1_tag_prepared: Arc<PreparedStatement>,
     pub select_1_value_and_tag_statement: Statement,
     pub select_1_value_and_tag_prepared: Arc<PreparedStatement>,
+    pub update_value_only_statement: Statement,
+    pub update_value_only_prepared: Arc<PreparedStatement>,
     pub keyspace: String,
     pub table_name: String,
     pub table_key: QDatabaseTableRoutingKey,
@@ -62,6 +64,12 @@ impl ScyllaTagTreeNodesPreparedStatements {
         ));
         let select_1_value_and_tag_prepared = session.prepare(select_1_value_and_tag_statement.clone()).await?;
 
+        let update_value_only_statement = Statement::new(&format!(
+            "UPDATE {}.{} SET node_value = ? WHERE unique_pending_id = ? AND level = ? AND node_index = ?",
+            keyspace, table_name
+        ));
+        let update_value_only_prepared = session.prepare(update_value_only_statement.clone()).await?;
+
         Ok(Self {
             insert_1_prepared: Arc::new(insert_prepared),
             select_1_value_prepared: Arc::new(select_1_value_prepared),
@@ -71,6 +79,8 @@ impl ScyllaTagTreeNodesPreparedStatements {
             select_1_tag_statement: select_1_tag_statement,
             select_1_value_and_tag_prepared: Arc::new(select_1_value_and_tag_prepared),
             select_1_value_and_tag_statement: select_1_value_and_tag_statement,
+            update_value_only_prepared: Arc::new(update_value_only_prepared),
+            update_value_only_statement: update_value_only_statement,
             keyspace: keyspace.to_string(),
             table_name: table_name.to_string(),
             table_key,
@@ -137,6 +147,26 @@ impl ScyllaTagTreeNodesPreparedStatements {
                     u64_to_i64_exact(node.index),
                     value,
                     tag,
+                ),
+            )
+            .await?;
+        Ok(())
+    }
+    pub async fn update_value_only(
+        &self,
+        session: &Session,
+        unique_pending_id: u64,
+        node: &SimpleMerkleNodeKey,
+        value: &[u8],
+    ) -> anyhow::Result<()> {
+        session
+            .execute_unpaged(
+                &self.update_value_only_prepared,
+                (
+                    value,
+                    u64_to_i64_exact(unique_pending_id),
+                    u8_to_i8_exact(node.level),
+                    u64_to_i64_exact(node.index),
                 ),
             )
             .await?;

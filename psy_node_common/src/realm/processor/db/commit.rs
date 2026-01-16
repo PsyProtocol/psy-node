@@ -208,10 +208,6 @@ where
             .await?;
         self.commit_checkpoint_state_no_guta_update(&coordinator_update.checkpoint_sync_info)
             .await?;
-        tracing::info!(
-            "Set rewards tag tree and global user tree top proofs for checkpoint ID: {}",
-            checkpoint_id
-        );
 
         // START STANDARD STATE UPDATES (technically these can be done in any order
         // after the above two are done) start contract updates

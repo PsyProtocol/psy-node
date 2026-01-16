@@ -215,10 +215,13 @@ impl ProvingJobCircuitType {
     pub fn needs_to_save_child_reward_tree_values_to_database(&self) -> bool {
         match self {
             | ProvingJobCircuitType::GUTATwoGUTA
+            | ProvingJobCircuitType::GUTATwoGUTALinear
             | ProvingJobCircuitType::GUTAVerifyToCap
+            | ProvingJobCircuitType::GUTAVerifyToCapWithCheckpointUpgrade
             | ProvingJobCircuitType::GUTATwoGUTAWithCheckpointUpgrade
             | ProvingJobCircuitType::GUTAVerifyToCapWithCheckpointUpgrade
             | ProvingJobCircuitType::GUTAVerifyLeftLinearRightLeafUpgradeCheckpoint
+            | ProvingJobCircuitType::GUTALeftGUTARightEndCap
             | ProvingJobCircuitType::GUTAVerifyLeftLeafRightLinearUpgradeCheckpoint => true,
             _ => false,
         }

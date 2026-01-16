@@ -487,14 +487,14 @@ impl<
                 let right_key = node_key.right_child();
                 if children_reward_tree_values.len() == 1 {
                     self.tag_tree_rewards_store
-                        .rewards_tag_tree_set_node_tag(unique_pending_id, left_key, N::QHash::get_zero_value(), children_reward_tree_values[0])
+                        .rewards_tag_tree_set_node_value_only(unique_pending_id, left_key, children_reward_tree_values[0])
                         .await?;
                 } else if children_reward_tree_values.len() == 2 {
                     self.tag_tree_rewards_store
-                        .rewards_tag_tree_set_node_tag(unique_pending_id, left_key, N::QHash::get_zero_value(), children_reward_tree_values[0])
+                        .rewards_tag_tree_set_node_value_only(unique_pending_id, left_key, children_reward_tree_values[0])
                         .await?;
                     self.tag_tree_rewards_store
-                        .rewards_tag_tree_set_node_tag(unique_pending_id, right_key, N::QHash::get_zero_value(), children_reward_tree_values[1])
+                        .rewards_tag_tree_set_node_value_only(unique_pending_id, right_key, children_reward_tree_values[1])
                         .await?;
                 } else if children_reward_tree_values.len() != 0 {
                     anyhow::bail!("Invalid number of children for saving tag tree values to database, this should never happen");
