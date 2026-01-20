@@ -57,6 +57,6 @@ where
         .realm_api_url_manager
         .add_api_urls::<QHashOut<C::F>, QProvingJobDataID>(&config.realm_api_urls)
         .await?;
-    let manager = PsyProofMinerWorkerManager::new(job_fetcher, Arc::new(gcv.library), Arc::new(coordinator_circuits));
+    let manager = PsyProofMinerWorkerManager::new(Arc::new(job_fetcher), Arc::new(gcv.library), Arc::new(coordinator_circuits));
     Ok(manager)
 }

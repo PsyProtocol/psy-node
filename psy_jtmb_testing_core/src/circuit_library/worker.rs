@@ -50,7 +50,7 @@ pub async fn get_simple_proof_miner_worker_for_network_jtmb<C: JTMBCircuitConfig
     job_fetcher.realm_api_url_manager.add_api_urls::<C::Hash, QProvingJobDataID>(&config.realm_api_urls).await?;
 
     let worker = PsyProofMinerWorkerManager::new(
-        job_fetcher,
+        Arc::new(job_fetcher),
         Arc::new(verifier.library),
         Arc::new(manager),
     );

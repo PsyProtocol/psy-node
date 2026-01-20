@@ -1,11 +1,9 @@
-use cf_utils::{log_indicator::print_cf_log_indicator, timer::DebugTimer};
+use cf_utils::log_indicator::print_cf_log_indicator;
 
 use crate::worker::prover_trait::{PsyWorkerGenericLibraryProver, PsyWorkerJobFetcher};
-use psy_core::job::job_id::QProvingJobDataID;
 use psy_data::worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse;
-use futures::future;
-use futures::stream::{self, StreamExt};
 use std::sync::Arc;
+use tokio::sync::{mpsc, Semaphore};
 use tokio::task;
 
 pub struct PsyProofMinerWorkerManager<
@@ -15,7 +13,7 @@ pub struct PsyProofMinerWorkerManager<
     CircuitLibrary,
     Prover,
 >{
-    pub job_fetcher: JobFetcher,
+    pub job_fetcher: Arc<JobFetcher>,
     pub circuit_library: Arc<CircuitLibrary>,
     pub prover: Arc<Prover>,
     pub _phantom_hash: std::marker::PhantomData<Hash>,
@@ -25,12 +23,12 @@ pub struct PsyProofMinerWorkerManager<
 impl<
     Hash: Copy + std::fmt::Debug + Send + 'static,
     JobId: Copy + std::fmt::Debug + Send + 'static,
-    JobFetcher: PsyWorkerJobFetcher<Hash, JobId>,
+    JobFetcher: PsyWorkerJobFetcher<Hash, JobId> + Send + Sync + 'static,
     CircuitLibrary: Send + Sync + 'static,
     Prover: PsyWorkerGenericLibraryProver<Hash, JobId, CircuitLibrary> + Send + Sync + 'static,
 > PsyProofMinerWorkerManager<Hash, JobId, JobFetcher, CircuitLibrary, Prover> {
     pub fn new(
-        job_fetcher: JobFetcher,
+        job_fetcher: Arc<JobFetcher>,
         circuit_library: Arc<CircuitLibrary>,
         prover: Arc<Prover>,
     ) -> Self {
@@ -43,63 +41,151 @@ impl<
         }
     }
 
-    pub async fn process_jobs(&self, batch_size: usize) -> anyhow::Result<()> {
-        let mut timer = DebugTimer::new("process_jobs");
-        let fetch_futures = (0..batch_size).map(|_| self.job_fetcher.fetch_new_job());
-        let fetch_results: Vec<anyhow::Result<Option<([u8; 32], Hash, PsyWorkerGetProvingWorkWithChildProofsAPIResponse<Hash, JobId>)>>> = futures::future::join_all(fetch_futures).await;
-        let jobs: Vec<_> = fetch_results.into_iter().filter_map(|res| res.ok().flatten()).collect();
-        if jobs.is_empty() {
-            return Ok(());
-        }
-        timer.lap("fetched jobs");
-        tracing::info!("Fetched {} new jobs", jobs.len());
-
-        let prove_futures = jobs.into_iter().map(|(api_url_hash, tag, job_response)| {
-            let job_id = job_response.base.job.job_id;
-            tracing::info!("Starting to prove job: {:?} from API URL hash: {:?}", job_id, api_url_hash);
-            let library = Arc::clone(&self.circuit_library);
-            let prover = Arc::clone(&self.prover);
-            async move {
-                let start_time = std::time::Instant::now();
-                let proof = task::spawn_blocking(move || {
-                    prover.prove_job_from_api(&*library, job_response, tag)
-                }).await??;
-                let proving_time = start_time.elapsed();
-                tracing::info!("Proved job: {:?} in {:?}", job_id, proving_time);
-                Ok::<([u8; 32], JobId, Hash, Vec<u8>), anyhow::Error>((api_url_hash, job_id, tag, proof))
-            }
-        });
-
-        let proofs: Vec<([u8; 32], JobId, Hash, Vec<u8>)> = future::join_all(prove_futures).await.into_iter().filter_map(|res: Result<_, _>| res.ok()).collect();
-        timer.lap("proved all jobs");
-        tracing::info!("Successfully proved {} jobs", proofs.len());
-
-        let submit_futures = proofs.into_iter().map(|(api_url_hash, job_id, tag, proof)| {
-            async move {
-                tracing::info!("Submitting proof for job: {:?}", job_id);
-                self.job_fetcher.submit_proof_raw_to_api(api_url_hash, job_id, tag, proof).await?;
-                tracing::info!("Submitted proof for job: {:?} to API URL hash: {}", job_id, hex::encode(api_url_hash));
-                Ok::<(), anyhow::Error>(())
-            }
-        });
-
-        future::try_join_all(submit_futures).await?;
-        timer.lap("submitted all proofs");
-        Ok(())
-    }
     pub async fn run_worker_loop(&self, poll_interval_ms: u64, batch_size: usize) -> anyhow::Result<()> {
         print_cf_log_indicator("PSY_PROOF_MINER_WORKER_STARTED", "");
-        loop {
-            if let Err(e) = self.process_jobs(batch_size).await {
-                let error = format!("Error processing jobs: {:?}", e);
-                if error.contains("no proving work available") {
-                    //tracing::debug!("{}", error);
-                } else {
-                    tracing::error!("{}", error);
+
+        let (job_tx, job_rx) = mpsc::channel::<([u8; 32], Hash, PsyWorkerGetProvingWorkWithChildProofsAPIResponse<Hash, JobId>)>(batch_size);
+
+        let (proof_tx, proof_rx) = mpsc::channel::<([u8; 32], JobId, Hash, Vec<u8>)>(batch_size);
+
+        let fetcher_handle = Self::spawn_fetcher_task(
+            self.job_fetcher.clone(),
+            job_tx,
+            poll_interval_ms,
+        );
+
+        let submitter_handle = Self::spawn_submitter_task(
+            self.job_fetcher.clone(),
+            proof_rx,
+        );
+
+        let worker_handle = Self::spawn_worker_task(
+            self.circuit_library.clone(),
+            self.prover.clone(),
+            job_rx,
+            proof_tx,
+            batch_size,
+        );
+
+        let _ = tokio::try_join!(fetcher_handle, submitter_handle, worker_handle);
+
+        Ok(())
+    }
+
+    fn spawn_fetcher_task(
+        fetcher: Arc<JobFetcher>,
+        job_tx: mpsc::Sender<([u8; 32], Hash, PsyWorkerGetProvingWorkWithChildProofsAPIResponse<Hash, JobId>)>,
+        poll_interval_ms: u64,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            tracing::info!("🔍 Fetcher role started - ensuring job queue stays full");
+
+            loop {
+                match job_tx.reserve().await {
+                    Ok(permit) => {
+                        match fetcher.fetch_new_job().await {
+                            Ok(Some(job)) => {
+                                permit.send(job);
+                                tracing::debug!("Fetcher: Added job to queue");
+                            }
+                            Ok(None) => {
+                                drop(permit);
+                                tokio::time::sleep(tokio::time::Duration::from_millis(poll_interval_ms)).await;
+                            }
+                            Err(e) => {
+                                let error = format!("Error fetching job: {:?}", e);
+                                if !error.contains("no proving work available") {
+                                    tracing::error!("Fetcher: {}", error);
+                                }
+                                drop(permit);
+                                tokio::time::sleep(tokio::time::Duration::from_millis(poll_interval_ms)).await;
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        tracing::info!("Fetcher: Job queue receiver dropped, shutting down");
+                        break;
+                    }
                 }
-                //tracing::error!("Error processing job: {:?}", e);
             }
-            tokio::time::sleep(std::time::Duration::from_millis(poll_interval_ms)).await;
-        }
+        })
+    }
+
+    fn spawn_worker_task(
+        circuit_library: Arc<CircuitLibrary>,
+        prover: Arc<Prover>,
+        mut job_rx: mpsc::Receiver<([u8; 32], Hash, PsyWorkerGetProvingWorkWithChildProofsAPIResponse<Hash, JobId>)>,
+        proof_tx: mpsc::Sender<([u8; 32], JobId, Hash, Vec<u8>)>,
+        batch_size: usize,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            tracing::info!("⚙️  Worker/Prover role started - processing jobs from fetch queue");
+
+            let semaphore = Arc::new(Semaphore::new(batch_size));
+
+            while let Some((api_url_hash, tag, job_response)) = job_rx.recv().await {
+                let job_id = job_response.base.job.job_id;
+                tracing::info!("Worker: Picked up job {:?}", job_id);
+
+                let permit = semaphore.clone().acquire_owned().await.unwrap();
+
+                let library = circuit_library.clone();
+                let prover_clone = prover.clone();
+                let proof_tx_clone = proof_tx.clone();
+
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    tracing::info!("Worker: Starting proof generation for job {:?}", job_id);
+                    let start_time = std::time::Instant::now();
+
+                    let result = task::spawn_blocking(move || {
+                        prover_clone.prove_job_from_api(&*library, job_response, tag)
+                    }).await;
+
+                    match result {
+                        Ok(Ok(proof)) => {
+                            let proving_time = start_time.elapsed();
+                            tracing::info!("Worker: Proved job {:?} in {:?}", job_id, proving_time);
+
+                            if let Err(e) = proof_tx_clone.send((api_url_hash, job_id, tag, proof)).await {
+                                tracing::error!("Worker: Failed to send proof to submitter: {:?}", e);
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            tracing::error!("Worker: Proving failed for job {:?}: {:?}", job_id, e);
+                        }
+                        Err(e) => {
+                            tracing::error!("Worker: Proving task panicked for job {:?}: {:?}", job_id, e);
+                        }
+                    }
+                });
+            }
+
+            tracing::info!("Worker: Job queue closed, shutting down");
+        })
+    }
+
+    fn spawn_submitter_task(
+        submitter: Arc<JobFetcher>,
+        mut proof_rx: mpsc::Receiver<([u8; 32], JobId, Hash, Vec<u8>)>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            tracing::info!("📤 Submitter role started - submitting proofs from proof queue");
+
+            while let Some((api_url_hash, job_id, tag, proof)) = proof_rx.recv().await {
+                tracing::info!("Submitter: Received proof for job {:?}", job_id);
+
+                match submitter.submit_proof_raw_to_api(api_url_hash, job_id, tag, proof).await {
+                    Ok(_) => {
+                        tracing::info!("Submitter: Successfully submitted proof for job {:?}", job_id);
+                    }
+                    Err(e) => {
+                        tracing::error!("Submitter: Error submitting proof for job {:?}: {:?}", job_id, e);
+                    }
+                }
+            }
+
+            tracing::info!("Submitter: Proof queue closed, shutting down");
+        })
     }
 }
