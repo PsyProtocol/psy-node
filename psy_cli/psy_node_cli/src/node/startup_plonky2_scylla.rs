@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
+use std::time::Duration;
 use parth_core::{node::realm_identifier::QRealmIdentifier, protocol::core_types::QNetworkTypesConfigHelper};
 use psy_core::{job::job_id::QProvingJobDataID, network_config::PsyNetworkLocalDevnetConstants};
 use psy_data::{
@@ -308,7 +309,7 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
         anyhow::bail!("No coordinator API URLs provided for realm processor node");
     }
     
-    let http_client: HttpClient = HttpClientBuilder::default().build(&config.coordinator_api_urls[0])?;
+    let http_client: HttpClient = HttpClientBuilder::default().set_keep_alive(Some(Duration::from_secs(10))).build(&config.coordinator_api_urls[0])?;
 
     /*
     

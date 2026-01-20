@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
+use std::time::Duration;
 use parth_core::{crypto::hash::merkle_proof::MerkleProofCore, protocol::core_types::QNetworkTypesConfig};
 use psy_api_core::coordinator::standard_edge_rpc::CoordinatorEdgeRpcClient;
 use psy_data::v1::qdata::public_key::PZKPublicKeyInfo;
@@ -18,7 +19,7 @@ pub struct PsyCoordinatorAPIFetcher<N: QNetworkTypesConfig + 'static, C: Coordin
 }
 
 pub fn new_coordinator_fetcher_from_url<N: QNetworkTypesConfig + 'static>(api_url: &str) -> anyhow::Result<PsyCoordinatorAPIFetcher<N, HttpClient>> {
-    let http_client: HttpClient = HttpClientBuilder::default().build(&api_url)?;
+    let http_client: HttpClient = HttpClientBuilder::default().set_keep_alive(Some(Duration::from_secs(10))).build(&api_url)?;
     Ok(PsyCoordinatorAPIFetcher::new(http_client))
 }
 

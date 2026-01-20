@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
+use std::time::Duration;
 use parth_core::node::realm_identifier::QRealmIdentifier;
 use psy_api_core::worker::standard_worker_rpc::NodeEdgeWorkerRpcClient;
 use psy_core::constants::url_rotation::PsyAPIURLRotationStrategy;
@@ -84,7 +85,7 @@ impl PsyWorkerAPIURLManager {
     ) -> anyhow::Result<()> {
         for api_url in api_urls {
             loop {
-                let client = HttpClientBuilder::default().build(api_url.as_ref())?;
+                let client = HttpClientBuilder::default().set_keep_alive(Some(Duration::from_secs(10))).build(api_url.as_ref())?;
                 let realm_identifier = <HttpClient as NodeEdgeWorkerRpcClient<Hash, JobId>>::get_realm_identifier_worker_api(&client).await;
 
                 match realm_identifier {

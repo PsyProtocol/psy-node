@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
+use std::time::Duration;
 use parth_common::tree_sync::traits::FastTreeSyncAsyncSource;
 use parth_core::{
     crypto::hash::merkle_proof::MerkleProofCore,
@@ -167,7 +168,7 @@ pub struct PsyRealmAPIUserContractDataFetcher<N: QNetworkTypesConfig + 'static, 
 pub fn new_contract_data_fetcher_from_url<N: QNetworkTypesConfig + 'static>(
     api_url: &str,
 ) -> anyhow::Result<PsyRealmAPIUserContractDataFetcher<N, HttpClient>> {
-    let http_client: HttpClient = HttpClientBuilder::default().build(&api_url)?;
+    let http_client: HttpClient = HttpClientBuilder::default().set_keep_alive(Some(Duration::from_secs(10))).build(&api_url)?;
     Ok(PsyRealmAPIUserContractDataFetcher::new(http_client))
 }
 
