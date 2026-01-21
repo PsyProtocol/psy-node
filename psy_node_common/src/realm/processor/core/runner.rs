@@ -55,7 +55,7 @@ where
 
             let current_slot = current_ms / 100;
 
-            if current_slot != last_slot && current_slot % 35 == 0 {
+            if current_slot != last_slot && current_slot % 40 == 0 {
                 last_slot = current_slot;
                 let start_processing_at = std::time::Instant::now();
                 tracing::debug!("[REALM] Process block starting...");

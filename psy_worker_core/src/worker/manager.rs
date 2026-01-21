@@ -78,7 +78,7 @@ impl<
         poll_interval_ms: u64,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            tracing::info!("🔍 Fetcher role started - ensuring job queue stays full");
+            tracing::info!("Fetcher role started - ensuring job queue stays full");
 
             loop {
                 match job_tx.reserve().await {
@@ -119,7 +119,7 @@ impl<
         batch_size: usize,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            tracing::info!("⚙️  Worker/Prover role started - processing jobs from fetch queue");
+            tracing::info!("Worker role started - processing jobs from fetch queue");
 
             let semaphore = Arc::new(Semaphore::new(batch_size));
 
@@ -170,7 +170,7 @@ impl<
         mut proof_rx: mpsc::Receiver<([u8; 32], JobId, Hash, Vec<u8>)>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            tracing::info!("📤 Submitter role started - submitting proofs from proof queue");
+            tracing::info!("Submitter role started - submitting proofs from proof queue");
 
             while let Some((api_url_hash, job_id, tag, proof)) = proof_rx.recv().await {
                 tracing::info!("Submitter: Received proof for job {:?}", job_id);

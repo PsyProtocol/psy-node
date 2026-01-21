@@ -390,10 +390,10 @@ impl<
             &deploy_contract_jobs,
         )?;
         timer.lap("get_root_job_ids");
-        if has_jobs.is_none() {
-            //tracing::info!("No jobs to process in this block, skipping.");
-            //return Ok(());
-            tracing::info!("No jobs to process in this block, but proceeding to create empty checkpoint state transition.");
+        if self.db.ids.next_checkpoint_id > 1 && has_jobs.is_none() {
+            tracing::info!("No jobs to process in this block, skipping.");
+            return Ok(());
+            // tracing::info!("No jobs to process in this block, but proceeding to create empty checkpoint state transition.");
         }
 
 
