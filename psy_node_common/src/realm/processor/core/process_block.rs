@@ -137,14 +137,8 @@ where
         Ok(guta_result)
     }
 
-    pub async fn process_block(&mut self) -> anyhow::Result<()> {
-        self.db.run_sanity_check("process_block start").await?;
-        let mut timer = TraceTimer::new("process_block");
-        tracing::info!(
-            "Starting to process new realm block. Last Committed Checkpoint: {}",
-            self.db.state.last_committed_checkpoint_id
-        );
-
+    pub async fn sync_and_verify(&mut self) -> anyhow::Result<()> {
+        let mut timer = TraceTimer::new("sync_and_verify");
         //self.db.print_last_10_checkpoint_roots_and_leaves("process_block before
         // sync_with_coordinator").await?;
 
@@ -180,6 +174,16 @@ where
         // ensure_db_matches_coordinator_head").await?;
 
         timer.lap("sync_and_verify_coordinator");
+        Ok(())
+    }
+
+    pub async fn process_block(&mut self) -> anyhow::Result<()> {
+        self.db.run_sanity_check("process_block start").await?;
+        let mut timer = TraceTimer::new("process_block");
+        tracing::info!(
+            "Starting to process new realm block. Last Committed Checkpoint: {}",
+            self.db.state.last_committed_checkpoint_id
+        );
 
         // 2. Gather Updates
         let guta_output = self.get_results_from_gatherers().await?;

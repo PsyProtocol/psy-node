@@ -49,15 +49,26 @@ where
     loop {
         let is_active = processor.db.is_active.load(Ordering::SeqCst);
         if is_active {
+            tracing::debug!("[REALM] Sync and verify starting...");
+            let sync_result = processor.sync_and_verify().await;
+            match sync_result {
+                Ok(_) => {
+                    tracing::debug!("[REALM] Sync and verify completed.");
+                }
+                Err(e) => {
+                    tracing::error!("[REALM] Sync and verify failed: {:?}, skipping block processing", e);
+                    continue;
+                }
+            }
+
             let now = std::time::SystemTime::now();
             let since_epoch = now.duration_since(std::time::UNIX_EPOCH).unwrap();
-            let current_ms = since_epoch.as_millis();
-
-            let current_slot = current_ms / 100;
+            let current_slot = since_epoch.as_millis() / 100;
 
             if current_slot != last_slot && current_slot % 40 == 0 {
                 last_slot = current_slot;
                 let start_processing_at = std::time::Instant::now();
+
                 tracing::debug!("[REALM] Process block starting...");
                 let result = processor.process_block().await;
                 let elapsed = start_processing_at.elapsed();
