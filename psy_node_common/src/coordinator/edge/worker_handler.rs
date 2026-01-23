@@ -113,25 +113,34 @@ impl<
             .get_tdb_proof_witness_bytes(&self.realm_identifier, unique_pending_id, work_item.job_id.get_input_witness_id())
             .await?;
 
-        let children_reward_tree_values = {
-            if work_item.metadata.dependencies.len() == 0 || work_item.metadata.reward_tree_hash_mode == PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN
-            {
-                vec![]
-            } else {
-                let mut values = Vec::with_capacity(work_item.metadata.dependencies.len());
-                for dependency in work_item.metadata.dependencies.iter() {
-                    if dependency.circuit_type == ProvingJobCircuitType::GenerateRollupStateTransitionProof {
-                        values.push(N::QHash::get_zero_value());
-                    } else {
-                        let value: N::QHash = self
-                            .temp_db
-                            .get_proof_miner_rewards_tree_value(&self.realm_identifier, unique_pending_id, *dependency)
-                            .await?;
-                        values.push(value);
+        let children_reward_tree_values = if work_item.metadata.dependencies.is_empty()
+            || work_item.metadata.reward_tree_hash_mode == PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN
+        {
+            vec![]
+        } else {
+            let temp_db = self.temp_db.clone();
+            let realm_identifier = self.realm_identifier.clone();
+            let futures = work_item
+                .metadata
+                .dependencies
+                .iter()
+                .map(|dependency| {
+                    let dep = dependency.clone();
+                    let temp_db = temp_db.clone();
+                    let realm_identifier = realm_identifier.clone();
+                    async move {
+                        if dep.circuit_type == ProvingJobCircuitType::GenerateRollupStateTransitionProof {
+                            Ok(N::QHash::get_zero_value())
+                        } else {
+                            temp_db
+                                .get_proof_miner_rewards_tree_value(&realm_identifier, unique_pending_id, dep)
+                                .await
+                        }
                     }
-                }
-                values
-            }
+                })
+                .collect::<Vec<_>>();
+
+            try_join_all(futures).await?
         };
         let response = PsyWorkerGetProvingWorkAPIResponse {
             job: work_item,

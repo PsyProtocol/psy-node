@@ -126,9 +126,11 @@ impl<
         for i in min_level..max_level {
             proving_state.set_current_proving_level(i as u8);
             self.db.temp_db.set_psy_node_proving_state(&self.db.ids.realm_identifier, &proving_state).await?;
-            self.publish_worker_jobs_if_exists(&queue_key, i, guta_jobs).await?;
-            self.publish_worker_jobs_if_exists(&queue_key, i, register_user_jobs).await?;
-            self.publish_worker_jobs_if_exists(&queue_key, i, deploy_contract_jobs).await?;
+            tokio::try_join!(
+                self.publish_worker_jobs_if_exists(&queue_key, i, guta_jobs),
+                self.publish_worker_jobs_if_exists(&queue_key, i, register_user_jobs),
+                self.publish_worker_jobs_if_exists(&queue_key, i, deploy_contract_jobs),
+            )?;
             if wait_for_jobs_completion {
                 self.db
                     .proof_work_queue
