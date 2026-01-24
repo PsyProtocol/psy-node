@@ -1,5 +1,6 @@
 use anyhow::Ok;
 use parth_core::{
+    QCoreProcCheckpointUniqueId,
     crypto::hash::
         merkle_proof::MerkleProofCore
     ,
@@ -64,10 +65,15 @@ where
         self.guta_update_queue.ensure_stream().await?;
         self.proof_work_queue.ensure_stream().await?;
 
-        // Create consumers for new gathering proc_checkpoint_unique_id only
+        // Create consumers for gathering proc_checkpoint_unique_id, and also for processing if it's 0 (genesis case)
         let realm_id = self.state.realm_id_u64;
         let realm_sub_id = self.state.realm_sub_id_u64;
         let unique_id = new_gathering_proc_checkpoint_unique_id;
+        let processing_proc_id = self.state.processing_proc_checkpoint_unique_id;
+        let should_create_processing_consumers = processing_proc_id == QCoreProcCheckpointUniqueId::from(0u128);
+
+        tracing::info!("REALM_CONSUMER_CREATION: Creating consumers for gathering proc_id: {}, realm_id: {}, realm_sub_id: {}, processing_proc_id: {}, should_create_processing: {}",
+                      unique_id, realm_id, realm_sub_id, processing_proc_id, should_create_processing_consumers);
 
         let guta_key = RealmUserUpdateQueueKey {
             realm_id, realm_sub_id, unique_id, task_group: 0,
@@ -78,8 +84,28 @@ where
             queue_type: QPBaseQueueType::WorkerQueue, _phantom_queue_item: std::marker::PhantomData::<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>,
         };
 
+        // Create consumers for gathering proc_id
         self.guta_update_queue.ensure_consumer(&guta_key, realm_id, realm_sub_id, unique_id, 0).await?;
         self.proof_work_queue.ensure_consumer(&proof_key, realm_id, realm_sub_id, unique_id, 0).await?;
+
+        // Also create consumers for processing proc_id if it's 0 (genesis case)
+        if should_create_processing_consumers {
+            tracing::info!("REALM_CONSUMER_CREATION: Also creating consumers for processing proc_id: {}", processing_proc_id);
+
+            let processing_guta_key = RealmUserUpdateQueueKey {
+                realm_id, realm_sub_id, unique_id: processing_proc_id, task_group: 0,
+                queue_type: QPBaseQueueType::StandardEphemeral, _phantom_queue_item: std::marker::PhantomData::<PsyRealmUserUpdateQueueItem<N::F, N::QHash>>,
+            };
+            let processing_proof_key = RealmProvingWorkQueueKey {
+                realm_id, realm_sub_id, unique_id: processing_proc_id, task_group: 0,
+                queue_type: QPBaseQueueType::WorkerQueue, _phantom_queue_item: std::marker::PhantomData::<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>,
+            };
+
+            self.guta_update_queue.ensure_consumer(&processing_guta_key, realm_id, realm_sub_id, processing_proc_id, 0).await?;
+            self.proof_work_queue.ensure_consumer(&processing_proof_key, realm_id, realm_sub_id, processing_proc_id, 0).await?;
+
+            tracing::info!("REALM_CONSUMER_CREATION: Successfully created all consumers for processing proc_id: {}", processing_proc_id);
+        }
 
         self.state.finish_gathering(
             gathering_realm_end_root.unwrap_or(self.state.last_committed_realm_end_root),
