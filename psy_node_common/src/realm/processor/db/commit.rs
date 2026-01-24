@@ -4,15 +4,18 @@ use parth_core::{
         merkle_proof::MerkleProofCore
     ,
     protocol::core_types::QNetworkTypesConfig,
+    data::queue::queue_key::{PCoreSubjectQueueBase, QPBaseQueueType},
 };
 use psy_core::
     job::job_id::ProvingJobCircuitType
 ;
 use psy_data::{
     prepared_block::realm::{PsyPreparedRealmBlockStateUpdates, PsyRealmCoordinatorUpdate},
+    queue_items::realm_user_update::PsyRealmUserUpdateQueueItem,
     v1::qdata::
         checkpoint_sync::PQEDCheckpointSyncInfoCompact
     ,
+    worker::metadata_with_job_id::PsyProvingJobMetadataWithJobId,
 };
 use psy_io::tokio::TokioLikeFileSystem;
 use psy_node_core::{
@@ -26,14 +29,17 @@ use psy_node_core::{
 };
 use parth_common::memory_stores::traits::PsyMemoryMerkleStoreImm;
 
-use crate::realm:: processor::db::PsyRealmDatabaseProcessor;
+use crate::realm::{
+    processor::db::PsyRealmDatabaseProcessor,
+    queue_key::{RealmUserUpdateQueueKey, RealmProvingWorkQueueKey},
+};
 
 impl<
         N: QNetworkTypesConfig,
         S: PsyRealmProcessorStore<N::F, N::QHash> + Send + Sync,
         STagTreeRewards: PsyNodeCoreRewardsTagTreeStoreWriter<N::F, N::QHash> + PsyNodeCoreRewardsTagTreeStoreReader<N::F, N::QHash> + Send + Sync,
-        GUTAUpdateQueue: QStandardEphemeralQueueSubscriber,
-        ProofWorkQueue: QStandardWorkerQueuePublisher,
+        GUTAUpdateQueue: QStandardEphemeralQueueSubscriber + Send + Sync,
+        ProofWorkQueue: QStandardWorkerQueuePublisher + Send + Sync,
         TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>,
         ProofStore: QParthProofStore,
         FileSystem: TokioLikeFileSystem + Send + Sync + 'static,
@@ -53,6 +59,28 @@ where
             self.state.processing_unique_pending_id, self.state.processing_proc_checkpoint_unique_id
         );
         let (new_gathering_unique_pending_id, new_gathering_proc_checkpoint_unique_id) = self.db.inc_unique_pending_id(1).await?;
+
+        // Ensure streams exist first
+        self.guta_update_queue.ensure_stream().await?;
+        self.proof_work_queue.ensure_stream().await?;
+
+        // Create consumers for new gathering proc_checkpoint_unique_id only
+        let realm_id = self.state.realm_id_u64;
+        let realm_sub_id = self.state.realm_sub_id_u64;
+        let unique_id = new_gathering_proc_checkpoint_unique_id;
+
+        let guta_key = RealmUserUpdateQueueKey {
+            realm_id, realm_sub_id, unique_id, task_group: 0,
+            queue_type: QPBaseQueueType::StandardEphemeral, _phantom_queue_item: std::marker::PhantomData::<PsyRealmUserUpdateQueueItem<N::F, N::QHash>>,
+        };
+        let proof_key = RealmProvingWorkQueueKey {
+            realm_id, realm_sub_id, unique_id, task_group: 0,
+            queue_type: QPBaseQueueType::WorkerQueue, _phantom_queue_item: std::marker::PhantomData::<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>,
+        };
+
+        self.guta_update_queue.ensure_consumer(&guta_key, realm_id, realm_sub_id, unique_id, 0).await?;
+        self.proof_work_queue.ensure_consumer(&proof_key, realm_id, realm_sub_id, unique_id, 0).await?;
+
         self.state.finish_gathering(
             gathering_realm_end_root.unwrap_or(self.state.last_committed_realm_end_root),
             self.checkpoint_tree_backup_manager.get_current_checkpoint_id_head(),
@@ -61,6 +89,7 @@ where
             new_gathering_proc_checkpoint_unique_id,
         )?;
         self.shared_state.update_from_core_state(&self.state).await?;
+
         self.temp_db
             .set_gathering_unique_pending_ids(
                 &self.state.realm_identifier,
@@ -75,6 +104,7 @@ where
                 self.state.processing_proc_checkpoint_unique_id,
             )
             .await?;
+
         println!(
             "new_unique_pending_id: {}, new_proc_checkpoint_unique_id: {}",
             self.state.processing_unique_pending_id, self.state.processing_proc_checkpoint_unique_id
@@ -83,6 +113,10 @@ where
             "new_gathering_unique_pending_id: {}, new_gathering_proc_checkpoint_unique_id: {}",
             self.state.gathering_unique_pending_id, self.state.gathering_proc_checkpoint_unique_id
         );
+
+        tracing::info!("Rotated unique IDs and pre-created consumers - processing: {}, gathering: {}",
+                      self.state.processing_unique_pending_id,
+                      self.state.gathering_unique_pending_id);
 
         Ok(())
     }
@@ -113,7 +147,7 @@ where
         self.db
             .set_checkpoint_leaf_data(checkpoint_sync_info.checkpoint_id, &checkpoint_sync_info.checkpoint_leaf)
             .await?;
-        
+
         println!("committing checkpoint proof: {:?}", &previous.to_append_proof::<N::HasherBase>());
         // --- START FIX ---
         // Instead of just setting the leaf hash, ingest the full proof from the correct in-memory tree.
@@ -122,7 +156,7 @@ where
             .checkpoint_tree_injest_merkle_proof(checkpoint_sync_info.checkpoint_id, &previous.to_append_proof::<N::HasherBase>())
             .await?;
         // --- END FIX ---
-        
+
         self.db
             .set_checkpoint_root_hash_to_id_mapping(checkpoint_sync_info.checkpoint_tree_root, checkpoint_sync_info.checkpoint_id)
             .await?;

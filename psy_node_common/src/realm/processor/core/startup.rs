@@ -27,7 +27,7 @@ impl<
         S: PsyRealmProcessorStore<N::F, N::QHash> + Send + Sync,
         STagTreeRewards: PsyNodeCoreRewardsTagTreeStoreWriter<N::F, N::QHash> + PsyNodeCoreRewardsTagTreeStoreReader<N::F, N::QHash> + Send + Sync,
         GUTAUpdateQueue: QStandardEphemeralQueueSubscriber + Send + Sync + 'static,
-        ProofWorkQueue: QStandardWorkerQueuePublisher,
+        ProofWorkQueue: QStandardWorkerQueuePublisher + Send + Sync,
         TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash> + Send + Sync + 'static,
         ProofStore: QParthProofStore,
         FileSystem: TokioLikeFileSystem + Send + Sync + 'static,

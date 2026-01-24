@@ -1,9 +1,10 @@
 use async_trait::async_trait;
 use parth_core::{data::queue::queue_key::PCoreStandardQueueKeyForRealm, QCoreProcCheckpointUniqueId};
+use super::infrastructure::QStandardQueueBase;
 
 
 #[async_trait]
-pub trait QStandardWorkerQueuePublisher {
+pub trait QStandardWorkerQueuePublisher: QStandardQueueBase {
     async fn publish_worker_queue_item_ref<QK: PCoreStandardQueueKeyForRealm>(
         &self,
         queue_key: &QK,
@@ -52,7 +53,7 @@ pub trait QStandardWorkerQueuePublisher {
 }
 
 #[async_trait]
-pub trait QStandardWorkerQueueSubscriber {
+pub trait QStandardWorkerQueueSubscriber: QStandardQueueBase {
     async fn wait_for_worker_queue_item<QK: PCoreStandardQueueKeyForRealm>(
         &self,
         queue_key: &QK,
@@ -88,7 +89,7 @@ pub trait QStandardWorkerQueueSubscriber {
         task_group: u32,
         timeout_ms: u64,
     ) -> anyhow::Result<()>;
-    
+
     async fn worker_queue_report_job_completed<QK: PCoreStandardQueueKeyForRealm>(
         &self,
         queue_key: &QK,

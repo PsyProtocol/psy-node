@@ -1,8 +1,9 @@
 use async_trait::async_trait;
 use parth_core::{data::queue::queue_key::PCoreStandardQueueKeyForRealm, QCoreProcCheckpointUniqueId};
+use super::infrastructure::QStandardQueueBase;
 
 #[async_trait]
-pub trait QStandardEphemeralQueuePublisher {
+pub trait QStandardEphemeralQueuePublisher: QStandardQueueBase {
     async fn publish_ephemeral_queue_item_bytes_ref<QK: PCoreStandardQueueKeyForRealm>(
         &self,
         queue_key: &QK,
@@ -87,7 +88,7 @@ pub trait QStandardEphemeralQueuePublisher {
 }
 
 #[async_trait]
-pub trait QStandardEphemeralQueueSubscriber {
+pub trait QStandardEphemeralQueueSubscriber: QStandardQueueBase {
     async fn wait_for_ephemeral_queue_item_bytes<QK: PCoreStandardQueueKeyForRealm>(
         &self,
         queue_key: &QK,
@@ -140,4 +141,5 @@ pub trait QStandardEphemeralQueueSubscriber {
         unique_id: QCoreProcCheckpointUniqueId,
         task_group: u32,
     ) -> anyhow::Result<Option<QK::QueueItem>>;
+
 }

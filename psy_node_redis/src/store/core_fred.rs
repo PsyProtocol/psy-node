@@ -8,14 +8,17 @@ use fred::{
 };
 use parth_core::{
     data::{
-        queue::queue_key::{PCoreQueueItemBase, PCoreStandardQueueKeyForRealm},
+        queue::queue_key::{PCoreQueueItemBase, PCoreStandardQueueKeyForRealm, QPBaseQueueType},
         serializable::{QPDPair, QPDSerializable},
     },
     utils::auto_implement::QAutoImplementGeneric,
     QCoreProcCheckpointUniqueId, QJobIdSerialized,
 };
 use psy_node_core::{
-    queue::ephemeral::{QStandardEphemeralQueuePublisher, QStandardEphemeralQueueSubscriber},
+    queue::{
+        ephemeral::{QStandardEphemeralQueuePublisher, QStandardEphemeralQueueSubscriber},
+        infrastructure::QStandardQueueBase,
+    },
     store::traits::{
         proof_store::{QParthProofStoreReader, QParthProofStoreWriter},
         temp_db::{
@@ -276,6 +279,24 @@ impl StandardFredRedisStore {
 }
 
 #[async_trait]
+impl QStandardQueueBase for StandardFredRedisStore {
+    async fn ensure_stream(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn ensure_consumer<QK: PCoreStandardQueueKeyForRealm>(
+        &self,
+        _queue_key: &QK,
+        _realm_id: u64,
+        _realm_sub_id: u64,
+        _unique_id: QCoreProcCheckpointUniqueId,
+        _task_group: u32,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+#[async_trait]
 impl QStandardEphemeralQueuePublisher for StandardFredRedisStore {
     async fn publish_ephemeral_queue_item_bytes_ref<QK: PCoreStandardQueueKeyForRealm>(
         &self,
@@ -420,6 +441,7 @@ impl QStandardEphemeralQueuePublisher for StandardFredRedisStore {
         let _: () = self.client.rpush(&subject, items_bytes).await?;
         Ok(())
     }
+
 }
 
 #[async_trait]
@@ -526,6 +548,7 @@ impl QStandardEphemeralQueueSubscriber for StandardFredRedisStore {
             Ok(None)
         }
     }
+
 }
 
 #[async_trait]
