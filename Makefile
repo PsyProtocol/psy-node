@@ -28,7 +28,7 @@ query-chain-info:
 	RUST_LOG=psy_node_common=debug ${BIN_PREFIX}/examples/query_chain_info
 
 run-all: shutdown clean-db
-	bun run dev/locSetupV4.ts --proving-backend ${PROVING_BACKEND} --db-only --coordinator-only --realm-only --start-realm-id 0 --end-realm-id 3 --workers-only --coordinator-workers 1 --realm-workers 4 --env RUST_LOG=psy_node_common=debug
+	bun run dev/locSetupV4.ts --proving-backend ${PROVING_BACKEND} --db-only --coordinator-only --realm-only --start-realm-id 0 --end-realm-id 3 --workers-only --coordinator-workers 1 --realm-workers 4 --env RUST_LOG=psy_node_common=debug,psy_worker_core=debug,psy_node_core=debug
 
 restart: shutdown
 	bun run dev/locSetupV4.ts --proving-backend ${PROVING_BACKEND} --coordinator-only --realm-only --start-realm-id 0 --end-realm-id 3 --workers-only --coordinator-workers 1 --realm-workers 4

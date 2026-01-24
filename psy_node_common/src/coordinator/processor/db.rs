@@ -393,6 +393,14 @@ impl<
         self.db.get_current_unique_pending_id().await
     }
     pub async fn set_new_unique_ids(&mut self) -> anyhow::Result<()> {
+        println!(
+            "old_unique_pending_id: {}, old_proc_checkpoint_unique_id: {}",
+            self.ids.unique_pending_id, self.ids.proc_checkpoint_unique_id
+        );
+        println!(
+            "old_gathering_unique_pending_id: {}, old_gathering_proc_checkpoint_unique_id: {}",
+            self.ids.gathering_unique_pending_id, self.ids.gathering_proc_checkpoint_unique_id
+        );
         // 1. ID rotation logic
         let (new_unique_pending_id, new_core_proc_unique_pending_id) = self.db.inc_unique_pending_id(1).await?;
 
@@ -410,9 +418,6 @@ impl<
         // 4. Create consumers for gathering proc_checkpoint_unique_id, and also for processing if it's 0 (genesis case)
         let processing_proc_id = self.ids.proc_checkpoint_unique_id;
         let should_create_processing_consumers = processing_proc_id == QCoreProcCheckpointUniqueId::from(0u128);
-
-        tracing::info!("CONSUMER_CREATION: Creating consumers for gathering proc_id: {}, realm_id: {}, realm_sub_id: {}, processing_proc_id: {}, should_create_processing: {}",
-                      unique_id, realm_id, realm_sub_id, processing_proc_id, should_create_processing_consumers);
 
         let guta_key = CoordinatorSubmitRealmGUTAUpdateQueueKey {
             realm_id, realm_sub_id, unique_id, task_group: 0,
@@ -439,8 +444,6 @@ impl<
 
         // Also create consumers for processing proc_id if it's 0 (genesis case)
         if should_create_processing_consumers {
-            tracing::info!("CONSUMER_CREATION: Also creating consumers for processing proc_id: {}", processing_proc_id);
-
             let processing_guta_key = CoordinatorSubmitRealmGUTAUpdateQueueKey {
                 realm_id, realm_sub_id, unique_id: processing_proc_id, task_group: 0,
                 queue_type: QPBaseQueueType::StandardEphemeral, _phantom_queue_item: std::marker::PhantomData::<GlobalUserTreeAggregatorHeaderWithTagValueAndJobID<N::F, N::QHash>>,
@@ -462,11 +465,7 @@ impl<
             self.register_user_queue.ensure_consumer(&processing_user_reg_key, realm_id, realm_sub_id, processing_proc_id, 0).await?;
             self.deploy_contract_queue.ensure_consumer(&processing_deploy_key, realm_id, realm_sub_id, processing_proc_id, 0).await?;
             self.proof_work_queue.ensure_consumer(&processing_proof_key, realm_id, realm_sub_id, processing_proc_id, 0).await?;
-
-            tracing::info!("CONSUMER_CREATION: Successfully created all consumers for processing proc_id: {}", processing_proc_id);
         }
-
-        tracing::info!("CONSUMER_CREATION: Successfully created all consumers for gathering proc_id: {}", unique_id);
 
         self.ids.unique_pending_id = self.ids.gathering_unique_pending_id;
         self.ids.proc_checkpoint_unique_id = self.ids.gathering_proc_checkpoint_unique_id;
@@ -477,7 +476,14 @@ impl<
         self.temp_db.set_gathering_unique_pending_ids(&self.ids.realm_identifier, self.ids.gathering_unique_pending_id, self.ids.gathering_proc_checkpoint_unique_id).await?;
         self.temp_db.set_unique_pending_ids(&self.ids.realm_identifier, self.ids.unique_pending_id, self.ids.proc_checkpoint_unique_id).await?;
 
-        tracing::info!("Coordinator rotated unique IDs and pre-created consumers for new gathering ID: {}", self.ids.gathering_unique_pending_id);
+        println!(
+            "new_unique_pending_id: {}, new_proc_checkpoint_unique_id: {}",
+            self.ids.unique_pending_id, self.ids.proc_checkpoint_unique_id
+        );
+        println!(
+            "new_gathering_unique_pending_id: {}, new_gathering_proc_checkpoint_unique_id: {}",
+            self.ids.gathering_unique_pending_id, self.ids.gathering_proc_checkpoint_unique_id
+        );
 
         Ok(())
     }

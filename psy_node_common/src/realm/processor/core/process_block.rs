@@ -127,15 +127,13 @@ where
                     realm_id, realm_sub_id, unique_id, task_group: 0,
                     queue_type: QPBaseQueueType::StandardEphemeral, _phantom_queue_item: std::marker::PhantomData::<PsyRealmUserUpdateQueueItem<N::F, N::QHash>>,
                 };
-
-                self.db.guta_update_queue.ensure_consumer(&guta_processing_key, realm_id, realm_sub_id, unique_id, 0).await?;
-
                 // Proof Worker queues
                 let proof_processing_key = RealmProvingWorkQueueKey {
                     realm_id, realm_sub_id, unique_id, task_group: 0,
                     queue_type: QPBaseQueueType::WorkerQueue, _phantom_queue_item: std::marker::PhantomData::<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>,
                 };
 
+                self.db.guta_update_queue.ensure_consumer(&guta_processing_key, realm_id, realm_sub_id, unique_id, 0).await?;
                 self.db.proof_work_queue.ensure_consumer(&proof_processing_key, realm_id, realm_sub_id, unique_id, 0).await?;
 
                 // Special handling for genesis rotation

@@ -162,7 +162,10 @@ impl NatsJetStreamClient {
             for &job in chunk {
                 futs.push(self.jetstream.publish(subject.clone(), Bytes::copy_from_slice(&job)));
             }
-            try_join_all(futs).await?;
+            let ack_futures = try_join_all(futs).await?;
+            for ack_future in ack_futures {
+                ack_future.await?;
+            }
         }
 
         Ok(())
@@ -177,7 +180,10 @@ impl NatsJetStreamClient {
             for job in chunk.iter() {
                 futs.push(self.jetstream.publish(subject.clone(), Bytes::copy_from_slice(&job)));
             }
-            try_join_all(futs).await?;
+            let ack_futures = try_join_all(futs).await?;
+            for ack_future in ack_futures {
+                ack_future.await?;
+            }
         }
 
         Ok(())
@@ -192,7 +198,10 @@ impl NatsJetStreamClient {
             for job in chunk.iter() {
                 futs.push(self.jetstream.publish(subject.clone(), Bytes::copy_from_slice(&job[..])));
             }
-            try_join_all(futs).await?;
+            let ack_futures = try_join_all(futs).await?;
+            for ack_future in ack_futures {
+                ack_future.await?;
+            }
         }
 
         Ok(())
@@ -215,6 +224,7 @@ impl NatsJetStreamClient {
                         .publish(subject.clone(), Bytes::copy_from_slice(&job.encode_queue_item_vec()?)),
                 );
             }
+            // NOTE: This function does NOT wait for ack - only waits for publish to complete
             try_join_all(futs).await?;
         }
 
@@ -237,7 +247,10 @@ impl NatsJetStreamClient {
                         .publish(subject.clone(), Bytes::copy_from_slice(&job.encode_queue_item_vec()?)),
                 );
             }
-            try_join_all(futs).await?;
+            let ack_futures = try_join_all(futs).await?;
+            for ack_future in ack_futures {
+                ack_future.await?;
+            }
         }
 
         Ok(())
@@ -251,6 +264,7 @@ impl NatsJetStreamClient {
         println!("Publishing to subject: {}", subject);
         self.jetstream
             .publish(subject.to_string(), Bytes::copy_from_slice(&data.encode_queue_item_vec()?))
+            .await?
             .await?;
         Ok(())
     }
@@ -259,6 +273,7 @@ impl NatsJetStreamClient {
         subject: &str,
         data: QueueItem,
     ) -> anyhow::Result<()> {
+        // NOTE: This function does NOT wait for ack - only waits for publish to complete
         self.jetstream
             .publish(subject.to_string(), Bytes::copy_from_slice(&data.encode_queue_item_vec()?))
             .await?;
@@ -316,7 +331,7 @@ impl NatsJetStreamClient {
             }
         }
         if let Some(reply) = last_reply {
-            self.jetstream.publish(reply, Bytes::from_static(b"+ACK")).await?;
+            self.jetstream.publish(reply, Bytes::from_static(b"+ACK")).await?.await?;
         }
         Ok(())
     }
@@ -369,7 +384,7 @@ impl NatsJetStreamClient {
         }
         if ack_mode == JetStreamAckMode::AckBatchLast {
             if let Some(reply) = last_reply {
-                self.jetstream.publish(reply, Bytes::from_static(b"+ACK")).await?;
+                self.jetstream.publish(reply, Bytes::from_static(b"+ACK")).await?.await?;
             }
         }
         Ok(total_messages_dumped)
@@ -553,7 +568,7 @@ impl NatsJetStreamClient {
                     anyhow::bail!("Failed to get consumer info for subject: {}, durable_name: {} {:?}", subject, durable_name,e );
                 }
             }?;
-            if info.num_pending == 0 && info.num_ack_pending == 0 {
+            if info.num_pending == 0 && info.num_ack_pending == 0 && info.ack_floor.stream_sequence == info.delivered.stream_sequence {
                 println!("all jobs complete for subject: {}, durable_name: {}", subject, durable_name);
                 return Ok(());
             }else{

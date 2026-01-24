@@ -49,7 +49,6 @@ impl<
 where
     N::HasherBase: 'static + Send + Sync,
 {
-    // ... (set_new_unique_ids function is unchanged) ...
     pub async fn set_new_unique_ids(&mut self, gathering_realm_end_root: Option<N::QHash>) -> anyhow::Result<()> {
         println!(
             "old_unique_pending_id: {}, old_proc_checkpoint_unique_id: {}",
@@ -72,9 +71,6 @@ where
         let processing_proc_id = self.state.processing_proc_checkpoint_unique_id;
         let should_create_processing_consumers = processing_proc_id == QCoreProcCheckpointUniqueId::from(0u128);
 
-        tracing::info!("REALM_CONSUMER_CREATION: Creating consumers for gathering proc_id: {}, realm_id: {}, realm_sub_id: {}, processing_proc_id: {}, should_create_processing: {}",
-                      unique_id, realm_id, realm_sub_id, processing_proc_id, should_create_processing_consumers);
-
         let guta_key = RealmUserUpdateQueueKey {
             realm_id, realm_sub_id, unique_id, task_group: 0,
             queue_type: QPBaseQueueType::StandardEphemeral, _phantom_queue_item: std::marker::PhantomData::<PsyRealmUserUpdateQueueItem<N::F, N::QHash>>,
@@ -90,8 +86,6 @@ where
 
         // Also create consumers for processing proc_id if it's 0 (genesis case)
         if should_create_processing_consumers {
-            tracing::info!("REALM_CONSUMER_CREATION: Also creating consumers for processing proc_id: {}", processing_proc_id);
-
             let processing_guta_key = RealmUserUpdateQueueKey {
                 realm_id, realm_sub_id, unique_id: processing_proc_id, task_group: 0,
                 queue_type: QPBaseQueueType::StandardEphemeral, _phantom_queue_item: std::marker::PhantomData::<PsyRealmUserUpdateQueueItem<N::F, N::QHash>>,
@@ -103,8 +97,6 @@ where
 
             self.guta_update_queue.ensure_consumer(&processing_guta_key, realm_id, realm_sub_id, processing_proc_id, 0).await?;
             self.proof_work_queue.ensure_consumer(&processing_proof_key, realm_id, realm_sub_id, processing_proc_id, 0).await?;
-
-            tracing::info!("REALM_CONSUMER_CREATION: Successfully created all consumers for processing proc_id: {}", processing_proc_id);
         }
 
         self.state.finish_gathering(
@@ -139,10 +131,6 @@ where
             "new_gathering_unique_pending_id: {}, new_gathering_proc_checkpoint_unique_id: {}",
             self.state.gathering_unique_pending_id, self.state.gathering_proc_checkpoint_unique_id
         );
-
-        tracing::info!("Rotated unique IDs and pre-created consumers - processing: {}, gathering: {}",
-                      self.state.processing_unique_pending_id,
-                      self.state.gathering_unique_pending_id);
 
         Ok(())
     }

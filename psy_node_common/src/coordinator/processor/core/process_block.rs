@@ -253,6 +253,7 @@ impl<
                 self.db.deploy_contract_queue.ensure_consumer(&deploy_processing_key, realm_id, realm_sub_id, unique_id, 0).await?;
                 self.db.proof_work_queue.ensure_consumer(&proof_processing_key, realm_id, realm_sub_id, unique_id, 0).await?;
 
+                self.db.set_new_unique_ids().await?;
                 self.db.shared_status.update_status(
                     self.db.ids.gathering_unique_pending_id,
                     self.db.ids.checkpoint_id,
@@ -261,8 +262,6 @@ impl<
                     self.db.last_committed.l2_state.clone(),
                     self.db.needs_revert,
                 )?;
-
-                self.db.set_new_unique_ids().await?;
 
                 let (_, _, _) = tokio::try_join!(
                     self.guta_queue_gatherer
