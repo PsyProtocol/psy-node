@@ -56,7 +56,7 @@ where
         );
         println!(
             "old_gathering_unique_pending_id: {}, old_gathering_proc_checkpoint_unique_id: {}",
-            self.state.processing_unique_pending_id, self.state.processing_proc_checkpoint_unique_id
+            self.state.gathering_unique_pending_id, self.state.gathering_proc_checkpoint_unique_id
         );
         let (new_gathering_unique_pending_id, new_gathering_proc_checkpoint_unique_id) = self.db.inc_unique_pending_id(1).await?;
 
@@ -68,8 +68,8 @@ where
         let realm_id = self.state.realm_id_u64;
         let realm_sub_id = self.state.realm_sub_id_u64;
         let unique_id = new_gathering_proc_checkpoint_unique_id;
-        let processing_proc_id = self.state.processing_proc_checkpoint_unique_id;
-        let should_create_processing_consumers = processing_proc_id == QCoreProcCheckpointUniqueId::from(0u128);
+        let gathering_proc_id = self.state.gathering_proc_checkpoint_unique_id;
+        let should_create_genesis_consumers = gathering_proc_id == QCoreProcCheckpointUniqueId::from(0u128);
 
         let guta_key = RealmUserUpdateQueueKey {
             realm_id, realm_sub_id, unique_id, task_group: 0,
@@ -85,18 +85,18 @@ where
         self.proof_work_queue.ensure_consumer(&proof_key, realm_id, realm_sub_id, unique_id, 0).await?;
 
         // Also create consumers for processing proc_id if it's 0 (genesis case)
-        if should_create_processing_consumers {
+        if should_create_genesis_consumers {
             let processing_guta_key = RealmUserUpdateQueueKey {
-                realm_id, realm_sub_id, unique_id: processing_proc_id, task_group: 0,
+                realm_id, realm_sub_id, unique_id: gathering_proc_id, task_group: 0,
                 queue_type: QPBaseQueueType::StandardEphemeral, _phantom_queue_item: std::marker::PhantomData::<PsyRealmUserUpdateQueueItem<N::F, N::QHash>>,
             };
             let processing_proof_key = RealmProvingWorkQueueKey {
-                realm_id, realm_sub_id, unique_id: processing_proc_id, task_group: 0,
+                realm_id, realm_sub_id, unique_id: gathering_proc_id, task_group: 0,
                 queue_type: QPBaseQueueType::WorkerQueue, _phantom_queue_item: std::marker::PhantomData::<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>,
             };
 
-            self.guta_update_queue.ensure_consumer(&processing_guta_key, realm_id, realm_sub_id, processing_proc_id, 0).await?;
-            self.proof_work_queue.ensure_consumer(&processing_proof_key, realm_id, realm_sub_id, processing_proc_id, 0).await?;
+            self.guta_update_queue.ensure_consumer(&processing_guta_key, realm_id, realm_sub_id, gathering_proc_id, 0).await?;
+            self.proof_work_queue.ensure_consumer(&processing_proof_key, realm_id, realm_sub_id, gathering_proc_id, 0).await?;
         }
 
         self.state.finish_gathering(

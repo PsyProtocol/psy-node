@@ -262,6 +262,7 @@ impl<
         }
 
         let (unique_pending_id, proc_checkpoint_id) = self.temp_db.get_gathering_unique_pending_ids(&self.realm_identifier).await?;
+        println!("unique_pending_id: {}, proc_checkpoint_id: {}", unique_pending_id, proc_checkpoint_id);
         timer.lap_micros("get_gathering_unique_pending_ids");
         self.ensure_user_has_not_submitted(user_id, unique_pending_id).await?;
         timer.lap_micros("ensure_user_has_not_submitted");

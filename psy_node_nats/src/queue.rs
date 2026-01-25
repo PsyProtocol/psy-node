@@ -331,7 +331,7 @@ impl NatsJetStreamClient {
             }
         }
         if let Some(reply) = last_reply {
-            self.jetstream.publish(reply, Bytes::from_static(b"+ACK")).await?.await?;
+            self.jetstream.publish(reply, Bytes::from_static(b"+ACK")).await?;
         }
         Ok(())
     }
@@ -384,7 +384,7 @@ impl NatsJetStreamClient {
         }
         if ack_mode == JetStreamAckMode::AckBatchLast {
             if let Some(reply) = last_reply {
-                self.jetstream.publish(reply, Bytes::from_static(b"+ACK")).await?.await?;
+                self.jetstream.publish(reply, Bytes::from_static(b"+ACK")).await?;
             }
         }
         Ok(total_messages_dumped)
