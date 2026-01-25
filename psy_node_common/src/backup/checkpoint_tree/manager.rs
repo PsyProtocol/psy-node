@@ -368,7 +368,7 @@ impl<Hasher: MerkleZeroHasher<Hash>, Hash: Eq + Copy + PartialEq + Default + std
         // 5. Short-circuit if fully synced
         if self.next_backup_checkpoint_id > remote_latest_checkpoint_id {
             // We are up to date (or ahead, which is handled by reset logic above if it was invalid)
-            tracing::info!(
+            tracing::debug!(
                 "Checkpoint Backup Manager up-to-date. Local Tip: {}, Remote Tip: {}",
                 self.next_backup_checkpoint_id.saturating_sub(1),
                 remote_latest_checkpoint_id
