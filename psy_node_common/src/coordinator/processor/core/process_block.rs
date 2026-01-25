@@ -1,8 +1,16 @@
 use cf_utils::timer::TraceTimer;
-use parth_core::protocol::core_types::QNetworkTypesConfig;
+use parth_core::{
+    data::queue::queue_key::QPBaseQueueType,
+    protocol::core_types::QNetworkTypesConfig,
+};
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{
-    node::node_proving_state::PsyNodeProvingState, prepared_block::coordinator::PsyPreparedCoordinatorBlockStateUpdates, proof_input::genesis::PsyCheckpointStateTransitionGenesisCircuitInput, worker::{
+    guta::header_extended::GlobalUserTreeAggregatorHeaderWithTagValueAndJobID,
+    node::node_proving_state::PsyNodeProvingState,
+    prepared_block::coordinator::PsyPreparedCoordinatorBlockStateUpdates,
+    proof_input::genesis::PsyCheckpointStateTransitionGenesisCircuitInput,
+    v1::qdata::{contract::PsyDeployContractQueueItem, public_key::PZKPublicKeyInfo},
+    worker::{
         metadata::{PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN, PsyProvingJobMetadata},
         metadata_with_job_id::PsyProvingJobMetadataWithJobId,
     }
@@ -21,7 +29,15 @@ use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 
 use crate::{
     backup::output::coordinator_output_builder::CoordinatorOutputBuilder,
-    coordinator::{processor::PsyCoordinatorProcessor, queue_key::CoordinatorProvingWorkQueueKey},
+    coordinator::{
+        processor::PsyCoordinatorProcessor,
+        queue_key::{
+            CoordinatorProvingWorkQueueKey,
+            CoordinatorSubmitRealmGUTAUpdateQueueKey,
+            CoordinatorRegisterUserPublicKeyQueueKey,
+            CoordinatorDeployContractQueueKey,
+        },
+    },
 };
 impl<
         N: QNetworkTypesConfig<JobId = QProvingJobDataID>,
@@ -194,8 +210,8 @@ impl<
 
     pub async fn get_results_from_gatherers(&mut self) -> anyhow::Result<(
         PsyNodeProvingState,
-        Vec<Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>>, 
-        Vec<Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>>, 
+        Vec<Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>>,
+        Vec<Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>>,
         Vec<Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>>,
         CoordinatorOutputBuilder<N>
     )> {
@@ -203,6 +219,42 @@ impl<
             tracing::info!("detected gathering unique ids: gathering_proc_checkpoint_unique_id = {}, current proc_checkpoint_unique_id = {}, gathering_unique_pending_id = {}, current unique_pending_id = {}. Updating unique ids before gathering results.", self.db.ids.gathering_proc_checkpoint_unique_id, self.db.ids.proc_checkpoint_unique_id, self.db.ids.gathering_unique_pending_id, self.db.ids.unique_pending_id);
             if self.db.ids.checkpoint_id == 0 {
                 tracing::info!("At genesis checkpoint, setting unique ids ahead of genesis.");
+
+                // Ensure streams exist first  
+                self.db.guta_update_queue.ensure_stream().await?;
+                self.db.register_user_queue.ensure_stream().await?;
+                self.db.deploy_contract_queue.ensure_stream().await?;
+                self.db.proof_work_queue.ensure_stream().await?;
+
+                // Create consumers for both processing and gathering proc_checkpoint_unique_id in genesis
+                let realm_id = self.db.ids.realm_id_u64;
+                let realm_sub_id = self.db.ids.realm_sub_id_u64;
+                let unique_id = self.db.ids.proc_checkpoint_unique_id;
+
+                // Create keys for all queue types
+                let guta_processing_key = CoordinatorSubmitRealmGUTAUpdateQueueKey {
+                    realm_id, realm_sub_id, unique_id, task_group: 0,
+                    queue_type: QPBaseQueueType::StandardEphemeral, _phantom_queue_item: std::marker::PhantomData::<GlobalUserTreeAggregatorHeaderWithTagValueAndJobID<N::F, N::QHash>>,
+                };
+                let user_reg_processing_key = CoordinatorRegisterUserPublicKeyQueueKey {
+                    realm_id, realm_sub_id, unique_id, task_group: 0,
+                    queue_type: QPBaseQueueType::StandardEphemeral, _phantom_queue_item: std::marker::PhantomData::<PZKPublicKeyInfo<N::QHash>>,
+                };
+                let deploy_processing_key = CoordinatorDeployContractQueueKey {
+                    realm_id, realm_sub_id, unique_id, task_group: 0,
+                    queue_type: QPBaseQueueType::StandardEphemeral, _phantom_queue_item: std::marker::PhantomData::<PsyDeployContractQueueItem<N::F, N::QHash>>,
+                };
+                let proof_processing_key = CoordinatorProvingWorkQueueKey {
+                    realm_id, realm_sub_id, unique_id, task_group: 0,
+                    queue_type: QPBaseQueueType::WorkerQueue, _phantom_queue_item: std::marker::PhantomData::<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>,
+                };
+
+                // Create all consumers
+                self.db.guta_update_queue.ensure_consumer(&guta_processing_key, realm_id, realm_sub_id, unique_id, 0).await?;
+                self.db.register_user_queue.ensure_consumer(&user_reg_processing_key, realm_id, realm_sub_id, unique_id, 0).await?;
+                self.db.deploy_contract_queue.ensure_consumer(&deploy_processing_key, realm_id, realm_sub_id, unique_id, 0).await?;
+                self.db.proof_work_queue.ensure_consumer(&proof_processing_key, realm_id, realm_sub_id, unique_id, 0).await?;
+
                 self.db.set_new_unique_ids().await?;
                 self.db.shared_status.update_status(
                     self.db.ids.gathering_unique_pending_id,
@@ -212,6 +264,7 @@ impl<
                     self.db.last_committed.l2_state.clone(),
                     self.db.needs_revert,
                 )?;
+
                 let (_, _, _) = tokio::try_join!(
                     self.guta_queue_gatherer
                         .finalize_gathering_and_update_queue_key(self.db.ids.gathering_proc_checkpoint_unique_id),
@@ -245,7 +298,7 @@ impl<
                 .finalize_gathering_and_update_queue_key(self.db.ids.gathering_proc_checkpoint_unique_id),
         )?;
 
-        /* 
+        /*
         tracing::info!("Gathering results from GUTA, Register Users, and Deploy Contracts gatherers...");
         let guta_result = self.guta_queue_gatherer
             .finalize_gathering_and_update_queue_key(self.db.ids.gathering_proc_checkpoint_unique_id)
@@ -260,7 +313,7 @@ impl<
             .await?;
         tracing::info!("Register Users gatherer results obtained.");
         */
-        
+
         Ok(CoordinatorOutputBuilder::new(
             &self.db.ids,
             guta_result,

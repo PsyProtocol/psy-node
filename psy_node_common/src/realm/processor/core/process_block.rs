@@ -1,10 +1,14 @@
 use cf_utils::timer::TraceTimer;
-use parth_core::protocol::core_types::QNetworkTypesConfig;
+use parth_core::{
+    data::queue::queue_key::{QPBaseQueueType, PCoreSubjectQueueBase},
+    protocol::core_types::QNetworkTypesConfig,
+};
 use psy_core::job::job_id::QProvingJobDataID;
 use psy_data::{
     guta::header_extended::{GlobalUserTreeAggregatorHeaderWithTagValue, GlobalUserTreeAggregatorHeaderWithTagValueAndJobType},
     node::node_proving_state::PsyNodeProvingState,
     prepared_block::realm::PsyPreparedRealmBlockStateUpdates,
+    queue_items::realm_user_update::PsyRealmUserUpdateQueueItem,
     worker::metadata_with_job_id::PsyProvingJobMetadataWithJobId,
 };
 use psy_io::tokio::TokioLikeFileSystem;
@@ -21,7 +25,7 @@ use psy_node_core::{
 
 use crate::realm::{
     processor::{core::PsyRealmProcessor, gatherers::realm_end_cap_gatherer::RealmGUTAEndCapGathererOutput},
-    queue_key::RealmProvingWorkQueueKey,
+    queue_key::{RealmProvingWorkQueueKey, RealmUserUpdateQueueKey},
 };
 
 impl<
@@ -109,8 +113,32 @@ where
         {
             tracing::info!("Rotating unique IDs before gathering results.");
             if self.db.state.last_committed_checkpoint_id == 0 {
+                // Ensure streams exist first
+                self.db.guta_update_queue.ensure_stream().await?;
+                self.db.proof_work_queue.ensure_stream().await?;
+
+                // Create consumers for both processing and gathering proc_checkpoint_unique_id in genesis
+                let realm_id = self.db.state.realm_id_u64;
+                let realm_sub_id = self.db.state.realm_sub_id_u64;
+                let unique_id = self.db.state.processing_proc_checkpoint_unique_id;
+
+                // GUTA ephemeral queues
+                let guta_processing_key = RealmUserUpdateQueueKey {
+                    realm_id, realm_sub_id, unique_id, task_group: 0,
+                    queue_type: QPBaseQueueType::StandardEphemeral, _phantom_queue_item: std::marker::PhantomData::<PsyRealmUserUpdateQueueItem<N::F, N::QHash>>,
+                };
+                // Proof Worker queues
+                let proof_processing_key = RealmProvingWorkQueueKey {
+                    realm_id, realm_sub_id, unique_id, task_group: 0,
+                    queue_type: QPBaseQueueType::WorkerQueue, _phantom_queue_item: std::marker::PhantomData::<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>,
+                };
+
+                self.db.guta_update_queue.ensure_consumer(&guta_processing_key, realm_id, realm_sub_id, unique_id, 0).await?;
+                self.db.proof_work_queue.ensure_consumer(&proof_processing_key, realm_id, realm_sub_id, unique_id, 0).await?;
+
                 // Special handling for genesis rotation
                 self.db.set_new_unique_ids(None).await?;
+                
                 // Flush the gatherer to ensure it picks up the new IDs
                 let _ = self
                     .guta_queue_gatherer

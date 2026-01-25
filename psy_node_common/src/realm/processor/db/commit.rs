@@ -1,18 +1,22 @@
 use anyhow::Ok;
 use parth_core::{
+    QCoreProcCheckpointUniqueId,
     crypto::hash::
         merkle_proof::MerkleProofCore
     ,
     protocol::core_types::QNetworkTypesConfig,
+    data::queue::queue_key::{PCoreSubjectQueueBase, QPBaseQueueType},
 };
 use psy_core::
     job::job_id::ProvingJobCircuitType
 ;
 use psy_data::{
     prepared_block::realm::{PsyPreparedRealmBlockStateUpdates, PsyRealmCoordinatorUpdate},
+    queue_items::realm_user_update::PsyRealmUserUpdateQueueItem,
     v1::qdata::
         checkpoint_sync::PQEDCheckpointSyncInfoCompact
     ,
+    worker::metadata_with_job_id::PsyProvingJobMetadataWithJobId,
 };
 use psy_io::tokio::TokioLikeFileSystem;
 use psy_node_core::{
@@ -26,14 +30,17 @@ use psy_node_core::{
 };
 use parth_common::memory_stores::traits::PsyMemoryMerkleStoreImm;
 
-use crate::realm:: processor::db::PsyRealmDatabaseProcessor;
+use crate::realm::{
+    processor::db::PsyRealmDatabaseProcessor,
+    queue_key::{RealmUserUpdateQueueKey, RealmProvingWorkQueueKey},
+};
 
 impl<
         N: QNetworkTypesConfig,
         S: PsyRealmProcessorStore<N::F, N::QHash> + Send + Sync,
         STagTreeRewards: PsyNodeCoreRewardsTagTreeStoreWriter<N::F, N::QHash> + PsyNodeCoreRewardsTagTreeStoreReader<N::F, N::QHash> + Send + Sync,
-        GUTAUpdateQueue: QStandardEphemeralQueueSubscriber,
-        ProofWorkQueue: QStandardWorkerQueuePublisher,
+        GUTAUpdateQueue: QStandardEphemeralQueueSubscriber + Send + Sync,
+        ProofWorkQueue: QStandardWorkerQueuePublisher + Send + Sync,
         TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>,
         ProofStore: QParthProofStore,
         FileSystem: TokioLikeFileSystem + Send + Sync + 'static,
@@ -42,7 +49,6 @@ impl<
 where
     N::HasherBase: 'static + Send + Sync,
 {
-    // ... (set_new_unique_ids function is unchanged) ...
     pub async fn set_new_unique_ids(&mut self, gathering_realm_end_root: Option<N::QHash>) -> anyhow::Result<()> {
         println!(
             "old_unique_pending_id: {}, old_proc_checkpoint_unique_id: {}",
@@ -53,6 +59,46 @@ where
             self.state.processing_unique_pending_id, self.state.processing_proc_checkpoint_unique_id
         );
         let (new_gathering_unique_pending_id, new_gathering_proc_checkpoint_unique_id) = self.db.inc_unique_pending_id(1).await?;
+
+        // Ensure streams exist first
+        self.guta_update_queue.ensure_stream().await?;
+        self.proof_work_queue.ensure_stream().await?;
+
+        // Create consumers for gathering proc_checkpoint_unique_id, and also for processing if it's 0 (genesis case)
+        let realm_id = self.state.realm_id_u64;
+        let realm_sub_id = self.state.realm_sub_id_u64;
+        let unique_id = new_gathering_proc_checkpoint_unique_id;
+        let processing_proc_id = self.state.processing_proc_checkpoint_unique_id;
+        let should_create_processing_consumers = processing_proc_id == QCoreProcCheckpointUniqueId::from(0u128);
+
+        let guta_key = RealmUserUpdateQueueKey {
+            realm_id, realm_sub_id, unique_id, task_group: 0,
+            queue_type: QPBaseQueueType::StandardEphemeral, _phantom_queue_item: std::marker::PhantomData::<PsyRealmUserUpdateQueueItem<N::F, N::QHash>>,
+        };
+        let proof_key = RealmProvingWorkQueueKey {
+            realm_id, realm_sub_id, unique_id, task_group: 0,
+            queue_type: QPBaseQueueType::WorkerQueue, _phantom_queue_item: std::marker::PhantomData::<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>,
+        };
+
+        // Create consumers for gathering proc_id
+        self.guta_update_queue.ensure_consumer(&guta_key, realm_id, realm_sub_id, unique_id, 0).await?;
+        self.proof_work_queue.ensure_consumer(&proof_key, realm_id, realm_sub_id, unique_id, 0).await?;
+
+        // Also create consumers for processing proc_id if it's 0 (genesis case)
+        if should_create_processing_consumers {
+            let processing_guta_key = RealmUserUpdateQueueKey {
+                realm_id, realm_sub_id, unique_id: processing_proc_id, task_group: 0,
+                queue_type: QPBaseQueueType::StandardEphemeral, _phantom_queue_item: std::marker::PhantomData::<PsyRealmUserUpdateQueueItem<N::F, N::QHash>>,
+            };
+            let processing_proof_key = RealmProvingWorkQueueKey {
+                realm_id, realm_sub_id, unique_id: processing_proc_id, task_group: 0,
+                queue_type: QPBaseQueueType::WorkerQueue, _phantom_queue_item: std::marker::PhantomData::<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>,
+            };
+
+            self.guta_update_queue.ensure_consumer(&processing_guta_key, realm_id, realm_sub_id, processing_proc_id, 0).await?;
+            self.proof_work_queue.ensure_consumer(&processing_proof_key, realm_id, realm_sub_id, processing_proc_id, 0).await?;
+        }
+
         self.state.finish_gathering(
             gathering_realm_end_root.unwrap_or(self.state.last_committed_realm_end_root),
             self.checkpoint_tree_backup_manager.get_current_checkpoint_id_head(),
@@ -61,6 +107,7 @@ where
             new_gathering_proc_checkpoint_unique_id,
         )?;
         self.shared_state.update_from_core_state(&self.state).await?;
+
         self.temp_db
             .set_gathering_unique_pending_ids(
                 &self.state.realm_identifier,
@@ -75,6 +122,7 @@ where
                 self.state.processing_proc_checkpoint_unique_id,
             )
             .await?;
+
         println!(
             "new_unique_pending_id: {}, new_proc_checkpoint_unique_id: {}",
             self.state.processing_unique_pending_id, self.state.processing_proc_checkpoint_unique_id
@@ -113,7 +161,7 @@ where
         self.db
             .set_checkpoint_leaf_data(checkpoint_sync_info.checkpoint_id, &checkpoint_sync_info.checkpoint_leaf)
             .await?;
-        
+
         println!("committing checkpoint proof: {:?}", &previous.to_append_proof::<N::HasherBase>());
         // --- START FIX ---
         // Instead of just setting the leaf hash, ingest the full proof from the correct in-memory tree.
@@ -122,7 +170,7 @@ where
             .checkpoint_tree_injest_merkle_proof(checkpoint_sync_info.checkpoint_id, &previous.to_append_proof::<N::HasherBase>())
             .await?;
         // --- END FIX ---
-        
+
         self.db
             .set_checkpoint_root_hash_to_id_mapping(checkpoint_sync_info.checkpoint_tree_root, checkpoint_sync_info.checkpoint_id)
             .await?;

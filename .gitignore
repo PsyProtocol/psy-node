@@ -17,7 +17,7 @@ Thumbs.db
 
 local_checkpoints/
 logs/
-db/
+/db
 genesis.json
 private_keys.json
 

@@ -4,14 +4,17 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use parth_core::{
     data::{
-        queue::queue_key::{PCoreQueueItemBase, PCoreStandardQueueKeyForRealm},
+        queue::queue_key::{PCoreQueueItemBase, PCoreStandardQueueKeyForRealm, QPBaseQueueType},
         serializable::{QPDPair, QPDSerializable},
     },
     utils::auto_implement::QAutoImplementGeneric,
     QCoreProcCheckpointUniqueId, QJobIdSerialized,
 };
 use psy_node_core::{
-    queue::ephemeral::{QStandardEphemeralQueuePublisher, QStandardEphemeralQueueSubscriber},
+    queue::{
+        ephemeral::{QStandardEphemeralQueuePublisher, QStandardEphemeralQueueSubscriber},
+        infrastructure::QStandardQueueBase,
+    },
     store::traits::{
         proof_store::{QParthProofStoreReader, QParthProofStoreWriter},
         temp_db::{QTempDatabaseRawCounterReaderBase, QTempDatabaseRawCounterWriterBase, QTempDatabaseRawKVReaderBase, QTempDatabaseRawKVWriterBase},
@@ -70,6 +73,24 @@ impl InMemoryTempStore {
     /// Helper to atomically get or create a queue handle.
     fn get_or_create_queue(&self, subject: &str) -> Arc<Queue> {
         self.queues.entry(subject.to_string()).or_default().clone()
+    }
+}
+
+#[async_trait]
+impl QStandardQueueBase for InMemoryTempStore {
+    async fn ensure_stream(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn ensure_consumer<QK: PCoreStandardQueueKeyForRealm>(
+        &self,
+        _queue_key: &QK,
+        _realm_id: u64,
+        _realm_sub_id: u64,
+        _unique_id: QCoreProcCheckpointUniqueId,
+        _task_group: u32,
+    ) -> anyhow::Result<()> {
+        Ok(())
     }
 }
 
@@ -207,6 +228,7 @@ impl QStandardEphemeralQueuePublisher for InMemoryTempStore {
         let refs: Vec<&QK::QueueItem> = items.iter().collect();
         self.publish_many_ephemeral_queue_items_ref(queue_key, realm_id, realm_sub_id, unique_id, task_group, &refs).await
     }
+
 }
 
 #[async_trait]
@@ -324,6 +346,7 @@ impl QStandardEphemeralQueueSubscriber for InMemoryTempStore {
             Ok(None)
         }
     }
+
 }
 
 #[async_trait]
@@ -365,7 +388,7 @@ impl QTempDatabaseRawKVReaderBase for InMemoryTempStore {
     async fn qtdb_raw_kv_get_value(&self, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
         Ok(self.kv_store.get(key).map(|r| r.value().clone()))
     }
-    
+
     async fn qtdb_raw_kv_get_many_values_vec_owned(&self, keys: Vec<Vec<u8>>) -> anyhow::Result<Vec<Option<Vec<u8>>>> {
         let result = keys.iter().map(|key| self.kv_store.get(key).map(|r| r.value().clone())).collect();
         Ok(result)

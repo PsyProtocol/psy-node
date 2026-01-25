@@ -1,6 +1,7 @@
 use std::{
     sync::Arc,
     time::{Duration, Instant},
+    collections::HashMap,
 };
 
 use async_nats::{
@@ -8,7 +9,9 @@ use async_nats::{
         self, consumer::{PullConsumer, pull::Config as PullConfig}, kv::Store
     }
 };
+use tokio::sync::RwLock;
 use async_trait::async_trait;
+use moka::future::Cache;
 use bytes::Bytes;
 use cf_utils::timer::DebugTimer;
 use futures::{future::try_join_all, stream::StreamExt};
@@ -17,6 +20,7 @@ use parth_core::{
     QCoreProcCheckpointUniqueId,
 };
 use psy_node_core::queue::{
+    infrastructure::QStandardQueueBase,
     ephemeral::{QStandardEphemeralQueuePublisher, QStandardEphemeralQueueSubscriber},
     worker_queue::{QStandardWorkerQueuePublisher, QStandardWorkerQueueSubscriber},
 };
@@ -35,6 +39,7 @@ pub struct NatsJetStreamClient {
     pub worker_queue_pull_config: PullConfig,
     pub standard_jet_stream_config: jetstream::stream::Config,
     kv: Store,
+    consumer_cache: Cache<String, PullConsumer>,
 }
 
 impl NatsJetStreamClient {
@@ -64,6 +69,11 @@ impl NatsJetStreamClient {
             }
         };
 
+        let consumer_cache = Cache::builder()
+            .max_capacity(100)
+            .time_to_idle(Duration::from_secs(300))
+            .build();
+
         Ok(Self {
             base_namespace,
             jetstream,
@@ -72,6 +82,7 @@ impl NatsJetStreamClient {
             worker_queue_pull_config,
             standard_jet_stream_config,
             kv,
+            consumer_cache,
         })
     }
 
@@ -91,6 +102,27 @@ impl NatsJetStreamClient {
 
         Ok(())
     }
+
+    async fn get_consumer_cached(&self, durable_name: &str) -> anyhow::Result<PullConsumer> {
+        let cache_key = format!("{}:{}", self.stream_name, durable_name);
+
+        if let Some(consumer) = self.consumer_cache.get(&cache_key).await {
+            return Ok(consumer);
+        }
+
+        match self
+            .jetstream
+            .get_consumer_from_stream::<PullConfig, _, _>(durable_name, &self.stream_name)
+            .await
+        {
+            Ok(consumer) => {
+                self.consumer_cache.insert(cache_key, consumer.clone()).await;
+                Ok(consumer)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
     pub fn get_pull_config_for_queue_type(&self, queue_type: QPBaseQueueType) -> PullConfig {
         match queue_type {
             QPBaseQueueType::StandardEphemeral => self.standard_ephemeral_queue_pull_config.clone(),
@@ -99,23 +131,20 @@ impl NatsJetStreamClient {
     }
 
     pub async fn ensure_consumer(&self, subject: &str, durable_name: &str, queue_type: QPBaseQueueType) -> anyhow::Result<()> {
+        let cache_key = format!("{}:{}", self.stream_name, durable_name);
+
+        if self.consumer_cache.get(&cache_key).await.is_some() {
+            return Ok(());
+        }
+
         let config = PullConfig {
             durable_name: Some(durable_name.to_string()),
             filter_subject: subject.to_string(),
             ..self.get_pull_config_for_queue_type(queue_type)
         };
 
-        if let Err(err) = self
-            .jetstream
-            .get_consumer_from_stream::<PullConfig, _, _>(durable_name, &self.stream_name)
-            .await
-        {
-            if !err.to_string().to_lowercase().contains("not found") {
-                return Err(err.into());
-            }
-            self.jetstream.create_consumer_on_stream(config, &self.stream_name).await?;
-        }
-
+        let consumer = self.jetstream.create_consumer_on_stream(config, &self.stream_name).await?;
+        self.consumer_cache.insert(cache_key, consumer).await;
         Ok(())
     }
 
@@ -124,7 +153,6 @@ impl NatsJetStreamClient {
         self.ensure_consumer(subject, durable_name, queue_type).await
     }
     pub async fn push_messages_dq_bytes(&self, subject: &str, data: &[&[u8]]) -> anyhow::Result<()> {
-        self.ensure_stream().await?;
 
         const BATCH_SIZE: usize = 1000; // Adjust based on testing; 1000-5000 is a good starting point
         let subject = subject.to_string();
@@ -134,13 +162,15 @@ impl NatsJetStreamClient {
             for &job in chunk {
                 futs.push(self.jetstream.publish(subject.clone(), Bytes::copy_from_slice(&job)));
             }
-            try_join_all(futs).await?;
+            let ack_futures = try_join_all(futs).await?;
+            for ack_future in ack_futures {
+                ack_future.await?;
+            }
         }
 
         Ok(())
     }
     pub async fn push_messages_dq_bytes_vec(&self, subject: &str, data: &[Vec<u8>]) -> anyhow::Result<()> {
-        self.ensure_stream().await?;
 
         const BATCH_SIZE: usize = 1000; // Adjust based on testing; 1000-5000 is a good starting point
         let subject = subject.to_string();
@@ -150,13 +180,15 @@ impl NatsJetStreamClient {
             for job in chunk.iter() {
                 futs.push(self.jetstream.publish(subject.clone(), Bytes::copy_from_slice(&job)));
             }
-            try_join_all(futs).await?;
+            let ack_futures = try_join_all(futs).await?;
+            for ack_future in ack_futures {
+                ack_future.await?;
+            }
         }
 
         Ok(())
     }
     pub async fn push_messages_dq_bytes_sized<const N: usize>(&self, subject: &str, data: &[[u8; N]]) -> anyhow::Result<()> {
-        self.ensure_stream().await?;
 
         const BATCH_SIZE: usize = 1000; // Adjust based on testing; 1000-5000 is a good starting point
         let subject = subject.to_string();
@@ -166,7 +198,10 @@ impl NatsJetStreamClient {
             for job in chunk.iter() {
                 futs.push(self.jetstream.publish(subject.clone(), Bytes::copy_from_slice(&job[..])));
             }
-            try_join_all(futs).await?;
+            let ack_futures = try_join_all(futs).await?;
+            for ack_future in ack_futures {
+                ack_future.await?;
+            }
         }
 
         Ok(())
@@ -177,7 +212,6 @@ impl NatsJetStreamClient {
         subject: &str,
         data: &[&QueueItem],
     ) -> anyhow::Result<()> {
-        self.ensure_stream().await?;
 
         const BATCH_SIZE: usize = 1000; // Adjust based on testing; 1000-5000 is a good starting point
         let subject = subject.to_string();
@@ -190,6 +224,7 @@ impl NatsJetStreamClient {
                         .publish(subject.clone(), Bytes::copy_from_slice(&job.encode_queue_item_vec()?)),
                 );
             }
+            // NOTE: This function does NOT wait for ack - only waits for publish to complete
             try_join_all(futs).await?;
         }
 
@@ -200,7 +235,6 @@ impl NatsJetStreamClient {
         subject: &str,
         data: &[QueueItem],
     ) -> anyhow::Result<()> {
-        self.ensure_stream().await?;
 
         const BATCH_SIZE: usize = 1000; // Adjust based on testing; 1000-5000 is a good starting point
         let subject = subject.to_string();
@@ -213,7 +247,10 @@ impl NatsJetStreamClient {
                         .publish(subject.clone(), Bytes::copy_from_slice(&job.encode_queue_item_vec()?)),
                 );
             }
-            try_join_all(futs).await?;
+            let ack_futures = try_join_all(futs).await?;
+            for ack_future in ack_futures {
+                ack_future.await?;
+            }
         }
 
         Ok(())
@@ -224,10 +261,10 @@ impl NatsJetStreamClient {
         subject: &str,
         data: &QueueItem,
     ) -> anyhow::Result<()> {
-        self.ensure_stream().await?;
         println!("Publishing to subject: {}", subject);
         self.jetstream
             .publish(subject.to_string(), Bytes::copy_from_slice(&data.encode_queue_item_vec()?))
+            .await?
             .await?;
         Ok(())
     }
@@ -236,7 +273,7 @@ impl NatsJetStreamClient {
         subject: &str,
         data: QueueItem,
     ) -> anyhow::Result<()> {
-        self.ensure_stream().await?;
+        // NOTE: This function does NOT wait for ack - only waits for publish to complete
         self.jetstream
             .publish(subject.to_string(), Bytes::copy_from_slice(&data.encode_queue_item_vec()?))
             .await?;
@@ -251,15 +288,10 @@ impl NatsJetStreamClient {
         max_messages_total_to_dump: usize,
         data_vec: &mut Vec<QK::QueueItem>,
     ) -> anyhow::Result<()> {
-        self.ensure_stream().await?;
-        self.ensure_consumer(subject, &durable_name, QPBaseQueueType::StandardEphemeral).await?;
         let size_hint = QK::QueueItem::get_size_hint();
         let has_fixed_size = QK::QueueItem::has_fixed_size() && size_hint > 0;
 
-        let consumer: PullConsumer = self
-            .jetstream
-            .get_consumer_from_stream::<PullConfig, _, _>(&durable_name, &self.stream_name)
-            .await?;
+        let consumer = self.get_consumer_cached(&durable_name).await?;
         let mut messages = consumer
             .fetch()
             .max_messages(max_messages_per_batch.min(max_messages_total_to_dump))
@@ -299,7 +331,7 @@ impl NatsJetStreamClient {
             }
         }
         if let Some(reply) = last_reply {
-            self.jetstream.publish(reply, Bytes::from_static(b"+ACK")).await?;
+            self.jetstream.publish(reply, Bytes::from_static(b"+ACK")).await?.await?;
         }
         Ok(())
     }
@@ -314,15 +346,10 @@ impl NatsJetStreamClient {
         expected_size: Option<usize>,
         bytes_vec: &mut Vec<Vec<u8>>,
     ) -> anyhow::Result<usize> {
-        self.ensure_stream().await?;
-        self.ensure_consumer(subject, &durable_name, QPBaseQueueType::StandardEphemeral).await?;
         let has_expected_size = expected_size.is_some();
         let real_expected_size = expected_size.unwrap_or(0);
 
-        let consumer: PullConsumer = self
-            .jetstream
-            .get_consumer_from_stream::<PullConfig, _, _>(&durable_name, &self.stream_name)
-            .await?;
+        let consumer = self.get_consumer_cached(&durable_name).await?;
         let mut messages = consumer.fetch().max_messages(max_messages_per_batch).messages().await?;
         let mut total_messages_dumped = 0;
         if max_messages_total_to_dump == 0 {
@@ -357,7 +384,7 @@ impl NatsJetStreamClient {
         }
         if ack_mode == JetStreamAckMode::AckBatchLast {
             if let Some(reply) = last_reply {
-                self.jetstream.publish(reply, Bytes::from_static(b"+ACK")).await?;
+                self.jetstream.publish(reply, Bytes::from_static(b"+ACK")).await?.await?;
             }
         }
         Ok(total_messages_dumped)
@@ -369,14 +396,8 @@ impl NatsJetStreamClient {
         durable_name: &str,
         ack_mode: JetStreamAckMode,
     ) -> anyhow::Result<Option<Vec<u8>>> {
-        self.ensure_stream().await?;
 
-        self.ensure_consumer(subject, durable_name, QPBaseQueueType::StandardEphemeral).await?;
-
-        let consumer: PullConsumer = self
-            .jetstream
-            .get_consumer_from_stream::<PullConfig, _, _>(&durable_name, &self.stream_name)
-            .await?;
+        let consumer = self.get_consumer_cached(&durable_name).await?;
 
         let request = consumer.fetch().max_messages(1);
         let mut messages = request.messages().await?;
@@ -399,14 +420,8 @@ impl NatsJetStreamClient {
         durable_name: &str,
         ack_mode: JetStreamAckMode,
     ) -> anyhow::Result<Option<QueueItem>> {
-        self.ensure_stream().await?;
 
-        self.ensure_consumer(subject, durable_name, QPBaseQueueType::StandardEphemeral).await?;
-
-        let consumer: PullConsumer = self
-            .jetstream
-            .get_consumer_from_stream::<PullConfig, _, _>(&durable_name, &self.stream_name)
-            .await?;
+        let consumer = self.get_consumer_cached(&durable_name).await?;
 
         let request = consumer.fetch().max_messages(1);
         let mut messages = request.messages().await?;
@@ -429,19 +444,10 @@ impl NatsJetStreamClient {
         subject: &str,
         durable_name: &str,
     ) -> anyhow::Result<Option<QK::QueueItem>> {
-
         let mut timer = DebugTimer::new("get_next_worker_queue_item_or_none");
 
-        self.ensure_stream().await?;
-
-        timer.lap("ensure_stream");
-        self.ensure_consumer(subject, durable_name, queue_key.get_queue_type()).await?;
-        timer.lap("ensure_consumer");
         /*tracing::info!("Getting message for worker queue, subject: {}, durable_name: {}", subject, durable_name);*/
-        let consumer: PullConsumer = self
-            .jetstream
-            .get_consumer_from_stream::<PullConfig, _, _>(&durable_name, &self.stream_name)
-            .await?;
+        let consumer = self.get_consumer_cached(&durable_name).await?;
         timer.lap("get_consumer_from_stream");
         let request = consumer.fetch().max_messages(1);
         let mut messages = request.messages().await?;
@@ -502,7 +508,7 @@ impl NatsJetStreamClient {
             return Ok(false);
         }
     }
-    /* 
+    /*
     pub async fn report_message_completed_dq(&self, subject: &str, report_id: &[u8]) -> anyhow::Result<bool> {
         let kv_key = format!("{}.{}", subject, hex::encode(report_id));
         if let Some(reply_bytes) = self.kv.get(&kv_key).await? {
@@ -543,16 +549,12 @@ impl NatsJetStreamClient {
         queue_type: QPBaseQueueType,
         timeout_ms: u64,
     ) -> anyhow::Result<()> {
-        self.ensure_stream_consumer(subject, durable_name, queue_type).await?;
         println!("waiting until all jobs complete for subject: {}, durable_name: {}", subject, durable_name);
         let start = Instant::now();
         let max_wait: Duration = Duration::from_millis(timeout_ms);
 
         loop {
-            let mut consumer: PullConsumer = match self
-                .jetstream
-                .get_consumer_from_stream::<PullConfig, _, _>(&durable_name, &self.stream_name)
-                .await {
+            let mut consumer = match self.get_consumer_cached(&durable_name).await {
                 Ok(c) => anyhow::Ok(c),
                 Err(e) => {
                     tracing::error!("Failed to get consumer: {}", e);
@@ -566,7 +568,7 @@ impl NatsJetStreamClient {
                     anyhow::bail!("Failed to get consumer info for subject: {}, durable_name: {} {:?}", subject, durable_name,e );
                 }
             }?;
-            if info.num_pending == 0 && info.num_ack_pending == 0 {
+            if info.num_pending == 0 && info.num_ack_pending == 0 && info.ack_floor.stream_sequence == info.delivered.stream_sequence {
                 println!("all jobs complete for subject: {}, durable_name: {}", subject, durable_name);
                 return Ok(());
             }else{
@@ -581,6 +583,56 @@ impl NatsJetStreamClient {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
+}
+
+#[async_trait]
+impl QStandardQueueBase for NatsJetStreamClient {
+    async fn ensure_stream(&self) -> anyhow::Result<()> {
+        let stream_config = jetstream::stream::Config {
+            name: self.stream_name.clone(),
+            subjects: vec![format!("{}.>", &self.base_namespace)],
+            ..self.standard_jet_stream_config.clone()
+        };
+
+        if let Err(err) = self.jetstream.get_stream(&self.stream_name).await {
+            if !err.to_string().to_lowercase().contains("not found") {
+                return Err(err.into());
+            }
+            self.jetstream.create_stream(stream_config).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn ensure_consumer<QK: PCoreStandardQueueKeyForRealm>(
+        &self,
+        queue_key: &QK,
+        realm_id: u64,
+        realm_sub_id: u64,
+        unique_id: QCoreProcCheckpointUniqueId,
+        task_group: u32,
+    ) -> anyhow::Result<()> {
+        let subject = queue_key.get_queue_subject(&self.base_namespace, realm_id, realm_sub_id, unique_id, task_group);
+        let durable_name = queue_key.get_durable_name(&self.base_namespace, realm_id, realm_sub_id, unique_id, task_group);
+        let queue_type = queue_key.get_queue_type();
+
+        let cache_key = format!("{}:{}", self.stream_name, durable_name);
+
+        if self.consumer_cache.get(&cache_key).await.is_some() {
+            return Ok(());
+        }
+
+        let config = PullConfig {
+            durable_name: Some(durable_name.to_string()),
+            filter_subject: subject.to_string(),
+            ..self.get_pull_config_for_queue_type(queue_type)
+        };
+
+        let consumer = self.jetstream.create_consumer_on_stream(config, &self.stream_name).await?;
+        self.consumer_cache.insert(cache_key, consumer).await;
+        Ok(())
+    }
+
 }
 
 #[async_trait]
@@ -833,13 +885,8 @@ impl QStandardEphemeralQueueSubscriber for NatsJetStreamClient {
 
         let real_batch_size = BATCH_SIZE.min(max_items);
         let mut total_items_dumped = 0usize;
-        self.ensure_stream().await?;
-        self.ensure_consumer(&subject, &durable_name, QPBaseQueueType::StandardEphemeral).await?;
 
-        let consumer: PullConsumer = self
-            .jetstream
-            .get_consumer_from_stream::<PullConfig, _, _>(&durable_name, &self.stream_name)
-            .await?;
+        let consumer = self.get_consumer_cached(&durable_name).await?;
         while total_items_dumped < max_items {
             let mut messages = consumer
                 .fetch()
@@ -903,6 +950,7 @@ impl QStandardEphemeralQueueSubscriber for NatsJetStreamClient {
         self.get_message_if_exists_dq_bytes_ephemeral_qi(&subject, &durable_name, JetStreamAckMode::AckEach)
             .await
     }
+
 }
 
 #[async_trait]
@@ -982,7 +1030,10 @@ impl QStandardWorkerQueuePublisher for NatsJetStreamClient {
         )
         .await
     }
+
 }
+
+
 #[async_trait]
 impl QStandardWorkerQueueSubscriber for NatsJetStreamClient {
     async fn wait_for_worker_queue_item<QK: PCoreStandardQueueKeyForRealm>(
@@ -1026,15 +1077,10 @@ impl QStandardWorkerQueueSubscriber for NatsJetStreamClient {
         }
         let subject = queue_key.get_queue_subject(&self.base_namespace, realm_id, realm_sub_id, unique_id, task_group);
         let durable_name = queue_key.get_durable_name(&self.base_namespace, realm_id, realm_sub_id, unique_id, task_group);
-        self.ensure_stream().await?;
-        self.ensure_consumer(&subject, &durable_name, QPBaseQueueType::StandardEphemeral).await?;
         let size_hint = QK::QueueItem::get_size_hint();
         let has_fixed_size = QK::QueueItem::has_fixed_size() && size_hint > 0;
 
-        let consumer: PullConsumer = self
-            .jetstream
-            .get_consumer_from_stream::<PullConfig, _, _>(&durable_name, &self.stream_name)
-            .await?;
+        let consumer = self.get_consumer_cached(&durable_name).await?;
         const BATCH_SIZE: usize = 1000;
         let max_messages_per_batch = BATCH_SIZE.min(max_items);
         let max_messages_total_to_dump = max_items;

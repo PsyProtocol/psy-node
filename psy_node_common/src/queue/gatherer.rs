@@ -245,7 +245,8 @@ pub async fn gatherer_runner<
             anyhow::bail!("GATHERER: Error creating new builder for queue topic ID {QUEUE_TOPIC_ID}");
         }
         let mut builder = builder.unwrap();
-        tracing::info!("GATHERER: Starting new gathering phase.");
+        tracing::info!("GATHERER: Starting new gathering phase with unique_id: {}, realm_id: {}, realm_sub_id: {}",
+                      queue_key.unique_id, queue_key.realm_id, queue_key.realm_sub_id);
         if trigger_rx.is_closed() {
             tracing::info!("GATHERER_{QUEUE_TOPIC_ID}: Trigger channel closed before gathering started, stopping gatherer.");
             return Ok(());
@@ -338,20 +339,21 @@ pub async fn gatherer_runner_for_tree<
             anyhow::bail!("GATHERER_{QUEUE_TOPIC_ID}: Error creating new builder");
         }
         let mut builder = builder.unwrap();
-        tracing::info!("GATHERER_{QUEUE_TOPIC_ID}: Starting new gathering phase.");
+        tracing::info!("GATHERER_{QUEUE_TOPIC_ID}: Starting new gathering phase with unique_id: {}, realm_id: {}, realm_sub_id: {}",
+                      queue_key.unique_id, queue_key.realm_id, queue_key.realm_sub_id);
         if trigger_rx.is_closed() {
             tracing::info!("GATHERER_{QUEUE_TOPIC_ID}: Trigger channel closed before gathering started, stopping gatherer.");
             return Ok(());
         }
         'gathering: loop {
-            /* 
+            /*
             if trigger_rx.is_closed() {
                 tracing::info!("GATHERER_{QUEUE_TOPIC_ID}: Trigger channel closed, stopping gatherer.");
                 return Ok(());
             }
             */
             //tracing::info!("GATHERER_{QUEUE_TOPIC_ID}: Waiting for messages or trigger...");
-            
+
             tokio::select! {
                 // Biased ensures we check for a processor trigger first for better responsiveness.
                 biased;

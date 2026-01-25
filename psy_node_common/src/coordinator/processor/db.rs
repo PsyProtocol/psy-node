@@ -7,6 +7,8 @@ use parth_core::{
         traits::{MerkleZeroHasher, QFieldHashable, ZeroableHash},
     }, data::queue::queue_key::{QPBaseQueueType, QPStandardUniqueIdQueueKey}, generic_traits::psy_debug_printable::PsyDebugPrintable, node::realm_identifier::QRealmIdentifier, protocol::core_types::{Q256BitHash, QNetworkTypesConfig}
 };
+use crate::coordinator::queue_key::{CoordinatorSubmitRealmGUTAUpdateQueueKey, CoordinatorRegisterUserPublicKeyQueueKey, CoordinatorDeployContractQueueKey, CoordinatorProvingWorkQueueKey};
+
 use psy_core::{
     constants::stale_checkpoint::STALE_CHECKPOINT_AGE_REALM_TO_COORDINATOR_PROOF,
     job::job_id::{ProvingJobCircuitType, QProvingJobDataID},
@@ -22,6 +24,7 @@ use psy_data::{
         verifiable_checkpoint_transition::{PsyVerifiableCheckpointTransition, PsyVerifiableCheckpointTransitionWithProof},
     },
     v1::qdata::{checkpoint::QEDL2BlockState, contract::PsyDeployContractQueueItem, public_key::PZKPublicKeyInfo},
+    worker::metadata_with_job_id::PsyProvingJobMetadataWithJobId,
 };
 use psy_io::tokio::TokioLikeFileSystem;
 use psy_node_core::{
@@ -35,15 +38,12 @@ use psy_node_core::{
 };
 
 use crate::{
-    backup::{checkpoint_tree::{CheckpointTreeBackupManager}, coordinator::generate_coordinator_output_from_backups},
+    backup::{checkpoint_tree::CheckpointTreeBackupManager, coordinator::generate_coordinator_output_from_backups},
     constants::queue::{
         PQ_COORDINATOR_DEPLOY_CONTRACT_QUEUE_TOPIC_ID, PQ_COORDINATOR_REGISTER_USER_PUBLIC_KEY_QUEUE_TOPIC_ID,
         PQ_COORDINATOR_SUBMIT_REALM_GUTA_UPDATE_QUEUE_TOPIC_ID,
     },
-    coordinator::{
-        processor::processor_shared_status::{PsyCoordinatorProcessorSharedStatus, PsyCoordinatorProcessorSharedStatusWrapper},
-        queue_key::CoordinatorProvingWorkQueueKey,
-    },
+    coordinator::processor::processor_shared_status::{PsyCoordinatorProcessorSharedStatus, PsyCoordinatorProcessorSharedStatusWrapper},
     queue::gatherer::QueueKeyStatusManager,
 };
 #[derive(Debug, Clone, PartialEq, Eq, Copy)]
@@ -393,25 +393,97 @@ impl<
         self.db.get_current_unique_pending_id().await
     }
     pub async fn set_new_unique_ids(&mut self) -> anyhow::Result<()> {
-        //println!("old_unique_pending_id: {}, old_proc_checkpoint_unique_id: {}", self.ids.unique_pending_id, self.ids.proc_checkpoint_unique_id);
-        //println!("old_gathering_unique_pending_id: {}, old_gathering_proc_checkpoint_unique_id: {}", self.ids.gathering_unique_pending_id, self.ids.gathering_proc_checkpoint_unique_id);
+        println!(
+            "old_unique_pending_id: {}, old_proc_checkpoint_unique_id: {}",
+            self.ids.unique_pending_id, self.ids.proc_checkpoint_unique_id
+        );
+        println!(
+            "old_gathering_unique_pending_id: {}, old_gathering_proc_checkpoint_unique_id: {}",
+            self.ids.gathering_unique_pending_id, self.ids.gathering_proc_checkpoint_unique_id
+        );
+        // 1. ID rotation logic
         let (new_unique_pending_id, new_core_proc_unique_pending_id) = self.db.inc_unique_pending_id(1).await?;
+
+        // 2. Ensure streams exist
+        self.guta_update_queue.ensure_stream().await?;
+        self.register_user_queue.ensure_stream().await?;
+        self.deploy_contract_queue.ensure_stream().await?;
+        self.proof_work_queue.ensure_stream().await?;
+
+        // 3. Only create consumers for new gathering unique_id
+        let realm_id = self.ids.realm_id_u64;
+        let realm_sub_id = self.ids.realm_sub_id_u64;
+        let unique_id = new_core_proc_unique_pending_id;
+
+        // 4. Create consumers for gathering proc_checkpoint_unique_id, and also for processing if it's 0 (genesis case)
+        let processing_proc_id = self.ids.proc_checkpoint_unique_id;
+        let should_create_processing_consumers = processing_proc_id == QCoreProcCheckpointUniqueId::from(0u128);
+
+        let guta_key = CoordinatorSubmitRealmGUTAUpdateQueueKey {
+            realm_id, realm_sub_id, unique_id, task_group: 0,
+            queue_type: QPBaseQueueType::StandardEphemeral, _phantom_queue_item: std::marker::PhantomData::<GlobalUserTreeAggregatorHeaderWithTagValueAndJobID<N::F, N::QHash>>,
+        };
+        let user_reg_key = CoordinatorRegisterUserPublicKeyQueueKey {
+            realm_id, realm_sub_id, unique_id, task_group: 0,
+            queue_type: QPBaseQueueType::StandardEphemeral, _phantom_queue_item: std::marker::PhantomData::<PZKPublicKeyInfo<N::QHash>>,
+        };
+        let deploy_key = CoordinatorDeployContractQueueKey {
+            realm_id, realm_sub_id, unique_id, task_group: 0,
+            queue_type: QPBaseQueueType::StandardEphemeral, _phantom_queue_item: std::marker::PhantomData::<PsyDeployContractQueueItem<N::F, N::QHash>>,
+        };
+        let proof_key = CoordinatorProvingWorkQueueKey {
+            realm_id, realm_sub_id, unique_id, task_group: 0,
+            queue_type: QPBaseQueueType::WorkerQueue, _phantom_queue_item: std::marker::PhantomData::<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>,
+        };
+
+        // Create consumers for gathering proc_id
+        self.guta_update_queue.ensure_consumer(&guta_key, realm_id, realm_sub_id, unique_id, 0).await?;
+        self.register_user_queue.ensure_consumer(&user_reg_key, realm_id, realm_sub_id, unique_id, 0).await?;
+        self.deploy_contract_queue.ensure_consumer(&deploy_key, realm_id, realm_sub_id, unique_id, 0).await?;
+        self.proof_work_queue.ensure_consumer(&proof_key, realm_id, realm_sub_id, unique_id, 0).await?;
+
+        // Also create consumers for processing proc_id if it's 0 (genesis case)
+        if should_create_processing_consumers {
+            let processing_guta_key = CoordinatorSubmitRealmGUTAUpdateQueueKey {
+                realm_id, realm_sub_id, unique_id: processing_proc_id, task_group: 0,
+                queue_type: QPBaseQueueType::StandardEphemeral, _phantom_queue_item: std::marker::PhantomData::<GlobalUserTreeAggregatorHeaderWithTagValueAndJobID<N::F, N::QHash>>,
+            };
+            let processing_user_reg_key = CoordinatorRegisterUserPublicKeyQueueKey {
+                realm_id, realm_sub_id, unique_id: processing_proc_id, task_group: 0,
+                queue_type: QPBaseQueueType::StandardEphemeral, _phantom_queue_item: std::marker::PhantomData::<PZKPublicKeyInfo<N::QHash>>,
+            };
+            let processing_deploy_key = CoordinatorDeployContractQueueKey {
+                realm_id, realm_sub_id, unique_id: processing_proc_id, task_group: 0,
+                queue_type: QPBaseQueueType::StandardEphemeral, _phantom_queue_item: std::marker::PhantomData::<PsyDeployContractQueueItem<N::F, N::QHash>>,
+            };
+            let processing_proof_key = CoordinatorProvingWorkQueueKey {
+                realm_id, realm_sub_id, unique_id: processing_proc_id, task_group: 0,
+                queue_type: QPBaseQueueType::WorkerQueue, _phantom_queue_item: std::marker::PhantomData::<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>,
+            };
+
+            self.guta_update_queue.ensure_consumer(&processing_guta_key, realm_id, realm_sub_id, processing_proc_id, 0).await?;
+            self.register_user_queue.ensure_consumer(&processing_user_reg_key, realm_id, realm_sub_id, processing_proc_id, 0).await?;
+            self.deploy_contract_queue.ensure_consumer(&processing_deploy_key, realm_id, realm_sub_id, processing_proc_id, 0).await?;
+            self.proof_work_queue.ensure_consumer(&processing_proof_key, realm_id, realm_sub_id, processing_proc_id, 0).await?;
+        }
+
         self.ids.unique_pending_id = self.ids.gathering_unique_pending_id;
         self.ids.proc_checkpoint_unique_id = self.ids.gathering_proc_checkpoint_unique_id;
         self.ids.gathering_unique_pending_id = new_unique_pending_id;
         self.ids.gathering_proc_checkpoint_unique_id = new_core_proc_unique_pending_id;
-        self.temp_db
-            .set_gathering_unique_pending_ids(
-                &self.ids.realm_identifier,
-                self.ids.gathering_unique_pending_id,
-                self.ids.gathering_proc_checkpoint_unique_id,
-            )
-            .await?;
-        self.temp_db
-            .set_unique_pending_ids(&self.ids.realm_identifier, self.ids.unique_pending_id, self.ids.proc_checkpoint_unique_id)
-            .await?;
-        //println!("new_unique_pending_id: {}, new_proc_checkpoint_unique_id: {}", self.ids.unique_pending_id, self.ids.proc_checkpoint_unique_id);
-        //println!("new_gathering_unique_pending_id: {}, new_gathering_proc_checkpoint_unique_id: {}", self.ids.gathering_unique_pending_id, self.ids.gathering_proc_checkpoint_unique_id);
+
+        // 5. Update temp_db
+        self.temp_db.set_gathering_unique_pending_ids(&self.ids.realm_identifier, self.ids.gathering_unique_pending_id, self.ids.gathering_proc_checkpoint_unique_id).await?;
+        self.temp_db.set_unique_pending_ids(&self.ids.realm_identifier, self.ids.unique_pending_id, self.ids.proc_checkpoint_unique_id).await?;
+
+        println!(
+            "new_unique_pending_id: {}, new_proc_checkpoint_unique_id: {}",
+            self.ids.unique_pending_id, self.ids.proc_checkpoint_unique_id
+        );
+        println!(
+            "new_gathering_unique_pending_id: {}, new_gathering_proc_checkpoint_unique_id: {}",
+            self.ids.gathering_unique_pending_id, self.ids.gathering_proc_checkpoint_unique_id
+        );
 
         Ok(())
     }
