@@ -828,42 +828,14 @@ impl<
     >
 {
     async fn global_user_tree_set_top_tree_merkle_proof(&self, checkpoint_id: u64, merkle_proof: &MerkleProofCore<N::QHash>) -> anyhow::Result<()> {
-        let leaf_level = merkle_proof.siblings.len() as u8;
-        let value_node_key = SimpleMerkleNodeKey::new(leaf_level, merkle_proof.index);
-
-        let mut realm_node_sibling_key = value_node_key.sibling();
-
-        let mut merkle_nodes = merkle_proof
-            .siblings
-            .iter()
-            .map(|value| {
-                let node = SimpleMerkleNode {
-                    key: realm_node_sibling_key.clone(),
-                    value: value.clone(),
-                };
-                realm_node_sibling_key = realm_node_sibling_key.parent();
-                node
-            })
-            .collect::<Vec<_>>();
-        merkle_nodes.push(SimpleMerkleNode {
-            key: value_node_key.clone(),
-            value: merkle_proof.value.clone(),
-        });
-        merkle_nodes.push(SimpleMerkleNode {
-            key: realm_node_sibling_key.clone(),
-            value: merkle_proof.root.clone(),
-        });
-        self.global_user_tree_set_nodes(checkpoint_id, &merkle_nodes).await?;
-        Ok(())
-
-        // self.store
-        //     .db_insert_one_single_checkpointed_object(
-        //         &self.checkpointed_object_table,
-        //         CHECKPOINTED_OBJECT_TABLE_OBJ_ID_REALM_ROOT_TO_GLOBAL_USER_TREE_ROOT_MERKLE_PROOF,
-        //         checkpoint_id,
-        //         merkle_proof,
-        //     )
-        //     .await
+        self.store
+            .db_insert_one_single_checkpointed_object(
+                &self.checkpointed_object_table,
+                CHECKPOINTED_OBJECT_TABLE_OBJ_ID_REALM_ROOT_TO_GLOBAL_USER_TREE_ROOT_MERKLE_PROOF,
+                checkpoint_id,
+                merkle_proof,
+            )
+            .await
     }
 
     async fn global_user_tree_set_leaf_hash(
