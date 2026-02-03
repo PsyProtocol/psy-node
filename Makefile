@@ -7,7 +7,7 @@ BIN_PREFIX      := ./target/release/
 all: build
 
 build:
-	cargo build --release --example realm_repl --example coordinator_repl --bin psy_worker_cli --bin psy_node_cli
+	cargo build --release --example realm_repl --example coordinator_repl --bin psy_worker_cli --bin psy_node_cli --bin psy_dev_cli
 
 clean:
 	cargo clean

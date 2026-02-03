@@ -1,0 +1,71 @@
+[package]
+edition = "2021"
+name    = "psy_dev_cli"
+version = "0.1.0"
+
+[lib]
+name = "psy_dev_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "psy_dev_cli"
+path = "src/main.rs"
+
+[features]
+default = ["std", "parth_core/serialize_rkyv", "parth_core/serialize_speedy", "parth_core/serialize_postcard", "serialize_bytemuck"]
+std = ["parth_core/std", "pser/std"]
+serialize_rkyv = ["dep:rkyv","pser/serialize_rkyv", "parth_core/serialize_rkyv"]
+serialize_speedy = ["dep:speedy", "pser/serialize_speedy", "parth_core/serialize_speedy"]
+serialize_postcard = ["dep:postcard", "pser/serialize_postcard", "parth_core/serialize_postcard"]
+serialize_bytemuck = ["dep:bytemuck", "parth_core/serialize_bytemuck", "psy_data/serialize_bytemuck", "psy_serialize/serialize_bytemuck"]
+
+[dependencies]
+clap = { workspace = true }
+postcard = { workspace = true, optional = true }
+rkyv = { workspace = true, optional = true }
+speedy = { workspace = true, optional = true }
+bytemuck = { workspace = true, optional = true }
+anyhow     = { workspace = true }
+async-trait      = { workspace = true }
+serde      = { workspace = true }
+serde_json      = { workspace = true }
+serde_yaml = { workspace = true }
+serde_repr      = { workspace = true }
+serde_with      = { workspace = true }
+hex = { workspace = true }
+hex-literal = { workspace = true }
+bincode = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true}
+rand = { workspace = true }
+auto_impl = { workspace = true }
+strum = { workspace = true }
+strum_macros = { workspace = true }
+futures = { workspace = true }
+hashbrown = { workspace = true }
+dashmap = { workspace = true }
+jsonrpsee = { workspace = true }
+dotenv = { workspace = true }
+rustyline = { workspace = true }
+rustyline-derive = { workspace = true }
+plonky2 = { workspace = true }
+lazy_static = { workspace = true }
+
+# start local packages
+pser = { workspace = true }
+psy_serialize = { workspace = true }
+pderive = { workspace = true }
+cf_utils = { workspace = true }
+parth_core = { workspace = true }
+parth_crypto = { workspace = true }
+parth_common = { workspace = true }
+psy_core = { workspace = true, features = ["clap_cli"] }
+psy_common = { workspace = true }
+psy_data = { workspace = true }
+psy_io = { workspace = true }
+psy_api_core = { workspace = true }
+psy_node_core = { workspace = true, features = ["clap_cli"] }
+psy_node_common = { workspace = true }
+psy_plonky2_circuits = { workspace = true }
+psy_jtmb_testing_core = { workspace = true }
+
