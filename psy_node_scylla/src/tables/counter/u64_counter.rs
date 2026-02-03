@@ -104,6 +104,15 @@ impl ScyllaNoTabletPreparedTableStatements for ScyllaU64ToU64CounterTablePrepare
     ) -> anyhow::Result<Self> {
         Self::new_create_from_session(session, no_tablet_keyspace, table_name, table_key).await
     }
+
+    async fn prepare_only_no_tablet(
+        session: Arc<Session>,
+        keyspace: &str,
+        table_name: &str,
+        table_key: QDatabaseTableRoutingKey,
+    ) -> anyhow::Result<Self> {
+        Self::new_from_session(session, keyspace, table_name, table_key).await
+    }
 }
 
 impl ScyllaU64ToU64CounterTablePreparedStatements {

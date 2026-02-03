@@ -63,7 +63,7 @@ pub async fn run_startup_plonky2_scylla_coordinator_processor_node(config: &Coor
     match config.network {
         psy_core::constants::chain_id::PsyChainNetworkType::LocalDevnet => {
             type N = QNetworkTypesConfigHelper<QProvingJobDataID, ZKTypesPlonky2GoldilocksPoseidon, PsyNetworkLocalDevnetConstants>;
-            let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url).await?;
+            let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url, true).await?;
             let db = Arc::new(db);
             let tag_tree_rewards_store = db.clone();
             create_coordinator_processor_and_run::<N, _, _, _, _, _, _, _, _, _>(
@@ -92,7 +92,7 @@ pub async fn run_startup_plonky2_scylla_coordinator_processor_node(config: &Coor
         /*
         psy_core::constants::chain_id::PsyChainNetworkType::PsyTeamDevnet => {
             type N = QNetworkTypesConfigHelper<QProvingJobDataID, ZKTypesPlonky2GoldilocksPoseidon, PsyNetworkLocalDevnetConstants>;
-            let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url).await?;
+            let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url, true).await?;
             let db = Arc::new(db);
             let tag_tree_rewards_store = db.clone();
             create_coordinator_processor_and_run::<N, _, _, _, _, _, _, _, _, _>(
@@ -117,7 +117,7 @@ pub async fn run_startup_plonky2_scylla_coordinator_processor_node(config: &Coor
         }
         psy_core::constants::chain_id::PsyChainNetworkType::InternalDevnet => {
             type N = QNetworkTypesConfigHelper<QProvingJobDataID, ZKTypesPlonky2GoldilocksPoseidon, PsyNetworkLocalDevnetConstants>;
-            let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url).await?;
+            let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url, true).await?;
             let db = Arc::new(db);
             let tag_tree_rewards_store = db.clone();
             create_coordinator_processor_and_run::<N, _, _, _, _, _, _, _, _, _>(
@@ -142,7 +142,7 @@ pub async fn run_startup_plonky2_scylla_coordinator_processor_node(config: &Coor
         }
         psy_core::constants::chain_id::PsyChainNetworkType::InternalTestnet => {
             type N = QNetworkTypesConfigHelper<QProvingJobDataID, ZKTypesPlonky2GoldilocksPoseidon, PsyNetworkLocalDevnetConstants>;
-            let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url).await?;
+            let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url, true).await?;
             let db = Arc::new(db);
             let tag_tree_rewards_store = db.clone();
             create_coordinator_processor_and_run::<N, _, _, _, _, _, _, _, _, _>(
@@ -167,7 +167,7 @@ pub async fn run_startup_plonky2_scylla_coordinator_processor_node(config: &Coor
         }
         psy_core::constants::chain_id::PsyChainNetworkType::InternalPreProduction => {
             type N = QNetworkTypesConfigHelper<QProvingJobDataID, ZKTypesPlonky2GoldilocksPoseidon, PsyNetworkLocalDevnetConstants>;
-            let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url).await?;
+            let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url, true).await?;
             let db = Arc::new(db);
             let tag_tree_rewards_store = db.clone();
             create_coordinator_processor_and_run::<N, _, _, _, _, _, _, _, _, _>(
@@ -192,7 +192,7 @@ pub async fn run_startup_plonky2_scylla_coordinator_processor_node(config: &Coor
         }
         psy_core::constants::chain_id::PsyChainNetworkType::PsyPublicCanary => {
             type N = QNetworkTypesConfigHelper<QProvingJobDataID, ZKTypesPlonky2GoldilocksPoseidon, PsyNetworkLocalDevnetConstants>;
-            let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url).await?;
+            let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url, true).await?;
             let db = Arc::new(db);
             let tag_tree_rewards_store = db.clone();
             create_coordinator_processor_and_run::<N, _, _, _, _, _, _, _, _, _>(
@@ -217,7 +217,7 @@ pub async fn run_startup_plonky2_scylla_coordinator_processor_node(config: &Coor
         }
         psy_core::constants::chain_id::PsyChainNetworkType::PsyPublicTestnet => {
             type N = QNetworkTypesConfigHelper<QProvingJobDataID, ZKTypesPlonky2GoldilocksPoseidon, PsyNetworkLocalDevnetConstants>;
-            let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url).await?;
+            let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url, true).await?;
             let db = Arc::new(db);
             let tag_tree_rewards_store = db.clone();
             create_coordinator_processor_and_run::<N, _, _, _, _, _, _, _, _, _>(
@@ -242,7 +242,7 @@ pub async fn run_startup_plonky2_scylla_coordinator_processor_node(config: &Coor
         }
         psy_core::constants::chain_id::PsyChainNetworkType::PsyMainnet => {
             type N = QNetworkTypesConfigHelper<QProvingJobDataID, ZKTypesPlonky2GoldilocksPoseidon, PsyNetworkLocalDevnetConstants>;
-            let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url).await?;
+            let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url, true).await?;
             let db = Arc::new(db);
             let tag_tree_rewards_store = db.clone();
             create_coordinator_processor_and_run::<N, _, _, _, _, _, _, _, _, _>(
@@ -333,7 +333,7 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
     match config.network {
         psy_core::constants::chain_id::PsyChainNetworkType::LocalDevnet => {
             type N = QNetworkTypesConfigHelper<QProvingJobDataID, ZKTypesPlonky2GoldilocksPoseidon, PsyNetworkLocalDevnetConstants>;
-            let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url).await?;
+            let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url, true).await?;
             let db = Arc::new(db);
             let tag_tree_rewards_store = db.clone();
             let coordinator_client = PsyRealmCoordinatorClientAPI::<N, _>::new(
@@ -366,7 +366,7 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
         /*
         psy_core::constants::chain_id::PsyChainNetworkType::PsyTeamDevnet => {
             type N = QNetworkTypesConfigHelper<QProvingJobDataID, ZKTypesPlonky2GoldilocksPoseidon, PsyNetworkLocalDevnetConstants>;
-            let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url).await?;
+            let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url, true).await?;
             let db = Arc::new(db);
             let tag_tree_rewards_store = db.clone();
             create_coordinator_processor_and_run::<N, _, _, _, _, _, _, _, _, _>(
@@ -391,7 +391,7 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
         }
         psy_core::constants::chain_id::PsyChainNetworkType::InternalDevnet => {
             type N = QNetworkTypesConfigHelper<QProvingJobDataID, ZKTypesPlonky2GoldilocksPoseidon, PsyNetworkLocalDevnetConstants>;
-            let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url).await?;
+            let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url, true).await?;
             let db = Arc::new(db);
             let tag_tree_rewards_store = db.clone();
             create_coordinator_processor_and_run::<N, _, _, _, _, _, _, _, _, _>(
@@ -416,7 +416,7 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
         }
         psy_core::constants::chain_id::PsyChainNetworkType::InternalTestnet => {
             type N = QNetworkTypesConfigHelper<QProvingJobDataID, ZKTypesPlonky2GoldilocksPoseidon, PsyNetworkLocalDevnetConstants>;
-            let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url).await?;
+            let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url, true).await?;
             let db = Arc::new(db);
             let tag_tree_rewards_store = db.clone();
             create_coordinator_processor_and_run::<N, _, _, _, _, _, _, _, _, _>(
@@ -441,7 +441,7 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
         }
         psy_core::constants::chain_id::PsyChainNetworkType::InternalPreProduction => {
             type N = QNetworkTypesConfigHelper<QProvingJobDataID, ZKTypesPlonky2GoldilocksPoseidon, PsyNetworkLocalDevnetConstants>;
-            let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url).await?;
+            let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url, true).await?;
             let db = Arc::new(db);
             let tag_tree_rewards_store = db.clone();
             create_coordinator_processor_and_run::<N, _, _, _, _, _, _, _, _, _>(
@@ -466,7 +466,7 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
         }
         psy_core::constants::chain_id::PsyChainNetworkType::PsyPublicCanary => {
             type N = QNetworkTypesConfigHelper<QProvingJobDataID, ZKTypesPlonky2GoldilocksPoseidon, PsyNetworkLocalDevnetConstants>;
-            let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url).await?;
+            let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url, true).await?;
             let db = Arc::new(db);
             let tag_tree_rewards_store = db.clone();
             create_coordinator_processor_and_run::<N, _, _, _, _, _, _, _, _, _>(
@@ -491,7 +491,7 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
         }
         psy_core::constants::chain_id::PsyChainNetworkType::PsyPublicTestnet => {
             type N = QNetworkTypesConfigHelper<QProvingJobDataID, ZKTypesPlonky2GoldilocksPoseidon, PsyNetworkLocalDevnetConstants>;
-            let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url).await?;
+            let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url, true).await?;
             let db = Arc::new(db);
             let tag_tree_rewards_store = db.clone();
             create_coordinator_processor_and_run::<N, _, _, _, _, _, _, _, _, _>(
@@ -516,7 +516,7 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
         }
         psy_core::constants::chain_id::PsyChainNetworkType::PsyMainnet => {
             type N = QNetworkTypesConfigHelper<QProvingJobDataID, ZKTypesPlonky2GoldilocksPoseidon, PsyNetworkLocalDevnetConstants>;
-            let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url).await?;
+            let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url, true).await?;
             let db = Arc::new(db);
             let tag_tree_rewards_store = db.clone();
             create_coordinator_processor_and_run::<N, _, _, _, _, _, _, _, _, _>(

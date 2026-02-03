@@ -105,6 +105,15 @@ impl ScyllaStandardPreparedTableStatements for ScyllaU64ToU64TablePreparedStatem
     ) -> anyhow::Result<Self> {
         Self::new_create_from_session(session, keyspace, table_name, table_key).await
     }
+
+    async fn prepare_only_standard(
+        session: Arc<Session>,
+        keyspace: &str,
+        table_name: &str,
+        table_key: QDatabaseTableRoutingKey,
+    ) -> anyhow::Result<Self> {
+        Self::new_from_session(session, keyspace, table_name, table_key).await
+    }
 }
 
 impl ScyllaU64ToU64TablePreparedStatements {

@@ -99,6 +99,22 @@ impl ScyllaStandardPreparedTableStatements for ScyllaBidirectionalU64U128Mapping
         )
         .await
     }
+
+    async fn prepare_only_standard(
+        session: Arc<Session>,
+        keyspace: &str,
+        table_name: &str,
+        table_key: QDatabaseTableRoutingKey,
+    ) -> anyhow::Result<Self> {
+        Self::new_from_session(
+            session,
+            keyspace,
+            &format!("{}_u64_to_u128", table_name),
+            &format!("{}_u128_to_u64", table_name),
+            table_key,
+        )
+        .await
+    }
 }
 
 impl ScyllaBidirectionalU64U128MappingPreparedStatements {

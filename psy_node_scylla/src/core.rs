@@ -78,6 +78,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
             _phantom_hasher: std::marker::PhantomData,
         })
     }
+
     pub async fn init_std_table<T: ScyllaStandardPreparedTableStatements>(
         &self,
         table_name: &str,
@@ -86,6 +87,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
         println!("intializing table: {}", table_name);
         T::create_table_standard(self.session.clone(), &self.keyspace, table_name, table_key).await
     }
+
     pub async fn init_no_tablet_table<T: ScyllaNoTabletPreparedTableStatements>(
         &self,
         table_name: &str,
@@ -94,6 +96,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
         println!("intializing no-tablet table: {}", table_name);
         T::create_table_no_tablet(self.session.clone(), &self.no_tablet_keyspace, table_name, table_key).await
     }
+
     pub async fn init_zero_id_merkle_table(
         &self,
         table_name: &str,
@@ -102,5 +105,33 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
     ) -> anyhow::Result<ScyllaMerkleNodesZeroPreparedStatements> {
         println!("intializing zero id merkle table: {}", table_name);
         ScyllaMerkleNodesZeroPreparedStatements::new_create_from_session(self.session.clone(), &self.keyspace, table_name, table_key, tree_height).await
+    }
+
+    pub async fn init_std_table_prepare_only<T: ScyllaStandardPreparedTableStatements>(
+        &self,
+        table_name: &str,
+        table_key: QDatabaseTableRoutingKey,
+    ) -> anyhow::Result<T> {
+        println!("preparing statements for table: {}", table_name);
+        T::prepare_only_standard(self.session.clone(), &self.keyspace, table_name, table_key).await
+    }
+
+    pub async fn init_no_tablet_table_prepare_only<T: ScyllaNoTabletPreparedTableStatements>(
+        &self,
+        table_name: &str,
+        table_key: QDatabaseTableRoutingKey,
+    ) -> anyhow::Result<T> {
+        println!("preparing statements for no-tablet table: {}", table_name);
+        T::prepare_only_no_tablet(self.session.clone(), &self.no_tablet_keyspace, table_name, table_key).await
+    }
+
+    pub async fn init_zero_id_merkle_table_prepare_only(
+        &self,
+        table_name: &str,
+        table_key: QDatabaseTableRoutingKey,
+        tree_height: u8,
+    ) -> anyhow::Result<ScyllaMerkleNodesZeroPreparedStatements> {
+        println!("preparing statements for zero id merkle table: {}", table_name);
+        ScyllaMerkleNodesZeroPreparedStatements::new_from_session(self.session.clone(), &self.keyspace, table_name, table_key, tree_height).await
     }
 }

@@ -69,7 +69,7 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_edge_node(config: &Coor
     match config.network {
         psy_core::constants::chain_id::PsyChainNetworkType::LocalDevnet => {
             type N = QNetworkTypesConfigHelper<QProvingJobDataID, ZKTypesJTMBGoldilocksPoseidon, PsyNetworkLocalDevnetConstants>;
-            let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url).await?;
+            let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url, false).await?;
             let db = Arc::new(db);
             let tag_tree_rewards_store = db.clone();
             let handler = CoordinatorEdgeHandler::<N, _, _, _, _, _, _, _, _>::new(
@@ -89,7 +89,7 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_edge_node(config: &Coor
         },
         psy_core::constants::chain_id::PsyChainNetworkType::InternalDevnet => {
             type N = QNetworkTypesConfigHelper<QProvingJobDataID, ZKTypesJTMBGoldilocksPoseidon, PsyNetworkPsyTeamDevnetConstants>;
-            let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url).await?;
+            let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url, false).await?;
             let db = Arc::new(db);
             let tag_tree_rewards_store = db.clone();
             let handler = CoordinatorEdgeHandler::<N, _, _, _, _, _, _, _, _>::new(
@@ -137,7 +137,7 @@ where
     };
     let proof_verifier = Arc::new(PsyJTMBZKVerifier::<C>::new(verifier));
     let chain_id = config.network.get_chain_id();
-    let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url).await?;
+    let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url, false).await?;
     let db = Arc::new(db);
     let tag_tree_rewards_store = db.clone();
 
