@@ -60,7 +60,7 @@ where
 
             let current_slot = current_ms / 100;
 
-            if current_slot != last_slot && current_slot % 70 == 0 {
+            if current_slot != last_slot && current_slot % 60 == 0 {
                 last_slot = current_slot;
                 let start_processing_at = std::time::Instant::now();
                 tracing::debug!("[COORDINATOR] Process block starting...");

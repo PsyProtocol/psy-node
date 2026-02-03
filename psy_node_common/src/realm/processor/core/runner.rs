@@ -65,7 +65,7 @@ where
             let since_epoch = now.duration_since(std::time::UNIX_EPOCH).unwrap();
             let current_slot = since_epoch.as_millis() / 100;
 
-            if current_slot != last_slot && current_slot % 40 == 0 {
+            if current_slot != last_slot && current_slot % 30 == 0 {
                 last_slot = current_slot;
                 let start_processing_at = std::time::Instant::now();
 
