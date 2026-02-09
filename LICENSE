@@ -1,0 +1,56 @@
+Copyright (c) 2024-2026 Psy Protocol. All Rights Reserved.
+
+PROPRIETARY LICENSE - NOT FOR PRODUCTION USE
+
+This software and associated documentation files (the "Software") are the
+proprietary and confidential property of Psy Protocol.
+
+IMPORTANT SECURITY NOTICE:
+This Software is under active development and has NOT been audited or
+approved for production use. Deploying this Software in a production
+environment may result in security vulnerabilities, loss of funds, data
+loss, or other critical failures.
+
+TERMS AND CONDITIONS:
+
+1. NO PRODUCTION USE
+   You may NOT use this Software, in whole or in part, in any production
+   environment, mainnet deployment, or any system that handles real user
+   data, real funds, or real transactions until explicitly authorized in
+   writing by Psy Protocol.
+
+2. PERMITTED USE
+   This Software is provided solely for the purposes of:
+   - Development and testing in isolated, non-production environments
+   - Code review and security research
+   - Educational and evaluation purposes
+
+3. NO REDISTRIBUTION
+   You may NOT copy, modify, merge, publish, distribute, sublicense,
+   and/or sell copies of the Software without prior written permission
+   from Psy Protocol.
+
+4. NO WARRANTY
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+   EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND
+   NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
+   BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER IN AN
+   ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF, OR IN
+   CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+   SOFTWARE.
+
+5. ASSUMPTION OF RISK
+   Any use of this Software is at your own risk. The authors and
+   copyright holders assume no responsibility for any damages, including
+   but not limited to security breaches, loss of funds, or data
+   corruption, resulting from the use of this Software.
+
+6. TERMINATION
+   This license is effective until terminated. It will terminate
+   automatically if you fail to comply with any of its terms. Upon
+   termination, you must destroy all copies of the Software in your
+   possession.
+
+For inquiries regarding production licensing or security audits,
+contact Psy Protocol.
