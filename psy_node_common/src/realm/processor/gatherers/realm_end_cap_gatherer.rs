@@ -1,4 +1,5 @@
 use std::{
+    io::{Cursor, Read},
     path::PathBuf,
     sync::{Arc, RwLock},
 };
@@ -103,11 +104,18 @@ pub async fn read_realm_end_cap_gatherer_backup_file<
     }
     let mut end_root_hash_bytes = [0u8; 32];
     file.read_exact(&mut end_root_hash_bytes).await?;
-    let mut expected_end_global_user_tree_root = Hash::from_owned_32bytes(end_root_hash_bytes);
+    let expected_end_global_user_tree_root = Hash::from_owned_32bytes(end_root_hash_bytes);
 
     let expected_end_caps_processed = file.read_u64_le().await?;
 
-    let mut queue_item_buf = [0u8; 232];
+    let guta_header_size = GlobalUserTreeAggregatorHeaderWithJobId::<F, Hash>::FIXED_SIZE;
+    let end_caps_data_len = file_len
+        .saturating_sub(const_size_len)
+        .saturating_sub(guta_header_size as u64) as usize;
+    let mut end_caps_data = vec![0u8; end_caps_data_len];
+    file.read_exact(&mut end_caps_data).await?;
+
+    let mut cursor = Cursor::new(end_caps_data);
     let mut actual_end_caps_processed = 0usize;
     let mut update_user_leaves_ffs = Vec::new();
     let mut update_user_contract_tree_nodes_ffs = Vec::new();
@@ -117,11 +125,10 @@ pub async fn read_realm_end_cap_gatherer_backup_file<
     let max_user_id = ((realm_id_u64 + 1) << (realm_global_user_tree_height as u64)) - 1;
     let mut merkle_header = [0u8; QBLOB_TREE_NODE_BATCH_HEADER_SIZE];
 
-    for i in 0..expected_end_caps_processed {
-        // A. Read Fixed Queue Item
-        file.read_exact(&mut queue_item_buf).await?;
-
-        let queue_item = PsyRealmUserUpdateQueueItem::<F, Hash>::psy_ser_from_slice(&queue_item_buf)?;
+    for _ in 0..expected_end_caps_processed {
+        // A. Read variable-length queue item via stream deserialization (handles events correctly)
+        let queue_item =
+            PsyRealmUserUpdateQueueItem::<F, Hash>::pio_read_from_io(&mut cursor)?;
 
         let user_leaf_node = queue_item.new_user_leaf;
         let user_id = user_leaf_node.user_id.to_u64_value();
@@ -137,22 +144,22 @@ pub async fn read_realm_end_cap_gatherer_backup_file<
 
         // B. Read Variable Contract Blobs
         // 1. Single Tree Nodes (User Contract Tree)
-        file.read_exact(&mut merkle_header).await?;
+        Read::read_exact(&mut cursor, &mut merkle_header)?;
 
         let single_header_parsed = QBlobSingleMerkleNodeBatchDataView::try_read_single_node_blob_header(&merkle_header)?;
 
         let user_contract_tree_nodes_size = single_header_parsed.total_size as usize - QBLOB_TREE_NODE_BATCH_HEADER_SIZE;
         let mut user_contract_tree_nodes = vec![0u8; user_contract_tree_nodes_size];
-        file.read_exact(&mut user_contract_tree_nodes).await?;
+        Read::read_exact(&mut cursor, &mut user_contract_tree_nodes)?;
 
         // 2. Double Tree Nodes (Contract State Tree)
-        file.read_exact(&mut merkle_header).await?;
+        Read::read_exact(&mut cursor, &mut merkle_header)?;
 
         let double_header_parsed = QBlobDoubleMerkleNodeBatchDataView::try_read_double_node_blob_header(&merkle_header)?;
 
         let contract_state_tree_nodes_size = double_header_parsed.total_size as usize - QBLOB_TREE_NODE_BATCH_HEADER_SIZE;
         let mut contract_state_tree_nodes = vec![0u8; contract_state_tree_nodes_size];
-        file.read_exact(&mut contract_state_tree_nodes).await?;
+        Read::read_exact(&mut cursor, &mut contract_state_tree_nodes)?;
 
         // C. Apply Logic
         user_leaf_node.pio_write_to_io(&mut update_user_leaves_ffs)?;
