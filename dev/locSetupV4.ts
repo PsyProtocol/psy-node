@@ -367,8 +367,8 @@ class DevNetProcessManager {
         // 2. Start Database
         if (this.needsStartDb) {
             // Clean checkpoints when resetting database
-            console.log("[DevNet] Cleaning local checkpoints...");
-            await cleanCheckpoint('./local_checkpoints', cwd);
+            // console.log("[DevNet] Cleaning local checkpoints...");
+            // await cleanCheckpoint('./local_checkpoints', cwd);
 
             console.log("[DevNet] Killing existing docker containers...");
             killDocker();
@@ -384,7 +384,7 @@ class DevNetProcessManager {
 
         // 3. Coordinator Processor
         if (startCoordinatorProcessor) {
-            await cleanCheckpoint('./local_checkpoints/coordinator_0_0', cwd);
+            // await cleanCheckpoint('./local_checkpoints/coordinator_0_0', cwd);
             await this.track(await RunningProcess.spawnWithInitializationHintWithRetry(
                 [
                     nodeCli, 'start-coordinator-processor',
@@ -469,11 +469,11 @@ class DevNetProcessManager {
             console.log(`[DevNet] Starting ${realmsCount} realm processors and edges in parallel...`);
 
             // Clean all checkpoints first
-            console.log(`[DevNet] Cleaning checkpoints for ${realmsCount} realms...`);
-            for (let i = 0; i < realmsCount; i++) {
-                const realmId = startRealmId + i;
-                await cleanCheckpoint('./local_checkpoints/realm_' + realmId + '_1', cwd);
-            }
+            // console.log(`[DevNet] Cleaning checkpoints for ${realmsCount} realms...`);
+            // for (let i = 0; i < realmsCount; i++) {
+            //     const realmId = startRealmId + i;
+            //     await cleanCheckpoint('./local_checkpoints/realm_' + realmId + '_1', cwd);
+            // }
 
             // Start realm processors first, then edges
             for (let b = 0; b < realmsCount; b += 4) {

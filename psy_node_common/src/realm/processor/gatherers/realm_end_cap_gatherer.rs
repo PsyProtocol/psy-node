@@ -75,7 +75,18 @@ pub async fn read_realm_end_cap_gatherer_backup_file<
     coordinator_global_user_tree_height: u8,
     insert_old_leaves: bool,
 ) -> anyhow::Result<RealmGUTAEndCapGathererOutputDatabase<F, Hash>> {
-    let mut file: FileSystem::File = file_system.file_like_fs_open(&file_path).await?;
+    let mut file: FileSystem::File = match file_system.file_like_fs_open(file_path).await {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::error!(
+                "Failed to open realm backup file: path={}, realm_id={}, error={:?}",
+                file_path,
+                realm_id_u64,
+                e
+            );
+            return Err(e.into());
+        }
+    };
     let metadata = file.file_like_metadata().await?;
     let file_len = metadata.len();
     let const_size_len = 4 + 32 + 32 + 8;

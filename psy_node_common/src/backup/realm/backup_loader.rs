@@ -15,18 +15,28 @@ pub async fn generate_realm_output_from_backups<
     file_system: &FileSystem,
     guta_gatherer_backup_directory: &str,
     state: &RealmProcessorCoreState<N::QHash>,
+    restore_unique_pending_id: Option<u64>,
     global_user_tree: &mut SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>,
 ) -> anyhow::Result<PsyPreparedRealmBlockStateUpdates<N::QHash>> {
+    let pending_id = restore_unique_pending_id.unwrap_or(state.processing_unique_pending_id);
     let guta_gatherer_backup_file_path = get_new_realm_end_cap_gatherer_backup_file_path(
         guta_gatherer_backup_directory,
         state.realm_id_u64,
         state.realm_sub_id_u64,
-        state.processing_unique_pending_id,
+        pending_id,
+    );
+    let path_str = guta_gatherer_backup_file_path.to_string_lossy();
+    tracing::info!(
+        "Loading realm backup for recovery: path={}, realm_id={}, realm_sub_id={}, pending_id={}",
+        path_str,
+        state.realm_id_u64,
+        state.realm_sub_id_u64,
+        pending_id
     );
 
     let guta_gatherer_result = read_realm_end_cap_gatherer_backup_file::<N::HasherBase, N::QHash, N::F, FileSystem>(
         file_system,
-        &guta_gatherer_backup_file_path.to_string_lossy(),
+        &path_str,
         global_user_tree,
         state.realm_id_u64,
         N::REALM_GLOBAL_USER_TREE_HEIGHT,
@@ -38,7 +48,7 @@ pub async fn generate_realm_output_from_backups<
     let updates = PsyPreparedRealmBlockStateUpdates {
         realm_id: state.realm_id_u64,
         realm_sub_id: state.realm_sub_id_u64,
-        unique_pending_id: state.processing_unique_pending_id,
+        unique_pending_id: pending_id,
         proc_checkpoint_unique_id: state.processing_proc_checkpoint_unique_id,
         old_realm_root: guta_gatherer_result.old_realm_root,
         new_realm_root: guta_gatherer_result.new_realm_root,

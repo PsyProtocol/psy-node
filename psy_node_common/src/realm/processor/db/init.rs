@@ -20,7 +20,7 @@ use psy_data::{
     config::network_config::PsyNodeCircuitFingerprintConfig,
     genesis::genesis_block_setup::PsyGenesisBlockSetupData,
     node::realm_processor::{RealmProcessorCoreState, RealmProcessorCoreStateWrapper},
-    prepared_block::realm::PsyPreparedRealmBlockStateUpdatesWithCoordinatorUpdate,
+    prepared_block::realm::{PsyPreparedRealmBlockStateUpdates, PsyPreparedRealmBlockStateUpdatesWithCoordinatorUpdate},
     queue_items::realm_user_update::PsyRealmUserUpdateQueueItem,
 };
 use psy_io::tokio::TokioLikeFileSystem;
@@ -384,14 +384,65 @@ where
             // 3. Fetch Full Coordinator Update Data for that checkpoint
             let coordinator_update = self.coordinator_client.rc_get_realm_sync_info(restore_checkpoint_id, self.state.realm_id_u64).await?;
 
-            // 4. Generate local updates from backup files corresponding to that state
-            let prepared_updates = generate_realm_output_from_backups::<N, FileSystem>(
-                file_system,
-                guta_gatherer_backup_directory,
-                &self.state, // Note: verify if self.state has correct pending IDs for finding the file?
-                global_user_tree,
-            )
-            .await?;
+            // 4. Generate local updates: genesis (checkpoint 0) has no backup file (pending_0.backup does not exist)
+            let prepared_updates = if restore_checkpoint_id == 0 {
+                tracing::info!("Restore target is checkpoint 0 (genesis); using genesis path without backup file.");
+                PsyPreparedRealmBlockStateUpdates {
+                    realm_id: self.state.realm_id_u64,
+                    realm_sub_id: self.state.realm_sub_id_u64,
+                    old_realm_root: target_realm_state.value,
+                    new_realm_root: target_realm_state.value,
+                    unique_pending_id: 0,
+                    proc_checkpoint_unique_id: 0,
+                    update_global_user_tree_nodes_ffs: vec![],
+                    update_user_contract_tree_nodes_ffs: vec![],
+                    update_contract_state_tree_nodes_ffs: vec![],
+                    update_user_leaves_ffs: vec![],
+                }
+            } else {
+                let realm_pending_id = self
+                    .db
+                    .get_unique_pending_id_for_checkpoint_id(restore_checkpoint_id)
+                    .await?;
+                let (realm_unique_pending_id, realm_proc_checkpoint_id) = match realm_pending_id {
+                    Some(res) => res,
+                    None => {
+                        anyhow::bail!(
+                            "Cannot restore from local backup: realm has no unique_pending_id mapping for checkpoint {}. \
+                             Realm must have committed this checkpoint locally, or protocol must provide realm's pending_id for this checkpoint.",
+                            restore_checkpoint_id
+                        );
+                    }
+                };
+                // unique_pending_id 0: no backup file exists (first file is pending_1.backup after first commit)
+                if realm_unique_pending_id == 0 {
+                    tracing::info!(
+                        "Restore target checkpoint {} maps to unique_pending_id 0 (no backup file); using genesis-like path.",
+                        restore_checkpoint_id
+                    );
+                    PsyPreparedRealmBlockStateUpdates {
+                        realm_id: self.state.realm_id_u64,
+                        realm_sub_id: self.state.realm_sub_id_u64,
+                        unique_pending_id: 0,
+                        proc_checkpoint_unique_id: realm_proc_checkpoint_id,
+                        old_realm_root: target_realm_state.value,
+                        new_realm_root: target_realm_state.value,
+                        update_global_user_tree_nodes_ffs: vec![],
+                        update_user_contract_tree_nodes_ffs: vec![],
+                        update_contract_state_tree_nodes_ffs: vec![],
+                        update_user_leaves_ffs: vec![],
+                    }
+                } else {
+                    generate_realm_output_from_backups::<N, FileSystem>(
+                        file_system,
+                        guta_gatherer_backup_directory,
+                        &self.state,
+                        Some(realm_unique_pending_id),
+                        global_user_tree,
+                    )
+                    .await?
+                }
+            };
 
             // 5. Commit state to DB
             self.commit_state(
