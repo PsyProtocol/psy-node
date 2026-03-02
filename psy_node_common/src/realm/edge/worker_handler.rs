@@ -24,9 +24,12 @@ use psy_node_core::{
  psy_core_db::traits::full::{PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmEdgeAPIStoreReader}, psy_temp_db::StandardEdgeAPITempDBStoreBase, queue::{ephemeral::QStandardEphemeralQueuePublisher, worker_queue::QStandardWorkerQueueSubscriber}, store::traits::proof_store::QParthProofStore
 };
 
-use crate::
-    realm::{edge::handler::RealmEdgeHandler, queue_key::RealmProvingWorkQueueKey}
-;
+use parth_core::crypto::secp256k1::REQUEST_TYPE_SUBMIT_PROOF;
+
+use crate::{
+    reputation::WorkerReputationOps,
+    realm::{edge::handler::RealmEdgeHandler, queue_key::RealmProvingWorkQueueKey},
+};
 
 use parth_core::protocol::core_types::QZKProofPublicInputsHasherReader;
 fn verify_api_signature(signature: &QEDCompressedSecp256K1Signature, request: &SimpleTimedRequest) -> bool {
@@ -43,7 +46,7 @@ impl<
         STagTreeRewards: PsyNodeCoreRewardsTagTreeStoreWriter<N::F, N::QHash> + PsyNodeCoreRewardsTagTreeStoreReader<N::F, N::QHash> + Send + Sync,
         UserUpdateQueue: QStandardEphemeralQueuePublisher,
         GetProofWorkQueue: QStandardWorkerQueueSubscriber,
-        TempDatabase: StandardEdgeAPITempDBStoreBase<N::JobId, N::QHash>,
+        TempDatabase: StandardEdgeAPITempDBStoreBase<N::JobId, N::QHash> + Send + Sync,
         ProofStore: QParthProofStore,
     > RealmEdgeHandler<N, S, STagTreeRewards, UserUpdateQueue, GetProofWorkQueue, TempDatabase, ProofStore>
 {
@@ -74,11 +77,15 @@ impl<
         if !verify_api_signature(&signature, &request) {
             anyhow::bail!("invalid signature from miner");
         }
-
-        // todo, check miner reputation here to prevent miners who request jobs but
-        // don't finish them in a reasonable amount of time
-
+        let reputation = self.temp_db.get_worker_reputation(&self.realm_identifier, &signature.public_key).await?;
+        if reputation <= 0 {
+            anyhow::bail!("worker not eligible: reputation must be positive");
+        }
         Ok(())
+    }
+
+    pub async fn get_worker_reputation_internal(&self, public_key: &[u8; 33]) -> anyhow::Result<u64> {
+        self.temp_db.get_worker_reputation(&self.realm_identifier, public_key).await
     }
 
     pub async fn get_user_leaf_data_internal(&self, checkpoint_id: u64, user_id: u64) -> anyhow::Result<PQEDUserLeaf<N::F, N::QHash>> {
@@ -317,6 +324,17 @@ impl<
             )
             .await?;
         timer.lap_micros("set_proof_miner_rewards_tree_value");
+        let claim_time_ms = chrono::Utc::now().timestamp_millis() as u64;
+        self.temp_db
+            .set_job_claim(
+                &self.realm_identifier,
+                unique_pending_id,
+                response.job.job_id.get_output_id(),
+                &signature.public_key,
+                claim_time_ms,
+            )
+            .await?;
+        timer.lap_micros("set_job_claim");
         timer.lap_group("get_proving_work_with_child_proofs_internal");
 
         Ok(PsyWorkerGetProvingWorkWithChildProofsAPIResponse {
@@ -324,23 +342,35 @@ impl<
             input_proofs: final_child_proofs,
         })
     }
-    pub async fn submit_proof_raw_internal(&self, mut job_id: N::JobId, tag: N::QHash, proof_bytes: Vec<u8>) -> anyhow::Result<()>
+    pub async fn submit_proof_raw_internal(
+        &self,
+        signature: QEDCompressedSecp256K1Signature,
+        request: SimpleTimedRequest,
+        mut job_id: N::JobId,
+        tag: N::QHash,
+        proof_bytes: Vec<u8>,
+    ) -> anyhow::Result<()>
     where
         N::ZKVerifier: 'static,
     {
+        if !verify_api_signature(&signature, &request) || request.request_type != REQUEST_TYPE_SUBMIT_PROOF {
+            anyhow::bail!("invalid signature for submit_proof_raw");
+        }
         job_id = job_id.get_output_id();
         let mut timer = DebugTimer::new("submit_proof_raw_internal");
         let (unique_pending_id, unique_proc_id) = self.get_current_unique_pending_id_internal().await?;
         timer.lap_micros("get_current_unique_pending_id_internal");
         let proof_bytes = Arc::new(proof_bytes);
 
-        //HACK: check to make sure the tag matches
-        if self
+        // HACK: check to make sure the tag matches. If not, job was completed by another worker (stolen) - slash submitter.
+        let expected_tag = self
             .temp_db
             .get_proof_miner_rewards_tree_value(&self.realm_identifier, unique_pending_id, job_id.get_output_id())
-            .await?
-            != tag
-        {
+            .await?;
+        if expected_tag != tag {
+            self.temp_db
+                .apply_reputation_slash_on_tag_mismatch(&self.realm_identifier, &signature.public_key)
+                .await?;
             anyhow::bail!("Submitted tag does not match expected tag for job id");
         }
         timer.lap_micros("get_proof_miner_rewards_tree_value");
@@ -425,6 +455,20 @@ impl<
         timer.lap_micros("get_proof_miner_rewards_tree_value");
         self.proof_store.put_proof_bytes_for_job_id(job_id.get_output_id(), &proof_bytes).await?;
         timer.lap_micros("put_proof_bytes_for_job_id");
+
+        if let Ok(Some((public_key, claim_time_ms))) = self
+            .temp_db
+            .get_job_claim(&self.realm_identifier, unique_pending_id, job_id)
+            .await
+        {
+            self.temp_db
+                .apply_reputation_on_submit(&self.realm_identifier, &public_key, claim_time_ms)
+                .await?;
+            timer.lap_micros("update_worker_reputation");
+        } else {
+            tracing::debug!("submit_proof_raw: no job_claim record for job_id {:?}, skipping reputation update", job_id);
+        }
+
         /*
         self.tag_tree_rewards_store
             .rewards_tag_tree_set_node_tag(unique_pending_id, metadata.get_reward_tree_node_key(), tag, reward_tree_value)

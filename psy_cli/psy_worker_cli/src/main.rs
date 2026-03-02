@@ -45,6 +45,12 @@ async fn main() -> anyhow::Result<()> {
         Commands::GetPublicKey { private_key } => {
             keypair_helper::get_public_key_for_private_key(&private_key)?;
         },
+        Commands::GetWorkerReputation { url,mut public_key ,private_key} => {
+            if let Some(private_key) = private_key {
+                public_key = keypair_helper::get_public_key_for_private_key(&private_key)?;
+            }
+            subcommand::get_reputation::run(&url, &public_key).await?;
+        },
         Commands::DummyEndCapProver {
             realm_api_url,
             coordinator_api_url,

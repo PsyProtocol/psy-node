@@ -271,7 +271,13 @@ impl<
         claim_metadata.proving_duration_ms = current_time - tag_creation_time;
         claim_metadata.job_submitted_at = current_time;
 
-        let submit_result: Result<(), _> = api_client.unwrap().submit_proof_raw(job_id, tag, proof).await;
+        let (signature, request) = SimpleTimedRequest::create_signed_timed_request_for_submit_proof::<Signer, CoreSha256Hasher>(
+            &self.api_signer,
+            &self.api_signer_public_key,
+            API_REQUEST_SIGNATURE_VALID_DURATION_MS,
+            tag.clone().into_owned_32bytes(),
+        );
+        let submit_result: Result<(), _> = api_client.unwrap().submit_proof_raw(signature, request, job_id, tag, proof).await;
         match submit_result {
             Ok(_) => {
                 self.notify_job_completed_with_claim_metadata(api_url_hash, claim_metadata).await?;

@@ -7,7 +7,8 @@ use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 
 use crate::{
     psy_temp_db::{
-        QTempDBDeployContractDataReader, QTempDBDeployContractDataWriter, QTempDBNodeProvingStateReader, QTempDBNodeProvingStateWriter, QTempDBPendingIdReader, QTempDBPendingIdWriter, QTempDBProofWitnessReader, QTempDBProofWitnessWriter, QTempDBProvingJobMetadataReader, QTempDBProvingJobMetadataWriter, QTempDBRewardsTreeReader, QTempDBRewardsTreeWriter, QTempDBSubmitStatusReader, QTempDBSubmitStatusWriter, QTempDBUserContractUpdatesReader, QTempDBUserContractUpdatesWriter, tt_get_contract_updates_key, tt_get_deploy_contract_code_definition_key, tt_get_gathering_unique_pending_id_key, tt_get_node_proving_state_key, tt_get_proof_witness_data_key_from_job, tt_get_proving_job_metadata_key_from_job, tt_get_rewards_tag_tree_value_key_from_job, tt_get_submit_status_key, tt_get_unique_pending_id_key
+        tt_get_worker_reputation_key,
+        QTempDBDeployContractDataReader, QTempDBDeployContractDataWriter, QTempDBJobClaimInfoReader, QTempDBJobClaimInfoWriter, QTempDBNodeProvingStateReader, QTempDBNodeProvingStateWriter, QTempDBPendingIdReader, QTempDBPendingIdWriter, QTempDBProofWitnessReader, QTempDBProofWitnessWriter, QTempDBProvingJobMetadataReader, QTempDBProvingJobMetadataWriter, QTempDBRewardsTreeReader, QTempDBRewardsTreeWriter, QTempDBSubmitStatusReader, QTempDBSubmitStatusWriter, QTempDBUserContractUpdatesReader, QTempDBUserContractUpdatesWriter, QTempDBWorkerReputationReader, QTempDBWorkerReputationWriter, tt_get_contract_updates_key, tt_get_deploy_contract_code_definition_key, tt_get_gathering_unique_pending_id_key, tt_get_job_claim_key_from_job, tt_get_node_proving_state_key, tt_get_proof_witness_data_key_from_job, tt_get_proving_job_metadata_key_from_job, tt_get_rewards_tag_tree_value_key_from_job, tt_get_submit_status_key, tt_get_unique_pending_id_key
     },
     store::traits::temp_db::{QTempDatabaseRawKVReaderBase, QTempDatabaseRawKVWriterBase},
 };
@@ -503,5 +504,73 @@ impl<T: QTempDatabaseRawKVWriterBase + Sync> QTempDBUserContractUpdatesWriter fo
     async fn set_contract_updates_for_user_ref(&self, rid: &QRealmIdentifier, unique_pending_id: u64, user_id: u64, data: &[u8]) -> anyhow::Result<()> {
         let key = tt_get_contract_updates_key(rid.realm_id, rid.realm_sub_id, unique_pending_id, user_id);
         self.qtdb_raw_kv_put_value(&key, data).await
+    }
+}
+
+#[async_trait]
+impl<JobId: QJobIdBase + 'static, D: QTempDatabaseRawKVReaderBase + Sync> QTempDBJobClaimInfoReader<JobId> for D {
+    async fn get_job_claim(
+        &self,
+        rid: &QRealmIdentifier,
+        unique_pending_id: u64,
+        job_id: JobId,
+    ) -> anyhow::Result<Option<([u8; 33], u64)>> {
+        let key = tt_get_job_claim_key_from_job(rid.realm_id, rid.realm_sub_id, unique_pending_id, &job_id);
+        let value_bytes = self.qtdb_raw_kv_get_value(&key).await?;
+        match value_bytes {
+            Some(v) if v.len() >= 41 => {
+                let mut public_key = [0u8; 33];
+                public_key.copy_from_slice(&v[0..33]);
+                let claim_time_ms = u64::from_le_bytes(v[33..41].try_into().unwrap());
+                Ok(Some((public_key, claim_time_ms)))
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
+#[async_trait]
+impl<JobId: QJobIdBase + 'static, D: QTempDatabaseRawKVWriterBase + Sync> QTempDBJobClaimInfoWriter<JobId> for D {
+    async fn set_job_claim(
+        &self,
+        rid: &QRealmIdentifier,
+        unique_pending_id: u64,
+        job_id: JobId,
+        public_key: &[u8; 33],
+        claim_time_ms: u64,
+    ) -> anyhow::Result<()> {
+        let key = tt_get_job_claim_key_from_job(rid.realm_id, rid.realm_sub_id, unique_pending_id, &job_id);
+        let mut value = [0u8; 41];
+        value[0..33].copy_from_slice(public_key);
+        value[33..41].copy_from_slice(&claim_time_ms.to_le_bytes());
+        self.qtdb_raw_kv_put_value(&key, &value).await
+    }
+}
+
+/// Initial reputation for new workers (no prior record). Must be positive to allow claiming.
+pub const INITIAL_WORKER_REPUTATION: u64 = 5;
+
+#[async_trait]
+impl<D: QTempDatabaseRawKVReaderBase + Sync> QTempDBWorkerReputationReader for D {
+    async fn get_worker_reputation(&self, rid: &QRealmIdentifier, public_key: &[u8; 33]) -> anyhow::Result<u64> {
+        let key = tt_get_worker_reputation_key(rid.realm_id, rid.realm_sub_id, public_key);
+        let value_bytes = self.qtdb_raw_kv_get_value(&key).await?;
+        match value_bytes {
+            Some(v) if v.len() >= 8 => Ok(u64::from_le_bytes(v[0..8].try_into().unwrap())),
+            _ => Ok(INITIAL_WORKER_REPUTATION),
+        }
+    }
+}
+
+#[async_trait]
+impl<D: QTempDatabaseRawKVWriterBase + Sync> QTempDBWorkerReputationWriter for D {
+    async fn set_worker_reputation(
+        &self,
+        rid: &QRealmIdentifier,
+        public_key: &[u8; 33],
+        reputation: u64,
+    ) -> anyhow::Result<()> {
+        let key = tt_get_worker_reputation_key(rid.realm_id, rid.realm_sub_id, public_key);
+        self.qtdb_raw_kv_put_value(&key, &reputation.to_le_bytes()).await
     }
 }

@@ -326,10 +326,24 @@ impl<
     ) -> RpcResult<PsyWorkerGetProvingWorkWithChildProofsAPIResponse<N::QHash, N::JobId>> {
         res(self.get_proving_work_with_child_proofs_internal(signature, request).await)
     }
-    async fn submit_proof_raw(&self, job_id: N::JobId, tag: N::QHash, proof: Vec<u8>) -> RpcResult<()> {
-        res(self.submit_proof_raw_internal(job_id, tag, proof).await)
+    async fn submit_proof_raw(
+        &self,
+        signature: QEDCompressedSecp256K1Signature,
+        request: SimpleTimedRequest,
+        job_id: N::JobId,
+        tag: N::QHash,
+        proof: Vec<u8>,
+    ) -> RpcResult<()> {
+        res(self.submit_proof_raw_internal(signature, request, job_id, tag, proof).await)
     }
     async fn get_realm_identifier_worker_api(&self) -> RpcResult<QRealmIdentifier> {
         Ok(self.realm_identifier.clone())
+    }
+
+    async fn get_worker_reputation(&self, public_key: Vec<u8>) -> RpcResult<u64> {
+        let key: [u8; 33] = public_key
+            .try_into()
+            .map_err(|_| RpcError::InvalidInput("public_key must be 33 bytes (compressed secp256k1)".to_string()))?;
+        res(self.get_worker_reputation_internal(&key).await)
     }
 }

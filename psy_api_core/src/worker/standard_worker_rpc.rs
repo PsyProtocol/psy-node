@@ -12,12 +12,15 @@ pub trait NodeEdgeWorkerRpc<Hash, JobId> {
     #[method(name = "get_proving_work_with_child_proofs")]
     async fn get_proving_work_with_child_proofs(&self, signature:  QEDCompressedSecp256K1Signature, request: SimpleTimedRequest) -> RpcResult<PsyWorkerGetProvingWorkWithChildProofsAPIResponse<Hash, JobId>>;
     #[method(name = "submit_proof_raw")]
-    async fn submit_proof_raw(&self, job_id: JobId, tag: Hash, proof: Vec<u8>) -> RpcResult<()>;
+    async fn submit_proof_raw(&self, signature: QEDCompressedSecp256K1Signature, request: SimpleTimedRequest, job_id: JobId, tag: Hash, proof: Vec<u8>) -> RpcResult<()>;
     
     #[method(name = "get_realm_identifier_worker_api")]
     async fn get_realm_identifier_worker_api(&self) -> RpcResult<QRealmIdentifier>;
 
     #[method(name = "get_node_proving_state")]
     async fn get_node_proving_state(&self) -> RpcResult<PsyNodeProvingState>;
+
+    #[method(name = "get_worker_reputation")]
+    async fn get_worker_reputation(&self, public_key: Vec<u8>) -> RpcResult<u64>;
 }
 

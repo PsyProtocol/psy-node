@@ -1,7 +1,7 @@
 use parth_common::secp256k1::get_public_key_for_secp256k1_private_key;
 use parth_core::data::hash::hash256::Hash256;
 
-pub fn get_public_key_for_private_key(private_key: &str) -> anyhow::Result<()> {
+pub fn get_public_key_for_private_key(private_key: &str) -> anyhow::Result<String> {
     let private_key_bytes = hex::decode(private_key)?;
     if private_key_bytes.len() != 32 {
         return Err(anyhow::anyhow!(
@@ -14,7 +14,7 @@ pub fn get_public_key_for_private_key(private_key: &str) -> anyhow::Result<()> {
     let hash256 = Hash256(pk_array);
     let public_key = get_public_key_for_secp256k1_private_key(hash256)?;
     println!("Public Key:\n{}", hex::encode(public_key.0));
-    Ok(())
+    Ok(hex::encode(public_key.0))
 }
 
 

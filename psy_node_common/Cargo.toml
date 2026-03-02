@@ -59,7 +59,7 @@ psy_api_core = { workspace = true }
 thiserror = { workspace = true }
 psy_node_store_memory = { workspace = true }
 ts-rs = { workspace = true }
-
+chrono = { workspace = true}
 
 
 [dev-dependencies]

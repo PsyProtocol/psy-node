@@ -6,6 +6,7 @@ pub mod worker_test;
 pub mod keypair_helper;
 pub mod dummy_end_cap_prover;
 pub mod dummy_end_cap_prover_lite;
+pub mod get_reputation;
 
 #[derive(Parser)]
 pub struct Cli {
@@ -83,6 +84,18 @@ pub enum Commands {
     GetPublicKey {
         #[arg(long = "private-key", env = "PRIVATE_KEY", help = "Private key hex string")]
         private_key: String,
+    },
+
+    #[command(about = "Query worker reputation for a 33-byte compressed public key (realm or coordinator RPC URL)")]
+    GetWorkerReputation {
+        #[arg(long = "url", help = "Realm or coordinator edge RPC URL (e.g. http://127.0.0.1:1338 or http://127.0.0.1:1337)")]
+        url: String,
+
+        #[arg(long = "public-key", help = "Worker compressed public key as hex (33 bytes = 66 hex chars)")]
+        public_key: String,
+
+        #[arg(long = "private-key", env = "PRIVATE_KEY", help = "Private key hex string")]
+        private_key: Option<String>,
     },
 
     #[command(about = "Run a proof mining worker")]

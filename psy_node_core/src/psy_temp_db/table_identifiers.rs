@@ -43,6 +43,16 @@ pub const TEMP_TABLE_ID_DEPLOY_CONTRACT_CODE_DEFINITION: u16 = 0x4344; // 'DC'
 pub const TEMP_TABLE_ID_DEPLOY_CONTRACT_CODE_DEFINITION_BYTES: [u8; 2] = [0x44, 0x43]; // 'DC'
 pub const TEMP_TABLE_ID_DEPLOY_CONTRACT_KEY_SIZE: usize = 32; // 4 + 2 + 2 + 8 + 16
 
+pub const TEMP_TABLE_ID_JOB_CLAIM: u16 = 0x434A; // 'JC'
+pub const TEMP_TABLE_ID_JOB_CLAIM_BYTES: [u8; 2] = [0x4A, 0x43]; // 'JC'
+pub const TEMP_TABLE_JOB_CLAIM_KEY_SIZE: usize = 40; // 4 + 2 + 2 + 8 + 24
+pub const TEMP_TABLE_JOB_CLAIM_VALUE_SIZE: usize = 41; // public_key 33 + claim_time_ms u64
+
+pub const TEMP_TABLE_ID_WORKER_REPUTATION: u16 = 0x5257; // 'WR'
+pub const TEMP_TABLE_ID_WORKER_REPUTATION_BYTES: [u8; 2] = [0x57, 0x52]; // 'WR'
+pub const TEMP_TABLE_WORKER_REPUTATION_KEY_SIZE: usize = 41; // 4 + 2 + 2 + 33 (compressed public key)
+pub const TEMP_TABLE_WORKER_REPUTATION_VALUE_SIZE: usize = 8; // u64
+
 // --- Psy Node Proving State ---
 #[inline(always)]
 pub fn tt_get_node_proving_state_key(realm_id: u32, realm_sub_id: u16) -> [u8; 8] {
@@ -358,4 +368,42 @@ pub fn tt_write_contract_code_definition_key<Writer: psy_io::Write>(
     writer.write_all(&unique_pending_id.to_le_bytes())?;
     writer.write_all(rand_key)?;
     Ok(())
+}
+
+// --- Job Claim (worker_id, claim_time_ms per job) ---
+#[inline(always)]
+pub fn tt_get_job_claim_key_from_bytes(
+    realm_id: u32,
+    realm_sub_id: u16,
+    unique_pending_id: u64,
+    job_id_bytes: &QJobIdSerialized,
+) -> [u8; 40] {
+    let mut key = [0u8; 40];
+    key[0..4].copy_from_slice(&realm_id.to_le_bytes());
+    key[4..6].copy_from_slice(&realm_sub_id.to_le_bytes());
+    key[6..8].copy_from_slice(&TEMP_TABLE_ID_JOB_CLAIM_BYTES);
+    key[8..16].copy_from_slice(&unique_pending_id.to_le_bytes());
+    key[16..40].copy_from_slice(job_id_bytes);
+    key
+}
+
+#[inline(always)]
+pub fn tt_get_job_claim_key_from_job<JobId: QJobIdBase>(
+    realm_id: u32,
+    realm_sub_id: u16,
+    unique_pending_id: u64,
+    job_id: &JobId,
+) -> [u8; 40] {
+    tt_get_job_claim_key_from_bytes(realm_id, realm_sub_id, unique_pending_id, &job_id.to_bytes_fixed())
+}
+
+// --- Worker Reputation (key = realm prefix + 33-byte compressed public key) ---
+#[inline(always)]
+pub fn tt_get_worker_reputation_key(realm_id: u32, realm_sub_id: u16, public_key: &[u8; 33]) -> [u8; 41] {
+    let mut key = [0u8; 41];
+    key[0..4].copy_from_slice(&realm_id.to_le_bytes());
+    key[4..6].copy_from_slice(&realm_sub_id.to_le_bytes());
+    key[6..8].copy_from_slice(&TEMP_TABLE_ID_WORKER_REPUTATION_BYTES);
+    key[8..41].copy_from_slice(public_key);
+    key
 }
