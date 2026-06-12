@@ -58,3 +58,4 @@ index.scip
 client_prover/psy-privacy-bridge/src/config/faucetOperators.json
 devnet_output.log
 genesis.json
+genesis_contracts.json
