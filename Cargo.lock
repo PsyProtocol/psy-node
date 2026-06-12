@@ -6300,7 +6300,6 @@ dependencies = [
  "pderive",
  "postcard",
  "pser",
- "psy_common",
  "psy_core",
  "psy_data",
  "psy_io",
@@ -6390,35 +6389,6 @@ dependencies = [
  "tracing",
  "ts-rs",
  "zstd 0.13.3",
-]
-
-[[package]]
-name = "psy_common"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "auto_impl",
- "bincode",
- "hashbrown 0.14.5",
- "hex",
- "hex-literal",
- "parth_core",
- "postcard",
- "pser",
- "psy_core",
- "psy_data",
- "rand 0.8.5",
- "rkyv",
- "serde",
- "serde_json",
- "serde_repr",
- "serde_with 3.16.1",
- "speedy",
- "strum 0.27.2",
- "strum_macros 0.27.2",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -6615,7 +6585,6 @@ dependencies = [
  "postcard",
  "pser",
  "psy_api_core",
- "psy_common",
  "psy_core",
  "psy_data",
  "psy_io",
@@ -6747,7 +6716,6 @@ dependencies = [
  "postcard",
  "pser",
  "psy_api_core",
- "psy_common",
  "psy_core",
  "psy_data",
  "psy_io",
@@ -6861,7 +6829,6 @@ dependencies = [
  "postcard",
  "pser",
  "psy_api_core",
- "psy_common",
  "psy_core",
  "psy_data",
  "psy_io",
@@ -6915,7 +6882,6 @@ dependencies = [
  "postcard",
  "pser",
  "psy_api_core",
- "psy_common",
  "psy_core",
  "psy_crypto",
  "psy_data",
@@ -6964,7 +6930,6 @@ dependencies = [
  "pderive",
  "postcard",
  "pser",
- "psy_common",
  "psy_core",
  "psy_data",
  "psy_io",
@@ -7006,7 +6971,6 @@ dependencies = [
  "parth_crypto",
  "postcard",
  "pser",
- "psy_common",
  "psy_core",
  "psy_data",
  "psy_node_core",
@@ -7042,7 +7006,6 @@ dependencies = [
  "parth_core",
  "postcard",
  "pser",
- "psy_common",
  "psy_core",
  "psy_data",
  "psy_node_core",
@@ -7154,7 +7117,6 @@ dependencies = [
  "pderive",
  "postcard",
  "pser",
- "psy_common",
  "psy_core",
  "psy_data",
  "psy_node_core",
@@ -7282,48 +7244,6 @@ dependencies = [
  "strum 0.27.2",
  "strum_macros 0.27.2",
  "tiny-keccak",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "psy_plonky2_testbed"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "auto_impl",
- "bincode",
- "cf_utils",
- "hashbrown 0.14.5",
- "hex",
- "hex-literal",
- "parth_common",
- "parth_core",
- "parth_crypto",
- "pderive",
- "plonky2",
- "postcard",
- "pser",
- "psy_core",
- "psy_data",
- "psy_io",
- "psy_node_common",
- "psy_node_core",
- "psy_node_store_memory",
- "psy_plonky2_basic_helpers",
- "psy_plonky2_circuits",
- "psy_plonky2_common_circuits",
- "psy_serialize",
- "rand 0.8.5",
- "rkyv",
- "serde",
- "serde_json",
- "serde_repr",
- "serde_with 3.16.1",
- "speedy",
- "strum 0.27.2",
- "strum_macros 0.27.2",
  "tokio",
  "tracing",
 ]
@@ -7537,22 +7457,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "psy_scratchpad"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "bincode",
- "hex",
- "hex-literal",
- "scylla",
- "serde",
- "serde_json",
- "serde_repr",
- "serde_with 3.16.1",
-]
-
-[[package]]
 name = "psy_serialize"
 version = "0.1.0"
 dependencies = [
@@ -7560,13 +7464,6 @@ dependencies = [
  "bytemuck",
  "paste",
  "psy_io",
-]
-
-[[package]]
-name = "psy_type_defaults"
-version = "0.1.0"
-dependencies = [
- "plonky2",
 ]
 
 [[package]]
@@ -7754,7 +7651,6 @@ dependencies = [
  "postcard",
  "pser",
  "psy_api_core",
- "psy_common",
  "psy_core",
  "psy_data",
  "psy_dummy_prover",
@@ -7801,7 +7697,6 @@ dependencies = [
  "postcard",
  "pser",
  "psy_api_core",
- "psy_common",
  "psy_core",
  "psy_data",
  "psy_io",

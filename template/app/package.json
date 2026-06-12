@@ -1,9 +1,0 @@
-{
-    scrips: {
-        "dev": ...
-        "build": ....
-    },
-    "dependencies": {
-        "psy-sdk": "https://github.com/PsyProtocol/psy-sdk#..."
-    }
-}

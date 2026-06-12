@@ -8,10 +8,8 @@ members = [
     "pderive",
     "parth_core",
     "parth_common",
-    "psy_scratchpad",
-    "psy_type_defaults",
+    # (removed psy_scratchpad, psy_type_defaults)
     "psy_core",
-    "psy_common",
     "psy_data",
     "psy_node_core",
     "psy_node_common",
@@ -25,7 +23,7 @@ members = [
     "psy_plonky2_basic_helpers",
     "psy_plonky2_common_circuits",
     "psy_plonky2_circuits",
-    "psy_plonky2_testbed",
+    # "psy_plonky2_testbed",
     "psy_worker_core",
     "psy_api_core",
     "psy_dummy_prover",
@@ -358,11 +356,10 @@ parth_crypto = { path = "./parth_crypto" }
 
 psy_core = { path = "./psy_core" }
 psy_data = { path = "./psy_data" }
-psy_common = { path = "./psy_common" }
 psy_node_core = { path = "./psy_node_core" }
 psy_node_common = { path = "./psy_node_common" }
-psy_scratchpad = { path = "./psy_scratchpad" }
-psy_type_defaults = { path = "./psy_type_defaults" }
+# psy_scratchpad = { path = "./psy_scratchpad" }
+# psy_type_defaults = { path = "./psy_type_defaults" }
 psy_worker_core = { path = "./psy_worker_core" }
 psy_api_core = { path = "./psy_api_core" }
 psy_dummy_prover = { path = "./psy_dummy_prover" }
