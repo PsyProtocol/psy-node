@@ -4,4 +4,4 @@ import type { MerkleProofCore } from "./MerkleProofCore";
 import type { PartialUpdateNearestCommonAncestorProof } from "./PartialUpdateNearestCommonAncestorProof";
 import type { QHashOut } from "./QHashOut";
 
-export type VerifyTwoGUTAProofUpgradeCheckpointStandardInputSimple = { historical_checkpoint_proof_a: MerkleProofCore<QHashOut>, historical_checkpoint_proof_b: MerkleProofCore<QHashOut>, stats_a: GUTAStats, stats_b: GUTAStats, nca_proof: PartialUpdateNearestCommonAncestorProof, };
+export type VerifyTwoGUTAProofUpgradeCheckpointStandardInputSimple = { historical_checkpoint_proof_a: MerkleProofCore<QHashOut>, historical_checkpoint_proof_b: MerkleProofCore<QHashOut>, stats_a: GUTAStats, stats_b: GUTAStats, nca_proof: PartialUpdateNearestCommonAncestorProof, total_aggregation_proofs_generated_a: bigint, total_aggregation_proofs_generated_b: bigint, };

@@ -26,6 +26,7 @@ pub struct PsyPreparedRealmBlockStateUpdates<Hash> {
     pub update_user_contract_tree_nodes_ffs: Vec<u8>,
     pub update_contract_state_tree_nodes_ffs: Vec<u8>,
     pub update_user_leaves_ffs: Vec<u8>,
+    pub update_contract_state_imt_leaves_ffs: Vec<u8>,
 }
 
 
@@ -46,6 +47,7 @@ impl<Hash: QPGenRandom> QPGenRandom for PsyPreparedRealmBlockStateUpdates<Hash> 
             update_user_contract_tree_nodes_ffs: QPGenRandom::qp_rand_gen_vec(32),
             update_contract_state_tree_nodes_ffs: QPGenRandom::qp_rand_gen_vec(32),
             update_user_leaves_ffs: QPGenRandom::qp_rand_gen_vec(32),
+            update_contract_state_imt_leaves_ffs: QPGenRandom::qp_rand_gen_vec(32),
         }
     }
 }
@@ -64,12 +66,13 @@ impl<Hash: Q256BitHash> FallbackPsySerializeCanonical for PsyPreparedRealmBlockS
         size += 16; // proc_checkpoint_unique_id
         size += 32; // old_realm_root
         size += 32; // new_realm_root
-        
+
         // Vec<u8> fields: 4 bytes for length + content length
         size += 4 + self.update_global_user_tree_nodes_ffs.len();
         size += 4 + self.update_user_contract_tree_nodes_ffs.len();
         size += 4 + self.update_contract_state_tree_nodes_ffs.len();
         size += 4 + self.update_user_leaves_ffs.len();
+        size += 4 + self.update_contract_state_imt_leaves_ffs.len();
         size
     }
 
@@ -78,14 +81,15 @@ impl<Hash: Q256BitHash> FallbackPsySerializeCanonical for PsyPreparedRealmBlockS
         writer.psy_write_u64(self.realm_sub_id)?;
         writer.psy_write_u64(self.unique_pending_id)?;
         writer.psy_write_u128(self.proc_checkpoint_unique_id)?;
-        
+
         writer.psy_write_bytes_fixed(&self.old_realm_root.into_owned_32bytes())?;
         writer.psy_write_bytes_fixed(&self.new_realm_root.into_owned_32bytes())?;
-        
+
         writer.psy_write_bytes_vec(&self.update_global_user_tree_nodes_ffs)?;
         writer.psy_write_bytes_vec(&self.update_user_contract_tree_nodes_ffs)?;
         writer.psy_write_bytes_vec(&self.update_contract_state_tree_nodes_ffs)?;
         writer.psy_write_bytes_vec(&self.update_user_leaves_ffs)?;
+        writer.psy_write_bytes_vec(&self.update_contract_state_imt_leaves_ffs)?;
         Ok(())
     }
 
@@ -94,14 +98,15 @@ impl<Hash: Q256BitHash> FallbackPsySerializeCanonical for PsyPreparedRealmBlockS
         let realm_sub_id = reader.psy_read_u64()?;
         let unique_pending_id = reader.psy_read_u64()?;
         let proc_checkpoint_unique_id = reader.psy_read_u128()?;
-        
+
         let old_realm_root = Hash::from_owned_32bytes(reader.psy_read_bytes_32()?);
         let new_realm_root = Hash::from_owned_32bytes(reader.psy_read_bytes_32()?);
-        
+
         let update_global_user_tree_nodes_ffs = reader.psy_read_bytes_vec()?;
         let update_user_contract_tree_nodes_ffs = reader.psy_read_bytes_vec()?;
         let update_contract_state_tree_nodes_ffs = reader.psy_read_bytes_vec()?;
         let update_user_leaves_ffs = reader.psy_read_bytes_vec()?;
+        let update_contract_state_imt_leaves_ffs = reader.psy_read_bytes_vec()?;
 
         Ok(Self {
             realm_id,
@@ -114,6 +119,7 @@ impl<Hash: Q256BitHash> FallbackPsySerializeCanonical for PsyPreparedRealmBlockS
             update_user_contract_tree_nodes_ffs,
             update_contract_state_tree_nodes_ffs,
             update_user_leaves_ffs,
+            update_contract_state_imt_leaves_ffs,
         })
     }
 }

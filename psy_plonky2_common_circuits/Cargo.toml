@@ -33,6 +33,7 @@ strum_macros = { workspace = true }
 hashbrown = { workspace = true }
 plonky2 = { workspace = true }
 bitflags = { workspace = true }
+tiny-keccak = { workspace = true }
 
 # start local packages
 cf_utils = { workspace = true }
@@ -40,3 +41,5 @@ parth_core = { workspace = true }
 parth_common = { workspace = true }
 psy_plonky2_basic_helpers = { workspace = true }
 pser = { workspace = true }
+
+[dev-dependencies]

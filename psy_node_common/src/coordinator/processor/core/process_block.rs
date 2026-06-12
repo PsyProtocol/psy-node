@@ -1,7 +1,7 @@
 use cf_utils::timer::TraceTimer;
 use parth_core::{
     data::queue::queue_key::QPBaseQueueType,
-    protocol::core_types::QNetworkTypesConfig,
+    protocol::core_types::{Q256BitHash, QNetworkTypesConfig},
 };
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{
@@ -121,6 +121,7 @@ impl<
             deploy_contract_root_job.job_id,
         )))
     }
+
     pub async fn publish_jobs(
         &self,
         proving_state: &mut PsyNodeProvingState,
@@ -298,28 +299,13 @@ impl<
                 .finalize_gathering_and_update_queue_key(self.db.ids.gathering_proc_checkpoint_unique_id),
         )?;
 
-        /*
-        tracing::info!("Gathering results from GUTA, Register Users, and Deploy Contracts gatherers...");
-        let guta_result = self.guta_queue_gatherer
-            .finalize_gathering_and_update_queue_key(self.db.ids.gathering_proc_checkpoint_unique_id)
-            .await?;
-        tracing::info!("GUTA gatherer results obtained.");
-        let deploy_contract_result = self.deploy_contract_queue_gatherer
-            .finalize_gathering_and_update_queue_key(self.db.ids.gathering_proc_checkpoint_unique_id)
-            .await?;
-        tracing::info!("Deploy Contracts gatherer results obtained.");
-        let register_users_result = self.register_user_queue_gatherer
-            .finalize_gathering_and_update_queue_key(self.db.ids.gathering_proc_checkpoint_unique_id)
-            .await?;
-        tracing::info!("Register Users gatherer results obtained.");
-        */
-
-        Ok(CoordinatorOutputBuilder::new(
+        let (proving_state, guta_jobs, register_user_jobs, deploy_contract_jobs, output_builder) = CoordinatorOutputBuilder::new(
             &self.db.ids,
             guta_result,
             register_users_result,
             deploy_contract_result,
-        )?)
+        )?;
+        Ok((proving_state, guta_jobs, register_user_jobs, deploy_contract_jobs, output_builder))
     }
     pub async fn plan_agg_guta_register_users_deploy_contracts_job(
         &self,
@@ -384,7 +370,11 @@ impl<
             anyhow::bail!("Missing reward tree value for checkpoint state transition job");
         }
         let reward_root = reward_root.unwrap();
-        let checkpoint_zk_proof: Option<Vec<u8>> = self.db.proof_store.get_proof_bytes_by_job_id(job_metadata.job_id.get_output_id()).await?;
+        let checkpoint_zk_proof: Option<Vec<u8>> = self
+            .db
+            .proof_store
+            .get_proof_bytes_by_job_id(job_metadata.job_id.get_output_id(), self.db.ids.unique_pending_id)
+            .await?;
         if checkpoint_zk_proof.is_none() {
             tracing::error!("Failed to retrieve zk proof for checkpoint state transition job id: {:?}", job_metadata.job_id);
             anyhow::bail!("Missing zk proof for checkpoint state transition job");
@@ -396,9 +386,11 @@ impl<
         Ok((output, checkpoint_zk_proof))
     }
     pub async fn plan_genesis_checkpoint_state_transition_proof(&self) -> anyhow::Result<()> {
+        let genesis_fingerprint = self.db.circuit_fingerprint_config.genesis_checkpoint_state_transition_fingerprint;
         let witness = PsyCheckpointStateTransitionGenesisCircuitInput::<N::QHash> {
-            genesis_checkpoint_state_transition_hash: self.db.genesis_checkpoint_state_transition_hash,
-            checkpoint_state_transition_circuit_fingerprint: self.db.circuit_fingerprint_config.checkpoint_state_transition_circuit_fingerprint,
+            checkpoint_tree_root: self.db.last_committed.checkpoint_state_transition.new_checkpoint_tree_root,
+            checkpoint_leaf_hash: self.db.last_committed.checkpoint_state_transition.new_checkpoint_leaf_hash,
+            genesis_fingerprint,
         };
         let expected_public_inputs = witness.get_public_inputs_hash_no_rewards_tag::<N::HasherBase>();
         let job_id = QProvingJobDataID::new_proof_job_id(0, 0, ProvingJobCircuitType::GenesisBlockCheckpointStateTransition, 0, 0);
@@ -437,6 +429,8 @@ impl<
         let mut timer = TraceTimer::new("process_block");
         tracing::info!("Starting to process new coordinator block with checkpoint_id = {}...", self.db.ids.next_checkpoint_id);
         let (mut proving_state, guta_jobs, register_user_jobs, deploy_contract_jobs, mut output_builder) = self.get_results_from_gatherers().await?;
+        let worker_queue_key_for_cleanup = self.db.get_proof_worker_queue_key();
+        let worker_unique_id_for_cleanup = self.db.ids.proc_checkpoint_unique_id;
 
         timer.lap("get_results_from_gatherers");
         let has_jobs = self.get_root_job_ids(
@@ -446,9 +440,7 @@ impl<
         )?;
         timer.lap("get_root_job_ids");
         if self.db.ids.next_checkpoint_id > 1 && has_jobs.is_none() {
-            tracing::info!("No jobs to process in this block, skipping.");
-            return Ok(());
-            // tracing::info!("No jobs to process in this block, but proceeding to create empty checkpoint state transition.");
+            tracing::info!("No jobs to process in this block; creating empty checkpoint state transition.");
         }
 
 
@@ -510,6 +502,23 @@ impl<
         timer.lap("commit_state");
         tracing::info!("Committed new coordinator block with checkpoint_id = {}.", self.db.ids.checkpoint_id);
         self.db.print_coordinator_processor_state();
+        if let Err(err) = self
+            .db
+            .proof_work_queue
+            .delete_worker_queue_consumer(
+                &worker_queue_key_for_cleanup,
+                self.db.ids.realm_id_u64,
+                self.db.ids.realm_sub_id_u64,
+                worker_unique_id_for_cleanup,
+                0,
+            )
+            .await
+        {
+            tracing::warn!(
+                "Failed to delete coordinator worker queue consumer after checkpoint commit: {}",
+                err
+            );
+        }
 
         Ok(())
     }

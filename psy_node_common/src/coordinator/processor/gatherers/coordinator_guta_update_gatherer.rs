@@ -17,7 +17,7 @@ use parth_core::{
 };
 use psy_core::job::job_id::QProvingJobDataID;
 use psy_data::{
-    guta::{header_extended::GlobalUserTreeAggregatorHeaderWithTagValueAndJobID, stats::GUTAStats},
+    guta::{header::GlobalUserTreeAggregatorHeader, header_extended::GlobalUserTreeAggregatorHeaderWithTagValueAndJobID, stats::GUTAStats},
     rewards_tree::offsets::{GUTA_REWARDS_TREE_OFFSET_ROOT_INDEX, GUTA_REWARDS_TREE_OFFSET_ROOT_LEVEL},
     worker::metadata_with_job_id::PsyProvingJobMetadataWithJobId,
 };
@@ -66,17 +66,13 @@ pub async fn read_coordinator_guta_update_gatherer_backup_file<
     let mut file: FileSystem::File = file_system.file_like_fs_open(&file_path).await?;
     let metadata = file.file_like_metadata().await?;
     let file_len = metadata.len();
-    let const_size_len = 4 + 32 + 32;
-    if file_len < const_size_len as u64 {
-        return Err(anyhow::anyhow!("Backup file too small to be valid: {} bytes", metadata.len()));
-    }
+    // Coordinator backup format: magic(4) + start_root(32) + [queue_items...] + random_seed(32)
+    // NOTE: There is NO end_root in this format (unlike realm backup).
+    let const_size_len = 4 + 32; // magic + start_root
+    let item_size = GlobalUserTreeAggregatorHeaderWithTagValueAndJobID::<F, Hash>::FIXED_SIZE;
 
-    let file_len_without_metadata = file_len as usize - const_size_len;
-    if file_len_without_metadata % (GlobalUserTreeAggregatorHeaderWithTagValueAndJobID::<F, Hash>::FIXED_SIZE) != 0 {
-        return Err(anyhow::anyhow!(
-            "Backup file length without metadata is not a multiple of 64: {} bytes",
-            file_len_without_metadata
-        ));
+    if file_len < const_size_len {
+        return Err(anyhow::anyhow!("Backup file too small to be valid: {} bytes", metadata.len()));
     }
 
     let magic_u32 = file.read_u32_le().await?;
@@ -99,7 +95,33 @@ pub async fn read_coordinator_guta_update_gatherer_backup_file<
         ));
     }
 
-    let expected_count = file_len_without_metadata / GlobalUserTreeAggregatorHeaderWithTagValueAndJobID::<F, Hash>::FIXED_SIZE;
+    // File layout after header: N * item_size bytes of queue items, then 32 bytes random_seed
+    let remaining_after_start = file_len as usize - (4 + 32);
+    if remaining_after_start == 0 {
+        // Empty file (no random_seed written by old code), return empty result
+        return Ok(CoordinatorGUTAUpdateGathererOutputDatabase {
+            update_global_user_tree_nodes_ffs: vec![],
+            new_realm_guta_reward_tree_node_keys_ffs: vec![],
+            guta_stats: GUTAStats::<F>::get_zero_value(),
+            total_guta_proofs_generated: F::ZERO_VALUE,
+            total_guta_inputs: 0,
+            start_global_user_tree_root,
+            end_global_user_tree_root: tree.get_root(),
+            random_seed_guta: Hash::get_zero_value(),
+            root_guta_header: None,
+        });
+    }
+
+    let file_len_without_metadata = remaining_after_start - 32; // exclude trailing random_seed
+    if file_len_without_metadata % item_size != 0 {
+        return Err(anyhow::anyhow!(
+            "Backup file length without metadata is not a multiple of {}: {} bytes",
+            item_size,
+            file_len_without_metadata
+        ));
+    }
+
+    let expected_count = file_len_without_metadata / item_size;
 
     let mut cur_guta_stats = GUTAStats::<F>::get_zero_value();
 
@@ -143,6 +165,7 @@ pub async fn read_coordinator_guta_update_gatherer_backup_file<
         random_seed_guta,
         total_guta_inputs: changes.len() as u64,
         new_realm_guta_reward_tree_node_keys_ffs: vec![],
+        root_guta_header: None,
     };
     Ok(output_db)
 }
@@ -220,6 +243,7 @@ pub struct CoordinatorGUTAUpdateGathererOutputDatabase<F, Hash> {
 
     pub start_global_user_tree_root: Hash,
     pub end_global_user_tree_root: Hash,
+    pub root_guta_header: Option<GlobalUserTreeAggregatorHeader<F, Hash>>,
 
     pub random_seed_guta: Hash,
 }
@@ -392,11 +416,7 @@ impl<
         };
 
         let new_status = self.config.status.read().map_err(|e| anyhow::anyhow!("error reading status {:?}", e))?.clone();
-        use std::collections::HashMap;
-        use parth_core::data::hash::merkle_node_key::SimpleMerkleNodeKey;
-
-        let jobs_for_queue_result: anyhow::Result<(Vec<Vec<PsyProvingJobMetadataWithJobId<N::QHash, QProvingJobDataID>>>, HashMap<u64, SimpleMerkleNodeKey>)> = self
-            .guta_planner
+        let jobs_for_queue_result = self.guta_planner
             .finalize_with_reward_ids(
                 &realm_identifier,
                 self.status.unique_pending_id,
@@ -419,7 +439,7 @@ impl<
             );
             anyhow::bail!("Error finalizing GUTA updates gatherer: {:?}", jobs_for_queue_result.err());
         }
-        let (jobs_for_queue, input_realm_reward_keys) = jobs_for_queue_result?;
+        let (jobs_for_queue, input_realm_reward_keys, root_guta_header) = jobs_for_queue_result?;
         tracing::info!(
             "Finalized GUTA updates gatherer for pending id {}, total jobs created: {}",
             self.status.unique_pending_id,
@@ -453,13 +473,26 @@ impl<
             key.pio_write_to_io(&mut new_realm_guta_reward_tree_node_keys_ffs)?;
         }
 
+        let random_seed_guta = get_temp_guta_rand_seed::<N::QHash>();
+
+        // Write trailing metadata to backup file so reader can verify length.
+        // Format: magic(4) + start_root(32) + [items...] + random_seed(32)
+        self.new_coordinator_guta_file
+            .write_all(&random_seed_guta.into_owned_32bytes())
+            .await?;
+        self.config
+            .file_system
+            .file_like_fs_flush_file_with_path(&self.pending_file_path, &mut self.new_coordinator_guta_file)
+            .await?;
+
         let output_database = CoordinatorGUTAUpdateGathererOutputDatabase {
             update_global_user_tree_nodes_ffs,
             guta_stats: self.guta_stats,
             total_guta_proofs_generated: self.total_guta_proofs_generated,
             start_global_user_tree_root: self.start_global_user_tree_root,
             end_global_user_tree_root,
-            random_seed_guta: get_temp_guta_rand_seed::<N::QHash>(),
+            root_guta_header: Some(root_guta_header),
+            random_seed_guta,
             new_realm_guta_reward_tree_node_keys_ffs,
             total_guta_inputs: self.total_guta_inputs,
         };
@@ -481,5 +514,157 @@ impl<
             self.status.unique_pending_id
         );
         Ok(output)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, path::Path};
+
+    use parth_common::memory_stores::mem_tree_recorder::SimpleMemoryMerkleRecorderStore;
+    use parth_core::{
+        crypto::hash::traits::ZeroableHash,
+        data::hash::merkle_node_key::SimpleMerkleNodeKey,
+        felt::{FromPrimitiveValuesFelt, ToU64Value, ZeroableFelt},
+        pgoldilocks::PoseidonHasher,
+        protocol::core_types::Q256BitHash,
+        PHash, PF, QJobIdBase,
+    };
+    use psy_core::job::job_id::QProvingJobDataID;
+    use psy_data::guta::{
+        header::GlobalUserTreeAggregatorHeader,
+        header_extended::{GlobalUserTreeAggregatorHeaderWithTagValue, GlobalUserTreeAggregatorHeaderWithTagValueAndJobID},
+        stats::GUTAStats,
+        sub_tree_transition::SubTreeNodeStateTransition,
+    };
+    use psy_node_core::file::memory_fs::SimpleMockMemoryFileSystem;
+    use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
+
+    use super::{
+        read_coordinator_guta_update_gatherer_backup_file, COORDINATOR_GUTA_UPDATE_GATHERER_BACKUP_V1_MAGIC_U32,
+    };
+
+    #[tokio::test]
+    async fn reads_coordinator_guta_backup_with_trailing_random_seed() -> anyhow::Result<()> {
+        type Hasher = PoseidonHasher;
+        type Hash = PHash;
+        type F = PF;
+
+        let path = "coordinator_guta_update_gatherer_realm_0_sub_1_pending_1.backup";
+        let file_system = SimpleMockMemoryFileSystem::new();
+        let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(4);
+        let start_root = tree.get_root();
+        let new_leaf = Hash::from_owned_32bytes([7u8; 32]);
+        let random_seed = Hash::from_owned_32bytes([9u8; 32]);
+
+        let item = GlobalUserTreeAggregatorHeaderWithTagValueAndJobID {
+            header: GlobalUserTreeAggregatorHeaderWithTagValue {
+                header: GlobalUserTreeAggregatorHeader {
+                    guta_circuit_whitelist: Hash::get_zero_value(),
+                    checkpoint_tree_root: Hash::get_zero_value(),
+                    state_transition: SubTreeNodeStateTransition {
+                        old_node_value: Hash::get_zero_value(),
+                        new_node_value: new_leaf,
+                        node_index: F::from_u64_value(0),
+                        node_level: F::ZERO_VALUE,
+                    },
+                    stats: GUTAStats {
+                        guta_fees_collected: F::from_u64_value(11),
+                        da_fees_collected: F::from_u64_value(12),
+                        user_ops_processed: F::from_u64_value(13),
+                        total_transactions: F::from_u64_value(14),
+                        slots_modified: F::from_u64_value(15),
+                    },
+                    total_aggregation_proofs_generated: F::from_u64_value(2),
+                },
+                new_tag_tree_node_value: Hash::from_owned_32bytes([8u8; 32]),
+            },
+            job_id: QProvingJobDataID::new_invalid_job_id(),
+        };
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&COORDINATOR_GUTA_UPDATE_GATHERER_BACKUP_V1_MAGIC_U32.to_le_bytes());
+        data.extend_from_slice(&start_root.into_owned_32bytes());
+        data.extend_from_slice(&item.psy_ser_to_bytes_vec()?);
+        data.extend_from_slice(&random_seed.into_owned_32bytes());
+        file_system.files.insert(path.to_string(), data);
+
+        let output =
+            read_coordinator_guta_update_gatherer_backup_file::<Hasher, Hash, F, SimpleMockMemoryFileSystem>(&file_system, path, &mut tree)
+                .await?;
+
+        assert_eq!(output.total_guta_inputs, 1);
+        assert_eq!(output.total_guta_proofs_generated.to_u64_value(), 2);
+        assert_eq!(output.guta_stats.user_ops_processed.to_u64_value(), 13);
+        assert_eq!(output.random_seed_guta, random_seed);
+        assert_eq!(output.end_global_user_tree_root, tree.get_root());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reads_all_local_coordinator_backups() -> anyhow::Result<()> {
+        type Hasher = PoseidonHasher;
+        type Hash = PHash;
+
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let workspace_root = manifest_dir.parent().unwrap();
+        let backup_dir = workspace_root.join("local_checkpoints/coordinator_0_0/guta_updates_backup");
+
+        if !backup_dir.exists() {
+            return Ok(());
+        }
+
+        let mut total_files = 0usize;
+        let mut ok_files = 0usize;
+        let mut bad_files = Vec::new();
+
+        for entry in fs::read_dir(&backup_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().map(|e| e == "backup").unwrap_or(false) {
+                total_files += 1;
+        match verify_local_coordinator_backup_file(&path).await {
+                    Ok(()) => ok_files += 1,
+                    Err(e) => {
+                        eprintln!("BAD: {} -> {}", path.display(), e);
+                        bad_files.push((path.display().to_string(), e.to_string()));
+                    }
+                }
+            }
+        }
+
+        println!("Total: {}, OK: {}, Bad: {}", total_files, ok_files, bad_files.len());
+        if !bad_files.is_empty() {
+            anyhow::bail!("{} coordinator backup files failed verification", bad_files.len());
+        }
+
+        Ok(())
+    }
+
+    async fn verify_local_coordinator_backup_file(path: &Path) -> anyhow::Result<()> {
+        let data = fs::read(path)?;
+        if data.len() < 36 {
+            anyhow::bail!("file too small: {} bytes", data.len());
+        }
+
+        let start_root = PHash::from_owned_32bytes(data[4..36].try_into().unwrap());
+        let mut tree = SimpleMemoryMerkleRecorderStore::<PoseidonHasher, PHash>::new(4);
+        tree.set_node_value(SimpleMerkleNodeKey::new_root(), start_root);
+        tree.commit_changes();
+
+        let file_system = SimpleMockMemoryFileSystem::new();
+        let path_str = path.to_string_lossy().to_string();
+        file_system.files.insert(path_str.clone(), data);
+
+        let output =
+            read_coordinator_guta_update_gatherer_backup_file::<PoseidonHasher, PHash, PF, SimpleMockMemoryFileSystem>(&file_system, &path_str, &mut tree)
+                .await?;
+
+        if output.total_guta_inputs == 0 && output.total_guta_proofs_generated.to_u64_value() == 0 {
+            tracing::debug!("coordinator backup {} is empty after parse", path.display());
+        }
+
+        Ok(())
     }
 }

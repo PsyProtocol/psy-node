@@ -1,0 +1,67 @@
+:root {
+  --cp-bg-base: #050505;
+  --cp-bg-surface: #0b0b0b;
+  --cp-bg-surface-alt: #101010;
+  --cp-bg-hover: #141414;
+  --cp-bg-active: #1a1a1a;
+
+  --cp-border-subtle: #131313;
+  --cp-border-default: #1a1a1a;
+  --cp-border-strong: #242424;
+
+  --cp-text-primary: #f4f4f4;
+  --cp-text-secondary: #8a8a8a;
+  --cp-text-tertiary: #666666;
+
+  --cp-accent-primary: #00e5a8;
+  --cp-accent-primary-dim: rgba(0, 229, 168, 0.16);
+  --cp-accent-info: #6e9bff;
+  --cp-accent-success: #86efac;
+  --cp-accent-warning: #fcd34d;
+  --cp-accent-danger: #fca5a5;
+
+  --cp-radius-sm: 4px;
+  --cp-radius-md: 6px;
+  --cp-radius-lg: 10px;
+
+  --cp-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.2);
+  --cp-shadow-md: 0 8px 24px rgba(0, 0, 0, 0.28);
+  --cp-shadow-lg: 0 16px 40px rgba(0, 0, 0, 0.36);
+
+  --bg-primary: var(--cp-bg-base);
+  --bg-secondary: var(--cp-bg-surface);
+  --bg-tertiary: var(--cp-bg-surface-alt);
+  --bg-elevated: var(--cp-bg-surface);
+  --bg-hover: var(--cp-bg-hover);
+  --bg-active: var(--cp-bg-active);
+
+  --border-default: var(--cp-border-default);
+  --border-muted: var(--cp-border-subtle);
+  --border-subtle-strong: var(--cp-border-strong);
+  --border-accent: var(--cp-accent-primary);
+
+  --text-primary: var(--cp-text-primary);
+  --text-secondary: var(--cp-text-secondary);
+  --text-tertiary: var(--cp-text-tertiary);
+  --text-link: var(--cp-accent-info);
+
+  --accent-blue: var(--cp-accent-info);
+  --accent-green: var(--cp-accent-primary);
+  --accent-red: #ef4444;
+  --accent-orange: #f59e0b;
+  --accent-purple: #8b5cf6;
+  --accent-cyan: #22d3ee;
+
+  --radius-sm: var(--cp-radius-sm);
+  --radius-md: var(--cp-radius-md);
+  --radius-lg: var(--cp-radius-lg);
+  --radius-xl: 12px;
+
+  --shadow-sm: var(--cp-shadow-sm);
+  --shadow-md: var(--cp-shadow-md);
+  --shadow-lg: var(--cp-shadow-lg);
+
+  --font-sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
+  --font-display: var(--font-sans);
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+}

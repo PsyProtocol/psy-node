@@ -40,6 +40,9 @@ pub struct QJumboStore<
     ZeroIdMerkleTableIdentifier: THStandardTableIdentifier,
     RewardTreeTableIdentifier: THStandardTableIdentifier,
     HashToManyIdsTableIdentifier: THStandardTableIdentifier,
+    IMTLeafTableIdentifier: THStandardTableIdentifier,
+    IMTKeyIndexTableIdentifier: THStandardTableIdentifier,
+    IMTNextAppendIndexTableIdentifier: THStandardTableIdentifier,
     S: CoreDatabaseStore<
             Hash,
             Hasher,
@@ -55,6 +58,9 @@ pub struct QJumboStore<
             ZeroIdMerkleTableIdentifier,
             RewardTreeTableIdentifier,
             HashToManyIdsTableIdentifier,
+            IMTLeafTableIdentifier,
+            IMTKeyIndexTableIdentifier,
+            IMTNextAppendIndexTableIdentifier,
         >
         + Send
         + Sync,
@@ -104,6 +110,7 @@ pub struct QJumboStore<
     _phantom_obj_single_id_table_b_value: std::marker::PhantomData<ObjSingleIdTableAValue>,
     _phantom_obj_double_id_table_a_value: std::marker::PhantomData<ObjDoubleIdTableBValue>,
     _phantom_obj_double_id_table_b_value: std::marker::PhantomData<ObjDoubleIdTableBValue>,
+    _phantom_value: std::marker::PhantomData<(IMTLeafTableIdentifier, IMTKeyIndexTableIdentifier, IMTNextAppendIndexTableIdentifier)>,
 }
 
 //#[async_trait]
@@ -136,6 +143,9 @@ impl<
         ZeroIdMerkleTableIdentifier: THStandardTableIdentifier,
         RewardTreeTableIdentifier: THStandardTableIdentifier,
         HashToManyIdsTableIdentifier: THStandardTableIdentifier,
+        IMTLeafTableIdentifier: THStandardTableIdentifier,
+        IMTKeyIndexTableIdentifier: THStandardTableIdentifier,
+        IMTNextAppendIndexTableIdentifier: THStandardTableIdentifier,
         S: CoreDatabaseStore<
                 Hash,
                 Hasher,
@@ -151,6 +161,9 @@ impl<
                 ZeroIdMerkleTableIdentifier,
                 RewardTreeTableIdentifier,
                 HashToManyIdsTableIdentifier,
+                IMTLeafTableIdentifier,
+                IMTKeyIndexTableIdentifier,
+                IMTNextAppendIndexTableIdentifier,
             >
             + Send
             + Sync,
@@ -184,7 +197,9 @@ impl<
         ZeroIdMerkleTableIdentifier,
         RewardTreeTableIdentifier,
         HashToManyIdsTableIdentifier,
-        
+        IMTLeafTableIdentifier,
+        IMTKeyIndexTableIdentifier,
+        IMTNextAppendIndexTableIdentifier,
         S,
     >
 {
@@ -255,6 +270,7 @@ impl<
             _phantom_obj_single_id_table_b_value: std::marker::PhantomData,
             _phantom_obj_double_id_table_a_value: std::marker::PhantomData,
             _phantom_obj_double_id_table_b_value: std::marker::PhantomData,
+            _phantom_value: std::marker::PhantomData,
         }
     }
 

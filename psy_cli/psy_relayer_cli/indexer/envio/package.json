@@ -1,0 +1,14 @@
+{
+  "name": "psy-relayer-envio",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "dev": "node ./generated/src/Index.res.js"
+  },
+  "devDependencies": {
+    "envio": "^2.32.10"
+  },
+  "dependencies": {
+    "@envio-dev/hypersync-client": "1.1.0"
+  }
+}

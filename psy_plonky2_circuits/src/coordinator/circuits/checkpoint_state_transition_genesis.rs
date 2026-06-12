@@ -21,8 +21,9 @@ use crate::{proof_minifier::pm_core::get_circuit_fingerprint_generic, qstandard:
 
 #[derive(Debug)]
 pub struct QEDCheckpointStateTransitionGenesisCircuit<C: GenericConfig<D>, const D: usize> {
-    pub genesis_checkpoint_state_transition_hash: HashOutTarget,
-    pub checkpoint_state_transition_circuit_fingerprint: HashOutTarget,
+    pub checkpoint_tree_root: HashOutTarget,
+    pub checkpoint_leaf_hash: HashOutTarget,
+    pub genesis_fingerprint: HashOutTarget,
     pub circuit_data: CircuitData<C::F, C, D>,
     pub fingerprint: QHashOut<C::F>,
 }
@@ -41,33 +42,18 @@ where
         let config = CircuitConfig::standard_recursion_config();
         let mut builder = CircuitBuilder::<C::F, D>::new(config);
         
-        let genesis_checkpoint_state_transition_hash = builder.add_virtual_hash();
-        let checkpoint_state_transition_circuit_fingerprint = builder.add_virtual_hash();
-        /*
-
-        let checkpoint_tree_root_transition = builder.hash_two_to_one::<H>(self.old_checkpoint_tree_root, self.new_checkpoint_tree_root);
-        let leaf_transition_hash = builder.hash_two_to_one::<H>(self.old_checkpoint_leaf_hash, self.new_checkpoint_leaf_hash);
-
-        let checkpoint_transition_hash = builder.hash_two_to_one::<H>(checkpoint_tree_root_transition, leaf_transition_hash);
-        let config_hash = builder.hash_two_to_one::<H>(genesis_checkpoint_state_transition_hash, checkpoint_state_transition_circuit_fingerprint);
-        builder.hash_two_to_one::<H>(checkpoint_transition_hash, config_hash)
-        
-        public inputs are:
-        hash(genesis_checkpoint_state_transition_hash, hash(genesis_checkpoint_state_transition_hash, checkpoint_state_transition_circuit_fingerprint))
-         */
-        let config_hash = builder.hash_two_to_one::<C::Hasher>(
-            genesis_checkpoint_state_transition_hash,
-            checkpoint_state_transition_circuit_fingerprint,
+        let checkpoint_tree_root = builder.add_virtual_hash();
+        let checkpoint_leaf_hash = builder.add_virtual_hash();
+        let genesis_fingerprint = builder.add_virtual_hash();
+        // chain_0 = H(H(checkpoint_tree_root_0, checkpoint_leaf_hash_0), genesis_fingerprint)
+        let root_leaf = builder.hash_two_to_one::<C::Hasher>(
+            checkpoint_tree_root,
+            checkpoint_leaf_hash,
         );
         let public_inputs_hash = builder.hash_two_to_one::<C::Hasher>(
-            genesis_checkpoint_state_transition_hash,
-            config_hash,
+            root_leaf,
+            genesis_fingerprint,
         );
-        /*
-        let config_hash = Hasher::two_to_one(&self.genesis_checkpoint_state_transition_hash, &self.checkpoint_state_transition_circuit_fingerprint);
-        Hasher::two_to_one(&self.genesis_checkpoint_state_transition_hash, &config_hash)
-    }
-     */
         builder.register_public_inputs(&public_inputs_hash.elements);
         builder.add_qed_type_e_common_gates();
         pad_circuit_degree::<C::F, D>(&mut builder, 11);
@@ -76,8 +62,9 @@ where
         let fingerprint = QHashOut(get_circuit_fingerprint_generic(&circuit_data.verifier_only));
 
         Self {
-            genesis_checkpoint_state_transition_hash,
-            checkpoint_state_transition_circuit_fingerprint,
+            checkpoint_tree_root,
+            checkpoint_leaf_hash,
+            genesis_fingerprint,
             circuit_data,
             fingerprint,
         }
@@ -85,13 +72,14 @@ where
 
     pub fn prove_base(
         &self,
-        genesis_checkpoint_state_transition_hash: QHashOut<C::F>,
-        checkpoint_state_transition_circuit_fingerprint: QHashOut<C::F>,
-
+        checkpoint_tree_root: QHashOut<C::F>,
+        checkpoint_leaf_hash: QHashOut<C::F>,
+        genesis_fingerprint: QHashOut<C::F>,
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
         let mut pw = PartialWitness::<C::F>::new();
-        pw.set_hash_target(self.genesis_checkpoint_state_transition_hash, genesis_checkpoint_state_transition_hash.0)?;
-        pw.set_hash_target(self.checkpoint_state_transition_circuit_fingerprint, checkpoint_state_transition_circuit_fingerprint.0)?;
+        pw.set_hash_target(self.checkpoint_tree_root, checkpoint_tree_root.0)?;
+        pw.set_hash_target(self.checkpoint_leaf_hash, checkpoint_leaf_hash.0)?;
+        pw.set_hash_target(self.genesis_fingerprint, genesis_fingerprint.0)?;
         self.circuit_data.prove(pw)
     }
 }
@@ -132,11 +120,12 @@ where
         let input: PsyCheckpointStateTransitionGenesisCircuitInput::<QHashOut<C::F>> = PsyCheckpointStateTransitionGenesisCircuitInput::<QHashOut<C::F>>::psy_ser_from_slice(&input.base.witness)?;
         let expected_public_inputs = input.get_public_inputs_hash_no_rewards_tag::<C::Hasher>();
         println!("🏛️ Genesis Checkpoint State Transition - expected_public_inputs: {:?}", hex::encode(&expected_public_inputs.into_owned_32bytes()));
-        println!("🏛️ Genesis Checkpoint State Transition - genesis_checkpoint_state_transition_hash: {:?} ({})", input.genesis_checkpoint_state_transition_hash, hex::encode(&input.genesis_checkpoint_state_transition_hash.into_owned_32bytes()));
-        println!("🏛️ Genesis Checkpoint State Transition - checkpoint_state_transition_circuit_fingerprint: {:?} ({})", input.checkpoint_state_transition_circuit_fingerprint, hex::encode(&input.checkpoint_state_transition_circuit_fingerprint.into_owned_32bytes()));
+        println!("🏛️ Genesis Checkpoint State Transition - checkpoint_tree_root: {:?} ({})", input.checkpoint_tree_root, hex::encode(&input.checkpoint_tree_root.into_owned_32bytes()));
+        println!("🏛️ Genesis Checkpoint State Transition - checkpoint_leaf_hash: {:?} ({})", input.checkpoint_leaf_hash, hex::encode(&input.checkpoint_leaf_hash.into_owned_32bytes()));
         let proof = self.prove_base(
-            input.genesis_checkpoint_state_transition_hash,
-            input.checkpoint_state_transition_circuit_fingerprint,
+            input.checkpoint_tree_root,
+            input.checkpoint_leaf_hash,
+            input.genesis_fingerprint,
         )?;
         let got_public_inputs = QHashOut::<C::F>::from_felt_slice(&proof.public_inputs);
         println!("🏛️ Genesis Checkpoint State Transition - got_public_inputs: {:?}", hex::encode(&got_public_inputs.into_owned_32bytes()));

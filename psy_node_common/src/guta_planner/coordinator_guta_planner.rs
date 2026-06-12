@@ -4,12 +4,14 @@ use parth_common::memory_stores::{
     mem_tree_recorder::SimpleMemoryMerkleRecorderStore,
 };
 use parth_core::{
-    crypto::hash::traits::{FieldQHasher, QFieldHashable},
+    crypto::hash::{
+        merkle_proof::DeltaMerkleProofCore,
+        traits::{FieldQHasher, QFieldHashable},
+    },
     data::hash::merkle_node_key::SimpleMerkleNodeKey,
     felt::QFelt64,
     node::realm_identifier::QRealmIdentifier,
     protocol::core_types::{Q256BitHash, QFHashBase},
-    QJobIdBase,
 };
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{
@@ -20,6 +22,7 @@ use psy_data::{
     proof_input::guta::{
         GUTANoChangeFullInput,
         GUTAVerifyLeftLinearRightLeafUpgradeCheckpointCircuitInput,
+        VerifyGUTAToCapCircuitInputSimple,
         GUTAVerifyTwoGUTACircuitInputV2,
         GUTAVerifyTwoGUTALinearCircuitInput,
         GUTAVerifyTwoGUTAUpgradeCheckpointCircuitInputV2,
@@ -94,6 +97,57 @@ impl<F, Hash> CoordinatorGUTAPlanner<F, Hash> {
 }
 
 impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> CoordinatorGUTAPlanner<F, Hash> {
+    fn get_leaf_value_after_pending_updates<Hasher: FieldQHasher<F, Hash>>(
+        global_user_tree: &SimpleMemoryMerkleRecorderStore<Hasher, Hash>,
+        pending_updates: &[(u64, Hash)],
+        index: u64,
+    ) -> Hash {
+        pending_updates
+            .iter()
+            .rev()
+            .find_map(|(updated_index, updated_value)| {
+                if *updated_index == index {
+                    Some(*updated_value)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| global_user_tree.get_e_leaf_value(index))
+    }
+
+    fn ensure_input_leaf_matches_global_tree<Hasher: FieldQHasher<F, Hash>>(
+        global_user_tree: &SimpleMemoryMerkleRecorderStore<Hasher, Hash>,
+        header: &GlobalUserTreeAggregatorHeader<F, Hash>,
+        pending_updates: &[(u64, Hash)],
+    ) -> anyhow::Result<()> {
+        let node_index = header.state_transition.node_index.to_u64_value();
+        let expected_old_value = header.state_transition.old_node_value;
+        let actual_old_value =
+            Self::get_leaf_value_after_pending_updates(global_user_tree, pending_updates, node_index);
+
+        if actual_old_value != expected_old_value {
+            anyhow::bail!(
+                "stale GUTA update: global user tree leaf mismatch at realm index {}: header old leaf {:?}, actual current leaf {:?}, header new leaf {:?}, header checkpoint root {:?}",
+                node_index,
+                expected_old_value,
+                actual_old_value,
+                header.state_transition.new_node_value,
+                header.checkpoint_tree_root,
+            );
+        }
+
+        Ok(())
+    }
+
+    fn apply_input_leaf_update_to_global_tree<Hasher: FieldQHasher<F, Hash>>(
+        global_user_tree: &mut SimpleMemoryMerkleRecorderStore<Hasher, Hash>,
+        header: &GlobalUserTreeAggregatorHeader<F, Hash>,
+    ) -> DeltaMerkleProofCore<Hash> {
+        let node_index = header.state_transition.node_index.to_u64_value();
+        let dmp = global_user_tree.set_e_leaf(node_index, header.state_transition.new_node_value);
+        debug_assert_eq!(dmp.old_value, header.state_transition.old_node_value);
+        dmp
+    }
     
     /// Adds a realm job and immediately performs any possible aggregations.
     /// This builds perfect binary subtrees on the fly, minimizing work for finalize.
@@ -220,15 +274,26 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> CoordinatorGUTAPlanner<F, Ha
 
         let (witness_bytes, new_header, circuit_type) = if left_is_leaf && right_is_leaf {
             // Level R -> Level 0 Promotion
-            
-            let left_dmp = global_user_tree.set_e_leaf(
+            Self::ensure_input_leaf_matches_global_tree::<Hasher>(
+                global_user_tree,
+                &left.header,
+                &[],
+            )?;
+
+            let left_pending_update = [(
                 left.header.state_transition.node_index.to_u64_value(),
                 left.header.state_transition.new_node_value,
-            );
-            let right_dmp = global_user_tree.set_e_leaf(
-                right.header.state_transition.node_index.to_u64_value(),
-                right.header.state_transition.new_node_value,
-            );
+            )];
+            Self::ensure_input_leaf_matches_global_tree::<Hasher>(
+                global_user_tree,
+                &right.header,
+                &left_pending_update,
+            )?;
+
+            let left_dmp =
+                Self::apply_input_leaf_update_to_global_tree::<Hasher>(global_user_tree, &left.header);
+            let right_dmp =
+                Self::apply_input_leaf_update_to_global_tree::<Hasher>(global_user_tree, &right.header);
 
             if left_needs_cp_upgrade || right_needs_cp_upgrade {
                 // Get the current checkpoint index to build upgrade proofs with the CURRENT root
@@ -278,10 +343,13 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> CoordinatorGUTAPlanner<F, Ha
             )
         } else if !left_is_leaf && right_is_leaf {
             // Mixed: Aggregated (Left) + Leaf (Right)
-            let right_dmp = global_user_tree.set_e_leaf(
-                right.header.state_transition.node_index.to_u64_value(),
-                right.header.state_transition.new_node_value,
-            );
+            Self::ensure_input_leaf_matches_global_tree::<Hasher>(
+                global_user_tree,
+                &right.header,
+                &[],
+            )?;
+            let right_dmp =
+                Self::apply_input_leaf_update_to_global_tree::<Hasher>(global_user_tree, &right.header);
 
             // Get the current checkpoint index to build upgrade proof with the CURRENT root
             // Note: left is already at current checkpoint (validated above), so we use left_cp's index
@@ -346,46 +414,63 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> CoordinatorGUTAPlanner<F, Ha
         current_checkpoint_root: &Hash,
         checkpoint_tree: &PsyDashMemoryAppendOnlyMerkleStore<Hasher, Hash>,
         global_user_tree: &mut SimpleMemoryMerkleRecorderStore<Hasher, Hash>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<GlobalUserTreeAggregatorHeader<F, Hash>> {
         if node.node_type != PlannerNodeType::InputLeaf {
              // If it's already linear, it's already a root proof. No action needed.
-             return Ok(());
+             return Ok(node.header);
         }
 
-        let dmp = global_user_tree.set_e_leaf(
-            node.header.state_transition.node_index.to_u64_value(),
-            node.header.state_transition.new_node_value,
-        );
+        Self::ensure_input_leaf_matches_global_tree::<Hasher>(
+            global_user_tree,
+            &node.header,
+            &[],
+        )?;
+        let dmp =
+            Self::apply_input_leaf_update_to_global_tree::<Hasher>(global_user_tree, &node.header);
 
-        let current_checkpoint_index = checkpoint_tree
-            .get_leaf_index_for_root(*current_checkpoint_root)
-            .ok_or_else(|| anyhow::anyhow!(
-                "Current checkpoint root {:?} not found in checkpoint tree",
-                current_checkpoint_root
-            ))?;
+        let (witness_bytes, new_header, circuit_type) =
+            if node.header.checkpoint_tree_root == *current_checkpoint_root {
+                let input = VerifyGUTAToCapCircuitInputSimple {
+                    guta_proof_header: node.header,
+                    top_line_siblings: dmp.siblings,
+                };
+                (
+                    input.psy_ser_to_bytes_vec()?,
+                    input.get_new_guta_header::<Hasher>(),
+                    ProvingJobCircuitType::GUTAVerifyToCap,
+                )
+            } else {
+                let current_checkpoint_index = checkpoint_tree
+                    .get_leaf_index_for_root(*current_checkpoint_root)
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "Current checkpoint root {:?} not found in checkpoint tree",
+                        current_checkpoint_root
+                    ))?;
 
-        println!("node.header.checkpoint_tree_root: {:?}", node.header.checkpoint_tree_root);
-        println!("roots: {:?}", checkpoint_tree.roots);
-        let input = VerifyGUTAToCapUpgradeCheckpointCircuitInputSimple {
-            guta_proof_header: node.header,
-            top_line_siblings: dmp.siblings,
-            historical_checkpoint_proof: checkpoint_tree.get_historical_index_append_only_merkle_proof_for_root(node.header.checkpoint_tree_root, current_checkpoint_index)?,
-            total_aggregation_proofs_generated: node.header.total_aggregation_proofs_generated,
-        };
+                let input = VerifyGUTAToCapUpgradeCheckpointCircuitInputSimple {
+                    guta_proof_header: node.header,
+                    top_line_siblings: dmp.siblings,
+                    historical_checkpoint_proof: checkpoint_tree.get_historical_index_append_only_merkle_proof_for_root(node.header.checkpoint_tree_root, current_checkpoint_index)?,
+                    total_aggregation_proofs_generated: node.header.total_aggregation_proofs_generated,
+                };
 
-        let witness_bytes = input.psy_ser_to_bytes_vec()?;
-        
+                (
+                    input.psy_ser_to_bytes_vec()?,
+                    input.get_new_guta_header::<Hasher>(),
+                    ProvingJobCircuitType::GUTAVerifyToCapWithCheckpointUpgrade,
+                )
+            };
+        let expected_hash = new_header.qfhash::<Hasher>();
+
         let new_job_id = QProvingJobDataID::new_proof_job_id(
             unique_pending_id,
             0,
-            ProvingJobCircuitType::GUTAVerifyToCapWithCheckpointUpgrade,
+            circuit_type,
             0,
             0,
         );
 
         self.job_witnesses.push((new_job_id, witness_bytes));
-
-        let expected_hash = input.get_public_inputs_hash_no_rewards_tag::<Hasher>();
         
         let metadata = PsyProvingJobMetadataWithJobId {
             job_id: new_job_id,
@@ -404,7 +489,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> CoordinatorGUTAPlanner<F, Ha
         }
         self.job_levels[0].push(metadata);
 
-        Ok(()) 
+        Ok(new_header)
     }
 
     fn update_reward_tree_config(
@@ -457,7 +542,11 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> CoordinatorGUTAPlanner<F, Ha
         most_recent_checkpoint_global_state_roots: PQEDCheckpointGlobalStateRoots<Hash>,
         most_recent_checkpoint_stats_hash: Hash,
         guta_circuit_whitelist: Hash,
-    ) -> anyhow::Result<(Vec<Vec<PsyProvingJobMetadataWithJobId<Hash, QProvingJobDataID>>>, HashMap<u64, SimpleMerkleNodeKey>)> {
+    ) -> anyhow::Result<(
+        Vec<Vec<PsyProvingJobMetadataWithJobId<Hash, QProvingJobDataID>>>,
+        HashMap<u64, SimpleMerkleNodeKey>,
+        GlobalUserTreeAggregatorHeader<F, Hash>,
+    )> {
         if !self.has_committed_updates {
             // No updates were committed yet, so we need to process queued updates now.
             let queued_updates = {
@@ -503,20 +592,21 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> CoordinatorGUTAPlanner<F, Ha
         }
 
         // 3. Handle Result
-        if let Some(root_node) = active_nodes.pop() {
+        let root_guta_header = if let Some(root_node) = active_nodes.pop() {
             // If single node remains, promote if it's a leaf.
-            if root_node.node_type == PlannerNodeType::InputLeaf {
-            tracing::info!("No GUTA updates to process, generating singlet root promotion job proof.");
+            let root_guta_header = if root_node.node_type == PlannerNodeType::InputLeaf {
+                tracing::info!("Promoting single GUTA update to cap/root proof.");
                 self.create_singlet_root_promotion_job::<Hasher>(
                     root_node, 
                     unique_pending_id, 
                     current_checkpoint_root,
                     checkpoint_tree, 
                     global_user_tree
-                )?;
+                )?
             }else{
                 tracing::info!("GUTA updates processed, root proof is already linear.");
-            }
+                root_node.header
+            };
             
             // Note: If root_node was already Linear, it is the root proof.
             // We need to find its ID in job_levels to configure rewards.
@@ -525,6 +615,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> CoordinatorGUTAPlanner<F, Ha
                 .ok_or_else(|| anyhow::anyhow!("Planner state error: Active node exists but job list empty"))?;
 
             self.update_reward_tree_config(&root_job_id, reward_tree_root_level, reward_tree_root_index)?;
+            root_guta_header
 
         } else {
             // No inputs -> No Change Proof
@@ -546,7 +637,24 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> CoordinatorGUTAPlanner<F, Ha
                     global_state_roots: most_recent_checkpoint_global_state_roots,
                 },
             };
+            let root_guta_header = GlobalUserTreeAggregatorHeader {
+                guta_circuit_whitelist,
+                checkpoint_tree_root: no_change_input.checkpoint_tree_proof.root,
+                state_transition: psy_data::guta::sub_tree_transition::SubTreeNodeStateTransition {
+                    old_node_value: no_change_input.checkpoint_leaf.global_state_roots.user_tree_root,
+                    new_node_value: no_change_input.checkpoint_leaf.global_state_roots.user_tree_root,
+                    node_index: F::ZERO_VALUE,
+                    node_level: F::ZERO_VALUE,
+                },
+                stats: psy_data::guta::stats::GUTAStats::<F>::get_zero_value(),
+                total_aggregation_proofs_generated: F::from_u8_value(1),
+            };
             let expected_public_inputs_hash = no_change_input.get_public_inputs_hash_no_rewards_tag::<F, Hasher>(guta_circuit_whitelist);
+            println!(
+                "Coordinator no-change metadata root={:?} expected_public_inputs_hash={:?}",
+                guta_circuit_whitelist,
+                expected_public_inputs_hash
+            );
             let witness_bytes = no_change_input.psy_ser_to_bytes_vec()?;
             let new_job_id = QProvingJobDataID::new_proof_job_id(
                 unique_pending_id,
@@ -570,7 +678,8 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> CoordinatorGUTAPlanner<F, Ha
                 },
             };
             self.job_levels.push(vec![metadata]);
-        }
+            root_guta_header
+        };
 
         // 4. Save witnesses
         if !self.job_witnesses.is_empty() {
@@ -579,7 +688,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> CoordinatorGUTAPlanner<F, Ha
             .await?;
         }
 
-        Ok((self.job_levels, self.input_realm_reward_keys))
+        Ok((self.job_levels, self.input_realm_reward_keys, root_guta_header))
     }
 }
 
@@ -595,7 +704,7 @@ mod tests {
         traits::PsyMemoryMerkleStoreImm,
     };
     use parth_core::{
-        crypto::hash::traits::{FieldQHasher, QFieldHashable},
+        crypto::hash::traits::{FieldQHasher, MerkleZeroHasher, QFieldHashable},
         felt::{FromPrimitiveValuesFelt, ZeroableFelt},
         node::realm_identifier::QRealmIdentifier,
         pgoldilocks::PoseidonHasher,
@@ -1185,7 +1294,7 @@ mod tests {
                     guta_circuit_whitelist: Hash::from_values(1, 2, 3, 4),
                     checkpoint_tree_root,
                     state_transition: SubTreeNodeStateTransition {
-                        old_node_value: Hash::rand(),
+                        old_node_value: Hasher::get_zero_hash(0),
                         new_node_value: Hash::rand(),
                         node_index: F::from_u64_value(index),
                         node_level: F::from_u8_value(REALM_LEVEL_U8),
@@ -1212,6 +1321,66 @@ mod tests {
                 0,
             ),
         }
+    }
+
+    fn fixed_header(
+        node_index: u64,
+        old_node_value: Hash,
+        new_node_value: Hash,
+    ) -> GlobalUserTreeAggregatorHeader<F, Hash> {
+        GlobalUserTreeAggregatorHeader {
+            guta_circuit_whitelist: Hash::from_values(1, 2, 3, 4),
+            checkpoint_tree_root: Hash::from_values(5, 6, 7, 8),
+            state_transition: SubTreeNodeStateTransition {
+                old_node_value,
+                new_node_value,
+                node_index: F::from_u64_value(node_index),
+                node_level: F::ZERO_VALUE,
+            },
+            stats: GUTAStats {
+                guta_fees_collected: F::ZERO_VALUE,
+                da_fees_collected: F::ZERO_VALUE,
+                user_ops_processed: F::ZERO_VALUE,
+                total_transactions: F::ZERO_VALUE,
+                slots_modified: F::ZERO_VALUE,
+            },
+            total_aggregation_proofs_generated: F::from_u8_value(1),
+        }
+    }
+
+    #[test]
+    fn rejects_stale_leaf_update_before_mutation() {
+        let tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(4);
+        let stale_header = fixed_header(
+            3,
+            Hash::from_values(10, 11, 12, 13),
+            Hash::from_values(20, 21, 22, 23),
+        );
+
+        let err = CoordinatorGUTAPlanner::<F, Hash>::ensure_input_leaf_matches_global_tree::<Hasher>(
+            &tree,
+            &stale_header,
+            &[],
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("stale GUTA update"));
+        assert_eq!(tree.get_e_leaf_value(3), Hasher::get_zero_hash(0));
+    }
+
+    #[test]
+    fn accepts_second_update_against_pending_first_update() {
+        let tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(4);
+        let first_new_value = Hash::from_values(20, 21, 22, 23);
+        let second_header = fixed_header(3, first_new_value, Hash::from_values(30, 31, 32, 33));
+        let pending_updates = [(3, first_new_value)];
+
+        CoordinatorGUTAPlanner::<F, Hash>::ensure_input_leaf_matches_global_tree::<Hasher>(
+            &tree,
+            &second_header,
+            &pending_updates,
+        )
+        .unwrap();
     }
 
     fn gen_rand_unique_array_of_u64s_in_range(len: usize, range_start: u64, range_end: u64) -> Vec<u64> {
@@ -1294,7 +1463,7 @@ mod tests {
         let guta_circuit_whitelist = Hash::from_values(1, 2, 3, 4);
 
         
-        let (result, _) = planner
+        let (result, _, _) = planner
             .finalize_with_reward_ids(
                 &realm_identifier,
                 unique_pending_id,
@@ -1364,4 +1533,3 @@ mod tests {
         }
     }
 }
-

@@ -47,15 +47,14 @@ pub async fn load_coordinator_memory_trees_from_db<
             (1u64<<N::BATCH_USER_REGISTRATION_SUB_TREE_HEIGHT) as usize,
         )
         .await?;
-    let global_user_tree=
-        load_global_user_tree_from_db::<N::HasherBase, Store, N::QHash>(
-            db_reader,
-            N::GLOBAL_USER_TREE_HEIGHT,
-            N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
-            checkpoint_id,
-            1000,
-        )
-        .await?;
+    let global_user_tree = load_global_user_tree_from_db::<N::HasherBase, Store, N::QHash>(
+        db_reader,
+        N::GLOBAL_USER_TREE_HEIGHT,
+        N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
+        checkpoint_id,
+        1000,
+    )
+    .await?;
     let (next_contract_id, global_contract_tree) =
         load_global_contract_tree_append_only_pivot_from_db::<N::HasherBase, Store, N::QHash>(
             db_reader,

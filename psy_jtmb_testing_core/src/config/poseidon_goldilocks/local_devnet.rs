@@ -33,12 +33,14 @@ pub fn get_psy_node_jtmb_poseidon_goldilocks_config_for_network(network: PsyChai
     let deploy_contracts_circuit_whitelist_root = Hasher::two_to_one(&batch_deploy_contracts_fingerprint, &agg_state_transition_fingerprint);
 
     let checkpoint_state_transition_circuit_fingerprint = lib.get_fingerprint(ProvingJobCircuitType::GenerateRollupStateTransitionProof)?;
+    let genesis_checkpoint_state_transition_fingerprint = lib.get_fingerprint(ProvingJobCircuitType::GenesisBlockCheckpointStateTransition)?;
 
     Ok(PsyNodeCircuitFingerprintConfig {
         guta_circuit_whitelist_root,
         register_users_circuit_whitelist_root,
         deploy_contracts_circuit_whitelist_root,
         checkpoint_state_transition_circuit_fingerprint,
+        genesis_checkpoint_state_transition_fingerprint,
     })
 }
 

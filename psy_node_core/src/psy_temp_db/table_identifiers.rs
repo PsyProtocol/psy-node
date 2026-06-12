@@ -29,6 +29,10 @@ pub const TEMP_TABLE_ID_USER_CONTRACT_TREE_UPDATES: u16 = 0x5543; // 'CU'
 pub const TEMP_TABLE_ID_USER_CONTRACT_TREE_UPDATES_BYTES: [u8; 2] = [0x43, 0x55]; // 'CU'
 pub const TEMP_TABLE_USER_CONTRACT_TREE_UPDATES_KEY_SIZE: usize = 24; // 4 + 2 + 2 + 8 + 8
 
+pub const TEMP_TABLE_ID_USER_END_CAP_SLOT_UPDATES: u16 = 0x5553; // 'SU'
+pub const TEMP_TABLE_ID_USER_END_CAP_SLOT_UPDATES_BYTES: [u8; 2] = [0x53, 0x55]; // 'SU'
+pub const TEMP_TABLE_USER_END_CAP_SLOT_UPDATES_KEY_SIZE: usize = 24; // 4 + 2 + 2 + 8 + 8
+
 pub const TEMP_TABLE_ID_TAG_TREE_VALUES: u16 = 0x5654; // 'TV'
 pub const TEMP_TABLE_ID_TAG_TREE_VALUES_BYTES: [u8; 2] = [0x54, 0x56]; // 'TV'
 pub const TEMP_TABLE_TAG_TREE_VALUES_KEY_SIZE: usize = 40; // 4 + 2 + 2 + 8 + 24
@@ -268,6 +272,38 @@ pub fn tt_get_contract_updates_key(
     key[8..16].copy_from_slice(&unique_pending_id.to_le_bytes());
     key[16..24].copy_from_slice(&user_id.to_le_bytes());
     key
+}
+
+#[inline(always)]
+pub fn tt_get_user_end_cap_slot_updates_key(
+    realm_id: u32,
+    realm_sub_id: u16,
+    unique_pending_id: u64,
+    user_id: u64,
+) -> [u8; 24] {
+    let mut key = [0u8; 24];
+    key[0..4].copy_from_slice(&realm_id.to_le_bytes());
+    key[4..6].copy_from_slice(&realm_sub_id.to_le_bytes());
+    key[6..8].copy_from_slice(&TEMP_TABLE_ID_USER_END_CAP_SLOT_UPDATES_BYTES);
+    key[8..16].copy_from_slice(&unique_pending_id.to_le_bytes());
+    key[16..24].copy_from_slice(&user_id.to_le_bytes());
+    key
+}
+
+#[inline(always)]
+pub fn tt_write_user_end_cap_slot_updates_key<Writer: psy_io::Write>(
+    writer: &mut Writer,
+    realm_id: u32,
+    realm_sub_id: u16,
+    unique_pending_id: u64,
+    user_id: u64,
+) -> anyhow::Result<()> {
+    writer.write_all(&realm_id.to_le_bytes())?;
+    writer.write_all(&realm_sub_id.to_le_bytes())?;
+    writer.write_all(&TEMP_TABLE_ID_USER_END_CAP_SLOT_UPDATES_BYTES)?;
+    writer.write_all(&unique_pending_id.to_le_bytes())?;
+    writer.write_all(&user_id.to_le_bytes())?;
+    Ok(())
 }
 
 #[inline(always)]

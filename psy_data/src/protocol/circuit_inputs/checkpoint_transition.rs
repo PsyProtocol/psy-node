@@ -96,6 +96,8 @@ pub struct QCQEDCheckpointStateTransitionInput<F, Hash> {
     // block 1, this is the genesis checkpoint tree leaf and root hash
     pub last_old_checkpoint_tree_leaf_hash: Hash,
     pub last_old_checkpoint_tree_root_hash: Hash,
+    pub previous_chain_hash: Hash,
+    pub checkpoint_state_transition_circuit_fingerprint: Hash,
 }
 impl<F: QFelt64, Hash: QFHashBase<F>> QCQEDCheckpointStateTransitionInput<F, Hash> {
     pub fn update_with_new_reward_tree_root<Hasher: FieldQHasher<F, Hash>>(&mut self, reward_tree_root: Hash) {
@@ -123,43 +125,78 @@ impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for QCQEDCheckpointStateTran
             genesis_checkpoint_state_transition_hash: Hash::qp_rand_gen(),
             last_old_checkpoint_tree_leaf_hash: Hash::qp_rand_gen(),
             last_old_checkpoint_tree_root_hash: Hash::qp_rand_gen(),
+            previous_chain_hash: Hash::qp_rand_gen(),
+            checkpoint_state_transition_circuit_fingerprint: Hash::qp_rand_gen(),
         }
     }
 }
 impl<F, Hash: Copy> QCQEDCheckpointStateTransitionInput<F, Hash> {
-    pub fn get_public_inputs_hash_with_fingerprint<Hasher: MerkleHasher<Hash>>(&self, checkpoint_state_transition_circuit_fingerprint: Hash) -> Hash {
+    /// New chain-mode step hash for current checkpoint i:
+    /// step_i = H(checkpoint_tree_root_i, checkpoint_leaf_hash_i, checkpoint_transition_fingerprint)
+    pub fn get_step_commit_hash_with_fingerprint<Hasher: MerkleHasher<Hash>>(
+        &self,
+        checkpoint_state_transition_circuit_fingerprint: Hash,
+    ) -> Hash {
+        let checkpoint_transition = CheckpointStateHashTransition {
+            old_checkpoint_tree_root: self.append_checkpoint_tree_proof.old_root,
+            new_checkpoint_tree_root: self.append_checkpoint_tree_proof.new_root,
+            old_checkpoint_leaf_hash: self.previous_checkpoint_proof.value,
+            new_checkpoint_leaf_hash: self.append_checkpoint_tree_proof.new_value,
+        };
         let data = CheckpointStateTransitionPublicInputs {
-            checkpoint_transition: CheckpointStateHashTransition{
-                old_checkpoint_tree_root: self.append_checkpoint_tree_proof.old_root,
-                new_checkpoint_tree_root: self.append_checkpoint_tree_proof.new_root,
-                old_checkpoint_leaf_hash: self.previous_checkpoint_proof.value,
-                new_checkpoint_leaf_hash: self.append_checkpoint_tree_proof.new_value,
-            },
+            checkpoint_transition,
             genesis_checkpoint_state_transition_hash: self.genesis_checkpoint_state_transition_hash,
             checkpoint_state_transition_circuit_fingerprint,
         };
-        data.get_public_inputs_hash_no_rewards_tag::<Hasher>()
+        data.get_step_commit_hash::<Hasher>()
     }
-    pub fn get_previous_proof_expected_public_inputs_hash_with_fingerprint<Hasher: MerkleHasher<Hash>>(&self, checkpoint_state_transition_circuit_fingerprint: Hash) -> Hash {
+
+    /// New chain-mode public input:
+    /// chain_i = H(chain_{i-1}, step_i)
+    pub fn get_chain_hash_from_previous_with_fingerprint<Hasher: MerkleHasher<Hash>>(
+        &self,
+        previous_chain_hash: Hash,
+        checkpoint_state_transition_circuit_fingerprint: Hash,
+    ) -> Hash {
+        let checkpoint_transition = CheckpointStateHashTransition {
+            old_checkpoint_tree_root: self.append_checkpoint_tree_proof.old_root,
+            new_checkpoint_tree_root: self.append_checkpoint_tree_proof.new_root,
+            old_checkpoint_leaf_hash: self.previous_checkpoint_proof.value,
+            new_checkpoint_leaf_hash: self.append_checkpoint_tree_proof.new_value,
+        };
         let data = CheckpointStateTransitionPublicInputs {
-            checkpoint_transition: CheckpointStateHashTransition{
-                old_checkpoint_tree_root: self.last_old_checkpoint_tree_root_hash,
-                new_checkpoint_tree_root: self.previous_checkpoint_proof.root,
-                old_checkpoint_leaf_hash: self.last_old_checkpoint_tree_leaf_hash,
-                new_checkpoint_leaf_hash: self.previous_checkpoint_proof.value,
-            },
+            checkpoint_transition,
             genesis_checkpoint_state_transition_hash: self.genesis_checkpoint_state_transition_hash,
             checkpoint_state_transition_circuit_fingerprint,
         };
-        data.get_public_inputs_hash_no_rewards_tag::<Hasher>()
+        data.get_chain_hash_from_previous::<Hasher>(&previous_chain_hash)
+    }
+
+    pub fn get_chain_hash_with_fingerprint_from_previous<Hasher: MerkleHasher<Hash>>(
+        &self,
+        previous_chain_hash: Hash,
+        checkpoint_state_transition_circuit_fingerprint: Hash,
+    ) -> Hash {
+        self.get_chain_hash_from_previous_with_fingerprint::<Hasher>(
+            previous_chain_hash,
+            checkpoint_state_transition_circuit_fingerprint,
+        )
     }
 }
 
 impl<F: QFelt64, Hash: Q256BitHash + QHashBase + QFHashBase<F>> QCQEDCheckpointStateTransitionInput<F, Hash> {
-    pub fn get_public_inputs_hash_with_fingerprint_and_reward_root<Hasher: FieldQHasher<F, Hash>>(&self, checkpoint_state_transition_circuit_fingerprint: Hash, reward_root: Hash) -> Hash {
+    pub fn get_chain_hash_with_fingerprint_and_reward_root<Hasher: FieldQHasher<F, Hash>>(
+        &self,
+        previous_chain_hash: Hash,
+        checkpoint_state_transition_circuit_fingerprint: Hash,
+        reward_root: Hash,
+    ) -> Hash {
         let mut modified = self.clone();
         modified.update_with_new_reward_tree_root::<Hasher>(reward_root);
-        modified.get_public_inputs_hash_with_fingerprint::<Hasher>(checkpoint_state_transition_circuit_fingerprint)
+        modified.get_chain_hash_with_fingerprint_from_previous::<Hasher>(
+            previous_chain_hash,
+            checkpoint_state_transition_circuit_fingerprint,
+        )
     }
 }
 impl<F: QFelt64, Hash: Q256BitHash> PsyCanonicalSerializeMetadata for QCQEDCheckpointStateTransitionInput<F, Hash> {
@@ -171,7 +208,7 @@ impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for QCQEDCheck
     fn fallback_pio_serialized_size(&self) -> usize {
         self.partial.pio_serialized_size()
         + self.append_checkpoint_tree_proof.pio_serialized_size()
-        + self.previous_checkpoint_proof.pio_serialized_size() + 32*3
+        + self.previous_checkpoint_proof.pio_serialized_size() + 32*5
     }
     
     fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
@@ -181,6 +218,8 @@ impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for QCQEDCheck
         writer.psy_write_bytes_fixed(&self.genesis_checkpoint_state_transition_hash.into_owned_32bytes())?;
         writer.psy_write_bytes_fixed(&self.last_old_checkpoint_tree_leaf_hash.into_owned_32bytes())?;
         writer.psy_write_bytes_fixed(&self.last_old_checkpoint_tree_root_hash.into_owned_32bytes())?;
+        writer.psy_write_bytes_fixed(&self.previous_chain_hash.into_owned_32bytes())?;
+        writer.psy_write_bytes_fixed(&self.checkpoint_state_transition_circuit_fingerprint.into_owned_32bytes())?;
         Ok(())
     }
     
@@ -191,6 +230,8 @@ impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for QCQEDCheck
         let genesis_checkpoint_state_transition_hash = Hash::from_owned_32bytes(reader.psy_read_bytes_32()?);
         let last_old_checkpoint_tree_leaf_hash = Hash::from_owned_32bytes(reader.psy_read_bytes_32()?);
         let last_old_checkpoint_tree_root_hash = Hash::from_owned_32bytes(reader.psy_read_bytes_32()?);
+        let previous_chain_hash = Hash::from_owned_32bytes(reader.psy_read_bytes_32()?);
+        let checkpoint_state_transition_circuit_fingerprint = Hash::from_owned_32bytes(reader.psy_read_bytes_32()?);
         Ok(Self {
             partial,
             append_checkpoint_tree_proof,
@@ -198,6 +239,8 @@ impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for QCQEDCheck
             genesis_checkpoint_state_transition_hash,
             last_old_checkpoint_tree_leaf_hash,
             last_old_checkpoint_tree_root_hash,
+            previous_chain_hash,
+            checkpoint_state_transition_circuit_fingerprint,
         })
     }
 }
@@ -236,7 +279,7 @@ impl<F: QFelt64, Hash: QFHashBase<F>> QCQEDCheckpointStateTransitionInputPartial
                 pm_jobs_completed: self.pm_jobs_completed,
                 block_time: self.block_time,
                 random_seed: self.final_random_seed_contribution,//Hasher::two_to_one(&self.old_stats.random_seed, &self.final_random_seed_contribution),
-                pm_rewards_commitment: PPMRewardCommitment {  // TODO: update this reward commitment to reflect the new tag-tree based commitment
+                pm_rewards_commitment: PPMRewardCommitment {
                     register_users_root: reward_tree_root,
                     gutas_root: reward_tree_root,
                     deploy_contracts_root: reward_tree_root,

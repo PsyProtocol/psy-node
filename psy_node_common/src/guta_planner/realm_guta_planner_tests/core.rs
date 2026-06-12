@@ -26,7 +26,7 @@ impl QNetworkTreeCircuitSpecificConstants for PsyRGPNetworkConfig {
 
     const DEFAULT_USER_STATE_TREE_ROOT_HASH_U64_X4: [u64; 4] = [3896366420105793420, 17410332186442776169, 7329967984378645716, 6310665049578686403];
 
-    const END_CAP_CIRCUIT_FINGERPRINT_HASH_U64_X4: [u64; 4] = [12754715765406858642, 4612576616381317529, 4116425460980992551, 3077498283916326135];
+    const END_CAP_CIRCUIT_FINGERPRINT_HASH_U64_X4: [u64; 4] = [1412692327731855940, 17963365021580141687, 10532510199226356508, 3943799806037696098];
 }
 
 impl QNetworkTreeConstants for PsyRGPNetworkConfig {
@@ -73,6 +73,9 @@ pub type TempStore = InMemoryTempStore;
 
 pub type PsyRGPTestDatabase = PsyUnifiedCoreDatabaseStore<
     PsyRGPNetworkConfig,
+    InMemoryTableIdentifier,
+    InMemoryTableIdentifier,
+    InMemoryTableIdentifier,
     InMemoryTableIdentifier,
     InMemoryTableIdentifier,
     InMemoryTableIdentifier,
@@ -160,6 +163,10 @@ pub async fn setup_rgp_test_db(store: Arc<InMemoryTestStore>) -> anyhow::Result<
         "checkpoint_zk_proof_and_transition_table",
     ));
 
+    let imt_leaf_table = Arc::new(InMemoryTableIdentifier::new_with_keyspace(&keyspace, "imt_leaf_table"));
+    let imt_key_index_table = Arc::new(InMemoryTableIdentifier::new_with_keyspace(&keyspace, "imt_key_index_table"));
+    let imt_next_append_index_table = Arc::new(InMemoryTableIdentifier::new_with_keyspace(&keyspace, "imt_next_append_index_table"));
+
     let psy_db = PsyUnifiedCoreDatabaseStore::new(
         store.clone(),
         checkpoint_leaf_table,
@@ -195,6 +202,9 @@ pub async fn setup_rgp_test_db(store: Arc<InMemoryTestStore>) -> anyhow::Result<
         contract_leaf_table,
         contract_code_definition_table,
         checkpoint_zk_proof_and_transition_table,
+        imt_leaf_table,
+        imt_key_index_table,
+        imt_next_append_index_table,
     );
     Ok(psy_db)
 }

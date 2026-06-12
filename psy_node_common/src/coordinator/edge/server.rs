@@ -6,6 +6,7 @@ use psy_api_core::{coordinator::standard_edge_rpc::CoordinatorEdgeRpcServer, wor
 use psy_core::job::job_id::QProvingJobDataID;
 use psy_node_core::{psy_core_db::traits::full::{PsyCoordinatorEdgeAPIStoreReader, PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter}, psy_temp_db::StandardEdgeAPITempDBStoreBase, queue::{ephemeral::QStandardEphemeralQueuePublisher, worker_queue::QStandardWorkerQueueSubscriber}, store::traits::proof_store::QParthProofStore};
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::compression::CompressionLayer;
 use tower::limit::ConcurrencyLimitLayer;
 
 use crate::coordinator::edge::handler::CoordinatorEdgeHandler;
@@ -49,11 +50,13 @@ pub async fn start_coordinator_edge_rpc_server<
             ServerConfig::builder()
                 .max_connections(100000)
                 .max_request_body_size(512 * 1024 * 1024)// 512MB
+                .max_response_body_size(512 * 1024 * 1024)// 512MB
                 .build()
         )
         .set_http_middleware(
             tower::ServiceBuilder::new()
                 .layer(cors)
+                .layer(CompressionLayer::new().gzip(true))
         )
         .build(format!("{}:{}", listen, port))
         .await?;

@@ -129,7 +129,16 @@ pser::impl_psy_ser_basic_tests_fallback!(
 
 impl<F: QFelt64, Hash: Q256BitHash> PCoreQueueItemBase for PsyRealmUserUpdateQueueItem<F, Hash> {
     fn is_queue_item(data: &[u8]) -> bool {
-        data.len() == Self::FIXED_SIZE
+        // Variable-length payload:
+        // fixed prefix = job_id + expected_fake_checkpoint_id + 2*hash + user_leaf + stats + events_len(u32)
+        let min_size = QJOB_ID_SERIALIZED_SIZE
+            + 8
+            + 32
+            + 32
+            + PQEDUserLeaf::<F, Hash>::FIXED_SIZE
+            + GUTAStats::<F>::FIXED_SIZE
+            + 4;
+        data.len() >= min_size
     }
 
     fn decode_queue_item_ref(data: &[u8]) -> anyhow::Result<Self> {
@@ -145,10 +154,18 @@ impl<F: QFelt64, Hash: Q256BitHash> PCoreQueueItemBase for PsyRealmUserUpdateQue
     }
 
     fn get_size_hint() -> usize {
-        Self::FIXED_SIZE
+        // Conservative estimate: fixed prefix (job_id + checkpoint_id + 2x hash + user_leaf + stats + events_len)
+        // Actual serialized size varies depending on events count.
+        QJOB_ID_SERIALIZED_SIZE
+            + 8
+            + 32
+            + 32
+            + PQEDUserLeaf::<F, Hash>::FIXED_SIZE
+            + GUTAStats::<F>::FIXED_SIZE
+            + 4
     }
 
     fn has_fixed_size() -> bool {
-        true
+        Self::IS_FIXED_SIZE
     }
 }

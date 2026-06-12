@@ -8,7 +8,7 @@ use parth_core::{
         tag_tree::TagTreeMerkleProof,
     }, data::
         hash::{
-            checkpointed_merkle_node::CheckpointedMerkleHash, merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}, merkle_store_key::{QMerkleStoreDoubleIdKeyWithHeight, QMerkleStoreDoubleIdNode, QMerkleStoreSingleIdKey, QMerkleStoreSingleIdNode}
+            checkpointed_merkle_node::CheckpointedMerkleHash, hash256::Hash256, merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}, merkle_store_key::{QMerkleStoreDoubleIdKeyWithHeight, QMerkleStoreDoubleIdNode, QMerkleStoreSingleIdKey, QMerkleStoreSingleIdNode}
         }
     
 };
@@ -141,6 +141,70 @@ pub trait PsyNodeContractStateTreeTreeDatabaseWriter<Hash> {
     async fn contract_state_tree_set_nodes_ffs(&self, checkpoint_id: u64, data: &[u8]) -> anyhow::Result<()>;
 }
 
+/// Reader trait for Indexed Merkle Tree (IMT) operations on contract state trees.
+///
+/// These operations support 256-bit key → 256-bit value storage with sorted
+/// linked-list pointers for non-membership proofs.
+#[async_trait]
+#[auto_impl(&, Arc)]
+pub trait PsyNodeContractStateIMTDatabaseReader<F, Hash> {
+    /// Get an IMT leaf preimage by its tree-position index.
+    async fn contract_state_imt_get_leaf_preimage(
+        &self,
+        checkpoint_id: u64,
+        user_id: u64,
+        contract_id: u64,
+        leaf_index: u64,
+    ) -> anyhow::Result<Option<psy_data::v1::qdata::contract::IMTContractStateLeaf<F, Hash>>>;
+
+    /// Look up the leaf index for a given key in a contract's IMT.
+    /// Returns None if the key doesn't exist in the tree.
+    async fn contract_state_imt_get_leaf_index_for_key(
+        &self,
+        checkpoint_id: u64,
+        user_id: u64,
+        contract_id: u64,
+        key: &Hash,
+    ) -> anyhow::Result<Option<u64>>;
+
+    /// Find the predecessor leaf for a given key (for non-membership proofs and insertions).
+    /// Returns (leaf_index, leaf_preimage) of the predecessor.
+    async fn contract_state_imt_find_predecessor(
+        &self,
+        checkpoint_id: u64,
+        user_id: u64,
+        contract_id: u64,
+        key: &Hash,
+    ) -> anyhow::Result<(u64, psy_data::v1::qdata::contract::IMTContractStateLeaf<F, Hash>)>;
+
+    /// Get the next append index for a contract's IMT.
+    async fn contract_state_imt_get_next_append_index(
+        &self,
+        user_id: u64,
+        contract_id: u64,
+    ) -> anyhow::Result<u64>;
+}
+
+/// Writer trait for Indexed Merkle Tree (IMT) operations on contract state trees.
+#[async_trait]
+#[auto_impl(&, Arc)]
+pub trait PsyNodeContractStateIMTDatabaseWriter<Hash> {
+    /// Write IMT leaf preimage(s) and key index entries from FFS-serialized data.
+    /// The data format is defined by IMT_LEAF_FFS_ENTRY_SIZE_V2 (161 bytes per entry).
+    async fn contract_state_imt_set_leaves_ffs(
+        &self,
+        checkpoint_id: u64,
+        data: &[u8],
+    ) -> anyhow::Result<()>;
+
+    async fn contract_state_imt_set_next_append_index(
+        &self,
+        user_id: u64,
+        contract_id: u64,
+        next_append_index: u64,
+    ) -> anyhow::Result<()>;
+}
+
 #[async_trait]
 #[auto_impl(&, Arc)]
 pub trait PsyNodeGlobalContractTreeDatabaseReader<Hash> {
@@ -221,6 +285,7 @@ pub trait PsyNodeCoordinatorSpecificDatabaseReader<F, Hash> {
         unique_pending_id: u64,
         realm_id: u64,
     ) -> anyhow::Result<Option<SimpleMerkleNodeKey>>;
+
 }
 #[async_trait]
 #[auto_impl(&, Arc)]
@@ -236,6 +301,7 @@ pub trait PsyNodeCoordinatorSpecificDatabaseWriter<F, Hash> {
         unique_pending_id: u64,
         data: &[u8],
     ) -> anyhow::Result<()>;
+
 }
 
 #[async_trait]
@@ -379,6 +445,8 @@ pub trait PsyRealmEdgeAPIStoreReader<F, Hash>:
     + PsyNodeCoreDatabaseUserStoreReader<F, Hash>
     + PsyNodeCoreDatabaseContractObjectStoreReader<F, Hash>
     + PsyNodeCoreDatabaseBasicContractInfoStoreReader<F, Hash>
+    // IMT reader for contract state indexed merkle trees
+    + PsyNodeContractStateIMTDatabaseReader<F, Hash>
 {
 }
 impl<
@@ -390,7 +458,8 @@ impl<
             + PsyNodeCheckpointRealmSpecificDatabaseReader<F, Hash>
             + PsyNodeCoreDatabaseUserStoreReader<F, Hash>
             + PsyNodeCoreDatabaseContractObjectStoreReader<F, Hash>
-            + PsyNodeCoreDatabaseBasicContractInfoStoreReader<F, Hash>,
+            + PsyNodeCoreDatabaseBasicContractInfoStoreReader<F, Hash>
+            + PsyNodeContractStateIMTDatabaseReader<F, Hash>,
         F,
         Hash,
     > PsyRealmEdgeAPIStoreReader<F, Hash> for T
@@ -511,7 +580,7 @@ pub trait PsyRealmProcessorStore<F, Hash>:
     // 1. Checkpoint Tree (R/W)
     PsyNodeCheckpointTreeDatabaseReader<Hash>
     + PsyNodeCheckpointTreeDatabaseWriter<Hash>
-    
+
     + PsyNodeGlobalUserTreeDatabaseReader<Hash>
     + PsyNodeGlobalUserTreeDatabaseWriter<Hash>
 
@@ -530,6 +599,9 @@ pub trait PsyRealmProcessorStore<F, Hash>:
     + PsyNodeContractStateTreeTreeDatabaseWriter<Hash>
     + PsyNodeCoreDatabaseBasicContractInfoStoreWriter<F, Hash>
     + PsyNodeCoreDatabaseBasicContractInfoStoreReader<F, Hash>
+    // IMT (Indexed Merkle Tree) for contract state
+    + PsyNodeContractStateIMTDatabaseReader<F, Hash>
+    + PsyNodeContractStateIMTDatabaseWriter<Hash>
 
 {
 }
@@ -537,7 +609,7 @@ pub trait PsyRealmProcessorStore<F, Hash>:
 impl<
         T: PsyNodeCheckpointTreeDatabaseReader<Hash>
         + PsyNodeCheckpointTreeDatabaseWriter<Hash>
-        
+
         + PsyNodeGlobalUserTreeDatabaseReader<Hash>
         + PsyNodeGlobalUserTreeDatabaseWriter<Hash>
 
@@ -555,7 +627,10 @@ impl<
         + PsyNodeContractStateTreeTreeDatabaseReader<Hash>
         + PsyNodeContractStateTreeTreeDatabaseWriter<Hash>
         + PsyNodeCoreDatabaseBasicContractInfoStoreWriter<F, Hash>
-        + PsyNodeCoreDatabaseBasicContractInfoStoreReader<F, Hash>,
+        + PsyNodeCoreDatabaseBasicContractInfoStoreReader<F, Hash>
+        // IMT (Indexed Merkle Tree) for contract state
+        + PsyNodeContractStateIMTDatabaseReader<F, Hash>
+        + PsyNodeContractStateIMTDatabaseWriter<Hash>,
         F,
         Hash,
     > PsyRealmProcessorStore<F, Hash> for T

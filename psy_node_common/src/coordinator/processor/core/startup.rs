@@ -76,7 +76,9 @@ where
         tokio::task::JoinHandle<Result<(), anyhow::Error>>,
         tokio::task::JoinHandle<Result<(), anyhow::Error>>,
     )> {
+        tracing::info!("[COORD_STARTUP] processor new start");
         db.ensure_genesis_applied(genesis_block_update.clone()).await?;
+        tracing::info!("[COORD_STARTUP] ensure_genesis_applied done");
         let (
             _db_tree_next_user_registration_id,
             _db_tree_next_contract_id,
@@ -86,6 +88,7 @@ where
         ) = load_coordinator_memory_trees_from_db::<N, _>(&db.db, db.ids.checkpoint_id + 1)
             .await?
             .into_tuple();
+        tracing::info!("[COORD_STARTUP] load_coordinator_memory_trees_from_db done");
         db.init_with_setup_and_genesis(
             &file_system,
             &deploy_contract_gatherer_backup_directory,
@@ -97,6 +100,7 @@ where
             &mut user_registration_tree,
         )
         .await?;
+        tracing::info!("[COORD_STARTUP] init_with_setup_and_genesis done");
         //db.set_new_unique_ids().await?;
         tracing::info!("intialized coordinator processor database, building gatherers...");
 

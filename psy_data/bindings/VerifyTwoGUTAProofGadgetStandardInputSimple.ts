@@ -3,4 +3,4 @@ import type { GUTAStats } from "./GUTAStats";
 import type { PartialUpdateNearestCommonAncestorProof } from "./PartialUpdateNearestCommonAncestorProof";
 import type { QHashOut } from "./QHashOut";
 
-export type VerifyTwoGUTAProofGadgetStandardInputSimple = { checkpoint_tree_root: QHashOut, b_checkpoint_tree_root: QHashOut, stats_a: GUTAStats, stats_b: GUTAStats, nca_proof: PartialUpdateNearestCommonAncestorProof, };
+export type VerifyTwoGUTAProofGadgetStandardInputSimple = { checkpoint_tree_root: QHashOut, b_checkpoint_tree_root: QHashOut, stats_a: GUTAStats, stats_b: GUTAStats, nca_proof: PartialUpdateNearestCommonAncestorProof, total_aggregation_proofs_generated_a: bigint, total_aggregation_proofs_generated_b: bigint, };

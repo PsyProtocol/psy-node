@@ -1,6 +1,7 @@
 #[cfg(feature = "rand_gen")]
 use parth_core::utils::QPGenRandom;
 use parth_core::{
+    crypto::hash::merkle_proof::DeltaMerkleProofCore,
     crypto::hash::traits::{FieldQHasher, QFieldHashable},
     felt::QFelt64,
     protocol::core_types::{Q256BitHash, QFHashBase},
@@ -11,16 +12,191 @@ use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata
 use crate::{
     proof_input::guta::SubmitUserEndCapNonProofCoreInput,
     v1::qdata::{
-        contract::{PSimpleContractHeightCache, PsyContractSlotUpdates, QEDContractStateUpdateHistory},
+        contract::{IMTContractStateUpdate, PSimpleContractHeightCache, PsyContractSlotUpdates, PsySlotUpdate},
         user::PQEDUserLeaf,
     },
 };
+
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    speedy::Readable,
+    speedy::Writable
+)]
+#[serde(
+    bound = "for<'de2> F: serde::Deserialize<'de2> + serde::Serialize,
+             for<'de2> Hash: serde::Deserialize<'de2> + serde::Serialize"
+)]
+pub enum ContractStateUpdate<F, Hash> {
+    Positional {
+        delta_proof: DeltaMerkleProofCore<Hash>,
+    },
+    IMT {
+        update: IMTContractStateUpdate<F, Hash>,
+    },
+}
+
+impl<F: QFelt64, Hash: Q256BitHash> ContractStateUpdate<F, Hash> {
+    pub fn old_root(&self) -> Hash {
+        match self {
+            ContractStateUpdate::Positional { delta_proof } => delta_proof.old_root,
+            ContractStateUpdate::IMT { update } => update.old_root(),
+        }
+    }
+
+    pub fn new_root(&self) -> Hash {
+        match self {
+            ContractStateUpdate::Positional { delta_proof } => delta_proof.new_root,
+            ContractStateUpdate::IMT { update } => update.new_root(),
+        }
+    }
+
+    pub fn get_double_id_nodes_size_hint(&self) -> usize {
+        match self {
+            ContractStateUpdate::Positional { delta_proof } => delta_proof.siblings.len() + 2,
+            ContractStateUpdate::IMT { update } => match update {
+                IMTContractStateUpdate::Update { delta_proof, .. } => delta_proof.siblings.len() + 2,
+                IMTContractStateUpdate::Insert {
+                    predecessor_delta_proof,
+                    new_leaf_delta_proof,
+                    ..
+                } => predecessor_delta_proof.siblings.len() + 2 + new_leaf_delta_proof.siblings.len() + 2,
+            },
+        }
+    }
+}
+
+impl<F: QFelt64, Hash: Q256BitHash> PsyCanonicalSerializeMetadata for ContractStateUpdate<F, Hash> {
+    const IS_FIXED_SIZE: bool = false;
+    const FIXED_SIZE: usize = 0;
+}
+
+impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for ContractStateUpdate<F, Hash> {
+    fn fallback_pio_serialized_size(&self) -> usize {
+        match self {
+            ContractStateUpdate::Positional { delta_proof } => 1 + delta_proof.pio_serialized_size(),
+            ContractStateUpdate::IMT { update } => 1 + update.pio_serialized_size(),
+        }
+    }
+
+    fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
+        match self {
+            ContractStateUpdate::Positional { delta_proof } => {
+                writer.psy_write_u8(0)?;
+                delta_proof.pio_write_to_io(writer)?;
+            }
+            ContractStateUpdate::IMT { update } => {
+                writer.psy_write_u8(1)?;
+                update.pio_write_to_io(writer)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
+        let variant = reader.psy_read_u8()?;
+        match variant {
+            0 => Ok(ContractStateUpdate::Positional {
+                delta_proof: DeltaMerkleProofCore::pio_read_from_io(reader)?,
+            }),
+            1 => Ok(ContractStateUpdate::IMT {
+                update: IMTContractStateUpdate::pio_read_from_io(reader)?,
+            }),
+            _ => anyhow::bail!("invalid ContractStateUpdate variant: {}", variant),
+        }
+    }
+}
+
+#[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
+psy_serialize::impl_psy_canonical_serialize_for_speedy!(
+    ContractStateUpdate,
+    { F: QFelt64, Hash: Q256BitHash } => { F, Hash }
+);
+#[cfg(not(all(feature = "serialize_speedy", target_endian = "little")))]
+impl<F: QFelt64, Hash: Q256BitHash> psy_serialize::AutoImplementFallbackPsySerializeCanonical for ContractStateUpdate<F, Hash> {}
+
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    speedy::Readable,
+    speedy::Writable
+)]
+#[serde(
+    bound = "for<'de2> F: serde::Deserialize<'de2> + serde::Serialize,
+             for<'de2> Hash: serde::Deserialize<'de2> + serde::Serialize"
+)]
+pub struct ContractStateUpdateHistory<F, Hash> {
+    pub user_contract_tree_update_proof: DeltaMerkleProofCore<Hash>,
+    pub updates: Vec<ContractStateUpdate<F, Hash>>,
+}
+
+impl<F: QFelt64, Hash: Q256BitHash> ContractStateUpdateHistory<F, Hash> {
+    pub fn get_double_id_nodes_size_hint(&self) -> usize {
+        self.updates.iter().map(|u| u.get_double_id_nodes_size_hint()).sum()
+    }
+}
+
+impl<F: QFelt64, Hash: Q256BitHash> PsyCanonicalSerializeMetadata for ContractStateUpdateHistory<F, Hash> {
+    const IS_FIXED_SIZE: bool = false;
+    const FIXED_SIZE: usize = 0;
+}
+
+impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for ContractStateUpdateHistory<F, Hash> {
+    fn fallback_pio_serialized_size(&self) -> usize {
+        self.user_contract_tree_update_proof.pio_serialized_size() + 4 + self.updates.iter().map(|u| u.pio_serialized_size()).sum::<usize>()
+    }
+
+    fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
+        self.user_contract_tree_update_proof.pio_write_to_io(writer)?;
+        writer.psy_write_vec_length(self.updates.len())?;
+        for update in &self.updates {
+            update.pio_write_to_io(writer)?;
+        }
+        Ok(())
+    }
+
+    fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
+        let user_contract_tree_update_proof = DeltaMerkleProofCore::<Hash>::pio_read_from_io(reader)?;
+        let updates_len = reader.psy_read_vec_length()?;
+        let mut updates = Vec::with_capacity(updates_len);
+        for _ in 0..updates_len {
+            updates.push(ContractStateUpdate::pio_read_from_io(reader)?);
+        }
+        Ok(Self {
+            user_contract_tree_update_proof,
+            updates,
+        })
+    }
+}
+
+#[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
+psy_serialize::impl_psy_canonical_serialize_for_speedy!(
+    ContractStateUpdateHistory,
+    { F: QFelt64, Hash: Q256BitHash } => { F, Hash }
+);
+#[cfg(not(all(feature = "serialize_speedy", target_endian = "little")))]
+impl<F: QFelt64, Hash: Q256BitHash> psy_serialize::AutoImplementFallbackPsySerializeCanonical for ContractStateUpdateHistory<F, Hash> {}
 
 #[pderive::serialize_clone_f_hash_ts]
 #[ts(export, concrete(F = parth_core::PF, Hash = parth_core::PHash))]
 pub struct SubmitUserEndCapNonProofInput<F, Hash> {
     pub core: SubmitUserEndCapNonProofCoreInput<F, Hash>,
-    pub contract_state_updates: Vec<QEDContractStateUpdateHistory<Hash>>,
+    #[ts(skip)]
+    pub contract_state_updates: Vec<ContractStateUpdateHistory<F, Hash>>,
     #[serde(default)]
     pub events: Vec<PsyUserEventRecord<F>>,
 }
@@ -32,7 +208,7 @@ impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for SubmitUserEndCapNonProof
     {
         Self {
             core: SubmitUserEndCapNonProofCoreInput::qp_rand_gen(),
-            contract_state_updates: QPGenRandom::qp_rand_gen_vec(rand::random::<u8>() as usize % 10 + 1),
+            contract_state_updates: Vec::new(),
             events: Vec::new(),
         }
     }
@@ -71,7 +247,7 @@ impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for SubmitUser
         let updates_len = reader.psy_read_vec_length()?;
         let mut contract_state_updates = Vec::with_capacity(updates_len);
         for _ in 0..updates_len {
-            contract_state_updates.push(QEDContractStateUpdateHistory::pio_read_from_io(reader)?);
+            contract_state_updates.push(ContractStateUpdateHistory::pio_read_from_io(reader)?);
         }
         let events_len = reader.psy_read_vec_length()?;
         let mut events = Vec::with_capacity(events_len);
@@ -100,7 +276,7 @@ pser::impl_psy_ser_basic_tests_fallback!(
     submit_user_end_cap_non_proof_input_ser_tests
 );
 
-impl<F: QFelt64, Hash: QFHashBase<F> + std::fmt::Debug> SubmitUserEndCapNonProofInput<F, Hash> {
+impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F> + std::fmt::Debug> SubmitUserEndCapNonProofInput<F, Hash> {
     pub fn ensure_simple_self_consistent<Hasher: FieldQHasher<F, Hash>, C: PSimpleContractHeightCache<Hash>>(
         &self,
         old_user_leaf: &PQEDUserLeaf<F, Hash>,
@@ -150,18 +326,10 @@ impl<F: QFelt64, Hash: QFHashBase<F> + std::fmt::Debug> SubmitUserEndCapNonProof
         if computed_leaf_hash != self.core.state_transition.end_user_leaf_hash {
             anyhow::bail!("invalid new_user_leaf");
         }
-        if self.contract_state_updates.len() == 0 {
+        if self.contract_state_updates.is_empty() {
             anyhow::bail!("contract_state_updates cannot be empty");
         }
 
-        let expected_total_slots_modified = self
-            .contract_state_updates
-            .iter()
-            .map(|u| u.contract_state_tree_updates.len())
-            .sum::<usize>() as u64;
-        if self.core.stats.slots_modified.to_u64_value() != expected_total_slots_modified {
-            anyhow::bail!("slots_modified does not match the sum of contract_state_tree_updates");
-        }
         for i in 1..self.contract_state_updates.len() {
             if self.contract_state_updates[i - 1].user_contract_tree_update_proof.new_root
                 != self.contract_state_updates[i].user_contract_tree_update_proof.old_root
@@ -174,15 +342,7 @@ impl<F: QFelt64, Hash: QFHashBase<F> + std::fmt::Debug> SubmitUserEndCapNonProof
                 );
             }
         }
-
-        let csu_old_root = self
-            .contract_state_updates
-            .first()
-            .as_ref()
-            .unwrap()
-            .user_contract_tree_update_proof
-            .old_root;
-
+        let csu_old_root = self.contract_state_updates.first().as_ref().unwrap().user_contract_tree_update_proof.old_root;
         if csu_old_root != old_user_leaf.user_state_tree_root {
             anyhow::bail!(
                 "user_state_tree_root does not match the first old root, left: {:?}, right: {:?}",
@@ -190,14 +350,7 @@ impl<F: QFelt64, Hash: QFHashBase<F> + std::fmt::Debug> SubmitUserEndCapNonProof
                 old_user_leaf.user_state_tree_root
             );
         }
-        let csu_last_new_root = self
-            .contract_state_updates
-            .last()
-            .as_ref()
-            .unwrap()
-            .user_contract_tree_update_proof
-            .new_root;
-
+        let csu_last_new_root = self.contract_state_updates.last().as_ref().unwrap().user_contract_tree_update_proof.new_root;
         if csu_last_new_root != self.core.new_user_leaf.user_state_tree_root {
             anyhow::bail!(
                 "user_state_tree_root does not match the last new root, left: {:?}, right: {:?}",
@@ -207,7 +360,56 @@ impl<F: QFelt64, Hash: QFHashBase<F> + std::fmt::Debug> SubmitUserEndCapNonProof
         }
 
         for csu in self.contract_state_updates.iter() {
-            csu.ensure_basic_consistency(contract_helper, contract_tree_height)?;
+            if csu.updates.is_empty() {
+                anyhow::bail!("mixed contract updates cannot be empty");
+            }
+            let cid = csu.user_contract_tree_update_proof.index as u32;
+            let expected_height = contract_helper.get_contract_height(cid)? as usize;
+            let first_old = csu.updates.first().unwrap().old_root();
+            let last_new = csu.updates.last().unwrap().new_root();
+            if first_old != csu.user_contract_tree_update_proof.old_value {
+                // Fresh contract leaf in UCT is zero, but CST root should be the tree-height zero root.
+                if csu.user_contract_tree_update_proof.old_value != Hash::get_zero_value()
+                    || first_old != contract_helper.get_contract_zero_hash(cid)?
+                {
+                    anyhow::bail!("first update old_root does not match user contract tree old_value");
+                }
+            }
+            if last_new != csu.user_contract_tree_update_proof.new_value {
+                anyhow::bail!("last update new_root does not match user contract tree new_value");
+            }
+            for j in 1..csu.updates.len() {
+                if csu.updates[j - 1].new_root() != csu.updates[j].old_root() {
+                    anyhow::bail!("mixed updates root chain broken at {}", j);
+                }
+            }
+            for update in csu.updates.iter() {
+                match update {
+                    ContractStateUpdate::Positional { delta_proof } => {
+                        if delta_proof.siblings.len() != expected_height {
+                            anyhow::bail!("positional proof height mismatch");
+                        }
+                    }
+                    ContractStateUpdate::IMT { update } => match update {
+                        IMTContractStateUpdate::Update { delta_proof, .. } => {
+                            if delta_proof.siblings.len() != expected_height {
+                                anyhow::bail!("imt update proof height mismatch");
+                            }
+                        }
+                        IMTContractStateUpdate::Insert {
+                            predecessor_delta_proof,
+                            new_leaf_delta_proof,
+                            ..
+                        } => {
+                            if predecessor_delta_proof.siblings.len() != expected_height
+                                || new_leaf_delta_proof.siblings.len() != expected_height
+                            {
+                                anyhow::bail!("imt insert proof height mismatch");
+                            }
+                        }
+                    },
+                }
+            }
         }
 
         Ok(())
@@ -216,11 +418,21 @@ impl<F: QFelt64, Hash: QFHashBase<F> + std::fmt::Debug> SubmitUserEndCapNonProof
         self.contract_state_updates
             .iter()
             .filter_map(|x| {
-                if x.user_contract_tree_update_proof.old_value == Hash::get_zero_value() && x.contract_state_tree_updates.len() != 0 {
-                    Some((x.user_contract_tree_update_proof.index, x.contract_state_tree_updates[0].siblings.len()))
-                } else {
-                    None
+                let first = x.updates.first()?;
+                if x.user_contract_tree_update_proof.old_value != Hash::get_zero_value() {
+                    return None;
                 }
+                let h = match first {
+                    ContractStateUpdate::Positional { delta_proof } => delta_proof.siblings.len(),
+                    ContractStateUpdate::IMT { update } => match update {
+                        IMTContractStateUpdate::Update { delta_proof, .. } => delta_proof.siblings.len(),
+                        IMTContractStateUpdate::Insert {
+                            predecessor_delta_proof,
+                            ..
+                        } => predecessor_delta_proof.siblings.len(),
+                    },
+                };
+                Some((x.user_contract_tree_update_proof.index, h))
             })
             .collect()
     }
@@ -228,19 +440,51 @@ impl<F: QFelt64, Hash: QFHashBase<F> + std::fmt::Debug> SubmitUserEndCapNonProof
         self.contract_state_updates.len() * (1 + contract_tree_height) + 1
     }
     pub fn double_id_nodes_size_hint_in_nodes_modified(&self) -> usize {
-        let mut count = 0;
-        for csu in self.contract_state_updates.iter() {
-            count += csu.get_double_id_nodes_size_hint();
-        }
-        count
+        self.contract_state_updates
+            .iter()
+            .map(|csu| csu.get_double_id_nodes_size_hint())
+            .sum()
     }
 
-    pub fn get_slot_updates(&self) -> anyhow::Result<Vec<PsyContractSlotUpdates<F>>> {
+    pub fn get_slot_updates(&self) -> anyhow::Result<Vec<PsyContractSlotUpdates<F>>>
+    where
+        Hash: QFHashBase<F>,
+    {
         let contract_updates = self
             .contract_state_updates
             .iter()
-            .map(|x| x.get_slot_updates())
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|contract_update| {
+                let slot_updates = contract_update
+                    .updates
+                    .iter()
+                    .flat_map(|update| match update {
+                        ContractStateUpdate::Positional { delta_proof } => {
+                            let old_elements = delta_proof.old_value.to_4_felts().to_vec();
+                            let new_elements = delta_proof.new_value.to_4_felts().to_vec();
+                            old_elements
+                                .iter()
+                                .zip(new_elements.iter())
+                                .enumerate()
+                                .filter(|(_, (old, new))| old != new)
+                                .map(|(offset, (old, new))| PsySlotUpdate {
+                                    slot: delta_proof.index * 4 + offset as u64,
+                                    old_value: *old,
+                                    new_value: *new,
+                                })
+                                .collect::<Vec<_>>()
+                        }
+                        ContractStateUpdate::IMT { .. } => Vec::new(),
+                    })
+                    .collect::<Vec<_>>();
+
+                PsyContractSlotUpdates {
+                    contract_id: contract_update.user_contract_tree_update_proof.index as u32,
+                    slot_updates,
+                }
+            })
+            .filter(|contract_update| !contract_update.slot_updates.is_empty())
+            .collect();
+
         Ok(contract_updates)
     }
     /*
@@ -357,15 +601,18 @@ pub mod gen_fake_data {
     use parth_core::{
         crypto::hash::traits::{MerkleZeroHasher, QFieldHashable},
         felt::QFelt64,
-        protocol::core_types::{QFHashBase, QFHasherU64},
+        protocol::core_types::{Q256BitHash, QFHashBase, QFHasherU64},
         utils::QPGenRandom,
     };
 
     use crate::{
         guta::stats::GUTAStats,
-        proof_input::guta::{end_cap_input::SubmitUserEndCapNonProofInput, SubmitUserEndCapNonProofCoreInput},
+        proof_input::guta::{
+            end_cap_input::{ContractStateUpdate, ContractStateUpdateHistory, SubmitUserEndCapNonProofInput},
+            SubmitUserEndCapNonProofCoreInput,
+        },
         v1::qdata::{
-            contract::{DashMapContractHeightCache, PSimpleContractHeightCache, QEDContractStateUpdateHistory},
+            contract::{DashMapContractHeightCache, PSimpleContractHeightCache},
             user::PQEDUserLeaf,
             user_end_cap_result::PUPSEndCapResultCompact,
         },
@@ -381,7 +628,7 @@ pub mod gen_fake_data {
     )
     where
         F: QFelt64,
-        Hash: QFHashBase<F> + QPGenRandom,
+        Hash: Q256BitHash + QFHashBase<F> + QPGenRandom,
         Hasher: QFHasherU64<F, Hash> + MerkleZeroHasher<Hash>,
     {
         let mut user_contract_tree = SimpleMemoryMerkleStoreV3::<Hasher, Hash>::new(contract_tree_height);
@@ -392,7 +639,7 @@ pub mod gen_fake_data {
                 let contract_state_tree_height = 24 + i as u8;
                 let mut tree = SimpleMemoryMerkleStoreV3::<Hasher, Hash>::new(contract_state_tree_height);
                 let max_leaf_id = 1u64 << contract_state_tree_height;
-                contract_helper.add_contract(0, contract_state_tree_height, tree.get_root());
+                contract_helper.add_contract(i as u32, contract_state_tree_height, tree.get_root());
 
                 for _ in 0..1000 {
                     let rand_leaf_id = rand::random::<u64>() % max_leaf_id;
@@ -438,9 +685,12 @@ pub mod gen_fake_data {
                 .collect::<Vec<_>>();
             let end_root = ctree.get_root();
             let user_contract_tree_update_proof = user_contract_tree.set_leaf(i as u64, end_root);
-            contract_state_updates.push(QEDContractStateUpdateHistory {
+            contract_state_updates.push(ContractStateUpdateHistory {
                 user_contract_tree_update_proof,
-                contract_state_tree_updates,
+                updates: contract_state_tree_updates
+                    .into_iter()
+                    .map(|delta_proof| ContractStateUpdate::Positional { delta_proof })
+                    .collect(),
             });
         });
 

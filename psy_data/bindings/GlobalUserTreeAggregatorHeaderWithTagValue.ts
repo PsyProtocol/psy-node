@@ -2,4 +2,4 @@
 import type { GlobalUserTreeAggregatorHeader } from "./GlobalUserTreeAggregatorHeader";
 import type { QHashOut } from "./QHashOut";
 
-export type GlobalUserTreeAggregatorHeaderWithTagValue = { header_with_stats: GlobalUserTreeAggregatorHeader, new_tag_tree_node_value: QHashOut, };
+export type GlobalUserTreeAggregatorHeaderWithTagValue = { header: GlobalUserTreeAggregatorHeader, new_tag_tree_node_value: QHashOut, };

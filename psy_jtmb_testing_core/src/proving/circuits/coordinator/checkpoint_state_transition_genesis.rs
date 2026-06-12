@@ -53,11 +53,13 @@ impl<C: JTMBCircuitConfig> QEDCheckpointStateTransitionGenesisCircuit<C> {
 
     pub fn prove_base(
         &self,
-        genesis_checkpoint_state_transition_hash: C::Hash,
-        checkpoint_state_transition_circuit_fingerprint: C::Hash,
+        checkpoint_tree_root: C::Hash,
+        checkpoint_leaf_hash: C::Hash,
+        genesis_fingerprint: C::Hash,
     ) -> anyhow::Result<PsyTestJTMBProof<C::Hash>> {
-        let config_hash = C::Hasher::two_to_one(&genesis_checkpoint_state_transition_hash, &checkpoint_state_transition_circuit_fingerprint);
-        let public_inputs_hash = C::Hasher::two_to_one(&genesis_checkpoint_state_transition_hash, &config_hash);
+        // chain_0 = H(H(root_0, leaf_0), genesis_fingerprint)
+        let root_leaf = C::Hasher::two_to_one(&checkpoint_tree_root, &checkpoint_leaf_hash);
+        let public_inputs_hash = C::Hasher::two_to_one(&root_leaf, &genesis_fingerprint);
 
         self.verifier_data.generate_proof_with_signer::<C::Hasher, C::Hash, C::F, _>(
             public_inputs_hash,
@@ -75,8 +77,9 @@ impl<L: PsyJTMBCircuitInfoLibrary<C::Hash>, C: JTMBCircuitConfig> QJTMBProofCirc
     ) -> anyhow::Result<PsyTestJTMBProof<C::Hash>> {
         let witness = PsyCheckpointStateTransitionGenesisCircuitInput::<C::Hash>::psy_ser_from_slice(&input.base.witness)?;
         self.prove_base(
-            witness.genesis_checkpoint_state_transition_hash,
-            witness.checkpoint_state_transition_circuit_fingerprint,
+            witness.checkpoint_tree_root,
+            witness.checkpoint_leaf_hash,
+            witness.genesis_fingerprint,
         )
     }
 }

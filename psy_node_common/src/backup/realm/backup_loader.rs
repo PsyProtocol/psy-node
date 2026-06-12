@@ -56,6 +56,7 @@ pub async fn generate_realm_output_from_backups<
         update_user_contract_tree_nodes_ffs: guta_gatherer_result.update_user_contract_tree_nodes_ffs,
         update_contract_state_tree_nodes_ffs: guta_gatherer_result.update_contract_state_tree_nodes_ffs,
         update_user_leaves_ffs: guta_gatherer_result.update_user_leaves_ffs,
+        update_contract_state_imt_leaves_ffs: guta_gatherer_result.update_contract_state_imt_leaves_ffs,
     };
     Ok(updates)
 }

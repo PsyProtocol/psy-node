@@ -18,10 +18,16 @@ type ExZeroIdMerkleTableIdentifier = InMemoryTableIdentifier;
 type ExTagTreeTableIdentifier = InMemoryTableIdentifier;
 type ExHashToManyIdsTableIdentifier = InMemoryTableIdentifier;
 type ExU64CounterTableIdentifier = InMemoryTableIdentifier;
+type ExIMTLeafTableIdentifier = InMemoryTableIdentifier;
+type ExIMTKeyIndexTableIdentifier = InMemoryTableIdentifier;
+type ExIMTNextAppendIndexTableIdentifier = InMemoryTableIdentifier;
 
 /// Unified Psy Store using InMemoryCoreStore (compatible with ScyllaUnifiedPsyStore interface)
 pub type MemoryUnifiedPsyStore<N, Hash, Hasher> = PsyUnifiedCoreDatabaseStore<
     N,
+    InMemoryTableIdentifier,
+    InMemoryTableIdentifier,
+    InMemoryTableIdentifier,
     InMemoryTableIdentifier,
     InMemoryTableIdentifier,
     InMemoryTableIdentifier,
@@ -82,6 +88,14 @@ pub async fn setup_psy_memory_database_store<N: QNetworkDatabaseTypes>(
     let contract_code_definition_table = store.init_std_table::<ExSingleIdTableIdentifier>("contract_code_definition_table", get_rk(28)).await?;
     let checkpoint_zk_proof_and_transition_table = store.init_std_table::<ExKivTableIdentifier>("checkpoint_zk_proof_and_transition_table", get_rk(29)).await?;
 
+    let imt_leaf_table = store.init_std_table::<ExIMTLeafTableIdentifier>("imt_leaf_table", get_rk(30)).await?;
+    let imt_key_index_table = store
+        .init_std_table::<ExIMTKeyIndexTableIdentifier>("imt_key_index_table", get_rk(31))
+        .await?;
+    let imt_next_append_index_table = store
+        .init_std_table::<ExIMTNextAppendIndexTableIdentifier>("imt_next_append_index_table", get_rk(32))
+        .await?;
+
     let psy_db = PsyUnifiedCoreDatabaseStore::new(
         store.clone(),
         Arc::new(checkpoint_leaf_table),
@@ -117,6 +131,10 @@ pub async fn setup_psy_memory_database_store<N: QNetworkDatabaseTypes>(
         Arc::new(contract_leaf_table),
         Arc::new(contract_code_definition_table),
         Arc::new(checkpoint_zk_proof_and_transition_table),
+        // IMT tables
+        Arc::new(imt_leaf_table),
+        Arc::new(imt_key_index_table),
+        Arc::new(imt_next_append_index_table),
     );
     Ok(psy_db)
 }

@@ -49,11 +49,11 @@ where
     loop {
         let is_active = processor.db.is_active.load(Ordering::SeqCst);
         if is_active {
-            tracing::debug!("[REALM] Sync and verify starting...");
+            // tracing::debug!("[REALM] Sync and verify starting...");
             let sync_result = processor.sync_and_verify().await;
             match sync_result {
                 Ok(_) => {
-                    tracing::debug!("[REALM] Sync and verify completed.");
+                    // tracing::debug!("[REALM] Sync and verify completed.");
                 }
                 Err(e) => {
                     tracing::error!("[REALM] Sync and verify failed: {:?}, skipping block processing", e);

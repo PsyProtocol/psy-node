@@ -1,7 +1,7 @@
 use anyhow::Context;
 use parth_core::data::hash::fast_node_serializer::{QMS_FAST_SERIALIZER_DOUBLE_ID_NODE_SIZE, QMS_FAST_SERIALIZER_SINGLE_ID_NODE_SIZE, QMS_FAST_SERIALIZER_ZERO_ID_NODE_SIZE};
 
-use crate::qblob::{blob_type::{get_item_size_for_data_type, is_valid_qblob_merkle_node_batch_type, QBlobDataType, QBlobMerkleNodeTreeType, QBLOB_STANDARD_V1_MAGIC_U32}, traits::common::QBlobStructHeaderBase};
+use crate::qblob::{blob_type::{get_item_size_for_data_type, is_valid_qblob_merkle_node_batch_type, QBlobDataType, QBlobMerkleNodeTreeType, QBLOB_IMT_LEAF_ENTRY_SIZE, QBLOB_STANDARD_V1_MAGIC_U32}, traits::common::QBlobStructHeaderBase};
 
 pub const QBLOB_TREE_NODE_BATCH_HEADER_SIZE: usize = 80;
 
@@ -119,6 +119,38 @@ impl QBlobMerkleTreeNodeBatchHeaderV1 {
         self.item_size = item_size;
         self.total_size = QBLOB_TREE_NODE_BATCH_HEADER_SIZE as u64 + (item_size as u64 * final_item_count);
     }
+
+    /// Create a new header for IMT leaf batch
+    pub fn new_imt_leaf_header(
+        tree_type: QBlobMerkleNodeTreeType,
+        chain_id: u32,
+        node_id: u32,
+        realm_id: u64,
+        realm_sub_id: u64,
+        unique_pending_id: u64,
+        for_target_id: u64,
+    ) -> Self {
+        Self {
+            blob_magic: QBLOB_STANDARD_V1_MAGIC_U32,
+            chain_id,
+            total_size: 0,
+            created_by_node_id: node_id,
+            created_at_seconds: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as u32,
+            blob_type: QBlobDataType::GenericIMTLeafBatch,
+            tree_type,
+            realm_id,
+            realm_sub_id,
+            unique_pending_id,
+            checkpoint_id: 0,
+            for_target_id,
+            item_count: 0,
+            item_size: QBLOB_IMT_LEAF_ENTRY_SIZE as u32,
+        }
+    }
+
     pub fn is_valid_for_realm_context(&self, chain_id: u32, realm_id: u64, realm_sub_id: u64, unique_pending_id: u64) -> bool {
         self.is_header_valid() && 
         self.chain_id == chain_id &&
@@ -156,6 +188,24 @@ impl QBlobMerkleTreeNodeBatchHeaderV1 {
     }
     pub fn clip_header_get_payload_ref(full_data: &[u8], expected_blob_type: Option<QBlobDataType>, expected_tree_type: Option<QBlobMerkleNodeTreeType>, exact_size: bool) -> anyhow::Result<(Self, &[u8])> {
         Self::clip_header_get_payload_internal_ref(full_data, expected_blob_type, expected_tree_type, exact_size)
+    }
+
+    /// Parse header and return (header, payload, remaining_bytes) - similar to single/double blob parsing
+    /// This is useful for IMT leaf batches where we want to keep remaining bytes for further parsing
+    pub fn clip_header_get_payload_with_remaining(
+        full_data: &[u8],
+        expected_blob_type: QBlobDataType,
+        expected_tree_type: QBlobMerkleNodeTreeType,
+    ) -> anyhow::Result<(Self, &[u8], &[u8])> {
+        let (header, payload) = Self::clip_header_get_payload_for_blob_type_and_tree_ref(
+            full_data,
+            expected_blob_type,
+            expected_tree_type,
+            false, // exact_size = false to allow remaining data
+        )?;
+        // Remaining starts after header + payload (i.e., after header.total_size)
+        let remaining = &full_data[header.total_size as usize..];
+        Ok((header, payload, remaining))
     }
 
     fn clip_header_get_payload_internal(mut full_data: Vec<u8>, expected_blob_type: Option<QBlobDataType>, expected_tree_type: Option<QBlobMerkleNodeTreeType>, exact_size: bool) -> anyhow::Result<(Self, Vec<u8>)> {

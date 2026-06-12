@@ -41,12 +41,8 @@ pub trait QEDCoordinatorTreeStoreReaderAsync<N: QNetworkDatabaseTypes> {
 
 
     async fn get_deposit_tree_root(&self, checkpoint_id: u64) -> anyhow::Result<N::QHash>;
-    async fn get_deposit_tree_leaf_hash(&self, checkpoint_id: u64, deposit_id: u32) -> anyhow::Result<N::QHash>;
-    async fn get_deposit_tree_merkle_proof(&self, checkpoint_id: u64, deposit_id: u32) -> anyhow::Result<MerkleProofCore<N::QHash>>;
 
     async fn get_withdrawal_tree_root(&self, checkpoint_id: u64) -> anyhow::Result<N::QHash>;
-    async fn get_withdrawal_tree_leaf_hash(&self, checkpoint_id: u64, withdrawal_id: u32) -> anyhow::Result<N::QHash>;
-    async fn get_withdrawal_tree_merkle_proof(&self, checkpoint_id: u64, withdrawal_id: u32) -> anyhow::Result<MerkleProofCore<N::QHash>>;
 
     async fn get_latest_checkpoint_tree_root(&self) -> anyhow::Result<N::QHash>;
     async fn get_checkpoint_tree_root(&self, checkpoint_id: u64) -> anyhow::Result<N::QHash>;

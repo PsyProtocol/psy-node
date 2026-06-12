@@ -142,4 +142,15 @@ pub trait QStandardEphemeralQueueSubscriber: QStandardQueueBase {
         task_group: u32,
     ) -> anyhow::Result<Option<QK::QueueItem>>;
 
+    async fn delete_ephemeral_queue_consumer<QK: PCoreStandardQueueKeyForRealm>(
+        &self,
+        _queue_key: &QK,
+        _realm_id: u64,
+        _realm_sub_id: u64,
+        _unique_id: QCoreProcCheckpointUniqueId,
+        _task_group: u32,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
 }

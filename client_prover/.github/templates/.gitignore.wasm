@@ -1,0 +1,27 @@
+.idea
+node_modules
+**/dist*
+results
+.nyc_output
+*.tsbuildinfo
+.DS_Store
+**/.DS_Store
+# SpecStory explanation file
+.specstory
+.cursorrules
+.cursorignore
+.cursor
+.vscode
+.cursorindexingignore
+# SpecStory explanation file
+.specstory/.what-is-this.md
+.specstory/**
+packages/contract-sdk/generated/
+packages/contract-sdk/dist/
+packages/qed-sdk/src/generated-contracts/
+package-lock.json
+
+*.wasm
+*.wasm.debug
+wasm-binary.ts
+*.js

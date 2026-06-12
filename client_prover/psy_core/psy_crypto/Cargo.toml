@@ -1,0 +1,47 @@
+[package]
+edition = "2021"
+name    = "psy_crypto"
+version = "0.1.0"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[features]
+default = []
+bn254 = ["dep:static_assertions", "dep:env_logger", "dep:log"]
+
+[dependencies]
+anyhow     = { workspace = true }
+serde_json = { workspace = true }
+serde_repr = { workspace = true }
+serde = { workspace = true }
+serde_with = { workspace = true }
+ts-rs = { workspace = true }
+bincode = { workspace = true }
+hex = { workspace = true }
+async-trait = { workspace = true }
+plonky2 = { workspace = true }
+plonky2_maybe_rayon = { workspace = true }
+rand = { workspace = true }
+tracing = { workspace = true }
+itertools = { workspace = true }
+kvq = { workspace = true }
+psy_config = { workspace = true }
+psy_client_common = { workspace = true }
+indexmap = { workspace = true }
+
+
+
+ripemd = { workspace = true }
+num = { workspace = true, default-features = false }
+
+sha2 = { workspace = true }
+
+
+k256 = { workspace = true }
+
+hashbrown = { workspace = true }
+
+# Optional dependencies for bn254
+static_assertions = { workspace = true, optional = true }
+env_logger = { workspace = true, optional = true }
+log = { workspace = true, optional = true }

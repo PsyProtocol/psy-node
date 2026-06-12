@@ -3,4 +3,4 @@ import type { GlobalUserTreeAggregatorHeader } from "./GlobalUserTreeAggregatorH
 import type { MerkleProofCore } from "./MerkleProofCore";
 import type { QHashOut } from "./QHashOut";
 
-export type VerifyGUTAToCapUpgradeCheckpointCircuitInputSimple = { guta_proof_header: GlobalUserTreeAggregatorHeader, top_line_siblings: Array<QHashOut>, historical_checkpoint_proof: MerkleProofCore<QHashOut>, };
+export type VerifyGUTAToCapUpgradeCheckpointCircuitInputSimple = { guta_proof_header: GlobalUserTreeAggregatorHeader, top_line_siblings: Array<QHashOut>, historical_checkpoint_proof: MerkleProofCore<QHashOut>, total_aggregation_proofs_generated: bigint, };

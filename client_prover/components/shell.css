@@ -1,0 +1,76 @@
+html {
+  font-feature-settings: "ss01", "cv01", "cv11";
+}
+
+html,
+body,
+#root {
+  background: var(--cp-bg-base);
+  color: var(--cp-text-primary);
+}
+
+body {
+  letter-spacing: 0;
+}
+
+h1,
+h2,
+h3,
+h4 {
+  letter-spacing: 0;
+}
+
+::selection {
+  background: rgba(0, 229, 168, 0.18);
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #1c1c1c;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #2a2a2a;
+}
+
+.cp-shell-surface {
+  background:
+    linear-gradient(
+      180deg,
+      rgba(255, 255, 255, 0.012) 0%,
+      rgba(255, 255, 255, 0) 100%
+    ),
+    var(--cp-bg-surface);
+  border: 1px solid var(--cp-border-default);
+  box-shadow:
+    0 1px 0 0 rgba(255, 255, 255, 0.02) inset,
+    0 0 0 1px rgba(255, 255, 255, 0.01);
+}
+
+.cp-shell-header {
+  background: rgba(5, 5, 5, 0.72);
+  backdrop-filter: blur(24px) saturate(140%);
+  -webkit-backdrop-filter: blur(24px) saturate(140%);
+  border-bottom: 1px solid var(--cp-border-subtle);
+}
+
+.cp-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 28px;
+  padding: 0 10px;
+  border-radius: var(--cp-radius-sm);
+  background: var(--cp-bg-surface-alt);
+  border: 1px solid var(--cp-border-default);
+  color: var(--cp-text-secondary);
+}

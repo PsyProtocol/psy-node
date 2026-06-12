@@ -2,4 +2,4 @@
 import type { ContractCodeDefinition } from "./ContractCodeDefinition";
 import type { QHashOut } from "./QHashOut";
 
-export type QBCDeployContractWithRoot = { deployer: QHashOut, code_definition: ContractCodeDefinition, function_whitelist: Array<QHashOut>, function_whitelist_root: QHashOut, };
+export type QBCDeployContractWithRoot = { deployer: QHashOut, code_definition: ContractCodeDefinition, function_whitelist: Array<QHashOut>, function_whitelist_root: QHashOut, code_root: QHashOut, };

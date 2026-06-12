@@ -6,7 +6,7 @@ use psy_node_core::psy_core_db::v3_implementation::full::PsyUnifiedCoreDatabaseS
 use crate::{
     core::ScyllaCoreStore,
     tables::{
-        blob::ScyllaBiDirectionalBlobToBlobTablePreparedStatements, counter::u64_counter::ScyllaU64ToU64CounterTablePreparedStatements, hash_to_many_ids::ScyllaHashToManyIdsTablePreparedStatements, merkle::{ScyllaDoubleMerkleNodesPreparedStatements, ScyllaMerkleNodesPreparedStatements, ScyllaMerkleNodesZeroPreparedStatements}, object::{
+        blob::ScyllaBiDirectionalBlobToBlobTablePreparedStatements, bridge::{deposit_leaf::ScyllaBridgeDepositLeafPreparedStatements, next_index::ScyllaBridgeDepositNextIndexPreparedStatements}, counter::u64_counter::ScyllaU64ToU64CounterTablePreparedStatements, hash_to_many_ids::ScyllaHashToManyIdsTablePreparedStatements, imt::{imt_key_index::ScyllaIMTKeyIndexPreparedStatements, imt_leaf::ScyllaIMTLeafPreparedStatements, imt_next_append_index::ScyllaIMTNextAppendIndexPreparedStatements}, merkle::{ScyllaDoubleMerkleNodesPreparedStatements, ScyllaMerkleNodesPreparedStatements, ScyllaMerkleNodesZeroPreparedStatements}, object::{
             ScyllaGenericKeyIdValueTablePreparedStatements, ScyllaGenericObjectDoubleIdTablePreparedStatements,
             ScyllaGenericObjectSingleIdTablePreparedStatements,
         }, tag_tree::ScyllaTagTreeNodesPreparedStatements, u64_table::{ScyllaBidirectionalU64U128MappingPreparedStatements, ScyllaU64ToU64TablePreparedStatements}
@@ -23,6 +23,11 @@ type ExDoubleIdMerkleTableIdentifier = ScyllaDoubleMerkleNodesPreparedStatements
 type ExTagTreeTableIdentifier = ScyllaTagTreeNodesPreparedStatements;
 type ExHashToManyIdsTableIdentifier = ScyllaHashToManyIdsTablePreparedStatements;
 type ExU64CounterTableIdentifier = ScyllaU64ToU64CounterTablePreparedStatements;
+type ExIMTLeafTableIdentifier = ScyllaIMTLeafPreparedStatements;
+type ExIMTKeyIndexTableIdentifier = ScyllaIMTKeyIndexPreparedStatements;
+type ExIMTNextAppendIndexTableIdentifier = ScyllaIMTNextAppendIndexPreparedStatements;
+type ExBridgeDepositLeafTableIdentifier = ScyllaBridgeDepositLeafPreparedStatements;
+type ExBridgeDepositNextIndexTableIdentifier = ScyllaBridgeDepositNextIndexPreparedStatements;
 pub type ScyllaUnifiedPsyStore<N, Hash, Hasher> = PsyUnifiedCoreDatabaseStore<
     N,
     ScyllaBiDirectionalBlobToBlobTablePreparedStatements,
@@ -37,6 +42,9 @@ pub type ScyllaUnifiedPsyStore<N, Hash, Hasher> = PsyUnifiedCoreDatabaseStore<
     ScyllaMerkleNodesZeroPreparedStatements,
     ScyllaTagTreeNodesPreparedStatements,
     ScyllaHashToManyIdsTablePreparedStatements,
+    ScyllaIMTLeafPreparedStatements,
+    ScyllaIMTKeyIndexPreparedStatements,
+    ScyllaIMTNextAppendIndexPreparedStatements,
     ScyllaCoreStore<Hash, Hasher>,
 >;
 
@@ -79,6 +87,10 @@ pub async fn setup_psy_scylla_database_store<N: QNetworkDatabaseTypes>(
     let contract_leaf_table = store.init_std_table::<ExSingleIdTableIdentifier>("contract_leaf_table", get_rk(27)).await?;
     let contract_code_definition_table = store.init_std_table::<ExSingleIdTableIdentifier>("contract_code_definition_table", get_rk(28)).await?;
     let checkpoint_zk_proof_and_transition_table = store.init_std_table::<ExKivTableIdentifier>("checkpoint_zk_proof_and_transition_table", get_rk(29)).await?;
+
+    let imt_leaf_table = store.init_std_table::<ExIMTLeafTableIdentifier>("imt_leaf_table", get_rk(30)).await?;
+    let imt_key_index_table = store.init_std_table::<ExIMTKeyIndexTableIdentifier>("imt_key_index_table", get_rk(31)).await?;
+    let imt_next_append_index_table = store.init_std_table::<ExIMTNextAppendIndexTableIdentifier>("imt_next_append_index_table", get_rk(32)).await?;
 
     /**
     let (
@@ -182,6 +194,10 @@ pub async fn setup_psy_scylla_database_store<N: QNetworkDatabaseTypes>(
         Arc::new(contract_leaf_table),
         Arc::new(contract_code_definition_table),
         Arc::new(checkpoint_zk_proof_and_transition_table),
+        // IMT tables
+        Arc::new(imt_leaf_table),
+        Arc::new(imt_key_index_table),
+        Arc::new(imt_next_append_index_table),
     );
     Ok(psy_db)
 }
@@ -223,6 +239,10 @@ pub async fn prepare_psy_scylla_database_store<N: QNetworkDatabaseTypes>(
     let contract_leaf_table = store.init_std_table_prepare_only::<ExSingleIdTableIdentifier>("contract_leaf_table", get_rk(27)).await?;
     let contract_code_definition_table = store.init_std_table_prepare_only::<ExSingleIdTableIdentifier>("contract_code_definition_table", get_rk(28)).await?;
     let checkpoint_zk_proof_and_transition_table = store.init_std_table_prepare_only::<ExKivTableIdentifier>("checkpoint_zk_proof_and_transition_table", get_rk(29)).await?;
+    // IMT tables
+    let imt_leaf_table = store.init_std_table_prepare_only::<ExIMTLeafTableIdentifier>("imt_leaf_table", get_rk(30)).await?;
+    let imt_key_index_table = store.init_std_table_prepare_only::<ExIMTKeyIndexTableIdentifier>("imt_key_index_table", get_rk(31)).await?;
+    let imt_next_append_index_table = store.init_std_table_prepare_only::<ExIMTNextAppendIndexTableIdentifier>("imt_next_append_index_table", get_rk(32)).await?;
 
     let psy_db = PsyUnifiedCoreDatabaseStore::new(
         store.clone(),
@@ -259,6 +279,10 @@ pub async fn prepare_psy_scylla_database_store<N: QNetworkDatabaseTypes>(
         Arc::new(contract_leaf_table),
         Arc::new(contract_code_definition_table),
         Arc::new(checkpoint_zk_proof_and_transition_table),
+        // IMT tables
+        Arc::new(imt_leaf_table),
+        Arc::new(imt_key_index_table),
+        Arc::new(imt_next_append_index_table),
     );
     Ok(psy_db)
 }

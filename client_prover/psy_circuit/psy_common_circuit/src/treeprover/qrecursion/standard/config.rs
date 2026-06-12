@@ -1,0 +1,1 @@
+pub const QRECURSION_CIRCUIT_WHITELIST_HEIGHT: usize = 3;

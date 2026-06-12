@@ -3,6 +3,7 @@ mod submit_status;
 mod witness;
 mod expected_public_inputs;
 mod user_contract_tree_updates;
+mod user_end_cap_slot_updates;
 mod deploy_contract_data;
 mod proof_metadata;
 mod rewards_tree;
@@ -17,6 +18,7 @@ pub use pending_id::*;
 pub use submit_status::*;
 pub use witness::*;
 pub use user_contract_tree_updates::*;
+pub use user_end_cap_slot_updates::*;
 pub use deploy_contract_data::*;
 pub use rewards_tree::*;
 pub use node_proving_state::*;
@@ -29,6 +31,7 @@ pub trait StandardEdgeAPITempDBStoreBase<JobId: QJobIdBase, Hash: QDBHashBase>:
     QTempDBSubmitStatusStore + 
     QTempDBProofWitnessStore<JobId> +
     QTempDBUserContractUpdatesStore + 
+    QTempDBUserEndCapSlotUpdatesStore +
     QTempDBProvingJobMetadataStore<Hash, JobId> +
     QTempDBRewardsTreeStore<Hash, JobId> +
     QTempDBDeployContractDataStore + 
@@ -47,6 +50,7 @@ impl<
     QTempDBSubmitStatusStore + 
     QTempDBProofWitnessStore<JobId> +
     QTempDBUserContractUpdatesStore + 
+    QTempDBUserEndCapSlotUpdatesStore +
     QTempDBProvingJobMetadataStore<Hash, JobId> +
     QTempDBRewardsTreeStore<Hash, JobId> +
     QTempDBDeployContractDataStore +
@@ -61,7 +65,8 @@ pub trait StandardProcessorTempDBStoreBase<JobId: QJobIdBase, Hash: QDBHashBase>
     QTempDBPendingIdStore + 
     QTempDBSubmitStatusStore + 
     QTempDBProofWitnessStore<JobId> +
-    QTempDBUserContractUpdatesStore + 
+    QTempDBUserContractUpdatesStore +
+    QTempDBUserEndCapSlotUpdatesStore +
     QTempDBProvingJobMetadataStore<Hash, JobId> +
     QTempDBRewardsTreeStore<Hash, JobId> +
     QTempDBDeployContractDataStore +
@@ -79,7 +84,8 @@ impl<
     QTempDBPendingIdStore + 
     QTempDBSubmitStatusStore + 
     QTempDBProofWitnessStore<JobId> +
-    QTempDBUserContractUpdatesStore + 
+    QTempDBUserContractUpdatesStore +
+    QTempDBUserEndCapSlotUpdatesStore +
     QTempDBProvingJobMetadataStore<Hash, JobId> +
     QTempDBRewardsTreeStore<Hash, JobId> +
     QTempDBDeployContractDataStore +
@@ -88,4 +94,3 @@ impl<
     QTempDBWorkerReputationStore,
 > StandardProcessorTempDBStoreBase<JobId, Hash> for T {
 }
-

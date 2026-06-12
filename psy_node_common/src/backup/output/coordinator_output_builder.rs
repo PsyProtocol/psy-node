@@ -191,11 +191,25 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
             append_checkpoint_tree_siblings: vec![],
         }))
     }
+
     pub fn get_part_1_header(
         &self,
         last_committed: &CoordinatorProcessorLastCommittedState<N::F, N::QHash>,
         circuit_fingerprint_config: &PsyNodeCircuitFingerprintConfig<N::QHash>,
     ) -> QCAggUserRegistartionDeployContractsGUTAInput<N::F, N::QHash> {
+        let guta_proof_header = self.guta_gatherer_result.root_guta_header.unwrap_or(GlobalUserTreeAggregatorHeader {
+            guta_circuit_whitelist: circuit_fingerprint_config.guta_circuit_whitelist_root,
+            checkpoint_tree_root: last_committed.checkpoint_root,
+            stats: self.guta_gatherer_result.guta_stats,
+            total_aggregation_proofs_generated: N::F::from_u64_value(self.total_guta_jobs as u64),
+            state_transition: SubTreeNodeStateTransition {
+                old_node_value: self.guta_gatherer_result.start_global_user_tree_root,
+                new_node_value: self.guta_gatherer_result.end_global_user_tree_root,
+                node_index: N::F::from_u64_value(0),
+                node_level: N::F::from_u64_value(0),
+            },
+        });
+
         let witness = QCAggUserRegistartionDeployContractsGUTAInput {
             register_users_state_transition: AggStateTransitionWithStats {
                 state_transition_start: self.register_users_gatherer_result.start_user_registration_tree_hash,
@@ -207,18 +221,7 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
                 state_transition_end: self.deploy_contract_gatherer_result.end_global_contract_tree_root,
                 total_proofs_generated: self.total_deploy_contract_jobs as u64,
             },
-            guta_proof_header: GlobalUserTreeAggregatorHeader {
-                guta_circuit_whitelist: circuit_fingerprint_config.guta_circuit_whitelist_root,
-                checkpoint_tree_root: last_committed.checkpoint_root,
-                stats: self.guta_gatherer_result.guta_stats,
-                total_aggregation_proofs_generated: N::F::from_u64_value(self.total_guta_jobs as u64),
-                state_transition: SubTreeNodeStateTransition {
-                    old_node_value: self.guta_gatherer_result.start_global_user_tree_root,
-                    new_node_value: self.guta_gatherer_result.end_global_user_tree_root,
-                    node_index: N::F::from_u64_value(0),
-                    node_level: N::F::from_u64_value(0),
-                },
-            },
+            guta_proof_header,
         };
         witness
     }
@@ -330,7 +333,29 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
             last_old_checkpoint_tree_leaf_hash: last_committed.checkpoint_state_transition.old_checkpoint_leaf_hash,
             last_old_checkpoint_tree_root_hash: last_committed.checkpoint_state_transition.old_checkpoint_tree_root,
             genesis_checkpoint_state_transition_hash: genesis_checkpoint_state_transition_hash,
+            previous_chain_hash: last_committed.last_chain_hash,
+            checkpoint_state_transition_circuit_fingerprint:
+                circuit_fingerprint_config.checkpoint_state_transition_circuit_fingerprint,
         };
+        let computed_old_checkpoint_leaf = witness.partial.get_old_checkpoint_leaf::<N::HasherBase>();
+        let computed_old_checkpoint_leaf_hash =
+            computed_old_checkpoint_leaf.qfhash::<N::HasherBase>();
+        if computed_old_checkpoint_leaf_hash != witness.previous_checkpoint_proof.value {
+            let old_state_roots = witness.partial.get_old_state_roots::<N::HasherBase>();
+            anyhow::bail!(
+                "checkpoint witness old leaf mismatch for checkpoint {} -> {}: computed old checkpoint leaf hash {:?} ({}) does not match previous checkpoint proof value {:?} ({}); old_state_roots {:?}; last_committed_state_roots {:?}; guta_header {:?}; old_stats {:?}",
+                checkpoint_id,
+                next_checkpoint_id,
+                computed_old_checkpoint_leaf_hash,
+                hex::encode(&computed_old_checkpoint_leaf_hash.into_owned_32bytes()),
+                witness.previous_checkpoint_proof.value,
+                hex::encode(&witness.previous_checkpoint_proof.value.into_owned_32bytes()),
+                old_state_roots,
+                last_committed.checkpoint_state_roots,
+                witness.partial.part_1_header.guta_proof_header,
+                witness.partial.old_stats,
+            );
+        }
         Ok(witness)
     }
 
@@ -356,9 +381,20 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
             block_time,
         )?;
         let witness_bytes = witness.psy_ser_to_bytes_vec()?;
-        println!("circuit_fingerprint_config.checkpoint_state_transition_circuit_fingerprint: {:?}", circuit_fingerprint_config.checkpoint_state_transition_circuit_fingerprint);
-        let expected_public_inputs = witness
-            .get_public_inputs_hash_with_fingerprint::<N::HasherBase>(circuit_fingerprint_config.checkpoint_state_transition_circuit_fingerprint);
+        tracing::info!(
+            "checkpoint_transition output_builder fingerprint(config)={} genesis_fp={} previous_chain_hash={}",
+            hex::encode(circuit_fingerprint_config.checkpoint_state_transition_circuit_fingerprint.into_owned_32bytes()),
+            hex::encode(circuit_fingerprint_config.genesis_checkpoint_state_transition_fingerprint.into_owned_32bytes()),
+            hex::encode(witness.previous_chain_hash.into_owned_32bytes()),
+        );
+        let expected_public_inputs = witness.get_chain_hash_with_fingerprint_from_previous::<N::HasherBase>(
+            witness.previous_chain_hash,
+            circuit_fingerprint_config.checkpoint_state_transition_circuit_fingerprint,
+        );
+        tracing::info!(
+            "checkpoint_transition output_builder expected_public_inputs={}",
+            hex::encode(expected_public_inputs.into_owned_32bytes()),
+        );
         self.append_checkpoint_tree_siblings = witness.append_checkpoint_tree_proof.siblings;
 
         let job_metadata = PsyProvingJobMetadataWithJobId {

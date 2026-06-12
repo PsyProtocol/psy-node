@@ -36,7 +36,7 @@ redis = { workspace = true }
 bb8-redis = { workspace = true }
 bb8 = { workspace = true }
 rsmq = { workspace = true }
-fred = { version = "10", features = ["enable-rustls", "dynamic-pool"] } # optional dynamic-pool for auto-scaling
+fred = { version = "10", features = ["enable-rustls", "dynamic-pool", "i-hexpire"] } # optional dynamic-pool for auto-scaling
 rustis = "0.16.2"
 
 

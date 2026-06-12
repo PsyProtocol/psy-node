@@ -15,6 +15,7 @@ serialize_postcard = ["dep:postcard", "pser/serialize_postcard", "parth_core/ser
 postcard = { workspace = true, optional = true }
 rkyv = { workspace = true, optional = true }
 speedy = { workspace = true, optional = true }
+zstd = { workspace = true }
 anyhow     = { workspace = true }
 async-trait      = { workspace = true }
 serde      = { workspace = true }
@@ -33,6 +34,11 @@ strum_macros = { workspace = true }
 hashbrown = { workspace = true }
 plonky2 = { workspace = true }
 jsonrpsee = { workspace = true }
+home = { workspace = true }
+gnark-plonky2-wrapper  = { workspace = true }
+gnark-plonky2-verifier-ffi = { workspace = true }
+plonky2x = { git = "https://github.com/logere/succinctx", rev = "eec027a324be98827b4b91b4054f4cac7044ced4" }
+tiny-keccak = { workspace = true }
 
 # start local packages
 cf_utils = { workspace = true }
@@ -51,3 +57,5 @@ pser = { workspace = true }
 [dev-dependencies]
 psy_node_core = { workspace = true }
 psy_node_store_memory = { workspace = true }
+psy_client_common = { workspace = true }
+psy_cli_common = { path = "../psy_cli/psy_cli_common" }

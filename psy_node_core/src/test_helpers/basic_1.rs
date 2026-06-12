@@ -174,22 +174,23 @@ where
     let job_id2 = QProvingJobDataID::qp_rand_gen();
 
     // Test contains on non-existent
-    assert!(!store.contains_proof_for_job_id(job_id1).await.unwrap());
+    let pending_id = 42u64;
+    assert!(!store.contains_proof_for_job_id(job_id1, pending_id).await.unwrap());
 
     // Test put and get (object)
-    store.put_proof_for_job_id(job_id1, &proof1).await.unwrap();
-    assert!(store.contains_proof_for_job_id(job_id1).await.unwrap());
-    let retrieved: TestProof = store.get_proof_by_job_id(job_id1).await.unwrap().unwrap();
+    store.put_proof_for_job_id(job_id1, pending_id, &proof1).await.unwrap();
+    assert!(store.contains_proof_for_job_id(job_id1, pending_id).await.unwrap());
+    let retrieved: TestProof = store.get_proof_by_job_id(job_id1, pending_id).await.unwrap().unwrap();
     assert_eq!(retrieved, proof1);
 
     // Test get non-existent
-    let retrieved_none: Option<TestProof> = store.get_proof_by_job_id(job_id2).await.unwrap();
+    let retrieved_none: Option<TestProof> = store.get_proof_by_job_id(job_id2, pending_id).await.unwrap();
     assert!(retrieved_none.is_none());
 
     // Test put and get (bytes)
     let proof_bytes = proof1.to_bytes().unwrap();
-    store.put_proof_bytes_for_job_id(job_id1, &proof_bytes).await.unwrap();
-    let retrieved_bytes = store.get_proof_bytes_by_job_id(job_id1).await.unwrap().unwrap();
+    store.put_proof_bytes_for_job_id(job_id1, pending_id, &proof_bytes).await.unwrap();
+    let retrieved_bytes = store.get_proof_bytes_by_job_id(job_id1, pending_id).await.unwrap().unwrap();
     assert_eq!(retrieved_bytes, proof_bytes);
 }
 
@@ -231,93 +232,15 @@ where
         .unwrap(); // here:
 
     /*
-    
-    
----- test_redis_store_implementation stdout ----
---- Running tests for StandardRedisStore ---
-  -> Testing KV Store...
-  -> Testing Counter Store...
-  -> Testing Proof Store...
-  -> Testing Ephemeral Queue...
+    Historical failure example for queue decoding:
 
-thread 'test_redis_store_implementation' panicked at /Users/carter/Documents/projects/psyv3/psy-v3/psy_node_core/src/test_helpers/basic_1.rs:233:10:
-called `Result::unwrap()` on an `Err` value: Response was of incompatible type - TypeError: "Could not convert from string." (response was bulk-string('"\u{1}\0\0\0\0\0\0\0\u{3}\0\0\0\0\0\0\0one"'))
+    - test_redis_store_implementation
+    - StandardRedisStore
+    - consume_ephemeral_queue_item_or_none returned:
+      Response was of incompatible type - TypeError: "Could not convert from string."
 
-Stack backtrace:
-   0: std::backtrace_rs::backtrace::libunwind::trace
-             at /rustc/49a8ba06848fa8f282fe9055b4178350970bb0ce/library/std/src/../../backtrace/src/backtrace/libunwind.rs:117:9
-   1: std::backtrace_rs::backtrace::trace_unsynchronized
-             at /rustc/49a8ba06848fa8f282fe9055b4178350970bb0ce/library/std/src/../../backtrace/src/backtrace/mod.rs:66:14
-   2: std::backtrace::Backtrace::create
-             at /rustc/49a8ba06848fa8f282fe9055b4178350970bb0ce/library/std/src/backtrace.rs:331:13
-   3: anyhow::error::<impl core::convert::From<E> for anyhow::Error>::from
-             at /Users/carter/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/anyhow-1.0.100/src/backtrace.rs:27:14
-   4: <core::result::Result<T,F> as core::ops::try_trait::FromResidual<core::result::Result<core::convert::Infallible,E>>>::from_residual
-             at /Users/carter/.rustup/toolchains/nightly-2025-06-15-aarch64-apple-darwin/lib/rustlib/src/rust/library/core/src/result.rs:2079:27
-   5: <psy_node_redis::store::core::StandardRedisStore as psy_node_core::queue::ephemeral::QStandardEphemeralQueueSubscriber>::consume_ephemeral_queue_item_or_none::{{closure}}
-             at ./src/store/core.rs:539:37
-   6: <core::pin::Pin<P> as core::future::future::Future>::poll
-             at /Users/carter/.rustup/toolchains/nightly-2025-06-15-aarch64-apple-darwin/lib/rustlib/src/rust/library/core/src/future/future.rs:124:9
-   7: psy_node_core::test_helpers::basic_1::test_ephemeral_queue::{{closure}}
-             at /Users/carter/Documents/projects/psyv3/psy-v3/psy_node_core/src/test_helpers/basic_1.rs:232:10
-   8: psy_node_core::test_helpers::basic_1::run_all_tests_for_factory::{{closure}}
-             at /Users/carter/Documents/projects/psyv3/psy-v3/psy_node_core/src/test_helpers/basic_1.rs:340:39
-   9: temp_v1::test_redis_store_implementation::{{closure}}
-             at ./tests/temp_v1.rs:43:40
-  10: <core::pin::Pin<P> as core::future::future::Future>::poll
-             at /Users/carter/.rustup/toolchains/nightly-2025-06-15-aarch64-apple-darwin/lib/rustlib/src/rust/library/core/src/future/future.rs:124:9
-  11: <core::pin::Pin<P> as core::future::future::Future>::poll
-             at /Users/carter/.rustup/toolchains/nightly-2025-06-15-aarch64-apple-darwin/lib/rustlib/src/rust/library/core/src/future/future.rs:124:9
-  12: tokio::runtime::scheduler::current_thread::CoreGuard::block_on::{{closure}}::{{closure}}::{{closure}}
-             at /Users/carter/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.47.1/src/runtime/scheduler/current_thread/mod.rs:742:70
-  13: tokio::task::coop::with_budget
-             at /Users/carter/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.47.1/src/task/coop/mod.rs:167:5
-  14: tokio::task::coop::budget
-             at /Users/carter/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.47.1/src/task/coop/mod.rs:133:5
-  15: tokio::runtime::scheduler::current_thread::CoreGuard::block_on::{{closure}}::{{closure}}
-             at /Users/carter/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.47.1/src/runtime/scheduler/current_thread/mod.rs:742:25
-  16: tokio::runtime::scheduler::current_thread::Context::enter
-             at /Users/carter/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.47.1/src/runtime/scheduler/current_thread/mod.rs:432:19
-  17: tokio::runtime::scheduler::current_thread::CoreGuard::block_on::{{closure}}
-             at /Users/carter/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.47.1/src/runtime/scheduler/current_thread/mod.rs:741:44
-  18: tokio::runtime::scheduler::current_thread::CoreGuard::enter::{{closure}}
-             at /Users/carter/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.47.1/src/runtime/scheduler/current_thread/mod.rs:829:68
-  19: tokio::runtime::context::scoped::Scoped<T>::set
-             at /Users/carter/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.47.1/src/runtime/context/scoped.rs:40:9
-  20: tokio::runtime::context::set_scheduler::{{closure}}
-             at /Users/carter/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.47.1/src/runtime/context.rs:176:38
-  21: std::thread::local::LocalKey<T>::try_with
-             at /Users/carter/.rustup/toolchains/nightly-2025-06-15-aarch64-apple-darwin/lib/rustlib/src/rust/library/std/src/thread/local.rs:315:12
-  22: std::thread::local::LocalKey<T>::with
-             at /Users/carter/.rustup/toolchains/nightly-2025-06-15-aarch64-apple-darwin/lib/rustlib/src/rust/library/std/src/thread/local.rs:279:20
-  23: tokio::runtime::context::set_scheduler
-             at /Users/carter/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.47.1/src/runtime/context.rs:176:17
-  24: tokio::runtime::scheduler::current_thread::CoreGuard::enter
-             at /Users/carter/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.47.1/src/runtime/scheduler/current_thread/mod.rs:829:27
-  25: tokio::runtime::scheduler::current_thread::CoreGuard::block_on
-             at /Users/carter/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.47.1/src/runtime/scheduler/current_thread/mod.rs:729:24
-  26: tokio::runtime::scheduler::current_thread::CurrentThread::block_on::{{closure}}
-             at /Users/carter/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.47.1/src/runtime/scheduler/current_thread/mod.rs:200:33
-  27: tokio::runtime::context::runtime::enter_runtime
-             at /Users/carter/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.47.1/src/runtime/context/runtime.rs:65:16
-  28: tokio::runtime::scheduler::current_thread::CurrentThread::block_on
-             at /Users/carter/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.47.1/src/runtime/scheduler/current_thread/mod.rs:188:9
-  29: tokio::runtime::runtime::Runtime::block_on_inner
-             at /Users/carter/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.47.1/src/runtime/runtime.rs:356:52
-  30: tokio::runtime::runtime::Runtime::block_on
-             at /Users/carter/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.47.1/src/runtime/runtime.rs:330:18
-  31: temp_v1::test_redis_store_implementation
-             at ./tests/temp_v1.rs:43:45
-  32: temp_v1::test_redis_store_implementation::{{closure}}
-             at ./tests/temp_v1.rs:41:47
-  33: core::ops::function::FnOnce::call_once
-             at /Users/carter/.rustup/toolchains/nightly-2025-06-15-aarch64-apple-darwin/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
-  34: core::ops::function::FnOnce::call_once
-             at /rustc/49a8ba06848fa8f282fe9055b4178350970bb0ce/library/core/src/ops/function.rs:250:5
-  35: test::__rust_begin_short_backtrace
-             at /rustc/49a8ba06848fa8f282fe9055b4178350970bb0ce/library/test/src/lib.rs:648:18
-  36: test::run_test_in_process::{{closure}}
-             at /rustc/49a8ba06848fa8f282fe9055b4178350970bb0ce/library/test/src/lib.rs:671:74
+    The original pasted backtrace contained developer-local absolute paths and
+    was intentionally removed.
   37: <core::panic::unwind_safe::AssertUnwindSafe<F> as core::ops::function::FnOnce<()>>::call_once
              at /rustc/49a8ba06848fa8f282fe9055b4178350970bb0ce/library/core/src/panic/unwind_safe.rs:272:9
   38: std::panicking::catch_unwind::do_call

@@ -118,10 +118,43 @@ pub struct CheckpointStateTransitionPublicInputs<Hash> {
 
 
 impl<Hash> CheckpointStateTransitionPublicInputs<Hash> {
+    /// Chain_0 = H(H(new_root, new_leaf), genesis_fingerprint)
+    /// This matches the genesis checkpoint state transition circuit's public
+    /// input hash, which uses the genesis_fingerprint in its formula.
+    pub fn get_chain_0_from_genesis_leaf<Hasher: MerkleHasher<Hash>>(&self, genesis_fingerprint: &Hash) -> Hash {
+        let root_leaf = Hasher::two_to_one(
+            &self.checkpoint_transition.new_checkpoint_tree_root,
+            &self.checkpoint_transition.new_checkpoint_leaf_hash,
+        );
+        Hasher::two_to_one(&root_leaf, genesis_fingerprint)
+    }
+    /// Legacy single-step PI hash (kept for compatibility while migrating).
     pub fn get_public_inputs_hash_no_rewards_tag<Hasher: MerkleHasher<Hash>>(
         &self, 
     ) -> Hash {
         self.checkpoint_transition.get_public_inputs_hash_no_rewards_tag::<Hasher>(&self.genesis_checkpoint_state_transition_hash,&self.checkpoint_state_transition_circuit_fingerprint)
+    }
+
+    /// New step hash used by bridge/checkpoint chain-mode semantics:
+    /// step_i = H(checkpoint_tree_root_i, checkpoint_leaf_hash_i, checkpoint_transition_fingerprint)
+    pub fn get_step_commit_hash<Hasher: MerkleHasher<Hash>>(&self) -> Hash {
+        let root_leaf_hash = Hasher::two_to_one(
+            &self.checkpoint_transition.new_checkpoint_tree_root,
+            &self.checkpoint_transition.new_checkpoint_leaf_hash,
+        );
+        Hasher::two_to_one(
+            &root_leaf_hash,
+            &self.checkpoint_state_transition_circuit_fingerprint,
+        )
+    }
+
+    /// chain_i = H(chain_{i-1}, step_i)
+    pub fn get_chain_hash_from_previous<Hasher: MerkleHasher<Hash>>(
+        &self,
+        previous_chain_hash: &Hash,
+    ) -> Hash {
+        let step_hash = self.get_step_commit_hash::<Hasher>();
+        Hasher::two_to_one(previous_chain_hash, &step_hash)
     }
 }
 impl<Hash: Copy, F> QFieldHashable<F, Hash> for CheckpointStateTransitionPublicInputs<Hash> {

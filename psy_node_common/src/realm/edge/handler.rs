@@ -15,14 +15,20 @@ use parth_core::{
         secp256k1::{QEDCompressedSecp256K1Signature, SimpleTimedRequest},
     }, data::{hash::{merkle_node_key::SimpleMerkleNodeKey, merkle_store_key::{QMerkleStoreDoubleIdKeyWithHeight, QMerkleStoreSingleIdKey}}, queue::queue_key::QPBaseQueueType}, felt::ToU64Value, node::realm_identifier::QRealmIdentifier, protocol::core_types::{QNetworkTypesConfig, QZKProofPublicInputsHasherReader, QZKProofVerifier}
 };
-use psy_api_core::{realm::standard_edge_rpc::RealmEdgeRpcServer, worker::standard_worker_rpc::NodeEdgeWorkerRpcServer};
+use psy_api_core::{
+    realm::standard_edge_rpc::{
+        RealmContractSlotUpdates, RealmEdgeRpcServer, RealmEndCapSlotUpdates, RealmSlotUpdate,
+    },
+    worker::standard_worker_rpc::NodeEdgeWorkerRpcServer,
+};
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{
     node::node_proving_state::PsyNodeProvingState, proof_input::guta::end_cap_input::SubmitUserEndCapNonProofInput, queue_items::realm_user_update::PsyRealmUserUpdateQueueItem, v1::{
         common_api::PsyProoffMinerRewardProof,
         qdata::{
             checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState},
-            contract::{DashMapContractHeightCache, PSimpleContractHeightCache},
+            contract::{DashMapContractHeightCache, IMTContractStateLeaf, IMTMembershipProof,
+                IMTNonMembershipProof, IMTPredecessorResult, PSimpleContractHeightCache},
             user::PQEDUserLeaf,
         },
     }, worker::api_response::{PsyWorkerGetProvingWorkAPIResponse, PsyWorkerGetProvingWorkWithChildProofsAPIResponse}
@@ -189,13 +195,18 @@ impl<
         let mut tag_proofs = self.tag_tree_rewards_store
             .rewards_tag_tree_get_tag_tree_merkle_proof_at_unique_pending_id(unique_pending_id, &merkle_node_keys).await?;
 
-        // Merge with top proof
-        let top_proof = self.get_top_global_user_rewards_tree_proof_to_realm_at_checkpoint_id_internal(unique_pending_id).await?;
-        let checkpoint_id = self.get_checkpoint_id_for_unique_pending_id_internal(unique_pending_id).await?;
+        // Merge the realm-local reward proof with the coordinator-level proof so
+        // the final root matches the checkpoint's global rewards root. The realm
+        // processor persists this top proof keyed by unique_pending_id.
+        let top_proof = self
+            .db_reader
+            .get_top_global_user_rewards_tree_proof_to_realm_at_unique_pending_id(unique_pending_id)
+            .await?;
         for proof in &mut tag_proofs {
+            let local_proof_height = proof.siblings.len();
             proof.siblings.extend(top_proof.siblings.clone());
             proof.root = top_proof.root;
-            proof.index = proof.index | (top_proof.index << proof.siblings.len());
+            proof.index |= top_proof.index << local_proof_height;
         }
 
         // Wrap into PsyProoffMinerRewardProof
@@ -243,6 +254,57 @@ impl<
         }
         Ok(())
     }
+
+    fn build_user_end_cap_slot_updates(
+        &self,
+        unique_pending_id: u64,
+        user_id: u64,
+        user_end_cap_input: &SubmitUserEndCapNonProofInput<N::F, N::QHash>,
+    ) -> anyhow::Result<RealmEndCapSlotUpdates> {
+        let contracts = user_end_cap_input
+            .get_slot_updates()?
+            .into_iter()
+            .map(|contract| RealmContractSlotUpdates {
+                contract_id: contract.contract_id,
+                slot_updates: contract
+                    .slot_updates
+                    .into_iter()
+                    .map(|slot_update| RealmSlotUpdate {
+                        slot: slot_update.slot,
+                        old_value: slot_update.old_value.to_u64_value(),
+                        new_value: slot_update.new_value.to_u64_value(),
+                    })
+                    .collect(),
+            })
+            .filter(|contract| !contract.slot_updates.is_empty())
+            .collect();
+
+        Ok(RealmEndCapSlotUpdates {
+            realm_id: self.realm_id_u64,
+            realm_sub_id: self.realm_sub_id_u64,
+            unique_pending_id,
+            user_id,
+            contracts,
+        })
+    }
+
+    pub async fn get_user_end_cap_slot_updates_internal(
+        &self,
+        unique_pending_id: u64,
+        user_id: u64,
+    ) -> anyhow::Result<Option<RealmEndCapSlotUpdates>> {
+        let Some(bytes) = self
+            .temp_db
+            .get_user_end_cap_slot_updates(&self.realm_identifier, unique_pending_id, user_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        let payload = bincode::deserialize(&bytes)?;
+        Ok(Some(payload))
+    }
+
     pub async fn handle_user_end_cap_proof_submission(
         &self,
         user_end_cap_input: SubmitUserEndCapNonProofInput<N::F, N::QHash>,
@@ -267,8 +329,8 @@ impl<
         if !self.user_belongs_to_realm(user_id) {
             anyhow::bail!("user_id {} does not belong to this realm", user_id);
         }
-        if user_end_cap_input.contract_state_updates.len() == 0 {
-            anyhow::bail!("invalid contract_state_updates: cannot be empty");
+        if user_end_cap_input.contract_state_updates.is_empty() {
+            anyhow::bail!("invalid end cap updates: contract_state_updates cannot be empty");
         }
 
         let (unique_pending_id, proc_checkpoint_id) = self.temp_db.get_gathering_unique_pending_ids(&self.realm_identifier).await?;
@@ -424,7 +486,9 @@ impl<
         }
 
         timer.lap_micros("get_submitted_status_for_pending (final)");
-        self.proof_store.put_proof_bytes_for_job_id(job_id, &proof_bytes).await?;
+        self.proof_store
+            .put_proof_bytes_for_job_id(job_id, unique_pending_id, &proof_bytes)
+            .await?;
         timer.lap_micros("put_proof_bytes_for_job_id");
         if self
             .temp_db
@@ -441,10 +505,63 @@ impl<
         }
         timer.lap_micros("get_submitted_status_for_pending (final 2)");
 
+        let slot_updates_payload = match self.build_user_end_cap_slot_updates(
+            unique_pending_id,
+            user_id,
+            &user_end_cap_input,
+        ) {
+            Ok(payload) => Some(payload),
+            Err(err) => {
+                tracing::warn!(
+                    user_id,
+                    unique_pending_id,
+                    error = ?err,
+                    "Failed to extract user end-cap slot updates"
+                );
+                None
+            }
+        };
+
         self.temp_db
             .set_contract_updates_for_user(&self.realm_identifier, unique_pending_id, user_id, contract_update_data_for_user)
             .await?;
         timer.lap_micros("set_contract_updates_for_user");
+
+        if let Some(slot_updates_payload) = slot_updates_payload {
+            if !slot_updates_payload.contracts.is_empty() {
+                match bincode::serialize(&slot_updates_payload) {
+                    Ok(bytes) => {
+                        if let Err(err) = self
+                            .temp_db
+                            .set_user_end_cap_slot_updates(
+                                &self.realm_identifier,
+                                unique_pending_id,
+                                user_id,
+                                bytes,
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                user_id,
+                                unique_pending_id,
+                                error = ?err,
+                                "Failed to store user end-cap slot updates"
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            user_id,
+                            unique_pending_id,
+                            error = ?err,
+                            "Failed to serialize user end-cap slot updates"
+                        );
+                    }
+                }
+            }
+        }
+        timer.lap_micros("set_user_end_cap_slot_updates");
+
         let queue_key = RealmUserUpdateQueueKey {
             realm_id: self.realm_id_u64,
             realm_sub_id: self.realm_sub_id_u64,
@@ -474,6 +591,7 @@ impl<
 
         Ok(())
     }
+
 }
 type QRpcResult<T> = RpcResult<T>;
 
@@ -502,6 +620,18 @@ impl<
     }
     async fn get_checkpoint_id_for_unique_pending_id(&self, unique_pending_id: u64) -> RpcResult<Option<u64>> {
         res(self.get_checkpoint_id_for_unique_pending_id_internal(unique_pending_id).await)
+    }
+    async fn get_unique_pending_id_for_checkpoint_id(&self, checkpoint_id: u64) -> RpcResult<Option<(u64, u128)>> {
+        res(self.db_reader.get_unique_pending_id_for_checkpoint_id(checkpoint_id).await)
+    }
+    async fn get_user_end_cap_slot_updates(
+        &self,
+        unique_pending_id: u64,
+        user_id: u64,
+    ) -> RpcResult<Option<RealmEndCapSlotUpdates>> {
+        res(self
+            .get_user_end_cap_slot_updates_internal(unique_pending_id, user_id)
+            .await)
     }
     async fn get_top_global_user_rewards_tree_proof_to_realm_at_checkpoint_id(&self, checkpoint_id: u64) -> RpcResult<TagTreeMerkleProof<N::QHash>> {
         res(self.get_top_global_user_rewards_tree_proof_to_realm_at_checkpoint_id_internal(checkpoint_id).await)
@@ -559,7 +689,10 @@ impl<
         Ok("ok".to_string())
     }
 
-    async fn submit_user_end_cap_batch(&self, requests: Vec<(SubmitUserEndCapNonProofInput<N::F, N::QHash>, Vec<u8>)>) -> QRpcResult<(Vec<u64>,Vec<u64>)> {
+    async fn submit_user_end_cap_batch(
+        &self,
+        requests: Vec<(SubmitUserEndCapNonProofInput<N::F, N::QHash>, Vec<u8>)>,
+    ) -> QRpcResult<(Vec<u64>, Vec<u64>)> {
         let results: Vec<(u64, bool)> = stream::iter(requests.into_iter().map(|(user_ec_input, proof)| async move {
             let user_id: u64 = user_ec_input.core.state_transition.user_id.to_u64_value();
             match self.handle_user_end_cap_proof_submission(user_ec_input, proof).await {
@@ -729,6 +862,153 @@ impl<
         job_ids: Vec<QProvingJobDataIDWithRewardPath<N::JobId>>,
     ) -> QRpcResult<Vec<PsyProoffMinerRewardProof<N::QHash, N::JobId>>> {
         res(self.generate_batch_proof_miner_reward_proofs_internal(unique_pending_id, job_ids).await)
+    }
+
+    // IMT endpoints
+
+    async fn get_imt_leaf_preimage(
+        &self,
+        checkpoint_id: u64,
+        user_id: u64,
+        contract_id: u32,
+        leaf_index: u64,
+    ) -> QRpcResult<IMTContractStateLeaf<N::F, N::QHash>> {
+        res(res(self
+            .db_reader
+            .contract_state_imt_get_leaf_preimage(checkpoint_id, user_id, contract_id as u64, leaf_index)
+            .await.transpose().ok_or(anyhow::format_err!("Leaf preimage not found at index {}", leaf_index)))?)
+    }
+
+    async fn get_imt_leaf_index_for_key(
+        &self,
+        checkpoint_id: u64,
+        user_id: u64,
+        contract_id: u32,
+        key: N::QHash,
+    ) -> QRpcResult<u64> {
+        res(res(self
+            .db_reader
+            .contract_state_imt_get_leaf_index_for_key(checkpoint_id, user_id, contract_id as u64, &key)
+            .await.transpose().ok_or(anyhow::format_err!("Key not found in IMT")))?)
+    }
+
+    async fn get_imt_membership_proof(
+        &self,
+        checkpoint_id: u64,
+        user_id: u64,
+        contract_id: u32,
+        key: N::QHash,
+    ) -> QRpcResult<IMTMembershipProof<N::F, N::QHash>> {
+        // Get the leaf index for the key
+        let leaf_index = self
+            .db_reader
+            .contract_state_imt_get_leaf_index_for_key(checkpoint_id, user_id, contract_id as u64, &key)
+            .await
+            .map_err(RpcError::Anyhow)?
+            .ok_or_else(|| RpcError::Anyhow(anyhow::anyhow!("Key not found in IMT")))?;
+
+        // Get the leaf preimage
+        let leaf = self
+            .db_reader
+            .contract_state_imt_get_leaf_preimage(checkpoint_id, user_id, contract_id as u64, leaf_index)
+            .await
+            .map_err(RpcError::Anyhow)?
+            .ok_or_else(|| RpcError::Anyhow(anyhow::anyhow!("Leaf preimage not found at index {}", leaf_index)))?;
+
+        // Get the merkle proof for the leaf's position in the tree
+        let merkle_proof = self
+            .db_reader
+            .contract_state_tree_get_merkle_proof(checkpoint_id, user_id, contract_id as u64, N::MAX_CONTRACT_STATE_TREE_HEIGHT, leaf_index)
+            .await
+            .map_err(RpcError::Anyhow)?;
+
+        Ok(IMTMembershipProof {
+            leaf,
+            merkle_proof,
+        })
+    }
+
+    async fn get_imt_non_membership_proof(
+        &self,
+        checkpoint_id: u64,
+        user_id: u64,
+        contract_id: u32,
+        key: N::QHash,
+    ) -> QRpcResult<IMTNonMembershipProof<N::F, N::QHash>> {
+        // Find the predecessor leaf
+        let (predecessor_index, predecessor_leaf) = self
+            .db_reader
+            .contract_state_imt_find_predecessor(checkpoint_id, user_id, contract_id as u64, &key)
+            .await
+            .map_err(RpcError::Anyhow)?;
+
+        // Get the merkle proof for the predecessor's position
+        let merkle_proof = self
+            .db_reader
+            .contract_state_tree_get_merkle_proof(checkpoint_id, user_id, contract_id as u64, N::MAX_CONTRACT_STATE_TREE_HEIGHT, predecessor_index)
+            .await
+            .map_err(RpcError::Anyhow)?;
+
+        Ok(IMTNonMembershipProof {
+            predecessor_leaf,
+            merkle_proof,
+        })
+    }
+
+    async fn get_imt_predecessor_info(
+        &self,
+        checkpoint_id: u64,
+        user_id: u64,
+        contract_id: u32,
+        key: N::QHash,
+    ) -> QRpcResult<IMTPredecessorResult<N::F, N::QHash>> {
+        // Find predecessor leaf
+        let (predecessor_index, predecessor_leaf) = self
+            .db_reader
+            .contract_state_imt_find_predecessor(checkpoint_id, user_id, contract_id as u64, &key)
+            .await
+            .map_err(RpcError::Anyhow)?;
+
+        // Get merkle proof for predecessor
+        let predecessor_merkle_proof = self
+            .db_reader
+            .contract_state_tree_get_merkle_proof(checkpoint_id, user_id, contract_id as u64, N::MAX_CONTRACT_STATE_TREE_HEIGHT, predecessor_index)
+            .await
+            .map_err(RpcError::Anyhow)?;
+
+        // Get next append index
+        let next_append_index = self
+            .db_reader
+            .contract_state_imt_get_next_append_index(user_id, contract_id as u64)
+            .await
+            .map_err(RpcError::Anyhow)?;
+
+        Ok(IMTPredecessorResult {
+            predecessor_leaf_index: predecessor_index,
+            predecessor_leaf,
+            predecessor_merkle_proof,
+            next_append_index,
+        })
+    }
+
+    async fn find_imt_predecessor(
+        &self,
+        checkpoint_id: u64,
+        user_id: u64,
+        contract_id: u64,
+        key: N::QHash,
+    ) -> QRpcResult<(u64, IMTContractStateLeaf<N::F, N::QHash>)> {
+        res(self
+            .db_reader
+            .contract_state_imt_find_predecessor(checkpoint_id, user_id, contract_id as u64, &key)
+            .await)
+    }
+
+    async fn get_imt_next_append_index(&self, user_id: u64, contract_id: u64) -> QRpcResult<u64> {
+        res(self
+            .db_reader
+            .contract_state_imt_get_next_append_index(user_id, contract_id as u64)
+            .await)
     }
 }
 

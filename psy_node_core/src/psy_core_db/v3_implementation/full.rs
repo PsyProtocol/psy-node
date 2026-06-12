@@ -1,26 +1,39 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use anyhow::Ok;
 use async_trait::async_trait;
 use parth_core::{
-    QCoreProcCheckpointUniqueId, crypto::hash::{
+    crypto::hash::{
         merkle_proof::{DeltaMerkleProofCore, MerkleProofCore},
         tag_tree::TagTreeMerkleProof,
-    }, data::{
+    },
+    data::{
         db::row::QDatabaseSingleIdTableRow,
         hash::{
             checkpointed_merkle_node::CheckpointedMerkleHash,
-            merkle_node_key::{PSY_OBJECT_FFS_SIZE_SIMPLE_MERKLE_NODE_KEY, SimpleMerkleNode, SimpleMerkleNodeKey},
+            hash256::Hash256,
+            merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey, PSY_OBJECT_FFS_SIZE_SIMPLE_MERKLE_NODE_KEY},
             merkle_store_key::{QMerkleStoreDoubleIdKeyWithHeight, QMerkleStoreDoubleIdNode, QMerkleStoreSingleIdKey, QMerkleStoreSingleIdNode},
         },
-    }, felt::ToU64Value, protocol::core_types::QNetworkDatabaseTypes
+        serializable::QPDSerializable,
+    },
+    felt::ToU64Value,
+    protocol::core_types::QNetworkDatabaseTypes,
+    QCoreProcCheckpointUniqueId,
 };
 use psy_data::{
     protocol::verifiable_checkpoint_transition::PsyVerifiableCheckpointTransitionWithProof,
     v1::qdata::{
         checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState},
         checkpoint_sync::PQEDCheckpointSyncInfo,
-        contract::{ContractCodeDefinition, ContractCodeDefinitionWithContractId, PQEDContractLeaf},
+        contract::{
+            deserialize_imt_leaf_ffs_entry_v2, encode_imt_key_for_sorting, imt_key_bucket, imt_key_bucket_to_i16, ContractCodeDefinition,
+            ContractCodeDefinitionWithContractId, IMTContractStateLeaf, PQEDContractLeaf,
+            IMT_LEAF_FFS_ENTRY_SIZE_V2,
+        },
         ffs_sizes::{PSY_OBJECT_FFS_SIZE_CONTRACT_LEAF, PSY_OBJECT_FFS_SIZE_USER_LEAF, PSY_OBJECT_FFS_SIZE_ZK_PUBLIC_KEY},
         public_key::PZKPublicKeyInfo,
         user::PQEDUserLeaf,
@@ -30,21 +43,61 @@ use psy_data::{
 use crate::{
     psy_core_db::{
         core_implementation::constants::{
+            CHECKPOINTED_OBJECT_TABLE_OBJ_ID_BRIDGE_DEPOSIT_LEAF_BASE,
             CHECKPOINTED_OBJECT_TABLE_OBJ_ID_REALM_ROOT_TO_GLOBAL_REWARDS_TAG_TREE_ROOT_PROOF,
             CHECKPOINTED_OBJECT_TABLE_OBJ_ID_REALM_ROOT_TO_GLOBAL_USER_TREE_ROOT_MERKLE_PROOF, LATEST_INFO_TABLE_OBJ_ID_LATEST_L2_BLOCK_STATE,
-            U64_SINGLETON_TABLE_OBJ_ID_CHECKPOINT_ID, U64_SINGLETON_TABLE_OBJ_ID_PENDING_ID,
+            U64_SINGLETON_TABLE_OBJ_ID_BRIDGE_DEPOSIT_NEXT_INDEX_BASE, U64_SINGLETON_TABLE_OBJ_ID_CHECKPOINT_ID, U64_SINGLETON_TABLE_OBJ_ID_PENDING_ID,
         },
         traits::full::*,
     },
     store::traits::{
         core_db::{
-            CoreDatabaseBidirectionalMappingReader, CoreDatabaseBidirectionalU64U128MappingReader, CoreDatabaseKivReader,
-            CoreDatabaseSingleIdCheckpointedReader, CoreDatabaseSingleIdMerkleReader, CoreDatabaseStore, CoreDatabaseU64Reader,
-            CoreDatabaseZeroIdMerkleReader,
+            CoreDatabaseBidirectionalMappingReader, CoreDatabaseBidirectionalU64U128MappingReader, CoreDatabaseIMTKeyIndexWriter,
+            CoreDatabaseIMTLeafWriter, CoreDatabaseKivReader, CoreDatabaseSingleIdCheckpointedReader, CoreDatabaseSingleIdMerkleReader,
+            CoreDatabaseStore, CoreDatabaseU64Reader, CoreDatabaseZeroIdMerkleReader,
         },
         helpers::*,
     },
 };
+
+fn bridge_deposit_leaf_obj_id(chain_id: u64, deposit_index: u64) -> anyhow::Result<u64> {
+    if chain_id > u32::MAX as u64 || deposit_index > u32::MAX as u64 {
+        anyhow::bail!(
+            "bridge deposit id overflow: chain_id={}, deposit_index={}, max_supported={}",
+            chain_id,
+            deposit_index,
+            u32::MAX
+        );
+    }
+    Ok(CHECKPOINTED_OBJECT_TABLE_OBJ_ID_BRIDGE_DEPOSIT_LEAF_BASE | (chain_id << 32) | deposit_index)
+}
+
+fn bridge_chain_tree_node_obj_id(chain_id: u64, level: u8, index: u64) -> anyhow::Result<u64> {
+    if chain_id > ((1u64 << 24) - 1) {
+        anyhow::bail!("bridge chain_id overflow: {}, max {}", chain_id, (1u64 << 24) - 1);
+    }
+    if level > 63 {
+        anyhow::bail!("bridge chain tree level overflow: {}, max 63", level);
+    }
+    if index > u32::MAX as u64 {
+        anyhow::bail!("bridge chain tree index overflow: {}, max {}", index, u32::MAX);
+    }
+    // Prefix 0b11 in the top two bits, then [chain_id:24 | level:6 | index:32].
+    let payload = (chain_id << 38) | ((level as u64) << 32) | index;
+    Ok((0b11u64 << 62) | payload)
+}
+
+fn bridge_global_tree_node_obj_id(level: u8, index: u64) -> anyhow::Result<u64> {
+    if level > 63 {
+        anyhow::bail!("bridge global tree level overflow: {}, max 63", level);
+    }
+    if index > ((1u64 << 56) - 1) {
+        anyhow::bail!("bridge global tree index overflow: {}, max {}", index, (1u64 << 56) - 1);
+    }
+    // Prefix 0b00 with subtype=1 in [61..56], then [level:6 | index:56].
+    let subtype = 1u64;
+    Ok((subtype << 56) | ((level as u64) << 50) | index)
+}
 
 #[derive(Clone)]
 pub struct PsyUnifiedCoreDatabaseStore<
@@ -61,6 +114,9 @@ pub struct PsyUnifiedCoreDatabaseStore<
     ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
     TagTreeTableIdentifier: Clone + Send + Sync,
     HashToManyIdsTableIdentifier: Clone + Send + Sync,
+    IMTLeafTableIdentifier: Clone + Send + Sync,
+    IMTKeyIndexTableIdentifier: Clone + Send + Sync,
+    IMTNextAppendIndexTableIdentifier: Clone + Send + Sync,
     S: CoreDatabaseStore<
             N::QHash,
             N::HasherBase,
@@ -76,6 +132,9 @@ pub struct PsyUnifiedCoreDatabaseStore<
             ZeroIdMerkleTableIdentifier,
             TagTreeTableIdentifier,
             HashToManyIdsTableIdentifier,
+            IMTLeafTableIdentifier,
+            IMTKeyIndexTableIdentifier,
+            IMTNextAppendIndexTableIdentifier,
         > + Send
         + Sync,
 > {
@@ -115,6 +174,10 @@ pub struct PsyUnifiedCoreDatabaseStore<
     pub contract_code_definition_table: Arc<SingleIdTableIdentifier>,
 
     pub checkpoint_zk_proof_and_transition_table: Arc<KivTableIdentifier>,
+    // IMT tables
+    pub imt_leaf_table: Arc<IMTLeafTableIdentifier>,
+    pub imt_key_index_table: Arc<IMTKeyIndexTableIdentifier>,
+    pub imt_next_append_index_table: Arc<IMTNextAppendIndexTableIdentifier>,
     // start unused table types
     pub _phantom_double_id_table: std::marker::PhantomData<DoubleIdTableIdentifier>,
     // start phantom N
@@ -135,6 +198,9 @@ impl<
         ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
         TagTreeTableIdentifier: Clone + Send + Sync,
         HashToManyIdsTableIdentifier: Clone + Send + Sync,
+        IMTLeafTableIdentifier: Clone + Send + Sync,
+        IMTKeyIndexTableIdentifier: Clone + Send + Sync,
+        IMTNextAppendIndexTableIdentifier: Clone + Send + Sync,
         S: CoreDatabaseStore<
                 N::QHash,
                 N::HasherBase,
@@ -150,6 +216,9 @@ impl<
                 ZeroIdMerkleTableIdentifier,
                 TagTreeTableIdentifier,
                 HashToManyIdsTableIdentifier,
+                IMTLeafTableIdentifier,
+                IMTKeyIndexTableIdentifier,
+                IMTNextAppendIndexTableIdentifier,
             > + Send
             + Sync,
     >
@@ -167,6 +236,9 @@ impl<
         ZeroIdMerkleTableIdentifier,
         TagTreeTableIdentifier,
         HashToManyIdsTableIdentifier,
+        IMTLeafTableIdentifier,
+        IMTKeyIndexTableIdentifier,
+        IMTNextAppendIndexTableIdentifier,
         S,
     >
 {
@@ -206,6 +278,10 @@ impl<
         contract_leaf_table: Arc<SingleIdTableIdentifier>,
         contract_code_definition_table: Arc<SingleIdTableIdentifier>,
         checkpoint_zk_proof_and_transition_table: Arc<KivTableIdentifier>,
+        // IMT tables
+        imt_leaf_table: Arc<IMTLeafTableIdentifier>,
+        imt_key_index_table: Arc<IMTKeyIndexTableIdentifier>,
+        imt_next_append_index_table: Arc<IMTNextAppendIndexTableIdentifier>,
     ) -> Self {
         Self {
             store,
@@ -238,6 +314,9 @@ impl<
             contract_leaf_table,
             contract_code_definition_table,
             checkpoint_zk_proof_and_transition_table,
+            imt_leaf_table,
+            imt_key_index_table,
+            imt_next_append_index_table,
             _phantom_double_id_table: std::marker::PhantomData {},
             _phantom_n: std::marker::PhantomData {},
         }
@@ -331,6 +410,9 @@ impl<
         ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
         TagTreeTableIdentifier: Clone + Send + Sync,
         HashToManyIdsTableIdentifier: Clone + Send + Sync,
+        IMTLeafTableIdentifier: Clone + Send + Sync,
+        IMTKeyIndexTableIdentifier: Clone + Send + Sync,
+        IMTNextAppendIndexTableIdentifier: Clone + Send + Sync,
         S: CoreDatabaseStore<
                 N::QHash,
                 N::HasherBase,
@@ -346,6 +428,9 @@ impl<
                 ZeroIdMerkleTableIdentifier,
                 TagTreeTableIdentifier,
                 HashToManyIdsTableIdentifier,
+                IMTLeafTableIdentifier,
+                IMTKeyIndexTableIdentifier,
+                IMTNextAppendIndexTableIdentifier,
             > + Send
             + Sync,
     > PsyNodeCheckpointTreeDatabaseReader<N::QHash>
@@ -363,6 +448,9 @@ impl<
         ZeroIdMerkleTableIdentifier,
         TagTreeTableIdentifier,
         HashToManyIdsTableIdentifier,
+        IMTLeafTableIdentifier,
+        IMTKeyIndexTableIdentifier,
+        IMTNextAppendIndexTableIdentifier,
         S,
     >
 {
@@ -408,6 +496,9 @@ impl<
         ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
         TagTreeTableIdentifier: Clone + Send + Sync,
         HashToManyIdsTableIdentifier: Clone + Send + Sync,
+        IMTLeafTableIdentifier: Clone + Send + Sync,
+        IMTKeyIndexTableIdentifier: Clone + Send + Sync,
+        IMTNextAppendIndexTableIdentifier: Clone + Send + Sync,
         S: CoreDatabaseStore<
                 N::QHash,
                 N::HasherBase,
@@ -423,6 +514,9 @@ impl<
                 ZeroIdMerkleTableIdentifier,
                 TagTreeTableIdentifier,
                 HashToManyIdsTableIdentifier,
+                IMTLeafTableIdentifier,
+                IMTKeyIndexTableIdentifier,
+                IMTNextAppendIndexTableIdentifier,
             > + Send
             + Sync,
     > PsyNodeCheckpointTreeDatabaseWriter<N::QHash>
@@ -440,6 +534,9 @@ impl<
         ZeroIdMerkleTableIdentifier,
         TagTreeTableIdentifier,
         HashToManyIdsTableIdentifier,
+        IMTLeafTableIdentifier,
+        IMTKeyIndexTableIdentifier,
+        IMTNextAppendIndexTableIdentifier,
         S,
     >
 {
@@ -515,6 +612,9 @@ impl<
         ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
         TagTreeTableIdentifier: Clone + Send + Sync,
         HashToManyIdsTableIdentifier: Clone + Send + Sync,
+        IMTLeafTableIdentifier: Clone + Send + Sync,
+        IMTKeyIndexTableIdentifier: Clone + Send + Sync,
+        IMTNextAppendIndexTableIdentifier: Clone + Send + Sync,
         S: CoreDatabaseStore<
                 N::QHash,
                 N::HasherBase,
@@ -530,6 +630,9 @@ impl<
                 ZeroIdMerkleTableIdentifier,
                 TagTreeTableIdentifier,
                 HashToManyIdsTableIdentifier,
+                IMTLeafTableIdentifier,
+                IMTKeyIndexTableIdentifier,
+                IMTNextAppendIndexTableIdentifier,
             > + Send
             + Sync,
     > PsyNodeUserRegistrationTreeDatabaseReader<N::QHash>
@@ -547,6 +650,9 @@ impl<
         ZeroIdMerkleTableIdentifier,
         TagTreeTableIdentifier,
         HashToManyIdsTableIdentifier,
+        IMTLeafTableIdentifier,
+        IMTKeyIndexTableIdentifier,
+        IMTNextAppendIndexTableIdentifier,
         S,
     >
 {
@@ -598,6 +704,9 @@ impl<
         ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
         TagTreeTableIdentifier: Clone + Send + Sync,
         HashToManyIdsTableIdentifier: Clone + Send + Sync,
+        IMTLeafTableIdentifier: Clone + Send + Sync,
+        IMTKeyIndexTableIdentifier: Clone + Send + Sync,
+        IMTNextAppendIndexTableIdentifier: Clone + Send + Sync,
         S: CoreDatabaseStore<
                 N::QHash,
                 N::HasherBase,
@@ -613,6 +722,9 @@ impl<
                 ZeroIdMerkleTableIdentifier,
                 TagTreeTableIdentifier,
                 HashToManyIdsTableIdentifier,
+                IMTLeafTableIdentifier,
+                IMTKeyIndexTableIdentifier,
+                IMTNextAppendIndexTableIdentifier,
             > + Send
             + Sync,
     > PsyNodeUserRegistrationTreeDatabaseWriter<N::QHash>
@@ -630,6 +742,9 @@ impl<
         ZeroIdMerkleTableIdentifier,
         TagTreeTableIdentifier,
         HashToManyIdsTableIdentifier,
+        IMTLeafTableIdentifier,
+        IMTKeyIndexTableIdentifier,
+        IMTNextAppendIndexTableIdentifier,
         S,
     >
 {
@@ -682,6 +797,9 @@ impl<
         ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
         TagTreeTableIdentifier: Clone + Send + Sync,
         HashToManyIdsTableIdentifier: Clone + Send + Sync,
+        IMTLeafTableIdentifier: Clone + Send + Sync,
+        IMTKeyIndexTableIdentifier: Clone + Send + Sync,
+        IMTNextAppendIndexTableIdentifier: Clone + Send + Sync,
         S: CoreDatabaseStore<
                 N::QHash,
                 N::HasherBase,
@@ -697,6 +815,9 @@ impl<
                 ZeroIdMerkleTableIdentifier,
                 TagTreeTableIdentifier,
                 HashToManyIdsTableIdentifier,
+                IMTLeafTableIdentifier,
+                IMTKeyIndexTableIdentifier,
+                IMTNextAppendIndexTableIdentifier,
             > + Send
             + Sync,
     > PsyNodeGlobalUserTreeDatabaseReader<N::QHash>
@@ -714,6 +835,9 @@ impl<
         ZeroIdMerkleTableIdentifier,
         TagTreeTableIdentifier,
         HashToManyIdsTableIdentifier,
+        IMTLeafTableIdentifier,
+        IMTKeyIndexTableIdentifier,
+        IMTNextAppendIndexTableIdentifier,
         S,
     >
 {
@@ -792,6 +916,9 @@ impl<
         ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
         TagTreeTableIdentifier: Clone + Send + Sync,
         HashToManyIdsTableIdentifier: Clone + Send + Sync,
+        IMTLeafTableIdentifier: Clone + Send + Sync,
+        IMTKeyIndexTableIdentifier: Clone + Send + Sync,
+        IMTNextAppendIndexTableIdentifier: Clone + Send + Sync,
         S: CoreDatabaseStore<
                 N::QHash,
                 N::HasherBase,
@@ -807,6 +934,9 @@ impl<
                 ZeroIdMerkleTableIdentifier,
                 TagTreeTableIdentifier,
                 HashToManyIdsTableIdentifier,
+                IMTLeafTableIdentifier,
+                IMTKeyIndexTableIdentifier,
+                IMTNextAppendIndexTableIdentifier,
             > + Send
             + Sync,
     > PsyNodeGlobalUserTreeDatabaseWriter<N::QHash>
@@ -824,6 +954,9 @@ impl<
         ZeroIdMerkleTableIdentifier,
         TagTreeTableIdentifier,
         HashToManyIdsTableIdentifier,
+        IMTLeafTableIdentifier,
+        IMTKeyIndexTableIdentifier,
+        IMTNextAppendIndexTableIdentifier,
         S,
     >
 {
@@ -887,6 +1020,9 @@ impl<
         ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
         TagTreeTableIdentifier: Clone + Send + Sync,
         HashToManyIdsTableIdentifier: Clone + Send + Sync,
+        IMTLeafTableIdentifier: Clone + Send + Sync,
+        IMTKeyIndexTableIdentifier: Clone + Send + Sync,
+        IMTNextAppendIndexTableIdentifier: Clone + Send + Sync,
         S: CoreDatabaseStore<
                 N::QHash,
                 N::HasherBase,
@@ -902,6 +1038,9 @@ impl<
                 ZeroIdMerkleTableIdentifier,
                 TagTreeTableIdentifier,
                 HashToManyIdsTableIdentifier,
+                IMTLeafTableIdentifier,
+                IMTKeyIndexTableIdentifier,
+                IMTNextAppendIndexTableIdentifier,
             > + Send
             + Sync,
     > PsyNodeUserContractTreeDatabaseReader<N::QHash>
@@ -919,6 +1058,9 @@ impl<
         ZeroIdMerkleTableIdentifier,
         TagTreeTableIdentifier,
         HashToManyIdsTableIdentifier,
+        IMTLeafTableIdentifier,
+        IMTKeyIndexTableIdentifier,
+        IMTNextAppendIndexTableIdentifier,
         S,
     >
 {
@@ -1007,6 +1149,9 @@ impl<
         ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
         TagTreeTableIdentifier: Clone + Send + Sync,
         HashToManyIdsTableIdentifier: Clone + Send + Sync,
+        IMTLeafTableIdentifier: Clone + Send + Sync,
+        IMTKeyIndexTableIdentifier: Clone + Send + Sync,
+        IMTNextAppendIndexTableIdentifier: Clone + Send + Sync,
         S: CoreDatabaseStore<
                 N::QHash,
                 N::HasherBase,
@@ -1022,6 +1167,9 @@ impl<
                 ZeroIdMerkleTableIdentifier,
                 TagTreeTableIdentifier,
                 HashToManyIdsTableIdentifier,
+                IMTLeafTableIdentifier,
+                IMTKeyIndexTableIdentifier,
+                IMTNextAppendIndexTableIdentifier,
             > + Send
             + Sync,
     > PsyNodeUserContractTreeDatabaseWriter<N::QHash>
@@ -1039,6 +1187,9 @@ impl<
         ZeroIdMerkleTableIdentifier,
         TagTreeTableIdentifier,
         HashToManyIdsTableIdentifier,
+        IMTLeafTableIdentifier,
+        IMTKeyIndexTableIdentifier,
+        IMTNextAppendIndexTableIdentifier,
         S,
     >
 {
@@ -1111,6 +1262,9 @@ impl<
         ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
         TagTreeTableIdentifier: Clone + Send + Sync,
         HashToManyIdsTableIdentifier: Clone + Send + Sync,
+        IMTLeafTableIdentifier: Clone + Send + Sync,
+        IMTKeyIndexTableIdentifier: Clone + Send + Sync,
+        IMTNextAppendIndexTableIdentifier: Clone + Send + Sync,
         S: CoreDatabaseStore<
                 N::QHash,
                 N::HasherBase,
@@ -1126,6 +1280,9 @@ impl<
                 ZeroIdMerkleTableIdentifier,
                 TagTreeTableIdentifier,
                 HashToManyIdsTableIdentifier,
+                IMTLeafTableIdentifier,
+                IMTKeyIndexTableIdentifier,
+                IMTNextAppendIndexTableIdentifier,
             > + Send
             + Sync,
     > PsyNodeContractStateTreeTreeDatabaseReader<N::QHash>
@@ -1143,6 +1300,9 @@ impl<
         ZeroIdMerkleTableIdentifier,
         TagTreeTableIdentifier,
         HashToManyIdsTableIdentifier,
+        IMTLeafTableIdentifier,
+        IMTKeyIndexTableIdentifier,
+        IMTNextAppendIndexTableIdentifier,
         S,
     >
 {
@@ -1198,11 +1358,7 @@ impl<
             return Ok(vec![]);
         }
         self.store
-            .db_select_many_double_id_merkle_nodes_with_height_max_checkpoint(
-                &self.contract_state_tree_table,
-                checkpoint_id,
-                keys,
-            )
+            .db_select_many_double_id_merkle_nodes_with_height_max_checkpoint(&self.contract_state_tree_table, checkpoint_id, keys)
             .await
     }
 }
@@ -1222,6 +1378,9 @@ impl<
         ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
         TagTreeTableIdentifier: Clone + Send + Sync,
         HashToManyIdsTableIdentifier: Clone + Send + Sync,
+        IMTLeafTableIdentifier: Clone + Send + Sync,
+        IMTKeyIndexTableIdentifier: Clone + Send + Sync,
+        IMTNextAppendIndexTableIdentifier: Clone + Send + Sync,
         S: CoreDatabaseStore<
                 N::QHash,
                 N::HasherBase,
@@ -1237,6 +1396,9 @@ impl<
                 ZeroIdMerkleTableIdentifier,
                 TagTreeTableIdentifier,
                 HashToManyIdsTableIdentifier,
+                IMTLeafTableIdentifier,
+                IMTKeyIndexTableIdentifier,
+                IMTNextAppendIndexTableIdentifier,
             > + Send
             + Sync,
     > PsyNodeContractStateTreeTreeDatabaseWriter<N::QHash>
@@ -1254,6 +1416,9 @@ impl<
         ZeroIdMerkleTableIdentifier,
         TagTreeTableIdentifier,
         HashToManyIdsTableIdentifier,
+        IMTLeafTableIdentifier,
+        IMTKeyIndexTableIdentifier,
+        IMTNextAppendIndexTableIdentifier,
         S,
     >
 {
@@ -1343,6 +1508,9 @@ impl<
         ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
         TagTreeTableIdentifier: Clone + Send + Sync,
         HashToManyIdsTableIdentifier: Clone + Send + Sync,
+        IMTLeafTableIdentifier: Clone + Send + Sync,
+        IMTKeyIndexTableIdentifier: Clone + Send + Sync,
+        IMTNextAppendIndexTableIdentifier: Clone + Send + Sync,
         S: CoreDatabaseStore<
                 N::QHash,
                 N::HasherBase,
@@ -1358,6 +1526,9 @@ impl<
                 ZeroIdMerkleTableIdentifier,
                 TagTreeTableIdentifier,
                 HashToManyIdsTableIdentifier,
+                IMTLeafTableIdentifier,
+                IMTKeyIndexTableIdentifier,
+                IMTNextAppendIndexTableIdentifier,
             > + Send
             + Sync,
     > PsyNodeGlobalContractTreeDatabaseReader<N::QHash>
@@ -1375,6 +1546,9 @@ impl<
         ZeroIdMerkleTableIdentifier,
         TagTreeTableIdentifier,
         HashToManyIdsTableIdentifier,
+        IMTLeafTableIdentifier,
+        IMTKeyIndexTableIdentifier,
+        IMTNextAppendIndexTableIdentifier,
         S,
     >
 {
@@ -1426,6 +1600,9 @@ impl<
         ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
         TagTreeTableIdentifier: Clone + Send + Sync,
         HashToManyIdsTableIdentifier: Clone + Send + Sync,
+        IMTLeafTableIdentifier: Clone + Send + Sync,
+        IMTKeyIndexTableIdentifier: Clone + Send + Sync,
+        IMTNextAppendIndexTableIdentifier: Clone + Send + Sync,
         S: CoreDatabaseStore<
                 N::QHash,
                 N::HasherBase,
@@ -1441,6 +1618,9 @@ impl<
                 ZeroIdMerkleTableIdentifier,
                 TagTreeTableIdentifier,
                 HashToManyIdsTableIdentifier,
+                IMTLeafTableIdentifier,
+                IMTKeyIndexTableIdentifier,
+                IMTNextAppendIndexTableIdentifier,
             > + Send
             + Sync,
     > PsyNodeGlobalContractTreeDatabaseWriter<N::QHash>
@@ -1458,6 +1638,9 @@ impl<
         ZeroIdMerkleTableIdentifier,
         TagTreeTableIdentifier,
         HashToManyIdsTableIdentifier,
+        IMTLeafTableIdentifier,
+        IMTKeyIndexTableIdentifier,
+        IMTNextAppendIndexTableIdentifier,
         S,
     >
 {
@@ -1510,6 +1693,9 @@ impl<
         ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
         TagTreeTableIdentifier: Clone + Send + Sync,
         HashToManyIdsTableIdentifier: Clone + Send + Sync,
+        IMTLeafTableIdentifier: Clone + Send + Sync,
+        IMTKeyIndexTableIdentifier: Clone + Send + Sync,
+        IMTNextAppendIndexTableIdentifier: Clone + Send + Sync,
         S: CoreDatabaseStore<
                 N::QHash,
                 N::HasherBase,
@@ -1525,6 +1711,9 @@ impl<
                 ZeroIdMerkleTableIdentifier,
                 TagTreeTableIdentifier,
                 HashToManyIdsTableIdentifier,
+                IMTLeafTableIdentifier,
+                IMTKeyIndexTableIdentifier,
+                IMTNextAppendIndexTableIdentifier,
             > + Send
             + Sync,
     > PsyNodeContractFunctionTreeDatabaseReader<N::QHash>
@@ -1542,6 +1731,9 @@ impl<
         ZeroIdMerkleTableIdentifier,
         TagTreeTableIdentifier,
         HashToManyIdsTableIdentifier,
+        IMTLeafTableIdentifier,
+        IMTKeyIndexTableIdentifier,
+        IMTNextAppendIndexTableIdentifier,
         S,
     >
 {
@@ -1630,6 +1822,9 @@ impl<
         ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
         TagTreeTableIdentifier: Clone + Send + Sync,
         HashToManyIdsTableIdentifier: Clone + Send + Sync,
+        IMTLeafTableIdentifier: Clone + Send + Sync,
+        IMTKeyIndexTableIdentifier: Clone + Send + Sync,
+        IMTNextAppendIndexTableIdentifier: Clone + Send + Sync,
         S: CoreDatabaseStore<
                 N::QHash,
                 N::HasherBase,
@@ -1645,6 +1840,9 @@ impl<
                 ZeroIdMerkleTableIdentifier,
                 TagTreeTableIdentifier,
                 HashToManyIdsTableIdentifier,
+                IMTLeafTableIdentifier,
+                IMTKeyIndexTableIdentifier,
+                IMTNextAppendIndexTableIdentifier,
             > + Send
             + Sync,
     > PsyNodeContractFunctionTreeDatabaseWriter<N::QHash>
@@ -1662,6 +1860,9 @@ impl<
         ZeroIdMerkleTableIdentifier,
         TagTreeTableIdentifier,
         HashToManyIdsTableIdentifier,
+        IMTLeafTableIdentifier,
+        IMTKeyIndexTableIdentifier,
+        IMTNextAppendIndexTableIdentifier,
         S,
     >
 {
@@ -1734,6 +1935,9 @@ impl<
         ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
         TagTreeTableIdentifier: Clone + Send + Sync,
         HashToManyIdsTableIdentifier: Clone + Send + Sync,
+        IMTLeafTableIdentifier: Clone + Send + Sync,
+        IMTKeyIndexTableIdentifier: Clone + Send + Sync,
+        IMTNextAppendIndexTableIdentifier: Clone + Send + Sync,
         S: CoreDatabaseStore<
                 N::QHash,
                 N::HasherBase,
@@ -1749,6 +1953,9 @@ impl<
                 ZeroIdMerkleTableIdentifier,
                 TagTreeTableIdentifier,
                 HashToManyIdsTableIdentifier,
+                IMTLeafTableIdentifier,
+                IMTKeyIndexTableIdentifier,
+                IMTNextAppendIndexTableIdentifier,
             > + Send
             + Sync,
     > PsyNodeCheckpointObjectDatabaseReader<N::F, N::QHash>
@@ -1766,6 +1973,9 @@ impl<
         ZeroIdMerkleTableIdentifier,
         TagTreeTableIdentifier,
         HashToManyIdsTableIdentifier,
+        IMTLeafTableIdentifier,
+        IMTKeyIndexTableIdentifier,
+        IMTNextAppendIndexTableIdentifier,
         S,
     >
 {
@@ -1859,6 +2069,9 @@ impl<
         ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
         TagTreeTableIdentifier: Clone + Send + Sync,
         HashToManyIdsTableIdentifier: Clone + Send + Sync,
+        IMTLeafTableIdentifier: Clone + Send + Sync,
+        IMTKeyIndexTableIdentifier: Clone + Send + Sync,
+        IMTNextAppendIndexTableIdentifier: Clone + Send + Sync,
         S: CoreDatabaseStore<
                 N::QHash,
                 N::HasherBase,
@@ -1874,6 +2087,9 @@ impl<
                 ZeroIdMerkleTableIdentifier,
                 TagTreeTableIdentifier,
                 HashToManyIdsTableIdentifier,
+                IMTLeafTableIdentifier,
+                IMTKeyIndexTableIdentifier,
+                IMTNextAppendIndexTableIdentifier,
             > + Send
             + Sync,
     > PsyNodeCoordinatorSpecificDatabaseReader<N::F, N::QHash>
@@ -1891,6 +2107,9 @@ impl<
         ZeroIdMerkleTableIdentifier,
         TagTreeTableIdentifier,
         HashToManyIdsTableIdentifier,
+        IMTLeafTableIdentifier,
+        IMTKeyIndexTableIdentifier,
+        IMTNextAppendIndexTableIdentifier,
         S,
     >
 {
@@ -1910,6 +2129,7 @@ impl<
             None => Ok(None),
         }
     }
+
 }
 
 #[async_trait]
@@ -1927,6 +2147,9 @@ impl<
         ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
         TagTreeTableIdentifier: Clone + Send + Sync,
         HashToManyIdsTableIdentifier: Clone + Send + Sync,
+        IMTLeafTableIdentifier: Clone + Send + Sync,
+        IMTKeyIndexTableIdentifier: Clone + Send + Sync,
+        IMTNextAppendIndexTableIdentifier: Clone + Send + Sync,
         S: CoreDatabaseStore<
                 N::QHash,
                 N::HasherBase,
@@ -1942,6 +2165,9 @@ impl<
                 ZeroIdMerkleTableIdentifier,
                 TagTreeTableIdentifier,
                 HashToManyIdsTableIdentifier,
+                IMTLeafTableIdentifier,
+                IMTKeyIndexTableIdentifier,
+                IMTNextAppendIndexTableIdentifier,
             > + Send
             + Sync,
     > PsyNodeCoordinatorSpecificDatabaseWriter<N::F, N::QHash>
@@ -1959,6 +2185,9 @@ impl<
         ZeroIdMerkleTableIdentifier,
         TagTreeTableIdentifier,
         HashToManyIdsTableIdentifier,
+        IMTLeafTableIdentifier,
+        IMTKeyIndexTableIdentifier,
+        IMTNextAppendIndexTableIdentifier,
         S,
     >
 {
@@ -1977,6 +2206,8 @@ impl<
             )
             .await
     }
+
+
 }
 
 #[async_trait]
@@ -1994,6 +2225,9 @@ impl<
         ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
         TagTreeTableIdentifier: Clone + Send + Sync,
         HashToManyIdsTableIdentifier: Clone + Send + Sync,
+        IMTLeafTableIdentifier: Clone + Send + Sync,
+        IMTKeyIndexTableIdentifier: Clone + Send + Sync,
+        IMTNextAppendIndexTableIdentifier: Clone + Send + Sync,
         S: CoreDatabaseStore<
                 N::QHash,
                 N::HasherBase,
@@ -2009,6 +2243,9 @@ impl<
                 ZeroIdMerkleTableIdentifier,
                 TagTreeTableIdentifier,
                 HashToManyIdsTableIdentifier,
+                IMTLeafTableIdentifier,
+                IMTKeyIndexTableIdentifier,
+                IMTNextAppendIndexTableIdentifier,
             > + Send
             + Sync,
     > PsyNodeCheckpointRealmSpecificDatabaseReader<N::F, N::QHash>
@@ -2026,6 +2263,9 @@ impl<
         ZeroIdMerkleTableIdentifier,
         TagTreeTableIdentifier,
         HashToManyIdsTableIdentifier,
+        IMTLeafTableIdentifier,
+        IMTKeyIndexTableIdentifier,
+        IMTNextAppendIndexTableIdentifier,
         S,
     >
 {
@@ -2084,6 +2324,9 @@ impl<
         ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
         TagTreeTableIdentifier: Clone + Send + Sync,
         HashToManyIdsTableIdentifier: Clone + Send + Sync,
+        IMTLeafTableIdentifier: Clone + Send + Sync,
+        IMTKeyIndexTableIdentifier: Clone + Send + Sync,
+        IMTNextAppendIndexTableIdentifier: Clone + Send + Sync,
         S: CoreDatabaseStore<
                 N::QHash,
                 N::HasherBase,
@@ -2099,6 +2342,9 @@ impl<
                 ZeroIdMerkleTableIdentifier,
                 TagTreeTableIdentifier,
                 HashToManyIdsTableIdentifier,
+                IMTLeafTableIdentifier,
+                IMTKeyIndexTableIdentifier,
+                IMTNextAppendIndexTableIdentifier,
             > + Send
             + Sync,
     > PsyNodeCheckpointObjectDatabaseWriter<N::F, N::QHash>
@@ -2116,6 +2362,9 @@ impl<
         ZeroIdMerkleTableIdentifier,
         TagTreeTableIdentifier,
         HashToManyIdsTableIdentifier,
+        IMTLeafTableIdentifier,
+        IMTKeyIndexTableIdentifier,
+        IMTNextAppendIndexTableIdentifier,
         S,
     >
 {
@@ -2227,6 +2476,9 @@ impl<
         ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
         TagTreeTableIdentifier: Clone + Send + Sync,
         HashToManyIdsTableIdentifier: Clone + Send + Sync,
+        IMTLeafTableIdentifier: Clone + Send + Sync,
+        IMTKeyIndexTableIdentifier: Clone + Send + Sync,
+        IMTNextAppendIndexTableIdentifier: Clone + Send + Sync,
         S: CoreDatabaseStore<
                 N::QHash,
                 N::HasherBase,
@@ -2242,6 +2494,9 @@ impl<
                 ZeroIdMerkleTableIdentifier,
                 TagTreeTableIdentifier,
                 HashToManyIdsTableIdentifier,
+                IMTLeafTableIdentifier,
+                IMTKeyIndexTableIdentifier,
+                IMTNextAppendIndexTableIdentifier,
             > + Send
             + Sync,
     > PsyNodeCoreDatabaseUserStoreReader<N::F, N::QHash>
@@ -2259,6 +2514,9 @@ impl<
         ZeroIdMerkleTableIdentifier,
         TagTreeTableIdentifier,
         HashToManyIdsTableIdentifier,
+        IMTLeafTableIdentifier,
+        IMTKeyIndexTableIdentifier,
+        IMTNextAppendIndexTableIdentifier,
         S,
     >
 {
@@ -2303,6 +2561,9 @@ impl<
         ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
         TagTreeTableIdentifier: Clone + Send + Sync,
         HashToManyIdsTableIdentifier: Clone + Send + Sync,
+        IMTLeafTableIdentifier: Clone + Send + Sync,
+        IMTKeyIndexTableIdentifier: Clone + Send + Sync,
+        IMTNextAppendIndexTableIdentifier: Clone + Send + Sync,
         S: CoreDatabaseStore<
                 N::QHash,
                 N::HasherBase,
@@ -2318,6 +2579,9 @@ impl<
                 ZeroIdMerkleTableIdentifier,
                 TagTreeTableIdentifier,
                 HashToManyIdsTableIdentifier,
+                IMTLeafTableIdentifier,
+                IMTKeyIndexTableIdentifier,
+                IMTNextAppendIndexTableIdentifier,
             > + Send
             + Sync,
     > PsyNodeCoreDatabaseUserStoreWriter<N::F, N::QHash>
@@ -2335,6 +2599,9 @@ impl<
         ZeroIdMerkleTableIdentifier,
         TagTreeTableIdentifier,
         HashToManyIdsTableIdentifier,
+        IMTLeafTableIdentifier,
+        IMTKeyIndexTableIdentifier,
+        IMTNextAppendIndexTableIdentifier,
         S,
     >
 {
@@ -2405,6 +2672,9 @@ impl<
         ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
         TagTreeTableIdentifier: Clone + Send + Sync,
         HashToManyIdsTableIdentifier: Clone + Send + Sync,
+        IMTLeafTableIdentifier: Clone + Send + Sync,
+        IMTKeyIndexTableIdentifier: Clone + Send + Sync,
+        IMTNextAppendIndexTableIdentifier: Clone + Send + Sync,
         S: CoreDatabaseStore<
                 N::QHash,
                 N::HasherBase,
@@ -2420,6 +2690,9 @@ impl<
                 ZeroIdMerkleTableIdentifier,
                 TagTreeTableIdentifier,
                 HashToManyIdsTableIdentifier,
+                IMTLeafTableIdentifier,
+                IMTKeyIndexTableIdentifier,
+                IMTNextAppendIndexTableIdentifier,
             > + Send
             + Sync,
     > PsyNodeCoreDatabaseBasicContractInfoStoreReader<N::F, N::QHash>
@@ -2437,6 +2710,9 @@ impl<
         ZeroIdMerkleTableIdentifier,
         TagTreeTableIdentifier,
         HashToManyIdsTableIdentifier,
+        IMTLeafTableIdentifier,
+        IMTKeyIndexTableIdentifier,
+        IMTNextAppendIndexTableIdentifier,
         S,
     >
 {
@@ -2466,6 +2742,9 @@ impl<
         ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
         TagTreeTableIdentifier: Clone + Send + Sync,
         HashToManyIdsTableIdentifier: Clone + Send + Sync,
+        IMTLeafTableIdentifier: Clone + Send + Sync,
+        IMTKeyIndexTableIdentifier: Clone + Send + Sync,
+        IMTNextAppendIndexTableIdentifier: Clone + Send + Sync,
         S: CoreDatabaseStore<
                 N::QHash,
                 N::HasherBase,
@@ -2481,6 +2760,9 @@ impl<
                 ZeroIdMerkleTableIdentifier,
                 TagTreeTableIdentifier,
                 HashToManyIdsTableIdentifier,
+                IMTLeafTableIdentifier,
+                IMTKeyIndexTableIdentifier,
+                IMTNextAppendIndexTableIdentifier,
             > + Send
             + Sync,
     > PsyNodeCoreDatabaseBasicContractInfoStoreWriter<N::F, N::QHash>
@@ -2498,6 +2780,9 @@ impl<
         ZeroIdMerkleTableIdentifier,
         TagTreeTableIdentifier,
         HashToManyIdsTableIdentifier,
+        IMTLeafTableIdentifier,
+        IMTKeyIndexTableIdentifier,
+        IMTNextAppendIndexTableIdentifier,
         S,
     >
 {
@@ -2526,6 +2811,9 @@ impl<
         ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
         TagTreeTableIdentifier: Clone + Send + Sync,
         HashToManyIdsTableIdentifier: Clone + Send + Sync,
+        IMTLeafTableIdentifier: Clone + Send + Sync,
+        IMTKeyIndexTableIdentifier: Clone + Send + Sync,
+        IMTNextAppendIndexTableIdentifier: Clone + Send + Sync,
         S: CoreDatabaseStore<
                 N::QHash,
                 N::HasherBase,
@@ -2541,6 +2829,9 @@ impl<
                 ZeroIdMerkleTableIdentifier,
                 TagTreeTableIdentifier,
                 HashToManyIdsTableIdentifier,
+                IMTLeafTableIdentifier,
+                IMTKeyIndexTableIdentifier,
+                IMTNextAppendIndexTableIdentifier,
             > + Send
             + Sync,
     > PsyNodeCoreDatabaseContractObjectStoreReader<N::F, N::QHash>
@@ -2558,6 +2849,9 @@ impl<
         ZeroIdMerkleTableIdentifier,
         TagTreeTableIdentifier,
         HashToManyIdsTableIdentifier,
+        IMTLeafTableIdentifier,
+        IMTKeyIndexTableIdentifier,
+        IMTNextAppendIndexTableIdentifier,
         S,
     >
 {
@@ -2607,6 +2901,9 @@ impl<
         ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
         TagTreeTableIdentifier: Clone + Send + Sync,
         HashToManyIdsTableIdentifier: Clone + Send + Sync,
+        IMTLeafTableIdentifier: Clone + Send + Sync,
+        IMTKeyIndexTableIdentifier: Clone + Send + Sync,
+        IMTNextAppendIndexTableIdentifier: Clone + Send + Sync,
         S: CoreDatabaseStore<
                 N::QHash,
                 N::HasherBase,
@@ -2622,6 +2919,9 @@ impl<
                 ZeroIdMerkleTableIdentifier,
                 TagTreeTableIdentifier,
                 HashToManyIdsTableIdentifier,
+                IMTLeafTableIdentifier,
+                IMTKeyIndexTableIdentifier,
+                IMTNextAppendIndexTableIdentifier,
             > + Send
             + Sync,
     > PsyNodeCoreDatabaseContractObjectStoreWriter<N::F, N::QHash>
@@ -2639,6 +2939,9 @@ impl<
         ZeroIdMerkleTableIdentifier,
         TagTreeTableIdentifier,
         HashToManyIdsTableIdentifier,
+        IMTLeafTableIdentifier,
+        IMTKeyIndexTableIdentifier,
+        IMTNextAppendIndexTableIdentifier,
         S,
     >
 {
@@ -2692,6 +2995,9 @@ impl<
         ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
         TagTreeTableIdentifier: Clone + Send + Sync,
         HashToManyIdsTableIdentifier: Clone + Send + Sync,
+        IMTLeafTableIdentifier: Clone + Send + Sync,
+        IMTKeyIndexTableIdentifier: Clone + Send + Sync,
+        IMTNextAppendIndexTableIdentifier: Clone + Send + Sync,
         S: CoreDatabaseStore<
                 N::QHash,
                 N::HasherBase,
@@ -2707,6 +3013,9 @@ impl<
                 ZeroIdMerkleTableIdentifier,
                 TagTreeTableIdentifier,
                 HashToManyIdsTableIdentifier,
+                IMTLeafTableIdentifier,
+                IMTKeyIndexTableIdentifier,
+                IMTNextAppendIndexTableIdentifier,
             > + Send
             + Sync,
     > PsyNodeCoreRewardsTagTreeStoreReader<N::F, N::QHash>
@@ -2724,6 +3033,9 @@ impl<
         ZeroIdMerkleTableIdentifier,
         TagTreeTableIdentifier,
         HashToManyIdsTableIdentifier,
+        IMTLeafTableIdentifier,
+        IMTKeyIndexTableIdentifier,
+        IMTNextAppendIndexTableIdentifier,
         S,
     >
 {
@@ -2795,6 +3107,9 @@ impl<
         ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
         TagTreeTableIdentifier: Clone + Send + Sync,
         HashToManyIdsTableIdentifier: Clone + Send + Sync,
+        IMTLeafTableIdentifier: Clone + Send + Sync,
+        IMTKeyIndexTableIdentifier: Clone + Send + Sync,
+        IMTNextAppendIndexTableIdentifier: Clone + Send + Sync,
         S: CoreDatabaseStore<
                 N::QHash,
                 N::HasherBase,
@@ -2810,6 +3125,9 @@ impl<
                 ZeroIdMerkleTableIdentifier,
                 TagTreeTableIdentifier,
                 HashToManyIdsTableIdentifier,
+                IMTLeafTableIdentifier,
+                IMTKeyIndexTableIdentifier,
+                IMTNextAppendIndexTableIdentifier,
             > + Send
             + Sync,
     > PsyNodeCoreRewardsTagTreeStoreWriter<N::F, N::QHash>
@@ -2827,6 +3145,9 @@ impl<
         ZeroIdMerkleTableIdentifier,
         TagTreeTableIdentifier,
         HashToManyIdsTableIdentifier,
+        IMTLeafTableIdentifier,
+        IMTKeyIndexTableIdentifier,
+        IMTNextAppendIndexTableIdentifier,
         S,
     >
 {
@@ -2868,6 +3189,9 @@ impl<
         ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
         TagTreeTableIdentifier: Clone + Send + Sync,
         HashToManyIdsTableIdentifier: Clone + Send + Sync,
+        IMTLeafTableIdentifier: Clone + Send + Sync,
+        IMTKeyIndexTableIdentifier: Clone + Send + Sync,
+        IMTNextAppendIndexTableIdentifier: Clone + Send + Sync,
         S: CoreDatabaseStore<
                 N::QHash,
                 N::HasherBase,
@@ -2883,6 +3207,9 @@ impl<
                 ZeroIdMerkleTableIdentifier,
                 TagTreeTableIdentifier,
                 HashToManyIdsTableIdentifier,
+                IMTLeafTableIdentifier,
+                IMTKeyIndexTableIdentifier,
+                IMTNextAppendIndexTableIdentifier,
             > + Send
             + Sync,
     > PsyNodeCheckpointTransitionZKProofDatabaseReader<N::F, N::QHash>
@@ -2900,6 +3227,9 @@ impl<
         ZeroIdMerkleTableIdentifier,
         TagTreeTableIdentifier,
         HashToManyIdsTableIdentifier,
+        IMTLeafTableIdentifier,
+        IMTKeyIndexTableIdentifier,
+        IMTNextAppendIndexTableIdentifier,
         S,
     >
 {
@@ -2934,6 +3264,9 @@ impl<
         ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
         TagTreeTableIdentifier: Clone + Send + Sync,
         HashToManyIdsTableIdentifier: Clone + Send + Sync,
+        IMTLeafTableIdentifier: Clone + Send + Sync,
+        IMTKeyIndexTableIdentifier: Clone + Send + Sync,
+        IMTNextAppendIndexTableIdentifier: Clone + Send + Sync,
         S: CoreDatabaseStore<
                 N::QHash,
                 N::HasherBase,
@@ -2949,6 +3282,9 @@ impl<
                 ZeroIdMerkleTableIdentifier,
                 TagTreeTableIdentifier,
                 HashToManyIdsTableIdentifier,
+                IMTLeafTableIdentifier,
+                IMTKeyIndexTableIdentifier,
+                IMTNextAppendIndexTableIdentifier,
             > + Send
             + Sync,
     > PsyNodeCheckpointTransitionZKProofDatabaseWriter<N::F, N::QHash>
@@ -2966,6 +3302,9 @@ impl<
         ZeroIdMerkleTableIdentifier,
         TagTreeTableIdentifier,
         HashToManyIdsTableIdentifier,
+        IMTLeafTableIdentifier,
+        IMTKeyIndexTableIdentifier,
+        IMTNextAppendIndexTableIdentifier,
         S,
     >
 {
@@ -2981,5 +3320,501 @@ impl<
                 verifiable_transition_and_proof,
             )
             .await
+    }
+}
+
+#[async_trait]
+impl<
+        N: QNetworkDatabaseTypes,
+        BiDirectionalMappingTableIdentifier: Clone + Send + Sync,
+        BiDirectionalU64U128MappingTableIdentifier: Clone + Send + Sync,
+        U64TableIdentifier: Clone + Send + Sync,
+        U64CounterTableIdentifier: Clone + Send + Sync,
+        SingleIdTableIdentifier: Clone + Send + Sync,
+        DoubleIdTableIdentifier: Clone + Send + Sync,
+        KivTableIdentifier: Clone + Send + Sync,
+        SingleIdMerkleTableIdentifier: Clone + Send + Sync,
+        DoubleIdMerkleTableIdentifier: Clone + Send + Sync,
+        ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
+        TagTreeTableIdentifier: Clone + Send + Sync,
+        HashToManyIdsTableIdentifier: Clone + Send + Sync,
+        IMTLeafTableIdentifier: Clone + Send + Sync,
+        IMTKeyIndexTableIdentifier: Clone + Send + Sync,
+        IMTNextAppendIndexTableIdentifier: Clone + Send + Sync,
+        S: CoreDatabaseStore<
+                N::QHash,
+                N::HasherBase,
+                BiDirectionalMappingTableIdentifier,
+                BiDirectionalU64U128MappingTableIdentifier,
+                U64TableIdentifier,
+                U64CounterTableIdentifier,
+                SingleIdTableIdentifier,
+                DoubleIdTableIdentifier,
+                KivTableIdentifier,
+                SingleIdMerkleTableIdentifier,
+                DoubleIdMerkleTableIdentifier,
+                ZeroIdMerkleTableIdentifier,
+                TagTreeTableIdentifier,
+                HashToManyIdsTableIdentifier,
+                IMTLeafTableIdentifier,
+                IMTKeyIndexTableIdentifier,
+                IMTNextAppendIndexTableIdentifier,
+            > + Send
+            + Sync,
+    > PsyNodeContractStateIMTDatabaseWriter<N::QHash>
+    for PsyUnifiedCoreDatabaseStore<
+        N,
+        BiDirectionalMappingTableIdentifier,
+        BiDirectionalU64U128MappingTableIdentifier,
+        U64TableIdentifier,
+        U64CounterTableIdentifier,
+        SingleIdTableIdentifier,
+        DoubleIdTableIdentifier,
+        KivTableIdentifier,
+        SingleIdMerkleTableIdentifier,
+        DoubleIdMerkleTableIdentifier,
+        ZeroIdMerkleTableIdentifier,
+        TagTreeTableIdentifier,
+        HashToManyIdsTableIdentifier,
+        IMTLeafTableIdentifier,
+        IMTKeyIndexTableIdentifier,
+        IMTNextAppendIndexTableIdentifier,
+        S,
+    >
+{
+    async fn contract_state_imt_set_leaves_ffs(&self, checkpoint_id: u64, data: &[u8]) -> anyhow::Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        if data.len() % IMT_LEAF_FFS_ENTRY_SIZE_V2 != 0 {
+            anyhow::bail!(
+                "Invalid IMT leaves FFS data size: {} is not a multiple of {}",
+                data.len(),
+                IMT_LEAF_FFS_ENTRY_SIZE_V2
+            );
+        }
+        let entry_count = data.len() / IMT_LEAF_FFS_ENTRY_SIZE_V2;
+
+        let mut next_index_by_pair: HashMap<(u64, u64), u64> = HashMap::new();
+
+        let mut latest_leaf_written: HashSet<(u64, u64, u64)> = HashSet::new();
+
+        // Parse and insert all entries. The end-cap encoder emits IMT updates
+        // newest-to-oldest so root-chain validation can walk backwards. The
+        // leaf table is only versioned by checkpoint_id, not by intra-checkpoint
+        // op_seq, so duplicate leaf updates in one checkpoint must keep the
+        // first entry (the checkpoint-final preimage).
+        for i in 0..entry_count {
+            let offset = i * IMT_LEAF_FFS_ENTRY_SIZE_V2;
+            let entry_data = &data[offset..offset + IMT_LEAF_FFS_ENTRY_SIZE_V2];
+            let (tree_id, tree_sub_id, leaf_index, leaf_hash, leaf_key, leaf_value, next_key, next_index, is_new_key) =
+                deserialize_imt_leaf_ffs_entry_v2(entry_data)?;
+
+            // For each new key, query DB and update if new value is larger
+            tracing::debug!(
+                "contract_state_imt_set_leaves_ffs: processing entry {}: tree_id={}, tree_sub_id={}, leaf_index={}, leaf_hash={}, leaf_key={}, leaf_value={}, next_key={}, next_index={}, is_new_key={}",
+                i, tree_id, tree_sub_id, leaf_index, hex::encode(&leaf_hash), hex::encode(&leaf_key), hex::encode(&leaf_value), hex::encode(&next_key), next_index, is_new_key
+            );
+            if latest_leaf_written.insert((tree_id, tree_sub_id, leaf_index)) {
+                self.store
+                    .db_insert_imt_leaf(
+                        &self.imt_leaf_table,
+                        tree_id as i64,
+                        tree_sub_id as i64,
+                        leaf_index as i64,
+                        checkpoint_id as i64,
+                        &leaf_hash,
+                        &leaf_key,
+                        &leaf_value,
+                        &next_key,
+                        next_index as i64,
+                    )
+                    .await?;
+            } else {
+                tracing::debug!(
+                    "contract_state_imt_set_leaves_ffs: skipped older duplicate entry {} for tree_id={}, tree_sub_id={}, leaf_index={}, checkpoint_id={}",
+                    i,
+                    tree_id,
+                    tree_sub_id,
+                    leaf_index,
+                    checkpoint_id
+                );
+            }
+
+            if let Some(existing_idx) = next_index_by_pair.get(&(tree_id, tree_sub_id)) {
+                if leaf_index + 1 > *existing_idx {
+                    next_index_by_pair.insert((tree_id, tree_sub_id), leaf_index + 1);
+                }
+            } else {
+                next_index_by_pair.insert((tree_id, tree_sub_id), leaf_index + 1);
+            }
+
+            // Insert into key index table if this is a new key OR if this is a sentinel (zero key/value)
+            let is_zero_key = leaf_key.iter().all(|&b| b == 0);
+            let is_zero_value = leaf_value.iter().all(|&b| b == 0);
+            let is_sentinel_initially = is_zero_key && is_zero_value;
+            if is_new_key || is_sentinel_initially {
+                // Compute key_bucket from the sort-encoded key
+                let encoded_key = encode_imt_key_for_sorting::<N::F, N::QHash>(&N::QHash::from_bytes(&leaf_key).unwrap());
+                // Compute as u16 first, then convert to i16 for ScyllaDB
+                let key_bucket_u16 = u16::from_be_bytes([encoded_key[0], encoded_key[1]]);
+                let key_bucket = imt_key_bucket_to_i16(key_bucket_u16);
+
+                self.store
+                    .db_insert_imt_key_index(
+                        &self.imt_key_index_table,
+                        tree_id as i64,
+                        tree_sub_id as i64,
+                        key_bucket,
+                        &encoded_key,
+                        &leaf_key,
+                        checkpoint_id as i64,
+                        leaf_index as i64,
+                    )
+                    .await?;
+            }
+        }
+
+        for ((tree_id, tree_sub_id), slot_index) in next_index_by_pair {
+            let current_next_append_index = self
+                .store
+                .db_select_imt_next_append_index(
+                    &self.imt_next_append_index_table,
+                    tree_id as i64,
+                    tree_sub_id as i64,
+                )
+                .await?
+                .unwrap_or(0) as u64;
+            let merged_next_append_index = current_next_append_index.max(slot_index);
+
+            tracing::debug!(
+                "contract_state_imt_set_leaves_ffs set: user_id={}, contract_id={:?}, slot_index(batch)={}, slot_index(current)={}, slot_index(merged)={}",
+                tree_id, tree_sub_id, slot_index, current_next_append_index, merged_next_append_index
+            );
+
+            self.store
+                .db_insert_imt_next_append_index(
+                    &self.imt_next_append_index_table,
+                    tree_id as i64,
+                    tree_sub_id as i64,
+                    merged_next_append_index as i64,
+                )
+                .await?;
+        }
+
+        tracing::debug!(
+            "contract_state_imt_set_leaves_ffs: inserted {} IMT leaf entries for checkpoint {}",
+            entry_count,
+            checkpoint_id
+        );
+        Ok(())
+    }
+
+    async fn contract_state_imt_set_next_append_index(
+        &self,
+        user_id: u64,
+        contract_id: u64,
+        next_append_index: u64,
+    ) -> anyhow::Result<()> {
+        tracing::debug!(
+            "contract_state_imt_set_next_append_index: user_id={}, contract_id={}, next_append_index={}",
+            user_id, contract_id, next_append_index
+        );
+
+        self.store
+            .db_insert_imt_next_append_index(
+                &self.imt_next_append_index_table,
+                user_id as i64,
+                contract_id as i64,
+                next_append_index as i64,
+            )
+            .await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl<
+        N: QNetworkDatabaseTypes,
+        BiDirectionalMappingTableIdentifier: Clone + Send + Sync,
+        BiDirectionalU64U128MappingTableIdentifier: Clone + Send + Sync,
+        U64TableIdentifier: Clone + Send + Sync,
+        U64CounterTableIdentifier: Clone + Send + Sync,
+        SingleIdTableIdentifier: Clone + Send + Sync,
+        DoubleIdTableIdentifier: Clone + Send + Sync,
+        KivTableIdentifier: Clone + Send + Sync,
+        SingleIdMerkleTableIdentifier: Clone + Send + Sync,
+        DoubleIdMerkleTableIdentifier: Clone + Send + Sync,
+        ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
+        TagTreeTableIdentifier: Clone + Send + Sync,
+        HashToManyIdsTableIdentifier: Clone + Send + Sync,
+        IMTLeafTableIdentifier: Clone + Send + Sync,
+        IMTKeyIndexTableIdentifier: Clone + Send + Sync,
+        IMTNextAppendIndexTableIdentifier: Clone + Send + Sync,
+        S: CoreDatabaseStore<
+                N::QHash,
+                N::HasherBase,
+                BiDirectionalMappingTableIdentifier,
+                BiDirectionalU64U128MappingTableIdentifier,
+                U64TableIdentifier,
+                U64CounterTableIdentifier,
+                SingleIdTableIdentifier,
+                DoubleIdTableIdentifier,
+                KivTableIdentifier,
+                SingleIdMerkleTableIdentifier,
+                DoubleIdMerkleTableIdentifier,
+                ZeroIdMerkleTableIdentifier,
+                TagTreeTableIdentifier,
+                HashToManyIdsTableIdentifier,
+                IMTLeafTableIdentifier,
+                IMTKeyIndexTableIdentifier,
+                IMTNextAppendIndexTableIdentifier,
+            > + Send
+            + Sync,
+    > PsyNodeContractStateIMTDatabaseReader<N::F, N::QHash>
+    for PsyUnifiedCoreDatabaseStore<
+        N,
+        BiDirectionalMappingTableIdentifier,
+        BiDirectionalU64U128MappingTableIdentifier,
+        U64TableIdentifier,
+        U64CounterTableIdentifier,
+        SingleIdTableIdentifier,
+        DoubleIdTableIdentifier,
+        KivTableIdentifier,
+        SingleIdMerkleTableIdentifier,
+        DoubleIdMerkleTableIdentifier,
+        ZeroIdMerkleTableIdentifier,
+        TagTreeTableIdentifier,
+        HashToManyIdsTableIdentifier,
+        IMTLeafTableIdentifier,
+        IMTKeyIndexTableIdentifier,
+        IMTNextAppendIndexTableIdentifier,
+        S,
+    >
+{
+    async fn contract_state_imt_get_leaf_preimage(
+        &self,
+        checkpoint_id: u64,
+        user_id: u64,
+        contract_id: u64,
+        leaf_index: u64,
+    ) -> anyhow::Result<Option<IMTContractStateLeaf<N::F, N::QHash>>> {
+        let result = self.store
+            .db_select_imt_leaf(
+                &self.imt_leaf_table,
+                user_id as i64,
+                contract_id as i64,
+                leaf_index as i64,
+                checkpoint_id as i64,
+            )
+            .await?;
+
+        if let Some((_leaf_hash, leaf_key, leaf_value, next_key, next_index)) = result {
+            use parth_core::data::serializable::QPDSerializable;
+            use parth_core::felt::ToU64Value;
+
+            let key = N::QHash::from_bytes(&leaf_key)?;
+            let value = N::QHash::from_bytes(&leaf_value)?;
+            let next_key_hash = N::QHash::from_bytes(&next_key)?;
+            let next_index_felt = N::F::from_owned_u64(next_index as u64);
+
+            Ok(Some(IMTContractStateLeaf {
+                key,
+                value,
+                next_key: next_key_hash,
+                next_index: next_index_felt,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn contract_state_imt_get_leaf_index_for_key(
+        &self,
+        checkpoint_id: u64,
+        user_id: u64,
+        contract_id: u64,
+        key: &N::QHash,
+    ) -> anyhow::Result<Option<u64>> {
+        // Compute key bucket from sort-encoded key (must match how it's stored)
+        let key_bytes = key.to_bytes()?;
+        let encoded_key = encode_imt_key_for_sorting::<N::F, N::QHash>(&N::QHash::from_bytes(&key_bytes).unwrap());
+        // Compute as u16 first, then convert to i16 for ScyllaDB
+        let key_bucket_u16 = u16::from_be_bytes([encoded_key[0], encoded_key[1]]);
+        let key_bucket = imt_key_bucket_to_i16(key_bucket_u16);
+
+        // Look up the exact key
+        let exact_result = self.store
+            .db_select_imt_key_index_exact(
+                &self.imt_key_index_table,
+                user_id as i64,
+                contract_id as i64,
+                key_bucket,
+                &encoded_key,
+            )
+            .await?;
+
+        if let Some((leaf_index, birth_checkpoint)) = exact_result {
+            // Check if the key was born before or at the checkpoint
+            if birth_checkpoint <= checkpoint_id as i64 {
+                return Ok(Some(leaf_index as u64));
+            }
+        }
+
+        Ok(None)
+    }
+
+    async fn contract_state_imt_find_predecessor(
+        &self,
+        checkpoint_id: u64,
+        user_id: u64,
+        contract_id: u64,
+        key: &N::QHash,
+    ) -> anyhow::Result<(u64, IMTContractStateLeaf<N::F, N::QHash>)> {
+        use parth_core::data::serializable::QPDSerializable;
+        use parth_core::felt::ToU64Value;
+
+        // Compute key bucket from sort-encoded key (must match how it's stored)
+        let key_bytes = key.to_bytes()?;
+        let encoded_key = encode_imt_key_for_sorting::<N::F, N::QHash>(&N::QHash::from_bytes(&key_bytes).unwrap());
+        // Compute as u16 first, then convert to i16 for ScyllaDB
+        let key_bucket_u16 = u16::from_be_bytes([encoded_key[0], encoded_key[1]]);
+        let key_bucket = imt_key_bucket_to_i16(key_bucket_u16);
+
+        // Try predecessor in same bucket
+        let predecessor_result = self.store
+            .db_select_imt_key_index_predecessor(
+                &self.imt_key_index_table,
+                user_id as i64,
+                contract_id as i64,
+                key_bucket,
+                &encoded_key,
+            )
+            .await?;
+
+        // Find the predecessor that was born before the checkpoint
+        for (_encoded_key_result, leaf_key, leaf_index, birth_checkpoint) in predecessor_result {
+            if birth_checkpoint <= checkpoint_id as i64 {
+                // Get the leaf preimage
+                let leaf_result = self.store
+                    .db_select_imt_leaf(
+                        &self.imt_leaf_table,
+                        user_id as i64,
+                        contract_id as i64,
+                        leaf_index,
+                        checkpoint_id as i64,
+                    )
+                    .await?;
+
+                if let Some((_, _, leaf_value, next_key, next_index)) = leaf_result {
+                    let key = N::QHash::from_bytes(&leaf_key)?;
+                    let value = N::QHash::from_bytes(&leaf_value)?;
+                    let next_key_hash = N::QHash::from_bytes(&next_key)?;
+                    let next_index_felt = N::F::from_owned_u64(next_index as u64);
+
+                    return Ok((leaf_index as u64, IMTContractStateLeaf {
+                        key,
+                        value,
+                        next_key: next_key_hash,
+                        next_index: next_index_felt,
+                    }));
+                }
+            }
+        }
+
+        // Try previous buckets
+        for prev_bucket_u16 in (0..key_bucket_u16).rev() {
+            let prev_bucket = imt_key_bucket_to_i16(prev_bucket_u16);
+            let bucket_result = self.store
+                .db_select_imt_key_index_predecessor_full_bucket(
+                    &self.imt_key_index_table,
+                    user_id as i64,
+                    contract_id as i64,
+                    prev_bucket,
+                )
+                .await?;
+
+            // Find the largest key in this bucket that was born before/at checkpoint
+            for (_, leaf_key, leaf_index, birth_checkpoint) in bucket_result.iter().rev() {
+                if *birth_checkpoint <= checkpoint_id as i64 {
+                    let leaf_result = self.store
+                        .db_select_imt_leaf(
+                            &self.imt_leaf_table,
+                            user_id as i64,
+                            contract_id as i64,
+                            *leaf_index,
+                            checkpoint_id as i64,
+                        )
+                        .await?;
+
+                    if let Some((_, _, leaf_value, next_key, next_index)) = leaf_result {
+                        let key = N::QHash::from_bytes(leaf_key)?;
+                        let value = N::QHash::from_bytes(&leaf_value)?;
+                        let next_key_hash = N::QHash::from_bytes(&next_key)?;
+                        let next_index_felt = N::F::from_owned_u64(next_index as u64);
+
+                        return Ok((*leaf_index as u64, IMTContractStateLeaf {
+                            key,
+                            value,
+                            next_key: next_key_hash,
+                            next_index: next_index_felt,
+                        }));
+                    }
+                }
+            }
+        }
+
+        let sentinel_key = N::QHash::default();
+        let sentinel_encoded_key = encode_imt_key_for_sorting::<N::F, N::QHash>(&sentinel_key);
+        let sentinel_bucket_u16 = u16::from_be_bytes([sentinel_encoded_key[0], sentinel_encoded_key[1]]);
+        let sentinel_bucket = imt_key_bucket_to_i16(sentinel_bucket_u16);
+        let sentinel_exact = self.store
+            .db_select_imt_key_index_exact(
+                &self.imt_key_index_table,
+                user_id as i64,
+                contract_id as i64,
+                sentinel_bucket,
+                &sentinel_encoded_key,
+            )
+            .await?;
+        if let Some((leaf_index, birth_checkpoint)) = sentinel_exact {
+            if birth_checkpoint <= checkpoint_id as i64 {
+                let leaf_result = self.store
+                    .db_select_imt_leaf(
+                        &self.imt_leaf_table,
+                        user_id as i64,
+                        contract_id as i64,
+                        leaf_index,
+                        checkpoint_id as i64,
+                    )
+                    .await?;
+                if let Some((_, leaf_key, leaf_value, next_key, next_index)) = leaf_result {
+                    let key = N::QHash::from_bytes(&leaf_key)?;
+                    let value = N::QHash::from_bytes(&leaf_value)?;
+                    let next_key_hash = N::QHash::from_bytes(&next_key)?;
+                    let next_index_felt = N::F::from_owned_u64(next_index as u64);
+                    return Ok((leaf_index as u64, IMTContractStateLeaf {
+                        key,
+                        value,
+                        next_key: next_key_hash,
+                        next_index: next_index_felt,
+                    }));
+                }
+            }
+        }
+
+        anyhow::bail!("No predecessor found for key")
+    }
+
+    async fn contract_state_imt_get_next_append_index(&self, user_id: u64, contract_id: u64) -> anyhow::Result<u64> {
+        let result = self.store
+            .db_select_imt_next_append_index(
+                &self.imt_next_append_index_table,
+                user_id as i64,
+                contract_id as i64,
+            )
+            .await?;
+
+        Ok(result.unwrap_or(0) as u64)
     }
 }

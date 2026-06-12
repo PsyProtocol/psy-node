@@ -1,10 +1,14 @@
 mod abi;
 mod aux;
+mod imt_leaf;
+mod imt_proof;
 mod leaf;
 mod queue;
 mod state_update_history;
 pub use abi::*;
 pub use aux::*;
+pub use imt_leaf::*;
+pub use imt_proof::*;
 pub use leaf::*;
 pub use queue::*;
 pub use state_update_history::*;

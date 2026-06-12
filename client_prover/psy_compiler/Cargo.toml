@@ -1,0 +1,30 @@
+[package]
+name = "psy_compiler"
+edition = "2021"
+version = "0.1.0"
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_cbor = { workspace = true }
+serde_json = { workspace = true }
+hashbrown = { workspace = true }
+plonky2 = { workspace = true }
+sha2 = { workspace = true }
+logos = { workspace = true }
+thiserror = { workspace = true }
+bincode = { workspace = true }
+
+psy_vm = { workspace = true }
+psy_client_data = { workspace = true, default-features = false }
+psy_crypto = { workspace = true }
+psy_client_common = { workspace = true }
+psy_config = { workspace = true }
+
+[features]
+is_sync = [
+    "psy_vm/is_sync",
+    "psy_client_data/is_sync",
+]
+
+[dev-dependencies]

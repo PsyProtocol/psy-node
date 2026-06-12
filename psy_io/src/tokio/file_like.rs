@@ -37,6 +37,7 @@ pub trait TokioLikeFileSystem: Send + Sync {
     async fn file_like_fs_create(&self, path: &str) -> tokio::io::Result<Self::File>;
     async fn file_like_fs_open(&self, path: &str) -> tokio::io::Result<Self::File>;
     async fn file_like_fs_flush_file_with_path(&self, _path: &str, file: &mut Self::File) -> tokio::io::Result<()>;
+    async fn file_like_fs_sync_file_with_path(&self, _path: &str, file: &mut Self::File) -> tokio::io::Result<()>;
     async fn file_like_exists(&self, path: &str) -> tokio::io::Result<bool>;
     async fn file_like_remove_file(&self, path: &str) -> tokio::io::Result<()>;
     async fn file_like_rename(&self, old_path: &str, new_path: &str) -> tokio::io::Result<()>;
@@ -62,6 +63,9 @@ impl TokioLikeFileSystem for TokioStdFileSystem {
     }
     async fn file_like_fs_flush_file_with_path(&self, _path: &str, file: &mut Self::File) -> tokio::io::Result<()> {
         file.flush().await
+    }
+    async fn file_like_fs_sync_file_with_path(&self, _path: &str, file: &mut Self::File) -> tokio::io::Result<()> {
+        file.sync_all().await
     }
 
     async fn file_like_exists(&self, path: &str) -> tokio::io::Result<bool>{

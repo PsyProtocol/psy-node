@@ -49,6 +49,9 @@ impl<
         ZeroIdMerkleTableIdentifier: THStandardTableIdentifier,
         RewardTreeTableIdentifier: THStandardTableIdentifier,
         HashToManyIdsTableIdentifier: THStandardTableIdentifier,
+        IMTLeafTableIdentifier: THStandardTableIdentifier,
+        IMTKeyIndexTableIdentifier: THStandardTableIdentifier,
+        IMTNextAppendIndexTableIdentifier: THStandardTableIdentifier,
         S: CoreDatabaseStore<
                 Hash,
                 Hasher,
@@ -64,6 +67,9 @@ impl<
                 ZeroIdMerkleTableIdentifier,
                 RewardTreeTableIdentifier,
                 HashToManyIdsTableIdentifier,
+                IMTLeafTableIdentifier,
+                IMTKeyIndexTableIdentifier,
+                IMTNextAppendIndexTableIdentifier,
             > + Send
             + Sync,
     >
@@ -96,6 +102,9 @@ impl<
         ZeroIdMerkleTableIdentifier,
         RewardTreeTableIdentifier,
         HashToManyIdsTableIdentifier,
+        IMTLeafTableIdentifier,
+        IMTKeyIndexTableIdentifier,
+        IMTNextAppendIndexTableIdentifier,
         S,
     >
 {

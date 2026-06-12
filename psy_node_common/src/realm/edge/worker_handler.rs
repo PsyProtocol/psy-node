@@ -40,6 +40,8 @@ fn print_hash<H: Q256BitHash + std::fmt::Debug>(label: &str, hash: &H) {
     tracing::debug!("{}: {:?} ({})", label, hash, hex::encode(&hash.into_owned_32bytes()));
 }
 
+const SUBMIT_PROOF_PENDING_LOOKBACK: u64 = 256;
+
 impl<
         N: QNetworkTypesConfig<JobId = QProvingJobDataID>,
         S: PsyRealmEdgeAPIStoreReader<N::F, N::QHash> + Send + Sync,
@@ -50,6 +52,41 @@ impl<
         ProofStore: QParthProofStore,
     > RealmEdgeHandler<N, S, STagTreeRewards, UserUpdateQueue, GetProofWorkQueue, TempDatabase, ProofStore>
 {
+    async fn resolve_unique_pending_id_for_submitted_job(
+        &self,
+        current_unique_pending_id: u64,
+        job_id: N::JobId,
+    ) -> anyhow::Result<(u64, Option<([u8; 33], u64)>)> {
+        for offset in 0..=SUBMIT_PROOF_PENDING_LOOKBACK {
+            let candidate = current_unique_pending_id.saturating_sub(offset);
+            if let Some(claim) = self
+                .temp_db
+                .get_job_claim(&self.realm_identifier, candidate, job_id)
+                .await?
+            {
+                if candidate != current_unique_pending_id {
+                    tracing::warn!(
+                        "submit_proof_raw resolved job {:?} from historical unique_pending_id {} (current={})",
+                        job_id,
+                        candidate,
+                        current_unique_pending_id
+                    );
+                }
+                return Ok((candidate, Some(claim)));
+            }
+            if candidate == 0 {
+                break;
+            }
+        }
+
+        tracing::warn!(
+            "submit_proof_raw found no claim record for job {:?} within lookback window; falling back to current unique_pending_id {}",
+            job_id,
+            current_unique_pending_id
+        );
+        Ok((current_unique_pending_id, None))
+    }
+
     pub async fn get_current_unique_pending_id_internal(&self) -> anyhow::Result<(u64, QCoreProcCheckpointUniqueId)> {
         self.temp_db.get_unique_pending_ids(&self.realm_identifier).await
     }
@@ -244,7 +281,7 @@ impl<
             .metadata
             .dependencies
             .iter()
-            .map(|id| self.proof_store.get_proof_bytes_by_job_id(id.get_output_id()))
+            .map(|id| self.proof_store.get_proof_bytes_by_job_id(id.get_output_id(), unique_pending_id))
             .collect::<Vec<_>>()
             .into_iter();
         timer.lap_micros("collect get_proof_bytes_by_job_id futures");
@@ -309,17 +346,13 @@ impl<
 
         timer.lap_micros("set_proving_job_metadata");
 
-        // HACK: in the future we should create a new table for the expected proving
-        // tag, but for now this ok i guess, but a HACK HACK: for now we set
-        // self.temp_db.set_proof_miner_rewards_tree_value( with the expected proving
-        // tag and then update it later to the actual value once the proof is submitted
-        // this ensures the right person submits the proof AND the proof can only be
-        // submitted once
+        // Store claim tag on input-witness key (separate from output key used for finalized reward value)
+        // to avoid claim-tag / reward-value slot aliasing under concurrent claim/submit attempts.
         self.temp_db
             .set_proof_miner_rewards_tree_value(
                 &self.realm_identifier,
                 unique_pending_id,
-                response.job.job_id.get_output_id(),
+                response.job.job_id.get_input_witness_id(),
                 N::QHash::from_ref_32bytes(&request.tag),
             )
             .await?;
@@ -358,14 +391,17 @@ impl<
         }
         job_id = job_id.get_output_id();
         let mut timer = DebugTimer::new("submit_proof_raw_internal");
-        let (unique_pending_id, unique_proc_id) = self.get_current_unique_pending_id_internal().await?;
+        let (current_unique_pending_id, unique_proc_id) = self.get_current_unique_pending_id_internal().await?;
+        let (unique_pending_id, job_claim) = self
+            .resolve_unique_pending_id_for_submitted_job(current_unique_pending_id, job_id)
+            .await?;
         timer.lap_micros("get_current_unique_pending_id_internal");
         let proof_bytes = Arc::new(proof_bytes);
 
         // HACK: check to make sure the tag matches. If not, job was completed by another worker (stolen) - slash submitter.
         let expected_tag = self
             .temp_db
-            .get_proof_miner_rewards_tree_value(&self.realm_identifier, unique_pending_id, job_id.get_output_id())
+            .get_proof_miner_rewards_tree_value(&self.realm_identifier, unique_pending_id, job_id.get_input_witness_id())
             .await?;
         if expected_tag != tag {
             self.temp_db
@@ -453,14 +489,12 @@ impl<
         }
 
         timer.lap_micros("get_proof_miner_rewards_tree_value");
-        self.proof_store.put_proof_bytes_for_job_id(job_id.get_output_id(), &proof_bytes).await?;
+        self.proof_store
+            .put_proof_bytes_for_job_id(job_id.get_output_id(), unique_pending_id, &proof_bytes)
+            .await?;
         timer.lap_micros("put_proof_bytes_for_job_id");
 
-        if let Ok(Some((public_key, claim_time_ms))) = self
-            .temp_db
-            .get_job_claim(&self.realm_identifier, unique_pending_id, job_id)
-            .await
-        {
+        if let Some((public_key, claim_time_ms)) = job_claim {
             self.temp_db
                 .apply_reputation_on_submit(&self.realm_identifier, &public_key, claim_time_ms)
                 .await?;
@@ -677,7 +711,7 @@ impl<
             .metadata
             .dependencies
             .iter()
-            .map(|id| self.proof_store.get_proof_bytes_by_job_id(*id))
+            .map(|id| self.proof_store.get_proof_bytes_by_job_id(*id, unique_pending_id))
             .collect::<Vec<_>>()
             .into_iter();
         let res: Vec<Option<Vec<u8>>> = try_join_all(child_proofs).await?;
@@ -806,7 +840,9 @@ impl<
             anyhow::bail!("Failed to set rewards tree value for job id");
         }
 
-        self.proof_store.put_proof_bytes_for_job_id(job_id, &proof_bytes).await?;
+        self.proof_store
+            .put_proof_bytes_for_job_id(job_id, unique_pending_id, &proof_bytes)
+            .await?;
 
 
         /*

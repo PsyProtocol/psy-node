@@ -2,9 +2,10 @@ use std::sync::Arc;
 
 use tokio::task;
 use parth_core::{
-    QCoreProcCheckpointUniqueId, QProvingJobDataIDWithRewardPath, crypto::hash::{merkle_proof::MerkleProofCore, tag_tree::TagTreeMerkleProof, traits::QFieldHashable}, data::{hash::merkle_node_key::SimpleMerkleNodeKey, queue::queue_key::QPBaseQueueType}, felt::ToU64Value, node::realm_identifier::QRealmIdentifier, protocol::core_types::{QNetworkTypesConfig, QZKProofVerifier}
+    QCoreProcCheckpointUniqueId, QProvingJobDataIDWithRewardPath, crypto::hash::{merkle_proof::MerkleProofCore, tag_tree::TagTreeMerkleProof, traits::QFieldHashable}, data::{hash::merkle_node_key::SimpleMerkleNodeKey, queue::queue_key::QPBaseQueueType}, felt::ToU64Value, node::realm_identifier::QRealmIdentifier, protocol::core_types::{Q256BitHash, QNetworkTypesConfig, QZKProofVerifier}
 };
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
+use psy_crypto::hash::tx_hash::{compute_deploy_contract_content_hash, hash_to_hex};
 use psy_data::{
     guta::header_extended::{GlobalUserTreeAggregatorHeaderWithTagValueAndJobID, GlobalUserTreeAggregatorHeaderWithTagValueAndJobType}, prepared_block::realm::PsyRealmCoordinatorUpdate, v1::{
         common_api::PsyProoffMinerRewardProof,
@@ -21,9 +22,7 @@ use psy_node_core::{
 };
 use psy_serialize::{PsyCanonicalDatabaseSerializeBaseMulti, PsyCanonicalDatabaseSerializeBaseSingle};
 
-use crate::coordinator::queue_key::{
-    CoordinatorDeployContractQueueKey, CoordinatorRegisterUserPublicKeyQueueKey, CoordinatorSubmitRealmGUTAUpdateQueueKey,
-};
+use crate::coordinator::queue_key::{CoordinatorDeployContractQueueKey, CoordinatorRegisterUserPublicKeyQueueKey, CoordinatorSubmitRealmGUTAUpdateQueueKey};
 
 // const END_CAP_PROOF_CIRCUIT_TYPE_U32: u32 = ProvingJobCircuitType::UserEndCap as u32;
 pub struct CoordinatorEdgeHandler<
@@ -376,6 +375,12 @@ impl<
             code_root,
             N::CONTRACT_FUNCTION_TREE_HEIGHT_USIZE,
         )?;
+        let deploy_content_hash = compute_deploy_contract_content_hash(
+            &queue_item.contract_leaf.deployer.into_owned_32bytes(),
+            &queue_item.contract_leaf.function_tree_root.into_owned_32bytes(),
+            code_definition.state_tree_height as u64,
+        );
+        let deploy_content_hash_hex = hash_to_hex(&deploy_content_hash);
 
         self.temp_db
             .set_deploy_contract_code_definition_raw(
@@ -398,7 +403,7 @@ impl<
             )
             .await?;
 
-        Ok("ok".to_string())
+        Ok(deploy_content_hash_hex)
     }
 }
 
@@ -455,6 +460,7 @@ impl<
         let proof_bytes = Arc::new(proof_bytes);
 
         let (unique_pending_id, proc_checkpoint_id) = self.get_current_gathering_unique_pending_id_internal().await?;
+        self.ensure_guta_matches_current_coordinator_state(realm_id_u64, &input).await?;
 
         let status = rand::random::<u64>() & 0x0fff_ffff_ffff_ffff;
         if self
@@ -500,7 +506,9 @@ impl<
                 unique_pending_id
             );
         }
-        self.proof_store.put_proof_bytes_for_job_id(&output_proof_job_id, &proof_bytes).await?;
+        self.proof_store
+            .put_proof_bytes_for_job_id(&output_proof_job_id, unique_pending_id, &proof_bytes)
+            .await?;
 
         let queue_item = GlobalUserTreeAggregatorHeaderWithTagValueAndJobID {
             header: input.header,
@@ -519,6 +527,38 @@ impl<
         self.guta_update_queue
             .publish_ephemeral_queue_item_owned(&queue_key, self.realm_id_u64, self.realm_sub_id_u64, proc_checkpoint_id, 0, queue_item)
             .await?;
+
+        Ok(())
+    }
+
+    async fn ensure_guta_matches_current_coordinator_state(
+        &self,
+        realm_id: u64,
+        input: &GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<N::F, N::QHash>,
+    ) -> anyhow::Result<()> {
+        let latest_checkpoint_id = self.get_latest_checkpoint_id_internal().await?;
+        let realm_key = SimpleMerkleNodeKey {
+            level: N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
+            index: realm_id,
+        };
+        let current_realm_root = self
+            .db_reader
+            .global_user_tree_get_node_and_checkpoint_id_max_checkpoint(latest_checkpoint_id, &realm_key)
+            .await?;
+        let submitted_old_realm_root = input.header.header.state_transition.old_node_value;
+
+        if current_realm_root.value != submitted_old_realm_root {
+            anyhow::bail!(
+                "stale GUTA update rejected at coordinator edge: realm_id {} latest_checkpoint_id {} realm_last_modified_checkpoint_id {} submitted_old_realm_root {:?} current_realm_root {:?} submitted_new_realm_root {:?} submitted_checkpoint_tree_root {:?}",
+                realm_id,
+                latest_checkpoint_id,
+                current_realm_root.checkpoint_id,
+                submitted_old_realm_root,
+                current_realm_root.value,
+                input.header.header.state_transition.new_node_value,
+                input.header.header.checkpoint_tree_root,
+            );
+        }
 
         Ok(())
     }

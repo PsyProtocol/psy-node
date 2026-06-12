@@ -1,0 +1,41 @@
+[package]
+edition = "2021"
+name    = "psy_vm"
+version = "0.1.0"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow     = { workspace = true }
+serde      = { workspace = true }
+serde_cbor = { workspace = true }
+serde_json = { workspace = true }
+bincode      = { workspace = true }
+serde_repr = { workspace = true }
+plonky2 = { workspace = true }
+twox-hash = { workspace = true }
+hashbrown = { workspace = true }
+ts-rs = { workspace = true }
+
+k256 = { workspace = true }
+kvq = { workspace = true }
+async-trait = { workspace = true }
+maybe-async = { workspace = true }
+tracing = { workspace = true }
+tiny-keccak = { workspace = true }
+
+psy_config = { workspace = true }
+psy_client_common = { workspace = true }
+psy_client_data = { workspace = true, default-features = false }
+psy_crypto = { workspace = true }
+
+[features]
+# default = ["is_sync"]
+is_sync = [
+    "maybe-async/is_sync",
+    "psy_client_data/is_sync"]
+
+[dev-dependencies]
+tokio = { workspace = true }
+alloy-primitives = { workspace = true }
+alloy-sol-types = { version = "1.3.1" }

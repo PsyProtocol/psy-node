@@ -5,10 +5,12 @@ use parth_core::{
 use psy_data::{node::node_proving_state::PsyNodeProvingState, worker::metadata::PsyProvingJobMetadata};
 use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 
+const DEPLOY_CONTRACT_ZSTD_PREFIX: &[u8; 4] = b"PSZ1";
+
 use crate::{
     psy_temp_db::{
         tt_get_worker_reputation_key,
-        QTempDBDeployContractDataReader, QTempDBDeployContractDataWriter, QTempDBJobClaimInfoReader, QTempDBJobClaimInfoWriter, QTempDBNodeProvingStateReader, QTempDBNodeProvingStateWriter, QTempDBPendingIdReader, QTempDBPendingIdWriter, QTempDBProofWitnessReader, QTempDBProofWitnessWriter, QTempDBProvingJobMetadataReader, QTempDBProvingJobMetadataWriter, QTempDBRewardsTreeReader, QTempDBRewardsTreeWriter, QTempDBSubmitStatusReader, QTempDBSubmitStatusWriter, QTempDBUserContractUpdatesReader, QTempDBUserContractUpdatesWriter, QTempDBWorkerReputationReader, QTempDBWorkerReputationWriter, tt_get_contract_updates_key, tt_get_deploy_contract_code_definition_key, tt_get_gathering_unique_pending_id_key, tt_get_job_claim_key_from_job, tt_get_node_proving_state_key, tt_get_proof_witness_data_key_from_job, tt_get_proving_job_metadata_key_from_job, tt_get_rewards_tag_tree_value_key_from_job, tt_get_submit_status_key, tt_get_unique_pending_id_key
+        QTempDBDeployContractDataReader, QTempDBDeployContractDataWriter, QTempDBJobClaimInfoReader, QTempDBJobClaimInfoWriter, QTempDBNodeProvingStateReader, QTempDBNodeProvingStateWriter, QTempDBPendingIdReader, QTempDBPendingIdWriter, QTempDBProofWitnessReader, QTempDBProofWitnessWriter, QTempDBProvingJobMetadataReader, QTempDBProvingJobMetadataWriter, QTempDBRewardsTreeReader, QTempDBRewardsTreeWriter, QTempDBSubmitStatusReader, QTempDBSubmitStatusWriter, QTempDBUserContractUpdatesReader, QTempDBUserContractUpdatesWriter, QTempDBUserEndCapSlotUpdatesReader, QTempDBUserEndCapSlotUpdatesWriter, QTempDBWorkerReputationReader, QTempDBWorkerReputationWriter, tt_get_contract_updates_key, tt_get_deploy_contract_code_definition_key, tt_get_gathering_unique_pending_id_key, tt_get_job_claim_key_from_job, tt_get_node_proving_state_key, tt_get_proof_witness_data_key_from_job, tt_get_proving_job_metadata_key_from_job, tt_get_rewards_tag_tree_value_key_from_job, tt_get_submit_status_key, tt_get_unique_pending_id_key, tt_get_user_end_cap_slot_updates_key
     },
     store::traits::temp_db::{QTempDatabaseRawKVReaderBase, QTempDatabaseRawKVWriterBase},
 };
@@ -379,7 +381,14 @@ impl<T: QTempDatabaseRawKVReaderBase + Sync> QTempDBDeployContractDataReader for
             if value_bytes.len() == 0 {
                 return Ok(None);
             }
-            Ok(Some(value_bytes))
+            if value_bytes.starts_with(DEPLOY_CONTRACT_ZSTD_PREFIX) {
+                let compressed = &value_bytes[DEPLOY_CONTRACT_ZSTD_PREFIX.len()..];
+                let decoded = zstd::stream::decode_all(compressed)
+                    .map_err(|e| anyhow::anyhow!("failed to zstd-decompress deploy contract code definition: {}", e))?;
+                Ok(Some(decoded))
+            } else {
+                Ok(Some(value_bytes))
+            }
         } else {
             anyhow::bail!("deploy contract code definition not found (key: {})", hex::encode(&key));
         }
@@ -396,7 +405,12 @@ impl<T: QTempDatabaseRawKVWriterBase + Sync> QTempDBDeployContractDataWriter for
         data: Vec<u8>,
     ) -> anyhow::Result<()> {
         let key = tt_get_deploy_contract_code_definition_key(rid.realm_id, rid.realm_sub_id, unique_pending_id, &rand_key);
-        self.qtdb_raw_kv_put_value(&key, &data).await
+        let compressed = zstd::stream::encode_all(data.as_slice(), 3)
+            .map_err(|e| anyhow::anyhow!("failed to zstd-compress deploy contract code definition: {}", e))?;
+        let mut stored = Vec::with_capacity(DEPLOY_CONTRACT_ZSTD_PREFIX.len() + compressed.len());
+        stored.extend_from_slice(DEPLOY_CONTRACT_ZSTD_PREFIX);
+        stored.extend_from_slice(&compressed);
+        self.qtdb_raw_kv_put_value(&key, &stored).await
     }
 }
 
@@ -503,6 +517,59 @@ impl<T: QTempDatabaseRawKVWriterBase + Sync> QTempDBUserContractUpdatesWriter fo
     }
     async fn set_contract_updates_for_user_ref(&self, rid: &QRealmIdentifier, unique_pending_id: u64, user_id: u64, data: &[u8]) -> anyhow::Result<()> {
         let key = tt_get_contract_updates_key(rid.realm_id, rid.realm_sub_id, unique_pending_id, user_id);
+        self.qtdb_raw_kv_put_value(&key, data).await
+    }
+}
+
+#[async_trait]
+impl<T: QTempDatabaseRawKVReaderBase + Sync> QTempDBUserEndCapSlotUpdatesReader for T {
+    async fn get_user_end_cap_slot_updates(
+        &self,
+        rid: &QRealmIdentifier,
+        unique_pending_id: u64,
+        user_id: u64,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        let key = tt_get_user_end_cap_slot_updates_key(
+            rid.realm_id,
+            rid.realm_sub_id,
+            unique_pending_id,
+            user_id,
+        );
+        self.qtdb_raw_kv_get_value(&key).await
+    }
+}
+
+#[async_trait]
+impl<T: QTempDatabaseRawKVWriterBase + Sync> QTempDBUserEndCapSlotUpdatesWriter for T {
+    async fn set_user_end_cap_slot_updates(
+        &self,
+        rid: &QRealmIdentifier,
+        unique_pending_id: u64,
+        user_id: u64,
+        data: Vec<u8>,
+    ) -> anyhow::Result<()> {
+        let key = tt_get_user_end_cap_slot_updates_key(
+            rid.realm_id,
+            rid.realm_sub_id,
+            unique_pending_id,
+            user_id,
+        );
+        self.qtdb_raw_kv_put_value(&key, &data).await
+    }
+
+    async fn set_user_end_cap_slot_updates_ref(
+        &self,
+        rid: &QRealmIdentifier,
+        unique_pending_id: u64,
+        user_id: u64,
+        data: &[u8],
+    ) -> anyhow::Result<()> {
+        let key = tt_get_user_end_cap_slot_updates_key(
+            rid.realm_id,
+            rid.realm_sub_id,
+            unique_pending_id,
+            user_id,
+        );
         self.qtdb_raw_kv_put_value(&key, data).await
     }
 }

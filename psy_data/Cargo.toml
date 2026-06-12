@@ -48,7 +48,7 @@ parth_common = { workspace = true }
 psy_core = { workspace = true }
 pser = { workspace = true }
 pderive = { workspace = true }
-psy_io = { workspace = true }
+psy_io = { path = "../psy_io", default-features = false }
 
 psy_serialize = { workspace = true }
 

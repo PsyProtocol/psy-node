@@ -2,6 +2,5 @@
 import type { DeltaMerkleProofCore } from "./DeltaMerkleProofCore";
 import type { QEDCheckpointCoreSyncInfo } from "./QEDCheckpointCoreSyncInfo";
 import type { QHashOut } from "./QHashOut";
-import type { ZKPublicKeyInfo } from "./ZKPublicKeyInfo";
 
-export type QEDCheckpointSyncInfo = { core: QEDCheckpointCoreSyncInfo, checkpoint_tree_update_proof: DeltaMerkleProofCore<QHashOut>, regsitered_users_start_pivot_siblings: Array<QHashOut>, registered_users: Array<ZKPublicKeyInfo>, slot: bigint, };
+export type QEDCheckpointSyncInfo = { core: QEDCheckpointCoreSyncInfo, checkpoint_tree_update_proof: DeltaMerkleProofCore<QHashOut>, unique_pending_id: bigint, };

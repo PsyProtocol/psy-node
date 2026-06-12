@@ -8,10 +8,14 @@ use parth_core::{
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{
     guta::{header::GlobalUserTreeAggregatorHeader, stats::GUTAStats},
-    proof_input::guta::{GUTAVerifyLeftGUTARightEndCapCircuitInputV2, GUTAVerifyTwoEndCapCircuitInputV2, GUTAVerifyTwoGUTALinearCircuitInput, SubmitUserEndCapNonProofCoreInput, VerifySingleEndCapInputV2, end_cap_input::SubmitUserEndCapNonProofInput},
+    proof_input::guta::{
+        end_cap_input::{ContractStateUpdate, ContractStateUpdateHistory, SubmitUserEndCapNonProofInput},
+        GUTAVerifyLeftGUTARightEndCapCircuitInputV2, GUTAVerifyTwoEndCapCircuitInputV2, GUTAVerifyTwoGUTALinearCircuitInput,
+        SubmitUserEndCapNonProofCoreInput, VerifySingleEndCapInputV2,
+    },
     queue_items::realm_user_update::PsyRealmUserUpdateQueueItem,
     v1::qdata::{
-        contract::{DashMapContractHeightCache, PSimpleContractHeightCache, QEDContractStateUpdateHistory},
+        contract::{DashMapContractHeightCache, PSimpleContractHeightCache},
         public_key::PZKPublicKeyInfo,
         user::PQEDUserLeaf,
         user_end_cap_result::PUPSEndCapResultCompact,
@@ -21,6 +25,7 @@ use psy_io::tokio::TokioLikeFileSystem;
 use psy_node_core::{
     file::memory_fs::SimpleMockMemoryFileSystem,
     psy_core_db::traits::full::{
+        PsyNodeContractStateIMTDatabaseWriter,
         PsyNodeContractStateTreeTreeDatabaseReader, PsyNodeContractStateTreeTreeDatabaseWriter,
         PsyNodeCoreDatabaseUserStoreReader, PsyNodeCoreDatabaseUserStoreWriter, PsyNodeGlobalUserTreeDatabaseReader,
         PsyNodeGlobalUserTreeDatabaseWriter, PsyNodeUserContractTreeDatabaseReader, PsyNodeUserContractTreeDatabaseWriter,
@@ -111,8 +116,11 @@ impl RGPUser {
                 contract_state_tree_updates.push(proof);
                 total_slots_modified += 1;
             }
-            state_history.push(QEDContractStateUpdateHistory {
-                contract_state_tree_updates,
+            state_history.push(ContractStateUpdateHistory {
+                updates: contract_state_tree_updates
+                    .into_iter()
+                    .map(|delta_proof| ContractStateUpdate::Positional { delta_proof })
+                    .collect(),
                 user_contract_tree_update_proof: self.uct.set_leaf(tx.contract_id as u64, contract_tree.get_root()),
             });
             contract_tree.commit_changes();
@@ -487,6 +495,11 @@ impl RGPTestChainState {
             self.db
                 .contract_state_tree_set_nodes_ffs(new_checkpoint_id, &result.db_output.update_contract_state_tree_nodes_ffs)
                 .await?;
+            if !result.db_output.update_contract_state_imt_leaves_ffs.is_empty() {
+                self.db
+                    .contract_state_imt_set_leaves_ffs(new_checkpoint_id, &result.db_output.update_contract_state_imt_leaves_ffs)
+                    .await?;
+            }
         }
 
         Ok(Some(result))

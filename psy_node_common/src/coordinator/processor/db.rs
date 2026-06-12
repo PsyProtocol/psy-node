@@ -1,11 +1,14 @@
-use std::sync::{Arc, atomic::AtomicBool};
+use std::{
+    sync::{Arc, atomic::AtomicBool},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use parth_common::memory_stores::{mem_tree_recorder::SimpleMemoryMerkleRecorderStore, traits::PsyMemoryMerkleStoreImm};
 use parth_core::{
     QCoreProcCheckpointUniqueId, crypto::hash::{
         merkle_proof::{DeltaMerkleProofCore, MerkleProofCore},
-        traits::{MerkleZeroHasher, QFieldHashable, ZeroableHash},
-    }, data::queue::queue_key::{QPBaseQueueType, QPStandardUniqueIdQueueKey}, generic_traits::psy_debug_printable::PsyDebugPrintable, node::realm_identifier::QRealmIdentifier, protocol::core_types::{Q256BitHash, QNetworkTypesConfig}
+        traits::{FieldQHasher, MerkleZeroHasher, QFieldHashable, ZeroableHash},
+    }, data::queue::queue_key::{QPBaseQueueType, QPStandardUniqueIdQueueKey}, generic_traits::psy_debug_printable::PsyDebugPrintable, node::realm_identifier::QRealmIdentifier, protocol::core_types::{Q256BitHash, QNetworkTypesConfig, QZKProofPublicInputsHasherReader}
 };
 use crate::coordinator::queue_key::{CoordinatorSubmitRealmGUTAUpdateQueueKey, CoordinatorRegisterUserPublicKeyQueueKey, CoordinatorDeployContractQueueKey, CoordinatorProvingWorkQueueKey};
 
@@ -26,7 +29,7 @@ use psy_data::{
     v1::qdata::{checkpoint::QEDL2BlockState, contract::PsyDeployContractQueueItem, public_key::PZKPublicKeyInfo},
     worker::metadata_with_job_id::PsyProvingJobMetadataWithJobId,
 };
-use psy_io::tokio::TokioLikeFileSystem;
+use psy_io::tokio::{TokioFileLike, TokioLikeFileSystem};
 use psy_node_core::{
     genesis::genesis_db_data_builder::GenesisDatabaseDataBuilder,
     psy_core_db::traits::full::{
@@ -46,6 +49,7 @@ use crate::{
     coordinator::processor::processor_shared_status::{PsyCoordinatorProcessorSharedStatus, PsyCoordinatorProcessorSharedStatusWrapper},
     queue::gatherer::QueueKeyStatusManager,
 };
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 #[derive(Debug, Clone, PartialEq, Eq, Copy)]
 pub enum DatabaseCheckState {
     NeedsGenesis = 0,
@@ -159,7 +163,11 @@ impl<
     pub async fn get_database_check_state(&self) -> anyhow::Result<DatabaseCheckState> {
         let actual_latest_applied_checkpoint_id: u64 = self.db.get_latest_checkpoint_id().await?;
         let (last_unique_pending_id, _last_unique_proc_checkpoint_id): (u64, QCoreProcCheckpointUniqueId) =
-            self.db.get_current_unique_pending_id().await?;
+            match self.db.get_current_unique_pending_id().await {
+                Ok(ids) => ids,
+                Err(_) if actual_latest_applied_checkpoint_id == 0 => return Ok(DatabaseCheckState::NeedsGenesis),
+                Err(e) => return Err(e),
+            };
 
         let expected_checkpoint_id: Option<u64> = self.db.get_checkpoint_id_for_unique_pending_id(last_unique_pending_id).await?;
         let database_check_state = if expected_checkpoint_id.is_none() && actual_latest_applied_checkpoint_id == 0 {
@@ -207,9 +215,20 @@ impl<
     ) -> anyhow::Result<Self> {
         let realm_id_u64 = realm_identifier.realm_id as u64;
         let realm_sub_id_u64 = realm_identifier.realm_sub_id as u64;
+        tracing::info!("[COORD_INIT] new_init start");
 
-        let (current_unique_pending_id, current_core_proc_unique_pending_id) = db.get_current_unique_pending_id().await?;
         let last_committed_checkpoint_id = db.get_latest_checkpoint_id().await?;
+        tracing::info!("[COORD_INIT] latest checkpoint id = {}", last_committed_checkpoint_id);
+        let (current_unique_pending_id, current_core_proc_unique_pending_id) = if last_committed_checkpoint_id == 0 {
+            (0, 0u128)
+        } else {
+            db.get_current_unique_pending_id().await?
+        };
+        tracing::info!(
+            "[COORD_INIT] current unique ids = ({}, {})",
+            current_unique_pending_id,
+            current_core_proc_unique_pending_id
+        );
 
         let ids = CoordinatorProcessorIdState {
             realm_identifier: realm_identifier.clone(),
@@ -232,9 +251,13 @@ impl<
             true,
         )
         .await?;
-        checkpoint_tree_backup_manager
-            .sync_from_database::<S>(&db, 1000, last_committed_checkpoint_id)
-            .await?;
+        tracing::info!("[COORD_INIT] checkpoint backup manager created");
+        if last_committed_checkpoint_id > 0 {
+            checkpoint_tree_backup_manager
+                .sync_from_database::<S>(&db, 1000, last_committed_checkpoint_id)
+                .await?;
+            tracing::info!("[COORD_INIT] checkpoint backup manager synced from db");
+        }
 
         let shared_status = if last_committed_checkpoint_id == 0 {
             PsyCoordinatorProcessorSharedStatus {
@@ -268,10 +291,12 @@ impl<
         temp_db
             .set_unique_pending_ids(&realm_identifier, current_unique_pending_id, current_core_proc_unique_pending_id)
             .await?;
+        tracing::info!("[COORD_INIT] temp db unique ids set");
 
         temp_db
             .set_gathering_unique_pending_ids(&realm_identifier, current_unique_pending_id, current_core_proc_unique_pending_id)
             .await?;
+        tracing::info!("[COORD_INIT] temp db gathering unique ids set");
         let last_committed_l2_state = shared_status.block_state.clone();
         let last_committed_checkpoint_leaf = shared_status.last_committed_checkpoint_leaf.clone();
         let last_committed_checkpoint_root = db.checkpoint_tree_get_root_hash(last_committed_checkpoint_id).await?;
@@ -289,6 +314,17 @@ impl<
                 new_checkpoint_leaf_hash: last_committed_checkpoint_leaf.qfhash::<N::HasherBase>(),
             }
         };
+        let last_chain_hash = if last_committed_checkpoint_id == 0 {
+            genesis_verifiable_state_transition
+                .state_transition
+                .get_chain_0_from_genesis_leaf::<N::HasherBase>(&circuit_fingerprint_config.genesis_checkpoint_state_transition_fingerprint)
+        } else {
+            let verifiable = db
+                .get_verifiable_checkpoint_state_transition_and_zkp(last_committed_checkpoint_id)
+                .await?;
+            let proof = N::ZKVerifier::try_proof_from_slice(&verifiable.zk_proof)?;
+            N::ZKVerifier::get_proof_public_inputs_hash(&proof)?
+        };
         let last_committed = CoordinatorProcessorLastCommittedState::<N::F, N::QHash> {
             l2_state: last_committed_l2_state,
             checkpoint_leaf_stats: last_committed_checkpoint_leaf_stats,
@@ -297,6 +333,7 @@ impl<
             checkpoint_state_transition: last_committed_checkpoint_state_transition,
             checkpoint_root: last_committed_checkpoint_root,
             checkpoint_leaf_hash: last_committed_checkpoint_leaf.qfhash::<N::HasherBase>(),
+            last_chain_hash,
         };
         Ok(Self {
             db,
@@ -391,6 +428,241 @@ impl<
     }
     pub async fn get_current_unique_pending_id_internal(&self) -> anyhow::Result<(u64, QCoreProcCheckpointUniqueId)> {
         self.db.get_current_unique_pending_id().await
+    }
+
+    async fn copy_checkpoint_backup_file_for_reset(&mut self, destination_path: &str) -> anyhow::Result<()> {
+        let source_path = self.checkpoint_tree_backup_manager.backup_file_path.clone();
+        self.checkpoint_tree_backup_manager
+            .file_system
+            .file_like_fs_sync_file_with_path(&source_path, &mut self.checkpoint_tree_backup_manager.backup_file)
+            .await?;
+
+        let mut source = self.checkpoint_tree_backup_manager.file_system.file_like_fs_open(&source_path).await?;
+        let mut destination = self
+            .checkpoint_tree_backup_manager
+            .file_system
+            .file_like_fs_create(destination_path)
+            .await?;
+        source.seek(std::io::SeekFrom::Start(0)).await?;
+        destination.seek(std::io::SeekFrom::Start(0)).await?;
+        destination.file_like_set_len(0).await?;
+
+        let mut buffer = vec![0u8; 64 * 1024];
+        loop {
+            let bytes_read = source.read(&mut buffer).await?;
+            if bytes_read == 0 {
+                break;
+            }
+            destination.write_all(&buffer[..bytes_read]).await?;
+        }
+        self.checkpoint_tree_backup_manager
+            .file_system
+            .file_like_fs_sync_file_with_path(destination_path, &mut destination)
+            .await?;
+        Ok(())
+    }
+
+    async fn backup_before_reset(
+        &mut self,
+        target_checkpoint_id: u64,
+        latest_checkpoint_id: u64,
+        unique_pending_id: u64,
+        proc_checkpoint_unique_id: QCoreProcCheckpointUniqueId,
+    ) -> anyhow::Result<String> {
+        let timestamp_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+        let backup_dir = format!(
+            "{}.reset_backups/reset_{}_from_{}_to_{}",
+            self.checkpoint_tree_backup_manager.backup_file_path,
+            timestamp_ms,
+            latest_checkpoint_id,
+            target_checkpoint_id
+        );
+        self.checkpoint_tree_backup_manager
+            .file_system
+            .file_like_fs_create_dir_all(&backup_dir)
+            .await?;
+
+        let checkpoint_backup_copy_path = format!("{}/checkpoint_tree_backup.copy", backup_dir);
+        let checkpoint_backup_copy_status = match self.copy_checkpoint_backup_file_for_reset(&checkpoint_backup_copy_path).await {
+            Ok(()) => "ok".to_string(),
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to copy checkpoint backup file before coordinator reset; continuing because reset state is sourced from DB: {:?}",
+                    e
+                );
+                format!("failed: {e:?}")
+            }
+        };
+
+        let old_pending_checkpoint_mapping = self.db.get_checkpoint_id_for_unique_pending_id(unique_pending_id).await?;
+        let old_target_checkpoint_pending_mapping = self.db.get_unique_pending_id_for_checkpoint_id(target_checkpoint_id).await?;
+        let old_latest_l2_state = self.db.get_l2_block_state(latest_checkpoint_id).await?;
+        let old_latest_checkpoint_root = self.db.checkpoint_tree_get_root_hash(latest_checkpoint_id).await?;
+
+        let manifest = format!(
+            "\
+reset_backup_version=1
+reset_state_source=db
+created_at_unix_ms={timestamp_ms}
+target_checkpoint_id={target_checkpoint_id}
+latest_checkpoint_id_before_reset={latest_checkpoint_id}
+unique_pending_id_before_reset={unique_pending_id}
+proc_checkpoint_unique_id_before_reset={proc_checkpoint_unique_id}
+old_unique_pending_id_to_checkpoint_id_mapping={old_pending_checkpoint_mapping:?}
+old_target_checkpoint_id_to_unique_pending_id_mapping={old_target_checkpoint_pending_mapping:?}
+old_latest_l2_state={old_latest_l2_state:?}
+old_latest_checkpoint_root={}
+checkpoint_backup_source_path={}
+checkpoint_backup_copy_path={}
+checkpoint_backup_copy_status={}
+",
+            old_latest_checkpoint_root.psy_debug_print(),
+            self.checkpoint_tree_backup_manager.backup_file_path,
+            checkpoint_backup_copy_path,
+            checkpoint_backup_copy_status
+        );
+        let manifest_path = format!("{}/reset_manifest.txt", backup_dir);
+        let mut manifest_file = self
+            .checkpoint_tree_backup_manager
+            .file_system
+            .file_like_fs_create(&manifest_path)
+            .await?;
+        manifest_file.file_like_set_len(0).await?;
+        manifest_file.write_all(manifest.as_bytes()).await?;
+        self.checkpoint_tree_backup_manager
+            .file_system
+            .file_like_fs_sync_file_with_path(&manifest_path, &mut manifest_file)
+            .await?;
+
+        tracing::warn!(
+            "Coordinator reset pre-backup complete. manifest={}, checkpoint_backup_copy={}, checkpoint_backup_copy_status={}",
+            manifest_path,
+            checkpoint_backup_copy_path,
+            checkpoint_backup_copy_status
+        );
+        Ok(backup_dir)
+    }
+
+    pub async fn reset_to_checkpoint(&mut self, checkpoint_id: u64) -> anyhow::Result<()> {
+        let latest_checkpoint_id = self.db.get_latest_checkpoint_id().await?;
+        if checkpoint_id > latest_checkpoint_id {
+            anyhow::bail!(
+                "Cannot reset coordinator to checkpoint {} because latest checkpoint is {}",
+                checkpoint_id,
+                latest_checkpoint_id
+            );
+        }
+
+        tracing::warn!(
+            "Resetting coordinator processor from checkpoint {} to checkpoint {}",
+            latest_checkpoint_id,
+            checkpoint_id
+        );
+
+        let checkpoint_leaf = self.db.get_checkpoint_leaf_data(checkpoint_id).await?;
+        let checkpoint_state_roots = self.db.get_checkpoint_global_state_roots(checkpoint_id).await?;
+        let l2_state = self.db.get_l2_block_state(checkpoint_id).await?;
+        let checkpoint_root = self.db.checkpoint_tree_get_root_hash(checkpoint_id).await?;
+        let checkpoint_leaf_hash = checkpoint_leaf.qfhash::<N::HasherBase>();
+        let checkpoint_state_transition = if checkpoint_id == 0 {
+            self.genesis_verifiable_state_transition.state_transition.checkpoint_transition.clone()
+        } else {
+            CheckpointStateHashTransition {
+                old_checkpoint_tree_root: self.db.checkpoint_tree_get_root_hash(checkpoint_id - 1).await?,
+                new_checkpoint_tree_root: checkpoint_root,
+                old_checkpoint_leaf_hash: self.db.checkpoint_tree_get_leaf_hash(checkpoint_id, checkpoint_id - 1).await?,
+                new_checkpoint_leaf_hash: checkpoint_leaf_hash,
+            }
+        };
+
+        let (unique_pending_id, proc_checkpoint_unique_id) = self
+            .db
+            .get_current_unique_pending_id()
+            .await
+            .unwrap_or((self.ids.unique_pending_id, self.ids.proc_checkpoint_unique_id));
+        let reset_backup_dir = self
+            .backup_before_reset(checkpoint_id, latest_checkpoint_id, unique_pending_id, proc_checkpoint_unique_id)
+            .await?;
+
+        // Reset target state is read only from DB. The checkpoint backup file is
+        // rebuilt from DB and is not used as a source of truth for reset.
+        let required_history_start = checkpoint_id.saturating_sub(STALE_CHECKPOINT_AGE_REALM_TO_COORDINATOR_PROOF).max(
+            if checkpoint_id >= self.checkpoint_tree_backup_manager.max_checkpoints_to_keep {
+                checkpoint_id - self.checkpoint_tree_backup_manager.max_checkpoints_to_keep + 1
+            } else {
+                0
+            },
+        );
+        self.checkpoint_tree_backup_manager
+            .hard_reset_and_truncate(required_history_start)
+            .await?;
+        self.checkpoint_tree_backup_manager
+            .sync_from_database::<S>(&self.db, 1000, checkpoint_id)
+            .await?;
+
+        // Keep the pending-id counter monotonic, but make the current pending id
+        // point at the reset checkpoint so startup consistency checks pass after
+        // this administrative rollback.
+        self.db
+            .set_unique_pending_id_checkpoint_id_mapping(unique_pending_id, checkpoint_id)
+            .await?;
+        self.db
+            .set_checkpoint_id_to_unique_pending_id_mapping(checkpoint_id, unique_pending_id, &proc_checkpoint_unique_id)
+            .await?;
+        self.db.set_l2_latest_block_state(&l2_state).await?;
+        self.db.set_latest_checkpoint_id(checkpoint_id).await?;
+
+        self.ids.checkpoint_id = checkpoint_id;
+        self.ids.next_checkpoint_id = checkpoint_id + 1;
+        self.ids.unique_pending_id = unique_pending_id;
+        self.ids.proc_checkpoint_unique_id = proc_checkpoint_unique_id;
+        self.ids.gathering_unique_pending_id = unique_pending_id;
+        self.ids.gathering_proc_checkpoint_unique_id = proc_checkpoint_unique_id;
+        // Reconstruct last_chain_hash for the target checkpoint.
+        // For genesis (0), chain_0 = H(H(root, leaf), genesis_fingerprint).
+        // For non-genesis, retrieve the stored ZKP and extract its public inputs hash.
+        let last_chain_hash = if checkpoint_id == 0 {
+            let root_leaf = N::HasherBase::q_two_to_one(checkpoint_root, checkpoint_leaf_hash);
+            N::HasherBase::q_two_to_one(root_leaf, self.circuit_fingerprint_config.genesis_checkpoint_state_transition_fingerprint)
+        } else {
+            let stored =
+                self.db.get_verifiable_checkpoint_state_transition_and_zkp(checkpoint_id).await?;
+            N::ZKVerifier::get_proof_public_inputs_hash(
+                &N::ZKVerifier::try_proof_from_slice(&stored.zk_proof)?,
+            )?
+        };
+        self.last_committed = CoordinatorProcessorLastCommittedState {
+            l2_state: l2_state.clone(),
+            checkpoint_leaf_stats: checkpoint_leaf.stats.clone(),
+            checkpoint_leaf: checkpoint_leaf.clone(),
+            checkpoint_state_roots: checkpoint_state_roots.clone(),
+            checkpoint_state_transition,
+            checkpoint_root,
+            checkpoint_leaf_hash,
+            last_chain_hash,
+        };
+        self.temp_db
+            .set_unique_pending_ids(&self.ids.realm_identifier, unique_pending_id, proc_checkpoint_unique_id)
+            .await?;
+        self.temp_db
+            .set_gathering_unique_pending_ids(&self.ids.realm_identifier, unique_pending_id, proc_checkpoint_unique_id)
+            .await?;
+        self.shared_status
+            .update_status(unique_pending_id, checkpoint_id, checkpoint_leaf, checkpoint_state_roots, l2_state, true)?;
+        // reset_to_checkpoint has already rebuilt DB / checkpoint-tree / in-memory state to the
+        // target. The current process_block path silently clears needs_revert without acting on
+        // it (see bugs.md CP-1), so setting it here is a no-op today; once CP-1 is fixed to bail!
+        // on the flag this signal must be re-evaluated.
+        self.needs_revert = true;
+        tracing::info!(
+            "Coordinator processor reset complete. checkpoint_id={}, next_checkpoint_id={}, unique_pending_id={}, gathering_unique_pending_id={}, reset_backup_dir={}",
+            self.ids.checkpoint_id,
+            self.ids.next_checkpoint_id,
+            self.ids.unique_pending_id,
+            self.ids.gathering_unique_pending_id,
+            reset_backup_dir
+        );
+        Ok(())
     }
     pub async fn set_new_unique_ids(&mut self) -> anyhow::Result<()> {
         println!(
@@ -549,6 +821,19 @@ impl<
 
         tracing::info!("start -> Committing coordinator state update to database for checkpoint_id: {}", checkpoint_id);
 
+        let checkpoint_proof_public_inputs_hash = if checkpoint_id == 0 && zk_proof.is_empty() {
+            // Genesis commit path does not carry a checkpoint proof blob.
+            // chain_0 = H(H(root, leaf), genesis_fingerprint) matches the
+            // genesis checkpoint state transition circuit's public input hash.
+            let root_leaf = N::HasherBase::q_two_to_one(
+                coordinator_update.new_base.checkpoint_tree_root,
+                coordinator_update.new_base.checkpoint_leaf_hash,
+            );
+            N::HasherBase::q_two_to_one(root_leaf, self.circuit_fingerprint_config.genesis_checkpoint_state_transition_fingerprint)
+        } else {
+            let checkpoint_proof = N::ZKVerifier::try_proof_from_slice(&zk_proof)?;
+            N::ZKVerifier::get_proof_public_inputs_hash(&checkpoint_proof)?
+        };
         let mut verifiable_checkpoint_transition = coordinator_update.get_public_inputs_verifiable_state_transition(
             self.genesis_checkpoint_state_transition_hash,
             self.circuit_fingerprint_config.checkpoint_state_transition_circuit_fingerprint,
@@ -668,7 +953,28 @@ impl<
         // recovery doesn't work this enables us to avoid having to do atomic
         // commits, since if the node dies during this process, it will load the backups
         // from disk SO LONG AS THE checkpoint_id is not set!!!!
+        let previous_checkpoint_id = self.ids.checkpoint_id;
         self.db.set_latest_checkpoint_id(checkpoint_id).await?;
+        if checkpoint_id > 0 && previous_checkpoint_id < checkpoint_id {
+            if let Some((previous_pending_id, _)) = self
+                .db
+                .get_unique_pending_id_for_checkpoint_id(previous_checkpoint_id)
+                .await?
+            {
+                if let Err(err) = self
+                    .proof_store
+                    .delete_all_proofs_for_pending_id(previous_pending_id)
+                    .await
+                {
+                    tracing::warn!(
+                        "Failed to delete coordinator proofs for previous checkpoint {} (pending_id={}): {}",
+                        previous_checkpoint_id,
+                        previous_pending_id,
+                        err
+                    );
+                }
+            }
+        }
         tracing::info!("Committed coordinator processor state for checkpoint ID: {}", checkpoint_id);
         self.checkpoint_tree_backup_manager
             .append_checkpoint_leaf_hash(checkpoint_id, checkpoint_leaf_hash)
@@ -698,6 +1004,7 @@ impl<
             verifiable_checkpoint_transition.checkpoint_leaf,
             verifiable_checkpoint_transition.state_transition.checkpoint_transition,
         )?;
+        self.last_committed.last_chain_hash = checkpoint_proof_public_inputs_hash;
 
         tracing::info!("Updated last committed state for checkpoint ID: {}", checkpoint_id);
         // This just updates the RwLock protected shared status, this is ok because we
@@ -956,7 +1263,7 @@ Checkpoint Root Hash: {}
         global_contract_tree: &mut SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>,
         user_registration_tree: &mut SimpleMemoryMerkleRecorderStore<N::HasherBase, N::QHash>,
     ) -> anyhow::Result<()> {
-        // self.ensure_genesis_applied(genesis_block_update).await?;
+        self.ensure_genesis_applied(genesis_block_update).await?;
         self.ensure_backup_restored_if_necessary(
             file_system,
             deploy_contract_gatherer_backup_directory,

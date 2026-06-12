@@ -9,8 +9,9 @@ use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata
 #[ts(export, concrete(Hash = parth_core::PHash))]
 
 pub struct PsyCheckpointStateTransitionGenesisCircuitInput<Hash> {
-    pub genesis_checkpoint_state_transition_hash: Hash,
-    pub checkpoint_state_transition_circuit_fingerprint: Hash,
+    pub checkpoint_tree_root: Hash,
+    pub checkpoint_leaf_hash: Hash,
+    pub genesis_fingerprint: Hash,
 }
 
 
@@ -18,12 +19,9 @@ impl<Hash> PsyCheckpointStateTransitionGenesisCircuitInput<Hash> {
     pub fn get_public_inputs_hash_no_rewards_tag<Hasher: MerkleHasher<Hash>>(
         &self, 
     ) -> Hash {        
-        /*
-        public inputs are:
-        hash(genesis_checkpoint_state_transition_hash, hash(genesis_checkpoint_state_transition_hash, checkpoint_state_transition_circuit_fingerprint))
-        */
-        let config_hash = Hasher::two_to_one(&self.genesis_checkpoint_state_transition_hash, &self.checkpoint_state_transition_circuit_fingerprint);
-        Hasher::two_to_one(&self.genesis_checkpoint_state_transition_hash, &config_hash)
+        // chain_0 = H(H(checkpoint_tree_root_0, checkpoint_leaf_hash_0), genesis_fingerprint)
+        let root_leaf = Hasher::two_to_one(&self.checkpoint_tree_root, &self.checkpoint_leaf_hash);
+        Hasher::two_to_one(&root_leaf, &self.genesis_fingerprint)
     }
 }
 impl<Hash: Copy, F> QFieldHashable<F, Hash> for PsyCheckpointStateTransitionGenesisCircuitInput<Hash> {
@@ -35,15 +33,16 @@ impl<Hash: Copy, F> QFieldHashable<F, Hash> for PsyCheckpointStateTransitionGene
 impl<Hash: QPGenRandom> QPGenRandom for PsyCheckpointStateTransitionGenesisCircuitInput<Hash> {
     fn qp_rand_gen() -> Self where Self: Sized {
         Self {
-            genesis_checkpoint_state_transition_hash: Hash::qp_rand_gen(),
-            checkpoint_state_transition_circuit_fingerprint: Hash::qp_rand_gen(),
+            checkpoint_tree_root: Hash::qp_rand_gen(),
+            checkpoint_leaf_hash: Hash::qp_rand_gen(),
+            genesis_fingerprint: Hash::qp_rand_gen(),
         }
     }
 }
 
 impl<Hash: Q256BitHash> PsyCanonicalSerializeMetadata for PsyCheckpointStateTransitionGenesisCircuitInput<Hash> {
     const IS_FIXED_SIZE: bool = true;
-    const FIXED_SIZE: usize = 32*2;
+    const FIXED_SIZE: usize = 32*3;
 }
 
 impl<Hash: Q256BitHash> FallbackPsySerializeCanonical for PsyCheckpointStateTransitionGenesisCircuitInput<Hash> {
@@ -52,17 +51,20 @@ impl<Hash: Q256BitHash> FallbackPsySerializeCanonical for PsyCheckpointStateTran
     }
     
     fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
-        writer.psy_write_bytes_fixed(&self.genesis_checkpoint_state_transition_hash.into_owned_32bytes())?;
-        writer.psy_write_bytes_fixed(&self.checkpoint_state_transition_circuit_fingerprint.into_owned_32bytes())?;
+        writer.psy_write_bytes_fixed(&self.checkpoint_tree_root.into_owned_32bytes())?;
+        writer.psy_write_bytes_fixed(&self.checkpoint_leaf_hash.into_owned_32bytes())?;
+        writer.psy_write_bytes_fixed(&self.genesis_fingerprint.into_owned_32bytes())?;
         Ok(())
     }
     
     fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
-        let genesis_checkpoint_state_transition_hash = Hash::from_owned_32bytes(reader.psy_read_bytes_32()?);
-        let checkpoint_state_transition_circuit_fingerprint = Hash::from_owned_32bytes(reader.psy_read_bytes_32()?);
+        let checkpoint_tree_root = Hash::from_owned_32bytes(reader.psy_read_bytes_32()?);
+        let checkpoint_leaf_hash = Hash::from_owned_32bytes(reader.psy_read_bytes_32()?);
+        let genesis_fingerprint = Hash::from_owned_32bytes(reader.psy_read_bytes_32()?);
         Ok(Self {
-            genesis_checkpoint_state_transition_hash,
-            checkpoint_state_transition_circuit_fingerprint,
+            checkpoint_tree_root,
+            checkpoint_leaf_hash,
+            genesis_fingerprint,
         })
     }
 }

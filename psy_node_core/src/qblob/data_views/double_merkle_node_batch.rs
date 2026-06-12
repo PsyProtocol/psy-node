@@ -104,7 +104,7 @@ impl QBlobDoubleMerkleNodeBatchDataView {
             data,
             QBlobDataType::GenericDoubleIdMerkleNodeBatch,
             QBlobMerkleNodeTreeType::UserContractStateTree,
-            true,
+            false,
         )?;
         if header.chain_id != chain_id
             || header.realm_id != realm_id
@@ -113,6 +113,29 @@ impl QBlobDoubleMerkleNodeBatchDataView {
             return Err(anyhow::anyhow!("Header context does not match expected context"));
         }
         Ok((header, payload_data))
+    }
+    /// Validate CST nodes batch header and return (header, payload, remaining_bytes)
+    /// The remaining bytes contain the IMT leaf data for IMT-based contract state trees
+    pub fn validate_cst_nodes_batch_header_for_realm_context_get_clipped_ref_any_unique_pending_id_with_remaining(
+        data: &[u8],
+        chain_id: u32,
+        realm_id: u64,
+        realm_sub_id: u64,
+    ) -> anyhow::Result<(QBlobMerkleTreeNodeBatchHeaderV1, &[u8], &[u8])> {
+        let (header, payload_data) = QBlobMerkleTreeNodeBatchHeaderV1::clip_header_get_payload_for_blob_type_and_tree_ref(
+            data,
+            QBlobDataType::GenericDoubleIdMerkleNodeBatch,
+            QBlobMerkleNodeTreeType::UserContractStateTree,
+            false,
+        )?;
+        if header.chain_id != chain_id
+            || header.realm_id != realm_id
+            || header.realm_sub_id != realm_sub_id
+        {
+            return Err(anyhow::anyhow!("Header context does not match expected context"));
+        }
+        let remaining = &data[header.total_size as usize..];
+        Ok((header, payload_data, remaining))
     }
     pub fn generate_double_merkle_node_batch_blob_data_from_ref_default_context<Hash: Q256BitHash>(
         nodes: &[QMerkleStoreDoubleIdNode<Hash>],
@@ -400,6 +423,15 @@ impl QBlobDoubleIdMerkleRecorder {
             item_count,
         ).to_bytes_fixed_size_array());
         blob
+    }
+    /// Finalize and return both single and double blobs
+    /// The single blob has single header, the double blob has double header
+    pub fn finalize_single_and_double(self, context: &QBlobWriterContextMetadataHeader) -> (Vec<u8>, Vec<u8>) {
+        // First get the single blob (blob already has single header from finalize_with_header_into_double)
+        let single_blob = self.blob.clone();
+        // Then get the double blob
+        let double_blob = self.finalize_with_header(context);
+        (single_blob, double_blob)
     }
 }
 

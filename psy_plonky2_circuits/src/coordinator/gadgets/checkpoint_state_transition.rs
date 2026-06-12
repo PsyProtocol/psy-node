@@ -64,6 +64,23 @@ impl CheckpointStateTransitionPublicInputsGadget {
             self.checkpoint_state_transition_circuit_fingerprint,
         )
     }
+    pub fn get_step_commit_hash<H: AlgebraicHasher<F>, F: RichField + Extendable<D>, const D: usize>(
+        &self,
+        builder: &mut CircuitBuilder<F, D>,
+    ) -> HashOutTarget {
+        self.checkpoint_transition.get_step_commit_hash::<H, F, D>(
+            builder,
+            self.checkpoint_state_transition_circuit_fingerprint,
+        )
+    }
+    pub fn get_chain_hash_from_previous<H: AlgebraicHasher<F>, F: RichField + Extendable<D>, const D: usize>(
+        &self,
+        builder: &mut CircuitBuilder<F, D>,
+        previous_chain_hash: HashOutTarget,
+    ) -> HashOutTarget {
+        let step_hash = self.get_step_commit_hash::<H, F, D>(builder);
+        builder.hash_two_to_one::<H>(previous_chain_hash, step_hash)
+    }
     pub fn set_witness_params<F: RichField>(
         &self,
         witness: &mut impl Witness<F>,
@@ -139,6 +156,17 @@ impl CheckpointStateHashTransitionGadget {
         let config_hash = builder.hash_two_to_one::<H>(genesis_checkpoint_state_transition_hash, checkpoint_state_transition_circuit_fingerprint);
         builder.hash_two_to_one::<H>(checkpoint_transition_hash, config_hash)
         
+    }
+    pub fn get_step_commit_hash<H: AlgebraicHasher<F>, F: RichField + Extendable<D>, const D: usize>(
+        &self,
+        builder: &mut CircuitBuilder<F, D>,
+        checkpoint_state_transition_circuit_fingerprint: HashOutTarget,
+    ) -> HashOutTarget {
+        let root_leaf_hash = builder.hash_two_to_one::<H>(
+            self.new_checkpoint_tree_root,
+            self.new_checkpoint_leaf_hash,
+        );
+        builder.hash_two_to_one::<H>(root_leaf_hash, checkpoint_state_transition_circuit_fingerprint)
     }
     pub fn set_witness_params<F: RichField>(
         &self,
@@ -225,5 +253,4 @@ impl CheckpointStateTransitionCoreGadget {
         Ok(())
     }
 }
-
 

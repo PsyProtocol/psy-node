@@ -1,0 +1,39 @@
+[package]
+edition = "2021"
+name    = "psy_client_common"
+version = "0.1.0"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+# Core WASM-compatible dependencies
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_with = { workspace = true }
+serde_repr = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+plonky2 = { workspace = true }
+rand = { workspace = true }
+async-trait = { workspace = true }
+indexmap = { workspace = true }
+ts-rs = { workspace = true }
+k256 = { workspace = true }
+uuid = { workspace = true }
+strum_macros = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+kvq = { workspace = true }
+bincode = { workspace = true }
+clap = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# Native-only dependencies that bring tokio/async dependencies
+chrono = { workspace = true }
+tracing-subscriber = { workspace = true }
+http = { workspace = true }
+tower = { workspace = true }
+jsonwebtoken = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros"] }

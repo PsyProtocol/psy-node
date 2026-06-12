@@ -12,9 +12,12 @@ use parth_core::{
 };
 use psy_data::{
     guta::stats::GUTAStats,
-    proof_input::guta::{end_cap_input::SubmitUserEndCapNonProofInput, SubmitUserEndCapNonProofCoreInput},
+    proof_input::guta::{
+        end_cap_input::{ContractStateUpdate, ContractStateUpdateHistory, SubmitUserEndCapNonProofInput},
+        SubmitUserEndCapNonProofCoreInput,
+    },
     v1::qdata::{
-        contract::QEDContractStateUpdateHistory, public_key::PZKPublicKeyInfo, user::PQEDUserLeaf, user_end_cap_result::PUPSEndCapResultCompact,
+        public_key::PZKPublicKeyInfo, user::PQEDUserLeaf, user_end_cap_result::PUPSEndCapResultCompact,
     },
 };
 
@@ -230,14 +233,17 @@ impl<F: QFelt64, Hash: QDBHashBase + QFHashBase<F>, Fetcher: PsyDummyProverCombo
 
     pub async fn finalize_and_build(mut self) -> anyhow::Result<SubmitUserEndCapNonProofInput<F, Hash>> {
         self.populate_user_contract_tree().await?;
-        let mut contract_state_updates: Vec<QEDContractStateUpdateHistory<Hash>> = Vec::new();
+        let mut contract_state_updates: Vec<ContractStateUpdateHistory<F, Hash>> = Vec::new();
         for (contract_id, dmps) in self.contract_state_dmps.into_iter() {
-            let contract_update = QEDContractStateUpdateHistory {
+            let contract_update = ContractStateUpdateHistory {
                 user_contract_tree_update_proof: self.user_contract_tree.set_leaf(
                     contract_id as u64,
                     dmps.last().ok_or_else(|| anyhow::anyhow!("No DMPs found for contract"))?.new_root,
                 ),
-                contract_state_tree_updates: dmps.clone(),
+                updates: dmps
+                    .into_iter()
+                    .map(|delta_proof| ContractStateUpdate::Positional { delta_proof })
+                    .collect(),
             };
             contract_state_updates.push(contract_update);
         }

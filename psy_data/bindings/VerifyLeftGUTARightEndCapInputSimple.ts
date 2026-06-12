@@ -4,4 +4,4 @@ import type { PartialUpdateNearestCommonAncestorProof } from "./PartialUpdateNea
 import type { QHashOut } from "./QHashOut";
 import type { VerifyEndCapSimpleStandardInput } from "./VerifyEndCapSimpleStandardInput";
 
-export type VerifyLeftGUTARightEndCapInputSimple = { checkpoint_tree_root: QHashOut, stats_a: GUTAStats, b_end_cap: VerifyEndCapSimpleStandardInput, nca_proof: PartialUpdateNearestCommonAncestorProof, };
+export type VerifyLeftGUTARightEndCapInputSimple = { checkpoint_tree_root: QHashOut, stats_a: GUTAStats, b_end_cap: VerifyEndCapSimpleStandardInput, nca_proof: PartialUpdateNearestCommonAncestorProof, total_aggregation_proofs_generated_a: bigint, };

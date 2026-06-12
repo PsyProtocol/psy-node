@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
 use parth_core::{
-    pgoldilocks::{PoseidonHasher, QHashOut}, protocol::core_types::{QNetworkDatabaseTypes, QNetworkHashTypes, QNetworkTreeCircuitSpecificConstants, QNetworkTreeConstants}, PHash, PF
+    pgoldilocks::{PoseidonHasher, QHashOut},
+    protocol::core_types::{QNetworkDatabaseTypes, QNetworkHashTypes, QNetworkTreeCircuitSpecificConstants, QNetworkTreeConstants},
+    PHash, PF,
 };
 use plonky2::{field::goldilocks_field::GoldilocksField, hash::hash_types::HashOut};
-use psy_node_core::
-    psy_core_db::v3_implementation::full::PsyUnifiedCoreDatabaseStore
-;
+use psy_node_core::psy_core_db::v3_implementation::full::PsyUnifiedCoreDatabaseStore;
 use psy_node_store_memory::cbs_store::{InMemoryCoreStore, InMemoryTableIdentifier};
 // ================================================================================================
 // REPLACEMENT FOR TEST HARNESS SETUP
@@ -43,7 +43,9 @@ type ExDoubleIdMerkleTableIdentifier = InMemoryTableIdentifier;
 type ExZeroIdMerkleTableIdentifier = InMemoryTableIdentifier;
 type ExTagTreeTableIdentifier = InMemoryTableIdentifier;
 type ExHashToManyIdsTableIdentifier = InMemoryTableIdentifier;
-
+type ExImtLeafTableIdentifier = InMemoryTableIdentifier;
+type ExImtKeyIndexTableIdentifier = InMemoryTableIdentifier;
+type ExImtNextAppendIndexTableIdentifier = InMemoryTableIdentifier;
 
 #[derive(Debug, Copy, Clone)]
 pub struct SimpleTestNetworkConfig;
@@ -130,6 +132,9 @@ pub struct P2TestbedChainStateStore<N: QNetworkDatabaseTypes> {
         ExZeroIdMerkleTableIdentifier,
         ExTagTreeTableIdentifier,
         ExHashToManyIdsTableIdentifier,
+        ExImtLeafTableIdentifier,
+        ExImtKeyIndexTableIdentifier,
+        ExImtNextAppendIndexTableIdentifier,
         InMemoryCoreStore<N::QHash, N::HasherBase>,
     >,
 }
@@ -179,6 +184,11 @@ impl<N: QNetworkDatabaseTypes> P2TestbedChainStateStore<N> {
         let contract_leaf_table = Arc::new(InMemoryTableIdentifier::new_with_keyspace(&keyspace, "contract_leaf_table"));
         let contract_code_definition_table = Arc::new(InMemoryTableIdentifier::new_with_keyspace(&keyspace, "contract_code_definition_table"));
         let checkpoint_zk_proof_and_transition_table = Arc::new(InMemoryTableIdentifier::new_with_keyspace(&keyspace, "checkpoint_zk_proof_and_transition_table"));
+
+        let imt_leaf_table = Arc::new(InMemoryTableIdentifier::new_with_keyspace(&keyspace, "imt_leaf_table"));
+        let imt_key_index_table = Arc::new(InMemoryTableIdentifier::new_with_keyspace(&keyspace, "imt_key_index_table"));
+        let imt_next_append_index_table = Arc::new(InMemoryTableIdentifier::new_with_keyspace(&keyspace, "imt_next_append_index_table"));
+
         let psy_db = PsyUnifiedCoreDatabaseStore::new(
             store.clone(),
             checkpoint_leaf_table,
@@ -214,6 +224,9 @@ impl<N: QNetworkDatabaseTypes> P2TestbedChainStateStore<N> {
             contract_leaf_table,
             contract_code_definition_table,
             checkpoint_zk_proof_and_transition_table,
+            imt_leaf_table,
+            imt_key_index_table,
+            imt_next_append_index_table,
         );
         Ok(Self { db: psy_db })
     }

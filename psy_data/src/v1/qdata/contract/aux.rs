@@ -140,7 +140,7 @@ impl FallbackPsySerializeCanonical for ContractCodeDefinition {
     fn fallback_pio_serialized_size(&self) -> usize {
         2 + 4 + self.functions.iter().map(|f| f.fallback_pio_serialized_size()).sum::<usize>()
     }
-    
+
     fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
         writer.psy_write_u16(self.state_tree_height)?;
         writer.psy_write_vec_length(self.functions.len())?;
@@ -149,11 +149,11 @@ impl FallbackPsySerializeCanonical for ContractCodeDefinition {
         }
         Ok(())
     }
-    
+
     fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
         let state_tree_height = reader.psy_read_u16()?;
         let function_count = reader.psy_read_vec_length()?;
-        
+
         let mut function_defs = Vec::with_capacity(function_count);
         for _ in 0..function_count {
             let function = ContractFunctionCodeDefinition::pio_read_from_io(&mut *reader)?;

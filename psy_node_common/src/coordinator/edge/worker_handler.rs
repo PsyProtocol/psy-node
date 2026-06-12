@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::task;
 use parth_core::{
     crypto::{
-        hash::traits::{MerkleHasher, ZeroableHash},
+        hash::{tag_tree::hash_tag_tree_node_single, traits::{MerkleHasher, ZeroableHash}},
         secp256k1::{QEDCompressedSecp256K1Signature, Secp256K1Verifier, SimpleTimedRequest},
     },
     data::queue::queue_key::QPBaseQueueType,
@@ -36,9 +36,7 @@ fn verify_api_signature(signature: &QEDCompressedSecp256K1Signature, request: &S
     request.get_sig_hash::<parth_crypto::hash::sha256::CoreSha256Hasher>() == signature.message
         && parth_common::secp256k1::Secp256K1VerifierHelper::secp256k1_verify(signature).is_ok()
 }
-fn print_hash<H: Q256BitHash + std::fmt::Debug>(label: &str, hash: &H) {
-    tracing::info!("{}: {:?} ({})", label, hash, hex::encode(&hash.into_owned_32bytes()));
-}
+const SUBMIT_PROOF_PENDING_LOOKBACK: u64 = 256;
 impl<
         N: QNetworkTypesConfig<JobId = QProvingJobDataID>,
         S: PsyCoordinatorEdgeAPIStoreReader<N::F, N::QHash> + Send + Sync,
@@ -62,6 +60,61 @@ impl<
         ProofStore,
     >
 {
+    async fn load_dependency_proof_bytes(&self, unique_pending_id: u64, job_id: &N::JobId) -> anyhow::Result<Option<Vec<u8>>> {
+        if let Some(proof) = self
+            .proof_store
+            .get_proof_bytes_by_job_id(job_id.get_output_id(), unique_pending_id)
+            .await?
+        {
+            return Ok(Some(proof));
+        }
+
+        if job_id.circuit_type == ProvingJobCircuitType::GenerateRollupStateTransitionProof {
+            let transition = self
+                .db_reader
+                .get_verifiable_checkpoint_state_transition_and_zkp(job_id.goal_id)
+                .await?;
+            return Ok(Some(transition.zk_proof));
+        }
+
+        Ok(None)
+    }
+
+    async fn resolve_unique_pending_id_for_submitted_job(
+        &self,
+        current_unique_pending_id: u64,
+        job_id: N::JobId,
+    ) -> anyhow::Result<(u64, Option<([u8; 33], u64)>)> {
+        for offset in 0..=SUBMIT_PROOF_PENDING_LOOKBACK {
+            let candidate = current_unique_pending_id.saturating_sub(offset);
+            if let Some(claim) = self
+                .temp_db
+                .get_job_claim(&self.realm_identifier, candidate, job_id)
+                .await?
+            {
+                if candidate != current_unique_pending_id {
+                    tracing::warn!(
+                        "submit_proof_raw resolved job {:?} from historical unique_pending_id {} (current={})",
+                        job_id,
+                        candidate,
+                        current_unique_pending_id
+                    );
+                }
+                return Ok((candidate, Some(claim)));
+            }
+            if candidate == 0 {
+                break;
+            }
+        }
+
+        tracing::warn!(
+            "submit_proof_raw found no claim record for job {:?} within lookback window; falling back to current unique_pending_id {}",
+            job_id,
+            current_unique_pending_id
+        );
+        Ok((current_unique_pending_id, None))
+    }
+
     pub async fn has_job_id_already_been_submitted(&self, unique_pending_id: u64, job_id: N::JobId) -> anyhow::Result<bool> {
         Ok(self
             .temp_db
@@ -187,18 +240,14 @@ impl<
 
         if work_item.is_none() {
             anyhow::bail!("no proving work available");
-        } else {
-            println!("unique_pending_id: {:?}", unique_pending_id);
-            println!("unique_proc_id: {:?}", unique_proc_id);
         }
         let work_item = work_item.unwrap();
-        println!("work_item.job_id: {:?}", work_item.job_id);
         tracing::info!("work item dependencies: {:?}", work_item.metadata.dependencies);
         let child_proofs = work_item
             .metadata
             .dependencies
             .iter()
-            .map(|id| self.proof_store.get_proof_bytes_by_job_id(id.get_output_id()))
+            .map(|id| self.load_dependency_proof_bytes(unique_pending_id, id))
             .collect::<Vec<_>>()
             .into_iter();
         let res: Vec<Option<Vec<u8>>> = try_join_all(child_proofs).await?;
@@ -213,12 +262,10 @@ impl<
             }
         }
 
-        println!("getting proof witness bytes: {:?}", work_item.job_id.get_input_witness_id());
         let witness_bytes: Vec<u8> = self
             .temp_db
             .get_tdb_proof_witness_bytes(&self.realm_identifier, unique_pending_id, work_item.job_id.get_input_witness_id())
             .await?;
-        println!("got proof witness bytes, len: {}", witness_bytes.len());
         let children_reward_tree_values = {
             if work_item.metadata.dependencies.len() == 0 || work_item.metadata.reward_tree_hash_mode == PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN
             {
@@ -257,17 +304,13 @@ impl<
             )
             .await?;
 
-        // HACK: in the future we should create a new table for the expected proving
-        // tag, but for now this ok i guess, but a HACK HACK: for now we set
-        // self.temp_db.set_proof_miner_rewards_tree_value( with the expected proving
-        // tag and then update it later to the actual value once the proof is submitted
-        // this ensures the right person submits the proof AND the proof can only be
-        // submitted once
+        // Store claim tag on input-witness key (separate from output key used for finalized reward value)
+        // to avoid claim-tag / reward-value slot aliasing under concurrent claim/submit attempts.
         self.temp_db
             .set_proof_miner_rewards_tree_value(
                 &self.realm_identifier,
                 unique_pending_id,
-                response.job.job_id.get_output_id(),
+                response.job.job_id.get_input_witness_id(),
                 N::QHash::from_ref_32bytes(&request.tag),
             )
             .await?;
@@ -300,7 +343,8 @@ impl<
             .await?;
         let witness: QCQEDCheckpointStateTransitionInput<N::F, N::QHash> =
             QCQEDCheckpointStateTransitionInput::<N::F, N::QHash>::psy_ser_from_owned_bytes_vec(witness_bytes)?;
-        let expected_public_inputs_hash = witness.get_public_inputs_hash_with_fingerprint_and_reward_root::<N::HasherBase>(
+        let expected_public_inputs_hash = witness.get_chain_hash_with_fingerprint_and_reward_root::<N::HasherBase>(
+            witness.previous_chain_hash,
             self.checkpoint_state_transition_circuit_fingerprint,
             new_reward_root,
         );
@@ -322,13 +366,16 @@ impl<
             anyhow::bail!("invalid signature for submit_proof_raw");
         }
         job_id = job_id.get_output_id();
-        let (unique_pending_id, unique_proc_id) = self.get_current_unique_pending_id_internal().await?;
+        let (current_unique_pending_id, unique_proc_id) = self.get_current_unique_pending_id_internal().await?;
+        let (unique_pending_id, job_claim) = self
+            .resolve_unique_pending_id_for_submitted_job(current_unique_pending_id, job_id)
+            .await?;
         let proof_bytes = Arc::new(proof_bytes);
 
         // HACK: check to make sure the tag matches. If not, job was completed by another worker (stolen) - slash submitter.
         let expected_tag = self
             .temp_db
-            .get_proof_miner_rewards_tree_value(&self.realm_identifier, unique_pending_id, job_id.get_output_id())
+            .get_proof_miner_rewards_tree_value(&self.realm_identifier, unique_pending_id, job_id.get_input_witness_id())
             .await?;
         if expected_tag != tag {
             self.temp_db
@@ -363,19 +410,19 @@ impl<
 
         let reward_tree_value = metadata.get_new_rewards_tag_tree_value::<N::HasherBase>(tag, &children_reward_tree_values)?;
 
-        print_hash("reward_tree_value", &reward_tree_value);
-        let full_expected_public_inputs_hash = if job_id.circuit_type == ProvingJobCircuitType::GenesisBlockCheckpointStateTransition {
+        let full_expected_public_inputs_hash = if job_id.circuit_type == ProvingJobCircuitType::GenerateRollupStateTransitionProof {
+            self.get_root_state_transition_expected_public_inputs_hash_internal(
+                job_id,
+                unique_pending_id,
+                reward_tree_value,
+            )
+            .await?
+        } else if job_id.circuit_type == ProvingJobCircuitType::GenesisBlockCheckpointStateTransition {
             metadata.expected_public_inputs_hash
-        } else if job_id.circuit_type == ProvingJobCircuitType::GenerateRollupStateTransitionProof {
-            self.get_root_state_transition_expected_public_inputs_hash_internal(job_id, unique_pending_id, reward_tree_value)
-                .await?
         } else {
             N::HasherBase::two_to_one(&metadata.expected_public_inputs_hash, &reward_tree_value)
         };
 
-
-        print_hash("full_expected_public_inputs_hash", &full_expected_public_inputs_hash);
-        print_hash("metadata.expected_public_inputs_hash", &metadata.expected_public_inputs_hash);
 
         tracing::info!(
             "Verifying proof for job id: {:?} with expected public inputs hash: {:?} (from metadata: {:?})",
@@ -388,8 +435,6 @@ impl<
             "Debug: extracted public inputs hash from proof: {:?}",
             hex::encode(&debug_public_inputs.into_owned_32bytes())
         );
-        print_hash("debug_public_inputs", &debug_public_inputs);
-
         let proof_verifier = self.proof_verifier.clone();
         task::spawn_blocking({
             let proof_bytes = proof_bytes.clone();
@@ -415,13 +460,11 @@ impl<
             anyhow::bail!("Failed to set rewards tree value for job id");
         }
 
-        self.proof_store.put_proof_bytes_for_job_id(job_id.get_output_id(), &proof_bytes).await?;
+        self.proof_store
+            .put_proof_bytes_for_job_id(job_id.get_output_id(), unique_pending_id, &proof_bytes)
+            .await?;
 
-        if let Ok(Some((public_key, claim_time_ms))) = self
-            .temp_db
-            .get_job_claim(&self.realm_identifier, unique_pending_id, job_id)
-            .await
-        {
+        if let Some((public_key, claim_time_ms)) = job_claim {
             self.temp_db
                 .apply_reputation_on_submit(&self.realm_identifier, &public_key, claim_time_ms)
                 .await?;

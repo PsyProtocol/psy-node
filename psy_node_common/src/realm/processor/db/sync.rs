@@ -35,9 +35,30 @@ where
             .sync_from_coordinator_client::<CoordinatorClient, N::F>(&self.coordinator_client, 2000)
             .await?;
 
-        let latest_db_checkpoint_id = self.db.get_latest_checkpoint_id().await?;
+        let mut latest_db_checkpoint_id = self.db.get_latest_checkpoint_id().await?;
         let latest_synced_checkpoint_id = self.checkpoint_tree_backup_manager.get_current_checkpoint_id_head();
         let latest_synced_checkpoint_root = self.checkpoint_tree_backup_manager.get_current_checkpoint_tree_root_head();
+
+        // Defensive: if a previous run (e.g. old fast-forward code) set latest_checkpoint_id
+        // without writing the corresponding L2 block state, roll back to the last checkpoint
+        // that actually has metadata. This keeps the DB self-consistent.
+        let latest_db_l2_info: QEDL2BlockState = loop {
+            match self.db.get_l2_block_state(latest_db_checkpoint_id).await {
+                std::result::Result::Ok(info) => break info,
+                std::result::Result::Err(_) if latest_db_checkpoint_id > 0 => {
+                    tracing::warn!(
+                        "No L2 block state for checkpoint {} (latest_checkpoint_id marker without metadata). \
+                         Rolling back to previous checkpoint.",
+                        latest_db_checkpoint_id
+                    );
+                    latest_db_checkpoint_id -= 1;
+                }
+                std::result::Result::Err(e) => return Err(e),
+            }
+        };
+        if latest_db_checkpoint_id != self.db.get_latest_checkpoint_id().await? {
+            self.db.set_latest_checkpoint_id(latest_db_checkpoint_id).await?;
+        }
 
         // Check if DB is already up to date
         let db_root = self.db.checkpoint_tree_get_root_hash(latest_db_checkpoint_id).await?;
@@ -49,8 +70,6 @@ where
             );
             return Ok(());
         }
-
-        let latest_db_l2_info: QEDL2BlockState = self.db.get_l2_block_state(latest_db_checkpoint_id).await?;
 
         // 2. Fetch and persist metadata for missing checkpoints
         for checkpoint_id in (latest_db_checkpoint_id + 1)..=latest_synced_checkpoint_id {
@@ -129,20 +148,9 @@ where
             ).await?;
         }
 
-        // 5. Update Mappings
-        self.db
-            .set_unique_pending_id_checkpoint_id_mapping(self.state.processing_unique_pending_id, latest_synced_checkpoint_id)
-            .await?;
-        self.db
-            .set_checkpoint_id_to_unique_pending_id_mapping(
-                latest_synced_checkpoint_id,
-                self.state.processing_unique_pending_id,
-                &self.state.processing_proc_checkpoint_unique_id,
-            )
-            .await?;
         self.db.set_latest_checkpoint_id(latest_synced_checkpoint_id).await?;
 
-        // 6. CRITICAL: Update Internal Memory State to match the new HEAD
+        // 5. CRITICAL: Update Internal Memory State to match the new HEAD
         let latest_checkpoint_root = self.checkpoint_tree_backup_manager.get_current_checkpoint_tree_root_head();
         
         self.state.coordinator_head_synced_checkpoint_id = latest_synced_checkpoint_id;

@@ -15,5 +15,7 @@ hex = { workspace = true }
 hex-literal = { workspace = true }
 embedded-io = { workspace = true }
 embedded-io-async = { workspace = true }
-tokio = { workspace = true, optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, optional = true, features = ["fs"] }
 async-trait = { workspace = true, optional = true }

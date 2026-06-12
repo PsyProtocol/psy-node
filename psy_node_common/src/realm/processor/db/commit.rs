@@ -139,15 +139,43 @@ where
         &mut self,
         checkpoint_sync_info: &PQEDCheckpointSyncInfoCompact<N::F, N::QHash>,
     ) -> anyhow::Result<()> {
-        let previous: MerkleProofCore<N::QHash> = self
-            .checkpoint_tree_backup_manager
-            .checkpoint_tree
-            .get_leaf(checkpoint_sync_info.checkpoint_id);
+        let previous = self.write_checkpoint_state_records(checkpoint_sync_info).await?;
+
         let expected_new_checkpoint_root = previous.compute_root_with_value::<N::HasherBase>(checkpoint_sync_info.checkpoint_leaf_hash);
         if expected_new_checkpoint_root != checkpoint_sync_info.checkpoint_tree_root {
             anyhow::bail!("Inconsistent checkpoint tree root detected when committing checkpoint ID: {}. Expected root: {:?}, but got: {:?}. This indicates a serious inconsistency in the checkpoint tree state.",
                 checkpoint_sync_info.checkpoint_id, expected_new_checkpoint_root, checkpoint_sync_info.checkpoint_tree_root);
         }
+
+        self.checkpoint_tree_backup_manager
+            .append_checkpoint_leaf_hash(checkpoint_sync_info.checkpoint_id, checkpoint_sync_info.checkpoint_leaf_hash)
+            .await?;
+
+        // THIS DOES NOT SET THE LATEST CHECKPOINT ID, THAT MUST BE DONE AT THE VERY END
+        // OF COMMITTING THE FULL STATE
+
+        Ok(())
+    }
+
+    async fn commit_checkpoint_state_after_checkpoint_tree_sync(
+        &mut self,
+        checkpoint_sync_info: &PQEDCheckpointSyncInfoCompact<N::F, N::QHash>,
+    ) -> anyhow::Result<()> {
+        self.write_checkpoint_state_records(checkpoint_sync_info).await?;
+
+        // The checkpoint tree backup manager was already synced from coordinator,
+        // so do not recompute a historical append root or append this leaf again.
+        Ok(())
+    }
+
+    async fn write_checkpoint_state_records(
+        &mut self,
+        checkpoint_sync_info: &PQEDCheckpointSyncInfoCompact<N::F, N::QHash>,
+    ) -> anyhow::Result<MerkleProofCore<N::QHash>> {
+        let previous: MerkleProofCore<N::QHash> = self
+            .checkpoint_tree_backup_manager
+            .checkpoint_tree
+            .get_leaf(checkpoint_sync_info.checkpoint_id);
 
         self.db
             .set_l2_block_state(checkpoint_sync_info.checkpoint_id, &checkpoint_sync_info.block_state)
@@ -174,14 +202,8 @@ where
         self.db
             .set_checkpoint_root_hash_to_id_mapping(checkpoint_sync_info.checkpoint_tree_root, checkpoint_sync_info.checkpoint_id)
             .await?;
-        self.checkpoint_tree_backup_manager
-            .append_checkpoint_leaf_hash(checkpoint_sync_info.checkpoint_id, checkpoint_sync_info.checkpoint_leaf_hash)
-            .await?;
 
-        // THIS DOES NOT SET THE LATEST CHECKPOINT ID, THAT MUST BE DONE AT THE VERY END
-        // OF COMMITTING THE FULL STATE
-
-        Ok(())
+        Ok(previous)
     }
 
     pub async fn commit_state(
@@ -190,11 +212,19 @@ where
         realm_update: &PsyPreparedRealmBlockStateUpdates<N::QHash>,
         _state_transition_circuit_type: ProvingJobCircuitType,
         _zk_proof: Vec<u8>,
+        skip_checkpoint_root_check: bool,
     ) -> anyhow::Result<()> {
         let checkpoint_id = coordinator_update.checkpoint_sync_info.checkpoint_id;
         let unique_pending_id = self.state.processing_unique_pending_id;
         // CRITICAL: set unique_pending_id to checkpoint_id mapping BEFORE ANY OTHER
-        // STATE UPDATES so we can recover if something goes wrong
+        // STATE UPDATES so we can recover if something goes wrong.
+        //
+        // SOLE writer of the (unique_pending_id <-> checkpoint_id) mapping. Catch-up,
+        // fast-forward, init, and no-jobs-skip paths MUST NOT write this mapping —
+        // doing so either pollutes it with `processing_unique_pending_id` values that
+        // were never actually committed, or overwrites a correct entry with a stale
+        // key -> newer checkpoint pair if the coordinator advanced between commit and
+        // a subsequent sync. Both break recovery (init.rs:423) and RPC consumers.
         self.db
             .set_unique_pending_id_checkpoint_id_mapping(unique_pending_id, checkpoint_id)
             .await?;
@@ -206,8 +236,19 @@ where
         self.db
             .global_user_tree_set_top_tree_merkle_proof(checkpoint_id, &coordinator_update.merkle_proof_to_realm_root)
             .await?;
-        self.commit_checkpoint_state_no_guta_update(&coordinator_update.checkpoint_sync_info)
+        self.db
+            .set_realm_rewards_tag_tree_top_proof_at_unique_pending_id(
+                unique_pending_id,
+                &coordinator_update.reward_tree_top_proof,
+            )
             .await?;
+        if skip_checkpoint_root_check {
+            self.commit_checkpoint_state_after_checkpoint_tree_sync(&coordinator_update.checkpoint_sync_info)
+                .await?;
+        } else {
+            self.commit_checkpoint_state_no_guta_update(&coordinator_update.checkpoint_sync_info)
+                .await?;
+        }
 
         // START STANDARD STATE UPDATES (technically these can be done in any order
         // after the above two are done) start contract updates
@@ -218,6 +259,13 @@ where
                 .contract_state_tree_set_nodes_ffs(checkpoint_id, &realm_update.update_contract_state_tree_nodes_ffs)
                 .await?;
             tracing::info!("Committed contract state tree updates for checkpoint ID: {}", checkpoint_id);
+            // Write IMT (Indexed Merkle Tree) leaf preimages and key index entries
+            if !realm_update.update_contract_state_imt_leaves_ffs.is_empty() {
+                self.db
+                    .contract_state_imt_set_leaves_ffs(checkpoint_id, &realm_update.update_contract_state_imt_leaves_ffs)
+                    .await?;
+                tracing::info!("Committed contract state IMT leaf updates for checkpoint ID: {}", checkpoint_id);
+            }
             self.db
                 .user_contract_tree_set_nodes_ffs(checkpoint_id, &realm_update.update_user_contract_tree_nodes_ffs)
                 .await?;
@@ -234,7 +282,28 @@ where
         // recovery doesn't work this enables us to avoid having to do atomic
         // commits, since if the node dies during this process, it will load the backups
         // from disk SO LONG AS THE checkpoint_id is not set!!!!
+        let previous_checkpoint_id = self.state.last_committed_checkpoint_id;
         self.db.set_latest_checkpoint_id(checkpoint_id).await?;
+        if checkpoint_id > 0 && previous_checkpoint_id < checkpoint_id {
+            if let Some((previous_pending_id, _)) = self
+                .db
+                .get_unique_pending_id_for_checkpoint_id(previous_checkpoint_id)
+                .await?
+            {
+                if let Err(err) = self
+                    .proof_store
+                    .delete_all_proofs_for_pending_id(previous_pending_id)
+                    .await
+                {
+                    tracing::warn!(
+                        "Failed to delete realm proofs for previous checkpoint {} (pending_id={}): {}",
+                        previous_checkpoint_id,
+                        previous_pending_id,
+                        err
+                    );
+                }
+            }
+        }
         tracing::info!("Committed coordinator processor state for checkpoint ID: {}", checkpoint_id);
         tracing::info!("Backed up checkpoint tree root for checkpoint ID: {}", checkpoint_id);
         self.state.commit_processing()?;

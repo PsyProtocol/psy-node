@@ -1,0 +1,9 @@
+[
+    {
+        "method_name": "simple_mint",
+        "inputs": [
+            10000000000
+        ],
+        "contract_id": 0
+    }
+]

@@ -1,0 +1,14 @@
+# <project-root>/.cargo/config.toml
+[env]
+TS_RS_EXPORT_DIR = { value = "psy_sdk/psy-ts-sdk/packages/psy-sdk/src/types", relative = true }
+
+[target.wasm32-unknown-unknown]
+rustflags = [
+    "-C", "target-feature=+atomics",
+    "-C", "panic=abort",
+    '--cfg', 'getrandom_backend="js"'
+]
+
+[unstable]
+build-std = ["panic_abort", "std"]
+# build-std-features = ["panic_immediate_abort"]

@@ -57,12 +57,14 @@ pub async fn create_realm_processor<
 where
     FileSystem::File: Send + Sync,
 {
+    tracing::info!("[REALM_CREATE] setup_for_realm start");
     let genesis =
         GenesisDatabaseDataBuilder::<N::F, N::QHash>::setup_for_realm::<N::HasherBase, N>(
             genesis_data,
             realm_identifier.realm_id as u64,
             realm_identifier.realm_sub_id as u64,
         )?;
+    tracing::info!("[REALM_CREATE] setup_for_realm done");
 
         /*
         
@@ -100,6 +102,7 @@ where
         genesis.coordinator_update.checkpoint_sync_info.checkpoint_tree_root,
     )
     .await?;
+    tracing::info!("[REALM_CREATE] db new_init done");
     /*
     pub async fn new(
         mut db: PsyCoordinatorDatabaseProcessor<
@@ -161,6 +164,7 @@ where
         guta_gatherer_backup_directory,
     )
     .await?;
+    tracing::info!("[REALM_CREATE] processor new done");
 
     Ok(processor_result)
 }
@@ -196,6 +200,7 @@ pub async fn create_realm_processor_and_run<
 where
     FileSystem::File: Send + Sync,
 {
+    tracing::info!("[REALM_CREATE] create_and_run start");
     let (processor, guta_gatherer_join_handle) = create_realm_processor::<N, S, STagTreeRewards, GUTAUpdateQueue, ProofWorkQueue, TempDatabase, ProofStore, FileSystem, CoordinatorClient>(
         chain_id,
         genesis_data,

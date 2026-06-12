@@ -49,7 +49,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
         let create_standard_keyspace = session
             .query_unpaged(
                 format!(
-                    "CREATE KEYSPACE IF NOT EXISTS {} WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': 1}}",
+                    "CREATE KEYSPACE IF NOT EXISTS {} WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': 1}} AND tablets = {{ 'enabled': false }}",
                     &keyspace
                 ),
                 &[],

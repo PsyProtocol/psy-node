@@ -17,6 +17,7 @@ pub struct PsyNodeCircuitFingerprintConfig<Hash>{
     pub register_users_circuit_whitelist_root: Hash,
     pub deploy_contracts_circuit_whitelist_root: Hash,
     pub checkpoint_state_transition_circuit_fingerprint: Hash,
+    pub genesis_checkpoint_state_transition_fingerprint: Hash,
 }
 
 pub trait PsyNodeCircuitFingerprintConfigProvider<Hash> {

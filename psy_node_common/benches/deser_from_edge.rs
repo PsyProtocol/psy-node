@@ -5,9 +5,12 @@ use parth_core::{
 };
 use psy_data::{
     guta::stats::GUTAStats,
-    proof_input::guta::{end_cap_input::SubmitUserEndCapNonProofInput, SubmitUserEndCapNonProofCoreInput},
+    proof_input::guta::{
+        end_cap_input::{ContractStateUpdate, ContractStateUpdateHistory, SubmitUserEndCapNonProofInput},
+        SubmitUserEndCapNonProofCoreInput,
+    },
     v1::qdata::{
-        contract::{DashMapContractHeightCache, PSimpleContractHeightCache, QEDContractStateUpdateHistory},
+        contract::{DashMapContractHeightCache, PSimpleContractHeightCache},
         user::PQEDUserLeaf,
         user_end_cap_result::PUPSEndCapResultCompact,
     },
@@ -31,7 +34,7 @@ pub fn gen_fake_valid_submit_user_end_cap_non_proof_input<F, Hash, Hasher>(
 )
 where
     F: QFelt64,
-    Hash: QFHashBase<F> + QPGenRandom,
+    Hash: Q256BitHash + QFHashBase<F> + QPGenRandom,
     Hasher: QFHasherU64<F, Hash> + MerkleZeroHasher<Hash>,
 {
     let mut user_contract_tree = SimpleMemoryMerkleStoreV3::<Hasher, Hash>::new(contract_tree_height);
@@ -42,7 +45,7 @@ where
             let contract_state_tree_height = 24 + i as u8;
             let mut tree = SimpleMemoryMerkleStoreV3::<Hasher, Hash>::new(contract_state_tree_height);
             let max_leaf_id = 1u64 << contract_state_tree_height;
-            contract_helper.add_contract(0, contract_state_tree_height, tree.get_root());
+            contract_helper.add_contract(i as u32, contract_state_tree_height, tree.get_root());
 
             for _ in 0..1000 {
                 let rand_leaf_id = rand::random::<u64>() % max_leaf_id;
@@ -88,9 +91,12 @@ where
             .collect::<Vec<_>>();
         let end_root = ctree.get_root();
         let user_contract_tree_update_proof = user_contract_tree.set_leaf(i as u64, end_root);
-        contract_state_updates.push(QEDContractStateUpdateHistory {
+        contract_state_updates.push(ContractStateUpdateHistory {
             user_contract_tree_update_proof,
-            contract_state_tree_updates,
+            updates: contract_state_tree_updates
+                .into_iter()
+                .map(|delta_proof| ContractStateUpdate::Positional { delta_proof })
+                .collect(),
         });
     });
 

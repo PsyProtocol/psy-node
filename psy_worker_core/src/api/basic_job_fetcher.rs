@@ -277,15 +277,17 @@ impl<
             API_REQUEST_SIGNATURE_VALID_DURATION_MS,
             tag.clone().into_owned_32bytes(),
         );
-        let submit_result: Result<(), _> = api_client.unwrap().submit_proof_raw(signature, request, job_id, tag, proof).await;
+        let submit_result: Result<(), _> = api_client.unwrap().submit_proof_raw(signature, request, job_id.clone(), tag, proof).await;
         match submit_result {
             Ok(_) => {
+                println!("[worker/basic_fetcher] submit_proof_raw ok: {:?}", job_id);
                 self.notify_job_completed_with_claim_metadata(api_url_hash, claim_metadata).await?;
                 self.report_fetch_job_success(api_url_hash).await;
                 Ok(())
             }
             Err(e) => {
                 self.report_submit_proof_failure(api_url_hash).await;
+                println!("[worker/basic_fetcher] submit_proof_raw error: job={:?} err={}", job_id, e);
                 Err(anyhow::anyhow!("Failed to submit proof to API URL: {}", e))
             }
         }

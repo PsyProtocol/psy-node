@@ -1,0 +1,23 @@
+[package]
+name = "psy_config"
+version = "0.1.0"
+edition = "2021"
+description = "Multi-network configuration management for PSY Protocol"
+
+# WASM exports moved to psy_rust_sdk
+
+[build-dependencies]
+serde_json = { workspace = true }
+zstd = { workspace = true }
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+indexmap = { workspace = true }
+plonky2 = { workspace = true }
+psy_client_common = { workspace = true }
+
+[features]
+default = []

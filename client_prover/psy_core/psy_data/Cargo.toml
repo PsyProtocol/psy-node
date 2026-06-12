@@ -1,0 +1,36 @@
+[package]
+edition = "2021"
+name = "psy_client_data"
+version = "0.1.0"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_repr = { workspace = true }
+hex = { workspace = true }
+plonky2 = { workspace = true }
+bincode = { workspace = true }
+serde_json = { workspace = true }
+maybe-async = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+hashbrown = { workspace = true }
+tracing = { workspace = true }
+indexmap = { workspace = true }
+
+kvq = { workspace = true }
+psy_config = { workspace = true }
+psy_client_common = { workspace = true }
+psy_crypto = { workspace = true }
+ts-rs = { workspace = true }
+
+fastbloom-rs = { workspace = true, features = ["serde"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+zstd = { workspace = true }
+
+[features]
+# default = ["is_sync"]
+is_sync = ["maybe-async/is_sync"]

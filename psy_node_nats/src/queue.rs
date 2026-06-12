@@ -43,6 +43,21 @@ pub struct NatsJetStreamClient {
 }
 
 impl NatsJetStreamClient {
+    fn consumer_cache_key(&self, durable_name: &str) -> String {
+        format!("{}:{}", self.stream_name, durable_name)
+    }
+
+    fn is_consumer_not_found_error(err: &(impl std::fmt::Display + ?Sized)) -> bool {
+        let err_string = err.to_string().to_lowercase();
+        err_string.contains("consumer not found") || err_string.contains("error code 10014")
+    }
+
+    async fn invalidate_consumer_cache(&self, durable_name: &str) {
+        self.consumer_cache
+            .invalidate(&self.consumer_cache_key(durable_name))
+            .await;
+    }
+
     pub async fn new_connection<A: ToServerAddrs>(
         base_namespace: String,
         nats_urls: A,
@@ -104,7 +119,7 @@ impl NatsJetStreamClient {
     }
 
     async fn get_consumer_cached(&self, durable_name: &str) -> anyhow::Result<PullConsumer> {
-        let cache_key = format!("{}:{}", self.stream_name, durable_name);
+        let cache_key = self.consumer_cache_key(durable_name);
 
         if let Some(consumer) = self.consumer_cache.get(&cache_key).await {
             return Ok(consumer);
@@ -131,10 +146,21 @@ impl NatsJetStreamClient {
     }
 
     pub async fn ensure_consumer(&self, subject: &str, durable_name: &str, queue_type: QPBaseQueueType) -> anyhow::Result<()> {
-        let cache_key = format!("{}:{}", self.stream_name, durable_name);
+        let cache_key = self.consumer_cache_key(durable_name);
 
-        if self.consumer_cache.get(&cache_key).await.is_some() {
-            return Ok(());
+        if let Some(mut consumer) = self.consumer_cache.get(&cache_key).await {
+            match consumer.info().await {
+                Ok(_) => return Ok(()),
+                Err(err) if Self::is_consumer_not_found_error(&err) => {
+                    tracing::warn!(
+                        "cached NATS consumer no longer exists, recreating: stream={}, durable={}",
+                        self.stream_name,
+                        durable_name
+                    );
+                    self.consumer_cache.invalidate(&cache_key).await;
+                }
+                Err(err) => return Err(err.into()),
+            }
         }
 
         let config = PullConfig {
@@ -152,6 +178,38 @@ impl NatsJetStreamClient {
         self.ensure_stream().await?;
         self.ensure_consumer(subject, durable_name, queue_type).await
     }
+
+    async fn delete_consumer_by_durable_name(&self, durable_name: &str) -> anyhow::Result<()> {
+        self.invalidate_consumer_cache(durable_name).await;
+
+        match self
+            .jetstream
+            .delete_consumer_from_stream(durable_name, &self.stream_name)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(err) => {
+                if Self::is_consumer_not_found_error(&err) || err.to_string().to_lowercase().contains("not found") {
+                    Ok(())
+                } else {
+                    Err(err.into())
+                }
+            }
+        }
+    }
+
+    async fn delete_consumer_for_queue<QK: PCoreStandardQueueKeyForRealm>(
+        &self,
+        queue_key: &QK,
+        realm_id: u64,
+        realm_sub_id: u64,
+        unique_id: QCoreProcCheckpointUniqueId,
+        task_group: u32,
+    ) -> anyhow::Result<()> {
+        let durable_name = queue_key.get_durable_name(&self.base_namespace, realm_id, realm_sub_id, unique_id, task_group);
+        self.delete_consumer_by_durable_name(&durable_name).await
+    }
+
     pub async fn push_messages_dq_bytes(&self, subject: &str, data: &[&[u8]]) -> anyhow::Result<()> {
 
         const BATCH_SIZE: usize = 1000; // Adjust based on testing; 1000-5000 is a good starting point
@@ -291,12 +349,24 @@ impl NatsJetStreamClient {
         let size_hint = QK::QueueItem::get_size_hint();
         let has_fixed_size = QK::QueueItem::has_fixed_size() && size_hint > 0;
 
-        let consumer = self.get_consumer_cached(&durable_name).await?;
-        let mut messages = consumer
+        let consumer = match self.get_consumer_cached(&durable_name).await {
+            Ok(consumer) => consumer,
+            Err(err) if Self::is_consumer_not_found_error(&err) => return Ok(()),
+            Err(err) => return Err(err),
+        };
+        let mut messages = match consumer
             .fetch()
             .max_messages(max_messages_per_batch.min(max_messages_total_to_dump))
             .messages()
-            .await?;
+            .await
+        {
+            Ok(messages) => messages,
+            Err(err) if Self::is_consumer_not_found_error(&err) => {
+                self.invalidate_consumer_cache(durable_name).await;
+                return Ok(());
+            }
+            Err(err) => return Err(err.into()),
+        };
         let mut total_messages_dumped = 0;
         if max_messages_total_to_dump == 0 {
             return Ok(());
@@ -349,8 +419,19 @@ impl NatsJetStreamClient {
         let has_expected_size = expected_size.is_some();
         let real_expected_size = expected_size.unwrap_or(0);
 
-        let consumer = self.get_consumer_cached(&durable_name).await?;
-        let mut messages = consumer.fetch().max_messages(max_messages_per_batch).messages().await?;
+        let consumer = match self.get_consumer_cached(&durable_name).await {
+            Ok(consumer) => consumer,
+            Err(err) if Self::is_consumer_not_found_error(&err) => return Ok(0),
+            Err(err) => return Err(err),
+        };
+        let mut messages = match consumer.fetch().max_messages(max_messages_per_batch).messages().await {
+            Ok(messages) => messages,
+            Err(err) if Self::is_consumer_not_found_error(&err) => {
+                self.invalidate_consumer_cache(durable_name).await;
+                return Ok(0);
+            }
+            Err(err) => return Err(err.into()),
+        };
         let mut total_messages_dumped = 0;
         if max_messages_total_to_dump == 0 {
             return Ok(0);
@@ -397,10 +478,21 @@ impl NatsJetStreamClient {
         ack_mode: JetStreamAckMode,
     ) -> anyhow::Result<Option<Vec<u8>>> {
 
-        let consumer = self.get_consumer_cached(&durable_name).await?;
+        let consumer = match self.get_consumer_cached(durable_name).await {
+            Ok(consumer) => consumer,
+            Err(err) if Self::is_consumer_not_found_error(&err) => return Ok(None),
+            Err(err) => return Err(err),
+        };
 
         let request = consumer.fetch().max_messages(1);
-        let mut messages = request.messages().await?;
+        let mut messages = match request.messages().await {
+            Ok(messages) => messages,
+            Err(err) if Self::is_consumer_not_found_error(&err) => {
+                self.invalidate_consumer_cache(durable_name).await;
+                return Ok(None);
+            }
+            Err(err) => return Err(err.into()),
+        };
 
         if let Some(Ok(jet_msg)) = messages.next().await {
             let job = jet_msg.payload.to_vec();
@@ -421,10 +513,21 @@ impl NatsJetStreamClient {
         ack_mode: JetStreamAckMode,
     ) -> anyhow::Result<Option<QueueItem>> {
 
-        let consumer = self.get_consumer_cached(&durable_name).await?;
+        let consumer = match self.get_consumer_cached(durable_name).await {
+            Ok(consumer) => consumer,
+            Err(err) if Self::is_consumer_not_found_error(&err) => return Ok(None),
+            Err(err) => return Err(err),
+        };
 
         let request = consumer.fetch().max_messages(1);
-        let mut messages = request.messages().await?;
+        let mut messages = match request.messages().await {
+            Ok(messages) => messages,
+            Err(err) if Self::is_consumer_not_found_error(&err) => {
+                self.invalidate_consumer_cache(durable_name).await;
+                return Ok(None);
+            }
+            Err(err) => return Err(err.into()),
+        };
 
         if let Some(Ok(jet_msg)) = messages.next().await {
             let job = QueueItem::decode_queue_item_ref(jet_msg.payload.as_ref())?;
@@ -447,10 +550,21 @@ impl NatsJetStreamClient {
         let mut timer = DebugTimer::new("get_next_worker_queue_item_or_none");
 
         /*tracing::info!("Getting message for worker queue, subject: {}, durable_name: {}", subject, durable_name);*/
-        let consumer = self.get_consumer_cached(&durable_name).await?;
+        let consumer = match self.get_consumer_cached(durable_name).await {
+            Ok(consumer) => consumer,
+            Err(err) if Self::is_consumer_not_found_error(&err) => return Ok(None),
+            Err(err) => return Err(err),
+        };
         timer.lap("get_consumer_from_stream");
         let request = consumer.fetch().max_messages(1);
-        let mut messages = request.messages().await?;
+        let mut messages = match request.messages().await {
+            Ok(messages) => messages,
+            Err(err) if Self::is_consumer_not_found_error(&err) => {
+                self.invalidate_consumer_cache(durable_name).await;
+                return Ok(None);
+            }
+            Err(err) => return Err(err.into()),
+        };
         timer.lap("consumer.fetch.messages");
 
         let base_queue_type = queue_key.get_queue_type();
@@ -555,27 +669,40 @@ impl NatsJetStreamClient {
 
         loop {
             let mut consumer = match self.get_consumer_cached(&durable_name).await {
-                Ok(c) => anyhow::Ok(c),
+                Ok(c) => c,
+                Err(e) if Self::is_consumer_not_found_error(&e) => {
+                    self.invalidate_consumer_cache(durable_name).await;
+                    return Ok(());
+                }
                 Err(e) => {
                     tracing::error!("Failed to get consumer: {}", e);
                     anyhow::bail!("Failed to get consumer for subject: {}, durable_name: {} {:?}", subject, durable_name,e );
                 }
-            }?;
+            };
             let info = match consumer.info().await {
-                Ok(i) => anyhow::Ok(i),
+                Ok(i) => i,
+                Err(e) if Self::is_consumer_not_found_error(&e) => {
+                    self.invalidate_consumer_cache(durable_name).await;
+                    return Ok(());
+                }
                 Err(e) => {
                     tracing::error!("Failed to get consumer info: {}", e);
                     anyhow::bail!("Failed to get consumer info for subject: {}, durable_name: {} {:?}", subject, durable_name,e );
                 }
-            }?;
+            };
             if info.num_pending == 0 && info.num_ack_pending == 0 && info.ack_floor.stream_sequence == info.delivered.stream_sequence {
                 println!("all jobs complete for subject: {}, durable_name: {}", subject, durable_name);
                 return Ok(());
             }else{
-                /*println!(
-                    "still waiting... pending: {}, ack_pending: {}",
-                    info.num_pending, info.num_ack_pending
-                );*/
+                tracing::trace!(
+                    "still waiting... subject: {} consumer: {} pending: {}, ack_pending: {}, delivered_seq: {}, ack_floor_seq: {}",
+                    subject,
+                    durable_name,
+                    info.num_pending,
+                    info.num_ack_pending,
+                    info.delivered.stream_sequence,
+                    info.ack_floor.stream_sequence,
+                );
             }
             if start.elapsed() > max_wait {
                 return Err(anyhow::anyhow!("Timeout waiting for all jobs to complete"));
@@ -631,6 +758,30 @@ impl QStandardQueueBase for NatsJetStreamClient {
         let consumer = self.jetstream.create_consumer_on_stream(config, &self.stream_name).await?;
         self.consumer_cache.insert(cache_key, consumer).await;
         Ok(())
+    }
+
+    async fn recreate_consumer<QK: PCoreStandardQueueKeyForRealm>(
+        &self,
+        queue_key: &QK,
+        realm_id: u64,
+        realm_sub_id: u64,
+        unique_id: QCoreProcCheckpointUniqueId,
+        task_group: u32,
+    ) -> anyhow::Result<()> {
+        let durable_name = queue_key.get_durable_name(&self.base_namespace, realm_id, realm_sub_id, unique_id, task_group);
+        let cache_key = format!("{}:{}", self.stream_name, durable_name);
+
+        self.consumer_cache.invalidate(&cache_key).await;
+
+        let stream = self.jetstream.get_stream(&self.stream_name).await?;
+        if let Err(e) = stream.delete_consumer(&durable_name).await {
+            let s = e.to_string().to_lowercase();
+            if !s.contains("not found") && !s.contains("does not exist") {
+                return Err(e.into());
+            }
+        }
+
+        <Self as QStandardQueueBase>::ensure_consumer(self, queue_key, realm_id, realm_sub_id, unique_id, task_group).await
     }
 
 }
@@ -886,13 +1037,25 @@ impl QStandardEphemeralQueueSubscriber for NatsJetStreamClient {
         let real_batch_size = BATCH_SIZE.min(max_items);
         let mut total_items_dumped = 0usize;
 
-        let consumer = self.get_consumer_cached(&durable_name).await?;
+        let consumer = match self.get_consumer_cached(&durable_name).await {
+            Ok(consumer) => consumer,
+            Err(err) if Self::is_consumer_not_found_error(&err) => return Ok(items),
+            Err(err) => return Err(err),
+        };
         while total_items_dumped < max_items {
-            let mut messages = consumer
+            let mut messages = match consumer
                 .fetch()
                 .max_messages(real_batch_size.min(max_items - total_items_dumped))
                 .messages()
-                .await?;
+                .await
+            {
+                Ok(messages) => messages,
+                Err(err) if Self::is_consumer_not_found_error(&err) => {
+                    self.invalidate_consumer_cache(&durable_name).await;
+                    return Ok(items);
+                }
+                Err(err) => return Err(err.into()),
+            };
             let mut last_reply = None;
 
             let mut total_dumped_for_batch = 0;
@@ -948,6 +1111,18 @@ impl QStandardEphemeralQueueSubscriber for NatsJetStreamClient {
         let durable_name = queue_key.get_durable_name(&self.base_namespace, realm_id, realm_sub_id, unique_id, task_group);
 
         self.get_message_if_exists_dq_bytes_ephemeral_qi(&subject, &durable_name, JetStreamAckMode::AckEach)
+            .await
+    }
+
+    async fn delete_ephemeral_queue_consumer<QK: PCoreStandardQueueKeyForRealm>(
+        &self,
+        queue_key: &QK,
+        realm_id: u64,
+        realm_sub_id: u64,
+        unique_id: QCoreProcCheckpointUniqueId,
+        task_group: u32,
+    ) -> anyhow::Result<()> {
+        self.delete_consumer_for_queue(queue_key, realm_id, realm_sub_id, unique_id, task_group)
             .await
     }
 
@@ -1080,7 +1255,11 @@ impl QStandardWorkerQueueSubscriber for NatsJetStreamClient {
         let size_hint = QK::QueueItem::get_size_hint();
         let has_fixed_size = QK::QueueItem::has_fixed_size() && size_hint > 0;
 
-        let consumer = self.get_consumer_cached(&durable_name).await?;
+        let consumer = match self.get_consumer_cached(&durable_name).await {
+            Ok(consumer) => consumer,
+            Err(err) if Self::is_consumer_not_found_error(&err) => return Ok(Vec::new()),
+            Err(err) => return Err(err),
+        };
         const BATCH_SIZE: usize = 1000;
         let max_messages_per_batch = BATCH_SIZE.min(max_items);
         let max_messages_total_to_dump = max_items;
@@ -1095,7 +1274,14 @@ impl QStandardWorkerQueueSubscriber for NatsJetStreamClient {
 
         let mut total_dumped_for_batch: usize;
         while total_messages_dumped < max_items {
-            let mut messages = consumer.fetch().max_messages(max_messages_per_batch.min(max_items)).messages().await?;
+            let mut messages = match consumer.fetch().max_messages(max_messages_per_batch.min(max_items)).messages().await {
+                Ok(messages) => messages,
+                Err(err) if Self::is_consumer_not_found_error(&err) => {
+                    self.invalidate_consumer_cache(&durable_name).await;
+                    return Ok(data_vec);
+                }
+                Err(err) => return Err(err.into()),
+            };
             total_dumped_for_batch = 0;
             while let Some(Ok(jet_msg)) = messages.next().await {
                 if has_fixed_size && jet_msg.payload.len() != size_hint {
@@ -1166,5 +1352,17 @@ impl QStandardWorkerQueueSubscriber for NatsJetStreamClient {
     ) -> anyhow::Result<bool> {
         let subject = queue_key.get_queue_subject(&self.base_namespace, realm_id, realm_sub_id, unique_topic, task_group);
         self.report_message_completed_dq(&subject, &item.get_restorable_job_id()).await
+    }
+
+    async fn delete_worker_queue_consumer<QK: PCoreStandardQueueKeyForRealm>(
+        &self,
+        queue_key: &QK,
+        realm_id: u64,
+        realm_sub_id: u64,
+        unique_topic: u128,
+        task_group: u32,
+    ) -> anyhow::Result<()> {
+        self.delete_consumer_for_queue(queue_key, realm_id, realm_sub_id, unique_topic, task_group)
+            .await
     }
 }

@@ -11,7 +11,7 @@ use parth_crypto::hash::sha256::CoreSha256Hasher;
 use psy_node_scylla::{
     core::ScyllaCoreStore,
     tables::{
-        blob::ScyllaBiDirectionalBlobToBlobTablePreparedStatements, counter::u64_counter::ScyllaU64ToU64CounterTablePreparedStatements, hash_to_many_ids::ScyllaHashToManyIdsTablePreparedStatements, merkle::{
+        blob::ScyllaBiDirectionalBlobToBlobTablePreparedStatements, counter::u64_counter::ScyllaU64ToU64CounterTablePreparedStatements, hash_to_many_ids::ScyllaHashToManyIdsTablePreparedStatements, imt::{ScyllaIMTKeyIndexPreparedStatements, ScyllaIMTLeafPreparedStatements, ScyllaIMTNextAppendIndexPreparedStatements}, merkle::{
             ScyllaDoubleMerkleNodesPreparedStatements, ScyllaMerkleNodesPreparedStatements, ScyllaMerkleNodesZeroPreparedStatements,
         }, object::{
             ScyllaGenericKeyIdValueTablePreparedStatements, ScyllaGenericObjectDoubleIdTablePreparedStatements,
@@ -43,7 +43,9 @@ type ExDoubleIdMerkleTableIdentifier = ScyllaDoubleMerkleNodesPreparedStatements
 type ExZeroIdMerkleTableIdentifier = ScyllaMerkleNodesZeroPreparedStatements;
 type ExTagTreeTableIdentifier = ScyllaTagTreeNodesPreparedStatements;
 type ExHashToManyIdsTableIdentifier = ScyllaHashToManyIdsTablePreparedStatements;
-
+type ExIMTLeafTableIdentifier = ScyllaIMTLeafPreparedStatements;
+type ExIMTKeyIndexTableIdentifier = ScyllaIMTKeyIndexPreparedStatements;
+type ExIMTNextAppendIndexTableIdentifier = ScyllaIMTNextAppendIndexPreparedStatements;
 
 type ScyllaTestStore = ScyllaCoreStore<ExHash, ExHasher>;
 
@@ -100,6 +102,9 @@ pub struct SimpleStoreEx {
         ExZeroIdMerkleTableIdentifier,
         ExTagTreeTableIdentifier,
         ExHashToManyIdsTableIdentifier,
+        ExIMTLeafTableIdentifier,
+        ExIMTKeyIndexTableIdentifier,
+        ExIMTNextAppendIndexTableIdentifier,
         ScyllaTestStore,
     >,
 }
@@ -184,6 +189,15 @@ impl SimpleStoreEx {
             store.init_std_table::<ExSingleIdTableIdentifier>("contract_code_definition_table", get_rk(28)).await?;
 
         let checkpoint_zk_proof_and_transition_table = store.init_std_table::<ExKivTableIdentifier>("checkpoint_zk_proof_and_transition_table", get_rk(29)).await?;
+
+        let imt_leaf_table = store.init_std_table::<ExIMTLeafTableIdentifier>("imt_leaf_table", get_rk(30)).await?;
+        let imt_key_index_table = store
+            .init_std_table::<ExIMTKeyIndexTableIdentifier>("imt_key_index_table", get_rk(31))
+            .await?;
+        let imt_next_append_index_table = store
+            .init_std_table::<ExIMTNextAppendIndexTableIdentifier>("imt_next_append_index_table", get_rk(32))
+            .await?;
+
         let psy_db = PsyUnifiedCoreDatabaseStore::new(
             store.clone(),
             Arc::new(checkpoint_leaf_table),
@@ -219,6 +233,9 @@ impl SimpleStoreEx {
             Arc::new(contract_leaf_table),
             Arc::new(contract_code_definition_table),
             Arc::new(checkpoint_zk_proof_and_transition_table),
+            Arc::new(imt_leaf_table),
+            Arc::new(imt_key_index_table),
+            Arc::new(imt_next_append_index_table),
         );
         let simple_store = ExPsyUnifiedStoreTestHelper::new(psy_db, 0, 0);
         Ok(Self { store: simple_store })

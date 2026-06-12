@@ -52,12 +52,16 @@ where
         file_system: Arc<FileSystem>,
         guta_gatherer_backup_directory: String,
     ) -> anyhow::Result<(Self, tokio::task::JoinHandle<Result<(), anyhow::Error>>)> {
+        tracing::info!("[REALM_STARTUP] processor new start");
         db.ensure_genesis_applied(genesis_block_update.clone()).await?;
+        tracing::info!("[REALM_STARTUP] ensure_genesis_applied done");
         let (mut global_user_tree,) = load_realm_memory_trees_from_db::<N, _>(&db.db, db.state.gathering_checkpoint_id, db.state.realm_id_u64)
             .await?
             .into_tuple();
+        tracing::info!("[REALM_STARTUP] load_realm_memory_trees_from_db done");
         db.init_with_setup_and_genesis(&file_system, &guta_gatherer_backup_directory, genesis_block_update, &mut global_user_tree)
             .await?;
+        tracing::info!("[REALM_STARTUP] init_with_setup_and_genesis done");
         //db.set_new_unique_ids().await?;
         tracing::info!("intialized realm processor database, building gatherers...");
 

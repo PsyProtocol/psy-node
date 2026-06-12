@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    # ---- Node crates ----
     "cf_utils",
     "psy_io",
     "psy_serialize",
@@ -29,9 +30,28 @@ members = [
     "psy_api_core",
     "psy_dummy_prover",
     "psy_cli/psy_worker_cli",
+    "psy_cli/psy_cli_common",
     "psy_cli/psy_node_cli",
     "psy_cli/psy_dev_cli",
+    "psy_cli/psy_relayer_cli",
     "psy_jtmb_testing_core",
+
+    # ---- Client/Prover crates ----
+    "client_prover/psy_core/kvq",
+    "client_prover/psy_core/psy_common",
+    "client_prover/psy_core/psy_crypto",
+    "client_prover/psy_core/psy_data",
+    "client_prover/psy_core/psy_config",
+    "client_prover/psy_vm",
+    "client_prover/psy_compiler",
+    "client_prover/psy_prover",
+    "client_prover/psy_provider",
+    "client_prover/psy_circuit/psy_common_circuit",
+    "client_prover/psy_circuit/psy_network_circuit",
+    "client_prover/psy_circuit/psy_ups_circuit",
+    "client_prover/psy_circuit/psy_dpn_circuit",
+    "client_prover/psy_cli/psy_user_cli",
+    "client_prover/psy_ide/psy_wasm",
 ]
 resolver = "2"
 
@@ -44,67 +64,83 @@ version = "0.1.0"
 
 [workspace.dependencies]
 
+# ---- Macros & Proc-macros ----
 syn = { version = "2.0", features = ["full"] }
 proc-macro2 = { version = "1.0", features = ["span-locations"] }
 quote = "1.0"
 paste = "1.0.15"
 const_format = "0.2.35"
+
+# ---- Core utilities ----
+lazy_static = "1.5"
+once_cell = "1.19.0"
+colored = "2"
+shell-words = "1.1"
 crossbeam-skiplist = "0.1"
 rustyline-derive = "0.11.1"
-lazy_static = "1.5"
+rustyline = "=5.0.2"
+itertools = "0.14"
+bitflags = "2.5.0"
+cfg-if = "1.0"
+derivative = "2.2"
+derive_more = { version = "2", default-features = false, features = ["full"] }
 
-shell-words = "1.1"
-colored = "2"
+# ---- Serialization ----
 serde = { version = "1.0.193", features = ["derive"] }
 serde_json = "1.0"
 serde_with = { version = "3.4.0", features = ["hex", "macros"] }
 serde_repr = "0.1.19"
 serde_yaml = "0.9"
-dotenv = "0.15"
-rustyline = "=5.0.2"
-hex = "0.4.3"
-hex-literal = "0.4.1"
-anyhow = "1.0.75"
-async-trait = { version = "0.1.88" }
-chrono = "0.4.39"
-rand = "0.8.5"
-rand_core = "0.9"
-rand_pcg = "0.9"
-rand_chacha = "0.3"
-#bincode = { version = "=2.0.1", features = ["serde"] }
-bincode = { version = "=1.3.3" }
 serde_cbor = { version = "0.11.2" }
-auto_impl = "1"
-strum = "0.27"
-strum_macros = "0.27"
-scylla = "1.4.1"
-thiserror = "2.0"
-moka = { version = "0.12", features = ["future"] }
-tracing = "0.1.40"
-tracing-log = "0.2.0"
-tracing-subscriber = { version = "0.3.20", features = [
-    "std",
-    "env-filter",
-    "json",
-    "chrono",
-    "ansi"
-] }
-bytes = "1"
-bytemuck = { version = "1.24.0", features = ["derive", "min_const_generics", "extern_crate_alloc"] }
-sha2 = "0.10.8"
-sha3 = "0.10.8"
-num = { version = "0.4.0", default-features = false }
+bincode = { version = "=1.3.3" }
 postcard = { version = "1.1.3", default-features = true, features = ["alloc", "use-std"] }
 speedy = "0.8.7"
 rkyv = { version = "0.8.12" }
+bytemuck = { version = "1.24.0", features = ["derive", "min_const_generics", "extern_crate_alloc"] }
+bytes = "1"
+byteorder = "1.5"
 
-log = { version = "0.4.14", default-features = false }
-env_logger = { version = "0.11", default-features = false }
-hashbrown = "0.14.5"
-embedded-io = "0.7.0"
-embedded-io-async = "0.7.0"
+# ---- Env / Config ----
+dotenv = "0.15"
+dotenvy = "0.15.0"
+envy = "0.4"
+config = "0.15"
+toml = "0.8"
 
-ts-rs = "10.1.0"
+# ---- Error handling ----
+anyhow = "1.0.75"
+thiserror = "2.0"
+miette = { version = "7.2", features = ["fancy"] }
+color-eyre = "0.6"
+
+# ---- Async ----
+async-trait = { version = "0.1.88" }
+async-recursion = "1.0"
+maybe-async = { version = "0.2", default-features = false }
+tokio = { version = "1.47.0", default-features = false, features = ["macros", "rt", "sync", "time", "io-util"] }
+tokio-executor-trait = "2.1.3"
+tokio-reactor-trait = "2"
+tokio-util = "0.7"
+futures = "0.3.0"
+futures-util = "0.3.28"
+async-nats = "0.43.1"
+
+# ---- Networking / HTTP ----
+tower-http = { version = "0.6", features = ["full"] }
+tower = { version = "0.5", features = ["full"] }
+http = "1"
+http-body = "1"
+http-body-util = "0.1.0"
+hyper = { version = "1.5", features = ["full"] }
+hyper-rustls = { version = "0.27", default-features = false }
+hyper-util = { version = "0.1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "gzip"] }
+axum = "0.8.3"
+jsonrpsee = { version = "0.26", features = ["server", "client", "macros"] }
+
+# ---- Cryptography ----
+sha2 = "0.10.8"
+sha3 = "0.10.8"
 k256 = { version = "0.13.2", features = [
   "arithmetic",
   "ecdsa",
@@ -116,33 +152,74 @@ k256 = { version = "0.13.2", features = [
   "serde",
 ] }
 ecdsa = "0.16.0"
-flate2 = "1.0"
-clap = { version = "4.5.53", features = ["derive", "env"] }
+secp256k1 = { version = "0.31", features = ["rand", "hashes"] }
+sodalite = "0.4.0"
+ripemd = "0.1.3"
+blake2 = { version = "0.10", default-features = false }
+blake3 = { version = "1.5", default-features = false }
+tiny-keccak = { version = "2.0", features = ["sha3", "keccak"] }
+gnark-plonky2-verifier-ffi = { git = "ssh://git@github.com/QEDProtocol/gnark-plonky2-verifier.git", package = "gnark-plonky2-verifier-ffi", rev = "35fd12a8117e53939703df6d7b98567933e65159" }
+alloy-signer = { version = "=1.6.3", default-features = false }
+alloy-signer-local = { version = "=1.6.3", features = ["mnemonic", "keystore"] }
+alloy-primitives = { version = "1.3.1", features = [
+    "getrandom",
+    "rand",
+    "map-fxhash",
+    "map-foldhash",
+] }
+alloy-provider = { version = "=1.6.3" }
+alloy-rpc-client = { version = "=1.6.3" }
+alloy-rpc-types-eth = { version = "=1.6.3" }
+alloy-transport-http = { version = "=1.6.3" }
 
-tokio = { version = "1.43.0", features = ["full"] }
-tokio-executor-trait = "2.1.3"
-tokio-reactor-trait = "2"
+# ---- Random ----
+rand = "0.8.5"
+rand_core = "0.9"
+rand_pcg = "0.9"
+rand_chacha = "0.3"
+getrandom = { version = "0.3" }
 
-futures = "0.3.0"
-chalk = "0.1"
-rayon = "1.11.0"
-uuid = { version = "1.0", features = ["serde", "v4", "js"] }
-
+# ---- Numeric ----
+num = { version = "0.4.0", default-features = false }
 num-traits = "0.2"
+num-bigint = { version = "0.4" }
+num-integer = { version = "0.1", default-features = false }
+ruint = { version = "1.12", default-features = false, features = ["serde", "num-bigint"] }
 
-futures-util = "0.3.28"
-maybe-async = { version = "0.2", default-features = false }
+# ---- Collections / Data structures ----
+hashbrown = "0.14.5"
+dashmap = "6.1.0"
+indexmap = { version = "2.9", features = ["serde"] }
+smallvec = "1.15"
+lru = "0.12"
+quick_cache = "0.6"
+static_assertions = "1.1.0"
 
-async-nats = "0.43.1"
+# ---- Concurrency ----
+rayon = "1.11.0"
+parking_lot = "0.12.5"
 
-jsonrpsee = { version = "0.26", features = ["server", "client", "macros"] }
-config = "0.15"
-plonky2 = { git = "https://github.com/PsyProtocol/plonky2-hwa", rev = "1dfe6112c3eca3668c15820755371a8a3e75f934", features = ["ts-rs"]}
-plonky2_maybe_rayon = { git = "https://github.com/PsyProtocol/plonky2-hwa", rev = "1dfe6112c3eca3668c15820755371a8a3e75f934" }
-plonky2_field = { git = "https://github.com/PsyProtocol/plonky2-hwa", rev = "1dfe6112c3eca3668c15820755371a8a3e75f934", features = ["ts-rs"] }
-# plonky2 = { path = "../p2new/plonky2/plonky2", features = ["ts-rs"] }
-# plonky2_field = { path = "../p2new/plonky2/field", features = ["ts-rs"] }
-# plonky2_maybe_rayon = { path = "../p2new/plonky2/maybe_rayon" }
+# ---- Logging / Tracing ----
+log = { version = "0.4.14", default-features = false }
+env_logger = { version = "0.11", default-features = false }
+tracing = "0.1.40"
+tracing-log = "0.2.0"
+tracing-subscriber = { version = "0.3.20", features = [
+    "std",
+    "env-filter",
+    "json",
+    "chrono",
+    "ansi"
+] }
+tracing-appender = "0.2"
+
+# ---- CLI ----
+clap = { version = "4.5.53", features = ["derive", "env"] }
+clap_complete = "4.5"
+rpassword = "7.3"
+
+# ---- Database / Storage ----
+scylla = "1.4.1"
 redis = { version = "0.30.0", default-features = false, features = [
     "acl",
     "keep-alive",
@@ -153,29 +230,119 @@ redis = { version = "0.30.0", default-features = false, features = [
 ] }
 bb8-redis = "0.22.0"
 bb8 = "0.9"
+fred = "10.0.4"
 rsmq = { git = "https://github.com/PsyRepoForks/rsmq-async-rs", package = "rsmq_async", features = ["break-js-comp", "sync", "tokio"] }
-dashmap = "6.1.0"
-lru = "0.12"
-parking_lot = "0.12.5"
-itertools = "0.14"
+tikv-client = { git = "https://github.com/PsyProtocol/client-rust", rev = "3fe2b9d8482657a3442473084b365c9b9d9cf5eb" }
+lapin = "=2.5.0"
+r2d2 = "0.8.10"
+rabbitmq-stream-client = "0.8.0"
+
+# ---- Caching / Compression ----
+moka = { version = "0.12", features = ["future"] }
+flate2 = "1.0"
+zstd = "0.13"
 fastbloom-rs = { version = "0.5.10" }
 
-bitflags = "2.5.0"
+# ---- Encoding ----
+hex = "0.4.3"
+hex-literal = "0.4.1"
+base64 = "0.22"
+bs58 = { version = "0.5.1", features = ["std", "check"] }
 
-# start server stuff
+# ---- I/O ----
+embedded-io = "0.7.0"
+embedded-io-async = "0.7.0"
 
-tower-http = { version = "0.6", features = ["full"] }
-tower = { version = "0.5", features = ["full"] }
-http = "1"
-http-body = "1"
-http-body-util = "0.1.0"
-hyper = "1.5"
-hyper-rustls = { version = "0.27", default-features = false }
-hyper-util = "0.1"
+# ---- UUID / Time ----
+uuid = { version = "1.0", features = ["serde", "v4", "js"] }
+chrono = "0.4.39"
 
-# Workspace Packages
+# ---- Type generation ----
+ts-rs = "10.1.0"
+
+# ---- Proof / ZK ----
+plonky2 = { git = "https://github.com/PsyProtocol/plonky2-hwa", rev = "1dfe6112c3eca3668c15820755371a8a3e75f934", features = ["ts-rs"]}
+plonky2_maybe_rayon = { git = "https://github.com/PsyProtocol/plonky2-hwa", rev = "1dfe6112c3eca3668c15820755371a8a3e75f934" }
+plonky2_field = { git = "https://github.com/PsyProtocol/plonky2-hwa", rev = "1dfe6112c3eca3668c15820755371a8a3e75f934", features = ["ts-rs"] }
+gnark-plonky2-wrapper = { git = "ssh://git@github.com/QEDProtocol/gnark-plonky2-verifier.git", package = "gnark-plonky2-wrapper", rev = "35fd12a8117e53939703df6d7b98567933e65159" }
+
+# ---- WASM ----
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+console_error_panic_hook = "0.1"
+wasm-logger = "0.2"
+wasm-tracing = "2.0"
+web-sys = "0.3"
+js-sys = "0.3"
+serde-wasm-bindgen = "0.6"
+
+# ---- Compiler / Parser (client_prover) ----
+nom = "8.0"
+logos = "0.15"
+ariadne = { version = "0.5.0", features = ["auto-color"] }
+lalrpop-util = { version = "0.22", features = ["lexer", "unicode"] }
+lalrpop = "0.22"
+smol_str = { version = "=0.3.2", features = ["serde"] }
+thin-vec = "0.2"
+id-arena = "2.2"
+unescaper = "0.1"
+petgraph = "0.7"
+rangemap = "1.4"
+ena = "0.14"
+unicode-segmentation = "1.12"
+either = "1"
+minijinja = { version = "2.0", features = ["serde"] }
+unroll = "0.1.5"
+
+# ---- LLVM / MLIR (client_prover) ----
+llvm-sys = "191.0"
+melior = { version = "0.21", features = ["ods-dialects"] }
+mlir-sys = { version = "0.4" }
+
+# ---- LSP (client_prover IDE) ----
+tower-lsp = "0.20"
+lsp-server = "0.7"
+lsp-types = "0.97"
+
+# ---- Auth / Security ----
+jsonwebtoken = "9.3.1"
+headers = { version = "0.4" }
+
+# ---- Misc ----
+auto_impl = "1"
+ambassador = "0.4"
+strum = { version = "0.27", features = ["derive"] }
+strum_macros = "0.27"
+enum-as-inner = "0.6"
+twox-hash = "1.6.3"
+bitcoin = { version = "0.31.1", features = ["serde", "rand"] }
+homedir = "0.3"
+chalk = "0.1"
+regex = "1.11"
+url = "2.5"
+dirs = "6.0"
+semver = "1.0"
+md5 = "0.7"
+walkdir = "2.5"
+home = { version = "0.5" }
+cc = "1.2"
+bindgen = "0.71"
+shadow-rs = "0.27.1"
+repl-rs = "0.2.8"
+
+# ---- AWS ----
+aws-config = "1.0"
+aws-sdk-s3 = "1.0"
+
+# ---- Test / Benchmark ----
+criterion = { version = "0.5.1", features = ["async_tokio", "async_futures"] }
+serial_test = "3.2"
+tempfile = "3.19"
+insta = { version = "1.40", features = ["glob"] }
+pprof = "0.14"
+
+# ---- Node workspace packages ----
 cf_utils = { path = "./cf_utils" }
-
 pser = { path = "./pser" }
 pderive = { path = "./pderive" }
 psy_io = { path = "./psy_io" }
@@ -188,8 +355,6 @@ psy_plonky2_circuits = { path = "./psy_plonky2_circuits" }
 parth_core = { path = "./parth_core" }
 parth_common = { path = "./parth_common" }
 parth_crypto = { path = "./parth_crypto" }
-
-
 
 psy_core = { path = "./psy_core" }
 psy_data = { path = "./psy_data" }
@@ -207,9 +372,19 @@ psy_node_scylla = { path = "./psy_node_scylla" }
 psy_node_store_memory = { path = "./psy_node_store_memory" }
 psy_jtmb_testing_core = { path = "./psy_jtmb_testing_core" }
 
-# Dev dependencies
-criterion = { version = "0.5.1", features = ["async_tokio", "async_futures"] }
+# ---- Client/Prover workspace packages ----
+psy_client_data = { path = "./client_prover/psy_core/psy_data", default-features = false }
+psy_client_common = { path = "./client_prover/psy_core/psy_common" }
+psy_crypto = { path = "./client_prover/psy_core/psy_crypto" }
+psy_config = { path = "./client_prover/psy_core/psy_config" }
+kvq = { path = "./client_prover/psy_core/kvq" }
+psy_vm = { path = "./client_prover/psy_vm", default-features = false }
+psy_compiler = { path = "./client_prover/psy_compiler" }
+psy_prover = { path = "./client_prover/psy_prover", default-features = false }
+psy_provider = { path = "./client_prover/psy_provider" }
+psy_common_circuit = { path = "./client_prover/psy_circuit/psy_common_circuit", default-features = false }
+psy_network_circuit = { path = "./client_prover/psy_circuit/psy_network_circuit", default-features = false }
+psy_ups_circuit = { path = "./client_prover/psy_circuit/psy_ups_circuit", default-features = false }
+psy_dpn_circuit = { path = "./client_prover/psy_circuit/psy_dpn_circuit", default-features = false }
 
 [profile.release]
-debug = true
-

@@ -14,7 +14,11 @@ use parth_core::{
                 QDatabaseSingleIdTableRowLike, QDatabaseSingleIdTableRowNoCheckpointId, QDatabaseSingleIdTableRowNoCheckpointIdLike, QDoubleIdKey,
             },
         },
-        hash::{checkpointed_merkle_node::CheckpointedMerkleHash, merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}, merkle_store_key::QMerkleStoreDoubleIdKeyWithHeight},
+        hash::{
+            checkpointed_merkle_node::CheckpointedMerkleHash,
+            merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey},
+            merkle_store_key::QMerkleStoreDoubleIdKeyWithHeight,
+        },
         serializable::QPDPair,
     },
     protocol::core_types::QHashBase,
@@ -798,6 +802,135 @@ impl<
 {
 }
 
+// IMT Leaf table - stores leaf preimages by (tree_id, tree_sub_id, leaf_index, checkpoint_id)
+#[async_trait]
+#[auto_impl(&, Arc)]
+pub trait CoreDatabaseIMTLeafReader<TableIdentifier: Clone + Send + Sync> {
+    /// Select the latest IMT leaf preimage at or before the given checkpoint.
+    /// Returns (leaf_hash, leaf_key, leaf_value, next_key, next_index)
+    async fn db_select_imt_leaf(
+        &self,
+        table: &TableIdentifier,
+        tree_id: i64,
+        tree_sub_id: i64,
+        leaf_index: i64,
+        max_checkpoint_id: i64,
+    ) -> anyhow::Result<Option<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, i64)>>;
+}
+
+#[async_trait]
+#[auto_impl(&, Arc)]
+pub trait CoreDatabaseIMTLeafWriter<TableIdentifier: Clone + Send + Sync> {
+    /// Insert an IMT leaf preimage.
+    async fn db_insert_imt_leaf(
+        &self,
+        table: &TableIdentifier,
+        tree_id: i64,
+        tree_sub_id: i64,
+        leaf_index: i64,
+        checkpoint_id: i64,
+        leaf_hash: &[u8],
+        leaf_key: &[u8],
+        leaf_value: &[u8],
+        next_key: &[u8],
+        next_index: i64,
+    ) -> anyhow::Result<()>;
+}
+
+pub trait CoreDatabaseIMTLeafStore<TableIdentifier: Clone + Send + Sync>:
+    CoreDatabaseIMTLeafReader<TableIdentifier> + CoreDatabaseIMTLeafWriter<TableIdentifier>
+{
+}
+impl<TableIdentifier: Clone + Send + Sync, T: CoreDatabaseIMTLeafReader<TableIdentifier> + CoreDatabaseIMTLeafWriter<TableIdentifier>>
+    CoreDatabaseIMTLeafStore<TableIdentifier> for T
+{
+}
+
+// IMT Key Index table - maps leaf_key to leaf_index
+#[async_trait]
+#[auto_impl(&, Arc)]
+pub trait CoreDatabaseIMTKeyIndexReader<TableIdentifier: Clone + Send + Sync> {
+    /// Exact key lookup: find the leaf index for a specific key.
+    async fn db_select_imt_key_index_exact(
+        &self,
+        table: &TableIdentifier,
+        tree_id: i64,
+        tree_sub_id: i64,
+        key_bucket: i16,
+        encoded_key: &[u8],
+    ) -> anyhow::Result<Option<(i64, i64)>>; // (leaf_index, birth_checkpoint)
+
+    /// Find predecessor: largest key < target_key in the same bucket.
+    async fn db_select_imt_key_index_predecessor(
+        &self,
+        table: &TableIdentifier,
+        tree_id: i64,
+        tree_sub_id: i64,
+        key_bucket: i16,
+        target_encoded_key: &[u8],
+    ) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>, i64, i64)>>; // (encoded_key, leaf_key, leaf_index, birth_checkpoint)
+
+    /// Find predecessor across bucket boundary: get largest key in a previous bucket.
+    async fn db_select_imt_key_index_predecessor_full_bucket(
+        &self,
+        table: &TableIdentifier,
+        tree_id: i64,
+        tree_sub_id: i64,
+        key_bucket: i16,
+    ) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>, i64, i64)>>; // (encoded_key, leaf_key, leaf_index, birth_checkpoint)
+}
+
+#[async_trait]
+#[auto_impl(&, Arc)]
+pub trait CoreDatabaseIMTKeyIndexWriter<TableIdentifier: Clone + Send + Sync> {
+    /// Insert a key-to-leaf mapping.
+    async fn db_insert_imt_key_index(
+        &self,
+        table: &TableIdentifier,
+        tree_id: i64,
+        tree_sub_id: i64,
+        key_bucket: i16,
+        encoded_key: &[u8],
+        leaf_key: &[u8],
+        birth_checkpoint: i64,
+        leaf_index: i64,
+    ) -> anyhow::Result<()>;
+}
+
+pub trait CoreDatabaseIMTKeyIndexStore<TableIdentifier: Clone + Send + Sync>:
+    CoreDatabaseIMTKeyIndexReader<TableIdentifier> + CoreDatabaseIMTKeyIndexWriter<TableIdentifier>
+{
+}
+impl<TableIdentifier: Clone + Send + Sync, T: CoreDatabaseIMTKeyIndexReader<TableIdentifier> + CoreDatabaseIMTKeyIndexWriter<TableIdentifier>>
+    CoreDatabaseIMTKeyIndexStore<TableIdentifier> for T
+{
+}
+
+#[async_trait]
+#[auto_impl(&, Arc)]
+pub trait CoreDatabaseIMTNextAppendIndexReader<TableIdentifier: Clone + Send + Sync> {
+    /// Get the next append index for a contract's IMT.
+    async fn db_select_imt_next_append_index(
+        &self,
+        table: &TableIdentifier,
+        tree_id: i64,
+        tree_sub_id: i64,
+    ) -> anyhow::Result<Option<i64>>;
+}
+
+#[async_trait]
+#[auto_impl(&, Arc)]
+pub trait CoreDatabaseIMTNextAppendIndexWriter<TableIdentifier: Clone + Send + Sync> {
+    /// Insert or update the next append index for a contract's IMT.
+    async fn db_insert_imt_next_append_index(
+        &self,
+        table: &TableIdentifier,
+        tree_id: i64,
+        tree_sub_id: i64,
+        next_append_index: i64,
+    ) -> anyhow::Result<()>;
+}
+
 // full implementations
 
 pub trait CoreDatabaseReader<
@@ -815,6 +948,9 @@ pub trait CoreDatabaseReader<
     ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
     TagTreeMerkleTableIdentifier: Clone + Send + Sync,
     HashToManyIdsTableIdentifier: Clone + Send + Sync,
+    IMTLeafTableIdentifier: Clone + Send + Sync,
+    IMTKeyIndexTableIdentifier: Clone + Send + Sync,
+    IMTNextAppendIndexTableIdentifier: Clone + Send + Sync,
 >:
     CoreDatabaseBidirectionalMappingReader<BiDirectionalMappingTableIdentifier>
     + CoreDatabaseBidirectionalU64U128MappingReader<BiDirectionalU64U128MappingTableIdentifier>
@@ -828,6 +964,9 @@ pub trait CoreDatabaseReader<
     + CoreDatabaseZeroIdMerkleReader<Hash, Hasher, ZeroIdMerkleTableIdentifier>
     + CoreDatabaseTagTreeReader<Hash, Hasher, TagTreeMerkleTableIdentifier>
     + CoreDatabaseHashToManyIdsReader<Hash, HashToManyIdsTableIdentifier>
+    + CoreDatabaseIMTLeafReader<IMTLeafTableIdentifier>
+    + CoreDatabaseIMTKeyIndexReader<IMTKeyIndexTableIdentifier>
+    + CoreDatabaseIMTNextAppendIndexReader<IMTNextAppendIndexTableIdentifier>
 {
 }
 impl<
@@ -845,6 +984,9 @@ impl<
         ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
         TagTreeMerkleTableIdentifier: Clone + Send + Sync,
         HashToManyIdsTableIdentifier: Clone + Send + Sync,
+        IMTLeafTableIdentifier: Clone + Send + Sync,
+        IMTKeyIndexTableIdentifier: Clone + Send + Sync,
+        IMTNextAppendIndexTableIdentifier: Clone + Send + Sync,
         T: CoreDatabaseBidirectionalMappingReader<BiDirectionalMappingTableIdentifier>
             + CoreDatabaseBidirectionalU64U128MappingReader<BiDirectionalU64U128MappingTableIdentifier>
             + CoreDatabaseU64Reader<U64TableIdentifier>
@@ -856,6 +998,9 @@ impl<
             + CoreDatabaseDoubleIdMerkleReader<Hash, Hasher, DoubleIdMerkleTableIdentifier>
             + CoreDatabaseZeroIdMerkleReader<Hash, Hasher, ZeroIdMerkleTableIdentifier>
             + CoreDatabaseTagTreeReader<Hash, Hasher, TagTreeMerkleTableIdentifier>
+            + CoreDatabaseIMTLeafReader<IMTLeafTableIdentifier>
+            + CoreDatabaseIMTKeyIndexReader<IMTKeyIndexTableIdentifier>
+            + CoreDatabaseIMTNextAppendIndexReader<IMTNextAppendIndexTableIdentifier>
             + CoreDatabaseHashToManyIdsReader<Hash, HashToManyIdsTableIdentifier>,
     >
     CoreDatabaseReader<
@@ -873,6 +1018,9 @@ impl<
         ZeroIdMerkleTableIdentifier,
         TagTreeMerkleTableIdentifier,
         HashToManyIdsTableIdentifier,
+        IMTLeafTableIdentifier,
+        IMTKeyIndexTableIdentifier,
+        IMTNextAppendIndexTableIdentifier,
     > for T
 {
 }
@@ -892,6 +1040,9 @@ pub trait CoreDatabaseWriter<
     ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
     TagTreeMerkleTableIdentifier: Clone + Send + Sync,
     HashToManyIdsTableIdentifier: Clone + Send + Sync,
+    IMTLeafTableIdentifier: Clone + Send + Sync,
+    IMTKeyIndexTableIdentifier: Clone + Send + Sync,
+    IMTNextAppendIndexTableIdentifier: Clone + Send + Sync,
 >:
     CoreDatabaseBidirectionalMappingWriter<BiDirectionalMappingTableIdentifier>
     + CoreDatabaseBidirectionalU64U128MappingWriter<BiDirectionalU64U128MappingTableIdentifier>
@@ -905,6 +1056,9 @@ pub trait CoreDatabaseWriter<
     + CoreDatabaseZeroIdMerkleWriter<Hash, Hasher, ZeroIdMerkleTableIdentifier>
     + CoreDatabaseTagTreeWriter<Hash, Hasher, TagTreeMerkleTableIdentifier>
     + CoreDatabaseHashToManyIdsWriter<Hash, HashToManyIdsTableIdentifier>
+    + CoreDatabaseIMTLeafWriter<IMTLeafTableIdentifier>
+    + CoreDatabaseIMTKeyIndexWriter<IMTKeyIndexTableIdentifier>
+    + CoreDatabaseIMTNextAppendIndexWriter<IMTNextAppendIndexTableIdentifier>
 {
 }
 impl<
@@ -922,6 +1076,9 @@ impl<
         ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
         TagTreeMerkleTableIdentifier: Clone + Send + Sync,
         HashToManyIdsTableIdentifier: Clone + Send + Sync,
+        IMTLeafTableIdentifier: Clone + Send + Sync,
+        IMTKeyIndexTableIdentifier: Clone + Send + Sync,
+        IMTNextAppendIndexTableIdentifier: Clone + Send + Sync,
         T: CoreDatabaseBidirectionalMappingWriter<BiDirectionalMappingTableIdentifier>
             + CoreDatabaseBidirectionalU64U128MappingWriter<BiDirectionalU64U128MappingTableIdentifier>
             + CoreDatabaseU64Writer<U64TableIdentifier>
@@ -934,6 +1091,9 @@ impl<
             + CoreDatabaseZeroIdMerkleWriter<Hash, Hasher, ZeroIdMerkleTableIdentifier>
             + CoreDatabaseTagTreeWriter<Hash, Hasher, TagTreeMerkleTableIdentifier>
             + CoreDatabaseHashToManyIdsWriter<Hash, HashToManyIdsTableIdentifier>
+            + CoreDatabaseIMTLeafWriter<IMTLeafTableIdentifier>
+            + CoreDatabaseIMTKeyIndexWriter<IMTKeyIndexTableIdentifier>
+            + CoreDatabaseIMTNextAppendIndexWriter<IMTNextAppendIndexTableIdentifier>,
     >
     CoreDatabaseWriter<
         Hash,
@@ -950,6 +1110,9 @@ impl<
         ZeroIdMerkleTableIdentifier,
         TagTreeMerkleTableIdentifier,
         HashToManyIdsTableIdentifier,
+        IMTLeafTableIdentifier,
+        IMTKeyIndexTableIdentifier,
+        IMTNextAppendIndexTableIdentifier,
     > for T
 {
 }
@@ -967,6 +1130,9 @@ pub trait CoreDatabaseTableConfig: Copy + Send + Sync + Clone + Sized {
     type ZeroIdMerkleTableIdentifier: Clone + Send + Sync;
     type TagTreeMerkleTableIdentifier: Clone + Send + Sync;
     type HashToManyIdsTableIdentifier: Clone + Send + Sync;
+    type IMTLeafTableIdentifier: Clone + Send + Sync;
+    type IMTKeyIndexTableIdentifier: Clone + Send + Sync;
+    type IMTNextAppendIndexTableIdentifier: Clone + Send + Sync;
 }
 pub trait CoreDatabaseStoreComboImpl<
     Hash: QHashBase + Send + Sync,
@@ -988,6 +1154,9 @@ pub trait CoreDatabaseStoreComboImpl<
         T::ZeroIdMerkleTableIdentifier,
         T::TagTreeMerkleTableIdentifier,
         T::HashToManyIdsTableIdentifier,
+        T::IMTLeafTableIdentifier,
+        T::IMTKeyIndexTableIdentifier,
+        T::IMTNextAppendIndexTableIdentifier,
     >
 {
 }
@@ -1024,6 +1193,9 @@ pub trait CoreDatabaseStore<
     ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
     TagTreeMerkleTableIdentifier: Clone + Send + Sync,
     HashToManyIdsTableIdentifier: Clone + Send + Sync,
+    IMTLeafTableIdentifier: Clone + Send + Sync,
+    IMTKeyIndexTableIdentifier: Clone + Send + Sync,
+    IMTNextAppendIndexTableIdentifier: Clone + Send + Sync,
 >:
     CoreDatabaseReader<
         Hash,
@@ -1040,6 +1212,9 @@ pub trait CoreDatabaseStore<
         ZeroIdMerkleTableIdentifier,
         TagTreeMerkleTableIdentifier,
         HashToManyIdsTableIdentifier,
+        IMTLeafTableIdentifier,
+        IMTKeyIndexTableIdentifier,
+        IMTNextAppendIndexTableIdentifier,
     > + CoreDatabaseWriter<
         Hash,
         Hasher,
@@ -1055,6 +1230,9 @@ pub trait CoreDatabaseStore<
         ZeroIdMerkleTableIdentifier,
         TagTreeMerkleTableIdentifier,
         HashToManyIdsTableIdentifier,
+        IMTLeafTableIdentifier,
+        IMTKeyIndexTableIdentifier,
+        IMTNextAppendIndexTableIdentifier,
     >
 {
 }
@@ -1073,6 +1251,9 @@ impl<
         ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
         TagTreeMerkleTableIdentifier: Clone + Send + Sync,
         HashToManyIdsTableIdentifier: Clone + Send + Sync,
+        IMTLeafTableIdentifier: Clone + Send + Sync,
+        IMTKeyIndexTableIdentifier: Clone + Send + Sync,
+        IMTNextAppendIndexTableIdentifier: Clone + Send + Sync,
         T: CoreDatabaseReader<
                 Hash,
                 Hasher,
@@ -1088,6 +1269,9 @@ impl<
                 ZeroIdMerkleTableIdentifier,
                 TagTreeMerkleTableIdentifier,
                 HashToManyIdsTableIdentifier,
+                IMTLeafTableIdentifier,
+                IMTKeyIndexTableIdentifier,
+                IMTNextAppendIndexTableIdentifier,
             > + CoreDatabaseWriter<
                 Hash,
                 Hasher,
@@ -1103,6 +1287,9 @@ impl<
                 ZeroIdMerkleTableIdentifier,
                 TagTreeMerkleTableIdentifier,
                 HashToManyIdsTableIdentifier,
+                IMTLeafTableIdentifier,
+                IMTKeyIndexTableIdentifier,
+                IMTNextAppendIndexTableIdentifier,
             >,
     >
     CoreDatabaseStore<
@@ -1120,6 +1307,9 @@ impl<
         ZeroIdMerkleTableIdentifier,
         TagTreeMerkleTableIdentifier,
         HashToManyIdsTableIdentifier,
+        IMTLeafTableIdentifier,
+        IMTKeyIndexTableIdentifier,
+        IMTNextAppendIndexTableIdentifier,
     > for T
 {
 }

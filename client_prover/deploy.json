@@ -1,0 +1,392 @@
+{
+  "coordinator": {
+    "id": 0,
+    "redis": {
+      "uri": "redis://127.0.0.1:6379",
+      "pool_size": 10,
+      "aws": {
+        "deployment_type": "ec2",
+        "cpu": 2048,
+        "memory": 8192,
+        "volume_size": 200,
+        "ec2": {
+          "min_instances": 1,
+          "max_instances": 1,
+          "desired_instances": 1
+        }
+      }
+    },
+    "backend": {
+      "type": "lmdbx",
+      "lmdbx": {
+        "path": "./db/coordinator",
+        "mmap_size_gb": 100,
+        "aws": {
+          "volume_size": 200
+        }
+      },
+      "scylla": {
+        "endpoints": ["127.0.0.1:9042"],
+        "replication_factor": 3,
+        "consistency_level": "LOCAL_QUORUM",
+        "aws": {
+          "cpu": 2048,
+          "memory": 8192,
+          "deployment_type": "ec2",
+          "ec2": {
+            "min_instances": 1,
+            "max_instances": 1,
+            "desired_instances": 1
+          },
+          "data_volume_size": 500,
+          "commitlog_volume_size": 100
+        }
+      },
+      "tikv": {
+        "pd_endpoints": ["127.0.0.1:2379", "127.0.0.1:2381", "127.0.0.1:2383"],
+        "namespace": "psy",
+        "aws": {
+          "cpu": 4096,
+          "memory": 16384,
+          "deployment_type": "ec2",
+          "ec2": {
+            "min_instances": 3,
+            "max_instances": 6,
+            "desired_instances": 3
+          },
+          "data_volume_size": 500,
+          "pd_count": 3,
+          "tikv_count": 3
+        }
+      }
+    },
+    "processor": {
+      "enabled": true,
+      "args": {},
+      "env": {
+        "RUST_LOG": "psy_user_cli=debug,psy_dev_cli=debug,psy_node_cli=debug,psy_node=debug,psy_common_circuit=debug,psy_network_circuit=debug,psy_prover=debug,psy_data=debug,plonky2=error"
+      },
+      "aws": {
+        "cpu": 4096,
+        "memory": 8192,
+        "deployment_type": "ec2",
+        "ec2": {
+          "min_instances": 1,
+          "max_instances": 1,
+          "desired_instances": 1
+        }
+      }
+    },
+    "edge": {
+      "enabled": true,
+      "instances": 2,
+      "args": {
+        "listen_addr": "0.0.0.0:8545"
+      },
+      "env": {
+        "RUST_LOG": "psy_user_cli=debug,psy_dev_cli=debug,psy_node_cli=debug,psy_node=debug,psy_common_circuit=debug,psy_network_circuit=debug,psy_prover=debug,psy_data=debug,plonky2=error"
+      },
+      "aws": {
+        "cpu": 4096,
+        "memory": 8192,
+        "deployment_type": "ecs",
+        "ecs": {
+          "instances": 2,
+          "task_count": 2
+        },
+        "load_balancer": {
+          "port": 8545,
+          "health_check_path": "/health"
+        }
+      }
+    },
+    "worker": {
+      "enabled": true,
+      "args": {},
+      "env": {
+        "RUST_LOG": "psy_user_cli=debug,psy_dev_cli=debug,psy_node_cli=debug,psy_node=debug,psy_common_circuit=debug,psy_network_circuit=debug,psy_prover=debug,psy_data=debug,plonky2=error"
+      },
+      "aws": {
+        "cpu": 8192,
+        "memory": 16384,
+        "deployment_type": "ecs",
+        "ecs": {
+          "task_count": 2
+        }
+      }
+    }
+  },
+  "realms": [
+    {
+      "id": 0,
+      "redis": {
+        "uri": "redis://127.0.0.1:6380",
+        "pool_size": 10,
+        "aws": {
+          "deployment_type": "ec2",
+          "cpu": 2048,
+          "memory": 8192,
+          "volume_size": 200,
+          "ec2": {
+            "min_instances": 1,
+            "max_instances": 1,
+            "desired_instances": 1
+          }
+        }
+      },
+      "backend": {
+        "type": "lmdbx",
+        "lmdbx": {
+          "path": "./db/realm0",
+          "mmap_size_gb": 100,
+          "aws": {
+            "volume_size": 200
+          }
+        },
+        "scylla": {
+          "endpoints": ["127.0.0.1:9042"],
+          "replication_factor": 3,
+          "consistency_level": "LOCAL_QUORUM",
+          "aws": {
+            "cpu": 2048,
+            "memory": 8192,
+            "deployment_type": "ec2",
+            "ec2": {
+              "min_instances": 3,
+              "max_instances": 3,
+              "desired_instances": 3
+            },
+            "data_volume_size": 500,
+            "commitlog_volume_size": 100
+          }
+        },
+        "tikv": {
+          "pd_endpoints": ["127.0.0.1:2379", "127.0.0.1:2381", "127.0.0.1:2383"],
+          "namespace": "psy_realm_0",
+          "aws": {
+            "deployment_type": "ec2",
+            "cpu": 2048,
+            "memory": 8192,
+            "volume_size": 200,
+            "ec2": {
+              "min_instances": 1,
+              "max_instances": 1,
+              "desired_instances": 1
+            }
+          }
+        }
+      },
+      "processor": {
+        "enabled": true,
+        "args": {
+          "queue_biz_key": "rwq0"
+        },
+        "env": {
+          "RUST_LOG": "psy_user_cli=debug,psy_dev_cli=debug,psy_node_cli=debug,psy_node=debug,psy_common_circuit=debug,psy_network_circuit=debug,psy_prover=debug,psy_data=debug,plonky2=error"
+        },
+        "aws": {
+          "cpu": 4096,
+          "memory": 8192,
+          "deployment_type": "ec2",
+          "ec2": {
+            "min_instances": 1,
+            "max_instances": 3,
+            "desired_instances": 1
+          }
+        }
+      },
+      "edge": {
+        "enabled": true,
+        "instances": 2,
+        "args": {
+          "listen_addr": "0.0.0.0:8546",
+          "coordinator_addr": "http://coordinator-edge:8545",
+          "queue_biz_key": "rwq0"
+        },
+        "env": {
+          "RUST_LOG": "psy_user_cli=debug,psy_dev_cli=debug,psy_node_cli=debug,psy_node=debug,psy_common_circuit=debug,psy_network_circuit=debug,psy_prover=debug,psy_data=debug,plonky2=error"
+        },
+        "aws": {
+          "cpu": 4096,
+          "memory": 8192,
+          "deployment_type": "ecs",
+          "ecs": {
+            "task_count": 2
+          },
+          "load_balancer": {
+            "port": 8546,
+            "health_check_path": "/health"
+          }
+        }
+      },
+      "worker": {
+        "enabled": true,
+        "instances": 2,
+        "args": {
+          "queue_biz_key": "rwq0"
+        },
+        "env": {
+          "RUST_LOG": "psy_user_cli=debug,psy_dev_cli=debug,psy_node_cli=debug,psy_node=debug,psy_common_circuit=debug,psy_network_circuit=debug,psy_prover=debug,psy_data=debug,plonky2=error"
+        },
+        "aws": {
+          "cpu": 8192,
+          "memory": 16384,
+          "deployment_type": "ecs",
+          "ecs": {
+            "task_count": 2
+          }
+        }
+      }
+    },
+    {
+      "id": 1,
+      "redis": {
+        "uri": "redis://127.0.0.1:6381",
+        "pool_size": 10,
+        "aws": {
+          "cpu": 2048,
+          "memory": 8192,
+          "deployment_type": "ec2",
+          "ec2": {
+            "min_instances": 1,
+            "max_instances": 1,
+            "desired_instances": 1
+          }
+        }
+      },
+      "backend": {
+        "type": "lmdbx",
+        "lmdbx": {
+          "path": "./db/realm1",
+          "mmap_size_gb": 100,
+          "aws": {
+            "volume_size": 200
+          }
+        },
+        "scylla": {
+          "endpoints": ["127.0.0.1:9042"],
+          "replication_factor": 3,
+          "consistency_level": "LOCAL_QUORUM",
+          "aws": {
+            "cpu": 2048,
+            "memory": 8192,
+            "deployment_type": "ec2",
+            "ec2": {
+              "min_instances": 3,
+              "max_instances": 3,
+              "desired_instances": 3
+            },
+            "data_volume_size": 500,
+            "commitlog_volume_size": 100
+          }
+        }
+      },
+      "processor": {
+        "enabled": true,
+        "args": {
+          "queue_biz_key": "rwq1"
+        },
+        "env": {
+          "RUST_LOG": "psy_user_cli=debug,psy_dev_cli=debug,psy_node_cli=debug,psy_node=debug,psy_common_circuit=debug,psy_network_circuit=debug,psy_prover=debug,psy_data=debug,plonky2=error"
+        },
+        "aws": {
+          "cpu": 4096,
+          "memory": 8192,
+          "deployment_type": "ec2",
+          "ec2": {
+            "min_instances": 1,
+            "max_instances": 3,
+            "desired_instances": 1
+          }
+        }
+      },
+      "edge": {
+        "enabled": true,
+        "instances": 2,
+        "args": {
+          "listen_addr": "0.0.0.0:8547",
+          "coordinator_addr": "http://coordinator-edge:8545",
+          "queue_biz_key": "rwq1"
+        },
+        "env": {
+          "RUST_LOG": "psy_user_cli=debug,psy_dev_cli=debug,psy_node_cli=debug,psy_node=debug,psy_common_circuit=debug,psy_network_circuit=debug,psy_prover=debug,psy_data=debug,plonky2=error"
+        },
+        "aws": {
+          "cpu": 4096,
+          "memory": 8192,
+          "deployment_type": "ecs",
+          "ecs": {
+            "task_count": 2
+          },
+          "load_balancer": {
+            "port": 8547,
+            "health_check_path": "/health"
+          }
+        }
+      },
+      "worker": {
+        "enabled": true,
+        "instances": 2,
+        "args": {
+          "queue_biz_key": "rwq1"
+        },
+        "env": {
+          "RUST_LOG": "psy_user_cli=debug,psy_dev_cli=debug,psy_node_cli=debug,psy_node=debug,psy_common_circuit=debug,psy_network_circuit=debug,psy_prover=debug,psy_data=debug,plonky2=error"
+        },
+        "aws": {
+          "cpu": 8192,
+          "memory": 16384,
+          "deployment_type": "ecs",
+          "ecs": {
+            "task_count": 2
+          }
+        }
+      }
+    }
+  ],
+  "prover": {
+    "enabled": true,
+    "args": {
+      "listen_addr": "0.0.0.0:8888"
+    },
+    "env": {
+      "RUST_LOG": "psy_user_cli=debug,psy_dev_cli=debug,psy_node_cli=debug,psy_node=debug,psy_common_circuit=debug,psy_network_circuit=debug,psy_prover=debug,psy_data=debug,plonky2=error"
+    },
+    "aws": {
+      "cpu": 8192,
+      "memory": 16384,
+      "deployment_type": "ecs",
+      "ecs": {
+        "task_count": 2
+      },
+      "load_balancer": {
+        "port": 8888,
+        "health_check_path": "/health"
+      }
+    }
+  },
+  "deployment": {
+    "aws": {
+      "region": "ap-northeast-1",
+      "project_name": "psy-protocol",
+      "vpc": {
+        "cidr": "10.0.0.0/16",
+        "availability_zones": 2
+      },
+      "ecs": {
+        "cluster_name": "psy-cluster",
+        "log_group": "/ecs/psy-protocol"
+      },
+      "ecr": {
+        "repository_name": "psy-protocol"
+      },
+      "s3": {
+        "bucket_prefix": "psy-protocol"
+      }
+    },
+    "docker": {
+      "network_name": "psy-network",
+      "network_subnet": "172.28.0.0/16"
+    }
+  }
+}

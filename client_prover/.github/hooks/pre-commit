@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+
+set -e
+
+files=$((git diff --cached --name-only --diff-filter=ACMR | grep -Ei "\.rs$") || true)
+
+if [ ! -z "${files}" ]; then
+  make fmt
+  git add $(echo "$files" | paste -s -d " " -)
+fi

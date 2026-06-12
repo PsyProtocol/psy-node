@@ -11,6 +11,7 @@ pub struct CoordinatorProcessorLastCommittedState<F, Hash> {
     pub checkpoint_state_transition: CheckpointStateHashTransition<Hash>,
     pub checkpoint_root: Hash,
     pub checkpoint_leaf_hash: Hash,
+    pub last_chain_hash: Hash,
 }
 
 
@@ -49,6 +50,7 @@ impl<F: QFelt64, Hash: QFHashBase<F>> CoordinatorProcessorLastCommittedState<F, 
         l2_state: QEDL2BlockState,
         populated_leaf: PsyCheckpointLeafPopulated<F, Hash>,
         checkpoint_state_transition: CheckpointStateHashTransition<Hash>,
+        last_chain_hash: Hash,
     ) -> anyhow::Result<Self> {
         let expected_leaf_hash = populated_leaf.qfhash::<Hasher>();
         if expected_leaf_hash != checkpoint_state_transition.new_checkpoint_leaf_hash {
@@ -66,6 +68,7 @@ impl<F: QFelt64, Hash: QFHashBase<F>> CoordinatorProcessorLastCommittedState<F, 
             checkpoint_state_transition,
             checkpoint_root: checkpoint_state_transition.new_checkpoint_tree_root,
             checkpoint_leaf_hash: expected_leaf_hash,
+            last_chain_hash,
         })
     }
 }
@@ -96,4 +99,3 @@ pub struct CoordinatorProcessorIdState {
     pub gathering_unique_pending_id: u64,
     pub gathering_proc_checkpoint_unique_id: QCoreProcCheckpointUniqueId,
 }
-

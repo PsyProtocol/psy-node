@@ -79,6 +79,7 @@ impl<
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             tracing::info!("Fetcher role started - ensuring job queue stays full");
+            println!("[worker/fetcher] started");
 
             loop {
                 match job_tx.reserve().await {
@@ -87,8 +88,11 @@ impl<
                             Ok(Some(job)) => {
                                 permit.send(job);
                                 tracing::debug!("Fetcher: Added job to queue");
+                                println!("[worker/fetcher] fetched job");
                             }
                             Ok(None) => {
+                                tracing::debug!("Fetcher: no proving work available (Ok(None))");
+                                println!("[worker/fetcher] no work");
                                 drop(permit);
                                 tokio::time::sleep(tokio::time::Duration::from_millis(poll_interval_ms)).await;
                             }
@@ -96,6 +100,7 @@ impl<
                                 let error = format!("Error fetching job: {:?}", e);
                                 if !error.contains("no proving work available") {
                                     tracing::error!("Fetcher: {}", error);
+                                    println!("[worker/fetcher] error: {}", error);
                                 }
                                 drop(permit);
                                 tokio::time::sleep(tokio::time::Duration::from_millis(poll_interval_ms)).await;
@@ -120,12 +125,14 @@ impl<
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             tracing::info!("Worker role started - processing jobs from fetch queue");
+            println!("[worker/prover] started");
 
             let semaphore = Arc::new(Semaphore::new(batch_size));
 
             while let Some((api_url_hash, tag, job_response)) = job_rx.recv().await {
                 let job_id = job_response.base.job.job_id;
                 tracing::info!("Worker: Picked up job {:?}", job_id);
+                println!("[worker/prover] picked job: {:?}", job_id);
 
                 let permit = semaphore.clone().acquire_owned().await.unwrap();
 
@@ -136,6 +143,7 @@ impl<
                 tokio::spawn(async move {
                     let _permit = permit;
                     tracing::info!("Worker: Starting proof generation for job {:?}", job_id);
+                    println!("[worker/prover] proving start: {:?}", job_id);
                     let start_time = std::time::Instant::now();
 
                     let result = task::spawn_blocking(move || {
@@ -146,16 +154,20 @@ impl<
                         Ok(Ok(proof)) => {
                             let proving_time = start_time.elapsed();
                             tracing::info!("Worker: Proved job {:?} in {:?}", job_id, proving_time);
+                            println!("[worker/prover] proving done: {:?}, elapsed={:?}, proof_bytes={}", job_id, proving_time, proof.len());
 
                             if let Err(e) = proof_tx_clone.send((api_url_hash, job_id, tag, proof)).await {
                                 tracing::error!("Worker: Failed to send proof to submitter: {:?}", e);
+                                println!("[worker/prover] send to submitter failed: {:?}", e);
                             }
                         }
                         Ok(Err(e)) => {
                             tracing::error!("Worker: Proving failed for job {:?}: {:?}", job_id, e);
+                            println!("[worker/prover] proving failed: {:?}, err={:?}", job_id, e);
                         }
                         Err(e) => {
                             tracing::error!("Worker: Proving task panicked for job {:?}: {:?}", job_id, e);
+                            println!("[worker/prover] proving panic: {:?}, err={:?}", job_id, e);
                         }
                     }
                 });
@@ -171,16 +183,20 @@ impl<
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             tracing::info!("Submitter role started - submitting proofs from proof queue");
+            println!("[worker/submitter] started");
 
             while let Some((api_url_hash, job_id, tag, proof)) = proof_rx.recv().await {
                 tracing::info!("Submitter: Received proof for job {:?}", job_id);
+                println!("[worker/submitter] submit start: {:?}, proof_bytes={}", job_id, proof.len());
 
                 match submitter.submit_proof_raw_to_api(api_url_hash, job_id, tag, proof).await {
                     Ok(_) => {
                         tracing::info!("Submitter: Successfully submitted proof for job {:?}", job_id);
+                        println!("[worker/submitter] submit ok: {:?}", job_id);
                     }
                     Err(e) => {
                         tracing::error!("Submitter: Error submitting proof for job {:?}: {:?}", job_id, e);
+                        println!("[worker/submitter] submit fail: {:?}, err={:?}", job_id, e);
                     }
                 }
             }

@@ -11,6 +11,10 @@ pub const PSY_OBJECT_FFS_SIZE_ZK_PUBLIC_KEY: usize = 64;
 // deployer(32 bytes) + function_tree_root(32 bytes) + state_tree_height(8 bytes) + code_root(32 bytes) = 104 bytes
 pub const PSY_OBJECT_FFS_SIZE_CONTRACT_LEAF: usize = 104;
 
+// IMTContractStateLeaf size in bytes
+// key(32 bytes) + value(32 bytes) + next_key(32 bytes) + next_index(8 bytes) = 104 bytes
+pub const PSY_OBJECT_FFS_SIZE_IMT_CONTRACT_STATE_LEAF: usize = 104;
+
 // PUPSEndCapResultCompact size in bytes
 // start_user_leaf_hash(32 bytes) + end_user_leaf_hash(32 bytes) + checkpoint_tree_root_hash(32 bytes) + user_id(8 bytes) = 104 bytes
 pub const PSY_OBJECT_FFS_SIZE_END_CAP_RESULT_COMPACT: usize = 104;

@@ -14,6 +14,9 @@ pub enum QBlobDataType {
     GenericZeroIdMerkleNodeBatch = 1,
     GenericSingleIdMerkleNodeBatch = 2,
     GenericDoubleIdMerkleNodeBatch = 3,
+
+    // IMT Leaf Batch (161 bytes per entry)
+    GenericIMTLeafBatch = 4,
 }
 
 
@@ -35,6 +38,9 @@ pub enum QBlobMerkleNodeTreeType {
 
     // Double ID Trees
     UserContractStateTree = 512,
+
+    // IMT (Indexed Merkle Tree)
+    IMTContractStateLeaf = 768,
 }
 
 pub const fn starts_with_qblob_v1_magic(data: &[u8]) -> bool {
@@ -57,15 +63,20 @@ pub const fn is_valid_qblob_merkle_node_batch_type(blob_data_type: QBlobDataType
             QBlobMerkleNodeTreeType::UserContractTree | QBlobMerkleNodeTreeType::ContractFunctionTree
         ),
         QBlobDataType::GenericDoubleIdMerkleNodeBatch => matches!(tree_type, QBlobMerkleNodeTreeType::UserContractStateTree),
+        QBlobDataType::GenericIMTLeafBatch => matches!(tree_type, QBlobMerkleNodeTreeType::IMTContractStateLeaf),
         _ => false,
     }
 }
+
+/// IMT leaf entry size (161 bytes for V2 format)
+pub const QBLOB_IMT_LEAF_ENTRY_SIZE: usize = 161;
 
 pub const fn get_item_size_for_data_type(blob_data_type: QBlobDataType) -> Option<usize> {
     match blob_data_type {
         QBlobDataType::GenericZeroIdMerkleNodeBatch => Some(QMS_FAST_SERIALIZER_ZERO_ID_NODE_SIZE),
         QBlobDataType::GenericSingleIdMerkleNodeBatch => Some(QMS_FAST_SERIALIZER_SINGLE_ID_NODE_SIZE),
         QBlobDataType::GenericDoubleIdMerkleNodeBatch => Some(QMS_FAST_SERIALIZER_DOUBLE_ID_NODE_SIZE),
+        QBlobDataType::GenericIMTLeafBatch => Some(QBLOB_IMT_LEAF_ENTRY_SIZE),
         _ => None,
     }
 }
@@ -76,6 +87,7 @@ pub const fn get_item_size_for_merkle_tree_type(tree_type: QBlobMerkleNodeTreeTy
         | QBlobMerkleNodeTreeType::GlobalUserRegistrationTree => Some(QMS_FAST_SERIALIZER_ZERO_ID_NODE_SIZE),
         QBlobMerkleNodeTreeType::UserContractTree | QBlobMerkleNodeTreeType::ContractFunctionTree => Some(QMS_FAST_SERIALIZER_SINGLE_ID_NODE_SIZE),
         QBlobMerkleNodeTreeType::UserContractStateTree => Some(QMS_FAST_SERIALIZER_DOUBLE_ID_NODE_SIZE),
+        QBlobMerkleNodeTreeType::IMTContractStateLeaf => Some(QBLOB_IMT_LEAF_ENTRY_SIZE),
         _ => None,
     }
 }

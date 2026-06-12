@@ -1,0 +1,15 @@
+[package]
+edition = "2021"
+name = "psy_cli_common"
+version = "0.1.0"
+
+[dependencies]
+anyhow = { workspace = true }
+plonky2 = { workspace = true }
+psy_client_common = { workspace = true }
+psy_client_data = { workspace = true }
+psy_crypto = { workspace = true }
+psy_provider = { workspace = true }
+psy_prover = { workspace = true, default-features = false }
+psy_ups_circuit = { workspace = true }
+serde = { workspace = true }

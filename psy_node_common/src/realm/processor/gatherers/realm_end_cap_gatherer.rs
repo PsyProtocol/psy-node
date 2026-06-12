@@ -25,7 +25,7 @@ use psy_data::{
     },
     node::realm_processor::RealmProcessorCoreState,
     queue_items::realm_user_update::PsyRealmUserUpdateQueueItem,
-    v1::qdata::ffs_sizes::PSY_OBJECT_FFS_SIZE_USER_LEAF,
+    v1::qdata::{ffs_sizes::PSY_OBJECT_FFS_SIZE_USER_LEAF, user::PQEDUserLeaf},
     worker::metadata_with_job_id::PsyProvingJobMetadataWithJobId,
 };
 use psy_io::tokio::{TokioFileLike, TokioLikeFileSystem};
@@ -36,7 +36,8 @@ use psy_node_core::{
             double_merkle_node_batch::QBlobDoubleMerkleNodeBatchDataView, single_merkle_node_batch::QBlobSingleMerkleNodeBatchDataView,
             zero_merkle_node_batch::create_ffs_merkle_nodes_zero_id_from_hash_map_with_offset,
         },
-        structs::common::tree_node_batch_header::QBLOB_TREE_NODE_BATCH_HEADER_SIZE,
+        structs::common::tree_node_batch_header::{QBlobMerkleTreeNodeBatchHeaderV1, QBLOB_TREE_NODE_BATCH_HEADER_SIZE},
+        traits::common::QBlobStructHeaderBase,
     },
 };
 use psy_serialize::{PsyCanonicalDatabaseSerializeBaseSingle, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
@@ -59,6 +60,29 @@ pub fn get_new_realm_end_cap_gatherer_backup_file_path(
         "realm_end_cap_gatherer_realm_{}_sub_{}_pending_{}.backup",
         realm_id_u64, realm_sub_id_u64, pending_unique_id
     ))
+}
+
+/// Reads only the end_root hash from a realm gatherer backup file header.
+/// This is a lightweight check to find which backup matches a target root
+/// without mutating any in-memory tree.
+pub async fn read_realm_backup_end_root<FileSystem: TokioLikeFileSystem, Hash: QDBHashBase>(
+    file_system: &FileSystem,
+    path: &str,
+) -> anyhow::Result<Hash> {
+    let mut file: FileSystem::File = file_system.file_like_fs_open(path).await?;
+    let magic_u32 = file.read_u32_le().await?;
+    if magic_u32 != REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_U32 {
+        return Err(anyhow::anyhow!(
+            "Backup file magic number mismatch: expected {:x}, got {:x}",
+            REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_U32,
+            magic_u32
+        ));
+    }
+    let mut start_root_hash_bytes = [0u8; 32];
+    file.read_exact(&mut start_root_hash_bytes).await?; // discard start_root
+    let mut end_root_hash_bytes = [0u8; 32];
+    file.read_exact(&mut end_root_hash_bytes).await?;
+    Ok(Hash::from_owned_32bytes(end_root_hash_bytes))
 }
 
 pub async fn read_realm_end_cap_gatherer_backup_file<
@@ -119,29 +143,40 @@ pub async fn read_realm_end_cap_gatherer_backup_file<
 
     let expected_end_caps_processed = file.read_u64_le().await?;
 
-    let guta_header_size = GlobalUserTreeAggregatorHeaderWithJobId::<F, Hash>::FIXED_SIZE;
-    let end_caps_data_len = file_len
-        .saturating_sub(const_size_len)
-        .saturating_sub(guta_header_size as u64) as usize;
-    let mut end_caps_data = vec![0u8; end_caps_data_len];
-    file.read_exact(&mut end_caps_data).await?;
+    let remaining_data_len = file_len.saturating_sub(const_size_len) as usize;
+    let mut remaining_data = vec![0u8; remaining_data_len];
+    file.read_exact(&mut remaining_data).await?;
 
-    let mut cursor = Cursor::new(end_caps_data);
+    let mut cursor = Cursor::new(remaining_data);
     let mut actual_end_caps_processed = 0usize;
     let mut update_user_leaves_ffs = Vec::new();
     let mut update_user_contract_tree_nodes_ffs = Vec::new();
     let mut update_contract_state_tree_nodes_ffs = Vec::new();
+    let mut update_contract_state_imt_leaves_ffs = Vec::new();
 
     let min_user_id = realm_id_u64 << (realm_global_user_tree_height as u64);
     let max_user_id = ((realm_id_u64 + 1) << (realm_global_user_tree_height as u64)) - 1;
     let mut merkle_header = [0u8; QBLOB_TREE_NODE_BATCH_HEADER_SIZE];
 
     for _ in 0..expected_end_caps_processed {
-        // A. Read variable-length queue item via stream deserialization (handles events correctly)
-        let queue_item =
-            PsyRealmUserUpdateQueueItem::<F, Hash>::pio_read_from_io(&mut cursor)?;
+        // A. Read queue item fields manually to match backup body layout
+        // Layout: job_id(24) + expected_checkpoint(8) + old_hash(32) + new_hash(32)
+        //         + user_leaf(104) + stats(40) + events_len(4) + events(variable)
+        let mut job_id_bytes = [0u8; 24];
+        Read::read_exact(&mut cursor, &mut job_id_bytes)?;
 
-        let user_leaf_node = queue_item.new_user_leaf;
+        let mut expected_checkpoint_bytes = [0u8; 8];
+        Read::read_exact(&mut cursor, &mut expected_checkpoint_bytes)?;
+
+        let mut old_hash_bytes = [0u8; 32];
+        Read::read_exact(&mut cursor, &mut old_hash_bytes)?;
+        let old_user_leaf_hash = Hash::from_owned_32bytes(old_hash_bytes);
+
+        let mut new_hash_bytes = [0u8; 32];
+        Read::read_exact(&mut cursor, &mut new_hash_bytes)?;
+        let new_user_leaf_hash = Hash::from_owned_32bytes(new_hash_bytes);
+
+        let user_leaf_node = PQEDUserLeaf::<F, Hash>::pio_read_from_io(&mut cursor)?;
         let user_id = user_leaf_node.user_id.to_u64_value();
         if user_id < min_user_id || user_id > max_user_id {
             return Err(anyhow::anyhow!(
@@ -151,6 +186,24 @@ pub async fn read_realm_end_cap_gatherer_backup_file<
                 min_user_id,
                 max_user_id
             ));
+        }
+
+        // Skip stats (40 bytes)
+        let mut stats_bytes = [0u8; 40];
+        Read::read_exact(&mut cursor, &mut stats_bytes)?;
+
+        // Read events_len and skip events
+        let mut events_len_bytes = [0u8; 4];
+        Read::read_exact(&mut cursor, &mut events_len_bytes)?;
+        let events_len = u32::from_le_bytes(events_len_bytes);
+        for _ in 0..events_len {
+            // Skip fixed event fields: checkpoint_id(8) + user_id(8) + contract_id(8) + method_id(8) + event_index(8) + data_len(4) = 44 bytes
+            let mut event_fixed = [0u8; 44];
+            Read::read_exact(&mut cursor, &mut event_fixed)?;
+            let data_len = u32::from_le_bytes(event_fixed[40..44].try_into().unwrap());
+            // Skip event data: data_len * 8 bytes
+            let mut event_data = vec![0u8; (data_len as usize) * 8];
+            Read::read_exact(&mut cursor, &mut event_data)?;
         }
 
         // B. Read Variable Contract Blobs
@@ -172,15 +225,34 @@ pub async fn read_realm_end_cap_gatherer_backup_file<
         let mut contract_state_tree_nodes = vec![0u8; contract_state_tree_nodes_size];
         Read::read_exact(&mut cursor, &mut contract_state_tree_nodes)?;
 
+        // 3. Optional IMT leaf blob. Older backups have two blobs; newer ones may include
+        // a third QBlob immediately before the footer.
+        let cursor_pos = cursor.position() as usize;
+        let data_ref = cursor.get_ref();
+        let footer_size = GlobalUserTreeAggregatorHeaderWithJobId::<F, Hash>::FIXED_SIZE;
+        if cursor_pos + QBLOB_TREE_NODE_BATCH_HEADER_SIZE + footer_size <= data_ref.len() {
+            let possible_header = &data_ref[cursor_pos..cursor_pos + QBLOB_TREE_NODE_BATCH_HEADER_SIZE];
+            if let Ok(imt_header_parsed) = QBlobMerkleTreeNodeBatchHeaderV1::try_read_header_from_slice(possible_header) {
+                let imt_blob_size = imt_header_parsed.total_size as usize;
+                if imt_blob_size >= QBLOB_TREE_NODE_BATCH_HEADER_SIZE && cursor_pos + imt_blob_size + footer_size <= data_ref.len() {
+                    cursor.set_position((cursor_pos + QBLOB_TREE_NODE_BATCH_HEADER_SIZE) as u64);
+                    let imt_leaf_size = imt_blob_size - QBLOB_TREE_NODE_BATCH_HEADER_SIZE;
+                    let mut imt_leaves = vec![0u8; imt_leaf_size];
+                    Read::read_exact(&mut cursor, &mut imt_leaves)?;
+                    update_contract_state_imt_leaves_ffs.extend_from_slice(&imt_leaves);
+                }
+            }
+        }
+
         // C. Apply Logic
         user_leaf_node.pio_write_to_io(&mut update_user_leaves_ffs)?;
         update_user_contract_tree_nodes_ffs.extend_from_slice(&user_contract_tree_nodes);
         update_contract_state_tree_nodes_ffs.extend_from_slice(&contract_state_tree_nodes);
 
         if insert_old_leaves {
-            tree.set_leaf(user_id - min_user_id, queue_item.old_user_leaf_hash);
+            tree.set_leaf(user_id - min_user_id, old_user_leaf_hash);
         } else {
-            tree.set_leaf(user_id - min_user_id, queue_item.new_user_leaf_hash);
+            tree.set_leaf(user_id - min_user_id, new_user_leaf_hash);
         }
         actual_end_caps_processed += 1;
     }
@@ -199,9 +271,18 @@ pub async fn read_realm_end_cap_gatherer_backup_file<
         tree.get_root(),
     );
 
+    let footer_start = cursor.position() as usize;
+    if footer_start + GlobalUserTreeAggregatorHeaderWithJobId::<F, Hash>::FIXED_SIZE > cursor.get_ref().len() {
+        anyhow::bail!(
+            "Realm backup file {} is missing GUTA footer: footer_start={}, remaining_len={}",
+            file_path,
+            footer_start,
+            cursor.get_ref().len()
+        );
+    }
     let mut header_bytes = vec![0u8; GlobalUserTreeAggregatorHeaderWithJobId::<F, Hash>::FIXED_SIZE];
-    file.read_exact(&mut header_bytes).await?;
-    let guta_header = GlobalUserTreeAggregatorHeaderWithJobId::<F, Hash>::psy_ser_from_owned_bytes_vec(header_bytes)?;
+    Read::read_exact(&mut cursor, &mut header_bytes)?;
+    let guta_header = read_guta_header_with_job_id_from_backup_bytes::<F, Hash>(&header_bytes)?;
 
     let update_global_user_tree_nodes_ffs = create_ffs_merkle_nodes_zero_id_from_hash_map_with_offset::<Hash>(
         tree.get_changes(),
@@ -218,9 +299,71 @@ pub async fn read_realm_end_cap_gatherer_backup_file<
         update_user_contract_tree_nodes_ffs,
         update_contract_state_tree_nodes_ffs,
         update_user_leaves_ffs,
+        update_contract_state_imt_leaves_ffs,
         total_proofs_generated: 0,
         total_users_updated: actual_end_caps_processed as u64,
         guta_header,
+    })
+}
+
+fn write_guta_header_with_job_id_backup_bytes<F: QFelt64, Hash: Q256BitHash>(
+    guta_header: &GlobalUserTreeAggregatorHeaderWithJobId<F, Hash>,
+) -> anyhow::Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(GlobalUserTreeAggregatorHeaderWithJobId::<F, Hash>::FIXED_SIZE);
+    bytes.extend_from_slice(&guta_header.header.guta_circuit_whitelist.into_owned_32bytes());
+    bytes.extend_from_slice(&guta_header.header.checkpoint_tree_root.into_owned_32bytes());
+    bytes.extend_from_slice(&guta_header.header.state_transition.old_node_value.into_owned_32bytes());
+    bytes.extend_from_slice(&guta_header.header.state_transition.new_node_value.into_owned_32bytes());
+    bytes.extend_from_slice(&guta_header.header.state_transition.node_index.to_u64_value().to_le_bytes());
+    bytes.extend_from_slice(&guta_header.header.state_transition.node_level.to_u64_value().to_le_bytes());
+    bytes.extend_from_slice(&guta_header.header.stats.guta_fees_collected.to_u64_value().to_le_bytes());
+    bytes.extend_from_slice(&guta_header.header.stats.da_fees_collected.to_u64_value().to_le_bytes());
+    bytes.extend_from_slice(&guta_header.header.stats.user_ops_processed.to_u64_value().to_le_bytes());
+    bytes.extend_from_slice(&guta_header.header.stats.total_transactions.to_u64_value().to_le_bytes());
+    bytes.extend_from_slice(&guta_header.header.stats.slots_modified.to_u64_value().to_le_bytes());
+    bytes.extend_from_slice(&guta_header.header.total_aggregation_proofs_generated.to_u64_value().to_le_bytes());
+    bytes.extend_from_slice(&guta_header.job_id.to_fixed_bytes());
+    debug_assert_eq!(bytes.len(), GlobalUserTreeAggregatorHeaderWithJobId::<F, Hash>::FIXED_SIZE);
+    Ok(bytes)
+}
+
+fn read_guta_header_with_job_id_from_backup_bytes<F: QFelt64, Hash: Q256BitHash>(
+    bytes: &[u8],
+) -> anyhow::Result<GlobalUserTreeAggregatorHeaderWithJobId<F, Hash>> {
+    if bytes.len() != GlobalUserTreeAggregatorHeaderWithJobId::<F, Hash>::FIXED_SIZE {
+        anyhow::bail!(
+            "invalid GUTA header footer size: expected {}, got {}",
+            GlobalUserTreeAggregatorHeaderWithJobId::<F, Hash>::FIXED_SIZE,
+            bytes.len()
+        );
+    }
+
+    let read_hash = |offset: usize| -> Hash { Hash::from_owned_32bytes(bytes[offset..offset + 32].try_into().unwrap()) };
+    let read_felt = |offset: usize| -> F { F::from_u64_value(u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())) };
+
+    let job_id_start = GlobalUserTreeAggregatorHeader::<F, Hash>::FIXED_SIZE;
+    let job_id = QProvingJobDataID::from_bytes_fixed(&bytes[job_id_start..job_id_start + 24].try_into().unwrap())?;
+
+    Ok(GlobalUserTreeAggregatorHeaderWithJobId {
+        header: GlobalUserTreeAggregatorHeader {
+            guta_circuit_whitelist: read_hash(0),
+            checkpoint_tree_root: read_hash(32),
+            state_transition: SubTreeNodeStateTransition {
+                old_node_value: read_hash(64),
+                new_node_value: read_hash(96),
+                node_index: read_felt(128),
+                node_level: read_felt(136),
+            },
+            stats: GUTAStats {
+                guta_fees_collected: read_felt(144),
+                da_fees_collected: read_felt(152),
+                user_ops_processed: read_felt(160),
+                total_transactions: read_felt(168),
+                slots_modified: read_felt(176),
+            },
+            total_aggregation_proofs_generated: read_felt(184),
+        },
+        job_id,
     })
 }
 pub struct RealmGUTAEndCapGathererConfig<
@@ -291,6 +434,8 @@ pub struct RealmGUTAEndCapGathererOutputDatabase<F, Hash> {
     pub update_user_contract_tree_nodes_ffs: Vec<u8>,
     pub update_contract_state_tree_nodes_ffs: Vec<u8>,
     pub update_user_leaves_ffs: Vec<u8>,
+    /// IMT leaf preimage data for indexed merkle tree contract state updates.
+    pub update_contract_state_imt_leaves_ffs: Vec<u8>,
     pub total_users_updated: u64,
     pub total_proofs_generated: u64,
     pub guta_header: GlobalUserTreeAggregatorHeaderWithJobId<F, Hash>,
@@ -310,6 +455,7 @@ impl<F: QFelt64, Hash: QDBHashBase> RealmGUTAEndCapGathererOutputDatabase<F, Has
             update_user_contract_tree_nodes_ffs: vec![],
             update_contract_state_tree_nodes_ffs: vec![],
             update_user_leaves_ffs: vec![],
+            update_contract_state_imt_leaves_ffs: vec![],
             guta_header: GlobalUserTreeAggregatorHeaderWithJobId {
                 job_id: QProvingJobDataID::new_invalid_job_id(),
                 header: GlobalUserTreeAggregatorHeader {
@@ -542,6 +688,10 @@ impl<
                     .file_system
                     .file_like_fs_flush_file_with_path(&self.pending_file_path, &mut self.new_realm_end_cap_gatherer_file)
                     .await?;
+                self.config
+                    .file_system
+                    .file_like_fs_sync_file_with_path(&self.pending_file_path, &mut self.new_realm_end_cap_gatherer_file)
+                    .await?;
 
                 tracing::info!(
                     "GUTA updates gatherer for pending id {} finalized with changes.",
@@ -584,9 +734,202 @@ impl<
             .file_system
             .file_like_fs_flush_file_with_path(&self.pending_file_path, &mut self.new_realm_end_cap_gatherer_file)
             .await?;
+        self.config
+            .file_system
+            .file_like_fs_sync_file_with_path(&self.pending_file_path, &mut self.new_realm_end_cap_gatherer_file)
+            .await?;
         Ok(RealmGUTAEndCapGathererOutput {
             db_output: RealmGUTAEndCapGathererOutputDatabase::<N::F, N::QHash>::get_empty(tree.get_root()),
             job_ids: vec![],
         })
+    }
+}
+
+#[cfg(test)]
+mod backup_file_tests {
+    use std::fs;
+    use std::path::Path;
+
+    use psy_core::job::job_id::QProvingJobDataID;
+    use psy_node_core::qblob::{
+        structs::common::tree_node_batch_header::{QBlobMerkleTreeNodeBatchHeaderV1, QBLOB_TREE_NODE_BATCH_HEADER_SIZE},
+        traits::common::QBlobStructHeaderBase,
+    };
+
+    const REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_U32: u32 = 0x31_45_47_52;
+    const HEADER_SIZE: usize = 4 + 32 + 32 + 8;
+    const FOOTER_SIZE: usize = 216;
+    const JOB_ID_SIZE: usize = 24;
+    const EXPECTED_CHECKPOINT_SIZE: usize = 8;
+    const HASH_SIZE: usize = 32;
+    const USER_LEAF_SIZE: usize = 104;
+    const GUTA_STATS_SIZE: usize = 40;
+    const EVENTS_LEN_SIZE: usize = 4;
+    const QUEUE_ITEM_FIXED_PREFIX_SIZE: usize =
+        JOB_ID_SIZE + EXPECTED_CHECKPOINT_SIZE + HASH_SIZE + HASH_SIZE + USER_LEAF_SIZE + GUTA_STATS_SIZE + EVENTS_LEN_SIZE;
+    const END_CAP_EVENT_FIXED_FIELDS_SIZE: usize = 8 * 5 + 4;
+
+    #[test]
+    fn test_all_local_end_cap_backup_files() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let workspace_root = manifest_dir.parent().unwrap();
+        let base_dirs = [
+            workspace_root.join("local_checkpoints/realm_0_1/guta_updates_backup"),
+            workspace_root.join("local_checkpoints/realm_1_1/guta_updates_backup"),
+        ];
+
+        let mut total_files = 0usize;
+        let mut ok_files = 0usize;
+        let mut bad_files = Vec::new();
+
+        for dir in &base_dirs {
+            let path = Path::new(dir);
+            if !path.exists() {
+                continue;
+            }
+            for entry in fs::read_dir(path).unwrap() {
+                let entry = entry.unwrap();
+                let file_path = entry.path();
+                if !file_path.extension().map(|e| e == "backup").unwrap_or(false) {
+                    continue;
+                }
+                total_files += 1;
+                match verify_backup_file(&file_path) {
+                    Ok(()) => ok_files += 1,
+                    Err(e) => {
+                        eprintln!("BAD: {} -> {}", file_path.display(), e);
+                        bad_files.push((file_path.display().to_string(), e.to_string()));
+                    }
+                }
+            }
+        }
+
+        println!("Total: {}, OK: {}, Bad: {}", total_files, ok_files, bad_files.len());
+        if !bad_files.is_empty() {
+            panic!("{} backup files failed verification. See stderr for details.", bad_files.len());
+        }
+    }
+
+    fn verify_backup_file(path: &Path) -> anyhow::Result<()> {
+        let data = fs::read(path)?;
+        let file_len = data.len();
+
+        if file_len < HEADER_SIZE {
+            anyhow::bail!("file too small: {} bytes (minimum {})", file_len, HEADER_SIZE);
+        }
+
+        let magic = u32::from_le_bytes(data[0..4].try_into().unwrap());
+        if magic != REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_U32 {
+            anyhow::bail!("bad magic: expected {:x}, got {:x}", REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_U32, magic);
+        }
+
+        let expected_end_caps = u64::from_le_bytes(data[68..76].try_into().unwrap());
+
+        if file_len == HEADER_SIZE && expected_end_caps == 0 {
+            // Header-only files are in-progress gatherer files that have not finalized yet.
+            return Ok(());
+        }
+
+        let mut offset = 0usize;
+        let body = &data[HEADER_SIZE..];
+
+        for actual_end_caps in 0..expected_end_caps as usize {
+            let queue_item_size = parse_queue_item_size(body, offset).map_err(|e| {
+                anyhow::anyhow!(
+                    "queue_item #{} parse failed at body offset {}: {}",
+                    actual_end_caps,
+                    offset,
+                    e
+                )
+            })?;
+            offset += queue_item_size;
+
+            offset += parse_qblob_total_size(body, offset)
+                .map_err(|e| anyhow::anyhow!("user blob parse failed for queue_item #{}: {}", actual_end_caps, e))?;
+            offset += parse_qblob_total_size(body, offset)
+                .map_err(|e| anyhow::anyhow!("state blob parse failed for queue_item #{}: {}", actual_end_caps, e))?;
+
+            if offset + QBLOB_TREE_NODE_BATCH_HEADER_SIZE <= body.len() && parse_qblob_total_size(body, offset).is_ok() {
+                offset += parse_qblob_total_size(body, offset)?;
+            }
+        }
+
+        if HEADER_SIZE + offset + FOOTER_SIZE > file_len {
+            anyhow::bail!(
+                "file too small for footer after {} end-cap records: file_len={}, footer_offset={}",
+                expected_end_caps,
+                file_len,
+                HEADER_SIZE + offset
+            );
+        }
+        verify_footer(&data[HEADER_SIZE + offset..HEADER_SIZE + offset + FOOTER_SIZE])?;
+
+        Ok(())
+    }
+
+    fn verify_footer(footer: &[u8]) -> anyhow::Result<()> {
+        if footer.len() != FOOTER_SIZE {
+            anyhow::bail!("invalid footer size: expected {}, got {}", FOOTER_SIZE, footer.len());
+        }
+
+        let job_id_start = FOOTER_SIZE - JOB_ID_SIZE;
+        QProvingJobDataID::try_from_byte_vec(&footer[job_id_start..])?;
+        Ok(())
+    }
+
+    fn parse_queue_item_size(data: &[u8], offset: usize) -> anyhow::Result<usize> {
+        if offset + QUEUE_ITEM_FIXED_PREFIX_SIZE > data.len() {
+            anyhow::bail!(
+                "truncated queue item prefix: need {} bytes, have {}",
+                QUEUE_ITEM_FIXED_PREFIX_SIZE,
+                data.len().saturating_sub(offset)
+            );
+        }
+
+        let events_len_offset = offset + QUEUE_ITEM_FIXED_PREFIX_SIZE - EVENTS_LEN_SIZE;
+        let events_len = read_u32_le(data, events_len_offset)? as usize;
+        let mut cursor = offset + QUEUE_ITEM_FIXED_PREFIX_SIZE;
+
+        for _ in 0..events_len {
+            if cursor + END_CAP_EVENT_FIXED_FIELDS_SIZE > data.len() {
+                anyhow::bail!("truncated event header at offset {}", cursor);
+            }
+
+            let event_data_len = read_u32_le(data, cursor + 8 * 5)? as usize;
+            cursor += END_CAP_EVENT_FIXED_FIELDS_SIZE;
+            let event_data_size = event_data_len
+                .checked_mul(8)
+                .ok_or_else(|| anyhow::anyhow!("event data length overflow: {}", event_data_len))?;
+            if cursor + event_data_size > data.len() {
+                anyhow::bail!("truncated event data at offset {}", cursor);
+            }
+            cursor += event_data_size;
+        }
+
+        Ok(cursor - offset)
+    }
+
+    fn parse_qblob_total_size(data: &[u8], offset: usize) -> anyhow::Result<usize> {
+        if offset + QBLOB_TREE_NODE_BATCH_HEADER_SIZE > data.len() {
+            anyhow::bail!("truncated qblob header at offset {}", offset);
+        }
+
+        let header = QBlobMerkleTreeNodeBatchHeaderV1::try_read_header_from_slice(&data[offset..offset + QBLOB_TREE_NODE_BATCH_HEADER_SIZE])?;
+        let total_size = header.total_size as usize;
+        if total_size < QBLOB_TREE_NODE_BATCH_HEADER_SIZE {
+            anyhow::bail!("invalid qblob total_size {} at offset {}", total_size, offset);
+        }
+        if offset + total_size > data.len() {
+            anyhow::bail!("truncated qblob payload at offset {}: total_size {}", offset, total_size);
+        }
+
+        Ok(total_size)
+    }
+
+    fn read_u32_le(data: &[u8], offset: usize) -> anyhow::Result<u32> {
+        let bytes = data
+            .get(offset..offset + 4)
+            .ok_or_else(|| anyhow::anyhow!("failed to read u32 at offset {}", offset))?;
+        Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
     }
 }

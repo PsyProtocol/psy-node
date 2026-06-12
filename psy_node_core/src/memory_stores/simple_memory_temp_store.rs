@@ -1,5 +1,12 @@
 use async_trait::async_trait;
-use parth_core::{data::{db::temp_db::{TempTableDefintion, TempTablePrefixIdentifierBaseForKey}, serializable::{QPDPair, QPDSerializable}}, utils::auto_implement::QAutoImplementGeneric, QJobIdSerialized};
+use parth_core::{
+    data::{
+        db::temp_db::{TempTableDefintion, TempTablePrefixIdentifierBaseForKey},
+        serializable::{QPDPair, QPDSerializable},
+    },
+    utils::auto_implement::QAutoImplementGeneric,
+    QJobIdSerialized,
+};
 use std::{collections::HashMap, sync::{Arc, RwLock}};
 
 use crate::store::traits::{proof_store::{QParthProofStoreReader, QParthProofStoreWriter}, temp_db::{QTempDatabaseCounterReaderBase, QTempDatabaseCounterWriterBase, QTempDatabaseRawKVReaderBase, QTempDatabaseRawKVWriterBase}};
@@ -8,7 +15,7 @@ use crate::store::traits::{proof_store::{QParthProofStoreReader, QParthProofStor
 pub struct SimpleMemoryTempStore {
     pub kv_map: Arc<RwLock<HashMap<Vec<u8>, Vec<u8>>>>,
     pub counter_map: Arc<RwLock<HashMap<Vec<u8>, i64>>>,
-    pub proof_map: Arc<RwLock<HashMap<Vec<u8>, Vec<u8>>>>,
+    pub proof_map: Arc<RwLock<HashMap<u64, HashMap<Vec<u8>, Vec<u8>>>>>,
 }
 impl SimpleMemoryTempStore {
     pub fn new() -> Self {
@@ -23,38 +30,55 @@ impl SimpleMemoryTempStore {
 #[async_trait]
 impl QParthProofStoreReader for SimpleMemoryTempStore {
 
-    async fn get_proof_bytes_by_job_id<J: Into<QJobIdSerialized> + Copy + Send + Sync>(&self, job_id: J) -> anyhow::Result<Option<Vec<u8>>>{
+    async fn get_proof_bytes_by_job_id<J: Into<QJobIdSerialized> + Copy + Send + Sync>(&self, job_id: J, unique_pending_id: u64) -> anyhow::Result<Option<Vec<u8>>>{
         let job_id_bytes = job_id.into().to_vec();
-        Ok(self.proof_map.read().map_err(|e| anyhow::anyhow!(e.to_string()))?.get(&job_id_bytes).cloned())
+        let guard = self.proof_map.read().map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        Ok(guard.get(&unique_pending_id).and_then(|bucket| bucket.get(&job_id_bytes).cloned()))
     }
-    async fn get_proof_by_job_id<J: Into<QJobIdSerialized> + Copy + Send + Sync, P: QPDSerializable>(&self, job_id: J) -> anyhow::Result<Option<P>>{
+    async fn get_proof_by_job_id<J: Into<QJobIdSerialized> + Copy + Send + Sync, P: QPDSerializable>(&self, job_id: J, unique_pending_id: u64) -> anyhow::Result<Option<P>>{
         let job_id_bytes = job_id.into().to_vec();
-        if let Some(data) = self.proof_map.read().map_err(|e| anyhow::anyhow!(e.to_string()))?.get(&job_id_bytes) {
+        let guard = self.proof_map.read().map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        if let Some(data) = guard.get(&unique_pending_id).and_then(|bucket| bucket.get(&job_id_bytes)) {
             let proof = P::from_bytes(data)?;
             Ok(Some(proof))
         } else {
             Ok(None)
         }
     }
-    async fn contains_proof_for_job_id<J:  Into<QJobIdSerialized> + Copy + Send + Sync>(&self, job_id: J) -> anyhow::Result<bool> {
+    async fn contains_proof_for_job_id<J:  Into<QJobIdSerialized> + Copy + Send + Sync>(&self, job_id: J, unique_pending_id: u64) -> anyhow::Result<bool> {
         let job_id_bytes = job_id.into().to_vec();
-        Ok(self.proof_map.read().map_err(|e| anyhow::anyhow!(e.to_string()))?.contains_key(&job_id_bytes))
+        let guard = self.proof_map.read().map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        Ok(guard
+            .get(&unique_pending_id)
+            .map(|bucket| bucket.contains_key(&job_id_bytes))
+            .unwrap_or(false))
     }
 
 }
 
 #[async_trait]
 impl QParthProofStoreWriter for SimpleMemoryTempStore {
-    async fn put_proof_bytes_for_job_id<J: Into<QJobIdSerialized> + Copy + Send + Sync>(&self, job_id: J, proof_bytes: &[u8]) -> anyhow::Result<()>{
+    async fn put_proof_bytes_for_job_id<J: Into<QJobIdSerialized> + Copy + Send + Sync>(&self, job_id: J, unique_pending_id: u64, proof_bytes: &[u8]) -> anyhow::Result<()>{
         let job_id_bytes = job_id.into().to_vec();
-        self.proof_map.write().map_err(|e| anyhow::anyhow!(e.to_string()))?.insert(job_id_bytes, proof_bytes.to_vec());
+        let mut guard = self.proof_map.write().map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let bucket = guard.entry(unique_pending_id).or_insert_with(HashMap::new);
+        bucket.insert(job_id_bytes, proof_bytes.to_vec());
         Ok(())
 
     }
-    async fn put_proof_for_job_id<J: Into<QJobIdSerialized> + Copy + Send + Sync, P: QPDSerializable + Send + Sync>(&self, job_id: J, proof: &P) -> anyhow::Result<()> {
+    async fn put_proof_for_job_id<J: Into<QJobIdSerialized> + Copy + Send + Sync, P: QPDSerializable + Send + Sync>(&self, job_id: J, unique_pending_id: u64, proof: &P) -> anyhow::Result<()> {
         let proof_bytes = proof.to_bytes()?;
         let job_id_bytes = job_id.into().to_vec();
-        self.proof_map.write().map_err(|e| anyhow::anyhow!(e.to_string()))?.insert(job_id_bytes, proof_bytes);
+        let mut guard = self.proof_map.write().map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let bucket = guard.entry(unique_pending_id).or_insert_with(HashMap::new);
+        bucket.insert(job_id_bytes, proof_bytes);
+        Ok(())
+    }
+    async fn delete_all_proofs_for_pending_id(&self, unique_pending_id: u64) -> anyhow::Result<()> {
+        self.proof_map
+            .write()
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?
+            .remove(&unique_pending_id);
         Ok(())
     }
 }

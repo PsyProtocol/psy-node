@@ -28,7 +28,7 @@ hex = { workspace = true }
 hex-literal = { workspace = true }
 bincode = { workspace = true }
 tracing = { workspace = true }
-tokio = { workspace = true}
+tokio = { workspace = true, features = ["signal"] }
 rand = { workspace = true }
 auto_impl = { workspace = true }
 strum = { workspace = true }
@@ -51,6 +51,7 @@ parth_core = { workspace = true }
 parth_crypto = { workspace = true }
 parth_common = { workspace = true }
 psy_core = { workspace = true }
+psy_crypto = { workspace = true }
 psy_io = { workspace = true }
 psy_common = { workspace = true }
 psy_data = { workspace = true }

@@ -1,0 +1,50 @@
+{
+    "name": "simple_sign",
+    "method_id": 1973188595,
+    "circuit_inputs": [],
+    "circuit_outputs": [],
+    "state_commands": [],
+    "state_command_resolution_indices": [],
+    "assertions": [
+        {
+            "left": 4294967296,
+            "right": 4294967297,
+            "message": "you can only sign two txns"
+        }
+    ],
+    "definitions": [
+        {
+            "data_type": 0,
+            "index": 0,
+            "op_type": 49,
+            "inputs": [
+                0
+            ]
+        },
+        {
+            "data_type": 0,
+            "index": 1,
+            "op_type": 1,
+            "inputs": [
+                2
+            ]
+        },
+        {
+            "data_type": 1,
+            "index": 0,
+            "op_type": 14,
+            "inputs": [
+                0,
+                1
+            ]
+        },
+        {
+            "data_type": 1,
+            "index": 1,
+            "op_type": 2,
+            "inputs": [
+                1
+            ]
+        }
+    ]
+}

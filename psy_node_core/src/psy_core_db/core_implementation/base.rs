@@ -3,23 +3,35 @@ use std::sync::Arc;
 use anyhow::Ok;
 use async_trait::async_trait;
 use parth_core::{
-    crypto::hash::{merkle_proof::MerkleProofCore, traits::MerkleZeroHasher}, data::hash::{fast_node_serializer::{QMerkleStoreFastDoubleNodeSerializer, QMerkleStoreFastSingleNodeSerializer}, merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey}, merkle_store_key::{QMerkleStoreDoubleIdNode, QMerkleStoreSingleIdNode}}, felt::ToU64Value, protocol::core_types::QNetworkDatabaseTypes, QCoreProcCheckpointUniqueId
+    crypto::hash::{merkle_proof::MerkleProofCore, traits::MerkleZeroHasher},
+    data::hash::{
+        fast_node_serializer::{QMerkleStoreFastDoubleNodeSerializer, QMerkleStoreFastSingleNodeSerializer},
+        merkle_node_key::{SimpleMerkleNode, SimpleMerkleNodeKey},
+        merkle_store_key::{QMerkleStoreDoubleIdNode, QMerkleStoreSingleIdNode},
+    },
+    felt::ToU64Value,
+    protocol::core_types::QNetworkDatabaseTypes,
+    QCoreProcCheckpointUniqueId,
 };
 use psy_data::v1::qdata::{
-    checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState}, checkpoint_sync::PQEDCheckpointSyncInfo, user::PQEDUserLeaf
+    checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState},
+    checkpoint_sync::PQEDCheckpointSyncInfo,
+    user::PQEDUserLeaf,
 };
-use crate::{psy_core_db::traits::realm::QEDRealmStoreWriterAsyncImm, store::traits::core_db::{
-    CoreDatabaseBidirectionalMappingReader, CoreDatabaseBidirectionalU64U128MappingReader,
-    CoreDatabaseKivReader, CoreDatabaseSingleIdCheckpointedReader, CoreDatabaseSingleIdMerkleReader, CoreDatabaseStore,
-    CoreDatabaseU64Reader, CoreDatabaseZeroIdMerkleReader,
-}};
 
-use crate::psy_core_db::{
-    core_implementation::constants::{
-        CHECKPOINTED_OBJECT_TABLE_OBJ_ID_REALM_ROOT_TO_GLOBAL_USER_TREE_ROOT_MERKLE_PROOF, LATEST_INFO_TABLE_OBJ_ID_LATEST_CHECKPOINT_TREE_ROOT,
-        LATEST_INFO_TABLE_OBJ_ID_LATEST_L2_BLOCK_STATE, U64_SINGLETON_TABLE_OBJ_ID_CHECKPOINT_ID, U64_SINGLETON_TABLE_OBJ_ID_PENDING_ID,
+use crate::{
+    psy_core_db::{
+        core_implementation::constants::{
+            CHECKPOINTED_OBJECT_TABLE_OBJ_ID_REALM_ROOT_TO_GLOBAL_USER_TREE_ROOT_MERKLE_PROOF, LATEST_INFO_TABLE_OBJ_ID_LATEST_CHECKPOINT_TREE_ROOT,
+            LATEST_INFO_TABLE_OBJ_ID_LATEST_L2_BLOCK_STATE, U64_SINGLETON_TABLE_OBJ_ID_CHECKPOINT_ID, U64_SINGLETON_TABLE_OBJ_ID_PENDING_ID,
+        },
+        traits::realm::{QEDRealmStoreReaderAsync, QEDRealmStoreWriterAsyncImm},
     },
-    traits::realm::QEDRealmStoreReaderAsync,
+    store::traits::core_db::{
+        CoreDatabaseBidirectionalMappingReader, CoreDatabaseBidirectionalU64U128MappingReader, CoreDatabaseKivReader,
+        CoreDatabaseSingleIdCheckpointedReader, CoreDatabaseSingleIdMerkleReader, CoreDatabaseStore, CoreDatabaseU64Reader,
+        CoreDatabaseZeroIdMerkleReader,
+    },
 };
 
 #[derive(Clone)]
@@ -37,6 +49,9 @@ pub struct QRealmStoreBase<
     ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
     TagTreeTableIdentifier: Clone + Send + Sync,
     HashToManyIdsTableIdentifier: Clone + Send + Sync,
+    IMTLeafTableIdentifier: Clone + Send + Sync,
+    IMTKeyIndexTableIdentifier: Clone + Send + Sync,
+    IMTNextAppendIndexTableIdentifier: Clone + Send + Sync,
     S: CoreDatabaseStore<
             N::QHash,
             N::HasherBase,
@@ -52,7 +67,11 @@ pub struct QRealmStoreBase<
             ZeroIdMerkleTableIdentifier,
             TagTreeTableIdentifier,
             HashToManyIdsTableIdentifier,
-        > + Send + Sync,
+            IMTLeafTableIdentifier,
+            IMTKeyIndexTableIdentifier,
+            IMTNextAppendIndexTableIdentifier,
+        > + Send
+        + Sync,
 > {
     pub store: Arc<S>,
     // start objects
@@ -86,7 +105,7 @@ pub struct QRealmStoreBase<
     pub guta_reward_tag_tree_table: Arc<TagTreeTableIdentifier>,
 
     // start unused table types
-    pub _phantom_double_id_table: std::marker::PhantomData<DoubleIdTableIdentifier>,
+    pub _phantom_double_id_table: std::marker::PhantomData<(DoubleIdTableIdentifier, IMTLeafTableIdentifier, IMTKeyIndexTableIdentifier, IMTNextAppendIndexTableIdentifier)>,
 
     // start phantom N
     pub _phantom_n: std::marker::PhantomData<N>,
@@ -107,6 +126,9 @@ impl<
         ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
         TagTreeTableIdentifier: Clone + Send + Sync,
         HashToManyIdsTableIdentifier: Clone + Send + Sync,
+        IMTLeafTableIdentifier: Clone + Send + Sync,
+        IMTKeyIndexTableIdentifier: Clone + Send + Sync,
+        IMTNextAppendIndexTableIdentifier: Clone + Send + Sync,
         S: CoreDatabaseStore<
                 N::QHash,
                 N::HasherBase,
@@ -122,7 +144,11 @@ impl<
                 ZeroIdMerkleTableIdentifier,
                 TagTreeTableIdentifier,
                 HashToManyIdsTableIdentifier,
-            > + Send + Sync
+                IMTLeafTableIdentifier,
+                IMTKeyIndexTableIdentifier,
+                IMTNextAppendIndexTableIdentifier,
+            > + Send
+            + Sync,
     >
     QRealmStoreBase<
         N,
@@ -138,6 +164,9 @@ impl<
         ZeroIdMerkleTableIdentifier,
         TagTreeTableIdentifier,
         HashToManyIdsTableIdentifier,
+        IMTLeafTableIdentifier,
+        IMTKeyIndexTableIdentifier,
+        IMTNextAppendIndexTableIdentifier,
         S,
     >
 {
@@ -294,6 +323,9 @@ impl<
         ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
         TagTreeTableIdentifier: Clone + Send + Sync,
         HashToManyIdsTableIdentifier: Clone + Send + Sync,
+        IMTLeafTableIdentifier: Clone + Send + Sync,
+        IMTKeyIndexTableIdentifier: Clone + Send + Sync,
+        IMTNextAppendIndexTableIdentifier: Clone + Send + Sync,
         S: CoreDatabaseStore<
                 N::QHash,
                 N::HasherBase,
@@ -309,10 +341,13 @@ impl<
                 ZeroIdMerkleTableIdentifier,
                 TagTreeTableIdentifier,
                 HashToManyIdsTableIdentifier,
-            > + Send + Sync,
-    >
-    QEDRealmStoreReaderAsync<N> for 
-    QRealmStoreBase<
+                IMTLeafTableIdentifier,
+                IMTKeyIndexTableIdentifier,
+                IMTNextAppendIndexTableIdentifier,
+            > + Send
+            + Sync,
+    > QEDRealmStoreReaderAsync<N>
+    for QRealmStoreBase<
         N,
         BiDirectionalMappingTableIdentifier,
         BiDirectionalU64U128MappingTableIdentifier,
@@ -326,6 +361,9 @@ impl<
         ZeroIdMerkleTableIdentifier,
         TagTreeTableIdentifier,
         HashToManyIdsTableIdentifier,
+        IMTLeafTableIdentifier,
+        IMTKeyIndexTableIdentifier,
+        IMTNextAppendIndexTableIdentifier,
         S,
     >
 {
@@ -634,6 +672,9 @@ impl<
         ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
         TagTreeTableIdentifier: Clone + Send + Sync,
         HashToManyIdsTableIdentifier: Clone + Send + Sync,
+        IMTLeafTableIdentifier: Clone + Send + Sync,
+        IMTKeyIndexTableIdentifier: Clone + Send + Sync,
+        IMTNextAppendIndexTableIdentifier: Clone + Send + Sync,
         S: CoreDatabaseStore<
                 N::QHash,
                 N::HasherBase,
@@ -649,10 +690,13 @@ impl<
                 ZeroIdMerkleTableIdentifier,
                 TagTreeTableIdentifier,
                 HashToManyIdsTableIdentifier,
-            > + Send + Sync,
-    >
-    QEDRealmStoreWriterAsyncImm<N> for 
-    QRealmStoreBase<
+                IMTLeafTableIdentifier,
+                IMTKeyIndexTableIdentifier,
+                IMTNextAppendIndexTableIdentifier,
+            > + Send
+            + Sync,
+    > QEDRealmStoreWriterAsyncImm<N>
+    for QRealmStoreBase<
         N,
         BiDirectionalMappingTableIdentifier,
         BiDirectionalU64U128MappingTableIdentifier,
@@ -666,6 +710,9 @@ impl<
         ZeroIdMerkleTableIdentifier,
         TagTreeTableIdentifier,
         HashToManyIdsTableIdentifier,
+        IMTLeafTableIdentifier,
+        IMTKeyIndexTableIdentifier,
+        IMTNextAppendIndexTableIdentifier,
         S,
     >
 {

@@ -1,6 +1,7 @@
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
 use parth_core::{
-    QProvingJobDataIDWithRewardPath, crypto::hash::merkle_proof::MerkleProofCore, data::hash::checkpointed_merkle_node::CheckpointedMerkleHash
+    QProvingJobDataIDWithRewardPath, crypto::hash::merkle_proof::MerkleProofCore,
+    data::hash::checkpointed_merkle_node::CheckpointedMerkleHash,
 };
 
 use psy_data::{
@@ -14,9 +15,6 @@ use psy_data::{
         },
     }
 };
-
-
-
 #[rpc(server, client, namespace = "psy")]
 pub trait CoordinatorEdgeRpc<F, Hash, JobId, ZKProof>: NodeEdgeWorkerRpcServer<Hash, JobId> {
     // Basic methods
@@ -45,6 +43,9 @@ pub trait CoordinatorEdgeRpc<F, Hash, JobId, ZKProof>: NodeEdgeWorkerRpcServer<H
 
     #[method(name = "get_checkpoint_id_for_unique_pending_id")]
     async fn get_checkpoint_id_for_unique_pending_id(&self, unique_pending_id: u64) -> RpcResult<Option<u64>>;
+
+    #[method(name = "get_unique_pending_id_for_checkpoint_id")]
+    async fn get_unique_pending_id_for_checkpoint_id(&self, checkpoint_id: u64) -> RpcResult<Option<(u64, u128)>>;
 
     /*
     // Checkpoint sync info
@@ -155,6 +156,10 @@ pub trait CoordinatorEdgeRpc<F, Hash, JobId, ZKProof>: NodeEdgeWorkerRpcServer<H
     #[method(name = "get_contract_tree_heights")]
     async fn get_contract_tree_heights(&self, checkpoint_id: u64, contract_ids: Vec<u64>) -> RpcResult<Vec<u8>>;
 
+    // Withdrawal tree
+    #[method(name = "get_withdrawal_tree_root")]
+    async fn get_withdrawal_tree_root(&self, checkpoint_id: u64) -> RpcResult<Hash>;
+
     // Checkpoint tree
     #[method(name = "get_latest_checkpoint_tree_root")]
     async fn get_latest_checkpoint_tree_root(&self) -> RpcResult<Hash>;
@@ -178,10 +183,8 @@ pub trait CoordinatorEdgeRpc<F, Hash, JobId, ZKProof>: NodeEdgeWorkerRpcServer<H
     #[method(name = "get_checkpoint_leaves_batch_raw")]
     async fn get_checkpoint_leaves_batch_raw(&self, start_checkpoint_id: u64, count: u32) -> RpcResult<Vec<u8>>;
 
+    /// Retrieve the ZK proof bytes for a given checkpoint's state transition.
+    #[method(name = "get_checkpoint_state_transition_proof")]
+    async fn get_checkpoint_state_transition_proof(&self, checkpoint_id: u64) -> RpcResult<Vec<u8>>;
 
 }
-
-
-
-
-

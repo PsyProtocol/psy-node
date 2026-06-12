@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use parth_common::memory_stores::dash_tag_tree_store::SimpleDashTagTreeStore;
 use parth_core::{
-    crypto::hash::traits::{FieldQHasher, MerkleZeroHasher, ZeroableHash},
+    crypto::hash::{tag_tree::hash_tag_tree_node_single, traits::{FieldQHasher, MerkleZeroHasher, ZeroableHash}},
     data::hash::merkle_node_key::SimpleMerkleNodeKey,
     felt::QFelt64,
     protocol::core_types::{Q256BitHash, QFHashBase, QHashBase, QZKProofVerifier},
@@ -299,8 +299,20 @@ impl<
                 if !self.witness_map.contains_key(&job_id) {
                     anyhow::bail!("Witness not found for state transition job ID {:?}", job_id);
                 }
-                let witness = QCQEDCheckpointStateTransitionInput::psy_ser_from_slice(&self.witness_map.get(&job_id).unwrap())?;
-                witness.get_public_inputs_hash_with_fingerprint_and_reward_root::<Hasher>(self.checkpoint_state_transition_circuit_fingerprint, tag)
+                let witness: QCQEDCheckpointStateTransitionInput<F, Hash> =
+                    QCQEDCheckpointStateTransitionInput::psy_ser_from_slice(
+                        &self.witness_map.get(&job_id).unwrap(),
+                    )?;
+                let part1_reward_value = *child_proof_tag_values
+                    .first()
+                    .ok_or_else(|| anyhow::anyhow!("missing part1 reward value for rollup"))?;
+                let rollup_reward_root =
+                    hash_tag_tree_node_single::<Hash, Hasher>(&part1_reward_value, &tag);
+                witness.get_chain_hash_with_fingerprint_and_reward_root::<Hasher>(
+                    witness.previous_chain_hash,
+                    self.checkpoint_state_transition_circuit_fingerprint,
+                    rollup_reward_root,
+                )
             }
             ProvingJobCircuitType::GenesisBlockCheckpointStateTransition | ProvingJobCircuitType::UserEndCap => metadata.expected_public_inputs_hash,
             _ => metadata.compute_reward_tagged_expected_public_inputs::<Hasher>(tag, &child_proof_tag_values)?,

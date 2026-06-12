@@ -1,0 +1,35 @@
+target
+*.log
+*.sublime*
+*~
+*.pyc
+result
+.DS_Store
+**/.DS_Store
+test-db
+**/db
+redis-data/
+/examples
+# *.sh
+perf2
+
+psy_prover/examples/debug_data/
+target/
+**/node_modules/
+.idea/
+.cursor
+.cursorrules
+.cursorignore
+.specstory
+.cursorindexingignore
+# SpecStory explanation file
+.specstory/.what-is-this.md
+/.vscode/
+
+book/
+
+*-key
+*-key.pub
+
+# Generated deployment files
+/aws*/

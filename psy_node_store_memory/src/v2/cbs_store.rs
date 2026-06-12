@@ -33,7 +33,7 @@ use parth_core::{
     protocol::core_types::{QDBHashBase, QHashBase},
 };
 use psy_node_core::store::traits::core_db::{
-    CoreDatabaseBidirectionalMappingReader, CoreDatabaseBidirectionalMappingWriter, CoreDatabaseBidirectionalU64U128MappingReader, CoreDatabaseBidirectionalU64U128MappingWriter, CoreDatabaseDoubleIdCheckpointedReader, CoreDatabaseDoubleIdCheckpointedWriter, CoreDatabaseDoubleIdMerkleReader, CoreDatabaseDoubleIdMerkleWriter, CoreDatabaseHashToManyIdsReader, CoreDatabaseHashToManyIdsWriter, CoreDatabaseKivReader, CoreDatabaseKivWriter, CoreDatabaseSingleIdCheckpointedReader, CoreDatabaseSingleIdCheckpointedWriter, CoreDatabaseSingleIdMerkleReader, CoreDatabaseSingleIdMerkleWriter, CoreDatabaseTagTreeReader, CoreDatabaseTagTreeWriter, CoreDatabaseU64CounterReader, CoreDatabaseU64CounterStore, CoreDatabaseU64CounterWriter, CoreDatabaseU64Reader, CoreDatabaseU64Store, CoreDatabaseU64Writer, CoreDatabaseZeroIdMerkleDumpReader, CoreDatabaseZeroIdMerkleReader, CoreDatabaseZeroIdMerkleWriter, MerkleTreeDumpStrategy
+    CoreDatabaseBidirectionalMappingReader, CoreDatabaseBidirectionalMappingWriter, CoreDatabaseBidirectionalU64U128MappingReader, CoreDatabaseBidirectionalU64U128MappingWriter, CoreDatabaseDoubleIdCheckpointedReader, CoreDatabaseDoubleIdCheckpointedWriter, CoreDatabaseDoubleIdMerkleReader, CoreDatabaseDoubleIdMerkleWriter, CoreDatabaseHashToManyIdsReader, CoreDatabaseHashToManyIdsWriter, CoreDatabaseIMTKeyIndexReader, CoreDatabaseIMTKeyIndexWriter, CoreDatabaseIMTNextAppendIndexReader, CoreDatabaseIMTNextAppendIndexWriter, CoreDatabaseIMTLeafReader, CoreDatabaseIMTLeafWriter, CoreDatabaseKivReader, CoreDatabaseKivWriter, CoreDatabaseSingleIdCheckpointedReader, CoreDatabaseSingleIdCheckpointedWriter, CoreDatabaseSingleIdMerkleReader, CoreDatabaseSingleIdMerkleWriter, CoreDatabaseTagTreeReader, CoreDatabaseTagTreeWriter, CoreDatabaseU64CounterReader, CoreDatabaseU64CounterStore, CoreDatabaseU64CounterWriter, CoreDatabaseU64Reader, CoreDatabaseU64Store, CoreDatabaseU64Writer, CoreDatabaseZeroIdMerkleDumpReader, CoreDatabaseZeroIdMerkleReader, CoreDatabaseZeroIdMerkleWriter, MerkleTreeDumpStrategy
 };
 use psy_serialize::{PsyCanonicalDatabaseSerializeBaseSingle, PsySerializeCanonicalAsyncSafe};
 use std::{
@@ -1786,5 +1786,302 @@ where
         }
 
         Ok(results)
+    }
+}
+
+// IMT Leaf table implementation for InMemoryCoreStore
+#[async_trait]
+impl<Hash, Hasher> CoreDatabaseIMTLeafReader<InMemoryTableIdentifier>
+    for InMemoryCoreStore<Hash, Hasher>
+where
+    Hash: QDBHashBase,
+    Hasher: MerkleZeroHasher<Hash> + Send + Sync
+{
+    async fn db_select_imt_leaf(
+        &self,
+        table: &InMemoryTableIdentifier,
+        tree_id: i64,
+        tree_sub_id: i64,
+        leaf_index: i64,
+        max_checkpoint_id: i64,
+    ) -> anyhow::Result<Option<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, i64)>> {
+        let db = self.get_or_create_table(&format!("{}_imt_leaf_{}", table.to_string(), "leaf"));
+        // Key: (tree_id, tree_sub_id, leaf_index, checkpoint_id) as bytes
+        let mut key = Vec::new();
+        key.extend_from_slice(&tree_id.to_be_bytes());
+        key.extend_from_slice(&tree_sub_id.to_be_bytes());
+        key.extend_from_slice(&leaf_index.to_be_bytes());
+        key.extend_from_slice(&max_checkpoint_id.to_be_bytes());
+
+        // Try primary key first
+        if let Some(entry) = db.get(&key) {
+            let value = entry.value();
+            if value.len() >= 136 {
+                let leaf_hash = value[0..32].to_vec();
+                let leaf_key = value[32..64].to_vec();
+                let leaf_value = value[64..96].to_vec();
+                let next_key = value[96..128].to_vec();
+                let next_index = i64::from_be_bytes(value[128..136].try_into()?);
+                return Ok(Some((leaf_hash, leaf_key, leaf_value, next_key, next_index)));
+            }
+        }
+        // Try with checkpoint 0 as fallback (latest)
+        let mut key0 = Vec::new();
+        key0.extend_from_slice(&tree_id.to_be_bytes());
+        key0.extend_from_slice(&tree_sub_id.to_be_bytes());
+        key0.extend_from_slice(&leaf_index.to_be_bytes());
+        key0.extend_from_slice(&0i64.to_be_bytes());
+        if let Some(entry) = db.get(&key0) {
+            let value = entry.value();
+            if value.len() >= 136 {
+                let leaf_hash = value[0..32].to_vec();
+                let leaf_key = value[32..64].to_vec();
+                let leaf_value = value[64..96].to_vec();
+                let next_key = value[96..128].to_vec();
+                let next_index = i64::from_be_bytes(value[128..136].try_into()?);
+                return Ok(Some((leaf_hash, leaf_key, leaf_value, next_key, next_index)));
+            }
+        }
+        Ok(None)
+    }
+}
+
+#[async_trait]
+impl<Hash, Hasher> CoreDatabaseIMTLeafWriter<InMemoryTableIdentifier>
+    for InMemoryCoreStore<Hash, Hasher>
+where
+    Hash: QDBHashBase,
+    Hasher: MerkleZeroHasher<Hash> + Send + Sync
+{
+    async fn db_insert_imt_leaf(
+        &self,
+        table: &InMemoryTableIdentifier,
+        tree_id: i64,
+        tree_sub_id: i64,
+        leaf_index: i64,
+        checkpoint_id: i64,
+        leaf_hash: &[u8],
+        leaf_key: &[u8],
+        leaf_value: &[u8],
+        next_key: &[u8],
+        next_index: i64,
+    ) -> anyhow::Result<()> {
+        let db = self.get_or_create_table(&format!("{}_imt_leaf_{}", table.to_string(), "leaf"));
+        let mut key = Vec::new();
+        key.extend_from_slice(&tree_id.to_be_bytes());
+        key.extend_from_slice(&tree_sub_id.to_be_bytes());
+        key.extend_from_slice(&leaf_index.to_be_bytes());
+        key.extend_from_slice(&checkpoint_id.to_be_bytes());
+
+        let mut value = Vec::with_capacity(136);
+        value.extend_from_slice(&leaf_hash[..32.min(leaf_hash.len())]);
+        value.resize(32, 0);
+        value.extend_from_slice(&leaf_key[..32.min(leaf_key.len())]);
+        value.resize(64, 0);
+        value.extend_from_slice(&leaf_value[..32.min(leaf_value.len())]);
+        value.resize(96, 0);
+        value.extend_from_slice(&next_key[..32.min(next_key.len())]);
+        value.resize(128, 0);
+        value.extend_from_slice(&next_index.to_be_bytes());
+
+        db.insert(key, value);
+        Ok(())
+    }
+}
+
+// IMT Key Index table implementation for InMemoryCoreStore
+#[async_trait]
+impl<Hash, Hasher> CoreDatabaseIMTKeyIndexReader<InMemoryTableIdentifier>
+    for InMemoryCoreStore<Hash, Hasher>
+where
+    Hash: QDBHashBase,
+    Hasher: MerkleZeroHasher<Hash> + Send + Sync
+{
+    async fn db_select_imt_key_index_exact(
+        &self,
+        table: &InMemoryTableIdentifier,
+        tree_id: i64,
+        tree_sub_id: i64,
+        key_bucket: i16,
+        encoded_key: &[u8],
+    ) -> anyhow::Result<Option<(i64, i64)>> {
+        let db = self.get_or_create_table(&format!("{}_imt_key_index_{}", table.to_string(), "idx"));
+        let mut key = Vec::new();
+        key.extend_from_slice(&tree_id.to_be_bytes());
+        key.extend_from_slice(&tree_sub_id.to_be_bytes());
+        key.extend_from_slice(&key_bucket.to_be_bytes());
+        key.extend_from_slice(encoded_key);
+
+        Ok(db.get(&key).and_then(|entry| {
+            let value = entry.value();
+            if value.len() >= 16 {
+                let leaf_index = i64::from_be_bytes(value[0..8].try_into().unwrap());
+                let birth_checkpoint = i64::from_be_bytes(value[8..16].try_into().unwrap());
+                Some((leaf_index, birth_checkpoint))
+            } else {
+                None
+            }
+        }))
+    }
+
+    async fn db_select_imt_key_index_predecessor(
+        &self,
+        table: &InMemoryTableIdentifier,
+        tree_id: i64,
+        tree_sub_id: i64,
+        key_bucket: i16,
+        target_encoded_key: &[u8],
+    ) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>, i64, i64)>> {
+        let db = self.get_or_create_table(&format!("{}_imt_key_index_{}", table.to_string(), "idx"));
+        let mut prefix = Vec::new();
+        prefix.extend_from_slice(&tree_id.to_be_bytes());
+        prefix.extend_from_slice(&tree_sub_id.to_be_bytes());
+        prefix.extend_from_slice(&key_bucket.to_be_bytes());
+        let prefix_str = String::from_utf8_lossy(&prefix).to_string();
+        let mut results = Vec::new();
+
+        for entry in db.range(prefix.clone()..) {
+            let key = entry.key();
+            if key.len() < prefix.len() {
+                break;
+            }
+            // Extract encoded_key from the key (after prefix)
+            let encoded_key_bytes = &key[prefix.len()..];
+            // Compare encoded_key < target_encoded_key (now both are MSL-encoded)
+            if encoded_key_bytes < target_encoded_key {
+                let value = entry.value();
+                if value.len() >= 32 {
+                    let leaf_index = i64::from_be_bytes(value[0..8].try_into()?);
+                    let birth_checkpoint = i64::from_be_bytes(value[8..16].try_into()?);
+                    let leaf_key_bytes = value[16..48].to_vec();
+                    results.push((encoded_key_bytes.to_vec(), leaf_key_bytes, leaf_index, birth_checkpoint));
+                }
+            }
+        }
+
+        // Sort by encoded_key descending and take up to 5
+        results.sort_by(|a, b| b.0.cmp(&a.0));
+        results.truncate(5);
+        Ok(results)
+    }
+
+    async fn db_select_imt_key_index_predecessor_full_bucket(
+        &self,
+        table: &InMemoryTableIdentifier,
+        tree_id: i64,
+        tree_sub_id: i64,
+        key_bucket: i16,
+    ) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>, i64, i64)>> {
+        let db = self.get_or_create_table(&format!("{}_imt_key_index_{}", table.to_string(), "idx"));
+        let mut prefix = Vec::new();
+        prefix.extend_from_slice(&tree_id.to_be_bytes());
+        prefix.extend_from_slice(&tree_sub_id.to_be_bytes());
+        prefix.extend_from_slice(&key_bucket.to_be_bytes());
+        let mut results = Vec::new();
+
+        for entry in db.range(prefix.clone()..) {
+            let key = entry.key();
+            if key.len() < prefix.len() {
+                break;
+            }
+            let encoded_key_bytes = &key[prefix.len()..];
+            let value = entry.value();
+            if value.len() >= 32 {
+                let leaf_index = i64::from_be_bytes(value[0..8].try_into()?);
+                let birth_checkpoint = i64::from_be_bytes(value[8..16].try_into()?);
+                let leaf_key_bytes = value[16..48].to_vec();
+                results.push((encoded_key_bytes.to_vec(), leaf_key_bytes, leaf_index, birth_checkpoint));
+            }
+        }
+
+        // Sort by encoded_key descending and take up to 5
+        results.sort_by(|a, b| b.0.cmp(&a.0));
+        results.truncate(5);
+        Ok(results)
+    }
+}
+
+#[async_trait]
+impl<Hash, Hasher> CoreDatabaseIMTKeyIndexWriter<InMemoryTableIdentifier>
+    for InMemoryCoreStore<Hash, Hasher>
+where
+    Hash: QDBHashBase,
+    Hasher: MerkleZeroHasher<Hash> + Send + Sync
+{
+    async fn db_insert_imt_key_index(
+        &self,
+        table: &InMemoryTableIdentifier,
+        tree_id: i64,
+        tree_sub_id: i64,
+        key_bucket: i16,
+        encoded_key: &[u8],
+        leaf_key: &[u8],
+        birth_checkpoint: i64,
+        leaf_index: i64,
+    ) -> anyhow::Result<()> {
+        let db = self.get_or_create_table(&format!("{}_imt_key_index_{}", table.to_string(), "idx"));
+        let mut key = Vec::new();
+        key.extend_from_slice(&tree_id.to_be_bytes());
+        key.extend_from_slice(&tree_sub_id.to_be_bytes());
+        key.extend_from_slice(&key_bucket.to_be_bytes());
+        key.extend_from_slice(encoded_key);
+
+        // Store: leaf_index (8 bytes) + birth_checkpoint (8 bytes) + leaf_key (32 bytes)
+        let mut value = Vec::with_capacity(48);
+        value.extend_from_slice(&leaf_index.to_be_bytes());
+        value.extend_from_slice(&birth_checkpoint.to_be_bytes());
+        value.extend_from_slice(leaf_key);
+
+        db.insert(key, value);
+        Ok(())
+    }
+}
+#[async_trait]
+impl<Hash, Hasher> CoreDatabaseIMTNextAppendIndexReader<InMemoryTableIdentifier>
+    for InMemoryCoreStore<Hash, Hasher>
+where
+    Hash: QDBHashBase,
+    Hasher: MerkleZeroHasher<Hash> + Send + Sync
+{
+    async fn db_select_imt_next_append_index(
+        &self,
+        table: &InMemoryTableIdentifier,
+        tree_id: i64,
+        tree_sub_id: i64,
+    ) -> anyhow::Result<Option<i64>> {
+        let db = self.get_or_create_table(&format!("{}_imt_next_append_index", table.to_string()));
+
+        let mut key = Vec::new();
+        key.extend_from_slice(&tree_id.to_be_bytes());
+        key.extend_from_slice(&tree_sub_id.to_be_bytes());
+
+        Ok(db.get(&key).map(|v| i64::from_be_bytes(v.value().as_slice().try_into().unwrap())))
+    }
+}
+
+#[async_trait]
+impl<Hash, Hasher> CoreDatabaseIMTNextAppendIndexWriter<InMemoryTableIdentifier>
+    for InMemoryCoreStore<Hash, Hasher>
+where
+    Hash: QDBHashBase,
+    Hasher: MerkleZeroHasher<Hash> + Send + Sync
+{
+    async fn db_insert_imt_next_append_index(
+        &self,
+        table: &InMemoryTableIdentifier,
+        tree_id: i64,
+        tree_sub_id: i64,
+        next_append_index: i64,
+    ) -> anyhow::Result<()> {
+        let db = self.get_or_create_table(&format!("{}_imt_next_append_index", table.to_string()));
+        let mut key = Vec::new();
+        key.extend_from_slice(&tree_id.to_be_bytes());
+        key.extend_from_slice(&tree_sub_id.to_be_bytes());
+        
+        let mut value = Vec::with_capacity(8);
+        value.extend_from_slice(&next_append_index.to_be_bytes());
+        
+        db.insert(key, value);
+        Ok(())
     }
 }

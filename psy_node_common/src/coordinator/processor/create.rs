@@ -67,11 +67,13 @@ pub async fn create_coordinator_processor<
 where
     FileSystem::File: Send + Sync,
 {
+    tracing::info!("[COORD_CREATE] setup_for_coordinator start");
     let (genesis_verifiable_checkpoint_transition, genesis_block_update) =
         GenesisDatabaseDataBuilder::<N::F, N::QHash>::setup_for_coordinator::<N::HasherBase, N>(
             genesis_data,
             circuit_fingerprint_config.checkpoint_state_transition_circuit_fingerprint,
         )?;
+    tracing::info!("[COORD_CREATE] setup_for_coordinator done");
 
     //tracing::debug!("genesis verifiable_checkpoint_transition: {:#?}", genesis_verifiable_checkpoint_transition);
 
@@ -111,6 +113,7 @@ where
         checkpoint_tree_root_backup_file_path,
     )
     .await?;
+    tracing::info!("[COORD_CREATE] db new_init done");
     /*
     pub async fn new(
         mut db: PsyCoordinatorDatabaseProcessor<
@@ -163,6 +166,7 @@ where
         guta_gatherer_backup_directory,
     )
     .await?;
+    tracing::info!("[COORD_CREATE] processor new done");
 
     Ok(processor_result)
 }
@@ -201,6 +205,7 @@ pub async fn create_coordinator_processor_and_run<
 where
     FileSystem::File: Send + Sync,
 {
+    tracing::info!("[COORD_CREATE] create_and_run start");
     let (processor, guta_gatherer_join_handle, register_users_gatherer_join_handle, deploy_contracts_gatherer_join_handle) = create_coordinator_processor::<N, S, STagTreeRewards, GUTAUpdateQueue, RegisterUserQueue, DeployContractQueue, ProofWorkQueue, TempDatabase, ProofStore, FileSystem>(
         genesis_data,
         file_system,

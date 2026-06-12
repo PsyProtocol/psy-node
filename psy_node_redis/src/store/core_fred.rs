@@ -33,6 +33,7 @@ type RedisPool = Pool;
 
 pub const REDIS_TMP_PROOF_STORE_PREFIX: &str = "TMPPSV1";
 pub const REDIS_TMP_KV_STORE_PREFIX: &str = "TKVSV1";
+const REDIS_TMP_PROOF_FIELD_TTL_SECONDS: i64 = 600;
 
 fn get_tmp_kv_store_ns_key(root_prefix: &str, realm_id: u64, realm_sub_id: u64) -> String {
     format!("{}-{}-{}-{}", REDIS_TMP_KV_STORE_PREFIX, root_prefix, realm_id, realm_sub_id)
@@ -40,6 +41,18 @@ fn get_tmp_kv_store_ns_key(root_prefix: &str, realm_id: u64, realm_sub_id: u64) 
 
 fn get_tmp_proof_store_ns_key(root_prefix: &str, realm_id: u64, realm_sub_id: u64) -> String {
     format!("{}-{}-{}-{}", REDIS_TMP_PROOF_STORE_PREFIX, root_prefix, realm_id, realm_sub_id)
+}
+
+fn get_tmp_proof_store_bucket_ns_key(
+    root_prefix: &str,
+    realm_id: u64,
+    realm_sub_id: u64,
+    unique_pending_id: u64,
+) -> String {
+    format!(
+        "{}-{}-{}-{}-{}",
+        REDIS_TMP_PROOF_STORE_PREFIX, root_prefix, realm_id, realm_sub_id, unique_pending_id
+    )
 }
 
 /// Create a high-performance fred RedisPool
@@ -126,6 +139,15 @@ impl StandardFredRedisStore {
 
     pub async fn set_bytes_generic_internal(&self, ns_key: &str, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
         let _: () = self.client.hset(ns_key, (key, value)).await?;
+        Ok(())
+    }
+
+    async fn set_proof_bytes_internal(&self, ns_key: &str, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
+        let _: () = self.client.hset(ns_key, (key, value)).await?;
+        let _: () = self
+            .client
+            .hexpire(ns_key, REDIS_TMP_PROOF_FIELD_TTL_SECONDS, None, key)
+            .await?;
         Ok(())
     }
 
@@ -553,16 +575,18 @@ impl QStandardEphemeralQueueSubscriber for StandardFredRedisStore {
 
 #[async_trait]
 impl QParthProofStoreReader for StandardFredRedisStore {
-    async fn get_proof_bytes_by_job_id<J: Into<QJobIdSerialized> + Copy + Send + Sync>(&self, job_id: J) -> anyhow::Result<Option<Vec<u8>>> {
+    async fn get_proof_bytes_by_job_id<J: Into<QJobIdSerialized> + Copy + Send + Sync>(&self, job_id: J, unique_pending_id: u64) -> anyhow::Result<Option<Vec<u8>>> {
         let job_id_bytes = job_id.into().to_vec();
+        let bucket = get_tmp_proof_store_bucket_ns_key(&self.root_prefix, self.realm_id, self.realm_sub_id, unique_pending_id);
         // hget returns Option<Value> or Value::Null -> maps to Option<Vec<u8>> with correct type hint
-        let data: Option<Vec<u8>> = self.client.hget(&self.proof_store_namespace, &job_id_bytes[..]).await?;
+        let data: Option<Vec<u8>> = self.client.hget(&bucket, &job_id_bytes[..]).await?;
         Ok(data.filter(|d| !d.is_empty()))
     }
 
-    async fn get_proof_by_job_id<J: Into<QJobIdSerialized> + Copy + Send + Sync, P: QPDSerializable>(&self, job_id: J) -> anyhow::Result<Option<P>> {
+    async fn get_proof_by_job_id<J: Into<QJobIdSerialized> + Copy + Send + Sync, P: QPDSerializable>(&self, job_id: J, unique_pending_id: u64) -> anyhow::Result<Option<P>> {
         let job_id_bytes = job_id.into().to_vec();
-        let data: Option<Vec<u8>> = self.client.hget(&self.proof_store_namespace, &job_id_bytes[..]).await?;
+        let bucket = get_tmp_proof_store_bucket_ns_key(&self.root_prefix, self.realm_id, self.realm_sub_id, unique_pending_id);
+        let data: Option<Vec<u8>> = self.client.hget(&bucket, &job_id_bytes[..]).await?;
         if let Some(d) = data {
              if d.is_empty() { Ok(None) } else { Ok(Some(P::from_bytes(&d)?)) }
         } else {
@@ -570,29 +594,38 @@ impl QParthProofStoreReader for StandardFredRedisStore {
         }
     }
 
-    async fn contains_proof_for_job_id<J: Into<QJobIdSerialized> + Copy + Send + Sync>(&self, job_id: J) -> anyhow::Result<bool> {
+    async fn contains_proof_for_job_id<J: Into<QJobIdSerialized> + Copy + Send + Sync>(&self, job_id: J, unique_pending_id: u64) -> anyhow::Result<bool> {
         let job_id_bytes = job_id.into().to_vec();
-        let data: bool = self.client.hexists(&self.proof_store_namespace, &job_id_bytes[..]).await?;
+        let bucket = get_tmp_proof_store_bucket_ns_key(&self.root_prefix, self.realm_id, self.realm_sub_id, unique_pending_id);
+        let data: bool = self.client.hexists(&bucket, &job_id_bytes[..]).await?;
         Ok(data)
     }
 }
 
 #[async_trait]
 impl QParthProofStoreWriter for StandardFredRedisStore {
-    async fn put_proof_bytes_for_job_id<J: Into<QJobIdSerialized> + Copy + Send + Sync>(&self, job_id: J, proof_bytes: &[u8]) -> anyhow::Result<()> {
+    async fn put_proof_bytes_for_job_id<J: Into<QJobIdSerialized> + Copy + Send + Sync>(&self, job_id: J, unique_pending_id: u64, proof_bytes: &[u8]) -> anyhow::Result<()> {
         let job_id_bytes = job_id.into().to_vec();
-        self.set_bytes_generic_internal(&self.proof_store_namespace, &job_id_bytes, proof_bytes)
+        let bucket = get_tmp_proof_store_bucket_ns_key(&self.root_prefix, self.realm_id, self.realm_sub_id, unique_pending_id);
+        self.set_proof_bytes_internal(&bucket, &job_id_bytes, proof_bytes)
             .await
     }
     async fn put_proof_for_job_id<J: Into<QJobIdSerialized> + Copy + Send + Sync, P: QPDSerializable + Send + Sync>(
         &self,
         job_id: J,
+        unique_pending_id: u64,
         proof: &P,
     ) -> anyhow::Result<()> {
         let job_id_bytes = job_id.into().to_vec();
+        let bucket = get_tmp_proof_store_bucket_ns_key(&self.root_prefix, self.realm_id, self.realm_sub_id, unique_pending_id);
         let proof_bytes = proof.to_bytes()?;
-        self.set_bytes_generic_internal(&self.proof_store_namespace, &job_id_bytes, &proof_bytes)
+        self.set_proof_bytes_internal(&bucket, &job_id_bytes, &proof_bytes)
             .await
+    }
+    async fn delete_all_proofs_for_pending_id(&self, unique_pending_id: u64) -> anyhow::Result<()> {
+        let bucket = get_tmp_proof_store_bucket_ns_key(&self.root_prefix, self.realm_id, self.realm_sub_id, unique_pending_id);
+        let _: i64 = self.client.del(&bucket).await?;
+        Ok(())
     }
 }
 
@@ -700,4 +733,3 @@ impl QTempDatabaseRawCounterWriterBase for StandardFredRedisStore {
 }
 
 impl QAutoImplementGeneric for StandardFredRedisStore {}
-

@@ -31,12 +31,14 @@ pub fn get_psy_node_circuit_config_for_local_devnet() -> anyhow::Result<PsyNodeC
     let deploy_contracts_circuit_whitelist_root = Hasher::two_to_one(&batch_deploy_contracts_fingerprint, &agg_state_transition_fingerprint);
 
     let checkpoint_state_transition_circuit_fingerprint = lib.get_fingerprint(ProvingJobCircuitType::GenerateRollupStateTransitionProof)?;
+    let genesis_checkpoint_state_transition_fingerprint = lib.get_fingerprint(ProvingJobCircuitType::GenesisBlockCheckpointStateTransition)?;
 
     Ok(PsyNodeCircuitFingerprintConfig {
         guta_circuit_whitelist_root,
         register_users_circuit_whitelist_root,
         deploy_contracts_circuit_whitelist_root,
         checkpoint_state_transition_circuit_fingerprint,
+        genesis_checkpoint_state_transition_fingerprint,
     })
 }
 
@@ -138,12 +140,19 @@ pub fn get_public_key_param<F: RichField, H: AlgebraicHasher<F>>(private_key: QH
     ]))
 }
 
+#[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
+    use parth_core::data::hash::merkle_node_nest::{MerkleLeafNode, MerkleNodeNest};
     use plonky2::{
         field::{goldilocks_field::GoldilocksField, types::Field},
         hash::poseidon::PoseidonHash,
         plonk::config::Hasher,
     };
+    use psy_cli_common::key_utils::{load_wallet_key_info, WalletSourceArgs};
+    use psy_client_common::args::SignType;
+    use psy_core::user_id::{UserIdBitsStrategy5, UserIdGeneratorStrategy};
     use psy_data::{
         user::complete_user_record::PsyCompactUserDefinition,
         v1::qdata::{
@@ -157,16 +166,79 @@ mod tests {
     type F = GoldilocksField;
     type Hash = QHashOut<F>;
 
+    fn deterministic_private_key(slot: u64) -> QHashOut<F> {
+        // Stable per-slot key derivation for local devnet artifacts.
+        QHashOut::from_values(
+            0x9e37_79b9_7f4a_7c15u64 ^ slot.wrapping_mul(0xbf58_476d_1ce4_e5b9u64),
+            0x243f_6a88_85a3_08d3u64 ^ slot.wrapping_mul(0x94d0_49bb_1331_11ebu64),
+            0xb7e1_5162_8aed_2a6bu64 ^ slot.wrapping_mul(0xda94_2042_e4dd_58b5u64),
+            0xc6ef_372f_e94f_82beu64 ^ slot.wrapping_mul(0x9e37_79b9_7f4a_7c15u64),
+        )
+    }
+
+    fn read_env(name: &str) -> Option<String> {
+        std::env::var(name)
+            .ok()
+            .map(|raw| raw.trim().to_string())
+            .filter(|raw| !raw.is_empty())
+    }
+
+    fn resolve_bridge_relayer_private_key() -> anyhow::Result<Option<QHashOut<F>>> {
+        let private_key = read_env("PRIVATE_KEY").or_else(|| read_env("BRIDGE_RELAYER_L2_PRIVATE_KEY"));
+        let keystore_path = read_env("KEYSTORE_PATH")
+            .or_else(|| read_env("BRIDGE_RELAYER_KEYSTORE_PATH"))
+            .or_else(|| {
+                // Use the daemon default only when it actually exists. A
+                // missing default keystore should not block fresh genesis
+                // generation; deployments without an explicit relayer key can
+                // still create a random genesis key.
+                let default = format!("{}/.psy/keystore/bridge-relayer", std::env::var("HOME").ok()?);
+                std::path::Path::new(&default).exists().then_some(default)
+            });
+        let wallet_password = read_env("WALLET_PASSWORD");
+
+        if private_key.is_none() && keystore_path.is_none() {
+            return Ok(None);
+        }
+
+        let wallet_args = WalletSourceArgs {
+            sign_type: SignType::ZKSign,
+            private_key,
+            keystore_path,
+            wallet_password,
+            fingerprint: None,
+            sdk_key_allowed_contract_id: vec![],
+            sdk_key_allowed_method_id: vec![],
+            sdk_key_expected_tx_count: 2,
+        };
+        let info = load_wallet_key_info(&wallet_args, false)?;
+        Ok(Some(QHashOut::<F>::from_str(&info.private_key.to_string())?))
+    }
+
     #[test]
     fn test_generate_genesis_block_setup_data_for_local_devnet() -> anyhow::Result<()> {
-        let contracts = serde_json::from_str::<Vec<PQBCDeployContract<QHashOut<F>>>>(include_str!("../../../../../token.deploy.json"))?;
-        let mut users = Vec::with_capacity(1<<19);
-        let mut private_keys = Vec::with_capacity(1<<19);
+let genesis_bytes: &[u8] = include_bytes!("../../../../../psy-genesis/genesis_contracts.json");
+        let contracts: Vec<PQBCDeployContract<QHashOut<F>>> = match serde_json::from_slice(genesis_bytes) {
+            Ok(v) => v,
+            Err(_) => {
+                let decoded = zstd::stream::decode_all(genesis_bytes)?;
+                serde_json::from_slice(&decoded)?
+            }
+        };
+        let mut users = Vec::with_capacity(1 << 19);
+        let mut private_keys = Vec::with_capacity(1 << 19);
 
         let zk_fingerprint = QHashOut::<F>::from_values(ZK_FINGERPRINT_U64[0], ZK_FINGERPRINT_U64[1], ZK_FINGERPRINT_U64[2], ZK_FINGERPRINT_U64[3]);
+        let sd_key_fingerprint = QHashOut::<F>::from_str("ade963d92bbf8772d671fd90a15e00e34897fc3ef6733dc588e1976ebfd222e0")?;
 
-        for i in 0..1 << 19 {
-            let private_key = QHashOut(PoseidonHash::hash_no_pad(&[F::from_canonical_u64(i)]));
+        let relayer_private_key = resolve_bridge_relayer_private_key()?;
+
+        for i in 0..1 << 2 {
+            let private_key = if i == 2 {
+                relayer_private_key.unwrap_or_else(|| deterministic_private_key(i as u64))
+            } else {
+                deterministic_private_key(i as u64)
+            };
             private_keys.push(private_key);
             let public_key_param = get_public_key_param::<F, PoseidonHash>(private_key);
             users.push(PsyCompactUserDefinition {
@@ -178,7 +250,36 @@ mod tests {
                 nonce: 0,
                 last_checkpoint_id: 0,
                 event_index: 0,
-                constract_state_tree_records: vec![],
+                constract_state_tree_records: vec![MerkleNodeNest {
+                    parent_index: 0,
+                    children: vec![MerkleLeafNode {
+                        index: 0,
+                        value: QHashOut::<F>::from_values(1_000_000_000_000_000, 0, 0, 0),
+                    }],
+                }],
+            });
+        }
+
+        for i in 0..10 {
+            let private_key = deterministic_private_key(((1 << 2) + i) as u64);
+            private_keys.push(private_key);
+            let public_key_param = get_public_key_param::<F, PoseidonHash>(private_key);
+            users.push(PsyCompactUserDefinition {
+                public_key_info: PZKPublicKeyInfo {
+                    public_key_param,
+                    fingerprint: sd_key_fingerprint,
+                },
+                balance: 0,
+                nonce: 0,
+                last_checkpoint_id: 0,
+                event_index: 0,
+                constract_state_tree_records: vec![MerkleNodeNest {
+                    parent_index: 0,
+                    children: vec![MerkleLeafNode {
+                        index: 0,
+                        value: QHashOut::<F>::from_values(1_000_000_000_000_000, 0, 0, 0),
+                    }],
+                }],
             });
         }
 
@@ -212,7 +313,90 @@ mod tests {
         let project_dir = env!("CARGO_MANIFEST_DIR");
 
         std::fs::write(&format!("{}/../genesis.json", project_dir), serde_json::to_string_pretty(&genesis_data)?)?;
-        std::fs::write(&format!("{}/../private_keys.json", project_dir), serde_json::to_string_pretty(&private_keys)?)?;
+        std::fs::write(
+            &format!("{}/../private_keys.json", project_dir),
+            serde_json::to_string_pretty(&private_keys)?,
+        )?;
+
+        // Emit faucet operator config for psy-privacy-bridge. The 10 sdk-key
+        // users above (slots 4..14) are the faucet operators; their userId in
+        // the indexer is the Strategy5-mapped registration id, and `address`
+        // is the same Poseidon public key param the genesis user record uses.
+        #[derive(serde::Serialize)]
+        struct FaucetOperatorJson {
+            #[serde(rename = "userId")]
+            user_id: String,
+            address: String,
+            #[serde(rename = "privateKey")]
+            private_key: String,
+            fingerprint: String,
+            #[serde(rename = "signType")]
+            sign_type: String,
+        }
+
+        #[derive(serde::Serialize)]
+        struct FaucetOperatorsJson {
+            #[serde(rename = "faucetContractId")]
+            faucet_contract_id: u64,
+            #[serde(rename = "faucetMethodName")]
+            faucet_method_name: String,
+            #[serde(rename = "faucetMethodId")]
+            faucet_method_id: u64,
+            #[serde(rename = "faucetPerClaimAmountNano")]
+            faucet_per_claim_amount_nano: String,
+            #[serde(rename = "sdkKeyExpectedTxCount")]
+            sdk_key_expected_tx_count: u32,
+            operators: Vec<FaucetOperatorJson>,
+        }
+
+        const LOCAL_DEVNET_COORDINATOR_GLOBAL_USER_TREE_HEIGHT: u8 = 12;
+        const LOCAL_DEVNET_REALM_GLOBAL_USER_TREE_HEIGHT: u8 = 20;
+        const LOCAL_DEVNET_GROUP_REALM_HEIGHT: u8 = 1;
+        const FAUCET_OPERATOR_SLOT_START: usize = 4;
+        const FAUCET_OPERATOR_COUNT: usize = 10;
+
+        let operators: Vec<FaucetOperatorJson> = (0..FAUCET_OPERATOR_COUNT)
+            .map(|i| {
+                let slot = FAUCET_OPERATOR_SLOT_START + i;
+                let pk = private_keys[slot];
+                let user_id = UserIdBitsStrategy5::get_user_id_from_user_registration_id(
+                    slot as u64,
+                    LOCAL_DEVNET_COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
+                    LOCAL_DEVNET_REALM_GLOBAL_USER_TREE_HEIGHT,
+                    LOCAL_DEVNET_GROUP_REALM_HEIGHT,
+                );
+                let public_key_param = get_public_key_param::<F, PoseidonHash>(pk);
+                let pk_info = PZKPublicKeyInfo {
+                    fingerprint: sd_key_fingerprint,
+                    public_key_param,
+                };
+                let address = pk_info.to_hash::<PoseidonHasher>();
+                FaucetOperatorJson {
+                    user_id: user_id.to_string(),
+                    address: format!("{}", address),
+                    private_key: format!("{}", pk),
+                    fingerprint: format!("{}", sd_key_fingerprint),
+                    sign_type: "sdk-key".to_string(),
+                }
+            })
+            .collect();
+
+        let faucet_operators = FaucetOperatorsJson {
+            faucet_contract_id: 5,
+            faucet_method_name: "faucet".to_string(),
+            faucet_method_id: 3375543263,
+            faucet_per_claim_amount_nano: "1000000000000".to_string(),
+            sdk_key_expected_tx_count: 3,
+            operators,
+        };
+
+        std::fs::write(
+            &format!(
+                "{}/../client_prover/psy-privacy-bridge/src/config/faucetOperators.json",
+                project_dir
+            ),
+            serde_json::to_string_pretty(&faucet_operators)?,
+        )?;
 
         Ok(())
     }

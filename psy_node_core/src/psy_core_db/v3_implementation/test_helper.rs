@@ -1,26 +1,7 @@
-use crate::psy_core_db::{
-    traits::full::{
-        PsyNodeCheckpointObjectDatabaseReader, PsyNodeCheckpointObjectDatabaseWriter, PsyNodeCheckpointRealmSpecificDatabaseReader,
-        PsyNodeCheckpointTreeDatabaseReader, PsyNodeCheckpointTreeDatabaseWriter, PsyNodeCoreDatabaseBasicContractInfoStoreReader,
-        PsyNodeCoreDatabaseBasicContractInfoStoreWriter, PsyNodeCoreDatabaseContractObjectStoreReader,
-        PsyNodeCoreDatabaseContractObjectStoreWriter, PsyNodeCoreDatabaseUserStoreReader, PsyNodeCoreDatabaseUserStoreWriter,
-        PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyNodeGlobalContractTreeDatabaseReader,
-        PsyNodeGlobalContractTreeDatabaseWriter, PsyNodeGlobalUserTreeDatabaseReader, PsyNodeGlobalUserTreeDatabaseWriter,
-        PsyNodeUserContractTreeDatabaseReader, PsyNodeUserContractTreeDatabaseWriter, PsyNodeUserRegistrationTreeDatabaseReader,
-        PsyNodeUserRegistrationTreeDatabaseWriter, PsyNodeContractStateTreeTreeDatabaseReader, PsyNodeContractStateTreeTreeDatabaseWriter, PsyNodeContractFunctionTreeDatabaseReader, PsyNodeContractFunctionTreeDatabaseWriter,
-    },
-    v3_implementation::full::PsyUnifiedCoreDatabaseStore,
-};
-use parth_core::crypto::hash::traits::MerkleZeroHasher;
 use anyhow::Ok;
 use parth_core::{
-    crypto::hash::{
-        merkle_proof::{MerkleProofCore},
-        tag_tree::TagTreeMerkleProof,
-    },
-    data::hash::
-        merkle_node_key::SimpleMerkleNodeKey
-    ,
+    crypto::hash::{merkle_proof::MerkleProofCore, tag_tree::TagTreeMerkleProof, traits::MerkleZeroHasher},
+    data::hash::merkle_node_key::SimpleMerkleNodeKey,
     felt::ToU64Value,
     protocol::core_types::QNetworkDatabaseTypes,
     utils::QPGenRandom,
@@ -32,7 +13,24 @@ use psy_data::v1::qdata::{
     user::PQEDUserLeaf,
 };
 use psy_serialize::{FastFixedSerializable, PsySerializeCanonicalAsyncSafe};
-use crate::store::traits::core_db::CoreDatabaseStore;
+
+use crate::{
+    psy_core_db::{
+        traits::full::{
+            PsyNodeCheckpointObjectDatabaseReader, PsyNodeCheckpointObjectDatabaseWriter, PsyNodeCheckpointRealmSpecificDatabaseReader,
+            PsyNodeCheckpointTreeDatabaseReader, PsyNodeCheckpointTreeDatabaseWriter, PsyNodeContractFunctionTreeDatabaseReader,
+            PsyNodeContractFunctionTreeDatabaseWriter, PsyNodeContractStateTreeTreeDatabaseReader, PsyNodeContractStateTreeTreeDatabaseWriter,
+            PsyNodeCoreDatabaseBasicContractInfoStoreReader, PsyNodeCoreDatabaseBasicContractInfoStoreWriter,
+            PsyNodeCoreDatabaseContractObjectStoreReader, PsyNodeCoreDatabaseContractObjectStoreWriter, PsyNodeCoreDatabaseUserStoreReader,
+            PsyNodeCoreDatabaseUserStoreWriter, PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter,
+            PsyNodeGlobalContractTreeDatabaseReader, PsyNodeGlobalContractTreeDatabaseWriter, PsyNodeGlobalUserTreeDatabaseReader,
+            PsyNodeGlobalUserTreeDatabaseWriter, PsyNodeUserContractTreeDatabaseReader, PsyNodeUserContractTreeDatabaseWriter,
+            PsyNodeUserRegistrationTreeDatabaseReader, PsyNodeUserRegistrationTreeDatabaseWriter,
+        },
+        v3_implementation::full::PsyUnifiedCoreDatabaseStore,
+    },
+    store::traits::core_db::CoreDatabaseStore,
+};
 
 pub struct ExPsyUnifiedStoreTestHelper<
     N: QNetworkDatabaseTypes,
@@ -48,6 +46,9 @@ pub struct ExPsyUnifiedStoreTestHelper<
     ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
     TagTreeTableIdentifier: Clone + Send + Sync,
     HashToManyIdsTableIdentifier: Clone + Send + Sync,
+    IMTLeafTableIdentifier: Clone + Send + Sync,
+    IMTKeyIndexTableIdentifier: Clone + Send + Sync,
+    IMTNextAppendIndexTableIdentifier: Clone + Send + Sync,
     S: CoreDatabaseStore<
             N::QHash,
             N::HasherBase,
@@ -63,6 +64,9 @@ pub struct ExPsyUnifiedStoreTestHelper<
             ZeroIdMerkleTableIdentifier,
             TagTreeTableIdentifier,
             HashToManyIdsTableIdentifier,
+            IMTLeafTableIdentifier,
+            IMTKeyIndexTableIdentifier,
+            IMTNextAppendIndexTableIdentifier,
         > + Send
         + Sync,
 > {
@@ -80,45 +84,54 @@ pub struct ExPsyUnifiedStoreTestHelper<
         ZeroIdMerkleTableIdentifier,
         TagTreeTableIdentifier,
         HashToManyIdsTableIdentifier,
+        IMTLeafTableIdentifier,
+        IMTKeyIndexTableIdentifier,
+        IMTNextAppendIndexTableIdentifier,
         S,
     >,
     pub realm_id: u64,
     pub realm_sub_id: u64,
 }
 
-
 impl<
-    N: QNetworkDatabaseTypes,
-    BiDirectionalMappingTableIdentifier: Clone + Send + Sync,
-    BiDirectionalU64U128MappingTableIdentifier: Clone + Send + Sync,
-    U64TableIdentifier: Clone + Send + Sync,
-    U64CounterTableIdentifier: Clone + Send + Sync,
-    SingleIdTableIdentifier: Clone + Send + Sync,
-    DoubleIdTableIdentifier: Clone + Send + Sync,
-    KivTableIdentifier: Clone + Send + Sync,
-    SingleIdMerkleTableIdentifier: Clone + Send + Sync,
-    DoubleIdMerkleTableIdentifier: Clone + Send + Sync,
-    ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
-    TagTreeTableIdentifier: Clone + Send + Sync,
-    HashToManyIdsTableIdentifier: Clone + Send + Sync,
-    S: CoreDatabaseStore<
-            N::QHash,
-            N::HasherBase,
-            BiDirectionalMappingTableIdentifier,
-            BiDirectionalU64U128MappingTableIdentifier,
-            U64TableIdentifier,
-            U64CounterTableIdentifier,
-            SingleIdTableIdentifier,
-            DoubleIdTableIdentifier,
-            KivTableIdentifier,
-            SingleIdMerkleTableIdentifier,
-            DoubleIdMerkleTableIdentifier,
-            ZeroIdMerkleTableIdentifier,
-            TagTreeTableIdentifier,
-            HashToManyIdsTableIdentifier,
-        > + Send
-        + Sync,
-> ExPsyUnifiedStoreTestHelper<
+        N: QNetworkDatabaseTypes,
+        BiDirectionalMappingTableIdentifier: Clone + Send + Sync,
+        BiDirectionalU64U128MappingTableIdentifier: Clone + Send + Sync,
+        U64TableIdentifier: Clone + Send + Sync,
+        U64CounterTableIdentifier: Clone + Send + Sync,
+        SingleIdTableIdentifier: Clone + Send + Sync,
+        DoubleIdTableIdentifier: Clone + Send + Sync,
+        KivTableIdentifier: Clone + Send + Sync,
+        SingleIdMerkleTableIdentifier: Clone + Send + Sync,
+        DoubleIdMerkleTableIdentifier: Clone + Send + Sync,
+        ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
+        TagTreeTableIdentifier: Clone + Send + Sync,
+        HashToManyIdsTableIdentifier: Clone + Send + Sync,
+        IMTLeafTableIdentifier: Clone + Send + Sync,
+        IMTKeyIndexTableIdentifier: Clone + Send + Sync,
+        IMTNextAppendIndexTableIdentifier: Clone + Send + Sync,
+        S: CoreDatabaseStore<
+                N::QHash,
+                N::HasherBase,
+                BiDirectionalMappingTableIdentifier,
+                BiDirectionalU64U128MappingTableIdentifier,
+                U64TableIdentifier,
+                U64CounterTableIdentifier,
+                SingleIdTableIdentifier,
+                DoubleIdTableIdentifier,
+                KivTableIdentifier,
+                SingleIdMerkleTableIdentifier,
+                DoubleIdMerkleTableIdentifier,
+                ZeroIdMerkleTableIdentifier,
+                TagTreeTableIdentifier,
+                HashToManyIdsTableIdentifier,
+                IMTLeafTableIdentifier,
+                IMTKeyIndexTableIdentifier,
+                IMTNextAppendIndexTableIdentifier,
+            > + Send
+            + Sync,
+    >
+    ExPsyUnifiedStoreTestHelper<
         N,
         BiDirectionalMappingTableIdentifier,
         BiDirectionalU64U128MappingTableIdentifier,
@@ -132,8 +145,12 @@ impl<
         ZeroIdMerkleTableIdentifier,
         TagTreeTableIdentifier,
         HashToManyIdsTableIdentifier,
+        IMTLeafTableIdentifier,
+        IMTKeyIndexTableIdentifier,
+        IMTNextAppendIndexTableIdentifier,
         S,
-> {
+    >
+{
     pub fn new(
         db: PsyUnifiedCoreDatabaseStore<
             N,
@@ -149,52 +166,57 @@ impl<
             ZeroIdMerkleTableIdentifier,
             TagTreeTableIdentifier,
             HashToManyIdsTableIdentifier,
+            IMTLeafTableIdentifier,
+            IMTKeyIndexTableIdentifier,
+            IMTNextAppendIndexTableIdentifier,
             S,
         >,
         realm_id: u64,
         realm_sub_id: u64,
     ) -> Self {
-        Self {
-            db,
-            realm_id,
-            realm_sub_id,
-        }
+        Self { db, realm_id, realm_sub_id }
     }
 }
 
-
 impl<
-    N: QNetworkDatabaseTypes,
-    BiDirectionalMappingTableIdentifier: Clone + Send + Sync,
-    BiDirectionalU64U128MappingTableIdentifier: Clone + Send + Sync,
-    U64TableIdentifier: Clone + Send + Sync,
-    U64CounterTableIdentifier: Clone + Send + Sync,
-    SingleIdTableIdentifier: Clone + Send + Sync,
-    DoubleIdTableIdentifier: Clone + Send + Sync,
-    KivTableIdentifier: Clone + Send + Sync,
-    SingleIdMerkleTableIdentifier: Clone + Send + Sync,
-    DoubleIdMerkleTableIdentifier: Clone + Send + Sync,
-    ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
-    TagTreeTableIdentifier: Clone + Send + Sync,
-    HashToManyIdsTableIdentifier: Clone + Send + Sync,
-    S: CoreDatabaseStore<
-            N::QHash,
-            N::HasherBase,
-            BiDirectionalMappingTableIdentifier,
-            BiDirectionalU64U128MappingTableIdentifier,
-            U64TableIdentifier,
-            U64CounterTableIdentifier,
-            SingleIdTableIdentifier,
-            DoubleIdTableIdentifier,
-            KivTableIdentifier,
-            SingleIdMerkleTableIdentifier,
-            DoubleIdMerkleTableIdentifier,
-            ZeroIdMerkleTableIdentifier,
-            TagTreeTableIdentifier,
-            HashToManyIdsTableIdentifier,
-        > + Send
-        + Sync,
-> ExPsyUnifiedStoreTestHelper<
+        N: QNetworkDatabaseTypes,
+        BiDirectionalMappingTableIdentifier: Clone + Send + Sync,
+        BiDirectionalU64U128MappingTableIdentifier: Clone + Send + Sync,
+        U64TableIdentifier: Clone + Send + Sync,
+        U64CounterTableIdentifier: Clone + Send + Sync,
+        SingleIdTableIdentifier: Clone + Send + Sync,
+        DoubleIdTableIdentifier: Clone + Send + Sync,
+        KivTableIdentifier: Clone + Send + Sync,
+        SingleIdMerkleTableIdentifier: Clone + Send + Sync,
+        DoubleIdMerkleTableIdentifier: Clone + Send + Sync,
+        ZeroIdMerkleTableIdentifier: Clone + Send + Sync,
+        TagTreeTableIdentifier: Clone + Send + Sync,
+        HashToManyIdsTableIdentifier: Clone + Send + Sync,
+        IMTLeafTableIdentifier: Clone + Send + Sync,
+        IMTKeyIndexTableIdentifier: Clone + Send + Sync,
+        IMTNextAppendIndexTableIdentifier: Clone + Send + Sync,
+        S: CoreDatabaseStore<
+                N::QHash,
+                N::HasherBase,
+                BiDirectionalMappingTableIdentifier,
+                BiDirectionalU64U128MappingTableIdentifier,
+                U64TableIdentifier,
+                U64CounterTableIdentifier,
+                SingleIdTableIdentifier,
+                DoubleIdTableIdentifier,
+                KivTableIdentifier,
+                SingleIdMerkleTableIdentifier,
+                DoubleIdMerkleTableIdentifier,
+                ZeroIdMerkleTableIdentifier,
+                TagTreeTableIdentifier,
+                HashToManyIdsTableIdentifier,
+                IMTLeafTableIdentifier,
+                IMTKeyIndexTableIdentifier,
+                IMTNextAppendIndexTableIdentifier,
+            > + Send
+            + Sync,
+    >
+    ExPsyUnifiedStoreTestHelper<
         N,
         BiDirectionalMappingTableIdentifier,
         BiDirectionalU64U128MappingTableIdentifier,
@@ -208,8 +230,15 @@ impl<
         ZeroIdMerkleTableIdentifier,
         TagTreeTableIdentifier,
         HashToManyIdsTableIdentifier,
+        IMTLeafTableIdentifier,
+        IMTKeyIndexTableIdentifier,
+        IMTNextAppendIndexTableIdentifier,
         S,
-> where N::QHash: QPGenRandom + std::fmt::Debug + PartialEq, N::F: QPGenRandom + PsySerializeCanonicalAsyncSafe + std::fmt::Debug + PartialEq, {
+    >
+where
+    N::QHash: QPGenRandom + std::fmt::Debug + PartialEq,
+    N::F: QPGenRandom + PsySerializeCanonicalAsyncSafe + std::fmt::Debug + PartialEq,
+{
     pub async fn run_all_tests(&self) -> anyhow::Result<()> {
         self.test_set_l2_block_data().await?;
         self.test_checkpoint_ids_and_hashes().await?;
@@ -250,7 +279,6 @@ impl<
         let got_block_state = got_block_state.unwrap();
         assert_eq!(base, got_block_state);
 
-
         let block_state_100 = QEDL2BlockState::qp_rand_gen();
         self.db.set_l2_block_state(100, &block_state_100).await?;
         self.db.set_l2_latest_block_state(&block_state_100).await?;
@@ -277,7 +305,6 @@ impl<
             assert_ne!(block_state_i, latest);
         }
         Ok(())
-
     }
 
     async fn test_checkpoint_ids_and_hashes(&self) -> anyhow::Result<()> {
@@ -293,9 +320,9 @@ impl<
         // Test root hash to ID mapping
         let root_hash_1 = N::QHash::qp_rand_gen();
         let root_hash_2 = N::QHash::qp_rand_gen();
-        
+
         assert_eq!(db.get_checkpoint_id_for_checkpoint_root_hash(root_hash_1).await?, None);
-        
+
         db.set_checkpoint_root_hash_to_id_mapping(root_hash_1, 101).await?;
         assert_eq!(db.get_checkpoint_id_for_checkpoint_root_hash(root_hash_1).await?, Some(101));
         assert_eq!(db.get_checkpoint_id_for_checkpoint_root_hash(root_hash_2).await?, None);
@@ -303,23 +330,23 @@ impl<
         db.set_checkpoint_root_hash_to_id_mapping(root_hash_2, 202).await?;
         assert_eq!(db.get_checkpoint_id_for_checkpoint_root_hash(root_hash_1).await?, Some(101));
         assert_eq!(db.get_checkpoint_id_for_checkpoint_root_hash(root_hash_2).await?, Some(202));
-        
+
         Ok(())
     }
 
     async fn test_checkpoint_leaf_and_roots(&self) -> anyhow::Result<()> {
         let db = &self.db;
-        
+
         // Test Checkpoint Leaf Data
         let leaf_data_1 = PQEDCheckpointLeaf::<N::F, N::QHash>::qp_rand_gen();
         let leaf_data_2 = PQEDCheckpointLeaf::<N::F, N::QHash>::qp_rand_gen();
 
         assert!(db.get_checkpoint_leaf_data(1).await.is_err(), "Should fail for non-existent leaf");
-        
+
         db.set_checkpoint_leaf_data(1, &leaf_data_1).await?;
         let retrieved_leaf_1 = db.get_checkpoint_leaf_data(1).await?;
         assert_eq!(leaf_data_1, retrieved_leaf_1, "Retrieved leaf data does not match");
-        
+
         db.set_checkpoint_leaf_data(2, &leaf_data_2).await?;
         let retrieved_leaf_2 = db.get_checkpoint_leaf_data(2).await?;
         assert_eq!(leaf_data_2, retrieved_leaf_2, "Retrieved leaf data 2 does not match");
@@ -327,12 +354,15 @@ impl<
 
         // Test Checkpoint Global State Roots
         let roots_data_1 = PQEDCheckpointGlobalStateRoots::<N::QHash>::qp_rand_gen();
-        assert!(db.get_checkpoint_global_state_roots(1).await.is_err(), "Should fail for non-existent roots");
-        
+        assert!(
+            db.get_checkpoint_global_state_roots(1).await.is_err(),
+            "Should fail for non-existent roots"
+        );
+
         db.set_checkpoint_global_state_roots(1, &roots_data_1).await?;
         let retrieved_roots_1 = db.get_checkpoint_global_state_roots(1).await?;
         assert_eq!(roots_data_1, retrieved_roots_1, "Retrieved roots data does not match");
-        
+
         Ok(())
     }
 
@@ -344,7 +374,7 @@ impl<
         let (pending_id_1, unique_id_1) = db.inc_unique_pending_id(1).await?;
         assert_eq!(pending_id_1, 1);
         assert_eq!(db.get_latest_pending_id().await?, 1);
-        
+
         let (current_pid, current_uid) = db.get_current_unique_pending_id().await?;
         assert_eq!(current_pid, 1);
         assert_eq!(current_uid, unique_id_1);
@@ -364,7 +394,8 @@ impl<
         assert_eq!(db.get_checkpoint_id_for_unique_pending_id(unique_pending_id).await?, Some(checkpoint_id));
 
         assert_eq!(db.get_unique_pending_id_for_checkpoint_id(checkpoint_id).await?, None);
-        db.set_checkpoint_id_to_unique_pending_id_mapping(checkpoint_id, unique_pending_id, &unique_id_struct).await?;
+        db.set_checkpoint_id_to_unique_pending_id_mapping(checkpoint_id, unique_pending_id, &unique_id_struct)
+            .await?;
         let retrieved_mapping = db.get_unique_pending_id_for_checkpoint_id(checkpoint_id).await?;
         assert_eq!(retrieved_mapping, Some((unique_pending_id, unique_id_struct)));
 
@@ -375,24 +406,37 @@ impl<
         let db = &self.db;
         let checkpoint_id = 42;
         let unique_pending_id = 7;
-        
+
         // Test Rewards Tag Tree Proof
         let tag_proof = TagTreeMerkleProof::<N::QHash>::qp_rand_gen();
-        
-        assert!(db.get_top_global_user_rewards_tree_proof_to_realm_at_checkpoint_id(checkpoint_id).await.is_err());
-        db.set_realm_rewards_tag_tree_top_proof_at_checkpoint_id(checkpoint_id, &tag_proof).await?;
+
+        assert!(db
+            .get_top_global_user_rewards_tree_proof_to_realm_at_checkpoint_id(checkpoint_id)
+            .await
+            .is_err());
+        db.set_realm_rewards_tag_tree_top_proof_at_checkpoint_id(checkpoint_id, &tag_proof)
+            .await?;
         let retrieved_tag_proof = db.get_top_global_user_rewards_tree_proof_to_realm_at_checkpoint_id(checkpoint_id).await?;
         assert_eq!(tag_proof, retrieved_tag_proof);
-        
-        assert!(db.get_top_global_user_rewards_tree_proof_to_realm_at_unique_pending_id(unique_pending_id).await.is_err());
-        db.set_realm_rewards_tag_tree_top_proof_at_unique_pending_id(unique_pending_id, &tag_proof).await?;
-        let retrieved_tag_proof_pending = db.get_top_global_user_rewards_tree_proof_to_realm_at_unique_pending_id(unique_pending_id).await?;
+
+        assert!(db
+            .get_top_global_user_rewards_tree_proof_to_realm_at_unique_pending_id(unique_pending_id)
+            .await
+            .is_err());
+        db.set_realm_rewards_tag_tree_top_proof_at_unique_pending_id(unique_pending_id, &tag_proof)
+            .await?;
+        let retrieved_tag_proof_pending = db
+            .get_top_global_user_rewards_tree_proof_to_realm_at_unique_pending_id(unique_pending_id)
+            .await?;
         assert_eq!(tag_proof, retrieved_tag_proof_pending);
 
         // Test Global User Tree Proof
         let user_tree_proof = MerkleProofCore::<N::QHash>::qp_rand_gen();
-        
-        assert!(db.get_top_global_user_tree_proof_to_realm_root_at_checkpoint_id(checkpoint_id).await.is_err());
+
+        assert!(db
+            .get_top_global_user_tree_proof_to_realm_root_at_checkpoint_id(checkpoint_id)
+            .await
+            .is_err());
         // The writer for this is on the PsyNodeGlobalUserTreeDatabaseWriter trait
         db.global_user_tree_set_top_tree_merkle_proof(checkpoint_id, &user_tree_proof).await?;
         let retrieved_user_proof = db.get_top_global_user_tree_proof_to_realm_root_at_checkpoint_id(checkpoint_id).await?;
@@ -447,14 +491,16 @@ impl<
 
         assert_eq!(db.get_user_ids_for_public_key(pk_hash, 0, 100).await?, Vec::<u64>::new());
         for &user_id in &user_ids_for_pk {
-            db.store.db_insert_one_hash_to_u64(&db.public_key_hash_to_user_ids_table, pk_hash, user_id).await?;
+            db.store
+                .db_insert_one_hash_to_u64(&db.public_key_hash_to_user_ids_table, pk_hash, user_id)
+                .await?;
         }
 
         assert_eq!(db.get_user_ids_for_public_key(pk_hash, 0, 3).await?, vec![10, 20, 30]);
         assert_eq!(db.get_user_ids_for_public_key(pk_hash, 25, 3).await?, vec![30, 40, 50]);
         assert_eq!(db.get_user_ids_for_public_key(pk_hash, 45, 10).await?, vec![50]);
         assert_eq!(db.get_user_ids_for_public_key(pk_hash, 51, 10).await?, Vec::<u64>::new());
-        
+
         Ok(())
     }
 
@@ -483,12 +529,15 @@ impl<
         }
         db.set_many_contract_code_definitions(checkpoint_id, &inserts).await?;
         for row in inserts {
-            assert_eq!(db.get_contract_code_definition(checkpoint_id, row.contract_id).await?, row.code_definition);
+            assert_eq!(
+                db.get_contract_code_definition(checkpoint_id, row.contract_id).await?,
+                row.code_definition
+            );
         }
 
         Ok(())
     }
-    
+
     async fn test_contract_tree_heights(&self) -> anyhow::Result<()> {
         let db = &self.db;
         let c_ids = vec![1, 2, 3];
@@ -508,7 +557,7 @@ impl<
         db.set_contract_tree_heights(checkpoint_11, &heights_11).await?;
         assert_eq!(db.get_contract_tree_heights(checkpoint_10, &c_ids).await?, vec![8, 0, 16]);
         assert_eq!(db.get_contract_tree_heights(checkpoint_11, &c_ids).await?, vec![8, 24, 16]);
-        
+
         Ok(())
     }
 
@@ -527,7 +576,7 @@ impl<
         let leaf_val_1 = N::QHash::qp_rand_gen();
         // The writer function hardcodes leaf_index to 0
         let delta_proof_1 = db.checkpoint_tree_set_leaf_hash(1, leaf_val_1).await?;
-        
+
         assert!(delta_proof_1.verify::<N::HasherBase>());
         assert_eq!(delta_proof_1.old_root, initial_root);
 
@@ -541,7 +590,7 @@ impl<
         assert_eq!(proof_1.root, new_root_1);
         assert!(proof_1.verify::<N::HasherBase>());
         assert_eq!(proof_1.value, leaf_val_1);
-        
+
         Ok(())
     }
 
@@ -552,19 +601,19 @@ impl<
 
         let initial_root = db.user_registration_tree_get_root_hash(0).await?;
         assert_eq!(initial_root, N::HasherBase::get_zero_hash(tree_height as usize));
-        
+
         let leaf_val = N::QHash::qp_rand_gen();
         let delta_proof = db.user_registration_tree_set_leaf_hash(1, leaf_index, leaf_val).await?;
         assert!(delta_proof.verify::<N::HasherBase>());
-        
+
         let new_root = db.user_registration_tree_get_root_hash(1).await?;
         assert_eq!(new_root, delta_proof.new_root);
         assert_eq!(db.user_registration_tree_get_leaf_hash(1, leaf_index).await?, leaf_val);
-        
+
         let proof = db.user_registration_tree_get_merkle_proof(1, leaf_index).await?;
         assert!(proof.verify::<N::HasherBase>());
         assert_eq!(proof.root, new_root);
-        
+
         Ok(())
     }
 
@@ -574,18 +623,23 @@ impl<
         let leaf_index = 0;
         let root_level = 5;
 
-        assert_eq!(db.global_user_tree_get_root_hash(0).await?, N::HasherBase::get_zero_hash(tree_height as usize));
+        assert_eq!(
+            db.global_user_tree_get_root_hash(0).await?,
+            N::HasherBase::get_zero_hash(tree_height as usize)
+        );
         let leaf_val = N::QHash::qp_rand_gen();
         let delta = db.global_user_tree_set_leaf_hash(1, leaf_index, leaf_val).await?;
-        
+
         let proof = db.global_user_tree_get_merkle_proof(1, leaf_index).await?;
         assert!(proof.verify::<N::HasherBase>());
         assert_eq!(proof.root, delta.new_root);
 
-        let sub_proof = db.global_user_tree_get_merkle_proof_sub_tree(1, root_level, tree_height, leaf_index).await?;
+        let sub_proof = db
+            .global_user_tree_get_merkle_proof_sub_tree(1, root_level, tree_height, leaf_index)
+            .await?;
         assert_eq!(sub_proof.siblings.len(), (tree_height - root_level) as usize);
         assert!(sub_proof.verify::<N::HasherBase>(), "proof is invalid");
-        
+
         Ok(())
     }
 
@@ -596,15 +650,18 @@ impl<
         let checkpoint_id = 5;
         let tree_height = N::GLOBAL_CONTRACT_TREE_HEIGHT;
 
-        assert_eq!(db.user_contract_tree_get_root_hash(checkpoint_id, user_id).await?, N::HasherBase::get_zero_hash(tree_height as usize));
-        
+        assert_eq!(
+            db.user_contract_tree_get_root_hash(checkpoint_id, user_id).await?,
+            N::HasherBase::get_zero_hash(tree_height as usize)
+        );
+
         let leaf_val = N::QHash::qp_rand_gen();
         let delta = db.user_contract_tree_set_leaf_hash(checkpoint_id, user_id, contract_id, leaf_val).await?;
-        
+
         let new_root = db.user_contract_tree_get_root_hash(checkpoint_id, user_id).await?;
         assert_eq!(new_root, delta.new_root);
         assert_eq!(db.user_contract_tree_get_leaf_hash(checkpoint_id, user_id, contract_id).await?, leaf_val);
-        
+
         let proof = db.user_contract_tree_get_merkle_proof(checkpoint_id, user_id, contract_id).await?;
         assert!(proof.verify::<N::HasherBase>());
         assert_eq!(proof.root, new_root);
@@ -620,19 +677,30 @@ impl<
         let checkpoint_id = 15;
         let tree_height = N::MAX_CONTRACT_STATE_TREE_HEIGHT;
 
-        assert_eq!(db.contract_state_tree_get_root_hash(checkpoint_id, user_id, contract_id).await?, N::HasherBase::get_zero_hash(tree_height as usize));
-        
+        assert_eq!(
+            db.contract_state_tree_get_root_hash(checkpoint_id, user_id, contract_id).await?,
+            N::HasherBase::get_zero_hash(tree_height as usize)
+        );
+
         let leaf_val = N::QHash::qp_rand_gen();
-        let delta = db.contract_state_tree_set_leaf_hash(checkpoint_id, user_id, contract_id, leaf_val).await?;
-        
+        let delta = db
+            .contract_state_tree_set_leaf_hash(checkpoint_id, user_id, contract_id, leaf_val)
+            .await?;
+
         let new_root = db.contract_state_tree_get_root_hash(checkpoint_id, user_id, contract_id).await?;
         assert_eq!(new_root, delta.new_root);
-        assert_eq!(db.contract_state_tree_get_leaf_hash(checkpoint_id, user_id, contract_id, state_slot_id).await?, leaf_val);
-        
-        let proof = db.contract_state_tree_get_merkle_proof(checkpoint_id, user_id, contract_id, tree_height, state_slot_id).await?;
+        assert_eq!(
+            db.contract_state_tree_get_leaf_hash(checkpoint_id, user_id, contract_id, state_slot_id)
+                .await?,
+            leaf_val
+        );
+
+        let proof = db
+            .contract_state_tree_get_merkle_proof(checkpoint_id, user_id, contract_id, tree_height, state_slot_id)
+            .await?;
         assert!(proof.verify::<N::HasherBase>());
         assert_eq!(proof.root, new_root);
-        
+
         Ok(())
     }
 
@@ -641,11 +709,14 @@ impl<
         let tree_height = N::GLOBAL_CONTRACT_TREE_HEIGHT;
         let leaf_index = 0;
 
-        assert_eq!(db.global_contract_tree_get_root_hash(0).await?, N::HasherBase::get_zero_hash(tree_height as usize));
-        
+        assert_eq!(
+            db.global_contract_tree_get_root_hash(0).await?,
+            N::HasherBase::get_zero_hash(tree_height as usize)
+        );
+
         let leaf_val = N::QHash::qp_rand_gen();
         let delta = db.global_contract_tree_set_leaf_hash(1, leaf_index, leaf_val).await?;
-        
+
         let new_root = db.global_contract_tree_get_root_hash(1).await?;
         assert_eq!(new_root, delta.new_root);
         let proof = db.global_contract_tree_get_merkle_proof(1, leaf_index).await?;
@@ -661,15 +732,22 @@ impl<
         let checkpoint_id = 8;
         let tree_height = N::CONTRACT_FUNCTION_TREE_HEIGHT;
 
-        assert_eq!(db.contract_function_tree_get_root_hash(checkpoint_id, contract_id).await?, N::HasherBase::get_zero_hash(tree_height as usize));
-        
+        assert_eq!(
+            db.contract_function_tree_get_root_hash(checkpoint_id, contract_id).await?,
+            N::HasherBase::get_zero_hash(tree_height as usize)
+        );
+
         let leaf_val = N::QHash::qp_rand_gen();
-        let delta = db.contract_function_tree_set_leaf_hash(checkpoint_id, contract_id, function_id, leaf_val).await?;
-        
+        let delta = db
+            .contract_function_tree_set_leaf_hash(checkpoint_id, contract_id, function_id, leaf_val)
+            .await?;
+
         let new_root = db.contract_function_tree_get_root_hash(checkpoint_id, contract_id).await?;
         assert_eq!(new_root, delta.new_root);
-        
-        let proof = db.contract_function_tree_get_merkle_proof(checkpoint_id, contract_id, function_id).await?;
+
+        let proof = db
+            .contract_function_tree_get_merkle_proof(checkpoint_id, contract_id, function_id)
+            .await?;
         assert!(proof.verify::<N::HasherBase>());
 
         Ok(())
@@ -678,10 +756,15 @@ impl<
     async fn test_rewards_tag_tree(&self) -> anyhow::Result<()> {
         let db = &self.db;
         let unique_pending_id = 1;
-        
+
         let root_key = SimpleMerkleNodeKey::new_root();
         assert!(db.rewards_tag_tree_get_root_at_unique_pending_id(unique_pending_id).await.is_err());
-        assert_eq!(db.rewards_tag_tree_get_node_at_unique_pending_id(unique_pending_id, root_key).await.unwrap_or_default(), N::QHash::default());
+        assert_eq!(
+            db.rewards_tag_tree_get_node_at_unique_pending_id(unique_pending_id, root_key)
+                .await
+                .unwrap_or_default(),
+            N::QHash::default()
+        );
 
         let key = SimpleMerkleNodeKey::new(1, 0);
         let tag = N::QHash::qp_rand_gen();
@@ -691,10 +774,10 @@ impl<
 
         let retrieved_tag = db.rewards_tag_tree_get_node_tags_at_unique_pending_id(unique_pending_id, &[key]).await?;
         assert_eq!(retrieved_tag, vec![Some(tag)]);
-        let retrieved_value = db.rewards_tag_tree_get_node_values_at_unique_pending_id(unique_pending_id, &[key]).await?;
+        let retrieved_value = db
+            .rewards_tag_tree_get_node_values_at_unique_pending_id(unique_pending_id, &[key])
+            .await?;
         assert_eq!(retrieved_value, vec![Some(value)]);
-
-
 
         let unique_pending_id = 2;
         let key_child_0 = SimpleMerkleNodeKey::new(1, 0);
@@ -708,9 +791,9 @@ impl<
         let parent_tag = N::QHash::qp_rand_gen();
         db.rewards_tag_tree_set_node_tag_only(unique_pending_id, parent_key, parent_tag).await?;
 
-
-        
-        let proofs = db.rewards_tag_tree_get_tag_tree_merkle_proof_at_unique_pending_id(unique_pending_id, &[key_child_0, key_child_1, parent_key]).await?;
+        let proofs = db
+            .rewards_tag_tree_get_tag_tree_merkle_proof_at_unique_pending_id(unique_pending_id, &[key_child_0, key_child_1, parent_key])
+            .await?;
         assert_eq!(proofs.len(), 3);
         for p in proofs.iter() {
             assert!(p.verify::<N::HasherBase>());
@@ -718,15 +801,14 @@ impl<
 
         assert!(proofs[0].root == proofs[1].root);
         assert!(proofs[0].root == proofs[2].root);
-        assert!(proofs[0].leaf.left == N::QHash::default(),"for leaf child, left should be default");
-        assert!(proofs[0].leaf.right == N::QHash::default(),"for leaf child, right should be default");
-        assert!(proofs[1].leaf.left == N::QHash::default(),"for leaf child, left should be default");
-        assert!(proofs[1].leaf.right == N::QHash::default(),"for leaf child, right should be default");
+        assert!(proofs[0].leaf.left == N::QHash::default(), "for leaf child, left should be default");
+        assert!(proofs[0].leaf.right == N::QHash::default(), "for leaf child, right should be default");
+        assert!(proofs[1].leaf.left == N::QHash::default(), "for leaf child, left should be default");
+        assert!(proofs[1].leaf.right == N::QHash::default(), "for leaf child, right should be default");
         assert!(proofs[0].leaf.tag == tag_child_0, "tag mismatch for child 0");
         assert!(proofs[1].leaf.tag == tag_child_1, "tag mismatch for child 1");
 
         assert!(proofs[2].leaf.tag == parent_tag, "tag mismatch for parent");
-
 
         Ok(())
     }

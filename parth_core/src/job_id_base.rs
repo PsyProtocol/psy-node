@@ -11,6 +11,19 @@ pub const QJOB_ID_WITH_UNIQUE_PENDING_ID_AND_REALM_PREFIX_SERIALIZED_SIZE: usize
 
 pub type QJobIdSerialized = [u8; QJOB_ID_SERIALIZED_SIZE];
 pub type QJobIdWithRewardPathSerialized = [u8; QJOB_ID_WITH_REWARD_PATH_SERIALIZED_SIZE];
+pub type QJobIdWithUniquePendingIdSerialized = [u8; QJOB_ID_WITH_UNIQUE_PENDING_ID_SERIALIZED_SIZE];
+
+#[inline]
+pub fn make_job_id_with_unique_pending_id(
+    job_id: QJobIdSerialized,
+    unique_pending_id: u64,
+) -> QJobIdWithUniquePendingIdSerialized {
+    let mut out = [0u8; QJOB_ID_WITH_UNIQUE_PENDING_ID_SERIALIZED_SIZE];
+    out[0..QJOB_ID_SERIALIZED_SIZE].copy_from_slice(&job_id);
+    out[QJOB_ID_SERIALIZED_SIZE..QJOB_ID_WITH_UNIQUE_PENDING_ID_SERIALIZED_SIZE]
+        .copy_from_slice(&unique_pending_id.to_be_bytes());
+    out
+}
 
 pub trait JobIDSerializable: Sized + Copy + Send + Sync + Clone + PartialEq + Eq{
     fn to_job_id_bytes(&self) -> QJobIdSerialized;

@@ -1,0 +1,175 @@
+use plonky2::{
+    gates::{constant::ConstantGate, gate::GateRef},
+    hash::hash_types::HashOut,
+    iop::witness::PartialWitness,
+    plonk::{
+        circuit_builder::CircuitBuilder,
+        circuit_data::{CircuitConfig, CircuitData, CommonCircuitData, VerifierOnlyCircuitData},
+        config::{AlgebraicHasher, GenericConfig},
+        proof::ProofWithPublicInputs,
+    },
+};
+use psy_client_common::data::qhashout::QHashOut;
+use psy_crypto::{
+    common::witnesses::qrecursion::header::QRecursionAggStandardHeader,
+    hash::{merkle::core::MerkleProofCore, traits::hasher::MerkleZeroHasher},
+};
+
+use crate::{
+    circuits::traits::qstandard::QStandardCircuit,
+    proof_minifier::pm_core::get_circuit_fingerprint_generic,
+    treeprover::qrecursion::standard::gadgets::{agg_proof_header::QRecursionAggStandardHeaderGadget, verify_agg_proof::VerifyAggProofGadget},
+};
+
+#[derive(Debug)]
+pub struct QRecursionStandardTwoAggCircuit<C: GenericConfig<D>, const D: usize>
+where
+    C::Hasher: AlgebraicHasher<C::F>,
+{
+    pub left_agg_gadget: VerifyAggProofGadget<D>,
+    pub right_agg_gadget: VerifyAggProofGadget<D>,
+    //pub self_header_gadget: QRecursionAggStandardHeaderGadget,
+
+    // end circuit targets
+    pub circuit_data: CircuitData<C::F, C, D>,
+    pub fingerprint: QHashOut<C::F>,
+    // end circuit data
+}
+impl<C: GenericConfig<D>, const D: usize> QRecursionStandardTwoAggCircuit<C, D>
+where
+    C::Hasher: AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>>,
+{
+    pub fn new(
+        //coset_gate: &GateRef<C::F, D>,
+        verifier_data_cap_height: usize,
+        child_common_data: &CommonCircuitData<C::F, D>,
+    ) -> Self {
+        let config = CircuitConfig::standard_recursion_config();
+        let mut builder = CircuitBuilder::<C::F, D>::new(config);
+
+        let left_agg_gadget = VerifyAggProofGadget::<D>::add_virtual_to::<C, C::F>(&mut builder, child_common_data, verifier_data_cap_height);
+        let right_agg_gadget = VerifyAggProofGadget::<D>::add_virtual_to::<C, C::F>(&mut builder, child_common_data, verifier_data_cap_height);
+
+        // left and right child aggregation state transitions should be back to back
+        // -> ie. the right child starts where the left child ends
+        builder.connect_hashes(
+            left_agg_gadget.agg_proof_header_gadget.state_transition_end,
+            right_agg_gadget.agg_proof_header_gadget.state_transition_start,
+        );
+
+        // left and right child proofs should have the same merkle whitelist root
+        builder.connect_hashes(
+            left_agg_gadget.agg_whitelist_merkle_proof.root,
+            right_agg_gadget.agg_whitelist_merkle_proof.root,
+        );
+
+        let self_header_gadget = QRecursionAggStandardHeaderGadget {
+            state_transition_start: left_agg_gadget.agg_proof_header_gadget.state_transition_start,
+            state_transition_end: right_agg_gadget.agg_proof_header_gadget.state_transition_end,
+            // note: we already checked above to make sure the left and right proofs have the same whitelist root
+            agg_circuit_whitelist_root: left_agg_gadget.agg_proof_header_gadget.agg_circuit_whitelist_root,
+        };
+
+        // get the public inputs for our proof
+        let self_public_inputs_hash = self_header_gadget.get_combined_hash::<C::Hasher, C::F, D>(&mut builder);
+
+        builder.register_public_inputs(&self_public_inputs_hash.elements);
+        //builder.add_psy_type_a_common_gates(Some(coset_gate.clone()));
+        //pad_circuit_degree::<C::F, D>(&mut builder, 12);
+
+        builder.add_gate_to_gate_set(GateRef::new(ConstantGate::new(builder.config.num_constants)));
+        let circuit_data = builder.build::<C>();
+
+        let fingerprint = QHashOut(get_circuit_fingerprint_generic(&circuit_data.verifier_only));
+
+        Self {
+            left_agg_gadget,
+            right_agg_gadget,
+            //self_header_gadget,
+            circuit_data,
+            fingerprint,
+        }
+    }
+    pub fn prove_base(
+        &self,
+        left_agg_whitelist_merkle_proof: &MerkleProofCore<QHashOut<C::F>>,
+        left_agg_proof_header: &QRecursionAggStandardHeader<C::F>,
+        left_proof: &ProofWithPublicInputs<C::F, C, D>,
+        left_verifier_data: &VerifierOnlyCircuitData<C, D>,
+
+        right_agg_whitelist_merkle_proof: &MerkleProofCore<QHashOut<C::F>>,
+        right_agg_proof_header: &QRecursionAggStandardHeader<C::F>,
+        right_proof: &ProofWithPublicInputs<C::F, C, D>,
+        right_verifier_data: &VerifierOnlyCircuitData<C, D>,
+    ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
+        let mut pw = PartialWitness::<C::F>::new();
+
+        self.left_agg_gadget.set_witness(
+            &mut pw,
+            left_agg_whitelist_merkle_proof,
+            left_agg_proof_header,
+            left_proof,
+            left_verifier_data,
+        )?;
+
+        self.right_agg_gadget.set_witness(
+            &mut pw,
+            right_agg_whitelist_merkle_proof,
+            right_agg_proof_header,
+            right_proof,
+            right_verifier_data,
+        )?;
+
+        self.circuit_data.prove(pw)
+    }
+}
+
+impl<C: GenericConfig<D>, const D: usize> QStandardCircuit<C, D> for QRecursionStandardTwoAggCircuit<C, D>
+where
+    C::Hasher: AlgebraicHasher<C::F>,
+{
+    fn get_fingerprint(&self) -> QHashOut<C::F> {
+        self.fingerprint
+    }
+
+    fn get_verifier_config_ref(&self) -> &VerifierOnlyCircuitData<C, D> {
+        &self.circuit_data.verifier_only
+    }
+
+    fn get_common_circuit_data_ref(&self) -> &CommonCircuitData<C::F, D> {
+        &self.circuit_data.common
+    }
+}
+
+/*
+impl<C: GenericConfig<D>, const D: usize>
+    QStandardCircuitProvable<QRecursionStandardTwoAggCircuitInput<C::F>, C, D>
+    for QRecursionStandardTwoAggCircuit<C, D>
+where
+    C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>>,
+{
+    fn prove_standard(
+        &self,
+        input: &QRecursionStandardTwoAggCircuitInput<C::F>,
+    ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
+        Ok(self.prove_base(
+            input
+        ))
+    }
+}
+
+impl<S: QProofStoreReaderSync, C: GenericConfig<D>, const D: usize>
+    QStandardCircuitProvableWithProofStoreSync<S, QRecursionStandardTwoAggCircuitInput<C::F>, C, D>
+    for QRecursionStandardTwoAggCircuit<C, D>
+where
+    C::Hasher:AlgebraicHasher<C::F> + MerkleZeroHasher<HashOut<C::F>>,
+{
+    fn prove_with_proof_store_sync(
+        &self,
+        _store: &S,
+        input: &QRecursionStandardTwoAggCircuitInput<C::F>,
+    ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
+        self.prove_standard(input)
+    }
+}
+*/

@@ -30,6 +30,9 @@ fn get_tmp_kv_store_ns_key(root_prefix: &str, realm_id: u64, realm_sub_id: u64) 
 fn get_tmp_proof_store_ns_key(root_prefix: &str, realm_id: u64, realm_sub_id: u64) -> String {
     format!("{}-{}-{}-{}", REDIS_TMP_PROOF_STORE_PREFIX, root_prefix, realm_id, realm_sub_id)
 }
+fn get_tmp_proof_store_bucket_ns_key(root_prefix: &str, realm_id: u64, realm_sub_id: u64, unique_pending_id: u64) -> String {
+    format!("{}-{}-{}-{}-{}", REDIS_TMP_PROOF_STORE_PREFIX, root_prefix, realm_id, realm_sub_id, unique_pending_id)
+}
 
 /// Create a new bb8-redis connection pool
 ///
@@ -685,18 +688,20 @@ impl QStandardEphemeralQueueSubscriber for StandardRedisStore {
 
 #[async_trait]
 impl QParthProofStoreReader for StandardRedisStore {
-    async fn get_proof_bytes_by_job_id<J: Into<QJobIdSerialized> + Copy + Send + Sync>(&self, job_id: J) -> anyhow::Result<Option<Vec<u8>>> {
+    async fn get_proof_bytes_by_job_id<J: Into<QJobIdSerialized> + Copy + Send + Sync>(&self, job_id: J, unique_pending_id: u64) -> anyhow::Result<Option<Vec<u8>>> {
         let job_id_bytes = job_id.into().to_vec();
-        let data = self.get_bytes_generic_internal(&self.proof_store_namespace, &job_id_bytes).await?;
+        let bucket = get_tmp_proof_store_bucket_ns_key(&self.root_prefix, self.realm_id, self.realm_sub_id, unique_pending_id);
+        let data = self.get_bytes_generic_internal(&bucket, &job_id_bytes).await?;
         if data.is_empty() {
             Ok(None)
         } else {
             Ok(Some(data))
         }
     }
-    async fn get_proof_by_job_id<J: Into<QJobIdSerialized> + Copy + Send + Sync, P: QPDSerializable>(&self, job_id: J) -> anyhow::Result<Option<P>> {
+    async fn get_proof_by_job_id<J: Into<QJobIdSerialized> + Copy + Send + Sync, P: QPDSerializable>(&self, job_id: J, unique_pending_id: u64) -> anyhow::Result<Option<P>> {
         let job_id_bytes = job_id.into().to_vec();
-        let data = self.get_bytes_generic_internal(&self.proof_store_namespace, &job_id_bytes).await?;
+        let bucket = get_tmp_proof_store_bucket_ns_key(&self.root_prefix, self.realm_id, self.realm_sub_id, unique_pending_id);
+        let data = self.get_bytes_generic_internal(&bucket, &job_id_bytes).await?;
         if data.is_empty() {
             Ok(None)
         } else {
@@ -704,29 +709,39 @@ impl QParthProofStoreReader for StandardRedisStore {
             Ok(Some(proof))
         }
     }
-    async fn contains_proof_for_job_id<J: Into<QJobIdSerialized> + Copy + Send + Sync>(&self, job_id: J) -> anyhow::Result<bool> {
+    async fn contains_proof_for_job_id<J: Into<QJobIdSerialized> + Copy + Send + Sync>(&self, job_id: J, unique_pending_id: u64) -> anyhow::Result<bool> {
         let job_id_bytes = job_id.into().to_vec();
-        let data = self.get_bytes_generic_internal(&self.proof_store_namespace, &job_id_bytes).await?;
+        let bucket = get_tmp_proof_store_bucket_ns_key(&self.root_prefix, self.realm_id, self.realm_sub_id, unique_pending_id);
+        let data = self.get_bytes_generic_internal(&bucket, &job_id_bytes).await?;
         Ok(!data.is_empty())
     }
 }
 
 #[async_trait]
 impl QParthProofStoreWriter for StandardRedisStore {
-    async fn put_proof_bytes_for_job_id<J: Into<QJobIdSerialized> + Copy + Send + Sync>(&self, job_id: J, proof_bytes: &[u8]) -> anyhow::Result<()> {
+    async fn put_proof_bytes_for_job_id<J: Into<QJobIdSerialized> + Copy + Send + Sync>(&self, job_id: J, unique_pending_id: u64, proof_bytes: &[u8]) -> anyhow::Result<()> {
         let job_id_bytes = job_id.into().to_vec();
-        self.set_bytes_generic_internal(&self.proof_store_namespace, &job_id_bytes, proof_bytes)
+        let bucket = get_tmp_proof_store_bucket_ns_key(&self.root_prefix, self.realm_id, self.realm_sub_id, unique_pending_id);
+        self.set_bytes_generic_internal(&bucket, &job_id_bytes, proof_bytes)
             .await
     }
     async fn put_proof_for_job_id<J: Into<QJobIdSerialized> + Copy + Send + Sync, P: QPDSerializable + Send + Sync>(
         &self,
         job_id: J,
+        unique_pending_id: u64,
         proof: &P,
     ) -> anyhow::Result<()> {
         let job_id_bytes = job_id.into().to_vec();
+        let bucket = get_tmp_proof_store_bucket_ns_key(&self.root_prefix, self.realm_id, self.realm_sub_id, unique_pending_id);
         let proof_bytes = proof.to_bytes()?;
-        self.set_bytes_generic_internal(&self.proof_store_namespace, &job_id_bytes, &proof_bytes)
+        self.set_bytes_generic_internal(&bucket, &job_id_bytes, &proof_bytes)
             .await
+    }
+    async fn delete_all_proofs_for_pending_id(&self, unique_pending_id: u64) -> anyhow::Result<()> {
+        let mut conn = self.pool.get().await?;
+        let bucket = get_tmp_proof_store_bucket_ns_key(&self.root_prefix, self.realm_id, self.realm_sub_id, unique_pending_id);
+        let _: i32 = conn.del(&bucket).await?;
+        Ok(())
     }
 }
 

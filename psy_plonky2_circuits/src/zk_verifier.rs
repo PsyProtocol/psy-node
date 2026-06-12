@@ -1,9 +1,13 @@
 use parth_core::{pgoldilocks::QHashOut, protocol::core_types::{QZKProofPublicInputsHasherReader, QZKProofVerifier}};
-use plonky2::{hash::hash_types::HashOut, plonk::{config::{AlgebraicHasher, GenericConfig}, proof::ProofWithPublicInputs}};
+use plonky2::{hash::hash_types::HashOut, plonk::{config::{AlgebraicHasher, GenericConfig, PoseidonGoldilocksConfig}, proof::ProofWithPublicInputs}};
+use psy_core::constants::chain_id::PsyChainNetworkType;
 use psy_core::job::job_id::ProvingJobCircuitType;
 use psy_plonky2_basic_helpers::verifier::generic_circuit_library::GenericCircuitVerifier;
 
-use crate::generated::{cached_circuit_library::get_cached_circuit_library, cached_common_data::get_cached_common_data_library};
+use crate::{
+    circuit_library::get_plonky2_circuit_library_and_prover_for_network,
+    generated::{cached_circuit_library::get_cached_circuit_library, cached_common_data::get_cached_common_data_library},
+};
 
 #[derive(Clone, Debug)]
 pub struct PsyPlonky2ZKVerifier<C: GenericConfig<D>, const D: usize> {
@@ -26,6 +30,14 @@ impl<C: GenericConfig<D>, const D: usize> PsyPlonky2ZKVerifier<C, D> {
             common: b
         };
         Self::new(gcv)
+    }
+
+}
+
+impl PsyPlonky2ZKVerifier<PoseidonGoldilocksConfig, 2> {
+    pub fn for_network(network: PsyChainNetworkType) -> anyhow::Result<Self> {
+        let (gcv, _) = get_plonky2_circuit_library_and_prover_for_network::<PoseidonGoldilocksConfig, 2>(network)?;
+        Ok(Self::new(gcv))
     }
 }
 impl<C: GenericConfig<D>, const D: usize> QZKProofPublicInputsHasherReader<QHashOut<C::F>, ProofWithPublicInputs<C::F, C, D>> for PsyPlonky2ZKVerifier<C, D> 

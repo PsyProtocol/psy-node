@@ -66,6 +66,9 @@ pub struct SimpleStoreEx {
         InMemoryTableIdentifier,
         InMemoryTableIdentifier,
         InMemoryTableIdentifier,
+        InMemoryTableIdentifier,
+        InMemoryTableIdentifier,
+        InMemoryTableIdentifier,
         InMemoryTestStore,
     >,
 }

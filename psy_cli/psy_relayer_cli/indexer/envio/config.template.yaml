@@ -1,0 +1,27 @@
+# Envio config template for PSY relayer.
+# Fill contract addresses and start blocks before running.
+
+name: psy-relayer-indexer
+field_selection:
+  transaction_fields:
+    - hash
+
+networks:
+  - id: 31337
+    start_block: 1
+    rpc_config:
+      url: ${ETH_RPC_URL}
+    contracts:
+      - name: Bridge
+        address:
+          - ${BRIDGE_ADDRESS}
+        handler: ./handlers.ts
+        events:
+          - event: DepositRecorded(uint32 indexed index, bytes32 shieldAddress, address indexed token, bytes32 l2TokenContractId, uint256 amount, uint8 chainIndex, bytes32 noteSecretHash, bytes32 leafHash)
+          - event: DepositBatchAppended(uint32 indexed fromIndex, uint32 indexed toIndex, bytes32 newRoot, bytes32[32] oldFrontier, bytes32[] leafHashes)
+      - name: StateManager
+        address:
+          - ${STATE_MANAGER_ADDRESS}
+        handler: ./handlers.ts
+        events:
+          - event: Finalized(uint64 indexed newLastFinalizedCheckpointId, bytes32 indexed newLastVerifiedCheckpointRoot, bytes32 depositTreeRoot, bytes32 withdrawalTreeRoot, uint32 depositsConsumed)

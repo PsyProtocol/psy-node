@@ -1478,6 +1478,38 @@ mod tests {
     type Hash = Hash256;
     type Hasher = CoreSha256Hasher;
     #[test]
+    fn repro_from_hash_map_rehash_commit_loses_root() {
+        // Mirrors the production hot-load path used by
+        // psy_node_common/src/backup/global_user_tree/db_loader_sub_root.rs:
+        //   from_hash_map -> rehash_range -> commit_changes
+        // After this sequence, get_root() must return the same root as
+        // a reference tree built via set_leaf().
+        type H = CoreSha256Hasher;
+        let tree_height: u8 = 6; // small but non-trivial
+        let leaf_count: u64 = 1u64 << (tree_height as u64);
+
+        let mut reference = SimpleMemoryMerkleRecorderStore::<H, Hash256>::new(tree_height);
+        let mut node_hash_map = std::collections::HashMap::new();
+        for i in 0..leaf_count {
+            let v = Hash256::from_u64_le_values(i + 1, 7, 9, 13);
+            reference.set_leaf(i, v);
+            node_hash_map.insert(SimpleMerkleNodeKey::new(tree_height, i), v);
+        }
+        let expected_root = reference.get_root();
+
+        let mut tree = SimpleMemoryMerkleRecorderStore::<H, Hash256>::from_hash_map(tree_height, node_hash_map);
+        tree.rehash_range(tree_height, 0, leaf_count);
+        tree.commit_changes();
+        let actual_root = tree.get_root();
+
+        assert_eq!(
+            actual_root, expected_root,
+            "from_hash_map+rehash_range+commit_changes lost the root: got {:?}, expected {:?}",
+            actual_root, expected_root
+        );
+    }
+
+    #[test]
     fn test_rehash_subtree_height_1_boundary() {
         let mut tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(4);
         let val0 = Hash::from_u64_le_values(1, 0, 0, 0);

@@ -25,11 +25,12 @@ use psy_io::tokio::TokioFileLike;
 use psy_node_core::{
     psy_temp_db::StandardProcessorTempDBStoreBase,
     qblob::{
-        blob_type::QBlobMerkleNodeTreeType,
+        blob_type::{QBlobDataType, QBlobMerkleNodeTreeType},
         data_views::{
             double_merkle_node_batch::QBlobDoubleMerkleNodeBatchDataView, single_merkle_node_batch::QBlobSingleMerkleNodeBatchDataView,
             zero_merkle_node_batch::create_ffs_merkle_nodes_zero_id_from_hash_map_with_offset,
         },
+        structs::common::tree_node_batch_header::QBlobMerkleTreeNodeBatchHeaderV1,
     },
 };
 use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
@@ -59,6 +60,9 @@ pub struct RealmGUTAPlanner<F, Hash> {
     pub user_contract_tree_updates_ffs: Vec<u8>,
     pub contract_state_tree_updates_ffs: Vec<u8>,
     pub user_leaf_updates_ffs: Vec<u8>,
+    /// IMT (Indexed Merkle Tree) leaf preimage data for contract state trees.
+    /// Accumulated from end cap submissions.
+    pub contract_state_imt_leaves_ffs: Vec<u8>,
 
     pub current_checkpoint_root: Hash,
     pub current_checkpoint_id: u64,
@@ -101,6 +105,7 @@ impl<F, Hash> RealmGUTAPlanner<F, Hash> {
             user_contract_tree_updates_ffs: Vec::new(),
             contract_state_tree_updates_ffs: Vec::new(),
             user_leaf_updates_ffs: Vec::new(),
+            contract_state_imt_leaves_ffs: Vec::new(),
             current_checkpoint_root,
             current_checkpoint_id,
             unique_pending_id,
@@ -271,6 +276,14 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
         }
         let last_user_leaf_value = global_user_tree.get_leaf_value(user_id - self.realm_user_min_id);
         if last_user_leaf_value != queue_item.old_user_leaf_hash {
+            if last_user_leaf_value == Hash::get_zero_value() {
+                tracing::warn!(
+                    "Initializing missing global user tree leaf for user ID {} from queue item old hash {:?}.",
+                    user_id,
+                    queue_item.old_user_leaf_hash
+                );
+                global_user_tree.set_leaf(user_id - self.realm_user_min_id, queue_item.old_user_leaf_hash);
+            } else {
             tracing::info!(
                 "Skipping end-cap job population due to user leaf hash mismatch for user ID {}. Expected last_user_leaf_value={:?}, found {:?}. Likely got overwritten due to a race condition. Gracefully skipping.",
                 user_id,
@@ -278,6 +291,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
                 queue_item.old_user_leaf_hash
             );
             return Ok(0);
+            }
         }
         if user_last_checkpoint_id > self.current_checkpoint_id {
             tracing::info!(
@@ -314,6 +328,8 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
         file.write_all(&data).await?;
         self.total_end_caps_processed += 1;
 
+        tracing::debug!("End-cap job populated data len {}.", data.len());
+
         let (single_header, single_payload, double_full) =
             QBlobSingleMerkleNodeBatchDataView::validate_single_tree_nodes_batch_header_for_realm_context_get_clipped_ref_no_exact_size_any_unique_pending_id(
                 &data,
@@ -322,13 +338,29 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
                 self.realm_sub_id_u64,
                 QBlobMerkleNodeTreeType::UserContractTree,
             )?;
-        let (_double_header, double_payload) =
-            QBlobDoubleMerkleNodeBatchDataView::validate_cst_nodes_batch_header_for_realm_context_get_clipped_ref_any_unique_pending_id(
+
+        tracing::debug!("Single header: {}", serde_json::to_string_pretty(&single_header)?);
+        let (double_header, double_payload, imt_full) =
+            QBlobDoubleMerkleNodeBatchDataView::validate_cst_nodes_batch_header_for_realm_context_get_clipped_ref_any_unique_pending_id_with_remaining(
                 &double_full,
                 self.chain_id,
                 self.realm_id_u64,
                 self.realm_sub_id_u64,
             )?;
+        tracing::debug!("Double header: {}", serde_json::to_string_pretty(&double_header)?);
+        
+        if !imt_full.is_empty() {
+            let (imt_header, imt_payload) = QBlobMerkleTreeNodeBatchHeaderV1::clip_header_get_payload_for_blob_type_and_tree_ref(
+                imt_full,
+                QBlobDataType::GenericIMTLeafBatch,
+                QBlobMerkleNodeTreeType::IMTContractStateLeaf,
+                true,
+            )?;
+            tracing::debug!("IMT header: {}", serde_json::to_string_pretty(&imt_header)?);
+            // Store IMT leaf preimage data for FFS database
+            self.contract_state_imt_leaves_ffs.extend_from_slice(imt_payload);
+        }
+
         if single_header.checkpoint_id != queue_item.expected_fake_checkpoint_id {
             tracing::info!("Skipping end-cap job population due to fake checkpoint ID mismatch: expected {}, found {}. Likely got overwritten due to a race condition. Gracefully skipping.",
                 queue_item.expected_fake_checkpoint_id,
@@ -509,13 +541,27 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
                 self.realm_sub_id_u64,
                 QBlobMerkleNodeTreeType::UserContractTree,
             )?;
-        let (_double_header, double_payload) =
-            QBlobDoubleMerkleNodeBatchDataView::validate_cst_nodes_batch_header_for_realm_context_get_clipped_ref_any_unique_pending_id(
+        tracing::debug!("Single header: {}", serde_json::to_string_pretty(&single_header)?);
+        // For IMT: validate CST nodes and extract IMT leaf data (3 parts: single, double, imt)
+        let (double_header, double_payload, imt_full) =
+            QBlobDoubleMerkleNodeBatchDataView::validate_cst_nodes_batch_header_for_realm_context_get_clipped_ref_any_unique_pending_id_with_remaining(
                 &double_full,
                 self.chain_id,
                 self.realm_id_u64,
                 self.realm_sub_id_u64,
             )?;
+        tracing::debug!("Double header: {}", serde_json::to_string_pretty(&double_header)?);
+        if !imt_full.is_empty() {
+            let (imt_header, imt_payload) = QBlobMerkleTreeNodeBatchHeaderV1::clip_header_get_payload_for_blob_type_and_tree_ref(
+                imt_full,
+                QBlobDataType::GenericIMTLeafBatch,
+                QBlobMerkleNodeTreeType::IMTContractStateLeaf,
+                true,
+            )?;
+            // Store IMT leaf preimage data for FFS database
+            tracing::debug!("IMT header: {}", serde_json::to_string_pretty(&imt_header)?);
+            self.contract_state_imt_leaves_ffs.extend_from_slice(imt_payload);
+        }
         if single_header.checkpoint_id != queue_item.expected_fake_checkpoint_id {
             tracing::info!("Skipping end-cap job population due to fake checkpoint ID mismatch: expected {}, found {}. Likely got overwritten due to a race condition. Gracefully skipping.",
                 queue_item.expected_fake_checkpoint_id,
@@ -825,6 +871,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
                         ),
                         update_user_contract_tree_nodes_ffs: self.user_contract_tree_updates_ffs,
                         update_contract_state_tree_nodes_ffs: self.contract_state_tree_updates_ffs,
+                        update_contract_state_imt_leaves_ffs: self.contract_state_imt_leaves_ffs,
                         update_user_leaves_ffs: self.user_leaf_updates_ffs,
                         guta_header: new_guta_header,
                     },
@@ -851,6 +898,7 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
                     total_proofs_generated: self.total_jobs as u64,
                     update_user_contract_tree_nodes_ffs: self.user_contract_tree_updates_ffs,
                     update_contract_state_tree_nodes_ffs: self.contract_state_tree_updates_ffs,
+                    update_contract_state_imt_leaves_ffs: self.contract_state_imt_leaves_ffs,
                     update_user_leaves_ffs: self.user_leaf_updates_ffs,
                     guta_header: straggler,
                 },

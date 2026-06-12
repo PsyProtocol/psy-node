@@ -1,0 +1,50 @@
+type Deposit @entity {
+  id: ID!
+  chain_id: Int!
+  deposit_index: Int!
+  shield_address: String!
+  token: String!
+  l2_token_contract_id: String!
+  amount: BigInt!
+  note_secret_hash: String!
+  chain_index: Int!
+  leaf_hash: String!
+  block_number: Int!
+  tx_hash: String!
+}
+
+type DepositBatchAppend @entity {
+  id: ID!
+  chain_id: Int!
+  from_index: Int!
+  to_index: Int!
+  deposit_root: String!
+  old_frontier_json: String!
+  leaf_hashes_json: String!
+  block_number: Int!
+  tx_hash: String!
+}
+
+type FinalizedBatch @entity {
+  id: ID!
+  chain_id: Int!
+  finalized_checkpoint_id: BigInt!
+  deposit_tree_root: String!
+  withdrawal_tree_root: String!
+  block_number: Int!
+  tx_hash: String!
+}
+
+# ── Incremental deposit tree node storage ───────────────────────────────────
+# Stores every node of the deposit Merkle tree (depth 32). Updated incrementally
+# in DepositBatchAppended handlers so proof queries are simple level+index
+# lookups without reconstructing the full tree from all leaves.
+#
+# The tree is keyed by (source_chain_id, level, node_index).
+type DepositTreeNode @entity {
+  id: ID!                           # "{source_chain_id}:{level}:{node_index}"
+  source_chain_id: Int!
+  level: Int!
+  node_index: BigInt!
+  hash: String!
+}

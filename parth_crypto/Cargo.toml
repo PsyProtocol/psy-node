@@ -19,6 +19,7 @@ speedy = { workspace = true, optional = true }
 pser = { workspace = true }
 anyhow = { workspace = true }
 sha2 = { workspace = true }
+tiny-keccak = { workspace = true }
 rand = { workspace = true }
 rand_chacha = { workspace = true }
 

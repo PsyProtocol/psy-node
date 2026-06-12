@@ -123,8 +123,10 @@ impl<C: JTMBCircuitConfig> QEDCheckpointStateTransitionCircuit<C> {
         
         if is_genesis_prev {
             jtmb_connect_ref(&prev_fp, &self.known_genesis_fingerprint, "Previous proof (Genesis) fingerprint mismatch")?;
-            let config_hash = C::Hasher::two_to_one(&input.genesis_checkpoint_state_transition_hash, &self.fingerprint);
-            let expected_genesis_pi = C::Hasher::two_to_one(&input.genesis_checkpoint_state_transition_hash, &config_hash);
+            // New genesis PI formula: chain_0 = H(H(root, leaf), genesis_fingerprint)
+            // Use witness merkle proof data for root/leaf, and compare against the ZKP's PI.
+            let root_leaf = C::Hasher::two_to_one(&input.previous_checkpoint_proof.root, &input.previous_checkpoint_proof.value);
+            let expected_genesis_pi = C::Hasher::two_to_one(&root_leaf, &self.known_genesis_fingerprint);
             jtmb_connect_ref(&expected_genesis_pi, &previous_checkpoint_proof.public_inputs_hash, "Genesis proof public inputs mismatch")?;
         } else {
             jtmb_connect_ref(&prev_fp, &self.fingerprint, "Previous proof (Recursive) fingerprint mismatch")?;

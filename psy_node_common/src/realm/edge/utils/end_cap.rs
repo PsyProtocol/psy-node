@@ -1,11 +1,16 @@
 use parth_core::{
+    crypto::hash::traits::QFieldHashable,
     felt::QFelt64,
     protocol::core_types::{QDBHashBase, QFHashBase, QFHasherU64},
 };
-use psy_data::proof_input::guta::end_cap_input::SubmitUserEndCapNonProofInput;
+use psy_data::{
+    proof_input::guta::end_cap_input::{ContractStateUpdate, SubmitUserEndCapNonProofInput},
+    v1::qdata::contract::{serialize_imt_leaf_ffs_entry_v2, IMTContractStateUpdate},
+};
 use psy_node_core::qblob::{
-    blob_type::QBlobMerkleNodeTreeType, data_views::single_merkle_node_batch::QBlobSingleIdMerkleRecorder,
-    structs::common::blob_metadata_header::QBlobWriterContextMetadataHeader,
+    blob_type::QBlobMerkleNodeTreeType,
+    data_views::single_merkle_node_batch::QBlobSingleIdMerkleRecorder,
+    structs::common::{blob_metadata_header::QBlobWriterContextMetadataHeader, tree_node_batch_header::QBlobMerkleTreeNodeBatchHeaderV1},
 };
 
 pub fn validate_end_cap_and_generate_node_data_for_edge<F: QFelt64, Hash: QDBHashBase + QFHashBase<F>, Hasher: QFHasherU64<F, Hash>>(
@@ -13,7 +18,7 @@ pub fn validate_end_cap_and_generate_node_data_for_edge<F: QFelt64, Hash: QDBHas
     user_id: u64,
     end_cap: &SubmitUserEndCapNonProofInput<F, Hash>,
 ) -> anyhow::Result<Vec<u8>> {
-    if end_cap.contract_state_updates.len() == 0 {
+    if end_cap.contract_state_updates.is_empty() {
         anyhow::bail!("End cap must have at least one contract state update");
     }
     let user_contract_tree_height = end_cap.contract_state_updates[0].user_contract_tree_update_proof.siblings.len();
@@ -24,11 +29,10 @@ pub fn validate_end_cap_and_generate_node_data_for_edge<F: QFelt64, Hash: QDBHas
     let mut next_uct_end_root = end_cap.contract_state_updates[end_cap.contract_state_updates.len() - 1]
         .user_contract_tree_update_proof
         .new_root;
-
     let null_hash = Hasher::get_zero_hash(0);
 
     for csu in end_cap.contract_state_updates.iter().rev() {
-        if csu.contract_state_tree_updates.is_empty() {
+        if csu.updates.is_empty() {
             anyhow::bail!("Contract state updates cannot be empty");
         }
 
@@ -45,14 +49,21 @@ pub fn validate_end_cap_and_generate_node_data_for_edge<F: QFelt64, Hash: QDBHas
         }
         next_uct_end_root = csu.user_contract_tree_update_proof.old_root;
 
-        if csu.contract_state_tree_updates.is_empty() {
-            anyhow::bail!("Contract state tree updates cannot be empty");
-        }
+        let first_old = csu.updates.first().unwrap().old_root();
+        if csu.user_contract_tree_update_proof.old_value != first_old {
+            let first_height = match csu.updates.first().unwrap() {
+                ContractStateUpdate::Positional { delta_proof } => delta_proof.siblings.len(),
+                ContractStateUpdate::IMT { update } => match update {
+                    IMTContractStateUpdate::Update { delta_proof, .. } => delta_proof.siblings.len(),
+                    IMTContractStateUpdate::Insert {
+                        predecessor_delta_proof,
+                        ..
+                    } => predecessor_delta_proof.siblings.len(),
+                },
+            };
+            let contract_empty_zero_hash = Hasher::get_zero_hash(first_height);
 
-        if csu.user_contract_tree_update_proof.old_value != csu.contract_state_tree_updates[0].old_root {
-            let contract_empty_zero_hash = Hasher::get_zero_hash(csu.contract_state_tree_updates[0].siblings.len());
-
-            if csu.user_contract_tree_update_proof.old_value == null_hash && csu.contract_state_tree_updates[0].old_root == contract_empty_zero_hash {
+            if csu.user_contract_tree_update_proof.old_value == null_hash && first_old == contract_empty_zero_hash {
                 // allow this special case where we are updating from an empty
                 // tree it means a user never tried the contract
                 // before, and we initialize it to an empty merkle tree with the
@@ -62,32 +73,144 @@ pub fn validate_end_cap_and_generate_node_data_for_edge<F: QFelt64, Hash: QDBHas
             }
         }
 
-        if csu.user_contract_tree_update_proof.new_value != csu.contract_state_tree_updates.last().unwrap().new_root {
+        let last_new = csu.updates.last().unwrap().new_root();
+        if csu.user_contract_tree_update_proof.new_value != last_new {
             anyhow::bail!("User contract tree update proof new value does not match last contract state tree update new root");
         }
     }
 
     let mut double_id_recorder = single_id_recorder.finalize_with_header_into_double(&context, QBlobMerkleNodeTreeType::UserContractTree);
+    let mut serialized_leaves = Vec::new();
     for csu in end_cap.contract_state_updates.iter().rev() {
-        let mut next_cst_root = csu.contract_state_tree_updates[csu.contract_state_tree_updates.len() - 1].new_root;
-        for cst_update in csu.contract_state_tree_updates.iter().rev() {
-            let computed_cst_root = double_id_recorder.record_and_compute_merkle_root_validate_delta_merkle_proof::<Hash, Hasher>(
-                user_id,
-                csu.user_contract_tree_update_proof.index,
-                cst_update.siblings.len() as u8,
-                &cst_update,
-            )?;
-            if computed_cst_root != cst_update.new_root {
-                anyhow::bail!("Computed contract state tree update new root does not match proof new root");
+        let contract_id = csu.user_contract_tree_update_proof.index;
+        let mut next_cst_root = csu.updates.last().unwrap().new_root();
+        for update in csu.updates.iter().rev() {
+            match update {
+                ContractStateUpdate::Positional { delta_proof } => {
+                    let computed = double_id_recorder.record_and_compute_merkle_root_validate_delta_merkle_proof::<Hash, Hasher>(
+                        user_id,
+                        contract_id,
+                        delta_proof.siblings.len() as u8,
+                        delta_proof,
+                    )?;
+                    if computed != delta_proof.new_root || next_cst_root != delta_proof.new_root {
+                        anyhow::bail!("Positional update root chain mismatch");
+                    }
+                    next_cst_root = delta_proof.old_root;
+                }
+                ContractStateUpdate::IMT { update } => match update {
+                    IMTContractStateUpdate::Update {
+                        new_preimage,
+                        delta_proof,
+                        ..
+                    } => {
+                        let computed = double_id_recorder.record_and_compute_merkle_root_validate_delta_merkle_proof::<Hash, Hasher>(
+                            user_id,
+                            contract_id,
+                            delta_proof.siblings.len() as u8,
+                            delta_proof,
+                        )?;
+                        if computed != delta_proof.new_root || next_cst_root != delta_proof.new_root {
+                            tracing::info!("IMT update root chain mismatch: computed={}, delta_proof.new_root={}, next_cst_root={}",
+                                serde_json::to_string(&computed).unwrap(),
+                                serde_json::to_string(&delta_proof.new_root).unwrap(),
+                                serde_json::to_string(&next_cst_root).unwrap()
+                            );
+                            anyhow::bail!("IMT update root chain mismatch");
+                        }
+                        next_cst_root = delta_proof.old_root;
+
+                        let leaf_hash = new_preimage.qfhash::<Hasher>();
+                        let next_index = new_preimage.next_index.to_u64_value();
+                        let serialized = serialize_imt_leaf_ffs_entry_v2(
+                            user_id,
+                            contract_id,
+                            delta_proof.index,
+                            &leaf_hash,
+                            &new_preimage.key,
+                            &new_preimage.value,
+                            &new_preimage.next_key,
+                            next_index,
+                            false,
+                        );
+                        serialized_leaves.extend_from_slice(&serialized);
+                    }
+                    IMTContractStateUpdate::Insert {
+                        predecessor_new_preimage,
+                        new_leaf_preimage,
+                        predecessor_delta_proof,
+                        new_leaf_delta_proof,
+                        ..
+                    } => {
+                        let computed_new_leaf = double_id_recorder.record_and_compute_merkle_root_validate_delta_merkle_proof::<Hash, Hasher>(
+                            user_id,
+                            contract_id,
+                            new_leaf_delta_proof.siblings.len() as u8,
+                            new_leaf_delta_proof,
+                        )?;
+                        if computed_new_leaf != new_leaf_delta_proof.new_root || next_cst_root != new_leaf_delta_proof.new_root {
+                            anyhow::bail!("IMT insert root chain mismatch at new leaf");
+                        }
+
+                        let computed_pred = double_id_recorder.record_and_compute_merkle_root_validate_delta_merkle_proof::<Hash, Hasher>(
+                            user_id,
+                            contract_id,
+                            predecessor_delta_proof.siblings.len() as u8,
+                            predecessor_delta_proof,
+                        )?;
+                        if computed_pred != predecessor_delta_proof.new_root
+                            || predecessor_delta_proof.new_root != new_leaf_delta_proof.old_root
+                        {
+                            anyhow::bail!("IMT insert root chain mismatch at predecessor");
+                        }
+                        next_cst_root = predecessor_delta_proof.old_root;
+
+                        let pred_leaf_hash = predecessor_new_preimage.qfhash::<Hasher>();
+                        let pred_next_index = predecessor_new_preimage.next_index.to_u64_value();
+                        let pred_serialized = serialize_imt_leaf_ffs_entry_v2(
+                            user_id,
+                            contract_id,
+                            predecessor_delta_proof.index,
+                            &pred_leaf_hash,
+                            &predecessor_new_preimage.key,
+                            &predecessor_new_preimage.value,
+                            &predecessor_new_preimage.next_key,
+                            pred_next_index,
+                            false,
+                        );
+                        serialized_leaves.extend_from_slice(&pred_serialized);
+
+                        let new_leaf_hash = new_leaf_preimage.qfhash::<Hasher>();
+                        let new_next_index = new_leaf_preimage.next_index.to_u64_value();
+                        let new_serialized = serialize_imt_leaf_ffs_entry_v2(
+                            user_id,
+                            contract_id,
+                            new_leaf_delta_proof.index,
+                            &new_leaf_hash,
+                            &new_leaf_preimage.key,
+                            &new_leaf_preimage.value,
+                            &new_leaf_preimage.next_key,
+                            new_next_index,
+                            true,
+                        );
+                        serialized_leaves.extend_from_slice(&new_serialized);
+                    }
+                },
             }
-            if next_cst_root != cst_update.new_root {
-                anyhow::bail!("Computed contract state tree update end root does not match expected end root");
-            }
-            next_cst_root = cst_update.old_root;
         }
         if next_cst_root != csu.user_contract_tree_update_proof.old_value {
             if csu.user_contract_tree_update_proof.old_value == null_hash {
-                let contract_empty_zero_hash = Hasher::get_zero_hash(csu.contract_state_tree_updates[0].siblings.len());
+                let first_height = match csu.updates.first().unwrap() {
+                    ContractStateUpdate::Positional { delta_proof } => delta_proof.siblings.len(),
+                    ContractStateUpdate::IMT { update } => match update {
+                        IMTContractStateUpdate::Update { delta_proof, .. } => delta_proof.siblings.len(),
+                        IMTContractStateUpdate::Insert {
+                            predecessor_delta_proof,
+                            ..
+                        } => predecessor_delta_proof.siblings.len(),
+                    },
+                };
+                let contract_empty_zero_hash = Hasher::get_zero_hash(first_height);
                 if next_cst_root == contract_empty_zero_hash {
                     // allow this special case where we are updating from an
                     // empty tree it means a user never
@@ -107,9 +230,24 @@ pub fn validate_end_cap_and_generate_node_data_for_edge<F: QFelt64, Hash: QDBHas
         }
     }
 
-    let finalized_blob = double_id_recorder.finalize_with_header(context);
+    let mut result = double_id_recorder.finalize_with_header(context);
+    if !serialized_leaves.is_empty() {
+        let imt_entry_count = (serialized_leaves.len() / 161) as u64;
+        let mut imt_header = QBlobMerkleTreeNodeBatchHeaderV1::new_imt_leaf_header(
+            QBlobMerkleNodeTreeType::IMTContractStateLeaf,
+            context.chain_id,
+            context.created_by_node_id,
+            context.realm_id,
+            context.realm_sub_id,
+            context.unique_pending_id,
+            user_id,
+        );
+        imt_header.modify_for_final_count_and_size(161, imt_entry_count);
+        result.extend_from_slice(&imt_header.to_bytes_fixed_size_array());
+        result.extend_from_slice(&serialized_leaves);
+    }
 
-    Ok(finalized_blob)
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -119,15 +257,18 @@ mod tests {
         crypto::hash::traits::{MerkleZeroHasher, QFieldHashable},
         felt::{QFelt64, ToU64Value},
         pgoldilocks::PoseidonHasher,
-        protocol::core_types::{QFHashBase, QFHasherU64},
+        protocol::core_types::{Q256BitHash, QFHashBase, QFHasherU64},
         utils::QPGenRandom,
         PHash,
     };
     use psy_data::{
         guta::stats::GUTAStats,
-        proof_input::guta::{end_cap_input::SubmitUserEndCapNonProofInput, SubmitUserEndCapNonProofCoreInput},
+        proof_input::guta::{
+            end_cap_input::{ContractStateUpdate, ContractStateUpdateHistory, SubmitUserEndCapNonProofInput},
+            SubmitUserEndCapNonProofCoreInput,
+        },
         v1::qdata::{
-            contract::{DashMapContractHeightCache, PSimpleContractHeightCache, QEDContractStateUpdateHistory},
+            contract::{DashMapContractHeightCache, PSimpleContractHeightCache},
             user::PQEDUserLeaf,
             user_end_cap_result::PUPSEndCapResultCompact,
         },
@@ -150,7 +291,7 @@ mod tests {
     )
     where
         F: QFelt64,
-        Hash: QFHashBase<F> + QPGenRandom,
+        Hash: Q256BitHash + QFHashBase<F> + QPGenRandom,
         Hasher: QFHasherU64<F, Hash> + MerkleZeroHasher<Hash>,
     {
         let mut user_contract_tree = SimpleMemoryMerkleStoreV3::<Hasher, Hash>::new(contract_tree_height);
@@ -161,9 +302,9 @@ mod tests {
                 let contract_state_tree_height = 24 + i as u8;
                 let tree = SimpleMemoryMerkleStoreV3::<Hasher, Hash>::new(contract_state_tree_height);
                 //let max_leaf_id = 1u64 << contract_state_tree_height;
-                contract_helper.add_contract(0, contract_state_tree_height, tree.get_root());
+                contract_helper.add_contract(i as u32, contract_state_tree_height, tree.get_root());
 
-                /* 
+                /*
                 for _ in 0..1000 {
                     let rand_leaf_id = rand::random::<u64>() % max_leaf_id;
                     //tree.set_leaf(rand_leaf_id, Hash::qp_rand_gen());
@@ -208,9 +349,12 @@ mod tests {
                 .collect::<Vec<_>>();
             let end_root = ctree.get_root();
             let user_contract_tree_update_proof = user_contract_tree.set_leaf(i as u64, end_root);
-            contract_state_updates.push(QEDContractStateUpdateHistory {
+            contract_state_updates.push(ContractStateUpdateHistory {
                 user_contract_tree_update_proof,
-                contract_state_tree_updates,
+                updates: contract_state_tree_updates
+                    .into_iter()
+                    .map(|delta_proof| ContractStateUpdate::Positional { delta_proof })
+                    .collect(),
             });
         });
 

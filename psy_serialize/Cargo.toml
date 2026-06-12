@@ -16,4 +16,4 @@ anyhow     = { workspace = true }
 bytemuck = { workspace = true, optional = true }
 paste = { workspace = true }
 # workspace dependencies
-psy_io = { workspace = true }
+psy_io = { path = "../psy_io", default-features = false }

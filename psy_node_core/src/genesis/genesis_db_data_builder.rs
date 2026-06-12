@@ -203,7 +203,7 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
             self.public_key_hash_to_user_id_rows_ffs = Vec::with_capacity(user_ids.len() * PSY_OBJECT_FFS_SIZE_HASH_256_AND_U64);
         }
 
-        // let mut global_user_tree_leaves = Vec::<MerkleLeafNode<Hash>>::with_capacity(genesis_block.users.len());
+        let mut global_user_tree_leaves = Vec::<MerkleLeafNode<Hash>>::with_capacity(genesis_block.users.len());
 
         for ((registration_id, user), user_id) in genesis_block.users.iter().enumerate().zip(user_ids.into_iter()) {
             let registration_id = registration_id as u64;
@@ -213,12 +213,12 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
                 value: public_key_hash,
             });
 
-            // let is_in_realm = if realm_id.is_some() {
-            //     user_id >= realm_start_user_id && user_id < next_realm_start_user_id
-            // } else {
-            //     true
-            // };
-            // let should_save_tree_nodes = is_in_realm && collect_user_leaves_and_contract_tree_nodes;
+            let is_in_realm = if realm_id.is_some() {
+                user_id >= realm_start_user_id && user_id < next_realm_start_user_id
+            } else {
+                true
+            };
+            let should_save_tree_nodes = is_in_realm && collect_user_leaves_and_contract_tree_nodes;
 
             if collect_public_keys {
                 let u64_hash_mapping_row = QHash256AndU64 {
@@ -233,48 +233,48 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
                     .extend_from_slice(&user.public_key_info.fx_tpl_psy_ser_into_bytes_vec()?);
             }
 
-            // let mut user_contract_tree_leaves = Vec::<MerkleLeafNode<Hash>>::with_capacity(user.constract_state_tree_records.len());
+            let mut user_contract_tree_leaves = Vec::<MerkleLeafNode<Hash>>::with_capacity(user.constract_state_tree_records.len());
 
-            // for constract_state_tree_record in user.constract_state_tree_records.iter() {
-            //     let contract_id = constract_state_tree_record.parent_index;
-            //     let contract_state_tree_height = genesis_block.get_contract_state_tree_height(contract_id)?;
-            //     let root = contract_state_tree_nodes_serializer.add_merkle_leaves_save_optional::<Hasher>(
-            //         user_id,
-            //         contract_id,
-            //         contract_state_tree_height,
-            //         &constract_state_tree_record.children,
-            //         should_save_tree_nodes,
-            //     );
-            //     user_contract_tree_leaves.push(MerkleLeafNode {
-            //         index: contract_id,
-            //         value: root,
-            //     });
-            // }
+            for constract_state_tree_record in user.constract_state_tree_records.iter() {
+                let contract_id = constract_state_tree_record.parent_index;
+                let contract_state_tree_height = genesis_block.get_contract_state_tree_height(contract_id)?;
+                let root = contract_state_tree_nodes_serializer.add_merkle_leaves_save_optional::<Hasher>(
+                    user_id,
+                    contract_id,
+                    contract_state_tree_height,
+                    &constract_state_tree_record.children,
+                    should_save_tree_nodes,
+                );
+                user_contract_tree_leaves.push(MerkleLeafNode {
+                    index: contract_id,
+                    value: root,
+                });
+            }
 
-            // let user_contract_tree_root = user_contract_tree_nodes_serializer.add_merkle_leaves_save_optional::<Hasher>(
-            //     user_id,
-            //     N::GLOBAL_CONTRACT_TREE_HEIGHT,
-            //     &user_contract_tree_leaves,
-            //     should_save_tree_nodes,
-            // );
+            let user_contract_tree_root = user_contract_tree_nodes_serializer.add_merkle_leaves_save_optional::<Hasher>(
+                user_id,
+                N::GLOBAL_CONTRACT_TREE_HEIGHT,
+                &user_contract_tree_leaves,
+                should_save_tree_nodes,
+            );
 
-            // let user_leaf = PQEDUserLeaf::<F, Hash> {
-            //     public_key: public_key_hash,
-            //     user_state_tree_root: user_contract_tree_root,
-            //     balance: F::from_u64_value(user.balance),
-            //     nonce: F::from_u64_value(user.nonce),
-            //     last_checkpoint_id: F::from_u64_value(user.last_checkpoint_id),
-            //     event_index: F::from_u64_value(user.event_index),
-            //     user_id: F::from_u64_value(user_id),
-            // };
-            // let user_leaf_hash = user_leaf.qfhash::<Hasher>();
-            // if should_save_tree_nodes {
-            //     self.user_leaves_ffs.extend_from_slice(&user_leaf.fx_tpl_psy_ser_into_bytes_vec()?);
-            // }
-            // global_user_tree_leaves.push(MerkleLeafNode {
-            //     index: user_id,
-            //     value: user_leaf_hash,
-            // });
+            let user_leaf = PQEDUserLeaf::<F, Hash> {
+                public_key: public_key_hash,
+                user_state_tree_root: user_contract_tree_root,
+                balance: F::from_u64_value(user.balance),
+                nonce: F::from_u64_value(user.nonce),
+                last_checkpoint_id: F::from_u64_value(user.last_checkpoint_id),
+                event_index: F::from_u64_value(user.event_index),
+                user_id: F::from_u64_value(user_id),
+            };
+            let user_leaf_hash = user_leaf.qfhash::<Hasher>();
+            if should_save_tree_nodes {
+                self.user_leaves_ffs.extend_from_slice(&user_leaf.fx_tpl_psy_ser_into_bytes_vec()?);
+            }
+            global_user_tree_leaves.push(MerkleLeafNode {
+                index: user_id,
+                value: user_leaf_hash,
+            });
         }
 
         self.user_contract_tree_nodes_ffs = user_contract_tree_nodes_serializer.serialize_into_bytes();
@@ -286,10 +286,10 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
         self.user_registration_tree_nodes_ffs =
             QMerkleStoreFastZeroNodeSerializer::serialize_zero_id_hash_map_to_vec(&user_registration_tree_nodes_hash_map);
 
-        let global_user_tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(N::GLOBAL_USER_TREE_HEIGHT);
-        // for leaf in global_user_tree_leaves.iter() {
-        //     global_user_tree.set_leaf_no_proof(leaf.index, leaf.value);
-        // }
+        let mut global_user_tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(N::GLOBAL_USER_TREE_HEIGHT);
+        for leaf in global_user_tree_leaves.iter() {
+            global_user_tree.set_leaf_no_proof(leaf.index, leaf.value);
+        }
         let global_user_tree_root = global_user_tree.get_root();
 
         let merkle_proof_to_realm_root = if let Some(realm_id) = realm_id {
@@ -453,6 +453,7 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
             old_realm_root: coordinator_update.merkle_proof_to_realm_root.root,
             new_realm_root: coordinator_update.merkle_proof_to_realm_root.root,
             update_global_user_tree_nodes_ffs: builder.global_user_tree_nodes_ffs,
+            update_contract_state_imt_leaves_ffs: vec![],
         };
 
         let prepared_updates_with_coordinator = PsyPreparedRealmBlockStateUpdatesWithCoordinatorUpdate {

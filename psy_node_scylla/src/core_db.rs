@@ -19,14 +19,14 @@ use parth_core::{
     protocol::core_types::QDBHashBase,
 };
 use psy_node_core::store::traits::core_db::{
-    CoreDatabaseBidirectionalMappingReader, CoreDatabaseBidirectionalMappingWriter, CoreDatabaseBidirectionalU64U128MappingReader, CoreDatabaseBidirectionalU64U128MappingWriter, CoreDatabaseDoubleIdCheckpointedReader, CoreDatabaseDoubleIdCheckpointedWriter, CoreDatabaseDoubleIdMerkleReader, CoreDatabaseDoubleIdMerkleWriter, CoreDatabaseHashToManyIdsReader, CoreDatabaseHashToManyIdsWriter, CoreDatabaseKivReader, CoreDatabaseKivWriter, CoreDatabaseSingleIdCheckpointedReader, CoreDatabaseSingleIdCheckpointedWriter, CoreDatabaseSingleIdMerkleReader, CoreDatabaseSingleIdMerkleWriter, CoreDatabaseTagTreeReader, CoreDatabaseTagTreeWriter, CoreDatabaseU64CounterReader, CoreDatabaseU64CounterWriter, CoreDatabaseU64Reader, CoreDatabaseU64Writer, CoreDatabaseZeroIdMerkleDumpReader, CoreDatabaseZeroIdMerkleReader, CoreDatabaseZeroIdMerkleWriter, MerkleTreeDumpStrategy
+    CoreDatabaseBidirectionalMappingReader, CoreDatabaseBidirectionalMappingWriter, CoreDatabaseBidirectionalU64U128MappingReader, CoreDatabaseBidirectionalU64U128MappingWriter, CoreDatabaseDoubleIdCheckpointedReader, CoreDatabaseDoubleIdCheckpointedWriter, CoreDatabaseDoubleIdMerkleReader, CoreDatabaseDoubleIdMerkleWriter, CoreDatabaseHashToManyIdsReader, CoreDatabaseHashToManyIdsWriter, CoreDatabaseIMTKeyIndexReader, CoreDatabaseIMTKeyIndexWriter, CoreDatabaseIMTNextAppendIndexReader, CoreDatabaseIMTNextAppendIndexWriter, CoreDatabaseIMTLeafReader, CoreDatabaseIMTLeafWriter, CoreDatabaseKivReader, CoreDatabaseKivWriter, CoreDatabaseSingleIdCheckpointedReader, CoreDatabaseSingleIdCheckpointedWriter, CoreDatabaseSingleIdMerkleReader, CoreDatabaseSingleIdMerkleWriter, CoreDatabaseTagTreeReader, CoreDatabaseTagTreeWriter, CoreDatabaseU64CounterReader, CoreDatabaseU64CounterWriter, CoreDatabaseU64Reader, CoreDatabaseU64Writer, CoreDatabaseZeroIdMerkleDumpReader, CoreDatabaseZeroIdMerkleReader, CoreDatabaseZeroIdMerkleWriter, MerkleTreeDumpStrategy
 };
 use psy_serialize::PsySerializeCanonicalAsyncSafe;
 
 use crate::{
     core::ScyllaCoreStore,
     tables::{
-        blob::ScyllaBiDirectionalBlobToBlobTablePreparedStatements, counter::u64_counter::ScyllaU64ToU64CounterTablePreparedStatements, hash_to_many_ids::ScyllaHashToManyIdsTablePreparedStatements, merkle::{ScyllaDoubleMerkleNodesPreparedStatements, ScyllaMerkleNodesPreparedStatements, ScyllaMerkleNodesZeroPreparedStatements}, object::{
+        blob::ScyllaBiDirectionalBlobToBlobTablePreparedStatements, counter::u64_counter::ScyllaU64ToU64CounterTablePreparedStatements, hash_to_many_ids::ScyllaHashToManyIdsTablePreparedStatements, imt::{ScyllaIMTKeyIndexPreparedStatements, ScyllaIMTLeafPreparedStatements, ScyllaIMTNextAppendIndexPreparedStatements}, merkle::{ScyllaDoubleMerkleNodesPreparedStatements, ScyllaMerkleNodesPreparedStatements, ScyllaMerkleNodesZeroPreparedStatements}, object::{
             ScyllaGenericKeyIdValueTablePreparedStatements, ScyllaGenericObjectDoubleIdTablePreparedStatements,
             ScyllaGenericObjectSingleIdTablePreparedStatements,
         }, tag_tree::ScyllaTagTreeNodesPreparedStatements, u64_table::{ScyllaBidirectionalU64U128MappingPreparedStatements, ScyllaU64ToU64TablePreparedStatements}
@@ -1002,5 +1002,129 @@ impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sy
         data: &[u8],
     ) -> anyhow::Result<()>{
         table.set_hash_256_to_u64_pairs_from_fast_serialized_data(&self.session, data).await
+    }
+}
+
+// IMT Leaf table implementation for ScyllaCoreStore
+#[async_trait]
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+    CoreDatabaseIMTLeafReader<ScyllaIMTLeafPreparedStatements> for ScyllaCoreStore<Hash, Hasher>
+{
+    async fn db_select_imt_leaf(
+        &self,
+        table: &ScyllaIMTLeafPreparedStatements,
+        tree_id: i64,
+        tree_sub_id: i64,
+        leaf_index: i64,
+        max_checkpoint_id: i64,
+    ) -> anyhow::Result<Option<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, i64)>> {
+        table.select_leaf(&self.session, tree_id, tree_sub_id, leaf_index, max_checkpoint_id).await
+    }
+}
+
+#[async_trait]
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+    CoreDatabaseIMTLeafWriter<ScyllaIMTLeafPreparedStatements> for ScyllaCoreStore<Hash, Hasher>
+{
+    async fn db_insert_imt_leaf(
+        &self,
+        table: &ScyllaIMTLeafPreparedStatements,
+        tree_id: i64,
+        tree_sub_id: i64,
+        leaf_index: i64,
+        checkpoint_id: i64,
+        leaf_hash: &[u8],
+        leaf_key: &[u8],
+        leaf_value: &[u8],
+        next_key: &[u8],
+        next_index: i64,
+    ) -> anyhow::Result<()> {
+        table.insert_leaf(&self.session, tree_id, tree_sub_id, leaf_index, checkpoint_id, leaf_hash, leaf_key, leaf_value, next_key, next_index).await
+    }
+}
+
+// IMT Key Index table implementation for ScyllaCoreStore
+#[async_trait]
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+    CoreDatabaseIMTKeyIndexReader<ScyllaIMTKeyIndexPreparedStatements> for ScyllaCoreStore<Hash, Hasher>
+{
+    async fn db_select_imt_key_index_exact(
+        &self,
+        table: &ScyllaIMTKeyIndexPreparedStatements,
+        tree_id: i64,
+        tree_sub_id: i64,
+        key_bucket: i16,
+        encoded_key: &[u8],
+    ) -> anyhow::Result<Option<(i64, i64)>> {
+        table.select_exact(&self.session, tree_id, tree_sub_id, key_bucket, encoded_key).await
+    }
+
+    async fn db_select_imt_key_index_predecessor(
+        &self,
+        table: &ScyllaIMTKeyIndexPreparedStatements,
+        tree_id: i64,
+        tree_sub_id: i64,
+        key_bucket: i16,
+        target_encoded_key: &[u8],
+    ) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>, i64, i64)>> {
+        table.select_predecessor(&self.session, tree_id, tree_sub_id, key_bucket, target_encoded_key).await
+    }
+
+    async fn db_select_imt_key_index_predecessor_full_bucket(
+        &self,
+        table: &ScyllaIMTKeyIndexPreparedStatements,
+        tree_id: i64,
+        tree_sub_id: i64,
+        key_bucket: i16,
+    ) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>, i64, i64)>> {
+        table.select_predecessor_full_bucket(&self.session, tree_id, tree_sub_id, key_bucket).await
+    }
+}
+
+#[async_trait]
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+    CoreDatabaseIMTKeyIndexWriter<ScyllaIMTKeyIndexPreparedStatements> for ScyllaCoreStore<Hash, Hasher>
+{
+    async fn db_insert_imt_key_index(
+        &self,
+        table: &ScyllaIMTKeyIndexPreparedStatements,
+        tree_id: i64,
+        tree_sub_id: i64,
+        key_bucket: i16,
+        encoded_key: &[u8],
+        leaf_key: &[u8],
+        birth_checkpoint: i64,
+        leaf_index: i64,
+    ) -> anyhow::Result<()> {
+        table.insert_key(&self.session, tree_id, tree_sub_id, key_bucket, encoded_key, leaf_key, birth_checkpoint, leaf_index).await
+    }
+}
+
+#[async_trait]
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+    CoreDatabaseIMTNextAppendIndexReader<ScyllaIMTNextAppendIndexPreparedStatements> for ScyllaCoreStore<Hash, Hasher>
+{
+    async fn db_select_imt_next_append_index(
+        &self,
+        table: &ScyllaIMTNextAppendIndexPreparedStatements,
+        tree_id: i64,
+        tree_sub_id: i64,
+    ) -> anyhow::Result<Option<i64>> {
+        table.select(&self.session, tree_id, tree_sub_id).await
+    }
+}
+
+#[async_trait]
+impl<Hash: QDBHashBase + Send + Sync, Hasher: MerkleZeroHasher<Hash> + Send + Sync>
+    CoreDatabaseIMTNextAppendIndexWriter<ScyllaIMTNextAppendIndexPreparedStatements> for ScyllaCoreStore<Hash, Hasher>
+{
+    async fn db_insert_imt_next_append_index(
+        &self,
+        table: &ScyllaIMTNextAppendIndexPreparedStatements,
+        tree_id: i64,
+        tree_sub_id: i64,
+        next_append_index: i64,
+    ) -> anyhow::Result<()> {
+        table.insert(&self.session, tree_id, tree_sub_id, next_append_index).await
     }
 }

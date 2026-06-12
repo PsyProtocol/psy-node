@@ -1,6 +1,6 @@
 use parth_core::data::proof_input::CircuitInputWithDependencies;
 use psy_core::job::job_id::QProvingJobDataID;
-use psy_data::{agg::AggStateTransitionInput, proof_input::guta::{GUTAOnlyRegisterUsersInput, VerifyGUTARegisterUsersCircuitInputSimple, VerifyGUTAToCapCircuitInputSimple, VerifyGUTAToCapUpgradeCheckpointCircuitInputSimple, VerifyLeftEndCapRightGUTAInputSimple, VerifyLeftGUTARightEndCapInputSimple, VerifySingleEndCapInput, VerifyTwoEndCapCircuitInput, VerifyTwoGUTAProofGadgetStandardInputSimple, VerifyTwoGUTAProofUpgradeCheckpointStandardInputSimple}, protocol::circuit_inputs::{agg_part_1::QCAggUserRegistartionDeployContractsGUTAInput, append_user_registration_tree::QCAppendUserRegistrationTreeCircuitInput, checkpoint_transition::QCQEDCheckpointStateTransitionInput, deploy_contracts::QCBatchDeployContractsCircuitInput}};
+use psy_data::{agg::AggStateTransitionInput, proof_input::guta::{GUTAOnlyRegisterUsersInput, VerifyGUTARegisterUsersCircuitInputSimple, VerifyGUTAToCapCircuitInputSimple, VerifyGUTAToCapUpgradeCheckpointCircuitInputSimple, VerifyLeftEndCapRightGUTAInputSimple, VerifyLeftGUTARightEndCapInputSimple, VerifySingleEndCapInput, VerifyTwoEndCapCircuitInput, VerifyTwoGUTAProofGadgetStandardInputSimple, VerifyTwoGUTAProofUpgradeCheckpointStandardInputSimple}, protocol::circuit_inputs::{add_l1_deposit::QCAddL1DepositCircuitInput, agg_part_1::QCAggUserRegistartionDeployContractsGUTAInput, append_user_registration_tree::QCAppendUserRegistrationTreeCircuitInput, checkpoint_transition::QCQEDCheckpointStateTransitionInput, deploy_contracts::QCBatchDeployContractsCircuitInput}};
 
 
 
@@ -31,11 +31,12 @@ pub type PCIAggUserRegisterDeployContractsGUTA<F, Hash> = CircuitInputWithDepend
 pub type PCIAppendUserRegistrationTree<Hash> = QCAppendUserRegistrationTreeCircuitInput<Hash>;
 
 pub type PCIBatchDeployContracts<F, Hash> = QCBatchDeployContractsCircuitInput<F, Hash>;
+pub type PCIAddL1Deposit<Hash> = QCAddL1DepositCircuitInput<Hash>;
 
 pub type PCIGenerateRollupStateTransitionProof<F, Hash> = CircuitInputWithDependencies<QCQEDCheckpointStateTransitionInput<F, Hash>, QProvingJobDataID>;
 
 pub type PCIAppendUserRegistrationTreeAggregate<Hash> = CircuitInputWithDependencies<AggStateTransitionInput<Hash>, QProvingJobDataID>;
 
 pub type PCIBatchDeployContractsAggregate<Hash> = CircuitInputWithDependencies<AggStateTransitionInput<Hash>, QProvingJobDataID>;
-
+pub type PCIAddL1DepositAggregate<Hash> = CircuitInputWithDependencies<AggStateTransitionInput<Hash>, QProvingJobDataID>;
 

@@ -3,4 +3,4 @@ import type { GUTAStats } from "./GUTAStats";
 import type { QHashOut } from "./QHashOut";
 import type { SubTreeNodeStateTransition } from "./SubTreeNodeStateTransition";
 
-export type GlobalUserTreeAggregatorHeader = { guta_circuit_whitelist: QHashOut, checkpoint_tree_root: QHashOut, state_transition: SubTreeNodeStateTransition, stats: GUTAStats, };
+export type GlobalUserTreeAggregatorHeader = { guta_circuit_whitelist: QHashOut, checkpoint_tree_root: QHashOut, state_transition: SubTreeNodeStateTransition, stats: GUTAStats, total_aggregation_proofs_generated: bigint, };

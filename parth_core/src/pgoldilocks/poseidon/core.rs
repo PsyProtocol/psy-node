@@ -160,3 +160,77 @@ impl QStaticNamedType for PoseidonHasher {
 }
 
 impl QFHasherU64<GoldilocksField, QHashOut<GoldilocksField>> for PoseidonHasher {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::felt::ToU64Value;
+    use plonky2::field::types::Field;
+
+    #[test]
+    fn print_poseidon_reference_values() {
+        let hash: BaseHashQ = PoseidonHasher::q_hash_many(&[
+            GoldilocksField::from_canonical_u64(1),
+            GoldilocksField::from_canonical_u64(2),
+            GoldilocksField::from_canonical_u64(3),
+            GoldilocksField::from_canonical_u64(4),
+        ]);
+        println!(
+            "hash_no_pad(1,2,3,4)={:?}",
+            hash.0
+                .elements
+                .iter()
+                .map(|x| x.to_u64_value())
+                .collect::<Vec<_>>()
+        );
+
+        let left = QHashOut(HashOut {
+            elements: [
+                GoldilocksField::from_canonical_u64(1),
+                GoldilocksField::from_canonical_u64(2),
+                GoldilocksField::from_canonical_u64(3),
+                GoldilocksField::from_canonical_u64(4),
+            ],
+        });
+        let right = QHashOut(HashOut {
+            elements: [
+                GoldilocksField::from_canonical_u64(5),
+                GoldilocksField::from_canonical_u64(6),
+                GoldilocksField::from_canonical_u64(7),
+                GoldilocksField::from_canonical_u64(8),
+            ],
+        });
+        let two: BaseHashQ = PoseidonHasher::q_two_to_one(left, right);
+        println!(
+            "two_to_one([1,2,3,4],[5,6,7,8])={:?}",
+            two.0
+                .elements
+                .iter()
+                .map(|x| x.to_u64_value())
+                .collect::<Vec<_>>()
+        );
+
+        let mut current = QHashOut(HashOut {
+            elements: [
+                GoldilocksField::from_canonical_u64(0x59aa2f0f2c6d2e9d),
+                GoldilocksField::from_canonical_u64(0x103c7e69c74ae9d6),
+                GoldilocksField::from_canonical_u64(0xc388f9c7866e4b27),
+                GoldilocksField::from_canonical_u64(0x12d83155d1c93dc6),
+            ],
+        });
+        let mut zero = QHashOut(HashOut {
+            elements: [
+                GoldilocksField::ZERO,
+                GoldilocksField::ZERO,
+                GoldilocksField::ZERO,
+                GoldilocksField::ZERO,
+            ],
+        });
+        for depth in 0..=32 {
+            let words: Vec<u64> = current.0.elements.iter().map(|x| x.to_u64_value()).collect();
+            println!("leaf_fold_depth_{depth}={words:?}");
+            current = PoseidonHasher::q_two_to_one(current, zero);
+            zero = PoseidonHasher::q_two_to_one(zero, zero);
+        }
+    }
+}

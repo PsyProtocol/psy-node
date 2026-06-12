@@ -34,8 +34,8 @@ struct Queue {
 /// and development environments.
 #[derive(Debug, Clone)]
 pub struct InMemoryTempStore {
-    /// Mimics the Redis HASH for proofs. Stores job_id -> proof_bytes.
-    proof_store: Arc<DashMap<Vec<u8>, Vec<u8>>>,
+    /// Mimics Redis bucketed proof hashes. Stores pending_id -> (job_id -> proof_bytes).
+    proof_store: Arc<DashMap<u64, Arc<DashMap<Vec<u8>, Vec<u8>>>>>,
     /// Mimics the Redis HASH for KV pairs.
     kv_store: Arc<DashMap<Vec<u8>, Vec<u8>>>,
     /// Mimics the Redis HASH for counters, using i64 for efficiency.
@@ -351,35 +351,52 @@ impl QStandardEphemeralQueueSubscriber for InMemoryTempStore {
 
 #[async_trait]
 impl QParthProofStoreReader for InMemoryTempStore {
-    async fn get_proof_bytes_by_job_id<J: Into<QJobIdSerialized> + Copy + Send + Sync>(&self, job_id: J) -> anyhow::Result<Option<Vec<u8>>> {
+    async fn get_proof_bytes_by_job_id<J: Into<QJobIdSerialized> + Copy + Send + Sync>(&self, job_id: J, unique_pending_id: u64) -> anyhow::Result<Option<Vec<u8>>> {
         let job_id_bytes = job_id.into().to_vec();
-        Ok(self.proof_store.get(&job_id_bytes).map(|r| r.value().clone()))
+        if let Some(bucket) = self.proof_store.get(&unique_pending_id) {
+            Ok(bucket.get(&job_id_bytes).map(|r| r.value().clone()))
+        } else {
+            Ok(None)
+        }
     }
 
-    async fn get_proof_by_job_id<J: Into<QJobIdSerialized> + Copy + Send + Sync, P: QPDSerializable>(&self, job_id: J) -> anyhow::Result<Option<P>> {
-        match self.get_proof_bytes_by_job_id(job_id).await? {
+    async fn get_proof_by_job_id<J: Into<QJobIdSerialized> + Copy + Send + Sync, P: QPDSerializable>(&self, job_id: J, unique_pending_id: u64) -> anyhow::Result<Option<P>> {
+        match self.get_proof_bytes_by_job_id(job_id, unique_pending_id).await? {
             Some(bytes) => Ok(Some(P::from_bytes(&bytes)?)),
             None => Ok(None),
         }
     }
 
-    async fn contains_proof_for_job_id<J: Into<QJobIdSerialized> + Copy + Send + Sync>(&self, job_id: J) -> anyhow::Result<bool> {
+    async fn contains_proof_for_job_id<J: Into<QJobIdSerialized> + Copy + Send + Sync>(&self, job_id: J, unique_pending_id: u64) -> anyhow::Result<bool> {
         let job_id_bytes = job_id.into().to_vec();
-        Ok(self.proof_store.contains_key(&job_id_bytes))
+        Ok(self
+            .proof_store
+            .get(&unique_pending_id)
+            .map(|bucket| bucket.contains_key(&job_id_bytes))
+            .unwrap_or(false))
     }
 }
 
 #[async_trait]
 impl QParthProofStoreWriter for InMemoryTempStore {
-    async fn put_proof_bytes_for_job_id<J: Into<QJobIdSerialized> + Copy + Send + Sync>(&self, job_id: J, proof_bytes: &[u8]) -> anyhow::Result<()> {
+    async fn put_proof_bytes_for_job_id<J: Into<QJobIdSerialized> + Copy + Send + Sync>(&self, job_id: J, unique_pending_id: u64, proof_bytes: &[u8]) -> anyhow::Result<()> {
         let job_id_bytes = job_id.into().to_vec();
-        self.proof_store.insert(job_id_bytes, proof_bytes.to_vec());
+        let bucket = self
+            .proof_store
+            .entry(unique_pending_id)
+            .or_insert_with(|| Arc::new(DashMap::new()))
+            .clone();
+        bucket.insert(job_id_bytes, proof_bytes.to_vec());
         Ok(())
     }
 
-    async fn put_proof_for_job_id<J: Into<QJobIdSerialized> + Copy + Send + Sync, P: QPDSerializable + Send + Sync>(&self, job_id: J, proof: &P) -> anyhow::Result<()> {
+    async fn put_proof_for_job_id<J: Into<QJobIdSerialized> + Copy + Send + Sync, P: QPDSerializable + Send + Sync>(&self, job_id: J, unique_pending_id: u64, proof: &P) -> anyhow::Result<()> {
         let proof_bytes = proof.to_bytes()?;
-        self.put_proof_bytes_for_job_id(job_id, &proof_bytes).await
+        self.put_proof_bytes_for_job_id(job_id, unique_pending_id, &proof_bytes).await
+    }
+    async fn delete_all_proofs_for_pending_id(&self, unique_pending_id: u64) -> anyhow::Result<()> {
+        self.proof_store.remove(&unique_pending_id);
+        Ok(())
     }
 }
 

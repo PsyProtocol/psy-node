@@ -58,8 +58,8 @@ fn get_time_text(duration: Duration) -> String {
 /// thread::sleep(Duration::from_millis(120));
 /// timer.lap_batch("Task 3: Process items", "item", batch_size);
 /// ```
+#[cfg(not(target_arch = "wasm32"))]
 pub struct TraceTimer {
-    #[cfg(not(target_arch = "wasm32"))]
     start_time: Instant,
     name: String,
 }

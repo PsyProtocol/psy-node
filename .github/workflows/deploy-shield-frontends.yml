@@ -1,0 +1,224 @@
+name: Deploy Shield Frontends
+
+on:
+  push:
+    branches:
+      - feat/shield-poseidon-bridge
+  workflow_dispatch:
+    inputs:
+      source_branch:
+        description: Source branch to mirror into the deploy branch
+        required: false
+        default: feat/shield-poseidon-bridge
+      deploy_branch:
+        description: Deploy branch that preserves deploy/ independently
+        required: false
+        default: review/shield-auto-frontend-deploy
+      deploy_app:
+        description: Deploy the app staging page after syncing
+        required: false
+        type: boolean
+        default: true
+      deploy_explorer:
+        description: Deploy the explorer staging page after syncing
+        required: false
+        type: boolean
+        default: true
+      pages_branch:
+        description: Cloudflare Pages branch label
+        required: false
+        default: staging
+
+permissions:
+  contents: write
+
+concurrency:
+  group: shield-frontend-deploy
+  cancel-in-progress: false
+
+env:
+  CI: true
+  HUSKY: 0
+  NODE_OPTIONS: --max-old-space-size=4096
+  CF_PAGES_BRANCH: ${{ inputs.pages_branch || 'staging' }}
+  CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+  CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+  L1_DEPLOYMENTS_NETWORK: sepolia
+  CHAIN_ID: '11155111'
+  ADDRESSES_PROVIDER_ADDRESS: '0x30239CEE87b6c006a788aaC3F3B96D3F879924f2'
+  ROUTER_ADDRESS: '0x598943197CE7C6c0be798429E061d181956F2dA5'
+  BRIDGE_ADDRESS: '0x9fE2145048272444bF186df1f7c704dde0397a5f'
+  STATE_MANAGER_ADDRESS: '0x27c972F97ba632F16ABb3b2C7e59f078189B839a'
+  ERC20_GATEWAY_ADDRESS: '0xb657619120d42a1FE1288f5F8726D95128dd9BFb'
+  ETH_GATEWAY_ADDRESS: '0xae4458491E074FF31616D58f05A9952DcFD70f23'
+  WETH_ADDRESS: '0xa52771c1C641CfEDdf1032C2502c696a18C030A4'
+  PSY_TOKEN_ADDRESS: '0xD3c18ed548C540E0f5Eb3f6c6daF658C3E5A1d47'
+  USDT_TOKEN_ADDRESS: '0x4E15d3b2D4c28fBc2fc300136Eb62fB7Ae9D5De6'
+
+jobs:
+  sync:
+    name: Rebuild deploy branch from shield
+    runs-on: ubuntu-latest
+    outputs:
+      deploy_branch: ${{ steps.sync.outputs.deploy_branch }}
+      deploy_sha: ${{ steps.sync.outputs.deploy_sha }}
+      source_sha: ${{ steps.sync.outputs.source_sha }}
+      pushed: ${{ steps.sync.outputs.pushed }}
+    env:
+      SOURCE_BRANCH: ${{ inputs.source_branch || 'feat/shield-poseidon-bridge' }}
+      DEPLOY_BRANCH: ${{ inputs.deploy_branch || 'review/shield-auto-frontend-deploy' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Rebuild deploy branch
+        id: sync
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git fetch origin \
+            "+refs/heads/${SOURCE_BRANCH}:refs/remotes/origin/${SOURCE_BRANCH}" \
+            "+refs/heads/${DEPLOY_BRANCH}:refs/remotes/origin/${DEPLOY_BRANCH}"
+
+          source_sha="$(git rev-parse "origin/${SOURCE_BRANCH}")"
+          previous_deploy_sha="$(git rev-parse "origin/${DEPLOY_BRANCH}")"
+
+          git checkout -B "${DEPLOY_BRANCH}" "${source_sha}"
+          git restore --source="${previous_deploy_sha}" -- deploy
+
+          if [ ! -d deploy ]; then
+            echo "deploy branch is missing deploy/" >&2
+            exit 1
+          fi
+
+          drift="$(git diff --name-only "${source_sha}" -- ':!deploy/**')"
+          if [ -n "$drift" ]; then
+            echo "deploy branch drifted outside deploy/:" >&2
+            echo "$drift" >&2
+            exit 1
+          fi
+
+          git add -A deploy
+
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(deploy): sync ${SOURCE_BRANCH} ${source_sha:0:12}"
+          fi
+
+          deploy_sha="$(git rev-parse HEAD)"
+          previous_tree="$(git rev-parse "${previous_deploy_sha}^{tree}")"
+          deploy_tree="$(git rev-parse "${deploy_sha}^{tree}")"
+          pushed=false
+
+          if [ "${previous_tree}" != "${deploy_tree}" ]; then
+            git push \
+              --force-with-lease="refs/heads/${DEPLOY_BRANCH}:${previous_deploy_sha}" \
+              origin "HEAD:${DEPLOY_BRANCH}"
+            pushed=true
+          else
+            deploy_sha="${previous_deploy_sha}"
+          fi
+
+          {
+            echo "deploy_branch=${DEPLOY_BRANCH}"
+            echo "deploy_sha=${deploy_sha}"
+            echo "source_sha=${source_sha}"
+            echo "pushed=${pushed}"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Shield frontend deploy sync"
+            echo
+            echo "- Source branch: \`${SOURCE_BRANCH}\`"
+            echo "- Source commit: \`${source_sha}\`"
+            echo "- Deploy branch: \`${DEPLOY_BRANCH}\`"
+            echo "- Deploy commit: \`${deploy_sha}\`"
+            echo "- Pushed deploy branch: \`${pushed}\`"
+            echo
+            echo "The deploy branch is rebuilt from shield and only \`deploy/\` is restored from the previous deploy branch."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy_app:
+    name: Deploy app staging page
+    needs: sync
+    if: needs.sync.outputs.pushed == 'true' || inputs.deploy_app
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout deploy branch snapshot
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.deploy_sha }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Deploy app to Cloudflare Pages
+        env:
+          CF_PAGES_PROJECT: psy-privacy-bridge-demo-stg
+          INCLUDE_WALLET_DOWNLOAD: 0
+          PSY_FAUCET_SERVER_MODE: 1
+        run: bash deploy/cloudflare-pages/deploy-privacy-bridge-demo.sh
+
+      - name: Write app summary
+        if: always()
+        run: |
+          {
+            echo "## App staging deploy"
+            echo
+            echo "- Deploy branch: \`${{ needs.sync.outputs.deploy_branch }}\`"
+            echo "- Deploy commit: \`${{ needs.sync.outputs.deploy_sha }}\`"
+            echo "- Source commit: \`${{ needs.sync.outputs.source_sha }}\`"
+            echo "- Project: \`psy-privacy-bridge-demo-stg\`"
+            echo "- Branch label: \`${CF_PAGES_BRANCH}\`"
+            echo "- URL: https://app-stg.psy-protocol.xyz/"
+            echo "- Wallet downloads: R2 metadata, no embedded Pages zip"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy_explorer:
+    name: Deploy explorer staging page
+    needs: sync
+    if: needs.sync.outputs.pushed == 'true' || inputs.deploy_explorer
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout deploy branch snapshot
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.deploy_sha }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Deploy explorer to Cloudflare Pages
+        env:
+          CF_PAGES_PROJECT: psy-explorer-stg
+        run: bash deploy/cloudflare-pages/deploy-psy-explorer.sh
+
+      - name: Write explorer summary
+        if: always()
+        run: |
+          {
+            echo "## Explorer staging deploy"
+            echo
+            echo "- Deploy branch: \`${{ needs.sync.outputs.deploy_branch }}\`"
+            echo "- Deploy commit: \`${{ needs.sync.outputs.deploy_sha }}\`"
+            echo "- Source commit: \`${{ needs.sync.outputs.source_sha }}\`"
+            echo "- Project: \`psy-explorer-stg\`"
+            echo "- Branch label: \`${CF_PAGES_BRANCH}\`"
+            echo "- URL: https://explorer-stg.psy-protocol.xyz/"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,11 @@
+[submodule "psy-genesis"]
+	path = psy-genesis
+	url = git@github.com:PsyProtocol/psy-genesis.git
+[submodule "psy-contracts"]
+	branch = mainnet-beta
+	path = psy-contracts
+	url = git@github.com:PsyProtocol/psy-contracts.git
+[submodule "psy-dapp"]
+	path = psy-dapp
+	url = git@github.com:PsyProtocol/psy-dapp.git
+	branch = mainnet-beta

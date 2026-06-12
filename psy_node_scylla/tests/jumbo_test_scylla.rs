@@ -14,7 +14,7 @@ use parth_crypto::hash::sha256::CoreSha256Hasher;
 use psy_node_scylla::{
     core::ScyllaCoreStore,
     tables::{
-        blob::ScyllaBiDirectionalBlobToBlobTablePreparedStatements, counter::u64_counter::ScyllaU64ToU64CounterTablePreparedStatements, hash_to_many_ids::ScyllaHashToManyIdsTablePreparedStatements, merkle::{ScyllaDoubleMerkleNodesPreparedStatements, ScyllaMerkleNodesPreparedStatements, ScyllaMerkleNodesZeroPreparedStatements}, object::{
+        blob::ScyllaBiDirectionalBlobToBlobTablePreparedStatements, counter::u64_counter::ScyllaU64ToU64CounterTablePreparedStatements, hash_to_many_ids::ScyllaHashToManyIdsTablePreparedStatements, imt::{ScyllaIMTKeyIndexPreparedStatements, ScyllaIMTLeafPreparedStatements, ScyllaIMTNextAppendIndexPreparedStatements}, merkle::{ScyllaDoubleMerkleNodesPreparedStatements, ScyllaMerkleNodesPreparedStatements, ScyllaMerkleNodesZeroPreparedStatements}, object::{
             ScyllaGenericKeyIdValueTablePreparedStatements, ScyllaGenericObjectDoubleIdTablePreparedStatements,
             ScyllaGenericObjectSingleIdTablePreparedStatements,
         }, tag_tree::ScyllaTagTreeNodesPreparedStatements, u64_table::{ScyllaBidirectionalU64U128MappingPreparedStatements, ScyllaU64ToU64TablePreparedStatements}
@@ -71,6 +71,9 @@ pub struct SimpleStoreEx {
         ScyllaMerkleNodesZeroPreparedStatements,
         ScyllaTagTreeNodesPreparedStatements,
         ScyllaHashToManyIdsTablePreparedStatements,
+        ScyllaIMTLeafPreparedStatements,
+        ScyllaIMTKeyIndexPreparedStatements,
+        ScyllaIMTNextAppendIndexPreparedStatements,
         ScyllaCoreStore<ExHash, ExHasher>,
     >,
 }

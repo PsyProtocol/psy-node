@@ -33,61 +33,66 @@ pub async fn fetch_global_user_tree_from_db_with_sub_root<
     );
     let mut node_hash_map = HashMap::<SimpleMerkleNodeKey, Hash>::new();
     let total = max_user_id_exclusive - min_user_id_inclusive;
-    let zero_hash = Hasher::get_zero_hash((tree_height-sub_root.level) as usize);
+    // DB returns zero leaves as the leaf-level zero hash, not the sub-tree-root level zero.
+    let leaf_zero_hash = Hasher::get_zero_hash(0);
     let full_batches = total / fetch_batch_size as u64;
     let remainder = total % fetch_batch_size as u64;
-    let mut keys = if full_batches > 0 {
-        vec![
-            SimpleMerkleNodeKey {
-                level: tree_height,
-                index: 0,
-            };
-            fetch_batch_size
-        ]
-    } else {
-        vec![
-            SimpleMerkleNodeKey {
-                level: tree_height,
-                index: 0,
-            };
-            remainder as usize
-        ]
-    };
+    let batch_capacity = if full_batches > 0 { fetch_batch_size } else { remainder as usize };
+    let mut keys = vec![
+        SimpleMerkleNodeKey {
+            level: tree_height,
+            index: 0,
+        };
+        batch_capacity
+    ];
     timer.start();
     let leaf_min_index = sub_root.index << (tree_height - sub_root.level);
     if leaf_min_index > min_user_id_inclusive || leaf_min_index + (1u64 << (tree_height - sub_root.level)) < max_user_id_exclusive {
         anyhow::bail!("Sub root {:?} does not cover the requested user ID range [{}, {})", sub_root, min_user_id_inclusive, max_user_id_exclusive);
     }
+    let sub_tree_leaf_level = tree_height - sub_root.level;
     for batch_index in 0..full_batches {
         let start_user_id = min_user_id_inclusive + batch_index * fetch_batch_size as u64;
+        // Reset level on every batch: the post-fetch loop below mutates keys[i].level
+        // for hashmap insertion, and we must re-issue DB lookups at the original leaf level.
         for i in 0..fetch_batch_size {
-            let index = start_user_id + i as u64;
-            keys[i].index = index;
+            keys[i] = SimpleMerkleNodeKey {
+                level: tree_height,
+                index: start_user_id + i as u64,
+            };
         }
         let batch_results = user_db_reader.global_user_tree_get_nodes(checkpoint_id, &keys).await?;
         for (i, hash) in batch_results.iter().enumerate() {
-            keys[i].index -= leaf_min_index;
-            keys[i].level -= sub_root.level;
-            if hash != &zero_hash {
-                node_hash_map.insert(keys[i], *hash);
+            if hash == &leaf_zero_hash {
+                continue;
             }
+            let local_key = SimpleMerkleNodeKey {
+                level: sub_tree_leaf_level,
+                index: keys[i].index - leaf_min_index,
+            };
+            node_hash_map.insert(local_key, *hash);
         }
     }
     if remainder > 0 {
         let start_user_id = min_user_id_inclusive + full_batches * fetch_batch_size as u64;
         for i in 0..remainder as usize {
-            let index = start_user_id + i as u64;
-            keys[i].index = index;
+            keys[i] = SimpleMerkleNodeKey {
+                level: tree_height,
+                index: start_user_id + i as u64,
+            };
         }
         let batch_results = user_db_reader
             .global_user_tree_get_nodes(checkpoint_id, &keys[0..remainder as usize])
             .await?;
         for (i, hash) in batch_results.iter().enumerate() {
-            keys[i].index -= leaf_min_index;
-            keys[i].level -= sub_root.level;
-            if hash != &zero_hash {
-                node_hash_map.insert(keys[i], *hash);
+            if hash == &leaf_zero_hash {
+                continue;
             }
+            let local_key = SimpleMerkleNodeKey {
+                level: sub_tree_leaf_level,
+                index: keys[i].index - leaf_min_index,
+            };
+            node_hash_map.insert(local_key, *hash);
         }
     }
     timer.lap_batch(
@@ -173,14 +178,201 @@ pub async fn load_global_user_tree_from_db_with_sub_root<
     }
     let max_user_id_exclusive = current_key.index + 1;
     println!("max_user_id_exclusive: {}", max_user_id_exclusive);
-    fetch_global_user_tree_from_db_with_sub_root::<Hasher, Store, Hash>(
+    let expected_sub_root = user_db_reader
+        .global_user_tree_get_node(checkpoint_id, sub_root)
+        .await?;
+    let tree = fetch_global_user_tree_from_db_with_sub_root::<Hasher, Store, Hash>(
         user_db_reader,
         tree_height,
         sub_root,
         checkpoint_id,
-        sub_root.index<<(tree_height - sub_root.level),
+        sub_root.index << (tree_height - sub_root.level),
         max_user_id_exclusive,
         fetch_batch_size,
     )
-    .await
+    .await?;
+    let loaded_root = tree.get_root();
+    if loaded_root != expected_sub_root {
+        anyhow::bail!(
+            "Loaded in-memory sub-tree root {:?} does not match DB sub_root {:?} at (level={}, index={}, checkpoint_id={}); refusing to start with a corrupt tree",
+            loaded_root,
+            expected_sub_root,
+            sub_root.level,
+            sub_root.index,
+            checkpoint_id
+        );
+    }
+    Ok(tree)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+    use parth_core::{
+        crypto::hash::{merkle_proof::MerkleProofCore, traits::MerkleZeroHasher},
+        data::hash::{
+            checkpointed_merkle_node::CheckpointedMerkleHash, hash256::Hash256,
+            merkle_node_key::SimpleMerkleNodeKey,
+        },
+    };
+    use parth_crypto::hash::sha256::CoreSha256Hasher;
+    use psy_node_core::psy_core_db::traits::full::PsyNodeGlobalUserTreeDatabaseReader;
+
+    use super::fetch_global_user_tree_from_db_with_sub_root;
+
+    /// Minimal in-memory reader: stores leaves and computes parents on demand using
+    /// the same hasher the loader uses. Returns the leaf-level zero hash for absent
+    /// leaves and the appropriate level zero for absent internal nodes.
+    struct MockUserTreeReader {
+        height: u8,
+        leaves: Mutex<HashMap<u64, Hash256>>,
+    }
+
+    impl MockUserTreeReader {
+        fn new(height: u8) -> Self {
+            Self { height, leaves: Mutex::new(HashMap::new()) }
+        }
+        fn set_leaf(&self, index: u64, value: Hash256) {
+            self.leaves.lock().unwrap().insert(index, value);
+        }
+        fn node(&self, key: SimpleMerkleNodeKey) -> Hash256 {
+            // Recursively compute the hash at (level, index) by hashing children.
+            if key.level == self.height {
+                return self
+                    .leaves
+                    .lock()
+                    .unwrap()
+                    .get(&key.index)
+                    .copied()
+                    .unwrap_or_else(|| <CoreSha256Hasher as MerkleZeroHasher<Hash256>>::get_zero_hash(0));
+            }
+            // Internal node: hash(children).
+            let left = self.node(SimpleMerkleNodeKey::new(key.level + 1, key.index << 1));
+            let right = self.node(SimpleMerkleNodeKey::new(key.level + 1, (key.index << 1) | 1));
+            <CoreSha256Hasher as parth_core::crypto::hash::traits::MerkleHasher<Hash256>>::two_to_one(&left, &right)
+        }
+    }
+
+    #[async_trait]
+    impl PsyNodeGlobalUserTreeDatabaseReader<Hash256> for MockUserTreeReader {
+        async fn global_user_tree_get_leaf_hash(&self, _cp: u64, leaf_index: u64) -> anyhow::Result<Hash256> {
+            Ok(self.node(SimpleMerkleNodeKey::new(self.height, leaf_index)))
+        }
+        async fn global_user_tree_get_root_hash(&self, _cp: u64) -> anyhow::Result<Hash256> {
+            Ok(self.node(SimpleMerkleNodeKey::new(0, 0)))
+        }
+        async fn global_user_tree_get_merkle_proof(&self, _cp: u64, _leaf_index: u64) -> anyhow::Result<MerkleProofCore<Hash256>> {
+            unimplemented!()
+        }
+        async fn global_user_tree_get_merkle_proof_sub_tree(
+            &self,
+            _cp: u64,
+            _root_level: u8,
+            _leaf_level: u8,
+            _leaf_index: u64,
+        ) -> anyhow::Result<MerkleProofCore<Hash256>> {
+            unimplemented!()
+        }
+        async fn global_user_tree_get_nodes(&self, _cp: u64, keys: &[SimpleMerkleNodeKey]) -> anyhow::Result<Vec<Hash256>> {
+            Ok(keys.iter().map(|k| self.node(*k)).collect())
+        }
+        async fn global_user_tree_get_node(&self, _cp: u64, key: SimpleMerkleNodeKey) -> anyhow::Result<Hash256> {
+            Ok(self.node(key))
+        }
+        async fn global_user_tree_dump_all_leaves(&self, _cp: u64) -> anyhow::Result<HashMap<u64, Hash256>> {
+            unimplemented!()
+        }
+        async fn global_user_tree_get_node_and_checkpoint_id_max_checkpoint(
+            &self,
+            _max_cp: u64,
+            _key: &SimpleMerkleNodeKey,
+        ) -> anyhow::Result<CheckpointedMerkleHash<Hash256>> {
+            unimplemented!()
+        }
+    }
+
+    /// Reproduces the production scenario: a sub-root at (level=12, index=1)
+    /// in a tree of height 16 with many populated leaves spanning many fetch
+    /// batches. Pre-fix the loader corrupted level on subsequent batches and
+    /// returned an empty in-memory tree; post-fix the loaded tree's root must
+    /// equal the DB sub-root value.
+    #[tokio::test(flavor = "current_thread")]
+    async fn loader_returns_correct_root_across_many_batches() {
+        let tree_height: u8 = 16;
+        let sub_root_level: u8 = 12;
+        let sub_root_index: u64 = 1;
+        let sub_tree_height = tree_height - sub_root_level; // 4
+        let leaves_in_realm: u64 = 1u64 << sub_tree_height; // 16
+        let leaf_min_index: u64 = sub_root_index << sub_tree_height;
+
+        // Use a small fetch_batch_size so that many batches are exercised
+        // (this is what triggers the level-mutation bug in the original code).
+        let fetch_batch_size: usize = 3;
+
+        let reader = MockUserTreeReader::new(tree_height);
+        for i in 0..leaves_in_realm {
+            // Non-zero leaf values
+            let v = Hash256::from_u64_le_values(i + 1, 7, 9, 13);
+            reader.set_leaf(leaf_min_index + i, v);
+        }
+
+        let sub_root_key = SimpleMerkleNodeKey { level: sub_root_level, index: sub_root_index };
+        let expected_root = reader.node(sub_root_key);
+
+        let tree = fetch_global_user_tree_from_db_with_sub_root::<CoreSha256Hasher, _, Hash256>(
+            &reader,
+            tree_height,
+            sub_root_key,
+            17_198,
+            leaf_min_index,
+            leaf_min_index + leaves_in_realm,
+            fetch_batch_size,
+        )
+        .await
+        .expect("loader should succeed");
+
+        assert_eq!(
+            tree.get_root(),
+            expected_root,
+            "loaded in-memory sub-tree root must match DB sub-root value"
+        );
+    }
+
+    /// Bonus: very small range (single batch + remainder) — also catches the
+    /// remainder branch's level mutation.
+    #[tokio::test(flavor = "current_thread")]
+    async fn loader_returns_correct_root_with_remainder_only() {
+        let tree_height: u8 = 8;
+        let sub_root_level: u8 = 4;
+        let sub_root_index: u64 = 3;
+        let sub_tree_height = tree_height - sub_root_level; // 4
+        let leaves_in_realm: u64 = 1u64 << sub_tree_height; // 16
+        let leaf_min_index: u64 = sub_root_index << sub_tree_height;
+
+        let reader = MockUserTreeReader::new(tree_height);
+        for i in 0..leaves_in_realm {
+            reader.set_leaf(leaf_min_index + i, Hash256::from_u64_le_values(i * 17 + 1, 0, 0, 0));
+        }
+
+        let sub_root_key = SimpleMerkleNodeKey { level: sub_root_level, index: sub_root_index };
+        let expected_root = reader.node(sub_root_key);
+
+        // 5 leaves per batch, 16 / 5 = 3 full batches + remainder of 1
+        let tree = fetch_global_user_tree_from_db_with_sub_root::<CoreSha256Hasher, _, Hash256>(
+            &reader,
+            tree_height,
+            sub_root_key,
+            1,
+            leaf_min_index,
+            leaf_min_index + leaves_in_realm,
+            5,
+        )
+        .await
+        .expect("loader should succeed");
+
+        assert_eq!(tree.get_root(), expected_root);
+    }
 }

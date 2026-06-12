@@ -1,0 +1,291 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "stable"
+      - "rc"
+      - "rc-*"
+      - "v*.*.*"
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  IS_NIGHTLY: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+  PROFILE: release
+  STABLE_VERSION: "v1.0.0"
+
+jobs:
+  prepare:
+    name: Prepare release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      tag_name: ${{ steps.release_info.outputs.tag_name }}
+      release_name: ${{ steps.release_info.outputs.release_name }}
+      changelog: ${{ steps.build_changelog.outputs.changelog }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute release name and tag
+        id: release_info
+        run: |
+          if [[ ${IS_NIGHTLY} == 'true' ]]; then
+            echo "tag_name=nightly-${GITHUB_SHA}" >> $GITHUB_OUTPUT
+            echo "release_name=Nightly ($(date '+%Y-%m-%d'))" >> $GITHUB_OUTPUT
+          else
+            echo "tag_name=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+            echo "release_name=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+          fi
+
+      # Creates a `nightly-SHA` tag for this specific nightly
+      # This tag is used for this specific nightly version's release
+      # which allows users to roll back. It is also used to build
+      # the changelog.
+      - name: Create build-specific nightly tag
+        if: ${{ env.IS_NIGHTLY == 'true' }}
+        uses: actions/github-script@v7
+        env:
+          TAG_NAME: ${{ steps.release_info.outputs.tag_name }}
+        with:
+          script: |
+            const createTag = require('./.github/scripts/create-tag.js')
+            await createTag({ github, context }, process.env.TAG_NAME)
+
+      - name: Build changelog
+        id: build_changelog
+        uses: mikepenz/release-changelog-builder-action@v4
+        with:
+          configuration: "./.github/changelog.json"
+          fromTag: ${{ env.IS_NIGHTLY == 'true' && 'nightly' || env.STABLE_VERSION }}
+          toTag: ${{ steps.release_info.outputs.tag_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  release:
+    permissions:
+      id-token: write
+      contents: write
+      attestations: write
+    name: ${{ matrix.target }} (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 240
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # `runner`: GHA runner label
+          # `target`: Rust build target triple
+          # `platform` and `arch`: Used in tarball names
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            platform: linux
+            arch: amd64
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            platform: alpine
+            arch: amd64
+          - runner: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            platform: linux
+            arch: arm64
+          - runner: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            platform: alpine
+            arch: arm64
+          - runner: macos-13-large
+            target: x86_64-apple-darwin
+            platform: darwin
+            arch: amd64
+          - runner: macos-latest-large
+            target: aarch64-apple-darwin
+            platform: darwin
+            arch: arm64
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform: win32
+            arch: amd64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+          cache-on-failure: true
+
+      - name: Apple M1 setup
+        if: matrix.target == 'aarch64-apple-darwin'
+        run: |
+          echo "SDKROOT=$(xcrun -sdk macosx --show-sdk-path)" >> $GITHUB_ENV
+          echo "MACOSX_DEPLOYMENT_TARGET=$(xcrun -sdk macosx --show-sdk-platform-version)" >> $GITHUB_ENV
+
+      - name: Install cross for musl builds
+        if: matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          cargo install cross
+
+      - name: Build binaries
+        env:
+          TAG_NAME: ${{ (env.IS_NIGHTLY == 'true' && 'nightly') || needs.prepare.outputs.tag_name }}
+          TARGET: ${{ matrix.target }}
+          OUT_DIR: target/${{ matrix.target }}/${{ env.PROFILE }}
+          SQLX_OFFLINE: true
+        shell: bash
+        run: |
+          set -eo pipefail
+          flags=(--target $TARGET --profile $PROFILE
+            --bin psy_user_cli --bin psy_node_cli --bin psy_dev_cli --bin dargo --bin psy-lsp-server)
+
+          [[ "$TARGET" == *windows* ]] && ext=".exe"
+
+          if [[ "$TARGET" == *-musl || "$TARGET" == "aarch64-unknown-linux-gnu" ]]; then
+            cross build "${flags[@]}"
+          else
+            cargo build "${flags[@]}"
+          fi
+
+          bins=(psy_user_cli psy_node_cli psy_dev_cli dargo psy-lsp-server)
+          for name in "${bins[@]}"; do
+            bin=$OUT_DIR/$name$ext
+            echo ""
+            file "$bin" || true
+            du -h "$bin" || true
+            ldd "$bin" || true
+            $bin --version || echo "$name version check failed" || true
+            # Convert hyphens to underscores for environment variable names
+            env_name=$(echo "${name}" | tr '-' '_')
+            echo "${env_name}_bin_path=${bin}" >> $GITHUB_ENV
+          done
+
+      - name: Archive binaries
+        id: artifacts
+        env:
+          PLATFORM_NAME: ${{ matrix.platform }}
+          OUT_DIR: target/${{ matrix.target }}/${{ env.PROFILE }}
+          VERSION_NAME: ${{ (env.IS_NIGHTLY == 'true' && 'nightly') || needs.prepare.outputs.tag_name }}
+          ARCH: ${{ matrix.arch }}
+        shell: bash
+        run: |
+          if [[ "$PLATFORM_NAME" == "linux" || "$PLATFORM_NAME" == "alpine" ]]; then
+            tar -czvf "psy_${VERSION_NAME}_${PLATFORM_NAME}_${ARCH}.tar.gz" -C $OUT_DIR psy_user_cli psy_node_cli psy_dev_cli dargo psy-lsp-server
+            echo "file_name=psy_${VERSION_NAME}_${PLATFORM_NAME}_${ARCH}.tar.gz" >> $GITHUB_OUTPUT
+          elif [ "$PLATFORM_NAME" == "darwin" ]; then
+            # We need to use gtar here otherwise the archive is corrupt.
+            # See: https://github.com/actions/virtual-environments/issues/2619
+            gtar -czvf "psy_${VERSION_NAME}_${PLATFORM_NAME}_${ARCH}.tar.gz" -C $OUT_DIR psy_user_cli psy_node_cli psy_dev_cli dargo psy-lsp-server
+            echo "file_name=psy_${VERSION_NAME}_${PLATFORM_NAME}_${ARCH}.tar.gz" >> $GITHUB_OUTPUT
+          else
+            cd $OUT_DIR
+            7z a -tzip "psy_${VERSION_NAME}_${PLATFORM_NAME}_${ARCH}.zip" psy_user_cli.exe psy_node_cli.exe psy_dev_cli.exe dargo.exe psy-lsp-server.exe
+            mv "psy_${VERSION_NAME}_${PLATFORM_NAME}_${ARCH}.zip" ../../../
+            echo "file_name=psy_${VERSION_NAME}_${PLATFORM_NAME}_${ARCH}.zip" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build man page
+        id: man
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        env:
+          OUT_DIR: target/${{ matrix.target }}/${{ env.PROFILE }}
+          VERSION_NAME: ${{ (env.IS_NIGHTLY == 'true' && 'nightly') || needs.prepare.outputs.tag_name }}
+        shell: bash
+        run: |
+          sudo apt-get -y install help2man
+          help2man -N $OUT_DIR/psy_user_cli > psy_user_cli.1 || echo "Manual page for psy_user_cli" > psy_user_cli.1
+          help2man -N $OUT_DIR/psy_node_cli > psy_node_cli.1 || echo "Manual page for psy_node_cli" > psy_node_cli.1
+          help2man -N $OUT_DIR/psy_dev_cli > psy_dev_cli.1 || echo "Manual page for psy_dev_cli" > psy_dev_cli.1
+          help2man -N $OUT_DIR/dargo > dargo.1 || echo "Manual page for dargo" > dargo.1
+          help2man -N $OUT_DIR/psy-lsp-server > psy-lsp-server.1 || echo "Manual page for psy-lsp-server" > psy-lsp-server.1
+          gzip psy_user_cli.1
+          gzip psy_node_cli.1
+          gzip psy_dev_cli.1
+          gzip dargo.1
+          gzip psy-lsp-server.1
+          tar -czvf "psy_man_${VERSION_NAME}.tar.gz" psy_user_cli.1.gz psy_node_cli.1.gz psy_dev_cli.1.gz dargo.1.gz psy-lsp-server.1.gz
+          echo "psy_man=psy_man_${VERSION_NAME}.tar.gz" >> $GITHUB_OUTPUT
+
+      # Creates the release for this specific version
+      - name: Create release
+        uses: softprops/action-gh-release@v2.2.2
+        with:
+          name: ${{ needs.prepare.outputs.release_name }}
+          tag_name: ${{ needs.prepare.outputs.tag_name }}
+          prerelease: ${{ env.IS_NIGHTLY == 'true' }}
+          body: ${{ needs.prepare.outputs.changelog }}
+          files: |
+            ${{ steps.artifacts.outputs.file_name }}
+            ${{ steps.man.outputs.psy_man }}
+
+      - name: Binaries attestation
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            ${{ env.psy_user_cli_bin_path }}
+            ${{ env.psy_node_cli_bin_path }}
+            ${{ env.psy_dev_cli_bin_path }}
+            ${{ env.dargo_bin_path }}
+            ${{ env.psy_lsp_server_bin_path }}
+
+      # If this is a nightly release, it also updates the release
+      # tagged `nightly` for compatibility with `psyup`
+      - name: Update nightly release
+        if: ${{ env.IS_NIGHTLY == 'true' }}
+        uses: softprops/action-gh-release@v2.2.2
+        with:
+          name: "Nightly"
+          tag_name: "nightly"
+          prerelease: true
+          body: ${{ needs.prepare.outputs.changelog }}
+          files: |
+            ${{ steps.artifacts.outputs.file_name }}
+            ${{ steps.man.outputs.psy_man }}
+
+  cleanup:
+    name: Release cleanup
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: release
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+
+      # Moves the `nightly` tag to `HEAD`
+      - name: Move nightly tag
+        if: ${{ env.IS_NIGHTLY == 'true' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const moveTag = require('./.github/scripts/move-tag.js')
+            await moveTag({ github, context }, 'nightly')
+
+      - name: Delete old nightlies
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prunePrereleases = require('./.github/scripts/prune-prereleases.js')
+            await prunePrereleases({github, context})
+
+  # If any of the jobs fail, this will create a high-priority issue to signal so.
+  issue:
+    name: Open an issue
+    runs-on: ubuntu-latest
+    needs: [prepare, release, cleanup]
+    if: failure()
+    steps:
+      - uses: actions/checkout@v4
+      - uses: JasonEtco/create-an-issue@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WORKFLOW_URL: |
+            ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        with:
+          update_existing: true
+          filename: .github/RELEASE_FAILURE_ISSUE_TEMPLATE.md

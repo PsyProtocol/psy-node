@@ -61,8 +61,10 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_coordinator_processor_n
         psy_core::constants::chain_id::PsyChainNetworkType::LocalDevnet => {
             type N = QNetworkTypesConfigHelper<QProvingJobDataID, ZKTypesJTMBGoldilocksPoseidon, PsyNetworkLocalDevnetConstants>;
             let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url, true).await?;
+            tracing::info!("[COORD_BOOT] scylla store ready");
             let db = Arc::new(db);
             let tag_tree_rewards_store = db.clone();
+            tracing::info!("[COORD_BOOT] creating coordinator processor");
             create_coordinator_processor_and_run::<N, _, _, _, _, _, _, _, _, _>(
                 &genesis_data,
                 circuit_fingerprint_config,
@@ -82,6 +84,7 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_coordinator_processor_n
                 realm_identifier,
             )
             .await?;
+            tracing::info!("[COORD_BOOT] coordinator processor exited");
         }
         _ => {
             anyhow::bail!("Unsupported network type '{:?}' for JTMB Poseidon Goldilocks Scylla coordinator processor node", config.network );
@@ -142,11 +145,13 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_realm_processor_node(co
         psy_core::constants::chain_id::PsyChainNetworkType::LocalDevnet => {
             type N = QNetworkTypesConfigHelper<QProvingJobDataID, ZKTypesJTMBGoldilocksPoseidon, PsyNetworkLocalDevnetConstants>;
             let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url, true).await?;
+            tracing::info!("[REALM_BOOT] scylla store ready");
             let db = Arc::new(db);
             let tag_tree_rewards_store = db.clone();
             let coordinator_client = PsyRealmCoordinatorClientAPI::<N, _>::new(
                 http_client,
             );
+            tracing::info!("[REALM_BOOT] creating realm processor");
             create_realm_processor_and_run::<N, _, _, _, _, _, _, _, _>(
                 chain_id,
                 &genesis_data,
@@ -167,6 +172,7 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_realm_processor_node(co
 
             )
             .await?;
+            tracing::info!("[REALM_BOOT] realm processor exited");
         }
         _ => {
             anyhow::bail!("Unsupported network type '{:?}' for JTMB Poseidon Goldilocks Scylla coordinator processor node", config.network );

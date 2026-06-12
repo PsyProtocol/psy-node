@@ -6,3 +6,5 @@ pub mod tag_tree;
 pub mod hash_to_many_ids;
 pub mod u64_table;
 pub mod counter;
+pub mod imt;
+pub mod bridge;

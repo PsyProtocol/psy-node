@@ -6,9 +6,12 @@ use parth_core::{
 };
 use psy_data::{
     guta::stats::GUTAStats,
-    proof_input::guta::{end_cap_input::SubmitUserEndCapNonProofInput, SubmitUserEndCapNonProofCoreInput},
+    proof_input::guta::{
+        end_cap_input::{ContractStateUpdate, ContractStateUpdateHistory, SubmitUserEndCapNonProofInput},
+        SubmitUserEndCapNonProofCoreInput,
+    },
     v1::qdata::{
-        contract::{DashMapContractHeightCache, PSimpleContractHeightCache, QEDContractStateUpdateHistory},
+        contract::{DashMapContractHeightCache, PSimpleContractHeightCache},
         user::PQEDUserLeaf,
         user_end_cap_result::PUPSEndCapResultCompact,
     },
@@ -208,8 +211,11 @@ impl<Hasher: FieldQHasher<F, Hash>, Hash: Q256BitHash + QFHashBase<F> + std::fmt
                 contract_state_tree_updates.push(proof);
                 total_slots_modified += 1;
             }
-            state_history.push(QEDContractStateUpdateHistory {
-                contract_state_tree_updates,
+            state_history.push(ContractStateUpdateHistory {
+                updates: contract_state_tree_updates
+                    .into_iter()
+                    .map(|delta_proof| ContractStateUpdate::Positional { delta_proof })
+                    .collect(),
                 user_contract_tree_update_proof: self.uct.set_leaf(tx.contract_id as u64, contract_tree.get_root()),
             });
             contract_tree.commit_changes();

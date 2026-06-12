@@ -10,3 +10,4 @@ pub mod mem_tree_recorder;
 pub mod dash_tree_append_only;
 pub mod dash_tag_tree_store;
 pub mod dash_tree_append_only_recorder;
+pub mod indexed_merkle_tree;

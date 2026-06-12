@@ -40,6 +40,12 @@ impl TokioLikeFileSystem for SimpleMockMemoryFileSystem {
         self.files.insert(path.to_string(), data);
         Ok(())
     }
+    async fn file_like_fs_sync_file_with_path(&self, path: &str, file: &mut Self::File) -> tokio::io::Result<()> {
+        // sync for memory fs is the same as flush
+        let data = file.get_ref().clone();
+        self.files.insert(path.to_string(), data);
+        Ok(())
+    }
         async fn file_like_fs_create_dir_all(&self, _path: &str) -> tokio::io::Result<()> {
             // No-op for in-memory filesystem
             Ok(())

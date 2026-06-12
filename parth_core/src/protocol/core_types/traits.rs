@@ -5,7 +5,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use ts_rs::TS;
 
 use crate::{
-    QJobIdBase, crypto::hash::traits::{FieldQHasher, FromU64x4, HashTo4Felts, MerkleZeroHasher, RandomHash, ZeroableHash}, data::{
+    QJobIdBase, crypto::hash::traits::{BasicBytesHasher, FieldQHasher, FromU64x4, HashTo4Felts, MerkleHasher, MerkleZeroHasher, RandomHash, ZeroableHash}, data::{
         db::data_types::{CoreDatabaseValueDeserialize, QDatabasePrimitiveKey},
         maybe_serialization::{MaybeBytemuck, MaybeSpeedy},
         serializable::{QPDSerializable, QPDSerializableFixed},
@@ -17,6 +17,7 @@ pub trait QStorableSizedBase: QStorableBase + Sized {}
 impl<T: Serialize + DeserializeOwned + Send + Sync + Clone + PartialEq + Eq> QStorableBase for T {}
 impl<T: QStorableBase + Sized> QStorableSizedBase for T {}
 pub trait QFHasherU64<F: QFelt64, Hash: QFHashBase<F>>: FieldQHasher<F, Hash> + MerkleZeroHasher<Hash> {}
+pub trait BridgeHasherBase<Hash: QHashBase>: MerkleHasher<Hash> + MerkleZeroHasher<Hash> + BasicBytesHasher<Hash> + Clone + Send + Sync {}
 pub trait Q256BitHash: FromU64x4 + Sized + Copy + MaybeBytemuck + MaybeSpeedy + Debug + Sync + Send + PartialEq {
     fn from_owned_32bytes(bytes: [u8; 32]) -> Self;
     fn into_owned_32bytes(self) -> [u8; 32];

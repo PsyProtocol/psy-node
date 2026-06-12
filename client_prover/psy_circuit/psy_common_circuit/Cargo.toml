@@ -1,0 +1,42 @@
+[package]
+edition = "2021"
+name    = "psy_common_circuit"
+version = "0.1.0"
+
+
+[dependencies]
+plonky2 = { workspace = true }
+plonky2_maybe_rayon = { workspace = true }
+anyhow = { workspace = true }
+num = { workspace = true }
+serde_json = { workspace = true }
+itertools = { workspace = true }
+serde = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+bitflags = { workspace = true }
+bincode = { workspace = true }
+hashbrown = { workspace = true }
+kvq = { workspace = true }
+psy_config = { workspace = true }
+psy_crypto = { workspace = true }
+psy_client_common = { workspace = true }
+psy_client_data = { workspace = true }
+psy_vm = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+maybe-async = { workspace = true }
+k256 = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+rand_chacha = { workspace = true }
+hex-literal = { workspace = true }
+
+
+[features]
+# default = ["is_sync"]
+is_sync = ["maybe-async/is_sync"]

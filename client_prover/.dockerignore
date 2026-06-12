@@ -1,0 +1,43 @@
+# Ignore build artifacts (except release binaries)
+target/debug/
+target/tmp/
+target/.rustc_info.json
+target/CACHEDIR.TAG
+target/release/deps/
+target/release/build/
+target/release/incremental/
+target/release/.fingerprint/
+target/release/examples/
+target/release/.cargo-lock
+target/release/*.d
+target/release/*.rlib
+target/release/*.so
+
+# Ignore git and IDE files
+.git/
+.gitignore
+.vscode/
+.idea/
+
+# Ignore documentation and examples that aren't needed for build
+docs/
+examples/
+
+# Ignore logs and databases
+logs/
+db/
+*.log
+
+# Ignore node modules and TypeScript projects
+node_modules/
+psy_sdk/psy-ts-sdk/
+
+# Ignore AWS deployment files (they're not needed in the container)
+aws-deployment/
+
+# Ignore other unnecessary files
+README.md
+*.md
+
+# Keep only source code and build configurations needed for Rust build
+rust-toolchain.toml

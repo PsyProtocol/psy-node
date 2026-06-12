@@ -2,11 +2,14 @@ use async_trait::async_trait;
 use jsonrpsee::core::RpcResult;
 use parth_core::{
     QProvingJobDataIDWithRewardPath, crypto::{
-        hash::merkle_proof::MerkleProofCore,
+        hash::{merkle_proof::MerkleProofCore, traits::MerkleZeroHasher},
         secp256k1::{QEDCompressedSecp256K1Signature, SimpleTimedRequest},
-    }, data::hash::{checkpointed_merkle_node::CheckpointedMerkleHash, merkle_node_key::SimpleMerkleNodeKey}, node::realm_identifier::QRealmIdentifier, protocol::core_types::QNetworkTypesConfig
+    }, data::{hash::{checkpointed_merkle_node::CheckpointedMerkleHash, hash256::Hash256, merkle_node_key::SimpleMerkleNodeKey}, serializable::QPDSerializable}, node::realm_identifier::QRealmIdentifier, protocol::core_types::QNetworkTypesConfig
 };
-use psy_api_core::{coordinator::standard_edge_rpc::CoordinatorEdgeRpcServer, worker::standard_worker_rpc::NodeEdgeWorkerRpcServer};
+use psy_api_core::{
+    coordinator::standard_edge_rpc::CoordinatorEdgeRpcServer,
+    worker::standard_worker_rpc::NodeEdgeWorkerRpcServer,
+};
 use psy_core::job::job_id::QProvingJobDataID;
 use psy_data::{
     guta::header_extended::GlobalUserTreeAggregatorHeaderWithTagValueAndJobType, node::node_proving_state::PsyNodeProvingState, prepared_block::realm::PsyRealmCoordinatorUpdate, v1::{
@@ -20,7 +23,7 @@ use psy_data::{
     }, worker::api_response::{PsyWorkerGetProvingWorkAPIResponse, PsyWorkerGetProvingWorkWithChildProofsAPIResponse}
 };
 use psy_node_core::{
-    psy_core_db::traits::full::{PsyCoordinatorEdgeAPIStoreReader, PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter},
+    psy_core_db::traits::full::{PsyCoordinatorEdgeAPIStoreReader, PsyNodeCheckpointObjectDatabaseReader, PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter},
     psy_temp_db::StandardEdgeAPITempDBStoreBase,
     queue::{ephemeral::QStandardEphemeralQueuePublisher, worker_queue::QStandardWorkerQueueSubscriber},
     store::traits::proof_store::QParthProofStore,
@@ -35,7 +38,6 @@ fn res<T>(data: anyhow::Result<T>) -> QRpcResult<T> {
 }
 
 const MAX_CHECKPOINT_ID: u64 = i64::MAX as u64;
-
 #[async_trait]
 impl<
         N: QNetworkTypesConfig<JobId = QProvingJobDataID> + Send + Sync + 'static,
@@ -80,6 +82,7 @@ impl<
         res(self.submit_guta_internal(input, proof).await)?;
         Ok("ok".to_string())
     }
+
     async fn get_user_ids_for_public_key(&self, public_key: N::QHash, start_user_id: u64, count: u32) -> QRpcResult<Vec<u64>> {
         res(self
             .db_reader
@@ -95,6 +98,9 @@ impl<
     }
     async fn get_checkpoint_id_for_unique_pending_id(&self, unique_pending_id: u64) -> QRpcResult<Option<u64>> {
         res(self.get_checkpoint_id_for_unique_pending_id_internal(unique_pending_id).await)
+    }
+    async fn get_unique_pending_id_for_checkpoint_id(&self, checkpoint_id: u64) -> QRpcResult<Option<(u64, u128)>> {
+        res(PsyNodeCheckpointObjectDatabaseReader::get_unique_pending_id_for_checkpoint_id(&self.db_reader, checkpoint_id).await)
     }
     async fn get_contract_leaf_data(&self, contract_id: u64) -> QRpcResult<PQEDContractLeaf<N::F, N::QHash>> {
         res(self.db_reader.get_contract_leaf(MAX_CHECKPOINT_ID, contract_id).await)
@@ -213,6 +219,11 @@ impl<
             .await)
     }
 
+
+    async fn get_withdrawal_tree_root(&self, checkpoint_id: u64) -> QRpcResult<N::QHash> {
+        res(self.db_reader.get_checkpoint_global_state_roots(checkpoint_id).await.map(|roots| roots.withdrawal_tree_root))
+    }
+
     async fn get_user_top_tree_merkle_proof(&self, checkpoint_id: u64, leaf_level: u8, leaf_index: u64) -> QRpcResult<MerkleProofCore<N::QHash>> {
         res(self
             .db_reader
@@ -281,6 +292,15 @@ impl<
     }
     async fn get_contract_tree_state_heights(&self, checkpoint_id: u64, contract_ids: Vec<u64>) -> RpcResult<Vec<u8>> {
         res(self.db_reader.get_contract_tree_heights(checkpoint_id, &contract_ids).await)
+    }
+
+    async fn get_checkpoint_state_transition_proof(&self, checkpoint_id: u64) -> QRpcResult<Vec<u8>> {
+        res(async {
+            let data = self.db_reader
+                .get_verifiable_checkpoint_state_transition_and_zkp(checkpoint_id)
+                .await?;
+            Ok(data.zk_proof)
+        }.await)
     }
 
 }
