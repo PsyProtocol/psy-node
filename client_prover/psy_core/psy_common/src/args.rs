@@ -22,6 +22,8 @@ pub enum SignType {
     ZKSign,
     #[clap(name = "secp256k1")]
     SECP256K1Sign,
+    #[clap(name = "eth-personal-secp256k1")]
+    EthPersonalSECP256K1Sign,
     #[clap(name = "software-defined-dpn")]
     SoftwareDefinedDPNSign,
     #[clap(name = "software-defined-plonky2")]
@@ -35,6 +37,7 @@ impl SignType {
         match s.to_lowercase().as_str() {
             "zk" => Ok(SignType::ZKSign),
             "secp256k1" => Ok(SignType::SECP256K1Sign),
+            "eth-personal-secp256k1" => Ok(SignType::EthPersonalSECP256K1Sign),
             "software-defined-dpn" => Ok(SignType::SoftwareDefinedDPNSign),
             "software-defined-plonky2" => Ok(SignType::SoftwareDefinedPlonky2Sign),
             "sd-key" => Ok(SignType::SDKeySign),

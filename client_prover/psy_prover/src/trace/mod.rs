@@ -614,6 +614,10 @@ pub struct ZkSignStep {
 pub enum TraceSignCircuitSource {
     ZkBuiltin,
     SecpBuiltin,
+    /// EIP-191 (MetaMask `personal_sign`) builtin secp256k1 circuit. Works for
+    /// both the held-key user and the externally injected (keyless) user —
+    /// proving dispatches on the fingerprint via the wallet's signature users.
+    EthPersonalSecpBuiltin,
     SdKey {
         allowed_contract_ids: Vec<u64>,
         allowed_method_ids: Vec<u32>,

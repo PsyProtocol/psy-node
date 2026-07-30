@@ -11,7 +11,7 @@ use plonky2::{
     },
     plonk::{circuit_data::VerifierOnlyCircuitData, config::PoseidonGoldilocksConfig, proof::ProofWithPublicInputs},
 };
-use psy_client_common::data::{alt::AltVerifierOnlyCircuitData, base_types::hash256::Hash256, qhashout::QHashOut};
+use psy_client_common::data::{alt::AltVerifierOnlyCircuitData, base_types::hash256::Hash256, qhashout::QHashOut, secp256k1::CompressedPublicKey};
 use psy_client_data::{
     config::store_config::PsyHasher,
     dpn::sd_key::SDKeyConfig,
@@ -50,7 +50,10 @@ use psy_vm::ups::{circuit_manager::UPSCircuitManager, state_reader::StateReader}
 use crate::signature::{
     context::SignContext,
     traits::{SignatureResult, SignatureUser},
-    users::{SDKeyUser, SECP256K1User, SoftwareDefinedDpnUser, SoftwareDefinedPlonky2User, ZKUser},
+    users::{
+        EthPersonalSignSECP256K1User, ExternalEthPersonalSignUser, ExternalSecp256K1User, SDKeyUser, SECP256K1User, SoftwareDefinedDpnUser,
+        SoftwareDefinedPlonky2User, ZKUser,
+    },
 };
 
 type C = PoseidonGoldilocksConfig;
@@ -70,6 +73,9 @@ pub const ZK_FINGERPRINT_U64: [u64; 4] = [10809942084296272720, 6801881445144280
 // 320d034234f0dab4d02c4b03d69276cbd5c2eb831aca1b11c7e52078ace2e33b
 pub const SECP256K1_FINGERPRINT_U64: [u64; 4] = [14403954685883114299, 15403132623883213585, 15000446938721187531, 3606542459484560052];
 
+// 4cf514982eb7155648bf1b7852a6a564d8e86998cc1c6365a50e15796b7f0745
+pub const ETH_SECP256K1_FINGERPRINT_U64: [u64; 4] = [11893467277170771781, 15629858611769664357, 5241938694879225188, 5545361160027968854];
+
 pub fn get_zk_fingerprint<F: RichField>() -> QHashOut<F> {
     QHashOut(HashOut {
         elements: [
@@ -88,6 +94,17 @@ pub fn get_secp256k1_fingerprint<F: RichField>() -> QHashOut<F> {
             F::from_canonical_u64(SECP256K1_FINGERPRINT_U64[1]),
             F::from_canonical_u64(SECP256K1_FINGERPRINT_U64[2]),
             F::from_canonical_u64(SECP256K1_FINGERPRINT_U64[3]),
+        ],
+    })
+}
+
+pub fn get_eth_secp256k1_fingerprint<F: RichField>() -> QHashOut<F> {
+    QHashOut(HashOut {
+        elements: [
+            F::from_canonical_u64(ETH_SECP256K1_FINGERPRINT_U64[0]),
+            F::from_canonical_u64(ETH_SECP256K1_FINGERPRINT_U64[1]),
+            F::from_canonical_u64(ETH_SECP256K1_FINGERPRINT_U64[2]),
+            F::from_canonical_u64(ETH_SECP256K1_FINGERPRINT_U64[3]),
         ],
     })
 }
@@ -196,7 +213,7 @@ pub fn get_allow_method_sd_key_fingerprint(
 pub fn get_public_key_info<F: RichField>(private_key: QHashOut<F>, fingerprint: QHashOut<F>) -> anyhow::Result<ZKPublicKeyInfo<F>> {
     let public_key_param = if fingerprint == get_zk_fingerprint() {
         SimplePsyPrivateKey::new(private_key).get_public_key_param::<PsyHasher>()
-    } else if fingerprint == get_secp256k1_fingerprint() {
+    } else if fingerprint == get_secp256k1_fingerprint() || fingerprint == get_eth_secp256k1_fingerprint() {
         let public_key = get_secp_public_key::<F>(private_key)?;
         hash_no_pad_compressed_public_key::<F, PoseidonPermutation<F>>(public_key)
     } else {
@@ -733,6 +750,113 @@ impl PsyMemoryWallet {
         Ok(pk_info)
     }
 
+    /// Held-key counterpart of [`Self::register_external_eth_personal_user`]:
+    /// installs an [`EthPersonalSignSECP256K1User`] that keeps the private key
+    /// in the wallet and signs EIP-191 (`personal_sign`) digests locally.
+    /// Shares the eth_personal circuit fingerprint with the external variant,
+    /// so the same key maps to the SAME `pk_hash`/identity either way.
+    pub async fn add_eth_personal_secp_private_key(&mut self, private_key: QHashOut<F>) -> anyhow::Result<ZKPublicKeyInfo<F>> {
+        let user: Arc<dyn SignatureUser> = Arc::new(EthPersonalSignSECP256K1User::new(private_key));
+        let manager = self.random_circuit_manager();
+        let manager_ref = manager.as_ref();
+        let pk_info = user.public_key_info(self, manager_ref).await?;
+        let pk_hash = pk_info.qfhash::<PsyHasher>();
+        self.signature_users.insert(pk_hash, user);
+        Ok(pk_info)
+    }
+
+    /// Mode-A (web/MetaMask): install a classic-secp user PK-first — ONLY the
+    /// compressed public key, no signature yet. Enough for on-chain
+    /// registration and trace generation. Proving (`sign()`) fails until
+    /// the entry is replaced via [`Self::inject_secp_signature`] with a
+    /// MetaMask signature over the session sighash.
+    pub async fn register_external_secp_user(&mut self, compressed_public_key: CompressedPublicKey) -> anyhow::Result<ZKPublicKeyInfo<F>> {
+        let user: Arc<dyn SignatureUser> = Arc::new(ExternalSecp256K1User::new(compressed_public_key));
+        let manager = self.random_circuit_manager();
+        let manager_ref = manager.as_ref();
+        let pk_info = user.public_key_info(self, manager_ref).await?;
+        let pk_hash = pk_info.qfhash::<PsyHasher>();
+        self.signature_users.insert(pk_hash, user);
+        Ok(pk_info)
+    }
+
+    /// Inject an externally produced (MetaMask `eth_sign`-style) signature over
+    /// the session sighash: REPLACES the wallet entry with a signature-carrying
+    /// [`ExternalSecp256K1User`]. Call this after trace generation, once per
+    /// transaction.
+    pub async fn inject_secp_signature(
+        &mut self,
+        expected_public_key: QHashOut<F>,
+        signature: PsyCompressedSecp256K1Signature,
+    ) -> anyhow::Result<ZKPublicKeyInfo<F>> {
+        let user: Arc<dyn SignatureUser> = Arc::new(ExternalSecp256K1User::with_signature(signature));
+        let manager = self.random_circuit_manager();
+        let manager_ref = manager.as_ref();
+        let pk_info = user.public_key_info(self, manager_ref).await?;
+        let actual_public_key = pk_info.qfhash::<PsyHasher>();
+        if actual_public_key != expected_public_key {
+            bail!(
+                "injected secp256k1 signature belongs to public key `{}`, expected registered public key `{}`",
+                actual_public_key,
+                expected_public_key
+            );
+        }
+        if !self.signature_users.contains_key(&expected_public_key) {
+            bail!("registered external secp256k1 user `{}` not found in wallet", expected_public_key);
+        }
+        self.signature_users.insert(expected_public_key, user);
+        Ok(pk_info)
+    }
+
+    /// Mode-A MetaMask `personal_sign` (EIP-191): install an eth_personal user
+    /// PK-first — ONLY the compressed public key, no signature yet. Enough for
+    /// on-chain registration and trace generation. Proving (`sign()`) fails
+    /// until the entry is replaced via [`Self::inject_eth_personal_signature`]
+    /// with a MetaMask signature over the session sighash.
+    ///
+    /// Because this user reports the eth_personal circuit fingerprint, the
+    /// resulting `pk_hash` is a DISTINCT identity from the classic-secp one for
+    /// the same public key.
+    pub async fn register_external_eth_personal_user(&mut self, compressed_public_key: CompressedPublicKey) -> anyhow::Result<ZKPublicKeyInfo<F>> {
+        let user: Arc<dyn SignatureUser> = Arc::new(ExternalEthPersonalSignUser::new(compressed_public_key));
+        let manager = self.random_circuit_manager();
+        let manager_ref = manager.as_ref();
+        let pk_info = user.public_key_info(self, manager_ref).await?;
+        let pk_hash = pk_info.qfhash::<PsyHasher>();
+        self.signature_users.insert(pk_hash, user);
+        Ok(pk_info)
+    }
+
+    /// Inject a MetaMask `personal_sign` signature over the session sighash:
+    /// REPLACES the wallet entry with a signature-carrying
+    /// [`ExternalEthPersonalSignUser`]. The signature's `(r,s)` is over
+    /// `keccak256(EIP-191 prefix || sighash)`; the EIP-191 circuit re-derives
+    /// that keccak in-circuit. Call this after trace generation, once per
+    /// transaction.
+    pub async fn inject_eth_personal_signature(
+        &mut self,
+        expected_public_key: QHashOut<F>,
+        signature: PsyCompressedSecp256K1Signature,
+    ) -> anyhow::Result<ZKPublicKeyInfo<F>> {
+        let user: Arc<dyn SignatureUser> = Arc::new(ExternalEthPersonalSignUser::with_signature(signature));
+        let manager = self.random_circuit_manager();
+        let manager_ref = manager.as_ref();
+        let pk_info = user.public_key_info(self, manager_ref).await?;
+        let actual_public_key = pk_info.qfhash::<PsyHasher>();
+        if actual_public_key != expected_public_key {
+            bail!(
+                "injected eth-personal signature belongs to public key `{}`, expected registered public key `{}`",
+                actual_public_key,
+                expected_public_key
+            );
+        }
+        if !self.signature_users.contains_key(&expected_public_key) {
+            bail!("registered external eth-personal user `{}` not found in wallet", expected_public_key);
+        }
+        self.signature_users.insert(expected_public_key, user);
+        Ok(pk_info)
+    }
+
     pub async fn get_zk_pk_info(&self, private_key: QHashOut<F>) -> anyhow::Result<ZKPublicKeyInfo<F>> {
         let simple_key = SimplePsyPrivateKey { private_key };
         let public_key_param = simple_key.get_public_key_param::<PoseidonHash>();
@@ -748,6 +872,20 @@ impl PsyMemoryWallet {
         let public_key_param =
             psy_crypto::signature::secp256k1::wallet::hash_no_pad_compressed_public_key::<F, PoseidonPermutation<F>>(pub_compressed);
         let fingerprint = self.random_circuit_manager().secp_circuit_fingerprint().await?;
+        Ok(ZKPublicKeyInfo {
+            fingerprint,
+            public_key_param,
+        })
+    }
+
+    /// EIP-191 (`personal_sign`) counterpart of [`Self::get_secp_pk_info`]:
+    /// same `public_key_param` derivation, but reports the eth_personal
+    /// circuit fingerprint.
+    pub async fn get_eth_personal_secp_pk_info(&self, private_key: QHashOut<F>) -> anyhow::Result<ZKPublicKeyInfo<F>> {
+        let pub_compressed = psy_crypto::signature::secp256k1::wallet::get_secp_public_key(private_key)?;
+        let public_key_param =
+            psy_crypto::signature::secp256k1::wallet::hash_no_pad_compressed_public_key::<F, PoseidonPermutation<F>>(pub_compressed);
+        let fingerprint = self.random_circuit_manager().eth_personal_secp_circuit_fingerprint().await?;
         Ok(ZKPublicKeyInfo {
             fingerprint,
             public_key_param,
@@ -844,11 +982,17 @@ impl PsyMemoryWallet {
         let manager = self.random_circuit_manager();
         let zk_fingerprint = self.zk_circuit_fingerprint().await?;
         let secp_fingerprint = manager.secp_circuit_fingerprint().await?;
+        // Tolerate prove-proxies that predate the EIP-191 circuit: the lookup
+        // fails there, so no held-key eth-personal user can be created — but
+        // every other user type must keep working.
+        let eth_personal_fingerprint = manager.eth_personal_secp_circuit_fingerprint().await.ok();
 
         if fingerprint == zk_fingerprint {
             self.add_zk_private_key(private_key).await
         } else if fingerprint == secp_fingerprint {
             self.add_secp_private_key(private_key).await
+        } else if Some(fingerprint) == eth_personal_fingerprint {
+            self.add_eth_personal_secp_private_key(private_key).await
         } else {
             if self.local_circuits.has_psy_software_defined_circuit(&fingerprint) {
                 self.add_software_defined_dpn_private_key(private_key, fingerprint).await
@@ -910,8 +1054,23 @@ impl PsyMemoryWallet {
         psy_crypto::signature::secp256k1::wallet::secp256k1_sign(k256::ecdsa::SigningKey::from_slice(&Hash256::from(private_key).0)?, sig_hash)
     }
 
+    /// EIP-191 (`personal_sign`) counterpart of [`Self::secp256k1_sign`].
+    pub fn eth_personal_secp256k1_sign(&self, private_key: QHashOut<F>, sig_hash: QHashOut<F>) -> anyhow::Result<PsyCompressedSecp256K1Signature> {
+        psy_crypto::signature::secp256k1::wallet::secp256k1_sign_eth_personal(
+            k256::ecdsa::SigningKey::from_slice(&Hash256::from(private_key).0)?,
+            sig_hash,
+        )
+    }
+
     pub async fn zk_secp256k1_from_signature(&self, signature: &PsyCompressedSecp256K1Signature) -> anyhow::Result<ProofWithPublicInputs<F, C, D>> {
         self.random_circuit_manager().prove_secp_sign(*signature).await
+    }
+
+    pub async fn zk_eth_personal_secp256k1_from_signature(
+        &self,
+        signature: &PsyCompressedSecp256K1Signature,
+    ) -> anyhow::Result<ProofWithPublicInputs<F, C, D>> {
+        self.random_circuit_manager().prove_eth_personal_secp_sign(*signature).await
     }
 
     pub async fn zk_sign_secp256k1(&self, public_key: QHashOut<F>, sig_hash: QHashOut<F>) -> anyhow::Result<ProofWithPublicInputs<F, C, D>> {
@@ -1313,6 +1472,63 @@ mod tests {
         assert_eq!(
             combined_hash_from_proof, expected_combined_hash,
             "Proof public inputs should match hash(sighash, public_key_hash)"
+        );
+
+        Ok(())
+    }
+
+    /// Held-key EIP-191 path: sign locally via
+    /// `PsyMemoryWallet::eth_personal_secp256k1_sign`, then prove through the
+    /// SAME `EthPersonalSignSecp256K1SignatureCircuit` the external
+    /// (MetaMask-injected) variant uses. The public inputs must bind the RAW
+    /// sighash (not the keccak digest), same as the raw-secp path.
+    /// `cargo test -p psy_prover test_eth_personal_secp256k1_sign -- --ignored
+    /// --nocapture`
+    #[test]
+    #[ignore]
+    fn test_eth_personal_secp256k1_sign() -> Result<()> {
+        use plonky2::hash::poseidon::PoseidonPermutation;
+        use psy_client_common::data::base_types::hash256::Hash256;
+        use psy_client_data::config::store_config::PsyHasher;
+        use psy_common_circuit::circuits::secp256k1_signature::EthPersonalSignSecp256K1SignatureCircuit;
+        use psy_crypto::hash::traits::hasher::FieldQHasher;
+
+        let private_key = QHashOut::<F>::from_str("17c975c2668ebe0ca7c87f67c6414ebb7fd664f46370a0af2a3b204c8824ac5a")?;
+        let sig_hash = QHashOut::<F>::from_str("83955402ec7f375d1d6e8f3bf59753fe0af1e7c62bb4b662716a2524d3e2d186")?;
+
+        let circuit_manager = psy_ups_circuit::circuit_manager::core::PsyUPSStepCircuitManager::new_with_config(0x1337);
+        let wallet = PsyMemoryWallet::new(vec![Box::new(circuit_manager)]);
+
+        let eth_signature = wallet.eth_personal_secp256k1_sign(private_key, sig_hash)?;
+
+        // The stored message must be the RAW sighash, not the EIP-191 digest.
+        assert_eq!(eth_signature.message, Hash256::from(sig_hash));
+
+        let eth_circuit = EthPersonalSignSecp256K1SignatureCircuit::<C, D>::new();
+        println!("Created EIP-191 circuit, fingerprint: {}", eth_circuit.get_fingerprint());
+        assert_eq!(eth_circuit.get_fingerprint(), get_eth_secp256k1_fingerprint());
+
+        let zk_proof = eth_circuit.prove(&eth_signature)?;
+        eth_circuit.minifier_chain.verify(zk_proof.clone())?;
+
+        let combined_hash_from_proof = QHashOut(plonky2::hash::hash_types::HashOut {
+            elements: [
+                zk_proof.public_inputs[0],
+                zk_proof.public_inputs[1],
+                zk_proof.public_inputs[2],
+                zk_proof.public_inputs[3],
+            ],
+        });
+
+        let public_key_param = psy_crypto::signature::secp256k1::wallet::hash_no_pad_compressed_public_key::<F, PoseidonPermutation<F>>(
+            psy_client_common::data::secp256k1::CompressedPublicKey(eth_signature.public_key),
+        );
+        let message_hash: QHashOut<F> = QHashOut::from(eth_signature.message);
+        let expected_combined_hash = PsyHasher::q_two_to_one(message_hash, public_key_param);
+
+        assert_eq!(
+            combined_hash_from_proof, expected_combined_hash,
+            "EIP-191 proof public inputs should match hash(raw_sighash, public_key_param)"
         );
 
         Ok(())

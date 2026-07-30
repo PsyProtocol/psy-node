@@ -23,6 +23,7 @@ psy_crypto = { workspace = true }
 psy_client_common = { workspace = true }
 psy_client_data = { workspace = true }
 psy_vm = { workspace = true }
+psy_plonky2_common_circuits = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
 maybe-async = { workspace = true }
@@ -37,6 +38,7 @@ tokio = { workspace = true }
 criterion = { workspace = true }
 rand_chacha = { workspace = true }
 hex-literal = { workspace = true }
+tiny-keccak = { workspace = true }
 
 
 [features]

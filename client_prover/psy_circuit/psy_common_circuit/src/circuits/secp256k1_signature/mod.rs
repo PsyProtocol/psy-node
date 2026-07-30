@@ -1,3 +1,5 @@
+use std::marker::PhantomData;
+
 use plonky2::{
     gates::gate::GateRef,
     iop::witness::PartialWitness,
@@ -13,19 +15,51 @@ use psy_crypto::signature::secp256k1::core::{PsyCompressedSecp256K1Signature, Ps
 
 use super::traits::qstandard::QStandardCircuit;
 use crate::{
-    crypto::secp256k1::gadget::DogePsySignatureGadget, proof_minifier::pm_chain::PsyProofMinifierChain, u32::gates::comparison::ComparisonGate,
+    crypto::secp256k1::gadget::{Secp256K1Gadget, DOGE_PSY_PREFIX, EIP191_PREFIX_32},
+    proof_minifier::pm_chain::PsyProofMinifierChain,
+    u32::gates::comparison::ComparisonGate,
 };
 
+/// Identifies which message-prefix flavor a secp256k1 signature circuit is built
+/// with. The prefix is the ONLY difference between flavors — the gadget wiring,
+/// minifier chain and `prove` are fully shared via [`Secp256K1SignatureCircuitBase`].
+pub trait Secp256K1SignatureFlavor: Send + Sync + 'static {
+    const PREFIX: &'static [u8];
+}
+
+/// Classic Doge/Psy flavor: the ECDSA message is the raw sighash (no prefix).
+#[derive(Debug, Clone, Copy)]
+pub struct DogePsySignatureFlavor;
+impl Secp256K1SignatureFlavor for DogePsySignatureFlavor {
+    const PREFIX: &'static [u8] = DOGE_PSY_PREFIX;
+}
+
+/// EIP-191 `personal_sign` flavor: the ECDSA message is
+/// `keccak256("\x19Ethereum Signed Message:\n32" || sighash)`, while the raw
+/// sighash is still bound into `combined_hash`.
+#[derive(Debug, Clone, Copy)]
+pub struct EthPersonalSignSignatureFlavor;
+impl Secp256K1SignatureFlavor for EthPersonalSignSignatureFlavor {
+    const PREFIX: &'static [u8] = EIP191_PREFIX_32;
+}
+
 #[derive(Debug)]
-pub struct Secp256K1SignatureCircuit<C: GenericConfig<D>, const D: usize>
+pub struct Secp256K1SignatureCircuitBase<M: Secp256K1SignatureFlavor, C: GenericConfig<D>, const D: usize>
 where
     C::Hasher: AlgebraicHasher<C::F>,
 {
-    pub signature_gadget: DogePsySignatureGadget,
+    pub signature_gadget: Secp256K1Gadget,
     pub base_circuit_data: CircuitData<C::F, C, D>,
     pub minifier_chain: PsyProofMinifierChain<D, C::F, C>,
+    _flavor: PhantomData<M>,
 }
-impl<C: GenericConfig<D>, const D: usize> Clone for Secp256K1SignatureCircuit<C, D>
+
+/// Classic Doge/Psy secp256k1 signature circuit (raw sighash, no prefix).
+pub type Secp256K1SignatureCircuit<C, const D: usize> = Secp256K1SignatureCircuitBase<DogePsySignatureFlavor, C, D>;
+/// EIP-191 `personal_sign` secp256k1 signature circuit (keccak-prefixed).
+pub type EthPersonalSignSecp256K1SignatureCircuit<C, const D: usize> = Secp256K1SignatureCircuitBase<EthPersonalSignSignatureFlavor, C, D>;
+
+impl<M: Secp256K1SignatureFlavor, C: GenericConfig<D>, const D: usize> Clone for Secp256K1SignatureCircuitBase<M, C, D>
 where
     C::Hasher: AlgebraicHasher<C::F>,
 {
@@ -33,14 +67,15 @@ where
         Self::new()
     }
 }
-impl<C: GenericConfig<D>, const D: usize> Secp256K1SignatureCircuit<C, D>
+
+impl<M: Secp256K1SignatureFlavor, C: GenericConfig<D>, const D: usize> Secp256K1SignatureCircuitBase<M, C, D>
 where
     C::Hasher: AlgebraicHasher<C::F>,
 {
     pub fn new() -> Self {
         let config = CircuitConfig::standard_ecc_config();
         let mut builder = CircuitBuilder::<C::F, D>::new(config);
-        let signature_gadget = DogePsySignatureGadget::add_virtual_to::<C::Hasher, C::F, D>(&mut builder);
+        let signature_gadget = Secp256K1Gadget::add_virtual_to::<C::Hasher, C::F, D>(&mut builder, M::PREFIX);
 
         builder.register_public_inputs(&signature_gadget.combined_hash.elements);
         let circuit_data = builder.build::<C>();
@@ -54,6 +89,7 @@ where
             base_circuit_data: circuit_data,
             signature_gadget,
             minifier_chain,
+            _flavor: PhantomData,
         }
     }
     pub fn prove(&self, compressed_signature: &PsyCompressedSecp256K1Signature) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
@@ -79,7 +115,7 @@ where
     }
 }
 
-impl<C: GenericConfig<D>, const D: usize> QStandardCircuit<C, D> for Secp256K1SignatureCircuit<C, D>
+impl<M: Secp256K1SignatureFlavor, C: GenericConfig<D>, const D: usize> QStandardCircuit<C, D> for Secp256K1SignatureCircuitBase<M, C, D>
 where
     C::Hasher: AlgebraicHasher<C::F>,
 {

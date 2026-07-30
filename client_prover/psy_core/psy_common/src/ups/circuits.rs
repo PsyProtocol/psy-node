@@ -92,6 +92,10 @@ pub enum LocalCircuitType {
     SimpleSecp256K1 = 49,
     SimplePrivateNoteInclusion = 50,
     SimpleShieldDepositClaim = 51,
+    // MetaMask `personal_sign` (EIP-191) secp256k1 — Mode-A web wallet.
+    // NOTE: 50 was already taken by SimplePrivateNoteInclusion on the relayer
+    // branch, so this Mode-A variant is assigned the next free signature slot.
+    EthPersonalSecp256K1 = 52,
 
     // GUTA Circuits
     GUTATwoEndCap = 65,
@@ -152,6 +156,7 @@ impl TryFrom<u8> for LocalCircuitType {
             49 => Ok(LocalCircuitType::SimpleSecp256K1),
             50 => Ok(LocalCircuitType::SimplePrivateNoteInclusion),
             51 => Ok(LocalCircuitType::SimpleShieldDepositClaim),
+            52 => Ok(LocalCircuitType::EthPersonalSecp256K1),
 
             65 => Ok(LocalCircuitType::GUTATwoEndCap),
             66 => Ok(LocalCircuitType::GUTATwoGUTA),

@@ -355,6 +355,12 @@ pub trait ProveProxyRpc {
     #[method(name = "prove_secp_sign")]
     async fn prove_secp_sign(&self, signature: PsyCompressedSecp256K1Signature) -> Result<ProofWithPublicInputs<F, C, D>, ErrorObjectOwned>;
 
+    #[method(name = "prove_eth_personal_secp_sign")]
+    async fn prove_eth_personal_secp_sign(
+        &self,
+        signature: PsyCompressedSecp256K1Signature,
+    ) -> Result<ProofWithPublicInputs<F, C, D>, ErrorObjectOwned>;
+
     #[method(name = "register_dpn_software_defined_circuit")]
     async fn register_dpn_software_defined_circuit(
         &self,
@@ -621,6 +627,10 @@ impl ProveProxyServerProvider {
                 fingerprint: circuit_manager.shield_deposit_claim_minifier_circuit().get_fingerprint(),
                 verifier_config: circuit_manager.shield_deposit_claim_minifier_circuit().get_verifier_config_ref().into(),
             },
+            eth_personal_secp_circuit: Some(QCommonCircuitData {
+                fingerprint: circuit_manager.eth_personal_secp_circuit().get_fingerprint(),
+                verifier_config: circuit_manager.eth_personal_secp_circuit().get_verifier_config_ref().into(),
+            }),
         };
 
         // ── Pre-build Groth16 wrapping circuits (shared across all threads) ──
@@ -1573,6 +1583,33 @@ impl ProveProxyRpcServer for ProveProxyServerProvider {
             ErrorObjectOwned::owned(
                 1,
                 "prove_secp_sign proving error",
+                Some(format!("ZK proof generation failed: {}", prove_err)),
+            )
+        })
+    }
+
+    async fn prove_eth_personal_secp_sign(
+        &self,
+        signature: PsyCompressedSecp256K1Signature,
+    ) -> Result<ProofWithPublicInputs<F, C, D>, ErrorObjectOwned> {
+        tracing::info!("prove_eth_personal_secp_sign");
+
+        let circuit_manager = self.circuit_manager.clone();
+
+        let proof_join_handle = tokio::task::spawn_blocking(move || circuit_manager.eth_personal_secp_circuit().prove(&signature));
+
+        let proof_result = proof_join_handle.await.map_err(|join_err| {
+            ErrorObjectOwned::owned(
+                1,
+                "prove_eth_personal_secp_sign: task schedule failed",
+                Some(format!("Thread pool task execution failed: {}", join_err)),
+            )
+        })?;
+
+        proof_result.map_err(|prove_err| {
+            ErrorObjectOwned::owned(
+                1,
+                "prove_eth_personal_secp_sign proving error",
                 Some(format!("ZK proof generation failed: {}", prove_err)),
             )
         })

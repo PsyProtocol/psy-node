@@ -297,6 +297,8 @@ pub enum RequestParams<F: RichField> {
     ShieldDepositClaimMinifierProof(QBaseProofMinifierRPCRequest),
     #[serde(rename = "psy_prove_secp_sign")]
     SECPSignatureProof(QSecpSignatureProofRPCRequest),
+    #[serde(rename = "psy_prove_eth_personal_secp_sign")]
+    EthPersonalSECPSignatureProof(QSecpSignatureProofRPCRequest),
     #[serde(rename = "psy_register_dpn_software_defined_circuit")]
     RegisterDPNSoftwareDefinedCircuit(QRegisterDPNSoftwareDefinedCircuitRPCRequest),
     #[serde(rename = "psy_register_plonky2_software_defined_circuit")]

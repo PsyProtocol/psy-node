@@ -14,6 +14,28 @@ use psy_client_common::data::{
 use super::core::PsyCompressedSecp256K1Signature;
 use crate::hash::core::btc::btc_hash160;
 
+/// The EIP-191 prefix for a 32-byte `personal_sign` message:
+/// `0x19 || "Ethereum Signed Message:\n" || "32"` (28 bytes).
+/// This is the single source of truth — the in-circuit keccak gadget
+/// (`psy_common_circuit::crypto::secp256k1::gadget`) re-exports it so the
+/// circuit preimage and the host-side signing preimage can never drift apart.
+pub const EIP191_PREFIX_32: &[u8] = b"\x19Ethereum Signed Message:\n32";
+
+/// Host-side EIP-191 digest: `keccak256(EIP191_PREFIX_32 || message)`.
+/// `message` must be the exact 32 bytes the circuit binds as the raw sighash
+/// (`Hash256::from(sighash).0`), matching what a MetaMask `personal_sign`
+/// over those bytes would produce.
+pub fn eth_personal_sign_digest(message: &[u8; 32]) -> [u8; 32] {
+    use tiny_keccak::{Hasher, Keccak};
+
+    let mut hasher = Keccak::v256();
+    hasher.update(EIP191_PREFIX_32);
+    hasher.update(message);
+    let mut digest = [0u8; 32];
+    hasher.finalize(&mut digest);
+    digest
+}
+
 pub trait CompressedPublicKeyToP2PKH {
     fn to_p2pkh_address(&self) -> Hash160;
 }
@@ -138,6 +160,27 @@ pub fn get_secp_public_key<F: RichField>(private_key: QHashOut<F>) -> anyhow::Re
     Ok(CompressedPublicKey(compressed))
 }
 
+/// Compresses an uncompressed secp256k1 public key — either the SEC1 form
+/// (`0x04 || X || Y`, 65 bytes) or the raw coordinate pair (`X || Y`, 64
+/// bytes), which is what MetaMask signature recovery (`ecrecover`) returns.
+///
+/// Compression is lossless: `0x02`/`0x03` prefix encodes the parity of Y,
+/// followed by X. The circuit witnesses the full (x, y) anyway; the
+/// compressed form is only the off-chain representation used for
+/// `public_key_param` and registration.
+pub fn uncompressed_secp256k1_to_compressed(uncompressed: &[u8]) -> anyhow::Result<CompressedPublicKey> {
+    let coords: &[u8] = match uncompressed.len() {
+        65 if uncompressed[0] == 0x04 => &uncompressed[1..],
+        64 => uncompressed,
+        _ => anyhow::bail!("expected 65-byte (0x04-prefixed) or 64-byte uncompressed secp256k1 public key, got {} bytes", uncompressed.len()),
+    };
+    let (x, y) = coords.split_at(32);
+    let mut compressed = [0u8; 33];
+    compressed[0] = 0x02 | (y[31] & 1);
+    compressed[1..].copy_from_slice(x);
+    Ok(CompressedPublicKey(compressed))
+}
+
 pub fn secp256k1_sign<F: RichField>(private_key: k256::ecdsa::SigningKey, sighash: QHashOut<F>) -> anyhow::Result<PsyCompressedSecp256K1Signature> {
     tracing::info!("🔔 prove_secp256k1_signature");
 
@@ -161,5 +204,41 @@ pub fn secp256k1_sign<F: RichField>(private_key: k256::ecdsa::SigningKey, sighas
         public_key: pub_compressed.0,
         signature: rs_bytes,
         message: sighash.into(),
+    })
+}
+
+/// EIP-191 (`personal_sign`) counterpart of [`secp256k1_sign`]. Signs
+/// `keccak256(EIP191_PREFIX_32 || raw_sighash_bytes)` — exactly what MetaMask
+/// `personal_sign` produces over the raw sighash bytes — while storing the RAW
+/// sighash in `message` so the circuit can re-derive the keccak in-circuit and
+/// still bind the sighash into `combined_hash`.
+pub fn secp256k1_sign_eth_personal<F: RichField>(private_key: k256::ecdsa::SigningKey, sighash: QHashOut<F>) -> anyhow::Result<PsyCompressedSecp256K1Signature> {
+    tracing::info!("🔔 prove_eth_personal_secp256k1_signature");
+
+    let public_key = private_key.verifying_key().to_encoded_point(true).to_bytes();
+    let mut compressed = [0u8; 33];
+    if public_key.len() == 33 {
+        compressed.copy_from_slice(&public_key);
+    } else {
+        return Err(anyhow::format_err!("pub key length is not 33"));
+    }
+    let pub_compressed = CompressedPublicKey(compressed);
+
+    let message = Hash256::from(sighash);
+    let digest = eth_personal_sign_digest(&message.0);
+    // k256's deterministic signer normalizes `s` to the low half of the curve
+    // order, matching MetaMask's low-S output.
+    let result: k256::ecdsa::Signature = private_key.sign_prehash(&digest)?;
+    let mut rs_bytes = [0u8; 64];
+
+    let r_bytes = result.r().to_bytes();
+    let s_bytes = result.s().to_bytes();
+    rs_bytes[0..32].copy_from_slice(&r_bytes);
+    rs_bytes[32..64].copy_from_slice(&s_bytes);
+
+    Ok(PsyCompressedSecp256K1Signature {
+        public_key: pub_compressed.0,
+        signature: rs_bytes,
+        message,
     })
 }

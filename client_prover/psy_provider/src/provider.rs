@@ -1090,6 +1090,10 @@ pub struct LocalCommonCircuitsData<F: RichField> {
     pub secp_circuit: QCommonCircuitData<F>,
     pub private_note_inclusion_minifier: QCommonCircuitData<F>,
     pub shield_deposit_claim_minifier: QCommonCircuitData<F>,
+    // Optional for backward compatibility: prove-proxies predating the EIP-191
+    // (MetaMask `personal_sign`) circuit don't send this field.
+    #[serde(default)]
+    pub eth_personal_secp_circuit: Option<QCommonCircuitData<F>>,
 
     pub ups_circuit_whitelist_root: QHashOut<F>,
     pub ups_start_whitelist_proof: MerkleProofCore<QHashOut<F>>,
@@ -1631,6 +1635,25 @@ where
         }
     }
 
+    async fn prove_eth_personal_secp_sign(&self, signature: PsyCompressedSecp256K1Signature) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
+        tracing::info!("prove_eth_personal_secp_sign: {}", serde_json::to_string_pretty(&signature)?);
+        let response = psy_rpc_call_back!(
+            self,
+            &self.proof_proxy_url,
+            RequestParams::<C::F>::EthPersonalSECPSignatureProof(QSecpSignatureProofRPCRequest {
+                signature,
+            }),
+            ProofWithPublicInputs<C::F, C, D>
+        );
+        match response.result {
+            ResponseResult::Success(proof) => {
+                tracing::info!("get proof: {}", serde_json::to_string_pretty(&proof.public_inputs)?);
+                Ok(proof)
+            }
+            ResponseResult::Error(e) => Err(anyhow::format_err!("rpc call failed `{:?}`", e)),
+        }
+    }
+
     async fn register_dpn_software_defined_circuit(
         &self,
         fn_def: psy_vm::dpn::vm::def::DPNFunctionCircuitDefinition,
@@ -1813,6 +1836,22 @@ where
 
     async fn secp_circuit_verifier_config(&self) -> anyhow::Result<VerifierOnlyCircuitData<C, D>> {
         Ok(self.common_circuits_data.secp_circuit.verifier_config.clone().to_verifier_data())
+    }
+
+    async fn eth_personal_secp_circuit_fingerprint(&self) -> anyhow::Result<QHashOut<C::F>> {
+        self.common_circuits_data
+            .eth_personal_secp_circuit
+            .as_ref()
+            .map(|c| c.fingerprint)
+            .ok_or_else(|| anyhow::format_err!("prove-proxy does not expose eth_personal_secp circuit metadata"))
+    }
+
+    async fn eth_personal_secp_circuit_verifier_config(&self) -> anyhow::Result<VerifierOnlyCircuitData<C, D>> {
+        self.common_circuits_data
+            .eth_personal_secp_circuit
+            .as_ref()
+            .map(|c| c.verifier_config.clone().to_verifier_data())
+            .ok_or_else(|| anyhow::format_err!("prove-proxy does not expose eth_personal_secp circuit metadata"))
     }
 }
 

@@ -111,6 +111,8 @@ where
 
     async fn prove_secp_sign(&self, signature: PsyCompressedSecp256K1Signature) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>>;
 
+    async fn prove_eth_personal_secp_sign(&self, signature: PsyCompressedSecp256K1Signature) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>>;
+
     async fn register_dpn_software_defined_circuit(
         &self,
         fn_def: DPNFunctionCircuitDefinition,
@@ -170,6 +172,10 @@ where
     async fn secp_circuit_fingerprint(&self) -> anyhow::Result<QHashOut<C::F>>;
 
     async fn secp_circuit_verifier_config(&self) -> anyhow::Result<VerifierOnlyCircuitData<C, D>>;
+
+    async fn eth_personal_secp_circuit_fingerprint(&self) -> anyhow::Result<QHashOut<C::F>>;
+
+    async fn eth_personal_secp_circuit_verifier_config(&self) -> anyhow::Result<VerifierOnlyCircuitData<C, D>>;
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), maybe_async)]
@@ -293,6 +299,10 @@ where
         (**self).prove_secp_sign(signature).await
     }
 
+    async fn prove_eth_personal_secp_sign(&self, signature: PsyCompressedSecp256K1Signature) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
+        (**self).prove_eth_personal_secp_sign(signature).await
+    }
+
     async fn register_dpn_software_defined_circuit(
         &self,
         fn_def: DPNFunctionCircuitDefinition,
@@ -401,6 +411,14 @@ where
 
     async fn secp_circuit_verifier_config(&self) -> anyhow::Result<VerifierOnlyCircuitData<C, D>> {
         (**self).secp_circuit_verifier_config().await
+    }
+
+    async fn eth_personal_secp_circuit_fingerprint(&self) -> anyhow::Result<QHashOut<C::F>> {
+        (**self).eth_personal_secp_circuit_fingerprint().await
+    }
+
+    async fn eth_personal_secp_circuit_verifier_config(&self) -> anyhow::Result<VerifierOnlyCircuitData<C, D>> {
+        (**self).eth_personal_secp_circuit_verifier_config().await
     }
 }
 
@@ -525,6 +543,10 @@ where
         (**self).prove_secp_sign(signature).await
     }
 
+    async fn prove_eth_personal_secp_sign(&self, signature: PsyCompressedSecp256K1Signature) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
+        (**self).prove_eth_personal_secp_sign(signature).await
+    }
+
     async fn register_dpn_software_defined_circuit(
         &self,
         fn_def: DPNFunctionCircuitDefinition,
@@ -633,6 +655,14 @@ where
 
     async fn secp_circuit_verifier_config(&self) -> anyhow::Result<VerifierOnlyCircuitData<C, D>> {
         (**self).secp_circuit_verifier_config().await
+    }
+
+    async fn eth_personal_secp_circuit_fingerprint(&self) -> anyhow::Result<QHashOut<C::F>> {
+        (**self).eth_personal_secp_circuit_fingerprint().await
+    }
+
+    async fn eth_personal_secp_circuit_verifier_config(&self) -> anyhow::Result<VerifierOnlyCircuitData<C, D>> {
+        (**self).eth_personal_secp_circuit_verifier_config().await
     }
 }
 

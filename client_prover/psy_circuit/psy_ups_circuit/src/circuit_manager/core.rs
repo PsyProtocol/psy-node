@@ -21,7 +21,9 @@ use psy_client_data::{
 };
 use psy_common_circuit::{
     circuits::{
-        secp256k1_signature::Secp256K1SignatureCircuit, traits::qstandard::QStandardCircuit, zk_signature3::core::PsyBasicZKSignatureCircuit,
+        secp256k1_signature::{EthPersonalSignSecp256K1SignatureCircuit, Secp256K1SignatureCircuit},
+        traits::qstandard::QStandardCircuit,
+        zk_signature3::core::PsyBasicZKSignatureCircuit,
     },
     treeprover::qrecursion::standard::manager::{
         leaf_circuit_set::QStandardBinaryRecursionTreeCircuitSet, portable::circuits::PortableQTreeRecursionCircuits,
@@ -80,6 +82,7 @@ where
 
     zk_signature_minifier_circuit: OnceLock<PsyBasicZKSignatureCircuit<C, D>>,
     secp_circuit: OnceLock<Secp256K1SignatureCircuit<C, D>>,
+    eth_personal_secp_circuit: OnceLock<EthPersonalSignSecp256K1SignatureCircuit<C, D>>,
     // Server-side minifier circuits (base+minifier) for the wallet's base-only privacy
     // proofs. The wallet produces base proofs; these minify them.
     private_note_inclusion_minifier_circuit: OnceLock<PrivateNoteInclusionCircuit<C, D>>,
@@ -160,6 +163,7 @@ where
             contract_method_ids: Cache::new(1000),
             zk_signature_minifier_circuit: OnceLock::new(),
             secp_circuit: OnceLock::new(),
+            eth_personal_secp_circuit: OnceLock::new(),
             private_note_inclusion_minifier_circuit: OnceLock::new(),
             shield_deposit_claim_minifier_circuit: OnceLock::new(),
         }
@@ -171,6 +175,11 @@ where
 
     pub fn secp_circuit(&self) -> &Secp256K1SignatureCircuit<C, D> {
         self.secp_circuit.get_or_init(Secp256K1SignatureCircuit::new)
+    }
+
+    pub fn eth_personal_secp_circuit(&self) -> &EthPersonalSignSecp256K1SignatureCircuit<C, D> {
+        self.eth_personal_secp_circuit
+            .get_or_init(EthPersonalSignSecp256K1SignatureCircuit::new)
     }
 
     pub fn private_note_inclusion_minifier_circuit(&self) -> &PrivateNoteInclusionCircuit<C, D> {
@@ -465,6 +474,10 @@ where
         self.secp_circuit().prove(&signature)
     }
 
+    async fn prove_eth_personal_secp_sign(&self, signature: PsyCompressedSecp256K1Signature) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
+        self.eth_personal_secp_circuit().prove(&signature)
+    }
+
     async fn register_dpn_software_defined_circuit(
         &self,
         _fn_def: psy_vm::dpn::vm::def::DPNFunctionCircuitDefinition,
@@ -573,6 +586,14 @@ where
 
     async fn secp_circuit_verifier_config(&self) -> anyhow::Result<VerifierOnlyCircuitData<C, D>> {
         Ok(self.secp_circuit().get_verifier_config_ref().clone().into())
+    }
+
+    async fn eth_personal_secp_circuit_fingerprint(&self) -> anyhow::Result<QHashOut<C::F>> {
+        Ok(self.eth_personal_secp_circuit().get_fingerprint())
+    }
+
+    async fn eth_personal_secp_circuit_verifier_config(&self) -> anyhow::Result<VerifierOnlyCircuitData<C, D>> {
+        Ok(self.eth_personal_secp_circuit().get_verifier_config_ref().clone().into())
     }
 }
 

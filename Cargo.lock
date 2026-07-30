@@ -6405,11 +6405,13 @@ dependencies = [
  "psy_client_data",
  "psy_config",
  "psy_crypto",
+ "psy_plonky2_common_circuits",
  "psy_vm",
  "rand 0.8.5",
  "rand_chacha 0.3.1",
  "serde",
  "serde_json",
+ "tiny-keccak",
  "tokio",
  "tracing",
 ]
@@ -6487,6 +6489,7 @@ dependencies = [
  "serde_with 3.16.1",
  "sha2",
  "static_assertions",
+ "tiny-keccak",
  "tracing",
  "ts-rs",
 ]
