@@ -93,7 +93,7 @@ where
             ));
         }
         */
-        let (guta_queue_gatherer, guta_join_handle) = EphemeralQueueGathererWithTree::new_with_is_active::<
+        let (guta_queue_gatherer, guta_join_handle) = EphemeralQueueGathererWithTree::new_with_status::<
             GUTAUpdateQueue,
             RealmGUTAEndCapGathererConfig<N, TempDatabase, FileSystem>,
             N::QHash,
@@ -104,7 +104,7 @@ where
             guta_create_builder_config,
             db.guta_queue_key_status_manager.get_queue_key()?,
             global_user_tree,
-            db.is_active.clone(),
+            db.status.clone(),
         );
 
         Ok((

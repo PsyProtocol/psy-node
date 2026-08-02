@@ -3,6 +3,7 @@ use psy_client_common::data::alt::AltVerifierOnlyCircuitData;
 use psy_common_circuit::circuits::traits::qstandard::QStandardCircuit;
 use psy_config::PSY_NETWORK_MAGIC;
 use psy_ups_circuit::circuit_manager::core::PsyUPSStepCircuitManager;
+use psy_vm::ups::circuit_manager::UPSCircuitManager;
 
 type C = PoseidonGoldilocksConfig;
 const D: usize = 2;
@@ -20,8 +21,8 @@ pub async fn run() -> anyhow::Result<()> {
     println!("alt_verify_data: {:?}", alt_verify_data);
     println!("alt_verify_data: {}", serde_json::to_string(&alt_verify_data)?);
 
-    let zk_fingerprint = circuit_manager.zk_circuit.get_fingerprint();
-    let secp_fingerprint = circuit_manager.secp_circuit.get_fingerprint();
+    let zk_fingerprint = circuit_manager.zk_signature_minifier_fingerprint().await?;
+    let secp_fingerprint = circuit_manager.secp_circuit().get_fingerprint();
     println!("zk_fingerprint: {}", zk_fingerprint);
     println!("secp_fingerprint: {}", secp_fingerprint);
 

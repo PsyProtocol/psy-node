@@ -21,17 +21,18 @@ use crate::hash::keccak::keccak256_u32_words_be_abi;
 
 const WORDS_PER_BYTES32: usize = 8;
 pub const MAX_WITHDRAWAL_CLAIM_BATCH_SIZE: usize = 32;
-pub const WITHDRAWAL_BATCH_CLAIM_SLOT_WORDS: usize = 26;
+pub const WITHDRAWAL_BATCH_CLAIM_SLOT_WORDS: usize = 34;
 pub const WITHDRAWAL_BATCH_CLAIM_PUBLIC_INPUTS_WORDS: usize =
     WORDS_PER_BYTES32 + 2 + WORDS_PER_BYTES32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WithdrawalBatchClaimSlotInputs<F: RichField> {
+    pub sender_user_id: u32,
     pub recipient: [u32; WORDS_PER_BYTES32],
     pub token: [u32; WORDS_PER_BYTES32],
     pub amount: [u32; WORDS_PER_BYTES32],
-    pub nonce: u32,
-    pub dest_chain_id: u32,
+    pub nonce: [u32; WORDS_PER_BYTES32],
+    pub destination_chain_index: u32,
     pub leaf_index: u32,
     pub siblings: Vec<QHashOut<F>>,
 }
@@ -45,11 +46,12 @@ pub struct WithdrawalBatchClaimInputs<F: RichField> {
 
 #[derive(Debug)]
 pub struct WithdrawalBatchClaimSlotTargets {
+    pub sender_user_id: U32Target,
     pub recipient: [U32Target; WORDS_PER_BYTES32],
     pub token: [U32Target; WORDS_PER_BYTES32],
     pub amount: [U32Target; WORDS_PER_BYTES32],
-    pub nonce: U32Target,
-    pub dest_chain_id: U32Target,
+    pub nonce: [U32Target; WORDS_PER_BYTES32],
+    pub destination_chain_index: U32Target,
     pub leaf_index: U32Target,
     pub leaf_hash: HashOutTarget,
 }
@@ -92,28 +94,29 @@ where
             Vec::with_capacity(MAX_WITHDRAWAL_CLAIM_BATCH_SIZE * WITHDRAWAL_BATCH_CLAIM_SLOT_WORDS);
 
         for i in 0..MAX_WITHDRAWAL_CLAIM_BATCH_SIZE {
+            let sender_user_id = builder.add_virtual_u32_target();
             let recipient = add_virtual_u32x8(&mut builder);
             let token = add_virtual_u32x8(&mut builder);
             let amount = add_virtual_u32x8(&mut builder);
-            let nonce = builder.add_virtual_u32_target();
-            let dest_chain_id = builder.add_virtual_u32_target();
+            let nonce = add_virtual_u32x8(&mut builder);
+            let destination_chain_index = builder.add_virtual_u32_target();
             let leaf_index = builder.add_virtual_u32_target();
 
             let leaf_hash = builder.hash_n_to_hash_no_pad::<PoseidonHash>(
-                recipient
-                    .iter()
-                    .chain(token.iter())
-                    .chain(amount.iter())
-                    .map(|v| v.0)
-                    .chain([nonce.0, dest_chain_id.0])
+                std::iter::once(sender_user_id.0)
+                    .chain(recipient.iter().map(|v| v.0))
+                    .chain(token.iter().map(|v| v.0))
+                    .chain(amount.iter().map(|v| v.0))
+                    .chain(nonce.iter().map(|v| v.0))
+                    .chain(std::iter::once(destination_chain_index.0))
                     .collect::<Vec<_>>(),
             );
-            let slot_data_words = recipient
-                .iter()
-                .chain(token.iter())
-                .chain(amount.iter())
-                .map(|v| v.0)
-                .chain([nonce.0, dest_chain_id.0])
+            let slot_data_words = std::iter::once(sender_user_id.0)
+                .chain(recipient.iter().map(|v| v.0))
+                .chain(token.iter().map(|v| v.0))
+                .chain(amount.iter().map(|v| v.0))
+                .chain(nonce.iter().map(|v| v.0))
+                .chain(std::iter::once(destination_chain_index.0))
                 .collect::<Vec<_>>();
 
             let merkle_proof = MerkleProofGadget::add_virtual_to_with_options::<PoseidonHash, C::F, D>(
@@ -133,11 +136,18 @@ where
 
             builder.connect_hashes_if_true(is_active, merkle_proof.root, withdrawal_root_target);
 
-            for word in recipient.iter().chain(token.iter()).chain(amount.iter()) {
+            // Zero sender_user_id for inactive padding slots (P2 fix).
+            // The loop below starts at recipient and omits sender_user_id.
+            builder.connect_zero_if_true(is_inactive, sender_user_id.0);
+            for word in recipient
+                .iter()
+                .chain(token.iter())
+                .chain(amount.iter())
+                .chain(nonce.iter())
+            {
                 builder.connect_zero_if_true(is_inactive, word.0);
             }
-            builder.connect_zero_if_true(is_inactive, nonce.0);
-            builder.connect_zero_if_true(is_inactive, dest_chain_id.0);
+            builder.connect_zero_if_true(is_inactive, destination_chain_index.0);
             builder.connect_zero_if_true(is_inactive, leaf_index.0);
             for sibling in &merkle_proof.siblings {
                 builder.connect_hashes_if_false(is_active, *sibling, zero_hash);
@@ -146,11 +156,12 @@ where
             merkle_proofs.push(merkle_proof);
             batch_commit_words.extend(slot_data_words);
             slot_targets.push(WithdrawalBatchClaimSlotTargets {
+                sender_user_id,
                 recipient,
                 token,
                 amount,
                 nonce,
-                dest_chain_id,
+                destination_chain_index,
                 leaf_index,
                 leaf_hash,
             });
@@ -204,50 +215,43 @@ where
                     merkle_proof.siblings.len(),
                     real.siblings.len()
                 );
+                pw.set_target(slot.sender_user_id.0, C::F::from_canonical_u32(real.sender_user_id))?;
                 set_u32x8_targets::<C::F>(&mut pw, &slot.recipient, &real.recipient)?;
                 set_u32x8_targets::<C::F>(&mut pw, &slot.token, &real.token)?;
                 set_u32x8_targets::<C::F>(&mut pw, &slot.amount, &real.amount)?;
-                pw.set_target(slot.nonce.0, C::F::from_canonical_u32(real.nonce))?;
+                set_u32x8_targets::<C::F>(&mut pw, &slot.nonce, &real.nonce)?;
                 pw.set_target(
-                    slot.dest_chain_id.0,
-                    C::F::from_canonical_u32(real.dest_chain_id),
+                    slot.destination_chain_index.0,
+                    C::F::from_canonical_u32(real.destination_chain_index),
                 )?;
                 pw.set_target(slot.leaf_index.0, C::F::from_canonical_u32(real.leaf_index))?;
                 merkle_proof.set_witness(
                     &mut pw,
                     C::F::from_canonical_u32(real.leaf_index),
                     poseidon_hash_u32_words(
-                        real.recipient
-                            .iter()
-                            .chain(real.token.iter())
-                            .chain(real.amount.iter())
-                            .copied()
-                            .map(|v| v as u64)
-                            .chain([real.nonce as u64, real.dest_chain_id as u64]),
+                        std::iter::once(real.sender_user_id as u64)
+                            .chain(real.recipient.iter().copied().map(|v| v as u64))
+                            .chain(real.token.iter().copied().map(|v| v as u64))
+                            .chain(real.amount.iter().copied().map(|v| v as u64))
+                            .chain(real.nonce.iter().copied().map(|v| v as u64))
+                            .chain(std::iter::once(real.destination_chain_index as u64)),
                     ),
                     &real.siblings,
                 )?;
             } else {
                 let zero_words = [0u32; WORDS_PER_BYTES32];
                 let zero_siblings = vec![QHashOut::ZERO; merkle_proof.siblings.len()];
+                pw.set_target(slot.sender_user_id.0, C::F::ZERO)?;
                 set_u32x8_targets::<C::F>(&mut pw, &slot.recipient, &zero_words)?;
                 set_u32x8_targets::<C::F>(&mut pw, &slot.token, &zero_words)?;
                 set_u32x8_targets::<C::F>(&mut pw, &slot.amount, &zero_words)?;
-                pw.set_target(slot.nonce.0, C::F::ZERO)?;
-                pw.set_target(slot.dest_chain_id.0, C::F::ZERO)?;
+                set_u32x8_targets::<C::F>(&mut pw, &slot.nonce, &zero_words)?;
+                pw.set_target(slot.destination_chain_index.0, C::F::ZERO)?;
                 pw.set_target(slot.leaf_index.0, C::F::ZERO)?;
                 merkle_proof.set_witness(
                     &mut pw,
                     C::F::ZERO,
-                    poseidon_hash_u32_words(
-                        zero_words
-                            .iter()
-                            .chain(zero_words.iter())
-                            .chain(zero_words.iter())
-                            .copied()
-                            .map(|v| v as u64)
-                            .chain([0u64, 0u64]),
-                    ),
+                    poseidon_hash_u32_words(std::iter::empty()),
                     &zero_siblings,
                 )?;
             }
@@ -351,18 +355,18 @@ mod tests {
         let recipient = sample_words(10);
         let token = sample_words(100);
         let amount = [0, 0, 0, 0, 0, 0, 0, 123];
-        let nonce = 77;
-        let dest_chain_id = 0;
+        let sender_user_id = 42;
+        let nonce = sample_words(77);
+        let destination_chain_index = 0;
         let leaf_index = 0;
         let siblings = zero_siblings(32);
         let leaf = poseidon_hash_u32_words(
-            recipient
-                .iter()
-                .chain(token.iter())
-                .chain(amount.iter())
-                .copied()
-                .map(|v| v as u64)
-                .chain([nonce as u64, dest_chain_id as u64]),
+            std::iter::once(sender_user_id as u64)
+                .chain(recipient.iter().copied().map(|v| v as u64))
+                .chain(token.iter().copied().map(|v| v as u64))
+                .chain(amount.iter().copied().map(|v| v as u64))
+                .chain(nonce.iter().copied().map(|v| v as u64))
+                .chain(std::iter::once(destination_chain_index as u64)),
         );
         let root = compute_root_merkle_proof_generic::<QHashOut<F>, PoseidonHash>(
             leaf,
@@ -373,11 +377,12 @@ mod tests {
             withdrawal_root: root,
             bridge_user_id: 524_288,
             withdrawals: vec![WithdrawalBatchClaimSlotInputs {
+                sender_user_id,
                 recipient,
                 token,
                 amount,
                 nonce,
-                dest_chain_id,
+                destination_chain_index,
                 leaf_index,
                 siblings,
             }],
@@ -396,26 +401,29 @@ mod tests {
         let recipient = sample_words(1);
         let token = sample_words(11);
         let amount = [0, 0, 0, 0, 0, 0, 0, 9];
+        let sender_user_id = 7;
+        let nonce = sample_words(1);
+        let destination_chain_index = 0;
         let siblings = zero_siblings(32);
         let leaf = poseidon_hash_u32_words(
-            recipient
-                .iter()
-                .chain(token.iter())
-                .chain(amount.iter())
-                .copied()
-                .map(|v| v as u64)
-                .chain([1u64, 0u64]),
+            std::iter::once(sender_user_id as u64)
+                .chain(recipient.iter().copied().map(|v| v as u64))
+                .chain(token.iter().copied().map(|v| v as u64))
+                .chain(amount.iter().copied().map(|v| v as u64))
+                .chain(nonce.iter().copied().map(|v| v as u64))
+                .chain(std::iter::once(destination_chain_index as u64)),
         );
         let root = compute_root_merkle_proof_generic::<QHashOut<F>, PoseidonHash>(leaf, 0, &siblings);
         let inputs = WithdrawalBatchClaimInputs::<F> {
             withdrawal_root: root,
             bridge_user_id: 524_288,
             withdrawals: vec![WithdrawalBatchClaimSlotInputs {
+                sender_user_id,
                 recipient,
                 token,
                 amount,
-                nonce: 1,
-                dest_chain_id: 0,
+                nonce,
+                destination_chain_index,
                 leaf_index: 0,
                 siblings,
             }],

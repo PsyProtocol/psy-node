@@ -543,19 +543,38 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleDPNBuilder<F, D> {
             }
             DPNOpType::HashNoPad => {
                 let targets = self.resolve_targets(&op.inputs);
-                let output = builder.hash_n_to_hash_no_pad::<PsyHasher>(targets);
+                // Isolate inputs: fresh virtual targets so each hash call's internal
+                // wires are independent even when multiple HashNoPad ops share inputs.
+                let fresh_targets: Vec<Target> = targets
+                    .iter()
+                    .map(|&t| {
+                        let new_t = builder.add_virtual_target();
+                        builder.connect(t, new_t);
+                        new_t
+                    })
+                    .collect();
+                let output = builder.hash_n_to_hash_no_pad::<PsyHasher>(fresh_targets);
+                // Isolate outputs: prevents TargetAt(HashOut, k) from reading the raw
+                // permutation output wire, avoiding cross-hash wire partition conflicts.
+                let fresh_output = HashOutTarget {
+                    elements: output.elements.map(|e| {
+                        let new_e = builder.add_virtual_target();
+                        builder.connect(e, new_e);
+                        new_e
+                    }),
+                };
                 if matches!(op.index, 0 | 1) {
                     tracing::info!(
                         op_index = op.index,
-                        inputs = ?op.inputs,
-                        out0 = ?output.elements[0],
-                        out1 = ?output.elements[1],
-                        out2 = ?output.elements[2],
-                        out3 = ?output.elements[3],
+                        input_count = op.inputs.len(),
+                        out0 = ?fresh_output.elements[0],
+                        out1 = ?fresh_output.elements[1],
+                        out2 = ?fresh_output.elements[2],
+                        out3 = ?fresh_output.elements[3],
                         "DPN HashNoPad assigned"
                     );
                 }
-                self.set_hash_at(op.index as usize, output, "HashNoPad");
+                self.set_hash_at(op.index as usize, fresh_output, "HashNoPad");
             }
             DPNOpType::HashTwoToOne => {
                 assert_eq!(op.inputs.len(), 8, "HashTwoToOne requires exactly 8 inputs");
@@ -998,15 +1017,17 @@ mod tests {
     use plonky2::{
         field::{goldilocks_field::GoldilocksField, types::Field},
         hash::hash_types::HashOutTarget,
-        iop::target::Target,
-        plonk::circuit_data::CircuitConfig,
+        iop::witness::{PartialWitness, WitnessWrite},
+        plonk::{circuit_data::CircuitConfig, config::PoseidonGoldilocksConfig},
     };
+    use psy_client_data::config::store_config::PsyHasher;
     use psy_vm::dpn::ops::op_types::{encode_indexed_op_id, DPNBuiltInDataType};
 
     use super::*;
 
     const D: usize = 2;
     type F = GoldilocksField;
+    type C = PoseidonGoldilocksConfig;
 
     fn dummy_hash(builder: &mut CircuitBuilder<F, D>) -> HashOutTarget {
         HashOutTarget {
@@ -1076,5 +1097,154 @@ mod tests {
         assert_eq!(executor.hashes.len(), 8);
         assert_eq!(executor.hashes[0], None);
         assert_eq!(executor.hashes[6], None);
+    }
+
+    #[test]
+    fn poseidon_hash_no_pad_two_calls_prove() {
+        let config = CircuitConfig::standard_recursion_config();
+        let mut builder = CircuitBuilder::<F, D>::new(config);
+
+        let inputs_a = (0..35).map(|_| builder.add_virtual_target()).collect::<Vec<_>>();
+        let inputs_b = (0..8).map(|_| builder.add_virtual_target()).collect::<Vec<_>>();
+
+        let hash_a = builder.hash_n_to_hash_no_pad::<PsyHasher>(inputs_a.clone());
+        let hash_b = builder.hash_n_to_hash_no_pad::<PsyHasher>(inputs_b.clone());
+
+        for target in hash_a.elements.into_iter().chain(hash_b.elements) {
+            builder.register_public_input(target);
+        }
+
+        let data = builder.build::<C>();
+        let mut pw = PartialWitness::new();
+        for (i, target) in inputs_a.into_iter().chain(inputs_b).enumerate() {
+            pw.set_target(target, F::from_canonical_u64((i + 1) as u64)).unwrap();
+        }
+
+        let proof = data.prove(pw).expect("two plain hash_no_pad calls should prove");
+        data.verify(proof).expect("two plain hash_no_pad calls should verify");
+    }
+
+    #[test]
+    fn dpn_hash_no_pad_two_ops_prove() {
+        let config = CircuitConfig::standard_recursion_config();
+        let mut builder = CircuitBuilder::<F, D>::new(config);
+        let mut executor = new_test_builder(&mut builder);
+
+        let mut witness_targets = Vec::new();
+        for index in 0..43usize {
+            let target = builder.add_virtual_target();
+            executor.push_external_target(index, target);
+            witness_targets.push(target);
+        }
+
+        let op_a = DPNIndexedVarDef {
+            data_type: DPNBuiltInDataType::HashOut,
+            index: 0,
+            op_type: DPNOpType::HashNoPad,
+            inputs: (0..35).map(|i| encode_indexed_op_id(DPNBuiltInDataType::Target, i)).collect(),
+        };
+        let op_b = DPNIndexedVarDef {
+            data_type: DPNBuiltInDataType::HashOut,
+            index: 1,
+            op_type: DPNOpType::HashNoPad,
+            inputs: (35..43).map(|i| encode_indexed_op_id(DPNBuiltInDataType::Target, i)).collect(),
+        };
+
+        executor.process_var_def(&mut builder, &op_a);
+        executor.process_var_def(&mut builder, &op_b);
+
+        let hash_a = executor.resolve_hash(encode_indexed_op_id(DPNBuiltInDataType::HashOut, 0));
+        let hash_b = executor.resolve_hash(encode_indexed_op_id(DPNBuiltInDataType::HashOut, 1));
+        for target in hash_a.elements.into_iter().chain(hash_b.elements) {
+            builder.register_public_input(target);
+        }
+
+        let data = builder.build::<C>();
+        let mut pw = PartialWitness::new();
+        for (i, target) in witness_targets.into_iter().enumerate() {
+            pw.set_target(target, F::from_canonical_u64((i + 1) as u64)).unwrap();
+        }
+
+        let proof = data.prove(pw).expect("two DPN HashNoPad ops should prove");
+        data.verify(proof).expect("two DPN HashNoPad ops should verify");
+    }
+
+    #[test]
+    fn poseidon_hash_no_pad_two_calls_with_shared_inputs_prove() {
+        let config = CircuitConfig::standard_recursion_config();
+        let mut builder = CircuitBuilder::<F, D>::new(config);
+
+        let unique_a = (0..27).map(|_| builder.add_virtual_target()).collect::<Vec<_>>();
+        let shared = (0..8).map(|_| builder.add_virtual_target()).collect::<Vec<_>>();
+        let inputs_a = unique_a.iter().copied().chain(shared.iter().copied()).collect::<Vec<_>>();
+        let inputs_b = shared.clone();
+
+        let hash_a = builder.hash_n_to_hash_no_pad::<PsyHasher>(inputs_a.clone());
+        let hash_b = builder.hash_n_to_hash_no_pad::<PsyHasher>(inputs_b.clone());
+
+        for target in hash_a.elements.into_iter().chain(hash_b.elements) {
+            builder.register_public_input(target);
+        }
+
+        let data = builder.build::<C>();
+        let mut pw = PartialWitness::new();
+        for (i, target) in unique_a.into_iter().chain(shared.into_iter()).enumerate() {
+            pw.set_target(target, F::from_canonical_u64((i + 1) as u64)).unwrap();
+        }
+
+        let proof = data.prove(pw).expect("two plain hash_no_pad calls with shared inputs should prove");
+        data.verify(proof).expect("two plain hash_no_pad calls with shared inputs should verify");
+    }
+
+    #[test]
+    fn dpn_hash_no_pad_two_ops_with_shared_inputs_prove() {
+        let config = CircuitConfig::standard_recursion_config();
+        let mut builder = CircuitBuilder::<F, D>::new(config);
+        let mut executor = new_test_builder(&mut builder);
+
+        let mut unique_targets = Vec::new();
+        for index in 0..27usize {
+            let target = builder.add_virtual_target();
+            executor.push_external_target(index, target);
+            unique_targets.push(target);
+        }
+
+        let mut shared_targets = Vec::new();
+        for index in 27..35usize {
+            let target = builder.add_virtual_target();
+            executor.push_external_target(index, target);
+            shared_targets.push(target);
+        }
+
+        let op_a = DPNIndexedVarDef {
+            data_type: DPNBuiltInDataType::HashOut,
+            index: 0,
+            op_type: DPNOpType::HashNoPad,
+            inputs: (0..35).map(|i| encode_indexed_op_id(DPNBuiltInDataType::Target, i)).collect(),
+        };
+        let op_b = DPNIndexedVarDef {
+            data_type: DPNBuiltInDataType::HashOut,
+            index: 1,
+            op_type: DPNOpType::HashNoPad,
+            inputs: (27..35).map(|i| encode_indexed_op_id(DPNBuiltInDataType::Target, i)).collect(),
+        };
+
+        executor.process_var_def(&mut builder, &op_a);
+        executor.process_var_def(&mut builder, &op_b);
+
+        let hash_a = executor.resolve_hash(encode_indexed_op_id(DPNBuiltInDataType::HashOut, 0));
+        let hash_b = executor.resolve_hash(encode_indexed_op_id(DPNBuiltInDataType::HashOut, 1));
+        for target in hash_a.elements.into_iter().chain(hash_b.elements) {
+            builder.register_public_input(target);
+        }
+
+        let data = builder.build::<C>();
+        let mut pw = PartialWitness::new();
+        for (i, target) in unique_targets.into_iter().chain(shared_targets.into_iter()).enumerate() {
+            pw.set_target(target, F::from_canonical_u64((i + 1) as u64)).unwrap();
+        }
+
+        let proof = data.prove(pw).expect("two DPN HashNoPad ops with shared inputs should prove");
+        data.verify(proof).expect("two DPN HashNoPad ops with shared inputs should verify");
     }
 }

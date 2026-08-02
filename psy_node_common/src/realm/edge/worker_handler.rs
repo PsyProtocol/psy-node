@@ -346,17 +346,20 @@ impl<
 
         timer.lap_micros("set_proving_job_metadata");
 
-        // Store claim tag on input-witness key (separate from output key used for finalized reward value)
-        // to avoid claim-tag / reward-value slot aliasing under concurrent claim/submit attempts.
+        // Store the worker's claim tag under the dedicated claim-tag key namespace
+        // (TEMP_TABLE_ID_PROOF_CLAIM_TAG), which is distinct from the finalized reward-tree
+        // value key (TEMP_TABLE_ID_TAG_TREE_VALUES). Input/output JobId alone does not
+        // guarantee separation, since a job's output id can equal another job's input
+        // witness id across the dependency graph; the distinct table-id prefix does.
         self.temp_db
-            .set_proof_miner_rewards_tree_value(
+            .set_proof_claim_tag(
                 &self.realm_identifier,
                 unique_pending_id,
                 response.job.job_id.get_input_witness_id(),
                 N::QHash::from_ref_32bytes(&request.tag),
             )
             .await?;
-        timer.lap_micros("set_proof_miner_rewards_tree_value");
+        timer.lap_micros("set_proof_claim_tag");
         let claim_time_ms = chrono::Utc::now().timestamp_millis() as u64;
         self.temp_db
             .set_job_claim(
@@ -399,9 +402,11 @@ impl<
         let proof_bytes = Arc::new(proof_bytes);
 
         // HACK: check to make sure the tag matches. If not, job was completed by another worker (stolen) - slash submitter.
+        // The expected tag is read from the dedicated claim-tag key namespace, not the
+        // finalized reward-tree value key, so it can never observe a finalized reward value.
         let expected_tag = self
             .temp_db
-            .get_proof_miner_rewards_tree_value(&self.realm_identifier, unique_pending_id, job_id.get_input_witness_id())
+            .get_proof_claim_tag(&self.realm_identifier, unique_pending_id, job_id.get_input_witness_id())
             .await?;
         if expected_tag != tag {
             self.temp_db
@@ -409,7 +414,7 @@ impl<
                 .await?;
             anyhow::bail!("Submitted tag does not match expected tag for job id");
         }
-        timer.lap_micros("get_proof_miner_rewards_tree_value");
+        timer.lap_micros("get_proof_claim_tag");
 
         let metadata: PsyProvingJobMetadata<N::QHash, N::JobId> = self
             .temp_db
@@ -494,9 +499,12 @@ impl<
             .await?;
         timer.lap_micros("put_proof_bytes_for_job_id");
 
-        if let Some((public_key, claim_time_ms)) = job_claim {
+        let job_duration_ms = job_claim.as_ref().map(|(_, claim_time_ms)| {
+            (chrono::Utc::now().timestamp_millis() as u64).saturating_sub(*claim_time_ms)
+        });
+        if let Some((public_key, claim_time_ms)) = job_claim.as_ref() {
             self.temp_db
-                .apply_reputation_on_submit(&self.realm_identifier, &public_key, claim_time_ms)
+                .apply_reputation_on_submit(&self.realm_identifier, public_key, *claim_time_ms)
                 .await?;
             timer.lap_micros("update_worker_reputation");
         } else {
@@ -599,6 +607,23 @@ impl<
             .worker_queue_report_job_completed(&queue_key, self.realm_id_u64, self.realm_sub_id_u64, unique_proc_id, 0, &item)
             .await?;
         timer.lap_micros("worker_queue_report_job_completed");
+
+        if let Some(duration_ms) = job_duration_ms {
+            if let Err(error) = self
+                .temp_db
+                .increment_job_stats(&self.realm_identifier, unique_pending_id, duration_ms)
+                .await
+            {
+                tracing::warn!(
+                    checkpoint_unique_pending_id = unique_pending_id,
+                    duration_ms,
+                    ?job_id,
+                    %error,
+                    "failed to record realm proof job statistics"
+                );
+            }
+        }
+
         timer.lap_group("submit_proof_raw_internal");
 
         Ok(())

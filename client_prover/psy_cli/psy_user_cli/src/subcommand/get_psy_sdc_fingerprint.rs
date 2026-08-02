@@ -2,11 +2,11 @@ use psy_config::network_constants::{DEFAULT_CALLER_CONTRACT_ID_U64, MAX_CONTRACT
 use psy_ups_circuit::signature::software_defined::DPNSoftwareDefinedSignatureGadget;
 use psy_vm::dpn::vm::def::DPNFunctionCircuitDefinition;
 
-use crate::subcommand::args::GetPsySdcFingerprintArgs;
+use crate::{result::{CommandResult, FingerprintResult}, subcommand::args::GetPsySdcFingerprintArgs};
 
 type F = plonky2::field::goldilocks_field::GoldilocksField;
 const D: usize = 2;
-pub async fn run(args: GetPsySdcFingerprintArgs) -> anyhow::Result<()> {
+pub async fn run(args: GetPsySdcFingerprintArgs) -> anyhow::Result<CommandResult> {
     let fn_def_str = std::fs::read_to_string(&args.sdc_path).map_err(|e| anyhow::format_err!("read sdc file error: {}", e))?;
     let fn_def =
         serde_json::from_str::<DPNFunctionCircuitDefinition>(&fn_def_str).map_err(|e| anyhow::format_err!("deserialize sdc file error: {}", e))?;
@@ -30,5 +30,5 @@ pub async fn run(args: GetPsySdcFingerprintArgs) -> anyhow::Result<()> {
 
     tracing::info!("register PSY software defined circuit: {}", fingerprint.to_string());
 
-    Ok(())
+    Ok(CommandResult::Fingerprint(FingerprintResult { fingerprint: fingerprint.to_string() }))
 }

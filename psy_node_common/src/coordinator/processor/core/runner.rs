@@ -1,4 +1,3 @@
-use std::sync::atomic::Ordering;
 
 use cf_utils::log_indicator::print_cf_log_indicator;
 use parth_core::protocol::core_types::QNetworkTypesConfig;
@@ -47,13 +46,13 @@ where
 {
     let realm_id = processor.db.ids.realm_id_u64;
     let realm_sub_id = processor.db.ids.realm_sub_id_u64;
+    processor.db.status.mark_running();
     print_cf_log_indicator("PSY_COORDINATOR_PROCESSOR_STARTED", &format!("R{}_{}", realm_id, realm_sub_id));
 
     let mut last_slot: u128 = 0;
 
     loop {
-        let is_active = processor.db.is_active.load(Ordering::SeqCst);
-        if is_active {
+        if processor.db.status.should_run() {
             let now = std::time::SystemTime::now();
             let since_epoch = now.duration_since(std::time::UNIX_EPOCH).unwrap();
             let current_ms = since_epoch.as_millis();
@@ -74,18 +73,24 @@ where
                         tracing::info!("Generated block in {}ms at slot {}", duration_ms, current_slot);
                     }
                     Err(e) => {
-                        tracing::error!("[COORDINATOR] Error processing block: {:?}, took {}ms at slot {}", e, duration_ms, current_slot);
+                        let error = format!("coordinator process_block failed at slot {}: {:#}", current_slot, e);
+                        processor.db.status.set_error(error.clone());
+                        tracing::error!("[COORDINATOR] Fatal error processing block: {:?}, took {}ms at slot {}; processor parked in Error state until manually restarted", e, duration_ms, current_slot);
+                        print_cf_log_indicator("PSY_COORDINATOR_PROCESSOR_ERROR", &format!("R{}_{}", realm_id, realm_sub_id));
                     }
                 }
             } else {
                 sleep(std::time::Duration::from_millis(50)).await;
             }
+        } else if processor.db.status.state() == crate::utils::processor_status::ProcessorState::Error {
+            sleep(std::time::Duration::from_secs(1)).await;
         } else {
             tracing::info!("Coordinator Processor is shutting down gracefully.");
             break;
         }
     }
 
+    processor.db.status.mark_stopped();
     print_cf_log_indicator("PSY_COORDINATOR_PROCESSOR_STOPPED", &format!("R{}_{}", realm_id, realm_sub_id));
 
     Ok(())
@@ -122,24 +127,29 @@ where
     N: 'static,
     FileSystem::File: Send + Sync + 'static,
 {
-
-    let is_active = processor.db.is_active.clone();
+    let status = processor.db.status.clone();
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::select! {
         _ = ctrl_c => {
             tracing::info!("Ctrl-C signal received, cleaning up...");
-            is_active.store(false, Ordering::SeqCst);
+            status.begin_shutdown();
             sleep(std::time::Duration::from_secs(5)).await;
             Ok(())
         }
-        _ = async {
-            tokio::try_join!(
+        result = async {
+            let (processor_result, guta_result, register_result, deploy_result) = tokio::try_join!(
                 tokio::spawn(run_coordinator_processor_loop(processor)),
                 guta_gatherer_join_handle,
                 register_users_gatherer_join_handle,
                 deploy_contracts_gatherer_join_handle,
-            )
+            )?;
+            processor_result?;
+            guta_result?;
+            register_result?;
+            deploy_result?;
+            Ok::<(), anyhow::Error>(())
         } => {
+            result?;
             tracing::info!("All coordinator processor threads completed");
             Ok(())
         }

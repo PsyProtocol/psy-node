@@ -98,6 +98,8 @@ pub enum RequestParams<F: RichField> {
     SubmitEndCap(QSubmitEndCapRPCRequest<F>),
     #[serde(rename = "psy_submit_user_end_cap_batch")]
     SubmitEndCapProofs(Vec<Vec<(SubmitUserEndCapNonProofInput<F>, Vec<u8>)>>),
+    #[serde(rename = "psy_get_user_end_cap_slot_updates")]
+    GetUserEndCapSlotUpdates(QGetUserEndCapSlotUpdatesRPCRequest),
 
     #[serde(rename = "psy_get_tx_status")]
     GetTxStatus(QGetTxStatusRPCRequest),
@@ -289,6 +291,10 @@ pub enum RequestParams<F: RichField> {
     ZKSignatureInnerProof(QSignatureInnerProofRPCRequest<F>),
     #[serde(rename = "psy_prove_zk_sign_minifier")]
     ZKSignatureMinifierProof(QSignatureMinifierProofRPCRequest),
+    #[serde(rename = "psy_prove_private_note_inclusion_minifier")]
+    PrivateNoteInclusionMinifierProof(QBaseProofMinifierRPCRequest),
+    #[serde(rename = "psy_prove_shield_deposit_claim_minifier")]
+    ShieldDepositClaimMinifierProof(QBaseProofMinifierRPCRequest),
     #[serde(rename = "psy_prove_secp_sign")]
     SECPSignatureProof(QSecpSignatureProofRPCRequest),
     #[serde(rename = "psy_register_dpn_software_defined_circuit")]
@@ -1339,6 +1345,12 @@ pub struct QSignatureMinifierProofRPCRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(bound = "")]
+pub struct QBaseProofMinifierRPCRequest {
+    pub base_proof: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(bound = "")]
 // #[ts(export, concrete(F = GoldilocksField))]
 pub struct QSecpSignatureProofRPCRequest {
     pub signature: PsyCompressedSecp256K1Signature,
@@ -1543,6 +1555,34 @@ pub struct QLeftAggRightLeafRpcRequestV2<C: GenericConfig<D>, const D: usize> {
     pub right_insert_leaf_proof: DeltaMerkleProofCore<QHashOut<C::F>>,
     pub right_proof: ProofWithPublicInputs<C::F, C, D>,
     pub right_verifier_data: AltVerifierOnlyCircuitData<C::F>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QGetUserEndCapSlotUpdatesRPCRequest {
+    pub unique_pending_id: u64,
+    pub user_id: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RealmSlotUpdate {
+    pub slot: u64,
+    pub old_value: u64,
+    pub new_value: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RealmContractSlotUpdates {
+    pub contract_id: u32,
+    pub slot_updates: Vec<RealmSlotUpdate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RealmEndCapSlotUpdates {
+    pub realm_id: u64,
+    pub realm_sub_id: u64,
+    pub unique_pending_id: u64,
+    pub user_id: u64,
+    pub contracts: Vec<RealmContractSlotUpdates>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

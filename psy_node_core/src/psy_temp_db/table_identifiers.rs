@@ -52,10 +52,85 @@ pub const TEMP_TABLE_ID_JOB_CLAIM_BYTES: [u8; 2] = [0x4A, 0x43]; // 'JC'
 pub const TEMP_TABLE_JOB_CLAIM_KEY_SIZE: usize = 40; // 4 + 2 + 2 + 8 + 24
 pub const TEMP_TABLE_JOB_CLAIM_VALUE_SIZE: usize = 41; // public_key 33 + claim_time_ms u64
 
+pub const TEMP_TABLE_ID_JOB_STATS: u16 = 0x534A; // 'JS'
+pub const TEMP_TABLE_ID_JOB_STATS_BYTES: [u8; 2] = [0x4A, 0x53]; // 'JS'
+pub const TEMP_TABLE_JOB_STATS_KEY_SIZE: usize = 17; // 4 + 2 + 2 + 8 + 1
+pub const JOB_STATS_COUNTER_COUNT: u8 = 0;
+pub const JOB_STATS_COUNTER_TOTAL_DURATION: u8 = 1;
+pub const JOB_STATS_COUNTER_MIN_DURATION: u8 = 2;
+pub const JOB_STATS_COUNTER_MAX_DURATION: u8 = 3;
+
 pub const TEMP_TABLE_ID_WORKER_REPUTATION: u16 = 0x5257; // 'WR'
 pub const TEMP_TABLE_ID_WORKER_REPUTATION_BYTES: [u8; 2] = [0x57, 0x52]; // 'WR'
 pub const TEMP_TABLE_WORKER_REPUTATION_KEY_SIZE: usize = 41; // 4 + 2 + 2 + 33 (compressed public key)
 pub const TEMP_TABLE_WORKER_REPUTATION_VALUE_SIZE: usize = 8; // u64
+
+#[inline(always)]
+fn tt_get_job_stats_key(
+    realm_id: u32,
+    realm_sub_id: u16,
+    unique_pending_id: u64,
+    counter_type: u8,
+) -> [u8; TEMP_TABLE_JOB_STATS_KEY_SIZE] {
+    let mut key = [0u8; TEMP_TABLE_JOB_STATS_KEY_SIZE];
+    key[0..4].copy_from_slice(&realm_id.to_le_bytes());
+    key[4..6].copy_from_slice(&realm_sub_id.to_le_bytes());
+    key[6..8].copy_from_slice(&TEMP_TABLE_ID_JOB_STATS_BYTES);
+    key[8..16].copy_from_slice(&unique_pending_id.to_le_bytes());
+    key[16] = counter_type;
+    key
+}
+
+#[inline(always)]
+pub fn tt_get_job_stats_count_key(
+    realm_id: u32,
+    realm_sub_id: u16,
+    unique_pending_id: u64,
+) -> [u8; TEMP_TABLE_JOB_STATS_KEY_SIZE] {
+    tt_get_job_stats_key(realm_id, realm_sub_id, unique_pending_id, JOB_STATS_COUNTER_COUNT)
+}
+
+#[inline(always)]
+pub fn tt_get_job_stats_total_duration_key(
+    realm_id: u32,
+    realm_sub_id: u16,
+    unique_pending_id: u64,
+) -> [u8; TEMP_TABLE_JOB_STATS_KEY_SIZE] {
+    tt_get_job_stats_key(
+        realm_id,
+        realm_sub_id,
+        unique_pending_id,
+        JOB_STATS_COUNTER_TOTAL_DURATION,
+    )
+}
+
+#[inline(always)]
+pub fn tt_get_job_stats_min_duration_key(
+    realm_id: u32,
+    realm_sub_id: u16,
+    unique_pending_id: u64,
+) -> [u8; TEMP_TABLE_JOB_STATS_KEY_SIZE] {
+    tt_get_job_stats_key(
+        realm_id,
+        realm_sub_id,
+        unique_pending_id,
+        JOB_STATS_COUNTER_MIN_DURATION,
+    )
+}
+
+#[inline(always)]
+pub fn tt_get_job_stats_max_duration_key(
+    realm_id: u32,
+    realm_sub_id: u16,
+    unique_pending_id: u64,
+) -> [u8; TEMP_TABLE_JOB_STATS_KEY_SIZE] {
+    tt_get_job_stats_key(
+        realm_id,
+        realm_sub_id,
+        unique_pending_id,
+        JOB_STATS_COUNTER_MAX_DURATION,
+    )
+}
 
 // --- Psy Node Proving State ---
 #[inline(always)]
@@ -368,6 +443,57 @@ pub fn tt_get_rewards_tag_tree_value_key_from_job<JobId: QJobIdBase>(
 }
 
 
+// --- Proof Claim Tag (worker claim tag, distinct namespace from finalized reward values) ---
+
+// (realm_id = 4) + (realm_sub_id = 2) + (table id length = 2) + (unique_pending_id = 8) + (QJOB_ID_SERIALIZED_SIZE = 24) = 40
+pub const TEMP_TABLE_ID_PROOF_CLAIM_TAG: u16 = 0x4354; // 'CT'
+pub const TEMP_TABLE_ID_PROOF_CLAIM_TAG_BYTES: [u8; 2] = [0x54, 0x43]; // 'CT'
+pub const TEMP_TABLE_PROOF_CLAIM_TAG_KEY_SIZE: usize = 40; // 4 + 2 + 2 + 8 + 24
+pub const TEMP_TABLE_PROOF_CLAIM_TAG_VALUE_SIZE: usize = 32; // Q256BitHash
+
+#[inline(always)]
+pub fn tt_get_proof_claim_tag_key(
+    realm_id: u32,
+    realm_sub_id: u16,
+    unique_pending_id: u64,
+    job_id_bytes: &QJobIdSerialized,
+) -> [u8; 40] {
+    let mut key = [0u8; 40];
+    key[0..4].copy_from_slice(&realm_id.to_le_bytes());
+    key[4..6].copy_from_slice(&realm_sub_id.to_le_bytes());
+    key[6..8].copy_from_slice(&TEMP_TABLE_ID_PROOF_CLAIM_TAG_BYTES);
+    key[8..16].copy_from_slice(&unique_pending_id.to_le_bytes());
+    key[16..40].copy_from_slice(job_id_bytes);
+    key
+}
+
+#[inline(always)]
+pub fn tt_write_proof_claim_tag_key<Writer: psy_io::Write>(
+    writer: &mut Writer,
+    realm_id: u32,
+    realm_sub_id: u16,
+    unique_pending_id: u64,
+    job_id_bytes: &QJobIdSerialized,
+) -> anyhow::Result<()> {
+    writer.write_all(&realm_id.to_le_bytes())?;
+    writer.write_all(&realm_sub_id.to_le_bytes())?;
+    writer.write_all(&TEMP_TABLE_ID_PROOF_CLAIM_TAG_BYTES)?;
+    writer.write_all(&unique_pending_id.to_le_bytes())?;
+    writer.write_all(job_id_bytes)?;
+    Ok(())
+}
+
+#[inline(always)]
+pub fn tt_get_proof_claim_tag_key_from_job<JobId: QJobIdBase>(
+    realm_id: u32,
+    realm_sub_id: u16,
+    unique_pending_id: u64,
+    job_id: &JobId,
+) -> [u8; 40] {
+    tt_get_proof_claim_tag_key(realm_id, realm_sub_id, unique_pending_id, &job_id.to_bytes_fixed())
+}
+
+
 
 
 
@@ -442,4 +568,110 @@ pub fn tt_get_worker_reputation_key(realm_id: u32, realm_sub_id: u16, public_key
     key[6..8].copy_from_slice(&TEMP_TABLE_ID_WORKER_REPUTATION_BYTES);
     key[8..41].copy_from_slice(public_key);
     key
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // For identical realm/pending/job-id, the proof claim-tag key must differ from the
+    // finalized-reward key so that a worker's claimed tag can never alias a finalized
+    // reward-tree value (the checkpoint-367 BridgeAgg divergence root cause).
+    #[test]
+    fn proof_claim_tag_key_never_aliases_rewards_tag_tree_value_key() {
+        let realm_id: u32 = 0x0a0b_0c0d;
+        let realm_sub_id: u16 = 0x0e0f;
+        let unique_pending_id: u64 = 0x1122_3344_5566_7788;
+        let job_id_bytes: QJobIdSerialized = [0xaau8; 24];
+
+        let reward_key = tt_get_rewards_tag_tree_value_key(
+            realm_id,
+            realm_sub_id,
+            unique_pending_id,
+            &job_id_bytes,
+        );
+        let claim_key = tt_get_proof_claim_tag_key(
+            realm_id,
+            realm_sub_id,
+            unique_pending_id,
+            &job_id_bytes,
+        );
+
+        // Same realm/pending/job-id shape, but distinct table-id prefix bytes => distinct keys.
+        assert_ne!(reward_key, claim_key);
+        assert_eq!(&reward_key[6..8], &TEMP_TABLE_ID_TAG_TREE_VALUES_BYTES);
+        assert_eq!(&claim_key[6..8], &TEMP_TABLE_ID_PROOF_CLAIM_TAG_BYTES);
+        // Shared shape: realm/sub/pending/job-id bytes are identical across both keys.
+        assert_eq!(&reward_key[0..6], &claim_key[0..6]);
+        assert_eq!(&reward_key[8..40], &claim_key[8..40]);
+        // The table-id prefix itself must not collide with the reward-tree prefix.
+        assert_ne!(TEMP_TABLE_ID_PROOF_CLAIM_TAG, TEMP_TABLE_ID_TAG_TREE_VALUES);
+        assert_ne!(
+            TEMP_TABLE_ID_PROOF_CLAIM_TAG_BYTES,
+            TEMP_TABLE_ID_TAG_TREE_VALUES_BYTES
+        );
+    }
+
+    // The claim-tag prefix must be globally unique among all temp table ids so it cannot
+    // collide with any other table namespace (e.g. job-claim, submit-status, witness data).
+    #[test]
+    fn proof_claim_tag_table_id_is_unique_among_known_temp_tables() {
+        let known: [u16; 13] = [
+            TEMP_TABLE_ID_WORKER_PROOF_METADATA,
+            TEMP_TABLE_ID_UNIQUE_PENDING_ID,
+            TEMP_TABLE_ID_GATHERING_UNIQUE_PENDING_ID,
+            TEMP_TABLE_ID_PROOF_WITNESS_DATA,
+            TEMP_TABLE_ID_SUBMIT_STATUS,
+            TEMP_TABLE_ID_USER_CONTRACT_TREE_UPDATES,
+            TEMP_TABLE_ID_USER_END_CAP_SLOT_UPDATES,
+            TEMP_TABLE_ID_TAG_TREE_VALUES,
+            TEMP_TABLE_ID_NODE_PROVING_STATE,
+            TEMP_TABLE_ID_DEPLOY_CONTRACT_CODE_DEFINITION,
+            TEMP_TABLE_ID_JOB_CLAIM,
+            TEMP_TABLE_ID_JOB_STATS,
+            TEMP_TABLE_ID_WORKER_REPUTATION,
+        ];
+        for id in known {
+            assert_ne!(
+                TEMP_TABLE_ID_PROOF_CLAIM_TAG, id,
+                "proof claim tag table id collides with existing temp table id {:#06x}",
+                id
+            );
+        }
+    }
+    // Every temp-table id must occupy a globally unique u16 namespace slot. A future
+    // addition (or accidental edit) that reuses an existing id would silently route one
+    // table's KV rows through another table's key — the checkpoint-367 class of corruption,
+    // generalized to the whole namespace. This checks ALL pairs (not just claim-tag vs
+    // reward), so a collision anywhere reddens it with a named pair.
+    #[test]
+    fn all_known_temp_table_ids_are_pairwise_distinct() {
+        let known: [(&str, u16); 14] = [
+            ("WORKER_PROOF_METADATA", TEMP_TABLE_ID_WORKER_PROOF_METADATA),
+            ("UNIQUE_PENDING_ID", TEMP_TABLE_ID_UNIQUE_PENDING_ID),
+            ("GATHERING_UNIQUE_PENDING_ID", TEMP_TABLE_ID_GATHERING_UNIQUE_PENDING_ID),
+            ("PROOF_WITNESS_DATA", TEMP_TABLE_ID_PROOF_WITNESS_DATA),
+            ("SUBMIT_STATUS", TEMP_TABLE_ID_SUBMIT_STATUS),
+            ("USER_CONTRACT_TREE_UPDATES", TEMP_TABLE_ID_USER_CONTRACT_TREE_UPDATES),
+            ("USER_END_CAP_SLOT_UPDATES", TEMP_TABLE_ID_USER_END_CAP_SLOT_UPDATES),
+            ("TAG_TREE_VALUES", TEMP_TABLE_ID_TAG_TREE_VALUES),
+            ("NODE_PROVING_STATE", TEMP_TABLE_ID_NODE_PROVING_STATE),
+            ("DEPLOY_CONTRACT_CODE_DEFINITION", TEMP_TABLE_ID_DEPLOY_CONTRACT_CODE_DEFINITION),
+            ("JOB_CLAIM", TEMP_TABLE_ID_JOB_CLAIM),
+            ("JOB_STATS", TEMP_TABLE_ID_JOB_STATS),
+            ("WORKER_REPUTATION", TEMP_TABLE_ID_WORKER_REPUTATION),
+            ("PROOF_CLAIM_TAG", TEMP_TABLE_ID_PROOF_CLAIM_TAG),
+        ];
+        for i in 0..known.len() {
+            for j in (i + 1)..known.len() {
+                let (name_i, id_i) = known[i];
+                let (name_j, id_j) = known[j];
+                assert_ne!(
+                    id_i, id_j,
+                    "temp table id collision: {} ({:#06x}) == {} ({:#06x})",
+                    name_i, id_i, name_j, id_j
+                );
+            }
+        }
+    }
 }

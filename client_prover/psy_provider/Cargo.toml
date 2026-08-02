@@ -17,6 +17,8 @@ serde_cbor = { workspace = true }
 clap = { workspace = true }
 ts-rs = { workspace = true }
 dashmap = { workspace = true }
+futures = { workspace = true }
+thiserror = { workspace = true }
 
 kvq = { workspace = true }
 psy_client_common = { workspace = true }
@@ -35,7 +37,6 @@ hex = { workspace = true }
 
 # Native-only dependencies
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-futures = { workspace = true }
 tokio = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
@@ -49,7 +50,6 @@ dirs = { workspace = true }
 rpassword = { workspace = true }
 rayon = { workspace = true }
 tempfile = { workspace = true }
-thiserror = { workspace = true }
 alloy-signer = { workspace = true }
 alloy-signer-local = { workspace = true }
 alloy-primitives = { workspace = true }

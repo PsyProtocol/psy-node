@@ -1,5 +1,5 @@
 use std::{
-    sync::{Arc, atomic::AtomicBool},
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -48,6 +48,7 @@ use crate::{
     },
     coordinator::processor::processor_shared_status::{PsyCoordinatorProcessorSharedStatus, PsyCoordinatorProcessorSharedStatusWrapper},
     queue::gatherer::QueueKeyStatusManager,
+    utils::processor_status::ProcessorStatus,
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 #[derive(Debug, Clone, PartialEq, Eq, Copy)]
@@ -81,6 +82,38 @@ pub async fn create_new_checkpoint_backup_manager_from_file_path<
     .await
 }
 
+fn qhash_to_hex<Hash: Q256BitHash>(hash: &Hash) -> String {
+    hex::encode(hash.into_owned_32bytes())
+}
+
+fn ensure_non_genesis_checkpoint_chain_commitment<F, Hash, Hasher>(
+    checkpoint_id: u64,
+    previous_chain_hash: Hash,
+    checkpoint_tree_root: Hash,
+    checkpoint_leaf_hash: Hash,
+    checkpoint_state_transition_circuit_fingerprint: Hash,
+    proof_public_inputs_hash: Hash,
+) -> anyhow::Result<()>
+where
+    Hash: Q256BitHash,
+    Hasher: FieldQHasher<F, Hash>,
+{
+    let root_leaf_hash = Hasher::q_two_to_one(checkpoint_tree_root, checkpoint_leaf_hash);
+    let step_hash = Hasher::q_two_to_one(root_leaf_hash, checkpoint_state_transition_circuit_fingerprint);
+    let expected_chain_hash = Hasher::q_two_to_one(previous_chain_hash, step_hash);
+
+    if proof_public_inputs_hash != expected_chain_hash {
+        anyhow::bail!(
+            "Checkpoint proof public-input hash mismatch for checkpoint ID {}. Expected chain hash: {}, actual proof public-input hash: {}",
+            checkpoint_id,
+            qhash_to_hex(&expected_chain_hash),
+            qhash_to_hex(&proof_public_inputs_hash),
+        );
+    }
+
+    Ok(())
+}
+
 pub struct PsyCoordinatorDatabaseProcessor<
     N: QNetworkTypesConfig,
     S: PsyCoordinatorProcessorStore<N::F, N::QHash> + Send + Sync,
@@ -109,7 +142,7 @@ pub struct PsyCoordinatorDatabaseProcessor<
     pub checkpoint_tree_backup_manager: CheckpointTreeBackupManager<N::HasherBase, N::QHash, FileSystem>,
 
     // status
-    pub is_active: Arc<AtomicBool>,
+    pub status: ProcessorStatus,
     pub guta_queue_key_status_manager: QueueKeyStatusManager<
         PQ_COORDINATOR_SUBMIT_REALM_GUTA_UPDATE_QUEUE_TOPIC_ID,
         GlobalUserTreeAggregatorHeaderWithTagValueAndJobID<N::F, N::QHash>,
@@ -156,6 +189,42 @@ impl<
         FileSystem,
     > where N::HasherBase: 'static + Send + Sync
 {
+    fn local_genesis_checkpoint_state_transition_hash(
+        genesis_verifiable_state_transition: &PsyVerifiableCheckpointTransition<N::F, N::QHash>,
+    ) -> N::QHash {
+        genesis_verifiable_state_transition
+            .state_transition
+            .genesis_checkpoint_state_transition_hash
+    }
+
+    async fn resolve_canonical_genesis_checkpoint_state_transition_hash(
+        db: &S,
+        last_committed_checkpoint_id: u64,
+        local_genesis_checkpoint_state_transition_hash: N::QHash,
+    ) -> anyhow::Result<N::QHash> {
+        if last_committed_checkpoint_id == 0 {
+            return Ok(local_genesis_checkpoint_state_transition_hash);
+        }
+
+        let stored = db
+            .get_verifiable_checkpoint_state_transition_and_zkp(last_committed_checkpoint_id)
+            .await?;
+        let canonical_genesis_checkpoint_state_transition_hash =
+            stored.info.state_transition.genesis_checkpoint_state_transition_hash;
+
+        if canonical_genesis_checkpoint_state_transition_hash
+            != local_genesis_checkpoint_state_transition_hash
+        {
+            anyhow::bail!(
+                "startup genesis checkpoint state transition hash mismatch at latest_checkpoint_id={}: local={}, db={}; refusing to start with non-canonical genesis CST hash",
+                last_committed_checkpoint_id,
+                qhash_to_hex(&local_genesis_checkpoint_state_transition_hash),
+                qhash_to_hex(&canonical_genesis_checkpoint_state_transition_hash),
+            );
+        }
+
+        Ok(canonical_genesis_checkpoint_state_transition_hash)
+    }
     pub async fn get_next_checkpoint_id(&self) -> anyhow::Result<u64> {
         let latest_checkpoint_id = self.db.get_latest_checkpoint_id().await?;
         Ok(latest_checkpoint_id + 1)
@@ -163,7 +232,7 @@ impl<
     pub async fn get_database_check_state(&self) -> anyhow::Result<DatabaseCheckState> {
         let actual_latest_applied_checkpoint_id: u64 = self.db.get_latest_checkpoint_id().await?;
         let (last_unique_pending_id, _last_unique_proc_checkpoint_id): (u64, QCoreProcCheckpointUniqueId) =
-            match self.db.get_current_unique_pending_id().await {
+            match self.db.get_latest_mapped_unique_pending_id().await {
                 Ok(ids) => ids,
                 Err(_) if actual_latest_applied_checkpoint_id == 0 => return Ok(DatabaseCheckState::NeedsGenesis),
                 Err(e) => return Err(e),
@@ -218,11 +287,23 @@ impl<
         tracing::info!("[COORD_INIT] new_init start");
 
         let last_committed_checkpoint_id = db.get_latest_checkpoint_id().await?;
+        let local_genesis_checkpoint_state_transition_hash =
+            Self::local_genesis_checkpoint_state_transition_hash(&genesis_verifiable_state_transition);
+        let genesis_checkpoint_state_transition_hash =
+            Self::resolve_canonical_genesis_checkpoint_state_transition_hash(
+                &db,
+                last_committed_checkpoint_id,
+                local_genesis_checkpoint_state_transition_hash,
+            )
+            .await?;
         tracing::info!("[COORD_INIT] latest checkpoint id = {}", last_committed_checkpoint_id);
         let (current_unique_pending_id, current_core_proc_unique_pending_id) = if last_committed_checkpoint_id == 0 {
             (0, 0u128)
         } else {
-            db.get_current_unique_pending_id().await?
+            // A crash can persist the pending-ID counter before its random
+            // processor-ID mapping. Skip that abandoned generation rather
+            // than making every subsequent coordinator restart fail closed.
+            db.get_latest_mapped_unique_pending_id().await?
         };
         tracing::info!(
             "[COORD_INIT] current unique ids = ({}, {})",
@@ -335,9 +416,10 @@ impl<
             checkpoint_leaf_hash: last_committed_checkpoint_leaf.qfhash::<N::HasherBase>(),
             last_chain_hash,
         };
+        let status = ProcessorStatus::new();
         Ok(Self {
             db,
-            is_active: Arc::new(AtomicBool::new(true)),
+            status: status.clone(),
             tag_tree_rewards_store,
             temp_db,
             proof_store,
@@ -353,41 +435,38 @@ impl<
             guta_queue_key_status_manager: QueueKeyStatusManager::<
                 PQ_COORDINATOR_SUBMIT_REALM_GUTA_UPDATE_QUEUE_TOPIC_ID,
                 GlobalUserTreeAggregatorHeaderWithTagValueAndJobID<N::F, N::QHash>,
-            >::new(QPStandardUniqueIdQueueKey {
+            >::new_with_status(QPStandardUniqueIdQueueKey {
                 realm_id: realm_id_u64,
                 realm_sub_id: realm_sub_id_u64,
                 unique_id: current_core_proc_unique_pending_id,
                 task_group: 0,
                 queue_type: QPBaseQueueType::StandardEphemeral,
                 _phantom_queue_item: std::marker::PhantomData,
-            }),
+            }, status.clone()),
             register_user_queue_key_status_manager: QueueKeyStatusManager::<
                 PQ_COORDINATOR_REGISTER_USER_PUBLIC_KEY_QUEUE_TOPIC_ID,
                 PZKPublicKeyInfo<N::QHash>,
-            >::new(QPStandardUniqueIdQueueKey {
+            >::new_with_status(QPStandardUniqueIdQueueKey {
                 realm_id: realm_id_u64,
                 realm_sub_id: realm_sub_id_u64,
                 unique_id: current_core_proc_unique_pending_id,
                 task_group: 0,
                 queue_type: QPBaseQueueType::StandardEphemeral,
                 _phantom_queue_item: std::marker::PhantomData,
-            }),
+            }, status.clone()),
             deploy_contract_queue_key_status_manager: QueueKeyStatusManager::<
                 PQ_COORDINATOR_DEPLOY_CONTRACT_QUEUE_TOPIC_ID,
                 PsyDeployContractQueueItem<N::F, N::QHash>,
-            >::new(QPStandardUniqueIdQueueKey {
+            >::new_with_status(QPStandardUniqueIdQueueKey {
                 realm_id: realm_id_u64,
                 realm_sub_id: realm_sub_id_u64,
                 unique_id: current_core_proc_unique_pending_id,
                 task_group: 0,
                 queue_type: QPBaseQueueType::StandardEphemeral,
                 _phantom_queue_item: std::marker::PhantomData,
-            }),
+            }, status.clone()),
             needs_revert: false,
-            genesis_checkpoint_state_transition_hash: genesis_verifiable_state_transition
-                .state_transition
-                .checkpoint_transition
-                .qfhash::<N::HasherBase>(),
+            genesis_checkpoint_state_transition_hash,
             last_committed,
             ids,
         })
@@ -807,16 +886,29 @@ checkpoint_backup_copy_status={}
             );
         }
 
-        let old_checkpoint_root = self.db.checkpoint_tree_get_root_hash(checkpoint_id).await?;
-        if checkpoint_id != 0 && old_checkpoint_root != coordinator_update.old_base.checkpoint_tree_root {
-            let actual_checkpoint_root = self.checkpoint_tree_backup_manager.checkpoint_tree.get_root();
-            tracing::error!(
-                "Computed old checkpoint tree root hash: {:?}, expected old checkpoint tree root hash: {:?}, actual root from backup manager: {:?}",
-                old_checkpoint_root,
-                coordinator_update.old_base.checkpoint_tree_root,
-                actual_checkpoint_root
-            );
-            anyhow::bail!("Old checkpoint tree root hash mismatch when committing coordinator state update to database. Computed hash: {:?}, expected hash: {:?}", old_checkpoint_root, coordinator_update.old_base.checkpoint_tree_root);
+        if checkpoint_id != 0 {
+            let expected_checkpoint_id = self.ids.checkpoint_id.checked_add(1).ok_or_else(|| {
+                anyhow::anyhow!("Committed checkpoint ID overflow while validating target checkpoint {}", checkpoint_id)
+            })?;
+            if checkpoint_id != expected_checkpoint_id {
+                anyhow::bail!(
+                    "Non-sequential coordinator commit: target checkpoint ID {} must follow committed checkpoint ID {}",
+                    checkpoint_id,
+                    self.ids.checkpoint_id
+                );
+            }
+
+            let old_checkpoint_root = self.db.checkpoint_tree_get_root_hash(self.ids.checkpoint_id).await?;
+            if old_checkpoint_root != coordinator_update.old_base.checkpoint_tree_root {
+                let actual_checkpoint_root = self.checkpoint_tree_backup_manager.checkpoint_tree.get_root();
+                tracing::error!(
+                    "Computed old checkpoint tree root hash: {:?}, expected old checkpoint tree root hash: {:?}, actual root from backup manager: {:?}",
+                    old_checkpoint_root,
+                    coordinator_update.old_base.checkpoint_tree_root,
+                    actual_checkpoint_root
+                );
+                anyhow::bail!("Old checkpoint tree root hash mismatch when committing coordinator state update to database. Computed hash: {:?}, expected hash: {:?}", old_checkpoint_root, coordinator_update.old_base.checkpoint_tree_root);
+            }
         }
 
         tracing::info!("start -> Committing coordinator state update to database for checkpoint_id: {}", checkpoint_id);
@@ -834,6 +926,16 @@ checkpoint_backup_copy_status={}
             let checkpoint_proof = N::ZKVerifier::try_proof_from_slice(&zk_proof)?;
             N::ZKVerifier::get_proof_public_inputs_hash(&checkpoint_proof)?
         };
+        if checkpoint_id != 0 {
+            ensure_non_genesis_checkpoint_chain_commitment::<N::F, N::QHash, N::HasherBase>(
+                checkpoint_id,
+                self.last_committed.last_chain_hash,
+                coordinator_update.new_base.checkpoint_tree_root,
+                coordinator_update.new_base.checkpoint_leaf_hash,
+                self.circuit_fingerprint_config.checkpoint_state_transition_circuit_fingerprint,
+                checkpoint_proof_public_inputs_hash,
+            )?;
+        }
         let mut verifiable_checkpoint_transition = coordinator_update.get_public_inputs_verifiable_state_transition(
             self.genesis_checkpoint_state_transition_hash,
             self.circuit_fingerprint_config.checkpoint_state_transition_circuit_fingerprint,
@@ -1292,5 +1394,267 @@ Checkpoint Root Hash: {}
         );
         self.print_coordinator_processor_state();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use parth_core::{pgoldilocks::PoseidonHasher, PHash};
+
+    #[test]
+    fn validates_non_genesis_checkpoint_chain_commitment() {
+        type Hasher = PoseidonHasher;
+
+        let checkpoint_id = 367;
+        let previous_chain_hash = PHash::from_values(1, 2, 3, 4);
+        let checkpoint_tree_root = PHash::from_values(5, 6, 7, 8);
+        let checkpoint_leaf_hash = PHash::from_values(9, 10, 11, 12);
+        let fingerprint = PHash::from_values(13, 14, 15, 16);
+        let root_leaf_hash = Hasher::q_two_to_one(checkpoint_tree_root, checkpoint_leaf_hash);
+        let step_hash = Hasher::q_two_to_one(root_leaf_hash, fingerprint);
+        let expected_chain_hash = Hasher::q_two_to_one(previous_chain_hash, step_hash);
+
+        ensure_non_genesis_checkpoint_chain_commitment::<_, _, Hasher>(
+            checkpoint_id,
+            previous_chain_hash,
+            checkpoint_tree_root,
+            checkpoint_leaf_hash,
+            fingerprint,
+            expected_chain_hash,
+        )
+        .expect("matching checkpoint proof chain commitment must pass");
+
+        let stale_proof_chain_hash = PHash::from_values(17, 18, 19, 20);
+        let error = ensure_non_genesis_checkpoint_chain_commitment::<_, _, Hasher>(
+            checkpoint_id,
+            previous_chain_hash,
+            checkpoint_tree_root,
+            checkpoint_leaf_hash,
+            fingerprint,
+            stale_proof_chain_hash,
+        )
+        .expect_err("mismatching checkpoint proof chain commitment must fail");
+        let error = error.to_string();
+
+        assert!(error.contains("checkpoint ID 367"));
+        assert!(error.contains(&qhash_to_hex(&expected_chain_hash)));
+        assert!(error.contains(&qhash_to_hex(&stale_proof_chain_hash)));
+    }
+    // Mirrors `ensure_non_genesis_checkpoint_chain_commitment`'s formula so the defensive
+    // cases below can build a matching proof or a "dropped-input" proof without restating
+    // the hash nesting inline each time.
+    fn chain_commitment_hash(
+        previous_chain_hash: PHash,
+        checkpoint_tree_root: PHash,
+        checkpoint_leaf_hash: PHash,
+        fingerprint: PHash,
+    ) -> PHash {
+        type H = PoseidonHasher;
+        let root_leaf = H::q_two_to_one(checkpoint_tree_root, checkpoint_leaf_hash);
+        let step = H::q_two_to_one(root_leaf, fingerprint);
+        H::q_two_to_one(previous_chain_hash, step)
+    }
+
+    /// Pinned contract: the validator applies the full check uniformly for every checkpoint
+    /// id, including 0. It does NOT internally short-circuit genesis, so the genesis exemption
+    /// ("skip the non-genesis check and do not bail on an empty proof") lives entirely in the
+    /// `commit_state` call site's `if checkpoint_id != 0` guard (exercised by process_block.rs).
+    /// Arm A kills a `if checkpoint_id == 0 { bail }` regression; Arm B kills a
+    /// `if checkpoint_id == 0 { return Ok }` regression; Arm C proves the non-genesis formula
+    /// genuinely cannot fit genesis (its empty-proof hash omits previous_chain_hash), so the
+    /// call-site guard is load-bearing.
+    #[test]
+    fn genesis_checkpoint_id_zero_is_not_internally_exempt() {
+        type Hasher = PoseidonHasher;
+        let checkpoint_id = 0u64;
+        let previous_chain_hash = PHash::from_values(1, 2, 3, 4);
+        let checkpoint_tree_root = PHash::from_values(5, 6, 7, 8);
+        let checkpoint_leaf_hash = PHash::from_values(9, 10, 11, 12);
+        let fingerprint = PHash::from_values(13, 14, 15, 16);
+        let expected = chain_commitment_hash(
+            previous_chain_hash, checkpoint_tree_root, checkpoint_leaf_hash, fingerprint,
+        );
+
+        // Arm A: id=0 with a formula-matching proof must NOT bail.
+        ensure_non_genesis_checkpoint_chain_commitment::<_, _, Hasher>(
+            checkpoint_id, previous_chain_hash, checkpoint_tree_root,
+            checkpoint_leaf_hash, fingerprint, expected,
+        )
+        .expect("id=0 with a matching proof must not bail (no internal genesis rejection)");
+
+        // Arm B: id=0 with a mismatched proof must bail — no internal `return Ok` for genesis.
+        let wrong = PHash::from_values(17, 18, 19, 20);
+        let error = ensure_non_genesis_checkpoint_chain_commitment::<_, _, Hasher>(
+            checkpoint_id, previous_chain_hash, checkpoint_tree_root,
+            checkpoint_leaf_hash, fingerprint, wrong,
+        )
+        .expect_err("id=0 with a mismatched proof must bail (no internal genesis exemption)");
+        assert!(error.to_string().contains("checkpoint ID 0"));
+
+        // Arm C: the real genesis public-inputs hash is H(H(root, leaf), fingerprint) and omits
+        // previous_chain_hash, so it can never satisfy the non-genesis formula. This is why the
+        // call-site `if checkpoint_id != 0` guard must exist.
+        let genesis_proof_hash = {
+            let root_leaf = Hasher::q_two_to_one(checkpoint_tree_root, checkpoint_leaf_hash);
+            Hasher::q_two_to_one(root_leaf, fingerprint)
+        };
+        let error = ensure_non_genesis_checkpoint_chain_commitment::<_, _, Hasher>(
+            checkpoint_id, previous_chain_hash, checkpoint_tree_root,
+            checkpoint_leaf_hash, fingerprint, genesis_proof_hash,
+        )
+        .expect_err("genesis empty-proof hash omits previous_chain_hash and must fail the non-genesis check");
+        assert!(error.to_string().contains("checkpoint ID 0"));
+    }
+
+    /// Pinned contract: the proof/expected comparison checks all four 256-bit limbs, not just
+    /// limb[0]. For each limb, flip one bit in only that limb of the proof hash (leaving the
+    /// other three equal to the expected hash) and assert the check still bails. Rows 1, 2, 3
+    /// kill a `compare only elements[0]` regression; row 0 is the baseline that any check catches.
+    #[test]
+    fn mismatch_on_any_single_hash_limb_bails() {
+        type Hasher = PoseidonHasher;
+        let checkpoint_id = 367u64;
+        let previous_chain_hash = PHash::from_values(1, 2, 3, 4);
+        let checkpoint_tree_root = PHash::from_values(5, 6, 7, 8);
+        let checkpoint_leaf_hash = PHash::from_values(9, 10, 11, 12);
+        let fingerprint = PHash::from_values(13, 14, 15, 16);
+        let expected = chain_commitment_hash(
+            previous_chain_hash, checkpoint_tree_root, checkpoint_leaf_hash, fingerprint,
+        );
+
+        for limb in 0u8..4u8 {
+            let mut bytes = expected.into_owned_32bytes();
+            // Flip the low bit of this limb. A single-bit flip is never a nonzero multiple of
+            // the Goldilocks prime, so the limb's field element genuinely changes.
+            bytes[(limb as usize) * 8] ^= 0x01;
+            let tampered = <PHash as Q256BitHash>::from_owned_32bytes(bytes);
+            assert_ne!(tampered, expected, "tamper must actually change limb {limb}");
+
+            let result = ensure_non_genesis_checkpoint_chain_commitment::<_, _, Hasher>(
+                checkpoint_id, previous_chain_hash, checkpoint_tree_root,
+                checkpoint_leaf_hash, fingerprint, tampered,
+            );
+            assert!(
+                result.is_err(),
+                "mismatch on limb {limb} alone must bail, got {result:?}"
+            );
+            assert!(result.unwrap_err().to_string().contains("checkpoint ID 367"));
+        }
+    }
+
+    /// Pinned contract: previous_chain_hash is wired into the formula. The proof is the formula
+    /// with previous_chain_hash collapsed away (the outer q_two_to_one removed -> expected =
+    /// step), which is what an accidental "drop previous_chain_hash" produces. Correct code
+    /// computes H(previous_chain_hash, step) != step and bails; the drop mutation computes
+    /// step == proof and returns Ok, reddening this test.
+    #[test]
+    fn previous_chain_hash_dropped_from_formula_bails() {
+        type Hasher = PoseidonHasher;
+        let checkpoint_id = 367u64;
+        let previous_chain_hash = PHash::from_values(1, 2, 3, 4);
+        let checkpoint_tree_root = PHash::from_values(5, 6, 7, 8);
+        let checkpoint_leaf_hash = PHash::from_values(9, 10, 11, 12);
+        let fingerprint = PHash::from_values(13, 14, 15, 16);
+
+        // Proof = step hash = the formula with previous_chain_hash collapsed out.
+        let root_leaf = Hasher::q_two_to_one(checkpoint_tree_root, checkpoint_leaf_hash);
+        let proof_dropped_prev = Hasher::q_two_to_one(root_leaf, fingerprint);
+        // Sanity: the full formula genuinely differs from the dropped one.
+        assert_ne!(
+            chain_commitment_hash(previous_chain_hash, checkpoint_tree_root, checkpoint_leaf_hash, fingerprint),
+            proof_dropped_prev,
+        );
+
+        let result = ensure_non_genesis_checkpoint_chain_commitment::<_, _, Hasher>(
+            checkpoint_id, previous_chain_hash, checkpoint_tree_root,
+            checkpoint_leaf_hash, fingerprint, proof_dropped_prev,
+        );
+        assert!(result.is_err(), "dropping previous_chain_hash from the formula must still bail against the dropped-formula proof");
+        assert!(result.unwrap_err().to_string().contains("checkpoint ID 367"));
+    }
+
+    /// Pinned contract: checkpoint_tree_root is wired into the formula. Proof = formula with
+    /// the root collapsed (inner q_two_to_one(root, leaf) -> leaf): H(prev, H(leaf, fp)).
+    /// Correct code computes H(prev, H(H(root,leaf), fp)) and bails; the drop mutation matches
+    /// the proof and returns Ok, reddening this test.
+    #[test]
+    fn checkpoint_tree_root_dropped_from_formula_bails() {
+        type Hasher = PoseidonHasher;
+        let checkpoint_id = 367u64;
+        let previous_chain_hash = PHash::from_values(1, 2, 3, 4);
+        let checkpoint_tree_root = PHash::from_values(5, 6, 7, 8);
+        let checkpoint_leaf_hash = PHash::from_values(9, 10, 11, 12);
+        let fingerprint = PHash::from_values(13, 14, 15, 16);
+
+        let leaf_fp = Hasher::q_two_to_one(checkpoint_leaf_hash, fingerprint);
+        let proof_dropped_root = Hasher::q_two_to_one(previous_chain_hash, leaf_fp);
+        assert_ne!(
+            chain_commitment_hash(previous_chain_hash, checkpoint_tree_root, checkpoint_leaf_hash, fingerprint),
+            proof_dropped_root,
+        );
+
+        let result = ensure_non_genesis_checkpoint_chain_commitment::<_, _, Hasher>(
+            checkpoint_id, previous_chain_hash, checkpoint_tree_root,
+            checkpoint_leaf_hash, fingerprint, proof_dropped_root,
+        );
+        assert!(result.is_err(), "dropping checkpoint_tree_root from the formula must still bail against the dropped-formula proof");
+        assert!(result.unwrap_err().to_string().contains("checkpoint ID 367"));
+    }
+
+    /// Pinned contract: checkpoint_leaf_hash is wired into the formula. Proof = formula with
+    /// the leaf collapsed (inner q_two_to_one(root, leaf) -> root): H(prev, H(root, fp)).
+    /// Correct code computes H(prev, H(H(root,leaf), fp)) and bails; the drop mutation matches
+    /// the proof and returns Ok, reddening this test.
+    #[test]
+    fn checkpoint_leaf_hash_dropped_from_formula_bails() {
+        type Hasher = PoseidonHasher;
+        let checkpoint_id = 367u64;
+        let previous_chain_hash = PHash::from_values(1, 2, 3, 4);
+        let checkpoint_tree_root = PHash::from_values(5, 6, 7, 8);
+        let checkpoint_leaf_hash = PHash::from_values(9, 10, 11, 12);
+        let fingerprint = PHash::from_values(13, 14, 15, 16);
+
+        let root_fp = Hasher::q_two_to_one(checkpoint_tree_root, fingerprint);
+        let proof_dropped_leaf = Hasher::q_two_to_one(previous_chain_hash, root_fp);
+        assert_ne!(
+            chain_commitment_hash(previous_chain_hash, checkpoint_tree_root, checkpoint_leaf_hash, fingerprint),
+            proof_dropped_leaf,
+        );
+
+        let result = ensure_non_genesis_checkpoint_chain_commitment::<_, _, Hasher>(
+            checkpoint_id, previous_chain_hash, checkpoint_tree_root,
+            checkpoint_leaf_hash, fingerprint, proof_dropped_leaf,
+        );
+        assert!(result.is_err(), "dropping checkpoint_leaf_hash from the formula must still bail against the dropped-formula proof");
+        assert!(result.unwrap_err().to_string().contains("checkpoint ID 367"));
+    }
+
+    /// Pinned contract: the state-transition circuit fingerprint is wired into the formula.
+    /// Proof = formula with the fingerprint collapsed (q_two_to_one(root_leaf, fp) ->
+    /// root_leaf): H(prev, H(root, leaf)). Correct code computes H(prev, H(root_leaf, fp)) and
+    /// bails; the drop mutation matches the proof and returns Ok, reddening this test.
+    #[test]
+    fn fingerprint_dropped_from_formula_bails() {
+        type Hasher = PoseidonHasher;
+        let checkpoint_id = 367u64;
+        let previous_chain_hash = PHash::from_values(1, 2, 3, 4);
+        let checkpoint_tree_root = PHash::from_values(5, 6, 7, 8);
+        let checkpoint_leaf_hash = PHash::from_values(9, 10, 11, 12);
+        let fingerprint = PHash::from_values(13, 14, 15, 16);
+
+        let root_leaf = Hasher::q_two_to_one(checkpoint_tree_root, checkpoint_leaf_hash);
+        let proof_dropped_fp = Hasher::q_two_to_one(previous_chain_hash, root_leaf);
+        assert_ne!(
+            chain_commitment_hash(previous_chain_hash, checkpoint_tree_root, checkpoint_leaf_hash, fingerprint),
+            proof_dropped_fp,
+        );
+
+        let result = ensure_non_genesis_checkpoint_chain_commitment::<_, _, Hasher>(
+            checkpoint_id, previous_chain_hash, checkpoint_tree_root,
+            checkpoint_leaf_hash, fingerprint, proof_dropped_fp,
+        );
+        assert!(result.is_err(), "dropping the circuit fingerprint from the formula must still bail against the dropped-formula proof");
+        assert!(result.unwrap_err().to_string().contains("checkpoint ID 367"));
     }
 }

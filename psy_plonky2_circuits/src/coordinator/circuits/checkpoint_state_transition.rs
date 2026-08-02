@@ -185,6 +185,11 @@ where
         previous_checkpoint_state_transition_verifier_data: &VerifierOnlyCircuitData<C, D>,
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
         let mut witness = input.clone();
+        assert_eq!(
+            witness.checkpoint_state_transition_circuit_fingerprint,
+            self.get_fingerprint(),
+            "checkpoint state transition witness fingerprint must match the proving circuit fingerprint",
+        );
         let canonical_transition_fingerprint = witness.checkpoint_state_transition_circuit_fingerprint;
 
         let mut pw = PartialWitness::<C::F>::new();

@@ -1,6 +1,7 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::bail;
+use base64::Engine;
 use dashmap::DashMap;
 use plonky2::{
     field::{goldilocks_field::GoldilocksField, types::Field},
@@ -8,11 +9,24 @@ use plonky2::{
         hash_types::{HashOut, RichField},
         poseidon::{PoseidonHash, PoseidonPermutation},
     },
-    plonk::{config::PoseidonGoldilocksConfig, proof::ProofWithPublicInputs},
+    plonk::{circuit_data::VerifierOnlyCircuitData, config::PoseidonGoldilocksConfig, proof::ProofWithPublicInputs},
 };
-use psy_client_common::data::{base_types::hash256::Hash256, qhashout::QHashOut};
-use psy_client_data::{config::store_config::PsyHasher, dpn::sdk_key::SDKKeyConfig, qstore::imm::cmd_processor::PsyReadCommandProcessorSync};
-use psy_config::network_constants::{DEFAULT_CALLER_CONTRACT_ID_U64, MAX_CONTRACT_STATE_TREE_HEIGHT, UPS_SESSION_PROOF_TREE_HEIGHT};
+use psy_client_common::data::{alt::AltVerifierOnlyCircuitData, base_types::hash256::Hash256, qhashout::QHashOut};
+use psy_client_data::{
+    config::store_config::PsyHasher,
+    dpn::sd_key::SDKeyConfig,
+    privacy::{deposit_inclusion::DepositInclusionInput, private_note_inclusion::PrivateNoteInclusionInput},
+    qdata::contract::ContractCodeDefinition,
+    qstore::imm::cmd_processor::PsyReadCommandProcessorSync,
+};
+use psy_common_circuit::circuits::{
+    traits::qstandard::QStandardCircuit,
+    zk_signature3::core::{PsyBasicZKSignatureCircuit, PsyBasicZKSignatureInnerCircuit},
+};
+use psy_config::network_constants::{
+    DEFAULT_CALLER_CONTRACT_ID_U64, GLOBAL_CONTRACT_TREE_HEIGHT, GLOBAL_USER_TREE_HEIGHT, MAX_CONTRACT_STATE_TREE_HEIGHT, PRIVATE_NOTE_TREE_HEIGHT,
+    UPS_SESSION_PROOF_TREE_HEIGHT,
+};
 use psy_crypto::{
     hash::traits::qhashable::QFieldHashable,
     signature::{
@@ -23,8 +37,12 @@ use psy_crypto::{
         zk::{data::ZKPublicKeyInfo, wallet::SimplePsyPrivateKey},
     },
 };
+use psy_dpn_circuit::circuits::privacy::{
+    private_note_inclusion::{PrivateNoteInclusionCircuit, PrivateNoteInclusionInnerCircuit},
+    shield_deposit_claim::{ShieldDepositClaimCircuit, ShieldDepositClaimInnerCircuit},
+};
 use psy_ups_circuit::signature::{
-    sdk_key::SDKKeyCircuitGadget,
+    sd_key::SDKeyCircuitGadget,
     software_defined::{DPNSoftwareDefinedSignatureGadget, Plonky2SoftwareDefinedSignatureGadget},
 };
 use psy_vm::ups::{circuit_manager::UPSCircuitManager, state_reader::StateReader};
@@ -32,12 +50,19 @@ use psy_vm::ups::{circuit_manager::UPSCircuitManager, state_reader::StateReader}
 use crate::signature::{
     context::SignContext,
     traits::{SignatureResult, SignatureUser},
-    users::{SDKKeyUser, SECP256K1User, SoftwareDefinedDpnUser, SoftwareDefinedPlonky2User, ZKUser},
+    users::{SDKeyUser, SECP256K1User, SoftwareDefinedDpnUser, SoftwareDefinedPlonky2User, ZKUser},
 };
 
 type C = PoseidonGoldilocksConfig;
 const D: usize = 2;
 type F = GoldilocksField;
+
+#[derive(Clone, Debug)]
+pub struct SDKeyPolicy {
+    pub allowed_contract_ids: Vec<u64>,
+    pub allowed_method_ids: Vec<u32>,
+    pub expected_tx_count: u64,
+}
 
 // 65e0169bfffd55f1c0ea9f76c111a5b15e652322ee253c1a9604a10d59066b50
 pub const ZK_FINGERPRINT_U64: [u64; 4] = [10809942084296272720, 6801881445144280090, 13901098532226573745, 7340892251884443121];
@@ -67,20 +92,16 @@ pub fn get_secp256k1_fingerprint<F: RichField>() -> QHashOut<F> {
     })
 }
 
-fn allowed_contract_method_pairs(allowed_contract_ids: &[u64], allowed_method_ids: &[u64]) -> anyhow::Result<Vec<(u64, u64)>> {
+fn allowed_contract_method_pairs(allowed_contract_ids: &[u64], allowed_method_ids: &[u32]) -> anyhow::Result<Vec<(u64, u32)>> {
     if allowed_contract_ids.is_empty() {
-        bail!("SDK key allowed contract_id list must not be empty");
+        bail!("SD key allowed contract_id list must not be empty");
     }
     if allowed_method_ids.is_empty() {
-        bail!("SDK key allowed method_id list must not be empty");
+        bail!("SD key allowed method_id list must not be empty");
     }
 
     if allowed_contract_ids.len() == allowed_method_ids.len() {
-        return Ok(allowed_contract_ids
-            .iter()
-            .copied()
-            .zip(allowed_method_ids.iter().copied())
-            .collect());
+        return Ok(allowed_contract_ids.iter().copied().zip(allowed_method_ids.iter().copied()).collect());
     }
 
     if allowed_contract_ids.len() == 1 {
@@ -99,25 +120,23 @@ fn allowed_contract_method_pairs(allowed_contract_ids: &[u64], allowed_method_id
             .collect());
     }
 
-    bail!(
-        "SDK key allowed contract_id and method_id lists must have the same length, or one list must contain exactly one value"
-    );
+    bail!("SD key allowed contract_id and method_id lists must have the same length, or one list must contain exactly one value");
 }
 
 fn assert_contract_method_in_allowed_pairs(
     builder: &mut plonky2::plonk::circuit_builder::CircuitBuilder<F, D>,
     contract_id_target: plonky2::iop::target::Target,
     method_id_target: plonky2::iop::target::Target,
-    allowed_pairs: &[(u64, u64)],
+    allowed_pairs: &[(u64, u32)],
 ) -> anyhow::Result<()> {
     if allowed_pairs.is_empty() {
-        bail!("SDK key allowed contract/method pair list must not be empty");
+        bail!("SD key allowed contract/method pair list must not be empty");
     }
 
     let mut is_allowed = builder._false();
     for (contract_id, method_id) in allowed_pairs {
         let expected_contract_id = builder.constant(F::from_canonical_u64(*contract_id));
-        let expected_method_id = builder.constant(F::from_canonical_u64(*method_id));
+        let expected_method_id = builder.constant(F::from_canonical_u64(*method_id as u64));
         let contract_matches = builder.is_equal(contract_id_target, expected_contract_id);
         let method_matches = builder.is_equal(method_id_target, expected_method_id);
         let pair_matches = builder.and(contract_matches, method_matches);
@@ -128,17 +147,21 @@ fn assert_contract_method_in_allowed_pairs(
     Ok(())
 }
 
-fn build_allow_method_sdk_key_circuit(allowed_contract_ids: &[u64], allowed_method_ids: &[u64], expected_tx_count: u64) -> anyhow::Result<SDKKeyCircuitGadget> {
+fn build_allow_method_sd_key_circuit(
+    allowed_contract_ids: &[u64],
+    allowed_method_ids: &[u32],
+    expected_tx_count: u64,
+) -> anyhow::Result<SDKeyCircuitGadget> {
     if expected_tx_count == 0 {
-        bail!("SDK key expected_tx_count must be greater than zero");
+        bail!("SD key expected_tx_count must be greater than zero");
     }
     if expected_tx_count > u32::MAX as u64 {
-        bail!("SDK key expected_tx_count exceeds u32 range: {}", expected_tx_count);
+        bail!("SD key expected_tx_count exceeds u32 range: {}", expected_tx_count);
     }
 
     let config = plonky2::plonk::circuit_data::CircuitConfig::standard_recursion_config();
     let mut builder = plonky2::plonk::circuit_builder::CircuitBuilder::<F, D>::new(config);
-    let sdk_config = SDKKeyConfig {
+    let sd_config = SDKeyConfig {
         num_introspectable_transactions: expected_tx_count as u32,
         can_read_state: false,
         contract_state_tree_height: MAX_CONTRACT_STATE_TREE_HEIGHT,
@@ -146,26 +169,28 @@ fn build_allow_method_sdk_key_circuit(allowed_contract_ids: &[u64], allowed_meth
         num_secp256k1_slots: 0,
     };
 
-    let mut gadget = SDKKeyCircuitGadget::add_virtual_to(&mut builder, &sdk_config, 0);
+    let mut gadget = SDKeyCircuitGadget::add_virtual_to(&mut builder, &sd_config, 0);
     let expected_tx_count_target = builder.constant(F::from_canonical_u64(expected_tx_count));
     let allowed_pairs = allowed_contract_method_pairs(allowed_contract_ids, allowed_method_ids)?;
-    assert_contract_method_in_allowed_pairs(
-        &mut builder,
-        gadget.tx_introspection.get_tx_contract_id(0),
-        gadget.tx_introspection.get_tx_method_id(0),
-        &allowed_pairs,
-    )?;
+    for tx_index in 0..expected_tx_count as usize {
+        assert_contract_method_in_allowed_pairs(
+            &mut builder,
+            gadget.tx_introspection.get_tx_contract_id(tx_index),
+            gadget.tx_introspection.get_tx_method_id(tx_index),
+            &allowed_pairs,
+        )?;
+    }
     builder.connect(gadget.tx_introspection.get_tx_count(), expected_tx_count_target);
     gadget.build_circuit(builder)?;
     Ok(gadget)
 }
 
-pub fn get_allow_method_sdk_key_fingerprint(
+pub fn get_allow_method_sd_key_fingerprint(
     allowed_contract_ids: &[u64],
-    allowed_method_ids: &[u64],
+    allowed_method_ids: &[u32],
     expected_tx_count: u64,
 ) -> anyhow::Result<QHashOut<GoldilocksField>> {
-    Ok(build_allow_method_sdk_key_circuit(allowed_contract_ids, allowed_method_ids, expected_tx_count)?.get_fingerprint())
+    Ok(build_allow_method_sd_key_circuit(allowed_contract_ids, allowed_method_ids, expected_tx_count)?.get_fingerprint())
 }
 
 pub fn get_public_key_info<F: RichField>(private_key: QHashOut<F>, fingerprint: QHashOut<F>) -> anyhow::Result<ZKPublicKeyInfo<F>> {
@@ -184,28 +209,283 @@ pub fn get_public_key_info<F: RichField>(private_key: QHashOut<F>, fingerprint: 
 }
 pub struct PsyMemoryWallet {
     signature_users: DashMap<QHashOut<F>, Arc<dyn SignatureUser>>,
-    psy_software_defined_circuits: DashMap<QHashOut<F>, DPNSoftwareDefinedSignatureGadget>,
-    plonky2_software_defined_circuits: DashMap<QHashOut<F>, Plonky2SoftwareDefinedSignatureGadget>,
-    sdk_key_circuits: DashMap<QHashOut<F>, SDKKeyCircuitGadget>,
+    local_circuits: PsyWalletLocalCircuits,
     circuit_manager: Vec<Box<dyn UPSCircuitManager<C, D> + Send + Sync>>,
+    fallback_minifiers: FallbackMinifierCircuits,
+    trace_contract_code_cache: DashMap<u64, Vec<u8>>,
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), maybe_async::maybe_async)]
-#[cfg_attr(target_arch = "wasm32", maybe_async::maybe_async(?Send))]
-impl PsyMemoryWallet {
-    pub fn new(circuit_manager: Vec<Box<dyn UPSCircuitManager<C, D> + Send + Sync>>) -> Self {
-        Self {
-            signature_users: DashMap::new(),
-            psy_software_defined_circuits: DashMap::new(),
-            plonky2_software_defined_circuits: DashMap::new(),
-            sdk_key_circuits: DashMap::new(),
-            circuit_manager,
+/// Local minifier circuits used when the prove proxy cannot minify a proof.
+/// Each circuit is built lazily and independently so the wallet only pays for
+/// the fallback paths it actually hits.
+#[derive(Default)]
+struct FallbackMinifierCircuits {
+    zk_signature: OnceLock<PsyBasicZKSignatureCircuit<C, D>>,
+    private_note_inclusion: OnceLock<PrivateNoteInclusionCircuit<C, D>>,
+    shield_deposit_claim: OnceLock<ShieldDepositClaimCircuit<C, D>>,
+}
+
+impl FallbackMinifierCircuits {
+    fn zk_signature(&self) -> &PsyBasicZKSignatureCircuit<C, D> {
+        self.zk_signature.get_or_init(|| {
+            tracing::warn!("initializing local zk-sign minifier fallback circuit");
+            PsyBasicZKSignatureCircuit::<C, D>::new()
+        })
+    }
+
+    fn private_note_inclusion(&self) -> &PrivateNoteInclusionCircuit<C, D> {
+        self.private_note_inclusion.get_or_init(|| {
+            tracing::warn!("initializing local private-note-inclusion minifier fallback circuit");
+            PrivateNoteInclusionCircuit::<C, D>::new(
+                GLOBAL_USER_TREE_HEIGHT as usize,
+                GLOBAL_CONTRACT_TREE_HEIGHT as usize,
+                MAX_CONTRACT_STATE_TREE_HEIGHT as usize,
+                PRIVATE_NOTE_TREE_HEIGHT,
+            )
+        })
+    }
+
+    fn shield_deposit_claim(&self) -> &ShieldDepositClaimCircuit<C, D> {
+        self.shield_deposit_claim.get_or_init(|| {
+            tracing::warn!("initializing local shield-deposit-claim minifier fallback circuit");
+            ShieldDepositClaimCircuit::<C, D>::new()
+        })
+    }
+}
+
+/// On-disk cache path for a local circuit. The `_v1` suffix is a manual schema
+/// version: bump it whenever the corresponding circuit layout changes.
+///
+/// Disk caching and the JSON bundle are host-only: wasm has no filesystem, and
+/// the `dirs`/`zstd`/`base64` crates are declared non-wasm in this crate's
+/// `Cargo.toml`.
+#[cfg(not(target_arch = "wasm32"))]
+fn local_circuit_cache_path(name: &str) -> Option<std::path::PathBuf> {
+    dirs::cache_dir().map(|d| d.join("psy").join("circuits").join(format!("{name}_v1.bin")))
+}
+
+/// Loads a local circuit from its on-disk cache when present, otherwise builds
+/// it and best-effort writes the cache for next time. Any IO/deserialize
+/// failure falls back to a fresh build, so this can never make startup fail.
+#[cfg(not(target_arch = "wasm32"))]
+fn load_or_build_local_circuit<T>(
+    name: &str,
+    build: impl FnOnce() -> T,
+    load: impl FnOnce(&[u8]) -> anyhow::Result<T>,
+    serialize: impl FnOnce(&T) -> anyhow::Result<Vec<u8>>,
+) -> T {
+    let Some(path) = local_circuit_cache_path(name) else {
+        return build();
+    };
+
+    if path.exists() {
+        match std::fs::read(&path).map_err(anyhow::Error::from).and_then(|b| load(&b)) {
+            Ok(circuit) => {
+                tracing::info!("loaded local circuit `{name}` from cache: {}", path.display());
+                return circuit;
+            }
+            Err(e) => tracing::warn!("failed to load local circuit `{name}` cache ({}), rebuilding: {e}", path.display()),
         }
     }
 
-    pub fn random_circuit_manager(&self) -> &Box<dyn UPSCircuitManager<C, D> + Send + Sync> {
-        let index = rand::random::<usize>() % self.circuit_manager.len();
-        &self.circuit_manager[index]
+    let circuit = build();
+    match serialize(&circuit) {
+        Ok(bytes) => {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            match std::fs::write(&path, &bytes) {
+                Ok(()) => tracing::info!("wrote local circuit `{name}` cache: {}", path.display()),
+                Err(e) => tracing::warn!("failed to write local circuit `{name}` cache {}: {e}", path.display()),
+            }
+        }
+        Err(e) => tracing::warn!("failed to serialize local circuit `{name}` for cache: {e}"),
+    }
+    circuit
+}
+
+/// `PrivateNoteInclusionCircuit` tree heights — must match between build and
+/// load.
+const PRIVATE_NOTE_INCLUSION_HEIGHTS: (usize, usize, usize, usize) = (
+    GLOBAL_USER_TREE_HEIGHT as usize,
+    GLOBAL_CONTRACT_TREE_HEIGHT as usize,
+    MAX_CONTRACT_STATE_TREE_HEIGHT as usize,
+    PRIVATE_NOTE_TREE_HEIGHT,
+);
+
+const LOCAL_CIRCUITS_BUNDLE_VERSION: u32 = 1;
+
+/// All three local base circuits serialized into one JSON document
+/// (`local_circuits.json`). Each field is `base64( circuit bytes )`. zk-sign is
+/// stored full (tiny); the two privacy circuits use the COMPACT encoding
+/// (Merkle tree omitted, rebuilt on load) so the bundle stays small enough to
+/// `include_str!` into the binary / ship to wasm.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct LocalCircuitsBundle {
+    version: u32,
+    zk_signature_inner: String,
+    private_note_inclusion: String,
+    shield_deposit_claim: String,
+}
+
+/// Host-only: producing the bundle builds the (heavy) circuits.
+#[cfg(not(target_arch = "wasm32"))]
+fn encode_circuit_field(bytes: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+fn decode_circuit_field(field: &str) -> anyhow::Result<Vec<u8>> {
+    Ok(base64::engine::general_purpose::STANDARD.decode(field)?)
+}
+
+#[derive(Default)]
+pub struct PsyWalletLocalCircuits {
+    zk_signature_inner: OnceLock<PsyBasicZKSignatureInnerCircuit<C, D>>,
+    private_note_inclusion: OnceLock<PrivateNoteInclusionInnerCircuit<C, D>>,
+    shield_deposit_claim: OnceLock<ShieldDepositClaimInnerCircuit<C, D>>,
+    psy_software_defined_circuits: DashMap<QHashOut<F>, DPNSoftwareDefinedSignatureGadget>,
+    plonky2_software_defined_circuits: DashMap<QHashOut<F>, Plonky2SoftwareDefinedSignatureGadget>,
+    sd_key_circuits: DashMap<QHashOut<F>, SDKeyCircuitGadget>,
+    sd_key_policies: DashMap<QHashOut<F>, SDKeyPolicy>,
+}
+
+impl PsyWalletLocalCircuits {
+    pub fn zk_signature_inner(&self) -> &PsyBasicZKSignatureInnerCircuit<C, D> {
+        self.zk_signature_inner.get_or_init(|| {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                load_or_build_local_circuit(
+                    "zk_signature_inner",
+                    PsyBasicZKSignatureInnerCircuit::<C, D>::new,
+                    PsyBasicZKSignatureInnerCircuit::<C, D>::new_with_serialized_circuit,
+                    PsyBasicZKSignatureInnerCircuit::<C, D>::serialize_circuit_data,
+                )
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                PsyBasicZKSignatureInnerCircuit::<C, D>::new()
+            }
+        })
+    }
+
+    pub fn private_note_inclusion(&self) -> &PrivateNoteInclusionInnerCircuit<C, D> {
+        let (h0, h1, h2, h3) = PRIVATE_NOTE_INCLUSION_HEIGHTS;
+        self.private_note_inclusion.get_or_init(|| {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                load_or_build_local_circuit(
+                    "private_note_inclusion",
+                    || PrivateNoteInclusionInnerCircuit::<C, D>::new(h0, h1, h2, h3),
+                    |bytes| PrivateNoteInclusionInnerCircuit::<C, D>::new_with_serialized_circuit(bytes, h0, h1, h2, h3),
+                    PrivateNoteInclusionInnerCircuit::<C, D>::serialize_circuit_data,
+                )
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                PrivateNoteInclusionInnerCircuit::<C, D>::new(h0, h1, h2, h3)
+            }
+        })
+    }
+
+    pub fn shield_deposit_claim(&self) -> &ShieldDepositClaimInnerCircuit<C, D> {
+        self.shield_deposit_claim.get_or_init(|| {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                load_or_build_local_circuit(
+                    "shield_deposit_claim",
+                    ShieldDepositClaimInnerCircuit::<C, D>::new,
+                    ShieldDepositClaimInnerCircuit::<C, D>::new_with_serialized_circuit,
+                    ShieldDepositClaimInnerCircuit::<C, D>::serialize_circuit_data,
+                )
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                ShieldDepositClaimInnerCircuit::<C, D>::new()
+            }
+        })
+    }
+
+    /// Build all three base circuits fresh and serialize them into
+    /// `local_circuits.json`: zk-sign full (tiny), the two privacy circuits
+    /// COMPACT. Host-only (builds the circuits). Run this to (re)generate
+    /// the embedded bundle.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn to_bundle_json() -> anyhow::Result<String> {
+        let (h0, h1, h2, h3) = PRIVATE_NOTE_INCLUSION_HEIGHTS;
+        let zk = PsyBasicZKSignatureInnerCircuit::<C, D>::new();
+        let mut pni = PrivateNoteInclusionInnerCircuit::<C, D>::new(h0, h1, h2, h3);
+        let mut sdc = ShieldDepositClaimInnerCircuit::<C, D>::new();
+
+        let bundle = LocalCircuitsBundle {
+            version: LOCAL_CIRCUITS_BUNDLE_VERSION,
+            zk_signature_inner: encode_circuit_field(&zk.serialize_circuit_data()?),
+            private_note_inclusion: encode_circuit_field(&pni.serialize_circuit_data_compact()?),
+            shield_deposit_claim: encode_circuit_field(&sdc.serialize_circuit_data_compact()?),
+        };
+        Ok(serde_json::to_string(&bundle)?)
+    }
+
+    /// The embedded `local_circuits.json`, loaded via [`from_bundle_json`].
+    /// Available everywhere (incl. wasm) — this is the intended runtime
+    /// constructor.
+    pub fn from_embedded_bundle() -> anyhow::Result<Self> {
+        tracing::info!("loading local circuits from embedded local_circuits.json");
+        Self::from_bundle_json(include_str!("local_circuits.json"))
+    }
+
+    /// Reconstruct from a `local_circuits.json` bundle. zk-sign is read full;
+    /// the two privacy circuits are read COMPACT (their Merkle tree is
+    /// rebuilt from poly coeffs). The software-defined circuit maps start
+    /// empty (registered dynamically at runtime).
+    pub fn from_bundle_json(json: &str) -> anyhow::Result<Self> {
+        #[cfg(not(target_arch = "wasm32"))]
+        let start = std::time::Instant::now();
+        tracing::info!("loading local circuits from bundle ({} KiB json)", json.len() / 1024);
+
+        let bundle: LocalCircuitsBundle = serde_json::from_str(json)?;
+        if bundle.version != LOCAL_CIRCUITS_BUNDLE_VERSION {
+            bail!(
+                "local circuits bundle version mismatch: expected {}, got {}",
+                LOCAL_CIRCUITS_BUNDLE_VERSION,
+                bundle.version
+            );
+        }
+
+        let (h0, h1, h2, h3) = PRIVATE_NOTE_INCLUSION_HEIGHTS;
+        let inner = PsyBasicZKSignatureInnerCircuit::<C, D>::new_with_serialized_circuit(&decode_circuit_field(&bundle.zk_signature_inner)?)?;
+        tracing::info!("  loaded zk_signature_inner (full)");
+        let pni = PrivateNoteInclusionInnerCircuit::<C, D>::new_with_serialized_circuit_compact(
+            &decode_circuit_field(&bundle.private_note_inclusion)?,
+            h0,
+            h1,
+            h2,
+            h3,
+        )?;
+        tracing::info!("  loaded private_note_inclusion (compact, merkle rebuilt)");
+        let sdc = ShieldDepositClaimInnerCircuit::<C, D>::new_with_serialized_circuit_compact(&decode_circuit_field(&bundle.shield_deposit_claim)?)?;
+        tracing::info!("  loaded shield_deposit_claim (compact, merkle rebuilt)");
+
+        let this = Self::default();
+        let _ = this.zk_signature_inner.set(inner);
+        let _ = this.private_note_inclusion.set(pni);
+        let _ = this.shield_deposit_claim.set(sdc);
+        #[cfg(not(target_arch = "wasm32"))]
+        tracing::info!("local circuits loaded in {:.3?}", start.elapsed());
+        #[cfg(target_arch = "wasm32")]
+        tracing::info!("local circuits loaded");
+        Ok(this)
+    }
+
+    pub fn prove_zk_sign_inner(&self, private_key: QHashOut<F>, sig_hash: QHashOut<F>) -> anyhow::Result<ProofWithPublicInputs<F, C, D>> {
+        self.zk_signature_inner().prove_base(private_key, sig_hash)
+    }
+
+    pub fn private_note_inclusion_verifier_data(&self) -> VerifierOnlyCircuitData<C, D> {
+        self.private_note_inclusion().get_verifier_config_ref().clone()
+    }
+
+    pub fn shield_deposit_claim_verifier_data(&self) -> VerifierOnlyCircuitData<C, D> {
+        self.shield_deposit_claim().get_verifier_config_ref().clone()
     }
 
     pub fn has_psy_software_defined_circuit(&self, fingerprint: &QHashOut<F>) -> bool {
@@ -216,8 +496,8 @@ impl PsyMemoryWallet {
         self.plonky2_software_defined_circuits.contains_key(fingerprint)
     }
 
-    pub fn has_sdk_key_circuit(&self, fingerprint: &QHashOut<F>) -> bool {
-        self.sdk_key_circuits.contains_key(fingerprint)
+    pub fn has_sd_key_circuit(&self, fingerprint: &QHashOut<F>) -> bool {
+        self.sd_key_circuits.contains_key(fingerprint)
     }
 
     pub fn insert_psy_software_defined_circuit(&self, fingerprint: QHashOut<F>, circuit: DPNSoftwareDefinedSignatureGadget) {
@@ -228,8 +508,208 @@ impl PsyMemoryWallet {
         self.plonky2_software_defined_circuits.insert(fingerprint, circuit);
     }
 
-    pub fn insert_sdk_key_circuit(&self, fingerprint: QHashOut<F>, circuit: SDKKeyCircuitGadget) {
-        self.sdk_key_circuits.insert(fingerprint, circuit);
+    pub fn insert_sd_key_circuit(&self, fingerprint: QHashOut<F>, circuit: SDKeyCircuitGadget) {
+        self.sd_key_circuits.insert(fingerprint, circuit);
+    }
+
+    pub fn insert_sd_key_policy(&self, fingerprint: QHashOut<F>, policy: SDKeyPolicy) {
+        self.sd_key_policies.insert(fingerprint, policy);
+    }
+
+    pub fn get_psy_software_defined_circuit(
+        &self,
+        fingerprint: &QHashOut<F>,
+    ) -> Option<dashmap::mapref::one::Ref<'_, QHashOut<F>, DPNSoftwareDefinedSignatureGadget>> {
+        self.psy_software_defined_circuits.get(fingerprint)
+    }
+
+    pub fn get_psy_software_defined_circuit_mut(
+        &self,
+        fingerprint: &QHashOut<F>,
+    ) -> Option<dashmap::mapref::one::RefMut<'_, QHashOut<F>, DPNSoftwareDefinedSignatureGadget>> {
+        self.psy_software_defined_circuits.get_mut(fingerprint)
+    }
+
+    pub fn get_plonky2_software_defined_circuit(
+        &self,
+        fingerprint: &QHashOut<F>,
+    ) -> Option<dashmap::mapref::one::Ref<'_, QHashOut<F>, Plonky2SoftwareDefinedSignatureGadget>> {
+        self.plonky2_software_defined_circuits.get(fingerprint)
+    }
+
+    pub fn get_plonky2_software_defined_circuit_mut(
+        &self,
+        fingerprint: &QHashOut<F>,
+    ) -> Option<dashmap::mapref::one::RefMut<'_, QHashOut<F>, Plonky2SoftwareDefinedSignatureGadget>> {
+        self.plonky2_software_defined_circuits.get_mut(fingerprint)
+    }
+
+    pub fn get_sd_key_circuit(&self, fingerprint: &QHashOut<F>) -> Option<dashmap::mapref::one::Ref<'_, QHashOut<F>, SDKeyCircuitGadget>> {
+        self.sd_key_circuits.get(fingerprint)
+    }
+
+    pub fn get_sd_key_circuit_mut(&self, fingerprint: &QHashOut<F>) -> Option<dashmap::mapref::one::RefMut<'_, QHashOut<F>, SDKeyCircuitGadget>> {
+        self.sd_key_circuits.get_mut(fingerprint)
+    }
+
+    pub fn get_sd_key_policy(&self, fingerprint: &QHashOut<F>) -> Option<SDKeyPolicy> {
+        self.sd_key_policies.get(fingerprint).map(|entry| entry.value().clone())
+    }
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), maybe_async::maybe_async)]
+#[cfg_attr(target_arch = "wasm32", maybe_async::maybe_async(?Send))]
+impl PsyMemoryWallet {
+    pub fn new(circuit_manager: Vec<Box<dyn UPSCircuitManager<C, D> + Send + Sync>>) -> Self {
+        Self::new_with_local_circuits(circuit_manager, PsyWalletLocalCircuits::default())
+    }
+
+    pub fn new_with_local_circuits(
+        circuit_manager: Vec<Box<dyn UPSCircuitManager<C, D> + Send + Sync>>,
+        local_circuits: PsyWalletLocalCircuits,
+    ) -> Self {
+        Self {
+            signature_users: DashMap::new(),
+            local_circuits,
+            circuit_manager,
+            fallback_minifiers: FallbackMinifierCircuits::default(),
+            trace_contract_code_cache: DashMap::new(),
+        }
+    }
+
+    pub fn local_circuits(&self) -> &PsyWalletLocalCircuits {
+        &self.local_circuits
+    }
+
+    pub fn fallback_private_note_inclusion_minifier_fingerprint(&self) -> QHashOut<F> {
+        self.fallback_minifiers.private_note_inclusion().get_fingerprint()
+    }
+
+    pub fn fallback_private_note_inclusion_minifier_verifier_data(&self) -> VerifierOnlyCircuitData<C, D> {
+        self.fallback_minifiers.private_note_inclusion().get_verifier_config_ref().clone()
+    }
+
+    /// Produce a base proof from the local (base-only) circuit, then minify it
+    /// via the circuit manager (server-side). Returns the MINIFIED
+    /// fingerprint/proof/verifier — what the network registers and
+    /// verifies. Mirrors `prove_zk_sign`.
+    pub async fn prove_private_note_inclusion(
+        &self,
+        input: &PrivateNoteInclusionInput<F>,
+    ) -> anyhow::Result<(QHashOut<F>, ProofWithPublicInputs<F, C, D>, AltVerifierOnlyCircuitData<F>)> {
+        let base_proof = self.local_circuits.private_note_inclusion().prove(input)?;
+        let manager = self.random_circuit_manager();
+        let (minified, fingerprint, verifier) = match manager.prove_private_note_inclusion_minifier(base_proof.clone()).await {
+            Ok(minified) => {
+                let fingerprint = manager.private_note_inclusion_minifier_fingerprint().await?;
+                let verifier = manager.private_note_inclusion_minifier_verifier_config().await?;
+                (minified, fingerprint, verifier)
+            }
+            Err(err) => {
+                tracing::warn!("private note inclusion minifier proxy failed, falling back to local circuit: {err}");
+                let circuit = self.fallback_minifiers.private_note_inclusion();
+                let minified = circuit.prove_minifier(base_proof)?;
+                (minified, circuit.get_fingerprint(), circuit.get_verifier_config_ref().clone())
+            }
+        };
+        Ok((fingerprint, minified, verifier.into()))
+    }
+
+    pub async fn prove_shield_deposit_claim(
+        &self,
+        input: &DepositInclusionInput<F>,
+    ) -> anyhow::Result<(QHashOut<F>, ProofWithPublicInputs<F, C, D>, AltVerifierOnlyCircuitData<F>)> {
+        let base_proof = self.local_circuits.shield_deposit_claim().prove(input)?;
+        let manager = self.random_circuit_manager();
+        let (minified, fingerprint, verifier) = match manager.prove_shield_deposit_claim_minifier(base_proof.clone()).await {
+            Ok(minified) => {
+                let fingerprint = manager.shield_deposit_claim_minifier_fingerprint().await?;
+                let verifier = manager.shield_deposit_claim_minifier_verifier_config().await?;
+                (minified, fingerprint, verifier)
+            }
+            Err(err) => {
+                tracing::warn!("shield deposit claim minifier proxy failed, falling back to local circuit: {err}");
+                let circuit = self.fallback_minifiers.shield_deposit_claim();
+                let minified = circuit.prove_minifier(base_proof)?;
+                (minified, circuit.get_fingerprint(), circuit.get_verifier_config_ref().clone())
+            }
+        };
+        Ok((fingerprint, minified, verifier.into()))
+    }
+
+    pub async fn zk_circuit_fingerprint(&self) -> anyhow::Result<QHashOut<F>> {
+        self.random_circuit_manager().zk_signature_minifier_fingerprint().await
+    }
+
+    pub async fn zk_circuit_verifier_config(&self) -> anyhow::Result<VerifierOnlyCircuitData<C, D>> {
+        self.random_circuit_manager().zk_signature_minifier_verifier_config().await
+    }
+
+    pub async fn prove_zk_sign(&self, private_key: QHashOut<F>, sig_hash: QHashOut<F>) -> anyhow::Result<ProofWithPublicInputs<F, C, D>> {
+        let inner_proof = self.local_circuits.prove_zk_sign_inner(private_key, sig_hash)?;
+        match self.random_circuit_manager().prove_zk_sign_minifier(inner_proof.clone()).await {
+            Ok(proof) => Ok(proof),
+            Err(err) => {
+                tracing::warn!("zk sign minifier proxy failed, falling back to local circuit: {err}");
+                self.fallback_minifiers.zk_signature().prove_minifier(inner_proof)
+            }
+        }
+    }
+
+    pub fn random_circuit_manager(&self) -> &Box<dyn UPSCircuitManager<C, D> + Send + Sync> {
+        let index = rand::random::<usize>() % self.circuit_manager.len();
+        &self.circuit_manager[index]
+    }
+
+    /// Register trace-provided contract circuits on every proving manager.
+    ///
+    /// Stateless step proving creates no long-lived session manager, so the
+    /// contract circuits referenced by a trace must be available on whichever
+    /// manager later gets picked for proving. Registering on all managers
+    /// avoids nondeterministic misses under multi-manager / multi-proxy
+    /// configs.
+    pub async fn register_contract_circuits_all(&self, contract_id: u64, contract_code: &ContractCodeDefinition) -> anyhow::Result<()> {
+        for mgr in &self.circuit_manager {
+            mgr.register_contract_circuits(contract_id, contract_code).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn ensure_trace_contract_circuits_registered(&self, contract_id: u64, contract_code_bytes: &[u8]) -> anyhow::Result<()> {
+        if let Some(existing) = self.trace_contract_code_cache.get(&contract_id) {
+            if existing.as_slice() == contract_code_bytes {
+                return Ok(());
+            }
+        }
+
+        let contract_code: ContractCodeDefinition = bincode::deserialize(contract_code_bytes)?;
+        self.register_contract_circuits_all(contract_id, &contract_code).await?;
+        self.trace_contract_code_cache.insert(contract_id, contract_code_bytes.to_vec());
+        Ok(())
+    }
+
+    pub fn has_psy_software_defined_circuit(&self, fingerprint: &QHashOut<F>) -> bool {
+        self.local_circuits.has_psy_software_defined_circuit(fingerprint)
+    }
+
+    pub fn has_plonky2_software_defined_circuit(&self, fingerprint: &QHashOut<F>) -> bool {
+        self.local_circuits.has_plonky2_software_defined_circuit(fingerprint)
+    }
+
+    pub fn has_sd_key_circuit(&self, fingerprint: &QHashOut<F>) -> bool {
+        self.local_circuits.has_sd_key_circuit(fingerprint)
+    }
+
+    pub fn insert_psy_software_defined_circuit(&self, fingerprint: QHashOut<F>, circuit: DPNSoftwareDefinedSignatureGadget) {
+        self.local_circuits.insert_psy_software_defined_circuit(fingerprint, circuit);
+    }
+
+    pub fn insert_plonky2_software_defined_circuit(&self, fingerprint: QHashOut<F>, circuit: Plonky2SoftwareDefinedSignatureGadget) {
+        self.local_circuits.insert_plonky2_software_defined_circuit(fingerprint, circuit);
+    }
+
+    pub fn insert_sd_key_circuit(&self, fingerprint: QHashOut<F>, circuit: SDKeyCircuitGadget) {
+        self.local_circuits.insert_sd_key_circuit(fingerprint, circuit);
     }
 
     pub async fn add_zk_private_key(&mut self, private_key: QHashOut<F>) -> anyhow::Result<ZKPublicKeyInfo<F>> {
@@ -256,7 +736,7 @@ impl PsyMemoryWallet {
     pub async fn get_zk_pk_info(&self, private_key: QHashOut<F>) -> anyhow::Result<ZKPublicKeyInfo<F>> {
         let simple_key = SimplePsyPrivateKey { private_key };
         let public_key_param = simple_key.get_public_key_param::<PoseidonHash>();
-        let fingerprint = self.random_circuit_manager().zk_circuit_fingerprint().await?;
+        let fingerprint = self.zk_circuit_fingerprint().await?;
         Ok(ZKPublicKeyInfo {
             fingerprint,
             public_key_param,
@@ -350,8 +830,8 @@ impl PsyMemoryWallet {
         Ok(pk_info)
     }
 
-    pub async fn add_sdk_key_private_key(&mut self, private_key: QHashOut<F>, fingerprint: QHashOut<F>) -> anyhow::Result<ZKPublicKeyInfo<F>> {
-        let user: Arc<dyn SignatureUser> = Arc::new(SDKKeyUser::new(private_key, fingerprint));
+    pub async fn add_sd_key_private_key(&mut self, private_key: QHashOut<F>, fingerprint: QHashOut<F>) -> anyhow::Result<ZKPublicKeyInfo<F>> {
+        let user: Arc<dyn SignatureUser> = Arc::new(SDKeyUser::new(private_key, fingerprint));
         let manager = self.random_circuit_manager();
         let manager_ref = manager.as_ref();
         let pk_info = user.public_key_info(self, manager_ref).await?;
@@ -362,7 +842,7 @@ impl PsyMemoryWallet {
 
     pub async fn get_or_create_user(&mut self, private_key: QHashOut<F>, fingerprint: QHashOut<F>) -> anyhow::Result<ZKPublicKeyInfo<F>> {
         let manager = self.random_circuit_manager();
-        let zk_fingerprint = manager.zk_circuit_fingerprint().await?;
+        let zk_fingerprint = self.zk_circuit_fingerprint().await?;
         let secp_fingerprint = manager.secp_circuit_fingerprint().await?;
 
         if fingerprint == zk_fingerprint {
@@ -370,12 +850,12 @@ impl PsyMemoryWallet {
         } else if fingerprint == secp_fingerprint {
             self.add_secp_private_key(private_key).await
         } else {
-            if self.psy_software_defined_circuits.contains_key(&fingerprint) {
+            if self.local_circuits.has_psy_software_defined_circuit(&fingerprint) {
                 self.add_software_defined_dpn_private_key(private_key, fingerprint).await
-            } else if self.plonky2_software_defined_circuits.contains_key(&fingerprint) {
+            } else if self.local_circuits.has_plonky2_software_defined_circuit(&fingerprint) {
                 self.add_software_defined_plonky2_private_key(private_key, fingerprint).await
-            } else if self.sdk_key_circuits.contains_key(&fingerprint) {
-                self.add_sdk_key_private_key(private_key, fingerprint).await
+            } else if self.local_circuits.has_sd_key_circuit(&fingerprint) {
+                self.add_sd_key_private_key(private_key, fingerprint).await
             } else {
                 bail!(
                     "Software defined circuit with fingerprint {} is not registered. Please register the circuit first.",
@@ -393,7 +873,7 @@ impl PsyMemoryWallet {
     }
 
     pub async fn zk_sign_with_private_key(&self, private_key: QHashOut<F>, sig_hash: QHashOut<F>) -> anyhow::Result<ProofWithPublicInputs<F, C, D>> {
-        self.random_circuit_manager().prove_zk_sign(private_key, sig_hash).await
+        self.prove_zk_sign(private_key, sig_hash).await
     }
 
     pub fn sdc_sign_for_public_key<
@@ -444,7 +924,7 @@ impl PsyMemoryWallet {
 
 impl PsyMemoryWallet {
     pub async fn register_psy_software_defined_circuit(
-        &mut self,
+        &self,
         fn_def: psy_vm::dpn::vm::def::DPNFunctionCircuitDefinition,
         force_four_align: bool,
     ) -> anyhow::Result<QHashOut<F>> {
@@ -468,18 +948,15 @@ impl PsyMemoryWallet {
 
         tracing::info!("register PSY software defined circuit: {}", fingerprint.to_string());
 
-        if let Some(_) = self.psy_software_defined_circuits.insert(fingerprint, gadget) {
+        if self.local_circuits.has_psy_software_defined_circuit(&fingerprint) {
             tracing::warn!("PSY software defined circuit `{}` is already registered", fingerprint.to_string());
         }
+        self.local_circuits.insert_psy_software_defined_circuit(fingerprint, gadget);
 
         Ok(fingerprint)
     }
 
-    pub async fn register_plonky2_software_defined_circuit(
-        &mut self,
-        contract_state_tree_height: u8,
-        input_len: usize,
-    ) -> anyhow::Result<QHashOut<F>> {
+    pub async fn register_plonky2_software_defined_circuit(&self, contract_state_tree_height: u8, input_len: usize) -> anyhow::Result<QHashOut<F>> {
         let config = plonky2::plonk::circuit_data::CircuitConfig::standard_recursion_config();
         let mut builder = plonky2::plonk::circuit_builder::CircuitBuilder::<F, D>::new(config);
 
@@ -489,33 +966,43 @@ impl PsyMemoryWallet {
 
         tracing::info!("register PLONKY2 software defined circuit: {}", fingerprint.to_string());
 
-        if let Some(_) = self.plonky2_software_defined_circuits.insert(fingerprint, gadget) {
+        if self.local_circuits.has_plonky2_software_defined_circuit(&fingerprint) {
             tracing::warn!("PLONKY2 software defined circuit `{}` is already registered", fingerprint.to_string());
         }
+        self.local_circuits.insert_plonky2_software_defined_circuit(fingerprint, gadget);
 
         Ok(fingerprint)
     }
 
-    pub async fn register_allow_method_sdk_key_circuit(
-        &mut self,
+    pub async fn register_allow_method_sd_key_circuit(
+        &self,
         allowed_contract_ids: &[u64],
-        allowed_method_ids: &[u64],
+        allowed_method_ids: &[u32],
         expected_tx_count: u64,
     ) -> anyhow::Result<QHashOut<F>> {
-        let gadget = build_allow_method_sdk_key_circuit(allowed_contract_ids, allowed_method_ids, expected_tx_count)?;
+        let gadget = build_allow_method_sd_key_circuit(allowed_contract_ids, allowed_method_ids, expected_tx_count)?;
         let fingerprint = gadget.get_fingerprint();
 
         tracing::info!(
-            "register allow-method SDK key circuit: fingerprint={}, contract_ids={:?}, method_ids={:?}, expected_tx_count={}",
+            "register allow-method SD key circuit: fingerprint={}, contract_ids={:?}, method_ids={:?}, expected_tx_count={}",
             fingerprint.to_string(),
             allowed_contract_ids,
             allowed_method_ids,
             expected_tx_count
         );
 
-        if let Some(_) = self.sdk_key_circuits.insert(fingerprint, gadget) {
-            tracing::warn!("SDK key circuit `{}` is already registered", fingerprint.to_string());
+        if self.local_circuits.has_sd_key_circuit(&fingerprint) {
+            tracing::warn!("SD key circuit `{}` is already registered", fingerprint.to_string());
         }
+        self.local_circuits.insert_sd_key_circuit(fingerprint, gadget);
+        self.local_circuits.insert_sd_key_policy(
+            fingerprint,
+            SDKeyPolicy {
+                allowed_contract_ids: allowed_contract_ids.to_vec(),
+                allowed_method_ids: allowed_method_ids.to_vec(),
+                expected_tx_count,
+            },
+        );
 
         Ok(fingerprint)
     }
@@ -524,36 +1011,40 @@ impl PsyMemoryWallet {
         &self,
         fingerprint: &QHashOut<F>,
     ) -> Option<dashmap::mapref::one::Ref<'_, QHashOut<F>, DPNSoftwareDefinedSignatureGadget>> {
-        self.psy_software_defined_circuits.get(fingerprint)
+        self.local_circuits.get_psy_software_defined_circuit(fingerprint)
     }
 
     pub fn get_psy_software_defined_circuit_mut(
         &self,
         fingerprint: &QHashOut<F>,
     ) -> Option<dashmap::mapref::one::RefMut<'_, QHashOut<F>, DPNSoftwareDefinedSignatureGadget>> {
-        self.psy_software_defined_circuits.get_mut(fingerprint)
+        self.local_circuits.get_psy_software_defined_circuit_mut(fingerprint)
     }
 
     pub fn get_plonky2_software_defined_circuit(
         &self,
         fingerprint: &QHashOut<F>,
     ) -> Option<dashmap::mapref::one::Ref<'_, QHashOut<F>, Plonky2SoftwareDefinedSignatureGadget>> {
-        self.plonky2_software_defined_circuits.get(fingerprint)
+        self.local_circuits.get_plonky2_software_defined_circuit(fingerprint)
     }
 
     pub fn get_plonky2_software_defined_circuit_mut(
         &self,
         fingerprint: &QHashOut<F>,
     ) -> Option<dashmap::mapref::one::RefMut<'_, QHashOut<F>, Plonky2SoftwareDefinedSignatureGadget>> {
-        self.plonky2_software_defined_circuits.get_mut(fingerprint)
+        self.local_circuits.get_plonky2_software_defined_circuit_mut(fingerprint)
     }
 
-    pub fn get_sdk_key_circuit(&self, fingerprint: &QHashOut<F>) -> Option<dashmap::mapref::one::Ref<'_, QHashOut<F>, SDKKeyCircuitGadget>> {
-        self.sdk_key_circuits.get(fingerprint)
+    pub fn get_sd_key_circuit(&self, fingerprint: &QHashOut<F>) -> Option<dashmap::mapref::one::Ref<'_, QHashOut<F>, SDKeyCircuitGadget>> {
+        self.local_circuits.get_sd_key_circuit(fingerprint)
     }
 
-    pub fn get_sdk_key_circuit_mut(&self, fingerprint: &QHashOut<F>) -> Option<dashmap::mapref::one::RefMut<'_, QHashOut<F>, SDKKeyCircuitGadget>> {
-        self.sdk_key_circuits.get_mut(fingerprint)
+    pub fn get_sd_key_circuit_mut(&self, fingerprint: &QHashOut<F>) -> Option<dashmap::mapref::one::RefMut<'_, QHashOut<F>, SDKeyCircuitGadget>> {
+        self.local_circuits.get_sd_key_circuit_mut(fingerprint)
+    }
+
+    pub fn get_sd_key_policy(&self, fingerprint: &QHashOut<F>) -> Option<SDKeyPolicy> {
+        self.local_circuits.get_sd_key_policy(fingerprint)
     }
 }
 
@@ -571,6 +1062,101 @@ mod tests {
     type F = GoldilocksField;
     type C = PoseidonGoldilocksConfig;
     const D: usize = 2;
+
+    /// Measures pure-Rust deflate (flate2/miniz_oxide, wasm-compatible)
+    /// compression ratio on the base circuit bytes, to see whether
+    /// wasm-side compression is worthwhile. `cargo test -p psy_prover
+    /// base_circuit_compression_ratio -- --nocapture`
+    #[test]
+    fn base_circuit_compression_ratio() -> Result<()> {
+        use std::io::Write;
+
+        use flate2::{write::DeflateEncoder, Compression};
+
+        fn deflate(bytes: &[u8], level: u32) -> std::io::Result<usize> {
+            let mut e = DeflateEncoder::new(Vec::new(), Compression::new(level));
+            e.write_all(bytes)?;
+            Ok(e.finish()?.len())
+        }
+
+        let circuits = PsyWalletLocalCircuits::default();
+        for (name, raw) in [
+            ("zk_signature_inner", circuits.zk_signature_inner().serialize_circuit_data()?),
+            ("private_note_inclusion", circuits.private_note_inclusion().serialize_circuit_data()?),
+            ("shield_deposit_claim", circuits.shield_deposit_claim().serialize_circuit_data()?),
+        ] {
+            let raw_len = raw.len();
+            let l1 = deflate(&raw, 1)?;
+            let l6 = deflate(&raw, 6)?;
+            let l9 = deflate(&raw, 9)?;
+            println!(
+                "{name:<24} raw {:>6} KiB | deflate L1 {:>6} KiB ({:.2}x) L6 {:>6} KiB ({:.2}x) L9 {:>6} KiB ({:.2}x)",
+                raw_len / 1024,
+                l1 / 1024,
+                raw_len as f64 / l1 as f64,
+                l6 / 1024,
+                raw_len as f64 / l6 as f64,
+                l9 / 1024,
+                raw_len as f64 / l9 as f64,
+            );
+        }
+        Ok(())
+    }
+
+    /// `to_bundle_json` (compact privacy) -> `from_bundle_json`, asserting
+    /// every circuit survives (zk-sign data identical; privacy fingerprints
+    /// match after Merkle rebuild). `cargo test -p psy_prover
+    /// local_circuits_bundle_json_round_trip -- --nocapture`
+    #[test]
+    fn local_circuits_bundle_json_round_trip() -> Result<()> {
+        let json = PsyWalletLocalCircuits::to_bundle_json()?;
+        let restored = PsyWalletLocalCircuits::from_bundle_json(&json)?;
+
+        // The freshly-built reference to compare fingerprints against.
+        let (h0, h1, h2, h3) = PRIVATE_NOTE_INCLUSION_HEIGHTS;
+        assert_eq!(
+            restored.private_note_inclusion().get_fingerprint(),
+            PrivateNoteInclusionInnerCircuit::<C, D>::new(h0, h1, h2, h3).get_fingerprint()
+        );
+        assert_eq!(
+            restored.shield_deposit_claim().get_fingerprint(),
+            ShieldDepositClaimInnerCircuit::<C, D>::new().get_fingerprint()
+        );
+        // zk-sign provable: rebuilt circuit verifies a proof it produces.
+        let proof = restored.prove_zk_sign_inner(QHashOut::<F>::rand(), QHashOut::<F>::rand())?;
+        restored.zk_signature_inner().circuit_data.verify(proof)?;
+
+        println!("local_circuits.json (zk-sign full + privacy compact): {} MiB", json.len() / 1024 / 1024);
+        Ok(())
+    }
+
+    /// The embedded `local_circuits.json` loads (incl. compact Merkle rebuild
+    /// for the two privacy circuits) and the zk-sign circuit proves &
+    /// verifies. Reports load time. `cargo test -p psy_prover
+    /// from_embedded_bundle_loads --release -- --nocapture`
+    #[test]
+    fn from_embedded_bundle_loads() -> Result<()> {
+        let t = std::time::Instant::now();
+        let circuits = PsyWalletLocalCircuits::from_embedded_bundle()?;
+        let load = t.elapsed();
+        let proof = circuits.prove_zk_sign_inner(QHashOut::<F>::rand(), QHashOut::<F>::rand())?;
+        circuits.zk_signature_inner().circuit_data.verify(proof)?;
+        println!("from_embedded_bundle() load time: {:.3?}", load);
+        Ok(())
+    }
+
+    /// Regenerates the embedded `src/wallet/local_circuits.json`. Run
+    /// explicitly: `cargo test -p psy_prover generate_local_circuits_json
+    /// -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn generate_local_circuits_json() -> Result<()> {
+        let json = PsyWalletLocalCircuits::to_bundle_json()?;
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/wallet/local_circuits.json");
+        std::fs::write(path, &json)?;
+        println!("wrote {} ({} MiB)", path, json.len() / 1024 / 1024);
+        Ok(())
+    }
 
     #[test]
     fn test_raw_secp256k1_sign() -> Result<()> {

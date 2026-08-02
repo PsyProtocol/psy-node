@@ -182,11 +182,7 @@ fn get_slot_mask(length: u64, sub_slot_index: u64) -> [u8; 4] {
 impl<
         F: RichField + PrimeField64,
         H: MerkleZeroHasherWithMarkedLeaf<QHashOut<F>> + FieldQHasher<F> + Send,
-        R: PsyReadCommandProcessorSync<F>
-            + psy_client_data::qstore::imm::cmd_processor::QUserIdManager
-            + QMetaDataStoreReaderSync<F>
-            + Send
-            + Sync,
+        R: PsyReadCommandProcessorSync<F> + psy_client_data::qstore::imm::cmd_processor::QUserIdManager + QMetaDataStoreReaderSync<F> + Send + Sync,
     > PsyCmdInputWitnessResolver<F, H> for PsyLocalProvingSessionStore<F, R, H>
 {
     async fn resolve_vec(&mut self, state_cmd: &DPNStateCmd<u64>) -> anyhow::Result<PsyCmdWithInputAndWitness<F>> {
@@ -232,8 +228,7 @@ impl<
                 let cur = mp.value.0.elements;
                 if c.condition == 0 {
                     let dmp = mp_to_dmp(mp);
-
-                    let result = vec![F::from_canonical_u64(c.value)];
+                    let result = vec![cur[n], cur[n]];
                     let witness = DPNStateCmdWitness::DeltaMerkleProof(dmp);
                     Ok(PsyCmdWithInputAndWitness {
                         state_cmd: state_cmd.clone(),
@@ -247,7 +242,7 @@ impl<
                     let dmp = self
                         .set_contract_state_slot(current_contract_id, slot_index, QHashOut(HashOut { elements: new_elements }))
                         .await?;
-                    let result = vec![F::from_canonical_u64(c.value)];
+                    let result = vec![cur[n], F::from_canonical_u64(c.value)];
                     let witness = DPNStateCmdWitness::DeltaMerkleProof(dmp);
                     Ok(PsyCmdWithInputAndWitness {
                         state_cmd: state_cmd.clone(),
@@ -1087,14 +1082,19 @@ impl<
                     })
                 } else {
                     let insertion_proof = self.add_deferred_tx_to_debt(call_data.clone())?;
+                    let call_hash = call_data.qfhash::<<Self as PsyReadLocalProvingSessionStoreMut<F>>::Hasher>();
+                    tracing::debug!(
+                        "deferred_witness insertion_proof old_root={} new_root={} old_value={} new_value={} call_hash={}",
+                        insertion_proof.old_root,
+                        insertion_proof.new_root,
+                        insertion_proof.old_value,
+                        insertion_proof.new_value,
+                        call_hash
+                    );
 
                     Ok(PsyCmdWithInputAndWitness {
                         state_cmd: state_cmd.clone(),
-                        result: call_data
-                            .qfhash::<<Self as PsyReadLocalProvingSessionStoreMut<F>>::Hasher>()
-                            .0
-                            .elements
-                            .to_vec(),
+                        result: call_hash.0.elements.to_vec(),
                         witness: DPNStateCmdWitness::InvokeExternalContractFunctionDeferred(DPNInvokeDeferredMethodCallWitness {
                             call_data,
                             insertion_proof,
@@ -1319,18 +1319,12 @@ impl<
                                 returned_leaf_key = %existing_leaf.key,
                                 "IMT key lookup returned non-matching leaf; treating as insert"
                             );
-                            (
-                                true,
-                                validate_imt_next_append_index(next_append_index, state_slot_base, capacity)?,
-                            )
+                            (true, validate_imt_next_append_index(next_append_index, state_slot_base, capacity)?)
                         }
                     }
                     Err(err) if is_imt_key_not_found_error(&err) => {
                         let next_append_index = self.resolve_contract_state_imt_get_next_append_index_mut(&next_append_lookup).await?;
-                        (
-                            true,
-                            validate_imt_next_append_index(next_append_index, state_slot_base, capacity)?,
-                        )
+                        (true, validate_imt_next_append_index(next_append_index, state_slot_base, capacity)?)
                     }
                     Err(err) => return Err(err),
                 };
@@ -1440,11 +1434,7 @@ impl<
                                 .resolve_contract_state_imt_get_leaf_preimage_mut(&sentinel_preimage_lookup)
                                 .await
                                 .unwrap_or_default();
-                            (
-                                false,
-                                state_slot_base,
-                                validate_imt_preimage(sentinel, state_slot_base, capacity)?,
-                            )
+                            (false, state_slot_base, validate_imt_preimage(sentinel, state_slot_base, capacity)?)
                         }
                         Err(err) => return Err(err),
                     };
@@ -1509,11 +1499,10 @@ impl<
                     state_slot_base,
                     capacity,
                 };
-                let leaf_slot_index = validate_imt_leaf_index(
-                    self.resolve_contract_state_imt_get_leaf_index_for_key_mut(&leaf_index_lookup).await?,
-                    state_slot_base,
-                    capacity,
-                )?;
+                let leaf_slot_index = match self.resolve_contract_state_imt_get_leaf_index_for_key_mut(&leaf_index_lookup).await {
+                    Ok(idx) => validate_imt_leaf_index(idx, state_slot_base, capacity)?,
+                    Err(err) => return Err(err),
+                };
                 let state_slot_index = F::from_canonical_u64(leaf_slot_index);
 
                 let merkle_witness = self.get_contract_state_slot(current_contract_id, state_slot_index).await?;
@@ -2121,8 +2110,10 @@ impl<F: RichField + PrimeField64> PsyEvalSessionResult<F> {
             })
             .collect::<Vec<u64>>();
         let new_cmd = cmd.convert_to_u64(&real_inputs);
+        tracing::debug!("process_state_cmd original={:?} real_inputs={:?} new_cmd={:?}", cmd, real_inputs, new_cmd);
 
         let r = sesh.resolve_vec(&new_cmd).await?;
+        tracing::debug!("process_state_cmd resolved result={:?}", r.result);
         self.cmd_witnesses.push(r);
         Ok(())
     }
@@ -2213,7 +2204,7 @@ impl<F: RichField + PrimeField64> PsyEvalSessionResult<F> {
             + PsyCmdInputWitnessResolver<F, <S as PsyReadLocalProvingSessionStoreMut<F>>::Hasher>,
     {
         let start_session_ctx = sesh.get_fresh_start_ctx_for_user(sesh.get_current_user_id()).await?;
-        let call_data_ctx = sesh
+        let mut call_data_ctx = sesh
             .get_call_start_data(sesh.get_current_contract_id(), F::from_canonical_u32(fn_def.method_id), &inputs)
             .await?;
 
@@ -2273,10 +2264,7 @@ impl<F: RichField + PrimeField64> PsyEvalSessionResult<F> {
             tracing::trace!("ASSERTION: msg={} left={} right={}", assertion.message, left, right);
             if left != right {
                 if assertion.message.contains("proof tree root mismatch") {
-                    tracing::error!(
-                        "ASSERTION FAILED: proof tree root mismatch — cmp_field={} expected_field={}",
-                        left, right,
-                    );
+                    tracing::error!("ASSERTION FAILED: proof tree root mismatch — cmp_field={} expected_field={}", left, right,);
                 }
                 anyhow::bail!("assertion failed: {} (left: {}, right: {})", assertion.message, left, right);
             }
@@ -2305,14 +2293,54 @@ impl<F: RichField + PrimeField64> PsyEvalSessionResult<F> {
         sesh.write_events(events.clone());
 
         let outputs = fn_def.circuit_outputs.iter().map(|x| executor.resolve_target(*x)).collect::<Vec<F>>();
-        let end_ctx = DapenCFCUserTransactionEndContext {
-            end_contract_state_tree_root: sesh.get_contract_state_slot(sesh.get_current_contract_id(), F::ZERO).await?.root,
+        let end_contract_state_tree_root = if let Some(tracker) = sesh
+            .get_local_state_tracker()
+            .contracts
+            .get(&sesh.get_current_contract_id().to_canonical_u64())
+        {
+            tracker.end_state_root
+        } else {
+            sesh.get_contract_state_slot(sesh.get_current_contract_id(), F::ZERO).await?.root
+        };
+        let mut end_ctx = DapenCFCUserTransactionEndContext {
+            end_contract_state_tree_root,
             end_deferred_tx_debt_tree_root: sesh.get_latest_deferred_tx_leaf()?.root,
             outputs_hash: safe_hash_fixed_length::<<S as PsyReadLocalProvingSessionStoreMut<F>>::Hasher, F>(&outputs),
             outputs_length: F::from_noncanonical_u64(outputs.len() as u64),
             total_events_emitted,
             total_balance_spent: F::from_noncanonical_u64(0),
         };
+
+        // Root-consistency fix for deferred commands:
+        // If this tx enqueued deferred children, align the tx input context roots
+        // with the actual insertion proof roots captured in the command witness.
+        let deferred_witnesses = self
+            .cmd_witnesses
+            .iter()
+            .filter_map(|w| match &w.witness {
+                DPNStateCmdWitness::InvokeExternalContractFunctionDeferred(dw) => Some(dw),
+                _ => None,
+            })
+            .collect::<Vec<&DPNInvokeDeferredMethodCallWitness<F>>>();
+        if let (Some(first), Some(last)) = (deferred_witnesses.first(), deferred_witnesses.last()) {
+            if call_data_ctx.start_deferred_tx_debt_tree_root != first.insertion_proof.old_root {
+                tracing::warn!(
+                    "adjusting start_deferred_tx_debt_tree_root from {} to {} to match deferred insertion proof",
+                    call_data_ctx.start_deferred_tx_debt_tree_root,
+                    first.insertion_proof.old_root
+                );
+                call_data_ctx.start_deferred_tx_debt_tree_root = first.insertion_proof.old_root;
+            }
+            if end_ctx.end_deferred_tx_debt_tree_root != last.insertion_proof.new_root {
+                tracing::warn!(
+                    "adjusting end_deferred_tx_debt_tree_root from {} to {} to match deferred insertion proof",
+                    end_ctx.end_deferred_tx_debt_tree_root,
+                    last.insertion_proof.new_root
+                );
+                end_ctx.end_deferred_tx_debt_tree_root = last.insertion_proof.new_root;
+            }
+        }
+
         let input_ctx = DapenCFCUserTransactionInputContext {
             proving_session_start_ctx: start_session_ctx,
             transaction_call_start_ctx: call_data_ctx,

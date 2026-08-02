@@ -207,9 +207,9 @@ mod tests {
             keystore_path,
             wallet_password,
             fingerprint: None,
-            sdk_key_allowed_contract_id: vec![],
-            sdk_key_allowed_method_id: vec![],
-            sdk_key_expected_tx_count: 2,
+            sd_key_allowed_contract_id: vec![5, 0, 0],
+            sd_key_allowed_method_id: vec![3375543263, 354447671, 2923993647],
+            sd_key_expected_tx_count: 3,
         };
         let info = load_wallet_key_info(&wallet_args, false)?;
         Ok(Some(QHashOut::<F>::from_str(&info.private_key.to_string())?))
@@ -217,7 +217,7 @@ mod tests {
 
     #[test]
     fn test_generate_genesis_block_setup_data_for_local_devnet() -> anyhow::Result<()> {
-let genesis_bytes: &[u8] = include_bytes!("../../../../../psy-genesis/genesis_contracts.json");
+        let genesis_bytes: &[u8] = include_bytes!("../../../../../psy-genesis/genesis_contracts.json");
         let contracts: Vec<PQBCDeployContract<QHashOut<F>>> = match serde_json::from_slice(genesis_bytes) {
             Ok(v) => v,
             Err(_) => {
@@ -229,7 +229,7 @@ let genesis_bytes: &[u8] = include_bytes!("../../../../../psy-genesis/genesis_co
         let mut private_keys = Vec::with_capacity(1 << 19);
 
         let zk_fingerprint = QHashOut::<F>::from_values(ZK_FINGERPRINT_U64[0], ZK_FINGERPRINT_U64[1], ZK_FINGERPRINT_U64[2], ZK_FINGERPRINT_U64[3]);
-        let sd_key_fingerprint = QHashOut::<F>::from_str("ade963d92bbf8772d671fd90a15e00e34897fc3ef6733dc588e1976ebfd222e0")?;
+        let sd_key_fingerprint = QHashOut::<F>::from_str("38755910c4dfb3c9bef528a4af697edced7e2607a6b769d054c4985a7000f0eb")?;
 
         let relayer_private_key = resolve_bridge_relayer_private_key()?;
 
@@ -318,7 +318,7 @@ let genesis_bytes: &[u8] = include_bytes!("../../../../../psy-genesis/genesis_co
             serde_json::to_string_pretty(&private_keys)?,
         )?;
 
-        // Emit faucet operator config for psy-privacy-bridge. The 10 sdk-key
+        // Emit faucet operator config for psy-privacy-bridge. The 10 sd-key
         // users above (slots 4..14) are the faucet operators; their userId in
         // the indexer is the Strategy5-mapped registration id, and `address`
         // is the same Poseidon public key param the genesis user record uses.
@@ -342,10 +342,14 @@ let genesis_bytes: &[u8] = include_bytes!("../../../../../psy-genesis/genesis_co
             faucet_method_name: String,
             #[serde(rename = "faucetMethodId")]
             faucet_method_id: u64,
-            #[serde(rename = "faucetPerClaimAmountNano")]
-            faucet_per_claim_amount_nano: String,
-            #[serde(rename = "sdkKeyExpectedTxCount")]
-            sdk_key_expected_tx_count: u32,
+            #[serde(rename = "faucetPerClaimAmount")]
+            faucet_per_claim_amount: String,
+            #[serde(rename = "sdKeyExpectedTxCount")]
+            sd_key_expected_tx_count: u32,
+            #[serde(rename = "sdKeyAllowedContractIds")]
+            sd_key_allowed_contract_ids: Vec<u64>,
+            #[serde(rename = "sdKeyAllowedMethodIds")]
+            sd_key_allowed_method_ids: Vec<u32>,
             operators: Vec<FaucetOperatorJson>,
         }
 
@@ -376,7 +380,7 @@ let genesis_bytes: &[u8] = include_bytes!("../../../../../psy-genesis/genesis_co
                     address: format!("{}", address),
                     private_key: format!("{}", pk),
                     fingerprint: format!("{}", sd_key_fingerprint),
-                    sign_type: "sdk-key".to_string(),
+                    sign_type: "sd-key".to_string(),
                 }
             })
             .collect();
@@ -385,8 +389,10 @@ let genesis_bytes: &[u8] = include_bytes!("../../../../../psy-genesis/genesis_co
             faucet_contract_id: 5,
             faucet_method_name: "faucet".to_string(),
             faucet_method_id: 3375543263,
-            faucet_per_claim_amount_nano: "1000000000000".to_string(),
-            sdk_key_expected_tx_count: 3,
+            faucet_per_claim_amount: "1000000000000".to_string(),
+            sd_key_expected_tx_count: 3,
+            sd_key_allowed_contract_ids: vec![5, 0, 0],
+            sd_key_allowed_method_ids: vec![3375543263, 354447671, 2923993647],
             operators,
         };
 

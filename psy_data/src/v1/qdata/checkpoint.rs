@@ -24,6 +24,7 @@ use crate::v1::qdata::{
     pm_jobs_completed_stats::PPMJobsCompletedStats, pm_rewards_commitment::PPMRewardCommitment,
 };
 
+
 #[pderive::serialize_copy_f_hash_ts]
 #[ts(export, concrete(F = parth_core::PF, Hash = parth_core::PHash), rename = "QEDCheckpointLeafStats")]
 pub struct PQEDCheckpointLeafStats<F, Hash> {
@@ -594,21 +595,10 @@ impl<F: QFelt64, Hash: QFHashBase<F>> ToQFelts<F> for PQEDCheckpointLeaf<F, Hash
 impl<F: QFelt64, Hash: QFHashBase<F>> QFieldHashable<F, Hash> for PQEDCheckpointLeaf<F, Hash> {
     fn qfhash<H: FieldQHasher<F, Hash>>(&self) -> Hash {
         let stats_hash = self.stats.qfhash::<H>();
-        let root_felts = self.global_chain_root.to_4_felts();
-        let stats_felts = stats_hash.to_4_felts();
-
-        H::q_hash_many(&[
-            root_felts[0],
-            root_felts[1],
-            root_felts[2],
-            root_felts[3],
-            stats_felts[0],
-            stats_felts[1],
-            stats_felts[2],
-            stats_felts[3],
-        ])
+        H::q_two_to_one(self.global_chain_root, stats_hash)
     }
 }
+
 
 #[pderive::serialize_copy_hash_ts]
 #[ts(export, concrete(Hash = parth_core::PHash), rename = "QEDCheckpointLeafCompact")]
@@ -653,7 +643,7 @@ psy_serialize::impl_psy_canonical_serialize_for_fixed_type!(
     { Hash: Q256BitHash } => { Hash },
     64
 );
-// This function is never called, it is just to ensure at compile time∂
+// This function is never called, it is just to ensure at compile time
 fn _ensure_compile_time_size_match_pqed_checkpoint_leaf_compact() {
     let _bytes_h256: [u8; 64] = PQEDCheckpointLeafCompact::<parth_core::data::hash::hash256::Hash256>::qp_rand_gen().ffs_into_bytes();
     let _bytes_phash: [u8; 64] = PQEDCheckpointLeafCompact::<parth_core::PHash>::qp_rand_gen().ffs_into_bytes();
@@ -661,8 +651,8 @@ fn _ensure_compile_time_size_match_pqed_checkpoint_leaf_compact() {
 
 // fallback for big endian platforms, not zero copy
 #[cfg(not(all(target_endian = "little", feature = "serialize_bytemuck")))]
-impl<Hash: Q256BitHash> FastFixedSerializable<64> for PQEDCheckpointLeafCompact<F, Hash> {
-    fn ffs_from_owned_bytes(data: [u8; PSY_OBJECT_FFS_SIZE_CONTRACT_LEAF]) -> Self {
+impl<Hash: Q256BitHash> FastFixedSerializable<64> for PQEDCheckpointLeafCompact<Hash> {
+    fn ffs_from_owned_bytes(data: [u8; 64]) -> Self {
         let global_chain_root = Hash::from_ref_32bytes(&data[0..32].try_into().unwrap());
         let stats_hash = Hash::from_ref_32bytes(&data[32..64].try_into().unwrap());
         PQEDCheckpointLeafCompact {

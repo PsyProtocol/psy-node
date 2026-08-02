@@ -9,6 +9,7 @@ mod proof_metadata;
 mod rewards_tree;
 mod node_proving_state;
 mod job_claim_info;
+mod job_stats;
 mod worker_reputation;
 
 use parth_core::{protocol::core_types::QDBHashBase, QJobIdBase};
@@ -23,6 +24,7 @@ pub use deploy_contract_data::*;
 pub use rewards_tree::*;
 pub use node_proving_state::*;
 pub use job_claim_info::*;
+pub use job_stats::*;
 pub use worker_reputation::*;
 
 
@@ -37,6 +39,7 @@ pub trait StandardEdgeAPITempDBStoreBase<JobId: QJobIdBase, Hash: QDBHashBase>:
     QTempDBDeployContractDataStore + 
     QTempDBNodeProvingStateStore +
     QTempDBJobClaimInfoStore<JobId> +
+    QTempDBJobStatsStore +
     QTempDBWorkerReputationStore
 {
 
@@ -56,6 +59,7 @@ impl<
     QTempDBDeployContractDataStore +
     QTempDBNodeProvingStateStore +
     QTempDBJobClaimInfoStore<JobId> +
+    QTempDBJobStatsStore +
     QTempDBWorkerReputationStore,
 > StandardEdgeAPITempDBStoreBase<JobId, Hash> for T {
 }
@@ -72,6 +76,7 @@ pub trait StandardProcessorTempDBStoreBase<JobId: QJobIdBase, Hash: QDBHashBase>
     QTempDBDeployContractDataStore +
     QTempDBNodeProvingStateStore +
     QTempDBJobClaimInfoStore<JobId> +
+    QTempDBJobStatsStore +
     QTempDBWorkerReputationStore
 {
 
@@ -91,6 +96,7 @@ impl<
     QTempDBDeployContractDataStore +
     QTempDBNodeProvingStateStore +
     QTempDBJobClaimInfoStore<JobId> +
+    QTempDBJobStatsStore +
     QTempDBWorkerReputationStore,
 > StandardProcessorTempDBStoreBase<JobId, Hash> for T {
 }

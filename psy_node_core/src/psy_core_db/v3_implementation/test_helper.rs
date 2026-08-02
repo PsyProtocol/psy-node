@@ -29,7 +29,7 @@ use crate::{
         },
         v3_implementation::full::PsyUnifiedCoreDatabaseStore,
     },
-    store::traits::core_db::CoreDatabaseStore,
+    store::traits::core_db::{CoreDatabaseStore, CoreDatabaseU64CounterWriter},
 };
 
 pub struct ExPsyUnifiedStoreTestHelper<
@@ -366,7 +366,7 @@ where
         Ok(())
     }
 
-    async fn test_pending_ids(&self) -> anyhow::Result<()> {
+    pub async fn test_pending_ids(&self) -> anyhow::Result<()> {
         let db = &self.db;
 
         // Test pending ID counter
@@ -399,6 +399,24 @@ where
         let retrieved_mapping = db.get_unique_pending_id_for_checkpoint_id(checkpoint_id).await?;
         assert_eq!(retrieved_mapping, Some((unique_pending_id, unique_id_struct)));
 
+        // Simulate a crash after incrementing the counter but before writing
+        // pending_id -> proc_checkpoint_unique_id. The strict runtime getter
+        // still exposes the corruption, while recovery resolves the newest
+        // earlier generation with a durable mapping.
+        let abandoned_pending_id = db
+            .store
+            .db_inc_u64_counter(&db.u64_counter_singleton_table, 2, 1)
+            .await?;
+        assert_eq!(abandoned_pending_id, 7);
+        assert!(db.get_current_unique_pending_id().await.is_err());
+        assert_eq!(db.get_latest_mapped_unique_pending_id().await?, (pending_id_6, unique_id_6));
+
+        // Recovery never rewinds or reuses the counter. A subsequent rotation
+        // skips the abandoned ID and restores the strict current mapping.
+        let (pending_id_8, unique_id_8) = db.inc_unique_pending_id(1).await?;
+        assert_eq!(pending_id_8, 8);
+        assert_eq!(db.get_current_unique_pending_id().await?, (pending_id_8, unique_id_8));
+        assert_eq!(db.get_latest_mapped_unique_pending_id().await?, (pending_id_8, unique_id_8));
         Ok(())
     }
 
@@ -678,19 +696,19 @@ where
         let tree_height = N::MAX_CONTRACT_STATE_TREE_HEIGHT;
 
         assert_eq!(
-            db.contract_state_tree_get_root_hash(checkpoint_id, user_id, contract_id).await?,
+            db.contract_state_tree_get_root_hash(checkpoint_id, user_id, contract_id, tree_height).await?,
             N::HasherBase::get_zero_hash(tree_height as usize)
         );
 
         let leaf_val = N::QHash::qp_rand_gen();
         let delta = db
-            .contract_state_tree_set_leaf_hash(checkpoint_id, user_id, contract_id, leaf_val)
+            .contract_state_tree_set_leaf_hash(checkpoint_id, user_id, contract_id, tree_height, leaf_val)
             .await?;
 
-        let new_root = db.contract_state_tree_get_root_hash(checkpoint_id, user_id, contract_id).await?;
+        let new_root = db.contract_state_tree_get_root_hash(checkpoint_id, user_id, contract_id, tree_height).await?;
         assert_eq!(new_root, delta.new_root);
         assert_eq!(
-            db.contract_state_tree_get_leaf_hash(checkpoint_id, user_id, contract_id, state_slot_id)
+            db.contract_state_tree_get_leaf_hash(checkpoint_id, user_id, contract_id, tree_height, state_slot_id)
                 .await?,
             leaf_val
         );

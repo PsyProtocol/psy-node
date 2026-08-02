@@ -105,7 +105,7 @@ impl ScyllaGenericKeyIdValueTablePreparedStatements {
         let res = session.execute_unpaged(&self.select_value_1_prepared, (u64_to_i64_exact(obj_id),)).await?;
         let rows = res.into_rows_result()?;
         match rows.maybe_first_row::<(Vec<u8>,)>()? {
-            Some(row) => Ok(Some(V::psy_ser_from_owned_bytes_vec(row.0)?)),
+            Some(row) => Ok(Some(V::psy_ser_from_owned_bytes_vec(crate::compression::decompress(&row.0)?)?)),
             None => Ok(None), 
         }
     }
@@ -120,7 +120,7 @@ impl ScyllaGenericKeyIdValueTablePreparedStatements {
 
             Some(row) =>Ok(Some(QDatabaseKeyIdValueTableRow {
                     obj_id: i64_to_u64_exact(row.0),
-                    value: V::psy_ser_from_owned_bytes_vec(row.1)?,
+                    value: V::psy_ser_from_owned_bytes_vec(crate::compression::decompress(&row.1)?)?,
                 })),
             None => Ok(None), // Return zero hash if not found
         }
@@ -133,7 +133,7 @@ impl ScyllaGenericKeyIdValueTablePreparedStatements {
         let res = session.execute_unpaged(&self.select_value_obj_id_1_prepared, (u64_to_i64_exact(obj_id),)).await?;
         let rows = res.into_rows_result()?;
         match rows.maybe_first_row::<(i64, Vec<u8>)>()? {
-            Some(row) => Ok(Some(R::create_from_key_id_value_row(i64_to_u64_exact(row.0), V::psy_ser_from_owned_bytes_vec(row.1)?))),
+            Some(row) => Ok(Some(R::create_from_key_id_value_row(i64_to_u64_exact(row.0), V::psy_ser_from_owned_bytes_vec(crate::compression::decompress(&row.1)?)?))),
            
             None => Ok(None), // Return zero hash if not found
         }
@@ -155,7 +155,7 @@ impl ScyllaGenericKeyIdValueTablePreparedStatements {
             let (obj_id, value): (i64, Vec<u8>) = row?;
             results.push(QDatabaseKeyIdValueTableRow {
                 obj_id: i64_to_u64_exact(obj_id),
-                value: V::psy_ser_from_owned_bytes_vec(value)?,
+                value: V::psy_ser_from_owned_bytes_vec(crate::compression::decompress(&value)?)?,
             });
         }
         Ok(results)
@@ -168,7 +168,7 @@ impl ScyllaGenericKeyIdValueTablePreparedStatements {
         obj_id: u64, 
         value: &V
     ) -> anyhow::Result<()> {
-        let value_bytes = value.psy_ser_to_bytes_vec()?;
+        let value_bytes = crate::compression::compress(&value.psy_ser_to_bytes_vec()?)?;
         session.execute_unpaged(&self.insert_1_prepared, (u64_to_i64_exact(obj_id), &value_bytes)).await?;
         Ok(())
     }
@@ -188,7 +188,7 @@ impl ScyllaGenericKeyIdValueTablePreparedStatements {
             let values: Vec<_> = chunk
                 .iter()
                 .map(|n| {
-                    Ok((u64_to_i64_exact(n.get_row_obj_id()),  n.get_row_value_ref().psy_ser_to_bytes_vec()?))
+                    Ok((u64_to_i64_exact(n.get_row_obj_id()),  crate::compression::compress(&n.get_row_value_ref().psy_ser_to_bytes_vec()?)?))
                 })
                 .collect::<anyhow::Result<_>>()?;
             batch_list.push(batch);
@@ -216,7 +216,7 @@ impl ScyllaGenericKeyIdValueTablePreparedStatements {
             let values: Vec<_> = chunk
                 .iter()
                 .map(|n| {
-                    Ok((u64_to_i64_exact(n.obj_id), n.value.psy_ser_to_bytes_vec()?))
+                    Ok((u64_to_i64_exact(n.obj_id), crate::compression::compress(&n.value.psy_ser_to_bytes_vec()?)?))
                 })
                 .collect::<anyhow::Result<_>>()?;
             batch_list.push(batch);
@@ -244,7 +244,7 @@ impl ScyllaGenericKeyIdValueTablePreparedStatements {
             let values: Vec<_> = chunk
                 .iter()
                 .map(|n| {
-                    Ok((u64_to_i64_exact(n.get_row_obj_id()), n.get_row_value_ref().psy_ser_to_bytes_vec()?))
+                    Ok((u64_to_i64_exact(n.get_row_obj_id()), crate::compression::compress(&n.get_row_value_ref().psy_ser_to_bytes_vec()?)?))
                 })
                 .collect::<anyhow::Result<_>>()?;
             batch_list.push(batch);
@@ -274,7 +274,7 @@ impl ScyllaGenericKeyIdValueTablePreparedStatements {
                         let res = session.execute_unpaged(&prep, (*key,)).await?;
                         let rows = res.into_rows_result()?;
                         if let Some((row,)) = rows.maybe_first_row::<(Vec<u8>,)>()? {
-                           anyhow::Ok(Some(V::psy_ser_from_owned_bytes_vec(row)?))
+                           anyhow::Ok(Some(V::psy_ser_from_owned_bytes_vec(crate::compression::decompress(&row)?)?))
                         } else {
                             // Assume reverse_level = level for simplicity; adjust if tree height known
                             Ok(None)
@@ -306,7 +306,7 @@ impl ScyllaGenericKeyIdValueTablePreparedStatements {
                         let res = session.execute_unpaged(&prep, (*key,)).await?;
                         let rows = res.into_rows_result()?;
                         if let Some(row) = rows.maybe_first_row::<(i64, Vec<u8>)>()? {
-                            anyhow::Ok(Some(R::create_from_key_id_value_row(i64_to_u64_exact(row.0), V::psy_ser_from_owned_bytes_vec(row.1)?)))
+                            anyhow::Ok(Some(R::create_from_key_id_value_row(i64_to_u64_exact(row.0), V::psy_ser_from_owned_bytes_vec(crate::compression::decompress(&row.1)?)?)))
                         } else {
                             // Assume reverse_level = level for simplicity; adjust if tree height known
                             Ok(None)

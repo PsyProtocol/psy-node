@@ -1,4 +1,4 @@
-use std::sync::{atomic::AtomicBool, Arc};
+use std::sync::Arc;
 
 use parth_common::memory_stores::{mem_tree_recorder::SimpleMemoryMerkleRecorderStore, traits::PsyMemoryMerkleStoreImm};
 use parth_core::{
@@ -41,6 +41,7 @@ use crate::{
     queue::gatherer::QueueKeyStatusManager,
     realm::processor::db::{DatabaseCheckState, PsyRealmDatabaseProcessor},
     realm::processor::gatherers::realm_end_cap_gatherer::{get_new_realm_end_cap_gatherer_backup_file_path, read_realm_backup_end_root},
+    utils::processor_status::ProcessorStatus,
 };
 
 pub async fn create_new_checkpoint_backup_manager_from_file_path<
@@ -87,7 +88,7 @@ where
         // 1. Check for Genesis requirement
         if local_latest_checkpoint_id == 0 {
             // Check if we actually have genesis applied (unique IDs > 0 usually implies initialization)
-            let (last_unique_pending_id, _) = match self.db.get_current_unique_pending_id().await {
+            let (last_unique_pending_id, _) = match self.db.get_latest_mapped_unique_pending_id().await {
                 Ok(ids) => ids,
                 Err(_) => return Ok(DatabaseCheckState::NeedsGenesis),
             };
@@ -133,7 +134,7 @@ where
         }
 
         // 3. Check internal DB consistency (Pending ID vs Checkpoint ID mapping)
-        let (last_unique_pending_id, _) = self.db.get_current_unique_pending_id().await?;
+        let (last_unique_pending_id, _) = self.db.get_latest_mapped_unique_pending_id().await?;
         let expected_checkpoint_id_opt = self.db.get_checkpoint_id_for_unique_pending_id(last_unique_pending_id).await?;
 
         if let Some(expected_checkpoint_id) = expected_checkpoint_id_opt {
@@ -181,7 +182,7 @@ where
         let (current_unique_pending_id, current_core_proc_unique_pending_id) = if last_committed_checkpoint_id == 0 {
             (0, 0u128)
         } else {
-            db.get_current_unique_pending_id().await?
+            db.get_latest_mapped_unique_pending_id().await?
         };
         tracing::info!(
             "[REALM_INIT] current unique ids = ({}, {})",
@@ -264,9 +265,10 @@ where
             .await?;
         tracing::info!("[REALM_INIT] temp db gathering unique ids set");
 
+        let status = ProcessorStatus::new();
         Ok(Self {
             db,
-            is_active: Arc::new(AtomicBool::new(true)),
+            status: status.clone(),
             tag_tree_rewards_store,
             temp_db,
             proof_store,
@@ -279,14 +281,14 @@ where
             guta_queue_key_status_manager: QueueKeyStatusManager::<
                 PQ_REALM_SUBMIT_USER_UPDATE_QUEUE_TOPIC_ID,
                 PsyRealmUserUpdateQueueItem<N::F, N::QHash>,
-            >::new(QPStandardUniqueIdQueueKey {
+            >::new_with_status(QPStandardUniqueIdQueueKey {
                 realm_id: realm_id_u64,
                 realm_sub_id: realm_sub_id_u64,
                 unique_id: current_core_proc_unique_pending_id,
                 task_group: 0,
                 queue_type: QPBaseQueueType::StandardEphemeral,
                 _phantom_queue_item: std::marker::PhantomData,
-            }),
+            }, status.clone()),
             needs_revert: false,
             state,
             realm_root_node,
@@ -463,7 +465,7 @@ where
                         None => {
                             // Coordinator has advanced past what realm committed locally.
                             // Scan all candidate pending_ids to find a backup whose end_root matches.
-                            let (current_unique_pending_id, current_proc_checkpoint_id) = self.db.get_current_unique_pending_id().await?;
+                            let (current_unique_pending_id, current_proc_checkpoint_id) = self.db.get_latest_mapped_unique_pending_id().await?;
                             let last_committed_unique_pending_id = self.state.last_committed_unique_pending_id;
 
                             let mut recovered_from_backup = false;
@@ -751,6 +753,12 @@ where
 
         // 7. Initialize Unique IDs for new work
         self.set_new_unique_ids(Some(current_realm_root)).await?;
+
+        // Sync gatherer queue key to the new gathering proc ID so the
+        // gatherer (created shortly after this, in startup.rs) polls the
+        // queue that end-cap submissions will write to.
+        self.guta_queue_key_status_manager
+            .set_unique_id(self.state.gathering_proc_checkpoint_unique_id)?;
         
         // 8. Publish state to shared wrapper
         self.shared_state.update_from_core_state(&self.state).await?;

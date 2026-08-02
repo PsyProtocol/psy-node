@@ -90,6 +90,8 @@ pub enum LocalCircuitType {
     // Common Signature Circuits (48-63 reserved)
     SimpleZKSignature = 48,
     SimpleSecp256K1 = 49,
+    SimplePrivateNoteInclusion = 50,
+    SimpleShieldDepositClaim = 51,
 
     // GUTA Circuits
     GUTATwoEndCap = 65,
@@ -148,6 +150,8 @@ impl TryFrom<u8> for LocalCircuitType {
             37 => Ok(LocalCircuitType::PTAggLeftLeafRightAgg),
             48 => Ok(LocalCircuitType::SimpleZKSignature),
             49 => Ok(LocalCircuitType::SimpleSecp256K1),
+            50 => Ok(LocalCircuitType::SimplePrivateNoteInclusion),
+            51 => Ok(LocalCircuitType::SimpleShieldDepositClaim),
 
             65 => Ok(LocalCircuitType::GUTATwoEndCap),
             66 => Ok(LocalCircuitType::GUTATwoGUTA),

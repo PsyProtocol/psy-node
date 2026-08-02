@@ -85,7 +85,29 @@ where
         input: &UPSCFCDeferredTransactionCircuitInput<C::F>,
     ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>>;
 
-    async fn prove_zk_sign(&self, private_key: QHashOut<C::F>, sig_hash: QHashOut<C::F>) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>>;
+    async fn prove_zk_sign_minifier(&self, inner_proof: ProofWithPublicInputs<C::F, C, D>) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>>;
+
+    async fn zk_signature_minifier_fingerprint(&self) -> anyhow::Result<QHashOut<C::F>>;
+
+    async fn zk_signature_minifier_verifier_config(&self) -> anyhow::Result<VerifierOnlyCircuitData<C, D>>;
+
+    async fn prove_private_note_inclusion_minifier(
+        &self,
+        base_proof: ProofWithPublicInputs<C::F, C, D>,
+    ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>>;
+
+    async fn private_note_inclusion_minifier_fingerprint(&self) -> anyhow::Result<QHashOut<C::F>>;
+
+    async fn private_note_inclusion_minifier_verifier_config(&self) -> anyhow::Result<VerifierOnlyCircuitData<C, D>>;
+
+    async fn prove_shield_deposit_claim_minifier(
+        &self,
+        base_proof: ProofWithPublicInputs<C::F, C, D>,
+    ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>>;
+
+    async fn shield_deposit_claim_minifier_fingerprint(&self) -> anyhow::Result<QHashOut<C::F>>;
+
+    async fn shield_deposit_claim_minifier_verifier_config(&self) -> anyhow::Result<VerifierOnlyCircuitData<C, D>>;
 
     async fn prove_secp_sign(&self, signature: PsyCompressedSecp256K1Signature) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>>;
 
@@ -144,10 +166,6 @@ where
     async fn ups_end_cap_circuit_verifier_config(&self) -> anyhow::Result<VerifierOnlyCircuitData<C, D>>;
 
     async fn ups_circuit_whitelist_root(&self) -> anyhow::Result<QHashOut<C::F>>;
-
-    async fn zk_circuit_fingerprint(&self) -> anyhow::Result<QHashOut<C::F>>;
-
-    async fn zk_circuit_verifier_config(&self) -> anyhow::Result<VerifierOnlyCircuitData<C, D>>;
 
     async fn secp_circuit_fingerprint(&self) -> anyhow::Result<QHashOut<C::F>>;
 
@@ -229,8 +247,46 @@ where
         (**self).prove_ups_cfc_deferred_tx(input).await
     }
 
-    async fn prove_zk_sign(&self, private_key: QHashOut<C::F>, sig_hash: QHashOut<C::F>) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
-        (**self).prove_zk_sign(private_key, sig_hash).await
+    async fn prove_zk_sign_minifier(&self, inner_proof: ProofWithPublicInputs<C::F, C, D>) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
+        (**self).prove_zk_sign_minifier(inner_proof).await
+    }
+
+    async fn zk_signature_minifier_fingerprint(&self) -> anyhow::Result<QHashOut<C::F>> {
+        (**self).zk_signature_minifier_fingerprint().await
+    }
+
+    async fn zk_signature_minifier_verifier_config(&self) -> anyhow::Result<VerifierOnlyCircuitData<C, D>> {
+        (**self).zk_signature_minifier_verifier_config().await
+    }
+
+    async fn prove_private_note_inclusion_minifier(
+        &self,
+        base_proof: ProofWithPublicInputs<C::F, C, D>,
+    ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
+        (**self).prove_private_note_inclusion_minifier(base_proof).await
+    }
+
+    async fn private_note_inclusion_minifier_fingerprint(&self) -> anyhow::Result<QHashOut<C::F>> {
+        (**self).private_note_inclusion_minifier_fingerprint().await
+    }
+
+    async fn private_note_inclusion_minifier_verifier_config(&self) -> anyhow::Result<VerifierOnlyCircuitData<C, D>> {
+        (**self).private_note_inclusion_minifier_verifier_config().await
+    }
+
+    async fn prove_shield_deposit_claim_minifier(
+        &self,
+        base_proof: ProofWithPublicInputs<C::F, C, D>,
+    ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
+        (**self).prove_shield_deposit_claim_minifier(base_proof).await
+    }
+
+    async fn shield_deposit_claim_minifier_fingerprint(&self) -> anyhow::Result<QHashOut<C::F>> {
+        (**self).shield_deposit_claim_minifier_fingerprint().await
+    }
+
+    async fn shield_deposit_claim_minifier_verifier_config(&self) -> anyhow::Result<VerifierOnlyCircuitData<C, D>> {
+        (**self).shield_deposit_claim_minifier_verifier_config().await
     }
 
     async fn prove_secp_sign(&self, signature: PsyCompressedSecp256K1Signature) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
@@ -337,14 +393,6 @@ where
 
     async fn ups_circuit_whitelist_root(&self) -> anyhow::Result<QHashOut<C::F>> {
         (**self).ups_circuit_whitelist_root().await
-    }
-
-    async fn zk_circuit_fingerprint(&self) -> anyhow::Result<QHashOut<C::F>> {
-        (**self).zk_circuit_fingerprint().await
-    }
-
-    async fn zk_circuit_verifier_config(&self) -> anyhow::Result<VerifierOnlyCircuitData<C, D>> {
-        (**self).zk_circuit_verifier_config().await
     }
 
     async fn secp_circuit_fingerprint(&self) -> anyhow::Result<QHashOut<C::F>> {
@@ -431,8 +479,46 @@ where
         (**self).prove_ups_cfc_deferred_tx(input).await
     }
 
-    async fn prove_zk_sign(&self, private_key: QHashOut<C::F>, sig_hash: QHashOut<C::F>) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
-        (**self).prove_zk_sign(private_key, sig_hash).await
+    async fn prove_zk_sign_minifier(&self, inner_proof: ProofWithPublicInputs<C::F, C, D>) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
+        (**self).prove_zk_sign_minifier(inner_proof).await
+    }
+
+    async fn zk_signature_minifier_fingerprint(&self) -> anyhow::Result<QHashOut<C::F>> {
+        (**self).zk_signature_minifier_fingerprint().await
+    }
+
+    async fn zk_signature_minifier_verifier_config(&self) -> anyhow::Result<VerifierOnlyCircuitData<C, D>> {
+        (**self).zk_signature_minifier_verifier_config().await
+    }
+
+    async fn prove_private_note_inclusion_minifier(
+        &self,
+        base_proof: ProofWithPublicInputs<C::F, C, D>,
+    ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
+        (**self).prove_private_note_inclusion_minifier(base_proof).await
+    }
+
+    async fn private_note_inclusion_minifier_fingerprint(&self) -> anyhow::Result<QHashOut<C::F>> {
+        (**self).private_note_inclusion_minifier_fingerprint().await
+    }
+
+    async fn private_note_inclusion_minifier_verifier_config(&self) -> anyhow::Result<VerifierOnlyCircuitData<C, D>> {
+        (**self).private_note_inclusion_minifier_verifier_config().await
+    }
+
+    async fn prove_shield_deposit_claim_minifier(
+        &self,
+        base_proof: ProofWithPublicInputs<C::F, C, D>,
+    ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
+        (**self).prove_shield_deposit_claim_minifier(base_proof).await
+    }
+
+    async fn shield_deposit_claim_minifier_fingerprint(&self) -> anyhow::Result<QHashOut<C::F>> {
+        (**self).shield_deposit_claim_minifier_fingerprint().await
+    }
+
+    async fn shield_deposit_claim_minifier_verifier_config(&self) -> anyhow::Result<VerifierOnlyCircuitData<C, D>> {
+        (**self).shield_deposit_claim_minifier_verifier_config().await
     }
 
     async fn prove_secp_sign(&self, signature: PsyCompressedSecp256K1Signature) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
@@ -539,14 +625,6 @@ where
 
     async fn ups_circuit_whitelist_root(&self) -> anyhow::Result<QHashOut<C::F>> {
         (**self).ups_circuit_whitelist_root().await
-    }
-
-    async fn zk_circuit_fingerprint(&self) -> anyhow::Result<QHashOut<C::F>> {
-        (**self).zk_circuit_fingerprint().await
-    }
-
-    async fn zk_circuit_verifier_config(&self) -> anyhow::Result<VerifierOnlyCircuitData<C, D>> {
-        (**self).zk_circuit_verifier_config().await
     }
 
     async fn secp_circuit_fingerprint(&self) -> anyhow::Result<QHashOut<C::F>> {

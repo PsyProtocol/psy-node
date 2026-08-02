@@ -30,10 +30,10 @@ impl ZKUser {
 impl SignatureUser for ZKUser {
     async fn public_key_info(
         &self,
-        _wallet: &PsyMemoryWallet,
-        circuit_manager: &(dyn UPSCircuitManager<PsyPlonky2Config, 2> + Send + Sync),
+        wallet: &PsyMemoryWallet,
+        _circuit_manager: &(dyn UPSCircuitManager<PsyPlonky2Config, 2> + Send + Sync),
     ) -> Result<ZKPublicKeyInfo<GoldilocksField>> {
-        let fingerprint = circuit_manager.zk_circuit_fingerprint().await?;
+        let fingerprint = wallet.zk_circuit_fingerprint().await?;
         let public_key_param = self.private_key.get_public_key_param::<PoseidonHash>();
         Ok(ZKPublicKeyInfo {
             fingerprint,
@@ -43,23 +43,23 @@ impl SignatureUser for ZKUser {
 
     async fn sign(
         &self,
-        _wallet: &PsyMemoryWallet,
-        circuit_manager: &(dyn UPSCircuitManager<PsyPlonky2Config, 2> + Send + Sync),
+        wallet: &PsyMemoryWallet,
+        _circuit_manager: &(dyn UPSCircuitManager<PsyPlonky2Config, 2> + Send + Sync),
         _context: &SignContext,
         sighash: QHashOut<GoldilocksField>,
     ) -> Result<PsyProof> {
-        circuit_manager.prove_zk_sign(self.private_key.private_key, sighash).await
+        wallet.prove_zk_sign(self.private_key.private_key, sighash).await
     }
 
     async fn circuit_info(
         &self,
-        _wallet: &PsyMemoryWallet,
-        circuit_manager: &(dyn UPSCircuitManager<PsyPlonky2Config, 2> + Send + Sync),
+        wallet: &PsyMemoryWallet,
+        _circuit_manager: &(dyn UPSCircuitManager<PsyPlonky2Config, 2> + Send + Sync),
         _context: &SignContext,
     ) -> Result<SignatureCircuitInfo> {
         Ok(SignatureCircuitInfo {
-            circuit_fingerprint: circuit_manager.zk_circuit_fingerprint().await?,
-            verifier_config: circuit_manager.zk_circuit_verifier_config().await?,
+            circuit_fingerprint: wallet.zk_circuit_fingerprint().await?,
+            verifier_config: wallet.zk_circuit_verifier_config().await?,
         })
     }
 }

@@ -332,7 +332,7 @@ let root_guta_job = QProvingJobDataID::new_invalid_job_id();
             previous_checkpoint_proof,
             last_old_checkpoint_tree_leaf_hash: last_committed.checkpoint_state_transition.old_checkpoint_leaf_hash,
             last_old_checkpoint_tree_root_hash: last_committed.checkpoint_state_transition.old_checkpoint_tree_root,
-            genesis_checkpoint_state_transition_hash: genesis_checkpoint_state_transition_hash,
+            genesis_checkpoint_state_transition_hash,
             previous_chain_hash: last_committed.last_chain_hash,
             checkpoint_state_transition_circuit_fingerprint:
                 circuit_fingerprint_config.checkpoint_state_transition_circuit_fingerprint,

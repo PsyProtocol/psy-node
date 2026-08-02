@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use plonky2::{
     hash::hash_types::{HashOut, RichField},
@@ -27,7 +27,10 @@ use psy_common_circuit::{
         leaf_circuit_set::QStandardBinaryRecursionTreeCircuitSet, portable::circuits::PortableQTreeRecursionCircuits,
     },
 };
-use psy_config::network_constants::{UPS_CIRCUIT_WHITELIST_TREE_HEIGHT, UPS_SESSION_PROOF_TREE_HEIGHT};
+use psy_config::network_constants::{
+    GLOBAL_CONTRACT_TREE_HEIGHT, GLOBAL_USER_TREE_HEIGHT, MAX_CONTRACT_STATE_TREE_HEIGHT, PRIVATE_NOTE_TREE_HEIGHT,
+    UPS_CIRCUIT_WHITELIST_TREE_HEIGHT, UPS_SESSION_PROOF_TREE_HEIGHT,
+};
 use psy_crypto::{
     common::witnesses::qrecursion::proof_data::{AggProofRecord, SimpleQTreeRecursionManagerInclusionProofs},
     hash::{
@@ -36,7 +39,10 @@ use psy_crypto::{
     },
     signature::secp256k1::core::PsyCompressedSecp256K1Signature,
 };
-use psy_dpn_circuit::circuits::cfc::DapenContractFunctionCircuit;
+use psy_dpn_circuit::circuits::{
+    cfc::DapenContractFunctionCircuit,
+    privacy::{private_note_inclusion::PrivateNoteInclusionCircuit, shield_deposit_claim::ShieldDepositClaimCircuit},
+};
 use psy_network_circuit::ups::circuits::{
     end_cap::UPSStandardEndCapCircuit, ups_cfc_deferred_tx::UPSCFCDeferredTransactionCircuit, ups_cfc_standard::UPSCFCStandardTransactionCircuit,
     ups_start::UPSStartSessionCircuit, ups_start_register_user::UPSStartSessionRegisterUserCircuit,
@@ -72,8 +78,12 @@ where
     // method name index, cached by (contract_id, method_name)
     pub contract_method_ids: Cache<(u64, String), u32>,
 
-    pub zk_circuit: PsyBasicZKSignatureCircuit<C, D>,
-    pub secp_circuit: Secp256K1SignatureCircuit<C, D>,
+    zk_signature_minifier_circuit: OnceLock<PsyBasicZKSignatureCircuit<C, D>>,
+    secp_circuit: OnceLock<Secp256K1SignatureCircuit<C, D>>,
+    // Server-side minifier circuits (base+minifier) for the wallet's base-only privacy
+    // proofs. The wallet produces base proofs; these minify them.
+    private_note_inclusion_minifier_circuit: OnceLock<PrivateNoteInclusionCircuit<C, D>>,
+    shield_deposit_claim_minifier_circuit: OnceLock<ShieldDepositClaimCircuit<C, D>>,
 }
 
 impl<C: GenericConfig<D> + 'static, const D: usize> PsyUPSStepCircuitManager<C, D>
@@ -148,9 +158,35 @@ where
             ups_start_register_user_whitelist_proof,
             contract_circuits: Cache::new(200),
             contract_method_ids: Cache::new(1000),
-            zk_circuit: PsyBasicZKSignatureCircuit::new(),
-            secp_circuit: Secp256K1SignatureCircuit::new(),
+            zk_signature_minifier_circuit: OnceLock::new(),
+            secp_circuit: OnceLock::new(),
+            private_note_inclusion_minifier_circuit: OnceLock::new(),
+            shield_deposit_claim_minifier_circuit: OnceLock::new(),
         }
+    }
+
+    fn zk_signature_minifier_circuit(&self) -> &PsyBasicZKSignatureCircuit<C, D> {
+        self.zk_signature_minifier_circuit.get_or_init(PsyBasicZKSignatureCircuit::<C, D>::new)
+    }
+
+    pub fn secp_circuit(&self) -> &Secp256K1SignatureCircuit<C, D> {
+        self.secp_circuit.get_or_init(Secp256K1SignatureCircuit::new)
+    }
+
+    pub fn private_note_inclusion_minifier_circuit(&self) -> &PrivateNoteInclusionCircuit<C, D> {
+        self.private_note_inclusion_minifier_circuit.get_or_init(|| {
+            PrivateNoteInclusionCircuit::<C, D>::new(
+                GLOBAL_USER_TREE_HEIGHT as usize,
+                GLOBAL_CONTRACT_TREE_HEIGHT as usize,
+                MAX_CONTRACT_STATE_TREE_HEIGHT as usize,
+                PRIVATE_NOTE_TREE_HEIGHT,
+            )
+        })
+    }
+
+    pub fn shield_deposit_claim_minifier_circuit(&self) -> &ShieldDepositClaimCircuit<C, D> {
+        self.shield_deposit_claim_minifier_circuit
+            .get_or_init(ShieldDepositClaimCircuit::<C, D>::new)
     }
 
     pub fn print_common_config(&self) {
@@ -209,16 +245,16 @@ where
         // compiles per (contract_id, fn_id); all others block and receive the
         // cached Arc via the guard mechanism.
         let state_tree_height = contract_code.state_tree_height as usize;
-        self.contract_circuits.get_or_insert_with(&(contract_id, fn_id), || {
-            Ok::<Arc<DapenContractFunctionCircuit<C, D>>, std::convert::Infallible>(
-                Arc::new(DapenContractFunctionCircuit::<C, D>::new(
+        self.contract_circuits
+            .get_or_insert_with(&(contract_id, fn_id), || {
+                Ok::<Arc<DapenContractFunctionCircuit<C, D>>, std::convert::Infallible>(Arc::new(DapenContractFunctionCircuit::<C, D>::new(
                     &dapen_fc,
                     state_tree_height,
                     UPS_SESSION_PROOF_TREE_HEIGHT as usize,
                     false,
-                )),
-            )
-        }).ok();
+                )))
+            })
+            .ok();
 
         self.contract_method_ids.insert((contract_id, fn_name), fn_id);
         Ok(())
@@ -383,12 +419,50 @@ where
         self.ups_cfc_deferred_tx.prove_base(&input)
     }
 
-    async fn prove_zk_sign(&self, private_key: QHashOut<C::F>, sig_hash: QHashOut<C::F>) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
-        self.zk_circuit.prove_base(private_key, sig_hash)
+    async fn prove_zk_sign_minifier(&self, inner_proof: ProofWithPublicInputs<C::F, C, D>) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
+        self.zk_signature_minifier_circuit().prove_minifier(inner_proof)
+    }
+
+    async fn zk_signature_minifier_fingerprint(&self) -> anyhow::Result<QHashOut<C::F>> {
+        Ok(self.zk_signature_minifier_circuit().get_fingerprint())
+    }
+
+    async fn zk_signature_minifier_verifier_config(&self) -> anyhow::Result<VerifierOnlyCircuitData<C, D>> {
+        Ok(self.zk_signature_minifier_circuit().get_verifier_config_ref().clone())
+    }
+
+    async fn prove_private_note_inclusion_minifier(
+        &self,
+        base_proof: ProofWithPublicInputs<C::F, C, D>,
+    ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
+        self.private_note_inclusion_minifier_circuit().prove_minifier(base_proof)
+    }
+
+    async fn private_note_inclusion_minifier_fingerprint(&self) -> anyhow::Result<QHashOut<C::F>> {
+        Ok(self.private_note_inclusion_minifier_circuit().get_fingerprint())
+    }
+
+    async fn private_note_inclusion_minifier_verifier_config(&self) -> anyhow::Result<VerifierOnlyCircuitData<C, D>> {
+        Ok(self.private_note_inclusion_minifier_circuit().get_verifier_config_ref().clone())
+    }
+
+    async fn prove_shield_deposit_claim_minifier(
+        &self,
+        base_proof: ProofWithPublicInputs<C::F, C, D>,
+    ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
+        self.shield_deposit_claim_minifier_circuit().prove_minifier(base_proof)
+    }
+
+    async fn shield_deposit_claim_minifier_fingerprint(&self) -> anyhow::Result<QHashOut<C::F>> {
+        Ok(self.shield_deposit_claim_minifier_circuit().get_fingerprint())
+    }
+
+    async fn shield_deposit_claim_minifier_verifier_config(&self) -> anyhow::Result<VerifierOnlyCircuitData<C, D>> {
+        Ok(self.shield_deposit_claim_minifier_circuit().get_verifier_config_ref().clone())
     }
 
     async fn prove_secp_sign(&self, signature: PsyCompressedSecp256K1Signature) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
-        self.secp_circuit.prove(&signature)
+        self.secp_circuit().prove(&signature)
     }
 
     async fn register_dpn_software_defined_circuit(
@@ -493,20 +567,12 @@ where
         Ok(self.ups_circuit_whitelist_root)
     }
 
-    async fn zk_circuit_fingerprint(&self) -> anyhow::Result<QHashOut<C::F>> {
-        Ok(self.zk_circuit.get_fingerprint())
-    }
-
-    async fn zk_circuit_verifier_config(&self) -> anyhow::Result<VerifierOnlyCircuitData<C, D>> {
-        Ok(self.zk_circuit.get_verifier_config_ref().clone().into())
-    }
-
     async fn secp_circuit_fingerprint(&self) -> anyhow::Result<QHashOut<C::F>> {
-        Ok(self.secp_circuit.get_fingerprint())
+        Ok(self.secp_circuit().get_fingerprint())
     }
 
     async fn secp_circuit_verifier_config(&self) -> anyhow::Result<VerifierOnlyCircuitData<C, D>> {
-        Ok(self.secp_circuit.get_verifier_config_ref().clone().into())
+        Ok(self.secp_circuit().get_verifier_config_ref().clone().into())
     }
 }
 

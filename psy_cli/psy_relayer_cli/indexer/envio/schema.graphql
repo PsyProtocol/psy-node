@@ -1,26 +1,15 @@
 type Deposit @entity {
   id: ID!
   chain_id: Int!
-  deposit_index: Int!
+  deposit_index: Int!               # global L1 bridge deposit index
+  chain_local_deposit_index: Int!   # dense per-chain helper-tree index
   shield_address: String!
   token: String!
   l2_token_contract_id: String!
   amount: BigInt!
-  note_secret_hash: String!
+  note_commitment: String!
   chain_index: Int!
   leaf_hash: String!
-  block_number: Int!
-  tx_hash: String!
-}
-
-type DepositBatchAppend @entity {
-  id: ID!
-  chain_id: Int!
-  from_index: Int!
-  to_index: Int!
-  deposit_root: String!
-  old_frontier_json: String!
-  leaf_hashes_json: String!
   block_number: Int!
   tx_hash: String!
 }
@@ -35,16 +24,52 @@ type FinalizedBatch @entity {
   tx_hash: String!
 }
 
-# ── Incremental deposit tree node storage ───────────────────────────────────
-# Stores every node of the deposit Merkle tree (depth 32). Updated incrementally
-# in DepositBatchAppended handlers so proof queries are simple level+index
-# lookups without reconstructing the full tree from all leaves.
+# ── Current per-chain deposit tree metadata ─────────────────────────────────
+# Tracks the current per-chain Poseidon helper tree as deposits arrive.
+# `last_count` is the current dense append count for this chain's helper tree
+# (that is, the number of deposits from this chain that have been absorbed into
+# the current tree state), not a finalized/proved counter.
 #
-# The tree is keyed by (source_chain_id, level, node_index).
+# `finalized_keccak_deposit_tree_root` / `last_finalized_checkpoint_id` remain
+# audit/debug metadata copied from StateManager.Finalized and are not the source
+# of truth for Poseidon claim roots.
+type DepositTreeMeta @entity {
+  id: ID!                         # "{chain_index}"
+  chain_index: Int!
+  last_count: Int!                # current per-chain helper-tree count
+  poseidon_deposit_tree_root: String!   # current per-chain Poseidon root
+  deposit_tree_root: String!             # backwards-compatible alias
+  finalized_keccak_deposit_tree_root: String!
+  last_finalized_checkpoint_id: BigInt!
+  block_number: Int!
+  tx_hash: String!
+}
+
+# ── Current per-chain deposit tree nodes ─────────────────────────────────────
+# Maintains the CURRENT Poseidon helper tree for each chain_index. Nodes are
+# updated incrementally on every DepositRecorded. Historical roots / proofs for
+# older tree counts are reconstructed from the current nodes plus the requested
+# snapshot boundary.
+#
+# Keyed by (chain_index, level, node_index). Namespace uses chain_index
+# (not chain_id), consistent with set_chain_root(chain_index, ...).
 type DepositTreeNode @entity {
-  id: ID!                           # "{source_chain_id}:{level}:{node_index}"
-  source_chain_id: Int!
-  level: Int!
+  id: ID!                         # "{chain_index}:{level}:{node_index}"
+  chain_index: Int!
+  level: Int!                     # 0 = leaf, 32 = root
   node_index: BigInt!
-  hash: String!
+  hash: String!                   # Poseidon QHashOut display hex
+  block_number: Int!
+  tx_hash: String!
+}
+
+type WithdrawalClaim @entity {
+  id: ID!
+  chain_id: Int!
+  nullifier: String!
+  recipient: String!
+  token: String!
+  amount: BigInt!
+  block_number: Int!
+  tx_hash: String!
 }

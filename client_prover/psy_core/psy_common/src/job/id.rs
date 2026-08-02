@@ -441,7 +441,7 @@ impl QProvingJobDataID {
         })
     }
 
-    /// Parse from 24-byte format (psy-node format, without slot_id)
+    /// Parse from 24-byte format (parth-generic-v1 format, without slot_id)
     /// Format: [0]: topic, [1..9]: goal_id, [9]: circuit_type, [10..14]:
     /// group_id, [14..18]: sub_group_id, [18..22]: task_index, [22]: data_type,
     /// [23]: data_index
@@ -470,7 +470,7 @@ impl QProvingJobDataID {
         })
     }
 
-    /// Serialize to 24-byte format (psy-node format, without slot_id)
+    /// Serialize to 24-byte format (parth-generic-v1 format, without slot_id)
     /// Format: [0]: topic, [1..9]: goal_id, [9]: circuit_type, [10..14]:
     /// group_id, [14..18]: sub_group_id, [18..22]: task_index, [22]: data_type,
     /// [23]: data_index
@@ -958,6 +958,16 @@ impl QProvingJobDataID {
         hex::encode(&self.to_fixed_bytes())
     }
 }
+
+// impl HistoryQueueMetadataTagged for QProvingJobDataID {
+//     fn get_hq_metadata(&self) -> HistoryQueueMetadata {
+//         HistoryQueueMetadata {
+//             channel_id: REALM_PROCESSOR_TO_EDGE_CHANNEL,
+//             checkpoint_id: self.goal_id,
+//             item_id: self.task_index as u64, // Use task_index as item_id
+//         }
+//     }
+// }
 
 #[derive(Serialize, Deserialize, PartialEq, Debug, Clone, Copy, Eq, Hash, PartialOrd, Ord)]
 pub struct QProvingJobDataIDWithRewardPath {

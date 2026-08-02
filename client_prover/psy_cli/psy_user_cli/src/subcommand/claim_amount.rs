@@ -2,9 +2,9 @@ use anyhow::Result;
 use psy_client_data::traits::qdatastore::qmetadata::QMetaDataStoreReaderSync;
 use psy_provider::provider::RpcProvider;
 
-use crate::subcommand::args::ClaimAmountArgs;
+use crate::{result::{ClaimAmountResult, CommandResult}, subcommand::args::ClaimAmountArgs};
 
-pub async fn run(args: ClaimAmountArgs) -> Result<()> {
+pub async fn run(args: ClaimAmountArgs) -> Result<CommandResult> {
     tracing::info!("claim amount: {}", serde_json::to_string_pretty(&args)?);
     let provider = RpcProvider::new_with_config_path(&args.rpc_config)?;
 
@@ -22,5 +22,5 @@ pub async fn run(args: ClaimAmountArgs) -> Result<()> {
         checkpoint_id
     );
 
-    Ok(())
+    Ok(CommandResult::ClaimAmount(ClaimAmountResult { claim_amount }))
 }

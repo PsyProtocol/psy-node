@@ -1,17 +1,19 @@
-rpc_config = "psy-genesis/config.json"
+# Reference template — locSetupV4 generates the actual daemon.toml at runtime
+# with absolute paths resolved from the current machine.
+rpc_config = "client_prover/config.json"
 services_url = "http://127.0.0.1:3000"
-withdraw_method_id = 4159421846
-proof_dir = "/home/cj/Projects/parth-generic-v1/local_checkpoints/bridge_proposer"
+withdraw_method_id = 3055054724
+proof_dir = "local_checkpoints/bridge_proposer"
 poll_interval_secs = 15
 confirmation_lag_checkpoints = 3
 
 [relayer_wallet]
 sign_type = "ZKSign"
-keystore_path = "/home/cj/.psy/keystore/bridge-relayer"
+keystore_path = "<HOME>/.psy/keystore/bridge-relayer"
 
 [finalize]
 l1_rpc_url = "http://127.0.0.1:8545"
 deployments_network = "localhost"
-keystore_path = "/home/cj/.psy/keystore/bridge-relayer"
+keystore_path = "<HOME>/.psy/keystore/bridge-relayer"
 password_env = "WALLET_PASSWORD"
 max_checkpoint_batch = 32

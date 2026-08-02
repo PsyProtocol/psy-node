@@ -2,8 +2,9 @@ use anyhow::Result;
 use psy_provider::provider::RpcProvider;
 
 use super::args::{GetCheckpointIdForUniquePendingIdArgs, RpcProviderType};
+use crate::result::{CheckpointIdResult, CommandResult};
 
-pub async fn run(args: GetCheckpointIdForUniquePendingIdArgs) -> Result<()> {
+pub async fn run(args: GetCheckpointIdForUniquePendingIdArgs) -> Result<CommandResult> {
     let psy_config = psy_config::PsyConfigGoldilocks::from_file(&args.rpc_config)?;
     let rpc_config = psy_config.get_current_network()?.clone();
     let provider = RpcProvider::new_with_config(&rpc_config)?;
@@ -17,5 +18,5 @@ pub async fn run(args: GetCheckpointIdForUniquePendingIdArgs) -> Result<()> {
         RpcProviderType::Realm => provider.get_realm_checkpoint_id_for_unique_pending_id(args.unique_pending_id).await?,
     };
     println!("unique_pending_id: {}, checkpoint_id: {:?}", args.unique_pending_id, checkpoint_id);
-    Ok(())
+    Ok(CommandResult::CheckpointId(CheckpointIdResult { checkpoint_id }))
 }

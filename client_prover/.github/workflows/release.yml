@@ -66,6 +66,55 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  compiler-sidecar:
+    name: Build SDK compiler sidecar
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout psy-sdk
+        uses: actions/checkout@v4
+        with:
+          repository: PsyProtocol/psy-sdk
+          ref: fix/regression
+          path: psy-sdk-source
+      - name: Checkout standalone compiler
+        uses: actions/checkout@v4
+        with:
+          repository: QEDProtocol/psy-compiler
+          ref: fix/regression
+          path: psy-compiler-source
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - name: Build SDK compiler distribution
+        shell: bash
+        run: |
+          set -eo pipefail
+          cargo install wasm-pack --locked
+          pnpm --dir psy-sdk-source/psy-ts-sdk install --frozen-lockfile
+          PSY_COMPILER_DIR="$GITHUB_WORKSPACE/psy-compiler-source" \
+            pnpm --dir psy-sdk-source/psy-ts-sdk/packages/psy-sdk build
+          mkdir psy-sdk-compiler
+          cp psy-sdk-source/psy-ts-sdk/packages/psy-sdk/dist/local-web-compiler/psy_compiler.mjs psy-sdk-compiler/
+          cp psy-sdk-source/psy-ts-sdk/packages/psy-sdk/dist/local-web-compiler/wasm-binary.mjs psy-sdk-compiler/
+          cp psy-sdk-source/psy-ts-sdk/packages/psy-sdk/.compiler-artifact.json psy-sdk-compiler/
+      - name: Upload SDK compiler sidecar
+        uses: actions/upload-artifact@v4
+        with:
+          name: psy-sdk-compiler
+          path: |
+            psy-sdk-compiler/psy_compiler.mjs
+            psy-sdk-compiler/wasm-binary.mjs
+            psy-sdk-compiler/.compiler-artifact.json
+          include-hidden-files: true
+          if-no-files-found: error
+
   release:
     permissions:
       id-token: write
@@ -74,7 +123,7 @@ jobs:
     name: ${{ matrix.target }} (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 240
-    needs: prepare
+    needs: [prepare, compiler-sidecar]
     strategy:
       fail-fast: false
       matrix:
@@ -143,7 +192,7 @@ jobs:
         run: |
           set -eo pipefail
           flags=(--target $TARGET --profile $PROFILE
-            --bin psy_user_cli --bin psy_node_cli --bin psy_dev_cli --bin dargo --bin psy-lsp-server)
+            --bin psy_user_cli --bin psy_node_cli --bin psy_dev_cli --bin dargo)
 
           [[ "$TARGET" == *windows* ]] && ext=".exe"
 
@@ -153,7 +202,7 @@ jobs:
             cargo build "${flags[@]}"
           fi
 
-          bins=(psy_user_cli psy_node_cli psy_dev_cli dargo psy-lsp-server)
+          bins=(psy_user_cli psy_node_cli psy_dev_cli dargo)
           for name in "${bins[@]}"; do
             bin=$OUT_DIR/$name$ext
             echo ""
@@ -166,6 +215,12 @@ jobs:
             echo "${env_name}_bin_path=${bin}" >> $GITHUB_ENV
           done
 
+      - name: Add SDK compiler sidecar
+        uses: actions/download-artifact@v4
+        with:
+          name: psy-sdk-compiler
+          path: target/${{ matrix.target }}/${{ env.PROFILE }}/psy-sdk-compiler
+
       - name: Archive binaries
         id: artifacts
         env:
@@ -176,16 +231,16 @@ jobs:
         shell: bash
         run: |
           if [[ "$PLATFORM_NAME" == "linux" || "$PLATFORM_NAME" == "alpine" ]]; then
-            tar -czvf "psy_${VERSION_NAME}_${PLATFORM_NAME}_${ARCH}.tar.gz" -C $OUT_DIR psy_user_cli psy_node_cli psy_dev_cli dargo psy-lsp-server
+            tar -czvf "psy_${VERSION_NAME}_${PLATFORM_NAME}_${ARCH}.tar.gz" -C $OUT_DIR psy_user_cli psy_node_cli psy_dev_cli dargo psy-sdk-compiler
             echo "file_name=psy_${VERSION_NAME}_${PLATFORM_NAME}_${ARCH}.tar.gz" >> $GITHUB_OUTPUT
           elif [ "$PLATFORM_NAME" == "darwin" ]; then
             # We need to use gtar here otherwise the archive is corrupt.
             # See: https://github.com/actions/virtual-environments/issues/2619
-            gtar -czvf "psy_${VERSION_NAME}_${PLATFORM_NAME}_${ARCH}.tar.gz" -C $OUT_DIR psy_user_cli psy_node_cli psy_dev_cli dargo psy-lsp-server
+            gtar -czvf "psy_${VERSION_NAME}_${PLATFORM_NAME}_${ARCH}.tar.gz" -C $OUT_DIR psy_user_cli psy_node_cli psy_dev_cli dargo psy-sdk-compiler
             echo "file_name=psy_${VERSION_NAME}_${PLATFORM_NAME}_${ARCH}.tar.gz" >> $GITHUB_OUTPUT
           else
             cd $OUT_DIR
-            7z a -tzip "psy_${VERSION_NAME}_${PLATFORM_NAME}_${ARCH}.zip" psy_user_cli.exe psy_node_cli.exe psy_dev_cli.exe dargo.exe psy-lsp-server.exe
+            7z a -tzip "psy_${VERSION_NAME}_${PLATFORM_NAME}_${ARCH}.zip" psy_user_cli.exe psy_node_cli.exe psy_dev_cli.exe dargo.exe psy-sdk-compiler
             mv "psy_${VERSION_NAME}_${PLATFORM_NAME}_${ARCH}.zip" ../../../
             echo "file_name=psy_${VERSION_NAME}_${PLATFORM_NAME}_${ARCH}.zip" >> $GITHUB_OUTPUT
           fi
@@ -203,13 +258,11 @@ jobs:
           help2man -N $OUT_DIR/psy_node_cli > psy_node_cli.1 || echo "Manual page for psy_node_cli" > psy_node_cli.1
           help2man -N $OUT_DIR/psy_dev_cli > psy_dev_cli.1 || echo "Manual page for psy_dev_cli" > psy_dev_cli.1
           help2man -N $OUT_DIR/dargo > dargo.1 || echo "Manual page for dargo" > dargo.1
-          help2man -N $OUT_DIR/psy-lsp-server > psy-lsp-server.1 || echo "Manual page for psy-lsp-server" > psy-lsp-server.1
           gzip psy_user_cli.1
           gzip psy_node_cli.1
           gzip psy_dev_cli.1
           gzip dargo.1
-          gzip psy-lsp-server.1
-          tar -czvf "psy_man_${VERSION_NAME}.tar.gz" psy_user_cli.1.gz psy_node_cli.1.gz psy_dev_cli.1.gz dargo.1.gz psy-lsp-server.1.gz
+          tar -czvf "psy_man_${VERSION_NAME}.tar.gz" psy_user_cli.1.gz psy_node_cli.1.gz psy_dev_cli.1.gz dargo.1.gz
           echo "psy_man=psy_man_${VERSION_NAME}.tar.gz" >> $GITHUB_OUTPUT
 
       # Creates the release for this specific version
@@ -232,7 +285,6 @@ jobs:
             ${{ env.psy_node_cli_bin_path }}
             ${{ env.psy_dev_cli_bin_path }}
             ${{ env.dargo_bin_path }}
-            ${{ env.psy_lsp_server_bin_path }}
 
       # If this is a nightly release, it also updates the release
       # tagged `nightly` for compatibility with `psyup`

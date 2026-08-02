@@ -365,9 +365,20 @@ impl<F: RichField + Extendable<D>, const D: usize> PackedEvaluableBase<F, D> for
 }
 
 #[derive(Debug)]
-struct ComparisonGenerator<F: RichField + Extendable<D>, const D: usize> {
+pub struct ComparisonGenerator<F: RichField + Extendable<D>, const D: usize> {
     row: usize,
     gate: ComparisonGate<F, D>,
+}
+
+// Needed by `impl_generator_serializer!`, which constructs a default instance
+// solely to read back its `id()`. The concrete field values are irrelevant.
+impl<F: RichField + Extendable<D>, const D: usize> Default for ComparisonGenerator<F, D> {
+    fn default() -> Self {
+        Self {
+            row: 0,
+            gate: ComparisonGate::new(32, 16),
+        }
+    }
 }
 
 impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D> for ComparisonGenerator<F, D> {

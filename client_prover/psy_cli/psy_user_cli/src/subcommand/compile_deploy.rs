@@ -25,10 +25,13 @@ pub async fn run(args: CompileAndDeployArgs) -> anyhow::Result<()> {
     // Phase 1: Compile
     tracing::info!("compiling contract...");
     let output = if args.is_crate {
-        psy_compiler::compile_crate(source_path)?
+        psy_prover::session::compile_bridge::compile_crate_output(source_path)
+            .map_err(|error| anyhow::anyhow!("failed to compile crate source {}: {:#}", source_path.display(), error))?
     } else {
-        let source = fs::read_to_string(source_path)?;
-        psy_compiler::compile(&source)?
+        let source = fs::read_to_string(source_path)
+            .map_err(|error| anyhow::anyhow!("failed to read source file {}: {}", source_path.display(), error))?;
+        psy_prover::session::compile_bridge::compile_contract_output(&source)
+            .map_err(|error| anyhow::anyhow!("failed to compile source {}: {:#}", source_path.display(), error))?
     };
 
     tracing::info!(
@@ -38,17 +41,20 @@ pub async fn run(args: CompileAndDeployArgs) -> anyhow::Result<()> {
     );
 
     // Save artifacts if output_dir specified
-    if let Some(ref out_dir) = args.output_dir {
-        fs::create_dir_all(out_dir)?;
+    if let Some(out_dir) = &args.output_dir {
+        fs::create_dir_all(out_dir).map_err(|error| anyhow::anyhow!("failed to create output directory {}: {}", out_dir, error))?;
 
         let abi_json = output.abi_to_json()?;
-        fs::write(format!("{}/abi.json", out_dir), &abi_json)?;
+        fs::write(format!("{}/abi.json", out_dir), &abi_json)
+            .map_err(|error| anyhow::anyhow!("failed to write ABI under {}: {}", out_dir, error))?;
 
         let code_bytes = output.to_bytes()?;
-        fs::write(format!("{}/contract_code.bin", out_dir), &code_bytes)?;
+        fs::write(format!("{}/contract_code.bin", out_dir), &code_bytes)
+            .map_err(|error| anyhow::anyhow!("failed to write contract code under {}: {}", out_dir, error))?;
 
         let defs_json = serde_json::to_string(&output.circuit_definitions)?;
-        fs::write(format!("{}/circuit_defs.json", out_dir), &defs_json)?;
+        fs::write(format!("{}/circuit_defs.json", out_dir), &defs_json)
+            .map_err(|error| anyhow::anyhow!("failed to write circuit definitions under {}: {}", out_dir, error))?;
     }
 
     // Phase 2: Generate circuits and deploy command
@@ -72,9 +78,10 @@ pub async fn run(args: CompileAndDeployArgs) -> anyhow::Result<()> {
     tracing::info!("circuits generated successfully");
 
     // Save deploy command
-    if let Some(ref out_dir) = args.output_dir {
+    if let Some(out_dir) = &args.output_dir {
         let deploy_cmd_json = serde_json::to_string(&deploy_cmd)?;
-        fs::write(format!("{}/deploy_cmd.json", out_dir), &deploy_cmd_json)?;
+        fs::write(format!("{}/deploy_cmd.json", out_dir), &deploy_cmd_json)
+            .map_err(|error| anyhow::anyhow!("failed to write deploy command under {}: {}", out_dir, error))?;
         tracing::info!("deploy command saved to {}/deploy_cmd.json", out_dir);
     }
 
@@ -104,8 +111,9 @@ pub async fn run(args: CompileAndDeployArgs) -> anyhow::Result<()> {
     tracing::info!("contract deployed: {}", contract_uuid);
 
     // Save contract ID
-    if let Some(ref out_dir) = args.output_dir {
-        fs::write(format!("{}/contract_id.txt", out_dir), contract_uuid.to_string())?;
+    if let Some(out_dir) = &args.output_dir {
+        fs::write(format!("{}/contract_id.txt", out_dir), contract_uuid.to_string())
+            .map_err(|error| anyhow::anyhow!("failed to write contract ID under {}: {}", out_dir, error))?;
     }
 
     println!("Contract deployed successfully:");

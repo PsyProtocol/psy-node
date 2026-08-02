@@ -459,21 +459,30 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F> + std::fmt::Debug> SubmitUser
                     .iter()
                     .flat_map(|update| match update {
                         ContractStateUpdate::Positional { delta_proof } => {
-                            let old_elements = delta_proof.old_value.to_4_felts().to_vec();
-                            let new_elements = delta_proof.new_value.to_4_felts().to_vec();
-                            old_elements
-                                .iter()
-                                .zip(new_elements.iter())
-                                .enumerate()
-                                .filter(|(_, (old, new))| old != new)
-                                .map(|(offset, (old, new))| PsySlotUpdate {
-                                    slot: delta_proof.index * 4 + offset as u64,
-                                    old_value: *old,
-                                    new_value: *new,
-                                })
-                                .collect::<Vec<_>>()
+                            delta_proof_to_slot_updates::<F, Hash>(delta_proof)
                         }
-                        ContractStateUpdate::IMT { .. } => Vec::new(),
+                        ContractStateUpdate::IMT { update } => match update {
+                            IMTContractStateUpdate::Update { delta_proof, .. } => {
+                                delta_proof_to_slot_updates::<F, Hash>(delta_proof)
+                            }
+                            IMTContractStateUpdate::Insert {
+                                predecessor_delta_proof,
+                                new_leaf_delta_proof,
+                                ..
+                            } => {
+                                // An insert touches two leaves: the predecessor
+                                // (its next_key/next_index pointers change) and the
+                                // newly appended leaf. Each carries its own delta proof
+                                // against the contract state tree, so both are emitted.
+                                let mut updates = delta_proof_to_slot_updates::<F, Hash>(
+                                    predecessor_delta_proof,
+                                );
+                                updates.extend(delta_proof_to_slot_updates::<F, Hash>(
+                                    new_leaf_delta_proof,
+                                ));
+                                updates
+                            }
+                        },
                     })
                     .collect::<Vec<_>>();
 
@@ -514,6 +523,35 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F> + std::fmt::Debug> SubmitUser
     */
 }
 
+/// Decompose a contract state tree delta proof into felt-level slot updates.
+///
+/// Each leaf in the contract state tree occupies 4 storage slots (one per felt of
+/// its 256-bit hash value); only the felts that actually change are emitted. This
+/// is shared by positional updates and IMT updates, since an IMT leaf is stored in
+/// the contract state tree as its leaf hash at `delta_proof.index` — the exact same
+/// layout a positional value uses.
+fn delta_proof_to_slot_updates<F, Hash>(
+    delta_proof: &DeltaMerkleProofCore<Hash>,
+) -> Vec<PsySlotUpdate<F>>
+where
+    F: QFelt64,
+    Hash: QFHashBase<F>,
+{
+    let old_elements = delta_proof.old_value.to_4_felts();
+    let new_elements = delta_proof.new_value.to_4_felts();
+    old_elements
+        .iter()
+        .zip(new_elements.iter())
+        .enumerate()
+        .filter(|(_, (old, new))| old != new)
+        .map(|(offset, (old, new))| PsySlotUpdate {
+            slot: delta_proof.index * 4 + offset as u64,
+            old_value: *old,
+            new_value: *new,
+        })
+        .collect()
+}
+
 #[pderive::serialize_clone_f_ts]
 #[ts(export, concrete(F = parth_core::PF))]
 pub struct PsyUserEventRecord<F> {
@@ -549,7 +587,8 @@ impl<F: QFelt64> PsyCanonicalSerializeMetadata for PsyUserEventRecord<F> {
 
 impl<F: QFelt64> FallbackPsySerializeCanonical for PsyUserEventRecord<F> {
     fn fallback_pio_serialized_size(&self) -> usize {
-        5 + 4 + self.data.len()
+        // 5 u64 fields (40 bytes) + vec_length u32 (4 bytes) + data.len() u64s
+        5 * 8 + 4 + self.data.len() * 8
     }
 
     fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {

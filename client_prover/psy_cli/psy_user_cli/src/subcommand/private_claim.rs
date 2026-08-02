@@ -1,11 +1,9 @@
 use std::{str::FromStr, time::Duration};
 
-use base64::Engine;
 use nostr_sdk::prelude::*;
 use plonky2::{field::types::PrimeField64, plonk::proof::ProofWithPublicInputs};
 use psy_client_common::{
-    args::{ContractCallArgs, DPNSoftwareDefinedCallData},
-    data::qhashout::QHashOut,
+    data::{alt::AltVerifierOnlyCircuitData, qhashout::QHashOut},
     ups::circuits::LocalCircuitType,
 };
 use psy_client_data::{
@@ -14,14 +12,12 @@ use psy_client_data::{
 };
 use psy_common_circuit::circuits::traits::qstandard::QStandardCircuit;
 use psy_dpn_circuit::circuits::privacy::private_note_inclusion::PrivateNoteInclusionCircuit;
-use psy_prover::session::WalletSession;
+use psy_prover::session::{ClaimBatchItem, PrivateTransferClaim, WalletSession};
 use psy_provider::provider::RpcProvider;
 use tokio::time::sleep;
 
-use crate::subcommand::{
-    args::PrivateClaimArgs,
-    note_proof_common::{build_private_claim_inputs, NoteProofOutput},
-};
+use crate::subcommand::{args::PrivateClaimArgs, note_proof_common::NoteProofOutput};
+use crate::result::{CommandResult, TransactionResult, TransactionStatus};
 
 const NOTE_TREE_HEIGHT: usize = 20;
 
@@ -121,7 +117,7 @@ async fn nostr_receive_private_msg(receiver_nsec: &str, relay_url: &str, timeout
     Ok(content)
 }
 
-pub async fn run(args: PrivateClaimArgs) -> anyhow::Result<()> {
+pub async fn run(args: PrivateClaimArgs) -> anyhow::Result<CommandResult> {
     let psy_config = psy_config::PsyConfigGoldilocks::from_file(&args.rpc_config)?;
     let rpc_config = psy_config.get_current_network()?.clone();
     let provider = RpcProvider::new_with_config(&rpc_config)?;
@@ -138,12 +134,20 @@ pub async fn run(args: PrivateClaimArgs) -> anyhow::Result<()> {
         let payload = nostr_receive_private_msg(nsec, &args.nostr_relay, args.nostr_timeout_secs).await?;
         serde_json::from_str(&payload).map_err(|e| anyhow::anyhow!("invalid note proof payload from nostr: {}", e))?
     };
+    let token_contract_id = note_data
+        .token_contract_id
+        .parse::<u64>()
+        .map_err(|e| anyhow::anyhow!("invalid token_contract_id in note proof: {}", e))?;
+    anyhow::ensure!(
+        args.contract_id == token_contract_id,
+        "private transfer claim contract mismatch: item contract_id={}, proof token_contract_id={}",
+        args.contract_id,
+        token_contract_id
+    );
 
-    // Deserialize proof from bincode(base64).
-    let proof_bytes = base64::engine::general_purpose::STANDARD
-        .decode(note_data.note_proof_bincode_b64.as_bytes())
-        .map_err(|e| anyhow::anyhow!("invalid proof base64: {}", e))?;
-    let proof: ProofWithPublicInputs<F, C, D> = bincode::deserialize(&proof_bytes).map_err(|e| anyhow::anyhow!("invalid bincode proof: {}", e))?;
+    // Deserialize proof from raw bytes (no longer bincode-b64).
+    let proof: ProofWithPublicInputs<F, C, D> =
+        bincode::deserialize(&note_data.note_proof).map_err(|e| anyhow::anyhow!("invalid bincode proof: {}", e))?;
     let fingerprint = QHashOut::<F>::from_values(
         note_data.note_proof_fingerprint[0],
         note_data.note_proof_fingerprint[1],
@@ -188,38 +192,37 @@ pub async fn run(args: PrivateClaimArgs) -> anyhow::Result<()> {
         .copied()
         .ok_or_else(|| anyhow::anyhow!("No user id found for receiver public key"))?;
 
-    // Important: start session first, then inject external proof into the active
-    // session tree.
-    wallet_session.start_session(receiver_pk).await?;
-    let leaf_index = wallet_session.add_external_proof(receiver_pk, fingerprint, proof, verifier_data).await?;
-    let leaf_proof = wallet_session
-        .user_session_mgrs
-        .get(&receiver_pk)
-        .ok_or_else(|| anyhow::anyhow!("User session manager not found for {}", receiver_pk))?
-        .proof_tree_state
-        .get_leaf_merkle_proof(leaf_index)
-        .await;
-
-    let inputs = build_private_claim_inputs(&note_data, &leaf_proof, leaf_index, args.random0, args.random1);
-    wallet_session
-        .prove_contract_call(
-            receiver_pk,
-            vec![ContractCallArgs {
-                contract_id: args.contract_id,
-                method_name: "private_claim".to_string(),
-                inputs,
-            }],
-        )
-        .await?;
-
-    tracing::info!("Submitting private_claim with proof_index={}", leaf_index);
     let checkpoint_before = provider.get_latest_block_state().await?.checkpoint_id;
     let baseline_nonce = provider
         .get_user_leaf_data(checkpoint_before, receiver_user_id)
         .await?
         .nonce
         .to_canonical_u64();
-    let tx_hash = wallet_session.sign_and_submit(receiver_pk, DPNSoftwareDefinedCallData::default()).await?;
+
+    let claim = PrivateTransferClaim {
+        nullifier: note_data.nullifier,
+        owner: note_data.owner,
+        amount: note_data.amount,
+        user_tree_root: note_data.user_tree_root,
+        checkpoint_id: note_data.checkpoint_id,
+        note_root_slot: note_data.note_root_slot,
+        token_contract_id,
+        random0: args.random0,
+        random1: args.random1,
+        note_proof_fingerprint: fingerprint,
+        note_proof: proof,
+        note_verifier_data: AltVerifierOnlyCircuitData::from(verifier_data),
+    };
+    tracing::info!("Submitting private_claim through claim_batch compatibility path");
+    let tx_hash = wallet_session
+        .claim_batch(
+            receiver_pk,
+            vec![ClaimBatchItem::PrivateTransfer {
+                contract_id: args.contract_id,
+                claim,
+            }],
+        )
+        .await?;
     tracing::info!("tx submitted! hash: {}", tx_hash);
     let checkpoint_after = wait_checkpoint_with_nonce_change(&provider, receiver_user_id, checkpoint_before, baseline_nonce).await?;
     tracing::info!(
@@ -229,5 +232,11 @@ pub async fn run(args: PrivateClaimArgs) -> anyhow::Result<()> {
         baseline_nonce
     );
 
-    Ok(())
+    Ok(CommandResult::Transaction(TransactionResult {
+        transaction_hash: tx_hash,
+        user_id: Some(receiver_user_id),
+        status: TransactionStatus::Confirmed,
+        confirmed_checkpoint: Some(checkpoint_after),
+        network: psy_config.current_network_name().to_string(),
+    }))
 }

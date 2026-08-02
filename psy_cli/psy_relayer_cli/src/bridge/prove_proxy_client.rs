@@ -13,11 +13,12 @@ use serde_json::json;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BridgeWithdrawalWitnessInput {
     pub withdrawal_root: String,
+    pub sender_user_id: u32,
     pub recipient: [u32; 8],
     pub token: [u32; 8],
     pub amount: [u32; 8],
-    pub nonce: u32,
-    pub dest_chain_id: u32,
+    pub nonce: [u32; 8],
+    pub destination_chain_index: u32,
     pub leaf_index: u32,
     pub bridge_user_id: u32,
     pub siblings: Vec<String>,
@@ -44,7 +45,7 @@ pub struct BridgeDepositLeafInput {
     pub l2_token_contract_id: [u32; 8],
     pub amount: [u32; 8],
     pub chain_index: u32,
-    pub note_secret_hash: [u32; 8],
+    pub note_commitment: [u32; 8],
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,11 +118,14 @@ pub struct BridgeAggDeltaProof {
 pub struct BridgeAggWitnessInput {
     pub from_checkpoint: u64,
     pub to_checkpoint: u64,
-    /// Bincode-serialized ProofWithPublicInputs for each checkpoint, hex-encoded
-    pub checkpoint_proofs_hex: Vec<String>,
+    /// Bincode-serialized ProofWithPublicInputs for the final (to_checkpoint)
+    /// checkpoint state transition proof, hex-encoded.
+    pub final_checkpoint_proof_hex: String,
     pub delta_merkle_proofs: Vec<BridgeAggDeltaProof>,
     pub pre_delta_merkle_proofs: Vec<BridgeAggDeltaProof>,
-    /// Genesis checkpoint state transition hash (legacy field name kept for wire compatibility).
+    /// Chain hash immediately before the aggregated range (chain hash of
+    /// checkpoint `from_checkpoint - 1`; for `from_checkpoint <= 1` this is the
+    /// genesis checkpoint state transition hash).
     pub chain_start: String,
     /// Checkpoint state transition circuit fingerprint (hex).
     /// Passed from the caller to match the coordinator's fingerprint.
@@ -130,7 +134,6 @@ pub struct BridgeAggWitnessInput {
     pub final_checkpoint_global_state_roots: BridgeAggGlobalStateRoots,
     pub deposit_witness: BridgeAggSlotWitness,
     pub withdrawal_witness: BridgeAggSlotWitness,
-    pub deposits_consumed: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,7 +141,6 @@ pub struct BridgeAggGroth16Output {
     pub from_checkpoint: u64,
     pub to_checkpoint: u64,
     pub num_checkpoints_aggregated: u64,
-    pub deposits_consumed: u64,
     pub bridge_agg_public_inputs_count: usize,
     pub bridge_agg_public_inputs: Vec<String>,
     pub groth16_proof: UncompressedGroth16ProofData,
@@ -147,7 +149,7 @@ pub struct BridgeAggGroth16Output {
     pub checkpoint_roots: Vec<String>,
     pub deposit_tree_root: String,
     pub withdrawal_tree_root: String,
-    pub bridge_user_id: String,
+    pub end_checkpoint_index: u64,
 }
 
 // ─────────────────────────────────────────────────────────────────────────

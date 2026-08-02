@@ -8,8 +8,10 @@ members = [
     "pderive",
     "parth_core",
     "parth_common",
-    # (removed psy_scratchpad, psy_type_defaults)
+    "psy_scratchpad",
+    "psy_type_defaults",
     "psy_core",
+    "psy_common",
     "psy_data",
     "psy_node_core",
     "psy_node_common",
@@ -23,7 +25,7 @@ members = [
     "psy_plonky2_basic_helpers",
     "psy_plonky2_common_circuits",
     "psy_plonky2_circuits",
-    # "psy_plonky2_testbed",
+    "psy_plonky2_testbed",
     "psy_worker_core",
     "psy_api_core",
     "psy_dummy_prover",
@@ -41,15 +43,14 @@ members = [
     "client_prover/psy_core/psy_data",
     "client_prover/psy_core/psy_config",
     "client_prover/psy_vm",
-    "client_prover/psy_compiler",
     "client_prover/psy_prover",
     "client_prover/psy_provider",
+    "client_prover/psy_mcp_server",
     "client_prover/psy_circuit/psy_common_circuit",
     "client_prover/psy_circuit/psy_network_circuit",
     "client_prover/psy_circuit/psy_ups_circuit",
     "client_prover/psy_circuit/psy_dpn_circuit",
     "client_prover/psy_cli/psy_user_cli",
-    "client_prover/psy_ide/psy_wasm",
 ]
 resolver = "2"
 
@@ -274,33 +275,6 @@ web-sys = "0.3"
 js-sys = "0.3"
 serde-wasm-bindgen = "0.6"
 
-# ---- Compiler / Parser (client_prover) ----
-nom = "8.0"
-logos = "0.15"
-ariadne = { version = "0.5.0", features = ["auto-color"] }
-lalrpop-util = { version = "0.22", features = ["lexer", "unicode"] }
-lalrpop = "0.22"
-smol_str = { version = "=0.3.2", features = ["serde"] }
-thin-vec = "0.2"
-id-arena = "2.2"
-unescaper = "0.1"
-petgraph = "0.7"
-rangemap = "1.4"
-ena = "0.14"
-unicode-segmentation = "1.12"
-either = "1"
-minijinja = { version = "2.0", features = ["serde"] }
-unroll = "0.1.5"
-
-# ---- LLVM / MLIR (client_prover) ----
-llvm-sys = "191.0"
-melior = { version = "0.21", features = ["ods-dialects"] }
-mlir-sys = { version = "0.4" }
-
-# ---- LSP (client_prover IDE) ----
-tower-lsp = "0.20"
-lsp-server = "0.7"
-lsp-types = "0.97"
 
 # ---- Auth / Security ----
 jsonwebtoken = "9.3.1"
@@ -356,10 +330,11 @@ parth_crypto = { path = "./parth_crypto" }
 
 psy_core = { path = "./psy_core" }
 psy_data = { path = "./psy_data" }
+psy_common = { path = "./psy_common" }
 psy_node_core = { path = "./psy_node_core" }
 psy_node_common = { path = "./psy_node_common" }
-# psy_scratchpad = { path = "./psy_scratchpad" }
-# psy_type_defaults = { path = "./psy_type_defaults" }
+psy_scratchpad = { path = "./psy_scratchpad" }
+psy_type_defaults = { path = "./psy_type_defaults" }
 psy_worker_core = { path = "./psy_worker_core" }
 psy_api_core = { path = "./psy_api_core" }
 psy_dummy_prover = { path = "./psy_dummy_prover" }
@@ -376,7 +351,6 @@ psy_crypto = { path = "./client_prover/psy_core/psy_crypto" }
 psy_config = { path = "./client_prover/psy_core/psy_config" }
 kvq = { path = "./client_prover/psy_core/kvq" }
 psy_vm = { path = "./client_prover/psy_vm", default-features = false }
-psy_compiler = { path = "./client_prover/psy_compiler" }
 psy_prover = { path = "./client_prover/psy_prover", default-features = false }
 psy_provider = { path = "./client_prover/psy_provider" }
 psy_common_circuit = { path = "./client_prover/psy_circuit/psy_common_circuit", default-features = false }

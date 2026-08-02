@@ -20,6 +20,7 @@ use psy_api_core::{
         RealmContractSlotUpdates, RealmEdgeRpcServer, RealmEndCapSlotUpdates, RealmSlotUpdate,
     },
     worker::standard_worker_rpc::NodeEdgeWorkerRpcServer,
+    CheckpointJobStats,
 };
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{
@@ -157,6 +158,26 @@ impl<
     pub async fn get_latest_checkpoint_id(&self) -> anyhow::Result<u64> {
         self.db_reader.get_latest_checkpoint_id().await
     }
+    pub async fn get_job_stats_internal(&self, checkpoint_id: u64) -> anyhow::Result<CheckpointJobStats> {
+        let (unique_pending_id, _) = self
+            .db_reader
+            .get_unique_pending_id_for_checkpoint_id(checkpoint_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("no unique pending id found for checkpoint id {}", checkpoint_id))?;
+        let stats = self
+            .temp_db
+            .get_job_stats(&self.realm_identifier, unique_pending_id)
+            .await?
+            .unwrap_or_default();
+
+        Ok(CheckpointJobStats {
+            unique_pending_id,
+            total_completed: stats.total_completed,
+            total_duration_ms: stats.total_duration_ms,
+            min_duration_ms: stats.min_duration_ms,
+            max_duration_ms: stats.max_duration_ms,
+        })
+    }
     pub async fn get_checkpoint_id_for_unique_pending_id_internal(&self, unique_pending_id: u64) -> anyhow::Result<Option<u64>> {
         self.db_reader.get_checkpoint_id_for_unique_pending_id(unique_pending_id).await
     }
@@ -253,6 +274,11 @@ impl<
             });
         }
         Ok(())
+    }
+
+    pub async fn contract_state_tree_height(&self, contract_id: u32) -> anyhow::Result<u8> {
+        self.ensure_contract_heights_in_cache(&[contract_id]).await?;
+        self.contract_state_tree_height_cache.get_contract_height(contract_id)
     }
 
     fn build_user_end_cap_slot_updates(
@@ -562,19 +588,26 @@ impl<
         }
         timer.lap_micros("set_user_end_cap_slot_updates");
 
+        // Re-read gathering proc ID right before publish to avoid a race with
+        // process_block.set_new_unique_ids, which may have advanced the ID
+        // during the async proof verification / storage calls above. Publishing
+        // to a stale (already-drained) queue silently drops the endcap.
+        let (_, live_proc_id) = self.temp_db.get_gathering_unique_pending_ids(&self.realm_identifier).await?;
+
         let queue_key = RealmUserUpdateQueueKey {
             realm_id: self.realm_id_u64,
             realm_sub_id: self.realm_sub_id_u64,
-            unique_id: proc_checkpoint_id,
+            unique_id: live_proc_id,
             task_group: 0,
             queue_type: QPBaseQueueType::StandardEphemeral,
             _phantom_queue_item: std::marker::PhantomData,
         };
         let new_user_leaf = user_end_cap_input.core.new_user_leaf.clone();
         let new_user_leaf_hash = new_user_leaf.qfhash::<N::HasherBase>();
+        // Keep original job_id (proof stored under it). Only refresh queue key.
 
         let queue_item = PsyRealmUserUpdateQueueItem {
-            job_id,
+            job_id: job_id,
             expected_fake_checkpoint_id: fake_checkpoint_id,
             old_user_leaf_hash: old_leaf_hash,
             new_user_leaf_hash,
@@ -582,9 +615,31 @@ impl<
             stats: user_end_cap_input.core.stats,
             events: user_end_cap_input.events,
         };
-        //println!("Publishing to user update queue: {:?}", queue_item);
+
+        // Ensure the consumer for live_proc_id exists BEFORE publishing. If
+        // the processor has already drained and deleted the consumer for this
+        // generation, publishing to an ephemeral queue with no consumer silently
+        // drops the message. By ensuring the consumer here, we guarantee the
+        // message will be buffered and picked up by the gatherer on its next
+        // drain cycle — even if the processor has already rotated past this ID.
+        // The consumer we create is idempotent: if it already exists this is a
+        // no-op; if it was deleted, it is recreated with DeliverPolicy::All so
+        // all pending messages are replayed.
+        if let Err(e) = self.user_update_queue.ensure_consumer(
+            &queue_key,
+            self.realm_id_u64,
+            self.realm_sub_id_u64,
+            live_proc_id,
+            0,
+        ).await {
+            tracing::warn!(
+                "Failed to ensure consumer for live_proc_id {} before publish (continuing): {}",
+                live_proc_id, e
+            );
+        }
+
         self.user_update_queue
-            .publish_ephemeral_queue_item_owned(&queue_key, self.realm_id_u64, self.realm_sub_id_u64, proc_checkpoint_id, 0, queue_item)
+            .publish_ephemeral_queue_item_owned(&queue_key, self.realm_id_u64, self.realm_sub_id_u64, live_proc_id, 0, queue_item)
             .await?;
         timer.lap_micros("publish_ephemeral_queue_item_owned");
         timer.lap_group("handle_user_end_cap_proof_submission total");
@@ -723,6 +778,10 @@ impl<
         res(self.db_reader.get_checkpoint_leaf_data(checkpoint_id).await)
     }
 
+    async fn get_job_stats(&self, checkpoint_id: u64) -> QRpcResult<CheckpointJobStats> {
+        res(self.get_job_stats_internal(checkpoint_id).await)
+    }
+
     async fn get_latest_l2_block_state(&self) -> QRpcResult<QEDL2BlockState> {
         res(self.db_reader.get_latest_l2_block_state().await)
     }
@@ -772,9 +831,10 @@ impl<
             .await)
     }
     async fn get_user_contract_state_tree_root(&self, checkpoint_id: u64, user_id: u64, contract_id: u32) -> QRpcResult<N::QHash> {
+        let height = self.contract_state_tree_height(contract_id).await.map_err(RpcError::Anyhow)?;
         res(self
             .db_reader
-            .contract_state_tree_get_root_hash(checkpoint_id, user_id, contract_id as u64)
+            .contract_state_tree_get_root_hash(checkpoint_id, user_id, contract_id as u64, height)
             .await)
     }
 
@@ -783,12 +843,12 @@ impl<
         checkpoint_id: u64,
         user_id: u64,
         contract_id: u32,
-        _height: u8, // height is not used in the db call
+        height: u8,
         leaf_id: u64,
     ) -> QRpcResult<N::QHash> {
         res(self
             .db_reader
-            .contract_state_tree_get_leaf_hash(checkpoint_id, user_id, contract_id as u64, leaf_id)
+            .contract_state_tree_get_leaf_hash(checkpoint_id, user_id, contract_id as u64, height, leaf_id)
             .await)
     }
 
@@ -899,6 +959,7 @@ impl<
         contract_id: u32,
         key: N::QHash,
     ) -> QRpcResult<IMTMembershipProof<N::F, N::QHash>> {
+        let height = self.contract_state_tree_height(contract_id).await.map_err(RpcError::Anyhow)?;
         // Get the leaf index for the key
         let leaf_index = self
             .db_reader
@@ -918,7 +979,7 @@ impl<
         // Get the merkle proof for the leaf's position in the tree
         let merkle_proof = self
             .db_reader
-            .contract_state_tree_get_merkle_proof(checkpoint_id, user_id, contract_id as u64, N::MAX_CONTRACT_STATE_TREE_HEIGHT, leaf_index)
+            .contract_state_tree_get_merkle_proof(checkpoint_id, user_id, contract_id as u64, height, leaf_index)
             .await
             .map_err(RpcError::Anyhow)?;
 
@@ -935,6 +996,7 @@ impl<
         contract_id: u32,
         key: N::QHash,
     ) -> QRpcResult<IMTNonMembershipProof<N::F, N::QHash>> {
+        let height = self.contract_state_tree_height(contract_id).await.map_err(RpcError::Anyhow)?;
         // Find the predecessor leaf
         let (predecessor_index, predecessor_leaf) = self
             .db_reader
@@ -945,7 +1007,7 @@ impl<
         // Get the merkle proof for the predecessor's position
         let merkle_proof = self
             .db_reader
-            .contract_state_tree_get_merkle_proof(checkpoint_id, user_id, contract_id as u64, N::MAX_CONTRACT_STATE_TREE_HEIGHT, predecessor_index)
+            .contract_state_tree_get_merkle_proof(checkpoint_id, user_id, contract_id as u64, height, predecessor_index)
             .await
             .map_err(RpcError::Anyhow)?;
 
@@ -962,6 +1024,7 @@ impl<
         contract_id: u32,
         key: N::QHash,
     ) -> QRpcResult<IMTPredecessorResult<N::F, N::QHash>> {
+        let height = self.contract_state_tree_height(contract_id).await.map_err(RpcError::Anyhow)?;
         // Find predecessor leaf
         let (predecessor_index, predecessor_leaf) = self
             .db_reader
@@ -972,7 +1035,7 @@ impl<
         // Get merkle proof for predecessor
         let predecessor_merkle_proof = self
             .db_reader
-            .contract_state_tree_get_merkle_proof(checkpoint_id, user_id, contract_id as u64, N::MAX_CONTRACT_STATE_TREE_HEIGHT, predecessor_index)
+            .contract_state_tree_get_merkle_proof(checkpoint_id, user_id, contract_id as u64, height, predecessor_index)
             .await
             .map_err(RpcError::Anyhow)?;
 

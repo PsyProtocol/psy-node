@@ -1,3 +1,5 @@
+pub mod faucet;
+#[cfg(feature = "gnark-wrap")]
 pub mod prove_proxy;
 
 use std::{sync::Arc, time::Duration};
@@ -17,7 +19,6 @@ use psy_client_data::qblock::cmds::deploy_contract::QBCDeployContract;
 use psy_crypto::signature::zk::data::ZKPublicKeyInfo;
 use psy_provider::provider::RpcProvider;
 use psy_vm::dpn::vm::def::DPNFunctionCircuitDefinition;
-use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
 
 use crate::session::{WalletKeyPair, WalletSession};
@@ -28,6 +29,12 @@ pub trait Rpc {
     /// local proving operation
     #[method(name = "exec_contract_call")]
     async fn exec_contract_call(&self, public_key: QHashOut<F>, contract_call_args: Vec<ContractCallArgs>) -> Result<String, ErrorObjectOwned>;
+    #[method(name = "generate_tx_trace")]
+    async fn generate_tx_trace(&self, public_key: QHashOut<F>, call_data: ContractCallData) -> Result<String, ErrorObjectOwned>;
+    #[method(name = "simulate_contract_call")]
+    async fn simulate_contract_call(&self, public_key: QHashOut<F>, call_data: ContractCallData) -> Result<String, ErrorObjectOwned>;
+    #[method(name = "prove_tx_trace")]
+    async fn prove_tx_trace(&self, public_key: QHashOut<F>, envelope_json: String) -> Result<String, ErrorObjectOwned>;
     #[method(name = "start_session")]
     async fn start_session(&self, public_key: QHashOut<F>) -> Result<String, ErrorObjectOwned>;
     #[method(name = "prove_contract_calls")]
@@ -38,11 +45,11 @@ pub trait Rpc {
     async fn register_user(&self, private_key: QHashOut<F>, fingerprint: QHashOut<F>) -> Result<QHashOut<F>, ErrorObjectOwned>;
     #[method(name = "add_user")]
     async fn add_user(&self, private_key: QHashOut<F>, fingerprint: QHashOut<F>) -> Result<QHashOut<F>, ErrorObjectOwned>;
-    #[method(name = "register_sdk_key_circuit")]
-    async fn register_sdk_key_circuit(
+    #[method(name = "register_sd_key_circuit")]
+    async fn register_sd_key_circuit(
         &self,
         allowed_contract_ids: Vec<u64>,
-        allowed_method_ids: Vec<u64>,
+        allowed_method_ids: Vec<u32>,
         expected_tx_count: u64,
     ) -> Result<QHashOut<F>, ErrorObjectOwned>;
     #[method(name = "get_zk_public_key")]
@@ -92,6 +99,63 @@ impl RpcServer for RpcServerImpl {
         .map_err(|e| ErrorObject::owned(1, e.to_string(), None::<()>))?
         .map_err(|e| ErrorObject::owned(1, e.to_string(), None::<()>))?;
         Ok("exec contract call".to_string())
+    }
+
+    async fn generate_tx_trace(&self, public_key: QHashOut<F>, call_data: ContractCallData) -> Result<String, ErrorObjectOwned> {
+        let wallet_session = self.wallet_session.clone();
+        let envelope = tokio::task::spawn_blocking(move || {
+            tokio::runtime::Handle::current().block_on(async move {
+                let call_data_value = serde_json::to_value(&call_data)?;
+                let trace = wallet_session.read().generate_tx_trace_with_opts(public_key, call_data).await?;
+                crate::trace::GeneratedTxTraceJson::from_trace(&trace, call_data_value)
+            })
+        })
+        .await
+        .map_err(|e| ErrorObject::owned(1, e.to_string(), None::<()>))?
+        .map_err(|e| ErrorObject::owned(1, e.to_string(), None::<()>))?;
+        serde_json::to_string(&envelope).map_err(|e| ErrorObject::owned(1, e.to_string(), None::<()>))
+    }
+
+    async fn simulate_contract_call(&self, public_key: QHashOut<F>, call_data: ContractCallData) -> Result<String, ErrorObjectOwned> {
+        let wallet_session = self.wallet_session.clone();
+        let simulated = tokio::task::spawn_blocking(move || {
+            tokio::runtime::Handle::current()
+                .block_on(async move { wallet_session.read().simulate_contract_call_with_opts(public_key, call_data).await })
+        })
+        .await
+        .map_err(|e| ErrorObject::owned(1, e.to_string(), None::<()>))?
+        .map_err(|e| ErrorObject::owned(1, e.to_string(), None::<()>))?;
+        serde_json::to_string(&simulated).map_err(|e| ErrorObject::owned(1, e.to_string(), None::<()>))
+    }
+
+    async fn prove_tx_trace(&self, public_key: QHashOut<F>, envelope_json: String) -> Result<String, ErrorObjectOwned> {
+        use base64::Engine;
+
+        let wallet_session = self.wallet_session.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            tokio::runtime::Handle::current().block_on(async move {
+                let envelope: crate::trace::GeneratedTxTraceJson = serde_json::from_str(&envelope_json)?;
+                let trace: crate::trace::TxTrace = match envelope.trace.encoding.as_str() {
+                    "json" => serde_json::from_str(&envelope.trace.payload)?,
+                    "bincode-base64" => {
+                        let payload = base64::engine::general_purpose::STANDARD.decode(&envelope.trace.payload)?;
+                        bincode::deserialize(&payload)?
+                    }
+                    other => anyhow::bail!("Unsupported trace payload encoding: {}", other),
+                };
+                let tx_hash = wallet_session.read().prove_tx_trace(public_key, &trace).await?;
+                Ok::<_, anyhow::Error>(crate::trace::ProvedTxResultJson::new(
+                    envelope.sig_hash.clone(),
+                    tx_hash.to_string(),
+                    None,
+                    "submitted".to_string(),
+                ))
+            })
+        })
+        .await
+        .map_err(|e| ErrorObject::owned(1, e.to_string(), None::<()>))?
+        .map_err(|e| ErrorObject::owned(1, e.to_string(), None::<()>))?;
+        serde_json::to_string(&result).map_err(|e| ErrorObject::owned(1, e.to_string(), None::<()>))
     }
 
     async fn start_session(&self, public_key: QHashOut<F>) -> Result<String, ErrorObjectOwned> {
@@ -167,10 +231,10 @@ impl RpcServer for RpcServerImpl {
         .map_err(|e| ErrorObject::owned(1, e.to_string(), None::<()>))
     }
 
-    async fn register_sdk_key_circuit(
+    async fn register_sd_key_circuit(
         &self,
         allowed_contract_ids: Vec<u64>,
-        allowed_method_ids: Vec<u64>,
+        allowed_method_ids: Vec<u32>,
         expected_tx_count: u64,
     ) -> Result<QHashOut<F>, ErrorObjectOwned> {
         let wallet_session = self.wallet_session.clone();
@@ -178,7 +242,7 @@ impl RpcServer for RpcServerImpl {
             tokio::runtime::Handle::current().block_on(async move {
                 wallet_session
                     .write()
-                    .register_sdk_key_circuit(&allowed_contract_ids, &allowed_method_ids, expected_tx_count)
+                    .register_sd_key_circuit(&allowed_contract_ids, &allowed_method_ids, expected_tx_count)
                     .await
             })
         })

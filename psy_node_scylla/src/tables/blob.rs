@@ -89,6 +89,7 @@ impl ScyllaBlobToBlobTablePreparedStatements {
     }
 
     pub async fn set_or_insert_one(&self, session: Arc<Session>, obj_id: &[u8], value: &[u8]) -> anyhow::Result<()> {
+        let value = crate::compression::compress(value)?;
         session
             .execute_unpaged(&self.insert_1_prepared, (obj_id, value))
             .await?;
@@ -96,7 +97,7 @@ impl ScyllaBlobToBlobTablePreparedStatements {
     }
     pub async fn set_or_insert_one_qpk<K: QDatabasePrimitiveKey, V: QDatabasePrimitiveKey>(&self, session: Arc<Session>, obj_id: &K, value: &V) -> anyhow::Result<()> {
         session
-            .execute_unpaged(&self.insert_1_prepared, (obj_id.psy_ser_to_bytes_vec()?, value.psy_ser_to_bytes_vec()?))
+            .execute_unpaged(&self.insert_1_prepared, (obj_id.psy_ser_to_bytes_vec()?, crate::compression::compress(&value.psy_ser_to_bytes_vec()?)?))
             .await?;
         Ok(())
     }
@@ -113,7 +114,7 @@ impl ScyllaBlobToBlobTablePreparedStatements {
                 return Ok(None);
             }else{
                 let value = value.unwrap();
-                Ok(Some(V::psy_ser_from_owned_bytes_vec(value)?))
+                Ok(Some(V::psy_ser_from_owned_bytes_vec(crate::compression::decompress(&value)?)?))
             }
         }
     }
@@ -123,7 +124,10 @@ impl ScyllaBlobToBlobTablePreparedStatements {
             .await?;
         let value = res.into_rows_result()?.maybe_first_row::<(Option<Vec<u8>>,)>()?.map(|(val,)| val);
         if value.is_some() {
-            Ok(value.unwrap())
+            match value.unwrap() {
+                Some(v) => Ok(Some(crate::compression::decompress(&v)?)),
+                None => Ok(None),
+            }
         } else {
             Ok(None)
         }
@@ -139,9 +143,9 @@ impl ScyllaBlobToBlobTablePreparedStatements {
             let mut value_chunk = Vec::with_capacity(chunk.len());
             for chk in chunk.iter() {
                 if swap_kv {
-                    value_chunk.push((chk.k2.psy_ser_to_bytes_vec()?, chk.k1.psy_ser_to_bytes_vec()?));
+                    value_chunk.push((chk.k2.psy_ser_to_bytes_vec()?, crate::compression::compress(&chk.k1.psy_ser_to_bytes_vec()?)?));
                 } else {
-                    value_chunk.push((chk.k1.psy_ser_to_bytes_vec()?, chk.k2.psy_ser_to_bytes_vec()?));
+                    value_chunk.push((chk.k1.psy_ser_to_bytes_vec()?, crate::compression::compress(&chk.k2.psy_ser_to_bytes_vec()?)?));
                 }
                 batch.append_statement(self.insert_1_statement.clone());
             }
@@ -164,17 +168,21 @@ impl ScyllaBlobToBlobTablePreparedStatements {
         //tree_id, tree_sub_id, level, node_index, checkpoint_id, value
 
         let chunk_size = INSERT_SINGLE_ID_CHECKPOINTED_OBJECT_BATCH_SIZE;
+        let mut value_list = Vec::with_capacity(entries.len());
         for chunk in entries.chunks(chunk_size) {
             let mut batch: Batch = Default::default();
-            for _ in 0..chunk.len() {
+            let mut value_chunk = Vec::with_capacity(chunk.len());
+            for (k, v) in chunk.iter() {
+                value_chunk.push((k.as_slice(), crate::compression::compress(v)?));
                 batch.append_statement(self.insert_1_statement.clone());
             }
             batch_list.push(batch);
+            value_list.push(value_chunk);
         }
         
         let batches: Vec<_> = batch_list
             .iter()
-            .zip(entries.chunks(chunk_size).into_iter())
+            .zip(value_list.iter())
             .map(|(batch, values)| session.batch(batch, values))
             .collect();
         let results = join_all(batches).await;
@@ -196,7 +204,7 @@ impl ScyllaBlobToBlobTablePreparedStatements {
                         let rows = res.into_rows_result()?;
                         if let Some(row) = rows.maybe_first_row::<(Option<Vec<u8>>,)>()? {
                             match row.0 {
-                                Some(v) => anyhow::Ok(Some(v)),
+                                Some(v) => anyhow::Ok(Some(crate::compression::decompress(&v)?)),
                                 None => Ok(None),
                             }
                         } else {
@@ -226,7 +234,7 @@ impl ScyllaBlobToBlobTablePreparedStatements {
                         let rows = res.into_rows_result()?;
                         if let Some(row) = rows.maybe_first_row::<(Option<Vec<u8>>,)>()? {
                             match row.0 {
-                                Some(v) => anyhow::Ok(Some(V::psy_ser_from_owned_bytes_vec(v)?),),
+                                Some(v) => anyhow::Ok(Some(V::psy_ser_from_owned_bytes_vec(crate::compression::decompress(&v)?)?),),
                                 None => Ok(None),
                             }
                         } else {
@@ -257,7 +265,7 @@ impl ScyllaBlobToBlobTablePreparedStatements {
                             match row.0 {
                                 Some(v) => anyhow::Ok(Some(BiDirectionalMappingRow{
                                     k1: key.clone(),
-                                    k2: V::psy_ser_from_owned_bytes_vec(v)?
+                                    k2: V::psy_ser_from_owned_bytes_vec(crate::compression::decompress(&v)?)?
                             }),),
                                 None => Ok(None),
                             }
@@ -290,7 +298,7 @@ impl ScyllaBlobToBlobTablePreparedStatements {
                         let rows = res.into_rows_result()?;
                         if let Some(row) = rows.maybe_first_row::<(Option<Vec<u8>>,)>()? {
                             match row.0 {
-                                Some(v) => anyhow::Ok(Some(v)),
+                                Some(v) => anyhow::Ok(Some(crate::compression::decompress(&v)?)),
                                 None => Ok(None),
                             }
                         } else {
@@ -320,6 +328,7 @@ impl ScyllaBlobToBlobTablePreparedStatements {
                         if let Some(row) = rows.maybe_first_row::<(Option<Vec<u8>>,)>()? {
                             match row.0 {
                                 Some(v) => {
+                                    let v = crate::compression::decompress(&v)?;
                                     if v.len() != VS {
                                         anyhow::bail!("Value length mismatch: expected {}, got {}", VS, v.len());
                                     }

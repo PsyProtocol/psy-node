@@ -44,12 +44,8 @@ enum Commands {
         from_checkpoint: u64,
         #[arg(long)]
         to_checkpoint: u64,
-        #[arg(long, default_value_t = 0)]
-        deposits_consumed: u64,
-        #[arg(long, default_value = "psy-genesis/config.json")]
+        #[arg(long, default_value = "config.json")]
         rpc_config: String,
-        #[arg(long, default_value = bridge::constants::DEFAULT_L1_RPC_URL)]
-        l1_rpc_url: String,
         #[arg(long, default_value = bridge::constants::DEFAULT_DEPLOYMENTS_NETWORK)]
         deployments_network: String,
         #[arg(long)]
@@ -61,6 +57,8 @@ enum Commands {
     ClaimWithdrawals(bridge::claim_withdrawals::BatchWithdrawalsArgs),
     /// Compute the Poseidon deposit leaf used by L2 deposit_tree / claim_deposit.
     ComputeDepositLeaf(bridge::compute_deposit_leaf::ComputeDepositLeafArgs),
+    /// Regenerate local Groth16 keystore files for bridge wrapper circuits.
+    RegenerateGroth16Keystore(bridge::regen_groth16_keystore::RegenerateGroth16KeystoreArgs),
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -140,7 +138,7 @@ fn default_source() -> String {
 }
 
 fn default_l2_rpc_config() -> String {
-    "psy-genesis/config.json".to_string()
+    "config.json".to_string()
 }
 
 fn default_deposit_tree_contract_id() -> u64 {
@@ -188,9 +186,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::ProveBridgeAgg {
             from_checkpoint,
             to_checkpoint,
-            deposits_consumed,
             rpc_config,
-            l1_rpc_url,
             deployments_network,
             out,
         }) => {
@@ -199,8 +195,6 @@ async fn main() -> anyhow::Result<()> {
                 to_checkpoint,
                 rpc_config,
                 out,
-                deposits_consumed,
-                l1_rpc_url,
                 deployments_network,
             )
             .await
@@ -209,6 +203,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::FinalizeBridgeAgg(args)) => bridge::finalize_bridge::run(args).await,
         Some(Commands::ClaimWithdrawals(args)) => bridge::claim_withdrawals::run(args).await,
         Some(Commands::ComputeDepositLeaf(args)) => bridge::compute_deposit_leaf::run(args),
+        Some(Commands::RegenerateGroth16Keystore(args)) => bridge::regen_groth16_keystore::run(args),
     }
 }
 
@@ -245,11 +240,11 @@ async fn run_indexer(cfg: Cfg) -> anyhow::Result<()> {
 
     loop {
         for chain in &cfg.chains {
-            // StateManager exposes "consumed count", while indexer rows use 0-based deposit_index.
-            // Convert consumed count to the last consumed index for an exclusive "after" window.
-            let consumed_count = get_last_consumed_deposit_index(chain).await?;
-            let last_consumed_index = consumed_count.saturating_sub(1);
-            let after = last_consumed_index
+            // Bridge exposes the proved deposit count, while indexer rows use 0-based deposit_index.
+            // Convert that count to the last proved index for an exclusive "after" window.
+            let proved_count = get_proved_deposit_count(chain).await?;
+            let last_proved_index = proved_count.saturating_sub(1);
+            let after = last_proved_index
                 .max(*last_submitted_by_chain.get(&chain.chain_id).unwrap_or(&-1))
                 ;
             let deposits = get_new_deposits(chain, after).await?;
@@ -302,8 +297,8 @@ async fn run_indexer(cfg: Cfg) -> anyhow::Result<()> {
             tracing::info!(
                 chain=%chain.name,
                 chain_id=chain.chain_id,
-                consumed_count=consumed_count,
-                last_consumed_index,
+                proved_count,
+                last_proved_index,
                 fetched_deposits=deposits.len(),
                 "indexer deposit sync window"
             );
@@ -809,12 +804,12 @@ fn parse_u256_decimal_to_u32x8(s: &str) -> anyhow::Result<[u32; 8]> {
     Ok(words)
 }
 
-async fn get_last_consumed_deposit_index(chain: &ChainCfg) -> anyhow::Result<i64> {
+async fn get_proved_deposit_count(chain: &ChainCfg) -> anyhow::Result<i64> {
     let rpc_url = Url::parse(&chain.rpc_url)
         .with_context(|| format!("invalid chain rpc url: {}", chain.rpc_url))?;
     let provider = ProviderBuilder::new().connect_http(rpc_url);
-    let to = resolve_state_manager_address(chain)?;
-    let selector = selector_for("nextConsumedDepositIndex()");
+    let to = resolve_bridge_address(chain)?;
+    let selector = selector_for("provedDepositCount()");
     let selector_bytes = hex::decode(selector.strip_prefix("0x").unwrap_or(&selector))
         .context("decode selector bytes failed")?;
     let call_data = Bytes::from(selector_bytes);
@@ -825,7 +820,8 @@ async fn get_last_consumed_deposit_index(chain: &ChainCfg) -> anyhow::Result<i64
         method = "eth_call",
         chain = %chain.name,
         chain_id = chain.chain_id,
-        state_manager = %to,
+        bridge = %to,
+        contract_method = "provedDepositCount",
         selector = %selector,
         "l1 rpc request"
     );
@@ -834,7 +830,7 @@ async fn get_last_consumed_deposit_index(chain: &ChainCfg) -> anyhow::Result<i64
         .await
         .with_context(|| format!("alloy eth_call failed: {}", chain.rpc_url))?;
     let n = parse_u256_bytes_to_i64(raw.as_ref())
-        .context("decode nextConsumedDepositIndex return bytes failed")?;
+        .context("decode provedDepositCount return bytes failed")?;
     Ok(n)
 }
 
@@ -849,94 +845,47 @@ fn resolve_state_manager_address(chain: &ChainCfg) -> anyhow::Result<Address> {
     }
 
     let network = chain.deployments_network.as_deref().unwrap_or("localhost");
-    let summary_path = format!("./psy-contracts/deployments/{}/deployed-contracts.json", network);
+    if let Ok(addr) = bridge::api_client::resolve_contract_address_from_deployments(network, "StateManager") {
+        return Ok(addr);
+    }
 
     #[derive(Deserialize)]
     struct DeploymentArtifact {
         address: String,
     }
-    #[derive(Deserialize)]
-    struct DeployedContractsSummary {
-        core: Option<HashMap<String, String>>,
-        contracts: Option<HashMap<String, String>>,
-    }
-
-    if let Ok(raw) = fs::read_to_string(&summary_path) {
-        let summary: DeployedContractsSummary = serde_json::from_str(&raw)
-            .with_context(|| format!("parse deployed contracts summary failed: {}", summary_path))?;
-        let candidate = summary
-            .core
-            .as_ref()
-            .and_then(|m| m.get("StateManager").cloned())
-            .or_else(|| {
-                summary
-                    .contracts
-                    .as_ref()
-                    .and_then(|m| m.get("StateManager").cloned())
-            });
-        if let Some(addr) = candidate {
-            return addr.trim().parse::<Address>().with_context(|| {
-                format!(
-                    "invalid StateManager address in {}: {}",
-                    summary_path, addr
-                )
-            });
-        }
-    }
-
-    let artifact_path = format!("./psy-contracts/deployments/{}/StateManager_Proxy.json", network);
+    let artifact_path =
+        bridge::api_client::resolve_deployments_file(network, "StateManager_Proxy.json");
     let raw = fs::read_to_string(&artifact_path)
-        .with_context(|| format!("read deployment artifact failed: {}", artifact_path))?;
+        .with_context(|| format!("read deployment artifact failed: {}", artifact_path.display()))?;
     let artifact: DeploymentArtifact = serde_json::from_str(&raw)
-        .with_context(|| format!("parse deployment artifact failed: {}", artifact_path))?;
+        .with_context(|| format!("parse deployment artifact failed: {}", artifact_path.display()))?;
     artifact.address.trim().parse::<Address>().with_context(|| {
         format!(
             "invalid state_manager address in {}: {}",
-            artifact_path, artifact.address
+            artifact_path.display(), artifact.address
         )
     })
 }
 
 fn resolve_bridge_address(chain: &ChainCfg) -> anyhow::Result<Address> {
     let network = chain.deployments_network.as_deref().unwrap_or("localhost");
-    let summary_path = format!("./psy-contracts/deployments/{}/deployed-contracts.json", network);
+    if let Ok(addr) = bridge::api_client::resolve_contract_address_from_deployments(network, "Bridge") {
+        return Ok(addr);
+    }
 
     #[derive(Deserialize)]
     struct DeploymentArtifact {
         address: String,
     }
-    #[derive(Deserialize)]
-    struct DeployedContractsSummary {
-        core: Option<HashMap<String, String>>,
-        contracts: Option<HashMap<String, String>>,
-        proxies: Option<HashMap<String, String>>,
-    }
-
-    if let Ok(raw) = fs::read_to_string(&summary_path) {
-        let summary: DeployedContractsSummary = serde_json::from_str(&raw)
-            .with_context(|| format!("parse deployed contracts summary failed: {}", summary_path))?;
-        let candidate = summary
-            .core
-            .as_ref()
-            .and_then(|m| m.get("Bridge").cloned())
-            .or_else(|| summary.contracts.as_ref().and_then(|m| m.get("Bridge").cloned()))
-            .or_else(|| summary.proxies.as_ref().and_then(|m| m.get("Bridge_Proxy").cloned()));
-        if let Some(addr) = candidate {
-            return addr.trim().parse::<Address>().with_context(|| {
-                format!("invalid Bridge address in {}: {}", summary_path, addr)
-            });
-        }
-    }
-
-    let artifact_path = format!("./psy-contracts/deployments/{}/Bridge_Proxy.json", network);
+    let artifact_path = bridge::api_client::resolve_deployments_file(network, "Bridge_Proxy.json");
     let raw = fs::read_to_string(&artifact_path)
-        .with_context(|| format!("read deployment artifact failed: {}", artifact_path))?;
+        .with_context(|| format!("read deployment artifact failed: {}", artifact_path.display()))?;
     let artifact: DeploymentArtifact = serde_json::from_str(&raw)
-        .with_context(|| format!("parse deployment artifact failed: {}", artifact_path))?;
+        .with_context(|| format!("parse deployment artifact failed: {}", artifact_path.display()))?;
     artifact.address.trim().parse::<Address>().with_context(|| {
         format!(
             "invalid bridge address in {}: {}",
-            artifact_path, artifact.address
+            artifact_path.display(), artifact.address
         )
     })
 }

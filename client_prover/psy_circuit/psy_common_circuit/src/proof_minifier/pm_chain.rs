@@ -7,6 +7,7 @@ use plonky2::{
         config::{AlgebraicHasher, GenericConfig},
         proof::ProofWithPublicInputs,
     },
+    util::serialization::{Buffer, GateSerializer, Read, WitnessGeneratorSerializer, Write},
 };
 
 use super::{pm_core::PsyProofMinifier, pm_custom::PMCircuitCustomizer};
@@ -252,5 +253,48 @@ where
     }
     pub fn verify(&self, proof: ProofWithPublicInputs<F, C, D>) -> Result<(), anyhow::Error> {
         self.minifiers[self.minifiers.len() - 1].circuit_data.verify(proof)
+    }
+
+    /// Serialize the whole chain. Layout: `[len][ (len_i, minifier_i bytes) ...
+    /// ]`.
+    pub fn to_bytes(
+        &self,
+        gate_serializer: &impl GateSerializer<F, D>,
+        generator_serializer: &impl WitnessGeneratorSerializer<F, D>,
+    ) -> anyhow::Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        buf.write_usize(self.minifiers.len())
+            .map_err(|e| anyhow::anyhow!("minifier chain write len failed: {e:?}"))?;
+        for minifier in &self.minifiers {
+            let m_bytes = minifier.to_bytes(gate_serializer, generator_serializer)?;
+            buf.write_usize(m_bytes.len())
+                .map_err(|e| anyhow::anyhow!("minifier chain write entry len failed: {e:?}"))?;
+            buf.write_all(&m_bytes)
+                .map_err(|e| anyhow::anyhow!("minifier chain write entry failed: {e:?}"))?;
+        }
+        Ok(buf)
+    }
+
+    pub fn from_bytes(
+        bytes: &[u8],
+        gate_serializer: &impl GateSerializer<F, D>,
+        generator_serializer: &impl WitnessGeneratorSerializer<F, D>,
+    ) -> anyhow::Result<Self> {
+        let mut buffer = Buffer::new(bytes);
+        let count = buffer
+            .read_usize()
+            .map_err(|e| anyhow::anyhow!("minifier chain read len failed: {e:?}"))?;
+        let mut minifiers = Vec::with_capacity(count);
+        for _ in 0..count {
+            let m_len = buffer
+                .read_usize()
+                .map_err(|e| anyhow::anyhow!("minifier chain read entry len failed: {e:?}"))?;
+            let mut m_bytes = vec![0u8; m_len];
+            buffer
+                .read_exact(&mut m_bytes)
+                .map_err(|e| anyhow::anyhow!("minifier chain read entry failed: {e:?}"))?;
+            minifiers.push(PsyProofMinifier::<D, F, C>::from_bytes(&m_bytes, gate_serializer, generator_serializer)?);
+        }
+        Ok(Self { minifiers })
     }
 }

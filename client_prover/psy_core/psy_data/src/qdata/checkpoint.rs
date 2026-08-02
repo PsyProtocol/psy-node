@@ -278,16 +278,7 @@ impl<F: RichField> ToQFelts<F> for PsyCheckpointLeaf<F> {
 impl<F: RichField> QFieldHashable<F> for PsyCheckpointLeaf<F> {
     fn qfhash<H: FieldQHasher<F>>(&self) -> QHashOut<F> {
         let stats_hash = self.stats.qfhash::<H>();
-        H::q_hash_many(&[
-            self.global_chain_root.0.elements[0],
-            self.global_chain_root.0.elements[1],
-            self.global_chain_root.0.elements[2],
-            self.global_chain_root.0.elements[3],
-            stats_hash.0.elements[0],
-            stats_hash.0.elements[1],
-            stats_hash.0.elements[2],
-            stats_hash.0.elements[3],
-        ])
+        H::q_two_to_one(self.global_chain_root, stats_hash)
     }
 }
 
@@ -330,7 +321,7 @@ impl<F: RichField> ToQFelts<F> for PsyCheckpointLeafCompact<F> {
             elements: [felts[0], felts[1], felts[2], felts[3]],
         });
         let stats_hash = QHashOut(HashOut {
-            elements: [felts[0], felts[1], felts[2], felts[3]],
+            elements: [felts[4], felts[5], felts[6], felts[7]],
         });
         PsyCheckpointLeafCompact {
             global_chain_root,

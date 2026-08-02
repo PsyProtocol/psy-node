@@ -1,5 +1,5 @@
 use std::{
-    sync::{Arc, RwLock, atomic::{AtomicBool, Ordering}},
+    sync::{Arc, RwLock},
     time::Duration,
 };
 
@@ -8,7 +8,10 @@ use parth_core::{crypto::hash::traits::MerkleZeroHasher, data::queue::queue_key:
 use psy_node_core::queue::ephemeral::QStandardEphemeralQueueSubscriber;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::queue::gatherer_builder::{QueueGathererItemBuilder, QueueGathererItemBuilderWithTree};
+use crate::{
+    queue::gatherer_builder::{QueueGathererItemBuilder, QueueGathererItemBuilderWithTree},
+    utils::processor_status::ProcessorStatus,
+};
 
 
 #[derive(Clone)]
@@ -38,37 +41,29 @@ impl<T: Clone> GathererValue<T> {
 #[derive(Clone)]
 pub struct QueueKeyStatusManager<const QUEUE_TOPIC_ID: u32, QueueItem: PCoreQueueItemBase> {
     queue_key: Arc<RwLock<QPStandardUniqueIdQueueKey<QUEUE_TOPIC_ID, QueueItem>>>,
-    is_active: Arc<AtomicBool>,
+    status: ProcessorStatus,
 }
 
 impl<const QUEUE_TOPIC_ID: u32, QueueItem: PCoreQueueItemBase> QueueKeyStatusManager<QUEUE_TOPIC_ID, QueueItem> {
     pub fn new(base_queue_key: QPStandardUniqueIdQueueKey<QUEUE_TOPIC_ID, QueueItem>) -> Self {
-        let queue_key = Arc::new(RwLock::new(base_queue_key));
-        let is_active = Arc::new(AtomicBool::new(true));
-
-        Self {
-            queue_key,
-            is_active,
-        }
+        let status = ProcessorStatus::new();
+        status.mark_running();
+        Self::new_with_status(base_queue_key, status)
     }
-    pub fn new_with_is_active(base_queue_key: QPStandardUniqueIdQueueKey<QUEUE_TOPIC_ID, QueueItem>, is_active: Arc<AtomicBool>) -> Self {
+    pub fn new_with_status(base_queue_key: QPStandardUniqueIdQueueKey<QUEUE_TOPIC_ID, QueueItem>, status: ProcessorStatus) -> Self {
         let queue_key = Arc::new(RwLock::new(base_queue_key));
 
-        Self {
-            queue_key,
-            is_active,
-        }
+        Self { queue_key, status }
     }
     pub fn get_queue_key(&self) -> anyhow::Result<QPStandardUniqueIdQueueKey<QUEUE_TOPIC_ID, QueueItem>> {
         let key = self.queue_key.read().unwrap();
         Ok(key.clone())
     }
-    pub fn is_active(&self) -> anyhow::Result<bool> {
-        let active = self.is_active.load(Ordering::SeqCst);
-        Ok(active)
+    pub fn should_run(&self) -> bool {
+        self.status.should_run()
     }
-    pub fn set_active(&self, active: bool) -> anyhow::Result<()> {
-        self.is_active.store(active, Ordering::SeqCst);
+    pub fn begin_shutdown(&self) -> anyhow::Result<()> {
+        self.status.begin_shutdown();
         Ok(())
     }
     pub fn set_unique_id(&self, unique_id: u128) -> anyhow::Result<()> {
@@ -114,7 +109,7 @@ impl<const QUEUE_TOPIC_ID: u32, QueueItem: PCoreQueueItemBase + 'static, Output:
     }
 
     pub async fn stop_gracefully(&mut self) -> anyhow::Result<()> {
-        self.qk.set_active(false)?;
+        self.qk.begin_shutdown()?;
         let (response_tx, response_rx) = oneshot::channel();
         self.trigger_tx.send(response_tx).await?;
         let _result = response_rx.await?;
@@ -157,9 +152,13 @@ impl<const QUEUE_TOPIC_ID: u32, QueueItem: PCoreQueueItemBase + 'static, Output:
         base_queue_key: QPStandardUniqueIdQueueKey<QUEUE_TOPIC_ID, QueueItem>,
         tree: SimpleMemoryMerkleRecorderStore<Hasher, Hash>,
     ) -> (Self, tokio::task::JoinHandle<Result<(), anyhow::Error>>) {
-        Self::new_with_is_active::<Sub, C, Hash, Hasher, Builder>(stream, create_builder_config, base_queue_key, tree, Arc::new(AtomicBool::new(true)))
+        Self::new_with_status::<Sub, C, Hash, Hasher, Builder>(stream, create_builder_config, base_queue_key, tree, {
+            let status = ProcessorStatus::new();
+            status.mark_running();
+            status
+        })
     }
-    pub fn new_with_is_active<
+    pub fn new_with_status<
         Sub: QStandardEphemeralQueueSubscriber + Send + Sync + 'static,
         C: Clone + Send + Sync + 'static,
         Hash: QHashBase + Send + Sync + 'static,
@@ -173,9 +172,9 @@ impl<const QUEUE_TOPIC_ID: u32, QueueItem: PCoreQueueItemBase + 'static, Output:
         create_builder_config: C,
         base_queue_key: QPStandardUniqueIdQueueKey<QUEUE_TOPIC_ID, QueueItem>,
         tree: SimpleMemoryMerkleRecorderStore<Hasher, Hash>,
-        is_active: Arc<AtomicBool>,
+        status: ProcessorStatus,
     ) -> (Self, tokio::task::JoinHandle<Result<(), anyhow::Error>>) {
-        let qk = QueueKeyStatusManager::new_with_is_active(base_queue_key.clone(), is_active);
+        let qk = QueueKeyStatusManager::new_with_status(base_queue_key.clone(), status);
         let (trigger_tx, trigger_rx) = mpsc::channel::<oneshot::Sender<Output>>(1);
 
         let jh: tokio::task::JoinHandle<Result<(), anyhow::Error>> =
@@ -200,7 +199,7 @@ impl<const QUEUE_TOPIC_ID: u32, QueueItem: PCoreQueueItemBase + 'static, Output:
     }
 
     pub async fn stop_gracefully(&mut self) -> anyhow::Result<()> {
-        self.qk.set_active(false)?;
+        self.qk.begin_shutdown()?;
         let (response_tx, response_rx) = oneshot::channel();
         self.trigger_tx.send(response_tx).await?;
         let _result = response_rx.await?;
@@ -239,6 +238,10 @@ pub async fn gatherer_runner<
     mut trigger_rx: mpsc::Receiver<oneshot::Sender<Builder::Output>>,
 ) -> anyhow::Result<()> {
     loop {
+        if !queue_key_helper.should_run() {
+            tracing::error!("GATHERER_{QUEUE_TOPIC_ID}: Processor entered {:?}; stopping gatherer", queue_key_helper.status.state());
+            return Ok(());
+        }
         let mut builder = match Builder::create_new(queue_key.unique_id, create_builder_config.clone()).await {
             Ok(builder) => builder,
             Err(err) => {
@@ -253,10 +256,10 @@ pub async fn gatherer_runner<
         tracing::info!("GATHERER: Starting new gathering phase with unique_id: {}, realm_id: {}, realm_sub_id: {}",
                       queue_key.unique_id, queue_key.realm_id, queue_key.realm_sub_id);
         if let Err(e) = stream
-            .recreate_consumer(&queue_key, queue_key.realm_id, queue_key.realm_sub_id, queue_key.unique_id, queue_key.task_group as u32)
+            .ensure_consumer(&queue_key, queue_key.realm_id, queue_key.realm_sub_id, queue_key.unique_id, queue_key.task_group as u32)
             .await
         {
-            tracing::warn!("GATHERER_{QUEUE_TOPIC_ID}: recreate_consumer for unique_id {} failed: {}; proceeding with existing consumer state",
+            tracing::warn!("GATHERER_{QUEUE_TOPIC_ID}: ensure_consumer for unique_id {} failed: {}; proceeding with existing consumer state",
                 queue_key.unique_id, e);
         }
         if trigger_rx.is_closed() {
@@ -264,6 +267,10 @@ pub async fn gatherer_runner<
             return Ok(());
         }
         'gathering: loop {
+            if !queue_key_helper.should_run() {
+                tracing::error!("GATHERER_{QUEUE_TOPIC_ID}: Processor entered {:?}; stopping gatherer", queue_key_helper.status.state());
+                return Ok(());
+            }
             if trigger_rx.is_closed() {
                 tracing::info!("GATHERER_{QUEUE_TOPIC_ID}: Trigger channel closed, shutting down gatherer.");
                 return Ok(());
@@ -277,8 +284,8 @@ pub async fn gatherer_runner<
                 Some(responder) = trigger_rx.recv() => {
                     tracing::info!("GATHERER: Interrupted by Processor. Preparing to hand over");
                     queue_key = queue_key_helper.get_queue_key()?;
-                    let is_stopped = queue_key_helper.is_active()?;
-                    tracing::info!("GATHERER: Current unique ID: {}, is_active: {}", queue_key.unique_id, is_stopped);
+                    let should_run = queue_key_helper.should_run();
+                    tracing::info!("GATHERER: Current unique ID: {}, should_run: {}", queue_key.unique_id, should_run);
 
                     match builder.finalize().await {
                         Ok(finalized_output) => {
@@ -296,8 +303,7 @@ pub async fn gatherer_runner<
                             );
                         }
                     }
-                    if is_stopped == false {
-                        tracing::info!("GATHERER: Stopping as requested.");
+                    if !should_run {
                         return Ok(());
                     }
                     if trigger_rx.is_closed() {
@@ -355,6 +361,10 @@ pub async fn gatherer_runner_for_tree<
     mut trigger_rx: mpsc::Receiver<oneshot::Sender<Builder::Output>>,
 ) -> anyhow::Result<()> {
     loop {
+        if !queue_key_helper.should_run() {
+            tracing::error!("GATHERER_{QUEUE_TOPIC_ID}: Processor entered {:?}; stopping gatherer", queue_key_helper.status.state());
+            return Ok(());
+        }
         let mut builder = match Builder::create_new_with_tree(&mut tree, queue_key.unique_id, create_builder_config.clone()).await {
             Ok(builder) => builder,
             Err(err) => {
@@ -369,10 +379,10 @@ pub async fn gatherer_runner_for_tree<
         tracing::info!("GATHERER_{QUEUE_TOPIC_ID}: Starting new gathering phase with unique_id: {}, realm_id: {}, realm_sub_id: {}",
                       queue_key.unique_id, queue_key.realm_id, queue_key.realm_sub_id);
         if let Err(e) = stream
-            .recreate_consumer(&queue_key, queue_key.realm_id, queue_key.realm_sub_id, queue_key.unique_id, queue_key.task_group as u32)
+            .ensure_consumer(&queue_key, queue_key.realm_id, queue_key.realm_sub_id, queue_key.unique_id, queue_key.task_group as u32)
             .await
         {
-            tracing::warn!("GATHERER_{QUEUE_TOPIC_ID}: recreate_consumer for unique_id {} failed: {}; proceeding with existing consumer state",
+            tracing::warn!("GATHERER_{QUEUE_TOPIC_ID}: ensure_consumer for unique_id {} failed: {}; proceeding with existing consumer state",
                 queue_key.unique_id, e);
         }
         if trigger_rx.is_closed() {
@@ -380,6 +390,10 @@ pub async fn gatherer_runner_for_tree<
             return Ok(());
         }
         'gathering: loop {
+            if !queue_key_helper.should_run() {
+                tracing::error!("GATHERER_{QUEUE_TOPIC_ID}: Processor entered {:?}; stopping gatherer", queue_key_helper.status.state());
+                return Ok(());
+            }
             /*
             if trigger_rx.is_closed() {
                 tracing::info!("GATHERER_{QUEUE_TOPIC_ID}: Trigger channel closed, stopping gatherer.");
@@ -400,7 +414,7 @@ pub async fn gatherer_runner_for_tree<
                     queue_key = queue_key_helper.get_queue_key()?;
                     let new_unique_id = queue_key.unique_id;
                     tracing::info!("GATHERER_{QUEUE_TOPIC_ID}: Switching from old unique_id {} to new unique_id {}", old_unique_id, new_unique_id);
-                    let is_stopped = queue_key_helper.is_active()?;
+                    let should_run = queue_key_helper.should_run();
                     let mut trigger_ok = true;
                     let remaining_items_bytes = match stream
                         .dump_entire_ephemeral_queue_bytes(
@@ -444,6 +458,38 @@ pub async fn gatherer_runner_for_tree<
                             trigger_ok = false;
                         }
                     }
+                    if trigger_ok {
+                        // Pre-finalize drain: one more drain right before finalize
+                        // to capture endcaps that arrived during the initial drain +
+                        // update_from_many_queue_items_with_tree above.
+                        let pre_final_items = match stream
+                            .dump_entire_ephemeral_queue_bytes(
+                                &old_queue_key,
+                                old_queue_key.realm_id,
+                                old_queue_key.realm_sub_id,
+                                old_unique_id,
+                                old_queue_key.task_group as u32,
+                                usize::MAX,
+                            )
+                            .await
+                        {
+                            Ok(items) => items,
+                            Err(_) => Vec::new(),
+                        };
+                        if !pre_final_items.is_empty() {
+                            tracing::info!(
+                                "GATHERER_{QUEUE_TOPIC_ID}: Captured {} pre-finalize items for old unique_id {}",
+                                pre_final_items.len(), old_unique_id
+                            );
+                            if let Err(err) = builder.update_from_many_queue_items_with_tree(&mut tree, pre_final_items).await {
+                                tracing::error!(
+                                    "GATHERER_{QUEUE_TOPIC_ID}: Error updating from pre-finalize items: {:?}; processor will retry",
+                                    err
+                                );
+                                trigger_ok = false;
+                            }
+                        }
+                    }
 
                     if trigger_ok {
                         match builder.finalize_with_tree(&mut tree).await {
@@ -465,24 +511,53 @@ pub async fn gatherer_runner_for_tree<
                     } else {
                         tracing::error!("GATHERER_{QUEUE_TOPIC_ID}: Skipped finalize after update error; processor will retry.");
                     }
-                    if let Err(err) = stream
-                        .delete_ephemeral_queue_consumer(
+
+                    // Post-finalize drain: capture any items that arrived during finalize.
+                    // If found, they need to be processed — but the builder is already
+                    // finalized/consumed. Since we use ensure_consumer (not recreate),
+                    // the consumer still exists and these messages will be replayed
+                    // via DeliverPolicy::All on the next dump_entire_ephemeral_queue_bytes
+                    // call for this unique_id. The next gatherer cycle won't drain this
+                    // old unique_id, so we must NOT delete the consumer here. The processor
+                    // will eventually re-process this checkpoint and pick up the messages.
+                    let late_items = match stream
+                        .dump_entire_ephemeral_queue_bytes(
                             &old_queue_key,
                             old_queue_key.realm_id,
                             old_queue_key.realm_sub_id,
                             old_unique_id,
                             old_queue_key.task_group as u32,
+                            usize::MAX,
                         )
                         .await
                     {
+                        Ok(items) => items,
+                        Err(_) => Vec::new(),
+                    };
+                    if !late_items.is_empty() {
                         tracing::warn!(
-                            "GATHERER_{QUEUE_TOPIC_ID}: Failed to delete old consumer for unique_id {} after handoff: {}",
-                            old_unique_id,
-                            err
+                            "GATHERER_{QUEUE_TOPIC_ID}: {} late items arrived during finalize for old unique_id {} — NOT deleting consumer; messages will be replayed on next drain",
+                            late_items.len(), old_unique_id
                         );
+                    } else {
+                        if let Err(err) = stream
+                            .delete_ephemeral_queue_consumer(
+                                &old_queue_key,
+                                old_queue_key.realm_id,
+                                old_queue_key.realm_sub_id,
+                                old_unique_id,
+                                old_queue_key.task_group as u32,
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                "GATHERER_{QUEUE_TOPIC_ID}: Failed to delete old consumer for unique_id {} after handoff: {}",
+                                old_unique_id,
+                                err
+                            );
+                        }
                     }
-                    if is_stopped == false {
-                        tracing::info!("GATHERER_{QUEUE_TOPIC_ID}: Stopping as requested.");
+                    if !should_run {
                         return Ok(());
                     }
 

@@ -3,8 +3,9 @@ use psy_client_common::job::id::QProvingJobDataIDWithRewardPath;
 use psy_provider::provider::RpcProvider;
 
 use super::args::{GenerateBatchProofMinerRewardProofsArgs, RpcProviderType};
+use crate::result::{CommandResult, ProofsResult};
 
-pub async fn run(args: GenerateBatchProofMinerRewardProofsArgs) -> Result<()> {
+pub async fn run(args: GenerateBatchProofMinerRewardProofsArgs) -> Result<CommandResult> {
     let psy_config = psy_config::PsyConfigGoldilocks::from_file(&args.rpc_config)?;
     let rpc_config = psy_config.get_current_network()?.clone();
     let provider = RpcProvider::new_with_config(&rpc_config)?;
@@ -29,7 +30,7 @@ pub async fn run(args: GenerateBatchProofMinerRewardProofsArgs) -> Result<()> {
     std::fs::write(&args.output_file, output)?;
     tracing::info!("Wrote {} proofs to {}", proofs.len(), args.output_file);
     println!("Generated {} proofs to {}", proofs.len(), args.output_file);
-    Ok(())
+    Ok(CommandResult::Proofs(ProofsResult { count: proofs.len(), output_file: args.output_file }))
 }
 
 fn load_job_ids_from_file(path: &str) -> Result<Vec<QProvingJobDataIDWithRewardPath>> {

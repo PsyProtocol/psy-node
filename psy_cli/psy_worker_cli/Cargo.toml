@@ -60,9 +60,11 @@ parth_core = { workspace = true }
 parth_crypto = { workspace = true }
 parth_common = { workspace = true }
 psy_core = { workspace = true, features = ["clap_cli"] }
+psy_common = { workspace = true }
 psy_data = { workspace = true }
 psy_io = { workspace = true }
 psy_api_core = { workspace = true }
+psy_provider = { workspace = true }
 psy_worker_core = { workspace = true, features = ["clap_cli"] }
 psy_plonky2_circuits = { workspace = true }
 psy_jtmb_testing_core = { workspace = true }

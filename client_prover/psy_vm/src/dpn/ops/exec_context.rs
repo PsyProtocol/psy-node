@@ -89,6 +89,10 @@ impl QExecContext {
         self.store.insert(value)
     }
 
+    fn resolve_state_cmd_side_effect(&mut self, cmd: DPNStateCmd<SymFeltRef>) {
+        self.state_cmd_store.injest_command(cmd);
+    }
+
     fn create_self_user_current_contract_state_ref(
         &mut self,
         condition: SymFeltRef,
@@ -794,10 +798,11 @@ impl DPNContext<SymFeltRef> for QExecContext {
     }
 
     fn split_bits(&mut self, value: SymFeltRef, num_bits: u64) -> Vec<SymFeltRef> {
+        let num_bits_ref = self.op_const(num_bits);
         let op = SymFeltRefValue {
             op_type: DPNOpType::SplitBits,
             const_param: num_bits,
-            inputs: vec![value, SymFeltRef::new_constant(num_bits)],
+            inputs: vec![value, num_bits_ref],
         };
         let parent = self.store.insert(op);
         self.op_target_at_vec(parent, num_bits)
@@ -1350,25 +1355,25 @@ impl DPNContext<SymFeltRef> for QExecContext {
             // data fields use op_select so they resolve to zero when false
             let condition = current_condition;
             let zero = SymFeltRef::new_constant(0);
-            let checkpoint_id = self.op_select(condition,
-                SymFeltRef::new_valueless(DPNOpType::GetCheckpointId), zero);
-            let user_id = self.op_select(condition,
-                SymFeltRef::new_valueless(DPNOpType::GetUserId), zero);
-            let contract_id = self.op_select(condition,
-                SymFeltRef::new_valueless(DPNOpType::GetContractId), zero);
-            let data = event_data.into_iter().map(|v| {
-                if v.eq(&zero) {
-                    v
-                } else if v.get_op_type() == DPNOpType::GetCheckpointId
-                    || v.get_op_type() == DPNOpType::GetUserId
-                    || v.get_op_type() == DPNOpType::GetContractId
-                {
-                    // new_valueless ops also need to be conditional
-                    self.op_select(condition, v, zero)
-                } else {
-                    self.op_select(condition, v, zero)
-                }
-            }).collect();
+            let checkpoint_id = self.op_select(condition, SymFeltRef::new_valueless(DPNOpType::GetCheckpointId), zero);
+            let user_id = self.op_select(condition, SymFeltRef::new_valueless(DPNOpType::GetUserId), zero);
+            let contract_id = self.op_select(condition, SymFeltRef::new_valueless(DPNOpType::GetContractId), zero);
+            let data = event_data
+                .into_iter()
+                .map(|v| {
+                    if v.eq(&zero) {
+                        v
+                    } else if v.get_op_type() == DPNOpType::GetCheckpointId
+                        || v.get_op_type() == DPNOpType::GetUserId
+                        || v.get_op_type() == DPNOpType::GetContractId
+                    {
+                        // new_valueless ops also need to be conditional
+                        self.op_select(condition, v, zero)
+                    } else {
+                        self.op_select(condition, v, zero)
+                    }
+                })
+                .collect();
             let event_record = EventRecord {
                 condition,
                 checkpoint_id,

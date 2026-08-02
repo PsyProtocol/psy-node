@@ -285,7 +285,7 @@ impl<F: QFelt64, Hash: QFHashBase<F>> QCQEDCheckpointStateTransitionInputPartial
                     deploy_contracts_root: reward_tree_root,
                 },
                 da_challenges_claimed: [F::ZERO_VALUE; DA_CHALLENGE_WINDOW],
-            }
+            },
         }
 
     }

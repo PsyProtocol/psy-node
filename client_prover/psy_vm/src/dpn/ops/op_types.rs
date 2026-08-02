@@ -660,15 +660,31 @@ impl<F: ContextFelt> ToFelts<F> for DPNAssertEqInfoIndexed {
     }
 }
 
+fn default_event_condition_true() -> u64 {
+    encode_indexed_op_id(DPNBuiltInDataType::Bool, 0)
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq, TS)]
 pub struct DPNEventRecord {
     // event_name: String,
-    #[serde(default)]
+    #[serde(default = "default_event_condition_true")]
     pub condition: u64,
     pub checkpoint_id: u64,
     pub user_id: u64,
     pub contract_id: u64,
     pub data: Vec<u64>,
+}
+
+#[cfg(test)]
+mod event_record_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_event_record_defaults_condition_to_true() {
+        let event: DPNEventRecord = serde_json::from_str(r#"{"checkpoint_id":10,"user_id":11,"contract_id":12,"data":[1,2]}"#).unwrap();
+
+        assert_eq!(event.condition, encode_indexed_op_id(DPNBuiltInDataType::Bool, 0));
+    }
 }
 
 impl<F: ContextFelt> ToFelts<F> for DPNEventRecord {

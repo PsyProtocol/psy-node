@@ -17,11 +17,11 @@ networks:
           - ${BRIDGE_ADDRESS}
         handler: ./handlers.ts
         events:
-          - event: DepositRecorded(uint32 indexed index, bytes32 shieldAddress, address indexed token, bytes32 l2TokenContractId, uint256 amount, uint8 chainIndex, bytes32 noteSecretHash, bytes32 leafHash)
-          - event: DepositBatchAppended(uint32 indexed fromIndex, uint32 indexed toIndex, bytes32 newRoot, bytes32[32] oldFrontier, bytes32[] leafHashes)
+          - event: WithdrawalClaimed(bytes32 indexed nullifier, address indexed recipient, address indexed token, uint256 amount)
+          - event: DepositRecorded(uint32 indexed index, bytes32 shieldAddress, address indexed token, bytes32 l2TokenContractId, uint256 amount, uint8 chainIndex, bytes32 noteCommitment, bytes32 leafHash)
       - name: StateManager
         address:
           - ${STATE_MANAGER_ADDRESS}
         handler: ./handlers.ts
         events:
-          - event: Finalized(uint64 indexed newLastFinalizedCheckpointId, bytes32 indexed newLastVerifiedCheckpointRoot, bytes32 depositTreeRoot, bytes32 withdrawalTreeRoot, uint32 depositsConsumed)
+          - event: Finalized(uint64 indexed newLastFinalizedCheckpointId, bytes32 indexed newLastVerifiedCheckpointRoot, bytes32 depositTreeRoot, bytes32 withdrawalTreeRoot)

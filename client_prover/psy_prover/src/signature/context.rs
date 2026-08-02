@@ -1,8 +1,7 @@
 use plonky2::field::goldilocks_field::GoldilocksField;
 use psy_client_common::data::qhashout::QHashOut;
 use psy_provider::request::DPNSoftwareDefinedSignatureInput;
-use psy_vm::ups::sdk_key::SDKKeyCircuitWitnessInput;
-use psy_vm::ups::signature::Plonky2SoftwareDefinedSignatureInput;
+use psy_vm::ups::{sd_key::SDKeyCircuitWitnessInput, signature::Plonky2SoftwareDefinedSignatureInput};
 
 #[derive(Debug)]
 pub struct SignContext {
@@ -11,7 +10,7 @@ pub struct SignContext {
     pub sign_inputs: Vec<u64>,
     pub psy_signature_input: Option<DPNSoftwareDefinedSignatureInput>,
     pub plonky2_signature_input: Option<Plonky2SoftwareDefinedSignatureInput>,
-    pub sdk_key_signature_input: Option<SDKKeyCircuitWitnessInput>,
+    pub sd_key_signature_input: Option<SDKeyCircuitWitnessInput>,
     pub checkpoint_id: Option<u64>,
     pub user_id: Option<u64>,
     pub contract_state_tree_root: Option<QHashOut<GoldilocksField>>,
@@ -26,7 +25,7 @@ impl SignContext {
             sign_inputs: Vec::new(),
             psy_signature_input: None,
             plonky2_signature_input: None,
-            sdk_key_signature_input: None,
+            sd_key_signature_input: None,
             checkpoint_id: None,
             user_id: None,
             contract_state_tree_root: None,
@@ -76,15 +75,15 @@ impl SignContext {
         self
     }
 
-    pub fn with_sdk_key_signature_input(
+    pub fn with_sd_key_signature_input(
         mut self,
-        signature_input: SDKKeyCircuitWitnessInput,
+        signature_input: SDKeyCircuitWitnessInput,
         checkpoint_id: u64,
         user_id: u64,
         contract_state_tree_root: QHashOut<GoldilocksField>,
         checkpoint_tree_root: QHashOut<GoldilocksField>,
     ) -> Self {
-        self.sdk_key_signature_input = Some(signature_input);
+        self.sd_key_signature_input = Some(signature_input);
         self.checkpoint_id = Some(checkpoint_id);
         self.user_id = Some(user_id);
         self.contract_state_tree_root = Some(contract_state_tree_root);

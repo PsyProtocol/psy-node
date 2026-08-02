@@ -1,3 +1,4 @@
+pub mod compile_output;
 use ops::exec_context::QExecContext;
 
 pub mod contract;

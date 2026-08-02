@@ -168,14 +168,16 @@ impl ScyllaGenericObjectSingleIdTablePreparedStatements {
 
         const CONCURRENCY_LIMIT: usize = 64; // Tuned for typical Scylla clusters
 
-        // Parallel deserialization using rayon
-        let values: Vec<(i64, i64, &[u8])> = data
+        // Parallel compress using rayon
+        let values: Vec<(i64, i64, Vec<u8>)> = data
             .par_chunks(object_size_with_id)
             .map(|slice| {
+                let value_bytes = crate::compression::compress(&slice[8..object_size_with_id])
+                    .expect("zstd compress failed");
                 (
                     i64::from_le_bytes(slice[0..8].try_into().unwrap()),
                     checkpoint_i64,
-                    &slice[8..object_size_with_id],
+                    value_bytes,
                 )
             })
             .collect();
@@ -239,14 +241,15 @@ impl ScyllaGenericObjectSingleIdTablePreparedStatements {
 
         const CONCURRENCY_LIMIT: usize = 64; // Tuned for typical Scylla clusters
 
-        // Parallel deserialization using rayon
-        let values: Vec<(i64, i64, &[u8])> = data
+        // Parallel compress using rayon
+        let values: Vec<(i64, i64, Vec<u8>)> = data
             .par_chunks(object_size)
             .map(|slice| {
+                let value_bytes = crate::compression::compress(slice).expect("zstd compress failed");
                 (
                     i64::from_le_bytes(slice[object_id_location..object_id_location + 8].try_into().unwrap()),
                     checkpoint_i64,
-                    &slice[..],
+                    value_bytes,
                 )
             })
             .collect();
@@ -354,7 +357,7 @@ impl ScyllaGenericObjectSingleIdTablePreparedStatements {
             .await?;
         let rows = res.into_rows_result()?;
         match rows.maybe_first_row::<(Vec<u8>,)>()? {
-            Some(row) => Ok(Some(V::psy_ser_from_owned_bytes_vec(row.0)?)),
+            Some(row) => Ok(Some(V::psy_ser_from_owned_bytes_vec(crate::compression::decompress(&row.0)?)?)),
             None => Ok(None), // Return zero hash if not found
         }
     }
@@ -375,7 +378,7 @@ impl ScyllaGenericObjectSingleIdTablePreparedStatements {
             Some(row) => Ok(Some(QDatabaseSingleIdTableRow {
                 obj_id: i64_to_u64_exact(row.0),
                 checkpoint_id: convert_i64_to_checkpoint_id(row.1),
-                value: V::psy_ser_from_owned_bytes_vec(row.2)?,
+                value: V::psy_ser_from_owned_bytes_vec(crate::compression::decompress(&row.2)?)?,
             })),
             None => Ok(None), // Return zero hash if not found
         }
@@ -400,7 +403,7 @@ impl ScyllaGenericObjectSingleIdTablePreparedStatements {
             Some(row) => Ok(Some(R::create_from_single_row(
                 i64_to_u64_exact(row.0),
                 convert_i64_to_checkpoint_id(row.1),
-                V::psy_ser_from_owned_bytes_vec(row.2)?,
+                V::psy_ser_from_owned_bytes_vec(crate::compression::decompress(&row.2)?)?,
             ))),
             None => Ok(None), // Return zero hash if not found
         }
@@ -421,7 +424,7 @@ impl ScyllaGenericObjectSingleIdTablePreparedStatements {
             results.push(QDatabaseSingleIdTableRow {
                 obj_id: i64_to_u64_exact(obj_id),
                 checkpoint_id: convert_i64_to_checkpoint_id(checkpoint_id),
-                value: V::psy_ser_from_owned_bytes_vec(value)?,
+                value: V::psy_ser_from_owned_bytes_vec(crate::compression::decompress(&value)?)?,
             });
         }
         Ok(results)
@@ -434,7 +437,7 @@ impl ScyllaGenericObjectSingleIdTablePreparedStatements {
         checkpoint_id: u64,
         value: &V,
     ) -> anyhow::Result<()> {
-        let value_bytes = value.psy_ser_to_bytes_vec()?;
+        let value_bytes = crate::compression::compress(&value.psy_ser_to_bytes_vec()?)?;
         session
             .execute_unpaged(
                 &self.insert_1_prepared,
@@ -462,7 +465,7 @@ impl ScyllaGenericObjectSingleIdTablePreparedStatements {
                     Ok((
                         u64_to_i64_exact(n.obj_id),
                         convert_checkpoint_id_to_i64(n.checkpoint_id),
-                        n.value.psy_ser_to_bytes_vec()?,
+                        crate::compression::compress(&n.value.psy_ser_to_bytes_vec()?)?,
                     ))
                 })
                 .collect::<anyhow::Result<_>>()?;
@@ -500,7 +503,7 @@ impl ScyllaGenericObjectSingleIdTablePreparedStatements {
                     Ok((
                         u64_to_i64_exact(n.get_row_obj_id()),
                         convert_checkpoint_id_to_i64(n.get_row_checkpoint_id()),
-                        n.get_row_value_ref().psy_ser_to_bytes_vec()?,
+                        crate::compression::compress(&n.get_row_value_ref().psy_ser_to_bytes_vec()?)?,
                     ))
                 })
                 .collect::<anyhow::Result<_>>()?;
@@ -538,7 +541,7 @@ impl ScyllaGenericObjectSingleIdTablePreparedStatements {
                     Ok((
                         u64_to_i64_exact(n.obj_id),
                         convert_checkpoint_id_to_i64(checkpoint_id),
-                        n.value.psy_ser_to_bytes_vec()?,
+                        crate::compression::compress(&n.value.psy_ser_to_bytes_vec()?)?,
                     ))
                 })
                 .collect::<anyhow::Result<_>>()?;
@@ -614,7 +617,7 @@ impl ScyllaGenericObjectSingleIdTablePreparedStatements {
                     Ok((
                         u64_to_i64_exact(n.get_row_obj_id()),
                         convert_checkpoint_id_to_i64(checkpoint_id),
-                        n.get_row_value_ref().psy_ser_to_bytes_vec()?,
+                        crate::compression::compress(&n.get_row_value_ref().psy_ser_to_bytes_vec()?)?,
                     ))
                 })
                 .collect::<anyhow::Result<_>>()?;
@@ -656,7 +659,7 @@ impl ScyllaGenericObjectSingleIdTablePreparedStatements {
                     Ok((
                         u64_to_i64_exact(n.get_row_obj_id()),
                         convert_checkpoint_id_to_i64(checkpoint_id),
-                        n.get_row_value_ref().psy_ser_to_bytes_vec()?,
+                        crate::compression::compress(&n.get_row_value_ref().psy_ser_to_bytes_vec()?)?,
                     ))
                 })
                 .collect::<anyhow::Result<_>>()?;
@@ -692,7 +695,7 @@ impl ScyllaGenericObjectSingleIdTablePreparedStatements {
                         let res = session.execute_unpaged(&prep, (*key, max_cp_i64)).await?;
                         let rows = res.into_rows_result()?;
                         if let Some(row) = rows.maybe_first_row::<(Vec<u8>,)>()? {
-                            anyhow::Ok(Some(V::psy_ser_from_owned_bytes_vec(row.0)?))
+                            anyhow::Ok(Some(V::psy_ser_from_owned_bytes_vec(crate::compression::decompress(&row.0)?)?))
                         } else {
                             // Assume reverse_level = level for simplicity; adjust if tree height known
                             Ok(None)
@@ -731,7 +734,7 @@ impl ScyllaGenericObjectSingleIdTablePreparedStatements {
                             anyhow::Ok(Some(R::create_from_single_row(
                                 i64_to_u64_exact(row.0),
                                 convert_i64_to_checkpoint_id(row.1),
-                                V::psy_ser_from_owned_bytes_vec(row.2)?,
+                                V::psy_ser_from_owned_bytes_vec(crate::compression::decompress(&row.2)?)?,
                             )))
                         } else {
                             // Assume reverse_level = level for simplicity; adjust if tree height known

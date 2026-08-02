@@ -31,6 +31,42 @@ impl<Hasher: MerkleZeroHasherWithMarkedLeaf<Hash>, Hash: Copy + PartialEq + Defa
     pub fn get_height(&self) -> u8 {
         self.height
     }
+
+    /// Iterator over (key, value) pairs for serialization.
+    pub fn nodes_iter(&self) -> impl Iterator<Item = (&SimpleMerkleNodeKey, &Hash)> {
+        self.nodes.iter()
+    }
+
+    /// Get the zero value hashes (for serialization/reconstruction).
+    pub fn get_zero_value_hashes(&self) -> &[Hash] {
+        &self.zero_value_hashes
+    }
+
+    /// Set zero value hashes (for reconstruction from serialized state).
+    pub fn set_zero_value_hashes(&mut self, hashes: Vec<Hash>) {
+        self.zero_value_hashes = hashes;
+    }
+
+    /// Get a reference to the internal nodes map (for serialization).
+    pub fn nodes_ref(&self) -> &hashbrown::HashMap<SimpleMerkleNodeKey, Hash> {
+        &self.nodes
+    }
+
+    /// Set the internal nodes map (for reconstruction from serialized state).
+    pub fn set_nodes(&mut self, nodes: hashbrown::HashMap<SimpleMerkleNodeKey, Hash>) {
+        self.nodes = nodes;
+    }
+
+    /// Construct a tree from pre-existing nodes (for reconstruction from
+    /// serialized state).
+    pub fn from_parts(height: u8, zero_value_hashes: Vec<Hash>, nodes: hashbrown::HashMap<SimpleMerkleNodeKey, Hash>) -> Self {
+        Self {
+            nodes,
+            height,
+            zero_value_hashes,
+            _hasher: PhantomData::default(),
+        }
+    }
     pub fn get_max_leaf_index(&self) -> u64 {
         (1u64 << (self.height as u64)) - 1u64
     }

@@ -26,7 +26,7 @@ sol! {
         bytes32 depositTreeRoot,
         bytes32[2] checkpointRoots,
         bytes32 withdrawalTreeRoot,
-        uint32 depositsConsumed,
+        uint8 provenChainIndex,
         uint64 newCheckpointId,
         bytes32[9] depositMerkleProof,
         bytes32[9] withdrawalMerkleProof
@@ -40,7 +40,7 @@ pub struct FinalizeBridgeAggArgs {
     pub proof_json: PathBuf,
     #[arg(long)]
     pub to_checkpoint: u64,
-    #[arg(long, default_value = "psy-genesis/config.json")]
+    #[arg(long, default_value = "config.json")]
     pub rpc_config: String,
     #[arg(long, default_value = DEFAULT_L1_RPC_URL)]
     pub l1_rpc_url: String,
@@ -58,8 +58,6 @@ pub struct FinalizeBridgeAggArgs {
     pub keystore_path: Option<PathBuf>,
     #[arg(long, env = "KEYSTORE_PASSWORD_ENV", default_value = "WALLET_PASSWORD")]
     pub password_env: String,
-    #[arg(long, default_value_t = 0)]
-    pub deposits_consumed: u32,
 }
 
 #[derive(Deserialize)]
@@ -75,6 +73,20 @@ struct ProveBridgeAggOutputJson {
     withdrawal_tree_root: String,
     withdrawal_subtree_root: Option<String>,
     withdrawal_merkle_proof: Option<[String; 9]>,
+    #[serde(default)]
+    l1_chain_index: Option<u8>,
+}
+
+async fn resolve_proven_chain_index<P: Provider>(
+    proof_json: &ProveBridgeAggOutputJson,
+    provider: &P,
+    deployments_network: &str,
+    state_manager: Address,
+) -> Result<u8> {
+    if let Some(index) = proof_json.l1_chain_index {
+        return Ok(index);
+    }
+    crate::bridge::api_client::resolve_l1_chain_index(provider, deployments_network, state_manager).await
 }
 
 #[derive(Deserialize)]
@@ -272,13 +284,18 @@ pub async fn run(args: FinalizeBridgeAggArgs) -> Result<()> {
         state_manager = %state_manager,
         bridge = %bridge,
         to_checkpoint = args.to_checkpoint,
-        deposits_consumed = args.deposits_consumed,
         "bridge finalize starting"
     );
-    let _l1_chain_index =
+    let proven_chain_index =
+        resolve_proven_chain_index(&proof_json, &provider, &args.deployments_network, state_manager).await?;
+    let on_chain_l1_chain_index =
         crate::bridge::api_client::resolve_l1_chain_index(&provider, &args.deployments_network, state_manager).await?;
-    let proved_before = crate::bridge::api_client::eth_call_u256(&provider, bridge, provedDepositCountCall {}).await?;
-    let expected_proved_after = proved_before;
+    anyhow::ensure!(
+        proven_chain_index == on_chain_l1_chain_index,
+        "proven l1_chain_index mismatch: proof={} state_manager={}",
+        proven_chain_index,
+        on_chain_l1_chain_index
+    );
 
     anyhow::ensure!(
         args.batch_append_proof_json.is_none(),
@@ -290,7 +307,7 @@ pub async fn run(args: FinalizeBridgeAggArgs) -> Result<()> {
         depositTreeRoot: deposit_tree_root,
         checkpointRoots: checkpoint_roots,
         withdrawalTreeRoot: withdrawal_tree_root,
-        depositsConsumed: args.deposits_consumed,
+        provenChainIndex: proven_chain_index,
         newCheckpointId: args.to_checkpoint,
         depositMerkleProof: deposit_merkle_proof,
         withdrawalMerkleProof: withdrawal_merkle_proof,
@@ -302,8 +319,7 @@ pub async fn run(args: FinalizeBridgeAggArgs) -> Result<()> {
     tracing::info!(
         state_manager = %state_manager,
         bridge = %bridge,
-        proved_before = %proved_before,
-        expected_proved_after = %expected_proved_after,
+        proven_chain_index,
         "sending finalize transaction"
     );
     let pending = timeout(
@@ -330,22 +346,12 @@ pub async fn run(args: FinalizeBridgeAggArgs) -> Result<()> {
         receipt.transaction_hash
     );
 
-    let proved_after = crate::bridge::api_client::eth_call_u256(&provider, bridge, provedDepositCountCall {}).await?;
-    anyhow::ensure!(
-        proved_after == expected_proved_after,
-        "Bridge provedDepositCount mismatch after finalize: expected={} actual={}",
-        expected_proved_after,
-        proved_after
-    );
-
     tracing::info!(
-        "bridge finalized: state_manager={} bridge={} tx_hash={} block_number={:?} proved_before={} proved_after={}",
+        "bridge finalized: state_manager={} bridge={} tx_hash={} block_number={:?}",
         state_manager,
         bridge,
         receipt.transaction_hash,
-        receipt.block_number,
-        proved_before,
-        proved_after
+        receipt.block_number
     );
     Ok(())
 }

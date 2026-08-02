@@ -244,7 +244,6 @@ impl<L: PsyJTMBCircuitInfoLibrary<C::Hash>, C: JTMBCircuitConfig> QJTMBProofCirc
         let old_global_chain_root = old_state_roots.qfhash::<C::Hasher>();
         //let new_global_chain_root = new_state_roots.qfhash::<C::Hasher>();
         //println!("old_global_chain_root: {:?} ({})", old_global_chain_root.0.elements, hex::encode(&old_global_chain_root.into_owned_32bytes()));
-        //println!("new_global_chain_root: {:?} ({})", new_global_chain_root.0.elements, hex::encode(&new_global_chain_root.into_owned_32bytes()));
         let old_stats = witness.partial.old_stats.clone();
         let old_checkpoint_leaf = PQEDCheckpointLeaf {
             global_chain_root: old_global_chain_root,

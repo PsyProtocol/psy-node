@@ -26,7 +26,8 @@ struct ProofMetadata {
     to_checkpoint: u64,
     #[serde(default)]
     num_checkpoints_aggregated: Option<u64>,
-    deposits_consumed: u64,
+    #[serde(default)]
+    deposit_tree_root: String,
     withdrawal_tree_root: String,
 }
 
@@ -165,6 +166,13 @@ impl L1Client {
         .await
     }
 
+    /// Run one L2 bridge round through a writable L1 provider.
+    ///
+    /// The returned result carries the sticky catch-up authority for the round:
+    /// it starts from the pre-round window flag and latches true if the fresh
+    /// coordinator head crosses the catch-up threshold mid-loop. Callers must
+    /// honor that latch for deposit append targets and durable pending-claim
+    /// settlement.
     pub async fn run_l2_bridge_round(
         &self,
         config: &BridgeProposeDaemonConfig,
@@ -173,10 +181,10 @@ impl L1Client {
         from_checkpoint: u64,
         to_checkpoint: u64,
         confirmation_lag_checkpoints: u64,
-        allow_deposit_appends: bool,
-        allow_withdrawal_processing: bool,
+        is_catchup_batch: bool,
         state: &DaemonState,
         propose_args: ProposeWithdrawalsArgs,
+        max_checkpoint_batch: u64,
     ) -> anyhow::Result<L2RoundResult> {
         self.with_retry("run_l2_bridge_round", L1_RETRY_MAX_ATTEMPTS, |url| {
             let owned = url.to_string();
@@ -194,10 +202,10 @@ impl L1Client {
                     from_checkpoint,
                     to_checkpoint,
                     confirmation_lag_checkpoints,
-                    allow_deposit_appends,
-                    allow_withdrawal_processing,
+                    is_catchup_batch,
                     state,
                     propose_args_clone,
+                    max_checkpoint_batch,
                 )
                 .await
             }
@@ -208,7 +216,7 @@ impl L1Client {
     pub async fn submit_deposit_batch_appends(
         &self,
         config: &BridgeProposeDaemonConfig,
-        deposits_consumed: u64,
+        target_deposit_count: u32,
     ) -> anyhow::Result<()> {
         let prove_proxy_url = resolve_prove_proxy_url(config);
         self.with_retry("deposit_batch_appends", L1_RETRY_MAX_ATTEMPTS, |url| {
@@ -218,7 +226,7 @@ impl L1Client {
                 submit_deposit_batch_appends_with_l1_rpc(
                     config,
                     &owned,
-                    deposits_consumed,
+                    target_deposit_count,
                     proxy.as_deref(),
                 )
                 .await
@@ -274,7 +282,6 @@ impl L1Client {
         proof_path: &Path,
         from_checkpoint: u64,
         to_checkpoint: u64,
-        deposits_consumed: u64,
         prove_proxy_url: Option<&str>,
     ) -> anyhow::Result<BridgeProveResult> {
         if proof_path.exists() {
@@ -285,16 +292,28 @@ impl L1Client {
                     .num_checkpoints_aggregated
                     .unwrap_or_else(|| to_checkpoint.saturating_sub(from_checkpoint) + 1)
                     == to_checkpoint.saturating_sub(from_checkpoint) + 1
-                && meta.deposits_consumed == deposits_consumed
             {
-                return Ok(BridgeProveResult {
-                    from_checkpoint,
-                    to_checkpoint,
-                    num_checkpoints_aggregated: to_checkpoint - from_checkpoint + 1,
-                    proof_path: proof_path.to_path_buf(),
-                    deposits_consumed,
-                    withdrawal_tree_root: meta.withdrawal_tree_root,
-                });
+                // Validate deposit_tree_root is present and well-formed.
+                // Old cached proofs without this field will be rejected
+                // and re-proved.
+                if !meta.deposit_tree_root.starts_with("0x") || meta.deposit_tree_root.len() != 66
+                    || !meta.deposit_tree_root[2..].chars().all(|c| c.is_ascii_hexdigit())
+                {
+                    tracing::warn!(
+                        deposit_tree_root = %meta.deposit_tree_root,
+                        "cached proof has missing or invalid deposit_tree_root; re-proving"
+                    );
+                    fs::remove_file(proof_path)?;
+                } else {
+                    return Ok(BridgeProveResult {
+                        from_checkpoint,
+                        to_checkpoint,
+                        num_checkpoints_aggregated: to_checkpoint - from_checkpoint + 1,
+                        proof_path: proof_path.to_path_buf(),
+                        deposit_tree_root: meta.deposit_tree_root.clone(),
+                        withdrawal_tree_root: meta.withdrawal_tree_root.clone(),
+                    });
+                }
             }
             fs::remove_file(proof_path)
                 .with_context(|| format!("failed to remove stale proof {}", proof_path.display()))?;
@@ -309,7 +328,6 @@ impl L1Client {
                     proof_path,
                     from_checkpoint,
                     to_checkpoint,
-                    deposits_consumed,
                     prove_proxy_url,
                 )
                 .await
@@ -344,12 +362,11 @@ fn load_proof_metadata(path: &Path) -> anyhow::Result<ProofMetadata> {
 }
 
 async fn load_or_build_proof_impl(
-    l1_rpc_url: &str,
+    _l1_rpc_url: &str,
     config: &BridgeProposeDaemonConfig,
     proof_path: &Path,
     from_checkpoint: u64,
     to_checkpoint: u64,
-    deposits_consumed: u64,
     prove_proxy_url: Option<&str>,
 ) -> anyhow::Result<BridgeProveResult> {
     let deployments_network = config
@@ -363,8 +380,6 @@ async fn load_or_build_proof_impl(
             to_checkpoint,
             config.rpc_config.clone(),
             proof_path.to_path_buf(),
-            deposits_consumed,
-            l1_rpc_url.to_string(),
             deployments_network,
             proxy_url,
         )
@@ -375,8 +390,6 @@ async fn load_or_build_proof_impl(
             to_checkpoint,
             config.rpc_config.clone(),
             proof_path.to_path_buf(),
-            deposits_consumed,
-            l1_rpc_url.to_string(),
             deployments_network,
         )
         .await
@@ -432,5 +445,117 @@ async fn claim_withdrawal_chunks(
     total.failure_reasons.extend(report.failure_reasons);
 
     Ok(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn temp_path(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!("psy-relayer-l1-client-test-{name}-{}", std::process::id()));
+        path
+    }
+
+    #[test]
+    fn proof_metadata_deserializes_with_deposit_tree_root() {
+        let json = r#"{
+            "from_checkpoint": 10,
+            "to_checkpoint": 20,
+            "deposit_tree_root": "0x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+            "withdrawal_tree_root": "0x2222222222222222222222222222222222222222222222222222222222222222"
+        }"#;
+
+        let meta: ProofMetadata = serde_json::from_str(json).unwrap();
+        assert_eq!(meta.to_checkpoint, 20);
+        assert_eq!(
+            meta.deposit_tree_root,
+            "0x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
+        );
+        assert_eq!(
+            meta.withdrawal_tree_root,
+            "0x2222222222222222222222222222222222222222222222222222222222222222"
+        );
+    }
+
+    #[test]
+    fn proof_metadata_deserializes_without_deposit_tree_root_old_format() {
+        // Old cached proof saved before deposit_tree_root was added.
+        // The field is #[serde(default)], so it should be empty string.
+        let json = r#"{
+            "from_checkpoint": 5,
+            "to_checkpoint": 8,
+            "withdrawal_tree_root": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }"#;
+
+        let meta: ProofMetadata = serde_json::from_str(json).unwrap();
+        assert_eq!(meta.to_checkpoint, 8);
+        assert_eq!(meta.deposit_tree_root, ""); // #[serde(default)] → empty String
+    }
+
+    #[test]
+    fn load_proof_metadata_file_not_found() {
+        let path = temp_path("nonexistent");
+        let result = load_proof_metadata(&path);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("failed to read"));
+    }
+
+    #[test]
+    fn load_proof_metadata_valid_json() {
+        let path = temp_path("valid");
+        let json = r#"{
+            "to_checkpoint": 42,
+            "deposit_tree_root": "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "withdrawal_tree_root": "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        }"#;
+        std::fs::write(&path, json).unwrap();
+
+        let meta = load_proof_metadata(&path).unwrap();
+        assert_eq!(meta.to_checkpoint, 42);
+        assert_eq!(
+            meta.deposit_tree_root,
+            "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        );
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn load_proof_metadata_garbage_deposit_tree_root_is_rejected() {
+        // cached proof has 0x prefix and 66 chars but non-hex characters
+        let path = temp_path("garbage-hex");
+        let json = r#"{
+            "to_checkpoint": 10,
+            "deposit_tree_root": "0xZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ",
+            "withdrawal_tree_root": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }"#;
+        std::fs::write(&path, json).unwrap();
+
+        // load_proof_metadata itself will succeed (just parses JSON),
+        // but the caller (load_or_build_proof) will reject it.
+        let meta = load_proof_metadata(&path).unwrap();
+        assert_eq!(meta.deposit_tree_root.len(), 66);
+        assert!(meta.deposit_tree_root.starts_with("0x"));
+        // Verify it has non-hex chars
+        assert!(meta.deposit_tree_root[2..]
+            .chars()
+            .any(|c| !c.is_ascii_hexdigit()));
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn load_proof_metadata_invalid_json() {
+        let path = temp_path("invalid");
+        std::fs::write(&path, "this is not json").unwrap();
+
+        let result = load_proof_metadata(&path);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("failed to parse"));
+
+        std::fs::remove_file(&path).unwrap();
+    }
 }
 

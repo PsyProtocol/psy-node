@@ -130,6 +130,13 @@ impl<F: RichField> PsyContractStateTracker<F> {
         self.imt_preimages.insert(preimage.qfhash::<PsyHasher>(), preimage);
     }
 
+    fn note_state_root_transition(&mut self, old_root: QHashOut<F>, new_root: QHashOut<F>) {
+        if self.ops.len() == 1 {
+            self.start_state_root = old_root;
+        }
+        self.end_state_root = new_root;
+    }
+
     fn advance_imt_next_append_index_for_insert(&mut self, inserted_leaf_index: u64) {
         if inserted_leaf_index >= self.imt_next_append_index {
             self.imt_next_append_index = inserted_leaf_index.saturating_add(1);
@@ -306,10 +313,8 @@ impl<F: RichField> PsyContractStateTracker<F> {
         let pred_new_hash = predecessor_new_preimage.qfhash::<PsyHasher>();
         let new_leaf_new_hash = new_leaf_preimage.qfhash::<PsyHasher>();
 
-        let (predecessor_from_version, predecessor_to_version) =
-            self.append_slot_version(predecessor_leaf_index, pred_dmp_old_value, pred_new_hash);
-        let (new_leaf_from_version, new_leaf_to_version) =
-            self.append_slot_version(new_leaf_index, new_leaf_dmp_old_value, new_leaf_new_hash);
+        let (predecessor_from_version, predecessor_to_version) = self.append_slot_version(predecessor_leaf_index, pred_dmp_old_value, pred_new_hash);
+        let (new_leaf_from_version, new_leaf_to_version) = self.append_slot_version(new_leaf_index, new_leaf_dmp_old_value, new_leaf_new_hash);
 
         self.persist_imt_preimage(predecessor_old_preimage);
         self.persist_imt_preimage(predecessor_new_preimage);
@@ -430,6 +435,12 @@ impl<F: RichField> PsyLocalStateTracker<F> {
         self.total_keys_modified
     }
 
+    pub fn note_contract_state_root_transition(&mut self, contract_id: u64, old_root: QHashOut<F>, new_root: QHashOut<F>) {
+        if let Some(contract) = self.contracts.get_mut(&contract_id) {
+            contract.note_state_root_transition(old_root, new_root);
+        }
+    }
+
     pub fn notify_imt_update(
         &mut self,
         contract_id: u64,
@@ -466,10 +477,26 @@ impl<F: RichField> PsyLocalStateTracker<F> {
         new_leaf_dmp_old_value: QHashOut<F>,
     ) {
         let inc = match self.contracts.get_mut(&contract_id) {
-            Some(c) => c.notify_imt_insert(predecessor_leaf_index, predecessor_old_preimage, predecessor_new_preimage, new_leaf_index, new_leaf_preimage, pred_dmp_old_value, new_leaf_dmp_old_value),
+            Some(c) => c.notify_imt_insert(
+                predecessor_leaf_index,
+                predecessor_old_preimage,
+                predecessor_new_preimage,
+                new_leaf_index,
+                new_leaf_preimage,
+                pred_dmp_old_value,
+                new_leaf_dmp_old_value,
+            ),
             None => {
                 let mut tracker = PsyContractStateTracker::new(contract_id);
-                let result = tracker.notify_imt_insert(predecessor_leaf_index, predecessor_old_preimage, predecessor_new_preimage, new_leaf_index, new_leaf_preimage, pred_dmp_old_value, new_leaf_dmp_old_value);
+                let result = tracker.notify_imt_insert(
+                    predecessor_leaf_index,
+                    predecessor_old_preimage,
+                    predecessor_new_preimage,
+                    new_leaf_index,
+                    new_leaf_preimage,
+                    pred_dmp_old_value,
+                    new_leaf_dmp_old_value,
+                );
                 self.contracts.insert(contract_id, tracker);
                 result
             }
@@ -975,14 +1002,24 @@ mod tests {
         assert_eq!(t.total_keys_modified, 1);
         assert!(t.imt_keys.get(&h(10)).is_some());
 
-        // Step 2: Insert key=20 with key=10 as predecessor, reverting key=10 to its start value
-        t.notify_imt_insert(base + 1, leaf(10, 7, 0, 0), leaf(10, 5, 0, 0), base + 2, leaf(20, 1, 10, base + 1), h(0), h(0));
+        // Step 2: Insert key=20 with key=10 as predecessor, reverting key=10 to its
+        // start value
+        t.notify_imt_insert(
+            base + 1,
+            leaf(10, 7, 0, 0),
+            leaf(10, 5, 0, 0),
+            base + 2,
+            leaf(20, 1, 10, base + 1),
+            h(0),
+            h(0),
+        );
 
         // key=10 should be removed (net-zero: is_insert=false, end==start)
         assert!(t.imt_keys.get(&h(10)).is_none());
         // key=20 should exist
         assert!(t.imt_keys.get(&h(20)).is_some());
-        // total_keys_modified: was 1, pred removed (-1), new added (+1) = net 0, still 1
+        // total_keys_modified: was 1, pred removed (-1), new added (+1) = net 0, still
+        // 1
         assert_eq!(t.total_keys_modified, 1);
     }
 
@@ -1133,8 +1170,9 @@ mod tests {
         let leaf_10 = leaf(10, 1, 0, 0);
         t.notify_imt_insert(0, s0, s1, 1, leaf_10, h(0), h(0));
 
-        // Insert key=20 with predecessor=10, updating predecessor back to start-like value
-        // Since predecessor is_insert=true, net-zero is skipped even if end==start
+        // Insert key=20 with predecessor=10, updating predecessor back to start-like
+        // value Since predecessor is_insert=true, net-zero is skipped even if
+        // end==start
         let s2 = leaf(0, 0, 20, 3);
         let leaf_20 = leaf(20, 1, 10, 1);
         let pred_old = leaf(10, 1, 0, 0);
@@ -1162,10 +1200,26 @@ mod tests {
         t.notify_imt_insert(base, s0, s1, base + 1, leaf(10, 1, 0, 0), h(0), h(0));
 
         let s2 = leaf(0, 0, 30, base + 2);
-        t.notify_imt_insert(base + 1, leaf(10, 1, 0, 0), leaf(10, 1, 30, base + 2), base + 2, leaf(30, 1, 0, 0), h(0), h(0));
+        t.notify_imt_insert(
+            base + 1,
+            leaf(10, 1, 0, 0),
+            leaf(10, 1, 30, base + 2),
+            base + 2,
+            leaf(30, 1, 0, 0),
+            h(0),
+            h(0),
+        );
 
         let s3 = leaf(0, 0, 20, base + 3);
-        t.notify_imt_insert(base + 1, leaf(10, 1, 30, base + 2), leaf(10, 1, 20, base + 3), base + 3, leaf(20, 1, 30, base + 2), h(0), h(0));
+        t.notify_imt_insert(
+            base + 1,
+            leaf(10, 1, 30, base + 2),
+            leaf(10, 1, 20, base + 3),
+            base + 3,
+            leaf(20, 1, 30, base + 2),
+            h(0),
+            h(0),
+        );
 
         // Update key=20
         t.notify_imt_update(h(20), base + 3, leaf(20, 1, 30, base + 2), leaf(20, 9, 30, base + 2));
@@ -1282,11 +1336,15 @@ mod tests {
         t.notify_imt_insert(0, s0, s1, 1, leaf(20, 1, 0, 0), h(0), h(0));
 
         assert_eq!(t.ops.len(), 3);
-        let op_seqs: Vec<u64> = t.ops.iter().map(|op| match op {
-            PsyStateOperation::PositionalWrite { op_seq, .. } => *op_seq,
-            PsyStateOperation::IMTUpdate { op_seq, .. } => *op_seq,
-            PsyStateOperation::IMTInsert { op_seq, .. } => *op_seq,
-        }).collect();
+        let op_seqs: Vec<u64> = t
+            .ops
+            .iter()
+            .map(|op| match op {
+                PsyStateOperation::PositionalWrite { op_seq, .. } => *op_seq,
+                PsyStateOperation::IMTUpdate { op_seq, .. } => *op_seq,
+                PsyStateOperation::IMTInsert { op_seq, .. } => *op_seq,
+            })
+            .collect();
         assert_eq!(op_seqs, vec![0, 1, 2]);
     }
 
@@ -1310,6 +1368,29 @@ mod tests {
         // Positional write should affect total_slots_modified
         t.notify_update_slot_dmp(&dmp(42, 0, 1, 100, 101));
         assert_eq!(t.total_slots_modified, 1);
+    }
+
+    #[test]
+    fn imt_only_root_transition_is_tracked() {
+        let mut top = PsyLocalStateTracker::<F>::new();
+        top.notify_imt_update(1, h(10), 1, leaf(10, 0, 0, 0), leaf(10, 1, 0, 0));
+        top.note_contract_state_root_transition(1, h(100), h(101));
+
+        let result = top.get_contract_result(1).expect("contract 1 result");
+        assert_eq!(result.start_state_root, h(100));
+        assert_eq!(result.end_state_root, h(101));
+    }
+
+    #[test]
+    fn mixed_positional_and_imt_write_keeps_final_root_from_imt() {
+        let mut top = PsyLocalStateTracker::<F>::new();
+        top.notify_update_slot_dmp(1, &dmp(42, 0, 1, 100, 101));
+        top.notify_imt_insert(1, 0, leaf(0, 0, 0, 0), leaf(0, 0, 20, 2), 1, leaf(20, 1, 0, 0), h(0), h(0));
+        top.note_contract_state_root_transition(1, h(101), h(103));
+
+        let result = top.get_contract_result(1).expect("contract 1 result");
+        assert_eq!(result.start_state_root, h(100));
+        assert_eq!(result.end_state_root, h(103));
     }
 
     // --- to_result includes IMT state ---

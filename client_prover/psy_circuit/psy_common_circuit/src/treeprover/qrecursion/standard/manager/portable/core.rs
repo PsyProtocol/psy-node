@@ -11,7 +11,10 @@ use psy_crypto::{
         proof_data::{AggProofRecord, InputLeafProof, LeafProofRecord, QStandardBinaryTreeCircuitType},
     },
     hash::{
-        merkle::{core::MerkleProofCore, utils::simple_merkle_tree::SimpleMerkleTree},
+        merkle::{
+            core::{DeltaMerkleProofCore, MerkleProofCore},
+            utils::simple_merkle_tree::SimpleMerkleTree,
+        },
         traits::hasher::MerkleZeroHasherWithMarkedLeaf,
     },
 };
@@ -55,6 +58,33 @@ where
     }
     pub async fn get_proof_tree_height(&self) -> usize {
         self.q_recursion_tree_height
+    }
+
+    /// Get the next proof leaf index (for ProofTreeMeta serialization).
+    pub fn next_proof_index(&self) -> u64 {
+        self.next_proof_index
+    }
+
+    /// Get the q_recursion_tree_height (for ProofTreeMeta serialization).
+    pub fn q_recursion_tree_height(&self) -> usize {
+        self.q_recursion_tree_height
+    }
+
+    /// Restore the manager's tree snapshot from externally-serialized state.
+    ///
+    /// This is used by step-by-step proving across process / WASM restarts:
+    /// `ProofTreeMeta` reconstructs a `SimpleMerkleTree`, then this method
+    /// replaces the live manager state with that snapshot.
+    pub fn restore_snapshot(
+        &mut self,
+        proof_tree: SimpleMerkleTree<C::Hasher, QHashOut<C::F>>,
+        root_history: Vec<QHashOut<C::F>>,
+        next_proof_index: u64,
+    ) {
+        self.proof_tree = proof_tree;
+        self.root_history = root_history;
+        self.next_proof_index = next_proof_index;
+        self.leaf_to_index_map.clear();
     }
     pub async fn get_proof_tree_height_u8(&self) -> u8 {
         self.q_recursion_tree_height as u8
@@ -105,6 +135,50 @@ where
             insertion_proof,
         };
         self.leaf_proofs.push_back(record);
+        self.next_proof_index += 1;
+        assert!(
+            self.next_proof_index < self.max_proofs_in_tree,
+            "added more proofs than the tree has capacity for"
+        );
+        index
+    }
+    /// Mirror a leaf value into the proof tree without storing a proof.
+    /// This advances the proof tree root exactly like
+    /// `injest_single_leaf_proof` would, so it can be used during
+    /// `generate_tx_trace` to keep the proof tree in sync with the real
+    /// prove path — without generating the actual proof.
+    pub async fn injest_single_leaf_value(
+        &mut self,
+        fingerprint: QHashOut<C::F>,
+        session_proof_tree_root: QHashOut<C::F>,
+        inner_public_inputs_hash: QHashOut<C::F>,
+    ) -> u64 {
+        let index = self.next_proof_index;
+        let public_inputs_hash = QHashOut(<C::Hasher as Hasher<C::F>>::two_to_one(
+            session_proof_tree_root.0,
+            inner_public_inputs_hash.0,
+        ));
+        let value = QHashOut(<C::Hasher as Hasher<C::F>>::two_to_one(fingerprint.0, public_inputs_hash.0));
+        self.leaf_to_index_map.insert(value, index);
+        let insertion_proof = self.proof_tree.set_leaf(index, value);
+        self.root_history.push(insertion_proof.old_root);
+        self.next_proof_index += 1;
+        assert!(
+            self.next_proof_index < self.max_proofs_in_tree,
+            "added more proofs than the tree has capacity for"
+        );
+        index
+    }
+
+    /// Mirror a leaf proof whose public input is already the final public input
+    /// hash. Unlike `injest_single_leaf_value`, this does not mix in the
+    /// session proof-tree root before hashing with the fingerprint.
+    pub async fn injest_single_leaf_public_inputs_hash(&mut self, fingerprint: QHashOut<C::F>, public_inputs_hash: QHashOut<C::F>) -> u64 {
+        let index = self.next_proof_index;
+        let value = QHashOut(<C::Hasher as Hasher<C::F>>::two_to_one(fingerprint.0, public_inputs_hash.0));
+        self.leaf_to_index_map.insert(value, index);
+        let insertion_proof = self.proof_tree.set_leaf(index, value);
+        self.root_history.push(insertion_proof.old_root);
         self.next_proof_index += 1;
         assert!(
             self.next_proof_index < self.max_proofs_in_tree,
@@ -284,6 +358,31 @@ where
             inds.push(self.injest_single_leaf_proof(lp).await)
         }
         inds
+    }
+
+    /// Extract leaf metadata (everything except proof blob and verifier_data).
+    ///
+    /// Returns per-leaf: leaf_circuit_type, fingerprint, insertion_proof.
+    /// Combined with proof blobs (from trace) and verifier_data (from circuit
+    /// manager), these are sufficient to reconstruct `LeafProofRecord` at
+    /// finalize time without serializing the full proof + verifier_data per
+    /// step.
+    pub fn extract_leaf_metadata(&self) -> Vec<(u64, QHashOut<C::F>, DeltaMerkleProofCore<QHashOut<C::F>>)> {
+        self.leaf_proofs
+            .iter()
+            .map(|r| (r.leaf_circuit_type, r.fingerprint, r.insertion_proof.clone()))
+            .collect()
+    }
+
+    /// Restore leaf proofs from pre-built records (no serialization).
+    /// The caller has already reconstructed the full `LeafProofRecord` from
+    /// leaf metadata + proof blobs + verifier_data.
+    pub fn restore_leaf_proofs_from_records(&mut self, records: Vec<LeafProofRecord<C, D>>) {
+        self.leaf_proofs.clear();
+        self.agg_proofs.clear();
+        for r in records {
+            self.leaf_proofs.push_back(r);
+        }
     }
 
     pub async fn finalize_tree<T: PortableQTreeRecursion<C, D> + ?Sized>(&mut self, circuit_mgr: &T) -> anyhow::Result<()> {

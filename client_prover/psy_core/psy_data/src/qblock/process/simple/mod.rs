@@ -9,8 +9,7 @@ use psy_crypto::hash::traits::qhashable::QFieldHashable;
 
 use crate::{
     config::store_config::{DepositTreeStore, PsyFelt, PsyHasher},
-    models::kvq_merkle::model::KVQFixedConfigMerkleTreeModelReaderCore,
-    models::user::contract_state_tree::UserContractStateTreeId,
+    models::{kvq_merkle::model::KVQFixedConfigMerkleTreeModelReaderCore, user::contract_state_tree::UserContractStateTreeId},
     protocol::circuit_fingerprints::PsyWorkerToolboxCoreCircuitFingerprints,
     qblock::{
         cmds::{core::PsyBlockCommands, deploy_contract::QBCDeployContract, register_user::QBCRegisterUser},

@@ -1311,22 +1311,23 @@ impl<
         checkpoint_id: u64,
         user_id: u64,
         contract_id: u64,
+        tree_height: u8,
         state_slot_id: u64,
     ) -> anyhow::Result<N::QHash> {
-        let key = SimpleMerkleNodeKey::new(N::MAX_CONTRACT_STATE_TREE_HEIGHT, state_slot_id);
+        let key = SimpleMerkleNodeKey::new(tree_height, state_slot_id);
         self.store
             .db_select_double_id_merkle_node_max_checkpoint(
                 &self.contract_state_tree_table,
                 checkpoint_id,
                 user_id,
                 contract_id,
-                N::MAX_CONTRACT_STATE_TREE_HEIGHT,
+                tree_height,
                 key,
             )
             .await
     }
 
-    async fn contract_state_tree_get_root_hash(&self, checkpoint_id: u64, user_id: u64, contract_id: u64) -> anyhow::Result<N::QHash> {
+    async fn contract_state_tree_get_root_hash(&self, checkpoint_id: u64, user_id: u64, contract_id: u64, tree_height: u8) -> anyhow::Result<N::QHash> {
         let key = SimpleMerkleNodeKey::new_root();
         self.store
             .db_select_double_id_merkle_node_max_checkpoint(
@@ -1334,7 +1335,7 @@ impl<
                 checkpoint_id,
                 user_id,
                 contract_id,
-                N::MAX_CONTRACT_STATE_TREE_HEIGHT,
+                tree_height,
                 key,
             )
             .await
@@ -1427,6 +1428,7 @@ impl<
         checkpoint_id: u64,
         user_id: u64,
         contract_id: u64,
+        tree_height: u8,
         value: N::QHash,
     ) -> anyhow::Result<DeltaMerkleProofCore<N::QHash>> {
         let mut res = db_helper_double_id_merkle_node_simple_set_leaves_fast_serialize::<N::QHash, N::HasherBase, _, _>(
@@ -1435,11 +1437,11 @@ impl<
             checkpoint_id,
             user_id,
             contract_id,
-            N::MAX_CONTRACT_STATE_TREE_HEIGHT,
+            tree_height,
             0,
-            2 * N::MAX_CONTRACT_STATE_TREE_HEIGHT as usize,
+            2 * tree_height as usize,
             &[SimpleMerkleNode {
-                key: SimpleMerkleNodeKey::new(N::MAX_CONTRACT_STATE_TREE_HEIGHT, 0),
+                key: SimpleMerkleNodeKey::new(tree_height, 0),
                 value,
             }],
         )
@@ -2003,6 +2005,56 @@ impl<
             .ok_or_else(|| anyhow::anyhow!("L2 block state not found for id {}", checkpoint_id))
     }
 
+    async fn try_get_complete_l2_block_state(&self, checkpoint_id: u64) -> anyhow::Result<Option<QEDL2BlockState>> {
+        // A checkpoint's metadata is written across several non-transactional steps (see
+        // `write_checkpoint_state_records` / `persist_checkpoint_metadata_range`). We treat it as usable only when
+        // ALL of the per-checkpoint dependency records exist, so a partially-written checkpoint left by a crash —
+        // under either the old "L2 first" ordering or the new "L2 last" ordering — is never mistaken for complete:
+        //   - L2 block state, global state roots, checkpoint leaf  (kiv, keyed by checkpoint_id)
+        //   - checkpoint root -> id mapping                        (proves the checkpoint-tree proof was ingested)
+        //   - global-user-tree -> realm-root top proof             (needed by witness / merkle-proof queries)
+        // Any genuine read/deserialization error is propagated; only true absence yields `Ok(None)`.
+        let block_state = match self
+            .store
+            .db_select_one_kiv_value::<QEDL2BlockState>(&self.l2_block_state_table, checkpoint_id)
+            .await?
+        {
+            Some(block_state) => block_state,
+            None => return Ok(None),
+        };
+        let has_state_roots = self
+            .store
+            .db_select_one_kiv_value::<PQEDCheckpointGlobalStateRoots<N::QHash>>(&self.checkpoint_state_roots_table, checkpoint_id)
+            .await?
+            .is_some();
+        let has_checkpoint_leaf = self
+            .store
+            .db_select_one_kiv_value::<PQEDCheckpointLeaf<N::F, N::QHash>>(&self.checkpoint_leaf_table, checkpoint_id)
+            .await?
+            .is_some();
+        // Reverse lookup (id -> root) over the bidirectional mapping; present only once the checkpoint-tree proof
+        // was ingested and the root mapping written.
+        let has_root_mapping = self
+            .store
+            .db_select_one_by_k2::<N::QHash, u64>(&self.checkpoint_root_to_checkpoint_id_table, &checkpoint_id)
+            .await?
+            .is_some();
+        let has_global_user_proof = self
+            .store
+            .db_select_one_single_checkpointed_object_value::<MerkleProofCore<N::QHash>>(
+                &self.checkpointed_object_table,
+                CHECKPOINTED_OBJECT_TABLE_OBJ_ID_REALM_ROOT_TO_GLOBAL_USER_TREE_ROOT_MERKLE_PROOF,
+                checkpoint_id,
+            )
+            .await?
+            .is_some();
+        if has_state_roots && has_checkpoint_leaf && has_root_mapping && has_global_user_proof {
+            Ok(Some(block_state))
+        } else {
+            Ok(None)
+        }
+    }
+
     async fn get_latest_l2_block_state(&self) -> anyhow::Result<QEDL2BlockState> {
         self.store
             .db_select_one_kiv_value::<QEDL2BlockState>(&self.latest_info_table, LATEST_INFO_TABLE_OBJ_ID_LATEST_L2_BLOCK_STATE)
@@ -2051,6 +2103,26 @@ impl<
             .await?
             .ok_or_else(|| anyhow::anyhow!("Unique ID not found for pending ID {}", pending_id))?;
         Ok((pending_id, uid))
+    }
+
+    async fn get_latest_mapped_unique_pending_id(&self) -> anyhow::Result<(u64, QCoreProcCheckpointUniqueId)> {
+        let latest_pending_id = self.get_latest_pending_id().await?;
+        if latest_pending_id == 0 {
+            return Ok((0, 0));
+        }
+        for pending_id in (1..=latest_pending_id).rev() {
+            if let Some(proc_checkpoint_unique_id) = self
+                .store
+                .db_select_one_u128_value_by_u64(&self.pending_id_to_pending_proc_id_table, pending_id)
+                .await?
+            {
+                return Ok((pending_id, proc_checkpoint_unique_id));
+            }
+        }
+        anyhow::bail!(
+            "No mapped unique pending ID found at or below pending counter {}",
+            latest_pending_id
+        )
     }
 }
 

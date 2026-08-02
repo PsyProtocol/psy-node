@@ -1,3 +1,76 @@
+use std::future::Future;
+
+const JOB_PERSISTENCE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+async fn wait_for_job_ready<Proof, Reward, FetchProof, FetchProofFuture, FetchReward, FetchRewardFuture>(
+    max_wait_ms: u64,
+    timeout_message: String,
+    mut fetch_proof: FetchProof,
+    mut fetch_reward: FetchReward,
+) -> anyhow::Result<(Proof, Reward)>
+where
+    FetchProof: FnMut() -> FetchProofFuture,
+    FetchProofFuture: Future<Output = anyhow::Result<Option<Proof>>>,
+    FetchReward: FnMut() -> FetchRewardFuture,
+    FetchRewardFuture: Future<Output = anyhow::Result<Option<Reward>>>,
+{
+    let deadline = (max_wait_ms != u64::MAX).then(|| Instant::now() + Duration::from_millis(max_wait_ms));
+
+    loop {
+        if let Some(proof) = fetch_proof().await? {
+            if let Some(reward) = fetch_reward().await? {
+                return Ok((proof, reward));
+            }
+        }
+
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            anyhow::bail!(timeout_message);
+        }
+
+        sleep(JOB_PERSISTENCE_POLL_INTERVAL).await;
+    }
+}
+
+async fn publish_wait_for_queue_and_job_ready<
+    Proof,
+    Reward,
+    Publish,
+    PublishFuture,
+    WaitForQueue,
+    WaitForQueueFuture,
+    FetchProof,
+    FetchProofFuture,
+    FetchReward,
+    FetchRewardFuture,
+>(
+    max_wait_ms: u64,
+    timeout_message: String,
+    publish: Publish,
+    wait_for_queue: WaitForQueue,
+    fetch_proof: FetchProof,
+    fetch_reward: FetchReward,
+) -> anyhow::Result<(Proof, Reward)>
+where
+    Publish: FnOnce() -> PublishFuture,
+    PublishFuture: Future<Output = anyhow::Result<()>>,
+    WaitForQueue: FnOnce() -> WaitForQueueFuture,
+    WaitForQueueFuture: Future<Output = anyhow::Result<()>>,
+    FetchProof: FnMut() -> FetchProofFuture,
+    FetchProofFuture: Future<Output = anyhow::Result<Option<Proof>>>,
+    FetchReward: FnMut() -> FetchRewardFuture,
+    FetchRewardFuture: Future<Output = anyhow::Result<Option<Reward>>>,
+{
+    publish().await?;
+    wait_for_queue().await?;
+    wait_for_job_ready(
+        max_wait_ms,
+        timeout_message,
+        fetch_proof,
+        fetch_reward,
+    )
+    .await
+}
+
 use cf_utils::timer::TraceTimer;
 use parth_core::{
     data::queue::queue_key::QPBaseQueueType,
@@ -13,9 +86,10 @@ use psy_data::{
     worker::{
         metadata::{PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN, PsyProvingJobMetadata},
         metadata_with_job_id::PsyProvingJobMetadataWithJobId,
-    }
+    },
 };
 use psy_io::tokio::TokioLikeFileSystem;
+use tokio::time::{sleep, Duration, Instant};
 use psy_node_core::{
     psy_core_db::traits::full::{PsyCoordinatorProcessorStore, PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter},
     psy_temp_db::StandardProcessorTempDBStoreBase,
@@ -180,34 +254,63 @@ impl<
             .await?;
         Ok(())
     }
-    pub async fn publish_and_wait_for_job_completion(&self, job: &PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>) -> anyhow::Result<()> {
+    pub async fn publish_and_wait_for_job_ready(
+        &self,
+        job: &PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>,
+        job_context: &str,
+    ) -> anyhow::Result<(Vec<u8>, N::QHash)> {
         let queue_key = self.db.get_proof_worker_queue_key();
         println!("Publishing job id: {:?}", job.job_id);
         println!("self.db.ids.proc_checkpoint_unique_id: {:?}", self.db.ids.proc_checkpoint_unique_id);
-        self.db
-            .proof_work_queue
-            .publish_worker_queue_item_ref(
-                &queue_key,
-                self.db.ids.realm_id_u64,
-                self.db.ids.realm_sub_id_u64,
-                self.db.ids.proc_checkpoint_unique_id,
-                0,
-                job,
-            )
-            .await?;
-        self.db
-            .proof_work_queue
-            .wait_until_all_jobs_complete_or_timeout_worker(
-                &queue_key,
-                self.db.ids.realm_id_u64,
-                self.db.ids.realm_sub_id_u64,
-                self.db.ids.proc_checkpoint_unique_id,
-                0,
-                self.proof_worker_queue_max_time_ms,
-            )
-            .await?;
-        Ok(())
+        let output_job_id = job.job_id.get_output_id();
+        let unique_pending_id = self.db.ids.unique_pending_id;
+        let (proof_bytes, reward_value) = publish_wait_for_queue_and_job_ready(
+            self.proof_worker_queue_max_time_ms,
+            format!(
+                "Timed out waiting for persisted proof and reward tree value for {} {:?} at realm {:?}, unique_pending_id {}",
+                job_context, output_job_id, self.db.ids.realm_identifier, unique_pending_id,
+            ),
+            || {
+                self.db.proof_work_queue.publish_worker_queue_item_ref(
+                    &queue_key,
+                    self.db.ids.realm_id_u64,
+                    self.db.ids.realm_sub_id_u64,
+                    self.db.ids.proc_checkpoint_unique_id,
+                    0,
+                    job,
+                )
+            },
+            || {
+                self.db.proof_work_queue.wait_until_all_jobs_complete_or_timeout_worker(
+                    &queue_key,
+                    self.db.ids.realm_id_u64,
+                    self.db.ids.realm_sub_id_u64,
+                    self.db.ids.proc_checkpoint_unique_id,
+                    0,
+                    self.proof_worker_queue_max_time_ms,
+                )
+            },
+            || self.db.proof_store.get_proof_bytes_by_job_id(output_job_id, unique_pending_id),
+            || {
+                self.db.temp_db.get_proof_miner_rewards_tree_value_or_none(
+                    &self.db.ids.realm_identifier,
+                    unique_pending_id,
+                    output_job_id,
+                )
+            },
+        )
+        .await?;
+
+        tracing::info!(
+            ?output_job_id,
+            unique_pending_id,
+            proof_bytes = proof_bytes.len(),
+            %job_context,
+            "Job proof and reward tree value persisted"
+        );
+        Ok((proof_bytes, reward_value))
     }
+
 
     pub async fn get_results_from_gatherers(&mut self) -> anyhow::Result<(
         PsyNodeProvingState,
@@ -323,21 +426,9 @@ impl<
     pub async fn plan_checkpoint_state_transition(
         &self,
         mut output_builder: CoordinatorOutputBuilder<N>,
+        agg_part_1_reward_root: N::QHash,
     ) -> anyhow::Result<(PsyPreparedCoordinatorBlockStateUpdates<N::F, N::QHash>, Vec<u8>)> {
         let block_time = output_builder.register_users_gatherer_result.block_time;
-        let agg_part_1_reward_root: Option<N::QHash> = self
-            .db
-            .temp_db
-            .get_proof_miner_rewards_tree_value_or_none(
-                &self.db.ids.realm_identifier,
-                self.db.ids.unique_pending_id,
-                output_builder.agg_state_part_1_job_id.get_output_id(),
-            )
-            .await?;
-        if agg_part_1_reward_root.is_none() {
-            anyhow::bail!("Missing reward tree value for checkpoint state transition job");
-        }
-        let agg_part_1_reward_root = agg_part_1_reward_root.unwrap();
         let (job_metadata, job_and_witness_bytes) = output_builder.get_checkpoint_state_transition_job(
             self.db.ids.checkpoint_id,
             self.db.ids.checkpoint_id + 1,
@@ -353,33 +444,14 @@ impl<
             .temp_db
             .set_tdb_proof_witnesses_tuple_owned_raw(&self.db.ids.realm_identifier, self.db.ids.unique_pending_id, vec![job_and_witness_bytes])
             .await?;
-        self.publish_and_wait_for_job_completion(&job_metadata).await?;
-        tracing::info!("Checkpoint State Transition Proof job completed, retrieving results...");
-
-        let reward_root: Option<N::QHash> = self
-            .db
-            .temp_db
-            .get_proof_miner_rewards_tree_value_or_none(
-                &self.db.ids.realm_identifier,
-                self.db.ids.unique_pending_id,
-                job_metadata.job_id.get_output_id(),
-            )
+        let (checkpoint_zk_proof, reward_root) = self
+            .publish_and_wait_for_job_ready(&job_metadata, "checkpoint state transition root job")
             .await?;
-        if reward_root.is_none() {
-            tracing::error!("Failed to retrieve reward root for checkpoint state transition job id: {:?}", job_metadata.job_id);
-            anyhow::bail!("Missing reward tree value for checkpoint state transition job");
-        }
-        let reward_root = reward_root.unwrap();
-        let checkpoint_zk_proof: Option<Vec<u8>> = self
-            .db
-            .proof_store
-            .get_proof_bytes_by_job_id(job_metadata.job_id.get_output_id(), self.db.ids.unique_pending_id)
-            .await?;
-        if checkpoint_zk_proof.is_none() {
-            tracing::error!("Failed to retrieve zk proof for checkpoint state transition job id: {:?}", job_metadata.job_id);
-            anyhow::bail!("Missing zk proof for checkpoint state transition job");
-        }
-        let checkpoint_zk_proof = checkpoint_zk_proof.unwrap();
+        tracing::info!(
+            job_id = ?job_metadata.job_id,
+            proof_bytes = checkpoint_zk_proof.len(),
+            "Checkpoint state transition root proof and reward value are ready"
+        );
         tracing::info!("Retrieved checkpoint zk proof of size: {} bytes", checkpoint_zk_proof.len());
         let output = output_builder.finalize(&self.db.ids, &self.db.last_committed, reward_root, block_time)?;
         tracing::info!("Finalized coordinator block state updates.");
@@ -486,12 +558,16 @@ impl<
 
         // wait for the Aggregate GUTA, User Registation and Deploy Contracts Proof to
         // finish being proved
-        self.publish_and_wait_for_job_completion(&agg_job_metadata).await?;
+        let (_, agg_part_1_reward_root) = self
+            .publish_and_wait_for_job_ready(&agg_job_metadata, "checkpoint state transition dependency")
+            .await?;
         timer.lap("publish_and_wait_for_job_completion_agg");
         println!("Aggregate GUTA, User Registration and Deploy Contracts Proof completed!");
         proving_state.inc_current_proving_level();
         self.db.temp_db.set_psy_node_proving_state(&self.db.ids.realm_identifier, &proving_state).await?;
-        let (coordinator_update, zk_proof) = self.plan_checkpoint_state_transition(output_builder).await?;
+        let (coordinator_update, zk_proof) = self
+            .plan_checkpoint_state_transition(output_builder, agg_part_1_reward_root)
+            .await?;
         timer.lap("plan_checkpoint_state_transition");
         tracing::info!("Checkpoint State Transition Proof completed!");
         proving_state.finish();
@@ -520,6 +596,300 @@ impl<
             );
         }
 
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use super::{publish_wait_for_queue_and_job_ready, wait_for_job_ready};
+
+    #[tokio::test]
+    async fn polls_until_both_job_values_exist() -> anyhow::Result<()> {
+        let proof_attempts = Arc::new(AtomicUsize::new(0));
+        let observed_proof_attempts = Arc::clone(&proof_attempts);
+        let reward_attempts = Arc::new(AtomicUsize::new(0));
+        let observed_reward_attempts = Arc::clone(&reward_attempts);
+
+        let (proof, reward) = wait_for_job_ready(
+            1_000,
+            "job proof and reward were not persisted".to_string(),
+            move || {
+                let attempt = observed_proof_attempts.fetch_add(1, Ordering::SeqCst);
+                async move { Ok((attempt >= 2).then_some(vec![1_u8, 2, 3])) }
+            },
+            move || {
+                let _attempt = observed_reward_attempts.fetch_add(1, Ordering::SeqCst);
+                async move { Ok(Some(87_u64)) }
+            },
+        )
+        .await?;
+
+        assert_eq!(proof, vec![1, 2, 3]);
+        assert_eq!(reward, 87);
+        assert_eq!(proof_attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(reward_attempts.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn immediate_queue_barrier_still_waits_for_keyed_job_values() -> anyhow::Result<()> {
+        let phase = Arc::new(AtomicUsize::new(0));
+        let publish_phase = Arc::clone(&phase);
+        let barrier_phase = Arc::clone(&phase);
+        let proof_phase = Arc::clone(&phase);
+        let reward_phase = Arc::clone(&phase);
+        let proof_attempts = Arc::new(AtomicUsize::new(0));
+        let observed_proof_attempts = Arc::clone(&proof_attempts);
+        let reward_attempts = Arc::new(AtomicUsize::new(0));
+        let observed_reward_attempts = Arc::clone(&reward_attempts);
+
+        let (proof, reward) = publish_wait_for_queue_and_job_ready(
+            1_000,
+            "job proof and reward were not persisted".to_string(),
+            move || async move {
+                assert_eq!(publish_phase.swap(1, Ordering::SeqCst), 0);
+                Ok(())
+            },
+            move || async move {
+                assert_eq!(barrier_phase.swap(2, Ordering::SeqCst), 1);
+                Ok(())
+            },
+            move || {
+                assert_eq!(proof_phase.load(Ordering::SeqCst), 2);
+                let attempt = observed_proof_attempts.fetch_add(1, Ordering::SeqCst);
+                async move { Ok((attempt >= 2).then_some(vec![4_u8, 5, 6])) }
+            },
+            move || {
+                assert_eq!(reward_phase.load(Ordering::SeqCst), 2);
+                let _attempt = observed_reward_attempts.fetch_add(1, Ordering::SeqCst);
+                async move { Ok(Some(91_u64)) }
+            },
+        )
+        .await?;
+
+        assert_eq!(proof, vec![4, 5, 6]);
+        assert_eq!(reward, 91);
+        assert_eq!(phase.load(Ordering::SeqCst), 2);
+        assert_eq!(proof_attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(reward_attempts.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn regression_reward_not_stale_when_proof_delayed() -> anyhow::Result<()> {
+        // Original checkpoint-367 corruption: reward-first polling read the reward
+        // store while the proof was still pending and cached the first `Some` it
+        // observed. When the claim-tag and the finalized reward shared a store, that
+        // cached value was a stale claim-tag, later paired with a freshly-visible
+        // proof -> proof/reward corruption.
+        //
+        // This test models the data flow against the proof-first helper:
+        //   * The reward store exposes `Some(claim_tag = 41)` while the proof is still
+        //     `None` (claim stage), then `Some(final = 99)` once the proof is visible.
+        //   * The proof closure returns `None` for the first two polls, `Some` after,
+        //     and flips a shared `proof_ready` flag the moment it first returns `Some`.
+        //   * The reward closure returns `Some(claim = 41)` while `proof_ready` is
+        //     false and `Some(final = 99)` once `proof_ready` is true.
+        //
+        // The proof-first helper only reads reward AFTER proof is `Some`, so its first
+        // reward read sees the finalized 99. The old reward-first-with-cache helper
+        // reads reward BEFORE proof is ready, caches 41, and returns the stale 41
+        // paired with the later proof -- the exact corruption vector, so the value
+        // assertion (`reward == 99`) mutation-kills the old implementation.
+        let proof_ready = Arc::new(AtomicBool::new(false));
+        let observed_proof_ready_for_proof = Arc::clone(&proof_ready);
+        let observed_proof_ready_for_reward = Arc::clone(&proof_ready);
+        let proof_attempts = Arc::new(AtomicUsize::new(0));
+        let observed_proof_attempts = Arc::clone(&proof_attempts);
+        let reward_attempts = Arc::new(AtomicUsize::new(0));
+        let observed_reward_attempts = Arc::clone(&reward_attempts);
+
+        let (proof, reward) = wait_for_job_ready(
+            1_000,
+            "job proof and reward were not persisted".to_string(),
+            move || {
+                let attempt = observed_proof_attempts.fetch_add(1, Ordering::SeqCst);
+                let ready = Arc::clone(&observed_proof_ready_for_proof);
+                async move {
+                    let is_ready = attempt >= 2;
+                    if is_ready {
+                        // Mark the proof as visible before yielding Some so that a
+                        // proof-first reader, which fetches reward only after this
+                        // point, observes the finalized reward.
+                        ready.store(true, Ordering::SeqCst);
+                    }
+                    Ok(is_ready.then_some(vec![7_u8, 8, 9]))
+                }
+            },
+            move || {
+                let _attempt = observed_reward_attempts.fetch_add(1, Ordering::SeqCst);
+                let ready = Arc::clone(&observed_proof_ready_for_reward);
+                async move {
+                    // While the proof is still pending the reward store holds the
+                    // claim-tag (41); once the proof is visible the finalized reward
+                    // (99) is present. A proof-first reader only reaches this branch
+                    // after the proof is ready, so it must observe 99.
+                    Ok(Some(if ready.load(Ordering::SeqCst) { 99_u64 } else { 41_u64 }))
+                }
+            },
+        )
+        .await?;
+
+        assert_eq!(proof, vec![7, 8, 9]);
+        assert_eq!(
+            reward, 99,
+            "must return the finalized reward, not the stale claim-tag cached before the proof was ready"
+        );
+        // Proof-first: proof is polled every iteration (3 polls); reward is read exactly
+        // once, after the proof becomes Some.
+        assert_eq!(proof_attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(reward_attempts.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn proof_and_reward_both_ready_on_first_poll_return_immediately() -> anyhow::Result<()> {
+        // Early-return contract: when both proof and reward are Some on the very
+        // first poll the helper must return at once -- no extra iteration, no
+        // sleep. A regression that always sleeps before the first check, or that
+        // polls a second time "to be sure", drives both counters past 1.
+        let proof_attempts = Arc::new(AtomicUsize::new(0));
+        let observed_proof_attempts = Arc::clone(&proof_attempts);
+        let reward_attempts = Arc::new(AtomicUsize::new(0));
+        let observed_reward_attempts = Arc::clone(&reward_attempts);
+
+        let (proof, reward) = wait_for_job_ready(
+            1_000,
+            "job proof and reward were not persisted".to_string(),
+            move || {
+                observed_proof_attempts.fetch_add(1, Ordering::SeqCst);
+                async move { Ok(Some(vec![1_u8, 2, 3])) }
+            },
+            move || {
+                observed_reward_attempts.fetch_add(1, Ordering::SeqCst);
+                async move { Ok(Some(87_u64)) }
+            },
+        )
+        .await?;
+
+        assert_eq!(proof, vec![1, 2, 3]);
+        assert_eq!(reward, 87);
+        assert_eq!(
+            proof_attempts.load(Ordering::SeqCst),
+            1,
+            "must return on the first poll when both values are immediately ready"
+        );
+        assert_eq!(
+            reward_attempts.load(Ordering::SeqCst),
+            1,
+            "reward must be fetched exactly once when already ready alongside the proof"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reward_never_appearing_while_proof_ready_times_out() -> anyhow::Result<()> {
+        // Anti-corruption contract: a proof must NEVER be returned without its
+        // finalized reward. The proof store reports Some on every poll while the
+        // reward store reports None forever; the helper must keep polling until
+        // the deadline and then bail, never returning Ok((proof, _)).
+        //
+        // Mutation-kills: `return Ok((proof, fetch_reward().await?.unwrap_or_default()))`
+        // on None reward, or any early-return that pairs a ready proof with a
+        // missing/default reward -- those return Ok, this test demands Err.
+        let reward_attempts = Arc::new(AtomicUsize::new(0));
+        let observed_reward_attempts = Arc::clone(&reward_attempts);
+        let timeout_message = "reward never materialized for ready proof".to_string();
+
+        let result = wait_for_job_ready(
+            150,
+            timeout_message.clone(),
+            move || {
+                // Proof is always Some -- the temptation the bug class exploits.
+                async move { Ok(Some(vec![7_u8, 8, 9])) }
+            },
+            move || {
+                observed_reward_attempts.fetch_add(1, Ordering::SeqCst);
+                async move { Ok(None::<u64>) }
+            },
+        )
+        .await;
+
+        let error = result.expect_err(
+            "must time out, never return a proof without its finalized reward",
+        );
+        let error = error.to_string();
+        assert!(
+            error.contains(&timeout_message),
+            "timeout must surface the configured message, got: {error}"
+        );
+        assert!(
+            reward_attempts.load(Ordering::SeqCst) >= 1,
+            "must have consulted the reward store before timing out, not short-circuited on a ready proof"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reward_transitioning_after_proof_ready_is_retried_not_early_returned() -> anyhow::Result<()> {
+        // After the proof becomes Some the reward may still be propagating
+        // (None on the first post-proof poll, Some(final) on the next). The
+        // helper must loop and re-fetch BOTH proof and reward, not early-return
+        // the proof paired with a missing/default reward.
+        //
+        // Mutation-kills:
+        //   * `return Ok((proof, fetch_reward().await?.unwrap_or_default()))`
+        //     (returns a default reward instead of the finalized one).
+        //   * any `break`/early-return triggered by None reward after a ready
+        //     proof (drops the retry, returns default/missing reward).
+        //   * caching the proof across iterations (proof_attempts would stay 1);
+        //     the helper must re-fetch proof each loop.
+        let proof_attempts = Arc::new(AtomicUsize::new(0));
+        let observed_proof_attempts = Arc::clone(&proof_attempts);
+        let reward_attempts = Arc::new(AtomicUsize::new(0));
+        let observed_reward_attempts = Arc::clone(&reward_attempts);
+
+        let (proof, reward) = wait_for_job_ready(
+            1_000,
+            "job proof and reward were not persisted".to_string(),
+            move || {
+                observed_proof_attempts.fetch_add(1, Ordering::SeqCst);
+                // Proof is ready immediately and stays ready every iteration.
+                async move { Ok(Some(vec![1_u8, 2, 3])) }
+            },
+            move || {
+                let attempt = observed_reward_attempts.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    // None on the first poll (reward still propagating after the
+                    // proof became visible), Some(final) from the second poll on.
+                    Ok((attempt >= 1).then_some(99_u64))
+                }
+            },
+        )
+        .await?;
+
+        assert_eq!(proof, vec![1, 2, 3]);
+        assert_eq!(
+            reward, 99,
+            "must return the finalized reward once it appears, not a default for the missing one"
+        );
+        // iter 1: proof Some, reward None -> continue; iter 2: proof Some, reward Some -> return.
+        assert_eq!(
+            proof_attempts.load(Ordering::SeqCst),
+            2,
+            "proof must be re-fetched on the retry, not cached from the first poll"
+        );
+        assert_eq!(
+            reward_attempts.load(Ordering::SeqCst),
+            2,
+            "reward must be polled again after the first None, not early-returned"
+        );
         Ok(())
     }
 }

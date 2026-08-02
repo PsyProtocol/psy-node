@@ -1,0 +1,261 @@
+name: Release psy-node
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release-shaped version tag (vX.Y.Z)"
+        required: true
+        type: string
+      publish:
+        description: "Publish assets to the existing tag"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: psy-node-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # Let cargo fetch git dependencies through `git`, so the SSH-to-HTTPS
+  # insteadOf rewrite below applies to every GitHub clone.
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+jobs:
+  prepare:
+    name: Resolve release inputs
+    runs-on: ubuntu-24.04
+    outputs:
+      checkout_ref: ${{ steps.release.outputs.checkout_ref }}
+      publish: ${{ steps.release.outputs.publish }}
+      tag: ${{ steps.release.outputs.tag }}
+    steps:
+      - name: Validate release inputs
+        id: release
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_TAG: ${{ github.ref_name }}
+          INPUT_PUBLISH: ${{ inputs.publish }}
+          INPUT_TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT_NAME" == "push" ]]; then
+            tag="$EVENT_TAG"
+            checkout_ref="$EVENT_TAG"
+            publish=true
+          else
+            tag="$INPUT_TAG"
+            publish="${INPUT_PUBLISH:-false}"
+            if [[ "$publish" == "true" ]]; then
+              checkout_ref="$tag"
+            else
+              checkout_ref="$GITHUB_SHA"
+            fi
+
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "tag must match vX.Y.Z; received: $tag" >&2
+            exit 1
+          fi
+
+          {
+            echo "checkout_ref=$checkout_ref"
+            echo "publish=$publish"
+            echo "tag=$tag"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.triple }}
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            triple: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            triple: aarch64-unknown-linux-gnu
+          - runner: macos-15-intel
+            triple: x86_64-apple-darwin
+          - runner: macos-14
+            triple: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out psy-node (no submodules yet)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ needs.prepare.outputs.checkout_ref }}
+
+      - name: Authenticate GitHub dependency fetches
+        env:
+          GH_TOKEN: ${{ secrets.PSY_RELEASE_REPOSITORY_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${GH_TOKEN:?PSY_RELEASE_REPOSITORY_TOKEN is required}"
+          auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          git config --global --add url."https://github.com/".insteadOf "git@github.com:"
+          git config --global http.https://github.com/.extraheader "AUTHORIZATION: basic ${auth}"
+
+      - name: Initialize recursive submodules
+        shell: bash
+        run: git submodule update --init --recursive
+
+      - name: Verify native target
+        env:
+          EXPECTED_TRIPLE: ${{ matrix.triple }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(rustc -vV | sed -n 's/^host: //p')"
+          if [[ "$actual" != "$EXPECTED_TRIPLE" ]]; then
+            echo "runner host $actual does not match $EXPECTED_TRIPLE" >&2
+            exit 1
+          fi
+
+      - name: Build release binaries
+        env:
+          TARGET_TRIPLE: ${{ matrix.triple }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked \
+            --target "${TARGET_TRIPLE}" \
+            --bin psy_user_cli \
+            --bin psy_node_cli \
+            --bin psy_worker_cli
+
+      - name: Package and smoke test
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          TARGET_TRIPLE: ${{ matrix.triple }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          asset="psy-node-${RELEASE_TAG}-${TARGET_TRIPLE}.tar.gz"
+          package="$RUNNER_TEMP/psy-node-package"
+          smoke="$RUNNER_TEMP/psy-node-smoke"
+          rm -rf "$package" "$smoke" dist
+          mkdir -p "$package" "$smoke" dist
+
+          cp "target/${TARGET_TRIPLE}/release/psy_user_cli" "$package/psy_user_cli"
+          cp "target/${TARGET_TRIPLE}/release/psy_node_cli" "$package/psy_node_cli"
+          cp "target/${TARGET_TRIPLE}/release/psy_worker_cli" "$package/psy_worker_cli"
+          cp LICENSE "$package/LICENSE"
+          chmod 0755 "$package/psy_user_cli" "$package/psy_node_cli" "$package/psy_worker_cli"
+
+          tar -C "$package" -czf "dist/$asset" \
+            psy_user_cli psy_node_cli psy_worker_cli LICENSE
+
+          cat > "$RUNNER_TEMP/expected-inventory" <<'EOF'
+          LICENSE
+          psy_node_cli
+          psy_user_cli
+          psy_worker_cli
+          EOF
+          tar -tzf "dist/$asset" | sed 's#^\./##' | LC_ALL=C sort > "$RUNNER_TEMP/actual-inventory"
+          LC_ALL=C sort "$RUNNER_TEMP/expected-inventory" -o "$RUNNER_TEMP/expected-inventory"
+          diff -u "$RUNNER_TEMP/expected-inventory" "$RUNNER_TEMP/actual-inventory"
+
+          tar -xzf "dist/$asset" -C "$smoke"
+          test -f "$smoke/LICENSE"
+          for name in psy_user_cli psy_node_cli psy_worker_cli; do
+            test -x "$smoke/$name"
+            "$smoke/$name" --help >/dev/null
+          done
+
+      - name: Upload packaged archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          if-no-files-found: error
+          name: psy-node-${{ matrix.triple }}
+          path: dist/psy-node-${{ needs.prepare.outputs.tag }}-${{ matrix.triple }}.tar.gz
+          retention-days: 7
+          compression-level: 0
+
+  checksums:
+    name: Generate checksums
+    needs:
+      - prepare
+      - build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download packaged archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          merge-multiple: true
+          path: dist
+          pattern: psy-node-*
+
+      - name: Validate assets and write SHA256SUMS
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          cat > "$RUNNER_TEMP/expected-assets" <<EOF
+          psy-node-${RELEASE_TAG}-aarch64-apple-darwin.tar.gz
+          psy-node-${RELEASE_TAG}-aarch64-unknown-linux-gnu.tar.gz
+          psy-node-${RELEASE_TAG}-x86_64-apple-darwin.tar.gz
+          psy-node-${RELEASE_TAG}-x86_64-unknown-linux-gnu.tar.gz
+          EOF
+          printf '%s\n' ./*.tar.gz | sed 's#^./##' | LC_ALL=C sort > "$RUNNER_TEMP/actual-assets"
+          diff -u "$RUNNER_TEMP/expected-assets" "$RUNNER_TEMP/actual-assets"
+          sha256sum ./*.tar.gz | sed 's#  \./#  #' > SHA256SUMS
+          sha256sum --check SHA256SUMS
+
+      - name: Upload complete release payload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          if-no-files-found: error
+          name: psy-node-release-${{ needs.prepare.outputs.tag }}
+          path: |
+            dist/psy-node-${{ needs.prepare.outputs.tag }}-*.tar.gz
+            dist/SHA256SUMS
+          retention-days: 7
+          compression-level: 0
+
+  publish:
+    name: Publish GitHub Release
+    if: needs.prepare.outputs.publish == 'true'
+    needs:
+      - prepare
+      - checksums
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Check out publish script
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 1
+          path: psy-node
+          persist-credentials: false
+          ref: ${{ needs.prepare.outputs.checkout_ref }}
+
+      - name: Download release payload
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: psy-node-release-${{ needs.prepare.outputs.tag }}
+          path: dist
+
+      - name: Guard immutability and publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        shell: bash
+        run: bash psy-node/.github/scripts/publish-release.sh

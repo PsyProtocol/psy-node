@@ -8,22 +8,30 @@ fn main() {
             if cargo_toml.exists() {
                 if let Ok(cargo_content) = fs::read_to_string(&cargo_toml) {
                     if cargo_content.contains("[workspace]") {
-                        let psy_genesis_config = current_dir.join("psy-genesis").join("config.json");
-                        if psy_genesis_config.exists() {
-                            return psy_genesis_config;
+                        let root_config = current_dir.join("config.json");
+                        if root_config.exists() {
+                            return root_config;
                         }
-                        panic!("config.json not found at psy-genesis/config.json. Ensure the psy-genesis submodule is initialized (git submodule update --init).");
+                        let client_prover_config = current_dir.join("client_prover").join("config.json");
+                        if client_prover_config.exists() {
+                            return client_prover_config;
+                        }
+                        return root_config;
                     }
                 }
             }
             if let Some(parent) = current_dir.parent() {
                 current_dir = parent.to_path_buf();
             } else {
-                let psy_genesis_config = Path::new("psy-genesis").join("config.json");
-                if psy_genesis_config.exists() {
-                    return psy_genesis_config;
+                let local_config = Path::new("config.json").to_path_buf();
+                if local_config.exists() {
+                    return local_config;
                 }
-                panic!("config.json not found at psy-genesis/config.json. Ensure the psy-genesis submodule is initialized (git submodule update --init).");
+                let local_client_prover_config = Path::new("client_prover").join("config.json");
+                if local_client_prover_config.exists() {
+                    return local_client_prover_config;
+                }
+                return local_config;
             }
         }
     });
@@ -125,8 +133,8 @@ fn main() {
 
     let precompile_constants = generate_precompile_constants_from_genesis_contracts().unwrap_or_default();
 
-    // Also re-generate config if genesis_contracts.json changed
-    println!("cargo:rerun-if-changed=psy-genesis/genesis_contracts.json");
+    // Also re-generate config if the committed genesis contracts change.
+    println!("cargo:rerun-if-changed=../../../psy-genesis/genesis_contracts.json");
 
     let out_dir = env::var_os("OUT_DIR").unwrap();
     let dest_path = Path::new(&out_dir).join("generated_constants.rs");
@@ -199,22 +207,22 @@ fn generate_precompile_constants_from_genesis_contracts() -> Result<String, Box<
     // CARGO_MANIFEST_DIR = client_prover/psy_core/psy_config
     // Parent 1: client_prover/psy_core
     // Parent 2: client_prover
-    // Parent 3: project root (where psy-genesis/genesis_contracts.json lives)
+    // Parent 3: project root
     let manifest_dir_str = env::var("CARGO_MANIFEST_DIR")?;
     let contracts_path = Path::new(&manifest_dir_str)
         .parent()
         .and_then(|p| p.parent())
         .and_then(|p| p.parent())
-        .map(|p| p.join("psy-genesis").join("genesis_contracts.json"))
-        .ok_or_else(|| "Cannot resolve genesis_contracts.json path from manifest dir".to_string())?;
+        .map(|p| p.join("psy-genesis/genesis_contracts.json"))
+        .ok_or_else(|| "Cannot resolve psy-genesis/genesis_contracts.json path from manifest dir".to_string())?;
 
     let contracts_bytes = fs::read(&contracts_path)
-        .unwrap_or_else(|_| panic!("Failed to read genesis_contracts.json at {}", contracts_path.display()));
+        .map_err(|error| format!("Failed to read {}: {error}", contracts_path.display()))?;
     let contracts: Vec<serde_json::Value> = match serde_json::from_slice(&contracts_bytes) {
         Ok(v) => v,
         Err(_) => {
-            let decoded = zstd::stream::decode_all(contracts_bytes.as_slice())
-                .map_err(|e| format!("failed to decode zstd genesis_contracts.json: {}", e))?;
+            let decoded =
+                zstd::stream::decode_all(contracts_bytes.as_slice()).map_err(|e| format!("failed to decode zstd genesis_contracts.json: {}", e))?;
             serde_json::from_slice(&decoded)?
         }
     };
@@ -247,17 +255,16 @@ fn generate_precompile_constants_from_genesis_contracts() -> Result<String, Box<
             .ok_or_else(|| format!("Contract '{}' missing code_definition.functions", contract_name))?;
 
         for func in functions {
-            let method_name = func.get("name")
+            let method_name = func
+                .get("name")
                 .and_then(|n| n.as_str())
                 .map(|n| n.split("::").last().unwrap_or(n))
                 .map(|n| n.to_string())
                 .or_else(|| {
-                    func.get("code")
-                        .and_then(|c| c.as_array())
-                        .and_then(|arr| {
-                            let bytes: Vec<u8> = arr.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect();
-                            extract_method_name_from_cbor(&bytes)
-                        })
+                    func.get("code").and_then(|c| c.as_array()).and_then(|arr| {
+                        let bytes: Vec<u8> = arr.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect();
+                        extract_method_name_from_cbor(&bytes)
+                    })
                 });
 
             if let (Some(method_name), Some(method_id)) = (method_name, func.get("method_id").and_then(|id| id.as_u64())) {
@@ -279,8 +286,9 @@ fn generate_precompile_constants_from_genesis_contracts() -> Result<String, Box<
     Ok(constants)
 }
 
-/// Extract method name from the CBOR-encoded `code` field of a genesis contract function.
-/// The CBOR map starts with `0xa9` and the "name" key is typically the first entry.
+/// Extract method name from the CBOR-encoded `code` field of a genesis contract
+/// function. The CBOR map starts with `0xa9` and the "name" key is typically
+/// the first entry.
 fn extract_method_name_from_cbor(code: &[u8]) -> Option<String> {
     // CBOR text string "name" = 0x64 + "name"
     let name_key = [0x64, b'n', b'a', b'm', b'e'];

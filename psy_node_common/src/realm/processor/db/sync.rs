@@ -42,23 +42,28 @@ where
         // Defensive: if a previous run (e.g. old fast-forward code) set latest_checkpoint_id
         // without writing the corresponding L2 block state, roll back to the last checkpoint
         // that actually has metadata. This keeps the DB self-consistent.
-        let latest_db_l2_info: QEDL2BlockState = loop {
-            match self.db.get_l2_block_state(latest_db_checkpoint_id).await {
-                std::result::Result::Ok(info) => break info,
-                std::result::Result::Err(_) if latest_db_checkpoint_id > 0 => {
-                    tracing::warn!(
-                        "No L2 block state for checkpoint {} (latest_checkpoint_id marker without metadata). \
-                         Rolling back to previous checkpoint.",
-                        latest_db_checkpoint_id
-                    );
-                    latest_db_checkpoint_id -= 1;
-                }
-                std::result::Result::Err(e) => return Err(e),
-            }
-        };
+        let requested_latest_db_checkpoint_id = latest_db_checkpoint_id;
+        let (available_latest_db_checkpoint_id, latest_db_l2_info) = self
+            .get_latest_available_l2_block_state(latest_db_checkpoint_id)
+            .await?;
+        latest_db_checkpoint_id = available_latest_db_checkpoint_id;
         if latest_db_checkpoint_id != self.db.get_latest_checkpoint_id().await? {
+            tracing::warn!(
+                "No L2 block state for latest_checkpoint_id marker {}. Rolling back marker to checkpoint {}.",
+                requested_latest_db_checkpoint_id,
+                latest_db_checkpoint_id
+            );
             self.db.set_latest_checkpoint_id(latest_db_checkpoint_id).await?;
         }
+
+        // Re-anchor the `latest_l2_block_state` singleton to the resolved marker on every sync start, even when
+        // the marker itself looked complete. The singleton and the marker are written non-transactionally and in
+        // separate steps (see steps 3/4 below and the wait path), so a crash after advancing the singleton but
+        // before advancing the marker / committing leaves the singleton *ahead* of the marker. In that case the
+        // rollback branch above does NOT fire (the marker's own checkpoint is complete), so the RPC
+        // `get_latest_l2_block_state` would keep serving a block_state for a checkpoint that was never committed.
+        // Pulling the singleton back to the marker's block state here heals that lead before we advance again.
+        self.db.set_l2_latest_block_state(&latest_db_l2_info).await?;
 
         // Check if DB is already up to date
         let db_root = self.db.checkpoint_tree_get_root_hash(latest_db_checkpoint_id).await?;
@@ -72,83 +77,32 @@ where
         }
 
         // 2. Fetch and persist metadata for missing checkpoints
-        for checkpoint_id in (latest_db_checkpoint_id + 1)..=latest_synced_checkpoint_id {
-            let sync_info: PsyRealmCoordinatorUpdate<N::F, N::QHash> = self.coordinator_client.rc_get_realm_sync_info(checkpoint_id, self.state.realm_id_u64).await?;
-            
+        let latest_sync_info = match self
+            .persist_checkpoint_metadata_range(latest_db_checkpoint_id + 1, latest_synced_checkpoint_id, latest_db_checkpoint_id)
+            .await?
+        {
+            Some(sync_info) => sync_info,
+            None => self
+                .coordinator_client
+                .rc_get_realm_sync_info(latest_synced_checkpoint_id, self.state.realm_id_u64)
+                .await?,
+        };
 
-            // CRITICAL VALIDATION: Ensure the local in-memory tree matches the Coordinator's canonical root for this checkpoint.
-            // If we have diverged (e.g. bad leaves or fork), we must reset the Backup Manager.
-            // We retrieve the proof for the leaf at `checkpoint_id`. The `get_append_root` from that proof 
-            // represents the root of the tree at the moment that leaf was the right-most element (i.e., at that checkpoint).
-            let local_proof = self.checkpoint_tree_backup_manager.checkpoint_tree.get_leaf(checkpoint_id);
-            let local_calculated_root = local_proof.get_append_root::<N::HasherBase>();
+        self.sync_contract_heights(
+            latest_db_l2_info.next_contract_id,
+            latest_sync_info.checkpoint_sync_info.block_state.next_contract_id,
+            latest_synced_checkpoint_id,
+        )
+        .await?;
 
-            if local_calculated_root != sync_info.checkpoint_sync_info.checkpoint_tree_root {
-                tracing::error!(
-                    "CRITICAL CHECKSUM MISMATCH: Local Checkpoint Tree Root {:?} != Coordinator Root {:?} at Checkpoint {}. Triggering Backup Manager Hard Reset.",
-                    local_calculated_root,
-                    sync_info.checkpoint_sync_info.checkpoint_tree_root,
-                    checkpoint_id
-                );
-                
-                // Reset the backup manager to the last known committed state in the DB to clear invalid in-memory state
-                self.checkpoint_tree_backup_manager.hard_reset_and_truncate(latest_db_checkpoint_id).await?;
-                
-                anyhow::bail!("Checkpoint Tree Divergence detected at checkpoint {}. Local state reset. Please retry sync.", checkpoint_id);
-            }
+        self.db.set_latest_checkpoint_id(latest_synced_checkpoint_id).await?;
 
-            tracing::info!("sync checkpoint id {} {}", checkpoint_id, serde_json::to_string_pretty(&sync_info)?);
-            self.db
-                .set_l2_block_state(checkpoint_id, &sync_info.checkpoint_sync_info.block_state)
-                .await?;
-            tracing::info!("set checkpoint global state roots {} {}", checkpoint_id, serde_json::to_string_pretty(&sync_info.checkpoint_sync_info.state_roots)?);
-            self.db
-                .set_checkpoint_global_state_roots(checkpoint_id, &sync_info.checkpoint_sync_info.state_roots)
-                .await?;
-            tracing::info!("get checkpoint global state roots {} {}", checkpoint_id, serde_json::to_string_pretty(&self.db.get_checkpoint_global_state_roots(checkpoint_id).await?)?);
-            self.db
-                .set_checkpoint_leaf_data(checkpoint_id, &sync_info.checkpoint_sync_info.checkpoint_leaf)
-                .await?;
-                    println!("committing checkpoint proof: {:?}", &local_proof.to_append_proof::<N::HasherBase>());
-
-            self.db
-                .checkpoint_tree_injest_merkle_proof(checkpoint_id, &local_proof.to_append_proof::<N::HasherBase>())
-                .await?;
-            self.db
-                .set_checkpoint_root_hash_to_id_mapping(
-                    sync_info.checkpoint_sync_info.checkpoint_tree_root,
-                    sync_info.checkpoint_sync_info.checkpoint_id,
-                )
-                .await?;
-
-            self.db
-                .global_user_tree_set_top_tree_merkle_proof(checkpoint_id, &sync_info.merkle_proof_to_realm_root)
-                .await?;
-        }
-
-        // 3. Update Latest Block State
-        let latest_sync_info: PsyRealmCoordinatorUpdate<N::F, N::QHash> =
-            self.coordinator_client.rc_get_realm_sync_info(latest_synced_checkpoint_id, self.state.realm_id_u64).await?;
-        
+        // Advance the `latest_l2_block_state` singleton only AFTER the checkpoint marker (and all dependent
+        // writes above) have succeeded, so the RPC `get_latest_l2_block_state` can never expose a block state
+        // that leads the committed `latest_checkpoint_id`.
         self.db
             .set_l2_latest_block_state(&latest_sync_info.checkpoint_sync_info.block_state)
             .await?;
-
-        // 4. Sync Contract Heights
-        if latest_db_l2_info.next_contract_id != latest_sync_info.checkpoint_sync_info.block_state.next_contract_id {
-            tracing::info!(
-                "Syncing contract heights: local={}, remote={}", 
-                latest_db_l2_info.next_contract_id, 
-                latest_sync_info.checkpoint_sync_info.block_state.next_contract_id
-            );
-            self.sync_contract_heights(
-                latest_db_l2_info.next_contract_id,
-                latest_sync_info.checkpoint_sync_info.block_state.next_contract_id,
-                latest_synced_checkpoint_id
-            ).await?;
-        }
-
-        self.db.set_latest_checkpoint_id(latest_synced_checkpoint_id).await?;
 
         // 5. CRITICAL: Update Internal Memory State to match the new HEAD
         let latest_checkpoint_root = self.checkpoint_tree_backup_manager.get_current_checkpoint_tree_root_head();
@@ -242,13 +196,31 @@ where
                     new_realm_root, realm_state.checkpoint_id
                 );
 
-                // Fetch the full block info for the *specific* checkpoint where the update happened
-                let sync_info: PsyRealmCoordinatorUpdate<N::F, N::QHash> =
-                    self.coordinator_client.rc_get_realm_sync_info(realm_state.checkpoint_id, self.state.realm_id_u64).await?;
-
-                // Persist auxiliary proofs to DB
-                tracing::info!("set global user tree top tree merkle proof at checkpoint id {} {}", realm_state.checkpoint_id, serde_json::to_string_pretty(&sync_info.merkle_proof_to_realm_root)?);
-                self.db.global_user_tree_set_top_tree_merkle_proof(realm_state.checkpoint_id, &sync_info.merkle_proof_to_realm_root).await?;
+                let (previous_l2_checkpoint_id, previous_l2_info) = self
+                    .get_latest_available_l2_block_state(self.state.last_committed_checkpoint_id)
+                    .await?;
+                if previous_l2_checkpoint_id != self.state.last_committed_checkpoint_id {
+                    tracing::warn!(
+                        "No L2 block state for last_committed_checkpoint_id {}. Backfilling metadata from checkpoint {}.",
+                        self.state.last_committed_checkpoint_id,
+                        previous_l2_checkpoint_id.saturating_add(1)
+                    );
+                }
+                let metadata_from_checkpoint_id = previous_l2_checkpoint_id.saturating_add(1);
+                let sync_info = match self
+                    .persist_checkpoint_metadata_range(
+                        metadata_from_checkpoint_id,
+                        realm_state.checkpoint_id,
+                        previous_l2_checkpoint_id,
+                    )
+                    .await?
+                {
+                    Some(sync_info) => sync_info,
+                    None => self
+                        .coordinator_client
+                        .rc_get_realm_sync_info(realm_state.checkpoint_id, self.state.realm_id_u64)
+                        .await?,
+                };
 
                 // Update mappings for the unique pending ID
                 self.db.set_realm_rewards_tag_tree_top_proof_at_unique_pending_id(
@@ -256,11 +228,18 @@ where
                     &sync_info.reward_tree_top_proof,
                 ).await?;
 
-                // Set Block/State Info
-                self.db.set_l2_block_state(realm_state.checkpoint_id, &sync_info.checkpoint_sync_info.block_state).await?;
-                self.db.set_l2_latest_block_state(&sync_info.checkpoint_sync_info.block_state).await?;
-                self.db.set_checkpoint_global_state_roots(realm_state.checkpoint_id, &sync_info.checkpoint_sync_info.state_roots).await?;
-                self.db.set_checkpoint_leaf_data(realm_state.checkpoint_id, &sync_info.checkpoint_sync_info.checkpoint_leaf).await?;
+                self.sync_contract_heights(
+                    previous_l2_info.next_contract_id,
+                    sync_info.checkpoint_sync_info.block_state.next_contract_id,
+                    realm_state.checkpoint_id,
+                )
+                .await?;
+
+                // NOTE: intentionally do NOT advance the `latest_l2_block_state` singleton here. The caller
+                // (`process_block`) runs `commit_state` right after this returns, and the local tree/user/contract
+                // state is only durably committed there. `commit_state` advances the singleton as its final step
+                // (after `set_latest_checkpoint_id`). Advancing it here would expose, via the
+                // `get_latest_l2_block_state` RPC, a latest checkpoint whose dependent state is not yet committed.
 
                 // Update In-Memory State for the commit
                 self.state.last_committed_checkpoint_id = realm_state.checkpoint_id;
@@ -295,7 +274,148 @@ where
 
     // --- Helper Functions ---
 
+    /// Walk backwards from `checkpoint_id` to the most recent checkpoint whose metadata is *fully* persisted.
+    /// Completeness is judged by `try_get_complete_l2_block_state`, which requires all per-checkpoint dependency
+    /// records to be present (L2 block state, global state roots, checkpoint leaf, checkpoint root->id mapping, and
+    /// global-user-tree top proof) — so this does not depend on any single record's write order and detects
+    /// partially-written checkpoints left by either the old or new ordering. We only treat a `None` (genuinely
+    /// incomplete checkpoint) as a reason to roll back; any real DB/IO/deserialization error is propagated so we
+    /// never silently regress the checkpoint marker over transient or corruption failures.
+    async fn get_latest_available_l2_block_state(&self, checkpoint_id: u64) -> anyhow::Result<(u64, QEDL2BlockState)> {
+        let mut candidate_checkpoint_id = checkpoint_id;
+        loop {
+            match self.db.try_get_complete_l2_block_state(candidate_checkpoint_id).await? {
+                Some(info) => return Ok((candidate_checkpoint_id, info)),
+                None if candidate_checkpoint_id > 0 => {
+                    candidate_checkpoint_id -= 1;
+                }
+                None => {
+                    anyhow::bail!(
+                        "No complete checkpoint metadata found at or below checkpoint {}; database has no usable checkpoint metadata.",
+                        checkpoint_id
+                    );
+                }
+            }
+        }
+    }
+
+    async fn persist_checkpoint_metadata_range(
+        &mut self,
+        from_checkpoint_id: u64,
+        to_checkpoint_id: u64,
+        reset_checkpoint_id: u64,
+    ) -> anyhow::Result<Option<PsyRealmCoordinatorUpdate<N::F, N::QHash>>> {
+        if from_checkpoint_id > to_checkpoint_id {
+            return Ok(None);
+        }
+
+        let mut latest_sync_info = None;
+        for checkpoint_id in from_checkpoint_id..=to_checkpoint_id {
+            let sync_info: PsyRealmCoordinatorUpdate<N::F, N::QHash> = self
+                .coordinator_client
+                .rc_get_realm_sync_info(checkpoint_id, self.state.realm_id_u64)
+                .await?;
+
+            // CRITICAL VALIDATION: Ensure the local in-memory tree matches the Coordinator's canonical root for this checkpoint.
+            // If we have diverged (e.g. bad leaves or fork), we must reset the Backup Manager.
+            // We retrieve the proof for the leaf at `checkpoint_id`. The `get_append_root` from that proof
+            // represents the root of the tree at the moment that leaf was the right-most element (i.e., at that checkpoint).
+            let local_proof = self.checkpoint_tree_backup_manager.checkpoint_tree.get_leaf(checkpoint_id);
+            let local_calculated_root = local_proof.get_append_root::<N::HasherBase>();
+
+            if local_calculated_root != sync_info.checkpoint_sync_info.checkpoint_tree_root {
+                tracing::error!(
+                    "CRITICAL CHECKSUM MISMATCH: Local Checkpoint Tree Root {:?} != Coordinator Root {:?} at Checkpoint {}. Triggering Backup Manager Hard Reset.",
+                    local_calculated_root,
+                    sync_info.checkpoint_sync_info.checkpoint_tree_root,
+                    checkpoint_id
+                );
+
+                // Reset the backup manager to the last known committed state in the DB to clear invalid in-memory state.
+                self.checkpoint_tree_backup_manager
+                    .hard_reset_and_truncate(reset_checkpoint_id)
+                    .await?;
+
+                anyhow::bail!("Checkpoint Tree Divergence detected at checkpoint {}. Local state reset. Please retry sync.", checkpoint_id);
+            }
+
+            tracing::info!(
+                "sync checkpoint metadata: checkpoint_id={}, checkpoint_tree_root={:?}, block_state_checkpoint_id={}",
+                checkpoint_id,
+                sync_info.checkpoint_sync_info.checkpoint_tree_root,
+                sync_info.checkpoint_sync_info.block_state.checkpoint_id
+            );
+            // ORDERING IS LOAD-BEARING: these writes are not transactional, so a crash between them can leave a
+            // checkpoint half-written. Recovery (`try_get_complete_l2_block_state`) requires all dependency records,
+            // and the L2 block state is written LAST so that its presence implies every other record was already
+            // written. Writing it earlier would let a crash after the block state but before the roots/leaf/proofs
+            // leave a checkpoint that recovery believes is complete and never re-syncs.
+            tracing::debug!(
+                "set checkpoint global state roots {} {:?}",
+                checkpoint_id,
+                sync_info.checkpoint_sync_info.state_roots
+            );
+            self.db
+                .set_checkpoint_global_state_roots(checkpoint_id, &sync_info.checkpoint_sync_info.state_roots)
+                .await?;
+            self.db
+                .set_checkpoint_leaf_data(checkpoint_id, &sync_info.checkpoint_sync_info.checkpoint_leaf)
+                .await?;
+            tracing::debug!(
+                "committing checkpoint proof: {:?}",
+                &local_proof.to_append_proof::<N::HasherBase>()
+            );
+
+            self.db
+                .checkpoint_tree_injest_merkle_proof(checkpoint_id, &local_proof.to_append_proof::<N::HasherBase>())
+                .await?;
+            self.db
+                .set_checkpoint_root_hash_to_id_mapping(
+                    sync_info.checkpoint_sync_info.checkpoint_tree_root,
+                    sync_info.checkpoint_sync_info.checkpoint_id,
+                )
+                .await?;
+
+            self.db
+                .global_user_tree_set_top_tree_merkle_proof(checkpoint_id, &sync_info.merkle_proof_to_realm_root)
+                .await?;
+
+            // Sentinel write — must remain the final persisted metadata for this checkpoint (see note above).
+            self.db
+                .set_l2_block_state(checkpoint_id, &sync_info.checkpoint_sync_info.block_state)
+                .await?;
+
+            latest_sync_info = Some(sync_info);
+        }
+
+        Ok(latest_sync_info)
+    }
+
     async fn sync_contract_heights(&self, start_id: u32, end_id: u32, checkpoint_id: u64) -> anyhow::Result<()> {
+        if start_id == end_id {
+            return Ok(());
+        }
+        if start_id > end_id {
+            // A regressing next_contract_id is never expected: contract ids are monotonic, so local > remote
+            // means local state leads the coordinator (reorg, fork, or DB inconsistency). Silently returning here
+            // would advance the checkpoint marker while keeping stale, too-high contract heights in the DB. Fail
+            // loudly so the inconsistency surfaces and triggers recovery instead of being baked into committed state.
+            anyhow::bail!(
+                "next_contract_id regressed (local={}, remote={}, checkpoint={}); local contract state leads the coordinator. \
+                 Refusing to advance with stale contract heights — manual/recovery intervention required.",
+                start_id,
+                end_id,
+                checkpoint_id
+            );
+        }
+
+        tracing::info!(
+            "Syncing contract heights: local={}, remote={}, checkpoint={}",
+            start_id,
+            end_id,
+            checkpoint_id
+        );
+
         let batch_size = 1000u32;
         let diff = end_id - start_id;
         let full_batches = diff / batch_size;
@@ -317,6 +437,18 @@ where
     async fn fetch_and_set_contract_heights(&self, start_id: u32, end_id: u32, checkpoint_id: u64) -> anyhow::Result<()> {
         let ids: Vec<u64> = (start_id..end_id).map(|x| x as u64).collect();
         let heights = self.coordinator_client.rc_get_contract_tree_state_heights(checkpoint_id, ids.clone()).await?;
+        // `zip` would silently drop trailing contract ids if the coordinator returned fewer heights, leaving
+        // those contracts unset. Fail loudly instead so a truncated/mismatched response cannot corrupt state.
+        if heights.len() != ids.len() {
+            anyhow::bail!(
+                "Contract height count mismatch at checkpoint {}: requested {} ids ({}..{}), got {} heights",
+                checkpoint_id,
+                ids.len(),
+                start_id,
+                end_id,
+                heights.len()
+            );
+        }
         let mapping: Vec<(u64, u8)> = ids.into_iter().zip(heights.into_iter()).collect();
         self.db.set_contract_tree_heights(checkpoint_id, &mapping).await?;
         Ok(())

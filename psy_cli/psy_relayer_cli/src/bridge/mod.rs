@@ -11,3 +11,4 @@ pub mod prove_proxy_client;
 pub mod l1_signer;
 pub mod propose_withdrawals;
 pub mod prove_bridge;
+pub mod regen_groth16_keystore;

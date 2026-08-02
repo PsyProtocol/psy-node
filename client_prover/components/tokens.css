@@ -11,7 +11,7 @@
 
   --cp-text-primary: #f4f4f4;
   --cp-text-secondary: #8a8a8a;
-  --cp-text-tertiary: #666666;
+  --cp-text-tertiary: #949494;
 
   --cp-accent-primary: #00e5a8;
   --cp-accent-primary-dim: rgba(0, 229, 168, 0.16);
@@ -64,4 +64,8 @@
   --font-sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
   --font-display: var(--font-sans);
   --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root { scroll-behavior: auto; }
 }

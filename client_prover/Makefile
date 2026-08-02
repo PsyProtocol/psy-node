@@ -1,12 +1,20 @@
+export SQLX_OFFLINE=true
+
 # All builds now go through the root workspace
 ROOT_DIR := $(shell cd .. && pwd)
 PROFILE := release
 BIN_DIR := $(ROOT_DIR)/target/$(PROFILE)
-ROOT_CONFIG_PATH := $(CURDIR)/psy-genesis/config.json
+ROOT_CONFIG_PATH := $(CURDIR)/config.json
 PRIVATE_KEYS_FILE ?= $(ROOT_DIR)/private_keys.json
 CARGO := cd $(ROOT_DIR) && PSY_CONFIG_PATH=$(ROOT_CONFIG_PATH) cargo
 USER_CLI := $(BIN_DIR)/psy_user_cli
 LOG_LEVEL := psy_ups_circuit=trace,psy_dpn_circuit=trace,psy_user_cli=debug,psy_common_circuit=trace,psy_network_circuit=trace,psy_prover=trace,psy_client_data=trace,plonky2=error
+
+BACKUP ?= false
+ifeq ($(BACKUP),true)
+	# configure backup credentials through the standard provider credential chain or environment variables
+	export PSY_BACKUP_BUCKET=psy-backup
+endif
 
 default: build
 
@@ -14,7 +22,7 @@ default: build
 	default build check fix fmt install clean help \
 	run-prove-proxy get-public-key wallet random-wallet \
 	register-user register-random-user register-sdc-user \
-	deploy-contract multi-contract-call \
+	deploy-contract get-deploy-contract-cmd multi-contract-call \
 	mint mint-sdc \
 	transfer claim return-back claim-rewards withdraw \
 	get-slot-value \
@@ -24,7 +32,7 @@ default: build
 	get-user-tree-root get-user-tree-leaf-hash get-user-tree-merkle-proof get-user-sub-tree-merkle-proof \
 	get-user-registration-tree-root get-user-registration-tree-leaf-hash get-user-registration-tree-merkle-proof \
 	get-user-contract-tree-root get-user-contract-state-tree-root get-user-contract-tree-merkle-proof get-user-contract-state-tree-merkle-proof \
-	get-psy-sdc-fingerprint get-endcap-common-data
+	get-psy-sdc-fingerprint get-endcap-common-data generate-trace prove-trace
 
 check:
 	@$(CARGO) check --workspace --all-targets --tests --benches --examples --bins
@@ -86,7 +94,11 @@ USER1_ID                 := 1
 
 SDC_PATH                 := "sdc.json"
 SDC_FINGERPRINT          := "136ed39299c17a8cc4ea84e0b676e74c70d2a1668abaf346088d2df4087304c5"
-SDK_KEY_FINGERPRINT      := "ade963d92bbf8772d671fd90a15e00e34897fc3ef6733dc588e1976ebfd222e0"
+SD_KEY_FINGERPRINT      := "38755910c4dfb3c9bef528a4af697edced7e2607a6b769d054c4985a7000f0eb"
+TRACE_FILE               ?= trace.json
+METHOD_NAME              ?= simple_transfer
+TX_INPUTS                ?= [0, 11000000000]
+
 WITHDRAW_DEST_CHAIN_ID   ?= 1
 WITHDRAW_TOKEN_ADDRESS   ?= 0x0000000000000000000000001111111111111111111111111111111111111111
 WITHDRAW_RECIPIENT       ?= 0x0000000000000000000000002222222222222222222222222222222222222222
@@ -134,6 +146,13 @@ deploy-contract:
 	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) deploy-contract --private-key=${USER0_PRIVATE_KEY} --contract-path ${PWD}/token.json --is-deploy
 	@echo "USER1 deploying token contract..."
 	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) deploy-contract --private-key=${USER1_PRIVATE_KEY} --contract-path ${PWD}/token.json --is-deploy
+
+get-deploy-contract-cmd:
+	@echo "Deploying contracts..."
+	@echo "USER0 deploying token contract..."
+	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) deploy-contract --private-key=${USER0_PRIVATE_KEY} --contract-path ${PWD}/token.json --output-path ./genesis_contracts.json
+	@echo "USER1 deploying token contract..."
+	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) deploy-contract --private-key=${USER1_PRIVATE_KEY} --contract-path ${PWD}/token.json --output-path ./genesis_contracts.json
 
 multi-contract-call:
 	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) call -p ${USER0_PRIVATE_KEY} --contract-id ${CONTRACT_ID}
@@ -262,37 +281,49 @@ get-endcap-common-data:
 	@$(USER_CLI) get-user-end-cap-common-data
 
 get-sd-key-fingerprint:
-	@RUST_LOG=$${RUST_LOG:-info} $(USER_CLI) wallet sdk-key-fingerprint \
+	@RUST_LOG=$${RUST_LOG:-info} $(USER_CLI) wallet sd-key-fingerprint \
 		--allowed-contract-id 5 \
+		--allowed-contract-id 0 \
+		--allowed-contract-id 0 \
     	--allowed-method-id 3375543263 \
+		--allowed-method-id 354447671 \
+		--allowed-method-id 2923993647 \
 		--expected-tx-count 3
 
 make register-sd-key-user:
 	@RUST_LOG=$${RUST_LOG:-info} $(USER_CLI) register-user \
-		--sign-type sdk-key \
+		--sign-type sd-key \
 		-p $(USER4_PRIVATE_KEY) \
-		--fingerprint $(SDK_KEY_FINGERPRINT)
+		--fingerprint $(SD_KEY_FINGERPRINT)
 
 faucet:
 	@RUST_LOG=$${RUST_LOG:-info} $(USER_CLI) call \
-    	--sign-type sdk-key \
+    	--sign-type sd-key \
     	--private-key $(USER4_PRIVATE_KEY) \
-    	--fingerprint $(SDK_KEY_FINGERPRINT) \
-    	--sdk-key-allowed-contract-id 5 \
-    	--sdk-key-allowed-method-id 3375543263 \
-    	--sdk-key-expected-tx-count 3 \
+    	--fingerprint $(SD_KEY_FINGERPRINT) \
+    	--sd-key-allowed-contract-id 5 \
+		--sd-key-allowed-contract-id 0 \
+		--sd-key-allowed-contract-id 0 \
+    	--sd-key-allowed-method-id 3375543263 \
+		--sd-key-allowed-method-id 354447671 \
+		--sd-key-allowed-method-id 2923993647 \
+    	--sd-key-expected-tx-count 3 \
     	--contract-id 5 \
     	--method-name faucet \
     	--inputs '[0, 666000000000]'
 
 error-faucet:
 	@RUST_LOG=$${RUST_LOG:-info} $(USER_CLI) call \
-    	--sign-type sdk-key \
+    	--sign-type sd-key \
     	--private-key $(USER4_PRIVATE_KEY) \
-    	--fingerprint $(SDK_KEY_FINGERPRINT) \
-    	--sdk-key-allowed-contract-id 5 \
-    	--sdk-key-allowed-method-id 3375543263 \
-    	--sdk-key-expected-tx-count 3 \
+    	--fingerprint $(SD_KEY_FINGERPRINT) \
+    	--sd-key-allowed-contract-id 5 \
+		--sd-key-allowed-contract-id 0 \
+		--sd-key-allowed-contract-id 0 \
+    	--sd-key-allowed-method-id 3375543263 \
+		--sd-key-allowed-method-id 354447671 \
+		--sd-key-allowed-method-id 2923993647 \
+    	--sd-key-expected-tx-count 3 \
     	--contract-id 0 \
     	--method-name simple_transfer \
     	--inputs '[0, 666000000000]' \
@@ -302,6 +333,38 @@ error-faucet:
 
 claim-faucet:
 	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) call -p ${USER0_PRIVATE_KEY} --contract-id ${CONTRACT_ID} --method-name simple_claim --inputs "[262144]" --sign-type $(SIGN_TYPE)
+
+################################################################################
+#                          Trace generation & proving                           #
+################################################################################
+# Variables (override on command line):
+#   TRACE_FILE   — path to trace JSON          (default: trace.json)
+#   CONTRACT_ID  — contract to call            (default: 0)
+#   METHOD_NAME  — method to call              (default: simple_mint)
+#   TX_INPUTS    — JSON array of u64 inputs    (default: [1000000000000])
+#
+# Multicall example (two CFC steps):
+#   make generate-trace \
+#     CONTRACT_ID="0 --contract-id 0" \
+#     METHOD_NAME="simple_mint --method-name simple_transfer" \
+#     TX_INPUTS="[1000000000000] --inputs [1,250000000000]"
+
+# Generate an unproved trace from a contract call.
+generate-trace:
+	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) generate-tx-trace \
+		--private-key ${CURRENT_USER_PRIVATE_KEY} \
+		--sign-type ${SIGN_TYPE} \
+		--contract-id ${CONTRACT_ID} \
+		--method-name ${METHOD_NAME} \
+		--inputs '${TX_INPUTS}' \
+		--output ${TRACE_FILE}
+
+# Prove a trace using the default graph path.
+prove-trace:
+	@RUST_LOG=${LOG_LEVEL} $(USER_CLI) prove-tx-trace \
+		--private-key ${CURRENT_USER_PRIVATE_KEY} \
+		--sign-type ${SIGN_TYPE} \
+		--input ${TRACE_FILE}
 
 help:
 	@grep -E '^[a-zA-Z_-]+:.*?' $(lastword $(MAKEFILE_LIST)) | cut -d: -f1 | sort

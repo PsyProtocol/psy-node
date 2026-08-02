@@ -627,8 +627,8 @@ impl<
                 .map_err(|e| anyhow::anyhow!("error reading status {:?}", e))?
                 .should_revert_processing_changes
         };
+        let initial_total_end_caps_processed = self.guta_planner.total_end_caps_processed;
 
-        let total_end_caps_processed = self.guta_planner.total_end_caps_processed;
 
         if needs_revert {
             tracing::info!(
@@ -652,6 +652,7 @@ impl<
                 "GUTA updates gatherer for pending id {} flushed to disk before finalize.",
                 self.status.gathering_unique_pending_id
             );
+            let total_end_caps_processed = self.guta_planner.total_end_caps_processed;
             let result = self
                 .guta_planner
                 .finalize_with_reward_ids(&self.config.checkpoint_tree, tree, self.config.temp_db.clone(), 0, 0)
@@ -702,6 +703,7 @@ impl<
             }
         }
 
+        let total_end_caps_processed = initial_total_end_caps_processed;
         let guta_header = GlobalUserTreeAggregatorHeaderWithJobId {
             job_id: QProvingJobDataID::new_invalid_job_id(),
             header: GlobalUserTreeAggregatorHeader {

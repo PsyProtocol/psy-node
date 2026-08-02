@@ -1,44 +1,34 @@
-use std::{fs, path::Path, str::FromStr};
+use std::{fs, path::Path};
 
-use anyhow::Ok;
-use psy_client_common::data::qhashout::QHashOut;
-use psy_client_data::config::store_config::{PsyHasher, C, D, F};
-use psy_config::network_constants::MAX_CONTRACT_STATE_TREE_HEIGHT;
-use psy_crypto::hash::traits::qhashable::QFieldHashable;
-use psy_prover::{
-    session::gen_contract_deploy_and_circuits_for_functions,
-    wallet::memory_wallet::{get_public_key_info, get_zk_fingerprint},
-};
+use psy_cli_common::key_utils::load_wallet_key_info;
+use psy_client_data::config::store_config::{C, D};
+use psy_prover::session::gen_contract_deploy_and_circuits_for_functions;
 use psy_provider::{
     provider::{QUserRpcProvider, RpcProvider},
     request::QDeployContractRPCRequest,
 };
-use psy_vm::dpn::vm::def::DPNFunctionCircuitDefinition;
+use psy_vm::dpn::vm::def::{derive_state_tree_height, DPNFunctionCircuitDefinition};
 
 use super::{args::DeployContractArgs, contract_abi_upload};
+use crate::result::{CommandResult, DeployResult, DeployStatus};
 
-// #[cfg(feature = "is_sync")]
-pub async fn run(args: DeployContractArgs) -> anyhow::Result<()> {
+pub async fn run(args: DeployContractArgs) -> anyhow::Result<CommandResult> {
     tracing::info!("deploying contract");
 
     let psy_config = psy_config::PsyConfigGoldilocks::from_file(&args.rpc_config)?;
     let rpc_config = psy_config.get_current_network()?.clone();
     let rpc_provider = RpcProvider::new_with_config(&rpc_config)?;
 
-    let private_key = QHashOut::<F>::from_str(&args.private_key)?;
-    let fingerprint = args
-        .fingerprint
-        .as_ref()
-        .map(|f| -> anyhow::Result<_> { QHashOut::<F>::from_str(f).map_err(|e| anyhow::anyhow!("parse fingerprint error: {}", e)) })
-        .transpose()?;
-
-    let fingerprint = fingerprint.unwrap_or_else(|| get_zk_fingerprint());
-    let deployer = get_public_key_info::<F>(private_key, fingerprint)?.qfhash::<PsyHasher>();
+    // `WalletSourceArgs` intentionally makes --sign-type live. A legacy
+    // FINGERPRINT environment value is rejected in main before parsing so it
+    // cannot silently select a different deployer identity.
+    let info = load_wallet_key_info(&args.wallet, false)?;
+    let deployer = info.public_key_hash;
 
     let defs_array: Vec<DPNFunctionCircuitDefinition> = serde_json::from_str(&fs::read_to_string(args.contract_path)?)?;
 
     tracing::info!("getting contract state tree height");
-    let contract_state_tree_height = MAX_CONTRACT_STATE_TREE_HEIGHT as usize;
+    let contract_state_tree_height = derive_state_tree_height(&defs_array) as usize;
 
     tracing::info!("generating circuits");
     let (_result_circuits, deploy_cmd) =
@@ -47,12 +37,9 @@ pub async fn run(args: DeployContractArgs) -> anyhow::Result<()> {
     match args.output_path {
         Some(output_path) => {
             tracing::debug!("deploy cmd save to {}", output_path);
-            let deploy_cmd_path = Path::new(&output_path);
-            fs::write(deploy_cmd_path, serde_json::to_string(&deploy_cmd)?)?;
+            fs::write(Path::new(&output_path), serde_json::to_string(&deploy_cmd)?)?;
         }
-        None => {
-            tracing::debug!("deploy cmd: {}", serde_json::to_string(&deploy_cmd)?);
-        }
+        None => tracing::debug!("deploy cmd: {}", serde_json::to_string(&deploy_cmd)?),
     }
 
     if args.is_deploy {
@@ -67,9 +54,13 @@ pub async fn run(args: DeployContractArgs) -> anyhow::Result<()> {
             .deploy_contract(QDeployContractRPCRequest { deploy_contract: deploy_cmd })
             .await?;
         tracing::info!("contract deployed: {}", contract_uuid);
-        // tracing::info!("contract deployed: {:?}",
-        // ContractUUID::from_str(&contract_uuid)?);
+        return Ok(CommandResult::Deploy(DeployResult {
+            contract_id: None,
+            tx_hash: contract_uuid.to_string(),
+            network: psy_config.current_network_name().to_string(),
+            status: DeployStatus::Submitted,
+        }));
     }
 
-    Ok(())
+    Ok(CommandResult::generic("deploy-contract"))
 }

@@ -10,7 +10,7 @@ use psy_plonky2_basic_helpers::{
         get_agg_state_transition_type_d_common_data, get_agg_user_registration_deploy_guta_type_f_common_data, get_end_cap_type_e_common_data,
         get_guta_type_c_common_data,
     },
-    verifier::{alt::AltVerifierOnlyCircuitData, generic_circuit_library::GenericCircuitVerifier},
+    verifier::generic_circuit_library::GenericCircuitVerifier,
 };
 use psy_plonky2_circuits::{
     circuit_library::end_cap_verifier_data::get_end_cap_alt_verifier_data_for_network, coordinator::coordinator_helper::QEDCoordinatorCircuitManager, guta::guta_helper::QEDGUTACircuitManager,
@@ -234,6 +234,9 @@ fn run_gen_config<N: QNetworkCircuitConstants>() -> anyhow::Result<(String, Stri
 
     gcv.common.print_common();
 
+    // Generate Groth16 setup for bridge wrap circuit
+    #[cfg(feature = "gnark-wrap")]
+    generate_groth16_setup::<N>(&coordinator_circuits)?;
     let gcv_ser = gcv.to_serialized();
 
     let library_data = serde_json::to_string(&gcv_ser.library)?;
@@ -290,6 +293,135 @@ where
     println!("[END: cached_common_data.rs]");
 
     Ok((cached_circuit_library, cached_common_data))
+}
+
+#[cfg(feature = "gnark-wrap")]
+fn generate_groth16_setup<N: QNetworkCircuitConstants>(
+    coordinator_circuits: &QEDCoordinatorCircuitManager<plonky2::plonk::config::PoseidonGoldilocksConfig, 2>,
+) -> anyhow::Result<()> {
+    use psy_plonky2_circuits::{
+        bridge::circuits::{bridge_agg_final::BridgeAggFinalCircuit, bridge_wrap::BridgeWrapCircuit},
+    };
+
+    type C = plonky2::plonk::config::PoseidonGoldilocksConfig;
+    const D: usize = 2;
+    type F = plonky2::field::goldilocks_field::GoldilocksField;
+
+    let checkpoint_circuit = &coordinator_circuits.checkpoint_root_transition;
+    let checkpoint_common = checkpoint_circuit.get_common_circuit_data_ref();
+    let checkpoint_fp = checkpoint_circuit.get_fingerprint();
+    let checkpoint_cap_height = checkpoint_circuit.get_verifier_config_ref().constants_sigmas_cap.height();
+
+    println!("[Groth16Setup] Building BridgeAggFinalCircuit...");
+    let final_circuit = BridgeAggFinalCircuit::<C, D>::prebuild_final_circuit(
+        checkpoint_common,
+        checkpoint_cap_height,
+        checkpoint_fp,
+        checkpoint_fp,
+        N::CHECKPOINT_TREE_HEIGHT_USIZE,
+        N::GLOBAL_USER_TREE_HEIGHT_USIZE,
+        N::GLOBAL_CONTRACT_TREE_HEIGHT_USIZE,
+        N::MAX_CONTRACT_STATE_TREE_HEIGHT_USIZE,
+    );
+
+    let bridge_agg_common = &final_circuit.circuit_data.common;
+    let bridge_agg_fp = final_circuit.get_fingerprint();
+    let bridge_agg_verifier = &final_circuit.circuit_data.verifier_only;
+    let bridge_agg_cap_height = bridge_agg_verifier.constants_sigmas_cap.height();
+
+    println!("[Groth16Setup] Building BridgeWrapCircuit + SharedGroth16Wrapper...");
+    let bridge_wrap = BridgeWrapCircuit::new(bridge_agg_common, bridge_agg_fp, bridge_agg_cap_height);
+    let keystore = std::env::var("HOME")
+        .map(|h| format!("{h}/.psy/keystore"))
+        .unwrap_or_else(|_| "/tmp/psy-keystore".to_string());
+    std::fs::create_dir_all(&keystore)?;
+
+    let shared_wrapper = bridge_wrap.into_shared_groth16_wrapper(keystore.clone());
+    let wrapper_circuit_data = &shared_wrapper.wrapped_circuit.wrapper_circuit.data;
+
+    println!("[Groth16Setup] Serializing wrapper circuit data...");
+    let common_json = serde_json::to_string(&wrapper_circuit_data.common)?;
+    let verifier_json = serde_json::to_string(&wrapper_circuit_data.verifier_only)?;
+    let n_pi = wrapper_circuit_data.common.num_public_inputs;
+    println!("[Groth16Setup] Wrapper circuit num_public_inputs = {n_pi}");
+
+    // The WrappedCircuit (Groth16WrapperParameters) has a fixed config regardless of the inner
+    // circuit, so the proof structure (cap sizes, FRI params) is the same across checkpoint
+    // fingerprint changes. We reuse an existing wrapper proof from /tmp/plonky2_proof/ for
+    // generate_groth16_proof will run groth16.Setup after stale keys are removed.
+    // only the JSON structure (array sizes, public_inputs count) matters.
+    let proof_json = match find_existing_wrapper_proof(n_pi) {
+        Some(json) => {
+            println!("[Groth16Setup] Reusing existing wrapper proof from /tmp/plonky2_proof/");
+            json
+        }
+        None => {
+            println!("[Groth16Setup] No existing wrapper proof found with {n_pi} public inputs.");
+            println!("[Groth16Setup] Skipping groth16 setup — run a devnet prove cycle first to");
+            println!("[Groth16Setup] generate a wrapper proof in /tmp/plonky2_proof/, then re-run.");
+            return Ok(());
+        }
+    };
+
+    // Remove stale keys so setup does not skip.
+    for fname in ["circuit_groth16.bin", "pk_groth16.bin", "vk_groth16.bin"] {
+        let p = format!("{keystore}/{fname}");
+        if std::path::Path::new(&p).exists() {
+            println!("[Groth16Setup] Removing stale {p}");
+            std::fs::remove_file(&p)?;
+        }
+    }
+
+    println!("[Groth16Setup] Calling generate_groth16_proof to force setup...");
+    let (proof_result, vk_result) =
+        gnark_plonky2_verifier_ffi::generate_groth16_proof(&common_json, &proof_json, &verifier_json, &keystore);
+    if proof_result.starts_with("error:") {
+        anyhow::bail!("generate_groth16_proof failed: {proof_result}");
+    }
+    if vk_result.starts_with("error:") {
+        anyhow::bail!("generate_groth16_proof failed: {vk_result}");
+    }
+    println!("[Groth16Setup] Groth16 setup written to {keystore}");
+
+    println!("[Groth16Setup] Exporting Solidity verifier...");
+    let sol = gnark_plonky2_verifier_ffi::export_solidity_verifier(&keystore);
+    if sol.starts_with("error:") {
+        anyhow::bail!("export_solidity_verifier failed: {sol}");
+    }
+    let sol_path = "psy-contracts/src/GnarkGroth16Verifier.sol";
+    std::fs::write(sol_path, &sol)?;
+    println!("[Groth16Setup] Solidity verifier written to {sol_path}");
+
+    Ok(())
+}
+
+#[cfg(feature = "gnark-wrap")]
+/// Search /tmp/plonky2_proof/ for a wrapper proof JSON with the expected number of public inputs.
+/// The WrappedCircuit (Groth16WrapperParameters) has a fixed config, so any existing wrapper proof
+/// has the correct JSON structure (cap sizes, FRI params) for setup — only the public_inputs
+/// count must match.
+fn find_existing_wrapper_proof(expected_num_pi: usize) -> Option<String> {
+    let proof_dir = "/tmp/plonky2_proof";
+    let entries = std::fs::read_dir(proof_dir).ok()?;
+    for entry in entries.flatten() {
+        let proof_path = entry.path().join("proof_with_public_inputs.json");
+        if !proof_path.exists() {
+            continue;
+        }
+        let content = match std::fs::read_to_string(&proof_path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        // Quick check: does the public_inputs array length match?
+        if let Ok(proof_val) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(pi) = proof_val.get("public_inputs").and_then(|v| v.as_array()) {
+                if pi.len() == expected_num_pi {
+                    return Some(content);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn gen_write_config() -> anyhow::Result<()> {

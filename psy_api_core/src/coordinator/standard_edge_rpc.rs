@@ -15,6 +15,8 @@ use psy_data::{
         },
     }
 };
+use crate::CheckpointJobStats;
+
 #[rpc(server, client, namespace = "psy")]
 pub trait CoordinatorEdgeRpc<F, Hash, JobId, ZKProof>: NodeEdgeWorkerRpcServer<Hash, JobId> {
     // Basic methods
@@ -65,6 +67,10 @@ pub trait CoordinatorEdgeRpc<F, Hash, JobId, ZKProof>: NodeEdgeWorkerRpcServer<H
     // Checkpoint methods
     #[method(name = "get_checkpoint_leaf_data")]
     async fn get_checkpoint_leaf_data(&self, checkpoint_id: u64) -> RpcResult<PQEDCheckpointLeaf<F, Hash>>;
+
+    /// Return proof job statistics for a committed checkpoint.
+    #[method(name = "get_job_stats")]
+    async fn get_job_stats(&self, checkpoint_id: u64) -> RpcResult<CheckpointJobStats>;
 
     #[method(name = "get_checkpoint_global_state_roots")]
     async fn get_checkpoint_global_state_roots(&self, checkpoint_id: u64) -> RpcResult<PQEDCheckpointGlobalStateRoots<Hash>>;

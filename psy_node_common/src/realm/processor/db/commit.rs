@@ -177,12 +177,13 @@ where
             .checkpoint_tree
             .get_leaf(checkpoint_sync_info.checkpoint_id);
 
-        self.db
-            .set_l2_block_state(checkpoint_sync_info.checkpoint_id, &checkpoint_sync_info.block_state)
-            .await?;
-        self.db
-            .set_l2_latest_block_state(&checkpoint_sync_info.block_state)
-            .await?;
+        // ORDERING IS LOAD-BEARING: these writes are not transactional. Recovery
+        // (`get_latest_available_l2_block_state` / `try_get_complete_l2_block_state`) treats a checkpoint as
+        // complete based on its core metadata records, so the L2 block state MUST be written LAST — after the
+        // state roots, checkpoint leaf, tree proof, and root mapping. Writing it earlier would let a crash mid-way
+        // leave a checkpoint that looks complete (L2 present) but is missing its proof/root mapping, which recovery
+        // would then never backfill. The `latest_l2_block_state` singleton is advanced by the caller
+        // (`commit_state`) only after `set_latest_checkpoint_id`, so it can never lead the committed marker.
         self.db
             .set_checkpoint_global_state_roots(checkpoint_sync_info.checkpoint_id, &checkpoint_sync_info.state_roots)
             .await?;
@@ -201,6 +202,11 @@ where
 
         self.db
             .set_checkpoint_root_hash_to_id_mapping(checkpoint_sync_info.checkpoint_tree_root, checkpoint_sync_info.checkpoint_id)
+            .await?;
+
+        // Sentinel write — must remain the final persisted metadata for this checkpoint (see note above).
+        self.db
+            .set_l2_block_state(checkpoint_sync_info.checkpoint_id, &checkpoint_sync_info.block_state)
             .await?;
 
         Ok(previous)
@@ -284,6 +290,11 @@ where
         // from disk SO LONG AS THE checkpoint_id is not set!!!!
         let previous_checkpoint_id = self.state.last_committed_checkpoint_id;
         self.db.set_latest_checkpoint_id(checkpoint_id).await?;
+        // Advance the `latest_l2_block_state` singleton only AFTER the checkpoint marker is committed, so the RPC
+        // `get_latest_l2_block_state` can never expose a block state that leads the committed `latest_checkpoint_id`.
+        self.db
+            .set_l2_latest_block_state(&coordinator_update.checkpoint_sync_info.block_state)
+            .await?;
         if checkpoint_id > 0 && previous_checkpoint_id < checkpoint_id {
             if let Some((previous_pending_id, _)) = self
                 .db

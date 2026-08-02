@@ -24,7 +24,7 @@ use crate::bridge::constants::{BRIDGE_USER_ID_U64, WITHDRAWAL_TREE_CONTRACT_ID};
 
 #[derive(Clone, Args, Serialize, Deserialize)]
 pub struct ProposeWithdrawalsArgs {
-    #[clap(env, long, default_value = "psy-genesis/config.json", env)]
+    #[clap(env, long, default_value = "config.json", env)]
     pub rpc_config: String,
     #[command(flatten)]
     pub wallet: WalletSourceArgs,
@@ -57,11 +57,13 @@ pub struct PendingWithdrawal {
     pub event_id: i64,
     pub checkpoint_id: u64,
     pub user_id: u64,
-    pub destination_chain_id: u64,
+    pub sender_user_id: u64,
+    pub contract_id: u64,
+    pub destination_chain_index: u64,
     pub token_address: [u32; 8],
     pub amount: [u32; 8],
     pub recipient: [u32; 8],
-    pub nonce: u64,
+    pub nonce: [u32; 8],
     pub leaf_hash: String,
 }
 
@@ -86,16 +88,22 @@ pub fn build_append_withdrawal_calls(withdrawals: &[PendingWithdrawal]) -> anyho
 
     let mut calls = Vec::with_capacity(withdrawals.len());
     for w in withdrawals {
-        // append_withdrawal(destination_chain_index, token_address, amount, recipient, nonce)
-        let mut inputs = Vec::with_capacity(26);
-        inputs.push(w.destination_chain_id);
+        // New append_withdrawal input order:
+        //   sender_user_id, token_contract_id, destination_chain_index,
+        //   token[8], amount[8], recipient[8], nonce[8]
+        let mut inputs = Vec::with_capacity(3 + 8 * 4);
+        inputs.push(w.sender_user_id);
+        inputs.push(w.contract_id);
+        inputs.push(w.destination_chain_index);
         inputs.extend(w.token_address.iter().map(|&v| v as u64));
         inputs.extend(w.amount.iter().map(|&v| v as u64));
         inputs.extend(w.recipient.iter().map(|&v| v as u64));
-        inputs.push(w.nonce);
+        inputs.extend(w.nonce.iter().map(|&v| v as u64));
         tracing::info!(
-            destination_chain_id = w.destination_chain_id,
-            nonce = w.nonce,
+            sender_user_id = w.sender_user_id,
+            contract_id = w.contract_id,
+            destination_chain_index = w.destination_chain_index,
+            nonce = ?w.nonce,
             leaf_hash = %w.leaf_hash,
             "building individual append_withdrawal call"
         );
@@ -127,14 +135,17 @@ struct BridgeWithdrawalEntry {
     pub event_id: i64,
     pub checkpoint_id: u64,
     pub user_id: u64,
-    pub destination_chain_id: u64,
+    pub sender_user_id: u64,
+    pub contract_id: u64,
+    pub destination_chain_index: u64,
     pub token_address_limbs: Option<[u32; 8]>,
     pub token_address_hex: Option<String>,
     pub amount_limbs: Option<[u32; 8]>,
     pub amount_hex: Option<String>,
     pub recipient_limbs: Option<[u32; 8]>,
     pub recipient_hex: Option<String>,
-    pub nonce: u64,
+    pub nonce_limbs: Option<[u32; 8]>,
+    pub nonce_hex: Option<String>,
     pub leaf_hash: String,
 }
 
@@ -169,6 +180,17 @@ impl BridgeWithdrawalEntry {
             .recipient_hex
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("bridge withdrawal entry missing recipient_limbs and recipient_hex"))?;
+        parse_u32x8_from_hex(hex)
+    }
+
+    fn nonce_words(&self) -> anyhow::Result<[u32; 8]> {
+        if let Some(words) = self.nonce_limbs {
+            return Ok(words);
+        }
+        let hex = self
+            .nonce_hex
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("bridge withdrawal entry missing nonce_limbs and nonce_hex"))?;
         parse_u32x8_from_hex(hex)
     }
 }
@@ -242,11 +264,11 @@ fn save_state_checkpoint(state_file: &Option<String>, next_from_checkpoint: u64)
 async fn fetch_bridge_withdrawals(
     http: &reqwest::Client,
     base_url: &str,
-    initial_offset: u64,
+    initial_event_offset: u64,
 ) -> anyhow::Result<Vec<BridgeWithdrawalEntry>> {
     let mut all_withdrawals: Vec<BridgeWithdrawalEntry> = Vec::new();
     let limit: u32 = 10_000;
-    let mut offset: u64 = initial_offset;
+    let mut offset: u64 = initial_event_offset;
 
     loop {
         let url = format!(
@@ -357,39 +379,32 @@ fn parse_u32x8_from_hex(hex_str: &str) -> anyhow::Result<[u32; 8]> {
     Ok(out)
 }
 
-fn u32x8_be_to_hex(words: [u32; 8]) -> String {
-    let mut bytes = [0u8; 32];
-    for (i, &w) in words.iter().enumerate() {
-        bytes[i * 4..(i + 1) * 4].copy_from_slice(&w.to_be_bytes());
-    }
-    format!("0x{}", hex::encode(bytes))
-}
-
 pub(crate) fn compute_withdrawal_leaf_words(
+    sender_user_id: u64,
     recipient: [u32; 8],
     token_address: [u32; 8],
     amount: [u32; 8],
-    nonce: u64,
-    destination_chain_id: u64,
+    nonce: [u32; 8],
+    destination_chain_index: u64,
 ) -> anyhow::Result<[u32; 8]> {
-    let nonce_u32 = u32::try_from(nonce)
-        .map_err(|_| anyhow::anyhow!("withdrawal nonce {} exceeds uint32 bridge encoding", nonce))?;
-    let destination_chain_u32 = u32::try_from(destination_chain_id).map_err(|_| {
+    let sender_user_id_u32 = u32::try_from(sender_user_id)
+        .map_err(|_| anyhow::anyhow!("sender_user_id {} exceeds uint32 bridge encoding", sender_user_id))?;
+    let destination_chain_u32 = u32::try_from(destination_chain_index).map_err(|_| {
         anyhow::anyhow!(
-            "destination_chain_id {} exceeds uint32 bridge encoding",
-            destination_chain_id
+            "destination_chain_index {} exceeds uint32 bridge encoding",
+            destination_chain_index
         )
     })?;
 
-    let felts = recipient
-        .into_iter()
-        .chain(token_address)
-        .chain(amount)
-        .map(GoldilocksField::from_canonical_u32)
-        .chain([
-            GoldilocksField::from_canonical_u32(nonce_u32),
-            GoldilocksField::from_canonical_u32(destination_chain_u32),
-        ])
+    // Leaf hash preimage (34 felts), matching the withdrawal-batch-claim circuit:
+    //   sender_user_id, recipient[8], token_address[8], amount[8],
+    //   nonce[8], destination_chain_index
+    let felts = std::iter::once(GoldilocksField::from_canonical_u32(sender_user_id_u32))
+        .chain(recipient.into_iter().map(GoldilocksField::from_canonical_u32))
+        .chain(token_address.into_iter().map(GoldilocksField::from_canonical_u32))
+        .chain(amount.into_iter().map(GoldilocksField::from_canonical_u32))
+        .chain(nonce.into_iter().map(GoldilocksField::from_canonical_u32))
+        .chain(std::iter::once(GoldilocksField::from_canonical_u32(destination_chain_u32)))
         .collect::<Vec<_>>();
     let leaf_hash = QHashOut(PoseidonHash::hash_no_pad(&felts));
     let elems = leaf_hash.0.elements;
@@ -406,52 +421,59 @@ pub(crate) fn compute_withdrawal_leaf_words(
 }
 
 fn compute_withdrawal_leaf_hash(
+    sender_user_id: u64,
     recipient: [u32; 8],
     token_address: [u32; 8],
     amount: [u32; 8],
-    nonce: u64,
-    destination_chain_id: u64,
+    nonce: [u32; 8],
+    destination_chain_index: u64,
 ) -> anyhow::Result<String> {
-    Ok(u32x8_be_to_hex(compute_withdrawal_leaf_words(
+    let words = compute_withdrawal_leaf_words(
+        sender_user_id,
         recipient,
         token_address,
         amount,
         nonce,
-        destination_chain_id,
-    )?))
+        destination_chain_index,
+    )?;
+    let mut bytes = [0u8; 32];
+    for (i, &w) in words.iter().enumerate() {
+        bytes[i * 4..(i + 1) * 4].copy_from_slice(&w.to_be_bytes());
+    }
+    Ok(format!("0x{}", hex::encode(bytes)))
 }
 
 pub async fn fetch_pending_bridge_withdrawals(
     args: &ProposeWithdrawalsArgs,
     _from_checkpoint: u64,
     _to_checkpoint_exclusive: u64,
-    initial_offset: u64,
+    initial_event_offset: u64,
 ) -> anyhow::Result<Vec<PendingWithdrawal>> {
     let psy_config = psy_config::PsyConfigGoldilocks::from_file(&args.rpc_config)?;
     let http = build_default_http_client()?;
     let services_url = resolve_services_url(&args.services_url, &psy_config)?;
 
     let mut service_withdrawals =
-        fetch_bridge_withdrawals(&http, &services_url, initial_offset).await?;
+        fetch_bridge_withdrawals(&http, &services_url, initial_event_offset).await?;
     service_withdrawals.sort_by_key(|w| w.event_id);
     tracing::info!(
         bridge_withdrawals = service_withdrawals.len(),
-        initial_offset,
+        initial_event_offset,
         "fetched bridge withdrawals (single pass, no retry)"
     );
 
     let mut withdrawals: Vec<PendingWithdrawal> = Vec::new();
 
     for withdrawal in service_withdrawals {
-        // `initial_offset` is derived from withdrawal_tree_next_index, so the
-        // services pagination cursor is already aligned with the first
-        // unappended withdrawal. We intentionally do not re-filter by
+        // `initial_event_offset` is the global withdrawal cursor persisted on
+        // the L2 withdrawal tree. It aligns with the first unappended entry in
+        // the services event stream, so we intentionally do not re-filter by
         // checkpoint window here.
         tracing::debug!(
             event_id = withdrawal.event_id,
             checkpoint_id = withdrawal.checkpoint_id,
-            nonce = withdrawal.nonce,
-            destination_chain_id = withdrawal.destination_chain_id,
+            nonce = ?withdrawal.nonce_limbs,
+            destination_chain_index = withdrawal.destination_chain_index,
             leaf_hash = %withdrawal.leaf_hash,
             "evaluated bridge withdrawal"
         );
@@ -459,18 +481,22 @@ pub async fn fetch_pending_bridge_withdrawals(
         let token_words = withdrawal.token_address_words()?;
         let amount_words = withdrawal.amount_words()?;
         let recipient_words = withdrawal.recipient_words()?;
+        let nonce_words = withdrawal.nonce_words()?;
         let local_leaf = compute_withdrawal_leaf_hash(
+            withdrawal.sender_user_id,
             recipient_words,
             token_words,
             amount_words,
-            withdrawal.nonce,
-            withdrawal.destination_chain_id,
+            nonce_words,
+            withdrawal.destination_chain_index,
         )?;
         if local_leaf != withdrawal.leaf_hash {
             tracing::error!(
+                sender_user_id = withdrawal.sender_user_id,
+                destination_chain_index = withdrawal.destination_chain_index,
                 local = %local_leaf,
                 services = %withdrawal.leaf_hash,
-                nonce = withdrawal.nonce,
+                nonce = ?nonce_words,
                 "leaf hash mismatch; services may have stale/incorrect data"
             );
             continue;
@@ -480,11 +506,13 @@ pub async fn fetch_pending_bridge_withdrawals(
             event_id: withdrawal.event_id,
             checkpoint_id: withdrawal.checkpoint_id,
             user_id: withdrawal.user_id,
-            destination_chain_id: withdrawal.destination_chain_id,
+            sender_user_id: withdrawal.sender_user_id,
+            contract_id: withdrawal.contract_id,
+            destination_chain_index: withdrawal.destination_chain_index,
             token_address: token_words,
             amount: amount_words,
             recipient: recipient_words,
-            nonce: withdrawal.nonce,
+            nonce: nonce_words,
             leaf_hash: withdrawal.leaf_hash,
         });
     }
@@ -604,16 +632,20 @@ pub async fn run_and_get_withdrawal_root(
     );
 
     // ── Step 4: build append_withdrawal contract calls ───────────────────────
+    // New input order: sender_user_id, token_contract_id, destination_chain_index,
+    //   token[8], amount[8], recipient[8], nonce[8]
     let contract_calls: Vec<ContractCallArgs> = discovered
         .iter()
         .map(|w| ContractCallArgs {
             contract_id: WITHDRAWAL_TREE_CONTRACT_ID as u64,
             method_name: "append_withdrawal".to_string(),
-            inputs: std::iter::once(w.destination_chain_id)
+            inputs: std::iter::once(w.sender_user_id)
+                .chain(std::iter::once(w.contract_id))
+                .chain(std::iter::once(w.destination_chain_index))
                 .chain(w.token_address.iter().map(|&v| v as u64))
                 .chain(w.amount.iter().map(|&v| v as u64))
                 .chain(w.recipient.iter().map(|&v| v as u64))
-                .chain(std::iter::once(w.nonce))
+                .chain(w.nonce.iter().map(|&v| v as u64))
                 .collect(),
         })
         .collect();
@@ -719,38 +751,48 @@ pub async fn run(args: ProposeWithdrawalsArgs) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    fn u32x8_be_to_hex(words: [u32; 8]) -> String {
+        let mut bytes = [0u8; 32];
+        for (i, &word) in words.iter().enumerate() {
+            bytes[i * 4..(i + 1) * 4].copy_from_slice(&word.to_be_bytes());
+        }
+        format!("0x{}", hex::encode(bytes))
+    }
+
     #[test]
-    fn debug_withdrawal_leaf_hash_encodings() -> anyhow::Result<()> {
+    fn withdrawal_leaf_hash_binds_sender_user_id() -> anyhow::Result<()> {
         let recipient_hex = "0x000000000000000000000000f39fd6e51aad88f6f4ce6ab8827279cfffb92266";
         let token_hex = "0x00000000000000000000000068b1d87f95878fe05b998f19b66f4baba5de1aed";
         let amount_hex = "0x000000000000000000000000000000000000000000000000000000e8d4a51000";
-        let nonce = 3_598_904_774u64;
-        let destination_chain_id = 0u64;
-        let expected_words = [
-            0xb266cae6,
-            0x9694ffe0,
-            0xf0551a56,
-            0x81482205,
-            0x35c48e19,
-            0x17ffb896,
-            0x3c70cafb,
-            0x0f98d424,
-        ];
+        let nonce_hex = "0xd6a2e0c60100000000000000000000000000000000000000000000000000000a";
+        let destination_chain_index = 0u64;
 
         let recipient = parse_u32x8_from_hex(recipient_hex)?;
         let token_address = parse_u32x8_from_hex(token_hex)?;
         let amount = parse_u32x8_from_hex(amount_hex)?;
+        let nonce = parse_u32x8_from_hex(nonce_hex)?;
 
-        let actual_words = compute_withdrawal_leaf_words(
+        let sender0 = compute_withdrawal_leaf_words(
+            0,
             recipient,
             token_address,
             amount,
             nonce,
-            destination_chain_id,
+            destination_chain_index,
         )?;
+        let sender1 = compute_withdrawal_leaf_words(
+            1,
+            recipient,
+            token_address,
+            amount,
+            nonce,
+            destination_chain_index,
+        )?;
+        assert_ne!(sender0, sender1, "sender_user_id must change withdrawal leaf hash");
         assert_eq!(
-            actual_words, expected_words,
-            "leaf word encoding must match on-chain append event"
+            compute_withdrawal_leaf_hash(0, recipient, token_address, amount, nonce, destination_chain_index)?,
+            u32x8_be_to_hex(sender0),
+            "hex helper must match limb helper"
         );
 
         Ok(())

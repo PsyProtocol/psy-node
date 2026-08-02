@@ -2,8 +2,10 @@ use std::str::FromStr;
 
 use anyhow::Context;
 use base64::Engine;
-use nostr_sdk::prelude::*;
-use plonky2::field::types::{Field, PrimeField64};
+#[cfg(not(target_arch = "wasm32"))]
+use futures_util::{SinkExt, StreamExt};
+use nostr_sdk::{prelude::*, UnsignedEvent};
+use plonky2::field::types::{Field, Field64, PrimeField64};
 use psy_client_common::{
     args::{WalletSessionArgs, WalletSourceArgs},
     data::qhashout::QHashOut,
@@ -18,11 +20,9 @@ use psy_common_circuit::circuits::traits::qstandard::QStandardCircuit;
 use psy_crypto::{
     hash::{
         merkle::core::MerkleProofCore,
-        traits::{
-            hasher::{FieldQHasher, PoseidonHasher},
-            qhashable::QFieldHashable,
-        },
+        traits::hasher::{FieldQHasher, PoseidonHasher},
     },
+    shield_address::{derive_note_commitment, shield_address_to_bytes32},
     signature::zk::wallet::SimplePsyPrivateKey,
 };
 use psy_dpn_circuit::circuits::privacy::private_note_inclusion::PrivateNoteInclusionCircuit;
@@ -30,13 +30,15 @@ use psy_prover::session::WalletSession;
 use psy_provider::provider::RpcProvider;
 use rand::RngCore;
 use tokio::time::{sleep, Duration};
+#[cfg(not(target_arch = "wasm32"))]
+use tokio_tungstenite::{connect_async, tungstenite::Message};
 
+use crate::result::{CommandResult, TransactionResult, TransactionStatus};
 use crate::subcommand::{
     args::PrivateTransferArgs,
     note_proof_common::{qhash_to_u64x4, NoteProofOutput},
     submit_end_cap_proof,
 };
-
 const NOTE_TREE_HEIGHT: usize = 20; // 2^20 = 1048576 notes
 
 #[derive(Clone)]
@@ -47,22 +49,169 @@ struct GenerateNoteProofInput {
     note_root_slot: u64,
     amount: u64,
     owner: String,
-    note_secret_hash: Vec<u64>,
+    note_secret: Vec<u64>,
     nullifier_secret: Vec<u64>,
     checkpoint_id: u64,
     output: String,
 }
 
-async fn nostr_send_private_msg(sender_nsec: &str, recipient_npub: &str, relay_url: &str, content: &str) -> anyhow::Result<()> {
-    let sender_keys = Keys::parse(sender_nsec)?;
+fn tag_limbs(values: &[u64; 4]) -> [String; 4] {
+    [values[0].to_string(), values[1].to_string(), values[2].to_string(), values[3].to_string()]
+}
+
+fn sample_canonical_secret_limb(mut next_u64: impl FnMut() -> u64) -> u64 {
+    loop {
+        let candidate = next_u64();
+        if candidate < F::ORDER {
+            return candidate;
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn publish_event_to_relay(relay_url: &str, event: &Event) -> anyhow::Result<String> {
+    let payload = serde_json::json!(["EVENT", serde_json::from_str::<serde_json::Value>(&event.as_json())?]);
+    let (mut ws, _) = connect_async(relay_url).await?;
+    ws.send(Message::Text(payload.to_string())).await?;
+
+    let expected_id = event.id.to_string();
+    let result = tokio::time::timeout(Duration::from_secs(15), async {
+        while let Some(msg) = ws.next().await {
+            let msg = msg?;
+            let text = match msg {
+                Message::Text(t) => t,
+                Message::Binary(b) => String::from_utf8(b.to_vec())?,
+                _ => continue,
+            };
+            let value: serde_json::Value = serde_json::from_str(&text)?;
+            let Some(items) = value.as_array() else { continue };
+            if items.first().and_then(|v| v.as_str()) != Some("OK") {
+                continue;
+            }
+            if items.get(1).and_then(|v| v.as_str()) != Some(expected_id.as_str()) {
+                continue;
+            }
+            let accepted = items.get(2).and_then(|v| v.as_bool()).unwrap_or(false);
+            if !accepted {
+                let reason = items.get(3).and_then(|v| v.as_str()).unwrap_or("relay rejected event");
+                anyhow::bail!(reason.to_string());
+            }
+            return Ok::<(), anyhow::Error>(());
+        }
+        anyhow::bail!("relay closed before acknowledging event")
+    })
+    .await;
+    match result {
+        Ok(inner) => inner?,
+        Err(_) => anyhow::bail!("publish timeout"),
+    }
+    tracing::info!("Nostr sent event_id={}", expected_id);
+    let _ = ws.close(None).await;
+    Ok(expected_id)
+}
+
+/// Publish a v2 two-event private transfer backup (proof + secrets) mirroring
+/// deposit.rs `publish_deposit_backup`. Event 1 is a plaintext GiftWrap with
+/// the PrivateNoteInclusionCircuit proof; Event 2 is a NIP-59 encrypted
+/// gift-wrap containing nullifier_secret + note_secret. Both share
+/// `backup_id = note_commitment` (64 lowercase hex).
+#[cfg(not(target_arch = "wasm32"))]
+async fn publish_private_transfer_backup(
+    note_data: &NoteProofOutput,
+    note_commitment_q: QHashOut<F>,
+    note_secret: [u64; 4],
+    nullifier_secret: [u64; 4],
+    recipient_npub: &str,
+    relay_url: &str,
+) -> anyhow::Result<(String, String)> {
     let recipient_pk = PublicKey::parse(recipient_npub)?;
-    let client = Client::new(sender_keys);
-    client.add_relay(relay_url).await?;
-    client.connect().await;
-    let output = client.send_private_msg(recipient_pk, content, []).await?;
-    tracing::info!("Nostr sent: success={}, failed={}", output.success.len(), output.failed.len());
-    client.disconnect().await;
-    Ok(())
+    let sender_keys = Keys::generate();
+    let backup_id = hex::encode(shield_address_to_bytes32(note_commitment_q));
+
+    let note_proof_raw = serde_json::json!({
+        "note_proof_bincode_b64": base64::engine::general_purpose::STANDARD.encode(&note_data.note_proof),
+        "note_proof_fingerprint": note_data.note_proof_fingerprint,
+        "owner": note_data.owner,
+        "amount": note_data.amount,
+        "user_tree_root": note_data.user_tree_root,
+        "checkpoint_id": note_data.checkpoint_id,
+        "note_root_slot": note_data.note_root_slot,
+        "token_contract_id": note_data.token_contract_id.as_str(),
+        "nullifier": note_data.nullifier,
+    })
+    .to_string();
+
+    let proof_content = serde_json::json!({
+        "type": "psy_private_transfer_proof",
+        "version": 2,
+        "backup_id": backup_id,
+        "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis(),
+        "note_proof_raw": note_proof_raw,
+        "metadata": {
+            "note_commitment": backup_id,
+            "shield_address": tag_limbs(&note_data.owner).join(":"),
+            "nullifier": tag_limbs(&note_data.nullifier).join(":"),
+            "amount": note_data.amount,
+            "checkpoint_id": note_data.checkpoint_id,
+            "note_root_slot": note_data.note_root_slot,
+            "token_contract_id": note_data.token_contract_id.as_str(),
+        }
+    })
+    .to_string();
+
+    let created_at = Timestamp::from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs());
+    let unsigned_proof = UnsignedEvent::new(
+        sender_keys.public_key(),
+        created_at,
+        Kind::GiftWrap,
+        vec![
+            Tag::custom(TagKind::p(), [recipient_pk.to_hex()]),
+            Tag::custom(TagKind::t(), ["psy_private_transfer_proof".to_string()]),
+            Tag::custom(TagKind::custom("backup_id"), [backup_id.clone()]),
+            Tag::custom(TagKind::custom("shield_address"), tag_limbs(&note_data.owner)),
+            Tag::custom(TagKind::custom("nullifier"), tag_limbs(&note_data.nullifier)),
+            Tag::custom(TagKind::custom("token_contract_id"), [note_data.token_contract_id.clone()]),
+        ],
+        proof_content,
+    );
+    let proof_event = unsigned_proof.sign_with_keys(&sender_keys)?;
+
+    let secrets_content = serde_json::json!({
+        "type": "psy_private_transfer_secrets",
+        "version": 2,
+        "backup_id": backup_id,
+        "nullifier_secret": tag_limbs(&nullifier_secret),
+        "note_secret": tag_limbs(&note_secret),
+    })
+    .to_string();
+    let rumor = EventBuilder::text_note(secrets_content).build(sender_keys.public_key());
+    let secrets_event = EventBuilder::gift_wrap(
+        &sender_keys,
+        &recipient_pk,
+        rumor,
+        [
+            Tag::custom(TagKind::t(), ["psy_private_transfer_secrets".to_string()]),
+            Tag::custom(TagKind::custom("backup_id"), [backup_id]),
+        ],
+    )
+    .await?;
+
+    let proof_event_id = publish_event_to_relay(relay_url, &proof_event).await?;
+    let secrets_event_id = publish_event_to_relay(relay_url, &secrets_event).await?;
+
+    Ok((proof_event_id, secrets_event_id))
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn publish_private_transfer_backup(
+    _note_data: &NoteProofOutput,
+    _note_commitment_q: QHashOut<F>,
+    _note_secret: [u64; 4],
+    _nullifier_secret: [u64; 4],
+    _recipient_npub: &str,
+    _relay_url: &str,
+) -> anyhow::Result<(String, String)> {
+    anyhow::bail!("nostr send is not supported in wasm build")
 }
 
 async fn wait_next_checkpoint(provider: &RpcProvider, previous_checkpoint_id: u64) -> anyhow::Result<u64> {
@@ -376,7 +525,7 @@ async fn build_membership_proof_from_previous_checkpoint(
     note_root_slot: u64,
     amount: u64,
     owner: QHashOut<F>,
-    note_secret_hash: QHashOut<F>,
+    note_commitment: QHashOut<F>,
     checkpoint_id: u64,
 ) -> anyhow::Result<MerkleProofCore<QHashOut<F>>> {
     let user_provider = provider.with_user_id_owned(sender_user_id);
@@ -425,7 +574,7 @@ async fn build_membership_proof_from_previous_checkpoint(
 
     let value_hash = QHashOut::<F>::from_values(amount, 0, 0, 0);
     let inner = PoseidonHasher::q_two_to_one(owner, value_hash);
-    let commitment = PoseidonHasher::q_two_to_one(inner, note_secret_hash);
+    let commitment = PoseidonHasher::q_two_to_one(inner, note_commitment);
 
     let mut siblings = Vec::with_capacity(20);
     let mut zero = QHashOut::<F>::from_values(0, 0, 0, 0);
@@ -458,7 +607,6 @@ async fn run_note_proof_with_membership_proof(
     let rpc_config = psy_config.get_current_network()?.clone();
 
     let sender_sk = QHashOut::<F>::from_str(&input.private_key).map_err(|e| anyhow::anyhow!("Invalid private key: {}", e))?;
-    let sender_pk_param = SimplePsyPrivateKey::new(sender_sk).get_public_key_param::<PoseidonHasher>();
 
     let provider = RpcProvider::new_with_config(&rpc_config)?;
     let checkpoint_id = if input.checkpoint_id == u64::MAX {
@@ -512,8 +660,8 @@ async fn run_note_proof_with_membership_proof(
         note_membership_proof.root
     );
     if note_membership_proof.root != note_root_slot_proof.value {
-        tracing::error!(
-            "run_note_proof root mismatch: membership_root={} != slot_value={} (checkpoint={}, slot={})",
+        anyhow::bail!(
+            "run_note_proof root mismatch: membership_root={} != slot_value={} (checkpoint={}, slot={}); checkpoint does not contain this note root",
             note_membership_proof.root,
             note_root_slot_proof.value,
             checkpoint_id,
@@ -532,12 +680,7 @@ async fn run_note_proof_with_membership_proof(
         .map_err(|e| anyhow::anyhow!("user tree merkle proof failed: {}", e))?;
     let global_user_tree_root = user_tree_proof.root;
 
-    let note_secret_hash = QHashOut::<F>::from_values(
-        input.note_secret_hash[0],
-        input.note_secret_hash[1],
-        input.note_secret_hash[2],
-        input.note_secret_hash[3],
-    );
+    let note_secret = QHashOut::<F>::from_values(input.note_secret[0], input.note_secret[1], input.note_secret[2], input.note_secret[3]);
     let nullifier_secret = QHashOut::<F>::from_values(
         input.nullifier_secret[0],
         input.nullifier_secret[1],
@@ -555,7 +698,7 @@ async fn run_note_proof_with_membership_proof(
         user_leaf,
         owner,
         amount,
-        randomness: note_secret_hash,
+        note_secret,
         note_membership_proof,
         note_root_slot_proof,
         contract_proof,
@@ -569,10 +712,15 @@ async fn run_note_proof_with_membership_proof(
         psy_config::network_constants::MAX_CONTRACT_STATE_TREE_HEIGHT as usize,
         NOTE_TREE_HEIGHT,
     );
-    let proof = circuit.prove(&circuit_input)?;
     let fingerprint = circuit.get_fingerprint();
+    let proof = circuit.prove(&circuit_input)?;
+    let fingerprint_after_prove = circuit.get_fingerprint();
+    tracing::info!(
+        fingerprint_before_prove = %fingerprint,
+        fingerprint_after_prove = %fingerprint_after_prove,
+        "PrivateNoteInclusion fingerprint"
+    );
     let proof_bytes = bincode::serialize(&proof)?;
-    let proof_b64 = base64::engine::general_purpose::STANDARD.encode(proof_bytes);
 
     let nullifier = PoseidonHasher::q_hash_many(&nullifier_secret.0.elements);
 
@@ -583,8 +731,9 @@ async fn run_note_proof_with_membership_proof(
         user_tree_root: qhash_to_u64x4(global_user_tree_root),
         checkpoint_id,
         note_root_slot: input.note_root_slot,
+        token_contract_id: input.contract_id.to_string(),
         note_proof_fingerprint: qhash_to_u64x4(fingerprint),
-        note_proof_bincode_b64: proof_b64,
+        note_proof: proof_bytes,
     };
 
     let json = serde_json::to_string_pretty(&output)?;
@@ -592,10 +741,10 @@ async fn run_note_proof_with_membership_proof(
     Ok(())
 }
 
-pub async fn run(args: PrivateTransferArgs) -> anyhow::Result<()> {
+pub async fn run(args: PrivateTransferArgs) -> anyhow::Result<CommandResult> {
     let mut rng = rand::thread_rng();
-    let note_secret_hash = vec![rng.next_u64(), rng.next_u64(), rng.next_u64(), rng.next_u64()];
-    let nullifier_secret = vec![rng.next_u64(), rng.next_u64(), rng.next_u64(), rng.next_u64()];
+    let note_secret = std::array::from_fn(|_| sample_canonical_secret_limb(|| rng.next_u64()));
+    let nullifier_secret = std::array::from_fn(|_| sample_canonical_secret_limb(|| rng.next_u64()));
 
     let receiver_hex = args
         .receiver
@@ -603,7 +752,8 @@ pub async fn run(args: PrivateTransferArgs) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("--receiver (or --owner alias) is required; receiver should provide shielded address out-of-band"))?;
     let owner_hash = QHashOut::<F>::from_str(&receiver_hex).map_err(|e| anyhow::anyhow!("Invalid receiver: {}", e))?;
     let sender_sk = QHashOut::<F>::from_str(&args.private_key).map_err(|e| anyhow::anyhow!("Invalid private key: {}", e))?;
-    let note_secret_hash_q = QHashOut::<F>::from_values(note_secret_hash[0], note_secret_hash[1], note_secret_hash[2], note_secret_hash[3]);
+    let note_commitment_q = derive_note_commitment(nullifier_secret, note_secret);
+    let note_commitment = qhash_to_u64x4(note_commitment_q);
 
     let psy_config = psy_config::PsyConfigGoldilocks::from_file(&args.rpc_config)?;
     let rpc_config = psy_config.get_current_network()?.clone();
@@ -639,10 +789,10 @@ pub async fn run(args: PrivateTransferArgs) -> anyhow::Result<()> {
     let mut inputs = Vec::<u64>::new();
     inputs.extend_from_slice(&owner_u64);
     inputs.push(args.amount);
-    inputs.extend_from_slice(&note_secret_hash);
+    inputs.extend_from_slice(&note_commitment);
 
     // 1) Execute private_transfer contract call.
-    let end_user_leaf_hash = submit_end_cap_proof::run_with_end_user_leaf_hash(WalletSessionArgs {
+    let (tx_hash, end_user_leaf_hash) = submit_end_cap_proof::run_with_end_user_leaf_hash(WalletSessionArgs {
         rpc_config: args.rpc_config.clone(),
         wallet: WalletSourceArgs {
             sign_type: args.sign_type.clone(),
@@ -650,9 +800,9 @@ pub async fn run(args: PrivateTransferArgs) -> anyhow::Result<()> {
             keystore_path: None,
             wallet_password: None,
             fingerprint: None,
-            sdk_key_allowed_contract_id: vec![],
-            sdk_key_allowed_method_id: vec![],
-            sdk_key_expected_tx_count: 2,
+            sd_key_allowed_contract_id: vec![],
+            sd_key_allowed_method_id: vec![],
+            sd_key_expected_tx_count: 2,
         },
         contract_id: vec![args.contract_id],
         method_name: vec!["private_transfer".to_string()],
@@ -663,7 +813,11 @@ pub async fn run(args: PrivateTransferArgs) -> anyhow::Result<()> {
         wait_until_confirmation: true,
     })
     .await?;
-    tracing::info!("private_transfer endcap submitted! end_user_leaf_hash={}", end_user_leaf_hash);
+    tracing::info!(
+        "private_transfer endcap submitted! tx_hash={} end_user_leaf_hash={}",
+        tx_hash,
+        end_user_leaf_hash
+    );
 
     // Build membership proof from the checkpoint just before private_transfer.
     let note_membership_proof = build_membership_proof_from_previous_checkpoint(
@@ -673,7 +827,7 @@ pub async fn run(args: PrivateTransferArgs) -> anyhow::Result<()> {
         args.note_root_slot,
         args.amount,
         owner_hash,
-        note_secret_hash_q,
+        note_commitment_q,
         checkpoint_before,
     )
     .await?;
@@ -719,12 +873,6 @@ pub async fn run(args: PrivateTransferArgs) -> anyhow::Result<()> {
             })?
         }
     };
-    tracing::info!(
-        "private_transfer selected checkpoint_after={} (baseline checkpoint={}, note_count slot {} changed)",
-        checkpoint_after,
-        checkpoint_before,
-        note_count_slot
-    );
 
     // 2) Generate note proof JSON from next checkpoint state.
     run_note_proof_with_membership_proof(
@@ -735,8 +883,8 @@ pub async fn run(args: PrivateTransferArgs) -> anyhow::Result<()> {
             note_root_slot: args.note_root_slot,
             amount: args.amount,
             owner: receiver_hex.clone(),
-            note_secret_hash: note_secret_hash.clone(),
-            nullifier_secret: nullifier_secret.clone(),
+            note_secret: note_secret.to_vec(),
+            nullifier_secret: nullifier_secret.to_vec(),
             checkpoint_id: checkpoint_after,
             output: args.output.clone(),
         },
@@ -746,19 +894,45 @@ pub async fn run(args: PrivateTransferArgs) -> anyhow::Result<()> {
 
     // 3) Optionally send generated note proof over Nostr.
     let note_payload = std::fs::read_to_string(&args.output).with_context(|| format!("failed to read generated note proof {}", args.output))?;
-    match (&args.nostr_secret_key, &args.nostr_recipient_pubkey) {
-        (Some(nsec), Some(npub)) => {
-            nostr_send_private_msg(nsec, npub, &args.nostr_relay, &note_payload).await?;
-            println!("Note proof sent via Nostr relay {}", args.nostr_relay);
-        }
-        (None, None) => {
-            println!("Note proof saved to {} (file mode)", args.output);
-        }
-        _ => {
-            anyhow::bail!("--nostr-secret-key and --nostr-recipient-pubkey must be provided together");
-        }
+    let note_data: NoteProofOutput = serde_json::from_str(&note_payload).context("generated note proof is not valid json")?;
+    if let Some(npub) = &args.nostr_recipient_pubkey {
+        let (proof_id, secrets_id) = publish_private_transfer_backup(
+            &note_data,
+            note_commitment_q,
+            note_secret,
+            nullifier_secret,
+            npub,
+            &args.nostr_relay,
+        )
+        .await?;
+        println!(
+            "private transfer backup sent via Nostr: proof={}, secrets={}",
+            proof_id, secrets_id
+        );
+    } else {
+        println!("Note proof saved to {} (file mode)", args.output);
     }
 
-    println!("private_transfer note_secret_hash: {:?}", note_secret_hash);
-    Ok(())
+    println!("private_transfer note_commitment: {:?}", note_commitment);
+    Ok(CommandResult::Transaction(TransactionResult {
+        transaction_hash: tx_hash,
+        user_id: Some(sender_user_id),
+        status: TransactionStatus::Confirmed,
+        confirmed_checkpoint: Some(checkpoint_after),
+        network: psy_config.current_network_name().to_string(),
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secret_limb_sampling_rejects_noncanonical_values() {
+        let mut candidates = [F::ORDER, u64::MAX, F::ORDER - 1].into_iter();
+
+        let sampled = sample_canonical_secret_limb(|| candidates.next().expect("candidate sequence exhausted"));
+
+        assert_eq!(sampled, F::ORDER - 1);
+    }
 }

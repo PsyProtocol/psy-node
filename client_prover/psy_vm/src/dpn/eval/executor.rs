@@ -505,6 +505,11 @@ impl<S: StateBackend> VmExecutor<S> {
                 let words: Vec<u64> = def.inputs.iter().map(|&id| registers.get_by_encoded_id(id)).collect();
                 let full_words: Vec<u64> = keccak_words_u32_be_to_u32_vec(&words).into_iter().map(|x| x as u64).collect();
                 registers.set_array(DPNBuiltInDataType::U32TargetArray, def.index, full_words);
+            } else if def.op_type == DPNOpType::SplitBits {
+                let value = registers.get_by_encoded_id(def.inputs[1]);
+                let num_bits = def.inputs[0];
+                let bits: Vec<u64> = (0..num_bits).map(|i| (value >> i) & 1).collect();
+                registers.set_array(DPNBuiltInDataType::BoolArray, def.index, bits);
             }
             op_counts.total_operations += 1;
         }
@@ -543,7 +548,7 @@ impl<S: StateBackend> VmExecutor<S> {
         // Build state delta
         let state_delta = Self::compute_state_delta(&state_reads, &state_writes);
 
-        // Collect events — filter by condition (matching vm/exec.rs runtime)
+        // Collect events — filter by condition (matching vm/exec.rs runtime).
         let events = circuit
             .events
             .iter()
@@ -1414,7 +1419,7 @@ impl<S: StateBackend> VmExecutor<S> {
                 Ok(vec![0; c.num_outputs as usize]) // Placeholder
             }
             DPNStateCmd::InvokeExternalContractFunctionDeferred(_) => {
-                Ok(vec![]) // No return for deferred calls
+                Ok(vec![0; 4]) // Deferred call returns call-hash[4]
             }
 
             // IMT write result: old_value[4] + new_value[4] = 8 felts

@@ -25,7 +25,9 @@ use psy_plonky2_circuits::{
             bridge_agg::BridgeAggProveResult,
             bridge_wrap::{BridgeWrapCircuit, DepositBatchWrapCircuit, UncompressedGroth16ProofData},
         },
-        gadgets::tree_root_in_contract_state::TreeRootInContractStateWitnessInput,
+        gadgets::{
+            tree_root_in_contract_state::TreeRootInContractStateWitnessInput,
+        },
     },
     circuit_library::get_plonky2_circuit_library_and_prover_for_network,
     coordinator::coordinator_helper::QEDCoordinatorCircuitManager,
@@ -66,8 +68,6 @@ const NETWORK_TYPE: PsyChainNetworkType = PsyChainNetworkType::LocalDevnet;
 const GLOBAL_USER_TREE_HEIGHT: usize = PsyNetworkLocalDevnetConstants::GLOBAL_USER_TREE_HEIGHT_USIZE;
 const GLOBAL_CONTRACT_TREE_HEIGHT: usize = PsyNetworkLocalDevnetConstants::GLOBAL_CONTRACT_TREE_HEIGHT_USIZE;
 const CONTRACT_STATE_TREE_HEIGHT: usize = PsyNetworkLocalDevnetConstants::MAX_CONTRACT_STATE_TREE_HEIGHT_USIZE;
-
-
 
 pub(crate) fn cached_bridge_coordinator_circuits() -> anyhow::Result<&'static QEDCoordinatorCircuitManager<C, D>> {
     static CACHE: OnceLock<QEDCoordinatorCircuitManager<C, D>> = OnceLock::new();
@@ -298,7 +298,8 @@ pub struct ProveBridgeAggOutput {
     pub from_checkpoint: u64,
     pub to_checkpoint: u64,
     pub num_checkpoints_aggregated: u64,
-    pub deposits_consumed: u64,
+    /// L1 chain index used for this proof (read from config; no longer a circuit PI).
+    pub l1_chain_index: u64,
     pub bridge_agg_public_inputs_count: usize,
     pub bridge_agg_public_inputs: Vec<String>,
     pub groth16_proof: UncompressedGroth16ProofData,
@@ -311,7 +312,7 @@ pub struct ProveBridgeAggOutput {
     pub withdrawal_tree_root: String,
     pub withdrawal_subtree_root: String,
     pub withdrawal_merkle_proof: [String; 9],
-    pub bridge_user_id: String,
+    pub end_checkpoint_index: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -321,7 +322,7 @@ pub struct DepositLeafData {
     pub l2_token_contract_id: [u32; 8],
     pub amount: [u32; 8],
     pub chain_index: u32,
-    pub note_secret_hash: [u32; 8],
+    pub note_commitment: [u32; 8],
 }
 
 #[derive(Clone, Debug)]
@@ -347,7 +348,7 @@ pub struct BridgeProveResult {
     pub to_checkpoint: u64,
     pub num_checkpoints_aggregated: u64,
     pub proof_path: PathBuf,
-    pub deposits_consumed: u64,
+    pub deposit_tree_root: String,
     pub withdrawal_tree_root: String,
 }
 
@@ -435,7 +436,7 @@ fn deposit_leaf_to_circuit(leaf: &DepositLeafData) -> CircuitDepositLeafData {
         l2_token_contract_id: leaf.l2_token_contract_id,
         amount: leaf.amount,
         chain_index: leaf.chain_index,
-        note_secret_hash: leaf.note_secret_hash,
+        note_commitment: leaf.note_commitment,
     }
 }
 
@@ -528,7 +529,7 @@ fn build_deposit_batch_append_call(
 }
 
 async fn fetch_deposit_batch_inputs(
-    deposits_consumed: u64,
+    target_deposit_count: u32,
     l1_rpc_url: &str,
     config: &L1DeploymentConfig,
     deployments_network: &str,
@@ -544,14 +545,17 @@ async fn fetch_deposit_batch_inputs(
     let pending_count = crate::bridge::api_client::eth_call_u256(&provider, bridge, pendingDepositCountCall {}).await?;
     let from_index = u256_to_u32("provedDepositCount", proved_count)?;
     let pending_index = u256_to_u32("pendingDepositCount", pending_count)?;
-    let to_index_u64 = u64::from(from_index) + deposits_consumed;
-    anyhow::ensure!(to_index_u64 <= u64::from(u32::MAX), "to_index exceeds u32 range");
-    let to_index = to_index_u64 as u32;
+    let to_index = target_deposit_count;
+    anyhow::ensure!(
+        from_index <= to_index,
+        "target_deposit_count {} < current provedDepositCount {}",
+        to_index,
+        from_index
+    );
     anyhow::ensure!(
         to_index <= pending_index,
-        "requested deposits exceed pending count: from_index={} deposits_consumed={} pending={}",
-        from_index,
-        deposits_consumed,
+        "target_deposit_count {} > pendingDepositCount {}",
+        to_index,
         pending_index
     );
 
@@ -594,7 +598,7 @@ async fn fetch_deposit_batch_inputs(
             l2_token_contract_id: bytes32_to_u32x8(event.l2TokenContractId),
             amount: u256_to_u32x8(event.amount),
             chain_index: u32::from(event.chainIndex),
-            note_secret_hash: bytes32_to_u32x8(event.noteSecretHash),
+            note_commitment: bytes32_to_u32x8(event.noteCommitment),
         };
         // Verify decoded data matches the on-chain leaf hash.
         let reconstructed = keccak_u32_words_be(&deposit_leaf_to_circuit(&leaf).to_u32_words());
@@ -620,24 +624,25 @@ async fn fetch_deposit_batch_inputs(
 pub async fn build_deposit_batch_append_calls(
     l1_rpc_url: &str,
     deployments_network: &str,
-    deposits_consumed: u64,
+    target_deposit_count: u32,
 ) -> anyhow::Result<Vec<DepositBatchAppendCall>> {
-    if deposits_consumed == 0 {
-        return Ok(Vec::new());
-    }
-
     let l1_config = load_l1_deployment_config(deployments_network)?;
     let inputs = fetch_deposit_batch_inputs(
-        deposits_consumed,
+        target_deposit_count,
         l1_rpc_url,
         &l1_config,
         deployments_network,
     )
     .await?;
+    if inputs.leaves.is_empty() {
+        // target equals current provedDepositCount: nothing to append.
+        return Ok(Vec::new());
+    }
+    let expected_len = (inputs.to_index - inputs.from_index) as usize;
     anyhow::ensure!(
-        inputs.leaves.len() == deposits_consumed as usize,
+        inputs.leaves.len() == expected_len,
         "deposit batch input length mismatch: expected {} got {}",
-        deposits_consumed,
+        expected_len,
         inputs.leaves.len()
     );
     anyhow::ensure!(
@@ -679,8 +684,6 @@ pub async fn run_prove_bridge_agg_with_result(
     to_checkpoint: u64,
     rpc_config: String,
     out_json: PathBuf,
-    deposits_consumed: u64,
-    l1_rpc_url: String,
     deployments_network: String,
 ) -> anyhow::Result<BridgeProveResult> {
     // Checkpoint 0 uses genesis transition proof path, not the normal
@@ -689,8 +692,8 @@ pub async fn run_prove_bridge_agg_with_result(
     anyhow::ensure!(from_checkpoint <= to_checkpoint, "from_checkpoint must be <= to_checkpoint");
     let num_checkpoints_aggregated = to_checkpoint - from_checkpoint + 1;
     anyhow::ensure!(
-        num_checkpoints_aggregated >= 2,
-        "bridge aggregation requires at least 2 checkpoints, got {} (from={} to={})",
+        num_checkpoints_aggregated >= 1,
+        "bridge aggregation requires at least 1 checkpoint, got {} (from={} to={})",
         num_checkpoints_aggregated,
         from_checkpoint,
         to_checkpoint
@@ -719,18 +722,13 @@ pub async fn run_prove_bridge_agg_with_result(
         from_checkpoint, to_checkpoint
     );
 
-    let mut checkpoint_proofs = Vec::new();
-    for cp_id in from_checkpoint..=to_checkpoint {
-        let proof_bytes = provider.get_checkpoint_state_transition_proof(cp_id).await?;
-        let proof: ProofWithPublicInputs<F, C, D> =
-            bincode::deserialize(&proof_bytes).map_err(|e| anyhow::format_err!("failed to deserialize checkpoint proof: {}", e))?;
-        let pi_hash = QHashOut::<F>::from_felt_slice(&proof.public_inputs);
-        tracing::info!(
-            "Fetched checkpoint {} proof PI hash: {:?}",
-            cp_id, pi_hash
-        );
-        checkpoint_proofs.push(proof);
-    }
+    let final_checkpoint_proof: ProofWithPublicInputs<F, C, D> = {
+        let proof_bytes = provider.get_checkpoint_state_transition_proof(to_checkpoint).await?;
+        bincode::deserialize(&proof_bytes)
+            .map_err(|e| anyhow::format_err!("failed to deserialize final checkpoint proof: {}", e))?
+    };
+    let pi_hash = QHashOut::<F>::from_felt_slice(&final_checkpoint_proof.public_inputs);
+    tracing::info!("Fetched final checkpoint {} proof PI hash: {:?}", to_checkpoint, pi_hash);
 
     let mut delta_merkle_proofs = Vec::new();
     let mut pre_delta_merkle_proofs = Vec::new();
@@ -787,8 +785,9 @@ pub async fn run_prove_bridge_agg_with_result(
         let prev_proof_bytes = provider
             .get_checkpoint_state_transition_proof(from_checkpoint - 1)
             .await?;
-        let prev_proof: ProofWithPublicInputs<F, C, D> = bincode::deserialize(&prev_proof_bytes)
-            .map_err(|e| anyhow::format_err!("failed to deserialize previous checkpoint proof: {}", e))?;
+        let prev_proof: ProofWithPublicInputs<F, C, D> =
+            bincode::deserialize(&prev_proof_bytes)
+                .map_err(|e| anyhow::format_err!("failed to deserialize previous checkpoint proof: {}", e))?;
         QHashOut::from_felt_slice(&prev_proof.public_inputs[..4])
     };
 
@@ -797,6 +796,8 @@ pub async fn run_prove_bridge_agg_with_result(
 
     let withdrawal_root_witness =
         fetch_tree_root_witness(&provider, to_checkpoint, BRIDGE_USER_ID_U64, WITHDRAWAL_TREE_CONTRACT_ID).await?;
+
+    let l1_chain_index = l1_config.l1_chain_index;
 
     // Fetch global state roots to bind the gadget's user_tree_root to the checkpoint leaf.
     let checkpoint_global_state_roots = {
@@ -820,7 +821,7 @@ pub async fn run_prove_bridge_agg_with_result(
         cap_height,
         checkpoint_state_transition_fingerprint,
         checkpoint_step_commit_fingerprint,
-        &checkpoint_proofs,
+        &final_checkpoint_proof,
         &checkpoint_verifier_data,
         &delta_merkle_proofs,
         &pre_delta_merkle_proofs,
@@ -844,8 +845,8 @@ pub async fn run_prove_bridge_agg_with_result(
     let bridge_agg_verifier_data = result.verifier_data;
 
     anyhow::ensure!(
-        bridge_agg_proof.public_inputs.len() >= 26,
-        "BridgeAgg proof public inputs too short: {}",
+        bridge_agg_proof.public_inputs.len() == 26,
+        "BridgeAgg proof public inputs width must be 26, got {}",
         bridge_agg_proof.public_inputs.len()
     );
     anyhow::ensure!(
@@ -876,8 +877,13 @@ pub async fn run_prove_bridge_agg_with_result(
     checkpoint_roots.push(felt4_to_bytes32_hex(20));
     let deposit_tree_root = u32x8_to_bytes32_hex(4);
     let withdrawal_tree_root = u32x8_to_bytes32_hex(12);
-    let bridge_user_id = format!("0x{}", hex::encode(bridge_agg_proof.public_inputs[24].to_canonical_u64().to_be_bytes()));
-    let l1_chain_index = l1_config.l1_chain_index;
+    let end_checkpoint_index = bridge_agg_proof.public_inputs[24].to_canonical_u64();
+    anyhow::ensure!(
+        end_checkpoint_index == to_checkpoint,
+        "BridgeAgg public input end_checkpoint_index mismatch: pi={} expected={}",
+        end_checkpoint_index,
+        to_checkpoint
+    );
     tracing::info!(
         deployments_network,
         l1_chain_index,
@@ -932,7 +938,7 @@ pub async fn run_prove_bridge_agg_with_result(
         from_checkpoint,
         to_checkpoint,
         num_checkpoints_aggregated,
-        deposits_consumed,
+        l1_chain_index: u64::from(l1_chain_index),
         bridge_agg_public_inputs_count: bridge_agg_proof.public_inputs.len(),
         bridge_agg_public_inputs: bridge_agg_proof
             .public_inputs
@@ -949,7 +955,7 @@ pub async fn run_prove_bridge_agg_with_result(
         withdrawal_tree_root,
         withdrawal_subtree_root: format!("{:#066x}", withdrawal_subtree_root),
         withdrawal_merkle_proof: b256_array_to_hex(withdrawal_merkle_proof_b256),
-        bridge_user_id,
+        end_checkpoint_index,
     };
     let out_str = serde_json::to_string_pretty(&output)?;
     fs::write(&out_json, &out_str).with_context(|| format!("failed to write output: {}", out_json.display()))?;
@@ -960,8 +966,8 @@ pub async fn run_prove_bridge_agg_with_result(
         to_checkpoint,
         num_checkpoints_aggregated,
         proof_path: out_json,
-        deposits_consumed,
-        withdrawal_tree_root: output.withdrawal_tree_root,
+        deposit_tree_root: output.deposit_tree_root.clone(),
+        withdrawal_tree_root: output.withdrawal_tree_root.clone(),
     })
 }
 
@@ -970,25 +976,26 @@ pub async fn run_prove_bridge_agg_with_result(
 pub async fn build_deposit_batch_append_calls_remote(
     l1_rpc_url: &str,
     deployments_network: &str,
-    deposits_consumed: u64,
+    target_deposit_count: u32,
     prove_proxy_url: &str,
 ) -> anyhow::Result<Vec<DepositBatchAppendCall>> {
-    if deposits_consumed == 0 {
-        return Ok(Vec::new());
-    }
-
     let l1_config = load_l1_deployment_config(deployments_network)?;
     let inputs = fetch_deposit_batch_inputs(
-        deposits_consumed,
+        target_deposit_count,
         l1_rpc_url,
         &l1_config,
         deployments_network,
     )
     .await?;
+    if inputs.leaves.is_empty() {
+        // target equals current provedDepositCount: nothing to append.
+        return Ok(Vec::new());
+    }
+    let expected_len = (inputs.to_index - inputs.from_index) as usize;
     anyhow::ensure!(
-        inputs.leaves.len() == deposits_consumed as usize,
+        inputs.leaves.len() == expected_len,
         "deposit batch input length mismatch: expected {} got {}",
-        deposits_consumed,
+        expected_len,
         inputs.leaves.len()
     );
 
@@ -1038,7 +1045,7 @@ pub async fn build_deposit_batch_append_calls_remote(
             l2_token_contract_id: leaf.l2_token_contract_id,
             amount: leaf.amount,
             chain_index: leaf.chain_index,
-            note_secret_hash: leaf.note_secret_hash,
+            note_commitment: leaf.note_commitment,
         }).collect();
 
         prep_list.push(ChunkPrep {
@@ -1169,8 +1176,6 @@ pub async fn run_prove_bridge_agg_with_result_remote(
     to_checkpoint: u64,
     rpc_config: String,
     out_json: PathBuf,
-    deposits_consumed: u64,
-    l1_rpc_url: String,
     deployments_network: String,
     prove_proxy_url: &str,
 ) -> anyhow::Result<BridgeProveResult> {
@@ -1178,8 +1183,8 @@ pub async fn run_prove_bridge_agg_with_result_remote(
     anyhow::ensure!(from_checkpoint <= to_checkpoint, "from_checkpoint must be <= to_checkpoint");
     let num_checkpoints_aggregated = to_checkpoint - from_checkpoint + 1;
     anyhow::ensure!(
-        num_checkpoints_aggregated >= 2,
-        "bridge aggregation requires at least 2 checkpoints, got {} (from={} to={})",
+        num_checkpoints_aggregated >= 1,
+        "bridge aggregation requires at least 1 checkpoint, got {} (from={} to={})",
         num_checkpoints_aggregated,
         from_checkpoint,
         to_checkpoint
@@ -1193,11 +1198,10 @@ pub async fn run_prove_bridge_agg_with_result_remote(
         from_checkpoint, to_checkpoint
     );
 
-    let mut checkpoint_proofs_hex = Vec::new();
-    for cp_id in from_checkpoint..=to_checkpoint {
-        let proof_bytes = provider.get_checkpoint_state_transition_proof(cp_id).await?;
-        checkpoint_proofs_hex.push(hex::encode(&proof_bytes));
-    }
+    let final_checkpoint_proof_hex = {
+        let proof_bytes = provider.get_checkpoint_state_transition_proof(to_checkpoint).await?;
+        hex::encode(&proof_bytes)
+    };
 
     let mut delta_merkle_proofs = Vec::new();
     let mut pre_delta_merkle_proofs = Vec::new();
@@ -1264,8 +1268,10 @@ pub async fn run_prove_bridge_agg_with_result_remote(
     // For from_checkpoint == 1, this is the genesis checkpoint transition PI = H(H(root_0, leaf_0), genesis_fingerprint).
     // For from_checkpoint > 1, this is checkpoint (from_checkpoint - 1)'s proof public input hash.
     let genesis_fingerprint = {
-        let circs = cached_bridge_coordinator_circuits()?;
-        circs.genesis_checkpoint_root_transition.get_fingerprint()
+        let cached_lib = psy_plonky2_circuits::generated::cached_circuit_library::get_cached_circuit_library::<F>();
+        cached_lib
+            .get_fingerprint(ProvingJobCircuitType::GenesisBlockCheckpointStateTransition)
+            .map_err(|e| anyhow::anyhow!("GenesisBlockCheckpointStateTransition fingerprint not found in cached circuit library: {e}"))?
     };
     let start_chain_hash = if from_checkpoint <= 1 {
         use plonky2::hash::poseidon::PoseidonHash;
@@ -1369,16 +1375,21 @@ pub async fn run_prove_bridge_agg_with_result_remote(
         user_registration_tree_root: qhash_to_hex(to_core_hash(state_roots.user_registration_tree_root)),
     };
 
-    // Get checkpoint fingerprint from coordinator circuits to ensure continuity matches
+    // Get checkpoint fingerprint from cached circuit library (avoids building
+    // the full QEDCoordinatorCircuitManager — saves ~2GB RSS when prove proxy
+    // is configured and the relayer doesn't need local proving).
     let remote_checkpoint_fp = {
-        let circs = cached_bridge_coordinator_circuits()?;
-        qhash_to_hex(circs.checkpoint_root_transition.get_fingerprint())
+        let cached_lib = psy_plonky2_circuits::generated::cached_circuit_library::get_cached_circuit_library::<F>();
+        let fp = cached_lib
+            .get_fingerprint(ProvingJobCircuitType::GenerateRollupStateTransitionProof)
+            .map_err(|e| anyhow::anyhow!("GenerateRollupStateTransitionProof fingerprint not found in cached circuit library: {e}"))?;
+        qhash_to_hex(fp)
     };
 
     let input = crate::bridge::prove_proxy_client::BridgeAggWitnessInput {
         from_checkpoint,
         to_checkpoint,
-        checkpoint_proofs_hex,
+        final_checkpoint_proof_hex,
         delta_merkle_proofs,
         pre_delta_merkle_proofs,
         chain_start: chain_start_hex,
@@ -1387,7 +1398,6 @@ pub async fn run_prove_bridge_agg_with_result_remote(
         final_checkpoint_global_state_roots: global_state_roots,
         deposit_witness: deposit_root_witness,
         withdrawal_witness: withdrawal_root_witness,
-        deposits_consumed,
     };
 
     eprintln!("[remote] Sending bridge agg to Prove Proxy at {}...", prove_proxy_url);
@@ -1396,6 +1406,12 @@ pub async fn run_prove_bridge_agg_with_result_remote(
         .prove_bridge_agg_groth16(deployments_network.clone(), input)
         .await?;
     eprintln!("[remote] Bridge agg proof received from Prove Proxy.");
+    anyhow::ensure!(
+        proxy_output.end_checkpoint_index == to_checkpoint,
+        "BridgeAgg proxy output end_checkpoint_index mismatch: got={} expected={}",
+        proxy_output.end_checkpoint_index,
+        to_checkpoint
+    );
 
     let (deposit_subtree_root, deposit_merkle_proof_b256) = fetch_tree_subroot_and_top_proof(
         &provider,
@@ -1419,9 +1435,9 @@ pub async fn run_prove_bridge_agg_with_result_remote(
         from_checkpoint: proxy_output.from_checkpoint,
         to_checkpoint: proxy_output.to_checkpoint,
         num_checkpoints_aggregated: proxy_output.num_checkpoints_aggregated,
-        deposits_consumed: proxy_output.deposits_consumed,
-        bridge_agg_public_inputs_count: proxy_output.bridge_agg_public_inputs_count,
+        l1_chain_index: u64::from(l1_config.l1_chain_index),
         bridge_agg_public_inputs: proxy_output.bridge_agg_public_inputs,
+        bridge_agg_public_inputs_count: proxy_output.bridge_agg_public_inputs_count,
         groth16_proof: proxy_output.groth16_proof,
         solidity_proof: proxy_output.solidity_proof.clone(),
         solidity_public_inputs: proxy_output.solidity_public_inputs,
@@ -1432,7 +1448,7 @@ pub async fn run_prove_bridge_agg_with_result_remote(
         withdrawal_tree_root: proxy_output.withdrawal_tree_root,
         withdrawal_subtree_root: format!("{:#066x}", withdrawal_subtree_root),
         withdrawal_merkle_proof: b256_array_to_hex(withdrawal_merkle_proof_b256),
-        bridge_user_id: proxy_output.bridge_user_id,
+        end_checkpoint_index: proxy_output.end_checkpoint_index,
     };
     let out_str = serde_json::to_string_pretty(&output)?;
     fs::write(&out_json, &out_str).with_context(|| format!("failed to write output: {}", out_json.display()))?;
@@ -1443,7 +1459,7 @@ pub async fn run_prove_bridge_agg_with_result_remote(
         to_checkpoint,
         num_checkpoints_aggregated,
         proof_path: out_json,
-        deposits_consumed,
+        deposit_tree_root: output.deposit_tree_root,
         withdrawal_tree_root: output.withdrawal_tree_root,
     })
 }

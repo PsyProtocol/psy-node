@@ -1002,7 +1002,7 @@ impl<T: Copy + Clone + Hash + Ord> DPNStateCmdCore<T> for DPNStateCmd<T> {
             DPNStateCmd::SetContractStateSlotRange(c) => c.get_state_command_type(),
             DPNStateCmd::ClearEntireTree(c) => c.get_state_command_type(),
             DPNStateCmd::InvokeExternalContractFunctionSync(c) => c.get_state_command_type(),
-            DPNStateCmd::InvokeExternalContractFunctionDeferred(c) => c.get_state_command_type(),
+            DPNStateCmd::InvokeExternalContractFunctionDeferred(_c) => DPNStateCommandType::InvokeExternalContractFunctionDeferred,
             DPNStateCmd::GetSelfUserCurrentContractStateSlotHash(c) => c.get_state_command_type(),
             DPNStateCmd::GetSelfUserCurrentContractStateSlotSingle(c) => c.get_state_command_type(),
             DPNStateCmd::GetSelfUserCurrentContractStateSlotRange(c) => c.get_state_command_type(),

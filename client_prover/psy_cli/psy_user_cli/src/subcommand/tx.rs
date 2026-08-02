@@ -3,12 +3,11 @@ use plonky2::field::goldilocks_field::GoldilocksField;
 use psy_client_common::data::qhashout::QHashOut;
 use psy_client_data::traits::qdatastore::qmetadata::QMetaDataStoreReaderSync;
 use psy_provider::provider::RpcProvider;
-use serde_json::json;
 
-use crate::subcommand::args::TxGetStatusArgs;
+use crate::{result::{CommandResult, StatusResult, TransactionStatus}, subcommand::args::TxGetStatusArgs};
 
 type F = GoldilocksField;
-pub async fn get_status(args: TxGetStatusArgs) -> Result<()> {
+pub async fn get_status(args: TxGetStatusArgs) -> Result<CommandResult> {
     tracing::info!("get endcap status: {}", serde_json::to_string_pretty(&args)?);
     let provider = RpcProvider::new_with_config_path(&args.rpc_config)?;
 
@@ -19,17 +18,17 @@ pub async fn get_status(args: TxGetStatusArgs) -> Result<()> {
         .await?;
     let latest_checkpoint = provider.get_coordinator_latest_block_state().await?.checkpoint_id;
 
-    let output = json!({
-        "status": "confirmed",
-        "user_id": args.user_id,
-        "end_user_leaf_hash": args.end_user_leaf_hash,
-        "checkpoint_id": included_checkpoint,
-        "from_checkpoint": checkpoint_before,
-        "latest_checkpoint": latest_checkpoint,
-    });
+    let output = StatusResult {
+        status: TransactionStatus::Confirmed,
+        user_id: args.user_id,
+        end_user_leaf_hash,
+        checkpoint_id: included_checkpoint,
+        from_checkpoint: checkpoint_before,
+        latest_checkpoint,
+    };
     println!("{}", serde_json::to_string_pretty(&output)?);
 
-    Ok(())
+    Ok(CommandResult::TxStatus(output))
 }
 
 fn parse_end_user_leaf_hash(value: &str) -> Result<QHashOut<F>> {

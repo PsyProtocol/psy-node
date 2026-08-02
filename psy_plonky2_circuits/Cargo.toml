@@ -5,11 +5,12 @@ version = "0.1.0"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [features]
-default = ["std", "parth_core/serialize_rkyv", "parth_core/serialize_speedy", "parth_core/serialize_postcard", "serialize_speedy"]
+default = ["std", "parth_core/serialize_rkyv", "parth_core/serialize_speedy", "parth_core/serialize_postcard", "serialize_speedy", "gnark-wrap"]
 std = ["parth_core/std", "pser/std", "psy_data/std"]
 serialize_rkyv = ["dep:rkyv","pser/serialize_rkyv", "parth_core/serialize_rkyv", "psy_data/serialize_rkyv"]
 serialize_speedy = ["dep:speedy", "pser/serialize_speedy", "parth_core/serialize_speedy", "psy_data/serialize_speedy"]
 serialize_postcard = ["dep:postcard", "pser/serialize_postcard", "parth_core/serialize_postcard", "psy_data/serialize_postcard"]
+gnark-wrap = ["dep:gnark-plonky2-wrapper", "dep:gnark-plonky2-verifier-ffi"]
 
 [dependencies]
 postcard = { workspace = true, optional = true }
@@ -35,8 +36,8 @@ hashbrown = { workspace = true }
 plonky2 = { workspace = true }
 jsonrpsee = { workspace = true }
 home = { workspace = true }
-gnark-plonky2-wrapper  = { workspace = true }
-gnark-plonky2-verifier-ffi = { workspace = true }
+gnark-plonky2-wrapper = { workspace = true, optional = true }
+gnark-plonky2-verifier-ffi = { workspace = true, optional = true }
 plonky2x = { git = "https://github.com/logere/succinctx", rev = "eec027a324be98827b4b91b4054f4cac7044ced4" }
 tiny-keccak = { workspace = true }
 

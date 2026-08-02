@@ -26,8 +26,8 @@ pub enum SignType {
     SoftwareDefinedDPNSign,
     #[clap(name = "software-defined-plonky2")]
     SoftwareDefinedPlonky2Sign,
-    #[clap(name = "sdk-key")]
-    SDKKeySign,
+    #[clap(name = "sd-key")]
+    SDKeySign,
 }
 
 impl SignType {
@@ -37,7 +37,7 @@ impl SignType {
             "secp256k1" => Ok(SignType::SECP256K1Sign),
             "software-defined-dpn" => Ok(SignType::SoftwareDefinedDPNSign),
             "software-defined-plonky2" => Ok(SignType::SoftwareDefinedPlonky2Sign),
-            "sdk-key" => Ok(SignType::SDKKeySign),
+            "sd-key" => Ok(SignType::SDKeySign),
             _ => Err(format!("Unknown sign type: {}", s)),
         }
     }
@@ -88,18 +88,18 @@ pub struct WalletSourceArgs {
     pub fingerprint: Option<String>,
     #[clap(long, action = clap::ArgAction::Append)]
     #[serde(default)]
-    pub sdk_key_allowed_contract_id: Vec<u64>,
+    pub sd_key_allowed_contract_id: Vec<u64>,
     #[clap(long, action = clap::ArgAction::Append)]
     #[serde(default)]
-    pub sdk_key_allowed_method_id: Vec<u64>,
+    pub sd_key_allowed_method_id: Vec<u32>,
     #[clap(long, default_value_t = 2)]
     #[serde(default)]
-    pub sdk_key_expected_tx_count: u64,
+    pub sd_key_expected_tx_count: u64,
 }
 
 #[derive(Clone, Args, Serialize, Deserialize)]
 pub struct WalletSessionArgs {
-    #[clap(env, long, default_value = "psy-genesis/config.json", env)]
+    #[clap(env, long, default_value = "config.json", env)]
     pub rpc_config: String,
     #[command(flatten)]
     pub wallet: WalletSourceArgs,
@@ -168,7 +168,7 @@ impl WalletSessionArgs {
 
 #[derive(Clone, Debug, Parser)]
 pub struct ProverArgs {
-    #[clap(env, long, default_value = "psy-genesis/config.json", env)]
+    #[clap(env, long, default_value = "config.json", env)]
     pub rpc_config: String,
     #[clap(env = "PROVER_LISTEN_ADDR", long, default_value = "0.0.0.0:8888")]
     pub listen_addr: String,
@@ -182,7 +182,15 @@ pub struct ProverArgs {
 pub struct ProveProxyArgs {
     #[clap(env = "PROVE_PROXY_LISTEN_ADDR", long, default_value = "0.0.0.0:9999")]
     pub listen_addr: String,
-    #[clap(env, long, default_value = "psy-genesis/config.json", env)]
+    #[clap(env, long, default_value = "config.json", env)]
+    pub rpc_config: String,
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct PsyFaucetServerArgs {
+    #[clap(env = "PSY_FAUCET_LISTEN_ADDR", long, default_value = "0.0.0.0:9998")]
+    pub listen_addr: String,
+    #[clap(env, long, default_value = "config.json", env)]
     pub rpc_config: String,
 }
 

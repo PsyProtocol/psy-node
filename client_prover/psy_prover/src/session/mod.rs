@@ -27,11 +27,7 @@ pub async fn sleep(dur: std::time::Duration) {
             .ok()
             .and_then(|v| v.dyn_into::<Function>().ok())
         {
-            let _ = set_timeout.call2(
-                &global_obj,
-                cb.as_ref().unchecked_ref(),
-                &JsValue::from_f64(ms as f64),
-            );
+            let _ = set_timeout.call2(&global_obj, cb.as_ref().unchecked_ref(), &JsValue::from_f64(ms as f64));
         } else {
             let _ = resolve.call0(&JsValue::NULL);
         }

@@ -28,6 +28,8 @@ tracing = { workspace = true }
 maybe-async = { workspace = true }
 k256 = { workspace = true }
 
+log = { workspace = true }
+
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { workspace = true }
 

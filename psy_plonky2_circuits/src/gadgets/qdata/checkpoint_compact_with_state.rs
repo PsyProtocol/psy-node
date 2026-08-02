@@ -38,7 +38,6 @@ impl QEDCheckpointLeafCompactWithStateRootsGadget {
 
         let checkpoint_leaf_hash = checkpoint_leaf.to_hash::<H, F, D>(builder);
 
-
         Self {
             checkpoint_leaf,
             global_state_roots,

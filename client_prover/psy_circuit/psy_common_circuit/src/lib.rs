@@ -5,6 +5,7 @@ pub mod debug;
 pub mod field;
 pub mod hash;
 pub mod proof_minifier;
+pub mod serialization;
 pub mod traits;
 pub mod treeprover;
 pub mod u32;

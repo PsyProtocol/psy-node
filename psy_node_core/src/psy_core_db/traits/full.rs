@@ -112,9 +112,9 @@ pub trait PsyNodeUserContractTreeDatabaseWriter<Hash> {
 #[async_trait]
 #[auto_impl(&, Arc)]
 pub trait PsyNodeContractStateTreeTreeDatabaseReader<Hash> {
-    async fn contract_state_tree_get_leaf_hash(&self, checkpoint_id: u64, user_id: u64, contract_id: u64, state_slot_id: u64)
+    async fn contract_state_tree_get_leaf_hash(&self, checkpoint_id: u64, user_id: u64, contract_id: u64, tree_height: u8, state_slot_id: u64)
         -> anyhow::Result<Hash>;
-    async fn contract_state_tree_get_root_hash(&self, checkpoint_id: u64, user_id: u64, contract_id: u64) -> anyhow::Result<Hash>;
+    async fn contract_state_tree_get_root_hash(&self, checkpoint_id: u64, user_id: u64, contract_id: u64, tree_height: u8) -> anyhow::Result<Hash>;
     async fn contract_state_tree_get_merkle_proof(
         &self,
         checkpoint_id: u64,
@@ -134,6 +134,7 @@ pub trait PsyNodeContractStateTreeTreeDatabaseWriter<Hash> {
         checkpoint_id: u64,
         user_id: u64,
         contract_id: u64,
+        tree_height: u8,
         value: Hash,
     ) -> anyhow::Result<DeltaMerkleProofCore<Hash>>;
     async fn contract_state_tree_set_nodes(&self, checkpoint_id: u64, nodes: &[QMerkleStoreDoubleIdNode<Hash>]) -> anyhow::Result<()>;
@@ -258,11 +259,26 @@ pub trait PsyNodeCheckpointObjectDatabaseReader<F, Hash> {
     async fn get_checkpoint_id_for_checkpoint_root_hash(&self, root_hash: Hash) -> anyhow::Result<Option<u64>>;
     async fn get_checkpoint_leaf_data(&self, checkpoint_id: u64) -> anyhow::Result<PQEDCheckpointLeaf<F, Hash>>;
     async fn get_l2_block_state(&self, checkpoint_id: u64) -> anyhow::Result<QEDL2BlockState>;
+    /// Returns the L2 block state for `checkpoint_id` **only if the checkpoint's metadata is fully persisted** —
+    /// i.e. all of its per-checkpoint dependency records exist: the L2 block state, the global state roots, the
+    /// checkpoint leaf, the checkpoint root->id mapping (proving the checkpoint-tree proof was ingested), and the
+    /// global-user-tree -> realm-root top proof.
+    ///
+    /// Returns `Ok(None)` when any of those records is missing (i.e. the checkpoint was only partially written
+    /// — e.g. a crash mid-write under either the old "L2 first" or the new "L2 last" ordering), and `Err` only
+    /// for genuine read/deserialization/storage failures. Callers doing self-healing recovery must use this
+    /// rather than relying on the presence of any single record, and must not conflate `None` with `Err`.
+    async fn try_get_complete_l2_block_state(&self, checkpoint_id: u64) -> anyhow::Result<Option<QEDL2BlockState>>;
     async fn get_latest_l2_block_state(&self) -> anyhow::Result<QEDL2BlockState>;
     async fn get_checkpoint_global_state_roots(&self, checkpoint_id: u64) -> anyhow::Result<PQEDCheckpointGlobalStateRoots<Hash>>;
     async fn get_unique_pending_id_for_checkpoint_id(&self, checkpoint_id: u64) -> anyhow::Result<Option<(u64, QCoreProcCheckpointUniqueId)>>;
     async fn get_checkpoint_id_for_unique_pending_id(&self, unique_pending_id: u64) -> anyhow::Result<Option<u64>>;
     async fn get_current_unique_pending_id(&self) -> anyhow::Result<(u64, QCoreProcCheckpointUniqueId)>;
+    /// Returns the newest pending generation whose pending -> processor ID mapping was durably written.
+    ///
+    /// Recovery callers may use this to skip abandoned counter values left by a crash between allocating
+    /// a pending ID and persisting its processor ID mapping. Runtime callers should use the strict current getter.
+    async fn get_latest_mapped_unique_pending_id(&self) -> anyhow::Result<(u64, QCoreProcCheckpointUniqueId)>;
 }
 
 #[async_trait]

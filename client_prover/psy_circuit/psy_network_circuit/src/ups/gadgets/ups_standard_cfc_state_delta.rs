@@ -238,17 +238,12 @@ impl UPSCFCStandardStateDeltaGadget {
         // step
         builder.connect(tx_in_start_event_index, previous_step_user_event_index);
 
-        // TODO: Add support for balance and event updates
+        // User leaf balance is not mutated by current token slot operations.
+        // Keep the old protocol behavior until a dedicated native-balance delta is
+        // specified.
         let zero_target = builder.zero();
-        // disable spending balance (TODO: remove)
         builder.connect(tx_in_total_balance_spent, zero_target);
-        // disable emitting events (TODO: remove)
-        // builder.connect(tx_in_total_events_emitted, zero_target);
-
-        // TODO: compute balance correctly instead of disabling it
         let new_step_user_balance = tx_in_start_user_balance;
-
-        // TODO: compute balance correctly instead of disabling it
         let new_step_event_index = builder.add(tx_in_start_event_index, tx_in_total_events_emitted);
 
         // ensure that the transaction inputs and previous step agree on the previous

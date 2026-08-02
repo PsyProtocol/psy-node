@@ -33,8 +33,9 @@ pub struct PrivateNoteInclusionInput<F: RichField> {
     /// Transfer amount
     pub amount: F,
 
-    /// Commitment randomness / nonce (4 field elements)
-    pub randomness: QHashOut<F>,
+    /// Raw note secret (4 field elements). The note commitment binds this to
+    /// `nullifier_secret` inside the circuit.
+    pub note_secret: QHashOut<F>,
 
     /// Merkle proof: note_index -> note_root. `index` is embedded in this
     /// proof.

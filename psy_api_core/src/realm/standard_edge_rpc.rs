@@ -12,6 +12,7 @@ use psy_data::{
         }}
     ,
 };
+use crate::CheckpointJobStats;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct RealmSlotUpdate {
@@ -68,6 +69,10 @@ pub trait RealmEdgeRpc<F, Hash, JobId, ZKProof> {
     #[method(name = "get_checkpoint_leaf_data")]
     async fn get_checkpoint_leaf_data(&self, checkpoint_id: u64)
         -> RpcResult<PQEDCheckpointLeaf<F, Hash>>;
+
+    /// Return proof job statistics for a committed checkpoint.
+    #[method(name = "get_job_stats")]
+    async fn get_job_stats(&self, checkpoint_id: u64) -> RpcResult<CheckpointJobStats>;
 
 
     #[method(name = "get_latest_checkpoint_id")]

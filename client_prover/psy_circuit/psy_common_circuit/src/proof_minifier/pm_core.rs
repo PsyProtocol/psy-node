@@ -10,6 +10,7 @@ use plonky2::{
         config::{AlgebraicHasher, GenericConfig, Hasher},
         proof::{ProofWithPublicInputs, ProofWithPublicInputsTarget},
     },
+    util::serialization::{Buffer, GateSerializer, Read, WitnessGeneratorSerializer, Write},
 };
 use psy_client_common::utils::debug_timer::DebugTimer;
 
@@ -127,5 +128,46 @@ where
         let result = self.circuit_data.prove(pw);
         timer.lap("proved compress");
         result
+    }
+
+    /// Serialize this minifier: its `circuit_data` plus the `proof_target`
+    /// handle. `circuit_fingerprint` is recomputed on load, so it is not
+    /// stored. Layout: `[proof_target (self-delimiting)][circuit_data
+    /// bytes]`.
+    pub fn to_bytes(
+        &self,
+        gate_serializer: &impl GateSerializer<F, D>,
+        generator_serializer: &impl WitnessGeneratorSerializer<F, D>,
+    ) -> Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        buf.write_target_proof_with_public_inputs(&self.proof_target)
+            .map_err(|e| anyhow::anyhow!("minifier proof_target serialize failed: {e:?}"))?;
+        let cd = self
+            .circuit_data
+            .to_bytes(gate_serializer, generator_serializer)
+            .map_err(|e| anyhow::anyhow!("minifier circuit_data serialize failed: {e:?}"))?;
+        buf.write_all(&cd)
+            .map_err(|e| anyhow::anyhow!("minifier write circuit_data failed: {e:?}"))?;
+        Ok(buf)
+    }
+
+    pub fn from_bytes(
+        bytes: &[u8],
+        gate_serializer: &impl GateSerializer<F, D>,
+        generator_serializer: &impl WitnessGeneratorSerializer<F, D>,
+    ) -> Result<Self> {
+        let mut buffer = Buffer::new(bytes);
+        let proof_target = buffer
+            .read_target_proof_with_public_inputs()
+            .map_err(|e| anyhow::anyhow!("minifier proof_target deserialize failed: {e:?}"))?;
+        let cd_bytes = buffer.unread_bytes();
+        let circuit_data = CircuitData::<F, C, D>::from_bytes(cd_bytes, gate_serializer, generator_serializer)
+            .map_err(|e| anyhow::anyhow!("minifier circuit_data deserialize failed: {e}"))?;
+        let circuit_fingerprint = get_circuit_fingerprint_generic(&circuit_data.verifier_only);
+        Ok(Self {
+            circuit_data,
+            circuit_fingerprint,
+            proof_target,
+        })
     }
 }

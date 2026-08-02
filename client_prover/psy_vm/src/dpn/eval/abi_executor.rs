@@ -5,50 +5,10 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use psy_client_data::abi::{Abi, AbiMethod, TypeRef};
+
 use super::executor::{ExecutionContext, ExecutionResult, StateBackend, VmExecutor};
 use crate::dpn::vm::def::DPNFunctionCircuitDefinition;
-
-// ---------------------------------------------------------------------------
-// ABI types (mirrored from psy_compiler for decoupling)
-// ---------------------------------------------------------------------------
-
-/// Contract ABI description for the executor layer.
-/// This mirrors psy_compiler::abi::ContractABI so the VM crate
-/// does not depend on psy_compiler.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecutorABI {
-    pub contract_name: String,
-    pub state_tree_height: u16,
-    pub state_layout: Vec<ABIStateField>,
-    pub methods: Vec<ABIMethod>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ABIStateField {
-    pub name: String,
-    pub field_type: String,
-    pub offset: usize,
-    pub felt_size: usize,
-    pub is_array: bool,
-    pub array_count: Option<usize>,
-    pub element_type: Option<String>,
-    pub element_felt_size: Option<usize>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ABIMethod {
-    pub name: String,
-    pub method_id: u32,
-    pub params: Vec<ABIParam>,
-    pub is_view: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ABIParam {
-    pub name: String,
-    pub param_type: String,
-    pub felt_size: usize,
-}
 
 // ---------------------------------------------------------------------------
 // Param value types
@@ -109,7 +69,7 @@ pub struct FormattedStateDelta {
 /// ABI-aware executor wrapping VmExecutor with contract metadata.
 pub struct AbiExecutor<S: StateBackend> {
     executor: VmExecutor<S>,
-    abi: ExecutorABI,
+    abi: Abi,
     circuit_defs: Vec<DPNFunctionCircuitDefinition>,
     /// Method name → index into circuit_defs
     method_index: HashMap<String, usize>,
@@ -117,11 +77,11 @@ pub struct AbiExecutor<S: StateBackend> {
 
 impl<S: StateBackend> AbiExecutor<S> {
     /// Create a new ABI executor.
-    pub fn new(state: S, abi: ExecutorABI, circuit_defs: Vec<DPNFunctionCircuitDefinition>) -> Self {
+    pub fn new(state: S, abi: Abi, circuit_defs: Vec<DPNFunctionCircuitDefinition>) -> Self {
         let method_index: HashMap<String, usize> = circuit_defs
             .iter()
             .enumerate()
-            .filter_map(|(i, d)| abi.methods.iter().find(|m| m.method_id == d.method_id).map(|m| (m.name.clone(), i)))
+            .filter_map(|(i, d)| abi.contract.methods.iter().find(|m| m.method_id == d.method_id).map(|m| (m.name.clone(), i)))
             .collect();
 
         AbiExecutor {
@@ -133,19 +93,19 @@ impl<S: StateBackend> AbiExecutor<S> {
     }
 
     /// Get the ABI
-    pub fn abi(&self) -> &ExecutorABI {
+    pub fn abi(&self) -> &Abi {
         &self.abi
     }
 
     /// List available method names.
     pub fn method_names(&self) -> Vec<&str> {
-        self.abi.methods.iter().map(|m| m.name.as_str()).collect()
+        self.abi.contract.methods.iter().map(|m| m.name.as_str()).collect()
     }
 
     /// Call a contract method by name with named parameters.
     pub fn call(&mut self, method_name: &str, params: &[(&str, ParamValue)], context: &ExecutionContext) -> anyhow::Result<ExecutionResult> {
         // Find method in ABI
-        let abi_method = self.abi.methods.iter().find(|m| m.name == method_name).ok_or_else(|| {
+        let abi_method = self.abi.contract.methods.iter().find(|m| m.name == method_name).ok_or_else(|| {
             let available: Vec<&str> = self.method_names();
             anyhow::anyhow!("Method '{}' not found. Available: {:?}", method_name, available)
         })?;
@@ -194,29 +154,27 @@ impl<S: StateBackend> AbiExecutor<S> {
             .collect();
 
         FormattedStateDelta {
-            contract_name: self.abi.contract_name.clone(),
+            contract_name: self.abi.contract.name.clone(),
             field_changes,
         }
     }
 
     /// Resolve a slot index to a human-readable field path.
     fn resolve_slot_to_field(&self, slot_index: u64) -> String {
-        for field in &self.abi.state_layout {
+        for field in &self.abi.contract.state {
             let offset = field.offset as u64;
             let size = field.felt_size as u64;
 
             if slot_index >= offset && slot_index < offset + size {
-                if field.is_array {
-                    if let (Some(elem_size), Some(_count)) = (field.element_felt_size, field.array_count) {
-                        let elem_size = elem_size as u64;
-                        let relative = slot_index - offset;
-                        let array_idx = relative / elem_size;
-                        let field_offset = relative % elem_size;
-                        if field_offset == 0 {
-                            return format!("{}[{}]", field.name, array_idx);
-                        }
-                        return format!("{}[{}]+{}", field.name, array_idx, field_offset);
+                if let TypeRef::Array { item_felt_size, .. } = &field.ty {
+                    let item_felt_size = *item_felt_size as u64;
+                    let relative = slot_index - offset;
+                    let array_index = relative / item_felt_size;
+                    let field_offset = relative % item_felt_size;
+                    if field_offset == 0 {
+                        return format!("{}[{}]", field.name, array_index);
                     }
+                    return format!("{}[{}]+{}", field.name, array_index, field_offset);
                 }
                 let relative = slot_index - offset;
                 if relative == 0 {
@@ -230,11 +188,11 @@ impl<S: StateBackend> AbiExecutor<S> {
     }
 
     /// Flatten named parameters according to ABI method definition.
-    fn flatten_params(&self, method: &ABIMethod, params: &[(&str, ParamValue)]) -> anyhow::Result<Vec<u64>> {
+    fn flatten_params(&self, method: &AbiMethod, params: &[(&str, ParamValue)]) -> anyhow::Result<Vec<u64>> {
         let mut inputs = Vec::new();
 
-        // Match params by name against ABI method params
-        for abi_param in &method.params {
+        // Match params by name against ABI method inputs.
+        for abi_param in &method.inputs {
             let value = params
                 .iter()
                 .find(|(name, _)| *name == abi_param.name)

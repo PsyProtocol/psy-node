@@ -14,9 +14,7 @@ include!(concat!(env!("OUT_DIR"), "/generated_constants.rs"));
 
 pub mod network_constants;
 
-pub use network_constants::{
-    DEFAULT_USER_STATE_TREE_ROOT_U64,
-};
+pub use network_constants::DEFAULT_USER_STATE_TREE_ROOT_U64;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(bound = "for<'de2> F: Deserialize<'de2>")]
@@ -57,6 +55,7 @@ pub struct NetworkConfig<F: RichField> {
     pub realm_configs: Vec<RealmConfig>,
     pub coordinator_configs: Vec<CoordinatorConfig>,
     pub prove_proxy_url: Vec<String>,
+    pub faucet_rpc_url: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_services_url: Option<Vec<String>>,
     pub native_currency: String,
@@ -516,7 +515,19 @@ pub struct PsyConfig<F: RichField> {
 
 impl<F: RichField> PsyConfig<F> {
     pub fn from_file(path: &str) -> Result<Self, ConfigError> {
-        let content = std::fs::read_to_string(path).map_err(ConfigError::IoError)?;
+        let content = match std::fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(err) => {
+                // Backward compatibility for repo-root invocations after moving the canonical
+                // config to client_prover/config.json.
+                let fallback_path = "client_prover/config.json";
+                if path == "config.json" {
+                    std::fs::read_to_string(fallback_path).map_err(|_| ConfigError::IoError(err))?
+                } else {
+                    return Err(ConfigError::IoError(err));
+                }
+            }
+        };
         let config: Config<F> = serde_json::from_str(&content)?;
 
         if !config.networks.contains_key(&config.default_network) {
@@ -657,7 +668,7 @@ impl<F: RichField> PsyConfigBuilder<F> {
         } else if let Some(path) = self.config_path {
             PsyConfig::from_file(&path)?
         } else {
-            PsyConfig::from_file("psy-genesis/config.json")?
+            PsyConfig::from_file("config.json")?
         };
 
         if let Some(deploy_path) = self.deploy_path {
@@ -765,7 +776,7 @@ mod tests {
 
     #[test]
     fn test_config_loading() {
-        let config_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../psy-genesis/config.json");
+        let config_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config.json");
         let config = PsyConfigGoldilocks::from_file(config_path.to_str().unwrap()).unwrap();
 
         assert_eq!(config.current_network_name(), "localhost");

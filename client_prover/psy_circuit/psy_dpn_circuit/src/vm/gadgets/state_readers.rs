@@ -1467,12 +1467,10 @@ impl StateReaderGadget {
                 self.end_deferred_tx_tree_root = new_root;
                 builder.connect_hashes_if_true(condition_target, dmp.new_value, tx_hash);
                 let zero_hash = builder.constant_hash(HashOut::ZERO);
-
                 builder.connect_hashes_if_true(condition_target, dmp.old_value, zero_hash);
 
                 let _ref_key = self.insert_delta_merkle_proof_gadget(ck, dmp);
                 self.deferred_tx_count += 1;
-
                 tx_hash.elements.to_vec()
             }
             DPNStateCmd::GetContractLeaf(c) => {
@@ -2079,7 +2077,8 @@ impl StateReaderGadget {
                     builder.connect_hashes_if_true(non_empty_case, leaf_hash, mp.value);
                     builder.connect_hashes_if_true(empty_non_member, mp.value, zero_hash);
                     builder.connect_if_true(exists, key_eq.target, one.target);
-                    //                     //                     builder.connect_if_true(not_exists, non_member.target, one.target);
+                    //                     //
+                    // builder.connect_if_true(not_exists, non_member.target, one.target);
 
                     builder.connect_hashes(mp.root, end_contract_state_root);
                     self.insert_imt_contains_gadget(ck, mp, leaf, exists.target);
@@ -2254,5 +2253,636 @@ impl StateReaderGadget {
             }
         };
         value
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use kvq::memory::simple::KVQSimpleMemoryBackingStore;
+    use plonky2::{
+        field::types::Field,
+        hash::poseidon::PoseidonHash,
+        iop::witness::{PartialWitness, WitnessWrite},
+        plonk::{
+            circuit_builder::CircuitBuilder,
+            circuit_data::CircuitConfig,
+            config::{GenericConfig, PoseidonGoldilocksConfig},
+        },
+    };
+    use psy_client_common::data::qhashout::QHashOut;
+    use psy_client_data::qdata::{imt_contract_state::IMTContractStateLeaf, imt_proof::IMTContractStateUpdate};
+    use psy_common_circuit::traits::CreatableTarget;
+    use psy_crypto::hash::traits::hasher::{FieldQHasher, PoseidonHasher};
+    use psy_vm::dpn::ops::{
+        op_types::{encode_indexed_op_id, DPNBuiltInDataType, DPNIndexedVarDef, DPNOpType},
+        state_cmd::data::{DPNStateCmd, DPNStateCmdSetIMTContractStateValue},
+    };
+
+    use super::*;
+
+    const D: usize = 2;
+    type C = PoseidonGoldilocksConfig;
+    type F = <C as GenericConfig<D>>::F;
+    type Store = KVQSimpleMemoryBackingStore;
+    type IMT = psy_client_data::models::imt::IndexedMerkleTree<Store, F, PoseidonHash>;
+    const TEST_TREE_HEIGHT: usize = 8;
+
+    fn dummy_hash(builder: &mut CircuitBuilder<F, D>) -> HashOutTarget {
+        HashOutTarget {
+            elements: [
+                builder.add_virtual_target(),
+                builder.add_virtual_target(),
+                builder.add_virtual_target(),
+                builder.add_virtual_target(),
+            ],
+        }
+    }
+
+    fn new_test_dpn(builder: &mut CircuitBuilder<F, D>) -> SimpleDPNBuilder<F, D> {
+        SimpleDPNBuilder::new_with_contract_ctx(
+            Vec::new(),
+            builder.zero(),
+            builder.zero(),
+            builder.zero(),
+            builder.zero(),
+            builder.zero(),
+            dummy_hash(builder),
+            dummy_hash(builder),
+        )
+    }
+
+    #[test]
+    fn state_reader_imt_set_first_insert_proves() {
+        let store = Store::new();
+        let mut imt = IMT::new(&store, 1, 1, TEST_TREE_HEIGHT as u8, 100).unwrap();
+        let key = QHashOut::from_values(10, 0, 0, 0);
+        let value = QHashOut::from_values(100, 200, 300, 400);
+
+        let update = imt.insert(&store, key, value).unwrap();
+        let (predecessor_old_leaf, predecessor_new_leaf, new_leaf, predecessor_delta_proof, new_leaf_delta_proof) = match update {
+            IMTContractStateUpdate::Insert {
+                predecessor_old_preimage,
+                predecessor_new_preimage,
+                new_leaf_preimage,
+                predecessor_delta_proof,
+                new_leaf_delta_proof,
+            } => (
+                predecessor_old_preimage,
+                predecessor_new_preimage,
+                new_leaf_preimage,
+                predecessor_delta_proof,
+                new_leaf_delta_proof,
+            ),
+            _ => panic!("expected insert"),
+        };
+
+        let config = CircuitConfig::standard_recursion_config();
+        let mut builder = CircuitBuilder::<F, D>::new(config);
+        let mut dpn = new_test_dpn(&mut builder);
+
+        let condition_target = builder.add_virtual_target();
+        let key_targets: [Target; 4] = core::array::from_fn(|_| builder.add_virtual_target());
+        let value_targets: [Target; 4] = core::array::from_fn(|_| builder.add_virtual_target());
+        dpn.push_external_target(0, condition_target);
+        for (i, target) in key_targets.iter().copied().enumerate() {
+            dpn.push_external_target(i + 1, target);
+        }
+        for (i, target) in value_targets.iter().copied().enumerate() {
+            dpn.push_external_target(i + 5, target);
+        }
+
+        let start_root = builder.constant_hash(predecessor_delta_proof.old_root.0);
+        let zero_hash = builder.constant_hash(HashOut::ZERO);
+        let checkpoint_stats = PsyCheckpointLeafStatsGadget::create_virtual(&mut builder);
+        let checkpoint_roots = PsyCheckpointGlobalStateRootsGadget::create_virtual(&mut builder);
+        let checkpoint_tree_root = zero_hash;
+
+        let mut state_reader = StateReaderGadget::new(
+            checkpoint_roots,
+            zero_hash,
+            zero_hash,
+            start_root,
+            TEST_TREE_HEIGHT,
+            zero_hash,
+            TEST_TREE_HEIGHT,
+            false,
+            checkpoint_stats,
+            checkpoint_tree_root,
+        );
+
+        let cmd = DPNStateCmd::SetIMTContractStateValue(DPNStateCmdSetIMTContractStateValue {
+            condition: encode_indexed_op_id(DPNBuiltInDataType::Target, 0),
+            base_offset: 0,
+            capacity: 0,
+            key: [
+                encode_indexed_op_id(DPNBuiltInDataType::Target, 1),
+                encode_indexed_op_id(DPNBuiltInDataType::Target, 2),
+                encode_indexed_op_id(DPNBuiltInDataType::Target, 3),
+                encode_indexed_op_id(DPNBuiltInDataType::Target, 4),
+            ],
+            value: [
+                encode_indexed_op_id(DPNBuiltInDataType::Target, 5),
+                encode_indexed_op_id(DPNBuiltInDataType::Target, 6),
+                encode_indexed_op_id(DPNBuiltInDataType::Target, 7),
+                encode_indexed_op_id(DPNBuiltInDataType::Target, 8),
+            ],
+        });
+
+        let result = state_reader.injest_symbolic_state_command::<PoseidonHash, F, D>(&mut builder, &dpn, &cmd);
+        builder.register_public_inputs(&state_reader.end_contract_state_root.elements);
+        builder.register_public_inputs(&result);
+
+        let data = builder.build::<C>();
+        let mut pw = PartialWitness::new();
+        pw.set_target(condition_target, F::ONE).unwrap();
+        for (target, value) in key_targets.iter().copied().zip(key.0.elements.into_iter()) {
+            pw.set_target(target, value).unwrap();
+        }
+        for (target, value) in value_targets.iter().copied().zip(value.0.elements.into_iter()) {
+            pw.set_target(target, value).unwrap();
+        }
+
+        let gadget = &state_reader.imt_set_requests[0];
+        pw.set_target(gadget.is_insert.target, F::ONE).unwrap();
+        pw.set_target(gadget.insert_has_predecessor.target, F::ONE).unwrap();
+        gadget.update_old_leaf.set_witness(&mut pw, &IMTContractStateLeaf::default()).unwrap();
+        gadget.update_new_leaf.set_witness(&mut pw, &new_leaf).unwrap();
+        gadget
+            .update_delta_proof
+            .set_witness_core_proof_q(&mut pw, &predecessor_delta_proof)
+            .unwrap();
+        gadget.insert_predecessor_old_leaf.set_witness(&mut pw, &predecessor_old_leaf).unwrap();
+        gadget.insert_predecessor_new_leaf.set_witness(&mut pw, &predecessor_new_leaf).unwrap();
+        gadget.insert_new_leaf.set_witness(&mut pw, &new_leaf).unwrap();
+        gadget
+            .insert_predecessor_delta_proof
+            .set_witness_core_proof_q(&mut pw, &predecessor_delta_proof)
+            .unwrap();
+        gadget
+            .insert_new_leaf_delta_proof
+            .set_witness_core_proof_q(&mut pw, &new_leaf_delta_proof)
+            .unwrap();
+
+        let proof = data.prove(pw).expect("state reader IMT first insert should prove");
+        assert_eq!(proof.public_inputs[0], new_leaf_delta_proof.new_root.0.elements[0]);
+        assert_eq!(proof.public_inputs[4], F::ZERO);
+        assert_eq!(proof.public_inputs[8], new_leaf.value.0.elements[0]);
+        data.verify(proof).expect("state reader IMT first insert should verify");
+    }
+
+    #[test]
+    fn state_reader_imt_set_from_hash_outputs_proves() {
+        let sender_user_id = F::from_canonical_u64(11);
+        let recipient = [
+            F::from_canonical_u64(21),
+            F::from_canonical_u64(22),
+            F::from_canonical_u64(23),
+            F::from_canonical_u64(24),
+            F::from_canonical_u64(25),
+            F::from_canonical_u64(26),
+            F::from_canonical_u64(27),
+            F::from_canonical_u64(28),
+        ];
+        let token = [
+            F::from_canonical_u64(31),
+            F::from_canonical_u64(32),
+            F::from_canonical_u64(33),
+            F::from_canonical_u64(34),
+            F::from_canonical_u64(35),
+            F::from_canonical_u64(36),
+            F::from_canonical_u64(37),
+            F::from_canonical_u64(38),
+        ];
+        let amount = [
+            F::from_canonical_u64(41),
+            F::from_canonical_u64(42),
+            F::from_canonical_u64(43),
+            F::from_canonical_u64(44),
+            F::from_canonical_u64(45),
+            F::from_canonical_u64(46),
+            F::from_canonical_u64(47),
+            F::from_canonical_u64(48),
+        ];
+        let nonce = [
+            F::from_canonical_u64(51),
+            F::from_canonical_u64(52),
+            F::from_canonical_u64(53),
+            F::from_canonical_u64(54),
+            F::from_canonical_u64(55),
+            F::from_canonical_u64(56),
+            F::from_canonical_u64(57),
+            F::from_canonical_u64(58),
+        ];
+        let destination_chain = F::from_canonical_u64(61);
+
+        let leaf_hash = PoseidonHasher::q_hash_many(
+            &core::iter::once(sender_user_id)
+                .chain(recipient)
+                .chain(token)
+                .chain(amount)
+                .chain(nonce)
+                .chain(core::iter::once(destination_chain))
+                .collect::<Vec<_>>(),
+        );
+        let record_key = PoseidonHasher::q_hash_many(&nonce);
+
+        let store = Store::new();
+        let mut imt = IMT::new(&store, 1, 1, TEST_TREE_HEIGHT as u8, 100).unwrap();
+        let update = imt.insert(&store, record_key, leaf_hash).unwrap();
+        let (predecessor_old_leaf, predecessor_new_leaf, new_leaf, predecessor_delta_proof, new_leaf_delta_proof) = match update {
+            IMTContractStateUpdate::Insert {
+                predecessor_old_preimage,
+                predecessor_new_preimage,
+                new_leaf_preimage,
+                predecessor_delta_proof,
+                new_leaf_delta_proof,
+            } => (
+                predecessor_old_preimage,
+                predecessor_new_preimage,
+                new_leaf_preimage,
+                predecessor_delta_proof,
+                new_leaf_delta_proof,
+            ),
+            _ => panic!("expected insert"),
+        };
+
+        let config = CircuitConfig::standard_recursion_config();
+        let mut builder = CircuitBuilder::<F, D>::new(config);
+        let mut dpn = new_test_dpn(&mut builder);
+
+        let mut external_targets = Vec::new();
+        for index in 0..35usize {
+            let target = builder.add_virtual_target();
+            dpn.push_external_target(index, target);
+            external_targets.push(target);
+        }
+
+        let leaf_hash_op = DPNIndexedVarDef {
+            data_type: DPNBuiltInDataType::HashOut,
+            index: 0,
+            op_type: DPNOpType::HashNoPad,
+            inputs: (0..34).map(|i| encode_indexed_op_id(DPNBuiltInDataType::Target, i)).collect(),
+        };
+        let record_key_op = DPNIndexedVarDef {
+            data_type: DPNBuiltInDataType::HashOut,
+            index: 1,
+            op_type: DPNOpType::HashNoPad,
+            inputs: (25..33).map(|i| encode_indexed_op_id(DPNBuiltInDataType::Target, i)).collect(),
+        };
+        dpn.process_var_def(&mut builder, &leaf_hash_op);
+        dpn.process_var_def(&mut builder, &record_key_op);
+
+        for limb in 0..4usize {
+            let const_op = DPNIndexedVarDef {
+                data_type: DPNBuiltInDataType::Target,
+                index: 100 + limb,
+                op_type: DPNOpType::Constant,
+                inputs: vec![limb as u64],
+            };
+            dpn.process_var_def(&mut builder, &const_op);
+
+            let key_limb_op = DPNIndexedVarDef {
+                data_type: DPNBuiltInDataType::Target,
+                index: 200 + limb,
+                op_type: DPNOpType::TargetAt,
+                inputs: vec![
+                    encode_indexed_op_id(DPNBuiltInDataType::HashOut, 1),
+                    encode_indexed_op_id(DPNBuiltInDataType::Target, 100 + limb),
+                ],
+            };
+            dpn.process_var_def(&mut builder, &key_limb_op);
+
+            let value_limb_op = DPNIndexedVarDef {
+                data_type: DPNBuiltInDataType::Target,
+                index: 204 + limb,
+                op_type: DPNOpType::TargetAt,
+                inputs: vec![
+                    encode_indexed_op_id(DPNBuiltInDataType::HashOut, 0),
+                    encode_indexed_op_id(DPNBuiltInDataType::Target, 100 + limb),
+                ],
+            };
+            dpn.process_var_def(&mut builder, &value_limb_op);
+        }
+
+        let start_root = builder.constant_hash(predecessor_delta_proof.old_root.0);
+        let zero_hash = builder.constant_hash(HashOut::ZERO);
+        let checkpoint_stats = PsyCheckpointLeafStatsGadget::create_virtual(&mut builder);
+        let checkpoint_roots = PsyCheckpointGlobalStateRootsGadget::create_virtual(&mut builder);
+        let mut state_reader = StateReaderGadget::new(
+            checkpoint_roots,
+            zero_hash,
+            zero_hash,
+            start_root,
+            TEST_TREE_HEIGHT,
+            zero_hash,
+            TEST_TREE_HEIGHT,
+            false,
+            checkpoint_stats,
+            zero_hash,
+        );
+
+        let cmd = DPNStateCmd::SetIMTContractStateValue(DPNStateCmdSetIMTContractStateValue {
+            condition: encode_indexed_op_id(DPNBuiltInDataType::Target, 34),
+            base_offset: 0,
+            capacity: 0,
+            key: [
+                encode_indexed_op_id(DPNBuiltInDataType::Target, 200),
+                encode_indexed_op_id(DPNBuiltInDataType::Target, 201),
+                encode_indexed_op_id(DPNBuiltInDataType::Target, 202),
+                encode_indexed_op_id(DPNBuiltInDataType::Target, 203),
+            ],
+            value: [
+                encode_indexed_op_id(DPNBuiltInDataType::Target, 204),
+                encode_indexed_op_id(DPNBuiltInDataType::Target, 205),
+                encode_indexed_op_id(DPNBuiltInDataType::Target, 206),
+                encode_indexed_op_id(DPNBuiltInDataType::Target, 207),
+            ],
+        });
+        state_reader.injest_symbolic_state_command::<PoseidonHash, F, D>(&mut builder, &dpn, &cmd);
+        builder.register_public_inputs(&state_reader.end_contract_state_root.elements);
+
+        let data = builder.build::<C>();
+        let mut pw = PartialWitness::new();
+        let external_values = core::iter::once(sender_user_id)
+            .chain(recipient)
+            .chain(token)
+            .chain(amount)
+            .chain(nonce)
+            .chain([destination_chain, F::ONE])
+            .collect::<Vec<_>>();
+        for (target, value) in external_targets.into_iter().zip(external_values.into_iter()) {
+            pw.set_target(target, value).unwrap();
+        }
+
+        let gadget = &state_reader.imt_set_requests[0];
+        pw.set_target(gadget.is_insert.target, F::ONE).unwrap();
+        pw.set_target(gadget.insert_has_predecessor.target, F::ZERO).unwrap();
+        gadget.update_old_leaf.set_witness(&mut pw, &IMTContractStateLeaf::default()).unwrap();
+        gadget.update_new_leaf.set_witness(&mut pw, &new_leaf).unwrap();
+        gadget
+            .update_delta_proof
+            .set_witness_core_proof_q(&mut pw, &predecessor_delta_proof)
+            .unwrap();
+        gadget.insert_predecessor_old_leaf.set_witness(&mut pw, &predecessor_old_leaf).unwrap();
+        gadget.insert_predecessor_new_leaf.set_witness(&mut pw, &predecessor_new_leaf).unwrap();
+        gadget.insert_new_leaf.set_witness(&mut pw, &new_leaf).unwrap();
+        gadget
+            .insert_predecessor_delta_proof
+            .set_witness_core_proof_q(&mut pw, &predecessor_delta_proof)
+            .unwrap();
+        gadget
+            .insert_new_leaf_delta_proof
+            .set_witness_core_proof_q(&mut pw, &new_leaf_delta_proof)
+            .unwrap();
+
+        let proof = data.prove(pw).expect("hash outputs feeding IMT set should prove");
+        assert_eq!(proof.public_inputs[0], new_leaf_delta_proof.new_root.0.elements[0]);
+        data.verify(proof).expect("hash outputs feeding IMT set should verify");
+    }
+
+    #[test]
+    fn state_reader_imt_set_with_namespaced_hash_key_proves() {
+        let sender_user_id = F::from_canonical_u64(11);
+        let recipient = [
+            F::from_canonical_u64(21),
+            F::from_canonical_u64(22),
+            F::from_canonical_u64(23),
+            F::from_canonical_u64(24),
+            F::from_canonical_u64(25),
+            F::from_canonical_u64(26),
+            F::from_canonical_u64(27),
+            F::from_canonical_u64(28),
+        ];
+        let token = [
+            F::from_canonical_u64(31),
+            F::from_canonical_u64(32),
+            F::from_canonical_u64(33),
+            F::from_canonical_u64(34),
+            F::from_canonical_u64(35),
+            F::from_canonical_u64(36),
+            F::from_canonical_u64(37),
+            F::from_canonical_u64(38),
+        ];
+        let amount = [
+            F::from_canonical_u64(41),
+            F::from_canonical_u64(42),
+            F::from_canonical_u64(43),
+            F::from_canonical_u64(44),
+            F::from_canonical_u64(45),
+            F::from_canonical_u64(46),
+            F::from_canonical_u64(47),
+            F::from_canonical_u64(48),
+        ];
+        let nonce = [
+            F::from_canonical_u64(51),
+            F::from_canonical_u64(52),
+            F::from_canonical_u64(53),
+            F::from_canonical_u64(54),
+            F::from_canonical_u64(55),
+            F::from_canonical_u64(56),
+            F::from_canonical_u64(57),
+            F::from_canonical_u64(58),
+        ];
+        let destination_chain = F::from_canonical_u64(61);
+        let namespace = F::from_canonical_u64(6);
+
+        let record_key = PoseidonHasher::q_hash_many(&nonce);
+        let namespaced_key = PoseidonHasher::q_hash_many(&core::iter::once(namespace).chain(record_key.0.elements).collect::<Vec<_>>());
+        let leaf_hash = PoseidonHasher::q_hash_many(
+            &core::iter::once(sender_user_id)
+                .chain(recipient)
+                .chain(token)
+                .chain(amount)
+                .chain(nonce)
+                .chain(core::iter::once(destination_chain))
+                .collect::<Vec<_>>(),
+        );
+
+        let store = Store::new();
+        let mut imt = IMT::new(&store, 1, 1, TEST_TREE_HEIGHT as u8, 100).unwrap();
+        let update = imt.insert(&store, namespaced_key, leaf_hash).unwrap();
+        let (predecessor_old_leaf, predecessor_new_leaf, new_leaf, predecessor_delta_proof, new_leaf_delta_proof) = match update {
+            IMTContractStateUpdate::Insert {
+                predecessor_old_preimage,
+                predecessor_new_preimage,
+                new_leaf_preimage,
+                predecessor_delta_proof,
+                new_leaf_delta_proof,
+            } => (
+                predecessor_old_preimage,
+                predecessor_new_preimage,
+                new_leaf_preimage,
+                predecessor_delta_proof,
+                new_leaf_delta_proof,
+            ),
+            _ => panic!("expected insert"),
+        };
+
+        let config = CircuitConfig::standard_recursion_config();
+        let mut builder = CircuitBuilder::<F, D>::new(config);
+        let mut dpn = new_test_dpn(&mut builder);
+
+        let mut external_targets = Vec::new();
+        for index in 0..35usize {
+            let target = builder.add_virtual_target();
+            dpn.push_external_target(index, target);
+            external_targets.push(target);
+        }
+
+        let record_key_op = DPNIndexedVarDef {
+            data_type: DPNBuiltInDataType::HashOut,
+            index: 0,
+            op_type: DPNOpType::HashNoPad,
+            inputs: (25..33).map(|i| encode_indexed_op_id(DPNBuiltInDataType::Target, i)).collect(),
+        };
+        dpn.process_var_def(&mut builder, &record_key_op);
+
+        for limb in 0..4usize {
+            let const_op = DPNIndexedVarDef {
+                data_type: DPNBuiltInDataType::Target,
+                index: 100 + limb,
+                op_type: DPNOpType::Constant,
+                inputs: vec![limb as u64],
+            };
+            dpn.process_var_def(&mut builder, &const_op);
+
+            let record_key_limb_op = DPNIndexedVarDef {
+                data_type: DPNBuiltInDataType::Target,
+                index: 200 + limb,
+                op_type: DPNOpType::TargetAt,
+                inputs: vec![
+                    encode_indexed_op_id(DPNBuiltInDataType::HashOut, 0),
+                    encode_indexed_op_id(DPNBuiltInDataType::Target, 100 + limb),
+                ],
+            };
+            dpn.process_var_def(&mut builder, &record_key_limb_op);
+        }
+
+        let namespace_op = DPNIndexedVarDef {
+            data_type: DPNBuiltInDataType::Target,
+            index: 300,
+            op_type: DPNOpType::Constant,
+            inputs: vec![6],
+        };
+        dpn.process_var_def(&mut builder, &namespace_op);
+
+        let namespaced_key_op = DPNIndexedVarDef {
+            data_type: DPNBuiltInDataType::HashOut,
+            index: 1,
+            op_type: DPNOpType::HashNoPad,
+            inputs: core::iter::once(encode_indexed_op_id(DPNBuiltInDataType::Target, 300))
+                .chain((0..4).map(|limb| encode_indexed_op_id(DPNBuiltInDataType::Target, 200 + limb)))
+                .collect(),
+        };
+        dpn.process_var_def(&mut builder, &namespaced_key_op);
+
+        for limb in 0..4usize {
+            let namespaced_key_limb_op = DPNIndexedVarDef {
+                data_type: DPNBuiltInDataType::Target,
+                index: 220 + limb,
+                op_type: DPNOpType::TargetAt,
+                inputs: vec![
+                    encode_indexed_op_id(DPNBuiltInDataType::HashOut, 1),
+                    encode_indexed_op_id(DPNBuiltInDataType::Target, 100 + limb),
+                ],
+            };
+            dpn.process_var_def(&mut builder, &namespaced_key_limb_op);
+        }
+
+        let leaf_hash_op = DPNIndexedVarDef {
+            data_type: DPNBuiltInDataType::HashOut,
+            index: 2,
+            op_type: DPNOpType::HashNoPad,
+            inputs: (0..34).map(|i| encode_indexed_op_id(DPNBuiltInDataType::Target, i)).collect(),
+        };
+        dpn.process_var_def(&mut builder, &leaf_hash_op);
+
+        for limb in 0..4usize {
+            let value_limb_op = DPNIndexedVarDef {
+                data_type: DPNBuiltInDataType::Target,
+                index: 240 + limb,
+                op_type: DPNOpType::TargetAt,
+                inputs: vec![
+                    encode_indexed_op_id(DPNBuiltInDataType::HashOut, 2),
+                    encode_indexed_op_id(DPNBuiltInDataType::Target, 100 + limb),
+                ],
+            };
+            dpn.process_var_def(&mut builder, &value_limb_op);
+        }
+
+        let start_root = builder.constant_hash(predecessor_delta_proof.old_root.0);
+        let zero_hash = builder.constant_hash(HashOut::ZERO);
+        let checkpoint_stats = PsyCheckpointLeafStatsGadget::create_virtual(&mut builder);
+        let checkpoint_roots = PsyCheckpointGlobalStateRootsGadget::create_virtual(&mut builder);
+        let mut state_reader = StateReaderGadget::new(
+            checkpoint_roots,
+            zero_hash,
+            zero_hash,
+            start_root,
+            TEST_TREE_HEIGHT,
+            zero_hash,
+            TEST_TREE_HEIGHT,
+            false,
+            checkpoint_stats,
+            zero_hash,
+        );
+
+        let cmd = DPNStateCmd::SetIMTContractStateValue(DPNStateCmdSetIMTContractStateValue {
+            condition: encode_indexed_op_id(DPNBuiltInDataType::Target, 34),
+            base_offset: 0,
+            capacity: 0,
+            key: [
+                encode_indexed_op_id(DPNBuiltInDataType::Target, 220),
+                encode_indexed_op_id(DPNBuiltInDataType::Target, 221),
+                encode_indexed_op_id(DPNBuiltInDataType::Target, 222),
+                encode_indexed_op_id(DPNBuiltInDataType::Target, 223),
+            ],
+            value: [
+                encode_indexed_op_id(DPNBuiltInDataType::Target, 240),
+                encode_indexed_op_id(DPNBuiltInDataType::Target, 241),
+                encode_indexed_op_id(DPNBuiltInDataType::Target, 242),
+                encode_indexed_op_id(DPNBuiltInDataType::Target, 243),
+            ],
+        });
+        state_reader.injest_symbolic_state_command::<PoseidonHash, F, D>(&mut builder, &dpn, &cmd);
+        builder.register_public_inputs(&state_reader.end_contract_state_root.elements);
+
+        let data = builder.build::<C>();
+        let mut pw = PartialWitness::new();
+        let external_values = core::iter::once(sender_user_id)
+            .chain(recipient)
+            .chain(token)
+            .chain(amount)
+            .chain(nonce)
+            .chain([destination_chain, F::ONE])
+            .collect::<Vec<_>>();
+        for (target, value) in external_targets.into_iter().zip(external_values.into_iter()) {
+            pw.set_target(target, value).unwrap();
+        }
+
+        let gadget = &state_reader.imt_set_requests[0];
+        pw.set_target(gadget.is_insert.target, F::ONE).unwrap();
+        pw.set_target(gadget.insert_has_predecessor.target, F::ONE).unwrap();
+        gadget.update_old_leaf.set_witness(&mut pw, &IMTContractStateLeaf::default()).unwrap();
+        gadget.update_new_leaf.set_witness(&mut pw, &new_leaf).unwrap();
+        gadget
+            .update_delta_proof
+            .set_witness_core_proof_q(&mut pw, &predecessor_delta_proof)
+            .unwrap();
+        gadget.insert_predecessor_old_leaf.set_witness(&mut pw, &predecessor_old_leaf).unwrap();
+        gadget.insert_predecessor_new_leaf.set_witness(&mut pw, &predecessor_new_leaf).unwrap();
+        gadget.insert_new_leaf.set_witness(&mut pw, &new_leaf).unwrap();
+        gadget
+            .insert_predecessor_delta_proof
+            .set_witness_core_proof_q(&mut pw, &predecessor_delta_proof)
+            .unwrap();
+        gadget
+            .insert_new_leaf_delta_proof
+            .set_witness_core_proof_q(&mut pw, &new_leaf_delta_proof)
+            .unwrap();
+
+        let proof = data.prove(pw).expect("namespaced hash key feeding IMT set should prove");
+        assert_eq!(proof.public_inputs[0], new_leaf_delta_proof.new_root.0.elements[0]);
+        data.verify(proof).expect("namespaced hash key feeding IMT set should verify");
     }
 }

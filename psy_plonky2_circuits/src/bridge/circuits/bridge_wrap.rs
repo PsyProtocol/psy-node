@@ -219,6 +219,7 @@ mod tests {
 
     #[test]
     fn bridge_wrap_keccak_bytes_pair_swap_tree_root_limbs() {
+        // Final PI width is 26: roots and checkpoint metadata (no l1_chain_index).
         let public_inputs = (0u64..26)
             .map(GoldilocksField::from_canonical_u64)
             .collect::<Vec<_>>();
@@ -239,6 +240,7 @@ mod tests {
         assert_eq!(&bytes[88..92], &19u32.to_be_bytes());
         assert_eq!(&bytes[92..96], &18u32.to_be_bytes());
 
+        // Checkpoint metadata [20..26) remains full u64 limbs (no pair-swap).
         assert_eq!(&bytes[96..104], &20u64.to_be_bytes());
         assert_eq!(&bytes[120..128], &23u64.to_be_bytes());
         assert_eq!(&bytes[128..136], &24u64.to_be_bytes());

@@ -218,3 +218,10 @@ async fn simple_store_basic_test_1() -> anyhow::Result<()> {
     simple_store.basic_test_1().await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn torn_pending_allocation_falls_back_then_skips_abandoned_id() -> anyhow::Result<()> {
+    let db = Arc::new(InMemoryTestStore::new());
+    let simple_store = SimpleStoreEx::setup(db).await?;
+    simple_store.store.test_pending_ids().await
+}

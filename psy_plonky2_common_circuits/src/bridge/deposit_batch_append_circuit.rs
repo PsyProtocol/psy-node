@@ -37,7 +37,7 @@ pub struct DepositLeafData {
     pub l2_token_contract_id: [u32; WORDS_PER_BYTES32],
     pub amount: [u32; WORDS_PER_BYTES32],
     pub chain_index: u32,
-    pub note_secret_hash: [u32; WORDS_PER_BYTES32],
+    pub note_commitment: [u32; WORDS_PER_BYTES32],
 }
 
 impl DepositLeafData {
@@ -52,7 +52,7 @@ impl DepositLeafData {
         .flatten()
         .copied()
         .chain([self.chain_index])
-        .chain(self.note_secret_hash)
+        .chain(self.note_commitment)
         .collect()
     }
 }
@@ -64,7 +64,7 @@ pub fn compute_batch_slot_data_words(deposits: &[DepositLeafData]) -> Vec<u32> {
         l2_token_contract_id: [0; WORDS_PER_BYTES32],
         amount: [0; WORDS_PER_BYTES32],
         chain_index: 0,
-        note_secret_hash: [0; WORDS_PER_BYTES32],
+        note_commitment: [0; WORDS_PER_BYTES32],
     };
     let mut out = Vec::with_capacity(MAX_DEPOSIT_BATCH_SIZE * DEPOSIT_BATCH_APPEND_SLOT_WORDS);
     for i in 0..MAX_DEPOSIT_BATCH_SIZE {
@@ -133,7 +133,7 @@ pub fn compute_batch_append_preimage(inputs: &BatchAppendInputs<GoldilocksField>
         l2_token_contract_id: [0; WORDS_PER_BYTES32],
         amount: [0; WORDS_PER_BYTES32],
         chain_index: 0,
-        note_secret_hash: [0; WORDS_PER_BYTES32],
+        note_commitment: [0; WORDS_PER_BYTES32],
     };
     let mut batch_commit_words =
         Vec::with_capacity(MAX_DEPOSIT_BATCH_SIZE * DEPOSIT_BATCH_APPEND_SLOT_WORDS);
@@ -178,7 +178,7 @@ pub struct DepositLeafTargets {
     pub l2_token_contract_id: [Target; WORDS_PER_BYTES32],
     pub amount: [Target; WORDS_PER_BYTES32],
     pub chain_index: Target,
-    pub note_secret_hash: [Target; WORDS_PER_BYTES32],
+    pub note_commitment: [Target; WORDS_PER_BYTES32],
 }
 
 impl DepositLeafTargets {
@@ -191,7 +191,7 @@ impl DepositLeafTargets {
             l2_token_contract_id: builder.add_virtual_targets(WORDS_PER_BYTES32).try_into().unwrap(),
             amount: builder.add_virtual_targets(WORDS_PER_BYTES32).try_into().unwrap(),
             chain_index: builder.add_virtual_target(),
-            note_secret_hash: builder.add_virtual_targets(WORDS_PER_BYTES32).try_into().unwrap(),
+            note_commitment: builder.add_virtual_targets(WORDS_PER_BYTES32).try_into().unwrap(),
         }
     }
 
@@ -206,7 +206,7 @@ impl DepositLeafTargets {
         .flatten()
         .copied()
         .chain([self.chain_index])
-        .chain(self.note_secret_hash)
+        .chain(self.note_commitment)
         .collect()
     }
 
@@ -232,7 +232,7 @@ impl DepositLeafTargets {
             pw.set_target(*target, F::from_canonical_u32(*word))?;
         }
         pw.set_target(self.chain_index, F::from_canonical_u32(value.chain_index))?;
-        for (target, word) in self.note_secret_hash.iter().zip(value.note_secret_hash.iter()) {
+        for (target, word) in self.note_commitment.iter().zip(value.note_commitment.iter()) {
             pw.set_target(*target, F::from_canonical_u32(*word))?;
         }
         Ok(())
@@ -416,7 +416,7 @@ where
 
         let zero_deposit = DepositLeafData {
             shield_address: [0; WORDS_PER_BYTES32],
-            note_secret_hash: [0; WORDS_PER_BYTES32],
+            note_commitment: [0; WORDS_PER_BYTES32],
             token: [0; WORDS_PER_BYTES32],
             l2_token_contract_id: [0; WORDS_PER_BYTES32],
             amount: [0; WORDS_PER_BYTES32],
@@ -571,7 +571,7 @@ mod tests {
     fn sample_deposit(seed: u32) -> DepositLeafData {
         DepositLeafData {
             shield_address: sample_bytes32(seed),
-            note_secret_hash: sample_bytes32(seed + 10),
+            note_commitment: sample_bytes32(seed + 10),
             token: sample_bytes32(seed + 20),
             l2_token_contract_id: sample_bytes32(seed + 30),
             amount: sample_bytes32(seed + 40),

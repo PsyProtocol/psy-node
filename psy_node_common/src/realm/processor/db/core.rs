@@ -1,4 +1,6 @@
-use std::sync::{atomic::AtomicBool, Arc};
+use std::sync::Arc;
+
+use crate::utils::processor_status::ProcessorStatus;
 
 use anyhow::Ok;
 use parth_core::{
@@ -74,7 +76,7 @@ pub struct PsyRealmDatabaseProcessor<
     // coordinator connection
     pub coordinator_client: Arc<CoordinatorClient>,
     // status
-    pub is_active: Arc<AtomicBool>,
+    pub status: ProcessorStatus,
     pub guta_queue_key_status_manager: QueueKeyStatusManager<PQ_REALM_SUBMIT_USER_UPDATE_QUEUE_TOPIC_ID, PsyRealmUserUpdateQueueItem<N::F, N::QHash>>,
     pub shared_state: RealmProcessorCoreStateWrapper<N::QHash>,
     pub needs_revert: bool,

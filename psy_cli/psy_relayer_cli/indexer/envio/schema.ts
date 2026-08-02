@@ -2,6 +2,8 @@
 // Keep table names aligned with psy_relayer_cli SQL:
 // - deposits
 // - finalized_batches
+// - deposit_tree_meta
+// - deposit_tree_nodes
 
 export const Deposit = {
   chain_id: "Int",
@@ -11,19 +13,8 @@ export const Deposit = {
   l2_token_contract_id: "String",
   amount: "BigInt",
   chain_index: "Int",
-  note_secret_hash: "String",
+  note_commitment: "String",
   leaf_hash: "String",
-  block_number: "Int",
-  tx_hash: "String",
-};
-
-export const DepositBatchAppend = {
-  chain_id: "Int",
-  from_index: "Int",
-  to_index: "Int",
-  deposit_root: "String",
-  old_frontier_json: "String",
-  leaf_hashes_json: "String",
   block_number: "Int",
   tx_hash: "String",
 };
@@ -33,6 +24,26 @@ export const FinalizedBatch = {
   finalized_checkpoint_id: "BigInt",
   deposit_tree_root: "String",
   withdrawal_tree_root: "String",
+  block_number: "Int",
+  tx_hash: "String",
+};
+
+export const DepositTreeMeta = {
+  chain_index: "Int",
+  last_count: "Int",
+  poseidon_deposit_tree_root: "String",
+  deposit_tree_root: "String",
+  finalized_keccak_deposit_tree_root: "String",
+  last_finalized_checkpoint_id: "BigInt",
+  block_number: "Int",
+  tx_hash: "String",
+};
+
+export const DepositTreeNode = {
+  chain_index: "Int",
+  level: "Int",
+  node_index: "BigInt",
+  hash: "String",
   block_number: "Int",
   tx_hash: "String",
 };

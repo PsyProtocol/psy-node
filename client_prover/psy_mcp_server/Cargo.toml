@@ -1,0 +1,41 @@
+[package]
+name = "psy_mcp_server"
+version = "0.1.0"
+edition = "2021"
+description = "Model Context Protocol server for the Psy wallet — exposes WalletSession's real capabilities (register, transfer, private transfer, claim/UPS) to AI agents under human-set spending policy."
+
+[[bin]]
+name = "psy-mcp-server"
+path = "src/main.rs"
+
+[dependencies]
+# ── Psy wallet engine (the whole point: real proving via WalletSession) ──
+psy_prover = { path = "../psy_prover", default-features = false }
+psy_provider = { path = "../psy_provider" }
+psy_client_common = { path = "../psy_core/psy_common" }
+psy_config = { path = "../psy_core/psy_config" }
+psy_crypto = { path = "../psy_core/psy_crypto" }
+
+# ── Field / proof types ──
+plonky2 = { workspace = true }
+
+# ── MCP transport (official Rust SDK) ──
+rmcp = { version = "0.2", features = ["server", "transport-io", "macros"] }
+
+# ── Nostr note delivery (NIP-59 gift wrap + NIP-44 v2), matching the shipped
+#    web wallet's format so recipient wallets can drain the note ──
+nostr = { version = "0.44", default-features = false, features = ["std", "nip44", "nip59"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = { workspace = true }
+
+# ── Runtime (features are additive on top of the workspace base set) ──
+tokio = { workspace = true, features = ["rt-multi-thread", "io-std", "signal"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+rand = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+schemars = "0.8"

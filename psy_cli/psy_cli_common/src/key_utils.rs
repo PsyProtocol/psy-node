@@ -16,7 +16,7 @@ use psy_crypto::{
 use psy_client_data::config::store_config::PsyHasher;
 use psy_prover::wallet::memory_wallet::{get_secp256k1_fingerprint, get_zk_fingerprint};
 use psy_provider::wallet::secp_wallet::Wallet;
-use psy_ups_circuit::signature::sdk_key::get_sdk_key_public_key_param;
+use psy_ups_circuit::signature::sd_key::get_sd_key_public_key_param;
 use psy_ups_circuit::signature::software_defined::get_sdc_public_key_param;
 use serde::{Deserialize, Serialize};
 
@@ -116,21 +116,21 @@ pub fn load_wallet_key_info(args: &WalletSourceArgs, allow_generate: bool) -> Re
                 generated,
             })
         }
-        SignType::SDKKeySign => {
+        SignType::SDKeySign => {
             let (private_key, generated) = load_or_create_key(args, allow_generate)?;
             let fingerprint = QHashOut::<GoldilocksField>::from_str(
                 args.fingerprint
                     .as_ref()
-                    .ok_or_else(|| anyhow!("sdk-key sign need fingerprint"))?,
+                    .ok_or_else(|| anyhow!("sd-key sign need fingerprint"))?,
             )?;
-            let public_key_param = get_sdk_key_public_key_param(&private_key);
+            let public_key_param = get_sd_key_public_key_param(&private_key);
             let public_key_hash = ZKPublicKeyInfo {
                 fingerprint,
                 public_key_param,
             }
             .qfhash::<PsyHasher>();
             Ok(WalletKeyInfo {
-                sign_type: SignType::SDKKeySign,
+                sign_type: SignType::SDKeySign,
                 private_key,
                 fingerprint,
                 public_key_param,

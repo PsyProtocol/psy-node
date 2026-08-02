@@ -23,7 +23,7 @@ pub struct ComputeDepositLeafArgs {
     #[arg(long)]
     pub chain_index: u32,
     #[arg(long)]
-    pub note_secret_hash: B256,
+    pub note_commitment: B256,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -44,7 +44,7 @@ pub fn compute(args: ComputeDepositLeafArgs) -> ComputeDepositLeafResult {
     let token = address_to_u32x8(args.token);
     let l2_token_contract_id = bytes32_to_u32x8(args.l2_token_contract_id);
     let amount = u256_to_u32x8(args.amount);
-    let note_secret_hash = bytes32_to_u32x8(args.note_secret_hash);
+    let note_commitment = bytes32_to_u32x8(args.note_commitment);
 
     let words = [
         shield_address.as_slice(),
@@ -56,7 +56,7 @@ pub fn compute(args: ComputeDepositLeafArgs) -> ComputeDepositLeafResult {
     .flatten()
     .copied()
     .chain([args.chain_index])
-    .chain(note_secret_hash)
+    .chain(note_commitment)
     .collect::<Vec<_>>();
 
     let leaf = poseidon_hash_u32_words(words.iter().map(|v| *v as u64));

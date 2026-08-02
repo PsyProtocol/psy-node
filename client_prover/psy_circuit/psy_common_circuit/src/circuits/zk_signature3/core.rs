@@ -17,7 +17,12 @@ use psy_crypto::{
 };
 
 use super::super::traits::qstandard::{provable::QStandardCircuitProvable, QStandardCircuit};
-use crate::{builder::hash::core::CircuitBuilderHashCore, proof_minifier::pm_chain::PsyProofMinifierChain, u32::gates::comparison::ComparisonGate};
+use crate::{
+    builder::hash::core::CircuitBuilderHashCore,
+    proof_minifier::pm_chain::PsyProofMinifierChain,
+    serialization::{PsyGateSerializer, PsyGeneratorSerializer},
+    u32::gates::comparison::ComparisonGate,
+};
 #[derive(Debug)]
 pub struct PsyBasicZKSignatureCircuit<C: GenericConfig<D> + 'static, const D: usize>
 where
@@ -257,13 +262,11 @@ impl<C: GenericConfig<D>, const D: usize> PsyBasicZKSignatureInnerCircuit<C, D>
 where
     C::Hasher: AlgebraicHasher<C::F>,
 {
-    pub fn new() -> Self {
-        let config = CircuitConfig::standard_recursion_config();
-
-        let mut timer = DebugTimer::new("new zk sign circuit");
-        timer.lap("build inner circuit");
-        let mut builder = CircuitBuilder::<C::F, D>::new(config);
-
+    /// Builds the inner circuit's virtual targets in a fixed, deterministic
+    /// order. Shared by `new()` and `new_with_serialized_circuit()` so the
+    /// wire indices in the deserialized `circuit_data` line up with these
+    /// freshly-created targets.
+    fn build_targets(builder: &mut CircuitBuilder<C::F, D>) -> (HashOutTarget, HashOutTarget) {
         let private_key = builder.add_virtual_hash();
         let private_key_constants = PRIVATE_KEY_CONSTANTS
             .iter()
@@ -301,15 +304,59 @@ where
         let sig_hash = builder.add_virtual_hash();
         let public_inputs_hash = builder.hash_two_to_one::<C::Hasher>(sig_hash, public_key_param_target);
         builder.register_public_inputs(&public_inputs_hash.elements);
-        let circuit_data = builder.build::<C>();
-        timer.lap("build inner circuit done");
+        (private_key, sig_hash)
+    }
 
+    pub fn new() -> Self {
+        let config = CircuitConfig::standard_recursion_config();
+        let mut builder = CircuitBuilder::<C::F, D>::new(config);
+        let (private_key, sig_hash) = Self::build_targets(&mut builder);
+        let circuit_data = builder.build::<C>();
         Self {
             private_key,
             sig_hash,
             circuit_data,
         }
     }
+
+    /// Serialize the inner circuit data. Uses `PsyGateSerializer`, a superset
+    /// of the stock serializer, so the same serializer works across all Psy
+    /// circuits.
+    pub fn serialize_circuit_data(&self) -> anyhow::Result<Vec<u8>> {
+        let gate_serializer = PsyGateSerializer;
+        let generator_serializer = PsyGeneratorSerializer::<C, D> {
+            _phantom: std::marker::PhantomData,
+        };
+        self.circuit_data
+            .to_bytes(&gate_serializer, &generator_serializer)
+            .map_err(|e| anyhow::anyhow!("zk sign inner circuit_data serialize failed: {e:?}"))
+    }
+
+    pub fn new_with_file(file_path: &str) -> anyhow::Result<Self> {
+        Self::new_with_serialized_circuit(&std::fs::read(file_path)?)
+    }
+
+    pub fn new_with_serialized_circuit(circuit_data_bytes: &[u8]) -> anyhow::Result<Self> {
+        let config = CircuitConfig::standard_recursion_config();
+        let mut builder = CircuitBuilder::<C::F, D>::new(config);
+        // Re-create the targets in the exact same order as `new()` so their wire
+        // indices match the deserialized circuit data; the builder is then discarded.
+        let (private_key, sig_hash) = Self::build_targets(&mut builder);
+
+        let gate_serializer = PsyGateSerializer;
+        let generator_serializer = PsyGeneratorSerializer::<C, D> {
+            _phantom: std::marker::PhantomData,
+        };
+        let circuit_data = CircuitData::<C::F, C, D>::from_bytes(circuit_data_bytes, &gate_serializer, &generator_serializer)
+            .map_err(|e| anyhow::format_err!("zk sign inner circuit_data deserialize failed: {e}"))?;
+
+        Ok(Self {
+            private_key,
+            sig_hash,
+            circuit_data,
+        })
+    }
+
     pub fn prove_base(&self, private_key: QHashOut<C::F>, sig_hash: QHashOut<C::F>) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
         let mut pw = PartialWitness::new();
         pw.set_hash_target(self.private_key, private_key.0)?;

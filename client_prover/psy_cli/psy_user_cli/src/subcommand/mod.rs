@@ -1,12 +1,16 @@
+use std::path::PathBuf;
+
 use clap::{command, Parser, Subcommand};
-use psy_client_common::args::{ExportKeyStoreArgs, ProveProxyArgs, ProverArgs, WalletSessionArgs};
+use psy_client_common::args::{ExportKeyStoreArgs, ProverArgs, PsyFaucetServerArgs, WalletSessionArgs};
 
 pub mod args;
 pub mod compile;
 pub mod compile_deploy;
 pub mod contract_abi_upload;
 pub mod deploy_contract;
+pub mod faucet_server;
 pub mod local_prover;
+#[cfg(feature = "gnark-wrap")]
 pub mod prove_proxy;
 pub mod simulate;
 
@@ -15,15 +19,18 @@ cfg_if::cfg_if! {
         pub mod wallet;
         pub mod register_user;
         pub mod submit_end_cap_proof;
+        pub mod batch_claim;
         pub mod claim_amount;
         pub mod claim_deposit;
         pub mod deposit;
+        pub mod deployments;
         pub mod claim_withdrawal;
         pub mod withdraw;
         pub mod tx;
         pub mod get_checkpoint_id_for_unique_pending_id;
         pub mod generate_batch_proof_miner_reward_proofs;
         pub mod claim_rewards;
+        pub mod get_user_id;
         pub mod get_psy_sdc_fingerprint;
         pub mod get_user_endcap_common_data;
         pub mod note_proof_common;
@@ -31,13 +38,19 @@ cfg_if::cfg_if! {
         pub mod private_transfer;
         pub mod shield_address;
         pub mod export_private_key;
+        pub mod generate_tx_trace;
+        pub mod prove_tx_trace;
     }
 }
 
 #[derive(Parser)]
+#[command(version)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
+    /// Atomically write the command's secret-free structured result.
+    #[arg(global = true, long = "result-file", value_name = "PATH")]
+    pub result_file: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -81,7 +94,6 @@ pub enum Commands {
 
     GetWithdrawalTreeRoot(crate::subcommand::args::WithdrawalTreeRootArgs),
 
-
     GetLatestCheckpointTreeRoot(crate::subcommand::args::LatestCheckpointTreeRootArgs),
     GetCheckpointTreeRoot(crate::subcommand::args::CheckpointTreeRootArgs),
     GetCheckpointTreeLeafHash(crate::subcommand::args::CheckpointTreeLeafHashArgs),
@@ -96,10 +108,13 @@ pub enum Commands {
 
     // local proving
     LocalProver(ProverArgs),
-    ProveProxy(ProveProxyArgs),
+    #[cfg(feature = "gnark-wrap")]
+    ProveProxy(psy_client_common::args::ProveProxyArgs),
+    FaucetServer(PsyFaucetServerArgs),
 
     // claim amount
     GetClaimAmount(crate::subcommand::args::ClaimAmountArgs),
+    BatchClaim(crate::subcommand::args::BatchClaimArgs),
     Tx(crate::subcommand::args::TxArgs),
     // batch proof miner rewards
     GetCheckpointIdForUniquePendingId(crate::subcommand::args::GetCheckpointIdForUniquePendingIdArgs),
@@ -118,13 +133,20 @@ pub enum Commands {
     CompileAndDeploy(crate::subcommand::args::CompileAndDeployArgs),
     /// Simulate a contract method execution (no proofs)
     Simulate(crate::subcommand::args::SimulateArgs),
+    /// Generate a transaction trace without proving (outputs a JSON trace file
+    /// that prove-tx-trace can consume).
+    GenerateTxTrace(crate::subcommand::generate_tx_trace::GenerateTxTraceArgs),
+    /// Prove a previously generated transaction trace and submit the end-cap
+    /// proof.
+    ProveTxTrace(crate::subcommand::prove_tx_trace::ProveTxTraceArgs),
     /// Execute private transfer flow and generate note proof payload.
     PrivateTransfer(crate::subcommand::args::PrivateTransferArgs),
     /// Claim a private note from generated proof payload.
     PrivateClaim(crate::subcommand::args::PrivateClaimArgs),
     /// Derive note owner hash from receiver pubkey and binding.
     DeriveNoteOwner(crate::subcommand::args::DeriveNoteOwnerArgs),
-    /// Claim a bridge deposit on L2. Requires the deposit proof from psy-services.
+    /// Claim a bridge deposit on L2. Requires the deposit proof from
+    /// psy-services.
     ClaimDeposit(crate::subcommand::args::ClaimDepositArgs),
     /// Withdraw tokens from L2 to L1 via the bridge.
     Withdraw(crate::subcommand::args::WithdrawArgs),

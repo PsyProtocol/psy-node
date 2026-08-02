@@ -41,7 +41,7 @@ parth_core = { path = "../../parth_core" }
 plonky2 = { workspace = true }
 gnark-plonky2-verifier-ffi = { workspace = true }
 home = { workspace = true }
-psy_plonky2_circuits = { workspace = true }
+psy_plonky2_circuits = { workspace = true, features = ["gnark-wrap"] }
 psy_plonky2_common_circuits = { workspace = true }
 psy_plonky2_basic_helpers = { workspace = true }
 psy_data = { workspace = true }
@@ -50,7 +50,7 @@ psy_client_data = { workspace = true }
 psy_client_common = { workspace = true }
 psy_cli_common = { path = "../psy_cli_common" }
 psy_config = { workspace = true }
-psy_prover = { workspace = true }
+psy_prover = { workspace = true, features = ["gnark-wrap"] }
 psy_core = { workspace = true }
 psy_vm = { workspace = true }
 psy_crypto = { workspace = true }

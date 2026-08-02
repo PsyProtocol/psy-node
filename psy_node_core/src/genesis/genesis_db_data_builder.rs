@@ -57,6 +57,7 @@ pub struct GenesisDatabaseDataBuilder<F, Hash> {
     pub total_users_registered: usize,
 
     pub contract_code_definitions: Vec<ContractCodeDefinitionWithContractId>,
+
 }
 
 impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisDatabaseDataBuilder<F, Hash> {
@@ -334,7 +335,7 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
     pub fn get_populated_checkpoint_leaf(&self) -> PsyCheckpointLeafPopulated<F, Hash> {
         PsyCheckpointLeafPopulated {
             global_state_roots: self.get_checkpoint_state_roots(),
-            stats: self.checkpoint_stats,
+            stats: self.checkpoint_stats.clone(),
         }
     }
     pub fn get_coordinator_pending_checkpoint_base<Hasher: FieldQHasher<F, Hash>>(

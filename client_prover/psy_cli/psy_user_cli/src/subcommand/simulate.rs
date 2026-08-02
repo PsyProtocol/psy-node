@@ -1,6 +1,6 @@
 use std::{fs, path::Path};
 
-use psy_compiler::abi::ContractABI;
+use psy_client_data::abi::Abi;
 use psy_vm::dpn::{
     eval::executor::{ExecutionContext, ExecutionResult, InMemoryStateBackend, VmExecutor},
     vm::def::DPNFunctionCircuitDefinition,
@@ -15,8 +15,8 @@ pub async fn run(args: SimulateArgs) -> anyhow::Result<()> {
     let (circuit_defs, abi) = load_contract(&args)?;
 
     // Find the method to execute
-    let method_info = abi.methods.iter().find(|m| m.name == args.method).ok_or_else(|| {
-        let available: Vec<&str> = abi.methods.iter().map(|m| m.name.as_str()).collect();
+    let method_info = abi.contract.methods.iter().find(|m| m.name == args.method).ok_or_else(|| {
+        let available: Vec<&str> = abi.contract.methods.iter().map(|m| m.name.as_str()).collect();
         anyhow::anyhow!("Method '{}' not found. Available methods: {:?}", args.method, available)
     })?;
 
@@ -58,8 +58,8 @@ pub async fn run(args: SimulateArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn load_contract(args: &SimulateArgs) -> anyhow::Result<(Vec<DPNFunctionCircuitDefinition>, ContractABI)> {
-    if let Some(ref source_path) = args.source {
+fn load_contract(args: &SimulateArgs) -> anyhow::Result<(Vec<DPNFunctionCircuitDefinition>, Abi)> {
+    if let Some(source_path) = &args.source {
         // Compile from source
         let path = Path::new(source_path);
         if !path.exists() {
@@ -67,34 +67,54 @@ fn load_contract(args: &SimulateArgs) -> anyhow::Result<(Vec<DPNFunctionCircuitD
         }
 
         let output = if args.is_crate {
-            psy_compiler::compile_crate(path)?
+            psy_prover::session::compile_bridge::compile_crate_output(path)
+                .map_err(|error| anyhow::anyhow!("failed to compile crate source {}: {:#}", path.display(), error))?
         } else {
-            let source = fs::read_to_string(path)?;
-            psy_compiler::compile(&source)?
+            let source = fs::read_to_string(path)
+                .map_err(|error| anyhow::anyhow!("failed to read source file {}: {}", path.display(), error))?;
+            psy_prover::session::compile_bridge::compile_contract_output(&source)
+                .map_err(|error| anyhow::anyhow!("failed to compile source {}: {:#}", path.display(), error))?
         };
 
         Ok((output.circuit_definitions, output.abi))
-    } else if let Some(ref defs_path) = args.circuit_defs_path {
+    } else if let Some(defs_path) = &args.circuit_defs_path {
         // Load pre-compiled circuit definitions + ABI
-        let defs: Vec<DPNFunctionCircuitDefinition> = serde_json::from_str(&fs::read_to_string(defs_path)?)?;
+        let defs_source = fs::read_to_string(defs_path)
+            .map_err(|error| anyhow::anyhow!("failed to read circuit definitions {}: {}", defs_path, error))?;
+        let defs: Vec<DPNFunctionCircuitDefinition> = serde_json::from_str(&defs_source)
+            .map_err(|error| anyhow::anyhow!("failed to parse circuit definitions {}: {}", defs_path, error))?;
 
-        let abi = if let Some(ref abi_path) = args.abi_path {
-            serde_json::from_str(&fs::read_to_string(abi_path)?)?
+        let abi = if let Some(abi_path) = &args.abi_path {
+            let abi_source = fs::read_to_string(abi_path)
+                .map_err(|error| anyhow::anyhow!("failed to read ABI {}: {}", abi_path, error))?;
+            serde_json::from_str(&abi_source).map_err(|error| anyhow::anyhow!("failed to parse ABI {}: {}", abi_path, error))?
         } else {
             // If no ABI path, create a minimal ABI from the circuit definitions
-            ContractABI {
-                contract_name: "Unknown".to_string(),
-                state_tree_height: 0,
-                state_layout: vec![],
-                methods: defs
-                    .iter()
-                    .map(|d| psy_compiler::abi::ABIMethod {
-                        name: d.name.clone(),
-                        method_id: d.method_id,
-                        params: vec![],
-                        is_view: d.is_view_function(),
-                    })
-                    .collect(),
+            Abi {
+                schema_version: "2.0.0".to_string(),
+                contract: psy_client_data::abi::AbiContract {
+                    name: "Unknown".to_string(),
+                    state_tree_height: 0,
+                    state: vec![],
+                    methods: defs
+                        .iter()
+                        .map(|d| psy_client_data::abi::AbiMethod {
+                            name: d.name.clone(),
+                            method_id: d.method_id,
+                            state_mutability: if d.is_view_function() {
+                                psy_client_data::abi::StateMutability::View
+                            } else {
+                                psy_client_data::abi::StateMutability::External
+                            },
+                            inputs: vec![],
+                            outputs: vec![],
+                            input_felt_count: 0,
+                            output_felt_count: 0,
+                            vm_type: None,
+                        })
+                        .collect(),
+                },
+                types: vec![],
             }
         };
 
@@ -104,7 +124,7 @@ fn load_contract(args: &SimulateArgs) -> anyhow::Result<(Vec<DPNFunctionCircuitD
     }
 }
 
-fn format_result(result: &ExecutionResult, abi: &ContractABI, args: &SimulateArgs) -> anyhow::Result<()> {
+fn format_result(result: &ExecutionResult, abi: &Abi, args: &SimulateArgs) -> anyhow::Result<()> {
     let format = args.format.as_deref().unwrap_or("table");
 
     match format {
@@ -118,7 +138,7 @@ fn format_result(result: &ExecutionResult, abi: &ContractABI, args: &SimulateArg
                     println!("outputs: {:?}", result.outputs);
                 }
                 println!("state_changes: {} reads, {} writes", result.state_reads.len(), result.state_writes.len());
-            } else if let Some(ref failure) = result.failure {
+            } else if let Some(failure) = &result.failure {
                 println!("FAILED: {}", failure.message);
                 println!(
                     "  assertion[{}]: {} != {}",
@@ -132,7 +152,7 @@ fn format_result(result: &ExecutionResult, abi: &ContractABI, args: &SimulateArg
             println!();
             println!("Status: {}", if result.success { "SUCCESS" } else { "FAILED" });
 
-            if let Some(ref failure) = result.failure {
+            if let Some(failure) = &result.failure {
                 println!();
                 println!("Failure:");
                 println!("  Assertion #{}: {}", failure.assertion_index, failure.message);
@@ -214,26 +234,27 @@ fn format_result(result: &ExecutionResult, abi: &ContractABI, args: &SimulateArg
 }
 
 /// Try to resolve a slot index to a human-readable field name from the ABI
-fn resolve_field_name(abi: &ContractABI, slot_index: u64) -> Option<String> {
-    for field in &abi.state_layout {
+fn resolve_field_name(abi: &Abi, slot_index: u64) -> Option<String> {
+    use psy_client_data::abi::TypeRef;
+    for field in &abi.contract.state {
         let offset = field.offset as u64;
         let size = field.felt_size as u64;
 
         if slot_index >= offset && slot_index < offset + size {
-            if field.is_array {
-                if let (Some(elem_size), Some(_count)) = (field.element_felt_size, field.array_count) {
-                    let elem_size = elem_size as u64;
-                    let relative = slot_index - offset;
+            let relative = slot_index - offset;
+            if let TypeRef::Array { item_felt_size, length, .. } = &field.ty {
+                let elem_size = *item_felt_size as u64;
+                if elem_size > 0 {
                     let array_idx = relative / elem_size;
                     let field_offset = relative % elem_size;
-                    return Some(format!("{}.{}[{}]+{}", abi.contract_name, field.name, array_idx, field_offset));
+                    return Some(format!("{}.{}[{}]+{}", abi.contract.name, field.name, array_idx, field_offset));
                 }
+                let _ = length;
             }
-            let relative = slot_index - offset;
             if relative == 0 {
-                return Some(format!("{}.{}", abi.contract_name, field.name));
+                return Some(format!("{}.{}", abi.contract.name, field.name));
             } else {
-                return Some(format!("{}.{}+{}", abi.contract_name, field.name, relative));
+                return Some(format!("{}.{}+{}", abi.contract.name, field.name, relative));
             }
         }
     }

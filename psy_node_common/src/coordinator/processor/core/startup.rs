@@ -132,7 +132,7 @@ where
             ));
         }
         */
-        let (guta_queue_gatherer, guta_join_handle) = EphemeralQueueGathererWithTree::new_with_is_active::<
+        let (guta_queue_gatherer, guta_join_handle) = EphemeralQueueGathererWithTree::new_with_status::<
             GUTAUpdateQueue,
             CoordinatorGUTAUpdateGathererConfig<N, TempDatabase, FileSystem>,
             N::QHash,
@@ -143,10 +143,10 @@ where
             guta_create_builder_config,
             db.guta_queue_key_status_manager.get_queue_key()?,
             global_user_tree,
-            db.is_active.clone(),
+            db.status.clone(),
         );
 
-        let (register_user_queue_gatherer, register_user_join_handle) = EphemeralQueueGathererWithTree::new_with_is_active::<
+        let (register_user_queue_gatherer, register_user_join_handle) = EphemeralQueueGathererWithTree::new_with_status::<
             RegisterUserQueue,
             RegisterUserGathererConfig<N, TempDatabase, FileSystem>,
             N::QHash,
@@ -168,9 +168,9 @@ where
             },
             db.register_user_queue_key_status_manager.get_queue_key()?,
             user_registration_tree,
-            db.is_active.clone(),
+            db.status.clone(),
         );
-        let (deploy_contract_queue_gatherer, deploy_contract_join_handle) = EphemeralQueueGathererWithTree::new_with_is_active::<
+        let (deploy_contract_queue_gatherer, deploy_contract_join_handle) = EphemeralQueueGathererWithTree::new_with_status::<
             DeployContractQueue,
             DeployContractGathererConfig<N, TempDatabase, FileSystem>,
             N::QHash,
@@ -191,7 +191,7 @@ where
             },
             db.deploy_contract_queue_key_status_manager.get_queue_key()?,
             global_contract_tree,
-            db.is_active.clone(),
+            db.status.clone(),
         );
 
         Ok((

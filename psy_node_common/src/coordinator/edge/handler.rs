@@ -6,6 +6,7 @@ use parth_core::{
 };
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_crypto::hash::tx_hash::{compute_deploy_contract_content_hash, hash_to_hex};
+use psy_api_core::CheckpointJobStats;
 use psy_data::{
     guta::header_extended::{GlobalUserTreeAggregatorHeaderWithTagValueAndJobID, GlobalUserTreeAggregatorHeaderWithTagValueAndJobType}, prepared_block::realm::PsyRealmCoordinatorUpdate, v1::{
         common_api::PsyProoffMinerRewardProof,
@@ -220,6 +221,26 @@ impl<
     }
     pub async fn get_latest_checkpoint_id_internal(&self) -> anyhow::Result<u64> {
         self.db_reader.get_latest_checkpoint_id().await
+    }
+    pub async fn get_job_stats_internal(&self, checkpoint_id: u64) -> anyhow::Result<CheckpointJobStats> {
+        let (unique_pending_id, _) = self
+            .db_reader
+            .get_unique_pending_id_for_checkpoint_id(checkpoint_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("no unique pending id found for checkpoint id {}", checkpoint_id))?;
+        let stats = self
+            .temp_db
+            .get_job_stats(&self.realm_identifier, unique_pending_id)
+            .await?
+            .unwrap_or_default();
+
+        Ok(CheckpointJobStats {
+            unique_pending_id,
+            total_completed: stats.total_completed,
+            total_duration_ms: stats.total_duration_ms,
+            min_duration_ms: stats.min_duration_ms,
+            max_duration_ms: stats.max_duration_ms,
+        })
     }
     pub async fn get_checkpoint_id_for_unique_pending_id_internal(&self, unique_pending_id: u64) -> anyhow::Result<Option<u64>> {
         self.db_reader.get_checkpoint_id_for_unique_pending_id(unique_pending_id).await

@@ -14,10 +14,16 @@ pub const MAX_EVENT_RECORDS_PER_CALL: usize = 32;
 pub const CONTRACT_FUNCTION_TREE_HEIGHT: u8 = 16;
 
 pub const MAX_CONTRACT_STATE_TREE_HEIGHT: u8 = 32;
-pub const MINING_REWARDS_CONTRACT_ID: u64 = 6;
+pub const MINING_REWARDS_CONTRACT_ID: u64 = 1;
 pub const TOKEN_CONTRACT_ID: u32 = 0;
 pub const TOKEN_SIMPLE_BURN_METHOD_ID: u32 = 2923993647;
 pub const USERS_PER_REALM: u64 = 1048576;
+
+/// Height of the private-note tree. Shared by the wallet's base
+/// `PrivateNoteInclusionInnerCircuit` and the server-side
+/// `PrivateNoteInclusionCircuit` minifier — they MUST agree or the base proof's
+/// fingerprint won't match the minifier that wraps it.
+pub const PRIVATE_NOTE_TREE_HEIGHT: usize = 20;
 
 pub const DA_CHALLENGE_WINDOW: usize = 14;
 
@@ -34,12 +40,12 @@ pub const UPS_CIRCUIT_WHITELIST_TREE_HEIGHT: u8 = 8;
 
 pub const PSY_SIG_ACTION_SIGN_UPS_END_CAP: u64 = 0x51454445434150CFu64;
 
-pub const SDK_KEY_MAGIC: u64 = 0x53444B4B45594D47u64;
-pub const SDK_KEY_TX_INTROSPECT_MAGIC: u64 = 0x53444B5458494E54u64;
-pub const SDK_KEY_MAX_INTROSPECTABLE_TRANSACTIONS: usize = 16;
+pub const SD_KEY_MAGIC: u64 = 0x53444B4B45594D47u64;
+pub const SD_KEY_TX_INTROSPECT_MAGIC: u64 = 0x53444B5458494E54u64;
+pub const SD_KEY_MAX_INTROSPECTABLE_TRANSACTIONS: usize = 16;
 
 pub const VM_TYPE_STANRDARD_DAPEN_V1: u32 = 1;
-pub const VM_TYPE_SDK_KEY_V1: u32 = 2;
+pub const VM_TYPE_SD_KEY_V1: u32 = 2;
 
 pub const GUTA_CIRCUIT_WHITELIST_TREE_HEIGHT: u8 = 4;
 

@@ -107,7 +107,6 @@ impl IMTLeafTargets {
 ///
 /// This matches
 /// [`compare_qhashout_keys`](psy_client_data::qdata::imt_contract_state::compare_qhashout_keys).
-///
 pub fn is_qhashout_lte<F: RichField + Extendable<D>, const D: usize>(
     builder: &mut CircuitBuilder<F, D>,
     a: HashOutTarget,

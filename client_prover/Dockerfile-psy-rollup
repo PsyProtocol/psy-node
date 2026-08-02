@@ -1,0 +1,19 @@
+#FROM ubuntu:24.04
+FROM archlinux:latest
+
+WORKDIR /psy-rollup
+
+# Copy built binaries
+COPY ./target/release/psy_node_cli /usr/local/bin/
+
+# Copy configuration files
+COPY config.json ./
+COPY .env ./
+
+# Set environment variables
+ENV RUST_LOG="psy_ups_circuit=trace,psy_dpn_circuit=trace,tikv_client=warn,psy_store=trace,psy_user_cli=debug,psy_dev_cli=debug,psy_services=info,psy_node_cli=debug,psy_node=trace,psy_common_circuit=trace,psy_network_circuit=trace,psy_prover=trace,psy_data=trace,plonky2=error"
+ENV TIKV_PD_ENDPOINTS="127.0.0.1:2379,127.0.0.1:2381,127.0.0.1:2383"
+ENV DATABASE_URL="postgres://postgres:password@127.0.0.1:5432/postgres"
+
+# Default command
+CMD ["psy_node_cli", "--help"]

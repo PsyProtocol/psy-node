@@ -1,4 +1,5 @@
 pub mod constants;
+pub mod compression;
 pub mod tables;
 pub mod core;
 pub mod core_db;

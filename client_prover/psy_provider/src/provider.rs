@@ -1,4 +1,4 @@
-use std::{collections::HashMap, marker::PhantomData, result::Result::Ok, sync::Arc, time::Duration};
+use std::{collections::HashMap, future::Future, marker::PhantomData, result::Result::Ok, sync::Arc, time::Duration};
 
 use plonky2::{
     field::{goldilocks_field::GoldilocksField, types::PrimeField64},
@@ -28,7 +28,7 @@ use psy_client_data::{
         ups_end_cap::UPSEndCapFromProofTreeGadgetInput,
     },
 };
-use psy_common_circuit::circuits::zk_signature3::core::PsyBasicZKSignatureInnerCircuit;
+use psy_config::network_constants::{COORDINATOR_USER_TREE_HEIGHT, REALM_USER_TREE_HEIGHT};
 use psy_crypto::{
     common::witnesses::qrecursion::{
         header::QRecursionAggStandardHeader,
@@ -56,19 +56,58 @@ use super::request::{
 };
 use crate::{
     request::{
-        DPNSoftwareDefinedSignatureProofRPCRequest, QBlockStateRPCRequest, QGenerateBatchProofMinerRewardProofsRPCRequest,
-        QGetCheckpointIdForUniquePendingIdRPCRequest, QGetContractMethodCommonDataRPCRequest, QGetFnIdRPCRequest, QLatestBlockStateRPCRequest,
-        QLeftAggRightLeafRpcRequestV2, QLeftLeafRightAggRpcRequestV2, QProveContractCallRPCRequest, QProveUpsStartRPCRequest,
-        QProveUpsStartRegisterUserRPCRequest, QRegisterCircuitsRPCRequest, QRegisterDPNSoftwareDefinedCircuitRPCRequest,
-        QRegisterPlonky2SoftwareDefinedCircuitRPCRequest, QResolveContractFunctionByMethodIdRPCRequest,
-        QResolveContractFunctionByMethodNameRPCRequest, QSecpSignatureProofRPCRequest, QSignatureMinifierProofRPCRequest, QSingleLeafRpcRequestV2,
-        QTwoAggRpcRequsetV2, QTwoLeafRpcRequestV2, QUpsCfcDeferredTxRPCRequest, QUpsCfcStandardTxRPCRequest, QUpsEndCapRPCRequestV2,
-        QUserSubTreeMerkleProofRPCRequest, RequestParamsV2,
+        DPNSoftwareDefinedSignatureProofRPCRequest, QBaseProofMinifierRPCRequest, QBlockStateRPCRequest,
+        QGenerateBatchProofMinerRewardProofsRPCRequest, QGetCheckpointIdForUniquePendingIdRPCRequest, QGetContractMethodCommonDataRPCRequest,
+        QGetFnIdRPCRequest, QGetUserEndCapSlotUpdatesRPCRequest, QLatestBlockStateRPCRequest, QLeftAggRightLeafRpcRequestV2,
+        QLeftLeafRightAggRpcRequestV2, QProveContractCallRPCRequest, QProveUpsStartRPCRequest, QProveUpsStartRegisterUserRPCRequest,
+        QRegisterCircuitsRPCRequest, QRegisterDPNSoftwareDefinedCircuitRPCRequest, QRegisterPlonky2SoftwareDefinedCircuitRPCRequest,
+        QResolveContractFunctionByMethodIdRPCRequest, QResolveContractFunctionByMethodNameRPCRequest, QSecpSignatureProofRPCRequest,
+        QSignatureMinifierProofRPCRequest, QSingleLeafRpcRequestV2, QTwoAggRpcRequsetV2, QTwoLeafRpcRequestV2, QUpsCfcDeferredTxRPCRequest,
+        QUpsCfcStandardTxRPCRequest, QUpsEndCapRPCRequestV2, QUserSubTreeMerkleProofRPCRequest, RealmEndCapSlotUpdates, RequestParamsV2,
     },
     session::TxStatus,
 };
 
 type TxHash = String;
+
+const END_CAP_ALREADY_SUBMITTED_ERROR_CODE: i64 = -32001;
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("end cap for user_id {user_id} at unique_pending_id {unique_pending_id} has already been submitted")]
+pub struct EndCapAlreadySubmitted {
+    pub user_id: u64,
+    pub unique_pending_id: u64,
+}
+
+fn parse_end_cap_already_submitted(error: &crate::request::RpcError) -> Option<EndCapAlreadySubmitted> {
+    if error.code != crate::request::ErrorCode::ServerError(END_CAP_ALREADY_SUBMITTED_ERROR_CODE) || error.data.is_some() {
+        return None;
+    }
+
+    let remainder = error.message.strip_prefix("end cap for user_id ")?;
+    let (user_id, remainder) = remainder.split_once(" at unique_pending_id ")?;
+    let unique_pending_id = remainder.strip_suffix(" has already been submitted")?;
+    if user_id.is_empty()
+        || unique_pending_id.is_empty()
+        || !user_id.bytes().all(|byte| byte.is_ascii_digit())
+        || !unique_pending_id.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+
+    Some(EndCapAlreadySubmitted {
+        user_id: user_id.parse().ok()?,
+        unique_pending_id: unique_pending_id.parse().ok()?,
+    })
+}
+// withdrawal_tree storage is felt-addressed, with 4 felts packed per
+// contract-state leaf. Layout:
+//   root[8]                 -> sub-slots 0..7
+//   frontiers[8192][8]      -> sub-slots 8..65543
+//   chain_counts[256]       -> sub-slots 65544..65799
+//   global_count            -> sub-slot 65800
+const WITHDRAWAL_TREE_CHAIN_COUNTS_SUBSLOT_BASE: u64 = 8 + (8192 * 8);
+const WITHDRAWAL_TREE_GLOBAL_COUNT_SUBSLOT_BASE: u64 = WITHDRAWAL_TREE_CHAIN_COUNTS_SUBSLOT_BASE + 256;
 
 #[cfg(not(target_arch = "wasm32"))]
 type WaitDeadline = tokio::time::Instant;
@@ -118,17 +157,29 @@ async fn sleep_for(duration: Duration) {
             .ok()
             .and_then(|v| v.dyn_into::<Function>().ok())
         {
-            let _ = set_timeout.call2(
-                &global_obj,
-                cb.as_ref().unchecked_ref(),
-                &JsValue::from_f64(ms as f64),
-            );
+            let _ = set_timeout.call2(&global_obj, cb.as_ref().unchecked_ref(), &JsValue::from_f64(ms as f64));
         } else {
             let _ = resolve.call0(&JsValue::NULL);
         }
         cb.forget();
     });
     let _ = JsFuture::from(promise).await;
+}
+
+async fn find_endcap_inclusion_in_range<F, Fut>(checkpoint_before: u64, latest: u64, mut is_included: F) -> anyhow::Result<Option<u64>>
+where
+    F: FnMut(u64) -> Fut,
+    Fut: Future<Output = anyhow::Result<bool>>,
+{
+    if latest < checkpoint_before {
+        return Ok(None);
+    }
+    for checkpoint_id in checkpoint_before..=latest {
+        if is_included(checkpoint_id).await? {
+            return Ok(Some(checkpoint_id));
+        }
+    }
+    Ok(None)
 }
 
 #[derive(Debug, Clone)]
@@ -399,6 +450,9 @@ impl QUserRpcProvider for RpcProvider {
             }
             ResponseResult::Error(e) => {
                 tracing::error!("RPC call failed: {:?}", e);
+                if let Some(ack) = parse_end_cap_already_submitted(&e) {
+                    return Err(ack.into());
+                }
                 Err(anyhow::format_err!("submit_end_cap_proof rpc call failed `{:?}`", e))
             }
         }
@@ -430,10 +484,7 @@ impl RpcProvider {
         match response.result {
             ResponseResult::Success(user_ids) => {
                 tracing::info!("get user ids: {:?}", user_ids);
-                match user_ids.is_empty() {
-                    true => Err(anyhow::format_err!("no user ids found")),
-                    false => Ok(user_ids),
-                }
+                Ok(user_ids)
             }
             ResponseResult::Error(e) => Err(anyhow::format_err!("rpc call failed `{:?}`", e)),
         }
@@ -689,19 +740,50 @@ impl RpcProvider {
         Ok(format!("0x{}", hex::encode(out)))
     }
 
-    /// Read the withdrawal tree contract's `next_index` (= chain_counts[0] for chain 0).
-    /// This tells us how many withdrawals have already been appended to chain 0.
-    /// The `next_index` field is stored at storage slot 2 (1 QHashOut slot).
-    pub async fn get_withdrawal_tree_next_index(&self, checkpoint_id: u64, user_id: u64) -> anyhow::Result<u64> {
+    /// Read the withdrawal tree contract's per-chain counter
+    /// (`chain_counts[chain_index]`). This matches
+    /// withdrawal_tree.get_chain_next_index(chain_index): the counter lives
+    /// in the compiled sub-slot layout, not at contract-state leaf index ==
+    /// chain_index.
+    pub async fn get_withdrawal_tree_next_index(&self, checkpoint_id: u64, user_id: u64, chain_index: u64) -> anyhow::Result<u64> {
         const WITHDRAWAL_TREE_CONTRACT_ID: u32 = 3;
         const CONTRACT_STATE_TREE_HEIGHT: u8 = 32;
-        const NEXT_INDEX_SLOT: u64 = 2;
 
+        let sub_slot_index = WITHDRAWAL_TREE_CHAIN_COUNTS_SUBSLOT_BASE + chain_index;
+        let leaf_index = sub_slot_index / 4;
         let slot = self
-            .get_user_contract_state_tree_leaf_hash(checkpoint_id, user_id, WITHDRAWAL_TREE_CONTRACT_ID, CONTRACT_STATE_TREE_HEIGHT, NEXT_INDEX_SLOT)
+            .get_user_contract_state_tree_leaf_hash(
+                checkpoint_id,
+                user_id,
+                WITHDRAWAL_TREE_CONTRACT_ID,
+                CONTRACT_STATE_TREE_HEIGHT,
+                leaf_index,
+            )
             .await?;
         let elements = slot.0.elements;
-        Ok(elements[0].to_canonical_u64())
+        Ok(elements[(sub_slot_index % 4) as usize].to_canonical_u64())
+    }
+
+    /// Read the withdrawal tree contract's global counter
+    /// (`global_count`), which tracks the total number of appended leaves
+    /// across all `chain_index` buckets.
+    pub async fn get_withdrawal_tree_global_count(&self, checkpoint_id: u64, user_id: u64) -> anyhow::Result<u64> {
+        const WITHDRAWAL_TREE_CONTRACT_ID: u32 = 3;
+        const CONTRACT_STATE_TREE_HEIGHT: u8 = 32;
+
+        let sub_slot_index = WITHDRAWAL_TREE_GLOBAL_COUNT_SUBSLOT_BASE;
+        let leaf_index = sub_slot_index / 4;
+        let slot = self
+            .get_user_contract_state_tree_leaf_hash(
+                checkpoint_id,
+                user_id,
+                WITHDRAWAL_TREE_CONTRACT_ID,
+                CONTRACT_STATE_TREE_HEIGHT,
+                leaf_index,
+            )
+            .await?;
+        let elements = slot.0.elements;
+        Ok(elements[(sub_slot_index % 4) as usize].to_canonical_u64())
     }
 
     pub async fn is_endcap_included_at_checkpoint(
@@ -714,12 +796,7 @@ impl RpcProvider {
         Ok(user_leaf_data.qfhash::<PsyHasher>() == end_user_leaf_hash)
     }
 
-    pub async fn wait_next_checkpoint(
-        &self,
-        checkpoint_before: u64,
-        deadline: Option<WaitDeadline>,
-        poll_interval_secs: u64,
-    ) -> anyhow::Result<u64> {
+    pub async fn wait_next_checkpoint(&self, checkpoint_before: u64, deadline: Option<WaitDeadline>, poll_interval_secs: u64) -> anyhow::Result<u64> {
         loop {
             let coordinator_latest = self.get_coordinator_latest_block_state().await?.checkpoint_id;
             if coordinator_latest > checkpoint_before {
@@ -747,29 +824,24 @@ impl RpcProvider {
         poll_interval_secs: u64,
     ) -> anyhow::Result<u64> {
         let deadline = deadline_after(timeout_secs);
-        let mut latest = self
-            .wait_next_checkpoint(checkpoint_before, deadline, poll_interval_secs)
-            .await?;
+        let mut latest = self.get_coordinator_latest_block_state().await?.checkpoint_id;
 
         loop {
-            for checkpoint_id in checkpoint_before..=latest {
-                match self
-                    .is_endcap_included_at_checkpoint(checkpoint_id, user_id, end_user_leaf_hash)
-                    .await
-                {
-                    Ok(true) => return Ok(checkpoint_id),
-                    Ok(false) => {}
-                    Err(err) => {
-                        tracing::warn!(
-                            user_id,
-                            checkpoint_id,
-                            checkpoint_before,
-                            latest,
-                            error = %err,
-                            "endcap inclusion checkpoint check failed; retrying"
-                        );
-                        break;
-                    }
+            match find_endcap_inclusion_in_range(checkpoint_before, latest, |checkpoint_id| {
+                self.is_endcap_included_at_checkpoint(checkpoint_id, user_id, end_user_leaf_hash)
+            })
+            .await
+            {
+                Ok(Some(checkpoint_id)) => return Ok(checkpoint_id),
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        user_id,
+                        checkpoint_before,
+                        latest,
+                        error = %err,
+                        "endcap inclusion checkpoint check failed; retrying"
+                    );
                 }
             }
 
@@ -873,6 +945,20 @@ impl RpcProvider {
         // reqwest
         let url = coordinator_urls[random_index].clone();
         Ok(url)
+    }
+
+    pub async fn get_realm_user_end_cap_slot_updates(&self, user_id: u64, unique_pending_id: u64) -> anyhow::Result<Option<RealmEndCapSlotUpdates>> {
+        let rpc_url = self.get_realm_url(user_id)?;
+        let response = psy_rpc_call_back!(
+            self,
+            rpc_url,
+            RequestParams::<F>::GetUserEndCapSlotUpdates(QGetUserEndCapSlotUpdatesRPCRequest { unique_pending_id, user_id }),
+            Option<RealmEndCapSlotUpdates>
+        );
+        match response.result {
+            ResponseResult::Success(updates) => Ok(updates),
+            ResponseResult::Error(error) => Err(anyhow::format_err!("rpc call failed `{:?}`", error)),
+        }
     }
 
     async fn get_checkpoint_id_for_unique_pending_id_inner(&self, url: String, unique_pending_id: u64) -> anyhow::Result<Option<u64>> {
@@ -982,7 +1068,6 @@ where
     pub client: Arc<Client>,
     pub proof_proxy_url: String,
     pub common_circuits_data: LocalCommonCircuitsData<C::F>,
-    pub zk_sign_inner_circuit: PsyBasicZKSignatureInnerCircuit<C, D>,
     pub _marker: PhantomData<C>,
 }
 
@@ -1003,6 +1088,8 @@ pub struct LocalCommonCircuitsData<F: RichField> {
     pub ups_end_cap: QCommonCircuitData<F>,
     pub zk_circuit: QCommonCircuitData<F>,
     pub secp_circuit: QCommonCircuitData<F>,
+    pub private_note_inclusion_minifier: QCommonCircuitData<F>,
+    pub shield_deposit_claim_minifier: QCommonCircuitData<F>,
 
     pub ups_circuit_whitelist_root: QHashOut<F>,
     pub ups_start_whitelist_proof: MerkleProofCore<QHashOut<F>>,
@@ -1055,7 +1142,6 @@ where
         Ok(Self {
             client: Arc::new(client),
             common_circuits_data,
-            zk_sign_inner_circuit: PsyBasicZKSignatureInnerCircuit::new(),
             proof_proxy_url,
             _marker: PhantomData,
         })
@@ -1098,7 +1184,6 @@ where
         Ok(Self {
             client: Arc::new(client),
             common_circuits_data,
-            zk_sign_inner_circuit: PsyBasicZKSignatureInnerCircuit::new(),
             proof_proxy_url,
             _marker: PhantomData,
         })
@@ -1434,16 +1519,15 @@ where
         }
     }
 
-    async fn prove_zk_sign(&self, private_key: QHashOut<C::F>, sig_hash: QHashOut<C::F>) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
-        tracing::info!("prove_zk_sign: {}", sig_hash.to_string());
-        let inner_proof = self.zk_sign_inner_circuit.prove_base(private_key, sig_hash)?;
-        let inner_proof_str = serde_json::to_string(&inner_proof)?;
+    async fn prove_zk_sign_minifier(&self, inner_proof: ProofWithPublicInputs<C::F, C, D>) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
+        tracing::info!("prove_zk_sign_minifier");
+        let inner_proof = serde_json::to_string(&inner_proof)?;
 
         let response = psy_rpc_call_back!(
             self,
             &self.proof_proxy_url,
             RequestParams::<C::F>::ZKSignatureMinifierProof(QSignatureMinifierProofRPCRequest {
-                inner_proof: inner_proof_str,
+                inner_proof,
             }),
             ProofWithPublicInputs<C::F, C, D>
         );
@@ -1454,6 +1538,78 @@ where
             }
             ResponseResult::Error(e) => Err(anyhow::format_err!("rpc call failed `{:?}`", e)),
         }
+    }
+
+    async fn zk_signature_minifier_fingerprint(&self) -> anyhow::Result<QHashOut<C::F>> {
+        Ok(self.common_circuits_data.zk_circuit.fingerprint)
+    }
+
+    async fn zk_signature_minifier_verifier_config(&self) -> anyhow::Result<VerifierOnlyCircuitData<C, D>> {
+        Ok(self.common_circuits_data.zk_circuit.verifier_config.clone().to_verifier_data())
+    }
+
+    // The privacy minifier RPC expects the local base proof under `base_proof`;
+    // zk-sign minification uses `inner_proof`, so keep the payload shapes separate.
+    async fn prove_private_note_inclusion_minifier(
+        &self,
+        base_proof: ProofWithPublicInputs<C::F, C, D>,
+    ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
+        tracing::info!("prove_private_note_inclusion_minifier");
+        let base_proof = serde_json::to_string(&base_proof)?;
+        let response = psy_rpc_call_back!(
+            self,
+            &self.proof_proxy_url,
+            RequestParams::<C::F>::PrivateNoteInclusionMinifierProof(QBaseProofMinifierRPCRequest { base_proof }),
+            ProofWithPublicInputs<C::F, C, D>
+        );
+        match response.result {
+            ResponseResult::Success(proof) => Ok(proof),
+            ResponseResult::Error(e) => Err(anyhow::format_err!("rpc call failed `{:?}`", e)),
+        }
+    }
+
+    async fn private_note_inclusion_minifier_fingerprint(&self) -> anyhow::Result<QHashOut<C::F>> {
+        Ok(self.common_circuits_data.private_note_inclusion_minifier.fingerprint)
+    }
+
+    async fn private_note_inclusion_minifier_verifier_config(&self) -> anyhow::Result<VerifierOnlyCircuitData<C, D>> {
+        Ok(self
+            .common_circuits_data
+            .private_note_inclusion_minifier
+            .verifier_config
+            .clone()
+            .to_verifier_data())
+    }
+
+    async fn prove_shield_deposit_claim_minifier(
+        &self,
+        base_proof: ProofWithPublicInputs<C::F, C, D>,
+    ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
+        tracing::info!("prove_shield_deposit_claim_minifier");
+        let base_proof = serde_json::to_string(&base_proof)?;
+        let response = psy_rpc_call_back!(
+            self,
+            &self.proof_proxy_url,
+            RequestParams::<C::F>::ShieldDepositClaimMinifierProof(QBaseProofMinifierRPCRequest { base_proof }),
+            ProofWithPublicInputs<C::F, C, D>
+        );
+        match response.result {
+            ResponseResult::Success(proof) => Ok(proof),
+            ResponseResult::Error(e) => Err(anyhow::format_err!("rpc call failed `{:?}`", e)),
+        }
+    }
+
+    async fn shield_deposit_claim_minifier_fingerprint(&self) -> anyhow::Result<QHashOut<C::F>> {
+        Ok(self.common_circuits_data.shield_deposit_claim_minifier.fingerprint)
+    }
+
+    async fn shield_deposit_claim_minifier_verifier_config(&self) -> anyhow::Result<VerifierOnlyCircuitData<C, D>> {
+        Ok(self
+            .common_circuits_data
+            .shield_deposit_claim_minifier
+            .verifier_config
+            .clone()
+            .to_verifier_data())
     }
 
     async fn prove_secp_sign(&self, signature: PsyCompressedSecp256K1Signature) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
@@ -1649,14 +1805,6 @@ where
 
     async fn ups_circuit_whitelist_root(&self) -> anyhow::Result<QHashOut<C::F>> {
         Ok(self.common_circuits_data.ups_circuit_whitelist_root)
-    }
-
-    async fn zk_circuit_fingerprint(&self) -> anyhow::Result<QHashOut<C::F>> {
-        Ok(self.common_circuits_data.zk_circuit.fingerprint)
-    }
-
-    async fn zk_circuit_verifier_config(&self) -> anyhow::Result<VerifierOnlyCircuitData<C, D>> {
-        Ok(self.common_circuits_data.zk_circuit.verifier_config.clone().to_verifier_data())
     }
 
     async fn secp_circuit_fingerprint(&self) -> anyhow::Result<QHashOut<C::F>> {
@@ -1920,5 +2068,84 @@ where
 {
     async fn circuit_inclusion_proofs(&self) -> &SimpleQTreeRecursionManagerInclusionProofs<C::F> {
         &self.common_circuits_data.circuit_inclusion_proofs
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::borrow::Cow;
+
+    use super::*;
+
+    fn rpc_error(code: crate::request::ErrorCode, message: &'static str) -> crate::request::RpcError {
+        crate::request::RpcError {
+            code,
+            message: Cow::Borrowed(message),
+            data: None,
+        }
+    }
+
+    #[test]
+    fn parses_exact_end_cap_already_submitted_acknowledgement() {
+        let error = rpc_error(
+            crate::request::ErrorCode::ServerError(END_CAP_ALREADY_SUBMITTED_ERROR_CODE),
+            "end cap for user_id 524288 at unique_pending_id 675 has already been submitted",
+        );
+
+        assert_eq!(
+            parse_end_cap_already_submitted(&error),
+            Some(EndCapAlreadySubmitted {
+                user_id: 524288,
+                unique_pending_id: 675,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_non_exact_or_non_protocol_duplicate_errors() {
+        let messages = [
+            "end cap for user_id 524288 at unique_pending_id 675 has already been submitted (race)",
+            "end cap for realm_id 524288 at unique_pending_id 675 has already been submitted",
+            "end cap for user_id 524289 at unique_pending_id 675 was already submitted",
+            "unrelated error",
+        ];
+        for message in messages {
+            let error = rpc_error(crate::request::ErrorCode::ServerError(END_CAP_ALREADY_SUBMITTED_ERROR_CODE), message);
+            assert_eq!(parse_end_cap_already_submitted(&error), None, "message={message}");
+        }
+
+        let wrong_code = rpc_error(
+            crate::request::ErrorCode::InternalError,
+            "end cap for user_id 524288 at unique_pending_id 675 has already been submitted",
+        );
+        assert_eq!(parse_end_cap_already_submitted(&wrong_code), None);
+
+        let with_data = crate::request::RpcError {
+            code: crate::request::ErrorCode::ServerError(END_CAP_ALREADY_SUBMITTED_ERROR_CODE),
+            message: Cow::Borrowed("end cap for user_id 524288 at unique_pending_id 675 has already been submitted"),
+            data: Some(serde_json::json!({ "other": true })),
+        };
+        assert_eq!(parse_end_cap_already_submitted(&with_data), None);
+    }
+
+    #[tokio::test]
+    async fn inclusion_scan_checks_current_checkpoint_without_waiting_for_next() {
+        let mut checked = Vec::new();
+        let found = find_endcap_inclusion_in_range(700, 700, |checkpoint_id| {
+            checked.push(checkpoint_id);
+            async move { Ok(true) }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(found, Some(700));
+        assert_eq!(checked, vec![700]);
+    }
+
+    #[tokio::test]
+    async fn inclusion_scan_skips_an_unpublished_checkpoint_range() {
+        let found = find_endcap_inclusion_in_range(701, 700, |_| async move { Ok(true) }).await.unwrap();
+
+        assert_eq!(found, None);
     }
 }

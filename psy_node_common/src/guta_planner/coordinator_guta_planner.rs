@@ -725,7 +725,8 @@ mod tests {
             pm_rewards_commitment::PPMRewardCommitment,
         }, worker::metadata_with_job_id::PsyProvingJobMetadataWithJobId
     };
-    use psy_node_core::{memory_stores::simple_memory_temp_store::SimpleMemoryTempStore, psy_temp_db::StandardProcessorTempDBStoreBase};
+    use psy_node_core::psy_temp_db::StandardProcessorTempDBStoreBase;
+    use psy_node_store_memory::temp_store::InMemoryTempStore;
     use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
     use rand::Rng;
 
@@ -1413,7 +1414,7 @@ mod tests {
             realm_id: 1,
             realm_sub_id: 0,
         };
-        let temp_store = Arc::new(SimpleMemoryTempStore::new());
+        let temp_store = Arc::new(InMemoryTempStore::new("coordinator-guta-planner-test".to_string(), 1, 0));
         let unique_pending_id = 0u64;
         let global_user_tree_height = REALM_LEVEL_U8;
         let checkpoint_tree = PsyDashMemoryAppendOnlyMerkleStore::<Hasher, Hash>::new(32);
@@ -1443,7 +1444,7 @@ mod tests {
         let mut planner = CoordinatorGUTAPlanner::<F, Hash>::new(checkpoint_1_root);
         for job in &jobs {
             planner
-                .add_realm_job::<Hasher, SimpleMemoryTempStore>(
+                .add_realm_job::<Hasher, InMemoryTempStore>(
                     unique_pending_id,
                     &checkpoint_1_root,
                     &checkpoint_tree,
@@ -1499,7 +1500,7 @@ mod tests {
         let correctness_checker = JobCorrectnessChecker::new(input_jobs_metadata, result);
         println!("graph viz:\n{}", correctness_checker.generate_graph_viz_simple()?);
         correctness_checker.check_jobs_correctness::<Hasher>()?;
-        correctness_checker.process_job_witness::<SimpleMemoryTempStore>(&realm_identifier, unique_pending_id, temp_store.clone(), root_job_id, guta_circuit_whitelist).await?;
+        correctness_checker.process_job_witness::<InMemoryTempStore>(&realm_identifier, unique_pending_id, temp_store.clone(), root_job_id, guta_circuit_whitelist).await?;
         
 
         Ok(())

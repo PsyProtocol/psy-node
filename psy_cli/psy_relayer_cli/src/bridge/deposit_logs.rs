@@ -25,7 +25,7 @@ sol! {
         bytes32 l2TokenContractId,
         uint256 amount,
         uint8 chainIndex,
-        bytes32 noteSecretHash,
+        bytes32 noteCommitment,
         bytes32 leafHash
     );
 }
@@ -127,7 +127,7 @@ pub async fn bulk_fetch_deposit_records(
             l2TokenContractId: event.l2TokenContractId,
             amount: event.amount,
             chainIndex: event.chainIndex,
-            noteSecretHash: event.noteSecretHash,
+            noteCommitment: event.noteCommitment,
             leafHash: event.leafHash,
         });
     }

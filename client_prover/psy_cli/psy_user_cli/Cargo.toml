@@ -20,12 +20,11 @@ tracing = { workspace = true }
 psy_client_common = { workspace = true }
 psy_cli_common = { path = "../../../psy_cli/psy_cli_common" }
 psy_vm = { workspace = true }
-psy_prover = { workspace = true, default-features = false}
+psy_prover = { workspace = true, default-features = false }
 psy_client_data = { workspace = true }
 # psy_rust_sdk = { workspace = true }
 psy_provider = { workspace = true }
 psy_config = { workspace = true }
-psy_compiler = { workspace = true }
 # psy_node = { workspace = true }
 # psy_store = { workspace = true, default-features = false }
 kvq = { workspace = true }
@@ -38,6 +37,7 @@ rand = { workspace = true }
 serde_with = { workspace = true }
 bincode = { workspace = true }
 base64 = { workspace = true }
+sha2 = { workspace = true }
 dashmap = { workspace = true }
 ts-rs =  { workspace = true }
 clap = { workspace = true }
@@ -67,6 +67,8 @@ alloy-signer-local = { workspace = true }
 alloy-rpc-types-eth = { workspace = true }
 shadow-rs = { workspace = true }
 nostr-sdk = { version = "0.44", features = ["nip44", "nip59"] }
+tokio-tungstenite = "0.24"
+futures-util = { workspace = true }
 
 # Native-only build dependencies
 [target.'cfg(not(target_arch = "wasm32"))'.build-dependencies]
@@ -78,5 +80,6 @@ shadow-rs = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 
 [features]
-# default = ["is_sync"]
+default = ["gnark-wrap"]
+gnark-wrap = ["psy_prover/gnark-wrap"]
 is_sync = ["psy_prover/is_sync"]

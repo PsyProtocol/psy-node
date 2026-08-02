@@ -34,11 +34,7 @@ pub struct StateReaderResults<F: RichField> {
 pub struct StateReader<
     F: RichField + Extendable<D>,
     const D: usize,
-    R: PsyReadCommandProcessorSync<F>
-        + psy_client_data::qstore::imm::cmd_processor::QUserIdManager
-        + QMetaDataStoreReaderSync<F>
-        + Send
-        + Sync,
+    R: PsyReadCommandProcessorSync<F> + psy_client_data::qstore::imm::cmd_processor::QUserIdManager + QMetaDataStoreReaderSync<F> + Send + Sync,
 > {
     pub state: UserContractState<F>,
     pub cmd_store: PsyCmdStoreWithCache<F, R>,
@@ -52,11 +48,7 @@ pub struct StateReader<
 impl<
         F: RichField + Extendable<D>,
         const D: usize,
-        R: PsyReadCommandProcessorSync<F>
-            + psy_client_data::qstore::imm::cmd_processor::QUserIdManager
-            + QMetaDataStoreReaderSync<F>
-            + Send
-            + Sync,
+        R: PsyReadCommandProcessorSync<F> + psy_client_data::qstore::imm::cmd_processor::QUserIdManager + QMetaDataStoreReaderSync<F> + Send + Sync,
     > StateReader<F, D, R>
 {
     pub async fn new(state: UserContractState<F>, cmd_store: PsyCmdStoreWithCache<F, R>, state_tree_store: KVQSimpleMemoryBackingStore) -> Self {

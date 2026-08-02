@@ -60,8 +60,8 @@ pub async fn run_worker_inner(
 pub async fn run(
     config: Option<String>,
     private_key: Option<String>,
-    _keystore_path: Option<String>,
-    _wallet_password: Option<String>,
+    keystore_path: Option<String>,
+    wallet_password: Option<String>,
     recipient: Option<u64>,
     network: Option<PsyNetworkTypeInput>,
     proving_backend: Option<PsyChainProvingBackendTypeInput>,
@@ -76,8 +76,8 @@ pub async fn run(
     let config = WorkerCliConfig::get_start_config(
         config,
         private_key,
-        _keystore_path,
-        _wallet_password,
+        keystore_path,
+        wallet_password,
         recipient,
         network,
         completed_jobs_log_file,

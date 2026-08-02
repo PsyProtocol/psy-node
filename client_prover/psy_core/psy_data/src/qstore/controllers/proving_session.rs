@@ -1,5 +1,8 @@
 use hashbrown::HashMap;
-use kvq::memory::simple::KVQSimpleMemoryBackingStore;
+use kvq::{
+    memory::simple::KVQSimpleMemoryBackingStore,
+    traits::{KVQBinaryStore, KVQPair, KVQSerializable},
+};
 use plonky2::{field::types::PrimeField64, hash::hash_types::RichField};
 use psy_client_common::data::qhashout::QHashOut;
 use psy_config::network_constants::{
@@ -14,7 +17,7 @@ use psy_crypto::{
             utils::simple_merkle_tree::SimpleMerkleTree,
         },
         traits::{
-            hasher::{FieldQHasher, MerkleZeroHasherWithMarkedLeaf},
+            hasher::{FieldQHasher, MerkleHasher, MerkleZeroHasherWithMarkedLeaf},
             qhashable::QFieldHashable,
         },
         utils::safe_hash_fixed_length,
@@ -37,7 +40,7 @@ use crate::{
     },
     guta::api::{ContractStateUpdate, PsyContractStateUpdateHistory},
     models::{
-        kvq_merkle::model::{KVQSemiFixedConfigMerkleTreeModelCore, KVQSemiFixedConfigMerkleTreeModelReaderCore},
+        kvq_merkle::model::{KVQMerkleTreeModelCore, KVQSemiFixedConfigMerkleTreeModelCore, KVQSemiFixedConfigMerkleTreeModelReaderCore},
         user::contract_state_tree::UserContractStateTreeId,
     },
     qdata::{
@@ -54,9 +57,8 @@ use crate::{
             cmd::{
                 QSRCmdGetBlockState, QSRCmdGetCheckpointLeafData, QSRCmdGetContractCodeDefinition, QSRCmdGetContractLeafData, QSRCmdGetUserLeafData,
                 QSRHashCmd, QSRHashCmdGetCheckpointTreeRoot, QSRHashCmdGetContractTreeRoot, QSRHashCmdGetUserRegistrationTreeRoot,
-                QSRHashCmdGetUserTreeRoot, QSRHashCmdGetWithdrawalTreeRoot, QSRMerkleCmd,
-                QSRMerkleCmdGetContractFunctionTreeMerkleProof, QSRMerkleCmdGetContractTreeMerkleProof,
-                QSRMerkleCmdGetUserContractStateTreeMerkleProof, QSRMerkleCmdGetUserContractTreeMerkleProof,
+                QSRHashCmdGetUserTreeRoot, QSRHashCmdGetWithdrawalTreeRoot, QSRMerkleCmd, QSRMerkleCmdGetContractFunctionTreeMerkleProof,
+                QSRMerkleCmdGetContractTreeMerkleProof, QSRMerkleCmdGetUserContractStateTreeMerkleProof, QSRMerkleCmdGetUserContractTreeMerkleProof,
                 QSRMerkleCmdGetUserRegistrationTreeMerkleProof, QSRMerkleCmdGetUserTreeMerkleProof,
             },
             cmd_processor::{
@@ -87,6 +89,7 @@ pub trait PsyReadLocalProvingSessionStore<F: RichField> {
     fn get_q_recursion_proof_tree_height(&self) -> usize;
     fn get_q_recursion_proof_tree_root(&self) -> QHashOut<F>;
     fn get_latest_deferred_tx_item(&self) -> Option<&DPNTransactionDebtItem<DPNProvingSessionSimpleMethodCall<F>, F>>;
+    fn get_local_state_tracker(&self) -> &PsyLocalStateTracker<F>;
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), maybe_async::maybe_async)]
@@ -154,8 +157,7 @@ impl<
         F: RichField,
         H: MerkleZeroHasherWithMarkedLeaf<QHashOut<F>> + Send,
         R: PsyReadCommandProcessorSync<F> + QUserIdManager + QMetaDataStoreReaderSync<F> + Send + Sync,
-    >
-    PsyReadLocalProvingSessionStore<F> for PsyLocalProvingSessionStore<F, R, H>
+    > PsyReadLocalProvingSessionStore<F> for PsyLocalProvingSessionStore<F, R, H>
 {
     fn get_current_contract_id(&self) -> F {
         self.last_transaction_record().call_data.call_data.contract_id
@@ -232,6 +234,10 @@ impl<
     fn get_latest_deferred_tx_item(&self) -> Option<&DPNTransactionDebtItem<DPNProvingSessionSimpleMethodCall<F>, F>> {
         self.deferred_tx_debt_store.get_latest_proof_debt_item()
     }
+
+    fn get_local_state_tracker(&self) -> &PsyLocalStateTracker<F> {
+        &self.local_state_tracker
+    }
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), maybe_async::maybe_async)]
@@ -240,8 +246,7 @@ impl<
         F: RichField,
         H: MerkleZeroHasherWithMarkedLeaf<QHashOut<F>> + Send,
         R: PsyReadCommandProcessorSync<F> + QUserIdManager + QMetaDataStoreReaderSync<F> + Send + Sync,
-    >
-    PsyReadCommandProcessorSyncMut<F> for PsyLocalProvingSessionStore<F, R, H>
+    > PsyReadCommandProcessorSyncMut<F> for PsyLocalProvingSessionStore<F, R, H>
 {
     async fn resolve_batch_mut(&mut self, input: &PsyReadCommandBatchInput) -> anyhow::Result<PsyReadCommandBatchOutput<F>> {
         self.cmd_store.resolve_batch_mut(input).await
@@ -300,9 +305,9 @@ impl<
         let key = QHashOut::from_values(input.key[0], input.key[1], input.key[2], input.key[3]);
         let contract_id = input.contract_id as u64;
 
-        if let Some(leaf_index) =
-            self.local_state_tracker
-                .get_imt_leaf_index_for_key(contract_id, input.state_slot_base, input.capacity, &key)
+        if let Some(leaf_index) = self
+            .local_state_tracker
+            .get_imt_leaf_index_for_key(contract_id, input.state_slot_base, input.capacity, &key)
         {
             return Ok(leaf_index);
         }
@@ -326,12 +331,10 @@ impl<
         // Merge local and remote predecessors. Equal keys must prefer local because
         // local carries the latest preimage after earlier writes in this proof.
         let result = match (local_pred, remote_pred) {
-            (Some((local_idx, local_leaf)), Some((remote_idx, remote_leaf))) => {
-                match compare_qhashout_keys(&local_leaf.key, &remote_leaf.key) {
-                    std::cmp::Ordering::Greater | std::cmp::Ordering::Equal => (local_idx, local_leaf),
-                    std::cmp::Ordering::Less => (remote_idx, remote_leaf),
-                }
-            }
+            (Some((local_idx, local_leaf)), Some((remote_idx, remote_leaf))) => match compare_qhashout_keys(&local_leaf.key, &remote_leaf.key) {
+                std::cmp::Ordering::Greater | std::cmp::Ordering::Equal => (local_idx, local_leaf),
+                std::cmp::Ordering::Less => (remote_idx, remote_leaf),
+            },
             (Some(local), None) => local,
             (None, Some(remote)) => remote,
             (None, None) => return Err(anyhow::anyhow!("No predecessor found")),
@@ -410,8 +413,7 @@ impl<
         F: RichField,
         H: MerkleZeroHasherWithMarkedLeaf<QHashOut<F>> + Send,
         R: PsyReadCommandProcessorSync<F> + QUserIdManager + QMetaDataStoreReaderSync<F> + Send + Sync,
-    >
-    PsyLocalProvingSessionStore<F, R, H>
+    > PsyLocalProvingSessionStore<F, R, H>
 {
     pub fn new_at(read_store: R, start_checkpoint: F, user_id: F, nonce: F, start_event_index: F, q_recursion_tree_height: usize) -> Self {
         let cmd_store = PsyCmdStoreWithCache::new(start_checkpoint.to_canonical_u64(), read_store);
@@ -502,6 +504,7 @@ impl<
     pub fn set_proof_tree_root(&mut self, session_proof_tree_root: QHashOut<F>) {
         self.session_proof_tree_root = session_proof_tree_root;
     }
+
     pub async fn new_at_head(read_store: R, user_id: F, nonce: F, start_event_index: F, q_recursion_tree_height: usize) -> anyhow::Result<Self> {
         let start_checkpoint = read_store.resolve_get_latest_block_state().await?;
 
@@ -604,8 +607,16 @@ impl<
     ) -> anyhow::Result<DapenCFCUserTransactionCallStartContext<F>> {
         let contract_state_root_proof = self.get_self_user_contract_tree_leaf(contract_id).await?;
 
-        let start_user_contract_tree_root = contract_state_root_proof.root;
-        let start_contract_state_tree_root = if contract_state_root_proof.value.eq(&QHashOut::ZERO) {
+        let start_user_contract_tree_root = if self.transaction_records.len() > 1 {
+            self.transaction_records[self.transaction_records.len() - 2]
+                .user_contract_tree_update_proof
+                .new_root
+        } else {
+            contract_state_root_proof.root
+        };
+        let start_contract_state_tree_root = if let Some(tracker) = self.local_state_tracker.contracts.get(&contract_id.to_canonical_u64()) {
+            tracker.end_state_root
+        } else if contract_state_root_proof.value.eq(&QHashOut::ZERO) {
             let state_tree_height = if contract_id == F::from_canonical_u64(DEFAULT_CALLER_CONTRACT_ID_U64) {
                 tracing::debug!("use default contract state tree root");
                 MAX_CONTRACT_STATE_TREE_HEIGHT as usize
@@ -737,6 +748,10 @@ impl<
                 },
             ))
             .await?;
+        // Seed the immutable base path at start_checkpoint. `set_leaf` reads
+        // old proofs with fuzzy checkpoint lookup, so a first write at
+        // write_checkpoint will naturally fall back to this base state, while
+        // subsequent writes will see the latest write-checkpoint state.
         id.injest_merkle_proof_ucs(&mut self.state_tree_store, self.start_checkpoint_u64, &base_mp)?;
         let dmp = id.set_leaf_ucs(&mut self.state_tree_store, self.write_checkpoint_u64, slot.to_canonical_u64(), value)?;
 
@@ -762,6 +777,8 @@ impl<
         let result = self.set_contract_state_slot_inner(contract, slot, new_leaf_hash).await?;
         self.local_state_tracker
             .notify_imt_update(contract.to_canonical_u64(), key, leaf_index, old_leaf, new_leaf);
+        self.local_state_tracker
+            .note_contract_state_root_transition(contract.to_canonical_u64(), result.old_root, result.new_root);
         Ok(result)
     }
 
@@ -792,6 +809,8 @@ impl<
             predecessor_dmp.old_value,
             new_leaf_dmp.old_value,
         );
+        self.local_state_tracker
+            .note_contract_state_root_transition(contract.to_canonical_u64(), predecessor_dmp.old_root, new_leaf_dmp.new_root);
 
         Ok((predecessor_dmp, new_leaf_dmp))
     }
@@ -802,6 +821,7 @@ impl<
             let empty_tree = SimpleMerkleTree::<H, QHashOut<F>>::new(MAX_CONTRACT_STATE_TREE_HEIGHT);
             return Ok(empty_tree.get_leaf(slot.to_canonical_u64()));
         }
+
         let state_tree_height = self
             .cmd_store
             .resolve_get_contract_leaf_mut(&QSRCmdGetContractLeafData {
@@ -815,6 +835,7 @@ impl<
             contract.to_canonical_u64() as u32,
             state_tree_height,
         );
+
         let base_mp = self
             .cmd_store
             .resolve_get_merkle_proof_mut(&QSRMerkleCmd::GetUserContractStateTreeMerkleProof(
@@ -827,11 +848,55 @@ impl<
                 },
             ))
             .await?;
+        tracing::info!(
+            "DEBUG get_contract_state_slot RPC result: contract={} slot={} checkpoint={} value={}",
+            contract,
+            slot,
+            self.start_checkpoint_u64,
+            base_mp.value
+        );
         id.injest_merkle_proof_ucs(&mut self.state_tree_store, self.start_checkpoint_u64, &base_mp)?;
-        id.get_leaf_ucs(&self.state_tree_store, self.write_checkpoint_u64, slot.to_canonical_u64())
+        let contract_id_u64 = contract.to_canonical_u64();
+        let slot_u64 = slot.to_canonical_u64();
+        if self.local_state_tracker.contracts.contains_key(&contract_id_u64) {
+            let result = id.get_leaf_ucs(&self.state_tree_store, self.write_checkpoint_u64, slot_u64)?;
+            tracing::info!(
+                "DEBUG get_contract_state_slot write_checkpoint proof: contract={} slot={} value={} root={}",
+                contract,
+                slot,
+                result.value,
+                result.root
+            );
+            return Ok(result);
+        }
+        tracing::info!(
+            "DEBUG get_contract_state_slot start_checkpoint fallback: contract={} slot={} value={} root={}",
+            contract,
+            slot,
+            base_mp.value,
+            base_mp.root
+        );
+        id.get_leaf_ucs(&self.state_tree_store, self.start_checkpoint_u64, slot_u64)
     }
+
     pub async fn get_self_user_contract_tree_leaf(&mut self, contract_id: F) -> anyhow::Result<MerkleProofCore<QHashOut<F>>> {
         let is_default_contract = contract_id == F::from_canonical_u64(DEFAULT_CALLER_CONTRACT_ID_U64);
+        let contract_id_u64 = contract_id.to_canonical_u64();
+
+        let write_leaf_key = UserContractTreeStore::<KVQSimpleMemoryBackingStore, F, H>::new_leaf_key_sfc(
+            self.write_checkpoint_u64,
+            self.user_id_u64,
+            contract_id_u64,
+        );
+        if self.state_tree_store.get_exact(&write_leaf_key.to_bytes()?).is_ok() {
+            return UserContractTreeStore::<KVQSimpleMemoryBackingStore, F, H>::get_leaf_sfc(
+                &self.state_tree_store,
+                self.write_checkpoint_u64,
+                self.user_id_u64,
+                contract_id_u64,
+            );
+        }
+
         let old_upper_merkle_proof = match self
             .cmd_store
             .resolve_get_merkle_proof_mut(&QSRMerkleCmd::GetUserContractTreeMerkleProof(
@@ -858,12 +923,79 @@ impl<
             self.start_checkpoint_u64,
             &old_upper_merkle_proof,
         )?;
+        // Return the leaf proof at the current write-checkpoint, not the immutable
+        // start-checkpoint. Other leaves in this user contract tree may already
+        // have been updated in this session, so deferred children must see the
+        // latest user-tree root while untouched leaves still fall back to the
+        // seeded base path from start-checkpoint.
         UserContractTreeStore::<KVQSimpleMemoryBackingStore, F, H>::get_leaf_sfc(
             &self.state_tree_store,
             self.write_checkpoint_u64,
             self.user_id_u64,
-            contract_id.to_canonical_u64(),
+            contract_id_u64,
         )
+    }
+
+    fn set_user_contract_tree_leaf_from_old_proof(
+        &mut self,
+        contract_id: u64,
+        old_proof: &MerkleProofCore<QHashOut<F>>,
+        new_value: QHashOut<F>,
+    ) -> anyhow::Result<DeltaMerkleProofCore<QHashOut<F>>> {
+        let mut current_key =
+            UserContractTreeStore::<KVQSimpleMemoryBackingStore, F, H>::new_leaf_key_sfc(self.write_checkpoint_u64, self.user_id_u64, contract_id);
+        let mut current_value = new_value;
+        let mut updates: Vec<KVQPair<_, _>> = Vec::with_capacity((current_key.level as usize) + 1);
+        let height = current_key.level as usize;
+        if height > 0 {
+            let new_key = current_key.parent();
+            let index = current_key.index;
+            updates.push(KVQPair {
+                key: current_key,
+                value: current_value,
+            });
+            current_value = if index & 1 == 0 {
+                <H as MerkleHasher<QHashOut<F>>>::two_to_one(&current_value, &old_proof.siblings[0])
+            } else {
+                <H as MerkleHasher<QHashOut<F>>>::two_to_one(&old_proof.siblings[0], &current_value)
+            };
+            current_key = new_key;
+        }
+        for i in 1..height {
+            let new_key = current_key.parent();
+            let index = current_key.index;
+            updates.push(KVQPair {
+                key: current_key,
+                value: current_value,
+            });
+            current_value = if index & 1 == 0 {
+                <H as MerkleHasher<QHashOut<F>>>::two_to_one(&current_value, &old_proof.siblings[i])
+            } else {
+                <H as MerkleHasher<QHashOut<F>>>::two_to_one(&old_proof.siblings[i], &current_value)
+            };
+            current_key = new_key;
+        }
+        updates.push(KVQPair {
+            key: current_key,
+            value: current_value,
+        });
+        UserContractTreeStore::<KVQSimpleMemoryBackingStore, F, H>::set_nodes(&mut self.state_tree_store, &updates)?;
+        tracing::info!(
+            "DEBUG set_user_contract_tree_leaf_from_old_proof contract_id={} old_root={} old_value={} new_value={} new_root={}",
+            contract_id,
+            old_proof.root,
+            old_proof.value,
+            new_value,
+            current_value
+        );
+        Ok(DeltaMerkleProofCore {
+            old_root: old_proof.root,
+            old_value: old_proof.value,
+            new_root: current_value,
+            new_value,
+            index: old_proof.index,
+            siblings: old_proof.siblings.clone(),
+        })
     }
     async fn set_user_contract_tree_leaf(&mut self, contract_id: F, leaf: QHashOut<F>) -> anyhow::Result<DeltaMerkleProofCore<QHashOut<F>>> {
         let old_upper_merkle_proof = self
@@ -876,20 +1008,7 @@ impl<
                 },
             ))
             .await?;
-
-        UserContractTreeStore::<KVQSimpleMemoryBackingStore, F, H>::injest_merkle_proof_sfc(
-            &mut self.state_tree_store,
-            self.user_id_u64,
-            self.start_checkpoint_u64,
-            &old_upper_merkle_proof,
-        )?;
-        UserContractTreeStore::<KVQSimpleMemoryBackingStore, F, H>::set_leaf_sfc(
-            &mut self.state_tree_store,
-            self.write_checkpoint_u64,
-            self.user_id_u64,
-            contract_id.to_canonical_u64(),
-            leaf,
-        )
+        self.set_user_contract_tree_leaf_from_old_proof(contract_id.to_canonical_u64(), &old_upper_merkle_proof, leaf)
     }
 
     async fn update_contract_state_root_in_user_contract_tree(&mut self, contract_id: F) -> anyhow::Result<DeltaMerkleProofCore<QHashOut<F>>> {
@@ -897,32 +1016,25 @@ impl<
             let empty_tree = SimpleMerkleTree::<H, QHashOut<F>>::new(MAX_CONTRACT_STATE_TREE_HEIGHT);
             return Ok(empty_tree.get_leaf(DEFAULT_CALLER_CONTRACT_ID_U64).to_delta_merkle_proof());
         }
-        let latest_root = self.get_contract_state_slot(contract_id, F::ZERO).await?.root;
-
-        let old_upper_merkle_proof = self
-            .cmd_store
-            .resolve_get_merkle_proof_mut(&QSRMerkleCmd::GetUserContractTreeMerkleProof(
-                QSRMerkleCmdGetUserContractTreeMerkleProof {
-                    checkpoint_id: self.start_checkpoint_u64,
-                    user_id: self.user_id_u64,
-                    contract_id: contract_id.to_canonical_u64() as u32,
-                },
-            ))
-            .await?;
-
-        UserContractTreeStore::<KVQSimpleMemoryBackingStore, F, H>::injest_merkle_proof_sfc(
-            &mut self.state_tree_store,
-            self.user_id_u64,
-            self.start_checkpoint_u64,
-            &old_upper_merkle_proof,
-        )?;
-        UserContractTreeStore::<KVQSimpleMemoryBackingStore, F, H>::set_leaf_sfc(
-            &mut self.state_tree_store,
-            self.write_checkpoint_u64,
-            self.user_id_u64,
-            contract_id.to_canonical_u64(),
-            latest_root,
-        )
+        let contract_id_u64 = contract_id.to_canonical_u64();
+        let latest_root = if let Some(tracker) = self.local_state_tracker.contracts.get(&contract_id_u64) {
+            tracker.end_state_root
+        } else {
+            self.get_contract_state_slot(contract_id, F::ZERO).await?.root
+        };
+        // Use the same local-overlay-aware leaf reader as get_call_start_data
+        // to ensure the DMP old_value matches the CFC witness's
+        // start_contract_state_tree_root.  Previously this fetched a fresh
+        // merkle proof from the coordinator, which could diverge from the
+        let old_leaf_proof = self.get_self_user_contract_tree_leaf(contract_id).await?;
+        tracing::info!(
+            "DEBUG update_contract_state_root_in_user_contract_tree contract_id={} old_leaf_proof: root={} value={} latest_root={}",
+            contract_id_u64,
+            old_leaf_proof.root,
+            old_leaf_proof.value,
+            latest_root
+        );
+        self.set_user_contract_tree_leaf_from_old_proof(contract_id_u64, &old_leaf_proof, latest_root)
     }
     pub async fn get_external_user_leaf_proof(&mut self, user_id: F) -> anyhow::Result<DPNReadOtherUserLeafMerkleProof<F>> {
         let user_tree_proof = self
@@ -1111,9 +1223,7 @@ impl<
             for op in r.ops.iter() {
                 match op {
                     PsyStateOperation::IMTUpdate {
-                        leaf_index,
-                        from_version,
-                        ..
+                        leaf_index, from_version, ..
                     } => {
                         let reset_hash = resolve_slot_hash(*leaf_index, *from_version)?;
                         reset_slots.entry(*leaf_index).or_insert(reset_hash);
@@ -1291,6 +1401,15 @@ impl<
             }
 
             let user_contract_tree_update_proof = self.update_contract_state_root_in_user_contract_tree(c).await?;
+            tracing::info!(
+                "DEBUG get_all_state_updates result contract_id={} old_root={} old_value={} new_root={} new_value={} cst_updates={}",
+                r.contract_id,
+                user_contract_tree_update_proof.old_root,
+                user_contract_tree_update_proof.old_value,
+                user_contract_tree_update_proof.new_root,
+                user_contract_tree_update_proof.new_value,
+                contract_state_tree_updates.len(),
+            );
             update_results.push(PsyContractStateUpdateHistory {
                 user_contract_tree_update_proof,
                 contract_state_tree_updates,

@@ -60,7 +60,7 @@ impl<Hash, JobId> PsyProvingJobClaimMetadata<Hash, JobId> {
 
 impl PsyProvingJobClaimMetadata<QHashOut<GoldilocksField>, QProvingJobDataID> {
     /// Deserialize PsyProvingJobClaimMetadata from a byte slice (173 bytes per
-    /// record) Format matches the backup file format from psy-node
+    /// record) Format matches the backup file format from parth-generic-v1
     pub fn psy_ser_from_slice(data: &[u8]) -> anyhow::Result<Self> {
         if data.len() < PSY_PROVING_JOB_CLAIM_METADATA_SIZE {
             anyhow::bail!(
@@ -72,7 +72,7 @@ impl PsyProvingJobClaimMetadata<QHashOut<GoldilocksField>, QProvingJobDataID> {
 
         let mut offset = 0usize;
 
-        // job_id: 24 bytes (psy-node format, no slot_id field)
+        // job_id: 24 bytes (parth-generic-v1 format, no slot_id field)
         let job_id = QProvingJobDataID::try_from_byte_vec_without_slot_id(&data[offset..offset + 24])?;
         offset += 24;
 
@@ -152,7 +152,7 @@ impl PsyProvingJobClaimMetadata<QHashOut<GoldilocksField>, QProvingJobDataID> {
     pub fn psy_ser_to_bytes(&self) -> anyhow::Result<Vec<u8>> {
         let mut result = Vec::with_capacity(PSY_PROVING_JOB_CLAIM_METADATA_SIZE);
 
-        // job_id: 24 bytes (psy-node format, no slot_id field)
+        // job_id: 24 bytes (parth-generic-v1 format, no slot_id field)
         result.extend_from_slice(&self.job_id.to_bytes_without_slot_id());
 
         // reward_tree_tag: 32 bytes (little-endian)

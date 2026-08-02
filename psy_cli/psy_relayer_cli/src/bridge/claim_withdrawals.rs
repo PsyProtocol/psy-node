@@ -1,6 +1,6 @@
 use std::{collections::HashMap, fs, path::{Path, PathBuf}, str::FromStr};
 
-use alloy_primitives::{Address, Bytes, U256, keccak256};
+use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy_provider::Provider;
 use alloy_rpc_types_eth::TransactionRequest;
 use alloy_sol_types::{sol, SolCall};
@@ -38,7 +38,7 @@ sol! {
     function batchClaimWithdrawal(
         uint256[8] proof,
         uint256[18] publicInputs,
-        uint256[832] slotData
+        uint256[1088] slotData
     );
 
     function claimedNullifiers(bytes32 nullifier) view returns (bool);
@@ -52,6 +52,16 @@ struct WithdrawalClaimProofResult {
     pub leaf_index: Option<u32>,
     pub withdrawal_root: Option<String>,
     pub siblings: Option<Vec<String>>,
+}
+
+fn select_claim_proof_poll_result(
+    final_result: Option<WithdrawalClaimProofResult>,
+    last_not_ready: Option<WithdrawalClaimProofResult>,
+    last_err: Option<anyhow::Error>,
+) -> Result<WithdrawalClaimProofResult> {
+    final_result
+        .or(last_not_ready)
+        .ok_or_else(|| last_err.unwrap_or_else(|| anyhow::anyhow!("claim proof fetch exhausted without response")))
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -142,15 +152,17 @@ async fn fetch_claim_proof(
     let recipient_hex = u32x8_to_hex(withdrawal.recipient);
     let token_hex = u32x8_to_hex(withdrawal.token_address);
     let amount_hex = u32x8_to_hex(withdrawal.amount);
+    let nonce_hex = u32x8_to_hex(withdrawal.nonce);
 
     let url = format!(
-        "{}/api/v1/bridge/withdrawal-claim-proof?recipient={}&token_address={}&amount={}&nonce={}&destination_chain_id={}",
+        "{}/api/v1/bridge/withdrawal-claim-proof?recipient={}&token_address={}&amount={}&nonce={}&destination_chain_index={}&sender_user_id={}",
         services_url.trim_end_matches('/'),
         recipient_hex,
         token_hex,
         amount_hex,
-        withdrawal.nonce,
-        withdrawal.destination_chain_id,
+        nonce_hex,
+        withdrawal.destination_chain_index,
+        withdrawal.sender_user_id,
     );
     tracing::debug!(url = %url, "fetching withdrawal claim proof");
 
@@ -198,31 +210,19 @@ async fn withdrawal_already_claimed<P: Provider>(
     bridge: Address,
     withdrawal: &PendingWithdrawal,
 ) -> Result<bool> {
-    let nonce_u32 = u32::try_from(withdrawal.nonce)
-        .with_context(|| format!("withdrawal nonce {} exceeds uint32 bridge encoding", withdrawal.nonce))?;
-    let dest_chain_u32 = u32::try_from(withdrawal.destination_chain_id).with_context(|| {
-        format!(
-            "withdrawal destination_chain_id {} exceeds uint32 bridge encoding",
-            withdrawal.destination_chain_id
-        )
-    })?;
-    let mut leaf_preimage = Vec::with_capacity(32 + 32 + 32 + 4 + 4);
-    for word in withdrawal.recipient {
-        leaf_preimage.extend_from_slice(&word.to_be_bytes());
-    }
-    for word in withdrawal.token_address {
-        leaf_preimage.extend_from_slice(&word.to_be_bytes());
-    }
-    for word in withdrawal.amount {
-        leaf_preimage.extend_from_slice(&word.to_be_bytes());
-    }
-    leaf_preimage.extend_from_slice(&nonce_u32.to_be_bytes());
-    leaf_preimage.extend_from_slice(&dest_chain_u32.to_be_bytes());
-    let nullifier = keccak256(leaf_preimage);
+    let nullifier = withdrawal_nullifier_from_nonce(withdrawal.nonce);
     let call = claimedNullifiersCall { nullifier };
     let tx = TransactionRequest::default().to(bridge).input(call.abi_encode().into());
     let raw = provider.call(tx).await.context("claimedNullifiers eth_call failed")?;
     claimedNullifiersCall::abi_decode_returns(&raw).context("failed to decode claimedNullifiers return")
+}
+
+fn withdrawal_nullifier_from_nonce(nonce: [u32; 8]) -> B256 {
+    let mut nonce_bytes = [0u8; 32];
+    for (i, word) in nonce.iter().enumerate() {
+        nonce_bytes[i * 4..(i + 1) * 4].copy_from_slice(&word.to_be_bytes());
+    }
+    B256::from(nonce_bytes)
 }
 
 async fn erc20_balance_of<P: Provider>(provider: &P, token: Address, owner: Address) -> Result<U256> {
@@ -242,10 +242,10 @@ pub(crate) fn resolve_multicall3_address(
         return Ok(Some(parsed));
     }
 
-    let path = PathBuf::from(format!(
-        "psy-contracts/deployments/{}/deployed-contracts.json",
-        deployments_network
-    ));
+    let path = crate::bridge::api_client::resolve_deployments_file(
+        deployments_network,
+        "deployed-contracts.json",
+    );
     let raw = match fs::read_to_string(&path) {
         Ok(raw) => raw,
         Err(_) => return Ok(None),
@@ -265,10 +265,8 @@ pub(crate) fn resolve_multicall3_address(
     }
 
     // Fallback: read the hardhat-deploy artifact directly when summary is stale/incomplete.
-    let multicall_artifact_path = PathBuf::from(format!(
-        "psy-contracts/deployments/{}/Multicall3.json",
-        deployments_network
-    ));
+    let multicall_artifact_path =
+        crate::bridge::api_client::resolve_deployments_file(deployments_network, "Multicall3.json");
     let artifact_raw = match fs::read_to_string(&multicall_artifact_path) {
         Ok(raw) => raw,
         Err(_) => return Ok(None),
@@ -307,25 +305,24 @@ async fn generate_withdrawal_batch_proof(batch: &[PendingProof], proxy_client: O
     // ── Remote Prove Proxy path (disabled via never-true constant) ──
     if let Some(client) = proxy_client {
         let withdrawals = batch.iter().map(|p| {
-            let nonce_u32 = u32::try_from(p.withdrawal.nonce)
-                .map_err(|_| anyhow::anyhow!("withdrawal nonce {} exceeds u32", p.withdrawal.nonce))?;
-            let dest_chain_u32 = u32::try_from(p.withdrawal.destination_chain_id)
+            let sender_user_id_u32 = u32::try_from(p.withdrawal.sender_user_id)
+                .map_err(|_| anyhow::anyhow!("sender_user_id {} exceeds u32", p.withdrawal.sender_user_id))?;
+            let dest_chain_u32 = u32::try_from(p.withdrawal.destination_chain_index)
                 .map_err(|_| anyhow::anyhow!(
-                    "destination_chain_id {} exceeds u32",
-                    p.withdrawal.destination_chain_id
+                    "destination_chain_index {} exceeds u32",
+                    p.withdrawal.destination_chain_index
                 ))?;
             Ok::<_, anyhow::Error>(ProxyWithdrawalWitnessInput {
                 withdrawal_root: qhash_to_solidity_hex(p.withdrawal_root),
+                sender_user_id: sender_user_id_u32,
                 recipient: p.withdrawal.recipient,
                 token: p.withdrawal.token_address,
                 amount: p.withdrawal.amount,
-                nonce: nonce_u32,
-                dest_chain_id: dest_chain_u32,
+                nonce: p.withdrawal.nonce,
+                destination_chain_index: dest_chain_u32,
                 leaf_index: p.leaf_index,
                 bridge_user_id: BRIDGE_USER_ID_U32,
-                siblings: p.siblings.iter().map(|s| {
-                    qhash_to_solidity_hex(*s)
-                }).collect(),
+                siblings: p.siblings.iter().map(|s| qhash_to_solidity_hex(*s)).collect(),
             })
         }).collect::<anyhow::Result<Vec<_>>>()?;
         let input = BridgeWithdrawalBatchWitnessInput {
@@ -351,21 +348,25 @@ async fn generate_withdrawal_batch_proof(batch: &[PendingProof], proxy_client: O
         let mut slot_data_u256 = [U256::ZERO; MAX_WITHDRAWAL_CLAIM_BATCH_SIZE * WITHDRAWAL_BATCH_CLAIM_SLOT_WORDS];
         for (slot_index, p) in batch.iter().enumerate() {
             let slot_offset = slot_index * WITHDRAWAL_BATCH_CLAIM_SLOT_WORDS;
+            let sender_user_id_u32 = u32::try_from(p.withdrawal.sender_user_id)
+                .map_err(|_| anyhow::anyhow!("sender_user_id {} exceeds u32", p.withdrawal.sender_user_id))?;
+            slot_data_u256[slot_offset] = U256::from(sender_user_id_u32);
             for (j, word) in p.withdrawal.recipient.iter().enumerate() {
-                slot_data_u256[slot_offset + j] = U256::from(*word);
+                slot_data_u256[slot_offset + 1 + j] = U256::from(*word);
             }
             for (j, word) in p.withdrawal.token_address.iter().enumerate() {
-                slot_data_u256[slot_offset + 8 + j] = U256::from(*word);
+                slot_data_u256[slot_offset + 9 + j] = U256::from(*word);
             }
             for (j, word) in p.withdrawal.amount.iter().enumerate() {
-                slot_data_u256[slot_offset + 16 + j] = U256::from(*word);
+                slot_data_u256[slot_offset + 17 + j] = U256::from(*word);
             }
-            let nonce_u32 = u32::try_from(p.withdrawal.nonce)
-                .map_err(|_| anyhow::anyhow!("withdrawal nonce {} exceeds u32", p.withdrawal.nonce))?;
-            let dest_chain_u32 = u32::try_from(p.withdrawal.destination_chain_id)
-                .map_err(|_| anyhow::anyhow!("destination_chain_id {} exceeds u32", p.withdrawal.destination_chain_id))?;
-            slot_data_u256[slot_offset + 24] = U256::from(nonce_u32);
-            slot_data_u256[slot_offset + 25] = U256::from(dest_chain_u32);
+            // nonce occupies words 25..32 (8 words); destination_chain_index at 33.
+            for (j, word) in p.withdrawal.nonce.iter().enumerate() {
+                slot_data_u256[slot_offset + 25 + j] = U256::from(*word);
+            }
+            let dest_chain_u32 = u32::try_from(p.withdrawal.destination_chain_index)
+                .map_err(|_| anyhow::anyhow!("destination_chain_index {} exceeds u32", p.withdrawal.destination_chain_index))?;
+            slot_data_u256[slot_offset + 33] = U256::from(dest_chain_u32);
         }
         // ── Debug: batch commit verification ──
         {
@@ -382,7 +383,7 @@ async fn generate_withdrawal_batch_proof(batch: &[PendingProof], proxy_client: O
                 pk_bytes[i*4..(i+1)*4].copy_from_slice(&(v as u32).to_be_bytes());
             }
             let p_commit = alloy_primitives::B256::from(pk_bytes);
-            let s0: Vec<u64> = proof.slot_data.iter().take(26).copied().collect();
+            let s0: Vec<u64> = proof.slot_data.iter().take(WITHDRAWAL_BATCH_CLAIM_SLOT_WORDS).copied().collect();
             tracing::debug!(
                 pi10_17 = ?pi_10_17,
                 slot0 = ?s0,
@@ -407,17 +408,18 @@ async fn generate_withdrawal_batch_proof(batch: &[PendingProof], proxy_client: O
         withdrawals: batch
             .iter()
             .map(|p| {
-                let nonce_u32 = u32::try_from(p.withdrawal.nonce)
-                    .map_err(|_| anyhow::anyhow!("withdrawal nonce {} exceeds u32", p.withdrawal.nonce))?;
-                let dest_chain_u32 = u32::try_from(p.withdrawal.destination_chain_id).map_err(|_| {
-                    anyhow::anyhow!("destination_chain_id {} exceeds u32", p.withdrawal.destination_chain_id)
+                let sender_user_id_u32 = u32::try_from(p.withdrawal.sender_user_id)
+                    .map_err(|_| anyhow::anyhow!("sender_user_id {} exceeds u32", p.withdrawal.sender_user_id))?;
+                let dest_chain_u32 = u32::try_from(p.withdrawal.destination_chain_index).map_err(|_| {
+                    anyhow::anyhow!("destination_chain_index {} exceeds u32", p.withdrawal.destination_chain_index)
                 })?;
                 Ok::<_, anyhow::Error>(WithdrawalBatchClaimSlotInputs::<F> {
+                    sender_user_id: sender_user_id_u32,
                     recipient: p.withdrawal.recipient,
                     token: p.withdrawal.token_address,
                     amount: p.withdrawal.amount,
-                    nonce: nonce_u32,
-                    dest_chain_id: dest_chain_u32,
+                    nonce: p.withdrawal.nonce,
+                    destination_chain_index: dest_chain_u32,
                     leaf_index: p.leaf_index,
                     siblings: p.siblings.clone(),
                 })
@@ -481,21 +483,25 @@ async fn generate_withdrawal_batch_proof(batch: &[PendingProof], proxy_client: O
         [U256::ZERO; MAX_WITHDRAWAL_CLAIM_BATCH_SIZE * WITHDRAWAL_BATCH_CLAIM_SLOT_WORDS];
     for (slot_index, pending) in batch.iter().enumerate() {
         let slot_offset = slot_index * WITHDRAWAL_BATCH_CLAIM_SLOT_WORDS;
+        let sender_user_id_u32 = u32::try_from(pending.withdrawal.sender_user_id)
+            .map_err(|_| anyhow::anyhow!("sender_user_id {} exceeds u32", pending.withdrawal.sender_user_id))?;
+        slot_data_u256[slot_offset] = U256::from(sender_user_id_u32);
         for (j, word) in pending.withdrawal.recipient.iter().enumerate() {
-            slot_data_u256[slot_offset + j] = U256::from(*word);
+            slot_data_u256[slot_offset + 1 + j] = U256::from(*word);
         }
         for (j, word) in pending.withdrawal.token_address.iter().enumerate() {
-            slot_data_u256[slot_offset + 8 + j] = U256::from(*word);
+            slot_data_u256[slot_offset + 9 + j] = U256::from(*word);
         }
         for (j, word) in pending.withdrawal.amount.iter().enumerate() {
-            slot_data_u256[slot_offset + 16 + j] = U256::from(*word);
+            slot_data_u256[slot_offset + 17 + j] = U256::from(*word);
         }
-        let nonce_u32 = u32::try_from(pending.withdrawal.nonce)
-            .map_err(|_| anyhow::anyhow!("withdrawal nonce {} exceeds u32", pending.withdrawal.nonce))?;
-        let dest_chain_u32 = u32::try_from(pending.withdrawal.destination_chain_id)
-            .map_err(|_| anyhow::anyhow!("destination_chain_id {} exceeds u32", pending.withdrawal.destination_chain_id))?;
-        slot_data_u256[slot_offset + 24] = U256::from(nonce_u32);
-        slot_data_u256[slot_offset + 25] = U256::from(dest_chain_u32);
+        // nonce occupies words 25..32 (8 words); destination_chain_index at 33.
+        for (j, word) in pending.withdrawal.nonce.iter().enumerate() {
+            slot_data_u256[slot_offset + 25 + j] = U256::from(*word);
+        }
+        let dest_chain_u32 = u32::try_from(pending.withdrawal.destination_chain_index)
+            .map_err(|_| anyhow::anyhow!("destination_chain_index {} exceeds u32", pending.withdrawal.destination_chain_index))?;
+        slot_data_u256[slot_offset + 33] = U256::from(dest_chain_u32);
     }
 
     let call = batchClaimWithdrawalCall {
@@ -661,6 +667,7 @@ pub async fn submit_batch(
 
         let proof_result = {
             let mut last_err: Option<anyhow::Error> = None;
+            let mut last_not_ready: Option<WithdrawalClaimProofResult> = None;
             let mut final_result: Option<WithdrawalClaimProofResult> = None;
             for attempt in 1..=CLAIM_PROOF_FETCH_MAX_ATTEMPTS {
                 match fetch_claim_proof(&http, services_url, w).await {
@@ -674,6 +681,7 @@ pub async fn submit_batch(
                                 recipient = %recipient_addr,
                                 "withdrawal claim proof not ready yet; will retry"
                             );
+                            last_not_ready = Some(r);
                         } else if let Some(ref root_hex) = r.withdrawal_root {
                             match read_l1_withdrawal_subtree_root(&provider, state_manager).await {
                                 Ok(l1_root) => {
@@ -713,13 +721,13 @@ pub async fn submit_batch(
                     tokio::time::sleep(Duration::from_secs(CLAIM_PROOF_FETCH_RETRY_DELAY_SECS)).await;
                 }
             }
-            if let Some(r) = final_result {
-                r
-            } else {
-                let err = last_err.unwrap_or_else(|| anyhow::anyhow!("claim proof fetch exhausted without response"));
-                failure_reasons.insert(w.leaf_hash.clone(), format!("fetch claim proof failed: {err}"));
-                tracing::error!(index = i, recipient = %recipient_addr, error = %err, "fetch claim proof failed, skipping");
-                continue;
+            match select_claim_proof_poll_result(final_result, last_not_ready, last_err) {
+                Ok(r) => r,
+                Err(err) => {
+                    failure_reasons.insert(w.leaf_hash.clone(), format!("fetch claim proof failed: {err}"));
+                    tracing::error!(index = i, recipient = %recipient_addr, error = %err, "fetch claim proof failed, skipping");
+                    continue;
+                }
             }
         };
 
@@ -1065,4 +1073,134 @@ pub async fn run(args: BatchWithdrawalsArgs) -> Result<()> {
         report.failure_reasons.len()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_l1_root_for_services_reverses_u32_word_order() {
+        let root =
+            "0x1111111122222222333333334444444455555555666666667777777788888888";
+        assert_eq!(
+            normalize_l1_root_for_services(root),
+            "0x8888888877777777666666665555555544444444333333332222222211111111"
+        );
+    }
+
+    #[test]
+    fn withdrawal_nullifier_from_nonce_concatenates_big_endian_u32_words() {
+        let nonce = [
+            0x01020304,
+            0x11121314,
+            0x21222324,
+            0x31323334,
+            0x41424344,
+            0x51525354,
+            0x61626364,
+            0x71727374,
+        ];
+        assert_eq!(
+            format!("0x{}", hex::encode(withdrawal_nullifier_from_nonce(nonce))),
+            "0x0102030411121314212223243132333441424344515253546162636471727374"
+        );
+    }
+
+    #[test]
+    fn u32x8_to_address_uses_low_20_bytes() {
+        let words = [
+            0x00000000,
+            0x00000000,
+            0x00000000,
+            0x11111111,
+            0x22222222,
+            0x33333333,
+            0x44444444,
+            0x55555555,
+        ];
+        assert_eq!(
+            u32x8_to_address(words).to_string(),
+            "0x1111111122222222333333334444444455555555"
+        );
+    }
+
+    #[test]
+    fn address_high_bits_are_zero_requires_zero_prefix_words() {
+        assert!(address_high_bits_are_zero([0, 0, 0, 1, 2, 3, 4, 5]));
+        assert!(!address_high_bits_are_zero([1, 0, 0, 1, 2, 3, 4, 5]));
+    }
+
+    // ── claim-scheduling fix (commit 7522ca93): poll-result classification ─
+
+    /// Build a `WithdrawalClaimProofResult` with only the fields the
+    /// classification tests need. `leaf_index` is the discriminator used to
+    /// tell which candidate a call returned.
+    fn proof_result(found: bool, leaf_index: Option<u32>) -> WithdrawalClaimProofResult {
+        WithdrawalClaimProofResult {
+            found,
+            leaf_index,
+            withdrawal_root: None,
+            siblings: None,
+        }
+    }
+
+    #[test]
+    fn select_claim_proof_poll_result_prefers_final_over_not_ready_and_error() {
+        // Defends the poll-result priority contract: a found=true final result
+        // is preferred over a found=false not-ready result AND over a fetch
+        // error (final > not_ready > err). A regression that swaps the `.or()`
+        // ordering (preferring not_ready, or surfacing the error when a final
+        // result exists) reddens this test. We distinguish the two results by
+        // leaf_index so the assertion proves the final one was returned.
+        let final_r = proof_result(true, Some(111));
+        let not_ready = proof_result(false, Some(222));
+        let chosen = select_claim_proof_poll_result(
+            Some(final_r),
+            Some(not_ready),
+            Some(anyhow::anyhow!("transient fetch error")),
+        )
+        .expect("final result must win over not-ready and error");
+        assert!(chosen.found, "final found=true must be returned, not the not-ready");
+        assert_eq!(
+            chosen.leaf_index,
+            Some(111),
+            "must return the final result, not the not-ready one"
+        );
+    }
+
+    #[test]
+    fn select_claim_proof_poll_result_returns_not_ready_when_no_final_so_caller_defers() {
+        // Defends the found=false classification contract: when only a
+        // not-ready (found=false) response was seen, the function must return
+        // it — so the caller's `!proof_result.found` branch defers to the next
+        // round — rather than erroring. A regression that errors on found=false
+        // (the pre-fix behaviour, which misreported a not-yet-finalized root
+        // as a fetch failure) would surface an error string instead and fail.
+        let not_ready = proof_result(false, Some(222));
+        let chosen = select_claim_proof_poll_result(None, Some(not_ready), None)
+            .expect("not-ready result must be returned, not errored");
+        assert!(!chosen.found);
+        assert_eq!(chosen.leaf_index, Some(222));
+    }
+
+    #[test]
+    fn select_claim_proof_poll_result_surfaces_real_error_when_no_response() {
+        // Defends the error-surfacing contract: with no final and no not-ready
+        // result but a real fetch error present, the function must surface
+        // THAT error — not the generic "exhausted without response" string —
+        // so the caller logs the actual failure cause. A regression that
+        // discards last_err in favour of the generic message reddens this.
+        let err = select_claim_proof_poll_result(None, None, Some(anyhow::anyhow!("RPC 503 upstream")))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("RPC 503 upstream"),
+            "must surface the real error, got: {err}"
+        );
+        assert!(
+            !err.to_string().contains("without response"),
+            "must not use the generic exhausted message when a real error exists: {err}"
+        );
+    }
+
 }

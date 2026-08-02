@@ -9,6 +9,7 @@ use parth_core::{
 use psy_api_core::{
     coordinator::standard_edge_rpc::CoordinatorEdgeRpcServer,
     worker::standard_worker_rpc::NodeEdgeWorkerRpcServer,
+    CheckpointJobStats,
 };
 use psy_core::job::job_id::QProvingJobDataID;
 use psy_data::{
@@ -108,6 +109,10 @@ impl<
 
     async fn get_checkpoint_leaf_data(&self, checkpoint_id: u64) -> QRpcResult<PQEDCheckpointLeaf<N::F, N::QHash>> {
         res(self.db_reader.get_checkpoint_leaf_data(checkpoint_id).await)
+    }
+
+    async fn get_job_stats(&self, checkpoint_id: u64) -> QRpcResult<CheckpointJobStats> {
+        res(self.get_job_stats_internal(checkpoint_id).await)
     }
 
     async fn get_latest_l2_block_state(&self) -> QRpcResult<QEDL2BlockState> {
