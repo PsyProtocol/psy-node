@@ -114,6 +114,12 @@ jobs:
         shell: bash
         run: git submodule update --init psy-genesis
 
+      - name: Set up Go
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version: "1.24.x"
+          cache: false
+
       - name: Verify native target
         env:
           EXPECTED_TRIPLE: ${{ matrix.triple }}

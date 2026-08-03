@@ -9,3 +9,4 @@
 	path = psy-dapp
 	url = git@github.com:PsyProtocol/psy-dapp.git
 	branch = mainnet-beta
+	update = none
