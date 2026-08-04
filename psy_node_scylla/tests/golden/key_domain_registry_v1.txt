@@ -1,0 +1,39 @@
+1|CheckpointLeaf|CheckpointLeaf|checkpoint leaf|Authoritative|CheckpointPartition|Ready
+2|CheckpointRootByHash|CheckpointRootToCheckpointIdK1|root -> checkpoint|Derived|RootBirthPartition|Ready
+3|CheckpointRootByCheckpoint|CheckpointRootToCheckpointIdK2|checkpoint -> root|Derived|CheckpointPartition|Ready
+4|CheckpointLeafByHash|CheckpointLeafToCheckpointIdK1|unused leaf -> checkpoint|Unused|NoActiveAxis|RetireCandidate
+5|CheckpointLeafByCheckpoint|CheckpointLeafToCheckpointIdK2|unused checkpoint -> leaf|Unused|NoActiveAxis|RetireCandidate
+6|L2BlockState|L2BlockState|L2 block state|Authoritative|CheckpointPartition|Ready
+7|UnusedCheckpointRealmRoot|CheckpointIdToRealmRoot|unused checkpoint realm root|Unused|NoActiveAxis|RetireCandidate
+8|LatestInfo|LatestInfo|mutable latest-info slots|DerivedOperational|Singleton|Ready
+9|CheckpointedGlobalUserProof|CheckpointedObject|obj_id=1 checkpoint proof|Derived|CheckpointClustering|Blocked(MixedCheckpointPendingAxis)
+10|CheckpointedRewardsProofAtCheckpoint|CheckpointedObject|obj_id=2 checkpoint reward proof|Derived|CheckpointClustering|Blocked(MixedCheckpointPendingAxis)
+11|CheckpointedRewardsProofAtPending|CheckpointedObject|obj_id=2 pending reward proof|Operational|UniquePendingClustering|Blocked(MixedCheckpointPendingAxis)
+12|CheckpointedContractStateProof|CheckpointedObject|obj_id=3 checkpoint contract-state proof|Derived|CheckpointClustering|Blocked(MixedCheckpointPendingAxis)
+13|CheckpointStateRoots|CheckpointStateRoots|checkpoint state roots|Authoritative|CheckpointPartition|Ready
+14|UserLeaf|UserLeaf|realm user leaf|Authoritative|CheckpointClustering|Ready
+15|UserPublicKey|UserPublicKey|coordinator user public key|Authoritative|CheckpointClustering|Ready
+16|U64Singleton|U64Singleton|mutable latest-checkpoint singleton|DerivedOperational|Singleton|Ready
+17|U64Counter|U64CounterSingleton|monotonic pending counter|Operational|MonotonicCounter|Ready
+18|ContractStateTreeHeight|ContractStateTreeHeight|contract tree height|Derived|CheckpointClustering|Ready
+19|CheckpointToPending|CheckpointIdToPendingId|reusable checkpoint -> pending|Operational|ReusedCheckpointPartition|Blocked(ReusableCheckpointHeightKey)
+20|PendingToCheckpoint|PendingIdToCheckpointId|pending -> checkpoint|Operational|UniquePendingPartition|Ready
+21|PendingToProc|PendingIdToPendingProcIdU64ToU128|pending -> proc UUID|Operational|UniquePendingPartition|Ready
+22|ProcToPending|PendingIdToPendingProcIdU128ToU64|proc UUID -> pending|Operational|ProcUuidPartition|Ready
+23|RealmRewardNode|RealmRewardsTreeNodeKey|realm reward materialization by pending|DerivedOperational|UniquePendingClustering|Blocked(PendingSuffixReadThrough)
+24|PublicKeyToUser|PublicKeyHashToUserIds|public-key hash projection|Derived|ContentBirth|Ready
+25|GlobalUserMerkle|GlobalUserTree|global user Merkle|Authoritative|CheckpointClustering|Ready
+26|UserContractMerkle|UserContractTree|user contract Merkle|Authoritative|CheckpointClustering|Ready
+27|ContractStateMerkle|ContractStateTree|contract state Merkle|Authoritative|CheckpointClustering|Ready
+28|GlobalCheckpointMerkle|GlobalCheckpointTree|checkpoint Merkle|Authoritative|CheckpointClustering|Ready
+29|RewardTagMerkle|GutaRewardTagTree|pending reward tag Merkle|Operational|UniquePendingPartition|Ready
+30|UserRegistrationMerkle|UserRegistrationTree|user registration Merkle|Authoritative|CheckpointClustering|Ready
+31|GlobalContractMerkle|GlobalContractTree|global contract Merkle|Authoritative|CheckpointClustering|Ready
+32|ContractFunctionMerkle|ContractFunctionTree|contract function Merkle|Authoritative|CheckpointClustering|Ready
+33|ContractLeaf|ContractLeaf|contract leaf|Authoritative|CheckpointClustering|Ready
+34|ContractCodeDefinition|ContractCodeDefinition|contract code definition|Authoritative|CheckpointClustering|Ready
+35|CheckpointZkProof|CheckpointZkProofAndTransition|checkpoint proof and transition|Authoritative|CheckpointPartition|Ready
+36|ImtLeaf|ImtLeaf|IMT leaf|Authoritative|CheckpointClustering|Ready
+37|ImtKeyIndex|ImtKeyIndex|IMT key index|Derived|ImtBirthOrdinaryColumn|Ready
+38|ImtCursor|ImtNextAppendIndex|IMT append cursor|Derived|MutableCursor|Ready
+FULL_METADATA_FNV1A64=2a05f891d9b9d9cb
