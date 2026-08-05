@@ -4,6 +4,7 @@
 //! prepare and execute CQL when explicitly constructed by a harness, but it is
 //! not connected to production setup or current writers.
 
+mod canonical_head_prototype;
 mod identity;
 mod key;
 mod mutation;
@@ -16,6 +17,7 @@ mod timestamp_prototype;
 mod timestamped;
 mod registry;
 
+pub use canonical_head_prototype::*;
 pub use identity::*;
 pub use key::*;
 pub use mutation::*;

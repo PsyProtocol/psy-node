@@ -1,0 +1,18 @@
+CreateTable|
+CREATE TABLE IF NOT EXISTS psy_c01a_control_no_tablet.c01a_coordinator_canonical_head (network_chain_id bigint PRIMARY KEY, revision bigint, canonical_ref blob)
+Read|network_chain_id:BIGINT
+SELECT network_chain_id, revision, canonical_ref FROM psy_c01a_control_no_tablet.c01a_coordinator_canonical_head WHERE network_chain_id = ?
+Bootstrap|network_chain_id:BIGINT,candidate_revision:BIGINT,candidate_canonical_ref:BLOB
+INSERT INTO psy_c01a_control_no_tablet.c01a_coordinator_canonical_head (network_chain_id, revision, canonical_ref) VALUES (?, ?, ?) IF NOT EXISTS
+CompareAndSet|candidate_revision:BIGINT,candidate_canonical_ref:BLOB,network_chain_id:BIGINT,expected_revision:BIGINT,expected_canonical_ref:BLOB
+UPDATE psy_c01a_control_no_tablet.c01a_coordinator_canonical_head SET revision = ?, canonical_ref = ? WHERE network_chain_id = ? IF revision = ? AND canonical_ref = ?
+BOOTSTRAP_BIND
+0:BIGINT:1769567056
+1:BIGINT:0
+2:BLOB:5053594343524546010050737969000000000000000000000000000000000120000100000000000000020000000000000003000000000000000400000000000000
+CAS_BIND
+0:BIGINT:8
+1:BLOB:50535943435245460100507379692a0000000000000070010000000000000120000500000000000000060000000000000007000000000000000800000000000000
+2:BIGINT:1769567056
+3:BIGINT:7
+4:BLOB:50535943435245460100507379692a000000000000006f010000000000000120000100000000000000020000000000000003000000000000000400000000000000
