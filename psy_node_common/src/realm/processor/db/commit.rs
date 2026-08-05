@@ -122,6 +122,10 @@ where
                 self.state.processing_proc_checkpoint_unique_id,
             )
             .await?;
+        // Publish the complete branch + authority + pending/proc identity last.
+        // Edge must consume this one value instead of composing independently
+        // mutable observation and legacy pending-ID reads.
+        self.publish_current_pending_context().await?;
 
         println!(
             "new_unique_pending_id: {}, new_proc_checkpoint_unique_id: {}",

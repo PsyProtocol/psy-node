@@ -1,4 +1,5 @@
 mod pending_id;
+mod pending_context;
 mod submit_status;
 mod witness;
 mod expected_public_inputs;
@@ -16,6 +17,7 @@ use parth_core::{protocol::core_types::QDBHashBase, QJobIdBase};
 pub use proof_metadata::*;
 pub use expected_public_inputs::*;
 pub use pending_id::*;
+pub use pending_context::*;
 pub use submit_status::*;
 pub use witness::*;
 pub use user_contract_tree_updates::*;
@@ -30,6 +32,7 @@ pub use worker_reputation::*;
 
 pub trait StandardEdgeAPITempDBStoreBase<JobId: QJobIdBase, Hash: QDBHashBase>: 
     QTempDBPendingIdStore + 
+    QTempDBPendingContextStore<Hash> +
     QTempDBSubmitStatusStore + 
     QTempDBProofWitnessStore<JobId> +
     QTempDBUserContractUpdatesStore + 
@@ -50,6 +53,7 @@ impl<
     Hash: QDBHashBase,
     T: 
     QTempDBPendingIdStore + 
+    QTempDBPendingContextStore<Hash> +
     QTempDBSubmitStatusStore + 
     QTempDBProofWitnessStore<JobId> +
     QTempDBUserContractUpdatesStore + 
@@ -67,6 +71,7 @@ impl<
 
 pub trait StandardProcessorTempDBStoreBase<JobId: QJobIdBase, Hash: QDBHashBase>: 
     QTempDBPendingIdStore + 
+    QTempDBPendingContextStore<Hash> +
     QTempDBSubmitStatusStore + 
     QTempDBProofWitnessStore<JobId> +
     QTempDBUserContractUpdatesStore +
@@ -87,6 +92,7 @@ impl<
     Hash: QDBHashBase,
     T: 
     QTempDBPendingIdStore + 
+    QTempDBPendingContextStore<Hash> +
     QTempDBSubmitStatusStore + 
     QTempDBProofWitnessStore<JobId> +
     QTempDBUserContractUpdatesStore +

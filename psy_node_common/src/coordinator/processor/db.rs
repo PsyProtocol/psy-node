@@ -31,6 +31,10 @@ use psy_data::{
             checkpoint_hash_from_previous,
             checkpoint_hash_from_saved_proof_bytes, genesis_checkpoint_hash,
         },
+        chain_context::{
+            AuthorityScope, PendingContext, WorkProcCheckpointUniqueId,
+            WorkUniquePendingId,
+        },
         checkpoint_transition_hash::CheckpointStateHashTransition,
         verifiable_checkpoint_transition::{PsyVerifiableCheckpointTransition, PsyVerifiableCheckpointTransitionWithProof},
     },
@@ -521,6 +525,7 @@ impl<
         processor
             .reconcile_canonical_head_on_startup(canonical_head_bootstrap_profile)
             .await?;
+        processor.reconcile_current_pending_context_on_startup().await?;
         processor
             .rollback_admission_boundary
             .ensure_slot_initialized()
@@ -539,7 +544,64 @@ impl<
             .reconcile_at_loop_boundary()
             .await?;
         self.canonical_head = Some(*outcome.canonical_head());
+        if !outcome.canonical_head().rollback_control().is_idle() {
+            self.temp_db
+                .clear_current_pending_context(&self.ids.realm_identifier)
+                .await?;
+        }
         Ok(outcome)
+    }
+
+    fn materialized_pending_context(&self) -> anyhow::Result<PendingContext<N::QHash>> {
+        let head = self.canonical_head.ok_or_else(|| {
+            anyhow::anyhow!(
+                "COORDINATOR_PENDING_CONTEXT_UNINITIALIZED: canonical head is not published"
+            )
+        })?;
+        if !head.rollback_control().is_idle() {
+            anyhow::bail!(
+                "COORDINATOR_PENDING_CONTEXT_MAINTENANCE: rollback control is active"
+            );
+        }
+        Ok(PendingContext::new(
+            *head.canonical_ref(),
+            AuthorityScope::Coordinator,
+            WorkUniquePendingId::new(self.ids.unique_pending_id),
+            WorkProcCheckpointUniqueId::from_u128(self.ids.proc_checkpoint_unique_id),
+        ))
+    }
+
+    async fn publish_current_pending_context(&self) -> anyhow::Result<()> {
+        let context = self.materialized_pending_context()?;
+        self.temp_db
+            .set_current_pending_context(&self.ids.realm_identifier, &context)
+            .await?;
+        let persisted = self
+            .temp_db
+            .get_current_pending_context(&self.ids.realm_identifier)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "COORDINATOR_PENDING_CONTEXT_UNINITIALIZED_AFTER_WRITE"
+                )
+            })?;
+        if persisted != context {
+            anyhow::bail!("COORDINATOR_PENDING_CONTEXT_READ_AFTER_WRITE_MISMATCH");
+        }
+        Ok(())
+    }
+
+    async fn reconcile_current_pending_context_on_startup(&self) -> anyhow::Result<()> {
+        if self
+            .canonical_head
+            .is_some_and(|head| head.rollback_control().is_idle())
+        {
+            self.publish_current_pending_context().await
+        } else {
+            self.temp_db
+                .clear_current_pending_context(&self.ids.realm_identifier)
+                .await
+        }
     }
 
     fn materialized_checkpoint_ref(&self) -> CheckpointRef<N::QHash> {
@@ -1066,6 +1128,10 @@ checkpoint_backup_copy_status={}
         // 5. Update temp_db
         self.temp_db.set_gathering_unique_pending_ids(&self.ids.realm_identifier, self.ids.gathering_unique_pending_id, self.ids.gathering_proc_checkpoint_unique_id).await?;
         self.temp_db.set_unique_pending_ids(&self.ids.realm_identifier, self.ids.unique_pending_id, self.ids.proc_checkpoint_unique_id).await?;
+        // Publish the complete branch + authority + pending/proc identity last.
+        // Edge must consume this one value instead of composing independently
+        // mutable canonical-head and legacy pending-ID reads.
+        self.publish_current_pending_context().await?;
 
         println!(
             "new_unique_pending_id: {}, new_proc_checkpoint_unique_id: {}",

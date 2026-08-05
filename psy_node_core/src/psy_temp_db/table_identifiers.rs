@@ -16,6 +16,24 @@ pub const TEMP_TABLE_ID_GATHERING_UNIQUE_PENDING_ID_BYTES: [u8; 2] = [0x47, 0x50
 pub const TEMP_TABLE_GATHERING_UNIQUE_PENDING_ID_KEY_SIZE: usize = 8; // 4 + 2 + 2
 pub const TEMP_TABLE_GATHERING_UNIQUE_PENDING_ID_VALUE_SIZE: usize = 24; // u64 + u128
 
+/// Exact branch + authority + pending/proc tuple. The value is the fixed
+/// `PendingContext` V1 canonical encoding.
+pub const TEMP_TABLE_ID_CURRENT_PENDING_CONTEXT: u16 = 0x4350; // 'PC'
+pub const TEMP_TABLE_ID_CURRENT_PENDING_CONTEXT_BYTES: [u8; 2] = [0x50, 0x43]; // 'PC'
+pub const TEMP_TABLE_CURRENT_PENDING_CONTEXT_KEY_SIZE: usize = 8; // 4 + 2 + 2
+
+#[inline(always)]
+pub fn tt_get_current_pending_context_key(
+    realm_id: u32,
+    realm_sub_id: u16,
+) -> [u8; TEMP_TABLE_CURRENT_PENDING_CONTEXT_KEY_SIZE] {
+    let mut key = [0u8; TEMP_TABLE_CURRENT_PENDING_CONTEXT_KEY_SIZE];
+    key[0..4].copy_from_slice(&realm_id.to_le_bytes());
+    key[4..6].copy_from_slice(&realm_sub_id.to_le_bytes());
+    key[6..8].copy_from_slice(&TEMP_TABLE_ID_CURRENT_PENDING_CONTEXT_BYTES);
+    key
+}
+
 pub const TEMP_TABLE_ID_PROOF_WITNESS_DATA: u16 = 0x5750; // 'PW'
 pub const TEMP_TABLE_ID_PROOF_WITNESS_DATA_BYTES: [u8; 2] = [0x50, 0x57]; // 'PW'
 pub const TEMP_TABLE_PROOF_WITNESS_DATA_KEY_SIZE: usize = 40; // 4 + 2 + 2 + 8 + 24
@@ -574,6 +592,16 @@ pub fn tt_get_worker_reputation_key(realm_id: u32, realm_sub_id: u16, public_key
 mod tests {
     use super::*;
 
+    #[test]
+    fn current_pending_context_key_has_stable_authority_layout() {
+        let key = tt_get_current_pending_context_key(0x0102_0304, 0x0506);
+        assert_eq!(
+            key,
+            [0x04, 0x03, 0x02, 0x01, 0x06, 0x05, 0x50, 0x43]
+        );
+        assert_eq!(&key[6..8], &TEMP_TABLE_ID_CURRENT_PENDING_CONTEXT_BYTES);
+    }
+
     // For identical realm/pending/job-id, the proof claim-tag key must differ from the
     // finalized-reward key so that a worker's claimed tag can never alias a finalized
     // reward-tree value (the checkpoint-367 BridgeAgg divergence root cause).
@@ -616,10 +644,11 @@ mod tests {
     // collide with any other table namespace (e.g. job-claim, submit-status, witness data).
     #[test]
     fn proof_claim_tag_table_id_is_unique_among_known_temp_tables() {
-        let known: [u16; 13] = [
+        let known: [u16; 14] = [
             TEMP_TABLE_ID_WORKER_PROOF_METADATA,
             TEMP_TABLE_ID_UNIQUE_PENDING_ID,
             TEMP_TABLE_ID_GATHERING_UNIQUE_PENDING_ID,
+            TEMP_TABLE_ID_CURRENT_PENDING_CONTEXT,
             TEMP_TABLE_ID_PROOF_WITNESS_DATA,
             TEMP_TABLE_ID_SUBMIT_STATUS,
             TEMP_TABLE_ID_USER_CONTRACT_TREE_UPDATES,
@@ -646,10 +675,11 @@ mod tests {
     // reward), so a collision anywhere reddens it with a named pair.
     #[test]
     fn all_known_temp_table_ids_are_pairwise_distinct() {
-        let known: [(&str, u16); 14] = [
+        let known: [(&str, u16); 15] = [
             ("WORKER_PROOF_METADATA", TEMP_TABLE_ID_WORKER_PROOF_METADATA),
             ("UNIQUE_PENDING_ID", TEMP_TABLE_ID_UNIQUE_PENDING_ID),
             ("GATHERING_UNIQUE_PENDING_ID", TEMP_TABLE_ID_GATHERING_UNIQUE_PENDING_ID),
+            ("CURRENT_PENDING_CONTEXT", TEMP_TABLE_ID_CURRENT_PENDING_CONTEXT),
             ("PROOF_WITNESS_DATA", TEMP_TABLE_ID_PROOF_WITNESS_DATA),
             ("SUBMIT_STATUS", TEMP_TABLE_ID_SUBMIT_STATUS),
             ("USER_CONTRACT_TREE_UPDATES", TEMP_TABLE_ID_USER_CONTRACT_TREE_UPDATES),

@@ -5,7 +5,8 @@ use psy_data::{
         canonical_chain::{CanonicalChainRef, NetworkId},
         chain_context::{
             AuthorityObservation, AuthorityScope, AuthorityStateCheckpointId,
-            AuthorityStateRoot,
+            AuthorityStateRoot, PendingContext, WorkProcCheckpointUniqueId,
+            WorkUniquePendingId,
         },
     },
 };
@@ -113,5 +114,52 @@ where
             anyhow::bail!("REALM_AUTHORITY_OBSERVATION_READ_AFTER_WRITE_MISMATCH");
         }
         Ok(observation)
+    }
+
+    pub(crate) async fn publish_current_pending_context(&self) -> anyhow::Result<()> {
+        let observation = self
+            .db
+            .get_realm_authority_observation()
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "REALM_PENDING_CONTEXT_UNINITIALIZED: authority observation is missing"
+                )
+            })?;
+        let expected_authority = AuthorityScope::Realm {
+            realm_id: u32::try_from(self.state.realm_id_u64)
+                .map_err(|_| anyhow::anyhow!("realm_id exceeds authority-scope u32"))?,
+            realm_sub_id: u16::try_from(self.state.realm_sub_id_u64)
+                .map_err(|_| anyhow::anyhow!("realm_sub_id exceeds authority-scope u16"))?,
+        };
+        if observation.authority() != expected_authority {
+            anyhow::bail!(
+                "REALM_PENDING_CONTEXT_AUTHORITY_MISMATCH: expected={expected_authority:?}, actual={:?}",
+                observation.authority()
+            );
+        }
+
+        let context = PendingContext::new(
+            *observation.chain(),
+            expected_authority,
+            WorkUniquePendingId::new(self.state.processing_unique_pending_id),
+            WorkProcCheckpointUniqueId::from_u128(
+                self.state.processing_proc_checkpoint_unique_id,
+            ),
+        );
+        self.temp_db
+            .set_current_pending_context(&self.state.realm_identifier, &context)
+            .await?;
+        let persisted = self
+            .temp_db
+            .get_current_pending_context(&self.state.realm_identifier)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!("REALM_PENDING_CONTEXT_UNINITIALIZED_AFTER_WRITE")
+            })?;
+        if persisted != context {
+            anyhow::bail!("REALM_PENDING_CONTEXT_READ_AFTER_WRITE_MISMATCH");
+        }
+        Ok(())
     }
 }

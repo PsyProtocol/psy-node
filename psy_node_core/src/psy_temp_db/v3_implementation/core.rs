@@ -2,7 +2,11 @@ use async_trait::async_trait;
 use parth_core::{
     QCoreProcCheckpointUniqueId, QJobIdBase, data::serializable::QProofWitnessSerializable, node::realm_identifier::QRealmIdentifier, protocol::core_types::Q256BitHash
 };
-use psy_data::{node::node_proving_state::PsyNodeProvingState, worker::metadata::PsyProvingJobMetadata};
+use psy_data::{
+    node::node_proving_state::PsyNodeProvingState,
+    protocol::chain_context::PendingContext,
+    worker::metadata::PsyProvingJobMetadata,
+};
 use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 
 const DEPLOY_CONTRACT_ZSTD_PREFIX: &[u8; 4] = b"PSZ1";
@@ -10,7 +14,7 @@ const DEPLOY_CONTRACT_ZSTD_PREFIX: &[u8; 4] = b"PSZ1";
 use crate::{
     psy_temp_db::{
         tt_get_worker_reputation_key,
-        CheckpointJobStats, QTempDBDeployContractDataReader, QTempDBDeployContractDataWriter, QTempDBJobClaimInfoReader, QTempDBJobClaimInfoWriter, QTempDBJobStatsStore, QTempDBNodeProvingStateReader, QTempDBNodeProvingStateWriter, QTempDBPendingIdReader, QTempDBPendingIdWriter, QTempDBProofWitnessReader, QTempDBProofWitnessWriter, QTempDBProvingJobMetadataReader, QTempDBProvingJobMetadataWriter, QTempDBRewardsTreeReader, QTempDBRewardsTreeWriter, QTempDBSubmitStatusReader, QTempDBSubmitStatusWriter, QTempDBUserContractUpdatesReader, QTempDBUserContractUpdatesWriter, QTempDBUserEndCapSlotUpdatesReader, QTempDBUserEndCapSlotUpdatesWriter, QTempDBWorkerReputationReader, QTempDBWorkerReputationWriter, tt_get_contract_updates_key, tt_get_deploy_contract_code_definition_key, tt_get_gathering_unique_pending_id_key, tt_get_job_claim_key_from_job, tt_get_job_stats_count_key, tt_get_job_stats_max_duration_key, tt_get_job_stats_min_duration_key, tt_get_job_stats_total_duration_key, tt_get_node_proving_state_key, tt_get_proof_claim_tag_key_from_job, tt_get_proof_witness_data_key_from_job, tt_get_proving_job_metadata_key_from_job, tt_get_rewards_tag_tree_value_key_from_job, tt_get_submit_status_key, tt_get_unique_pending_id_key, tt_get_user_end_cap_slot_updates_key
+        CheckpointJobStats, QTempDBDeployContractDataReader, QTempDBDeployContractDataWriter, QTempDBJobClaimInfoReader, QTempDBJobClaimInfoWriter, QTempDBJobStatsStore, QTempDBNodeProvingStateReader, QTempDBNodeProvingStateWriter, QTempDBPendingContextCleaner, QTempDBPendingContextReader, QTempDBPendingContextWriter, QTempDBPendingIdReader, QTempDBPendingIdWriter, QTempDBProofWitnessReader, QTempDBProofWitnessWriter, QTempDBProvingJobMetadataReader, QTempDBProvingJobMetadataWriter, QTempDBRewardsTreeReader, QTempDBRewardsTreeWriter, QTempDBSubmitStatusReader, QTempDBSubmitStatusWriter, QTempDBUserContractUpdatesReader, QTempDBUserContractUpdatesWriter, QTempDBUserEndCapSlotUpdatesReader, QTempDBUserEndCapSlotUpdatesWriter, QTempDBWorkerReputationReader, QTempDBWorkerReputationWriter, tt_get_contract_updates_key, tt_get_current_pending_context_key, tt_get_deploy_contract_code_definition_key, tt_get_gathering_unique_pending_id_key, tt_get_job_claim_key_from_job, tt_get_job_stats_count_key, tt_get_job_stats_max_duration_key, tt_get_job_stats_min_duration_key, tt_get_job_stats_total_duration_key, tt_get_node_proving_state_key, tt_get_proof_claim_tag_key_from_job, tt_get_proof_witness_data_key_from_job, tt_get_proving_job_metadata_key_from_job, tt_get_rewards_tag_tree_value_key_from_job, tt_get_submit_status_key, tt_get_unique_pending_id_key, tt_get_user_end_cap_slot_updates_key
     },
     store::traits::temp_db::{
         QTempDatabaseRawCounterReaderBase, QTempDatabaseRawCounterWriterBase, QTempDatabaseRawKVReaderBase, QTempDatabaseRawKVWriterBase,
@@ -314,6 +318,55 @@ impl<T: QTempDatabaseRawKVWriterBase + Sync> QTempDBPendingIdWriter for T {
         data[0..8].copy_from_slice(&unique_pending_id.to_le_bytes());
         data[8..24].copy_from_slice(&proc_checkpoint_unique_id.to_le_bytes());
         self.qtdb_raw_kv_put_value(&key, &data).await
+    }
+}
+
+#[async_trait]
+impl<T, Hash> QTempDBPendingContextReader<Hash> for T
+where
+    T: QTempDatabaseRawKVReaderBase + Sync,
+    Hash: Q256BitHash + Send + Sync,
+{
+    async fn get_current_pending_context(
+        &self,
+        rid: &QRealmIdentifier,
+    ) -> anyhow::Result<Option<PendingContext<Hash>>> {
+        let key = tt_get_current_pending_context_key(rid.realm_id, rid.realm_sub_id);
+        self.qtdb_raw_kv_get_value(&key)
+            .await?
+            .map(|bytes| PendingContext::from_canonical_bytes(&bytes).map_err(Into::into))
+            .transpose()
+    }
+}
+
+#[async_trait]
+impl<T, Hash> QTempDBPendingContextWriter<Hash> for T
+where
+    T: QTempDatabaseRawKVWriterBase + Sync,
+    Hash: Q256BitHash + Send + Sync,
+{
+    async fn set_current_pending_context(
+        &self,
+        rid: &QRealmIdentifier,
+        context: &PendingContext<Hash>,
+    ) -> anyhow::Result<()> {
+        let key = tt_get_current_pending_context_key(rid.realm_id, rid.realm_sub_id);
+        self.qtdb_raw_kv_put_value(&key, &context.to_canonical_bytes())
+            .await
+    }
+}
+
+#[async_trait]
+impl<T> QTempDBPendingContextCleaner for T
+where
+    T: QTempDatabaseRawKVWriterBase + Sync,
+{
+    async fn clear_current_pending_context(
+        &self,
+        rid: &QRealmIdentifier,
+    ) -> anyhow::Result<()> {
+        let key = tt_get_current_pending_context_key(rid.realm_id, rid.realm_sub_id);
+        self.qtdb_raw_kv_delete_key(&key).await
     }
 }
 
@@ -756,13 +809,170 @@ mod tests {
         data::hash::hash256::Hash256,
         node::realm_identifier::QRealmIdentifier,
         protocol::core_types::Q256BitHash,
+        PHash,
     };
     use psy_core::job::job_id::{
         QJobTopic, ProvingJobCircuitType, ProvingJobDataType, QProvingJobDataID,
     };
 
+    use psy_data::protocol::{
+        canonical_chain::{
+            CanonicalChainRef, ChainEpoch, CheckpointHash, CheckpointId,
+            CheckpointRef, NetworkId,
+        },
+        chain_context::{
+            AuthorityScope, PendingContext, WorkProcCheckpointUniqueId,
+            WorkUniquePendingId,
+        },
+    };
+
     use crate::memory_stores::simple_memory_temp_store::SimpleMemoryTempStore;
-    use crate::psy_temp_db::{QTempDBRewardsTreeReader, QTempDBRewardsTreeWriter};
+    use crate::psy_temp_db::{
+        tt_get_current_pending_context_key, QTempDBPendingContextCleaner,
+        QTempDBPendingContextReader, QTempDBPendingContextWriter,
+        QTempDBRewardsTreeReader, QTempDBRewardsTreeWriter,
+    };
+    use crate::store::traits::temp_db::QTempDatabaseRawKVWriterBase;
+
+    fn pending_context() -> PendingContext<PHash> {
+        PendingContext::new(
+            CanonicalChainRef::new(
+                NetworkId::try_from_chain_id(0x6979_7350).unwrap(),
+                ChainEpoch::new(7),
+                CheckpointRef::new(
+                    CheckpointId::new(367),
+                    CheckpointHash::from_last_chain_hash(PHash::from_values(1, 2, 3, 4)),
+                ),
+            ),
+            AuthorityScope::Realm {
+                realm_id: 9,
+                realm_sub_id: 2,
+            },
+            WorkUniquePendingId::new(411),
+            WorkProcCheckpointUniqueId::from_u128(
+                0x0011_2233_4455_6677_8899_aabb_ccdd_eeff,
+            ),
+        )
+    }
+
+    fn alternate_pending_context() -> PendingContext<PHash> {
+        PendingContext::new(
+            CanonicalChainRef::new(
+                NetworkId::try_from_chain_id(0x6979_7350).unwrap(),
+                ChainEpoch::new(8),
+                CheckpointRef::new(
+                    CheckpointId::new(368),
+                    CheckpointHash::from_last_chain_hash(PHash::from_values(5, 6, 7, 8)),
+                ),
+            ),
+            AuthorityScope::Realm {
+                realm_id: 9,
+                realm_sub_id: 2,
+            },
+            WorkUniquePendingId::new(412),
+            WorkProcCheckpointUniqueId::from_u128(
+                0xffee_ddcc_bbaa_9988_7766_5544_3322_1100,
+            ),
+        )
+    }
+
+    #[tokio::test]
+    async fn current_pending_context_is_one_exact_fail_closed_value() {
+        let store = SimpleMemoryTempStore::new();
+        let rid = QRealmIdentifier {
+            realm_id: 9,
+            realm_sub_id: 2,
+        };
+        let context = pending_context();
+
+        let missing: Option<PendingContext<PHash>> = store
+            .get_current_pending_context(&rid)
+            .await
+            .unwrap();
+        assert!(missing.is_none());
+
+        store
+            .set_current_pending_context(&rid, &context)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get_current_pending_context(&rid)
+                .await
+                .unwrap(),
+            Some(context)
+        );
+
+        store.clear_current_pending_context(&rid).await.unwrap();
+        assert_eq!(
+            <SimpleMemoryTempStore as QTempDBPendingContextReader<PHash>>::get_current_pending_context(
+                &store,
+                &rid,
+            )
+                .await
+                .unwrap(),
+            None
+        );
+
+        store
+            .set_current_pending_context(&rid, &context)
+            .await
+            .unwrap();
+
+        let key = tt_get_current_pending_context_key(rid.realm_id, rid.realm_sub_id);
+        store.qtdb_raw_kv_put_value(&key, &[0_u8; 17]).await.unwrap();
+        assert!(
+            <SimpleMemoryTempStore as QTempDBPendingContextReader<PHash>>::get_current_pending_context(
+                &store, &rid
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_pending_context_reads_never_observe_a_hybrid() {
+        let store = SimpleMemoryTempStore::new();
+        let rid = QRealmIdentifier {
+            realm_id: 9,
+            realm_sub_id: 2,
+        };
+        let first = pending_context();
+        let second = alternate_pending_context();
+        store
+            .set_current_pending_context(&rid, &first)
+            .await
+            .unwrap();
+
+        let writer_store = store.clone();
+        let writer_rid = rid.clone();
+        let writer = tokio::spawn(async move {
+            for index in 0..2_000 {
+                let next = if index % 2 == 0 { &second } else { &first };
+                writer_store
+                    .set_current_pending_context(&writer_rid, next)
+                    .await
+                    .unwrap();
+                tokio::task::yield_now().await;
+            }
+        });
+
+        let reader_store = store.clone();
+        let reader = tokio::spawn(async move {
+            for _ in 0..2_000 {
+                let observed: PendingContext<PHash> = reader_store
+                    .get_current_pending_context(&rid)
+                    .await
+                    .unwrap()
+                    .expect("the initial context remains present");
+                assert!(observed == first || observed == second);
+                tokio::task::yield_now().await;
+            }
+        });
+
+        writer.await.unwrap();
+        reader.await.unwrap();
+    }
 
     // Defends the checkpoint-367 contract against the proof/reward namespace corruption:
     // for one realm/pending/job-id, a worker's proof claim-tag and the finalized
