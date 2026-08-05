@@ -1,9 +1,10 @@
 //! Driver-independent durable canonical-head contracts.
 //!
 //! This module deliberately models only two safe transitions: advancing one
-//! checkpoint in the current epoch and opening the next rollback epoch while
-//! keeping the checkpoint unchanged. Publishing a rewind target remains a
-//! responsibility of the future durable rollback-control state machine.
+//! checkpoint in the current epoch and atomically opening the next rollback
+//! epoch with a validated REQUESTED control while keeping the checkpoint
+//! unchanged. Publishing a rewind target remains a responsibility of the
+//! future durable rollback-control state machine.
 
 use std::{error::Error, fmt};
 
@@ -15,6 +16,11 @@ use psy_data::protocol::canonical_chain::{
     CANONICAL_CHAIN_REF_V1_LEN,
 };
 use serde::{Deserialize, Serialize};
+
+use super::rollback_control::{
+    RollbackControlCodecError, RollbackControlState, RollbackRequest,
+    ROLLBACK_CONTROL_V1_LEN,
+};
 
 /// Monotonic revision of one durable Coordinator canonical-head row.
 ///
@@ -105,6 +111,7 @@ impl CanonicalHeadRevision {
 pub struct StoredCanonicalHead<Hash> {
     revision: CanonicalHeadRevision,
     canonical_ref: CanonicalChainRef<Hash>,
+    rollback_control: RollbackControlState<Hash>,
 }
 
 impl<Hash> StoredCanonicalHead<Hash> {
@@ -115,6 +122,10 @@ impl<Hash> StoredCanonicalHead<Hash> {
     pub const fn canonical_ref(&self) -> &CanonicalChainRef<Hash> {
         &self.canonical_ref
     }
+
+    pub const fn rollback_control(&self) -> &RollbackControlState<Hash> {
+        &self.rollback_control
+    }
 }
 
 impl<Hash: Q256BitHash> StoredCanonicalHead<Hash> {
@@ -124,6 +135,7 @@ impl<Hash: Q256BitHash> StoredCanonicalHead<Hash> {
         partition_network: NetworkId,
         revision: i64,
         canonical_payload: &[u8],
+        rollback_control_payload: &[u8],
     ) -> Result<Self, CanonicalHeadModelError> {
         let revision = CanonicalHeadRevision::try_from_i64(revision)?;
         let canonical_ref = CanonicalChainRef::from_canonical_bytes(canonical_payload)?;
@@ -133,14 +145,22 @@ impl<Hash: Q256BitHash> StoredCanonicalHead<Hash> {
                 payload: canonical_ref.network_id(),
             });
         }
+        let rollback_control =
+            RollbackControlState::from_canonical_bytes(rollback_control_payload)?;
+        validate_control_against_head(&canonical_ref, &rollback_control)?;
         Ok(Self {
             revision,
             canonical_ref,
+            rollback_control,
         })
     }
 
     pub fn canonical_ref_bytes(&self) -> [u8; CANONICAL_CHAIN_REF_V1_LEN] {
         self.canonical_ref.to_canonical_bytes()
+    }
+
+    pub fn rollback_control_bytes(&self) -> [u8; ROLLBACK_CONTROL_V1_LEN] {
+        self.rollback_control.to_canonical_bytes()
     }
 }
 
@@ -161,6 +181,7 @@ pub struct CanonicalHeadBootstrap<Hash> {
     profile: CanonicalHeadBootstrapProfile,
     candidate: StoredCanonicalHead<Hash>,
     candidate_payload: [u8; CANONICAL_CHAIN_REF_V1_LEN],
+    candidate_control_payload: [u8; ROLLBACK_CONTROL_V1_LEN],
 }
 
 impl<Hash: Q256BitHash> CanonicalHeadBootstrap<Hash> {
@@ -187,13 +208,17 @@ impl<Hash: Q256BitHash> CanonicalHeadBootstrap<Hash> {
             | CanonicalHeadBootstrapProfile::PostGenesisFloor => {}
         }
         let candidate_payload = canonical_ref.to_canonical_bytes();
+        let rollback_control = RollbackControlState::Idle;
+        let candidate_control_payload = rollback_control.to_canonical_bytes();
         Ok(Self {
             profile,
             candidate: StoredCanonicalHead {
                 revision: CanonicalHeadRevision::initial(),
                 canonical_ref,
+                rollback_control,
             },
             candidate_payload,
+            candidate_control_payload,
         })
     }
 
@@ -209,6 +234,10 @@ impl<Hash: Q256BitHash> CanonicalHeadBootstrap<Hash> {
         &self.candidate_payload
     }
 
+    pub const fn candidate_control_payload(&self) -> &[u8; ROLLBACK_CONTROL_V1_LEN] {
+        &self.candidate_control_payload
+    }
+
     pub fn classify_lwt_observation(
         &self,
         applied: bool,
@@ -221,7 +250,7 @@ impl<Hash: Q256BitHash> CanonicalHeadBootstrap<Hash> {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum CanonicalHeadTransitionKind {
     NormalCheckpointAdvance,
-    OpenRollbackEpoch,
+    StartRollback,
 }
 
 /// A validated transition before its canonical payloads are sealed.
@@ -239,6 +268,9 @@ impl<Hash: Q256BitHash> CanonicalHeadTransition<Hash> {
         expected: StoredCanonicalHead<Hash>,
         proposed: CanonicalChainRef<Hash>,
     ) -> Result<Self, CanonicalHeadModelError> {
+        if !expected.rollback_control().is_idle() {
+            return Err(CanonicalHeadModelError::NormalAdvanceWhileRollbackActive);
+        }
         require_same_network(expected.canonical_ref(), &proposed)?;
         if proposed.chain_epoch() != expected.canonical_ref().chain_epoch() {
             return Err(CanonicalHeadModelError::ChainEpochChangedDuringNormalAdvance {
@@ -262,36 +294,39 @@ impl<Hash: Q256BitHash> CanonicalHeadTransition<Hash> {
             candidate: StoredCanonicalHead {
                 revision: expected.revision.checked_next()?,
                 canonical_ref: proposed,
+                rollback_control: RollbackControlState::Idle,
             },
         })
     }
 
-    /// Validate opening a new rollback epoch while leaving the exact checkpoint
-    /// occurrence unchanged.
-    pub fn open_rollback_epoch(
+    /// Atomically open the next epoch and publish the exact rollback request.
+    /// The target and plan cannot be attached in a second row after this CAS.
+    pub fn start_rollback(
         expected: StoredCanonicalHead<Hash>,
-        proposed: CanonicalChainRef<Hash>,
+        request: RollbackRequest<Hash>,
     ) -> Result<Self, CanonicalHeadModelError> {
-        require_same_network(expected.canonical_ref(), &proposed)?;
+        if !expected.rollback_control().is_idle() {
+            return Err(CanonicalHeadModelError::RollbackAlreadyActive);
+        }
+        if request.requested_head() != expected.canonical_ref().checkpoint() {
+            return Err(CanonicalHeadModelError::RollbackRequestedHeadMismatch);
+        }
         let old_epoch = expected.canonical_ref().chain_epoch().get();
         let next_epoch = old_epoch
             .checked_add(1)
             .ok_or(CanonicalHeadModelError::ChainEpochOverflow(old_epoch))?;
-        if proposed.chain_epoch().get() != next_epoch {
-            return Err(CanonicalHeadModelError::ChainEpochNotNext {
-                expected: next_epoch,
-                proposed: proposed.chain_epoch().get(),
-            });
-        }
-        if proposed.checkpoint() != expected.canonical_ref().checkpoint() {
-            return Err(CanonicalHeadModelError::CheckpointChangedWhileOpeningEpoch);
-        }
+        let proposed = CanonicalChainRef::new(
+            expected.canonical_ref().network_id(),
+            ChainEpoch::new(next_epoch),
+            *expected.canonical_ref().checkpoint(),
+        );
         Ok(Self {
-            kind: CanonicalHeadTransitionKind::OpenRollbackEpoch,
+            kind: CanonicalHeadTransitionKind::StartRollback,
             expected,
             candidate: StoredCanonicalHead {
                 revision: expected.revision.checked_next()?,
                 canonical_ref: proposed,
+                rollback_control: RollbackControlState::Requested(request),
             },
         })
     }
@@ -311,10 +346,14 @@ impl<Hash: Q256BitHash> CanonicalHeadTransition<Hash> {
     pub fn seal(self) -> SealedCanonicalHeadCas<Hash> {
         let expected_payload = self.expected.canonical_ref_bytes();
         let candidate_payload = self.candidate.canonical_ref_bytes();
+        let expected_control_payload = self.expected.rollback_control_bytes();
+        let candidate_control_payload = self.candidate.rollback_control_bytes();
         SealedCanonicalHeadCas {
             transition: self,
             expected_payload,
             candidate_payload,
+            expected_control_payload,
+            candidate_control_payload,
         }
     }
 }
@@ -341,6 +380,8 @@ pub struct SealedCanonicalHeadCas<Hash> {
     transition: CanonicalHeadTransition<Hash>,
     expected_payload: [u8; CANONICAL_CHAIN_REF_V1_LEN],
     candidate_payload: [u8; CANONICAL_CHAIN_REF_V1_LEN],
+    expected_control_payload: [u8; ROLLBACK_CONTROL_V1_LEN],
+    candidate_control_payload: [u8; ROLLBACK_CONTROL_V1_LEN],
 }
 
 impl<Hash: Q256BitHash> SealedCanonicalHeadCas<Hash> {
@@ -362,6 +403,14 @@ impl<Hash: Q256BitHash> SealedCanonicalHeadCas<Hash> {
 
     pub const fn candidate_payload(&self) -> &[u8; CANONICAL_CHAIN_REF_V1_LEN] {
         &self.candidate_payload
+    }
+
+    pub const fn expected_control_payload(&self) -> &[u8; ROLLBACK_CONTROL_V1_LEN] {
+        &self.expected_control_payload
+    }
+
+    pub const fn candidate_control_payload(&self) -> &[u8; ROLLBACK_CONTROL_V1_LEN] {
+        &self.candidate_control_payload
     }
 
     pub fn classify_lwt_observation(
@@ -538,6 +587,21 @@ fn require_same_network<Hash>(
     }
 }
 
+fn validate_control_against_head<Hash: PartialEq>(
+    canonical_ref: &CanonicalChainRef<Hash>,
+    control: &RollbackControlState<Hash>,
+) -> Result<(), CanonicalHeadModelError> {
+    if let RollbackControlState::Requested(request) = control {
+        if canonical_ref.chain_epoch().get() == 0 {
+            return Err(CanonicalHeadModelError::RequestedControlAtEpochZero);
+        }
+        if request.requested_head() != canonical_ref.checkpoint() {
+            return Err(CanonicalHeadModelError::RollbackRequestedHeadMismatch);
+        }
+    }
+    Ok(())
+}
+
 fn classify_lwt_observation<Hash: Copy + PartialEq>(
     applied: bool,
     candidate: StoredCanonicalHead<Hash>,
@@ -563,6 +627,7 @@ pub enum CanonicalHeadModelError {
     NegativeRevision(i64),
     RevisionOverflow(u64),
     Codec(CanonicalChainRefCodecError),
+    RollbackControlCodec(RollbackControlCodecError),
     PartitionNetworkMismatch { partition: NetworkId, payload: NetworkId },
     BootstrapEpochMustBeZero(u64),
     GenesisBootstrapMustUseCheckpointZero(u64),
@@ -571,9 +636,11 @@ pub enum CanonicalHeadModelError {
     ChainEpochChangedDuringNormalAdvance { expected: u64, proposed: u64 },
     CheckpointNotNext { expected: u64, proposed: u64 },
     CheckpointOverflow(u64),
-    ChainEpochNotNext { expected: u64, proposed: u64 },
     ChainEpochOverflow(u64),
-    CheckpointChangedWhileOpeningEpoch,
+    NormalAdvanceWhileRollbackActive,
+    RollbackAlreadyActive,
+    RollbackRequestedHeadMismatch,
+    RequestedControlAtEpochZero,
     AppliedStateMismatch,
     BootstrapProfileRequired,
     GenesisPendingAtNonZeroCheckpoint(u64),
@@ -595,6 +662,7 @@ impl fmt::Display for CanonicalHeadModelError {
                 write!(formatter, "canonical-head revision has no successor: {value}")
             }
             Self::Codec(error) => error.fmt(formatter),
+            Self::RollbackControlCodec(error) => error.fmt(formatter),
             Self::PartitionNetworkMismatch { partition, payload } => write!(
                 formatter,
                 "canonical-head partition network {:?} does not match payload network {:?}",
@@ -626,14 +694,19 @@ impl fmt::Display for CanonicalHeadModelError {
             Self::CheckpointOverflow(checkpoint) => {
                 write!(formatter, "checkpoint {checkpoint} has no successor")
             }
-            Self::ChainEpochNotNext { expected, proposed } => write!(
-                formatter,
-                "opening rollback epoch requires epoch {expected}, got {proposed}"
-            ),
             Self::ChainEpochOverflow(epoch) => write!(formatter, "chain epoch {epoch} has no successor"),
-            Self::CheckpointChangedWhileOpeningEpoch => formatter.write_str(
-                "opening rollback epoch must preserve the exact checkpoint ID and hash",
+            Self::NormalAdvanceWhileRollbackActive => formatter.write_str(
+                "normal checkpoint advance is forbidden while rollback control is active",
             ),
+            Self::RollbackAlreadyActive => {
+                formatter.write_str("rollback admission requires idle canonical control")
+            }
+            Self::RollbackRequestedHeadMismatch => formatter.write_str(
+                "rollback request head must equal the exact current canonical checkpoint",
+            ),
+            Self::RequestedControlAtEpochZero => {
+                formatter.write_str("REQUESTED rollback control requires an opened non-zero epoch")
+            }
             Self::AppliedStateMismatch => formatter.write_str(
                 "LWT reported applied but durable canonical head is not the sealed candidate",
             ),
@@ -663,6 +736,7 @@ impl Error for CanonicalHeadModelError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Codec(error) => Some(error),
+            Self::RollbackControlCodec(error) => Some(error),
             _ => None,
         }
     }
@@ -674,6 +748,12 @@ impl From<CanonicalChainRefCodecError> for CanonicalHeadModelError {
     }
 }
 
+impl From<RollbackControlCodecError> for CanonicalHeadModelError {
+    fn from(value: RollbackControlCodecError) -> Self {
+        Self::RollbackControlCodec(value)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -681,6 +761,12 @@ mod tests {
     use psy_core::constants::chain_id::PsyChainNetworkType;
     use psy_data::protocol::canonical_chain::{
         ChainEpoch, CheckpointHash, CheckpointId, CheckpointRef,
+    };
+    use crate::store::{
+        rollback_control::{
+            RollbackExecutionMode, RollbackPlanDigest, RollbackRequest,
+        },
+        timestamp::{CommitWriteTimestampUs, TimestampFenceWindow},
     };
 
     fn canonical_ref(network: PsyChainNetworkType, epoch: u64, checkpoint: u64, hash: u64) -> CanonicalChainRef<PHash> {
@@ -698,6 +784,29 @@ mod tests {
         CanonicalHeadBootstrap::try_new(
             CanonicalHeadBootstrapProfile::GenesisNative,
             canonical_ref(PsyChainNetworkType::PsyMainnet, 0, 0, 1),
+        )
+        .unwrap()
+    }
+
+    fn idle_control_bytes() -> [u8; ROLLBACK_CONTROL_V1_LEN] {
+        RollbackControlState::<PHash>::Idle.to_canonical_bytes()
+    }
+
+    fn rollback_request(
+        requested_head: CheckpointRef<PHash>,
+        target: CheckpointRef<PHash>,
+    ) -> RollbackRequest<PHash> {
+        RollbackRequest::try_new(
+            requested_head,
+            target,
+            TimestampFenceWindow::try_new(
+                CommitWriteTimestampUs::try_from_i128(100).unwrap(),
+                101,
+                102,
+            )
+            .unwrap(),
+            RollbackExecutionMode::InPlace,
+            RollbackPlanDigest::try_new([7; 32]).unwrap(),
         )
         .unwrap()
     }
@@ -727,6 +836,7 @@ mod tests {
             candidate.canonical_ref().network_id(),
             candidate.revision().as_i64(),
             bootstrap.candidate_payload(),
+            bootstrap.candidate_control_payload(),
         )
         .unwrap();
         assert_eq!(&decoded, candidate);
@@ -741,6 +851,7 @@ mod tests {
                 NetworkId::from(PsyChainNetworkType::PsyPublicTestnet),
                 0,
                 &encoded,
+                &idle_control_bytes(),
             ),
             Err(CanonicalHeadModelError::PartitionNetworkMismatch { .. })
         ));
@@ -749,6 +860,7 @@ mod tests {
                 NetworkId::from(PsyChainNetworkType::PsyMainnet),
                 0,
                 &encoded[..cut],
+                &idle_control_bytes(),
             )
             .is_err());
         }
@@ -758,6 +870,7 @@ mod tests {
             NetworkId::from(PsyChainNetworkType::PsyMainnet),
             0,
             &trailing,
+            &idle_control_bytes(),
         )
         .is_err());
         let mut unknown_version = encoded;
@@ -767,6 +880,7 @@ mod tests {
                 NetworkId::from(PsyChainNetworkType::PsyMainnet),
                 0,
                 &unknown_version,
+                &idle_control_bytes(),
             ),
             Err(CanonicalHeadModelError::Codec(
                 CanonicalChainRefCodecError::UnsupportedVersion(2)
@@ -779,6 +893,7 @@ mod tests {
                 NetworkId::from(PsyChainNetworkType::PsyMainnet),
                 0,
                 &invalid_magic,
+                &idle_control_bytes(),
             ),
             Err(CanonicalHeadModelError::Codec(
                 CanonicalChainRefCodecError::InvalidMagic
@@ -843,39 +958,59 @@ mod tests {
     }
 
     #[test]
-    fn open_epoch_validates_next_epoch_and_exact_checkpoint_ref() {
-        let expected = *genesis().candidate();
-        let unchanged = *expected.canonical_ref().checkpoint();
-        let valid = CanonicalChainRef::new(
-            expected.canonical_ref().network_id(),
-            ChainEpoch::new(1),
-            unchanged,
-        );
-        let transition = CanonicalHeadTransition::open_rollback_epoch(expected, valid).unwrap();
-        assert_eq!(transition.kind(), CanonicalHeadTransitionKind::OpenRollbackEpoch);
+    fn rollback_admission_opens_epoch_and_attaches_exact_request() {
+        let head = canonical_ref(PsyChainNetworkType::PsyMainnet, 0, 10, 50);
+        let expected = stored_for_test(head);
+        let target = *canonical_ref(PsyChainNetworkType::PsyMainnet, 0, 7, 40).checkpoint();
+        let request = rollback_request(*head.checkpoint(), target);
+        let transition = CanonicalHeadTransition::start_rollback(expected, request).unwrap();
+        assert_eq!(transition.kind(), CanonicalHeadTransitionKind::StartRollback);
         assert_eq!(transition.candidate().revision().get(), 1);
+        assert_eq!(transition.candidate().canonical_ref().chain_epoch().get(), 1);
         assert_eq!(transition.candidate().canonical_ref().checkpoint(), expected.canonical_ref().checkpoint());
+        assert_eq!(transition.candidate().rollback_control().requested(), Some(&request));
 
-        for proposed in [
-            canonical_ref(PsyChainNetworkType::PsyMainnet, 0, 0, 1),
-            canonical_ref(PsyChainNetworkType::PsyMainnet, 2, 0, 1),
-            canonical_ref(PsyChainNetworkType::PsyMainnet, 1, 1, 1),
-            canonical_ref(PsyChainNetworkType::PsyMainnet, 1, 0, 99),
-            canonical_ref(PsyChainNetworkType::PsyPublicTestnet, 1, 0, 1),
-        ] {
-            assert!(CanonicalHeadTransition::open_rollback_epoch(expected, proposed).is_err());
-        }
-        let later = stored_for_test(canonical_ref(
-            PsyChainNetworkType::PsyMainnet,
-            5,
-            10,
-            30,
-        ));
-        assert!(CanonicalHeadTransition::open_rollback_epoch(
-            later,
-            canonical_ref(PsyChainNetworkType::PsyMainnet, 4, 10, 30),
-        )
-        .is_err());
+        let wrong_head = *canonical_ref(PsyChainNetworkType::PsyMainnet, 0, 9, 49).checkpoint();
+        assert_eq!(
+            CanonicalHeadTransition::start_rollback(
+                expected,
+                rollback_request(wrong_head, target),
+            ),
+            Err(CanonicalHeadModelError::RollbackRequestedHeadMismatch)
+        );
+        assert_eq!(
+            CanonicalHeadTransition::normal_checkpoint_advance(
+                *transition.candidate(),
+                canonical_ref(PsyChainNetworkType::PsyMainnet, 1, 11, 60),
+            ),
+            Err(CanonicalHeadModelError::NormalAdvanceWhileRollbackActive)
+        );
+        assert_eq!(
+            CanonicalHeadTransition::start_rollback(*transition.candidate(), request),
+            Err(CanonicalHeadModelError::RollbackAlreadyActive)
+        );
+
+        let requested_bytes = transition.candidate().rollback_control_bytes();
+        assert_eq!(
+            StoredCanonicalHead::<PHash>::decode_persisted(
+                head.network_id(),
+                1,
+                &head.to_canonical_bytes(),
+                &requested_bytes,
+            ),
+            Err(CanonicalHeadModelError::RequestedControlAtEpochZero)
+        );
+        let mismatched_head =
+            canonical_ref(PsyChainNetworkType::PsyMainnet, 1, 11, 60);
+        assert_eq!(
+            StoredCanonicalHead::<PHash>::decode_persisted(
+                mismatched_head.network_id(),
+                1,
+                &mismatched_head.to_canonical_bytes(),
+                &requested_bytes,
+            ),
+            Err(CanonicalHeadModelError::RollbackRequestedHeadMismatch)
+        );
     }
 
     #[test]
@@ -916,6 +1051,7 @@ mod tests {
             max_checkpoint_ref.network_id(),
             0,
             &max_checkpoint_ref.to_canonical_bytes(),
+            &idle_control_bytes(),
         )
         .unwrap();
         assert_eq!(
@@ -928,10 +1064,18 @@ mod tests {
             max_epoch_ref.network_id(),
             0,
             &max_epoch_ref.to_canonical_bytes(),
+            &idle_control_bytes(),
         )
         .unwrap();
         assert_eq!(
-            CanonicalHeadTransition::open_rollback_epoch(max_epoch, max_epoch_ref),
+            CanonicalHeadTransition::start_rollback(
+                max_epoch,
+                rollback_request(
+                    *max_epoch_ref.checkpoint(),
+                    *canonical_ref(PsyChainNetworkType::PsyMainnet, u64::MAX, 6, 2)
+                        .checkpoint(),
+                ),
+            ),
             Err(CanonicalHeadModelError::ChainEpochOverflow(u64::MAX))
         );
 
@@ -939,6 +1083,7 @@ mod tests {
             NetworkId::from(PsyChainNetworkType::PsyMainnet),
             i64::MAX,
             genesis().candidate_payload(),
+            genesis().candidate_control_payload(),
         )
         .unwrap();
         assert_eq!(
@@ -1063,6 +1208,7 @@ mod tests {
             network,
             9,
             &current_ref.to_canonical_bytes(),
+            &idle_control_bytes(),
         )
         .unwrap();
         assert_eq!(
@@ -1105,6 +1251,7 @@ mod tests {
             network,
             9,
             &current_ref.to_canonical_bytes(),
+            &idle_control_bytes(),
         )
         .unwrap();
         for materialized in [
@@ -1138,6 +1285,7 @@ mod tests {
             canonical_ref.network_id(),
             0,
             &canonical_ref.to_canonical_bytes(),
+            &idle_control_bytes(),
         )
         .unwrap()
     }

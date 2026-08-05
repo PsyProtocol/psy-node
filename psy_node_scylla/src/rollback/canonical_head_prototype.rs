@@ -116,39 +116,42 @@ impl CanonicalHeadQueries {
             create_table: CanonicalHeadQuery {
                 id: CanonicalHeadQueryId::CreateTable,
                 cql: format!(
-                    "CREATE TABLE IF NOT EXISTS {qualified} (network_chain_id bigint PRIMARY KEY, revision bigint, canonical_ref blob)"
+                    "CREATE TABLE IF NOT EXISTS {qualified} (network_chain_id bigint PRIMARY KEY, revision bigint, canonical_ref blob, rollback_control blob)"
                 ),
                 bind_shape: &[],
             },
             read: CanonicalHeadQuery {
                 id: CanonicalHeadQueryId::Read,
                 cql: format!(
-                    "SELECT network_chain_id, revision, canonical_ref FROM {qualified} WHERE network_chain_id = ?"
+                    "SELECT network_chain_id, revision, canonical_ref, rollback_control FROM {qualified} WHERE network_chain_id = ?"
                 ),
                 bind_shape: &["network_chain_id:BIGINT"],
             },
             bootstrap: CanonicalHeadQuery {
                 id: CanonicalHeadQueryId::Bootstrap,
                 cql: format!(
-                    "INSERT INTO {qualified} (network_chain_id, revision, canonical_ref) VALUES (?, ?, ?) IF NOT EXISTS"
+                    "INSERT INTO {qualified} (network_chain_id, revision, canonical_ref, rollback_control) VALUES (?, ?, ?, ?) IF NOT EXISTS"
                 ),
                 bind_shape: &[
                     "network_chain_id:BIGINT",
                     "candidate_revision:BIGINT",
                     "candidate_canonical_ref:BLOB",
+                    "candidate_rollback_control:BLOB",
                 ],
             },
             compare_and_set: CanonicalHeadQuery {
                 id: CanonicalHeadQueryId::CompareAndSet,
                 cql: format!(
-                    "UPDATE {qualified} SET revision = ?, canonical_ref = ? WHERE network_chain_id = ? IF revision = ? AND canonical_ref = ?"
+                    "UPDATE {qualified} SET revision = ?, canonical_ref = ?, rollback_control = ? WHERE network_chain_id = ? IF revision = ? AND canonical_ref = ? AND rollback_control = ?"
                 ),
                 bind_shape: &[
                     "candidate_revision:BIGINT",
                     "candidate_canonical_ref:BLOB",
+                    "candidate_rollback_control:BLOB",
                     "network_chain_id:BIGINT",
                     "expected_revision:BIGINT",
                     "expected_canonical_ref:BLOB",
+                    "expected_rollback_control:BLOB",
                 ],
             },
         }
@@ -228,6 +231,7 @@ pub struct CanonicalHeadBootstrapBinding {
     network_chain_id: i64,
     candidate_revision: i64,
     candidate_canonical_ref: Vec<u8>,
+    candidate_rollback_control: Vec<u8>,
 }
 
 impl CanonicalHeadBootstrapBinding {
@@ -236,6 +240,7 @@ impl CanonicalHeadBootstrapBinding {
             network_chain_id: i64::from(bootstrap.candidate().canonical_ref().network_id().chain_id()),
             candidate_revision: bootstrap.candidate().revision().as_i64(),
             candidate_canonical_ref: bootstrap.candidate_payload().to_vec(),
+            candidate_rollback_control: bootstrap.candidate_control_payload().to_vec(),
         }
     }
 
@@ -244,6 +249,7 @@ impl CanonicalHeadBootstrapBinding {
             CanonicalHeadBindValue::BigInt(self.network_chain_id),
             CanonicalHeadBindValue::BigInt(self.candidate_revision),
             CanonicalHeadBindValue::Blob(self.candidate_canonical_ref.clone()),
+            CanonicalHeadBindValue::Blob(self.candidate_rollback_control.clone()),
         ]
     }
 
@@ -257,9 +263,11 @@ impl CanonicalHeadBootstrapBinding {
 pub struct CanonicalHeadCasBinding {
     candidate_revision: i64,
     candidate_canonical_ref: Vec<u8>,
+    candidate_rollback_control: Vec<u8>,
     network_chain_id: i64,
     expected_revision: i64,
     expected_canonical_ref: Vec<u8>,
+    expected_rollback_control: Vec<u8>,
 }
 
 impl CanonicalHeadCasBinding {
@@ -267,9 +275,11 @@ impl CanonicalHeadCasBinding {
         Self {
             candidate_revision: sealed.candidate().revision().as_i64(),
             candidate_canonical_ref: sealed.candidate_payload().to_vec(),
+            candidate_rollback_control: sealed.candidate_control_payload().to_vec(),
             network_chain_id: i64::from(sealed.expected().canonical_ref().network_id().chain_id()),
             expected_revision: sealed.expected().revision().as_i64(),
             expected_canonical_ref: sealed.expected_payload().to_vec(),
+            expected_rollback_control: sealed.expected_control_payload().to_vec(),
         }
     }
 
@@ -277,9 +287,11 @@ impl CanonicalHeadCasBinding {
         vec![
             CanonicalHeadBindValue::BigInt(self.candidate_revision),
             CanonicalHeadBindValue::Blob(self.candidate_canonical_ref.clone()),
+            CanonicalHeadBindValue::Blob(self.candidate_rollback_control.clone()),
             CanonicalHeadBindValue::BigInt(self.network_chain_id),
             CanonicalHeadBindValue::BigInt(self.expected_revision),
             CanonicalHeadBindValue::Blob(self.expected_canonical_ref.clone()),
+            CanonicalHeadBindValue::Blob(self.expected_rollback_control.clone()),
         ]
     }
 
@@ -326,6 +338,7 @@ struct CanonicalHeadDbRow {
     network_chain_id: i64,
     revision: Option<i64>,
     canonical_ref: Option<Vec<u8>>,
+    rollback_control: Option<Vec<u8>>,
 }
 
 /// Isolated durable adapter. The raw Session remains behind this composition
@@ -535,6 +548,7 @@ fn decode_db_row<Hash: Q256BitHash>(
         row.network_chain_id,
         row.revision,
         row.canonical_ref.as_deref(),
+        row.rollback_control.as_deref(),
     )
 }
 
@@ -545,6 +559,7 @@ pub fn decode_canonical_head_persisted_cells<Hash: Q256BitHash>(
     network_chain_id: i64,
     revision: Option<i64>,
     canonical_ref: Option<&[u8]>,
+    rollback_control: Option<&[u8]>,
 ) -> Result<StoredCanonicalHead<Hash>, CanonicalHeadPrototypeError> {
     let chain_id = u32::try_from(network_chain_id)
         .map_err(|_| CanonicalHeadPrototypeError::NetworkChainIdOutOfRange(network_chain_id))?;
@@ -557,7 +572,15 @@ pub fn decode_canonical_head_persisted_cells<Hash: Q256BitHash>(
     }
     let revision = revision.ok_or(CanonicalHeadPrototypeError::MissingRevision)?;
     let canonical_ref = canonical_ref.ok_or(CanonicalHeadPrototypeError::MissingCanonicalPayload)?;
-    StoredCanonicalHead::decode_persisted(partition_network, revision, canonical_ref).map_err(Into::into)
+    let rollback_control =
+        rollback_control.ok_or(CanonicalHeadPrototypeError::MissingRollbackControlPayload)?;
+    StoredCanonicalHead::decode_persisted(
+        partition_network,
+        revision,
+        canonical_ref,
+        rollback_control,
+    )
+    .map_err(Into::into)
 }
 
 fn decode_lwt_applied(result: QueryResult) -> Result<bool, CanonicalHeadPrototypeError> {
@@ -586,6 +609,7 @@ pub enum CanonicalHeadPrototypeError {
     SelectedPartitionMismatch { requested: NetworkId, returned: NetworkId },
     MissingRevision,
     MissingCanonicalPayload,
+    MissingRollbackControlPayload,
     MissingAppliedColumn,
     InvalidAppliedColumn,
     CurrentMissingAfterLwt { operation: &'static str, applied: bool },
@@ -616,6 +640,9 @@ impl fmt::Display for CanonicalHeadPrototypeError {
             Self::MissingRevision => formatter.write_str("canonical-head row has null revision"),
             Self::MissingCanonicalPayload => {
                 formatter.write_str("canonical-head row has null canonical_ref")
+            }
+            Self::MissingRollbackControlPayload => {
+                formatter.write_str("canonical-head row has null rollback_control")
             }
             Self::MissingAppliedColumn => {
                 formatter.write_str("canonical-head LWT result has no [applied] column")

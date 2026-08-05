@@ -12,6 +12,13 @@ use psy_node_core::store::canonical_head::{
     CanonicalHeadWriteOutcome, CoordinatorCanonicalHeadReader,
     CoordinatorCanonicalHeadStore,
 };
+use psy_node_core::store::{
+    rollback_control::{
+        RollbackExecutionMode, RollbackPlanDigest, RollbackRequest,
+        RollbackControlState,
+    },
+    timestamp::{CommitWriteTimestampUs, TimestampFenceWindow},
+};
 use psy_node_store_memory::cbs_store::InMemoryCoreStore;
 
 type Store = InMemoryCoreStore<Hash256, CoreSha256Hasher>;
@@ -194,4 +201,84 @@ async fn concurrent_authority_reads_only_observe_complete_published_identities()
         reader.await.unwrap();
     }
     writer.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn normal_publish_and_rollback_admission_have_one_atomic_winner() {
+    let store = Arc::new(Store::new());
+    let bootstrap = genesis();
+    store.bootstrap_canonical_head(&bootstrap).await.unwrap();
+    let to_one = CanonicalHeadTransition::normal_checkpoint_advance(
+        *bootstrap.candidate(),
+        canonical_ref(1, 2),
+    )
+    .unwrap()
+    .seal();
+    let CanonicalHeadWriteOutcome::Applied(expected) = store
+        .compare_and_set_canonical_head(&to_one)
+        .await
+        .unwrap()
+    else {
+        panic!("single writer must publish checkpoint one");
+    };
+
+    let normal = CanonicalHeadTransition::normal_checkpoint_advance(
+        expected,
+        canonical_ref(2, 3),
+    )
+    .unwrap()
+    .seal();
+    let request = RollbackRequest::try_new(
+        *expected.canonical_ref().checkpoint(),
+        *canonical_ref(0, 1).checkpoint(),
+        TimestampFenceWindow::try_new(
+            CommitWriteTimestampUs::try_from_i128(100).unwrap(),
+            101,
+            102,
+        )
+        .unwrap(),
+        RollbackExecutionMode::InPlace,
+        RollbackPlanDigest::try_new([0xA5; 32]).unwrap(),
+    )
+    .unwrap();
+    let rollback = CanonicalHeadTransition::start_rollback(expected, request)
+        .unwrap()
+        .seal();
+
+    let tasks = (0..64).map(|index| {
+        let store = Arc::clone(&store);
+        let sealed = if index % 2 == 0 { normal } else { rollback };
+        tokio::spawn(async move {
+            store
+                .compare_and_set_canonical_head(&sealed)
+                .await
+                .unwrap()
+        })
+    });
+    let mut applied = 0;
+    for task in tasks {
+        if task.await.unwrap().was_applied() {
+            applied += 1;
+        }
+    }
+    assert_eq!(applied, 1);
+
+    let CanonicalHeadReadState::Current(current) =
+        store.read_canonical_head(network()).await.unwrap()
+    else {
+        panic!("authority must remain initialized");
+    };
+    if current == *normal.candidate() {
+        assert!(current.rollback_control().is_idle());
+        assert_eq!(current.canonical_ref().chain_epoch().get(), 0);
+        assert_eq!(current.canonical_ref().checkpoint().checkpoint_id().get(), 2);
+    } else {
+        assert_eq!(current, *rollback.candidate());
+        assert!(matches!(
+            current.rollback_control(),
+            RollbackControlState::Requested(_)
+        ));
+        assert_eq!(current.canonical_ref().chain_epoch().get(), 1);
+        assert_eq!(current.canonical_ref().checkpoint().checkpoint_id().get(), 1);
+    }
 }

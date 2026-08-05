@@ -17,6 +17,13 @@ use psy_node_core::store::canonical_head::{
     CanonicalHeadTransition, CanonicalHeadWriteOutcome, SealedCanonicalHeadCas,
     StoredCanonicalHead,
 };
+use psy_node_core::store::{
+    rollback_control::{
+        RollbackExecutionMode, RollbackPlanDigest, RollbackRequest,
+        RollbackControlState,
+    },
+    timestamp::{CommitWriteTimestampUs, TimestampFenceWindow},
+};
 use psy_node_scylla::rollback::{
     CanonicalHeadNoTabletKeyspace, CanonicalHeadPrototypeAdapter,
     CanonicalHeadPrototypeError, C01A_CANONICAL_HEAD_TABLE,
@@ -30,7 +37,7 @@ use serde::Serialize;
 use tokio::time::sleep;
 
 const KEYSPACE: &str = "psy_c01a_rf3_nt";
-const BASELINE: &str = "43a1097f88df6d55810e7af30502d80c44401c09";
+const BASELINE: &str = "6432995b423db207f84c38609d80dd2159ab5ede";
 const IMAGE: &str =
     "scylladb/scylla@sha256:17496f2dd6e72056d0b0d7e2bd18bd62638872d1d80a5dd9db96ba017fd426fc";
 const CONCURRENT_WRITERS: usize = 64;
@@ -114,16 +121,29 @@ fn advance(
     .seal()
 }
 
-fn open_epoch(expected: StoredCanonicalHead<PHash>) -> SealedCanonicalHeadCas<PHash> {
-    CanonicalHeadTransition::open_rollback_epoch(
-        expected,
-        CanonicalChainRef::new(
-            expected.canonical_ref().network_id(),
-            ChainEpoch::new(expected.canonical_ref().chain_epoch().get() + 1),
-            *expected.canonical_ref().checkpoint(),
-        ),
+fn start_rollback(expected: StoredCanonicalHead<PHash>) -> SealedCanonicalHeadCas<PHash> {
+    let target = *canonical_ref(
+        expected.canonical_ref().network_id(),
+        expected.canonical_ref().chain_epoch().get(),
+        expected.canonical_ref().checkpoint().checkpoint_id().get() - 1,
+        90_000,
     )
-    .expect("valid test epoch transition")
+    .checkpoint();
+    let request = RollbackRequest::try_new(
+        *expected.canonical_ref().checkpoint(),
+        target,
+        TimestampFenceWindow::try_new(
+            CommitWriteTimestampUs::try_from_i128(100).unwrap(),
+            101,
+            102,
+        )
+        .unwrap(),
+        RollbackExecutionMode::InPlace,
+        RollbackPlanDigest::try_new([0xA5; 32]).unwrap(),
+    )
+    .unwrap();
+    CanonicalHeadTransition::start_rollback(expected, request)
+    .expect("valid test rollback admission")
     .seal()
 }
 
@@ -256,20 +276,21 @@ async fn read_direct(
     let row = session
         .query_unpaged(
             format!(
-                "SELECT network_chain_id, revision, canonical_ref FROM \
+                "SELECT network_chain_id, revision, canonical_ref, rollback_control FROM \
                  {KEYSPACE}.{C01A_CANONICAL_HEAD_TABLE} WHERE network_chain_id = ?"
             ),
             (i64::from(requested_network.chain_id()),),
         )
         .await?
         .into_rows_result()?
-        .maybe_first_row::<(i64, Option<i64>, Option<Vec<u8>>)>()?;
-    row.map(|(network_chain_id, revision, canonical_ref)| {
+        .maybe_first_row::<(i64, Option<i64>, Option<Vec<u8>>, Option<Vec<u8>>)>()?;
+    row.map(|(network_chain_id, revision, canonical_ref, rollback_control)| {
         psy_node_scylla::rollback::decode_canonical_head_persisted_cells::<PHash>(
             requested_network,
             network_chain_id,
             revision,
             canonical_ref.as_deref(),
+            rollback_control.as_deref(),
         )
         .map_err(Into::into)
     })
@@ -282,16 +303,18 @@ async fn raw_put(
     revision: i64,
     canonical_ref: &[u8],
 ) -> anyhow::Result<()> {
+    let rollback_control = RollbackControlState::<PHash>::Idle.to_canonical_bytes();
     session
         .query_unpaged(
             format!(
                 "INSERT INTO {KEYSPACE}.{C01A_CANONICAL_HEAD_TABLE} \
-                 (network_chain_id, revision, canonical_ref) VALUES (?, ?, ?)"
+                 (network_chain_id, revision, canonical_ref, rollback_control) VALUES (?, ?, ?, ?)"
             ),
             (
                 i64::from(partition_network.chain_id()),
                 revision,
                 canonical_ref,
+                rollback_control.as_slice(),
             ),
         )
         .await?;
@@ -305,6 +328,40 @@ fn current(
         CanonicalHeadReadState::Current(current) => Ok(current),
         CanonicalHeadReadState::Uninitialized => bail!("canonical head unexpectedly uninitialized"),
     }
+}
+
+async fn bootstrap_until_observed(
+    adapter: &CanonicalHeadPrototypeAdapter,
+    bootstrap: &CanonicalHeadBootstrap<PHash>,
+) -> anyhow::Result<CanonicalHeadWriteOutcome<PHash>> {
+    for attempt in 1..=12_u64 {
+        match adapter.bootstrap(bootstrap).await {
+            Ok(outcome) => return Ok(outcome),
+            Err(
+                CanonicalHeadPrototypeError::IndeterminateWrite { .. }
+                | CanonicalHeadPrototypeError::IndeterminateReadFailed { .. },
+            ) => sleep(Duration::from_millis(attempt * 100)).await,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    bail!("bootstrap remained indeterminate after exact-intent retries")
+}
+
+async fn compare_and_set_until_observed(
+    adapter: &CanonicalHeadPrototypeAdapter,
+    sealed: &SealedCanonicalHeadCas<PHash>,
+) -> anyhow::Result<CanonicalHeadWriteOutcome<PHash>> {
+    for attempt in 1..=12_u64 {
+        match adapter.compare_and_set(sealed).await {
+            Ok(outcome) => return Ok(outcome),
+            Err(
+                CanonicalHeadPrototypeError::IndeterminateWrite { .. }
+                | CanonicalHeadPrototypeError::IndeterminateReadFailed { .. },
+            ) => sleep(Duration::from_millis(attempt * 100)).await,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    bail!("compare_and_set remained indeterminate after exact-intent retries")
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -329,6 +386,9 @@ struct GateReport {
     identical_bootstrap_idempotent: usize,
     competing_cas_applied: usize,
     competing_cas_conflict: usize,
+    admission_race_applied: usize,
+    admission_race_idempotent: usize,
+    admission_race_conflict: usize,
     maintenance: MaintenanceTiming,
     scenarios_passed: Vec<&'static str>,
     qualification: &'static str,
@@ -368,7 +428,8 @@ async fn canonical_head_rf3_gate() -> anyhow::Result<()> {
     let mainnet_bootstrap = genesis(mainnet(), 1);
     let bootstrap_started = Instant::now();
     let bootstrap_outcomes = join_all(
-        (0..CONCURRENT_WRITERS).map(|_| adapter.bootstrap(&mainnet_bootstrap)),
+        (0..CONCURRENT_WRITERS)
+            .map(|_| bootstrap_until_observed(&adapter, &mainnet_bootstrap)),
     )
     .await
     .into_iter()
@@ -393,7 +454,7 @@ async fn canonical_head_rf3_gate() -> anyhow::Result<()> {
     let outcomes = join_all(
         competing_bootstraps
             .iter()
-            .map(|bootstrap| adapter.bootstrap(bootstrap)),
+            .map(|bootstrap| bootstrap_until_observed(&adapter, bootstrap)),
     )
     .await
     .into_iter()
@@ -413,7 +474,7 @@ async fn canonical_head_rf3_gate() -> anyhow::Result<()> {
     let outcomes = join_all(
         competing
             .iter()
-            .map(|sealed| adapter.compare_and_set(sealed)),
+            .map(|sealed| compare_and_set_until_observed(&adapter, sealed)),
     )
     .await
     .into_iter()
@@ -444,11 +505,6 @@ async fn canonical_head_rf3_gate() -> anyhow::Result<()> {
         .await?
         .was_idempotent());
 
-    // Opening the next rollback epoch changes only epoch and revision.
-    let epoch_transition = open_epoch(winner);
-    ensure!(adapter.compare_and_set(&epoch_transition).await?.was_applied());
-    let epoch_head = *epoch_transition.candidate();
-
     // A quorum CAS remains durable while one replica is offline. After the
     // replica returns, repair/flush/compaction must converge every direct ONE
     // read to the exact candidate.
@@ -457,7 +513,7 @@ async fn canonical_head_rf3_gate() -> anyhow::Result<()> {
         &["stop", "--timeout", "30", "scylla3"],
         "stop C-01a stale replica",
     )?;
-    let offline_transition = advance(epoch_head, 30_000);
+    let offline_transition = advance(winner, 30_000);
     ensure!(adapter
         .compare_and_set(&offline_transition)
         .await?
@@ -491,6 +547,63 @@ async fn canonical_head_rf3_gate() -> anyhow::Result<()> {
         current(reconnected.read::<PHash>(mainnet()).await?)?
             == *offline_transition.candidate()
     );
+
+    // Normal publish and rollback admission compete through the exact same
+    // revision/head/control LWT. One candidate wins atomically; retries of the
+    // winning candidate are idempotent and the other candidate conflicts.
+    let admission_expected = *offline_transition.candidate();
+    let normal_publish = advance(admission_expected, 30_001);
+    let rollback_admission = start_rollback(admission_expected);
+    let admission_competing = (0..CONCURRENT_WRITERS)
+        .map(|index| {
+            if index % 2 == 0 {
+                normal_publish
+            } else {
+                rollback_admission
+            }
+        })
+        .collect::<Vec<_>>();
+    let admission_outcomes = join_all(
+        admission_competing
+            .iter()
+            .map(|sealed| compare_and_set_until_observed(&reconnected, sealed)),
+    )
+    .await
+    .into_iter()
+    .collect::<Result<Vec<_>, _>>()?;
+    let admission_race_applied = admission_outcomes
+        .iter()
+        .filter(|outcome| outcome.was_applied())
+        .count();
+    let admission_race_idempotent = admission_outcomes
+        .iter()
+        .filter(|outcome| outcome.was_idempotent())
+        .count();
+    let admission_race_conflict = admission_outcomes
+        .iter()
+        .filter(|outcome| matches!(outcome, CanonicalHeadWriteOutcome::Conflict { .. }))
+        .count();
+    ensure!(admission_race_applied == 1);
+    ensure!(admission_race_idempotent + admission_race_conflict == CONCURRENT_WRITERS - 1);
+    let admission_winner = current(reconnected.read::<PHash>(mainnet()).await?)?;
+    ensure!(admission_outcomes
+        .iter()
+        .all(|outcome| outcome.current() == &admission_winner));
+    if admission_winner == *normal_publish.candidate() {
+        ensure!(admission_winner.rollback_control().is_idle());
+        ensure!(
+            admission_winner.canonical_ref().chain_epoch()
+                == admission_expected.canonical_ref().chain_epoch()
+        );
+    } else {
+        ensure!(admission_winner == *rollback_admission.candidate());
+        ensure!(admission_winner.rollback_control().requested().is_some());
+        ensure!(CanonicalHeadTransition::normal_checkpoint_advance(
+            admission_winner,
+            canonical_ref(mainnet(), 1, 3, 30_002),
+        )
+        .is_err());
+    }
 
     // Real Scylla ABA injection: payload returns to A but revision advances to
     // two. The original revision-zero expected state can no longer write B.
@@ -554,6 +667,9 @@ async fn canonical_head_rf3_gate() -> anyhow::Result<()> {
         identical_bootstrap_idempotent,
         competing_cas_applied,
         competing_cas_conflict,
+        admission_race_applied,
+        admission_race_idempotent,
+        admission_race_conflict,
         maintenance,
         scenarios_passed: vec![
             "UNINITIALIZED",
@@ -561,14 +677,14 @@ async fn canonical_head_rf3_gate() -> anyhow::Result<()> {
             "CONCURRENT_CONFLICTING_BOOTSTRAP",
             "CONCURRENT_EXPECTED_STATE_CAS",
             "IDEMPOTENT_RESPONSE_LOSS_RETRY",
-            "OPEN_EPOCH",
+            "ATOMIC_ROLLBACK_ADMISSION",
             "ONE_REPLICA_OFFLINE_REPAIR_RESTART",
             "HANDLE_DROP_RECONNECT",
             "REVISION_ABA_FENCE",
             "MALFORMED_ROW_FAIL_CLOSED",
             "NETWORK_MISMATCH_FAIL_CLOSED",
         ],
-        qualification: "C-01a durable-row RF=3 mechanism evidence only; not production authority, commit integration, D-01b RPC, or full C-01 control.",
+        qualification: "C-01c single-row rollback admission evidence; later phases, ABORT/PONR, RPC, executor, and full C-01 remain out of scope.",
     };
     let report_path = Path::new(&report_path);
     if let Some(parent) = report_path.parent() {

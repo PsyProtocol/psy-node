@@ -10,6 +10,13 @@ use psy_node_core::store::canonical_head::{
     CanonicalHeadModelError, CanonicalHeadReadState, CanonicalHeadTransition,
     CanonicalHeadWriteOutcome, SealedCanonicalHeadCas, StoredCanonicalHead,
 };
+use psy_node_core::store::{
+    rollback_control::{
+        RollbackControlState, RollbackExecutionMode, RollbackPlanDigest,
+        RollbackRequest,
+    },
+    timestamp::{CommitWriteTimestampUs, TimestampFenceWindow},
+};
 use psy_node_scylla::rollback::{
     decode_canonical_head_persisted_cells,
     CanonicalHeadBindValue, CanonicalHeadBootstrapBinding,
@@ -60,10 +67,12 @@ fn genesis() -> CanonicalHeadBootstrap<PHash> {
 }
 
 fn stored(revision: i64, canonical_ref: CanonicalChainRef<PHash>) -> StoredCanonicalHead<PHash> {
+    let idle = RollbackControlState::<PHash>::Idle.to_canonical_bytes();
     StoredCanonicalHead::decode_persisted(
         canonical_ref.network_id(),
         revision,
         &canonical_ref.to_canonical_bytes(),
+        &idle,
     )
     .unwrap()
 }
@@ -84,6 +93,25 @@ fn advance(
         .seal()
 }
 
+fn rollback_request(
+    requested: StoredCanonicalHead<PHash>,
+    target: CheckpointRef<PHash>,
+) -> RollbackRequest<PHash> {
+    RollbackRequest::try_new(
+        *requested.canonical_ref().checkpoint(),
+        target,
+        TimestampFenceWindow::try_new(
+            CommitWriteTimestampUs::try_from_i128(1_000).unwrap(),
+            2_000,
+            3_000,
+        )
+        .unwrap(),
+        RollbackExecutionMode::InPlace,
+        RollbackPlanDigest::try_new([0xA5; 32]).unwrap(),
+    )
+    .unwrap()
+}
+
 fn d01_golden(name: &str) -> &str {
     D01_GOLDEN
         .lines()
@@ -97,6 +125,7 @@ struct RawCanonicalHeadRow {
     network_chain_id: i64,
     revision: Option<i64>,
     canonical_ref: Option<Vec<u8>>,
+    rollback_control: Option<Vec<u8>>,
 }
 
 impl RawCanonicalHeadRow {
@@ -107,6 +136,7 @@ impl RawCanonicalHeadRow {
             ),
             revision: Some(head.revision().as_i64()),
             canonical_ref: Some(head.canonical_ref_bytes().to_vec()),
+            rollback_control: Some(head.rollback_control_bytes().to_vec()),
         }
     }
 
@@ -126,10 +156,15 @@ impl RawCanonicalHeadRow {
             .canonical_ref
             .as_deref()
             .ok_or(TestModelError::Malformed)?;
+        let rollback_control = self
+            .rollback_control
+            .as_deref()
+            .ok_or(TestModelError::Malformed)?;
         StoredCanonicalHead::decode_persisted(
             returned_network,
             revision,
             canonical_ref,
+            rollback_control,
         )
         .map_err(TestModelError::Model)
     }
@@ -242,8 +277,8 @@ fn schema_query_and_binding_golden_are_single_source_and_stable() {
     assert!(queries
         .compare_and_set()
         .cql()
-        .ends_with("IF revision = ? AND canonical_ref = ?"));
-    assert_eq!(queries.compare_and_set().cql().matches('?').count(), 5);
+        .ends_with("IF revision = ? AND canonical_ref = ? AND rollback_control = ?"));
+    assert_eq!(queries.compare_and_set().cql().matches('?').count(), 7);
     assert!(!queries.create_table().cql().contains("chain_epoch"));
     assert!(!queries.create_table().cql().contains("checkpoint_id"));
     assert!(!queries.create_table().cql().contains("checkpoint_hash"));
@@ -268,6 +303,9 @@ fn bind_order_is_typed_and_reuses_d01_payload_bytes() {
             CanonicalHeadBindValue::Blob(
                 bootstrap.candidate().canonical_ref().to_canonical_bytes().to_vec(),
             ),
+            CanonicalHeadBindValue::Blob(
+                bootstrap.candidate().rollback_control_bytes().to_vec(),
+            ),
         ]
     );
 
@@ -288,11 +326,13 @@ fn bind_order_is_typed_and_reuses_d01_payload_bytes() {
         vec![
             CanonicalHeadBindValue::BigInt(8),
             CanonicalHeadBindValue::Blob(sealed.candidate_payload().to_vec()),
+            CanonicalHeadBindValue::Blob(sealed.candidate_control_payload().to_vec()),
             CanonicalHeadBindValue::BigInt(i64::from(
                 mainnet().chain_id(),
             )),
             CanonicalHeadBindValue::BigInt(7),
             CanonicalHeadBindValue::Blob(sealed.expected_payload().to_vec()),
+            CanonicalHeadBindValue::Blob(sealed.expected_control_payload().to_vec()),
         ]
     );
     assert_eq!(sealed.expected_payload(), &expected.canonical_ref_bytes());
@@ -337,12 +377,14 @@ fn missing_row_is_uninitialized_and_does_not_invent_epoch_zero() {
 #[test]
 fn nullable_or_invalid_persisted_cells_fail_closed() {
     let payload = genesis().candidate().canonical_ref_bytes();
+    let control = genesis().candidate().rollback_control_bytes();
     assert_eq!(
         decode_canonical_head_persisted_cells::<PHash>(
             mainnet(),
             i64::from(mainnet().chain_id()),
             None,
             Some(&payload),
+            Some(&control),
         ),
         Err(CanonicalHeadPrototypeError::MissingRevision)
     );
@@ -352,11 +394,18 @@ fn nullable_or_invalid_persisted_cells_fail_closed() {
             i64::from(mainnet().chain_id()),
             Some(0),
             None,
+            Some(&control),
         ),
         Err(CanonicalHeadPrototypeError::MissingCanonicalPayload)
     );
     assert_eq!(
-        decode_canonical_head_persisted_cells::<PHash>(mainnet(), -1, Some(0), Some(&payload)),
+        decode_canonical_head_persisted_cells::<PHash>(
+            mainnet(),
+            -1,
+            Some(0),
+            Some(&payload),
+            Some(&control),
+        ),
         Err(CanonicalHeadPrototypeError::NetworkChainIdOutOfRange(-1))
     );
     assert!(matches!(
@@ -365,9 +414,20 @@ fn nullable_or_invalid_persisted_cells_fail_closed() {
             i64::from(mainnet().chain_id()),
             Some(0),
             Some(&payload),
+            Some(&control),
         ),
         Err(CanonicalHeadPrototypeError::SelectedPartitionMismatch { .. })
     ));
+    assert_eq!(
+        decode_canonical_head_persisted_cells::<PHash>(
+            mainnet(),
+            i64::from(mainnet().chain_id()),
+            Some(0),
+            Some(&payload),
+            None,
+        ),
+        Err(CanonicalHeadPrototypeError::MissingRollbackControlPayload)
+    );
 }
 
 #[test]
@@ -450,7 +510,7 @@ fn concurrent_cas_has_one_expected_state_winner() {
     assert_eq!(
         outcomes
             .iter()
-            .filter(|outcome| matches!(outcome, CanonicalHeadWriteOutcome::Conflict { .. }))
+            .filter(|outcome| !outcome.was_applied())
             .count(),
         WORKERS - 1
     );
@@ -466,6 +526,91 @@ fn concurrent_cas_has_one_expected_state_winner() {
             assert_eq!(current, durable);
         }
     }
+}
+
+#[test]
+fn normal_publish_and_rollback_admission_compete_on_one_atomic_row() {
+    const WORKERS: usize = 64;
+    let store = Arc::new(DeterministicCanonicalHeadStore::default());
+    let bootstrap = genesis();
+    store.bootstrap(&bootstrap).unwrap();
+
+    let first_advance = advance(*bootstrap.candidate(), 10);
+    assert!(store.compare_and_set(&first_advance).unwrap().was_applied());
+    let expected = *first_advance.candidate();
+    let normal_publish = advance(expected, 20);
+    let rollback_admission = CanonicalHeadTransition::start_rollback(
+        expected,
+        rollback_request(
+            expected,
+            *bootstrap.candidate().canonical_ref().checkpoint(),
+        ),
+    )
+    .unwrap()
+    .seal();
+
+    let barrier = Arc::new(Barrier::new(WORKERS));
+    let mut handles = Vec::new();
+    for worker in 0..WORKERS {
+        let store = Arc::clone(&store);
+        let barrier = Arc::clone(&barrier);
+        let sealed = if worker % 2 == 0 {
+            normal_publish
+        } else {
+            rollback_admission
+        };
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            store.compare_and_set(&sealed).unwrap()
+        }));
+    }
+
+    let outcomes = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        outcomes.iter().filter(|outcome| outcome.was_applied()).count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| !outcome.was_applied())
+            .count(),
+        WORKERS - 1
+    );
+
+    let durable = match store.read(mainnet()).unwrap() {
+        CanonicalHeadReadState::Current(current) => current,
+        CanonicalHeadReadState::Uninitialized => panic!("winner must publish"),
+    };
+    assert_eq!(durable.revision().get(), expected.revision().get() + 1);
+    match durable.rollback_control() {
+        RollbackControlState::Idle => {
+            assert_eq!(durable.canonical_ref().chain_epoch(), ChainEpoch::new(0));
+            assert_eq!(
+                durable.canonical_ref().checkpoint().checkpoint_id(),
+                CheckpointId::new(2)
+            );
+        }
+        RollbackControlState::Requested(request) => {
+            assert_eq!(durable.canonical_ref().chain_epoch(), ChainEpoch::new(1));
+            assert_eq!(
+                durable.canonical_ref().checkpoint().checkpoint_id(),
+                CheckpointId::new(1)
+            );
+            assert_eq!(
+                request.requested_head(),
+                expected.canonical_ref().checkpoint()
+            );
+            assert_eq!(
+                request.target(),
+                bootstrap.candidate().canonical_ref().checkpoint()
+            );
+        }
+    }
+    assert!(outcomes.iter().all(|outcome| outcome.current() == &durable));
 }
 
 #[test]
@@ -540,7 +685,8 @@ fn arbitrary_rewind_cannot_be_sealed_by_the_public_builders() {
     );
     let rewind = canonical_ref(mainnet(), 43, 100, 99);
     assert!(CanonicalHeadTransition::normal_checkpoint_advance(old, rewind).is_err());
-    assert!(CanonicalHeadTransition::open_rollback_epoch(old, rewind).is_err());
+    let source = include_str!("../../psy_node_core/src/store/canonical_head.rs");
+    assert!(!source.contains("pub fn open_rollback_epoch"));
 }
 
 #[test]
@@ -564,6 +710,7 @@ fn qualified_adapter_is_wired_only_into_coordinator_production() {
     assert!(setup.contains("initialize_coordinator_canonical_head"));
     assert!(processor.contains("publish_canonical_head"));
     assert!(processor.contains("reconcile_canonical_head_on_startup"));
+    assert!(!processor.contains("start_rollback"));
     assert!(jtmb_startup.contains(
         "setup_coordinator_psy_scylla_database_store_from_connection_string"
     ));
@@ -571,6 +718,7 @@ fn qualified_adapter_is_wired_only_into_coordinator_production() {
         "setup_coordinator_psy_scylla_database_store_from_connection_string"
     ));
     assert!(!coordinator_edge.contains("CoordinatorCanonicalHeadStore"));
+    assert!(!coordinator_edge.contains("start_rollback"));
     assert!(!realm_processor_db.contains("CoordinatorCanonicalHeadStore"));
     assert!(!realm_processor_create.contains("CoordinatorCanonicalHeadStore"));
 }
