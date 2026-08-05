@@ -8,7 +8,7 @@ use parth_core::{
     QCoreProcCheckpointUniqueId, crypto::hash::{
         merkle_proof::{DeltaMerkleProofCore, MerkleProofCore},
         traits::{FieldQHasher, MerkleZeroHasher, QFieldHashable, ZeroableHash},
-    }, data::queue::queue_key::{QPBaseQueueType, QPStandardUniqueIdQueueKey}, generic_traits::psy_debug_printable::PsyDebugPrintable, node::realm_identifier::QRealmIdentifier, protocol::core_types::{Q256BitHash, QNetworkTypesConfig, QZKProofPublicInputsHasherReader}
+    }, data::queue::queue_key::{QPBaseQueueType, QPStandardUniqueIdQueueKey}, generic_traits::psy_debug_printable::PsyDebugPrintable, node::realm_identifier::QRealmIdentifier, protocol::core_types::{Q256BitHash, QNetworkTypesConfig}
 };
 use crate::coordinator::queue_key::{CoordinatorSubmitRealmGUTAUpdateQueueKey, CoordinatorRegisterUserPublicKeyQueueKey, CoordinatorDeployContractQueueKey, CoordinatorProvingWorkQueueKey};
 
@@ -23,6 +23,10 @@ use psy_data::{
     node::coordinator_processor::{CoordinatorProcessorIdState, CoordinatorProcessorLastCommittedState},
     prepared_block::coordinator::PsyPreparedCoordinatorBlockStateUpdates,
     protocol::{
+        canonical_chain::{
+            CheckpointHash, checkpoint_hash_from_previous,
+            checkpoint_hash_from_saved_proof_bytes, genesis_checkpoint_hash,
+        },
         checkpoint_transition_hash::CheckpointStateHashTransition,
         verifiable_checkpoint_transition::{PsyVerifiableCheckpointTransition, PsyVerifiableCheckpointTransitionWithProof},
     },
@@ -98,9 +102,13 @@ where
     Hash: Q256BitHash,
     Hasher: FieldQHasher<F, Hash>,
 {
-    let root_leaf_hash = Hasher::q_two_to_one(checkpoint_tree_root, checkpoint_leaf_hash);
-    let step_hash = Hasher::q_two_to_one(root_leaf_hash, checkpoint_state_transition_circuit_fingerprint);
-    let expected_chain_hash = Hasher::q_two_to_one(previous_chain_hash, step_hash);
+    let expected_chain_hash = checkpoint_hash_from_previous::<_, Hasher>(
+        CheckpointHash::from_last_chain_hash(previous_chain_hash),
+        checkpoint_tree_root,
+        checkpoint_leaf_hash,
+        checkpoint_state_transition_circuit_fingerprint,
+    )
+    .into_inner();
 
     if proof_public_inputs_hash != expected_chain_hash {
         anyhow::bail!(
@@ -403,8 +411,10 @@ impl<
             let verifiable = db
                 .get_verifiable_checkpoint_state_transition_and_zkp(last_committed_checkpoint_id)
                 .await?;
-            let proof = N::ZKVerifier::try_proof_from_slice(&verifiable.zk_proof)?;
-            N::ZKVerifier::get_proof_public_inputs_hash(&proof)?
+            checkpoint_hash_from_saved_proof_bytes::<N::QHash, N::ZKProof, N::ZKVerifier>(
+                &verifiable.zk_proof,
+            )?
+            .into_inner()
         };
         let last_committed = CoordinatorProcessorLastCommittedState::<N::F, N::QHash> {
             l2_state: last_committed_l2_state,
@@ -654,6 +664,58 @@ checkpoint_backup_copy_status={}
             }
         };
 
+        // Validate the target's canonical chain identity before any reset-side
+        // mutation (backup truncate, mapping rewrite, or singleton update).
+        let last_chain_hash = if checkpoint_id == 0 {
+            genesis_checkpoint_hash::<_, N::HasherBase>(
+                checkpoint_root,
+                checkpoint_leaf_hash,
+                self.circuit_fingerprint_config
+                    .genesis_checkpoint_state_transition_fingerprint,
+            )
+            .into_inner()
+        } else {
+            let stored = self
+                .db
+                .get_verifiable_checkpoint_state_transition_and_zkp(checkpoint_id)
+                .await?;
+            let proof_checkpoint_hash =
+                checkpoint_hash_from_saved_proof_bytes::<N::QHash, N::ZKProof, N::ZKVerifier>(
+                    &stored.zk_proof,
+                )?
+                .into_inner();
+            let parent_checkpoint_hash = if checkpoint_id == 1 {
+                let parent_root = self.db.checkpoint_tree_get_root_hash(0).await?;
+                let parent_leaf_hash = self.db.get_checkpoint_leaf_data(0).await?.qfhash::<N::HasherBase>();
+                genesis_checkpoint_hash::<_, N::HasherBase>(
+                    parent_root,
+                    parent_leaf_hash,
+                    self.circuit_fingerprint_config
+                        .genesis_checkpoint_state_transition_fingerprint,
+                )
+                .into_inner()
+            } else {
+                let parent = self
+                    .db
+                    .get_verifiable_checkpoint_state_transition_and_zkp(checkpoint_id - 1)
+                    .await?;
+                checkpoint_hash_from_saved_proof_bytes::<N::QHash, N::ZKProof, N::ZKVerifier>(
+                    &parent.zk_proof,
+                )?
+                .into_inner()
+            };
+            ensure_non_genesis_checkpoint_chain_commitment::<N::F, N::QHash, N::HasherBase>(
+                checkpoint_id,
+                parent_checkpoint_hash,
+                checkpoint_root,
+                checkpoint_leaf_hash,
+                self.circuit_fingerprint_config
+                    .checkpoint_state_transition_circuit_fingerprint,
+                proof_checkpoint_hash,
+            )?;
+            proof_checkpoint_hash
+        };
+
         let (unique_pending_id, proc_checkpoint_unique_id) = self
             .db
             .get_current_unique_pending_id()
@@ -697,19 +759,6 @@ checkpoint_backup_copy_status={}
         self.ids.proc_checkpoint_unique_id = proc_checkpoint_unique_id;
         self.ids.gathering_unique_pending_id = unique_pending_id;
         self.ids.gathering_proc_checkpoint_unique_id = proc_checkpoint_unique_id;
-        // Reconstruct last_chain_hash for the target checkpoint.
-        // For genesis (0), chain_0 = H(H(root, leaf), genesis_fingerprint).
-        // For non-genesis, retrieve the stored ZKP and extract its public inputs hash.
-        let last_chain_hash = if checkpoint_id == 0 {
-            let root_leaf = N::HasherBase::q_two_to_one(checkpoint_root, checkpoint_leaf_hash);
-            N::HasherBase::q_two_to_one(root_leaf, self.circuit_fingerprint_config.genesis_checkpoint_state_transition_fingerprint)
-        } else {
-            let stored =
-                self.db.get_verifiable_checkpoint_state_transition_and_zkp(checkpoint_id).await?;
-            N::ZKVerifier::get_proof_public_inputs_hash(
-                &N::ZKVerifier::try_proof_from_slice(&stored.zk_proof)?,
-            )?
-        };
         self.last_committed = CoordinatorProcessorLastCommittedState {
             l2_state: l2_state.clone(),
             checkpoint_leaf_stats: checkpoint_leaf.stats.clone(),
@@ -917,14 +966,16 @@ checkpoint_backup_copy_status={}
             // Genesis commit path does not carry a checkpoint proof blob.
             // chain_0 = H(H(root, leaf), genesis_fingerprint) matches the
             // genesis checkpoint state transition circuit's public input hash.
-            let root_leaf = N::HasherBase::q_two_to_one(
+            genesis_checkpoint_hash::<_, N::HasherBase>(
                 coordinator_update.new_base.checkpoint_tree_root,
                 coordinator_update.new_base.checkpoint_leaf_hash,
-            );
-            N::HasherBase::q_two_to_one(root_leaf, self.circuit_fingerprint_config.genesis_checkpoint_state_transition_fingerprint)
+                self.circuit_fingerprint_config
+                    .genesis_checkpoint_state_transition_fingerprint,
+            )
+            .into_inner()
         } else {
-            let checkpoint_proof = N::ZKVerifier::try_proof_from_slice(&zk_proof)?;
-            N::ZKVerifier::get_proof_public_inputs_hash(&checkpoint_proof)?
+            checkpoint_hash_from_saved_proof_bytes::<N::QHash, N::ZKProof, N::ZKVerifier>(&zk_proof)?
+                .into_inner()
         };
         if checkpoint_id != 0 {
             ensure_non_genesis_checkpoint_chain_commitment::<N::F, N::QHash, N::HasherBase>(

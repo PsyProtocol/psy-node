@@ -6,6 +6,10 @@ use parth_core::utils::QPGenRandom;
 use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
 use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
 
+use super::canonical_chain::{
+    CheckpointHash, checkpoint_hash_from_previous, genesis_checkpoint_hash,
+};
+
 
 
 #[pderive::serialize_copy_hash_ts]
@@ -121,12 +125,16 @@ impl<Hash> CheckpointStateTransitionPublicInputs<Hash> {
     /// Chain_0 = H(H(new_root, new_leaf), genesis_fingerprint)
     /// This matches the genesis checkpoint state transition circuit's public
     /// input hash, which uses the genesis_fingerprint in its formula.
-    pub fn get_chain_0_from_genesis_leaf<Hasher: MerkleHasher<Hash>>(&self, genesis_fingerprint: &Hash) -> Hash {
-        let root_leaf = Hasher::two_to_one(
-            &self.checkpoint_transition.new_checkpoint_tree_root,
-            &self.checkpoint_transition.new_checkpoint_leaf_hash,
-        );
-        Hasher::two_to_one(&root_leaf, genesis_fingerprint)
+    pub fn get_chain_0_from_genesis_leaf<Hasher: MerkleHasher<Hash>>(&self, genesis_fingerprint: &Hash) -> Hash
+    where
+        Hash: Copy,
+    {
+        genesis_checkpoint_hash::<_, Hasher>(
+            self.checkpoint_transition.new_checkpoint_tree_root,
+            self.checkpoint_transition.new_checkpoint_leaf_hash,
+            *genesis_fingerprint,
+        )
+        .into_inner()
     }
     /// Legacy single-step PI hash (kept for compatibility while migrating).
     pub fn get_public_inputs_hash_no_rewards_tag<Hasher: MerkleHasher<Hash>>(
@@ -152,9 +160,17 @@ impl<Hash> CheckpointStateTransitionPublicInputs<Hash> {
     pub fn get_chain_hash_from_previous<Hasher: MerkleHasher<Hash>>(
         &self,
         previous_chain_hash: &Hash,
-    ) -> Hash {
-        let step_hash = self.get_step_commit_hash::<Hasher>();
-        Hasher::two_to_one(previous_chain_hash, &step_hash)
+    ) -> Hash
+    where
+        Hash: Copy,
+    {
+        checkpoint_hash_from_previous::<_, Hasher>(
+            CheckpointHash::from_last_chain_hash(*previous_chain_hash),
+            self.checkpoint_transition.new_checkpoint_tree_root,
+            self.checkpoint_transition.new_checkpoint_leaf_hash,
+            self.checkpoint_state_transition_circuit_fingerprint,
+        )
+        .into_inner()
     }
 }
 impl<Hash: Copy, F> QFieldHashable<F, Hash> for CheckpointStateTransitionPublicInputs<Hash> {
