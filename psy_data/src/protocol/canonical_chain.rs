@@ -13,6 +13,10 @@ use parth_core::{
     protocol::core_types::{Q256BitHash, QZKProofPublicInputsHasherReader},
 };
 use psy_core::constants::chain_id::PsyChainNetworkType;
+use serde::{
+    de::Error as SerdeDeError, ser::SerializeStruct, Deserialize, Deserializer,
+    Serialize, Serializer,
+};
 
 /// Domain separator for the V1 canonical-chain-reference codec.
 pub const CANONICAL_CHAIN_REF_MAGIC: [u8; 8] = *b"PSYCCREF";
@@ -237,6 +241,60 @@ impl<Hash> CanonicalChainRef<Hash> {
 
     pub const fn checkpoint(&self) -> &CheckpointRef<Hash> {
         &self.checkpoint
+    }
+}
+
+/// Stable named-field representation used by the Coordinator Edge RPC.
+///
+/// Durable storage continues to use the fixed 65-byte canonical codec below.
+/// This serde envelope carries an explicit version and reconstructs the
+/// semantic checkpoint-hash wrapper on decode.
+impl<Hash: Serialize> Serialize for CanonicalChainRef<Hash> {
+    fn serialize<SerializerT: Serializer>(
+        &self,
+        serializer: SerializerT,
+    ) -> Result<SerializerT::Ok, SerializerT::Error> {
+        let mut state = serializer.serialize_struct("CanonicalChainRef", 5)?;
+        state.serialize_field("codec_version", &CANONICAL_CHAIN_REF_CODEC_VERSION)?;
+        state.serialize_field("network_id", &self.network_id.chain_id())?;
+        state.serialize_field("chain_epoch", &self.chain_epoch.get())?;
+        state.serialize_field("checkpoint_id", &self.checkpoint.checkpoint_id.get())?;
+        state.serialize_field("checkpoint_hash", self.checkpoint.checkpoint_hash.as_inner())?;
+        state.end()
+    }
+}
+
+impl<'de, Hash: Deserialize<'de>> Deserialize<'de> for CanonicalChainRef<Hash> {
+    fn deserialize<DeserializerT: Deserializer<'de>>(
+        deserializer: DeserializerT,
+    ) -> Result<Self, DeserializerT::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct CanonicalChainRefWire<Hash> {
+            codec_version: u16,
+            network_id: u32,
+            chain_epoch: u64,
+            checkpoint_id: u64,
+            checkpoint_hash: Hash,
+        }
+
+        let wire = CanonicalChainRefWire::<Hash>::deserialize(deserializer)?;
+        if wire.codec_version != CANONICAL_CHAIN_REF_CODEC_VERSION {
+            return Err(DeserializerT::Error::custom(format_args!(
+                "unsupported canonical-chain-reference RPC codec version {}",
+                wire.codec_version
+            )));
+        }
+        let network_id = NetworkId::try_from_chain_id(wire.network_id)
+            .map_err(DeserializerT::Error::custom)?;
+        Ok(Self::new(
+            network_id,
+            ChainEpoch::new(wire.chain_epoch),
+            CheckpointRef::new(
+                CheckpointId::new(wire.checkpoint_id),
+                CheckpointHash::from_last_chain_hash(wire.checkpoint_hash),
+            ),
+        ))
     }
 }
 
@@ -481,6 +539,50 @@ mod tests {
             golden("canonical_mainnet_epoch_42_checkpoint_367_hash_1_2_3_4"),
         );
         assert_eq!(CanonicalChainRef::<PHash>::from_canonical_bytes(&first).unwrap(), chain);
+    }
+
+    #[test]
+    fn rpc_json_wire_is_named_versioned_and_round_trips() {
+        let chain = canonical_ref(
+            PsyChainNetworkType::PsyMainnet,
+            42,
+            367,
+            PHash::from_values(1, 2, 3, 4),
+        );
+        let value = serde_json::to_value(chain).unwrap();
+        assert_eq!(value["codec_version"], 1);
+        assert_eq!(
+            value["network_id"],
+            PsyChainNetworkType::PsyMainnet.get_chain_id()
+        );
+        assert_eq!(value["chain_epoch"], 42);
+        assert_eq!(value["checkpoint_id"], 367);
+        assert!(value.get("checkpoint_hash").is_some());
+        assert_eq!(
+            serde_json::from_value::<CanonicalChainRef<PHash>>(value).unwrap(),
+            chain
+        );
+    }
+
+    #[test]
+    fn rpc_json_wire_rejects_unknown_version_network_and_fields() {
+        let chain = canonical_ref(
+            PsyChainNetworkType::PsyMainnet,
+            42,
+            367,
+            PHash::from_values(1, 2, 3, 4),
+        );
+        let mut unknown_version = serde_json::to_value(chain).unwrap();
+        unknown_version["codec_version"] = serde_json::json!(2);
+        assert!(serde_json::from_value::<CanonicalChainRef<PHash>>(unknown_version).is_err());
+
+        let mut unknown_network = serde_json::to_value(chain).unwrap();
+        unknown_network["network_id"] = serde_json::json!(u32::MAX);
+        assert!(serde_json::from_value::<CanonicalChainRef<PHash>>(unknown_network).is_err());
+
+        let mut unexpected_field = serde_json::to_value(chain).unwrap();
+        unexpected_field["height"] = serde_json::json!(367);
+        assert!(serde_json::from_value::<CanonicalChainRef<PHash>>(unexpected_field).is_err());
     }
 
     #[test]

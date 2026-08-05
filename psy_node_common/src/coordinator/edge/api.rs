@@ -13,7 +13,8 @@ use psy_api_core::{
 };
 use psy_core::job::job_id::QProvingJobDataID;
 use psy_data::{
-    guta::header_extended::GlobalUserTreeAggregatorHeaderWithTagValueAndJobType, node::node_proving_state::PsyNodeProvingState, prepared_block::realm::PsyRealmCoordinatorUpdate, v1::{
+    guta::header_extended::GlobalUserTreeAggregatorHeaderWithTagValueAndJobType, node::node_proving_state::PsyNodeProvingState, prepared_block::realm::PsyRealmCoordinatorUpdate,
+    protocol::canonical_chain::CanonicalChainRef, v1::{
         common_api::PsyProoffMinerRewardProof,
         qdata::{
             checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState},
@@ -96,6 +97,9 @@ impl<
     }
     async fn get_latest_checkpoint_id(&self) -> QRpcResult<u64> {
         res(self.get_latest_checkpoint_id_internal().await)
+    }
+    async fn get_canonical_chain_ref(&self) -> QRpcResult<CanonicalChainRef<N::QHash>> {
+        res(self.get_canonical_chain_ref_internal().await)
     }
     async fn get_checkpoint_id_for_unique_pending_id(&self, unique_pending_id: u64) -> QRpcResult<Option<u64>> {
         res(self.get_checkpoint_id_for_unique_pending_id_internal(unique_pending_id).await)

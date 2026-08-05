@@ -308,9 +308,11 @@ pub async fn setup_psy_scylla_database_store_from_connection_string<N: QNetworkD
     }
 }
 
-/// Coordinator processor composition root. The canonical-head control table
-/// is deliberately initialized here instead of in the generic 32-table setup,
-/// so Realm and Edge databases do not acquire Coordinator authority state.
+/// Coordinator processor/edge composition root. The canonical-head control
+/// table is deliberately initialized here instead of in the generic 32-table
+/// setup, so Realm databases and Realm Edge processes do not acquire
+/// Coordinator authority state. With `create_tables=false`, Coordinator Edge
+/// only prepares access to a schema already created by the processor rollout.
 pub async fn setup_coordinator_psy_scylla_database_store_from_connection_string<
     N: QNetworkDatabaseTypes,
 >(

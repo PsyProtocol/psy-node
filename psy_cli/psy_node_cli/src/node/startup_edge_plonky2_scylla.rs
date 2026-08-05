@@ -10,7 +10,10 @@ use psy_node_common::{coordinator::edge::{handler::CoordinatorEdgeHandler, serve
 use psy_node_core::config::node_start_config::{CoordinatorEdgeStartConfig, RealmEdgeStartConfig};
 use psy_node_nats::psy_queue::setup_nats_psy_queue_from_connection_str;
 use psy_node_redis::store::{new_redis_async_pool, StandardRedisStore};
-use psy_node_scylla::psy_setup::setup_psy_scylla_database_store_from_connection_string;
+use psy_node_scylla::psy_setup::{
+    setup_coordinator_psy_scylla_database_store_from_connection_string,
+    setup_psy_scylla_database_store_from_connection_string,
+};
 use psy_plonky2_circuits::{
     node::config::networks::resolver::PsyPlonky2NodeConfigResolver,
     protocol_types::ZKTypesPlonky2GoldilocksPoseidon, zk_verifier::PsyPlonky2ZKVerifier,
@@ -66,11 +69,13 @@ pub async fn run_startup_plonky2_scylla_edge_node(config: &CoordinatorEdgeStartC
     match config.network {
         psy_core::constants::chain_id::PsyChainNetworkType::LocalDevnet => {
             type N = QNetworkTypesConfigHelper<QProvingJobDataID, ZKTypesPlonky2GoldilocksPoseidon, PsyNetworkLocalDevnetConstants>;
-            let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url, false).await?;
+            let db = setup_coordinator_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url, false).await?;
+            let canonical_head_reader = db.store.clone();
             let db = Arc::new(db);
             let tag_tree_rewards_store = db.clone();
             let handler = CoordinatorEdgeHandler::<N, _, _, _, _, _, _, _, _>::new(
                 db,
+                canonical_head_reader,
                 tag_tree_rewards_store,
                 temp_db,
                 proof_store,
@@ -81,6 +86,7 @@ pub async fn run_startup_plonky2_scylla_edge_node(config: &CoordinatorEdgeStartC
                 realm_identifier,
                 proof_verifier,
                 checkpoint_state_transition_circuit_fingerprint,
+                config.network.into(),
             );
             start_coordinator_edge_rpc_server::<N, _, _, _, _, _, _, _, _>(
                 handler,

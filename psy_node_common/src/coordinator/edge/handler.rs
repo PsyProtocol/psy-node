@@ -8,7 +8,8 @@ use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_crypto::hash::tx_hash::{compute_deploy_contract_content_hash, hash_to_hex};
 use psy_api_core::CheckpointJobStats;
 use psy_data::{
-    guta::header_extended::{GlobalUserTreeAggregatorHeaderWithTagValueAndJobID, GlobalUserTreeAggregatorHeaderWithTagValueAndJobType}, prepared_block::realm::PsyRealmCoordinatorUpdate, v1::{
+    guta::header_extended::{GlobalUserTreeAggregatorHeaderWithTagValueAndJobID, GlobalUserTreeAggregatorHeaderWithTagValueAndJobType}, prepared_block::realm::PsyRealmCoordinatorUpdate,
+    protocol::canonical_chain::{CanonicalChainRef, NetworkId}, v1::{
         common_api::PsyProoffMinerRewardProof,
         qdata::{
             checkpoint::PQEDCheckpointGlobalStateRoots, checkpoint_sync::PQEDCheckpointSyncInfoCompact, contract::{DashMapContractHeightCache, PQBCDeployContract, PsyDeployContractQueueItem}, public_key::PZKPublicKeyInfo
@@ -19,6 +20,7 @@ use psy_node_core::{
     psy_core_db::traits::full::{PsyCoordinatorEdgeAPIStoreReader, PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter},
     psy_temp_db::StandardEdgeAPITempDBStoreBase,
     queue::{ephemeral::QStandardEphemeralQueuePublisher, worker_queue::QStandardWorkerQueueSubscriber},
+    store::canonical_head::{CanonicalHeadReadState, CoordinatorCanonicalHeadReader},
     store::traits::proof_store::QParthProofStore,
 };
 use psy_serialize::{PsyCanonicalDatabaseSerializeBaseMulti, PsyCanonicalDatabaseSerializeBaseSingle};
@@ -38,6 +40,7 @@ pub struct CoordinatorEdgeHandler<
     ProofStore: QParthProofStore,
 > {
     pub db_reader: Arc<S>,
+    pub canonical_head_reader: Arc<dyn CoordinatorCanonicalHeadReader<N::QHash>>,
     pub tag_tree_rewards_store: Arc<STagTreeRewards>,
     pub temp_db: Arc<TempDatabase>,
     pub proof_store: Arc<ProofStore>,
@@ -55,6 +58,7 @@ pub struct CoordinatorEdgeHandler<
     pub contract_state_tree_height_cache: Arc<DashMapContractHeightCache<N::QHash>>,
 
     pub checkpoint_state_transition_circuit_fingerprint: N::QHash,
+    pub network_id: NetworkId,
 }
 impl<
         N: QNetworkTypesConfig,
@@ -82,6 +86,7 @@ impl<
     fn clone(&self) -> Self {
         Self {
             db_reader: self.db_reader.clone(),
+            canonical_head_reader: self.canonical_head_reader.clone(),
             tag_tree_rewards_store: self.tag_tree_rewards_store.clone(),
             temp_db: self.temp_db.clone(),
             proof_store: self.proof_store.clone(),
@@ -95,6 +100,7 @@ impl<
             proof_verifier: self.proof_verifier.clone(),
             contract_state_tree_height_cache: self.contract_state_tree_height_cache.clone(),
             checkpoint_state_transition_circuit_fingerprint: self.checkpoint_state_transition_circuit_fingerprint.clone(),
+            network_id: self.network_id,
         }
     }
 }
@@ -123,6 +129,7 @@ impl<
 {
     pub fn new(
         db: Arc<S>,
+        canonical_head_reader: Arc<dyn CoordinatorCanonicalHeadReader<N::QHash>>,
         tag_tree_rewards_store: Arc<STagTreeRewards>,
         temp_db: Arc<TempDatabase>,
         proof_store: Arc<ProofStore>,
@@ -133,11 +140,13 @@ impl<
         realm_identifier: QRealmIdentifier,
         proof_verifier: Arc<N::ZKVerifier>,
         checkpoint_state_transition_circuit_fingerprint: N::QHash,
+        network_id: NetworkId,
     ) -> Self {
         let realm_id_u64 = realm_identifier.realm_id as u64;
         let realm_sub_id_u64 = realm_identifier.realm_sub_id as u64;
         Self {
             db_reader: db,
+            canonical_head_reader,
             tag_tree_rewards_store,
             temp_db,
             proof_store,
@@ -151,6 +160,7 @@ impl<
             proof_verifier,
             contract_state_tree_height_cache: Arc::new(DashMapContractHeightCache::new()),
             checkpoint_state_transition_circuit_fingerprint,
+            network_id,
         }
     }
     pub async fn get_checkpoint_leaves_batch_raw_internal(&self, start_checkpoint_id: u64, count: u32) -> anyhow::Result<Vec<u8>>{
@@ -221,6 +231,18 @@ impl<
     }
     pub async fn get_latest_checkpoint_id_internal(&self) -> anyhow::Result<u64> {
         self.db_reader.get_latest_checkpoint_id().await
+    }
+    pub async fn get_canonical_chain_ref_internal(&self) -> anyhow::Result<CanonicalChainRef<N::QHash>> {
+        match self
+            .canonical_head_reader
+            .read_canonical_head(self.network_id)
+            .await?
+        {
+            CanonicalHeadReadState::Current(current) => Ok(*current.canonical_ref()),
+            CanonicalHeadReadState::Uninitialized => {
+                anyhow::bail!("CANONICAL_HEAD_UNINITIALIZED")
+            }
+        }
     }
     pub async fn get_job_stats_internal(&self, checkpoint_id: u64) -> anyhow::Result<CheckpointJobStats> {
         let (unique_pending_id, _) = self

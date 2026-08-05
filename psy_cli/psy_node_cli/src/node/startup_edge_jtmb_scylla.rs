@@ -20,7 +20,10 @@ use psy_node_common::{
 use psy_node_core::config::node_start_config::{CoordinatorEdgeStartConfig, RealmEdgeStartConfig};
 use psy_node_nats::psy_queue::setup_nats_psy_queue_from_connection_str;
 use psy_node_redis::store::{new_redis_async_pool, StandardRedisStore};
-use psy_node_scylla::psy_setup::setup_psy_scylla_database_store_from_connection_string;
+use psy_node_scylla::psy_setup::{
+    setup_coordinator_psy_scylla_database_store_from_connection_string,
+    setup_psy_scylla_database_store_from_connection_string,
+};
 
 pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_edge_node(config: &CoordinatorEdgeStartConfig) -> anyhow::Result<()> {
     let (verifier, _) = get_jtmb_circuit_library_and_prover_for_network::<JTMBPoseidonGoldilocksConfig>(config.network)?;
@@ -69,11 +72,13 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_edge_node(config: &Coor
     match config.network {
         psy_core::constants::chain_id::PsyChainNetworkType::LocalDevnet => {
             type N = QNetworkTypesConfigHelper<QProvingJobDataID, ZKTypesJTMBGoldilocksPoseidon, PsyNetworkLocalDevnetConstants>;
-            let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url, false).await?;
+            let db = setup_coordinator_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url, false).await?;
+            let canonical_head_reader = db.store.clone();
             let db = Arc::new(db);
             let tag_tree_rewards_store = db.clone();
             let handler = CoordinatorEdgeHandler::<N, _, _, _, _, _, _, _, _>::new(
                 db,
+                canonical_head_reader,
                 tag_tree_rewards_store,
                 temp_db,
                 proof_store,
@@ -84,16 +89,19 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_edge_node(config: &Coor
                 realm_identifier,
                 proof_verifier,
                 checkpoint_state_transition_circuit_fingerprint,
+                config.network.into(),
             );
             start_coordinator_edge_rpc_server::<N, _, _, _, _, _, _, _, _>(handler, &config.listen, config.port).await?;
         },
         psy_core::constants::chain_id::PsyChainNetworkType::InternalDevnet => {
             type N = QNetworkTypesConfigHelper<QProvingJobDataID, ZKTypesJTMBGoldilocksPoseidon, PsyNetworkPsyTeamDevnetConstants>;
-            let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url, false).await?;
+            let db = setup_coordinator_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url, false).await?;
+            let canonical_head_reader = db.store.clone();
             let db = Arc::new(db);
             let tag_tree_rewards_store = db.clone();
             let handler = CoordinatorEdgeHandler::<N, _, _, _, _, _, _, _, _>::new(
                 db,
+                canonical_head_reader,
                 tag_tree_rewards_store,
                 temp_db,
                 proof_store,
@@ -104,6 +112,7 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_edge_node(config: &Coor
                 realm_identifier,
                 proof_verifier,
                 checkpoint_state_transition_circuit_fingerprint,
+                config.network.into(),
             );
             start_coordinator_edge_rpc_server::<N, _, _, _, _, _, _, _, _>(handler, &config.listen, config.port).await?;
         }

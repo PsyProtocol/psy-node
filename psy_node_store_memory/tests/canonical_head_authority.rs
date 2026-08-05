@@ -9,7 +9,8 @@ use psy_data::protocol::canonical_chain::{
 use psy_node_core::store::canonical_head::{
     CanonicalHeadBootstrap, CanonicalHeadBootstrapProfile,
     CanonicalHeadReadState, CanonicalHeadTransition,
-    CanonicalHeadWriteOutcome, CoordinatorCanonicalHeadStore,
+    CanonicalHeadWriteOutcome, CoordinatorCanonicalHeadReader,
+    CoordinatorCanonicalHeadStore,
 };
 use psy_node_store_memory::cbs_store::InMemoryCoreStore;
 
@@ -129,4 +130,68 @@ async fn concurrent_distinct_cas_has_one_winner_and_revision_blocks_stale_retry(
         CanonicalHeadWriteOutcome::Conflict { current }
             if current == *winner.candidate()
     ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_authority_reads_only_observe_complete_published_identities() {
+    let store = Arc::new(Store::new());
+    let bootstrap = genesis();
+    store.bootstrap_canonical_head(&bootstrap).await.unwrap();
+
+    let writer_store = Arc::clone(&store);
+    let writer = tokio::spawn(async move {
+        let mut expected = *bootstrap.candidate();
+        for checkpoint in 1_u8..=64 {
+            let sealed = CanonicalHeadTransition::normal_checkpoint_advance(
+                expected,
+                canonical_ref(u64::from(checkpoint), checkpoint),
+            )
+            .unwrap()
+            .seal();
+            let outcome = writer_store
+                .compare_and_set_canonical_head(&sealed)
+                .await
+                .unwrap();
+            expected = match outcome {
+                CanonicalHeadWriteOutcome::Applied(current) => current,
+                other => panic!("single writer must advance: {other:?}"),
+            };
+            tokio::task::yield_now().await;
+        }
+    });
+
+    let readers = (0..32).map(|_| {
+        let store = Arc::clone(&store);
+        tokio::spawn(async move {
+            for _ in 0..128 {
+                let CanonicalHeadReadState::Current(current) =
+                    store.read_canonical_head(network()).await.unwrap()
+                else {
+                    panic!("bootstrapped authority cannot become uninitialized");
+                };
+                let wire = current.canonical_ref().to_canonical_bytes();
+                let decoded: CanonicalChainRef<Hash256> =
+                    CanonicalChainRef::from_canonical_bytes(&wire).unwrap();
+                let checkpoint = decoded.checkpoint().checkpoint_id().get();
+                assert_eq!(decoded.network_id(), network());
+                assert_eq!(decoded.chain_epoch().get(), 0);
+                let expected_hash_seed = if checkpoint == 0 {
+                    1
+                } else {
+                    checkpoint as u8
+                };
+                assert_eq!(
+                    decoded.checkpoint().checkpoint_hash().as_inner(),
+                    &hash(expected_hash_seed),
+                    "a reader must not combine a height from one publish with a hash from another"
+                );
+                tokio::task::yield_now().await;
+            }
+        })
+    });
+
+    for reader in readers {
+        reader.await.unwrap();
+    }
+    writer.await.unwrap();
 }

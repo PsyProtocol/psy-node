@@ -5,7 +5,10 @@ use parth_core::{
 };
 
 use psy_data::{
-    guta::header_extended::GlobalUserTreeAggregatorHeaderWithTagValueAndJobType, prepared_block::realm::PsyRealmCoordinatorUpdate, v1::{
+    guta::header_extended::GlobalUserTreeAggregatorHeaderWithTagValueAndJobType,
+    prepared_block::realm::PsyRealmCoordinatorUpdate,
+    protocol::canonical_chain::CanonicalChainRef,
+    v1::{
         common_api::PsyProoffMinerRewardProof,
         qdata::{
             checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState},
@@ -42,6 +45,10 @@ pub trait CoordinatorEdgeRpc<F, Hash, JobId, ZKProof>: NodeEdgeWorkerRpcServer<H
 
     #[method(name = "get_latest_checkpoint_id")]
     async fn get_latest_checkpoint_id(&self) -> RpcResult<u64>;
+
+    /// Read the complete durable Coordinator canonical identity atomically.
+    #[method(name = "get_canonical_chain_ref")]
+    async fn get_canonical_chain_ref(&self) -> RpcResult<CanonicalChainRef<Hash>>;
 
     #[method(name = "get_checkpoint_id_for_unique_pending_id")]
     async fn get_checkpoint_id_for_unique_pending_id(&self, unique_pending_id: u64) -> RpcResult<Option<u64>>;

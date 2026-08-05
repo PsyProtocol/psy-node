@@ -1,7 +1,11 @@
 use async_trait::async_trait;
 use parth_core::{crypto::hash::merkle_proof::MerkleProofCore, data::hash::checkpointed_merkle_node::CheckpointedMerkleHash, protocol::core_types::QNetworkTypesConfig};
 use psy_api_core::coordinator::standard_edge_rpc::CoordinatorEdgeRpcClient;
-use psy_data::{guta::header_extended::GlobalUserTreeAggregatorHeaderWithTagValueAndJobType, prepared_block::realm::PsyRealmCoordinatorUpdate};
+use psy_data::{
+    guta::header_extended::GlobalUserTreeAggregatorHeaderWithTagValueAndJobType,
+    prepared_block::realm::PsyRealmCoordinatorUpdate,
+    protocol::canonical_chain::CanonicalChainRef,
+};
 use psy_node_core::p2p::traits::realm_coordinantor::RealmCoordinatorClient;
 use psy_serialize::PsyCanonicalDatabaseSerializeBaseMulti;
 
@@ -29,17 +33,28 @@ impl<N: QNetworkTypesConfig + 'static, C: CoordinatorEdgeRpcClient<N::F, N::QHas
         async fn rc_get_checkpoint_tree_merkle_proof(&self, checkpoint_id: u64) -> anyhow::Result<MerkleProofCore<N::QHash>>{
             self.client.get_checkpoint_tree_merkle_proof(checkpoint_id, checkpoint_id).await.map_err(|e| anyhow::anyhow!("{:?}", e))
         }
+    async fn rc_get_canonical_chain_ref(&self) -> anyhow::Result<CanonicalChainRef<N::QHash>> {
+        self.client
+            .get_canonical_chain_ref()
+            .await
+            .map_err(|e| anyhow::anyhow!("{:?}", e))
+    }
     async fn rc_get_latest_checkpoint_id(&self) -> anyhow::Result<u64> {
-        self.client.get_latest_checkpoint_id().await.map_err(|e| anyhow::anyhow!("{:?}", e))
+        Ok(self
+            .rc_get_canonical_chain_ref()
+            .await?
+            .checkpoint()
+            .checkpoint_id()
+            .get())
     }
     async fn rc_wait_for_next_checkpoint(&self) -> anyhow::Result<u64> {
-        let start = self.client.get_latest_checkpoint_id().await.map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        let start = self.rc_get_canonical_chain_ref().await?;
         let mut current = start;
         while current == start {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            current = self.client.get_latest_checkpoint_id().await.map_err(|e| anyhow::anyhow!("{:?}", e))?;
+            current = self.rc_get_canonical_chain_ref().await?;
         }
-        Ok(current)
+        Ok(current.checkpoint().checkpoint_id().get())
     }
     async fn rc_get_realm_sync_info(&self, checkpoint_id: u64, realm_id: u64) -> anyhow::Result<PsyRealmCoordinatorUpdate<N::F, N::QHash>> {
         self.client

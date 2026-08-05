@@ -35,8 +35,9 @@ use parth_core::{
 use psy_node_core::store::{
     canonical_head::{
         CanonicalHeadBootstrap, CanonicalHeadReadState,
-        CanonicalHeadWriteOutcome, CoordinatorCanonicalHeadStore, NetworkId,
-        SealedCanonicalHeadCas, StoredCanonicalHead,
+        CanonicalHeadWriteOutcome, CoordinatorCanonicalHeadReader,
+        CoordinatorCanonicalHeadStore, NetworkId, SealedCanonicalHeadCas,
+        StoredCanonicalHead,
     },
     traits::core_db::{
     CoreDatabaseBidirectionalMappingReader, CoreDatabaseBidirectionalMappingWriter, CoreDatabaseBidirectionalU64U128MappingReader, CoreDatabaseBidirectionalU64U128MappingWriter, CoreDatabaseDoubleIdCheckpointedReader, CoreDatabaseDoubleIdCheckpointedWriter, CoreDatabaseDoubleIdMerkleReader, CoreDatabaseDoubleIdMerkleWriter, CoreDatabaseHashToManyIdsReader, CoreDatabaseHashToManyIdsWriter, CoreDatabaseIMTKeyIndexReader, CoreDatabaseIMTKeyIndexWriter, CoreDatabaseIMTNextAppendIndexReader, CoreDatabaseIMTNextAppendIndexWriter, CoreDatabaseIMTLeafReader, CoreDatabaseIMTLeafWriter, CoreDatabaseKivReader, CoreDatabaseKivWriter, CoreDatabaseSingleIdCheckpointedReader, CoreDatabaseSingleIdCheckpointedWriter, CoreDatabaseSingleIdMerkleReader, CoreDatabaseSingleIdMerkleWriter, CoreDatabaseTagTreeReader, CoreDatabaseTagTreeWriter, CoreDatabaseU64CounterReader, CoreDatabaseU64CounterStore, CoreDatabaseU64CounterWriter, CoreDatabaseU64Reader, CoreDatabaseU64Store, CoreDatabaseU64Writer, CoreDatabaseZeroIdMerkleDumpReader, CoreDatabaseZeroIdMerkleReader, CoreDatabaseZeroIdMerkleWriter, MerkleTreeDumpStrategy
@@ -202,7 +203,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash> + Send + Sync> InMemoryCore
 }
 
 #[async_trait]
-impl<Hash, Hasher> CoordinatorCanonicalHeadStore<Hash>
+impl<Hash, Hasher> CoordinatorCanonicalHeadReader<Hash>
     for InMemoryCoreStore<Hash, Hasher>
 where
     Hash: QHashBase + Q256BitHash + Copy,
@@ -217,7 +218,15 @@ where
             None => CanonicalHeadReadState::Uninitialized,
         })
     }
+}
 
+#[async_trait]
+impl<Hash, Hasher> CoordinatorCanonicalHeadStore<Hash>
+    for InMemoryCoreStore<Hash, Hasher>
+where
+    Hash: QHashBase + Q256BitHash + Copy,
+    Hasher: MerkleZeroHasher<Hash> + Send + Sync,
+{
     async fn bootstrap_canonical_head(
         &self,
         bootstrap: &CanonicalHeadBootstrap<Hash>,

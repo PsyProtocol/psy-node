@@ -402,16 +402,23 @@ impl<Hash> CanonicalHeadWriteOutcome<Hash> {
     }
 }
 
-/// Driver-independent authority boundary for the one Coordinator canonical
-/// head row. Implementations must preserve the exact LWT semantics modeled by
-/// [`CanonicalHeadBootstrap`] and [`SealedCanonicalHeadCas`].
+/// Driver-independent read boundary for the one Coordinator canonical-head
+/// row. Edge/API code depends only on this capability.
 #[async_trait]
-pub trait CoordinatorCanonicalHeadStore<Hash: Q256BitHash>: Send + Sync {
+pub trait CoordinatorCanonicalHeadReader<Hash: Q256BitHash>: Send + Sync {
     async fn read_canonical_head(
         &self,
         network: NetworkId,
     ) -> anyhow::Result<CanonicalHeadReadState<Hash>>;
+}
 
+/// Full Coordinator authority boundary. Implementations must preserve the
+/// exact LWT semantics modeled by [`CanonicalHeadBootstrap`] and
+/// [`SealedCanonicalHeadCas`].
+#[async_trait]
+pub trait CoordinatorCanonicalHeadStore<Hash: Q256BitHash>:
+    CoordinatorCanonicalHeadReader<Hash>
+{
     async fn bootstrap_canonical_head(
         &self,
         bootstrap: &CanonicalHeadBootstrap<Hash>,

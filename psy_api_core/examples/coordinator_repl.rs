@@ -84,6 +84,7 @@ impl ReplHelper {
         commands.insert("get_public_key_for_user_id", "<user_id>");
         commands.insert("get_user_ids_for_public_key", "<public_key_hex> <start_user_id> <count>");
         commands.insert("get_latest_checkpoint_id", "");
+        commands.insert("get_canonical_chain_ref", "");
         commands.insert("get_contract_leaf_data", "<contract_id>");
         commands.insert("get_contract_code_definition", "<contract_id>");
         commands.insert("get_checkpoint_leaf_data", "<checkpoint_id>");
@@ -250,6 +251,7 @@ async fn execute_command<
             format!("{:#?}", res)
         }
         "get_latest_checkpoint_id" => format!("{:#?}", client.get_latest_checkpoint_id().await?),
+        "get_canonical_chain_ref" => format!("{:#?}", client.get_canonical_chain_ref().await?),
         "get_contract_leaf_data" => format!("{:#?}", client.get_contract_leaf_data(parse_arg(&mut args, "contract_id")?).await?),
         "get_contract_code_definition" => format!("{:#?}", client.get_contract_code_definition(parse_arg(&mut args, "contract_id")?).await?),
         "get_checkpoint_leaf_data" => format!("{:#?}", client.get_checkpoint_leaf_data(parse_arg(&mut args, "checkpoint_id")?).await?),

@@ -7,7 +7,8 @@ use scylla::client::PoolSize;
 use parth_core::{crypto::hash::traits::MerkleZeroHasher, data::db::table::QDatabaseTableRoutingKey, protocol::core_types::{Q256BitHash, QHashBase}};
 use psy_node_core::store::canonical_head::{
     CanonicalHeadBootstrap, CanonicalHeadReadState, CanonicalHeadWriteOutcome,
-    CoordinatorCanonicalHeadStore, NetworkId, SealedCanonicalHeadCas,
+    CoordinatorCanonicalHeadReader, CoordinatorCanonicalHeadStore, NetworkId,
+    SealedCanonicalHeadCas,
 };
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
@@ -174,7 +175,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
 }
 
 #[async_trait]
-impl<Hash, Hasher> CoordinatorCanonicalHeadStore<Hash> for ScyllaCoreStore<Hash, Hasher>
+impl<Hash, Hasher> CoordinatorCanonicalHeadReader<Hash> for ScyllaCoreStore<Hash, Hasher>
 where
     Hash: QHashBase + Q256BitHash,
     Hasher: MerkleZeroHasher<Hash> + Send + Sync,
@@ -185,7 +186,14 @@ where
     ) -> anyhow::Result<CanonicalHeadReadState<Hash>> {
         Ok(self.coordinator_canonical_head()?.read(network).await?)
     }
+}
 
+#[async_trait]
+impl<Hash, Hasher> CoordinatorCanonicalHeadStore<Hash> for ScyllaCoreStore<Hash, Hasher>
+where
+    Hash: QHashBase + Q256BitHash,
+    Hasher: MerkleZeroHasher<Hash> + Send + Sync,
+{
     async fn bootstrap_canonical_head(
         &self,
         bootstrap: &CanonicalHeadBootstrap<Hash>,
