@@ -50,6 +50,7 @@ psy_serialize = { workspace = true }
 psy_node_core = { workspace = true }
 dashmap = { workspace = true }
 zstd = { workspace = true }
+sha2 = { workspace = true }
 
 
 
