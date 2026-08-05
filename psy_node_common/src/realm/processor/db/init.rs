@@ -322,7 +322,14 @@ where
         if database_check_state == DatabaseCheckState::NeedsGenesis {
             tracing::info!("Applying genesis block setup data to realm processor database...");
             let genesis_block_update =
-                GenesisDatabaseDataBuilder::setup_for_realm::<N::HasherBase, N>(&genesis_data, self.state.realm_id_u64, self.state.realm_sub_id_u64)?;
+                GenesisDatabaseDataBuilder::setup_for_realm::<N::HasherBase, N>(
+                    &genesis_data,
+                    self.state.realm_id_u64,
+                    self.state.realm_sub_id_u64,
+                    self.state.chain_id,
+                    self.circuit_fingerprint_config
+                        .genesis_checkpoint_state_transition_fingerprint,
+                )?;
             self.commit_state(
                 &genesis_block_update.coordinator_update,
                 &genesis_block_update.prepared_updates,

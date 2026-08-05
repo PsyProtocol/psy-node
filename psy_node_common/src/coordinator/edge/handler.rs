@@ -17,7 +17,8 @@ use psy_api_core::{
 use psy_data::{
     guta::header_extended::{GlobalUserTreeAggregatorHeaderWithTagValueAndJobID, GlobalUserTreeAggregatorHeaderWithTagValueAndJobType}, prepared_block::realm::PsyRealmCoordinatorUpdate,
     protocol::canonical_chain::{
-        CanonicalChainRef, CheckpointHash, CheckpointId, CheckpointRef, NetworkId,
+        checkpoint_hash_from_saved_proof_bytes, CanonicalChainRef, CheckpointHash,
+        CheckpointId, CheckpointRef, NetworkId,
     }, v1::{
         common_api::PsyProoffMinerRewardProof,
         qdata::{
@@ -69,6 +70,35 @@ fn map_admin_disposition(
             RollbackAdminStartDisposition::RollbackAdmissionConflict
         }
     }
+}
+
+fn realm_sync_canonical_ref<Hash: Copy + Eq>(
+    head: CanonicalChainRef<Hash>,
+    checkpoint_id: u64,
+    checkpoint_hash: CheckpointHash<Hash>,
+) -> anyhow::Result<CanonicalChainRef<Hash>> {
+    let head_checkpoint_id = head.checkpoint().checkpoint_id().get();
+    if checkpoint_id > head_checkpoint_id {
+        anyhow::bail!(
+            "REALM_SYNC_CHECKPOINT_AHEAD_OF_CANONICAL_HEAD:requested={},head={}",
+            checkpoint_id,
+            head_checkpoint_id
+        );
+    }
+    if checkpoint_id == head_checkpoint_id
+        && head.checkpoint().checkpoint_hash() != &checkpoint_hash
+    {
+        anyhow::bail!(
+            "REALM_SYNC_HEAD_HASH_MISMATCH:checkpoint_id={}",
+            checkpoint_id
+        );
+    }
+
+    Ok(CanonicalChainRef::new(
+        head.network_id(),
+        head.chain_epoch(),
+        CheckpointRef::new(CheckpointId::new(checkpoint_id), checkpoint_hash),
+    ))
 }
 
 #[cfg(test)]
@@ -199,6 +229,64 @@ mod rollback_admin_tests {
         let mut invalid = request();
         invalid.delete_fence_timestamp_us = invalid.orphan_write_max_timestamp_us;
         assert!(parse_rollback_admin_intent(invalid).is_err());
+    }
+
+    fn chain_ref(checkpoint_id: u64, hash_seed: u64) -> CanonicalChainRef<PHash> {
+        CanonicalChainRef::new(
+            NetworkId::try_from_chain_id(0x6979_7350).unwrap(),
+            ChainEpoch::new(9),
+            CheckpointRef::new(
+                CheckpointId::new(checkpoint_id),
+                CheckpointHash::from_last_chain_hash(PHash::from_values(
+                    hash_seed,
+                    hash_seed + 1,
+                    hash_seed + 2,
+                    hash_seed + 3,
+                )),
+            ),
+        )
+    }
+
+    #[test]
+    fn historical_realm_sync_ref_preserves_current_network_and_epoch() {
+        let head = chain_ref(100, 1000);
+        let historical_hash =
+            CheckpointHash::from_last_chain_hash(PHash::from_values(90, 91, 92, 93));
+
+        let observed = realm_sync_canonical_ref(head, 90, historical_hash).unwrap();
+
+        assert_eq!(observed.network_id(), head.network_id());
+        assert_eq!(observed.chain_epoch(), head.chain_epoch());
+        assert_eq!(observed.checkpoint().checkpoint_id().get(), 90);
+        assert_eq!(observed.checkpoint().checkpoint_hash(), &historical_hash);
+    }
+
+    #[test]
+    fn realm_sync_ref_rejects_future_checkpoint() {
+        let error = realm_sync_canonical_ref(
+            chain_ref(100, 1000),
+            101,
+            CheckpointHash::from_last_chain_hash(PHash::from_values(1, 2, 3, 4)),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("REALM_SYNC_CHECKPOINT_AHEAD_OF_CANONICAL_HEAD")
+        );
+    }
+
+    #[test]
+    fn realm_sync_ref_rejects_wrong_hash_at_current_head() {
+        let error = realm_sync_canonical_ref(
+            chain_ref(100, 1000),
+            100,
+            CheckpointHash::from_last_chain_hash(PHash::from_values(1, 2, 3, 4)),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("REALM_SYNC_HEAD_HASH_MISMATCH"));
     }
 }
 
@@ -529,7 +617,16 @@ impl<
     }
 
     pub async fn get_realm_sync_info_internal(&self, realm_id: u64, checkpoint_id: u64) -> anyhow::Result<PsyRealmCoordinatorUpdate<N::F, N::QHash>> {
-        //let checkpoint_id = self.get_latest_checkpoint_id_internal().await?;
+        // This response becomes Realm's durable local branch observation.  It
+        // must therefore be read inside a stable IDLE control-plane window,
+        // rather than combining a historical DB row with a remote "latest"
+        // head observed at another time.
+        let before = self.rollback_admin_inbox.status().await?;
+        if before.phase() != RollbackAdminInboxPhase::Idle {
+            anyhow::bail!("ROLLBACK_MAINTENANCE:{:?}", before.phase());
+        }
+        let head = before.canonical_head();
+
         let l2_block_state = self.db_reader.get_l2_block_state(checkpoint_id).await?;
         let checkpoint_leaf = self.db_reader.get_checkpoint_leaf_data(checkpoint_id).await?;
         let state_roots:PQEDCheckpointGlobalStateRoots<N::QHash> = self.db_reader.get_checkpoint_global_state_roots(checkpoint_id).await?;
@@ -555,7 +652,40 @@ impl<
         } else {
             TagTreeMerkleProof::<N::QHash>::new_empty()
         };
+
+        let stored_transition = self
+            .db_reader
+            .get_verifiable_checkpoint_state_transition_and_zkp(checkpoint_id)
+            .await?;
+        let computed_checkpoint_hash = stored_transition
+            .get_computed_public_inputs_hash::<N::HasherBase>();
+        let checkpoint_hash = if checkpoint_id == 0 && stored_transition.zk_proof.is_empty() {
+            CheckpointHash::from_proof_public_inputs_hash(computed_checkpoint_hash)
+        } else {
+            let extracted = checkpoint_hash_from_saved_proof_bytes::<
+                N::QHash,
+                N::ZKProof,
+                N::ZKVerifier,
+            >(&stored_transition.zk_proof)?;
+            if extracted.as_inner() != &computed_checkpoint_hash {
+                anyhow::bail!(
+                    "REALM_SYNC_CHECKPOINT_PROOF_HASH_MISMATCH:checkpoint_id={}",
+                    checkpoint_id
+                );
+            }
+            extracted
+        };
+
+        let canonical_chain_ref =
+            realm_sync_canonical_ref(*head.canonical_ref(), checkpoint_id, checkpoint_hash)?;
+
+        let after = self.rollback_admin_inbox.status().await?;
+        if after.phase() != RollbackAdminInboxPhase::Idle || before != after {
+            anyhow::bail!("REALM_SYNC_CANONICAL_OBSERVATION_UNSTABLE");
+        }
+
         Ok(PsyRealmCoordinatorUpdate {
+            canonical_chain_ref,
             checkpoint_sync_info: PQEDCheckpointSyncInfoCompact {
                 checkpoint_tree_root: checkpoint_tree_proof.root,
                 checkpoint_leaf_hash: checkpoint_tree_proof.value,

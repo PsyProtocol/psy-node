@@ -220,7 +220,32 @@ where
         _zk_proof: Vec<u8>,
         skip_checkpoint_root_check: bool,
     ) -> anyhow::Result<()> {
+        self.validate_realm_sync_context(coordinator_update)?;
         let checkpoint_id = coordinator_update.checkpoint_sync_info.checkpoint_id;
+        if coordinator_update.merkle_proof_to_realm_root.value != realm_update.new_realm_root {
+            anyhow::bail!(
+                "REALM_AUTHORITY_OBSERVATION_ROOT_MISMATCH:checkpoint={},coordinator={:?},local={:?}",
+                checkpoint_id,
+                coordinator_update.merkle_proof_to_realm_root.value,
+                realm_update.new_realm_root
+            );
+        }
+        let prior_observation = self.db.get_realm_authority_observation().await?;
+        let state_checkpoint_id = if checkpoint_id == 0
+            || realm_update.old_realm_root != realm_update.new_realm_root
+        {
+            checkpoint_id
+        } else {
+            prior_observation
+                .as_ref()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "REALM_AUTHORITY_OBSERVATION_UNINITIALIZED_FOR_UNCHANGED_STATE"
+                    )
+                })?
+                .state_checkpoint_id()
+                .get()
+        };
         let unique_pending_id = self.state.processing_unique_pending_id;
         // CRITICAL: set unique_pending_id to checkpoint_id mapping BEFORE ANY OTHER
         // STATE UPDATES so we can recover if something goes wrong.
@@ -295,6 +320,16 @@ where
         self.db
             .set_l2_latest_block_state(&coordinator_update.checkpoint_sync_info.block_state)
             .await?;
+        // Final durable publication marker for consumers.  It is written only
+        // after the local state, checkpoint marker, and latest block-state
+        // singleton are complete; startup/sync can safely republish it after a
+        // crash in this narrow final window.
+        self.publish_realm_authority_observation(
+            coordinator_update.canonical_chain_ref,
+            state_checkpoint_id,
+            realm_update.new_realm_root,
+        )
+        .await?;
         if checkpoint_id > 0 && previous_checkpoint_id < checkpoint_id {
             if let Some((previous_pending_id, _)) = self
                 .db

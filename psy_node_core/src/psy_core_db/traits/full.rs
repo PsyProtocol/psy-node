@@ -12,7 +12,7 @@ use parth_core::{
         }
     
 };
-use psy_data::{protocol::verifiable_checkpoint_transition::PsyVerifiableCheckpointTransitionWithProof, v1::qdata::{
+use psy_data::{protocol::{chain_context::AuthorityObservation, verifiable_checkpoint_transition::PsyVerifiableCheckpointTransitionWithProof}, v1::qdata::{
     checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState},
     contract::{ContractCodeDefinition, ContractCodeDefinitionWithContractId, PQEDContractLeaf},
     public_key::PZKPublicKeyInfo,
@@ -270,6 +270,11 @@ pub trait PsyNodeCheckpointObjectDatabaseReader<F, Hash> {
     /// rather than relying on the presence of any single record, and must not conflate `None` with `Err`.
     async fn try_get_complete_l2_block_state(&self, checkpoint_id: u64) -> anyhow::Result<Option<QEDL2BlockState>>;
     async fn get_latest_l2_block_state(&self) -> anyhow::Result<QEDL2BlockState>;
+    /// Exact branch/local-state marker last published by a Realm processor.
+    /// Missing data is explicitly uninitialized and must never imply epoch 0.
+    async fn get_realm_authority_observation(
+        &self,
+    ) -> anyhow::Result<Option<AuthorityObservation<Hash>>>;
     async fn get_checkpoint_global_state_roots(&self, checkpoint_id: u64) -> anyhow::Result<PQEDCheckpointGlobalStateRoots<Hash>>;
     async fn get_unique_pending_id_for_checkpoint_id(&self, checkpoint_id: u64) -> anyhow::Result<Option<(u64, QCoreProcCheckpointUniqueId)>>;
     async fn get_checkpoint_id_for_unique_pending_id(&self, unique_pending_id: u64) -> anyhow::Result<Option<u64>>;
@@ -335,6 +340,10 @@ pub trait PsyNodeCheckpointObjectDatabaseWriter<F, Hash> {
     async fn set_checkpoint_leaf_data(&self, checkpoint_id: u64, leaf_data: &PQEDCheckpointLeaf<F, Hash>) -> anyhow::Result<()>;
     async fn set_checkpoint_root_hash_to_id_mapping(&self, checkpoint_root: Hash, checkpoint_id: u64) -> anyhow::Result<()>;
     async fn set_l2_latest_block_state(&self, block_state: &QEDL2BlockState) -> anyhow::Result<()>;
+    async fn set_realm_authority_observation(
+        &self,
+        observation: &AuthorityObservation<Hash>,
+    ) -> anyhow::Result<()>;
     async fn set_l2_block_state(&self, checkpoint_id: u64, block_state: &QEDL2BlockState) -> anyhow::Result<()>;
     async fn set_checkpoint_global_state_roots(&self, checkpoint_id: u64, roots: &PQEDCheckpointGlobalStateRoots<Hash>) -> anyhow::Result<()>;
     async fn set_realm_rewards_tag_tree_top_proof_at_unique_pending_id(

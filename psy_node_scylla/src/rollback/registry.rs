@@ -552,7 +552,7 @@ pub const fn physical_descriptor(id: ScyllaPhysicalTableId) -> PhysicalTableDesc
         P::CheckpointLeafToCheckpointIdK2 => desc(id, PsyLogicalTableId::CheckpointLeafToCheckpointId, "checkpoint_leaf_to_checkpoint_id_table_k2", "_k2", ScyllaKeyspaceKind::Standard, Blob, S, U, AU, PN, XX, RU, NO_DELETE, RE, MR, VN, RetireCandidate, &[], &[]),
         P::L2BlockState => desc(id, PsyLogicalTableId::L2BlockState, "l2_block_state_table", "", ScyllaKeyspaceKind::Standard, Kiv, S, A, RW, PI, XP, AV, VERSION_PARTITION, RA, ME, VL, Ready, &["get_l2_block_state", "try_get_complete_l2_block_state"], &["set_l2_block_state"]),
         P::CheckpointIdToRealmRoot => desc(id, PsyLogicalTableId::CheckpointIdToRealmRoot, "checkpoint_id_to_realm_root_table", "", ScyllaKeyspaceKind::Standard, Kiv, S, U, AU, PN, XX, RU, NO_DELETE, RE, MR, VN, RetireCandidate, &[], &[]),
-        P::LatestInfo => desc(id, PsyLogicalTableId::LatestInfo, "latest_info_table", "", ScyllaKeyspaceKind::Standard, Kiv, S, D, RW, PI, XS, RS, NO_DELETE, RT, MS, VH, Ready, &["get_latest_l2_block_state", "get_latest_checkpoint_tree_root (reader-only slot=2)"], &["set_l2_latest_block_state"]),
+        P::LatestInfo => desc(id, PsyLogicalTableId::LatestInfo, "latest_info_table", "", ScyllaKeyspaceKind::Standard, Kiv, S, D, RW, PI, XS, RS, NO_DELETE, RT, MS, VH, Ready, &["get_latest_l2_block_state", "get_latest_checkpoint_tree_root (reader-only slot=2)", "get_realm_authority_observation (slot=3)"], &["set_l2_latest_block_state", "set_realm_authority_observation (slot=3)"]),
         P::CheckpointedObject => desc(id, PsyLogicalTableId::CheckpointedObject, "checkpointed_object_table", "", ScyllaKeyspaceKind::Standard, ObjectSingle, R, D, RW, PI, XM, BK, NO_DELETE, RB, MB, VM, BlockedR(BM), &["try_get_complete_l2_block_state", "get_top_global_user_*_proof_*"], &["global_user_tree_set_top_tree_merkle_proof", "set_realm_rewards_tag_tree_top_proof_at_*", "contract_state_tree_set_top_tree_merkle_proof"]),
         P::CheckpointStateRoots => desc(id, PsyLogicalTableId::CheckpointStateRoots, "checkpoint_state_roots_table", "", ScyllaKeyspaceKind::Standard, Kiv, S, A, RW, PI, XP, AV, VERSION_PARTITION, RA, ME, VC, Ready, &["get_checkpoint_global_state_roots", "try_get_complete_l2_block_state"], &["set_checkpoint_global_state_roots"]),
         P::UserLeaf => desc(id, PsyLogicalTableId::UserLeaf, "user_leaf_table", "", ScyllaKeyspaceKind::Standard, ObjectSingle, R, A, RW, PD, XC, AV, VERSION_CLUSTERING, RA, ME, VM, Ready, &["get_user_leaf", "get_user_leaves_batch"], &["set_user_leaf", "set_user_leaves_ffs"]),
@@ -599,6 +599,7 @@ const fn coverage(
 const C_DIRECT: PreparedCoverageByAuthority = coverage(DD, NA, NA);
 const C_INDIRECT: PreparedCoverageByAuthority = coverage(DI, NA, NA);
 const R_DIRECT: PreparedCoverageByAuthority = coverage(NA, DD, NA);
+const R_INDIRECT: PreparedCoverageByAuthority = coverage(NA, DI, NA);
 const R_NONE: PreparedCoverageByAuthority = coverage(NA, DN, NA);
 const R_NONE_RS_INDIRECT: PreparedCoverageByAuthority = coverage(NA, DN, DI);
 const SHARED_DIRECT: PreparedCoverageByAuthority = coverage(DD, DD, NA);
@@ -722,6 +723,9 @@ pub const fn key_domain_descriptor(id: ScyllaKeyDomain) -> KeyDomainDescriptor {
         K::L2BlockState => domain_from_physical(id, P::L2BlockState, "L2 block state", A, C_INDIRECT_RS_INDIRECT),
         K::UnusedCheckpointRealmRoot => domain_from_physical(id, P::CheckpointIdToRealmRoot, "unused checkpoint realm root", U, UNUSED_COVERAGE),
         K::LatestInfo => domain_from_physical(id, P::LatestInfo, "mutable latest-info slots", DO, C_INDIRECT_RS_INDIRECT),
+        K::RealmAuthorityObservation => {
+            domain_from_physical(id, P::LatestInfo, "Realm canonical/local-state observation slot=3", A, R_INDIRECT)
+        }
         K::CheckpointedGlobalUserProof => domain_desc(id, P::CheckpointedObject, "obj_id=1 checkpoint proof", D, R_NONE_RS_INDIRECT, XC, AV, RB, MB, PSY_VALUES, Blocked(BM)),
         K::CheckpointedRewardsProofAtCheckpoint => {
             domain_desc(id, P::CheckpointedObject, "obj_id=2 checkpoint reward proof", D, R_NONE, XC, AV, RB, MB, PSY_VALUES, Blocked(BM))

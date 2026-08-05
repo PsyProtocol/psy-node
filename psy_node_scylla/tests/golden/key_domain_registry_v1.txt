@@ -36,4 +36,5 @@
 36|ImtLeaf|ImtLeaf|IMT leaf|Authoritative|CheckpointClustering|Ready
 37|ImtKeyIndex|ImtKeyIndex|IMT key index|Derived|ImtBirthOrdinaryColumn|Ready
 38|ImtCursor|ImtNextAppendIndex|IMT append cursor|Derived|MutableCursor|Ready
-FULL_METADATA_FNV1A64=7eb8c8543a4c089f
+39|RealmAuthorityObservation|LatestInfo|Realm canonical/local-state observation slot=3|Authoritative|Singleton|Ready
+FULL_METADATA_FNV1A64=43888ddf0f13513b

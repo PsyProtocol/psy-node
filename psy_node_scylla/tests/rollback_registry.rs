@@ -564,6 +564,7 @@ fn all_key_domain_samples() -> Vec<TypedTableKey> {
         TypedTableKey::L2BlockState(cp),
         TypedTableKey::UnusedCheckpointRealmRoot(cp),
         TypedTableKey::LatestInfo(LatestInfoSlot::LatestL2BlockState),
+        TypedTableKey::LatestInfo(LatestInfoSlot::RealmAuthorityObservation),
         TypedTableKey::CheckpointedObject(CheckpointedObjectKey::GlobalUserProofAtCheckpoint(cp)),
         TypedTableKey::CheckpointedObject(CheckpointedObjectKey::RewardsProofAtCheckpoint(cp)),
         TypedTableKey::CheckpointedObject(CheckpointedObjectKey::RewardsProofAtPending(pending)),
@@ -609,11 +610,11 @@ fn all_key_domain_samples() -> Vec<TypedTableKey> {
 #[test]
 fn key_domain_registry_is_total_and_matches_typed_resolver() {
     let domains: Vec<_> = ScyllaKeyDomain::iter().collect();
-    assert_eq!(domains.len(), 38);
-    assert_eq!(domains.iter().map(|id| id.stable_id()).collect::<Vec<_>>(), (1..=38).collect::<Vec<_>>());
+    assert_eq!(domains.len(), 39);
+    assert_eq!(domains.iter().map(|id| id.stable_id()).collect::<Vec<_>>(), (1..=39).collect::<Vec<_>>());
 
     let samples = all_key_domain_samples();
-    assert_eq!(samples.len(), 38);
+    assert_eq!(samples.len(), 39);
     let resolved_domains: BTreeSet<_> = samples
         .iter()
         .map(|key| {
@@ -720,6 +721,18 @@ fn typed_primary_key_examples_cover_special_semantics() {
     assert_eq!(latest_checkpoint_tree_root.physical_table(), ScyllaPhysicalTableId::LatestInfo);
     assert_ne!(
         latest_checkpoint_tree_root.locator_bytes(),
+        describe_existing_key(&TypedTableKey::LatestInfo(LatestInfoSlot::LatestL2BlockState)).locator_bytes()
+    );
+    let realm_observation = describe_existing_key(&TypedTableKey::LatestInfo(
+        LatestInfoSlot::RealmAuthorityObservation,
+    ));
+    assert_eq!(realm_observation.physical_table(), ScyllaPhysicalTableId::LatestInfo);
+    assert_ne!(
+        realm_observation.locator_bytes(),
+        latest_checkpoint_tree_root.locator_bytes()
+    );
+    assert_ne!(
+        realm_observation.locator_bytes(),
         describe_existing_key(&TypedTableKey::LatestInfo(LatestInfoSlot::LatestL2BlockState)).locator_bytes()
     );
 

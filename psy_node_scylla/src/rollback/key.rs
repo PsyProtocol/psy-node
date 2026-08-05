@@ -1,5 +1,6 @@
 use psy_node_core::store::typed::{
-    CheckpointedObjectKey, ImtEncodedKey, MerkleNode, PsyLogicalTableId, TypedTableKey, STORAGE_KEY_CODEC_VERSION,
+    CheckpointedObjectKey, ImtEncodedKey, LatestInfoSlot, MerkleNode, PsyLogicalTableId,
+    TypedTableKey, STORAGE_KEY_CODEC_VERSION,
 };
 
 use super::{
@@ -190,7 +191,14 @@ pub fn describe_existing_key(key: &TypedTableKey) -> ResolvedScyllaKey {
             D::UnusedCheckpointRealmRoot,
             vec![Field::U64(checkpoint.get())],
         ),
-        TypedTableKey::LatestInfo(slot) => (P::LatestInfo, D::LatestInfo, vec![Field::U64(*slot as u8 as u64)]),
+        TypedTableKey::LatestInfo(slot) => (
+            P::LatestInfo,
+            match slot {
+                LatestInfoSlot::RealmAuthorityObservation => D::RealmAuthorityObservation,
+                LatestInfoSlot::LatestL2BlockState | LatestInfoSlot::LatestCheckpointTreeRoot => D::LatestInfo,
+            },
+            vec![Field::U64(*slot as u8 as u64)],
+        ),
         TypedTableKey::CheckpointedObject(object) => match object {
             CheckpointedObjectKey::GlobalUserProofAtCheckpoint(checkpoint) => (
                 P::CheckpointedObject,

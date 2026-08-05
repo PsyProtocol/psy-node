@@ -21,6 +21,10 @@ use psy_data::{
     genesis::genesis_block_setup::PsyGenesisBlockSetupData,
     prepared_block::{common::PsyCoordinatorPendingCheckpointBase, coordinator::PsyPreparedCoordinatorBlockStateUpdates, realm::{PsyPreparedRealmBlockStateUpdates, PsyPreparedRealmBlockStateUpdatesWithCoordinatorUpdate, PsyRealmCoordinatorUpdate}},
     protocol::{
+        canonical_chain::{
+            genesis_checkpoint_hash, CanonicalChainRef, ChainEpoch, CheckpointId,
+            CheckpointRef, NetworkId,
+        },
         checkpoint_transition_hash::{CheckpointStateHashTransition, CheckpointStateTransitionPublicInputs},
         verifiable_checkpoint_transition::PsyVerifiableCheckpointTransition,
     },
@@ -402,6 +406,8 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
         genesis_block: &PsyGenesisBlockSetupData<F, Hash>,
         realm_id: u64,
         realm_sub_id: u64,
+        chain_id: u32,
+        genesis_checkpoint_state_transition_fingerprint: Hash,
     ) -> anyhow::Result<
         PsyPreparedRealmBlockStateUpdatesWithCoordinatorUpdate<F, Hash>,
     > {
@@ -427,8 +433,21 @@ impl<F: QFelt64, Hash: QFHashBase<F> + Q256BitHash + Default + Copy> GenesisData
             .map(|i| Hasher::get_zero_hash(i))
             .collect::<Vec<Hash>>();
         let checkpoint_tree_root = compute_root_merkle_proof_generic::<Hash, Hasher>(checkpoint_leaf_hash, 0, &siblings);
+        let canonical_chain_ref = CanonicalChainRef::new(
+            NetworkId::try_from_chain_id(chain_id)?,
+            ChainEpoch::new(0),
+            CheckpointRef::new(
+                CheckpointId::new(0),
+                genesis_checkpoint_hash::<Hash, Hasher>(
+                    checkpoint_tree_root,
+                    checkpoint_leaf_hash,
+                    genesis_checkpoint_state_transition_fingerprint,
+                ),
+            ),
+        );
 
         let coordinator_update = PsyRealmCoordinatorUpdate {
+            canonical_chain_ref,
             checkpoint_sync_info: PQEDCheckpointSyncInfoCompact{
                 state_roots,
                 checkpoint_id: 0,

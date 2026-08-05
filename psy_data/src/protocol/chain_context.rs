@@ -12,6 +12,8 @@ use parth_core::{
 use serde::{
     de::Error as SerdeDeError, Deserialize, Deserializer, Serialize, Serializer,
 };
+use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
+use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata};
 
 use super::canonical_chain::{
     CanonicalChainRef, CanonicalChainRefCodecError, CheckpointHash, CheckpointId,
@@ -315,6 +317,70 @@ impl<Hash: Q256BitHash> AuthorityObservation<Hash> {
         ));
         Self::try_new(chain, authority, state_checkpoint_id, state_root).map_err(Into::into)
     }
+}
+
+impl<Hash: Q256BitHash> PsyCanonicalSerializeMetadata for AuthorityObservation<Hash> {
+    const IS_FIXED_SIZE: bool = true;
+    const FIXED_SIZE: usize = AUTHORITY_OBSERVATION_V1_LEN;
+}
+
+impl<Hash: Q256BitHash> FallbackPsySerializeCanonical for AuthorityObservation<Hash> {
+    fn fallback_pio_serialized_size(&self) -> usize {
+        AUTHORITY_OBSERVATION_V1_LEN
+    }
+
+    fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
+        writer.psy_write_bytes_fixed(&self.to_canonical_bytes())
+    }
+
+    fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
+        let bytes: [u8; AUTHORITY_OBSERVATION_V1_LEN] = reader.psy_read_bytes_fixed()?;
+        Ok(Self::from_canonical_bytes(&bytes)?)
+    }
+}
+
+#[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
+impl<Hash: Q256BitHash, C: speedy::Context> speedy::Writable<C>
+    for AuthorityObservation<Hash>
+{
+    fn write_to<T: ?Sized + speedy::Writer<C>>(
+        &self,
+        writer: &mut T,
+    ) -> Result<(), C::Error> {
+        writer.write_bytes(&self.to_canonical_bytes())
+    }
+
+    fn bytes_needed(&self) -> Result<usize, C::Error> {
+        Ok(AUTHORITY_OBSERVATION_V1_LEN)
+    }
+}
+
+#[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
+impl<'a, Hash: Q256BitHash, C: speedy::Context> speedy::Readable<'a, C>
+    for AuthorityObservation<Hash>
+{
+    fn read_from<T: speedy::Reader<'a, C>>(reader: &mut T) -> Result<Self, C::Error> {
+        let mut bytes = [0u8; AUTHORITY_OBSERVATION_V1_LEN];
+        reader.read_bytes(&mut bytes)?;
+        Self::from_canonical_bytes(&bytes)
+            .map_err(|error| speedy::Error::custom(error).into())
+    }
+
+    fn minimum_bytes_needed() -> usize {
+        AUTHORITY_OBSERVATION_V1_LEN
+    }
+}
+
+#[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
+psy_serialize::impl_psy_canonical_serialize_for_speedy!(
+    AuthorityObservation,
+    { Hash: Q256BitHash } => { Hash }
+);
+
+#[cfg(not(all(feature = "serialize_speedy", target_endian = "little")))]
+impl<Hash: Q256BitHash> psy_serialize::AutoImplementFallbackPsySerializeCanonical
+    for AuthorityObservation<Hash>
+{
 }
 
 /// Required context for one pending/proc namespace.
@@ -892,6 +958,7 @@ mod tests {
             ProvingJobCircuitType, ProvingJobDataType, QJobTopic, QProvingJobDataID,
         },
     };
+    use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 
     const GOLDEN_VECTORS: &str = include_str!("../../tests/golden/chain_context_vectors_v1.txt");
 
@@ -1016,6 +1083,30 @@ mod tests {
             HistoricalReadContext::from_canonical_bytes(&historical.to_canonical_bytes()).unwrap(),
             historical
         );
+    }
+
+    #[test]
+    fn authority_observation_database_codec_is_the_protocol_codec() {
+        let observation = AuthorityObservation::try_new(
+            chain(367, PHash::from_values(1, 2, 3, 4)),
+            AuthorityScope::Realm {
+                realm_id: 7,
+                realm_sub_id: 3,
+            },
+            AuthorityStateCheckpointId::new(360),
+            AuthorityStateRoot::from_local_state_root(PHash::from_values(5, 6, 7, 8)),
+        )
+        .unwrap();
+        let encoded = observation.psy_ser_to_bytes_vec().unwrap();
+        assert_eq!(encoded, observation.to_canonical_bytes());
+        assert_eq!(
+            AuthorityObservation::<PHash>::psy_ser_from_slice(&encoded).unwrap(),
+            observation
+        );
+
+        let mut corrupt = encoded;
+        corrupt[0] ^= 0xff;
+        assert!(AuthorityObservation::<PHash>::psy_ser_from_slice(&corrupt).is_err());
     }
 
     #[test]

@@ -68,6 +68,36 @@ where
         // Check if DB is already up to date
         let db_root = self.db.checkpoint_tree_get_root_hash(latest_db_checkpoint_id).await?;
         if latest_synced_checkpoint_id == latest_db_checkpoint_id && latest_synced_checkpoint_root == db_root {
+            let sync_info = self
+                .coordinator_client
+                .rc_get_realm_sync_info(latest_synced_checkpoint_id, self.state.realm_id_u64)
+                .await?;
+            self.validate_realm_sync_context(&sync_info)?;
+            let realm_state = self
+                .coordinator_client
+                .rc_get_realm_root_and_last_modified_checkpoint(
+                    latest_synced_checkpoint_id,
+                    self.state.realm_id_u64,
+                )
+                .await?;
+            let local_root = self
+                .db
+                .global_user_tree_get_node(latest_synced_checkpoint_id, self.realm_root_node)
+                .await?;
+            if local_root != realm_state.value {
+                anyhow::bail!(
+                    "REALM_AUTHORITY_OBSERVATION_ROOT_MISMATCH:checkpoint={},local={:?},coordinator={:?}",
+                    latest_synced_checkpoint_id,
+                    local_root,
+                    realm_state.value
+                );
+            }
+            self.publish_realm_authority_observation(
+                sync_info.canonical_chain_ref,
+                realm_state.checkpoint_id,
+                realm_state.value,
+            )
+            .await?;
             tracing::debug!(
                 "Coordinator processor database is already synced to latest checkpoint ID: {} and root: {:?}",
                 latest_synced_checkpoint_id,
@@ -87,6 +117,7 @@ where
                 .rc_get_realm_sync_info(latest_synced_checkpoint_id, self.state.realm_id_u64)
                 .await?,
         };
+        self.validate_realm_sync_context(&latest_sync_info)?;
 
         self.sync_contract_heights(
             latest_db_l2_info.next_contract_id,
@@ -118,6 +149,18 @@ where
         let realm_root_state = self.coordinator_client
             .rc_get_realm_root_and_last_modified_checkpoint(latest_synced_checkpoint_id, self.state.realm_id_u64)
             .await?;
+        let local_realm_root = self
+            .db
+            .global_user_tree_get_node(latest_synced_checkpoint_id, self.realm_root_node)
+            .await?;
+        if local_realm_root != realm_root_state.value {
+            anyhow::bail!(
+                "REALM_AUTHORITY_OBSERVATION_ROOT_MISMATCH:checkpoint={},local={:?},coordinator={:?}",
+                latest_synced_checkpoint_id,
+                local_realm_root,
+                realm_root_state.value
+            );
+        }
         
         self.state.last_committed_checkpoint_id = latest_synced_checkpoint_id;
         self.state.last_committed_realm_end_root = realm_root_state.value;
@@ -130,6 +173,13 @@ where
         // Also update checkpoint root
         let checkpoint_proof = self.checkpoint_tree_backup_manager.checkpoint_tree.get_leaf(latest_synced_checkpoint_id);
         self.state.last_committed_checkpoint_root = checkpoint_proof.get_append_root::<N::HasherBase>();
+
+        self.publish_realm_authority_observation(
+            latest_sync_info.canonical_chain_ref,
+            realm_root_state.checkpoint_id,
+            realm_root_state.value,
+        )
+        .await?;
 
         tracing::info!(
             "Synchronized coordinator processor database to checkpoint ID: {}. New Base Realm Root: {:?}.", 
@@ -221,6 +271,7 @@ where
                         .rc_get_realm_sync_info(realm_state.checkpoint_id, self.state.realm_id_u64)
                         .await?,
                 };
+                self.validate_realm_sync_context(&sync_info)?;
 
                 // Update mappings for the unique pending ID
                 self.db.set_realm_rewards_tag_tree_top_proof_at_unique_pending_id(
@@ -315,6 +366,7 @@ where
                 .coordinator_client
                 .rc_get_realm_sync_info(checkpoint_id, self.state.realm_id_u64)
                 .await?;
+            self.validate_realm_sync_context(&sync_info)?;
 
             // CRITICAL VALIDATION: Ensure the local in-memory tree matches the Coordinator's canonical root for this checkpoint.
             // If we have diverged (e.g. bad leaves or fork), we must reset the Backup Manager.

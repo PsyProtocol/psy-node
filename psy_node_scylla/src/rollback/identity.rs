@@ -90,6 +90,9 @@ pub enum ScyllaKeyDomain {
     ImtLeaf = 36,
     ImtKeyIndex = 37,
     ImtCursor = 38,
+    /// Realm serving-head marker stored in latest_info slot 3.  It is kept a
+    /// distinct semantic domain from the derived legacy latest-info slots.
+    RealmAuthorityObservation = 39,
 }
 
 impl ScyllaKeyDomain {

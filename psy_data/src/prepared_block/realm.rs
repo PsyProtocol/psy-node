@@ -7,6 +7,7 @@ use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
 use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
 
 use crate::v1::qdata::checkpoint_sync::PQEDCheckpointSyncInfoCompact;
+use crate::protocol::canonical_chain::{CanonicalChainRef, CANONICAL_CHAIN_REF_V1_LEN};
 
 
 
@@ -222,6 +223,10 @@ pser::impl_psy_ser_basic_tests_fallback!(
 #[pderive::serialize_clone_f_hash_ts]
 #[ts(export, concrete(F = parth_core::PF, Hash = parth_core::PHash))]
 pub struct PsyRealmCoordinatorUpdate<F, Hash> {
+    // Exact Coordinator branch identity for `checkpoint_sync_info.checkpoint_id`.
+    // This is the proof public-input hash, not the checkpoint-tree root/leaf.
+    #[ts(type = "{ network_id: number, chain_epoch: bigint, checkpoint: { checkpoint_id: bigint, checkpoint_hash: QHashOut } }")]
+    pub canonical_chain_ref: CanonicalChainRef<Hash>,
     pub checkpoint_sync_info: PQEDCheckpointSyncInfoCompact<F, Hash>,
     pub merkle_proof_to_realm_root: MerkleProofCore<Hash>,
     pub reward_tree_top_proof: TagTreeMerkleProof<Hash>,
@@ -237,8 +242,22 @@ impl<F: QPGenRandom, Hash: QPGenRandom> QPGenRandom for PsyRealmCoordinatorUpdat
     where
         Self: Sized,
     {
+        let checkpoint_sync_info = PQEDCheckpointSyncInfoCompact::qp_rand_gen();
         Self {
-            checkpoint_sync_info: PQEDCheckpointSyncInfoCompact::qp_rand_gen(),
+            canonical_chain_ref: CanonicalChainRef::new(
+                crate::protocol::canonical_chain::NetworkId::try_from_chain_id(0)
+                    .expect("local devnet is a supported network"),
+                crate::protocol::canonical_chain::ChainEpoch::new(0),
+                crate::protocol::canonical_chain::CheckpointRef::new(
+                    crate::protocol::canonical_chain::CheckpointId::new(
+                        checkpoint_sync_info.checkpoint_id,
+                    ),
+                    crate::protocol::canonical_chain::CheckpointHash::from_last_chain_hash(
+                        Hash::qp_rand_gen(),
+                    ),
+                ),
+            ),
+            checkpoint_sync_info,
             merkle_proof_to_realm_root: MerkleProofCore::qp_rand_gen(),
             reward_tree_top_proof: TagTreeMerkleProof::qp_rand_gen(),
         }
@@ -252,12 +271,14 @@ impl<F: QFelt64, Hash: Q256BitHash> PsyCanonicalSerializeMetadata for PsyRealmCo
 
 impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for PsyRealmCoordinatorUpdate<F, Hash> {
     fn fallback_pio_serialized_size(&self) -> usize {
+        CANONICAL_CHAIN_REF_V1_LEN +
         self.checkpoint_sync_info.pio_serialized_size() +
         self.merkle_proof_to_realm_root.pio_serialized_size() +
         self.reward_tree_top_proof.pio_serialized_size()
     }
 
     fn fallback_pio_write_to_io<W: psy_io::Write>(&self, writer: &mut W) -> anyhow::Result<()> {
+        writer.psy_write_bytes_fixed(&self.canonical_chain_ref.to_canonical_bytes())?;
         self.checkpoint_sync_info.pio_write_to_io(writer)?;
         self.merkle_proof_to_realm_root.pio_write_to_io(writer)?;
         self.reward_tree_top_proof.pio_write_to_io(writer)?;
@@ -265,11 +286,16 @@ impl<F: QFelt64, Hash: Q256BitHash> FallbackPsySerializeCanonical for PsyRealmCo
     }
 
     fn fallback_pio_read_from_io<R: psy_io::Read>(reader: &mut R) -> anyhow::Result<Self> {
+        let canonical_chain_ref_bytes: [u8; CANONICAL_CHAIN_REF_V1_LEN] =
+            reader.psy_read_bytes_fixed()?;
+        let canonical_chain_ref =
+            CanonicalChainRef::from_canonical_bytes(&canonical_chain_ref_bytes)?;
         let checkpoint_sync_info = PQEDCheckpointSyncInfoCompact::<F, Hash>::pio_read_from_io(reader)?;
         let merkle_proof_to_realm_root = MerkleProofCore::<Hash>::pio_read_from_io(reader)?;
         let reward_tree_top_proof = TagTreeMerkleProof::<Hash>::pio_read_from_io(reader)?;
 
         Ok(Self {
+            canonical_chain_ref,
             checkpoint_sync_info,
             merkle_proof_to_realm_root,
             reward_tree_top_proof,

@@ -25,7 +25,10 @@ use parth_core::{
     QCoreProcCheckpointUniqueId,
 };
 use psy_data::{
-    protocol::verifiable_checkpoint_transition::PsyVerifiableCheckpointTransitionWithProof,
+    protocol::{
+        chain_context::AuthorityObservation,
+        verifiable_checkpoint_transition::PsyVerifiableCheckpointTransitionWithProof,
+    },
     v1::qdata::{
         checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState},
         checkpoint_sync::PQEDCheckpointSyncInfo,
@@ -46,6 +49,7 @@ use crate::{
             CHECKPOINTED_OBJECT_TABLE_OBJ_ID_BRIDGE_DEPOSIT_LEAF_BASE,
             CHECKPOINTED_OBJECT_TABLE_OBJ_ID_REALM_ROOT_TO_GLOBAL_REWARDS_TAG_TREE_ROOT_PROOF,
             CHECKPOINTED_OBJECT_TABLE_OBJ_ID_REALM_ROOT_TO_GLOBAL_USER_TREE_ROOT_MERKLE_PROOF, LATEST_INFO_TABLE_OBJ_ID_LATEST_L2_BLOCK_STATE,
+            LATEST_INFO_TABLE_OBJ_ID_REALM_AUTHORITY_OBSERVATION,
             U64_SINGLETON_TABLE_OBJ_ID_BRIDGE_DEPOSIT_NEXT_INDEX_BASE, U64_SINGLETON_TABLE_OBJ_ID_CHECKPOINT_ID, U64_SINGLETON_TABLE_OBJ_ID_PENDING_ID,
         },
         traits::full::*,
@@ -2062,6 +2066,17 @@ impl<
             .ok_or_else(|| anyhow::anyhow!("Latest L2 block state not found"))
     }
 
+    async fn get_realm_authority_observation(
+        &self,
+    ) -> anyhow::Result<Option<AuthorityObservation<N::QHash>>> {
+        self.store
+            .db_select_one_kiv_value::<AuthorityObservation<N::QHash>>(
+                &self.latest_info_table,
+                LATEST_INFO_TABLE_OBJ_ID_REALM_AUTHORITY_OBSERVATION,
+            )
+            .await
+    }
+
     async fn get_checkpoint_global_state_roots(&self, checkpoint_id: u64) -> anyhow::Result<PQEDCheckpointGlobalStateRoots<N::QHash>> {
         self.store
             .db_select_one_kiv_value::<PQEDCheckpointGlobalStateRoots<N::QHash>>(&self.checkpoint_state_roots_table, checkpoint_id)
@@ -2490,6 +2505,18 @@ impl<
     async fn set_l2_latest_block_state(&self, block_state: &QEDL2BlockState) -> anyhow::Result<()> {
         self.store
             .db_insert_one_kiv(&self.latest_info_table, LATEST_INFO_TABLE_OBJ_ID_LATEST_L2_BLOCK_STATE, block_state)
+            .await
+    }
+    async fn set_realm_authority_observation(
+        &self,
+        observation: &AuthorityObservation<N::QHash>,
+    ) -> anyhow::Result<()> {
+        self.store
+            .db_insert_one_kiv(
+                &self.latest_info_table,
+                LATEST_INFO_TABLE_OBJ_ID_REALM_AUTHORITY_OBSERVATION,
+                observation,
+            )
             .await
     }
     async fn set_l2_block_state(&self, checkpoint_id: u64, block_state: &QEDL2BlockState) -> anyhow::Result<()> {

@@ -153,7 +153,7 @@ impl From<PsyChainNetworkType> for NetworkId {
 /// use psy_data::protocol::canonical_chain::CheckpointHash;
 /// let _: CheckpointHash<parth_core::PHash> = Default::default();
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CheckpointHash<Hash>(Hash);
 
 impl<Hash> CheckpointHash<Hash> {
@@ -182,7 +182,7 @@ impl<Hash> CheckpointHash<Hash> {
 /// use psy_data::protocol::canonical_chain::CheckpointRef;
 /// let _: CheckpointRef<parth_core::PHash> = Default::default();
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CheckpointRef<Hash> {
     checkpoint_id: CheckpointId,
     checkpoint_hash: CheckpointHash<Hash>,
@@ -252,11 +252,46 @@ impl<'de, Hash: Deserialize<'de>> Deserialize<'de> for CheckpointRef<Hash> {
 /// use psy_data::protocol::canonical_chain::CanonicalChainRef;
 /// let _: CanonicalChainRef<parth_core::PHash> = Default::default();
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CanonicalChainRef<Hash> {
     network_id: NetworkId,
     chain_epoch: ChainEpoch,
     checkpoint: CheckpointRef<Hash>,
+}
+
+// Existing Realm sync payloads use Speedy on little-endian builds.  Keep the
+// branch identity byte-for-byte identical to the protocol canonical codec
+// instead of letting Speedy derive a second field-layout encoding.
+#[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
+impl<Hash: Q256BitHash, C: speedy::Context> speedy::Writable<C>
+    for CanonicalChainRef<Hash>
+{
+    fn write_to<T: ?Sized + speedy::Writer<C>>(
+        &self,
+        writer: &mut T,
+    ) -> Result<(), C::Error> {
+        writer.write_bytes(&self.to_canonical_bytes())
+    }
+
+    fn bytes_needed(&self) -> Result<usize, C::Error> {
+        Ok(CANONICAL_CHAIN_REF_V1_LEN)
+    }
+}
+
+#[cfg(all(feature = "serialize_speedy", target_endian = "little"))]
+impl<'a, Hash: Q256BitHash, C: speedy::Context> speedy::Readable<'a, C>
+    for CanonicalChainRef<Hash>
+{
+    fn read_from<T: speedy::Reader<'a, C>>(reader: &mut T) -> Result<Self, C::Error> {
+        let mut bytes = [0u8; CANONICAL_CHAIN_REF_V1_LEN];
+        reader.read_bytes(&mut bytes)?;
+        Self::from_canonical_bytes(&bytes)
+            .map_err(|error| speedy::Error::custom(error).into())
+    }
+
+    fn minimum_bytes_needed() -> usize {
+        CANONICAL_CHAIN_REF_V1_LEN
+    }
 }
 
 impl<Hash> CanonicalChainRef<Hash> {

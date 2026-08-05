@@ -63,6 +63,8 @@ where
             genesis_data,
             realm_identifier.realm_id as u64,
             realm_identifier.realm_sub_id as u64,
+            chain_id,
+            circuit_fingerprint_config.genesis_checkpoint_state_transition_fingerprint,
         )?;
     tracing::info!("[REALM_CREATE] setup_for_realm done");
 

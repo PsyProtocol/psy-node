@@ -293,6 +293,8 @@ pub enum LatestInfoSlot {
     /// Legacy/read-only checkpoint-tree root slot. It remains part of the
     /// physical key domain even though the current v3 writer does not update it.
     LatestCheckpointTreeRoot = 2,
+    /// Realm-local exact branch/root publication marker.
+    RealmAuthorityObservation = 3,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -470,6 +472,11 @@ pub enum LogicalMutation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::psy_core_db::core_implementation::constants::{
+        LATEST_INFO_TABLE_OBJ_ID_LATEST_CHECKPOINT_TREE_ROOT,
+        LATEST_INFO_TABLE_OBJ_ID_LATEST_L2_BLOCK_STATE,
+        LATEST_INFO_TABLE_OBJ_ID_REALM_AUTHORITY_OBSERVATION,
+    };
 
     #[test]
     fn checkpoint_id_rejects_current_cql_alias_range() {
@@ -493,5 +500,21 @@ mod tests {
             bytes[..2].copy_from_slice(&bucket.to_be_bytes());
             assert_eq!(ImtEncodedKey::new(bytes).cql_bucket(), expected);
         }
+    }
+
+    #[test]
+    fn latest_info_typed_slots_match_the_production_kiv_keys() {
+        assert_eq!(
+            LatestInfoSlot::LatestL2BlockState as u64,
+            LATEST_INFO_TABLE_OBJ_ID_LATEST_L2_BLOCK_STATE
+        );
+        assert_eq!(
+            LatestInfoSlot::LatestCheckpointTreeRoot as u64,
+            LATEST_INFO_TABLE_OBJ_ID_LATEST_CHECKPOINT_TREE_ROOT
+        );
+        assert_eq!(
+            LatestInfoSlot::RealmAuthorityObservation as u64,
+            LATEST_INFO_TABLE_OBJ_ID_REALM_AUTHORITY_OBSERVATION
+        );
     }
 }

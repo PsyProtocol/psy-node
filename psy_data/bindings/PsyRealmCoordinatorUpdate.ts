@@ -4,4 +4,4 @@ import type { QEDCheckpointSyncInfoCompact } from "./QEDCheckpointSyncInfoCompac
 import type { QHashOut } from "./QHashOut";
 import type { TagTreeMerkleProof } from "./TagTreeMerkleProof";
 
-export type PsyRealmCoordinatorUpdate = { checkpoint_sync_info: QEDCheckpointSyncInfoCompact, merkle_proof_to_realm_root: MerkleProofCore<QHashOut>, reward_tree_top_proof: TagTreeMerkleProof<QHashOut>, };
+export type PsyRealmCoordinatorUpdate = { canonical_chain_ref: { network_id: number, chain_epoch: bigint, checkpoint: { checkpoint_id: bigint, checkpoint_hash: QHashOut } }, checkpoint_sync_info: QEDCheckpointSyncInfoCompact, merkle_proof_to_realm_root: MerkleProofCore<QHashOut>, reward_tree_top_proof: TagTreeMerkleProof<QHashOut>, };
