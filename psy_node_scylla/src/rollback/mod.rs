@@ -7,6 +7,8 @@
 mod identity;
 mod key;
 mod mutation;
+mod namespace;
+mod namespace_prototype;
 mod timestamp_prototype;
 mod timestamped;
 mod registry;
@@ -14,6 +16,8 @@ mod registry;
 pub use identity::*;
 pub use key::*;
 pub use mutation::*;
+pub use namespace::*;
+pub use namespace_prototype::*;
 pub use timestamp_prototype::*;
 pub use timestamped::*;
 pub use registry::*;
