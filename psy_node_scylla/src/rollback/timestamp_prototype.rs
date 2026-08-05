@@ -8,14 +8,18 @@ use std::{error::Error, fmt};
 
 use psy_node_core::store::{
     timestamp::DeleteFenceTimestampUs,
-    typed::{CheckpointId, MerkleNode, MutationOperation, MutationValue, TypedTableKey},
+    typed::{CheckpointId, CheckpointRootKey, MerkleNode, MutationOperation, MutationValue, TypedTableKey},
 };
-use scylla::{client::session::Session, statement::prepared::PreparedStatement};
+use scylla::{
+    client::session::Session,
+    statement::{prepared::PreparedStatement, Consistency},
+};
 
 use crate::utils::{convert_checkpoint_id_to_i64, u64_to_i64_exact, u8_to_i8_exact};
 
 use super::{
     physical_descriptor, resolve_key_for_rollback, RegistryReadinessError, ScyllaPhysicalTableId, SealedTimestampedPut,
+    SealedTimestampedPutBatch,
 };
 
 const MERKLE_ZERO_HASH_BYTES: usize = 32;
@@ -220,6 +224,8 @@ pub enum TimestampPrototypePlanError {
     InvalidMerkleValueLength { expected: usize, actual: usize },
     ValueCodec(String),
     EmptyOrReversedRange { target: u64, old_head: u64 },
+    ExpectedRootPair { actual: usize },
+    InvalidCheckpointBytes { actual: usize },
 }
 
 impl fmt::Display for TimestampPrototypePlanError {
@@ -237,6 +243,10 @@ impl fmt::Display for TimestampPrototypePlanError {
             Self::ValueCodec(error) => write!(f, "value codec failed: {error}"),
             Self::EmptyOrReversedRange { target, old_head } => {
                 write!(f, "bounded delete requires target < old_head, got {target} >= {old_head}")
+            }
+            Self::ExpectedRootPair { actual } => write!(f, "checkpoint root mapping must contain exactly two physical PUTs, got {actual}"),
+            Self::InvalidCheckpointBytes { actual } => {
+                write!(f, "checkpoint mapping value must decode to exactly 8 canonical bytes, got {actual}")
             }
         }
     }
@@ -502,12 +512,25 @@ pub struct TimestampPrototypeAdapter {
 
 impl TimestampPrototypeAdapter {
     pub async fn prepare(session: &Session, keyspace: CqlKeyspaceName) -> anyhow::Result<Self> {
+        Self::prepare_with_consistency(session, keyspace, Consistency::LocalOne).await
+    }
+
+    /// Prepares the same production-shaped statements at an explicit
+    /// consistency level. The RF=3 harness uses ALL for fully replicated
+    /// writes and QUORUM while one replica is intentionally unavailable.
+    pub async fn prepare_with_consistency(
+        session: &Session,
+        keyspace: CqlKeyspaceName,
+        consistency: Consistency,
+    ) -> anyhow::Result<Self> {
         let queries = TimestampPrototypeQueries::new(&keyspace);
-        let checkpoint_leaf_put = session.prepare(queries.checkpoint_leaf_put().cql()).await?;
-        let checkpoint_leaf_delete = session.prepare(queries.checkpoint_leaf_delete().cql()).await?;
-        let global_user_merkle_put = session.prepare(queries.global_user_merkle_put().cql()).await?;
-        let global_user_merkle_point_delete = session.prepare(queries.global_user_merkle_point_delete().cql()).await?;
-        let global_user_merkle_range_delete = session.prepare(queries.global_user_merkle_range_delete().cql()).await?;
+        let checkpoint_leaf_put = prepare_idempotent(session, queries.checkpoint_leaf_put().cql(), consistency).await?;
+        let checkpoint_leaf_delete = prepare_idempotent(session, queries.checkpoint_leaf_delete().cql(), consistency).await?;
+        let global_user_merkle_put = prepare_idempotent(session, queries.global_user_merkle_put().cql(), consistency).await?;
+        let global_user_merkle_point_delete =
+            prepare_idempotent(session, queries.global_user_merkle_point_delete().cql(), consistency).await?;
+        let global_user_merkle_range_delete =
+            prepare_idempotent(session, queries.global_user_merkle_range_delete().cql(), consistency).await?;
         Ok(Self {
             queries,
             checkpoint_leaf_put,
@@ -563,6 +586,191 @@ impl TimestampPrototypeAdapter {
     ) -> anyhow::Result<()> {
         session.execute_unpaged(&self.global_user_merkle_range_delete, plan.driver_values()).await?;
         Ok(())
+    }
+}
+
+async fn prepare_idempotent(
+    session: &Session,
+    cql: &str,
+    consistency: Consistency,
+) -> anyhow::Result<PreparedStatement> {
+    let mut statement = session.prepare(cql).await?;
+    statement.set_consistency(consistency);
+    statement.set_is_idempotent(true);
+    Ok(statement)
+}
+
+/// Separate query catalog for the derived root <-> checkpoint mapping used by
+/// S16. It stays outside the original two-table G0-06 golden so the earlier
+/// representative contract remains stable.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CheckpointRootPrototypeQueries {
+    k1_put: String,
+    k2_put: String,
+    k1_delete: String,
+    k1_select: String,
+}
+
+impl CheckpointRootPrototypeQueries {
+    pub fn new(keyspace: &CqlKeyspaceName) -> Self {
+        let k1 = physical_descriptor(ScyllaPhysicalTableId::CheckpointRootToCheckpointIdK1).physical_name;
+        let k2 = physical_descriptor(ScyllaPhysicalTableId::CheckpointRootToCheckpointIdK2).physical_name;
+        Self {
+            k1_put: format!("INSERT INTO {}.{k1} (obj_id, value) VALUES (?, ?) USING TIMESTAMP ?", keyspace.as_str()),
+            k2_put: format!("INSERT INTO {}.{k2} (obj_id, value) VALUES (?, ?) USING TIMESTAMP ?", keyspace.as_str()),
+            k1_delete: format!("DELETE FROM {}.{k1} USING TIMESTAMP ? WHERE obj_id = ?", keyspace.as_str()),
+            k1_select: format!("SELECT value FROM {}.{k1} WHERE obj_id = ? LIMIT 1", keyspace.as_str()),
+        }
+    }
+
+    pub fn k1_put(&self) -> &str {
+        &self.k1_put
+    }
+
+    pub fn k2_put(&self) -> &str {
+        &self.k2_put
+    }
+
+    pub fn k1_delete(&self) -> &str {
+        &self.k1_delete
+    }
+
+    pub fn k1_select(&self) -> &str {
+        &self.k1_select
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CheckpointRootPutBinding {
+    obj_id: Vec<u8>,
+    stored_value: Vec<u8>,
+    write_timestamp_us: i64,
+}
+
+impl CheckpointRootPutBinding {
+    fn try_from_member(
+        member: &SealedTimestampedPut,
+        expected: ScyllaPhysicalTableId,
+    ) -> Result<Self, TimestampPrototypePlanError> {
+        let mutation = member.resolved().mutation();
+        require_physical(mutation.physical_table(), expected)?;
+        let obj_id = match mutation.key() {
+            TypedTableKey::CheckpointRootByHash(root) => root.as_bytes().to_vec(),
+            TypedTableKey::CheckpointRootByCheckpoint(checkpoint) => checkpoint.get().to_le_bytes().to_vec(),
+            _ => return Err(TimestampPrototypePlanError::WrongTypedKey),
+        };
+        let value = match mutation.operation() {
+            MutationOperation::Put(MutationValue::PsyCanonicalBytes(value)) => value,
+            _ => return Err(TimestampPrototypePlanError::ExpectedPsyCanonicalBytes),
+        };
+        Ok(Self {
+            obj_id,
+            stored_value: crate::compression::compress(value)
+                .map_err(|error| TimestampPrototypePlanError::ValueCodec(error.to_string()))?,
+            write_timestamp_us: member.timestamp().as_i64(),
+        })
+    }
+
+    fn driver_values(&self) -> (&Vec<u8>, &Vec<u8>, i64) {
+        (&self.obj_id, &self.stored_value, self.write_timestamp_us)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CheckpointRootOrphanDeletePlan {
+    root: CheckpointRootKey,
+    fence: DeleteFenceTimestampUs,
+}
+
+impl CheckpointRootOrphanDeletePlan {
+    pub fn try_new(root: CheckpointRootKey, fence: DeleteFenceTimestampUs) -> Result<Self, TimestampPrototypePlanError> {
+        let key = TypedTableKey::CheckpointRootByHash(root.clone());
+        let resolved = resolve_key_for_rollback(&key)?;
+        require_physical(resolved.physical_table(), ScyllaPhysicalTableId::CheckpointRootToCheckpointIdK1)?;
+        Ok(Self { root, fence })
+    }
+
+    fn driver_values(&self) -> (i64, &[u8]) {
+        (self.fence.as_i64(), self.root.as_bytes())
+    }
+}
+
+pub struct CheckpointRootPrototypeAdapter {
+    queries: CheckpointRootPrototypeQueries,
+    k1_put: PreparedStatement,
+    k2_put: PreparedStatement,
+    k1_delete: PreparedStatement,
+    k1_select: PreparedStatement,
+}
+
+impl CheckpointRootPrototypeAdapter {
+    pub async fn prepare_with_consistency(
+        session: &Session,
+        keyspace: CqlKeyspaceName,
+        consistency: Consistency,
+    ) -> anyhow::Result<Self> {
+        let queries = CheckpointRootPrototypeQueries::new(&keyspace);
+        Ok(Self {
+            k1_put: prepare_idempotent(session, queries.k1_put(), consistency).await?,
+            k2_put: prepare_idempotent(session, queries.k2_put(), consistency).await?,
+            k1_delete: prepare_idempotent(session, queries.k1_delete(), consistency).await?,
+            k1_select: prepare_idempotent(session, queries.k1_select(), consistency).await?,
+            queries,
+        })
+    }
+
+    pub const fn queries(&self) -> &CheckpointRootPrototypeQueries {
+        &self.queries
+    }
+
+    pub async fn put_mapping(
+        &self,
+        session: &Session,
+        sealed: &SealedTimestampedPutBatch,
+    ) -> anyhow::Result<()> {
+        if sealed.members().len() != 2 {
+            return Err(TimestampPrototypePlanError::ExpectedRootPair { actual: sealed.members().len() }.into());
+        }
+        let k1 = CheckpointRootPutBinding::try_from_member(
+            &sealed.members()[0],
+            ScyllaPhysicalTableId::CheckpointRootToCheckpointIdK1,
+        )?;
+        let k2 = CheckpointRootPutBinding::try_from_member(
+            &sealed.members()[1],
+            ScyllaPhysicalTableId::CheckpointRootToCheckpointIdK2,
+        )?;
+        session.execute_unpaged(&self.k1_put, k1.driver_values()).await?;
+        session.execute_unpaged(&self.k2_put, k2.driver_values()).await?;
+        Ok(())
+    }
+
+    pub async fn delete_orphan_root(
+        &self,
+        session: &Session,
+        plan: &CheckpointRootOrphanDeletePlan,
+    ) -> anyhow::Result<()> {
+        session.execute_unpaged(&self.k1_delete, plan.driver_values()).await?;
+        Ok(())
+    }
+
+    pub async fn get_checkpoint_for_root(
+        &self,
+        session: &Session,
+        root: &CheckpointRootKey,
+    ) -> anyhow::Result<Option<CheckpointId>> {
+        let resolved = resolve_key_for_rollback(&TypedTableKey::CheckpointRootByHash(root.clone()))
+            .map_err(TimestampPrototypePlanError::from)?;
+        require_physical(resolved.physical_table(), ScyllaPhysicalTableId::CheckpointRootToCheckpointIdK1)?;
+        let result = session.execute_unpaged(&self.k1_select, (root.as_bytes(),)).await?;
+        let Some((stored,)) = result.into_rows_result()?.maybe_first_row::<(Vec<u8>,)>()? else {
+            return Ok(None);
+        };
+        let bytes = crate::compression::decompress(&stored)?;
+        let raw: [u8; 8] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| TimestampPrototypePlanError::InvalidCheckpointBytes { actual: bytes.len() })?;
+        Ok(Some(CheckpointId::try_new(u64::from_le_bytes(raw))?))
     }
 }
 

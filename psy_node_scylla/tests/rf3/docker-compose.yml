@@ -1,0 +1,70 @@
+name: psy-g0-02-rf3
+
+x-scylla-common: &scylla-common
+  image: scylladb/scylla@sha256:17496f2dd6e72056d0b0d7e2bd18bd62638872d1d80a5dd9db96ba017fd426fc
+  command:
+    - --smp=1
+    - --memory=1G
+    - --overprovisioned=1
+    - --developer-mode=1
+    - --reactor-backend=io_uring
+    - --api-address=0.0.0.0
+    - --seeds=172.29.86.11
+  security_opt:
+    - seccomp=unconfined
+  restart: "no"
+  labels:
+    psy.test-purpose: g0-02-rf3-destructive
+  healthcheck:
+    test: ["CMD-SHELL", "cqlsh $$(hostname -i) 9042 -e 'SELECT host_id FROM system.local' >/dev/null 2>&1"]
+    interval: 5s
+    timeout: 4s
+    retries: 60
+    start_period: 20s
+
+services:
+  scylla1:
+    <<: *scylla-common
+    hostname: scylla1
+    networks:
+      rf3:
+        ipv4_address: 172.29.86.11
+    volumes:
+      - scylla1-data:/var/lib/scylla
+
+  scylla2:
+    <<: *scylla-common
+    hostname: scylla2
+    depends_on:
+      scylla1:
+        condition: service_healthy
+    networks:
+      rf3:
+        ipv4_address: 172.29.86.12
+    volumes:
+      - scylla2-data:/var/lib/scylla
+
+  scylla3:
+    <<: *scylla-common
+    hostname: scylla3
+    depends_on:
+      scylla1:
+        condition: service_healthy
+    networks:
+      rf3:
+        ipv4_address: 172.29.86.13
+    volumes:
+      - scylla3-data:/var/lib/scylla
+
+networks:
+  rf3:
+    name: psy-g0-02-rf3
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.29.86.0/24
+
+volumes:
+  scylla1-data:
+  scylla2-data:
+  scylla3-data:

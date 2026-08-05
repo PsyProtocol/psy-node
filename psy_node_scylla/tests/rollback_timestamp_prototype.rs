@@ -373,6 +373,7 @@ fn prototype_does_not_claim_production_coverage_or_change_production_callsites()
         realm_sync,
     ] {
         assert!(!production_source.contains("TimestampPrototypeAdapter"));
+        assert!(!production_source.contains("CheckpointRootPrototypeAdapter"));
     }
     assert!(!kiv.contains("USING TIMESTAMP"));
     assert!(!kiv.contains("DELETE FROM"));
@@ -390,4 +391,36 @@ fn unrelated_pair_intent_cannot_be_sealed_as_representative_put() {
         seal_commit_put(pair, timestamp(1)),
         Err(TimestampedMutationError::ExpectedOnePhysicalMutation { actual: 2 })
     ));
+}
+
+#[test]
+fn checkpoint_root_pair_has_one_timestamp_and_two_ordered_physical_mutations() {
+    let intent = LogicalMutation::CheckpointRootMapping {
+        root: CheckpointRootKey::new(vec![0xa1; 32]),
+        checkpoint: checkpoint(7),
+    };
+    let sealed = seal_commit_put_batch(intent.clone(), timestamp(1_000)).unwrap();
+    assert_eq!(sealed.members().len(), 2);
+    assert_eq!(
+        sealed.members()[0].resolved().mutation().physical_table(),
+        ScyllaPhysicalTableId::CheckpointRootToCheckpointIdK1
+    );
+    assert_eq!(
+        sealed.members()[1].resolved().mutation().physical_table(),
+        ScyllaPhysicalTableId::CheckpointRootToCheckpointIdK2
+    );
+    assert!(sealed.members().iter().all(|member| member.timestamp().as_i64() == 1_000));
+    sealed
+        .ensure_exact_retry(intent, timestamp(1_000), TimestampedWriteKind::AuthorityCommit)
+        .unwrap();
+
+    let queries = CheckpointRootPrototypeQueries::new(&CqlKeyspaceName::try_new("psy_g006").unwrap());
+    assert!(queries.k1_put().contains("checkpoint_root_to_checkpoint_id_table_k1"));
+    assert!(queries.k2_put().contains("checkpoint_root_to_checkpoint_id_table_k2"));
+    assert!(queries.k1_put().contains("USING TIMESTAMP ?"));
+    assert!(queries.k2_put().contains("USING TIMESTAMP ?"));
+    assert_eq!(
+        queries.k1_delete(),
+        "DELETE FROM psy_g006.checkpoint_root_to_checkpoint_id_table_k1 USING TIMESTAMP ? WHERE obj_id = ?"
+    );
 }

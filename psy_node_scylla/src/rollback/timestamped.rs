@@ -99,6 +99,51 @@ pub struct SealedTimestampedPut {
     canonical_bytes: Vec<u8>,
 }
 
+/// An immutable timestamped logical intent which expands to more than one
+/// physical PUT (currently the two directions of a bidirectional mapping).
+/// Every member carries the same timestamp and write kind; callers cannot
+/// partially reseal a retry with a different timestamp.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SealedTimestampedPutBatch {
+    members: Vec<SealedTimestampedPut>,
+    intent_digest: TimestampedIntentDigest,
+}
+
+impl SealedTimestampedPutBatch {
+    pub fn members(&self) -> &[SealedTimestampedPut] {
+        &self.members
+    }
+
+    pub const fn intent_digest(&self) -> TimestampedIntentDigest {
+        self.intent_digest
+    }
+
+    pub fn ensure_exact_retry(
+        &self,
+        intent: LogicalMutation,
+        timestamp: CommitWriteTimestampUs,
+        write_kind: TimestampedWriteKind,
+    ) -> Result<(), TimestampedMutationError> {
+        if self.members.first().is_some_and(|member| member.write_kind != write_kind) {
+            return Err(TimestampedMutationError::RetryWriteKindChanged {
+                sealed: self.members[0].write_kind,
+                attempted: write_kind,
+            });
+        }
+        if self.members.first().is_some_and(|member| member.timestamp != timestamp) {
+            return Err(TimestampedMutationError::RetryTimestampChanged {
+                sealed: self.members[0].timestamp.as_i64(),
+                attempted: timestamp.as_i64(),
+            });
+        }
+        let candidate = seal_batch_inner(intent, timestamp, write_kind)?;
+        if candidate.intent_digest != self.intent_digest {
+            return Err(TimestampedMutationError::RetryMutationChanged);
+        }
+        Ok(())
+    }
+}
+
 impl SealedTimestampedPut {
     pub const fn resolved(&self) -> &ResolvedScyllaMutation {
         &self.resolved
@@ -167,6 +212,14 @@ fn seal_inner(
         return Err(TimestampedMutationError::ExpectedOnePhysicalMutation { actual: resolved.len() });
     }
     let resolved = resolved.pop().expect("length was checked");
+    seal_resolved(resolved, timestamp, write_kind)
+}
+
+fn seal_resolved(
+    resolved: ResolvedScyllaMutation,
+    timestamp: CommitWriteTimestampUs,
+    write_kind: TimestampedWriteKind,
+) -> Result<SealedTimestampedPut, TimestampedMutationError> {
     match resolved.mutation().operation() {
         MutationOperation::Put(MutationValue::Digest { .. }) => {
             return Err(TimestampedMutationError::CommitmentOnlyPayload);
@@ -204,6 +257,31 @@ fn seal_inner(
     })
 }
 
+fn seal_batch_inner(
+    intent: LogicalMutation,
+    timestamp: CommitWriteTimestampUs,
+    write_kind: TimestampedWriteKind,
+) -> Result<SealedTimestampedPutBatch, TimestampedMutationError> {
+    let resolved = expand_logical_mutation(intent)?;
+    let members = resolved
+        .into_iter()
+        .map(|mutation| seal_resolved(mutation, timestamp, write_kind))
+        .collect::<Result<Vec<_>, _>>()?;
+    let kind_bytes = [write_kind as u8];
+    let timestamp_bytes = timestamp.as_i64().to_be_bytes();
+    let member_digests = members
+        .iter()
+        .flat_map(|member| member.mutation_digest.as_bytes().iter().copied())
+        .collect::<Vec<_>>();
+    let intent_digest = TimestampedIntentDigest(sha256(&[
+        b"psy/scylla/timestamped-put-batch/v1",
+        &kind_bytes,
+        &timestamp_bytes,
+        &member_digests,
+    ]));
+    Ok(SealedTimestampedPutBatch { members, intent_digest })
+}
+
 /// Seals a normal authority write. The caller must provide an already
 /// allocated timestamp; this function never reads a clock.
 ///
@@ -228,4 +306,25 @@ pub fn seal_new_branch_put(
     timestamp: NewBranchWriteTimestampUs,
 ) -> Result<SealedTimestampedPut, TimestampedMutationError> {
     seal_inner(intent, timestamp.as_commit_timestamp(), TimestampedWriteKind::NewBranchAfterFence)
+}
+
+/// Seals a logical bidirectional mapping as an ordered set of physical PUTs.
+/// This is an execution identity contract, not a claim of cross-table CQL
+/// atomicity.
+pub fn seal_commit_put_batch(
+    intent: LogicalMutation,
+    timestamp: CommitWriteTimestampUs,
+) -> Result<SealedTimestampedPutBatch, TimestampedMutationError> {
+    seal_batch_inner(intent, timestamp, TimestampedWriteKind::AuthorityCommit)
+}
+
+pub fn seal_new_branch_put_batch(
+    intent: LogicalMutation,
+    timestamp: NewBranchWriteTimestampUs,
+) -> Result<SealedTimestampedPutBatch, TimestampedMutationError> {
+    seal_batch_inner(
+        intent,
+        timestamp.as_commit_timestamp(),
+        TimestampedWriteKind::NewBranchAfterFence,
+    )
 }
