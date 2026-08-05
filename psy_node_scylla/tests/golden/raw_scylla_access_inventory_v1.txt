@@ -15,9 +15,9 @@ psy_node_scylla/examples/tst6.rs|Example|2|2|0|0|1|1|2|3
 psy_node_scylla/examples/tst6_nobucket.rs|Example|2|2|0|0|1|1|2|3
 psy_node_scylla/examples/tst7.rs|Example|2|2|0|0|1|1|2|3
 psy_node_scylla/examples/tst7_nobucket.rs|Example|2|2|0|0|1|1|2|3
-psy_node_scylla/src/core.rs|DriverCore|2|2|7|0|0|0|2|2
+psy_node_scylla/src/core.rs|DriverCore|2|2|9|0|0|0|2|2
 psy_node_scylla/src/core_db.rs|DriverCore|0|0|97|0|0|0|0|0
-psy_node_scylla/src/rollback/canonical_head_prototype.rs|RollbackPrototypeAdapter|7|0|3|6|2|3|1|6
+psy_node_scylla/src/rollback/canonical_head_prototype.rs|CanonicalHeadAuthority|7|0|3|6|2|3|1|6
 psy_node_scylla/src/rollback/confinement.rs|RollbackPrototypeAdapter|4|0|2|0|0|0|1|0
 psy_node_scylla/src/rollback/namespace_prototype.rs|RollbackPrototypeAdapter|27|0|0|13|2|10|4|16
 psy_node_scylla/src/rollback/raw_access.rs|GuardImplementation|2|1|1|1|3|8|6|9

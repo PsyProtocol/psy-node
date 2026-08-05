@@ -1,7 +1,7 @@
 
 use async_trait::async_trait;
 use crossbeam_skiplist::SkipMap;
-use dashmap::DashMap;
+use dashmap::{mapref::entry::Entry, DashMap};
 use futures::future;
 use parth_core::{
     crypto::hash::{
@@ -30,10 +30,17 @@ use parth_core::{
         },
         serializable::QPDPair,
     },
-    protocol::core_types::{QDBHashBase, QHashBase},
+    protocol::core_types::{Q256BitHash, QDBHashBase, QHashBase},
 };
-use psy_node_core::store::traits::core_db::{
+use psy_node_core::store::{
+    canonical_head::{
+        CanonicalHeadBootstrap, CanonicalHeadReadState,
+        CanonicalHeadWriteOutcome, CoordinatorCanonicalHeadStore, NetworkId,
+        SealedCanonicalHeadCas, StoredCanonicalHead,
+    },
+    traits::core_db::{
     CoreDatabaseBidirectionalMappingReader, CoreDatabaseBidirectionalMappingWriter, CoreDatabaseBidirectionalU64U128MappingReader, CoreDatabaseBidirectionalU64U128MappingWriter, CoreDatabaseDoubleIdCheckpointedReader, CoreDatabaseDoubleIdCheckpointedWriter, CoreDatabaseDoubleIdMerkleReader, CoreDatabaseDoubleIdMerkleWriter, CoreDatabaseHashToManyIdsReader, CoreDatabaseHashToManyIdsWriter, CoreDatabaseIMTKeyIndexReader, CoreDatabaseIMTKeyIndexWriter, CoreDatabaseIMTNextAppendIndexReader, CoreDatabaseIMTNextAppendIndexWriter, CoreDatabaseIMTLeafReader, CoreDatabaseIMTLeafWriter, CoreDatabaseKivReader, CoreDatabaseKivWriter, CoreDatabaseSingleIdCheckpointedReader, CoreDatabaseSingleIdCheckpointedWriter, CoreDatabaseSingleIdMerkleReader, CoreDatabaseSingleIdMerkleWriter, CoreDatabaseTagTreeReader, CoreDatabaseTagTreeWriter, CoreDatabaseU64CounterReader, CoreDatabaseU64CounterStore, CoreDatabaseU64CounterWriter, CoreDatabaseU64Reader, CoreDatabaseU64Store, CoreDatabaseU64Writer, CoreDatabaseZeroIdMerkleDumpReader, CoreDatabaseZeroIdMerkleReader, CoreDatabaseZeroIdMerkleWriter, MerkleTreeDumpStrategy
+    },
 };
 use psy_serialize::{PsyCanonicalDatabaseSerializeBaseSingle, PsySerializeCanonicalAsyncSafe};
 use std::{
@@ -56,6 +63,9 @@ pub struct InMemoryCoreStore<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash> + S
     tables: Arc<DashMap<String, Arc<SkipMap<Vec<u8>, Vec<u8>>>>>,
     /// Stores U64-keyed tables for atomic operations.
     u64_tables: Arc<DashMap<String, Arc<DashMap<u64, AtomicU64>>>>,
+    /// Coordinator control-plane authority, separate from the 32 logical state
+    /// tables. DashMap entry guards provide per-network atomic CAS semantics.
+    canonical_heads: Arc<DashMap<NetworkId, StoredCanonicalHead<Hash>>>,
     /// Keyspace name for table naming (similar to ScyllaDB keyspace)
     pub keyspace: String,
     /// No-tablet keyspace name (for compatibility with ScyllaDB interface)
@@ -80,6 +90,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash> + Send + Sync> InMemoryCore
         Self {
             tables: Arc::new(DashMap::new()),
             u64_tables: Arc::new(DashMap::new()),
+            canonical_heads: Arc::new(DashMap::new()),
             keyspace: String::new(),
             no_tablet_keyspace: String::new(),
             realm_id: 0,
@@ -95,6 +106,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash> + Send + Sync> InMemoryCore
         Self {
             tables: Arc::new(DashMap::new()),
             u64_tables: Arc::new(DashMap::new()),
+            canonical_heads: Arc::new(DashMap::new()),
             keyspace,
             no_tablet_keyspace,
             realm_id,
@@ -187,6 +199,58 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash> + Send + Sync> InMemoryCore
         Ok(T::from(identifier))
     }
 
+}
+
+#[async_trait]
+impl<Hash, Hasher> CoordinatorCanonicalHeadStore<Hash>
+    for InMemoryCoreStore<Hash, Hasher>
+where
+    Hash: QHashBase + Q256BitHash + Copy,
+    Hasher: MerkleZeroHasher<Hash> + Send + Sync,
+{
+    async fn read_canonical_head(
+        &self,
+        network: NetworkId,
+    ) -> anyhow::Result<CanonicalHeadReadState<Hash>> {
+        Ok(match self.canonical_heads.get(&network) {
+            Some(current) => CanonicalHeadReadState::Current(*current),
+            None => CanonicalHeadReadState::Uninitialized,
+        })
+    }
+
+    async fn bootstrap_canonical_head(
+        &self,
+        bootstrap: &CanonicalHeadBootstrap<Hash>,
+    ) -> anyhow::Result<CanonicalHeadWriteOutcome<Hash>> {
+        let network = bootstrap.candidate().canonical_ref().network_id();
+        Ok(match self.canonical_heads.entry(network) {
+            Entry::Vacant(entry) => {
+                entry.insert(*bootstrap.candidate());
+                CanonicalHeadWriteOutcome::Applied(*bootstrap.candidate())
+            }
+            Entry::Occupied(entry) => bootstrap
+                .classify_lwt_observation(false, *entry.get())?,
+        })
+    }
+
+    async fn compare_and_set_canonical_head(
+        &self,
+        sealed: &SealedCanonicalHeadCas<Hash>,
+    ) -> anyhow::Result<CanonicalHeadWriteOutcome<Hash>> {
+        let network = sealed.expected().canonical_ref().network_id();
+        Ok(match self.canonical_heads.entry(network) {
+            Entry::Vacant(_) => anyhow::bail!(
+                "canonical-head CAS cannot run before explicit bootstrap"
+            ),
+            Entry::Occupied(mut entry) if entry.get() == sealed.expected() => {
+                entry.insert(*sealed.candidate());
+                sealed.classify_lwt_observation(true, *sealed.candidate())?
+            }
+            Entry::Occupied(entry) => {
+                sealed.classify_lwt_observation(false, *entry.get())?
+            }
+        })
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct InMemoryTableIdentifier {

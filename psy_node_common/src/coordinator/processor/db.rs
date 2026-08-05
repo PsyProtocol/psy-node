@@ -13,7 +13,10 @@ use parth_core::{
 use crate::coordinator::queue_key::{CoordinatorSubmitRealmGUTAUpdateQueueKey, CoordinatorRegisterUserPublicKeyQueueKey, CoordinatorDeployContractQueueKey, CoordinatorProvingWorkQueueKey};
 
 use psy_core::{
-    constants::stale_checkpoint::STALE_CHECKPOINT_AGE_REALM_TO_COORDINATOR_PROOF,
+    constants::{
+        chain_id::PsyChainNetworkType,
+        stale_checkpoint::STALE_CHECKPOINT_AGE_REALM_TO_COORDINATOR_PROOF,
+    },
     job::job_id::{ProvingJobCircuitType, QProvingJobDataID},
 };
 use psy_data::{
@@ -24,7 +27,8 @@ use psy_data::{
     prepared_block::coordinator::PsyPreparedCoordinatorBlockStateUpdates,
     protocol::{
         canonical_chain::{
-            CheckpointHash, checkpoint_hash_from_previous,
+            CanonicalChainRef, CheckpointHash, CheckpointId, CheckpointRef,
+            checkpoint_hash_from_previous,
             checkpoint_hash_from_saved_proof_bytes, genesis_checkpoint_hash,
         },
         checkpoint_transition_hash::CheckpointStateHashTransition,
@@ -41,7 +45,16 @@ use psy_node_core::{
     },
     psy_temp_db::StandardProcessorTempDBStoreBase,
     queue::{ephemeral::QStandardEphemeralQueueSubscriber, worker_queue::QStandardWorkerQueuePublisher},
-    store::traits::proof_store::QParthProofStore,
+    store::{
+        canonical_head::{
+            plan_canonical_head_startup, CanonicalHeadBootstrap,
+            CanonicalHeadBootstrapProfile,
+            CanonicalHeadStartupPlan, CanonicalHeadTransition,
+            CanonicalHeadWriteOutcome, CoordinatorCanonicalHeadStore, NetworkId,
+            StoredCanonicalHead,
+        },
+        traits::proof_store::QParthProofStore,
+    },
 };
 
 use crate::{
@@ -139,6 +152,7 @@ pub struct PsyCoordinatorDatabaseProcessor<
     pub tag_tree_rewards_store: Arc<STagTreeRewards>,
     pub temp_db: Arc<TempDatabase>,
     pub proof_store: Arc<ProofStore>,
+    canonical_head_store: Arc<dyn CoordinatorCanonicalHeadStore<N::QHash>>,
 
     //queues
     pub guta_update_queue: Arc<GUTAUpdateQueue>,
@@ -165,8 +179,11 @@ pub struct PsyCoordinatorDatabaseProcessor<
     // state
     pub last_committed: CoordinatorProcessorLastCommittedState<N::F, N::QHash>,
     pub ids: CoordinatorProcessorIdState,
+    canonical_head: Option<StoredCanonicalHead<N::QHash>>,
+    pending_genesis_head: Option<CanonicalHeadBootstrap<N::QHash>>,
 
     // config
+    network_id: NetworkId,
     pub circuit_fingerprint_config: PsyNodeCircuitFingerprintConfig<N::QHash>,
     pub genesis_checkpoint_state_transition_hash: N::QHash,
     pub genesis_verifiable_state_transition: PsyVerifiableCheckpointTransition<N::F, N::QHash>,
@@ -277,6 +294,9 @@ impl<
     }
     pub async fn new_init(
         db: Arc<S>,
+        canonical_head_store: Arc<dyn CoordinatorCanonicalHeadStore<N::QHash>>,
+        network: PsyChainNetworkType,
+        canonical_head_bootstrap_profile: Option<CanonicalHeadBootstrapProfile>,
         tag_tree_rewards_store: Arc<STagTreeRewards>,
         temp_db: Arc<TempDatabase>,
         proof_store: Arc<ProofStore>,
@@ -427,12 +447,13 @@ impl<
             last_chain_hash,
         };
         let status = ProcessorStatus::new();
-        Ok(Self {
+        let mut processor = Self {
             db,
             status: status.clone(),
             tag_tree_rewards_store,
             temp_db,
             proof_store,
+            canonical_head_store,
             guta_update_queue,
             register_user_queue,
             deploy_contract_queue,
@@ -476,10 +497,143 @@ impl<
                 _phantom_queue_item: std::marker::PhantomData,
             }, status.clone()),
             needs_revert: false,
+            network_id: NetworkId::from(network),
             genesis_checkpoint_state_transition_hash,
             last_committed,
             ids,
-        })
+            canonical_head: None,
+            pending_genesis_head: None,
+        };
+        processor
+            .reconcile_canonical_head_on_startup(canonical_head_bootstrap_profile)
+            .await?;
+        Ok(processor)
+    }
+
+    fn materialized_checkpoint_ref(&self) -> CheckpointRef<N::QHash> {
+        CheckpointRef::new(
+            CheckpointId::new(self.ids.checkpoint_id),
+            CheckpointHash::from_last_chain_hash(self.last_committed.last_chain_hash),
+        )
+    }
+
+    fn require_published_outcome(
+        operation: &str,
+        outcome: CanonicalHeadWriteOutcome<N::QHash>,
+    ) -> anyhow::Result<StoredCanonicalHead<N::QHash>> {
+        match outcome {
+            CanonicalHeadWriteOutcome::Applied(current)
+            | CanonicalHeadWriteOutcome::Idempotent(current) => Ok(current),
+            CanonicalHeadWriteOutcome::Conflict { current } => anyhow::bail!(
+                "canonical-head {operation} conflict: durable revision={}, epoch={}, checkpoint={}",
+                current.revision().get(),
+                current.canonical_ref().chain_epoch().get(),
+                current.canonical_ref().checkpoint().checkpoint_id().get(),
+            ),
+        }
+    }
+
+    async fn reconcile_canonical_head_on_startup(
+        &mut self,
+        bootstrap_profile: Option<CanonicalHeadBootstrapProfile>,
+    ) -> anyhow::Result<()> {
+        let database_check_state = self.get_database_check_state().await?;
+        let durable = self
+            .canonical_head_store
+            .read_canonical_head(self.network_id)
+            .await?;
+        let plan = plan_canonical_head_startup(
+            self.network_id,
+            bootstrap_profile,
+            durable,
+            self.materialized_checkpoint_ref(),
+            database_check_state == DatabaseCheckState::NeedsGenesis,
+        )?;
+        match plan {
+            CanonicalHeadStartupPlan::AwaitGenesis(bootstrap) => {
+                self.pending_genesis_head = Some(bootstrap);
+                self.canonical_head = None;
+            }
+            CanonicalHeadStartupPlan::Bootstrap(bootstrap) => {
+                let outcome = self
+                    .canonical_head_store
+                    .bootstrap_canonical_head(&bootstrap)
+                    .await?;
+                self.canonical_head = Some(Self::require_published_outcome(
+                    "startup bootstrap",
+                    outcome,
+                )?);
+            }
+            CanonicalHeadStartupPlan::Current(current) => {
+                self.canonical_head = Some(current);
+            }
+            CanonicalHeadStartupPlan::PublishMaterialized(sealed) => {
+                let outcome = self
+                    .canonical_head_store
+                    .compare_and_set_canonical_head(&sealed)
+                    .await?;
+                self.canonical_head = Some(Self::require_published_outcome(
+                    "startup reconcile",
+                    outcome,
+                )?);
+            }
+        }
+        Ok(())
+    }
+
+    async fn publish_canonical_head(
+        &mut self,
+        checkpoint_id: u64,
+        checkpoint_hash: N::QHash,
+    ) -> anyhow::Result<()> {
+        let checkpoint = CheckpointRef::new(
+            CheckpointId::new(checkpoint_id),
+            CheckpointHash::from_last_chain_hash(checkpoint_hash),
+        );
+        let published = if checkpoint_id == 0 {
+            let bootstrap = self.pending_genesis_head.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "genesis canonical-head publish requires an explicit pending GENESIS_NATIVE bootstrap"
+                )
+            })?;
+            if bootstrap.candidate().canonical_ref().checkpoint() != &checkpoint
+                || bootstrap.candidate().canonical_ref().network_id() != self.network_id
+            {
+                anyhow::bail!(
+                    "materialized genesis does not match the sealed canonical-head bootstrap"
+                );
+            }
+            let outcome = self
+                .canonical_head_store
+                .bootstrap_canonical_head(bootstrap)
+                .await?;
+            Self::require_published_outcome("genesis publish", outcome)?
+        } else {
+            let expected = self.canonical_head.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "normal checkpoint {} cannot publish before canonical-head bootstrap",
+                    checkpoint_id
+                )
+            })?;
+            let proposed = CanonicalChainRef::new(
+                self.network_id,
+                expected.canonical_ref().chain_epoch(),
+                checkpoint,
+            );
+            let sealed = CanonicalHeadTransition::normal_checkpoint_advance(
+                expected,
+                proposed,
+            )?
+            .seal();
+            let outcome = self
+                .canonical_head_store
+                .compare_and_set_canonical_head(&sealed)
+                .await?;
+            Self::require_published_outcome("normal final publish", outcome)?
+        };
+        self.canonical_head = Some(published);
+        self.pending_genesis_head = None;
+        Ok(())
     }
 
     pub async fn ensure_genesis_applied(
@@ -633,6 +787,11 @@ checkpoint_backup_copy_status={}
     }
 
     pub async fn reset_to_checkpoint(&mut self, checkpoint_id: u64) -> anyhow::Result<()> {
+        if self.canonical_head.is_some() {
+            anyhow::bail!(
+                "legacy reset_to_checkpoint is disabled once canonical-head authority is active; use the future C-01 rollback control/executor"
+            );
+        }
         let latest_checkpoint_id = self.db.get_latest_checkpoint_id().await?;
         if checkpoint_id > latest_checkpoint_id {
             anyhow::bail!(
@@ -1133,6 +1292,19 @@ checkpoint_backup_copy_status={}
             .append_checkpoint_leaf_hash(checkpoint_id, checkpoint_leaf_hash)
             .await?;
         tracing::info!("Backed up checkpoint tree root for checkpoint ID: {}", checkpoint_id);
+
+        // This is the final durable publish marker. All materialized state,
+        // compatibility singletons, and the checkpoint-tree backup must be
+        // durable before the canonical identity becomes externally usable.
+        self.publish_canonical_head(
+            checkpoint_id,
+            checkpoint_proof_public_inputs_hash,
+        )
+        .await?;
+        tracing::info!(
+            "Published durable canonical head for checkpoint ID: {}",
+            checkpoint_id
+        );
 
         if checkpoint_id != 0 {
 

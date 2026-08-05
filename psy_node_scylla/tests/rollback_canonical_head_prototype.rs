@@ -15,7 +15,7 @@ use psy_node_scylla::rollback::{
     CanonicalHeadBindValue, CanonicalHeadBootstrapBinding,
     CanonicalHeadCasBinding, CanonicalHeadLwtContract,
     CanonicalHeadNoTabletKeyspace, CanonicalHeadQueries,
-    CanonicalHeadPrototypeError, C01A_CANONICAL_HEAD_TABLE,
+    CanonicalHeadPrototypeError, COORDINATOR_CANONICAL_HEAD_TABLE,
 };
 use scylla::statement::{Consistency, SerialConsistency};
 
@@ -250,7 +250,7 @@ fn schema_query_and_binding_golden_are_single_source_and_stable() {
     assert!(queries
         .create_table()
         .cql()
-        .contains(C01A_CANONICAL_HEAD_TABLE));
+        .contains(COORDINATOR_CANONICAL_HEAD_TABLE));
 }
 
 #[test]
@@ -544,14 +544,83 @@ fn arbitrary_rewind_cannot_be_sealed_by_the_public_builders() {
 }
 
 #[test]
-fn prototype_is_not_wired_into_production_or_registered_as_a_table() {
-    let production_sources = [
-        include_str!("../src/psy_setup.rs"),
-        include_str!("../../psy_node_common/src/coordinator/processor/db.rs"),
-        include_str!("../../psy_node_common/src/coordinator/edge/handler.rs"),
-    ];
-    for source in production_sources {
-        assert!(!source.contains("CanonicalHeadPrototypeAdapter"));
-        assert!(!source.contains(C01A_CANONICAL_HEAD_TABLE));
-    }
+fn qualified_adapter_is_wired_only_into_coordinator_production() {
+    let setup = include_str!("../src/psy_setup.rs");
+    let processor = include_str!("../../psy_node_common/src/coordinator/processor/db.rs");
+    let jtmb_startup = include_str!(
+        "../../psy_cli/psy_node_cli/src/node/startup_processor_jtmb_scylla.rs"
+    );
+    let plonky2_startup = include_str!(
+        "../../psy_cli/psy_node_cli/src/node/startup_plonky2_scylla.rs"
+    );
+    let coordinator_edge = include_str!("../../psy_node_common/src/coordinator/edge/handler.rs");
+    let realm_processor_db = include_str!(
+        "../../psy_node_common/src/realm/processor/db/core.rs"
+    );
+    let realm_processor_create = include_str!(
+        "../../psy_node_common/src/realm/processor/create.rs"
+    );
+
+    assert!(setup.contains("initialize_coordinator_canonical_head"));
+    assert!(processor.contains("publish_canonical_head"));
+    assert!(processor.contains("reconcile_canonical_head_on_startup"));
+    assert!(jtmb_startup.contains(
+        "setup_coordinator_psy_scylla_database_store_from_connection_string"
+    ));
+    assert!(plonky2_startup.contains(
+        "setup_coordinator_psy_scylla_database_store_from_connection_string"
+    ));
+    assert!(!coordinator_edge.contains("CoordinatorCanonicalHeadStore"));
+    assert!(!realm_processor_db.contains("CoordinatorCanonicalHeadStore"));
+    assert!(!realm_processor_create.contains("CoordinatorCanonicalHeadStore"));
+}
+
+#[test]
+fn coordinator_commit_publishes_head_after_durable_state_and_before_memory() {
+    let processor = include_str!("../../psy_node_common/src/coordinator/processor/db.rs");
+    let commit = processor
+        .split_once("pub async fn commit_state")
+        .expect("Coordinator commit_state must exist")
+        .1;
+
+    let proof = commit
+        .find("set_verifiable_checkpoint_state_transition_and_zkp")
+        .expect("proof persistence must precede final publish");
+    let latest = commit
+        .find("set_latest_checkpoint_id(checkpoint_id)")
+        .expect("compatibility latest singleton must be persisted");
+    let backup = commit
+        .find("append_checkpoint_leaf_hash(checkpoint_id, checkpoint_leaf_hash)")
+        .expect("checkpoint-tree backup must be persisted");
+    let publish = commit
+        .find("self.publish_canonical_head(")
+        .expect("canonical head must be the final durable publish marker");
+    let memory = commit
+        .find("self.ids.checkpoint_id = checkpoint_id")
+        .expect("in-memory checkpoint must be updated after publish");
+    let shared = commit
+        .find("self.shared_status.update_status(")
+        .expect("shared status must be updated after publish");
+
+    assert!(proof < latest);
+    assert!(latest < backup);
+    assert!(backup < publish);
+    assert!(publish < memory);
+    assert!(memory < shared);
+}
+
+#[test]
+fn legacy_reset_is_fail_closed_once_canonical_authority_exists() {
+    let processor = include_str!("../../psy_node_common/src/coordinator/processor/db.rs");
+    let reset = processor
+        .split_once("pub async fn reset_to_checkpoint")
+        .expect("legacy reset_to_checkpoint must remain explicit")
+        .1;
+    let guard = reset
+        .find("if self.canonical_head.is_some()")
+        .expect("canonical authority must guard legacy reset");
+    let first_reset_read = reset
+        .find("let latest_checkpoint_id = self.db.get_latest_checkpoint_id()")
+        .expect("legacy reset body must still be visible after the guard");
+    assert!(guard < first_reset_read);
 }

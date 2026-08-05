@@ -1,6 +1,7 @@
 coordinator_id: 0
 coordinator_sub_id: 0
 network: local-devnet
+canonical_head_bootstrap_profile: GENESIS_NATIVE
 verbose: true
 
 db_namespace: coordinator

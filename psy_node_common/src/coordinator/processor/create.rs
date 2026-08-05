@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
 use parth_core::{node::realm_identifier::QRealmIdentifier, protocol::core_types::QNetworkTypesConfig};
-use psy_core::job::job_id::QProvingJobDataID;
+use psy_core::{
+    constants::chain_id::PsyChainNetworkType,
+    job::job_id::QProvingJobDataID,
+};
 use psy_data::{
     config::network_config::PsyNodeCircuitFingerprintConfig, genesis::genesis_block_setup::PsyGenesisBlockSetupData,
 };
@@ -15,6 +18,9 @@ use psy_node_core::{
         worker_queue::{QStandardWorkerQueuePublisher, QStandardWorkerQueueSubscriber},
     },
     store::traits::proof_store::QParthProofStore,
+    store::canonical_head::{
+        CanonicalHeadBootstrapProfile, CoordinatorCanonicalHeadStore,
+    },
 };
 
 use crate::coordinator::processor::{PsyCoordinatorProcessor, db::PsyCoordinatorDatabaseProcessor, runner::run_coordinator_processor};
@@ -32,6 +38,9 @@ pub async fn create_coordinator_processor<
     FileSystem: TokioLikeFileSystem + Send + Sync + 'static,
 >(
     genesis_data: &PsyGenesisBlockSetupData<N::F, N::QHash>,
+    network: PsyChainNetworkType,
+    canonical_head_bootstrap_profile: Option<CanonicalHeadBootstrapProfile>,
+    canonical_head_store: Arc<dyn CoordinatorCanonicalHeadStore<N::QHash>>,
     file_system: Arc<FileSystem>,
     deploy_contract_gatherer_backup_directory: String,
     register_user_gatherer_backup_directory: String,
@@ -99,6 +108,9 @@ where
 
     let db = PsyCoordinatorDatabaseProcessor::<N, _, _, _, _, _, _, _, _, FileSystem>::new_init(
         db,
+        canonical_head_store,
+        network,
+        canonical_head_bootstrap_profile,
         tag_tree_rewards_store,
         temp_db,
         proof_store,
@@ -186,6 +198,9 @@ pub async fn create_coordinator_processor_and_run<
     FileSystem: TokioLikeFileSystem + Send + Sync + 'static,
 >(
     genesis_data: &PsyGenesisBlockSetupData<N::F, N::QHash>,
+    network: PsyChainNetworkType,
+    canonical_head_bootstrap_profile: Option<CanonicalHeadBootstrapProfile>,
+    canonical_head_store: Arc<dyn CoordinatorCanonicalHeadStore<N::QHash>>,
     circuit_fingerprint_config: PsyNodeCircuitFingerprintConfig<N::QHash>,
     file_system: Arc<FileSystem>,
     deploy_contract_gatherer_backup_directory: String,
@@ -208,6 +223,9 @@ where
     tracing::info!("[COORD_CREATE] create_and_run start");
     let (processor, guta_gatherer_join_handle, register_users_gatherer_join_handle, deploy_contracts_gatherer_join_handle) = create_coordinator_processor::<N, S, STagTreeRewards, GUTAUpdateQueue, RegisterUserQueue, DeployContractQueue, ProofWorkQueue, TempDatabase, ProofStore, FileSystem>(
         genesis_data,
+        network,
+        canonical_head_bootstrap_profile,
+        canonical_head_store,
         file_system,
         deploy_contract_gatherer_backup_directory,
         register_user_gatherer_backup_directory,

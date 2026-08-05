@@ -307,3 +307,25 @@ pub async fn setup_psy_scylla_database_store_from_connection_string<N: QNetworkD
         prepare_psy_scylla_database_store::<N>(Arc::new(scylla_db)).await
     }
 }
+
+/// Coordinator processor composition root. The canonical-head control table
+/// is deliberately initialized here instead of in the generic 32-table setup,
+/// so Realm and Edge databases do not acquire Coordinator authority state.
+pub async fn setup_coordinator_psy_scylla_database_store_from_connection_string<
+    N: QNetworkDatabaseTypes,
+>(
+    keyspace: &str,
+    connection_string: &str,
+    create_tables: bool,
+) -> anyhow::Result<ScyllaUnifiedPsyStore<N, N::QHash, N::HasherBase>> {
+    let db = setup_psy_scylla_database_store_from_connection_string::<N>(
+        keyspace,
+        connection_string,
+        create_tables,
+    )
+    .await?;
+    db.store
+        .initialize_coordinator_canonical_head(create_tables)
+        .await?;
+    Ok(db)
+}

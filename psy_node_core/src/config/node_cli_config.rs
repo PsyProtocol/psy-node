@@ -1,7 +1,13 @@
 use psy_core::constants::chain_id::PsyNetworkTypeInput;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use crate::config::node_start_config::{CoordinatorEdgeStartConfig, CoordinatorProcessorStartConfig, RealmEdgeStartConfig, RealmProcessorStartConfig};
+use crate::{
+    config::node_start_config::{
+        CoordinatorEdgeStartConfig, CoordinatorProcessorStartConfig,
+        RealmEdgeStartConfig, RealmProcessorStartConfig,
+    },
+    store::canonical_head::CanonicalHeadBootstrapProfile,
+};
 
 
 pub async fn load_cli_config_from_file<T: DeserializeOwned>(path: &str) -> anyhow::Result<T> {
@@ -222,6 +228,7 @@ pub struct CoordinatorProcessorCliConfig {
     pub coordinator_id: Option<u64>,
     pub coordinator_sub_id: Option<u16>,
     pub network: Option<PsyNetworkTypeInput>,
+    pub canonical_head_bootstrap_profile: Option<CanonicalHeadBootstrapProfile>,
     pub verbose: Option<bool>,
     pub checkpoint_backup_path: Option<String>,
     pub genesis_data_path: Option<String>,
@@ -236,6 +243,7 @@ impl CoordinatorProcessorCliConfig {
             coordinator_id: None,
             coordinator_sub_id: None,
             network: None,
+            canonical_head_bootstrap_profile: None,
             verbose: None,
             checkpoint_backup_path: None,
             genesis_data_path: None,
@@ -262,6 +270,7 @@ impl CoordinatorProcessorCliConfig {
             coordinator_id: coordinator_id.or(self.coordinator_id).ok_or_else(|| anyhow::anyhow!("coordinator_id is required"))?,
             coordinator_sub_id: coordinator_sub_id.or(self.coordinator_sub_id).ok_or_else(|| anyhow::anyhow!("coordinator_sub_id is required"))?,
             network: network.or(self.network).ok_or_else(|| anyhow::anyhow!("network is required"))?.into(),
+            canonical_head_bootstrap_profile: self.canonical_head_bootstrap_profile,
             verbose: verbose || self.verbose.unwrap_or(false),
             checkpoint_backup_path: checkpoint_backup_path.or(self.checkpoint_backup_path).ok_or_else(|| anyhow::anyhow!("checkpoint_backup_path is required"))?,
             genesis_data_path: genesis_data_path.or(self.genesis_data_path),

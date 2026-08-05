@@ -1,8 +1,9 @@
-//! Isolated, production-shaped C-01a durable canonical-head adapter.
+//! Durable Scylla adapter for the Coordinator canonical-head authority.
 //!
-//! The adapter is not registered by `psy_setup` and is not called by the
-//! Coordinator, Realm, Edge, or any current writer. It proves only the
-//! atomicity of one canonical-head row and its exact LWT contract.
+//! C-01a built and qualified this adapter in isolation. C-01b promotes the
+//! same query/binding implementation into the Coordinator-only production
+//! setup while keeping Realm/Edge stores and the 32/35 state-table inventory
+//! separate.
 
 use std::{error::Error, fmt, sync::Arc};
 
@@ -21,7 +22,10 @@ use scylla::{
 
 use super::{CqlKeyspaceName, InvalidCqlKeyspaceName};
 
-pub const C01A_CANONICAL_HEAD_TABLE: &str = "c01a_coordinator_canonical_head";
+pub const COORDINATOR_CANONICAL_HEAD_TABLE: &str = "coordinator_canonical_head";
+/// Historical C-01a name retained for source compatibility with the qualified
+/// RF=3 harness. It resolves to the production table identity.
+pub const C01A_CANONICAL_HEAD_TABLE: &str = COORDINATOR_CANONICAL_HEAD_TABLE;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InvalidCanonicalHeadNoTabletKeyspace(pub String);
@@ -104,7 +108,10 @@ pub struct CanonicalHeadQueries {
 
 impl CanonicalHeadQueries {
     pub fn new(no_tablet_keyspace: &CanonicalHeadNoTabletKeyspace) -> Self {
-        let qualified = format!("{}.{C01A_CANONICAL_HEAD_TABLE}", no_tablet_keyspace.as_str());
+        let qualified = format!(
+            "{}.{COORDINATOR_CANONICAL_HEAD_TABLE}",
+            no_tablet_keyspace.as_str()
+        );
         Self {
             create_table: CanonicalHeadQuery {
                 id: CanonicalHeadQueryId::CreateTable,
@@ -323,7 +330,7 @@ struct CanonicalHeadDbRow {
 
 /// Isolated durable adapter. The raw Session remains behind this composition
 /// root; write APIs accept only validated bootstrap or sealed CAS values.
-pub struct CanonicalHeadPrototypeAdapter {
+pub struct ScyllaCanonicalHeadStore {
     session: Arc<Session>,
     queries: CanonicalHeadQueries,
     contract: CanonicalHeadLwtContract,
@@ -332,7 +339,11 @@ pub struct CanonicalHeadPrototypeAdapter {
     compare_and_set: PreparedStatement,
 }
 
-impl CanonicalHeadPrototypeAdapter {
+/// Historical alias retained so the original C-01a tests continue exercising
+/// the exact adapter that production now uses.
+pub type CanonicalHeadPrototypeAdapter = ScyllaCanonicalHeadStore;
+
+impl ScyllaCanonicalHeadStore {
     /// Create only the table in an already provisioned no-tablet keyspace. The
     /// adapter deliberately does not choose replication factor or deployment
     /// profile.

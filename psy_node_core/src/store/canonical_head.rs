@@ -7,11 +7,14 @@
 
 use std::{error::Error, fmt};
 
+use async_trait::async_trait;
 use parth_core::protocol::core_types::Q256BitHash;
 pub use psy_data::protocol::canonical_chain::NetworkId;
 use psy_data::protocol::canonical_chain::{
-    CanonicalChainRef, CanonicalChainRefCodecError, CANONICAL_CHAIN_REF_V1_LEN,
+    CanonicalChainRef, CanonicalChainRefCodecError, ChainEpoch, CheckpointRef,
+    CANONICAL_CHAIN_REF_V1_LEN,
 };
+use serde::{Deserialize, Serialize};
 
 /// Monotonic revision of one durable Coordinator canonical-head row.
 ///
@@ -145,7 +148,8 @@ impl<Hash: Q256BitHash> StoredCanonicalHead<Hash> {
 ///
 /// The choice is made by release/operations policy; this enum does not infer a
 /// profile from an empty database.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum CanonicalHeadBootstrapProfile {
     GenesisNative,
     PostGenesisFloor,
@@ -398,6 +402,121 @@ impl<Hash> CanonicalHeadWriteOutcome<Hash> {
     }
 }
 
+/// Driver-independent authority boundary for the one Coordinator canonical
+/// head row. Implementations must preserve the exact LWT semantics modeled by
+/// [`CanonicalHeadBootstrap`] and [`SealedCanonicalHeadCas`].
+#[async_trait]
+pub trait CoordinatorCanonicalHeadStore<Hash: Q256BitHash>: Send + Sync {
+    async fn read_canonical_head(
+        &self,
+        network: NetworkId,
+    ) -> anyhow::Result<CanonicalHeadReadState<Hash>>;
+
+    async fn bootstrap_canonical_head(
+        &self,
+        bootstrap: &CanonicalHeadBootstrap<Hash>,
+    ) -> anyhow::Result<CanonicalHeadWriteOutcome<Hash>>;
+
+    async fn compare_and_set_canonical_head(
+        &self,
+        sealed: &SealedCanonicalHeadCas<Hash>,
+    ) -> anyhow::Result<CanonicalHeadWriteOutcome<Hash>>;
+}
+
+/// Exhaustive startup decision. It never invents a durable head and only
+/// permits reconciliation of a fully materialized checkpoint that is equal to
+/// or exactly one checkpoint ahead of the durable publish marker.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CanonicalHeadStartupPlan<Hash> {
+    /// A fresh database has not materialized genesis yet. Keep this exact
+    /// bootstrap sealed until genesis state and its backup are durable.
+    AwaitGenesis(CanonicalHeadBootstrap<Hash>),
+    /// Materialized state exists but the durable row does not. This is allowed
+    /// only under an explicit deployment bootstrap profile.
+    Bootstrap(CanonicalHeadBootstrap<Hash>),
+    /// Durable head and materialized state already agree.
+    Current(StoredCanonicalHead<Hash>),
+    /// Materialized state is exactly one checkpoint ahead because the process
+    /// crashed before the final head publish.
+    PublishMaterialized(SealedCanonicalHeadCas<Hash>),
+}
+
+/// Decide how startup reconciles the durable canonical head with the already
+/// validated materialized checkpoint/proof state.
+///
+/// `genesis_pending` must only be true for an actually empty database. A
+/// missing row never implies genesis and a profile is always explicit.
+pub fn plan_canonical_head_startup<Hash: Q256BitHash>(
+    network: NetworkId,
+    bootstrap_profile: Option<CanonicalHeadBootstrapProfile>,
+    durable: CanonicalHeadReadState<Hash>,
+    materialized_checkpoint: CheckpointRef<Hash>,
+    genesis_pending: bool,
+) -> Result<CanonicalHeadStartupPlan<Hash>, CanonicalHeadModelError> {
+    let materialized_checkpoint_id = materialized_checkpoint.checkpoint_id().get();
+    match durable {
+        CanonicalHeadReadState::Uninitialized => {
+            if genesis_pending && materialized_checkpoint_id != 0 {
+                return Err(CanonicalHeadModelError::GenesisPendingAtNonZeroCheckpoint(
+                    materialized_checkpoint_id,
+                ));
+            }
+            let profile = bootstrap_profile
+                .ok_or(CanonicalHeadModelError::BootstrapProfileRequired)?;
+            let bootstrap = CanonicalHeadBootstrap::try_new(
+                profile,
+                CanonicalChainRef::new(network, ChainEpoch::new(0), materialized_checkpoint),
+            )?;
+            if genesis_pending {
+                Ok(CanonicalHeadStartupPlan::AwaitGenesis(bootstrap))
+            } else {
+                Ok(CanonicalHeadStartupPlan::Bootstrap(bootstrap))
+            }
+        }
+        CanonicalHeadReadState::Current(current) => {
+            if genesis_pending {
+                return Err(CanonicalHeadModelError::DurableHeadBeforeGenesisMaterialized);
+            }
+            if current.canonical_ref().network_id() != network {
+                return Err(CanonicalHeadModelError::NetworkChanged {
+                    expected: network,
+                    proposed: current.canonical_ref().network_id(),
+                });
+            }
+
+            let durable_checkpoint = current
+                .canonical_ref()
+                .checkpoint()
+                .checkpoint_id()
+                .get();
+            if materialized_checkpoint_id == durable_checkpoint {
+                if current.canonical_ref().checkpoint() != &materialized_checkpoint {
+                    return Err(CanonicalHeadModelError::MaterializedCheckpointConflict {
+                        checkpoint_id: durable_checkpoint,
+                    });
+                }
+                return Ok(CanonicalHeadStartupPlan::Current(current));
+            }
+
+            if durable_checkpoint.checked_add(1) == Some(materialized_checkpoint_id) {
+                let proposed = CanonicalChainRef::new(
+                    network,
+                    current.canonical_ref().chain_epoch(),
+                    materialized_checkpoint,
+                );
+                return Ok(CanonicalHeadStartupPlan::PublishMaterialized(
+                    CanonicalHeadTransition::normal_checkpoint_advance(current, proposed)?.seal(),
+                ));
+            }
+
+            Err(CanonicalHeadModelError::MaterializedCheckpointNotCurrentOrNext {
+                durable: durable_checkpoint,
+                materialized: materialized_checkpoint_id,
+            })
+        }
+    }
+}
+
 fn require_same_network<Hash>(
     expected: &CanonicalChainRef<Hash>,
     proposed: &CanonicalChainRef<Hash>,
@@ -449,6 +568,11 @@ pub enum CanonicalHeadModelError {
     ChainEpochOverflow(u64),
     CheckpointChangedWhileOpeningEpoch,
     AppliedStateMismatch,
+    BootstrapProfileRequired,
+    GenesisPendingAtNonZeroCheckpoint(u64),
+    DurableHeadBeforeGenesisMaterialized,
+    MaterializedCheckpointConflict { checkpoint_id: u64 },
+    MaterializedCheckpointNotCurrentOrNext { durable: u64, materialized: u64 },
 }
 
 impl fmt::Display for CanonicalHeadModelError {
@@ -505,6 +629,24 @@ impl fmt::Display for CanonicalHeadModelError {
             ),
             Self::AppliedStateMismatch => formatter.write_str(
                 "LWT reported applied but durable canonical head is not the sealed candidate",
+            ),
+            Self::BootstrapProfileRequired => formatter.write_str(
+                "canonical-head row is uninitialized and no explicit bootstrap profile was configured",
+            ),
+            Self::GenesisPendingAtNonZeroCheckpoint(checkpoint) => write!(
+                formatter,
+                "genesis cannot be pending while materialized checkpoint is {checkpoint}"
+            ),
+            Self::DurableHeadBeforeGenesisMaterialized => formatter.write_str(
+                "durable canonical head exists before genesis state is materialized",
+            ),
+            Self::MaterializedCheckpointConflict { checkpoint_id } => write!(
+                formatter,
+                "materialized checkpoint {checkpoint_id} has a different hash from the durable canonical head"
+            ),
+            Self::MaterializedCheckpointNotCurrentOrNext { durable, materialized } => write!(
+                formatter,
+                "materialized checkpoint {materialized} must equal durable checkpoint {durable} or be its exact successor"
             ),
         }
     }
@@ -798,6 +940,189 @@ mod tests {
                 canonical_ref(PsyChainNetworkType::PsyMainnet, 0, 1, 10),
             ),
             Err(CanonicalHeadModelError::RevisionOverflow(i64::MAX as u64))
+        );
+    }
+
+    #[test]
+    fn startup_requires_explicit_profile_and_defers_fresh_genesis_publish() {
+        let network = NetworkId::from(PsyChainNetworkType::PsyMainnet);
+        let materialized = *canonical_ref(PsyChainNetworkType::PsyMainnet, 0, 0, 1)
+            .checkpoint();
+        assert_eq!(
+            plan_canonical_head_startup::<PHash>(
+                network,
+                None,
+                CanonicalHeadReadState::Uninitialized,
+                materialized,
+                true,
+            ),
+            Err(CanonicalHeadModelError::BootstrapProfileRequired)
+        );
+
+        let plan = plan_canonical_head_startup::<PHash>(
+            network,
+            Some(CanonicalHeadBootstrapProfile::GenesisNative),
+            CanonicalHeadReadState::Uninitialized,
+            materialized,
+            true,
+        )
+        .unwrap();
+        assert!(matches!(
+            plan,
+            CanonicalHeadStartupPlan::AwaitGenesis(bootstrap)
+                if bootstrap.candidate().canonical_ref().checkpoint() == &materialized
+        ));
+    }
+
+    #[test]
+    fn bootstrap_profile_config_spelling_is_stable_and_missing_stays_absent() {
+        #[derive(Deserialize)]
+        struct Config {
+            #[serde(default)]
+            profile: Option<CanonicalHeadBootstrapProfile>,
+        }
+
+        let genesis: Config = serde_yaml::from_str("profile: GENESIS_NATIVE\n").unwrap();
+        assert_eq!(
+            genesis.profile,
+            Some(CanonicalHeadBootstrapProfile::GenesisNative)
+        );
+        let floor: Config = serde_yaml::from_str("profile: POST_GENESIS_FLOOR\n").unwrap();
+        assert_eq!(
+            floor.profile,
+            Some(CanonicalHeadBootstrapProfile::PostGenesisFloor)
+        );
+        let missing: Config = serde_yaml::from_str("{}\n").unwrap();
+        assert_eq!(missing.profile, None);
+        assert!(serde_yaml::from_str::<Config>("profile: genesis_native\n").is_err());
+    }
+
+    #[test]
+    fn startup_bootstraps_only_explicit_materialized_genesis_or_floor() {
+        let network = NetworkId::from(PsyChainNetworkType::PsyMainnet);
+        let genesis_checkpoint = *canonical_ref(
+            PsyChainNetworkType::PsyMainnet,
+            0,
+            0,
+            1,
+        )
+        .checkpoint();
+        assert!(matches!(
+            plan_canonical_head_startup::<PHash>(
+                network,
+                Some(CanonicalHeadBootstrapProfile::GenesisNative),
+                CanonicalHeadReadState::Uninitialized,
+                genesis_checkpoint,
+                false,
+            )
+            .unwrap(),
+            CanonicalHeadStartupPlan::Bootstrap(_)
+        ));
+
+        let floor_checkpoint = *canonical_ref(
+            PsyChainNetworkType::PsyMainnet,
+            0,
+            900,
+            10,
+        )
+        .checkpoint();
+        assert!(matches!(
+            plan_canonical_head_startup::<PHash>(
+                network,
+                Some(CanonicalHeadBootstrapProfile::PostGenesisFloor),
+                CanonicalHeadReadState::Uninitialized,
+                floor_checkpoint,
+                false,
+            )
+            .unwrap(),
+            CanonicalHeadStartupPlan::Bootstrap(bootstrap)
+                if bootstrap.profile() == CanonicalHeadBootstrapProfile::PostGenesisFloor
+        ));
+        assert!(plan_canonical_head_startup::<PHash>(
+            network,
+            Some(CanonicalHeadBootstrapProfile::PostGenesisFloor),
+            CanonicalHeadReadState::Uninitialized,
+            genesis_checkpoint,
+            false,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn startup_accepts_exact_head_or_seals_one_missing_final_publish() {
+        let network = NetworkId::from(PsyChainNetworkType::PsyMainnet);
+        let current_ref = canonical_ref(PsyChainNetworkType::PsyMainnet, 7, 41, 100);
+        let current = StoredCanonicalHead::decode_persisted(
+            network,
+            9,
+            &current_ref.to_canonical_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            plan_canonical_head_startup(
+                network,
+                None,
+                CanonicalHeadReadState::Current(current),
+                *current_ref.checkpoint(),
+                false,
+            )
+            .unwrap(),
+            CanonicalHeadStartupPlan::Current(current)
+        );
+
+        let next = *canonical_ref(PsyChainNetworkType::PsyMainnet, 0, 42, 200)
+            .checkpoint();
+        let plan = plan_canonical_head_startup(
+            network,
+            None,
+            CanonicalHeadReadState::Current(current),
+            next,
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            plan,
+            CanonicalHeadStartupPlan::PublishMaterialized(sealed)
+                if sealed.expected() == &current
+                    && sealed.candidate().revision().get() == 10
+                    && sealed.candidate().canonical_ref().chain_epoch().get() == 7
+                    && sealed.candidate().canonical_ref().checkpoint() == &next
+        ));
+    }
+
+    #[test]
+    fn startup_reconciliation_rejects_hash_conflict_gap_and_head_ahead() {
+        let network = NetworkId::from(PsyChainNetworkType::PsyMainnet);
+        let current_ref = canonical_ref(PsyChainNetworkType::PsyMainnet, 3, 41, 100);
+        let current = StoredCanonicalHead::decode_persisted(
+            network,
+            9,
+            &current_ref.to_canonical_bytes(),
+        )
+        .unwrap();
+        for materialized in [
+            *canonical_ref(PsyChainNetworkType::PsyMainnet, 0, 41, 999).checkpoint(),
+            *canonical_ref(PsyChainNetworkType::PsyMainnet, 0, 40, 90).checkpoint(),
+            *canonical_ref(PsyChainNetworkType::PsyMainnet, 0, 43, 300).checkpoint(),
+        ] {
+            assert!(plan_canonical_head_startup(
+                network,
+                None,
+                CanonicalHeadReadState::Current(current),
+                materialized,
+                false,
+            )
+            .is_err());
+        }
+        assert_eq!(
+            plan_canonical_head_startup(
+                network,
+                None,
+                CanonicalHeadReadState::Current(current),
+                *current_ref.checkpoint(),
+                true,
+            ),
+            Err(CanonicalHeadModelError::DurableHeadBeforeGenesisMaterialized)
         );
     }
 

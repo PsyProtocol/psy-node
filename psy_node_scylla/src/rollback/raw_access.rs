@@ -9,6 +9,7 @@
 pub enum RawScyllaAccessScope {
     DriverCore,
     LegacyTableAdapter,
+    CanonicalHeadAuthority,
     RollbackPrototypeAdapter,
     GuardImplementation,
     TestHarness,
@@ -51,7 +52,7 @@ pub const RAW_SCYLLA_ACCESS_ALLOWLIST: &[RawScyllaAccessAllowance] = &[
     allow!("psy_node_scylla/examples/tst7_nobucket.rs", Example),
     allow!("psy_node_scylla/src/core.rs", DriverCore),
     allow!("psy_node_scylla/src/core_db.rs", DriverCore),
-    allow!("psy_node_scylla/src/rollback/canonical_head_prototype.rs", RollbackPrototypeAdapter),
+    allow!("psy_node_scylla/src/rollback/canonical_head_prototype.rs", CanonicalHeadAuthority),
     allow!("psy_node_scylla/src/rollback/confinement.rs", RollbackPrototypeAdapter),
     allow!("psy_node_scylla/src/rollback/namespace_prototype.rs", RollbackPrototypeAdapter),
     allow!("psy_node_scylla/src/rollback/raw_access.rs", GuardImplementation),

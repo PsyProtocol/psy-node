@@ -228,7 +228,7 @@ fn lexical_inventory_is_stable_and_nontrivial() {
         RawScyllaAccessCounts {
             session_type: 583,
             session_builder: 33,
-            session_field_access: 133,
+            session_field_access: 135,
             prepared_statement: 151,
             prepare_call: 115,
             execute_call: 194,

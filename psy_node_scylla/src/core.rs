@@ -1,12 +1,17 @@
 use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+use async_trait::async_trait;
 use scylla::client::execution_profile::ExecutionProfile;
 use scylla::client::PoolSize;
-use parth_core::{crypto::hash::traits::MerkleZeroHasher, data::db::table::QDatabaseTableRoutingKey, protocol::core_types::QHashBase};
+use parth_core::{crypto::hash::traits::MerkleZeroHasher, data::db::table::QDatabaseTableRoutingKey, protocol::core_types::{Q256BitHash, QHashBase}};
+use psy_node_core::store::canonical_head::{
+    CanonicalHeadBootstrap, CanonicalHeadReadState, CanonicalHeadWriteOutcome,
+    CoordinatorCanonicalHeadStore, NetworkId, SealedCanonicalHeadCas,
+};
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
-use tokio::time::sleep;
+use crate::rollback::{CanonicalHeadNoTabletKeyspace, ScyllaCanonicalHeadStore};
 use crate::tables::{merkle::ScyllaMerkleNodesZeroPreparedStatements, traits::ScyllaStandardPreparedTableStatements};
 use crate::tables::traits::ScyllaNoTabletPreparedTableStatements;
 
@@ -17,6 +22,7 @@ pub struct ScyllaCoreStore<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> {
     pub no_tablet_keyspace: String,
     pub realm_id: u64,
     pub realm_sub_id: u64,
+    canonical_head_store: Arc<OnceLock<Arc<ScyllaCanonicalHeadStore>>>,
     _phantom_hash: std::marker::PhantomData<Hash>,
     _phantom_hasher: std::marker::PhantomData<Hasher>,
 }
@@ -74,6 +80,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
             no_tablet_keyspace,
             realm_id,
             realm_sub_id,
+            canonical_head_store: Arc::new(OnceLock::new()),
             _phantom_hash: std::marker::PhantomData,
             _phantom_hasher: std::marker::PhantomData,
         })
@@ -133,5 +140,69 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
     ) -> anyhow::Result<ScyllaMerkleNodesZeroPreparedStatements> {
         println!("preparing statements for zero id merkle table: {}", table_name);
         ScyllaMerkleNodesZeroPreparedStatements::new_from_session(self.session.clone(), &self.keyspace, table_name, table_key, tree_height).await
+    }
+
+    /// Initialize the Coordinator-only canonical-head authority in the
+    /// existing no-tablet keyspace. Generic Realm/Edge setup never calls this.
+    pub async fn initialize_coordinator_canonical_head(
+        &self,
+        create_schema: bool,
+    ) -> anyhow::Result<()> {
+        let keyspace = CanonicalHeadNoTabletKeyspace::try_new(
+            self.no_tablet_keyspace.clone(),
+        )?;
+        if create_schema {
+            ScyllaCanonicalHeadStore::create_schema(&self.session, &keyspace).await?;
+        }
+        let adapter = Arc::new(
+            ScyllaCanonicalHeadStore::prepare(self.session.clone(), keyspace).await?,
+        );
+        self.canonical_head_store
+            .set(adapter)
+            .map_err(|_| anyhow::anyhow!("Coordinator canonical-head store initialized more than once"))?;
+        Ok(())
+    }
+
+    fn coordinator_canonical_head(&self) -> anyhow::Result<&ScyllaCanonicalHeadStore> {
+        self.canonical_head_store
+            .get()
+            .map(Arc::as_ref)
+            .ok_or_else(|| anyhow::anyhow!(
+                "Coordinator canonical-head store was not initialized by Coordinator setup"
+            ))
+    }
+}
+
+#[async_trait]
+impl<Hash, Hasher> CoordinatorCanonicalHeadStore<Hash> for ScyllaCoreStore<Hash, Hasher>
+where
+    Hash: QHashBase + Q256BitHash,
+    Hasher: MerkleZeroHasher<Hash> + Send + Sync,
+{
+    async fn read_canonical_head(
+        &self,
+        network: NetworkId,
+    ) -> anyhow::Result<CanonicalHeadReadState<Hash>> {
+        Ok(self.coordinator_canonical_head()?.read(network).await?)
+    }
+
+    async fn bootstrap_canonical_head(
+        &self,
+        bootstrap: &CanonicalHeadBootstrap<Hash>,
+    ) -> anyhow::Result<CanonicalHeadWriteOutcome<Hash>> {
+        Ok(self
+            .coordinator_canonical_head()?
+            .bootstrap(bootstrap)
+            .await?)
+    }
+
+    async fn compare_and_set_canonical_head(
+        &self,
+        sealed: &SealedCanonicalHeadCas<Hash>,
+    ) -> anyhow::Result<CanonicalHeadWriteOutcome<Hash>> {
+        Ok(self
+            .coordinator_canonical_head()?
+            .compare_and_set(sealed)
+            .await?)
     }
 }

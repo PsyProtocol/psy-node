@@ -1,4 +1,5 @@
 use psy_core::constants::chain_id::PsyChainNetworkType;
+use crate::store::canonical_head::CanonicalHeadBootstrapProfile;
 use serde::{Deserialize, Serialize};
 
 
@@ -55,6 +56,10 @@ pub struct CoordinatorProcessorStartConfig {
     pub coordinator_id: u64,
     pub coordinator_sub_id: u16,
     pub network: PsyChainNetworkType,
+    /// Required only while the durable canonical-head row is absent. Once the
+    /// row exists this value cannot overwrite or reinterpret it.
+    #[serde(default)]
+    pub canonical_head_bootstrap_profile: Option<CanonicalHeadBootstrapProfile>,
     pub verbose: bool,
     pub checkpoint_backup_path: String,
     pub genesis_data_path: Option<String>,
