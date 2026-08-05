@@ -4,10 +4,15 @@
 //! command is not an active rollback: only the Coordinator Processor may
 //! consume the inbox and publish `REQUESTED` in the canonical-head row.
 
-use std::sync::Arc;
+use std::{
+    fmt,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use parth_core::protocol::core_types::Q256BitHash;
 use psy_data::protocol::canonical_chain::{CanonicalChainRef, CheckpointRef, NetworkId};
+use tokio::sync::Mutex;
 
 use super::{
     canonical_head::{
@@ -16,6 +21,7 @@ use super::{
     },
     rollback_admission::{
         CoordinatorRollbackAdmissionStore, RollbackAdmissionCommand,
+        RollbackAdmissionSlotRevision,
         RollbackAdmissionSlotReadState, RollbackAdmissionSlotState,
         RollbackAdmissionSlotWriteOutcome, SealedRollbackAdmissionSlotCas,
         StoredRollbackAdmissionSlot,
@@ -95,6 +101,93 @@ pub enum RollbackAdminInboxPhase {
     Stale,
 }
 
+impl RollbackAdminInboxPhase {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "IDLE",
+            Self::Pending => "PENDING",
+            Self::Active => "ACTIVE",
+            Self::Stale => "STALE",
+        }
+    }
+}
+
+/// Stable rejection returned by the Coordinator Edge maintenance gate.
+///
+/// `Pending` is intentionally blocking even before the Processor promotes the
+/// command to authoritative rollback control. `Stale` is also blocking: an
+/// operator must reconcile the durable inbox instead of silently admitting
+/// new work against an ambiguous observation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RollbackMaintenanceGateError {
+    phase: RollbackAdminInboxPhase,
+}
+
+impl fmt::Display for RollbackMaintenanceGateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "ROLLBACK_IN_PROGRESS:{}", self.phase.as_str())
+    }
+}
+
+impl std::error::Error for RollbackMaintenanceGateError {}
+
+impl RollbackMaintenanceGateError {
+    const fn new(phase: RollbackAdminInboxPhase) -> Self {
+        Self { phase }
+    }
+
+    pub const fn phase(&self) -> RollbackAdminInboxPhase {
+        self.phase
+    }
+}
+
+/// Read-only evidence that the canonical head and rollback inbox were stable
+/// and idle at one admission boundary.
+///
+/// This is deliberately not a lease: C-02's epoch-carrying messages are still
+/// required to close the race between this check and a later cross-store side
+/// effect.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RollbackMaintenancePermit<Hash> {
+    canonical_head: StoredCanonicalHead<Hash>,
+    inbox_revision: RollbackAdmissionSlotRevision,
+}
+
+impl<Hash> RollbackMaintenancePermit<Hash> {
+    pub const fn canonical_head(&self) -> &StoredCanonicalHead<Hash> {
+        &self.canonical_head
+    }
+
+    pub const fn inbox_revision(&self) -> RollbackAdmissionSlotRevision {
+        self.inbox_revision
+    }
+}
+
+const MAINTENANCE_GATE_CACHE_TTL: Duration = Duration::from_millis(100);
+
+#[derive(Clone, Debug)]
+enum CachedRollbackMaintenanceState<Hash> {
+    Available(RollbackMaintenancePermit<Hash>),
+    Blocked(RollbackAdminInboxPhase),
+    Unavailable(String),
+}
+
+impl<Hash: Copy> CachedRollbackMaintenanceState<Hash> {
+    fn result(&self) -> anyhow::Result<RollbackMaintenancePermit<Hash>> {
+        match self {
+            Self::Available(permit) => Ok(*permit),
+            Self::Blocked(phase) => Err(RollbackMaintenanceGateError::new(*phase).into()),
+            Self::Unavailable(error) => anyhow::bail!(error.clone()),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CachedRollbackMaintenanceObservation<Hash> {
+    observed_at: Instant,
+    state: CachedRollbackMaintenanceState<Hash>,
+}
+
 /// A two-row observation.  The rows are individually atomic but are not a
 /// cross-table snapshot; consumers must use `phase`, not infer authority from
 /// the inbox alone.
@@ -152,6 +245,7 @@ pub struct CoordinatorRollbackAdminInbox<Hash> {
     access: RollbackAdminInboxAccess,
     canonical_head_reader: Arc<dyn CoordinatorCanonicalHeadReader<Hash>>,
     admission_store: Arc<dyn CoordinatorRollbackAdmissionStore<Hash>>,
+    maintenance_cache: Mutex<Option<CachedRollbackMaintenanceObservation<Hash>>>,
 }
 
 impl<Hash> CoordinatorRollbackAdminInbox<Hash> {
@@ -166,6 +260,7 @@ impl<Hash> CoordinatorRollbackAdminInbox<Hash> {
             access,
             canonical_head_reader,
             admission_store,
+            maintenance_cache: Mutex::new(None),
         }
     }
 
@@ -176,6 +271,22 @@ impl<Hash> CoordinatorRollbackAdminInbox<Hash> {
 
 impl<Hash: Q256BitHash + Send + Sync + 'static> CoordinatorRollbackAdminInbox<Hash> {
     pub async fn status(&self) -> anyhow::Result<RollbackAdminInboxStatus<Hash>> {
+        match self.read_status_fresh().await {
+            Ok(status) => {
+                self.cache_status(&status).await;
+                Ok(status)
+            }
+            Err(error) => {
+                self.cache_maintenance_state(CachedRollbackMaintenanceState::Unavailable(
+                    format!("{error:#}"),
+                ))
+                .await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn read_status_fresh(&self) -> anyhow::Result<RollbackAdminInboxStatus<Hash>> {
         // The two rows cannot be read atomically. Bracket the inbox read with
         // the authoritative head and only return an observation for which the
         // head was stable. This closes the old-IDLE/new-empty false-IDLE window
@@ -189,6 +300,41 @@ impl<Hash: Q256BitHash + Send + Sync + 'static> CoordinatorRollbackAdminInbox<Ha
             }
         }
         anyhow::bail!("ROLLBACK_ADMIN_STATUS_OBSERVATION_UNSTABLE")
+    }
+
+    /// Fail-closed admission check for Coordinator Edge operations which can
+    /// create work or mutate state.
+    pub async fn require_service_available(
+        &self,
+    ) -> anyhow::Result<RollbackMaintenancePermit<Hash>> {
+        let mut cache = self.maintenance_cache.lock().await;
+        if let Some(observation) = cache.as_ref() {
+            if observation.observed_at.elapsed() < MAINTENANCE_GATE_CACHE_TTL {
+                return observation.state.result();
+            }
+        }
+
+        let state = match self.read_status_fresh().await {
+            Ok(status) => maintenance_state_from_status(&status),
+            Err(error) => CachedRollbackMaintenanceState::Unavailable(format!("{error:#}")),
+        };
+        *cache = Some(CachedRollbackMaintenanceObservation {
+            observed_at: Instant::now(),
+            state,
+        });
+        cache.as_ref().unwrap().state.result()
+    }
+
+    async fn cache_status(&self, status: &RollbackAdminInboxStatus<Hash>) {
+        self.cache_maintenance_state(maintenance_state_from_status(status))
+            .await;
+    }
+
+    async fn cache_maintenance_state(&self, state: CachedRollbackMaintenanceState<Hash>) {
+        *self.maintenance_cache.lock().await = Some(CachedRollbackMaintenanceObservation {
+            observed_at: Instant::now(),
+            state,
+        });
     }
 
     pub async fn start(
@@ -261,10 +407,12 @@ impl<Hash: Q256BitHash + Send + Sync + 'static> CoordinatorRollbackAdminInbox<Ha
                 (RollbackAdminStartDisposition::Conflict, current)
             }
         };
-        Ok(receipt(
+        let receipt = receipt(
             disposition,
             classify_status(observed.canonical_head, slot),
-        ))
+        );
+        self.cache_status(receipt.status()).await;
+        Ok(receipt)
     }
 
     async fn read_head(&self) -> anyhow::Result<StoredCanonicalHead<Hash>> {
@@ -291,6 +439,20 @@ impl<Hash: Q256BitHash + Send + Sync + 'static> CoordinatorRollbackAdminInbox<Ha
             }
             RollbackAdmissionSlotReadState::Current(slot) => Ok(slot),
         }
+    }
+}
+
+fn maintenance_state_from_status<Hash: Q256BitHash>(
+    status: &RollbackAdminInboxStatus<Hash>,
+) -> CachedRollbackMaintenanceState<Hash> {
+    match status.phase() {
+        RollbackAdminInboxPhase::Idle => {
+            CachedRollbackMaintenanceState::Available(RollbackMaintenancePermit {
+                canonical_head: *status.canonical_head(),
+                inbox_revision: status.admission_slot().revision(),
+            })
+        }
+        phase => CachedRollbackMaintenanceState::Blocked(phase),
     }
 }
 
@@ -354,6 +516,7 @@ mod tests {
     #[derive(Clone)]
     struct MemoryCanonicalHead {
         state: Arc<Mutex<CanonicalHeadReadState<PHash>>>,
+        reads: Arc<AtomicUsize>,
     }
 
     #[async_trait]
@@ -362,6 +525,7 @@ mod tests {
             &self,
             _network: NetworkId,
         ) -> anyhow::Result<CanonicalHeadReadState<PHash>> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
             Ok(*self.state.lock().await)
         }
     }
@@ -390,6 +554,7 @@ mod tests {
     #[derive(Clone)]
     struct MemoryAdmissionStore {
         state: Arc<Mutex<RollbackAdmissionSlotReadState<PHash>>>,
+        reads: Arc<AtomicUsize>,
     }
 
     #[async_trait]
@@ -400,6 +565,7 @@ mod tests {
             &self,
             _network: NetworkId,
         ) -> anyhow::Result<RollbackAdmissionSlotReadState<PHash>> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
             Ok(*self.state.lock().await)
         }
     }
@@ -473,9 +639,11 @@ mod tests {
         let slot = *RollbackAdmissionSlotBootstrap::<PHash>::new(network()).candidate();
         let head_store = MemoryCanonicalHead {
             state: Arc::new(Mutex::new(CanonicalHeadReadState::Current(head))),
+            reads: Arc::new(AtomicUsize::new(0)),
         };
         let admission_store = MemoryAdmissionStore {
             state: Arc::new(Mutex::new(RollbackAdmissionSlotReadState::Current(slot))),
+            reads: Arc::new(AtomicUsize::new(0)),
         };
         let service = Arc::new(CoordinatorRollbackAdminInbox::new(
             network(),
@@ -510,6 +678,13 @@ mod tests {
     #[tokio::test]
     async fn disabled_is_fail_closed_and_does_not_mutate_inbox() {
         let fixture = fixture(RollbackAdminInboxAccess::Disabled);
+        let permit = fixture
+            .service
+            .require_service_available()
+            .await
+            .unwrap();
+        assert_eq!(permit.canonical_head(), &fixture.head);
+        assert_eq!(permit.inbox_revision().get(), 0);
         let receipt = fixture
             .service
             .start(intent(fixture.head, checkpoint(90, 20)))
@@ -522,6 +697,66 @@ mod tests {
             panic!("slot must remain initialized")
         };
         assert!(slot.state().is_empty());
+    }
+
+    #[tokio::test]
+    async fn idle_gate_observation_is_briefly_cached_on_the_hot_path() {
+        let fixture = fixture(RollbackAdminInboxAccess::ManualPreflight);
+        let first = fixture
+            .service
+            .require_service_available()
+            .await
+            .unwrap();
+        let second = fixture
+            .service
+            .require_service_available()
+            .await
+            .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(fixture.head_store.reads.load(Ordering::SeqCst), 2);
+        assert_eq!(fixture.admission_store.reads.load(Ordering::SeqCst), 1);
+
+        *fixture.head_store.state.lock().await = CanonicalHeadReadState::Uninitialized;
+        assert!(fixture.service.status().await.is_err());
+        *fixture.head_store.state.lock().await = CanonicalHeadReadState::Current(fixture.head);
+        assert!(
+            fixture
+                .service
+                .require_service_available()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("ROLLBACK_ADMIN_CANONICAL_HEAD_UNINITIALIZED"),
+            "a failed forced refresh must invalidate a cached IDLE permit"
+        );
+    }
+
+    #[tokio::test]
+    async fn maintenance_gate_fails_closed_when_durable_authority_is_unavailable() {
+        let head_fixture = fixture(RollbackAdminInboxAccess::ManualPreflight);
+        *head_fixture.head_store.state.lock().await = CanonicalHeadReadState::Uninitialized;
+        assert!(
+            head_fixture
+                .service
+                .require_service_available()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("ROLLBACK_ADMIN_CANONICAL_HEAD_UNINITIALIZED")
+        );
+
+        let inbox_fixture = fixture(RollbackAdminInboxAccess::ManualPreflight);
+        *inbox_fixture.admission_store.state.lock().await =
+            RollbackAdmissionSlotReadState::Uninitialized;
+        assert!(
+            inbox_fixture
+                .service
+                .require_service_available()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("ROLLBACK_ADMIN_INBOX_UNINITIALIZED")
+        );
     }
 
     #[tokio::test]
@@ -577,6 +812,18 @@ mod tests {
             fixture.service.status().await.unwrap().phase(),
             RollbackAdminInboxPhase::Pending
         );
+        let pending = fixture
+            .service
+            .require_service_available()
+            .await
+            .unwrap_err();
+        assert_eq!(
+            pending
+                .downcast_ref::<RollbackMaintenanceGateError>()
+                .unwrap()
+                .phase(),
+            RollbackAdminInboxPhase::Pending
+        );
 
         let advanced = *super::super::canonical_head::CanonicalHeadTransition::normal_checkpoint_advance(
             fixture.head,
@@ -590,6 +837,18 @@ mod tests {
             fixture.service.status().await.unwrap().phase(),
             RollbackAdminInboxPhase::Stale
         );
+        let stale = fixture
+            .service
+            .require_service_available()
+            .await
+            .unwrap_err();
+        assert_eq!(
+            stale
+                .downcast_ref::<RollbackMaintenanceGateError>()
+                .unwrap()
+                .phase(),
+            RollbackAdminInboxPhase::Stale
+        );
 
         let slot = match *fixture.admission_store.state.lock().await {
             RollbackAdmissionSlotReadState::Current(slot) => slot,
@@ -600,6 +859,18 @@ mod tests {
             CanonicalHeadReadState::Current(*command.sealed().candidate());
         assert_eq!(
             fixture.service.status().await.unwrap().phase(),
+            RollbackAdminInboxPhase::Active
+        );
+        let active = fixture
+            .service
+            .require_service_available()
+            .await
+            .unwrap_err();
+        assert_eq!(
+            active
+                .downcast_ref::<RollbackMaintenanceGateError>()
+                .unwrap()
+                .phase(),
             RollbackAdminInboxPhase::Active
         );
     }

@@ -81,6 +81,70 @@ mod rollback_admin_tests {
 
     use super::*;
 
+    #[test]
+    fn mutating_edge_operation_inventory_is_explicit_and_complete() {
+        assert_eq!(CoordinatorMutatingEdgeOperation::ALL.len(), 6);
+        assert_eq!(
+            CoordinatorMutatingEdgeOperation::ALL.map(|operation| operation.as_str()),
+            [
+                "register_user",
+                "deploy_contract",
+                "submit_guta",
+                "get_proving_work",
+                "get_proving_work_with_child_proofs",
+                "submit_proof_raw",
+            ]
+        );
+    }
+
+    #[test]
+    fn every_known_mutating_edge_entrypoint_invokes_the_gate() {
+        fn function_body<'a>(source: &'a str, name: &str) -> &'a str {
+            let marker = format!("pub async fn {name}");
+            let start = source.find(&marker).expect("entrypoint must exist");
+            let rest = &source[start + marker.len()..];
+            let end = rest.find("\n    pub async fn ").unwrap_or(rest.len());
+            &rest[..end]
+        }
+
+        let handler = include_str!("handler.rs");
+        let worker = include_str!("worker_handler.rs");
+        for (source, name, operation) in [
+            (handler, "register_user_internal", "RegisterUser"),
+            (handler, "deploy_contract_internal", "DeployContract"),
+            (handler, "submit_guta_internal", "SubmitGuta"),
+            (worker, "get_proving_work_internal", "GetProvingWork"),
+            (
+                worker,
+                "get_proving_work_with_child_proofs_internal",
+                "GetProvingWorkWithChildProofs",
+            ),
+            (worker, "submit_proof_raw_internal", "SubmitProofRaw"),
+        ] {
+            let body = function_body(source, name);
+            assert!(
+                body.contains("require_mutating_service_available_internal"),
+                "{name} must invoke the maintenance gate"
+            );
+            assert!(
+                body.contains(&format!("CoordinatorMutatingEdgeOperation::{operation}")),
+                "{name} must identify its typed operation"
+            );
+        }
+
+        for name in [
+            "admin_start_rollback_internal",
+            "admin_get_rollback_status_internal",
+            "get_canonical_chain_ref_internal",
+        ] {
+            assert!(
+                !function_body(handler, name)
+                    .contains("require_mutating_service_available_internal"),
+                "{name} must remain available for control-plane observation"
+            );
+        }
+    }
+
     fn request() -> RollbackAdminStartRequest<PHash> {
         RollbackAdminStartRequest {
             request_version: ROLLBACK_ADMIN_START_REQUEST_VERSION,
@@ -204,6 +268,38 @@ fn parse_rollback_admin_intent<Hash: Q256BitHash>(
 }
 
 // const END_CAP_PROOF_CIRCUIT_TYPE_U32: u32 = ProvingJobCircuitType::UserEndCap as u32;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CoordinatorMutatingEdgeOperation {
+    RegisterUser,
+    DeployContract,
+    SubmitGuta,
+    GetProvingWork,
+    GetProvingWorkWithChildProofs,
+    SubmitProofRaw,
+}
+
+impl CoordinatorMutatingEdgeOperation {
+    pub const ALL: [Self; 6] = [
+        Self::RegisterUser,
+        Self::DeployContract,
+        Self::SubmitGuta,
+        Self::GetProvingWork,
+        Self::GetProvingWorkWithChildProofs,
+        Self::SubmitProofRaw,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RegisterUser => "register_user",
+            Self::DeployContract => "deploy_contract",
+            Self::SubmitGuta => "submit_guta",
+            Self::GetProvingWork => "get_proving_work",
+            Self::GetProvingWorkWithChildProofs => "get_proving_work_with_child_proofs",
+            Self::SubmitProofRaw => "submit_proof_raw",
+        }
+    }
+}
+
 pub struct CoordinatorEdgeHandler<
     N: QNetworkTypesConfig,
     S: PsyCoordinatorEdgeAPIStoreReader<N::F, N::QHash> + Send + Sync,
@@ -361,6 +457,25 @@ impl<
     ) -> anyhow::Result<RollbackAdminStatus<N::QHash>> {
         let status = self.rollback_admin_inbox.status().await?;
         Ok(self.map_admin_status(&status))
+    }
+
+    /// Admission boundary for operations that create work or mutate
+    /// Coordinator-owned state. The returned permit is intentionally consumed
+    /// here: it is evidence of an idle observation, not a cross-store lease.
+    pub async fn require_mutating_service_available_internal(
+        &self,
+        operation: CoordinatorMutatingEdgeOperation,
+    ) -> anyhow::Result<()> {
+        let permit = self.rollback_admin_inbox
+            .require_service_available()
+            .await?;
+        tracing::trace!(
+            operation = operation.as_str(),
+            canonical_revision = permit.canonical_head().revision().get(),
+            inbox_revision = permit.inbox_revision().get(),
+            "coordinator mutating edge operation admitted"
+        );
+        Ok(())
     }
 
     fn map_admin_status(
@@ -618,7 +733,9 @@ impl<
     where
         N::ZKVerifier: 'static,
     {
+        self.require_mutating_service_available_internal(CoordinatorMutatingEdgeOperation::RegisterUser).await?;
         let (_, unique_proc_checkpoint_id, queue_key) = self.get_register_user_queue_key().await?;
+        self.require_mutating_service_available_internal(CoordinatorMutatingEdgeOperation::RegisterUser).await?;
         self.register_user_queue
             .publish_ephemeral_queue_item_owned_bytes(
                 &queue_key,
@@ -633,6 +750,7 @@ impl<
         Ok("ok".to_string())
     }
     pub async fn deploy_contract_internal(&self, deploy_contract: PQBCDeployContract<N::QHash>) -> anyhow::Result<String> {
+        self.require_mutating_service_available_internal(CoordinatorMutatingEdgeOperation::DeployContract).await?;
         if deploy_contract.code_definition.functions.len() == 0 {
             anyhow::bail!("contracts with no functions are not supported");
         } else if deploy_contract.code_definition.functions.len() > (1usize << N::CONTRACT_FUNCTION_TREE_HEIGHT) {
@@ -656,6 +774,7 @@ impl<
         );
         let deploy_content_hash_hex = hash_to_hex(&deploy_content_hash);
 
+        self.require_mutating_service_available_internal(CoordinatorMutatingEdgeOperation::DeployContract).await?;
         self.temp_db
             .set_deploy_contract_code_definition_raw(
                 &self.realm_identifier,
@@ -712,6 +831,7 @@ impl<
     where
         N::ZKVerifier: 'static,
     {
+        self.require_mutating_service_available_internal(CoordinatorMutatingEdgeOperation::SubmitGuta).await?;
         let realm_id_u64 = input.header.header.state_transition.node_index.to_u64_value();
         println!("Submitting GUTA for realm_id {}\n{:?}", realm_id_u64, input);
 
@@ -749,10 +869,6 @@ impl<
                 unique_pending_id
             );
         }
-        self.temp_db
-            .set_submitted_status_for_pending(&self.realm_identifier, unique_pending_id, realm_id_u64, status)
-            .await?;
-
         let output_proof_job_id = QProvingJobDataID::try_get_coordinator_edge_proof_store_output_proof_id_for_realm_submit(
             realm_id,
             realm_level,
@@ -768,6 +884,22 @@ impl<
                 proof_verifier.verify_zk_proof_from_slice_check_public_inputs_hash(input.job_type_u32, &proof_bytes, expected_public_inputs_hash)
             }
         }).await??;
+        self.require_mutating_service_available_internal(CoordinatorMutatingEdgeOperation::SubmitGuta).await?;
+        if self
+            .temp_db
+            .get_submitted_status_for_pending(&self.realm_identifier, unique_pending_id, realm_id_u64)
+            .await?
+            != 0
+        {
+            anyhow::bail!(
+                "GUTA for realm_id {} at unique_pending_id {} was submitted while proof verification was running",
+                realm_id,
+                unique_pending_id
+            );
+        }
+        self.temp_db
+            .set_submitted_status_for_pending(&self.realm_identifier, unique_pending_id, realm_id_u64, status)
+            .await?;
         if self
             .temp_db
             .get_submitted_status_for_pending(&self.realm_identifier, unique_pending_id, realm_id_u64)

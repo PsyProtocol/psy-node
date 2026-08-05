@@ -30,7 +30,10 @@ use parth_core::crypto::secp256k1::REQUEST_TYPE_SUBMIT_PROOF;
 
 use crate::{
     reputation::WorkerReputationOps,
-    coordinator::{edge::handler::CoordinatorEdgeHandler, queue_key::CoordinatorProvingWorkQueueKey},
+    coordinator::{
+        edge::handler::{CoordinatorEdgeHandler, CoordinatorMutatingEdgeOperation},
+        queue_key::CoordinatorProvingWorkQueueKey,
+    },
 };
 fn verify_api_signature(signature: &QEDCompressedSecp256K1Signature, request: &SimpleTimedRequest) -> bool {
     request.get_sig_hash::<parth_crypto::hash::sha256::CoreSha256Hasher>() == signature.message
@@ -149,6 +152,10 @@ impl<
         signature: QEDCompressedSecp256K1Signature,
         request: SimpleTimedRequest,
     ) -> anyhow::Result<PsyWorkerGetProvingWorkAPIResponse<N::QHash, N::JobId>> {
+        self.require_mutating_service_available_internal(
+            CoordinatorMutatingEdgeOperation::GetProvingWork,
+        )
+        .await?;
         self.verify_miner_api_signature_and_check_reputation(&signature, &request).await?;
 
         let (unique_pending_id, unique_proc_id) = self.get_current_unique_pending_id_internal().await?;
@@ -161,6 +168,10 @@ impl<
             queue_type: QPBaseQueueType::WorkerQueue,
             _phantom_queue_item: std::marker::PhantomData,
         };
+        self.require_mutating_service_available_internal(
+            CoordinatorMutatingEdgeOperation::GetProvingWork,
+        )
+        .await?;
         let work_item: Option<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>> = self
             .get_proof_work_queue
             .get_next_worker_queue_item_or_none(&queue_key, self.realm_id_u64, self.realm_sub_id_u64, unique_proc_id, 0)
@@ -221,6 +232,10 @@ impl<
         signature: QEDCompressedSecp256K1Signature,
         request: SimpleTimedRequest,
     ) -> anyhow::Result<PsyWorkerGetProvingWorkWithChildProofsAPIResponse<N::QHash, N::JobId>> {
+        self.require_mutating_service_available_internal(
+            CoordinatorMutatingEdgeOperation::GetProvingWorkWithChildProofs,
+        )
+        .await?;
         self.verify_miner_api_signature_and_check_reputation(&signature, &request).await?;
 
         let (unique_pending_id, unique_proc_id) = self.get_current_unique_pending_id_internal().await?;
@@ -233,6 +248,10 @@ impl<
             queue_type: QPBaseQueueType::WorkerQueue,
             _phantom_queue_item: std::marker::PhantomData,
         };
+        self.require_mutating_service_available_internal(
+            CoordinatorMutatingEdgeOperation::GetProvingWorkWithChildProofs,
+        )
+        .await?;
         let work_item: Option<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>> = self
             .get_proof_work_queue
             .get_next_worker_queue_item_or_none(&queue_key, self.realm_id_u64, self.realm_sub_id_u64, unique_proc_id, 0)
@@ -365,6 +384,10 @@ impl<
     where
         N::ZKVerifier: 'static,
     {
+        self.require_mutating_service_available_internal(
+            CoordinatorMutatingEdgeOperation::SubmitProofRaw,
+        )
+        .await?;
         if !verify_api_signature(&signature, &request) || request.request_type != REQUEST_TYPE_SUBMIT_PROOF {
             anyhow::bail!("invalid signature for submit_proof_raw");
         }
@@ -383,6 +406,10 @@ impl<
             .get_proof_claim_tag(&self.realm_identifier, unique_pending_id, job_id.get_input_witness_id())
             .await?;
         if expected_tag != tag {
+            self.require_mutating_service_available_internal(
+                CoordinatorMutatingEdgeOperation::SubmitProofRaw,
+            )
+            .await?;
             self.temp_db
                 .apply_reputation_slash_on_tag_mismatch(&self.realm_identifier, &signature.public_key)
                 .await?;
@@ -451,6 +478,15 @@ impl<
                 )
             }
         }).await??;
+
+        // Complete proof validation before the final maintenance check. Once
+        // this boundary is passed, finish the existing multi-store submission
+        // sequence so a mid-sequence rejection cannot create a new partial
+        // proof record.
+        self.require_mutating_service_available_internal(
+            CoordinatorMutatingEdgeOperation::SubmitProofRaw,
+        )
+        .await?;
 
         // HACK: now set the correct reward tree value
         self.temp_db

@@ -10,6 +10,8 @@ use jsonrpsee::{
 };
 use tracing::error;
 
+pub const ROLLBACK_IN_PROGRESS_ERROR_CODE: i32 = -32010;
+
 // Define error enum
 #[derive(Debug, thiserror::Error)]
 pub enum RpcError {
@@ -21,6 +23,8 @@ pub enum RpcError {
     PermissionDenied,
     #[error("Internal error: {0}")]
     Internal(String),
+    #[error("ROLLBACK_IN_PROGRESS:{0}")]
+    RollbackInProgress(String),
     #[error("Anyhow error: {0}")]
     Anyhow(#[from] anyhow::Error),
     // ... more
@@ -35,6 +39,11 @@ impl From<RpcError> for ErrorObjectOwned {
                 ErrorObject::owned(INVALID_REQUEST_CODE, "Permission denied", None::<()>)
             }
             RpcError::Internal(msg) => ErrorObject::owned(INTERNAL_ERROR_CODE, msg, None::<()>),
+            RpcError::RollbackInProgress(phase) => ErrorObject::owned(
+                ROLLBACK_IN_PROGRESS_ERROR_CODE,
+                "ROLLBACK_IN_PROGRESS",
+                Some(phase),
+            ),
             RpcError::Anyhow(msg) => {
                 ErrorObject::owned(UNKNOWN_ERROR_CODE, msg.to_string(), None::<()>)
             }
@@ -54,3 +63,17 @@ impl<T> From<RpcError> for JsonRpcResult<T> {
 }
 
 pub type Result<T, E = RpcError> = core::result::Result<T, E>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rollback_in_progress_has_stable_server_code_and_phase_data() {
+        let error: ErrorObjectOwned =
+            RpcError::RollbackInProgress("PENDING".to_owned()).into();
+        assert_eq!(error.code(), ROLLBACK_IN_PROGRESS_ERROR_CODE);
+        assert_eq!(error.message(), "ROLLBACK_IN_PROGRESS");
+        assert_eq!(error.data().unwrap().get(), "\"PENDING\"");
+    }
+}

@@ -31,6 +31,7 @@ use psy_node_core::{
     psy_core_db::traits::full::{PsyCoordinatorEdgeAPIStoreReader, PsyNodeCheckpointObjectDatabaseReader, PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter},
     psy_temp_db::StandardEdgeAPITempDBStoreBase,
     queue::{ephemeral::QStandardEphemeralQueuePublisher, worker_queue::QStandardWorkerQueueSubscriber},
+    store::rollback_admin::RollbackMaintenanceGateError,
     store::traits::proof_store::QParthProofStore,
 };
 
@@ -39,7 +40,18 @@ use crate::{coordinator::edge::handler::CoordinatorEdgeHandler, realm::edge::err
 type QRpcResult<T> = RpcResult<T>;
 
 fn res<T>(data: anyhow::Result<T>) -> QRpcResult<T> {
-    Ok(data.map_err(RpcError::Anyhow)?)
+    match data {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            if let Some(gate) = error.downcast_ref::<RollbackMaintenanceGateError>() {
+                return Err(RpcError::RollbackInProgress(
+                    gate.phase().as_str().to_owned(),
+                )
+                .into());
+            }
+            Err(RpcError::Anyhow(error).into())
+        }
+    }
 }
 
 const MAX_CHECKPOINT_ID: u64 = i64::MAX as u64;
