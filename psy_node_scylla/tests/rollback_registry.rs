@@ -636,7 +636,10 @@ fn key_domain_registry_is_total_and_matches_typed_resolver() {
 
     let contract_height = key_domain_descriptor(ScyllaKeyDomain::ContractStateTreeHeight);
     assert_eq!(contract_height.prepared_coverage.coordinator, DomainPreparedUpdateCoverage::Indirect);
-    assert_eq!(contract_height.prepared_coverage.realm, DomainPreparedUpdateCoverage::None);
+    assert_eq!(contract_height.prepared_coverage.realm, DomainPreparedUpdateCoverage::Indirect);
+
+    let checkpoint_reward = key_domain_descriptor(ScyllaKeyDomain::CheckpointedRewardsProofAtCheckpoint);
+    assert_eq!(checkpoint_reward.prepared_coverage.realm, DomainPreparedUpdateCoverage::None);
 }
 
 #[test]

@@ -604,7 +604,6 @@ const R_NONE_RS_INDIRECT: PreparedCoverageByAuthority = coverage(NA, DN, DI);
 const SHARED_DIRECT: PreparedCoverageByAuthority = coverage(DD, DD, NA);
 const C_INDIRECT_RS_INDIRECT: PreparedCoverageByAuthority = coverage(DI, NA, DI);
 const C_INDIRECT_R_INDIRECT: PreparedCoverageByAuthority = coverage(DI, DI, NA);
-const C_INDIRECT_R_NONE: PreparedCoverageByAuthority = coverage(DI, DN, NA);
 const SHARED_NONE: PreparedCoverageByAuthority = coverage(DN, DN, NA);
 const UNUSED_COVERAGE: PreparedCoverageByAuthority = coverage(NA, NA, NA);
 
@@ -724,7 +723,9 @@ pub const fn key_domain_descriptor(id: ScyllaKeyDomain) -> KeyDomainDescriptor {
         K::UnusedCheckpointRealmRoot => domain_from_physical(id, P::CheckpointIdToRealmRoot, "unused checkpoint realm root", U, UNUSED_COVERAGE),
         K::LatestInfo => domain_from_physical(id, P::LatestInfo, "mutable latest-info slots", DO, C_INDIRECT_RS_INDIRECT),
         K::CheckpointedGlobalUserProof => domain_desc(id, P::CheckpointedObject, "obj_id=1 checkpoint proof", D, R_NONE_RS_INDIRECT, XC, AV, RB, MB, PSY_VALUES, Blocked(BM)),
-        K::CheckpointedRewardsProofAtCheckpoint => domain_desc(id, P::CheckpointedObject, "obj_id=2 checkpoint reward proof", D, R_NONE_RS_INDIRECT, XC, AV, RB, MB, PSY_VALUES, Blocked(BM)),
+        K::CheckpointedRewardsProofAtCheckpoint => {
+            domain_desc(id, P::CheckpointedObject, "obj_id=2 checkpoint reward proof", D, R_NONE, XC, AV, RB, MB, PSY_VALUES, Blocked(BM))
+        }
         K::CheckpointedRewardsProofAtPending => domain_desc(id, P::CheckpointedObject, "obj_id=2 pending reward proof", O, R_NONE, XL, PO, RN, MO, PSY_VALUES, Blocked(BM)),
         K::CheckpointedContractStateProof => domain_desc(id, P::CheckpointedObject, "obj_id=3 checkpoint contract-state proof", D, R_NONE, XC, AV, RB, MB, PSY_VALUES, Blocked(BM)),
         K::CheckpointStateRoots => domain_from_physical(id, P::CheckpointStateRoots, "checkpoint state roots", A, C_INDIRECT_RS_INDIRECT),
@@ -732,7 +733,9 @@ pub const fn key_domain_descriptor(id: ScyllaKeyDomain) -> KeyDomainDescriptor {
         K::UserPublicKey => domain_from_physical(id, P::UserPublicKey, "coordinator user public key", A, C_DIRECT),
         K::U64Singleton => domain_from_physical(id, P::U64Singleton, "mutable latest-checkpoint singleton", DO, C_INDIRECT_R_INDIRECT),
         K::U64Counter => domain_from_physical(id, P::U64CounterSingleton, "monotonic pending counter", O, SHARED_NONE),
-        K::ContractStateTreeHeight => domain_from_physical(id, P::ContractStateTreeHeight, "contract tree height", D, C_INDIRECT_R_NONE),
+        K::ContractStateTreeHeight => {
+            domain_from_physical(id, P::ContractStateTreeHeight, "contract tree height", D, C_INDIRECT_R_INDIRECT)
+        }
         K::CheckpointToPending => domain_from_physical(id, P::CheckpointIdToPendingId, "reusable checkpoint -> pending", O, C_INDIRECT_R_INDIRECT),
         K::PendingToCheckpoint => domain_from_physical(id, P::PendingIdToCheckpointId, "pending -> checkpoint", O, C_INDIRECT_R_INDIRECT),
         K::PendingToProc => domain_from_physical(id, P::PendingIdToPendingProcIdU64ToU128, "pending -> proc UUID", O, C_INDIRECT_R_INDIRECT),
