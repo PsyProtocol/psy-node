@@ -20,12 +20,18 @@ use psy_node_core::{
         infrastructure::QStandardQueueBase,
     },
     store::traits::{
-        proof_store::{QParthProofStoreReader, QParthProofStoreWriter},
+        proof_store::{
+            QCanonicalProofStoreV2, QParthProofStoreReader,
+            QParthProofStoreWriter,
+        },
         temp_db::{
             QTempDatabaseRawCounterReaderBase, QTempDatabaseRawCounterWriterBase,
             QTempDatabaseRawKVReaderBase, QTempDatabaseRawKVWriterBase,
         },
     },
+};
+use psy_node_core::store::proof_namespace::{
+    CanonicalProofStoreAddress, CanonicalProofStoreNamespace,
 };
 
 // Fred Pool alias
@@ -625,6 +631,51 @@ impl QParthProofStoreWriter for StandardFredRedisStore {
     async fn delete_all_proofs_for_pending_id(&self, unique_pending_id: u64) -> anyhow::Result<()> {
         let bucket = get_tmp_proof_store_bucket_ns_key(&self.root_prefix, self.realm_id, self.realm_sub_id, unique_pending_id);
         let _: i64 = self.client.del(&bucket).await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl QCanonicalProofStoreV2 for StandardFredRedisStore {
+    async fn get_proof_bytes_exact(
+        &self,
+        address: &CanonicalProofStoreAddress,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        let data: Option<Vec<u8>> = self
+            .client
+            .hget(address.redis_hash_key(), address.job_field())
+            .await?;
+        Ok(data.filter(|proof| !proof.is_empty()))
+    }
+
+    async fn contains_proof_exact(
+        &self,
+        address: &CanonicalProofStoreAddress,
+    ) -> anyhow::Result<bool> {
+        Ok(self
+            .client
+            .hexists(address.redis_hash_key(), address.job_field())
+            .await?)
+    }
+
+    async fn put_proof_bytes_exact(
+        &self,
+        address: &CanonicalProofStoreAddress,
+        proof_bytes: &[u8],
+    ) -> anyhow::Result<()> {
+        self.set_proof_bytes_internal(
+            address.redis_hash_key(),
+            address.job_field(),
+            proof_bytes,
+        )
+        .await
+    }
+
+    async fn delete_proof_namespace_exact(
+        &self,
+        namespace: &CanonicalProofStoreNamespace,
+    ) -> anyhow::Result<()> {
+        let _: i64 = self.client.del(namespace.redis_hash_key()).await?;
         Ok(())
     }
 }
