@@ -5,6 +5,7 @@
 //! not connected to production setup or current writers.
 
 mod canonical_head_prototype;
+mod rollback_admission;
 mod identity;
 mod key;
 mod mutation;
@@ -18,6 +19,7 @@ mod timestamped;
 mod registry;
 
 pub use canonical_head_prototype::*;
+pub use rollback_admission::*;
 pub use identity::*;
 pub use key::*;
 pub use mutation::*;

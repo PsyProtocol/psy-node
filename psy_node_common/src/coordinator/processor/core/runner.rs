@@ -11,6 +11,7 @@ use psy_node_core::{
         worker_queue::{QStandardWorkerQueuePublisher, QStandardWorkerQueueSubscriber},
     },
     store::traits::proof_store::QParthProofStore,
+    store::rollback_admission::RollbackAdmissionBoundaryOutcome,
 };
 use tokio::time::sleep;
 
@@ -61,6 +62,37 @@ where
 
             if current_slot != last_slot && current_slot % 60 == 0 {
                 last_slot = current_slot;
+                let admission = processor
+                    .db
+                    .reconcile_rollback_admission_at_loop_boundary()
+                    .await;
+                match admission {
+                    Ok(RollbackAdmissionBoundaryOutcome::Maintenance(head)) => {
+                        tracing::warn!(
+                            "[COORDINATOR] Rollback maintenance active at epoch {}, checkpoint {}; normal block processing remains parked",
+                            head.canonical_ref().chain_epoch().get(),
+                            head.canonical_ref().checkpoint().checkpoint_id().get(),
+                        );
+                        continue;
+                    }
+                    Ok(RollbackAdmissionBoundaryOutcome::StaleCommandRejected(head)) => {
+                        tracing::warn!(
+                            "[COORDINATOR] Rejected stale rollback command at current epoch {}, checkpoint {}; continuing normal processing",
+                            head.canonical_ref().chain_epoch().get(),
+                            head.canonical_ref().checkpoint().checkpoint_id().get(),
+                        );
+                    }
+                    Ok(RollbackAdmissionBoundaryOutcome::Normal(_)) => {}
+                    Err(error) => {
+                        let error = format!(
+                            "coordinator rollback admission boundary failed at slot {}: {:#}",
+                            current_slot, error
+                        );
+                        processor.db.status.set_error(error.clone());
+                        tracing::error!("{error}");
+                        continue;
+                    }
+                }
                 let start_processing_at = std::time::Instant::now();
                 tracing::debug!("[COORDINATOR] Process block starting...");
                 let result = processor.process_block().await;

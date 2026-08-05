@@ -68,6 +68,7 @@ pub async fn run_startup_plonky2_scylla_coordinator_processor_node(config: &Coor
             type N = QNetworkTypesConfigHelper<QProvingJobDataID, ZKTypesPlonky2GoldilocksPoseidon, PsyNetworkLocalDevnetConstants>;
             let db = setup_coordinator_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url, true).await?;
             let canonical_head_store = db.store.clone();
+            let rollback_admission_store = db.store.clone();
             let db = Arc::new(db);
             let tag_tree_rewards_store = db.clone();
             create_coordinator_processor_and_run::<N, _, _, _, _, _, _, _, _, _>(
@@ -75,6 +76,7 @@ pub async fn run_startup_plonky2_scylla_coordinator_processor_node(config: &Coor
                 config.network,
                 config.canonical_head_bootstrap_profile,
                 canonical_head_store,
+                rollback_admission_store,
                 circuit_fingerprint_config,
                 file_system,
                 deploy_contract_gatherer_backup_directory,

@@ -329,5 +329,8 @@ pub async fn setup_coordinator_psy_scylla_database_store_from_connection_string<
     db.store
         .initialize_coordinator_canonical_head(create_tables)
         .await?;
+    db.store
+        .initialize_coordinator_rollback_admission(create_tables)
+        .await?;
     Ok(db)
 }

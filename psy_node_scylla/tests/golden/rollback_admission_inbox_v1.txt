@@ -1,0 +1,8 @@
+CreateTable|
+CREATE TABLE IF NOT EXISTS psy_c01d_control_no_tablet.coordinator_rollback_admission_inbox (network_chain_id bigint PRIMARY KEY, revision bigint, slot blob)
+Read|network_chain_id:BIGINT
+SELECT network_chain_id, revision, slot FROM psy_c01d_control_no_tablet.coordinator_rollback_admission_inbox WHERE network_chain_id = ?
+Bootstrap|network_chain_id:BIGINT,candidate_revision:BIGINT,candidate_slot:BLOB
+INSERT INTO psy_c01d_control_no_tablet.coordinator_rollback_admission_inbox (network_chain_id, revision, slot) VALUES (?, ?, ?) IF NOT EXISTS
+CompareAndSet|candidate_revision:BIGINT,candidate_slot:BLOB,network_chain_id:BIGINT,expected_revision:BIGINT,expected_slot:BLOB
+UPDATE psy_c01d_control_no_tablet.coordinator_rollback_admission_inbox SET revision = ?, slot = ? WHERE network_chain_id = ? IF revision = ? AND slot = ?

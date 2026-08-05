@@ -21,6 +21,7 @@ use psy_node_core::{
     store::canonical_head::{
         CanonicalHeadBootstrapProfile, CoordinatorCanonicalHeadStore,
     },
+    store::rollback_admission::CoordinatorRollbackAdmissionStore,
 };
 
 use crate::coordinator::processor::{PsyCoordinatorProcessor, db::PsyCoordinatorDatabaseProcessor, runner::run_coordinator_processor};
@@ -41,6 +42,7 @@ pub async fn create_coordinator_processor<
     network: PsyChainNetworkType,
     canonical_head_bootstrap_profile: Option<CanonicalHeadBootstrapProfile>,
     canonical_head_store: Arc<dyn CoordinatorCanonicalHeadStore<N::QHash>>,
+    rollback_admission_store: Arc<dyn CoordinatorRollbackAdmissionStore<N::QHash>>,
     file_system: Arc<FileSystem>,
     deploy_contract_gatherer_backup_directory: String,
     register_user_gatherer_backup_directory: String,
@@ -109,6 +111,7 @@ where
     let db = PsyCoordinatorDatabaseProcessor::<N, _, _, _, _, _, _, _, _, FileSystem>::new_init(
         db,
         canonical_head_store,
+        rollback_admission_store,
         network,
         canonical_head_bootstrap_profile,
         tag_tree_rewards_store,
@@ -201,6 +204,7 @@ pub async fn create_coordinator_processor_and_run<
     network: PsyChainNetworkType,
     canonical_head_bootstrap_profile: Option<CanonicalHeadBootstrapProfile>,
     canonical_head_store: Arc<dyn CoordinatorCanonicalHeadStore<N::QHash>>,
+    rollback_admission_store: Arc<dyn CoordinatorRollbackAdmissionStore<N::QHash>>,
     circuit_fingerprint_config: PsyNodeCircuitFingerprintConfig<N::QHash>,
     file_system: Arc<FileSystem>,
     deploy_contract_gatherer_backup_directory: String,
@@ -226,6 +230,7 @@ where
         network,
         canonical_head_bootstrap_profile,
         canonical_head_store,
+        rollback_admission_store,
         file_system,
         deploy_contract_gatherer_backup_directory,
         register_user_gatherer_backup_directory,

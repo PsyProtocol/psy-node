@@ -53,6 +53,11 @@ use psy_node_core::{
             CanonicalHeadWriteOutcome, CoordinatorCanonicalHeadStore, NetworkId,
             StoredCanonicalHead,
         },
+        rollback_admission::{
+            CoordinatorRollbackAdmissionBoundary,
+            CoordinatorRollbackAdmissionStore,
+            RollbackAdmissionBoundaryOutcome,
+        },
         traits::proof_store::QParthProofStore,
     },
 };
@@ -153,6 +158,7 @@ pub struct PsyCoordinatorDatabaseProcessor<
     pub temp_db: Arc<TempDatabase>,
     pub proof_store: Arc<ProofStore>,
     canonical_head_store: Arc<dyn CoordinatorCanonicalHeadStore<N::QHash>>,
+    rollback_admission_boundary: CoordinatorRollbackAdmissionBoundary<N::QHash>,
 
     //queues
     pub guta_update_queue: Arc<GUTAUpdateQueue>,
@@ -295,6 +301,7 @@ impl<
     pub async fn new_init(
         db: Arc<S>,
         canonical_head_store: Arc<dyn CoordinatorCanonicalHeadStore<N::QHash>>,
+        rollback_admission_store: Arc<dyn CoordinatorRollbackAdmissionStore<N::QHash>>,
         network: PsyChainNetworkType,
         canonical_head_bootstrap_profile: Option<CanonicalHeadBootstrapProfile>,
         tag_tree_rewards_store: Arc<STagTreeRewards>,
@@ -447,6 +454,12 @@ impl<
             last_chain_hash,
         };
         let status = ProcessorStatus::new();
+        let network_id = NetworkId::from(network);
+        let rollback_admission_boundary = CoordinatorRollbackAdmissionBoundary::new(
+            network_id,
+            canonical_head_store.clone(),
+            rollback_admission_store,
+        );
         let mut processor = Self {
             db,
             status: status.clone(),
@@ -454,6 +467,7 @@ impl<
             temp_db,
             proof_store,
             canonical_head_store,
+            rollback_admission_boundary,
             guta_update_queue,
             register_user_queue,
             deploy_contract_queue,
@@ -497,7 +511,7 @@ impl<
                 _phantom_queue_item: std::marker::PhantomData,
             }, status.clone()),
             needs_revert: false,
-            network_id: NetworkId::from(network),
+            network_id,
             genesis_checkpoint_state_transition_hash,
             last_committed,
             ids,
@@ -507,7 +521,25 @@ impl<
         processor
             .reconcile_canonical_head_on_startup(canonical_head_bootstrap_profile)
             .await?;
+        processor
+            .rollback_admission_boundary
+            .ensure_slot_initialized()
+            .await?;
         Ok(processor)
+    }
+
+    /// The only production bridge from an external durable inbox command to
+    /// canonical-head rollback admission. The runner calls this immediately
+    /// before starting a new block, never from Edge or inside proof execution.
+    pub async fn reconcile_rollback_admission_at_loop_boundary(
+        &mut self,
+    ) -> anyhow::Result<RollbackAdmissionBoundaryOutcome<N::QHash>> {
+        let outcome = self
+            .rollback_admission_boundary
+            .reconcile_at_loop_boundary()
+            .await?;
+        self.canonical_head = Some(*outcome.canonical_head());
+        Ok(outcome)
     }
 
     fn materialized_checkpoint_ref(&self) -> CheckpointRef<N::QHash> {

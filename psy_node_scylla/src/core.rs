@@ -10,9 +10,17 @@ use psy_node_core::store::canonical_head::{
     CoordinatorCanonicalHeadReader, CoordinatorCanonicalHeadStore, NetworkId,
     SealedCanonicalHeadCas,
 };
+use psy_node_core::store::rollback_admission::{
+    CoordinatorRollbackAdmissionReader, CoordinatorRollbackAdmissionStore,
+    RollbackAdmissionSlotBootstrap, RollbackAdmissionSlotReadState,
+    RollbackAdmissionSlotWriteOutcome, SealedRollbackAdmissionSlotCas,
+};
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
-use crate::rollback::{CanonicalHeadNoTabletKeyspace, ScyllaCanonicalHeadStore};
+use crate::rollback::{
+    CanonicalHeadNoTabletKeyspace, ScyllaCanonicalHeadStore,
+    ScyllaRollbackAdmissionStore,
+};
 use crate::tables::{merkle::ScyllaMerkleNodesZeroPreparedStatements, traits::ScyllaStandardPreparedTableStatements};
 use crate::tables::traits::ScyllaNoTabletPreparedTableStatements;
 
@@ -24,6 +32,7 @@ pub struct ScyllaCoreStore<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> {
     pub realm_id: u64,
     pub realm_sub_id: u64,
     canonical_head_store: Arc<OnceLock<Arc<ScyllaCanonicalHeadStore>>>,
+    rollback_admission_store: Arc<OnceLock<Arc<ScyllaRollbackAdmissionStore>>>,
     _phantom_hash: std::marker::PhantomData<Hash>,
     _phantom_hasher: std::marker::PhantomData<Hasher>,
 }
@@ -82,6 +91,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
             realm_id,
             realm_sub_id,
             canonical_head_store: Arc::new(OnceLock::new()),
+            rollback_admission_store: Arc::new(OnceLock::new()),
             _phantom_hash: std::marker::PhantomData,
             _phantom_hasher: std::marker::PhantomData,
         })
@@ -164,12 +174,44 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
         Ok(())
     }
 
+    /// Initialize the Coordinator-only durable admin-to-Processor inbox in
+    /// the same no-tablet control keyspace as the canonical-head authority.
+    pub async fn initialize_coordinator_rollback_admission(
+        &self,
+        create_schema: bool,
+    ) -> anyhow::Result<()> {
+        let keyspace = CanonicalHeadNoTabletKeyspace::try_new(
+            self.no_tablet_keyspace.clone(),
+        )?;
+        if create_schema {
+            ScyllaRollbackAdmissionStore::create_schema(&self.session, &keyspace).await?;
+        }
+        let adapter = Arc::new(
+            ScyllaRollbackAdmissionStore::prepare(self.session.clone(), keyspace).await?,
+        );
+        self.rollback_admission_store
+            .set(adapter)
+            .map_err(|_| anyhow::anyhow!("Coordinator rollback-admission store initialized more than once"))?;
+        Ok(())
+    }
+
     fn coordinator_canonical_head(&self) -> anyhow::Result<&ScyllaCanonicalHeadStore> {
         self.canonical_head_store
             .get()
             .map(Arc::as_ref)
             .ok_or_else(|| anyhow::anyhow!(
                 "Coordinator canonical-head store was not initialized by Coordinator setup"
+            ))
+    }
+
+    fn coordinator_rollback_admission(
+        &self,
+    ) -> anyhow::Result<&ScyllaRollbackAdmissionStore> {
+        self.rollback_admission_store
+            .get()
+            .map(Arc::as_ref)
+            .ok_or_else(|| anyhow::anyhow!(
+                "Coordinator rollback-admission store was not initialized by Coordinator setup"
             ))
     }
 }
@@ -210,6 +252,49 @@ where
     ) -> anyhow::Result<CanonicalHeadWriteOutcome<Hash>> {
         Ok(self
             .coordinator_canonical_head()?
+            .compare_and_set(sealed)
+            .await?)
+    }
+}
+
+#[async_trait]
+impl<Hash, Hasher> CoordinatorRollbackAdmissionReader<Hash>
+    for ScyllaCoreStore<Hash, Hasher>
+where
+    Hash: QHashBase + Q256BitHash,
+    Hasher: MerkleZeroHasher<Hash> + Send + Sync,
+{
+    async fn read_rollback_admission_slot(
+        &self,
+        network: NetworkId,
+    ) -> anyhow::Result<RollbackAdmissionSlotReadState<Hash>> {
+        Ok(self.coordinator_rollback_admission()?.read(network).await?)
+    }
+}
+
+#[async_trait]
+impl<Hash, Hasher> CoordinatorRollbackAdmissionStore<Hash>
+    for ScyllaCoreStore<Hash, Hasher>
+where
+    Hash: QHashBase + Q256BitHash,
+    Hasher: MerkleZeroHasher<Hash> + Send + Sync,
+{
+    async fn bootstrap_rollback_admission_slot(
+        &self,
+        bootstrap: &RollbackAdmissionSlotBootstrap<Hash>,
+    ) -> anyhow::Result<RollbackAdmissionSlotWriteOutcome<Hash>> {
+        Ok(self
+            .coordinator_rollback_admission()?
+            .bootstrap(bootstrap)
+            .await?)
+    }
+
+    async fn compare_and_set_rollback_admission_slot(
+        &self,
+        sealed: &SealedRollbackAdmissionSlotCas<Hash>,
+    ) -> anyhow::Result<RollbackAdmissionSlotWriteOutcome<Hash>> {
+        Ok(self
+            .coordinator_rollback_admission()?
             .compare_and_set(sealed)
             .await?)
     }
