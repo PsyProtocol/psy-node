@@ -124,6 +124,7 @@ async fn main() -> anyhow::Result<()> {
             verbose,
             port,
             listen,
+            rollback_admin_rpc_enabled,
             proving_backend,
         } => {
             let config = CoordinatorEdgeCliConfig::get_start_config(
@@ -138,6 +139,7 @@ async fn main() -> anyhow::Result<()> {
                 verbose,
                 port,
                 listen,
+                rollback_admin_rpc_enabled,
             )
             .await?;
             start_coordinator_edge::run(config, get_proving_backend_from_input(proving_backend)).await?;

@@ -19,6 +19,9 @@ use psy_data::{
     }
 };
 use crate::CheckpointJobStats;
+use crate::coordinator::rollback_admin::{
+    RollbackAdminStartRequest, RollbackAdminStartResponse, RollbackAdminStatus,
+};
 
 #[rpc(server, client, namespace = "psy")]
 pub trait CoordinatorEdgeRpc<F, Hash, JobId, ZKProof>: NodeEdgeWorkerRpcServer<Hash, JobId> {
@@ -49,6 +52,18 @@ pub trait CoordinatorEdgeRpc<F, Hash, JobId, ZKProof>: NodeEdgeWorkerRpcServer<H
     /// Read the complete durable Coordinator canonical identity atomically.
     #[method(name = "get_canonical_chain_ref")]
     async fn get_canonical_chain_ref(&self) -> RpcResult<CanonicalChainRef<Hash>>;
+
+    /// Queue a rollback request in the durable Coordinator inbox. `ACCEPTED`
+    /// means queued, not active; the Processor remains the sole consumer.
+    #[method(name = "admin_start_rollback")]
+    async fn admin_start_rollback(
+        &self,
+        request: RollbackAdminStartRequest<Hash>,
+    ) -> RpcResult<RollbackAdminStartResponse<Hash>>;
+
+    /// Observe the canonical control and admission inbox together.
+    #[method(name = "admin_get_rollback_status")]
+    async fn admin_get_rollback_status(&self) -> RpcResult<RollbackAdminStatus<Hash>>;
 
     #[method(name = "get_checkpoint_id_for_unique_pending_id")]
     async fn get_checkpoint_id_for_unique_pending_id(&self, unique_pending_id: u64) -> RpcResult<Option<u64>>;

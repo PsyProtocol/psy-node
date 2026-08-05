@@ -104,4 +104,8 @@ pub struct CoordinatorEdgeStartConfig {
     pub verbose: bool,
     pub port: u16,
     pub listen: String,
+    /// Disabled by default. When enabled, the Edge may only enqueue a typed
+    /// request; it still cannot publish canonical rollback control.
+    #[serde(default)]
+    pub rollback_admin_rpc_enabled: bool,
 }

@@ -7,7 +7,10 @@ use psy_data::
     config::network_config::PsyNodeCircuitFingerprintConfigProvider
 ;
 use psy_node_common::{coordinator::edge::{handler::CoordinatorEdgeHandler, server::start_coordinator_edge_rpc_server}, realm::edge::{handler::RealmEdgeHandler, server::start_realm_edge_rpc_server}};
-use psy_node_core::config::node_start_config::{CoordinatorEdgeStartConfig, RealmEdgeStartConfig};
+use psy_node_core::{
+    config::node_start_config::{CoordinatorEdgeStartConfig, RealmEdgeStartConfig},
+    store::rollback_admin::{CoordinatorRollbackAdminInbox, RollbackAdminInboxAccess},
+};
 use psy_node_nats::psy_queue::setup_nats_psy_queue_from_connection_str;
 use psy_node_redis::store::{new_redis_async_pool, StandardRedisStore};
 use psy_node_scylla::psy_setup::{
@@ -71,11 +74,22 @@ pub async fn run_startup_plonky2_scylla_edge_node(config: &CoordinatorEdgeStartC
             type N = QNetworkTypesConfigHelper<QProvingJobDataID, ZKTypesPlonky2GoldilocksPoseidon, PsyNetworkLocalDevnetConstants>;
             let db = setup_coordinator_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url, false).await?;
             let canonical_head_reader = db.store.clone();
+            let rollback_admin_inbox = Arc::new(CoordinatorRollbackAdminInbox::new(
+                config.network.into(),
+                if config.rollback_admin_rpc_enabled {
+                    RollbackAdminInboxAccess::ManualPreflight
+                } else {
+                    RollbackAdminInboxAccess::Disabled
+                },
+                canonical_head_reader.clone(),
+                db.store.clone(),
+            ));
             let db = Arc::new(db);
             let tag_tree_rewards_store = db.clone();
             let handler = CoordinatorEdgeHandler::<N, _, _, _, _, _, _, _, _>::new(
                 db,
                 canonical_head_reader,
+                rollback_admin_inbox,
                 tag_tree_rewards_store,
                 temp_db,
                 proof_store,

@@ -141,7 +141,7 @@ fn persisted_cells_are_fail_closed() {
 }
 
 #[test]
-fn production_wiring_keeps_edge_read_only_and_processor_at_loop_boundary() {
+fn production_wiring_keeps_edge_inbox_only_and_processor_at_loop_boundary() {
     let setup = fs::read_to_string("src/psy_setup.rs").unwrap();
     assert!(setup.contains("initialize_coordinator_rollback_admission(create_tables)"));
 
@@ -155,7 +155,10 @@ fn production_wiring_keeps_edge_read_only_and_processor_at_loop_boundary() {
 
     let edge = fs::read_to_string("../psy_node_common/src/coordinator/edge/handler.rs").unwrap();
     assert!(!edge.contains("CoordinatorRollbackAdmissionStore"));
-    assert!(!edge.contains("start_rollback"));
+    assert!(!edge.contains("CoordinatorCanonicalHeadStore"));
+    assert!(!edge.contains("compare_and_set_canonical_head"));
+    assert!(edge.contains("admin_start_rollback_internal"));
+    assert!(edge.contains("rollback_admin_inbox.start(intent)"));
 }
 
 #[test]

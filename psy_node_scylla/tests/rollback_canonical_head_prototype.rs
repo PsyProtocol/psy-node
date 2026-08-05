@@ -718,7 +718,9 @@ fn qualified_adapter_is_wired_only_into_coordinator_production() {
         "setup_coordinator_psy_scylla_database_store_from_connection_string"
     ));
     assert!(!coordinator_edge.contains("CoordinatorCanonicalHeadStore"));
-    assert!(!coordinator_edge.contains("start_rollback"));
+    assert!(!coordinator_edge.contains("compare_and_set_canonical_head"));
+    assert!(coordinator_edge.contains("admin_start_rollback_internal"));
+    assert!(coordinator_edge.contains("rollback_admin_inbox.start(intent)"));
     assert!(!realm_processor_db.contains("CoordinatorCanonicalHeadStore"));
     assert!(!realm_processor_create.contains("CoordinatorCanonicalHeadStore"));
 }

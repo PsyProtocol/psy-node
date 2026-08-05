@@ -6,10 +6,19 @@ use parth_core::{
 };
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_crypto::hash::tx_hash::{compute_deploy_contract_content_hash, hash_to_hex};
-use psy_api_core::CheckpointJobStats;
+use psy_api_core::{
+    CheckpointJobStats,
+    coordinator::rollback_admin::{
+        ROLLBACK_ADMIN_START_REQUEST_VERSION, RollbackAdminExecutionMode,
+        RollbackAdminPhase, RollbackAdminRequestSummary, RollbackAdminStartDisposition,
+        RollbackAdminStartRequest, RollbackAdminStartResponse, RollbackAdminStatus,
+    },
+};
 use psy_data::{
     guta::header_extended::{GlobalUserTreeAggregatorHeaderWithTagValueAndJobID, GlobalUserTreeAggregatorHeaderWithTagValueAndJobType}, prepared_block::realm::PsyRealmCoordinatorUpdate,
-    protocol::canonical_chain::{CanonicalChainRef, NetworkId}, v1::{
+    protocol::canonical_chain::{
+        CanonicalChainRef, CheckpointHash, CheckpointId, CheckpointRef, NetworkId,
+    }, v1::{
         common_api::PsyProoffMinerRewardProof,
         qdata::{
             checkpoint::PQEDCheckpointGlobalStateRoots, checkpoint_sync::PQEDCheckpointSyncInfoCompact, contract::{DashMapContractHeightCache, PQBCDeployContract, PsyDeployContractQueueItem}, public_key::PZKPublicKeyInfo
@@ -20,12 +29,179 @@ use psy_node_core::{
     psy_core_db::traits::full::{PsyCoordinatorEdgeAPIStoreReader, PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter},
     psy_temp_db::StandardEdgeAPITempDBStoreBase,
     queue::{ephemeral::QStandardEphemeralQueuePublisher, worker_queue::QStandardWorkerQueueSubscriber},
-    store::canonical_head::{CanonicalHeadReadState, CoordinatorCanonicalHeadReader},
+    store::{
+        canonical_head::{CanonicalHeadReadState, CanonicalHeadRevision, CoordinatorCanonicalHeadReader},
+        rollback_admin::{
+            CoordinatorRollbackAdminInbox, RollbackAdminInboxAccess,
+            RollbackAdminInboxPhase, RollbackAdminInboxStatus,
+            RollbackAdminStartDisposition as CoreRollbackAdminStartDisposition,
+            RollbackAdminStartIntent,
+        },
+        rollback_control::{
+            RollbackExecutionMode, RollbackPlanDigest, RollbackRequest,
+        },
+        timestamp::{CommitWriteTimestampUs, TimestampFenceWindow},
+    },
     store::traits::proof_store::QParthProofStore,
 };
 use psy_serialize::{PsyCanonicalDatabaseSerializeBaseMulti, PsyCanonicalDatabaseSerializeBaseSingle};
 
 use crate::coordinator::queue_key::{CoordinatorDeployContractQueueKey, CoordinatorRegisterUserPublicKeyQueueKey, CoordinatorSubmitRealmGUTAUpdateQueueKey};
+
+fn map_admin_disposition(
+    disposition: CoreRollbackAdminStartDisposition,
+) -> RollbackAdminStartDisposition {
+    match disposition {
+        CoreRollbackAdminStartDisposition::Accepted => RollbackAdminStartDisposition::Accepted,
+        CoreRollbackAdminStartDisposition::Idempotent => {
+            RollbackAdminStartDisposition::Idempotent
+        }
+        CoreRollbackAdminStartDisposition::Disabled => {
+            RollbackAdminStartDisposition::RollbackAdminDisabled
+        }
+        CoreRollbackAdminStartDisposition::AlreadyActive => {
+            RollbackAdminStartDisposition::RollbackAlreadyInProgress
+        }
+        CoreRollbackAdminStartDisposition::HeadMismatch => {
+            RollbackAdminStartDisposition::HeadMismatch
+        }
+        CoreRollbackAdminStartDisposition::Conflict => {
+            RollbackAdminStartDisposition::RollbackAdmissionConflict
+        }
+    }
+}
+
+#[cfg(test)]
+mod rollback_admin_tests {
+    use parth_core::PHash;
+    use psy_data::protocol::canonical_chain::{
+        CanonicalChainRef, ChainEpoch, CheckpointHash, CheckpointId, CheckpointRef,
+        NetworkId,
+    };
+
+    use super::*;
+
+    fn request() -> RollbackAdminStartRequest<PHash> {
+        RollbackAdminStartRequest {
+            request_version: ROLLBACK_ADMIN_START_REQUEST_VERSION,
+            expected_revision: 7,
+            expected_canonical_ref: CanonicalChainRef::new(
+                NetworkId::try_from_chain_id(0x6979_7350).unwrap(),
+                ChainEpoch::new(2),
+                CheckpointRef::new(
+                    CheckpointId::new(100),
+                    CheckpointHash::from_last_chain_hash(PHash::from_values(1, 2, 3, 4)),
+                ),
+            ),
+            target_checkpoint_id: 90,
+            target_checkpoint_hash: PHash::from_values(5, 6, 7, 8),
+            orphan_write_max_timestamp_us: 1_000,
+            delete_fence_timestamp_us: 1_001,
+            new_branch_write_timestamp_us: 1_002,
+            execution_mode: RollbackAdminExecutionMode::InPlace,
+            plan_digest_hex: format!("0x{}", "a5".repeat(32)),
+        }
+    }
+
+    #[test]
+    fn valid_wire_request_becomes_typed_intent() {
+        let intent = parse_rollback_admin_intent(request()).unwrap();
+        assert_eq!(intent.expected_revision().get(), 7);
+        assert_eq!(intent.target().checkpoint_id().get(), 90);
+        assert_eq!(intent.fence_window().delete_fence().as_i64(), 1_001);
+        assert_eq!(intent.plan_digest().as_bytes(), &[0xA5; 32]);
+    }
+
+    #[test]
+    fn version_digest_and_timestamp_errors_fail_closed() {
+        let mut invalid = request();
+        invalid.request_version += 1;
+        assert!(
+            parse_rollback_admin_intent(invalid)
+                .unwrap_err()
+                .to_string()
+                .contains("ROLLBACK_ADMIN_UNSUPPORTED_REQUEST_VERSION")
+        );
+
+        let mut invalid = request();
+        invalid.plan_digest_hex = "00".repeat(31);
+        assert!(
+            parse_rollback_admin_intent(invalid)
+                .unwrap_err()
+                .to_string()
+                .contains("ROLLBACK_ADMIN_INVALID_PLAN_DIGEST_LENGTH")
+        );
+
+        let mut invalid = request();
+        invalid.delete_fence_timestamp_us = invalid.orphan_write_max_timestamp_us;
+        assert!(parse_rollback_admin_intent(invalid).is_err());
+    }
+}
+
+fn map_admin_request<Hash: Copy>(
+    request: &RollbackRequest<Hash>,
+) -> RollbackAdminRequestSummary<Hash> {
+    RollbackAdminRequestSummary {
+        requested_checkpoint_id: request.requested_head().checkpoint_id().get(),
+        requested_checkpoint_hash: *request.requested_head().checkpoint_hash().as_inner(),
+        target_checkpoint_id: request.target().checkpoint_id().get(),
+        target_checkpoint_hash: *request.target().checkpoint_hash().as_inner(),
+        execution_mode: match request.execution_mode() {
+            RollbackExecutionMode::InPlace => RollbackAdminExecutionMode::InPlace,
+            RollbackExecutionMode::SnapshotReplay => {
+                RollbackAdminExecutionMode::SnapshotReplay
+            }
+        },
+        plan_digest_hex: hex::encode(request.plan_digest().as_bytes()),
+    }
+}
+
+fn parse_rollback_admin_intent<Hash: Q256BitHash>(
+    request: RollbackAdminStartRequest<Hash>,
+) -> anyhow::Result<RollbackAdminStartIntent<Hash>> {
+    if request.request_version != ROLLBACK_ADMIN_START_REQUEST_VERSION {
+        anyhow::bail!(
+            "ROLLBACK_ADMIN_UNSUPPORTED_REQUEST_VERSION:{}",
+            request.request_version
+        );
+    }
+    let digest_hex = request
+        .plan_digest_hex
+        .strip_prefix("0x")
+        .or_else(|| request.plan_digest_hex.strip_prefix("0X"))
+        .unwrap_or(&request.plan_digest_hex);
+    let digest_bytes = hex::decode(digest_hex)
+        .map_err(|error| anyhow::anyhow!("ROLLBACK_ADMIN_INVALID_PLAN_DIGEST:{error}"))?;
+    let digest: [u8; 32] = digest_bytes.try_into().map_err(|bytes: Vec<u8>| {
+        anyhow::anyhow!(
+            "ROLLBACK_ADMIN_INVALID_PLAN_DIGEST_LENGTH:{}",
+            bytes.len()
+        )
+    })?;
+    let execution_mode = match request.execution_mode {
+        RollbackAdminExecutionMode::InPlace => RollbackExecutionMode::InPlace,
+        RollbackAdminExecutionMode::SnapshotReplay => RollbackExecutionMode::SnapshotReplay,
+    };
+    let orphan_write_max = CommitWriteTimestampUs::try_from_i128(i128::from(
+        request.orphan_write_max_timestamp_us,
+    ))?;
+    let fence_window = TimestampFenceWindow::try_new(
+        orphan_write_max,
+        i128::from(request.delete_fence_timestamp_us),
+        i128::from(request.new_branch_write_timestamp_us),
+    )?;
+    Ok(RollbackAdminStartIntent::new(
+        CanonicalHeadRevision::try_new(request.expected_revision)?,
+        request.expected_canonical_ref,
+        CheckpointRef::new(
+            CheckpointId::new(request.target_checkpoint_id),
+            CheckpointHash::from_last_chain_hash(request.target_checkpoint_hash),
+        ),
+        fence_window,
+        execution_mode,
+        RollbackPlanDigest::try_new(digest)?,
+    ))
+}
 
 // const END_CAP_PROOF_CIRCUIT_TYPE_U32: u32 = ProvingJobCircuitType::UserEndCap as u32;
 pub struct CoordinatorEdgeHandler<
@@ -41,6 +217,7 @@ pub struct CoordinatorEdgeHandler<
 > {
     pub db_reader: Arc<S>,
     pub canonical_head_reader: Arc<dyn CoordinatorCanonicalHeadReader<N::QHash>>,
+    pub rollback_admin_inbox: Arc<CoordinatorRollbackAdminInbox<N::QHash>>,
     pub tag_tree_rewards_store: Arc<STagTreeRewards>,
     pub temp_db: Arc<TempDatabase>,
     pub proof_store: Arc<ProofStore>,
@@ -87,6 +264,7 @@ impl<
         Self {
             db_reader: self.db_reader.clone(),
             canonical_head_reader: self.canonical_head_reader.clone(),
+            rollback_admin_inbox: self.rollback_admin_inbox.clone(),
             tag_tree_rewards_store: self.tag_tree_rewards_store.clone(),
             temp_db: self.temp_db.clone(),
             proof_store: self.proof_store.clone(),
@@ -130,6 +308,7 @@ impl<
     pub fn new(
         db: Arc<S>,
         canonical_head_reader: Arc<dyn CoordinatorCanonicalHeadReader<N::QHash>>,
+        rollback_admin_inbox: Arc<CoordinatorRollbackAdminInbox<N::QHash>>,
         tag_tree_rewards_store: Arc<STagTreeRewards>,
         temp_db: Arc<TempDatabase>,
         proof_store: Arc<ProofStore>,
@@ -147,6 +326,7 @@ impl<
         Self {
             db_reader: db,
             canonical_head_reader,
+            rollback_admin_inbox,
             tag_tree_rewards_store,
             temp_db,
             proof_store,
@@ -161,6 +341,57 @@ impl<
             contract_state_tree_height_cache: Arc::new(DashMapContractHeightCache::new()),
             checkpoint_state_transition_circuit_fingerprint,
             network_id,
+        }
+    }
+
+    pub async fn admin_start_rollback_internal(
+        &self,
+        request: RollbackAdminStartRequest<N::QHash>,
+    ) -> anyhow::Result<RollbackAdminStartResponse<N::QHash>> {
+        let intent = parse_rollback_admin_intent(request)?;
+        let receipt = self.rollback_admin_inbox.start(intent).await?;
+        Ok(RollbackAdminStartResponse {
+            disposition: map_admin_disposition(receipt.disposition()),
+            status: self.map_admin_status(receipt.status()),
+        })
+    }
+
+    pub async fn admin_get_rollback_status_internal(
+        &self,
+    ) -> anyhow::Result<RollbackAdminStatus<N::QHash>> {
+        let status = self.rollback_admin_inbox.status().await?;
+        Ok(self.map_admin_status(&status))
+    }
+
+    fn map_admin_status(
+        &self,
+        status: &RollbackAdminInboxStatus<N::QHash>,
+    ) -> RollbackAdminStatus<N::QHash> {
+        let request = status
+            .canonical_head()
+            .rollback_control()
+            .requested()
+            .or_else(|| {
+                status
+                    .admission_slot()
+                    .state()
+                    .pending()
+                    .map(|command| command.request())
+            })
+            .map(map_admin_request);
+        RollbackAdminStatus {
+            admin_rpc_enabled: self.rollback_admin_inbox.access()
+                == RollbackAdminInboxAccess::ManualPreflight,
+            phase: match status.phase() {
+                RollbackAdminInboxPhase::Idle => RollbackAdminPhase::Idle,
+                RollbackAdminInboxPhase::Pending => RollbackAdminPhase::Pending,
+                RollbackAdminInboxPhase::Active => RollbackAdminPhase::Active,
+                RollbackAdminInboxPhase::Stale => RollbackAdminPhase::Stale,
+            },
+            canonical_revision: status.canonical_head().revision().get(),
+            canonical_ref: *status.canonical_head().canonical_ref(),
+            inbox_revision: status.admission_slot().revision().get(),
+            request,
         }
     }
     pub async fn get_checkpoint_leaves_batch_raw_internal(&self, start_checkpoint_id: u64, count: u32) -> anyhow::Result<Vec<u8>>{

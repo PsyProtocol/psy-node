@@ -320,6 +320,7 @@ pub struct CoordinatorEdgeCliConfig {
     pub verbose: Option<bool>,
     pub port: Option<u16>,
     pub listen: Option<String>,
+    pub rollback_admin_rpc_enabled: Option<bool>,
 }
 
 impl CoordinatorEdgeCliConfig {
@@ -335,6 +336,7 @@ impl CoordinatorEdgeCliConfig {
             verbose: None,
             port: None,
             listen: None,
+            rollback_admin_rpc_enabled: None,
         }
     }
     pub fn into_start_config_with_cli_args(
@@ -349,6 +351,7 @@ impl CoordinatorEdgeCliConfig {
         verbose: bool,
         port: Option<u16>,
         listen: Option<String>,
+        rollback_admin_rpc_enabled: bool,
     ) -> anyhow::Result<CoordinatorEdgeStartConfig> {
         Ok(CoordinatorEdgeStartConfig {
             scylla_db_url: scylla_db_url.or(self.scylla_db_url).ok_or_else(|| anyhow::anyhow!("scylla_db_url is required"))?,
@@ -361,6 +364,8 @@ impl CoordinatorEdgeCliConfig {
             verbose: verbose || self.verbose.unwrap_or(false),
             port: port.or(self.port).unwrap_or(8080),
             listen: listen.or(self.listen).unwrap_or_else(|| "0.0.0.0".to_string()),
+            rollback_admin_rpc_enabled: rollback_admin_rpc_enabled
+                || self.rollback_admin_rpc_enabled.unwrap_or(false),
         })
     }
     pub async fn get_start_config(
@@ -375,6 +380,7 @@ impl CoordinatorEdgeCliConfig {
         verbose: bool,
         port: Option<u16>,
         listen: Option<String>,
+        rollback_admin_rpc_enabled: bool,
     ) -> anyhow::Result<CoordinatorEdgeStartConfig> {
         let cli_config = if let Some(config_path) = config {
             load_cli_config_from_file::<Self>(&config_path).await?
@@ -392,6 +398,46 @@ impl CoordinatorEdgeCliConfig {
             verbose,
             port,
             listen,
+            rollback_admin_rpc_enabled,
         )
+    }
+}
+
+#[cfg(test)]
+mod coordinator_edge_rollback_admin_tests {
+    use super::*;
+
+    fn start_config(
+        file_value: Option<bool>,
+        cli_value: bool,
+    ) -> CoordinatorEdgeStartConfig {
+        let mut config = CoordinatorEdgeCliConfig::get_default_empty();
+        config.rollback_admin_rpc_enabled = file_value;
+        config
+            .into_start_config_with_cli_args(
+                Some("127.0.0.1:9042".to_string()),
+                Some("nats://127.0.0.1:4222".to_string()),
+                Some("redis://127.0.0.1".to_string()),
+                Some("rollback_config_test".to_string()),
+                Some(0),
+                Some(0),
+                Some(PsyNetworkTypeInput::LocalDevnet),
+                false,
+                None,
+                None,
+                cli_value,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn rollback_admin_rpc_is_disabled_by_default() {
+        assert!(!start_config(None, false).rollback_admin_rpc_enabled);
+    }
+
+    #[test]
+    fn rollback_admin_rpc_requires_explicit_file_or_cli_opt_in() {
+        assert!(start_config(Some(true), false).rollback_admin_rpc_enabled);
+        assert!(start_config(None, true).rollback_admin_rpc_enabled);
     }
 }

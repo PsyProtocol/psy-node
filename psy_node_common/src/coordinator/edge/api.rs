@@ -7,6 +7,9 @@ use parth_core::{
     }, data::{hash::{checkpointed_merkle_node::CheckpointedMerkleHash, hash256::Hash256, merkle_node_key::SimpleMerkleNodeKey}, serializable::QPDSerializable}, node::realm_identifier::QRealmIdentifier, protocol::core_types::QNetworkTypesConfig
 };
 use psy_api_core::{
+    coordinator::rollback_admin::{
+        RollbackAdminStartRequest, RollbackAdminStartResponse, RollbackAdminStatus,
+    },
     coordinator::standard_edge_rpc::CoordinatorEdgeRpcServer,
     worker::standard_worker_rpc::NodeEdgeWorkerRpcServer,
     CheckpointJobStats,
@@ -100,6 +103,15 @@ impl<
     }
     async fn get_canonical_chain_ref(&self) -> QRpcResult<CanonicalChainRef<N::QHash>> {
         res(self.get_canonical_chain_ref_internal().await)
+    }
+    async fn admin_start_rollback(
+        &self,
+        request: RollbackAdminStartRequest<N::QHash>,
+    ) -> QRpcResult<RollbackAdminStartResponse<N::QHash>> {
+        res(self.admin_start_rollback_internal(request).await)
+    }
+    async fn admin_get_rollback_status(&self) -> QRpcResult<RollbackAdminStatus<N::QHash>> {
+        res(self.admin_get_rollback_status_internal().await)
     }
     async fn get_checkpoint_id_for_unique_pending_id(&self, unique_pending_id: u64) -> QRpcResult<Option<u64>> {
         res(self.get_checkpoint_id_for_unique_pending_id_internal(unique_pending_id).await)
