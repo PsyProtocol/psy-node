@@ -87,6 +87,7 @@ pub const RAW_SCYLLA_ACCESS_ALLOWLIST: &[RawScyllaAccessAllowance] = &[
     allow!("psy_node_scylla/src/tables/u64_table/u64_u128_bidirectional.rs", LegacyTableAdapter),
     allow!("psy_node_scylla/src/tables/u64_tbl.rs", LegacyTableAdapter),
     allow!("psy_node_scylla/src/utils.rs", LegacyTableAdapter),
+    allow!("psy_node_scylla/tests/rollback_canonical_head_rf3_gate.rs", TestHarness),
     allow!("psy_node_scylla/tests/rollback_confinement.rs", TestHarness),
     allow!("psy_node_scylla/tests/rollback_namespace_prototype.rs", TestHarness),
     allow!("psy_node_scylla/tests/rollback_namespace_rf3_gate.rs", TestHarness),

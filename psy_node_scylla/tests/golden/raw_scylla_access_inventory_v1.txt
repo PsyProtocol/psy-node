@@ -53,6 +53,7 @@ psy_node_scylla/src/tables/u64_table/u64_to_u64.rs|LegacyTableAdapter|11|0|0|5|4
 psy_node_scylla/src/tables/u64_table/u64_u128_bidirectional.rs|LegacyTableAdapter|12|0|0|0|0|0|0|0
 psy_node_scylla/src/tables/u64_tbl.rs|LegacyTableAdapter|41|0|0|12|11|12|0|14
 psy_node_scylla/src/utils.rs|LegacyTableAdapter|3|0|0|4|2|0|0|0
+psy_node_scylla/tests/rollback_canonical_head_rf3_gate.rs|TestHarness|5|2|0|0|0|0|3|3
 psy_node_scylla/tests/rollback_confinement.rs|TestHarness|2|0|1|0|0|0|1|1
 psy_node_scylla/tests/rollback_namespace_prototype.rs|TestHarness|0|0|0|0|0|0|0|1
 psy_node_scylla/tests/rollback_namespace_rf3_gate.rs|TestHarness|7|2|0|0|0|0|4|4
