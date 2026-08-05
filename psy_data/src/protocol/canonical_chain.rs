@@ -209,6 +209,43 @@ impl<Hash> CheckpointRef<Hash> {
     }
 }
 
+/// Stable named-field wire representation for an exact checkpoint occurrence.
+///
+/// The enclosing request/response owns the protocol codec version. Keeping the
+/// hash semantic wrapper private prevents callers from substituting a raw tree
+/// root while still allowing historical selectors to use a typed
+/// [`CheckpointRef`].
+impl<Hash: Serialize> Serialize for CheckpointRef<Hash> {
+    fn serialize<SerializerT: Serializer>(
+        &self,
+        serializer: SerializerT,
+    ) -> Result<SerializerT::Ok, SerializerT::Error> {
+        let mut state = serializer.serialize_struct("CheckpointRef", 2)?;
+        state.serialize_field("checkpoint_id", &self.checkpoint_id.get())?;
+        state.serialize_field("checkpoint_hash", self.checkpoint_hash.as_inner())?;
+        state.end()
+    }
+}
+
+impl<'de, Hash: Deserialize<'de>> Deserialize<'de> for CheckpointRef<Hash> {
+    fn deserialize<DeserializerT: Deserializer<'de>>(
+        deserializer: DeserializerT,
+    ) -> Result<Self, DeserializerT::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct CheckpointRefWire<Hash> {
+            checkpoint_id: u64,
+            checkpoint_hash: Hash,
+        }
+
+        let wire = CheckpointRefWire::<Hash>::deserialize(deserializer)?;
+        Ok(Self::new(
+            CheckpointId::new(wire.checkpoint_id),
+            CheckpointHash::from_last_chain_hash(wire.checkpoint_hash),
+        ))
+    }
+}
+
 /// Canonical branch identity at one exact checkpoint occurrence.
 ///
 /// ```compile_fail
