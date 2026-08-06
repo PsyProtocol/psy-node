@@ -22,8 +22,8 @@ use psy_node_core::store::{
 use super::{
     seal_commit_put, CanonicalPhysicalMutationBatch, PreparedPayload,
     PreparedPayloadKind, ReplayPrototypeError, ReplayRecordKind,
-    RollbackableStorePrototype, ScyllaPhysicalTableId, SealedTimestampedPut,
-    TimestampedMutationError,
+    RollbackableStorePrototype, RollbackableStorePrototypeError,
+    ScyllaPhysicalTableId, SealedTimestampedPut, TimestampedMutationError,
     VerifiedPersistedManifestArtifacts,
 };
 
@@ -264,7 +264,7 @@ impl<'a> RepresentativeRealmStateReplayExecutor<'a> {
     pub async fn reapply_all<Hash: Q256BitHash>(
         &self,
         plan: &RepresentativeRealmStateReplayPlan<Hash>,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), RepresentativeStateExecutionError> {
         self.reapply_prefix_for_gate(plan, plan.mutation_count()).await
     }
 
@@ -275,12 +275,12 @@ impl<'a> RepresentativeRealmStateReplayExecutor<'a> {
         &self,
         plan: &RepresentativeRealmStateReplayPlan<Hash>,
         count: usize,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), RepresentativeStateExecutionError> {
         if count > plan.mutation_count() {
-            anyhow::bail!(
-                "fault-injection prefix {count} exceeds mutation count {}",
-                plan.mutation_count()
-            );
+            return Err(RepresentativeStateExecutionError::PrefixOutOfBounds {
+                requested: count,
+                available: plan.mutation_count(),
+            });
         }
         for sealed in plan.puts().take(count) {
             self.store.put_global_user_merkle(sealed).await?;
@@ -291,7 +291,7 @@ impl<'a> RepresentativeRealmStateReplayExecutor<'a> {
     pub async fn read_exact<Hash: Q256BitHash>(
         &self,
         plan: &RepresentativeRealmStateReplayPlan<Hash>,
-    ) -> anyhow::Result<Vec<Option<Vec<u8>>>> {
+    ) -> Result<Vec<Option<Vec<u8>>>, RepresentativeStateExecutionError> {
         let mut observed = Vec::with_capacity(plan.mutation_count());
         for sealed in plan.puts() {
             observed.push(self.store.read_global_user_merkle_exact(sealed).await?);
@@ -302,11 +302,40 @@ impl<'a> RepresentativeRealmStateReplayExecutor<'a> {
     pub async fn verify_exact<Hash: Q256BitHash>(
         &self,
         plan: &RepresentativeRealmStateReplayPlan<Hash>,
-    ) -> anyhow::Result<AuthorityPostWriteObservation<Hash>> {
+    ) -> Result<AuthorityPostWriteObservation<Hash>, RepresentativeStateExecutionError> {
         let observed = self.read_exact(plan).await?;
         plan.verify_observed_rows(&observed).map_err(Into::into)
     }
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RepresentativeStateExecutionError {
+    Store(RollbackableStorePrototypeError),
+    Verification(RepresentativeStateReplayError),
+    PrefixOutOfBounds { requested: usize, available: usize },
+}
+
+impl From<RollbackableStorePrototypeError>
+    for RepresentativeStateExecutionError
+{
+    fn from(value: RollbackableStorePrototypeError) -> Self {
+        Self::Store(value)
+    }
+}
+
+impl From<RepresentativeStateReplayError> for RepresentativeStateExecutionError {
+    fn from(value: RepresentativeStateReplayError) -> Self {
+        Self::Verification(value)
+    }
+}
+
+impl fmt::Display for RepresentativeStateExecutionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl Error for RepresentativeStateExecutionError {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RepresentativeStateReplayError {
@@ -634,5 +663,22 @@ mod tests {
             ),
             Err(RepresentativeStateReplayError::DurablePreparedPayloadMissing)
         );
+    }
+
+    #[tokio::test]
+    async fn fault_injection_prefix_is_bounded_before_any_write() {
+        let plan = plan();
+        let store = RollbackableStorePrototype::recording();
+        let executor = RepresentativeRealmStateReplayExecutor::new(&store);
+        assert_eq!(
+            executor
+                .reapply_prefix_for_gate(&plan, plan.mutation_count() + 1)
+                .await,
+            Err(RepresentativeStateExecutionError::PrefixOutOfBounds {
+                requested: plan.mutation_count() + 1,
+                available: plan.mutation_count(),
+            })
+        );
+        assert!(store.recorded_calls().unwrap().is_empty());
     }
 }

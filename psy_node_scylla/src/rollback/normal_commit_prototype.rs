@@ -14,13 +14,17 @@ use psy_node_core::store::{
     },
     authority_local_head::AuthorityLocalHeadReadState,
     manifest_lifecycle::{
-        CommittedAuthorityManifest, SealedAuthorityManifest,
+        AuthorityPostWriteObservation, CommittedAuthorityManifest,
+        SealedAuthorityManifest,
     },
-    manifest_record::AuthorityManifestIdentity,
+    manifest_record::{
+        AuthorityManifestIdentity, PreparedAuthorityManifestRecord,
+    },
     normal_commit::{
         classify_normal_head_publish, plan_normal_commit_recovery,
-        NormalCommitOrchestrationError, NormalCommitRecoveryAction,
-        NormalHeadPublishProgress, SealedNormalHeadPublish,
+        seal_verified_normal_commit, NormalCommitOrchestrationError,
+        NormalCommitRecoveryAction, NormalHeadPublishProgress,
+        SealedNormalHeadPublish,
     },
 };
 
@@ -89,6 +93,37 @@ impl<'a> ScyllaNormalCommitMetadataExecutor<'a> {
                 Err(NormalCommitMetadataError::ManifestLifecycleConflict)
             }
         }
+    }
+
+    /// Re-read the durable authority head and allocator after physical state
+    /// verification, seal only the exact PREPARED intent, then persist SEALED.
+    /// This closes the stale-observation window without giving callers access
+    /// to raw head or allocator coordinates.
+    pub async fn verify_and_persist_sealed<Hash: Q256BitHash>(
+        &self,
+        prepared: PreparedAuthorityManifestRecord<Hash>,
+        observation: AuthorityPostWriteObservation<Hash>,
+    ) -> Result<SealedAuthorityManifest<Hash>, NormalCommitMetadataError> {
+        let key = prepared.identity().timestamp_key();
+        let head = match self.heads.read(key).await? {
+            AuthorityLocalHeadReadState::Uninitialized => {
+                return Err(NormalCommitMetadataError::HeadUninitialized)
+            }
+            AuthorityLocalHeadReadState::Current(head) => head,
+        };
+        let allocator = self
+            .timestamps
+            .read_observed(key)
+            .await?
+            .ok_or(NormalCommitMetadataError::AllocatorUninitialized)?;
+        let sealed = seal_verified_normal_commit(
+            prepared,
+            observation,
+            &head,
+            allocator,
+        )?;
+        self.persist_sealed(&sealed).await?;
+        Ok(sealed)
     }
 
     /// Execute and classify the exact authority-head CAS. An indeterminate

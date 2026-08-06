@@ -210,6 +210,9 @@ fn prototype_is_not_wired_into_production_or_promoted_to_full_capability() {
     );
     for production_source in [include_str!("../src/psy_setup.rs"), include_str!("../src/core_db.rs")] {
         assert!(!production_source.contains("RollbackableStorePrototype"));
+        assert!(!production_source.contains(
+            "ScyllaRepresentativeRealmNormalCommitExecutor"
+        ));
     }
 }
 
@@ -231,7 +234,7 @@ fn lexical_inventory_is_stable_and_nontrivial() {
     assert_eq!(
         total,
         RawScyllaAccessCounts {
-            session_type: 690,
+            session_type: 693,
             session_builder: 45,
             session_field_access: 159,
             prepared_statement: 230,

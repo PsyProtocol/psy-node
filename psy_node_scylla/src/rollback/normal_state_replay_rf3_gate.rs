@@ -22,13 +22,20 @@ use psy_node_core::store::{
     authority_commit::{
         AuthorityClockSampleUs, AuthorityTimestampBootstrap,
         AuthorityTimestampBootstrapReason, AuthorityTimestampKey,
+        AuthorityTimestampWriteOutcome, SealedAuthorityTimestampReservation,
+    },
+    authority_local_head::{
+        AuthorityLocalHeadBootstrap, AuthorityLocalHeadBootstrapReason,
+        AuthorityLocalHeadWriteOutcome, AuthorityStorageBindingGeneration,
+        AuthorityStorageBindingRef, AuthorityStorageNamespaceId,
     },
     manifest_intent::{
         AuthorityHeadPayload, AuthorityStateTransition,
         SealedAuthorityCommitIntent,
     },
     manifest_lifecycle::{
-        PersistedAuthorityManifest, SealedAuthorityManifest,
+        AuthorityHeadView, PersistedAuthorityManifest,
+        SealedAuthorityManifest,
     },
     manifest_record::AuthorityManifestIdentity,
     timestamp::CommitWriteTimestampUs,
@@ -90,21 +97,41 @@ fn chain(checkpoint: u64, seed: u8) -> CanonicalChainRef<PHash> {
     )
 }
 
-fn fixture() -> VerifiedPreparedManifestPackage<PHash> {
-    let checkpoint = StorageCheckpointId::try_new(41).unwrap();
+struct Fixture {
+    timestamp_bootstrap: AuthorityTimestampBootstrap,
+    reservation: SealedAuthorityTimestampReservation,
+    head_bootstrap: AuthorityLocalHeadBootstrap<PHash>,
+    package: VerifiedPreparedManifestPackage<PHash>,
+}
+
+impl Fixture {
+    fn identity(&self) -> AuthorityManifestIdentity<PHash> {
+        *self.package.record().identity()
+    }
+}
+
+fn fixture(
+    realm_id: u32,
+    checkpoint_id: u64,
+    seed: u8,
+    high_water: i64,
+) -> Fixture {
+    let checkpoint = StorageCheckpointId::try_new(checkpoint_id).unwrap();
     let semantic = [
-        (MerkleNode::new(0, NodeIndex::new(0)), 4_u8),
-        (MerkleNode::new(1, NodeIndex::new(0)), 5_u8),
-        (MerkleNode::new(1, NodeIndex::new(1)), 6_u8),
+        (MerkleNode::new(0, NodeIndex::new(0)), seed.wrapping_add(3)),
+        (MerkleNode::new(1, NodeIndex::new(0)), seed.wrapping_add(4)),
+        (MerkleNode::new(1, NodeIndex::new(1)), seed.wrapping_add(5)),
     ];
     let payload = PreparedPayload::try_v1(
         PreparedPayloadKind::Realm,
         semantic
             .iter()
-            .map(|(node, seed)| PreparedSemanticMutation::GlobalUserMerkle {
-                checkpoint,
-                node: *node,
-                value: vec![*seed; 32],
+            .map(|(node, value_seed)| {
+                PreparedSemanticMutation::GlobalUserMerkle {
+                    checkpoint,
+                    node: *node,
+                    value: vec![*value_seed; 32],
+                }
             })
             .collect(),
     )
@@ -119,12 +146,12 @@ fn fixture() -> VerifiedPreparedManifestPackage<PHash> {
     .unwrap();
     let logical = semantic
         .iter()
-        .map(|(node, seed)| LogicalMutation::Put {
+        .map(|(node, value_seed)| LogicalMutation::Put {
             key: TypedTableKey::GlobalUserMerkle {
                 node: *node,
                 checkpoint,
             },
-            value: MutationValue::PsyCanonicalBytes(vec![*seed; 32]),
+            value: MutationValue::PsyCanonicalBytes(vec![*value_seed; 32]),
         })
         .collect();
     let full = CanonicalPhysicalMutationBatch::from_logical(logical).unwrap();
@@ -148,38 +175,66 @@ fn fixture() -> VerifiedPreparedManifestPackage<PHash> {
     let key = AuthorityTimestampKey::new(
         network(),
         AuthorityScope::Realm {
-            realm_id: 3,
+            realm_id,
             realm_sub_id: 2,
         },
     );
     let intent = SealedAuthorityCommitIntent::seal_normal_advance(
         key,
-        chain(40, 1),
-        chain(41, 2),
+        chain(checkpoint_id - 1, seed),
+        chain(checkpoint_id, seed.wrapping_add(1)),
         AuthorityStateTransition::Changed {
-            previous_checkpoint: AuthorityStateCheckpointId::new(40),
-            checkpoint: AuthorityStateCheckpointId::new(41),
-            old_root: AuthorityStateRoot::from_local_state_root(hash(3)),
-            new_root: AuthorityStateRoot::from_local_state_root(hash(4)),
+            previous_checkpoint: AuthorityStateCheckpointId::new(
+                checkpoint_id - 1,
+            ),
+            checkpoint: AuthorityStateCheckpointId::new(checkpoint_id),
+            old_root: AuthorityStateRoot::from_local_state_root(hash(
+                seed.wrapping_add(2),
+            )),
+            new_root: AuthorityStateRoot::from_local_state_root(hash(
+                seed.wrapping_add(3),
+            )),
         },
-        AuthorityHeadPayload::try_new(vec![0x66; 16]).unwrap(),
+        AuthorityHeadPayload::try_new(vec![seed; 16]).unwrap(),
         artifacts.commitment(),
     )
     .unwrap();
-    let reservation = AuthorityTimestampBootstrap::new(
+    let timestamp_bootstrap = AuthorityTimestampBootstrap::new(
         key,
-        CommitWriteTimestampUs::try_from_i128(500).unwrap(),
+        CommitWriteTimestampUs::try_from_i128(high_water as i128).unwrap(),
         AuthorityTimestampBootstrapReason::GenesisNative,
-    )
-    .candidate()
-    .seal_reservation(
-        key,
-        intent.digest(),
-        AuthorityClockSampleUs::try_from_i128(501).unwrap(),
-    )
-    .unwrap();
+    );
+    let reservation = timestamp_bootstrap
+        .candidate()
+        .seal_reservation(
+            key,
+            intent.digest(),
+            AuthorityClockSampleUs::try_from_i128((high_water + 1) as i128)
+                .unwrap(),
+        )
+        .unwrap();
     let prepared = intent.attach_timestamp_lease(reservation.lease()).unwrap();
-    VerifiedPreparedManifestPackage::try_new(&prepared, artifacts).unwrap()
+    let package =
+        VerifiedPreparedManifestPackage::try_new(&prepared, artifacts).unwrap();
+    let head_bootstrap = AuthorityLocalHeadBootstrap::seal(
+        AuthorityLocalHeadBootstrapReason::GenesisNative,
+        AuthorityHeadView::expected(package.record()),
+        CommitWriteTimestampUs::try_from_i128(high_water as i128).unwrap(),
+        package.record().digest(),
+        AuthorityStorageBindingRef::new(
+            AuthorityStorageBindingGeneration::try_new(3).unwrap(),
+            AuthorityStorageNamespaceId::from_verified_namespace_id([
+                seed.wrapping_add(6);
+                32
+            ]),
+        ),
+    );
+    Fixture {
+        timestamp_bootstrap,
+        reservation,
+        head_bootstrap,
+        package,
+    }
 }
 
 async fn connect(
@@ -283,12 +338,107 @@ async fn open_stores() -> anyhow::Result<Stores> {
     })
 }
 
+struct CombinedStores {
+    manifests: ScyllaPreparedManifestStore,
+    heads: ScyllaAuthorityLocalHeadStore,
+    timestamps: ScyllaAuthorityTimestampStore,
+    state: RollbackableStorePrototype,
+}
+
+impl CombinedStores {
+    fn executor(&self) -> ScyllaRepresentativeRealmNormalCommitExecutor<'_> {
+        ScyllaRepresentativeRealmNormalCommitExecutor::new(
+            &self.manifests,
+            &self.heads,
+            &self.timestamps,
+            &self.state,
+        )
+    }
+}
+
+async fn create_combined_schema(session: &Session) -> anyhow::Result<()> {
+    create_schema(session).await?;
+    ScyllaAuthorityTimestampStore::create_schema(
+        session,
+        &AuthorityTimestampNoTabletKeyspace::try_new(CONTROL_KEYSPACE)?,
+    )
+    .await?;
+    ScyllaAuthorityLocalHeadStore::create_schema(
+        session,
+        &AuthorityLocalHeadNoTabletKeyspace::try_new(CONTROL_KEYSPACE)?,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn open_combined_stores() -> anyhow::Result<CombinedStores> {
+    let session = Arc::new(connect(None, Consistency::Quorum).await?);
+    Ok(CombinedStores {
+        manifests: ScyllaPreparedManifestStore::prepare(
+            Arc::clone(&session),
+            keyspaces()?,
+        )
+        .await?,
+        heads: ScyllaAuthorityLocalHeadStore::prepare(
+            Arc::clone(&session),
+            AuthorityLocalHeadNoTabletKeyspace::try_new(CONTROL_KEYSPACE)?,
+        )
+        .await?,
+        timestamps: ScyllaAuthorityTimestampStore::prepare(
+            Arc::clone(&session),
+            AuthorityTimestampNoTabletKeyspace::try_new(CONTROL_KEYSPACE)?,
+        )
+        .await?,
+        state: RollbackableStorePrototype::prepare_scylla(
+            session,
+            CqlKeyspaceName::try_new(STATE_KEYSPACE)?,
+            Consistency::Quorum,
+        )
+        .await?,
+    })
+}
+
+async fn initialize_combined_fixture(
+    stores: &CombinedStores,
+    fixture: &Fixture,
+) -> anyhow::Result<()> {
+    ensure!(matches!(
+        stores
+            .timestamps
+            .bootstrap(fixture.timestamp_bootstrap)
+            .await?,
+        AuthorityTimestampWriteOutcome::Applied(_)
+    ));
+    ensure!(matches!(
+        stores.timestamps.reserve(fixture.reservation).await?,
+        AuthorityTimestampWriteOutcome::Applied(_)
+    ));
+    ensure!(matches!(
+        stores.heads.bootstrap(&fixture.head_bootstrap).await?,
+        AuthorityLocalHeadWriteOutcome::Applied(_)
+    ));
+    ensure!(matches!(
+        stores
+            .manifests
+            .persist_prepared(&fixture.package)
+            .await?,
+        psy_node_core::store::manifest_record::PreparedManifestWriteOutcome::Applied(_)
+    ));
+    Ok(())
+}
+
 async fn load_plan(
     stores: &Stores,
     identity: AuthorityManifestIdentity<PHash>,
 ) -> anyhow::Result<RepresentativeRealmStateReplayPlan<PHash>> {
-    let prepared = match stores
-        .manifests
+    load_plan_from(&stores.manifests, identity).await
+}
+
+async fn load_plan_from(
+    manifests: &ScyllaPreparedManifestStore,
+    identity: AuthorityManifestIdentity<PHash>,
+) -> anyhow::Result<RepresentativeRealmStateReplayPlan<PHash>> {
+    let prepared = match manifests
         .read_lifecycle(identity)
         .await?
         .context("durable PREPARED row is missing")?
@@ -296,10 +446,7 @@ async fn load_plan(
         PersistedAuthorityManifest::Prepared(prepared) => prepared,
         other => bail!("expected PREPARED lifecycle, got {other:?}"),
     };
-    let artifacts = stores
-        .manifests
-        .load_verified_artifacts(&prepared)
-        .await?;
+    let artifacts = manifests.load_verified_artifacts(&prepared).await?;
     RepresentativeRealmStateReplayPlan::try_from_verified_artifacts(
         &prepared,
         &artifacts,
@@ -472,11 +619,11 @@ async fn d04b2c_representative_state_replay_rf3_gate() -> anyhow::Result<()> {
     .to_owned();
     drop(initial_session);
 
-    let package = fixture();
-    let identity = *package.record().identity();
+    let fixture = fixture(3, 41, 1, 500);
+    let identity = fixture.identity();
     let stores = open_stores().await?;
     ensure!(matches!(
-        stores.manifests.persist_prepared(&package).await?,
+        stores.manifests.persist_prepared(&fixture.package).await?,
         psy_node_core::store::manifest_record::PreparedManifestWriteOutcome::Applied(_)
     ));
     let plan = load_plan(&stores, identity).await?;
@@ -544,6 +691,175 @@ async fn d04b2c_representative_state_replay_rf3_gate() -> anyhow::Result<()> {
     };
     let report_path = std::env::var("PSY_D04B2C_REPORT_PATH")
         .unwrap_or_else(|_| "target/d04b2c-state-replay-rf3-report.json".into());
+    let report_path = Path::new(&report_path);
+    if let Some(parent) = report_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(report_path, serde_json::to_vec_pretty(&report)?)?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct D04b2dReport {
+    baseline: &'static str,
+    image: &'static str,
+    scylla_release: String,
+    replication_factor: u8,
+    regular_consistency: &'static str,
+    serial_consistency: &'static str,
+    restart_count: u8,
+    partial_state_recovered_into_sealed: bool,
+    head_response_loss_recovered: bool,
+    committed_response_loss_recovered: bool,
+    timestamp_response_loss_recovered: bool,
+    one_replica_offline_drive_reached_done: bool,
+    direct_one_state_replicas_equal: bool,
+    scenarios_passed: Vec<&'static str>,
+    finished_unix_ms: u64,
+    qualification: &'static str,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the destructive local three-node Scylla RF=3 harness"]
+async fn d04b2d_combined_representative_normal_commit_rf3_gate(
+) -> anyhow::Result<()> {
+    if std::env::var_os("PSY_D04B2D_RF3").is_none() {
+        bail!("set PSY_D04B2D_RF3=1 through run-d04b2d.sh");
+    }
+    let initial_session = connect(None, Consistency::Quorum).await?;
+    create_combined_schema(&initial_session).await?;
+    let release = docker_exec(
+        NODE_CONTAINERS[0],
+        &["scylla", "--version"],
+        "read D-04b2d Scylla version",
+    )?
+    .trim()
+    .to_owned();
+    drop(initial_session);
+
+    // Start from a real PREPARED row with only the root physical mutation
+    // present, then destroy every Session/adapter.  The combined executor must
+    // reconstruct state from durable artifacts before it can persist SEALED.
+    let crash = fixture(13, 51, 11, 1_500);
+    let stores = open_combined_stores().await?;
+    initialize_combined_fixture(&stores, &crash).await?;
+    let crash_plan = load_plan_from(&stores.manifests, crash.identity()).await?;
+    ensure!(crash_plan.root_position() == 0);
+    RepresentativeRealmStateReplayExecutor::new(&stores.state)
+        .reapply_prefix_for_gate(&crash_plan, 1)
+        .await?;
+    drop(stores);
+
+    let stores = open_combined_stores().await?;
+    ensure!(matches!(
+        stores.executor().step(crash.identity()).await?,
+        RepresentativeNormalCommitStep::StateVerifiedAndSealed { .. }
+    ));
+    drop(stores);
+
+    // Each following response is deliberately discarded with the adapters.
+    // The next process is allowed to advance only from durable observations.
+    let stores = open_combined_stores().await?;
+    ensure!(matches!(
+        stores.executor().step(crash.identity()).await?,
+        RepresentativeNormalCommitStep::HeadPublishedAwaitingCommitted { .. }
+    ));
+    drop(stores);
+
+    let stores = open_combined_stores().await?;
+    ensure!(matches!(
+        stores.executor().step(crash.identity()).await?,
+        RepresentativeNormalCommitStep::CommittedPersisted { .. }
+    ));
+    drop(stores);
+
+    let stores = open_combined_stores().await?;
+    ensure!(matches!(
+        stores.executor().step(crash.identity()).await?,
+        RepresentativeNormalCommitStep::TimestampCompleted
+    ));
+    drop(stores);
+
+    let stores = open_combined_stores().await?;
+    ensure!(matches!(
+        stores.executor().step(crash.identity()).await?,
+        RepresentativeNormalCommitStep::Done { .. }
+    ));
+    drop(stores);
+
+    // A second authority executes the same state+metadata loop while one
+    // replica is offline.  The Session is prepared first so driver topology
+    // discovery is not part of the measured fault.
+    let offline = fixture(14, 52, 21, 2_500);
+    let stores = open_combined_stores().await?;
+    initialize_combined_fixture(&stores, &offline).await?;
+    let offline_plan =
+        load_plan_from(&stores.manifests, offline.identity()).await?;
+    docker_container("stop", NODE_CONTAINERS[2])?;
+    let committed = stores
+        .executor()
+        .drive_to_done(offline.identity(), 8)
+        .await?;
+    ensure!(
+        committed.sealed().prepared().identity() == &offline.identity()
+    );
+    drop(stores);
+
+    docker_container("start", NODE_CONTAINERS[2])?;
+    wait_for_three_up_normal().await?;
+    repair_flush_compact()?;
+
+    let expected = expected_rows(&offline_plan)?;
+    let mut replicas = Vec::new();
+    for ip in NODE_IPS {
+        replicas.push(read_direct_rows(ip, &offline_plan).await?);
+    }
+    let direct_one_state_replicas_equal =
+        replicas.iter().all(|rows| rows == &expected);
+    ensure!(direct_one_state_replicas_equal);
+
+    let final_stores = open_combined_stores().await?;
+    ensure!(matches!(
+        final_stores.executor().step(crash.identity()).await?,
+        RepresentativeNormalCommitStep::Done { .. }
+    ));
+    ensure!(matches!(
+        final_stores.executor().step(offline.identity()).await?,
+        RepresentativeNormalCommitStep::Done { .. }
+    ));
+    RepresentativeRealmStateReplayExecutor::new(&final_stores.state)
+        .verify_exact(&offline_plan)
+        .await?;
+
+    let report = D04b2dReport {
+        baseline: "7ef3043346182e0340504ba956a7379bbcced576",
+        image: IMAGE,
+        scylla_release: release,
+        replication_factor: 3,
+        regular_consistency: "QUORUM",
+        serial_consistency: "LOCAL_SERIAL",
+        restart_count: 5,
+        partial_state_recovered_into_sealed: true,
+        head_response_loss_recovered: true,
+        committed_response_loss_recovered: true,
+        timestamp_response_loss_recovered: true,
+        one_replica_offline_drive_reached_done: true,
+        direct_one_state_replicas_equal,
+        scenarios_passed: vec![
+            "partial exact state restart replays before SEALED",
+            "SEALED restart resumes exact head publication",
+            "head response loss recovers COMMITTED from durable state",
+            "COMMITTED response loss recovers timestamp completion",
+            "one replica offline combined drive reaches Done",
+            "repair flush compact converges exact state rows on every replica",
+        ],
+        finished_unix_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_millis() as u64,
+        qualification: "representative Realm global-user Merkle plus manifest/head/timestamp recovery loop only; not production Processor integration or full table coverage",
+    };
+    let report_path = std::env::var("PSY_D04B2D_REPORT_PATH")
+        .unwrap_or_else(|_| "target/d04b2d-combined-normal-commit-rf3-report.json".into());
     let report_path = Path::new(&report_path);
     if let Some(parent) = report_path.parent() {
         fs::create_dir_all(parent)?;
