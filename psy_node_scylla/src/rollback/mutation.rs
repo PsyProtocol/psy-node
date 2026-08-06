@@ -1,8 +1,9 @@
 use std::{error::Error, fmt};
 
 use psy_node_core::store::typed::{
-    LogicalMutation, MutationOperation, MutationValue, MutationValueKind, PsyLogicalTableId, StructuredValueSchema, TypedTableKey,
-    ValueDigestAlgorithm,
+    ImtCursorTransition, ImtCursorTransitionError, LogicalMutation,
+    MutationOperation, MutationValue, MutationValueKind, PsyLogicalTableId,
+    StructuredValueSchema, TypedTableKey, ValueDigestAlgorithm,
 };
 
 use super::{
@@ -129,6 +130,7 @@ impl ResolvedScyllaMutation {
                     StructuredValueSchema::TagTreeNodeV1 => 1,
                     StructuredValueSchema::ImtLeafRowV1 => 2,
                     StructuredValueSchema::ImtKeyIndexRowV1 => 3,
+                    StructuredValueSchema::ImtCursorTransitionV1 => 4,
                 });
                 encoded.extend_from_slice(&(canonical_bytes.len() as u32).to_be_bytes());
                 encoded.extend_from_slice(canonical_bytes);
@@ -170,6 +172,7 @@ impl ResolvedScyllaMutation {
                     1 => StructuredValueSchema::TagTreeNodeV1,
                     2 => StructuredValueSchema::ImtLeafRowV1,
                     3 => StructuredValueSchema::ImtKeyIndexRowV1,
+                    4 => StructuredValueSchema::ImtCursorTransitionV1,
                     _ => return Err(MutationDecodeError::InvalidEncoding("unknown structured value schema")),
                 };
                 MutationOperation::Put(MutationValue::Structured { schema, canonical_bytes: cursor.bytes()?.to_vec() })
@@ -283,6 +286,7 @@ pub enum MutationBuildError {
     PairDirectionRequiresLogicalIntent,
     DeleteNotEnabled,
     ValueEncodingMismatch { domain: ScyllaKeyDomain, actual: MutationValueKind },
+    InvalidImtCursorTransition(ImtCursorTransitionError),
 }
 
 impl fmt::Display for MutationBuildError {
@@ -294,6 +298,7 @@ impl fmt::Display for MutationBuildError {
             Self::ValueEncodingMismatch { domain, actual } => {
                 write!(f, "value encoding {actual:?} is not allowed for key domain {domain:?}")
             }
+            Self::InvalidImtCursorTransition(error) => error.fmt(f),
         }
     }
 }
@@ -333,11 +338,21 @@ fn build_resolved(resolved: ResolvedScyllaKey, operation: MutationOperation) -> 
 fn validate_put_value(resolved: &ResolvedScyllaKey, value: &MutationValue) -> Result<(), MutationBuildError> {
     let descriptor = key_domain_descriptor(resolved.key_domain());
     let actual = value.kind();
-    if descriptor.allowed_put_values.contains(&actual) {
-        Ok(())
-    } else {
-        Err(MutationBuildError::ValueEncodingMismatch { domain: resolved.key_domain(), actual })
+    if !descriptor.allowed_put_values.contains(&actual) {
+        return Err(MutationBuildError::ValueEncodingMismatch {
+            domain: resolved.key_domain(),
+            actual,
+        });
     }
+    if let MutationValue::Structured {
+        schema: StructuredValueSchema::ImtCursorTransitionV1,
+        canonical_bytes,
+    } = value
+    {
+        ImtCursorTransition::decode_canonical(canonical_bytes)
+            .map_err(MutationBuildError::InvalidImtCursorTransition)?;
+    }
+    Ok(())
 }
 
 fn build_single(key: TypedTableKey, operation: MutationOperation) -> Result<ResolvedScyllaMutation, MutationBuildError> {

@@ -393,6 +393,88 @@ pub enum TypedTableKey {
     ImtCursor { tree: TreeId, tree_sub: TreeSubId },
 }
 
+/// Durable, checkpoint-bound before/after image for one mutable IMT cursor.
+///
+/// The corresponding [`TypedTableKey::ImtCursor`] binds the tree identity;
+/// these bytes bind the checkpoint transition that produced the CQL value.
+/// Keeping the before image in the mutation commitment is required for
+/// restart reconciliation and later rollback restoration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ImtCursorTransition {
+    checkpoint: CheckpointId,
+    before: u64,
+    after: u64,
+}
+
+impl ImtCursorTransition {
+    pub const CANONICAL_BYTES: usize = 24;
+
+    pub const fn try_new(
+        checkpoint: CheckpointId,
+        before: u64,
+        after: u64,
+    ) -> Result<Self, ImtCursorTransitionError> {
+        if after < before {
+            return Err(ImtCursorTransitionError::Rewind { before, after });
+        }
+        Ok(Self {
+            checkpoint,
+            before,
+            after,
+        })
+    }
+
+    pub const fn checkpoint(self) -> CheckpointId {
+        self.checkpoint
+    }
+
+    pub const fn before(self) -> u64 {
+        self.before
+    }
+
+    pub const fn after(self) -> u64 {
+        self.after
+    }
+
+    pub fn encode_canonical(self) -> [u8; Self::CANONICAL_BYTES] {
+        let mut bytes = [0_u8; Self::CANONICAL_BYTES];
+        bytes[..8].copy_from_slice(&self.checkpoint.get().to_be_bytes());
+        bytes[8..16].copy_from_slice(&self.before.to_be_bytes());
+        bytes[16..24].copy_from_slice(&self.after.to_be_bytes());
+        bytes
+    }
+
+    pub fn decode_canonical(bytes: &[u8]) -> Result<Self, ImtCursorTransitionError> {
+        if bytes.len() != Self::CANONICAL_BYTES {
+            return Err(ImtCursorTransitionError::InvalidCanonicalLength {
+                actual: bytes.len(),
+            });
+        }
+        let checkpoint = CheckpointId::try_new(u64::from_be_bytes(
+            bytes[..8].try_into().expect("fixed length"),
+        ))
+        .map_err(|error| ImtCursorTransitionError::CheckpointOutOfRange(error.0))?;
+        let before = u64::from_be_bytes(bytes[8..16].try_into().expect("fixed length"));
+        let after = u64::from_be_bytes(bytes[16..24].try_into().expect("fixed length"));
+        Self::try_new(checkpoint, before, after)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ImtCursorTransitionError {
+    InvalidCanonicalLength { actual: usize },
+    CheckpointOutOfRange(u64),
+    Rewind { before: u64, after: u64 },
+}
+
+impl fmt::Display for ImtCursorTransitionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid durable IMT cursor transition: {self:?}")
+    }
+}
+
+impl Error for ImtCursorTransitionError {}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum ValueDigestAlgorithm {
@@ -407,6 +489,7 @@ pub enum StructuredValueSchema {
     TagTreeNodeV1 = 1,
     ImtLeafRowV1 = 2,
     ImtKeyIndexRowV1 = 3,
+    ImtCursorTransitionV1 = 4,
 }
 
 /// The stable wire contract between a key domain and its mutation value.
@@ -449,6 +532,15 @@ impl MutationValue {
             Self::KeyOnly => MutationValueKind::KeyOnly,
             Self::Structured { schema, .. } => MutationValueKind::Structured(*schema),
             Self::Digest { .. } => MutationValueKind::Digest,
+        }
+    }
+
+    pub fn imt_cursor_transition(
+        transition: ImtCursorTransition,
+    ) -> Self {
+        Self::Structured {
+            schema: StructuredValueSchema::ImtCursorTransitionV1,
+            canonical_bytes: transition.encode_canonical().to_vec(),
         }
     }
 }
@@ -515,6 +607,38 @@ mod tests {
         assert_eq!(
             LatestInfoSlot::RealmAuthorityObservation as u64,
             LATEST_INFO_TABLE_OBJ_ID_REALM_AUTHORITY_OBSERVATION
+        );
+    }
+
+    #[test]
+    fn imt_cursor_transition_is_canonical_and_fail_closed() {
+        let checkpoint = CheckpointId::try_new(17).unwrap();
+        let transition = ImtCursorTransition::try_new(checkpoint, 9, 12).unwrap();
+        let bytes = transition.encode_canonical();
+        assert_eq!(bytes.len(), ImtCursorTransition::CANONICAL_BYTES);
+        assert_eq!(ImtCursorTransition::decode_canonical(&bytes), Ok(transition));
+        assert_eq!(
+            ImtCursorTransition::try_new(checkpoint, 12, 9),
+            Err(ImtCursorTransitionError::Rewind {
+                before: 12,
+                after: 9,
+            })
+        );
+        let high = ImtCursorTransition::try_new(
+            checkpoint,
+            i64::MAX as u64,
+            i64::MAX as u64 + 1,
+        )
+        .unwrap();
+        assert_eq!(
+            ImtCursorTransition::decode_canonical(&high.encode_canonical()),
+            Ok(high)
+        );
+        assert_eq!(
+            ImtCursorTransition::decode_canonical(&bytes[..23]),
+            Err(ImtCursorTransitionError::InvalidCanonicalLength {
+                actual: 23,
+            })
         );
     }
 }

@@ -7,8 +7,10 @@
 use std::{error::Error, fmt};
 
 use psy_node_core::store::typed::{
-    CheckpointId, ImtEncodedKey, LeafIndex, LogicalMutation, MerkleNode, MutationOperation, MutationValue, NodeIndex,
-    StructuredValueSchema, TreeId, TreeSubId, TypedTableKey, U64SingletonSlot, UserId,
+    CheckpointId, ImtCursorTransition, ImtCursorTransitionError,
+    ImtEncodedKey, LeafIndex, LogicalMutation, MerkleNode, MutationOperation,
+    MutationValue, NodeIndex, StructuredValueSchema, TreeId, TreeSubId,
+    TypedTableKey, U64SingletonSlot, UserId,
 };
 use sha2::{Digest, Sha256};
 use strum::IntoEnumIterator;
@@ -667,6 +669,7 @@ pub struct FullPhysicalDeltaRecord {
 impl FullPhysicalDeltaRecord {
     pub fn try_new(batch: CanonicalPhysicalMutationBatch, receipt: ReplayReceipt) -> Result<Self, ReplayPrototypeError> {
         receipt.validate_count(batch.mutations().len())?;
+        validate_imt_cursor_transitions(&batch, &receipt)?;
         Ok(Self { batch, receipt })
     }
 
@@ -709,6 +712,8 @@ impl PreparedReferencePlusSupplementRecord {
     ) -> Result<Self, ReplayPrototypeError> {
         receipt.validate_count(expected_full.mutations().len())?;
         validate_receipt_payload_authority(&receipt, prepared.payload_kind)?;
+        validate_imt_cursor_transitions(supplements.batch(), &receipt)?;
+        validate_imt_cursor_transitions(expected_full, &receipt)?;
         let record = Self {
             prepared,
             supplements,
@@ -780,6 +785,7 @@ impl PreparedReferencePlusSupplementRecord {
             return Err(ReplayPrototypeError::InvalidCanonicalPayload("trailing compact replay bytes"));
         }
         receipt.validate_count(expected_mutation_count as usize)?;
+        validate_imt_cursor_transitions(supplements.batch(), &receipt)?;
         let decoded = Self {
             prepared,
             supplements,
@@ -814,6 +820,36 @@ impl PreparedReferencePlusSupplementRecord {
         }
         Ok(expanded)
     }
+}
+
+fn validate_imt_cursor_transitions(
+    batch: &CanonicalPhysicalMutationBatch,
+    receipt: &ReplayReceipt,
+) -> Result<(), ReplayPrototypeError> {
+    for resolved in batch.mutations() {
+        if resolved.mutation().physical_table()
+            != ScyllaPhysicalTableId::ImtNextAppendIndex
+        {
+            continue;
+        }
+        if receipt.authority() != ReplayAuthority::Realm {
+            return Err(ReplayPrototypeError::ImtCursorAuthorityMismatch);
+        }
+        let transition = match resolved.mutation().operation() {
+            MutationOperation::Put(MutationValue::Structured {
+                schema: StructuredValueSchema::ImtCursorTransitionV1,
+                canonical_bytes,
+            }) => ImtCursorTransition::decode_canonical(canonical_bytes)?,
+            _ => return Err(ReplayPrototypeError::ImtCursorTransitionRequired),
+        };
+        if transition.checkpoint() != receipt.checkpoint() {
+            return Err(ReplayPrototypeError::ImtCursorCheckpointMismatch {
+                receipt: receipt.checkpoint(),
+                transition: transition.checkpoint(),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn validate_receipt_payload_authority(
@@ -954,6 +990,13 @@ pub enum ReplayPrototypeError {
     CoverageCountMismatch(usize),
     CoverageReadinessMismatch(ScyllaPhysicalTableId),
     ReceiptMutationCountMismatch { receipt: usize, actual: usize },
+    ImtCursorTransition(ImtCursorTransitionError),
+    ImtCursorTransitionRequired,
+    ImtCursorAuthorityMismatch,
+    ImtCursorCheckpointMismatch {
+        receipt: CheckpointId,
+        transition: CheckpointId,
+    },
 }
 
 impl From<MutationBuildError> for ReplayPrototypeError {
@@ -965,6 +1008,12 @@ impl From<MutationBuildError> for ReplayPrototypeError {
 impl From<MutationDecodeError> for ReplayPrototypeError {
     fn from(value: MutationDecodeError) -> Self {
         Self::MutationDecode(value)
+    }
+}
+
+impl From<ImtCursorTransitionError> for ReplayPrototypeError {
+    fn from(value: ImtCursorTransitionError) -> Self {
+        Self::ImtCursorTransition(value)
     }
 }
 
@@ -1048,9 +1097,15 @@ pub fn imt_leaf_supplements(
     tree_sub: TreeSubId,
     encoded_key: ImtEncodedKey,
     birth_checkpoint: CheckpointId,
-    next_append_index: u64,
-) -> Vec<LogicalMutation> {
-    vec![
+    cursor_before: u64,
+    cursor_after: u64,
+) -> Result<Vec<LogicalMutation>, ReplayPrototypeError> {
+    let cursor_transition = ImtCursorTransition::try_new(
+        birth_checkpoint,
+        cursor_before,
+        cursor_after,
+    )?;
+    Ok(vec![
         LogicalMutation::Put {
             key: TypedTableKey::ImtKeyIndex { tree, tree_sub, encoded_key },
             value: MutationValue::Structured {
@@ -1060,9 +1115,9 @@ pub fn imt_leaf_supplements(
         },
         LogicalMutation::Put {
             key: TypedTableKey::ImtCursor { tree, tree_sub },
-            value: MutationValue::CqlU64(next_append_index),
+            value: MutationValue::imt_cursor_transition(cursor_transition),
         },
-    ]
+    ])
 }
 
 /// Explicit restore mutation for the mutable latest-checkpoint singleton.

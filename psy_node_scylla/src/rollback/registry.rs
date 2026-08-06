@@ -624,6 +624,10 @@ const IMT_INDEX_VALUES: &[MutationValueKind] = &[
     MutationValueKind::Structured(StructuredValueSchema::ImtKeyIndexRowV1),
     MutationValueKind::Digest,
 ];
+const IMT_CURSOR_VALUES: &[MutationValueKind] = &[
+    MutationValueKind::Structured(StructuredValueSchema::ImtCursorTransitionV1),
+    MutationValueKind::Digest,
+];
 
 const fn allowed_values_for_family(family: ScyllaSchemaFamily) -> &'static [MutationValueKind] {
     match family {
@@ -635,13 +639,13 @@ const fn allowed_values_for_family(family: ScyllaSchemaFamily) -> &'static [Muta
         | ScyllaSchemaFamily::MerkleDouble => PSY_VALUES,
         ScyllaSchemaFamily::U64
         | ScyllaSchemaFamily::Counter
-        | ScyllaSchemaFamily::U128ToU64
-        | ScyllaSchemaFamily::ImtCursor => U64_VALUES,
+        | ScyllaSchemaFamily::U128ToU64 => U64_VALUES,
         ScyllaSchemaFamily::U64ToU128 => U128_VALUES,
         ScyllaSchemaFamily::HashToMany => KEY_ONLY_VALUES,
         ScyllaSchemaFamily::TagTree => TAG_VALUES,
         ScyllaSchemaFamily::ImtLeaf => IMT_LEAF_VALUES,
         ScyllaSchemaFamily::ImtKeyIndex => IMT_INDEX_VALUES,
+        ScyllaSchemaFamily::ImtCursor => IMT_CURSOR_VALUES,
     }
 }
 

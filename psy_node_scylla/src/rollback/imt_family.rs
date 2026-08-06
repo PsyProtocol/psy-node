@@ -14,8 +14,10 @@ use std::{collections::{BTreeMap, BTreeSet}, error::Error, fmt};
 use psy_node_core::store::{
     timestamp::{DeleteFenceTimestampUs, NewBranchWriteTimestampUs},
     typed::{
-        CheckpointId, ImtEncodedKey, LeafIndex, MutationOperation, MutationValue,
-        StructuredValueSchema, TreeId, TreeSubId, TypedTableKey,
+        CheckpointId, ImtCursorTransition, ImtCursorTransitionError,
+        ImtEncodedKey, LeafIndex, LogicalMutation, MutationOperation,
+        MutationValue, StructuredValueSchema, TreeId, TreeSubId,
+        TypedTableKey,
     },
 };
 use scylla::{
@@ -314,15 +316,26 @@ impl ImtIndexPutBinding {
 pub struct ImtCursorPutBinding {
     before: ImtCursorSnapshot,
     after: ImtCursorSnapshot,
-    checkpoint: CheckpointId,
+    transition: ImtCursorTransition,
     write_timestamp_us: i64,
 }
 
 impl ImtCursorPutBinding {
     pub const fn before(&self) -> ImtCursorSnapshot { self.before }
     pub const fn after(&self) -> ImtCursorSnapshot { self.after }
-    pub const fn checkpoint(&self) -> CheckpointId { self.checkpoint }
+    pub const fn checkpoint(&self) -> CheckpointId { self.transition.checkpoint() }
+    pub const fn durable_transition(&self) -> ImtCursorTransition { self.transition }
     pub const fn write_timestamp_us(&self) -> i64 { self.write_timestamp_us }
+
+    pub fn durable_supplement(&self) -> LogicalMutation {
+        LogicalMutation::Put {
+            key: TypedTableKey::ImtCursor {
+                tree: self.after.tree,
+                tree_sub: self.after.tree_sub,
+            },
+            value: MutationValue::imt_cursor_transition(self.transition),
+        }
+    }
 
     pub fn bind_values(&self) -> Vec<PrototypeBindValue> {
         cursor_bind_values(self.after, self.write_timestamp_us)
@@ -414,7 +427,13 @@ impl ImtCheckpointWritePlan {
             let after = ImtCursorSnapshot::new(pair.0, pair.1, before.next_append_index.max(requested));
             let resolved = resolve_key_for_rollback(&TypedTableKey::ImtCursor { tree: pair.0, tree_sub: pair.1 })?;
             require_physical(resolved.physical_table(), ScyllaPhysicalTableId::ImtNextAppendIndex)?;
-            cursor_puts.push(ImtCursorPutBinding { before, after, checkpoint, write_timestamp_us });
+            let transition = ImtCursorTransition::try_new(
+                checkpoint,
+                before.next_append_index,
+                after.next_append_index,
+            )
+            .map_err(ImtPlanError::CursorTransition)?;
+            cursor_puts.push(ImtCursorPutBinding { before, after, transition, write_timestamp_us });
         }
 
         let mut hasher = Sha256::new();
@@ -605,6 +624,7 @@ pub enum ImtPlanError {
     EmptyLeafBatch, MixedCheckpoints { expected: CheckpointId, actual: CheckpointId },
     MixedWriteTimestamps { expected: i64, actual: i64 }, DuplicateCursorBeforeImage,
     CursorBeforeImageCoverage, LeafIndexOverflow, ConflictingIndexBirth,
+    CursorTransition(ImtCursorTransitionError),
     VersionNotAfterTarget { version: CheckpointId, target: CheckpointId },
     FenceNotAfterWrite { fence: i64, write: i64 },
     InvalidRange { target: CheckpointId, old_head: CheckpointId },

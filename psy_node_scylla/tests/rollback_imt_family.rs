@@ -107,6 +107,19 @@ fn one_plan_dedupes_checkpoint_final_leaf_and_derives_index_and_cursor() {
     assert_eq!(plan.cursor_puts().len(), 1);
     assert_eq!(plan.cursor_puts()[0].before().next_append_index(), 4);
     assert_eq!(plan.cursor_puts()[0].after().next_append_index(), 8);
+    let transition = plan.cursor_puts()[0].durable_transition();
+    assert_eq!(transition.checkpoint(), checkpoint(50));
+    assert_eq!((transition.before(), transition.after()), (4, 8));
+    assert!(matches!(
+        plan.cursor_puts()[0].durable_supplement(),
+        LogicalMutation::Put {
+            key: TypedTableKey::ImtCursor { .. },
+            value: MutationValue::Structured {
+                schema: StructuredValueSchema::ImtCursorTransitionV1,
+                ..
+            }
+        }
+    ));
     assert_ne!(plan.digest().as_bytes(), &[0; 32]);
 }
 

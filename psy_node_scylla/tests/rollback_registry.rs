@@ -1,10 +1,13 @@
 use std::collections::{BTreeSet, HashSet};
 
 use psy_node_core::store::typed::{
-    CheckpointId, CheckpointLeafKey, CheckpointRootKey, CheckpointedObjectKey, ContractId, ImtEncodedKey, LeafIndex, LogicalMutation,
-    LatestInfoSlot, MerkleNode, MutationOperation, MutationValue, MutationValueKind, NodeIndex, ProcCheckpointUniqueId, PsyLogicalTableId,
-    PublicKeyHash, RealmId, StructuredValueSchema, TreeId, TreeSubId, TypedTableKey, U64CounterSlot, U64SingletonSlot, UniquePendingId,
-    UserId,
+    CheckpointId, CheckpointLeafKey, CheckpointRootKey, CheckpointedObjectKey,
+    ContractId, ImtCursorTransition, ImtCursorTransitionError, ImtEncodedKey,
+    LeafIndex, LatestInfoSlot,
+    LogicalMutation, MerkleNode, MutationOperation, MutationValue,
+    MutationValueKind, NodeIndex, ProcCheckpointUniqueId, PsyLogicalTableId,
+    PublicKeyHash, RealmId, StructuredValueSchema, TreeId, TreeSubId,
+    TypedTableKey, U64CounterSlot, U64SingletonSlot, UniquePendingId, UserId,
 };
 use psy_node_scylla::rollback::*;
 use strum::IntoEnumIterator;
@@ -445,6 +448,15 @@ fn mutation_value_kind_is_checked_per_key_domain() {
             ScyllaKeyDomain::ImtLeaf,
             MutationValueKind::Structured(StructuredValueSchema::ImtKeyIndexRowV1),
         ),
+        (
+            TypedTableKey::ImtCursor {
+                tree: TreeId::new(1),
+                tree_sub: TreeSubId::new(2),
+            },
+            MutationValue::CqlU64(7),
+            ScyllaKeyDomain::ImtCursor,
+            MutationValueKind::CqlU64,
+        ),
     ];
     for (key, value, domain, actual) in mismatch_cases {
         assert_eq!(
@@ -481,7 +493,15 @@ fn mutation_value_kind_is_checked_per_key_domain() {
             },
             MutationValue::Structured { schema: StructuredValueSchema::ImtKeyIndexRowV1, canonical_bytes: vec![5, 6] },
         ),
-        (TypedTableKey::ImtCursor { tree: TreeId::new(1), tree_sub: TreeSubId::new(2) }, MutationValue::CqlU64(7)),
+        (
+            TypedTableKey::ImtCursor {
+                tree: TreeId::new(1),
+                tree_sub: TreeSubId::new(2),
+            },
+            MutationValue::imt_cursor_transition(
+                ImtCursorTransition::try_new(checkpoint(4), 6, 7).unwrap(),
+            ),
+        ),
     ];
     for (key, value) in valid_cases {
         assert_eq!(expand_logical_mutation(LogicalMutation::Put { key, value }).unwrap().len(), 1);
@@ -496,6 +516,26 @@ fn delete_is_reserved_until_the_adapter_and_strategy_are_enabled() {
             Err(MutationBuildError::DeleteNotEnabled)
         );
     }
+}
+
+#[test]
+fn malformed_imt_cursor_transition_is_rejected_by_mutation_construction() {
+    let key = TypedTableKey::ImtCursor {
+        tree: TreeId::new(1),
+        tree_sub: TreeSubId::new(2),
+    };
+    assert_eq!(
+        expand_logical_mutation(LogicalMutation::Put {
+            key,
+            value: MutationValue::Structured {
+                schema: StructuredValueSchema::ImtCursorTransitionV1,
+                canonical_bytes: vec![0; 23],
+            },
+        }),
+        Err(MutationBuildError::InvalidImtCursorTransition(
+            ImtCursorTransitionError::InvalidCanonicalLength { actual: 23 }
+        ))
+    );
 }
 
 #[test]

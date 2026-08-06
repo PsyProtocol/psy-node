@@ -1,8 +1,10 @@
 use std::time::Instant;
 
 use psy_node_core::store::typed::{
-    CheckpointId, CheckpointLeafKey, CheckpointRootKey, CheckpointedObjectKey, ImtEncodedKey, LatestInfoSlot, LeafIndex,
-    LogicalMutation, MerkleNode, MutationValue, NodeIndex, RealmId, StructuredValueSchema, TreeId, TreeSubId, TypedTableKey,
+    CheckpointId, CheckpointLeafKey, CheckpointRootKey,
+    CheckpointedObjectKey, ImtCursorTransition, ImtEncodedKey, LatestInfoSlot,
+    LeafIndex, LogicalMutation, MerkleNode, MutationOperation, MutationValue,
+    NodeIndex, RealmId, StructuredValueSchema, TreeId, TreeSubId, TypedTableKey,
     U64SingletonSlot, UniquePendingId, UserId, ValueDigestAlgorithm,
 };
 use psy_node_scylla::rollback::*;
@@ -151,7 +153,9 @@ fn realm_spec() -> FixtureSpec {
         PreparedSemanticMutation::L2BlockState { checkpoint: cp, value: vec![0x25; 80] },
         PreparedSemanticMutation::CheckpointStateRoots { checkpoint: cp, value: vec![0x26; 128] },
     ];
-    let mut supplements = imt_leaf_supplements(tree, tree_sub, encoded_key.clone(), cp, 4);
+    let mut supplements =
+        imt_leaf_supplements(tree, tree_sub, encoded_key.clone(), cp, 3, 4)
+            .unwrap();
     supplements.extend([
         put(
             TypedTableKey::GlobalCheckpointMerkle { node: MerkleNode::new(5, NodeIndex::new(1)), checkpoint: cp },
@@ -178,7 +182,7 @@ fn realm_spec() -> FixtureSpec {
         put(TypedTableKey::L2BlockState(cp), vec![0x25; 80]),
         put(TypedTableKey::CheckpointStateRoots(cp), vec![0x26; 128]),
     ];
-    full.extend(imt_leaf_supplements(tree, tree_sub, encoded_key, cp, 4));
+    full.extend(imt_leaf_supplements(tree, tree_sub, encoded_key, cp, 3, 4).unwrap());
     full.extend([
         put(
             TypedTableKey::GlobalCheckpointMerkle { node: MerkleNode::new(5, NodeIndex::new(1)), checkpoint: cp },
@@ -573,6 +577,121 @@ fn root_pair_imt_supplements_and_singleton_restore_are_explicit() {
     ] {
         assert!(physical.contains(&required), "missing {required:?}");
     }
+    let cursor = realm
+        .full
+        .mutations()
+        .iter()
+        .find(|mutation| {
+            mutation.mutation().physical_table()
+                == ScyllaPhysicalTableId::ImtNextAppendIndex
+        })
+        .unwrap();
+    let MutationOperation::Put(MutationValue::Structured {
+        schema: StructuredValueSchema::ImtCursorTransitionV1,
+        canonical_bytes,
+    }) = cursor.mutation().operation()
+    else {
+        panic!("IMT cursor must carry a durable transition")
+    };
+    let transition = ImtCursorTransition::decode_canonical(canonical_bytes).unwrap();
+    assert_eq!(transition.checkpoint(), checkpoint(43));
+    assert_eq!((transition.before(), transition.after()), (3, 4));
+}
+
+#[test]
+fn imt_cursor_before_image_is_digest_bound_and_checkpoint_checked() {
+    let key = TypedTableKey::ImtCursor {
+        tree: TreeId::new(9),
+        tree_sub: TreeSubId::new(2),
+    };
+    let one = CanonicalPhysicalMutationBatch::from_logical(vec![
+        LogicalMutation::Put {
+            key: key.clone(),
+            value: MutationValue::imt_cursor_transition(
+                ImtCursorTransition::try_new(checkpoint(43), 3, 4).unwrap(),
+            ),
+        },
+    ])
+    .unwrap();
+    let changed_before = CanonicalPhysicalMutationBatch::from_logical(vec![
+        LogicalMutation::Put {
+            key,
+            value: MutationValue::imt_cursor_transition(
+                ImtCursorTransition::try_new(checkpoint(43), 2, 4).unwrap(),
+            ),
+        },
+    ])
+    .unwrap();
+    assert_ne!(one.digest(), changed_before.digest());
+
+    let coordinator_receipt = ReplayReceipt::new(
+        ReplayAuthority::Coordinator,
+        checkpoint(43),
+        0,
+        1,
+        vec![],
+    );
+    assert_eq!(
+        FullPhysicalDeltaRecord::try_new(
+            one.clone(),
+            coordinator_receipt
+        )
+        .unwrap_err(),
+        ReplayPrototypeError::ImtCursorAuthorityMismatch
+    );
+
+    let receipt = ReplayReceipt::new(
+        ReplayAuthority::Realm,
+        checkpoint(44),
+        0,
+        1,
+        vec![],
+    );
+    assert_eq!(
+        FullPhysicalDeltaRecord::try_new(one, receipt).unwrap_err(),
+        ReplayPrototypeError::ImtCursorCheckpointMismatch {
+            receipt: checkpoint(44),
+            transition: checkpoint(43),
+        }
+    );
+}
+
+#[test]
+fn persisted_imt_cursor_transition_corruption_fails_closed() {
+    let fixture = materialize(realm_spec()).unwrap();
+    let transition = ImtCursorTransition::try_new(checkpoint(43), 3, 4)
+        .unwrap()
+        .encode_canonical();
+    let canonical = fixture.compact_record.encode_canonical();
+    let offset = canonical
+        .windows(transition.len())
+        .position(|window| window == transition)
+        .expect("cursor transition must be embedded in the replay record");
+
+    let mut wrong_checkpoint = canonical.clone();
+    wrong_checkpoint[offset..offset + 8]
+        .copy_from_slice(&checkpoint(44).get().to_be_bytes());
+    assert_eq!(
+        PreparedReferencePlusSupplementRecord::decode_canonical(
+            &wrong_checkpoint
+        )
+        .unwrap_err(),
+        ReplayPrototypeError::ImtCursorCheckpointMismatch {
+            receipt: checkpoint(43),
+            transition: checkpoint(44),
+        }
+    );
+
+    let mut rewind = canonical;
+    rewind[offset + 8..offset + 16].copy_from_slice(&5_u64.to_be_bytes());
+    assert!(matches!(
+        PreparedReferencePlusSupplementRecord::decode_canonical(&rewind),
+        Err(ReplayPrototypeError::MutationDecode(
+            MutationDecodeError::MutationBuild(
+                MutationBuildError::InvalidImtCursorTransition(_)
+            )
+        ))
+    ));
 }
 
 #[test]
