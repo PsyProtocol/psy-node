@@ -525,7 +525,7 @@ fn physical_coverage_is_exact_and_registry_consistent() {
     assert_eq!((blocked, retired), (3, 3));
     assert_eq!(psy_node_core::store::typed::PsyLogicalTableId::iter().count(), 32);
     assert_eq!(ScyllaPhysicalTableId::iter().count(), 35);
-    assert_eq!(ScyllaKeyDomain::iter().count(), 38);
+    assert_eq!(ScyllaKeyDomain::iter().count(), 39);
 }
 
 #[test]

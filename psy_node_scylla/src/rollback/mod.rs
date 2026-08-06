@@ -1,10 +1,11 @@
 //! Typed Scylla identities, primary keys, mutations, and rollback metadata.
 //!
-//! D-02a remains descriptive. The isolated G0-06 representative adapter can
-//! prepare and execute CQL when explicitly constructed by a harness, but it is
-//! not connected to production setup or current writers.
+//! D-02a remains the registry baseline. G0-06 provides representative fence
+//! adapters and D-02T1 adds the closed checkpoint-keyed KIV family, but neither
+//! is connected to production setup or current writers yet.
 
 mod canonical_head_prototype;
+mod checkpoint_kiv;
 mod rollback_admission;
 mod identity;
 mod key;
@@ -19,6 +20,7 @@ mod timestamped;
 mod registry;
 
 pub use canonical_head_prototype::*;
+pub use checkpoint_kiv::*;
 pub use rollback_admission::*;
 pub use identity::*;
 pub use key::*;
