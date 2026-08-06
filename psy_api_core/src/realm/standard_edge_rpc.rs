@@ -4,6 +4,7 @@ use parth_core::{
 };
 use psy_data::{
     proof_input::guta::end_cap_input::SubmitUserEndCapNonProofInput,
+    protocol::chain_context::AuthorityObservation,
     v1::{common_api::PsyProoffMinerRewardProof,
         qdata::{
             checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState},
@@ -48,6 +49,13 @@ pub trait RealmEdgeRpcTest {
 
 #[rpc(server, client, namespace = "psy")]
 pub trait RealmEdgeRpc<F, Hash, JobId, ZKProof> {
+    /// Return the exact durable branch and local-state marker last published
+    /// by the Realm Processor. Missing state is an explicit RPC error; callers
+    /// must never synthesize epoch zero or combine this with legacy latest
+    /// reads as if the pair were atomic.
+    #[method(name = "get_realm_authority_observation")]
+    async fn get_realm_authority_observation(&self) -> RpcResult<AuthorityObservation<Hash>>;
+
     /// Check if a user id belongs to this realm
     #[method(name = "check_user_id_in_realm")]
     async fn check_user_id_in_realm(&self, user_id: u64) -> RpcResult<bool>;

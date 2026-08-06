@@ -24,7 +24,7 @@ use psy_api_core::{
 };
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{
-    node::node_proving_state::PsyNodeProvingState, proof_input::guta::end_cap_input::SubmitUserEndCapNonProofInput, queue_items::realm_user_update::PsyRealmUserUpdateQueueItem, v1::{
+    node::node_proving_state::PsyNodeProvingState, proof_input::guta::end_cap_input::SubmitUserEndCapNonProofInput, protocol::chain_context::{AuthorityObservation, AuthorityScope}, queue_items::realm_user_update::PsyRealmUserUpdateQueueItem, v1::{
         common_api::PsyProoffMinerRewardProof,
         qdata::{
             checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState},
@@ -53,6 +53,35 @@ use crate::realm::{
 };
 
 const END_CAP_PROOF_CIRCUIT_TYPE_U32: u32 = ProvingJobCircuitType::UserEndCap as u32;
+
+fn require_realm_authority_observation<Hash>(
+    observation: Option<AuthorityObservation<Hash>>,
+    expected_chain_id: u32,
+    expected_realm: &QRealmIdentifier,
+) -> anyhow::Result<AuthorityObservation<Hash>> {
+    let observation = observation
+        .ok_or_else(|| anyhow::anyhow!("REALM_AUTHORITY_OBSERVATION_UNINITIALIZED"))?;
+    if observation.chain().network_id().chain_id() != expected_chain_id {
+        anyhow::bail!(
+            "REALM_AUTHORITY_OBSERVATION_NETWORK_MISMATCH:expected={},observed={}",
+            expected_chain_id,
+            observation.chain().network_id().chain_id(),
+        );
+    }
+    let expected_authority = AuthorityScope::Realm {
+        realm_id: expected_realm.realm_id,
+        realm_sub_id: expected_realm.realm_sub_id,
+    };
+    if observation.authority() != expected_authority {
+        anyhow::bail!(
+            "REALM_AUTHORITY_OBSERVATION_SCOPE_MISMATCH:expected={:?},observed={:?}",
+            expected_authority,
+            observation.authority(),
+        );
+    }
+    Ok(observation)
+}
+
 pub struct RealmEdgeHandler<
     N: QNetworkTypesConfig,
     S: PsyRealmEdgeAPIStoreReader<N::F, N::QHash> + Send + Sync,
@@ -155,6 +184,15 @@ impl<
     }
     pub async fn get_latest_checkpoint_id(&self) -> anyhow::Result<u64> {
         self.db_reader.get_latest_checkpoint_id().await
+    }
+    pub async fn get_realm_authority_observation_internal(
+        &self,
+    ) -> anyhow::Result<AuthorityObservation<N::QHash>> {
+        require_realm_authority_observation(
+            self.db_reader.get_realm_authority_observation().await?,
+            self.chain_id,
+            &self.realm_identifier,
+        )
     }
     pub async fn get_job_stats_internal(&self, checkpoint_id: u64) -> anyhow::Result<CheckpointJobStats> {
         let (unique_pending_id, _) = self
@@ -693,6 +731,12 @@ impl<
 {
     /// Check if a user id belongs to this realm
 
+    async fn get_realm_authority_observation(
+        &self,
+    ) -> RpcResult<AuthorityObservation<N::QHash>> {
+        res(self.get_realm_authority_observation_internal().await)
+    }
+
     async fn get_latest_checkpoint_id(&self) -> RpcResult<u64> {
         res(self.get_latest_checkpoint_id().await)
     }
@@ -1095,6 +1139,113 @@ impl<
             .db_reader
             .contract_state_imt_get_next_append_index(user_id, contract_id as u64)
             .await)
+    }
+}
+
+#[cfg(test)]
+mod authority_observation_rpc_tests {
+    use super::*;
+    use parth_core::data::hash::hash256::Hash256;
+    use psy_data::protocol::{
+        canonical_chain::{
+            CanonicalChainRef, ChainEpoch, CheckpointHash, CheckpointId,
+            CheckpointRef, NetworkId,
+        },
+        chain_context::{AuthorityStateCheckpointId, AuthorityStateRoot},
+    };
+
+    const TEST_CHAIN_ID: u32 = 0x6979_7350;
+
+    fn observation(
+        chain_id: u32,
+        authority: AuthorityScope,
+    ) -> AuthorityObservation<Hash256> {
+        AuthorityObservation::try_new(
+            CanonicalChainRef::new(
+                NetworkId::try_from_chain_id(chain_id).unwrap(),
+                ChainEpoch::new(7),
+                CheckpointRef::new(
+                    CheckpointId::new(367),
+                    CheckpointHash::from_last_chain_hash(Hash256([0x11; 32])),
+                ),
+            ),
+            authority,
+            AuthorityStateCheckpointId::new(360),
+            AuthorityStateRoot::from_local_state_root(Hash256([0x22; 32])),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn realm_rpc_observation_accepts_only_configured_network_and_scope() {
+        let realm = QRealmIdentifier::new(9, 2);
+        let valid = observation(
+            TEST_CHAIN_ID,
+            AuthorityScope::Realm {
+                realm_id: 9,
+                realm_sub_id: 2,
+            },
+        );
+        assert_eq!(
+            require_realm_authority_observation(
+                Some(valid),
+                TEST_CHAIN_ID,
+                &realm,
+            )
+                .unwrap(),
+            valid,
+        );
+
+        assert!(
+            require_realm_authority_observation::<Hash256>(
+                None,
+                TEST_CHAIN_ID,
+                &realm,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("UNINITIALIZED")
+        );
+
+        let wrong_scope = observation(
+            TEST_CHAIN_ID,
+            AuthorityScope::Realm {
+                realm_id: 10,
+                realm_sub_id: 2,
+            },
+        );
+        assert!(
+            require_realm_authority_observation(
+                Some(wrong_scope),
+                TEST_CHAIN_ID,
+                &realm,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("SCOPE_MISMATCH")
+        );
+
+        let other_network = psy_core::constants::chain_id::PsyChainNetworkType::LocalDevnet
+            .get_chain_id();
+        if other_network != TEST_CHAIN_ID {
+            let wrong_network = observation(
+                other_network,
+                AuthorityScope::Realm {
+                    realm_id: 9,
+                    realm_sub_id: 2,
+                },
+            );
+            assert!(
+                require_realm_authority_observation(
+                    Some(wrong_network),
+                    TEST_CHAIN_ID,
+                    &realm,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("NETWORK_MISMATCH")
+            );
+        }
     }
 }
 
