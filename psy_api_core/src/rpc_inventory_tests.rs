@@ -66,7 +66,7 @@ fn production_rpc_inventory_is_explicit_and_excludes_commented_methods() {
     let realm = assert_inventory(
         include_str!("realm/standard_edge_rpc.rs"),
         "pub trait RealmEdgeRpc<",
-        43,
+        46,
     );
     let worker = assert_inventory(
         include_str!("worker/standard_worker_rpc.rs"),
@@ -76,6 +76,10 @@ fn production_rpc_inventory_is_explicit_and_excludes_commented_methods() {
 
     assert!(coordinator.contains("get_canonical_chain_ref"));
     assert!(realm.contains("get_realm_authority_observation"));
+    assert!(realm.contains("get_latest_checkpoint_id_v2"));
+    assert!(realm.contains("get_latest_l2_block_state_v2"));
+    assert!(realm.contains("get_latest_checkpoint_tree_root_v2"));
+    assert!(!realm.contains("get_imt_next_append_index_v2"));
     assert!(worker.contains("submit_proof_raw"));
 
     assert!(!coordinator.contains("build_block"));

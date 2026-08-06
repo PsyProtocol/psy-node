@@ -4,7 +4,7 @@ use parth_core::{
 };
 use psy_data::{
     proof_input::guta::end_cap_input::SubmitUserEndCapNonProofInput,
-    protocol::chain_context::AuthorityObservation,
+    protocol::chain_context::{AuthorityObservation, CanonicalResponse},
     v1::{common_api::PsyProoffMinerRewardProof,
         qdata::{
             checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState},
@@ -55,6 +55,25 @@ pub trait RealmEdgeRpc<F, Hash, JobId, ZKProof> {
     /// reads as if the pair were atomic.
     #[method(name = "get_realm_authority_observation")]
     async fn get_realm_authority_observation(&self) -> RpcResult<AuthorityObservation<Hash>>;
+
+    /// Return the checkpoint ID derived from the same durable Realm
+    /// observation carried by the response.
+    #[method(name = "get_latest_checkpoint_id_v2")]
+    async fn get_latest_checkpoint_id_v2(&self) -> RpcResult<CanonicalResponse<Hash, u64>>;
+
+    /// Read the checkpoint-keyed L2 block state selected by a stable durable
+    /// Realm observation. This never reads the legacy latest-info singleton.
+    #[method(name = "get_latest_l2_block_state_v2")]
+    async fn get_latest_l2_block_state_v2(
+        &self,
+    ) -> RpcResult<CanonicalResponse<Hash, QEDL2BlockState>>;
+
+    /// Read the checkpoint-tree root at the checkpoint selected by a stable
+    /// durable Realm observation. This never uses MAX_CHECKPOINT_ID.
+    #[method(name = "get_latest_checkpoint_tree_root_v2")]
+    async fn get_latest_checkpoint_tree_root_v2(
+        &self,
+    ) -> RpcResult<CanonicalResponse<Hash, Hash>>;
 
     /// Check if a user id belongs to this realm
     #[method(name = "check_user_id_in_realm")]

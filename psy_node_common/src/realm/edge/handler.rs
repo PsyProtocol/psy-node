@@ -1,4 +1,4 @@
-use std::{sync::Arc, u64};
+use std::{future::Future, sync::Arc, u64};
 use tokio::task;
 use futures::stream::{self, StreamExt};
 
@@ -24,7 +24,7 @@ use psy_api_core::{
 };
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{
-    node::node_proving_state::PsyNodeProvingState, proof_input::guta::end_cap_input::SubmitUserEndCapNonProofInput, protocol::chain_context::{AuthorityObservation, AuthorityScope}, queue_items::realm_user_update::PsyRealmUserUpdateQueueItem, v1::{
+    node::node_proving_state::PsyNodeProvingState, proof_input::guta::end_cap_input::SubmitUserEndCapNonProofInput, protocol::chain_context::{AuthorityObservation, AuthorityScope, CanonicalResponse}, queue_items::realm_user_update::PsyRealmUserUpdateQueueItem, v1::{
         common_api::PsyProoffMinerRewardProof,
         qdata::{
             checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState},
@@ -53,6 +53,7 @@ use crate::realm::{
 };
 
 const END_CAP_PROOF_CIRCUIT_TYPE_U32: u32 = ProvingJobCircuitType::UserEndCap as u32;
+const REALM_STABLE_READ_MAX_ATTEMPTS: usize = 3;
 
 fn require_realm_authority_observation<Hash>(
     observation: Option<AuthorityObservation<Hash>>,
@@ -80,6 +81,58 @@ fn require_realm_authority_observation<Hash>(
         );
     }
     Ok(observation)
+}
+
+fn realm_checkpoint_id_response<Hash>(
+    observation: AuthorityObservation<Hash>,
+) -> CanonicalResponse<Hash, u64> {
+    let checkpoint_id = observation
+        .chain()
+        .checkpoint()
+        .checkpoint_id()
+        .get();
+    CanonicalResponse::new(observation, checkpoint_id)
+}
+
+async fn read_stable_realm_value<
+    Hash,
+    Value,
+    ReadObservation,
+    ObservationFuture,
+    ReadValue,
+    ValueFuture,
+>(
+    mut read_observation: ReadObservation,
+    mut read_value: ReadValue,
+) -> anyhow::Result<CanonicalResponse<Hash, Value>>
+where
+    Hash: PartialEq,
+    ReadObservation: FnMut() -> ObservationFuture,
+    ObservationFuture: Future<Output = anyhow::Result<AuthorityObservation<Hash>>>,
+    ReadValue: FnMut(u64) -> ValueFuture,
+    ValueFuture: Future<Output = anyhow::Result<Value>>,
+{
+    for _ in 0..REALM_STABLE_READ_MAX_ATTEMPTS {
+        let observation_before = read_observation().await?;
+        let target_checkpoint_id = observation_before
+            .chain()
+            .checkpoint()
+            .checkpoint_id()
+            .get();
+        let value_result = read_value(target_checkpoint_id).await;
+        let observation_after = read_observation().await?;
+
+        if observation_before != observation_after {
+            continue;
+        }
+
+        return value_result.map(|value| CanonicalResponse::new(observation_before, value));
+    }
+
+    anyhow::bail!(
+        "REALM_STABLE_READ_RETRY_EXHAUSTED:attempts={}",
+        REALM_STABLE_READ_MAX_ATTEMPTS
+    )
 }
 
 pub struct RealmEdgeHandler<
@@ -193,6 +246,31 @@ impl<
             self.chain_id,
             &self.realm_identifier,
         )
+    }
+    pub async fn get_latest_checkpoint_id_v2_internal(
+        &self,
+    ) -> anyhow::Result<CanonicalResponse<N::QHash, u64>> {
+        self.get_realm_authority_observation_internal()
+            .await
+            .map(realm_checkpoint_id_response)
+    }
+    pub async fn get_latest_l2_block_state_v2_internal(
+        &self,
+    ) -> anyhow::Result<CanonicalResponse<N::QHash, QEDL2BlockState>> {
+        read_stable_realm_value(
+            || self.get_realm_authority_observation_internal(),
+            |checkpoint_id| self.db_reader.get_l2_block_state(checkpoint_id),
+        )
+        .await
+    }
+    pub async fn get_latest_checkpoint_tree_root_v2_internal(
+        &self,
+    ) -> anyhow::Result<CanonicalResponse<N::QHash, N::QHash>> {
+        read_stable_realm_value(
+            || self.get_realm_authority_observation_internal(),
+            |checkpoint_id| self.db_reader.checkpoint_tree_get_root_hash(checkpoint_id),
+        )
+        .await
     }
     pub async fn get_job_stats_internal(&self, checkpoint_id: u64) -> anyhow::Result<CheckpointJobStats> {
         let (unique_pending_id, _) = self
@@ -737,6 +815,24 @@ impl<
         res(self.get_realm_authority_observation_internal().await)
     }
 
+    async fn get_latest_checkpoint_id_v2(
+        &self,
+    ) -> RpcResult<CanonicalResponse<N::QHash, u64>> {
+        res(self.get_latest_checkpoint_id_v2_internal().await)
+    }
+
+    async fn get_latest_l2_block_state_v2(
+        &self,
+    ) -> RpcResult<CanonicalResponse<N::QHash, QEDL2BlockState>> {
+        res(self.get_latest_l2_block_state_v2_internal().await)
+    }
+
+    async fn get_latest_checkpoint_tree_root_v2(
+        &self,
+    ) -> RpcResult<CanonicalResponse<N::QHash, N::QHash>> {
+        res(self.get_latest_checkpoint_tree_root_v2_internal().await)
+    }
+
     async fn get_latest_checkpoint_id(&self) -> RpcResult<u64> {
         res(self.get_latest_checkpoint_id().await)
     }
@@ -1146,6 +1242,7 @@ impl<
 mod authority_observation_rpc_tests {
     use super::*;
     use parth_core::data::hash::hash256::Hash256;
+    use std::{collections::VecDeque, future::ready};
     use psy_data::protocol::{
         canonical_chain::{
             CanonicalChainRef, ChainEpoch, CheckpointHash, CheckpointId,
@@ -1160,32 +1257,74 @@ mod authority_observation_rpc_tests {
         chain_id: u32,
         authority: AuthorityScope,
     ) -> AuthorityObservation<Hash256> {
+        observation_at(chain_id, authority, 7, 367, 0x11, 360, 0x22)
+    }
+
+    fn observation_at(
+        chain_id: u32,
+        authority: AuthorityScope,
+        epoch: u64,
+        checkpoint_id: u64,
+        checkpoint_hash_byte: u8,
+        state_checkpoint_id: u64,
+        state_root_byte: u8,
+    ) -> AuthorityObservation<Hash256> {
         AuthorityObservation::try_new(
             CanonicalChainRef::new(
                 NetworkId::try_from_chain_id(chain_id).unwrap(),
-                ChainEpoch::new(7),
+                ChainEpoch::new(epoch),
                 CheckpointRef::new(
-                    CheckpointId::new(367),
-                    CheckpointHash::from_last_chain_hash(Hash256([0x11; 32])),
+                    CheckpointId::new(checkpoint_id),
+                    CheckpointHash::from_last_chain_hash(Hash256([
+                        checkpoint_hash_byte;
+                        32
+                    ])),
                 ),
             ),
             authority,
-            AuthorityStateCheckpointId::new(360),
-            AuthorityStateRoot::from_local_state_root(Hash256([0x22; 32])),
+            AuthorityStateCheckpointId::new(state_checkpoint_id),
+            AuthorityStateRoot::from_local_state_root(Hash256([state_root_byte; 32])),
         )
         .unwrap()
+    }
+
+    fn realm_scope() -> AuthorityScope {
+        AuthorityScope::Realm {
+            realm_id: 9,
+            realm_sub_id: 2,
+        }
+    }
+
+    fn rust_function_body<'a>(source: &'a str, signature: &str) -> &'a str {
+        let start = source
+            .find(signature)
+            .unwrap_or_else(|| panic!("missing function signature: {signature}"));
+        let relative_open = source[start..]
+            .find('{')
+            .unwrap_or_else(|| panic!("missing function body: {signature}"));
+        let open = start + relative_open;
+        let mut depth = 0usize;
+
+        for (offset, byte) in source.as_bytes()[open..].iter().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[open..=open + offset];
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        panic!("unterminated function body: {signature}")
     }
 
     #[test]
     fn realm_rpc_observation_accepts_only_configured_network_and_scope() {
         let realm = QRealmIdentifier::new(9, 2);
-        let valid = observation(
-            TEST_CHAIN_ID,
-            AuthorityScope::Realm {
-                realm_id: 9,
-                realm_sub_id: 2,
-            },
-        );
+        let valid = observation(TEST_CHAIN_ID, realm_scope());
         assert_eq!(
             require_realm_authority_observation(
                 Some(valid),
@@ -1246,6 +1385,257 @@ mod authority_observation_rpc_tests {
                 .contains("NETWORK_MISMATCH")
             );
         }
+    }
+
+    #[test]
+    fn checkpoint_id_response_is_derived_from_the_same_observation() {
+        let observation = observation_at(
+            TEST_CHAIN_ID,
+            realm_scope(),
+            11,
+            912,
+            0x31,
+            906,
+            0x41,
+        );
+        let response = realm_checkpoint_id_response(observation);
+
+        assert_eq!(*response.value(), 912);
+        assert_eq!(response.observed(), &observation);
+        assert_eq!(
+            *response.value(),
+            response
+                .observed()
+                .chain()
+                .checkpoint()
+                .checkpoint_id()
+                .get()
+        );
+    }
+
+    #[test]
+    fn v2_handlers_are_checkpoint_addressed_not_legacy_latest_reads() {
+        let source = include_str!("handler.rs");
+        let checkpoint_id = rust_function_body(
+            source,
+            "pub async fn get_latest_checkpoint_id_v2_internal",
+        );
+        assert!(checkpoint_id.contains("get_realm_authority_observation_internal"));
+        assert!(!checkpoint_id.contains("self.get_latest_checkpoint_id()"));
+        assert!(!checkpoint_id.contains("db_reader.get_latest_checkpoint_id"));
+
+        let l2 = rust_function_body(
+            source,
+            "pub async fn get_latest_l2_block_state_v2_internal",
+        );
+        assert!(l2.contains("get_l2_block_state(checkpoint_id)"));
+        assert!(!l2.contains("get_latest_l2_block_state()"));
+
+        let checkpoint_tree = rust_function_body(
+            source,
+            "pub async fn get_latest_checkpoint_tree_root_v2_internal",
+        );
+        assert!(checkpoint_tree.contains("checkpoint_tree_get_root_hash(checkpoint_id)"));
+        assert!(!checkpoint_tree.contains("MAX_CHECKPOINT_ID"));
+    }
+
+    #[tokio::test]
+    async fn stable_read_reselects_value_after_observation_changes() {
+        let old = observation_at(
+            TEST_CHAIN_ID,
+            realm_scope(),
+            7,
+            367,
+            0x11,
+            360,
+            0x22,
+        );
+        let new = observation_at(
+            TEST_CHAIN_ID,
+            realm_scope(),
+            7,
+            368,
+            0x12,
+            368,
+            0x23,
+        );
+        let mut observations = VecDeque::from([old, new, new, new]);
+        let mut selected_checkpoints = Vec::new();
+
+        let response = read_stable_realm_value(
+            || {
+                ready(
+                    observations
+                        .pop_front()
+                        .ok_or_else(|| anyhow::anyhow!("observation script exhausted")),
+                )
+            },
+            |checkpoint_id| {
+                selected_checkpoints.push(checkpoint_id);
+                ready(Ok(checkpoint_id))
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(selected_checkpoints, vec![367, 368]);
+        assert_eq!(*response.value(), 368);
+        assert_eq!(response.observed(), &new);
+    }
+
+    #[tokio::test]
+    async fn stable_read_retries_same_height_hash_or_local_state_changes() {
+        let old = observation_at(
+            TEST_CHAIN_ID,
+            realm_scope(),
+            7,
+            367,
+            0x11,
+            360,
+            0x22,
+        );
+        let different_hash = observation_at(
+            TEST_CHAIN_ID,
+            realm_scope(),
+            7,
+            367,
+            0x12,
+            360,
+            0x22,
+        );
+        let different_local_state = observation_at(
+            TEST_CHAIN_ID,
+            realm_scope(),
+            7,
+            367,
+            0x12,
+            361,
+            0x23,
+        );
+        let mut observations = VecDeque::from([
+            old,
+            different_hash,
+            different_hash,
+            different_local_state,
+            different_local_state,
+            different_local_state,
+        ]);
+        let mut value_reads = 0usize;
+
+        let response = read_stable_realm_value(
+            || {
+                ready(
+                    observations
+                        .pop_front()
+                        .ok_or_else(|| anyhow::anyhow!("observation script exhausted")),
+                )
+            },
+            |checkpoint_id| {
+                value_reads += 1;
+                ready(Ok(checkpoint_id))
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(value_reads, 3);
+        assert_eq!(response.observed(), &different_local_state);
+    }
+
+    #[tokio::test]
+    async fn changed_observation_discards_value_error_but_stable_error_is_returned() {
+        let old = observation_at(
+            TEST_CHAIN_ID,
+            realm_scope(),
+            7,
+            367,
+            0x11,
+            360,
+            0x22,
+        );
+        let new = observation_at(
+            TEST_CHAIN_ID,
+            realm_scope(),
+            7,
+            368,
+            0x12,
+            368,
+            0x23,
+        );
+        let mut observations = VecDeque::from([old, new, new, new]);
+
+        let response = read_stable_realm_value(
+            || {
+                ready(
+                    observations
+                        .pop_front()
+                        .ok_or_else(|| anyhow::anyhow!("observation script exhausted")),
+                )
+            },
+            |checkpoint_id| {
+                ready(if checkpoint_id == 367 {
+                    Err(anyhow::anyhow!("transient old-branch read error"))
+                } else {
+                    Ok(checkpoint_id)
+                })
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(*response.value(), 368);
+
+        let mut stable_observations = VecDeque::from([new, new]);
+        let error = read_stable_realm_value(
+            || {
+                ready(
+                    stable_observations
+                        .pop_front()
+                        .ok_or_else(|| anyhow::anyhow!("observation script exhausted")),
+                )
+            },
+            |_| ready(Err::<u64, _>(anyhow::anyhow!("stable data error"))),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("stable data error"));
+    }
+
+    #[tokio::test]
+    async fn continuously_changing_observation_exhausts_the_bounded_retry() {
+        let observations = (0..(REALM_STABLE_READ_MAX_ATTEMPTS * 2))
+            .map(|index| {
+                observation_at(
+                    TEST_CHAIN_ID,
+                    realm_scope(),
+                    7 + index as u64,
+                    367,
+                    0x11,
+                    360,
+                    0x22,
+                )
+            })
+            .collect::<VecDeque<_>>();
+        let mut observations = observations;
+        let mut value_reads = 0usize;
+
+        let error = read_stable_realm_value(
+            || {
+                ready(
+                    observations
+                        .pop_front()
+                        .ok_or_else(|| anyhow::anyhow!("observation script exhausted")),
+                )
+            },
+            |checkpoint_id| {
+                value_reads += 1;
+                ready(Ok(checkpoint_id))
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(value_reads, REALM_STABLE_READ_MAX_ATTEMPTS);
+        assert!(error.to_string().contains("REALM_STABLE_READ_RETRY_EXHAUSTED"));
     }
 }
 
