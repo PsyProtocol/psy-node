@@ -50,8 +50,9 @@ use psy_node_core::store::{
     timestamp::CommitWriteTimestampUs,
     typed::{
         CheckpointId as StorageCheckpointId, CheckpointRootKey,
-        LogicalMutation, MerkleNode, MutationOperation, MutationValue,
-        NodeIndex, TypedTableKey, U64SingletonSlot,
+        ImtEncodedKey, ImtKeyIndexRow, LeafIndex, LogicalMutation, MerkleNode,
+        MutationValue, NodeIndex, StructuredValueSchema,
+        TreeId, TreeSubId, TypedTableKey, U64SingletonSlot,
     },
 };
 use scylla::{
@@ -76,7 +77,7 @@ use crate::utils::{
 const CONTROL_KEYSPACE: &str = "psy_d04b2c_rf3_nt";
 const ARTIFACT_KEYSPACE: &str = "psy_d04b2c_rf3_artifacts";
 const STATE_KEYSPACE: &str = "psy_d04b2c_rf3_state";
-const BASELINE: &str = "51f7bdb88490c7faff7667538419941a0540f73d";
+const BASELINE: &str = "01b31224f8f994a4d9940801418ba7955a8e6ca7";
 const IMAGE: &str = "scylladb/scylla@sha256:17496f2dd6e72056d0b0d7e2bd18bd62638872d1d80a5dd9db96ba017fd426fc";
 const NODE_IPS: [Ipv4Addr; 3] = [
     Ipv4Addr::new(172, 29, 86, 11),
@@ -106,6 +107,26 @@ fn chain(checkpoint: u64, seed: u8) -> CanonicalChainRef<PHash> {
             CheckpointHash::from_last_chain_hash(hash(seed)),
         ),
     )
+}
+
+fn imt_row(
+    tree: u64,
+    tree_sub: u64,
+    leaf: u64,
+    seed: u8,
+    leaf_key: [u8; 32],
+) -> Vec<u8> {
+    let mut bytes = vec![0_u8; 161];
+    bytes[0..8].copy_from_slice(&tree.to_le_bytes());
+    bytes[8..16].copy_from_slice(&tree_sub.to_le_bytes());
+    bytes[16..24].copy_from_slice(&leaf.to_le_bytes());
+    bytes[24..56].copy_from_slice(&[seed; 32]);
+    bytes[56..88].copy_from_slice(&leaf_key);
+    bytes[88..120].copy_from_slice(&[seed.wrapping_add(1); 32]);
+    bytes[120..152].copy_from_slice(&[seed.wrapping_add(2); 32]);
+    bytes[152..160].copy_from_slice(&(leaf + 1).to_le_bytes());
+    bytes[160] = 1;
+    bytes
 }
 
 struct Fixture {
@@ -200,18 +221,37 @@ fn fixture_from_seeds(
             new_root_seed.wrapping_add(2),
         ),
     ];
+    let imt_tree = TreeId::new(9);
+    let imt_sub = TreeSubId::new(realm_id as u64);
+    let imt_leaf = LeafIndex::new(3);
+    let imt_leaf_key = [payload_seed.wrapping_add(30); 32];
+    let imt_row = imt_row(
+        imt_tree.get(),
+        imt_sub.get(),
+        imt_leaf.get(),
+        payload_seed.wrapping_add(31),
+        imt_leaf_key,
+    );
+    let mut prepared_semantic = semantic
+        .iter()
+        .map(|(node, value_seed)| {
+            PreparedSemanticMutation::GlobalUserMerkle {
+                checkpoint,
+                node: *node,
+                value: vec![*value_seed; 32],
+            }
+        })
+        .collect::<Vec<_>>();
+    prepared_semantic.push(PreparedSemanticMutation::ImtLeaf {
+        tree: imt_tree,
+        tree_sub: imt_sub,
+        leaf: imt_leaf,
+        checkpoint,
+        canonical_row: imt_row.clone(),
+    });
     let payload = PreparedPayload::try_v1(
         PreparedPayloadKind::Realm,
-        semantic
-            .iter()
-            .map(|(node, value_seed)| {
-                PreparedSemanticMutation::GlobalUserMerkle {
-                    checkpoint,
-                    node: *node,
-                    value: vec![*value_seed; 32],
-                }
-            })
-            .collect(),
+        prepared_semantic,
     )
     .unwrap();
     let payload_bytes = payload.encode_canonical();
@@ -232,6 +272,18 @@ fn fixture_from_seeds(
             value: MutationValue::PsyCanonicalBytes(vec![*value_seed; 32]),
         })
         .collect::<Vec<_>>();
+    logical.push(LogicalMutation::Put {
+        key: TypedTableKey::ImtLeaf {
+            tree: imt_tree,
+            tree_sub: imt_sub,
+            leaf: imt_leaf,
+            checkpoint,
+        },
+        value: MutationValue::Structured {
+            schema: StructuredValueSchema::ImtLeafRowV1,
+            canonical_bytes: imt_row,
+        },
+    });
     let latest_checkpoint = LogicalMutation::Put {
         key: TypedTableKey::U64Singleton(
             U64SingletonSlot::LatestCheckpoint,
@@ -242,21 +294,35 @@ fn fixture_from_seeds(
         root: CheckpointRootKey::new(vec![payload_seed.wrapping_add(40); 32]),
         checkpoint,
     };
+    let imt_supplements = imt_leaf_supplements(
+        imt_tree,
+        imt_sub,
+        ImtEncodedKey::new(encode_raw_imt_key_for_sorting(imt_leaf_key)),
+        imt_leaf_key,
+        imt_leaf,
+        checkpoint,
+        3,
+        4,
+    )
+    .unwrap();
+    logical.extend(imt_supplements.clone());
     logical.push(checkpoint_root.clone());
     logical.push(latest_checkpoint.clone());
     let full = CanonicalPhysicalMutationBatch::from_logical(logical).unwrap();
     let compact = PreparedReferencePlusSupplementRecord::try_v1(
         reference,
-        DerivedSupplementBatch::from_logical(vec![
-            checkpoint_root,
-            latest_checkpoint,
-        ])
+        DerivedSupplementBatch::from_logical(
+            imt_supplements
+                .into_iter()
+                .chain([checkpoint_root, latest_checkpoint])
+                .collect(),
+        )
         .unwrap(),
         ReplayReceipt::new(
             ReplayAuthority::Realm,
             checkpoint,
-            3,
-            3,
+            4,
+            5,
             vec![OperationalReplayAction::RotatePendingCheckpointNamespace],
         ),
         &payload_bytes,
@@ -386,6 +452,30 @@ async fn create_schema(session: &Session) -> anyhow::Result<()> {
             )
             .await?;
     }
+    session
+        .query_unpaged(
+            format!(
+                "CREATE TABLE IF NOT EXISTS {STATE_KEYSPACE}.imt_leaf_table (tree_id BIGINT, tree_sub_id BIGINT, leaf_index BIGINT, checkpoint_id BIGINT, leaf_hash BLOB, leaf_key BLOB, leaf_value BLOB, next_key BLOB, next_index BIGINT, PRIMARY KEY ((tree_id, tree_sub_id, leaf_index), checkpoint_id)) WITH CLUSTERING ORDER BY (checkpoint_id DESC)"
+            ),
+            &[],
+        )
+        .await?;
+    session
+        .query_unpaged(
+            format!(
+                "CREATE TABLE IF NOT EXISTS {STATE_KEYSPACE}.imt_key_index_table (tree_id BIGINT, tree_sub_id BIGINT, key_bucket SMALLINT, encoded_key BLOB, leaf_key BLOB, birth_checkpoint BIGINT, leaf_index BIGINT, PRIMARY KEY ((tree_id, tree_sub_id, key_bucket), encoded_key))"
+            ),
+            &[],
+        )
+        .await?;
+    session
+        .query_unpaged(
+            format!(
+                "CREATE TABLE IF NOT EXISTS {STATE_KEYSPACE}.imt_next_append_index_table (tree_id BIGINT, tree_sub_id BIGINT, next_append_index BIGINT, PRIMARY KEY ((tree_id, tree_sub_id)))"
+            ),
+            &[],
+        )
+        .await?;
     for suffix in ["k1", "k2"] {
         session
             .query_unpaged(
@@ -679,6 +769,15 @@ async fn read_direct_rows(
     let checkpoint_root_k2_query = format!(
         "SELECT value FROM {STATE_KEYSPACE}.checkpoint_root_to_checkpoint_id_table_k2 WHERE obj_id = ?"
     );
+    let imt_leaf_query = format!(
+        "SELECT leaf_hash, leaf_key, leaf_value, next_key, next_index FROM {STATE_KEYSPACE}.imt_leaf_table WHERE tree_id = ? AND tree_sub_id = ? AND leaf_index = ? AND checkpoint_id = ?"
+    );
+    let imt_index_query = format!(
+        "SELECT leaf_key, birth_checkpoint, leaf_index FROM {STATE_KEYSPACE}.imt_key_index_table WHERE tree_id = ? AND tree_sub_id = ? AND key_bucket = ? AND encoded_key = ?"
+    );
+    let imt_cursor_query = format!(
+        "SELECT next_append_index FROM {STATE_KEYSPACE}.imt_next_append_index_table WHERE tree_id = ? AND tree_sub_id = ?"
+    );
     let mut values = Vec::with_capacity(plan.mutation_count());
     for sealed in plan.puts() {
         let value = match sealed.resolved().mutation().key() {
@@ -736,6 +835,80 @@ async fn read_direct_rows(
                     .0;
                 crate::compression::decompress(&stored)?
             }
+            TypedTableKey::ImtLeaf {
+                tree,
+                tree_sub,
+                leaf,
+                checkpoint,
+            } => {
+                let (leaf_hash, leaf_key, leaf_value, next_key, next_index) = session
+                    .query_unpaged(
+                        imt_leaf_query.as_str(),
+                        (
+                            u64_to_i64_exact(tree.get()),
+                            u64_to_i64_exact(tree_sub.get()),
+                            u64_to_i64_exact(leaf.get()),
+                            convert_checkpoint_id_to_i64(checkpoint.get()),
+                        ),
+                    )
+                    .await?
+                    .into_rows_result()?
+                    .single_row::<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, i64)>()?;
+                ensure!(
+                    leaf_hash.len() == 32
+                        && leaf_key.len() == 32
+                        && leaf_value.len() == 32
+                        && next_key.len() == 32
+                );
+                [leaf_hash, leaf_key, leaf_value, next_key]
+                    .into_iter()
+                    .flatten()
+                    .chain(i64_to_u64_exact(next_index).to_be_bytes())
+                    .collect()
+            }
+            TypedTableKey::ImtKeyIndex {
+                tree,
+                tree_sub,
+                encoded_key,
+            } => {
+                let (leaf_key, birth_checkpoint, leaf_index) = session
+                    .query_unpaged(
+                        imt_index_query.as_str(),
+                        (
+                            u64_to_i64_exact(tree.get()),
+                            u64_to_i64_exact(tree_sub.get()),
+                            encoded_key.cql_bucket(),
+                            encoded_key.as_bytes(),
+                        ),
+                    )
+                    .await?
+                    .into_rows_result()?
+                    .single_row::<(Vec<u8>, i64, i64)>()?;
+                ensure!(leaf_key.len() == 32 && birth_checkpoint >= 0);
+                ImtKeyIndexRow::new(
+                    leaf_key.as_slice().try_into().expect("validated length"),
+                    StorageCheckpointId::try_new(birth_checkpoint as u64)?,
+                    LeafIndex::new(i64_to_u64_exact(leaf_index)),
+                )
+                .encode_canonical()
+                .to_vec()
+            }
+            TypedTableKey::ImtCursor { tree, tree_sub } => i64_to_u64_exact(
+                session
+                    .query_unpaged(
+                        imt_cursor_query.as_str(),
+                        (
+                            u64_to_i64_exact(tree.get()),
+                            u64_to_i64_exact(tree_sub.get()),
+                        ),
+                    )
+                    .await?
+                    .into_rows_result()?
+                    .single_row::<(i64,)>()?
+                    .0,
+            )
+            .to_be_bytes()
+            .to_vec(),
             _ => bail!("representative plan exposed an unsupported typed key"),
         };
         values.push(value);
@@ -746,17 +919,10 @@ async fn read_direct_rows(
 fn expected_rows(
     plan: &RepresentativeRealmStateReplayPlan<PHash>,
 ) -> anyhow::Result<Vec<Vec<u8>>> {
-    plan.puts()
-        .map(|sealed| match sealed.resolved().mutation().operation() {
-            MutationOperation::Put(MutationValue::PsyCanonicalBytes(value)) => {
-                Ok(value.clone())
-            }
-            MutationOperation::Put(MutationValue::CqlU64(value)) => {
-                Ok(value.to_be_bytes().to_vec())
-            }
-            _ => bail!("representative plan exposed a non-executable value"),
-        })
-        .collect()
+    Ok(plan
+        .expected_physical_values()
+        .map(<[u8]>::to_vec)
+        .collect())
 }
 
 #[derive(Serialize)]
@@ -855,13 +1021,14 @@ async fn d04b2c_representative_state_replay_rf3_gate() -> anyhow::Result<()> {
         scenarios_passed: vec![
             "M16_partial_state_write_restart_reapplies_exact_timestamped_rows",
             "M17_root_present_but_missing_non_root_row_cannot_seal",
+            "IMT_leaf_index_cursor_exact_rows_are_all_required_before_seal",
             "one_replica_offline_quorum_replay_then_repair_flush_compact",
             "direct_one_all_replicas_equal_expected_rows",
         ],
         finished_unix_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_millis() as u64,
-        qualification: "representative Realm global-user Merkle plus checkpoint-root pair and latest-checkpoint singleton replay; not production Processor integration or full 35-table replay coverage",
+        qualification: "representative Realm global-user Merkle, IMT leaf/key-index/cursor, checkpoint-root pair and latest-checkpoint singleton replay; verifies exact IMT physical durability, not upstream contract-state/root proof binding, production Processor integration, or full 35-table replay coverage",
     };
     let report_path = std::env::var("PSY_D04B2C_REPORT_PATH")
         .unwrap_or_else(|_| "target/d04b2c-state-replay-rf3-report.json".into());
@@ -1009,7 +1176,7 @@ async fn d04b2d_combined_representative_normal_commit_rf3_gate(
         .await?;
 
     let report = D04b2dReport {
-        baseline: "7ef3043346182e0340504ba956a7379bbcced576",
+        baseline: BASELINE,
         image: IMAGE,
         scylla_release: release,
         replication_factor: 3,
@@ -1024,6 +1191,7 @@ async fn d04b2d_combined_representative_normal_commit_rf3_gate(
         direct_one_state_replicas_equal,
         scenarios_passed: vec![
             "partial exact state restart replays before SEALED",
+            "IMT leaf/index/cursor are reconstructed and verified as one replay unit",
             "SEALED restart resumes exact head publication",
             "head response loss recovers COMMITTED from durable state",
             "COMMITTED response loss recovers timestamp completion",
@@ -1033,7 +1201,7 @@ async fn d04b2d_combined_representative_normal_commit_rf3_gate(
         finished_unix_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_millis() as u64,
-        qualification: "representative Realm global-user Merkle plus checkpoint-root pair/latest-checkpoint supplements and manifest/head/timestamp recovery loop; not production Processor integration or full table coverage",
+        qualification: "representative Realm global-user Merkle plus exact IMT leaf/key-index/cursor and checkpoint-root/latest-checkpoint supplements in the manifest/head/timestamp recovery loop; not upstream IMT root proof binding, production Processor integration, or full table coverage",
     };
     let report_path = std::env::var("PSY_D04B2D_REPORT_PATH")
         .unwrap_or_else(|_| "target/d04b2d-combined-normal-commit-rf3-report.json".into());
@@ -1290,7 +1458,7 @@ async fn d04b2e_conflicting_normal_commit_rf3_gate() -> anyhow::Result<()> {
         .is_none());
 
     let report = D04b2eReport {
-        baseline: "98145fce1a1b0f1c1a95bacea8affefe65135274",
+        baseline: BASELINE,
         image: IMAGE,
         scylla_release: release,
         replication_factor: 3,
@@ -1308,6 +1476,7 @@ async fn d04b2e_conflicting_normal_commit_rf3_gate() -> anyhow::Result<()> {
         scenarios_passed: vec![
             "two intent reservations have one durable owner",
             "stale losing publish is rejected before head CAS",
+            "winning replay includes exact IMT leaf/index/cursor physical rows",
             "winning publish is the only canonical head",
             "32 exact publish retries are idempotent",
             "loser cannot persist a manifest or complete a timestamp lease",
@@ -1316,7 +1485,7 @@ async fn d04b2e_conflicting_normal_commit_rf3_gate() -> anyhow::Result<()> {
         finished_unix_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_millis() as u64,
-        qualification: "M20 for one representative Realm normal commit with global-user Merkle plus checkpoint-root pair/latest-checkpoint supplements; not production Processor integration or full table coverage",
+        qualification: "M20 for one representative Realm normal commit with global-user Merkle plus exact IMT leaf/key-index/cursor and checkpoint-root/latest-checkpoint supplements; not upstream IMT root proof binding, production Processor integration, or full table coverage",
     };
     let report_path = std::env::var("PSY_D04B2E_REPORT_PATH")
         .unwrap_or_else(|_| "target/d04b2e-normal-commit-conflict-rf3-report.json".into());

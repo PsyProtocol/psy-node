@@ -39,7 +39,9 @@ use super::{
     CheckpointRootPairPlanError, CheckpointRootPairPutPlan,
     CheckpointRootPairQueryKind, CqlKeyspaceName, GlobalUserMerklePutBinding,
     PrototypeBindValue,
-    MutableSingletonAdapter, MutableSingletonPlanError, MutableSingletonQueryKind,
+    ImtCursorPutBinding, ImtFamilyAdapter, ImtIndexPutBinding,
+    ImtLeafPutBinding, ImtPlanError, ImtQueryKind, MutableSingletonAdapter,
+    MutableSingletonPlanError, MutableSingletonQueryKind,
     ScyllaPhysicalTableId, SealedTimestampedPut, SealedTimestampedPutBatch,
     TimestampPrototypeAdapter,
     TimestampPrototypePlanError, TimestampPrototypeQueryId,
@@ -51,6 +53,7 @@ pub enum ConfinedWriteQueryId {
     TimestampPrototype(TimestampPrototypeQueryId),
     MutableSingleton(MutableSingletonQueryKind),
     CheckpointRootPair(CheckpointRootPairQueryKind),
+    Imt(ImtQueryKind),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -84,6 +87,7 @@ pub enum RollbackableStorePrototypeError {
     TypedPlan(TimestampPrototypePlanError),
     MutableSingletonPlan(MutableSingletonPlanError),
     CheckpointRootPairPlan(CheckpointRootPairPlanError),
+    ImtPlan(ImtPlanError),
     Driver(String),
     RecordingLockPoisoned,
     NotARecordingStore,
@@ -97,6 +101,7 @@ impl fmt::Display for RollbackableStorePrototypeError {
             Self::TypedPlan(error) => error.fmt(f),
             Self::MutableSingletonPlan(error) => error.fmt(f),
             Self::CheckpointRootPairPlan(error) => error.fmt(f),
+            Self::ImtPlan(error) => error.fmt(f),
             Self::Driver(error) => write!(f, "Scylla prototype adapter failed: {error}"),
             Self::RecordingLockPoisoned => write!(f, "recording prototype lock is poisoned"),
             Self::NotARecordingStore => write!(f, "prepared Scylla stores do not expose an in-memory recording"),
@@ -126,11 +131,18 @@ impl From<CheckpointRootPairPlanError> for RollbackableStorePrototypeError {
     }
 }
 
+impl From<ImtPlanError> for RollbackableStorePrototypeError {
+    fn from(value: ImtPlanError) -> Self {
+        Self::ImtPlan(value)
+    }
+}
+
 struct PrivateScyllaBackend {
     session: Arc<Session>,
     adapter: TimestampPrototypeAdapter,
     mutable_singleton: MutableSingletonAdapter,
     checkpoint_root_pair: CheckpointRootPairAdapter,
+    imt: ImtFamilyAdapter,
 }
 
 enum PrivateStoreBackend {
@@ -174,6 +186,13 @@ impl RollbackableStorePrototype {
             .map_err(|error| RollbackableStorePrototypeError::Driver(error.to_string()))?;
         let checkpoint_root_pair = CheckpointRootPairAdapter::prepare_with_consistency(
             &session,
+            keyspace.clone(),
+            consistency,
+        )
+        .await
+        .map_err(|error| RollbackableStorePrototypeError::Driver(error.to_string()))?;
+        let imt = ImtFamilyAdapter::prepare_with_consistency(
+            &session,
             keyspace,
             consistency,
         )
@@ -184,7 +203,109 @@ impl RollbackableStorePrototype {
             adapter,
             mutable_singleton,
             checkpoint_root_pair,
+            imt,
         }) })
+    }
+
+    pub async fn put_imt_leaf(
+        &self,
+        sealed: &SealedTimestampedPut,
+        binding: &ImtLeafPutBinding,
+    ) -> Result<ConfinedWriteReceipt, RollbackableStorePrototypeError> {
+        if &ImtLeafPutBinding::try_from_sealed(sealed)? != binding {
+            return Err(ImtPlanError::DerivedMutationMismatch.into());
+        }
+        let receipt = ConfinedWriteReceipt {
+            physical_table: ScyllaPhysicalTableId::ImtLeaf,
+            query_id: ConfinedWriteQueryId::Imt(ImtQueryKind::LeafPut),
+            bind_values: binding.bind_values(),
+            canonical_mutation: sealed.canonical_bytes().to_vec(),
+        };
+        match &self.backend {
+            PrivateStoreBackend::Recording(_) => self.record(receipt),
+            PrivateStoreBackend::Scylla(backend) => {
+                backend.imt.put_leaf(&backend.session, binding).await
+                    .map_err(|error| RollbackableStorePrototypeError::Driver(error.to_string()))?;
+                Ok(receipt)
+            }
+        }
+    }
+
+    pub async fn put_imt_index(
+        &self,
+        sealed: &SealedTimestampedPut,
+        binding: &ImtIndexPutBinding,
+    ) -> Result<ConfinedWriteReceipt, RollbackableStorePrototypeError> {
+        validate_imt_derived_sealed(sealed, binding.durable_supplement(), binding.write_timestamp_us())?;
+        let receipt = ConfinedWriteReceipt {
+            physical_table: ScyllaPhysicalTableId::ImtKeyIndex,
+            query_id: ConfinedWriteQueryId::Imt(ImtQueryKind::IndexPut),
+            bind_values: binding.bind_values(),
+            canonical_mutation: sealed.canonical_bytes().to_vec(),
+        };
+        match &self.backend {
+            PrivateStoreBackend::Recording(_) => self.record(receipt),
+            PrivateStoreBackend::Scylla(backend) => {
+                backend.imt.put_index(&backend.session, binding).await
+                    .map_err(|error| RollbackableStorePrototypeError::Driver(error.to_string()))?;
+                Ok(receipt)
+            }
+        }
+    }
+
+    pub async fn put_imt_cursor(
+        &self,
+        sealed: &SealedTimestampedPut,
+        binding: &ImtCursorPutBinding,
+    ) -> Result<ConfinedWriteReceipt, RollbackableStorePrototypeError> {
+        validate_imt_derived_sealed(sealed, binding.durable_supplement(), binding.write_timestamp_us())?;
+        let receipt = ConfinedWriteReceipt {
+            physical_table: ScyllaPhysicalTableId::ImtNextAppendIndex,
+            query_id: ConfinedWriteQueryId::Imt(ImtQueryKind::CursorPut),
+            bind_values: binding.bind_values(),
+            canonical_mutation: sealed.canonical_bytes().to_vec(),
+        };
+        match &self.backend {
+            PrivateStoreBackend::Recording(_) => self.record(receipt),
+            PrivateStoreBackend::Scylla(backend) => {
+                backend.imt.put_cursor(&backend.session, binding).await
+                    .map_err(|error| RollbackableStorePrototypeError::Driver(error.to_string()))?;
+                Ok(receipt)
+            }
+        }
+    }
+
+    pub async fn read_imt_leaf_exact(
+        &self,
+        binding: &ImtLeafPutBinding,
+    ) -> Result<Option<Vec<u8>>, RollbackableStorePrototypeError> {
+        match &self.backend {
+            PrivateStoreBackend::Recording(_) => Err(RollbackableStorePrototypeError::ExactReadRequiresScylla),
+            PrivateStoreBackend::Scylla(backend) => backend.imt.read_leaf_exact(&backend.session, binding).await
+                .map_err(|error| RollbackableStorePrototypeError::Driver(error.to_string())),
+        }
+    }
+
+    pub async fn read_imt_index_exact(
+        &self,
+        binding: &ImtIndexPutBinding,
+    ) -> Result<Option<Vec<u8>>, RollbackableStorePrototypeError> {
+        match &self.backend {
+            PrivateStoreBackend::Recording(_) => Err(RollbackableStorePrototypeError::ExactReadRequiresScylla),
+            PrivateStoreBackend::Scylla(backend) => backend.imt.read_index_exact(&backend.session, binding).await
+                .map_err(|error| RollbackableStorePrototypeError::Driver(error.to_string())),
+        }
+    }
+
+    pub async fn read_imt_cursor_exact(
+        &self,
+        binding: &ImtCursorPutBinding,
+    ) -> Result<Option<Vec<u8>>, RollbackableStorePrototypeError> {
+        match &self.backend {
+            PrivateStoreBackend::Recording(_) => Err(RollbackableStorePrototypeError::ExactReadRequiresScylla),
+            PrivateStoreBackend::Scylla(backend) => backend.imt.read_cursor_exact(&backend.session, binding).await
+                .map_err(|error| RollbackableStorePrototypeError::Driver(error.to_string())),
+        }
     }
 
     pub async fn put_checkpoint_leaf(
@@ -415,4 +536,19 @@ impl RollbackableStorePrototype {
             .extend(receipts.iter().cloned());
         Ok(receipts)
     }
+}
+
+fn validate_imt_derived_sealed(
+    sealed: &SealedTimestampedPut,
+    mutation: psy_node_core::store::typed::LogicalMutation,
+    write_timestamp_us: i64,
+) -> Result<(), RollbackableStorePrototypeError> {
+    let resolved = super::expand_logical_mutation(mutation).map_err(ImtPlanError::from)?;
+    if resolved.len() != 1
+        || &resolved[0] != sealed.resolved()
+        || sealed.timestamp().as_i64() != write_timestamp_us
+    {
+        return Err(ImtPlanError::DerivedMutationMismatch.into());
+    }
+    Ok(())
 }

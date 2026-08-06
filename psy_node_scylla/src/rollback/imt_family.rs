@@ -26,7 +26,7 @@ use scylla::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::utils::{convert_checkpoint_id_to_i64, u64_to_i64_exact};
+use crate::utils::{convert_checkpoint_id_to_i64, i64_to_u64_exact, u64_to_i64_exact};
 
 use super::{
     expand_logical_mutation, physical_descriptor, resolve_key_for_rollback,
@@ -47,6 +47,9 @@ pub enum ImtQueryKind {
     IndexPut = 4,
     IndexPointDelete = 5,
     CursorPut = 6,
+    LeafExactRead = 7,
+    IndexExactRead = 8,
+    CursorExactRead = 9,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -70,6 +73,9 @@ pub struct ImtQueries {
     index_put: ImtQuery,
     index_point_delete: ImtQuery,
     cursor_put: ImtQuery,
+    leaf_exact_read: ImtQuery,
+    index_exact_read: ImtQuery,
+    cursor_exact_read: ImtQuery,
 }
 
 impl ImtQueries {
@@ -120,6 +126,21 @@ impl ImtQueries {
                 format!("INSERT INTO {cursor} (tree_id, tree_sub_id, next_append_index) VALUES (?, ?, ?) USING TIMESTAMP ?"),
                 &["tree_id:BIGINT", "tree_sub_id:BIGINT", "next_append_index:BIGINT", "write_timestamp_us:BIGINT"],
             ),
+            leaf_exact_read: query(
+                ImtQueryKind::LeafExactRead,
+                format!("SELECT leaf_hash, leaf_key, leaf_value, next_key, next_index FROM {leaf} WHERE tree_id = ? AND tree_sub_id = ? AND leaf_index = ? AND checkpoint_id = ?"),
+                &["tree_id:BIGINT", "tree_sub_id:BIGINT", "leaf_index:BIGINT", "checkpoint_id:BIGINT"],
+            ),
+            index_exact_read: query(
+                ImtQueryKind::IndexExactRead,
+                format!("SELECT leaf_key, birth_checkpoint, leaf_index FROM {index} WHERE tree_id = ? AND tree_sub_id = ? AND key_bucket = ? AND encoded_key = ?"),
+                &["tree_id:BIGINT", "tree_sub_id:BIGINT", "key_bucket:SMALLINT", "encoded_key:BLOB"],
+            ),
+            cursor_exact_read: query(
+                ImtQueryKind::CursorExactRead,
+                format!("SELECT next_append_index FROM {cursor} WHERE tree_id = ? AND tree_sub_id = ?"),
+                &["tree_id:BIGINT", "tree_sub_id:BIGINT"],
+            ),
         }
     }
 
@@ -129,6 +150,9 @@ impl ImtQueries {
     pub const fn index_put(&self) -> &ImtQuery { &self.index_put }
     pub const fn index_point_delete(&self) -> &ImtQuery { &self.index_point_delete }
     pub const fn cursor_put(&self) -> &ImtQuery { &self.cursor_put }
+    pub const fn leaf_exact_read(&self) -> &ImtQuery { &self.leaf_exact_read }
+    pub const fn index_exact_read(&self) -> &ImtQuery { &self.index_exact_read }
+    pub const fn cursor_exact_read(&self) -> &ImtQuery { &self.cursor_exact_read }
 
     pub fn render_golden(&self) -> String {
         let mut output = String::new();
@@ -139,6 +163,9 @@ impl ImtQueries {
             self.index_put(),
             self.index_point_delete(),
             self.cursor_put(),
+            self.leaf_exact_read(),
+            self.index_exact_read(),
+            self.cursor_exact_read(),
         ] {
             output.push_str(&format!(
                 "{:?}\n{}\n{}\n",
@@ -192,6 +219,7 @@ pub struct ImtLeafPutBinding {
 }
 
 impl ImtLeafPutBinding {
+    pub const PHYSICAL_VALUE_BYTES: usize = 136;
     pub fn try_from_sealed(sealed: &SealedTimestampedPut) -> Result<Self, ImtPlanError> {
         let mutation = sealed.resolved().mutation();
         if mutation.physical_table() != ScyllaPhysicalTableId::ImtLeaf {
@@ -270,6 +298,25 @@ impl ImtLeafPutBinding {
             self.next_key.to_vec(), u64_to_i64_exact(self.next_index), self.write_timestamp_us,
         )
     }
+
+    fn exact_read_driver_values(&self) -> (i64, i64, i64, i64) {
+        (
+            u64_to_i64_exact(self.tree.get()),
+            u64_to_i64_exact(self.tree_sub.get()),
+            u64_to_i64_exact(self.leaf.get()),
+            convert_checkpoint_id_to_i64(self.checkpoint.get()),
+        )
+    }
+
+    pub fn expected_physical_value(&self) -> Vec<u8> {
+        encode_leaf_physical_value(
+            &self.leaf_hash,
+            &self.leaf_key,
+            &self.leaf_value,
+            &self.next_key,
+            self.next_index,
+        )
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -327,6 +374,21 @@ impl ImtIndexPutBinding {
             u64_to_i64_exact(self.leaf.get()), self.write_timestamp_us,
         )
     }
+
+    fn exact_read_driver_values(&self) -> (i64, i64, i16, Vec<u8>) {
+        (
+            u64_to_i64_exact(self.tree.get()),
+            u64_to_i64_exact(self.tree_sub.get()),
+            self.encoded_key.cql_bucket(),
+            self.encoded_key.as_bytes().to_vec(),
+        )
+    }
+
+    pub fn expected_physical_value(&self) -> Vec<u8> {
+        ImtKeyIndexRow::new(self.leaf_key, self.birth_checkpoint, self.leaf)
+            .encode_canonical()
+            .to_vec()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -361,6 +423,33 @@ impl ImtCursorPutBinding {
     fn driver_values(&self) -> (i64, i64, i64, i64) {
         cursor_driver_values(self.after, self.write_timestamp_us)
     }
+
+    fn exact_read_driver_values(&self) -> (i64, i64) {
+        (
+            u64_to_i64_exact(self.after.tree.get()),
+            u64_to_i64_exact(self.after.tree_sub.get()),
+        )
+    }
+
+    pub fn expected_physical_value(&self) -> Vec<u8> {
+        self.after.next_append_index.to_be_bytes().to_vec()
+    }
+}
+
+fn encode_leaf_physical_value(
+    leaf_hash: &[u8; 32],
+    leaf_key: &[u8; 32],
+    leaf_value: &[u8; 32],
+    next_key: &[u8; 32],
+    next_index: u64,
+) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(ImtLeafPutBinding::PHYSICAL_VALUE_BYTES);
+    encoded.extend_from_slice(leaf_hash);
+    encoded.extend_from_slice(leaf_key);
+    encoded.extend_from_slice(leaf_value);
+    encoded.extend_from_slice(next_key);
+    encoded.extend_from_slice(&next_index.to_be_bytes());
+    encoded
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -691,7 +780,7 @@ pub fn encode_raw_imt_key_for_sorting(raw: [u8; 32]) -> [u8; 32] {
     encoded
 }
 
-struct PreparedImtFamily { leaf_put: PreparedStatement, leaf_point_delete: PreparedStatement, leaf_range_delete: PreparedStatement, index_put: PreparedStatement, index_point_delete: PreparedStatement, cursor_put: PreparedStatement }
+struct PreparedImtFamily { leaf_put: PreparedStatement, leaf_point_delete: PreparedStatement, leaf_range_delete: PreparedStatement, index_put: PreparedStatement, index_point_delete: PreparedStatement, cursor_put: PreparedStatement, leaf_exact_read: PreparedStatement, index_exact_read: PreparedStatement, cursor_exact_read: PreparedStatement }
 
 #[allow(dead_code)]
 pub(crate) struct ImtFamilyAdapter { queries: ImtQueries, prepared: PreparedImtFamily }
@@ -707,6 +796,9 @@ impl ImtFamilyAdapter {
             index_put: prepare(session, queries.index_put().cql(), consistency).await?,
             index_point_delete: prepare(session, queries.index_point_delete().cql(), consistency).await?,
             cursor_put: prepare(session, queries.cursor_put().cql(), consistency).await?,
+            leaf_exact_read: prepare(session, queries.leaf_exact_read().cql(), consistency).await?,
+            index_exact_read: prepare(session, queries.index_exact_read().cql(), consistency).await?,
+            cursor_exact_read: prepare(session, queries.cursor_exact_read().cql(), consistency).await?,
         };
         Ok(Self { queries, prepared })
     }
@@ -718,6 +810,35 @@ impl ImtFamilyAdapter {
     pub(crate) async fn delete_leaf_range(&self, session: &Session, plan: &ImtLeafBoundedRangeDeletePlan) -> anyhow::Result<()> { session.execute_unpaged(&self.prepared.leaf_range_delete, plan.driver_values()).await?; Ok(()) }
     pub(crate) async fn delete_index(&self, session: &Session, plan: &ImtIndexPointDeletePlan) -> anyhow::Result<()> { session.execute_unpaged(&self.prepared.index_point_delete, plan.driver_values()).await?; Ok(()) }
     pub(crate) async fn restore_cursor(&self, session: &Session, plan: &ImtCursorRestorePlan) -> anyhow::Result<()> { session.execute_unpaged(&self.prepared.cursor_put, plan.driver_values()).await?; Ok(()) }
+    pub(crate) async fn read_leaf_exact(&self, session: &Session, binding: &ImtLeafPutBinding) -> anyhow::Result<Option<Vec<u8>>> {
+        let result = session.execute_unpaged(&self.prepared.leaf_exact_read, binding.exact_read_driver_values()).await?;
+        let Some((leaf_hash, leaf_key, leaf_value, next_key, next_index)) = result.into_rows_result()?.maybe_first_row::<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, i64)>()? else { return Ok(None); };
+        anyhow::ensure!(leaf_hash.len() == 32 && leaf_key.len() == 32 && leaf_value.len() == 32 && next_key.len() == 32, "stored IMT leaf hash field has invalid length");
+        Ok(Some(encode_leaf_physical_value(
+            leaf_hash.as_slice().try_into().expect("validated length"),
+            leaf_key.as_slice().try_into().expect("validated length"),
+            leaf_value.as_slice().try_into().expect("validated length"),
+            next_key.as_slice().try_into().expect("validated length"),
+            i64_to_u64_exact(next_index),
+        )))
+    }
+    pub(crate) async fn read_index_exact(&self, session: &Session, binding: &ImtIndexPutBinding) -> anyhow::Result<Option<Vec<u8>>> {
+        let result = session.execute_unpaged(&self.prepared.index_exact_read, binding.exact_read_driver_values()).await?;
+        let Some((leaf_key, birth_checkpoint, leaf_index)) = result.into_rows_result()?.maybe_first_row::<(Vec<u8>, i64, i64)>()? else { return Ok(None); };
+        anyhow::ensure!(leaf_key.len() == 32, "stored IMT index leaf_key has invalid length");
+        anyhow::ensure!(birth_checkpoint >= 0, "stored IMT index birth checkpoint is negative");
+        let birth_checkpoint = CheckpointId::try_new(birth_checkpoint as u64)
+            .map_err(|_| anyhow::anyhow!("stored IMT index birth checkpoint is outside typed range"))?;
+        Ok(Some(ImtKeyIndexRow::new(
+            leaf_key.as_slice().try_into().expect("validated length"),
+            birth_checkpoint,
+            LeafIndex::new(i64_to_u64_exact(leaf_index)),
+        ).encode_canonical().to_vec()))
+    }
+    pub(crate) async fn read_cursor_exact(&self, session: &Session, binding: &ImtCursorPutBinding) -> anyhow::Result<Option<Vec<u8>>> {
+        let result = session.execute_unpaged(&self.prepared.cursor_exact_read, binding.exact_read_driver_values()).await?;
+        Ok(result.into_rows_result()?.maybe_first_row::<(i64,)>()?.map(|(value,)| i64_to_u64_exact(value).to_be_bytes().to_vec()))
+    }
 }
 
 async fn prepare(session: &Session, cql: &str, consistency: Consistency) -> anyhow::Result<PreparedStatement> {

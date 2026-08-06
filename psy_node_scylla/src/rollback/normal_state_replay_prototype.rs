@@ -1,12 +1,14 @@
 //! Representative D-04b2 state replay and verification boundary.
 //!
-//! This prototype supports Realm `global_user_tree_table` PUTs plus the
-//! checkpoint-root bidirectional mapping and latest-checkpoint singleton
-//! carried by durable supplements. It proves that root-covered state and
-//! root-independent rows share one recovery boundary without pretending that
-//! all 35 physical tables have replay adapters: every exact physical row is
-//! read back, the committed state root is compared independently, and only
-//! then can an [`AuthorityPostWriteObservation`] be produced for SEALED.
+//! This prototype supports Realm `global_user_tree_table` and IMT leaf PUTs,
+//! plus the IMT key-index/cursor, checkpoint-root bidirectional mapping and
+//! latest-checkpoint singleton carried by durable supplements. It proves that
+//! root-covered state and root-independent rows share one recovery boundary
+//! without pretending that all 35 physical tables have replay adapters: every
+//! exact physical row is read back, the committed state root is compared
+//! independently, and only then can an [`AuthorityPostWriteObservation`] be
+//! produced for SEALED. The representative root is not yet a proof that binds
+//! these IMT rows into the upstream contract-state commitment.
 
 use std::{error::Error, fmt};
 
@@ -26,7 +28,8 @@ use psy_node_core::store::{
 use super::{
     seal_commit_put, seal_commit_put_batch, CanonicalPhysicalMutationBatch,
     CheckpointRootPairPutPlan, PreparedPayload, PreparedPayloadKind,
-    ReplayPrototypeError,
+    ImtCheckpointWritePlan, ImtCursorPutBinding, ImtIndexPutBinding,
+    ImtLeafPutBinding, ImtPlanError, ReplayPrototypeError,
     RollbackableStorePrototype, RollbackableStorePrototypeError,
     ScyllaPhysicalTableId, SealedTimestampedPut, SealedTimestampedPutBatch,
     TimestampedMutationError,
@@ -40,6 +43,17 @@ struct ExpectedStateRow {
     sealed: SealedTimestampedPut,
     value: Vec<u8>,
     is_root: bool,
+    write: ExpectedWrite,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ExpectedWrite {
+    GlobalUserMerkle,
+    ImtLeaf(ImtLeafPutBinding),
+    ImtIndex(ImtIndexPutBinding),
+    ImtCursor(ImtCursorPutBinding),
+    CheckpointRootDirection,
+    LatestCheckpoint,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -151,6 +165,8 @@ impl<Hash: Q256BitHash> RepresentativeRealmStateReplayPlan<Hash> {
         let mut root_count = 0_usize;
         let mut checkpoint_root_k1 = None;
         let mut checkpoint_root_k2 = None;
+        let mut imt_leaves = Vec::new();
+        let mut imt_derived = Vec::new();
 
         for resolved in batch.mutations() {
             let mutation = resolved.mutation();
@@ -188,7 +204,45 @@ impl<Hash: Q256BitHash> RepresentativeRealmStateReplayPlan<Hash> {
                         },
                         prepared.commit_write_timestamp(),
                     )?;
-                    rows.push(ExpectedStateRow { sealed, value, is_root });
+                    rows.push(ExpectedStateRow {
+                        sealed,
+                        value,
+                        is_root,
+                        write: ExpectedWrite::GlobalUserMerkle,
+                    });
+                }
+                ScyllaPhysicalTableId::ImtLeaf => {
+                    let checkpoint = match mutation.key() {
+                        TypedTableKey::ImtLeaf { checkpoint, .. } => *checkpoint,
+                        _ => return Err(RepresentativeStateReplayError::WrongTypedKey),
+                    };
+                    if checkpoint.get() != expected_checkpoint {
+                        return Err(RepresentativeStateReplayError::StateCheckpointMismatch {
+                            expected: expected_checkpoint,
+                            actual: checkpoint.get(),
+                        });
+                    }
+                    let value = match mutation.operation() {
+                        MutationOperation::Put(value @ MutationValue::Structured { .. }) => value.clone(),
+                        MutationOperation::Put(_) => return Err(RepresentativeStateReplayError::WrongValueEncoding),
+                        MutationOperation::Delete => return Err(RepresentativeStateReplayError::DeleteNotSupported),
+                    };
+                    imt_leaves.push(seal_commit_put(
+                        LogicalMutation::Put { key: mutation.key().clone(), value },
+                        prepared.commit_write_timestamp(),
+                    )?);
+                }
+                ScyllaPhysicalTableId::ImtKeyIndex
+                | ScyllaPhysicalTableId::ImtNextAppendIndex => {
+                    let value = match mutation.operation() {
+                        MutationOperation::Put(value @ MutationValue::Structured { .. }) => value.clone(),
+                        MutationOperation::Put(_) => return Err(RepresentativeStateReplayError::WrongValueEncoding),
+                        MutationOperation::Delete => return Err(RepresentativeStateReplayError::DeleteNotSupported),
+                    };
+                    imt_derived.push(seal_commit_put(
+                        LogicalMutation::Put { key: mutation.key().clone(), value },
+                        prepared.commit_write_timestamp(),
+                    )?);
                 }
                 ScyllaPhysicalTableId::U64Singleton => {
                     if !matches!(mutation.key(), TypedTableKey::U64Singleton(_)) {
@@ -212,7 +266,12 @@ impl<Hash: Q256BitHash> RepresentativeRealmStateReplayPlan<Hash> {
                         },
                         prepared.commit_write_timestamp(),
                     )?;
-                    rows.push(ExpectedStateRow { sealed, value: value.to_be_bytes().to_vec(), is_root: false });
+                    rows.push(ExpectedStateRow {
+                        sealed,
+                        value: value.to_be_bytes().to_vec(),
+                        is_root: false,
+                        write: ExpectedWrite::LatestCheckpoint,
+                    });
                 }
                 ScyllaPhysicalTableId::CheckpointRootToCheckpointIdK1 => {
                     if checkpoint_root_k1.replace(resolved.clone()).is_some() {
@@ -235,6 +294,69 @@ impl<Hash: Q256BitHash> RepresentativeRealmStateReplayPlan<Hash> {
             return Err(RepresentativeStateReplayError::ExpectedExactlyOneRoot {
                 actual: root_count,
             });
+        }
+
+        if !imt_leaves.is_empty() || !imt_derived.is_empty() {
+            let imt_plan = ImtCheckpointWritePlan::try_from_persisted_replay(
+                &imt_leaves,
+                &imt_derived,
+            )?;
+            for binding in imt_plan.leaf_puts() {
+                let sealed = imt_leaves
+                    .iter()
+                    .find(|sealed| {
+                        ImtLeafPutBinding::try_from_sealed(sealed).as_ref()
+                            == Ok(binding)
+                    })
+                    .cloned()
+                    .ok_or(RepresentativeStateReplayError::ImtPlanMismatch)?;
+                rows.push(ExpectedStateRow {
+                    sealed,
+                    value: binding.expected_physical_value(),
+                    is_root: false,
+                    write: ExpectedWrite::ImtLeaf(binding.clone()),
+                });
+            }
+            for binding in imt_plan.index_puts() {
+                let expected = super::expand_logical_mutation(
+                    binding.durable_supplement(),
+                )
+                .map_err(ImtPlanError::from)?;
+                let sealed = imt_derived
+                    .iter()
+                    .find(|sealed| {
+                        expected.len() == 1
+                            && &expected[0] == sealed.resolved()
+                    })
+                    .cloned()
+                    .ok_or(RepresentativeStateReplayError::ImtPlanMismatch)?;
+                rows.push(ExpectedStateRow {
+                    sealed,
+                    value: binding.expected_physical_value(),
+                    is_root: false,
+                    write: ExpectedWrite::ImtIndex(binding.clone()),
+                });
+            }
+            for binding in imt_plan.cursor_puts() {
+                let expected = super::expand_logical_mutation(
+                    binding.durable_supplement(),
+                )
+                .map_err(ImtPlanError::from)?;
+                let sealed = imt_derived
+                    .iter()
+                    .find(|sealed| {
+                        expected.len() == 1
+                            && &expected[0] == sealed.resolved()
+                    })
+                    .cloned()
+                    .ok_or(RepresentativeStateReplayError::ImtPlanMismatch)?;
+                rows.push(ExpectedStateRow {
+                    sealed,
+                    value: binding.expected_physical_value(),
+                    is_root: false,
+                    write: ExpectedWrite::ImtCursor(binding.clone()),
+                });
+            }
         }
 
         let (checkpoint_root_k1, checkpoint_root_k2) = checkpoint_root_k1
@@ -287,6 +409,7 @@ impl<Hash: Q256BitHash> RepresentativeRealmStateReplayPlan<Hash> {
                 sealed,
                 value,
                 is_root: false,
+                write: ExpectedWrite::CheckpointRootDirection,
             });
         }
 
@@ -297,10 +420,13 @@ impl<Hash: Q256BitHash> RepresentativeRealmStateReplayPlan<Hash> {
         rows.sort_by_key(|row| {
             match row.sealed.resolved().mutation().physical_table() {
                 ScyllaPhysicalTableId::GlobalUserTree => 0,
-                ScyllaPhysicalTableId::CheckpointRootToCheckpointIdK1 => 1,
-                ScyllaPhysicalTableId::CheckpointRootToCheckpointIdK2 => 2,
-                ScyllaPhysicalTableId::U64Singleton => 3,
-                _ => 4,
+                ScyllaPhysicalTableId::ImtLeaf => 1,
+                ScyllaPhysicalTableId::ImtKeyIndex => 2,
+                ScyllaPhysicalTableId::ImtNextAppendIndex => 3,
+                ScyllaPhysicalTableId::CheckpointRootToCheckpointIdK1 => 4,
+                ScyllaPhysicalTableId::CheckpointRootToCheckpointIdK2 => 5,
+                ScyllaPhysicalTableId::U64Singleton => 6,
+                _ => 7,
             }
         });
         let checkpoint_root_pair_start = rows
@@ -335,6 +461,13 @@ impl<Hash: Q256BitHash> RepresentativeRealmStateReplayPlan<Hash> {
 
     pub fn mutation_count(&self) -> usize {
         self.rows.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expected_physical_values(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &[u8]> {
+        self.rows.iter().map(|row| row.value.as_slice())
     }
 
     pub fn root_position(&self) -> usize {
@@ -444,22 +577,30 @@ impl<'a> RepresentativeRealmStateReplayExecutor<'a> {
                 index += 2;
                 continue;
             }
-            let sealed = &plan.rows[index].sealed;
-            match sealed.resolved().mutation().physical_table() {
-                ScyllaPhysicalTableId::GlobalUserTree => {
+            let row = &plan.rows[index];
+            let sealed = &row.sealed;
+            match &row.write {
+                ExpectedWrite::GlobalUserMerkle => {
                     self.store.put_global_user_merkle(sealed).await?;
                 }
-                ScyllaPhysicalTableId::U64Singleton => {
+                ExpectedWrite::ImtLeaf(binding) => {
+                    self.store.put_imt_leaf(sealed, binding).await?;
+                }
+                ExpectedWrite::ImtIndex(binding) => {
+                    self.store.put_imt_index(sealed, binding).await?;
+                }
+                ExpectedWrite::ImtCursor(binding) => {
+                    self.store.put_imt_cursor(sealed, binding).await?;
+                }
+                ExpectedWrite::LatestCheckpoint => {
                     self.store.put_latest_checkpoint(sealed).await?;
                 }
-                ScyllaPhysicalTableId::CheckpointRootToCheckpointIdK1
-                | ScyllaPhysicalTableId::CheckpointRootToCheckpointIdK2 => {
+                ExpectedWrite::CheckpointRootDirection => {
                     return Err(
                         RepresentativeStateReplayError::CheckpointRootPairMismatch
                             .into(),
                     )
                 }
-                other => return Err(RepresentativeStateReplayError::UnsupportedPhysicalTable(other).into()),
             }
             index += 1;
         }
@@ -484,22 +625,24 @@ impl<'a> RepresentativeRealmStateReplayExecutor<'a> {
                 index += 2;
                 continue;
             }
-            let sealed = &plan.rows[index].sealed;
-            let value = match sealed.resolved().mutation().physical_table() {
-                ScyllaPhysicalTableId::GlobalUserTree => self.store.read_global_user_merkle_exact(sealed).await?,
-                ScyllaPhysicalTableId::U64Singleton => self
+            let row = &plan.rows[index];
+            let sealed = &row.sealed;
+            let value = match &row.write {
+                ExpectedWrite::GlobalUserMerkle => self.store.read_global_user_merkle_exact(sealed).await?,
+                ExpectedWrite::ImtLeaf(binding) => self.store.read_imt_leaf_exact(binding).await?,
+                ExpectedWrite::ImtIndex(binding) => self.store.read_imt_index_exact(binding).await?,
+                ExpectedWrite::ImtCursor(binding) => self.store.read_imt_cursor_exact(binding).await?,
+                ExpectedWrite::LatestCheckpoint => self
                     .store
                     .read_latest_checkpoint_exact(sealed)
                     .await?
                     .map(|value| value.to_be_bytes().to_vec()),
-                ScyllaPhysicalTableId::CheckpointRootToCheckpointIdK1
-                | ScyllaPhysicalTableId::CheckpointRootToCheckpointIdK2 => {
+                ExpectedWrite::CheckpointRootDirection => {
                     return Err(
                         RepresentativeStateReplayError::CheckpointRootPairMismatch
                             .into(),
                     )
                 }
-                other => return Err(RepresentativeStateReplayError::UnsupportedPhysicalTable(other).into()),
             };
             observed.push(value);
             index += 1;
@@ -550,6 +693,7 @@ impl Error for RepresentativeStateExecutionError {}
 pub enum RepresentativeStateReplayError {
     Replay(ReplayPrototypeError),
     Timestamped(TimestampedMutationError),
+    Imt(ImtPlanError),
     RealmAuthorityRequired,
     ChangedStateRequired,
     CompactPreparedReplayRequired,
@@ -567,6 +711,7 @@ pub enum RepresentativeStateReplayError {
     ExpectedCheckpointRootPair,
     DuplicateCheckpointRootDirection,
     CheckpointRootPairMismatch,
+    ImtPlanMismatch,
     ObservationCountMismatch { expected: usize, actual: usize },
     PhysicalRowMissing { index: usize },
     PhysicalRowValueMismatch { index: usize },
@@ -582,6 +727,12 @@ impl From<ReplayPrototypeError> for RepresentativeStateReplayError {
 impl From<TimestampedMutationError> for RepresentativeStateReplayError {
     fn from(value: TimestampedMutationError) -> Self {
         Self::Timestamped(value)
+    }
+}
+
+impl From<ImtPlanError> for RepresentativeStateReplayError {
+    fn from(value: ImtPlanError) -> Self {
+        Self::Imt(value)
     }
 }
 
@@ -618,8 +769,9 @@ mod tests {
         timestamp::CommitWriteTimestampUs,
         typed::{
             CheckpointId as StorageCheckpointId, CheckpointRootKey,
-            LogicalMutation, MerkleNode, MutationValue, NodeIndex,
-            TypedTableKey, U64SingletonSlot,
+            ImtEncodedKey, LeafIndex, LogicalMutation, MerkleNode,
+            MutationValue, NodeIndex, StructuredValueSchema, TreeId,
+            TreeSubId, TypedTableKey, U64SingletonSlot,
         },
     };
 
@@ -629,7 +781,8 @@ mod tests {
         DurablePreparedPayloadReference, OperationalReplayAction,
         PreparedPayloadSource, PreparedReferencePlusSupplementRecord,
         PreparedSemanticMutation, ReplayAuthority, ReplayReceipt,
-        VerifiedPreparedManifestPackage,
+        VerifiedPreparedManifestPackage, encode_raw_imt_key_for_sorting,
+        imt_leaf_supplements,
     };
 
     fn hash(seed: u8) -> PHash {
@@ -651,6 +804,20 @@ mod tests {
         )
     }
 
+    fn imt_row(tree: u64, tree_sub: u64, leaf: u64, leaf_key: [u8; 32]) -> Vec<u8> {
+        let mut bytes = vec![0_u8; 161];
+        bytes[0..8].copy_from_slice(&tree.to_le_bytes());
+        bytes[8..16].copy_from_slice(&tree_sub.to_le_bytes());
+        bytes[16..24].copy_from_slice(&leaf.to_le_bytes());
+        bytes[24..56].copy_from_slice(&[0x31; 32]);
+        bytes[56..88].copy_from_slice(&leaf_key);
+        bytes[88..120].copy_from_slice(&[0x32; 32]);
+        bytes[120..152].copy_from_slice(&[0x33; 32]);
+        bytes[152..160].copy_from_slice(&(leaf + 1).to_le_bytes());
+        bytes[160] = 1;
+        bytes
+    }
+
     fn fixture() -> (
         VerifiedPreparedManifestPackage<PHash>,
         Vec<u8>,
@@ -659,6 +826,16 @@ mod tests {
         let checkpoint = StorageCheckpointId::try_new(41).unwrap();
         let root = MerkleNode::new(0, NodeIndex::new(0));
         let child = MerkleNode::new(1, NodeIndex::new(0));
+        let imt_tree = TreeId::new(9);
+        let imt_sub = TreeSubId::new(2);
+        let imt_leaf = LeafIndex::new(3);
+        let imt_leaf_key = [0x34; 32];
+        let imt_row = imt_row(
+            imt_tree.get(),
+            imt_sub.get(),
+            imt_leaf.get(),
+            imt_leaf_key,
+        );
         let semantic = vec![
             PreparedSemanticMutation::GlobalUserMerkle {
                 checkpoint,
@@ -669,6 +846,13 @@ mod tests {
                 checkpoint,
                 node: child,
                 value: vec![5; 32],
+            },
+            PreparedSemanticMutation::ImtLeaf {
+                tree: imt_tree,
+                tree_sub: imt_sub,
+                leaf: imt_leaf,
+                checkpoint,
+                canonical_row: imt_row.clone(),
             },
         ];
         let payload =
@@ -692,7 +876,7 @@ mod tests {
             root: CheckpointRootKey::new(vec![0x44; 32]),
             checkpoint,
         };
-        let logical = vec![
+        let mut logical = vec![
             LogicalMutation::Put {
                 key: TypedTableKey::GlobalUserMerkle {
                     checkpoint,
@@ -707,22 +891,48 @@ mod tests {
                 },
                 value: MutationValue::PsyCanonicalBytes(vec![5; 32]),
             },
-            checkpoint_root.clone(),
-            singleton.clone(),
+            LogicalMutation::Put {
+                key: TypedTableKey::ImtLeaf {
+                    tree: imt_tree,
+                    tree_sub: imt_sub,
+                    leaf: imt_leaf,
+                    checkpoint,
+                },
+                value: MutationValue::Structured {
+                    schema: StructuredValueSchema::ImtLeafRowV1,
+                    canonical_bytes: imt_row,
+                },
+            },
         ];
+        let imt_supplements = imt_leaf_supplements(
+            imt_tree,
+            imt_sub,
+            ImtEncodedKey::new(encode_raw_imt_key_for_sorting(imt_leaf_key)),
+            imt_leaf_key,
+            imt_leaf,
+            checkpoint,
+            3,
+            4,
+        )
+        .unwrap();
+        logical.extend(imt_supplements.clone());
+        logical.push(checkpoint_root.clone());
+        logical.push(singleton.clone());
         let full = CanonicalPhysicalMutationBatch::from_logical(logical).unwrap();
         let compact = PreparedReferencePlusSupplementRecord::try_v1(
             reference,
-            DerivedSupplementBatch::from_logical(vec![
-                checkpoint_root,
-                singleton,
-            ])
+            DerivedSupplementBatch::from_logical(
+                imt_supplements
+                    .into_iter()
+                    .chain([checkpoint_root, singleton])
+                    .collect(),
+            )
             .unwrap(),
             ReplayReceipt::new(
                 ReplayAuthority::Realm,
                 checkpoint,
-                2,
                 3,
+                5,
                 vec![OperationalReplayAction::RotatePendingCheckpointNamespace],
             ),
             &payload_bytes,
@@ -788,8 +998,8 @@ mod tests {
     #[test]
     fn compact_payload_becomes_exact_timestamped_replay_and_seal_evidence() {
         let plan = plan();
-        assert_eq!(plan.mutation_count(), 5);
-        assert_eq!(plan.checkpoint_root_pair.start, 2);
+        assert_eq!(plan.mutation_count(), 8);
+        assert_eq!(plan.checkpoint_root_pair.start, 5);
         assert_eq!(plan.checkpoint_root_pair.sealed.members().len(), 2);
         assert_eq!(
             plan.puts()
@@ -908,6 +1118,37 @@ mod tests {
                 index: singleton_index,
             })
         );
+    }
+
+    #[test]
+    fn every_imt_physical_row_is_required_after_plan_reconstruction() {
+        let plan = plan();
+        let complete = plan
+            .rows
+            .iter()
+            .map(|row| Some(row.value.clone()))
+            .collect::<Vec<_>>();
+        for physical in [
+            ScyllaPhysicalTableId::ImtLeaf,
+            ScyllaPhysicalTableId::ImtKeyIndex,
+            ScyllaPhysicalTableId::ImtNextAppendIndex,
+        ] {
+            let index = plan
+                .rows
+                .iter()
+                .position(|row| {
+                    row.sealed.resolved().mutation().physical_table() == physical
+                })
+                .unwrap();
+            let mut missing = complete.clone();
+            missing[index] = None;
+            assert_eq!(
+                plan.verify_observed_rows(&missing),
+                Err(RepresentativeStateReplayError::PhysicalRowMissing {
+                    index,
+                })
+            );
+        }
     }
 
     #[test]

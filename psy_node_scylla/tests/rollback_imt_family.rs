@@ -74,6 +74,14 @@ fn query_catalog_matches_all_three_real_schemas() {
         assert!(query.cql().contains("USING TIMESTAMP ?"));
         assert_eq!(query.cql().matches('?').count(), query.bind_shape().len());
     }
+    for query in [
+        queries.leaf_exact_read(),
+        queries.index_exact_read(),
+        queries.cursor_exact_read(),
+    ] {
+        assert!(!query.cql().is_empty());
+        assert_eq!(query.cql().matches('?').count(), query.bind_shape().len());
+    }
 }
 
 #[test]
@@ -101,9 +109,14 @@ fn one_plan_dedupes_checkpoint_final_leaf_and_derives_index_and_cursor() {
     assert_eq!(plan.leaf_puts().len(), 2);
     assert_eq!(plan.leaf_puts()[0].leaf(), LeafIndex::new(3));
     assert_eq!(plan.leaf_puts()[0].next_index(), 8);
+    assert_eq!(
+        plan.leaf_puts()[0].expected_physical_value().len(),
+        ImtLeafPutBinding::PHYSICAL_VALUE_BYTES
+    );
     assert_eq!(plan.index_puts().len(), 1);
     assert_eq!(plan.index_puts()[0].birth_checkpoint(), checkpoint(50));
     assert_eq!(plan.index_puts()[0].leaf(), LeafIndex::new(3));
+    assert_eq!(plan.index_puts()[0].expected_physical_value().len(), 48);
     assert!(matches!(
         plan.index_puts()[0].durable_supplement(),
         LogicalMutation::Put {
@@ -118,6 +131,7 @@ fn one_plan_dedupes_checkpoint_final_leaf_and_derives_index_and_cursor() {
     assert_eq!(plan.cursor_puts().len(), 1);
     assert_eq!(plan.cursor_puts()[0].before().next_append_index(), 4);
     assert_eq!(plan.cursor_puts()[0].after().next_append_index(), 8);
+    assert_eq!(plan.cursor_puts()[0].expected_physical_value(), 8_u64.to_be_bytes());
     let transition = plan.cursor_puts()[0].durable_transition();
     assert_eq!(transition.checkpoint(), checkpoint(50));
     assert_eq!((transition.before(), transition.after()), (4, 8));
@@ -132,6 +146,53 @@ fn one_plan_dedupes_checkpoint_final_leaf_and_derives_index_and_cursor() {
         }
     ));
     assert_ne!(plan.digest().as_bytes(), &[0; 32]);
+}
+
+#[tokio::test]
+async fn all_three_imt_writes_cross_only_the_confined_typed_boundary() {
+    let leaf = seal_leaf(
+        9,
+        2,
+        3,
+        50,
+        row(9, 2, 3, [1; 32], [0x31; 32], [2; 32], [3; 32], 8, true),
+        1_000,
+    );
+    let plan = ImtCheckpointWritePlan::try_from_sealed_leaves(
+        std::slice::from_ref(&leaf),
+        &[ImtCursorSnapshot::new(TreeId::new(9), TreeSubId::new(2), 4)],
+    )
+    .unwrap();
+    let derived = plan
+        .derived_supplements()
+        .into_iter()
+        .map(|mutation| seal_commit_put(mutation, timestamp(1_000)).unwrap())
+        .collect::<Vec<_>>();
+    let store = RollbackableStorePrototype::recording();
+
+    let leaf_receipt = store.put_imt_leaf(&leaf, &plan.leaf_puts()[0]).await.unwrap();
+    let index_receipt = store
+        .put_imt_index(&derived[0], &plan.index_puts()[0])
+        .await
+        .unwrap();
+    let cursor_receipt = store
+        .put_imt_cursor(&derived[1], &plan.cursor_puts()[0])
+        .await
+        .unwrap();
+
+    assert_eq!(leaf_receipt.physical_table(), ScyllaPhysicalTableId::ImtLeaf);
+    assert_eq!(leaf_receipt.query_id(), ConfinedWriteQueryId::Imt(ImtQueryKind::LeafPut));
+    assert_eq!(leaf_receipt.canonical_mutation(), leaf.canonical_bytes());
+    assert_eq!(index_receipt.physical_table(), ScyllaPhysicalTableId::ImtKeyIndex);
+    assert_eq!(index_receipt.query_id(), ConfinedWriteQueryId::Imt(ImtQueryKind::IndexPut));
+    assert_eq!(index_receipt.canonical_mutation(), derived[0].canonical_bytes());
+    assert_eq!(cursor_receipt.physical_table(), ScyllaPhysicalTableId::ImtNextAppendIndex);
+    assert_eq!(cursor_receipt.query_id(), ConfinedWriteQueryId::Imt(ImtQueryKind::CursorPut));
+    assert_eq!(cursor_receipt.canonical_mutation(), derived[1].canonical_bytes());
+    assert_eq!(
+        store.recorded_calls().unwrap(),
+        vec![leaf_receipt, index_receipt, cursor_receipt]
+    );
 }
 
 #[test]
