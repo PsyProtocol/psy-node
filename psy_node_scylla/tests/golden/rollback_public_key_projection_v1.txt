@@ -1,0 +1,6 @@
+Put
+INSERT INTO psy_d02t5.public_key_hash_to_user_ids_table (hash_id, value_u64) VALUES (?, ?) USING TIMESTAMP ?
+public_key_hash:BLOB,user_id:BIGINT,write_timestamp_us:BIGINT
+PointDelete
+DELETE FROM psy_d02t5.public_key_hash_to_user_ids_table USING TIMESTAMP ? WHERE hash_id = ? AND value_u64 = ?
+delete_fence_us:BIGINT,public_key_hash:BLOB,user_id:BIGINT
