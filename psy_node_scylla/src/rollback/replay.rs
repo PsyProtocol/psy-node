@@ -8,9 +8,9 @@ use std::{error::Error, fmt};
 
 use psy_node_core::store::typed::{
     CheckpointId, ImtCursorTransition, ImtCursorTransitionError,
-    ImtEncodedKey, LeafIndex, LogicalMutation, MerkleNode, MutationOperation,
-    MutationValue, NodeIndex, StructuredValueSchema, TreeId, TreeSubId,
-    TypedTableKey, U64SingletonSlot, UserId,
+    ImtEncodedKey, ImtKeyIndexRow, LeafIndex, LogicalMutation, MerkleNode,
+    MutationOperation, MutationValue, NodeIndex, StructuredValueSchema,
+    TreeId, TreeSubId, TypedTableKey, U64SingletonSlot, UserId,
 };
 use sha2::{Digest, Sha256};
 use strum::IntoEnumIterator;
@@ -1096,6 +1096,8 @@ pub fn imt_leaf_supplements(
     tree: TreeId,
     tree_sub: TreeSubId,
     encoded_key: ImtEncodedKey,
+    leaf_key: [u8; 32],
+    leaf_index: LeafIndex,
     birth_checkpoint: CheckpointId,
     cursor_before: u64,
     cursor_after: u64,
@@ -1108,10 +1110,11 @@ pub fn imt_leaf_supplements(
     Ok(vec![
         LogicalMutation::Put {
             key: TypedTableKey::ImtKeyIndex { tree, tree_sub, encoded_key },
-            value: MutationValue::Structured {
-                schema: StructuredValueSchema::ImtKeyIndexRowV1,
-                canonical_bytes: birth_checkpoint.get().to_be_bytes().to_vec(),
-            },
+            value: MutationValue::imt_key_index_row(ImtKeyIndexRow::new(
+                leaf_key,
+                birth_checkpoint,
+                leaf_index,
+            )),
         },
         LogicalMutation::Put {
             key: TypedTableKey::ImtCursor { tree, tree_sub },

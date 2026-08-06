@@ -15,9 +15,9 @@ use psy_node_core::store::{
     timestamp::{DeleteFenceTimestampUs, NewBranchWriteTimestampUs},
     typed::{
         CheckpointId, ImtCursorTransition, ImtCursorTransitionError,
-        ImtEncodedKey, LeafIndex, LogicalMutation, MutationOperation,
-        MutationValue, StructuredValueSchema, TreeId, TreeSubId,
-        TypedTableKey,
+        ImtEncodedKey, ImtKeyIndexRow, LeafIndex, LogicalMutation,
+        MutationOperation, MutationValue, StructuredValueSchema, TreeId,
+        TreeSubId, TypedTableKey,
     },
 };
 use scylla::{
@@ -29,8 +29,10 @@ use sha2::{Digest, Sha256};
 use crate::utils::{convert_checkpoint_id_to_i64, u64_to_i64_exact};
 
 use super::{
-    physical_descriptor, resolve_key_for_rollback, CqlKeyspaceName, PrototypeBindValue,
-    RegistryReadinessError, ScyllaPhysicalTableId, SealedTimestampedPut,
+    expand_logical_mutation, physical_descriptor, resolve_key_for_rollback,
+    CqlKeyspaceName, MutationBuildError, PrototypeBindValue,
+    RegistryReadinessError, ResolvedScyllaMutation, ScyllaPhysicalTableId,
+    SealedTimestampedPut,
 };
 
 const IMT_LEAF_ROW_V1_BYTES: usize = 161;
@@ -289,6 +291,21 @@ impl ImtIndexPutBinding {
     pub const fn leaf(&self) -> LeafIndex { self.leaf }
     pub const fn write_timestamp_us(&self) -> i64 { self.write_timestamp_us }
 
+    pub fn durable_supplement(&self) -> LogicalMutation {
+        LogicalMutation::Put {
+            key: TypedTableKey::ImtKeyIndex {
+                tree: self.tree,
+                tree_sub: self.tree_sub,
+                encoded_key: self.encoded_key.clone(),
+            },
+            value: MutationValue::imt_key_index_row(ImtKeyIndexRow::new(
+                self.leaf_key,
+                self.birth_checkpoint,
+                self.leaf,
+            )),
+        }
+    }
+
     pub fn bind_values(&self) -> Vec<PrototypeBindValue> {
         vec![
             PrototypeBindValue::BigInt(u64_to_i64_exact(self.tree.get())),
@@ -454,12 +471,105 @@ impl ImtCheckpointWritePlan {
         })
     }
 
+    /// Reconstructs the coordinated three-table plan from durable physical
+    /// mutations and proves that every persisted derived row is exactly the
+    /// row implied by the leaf batch and cursor before-images.
+    pub fn try_from_persisted_replay(
+        sealed_leaves: &[SealedTimestampedPut],
+        sealed_derived: &[SealedTimestampedPut],
+    ) -> Result<Self, ImtPlanError> {
+        let first_leaf = sealed_leaves.first().ok_or(ImtPlanError::EmptyLeafBatch)?;
+        let timestamp = first_leaf.timestamp().as_i64();
+        let mut cursor_before = Vec::new();
+
+        for sealed in sealed_derived {
+            if sealed.timestamp().as_i64() != timestamp {
+                return Err(ImtPlanError::MixedWriteTimestamps {
+                    expected: timestamp,
+                    actual: sealed.timestamp().as_i64(),
+                });
+            }
+            let mutation = sealed.resolved().mutation();
+            match mutation.physical_table() {
+                ScyllaPhysicalTableId::ImtKeyIndex => {}
+                ScyllaPhysicalTableId::ImtNextAppendIndex => {
+                    let (tree, tree_sub) = match mutation.key() {
+                        TypedTableKey::ImtCursor { tree, tree_sub } => (*tree, *tree_sub),
+                        _ => return Err(ImtPlanError::WrongTypedKey),
+                    };
+                    let transition = match mutation.operation() {
+                        MutationOperation::Put(MutationValue::Structured {
+                            schema: StructuredValueSchema::ImtCursorTransitionV1,
+                            canonical_bytes,
+                        }) => ImtCursorTransition::decode_canonical(canonical_bytes)
+                            .map_err(ImtPlanError::CursorTransition)?,
+                        _ => return Err(ImtPlanError::ExpectedCursorTransitionV1),
+                    };
+                    let snapshot = ImtCursorSnapshot::new(tree, tree_sub, transition.before());
+                    if cursor_before.iter().any(|existing| existing == &snapshot) {
+                        return Err(ImtPlanError::DuplicateCursorBeforeImage);
+                    }
+                    cursor_before.push(snapshot);
+                }
+                actual => return Err(ImtPlanError::UnexpectedDerivedTable(actual)),
+            }
+        }
+
+        let plan = Self::try_from_sealed_leaves(sealed_leaves, &cursor_before)?;
+        let mut actual = sealed_derived
+            .iter()
+            .map(|sealed| sealed.resolved().clone())
+            .collect::<Vec<_>>();
+        let mut expected = plan.derived_resolved_mutations()?;
+        sort_unique_resolved(&mut actual)?;
+        sort_unique_resolved(&mut expected)?;
+        if actual != expected {
+            return Err(ImtPlanError::DerivedMutationMismatch);
+        }
+        Ok(plan)
+    }
+
     pub const fn checkpoint(&self) -> CheckpointId { self.checkpoint }
     pub const fn write_timestamp_us(&self) -> i64 { self.write_timestamp_us }
     pub fn leaf_puts(&self) -> &[ImtLeafPutBinding] { &self.leaf_puts }
     pub fn index_puts(&self) -> &[ImtIndexPutBinding] { &self.index_puts }
     pub fn cursor_puts(&self) -> &[ImtCursorPutBinding] { &self.cursor_puts }
     pub const fn digest(&self) -> ImtCheckpointWriteDigest { self.digest }
+
+    pub fn derived_supplements(&self) -> Vec<LogicalMutation> {
+        self.index_puts
+            .iter()
+            .map(ImtIndexPutBinding::durable_supplement)
+            .chain(
+                self.cursor_puts
+                    .iter()
+                    .map(ImtCursorPutBinding::durable_supplement),
+            )
+            .collect()
+    }
+
+    pub fn derived_resolved_mutations(
+        &self,
+    ) -> Result<Vec<ResolvedScyllaMutation>, ImtPlanError> {
+        let mut resolved = Vec::with_capacity(self.index_puts.len() + self.cursor_puts.len());
+        for mutation in self.derived_supplements() {
+            resolved.extend(expand_logical_mutation(mutation)?);
+        }
+        Ok(resolved)
+    }
+}
+
+fn sort_unique_resolved(
+    mutations: &mut [ResolvedScyllaMutation],
+) -> Result<(), ImtPlanError> {
+    mutations.sort_by(|left, right| left.locator_bytes().cmp(right.locator_bytes()));
+    if mutations
+        .windows(2)
+        .any(|pair| pair[0].locator_bytes() == pair[1].locator_bytes())
+    {
+        return Err(ImtPlanError::DuplicateDerivedMutation);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -619,11 +729,14 @@ async fn prepare(session: &Session, cql: &str, consistency: Consistency) -> anyh
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ImtPlanError {
-    Registry(RegistryReadinessError), WrongPhysicalTable(ScyllaPhysicalTableId), WrongTypedKey,
+    Registry(RegistryReadinessError), MutationBuild(MutationBuildError),
+    WrongPhysicalTable(ScyllaPhysicalTableId), WrongTypedKey,
     ExpectedLeafRowV1, InvalidLeafRowLength { actual: usize }, LeafKeyRowMismatch,
+    ExpectedCursorTransitionV1, UnexpectedDerivedTable(ScyllaPhysicalTableId),
     EmptyLeafBatch, MixedCheckpoints { expected: CheckpointId, actual: CheckpointId },
     MixedWriteTimestamps { expected: i64, actual: i64 }, DuplicateCursorBeforeImage,
-    CursorBeforeImageCoverage, LeafIndexOverflow, ConflictingIndexBirth,
+    DuplicateDerivedMutation, DerivedMutationMismatch, CursorBeforeImageCoverage,
+    LeafIndexOverflow, ConflictingIndexBirth,
     CursorTransition(ImtCursorTransitionError),
     VersionNotAfterTarget { version: CheckpointId, target: CheckpointId },
     FenceNotAfterWrite { fence: i64, write: i64 },
@@ -635,3 +748,4 @@ impl fmt::Display for ImtPlanError {
 }
 impl Error for ImtPlanError {}
 impl From<RegistryReadinessError> for ImtPlanError { fn from(value: RegistryReadinessError) -> Self { Self::Registry(value) } }
+impl From<MutationBuildError> for ImtPlanError { fn from(value: MutationBuildError) -> Self { Self::MutationBuild(value) } }

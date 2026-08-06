@@ -154,7 +154,16 @@ fn realm_spec() -> FixtureSpec {
         PreparedSemanticMutation::CheckpointStateRoots { checkpoint: cp, value: vec![0x26; 128] },
     ];
     let mut supplements =
-        imt_leaf_supplements(tree, tree_sub, encoded_key.clone(), cp, 3, 4)
+        imt_leaf_supplements(
+            tree,
+            tree_sub,
+            encoded_key.clone(),
+            [0x38; 32],
+            LeafIndex::new(3),
+            cp,
+            3,
+            4,
+        )
             .unwrap();
     supplements.extend([
         put(
@@ -182,7 +191,19 @@ fn realm_spec() -> FixtureSpec {
         put(TypedTableKey::L2BlockState(cp), vec![0x25; 80]),
         put(TypedTableKey::CheckpointStateRoots(cp), vec![0x26; 128]),
     ];
-    full.extend(imt_leaf_supplements(tree, tree_sub, encoded_key, cp, 3, 4).unwrap());
+    full.extend(
+        imt_leaf_supplements(
+            tree,
+            tree_sub,
+            encoded_key,
+            [0x38; 32],
+            LeafIndex::new(3),
+            cp,
+            3,
+            4,
+        )
+        .unwrap(),
+    );
     full.extend([
         put(
             TypedTableKey::GlobalCheckpointMerkle { node: MerkleNode::new(5, NodeIndex::new(1)), checkpoint: cp },

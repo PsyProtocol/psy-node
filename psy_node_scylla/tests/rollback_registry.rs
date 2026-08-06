@@ -3,7 +3,7 @@ use std::collections::{BTreeSet, HashSet};
 use psy_node_core::store::typed::{
     CheckpointId, CheckpointLeafKey, CheckpointRootKey, CheckpointedObjectKey,
     ContractId, ImtCursorTransition, ImtCursorTransitionError, ImtEncodedKey,
-    LeafIndex, LatestInfoSlot,
+    ImtKeyIndexRow, ImtKeyIndexRowError, LeafIndex, LatestInfoSlot,
     LogicalMutation, MerkleNode, MutationOperation, MutationValue,
     MutationValueKind, NodeIndex, ProcCheckpointUniqueId, PsyLogicalTableId,
     PublicKeyHash, RealmId, StructuredValueSchema, TreeId, TreeSubId,
@@ -491,7 +491,11 @@ fn mutation_value_kind_is_checked_per_key_domain() {
                 tree_sub: TreeSubId::new(2),
                 encoded_key: ImtEncodedKey::new(imt_key),
             },
-            MutationValue::Structured { schema: StructuredValueSchema::ImtKeyIndexRowV1, canonical_bytes: vec![5, 6] },
+            MutationValue::imt_key_index_row(ImtKeyIndexRow::new(
+                [5; 32],
+                checkpoint(4),
+                LeafIndex::new(3),
+            )),
         ),
         (
             TypedTableKey::ImtCursor {
@@ -534,6 +538,27 @@ fn malformed_imt_cursor_transition_is_rejected_by_mutation_construction() {
         }),
         Err(MutationBuildError::InvalidImtCursorTransition(
             ImtCursorTransitionError::InvalidCanonicalLength { actual: 23 }
+        ))
+    );
+}
+
+#[test]
+fn incomplete_imt_key_index_value_is_rejected_by_mutation_construction() {
+    let key = TypedTableKey::ImtKeyIndex {
+        tree: TreeId::new(1),
+        tree_sub: TreeSubId::new(2),
+        encoded_key: ImtEncodedKey::new([3; 32]),
+    };
+    assert_eq!(
+        expand_logical_mutation(LogicalMutation::Put {
+            key,
+            value: MutationValue::Structured {
+                schema: StructuredValueSchema::ImtKeyIndexRowV2,
+                canonical_bytes: vec![0; 47],
+            },
+        }),
+        Err(MutationBuildError::InvalidImtKeyIndexRow(
+            ImtKeyIndexRowError::InvalidCanonicalLength { actual: 47 }
         ))
     );
 }

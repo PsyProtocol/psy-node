@@ -2,8 +2,9 @@ use std::{error::Error, fmt};
 
 use psy_node_core::store::typed::{
     ImtCursorTransition, ImtCursorTransitionError, LogicalMutation,
-    MutationOperation, MutationValue, MutationValueKind, PsyLogicalTableId,
-    StructuredValueSchema, TypedTableKey, ValueDigestAlgorithm,
+    ImtKeyIndexRow, ImtKeyIndexRowError, MutationOperation, MutationValue,
+    MutationValueKind, PsyLogicalTableId, StructuredValueSchema, TypedTableKey,
+    ValueDigestAlgorithm,
 };
 
 use super::{
@@ -131,6 +132,7 @@ impl ResolvedScyllaMutation {
                     StructuredValueSchema::ImtLeafRowV1 => 2,
                     StructuredValueSchema::ImtKeyIndexRowV1 => 3,
                     StructuredValueSchema::ImtCursorTransitionV1 => 4,
+                    StructuredValueSchema::ImtKeyIndexRowV2 => 5,
                 });
                 encoded.extend_from_slice(&(canonical_bytes.len() as u32).to_be_bytes());
                 encoded.extend_from_slice(canonical_bytes);
@@ -173,6 +175,7 @@ impl ResolvedScyllaMutation {
                     2 => StructuredValueSchema::ImtLeafRowV1,
                     3 => StructuredValueSchema::ImtKeyIndexRowV1,
                     4 => StructuredValueSchema::ImtCursorTransitionV1,
+                    5 => StructuredValueSchema::ImtKeyIndexRowV2,
                     _ => return Err(MutationDecodeError::InvalidEncoding("unknown structured value schema")),
                 };
                 MutationOperation::Put(MutationValue::Structured { schema, canonical_bytes: cursor.bytes()?.to_vec() })
@@ -287,6 +290,7 @@ pub enum MutationBuildError {
     DeleteNotEnabled,
     ValueEncodingMismatch { domain: ScyllaKeyDomain, actual: MutationValueKind },
     InvalidImtCursorTransition(ImtCursorTransitionError),
+    InvalidImtKeyIndexRow(ImtKeyIndexRowError),
 }
 
 impl fmt::Display for MutationBuildError {
@@ -299,6 +303,7 @@ impl fmt::Display for MutationBuildError {
                 write!(f, "value encoding {actual:?} is not allowed for key domain {domain:?}")
             }
             Self::InvalidImtCursorTransition(error) => error.fmt(f),
+            Self::InvalidImtKeyIndexRow(error) => error.fmt(f),
         }
     }
 }
@@ -351,6 +356,14 @@ fn validate_put_value(resolved: &ResolvedScyllaKey, value: &MutationValue) -> Re
     {
         ImtCursorTransition::decode_canonical(canonical_bytes)
             .map_err(MutationBuildError::InvalidImtCursorTransition)?;
+    }
+    if let MutationValue::Structured {
+        schema: StructuredValueSchema::ImtKeyIndexRowV2,
+        canonical_bytes,
+    } = value
+    {
+        ImtKeyIndexRow::decode_canonical(canonical_bytes)
+            .map_err(MutationBuildError::InvalidImtKeyIndexRow)?;
     }
     Ok(())
 }

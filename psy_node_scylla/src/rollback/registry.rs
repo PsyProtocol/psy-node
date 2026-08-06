@@ -621,7 +621,7 @@ const IMT_LEAF_VALUES: &[MutationValueKind] = &[
     MutationValueKind::Digest,
 ];
 const IMT_INDEX_VALUES: &[MutationValueKind] = &[
-    MutationValueKind::Structured(StructuredValueSchema::ImtKeyIndexRowV1),
+    MutationValueKind::Structured(StructuredValueSchema::ImtKeyIndexRowV2),
     MutationValueKind::Digest,
 ];
 const IMT_CURSOR_VALUES: &[MutationValueKind] = &[

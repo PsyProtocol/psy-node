@@ -3,8 +3,8 @@ use psy_data::v1::qdata::contract::encode_imt_key_for_sorting;
 use psy_node_core::store::{
     timestamp::{CommitWriteTimestampUs, DeleteFenceTimestampUs, NewBranchWriteTimestampUs},
     typed::{
-        CheckpointId, LeafIndex, LogicalMutation, MutationValue, StructuredValueSchema, TreeId,
-        TreeSubId, TypedTableKey,
+        CheckpointId, ImtKeyIndexRow, LeafIndex, LogicalMutation, MutationValue,
+        StructuredValueSchema, TreeId, TreeSubId, TypedTableKey,
     },
 };
 use psy_node_scylla::rollback::*;
@@ -104,6 +104,17 @@ fn one_plan_dedupes_checkpoint_final_leaf_and_derives_index_and_cursor() {
     assert_eq!(plan.index_puts().len(), 1);
     assert_eq!(plan.index_puts()[0].birth_checkpoint(), checkpoint(50));
     assert_eq!(plan.index_puts()[0].leaf(), LeafIndex::new(3));
+    assert!(matches!(
+        plan.index_puts()[0].durable_supplement(),
+        LogicalMutation::Put {
+            key: TypedTableKey::ImtKeyIndex { .. },
+            value: MutationValue::Structured {
+                schema: StructuredValueSchema::ImtKeyIndexRowV2,
+                canonical_bytes,
+            },
+        } if ImtKeyIndexRow::decode_canonical(&canonical_bytes)
+            == Ok(ImtKeyIndexRow::new(key, checkpoint(50), LeafIndex::new(3)))
+    ));
     assert_eq!(plan.cursor_puts().len(), 1);
     assert_eq!(plan.cursor_puts()[0].before().next_append_index(), 4);
     assert_eq!(plan.cursor_puts()[0].after().next_append_index(), 8);
@@ -121,6 +132,124 @@ fn one_plan_dedupes_checkpoint_final_leaf_and_derives_index_and_cursor() {
         }
     ));
     assert_ne!(plan.digest().as_bytes(), &[0; 32]);
+}
+
+#[test]
+fn persisted_leaf_index_and_cursor_reconstruct_the_exact_same_plan() {
+    let leaf = seal_leaf(
+        9,
+        2,
+        3,
+        50,
+        row(
+            9,
+            2,
+            3,
+            [1; 32],
+            [0x31; 32],
+            [2; 32],
+            [3; 32],
+            8,
+            true,
+        ),
+        1_000,
+    );
+    let original = ImtCheckpointWritePlan::try_from_sealed_leaves(
+        std::slice::from_ref(&leaf),
+        &[ImtCursorSnapshot::new(TreeId::new(9), TreeSubId::new(2), 4)],
+    )
+    .unwrap();
+    let persisted = original
+        .derived_supplements()
+        .into_iter()
+        .map(|mutation| seal_commit_put(mutation, timestamp(1_000)).unwrap())
+        .collect::<Vec<_>>();
+
+    let recovered = ImtCheckpointWritePlan::try_from_persisted_replay(
+        std::slice::from_ref(&leaf),
+        &persisted,
+    )
+    .unwrap();
+    assert_eq!(recovered, original);
+    assert_eq!(recovered.derived_resolved_mutations().unwrap().len(), 2);
+}
+
+#[test]
+fn incomplete_or_conflicting_persisted_derived_rows_fail_closed() {
+    let leaf = seal_leaf(
+        9,
+        2,
+        3,
+        50,
+        row(
+            9,
+            2,
+            3,
+            [1; 32],
+            [0x31; 32],
+            [2; 32],
+            [3; 32],
+            8,
+            true,
+        ),
+        1_000,
+    );
+    let plan = ImtCheckpointWritePlan::try_from_sealed_leaves(
+        std::slice::from_ref(&leaf),
+        &[ImtCursorSnapshot::new(TreeId::new(9), TreeSubId::new(2), 4)],
+    )
+    .unwrap();
+    let persisted = plan
+        .derived_supplements()
+        .into_iter()
+        .map(|mutation| seal_commit_put(mutation, timestamp(1_000)).unwrap())
+        .collect::<Vec<_>>();
+
+    assert!(matches!(
+        ImtCheckpointWritePlan::try_from_persisted_replay(
+            std::slice::from_ref(&leaf),
+            &persisted[1..],
+        ),
+        Err(ImtPlanError::DerivedMutationMismatch)
+    ));
+
+    let wrong_index = match plan.index_puts()[0].durable_supplement() {
+        LogicalMutation::Put { key, .. } => LogicalMutation::Put {
+            key,
+            value: MutationValue::imt_key_index_row(ImtKeyIndexRow::new(
+                [0x31; 32],
+                checkpoint(50),
+                LeafIndex::new(4),
+            )),
+        },
+        _ => unreachable!("index supplement is always a put"),
+    };
+    let mut conflicting = persisted.clone();
+    conflicting[0] = seal_commit_put(wrong_index, timestamp(1_000)).unwrap();
+    assert!(matches!(
+        ImtCheckpointWritePlan::try_from_persisted_replay(
+            std::slice::from_ref(&leaf),
+            &conflicting,
+        ),
+        Err(ImtPlanError::DerivedMutationMismatch)
+    ));
+
+    let legacy_v1 = match plan.index_puts()[0].durable_supplement() {
+        LogicalMutation::Put { key, .. } => LogicalMutation::Put {
+            key,
+            value: MutationValue::Structured {
+                schema: StructuredValueSchema::ImtKeyIndexRowV1,
+                canonical_bytes: checkpoint(50).get().to_be_bytes().to_vec(),
+            },
+        },
+        _ => unreachable!("index supplement is always a put"),
+    };
+    assert!(matches!(
+        seal_commit_put(legacy_v1, timestamp(1_000)),
+        Err(TimestampedMutationError::MutationBuild(
+            MutationBuildError::ValueEncodingMismatch { .. }
+        ))
+    ));
 }
 
 #[test]

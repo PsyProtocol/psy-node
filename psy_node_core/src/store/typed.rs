@@ -475,6 +475,85 @@ impl fmt::Display for ImtCursorTransitionError {
 
 impl Error for ImtCursorTransitionError {}
 
+/// Canonical durable value for one `imt_key_index_table` row.
+///
+/// The physical primary key already carries tree/subtree/bucket/encoded-key.
+/// Replay additionally needs every non-key CQL column; recording only the
+/// birth checkpoint cannot reconstruct the row.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ImtKeyIndexRow {
+    leaf_key: [u8; 32],
+    birth_checkpoint: CheckpointId,
+    leaf_index: LeafIndex,
+}
+
+impl ImtKeyIndexRow {
+    pub const CANONICAL_BYTES: usize = 48;
+
+    pub const fn new(
+        leaf_key: [u8; 32],
+        birth_checkpoint: CheckpointId,
+        leaf_index: LeafIndex,
+    ) -> Self {
+        Self {
+            leaf_key,
+            birth_checkpoint,
+            leaf_index,
+        }
+    }
+
+    pub const fn leaf_key(self) -> [u8; 32] {
+        self.leaf_key
+    }
+
+    pub const fn birth_checkpoint(self) -> CheckpointId {
+        self.birth_checkpoint
+    }
+
+    pub const fn leaf_index(self) -> LeafIndex {
+        self.leaf_index
+    }
+
+    pub fn encode_canonical(self) -> [u8; Self::CANONICAL_BYTES] {
+        let mut bytes = [0_u8; Self::CANONICAL_BYTES];
+        bytes[..32].copy_from_slice(&self.leaf_key);
+        bytes[32..40].copy_from_slice(&self.birth_checkpoint.get().to_be_bytes());
+        bytes[40..48].copy_from_slice(&self.leaf_index.get().to_be_bytes());
+        bytes
+    }
+
+    pub fn decode_canonical(bytes: &[u8]) -> Result<Self, ImtKeyIndexRowError> {
+        if bytes.len() != Self::CANONICAL_BYTES {
+            return Err(ImtKeyIndexRowError::InvalidCanonicalLength {
+                actual: bytes.len(),
+            });
+        }
+        let leaf_key = bytes[..32].try_into().expect("fixed length");
+        let birth_checkpoint = CheckpointId::try_new(u64::from_be_bytes(
+            bytes[32..40].try_into().expect("fixed length"),
+        ))
+        .map_err(|error| ImtKeyIndexRowError::CheckpointOutOfRange(error.0))?;
+        let leaf_index = LeafIndex::new(u64::from_be_bytes(
+            bytes[40..48].try_into().expect("fixed length"),
+        ));
+        Ok(Self::new(leaf_key, birth_checkpoint, leaf_index))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ImtKeyIndexRowError {
+    InvalidCanonicalLength { actual: usize },
+    CheckpointOutOfRange(u64),
+}
+
+impl fmt::Display for ImtKeyIndexRowError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid durable IMT key-index row: {self:?}")
+    }
+}
+
+impl Error for ImtKeyIndexRowError {}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum ValueDigestAlgorithm {
@@ -490,6 +569,9 @@ pub enum StructuredValueSchema {
     ImtLeafRowV1 = 2,
     ImtKeyIndexRowV1 = 3,
     ImtCursorTransitionV1 = 4,
+    /// Complete key-index value (`leaf_key`, birth checkpoint, leaf index).
+    /// V1 recorded only birth checkpoint and is deliberately not executable.
+    ImtKeyIndexRowV2 = 5,
 }
 
 /// The stable wire contract between a key domain and its mutation value.
@@ -541,6 +623,13 @@ impl MutationValue {
         Self::Structured {
             schema: StructuredValueSchema::ImtCursorTransitionV1,
             canonical_bytes: transition.encode_canonical().to_vec(),
+        }
+    }
+
+    pub fn imt_key_index_row(row: ImtKeyIndexRow) -> Self {
+        Self::Structured {
+            schema: StructuredValueSchema::ImtKeyIndexRowV2,
+            canonical_bytes: row.encode_canonical().to_vec(),
         }
     }
 }
@@ -639,6 +728,25 @@ mod tests {
             Err(ImtCursorTransitionError::InvalidCanonicalLength {
                 actual: 23,
             })
+        );
+    }
+
+    #[test]
+    fn imt_key_index_row_v2_is_complete_and_canonical() {
+        let row = ImtKeyIndexRow::new(
+            [0x5a; 32],
+            CheckpointId::try_new(42).unwrap(),
+            LeafIndex::new(u64::MAX),
+        );
+        let bytes = row.encode_canonical();
+        assert_eq!(bytes.len(), ImtKeyIndexRow::CANONICAL_BYTES);
+        assert_eq!(&bytes[..32], &[0x5a; 32]);
+        assert_eq!(&bytes[32..40], &42_u64.to_be_bytes());
+        assert_eq!(&bytes[40..48], &u64::MAX.to_be_bytes());
+        assert_eq!(ImtKeyIndexRow::decode_canonical(&bytes), Ok(row));
+        assert_eq!(
+            ImtKeyIndexRow::decode_canonical(&bytes[..47]),
+            Err(ImtKeyIndexRowError::InvalidCanonicalLength { actual: 47 })
         );
     }
 }
