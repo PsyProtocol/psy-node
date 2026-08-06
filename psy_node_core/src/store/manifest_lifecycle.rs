@@ -18,13 +18,39 @@ use sha2::{Digest, Sha256};
 use super::{
     authority_commit::AuthorityTimestampKey,
     manifest_record::{
-        AuthorityManifestDigest, AuthorityManifestStatus, ManifestRevision,
+        AuthorityManifestDigest, AuthorityManifestIdentity,
+        AuthorityManifestStatus, ManifestRecordError, ManifestRevision,
         PreparedAuthorityManifestRecord,
     },
 };
 
 const AUTHORITY_HEAD_PAYLOAD_DIGEST_DOMAIN: &[u8] =
     b"psy.rollback.authority-head-payload.v1\0";
+const SEALED_MANIFEST_DIGEST_DOMAIN: &[u8] =
+    b"psy.rollback.sealed-authority-manifest.v1\0";
+const COMMITTED_MANIFEST_DIGEST_DOMAIN: &[u8] =
+    b"psy.rollback.committed-authority-manifest.v1\0";
+
+pub const SEALED_AUTHORITY_MANIFEST_MAGIC: [u8; 8] = *b"PSYMSEAL";
+pub const COMMITTED_AUTHORITY_MANIFEST_MAGIC: [u8; 8] = *b"PSYMCOMT";
+pub const AUTHORITY_MANIFEST_LIFECYCLE_CODEC_VERSION: u16 = 1;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct AuthorityLifecycleDigest([u8; 32]);
+
+impl AuthorityLifecycleDigest {
+    fn calculate(domain: &[u8], payload: &[u8]) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(domain);
+        hasher.update((payload.len() as u64).to_be_bytes());
+        hasher.update(payload);
+        Self(hasher.finalize().into())
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
 
 /// Digest of the canonical singleton/cursor payload written with an authority
 /// commit. Root verification cannot cover these cells, so SEALED must compare
@@ -43,6 +69,10 @@ impl AuthorityHeadPayloadDigest {
 
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+
+    fn from_persisted(bytes: [u8; 32]) -> Self {
+        Self(bytes)
     }
 }
 
@@ -187,6 +217,13 @@ pub struct AuthorityPostWriteObservation<Hash> {
     proof: AuthorityProofObservation<Hash>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct VerifiedSealEvidence<Hash> {
+    mutation_digest: [u8; 32],
+    head_payload_digest: AuthorityHeadPayloadDigest,
+    proof: AuthorityProofObservation<Hash>,
+}
+
 impl<Hash> AuthorityPostWriteObservation<Hash> {
     pub const fn new(
         head: AuthorityHeadView<Hash>,
@@ -210,6 +247,9 @@ impl<Hash> AuthorityPostWriteObservation<Hash> {
 pub struct SealedAuthorityManifest<Hash> {
     prepared: PreparedAuthorityManifestRecord<Hash>,
     verified_head: AuthorityHeadView<Hash>,
+    evidence: VerifiedSealEvidence<Hash>,
+    canonical_payload: Vec<u8>,
+    lifecycle_digest: AuthorityLifecycleDigest,
 }
 
 impl<Hash: Q256BitHash> SealedAuthorityManifest<Hash> {
@@ -253,10 +293,64 @@ impl<Hash: Q256BitHash> SealedAuthorityManifest<Hash> {
                 return Err(ManifestLifecycleError::RealmProofMustBeAbsent)
             }
         }
+        let evidence = VerifiedSealEvidence {
+            mutation_digest: observation.mutation_digest,
+            head_payload_digest: observation.head_payload_digest,
+            proof: observation.proof,
+        };
+        Self::from_verified_parts(prepared, candidate, evidence)
+    }
+
+    fn from_verified_parts(
+        prepared: PreparedAuthorityManifestRecord<Hash>,
+        verified_head: AuthorityHeadView<Hash>,
+        evidence: VerifiedSealEvidence<Hash>,
+    ) -> Result<Self, ManifestLifecycleError> {
+        let canonical_payload = encode_sealed_payload(&prepared, evidence)?;
+        let lifecycle_digest = AuthorityLifecycleDigest::calculate(
+            SEALED_MANIFEST_DIGEST_DOMAIN,
+            &canonical_payload,
+        );
         Ok(Self {
             prepared,
-            verified_head: candidate,
+            verified_head,
+            evidence,
+            canonical_payload,
+            lifecycle_digest,
         })
+    }
+
+    pub fn decode_persisted(
+        selected_identity: AuthorityManifestIdentity<Hash>,
+        revision: i64,
+        status: i8,
+        prepared_digest: &[u8],
+        lifecycle_digest: &[u8],
+        canonical_payload: &[u8],
+    ) -> Result<Self, ManifestLifecycleError> {
+        validate_lifecycle_cells(
+            AuthorityManifestLifecyclePhase::Sealed,
+            revision,
+            status,
+            lifecycle_digest,
+            canonical_payload,
+        )?;
+        let decoded = decode_sealed_payload(
+            selected_identity,
+            prepared_digest,
+            canonical_payload,
+        )?;
+        let observation = AuthorityPostWriteObservation::new(
+            AuthorityHeadView::candidate(&decoded.prepared),
+            decoded.evidence.mutation_digest,
+            decoded.evidence.head_payload_digest,
+            decoded.evidence.proof,
+        );
+        let sealed = Self::verify_and_seal(decoded.prepared, observation)?;
+        if sealed.canonical_payload != canonical_payload {
+            return Err(ManifestLifecycleError::NonCanonicalLifecyclePayload);
+        }
+        Ok(sealed)
     }
 
     pub const fn phase(&self) -> AuthorityManifestLifecyclePhase {
@@ -279,6 +373,14 @@ impl<Hash: Q256BitHash> SealedAuthorityManifest<Hash> {
         &self.verified_head
     }
 
+    pub fn encode_canonical(&self) -> &[u8] {
+        &self.canonical_payload
+    }
+
+    pub const fn lifecycle_digest(&self) -> AuthorityLifecycleDigest {
+        self.lifecycle_digest
+    }
+
     pub fn classify_head_cas(
         &self,
         applied: bool,
@@ -289,11 +391,17 @@ impl<Hash: Q256BitHash> SealedAuthorityManifest<Hash> {
         if current == candidate {
             return Ok(if applied {
                 AuthorityHeadPublishDecision::Published(
-                    HeadPublishReceipt::for_sealed(self),
+                    HeadPublishReceipt::for_sealed(
+                        self,
+                        AuthorityHeadPublicationKind::Applied,
+                    ),
                 )
             } else {
                 AuthorityHeadPublishDecision::Idempotent(
-                    HeadPublishReceipt::for_sealed(self),
+                    HeadPublishReceipt::for_sealed(
+                        self,
+                        AuthorityHeadPublicationKind::Idempotent,
+                    ),
                 )
             });
         }
@@ -312,7 +420,7 @@ impl<Hash: Q256BitHash> SealedAuthorityManifest<Hash> {
         receipt: HeadPublishReceipt<Hash>,
     ) -> Result<CommittedAuthorityManifest<Hash>, ManifestLifecycleError> {
         receipt.verify_for(&self)?;
-        Ok(CommittedAuthorityManifest { sealed: self })
+        CommittedAuthorityManifest::from_published(self, receipt)
     }
 
     pub fn recovery_action(
@@ -322,7 +430,10 @@ impl<Hash: Q256BitHash> SealedAuthorityManifest<Hash> {
         let expected = AuthorityHeadView::expected(&self.prepared);
         if current == self.verified_head {
             SealedManifestRecoveryAction::MarkCommitted(
-                HeadPublishReceipt::for_sealed(self),
+                HeadPublishReceipt::for_sealed(
+                    self,
+                    AuthorityHeadPublicationKind::RecoveredCandidate,
+                ),
             )
         } else if current == expected {
             SealedManifestRecoveryAction::PublishExactCandidate
@@ -332,17 +443,45 @@ impl<Hash: Q256BitHash> SealedAuthorityManifest<Hash> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u8)]
+pub enum AuthorityHeadPublicationKind {
+    Applied = 1,
+    Idempotent = 2,
+    RecoveredCandidate = 3,
+}
+
+impl TryFrom<u8> for AuthorityHeadPublicationKind {
+    type Error = ManifestLifecycleError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::Applied),
+            2 => Ok(Self::Idempotent),
+            3 => Ok(Self::RecoveredCandidate),
+            value => Err(ManifestLifecycleError::UnknownHeadPublicationKind(
+                value,
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HeadPublishReceipt<Hash> {
     manifest_digest: AuthorityManifestDigest,
     candidate: AuthorityHeadView<Hash>,
+    publication_kind: AuthorityHeadPublicationKind,
 }
 
 impl<Hash: Q256BitHash> HeadPublishReceipt<Hash> {
-    fn for_sealed(sealed: &SealedAuthorityManifest<Hash>) -> Self {
+    fn for_sealed(
+        sealed: &SealedAuthorityManifest<Hash>,
+        publication_kind: AuthorityHeadPublicationKind,
+    ) -> Self {
         Self {
             manifest_digest: sealed.prepared.digest(),
             candidate: sealed.verified_head,
+            publication_kind,
         }
     }
 
@@ -378,9 +517,57 @@ pub enum SealedManifestRecoveryAction<Hash> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommittedAuthorityManifest<Hash> {
     sealed: SealedAuthorityManifest<Hash>,
+    publication_kind: AuthorityHeadPublicationKind,
+    canonical_payload: Vec<u8>,
+    lifecycle_digest: AuthorityLifecycleDigest,
 }
 
 impl<Hash: Q256BitHash> CommittedAuthorityManifest<Hash> {
+    fn from_published(
+        sealed: SealedAuthorityManifest<Hash>,
+        receipt: HeadPublishReceipt<Hash>,
+    ) -> Result<Self, ManifestLifecycleError> {
+        let publication_kind = receipt.publication_kind;
+        let canonical_payload =
+            encode_committed_payload(&sealed, publication_kind)?;
+        let lifecycle_digest = AuthorityLifecycleDigest::calculate(
+            COMMITTED_MANIFEST_DIGEST_DOMAIN,
+            &canonical_payload,
+        );
+        Ok(Self {
+            sealed,
+            publication_kind,
+            canonical_payload,
+            lifecycle_digest,
+        })
+    }
+
+    pub fn decode_persisted(
+        selected_identity: AuthorityManifestIdentity<Hash>,
+        revision: i64,
+        status: i8,
+        prepared_digest: &[u8],
+        lifecycle_digest: &[u8],
+        canonical_payload: &[u8],
+    ) -> Result<Self, ManifestLifecycleError> {
+        validate_lifecycle_cells(
+            AuthorityManifestLifecyclePhase::Committed,
+            revision,
+            status,
+            lifecycle_digest,
+            canonical_payload,
+        )?;
+        let decoded = decode_committed_payload(
+            selected_identity,
+            prepared_digest,
+            canonical_payload,
+        )?;
+        if decoded.canonical_payload != canonical_payload {
+            return Err(ManifestLifecycleError::NonCanonicalLifecyclePayload);
+        }
+        Ok(decoded)
+    }
+
     pub const fn phase(&self) -> AuthorityManifestLifecyclePhase {
         AuthorityManifestLifecyclePhase::Committed
     }
@@ -395,6 +582,18 @@ impl<Hash: Q256BitHash> CommittedAuthorityManifest<Hash> {
 
     pub const fn sealed(&self) -> &SealedAuthorityManifest<Hash> {
         &self.sealed
+    }
+
+    pub const fn publication_kind(&self) -> AuthorityHeadPublicationKind {
+        self.publication_kind
+    }
+
+    pub fn encode_canonical(&self) -> &[u8] {
+        &self.canonical_payload
+    }
+
+    pub const fn lifecycle_digest(&self) -> AuthorityLifecycleDigest {
+        self.lifecycle_digest
     }
 
     pub fn recovery_action(
@@ -425,8 +624,235 @@ pub enum CommittedManifestRecoveryAction {
     CompleteTimestampLease,
 }
 
+struct DecodedSealedPayload<Hash> {
+    prepared: PreparedAuthorityManifestRecord<Hash>,
+    evidence: VerifiedSealEvidence<Hash>,
+}
+
+fn encode_sealed_payload<Hash: Q256BitHash>(
+    prepared: &PreparedAuthorityManifestRecord<Hash>,
+    evidence: VerifiedSealEvidence<Hash>,
+) -> Result<Vec<u8>, ManifestLifecycleError> {
+    let prepared_payload = prepared.encode_canonical();
+    let prepared_len = u32::try_from(prepared_payload.len()).map_err(|_| {
+        ManifestLifecycleError::LifecyclePayloadTooLarge(prepared_payload.len())
+    })?;
+    let mut out = Vec::with_capacity(143 + prepared_payload.len());
+    out.extend_from_slice(&SEALED_AUTHORITY_MANIFEST_MAGIC);
+    out.extend_from_slice(&AUTHORITY_MANIFEST_LIFECYCLE_CODEC_VERSION.to_be_bytes());
+    out.extend_from_slice(prepared.digest().as_bytes());
+    out.extend_from_slice(&prepared_len.to_be_bytes());
+    out.extend_from_slice(prepared_payload);
+    out.extend_from_slice(&evidence.mutation_digest);
+    out.extend_from_slice(evidence.head_payload_digest.as_bytes());
+    match evidence.proof {
+        AuthorityProofObservation::CoordinatorPublicInput(hash) => {
+            out.push(1);
+            out.extend_from_slice(&hash.into_inner().into_owned_32bytes());
+        }
+        AuthorityProofObservation::NotApplicableForRealm => {
+            out.push(2);
+            out.extend_from_slice(&[0; 32]);
+        }
+    }
+    Ok(out)
+}
+
+fn decode_sealed_payload<Hash: Q256BitHash>(
+    selected_identity: AuthorityManifestIdentity<Hash>,
+    selected_prepared_digest: &[u8],
+    bytes: &[u8],
+) -> Result<DecodedSealedPayload<Hash>, ManifestLifecycleError> {
+    const PREFIX_LEN: usize = 46;
+    const EVIDENCE_LEN: usize = 97;
+    if bytes.len() < PREFIX_LEN + EVIDENCE_LEN {
+        return Err(ManifestLifecycleError::TruncatedLifecyclePayload);
+    }
+    if bytes[..8] != SEALED_AUTHORITY_MANIFEST_MAGIC {
+        return Err(ManifestLifecycleError::InvalidLifecycleMagic);
+    }
+    let version = u16::from_be_bytes(bytes[8..10].try_into().expect("fixed"));
+    if version != AUTHORITY_MANIFEST_LIFECYCLE_CODEC_VERSION {
+        return Err(ManifestLifecycleError::UnknownLifecycleCodecVersion(
+            version,
+        ));
+    }
+    if selected_prepared_digest.len() != 32 {
+        return Err(ManifestLifecycleError::InvalidPreparedDigestLength(
+            selected_prepared_digest.len(),
+        ));
+    }
+    if &bytes[10..42] != selected_prepared_digest {
+        return Err(ManifestLifecycleError::PreparedDigestMismatch);
+    }
+    let prepared_len =
+        u32::from_be_bytes(bytes[42..46].try_into().expect("fixed")) as usize;
+    let prepared_end = PREFIX_LEN
+        .checked_add(prepared_len)
+        .ok_or(ManifestLifecycleError::LifecyclePayloadLengthOverflow)?;
+    let expected_end = prepared_end
+        .checked_add(EVIDENCE_LEN)
+        .ok_or(ManifestLifecycleError::LifecyclePayloadLengthOverflow)?;
+    if bytes.len() < expected_end {
+        return Err(ManifestLifecycleError::TruncatedLifecyclePayload);
+    }
+    if bytes.len() > expected_end {
+        return Err(ManifestLifecycleError::TrailingLifecyclePayloadBytes);
+    }
+    let prepared = PreparedAuthorityManifestRecord::decode_persisted(
+        selected_identity,
+        ManifestRevision::prepared().as_i64(),
+        AuthorityManifestStatus::Prepared as i8,
+        selected_prepared_digest,
+        &bytes[PREFIX_LEN..prepared_end],
+    )?;
+    let mutation_end = prepared_end + 32;
+    let head_payload_end = mutation_end + 32;
+    let proof_kind = bytes[head_payload_end];
+    let proof_bytes: [u8; 32] = bytes[head_payload_end + 1..expected_end]
+        .try_into()
+        .expect("fixed");
+    let proof = match proof_kind {
+        1 => AuthorityProofObservation::CoordinatorPublicInput(
+            CheckpointHash::from_proof_public_inputs_hash(
+                Hash::from_owned_32bytes(proof_bytes),
+            ),
+        ),
+        2 if proof_bytes == [0; 32] => {
+            AuthorityProofObservation::NotApplicableForRealm
+        }
+        2 => return Err(ManifestLifecycleError::NonCanonicalRealmProof),
+        value => return Err(ManifestLifecycleError::UnknownProofKind(value)),
+    };
+    Ok(DecodedSealedPayload {
+        prepared,
+        evidence: VerifiedSealEvidence {
+            mutation_digest: bytes[prepared_end..mutation_end]
+                .try_into()
+                .expect("fixed"),
+            head_payload_digest: AuthorityHeadPayloadDigest::from_persisted(
+                bytes[mutation_end..head_payload_end]
+                    .try_into()
+                    .expect("fixed"),
+            ),
+            proof,
+        },
+    })
+}
+
+fn encode_committed_payload<Hash: Q256BitHash>(
+    sealed: &SealedAuthorityManifest<Hash>,
+    publication_kind: AuthorityHeadPublicationKind,
+) -> Result<Vec<u8>, ManifestLifecycleError> {
+    let sealed_payload = sealed.encode_canonical();
+    let sealed_len = u32::try_from(sealed_payload.len()).map_err(|_| {
+        ManifestLifecycleError::LifecyclePayloadTooLarge(sealed_payload.len())
+    })?;
+    let mut out = Vec::with_capacity(47 + sealed_payload.len());
+    out.extend_from_slice(&COMMITTED_AUTHORITY_MANIFEST_MAGIC);
+    out.extend_from_slice(&AUTHORITY_MANIFEST_LIFECYCLE_CODEC_VERSION.to_be_bytes());
+    out.extend_from_slice(sealed.lifecycle_digest().as_bytes());
+    out.extend_from_slice(&sealed_len.to_be_bytes());
+    out.extend_from_slice(sealed_payload);
+    out.push(publication_kind as u8);
+    Ok(out)
+}
+
+fn decode_committed_payload<Hash: Q256BitHash>(
+    selected_identity: AuthorityManifestIdentity<Hash>,
+    selected_prepared_digest: &[u8],
+    bytes: &[u8],
+) -> Result<CommittedAuthorityManifest<Hash>, ManifestLifecycleError> {
+    const PREFIX_LEN: usize = 46;
+    if bytes.len() < PREFIX_LEN + 1 {
+        return Err(ManifestLifecycleError::TruncatedLifecyclePayload);
+    }
+    if bytes[..8] != COMMITTED_AUTHORITY_MANIFEST_MAGIC {
+        return Err(ManifestLifecycleError::InvalidLifecycleMagic);
+    }
+    let version = u16::from_be_bytes(bytes[8..10].try_into().expect("fixed"));
+    if version != AUTHORITY_MANIFEST_LIFECYCLE_CODEC_VERSION {
+        return Err(ManifestLifecycleError::UnknownLifecycleCodecVersion(
+            version,
+        ));
+    }
+    let sealed_len =
+        u32::from_be_bytes(bytes[42..46].try_into().expect("fixed")) as usize;
+    let sealed_end = PREFIX_LEN
+        .checked_add(sealed_len)
+        .ok_or(ManifestLifecycleError::LifecyclePayloadLengthOverflow)?;
+    let expected_end = sealed_end
+        .checked_add(1)
+        .ok_or(ManifestLifecycleError::LifecyclePayloadLengthOverflow)?;
+    if bytes.len() < expected_end {
+        return Err(ManifestLifecycleError::TruncatedLifecyclePayload);
+    }
+    if bytes.len() > expected_end {
+        return Err(ManifestLifecycleError::TrailingLifecyclePayloadBytes);
+    }
+    let persisted_sealed_digest = &bytes[10..42];
+    let sealed = SealedAuthorityManifest::decode_persisted(
+        selected_identity,
+        AuthorityManifestLifecyclePhase::Sealed.revision().as_i64(),
+        AuthorityManifestStatus::Sealed as i8,
+        selected_prepared_digest,
+        persisted_sealed_digest,
+        &bytes[PREFIX_LEN..sealed_end],
+    )?;
+    let publication_kind = AuthorityHeadPublicationKind::try_from(bytes[sealed_end])?;
+    let receipt = HeadPublishReceipt::for_sealed(&sealed, publication_kind);
+    CommittedAuthorityManifest::from_published(sealed, receipt)
+}
+
+fn validate_lifecycle_cells(
+    expected_phase: AuthorityManifestLifecyclePhase,
+    revision: i64,
+    status: i8,
+    persisted_digest: &[u8],
+    canonical_payload: &[u8],
+) -> Result<(), ManifestLifecycleError> {
+    let revision = ManifestRevision::try_from_i64(revision)?;
+    if revision != expected_phase.revision() {
+        return Err(ManifestLifecycleError::LifecycleRevisionMismatch {
+            expected: expected_phase.revision().get(),
+            actual: revision.get(),
+        });
+    }
+    let status = AuthorityManifestStatus::try_from(status)?;
+    if status != expected_phase.status() {
+        return Err(ManifestLifecycleError::LifecycleStatusMismatch {
+            expected: expected_phase.status() as i8,
+            actual: status as i8,
+        });
+    }
+    if persisted_digest.len() != 32 {
+        return Err(ManifestLifecycleError::InvalidLifecycleDigestLength(
+            persisted_digest.len(),
+        ));
+    }
+    let domain = match expected_phase {
+        AuthorityManifestLifecyclePhase::Sealed => {
+            SEALED_MANIFEST_DIGEST_DOMAIN
+        }
+        AuthorityManifestLifecyclePhase::Committed => {
+            COMMITTED_MANIFEST_DIGEST_DOMAIN
+        }
+        AuthorityManifestLifecyclePhase::Prepared => {
+            return Err(ManifestLifecycleError::PreparedUsesDedicatedCodec)
+        }
+    };
+    if AuthorityLifecycleDigest::calculate(domain, canonical_payload)
+        .as_bytes()
+        != persisted_digest
+    {
+        return Err(ManifestLifecycleError::LifecycleDigestMismatch);
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ManifestLifecycleError {
+    ManifestRecord(ManifestRecordError),
     HeadNetworkMismatch,
     CoordinatorStateCheckpointMismatch {
         state_checkpoint: u64,
@@ -445,6 +871,29 @@ pub enum ManifestLifecycleError {
     AppliedHeadCasMismatch,
     HeadPublishReceiptMismatch,
     CommittedHeadMismatch,
+    LifecyclePayloadTooLarge(usize),
+    InvalidPreparedDigestLength(usize),
+    InvalidLifecycleDigestLength(usize),
+    InvalidLifecycleMagic,
+    UnknownLifecycleCodecVersion(u16),
+    UnknownProofKind(u8),
+    NonCanonicalRealmProof,
+    UnknownHeadPublicationKind(u8),
+    PreparedDigestMismatch,
+    LifecycleDigestMismatch,
+    LifecyclePayloadLengthOverflow,
+    TruncatedLifecyclePayload,
+    TrailingLifecyclePayloadBytes,
+    NonCanonicalLifecyclePayload,
+    LifecycleRevisionMismatch { expected: u64, actual: u64 },
+    LifecycleStatusMismatch { expected: i8, actual: i8 },
+    PreparedUsesDedicatedCodec,
+}
+
+impl From<ManifestRecordError> for ManifestLifecycleError {
+    fn from(value: ManifestRecordError) -> Self {
+        Self::ManifestRecord(value)
+    }
 }
 
 impl fmt::Display for ManifestLifecycleError {

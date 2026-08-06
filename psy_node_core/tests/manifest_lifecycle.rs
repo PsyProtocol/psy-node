@@ -19,12 +19,12 @@ use psy_node_core::store::{
     },
     manifest_lifecycle::{
         prepared_recovery_action, AuthorityHeadPublishDecision,
-        AuthorityHeadPayloadDigest, AuthorityHeadView,
-        AuthorityManifestLifecyclePhase,
+        AuthorityHeadPayloadDigest, AuthorityHeadPublicationKind,
+        AuthorityHeadView, AuthorityManifestLifecyclePhase,
         AuthorityPostWriteObservation, AuthorityProofObservation,
-        CommittedManifestRecoveryAction, ManifestLifecycleError,
-        PreparedManifestRecoveryAction, SealedAuthorityManifest,
-        SealedManifestRecoveryAction,
+        CommittedAuthorityManifest, CommittedManifestRecoveryAction,
+        ManifestLifecycleError, PreparedManifestRecoveryAction,
+        SealedAuthorityManifest, SealedManifestRecoveryAction,
     },
     manifest_record::{
         AuthorityManifestStatus, ManifestRecordError,
@@ -32,6 +32,15 @@ use psy_node_core::store::{
     },
     timestamp::CommitWriteTimestampUs,
 };
+use sha2::{Digest, Sha256};
+
+fn lifecycle_digest(domain: &[u8], payload: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update((payload.len() as u64).to_be_bytes());
+    hasher.update(payload);
+    hasher.finalize().into()
+}
 
 fn hash(seed: u8) -> PHash {
     PHash::from_owned_32bytes([seed; 32])
@@ -180,6 +189,25 @@ fn coordinator_observation(
             ),
         ),
     )
+}
+
+fn sealed_realm(seed: u8) -> SealedAuthorityManifest<PHash> {
+    let record = realm_prepared(seed);
+    SealedAuthorityManifest::verify_and_seal(
+        record.clone(),
+        realm_observation(&record),
+    )
+    .unwrap()
+}
+
+fn committed_realm(seed: u8) -> CommittedAuthorityManifest<PHash> {
+    let sealed = sealed_realm(seed);
+    let candidate = *sealed.verified_head();
+    let receipt = match sealed.classify_head_cas(true, candidate).unwrap() {
+        AuthorityHeadPublishDecision::Published(receipt) => receipt,
+        other => panic!("unexpected publication decision: {other:?}"),
+    };
+    sealed.mark_committed(receipt).unwrap()
 }
 
 #[test]
@@ -509,5 +537,240 @@ fn prepared_decoder_cannot_accept_future_lifecycle_status() {
         ManifestRecordError::UnsupportedPreparedStatus(
             AuthorityManifestStatus::Sealed as i8
         )
+    );
+}
+
+#[test]
+fn sealed_and_committed_codecs_round_trip_exactly() {
+    let sealed = sealed_realm(16);
+    let sealed_decoded = SealedAuthorityManifest::decode_persisted(
+        *sealed.prepared().identity(),
+        sealed.revision().as_i64(),
+        sealed.status() as i8,
+        sealed.prepared().digest().as_bytes(),
+        sealed.lifecycle_digest().as_bytes(),
+        sealed.encode_canonical(),
+    )
+    .unwrap();
+    assert_eq!(sealed_decoded, sealed);
+    assert_eq!(
+        sealed_decoded.encode_canonical(),
+        sealed.encode_canonical()
+    );
+
+    let committed = committed_realm(17);
+    let committed_decoded = CommittedAuthorityManifest::decode_persisted(
+        *committed.sealed().prepared().identity(),
+        committed.revision().as_i64(),
+        committed.status() as i8,
+        committed.sealed().prepared().digest().as_bytes(),
+        committed.lifecycle_digest().as_bytes(),
+        committed.encode_canonical(),
+    )
+    .unwrap();
+    assert_eq!(committed_decoded, committed);
+    assert_eq!(
+        committed_decoded.publication_kind(),
+        AuthorityHeadPublicationKind::Applied
+    );
+}
+
+#[test]
+fn lifecycle_codec_is_deterministic_and_keeps_prepared_digest_immutable() {
+    let first = committed_realm(18);
+    let second = committed_realm(18);
+    assert_eq!(first, second);
+    assert_eq!(first.encode_canonical(), second.encode_canonical());
+    assert_eq!(first.lifecycle_digest(), second.lifecycle_digest());
+    assert_ne!(
+        first.sealed().lifecycle_digest().as_bytes(),
+        first.lifecycle_digest().as_bytes()
+    );
+    assert_eq!(
+        first.sealed().prepared().digest(),
+        second.sealed().prepared().digest()
+    );
+    assert_eq!(
+        hex::encode(first.sealed().lifecycle_digest().as_bytes()),
+        "ffe9e4205628824fd11b7468fc3bb7655a182409e364cb606fb9811f0afc37f1"
+    );
+    assert_eq!(
+        hex::encode(first.lifecycle_digest().as_bytes()),
+        "3fcc6bd563d2a8598348fb01063087fb475e3cd62e97bde87ee18903998f5736"
+    );
+}
+
+#[test]
+fn sealed_codec_rejects_cell_and_payload_corruption() {
+    let sealed = sealed_realm(19);
+    let decode = |revision: i64,
+                  status: i8,
+                  prepared_digest: &[u8],
+                  lifecycle_digest: &[u8],
+                  payload: &[u8]| {
+        SealedAuthorityManifest::decode_persisted(
+            *sealed.prepared().identity(),
+            revision,
+            status,
+            prepared_digest,
+            lifecycle_digest,
+            payload,
+        )
+    };
+    assert!(matches!(
+        decode(
+            0,
+            sealed.status() as i8,
+            sealed.prepared().digest().as_bytes(),
+            sealed.lifecycle_digest().as_bytes(),
+            sealed.encode_canonical(),
+        ),
+        Err(ManifestLifecycleError::LifecycleRevisionMismatch { .. })
+    ));
+    assert!(matches!(
+        decode(
+            sealed.revision().as_i64(),
+            AuthorityManifestStatus::Committed as i8,
+            sealed.prepared().digest().as_bytes(),
+            sealed.lifecycle_digest().as_bytes(),
+            sealed.encode_canonical(),
+        ),
+        Err(ManifestLifecycleError::LifecycleStatusMismatch { .. })
+    ));
+    let mut wrong_prepared_digest = *sealed.prepared().digest().as_bytes();
+    wrong_prepared_digest[0] ^= 1;
+    assert_eq!(
+        decode(
+            sealed.revision().as_i64(),
+            sealed.status() as i8,
+            &wrong_prepared_digest,
+            sealed.lifecycle_digest().as_bytes(),
+            sealed.encode_canonical(),
+        )
+        .unwrap_err(),
+        ManifestLifecycleError::PreparedDigestMismatch
+    );
+    let mut wrong_lifecycle_digest = *sealed.lifecycle_digest().as_bytes();
+    wrong_lifecycle_digest[0] ^= 1;
+    assert_eq!(
+        decode(
+            sealed.revision().as_i64(),
+            sealed.status() as i8,
+            sealed.prepared().digest().as_bytes(),
+            &wrong_lifecycle_digest,
+            sealed.encode_canonical(),
+        )
+        .unwrap_err(),
+        ManifestLifecycleError::LifecycleDigestMismatch
+    );
+    let bytes = sealed.encode_canonical();
+    let sealed_domain = b"psy.rollback.sealed-authority-manifest.v1\0";
+    let truncated = &bytes[..bytes.len() - 1];
+    let truncated_digest = lifecycle_digest(sealed_domain, truncated);
+    assert_eq!(
+        decode(
+            sealed.revision().as_i64(),
+            sealed.status() as i8,
+            sealed.prepared().digest().as_bytes(),
+            &truncated_digest,
+            truncated,
+        )
+        .unwrap_err(),
+        ManifestLifecycleError::TruncatedLifecyclePayload
+    );
+    let mut trailing = bytes.to_vec();
+    trailing.push(0);
+    let trailing_digest = lifecycle_digest(sealed_domain, &trailing);
+    assert_eq!(
+        decode(
+            sealed.revision().as_i64(),
+            sealed.status() as i8,
+            sealed.prepared().digest().as_bytes(),
+            &trailing_digest,
+            &trailing,
+        )
+        .unwrap_err(),
+        ManifestLifecycleError::TrailingLifecyclePayloadBytes
+    );
+    let mut bad_magic = bytes.to_vec();
+    bad_magic[0] ^= 1;
+    let bad_magic_digest = lifecycle_digest(sealed_domain, &bad_magic);
+    assert_eq!(
+        decode(
+            sealed.revision().as_i64(),
+            sealed.status() as i8,
+            sealed.prepared().digest().as_bytes(),
+            &bad_magic_digest,
+            &bad_magic,
+        )
+        .unwrap_err(),
+        ManifestLifecycleError::InvalidLifecycleMagic
+    );
+    let mut bad_version = bytes.to_vec();
+    bad_version[9] = 2;
+    let bad_version_digest = lifecycle_digest(sealed_domain, &bad_version);
+    assert_eq!(
+        decode(
+            sealed.revision().as_i64(),
+            sealed.status() as i8,
+            sealed.prepared().digest().as_bytes(),
+            &bad_version_digest,
+            &bad_version,
+        )
+        .unwrap_err(),
+        ManifestLifecycleError::UnknownLifecycleCodecVersion(2)
+    );
+    let mut bad_proof_kind = bytes.to_vec();
+    let proof_kind_offset = bad_proof_kind.len() - 33;
+    bad_proof_kind[proof_kind_offset] = 99;
+    let bad_proof_digest = lifecycle_digest(sealed_domain, &bad_proof_kind);
+    assert_eq!(
+        decode(
+            sealed.revision().as_i64(),
+            sealed.status() as i8,
+            sealed.prepared().digest().as_bytes(),
+            &bad_proof_digest,
+            &bad_proof_kind,
+        )
+        .unwrap_err(),
+        ManifestLifecycleError::UnknownProofKind(99)
+    );
+    let mut noncanonical_realm_proof = bytes.to_vec();
+    *noncanonical_realm_proof.last_mut().unwrap() = 1;
+    let noncanonical_realm_digest =
+        lifecycle_digest(sealed_domain, &noncanonical_realm_proof);
+    assert_eq!(
+        decode(
+            sealed.revision().as_i64(),
+            sealed.status() as i8,
+            sealed.prepared().digest().as_bytes(),
+            &noncanonical_realm_digest,
+            &noncanonical_realm_proof,
+        )
+        .unwrap_err(),
+        ManifestLifecycleError::NonCanonicalRealmProof
+    );
+}
+
+#[test]
+fn committed_codec_rejects_unknown_publication_kind() {
+    let committed = committed_realm(20);
+    let mut bytes = committed.encode_canonical().to_vec();
+    *bytes.last_mut().unwrap() = 99;
+    let digest = lifecycle_digest(
+        b"psy.rollback.committed-authority-manifest.v1\0",
+        &bytes,
+    );
+    assert_eq!(
+        CommittedAuthorityManifest::decode_persisted(
+            *committed.sealed().prepared().identity(),
+            committed.revision().as_i64(),
+            committed.status() as i8,
+            committed.sealed().prepared().digest().as_bytes(),
+            &digest,
+            &bytes,
+        )
+        .unwrap_err(),
+        ManifestLifecycleError::UnknownHeadPublicationKind(99)
     );
 }
