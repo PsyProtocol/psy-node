@@ -13,6 +13,7 @@
 //! None is connected to production setup or current writers yet.
 
 mod canonical_head_prototype;
+mod authority_timestamp_prototype;
 mod checkpoint_kiv;
 mod checkpoint_merkle;
 mod checkpoint_object_single;
@@ -39,6 +40,7 @@ mod timestamped;
 mod registry;
 
 pub use canonical_head_prototype::*;
+pub use authority_timestamp_prototype::*;
 pub use checkpoint_kiv::*;
 pub use checkpoint_merkle::*;
 pub use checkpoint_object_single::*;

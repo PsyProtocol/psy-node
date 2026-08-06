@@ -1,4 +1,5 @@
 pub mod canonical_head;
+pub mod authority_commit;
 pub mod proof_namespace;
 pub mod rollback_admin;
 pub mod rollback_admission;
