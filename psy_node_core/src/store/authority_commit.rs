@@ -175,6 +175,42 @@ pub struct StoredAuthorityTimestampState {
     phase: AuthorityTimestampPhase,
 }
 
+/// A durable allocator row bound to the exact partition key used to read it.
+///
+/// The Scylla adapter is the trust boundary that constructs this value after
+/// selecting one row. Recovery planners accept this key-bound observation
+/// instead of a bare payload, so they cannot silently reinterpret a row from
+/// another network or authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ObservedAuthorityTimestampState {
+    key: AuthorityTimestampKey,
+    state: StoredAuthorityTimestampState,
+}
+
+impl ObservedAuthorityTimestampState {
+    pub const fn from_selected_row(
+        key: AuthorityTimestampKey,
+        state: StoredAuthorityTimestampState,
+    ) -> Self {
+        Self { key, state }
+    }
+
+    pub const fn key(self) -> AuthorityTimestampKey {
+        self.key
+    }
+
+    pub const fn state(self) -> StoredAuthorityTimestampState {
+        self.state
+    }
+
+    pub fn observe_intent(
+        self,
+        intent: AuthorityCommitIntentDigest,
+    ) -> AuthorityIntentObservation {
+        self.state.observe_intent(self.key, intent)
+    }
+}
+
 impl StoredAuthorityTimestampState {
     pub const fn revision(self) -> AuthorityTimestampRevision {
         self.revision

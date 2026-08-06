@@ -3,6 +3,7 @@ pub mod authority_commit;
 pub mod manifest_intent;
 pub mod manifest_lifecycle;
 pub mod manifest_record;
+pub mod normal_commit;
 pub mod proof_namespace;
 pub mod rollback_admin;
 pub mod rollback_admission;
