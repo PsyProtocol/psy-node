@@ -722,6 +722,47 @@ pub struct VerifiedPreparedManifestPackage<Hash> {
     artifacts: CanonicalManifestArtifacts,
 }
 
+/// Capability issued only after every chunk for one exact manifest digest
+/// has been read back and verified. A conflicting intent at the same chain
+/// identity cannot reuse this receipt because its manifest digest differs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedPreparedChunkReceipt<Hash> {
+    identity: AuthorityManifestIdentity<Hash>,
+    manifest_digest: [u8; 32],
+}
+
+impl<Hash: Q256BitHash> VerifiedPreparedChunkReceipt<Hash> {
+    fn from_verified_record(
+        record: &PreparedAuthorityManifestRecord<Hash>,
+    ) -> Self {
+        Self {
+            identity: *record.identity(),
+            manifest_digest: *record.digest().as_bytes(),
+        }
+    }
+
+    pub const fn identity(&self) -> &AuthorityManifestIdentity<Hash> {
+        &self.identity
+    }
+
+    pub const fn manifest_digest(&self) -> &[u8; 32] {
+        &self.manifest_digest
+    }
+
+    pub fn verify_for(
+        &self,
+        record: &PreparedAuthorityManifestRecord<Hash>,
+    ) -> Result<(), ManifestPreparedError> {
+        if self.identity == *record.identity()
+            && self.manifest_digest == *record.digest().as_bytes()
+        {
+            Ok(())
+        } else {
+            Err(ManifestPreparedError::VerifiedChunkReceiptMismatch)
+        }
+    }
+}
+
 impl<Hash: Q256BitHash> VerifiedPreparedManifestPackage<Hash> {
     pub fn try_new(
         prepared: &PreparedAuthorityManifestIntent<Hash>,
@@ -950,14 +991,57 @@ impl ScyllaPreparedManifestStore {
         &self,
         package: &VerifiedPreparedManifestPackage<Hash>,
     ) -> Result<PreparedManifestWriteOutcome<Hash>, ManifestPreparedError> {
+        let receipt = self.persist_artifacts(package).await?;
+        self.insert_prepared(package.record(), &receipt).await
+    }
+
+    pub async fn persist_artifacts<Hash: Q256BitHash>(
+        &self,
+        package: &VerifiedPreparedManifestPackage<Hash>,
+    ) -> Result<VerifiedPreparedChunkReceipt<Hash>, ManifestPreparedError> {
         self.persist_and_verify_chunks(package).await?;
+        Ok(VerifiedPreparedChunkReceipt::from_verified_record(
+            package.record(),
+        ))
+    }
+
+    pub async fn verify_existing_artifacts<Hash: Q256BitHash>(
+        &self,
+        package: &VerifiedPreparedManifestPackage<Hash>,
+    ) -> Result<VerifiedPreparedChunkReceipt<Hash>, ManifestPreparedError> {
+        package.artifacts().verify_integrity()?;
+        if let Some(set) = package.artifacts().chunked() {
+            for descriptor in [
+                Some(set.locator().descriptor()),
+                Some(set.replay_record().descriptor()),
+                set.durable_prepared_payload()
+                    .map(CanonicalManifestArtifact::descriptor),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                self.read_verified_artifact(package.record(), descriptor)
+                    .await?;
+            }
+        }
+        Ok(VerifiedPreparedChunkReceipt::from_verified_record(
+            package.record(),
+        ))
+    }
+
+    pub async fn insert_prepared<Hash: Q256BitHash>(
+        &self,
+        record: &PreparedAuthorityManifestRecord<Hash>,
+        receipt: &VerifiedPreparedChunkReceipt<Hash>,
+    ) -> Result<PreparedManifestWriteOutcome<Hash>, ManifestPreparedError> {
+        receipt.verify_for(record)?;
         let binding =
-            PreparedManifestInsertBinding::try_from_record(package.record())?;
+            PreparedManifestInsertBinding::try_from_record(record)?;
         let execution = self
             .session
             .execute_unpaged(&self.insert_manifest, binding)
             .await;
-        self.finish_manifest_insert(execution, package.record()).await
+        self.finish_manifest_insert(execution, record).await
     }
 
     pub async fn read_manifest<Hash: Q256BitHash>(
@@ -1217,6 +1301,7 @@ pub enum ManifestPreparedError {
     ManifestRecord(ManifestRecordError),
     Artifact(ManifestArtifactError),
     IntentArtifactMismatch,
+    VerifiedChunkReceiptMismatch,
     CheckpointBucketOutOfRange,
     ChainEpochOutOfRange,
     CheckpointIdOutOfRange,
