@@ -31,9 +31,10 @@ use psy_node_core::store::{
     },
     manifest_record::PreparedAuthorityManifestRecord,
     normal_commit::{
-        classify_normal_head_publish, plan_normal_commit_recovery,
-        seal_verified_normal_commit, NormalCommitOrchestrationError,
-        NormalCommitRecoveryAction, NormalHeadPublishProgress,
+        authorize_normal_head_publish, classify_normal_head_publish,
+        plan_normal_commit_recovery, seal_verified_normal_commit,
+        NormalCommitOrchestrationError, NormalCommitRecoveryAction,
+        NormalHeadPublishProgress,
     },
     timestamp::CommitWriteTimestampUs,
 };
@@ -457,6 +458,43 @@ fn head_retry_and_lost_success_have_distinct_safe_results() {
             if committed.publication_kind()
                 == AuthorityHeadPublicationKind::Idempotent
     ));
+}
+
+#[test]
+fn delayed_head_publish_is_reauthorized_before_io() {
+    let other = fixture(16);
+    let fixture = fixture(15);
+    let sealed = seal_verified_normal_commit(
+        fixture.prepared.clone(),
+        observation(&fixture.prepared),
+        &fixture.local_head,
+        observed_allocator(&fixture),
+    )
+    .unwrap();
+    let publish = match plan_normal_commit_recovery(
+        &PersistedAuthorityManifest::Sealed(sealed),
+        &fixture.local_head,
+        observed_allocator(&fixture),
+    )
+    .unwrap()
+    {
+        NormalCommitRecoveryAction::PublishExactHead { publish } => publish,
+        other => panic!("unexpected publish plan: {other:?}"),
+    };
+
+    authorize_normal_head_publish(&publish, observed_allocator(&fixture))
+        .unwrap();
+    assert_eq!(
+        authorize_normal_head_publish(
+            &publish,
+            ObservedAuthorityTimestampState::from_selected_row(
+                fixture.prepared.identity().timestamp_key(),
+                other.allocator_active,
+            ),
+        )
+        .unwrap_err(),
+        NormalCommitOrchestrationError::AllocatorOwnedByOtherIntent
+    );
 }
 
 #[test]

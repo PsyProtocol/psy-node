@@ -8,6 +8,7 @@ use std::{
 };
 
 use anyhow::{bail, ensure, Context};
+use futures::future::join_all;
 use parth_core::{protocol::core_types::Q256BitHash, PHash};
 use psy_data::protocol::{
     canonical_chain::{
@@ -22,22 +23,30 @@ use psy_node_core::store::{
     authority_commit::{
         AuthorityClockSampleUs, AuthorityTimestampBootstrap,
         AuthorityTimestampBootstrapReason, AuthorityTimestampKey,
-        AuthorityTimestampWriteOutcome, SealedAuthorityTimestampReservation,
+        AuthorityTimestampWriteOutcome, ObservedAuthorityTimestampState,
+        SealedAuthorityTimestampReservation,
     },
     authority_local_head::{
         AuthorityLocalHeadBootstrap, AuthorityLocalHeadBootstrapReason,
         AuthorityLocalHeadWriteOutcome, AuthorityStorageBindingGeneration,
         AuthorityStorageBindingRef, AuthorityStorageNamespaceId,
+        StoredAuthorityLocalHead,
     },
     manifest_intent::{
         AuthorityHeadPayload, AuthorityStateTransition,
         SealedAuthorityCommitIntent,
     },
     manifest_lifecycle::{
-        AuthorityHeadView, PersistedAuthorityManifest,
-        SealedAuthorityManifest,
+        AuthorityHeadPayloadDigest, AuthorityHeadView,
+        AuthorityPostWriteObservation, AuthorityProofObservation,
+        PersistedAuthorityManifest, SealedAuthorityManifest,
     },
     manifest_record::AuthorityManifestIdentity,
+    normal_commit::{
+        plan_normal_commit_recovery, NormalCommitOrchestrationError,
+        NormalCommitRecoveryAction, NormalHeadPublishProgress,
+        SealedNormalHeadPublish,
+    },
     timestamp::CommitWriteTimestampUs,
     typed::{
         CheckpointId as StorageCheckpointId, LogicalMutation, MerkleNode,
@@ -110,17 +119,84 @@ impl Fixture {
     }
 }
 
+fn seal_fixture_for_head_gate(
+    fixture: &Fixture,
+) -> SealedAuthorityManifest<PHash> {
+    let prepared = fixture.package.record().clone();
+    let observation = AuthorityPostWriteObservation::new(
+        AuthorityHeadView::candidate(&prepared),
+        prepared.intent().artifacts().mutation_digest(),
+        AuthorityHeadPayloadDigest::from_verified_payload_bytes(
+            prepared.intent().head_payload().as_bytes(),
+        ),
+        AuthorityProofObservation::NotApplicableForRealm,
+    );
+    SealedAuthorityManifest::verify_and_seal(prepared, observation).unwrap()
+}
+
+fn publish_fixture_for_head_gate(
+    fixture: &Fixture,
+    sealed: &SealedAuthorityManifest<PHash>,
+    expected: &StoredAuthorityLocalHead<PHash>,
+) -> SealedNormalHeadPublish<PHash> {
+    let allocator = ObservedAuthorityTimestampState::from_selected_row(
+        fixture.package.record().identity().timestamp_key(),
+        fixture.reservation.candidate(),
+    );
+    match plan_normal_commit_recovery(
+        &PersistedAuthorityManifest::Sealed(sealed.clone()),
+        expected,
+        allocator,
+    )
+    .unwrap()
+    {
+        NormalCommitRecoveryAction::PublishExactHead { publish } => publish,
+        other => panic!("unexpected conflict-gate plan: {other:?}"),
+    }
+}
+
 fn fixture(
     realm_id: u32,
     checkpoint_id: u64,
     seed: u8,
     high_water: i64,
 ) -> Fixture {
+    fixture_from_seeds(
+        realm_id,
+        checkpoint_id,
+        seed,
+        seed.wrapping_add(1),
+        seed.wrapping_add(2),
+        seed.wrapping_add(3),
+        seed,
+        high_water,
+        seed.wrapping_add(6),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fixture_from_seeds(
+    realm_id: u32,
+    checkpoint_id: u64,
+    expected_chain_seed: u8,
+    candidate_chain_seed: u8,
+    old_root_seed: u8,
+    new_root_seed: u8,
+    payload_seed: u8,
+    high_water: i64,
+    namespace_seed: u8,
+) -> Fixture {
     let checkpoint = StorageCheckpointId::try_new(checkpoint_id).unwrap();
     let semantic = [
-        (MerkleNode::new(0, NodeIndex::new(0)), seed.wrapping_add(3)),
-        (MerkleNode::new(1, NodeIndex::new(0)), seed.wrapping_add(4)),
-        (MerkleNode::new(1, NodeIndex::new(1)), seed.wrapping_add(5)),
+        (MerkleNode::new(0, NodeIndex::new(0)), new_root_seed),
+        (
+            MerkleNode::new(1, NodeIndex::new(0)),
+            new_root_seed.wrapping_add(1),
+        ),
+        (
+            MerkleNode::new(1, NodeIndex::new(1)),
+            new_root_seed.wrapping_add(2),
+        ),
     ];
     let payload = PreparedPayload::try_v1(
         PreparedPayloadKind::Realm,
@@ -181,21 +257,21 @@ fn fixture(
     );
     let intent = SealedAuthorityCommitIntent::seal_normal_advance(
         key,
-        chain(checkpoint_id - 1, seed),
-        chain(checkpoint_id, seed.wrapping_add(1)),
+        chain(checkpoint_id - 1, expected_chain_seed),
+        chain(checkpoint_id, candidate_chain_seed),
         AuthorityStateTransition::Changed {
             previous_checkpoint: AuthorityStateCheckpointId::new(
                 checkpoint_id - 1,
             ),
             checkpoint: AuthorityStateCheckpointId::new(checkpoint_id),
             old_root: AuthorityStateRoot::from_local_state_root(hash(
-                seed.wrapping_add(2),
+                old_root_seed,
             )),
             new_root: AuthorityStateRoot::from_local_state_root(hash(
-                seed.wrapping_add(3),
+                new_root_seed,
             )),
         },
-        AuthorityHeadPayload::try_new(vec![seed; 16]).unwrap(),
+        AuthorityHeadPayload::try_new(vec![payload_seed; 16]).unwrap(),
         artifacts.commitment(),
     )
     .unwrap();
@@ -224,7 +300,7 @@ fn fixture(
         AuthorityStorageBindingRef::new(
             AuthorityStorageBindingGeneration::try_new(3).unwrap(),
             AuthorityStorageNamespaceId::from_verified_namespace_id([
-                seed.wrapping_add(6);
+                namespace_seed;
                 32
             ]),
         ),
@@ -860,6 +936,289 @@ async fn d04b2d_combined_representative_normal_commit_rf3_gate(
     };
     let report_path = std::env::var("PSY_D04B2D_REPORT_PATH")
         .unwrap_or_else(|_| "target/d04b2d-combined-normal-commit-rf3-report.json".into());
+    let report_path = Path::new(&report_path);
+    if let Some(parent) = report_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(report_path, serde_json::to_vec_pretty(&report)?)?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct D04b2eReport {
+    baseline: &'static str,
+    image: &'static str,
+    scylla_release: String,
+    replication_factor: u8,
+    regular_consistency: &'static str,
+    serial_consistency: &'static str,
+    conflicting_reservations_applied: u8,
+    conflicting_reservations_rejected: u8,
+    losing_publish_rejected_before_head_io: bool,
+    winning_head_published: bool,
+    exact_idempotent_publish_retries: usize,
+    losing_manifest_absent: bool,
+    winner_reached_done: bool,
+    one_replica_offline: bool,
+    direct_one_state_replicas_equal: bool,
+    scenarios_passed: Vec<&'static str>,
+    finished_unix_ms: u64,
+    qualification: &'static str,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the destructive local three-node Scylla RF=3 harness"]
+async fn d04b2e_conflicting_normal_commit_rf3_gate() -> anyhow::Result<()> {
+    if std::env::var_os("PSY_D04B2E_RF3").is_none() {
+        bail!("set PSY_D04B2E_RF3=1 through run-d04b2e.sh");
+    }
+    let initial_session = connect(None, Consistency::Quorum).await?;
+    create_combined_schema(&initial_session).await?;
+    let release = docker_exec(
+        NODE_CONTAINERS[0],
+        &["scylla", "--version"],
+        "read D-04b2e Scylla version",
+    )?
+    .trim()
+    .to_owned();
+    drop(initial_session);
+
+    // Both requests target the same authority and exact expected head, but
+    // commit different checkpoint hashes, state roots, payloads and artifact
+    // digests.  Their independently sealed timestamp reservations therefore
+    // compete for the same idle allocator revision.
+    let left = fixture_from_seeds(
+        15, 61, 31, 32, 33, 34, 35, 4_000, 40,
+    );
+    let right = fixture_from_seeds(
+        15, 61, 31, 42, 33, 44, 45, 4_000, 40,
+    );
+    ensure!(
+        AuthorityHeadView::expected(left.package.record())
+            == AuthorityHeadView::expected(right.package.record())
+    );
+    ensure!(left.reservation.candidate() != right.reservation.candidate());
+    ensure!(
+        left.timestamp_bootstrap.candidate()
+            == right.timestamp_bootstrap.candidate()
+    );
+
+    let common_head = left.head_bootstrap.candidate().clone();
+    ensure!(
+        *common_head.head() == AuthorityHeadView::expected(right.package.record())
+    );
+    let left_sealed = seal_fixture_for_head_gate(&left);
+    let right_sealed = seal_fixture_for_head_gate(&right);
+    let left_publish = publish_fixture_for_head_gate(
+        &left,
+        &left_sealed,
+        &common_head,
+    );
+    let right_publish = publish_fixture_for_head_gate(
+        &right,
+        &right_sealed,
+        &common_head,
+    );
+    ensure!(left_publish.head_cas().candidate() != right_publish.head_cas().candidate());
+
+    let stores = open_combined_stores().await?;
+    ensure!(matches!(
+        stores
+            .timestamps
+            .bootstrap(left.timestamp_bootstrap)
+            .await?,
+        AuthorityTimestampWriteOutcome::Applied(_)
+    ));
+    ensure!(matches!(
+        stores.heads.bootstrap(&left.head_bootstrap).await?,
+        AuthorityLocalHeadWriteOutcome::Applied(_)
+    ));
+
+    // Exercise allocator ownership, state replay and the conflicting publish
+    // attempts while one RF=3 member is unavailable.
+    docker_container("stop", NODE_CONTAINERS[2])?;
+    let (left_reservation, right_reservation) = tokio::join!(
+        stores.timestamps.reserve(left.reservation),
+        stores.timestamps.reserve(right.reservation),
+    );
+    let left_reservation = left_reservation?;
+    let right_reservation = right_reservation?;
+    let left_won = matches!(
+        left_reservation,
+        AuthorityTimestampWriteOutcome::Applied(_)
+    );
+    ensure!(
+        (left_won
+            && matches!(
+                right_reservation,
+                AuthorityTimestampWriteOutcome::Conflict(_)
+            ))
+            || (!left_won
+                && matches!(
+                    left_reservation,
+                    AuthorityTimestampWriteOutcome::Conflict(_)
+                )
+                && matches!(
+                    right_reservation,
+                    AuthorityTimestampWriteOutcome::Applied(_)
+                ))
+    );
+
+    let (winner, loser, winner_publish, loser_publish, winner_sealed) =
+        if left_won {
+            (
+                &left,
+                &right,
+                left_publish,
+                right_publish,
+                left_sealed,
+            )
+        } else {
+            (
+                &right,
+                &left,
+                right_publish,
+                left_publish,
+                right_sealed,
+            )
+        };
+
+    ensure!(matches!(
+        stores.manifests.persist_prepared(&winner.package).await?,
+        psy_node_core::store::manifest_record::PreparedManifestWriteOutcome::Applied(_)
+    ));
+    let winner_plan = load_plan_from(&stores.manifests, winner.identity()).await?;
+    let combined = stores.executor();
+    let durable_sealed = match combined.step(winner.identity()).await? {
+        RepresentativeNormalCommitStep::StateVerifiedAndSealed { sealed } => sealed,
+        other => bail!("unexpected winner state step: {other:?}"),
+    };
+    ensure!(durable_sealed == winner_sealed);
+
+    let metadata = ScyllaNormalCommitMetadataExecutor::new(
+        &stores.manifests,
+        &stores.heads,
+        &stores.timestamps,
+    );
+    let (winner_result, loser_result) = tokio::join!(
+        metadata.publish_head(winner_publish.clone()),
+        metadata.publish_head(loser_publish.clone()),
+    );
+    let committed = match winner_result? {
+        NormalHeadPublishProgress::PersistCommitted { committed } => committed,
+        other => bail!("unexpected winning publish result: {other:?}"),
+    };
+    ensure!(matches!(
+        loser_result,
+        Err(NormalCommitMetadataError::Orchestration(
+            NormalCommitOrchestrationError::AllocatorOwnedByOtherIntent
+        ))
+    ));
+    let current_head = match stores
+        .heads
+        .read(winner.identity().timestamp_key())
+        .await?
+    {
+        psy_node_core::store::authority_local_head::AuthorityLocalHeadReadState::Current(head) => head,
+        psy_node_core::store::authority_local_head::AuthorityLocalHeadReadState::Uninitialized => {
+            bail!("authority head disappeared after winning publish")
+        }
+    };
+    ensure!(current_head == *winner_publish.head_cas().candidate());
+
+    // Exact duplicate requests remain safe: all observe the same candidate
+    // and become idempotent COMMITTED capabilities rather than alternate
+    // interpretations of the losing branch.
+    let retry_results = join_all(
+        (0..32).map(|_| metadata.publish_head(winner_publish.clone())),
+    )
+    .await;
+    for result in retry_results {
+        ensure!(matches!(
+            result?,
+            NormalHeadPublishProgress::PersistCommitted { .. }
+        ));
+    }
+
+    metadata.persist_committed(&committed).await?;
+    let completion = match metadata.plan(winner.identity()).await? {
+        NormalCommitRecoveryAction::CompleteTimestampLease { completion } => completion,
+        other => bail!("unexpected post-COMMITTED plan: {other:?}"),
+    };
+    metadata.complete_timestamp(completion).await?;
+    ensure!(matches!(
+        metadata.plan(winner.identity()).await?,
+        NormalCommitRecoveryAction::Done { .. }
+    ));
+    ensure!(stores
+        .manifests
+        .read_lifecycle(loser.identity())
+        .await?
+        .is_none());
+    ensure!(matches!(
+        metadata.publish_head(loser_publish).await,
+        Err(NormalCommitMetadataError::Orchestration(
+            NormalCommitOrchestrationError::AllocatorDoesNotOwnIntent
+        ))
+    ));
+    drop(metadata);
+    drop(stores);
+
+    docker_container("start", NODE_CONTAINERS[2])?;
+    wait_for_three_up_normal().await?;
+    repair_flush_compact()?;
+
+    let expected = expected_rows(&winner_plan)?;
+    let mut replicas = Vec::new();
+    for ip in NODE_IPS {
+        replicas.push(read_direct_rows(ip, &winner_plan).await?);
+    }
+    let direct_one_state_replicas_equal =
+        replicas.iter().all(|rows| rows == &expected);
+    ensure!(direct_one_state_replicas_equal);
+
+    let final_stores = open_combined_stores().await?;
+    ensure!(matches!(
+        final_stores.executor().step(winner.identity()).await?,
+        RepresentativeNormalCommitStep::Done { .. }
+    ));
+    ensure!(final_stores
+        .manifests
+        .read_lifecycle(loser.identity())
+        .await?
+        .is_none());
+
+    let report = D04b2eReport {
+        baseline: "98145fce1a1b0f1c1a95bacea8affefe65135274",
+        image: IMAGE,
+        scylla_release: release,
+        replication_factor: 3,
+        regular_consistency: "QUORUM",
+        serial_consistency: "LOCAL_SERIAL",
+        conflicting_reservations_applied: 1,
+        conflicting_reservations_rejected: 1,
+        losing_publish_rejected_before_head_io: true,
+        winning_head_published: true,
+        exact_idempotent_publish_retries: 32,
+        losing_manifest_absent: true,
+        winner_reached_done: true,
+        one_replica_offline: true,
+        direct_one_state_replicas_equal,
+        scenarios_passed: vec![
+            "two intent reservations have one durable owner",
+            "stale losing publish is rejected before head CAS",
+            "winning publish is the only canonical head",
+            "32 exact publish retries are idempotent",
+            "loser cannot persist a manifest or complete a timestamp lease",
+            "one replica offline flow converges after repair flush compact",
+        ],
+        finished_unix_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_millis() as u64,
+        qualification: "M20 for one representative Realm normal commit; not production Processor integration or full table coverage",
+    };
+    let report_path = std::env::var("PSY_D04B2E_REPORT_PATH")
+        .unwrap_or_else(|_| "target/d04b2e-normal-commit-conflict-rf3-report.json".into());
     let report_path = Path::new(&report_path);
     if let Some(parent) = report_path.parent() {
         fs::create_dir_all(parent)?;

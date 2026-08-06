@@ -163,6 +163,18 @@ pub fn seal_verified_normal_commit<Hash: Q256BitHash>(
         .map_err(Into::into)
 }
 
+/// Revalidate allocator ownership immediately before executing a previously
+/// sealed head-publish capability.  A planner result may have waited in a
+/// queue while another task made progress, so the Scylla adapter must not
+/// rely solely on the observation that originally created the capability.
+pub fn authorize_normal_head_publish<Hash: Q256BitHash>(
+    publish: &SealedNormalHeadPublish<Hash>,
+    allocator: ObservedAuthorityTimestampState,
+) -> Result<(), NormalCommitOrchestrationError> {
+    require_active_lease(publish.manifest.prepared(), allocator)?;
+    Ok(())
+}
+
 /// Classify a real authority-head CAS without allowing the caller to mint a
 /// COMMITTED manifest from arbitrary current state.
 pub fn classify_normal_head_publish<Hash: Q256BitHash>(
@@ -170,7 +182,7 @@ pub fn classify_normal_head_publish<Hash: Q256BitHash>(
     outcome: AuthorityLocalHeadWriteOutcome<Hash>,
     allocator: ObservedAuthorityTimestampState,
 ) -> Result<NormalHeadPublishProgress<Hash>, NormalCommitOrchestrationError> {
-    require_active_lease(publish.manifest.prepared(), allocator)?;
+    authorize_normal_head_publish(&publish, allocator)?;
     let (applied, current_head) = match outcome {
         AuthorityLocalHeadWriteOutcome::Applied(current) => {
             if current != *publish.head_cas.candidate() {

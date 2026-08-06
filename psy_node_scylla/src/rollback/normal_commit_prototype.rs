@@ -21,10 +21,10 @@ use psy_node_core::store::{
         AuthorityManifestIdentity, PreparedAuthorityManifestRecord,
     },
     normal_commit::{
-        classify_normal_head_publish, plan_normal_commit_recovery,
-        seal_verified_normal_commit, NormalCommitOrchestrationError,
-        NormalCommitRecoveryAction, NormalHeadPublishProgress,
-        SealedNormalHeadPublish,
+        authorize_normal_head_publish, classify_normal_head_publish,
+        plan_normal_commit_recovery, seal_verified_normal_commit,
+        NormalCommitOrchestrationError, NormalCommitRecoveryAction,
+        NormalHeadPublishProgress, SealedNormalHeadPublish,
     },
 };
 
@@ -134,13 +134,19 @@ impl<'a> ScyllaNormalCommitMetadataExecutor<'a> {
         publish: SealedNormalHeadPublish<Hash>,
     ) -> Result<NormalHeadPublishProgress<Hash>, NormalCommitMetadataError> {
         let key = publish.head_cas().key();
-        let outcome = self.heads.compare_and_set(publish.head_cas()).await?;
-        let allocator = self
+        let allocator_before = self
             .timestamps
             .read_observed(key)
             .await?
             .ok_or(NormalCommitMetadataError::AllocatorUninitialized)?;
-        classify_normal_head_publish(publish, outcome, allocator)
+        authorize_normal_head_publish(&publish, allocator_before)?;
+        let outcome = self.heads.compare_and_set(publish.head_cas()).await?;
+        let allocator_after = self
+            .timestamps
+            .read_observed(key)
+            .await?
+            .ok_or(NormalCommitMetadataError::AllocatorUninitialized)?;
+        classify_normal_head_publish(publish, outcome, allocator_after)
             .map_err(Into::into)
     }
 
