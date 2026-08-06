@@ -4,10 +4,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 COMPOSE_FILE="${SCRIPT_DIR}/docker-compose.yml"
-REPORT_PATH="${PSY_D03B_REPORT_PATH:-${WORKSPACE_ROOT}/target/d03b-prepared-manifest-rf3-report.json}"
+REPORT_PATH="${PSY_D03D3_REPORT_PATH:-${WORKSPACE_ROOT}/target/d03d3-manifest-lifecycle-rf3-report.json}"
 
 cleanup() {
-  if [[ "${PSY_D03B_KEEP_CLUSTER:-0}" != "1" ]]; then
+  if [[ "${PSY_D03D3_KEEP_CLUSTER:-0}" != "1" ]]; then
     docker compose -f "${COMPOSE_FILE}" down --volumes --remove-orphans
   fi
 }
@@ -31,10 +31,10 @@ done
 mkdir -p "$(dirname "${REPORT_PATH}")"
 cd "${WORKSPACE_ROOT}"
 
-PSY_D03B_RF3=1 \
-PSY_D03B_COMPOSE_FILE="${COMPOSE_FILE}" \
-PSY_D03B_REPORT_PATH="${REPORT_PATH}" \
+PSY_D03D3_RF3=1 \
+PSY_D03D3_COMPOSE_FILE="${COMPOSE_FILE}" \
+PSY_D03D3_REPORT_PATH="${REPORT_PATH}" \
 cargo test -p psy_node_scylla --test rollback_manifest_prepared_rf3_gate \
-  d03b_prepared_manifest_rf3_gate -- --ignored --exact --nocapture
+  d03d3_manifest_lifecycle_rf3_gate -- --ignored --exact --nocapture
 
-echo "D-03b RF=3 report: ${REPORT_PATH}"
+echo "D-03d3 RF=3 report: ${REPORT_PATH}"

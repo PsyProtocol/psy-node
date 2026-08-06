@@ -27,6 +27,12 @@ use psy_node_core::store::{
         AuthorityHeadPayload, AuthorityStateTransition,
         SealedAuthorityCommitIntent,
     },
+    manifest_lifecycle::{
+        AuthorityHeadPayloadDigest, AuthorityHeadPublishDecision,
+        AuthorityHeadView, AuthorityPostWriteObservation,
+        AuthorityProofObservation, CommittedAuthorityManifest,
+        PersistedAuthorityManifest, SealedAuthorityManifest,
+    },
     manifest_record::PreparedManifestWriteOutcome,
     timestamp::CommitWriteTimestampUs,
     typed::{
@@ -38,6 +44,7 @@ use psy_node_scylla::rollback::{
     CanonicalManifestArtifacts, CanonicalPhysicalMutationBatch,
     FullPhysicalDeltaRecord, ManifestArtifactKeyspace,
     ManifestControlNoTabletKeyspace, ManifestPreparedKeyspaces,
+    ManifestLifecycleWriteOutcome,
     OperationalReplayAction, ReplayAuthority, ReplayReceipt,
     ScyllaPreparedManifestStore, VerifiedPreparedManifestPackage,
 };
@@ -54,6 +61,7 @@ use tokio::time::sleep;
 const CONTROL_KEYSPACE: &str = "psy_d03b_rf3_nt";
 const ARTIFACT_KEYSPACE: &str = "psy_d03b_rf3_artifacts";
 const BASELINE: &str = "3f485c776abb8cc3a7ee1dc2ed31d5cf55de0559";
+const D03D3_BASELINE: &str = "42a10414969e37ff307002bdcb11928d4be540ef";
 const IMAGE: &str = "scylladb/scylla@sha256:17496f2dd6e72056d0b0d7e2bd18bd62638872d1d80a5dd9db96ba017fd426fc";
 const CONCURRENT_WRITERS: usize = 32;
 const NODE_IPS: [Ipv4Addr; 3] = [
@@ -154,6 +162,42 @@ fn package(
         .unwrap();
     let prepared = intent.attach_timestamp_lease(reservation.lease()).unwrap();
     VerifiedPreparedManifestPackage::try_new(&prepared, artifacts).unwrap()
+}
+
+fn sealed_package(
+    package: &VerifiedPreparedManifestPackage<PHash>,
+) -> SealedAuthorityManifest<PHash> {
+    let prepared = package.record();
+    SealedAuthorityManifest::verify_and_seal(
+        prepared.clone(),
+        AuthorityPostWriteObservation::new(
+            AuthorityHeadView::candidate(prepared),
+            prepared.intent().artifacts().mutation_digest(),
+            AuthorityHeadPayloadDigest::from_verified_payload_bytes(
+                prepared.intent().head_payload().as_bytes(),
+            ),
+            AuthorityProofObservation::NotApplicableForRealm,
+        ),
+    )
+    .expect("fixture observation is exact")
+}
+
+fn committed_package(
+    sealed: &SealedAuthorityManifest<PHash>,
+    applied: bool,
+) -> CommittedAuthorityManifest<PHash> {
+    let receipt = match sealed
+        .classify_head_cas(applied, *sealed.verified_head())
+        .expect("fixture head observation is exact")
+    {
+        AuthorityHeadPublishDecision::Published(receipt)
+        | AuthorityHeadPublishDecision::Idempotent(receipt) => receipt,
+        other => panic!("unexpected fixture head decision: {other:?}"),
+    };
+    sealed
+        .clone()
+        .mark_committed(receipt)
+        .expect("receipt belongs to fixture manifest")
 }
 
 fn unix_ms() -> anyhow::Result<u64> {
@@ -354,6 +398,26 @@ struct D03bReport {
     concurrent_idempotent: usize,
     concurrent_conflicts: usize,
     offline_write_us: u64,
+    maintenance: MaintenanceTiming,
+    scenarios_passed: Vec<&'static str>,
+    qualification: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct D03d3Report {
+    baseline: &'static str,
+    image: &'static str,
+    scylla_release: String,
+    replication_factor: u8,
+    lifecycle_regular_consistency: &'static str,
+    lifecycle_serial_consistency: &'static str,
+    started_unix_ms: u64,
+    finished_unix_ms: u64,
+    concurrent_writers: usize,
+    concurrent_applied: usize,
+    concurrent_idempotent: usize,
+    concurrent_conflicts: usize,
+    offline_lifecycle_us: u64,
     maintenance: MaintenanceTiming,
     scenarios_passed: Vec<&'static str>,
     qualification: &'static str,
@@ -589,6 +653,239 @@ async fn d03b_prepared_manifest_rf3_gate() -> anyhow::Result<()> {
     };
     std::fs::write(&report_path, serde_json::to_vec_pretty(&report)?)
         .with_context(|| format!("write D-03b report {report_path}"))?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the destructive local three-node Scylla RF=3 harness"]
+async fn d03d3_manifest_lifecycle_rf3_gate() -> anyhow::Result<()> {
+    ensure!(
+        std::env::var("PSY_D03D3_RF3").as_deref() == Ok("1"),
+        "run through tests/rf3/run-d03d3.sh"
+    );
+    let compose_file = std::env::var("PSY_D03D3_COMPOSE_FILE")
+        .context("PSY_D03D3_COMPOSE_FILE is required")?;
+    let report_path = std::env::var("PSY_D03D3_REPORT_PATH")
+        .context("PSY_D03D3_REPORT_PATH is required")?;
+    let started_unix_ms = unix_ms()?;
+    ensure!(
+        cluster_status()?.lines().filter(|line| line.starts_with("UN ")).count()
+            == 3,
+        "RF=3 cluster must start with three UN members"
+    );
+
+    let session = Arc::new(connect().await?);
+    let keyspaces = create_schema(&session).await?;
+    let store = Arc::new(
+        ScyllaPreparedManifestStore::prepare(
+            Arc::clone(&session),
+            keyspaces.clone(),
+        )
+        .await?,
+    );
+    let contract = store.consistency_contract();
+    ensure!(contract.read() == Consistency::Quorum);
+    ensure!(contract.lwt_regular() == Consistency::Quorum);
+
+    let happy = package(9, 51, 0x31, Some(0x61), 2_000_001);
+    ensure!(matches!(
+        store.persist_prepared(&happy).await?,
+        PreparedManifestWriteOutcome::Applied(_)
+    ));
+    let sealed = sealed_package(&happy);
+    let committed_applied = Arc::new(committed_package(&sealed, true));
+    let committed_idempotent = Arc::new(committed_package(&sealed, false));
+    ensure!(
+        committed_applied.lifecycle_digest()
+            != committed_idempotent.lifecycle_digest(),
+        "publication kind must produce conflicting committed payloads"
+    );
+
+    // COMMITTED cannot skip SEALED. The current PREPARED row is returned as
+    // a structured conflict rather than being overwritten.
+    ensure!(matches!(
+        store.advance_to_committed(&committed_applied).await?,
+        ManifestLifecycleWriteOutcome::Conflict {
+            current: PersistedAuthorityManifest::Prepared(_)
+        }
+    ));
+    ensure!(matches!(
+        store.advance_to_sealed(&sealed).await?,
+        ManifestLifecycleWriteOutcome::Applied(
+            PersistedAuthorityManifest::Sealed(_)
+        )
+    ));
+    ensure!(matches!(
+        store.read_lifecycle(*happy.record().identity()).await?,
+        Some(PersistedAuthorityManifest::Sealed(ref current)) if current == &sealed
+    ));
+    ensure!(
+        store.read_manifest(*happy.record().identity()).await.is_err(),
+        "PREPARED-only reader must reject a SEALED row"
+    );
+
+    // M18-style adapter restart: the exact SEALED payload remains readable
+    // and the same transition retry is idempotent.
+    drop(store);
+    drop(session);
+    let restarted_session = Arc::new(connect().await?);
+    let restarted = Arc::new(
+        ScyllaPreparedManifestStore::prepare(
+            Arc::clone(&restarted_session),
+            keyspaces,
+        )
+        .await?,
+    );
+    ensure!(matches!(
+        restarted.advance_to_sealed(&sealed).await?,
+        ManifestLifecycleWriteOutcome::Idempotent(
+            PersistedAuthorityManifest::Sealed(_)
+        )
+    ));
+
+    // Both candidates have the exact same expected SEALED row but differ in
+    // publication-kind payload. Paxos must apply precisely one candidate.
+    let attempts = (0..CONCURRENT_WRITERS).map(|index| {
+        let store = Arc::clone(&restarted);
+        let candidate = if index % 2 == 0 {
+            Arc::clone(&committed_applied)
+        } else {
+            Arc::clone(&committed_idempotent)
+        };
+        async move { store.advance_to_committed(&candidate).await }
+    });
+    let mut applied = 0usize;
+    let mut idempotent = 0usize;
+    let mut conflicts = 0usize;
+    for result in join_all(attempts).await {
+        match result? {
+            ManifestLifecycleWriteOutcome::Applied(_) => applied += 1,
+            ManifestLifecycleWriteOutcome::Idempotent(_) => idempotent += 1,
+            ManifestLifecycleWriteOutcome::Conflict { .. } => conflicts += 1,
+        }
+    }
+    ensure!(applied == 1, "concurrent COMMITTED LWT had {applied} winners");
+    ensure!(
+        applied + idempotent + conflicts == CONCURRENT_WRITERS,
+        "concurrent lifecycle outcome count mismatch"
+    );
+    ensure!(idempotent > 0, "winner had no idempotent retries");
+    ensure!(conflicts > 0, "losing payload had no conflicts");
+
+    let current = restarted
+        .read_lifecycle(*happy.record().identity())
+        .await?
+        .context("committed lifecycle row missing")?;
+    let winner = match &current {
+        PersistedAuthorityManifest::Committed(record)
+            if record == &*committed_applied => &*committed_applied,
+        PersistedAuthorityManifest::Committed(record)
+            if record == &*committed_idempotent => &*committed_idempotent,
+        other => bail!("unexpected committed winner: {other:?}"),
+    };
+    ensure!(matches!(
+        restarted.advance_to_committed(winner).await?,
+        ManifestLifecycleWriteOutcome::Idempotent(_)
+    ));
+    ensure!(matches!(
+        restarted.advance_to_sealed(&sealed).await?,
+        ManifestLifecycleWriteOutcome::Conflict {
+            current: PersistedAuthorityManifest::Committed(_)
+        }
+    ));
+    assert_artifacts(
+        &happy,
+        &restarted.load_verified_artifacts(current.prepared()).await?,
+    )?;
+
+    // QUORUM lifecycle transitions remain available with one replica down.
+    compose(
+        Path::new(&compose_file),
+        &["stop", "--timeout", "30", "scylla3"],
+        "stop one D-03d3 replica",
+    )?;
+    sleep(Duration::from_secs(3)).await;
+    let offline = package(9, 52, 0x32, Some(0x62), 2_000_002);
+    let offline_started = Instant::now();
+    ensure!(matches!(
+        restarted.persist_prepared(&offline).await?,
+        PreparedManifestWriteOutcome::Applied(_)
+    ));
+    let offline_sealed = sealed_package(&offline);
+    ensure!(matches!(
+        restarted.advance_to_sealed(&offline_sealed).await?,
+        ManifestLifecycleWriteOutcome::Applied(_)
+    ));
+    let offline_committed = committed_package(&offline_sealed, true);
+    ensure!(matches!(
+        restarted.advance_to_committed(&offline_committed).await?,
+        ManifestLifecycleWriteOutcome::Applied(_)
+    ));
+    let offline_lifecycle_us = offline_started.elapsed().as_micros() as u64;
+    // Lost-success-response model: exact retry reads the candidate and is
+    // idempotent while the third replica is still offline.
+    ensure!(matches!(
+        restarted.advance_to_committed(&offline_committed).await?,
+        ManifestLifecycleWriteOutcome::Idempotent(_)
+    ));
+    compose(
+        Path::new(&compose_file),
+        &["start", "scylla3"],
+        "restart D-03d3 replica",
+    )?;
+    wait_for_three_up_normal().await?;
+    let maintenance = repair_flush_compact_all()?;
+
+    let repaired = restarted
+        .read_lifecycle(*offline.record().identity())
+        .await?
+        .context("offline lifecycle missing after repair")?;
+    ensure!(
+        repaired
+            == PersistedAuthorityManifest::Committed(offline_committed.clone()),
+        "lifecycle changed after repair/flush/compact"
+    );
+    assert_artifacts(
+        &offline,
+        &restarted.load_verified_artifacts(repaired.prepared()).await?,
+    )?;
+
+    let scylla_release = docker_exec(
+        NODE_CONTAINERS[0],
+        &["scylla", "--version"],
+        "read Scylla version",
+    )?
+    .trim()
+    .to_owned();
+    let report = D03d3Report {
+        baseline: D03D3_BASELINE,
+        image: IMAGE,
+        scylla_release,
+        replication_factor: 3,
+        lifecycle_regular_consistency: "QUORUM",
+        lifecycle_serial_consistency: "LOCAL_SERIAL",
+        started_unix_ms,
+        finished_unix_ms: unix_ms()?,
+        concurrent_writers: CONCURRENT_WRITERS,
+        concurrent_applied: applied,
+        concurrent_idempotent: idempotent,
+        concurrent_conflicts: conflicts,
+        offline_lifecycle_us,
+        maintenance,
+        scenarios_passed: vec![
+            "COMMITTED cannot skip PREPARED to SEALED",
+            "PREPARED to SEALED survives adapter restart",
+            "same expected SEALED has one conflicting COMMITTED winner",
+            "exact lifecycle retry is idempotent",
+            "stale SEALED transition conflicts with COMMITTED",
+            "one replica offline supports PREPARED to SEALED to COMMITTED",
+            "repair flush compact preserves strict lifecycle decode and artifacts",
+        ],
+        qualification: "D-03d3 isolated manifest lifecycle RF=3 gate only; no production state writer, authority-head CAS, processor recovery, archive, or executor wiring",
+    };
+    std::fs::write(&report_path, serde_json::to_vec_pretty(&report)?)
+        .with_context(|| format!("write D-03d3 report {report_path}"))?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }
