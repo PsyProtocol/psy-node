@@ -72,6 +72,7 @@ pub enum TimestampPrototypeQueryId {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PrototypeBindValue {
     TinyInt(i8),
+    SmallInt(i16),
     BigInt(i64),
     Blob(Vec<u8>),
 }
@@ -80,6 +81,7 @@ impl PrototypeBindValue {
     fn shape_name(&self) -> &'static str {
         match self {
             Self::TinyInt(_) => "TINYINT",
+            Self::SmallInt(_) => "SMALLINT",
             Self::BigInt(_) => "BIGINT",
             Self::Blob(_) => "BLOB",
         }

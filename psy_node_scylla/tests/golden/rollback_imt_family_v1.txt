@@ -1,0 +1,18 @@
+LeafPut
+INSERT INTO psy_d02t6.imt_leaf_table (tree_id, tree_sub_id, leaf_index, checkpoint_id, leaf_hash, leaf_key, leaf_value, next_key, next_index) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) USING TIMESTAMP ?
+tree_id:BIGINT,tree_sub_id:BIGINT,leaf_index:BIGINT,checkpoint_id:BIGINT,leaf_hash:BLOB,leaf_key:BLOB,leaf_value:BLOB,next_key:BLOB,next_index:BIGINT,write_timestamp_us:BIGINT
+LeafPointDelete
+DELETE FROM psy_d02t6.imt_leaf_table USING TIMESTAMP ? WHERE tree_id = ? AND tree_sub_id = ? AND leaf_index = ? AND checkpoint_id = ?
+delete_fence_us:BIGINT,tree_id:BIGINT,tree_sub_id:BIGINT,leaf_index:BIGINT,checkpoint_id:BIGINT
+LeafBoundedRangeDelete
+DELETE FROM psy_d02t6.imt_leaf_table USING TIMESTAMP ? WHERE tree_id = ? AND tree_sub_id = ? AND leaf_index = ? AND checkpoint_id > ? AND checkpoint_id <= ?
+delete_fence_us:BIGINT,tree_id:BIGINT,tree_sub_id:BIGINT,leaf_index:BIGINT,target_exclusive:BIGINT,old_head_inclusive:BIGINT
+IndexPut
+INSERT INTO psy_d02t6.imt_key_index_table (tree_id, tree_sub_id, key_bucket, encoded_key, leaf_key, birth_checkpoint, leaf_index) VALUES (?, ?, ?, ?, ?, ?, ?) USING TIMESTAMP ?
+tree_id:BIGINT,tree_sub_id:BIGINT,key_bucket:SMALLINT,encoded_key:BLOB,leaf_key:BLOB,birth_checkpoint:BIGINT,leaf_index:BIGINT,write_timestamp_us:BIGINT
+IndexPointDelete
+DELETE FROM psy_d02t6.imt_key_index_table USING TIMESTAMP ? WHERE tree_id = ? AND tree_sub_id = ? AND key_bucket = ? AND encoded_key = ?
+delete_fence_us:BIGINT,tree_id:BIGINT,tree_sub_id:BIGINT,key_bucket:SMALLINT,encoded_key:BLOB
+CursorPut
+INSERT INTO psy_d02t6.imt_next_append_index_table (tree_id, tree_sub_id, next_append_index) VALUES (?, ?, ?) USING TIMESTAMP ?
+tree_id:BIGINT,tree_sub_id:BIGINT,next_append_index:BIGINT,write_timestamp_us:BIGINT
