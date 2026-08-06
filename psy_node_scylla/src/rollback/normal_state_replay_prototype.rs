@@ -1,11 +1,12 @@
 //! Representative D-04b2 state replay and verification boundary.
 //!
-//! This prototype deliberately supports only Realm `global_user_tree_table`
-//! PUTs carried directly by the durable prepared payload. It proves the
-//! important normal-commit property without pretending that all 35 physical
-//! tables have replay adapters: every exact physical row is read back, the
-//! committed root row is compared independently, and only then can an
-//! [`AuthorityPostWriteObservation`] be produced for SEALED.
+//! This prototype supports Realm `global_user_tree_table` PUTs plus the
+//! derived latest-checkpoint singleton carried by a durable supplement. It
+//! proves that root-covered and root-independent rows share one recovery
+//! boundary without pretending that all 35 physical tables have replay
+//! adapters: every exact physical row is read back, the committed root row is
+//! compared independently, and only then can an [`AuthorityPostWriteObservation`]
+//! be produced for SEALED.
 
 use std::{error::Error, fmt};
 
@@ -30,7 +31,7 @@ use super::{
 use super::ReplayRecordKind;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct ExpectedMerkleRow {
+struct ExpectedStateRow {
     sealed: SealedTimestampedPut,
     value: Vec<u8>,
     is_root: bool,
@@ -43,7 +44,7 @@ struct ExpectedMerkleRow {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RepresentativeRealmStateReplayPlan<Hash> {
     prepared: PreparedAuthorityManifestRecord<Hash>,
-    rows: Vec<ExpectedMerkleRow>,
+    rows: Vec<ExpectedStateRow>,
     mutation_digest: [u8; 32],
 }
 
@@ -139,64 +140,85 @@ impl<Hash: Q256BitHash> RepresentativeRealmStateReplayPlan<Hash> {
 
         for resolved in batch.mutations() {
             let mutation = resolved.mutation();
-            if mutation.physical_table() != ScyllaPhysicalTableId::GlobalUserTree {
-                return Err(RepresentativeStateReplayError::UnsupportedPhysicalTable(
-                    mutation.physical_table(),
-                ));
+            match mutation.physical_table() {
+                ScyllaPhysicalTableId::GlobalUserTree => {
+                    let (node, checkpoint) = match mutation.key() {
+                        TypedTableKey::GlobalUserMerkle { node, checkpoint } => (*node, *checkpoint),
+                        _ => return Err(RepresentativeStateReplayError::WrongTypedKey),
+                    };
+                    if checkpoint.get() != expected_checkpoint {
+                        return Err(RepresentativeStateReplayError::StateCheckpointMismatch {
+                            expected: expected_checkpoint,
+                            actual: checkpoint.get(),
+                        });
+                    }
+                    let value = match mutation.operation() {
+                        MutationOperation::Put(MutationValue::PsyCanonicalBytes(value)) => value.clone(),
+                        MutationOperation::Put(_) => return Err(RepresentativeStateReplayError::WrongValueEncoding),
+                        MutationOperation::Delete => return Err(RepresentativeStateReplayError::DeleteNotSupported),
+                    };
+                    if value.len() != 32 {
+                        return Err(RepresentativeStateReplayError::InvalidMerkleValueLength(value.len()));
+                    }
+                    let is_root = node.level() == 0 && node.index().get() == 0;
+                    if is_root {
+                        root_count += 1;
+                        if value != expected_root {
+                            return Err(RepresentativeStateReplayError::ManifestRootMismatch);
+                        }
+                    }
+                    let sealed = seal_commit_put(
+                        LogicalMutation::Put {
+                            key: mutation.key().clone(),
+                            value: MutationValue::PsyCanonicalBytes(value.clone()),
+                        },
+                        prepared.commit_write_timestamp(),
+                    )?;
+                    rows.push(ExpectedStateRow { sealed, value, is_root });
+                }
+                ScyllaPhysicalTableId::U64Singleton => {
+                    if !matches!(mutation.key(), TypedTableKey::U64Singleton(_)) {
+                        return Err(RepresentativeStateReplayError::WrongTypedKey);
+                    }
+                    let value = match mutation.operation() {
+                        MutationOperation::Put(MutationValue::CqlU64(value)) => *value,
+                        MutationOperation::Put(_) => return Err(RepresentativeStateReplayError::WrongValueEncoding),
+                        MutationOperation::Delete => return Err(RepresentativeStateReplayError::DeleteNotSupported),
+                    };
+                    if value != expected_checkpoint {
+                        return Err(RepresentativeStateReplayError::StateCheckpointMismatch {
+                            expected: expected_checkpoint,
+                            actual: value,
+                        });
+                    }
+                    let sealed = seal_commit_put(
+                        LogicalMutation::Put {
+                            key: mutation.key().clone(),
+                            value: MutationValue::CqlU64(value),
+                        },
+                        prepared.commit_write_timestamp(),
+                    )?;
+                    rows.push(ExpectedStateRow { sealed, value: value.to_be_bytes().to_vec(), is_root: false });
+                }
+                other => return Err(RepresentativeStateReplayError::UnsupportedPhysicalTable(other)),
             }
-            let (node, checkpoint) = match mutation.key() {
-                TypedTableKey::GlobalUserMerkle { node, checkpoint } => {
-                    (*node, *checkpoint)
-                }
-                _ => return Err(RepresentativeStateReplayError::WrongTypedKey),
-            };
-            if checkpoint.get() != expected_checkpoint {
-                return Err(RepresentativeStateReplayError::StateCheckpointMismatch {
-                    expected: expected_checkpoint,
-                    actual: checkpoint.get(),
-                });
-            }
-            let value = match mutation.operation() {
-                MutationOperation::Put(MutationValue::PsyCanonicalBytes(value)) => {
-                    value.clone()
-                }
-                MutationOperation::Put(_) => {
-                    return Err(RepresentativeStateReplayError::WrongValueEncoding)
-                }
-                MutationOperation::Delete => {
-                    return Err(RepresentativeStateReplayError::DeleteNotSupported)
-                }
-            };
-            if value.len() != 32 {
-                return Err(RepresentativeStateReplayError::InvalidMerkleValueLength(
-                    value.len(),
-                ));
-            }
-            let is_root = node.level() == 0 && node.index().get() == 0;
-            if is_root {
-                root_count += 1;
-                if value != expected_root {
-                    return Err(RepresentativeStateReplayError::ManifestRootMismatch);
-                }
-            }
-            let sealed = seal_commit_put(
-                LogicalMutation::Put {
-                    key: mutation.key().clone(),
-                    value: MutationValue::PsyCanonicalBytes(value.clone()),
-                },
-                prepared.commit_write_timestamp(),
-            )?;
-            rows.push(ExpectedMerkleRow {
-                sealed,
-                value,
-                is_root,
-            });
         }
         if root_count != 1 {
             return Err(RepresentativeStateReplayError::ExpectedExactlyOneRoot {
                 actual: root_count,
             });
         }
+
+        // Keep mutable singleton metadata behind all root-covered state rows.
+        // The manifest digest remains over the canonical physical batch; this
+        // ordering is only the deterministic execution order.  The durable
+        // authority head remains the actual final publish marker.
+        rows.sort_by_key(|row| {
+            matches!(
+                row.sealed.resolved().mutation().physical_table(),
+                ScyllaPhysicalTableId::U64Singleton
+            )
+        });
 
         Ok(Self {
             prepared: prepared.clone(),
@@ -307,7 +329,15 @@ impl<'a> RepresentativeRealmStateReplayExecutor<'a> {
             });
         }
         for sealed in plan.puts().take(count) {
-            self.store.put_global_user_merkle(sealed).await?;
+            match sealed.resolved().mutation().physical_table() {
+                ScyllaPhysicalTableId::GlobalUserTree => {
+                    self.store.put_global_user_merkle(sealed).await?;
+                }
+                ScyllaPhysicalTableId::U64Singleton => {
+                    self.store.put_latest_checkpoint(sealed).await?;
+                }
+                other => return Err(RepresentativeStateReplayError::UnsupportedPhysicalTable(other).into()),
+            }
         }
         Ok(())
     }
@@ -318,7 +348,16 @@ impl<'a> RepresentativeRealmStateReplayExecutor<'a> {
     ) -> Result<Vec<Option<Vec<u8>>>, RepresentativeStateExecutionError> {
         let mut observed = Vec::with_capacity(plan.mutation_count());
         for sealed in plan.puts() {
-            observed.push(self.store.read_global_user_merkle_exact(sealed).await?);
+            let value = match sealed.resolved().mutation().physical_table() {
+                ScyllaPhysicalTableId::GlobalUserTree => self.store.read_global_user_merkle_exact(sealed).await?,
+                ScyllaPhysicalTableId::U64Singleton => self
+                    .store
+                    .read_latest_checkpoint_exact(sealed)
+                    .await?
+                    .map(|value| value.to_be_bytes().to_vec()),
+                other => return Err(RepresentativeStateReplayError::UnsupportedPhysicalTable(other).into()),
+            };
+            observed.push(value);
         }
         Ok(observed)
     }
@@ -430,7 +469,7 @@ mod tests {
         timestamp::CommitWriteTimestampUs,
         typed::{
             CheckpointId as StorageCheckpointId, LogicalMutation, MerkleNode,
-            MutationValue, NodeIndex, TypedTableKey,
+            MutationValue, NodeIndex, TypedTableKey, U64SingletonSlot,
         },
     };
 
@@ -465,6 +504,7 @@ mod tests {
     fn fixture() -> (
         VerifiedPreparedManifestPackage<PHash>,
         Vec<u8>,
+        CanonicalPhysicalMutationBatch,
     ) {
         let checkpoint = StorageCheckpointId::try_new(41).unwrap();
         let root = MerkleNode::new(0, NodeIndex::new(0));
@@ -492,6 +532,12 @@ mod tests {
             PreparedPayloadSource::ContentAddressedBytes(&payload_bytes),
         )
         .unwrap();
+        let singleton = LogicalMutation::Put {
+            key: TypedTableKey::U64Singleton(
+                U64SingletonSlot::LatestCheckpoint,
+            ),
+            value: MutationValue::CqlU64(checkpoint.get()),
+        };
         let logical = vec![
             LogicalMutation::Put {
                 key: TypedTableKey::GlobalUserMerkle {
@@ -507,16 +553,17 @@ mod tests {
                 },
                 value: MutationValue::PsyCanonicalBytes(vec![5; 32]),
             },
+            singleton.clone(),
         ];
         let full = CanonicalPhysicalMutationBatch::from_logical(logical).unwrap();
         let compact = PreparedReferencePlusSupplementRecord::try_v1(
             reference,
-            DerivedSupplementBatch::from_logical(Vec::new()).unwrap(),
+            DerivedSupplementBatch::from_logical(vec![singleton]).unwrap(),
             ReplayReceipt::new(
                 ReplayAuthority::Realm,
                 checkpoint,
                 2,
-                0,
+                1,
                 vec![OperationalReplayAction::RotatePendingCheckpointNamespace],
             ),
             &payload_bytes,
@@ -564,17 +611,17 @@ mod tests {
             VerifiedPreparedManifestPackage::try_new(&prepared, artifacts)
                 .unwrap(),
             payload_bytes,
+            full,
         )
     }
 
     fn plan() -> RepresentativeRealmStateReplayPlan<PHash> {
-        let (package, payload) = fixture();
+        let (package, _, full) = fixture();
         let set = package.artifacts().chunked().unwrap();
-        RepresentativeRealmStateReplayPlan::try_from_verified_parts(
+        RepresentativeRealmStateReplayPlan::try_from_expanded_batch(
             package.record(),
-            Some(set.replay_record_kind()),
             *set.mutation_digest(),
-            Some(&payload),
+            full,
         )
         .unwrap()
     }
@@ -582,7 +629,16 @@ mod tests {
     #[test]
     fn compact_payload_becomes_exact_timestamped_replay_and_seal_evidence() {
         let plan = plan();
-        assert_eq!(plan.mutation_count(), 2);
+        assert_eq!(plan.mutation_count(), 3);
+        assert_eq!(
+            plan.puts()
+                .last()
+                .unwrap()
+                .resolved()
+                .mutation()
+                .physical_table(),
+            ScyllaPhysicalTableId::U64Singleton
+        );
         assert_eq!(
             plan.mutation_digest(),
             &plan.prepared().intent().artifacts().mutation_digest()
@@ -638,7 +694,15 @@ mod tests {
             Err(RepresentativeStateReplayError::ObservedRootMismatch)
         );
 
-        let child_index = plan.rows.iter().position(|row| !row.is_root).unwrap();
+        let child_index = plan
+            .rows
+            .iter()
+            .position(|row| {
+                !row.is_root
+                    && row.sealed.resolved().mutation().physical_table()
+                        == ScyllaPhysicalTableId::GlobalUserTree
+            })
+            .unwrap();
         let mut wrong_child = complete;
         wrong_child[child_index] = Some(vec![0xDD; 32]);
         assert_eq!(
@@ -650,8 +714,44 @@ mod tests {
     }
 
     #[test]
+    fn singleton_supplement_is_required_even_when_every_merkle_row_matches() {
+        let plan = plan();
+        let singleton_index = plan
+            .rows
+            .iter()
+            .position(|row| {
+                row.sealed.resolved().mutation().physical_table()
+                    == ScyllaPhysicalTableId::U64Singleton
+            })
+            .unwrap();
+        let complete = plan
+            .rows
+            .iter()
+            .map(|row| Some(row.value.clone()))
+            .collect::<Vec<_>>();
+
+        let mut missing = complete.clone();
+        missing[singleton_index] = None;
+        assert_eq!(
+            plan.verify_observed_rows(&missing),
+            Err(RepresentativeStateReplayError::PhysicalRowMissing {
+                index: singleton_index,
+            })
+        );
+
+        let mut wrong = complete;
+        wrong[singleton_index] = Some(40_u64.to_be_bytes().to_vec());
+        assert_eq!(
+            plan.verify_observed_rows(&wrong),
+            Err(RepresentativeStateReplayError::PhysicalRowValueMismatch {
+                index: singleton_index,
+            })
+        );
+    }
+
+    #[test]
     fn payload_not_covering_manifest_fails_before_any_put_is_executable() {
-        let (package, payload) = fixture();
+        let (package, payload, _) = fixture();
         assert_eq!(
             RepresentativeRealmStateReplayPlan::try_from_verified_parts(
                 package.record(),
@@ -667,7 +767,7 @@ mod tests {
 
     #[test]
     fn unsupported_replay_kind_and_missing_payload_fail_closed() {
-        let (package, _) = fixture();
+        let (package, _, _) = fixture();
         let digest = package.record().intent().artifacts().mutation_digest();
         assert_eq!(
             RepresentativeRealmStateReplayPlan::try_from_verified_parts(

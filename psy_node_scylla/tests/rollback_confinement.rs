@@ -4,7 +4,7 @@ use psy_node_core::store::{
     timestamp::CommitWriteTimestampUs,
     typed::{
         CheckpointId, CheckpointLeafKey, CheckpointedObjectKey, LogicalMutation, MerkleNode,
-        MutationValue, NodeIndex, TypedTableKey,
+        MutationValue, NodeIndex, TypedTableKey, U64SingletonSlot,
     },
 };
 use psy_node_scylla::rollback::*;
@@ -39,18 +39,33 @@ async fn representative_writes_cross_only_the_typed_store_boundary() {
     let store = RollbackableStorePrototype::recording();
     let leaf = seal_commit_put(checkpoint_leaf_intent(9, &[1, 2, 3]), timestamp(1_000)).unwrap();
     let merkle = seal_commit_put(global_user_intent(7, 11, 9, [5; 32]), timestamp(1_001)).unwrap();
+    let singleton = seal_commit_put(
+        LogicalMutation::Put {
+            key: TypedTableKey::U64Singleton(U64SingletonSlot::LatestCheckpoint),
+            value: MutationValue::CqlU64(9),
+        },
+        timestamp(1_002),
+    )
+    .unwrap();
 
     let leaf_receipt = store.put_checkpoint_leaf(&leaf).await.unwrap();
     let merkle_receipt = store.put_global_user_merkle(&merkle).await.unwrap();
+    let singleton_receipt = store.put_latest_checkpoint(&singleton).await.unwrap();
     assert_eq!(leaf_receipt.physical_table(), ScyllaPhysicalTableId::CheckpointLeaf);
-    assert_eq!(leaf_receipt.query_id(), TimestampPrototypeQueryId::CheckpointLeafPut);
+    assert_eq!(leaf_receipt.query_id(), ConfinedWriteQueryId::TimestampPrototype(TimestampPrototypeQueryId::CheckpointLeafPut));
     assert_eq!(leaf_receipt.canonical_mutation(), leaf.canonical_bytes());
     assert_eq!(merkle_receipt.physical_table(), ScyllaPhysicalTableId::GlobalUserTree);
-    assert_eq!(merkle_receipt.query_id(), TimestampPrototypeQueryId::GlobalUserMerklePut);
+    assert_eq!(merkle_receipt.query_id(), ConfinedWriteQueryId::TimestampPrototype(TimestampPrototypeQueryId::GlobalUserMerklePut));
     assert_eq!(merkle_receipt.canonical_mutation(), merkle.canonical_bytes());
+    assert_eq!(singleton_receipt.physical_table(), ScyllaPhysicalTableId::U64Singleton);
+    assert_eq!(
+        singleton_receipt.query_id(),
+        ConfinedWriteQueryId::MutableSingleton(MutableSingletonQueryKind::LatestCheckpointPut)
+    );
+    assert_eq!(singleton_receipt.canonical_mutation(), singleton.canonical_bytes());
 
     let calls = store.recorded_calls().unwrap();
-    assert_eq!(calls, vec![leaf_receipt, merkle_receipt]);
+    assert_eq!(calls, vec![leaf_receipt, merkle_receipt, singleton_receipt]);
 }
 
 #[tokio::test]
@@ -234,14 +249,14 @@ fn lexical_inventory_is_stable_and_nontrivial() {
     assert_eq!(
         total,
         RawScyllaAccessCounts {
-            session_type: 693,
+            session_type: 694,
             session_builder: 45,
-            session_field_access: 159,
-            prepared_statement: 230,
+            session_field_access: 162,
+            prepared_statement: 231,
             prepare_call: 134,
-            execute_call: 245,
-            query_call: 109,
-            direct_cql: 341,
+            execute_call: 246,
+            query_call: 112,
+            direct_cql: 345,
         }
     );
 }

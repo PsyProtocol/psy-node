@@ -36,14 +36,22 @@ use scylla::{client::session::Session, statement::Consistency};
 
 use super::{
     CheckpointLeafPutBinding, CqlKeyspaceName, GlobalUserMerklePutBinding, PrototypeBindValue,
+    MutableSingletonAdapter, MutableSingletonPlanError, MutableSingletonQueryKind,
     ScyllaPhysicalTableId, SealedTimestampedPut, TimestampPrototypeAdapter,
     TimestampPrototypePlanError, TimestampPrototypeQueryId,
+    U64SingletonBeforeImage, U64SingletonTransitionPlan,
 };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConfinedWriteQueryId {
+    TimestampPrototype(TimestampPrototypeQueryId),
+    MutableSingleton(MutableSingletonQueryKind),
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConfinedWriteReceipt {
     physical_table: ScyllaPhysicalTableId,
-    query_id: TimestampPrototypeQueryId,
+    query_id: ConfinedWriteQueryId,
     bind_values: Vec<PrototypeBindValue>,
     canonical_mutation: Vec<u8>,
 }
@@ -53,7 +61,7 @@ impl ConfinedWriteReceipt {
         self.physical_table
     }
 
-    pub const fn query_id(&self) -> TimestampPrototypeQueryId {
+    pub const fn query_id(&self) -> ConfinedWriteQueryId {
         self.query_id
     }
 
@@ -69,20 +77,24 @@ impl ConfinedWriteReceipt {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RollbackableStorePrototypeError {
     TypedPlan(TimestampPrototypePlanError),
+    MutableSingletonPlan(MutableSingletonPlanError),
     Driver(String),
     RecordingLockPoisoned,
     NotARecordingStore,
     ExactReadRequiresScylla,
+    CheckpointOutOfRange(u64),
 }
 
 impl fmt::Display for RollbackableStorePrototypeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::TypedPlan(error) => error.fmt(f),
+            Self::MutableSingletonPlan(error) => error.fmt(f),
             Self::Driver(error) => write!(f, "Scylla prototype adapter failed: {error}"),
             Self::RecordingLockPoisoned => write!(f, "recording prototype lock is poisoned"),
             Self::NotARecordingStore => write!(f, "prepared Scylla stores do not expose an in-memory recording"),
             Self::ExactReadRequiresScylla => write!(f, "exact physical read requires the confined Scylla backend"),
+            Self::CheckpointOutOfRange(value) => write!(f, "singleton checkpoint {value} is outside the typed CQL range"),
         }
     }
 }
@@ -95,9 +107,16 @@ impl From<TimestampPrototypePlanError> for RollbackableStorePrototypeError {
     }
 }
 
+impl From<MutableSingletonPlanError> for RollbackableStorePrototypeError {
+    fn from(value: MutableSingletonPlanError) -> Self {
+        Self::MutableSingletonPlan(value)
+    }
+}
+
 struct PrivateScyllaBackend {
     session: Arc<Session>,
     adapter: TimestampPrototypeAdapter,
+    mutable_singleton: MutableSingletonAdapter,
 }
 
 enum PrivateStoreBackend {
@@ -129,10 +148,13 @@ impl RollbackableStorePrototype {
         keyspace: CqlKeyspaceName,
         consistency: Consistency,
     ) -> Result<Self, RollbackableStorePrototypeError> {
-        let adapter = TimestampPrototypeAdapter::prepare_with_consistency(&session, keyspace, consistency)
+        let adapter = TimestampPrototypeAdapter::prepare_with_consistency(&session, keyspace.clone(), consistency)
             .await
             .map_err(|error| RollbackableStorePrototypeError::Driver(error.to_string()))?;
-        Ok(Self { backend: PrivateStoreBackend::Scylla(PrivateScyllaBackend { session, adapter }) })
+        let mutable_singleton = MutableSingletonAdapter::prepare_with_consistency(&session, keyspace, consistency)
+            .await
+            .map_err(|error| RollbackableStorePrototypeError::Driver(error.to_string()))?;
+        Ok(Self { backend: PrivateStoreBackend::Scylla(PrivateScyllaBackend { session, adapter, mutable_singleton }) })
     }
 
     pub async fn put_checkpoint_leaf(
@@ -142,7 +164,7 @@ impl RollbackableStorePrototype {
         let binding = CheckpointLeafPutBinding::try_from_sealed(sealed)?;
         let receipt = ConfinedWriteReceipt {
             physical_table: ScyllaPhysicalTableId::CheckpointLeaf,
-            query_id: TimestampPrototypeQueryId::CheckpointLeafPut,
+            query_id: ConfinedWriteQueryId::TimestampPrototype(TimestampPrototypeQueryId::CheckpointLeafPut),
             bind_values: binding.bind_values(),
             canonical_mutation: sealed.canonical_bytes().to_vec(),
         };
@@ -166,7 +188,7 @@ impl RollbackableStorePrototype {
         let binding = GlobalUserMerklePutBinding::try_from_sealed(sealed)?;
         let receipt = ConfinedWriteReceipt {
             physical_table: ScyllaPhysicalTableId::GlobalUserTree,
-            query_id: TimestampPrototypeQueryId::GlobalUserMerklePut,
+            query_id: ConfinedWriteQueryId::TimestampPrototype(TimestampPrototypeQueryId::GlobalUserMerklePut),
             bind_values: binding.bind_values(),
             canonical_mutation: sealed.canonical_bytes().to_vec(),
         };
@@ -201,6 +223,78 @@ impl RollbackableStorePrototype {
                 .map_err(|error| {
                     RollbackableStorePrototypeError::Driver(error.to_string())
                 }),
+        }
+    }
+
+    pub async fn put_latest_checkpoint(
+        &self,
+        sealed: &SealedTimestampedPut,
+    ) -> Result<ConfinedWriteReceipt, RollbackableStorePrototypeError> {
+        let mutation = sealed.resolved().mutation();
+        let checkpoint = match (mutation.key(), mutation.operation()) {
+            (
+                psy_node_core::store::typed::TypedTableKey::U64Singleton(_),
+                psy_node_core::store::typed::MutationOperation::Put(
+                    psy_node_core::store::typed::MutationValue::CqlU64(value),
+                ),
+            ) => psy_node_core::store::typed::CheckpointId::try_new(*value)
+                .map_err(|_| RollbackableStorePrototypeError::CheckpointOutOfRange(*value))?,
+            _ => return Err(MutableSingletonPlanError::WrongTypedKey.into()),
+        };
+        let before = match &self.backend {
+            PrivateStoreBackend::Recording(_) => U64SingletonBeforeImage::Absent,
+            PrivateStoreBackend::Scylla(backend) => backend
+                .mutable_singleton
+                .read_latest_checkpoint(&backend.session)
+                .await
+                .map_err(|error| RollbackableStorePrototypeError::Driver(error.to_string()))?
+                .map_or(U64SingletonBeforeImage::Absent, |value| U64SingletonBeforeImage::Present(value.get())),
+        };
+        let plan = U64SingletonTransitionPlan::try_for_commit(sealed, checkpoint, before)?;
+        let receipt = ConfinedWriteReceipt {
+            physical_table: ScyllaPhysicalTableId::U64Singleton,
+            query_id: ConfinedWriteQueryId::MutableSingleton(MutableSingletonQueryKind::LatestCheckpointPut),
+            bind_values: plan.put().bind_values(),
+            canonical_mutation: sealed.canonical_bytes().to_vec(),
+        };
+        match &self.backend {
+            PrivateStoreBackend::Recording(_) => self.record(receipt),
+            PrivateStoreBackend::Scylla(backend) => {
+                backend
+                    .mutable_singleton
+                    .put_latest_checkpoint(&backend.session, &plan)
+                    .await
+                    .map_err(|error| RollbackableStorePrototypeError::Driver(error.to_string()))?;
+                Ok(receipt)
+            }
+        }
+    }
+
+    pub async fn read_latest_checkpoint_exact(
+        &self,
+        sealed: &SealedTimestampedPut,
+    ) -> Result<Option<u64>, RollbackableStorePrototypeError> {
+        let mutation = sealed.resolved().mutation();
+        if !matches!(
+            (mutation.physical_table(), mutation.key(), mutation.operation()),
+            (
+                ScyllaPhysicalTableId::U64Singleton,
+                psy_node_core::store::typed::TypedTableKey::U64Singleton(_),
+                psy_node_core::store::typed::MutationOperation::Put(
+                    psy_node_core::store::typed::MutationValue::CqlU64(_)
+                )
+            )
+        ) {
+            return Err(MutableSingletonPlanError::WrongTypedKey.into());
+        }
+        match &self.backend {
+            PrivateStoreBackend::Recording(_) => Err(RollbackableStorePrototypeError::ExactReadRequiresScylla),
+            PrivateStoreBackend::Scylla(backend) => backend
+                .mutable_singleton
+                .read_latest_checkpoint(&backend.session)
+                .await
+                .map(|value| value.map(|checkpoint| checkpoint.get()))
+                .map_err(|error| RollbackableStorePrototypeError::Driver(error.to_string())),
         }
     }
 

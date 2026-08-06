@@ -51,6 +51,7 @@ use psy_node_core::store::{
     typed::{
         CheckpointId as StorageCheckpointId, LogicalMutation, MerkleNode,
         MutationOperation, MutationValue, NodeIndex, TypedTableKey,
+        U64SingletonSlot,
     },
 };
 use scylla::{
@@ -68,7 +69,8 @@ use tokio::time::sleep;
 
 use super::*;
 use crate::utils::{
-    convert_checkpoint_id_to_i64, u64_to_i64_exact, u8_to_i8_exact,
+    convert_checkpoint_id_to_i64, i64_to_u64_exact, u64_to_i64_exact,
+    u8_to_i8_exact,
 };
 
 const CONTROL_KEYSPACE: &str = "psy_d04b2c_rf3_nt";
@@ -220,7 +222,7 @@ fn fixture_from_seeds(
         PreparedPayloadSource::ContentAddressedBytes(&payload_bytes),
     )
     .unwrap();
-    let logical = semantic
+    let mut logical = semantic
         .iter()
         .map(|(node, value_seed)| LogicalMutation::Put {
             key: TypedTableKey::GlobalUserMerkle {
@@ -229,16 +231,23 @@ fn fixture_from_seeds(
             },
             value: MutationValue::PsyCanonicalBytes(vec![*value_seed; 32]),
         })
-        .collect();
+        .collect::<Vec<_>>();
+    let latest_checkpoint = LogicalMutation::Put {
+        key: TypedTableKey::U64Singleton(
+            U64SingletonSlot::LatestCheckpoint,
+        ),
+        value: MutationValue::CqlU64(checkpoint.get()),
+    };
+    logical.push(latest_checkpoint.clone());
     let full = CanonicalPhysicalMutationBatch::from_logical(logical).unwrap();
     let compact = PreparedReferencePlusSupplementRecord::try_v1(
         reference,
-        DerivedSupplementBatch::from_logical(Vec::new()).unwrap(),
+        DerivedSupplementBatch::from_logical(vec![latest_checkpoint]).unwrap(),
         ReplayReceipt::new(
             ReplayAuthority::Realm,
             checkpoint,
             3,
-            0,
+            1,
             vec![OperationalReplayAction::RotatePendingCheckpointNamespace],
         ),
         &payload_bytes,
@@ -385,6 +394,25 @@ async fn create_schema(session: &Session) -> anyhow::Result<()> {
         .query_unpaged(
             format!(
                 "CREATE TABLE IF NOT EXISTS {STATE_KEYSPACE}.global_user_tree_table (level TINYINT, node_index BIGINT, checkpoint_id BIGINT, value BLOB, PRIMARY KEY ((level), node_index, checkpoint_id)) WITH CLUSTERING ORDER BY (node_index ASC, checkpoint_id DESC)"
+            ),
+            &[],
+        )
+        .await?;
+    session
+        .query_unpaged(
+            format!(
+                "CREATE TABLE IF NOT EXISTS {STATE_KEYSPACE}.u64_singleton_table (obj_id BIGINT PRIMARY KEY, value BIGINT)"
+            ),
+            &[],
+        )
+        .await?;
+    // The confined mutable-singleton adapter prepares its complete query
+    // family. This table is not executed by this gate, but keeping the real
+    // schema present proves preparation uses the production-shaped catalog.
+    session
+        .query_unpaged(
+            format!(
+                "CREATE TABLE IF NOT EXISTS {STATE_KEYSPACE}.latest_info_table (obj_id BIGINT PRIMARY KEY, value BLOB)"
             ),
             &[],
         )
@@ -620,29 +648,47 @@ async fn read_direct_rows(
     plan: &RepresentativeRealmStateReplayPlan<PHash>,
 ) -> anyhow::Result<Vec<Vec<u8>>> {
     let session = connect(Some(ip), Consistency::One).await?;
-    let query = format!(
+    let merkle_query = format!(
         "SELECT value FROM {STATE_KEYSPACE}.global_user_tree_table WHERE level = ? AND node_index = ? AND checkpoint_id = ?"
+    );
+    let singleton_query = format!(
+        "SELECT value FROM {STATE_KEYSPACE}.u64_singleton_table WHERE obj_id = ?"
     );
     let mut values = Vec::with_capacity(plan.mutation_count());
     for sealed in plan.puts() {
-        let TypedTableKey::GlobalUserMerkle { node, checkpoint } =
-            sealed.resolved().mutation().key()
-        else {
-            bail!("representative plan exposed a non-Merkle key");
-        };
-        let value = session
-            .query_unpaged(
-                query.as_str(),
-                (
-                    u8_to_i8_exact(node.level()),
-                    u64_to_i64_exact(node.index().get()),
-                    convert_checkpoint_id_to_i64(checkpoint.get()),
-                ),
+        let value = match sealed.resolved().mutation().key() {
+            TypedTableKey::GlobalUserMerkle { node, checkpoint } => session
+                .query_unpaged(
+                    merkle_query.as_str(),
+                    (
+                        u8_to_i8_exact(node.level()),
+                        u64_to_i64_exact(node.index().get()),
+                        convert_checkpoint_id_to_i64(checkpoint.get()),
+                    ),
+                )
+                .await?
+                .into_rows_result()?
+                .single_row::<(Vec<u8>,)>()?
+                .0,
+            TypedTableKey::U64Singleton(
+                U64SingletonSlot::LatestCheckpoint,
+            ) => i64_to_u64_exact(
+                session
+                    .query_unpaged(
+                        singleton_query.as_str(),
+                        (u64_to_i64_exact(
+                            U64SingletonSlot::LatestCheckpoint as u8 as u64,
+                        ),),
+                    )
+                    .await?
+                    .into_rows_result()?
+                    .single_row::<(i64,)>()?
+                    .0,
             )
-            .await?
-            .into_rows_result()?
-            .single_row::<(Vec<u8>,)>()?
-            .0;
+            .to_be_bytes()
+            .to_vec(),
+            _ => bail!("representative plan exposed an unsupported typed key"),
+        };
         values.push(value);
     }
     Ok(values)
@@ -655,6 +701,9 @@ fn expected_rows(
         .map(|sealed| match sealed.resolved().mutation().operation() {
             MutationOperation::Put(MutationValue::PsyCanonicalBytes(value)) => {
                 Ok(value.clone())
+            }
+            MutationOperation::Put(MutationValue::CqlU64(value)) => {
+                Ok(value.to_be_bytes().to_vec())
             }
             _ => bail!("representative plan exposed a non-executable value"),
         })
@@ -763,7 +812,7 @@ async fn d04b2c_representative_state_replay_rf3_gate() -> anyhow::Result<()> {
         finished_unix_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_millis() as u64,
-        qualification: "representative Realm global-user Merkle replay only; not production Processor integration or full 35-table replay coverage",
+        qualification: "representative Realm global-user Merkle plus latest-checkpoint singleton replay; not production Processor integration or full 35-table replay coverage",
     };
     let report_path = std::env::var("PSY_D04B2C_REPORT_PATH")
         .unwrap_or_else(|_| "target/d04b2c-state-replay-rf3-report.json".into());
@@ -813,16 +862,19 @@ async fn d04b2d_combined_representative_normal_commit_rf3_gate(
     .to_owned();
     drop(initial_session);
 
-    // Start from a real PREPARED row with only the root physical mutation
-    // present, then destroy every Session/adapter.  The combined executor must
-    // reconstruct state from durable artifacts before it can persist SEALED.
+    // Start from a real PREPARED row with only the physical prefix through the
+    // root present, then destroy every Session/adapter. The combined executor
+    // must reconstruct both root-covered state and the singleton supplement
+    // from durable artifacts before it can persist SEALED.
     let crash = fixture(13, 51, 11, 1_500);
     let stores = open_combined_stores().await?;
     initialize_combined_fixture(&stores, &crash).await?;
     let crash_plan = load_plan_from(&stores.manifests, crash.identity()).await?;
     ensure!(crash_plan.root_position() == 0);
+    let crash_prefix = crash_plan.root_position() + 1;
+    ensure!(crash_prefix < crash_plan.mutation_count());
     RepresentativeRealmStateReplayExecutor::new(&stores.state)
-        .reapply_prefix_for_gate(&crash_plan, 1)
+        .reapply_prefix_for_gate(&crash_plan, crash_prefix)
         .await?;
     drop(stores);
 
@@ -932,7 +984,7 @@ async fn d04b2d_combined_representative_normal_commit_rf3_gate(
         finished_unix_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_millis() as u64,
-        qualification: "representative Realm global-user Merkle plus manifest/head/timestamp recovery loop only; not production Processor integration or full table coverage",
+        qualification: "representative Realm global-user Merkle plus latest-checkpoint singleton supplement and manifest/head/timestamp recovery loop; not production Processor integration or full table coverage",
     };
     let report_path = std::env::var("PSY_D04B2D_REPORT_PATH")
         .unwrap_or_else(|_| "target/d04b2d-combined-normal-commit-rf3-report.json".into());
@@ -1215,7 +1267,7 @@ async fn d04b2e_conflicting_normal_commit_rf3_gate() -> anyhow::Result<()> {
         finished_unix_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_millis() as u64,
-        qualification: "M20 for one representative Realm normal commit; not production Processor integration or full table coverage",
+        qualification: "M20 for one representative Realm normal commit with global-user Merkle plus latest-checkpoint singleton supplement; not production Processor integration or full table coverage",
     };
     let report_path = std::env::var("PSY_D04B2E_REPORT_PATH")
         .unwrap_or_else(|_| "target/d04b2e-normal-commit-conflict-rf3-report.json".into());

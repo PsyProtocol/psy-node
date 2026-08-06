@@ -20,7 +20,7 @@ use scylla::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::utils::u64_to_i64_exact;
+use crate::utils::{i64_to_u64_exact, u64_to_i64_exact};
 
 use super::{
     physical_descriptor, CqlKeyspaceName, PrototypeBindValue,
@@ -48,6 +48,7 @@ pub enum SingletonTransitionKind {
 pub enum MutableSingletonQueryKind {
     LatestInfoPut = 1,
     LatestCheckpointPut = 2,
+    LatestCheckpointRead = 3,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -67,6 +68,7 @@ impl MutableSingletonQuery {
 pub struct MutableSingletonQueries {
     latest_info_put: MutableSingletonQuery,
     latest_checkpoint_put: MutableSingletonQuery,
+    latest_checkpoint_read: MutableSingletonQuery,
 }
 
 impl MutableSingletonQueries {
@@ -84,15 +86,21 @@ impl MutableSingletonQueries {
                 cql: format!("INSERT INTO {}.{latest_checkpoint} (obj_id, value) VALUES (?, ?) USING TIMESTAMP ?", keyspace.as_str()),
                 bind_shape: &["obj_id:BIGINT", "value:BIGINT", "write_timestamp_us:BIGINT"],
             },
+            latest_checkpoint_read: MutableSingletonQuery {
+                kind: MutableSingletonQueryKind::LatestCheckpointRead,
+                cql: format!("SELECT value FROM {}.{latest_checkpoint} WHERE obj_id = ?", keyspace.as_str()),
+                bind_shape: &["obj_id:BIGINT"],
+            },
         }
     }
 
     pub const fn latest_info_put(&self) -> &MutableSingletonQuery { &self.latest_info_put }
     pub const fn latest_checkpoint_put(&self) -> &MutableSingletonQuery { &self.latest_checkpoint_put }
+    pub const fn latest_checkpoint_read(&self) -> &MutableSingletonQuery { &self.latest_checkpoint_read }
 
     pub fn render_golden(&self) -> String {
         let mut output = String::new();
-        for query in [self.latest_info_put(), self.latest_checkpoint_put()] {
+        for query in [self.latest_info_put(), self.latest_checkpoint_put(), self.latest_checkpoint_read()] {
             output.push_str(&format!("{:?}\n{}\n{}\n", query.kind(), query.cql(), query.bind_shape().join(",")));
         }
         output
@@ -497,6 +505,7 @@ fn transition_digest(
 struct PreparedMutableSingleton {
     latest_info_put: PreparedStatement,
     latest_checkpoint_put: PreparedStatement,
+    latest_checkpoint_read: PreparedStatement,
 }
 
 #[allow(dead_code)]
@@ -516,6 +525,7 @@ impl MutableSingletonAdapter {
         let prepared = PreparedMutableSingleton {
             latest_info_put: prepare(session, queries.latest_info_put().cql(), consistency).await?,
             latest_checkpoint_put: prepare(session, queries.latest_checkpoint_put().cql(), consistency).await?,
+            latest_checkpoint_read: prepare(session, queries.latest_checkpoint_read().cql(), consistency).await?,
         };
         Ok(Self { queries, prepared })
     }
@@ -538,6 +548,25 @@ impl MutableSingletonAdapter {
     ) -> anyhow::Result<()> {
         session.execute_unpaged(&self.prepared.latest_checkpoint_put, plan.put.driver_values()).await?;
         Ok(())
+    }
+
+    pub(crate) async fn read_latest_checkpoint(
+        &self,
+        session: &Session,
+    ) -> anyhow::Result<Option<CheckpointId>> {
+        let result = session
+            .execute_unpaged(
+                &self.prepared.latest_checkpoint_read,
+                (u64_to_i64_exact(U64SingletonSlot::LatestCheckpoint as u8 as u64),),
+            )
+            .await?;
+        let rows = result.into_rows_result()?;
+        rows.maybe_first_row::<(i64,)>()?
+            .map(|row| {
+                CheckpointId::try_new(i64_to_u64_exact(row.0))
+                    .map_err(anyhow::Error::from)
+            })
+            .transpose()
     }
 }
 
