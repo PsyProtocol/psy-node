@@ -17,6 +17,7 @@ psy_node_scylla/examples/tst7.rs|Example|2|2|0|0|1|1|2|3
 psy_node_scylla/examples/tst7_nobucket.rs|Example|2|2|0|0|1|1|2|3
 psy_node_scylla/src/core.rs|DriverCore|2|2|11|0|0|0|2|2
 psy_node_scylla/src/core_db.rs|DriverCore|0|0|97|0|0|0|0|0
+psy_node_scylla/src/rollback/authority_timestamp_prototype.rs|DurableControlAuthority|6|0|4|6|2|4|1|6
 psy_node_scylla/src/rollback/canonical_head_prototype.rs|CanonicalHeadAuthority|7|0|3|6|2|3|1|6
 psy_node_scylla/src/rollback/checkpoint_kiv.rs|RollbackPrototypeAdapter|6|0|0|4|1|2|0|2
 psy_node_scylla/src/rollback/checkpoint_merkle.rs|RollbackPrototypeAdapter|7|0|0|5|1|9|0|9
@@ -67,6 +68,7 @@ psy_node_scylla/src/tables/u64_tbl.rs|LegacyTableAdapter|41|0|0|12|11|12|0|14
 psy_node_scylla/src/utils.rs|LegacyTableAdapter|3|0|0|4|2|0|0|0
 psy_node_scylla/tests/rollback_admission_inbox.rs|TestHarness|0|0|0|0|0|0|0|1
 psy_node_scylla/tests/rollback_admission_inbox_rf3_gate.rs|TestHarness|5|2|0|0|0|0|3|3
+psy_node_scylla/tests/rollback_authority_timestamp_rf3_gate.rs|TestHarness|4|2|0|0|0|0|2|2
 psy_node_scylla/tests/rollback_canonical_head_rf3_gate.rs|TestHarness|5|2|0|0|0|0|3|3
 psy_node_scylla/tests/rollback_checkpoint_kiv.rs|TestHarness|0|0|0|0|0|0|0|1
 psy_node_scylla/tests/rollback_checkpoint_merkle.rs|TestHarness|0|0|0|0|0|0|0|1

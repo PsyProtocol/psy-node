@@ -399,7 +399,12 @@ impl AuthorityTimestampLwtContract {
         Self {
             regular: Consistency::Quorum,
             serial: SerialConsistency::LocalSerial,
-            read: Consistency::LocalSerial,
+            // LOCAL_SERIAL belongs on the Paxos/LWT statement. A plain
+            // SELECT uses a regular consistency level; QUORUM is sufficient
+            // after an applied LWT and remains fail-closed for an
+            // indeterminate response because the caller retries the exact
+            // sealed intent rather than allocating a replacement timestamp.
+            read: Consistency::Quorum,
         }
     }
 
@@ -890,7 +895,7 @@ mod tests {
         let contract = AuthorityTimestampLwtContract::rf3_default();
         assert_eq!(contract.regular(), Consistency::Quorum);
         assert_eq!(contract.serial(), SerialConsistency::LocalSerial);
-        assert_eq!(contract.read(), Consistency::LocalSerial);
+        assert_eq!(contract.read(), Consistency::Quorum);
     }
 
     #[test]
