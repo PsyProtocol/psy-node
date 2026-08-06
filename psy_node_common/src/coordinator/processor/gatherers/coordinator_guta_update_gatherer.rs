@@ -324,15 +324,24 @@ impl<
             self.last_committed_checkpoint_root = current_checkpoint_root;
         }
         let unique_pending_id = self.status.unique_pending_id;
+        let realm_identifier = QRealmIdentifier {
+            realm_id: self.config.realm_id_u64 as u32,
+            realm_sub_id: self.config.realm_sub_id_u64 as u16,
+        };
+        let pending_context = self
+            .config
+            .temp_db
+            .require_pending_context_for_pending_id(
+                &realm_identifier,
+                unique_pending_id,
+            )
+            .await?;
 
         self.config
             .temp_db
             .set_proof_miner_rewards_tree_value(
-                &QRealmIdentifier {
-                    realm_id: self.config.realm_id_u64 as u32,
-                    realm_sub_id: self.config.realm_sub_id_u64 as u16,
-                },
-                self.status.unique_pending_id,
+                &realm_identifier,
+                &pending_context,
                 update_header.job_id,
                 update_header.header.new_tag_tree_node_value,
             )

@@ -10,7 +10,7 @@ use psy_node_core::{
     genesis::genesis_db_data_builder::GenesisDatabaseDataBuilder, p2p::traits::realm_coordinantor::RealmCoordinatorClient, psy_core_db::traits::full::{PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmProcessorStore}, psy_temp_db::StandardProcessorTempDBStoreBase, queue::{
         ephemeral::QStandardEphemeralQueueSubscriber,
         worker_queue::{QStandardWorkerQueuePublisher, QStandardWorkerQueueSubscriber},
-    }, store::traits::proof_store::QParthProofStore
+    }, store::traits::proof_store::{QCanonicalProofStoreV2, QParthProofStore}
 };
 
 use crate::realm::processor::{core::{PsyRealmProcessor, runner::run_realm_processor}, db::PsyRealmDatabaseProcessor};
@@ -22,7 +22,7 @@ pub async fn create_realm_processor<
     GUTAUpdateQueue: QStandardEphemeralQueueSubscriber + Send + Sync + 'static,
     ProofWorkQueue: QStandardWorkerQueuePublisher + QStandardWorkerQueueSubscriber + Send + Sync + 'static,
     TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash> + Send + Sync + 'static,
-    ProofStore: QParthProofStore + Send + Sync + 'static,
+    ProofStore: QParthProofStore + QCanonicalProofStoreV2 + Send + Sync + 'static,
     FileSystem: TokioLikeFileSystem + Send + Sync + 'static,
     CoordinatorClient: RealmCoordinatorClient<N::F, N::QHash> + Send + Sync + 'static,
 >(
@@ -180,7 +180,7 @@ pub async fn create_realm_processor_and_run<
     GUTAUpdateQueue: QStandardEphemeralQueueSubscriber + Send + Sync + 'static,
     ProofWorkQueue: QStandardWorkerQueuePublisher + QStandardWorkerQueueSubscriber + Send + Sync + 'static,
     TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash> + Send + Sync + 'static,
-    ProofStore: QParthProofStore + Send + Sync + 'static,
+    ProofStore: QParthProofStore + QCanonicalProofStoreV2 + Send + Sync + 'static,
     FileSystem: TokioLikeFileSystem + Send + Sync + 'static,
     CoordinatorClient: RealmCoordinatorClient<N::F, N::QHash> + Send + Sync + 'static,
 >(

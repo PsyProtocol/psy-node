@@ -10,7 +10,7 @@ use psy_node_core::{
         ephemeral::QStandardEphemeralQueueSubscriber,
         worker_queue::{QStandardWorkerQueuePublisher, QStandardWorkerQueueSubscriber},
     },
-    store::traits::proof_store::QParthProofStore,
+    store::traits::proof_store::{QCanonicalProofStoreV2, QParthProofStore},
     store::rollback_admission::RollbackAdmissionBoundaryOutcome,
 };
 use tokio::time::sleep;
@@ -26,7 +26,7 @@ pub async fn run_coordinator_processor_loop<
     DeployContractQueue: QStandardEphemeralQueueSubscriber + Send + Sync + 'static,
     ProofWorkQueue: QStandardWorkerQueuePublisher + QStandardWorkerQueueSubscriber + Send + Sync,
     TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash> + Send + Sync + 'static,
-    ProofStore: QParthProofStore,
+    ProofStore: QParthProofStore + QCanonicalProofStoreV2,
     FileSystem: TokioLikeFileSystem + Send + Sync + 'static,
 >(
     mut processor: PsyCoordinatorProcessor<
@@ -136,7 +136,7 @@ pub async fn run_coordinator_processor<
     DeployContractQueue: QStandardEphemeralQueueSubscriber + Send + Sync + 'static,
     ProofWorkQueue: QStandardWorkerQueuePublisher + QStandardWorkerQueueSubscriber + Send + Sync + 'static,
     TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash> + Send + Sync + 'static,
-    ProofStore: QParthProofStore + Send + Sync + 'static,
+    ProofStore: QParthProofStore + QCanonicalProofStoreV2 + Send + Sync + 'static,
     FileSystem: TokioLikeFileSystem + Send + Sync + 'static,
 >(
     processor: PsyCoordinatorProcessor<

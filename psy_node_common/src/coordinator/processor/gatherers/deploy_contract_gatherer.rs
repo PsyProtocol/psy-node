@@ -604,9 +604,21 @@ impl<
         let update_global_contract_tree_nodes_ffs = create_ffs_merkle_nodes_zero_id_from_hash_map::<N::QHash>(tree.get_changes());
         //tree.commit_changes();
 
+        let pending_context = self
+            .config
+            .temp_db
+            .require_pending_context_for_pending_id(
+                &realm_identifier,
+                pending_unique_id,
+            )
+            .await?;
         self.config
             .temp_db
-            .set_tdb_proof_witnesses_tuple_owned_raw(&realm_identifier, pending_unique_id, job_temp_data)
+            .set_tdb_proof_witnesses_tuple_owned_raw(
+                &realm_identifier,
+                &pending_context,
+                job_temp_data,
+            )
             .await?;
 
         let start_next_contract_id = self.shared_status.block_state.next_contract_id as u64;

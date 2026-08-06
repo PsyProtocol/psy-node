@@ -32,7 +32,7 @@ use psy_node_core::{
     psy_temp_db::StandardEdgeAPITempDBStoreBase,
     queue::{ephemeral::QStandardEphemeralQueuePublisher, worker_queue::QStandardWorkerQueueSubscriber},
     store::rollback_admin::RollbackMaintenanceGateError,
-    store::traits::proof_store::QParthProofStore,
+    store::traits::proof_store::{QCanonicalProofStoreV2, QParthProofStore},
 };
 
 use crate::{coordinator::edge::handler::CoordinatorEdgeHandler, realm::edge::error::RpcError};
@@ -65,7 +65,7 @@ impl<
         DeployContractQueue: QStandardEphemeralQueuePublisher + Send + Sync + 'static,
         GetProofWorkQueue: QStandardWorkerQueueSubscriber + Send + Sync + 'static,
         TempDatabase: StandardEdgeAPITempDBStoreBase<N::JobId, N::QHash> + std::marker::Sync + std::marker::Send + 'static,
-        ProofStore: QParthProofStore + Send + Sync + 'static,
+        ProofStore: QParthProofStore + QCanonicalProofStoreV2 + Send + Sync + 'static,
     > CoordinatorEdgeRpcServer<N::F, N::QHash, N::JobId, N::ZKProof>
     for CoordinatorEdgeHandler<
         N,
@@ -348,7 +348,7 @@ impl<
         DeployContractQueue: QStandardEphemeralQueuePublisher + Send + Sync + 'static,
         GetProofWorkQueue: QStandardWorkerQueueSubscriber + Send + Sync + 'static,
         TempDatabase: StandardEdgeAPITempDBStoreBase<N::JobId, N::QHash> + std::marker::Sync + std::marker::Send + 'static,
-        ProofStore: QParthProofStore + Send + Sync + 'static,
+        ProofStore: QParthProofStore + QCanonicalProofStoreV2 + Send + Sync + 'static,
     > NodeEdgeWorkerRpcServer<N::QHash, N::JobId>
     for CoordinatorEdgeHandler<
         N,

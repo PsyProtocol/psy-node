@@ -16,7 +16,7 @@ use psy_node_core::{
         ephemeral::QStandardEphemeralQueueSubscriber,
         worker_queue::{QStandardWorkerQueuePublisher, QStandardWorkerQueueSubscriber},
     },
-    store::traits::proof_store::QParthProofStore,
+    store::traits::proof_store::{QCanonicalProofStoreV2, QParthProofStore},
 };
 
 use crate::realm::{
@@ -31,7 +31,7 @@ impl<
         GUTAUpdateQueue: QStandardEphemeralQueueSubscriber + Send + Sync + 'static,
         ProofWorkQueue: QStandardWorkerQueuePublisher + QStandardWorkerQueueSubscriber + Send + Sync + 'static,
         TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash> + Send + Sync + 'static,
-        ProofStore: QParthProofStore,
+        ProofStore: QParthProofStore + QCanonicalProofStoreV2,
         FileSystem: TokioLikeFileSystem + Send + Sync + 'static,
         CoordinatorClient: RealmCoordinatorClient<N::F, N::QHash> + Send + Sync,
     > PsyRealmProcessor<N, S, STagTreeRewards, GUTAUpdateQueue, ProofWorkQueue, TempDatabase, ProofStore, FileSystem, CoordinatorClient>
@@ -264,10 +264,22 @@ where
         tracing::info!("GUTA jobs completed!");
 
         // 5. Retrieve Proof
+        let pending_context = self
+            .db
+            .temp_db
+            .require_pending_context_for_pending_id(
+                &self.db.state.realm_identifier,
+                self.db.state.processing_unique_pending_id,
+            )
+            .await?;
+        let root_proof_address = self
+            .db
+            .proof_store
+            .resolve_proof_address(&pending_context, &root_job_id)?;
         let root_job_proof = self
             .db
             .proof_store
-            .get_proof_bytes_by_job_id(root_job_id, self.db.state.processing_unique_pending_id)
+            .get_proof_bytes_exact(&root_proof_address)
             .await?;
         if root_job_proof.is_none() {
             anyhow::bail!("No proof found for root GUTA job id: {:?}", root_job_id);

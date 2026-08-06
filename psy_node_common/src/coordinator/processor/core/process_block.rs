@@ -74,7 +74,7 @@ where
 use cf_utils::timer::TraceTimer;
 use parth_core::{
     data::queue::queue_key::QPBaseQueueType,
-    protocol::core_types::{Q256BitHash, QNetworkTypesConfig},
+    protocol::core_types::QNetworkTypesConfig,
 };
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{
@@ -97,7 +97,7 @@ use psy_node_core::{
         ephemeral::QStandardEphemeralQueueSubscriber,
         worker_queue::{QStandardWorkerQueuePublisher, QStandardWorkerQueueSubscriber},
     },
-    store::traits::proof_store::QParthProofStore,
+    store::traits::proof_store::{QCanonicalProofStoreV2, QParthProofStore},
 };
 use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 
@@ -122,7 +122,7 @@ impl<
         DeployContractQueue: QStandardEphemeralQueueSubscriber + Send + Sync + 'static,
         ProofWorkQueue: QStandardWorkerQueuePublisher + QStandardWorkerQueueSubscriber + Send + Sync,
         TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash> + Send + Sync + 'static,
-        ProofStore: QParthProofStore,
+        ProofStore: QParthProofStore + QCanonicalProofStoreV2,
         FileSystem: TokioLikeFileSystem + Send + Sync + 'static,
     >
     PsyCoordinatorProcessor<
@@ -264,6 +264,18 @@ impl<
         println!("self.db.ids.proc_checkpoint_unique_id: {:?}", self.db.ids.proc_checkpoint_unique_id);
         let output_job_id = job.job_id.get_output_id();
         let unique_pending_id = self.db.ids.unique_pending_id;
+        let pending_context = self
+            .db
+            .temp_db
+            .require_pending_context_for_pending_id(
+                &self.db.ids.realm_identifier,
+                unique_pending_id,
+            )
+            .await?;
+        let proof_address = self
+            .db
+            .proof_store
+            .resolve_proof_address(&pending_context, &output_job_id)?;
         let (proof_bytes, reward_value) = publish_wait_for_queue_and_job_ready(
             self.proof_worker_queue_max_time_ms,
             format!(
@@ -290,11 +302,11 @@ impl<
                     self.proof_worker_queue_max_time_ms,
                 )
             },
-            || self.db.proof_store.get_proof_bytes_by_job_id(output_job_id, unique_pending_id),
+            || self.db.proof_store.get_proof_bytes_exact(&proof_address),
             || {
                 self.db.temp_db.get_proof_miner_rewards_tree_value_or_none(
                     &self.db.ids.realm_identifier,
-                    unique_pending_id,
+                    &pending_context,
                     output_job_id,
                 )
             },
@@ -416,9 +428,17 @@ impl<
     ) -> anyhow::Result<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>> {
         let (job_metadata, job_and_witness_bytes) =
             output_builder.get_agg_guta_register_users_deploy_contracts_job(&self.db.last_committed, &self.db.circuit_fingerprint_config)?;
+        let pending_context = self
+            .db
+            .temp_db
+            .require_pending_context_for_pending_id(
+                &self.db.ids.realm_identifier,
+                self.db.ids.unique_pending_id,
+            )
+            .await?;
         self.db
             .temp_db
-            .set_tdb_proof_witnesses_tuple_owned_raw(&self.db.ids.realm_identifier, self.db.ids.unique_pending_id, vec![job_and_witness_bytes])
+            .set_tdb_proof_witnesses_tuple_owned_raw(&self.db.ids.realm_identifier, &pending_context, vec![job_and_witness_bytes])
             .await?;
         Ok(job_metadata)
     }
@@ -440,9 +460,17 @@ impl<
             block_time,
         )?;
 
+        let pending_context = self
+            .db
+            .temp_db
+            .require_pending_context_for_pending_id(
+                &self.db.ids.realm_identifier,
+                self.db.ids.unique_pending_id,
+            )
+            .await?;
         self.db
             .temp_db
-            .set_tdb_proof_witnesses_tuple_owned_raw(&self.db.ids.realm_identifier, self.db.ids.unique_pending_id, vec![job_and_witness_bytes])
+            .set_tdb_proof_witnesses_tuple_owned_raw(&self.db.ids.realm_identifier, &pending_context, vec![job_and_witness_bytes])
             .await?;
         let (checkpoint_zk_proof, reward_root) = self
             .publish_and_wait_for_job_ready(&job_metadata, "checkpoint state transition root job")
@@ -478,9 +506,17 @@ impl<
             },
         };
         let witness_data = witness.psy_ser_into_bytes_vec()?;
+        let pending_context = self
+            .db
+            .temp_db
+            .require_pending_context_for_pending_id(
+                &self.db.ids.realm_identifier,
+                self.db.ids.unique_pending_id,
+            )
+            .await?;
         self.db
             .temp_db
-            .set_tdb_proof_witnesses_tuple_owned_raw(&self.db.ids.realm_identifier, self.db.ids.unique_pending_id, vec![(job_id, witness_data)])
+            .set_tdb_proof_witnesses_tuple_owned_raw(&self.db.ids.realm_identifier, &pending_context, vec![(job_id, witness_data)])
             .await?;
         self.db
             .proof_work_queue

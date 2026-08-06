@@ -4,7 +4,7 @@ use jsonrpsee::server::{BatchRequestConfig, ServerConfig};
 use parth_core::protocol::core_types::QNetworkTypesConfig;
 use psy_api_core::{coordinator::standard_edge_rpc::CoordinatorEdgeRpcServer, worker::standard_worker_rpc::NodeEdgeWorkerRpcServer};
 use psy_core::job::job_id::QProvingJobDataID;
-use psy_node_core::{psy_core_db::traits::full::{PsyCoordinatorEdgeAPIStoreReader, PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter}, psy_temp_db::StandardEdgeAPITempDBStoreBase, queue::{ephemeral::QStandardEphemeralQueuePublisher, worker_queue::QStandardWorkerQueueSubscriber}, store::traits::proof_store::QParthProofStore};
+use psy_node_core::{psy_core_db::traits::full::{PsyCoordinatorEdgeAPIStoreReader, PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter}, psy_temp_db::StandardEdgeAPITempDBStoreBase, queue::{ephemeral::QStandardEphemeralQueuePublisher, worker_queue::QStandardWorkerQueueSubscriber}, store::traits::proof_store::{QCanonicalProofStoreV2, QParthProofStore}};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::compression::CompressionLayer;
 use tower::limit::ConcurrencyLimitLayer;
@@ -20,7 +20,7 @@ pub async fn start_coordinator_edge_rpc_server<
         DeployContractQueue: QStandardEphemeralQueuePublisher + Send + Sync + 'static,
         GetProofWorkQueue: QStandardWorkerQueueSubscriber + Send + Sync + 'static,
         TempDatabase: StandardEdgeAPITempDBStoreBase<N::JobId, N::QHash> + std::marker::Sync + std::marker::Send + 'static,
-        ProofStore: QParthProofStore + Send + Sync + 'static,
+        ProofStore: QParthProofStore + QCanonicalProofStoreV2 + Send + Sync + 'static,
 >(
     handler: CoordinatorEdgeHandler<
         N,

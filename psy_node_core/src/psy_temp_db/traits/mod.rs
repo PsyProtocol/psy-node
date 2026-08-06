@@ -34,14 +34,14 @@ pub trait StandardEdgeAPITempDBStoreBase<JobId: QJobIdBase, Hash: QDBHashBase>:
     QTempDBPendingIdStore + 
     QTempDBPendingContextStore<Hash> +
     QTempDBSubmitStatusStore + 
-    QTempDBProofWitnessStore<JobId> +
+    QTempDBProofWitnessStore<Hash, JobId> +
     QTempDBUserContractUpdatesStore + 
     QTempDBUserEndCapSlotUpdatesStore +
     QTempDBProvingJobMetadataStore<Hash, JobId> +
     QTempDBRewardsTreeStore<Hash, JobId> +
     QTempDBDeployContractDataStore + 
     QTempDBNodeProvingStateStore +
-    QTempDBJobClaimInfoStore<JobId> +
+    QTempDBJobClaimInfoStore<Hash, JobId> +
     QTempDBJobStatsStore +
     QTempDBWorkerReputationStore
 {
@@ -55,14 +55,14 @@ impl<
     QTempDBPendingIdStore + 
     QTempDBPendingContextStore<Hash> +
     QTempDBSubmitStatusStore + 
-    QTempDBProofWitnessStore<JobId> +
+    QTempDBProofWitnessStore<Hash, JobId> +
     QTempDBUserContractUpdatesStore + 
     QTempDBUserEndCapSlotUpdatesStore +
     QTempDBProvingJobMetadataStore<Hash, JobId> +
     QTempDBRewardsTreeStore<Hash, JobId> +
     QTempDBDeployContractDataStore +
     QTempDBNodeProvingStateStore +
-    QTempDBJobClaimInfoStore<JobId> +
+    QTempDBJobClaimInfoStore<Hash, JobId> +
     QTempDBJobStatsStore +
     QTempDBWorkerReputationStore,
 > StandardEdgeAPITempDBStoreBase<JobId, Hash> for T {
@@ -73,14 +73,14 @@ pub trait StandardProcessorTempDBStoreBase<JobId: QJobIdBase, Hash: QDBHashBase>
     QTempDBPendingIdStore + 
     QTempDBPendingContextStore<Hash> +
     QTempDBSubmitStatusStore + 
-    QTempDBProofWitnessStore<JobId> +
+    QTempDBProofWitnessStore<Hash, JobId> +
     QTempDBUserContractUpdatesStore +
     QTempDBUserEndCapSlotUpdatesStore +
     QTempDBProvingJobMetadataStore<Hash, JobId> +
     QTempDBRewardsTreeStore<Hash, JobId> +
     QTempDBDeployContractDataStore +
     QTempDBNodeProvingStateStore +
-    QTempDBJobClaimInfoStore<JobId> +
+    QTempDBJobClaimInfoStore<Hash, JobId> +
     QTempDBJobStatsStore +
     QTempDBWorkerReputationStore
 {
@@ -94,14 +94,14 @@ impl<
     QTempDBPendingIdStore + 
     QTempDBPendingContextStore<Hash> +
     QTempDBSubmitStatusStore + 
-    QTempDBProofWitnessStore<JobId> +
+    QTempDBProofWitnessStore<Hash, JobId> +
     QTempDBUserContractUpdatesStore +
     QTempDBUserEndCapSlotUpdatesStore +
     QTempDBProvingJobMetadataStore<Hash, JobId> +
     QTempDBRewardsTreeStore<Hash, JobId> +
     QTempDBDeployContractDataStore +
     QTempDBNodeProvingStateStore +
-    QTempDBJobClaimInfoStore<JobId> +
+    QTempDBJobClaimInfoStore<Hash, JobId> +
     QTempDBJobStatsStore +
     QTempDBWorkerReputationStore,
 > StandardProcessorTempDBStoreBase<JobId, Hash> for T {

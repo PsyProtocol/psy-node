@@ -44,9 +44,7 @@ use psy_node_core::{
         ephemeral::QStandardEphemeralQueuePublisher,
         worker_queue::QStandardWorkerQueueSubscriber,
     },
-    store::traits::
-        proof_store::QParthProofStore
-    ,
+    store::traits::proof_store::{QCanonicalProofStoreV2, QParthProofStore},
 };
 
 use crate::realm::{
@@ -249,7 +247,7 @@ impl<
         UserUpdateQueue: QStandardEphemeralQueuePublisher,
         GetProofWorkQueue: QStandardWorkerQueueSubscriber,
         TempDatabase: StandardEdgeAPITempDBStoreBase<N::JobId, N::QHash> + Send + Sync,
-        ProofStore: QParthProofStore,
+        ProofStore: QParthProofStore + QCanonicalProofStoreV2,
     > RealmEdgeHandler<N, S, STagTreeRewards, UserUpdateQueue, GetProofWorkQueue, TempDatabase, ProofStore>
 {
     pub async fn ensure_contract_heights_in_cache(&self, contract_ids: &[u32]) -> anyhow::Result<()> {
@@ -360,6 +358,20 @@ impl<
         }
 
         let (unique_pending_id, proc_checkpoint_id) = self.temp_db.get_gathering_unique_pending_ids(&self.realm_identifier).await?;
+        let pending_context = self
+            .temp_db
+            .require_pending_context_for_pending_id(
+                &self.realm_identifier,
+                unique_pending_id,
+            )
+            .await?;
+        if pending_context.proc_checkpoint_unique_id().as_u128() != proc_checkpoint_id {
+            anyhow::bail!(
+                "current pending context proc ID {} does not match gathering proc ID {}",
+                pending_context.proc_checkpoint_unique_id().as_u128(),
+                proc_checkpoint_id,
+            );
+        }
         println!("unique_pending_id: {}, proc_checkpoint_id: {}", unique_pending_id, proc_checkpoint_id);
         timer.lap_micros("get_gathering_unique_pending_ids");
         self.ensure_user_has_not_submitted(user_id, unique_pending_id).await?;
@@ -512,10 +524,21 @@ impl<
         }
 
         timer.lap_micros("get_submitted_status_for_pending (final)");
+        let current_context = self
+            .temp_db
+            .get_current_pending_context(&self.realm_identifier)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("current pending context disappeared during end-cap verification"))?;
+        if current_context != pending_context {
+            anyhow::bail!("pending context changed during end-cap verification");
+        }
+        let proof_address = self
+            .proof_store
+            .resolve_proof_address(&pending_context, &job_id)?;
         self.proof_store
-            .put_proof_bytes_for_job_id(job_id, unique_pending_id, &proof_bytes)
+            .put_proof_bytes_exact(&proof_address, &proof_bytes)
             .await?;
-        timer.lap_micros("put_proof_bytes_for_job_id");
+        timer.lap_micros("put_proof_bytes_exact");
         if self
             .temp_db
             .get_submitted_status_for_pending(&self.realm_identifier, unique_pending_id, user_id)
@@ -664,7 +687,7 @@ impl<
         UserUpdateQueue: QStandardEphemeralQueuePublisher + Send + Sync + 'static,
         GetProofWorkQueue: QStandardWorkerQueueSubscriber + Send + Sync + 'static,
         TempDatabase: StandardEdgeAPITempDBStoreBase<N::JobId, N::QHash> + Send + Sync + 'static,
-        ProofStore: QParthProofStore + Send + Sync + 'static,
+        ProofStore: QParthProofStore + QCanonicalProofStoreV2 + Send + Sync + 'static,
     > RealmEdgeRpcServer<N::F, N::QHash, N::JobId, N::ZKProof>
     for RealmEdgeHandler<N, S, STagTreeRewards, UserUpdateQueue, GetProofWorkQueue, TempDatabase, ProofStore>
 {
@@ -1083,7 +1106,7 @@ impl<
         UserUpdateQueue: QStandardEphemeralQueuePublisher + Send + Sync + 'static,
         GetProofWorkQueue: QStandardWorkerQueueSubscriber + Send + Sync + 'static,
         TempDatabase: StandardEdgeAPITempDBStoreBase<N::JobId, N::QHash> + Send + Sync + 'static,
-        ProofStore: QParthProofStore + Send + Sync + 'static,
+        ProofStore: QParthProofStore + QCanonicalProofStoreV2 + Send + Sync + 'static,
     > NodeEdgeWorkerRpcServer<N::QHash, N::JobId>
     for RealmEdgeHandler<N, S, STagTreeRewards, UserUpdateQueue, GetProofWorkQueue, TempDatabase, ProofStore>
 {

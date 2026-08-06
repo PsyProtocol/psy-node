@@ -213,10 +213,16 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
                     left_job_id,
                     right_job_id,
                 );
+                let pending_context = temp_store
+                    .require_pending_context_for_pending_id(
+                        &self.realm_identifier,
+                        self.unique_pending_id,
+                    )
+                    .await?;
                 temp_store
                     .set_tdb_proof_witnesses_tuple_owned_raw(
                         &self.realm_identifier,
-                        self.unique_pending_id,
+                        &pending_context,
                         vec![(job.job_id, witness.psy_ser_into_bytes_vec()?)],
                     )
                     .await?;
@@ -446,10 +452,16 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
                 header: parent_witness.get_new_guta_header(self.global_user_tree_height as usize, self.guta_circuit_whitelist),
                 job_id: parent_witness_job_id,
             };
+            let pending_context = temp_store
+                .require_pending_context_for_pending_id(
+                    &self.realm_identifier,
+                    self.unique_pending_id,
+                )
+                .await?;
             temp_store
                 .set_tdb_proof_witnesses_tuple_owned_raw(
                     &self.realm_identifier,
-                    self.unique_pending_id,
+                    &pending_context,
                     vec![(parent_witness_job_id, parent_witness.psy_ser_into_bytes_vec()?)],
                 )
                 .await?;
@@ -626,10 +638,16 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
                 header: parent_witness.get_new_guta_header(self.global_user_tree_height as usize, self.guta_circuit_whitelist),
                 job_id: parent_witness_job_id,
             };
+            let pending_context = temp_store
+                .require_pending_context_for_pending_id(
+                    &self.realm_identifier,
+                    self.unique_pending_id,
+                )
+                .await?;
             temp_store
                 .set_tdb_proof_witnesses_tuple_owned_raw(
                     &self.realm_identifier,
-                    self.unique_pending_id,
+                    &pending_context,
                     vec![(parent_witness_job_id, parent_witness.psy_ser_into_bytes_vec()?)],
                 )
                 .await?;
@@ -703,10 +721,16 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
                     left_job_id,
                     right_job_id,
                 );
+                let pending_context = temp_store
+                    .require_pending_context_for_pending_id(
+                        &self.realm_identifier,
+                        self.unique_pending_id,
+                    )
+                    .await?;
                 temp_store
                     .set_tdb_proof_witnesses_tuple_owned_raw(
                         &self.realm_identifier,
-                        self.unique_pending_id,
+                        &pending_context,
                         vec![(job.job_id, witness.psy_ser_into_bytes_vec()?)],
                     )
                     .await?;
@@ -771,10 +795,16 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
                 left_job_id,
                 right_job_id,
             );
+            let pending_context = temp_store
+                .require_pending_context_for_pending_id(
+                    &self.realm_identifier,
+                    self.unique_pending_id,
+                )
+                .await?;
             temp_store
                 .set_tdb_proof_witnesses_tuple_owned_raw(
                     &self.realm_identifier,
-                    self.unique_pending_id,
+                    &pending_context,
                     vec![(job.job_id, witness.psy_ser_into_bytes_vec()?)],
                 )
                 .await?;
@@ -851,10 +881,16 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
                     job_id: job_id.clone(),
                 };
                 println!("new_guta_header: {:?}", new_guta_header);
+                let pending_context = temp_store
+                    .require_pending_context_for_pending_id(
+                        &self.realm_identifier,
+                        self.unique_pending_id,
+                    )
+                    .await?;
                 temp_store
                     .set_tdb_proof_witnesses_tuple_owned_raw(
                         &self.realm_identifier,
-                        self.unique_pending_id,
+                        &pending_context,
                         vec![(job_id, witness.psy_ser_into_bytes_vec()?)],
                     )
                     .await?;

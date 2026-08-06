@@ -165,14 +165,25 @@ where
     N::HasherBase: 'static + Send + Sync,
 {
     pub async fn get_reward_tree_root(&self, _checkpoint_id: u64, unique_pending_id: u64, job_id: N::JobId) -> anyhow::Result<N::QHash> {
-        let temp_store_reward_tree_root: Option<N::QHash> = self
+        let current_context = self
             .temp_db
-            .get_proof_miner_rewards_tree_value_or_none(
-                &self.state.realm_identifier,
-                unique_pending_id,
-                job_id,
-            )
+            .get_current_pending_context(&self.state.realm_identifier)
             .await?;
+        let temp_store_reward_tree_root: Option<N::QHash> = if let Some(context) =
+            current_context
+                .as_ref()
+                .filter(|context| context.unique_pending_id().get() == unique_pending_id)
+        {
+            self.temp_db
+                .get_proof_miner_rewards_tree_value_or_none(
+                    &self.state.realm_identifier,
+                    context,
+                    job_id,
+                )
+                .await?
+        } else {
+            None
+        };
         if temp_store_reward_tree_root.is_some() {
             let root = temp_store_reward_tree_root.unwrap();
             if root != N::QHash::get_zero_value() || unique_pending_id == 0 {

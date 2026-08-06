@@ -14,7 +14,7 @@ const DEPLOY_CONTRACT_ZSTD_PREFIX: &[u8; 4] = b"PSZ1";
 use crate::{
     psy_temp_db::{
         tt_get_worker_reputation_key,
-        CheckpointJobStats, QTempDBDeployContractDataReader, QTempDBDeployContractDataWriter, QTempDBJobClaimInfoReader, QTempDBJobClaimInfoWriter, QTempDBJobStatsStore, QTempDBNodeProvingStateReader, QTempDBNodeProvingStateWriter, QTempDBPendingContextCleaner, QTempDBPendingContextReader, QTempDBPendingContextWriter, QTempDBPendingIdReader, QTempDBPendingIdWriter, QTempDBProofWitnessReader, QTempDBProofWitnessWriter, QTempDBProvingJobMetadataReader, QTempDBProvingJobMetadataWriter, QTempDBRewardsTreeReader, QTempDBRewardsTreeWriter, QTempDBSubmitStatusReader, QTempDBSubmitStatusWriter, QTempDBUserContractUpdatesReader, QTempDBUserContractUpdatesWriter, QTempDBUserEndCapSlotUpdatesReader, QTempDBUserEndCapSlotUpdatesWriter, QTempDBWorkerReputationReader, QTempDBWorkerReputationWriter, tt_get_contract_updates_key, tt_get_current_pending_context_key, tt_get_deploy_contract_code_definition_key, tt_get_gathering_unique_pending_id_key, tt_get_job_claim_key_from_job, tt_get_job_stats_count_key, tt_get_job_stats_max_duration_key, tt_get_job_stats_min_duration_key, tt_get_job_stats_total_duration_key, tt_get_node_proving_state_key, tt_get_proof_claim_tag_key_from_job, tt_get_proof_witness_data_key_from_job, tt_get_proving_job_metadata_key_from_job, tt_get_rewards_tag_tree_value_key_from_job, tt_get_submit_status_key, tt_get_unique_pending_id_key, tt_get_user_end_cap_slot_updates_key
+        CheckpointJobStats, QTempDBDeployContractDataReader, QTempDBDeployContractDataWriter, QTempDBJobClaimInfoReader, QTempDBJobClaimInfoWriter, QTempDBJobStatsStore, QTempDBNodeProvingStateReader, QTempDBNodeProvingStateWriter, QTempDBPendingContextCleaner, QTempDBPendingContextReader, QTempDBPendingContextWriter, QTempDBPendingIdReader, QTempDBPendingIdWriter, QTempDBProofWitnessReader, QTempDBProofWitnessWriter, QTempDBProvingJobMetadataReader, QTempDBProvingJobMetadataWriter, QTempDBRewardsTreeReader, QTempDBRewardsTreeWriter, QTempDBSubmitStatusReader, QTempDBSubmitStatusWriter, QTempDBUserContractUpdatesReader, QTempDBUserContractUpdatesWriter, QTempDBUserEndCapSlotUpdatesReader, QTempDBUserEndCapSlotUpdatesWriter, QTempDBWorkerReputationReader, QTempDBWorkerReputationWriter, tt_get_contract_updates_key, tt_get_current_pending_context_key, tt_get_deploy_contract_code_definition_key, tt_get_gathering_unique_pending_id_key, tt_get_job_claim_key_v2, tt_get_job_stats_count_key, tt_get_job_stats_max_duration_key, tt_get_job_stats_min_duration_key, tt_get_job_stats_total_duration_key, tt_get_node_proving_state_key, tt_get_proof_claim_tag_key_v2, tt_get_proof_witness_data_key_v2, tt_get_proving_job_metadata_key_v2, tt_get_rewards_tag_tree_value_key_v2, tt_get_submit_status_key, tt_get_unique_pending_id_key, tt_get_user_end_cap_slot_updates_key
     },
     store::traits::temp_db::{
         QTempDatabaseRawCounterReaderBase, QTempDatabaseRawCounterWriterBase, QTempDatabaseRawKVReaderBase, QTempDatabaseRawKVWriterBase,
@@ -440,10 +440,12 @@ pub trait QTempDBProofWitnessWriter<JobId: QJobIdBase> {
 */
 
 #[async_trait]
-impl<JobId: QJobIdBase + 'static, D: QTempDatabaseRawKVReaderBase + Sync> QTempDBProofWitnessReader<JobId> for D {
+impl<Hash: Q256BitHash, JobId: QJobIdBase + 'static, D: QTempDatabaseRawKVReaderBase + Sync>
+    QTempDBProofWitnessReader<Hash, JobId> for D
+{
 
-    async fn get_tdb_proof_witness<T: QProofWitnessSerializable>(&self, rid: &QRealmIdentifier, unique_pending_id: u64, job_id: JobId) -> anyhow::Result<T>{
-        let key = tt_get_proof_witness_data_key_from_job(rid.realm_id, rid.realm_sub_id , unique_pending_id, &job_id);
+    async fn get_tdb_proof_witness<T: QProofWitnessSerializable>(&self, rid: &QRealmIdentifier, context: &PendingContext<Hash>, job_id: JobId) -> anyhow::Result<T>{
+        let key = tt_get_proof_witness_data_key_v2(rid, context, &job_id)?;
         let value_bytes = self.qtdb_raw_kv_get_value(&key).await?;
         if value_bytes.is_some() {
             T::psy_ser_from_owned_bytes_vec(value_bytes.unwrap())
@@ -451,8 +453,8 @@ impl<JobId: QJobIdBase + 'static, D: QTempDatabaseRawKVReaderBase + Sync> QTempD
             anyhow::bail!("Proof witness not found");
         }
     }
-    async fn get_tdb_proof_witness_bytes(&self, rid: &QRealmIdentifier, unique_pending_id: u64, job_id: JobId) -> anyhow::Result<Vec<u8>>{
-        let key = tt_get_proof_witness_data_key_from_job(rid.realm_id, rid.realm_sub_id , unique_pending_id, &job_id);
+    async fn get_tdb_proof_witness_bytes(&self, rid: &QRealmIdentifier, context: &PendingContext<Hash>, job_id: JobId) -> anyhow::Result<Vec<u8>>{
+        let key = tt_get_proof_witness_data_key_v2(rid, context, &job_id)?;
         let value_bytes = self.qtdb_raw_kv_get_value(&key).await?;
         if value_bytes.is_some() {
             Ok(value_bytes.unwrap())
@@ -463,26 +465,28 @@ impl<JobId: QJobIdBase + 'static, D: QTempDatabaseRawKVReaderBase + Sync> QTempD
 }
 
 #[async_trait]
-impl<JobId: QJobIdBase + 'static, D: QTempDatabaseRawKVWriterBase + Sync> QTempDBProofWitnessWriter<JobId> for D {
-    async fn set_tdb_proof_witness<T: QProofWitnessSerializable>(&self, rid: &QRealmIdentifier, unique_pending_id: u64, job_id: JobId, witness: &T) -> anyhow::Result<()>{
-        let key = tt_get_proof_witness_data_key_from_job(rid.realm_id, rid.realm_sub_id , unique_pending_id, &job_id);
+impl<Hash: Q256BitHash, JobId: QJobIdBase + 'static, D: QTempDatabaseRawKVWriterBase + Sync>
+    QTempDBProofWitnessWriter<Hash, JobId> for D
+{
+    async fn set_tdb_proof_witness<T: QProofWitnessSerializable>(&self, rid: &QRealmIdentifier, context: &PendingContext<Hash>, job_id: JobId, witness: &T) -> anyhow::Result<()>{
+        let key = tt_get_proof_witness_data_key_v2(rid, context, &job_id)?;
         let value_bytes = witness.psy_ser_to_bytes_vec()?;
         self.qtdb_raw_kv_put_value(&key, &value_bytes).await
     }
-    async fn set_tdb_proof_witnesses_tuple_owned<T: QProofWitnessSerializable>(&self, rid: &QRealmIdentifier, unique_pending_id: u64, job_witnesses: &[(JobId, T)]) -> anyhow::Result<()>{
+    async fn set_tdb_proof_witnesses_tuple_owned<T: QProofWitnessSerializable>(&self, rid: &QRealmIdentifier, context: &PendingContext<Hash>, job_witnesses: &[(JobId, T)]) -> anyhow::Result<()>{
         let mut entries = Vec::with_capacity(job_witnesses.len());
         for (job_id, witness) in job_witnesses.iter() {
-            let key = tt_get_proof_witness_data_key_from_job(rid.realm_id, rid.realm_sub_id , unique_pending_id, job_id);
+            let key = tt_get_proof_witness_data_key_v2(rid, context, job_id)?;
             let value_bytes = witness.psy_ser_to_bytes_vec()?;
             entries.push((key.to_vec(), value_bytes));
         }
         self.qtdb_raw_kv_put_many_values_tuple(&entries).await?;
         Ok(())
     }
-    async fn set_tdb_proof_witnesses_tuple_owned_raw(&self, rid: &QRealmIdentifier, unique_pending_id: u64, job_witnesses: Vec<(JobId, Vec<u8>)>) -> anyhow::Result<()> {
+    async fn set_tdb_proof_witnesses_tuple_owned_raw(&self, rid: &QRealmIdentifier, context: &PendingContext<Hash>, job_witnesses: Vec<(JobId, Vec<u8>)>) -> anyhow::Result<()> {
         let mut entries = Vec::with_capacity(job_witnesses.len());
         for (job_id, witness) in job_witnesses {
-            let key = tt_get_proof_witness_data_key_from_job(rid.realm_id, rid.realm_sub_id, unique_pending_id, &job_id);
+            let key = tt_get_proof_witness_data_key_v2(rid, context, &job_id)?;
             entries.push((key.to_vec(), witness));
         }
         self.qtdb_raw_kv_put_many_values_tuple(&entries).await?;
@@ -559,27 +563,27 @@ impl<T: QTempDatabaseRawKVWriterBase + Sync> QTempDBDeployContractDataWriter for
 
 #[async_trait]
 impl<Hash: Q256BitHash, JobId: QJobIdBase + 'static, D: QTempDatabaseRawKVReaderBase + Sync> QTempDBProvingJobMetadataReader<Hash, JobId> for D {
-    async fn get_proving_job_metadata(&self, rid: &QRealmIdentifier, unique_pending_id: u64, job_id: JobId) -> anyhow::Result<PsyProvingJobMetadata<Hash, JobId>>{
-        let value_bytes = self.qtdb_raw_kv_get_value(&tt_get_proving_job_metadata_key_from_job(rid.realm_id, rid.realm_sub_id, unique_pending_id, &job_id)).await?;
+    async fn get_proving_job_metadata(&self, rid: &QRealmIdentifier, context: &PendingContext<Hash>, job_id: JobId) -> anyhow::Result<PsyProvingJobMetadata<Hash, JobId>>{
+        let value_bytes = self.qtdb_raw_kv_get_value(&tt_get_proving_job_metadata_key_v2(rid, context, &job_id)?).await?;
         if value_bytes.is_some() {
             PsyProvingJobMetadata::<Hash, JobId>::psy_ser_from_owned_bytes_vec(value_bytes.unwrap())
         }else{
-            anyhow::bail!("Proving job metadata not found for job {:?} at unique_pending_id {}", job_id, unique_pending_id);
+            anyhow::bail!("Proving job metadata not found for job {:?} in exact pending context", job_id);
         }
     }
 }
 
 #[async_trait]
 impl<Hash: Q256BitHash, JobId: QJobIdBase + 'static, D: QTempDatabaseRawKVWriterBase + Sync> QTempDBProvingJobMetadataWriter<Hash, JobId> for D {
-    async fn set_proving_job_metadata(&self, rid: &QRealmIdentifier, unique_pending_id: u64, job_id: JobId, metadata: &PsyProvingJobMetadata<Hash, JobId>) -> anyhow::Result<()>{
-        let key = tt_get_proving_job_metadata_key_from_job(rid.realm_id, rid.realm_sub_id, unique_pending_id, &job_id);
+    async fn set_proving_job_metadata(&self, rid: &QRealmIdentifier, context: &PendingContext<Hash>, job_id: JobId, metadata: &PsyProvingJobMetadata<Hash, JobId>) -> anyhow::Result<()>{
+        let key = tt_get_proving_job_metadata_key_v2(rid, context, &job_id)?;
         let value_bytes = metadata.psy_ser_to_bytes_vec()?;
         self.qtdb_raw_kv_put_value(&key, &value_bytes).await
     }
-    async fn set_proving_job_metadata_batch(&self, rid: &QRealmIdentifier, unique_pending_id: u64, data: &[(JobId, PsyProvingJobMetadata<Hash, JobId>)]) -> anyhow::Result<()>{
+    async fn set_proving_job_metadata_batch(&self, rid: &QRealmIdentifier, context: &PendingContext<Hash>, data: &[(JobId, PsyProvingJobMetadata<Hash, JobId>)]) -> anyhow::Result<()>{
         let mut entries = Vec::with_capacity(data.len());
         for (job_id, metadata) in data.iter() {
-            let key = tt_get_proving_job_metadata_key_from_job(rid.realm_id, rid.realm_sub_id, unique_pending_id, job_id);
+            let key = tt_get_proving_job_metadata_key_v2(rid, context, job_id)?;
             let value_bytes = metadata.psy_ser_to_bytes_vec()?;
             entries.push((key.to_vec(), value_bytes));
         }
@@ -592,16 +596,16 @@ impl<Hash: Q256BitHash, JobId: QJobIdBase + 'static, D: QTempDatabaseRawKVWriter
 
 #[async_trait]
 impl<Hash: Q256BitHash, JobId: QJobIdBase + 'static, D: QTempDatabaseRawKVReaderBase + Sync> QTempDBRewardsTreeReader<Hash, JobId> for D {
-    async fn get_proof_miner_rewards_tree_value(&self, rid: &QRealmIdentifier, unique_pending_id: u64, job_id: JobId) -> anyhow::Result<Hash> {
-        let value_bytes: Option<Vec<u8>> = self.qtdb_raw_kv_get_value(&tt_get_rewards_tag_tree_value_key_from_job(rid.realm_id, rid.realm_sub_id, unique_pending_id, &job_id)).await?;
+    async fn get_proof_miner_rewards_tree_value(&self, rid: &QRealmIdentifier, context: &PendingContext<Hash>, job_id: JobId) -> anyhow::Result<Hash> {
+        let value_bytes: Option<Vec<u8>> = self.qtdb_raw_kv_get_value(&tt_get_rewards_tag_tree_value_key_v2(rid, context, &job_id)?).await?;
         if value_bytes.is_some() {
             Hash::from_slice_32bytes(&value_bytes.unwrap())
         }else{
-            anyhow::bail!("get_proof_miner_rewards_tree_value not found for job {:?} at unique_pending_id {}", job_id, unique_pending_id);
+            anyhow::bail!("get_proof_miner_rewards_tree_value not found for job {:?} in exact pending context", job_id);
         }
     }
-    async fn get_proof_miner_rewards_tree_value_or_none(&self, rid: &QRealmIdentifier, unique_pending_id: u64, job_id: JobId) -> anyhow::Result<Option<Hash>>{
-        let value_bytes: Option<Vec<u8>> = self.qtdb_raw_kv_get_value(&tt_get_rewards_tag_tree_value_key_from_job(rid.realm_id, rid.realm_sub_id, unique_pending_id, &job_id)).await?;
+    async fn get_proof_miner_rewards_tree_value_or_none(&self, rid: &QRealmIdentifier, context: &PendingContext<Hash>, job_id: JobId) -> anyhow::Result<Option<Hash>>{
+        let value_bytes: Option<Vec<u8>> = self.qtdb_raw_kv_get_value(&tt_get_rewards_tag_tree_value_key_v2(rid, context, &job_id)?).await?;
         if value_bytes.is_some() {
             let hash = Hash::from_slice_32bytes(&value_bytes.unwrap())?;
             Ok(Some(hash))
@@ -609,16 +613,16 @@ impl<Hash: Q256BitHash, JobId: QJobIdBase + 'static, D: QTempDatabaseRawKVReader
             Ok(None)
         }
     }
-    async fn get_proof_claim_tag(&self, rid: &QRealmIdentifier, unique_pending_id: u64, job_id: JobId) -> anyhow::Result<Hash> {
-        let value_bytes: Option<Vec<u8>> = self.qtdb_raw_kv_get_value(&tt_get_proof_claim_tag_key_from_job(rid.realm_id, rid.realm_sub_id, unique_pending_id, &job_id)).await?;
+    async fn get_proof_claim_tag(&self, rid: &QRealmIdentifier, context: &PendingContext<Hash>, job_id: JobId) -> anyhow::Result<Hash> {
+        let value_bytes: Option<Vec<u8>> = self.qtdb_raw_kv_get_value(&tt_get_proof_claim_tag_key_v2(rid, context, &job_id)?).await?;
         if let Some(v) = value_bytes {
             Hash::from_slice_32bytes(&v)
         } else {
-            anyhow::bail!("get_proof_claim_tag not found for job {:?} at unique_pending_id {}", job_id, unique_pending_id);
+            anyhow::bail!("get_proof_claim_tag not found for job {:?} in exact pending context", job_id);
         }
     }
-    async fn get_proof_claim_tag_or_none(&self, rid: &QRealmIdentifier, unique_pending_id: u64, job_id: JobId) -> anyhow::Result<Option<Hash>> {
-        let value_bytes: Option<Vec<u8>> = self.qtdb_raw_kv_get_value(&tt_get_proof_claim_tag_key_from_job(rid.realm_id, rid.realm_sub_id, unique_pending_id, &job_id)).await?;
+    async fn get_proof_claim_tag_or_none(&self, rid: &QRealmIdentifier, context: &PendingContext<Hash>, job_id: JobId) -> anyhow::Result<Option<Hash>> {
+        let value_bytes: Option<Vec<u8>> = self.qtdb_raw_kv_get_value(&tt_get_proof_claim_tag_key_v2(rid, context, &job_id)?).await?;
         if let Some(v) = value_bytes {
             Ok(Some(Hash::from_slice_32bytes(&v)?))
         } else {
@@ -629,13 +633,13 @@ impl<Hash: Q256BitHash, JobId: QJobIdBase + 'static, D: QTempDatabaseRawKVReader
 
 #[async_trait]
 impl<Hash: Q256BitHash, JobId: QJobIdBase + 'static, D: QTempDatabaseRawKVWriterBase + Sync> QTempDBRewardsTreeWriter<Hash, JobId> for D {
-    async fn set_proof_miner_rewards_tree_value(&self, rid: &QRealmIdentifier, unique_pending_id: u64, job_id: JobId, value: Hash) -> anyhow::Result<Hash>{
-        let key = tt_get_rewards_tag_tree_value_key_from_job(rid.realm_id, rid.realm_sub_id, unique_pending_id, &job_id);
+    async fn set_proof_miner_rewards_tree_value(&self, rid: &QRealmIdentifier, context: &PendingContext<Hash>, job_id: JobId, value: Hash) -> anyhow::Result<Hash>{
+        let key = tt_get_rewards_tag_tree_value_key_v2(rid, context, &job_id)?;
         self.qtdb_raw_kv_put_value(&key, &value.into_owned_32bytes()).await?;
         Ok(value)
     }
-    async fn set_proof_claim_tag(&self, rid: &QRealmIdentifier, unique_pending_id: u64, job_id: JobId, tag: Hash) -> anyhow::Result<Hash> {
-        let key = tt_get_proof_claim_tag_key_from_job(rid.realm_id, rid.realm_sub_id, unique_pending_id, &job_id);
+    async fn set_proof_claim_tag(&self, rid: &QRealmIdentifier, context: &PendingContext<Hash>, job_id: JobId, tag: Hash) -> anyhow::Result<Hash> {
+        let key = tt_get_proof_claim_tag_key_v2(rid, context, &job_id)?;
         self.qtdb_raw_kv_put_value(&key, &tag.into_owned_32bytes()).await?;
         Ok(tag)
     }
@@ -735,14 +739,14 @@ impl<T: QTempDatabaseRawKVWriterBase + Sync> QTempDBUserEndCapSlotUpdatesWriter 
 }
 
 #[async_trait]
-impl<JobId: QJobIdBase + 'static, D: QTempDatabaseRawKVReaderBase + Sync> QTempDBJobClaimInfoReader<JobId> for D {
+impl<Hash: Q256BitHash, JobId: QJobIdBase + 'static, D: QTempDatabaseRawKVReaderBase + Sync> QTempDBJobClaimInfoReader<Hash, JobId> for D {
     async fn get_job_claim(
         &self,
         rid: &QRealmIdentifier,
-        unique_pending_id: u64,
+        context: &PendingContext<Hash>,
         job_id: JobId,
     ) -> anyhow::Result<Option<([u8; 33], u64)>> {
-        let key = tt_get_job_claim_key_from_job(rid.realm_id, rid.realm_sub_id, unique_pending_id, &job_id);
+        let key = tt_get_job_claim_key_v2(rid, context, &job_id)?;
         let value_bytes = self.qtdb_raw_kv_get_value(&key).await?;
         match value_bytes {
             Some(v) if v.len() >= 41 => {
@@ -757,16 +761,16 @@ impl<JobId: QJobIdBase + 'static, D: QTempDatabaseRawKVReaderBase + Sync> QTempD
 }
 
 #[async_trait]
-impl<JobId: QJobIdBase + 'static, D: QTempDatabaseRawKVWriterBase + Sync> QTempDBJobClaimInfoWriter<JobId> for D {
+impl<Hash: Q256BitHash, JobId: QJobIdBase + 'static, D: QTempDatabaseRawKVWriterBase + Sync> QTempDBJobClaimInfoWriter<Hash, JobId> for D {
     async fn set_job_claim(
         &self,
         rid: &QRealmIdentifier,
-        unique_pending_id: u64,
+        context: &PendingContext<Hash>,
         job_id: JobId,
         public_key: &[u8; 33],
         claim_time_ms: u64,
     ) -> anyhow::Result<()> {
-        let key = tt_get_job_claim_key_from_job(rid.realm_id, rid.realm_sub_id, unique_pending_id, &job_id);
+        let key = tt_get_job_claim_key_v2(rid, context, &job_id)?;
         let mut value = [0u8; 41];
         value[0..33].copy_from_slice(public_key);
         value[33..41].copy_from_slice(&claim_time_ms.to_le_bytes());
@@ -825,14 +829,25 @@ mod tests {
             WorkUniquePendingId,
         },
     };
+    use psy_data::worker::metadata::{
+        PsyProvingJobMetadata, PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN,
+    };
 
     use crate::memory_stores::simple_memory_temp_store::SimpleMemoryTempStore;
     use crate::psy_temp_db::{
-        tt_get_current_pending_context_key, QTempDBPendingContextCleaner,
-        QTempDBPendingContextReader, QTempDBPendingContextWriter,
-        QTempDBRewardsTreeReader, QTempDBRewardsTreeWriter,
+        tt_get_current_pending_context_key,
+        tt_get_proof_witness_data_key_from_job,
+        QTempDBJobClaimInfoReader, QTempDBJobClaimInfoWriter,
+        QTempDBPendingContextCleaner, QTempDBPendingContextReader,
+        QTempDBPendingContextWriter, QTempDBProofWitnessReader,
+        QTempDBProofWitnessWriter, QTempDBProvingJobMetadataReader,
+        QTempDBProvingJobMetadataWriter, QTempDBRewardsTreeReader,
+        QTempDBRewardsTreeWriter,
     };
-    use crate::store::traits::temp_db::QTempDatabaseRawKVWriterBase;
+    use crate::store::traits::{
+        proof_store::QCanonicalProofStoreV2,
+        temp_db::QTempDatabaseRawKVWriterBase,
+    };
 
     fn pending_context() -> PendingContext<PHash> {
         PendingContext::new(
@@ -873,6 +888,32 @@ mod tests {
             WorkProcCheckpointUniqueId::from_u128(
                 0xffee_ddcc_bbaa_9988_7766_5544_3322_1100,
             ),
+        )
+    }
+
+    fn proof_work_context(
+        rid: QRealmIdentifier,
+        unique_pending_id: u64,
+        epoch: u64,
+    ) -> PendingContext<Hash256> {
+        PendingContext::new(
+            CanonicalChainRef::new(
+                NetworkId::try_from_chain_id(0x6979_7350).unwrap(),
+                ChainEpoch::new(epoch),
+                CheckpointRef::new(
+                    CheckpointId::new(367),
+                    CheckpointHash::from_last_chain_hash(Hash256([
+                        epoch as u8;
+                        32
+                    ])),
+                ),
+            ),
+            AuthorityScope::Realm {
+                realm_id: rid.realm_id,
+                realm_sub_id: rid.realm_sub_id,
+            },
+            WorkUniquePendingId::new(unique_pending_id),
+            WorkProcCheckpointUniqueId::from_u128(epoch as u128 + 1000),
         )
     }
 
@@ -987,6 +1028,7 @@ mod tests {
         let store = SimpleMemoryTempStore::new();
         let rid = QRealmIdentifier::new(0x0a0b_0c0d, 0x0e0f);
         let unique_pending_id: u64 = 0x1122_3344_5566_7788;
+        let context = proof_work_context(rid, unique_pending_id, 7);
 
         // Fixed, reproducible job id using a real QJobIdBase type (not raw bytes), so the
         // blanket reward-trait impls (which require JobId: QJobIdBase) are exercised exactly
@@ -1012,7 +1054,7 @@ mod tests {
 
         // 1. Record the worker's claim tag.
         let written_tag = store
-            .set_proof_claim_tag(&rid, unique_pending_id, job_id, claim_tag)
+            .set_proof_claim_tag(&rid, &context, job_id, claim_tag)
             .await
             .unwrap();
         assert_eq!(
@@ -1024,21 +1066,21 @@ mod tests {
         //    the claim-tag key it would return Some(claim_tag) here instead of None.
         assert_eq!(
             store
-                .get_proof_claim_tag_or_none(&rid, unique_pending_id, job_id)
+                .get_proof_claim_tag_or_none(&rid, &context, job_id)
                 .await
                 .unwrap()
                 .map(|h: Hash256| h.into_owned_32bytes()),
             Some(claim_tag.into_owned_32bytes())
         );
         let reward_before_finalize: Option<Hash256> = store
-            .get_proof_miner_rewards_tree_value_or_none(&rid, unique_pending_id, job_id)
+            .get_proof_miner_rewards_tree_value_or_none(&rid, &context, job_id)
             .await
             .unwrap();
         assert!(reward_before_finalize.is_none());
 
         // 3. Record the finalized reward.
         let written_reward = store
-            .set_proof_miner_rewards_tree_value(&rid, unique_pending_id, job_id, final_reward)
+            .set_proof_miner_rewards_tree_value(&rid, &context, job_id, final_reward)
             .await
             .unwrap();
         assert_eq!(
@@ -1049,7 +1091,7 @@ mod tests {
         // 4. Finalized reward is readable under the reward key.
         assert_eq!(
             store
-                .get_proof_miner_rewards_tree_value_or_none(&rid, unique_pending_id, job_id)
+                .get_proof_miner_rewards_tree_value_or_none(&rid, &context, job_id)
                 .await
                 .unwrap()
                 .map(|h: Hash256| h.into_owned_32bytes()),
@@ -1062,14 +1104,14 @@ mod tests {
         //    wrote the claim-tag key, the claim read here would yield final_reward instead.
         assert_eq!(
             store
-                .get_proof_claim_tag_or_none(&rid, unique_pending_id, job_id)
+                .get_proof_claim_tag_or_none(&rid, &context, job_id)
                 .await
                 .unwrap()
                 .map(|h: Hash256| h.into_owned_32bytes()),
             Some(claim_tag.into_owned_32bytes())
         );
         let claim_roundtrip: Hash256 = store
-            .get_proof_claim_tag(&rid, unique_pending_id, job_id)
+            .get_proof_claim_tag(&rid, &context, job_id)
             .await
             .unwrap();
         assert_eq!(
@@ -1094,6 +1136,175 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn proof_work_v2_records_are_branch_exact_without_v1_fallback() {
+        let store = SimpleMemoryTempStore::new();
+        let rid = QRealmIdentifier::new(0x0a0b_0c0d, 0x0e0f);
+        let unique_pending_id = 0x1122_3344_5566_7788;
+        let branch_a = proof_work_context(rid, unique_pending_id, 7);
+        let branch_b = proof_work_context(rid, unique_pending_id, 8);
+        let job_id = sample_job_id();
+        let witness = vec![1, 3, 3, 7];
+        let reward = Hash256([0x22; 32]);
+        let claim_tag = Hash256([0x11; 32]);
+        let public_key = [0x03; 33];
+        let metadata = PsyProvingJobMetadata {
+            expected_public_inputs_hash: Hash256([0x44; 32]),
+            reward_tree_hash_mode: PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN,
+            reward_tree_node_index: 3,
+            reward_tree_node_level: 4,
+            reward_tree_node_children: 0,
+            dependencies: vec![],
+        };
+
+        store
+            .set_tdb_proof_witnesses_tuple_owned_raw(
+                &rid,
+                &branch_a,
+                vec![(job_id, witness.clone())],
+            )
+            .await
+            .unwrap();
+        store
+            .set_proving_job_metadata(&rid, &branch_a, job_id, &metadata)
+            .await
+            .unwrap();
+        store
+            .set_proof_miner_rewards_tree_value(&rid, &branch_a, job_id, reward)
+            .await
+            .unwrap();
+        store
+            .set_proof_claim_tag(&rid, &branch_a, job_id, claim_tag)
+            .await
+            .unwrap();
+        store
+            .set_job_claim(&rid, &branch_a, job_id, &public_key, 1234)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .get_tdb_proof_witness_bytes(&rid, &branch_a, job_id)
+                .await
+                .unwrap(),
+            witness,
+        );
+        assert_eq!(
+            store
+                .get_proof_miner_rewards_tree_value_or_none(
+                    &rid,
+                    &branch_a,
+                    job_id,
+                )
+                .await
+                .unwrap(),
+            Some(reward),
+        );
+        assert_eq!(
+            store
+                .get_proof_claim_tag_or_none(&rid, &branch_a, job_id)
+                .await
+                .unwrap(),
+            Some(claim_tag),
+        );
+        assert_eq!(
+            store
+                .get_job_claim(&rid, &branch_a, job_id)
+                .await
+                .unwrap(),
+            Some((public_key, 1234)),
+        );
+        assert!(
+            store
+                .get_proving_job_metadata(&rid, &branch_a, job_id)
+                .await
+                .is_ok()
+        );
+
+        assert!(
+            store
+                .get_tdb_proof_witness_bytes(&rid, &branch_b, job_id)
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .get_proving_job_metadata(&rid, &branch_b, job_id)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .get_proof_miner_rewards_tree_value_or_none(
+                    &rid,
+                    &branch_b,
+                    job_id,
+                )
+                .await
+                .unwrap(),
+            None,
+        );
+        assert_eq!(
+            store
+                .get_proof_claim_tag_or_none(&rid, &branch_b, job_id)
+                .await
+                .unwrap(),
+            None,
+        );
+        assert_eq!(
+            store
+                .get_job_claim(&rid, &branch_b, job_id)
+                .await
+                .unwrap(),
+            None,
+        );
+
+        let branch_a_proof = store
+            .resolve_proof_address(&branch_a, &job_id)
+            .unwrap();
+        let branch_b_proof = store
+            .resolve_proof_address(&branch_b, &job_id)
+            .unwrap();
+        store
+            .put_proof_bytes_exact(&branch_a_proof, &[9, 8, 7])
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get_proof_bytes_exact(&branch_a_proof)
+                .await
+                .unwrap(),
+            Some(vec![9, 8, 7]),
+        );
+        assert_eq!(
+            store
+                .get_proof_bytes_exact(&branch_b_proof)
+                .await
+                .unwrap(),
+            None,
+        );
+
+        let mut legacy_job = job_id;
+        legacy_job.data_index = 2;
+        let legacy_key = tt_get_proof_witness_data_key_from_job(
+            rid.realm_id,
+            rid.realm_sub_id,
+            unique_pending_id,
+            &legacy_job,
+        );
+        store
+            .qtdb_raw_kv_put_value(&legacy_key, &[0xaa, 0xbb])
+            .await
+            .unwrap();
+        assert!(
+            store
+                .get_tdb_proof_witness_bytes(&rid, &branch_a, legacy_job)
+                .await
+                .is_err(),
+            "a V2 read must never fall back to the legacy pending-only key",
+        );
+    }
+
     // Claim tag survives an independent final-reward write to the same job. Defends the
     // forward direction of the checkpoint-367 contract: set_proof_miner_rewards_tree_value
     // must NOT write the claim-tag key. If it did (or the claim getter read the reward
@@ -1103,17 +1314,18 @@ mod tests {
         let store = SimpleMemoryTempStore::new();
         let rid = QRealmIdentifier::new(0x0a0b_0c0d, 0x0e0f);
         let unique_pending_id: u64 = 0x1122_3344_5566_7788;
+        let context = proof_work_context(rid, unique_pending_id, 7);
         let job_id = sample_job_id();
 
         let claim_tag = Hash256([0x11u8; 32]);
         let final_reward = Hash256([0x22u8; 32]);
 
         store
-            .set_proof_claim_tag(&rid, unique_pending_id, job_id, claim_tag)
+            .set_proof_claim_tag(&rid, &context, job_id, claim_tag)
             .await
             .unwrap();
         store
-            .set_proof_miner_rewards_tree_value(&rid, unique_pending_id, job_id, final_reward)
+            .set_proof_miner_rewards_tree_value(&rid, &context, job_id, final_reward)
             .await
             .unwrap();
 
@@ -1122,14 +1334,14 @@ mod tests {
         // reward write aliased the claim key.
         assert_eq!(
             store
-                .get_proof_claim_tag_or_none(&rid, unique_pending_id, job_id)
+                .get_proof_claim_tag_or_none(&rid, &context, job_id)
                 .await
                 .unwrap()
                 .map(|h: Hash256| h.into_owned_32bytes()),
             Some(claim_tag.into_owned_32bytes())
         );
         let claim_roundtrip: Hash256 = store
-            .get_proof_claim_tag(&rid, unique_pending_id, job_id)
+            .get_proof_claim_tag(&rid, &context, job_id)
             .await
             .unwrap();
         assert_eq!(
@@ -1147,24 +1359,25 @@ mod tests {
         let store = SimpleMemoryTempStore::new();
         let rid = QRealmIdentifier::new(0x0a0b_0c0d, 0x0e0f);
         let unique_pending_id: u64 = 0x1122_3344_5566_7788;
+        let context = proof_work_context(rid, unique_pending_id, 7);
         let job_id = sample_job_id();
 
         let final_reward = Hash256([0x22u8; 32]);
         let claim_tag = Hash256([0x11u8; 32]);
 
         store
-            .set_proof_miner_rewards_tree_value(&rid, unique_pending_id, job_id, final_reward)
+            .set_proof_miner_rewards_tree_value(&rid, &context, job_id, final_reward)
             .await
             .unwrap();
         store
-            .set_proof_claim_tag(&rid, unique_pending_id, job_id, claim_tag)
+            .set_proof_claim_tag(&rid, &context, job_id, claim_tag)
             .await
             .unwrap();
 
         // The reward must still read back as the finalized reward, not the claim.
         assert_eq!(
             store
-                .get_proof_miner_rewards_tree_value_or_none(&rid, unique_pending_id, job_id)
+                .get_proof_miner_rewards_tree_value_or_none(&rid, &context, job_id)
                 .await
                 .unwrap()
                 .map(|h: Hash256| h.into_owned_32bytes()),
@@ -1181,18 +1394,19 @@ mod tests {
         let store = SimpleMemoryTempStore::new();
         let rid = QRealmIdentifier::new(0x0a0b_0c0d, 0x0e0f);
         let unique_pending_id: u64 = 0x1122_3344_5566_7788;
+        let context = proof_work_context(rid, unique_pending_id, 7);
         let job_id = sample_job_id();
 
         let final_reward = Hash256([0x22u8; 32]);
 
         store
-            .set_proof_miner_rewards_tree_value(&rid, unique_pending_id, job_id, final_reward)
+            .set_proof_miner_rewards_tree_value(&rid, &context, job_id, final_reward)
             .await
             .unwrap();
         // Reward is present under the reward key...
         assert_eq!(
             store
-                .get_proof_miner_rewards_tree_value_or_none(&rid, unique_pending_id, job_id)
+                .get_proof_miner_rewards_tree_value_or_none(&rid, &context, job_id)
                 .await
                 .unwrap()
                 .map(|h: Hash256| h.into_owned_32bytes()),
@@ -1202,7 +1416,7 @@ mod tests {
         // reward value.
         assert_eq!(
             store
-                .get_proof_claim_tag_or_none(&rid, unique_pending_id, job_id)
+                .get_proof_claim_tag_or_none(&rid, &context, job_id)
                 .await
                 .unwrap()
                 .map(|h: Hash256| h.into_owned_32bytes()),

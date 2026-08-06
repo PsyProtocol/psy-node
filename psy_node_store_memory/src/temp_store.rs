@@ -4,21 +4,24 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use parth_core::{
     data::{
-        queue::queue_key::{PCoreQueueItemBase, PCoreStandardQueueKeyForRealm, QPBaseQueueType},
+        queue::queue_key::{PCoreQueueItemBase, PCoreStandardQueueKeyForRealm},
         serializable::{QPDPair, QPDSerializable},
     },
     utils::auto_implement::QAutoImplementGeneric,
-    QCoreProcCheckpointUniqueId, QJobIdSerialized,
+    protocol::core_types::Q256BitHash,
+    QCoreProcCheckpointUniqueId, QJobIdBase, QJobIdSerialized,
 };
+use psy_data::protocol::chain_context::PendingContext;
 use psy_node_core::{
     queue::{
         ephemeral::{QStandardEphemeralQueuePublisher, QStandardEphemeralQueueSubscriber},
         infrastructure::QStandardQueueBase,
     },
     store::traits::{
-        proof_store::{QParthProofStoreReader, QParthProofStoreWriter},
+        proof_store::{QCanonicalProofStoreV2, QParthProofStoreReader, QParthProofStoreWriter},
         temp_db::{QTempDatabaseRawCounterReaderBase, QTempDatabaseRawCounterWriterBase, QTempDatabaseRawKVReaderBase, QTempDatabaseRawKVWriterBase},
     },
+    store::proof_namespace::{CanonicalProofStoreAddress, CanonicalProofStoreNamespace},
 };
 use tokio::sync::{Mutex, Notify};
 
@@ -36,6 +39,9 @@ struct Queue {
 pub struct InMemoryTempStore {
     /// Mimics Redis bucketed proof hashes. Stores pending_id -> (job_id -> proof_bytes).
     proof_store: Arc<DashMap<u64, Arc<DashMap<Vec<u8>, Vec<u8>>>>>,
+    /// Exact C-02b proof namespaces. Kept separate from V1 so no fallback can
+    /// accidentally expose a proof written under a bare pending ID.
+    proof_store_v2: Arc<DashMap<String, Arc<DashMap<Vec<u8>, Vec<u8>>>>>,
     /// Mimics the Redis HASH for KV pairs.
     kv_store: Arc<DashMap<Vec<u8>, Vec<u8>>>,
     /// Mimics the Redis HASH for counters, using i64 for efficiency.
@@ -61,6 +67,7 @@ impl InMemoryTempStore {
     pub fn new(root_prefix: String, realm_id: u64, realm_sub_id: u64) -> Self {
         Self {
             proof_store: Arc::new(DashMap::new()),
+            proof_store_v2: Arc::new(DashMap::new()),
             kv_store: Arc::new(DashMap::new()),
             counter_store: Arc::new(DashMap::new()),
             queues: Arc::new(DashMap::new()),
@@ -73,6 +80,63 @@ impl InMemoryTempStore {
     /// Helper to atomically get or create a queue handle.
     fn get_or_create_queue(&self, subject: &str) -> Arc<Queue> {
         self.queues.entry(subject.to_string()).or_default().clone()
+    }
+}
+
+#[async_trait]
+impl QCanonicalProofStoreV2 for InMemoryTempStore {
+    fn resolve_proof_address<Hash: Q256BitHash, JobId: QJobIdBase>(
+        &self,
+        context: &PendingContext<Hash>,
+        job_id: &JobId,
+    ) -> anyhow::Result<CanonicalProofStoreAddress> {
+        Ok(CanonicalProofStoreAddress::try_from_pending_context(
+            &self.root_prefix,
+            context,
+            job_id,
+        )?)
+    }
+
+    async fn get_proof_bytes_exact(
+        &self,
+        address: &CanonicalProofStoreAddress,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        Ok(self
+            .proof_store_v2
+            .get(address.redis_hash_key())
+            .and_then(|bucket| bucket.get(address.job_field()).map(|value| value.clone())))
+    }
+
+    async fn contains_proof_exact(
+        &self,
+        address: &CanonicalProofStoreAddress,
+    ) -> anyhow::Result<bool> {
+        Ok(self
+            .proof_store_v2
+            .get(address.redis_hash_key())
+            .is_some_and(|bucket| bucket.contains_key(address.job_field())))
+    }
+
+    async fn put_proof_bytes_exact(
+        &self,
+        address: &CanonicalProofStoreAddress,
+        proof_bytes: &[u8],
+    ) -> anyhow::Result<()> {
+        let bucket = self
+            .proof_store_v2
+            .entry(address.redis_hash_key().to_owned())
+            .or_insert_with(|| Arc::new(DashMap::new()))
+            .clone();
+        bucket.insert(address.job_field().to_vec(), proof_bytes.to_vec());
+        Ok(())
+    }
+
+    async fn delete_proof_namespace_exact(
+        &self,
+        namespace: &CanonicalProofStoreNamespace,
+    ) -> anyhow::Result<()> {
+        self.proof_store_v2.remove(namespace.redis_hash_key());
+        Ok(())
     }
 }
 

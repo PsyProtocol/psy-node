@@ -8,12 +8,14 @@ use fred::{
 };
 use parth_core::{
     data::{
-        queue::queue_key::{PCoreQueueItemBase, PCoreStandardQueueKeyForRealm, QPBaseQueueType},
+        queue::queue_key::{PCoreQueueItemBase, PCoreStandardQueueKeyForRealm},
         serializable::{QPDPair, QPDSerializable},
     },
+    protocol::core_types::Q256BitHash,
     utils::auto_implement::QAutoImplementGeneric,
-    QCoreProcCheckpointUniqueId, QJobIdSerialized,
+    QCoreProcCheckpointUniqueId, QJobIdBase, QJobIdSerialized,
 };
+use psy_data::protocol::chain_context::PendingContext;
 use psy_node_core::{
     queue::{
         ephemeral::{QStandardEphemeralQueuePublisher, QStandardEphemeralQueueSubscriber},
@@ -637,6 +639,18 @@ impl QParthProofStoreWriter for StandardFredRedisStore {
 
 #[async_trait]
 impl QCanonicalProofStoreV2 for StandardFredRedisStore {
+    fn resolve_proof_address<Hash: Q256BitHash, JobId: QJobIdBase>(
+        &self,
+        context: &PendingContext<Hash>,
+        job_id: &JobId,
+    ) -> anyhow::Result<CanonicalProofStoreAddress> {
+        Ok(CanonicalProofStoreAddress::try_from_pending_context(
+            &self.root_prefix,
+            context,
+            job_id,
+        )?)
+    }
+
     async fn get_proof_bytes_exact(
         &self,
         address: &CanonicalProofStoreAddress,

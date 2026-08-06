@@ -17,7 +17,7 @@ use psy_node_core::{
         ephemeral::QStandardEphemeralQueueSubscriber,
         worker_queue::{QStandardWorkerQueuePublisher, QStandardWorkerQueueSubscriber},
     },
-    store::traits::proof_store::QParthProofStore,
+    store::traits::proof_store::{QCanonicalProofStoreV2, QParthProofStore},
     store::canonical_head::{
         CanonicalHeadBootstrapProfile, CoordinatorCanonicalHeadStore,
     },
@@ -35,7 +35,7 @@ pub async fn create_coordinator_processor<
     DeployContractQueue: QStandardEphemeralQueueSubscriber + Send + Sync + 'static,
     ProofWorkQueue: QStandardWorkerQueuePublisher + QStandardWorkerQueueSubscriber + Send + Sync + 'static,
     TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash> + Send + Sync + 'static,
-    ProofStore: QParthProofStore + Send + Sync + 'static,
+    ProofStore: QParthProofStore + QCanonicalProofStoreV2 + Send + Sync + 'static,
     FileSystem: TokioLikeFileSystem + Send + Sync + 'static,
 >(
     genesis_data: &PsyGenesisBlockSetupData<N::F, N::QHash>,
@@ -197,7 +197,7 @@ pub async fn create_coordinator_processor_and_run<
     DeployContractQueue: QStandardEphemeralQueueSubscriber + Send + Sync + 'static,
     ProofWorkQueue: QStandardWorkerQueuePublisher + QStandardWorkerQueueSubscriber + Send + Sync + 'static,
     TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash> + Send + Sync + 'static,
-    ProofStore: QParthProofStore + Send + Sync + 'static,
+    ProofStore: QParthProofStore + QCanonicalProofStoreV2 + Send + Sync + 'static,
     FileSystem: TokioLikeFileSystem + Send + Sync + 'static,
 >(
     genesis_data: &PsyGenesisBlockSetupData<N::F, N::QHash>,

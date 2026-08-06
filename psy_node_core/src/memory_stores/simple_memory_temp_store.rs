@@ -5,17 +5,26 @@ use parth_core::{
         serializable::{QPDPair, QPDSerializable},
     },
     utils::auto_implement::QAutoImplementGeneric,
-    QJobIdSerialized,
+    protocol::core_types::Q256BitHash,
+    QJobIdBase, QJobIdSerialized,
 };
+use psy_data::protocol::chain_context::PendingContext;
 use std::{collections::HashMap, sync::{Arc, RwLock}};
 
-use crate::store::traits::{proof_store::{QParthProofStoreReader, QParthProofStoreWriter}, temp_db::{QTempDatabaseCounterReaderBase, QTempDatabaseCounterWriterBase, QTempDatabaseRawKVReaderBase, QTempDatabaseRawKVWriterBase}};
+use crate::store::{
+    proof_namespace::{CanonicalProofStoreAddress, CanonicalProofStoreNamespace},
+    traits::{
+        proof_store::{QCanonicalProofStoreV2, QParthProofStoreReader, QParthProofStoreWriter},
+        temp_db::{QTempDatabaseCounterReaderBase, QTempDatabaseCounterWriterBase, QTempDatabaseRawKVReaderBase, QTempDatabaseRawKVWriterBase},
+    },
+};
 
 #[derive(Debug, Clone)]
 pub struct SimpleMemoryTempStore {
     pub kv_map: Arc<RwLock<HashMap<Vec<u8>, Vec<u8>>>>,
     pub counter_map: Arc<RwLock<HashMap<Vec<u8>, i64>>>,
     pub proof_map: Arc<RwLock<HashMap<u64, HashMap<Vec<u8>, Vec<u8>>>>>,
+    pub proof_map_v2: Arc<RwLock<HashMap<String, HashMap<Vec<u8>, Vec<u8>>>>>,
 }
 impl SimpleMemoryTempStore {
     pub fn new() -> Self {
@@ -23,7 +32,76 @@ impl SimpleMemoryTempStore {
             kv_map: Arc::new(RwLock::new(HashMap::new())),
             counter_map: Arc::new(RwLock::new(HashMap::new())),
             proof_map: Arc::new(RwLock::new(HashMap::new())),
+            proof_map_v2: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+}
+
+#[async_trait]
+impl QCanonicalProofStoreV2 for SimpleMemoryTempStore {
+    fn resolve_proof_address<Hash: Q256BitHash, JobId: QJobIdBase>(
+        &self,
+        context: &PendingContext<Hash>,
+        job_id: &JobId,
+    ) -> anyhow::Result<CanonicalProofStoreAddress> {
+        Ok(CanonicalProofStoreAddress::try_from_pending_context(
+            "simple-memory",
+            context,
+            job_id,
+        )?)
+    }
+
+    async fn get_proof_bytes_exact(
+        &self,
+        address: &CanonicalProofStoreAddress,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        let guard = self
+            .proof_map_v2
+            .read()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        Ok(guard
+            .get(address.redis_hash_key())
+            .and_then(|bucket| bucket.get(address.job_field()).cloned()))
+    }
+
+    async fn contains_proof_exact(
+        &self,
+        address: &CanonicalProofStoreAddress,
+    ) -> anyhow::Result<bool> {
+        let guard = self
+            .proof_map_v2
+            .read()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        Ok(guard
+            .get(address.redis_hash_key())
+            .is_some_and(|bucket| bucket.contains_key(address.job_field())))
+    }
+
+    async fn put_proof_bytes_exact(
+        &self,
+        address: &CanonicalProofStoreAddress,
+        proof_bytes: &[u8],
+    ) -> anyhow::Result<()> {
+        let mut guard = self
+            .proof_map_v2
+            .write()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        guard
+            .entry(address.redis_hash_key().to_owned())
+            .or_default()
+            .insert(address.job_field().to_vec(), proof_bytes.to_vec());
+        Ok(())
+    }
+
+    async fn delete_proof_namespace_exact(
+        &self,
+        namespace: &CanonicalProofStoreNamespace,
+    ) -> anyhow::Result<()> {
+        self.proof_map_v2
+            .write()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?
+            .remove(namespace.redis_hash_key());
+        Ok(())
     }
 }
 

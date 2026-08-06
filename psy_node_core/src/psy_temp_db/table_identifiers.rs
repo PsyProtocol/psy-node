@@ -1,4 +1,10 @@
-use parth_core::{QJobIdBase, QJobIdSerialized};
+use parth_core::{
+    node::realm_identifier::QRealmIdentifier, protocol::core_types::Q256BitHash,
+    QJobIdBase, QJobIdSerialized, QJOB_ID_SERIALIZED_SIZE,
+};
+use psy_data::protocol::chain_context::{
+    AuthorityScope, PendingContext, PENDING_CONTEXT_V1_LEN,
+};
 
 pub const TEMP_TABLE_ID_WORKER_PROOF_METADATA: u16 = 0x5045; // 'EP'
 pub const TEMP_TABLE_ID_WORKER_PROOF_METADATA_BYTES: [u8; 2] = [0x45, 0x50]; // 'EP'
@@ -22,6 +28,18 @@ pub const TEMP_TABLE_ID_CURRENT_PENDING_CONTEXT: u16 = 0x4350; // 'PC'
 pub const TEMP_TABLE_ID_CURRENT_PENDING_CONTEXT_BYTES: [u8; 2] = [0x50, 0x43]; // 'PC'
 pub const TEMP_TABLE_CURRENT_PENDING_CONTEXT_KEY_SIZE: usize = 8; // 4 + 2 + 2
 
+/// Domain marker for branch-exact proof-work records in the temporary store.
+///
+/// V1 keys ended after `rid || table_id || pending_id || job_id`. V2 keeps the
+/// stable rid/table prefix, adds this marker, then embeds the complete canonical
+/// PendingContext before the job ID. Exact raw-KV lookup means V1 and V2 can
+/// coexist during a full-stop rollout without any read fallback.
+pub const TEMP_PROOF_WORK_CONTEXT_KEY_V2_MAGIC: [u8; 4] = *b"CTX2";
+pub const TEMP_PROOF_WORK_CONTEXT_KEY_V2_SIZE: usize =
+    4 + 2 + 2 + TEMP_PROOF_WORK_CONTEXT_KEY_V2_MAGIC.len()
+        + PENDING_CONTEXT_V1_LEN
+        + QJOB_ID_SERIALIZED_SIZE;
+
 #[inline(always)]
 pub fn tt_get_current_pending_context_key(
     realm_id: u32,
@@ -32,6 +50,95 @@ pub fn tt_get_current_pending_context_key(
     key[4..6].copy_from_slice(&realm_sub_id.to_le_bytes());
     key[6..8].copy_from_slice(&TEMP_TABLE_ID_CURRENT_PENDING_CONTEXT_BYTES);
     key
+}
+
+fn tt_get_context_job_key_v2<Hash: Q256BitHash, JobId: QJobIdBase>(
+    rid: &QRealmIdentifier,
+    table_id: [u8; 2],
+    context: &PendingContext<Hash>,
+    job_id: &JobId,
+) -> anyhow::Result<[u8; TEMP_PROOF_WORK_CONTEXT_KEY_V2_SIZE]> {
+    if !job_id.is_valid() {
+        anyhow::bail!("V2 temp proof-work key contains an invalid job ID");
+    }
+    if let AuthorityScope::Realm {
+        realm_id,
+        realm_sub_id,
+    } = context.authority()
+    {
+        if realm_id != rid.realm_id || realm_sub_id != rid.realm_sub_id {
+            anyhow::bail!("V2 temp proof-work context authority does not match realm identifier");
+        }
+    }
+
+    let mut key = [0u8; TEMP_PROOF_WORK_CONTEXT_KEY_V2_SIZE];
+    key[0..4].copy_from_slice(&rid.realm_id.to_le_bytes());
+    key[4..6].copy_from_slice(&rid.realm_sub_id.to_le_bytes());
+    key[6..8].copy_from_slice(&table_id);
+    key[8..12].copy_from_slice(&TEMP_PROOF_WORK_CONTEXT_KEY_V2_MAGIC);
+    key[12..(12 + PENDING_CONTEXT_V1_LEN)].copy_from_slice(&context.to_canonical_bytes());
+    key[(12 + PENDING_CONTEXT_V1_LEN)..].copy_from_slice(&job_id.to_bytes_fixed());
+    Ok(key)
+}
+
+pub fn tt_get_proving_job_metadata_key_v2<Hash: Q256BitHash, JobId: QJobIdBase>(
+    rid: &QRealmIdentifier,
+    context: &PendingContext<Hash>,
+    job_id: &JobId,
+) -> anyhow::Result<[u8; TEMP_PROOF_WORK_CONTEXT_KEY_V2_SIZE]> {
+    tt_get_context_job_key_v2(
+        rid,
+        TEMP_TABLE_ID_WORKER_PROOF_METADATA_BYTES,
+        context,
+        job_id,
+    )
+}
+
+pub fn tt_get_proof_witness_data_key_v2<Hash: Q256BitHash, JobId: QJobIdBase>(
+    rid: &QRealmIdentifier,
+    context: &PendingContext<Hash>,
+    job_id: &JobId,
+) -> anyhow::Result<[u8; TEMP_PROOF_WORK_CONTEXT_KEY_V2_SIZE]> {
+    tt_get_context_job_key_v2(
+        rid,
+        TEMP_TABLE_ID_PROOF_WITNESS_DATA_BYTES,
+        context,
+        job_id,
+    )
+}
+
+pub fn tt_get_rewards_tag_tree_value_key_v2<Hash: Q256BitHash, JobId: QJobIdBase>(
+    rid: &QRealmIdentifier,
+    context: &PendingContext<Hash>,
+    job_id: &JobId,
+) -> anyhow::Result<[u8; TEMP_PROOF_WORK_CONTEXT_KEY_V2_SIZE]> {
+    tt_get_context_job_key_v2(
+        rid,
+        TEMP_TABLE_ID_TAG_TREE_VALUES_BYTES,
+        context,
+        job_id,
+    )
+}
+
+pub fn tt_get_proof_claim_tag_key_v2<Hash: Q256BitHash, JobId: QJobIdBase>(
+    rid: &QRealmIdentifier,
+    context: &PendingContext<Hash>,
+    job_id: &JobId,
+) -> anyhow::Result<[u8; TEMP_PROOF_WORK_CONTEXT_KEY_V2_SIZE]> {
+    tt_get_context_job_key_v2(
+        rid,
+        TEMP_TABLE_ID_PROOF_CLAIM_TAG_BYTES,
+        context,
+        job_id,
+    )
+}
+
+pub fn tt_get_job_claim_key_v2<Hash: Q256BitHash, JobId: QJobIdBase>(
+    rid: &QRealmIdentifier,
+    context: &PendingContext<Hash>,
+    job_id: &JobId,
+) -> anyhow::Result<[u8; TEMP_PROOF_WORK_CONTEXT_KEY_V2_SIZE]> {
+    tt_get_context_job_key_v2(rid, TEMP_TABLE_ID_JOB_CLAIM_BYTES, context, job_id)
 }
 
 pub const TEMP_TABLE_ID_PROOF_WITNESS_DATA: u16 = 0x5750; // 'PW'
@@ -591,6 +698,53 @@ pub fn tt_get_worker_reputation_key(realm_id: u32, realm_sub_id: u16, public_key
 #[cfg(test)]
 mod tests {
     use super::*;
+    use parth_core::data::hash::hash256::Hash256;
+    use psy_core::job::job_id::{
+        ProvingJobCircuitType, ProvingJobDataType, QJobTopic,
+        QProvingJobDataID,
+    };
+    use psy_data::protocol::{
+        canonical_chain::{
+            CanonicalChainRef, ChainEpoch, CheckpointHash, CheckpointId,
+            CheckpointRef, NetworkId,
+        },
+        chain_context::{WorkProcCheckpointUniqueId, WorkUniquePendingId},
+    };
+
+    fn sample_job_id() -> QProvingJobDataID {
+        QProvingJobDataID {
+            topic: QJobTopic::GenerateStandardProof,
+            goal_id: 0x1122_3344_5566_7788,
+            circuit_type: ProvingJobCircuitType::BatchDeployContractsAggregate,
+            group_id: 0x1122_3344,
+            sub_group_id: 0x5566_7788,
+            task_index: 0x99aa_bbcc,
+            data_type: ProvingJobDataType::StandardProof,
+            data_index: 1,
+        }
+    }
+
+    fn sample_context(epoch: u64) -> PendingContext<Hash256> {
+        PendingContext::new(
+            CanonicalChainRef::new(
+                NetworkId::try_from_chain_id(0x6979_7350).unwrap(),
+                ChainEpoch::new(epoch),
+                CheckpointRef::new(
+                    CheckpointId::new(367),
+                    CheckpointHash::from_last_chain_hash(Hash256([
+                        epoch as u8;
+                        32
+                    ])),
+                ),
+            ),
+            AuthorityScope::Realm {
+                realm_id: 9,
+                realm_sub_id: 2,
+            },
+            WorkUniquePendingId::new(411),
+            WorkProcCheckpointUniqueId::from_u128(epoch as u128 + 1000),
+        )
+    }
 
     #[test]
     fn current_pending_context_key_has_stable_authority_layout() {
@@ -600,6 +754,78 @@ mod tests {
             [0x04, 0x03, 0x02, 0x01, 0x06, 0x05, 0x50, 0x43]
         );
         assert_eq!(&key[6..8], &TEMP_TABLE_ID_CURRENT_PENDING_CONTEXT_BYTES);
+    }
+
+    #[test]
+    fn proof_work_v2_key_embeds_exact_context_and_never_aliases_v1() {
+        let rid = QRealmIdentifier::new(9, 2);
+        let job_id = sample_job_id();
+        let context = sample_context(7);
+        let key = tt_get_proof_witness_data_key_v2(&rid, &context, &job_id)
+            .unwrap();
+        let legacy = tt_get_proof_witness_data_key_from_job(
+            rid.realm_id,
+            rid.realm_sub_id,
+            context.unique_pending_id().get(),
+            &job_id,
+        );
+
+        assert_eq!(key.len(), TEMP_PROOF_WORK_CONTEXT_KEY_V2_SIZE);
+        assert_eq!(&key[0..4], &rid.realm_id.to_le_bytes());
+        assert_eq!(&key[4..6], &rid.realm_sub_id.to_le_bytes());
+        assert_eq!(&key[6..8], &TEMP_TABLE_ID_PROOF_WITNESS_DATA_BYTES);
+        assert_eq!(&key[8..12], &TEMP_PROOF_WORK_CONTEXT_KEY_V2_MAGIC);
+        assert_eq!(
+            &key[12..(12 + PENDING_CONTEXT_V1_LEN)],
+            &context.to_canonical_bytes(),
+        );
+        assert_eq!(
+            &key[(12 + PENDING_CONTEXT_V1_LEN)..],
+            &job_id.to_bytes_fixed(),
+        );
+        assert_ne!(key.as_slice(), legacy.as_slice());
+    }
+
+    #[test]
+    fn proof_work_v2_key_changes_with_branch_and_table_domain() {
+        let rid = QRealmIdentifier::new(9, 2);
+        let job_id = sample_job_id();
+        let first = sample_context(7);
+        let second = sample_context(8);
+
+        assert_ne!(
+            tt_get_proof_witness_data_key_v2(&rid, &first, &job_id)
+                .unwrap(),
+            tt_get_proof_witness_data_key_v2(&rid, &second, &job_id)
+                .unwrap(),
+        );
+
+        let domain_keys = [
+            tt_get_proving_job_metadata_key_v2(&rid, &first, &job_id)
+                .unwrap(),
+            tt_get_proof_witness_data_key_v2(&rid, &first, &job_id).unwrap(),
+            tt_get_rewards_tag_tree_value_key_v2(&rid, &first, &job_id)
+                .unwrap(),
+            tt_get_proof_claim_tag_key_v2(&rid, &first, &job_id).unwrap(),
+            tt_get_job_claim_key_v2(&rid, &first, &job_id).unwrap(),
+        ];
+        for left in 0..domain_keys.len() {
+            for right in (left + 1)..domain_keys.len() {
+                assert_ne!(domain_keys[left], domain_keys[right]);
+            }
+        }
+    }
+
+    #[test]
+    fn proof_work_v2_key_rejects_realm_authority_mismatch() {
+        let wrong_rid = QRealmIdentifier::new(10, 2);
+        let error = tt_get_proof_witness_data_key_v2(
+            &wrong_rid,
+            &sample_context(7),
+            &sample_job_id(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("authority"));
     }
 
     // For identical realm/pending/job-id, the proof claim-tag key must differ from the

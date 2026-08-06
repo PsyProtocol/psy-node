@@ -5,7 +5,7 @@ use tower::limit::ConcurrencyLimitLayer;
 use parth_core::protocol::core_types::QNetworkTypesConfig;
 use psy_api_core::{realm::standard_edge_rpc::RealmEdgeRpcServer, worker::standard_worker_rpc::NodeEdgeWorkerRpcServer};
 use psy_core::job::job_id::QProvingJobDataID;
-use psy_node_core::{psy_core_db::traits::full::{PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmEdgeAPIStoreReader}, psy_temp_db::StandardEdgeAPITempDBStoreBase, queue::{ephemeral::QStandardEphemeralQueuePublisher, worker_queue::QStandardWorkerQueueSubscriber}, store::traits::proof_store::QParthProofStore};
+use psy_node_core::{psy_core_db::traits::full::{PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmEdgeAPIStoreReader}, psy_temp_db::StandardEdgeAPITempDBStoreBase, queue::{ephemeral::QStandardEphemeralQueuePublisher, worker_queue::QStandardWorkerQueueSubscriber}, store::traits::proof_store::{QCanonicalProofStoreV2, QParthProofStore}};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::compression::CompressionLayer;
 
@@ -18,7 +18,7 @@ pub async fn start_realm_edge_rpc_server<
         GUTAUpdateQueue: QStandardEphemeralQueuePublisher + Send + Sync + 'static,
         GetProofWorkQueue: QStandardWorkerQueueSubscriber + Send + Sync + 'static,
         TempDatabase: StandardEdgeAPITempDBStoreBase<N::JobId, N::QHash> + std::marker::Sync + std::marker::Send + 'static,
-        ProofStore: QParthProofStore + Send + Sync + 'static,
+        ProofStore: QParthProofStore + QCanonicalProofStoreV2 + Send + Sync + 'static,
 >(
     handler: RealmEdgeHandler<
         N,

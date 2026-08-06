@@ -23,7 +23,7 @@ use psy_data::{
     }}
 ;
 use psy_node_core::{
- psy_core_db::traits::full::{PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmEdgeAPIStoreReader}, psy_temp_db::StandardEdgeAPITempDBStoreBase, queue::{ephemeral::QStandardEphemeralQueuePublisher, worker_queue::QStandardWorkerQueueSubscriber}, store::traits::proof_store::QParthProofStore
+ psy_core_db::traits::full::{PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmEdgeAPIStoreReader}, psy_temp_db::StandardEdgeAPITempDBStoreBase, queue::{ephemeral::QStandardEphemeralQueuePublisher, worker_queue::QStandardWorkerQueueSubscriber}, store::traits::proof_store::{QCanonicalProofStoreV2, QParthProofStore}
 };
 
 use parth_core::crypto::secp256k1::REQUEST_TYPE_SUBMIT_PROOF;
@@ -49,7 +49,7 @@ impl<
         UserUpdateQueue: QStandardEphemeralQueuePublisher,
         GetProofWorkQueue: QStandardWorkerQueueSubscriber,
         TempDatabase: StandardEdgeAPITempDBStoreBase<N::JobId, N::QHash> + Send + Sync,
-        ProofStore: QParthProofStore,
+        ProofStore: QParthProofStore + QCanonicalProofStoreV2,
     > RealmEdgeHandler<N, S, STagTreeRewards, UserUpdateQueue, GetProofWorkQueue, TempDatabase, ProofStore>
 {
     fn expected_authority(&self) -> anyhow::Result<AuthorityScope> {
@@ -125,9 +125,13 @@ impl<
 
 
     pub async fn has_job_id_already_been_submitted(&self, unique_pending_id: u64, job_id: N::JobId) -> anyhow::Result<bool> {
+        let pending_context = self.require_current_pending_context().await?;
+        if pending_context.unique_pending_id().get() != unique_pending_id {
+            anyhow::bail!("requested pending ID is not the current exact context");
+        }
         Ok(self
             .temp_db
-            .get_proof_miner_rewards_tree_value_or_none(&self.realm_identifier, unique_pending_id, job_id)
+            .get_proof_miner_rewards_tree_value_or_none(&self.realm_identifier, &pending_context, job_id)
             .await?
             .is_some())
     }
@@ -213,7 +217,6 @@ impl<
         self.verify_miner_api_signature_and_check_reputation(&signature, &request).await?;
 
         let pending_context = self.require_current_pending_context().await?;
-        let unique_pending_id = pending_context.unique_pending_id().get();
         let unique_proc_id = pending_context.proc_checkpoint_unique_id().as_u128();
 
         let queue_key = RealmProvingWorkQueueKey::<N::QHash, N::JobId> {
@@ -238,7 +241,7 @@ impl<
 
         let witness_bytes: Vec<u8> = self
             .temp_db
-            .get_tdb_proof_witness_bytes(&self.realm_identifier, unique_pending_id, work_item.job_id.get_input_witness_id())
+            .get_tdb_proof_witness_bytes(&self.realm_identifier, &pending_context, work_item.job_id.get_input_witness_id())
             .await?;
 
         let children_reward_tree_values = {
@@ -253,7 +256,7 @@ impl<
                     } else {
                         let value: N::QHash = self
                             .temp_db
-                            .get_proof_miner_rewards_tree_value(&self.realm_identifier, unique_pending_id, *dependency)
+                            .get_proof_miner_rewards_tree_value(&self.realm_identifier, &pending_context, *dependency)
                             .await?;
                         values.push(value);
                     }
@@ -273,7 +276,7 @@ impl<
         self.temp_db
             .set_proving_job_metadata(
                 &self.realm_identifier,
-                unique_pending_id,
+                &pending_context,
                 response.job.job_id.get_output_id(),
                 &response.job.metadata,
             )
@@ -281,7 +284,7 @@ impl<
         self.temp_db
             .set_proof_claim_tag(
                 &self.realm_identifier,
-                unique_pending_id,
+                &pending_context,
                 response.job.job_id.get_input_witness_id(),
                 N::QHash::from_ref_32bytes(&request.tag),
             )
@@ -289,7 +292,7 @@ impl<
         self.temp_db
             .set_job_claim(
                 &self.realm_identifier,
-                unique_pending_id,
+                &pending_context,
                 response.job.job_id.get_output_id(),
                 &signature.public_key,
                 chrono::Utc::now().timestamp_millis() as u64,
@@ -310,7 +313,6 @@ impl<
 
 
         let pending_context = self.require_current_pending_context().await?;
-        let unique_pending_id = pending_context.unique_pending_id().get();
         let unique_proc_id = pending_context.proc_checkpoint_unique_id().as_u128();
         timer.lap_micros("get_current_unique_pending_id_internal");
 
@@ -343,12 +345,21 @@ impl<
             .metadata
             .dependencies
             .iter()
-            .map(|id| self.proof_store.get_proof_bytes_by_job_id(id.get_output_id(), unique_pending_id))
+            .map(|id| {
+                let address = self
+                    .proof_store
+                    .resolve_proof_address(&pending_context, &id.get_output_id());
+                async move {
+                    self.proof_store
+                        .get_proof_bytes_exact(&address?)
+                        .await
+                }
+            })
             .collect::<Vec<_>>()
             .into_iter();
-        timer.lap_micros("collect get_proof_bytes_by_job_id futures");
+        timer.lap_micros("collect get_proof_bytes_exact futures");
         let res: Vec<Option<Vec<u8>>> = try_join_all(child_proofs).await?;
-        timer.lap_micros("try_join_all get_proof_bytes_by_job_id futures");
+        timer.lap_micros("try_join_all get_proof_bytes_exact futures");
         let mut final_child_proofs: Vec<Vec<u8>> = Vec::with_capacity(res.len());
 
         for (index, item) in res.into_iter().enumerate() {
@@ -363,7 +374,7 @@ impl<
         //println!("getting proof witness bytes: {:?}", work_item.job_id.get_input_witness_id());
         let witness_bytes: Vec<u8> = self
             .temp_db
-            .get_tdb_proof_witness_bytes(&self.realm_identifier, unique_pending_id, work_item.job_id.get_input_witness_id())
+            .get_tdb_proof_witness_bytes(&self.realm_identifier, &pending_context, work_item.job_id.get_input_witness_id())
             .await?;
         timer.lap_micros("get_tdb_proof_witness_bytes");
         //println!("got proof witness bytes, len: {}", witness_bytes.len());
@@ -379,7 +390,7 @@ impl<
                     } else {
                         let value: N::QHash = self
                             .temp_db
-                            .get_proof_miner_rewards_tree_value(&self.realm_identifier, unique_pending_id, *dependency)
+                            .get_proof_miner_rewards_tree_value(&self.realm_identifier, &pending_context, *dependency)
                             .await?;
                         values.push(value);
                     }
@@ -400,7 +411,7 @@ impl<
         self.temp_db
             .set_proving_job_metadata(
                 &self.realm_identifier,
-                unique_pending_id,
+                &pending_context,
                 response.job.job_id.get_output_id(),
                 &response.job.metadata,
             )
@@ -416,7 +427,7 @@ impl<
         self.temp_db
             .set_proof_claim_tag(
                 &self.realm_identifier,
-                unique_pending_id,
+                &pending_context,
                 response.job.job_id.get_input_witness_id(),
                 N::QHash::from_ref_32bytes(&request.tag),
             )
@@ -426,7 +437,7 @@ impl<
         self.temp_db
             .set_job_claim(
                 &self.realm_identifier,
-                unique_pending_id,
+                &pending_context,
                 response.job.job_id.get_output_id(),
                 &signature.public_key,
                 claim_time_ms,
@@ -459,12 +470,18 @@ impl<
         let work_context = self
             .require_exact_current_work_context(work_context)
             .await?;
+        let pending_context = PendingContext::new(
+            *work_context.chain(),
+            work_context.authority(),
+            work_context.unique_pending_id(),
+            work_context.proc_checkpoint_unique_id(),
+        );
         let job_id = work_context.job_id().get_output_id();
         let unique_pending_id = work_context.unique_pending_id().get();
         let unique_proc_id = work_context.proc_checkpoint_unique_id().as_u128();
         let job_claim = self
             .temp_db
-            .get_job_claim(&self.realm_identifier, unique_pending_id, job_id)
+            .get_job_claim(&self.realm_identifier, &pending_context, job_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("no exact job claim exists for submitted work context"))?;
         timer.lap_micros("require_exact_current_work_context");
@@ -475,7 +492,7 @@ impl<
         // finalized reward-tree value key, so it can never observe a finalized reward value.
         let expected_tag = self
             .temp_db
-            .get_proof_claim_tag(&self.realm_identifier, unique_pending_id, job_id.get_input_witness_id())
+            .get_proof_claim_tag(&self.realm_identifier, &pending_context, job_id.get_input_witness_id())
             .await?;
         if expected_tag != tag {
             self.temp_db
@@ -487,7 +504,7 @@ impl<
 
         let metadata: PsyProvingJobMetadata<N::QHash, N::JobId> = self
             .temp_db
-            .get_proving_job_metadata(&self.realm_identifier, unique_pending_id, job_id.get_output_id())
+            .get_proving_job_metadata(&self.realm_identifier, &pending_context, job_id.get_output_id())
             .await?;
 
         timer.lap_micros("get_proving_job_metadata");
@@ -501,7 +518,7 @@ impl<
                         N::QHash::get_zero_value()
                     } else {
                         self.temp_db
-                            .get_proof_miner_rewards_tree_value(&self.realm_identifier, unique_pending_id, dependency.get_output_id())
+                            .get_proof_miner_rewards_tree_value(&self.realm_identifier, &pending_context, dependency.get_output_id())
                             .await?
                     };
                     values.push(value);
@@ -552,13 +569,13 @@ impl<
 
         // HACK: now set the correct reward tree value
         self.temp_db
-            .set_proof_miner_rewards_tree_value(&self.realm_identifier, unique_pending_id, job_id, reward_tree_value)
+            .set_proof_miner_rewards_tree_value(&self.realm_identifier, &pending_context, job_id, reward_tree_value)
             .await?;
 
         timer.lap_micros("set_proof_miner_rewards_tree_value");
         if self
             .temp_db
-            .get_proof_miner_rewards_tree_value(&self.realm_identifier, unique_pending_id, job_id)
+            .get_proof_miner_rewards_tree_value(&self.realm_identifier, &pending_context, job_id)
             .await?
             != reward_tree_value
         {
@@ -566,10 +583,13 @@ impl<
         }
 
         timer.lap_micros("get_proof_miner_rewards_tree_value");
+        let proof_address = self
+            .proof_store
+            .resolve_proof_address(&pending_context, &job_id.get_output_id())?;
         self.proof_store
-            .put_proof_bytes_for_job_id(job_id.get_output_id(), unique_pending_id, &proof_bytes)
+            .put_proof_bytes_exact(&proof_address, &proof_bytes)
             .await?;
-        timer.lap_micros("put_proof_bytes_for_job_id");
+        timer.lap_micros("put_proof_bytes_exact");
 
         let job_duration_ms = (chrono::Utc::now().timestamp_millis() as u64)
             .saturating_sub(job_claim.1);

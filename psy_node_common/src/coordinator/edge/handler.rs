@@ -43,7 +43,7 @@ use psy_node_core::{
         },
         timestamp::{CommitWriteTimestampUs, TimestampFenceWindow},
     },
-    store::traits::proof_store::QParthProofStore,
+    store::traits::proof_store::{QCanonicalProofStoreV2, QParthProofStore},
 };
 use psy_serialize::{PsyCanonicalDatabaseSerializeBaseMulti, PsyCanonicalDatabaseSerializeBaseSingle};
 
@@ -939,7 +939,7 @@ impl<
         DeployContractQueue: QStandardEphemeralQueuePublisher,
         GetProofWorkQueue: QStandardWorkerQueueSubscriber,
         TempDatabase: StandardEdgeAPITempDBStoreBase<N::JobId, N::QHash>,
-        ProofStore: QParthProofStore,
+        ProofStore: QParthProofStore + QCanonicalProofStoreV2,
     >
     CoordinatorEdgeHandler<
         N,
@@ -984,6 +984,20 @@ impl<
         let proof_bytes = Arc::new(proof_bytes);
 
         let (unique_pending_id, proc_checkpoint_id) = self.get_current_gathering_unique_pending_id_internal().await?;
+        let pending_context = self
+            .temp_db
+            .require_pending_context_for_pending_id(
+                &self.realm_identifier,
+                unique_pending_id,
+            )
+            .await?;
+        if pending_context.proc_checkpoint_unique_id().as_u128() != proc_checkpoint_id {
+            anyhow::bail!(
+                "current pending context proc ID {} does not match gathering proc ID {}",
+                pending_context.proc_checkpoint_unique_id().as_u128(),
+                proc_checkpoint_id,
+            );
+        }
         self.ensure_guta_matches_current_coordinator_state(realm_id_u64, &input).await?;
 
         let status = rand::random::<u64>() & 0x0fff_ffff_ffff_ffff;
@@ -1015,6 +1029,14 @@ impl<
             }
         }).await??;
         self.require_mutating_service_available_internal(CoordinatorMutatingEdgeOperation::SubmitGuta).await?;
+        let current_context = self
+            .temp_db
+            .get_current_pending_context(&self.realm_identifier)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("current pending context disappeared during GUTA verification"))?;
+        if current_context != pending_context {
+            anyhow::bail!("pending context changed during GUTA verification");
+        }
         if self
             .temp_db
             .get_submitted_status_for_pending(&self.realm_identifier, unique_pending_id, realm_id_u64)
@@ -1042,8 +1064,11 @@ impl<
                 unique_pending_id
             );
         }
+        let proof_address = self
+            .proof_store
+            .resolve_proof_address(&pending_context, &output_proof_job_id)?;
         self.proof_store
-            .put_proof_bytes_for_job_id(&output_proof_job_id, unique_pending_id, &proof_bytes)
+            .put_proof_bytes_exact(&proof_address, &proof_bytes)
             .await?;
 
         let queue_item = GlobalUserTreeAggregatorHeaderWithTagValueAndJobID {

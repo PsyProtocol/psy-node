@@ -13,6 +13,10 @@ use psy_data::{
         GUTAVerifyLeftGUTARightEndCapCircuitInputV2, GUTAVerifyTwoEndCapCircuitInputV2, GUTAVerifyTwoGUTALinearCircuitInput,
         SubmitUserEndCapNonProofCoreInput, VerifySingleEndCapInputV2,
     },
+    protocol::{
+        canonical_chain::{CanonicalChainRef, ChainEpoch, CheckpointHash, CheckpointId, CheckpointRef, NetworkId},
+        chain_context::{AuthorityScope, PendingContext, WorkProcCheckpointUniqueId, WorkUniquePendingId},
+    },
     queue_items::realm_user_update::PsyRealmUserUpdateQueueItem,
     v1::qdata::{
         contract::{DashMapContractHeightCache, PSimpleContractHeightCache},
@@ -31,7 +35,7 @@ use psy_node_core::{
         PsyNodeGlobalUserTreeDatabaseWriter, PsyNodeUserContractTreeDatabaseReader, PsyNodeUserContractTreeDatabaseWriter,
         PsyNodeUserRegistrationTreeDatabaseWriter,
     },
-    psy_temp_db::{QTempDBProofWitnessReader, QTempDBSubmitStatusWriter, QTempDBUserContractUpdatesWriter},
+    psy_temp_db::{QTempDBPendingContextReader, QTempDBPendingContextWriter, QTempDBProofWitnessReader, QTempDBSubmitStatusWriter, QTempDBUserContractUpdatesWriter},
     qblob::structs::common::blob_metadata_header::QBlobWriterContextMetadataHeader,
 };
 use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
@@ -423,6 +427,25 @@ impl RGPTestChainState {
         let unique_pending_id = self.unique_pending_id;
         let start_realm_root = self.first_realm_global_user_tree.get_root();
         let old_checkpoint_root = self.checkpoint_tree_root;
+        let pending_context = PendingContext::new(
+            CanonicalChainRef::new(
+                NetworkId::try_from_chain_id(0x6979_7350)?,
+                ChainEpoch::new(0),
+                CheckpointRef::new(
+                    CheckpointId::new(checkpoint_id),
+                    CheckpointHash::from_last_chain_hash(old_checkpoint_root),
+                ),
+            ),
+            AuthorityScope::Realm {
+                realm_id: self.realm_identifier.realm_id,
+                realm_sub_id: self.realm_identifier.realm_sub_id,
+            },
+            WorkUniquePendingId::new(unique_pending_id),
+            WorkProcCheckpointUniqueId::from_u128(self.unique_cord_proc_id),
+        );
+        self.temp_db
+            .set_current_pending_context(&self.realm_identifier, &pending_context)
+            .await?;
         for contract_height in contracts_to_deploy.iter() {
             self.add_new_contract(*contract_height).await?;
         }
@@ -582,7 +605,13 @@ impl RGPTestChainState {
         for level in job_levels.iter() {
             let mut level_outputs = Vec::with_capacity(level.len());
             for j in level.iter() {
-                let raw_witness = self.temp_db.get_tdb_proof_witness_bytes(&self.realm_identifier, self.unique_pending_id, j.job_id).await.map_err(|e|{
+                let pending_context: PendingContext<Hash> = self.temp_db
+                    .require_pending_context_for_pending_id(
+                        &self.realm_identifier,
+                        self.unique_pending_id,
+                    )
+                    .await?;
+                let raw_witness = self.temp_db.get_tdb_proof_witness_bytes(&self.realm_identifier, &pending_context, j.job_id).await.map_err(|e|{
                     anyhow::anyhow!("error fetching witness for job: {:?}: {:?}", j.job_id, e)
                 })?;
                 let info = RGPJobInfo::new_from_metadata_and_raw_witness(j, &raw_witness).map_err(|e|{

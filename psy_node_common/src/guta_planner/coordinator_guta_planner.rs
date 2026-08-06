@@ -683,9 +683,19 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> CoordinatorGUTAPlanner<F, Ha
 
         // 4. Save witnesses
         if !self.job_witnesses.is_empty() {
-             temp_store
-            .set_tdb_proof_witnesses_tuple_owned_raw(realm_identifier, unique_pending_id, self.job_witnesses)
-            .await?;
+            let pending_context = temp_store
+                .require_pending_context_for_pending_id(
+                    realm_identifier,
+                    unique_pending_id,
+                )
+                .await?;
+            temp_store
+                .set_tdb_proof_witnesses_tuple_owned_raw(
+                    realm_identifier,
+                    &pending_context,
+                    self.job_witnesses,
+                )
+                .await?;
         }
 
         Ok((self.job_levels, self.input_realm_reward_keys, root_guta_header))
@@ -725,7 +735,9 @@ mod tests {
             pm_rewards_commitment::PPMRewardCommitment,
         }, worker::metadata_with_job_id::PsyProvingJobMetadataWithJobId
     };
-    use psy_node_core::psy_temp_db::StandardProcessorTempDBStoreBase;
+    use psy_node_core::psy_temp_db::{
+        QTempDBPendingContextWriter, StandardProcessorTempDBStoreBase,
+    };
     use psy_node_store_memory::temp_store::InMemoryTempStore;
     use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
     use rand::Rng;
@@ -776,7 +788,19 @@ mod tests {
             TempStore: StandardProcessorTempDBStoreBase<QProvingJobDataID, Hash> + Send + Sync + 'a,
         {
             Box::pin(async move {
-                let data: Vec<u8> = temp_store.get_tdb_proof_witness_bytes(realm_identifier, unique_pending_id, job_id).await?;
+                let pending_context = temp_store
+                    .require_pending_context_for_pending_id(
+                        realm_identifier,
+                        unique_pending_id,
+                    )
+                    .await?;
+                let data: Vec<u8> = temp_store
+                    .get_tdb_proof_witness_bytes(
+                        realm_identifier,
+                        &pending_context,
+                        job_id,
+                    )
+                    .await?;
                 let (state_transition, computed_public_inputs_hash) = match job_id.circuit_type {
                     ProvingJobCircuitType::GUTATwoGUTA => {
                         let witness = GUTAVerifyTwoGUTACircuitInputV2::<F, Hash>::psy_ser_from_slice(&data)?;
@@ -1427,6 +1451,28 @@ mod tests {
         let (checkpoint_1_leaf_hash, _, stats_1, global_state_roots_1, _checkpoint_1_leaf_compact) = gen_random_checkpoint();
         checkpoint_tree.append_leaf(1, checkpoint_1_leaf_hash)?;
         let checkpoint_1_root = checkpoint_tree.get_root();
+        let pending_context = psy_data::protocol::chain_context::PendingContext::new(
+            psy_data::protocol::canonical_chain::CanonicalChainRef::new(
+                psy_data::protocol::canonical_chain::NetworkId::try_from_chain_id(
+                    0x6979_7350,
+                )?,
+                psy_data::protocol::canonical_chain::ChainEpoch::new(0),
+                psy_data::protocol::canonical_chain::CheckpointRef::new(
+                    psy_data::protocol::canonical_chain::CheckpointId::new(1),
+                    psy_data::protocol::canonical_chain::CheckpointHash::from_last_chain_hash(
+                        checkpoint_1_root,
+                    ),
+                ),
+            ),
+            psy_data::protocol::chain_context::AuthorityScope::Coordinator,
+            psy_data::protocol::chain_context::WorkUniquePendingId::new(
+                unique_pending_id,
+            ),
+            psy_data::protocol::chain_context::WorkProcCheckpointUniqueId::from_u128(1),
+        );
+        temp_store
+            .set_current_pending_context(&realm_identifier, &pending_context)
+            .await?;
 
         let jobs = gen_rand_unique_array_of_u64s_in_range(input_jobs_count, 0, 1u64 << REALM_LEVEL_U8)
             .into_iter()

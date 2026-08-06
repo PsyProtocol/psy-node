@@ -12,6 +12,29 @@ pub trait QTempDBPendingContextReader<Hash: Q256BitHash> {
         &self,
         rid: &QRealmIdentifier,
     ) -> anyhow::Result<Option<PendingContext<Hash>>>;
+
+    /// Resolve the atomically published context for a producer that still
+    /// carries the processing pending ID in its local state. There is no
+    /// legacy-key fallback: missing context or any pending mismatch fails
+    /// closed before a V2 proof-work key can be constructed.
+    async fn require_pending_context_for_pending_id(
+        &self,
+        rid: &QRealmIdentifier,
+        expected_unique_pending_id: u64,
+    ) -> anyhow::Result<PendingContext<Hash>> {
+        let context = self
+            .get_current_pending_context(rid)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("current pending context is unavailable"))?;
+        if context.unique_pending_id().get() != expected_unique_pending_id {
+            anyhow::bail!(
+                "current pending context ID {} does not match producer ID {}",
+                context.unique_pending_id().get(),
+                expected_unique_pending_id
+            );
+        }
+        Ok(context)
+    }
 }
 
 #[async_trait]
