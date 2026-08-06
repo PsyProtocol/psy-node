@@ -50,6 +50,12 @@ impl AuthorityLifecycleDigest {
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
+
+    pub const fn from_prepared_digest(
+        digest: AuthorityManifestDigest,
+    ) -> Self {
+        Self(*digest.as_bytes())
+    }
 }
 
 /// Digest of the canonical singleton/cursor payload written with an authority
@@ -522,6 +528,143 @@ pub struct CommittedAuthorityManifest<Hash> {
     lifecycle_digest: AuthorityLifecycleDigest,
 }
 
+/// Strictly decoded value of one durable lifecycle row. The enum makes status
+/// dispatch exhaustive and prevents callers from decoding a future phase with
+/// the PREPARED-only codec.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PersistedAuthorityManifest<Hash> {
+    Prepared(PreparedAuthorityManifestRecord<Hash>),
+    Sealed(SealedAuthorityManifest<Hash>),
+    Committed(CommittedAuthorityManifest<Hash>),
+}
+
+impl<Hash: Q256BitHash> PersistedAuthorityManifest<Hash> {
+    pub fn decode_persisted(
+        selected_identity: AuthorityManifestIdentity<Hash>,
+        revision: i64,
+        status: i8,
+        prepared_digest: &[u8],
+        lifecycle_digest: &[u8],
+        canonical_payload: &[u8],
+    ) -> Result<Self, ManifestLifecycleError> {
+        match AuthorityManifestStatus::try_from(status)? {
+            AuthorityManifestStatus::Prepared => {
+                if prepared_digest.len() != 32 {
+                    return Err(
+                        ManifestLifecycleError::InvalidPreparedDigestLength(
+                            prepared_digest.len(),
+                        ),
+                    );
+                }
+                if lifecycle_digest != prepared_digest {
+                    return Err(
+                        ManifestLifecycleError::PreparedLifecycleDigestMismatch,
+                    );
+                }
+                Ok(Self::Prepared(
+                    PreparedAuthorityManifestRecord::decode_persisted(
+                        selected_identity,
+                        revision,
+                        status,
+                        prepared_digest,
+                        canonical_payload,
+                    )?,
+                ))
+            }
+            AuthorityManifestStatus::Sealed => Ok(Self::Sealed(
+                SealedAuthorityManifest::decode_persisted(
+                    selected_identity,
+                    revision,
+                    status,
+                    prepared_digest,
+                    lifecycle_digest,
+                    canonical_payload,
+                )?,
+            )),
+            AuthorityManifestStatus::Committed => Ok(Self::Committed(
+                CommittedAuthorityManifest::decode_persisted(
+                    selected_identity,
+                    revision,
+                    status,
+                    prepared_digest,
+                    lifecycle_digest,
+                    canonical_payload,
+                )?,
+            )),
+        }
+    }
+
+    pub const fn phase(&self) -> AuthorityManifestLifecyclePhase {
+        match self {
+            Self::Prepared(_) => AuthorityManifestLifecyclePhase::Prepared,
+            Self::Sealed(_) => AuthorityManifestLifecyclePhase::Sealed,
+            Self::Committed(_) => AuthorityManifestLifecyclePhase::Committed,
+        }
+    }
+
+    pub const fn identity(&self) -> &AuthorityManifestIdentity<Hash> {
+        self.prepared().identity()
+    }
+
+    pub const fn prepared(&self) -> &PreparedAuthorityManifestRecord<Hash> {
+        match self {
+            Self::Prepared(record) => record,
+            Self::Sealed(record) => record.prepared(),
+            Self::Committed(record) => record.sealed().prepared(),
+        }
+    }
+
+    pub const fn revision(&self) -> ManifestRevision {
+        self.phase().revision()
+    }
+
+    pub const fn status(&self) -> AuthorityManifestStatus {
+        self.phase().status()
+    }
+
+    pub const fn lifecycle_digest(&self) -> AuthorityLifecycleDigest {
+        match self {
+            Self::Prepared(record) => {
+                AuthorityLifecycleDigest::from_prepared_digest(record.digest())
+            }
+            Self::Sealed(record) => record.lifecycle_digest(),
+            Self::Committed(record) => record.lifecycle_digest(),
+        }
+    }
+
+    pub fn encode_canonical(&self) -> &[u8] {
+        match self {
+            Self::Prepared(record) => record.encode_canonical(),
+            Self::Sealed(record) => record.encode_canonical(),
+            Self::Committed(record) => record.encode_canonical(),
+        }
+    }
+}
+
+impl<Hash> From<PreparedAuthorityManifestRecord<Hash>>
+    for PersistedAuthorityManifest<Hash>
+{
+    fn from(value: PreparedAuthorityManifestRecord<Hash>) -> Self {
+        Self::Prepared(value)
+    }
+}
+
+impl<Hash> From<SealedAuthorityManifest<Hash>>
+    for PersistedAuthorityManifest<Hash>
+{
+    fn from(value: SealedAuthorityManifest<Hash>) -> Self {
+        Self::Sealed(value)
+    }
+}
+
+impl<Hash> From<CommittedAuthorityManifest<Hash>>
+    for PersistedAuthorityManifest<Hash>
+{
+    fn from(value: CommittedAuthorityManifest<Hash>) -> Self {
+        Self::Committed(value)
+    }
+}
+
 impl<Hash: Q256BitHash> CommittedAuthorityManifest<Hash> {
     fn from_published(
         sealed: SealedAuthorityManifest<Hash>,
@@ -888,6 +1031,7 @@ pub enum ManifestLifecycleError {
     LifecycleRevisionMismatch { expected: u64, actual: u64 },
     LifecycleStatusMismatch { expected: i8, actual: i8 },
     PreparedUsesDedicatedCodec,
+    PreparedLifecycleDigestMismatch,
 }
 
 impl From<ManifestRecordError> for ManifestLifecycleError {

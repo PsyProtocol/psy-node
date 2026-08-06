@@ -23,8 +23,9 @@ use psy_node_core::store::{
         AuthorityHeadView, AuthorityManifestLifecyclePhase,
         AuthorityPostWriteObservation, AuthorityProofObservation,
         CommittedAuthorityManifest, CommittedManifestRecoveryAction,
-        ManifestLifecycleError, PreparedManifestRecoveryAction,
-        SealedAuthorityManifest, SealedManifestRecoveryAction,
+        ManifestLifecycleError, PersistedAuthorityManifest,
+        PreparedManifestRecoveryAction, SealedAuthorityManifest,
+        SealedManifestRecoveryAction,
     },
     manifest_record::{
         AuthorityManifestStatus, ManifestRecordError,
@@ -772,5 +773,67 @@ fn committed_codec_rejects_unknown_publication_kind() {
         )
         .unwrap_err(),
         ManifestLifecycleError::UnknownHeadPublicationKind(99)
+    );
+}
+
+#[test]
+fn persisted_lifecycle_dispatches_all_three_statuses_strictly() {
+    let prepared = realm_prepared(21);
+    let decoded = PersistedAuthorityManifest::decode_persisted(
+        *prepared.identity(),
+        prepared.revision().as_i64(),
+        prepared.status() as i8,
+        prepared.digest().as_bytes(),
+        prepared.digest().as_bytes(),
+        prepared.encode_canonical(),
+    )
+    .unwrap();
+    assert!(matches!(decoded, PersistedAuthorityManifest::Prepared(_)));
+    assert_eq!(decoded.prepared(), &prepared);
+
+    let sealed = sealed_realm(22);
+    let decoded = PersistedAuthorityManifest::decode_persisted(
+        *sealed.prepared().identity(),
+        sealed.revision().as_i64(),
+        sealed.status() as i8,
+        sealed.prepared().digest().as_bytes(),
+        sealed.lifecycle_digest().as_bytes(),
+        sealed.encode_canonical(),
+    )
+    .unwrap();
+    assert!(matches!(decoded, PersistedAuthorityManifest::Sealed(_)));
+
+    let committed = committed_realm(23);
+    let decoded = PersistedAuthorityManifest::decode_persisted(
+        *committed.sealed().prepared().identity(),
+        committed.revision().as_i64(),
+        committed.status() as i8,
+        committed.sealed().prepared().digest().as_bytes(),
+        committed.lifecycle_digest().as_bytes(),
+        committed.encode_canonical(),
+    )
+    .unwrap();
+    assert!(matches!(
+        decoded,
+        PersistedAuthorityManifest::Committed(_)
+    ));
+}
+
+#[test]
+fn prepared_lifecycle_digest_must_equal_immutable_manifest_digest() {
+    let prepared = realm_prepared(24);
+    let mut wrong = *prepared.digest().as_bytes();
+    wrong[0] ^= 1;
+    assert_eq!(
+        PersistedAuthorityManifest::decode_persisted(
+            *prepared.identity(),
+            prepared.revision().as_i64(),
+            prepared.status() as i8,
+            prepared.digest().as_bytes(),
+            &wrong,
+            prepared.encode_canonical(),
+        )
+        .unwrap_err(),
+        ManifestLifecycleError::PreparedLifecycleDigestMismatch
     );
 }

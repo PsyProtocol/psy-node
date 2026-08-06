@@ -2,8 +2,8 @@
 //!
 //! Immutable chunks are written with the exact D-04a timestamp and verified
 //! by QUORUM read-back before the PREPARED row is created with LWT. The module
-//! is deliberately absent from production setup and exposes no SEALED,
-//! COMMITTED or state-writer operation.
+//! is deliberately absent from production setup. D-03d2 adds exact lifecycle
+//! CAS for SEALED and COMMITTED records, but no state-writer operation.
 
 use std::{error::Error, fmt, sync::Arc};
 
@@ -14,6 +14,10 @@ use psy_node_core::store::{
     manifest_record::{
         AuthorityManifestIdentity, ManifestRecordError,
         PreparedAuthorityManifestRecord, PreparedManifestWriteOutcome,
+    },
+    manifest_lifecycle::{
+        CommittedAuthorityManifest, ManifestLifecycleError,
+        PersistedAuthorityManifest, SealedAuthorityManifest,
     },
 };
 use scylla::{
@@ -151,6 +155,7 @@ pub enum ManifestPreparedQueryId {
     ReadLocatorBucket = 10,
     ReadReplayBucket = 11,
     ReadPreparedPayloadBucket = 12,
+    AdvanceLifecycle = 13,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -180,6 +185,7 @@ pub struct ManifestPreparedQueries {
     create_chunks: [ManifestPreparedQuery; 3],
     read_manifest: ManifestPreparedQuery,
     insert_prepared_manifest: ManifestPreparedQuery,
+    advance_lifecycle: ManifestPreparedQuery,
     put_chunks: [ManifestPreparedQuery; 3],
     read_buckets: [ManifestPreparedQuery; 3],
 }
@@ -227,7 +233,7 @@ impl ManifestPreparedQueries {
             create_manifest: ManifestPreparedQuery {
                 id: ManifestPreparedQueryId::CreateManifest,
                 cql: format!(
-                    "CREATE TABLE IF NOT EXISTS {manifest} (network_chain_id bigint, authority_kind tinyint, realm_id bigint, realm_sub_id bigint, checkpoint_bucket bigint, chain_epoch bigint, checkpoint_id bigint, checkpoint_hash blob, revision bigint, status tinyint, manifest_digest blob, manifest_payload blob, PRIMARY KEY ((network_chain_id, authority_kind, realm_id, realm_sub_id, checkpoint_bucket), chain_epoch, checkpoint_id, checkpoint_hash))"
+                    "CREATE TABLE IF NOT EXISTS {manifest} (network_chain_id bigint, authority_kind tinyint, realm_id bigint, realm_sub_id bigint, checkpoint_bucket bigint, chain_epoch bigint, checkpoint_id bigint, checkpoint_hash blob, revision bigint, status tinyint, manifest_digest blob, lifecycle_digest blob, manifest_payload blob, PRIMARY KEY ((network_chain_id, authority_kind, realm_id, realm_sub_id, checkpoint_bucket), chain_epoch, checkpoint_id, checkpoint_hash))"
                 ),
                 bind_shape: &[],
             },
@@ -248,16 +254,23 @@ impl ManifestPreparedQueries {
             read_manifest: ManifestPreparedQuery {
                 id: ManifestPreparedQueryId::ReadManifest,
                 cql: format!(
-                    "SELECT revision, status, manifest_digest, manifest_payload FROM {manifest} WHERE network_chain_id = ? AND authority_kind = ? AND realm_id = ? AND realm_sub_id = ? AND checkpoint_bucket = ? AND chain_epoch = ? AND checkpoint_id = ? AND checkpoint_hash = ?"
+                    "SELECT revision, status, manifest_digest, lifecycle_digest, manifest_payload FROM {manifest} WHERE network_chain_id = ? AND authority_kind = ? AND realm_id = ? AND realm_sub_id = ? AND checkpoint_bucket = ? AND chain_epoch = ? AND checkpoint_id = ? AND checkpoint_hash = ?"
                 ),
                 bind_shape: MANIFEST_IDENTITY_BIND_SHAPE,
             },
             insert_prepared_manifest: ManifestPreparedQuery {
                 id: ManifestPreparedQueryId::InsertPreparedManifest,
                 cql: format!(
-                    "INSERT INTO {manifest} (network_chain_id, authority_kind, realm_id, realm_sub_id, checkpoint_bucket, chain_epoch, checkpoint_id, checkpoint_hash, revision, status, manifest_digest, manifest_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS"
+                    "INSERT INTO {manifest} (network_chain_id, authority_kind, realm_id, realm_sub_id, checkpoint_bucket, chain_epoch, checkpoint_id, checkpoint_hash, revision, status, manifest_digest, lifecycle_digest, manifest_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS"
                 ),
                 bind_shape: MANIFEST_INSERT_BIND_SHAPE,
+            },
+            advance_lifecycle: ManifestPreparedQuery {
+                id: ManifestPreparedQueryId::AdvanceLifecycle,
+                cql: format!(
+                    "UPDATE {manifest} SET revision = ?, status = ?, lifecycle_digest = ?, manifest_payload = ? WHERE network_chain_id = ? AND authority_kind = ? AND realm_id = ? AND realm_sub_id = ? AND checkpoint_bucket = ? AND chain_epoch = ? AND checkpoint_id = ? AND checkpoint_hash = ? IF revision = ? AND status = ? AND manifest_digest = ? AND lifecycle_digest = ? AND manifest_payload = ?"
+                ),
+                bind_shape: MANIFEST_LIFECYCLE_CAS_BIND_SHAPE,
             },
             put_chunks: [
                 put_chunk(ManifestPreparedQueryId::PutLocatorChunk, &locator),
@@ -300,6 +313,10 @@ impl ManifestPreparedQueries {
         &self.insert_prepared_manifest
     }
 
+    pub const fn advance_lifecycle(&self) -> &ManifestPreparedQuery {
+        &self.advance_lifecycle
+    }
+
     pub const fn put_chunk(
         &self,
         kind: ManifestArtifactKind,
@@ -320,6 +337,7 @@ impl ManifestPreparedQueries {
             .chain(self.create_chunks.iter())
             .chain(std::iter::once(&self.read_manifest))
             .chain(std::iter::once(&self.insert_prepared_manifest))
+            .chain(std::iter::once(&self.advance_lifecycle))
             .chain(self.put_chunks.iter())
             .chain(self.read_buckets.iter())
         {
@@ -357,7 +375,28 @@ const MANIFEST_INSERT_BIND_SHAPE: &[&str] = &[
     "revision:BIGINT",
     "status:TINYINT",
     "manifest_digest:BLOB",
+    "lifecycle_digest:BLOB",
     "manifest_payload:BLOB",
+];
+
+const MANIFEST_LIFECYCLE_CAS_BIND_SHAPE: &[&str] = &[
+    "candidate_revision:BIGINT",
+    "candidate_status:TINYINT",
+    "candidate_lifecycle_digest:BLOB",
+    "candidate_manifest_payload:BLOB",
+    "network_chain_id:BIGINT",
+    "authority_kind:TINYINT",
+    "realm_id:BIGINT",
+    "realm_sub_id:BIGINT",
+    "checkpoint_bucket:BIGINT",
+    "chain_epoch:BIGINT",
+    "checkpoint_id:BIGINT",
+    "checkpoint_hash:BLOB",
+    "expected_revision:BIGINT",
+    "expected_status:TINYINT",
+    "expected_manifest_digest:BLOB",
+    "expected_lifecycle_digest:BLOB",
+    "expected_manifest_payload:BLOB",
 ];
 
 const CHUNK_PUT_BIND_SHAPE: &[&str] = &[
@@ -527,6 +566,7 @@ pub struct PreparedManifestInsertBinding {
     revision: i64,
     status: i8,
     manifest_digest: Vec<u8>,
+    lifecycle_digest: Vec<u8>,
     manifest_payload: Vec<u8>,
 }
 
@@ -547,6 +587,7 @@ impl PreparedManifestInsertBinding {
             revision: record.revision().as_i64(),
             status: record.status() as i8,
             manifest_digest: record.digest().as_bytes().to_vec(),
+            lifecycle_digest: record.digest().as_bytes().to_vec(),
             manifest_payload: record.encode_canonical().to_vec(),
         })
     }
@@ -567,9 +608,137 @@ impl PreparedManifestInsertBinding {
             ManifestPreparedBindValue::BigInt(self.revision),
             ManifestPreparedBindValue::TinyInt(self.status),
             ManifestPreparedBindValue::Blob(self.manifest_digest.clone()),
+            ManifestPreparedBindValue::Blob(self.lifecycle_digest.clone()),
             ManifestPreparedBindValue::Blob(self.manifest_payload.clone()),
         ]);
         values
+    }
+
+    pub fn render_golden(&self) -> String {
+        render_bind_values(&self.values())
+    }
+}
+
+/// Exact compare-and-set binding for one allowed lifecycle edge. The
+/// immutable PREPARED digest is compared but never updated; only revision,
+/// status, lifecycle digest and canonical lifecycle payload change.
+#[derive(Clone, Debug, Eq, PartialEq, scylla::SerializeRow)]
+#[scylla(flavor = "enforce_order", skip_name_checks)]
+pub struct ManifestLifecycleCasBinding {
+    candidate_revision: i64,
+    candidate_status: i8,
+    candidate_lifecycle_digest: Vec<u8>,
+    candidate_manifest_payload: Vec<u8>,
+    network_chain_id: i64,
+    authority_kind: i8,
+    realm_id: i64,
+    realm_sub_id: i64,
+    checkpoint_bucket: i64,
+    chain_epoch: i64,
+    checkpoint_id: i64,
+    checkpoint_hash: Vec<u8>,
+    expected_revision: i64,
+    expected_status: i8,
+    expected_manifest_digest: Vec<u8>,
+    expected_lifecycle_digest: Vec<u8>,
+    expected_manifest_payload: Vec<u8>,
+}
+
+impl ManifestLifecycleCasBinding {
+    pub fn try_from_sealed<Hash: Q256BitHash>(
+        candidate: &SealedAuthorityManifest<Hash>,
+    ) -> Result<Self, ManifestPreparedError> {
+        let expected = PersistedAuthorityManifest::Prepared(
+            candidate.prepared().clone(),
+        );
+        let candidate = PersistedAuthorityManifest::Sealed(candidate.clone());
+        Self::try_new(&expected, &candidate)
+    }
+
+    pub fn try_from_committed<Hash: Q256BitHash>(
+        candidate: &CommittedAuthorityManifest<Hash>,
+    ) -> Result<Self, ManifestPreparedError> {
+        let expected =
+            PersistedAuthorityManifest::Sealed(candidate.sealed().clone());
+        let candidate =
+            PersistedAuthorityManifest::Committed(candidate.clone());
+        Self::try_new(&expected, &candidate)
+    }
+
+    fn try_new<Hash: Q256BitHash>(
+        expected: &PersistedAuthorityManifest<Hash>,
+        candidate: &PersistedAuthorityManifest<Hash>,
+    ) -> Result<Self, ManifestPreparedError> {
+        if expected.identity() != candidate.identity()
+            || candidate.revision().get()
+                != expected.revision().get().checked_add(1).ok_or(
+                    ManifestPreparedError::LifecycleRevisionOverflow,
+                )?
+        {
+            return Err(ManifestPreparedError::InvalidLifecycleTransition);
+        }
+        let identity = ManifestReadBinding::try_from_identity(expected.identity())?;
+        Ok(Self {
+            candidate_revision: candidate.revision().as_i64(),
+            candidate_status: candidate.status() as i8,
+            candidate_lifecycle_digest: candidate
+                .lifecycle_digest()
+                .as_bytes()
+                .to_vec(),
+            candidate_manifest_payload: candidate.encode_canonical().to_vec(),
+            network_chain_id: identity.network_chain_id,
+            authority_kind: identity.authority_kind,
+            realm_id: identity.realm_id,
+            realm_sub_id: identity.realm_sub_id,
+            checkpoint_bucket: identity.checkpoint_bucket,
+            chain_epoch: identity.chain_epoch,
+            checkpoint_id: identity.checkpoint_id,
+            checkpoint_hash: identity.checkpoint_hash,
+            expected_revision: expected.revision().as_i64(),
+            expected_status: expected.status() as i8,
+            expected_manifest_digest: expected
+                .prepared()
+                .digest()
+                .as_bytes()
+                .to_vec(),
+            expected_lifecycle_digest: expected
+                .lifecycle_digest()
+                .as_bytes()
+                .to_vec(),
+            expected_manifest_payload: expected.encode_canonical().to_vec(),
+        })
+    }
+
+    pub fn values(&self) -> Vec<ManifestPreparedBindValue> {
+        vec![
+            ManifestPreparedBindValue::BigInt(self.candidate_revision),
+            ManifestPreparedBindValue::TinyInt(self.candidate_status),
+            ManifestPreparedBindValue::Blob(
+                self.candidate_lifecycle_digest.clone(),
+            ),
+            ManifestPreparedBindValue::Blob(
+                self.candidate_manifest_payload.clone(),
+            ),
+            ManifestPreparedBindValue::BigInt(self.network_chain_id),
+            ManifestPreparedBindValue::TinyInt(self.authority_kind),
+            ManifestPreparedBindValue::BigInt(self.realm_id),
+            ManifestPreparedBindValue::BigInt(self.realm_sub_id),
+            ManifestPreparedBindValue::BigInt(self.checkpoint_bucket),
+            ManifestPreparedBindValue::BigInt(self.chain_epoch),
+            ManifestPreparedBindValue::BigInt(self.checkpoint_id),
+            ManifestPreparedBindValue::Blob(self.checkpoint_hash.clone()),
+            ManifestPreparedBindValue::BigInt(self.expected_revision),
+            ManifestPreparedBindValue::TinyInt(self.expected_status),
+            ManifestPreparedBindValue::Blob(
+                self.expected_manifest_digest.clone(),
+            ),
+            ManifestPreparedBindValue::Blob(
+                self.expected_lifecycle_digest.clone(),
+            ),
+            ManifestPreparedBindValue::Blob(
+                self.expected_manifest_payload.clone(),
+            ),
+        ]
     }
 
     pub fn render_golden(&self) -> String {
@@ -858,7 +1027,35 @@ struct ManifestDbRow {
     revision: i64,
     status: i8,
     manifest_digest: Vec<u8>,
+    lifecycle_digest: Vec<u8>,
     manifest_payload: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ManifestLifecycleWriteOutcome<Hash> {
+    Applied(PersistedAuthorityManifest<Hash>),
+    Idempotent(PersistedAuthorityManifest<Hash>),
+    Conflict {
+        current: PersistedAuthorityManifest<Hash>,
+    },
+}
+
+pub fn classify_lifecycle_cas_observation<Hash: Q256BitHash>(
+    applied: bool,
+    candidate: PersistedAuthorityManifest<Hash>,
+    current: PersistedAuthorityManifest<Hash>,
+) -> Result<ManifestLifecycleWriteOutcome<Hash>, ManifestPreparedError> {
+    if current == candidate {
+        if applied {
+            Ok(ManifestLifecycleWriteOutcome::Applied(current))
+        } else {
+            Ok(ManifestLifecycleWriteOutcome::Idempotent(current))
+        }
+    } else if applied {
+        Err(ManifestPreparedError::AppliedLifecycleCasMismatch)
+    } else {
+        Ok(ManifestLifecycleWriteOutcome::Conflict { current })
+    }
 }
 
 #[derive(scylla::DeserializeRow)]
@@ -879,6 +1076,7 @@ pub struct ScyllaPreparedManifestStore {
     contract: ManifestPreparedConsistencyContract,
     read_manifest: PreparedStatement,
     insert_manifest: PreparedStatement,
+    advance_lifecycle: PreparedStatement,
     put_chunks: [PreparedStatement; 3],
     read_buckets: [PreparedStatement; 3],
 }
@@ -915,6 +1113,12 @@ impl ScyllaPreparedManifestStore {
         let insert_manifest = prepare_lwt(
             &session,
             queries.insert_prepared_manifest().cql(),
+            contract,
+        )
+        .await?;
+        let advance_lifecycle = prepare_lwt(
+            &session,
+            queries.advance_lifecycle().cql(),
             contract,
         )
         .await?;
@@ -972,6 +1176,7 @@ impl ScyllaPreparedManifestStore {
             contract,
             read_manifest,
             insert_manifest,
+            advance_lifecycle,
             put_chunks,
             read_buckets,
         })
@@ -1048,6 +1253,20 @@ impl ScyllaPreparedManifestStore {
         &self,
         identity: AuthorityManifestIdentity<Hash>,
     ) -> Result<Option<PreparedAuthorityManifestRecord<Hash>>, ManifestPreparedError> {
+        match self.read_lifecycle(identity).await? {
+            Some(PersistedAuthorityManifest::Prepared(record)) => Ok(Some(record)),
+            Some(current) => Err(ManifestPreparedError::UnexpectedLifecyclePhase {
+                expected: "PREPARED",
+                actual: current.status() as i8,
+            }),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn read_lifecycle<Hash: Q256BitHash>(
+        &self,
+        identity: AuthorityManifestIdentity<Hash>,
+    ) -> Result<Option<PersistedAuthorityManifest<Hash>>, ManifestPreparedError> {
         let binding = ManifestReadBinding::try_from_identity(&identity)?;
         let result = self
             .session
@@ -1060,16 +1279,50 @@ impl ScyllaPreparedManifestStore {
             .maybe_first_row::<ManifestDbRow>()
             .map_err(cql_error)?;
         row.map(|row| {
-            PreparedAuthorityManifestRecord::decode_persisted(
+            PersistedAuthorityManifest::decode_persisted(
                 identity,
                 row.revision,
                 row.status,
                 &row.manifest_digest,
+                &row.lifecycle_digest,
                 &row.manifest_payload,
             )
             .map_err(Into::into)
         })
         .transpose()
+    }
+
+    pub async fn advance_to_sealed<Hash: Q256BitHash>(
+        &self,
+        candidate: &SealedAuthorityManifest<Hash>,
+    ) -> Result<ManifestLifecycleWriteOutcome<Hash>, ManifestPreparedError> {
+        let binding = ManifestLifecycleCasBinding::try_from_sealed(candidate)?;
+        let execution = self
+            .session
+            .execute_unpaged(&self.advance_lifecycle, binding)
+            .await;
+        self.finish_lifecycle_cas(
+            execution,
+            PersistedAuthorityManifest::Sealed(candidate.clone()),
+        )
+        .await
+    }
+
+    pub async fn advance_to_committed<Hash: Q256BitHash>(
+        &self,
+        candidate: &CommittedAuthorityManifest<Hash>,
+    ) -> Result<ManifestLifecycleWriteOutcome<Hash>, ManifestPreparedError> {
+        let binding =
+            ManifestLifecycleCasBinding::try_from_committed(candidate)?;
+        let execution = self
+            .session
+            .execute_unpaged(&self.advance_lifecycle, binding)
+            .await;
+        self.finish_lifecycle_cas(
+            execution,
+            PersistedAuthorityManifest::Committed(candidate.clone()),
+        )
+        .await
     }
 
     pub async fn load_verified_artifacts<Hash: Q256BitHash>(
@@ -1200,20 +1453,58 @@ impl ScyllaPreparedManifestStore {
             Ok(result) => {
                 let applied = decode_lwt_applied(result)?;
                 let current = self
-                    .read_manifest(*candidate.identity())
+                    .read_lifecycle(*candidate.identity())
                     .await?
                     .ok_or(ManifestPreparedError::ManifestMissingAfterLwt {
                         applied,
                     })?;
                 candidate
-                    .classify_insert_observation(applied, current)
+                    .classify_insert_observation(
+                        applied,
+                        current.prepared().clone(),
+                    )
                     .map_err(Into::into)
             }
-            Err(error) => match self.read_manifest(*candidate.identity()).await {
-                Ok(Some(current)) if current == *candidate => Ok(
-                    PreparedManifestWriteOutcome::Idempotent(current),
+            Err(error) => match self.read_lifecycle(*candidate.identity()).await {
+                Ok(Some(current)) if current.prepared() == candidate => Ok(
+                    PreparedManifestWriteOutcome::Idempotent(
+                        current.prepared().clone(),
+                    ),
                 ),
                 Ok(_) => Err(ManifestPreparedError::IndeterminateManifestWrite {
+                    execute_error: error.to_string(),
+                }),
+                Err(read_error) => Err(
+                    ManifestPreparedError::IndeterminateManifestReadFailed {
+                        execute_error: error.to_string(),
+                        read_error: read_error.to_string(),
+                    },
+                ),
+            },
+        }
+    }
+
+    async fn finish_lifecycle_cas<Hash: Q256BitHash>(
+        &self,
+        execution: Result<QueryResult, scylla::errors::ExecutionError>,
+        candidate: PersistedAuthorityManifest<Hash>,
+    ) -> Result<ManifestLifecycleWriteOutcome<Hash>, ManifestPreparedError> {
+        match execution {
+            Ok(result) => {
+                let applied = decode_lwt_applied(result)?;
+                let current = self
+                    .read_lifecycle(*candidate.identity())
+                    .await?
+                    .ok_or(ManifestPreparedError::ManifestMissingAfterLwt {
+                        applied,
+                    })?;
+                classify_lifecycle_cas_observation(applied, candidate, current)
+            }
+            Err(error) => match self.read_lifecycle(*candidate.identity()).await {
+                Ok(Some(current)) if current == candidate => {
+                    Ok(ManifestLifecycleWriteOutcome::Idempotent(current))
+                }
+                Ok(_) => Err(ManifestPreparedError::IndeterminateLifecycleWrite {
                     execute_error: error.to_string(),
                 }),
                 Err(read_error) => Err(
@@ -1299,6 +1590,7 @@ pub enum ManifestPreparedError {
     InvalidControlKeyspace(InvalidManifestControlNoTabletKeyspace),
     InvalidArtifactKeyspace(InvalidManifestArtifactTabletKeyspace),
     ManifestRecord(ManifestRecordError),
+    ManifestLifecycle(ManifestLifecycleError),
     Artifact(ManifestArtifactError),
     IntentArtifactMismatch,
     VerifiedChunkReceiptMismatch,
@@ -1309,6 +1601,12 @@ pub enum ManifestPreparedError {
     NegativeChunkCoordinate,
     InvalidChunkHashLength(usize),
     ExpectedArtifactHasNoChunks,
+    LifecycleRevisionOverflow,
+    InvalidLifecycleTransition,
+    UnexpectedLifecyclePhase {
+        expected: &'static str,
+        actual: i8,
+    },
     IndeterminateChunkWrite {
         kind: ManifestArtifactKind,
         chunk_index: u32,
@@ -1320,6 +1618,10 @@ pub enum ManifestPreparedError {
         applied: bool,
     },
     IndeterminateManifestWrite {
+        execute_error: String,
+    },
+    AppliedLifecycleCasMismatch,
+    IndeterminateLifecycleWrite {
         execute_error: String,
     },
     IndeterminateManifestReadFailed {
@@ -1338,6 +1640,12 @@ impl From<InvalidCqlKeyspaceName> for ManifestPreparedError {
 impl From<ManifestRecordError> for ManifestPreparedError {
     fn from(value: ManifestRecordError) -> Self {
         Self::ManifestRecord(value)
+    }
+}
+
+impl From<ManifestLifecycleError> for ManifestPreparedError {
+    fn from(value: ManifestLifecycleError) -> Self {
+        Self::ManifestLifecycle(value)
     }
 }
 

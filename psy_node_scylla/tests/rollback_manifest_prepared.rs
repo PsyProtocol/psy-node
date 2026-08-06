@@ -17,6 +17,12 @@ use psy_node_core::store::{
         AuthorityHeadPayload, AuthorityStateTransition,
         SealedAuthorityCommitIntent,
     },
+    manifest_lifecycle::{
+        AuthorityHeadPayloadDigest, AuthorityHeadPublishDecision,
+        AuthorityHeadView, AuthorityPostWriteObservation,
+        AuthorityProofObservation, CommittedAuthorityManifest,
+        PersistedAuthorityManifest, SealedAuthorityManifest,
+    },
     manifest_record::PreparedManifestWriteOutcome,
     timestamp::CommitWriteTimestampUs,
     typed::{
@@ -25,11 +31,14 @@ use psy_node_core::store::{
     },
 };
 use psy_node_scylla::rollback::{
-    decode_manifest_artifact_plan, CanonicalManifestArtifacts,
+    classify_lifecycle_cas_observation, decode_manifest_artifact_plan,
+    CanonicalManifestArtifacts,
     CanonicalPhysicalMutationBatch, DecodedManifestArtifactPlan,
     FullPhysicalDeltaRecord, ManifestArtifactKind,
     ManifestChunkBucketReadBinding,
     ManifestChunkPutBinding, ManifestControlNoTabletKeyspace,
+    ManifestLifecycleCasBinding, ManifestPreparedBindValue,
+    ManifestLifecycleWriteOutcome,
     ManifestPreparedConsistencyContract, ManifestPreparedKeyspaces,
     ManifestPreparedQueries, ManifestReadBinding,
     OperationalReplayAction, PreparedManifestInsertBinding, ReplayAuthority,
@@ -134,6 +143,38 @@ fn keyspaces() -> ManifestPreparedKeyspaces {
     )
 }
 
+fn sealed_package(
+    package: &VerifiedPreparedManifestPackage<PHash>,
+) -> SealedAuthorityManifest<PHash> {
+    let prepared = package.record();
+    SealedAuthorityManifest::verify_and_seal(
+        prepared.clone(),
+        AuthorityPostWriteObservation::new(
+            AuthorityHeadView::candidate(prepared),
+            prepared.intent().artifacts().mutation_digest(),
+            AuthorityHeadPayloadDigest::from_verified_payload_bytes(
+                prepared.intent().head_payload().as_bytes(),
+            ),
+            AuthorityProofObservation::NotApplicableForRealm,
+        ),
+    )
+    .unwrap()
+}
+
+fn committed_package(
+    package: &VerifiedPreparedManifestPackage<PHash>,
+) -> CommittedAuthorityManifest<PHash> {
+    let sealed = sealed_package(package);
+    let receipt = match sealed
+        .classify_head_cas(true, *sealed.verified_head())
+        .unwrap()
+    {
+        AuthorityHeadPublishDecision::Published(receipt) => receipt,
+        other => panic!("unexpected publication decision: {other:?}"),
+    };
+    sealed.mark_committed(receipt).unwrap()
+}
+
 fn render_golden() -> String {
     let package = package(7, 41, 0x22, Some(0x31));
     let set = package.artifacts().chunked().unwrap();
@@ -197,6 +238,107 @@ fn prepared_is_the_only_authority_marker_and_chunks_are_digest_isolated() {
     let prepared_manifest_row: Option<()> = None;
     assert!(persisted_chunks > 0);
     assert!(prepared_manifest_row.is_none());
+}
+
+#[test]
+fn lifecycle_cas_is_exact_monotonic_and_keeps_prepared_digest_immutable() {
+    let package = package(7, 41, 0x22, Some(0x31));
+    let queries = ManifestPreparedQueries::new(&keyspaces());
+    let cql = queries.advance_lifecycle().cql();
+    assert!(cql.starts_with("UPDATE "));
+    assert!(!cql.contains("USING TIMESTAMP"));
+    assert!(!cql.contains("SET manifest_digest"));
+    for condition in [
+        "IF revision = ?",
+        "status = ?",
+        "manifest_digest = ?",
+        "lifecycle_digest = ?",
+        "manifest_payload = ?",
+    ] {
+        assert!(cql.contains(condition), "missing {condition}");
+    }
+
+    let sealed = sealed_package(&package);
+    let first = ManifestLifecycleCasBinding::try_from_sealed(&sealed).unwrap();
+    let second = ManifestLifecycleCasBinding::try_from_sealed(&sealed).unwrap();
+    assert_eq!(first, second);
+    assert_eq!(first.render_golden(), second.render_golden());
+    let values = first.values();
+    assert_eq!(values.len(), 17);
+    assert_eq!(values[0], ManifestPreparedBindValue::BigInt(1));
+    assert_eq!(values[1], ManifestPreparedBindValue::TinyInt(2));
+    assert_eq!(values[12], ManifestPreparedBindValue::BigInt(0));
+    assert_eq!(values[13], ManifestPreparedBindValue::TinyInt(1));
+    assert_eq!(
+        values[14],
+        ManifestPreparedBindValue::Blob(
+            package.record().digest().as_bytes().to_vec()
+        )
+    );
+    assert_eq!(values[14], values[15]);
+
+    let committed = committed_package(&package);
+    let values = ManifestLifecycleCasBinding::try_from_committed(&committed)
+        .unwrap()
+        .values();
+    assert_eq!(values[0], ManifestPreparedBindValue::BigInt(2));
+    assert_eq!(values[1], ManifestPreparedBindValue::TinyInt(3));
+    assert_eq!(values[12], ManifestPreparedBindValue::BigInt(1));
+    assert_eq!(values[13], ManifestPreparedBindValue::TinyInt(2));
+    assert_eq!(
+        values[14],
+        ManifestPreparedBindValue::Blob(
+            package.record().digest().as_bytes().to_vec()
+        )
+    );
+    assert_ne!(values[14], values[15]);
+}
+
+#[test]
+fn lifecycle_lwt_observation_is_applied_idempotent_or_conflict() {
+    let first_package = package(7, 41, 0x22, Some(0x31));
+    let candidate = PersistedAuthorityManifest::Sealed(sealed_package(
+        &first_package,
+    ));
+    assert!(matches!(
+        classify_lifecycle_cas_observation(
+            true,
+            candidate.clone(),
+            candidate.clone(),
+        )
+        .unwrap(),
+        ManifestLifecycleWriteOutcome::Applied(_)
+    ));
+    assert!(matches!(
+        classify_lifecycle_cas_observation(
+            false,
+            candidate.clone(),
+            candidate.clone(),
+        )
+        .unwrap(),
+        ManifestLifecycleWriteOutcome::Idempotent(_)
+    ));
+
+    let other_package = package(7, 41, 0x23, Some(0x32));
+    let conflict = PersistedAuthorityManifest::Sealed(sealed_package(
+        &other_package,
+    ));
+    assert!(matches!(
+        classify_lifecycle_cas_observation(
+            false,
+            candidate.clone(),
+            conflict.clone(),
+        )
+        .unwrap(),
+        ManifestLifecycleWriteOutcome::Conflict { current }
+            if current == conflict
+    ));
+    assert!(classify_lifecycle_cas_observation(
+        true,
+        candidate,
+        conflict,
+    )
+    .is_err());
 }
 
 #[test]
