@@ -5,7 +5,13 @@ use dashmap::DashMap;
 use parth_common::memory_stores::dash_tag_tree_store::SimpleDashTagTreeStore;
 use parth_core::{crypto::hash::traits::MerkleZeroHasher, data::hash::merkle_node_key::SimpleMerkleNodeKey, protocol::core_types::Q256BitHash};
 use psy_core::job::job_id::QProvingJobDataID;
-use psy_data::worker::{api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse, proving_work_history::PsyProvingJobClaimMetadata};
+use psy_data::{
+    protocol::chain_context::WorkContextToken,
+    worker::{
+        api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse,
+        proving_work_history::PsyProvingJobClaimMetadata,
+    },
+};
 use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 use tokio::{io::AsyncWriteExt, sync::RwLock};
 
@@ -17,7 +23,7 @@ pub struct FakeJobFetcherV2<Hash: Copy + Eq + Default, JobId: std::hash::Hash + 
     pub tag_tree: SimpleDashTagTreeStore<Hasher, Hash>,
     pub job_id_to_rewards_tree_location: DashMap<JobId, SimpleMerkleNodeKey>,
     pub completed_jobs: Arc<RwLock<Vec<PsyProvingJobClaimMetadata<Hash, JobId>>>>,
-    pub reward_preimage_map: DashMap<([u8; 32], JobId), (PsyProvingJobClaimMetadata<Hash, JobId>, u64)>,
+    pub reward_preimage_map: DashMap<([u8; 32], WorkContextToken), (PsyProvingJobClaimMetadata<Hash, JobId>, u64)>,
     pub proof_map: DashMap<JobId, Vec<u8>>,
     pub backup_file: Option<tokio::fs::File>,
     pub user_id: u64,
@@ -83,9 +89,9 @@ impl<
     }
     pub fn get_remove_reward_tree_tag_preimage_for_job_id(
         &self,
-        job_id: QProvingJobDataID,
+        work_context: WorkContextToken,
     ) -> Option<(PsyProvingJobClaimMetadata<Hash, QProvingJobDataID>, u64)> {
-        if let Some(entry) = self.reward_preimage_map.remove(&(self.api_url_hash, job_id)) {
+        if let Some(entry) = self.reward_preimage_map.remove(&(self.api_url_hash, work_context)) {
             Some(entry.1)
         } else {
             None
@@ -135,6 +141,7 @@ impl<
                         Err(anyhow::anyhow!("Failed to fetch job from API URL: No job available"))
                     }
                     Some(response) => {
+                        let work_context = response.base.decode_and_validate_work_context()?;
                         self.job_id_to_rewards_tree_location
                             .insert(response.base.job.job_id.clone(), response.base.job.get_reward_tree_node_key());
                         // use resp
@@ -144,7 +151,7 @@ impl<
                             reward_tree_tag_preimage: tag_preimage.clone(),
                             proving_duration_ms: 0,
                             job_submitted_at: 0,
-                            unique_pending_id: response.base.unique_pending_id,
+                            unique_pending_id: work_context.unique_pending_id().get(),
                             realm_id: response.base.realm_id,
                             realm_sub_id: response.base.realm_sub_id,
                             reward_tree_node_key: response.base.job.get_reward_tree_node_key(),
@@ -154,7 +161,7 @@ impl<
                             api_url_hash: api_url_hash,
                         };
                         self.reward_preimage_map
-                            .insert((api_url_hash, response.base.job.job_id.clone()), (claim_metadata, get_current_time_ms()));
+                            .insert((api_url_hash, response.base.work_context), (claim_metadata, get_current_time_ms()));
                         Ok(Some((api_url_hash, tag.clone(), response)))
                     }
                 }
@@ -165,11 +172,13 @@ impl<
         }
     }
 
-    pub async fn submit_proof_inner(&self, api_url_hash: [u8; 32], job_id: QProvingJobDataID, tag: Hash, proof: Vec<u8>) -> anyhow::Result<()> {
+    pub async fn submit_proof_inner(&self, api_url_hash: [u8; 32], work_context: WorkContextToken, tag: Hash, proof: Vec<u8>) -> anyhow::Result<()> {
+        let decoded = work_context.decode::<Hash, QProvingJobDataID>()?;
+        let job_id = *decoded.job_id();
         
 
         let current_time = get_current_time_ms();
-        let (mut claim_metadata, tag_creation_time) = match self.reward_preimage_map.remove(&(api_url_hash, job_id.clone())) {
+        let (mut claim_metadata, tag_creation_time) = match self.reward_preimage_map.remove(&(api_url_hash, work_context)) {
             Some((_, v)) => v,
             None => {
                 anyhow::bail!("Reward tree tag preimage not found for job ID");
@@ -204,7 +213,7 @@ impl<
     ) -> anyhow::Result<Option<([u8; 32], Hash, PsyWorkerGetProvingWorkWithChildProofsAPIResponse<Hash, QProvingJobDataID>)>> {
         self.fetch_next_job().await
     }
-    async fn submit_proof_raw_to_api(&self, api_url_hash: [u8; 32], job_id: QProvingJobDataID, tag: Hash, proof: Vec<u8>) -> anyhow::Result<()> {
-        self.submit_proof_inner(api_url_hash, job_id, tag, proof).await
+    async fn submit_proof_raw_to_api(&self, api_url_hash: [u8; 32], work_context: WorkContextToken, tag: Hash, proof: Vec<u8>) -> anyhow::Result<()> {
+        self.submit_proof_inner(api_url_hash, work_context, tag, proof).await
     }
 }

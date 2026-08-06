@@ -11,7 +11,10 @@ use parth_core::{
 };
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{
-    protocol::circuit_inputs::checkpoint_transition::QCQEDCheckpointStateTransitionInput,
+    protocol::{
+        chain_context::{AuthorityScope, PendingContext, WorkContext, WorkContextToken},
+        circuit_inputs::checkpoint_transition::QCQEDCheckpointStateTransitionInput,
+    },
     worker::{
         api_response::{PsyWorkerGetProvingWorkAPIResponse, PsyWorkerGetProvingWorkWithChildProofsAPIResponse, PROVING_JOB_NODE_TYPE_COORDINATOR},
         metadata::{PsyProvingJobMetadata, PROOF_REWARD_TREE_HASH_MODE_NO_HASH_CHILDREN},
@@ -39,7 +42,6 @@ fn verify_api_signature(signature: &QEDCompressedSecp256K1Signature, request: &S
     request.get_sig_hash::<parth_crypto::hash::sha256::CoreSha256Hasher>() == signature.message
         && parth_common::secp256k1::Secp256K1VerifierHelper::secp256k1_verify(signature).is_ok()
 }
-const SUBMIT_PROOF_PENDING_LOOKBACK: u64 = 256;
 impl<
         N: QNetworkTypesConfig<JobId = QProvingJobDataID>,
         S: PsyCoordinatorEdgeAPIStoreReader<N::F, N::QHash> + Send + Sync,
@@ -63,6 +65,59 @@ impl<
         ProofStore,
     >
 {
+    async fn require_current_pending_context(&self) -> anyhow::Result<PendingContext<N::QHash>> {
+        let context = self
+            .temp_db
+            .get_current_pending_context(&self.realm_identifier)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("current pending context is unavailable"))?;
+        if context.authority() != AuthorityScope::Coordinator {
+            anyhow::bail!("current pending context has the wrong Coordinator authority");
+        }
+        Ok(context)
+    }
+
+    fn work_context_for_job(
+        pending: &PendingContext<N::QHash>,
+        job_id: N::JobId,
+    ) -> anyhow::Result<WorkContext<N::QHash, N::JobId>> {
+        Ok(WorkContext::try_new(
+            *pending.chain(),
+            pending.authority(),
+            pending.unique_pending_id(),
+            pending.proc_checkpoint_unique_id(),
+            job_id,
+        )?)
+    }
+
+    async fn require_exact_current_work_context(
+        &self,
+        token: WorkContextToken,
+    ) -> anyhow::Result<WorkContext<N::QHash, N::JobId>> {
+        let submitted = token.decode::<N::QHash, N::JobId>()?;
+        let current = self.require_current_pending_context().await?;
+        submitted.ensure_matches_pending_context(&current)?;
+        Ok(submitted)
+    }
+
+    async fn require_pending_context_unchanged(
+        &self,
+        expected: &PendingContext<N::QHash>,
+    ) -> anyhow::Result<()> {
+        if &self.require_current_pending_context().await? != expected {
+            anyhow::bail!("pending context changed while assigning proving work");
+        }
+        Ok(())
+    }
+
+    async fn require_work_context_still_current(
+        &self,
+        work_context: &WorkContext<N::QHash, N::JobId>,
+    ) -> anyhow::Result<()> {
+        work_context.ensure_matches_pending_context(&self.require_current_pending_context().await?)?;
+        Ok(())
+    }
+
     async fn load_dependency_proof_bytes(&self, unique_pending_id: u64, job_id: &N::JobId) -> anyhow::Result<Option<Vec<u8>>> {
         if let Some(proof) = self
             .proof_store
@@ -81,41 +136,6 @@ impl<
         }
 
         Ok(None)
-    }
-
-    async fn resolve_unique_pending_id_for_submitted_job(
-        &self,
-        current_unique_pending_id: u64,
-        job_id: N::JobId,
-    ) -> anyhow::Result<(u64, Option<([u8; 33], u64)>)> {
-        for offset in 0..=SUBMIT_PROOF_PENDING_LOOKBACK {
-            let candidate = current_unique_pending_id.saturating_sub(offset);
-            if let Some(claim) = self
-                .temp_db
-                .get_job_claim(&self.realm_identifier, candidate, job_id)
-                .await?
-            {
-                if candidate != current_unique_pending_id {
-                    tracing::warn!(
-                        "submit_proof_raw resolved job {:?} from historical unique_pending_id {} (current={})",
-                        job_id,
-                        candidate,
-                        current_unique_pending_id
-                    );
-                }
-                return Ok((candidate, Some(claim)));
-            }
-            if candidate == 0 {
-                break;
-            }
-        }
-
-        tracing::warn!(
-            "submit_proof_raw found no claim record for job {:?} within lookback window; falling back to current unique_pending_id {}",
-            job_id,
-            current_unique_pending_id
-        );
-        Ok((current_unique_pending_id, None))
     }
 
     pub async fn has_job_id_already_been_submitted(&self, unique_pending_id: u64, job_id: N::JobId) -> anyhow::Result<bool> {
@@ -158,7 +178,9 @@ impl<
         .await?;
         self.verify_miner_api_signature_and_check_reputation(&signature, &request).await?;
 
-        let (unique_pending_id, unique_proc_id) = self.get_current_unique_pending_id_internal().await?;
+        let pending_context = self.require_current_pending_context().await?;
+        let unique_pending_id = pending_context.unique_pending_id().get();
+        let unique_proc_id = pending_context.proc_checkpoint_unique_id().as_u128();
 
         let queue_key = CoordinatorProvingWorkQueueKey::<N::QHash, N::JobId> {
             realm_id: self.realm_id_u64,
@@ -181,6 +203,8 @@ impl<
             anyhow::bail!("no proving work available");
         }
         let work_item = work_item.unwrap();
+        self.require_pending_context_unchanged(&pending_context).await?;
+        let work_context = Self::work_context_for_job(&pending_context, work_item.job_id)?;
 
         let witness_bytes: Vec<u8> = self
             .temp_db
@@ -222,9 +246,35 @@ impl<
             witness: witness_bytes,
             realm_id: self.realm_id_u64,
             realm_sub_id: self.realm_sub_id_u64,
-            unique_pending_id,
+            work_context: WorkContextToken::from_work_context(&work_context),
             node_type: PROVING_JOB_NODE_TYPE_COORDINATOR,
         };
+        self.temp_db
+            .set_proving_job_metadata(
+                &self.realm_identifier,
+                unique_pending_id,
+                response.job.job_id.get_output_id(),
+                &response.job.metadata,
+            )
+            .await?;
+        self.temp_db
+            .set_proof_claim_tag(
+                &self.realm_identifier,
+                unique_pending_id,
+                response.job.job_id.get_input_witness_id(),
+                N::QHash::from_ref_32bytes(&request.tag),
+            )
+            .await?;
+        self.temp_db
+            .set_job_claim(
+                &self.realm_identifier,
+                unique_pending_id,
+                response.job.job_id.get_output_id(),
+                &signature.public_key,
+                chrono::Utc::now().timestamp_millis() as u64,
+            )
+            .await?;
+        self.require_pending_context_unchanged(&pending_context).await?;
         Ok(response)
     }
     pub async fn get_proving_work_with_child_proofs_internal(
@@ -238,7 +288,9 @@ impl<
         .await?;
         self.verify_miner_api_signature_and_check_reputation(&signature, &request).await?;
 
-        let (unique_pending_id, unique_proc_id) = self.get_current_unique_pending_id_internal().await?;
+        let pending_context = self.require_current_pending_context().await?;
+        let unique_pending_id = pending_context.unique_pending_id().get();
+        let unique_proc_id = pending_context.proc_checkpoint_unique_id().as_u128();
 
         let queue_key = CoordinatorProvingWorkQueueKey::<N::QHash, N::JobId> {
             realm_id: self.realm_id_u64,
@@ -261,6 +313,8 @@ impl<
             anyhow::bail!("no proving work available");
         }
         let work_item = work_item.unwrap();
+        self.require_pending_context_unchanged(&pending_context).await?;
+        let work_context = Self::work_context_for_job(&pending_context, work_item.job_id)?;
         tracing::info!("work item dependencies: {:?}", work_item.metadata.dependencies);
         let child_proofs = work_item
             .metadata
@@ -311,7 +365,7 @@ impl<
             witness: witness_bytes,
             realm_id: self.realm_id_u64,
             realm_sub_id: self.realm_sub_id_u64,
-            unique_pending_id,
+            work_context: WorkContextToken::from_work_context(&work_context),
             node_type: PROVING_JOB_NODE_TYPE_COORDINATOR,
         };
         self.temp_db
@@ -347,6 +401,7 @@ impl<
                 claim_time_ms,
             )
             .await?;
+        self.require_pending_context_unchanged(&pending_context).await?;
 
         Ok(PsyWorkerGetProvingWorkWithChildProofsAPIResponse {
             base: response,
@@ -377,7 +432,7 @@ impl<
         &self,
         signature: QEDCompressedSecp256K1Signature,
         request: SimpleTimedRequest,
-        mut job_id: N::JobId,
+        work_context: WorkContextToken,
         tag: N::QHash,
         proof_bytes: Vec<u8>,
     ) -> anyhow::Result<()>
@@ -391,11 +446,17 @@ impl<
         if !verify_api_signature(&signature, &request) || request.request_type != REQUEST_TYPE_SUBMIT_PROOF {
             anyhow::bail!("invalid signature for submit_proof_raw");
         }
-        job_id = job_id.get_output_id();
-        let (current_unique_pending_id, unique_proc_id) = self.get_current_unique_pending_id_internal().await?;
-        let (unique_pending_id, job_claim) = self
-            .resolve_unique_pending_id_for_submitted_job(current_unique_pending_id, job_id)
+        let work_context = self
+            .require_exact_current_work_context(work_context)
             .await?;
+        let job_id = work_context.job_id().get_output_id();
+        let unique_pending_id = work_context.unique_pending_id().get();
+        let unique_proc_id = work_context.proc_checkpoint_unique_id().as_u128();
+        let job_claim = self
+            .temp_db
+            .get_job_claim(&self.realm_identifier, unique_pending_id, job_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("no exact job claim exists for submitted work context"))?;
         let proof_bytes = Arc::new(proof_bytes);
 
         // HACK: check to make sure the tag matches. If not, job was completed by another worker (stolen) - slash submitter.
@@ -479,6 +540,8 @@ impl<
             }
         }).await??;
 
+        self.require_work_context_still_current(&work_context).await?;
+
         // Complete proof validation before the final maintenance check. Once
         // this boundary is passed, finish the existing multi-store submission
         // sequence so a mid-sequence rejection cannot create a new partial
@@ -505,16 +568,11 @@ impl<
             .put_proof_bytes_for_job_id(job_id.get_output_id(), unique_pending_id, &proof_bytes)
             .await?;
 
-        let job_duration_ms = job_claim.as_ref().map(|(_, claim_time_ms)| {
-            (chrono::Utc::now().timestamp_millis() as u64).saturating_sub(*claim_time_ms)
-        });
-        if let Some((public_key, claim_time_ms)) = job_claim.as_ref() {
-            self.temp_db
-                .apply_reputation_on_submit(&self.realm_identifier, public_key, *claim_time_ms)
-                .await?;
-        } else {
-            tracing::debug!("submit_proof_raw: no job_claim record for job_id {:?}, skipping reputation update", job_id);
-        }
+        let job_duration_ms = (chrono::Utc::now().timestamp_millis() as u64)
+            .saturating_sub(job_claim.1);
+        self.temp_db
+            .apply_reputation_on_submit(&self.realm_identifier, &job_claim.0, job_claim.1)
+            .await?;
 
         /*
         self.tag_tree_rewards_store
@@ -609,7 +667,8 @@ impl<
             .worker_queue_report_job_completed(&queue_key, self.realm_id_u64, self.realm_sub_id_u64, unique_proc_id, 0, &item)
             .await?;
 
-        if let Some(duration_ms) = job_duration_ms {
+        {
+            let duration_ms = job_duration_ms;
             if let Err(error) = self
                 .temp_db
                 .increment_job_stats(&self.realm_identifier, unique_pending_id, duration_ms)

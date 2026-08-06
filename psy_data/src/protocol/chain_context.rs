@@ -10,7 +10,8 @@ use parth_core::{
     protocol::core_types::Q256BitHash, QJobIdBase, QJOB_ID_SERIALIZED_SIZE,
 };
 use serde::{
-    de::Error as SerdeDeError, Deserialize, Deserializer, Serialize, Serializer,
+    de::Error as SerdeDeError, ser::SerializeStruct, Deserialize, Deserializer, Serialize,
+    Serializer,
 };
 use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
 use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata};
@@ -36,6 +37,81 @@ pub const PENDING_CONTEXT_V1_LEN: usize =
 pub const WORK_CONTEXT_V1_LEN: usize = PENDING_CONTEXT_V1_LEN + QJOB_ID_SERIALIZED_SIZE;
 pub const HISTORICAL_READ_CONTEXT_V1_LEN: usize =
     CONTEXT_HEADER_LEN + CANONICAL_CHAIN_REF_V1_LEN + 8 + 32;
+
+/// Opaque, canonical wire token for one [`WorkContext`].
+///
+/// Workers must echo this token unchanged when submitting a proof. Only the
+/// node Edge decodes it and compares every field with the atomically published
+/// current [`PendingContext`]. Keeping the fixed-size canonical bytes in the
+/// wire type also prevents JSON/RPC clients from constructing a partial
+/// context or silently defaulting a newly added field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, ts_rs::TS)]
+#[cfg_attr(
+    feature = "serialize_rkyv",
+    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
+)]
+#[cfg_attr(
+    feature = "serialize_speedy",
+    derive(speedy::Readable, speedy::Writable)
+)]
+pub struct WorkContextToken {
+    #[ts(type = "Array<number>")]
+    bytes: [u8; WORK_CONTEXT_V1_LEN],
+}
+
+impl WorkContextToken {
+    pub fn from_work_context<Hash: Q256BitHash, JobId: QJobIdBase>(
+        context: &WorkContext<Hash, JobId>,
+    ) -> Self {
+        Self {
+            bytes: context.to_canonical_bytes(),
+        }
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; WORK_CONTEXT_V1_LEN] {
+        &self.bytes
+    }
+
+    pub fn decode<Hash: Q256BitHash, JobId: QJobIdBase>(
+        &self,
+    ) -> Result<WorkContext<Hash, JobId>, ChainContextCodecError> {
+        WorkContext::from_canonical_bytes(&self.bytes)
+    }
+
+    pub fn try_from_canonical_bytes<Hash: Q256BitHash, JobId: QJobIdBase>(
+        bytes: [u8; WORK_CONTEXT_V1_LEN],
+    ) -> Result<Self, ChainContextCodecError> {
+        WorkContext::<Hash, JobId>::from_canonical_bytes(&bytes)?;
+        Ok(Self { bytes })
+    }
+}
+
+impl Serialize for WorkContextToken {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut state = serializer.serialize_struct("WorkContextToken", 1)?;
+        state.serialize_field("bytes", self.bytes.as_slice())?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for WorkContextToken {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            bytes: Vec<u8>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        let bytes: [u8; WORK_CONTEXT_V1_LEN] = wire.bytes.try_into().map_err(|bytes: Vec<u8>| {
+            D::Error::custom(format_args!(
+                "work-context token must contain exactly {WORK_CONTEXT_V1_LEN} bytes, got {}",
+                bytes.len()
+            ))
+        })?;
+        Ok(Self { bytes })
+    }
+}
 
 const AUTHORITY_KIND_COORDINATOR: u8 = 1;
 const AUTHORITY_KIND_REALM: u8 = 2;
@@ -506,6 +582,24 @@ impl<Hash, JobId: QJobIdBase> WorkContext<Hash, JobId> {
     }
 }
 
+impl<Hash: PartialEq, JobId: QJobIdBase> WorkContext<Hash, JobId> {
+    /// Verify that the non-job portion of this token still names the exact
+    /// atomically published pending namespace.
+    pub fn ensure_matches_pending_context(
+        &self,
+        current: &PendingContext<Hash>,
+    ) -> Result<(), ChainContextValidationError> {
+        if self.chain != current.chain
+            || self.authority != current.authority
+            || self.unique_pending_id != current.unique_pending_id
+            || self.proc_checkpoint_unique_id != current.proc_checkpoint_unique_id
+        {
+            return Err(ChainContextValidationError::StaleWorkContext);
+        }
+        Ok(())
+    }
+}
+
 impl<'de, Hash, JobId> Deserialize<'de> for WorkContext<Hash, JobId>
 where
     Hash: Deserialize<'de>,
@@ -863,6 +957,7 @@ pub enum ChainContextValidationError {
     HistoricalTargetAhead { head: u64, target: u64 },
     SameHeightTargetHashMismatch { checkpoint_id: u64 },
     InvalidJobId,
+    StaleWorkContext,
 }
 
 impl fmt::Display for ChainContextValidationError {
@@ -883,6 +978,9 @@ impl fmt::Display for ChainContextValidationError {
                 "historical target hash differs from current head at checkpoint {checkpoint_id}"
             ),
             Self::InvalidJobId => formatter.write_str("work context contains an invalid job ID"),
+            Self::StaleWorkContext => {
+                formatter.write_str("work context does not match the current pending namespace")
+            }
         }
     }
 }
@@ -1422,6 +1520,80 @@ mod tests {
             ),
             Err(ChainContextValidationError::InvalidJobId)
         );
+    }
+
+    #[test]
+    fn opaque_work_context_token_round_trips_and_rejects_malformed_wire_data() {
+        let expected = work();
+        let token = WorkContextToken::from_work_context(&expected);
+        assert_eq!(
+            token
+                .decode::<PHash, QProvingJobDataID>()
+                .expect("canonical token must decode"),
+            expected
+        );
+
+        let json = serde_json::to_value(token).unwrap();
+        let decoded: WorkContextToken = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(decoded, token);
+
+        let mut short = json.clone();
+        short["bytes"].as_array_mut().unwrap().pop();
+        assert!(serde_json::from_value::<WorkContextToken>(short).is_err());
+
+        let mut unknown_version = *token.as_bytes();
+        unknown_version[8..10].copy_from_slice(&2u16.to_le_bytes());
+        assert_eq!(
+            WorkContextToken::try_from_canonical_bytes::<PHash, QProvingJobDataID>(
+                unknown_version
+            ),
+            Err(ChainContextCodecError::UnsupportedVersion(2))
+        );
+    }
+
+    #[test]
+    fn work_context_requires_the_exact_current_pending_namespace() {
+        let work = work();
+        let current = pending();
+        assert_eq!(work.ensure_matches_pending_context(&current), Ok(()));
+
+        let stale_contexts = [
+            PendingContext::new(
+                chain(367, PHash::from_values(9, 2, 3, 4)),
+                current.authority(),
+                current.unique_pending_id(),
+                current.proc_checkpoint_unique_id(),
+            ),
+            PendingContext::new(
+                *current.chain(),
+                AuthorityScope::Realm {
+                    realm_id: 8,
+                    realm_sub_id: 3,
+                },
+                current.unique_pending_id(),
+                current.proc_checkpoint_unique_id(),
+            ),
+            PendingContext::new(
+                *current.chain(),
+                current.authority(),
+                WorkUniquePendingId::new(current.unique_pending_id().get() + 1),
+                current.proc_checkpoint_unique_id(),
+            ),
+            PendingContext::new(
+                *current.chain(),
+                current.authority(),
+                current.unique_pending_id(),
+                WorkProcCheckpointUniqueId::from_u128(
+                    current.proc_checkpoint_unique_id().as_u128() + 1,
+                ),
+            ),
+        ];
+        for stale in stale_contexts {
+            assert_eq!(
+                work.ensure_matches_pending_context(&stale),
+                Err(ChainContextValidationError::StaleWorkContext)
+            );
+        }
     }
 
     #[test]

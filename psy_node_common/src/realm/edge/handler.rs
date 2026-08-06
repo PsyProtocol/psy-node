@@ -1105,11 +1105,11 @@ impl<
         &self,
         signature: QEDCompressedSecp256K1Signature,
         request: SimpleTimedRequest,
-        job_id: N::JobId,
+        work_context: psy_data::protocol::chain_context::WorkContextToken,
         tag: N::QHash,
         proof: Vec<u8>,
     ) -> RpcResult<()> {
-        res(self.submit_proof_raw_internal(signature, request, job_id, tag, proof).await)
+        res(self.submit_proof_raw_internal(signature, request, work_context, tag, proof).await)
     }
     async fn get_realm_identifier_worker_api(&self) -> RpcResult<QRealmIdentifier> {
         Ok(self.realm_identifier.clone())

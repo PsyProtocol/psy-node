@@ -1,5 +1,8 @@
 use async_trait::async_trait;
-use psy_data::worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse;
+use psy_data::{
+    protocol::chain_context::WorkContextToken,
+    worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse,
+};
 
 
 pub trait PsyWorkerGenericLibraryProverInfoProvider<JobId> {
@@ -24,5 +27,5 @@ pub trait PsyWorkerJobFetcher<Hash, JobId> {
     async fn fetch_new_job(
         &self,
     ) -> anyhow::Result<Option<([u8; 32], Hash, PsyWorkerGetProvingWorkWithChildProofsAPIResponse<Hash, JobId>)>>;
-    async fn submit_proof_raw_to_api(&self, api_url_hash: [u8; 32], job_id: JobId, tag: Hash, proof: Vec<u8>) -> anyhow::Result<()>;
+    async fn submit_proof_raw_to_api(&self, api_url_hash: [u8; 32], work_context: WorkContextToken, tag: Hash, proof: Vec<u8>) -> anyhow::Result<()>;
 }

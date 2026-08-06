@@ -2,6 +2,11 @@
 use parth_core::utils::QPGenRandom;
 use parth_core::{QJOB_ID_SERIALIZED_SIZE, QJobIdBase, protocol::core_types::Q256BitHash};
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
+use psy_core::constants::chain_id::PsyChainNetworkType;
+use crate::protocol::{
+    canonical_chain::{CanonicalChainRef, ChainEpoch, CheckpointHash, CheckpointId, CheckpointRef, NetworkId},
+    chain_context::{AuthorityScope, WorkContext, WorkContextToken, WorkProcCheckpointUniqueId, WorkUniquePendingId, WORK_CONTEXT_V1_LEN},
+};
 use psy_io::{PsyReaderExtensions, PsyWriterExtensions};
 use psy_serialize::{FallbackPsySerializeCanonical, PsyCanonicalSerializeMetadata, PsyIOReadWrite};
 
@@ -17,7 +22,9 @@ pub struct PsyWorkerGetProvingWorkAPIResponse<Hash, JobId> {
     pub child_proof_tag_values: Vec<Hash>,
     pub realm_id: u64,
     pub realm_sub_id: u64,
-    pub unique_pending_id: u64,
+    /// Opaque canonical WorkContext returned by Edge and echoed unchanged on
+    /// proof submission. It binds branch, authority, pending/proc and job.
+    pub work_context: WorkContextToken,
     pub node_type: u8,
     pub witness: Vec<u8>,
 }
@@ -59,6 +66,30 @@ impl<Hash, JobId> PsyWorkerGetProvingWorkWithChildProofsAPIResponse<Hash, JobId>
             anyhow::bail!("invalid dependencies in job metadata from API response: expected {} dependencies, got {} dependencies", expected_child_proof_count, self.base.job.metadata.dependencies.len());
         }
         Ok(())
+    }
+}
+
+impl<Hash: Q256BitHash, JobId: QJobIdBase>
+    PsyWorkerGetProvingWorkAPIResponse<Hash, JobId>
+{
+    pub fn decode_and_validate_work_context(&self) -> anyhow::Result<WorkContext<Hash, JobId>> {
+        let context = self.work_context.decode::<Hash, JobId>()?;
+        if context.job_id() != &self.job.job_id {
+            anyhow::bail!("work context job ID does not match response job");
+        }
+        match (self.node_type, context.authority()) {
+            (PROVING_JOB_NODE_TYPE_COORDINATOR, AuthorityScope::Coordinator) => {}
+            (
+                PROVING_JOB_NODE_TYPE_REALM,
+                AuthorityScope::Realm {
+                    realm_id,
+                    realm_sub_id,
+                },
+            ) if u64::from(realm_id) == self.realm_id
+                && u64::from(realm_sub_id) == self.realm_sub_id => {}
+            _ => anyhow::bail!("work context authority does not match response routing metadata"),
+        }
+        Ok(context)
     }
 }
 
@@ -125,18 +156,36 @@ pub fn decode_expected_public_inputs_hash_and_dependencies<JobId: QJobIdBase>(da
 // ================================================================================================
 
 #[cfg(feature = "rand_gen")]
-impl<Hash: QPGenRandom, JobId: QPGenRandom> QPGenRandom for PsyWorkerGetProvingWorkAPIResponse<Hash, JobId> {
+impl<Hash: QPGenRandom + Q256BitHash, JobId: QPGenRandom + QJobIdBase> QPGenRandom for PsyWorkerGetProvingWorkAPIResponse<Hash, JobId> {
     fn qp_rand_gen() -> Self
     where
         Self: Sized,
     {
+        let job: PsyProvingJobMetadataWithJobId<Hash, JobId> =
+            PsyProvingJobMetadataWithJobId::qp_rand_gen();
+        let chain = CanonicalChainRef::new(
+            NetworkId::from(PsyChainNetworkType::LocalDevnet),
+            ChainEpoch::new(u64::qp_rand_gen()),
+            CheckpointRef::new(
+                CheckpointId::new(u64::qp_rand_gen()),
+                CheckpointHash::from_last_chain_hash(Hash::qp_rand_gen()),
+            ),
+        );
+        let context = WorkContext::try_new(
+            chain,
+            AuthorityScope::Coordinator,
+            WorkUniquePendingId::new(u64::qp_rand_gen()),
+            WorkProcCheckpointUniqueId::from_u128(u128::qp_rand_gen()),
+            job.job_id,
+        )
+        .expect("generated job ID must be valid");
         Self {
-            job: PsyProvingJobMetadataWithJobId::qp_rand_gen(),
+            job,
             child_proof_tag_values: QPGenRandom::qp_rand_gen_vec_in_range(0, 5),
-            realm_id: u64::qp_rand_gen(),
-            realm_sub_id: u64::qp_rand_gen(),
-            unique_pending_id: u64::qp_rand_gen(),
-            node_type: u8::qp_rand_gen(),
+            realm_id: 0,
+            realm_sub_id: 0,
+            work_context: WorkContextToken::from_work_context(&context),
+            node_type: PROVING_JOB_NODE_TYPE_COORDINATOR,
             witness: QPGenRandom::qp_rand_gen_vec_in_range(0, 32),
         }
     }
@@ -152,8 +201,8 @@ impl<Hash: Q256BitHash, JobId: QJobIdBase> FallbackPsySerializeCanonical for Psy
         let mut size = self.job.pio_serialized_size();
         // child_proof_tag_values: vec len (4) + items * 32
         size += 4 + (self.child_proof_tag_values.len() * 32);
-        // realm_id (8) + realm_sub_id (8) + unique_pending_id (8) + node_type (1)
-        size += 8 + 8 + 8 + 1;
+        // realm_id (8) + realm_sub_id (8) + opaque WorkContext (130) + node_type (1)
+        size += 8 + 8 + WORK_CONTEXT_V1_LEN + 1;
         // witness: vec len (4) + bytes
         size += 4 + self.witness.len();
         size
@@ -169,7 +218,7 @@ impl<Hash: Q256BitHash, JobId: QJobIdBase> FallbackPsySerializeCanonical for Psy
 
         writer.psy_write_u64(self.realm_id)?;
         writer.psy_write_u64(self.realm_sub_id)?;
-        writer.psy_write_u64(self.unique_pending_id)?;
+        writer.psy_write_bytes_fixed(self.work_context.as_bytes())?;
         writer.psy_write_u8(self.node_type)?;
         
         writer.psy_write_bytes_vec(&self.witness)?;
@@ -188,7 +237,8 @@ impl<Hash: Q256BitHash, JobId: QJobIdBase> FallbackPsySerializeCanonical for Psy
 
         let realm_id = reader.psy_read_u64()?;
         let realm_sub_id = reader.psy_read_u64()?;
-        let unique_pending_id = reader.psy_read_u64()?;
+        let work_context_bytes: [u8; WORK_CONTEXT_V1_LEN] = reader.psy_read_bytes_fixed()?;
+        let work_context = WorkContextToken::try_from_canonical_bytes::<Hash, JobId>(work_context_bytes)?;
         let node_type = reader.psy_read_u8()?;
         let witness = reader.psy_read_bytes_vec()?;
 
@@ -197,7 +247,7 @@ impl<Hash: Q256BitHash, JobId: QJobIdBase> FallbackPsySerializeCanonical for Psy
             child_proof_tag_values,
             realm_id,
             realm_sub_id,
-            unique_pending_id,
+            work_context,
             node_type,
             witness,
         })
@@ -228,7 +278,9 @@ pser::impl_psy_ser_basic_tests_fallback!(
 // ================================================================================================
 
 #[cfg(feature = "rand_gen")]
-impl<Hash: QPGenRandom, JobId: QPGenRandom> QPGenRandom for PsyWorkerGetProvingWorkWithChildProofsAPIResponse<Hash, JobId> {
+impl<Hash: QPGenRandom + Q256BitHash, JobId: QPGenRandom + QJobIdBase> QPGenRandom
+    for PsyWorkerGetProvingWorkWithChildProofsAPIResponse<Hash, JobId>
+{
     fn qp_rand_gen() -> Self
     where
         Self: Sized,
@@ -307,3 +359,25 @@ pser::impl_psy_ser_basic_tests_fallback!(
     { parth_core::PHash, psy_core::job::job_id::QProvingJobDataID },
     psy_worker_get_proving_work_with_child_proofs_api_response_tests
 );
+
+#[cfg(all(test, feature = "rand_gen"))]
+mod work_context_tests {
+    use parth_core::{utils::QPGenRandom, PHash};
+
+    use super::*;
+
+    #[test]
+    fn response_accepts_only_a_matching_work_context() {
+        let response = PsyWorkerGetProvingWorkAPIResponse::<PHash, QProvingJobDataID>::qp_rand_gen();
+        let context = response.decode_and_validate_work_context().unwrap();
+        assert_eq!(context.job_id(), &response.job.job_id);
+
+        let mut wrong_job = response.clone();
+        wrong_job.job.job_id.goal_id = wrong_job.job.job_id.goal_id.wrapping_add(1);
+        assert!(wrong_job.decode_and_validate_work_context().is_err());
+
+        let mut wrong_authority = response;
+        wrong_authority.node_type = PROVING_JOB_NODE_TYPE_REALM;
+        assert!(wrong_authority.decode_and_validate_work_context().is_err());
+    }
+}

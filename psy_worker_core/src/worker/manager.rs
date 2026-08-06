@@ -1,7 +1,10 @@
 use cf_utils::log_indicator::print_cf_log_indicator;
 
 use crate::worker::prover_trait::{PsyWorkerGenericLibraryProver, PsyWorkerJobFetcher};
-use psy_data::worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse;
+use psy_data::{
+    protocol::chain_context::WorkContextToken,
+    worker::api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse,
+};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task;
@@ -46,7 +49,8 @@ impl<
 
         let (job_tx, job_rx) = mpsc::channel::<([u8; 32], Hash, PsyWorkerGetProvingWorkWithChildProofsAPIResponse<Hash, JobId>)>(batch_size);
 
-        let (proof_tx, proof_rx) = mpsc::channel::<([u8; 32], JobId, Hash, Vec<u8>)>(batch_size);
+        let (proof_tx, proof_rx) =
+            mpsc::channel::<([u8; 32], WorkContextToken, JobId, Hash, Vec<u8>)>(batch_size);
 
         let fetcher_handle = Self::spawn_fetcher_task(
             self.job_fetcher.clone(),
@@ -120,7 +124,7 @@ impl<
         circuit_library: Arc<CircuitLibrary>,
         prover: Arc<Prover>,
         mut job_rx: mpsc::Receiver<([u8; 32], Hash, PsyWorkerGetProvingWorkWithChildProofsAPIResponse<Hash, JobId>)>,
-        proof_tx: mpsc::Sender<([u8; 32], JobId, Hash, Vec<u8>)>,
+        proof_tx: mpsc::Sender<([u8; 32], WorkContextToken, JobId, Hash, Vec<u8>)>,
         batch_size: usize,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
@@ -131,6 +135,7 @@ impl<
 
             while let Some((api_url_hash, tag, job_response)) = job_rx.recv().await {
                 let job_id = job_response.base.job.job_id;
+                let work_context = job_response.base.work_context;
                 tracing::info!("Worker: Picked up job {:?}", job_id);
                 println!("[worker/prover] picked job: {:?}", job_id);
 
@@ -156,7 +161,10 @@ impl<
                             tracing::info!("Worker: Proved job {:?} in {:?}", job_id, proving_time);
                             println!("[worker/prover] proving done: {:?}, elapsed={:?}, proof_bytes={}", job_id, proving_time, proof.len());
 
-                            if let Err(e) = proof_tx_clone.send((api_url_hash, job_id, tag, proof)).await {
+                            if let Err(e) = proof_tx_clone
+                                .send((api_url_hash, work_context, job_id, tag, proof))
+                                .await
+                            {
                                 tracing::error!("Worker: Failed to send proof to submitter: {:?}", e);
                                 println!("[worker/prover] send to submitter failed: {:?}", e);
                             }
@@ -179,17 +187,20 @@ impl<
 
     fn spawn_submitter_task(
         submitter: Arc<JobFetcher>,
-        mut proof_rx: mpsc::Receiver<([u8; 32], JobId, Hash, Vec<u8>)>,
+        mut proof_rx: mpsc::Receiver<([u8; 32], WorkContextToken, JobId, Hash, Vec<u8>)>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             tracing::info!("Submitter role started - submitting proofs from proof queue");
             println!("[worker/submitter] started");
 
-            while let Some((api_url_hash, job_id, tag, proof)) = proof_rx.recv().await {
+            while let Some((api_url_hash, work_context, job_id, tag, proof)) = proof_rx.recv().await {
                 tracing::info!("Submitter: Received proof for job {:?}", job_id);
                 println!("[worker/submitter] submit start: {:?}, proof_bytes={}", job_id, proof.len());
 
-                match submitter.submit_proof_raw_to_api(api_url_hash, job_id, tag, proof).await {
+                match submitter
+                    .submit_proof_raw_to_api(api_url_hash, work_context, tag, proof)
+                    .await
+                {
                     Ok(_) => {
                         tracing::info!("Submitter: Successfully submitted proof for job {:?}", job_id);
                         println!("[worker/submitter] submit ok: {:?}", job_id);

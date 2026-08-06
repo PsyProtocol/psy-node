@@ -12,7 +12,13 @@ use parth_core::{
 use parth_crypto::hash::sha256::CoreSha256Hasher;
 use psy_api_core::worker::standard_worker_rpc::NodeEdgeWorkerRpcClient;
 use psy_core::{constants::url_rotation::PsyAPIURLRotationStrategy, job::job_id::QProvingJobDataID};
-use psy_data::worker::{api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse, proving_work_history::PsyProvingJobClaimMetadata};
+use psy_data::{
+    protocol::chain_context::{AuthorityScope, WorkContextToken},
+    worker::{
+        api_response::PsyWorkerGetProvingWorkWithChildProofsAPIResponse,
+        proving_work_history::PsyProvingJobClaimMetadata,
+    },
+};
 use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 use tokio::{io::AsyncWriteExt, sync::RwLock};
 
@@ -27,7 +33,7 @@ pub struct PsyWorkerBasicAPIJobFetcher<Hash, JobId: std::hash::Hash + Eq, Signer
     pub coordinator_api_url_manager: PsyWorkerAPIURLManager,
     pub is_in_realm_mode: AtomicBool,
     pub completed_jobs: Arc<RwLock<Vec<PsyProvingJobClaimMetadata<Hash, JobId>>>>,
-    pub reward_preimage_map: DashMap<([u8; 32], JobId), (PsyProvingJobClaimMetadata<Hash, JobId>, u64)>,
+    pub reward_preimage_map: DashMap<([u8; 32], WorkContextToken), (PsyProvingJobClaimMetadata<Hash, JobId>, u64)>,
     pub backup_file: Option<tokio::fs::File>,
     pub api_signer: Arc<Signer>,
     pub api_signer_public_key: CompressedPublicKey,
@@ -92,9 +98,9 @@ impl<
     pub fn get_remove_reward_tree_tag_preimage_for_job_id(
         &self,
         api_url_hash: [u8; 32],
-        job_id: QProvingJobDataID,
+        work_context: WorkContextToken,
     ) -> Option<(PsyProvingJobClaimMetadata<Hash, QProvingJobDataID>, u64)> {
-        if let Some(entry) = self.reward_preimage_map.remove(&(api_url_hash, job_id)) {
+        if let Some(entry) = self.reward_preimage_map.remove(&(api_url_hash, work_context)) {
             Some(entry.1)
         } else {
             None
@@ -222,13 +228,14 @@ impl<
             api_client.unwrap().get_proving_work_with_child_proofs(signature, timed_request).await;
         match fetch_result {
             Ok(response) => {
+                let work_context = response.base.decode_and_validate_work_context()?;
                 let claim_metadata = PsyProvingJobClaimMetadata {
                     job_id: response.base.job.job_id.clone(),
                     reward_tree_tag: tag.clone(),
                     reward_tree_tag_preimage: tag_preimage.clone(),
                     proving_duration_ms: 0,
                     job_submitted_at: 0,
-                    unique_pending_id: response.base.unique_pending_id,
+                    unique_pending_id: work_context.unique_pending_id().get(),
                     realm_id: response.base.realm_id,
                     realm_sub_id: response.base.realm_sub_id,
                     reward_tree_node_key: response.base.job.get_reward_tree_node_key(),
@@ -238,7 +245,7 @@ impl<
                     api_url_hash: api_url_hash,
                 };
                 self.reward_preimage_map
-                    .insert((api_url_hash, response.base.job.job_id.clone()), (claim_metadata, get_current_time_ms()));
+                    .insert((api_url_hash, response.base.work_context), (claim_metadata, get_current_time_ms()));
                 self.report_fetch_job_success(api_url_hash).await;
                 Ok(Some((api_url_hash, tag.clone(), response)))
             }
@@ -249,19 +256,25 @@ impl<
         }
     }
 
-    pub async fn submit_proof_inner(&self, api_url_hash: [u8; 32], job_id: QProvingJobDataID, tag: Hash, proof: Vec<u8>) -> anyhow::Result<()> {
-        let is_in_realm_mode = self.is_in_realm_mode.load(std::sync::atomic::Ordering::SeqCst);
-        let api_client = if is_in_realm_mode {
-            self.realm_api_url_manager.api_url_hash_to_client.get(&api_url_hash)
-        } else {
-            self.coordinator_api_url_manager.api_url_hash_to_client.get(&api_url_hash)
+    pub async fn submit_proof_inner(&self, api_url_hash: [u8; 32], work_context: WorkContextToken, tag: Hash, proof: Vec<u8>) -> anyhow::Result<()> {
+        let decoded = work_context.decode::<Hash, QProvingJobDataID>()?;
+        let job_id = *decoded.job_id();
+        let api_client = match decoded.authority() {
+            AuthorityScope::Realm { .. } => self
+                .realm_api_url_manager
+                .api_url_hash_to_client
+                .get(&api_url_hash),
+            AuthorityScope::Coordinator => self
+                .coordinator_api_url_manager
+                .api_url_hash_to_client
+                .get(&api_url_hash),
         };
         if api_client.is_none() {
             anyhow::bail!("API client not found for URL hash");
         }
 
         let current_time = get_current_time_ms();
-        let (mut claim_metadata, tag_creation_time) = match self.reward_preimage_map.remove(&(api_url_hash, job_id.clone())) {
+        let (mut claim_metadata, tag_creation_time) = match self.reward_preimage_map.remove(&(api_url_hash, work_context)) {
             Some((_, v)) => v,
             None => {
                 anyhow::bail!("Reward tree tag preimage not found for job ID");
@@ -277,7 +290,20 @@ impl<
             API_REQUEST_SIGNATURE_VALID_DURATION_MS,
             tag.clone().into_owned_32bytes(),
         );
-        let submit_result: Result<(), _> = api_client.unwrap().submit_proof_raw(signature, request, job_id.clone(), tag, proof).await;
+        let api_client = api_client.unwrap();
+        let submit_result: Result<(), _> =
+            <jsonrpsee::http_client::HttpClient as NodeEdgeWorkerRpcClient<
+                Hash,
+                QProvingJobDataID,
+            >>::submit_proof_raw(
+                api_client.value(),
+                signature,
+                request,
+                work_context,
+                tag,
+                proof,
+            )
+            .await;
         match submit_result {
             Ok(_) => {
                 println!("[worker/basic_fetcher] submit_proof_raw ok: {:?}", job_id);
@@ -306,7 +332,7 @@ impl<
     ) -> anyhow::Result<Option<([u8; 32], Hash, PsyWorkerGetProvingWorkWithChildProofsAPIResponse<Hash, QProvingJobDataID>)>> {
         self.fetch_next_job().await
     }
-    async fn submit_proof_raw_to_api(&self, api_url_hash: [u8; 32], job_id: QProvingJobDataID, tag: Hash, proof: Vec<u8>) -> anyhow::Result<()> {
-        self.submit_proof_inner(api_url_hash, job_id, tag, proof).await
+    async fn submit_proof_raw_to_api(&self, api_url_hash: [u8; 32], work_context: WorkContextToken, tag: Hash, proof: Vec<u8>) -> anyhow::Result<()> {
+        self.submit_proof_inner(api_url_hash, work_context, tag, proof).await
     }
 }
