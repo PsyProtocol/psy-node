@@ -1,0 +1,9 @@
+PendingToCheckpointPut
+INSERT INTO psy_d02t8.pending_id_to_checkpoint_id_table (obj_id, value) VALUES (?, ?) USING TIMESTAMP ?
+pending_id:BIGINT,checkpoint_id:BIGINT,write_timestamp_us:BIGINT
+PendingToProcPut
+INSERT INTO psy_d02t8.pending_id_to_pending_proc_id_table_u64_to_u128 (obj_id, value) VALUES (?, ?) USING TIMESTAMP ?
+pending_id:BIGINT,proc_id:UUID,write_timestamp_us:BIGINT
+ProcToPendingPut
+INSERT INTO psy_d02t8.pending_id_to_pending_proc_id_table_u128_to_u64 (obj_id, value) VALUES (?, ?) USING TIMESTAMP ?
+proc_id:UUID,pending_id:BIGINT,write_timestamp_us:BIGINT
