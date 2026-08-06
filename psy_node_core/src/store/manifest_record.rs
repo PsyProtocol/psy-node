@@ -143,6 +143,8 @@ impl ManifestRevision {
 #[repr(i8)]
 pub enum AuthorityManifestStatus {
     Prepared = 1,
+    Sealed = 2,
+    Committed = 3,
 }
 
 impl TryFrom<i8> for AuthorityManifestStatus {
@@ -151,6 +153,8 @@ impl TryFrom<i8> for AuthorityManifestStatus {
     fn try_from(value: i8) -> Result<Self, Self::Error> {
         match value {
             1 => Ok(Self::Prepared),
+            2 => Ok(Self::Sealed),
+            3 => Ok(Self::Committed),
             value => Err(ManifestRecordError::UnknownManifestStatus(value)),
         }
     }
@@ -234,6 +238,11 @@ impl<Hash: Q256BitHash> PreparedAuthorityManifestRecord<Hash> {
             ));
         }
         let status = AuthorityManifestStatus::try_from(status)?;
+        if status != AuthorityManifestStatus::Prepared {
+            return Err(ManifestRecordError::UnsupportedPreparedStatus(
+                status as i8,
+            ));
+        }
         if persisted_digest.len() != 32 {
             return Err(ManifestRecordError::InvalidManifestDigestLength(
                 persisted_digest.len(),
@@ -489,6 +498,7 @@ pub enum ManifestRecordError {
     NegativeRevision(i64),
     UnsupportedPreparedRevision(u64),
     UnknownManifestStatus(i8),
+    UnsupportedPreparedStatus(i8),
     EmptyArtifactSummary,
     ArtifactSummaryTooLarge { actual: usize, maximum: usize },
     InvalidManifestDigestLength(usize),
