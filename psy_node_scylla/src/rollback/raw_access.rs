@@ -63,6 +63,7 @@ pub const RAW_SCYLLA_ACCESS_ALLOWLIST: &[RawScyllaAccessAllowance] = &[
     allow!("psy_node_scylla/src/rollback/mutable_singleton.rs", RollbackPrototypeAdapter),
     allow!("psy_node_scylla/src/rollback/pending_counter.rs", RollbackPrototypeAdapter),
     allow!("psy_node_scylla/src/rollback/pending_context.rs", RollbackPrototypeAdapter),
+    allow!("psy_node_scylla/src/rollback/pending_namespace_rf3_gate.rs", TestHarness),
     allow!("psy_node_scylla/src/rollback/confinement.rs", RollbackPrototypeAdapter),
     allow!("psy_node_scylla/src/rollback/namespace_prototype.rs", RollbackPrototypeAdapter),
     allow!("psy_node_scylla/src/rollback/raw_access.rs", GuardImplementation),

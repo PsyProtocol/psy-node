@@ -26,6 +26,8 @@ mod mutation;
 mod mutable_singleton;
 mod pending_counter;
 mod pending_context;
+#[cfg(test)]
+mod pending_namespace_rf3_gate;
 mod confinement;
 mod namespace;
 mod namespace_prototype;
