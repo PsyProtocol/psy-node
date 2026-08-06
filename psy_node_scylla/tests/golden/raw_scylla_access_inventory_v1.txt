@@ -17,6 +17,7 @@ psy_node_scylla/examples/tst7.rs|Example|2|2|0|0|1|1|2|3
 psy_node_scylla/examples/tst7_nobucket.rs|Example|2|2|0|0|1|1|2|3
 psy_node_scylla/src/core.rs|DriverCore|2|2|11|0|0|0|2|2
 psy_node_scylla/src/core_db.rs|DriverCore|0|0|97|0|0|0|0|0
+psy_node_scylla/src/rollback/authority_local_head_prototype.rs|DurableControlAuthority|6|0|3|6|2|3|1|4
 psy_node_scylla/src/rollback/authority_timestamp_prototype.rs|DurableControlAuthority|6|0|4|6|2|4|1|6
 psy_node_scylla/src/rollback/canonical_head_prototype.rs|CanonicalHeadAuthority|7|0|3|6|2|3|1|6
 psy_node_scylla/src/rollback/checkpoint_kiv.rs|RollbackPrototypeAdapter|6|0|0|4|1|2|0|2
@@ -25,6 +26,7 @@ psy_node_scylla/src/rollback/checkpoint_object_single.rs|RollbackPrototypeAdapte
 psy_node_scylla/src/rollback/checkpoint_root_pair.rs|RollbackPrototypeAdapter|5|0|0|6|1|0|0|4
 psy_node_scylla/src/rollback/confinement.rs|RollbackPrototypeAdapter|4|0|2|0|0|0|1|0
 psy_node_scylla/src/rollback/imt_family.rs|RollbackPrototypeAdapter|10|0|0|8|1|7|0|6
+psy_node_scylla/src/rollback/manifest_prepared.rs|DurableControlAuthority|6|0|6|8|2|6|2|7
 psy_node_scylla/src/rollback/mutable_singleton.rs|RollbackPrototypeAdapter|5|0|0|4|1|2|0|2
 psy_node_scylla/src/rollback/namespace_prototype.rs|RollbackPrototypeAdapter|27|0|0|13|2|10|4|16
 psy_node_scylla/src/rollback/pending_context.rs|RollbackPrototypeAdapter|4|0|0|4|1|2|0|3
@@ -75,8 +77,11 @@ psy_node_scylla/tests/rollback_checkpoint_merkle.rs|TestHarness|0|0|0|0|0|0|0|1
 psy_node_scylla/tests/rollback_checkpoint_object_single.rs|TestHarness|0|0|0|0|0|0|0|2
 psy_node_scylla/tests/rollback_checkpoint_root_pair.rs|TestHarness|0|0|0|0|0|0|0|1
 psy_node_scylla/tests/rollback_confinement.rs|TestHarness|2|0|1|0|0|0|1|1
+psy_node_scylla/tests/rollback_manifest_prepared.rs|TestHarness|0|0|0|0|0|0|0|1
+psy_node_scylla/tests/rollback_manifest_prepared_rf3_gate.rs|TestHarness|3|2|0|0|0|0|2|2
 psy_node_scylla/tests/rollback_namespace_prototype.rs|TestHarness|0|0|0|0|0|0|0|1
 psy_node_scylla/tests/rollback_namespace_rf3_gate.rs|TestHarness|7|2|0|0|0|0|4|4
+psy_node_scylla/tests/rollback_normal_commit_rf3_gate.rs|TestHarness|3|2|0|0|0|0|5|2
 psy_node_scylla/tests/rollback_pending_counter.rs|TestHarness|0|0|0|0|0|0|0|1
 psy_node_scylla/tests/rollback_public_key_projection.rs|TestHarness|0|0|0|0|0|0|0|1
 psy_node_scylla/tests/rollback_reward_tag_tree.rs|TestHarness|0|0|0|0|0|0|0|3
