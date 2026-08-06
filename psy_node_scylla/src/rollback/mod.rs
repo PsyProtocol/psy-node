@@ -36,6 +36,9 @@ mod confinement;
 mod namespace;
 mod namespace_prototype;
 mod normal_commit_prototype;
+mod normal_state_replay_prototype;
+#[cfg(test)]
+mod normal_state_replay_rf3_gate;
 mod raw_access;
 mod replay;
 mod reward_tag_tree;
@@ -65,6 +68,7 @@ pub use confinement::*;
 pub use namespace::*;
 pub use namespace_prototype::*;
 pub use normal_commit_prototype::*;
+pub use normal_state_replay_prototype::*;
 pub use raw_access::*;
 pub use replay::*;
 pub use reward_tag_tree::*;

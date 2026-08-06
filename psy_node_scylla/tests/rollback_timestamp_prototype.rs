@@ -51,6 +51,8 @@ fn query_and_bind_contract_matches_golden() {
     assert_eq!(queries.global_user_merkle_put().cql().matches('?').count(), 5);
     assert_eq!(queries.global_user_merkle_point_delete().cql().matches('?').count(), 4);
     assert_eq!(queries.global_user_merkle_range_delete().cql().matches('?').count(), 5);
+    assert_eq!(queries.global_user_merkle_exact_read().cql().matches('?').count(), 3);
+    assert!(!queries.global_user_merkle_exact_read().cql().contains("<="));
 }
 
 #[test]

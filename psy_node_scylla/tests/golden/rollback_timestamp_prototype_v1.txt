@@ -13,3 +13,6 @@ delete_fence_us:BIGINT,level:TINYINT,node_index:BIGINT,checkpoint_id:BIGINT
 GlobalUserMerkleBoundedRangeDelete
 DELETE FROM psy_g006.global_user_tree_table USING TIMESTAMP ? WHERE level = ? AND node_index = ? AND checkpoint_id > ? AND checkpoint_id <= ?
 delete_fence_us:BIGINT,level:TINYINT,node_index:BIGINT,target_checkpoint_id:BIGINT,old_head_checkpoint_id:BIGINT
+GlobalUserMerkleExactRead
+SELECT value FROM psy_g006.global_user_tree_table WHERE level = ? AND node_index = ? AND checkpoint_id = ?
+level:TINYINT,node_index:BIGINT,checkpoint_id:BIGINT

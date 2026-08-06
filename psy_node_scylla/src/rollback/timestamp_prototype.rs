@@ -66,6 +66,7 @@ pub enum TimestampPrototypeQueryId {
     GlobalUserMerklePut = 3,
     GlobalUserMerklePointDelete = 4,
     GlobalUserMerkleBoundedRangeDelete = 5,
+    GlobalUserMerkleExactRead = 6,
 }
 
 /// The exact value order consumed by each prepared statement.
@@ -120,6 +121,7 @@ pub struct TimestampPrototypeQueries {
     global_user_merkle_put: TimestampPrototypeQuery,
     global_user_merkle_point_delete: TimestampPrototypeQuery,
     global_user_merkle_range_delete: TimestampPrototypeQuery,
+    global_user_merkle_exact_read: TimestampPrototypeQuery,
 }
 
 impl TimestampPrototypeQueries {
@@ -177,6 +179,17 @@ impl TimestampPrototypeQueries {
                     "old_head_checkpoint_id:BIGINT",
                 ],
             },
+            global_user_merkle_exact_read: TimestampPrototypeQuery {
+                id: TimestampPrototypeQueryId::GlobalUserMerkleExactRead,
+                cql: format!(
+                    "SELECT value FROM {qualified_global_user} WHERE level = ? AND node_index = ? AND checkpoint_id = ?"
+                ),
+                bind_shape: &[
+                    "level:TINYINT",
+                    "node_index:BIGINT",
+                    "checkpoint_id:BIGINT",
+                ],
+            },
         }
     }
 
@@ -200,13 +213,18 @@ impl TimestampPrototypeQueries {
         &self.global_user_merkle_range_delete
     }
 
-    pub fn all(&self) -> [&TimestampPrototypeQuery; 5] {
+    pub const fn global_user_merkle_exact_read(&self) -> &TimestampPrototypeQuery {
+        &self.global_user_merkle_exact_read
+    }
+
+    pub fn all(&self) -> [&TimestampPrototypeQuery; 6] {
         [
             &self.checkpoint_leaf_put,
             &self.checkpoint_leaf_delete,
             &self.global_user_merkle_put,
             &self.global_user_merkle_point_delete,
             &self.global_user_merkle_range_delete,
+            &self.global_user_merkle_exact_read,
         ]
     }
 
@@ -406,6 +424,10 @@ impl GlobalUserMerklePutBinding {
     fn driver_values(&self) -> (i8, i64, i64, &Vec<u8>, i64) {
         (self.level, self.node_index, self.checkpoint, &self.value, self.write_timestamp_us)
     }
+
+    fn exact_read_driver_values(&self) -> (i8, i64, i64) {
+        (self.level, self.node_index, self.checkpoint)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -512,6 +534,7 @@ pub struct TimestampPrototypeAdapter {
     global_user_merkle_put: PreparedStatement,
     global_user_merkle_point_delete: PreparedStatement,
     global_user_merkle_range_delete: PreparedStatement,
+    global_user_merkle_exact_read: PreparedStatement,
 }
 
 impl TimestampPrototypeAdapter {
@@ -535,6 +558,8 @@ impl TimestampPrototypeAdapter {
             prepare_idempotent(session, queries.global_user_merkle_point_delete().cql(), consistency).await?;
         let global_user_merkle_range_delete =
             prepare_idempotent(session, queries.global_user_merkle_range_delete().cql(), consistency).await?;
+        let global_user_merkle_exact_read =
+            prepare_idempotent(session, queries.global_user_merkle_exact_read().cql(), consistency).await?;
         Ok(Self {
             queries,
             checkpoint_leaf_put,
@@ -542,6 +567,7 @@ impl TimestampPrototypeAdapter {
             global_user_merkle_put,
             global_user_merkle_point_delete,
             global_user_merkle_range_delete,
+            global_user_merkle_exact_read,
         })
     }
 
@@ -572,6 +598,26 @@ impl TimestampPrototypeAdapter {
         let binding = GlobalUserMerklePutBinding::try_from_sealed(sealed)?;
         session.execute_unpaged(&self.global_user_merkle_put, binding.driver_values()).await?;
         Ok(())
+    }
+
+    /// Read the exact physical row represented by a sealed global-user
+    /// Merkle PUT. This deliberately does not use the production `<= height`
+    /// proof lookup: normal-commit verification must prove that every row of
+    /// this exact commit exists before the manifest can become SEALED.
+    pub async fn read_global_user_merkle_exact(
+        &self,
+        session: &Session,
+        sealed: &SealedTimestampedPut,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        let binding = GlobalUserMerklePutBinding::try_from_sealed(sealed)?;
+        let result = session
+            .execute_unpaged(
+                &self.global_user_merkle_exact_read,
+                binding.exact_read_driver_values(),
+            )
+            .await?;
+        let rows = result.into_rows_result()?;
+        Ok(rows.maybe_first_row::<(Vec<u8>,)>()?.map(|row| row.0))
     }
 
     pub async fn delete_global_user_merkle_point(

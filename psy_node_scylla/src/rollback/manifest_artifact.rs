@@ -457,6 +457,16 @@ pub enum DecodedManifestArtifactPlan {
 }
 
 impl DecodedManifestArtifactPlan {
+    pub const fn replay_record_kind(&self) -> Option<ReplayRecordKind> {
+        match self {
+            Self::Chunked {
+                replay_record_kind,
+                ..
+            } => Some(*replay_record_kind),
+            Self::ZeroMutation { .. } => None,
+        }
+    }
+
     pub const fn mutation_digest(&self) -> &[u8; 32] {
         match self {
             Self::Chunked {

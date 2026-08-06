@@ -72,6 +72,7 @@ pub enum RollbackableStorePrototypeError {
     Driver(String),
     RecordingLockPoisoned,
     NotARecordingStore,
+    ExactReadRequiresScylla,
 }
 
 impl fmt::Display for RollbackableStorePrototypeError {
@@ -81,6 +82,7 @@ impl fmt::Display for RollbackableStorePrototypeError {
             Self::Driver(error) => write!(f, "Scylla prototype adapter failed: {error}"),
             Self::RecordingLockPoisoned => write!(f, "recording prototype lock is poisoned"),
             Self::NotARecordingStore => write!(f, "prepared Scylla stores do not expose an in-memory recording"),
+            Self::ExactReadRequiresScylla => write!(f, "exact physical read requires the confined Scylla backend"),
         }
     }
 }
@@ -178,6 +180,27 @@ impl RollbackableStorePrototype {
                     .map_err(|error| RollbackableStorePrototypeError::Driver(error.to_string()))?;
                 Ok(receipt)
             }
+        }
+    }
+
+    /// Exact physical read used by the representative normal-commit verifier.
+    /// It intentionally remains behind the same confined backend as writes.
+    pub async fn read_global_user_merkle_exact(
+        &self,
+        sealed: &SealedTimestampedPut,
+    ) -> Result<Option<Vec<u8>>, RollbackableStorePrototypeError> {
+        GlobalUserMerklePutBinding::try_from_sealed(sealed)?;
+        match &self.backend {
+            PrivateStoreBackend::Recording(_) => {
+                Err(RollbackableStorePrototypeError::ExactReadRequiresScylla)
+            }
+            PrivateStoreBackend::Scylla(backend) => backend
+                .adapter
+                .read_global_user_merkle_exact(&backend.session, sealed)
+                .await
+                .map_err(|error| {
+                    RollbackableStorePrototypeError::Driver(error.to_string())
+                }),
         }
     }
 

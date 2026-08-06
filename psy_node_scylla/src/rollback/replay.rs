@@ -349,7 +349,12 @@ impl PreparedPayload {
         Ok(Self { kind, codec_version, writer_version, mutations })
     }
 
-    fn expand(self) -> Result<Vec<ResolvedScyllaMutation>, ReplayPrototypeError> {
+    /// Expand a strictly decoded durable prepared payload through the typed
+    /// registry. Callers must still compare the resulting batch digest with
+    /// the manifest commitment before executing it.
+    pub(crate) fn expand_physical(
+        self,
+    ) -> Result<Vec<ResolvedScyllaMutation>, ReplayPrototypeError> {
         let mut mutations = Vec::new();
         for mutation in self.mutations {
             mutations.extend(expand_logical_mutation(mutation.into_logical())?);
@@ -671,7 +676,7 @@ impl PreparedReferencePlusSupplementRecord {
         if payload.kind != self.prepared.payload_kind {
             return Err(ReplayPrototypeError::PreparedPayloadKindMismatch);
         }
-        let mut mutations = payload.expand()?;
+        let mut mutations = payload.expand_physical()?;
         mutations.extend(self.supplements.batch().mutations().iter().cloned());
         let expanded = CanonicalPhysicalMutationBatch::try_new(mutations)?;
         if expanded.mutations().len() != self.expected_mutation_count as usize || expanded.digest() != self.expected_full_digest {

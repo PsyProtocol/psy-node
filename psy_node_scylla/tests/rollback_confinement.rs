@@ -67,6 +67,11 @@ async fn typed_store_rejects_a_ready_mutation_for_the_wrong_representative_adapt
         ))
     ));
     assert!(store.recorded_calls().unwrap().is_empty());
+
+    assert_eq!(
+        store.read_global_user_merkle_exact(&merkle).await,
+        Err(RollbackableStorePrototypeError::ExactReadRequiresScylla)
+    );
 }
 
 #[test]
@@ -222,18 +227,18 @@ fn lexical_inventory_is_stable_and_nontrivial() {
         total.direct_cql += row.direct_cql;
         total
     });
-    assert_eq!(detected.len(), 89);
+    assert_eq!(detected.len(), 90);
     assert_eq!(
         total,
         RawScyllaAccessCounts {
-            session_type: 686,
-            session_builder: 43,
-            session_field_access: 158,
-            prepared_statement: 229,
+            session_type: 690,
+            session_builder: 45,
+            session_field_access: 159,
+            prepared_statement: 230,
             prepare_call: 134,
-            execute_call: 244,
-            query_call: 104,
-            direct_cql: 335,
+            execute_call: 245,
+            query_call: 109,
+            direct_cql: 341,
         }
     );
 }
