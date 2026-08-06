@@ -10,7 +10,8 @@ use psy_node_core::store::authority_commit::{
     AuthorityCommitModelError, AuthorityScope, AuthorityTimestampBootstrap,
     AuthorityTimestampKey, AuthorityTimestampReadState,
     AuthorityTimestampWriteOutcome, SealedAuthorityTimestampCompletion,
-    SealedAuthorityTimestampReservation, StoredAuthorityTimestampState,
+    SealedAuthorityTimestampReservation, ObservedAuthorityTimestampState,
+    StoredAuthorityTimestampState,
 };
 use scylla::{
     client::session::Session,
@@ -502,6 +503,21 @@ impl ScyllaAuthorityTimestampStore {
             Some(row) => Ok(AuthorityTimestampReadState::Current(decode_db_row(
                 key, row,
             )?)),
+        }
+    }
+
+    /// Read the durable row while preserving the exact selected partition for
+    /// D-04b recovery planning. Missing remains explicit and is never
+    /// interpreted as a default allocator state.
+    pub async fn read_observed(
+        &self,
+        key: AuthorityTimestampKey,
+    ) -> Result<Option<ObservedAuthorityTimestampState>, AuthorityTimestampPrototypeError> {
+        match self.read(key).await? {
+            AuthorityTimestampReadState::Uninitialized => Ok(None),
+            AuthorityTimestampReadState::Current(state) => Ok(Some(
+                ObservedAuthorityTimestampState::from_selected_row(key, state),
+            )),
         }
     }
 

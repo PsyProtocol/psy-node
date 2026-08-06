@@ -15,6 +15,10 @@ use super::{
         AuthorityTimestampLease, ObservedAuthorityTimestampState,
         SealedAuthorityTimestampCompletion,
     },
+    authority_local_head::{
+        AuthorityLocalHeadModelError, AuthorityLocalHeadWriteOutcome,
+        SealedAuthorityLocalHeadCas, StoredAuthorityLocalHead,
+    },
     manifest_lifecycle::{
         AuthorityHeadPublishDecision, AuthorityHeadView,
         AuthorityPostWriteObservation, CommittedAuthorityManifest,
@@ -33,7 +37,7 @@ pub enum NormalCommitRecoveryAction<Hash> {
         prepared: PreparedAuthorityManifestRecord<Hash>,
     },
     PublishExactHead {
-        sealed: SealedAuthorityManifest<Hash>,
+        publish: SealedNormalHeadPublish<Hash>,
     },
     PersistRecoveredCommitted {
         committed: CommittedAuthorityManifest<Hash>,
@@ -56,17 +60,36 @@ pub enum NormalHeadPublishProgress<Hash> {
     },
 }
 
+/// The exact SEALED manifest and authority-head CAS that must be executed as
+/// one publish attempt. Neither component can be substituted independently.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SealedNormalHeadPublish<Hash> {
+    manifest: SealedAuthorityManifest<Hash>,
+    head_cas: SealedAuthorityLocalHeadCas<Hash>,
+}
+
+impl<Hash> SealedNormalHeadPublish<Hash> {
+    pub const fn manifest(&self) -> &SealedAuthorityManifest<Hash> {
+        &self.manifest
+    }
+
+    pub const fn head_cas(&self) -> &SealedAuthorityLocalHeadCas<Hash> {
+        &self.head_cas
+    }
+}
+
 /// Determine the only safe next step after startup or a lost response.
 pub fn plan_normal_commit_recovery<Hash: Q256BitHash>(
     manifest: &PersistedAuthorityManifest<Hash>,
-    current_head: AuthorityHeadView<Hash>,
+    current_head: &StoredAuthorityLocalHead<Hash>,
     allocator: ObservedAuthorityTimestampState,
 ) -> Result<NormalCommitRecoveryAction<Hash>, NormalCommitOrchestrationError> {
+    let current_view = *current_head.head();
     match manifest {
         PersistedAuthorityManifest::Prepared(prepared) => {
             require_active_lease(prepared, allocator)?;
             let expected = AuthorityHeadView::expected(prepared);
-            if current_head != expected {
+            if current_view != expected {
                 return Err(
                     NormalCommitOrchestrationError::PreparedHeadIsNotExpected,
                 );
@@ -77,10 +100,17 @@ pub fn plan_normal_commit_recovery<Hash: Q256BitHash>(
         }
         PersistedAuthorityManifest::Sealed(sealed) => {
             require_active_lease(sealed.prepared(), allocator)?;
-            match sealed.recovery_action(current_head) {
+            match sealed.recovery_action(current_view) {
                 SealedManifestRecoveryAction::PublishExactCandidate => {
+                    let head_cas = SealedAuthorityLocalHeadCas::seal_normal_advance(
+                        current_head.clone(),
+                        sealed,
+                    )?;
                     Ok(NormalCommitRecoveryAction::PublishExactHead {
-                        sealed: sealed.clone(),
+                        publish: SealedNormalHeadPublish {
+                            manifest: sealed.clone(),
+                            head_cas,
+                        },
                     })
                 }
                 SealedManifestRecoveryAction::MarkCommitted(receipt) => {
@@ -94,7 +124,7 @@ pub fn plan_normal_commit_recovery<Hash: Q256BitHash>(
             }
         }
         PersistedAuthorityManifest::Committed(committed) => {
-            committed.recovery_action(current_head)?;
+            committed.recovery_action(current_view)?;
             let prepared = committed.sealed().prepared();
             match observe_allocator(prepared, allocator)? {
                 ExactAllocatorObservation::Active(lease) => {
@@ -122,11 +152,11 @@ pub fn plan_normal_commit_recovery<Hash: Q256BitHash>(
 pub fn seal_verified_normal_commit<Hash: Q256BitHash>(
     prepared: PreparedAuthorityManifestRecord<Hash>,
     observation: AuthorityPostWriteObservation<Hash>,
-    current_head: AuthorityHeadView<Hash>,
+    current_head: &StoredAuthorityLocalHead<Hash>,
     allocator: ObservedAuthorityTimestampState,
 ) -> Result<SealedAuthorityManifest<Hash>, NormalCommitOrchestrationError> {
     require_active_lease(&prepared, allocator)?;
-    if current_head != AuthorityHeadView::expected(&prepared) {
+    if *current_head.head() != AuthorityHeadView::expected(&prepared) {
         return Err(NormalCommitOrchestrationError::AuthorityHeadChangedBeforeSeal);
     }
     SealedAuthorityManifest::verify_and_seal(prepared, observation)
@@ -136,17 +166,36 @@ pub fn seal_verified_normal_commit<Hash: Q256BitHash>(
 /// Classify a real authority-head CAS without allowing the caller to mint a
 /// COMMITTED manifest from arbitrary current state.
 pub fn classify_normal_head_publish<Hash: Q256BitHash>(
-    sealed: SealedAuthorityManifest<Hash>,
-    applied: bool,
-    current_head: AuthorityHeadView<Hash>,
+    publish: SealedNormalHeadPublish<Hash>,
+    outcome: AuthorityLocalHeadWriteOutcome<Hash>,
     allocator: ObservedAuthorityTimestampState,
 ) -> Result<NormalHeadPublishProgress<Hash>, NormalCommitOrchestrationError> {
-    require_active_lease(sealed.prepared(), allocator)?;
-    match sealed.classify_head_cas(applied, current_head)? {
+    require_active_lease(publish.manifest.prepared(), allocator)?;
+    let (applied, current_head) = match outcome {
+        AuthorityLocalHeadWriteOutcome::Applied(current) => {
+            if current != *publish.head_cas.candidate() {
+                return Err(NormalCommitOrchestrationError::HeadCasOutcomeMismatch);
+            }
+            (true, *current.head())
+        }
+        AuthorityLocalHeadWriteOutcome::Idempotent(current) => {
+            if current != *publish.head_cas.candidate() {
+                return Err(NormalCommitOrchestrationError::HeadCasOutcomeMismatch);
+            }
+            (false, *current.head())
+        }
+        AuthorityLocalHeadWriteOutcome::Conflict(current) => {
+            if current != *publish.head_cas.expected() {
+                return Err(NormalCommitOrchestrationError::AuthorityHeadConflict);
+            }
+            (false, *current.head())
+        }
+    };
+    match publish.manifest.classify_head_cas(applied, current_head)? {
         AuthorityHeadPublishDecision::Published(receipt)
         | AuthorityHeadPublishDecision::Idempotent(receipt) => {
             Ok(NormalHeadPublishProgress::PersistCommitted {
-                committed: sealed.mark_committed(receipt)?,
+                committed: publish.manifest.mark_committed(receipt)?,
             })
         }
         AuthorityHeadPublishDecision::RetryExactSealedIntent => {
@@ -223,9 +272,11 @@ fn observe_allocator<Hash: Q256BitHash>(
 pub enum NormalCommitOrchestrationError {
     ManifestLifecycle(ManifestLifecycleError),
     AuthorityCommit(AuthorityCommitModelError),
+    AuthorityLocalHead(AuthorityLocalHeadModelError),
     PreparedHeadIsNotExpected,
     AuthorityHeadChangedBeforeSeal,
     AuthorityHeadConflict,
+    HeadCasOutcomeMismatch,
     AllocatorOwnedByOtherIntent,
     AllocatorDoesNotOwnIntent,
     AllocatorKeyMismatch,
@@ -242,6 +293,12 @@ impl From<ManifestLifecycleError> for NormalCommitOrchestrationError {
 impl From<AuthorityCommitModelError> for NormalCommitOrchestrationError {
     fn from(value: AuthorityCommitModelError) -> Self {
         Self::AuthorityCommit(value)
+    }
+}
+
+impl From<AuthorityLocalHeadModelError> for NormalCommitOrchestrationError {
+    fn from(value: AuthorityLocalHeadModelError) -> Self {
+        Self::AuthorityLocalHead(value)
     }
 }
 

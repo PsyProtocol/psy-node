@@ -1,0 +1,8 @@
+CreateTable|
+CREATE TABLE IF NOT EXISTS psy_d04b_nt.d04b_authority_local_head (network_chain_id bigint, authority_kind tinyint, realm_id bigint, realm_sub_id bigint, revision bigint, head blob, PRIMARY KEY ((network_chain_id, authority_kind, realm_id, realm_sub_id)))
+Read|network_chain_id:BIGINT,authority_kind:TINYINT,realm_id:BIGINT,realm_sub_id:BIGINT
+SELECT network_chain_id, authority_kind, realm_id, realm_sub_id, revision, head FROM psy_d04b_nt.d04b_authority_local_head WHERE network_chain_id = ? AND authority_kind = ? AND realm_id = ? AND realm_sub_id = ?
+Bootstrap|network_chain_id:BIGINT,authority_kind:TINYINT,realm_id:BIGINT,realm_sub_id:BIGINT,candidate_revision:BIGINT,candidate_head:BLOB
+INSERT INTO psy_d04b_nt.d04b_authority_local_head (network_chain_id, authority_kind, realm_id, realm_sub_id, revision, head) VALUES (?, ?, ?, ?, ?, ?) IF NOT EXISTS
+CompareAndSet|candidate_revision:BIGINT,candidate_head:BLOB,network_chain_id:BIGINT,authority_kind:TINYINT,realm_id:BIGINT,realm_sub_id:BIGINT,expected_revision:BIGINT,expected_head:BLOB
+UPDATE psy_d04b_nt.d04b_authority_local_head SET revision = ?, head = ? WHERE network_chain_id = ? AND authority_kind = ? AND realm_id = ? AND realm_sub_id = ? IF revision = ? AND head = ?

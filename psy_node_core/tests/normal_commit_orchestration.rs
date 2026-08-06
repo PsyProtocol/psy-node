@@ -14,6 +14,12 @@ use psy_node_core::store::{
         AuthorityTimestampBootstrapReason, AuthorityTimestampKey,
         ObservedAuthorityTimestampState, StoredAuthorityTimestampState,
     },
+    authority_local_head::{
+        AuthorityLocalHeadBootstrap, AuthorityLocalHeadBootstrapReason,
+        AuthorityLocalHeadModelError, AuthorityLocalHeadWriteOutcome,
+        AuthorityStorageBindingGeneration, AuthorityStorageBindingRef,
+        AuthorityStorageNamespaceId, StoredAuthorityLocalHead,
+    },
     manifest_intent::{
         AuthorityHeadPayload, AuthorityStateTransition,
         ManifestArtifactSetCommitment, SealedAuthorityCommitIntent,
@@ -55,6 +61,7 @@ fn chain(checkpoint: u64, seed: u8) -> CanonicalChainRef<PHash> {
 struct Fixture {
     prepared: PreparedAuthorityManifestRecord<PHash>,
     allocator_active: StoredAuthorityTimestampState,
+    local_head: StoredAuthorityLocalHead<PHash>,
 }
 
 fn fixture(seed: u8) -> Fixture {
@@ -104,9 +111,25 @@ fn fixture(seed: u8) -> Fixture {
     let prepared_intent = intent.attach_timestamp_lease(reservation.lease()).unwrap();
     let prepared =
         PreparedAuthorityManifestRecord::seal(&prepared_intent, summary).unwrap();
+    let local_head = AuthorityLocalHeadBootstrap::seal(
+        AuthorityLocalHeadBootstrapReason::GenesisNative,
+        AuthorityHeadView::expected(&prepared),
+        CommitWriteTimestampUs::try_from_i128(999_999).unwrap(),
+        prepared.digest(),
+        AuthorityStorageBindingRef::new(
+            AuthorityStorageBindingGeneration::try_new(0).unwrap(),
+            AuthorityStorageNamespaceId::from_verified_namespace_id([
+                0xE0 | seed;
+                32
+            ]),
+        ),
+    )
+    .candidate()
+    .clone();
     Fixture {
         prepared,
         allocator_active: reservation.candidate(),
+        local_head,
     }
 }
 
@@ -158,16 +181,29 @@ fn observed_state(
     )
 }
 
+fn local_head_with_view(
+    fixture: &Fixture,
+    view: AuthorityHeadView<PHash>,
+) -> StoredAuthorityLocalHead<PHash> {
+    AuthorityLocalHeadBootstrap::seal(
+        AuthorityLocalHeadBootstrapReason::GenesisNative,
+        view,
+        fixture.local_head.commit_write_timestamp(),
+        fixture.prepared.digest(),
+        fixture.local_head.storage_binding(),
+    )
+    .candidate()
+    .clone()
+}
+
 #[test]
 fn happy_path_has_one_unskippable_typed_action_per_durable_phase() {
     let fixture = fixture(1);
-    let expected = AuthorityHeadView::expected(&fixture.prepared);
-    let candidate = AuthorityHeadView::candidate(&fixture.prepared);
     let mut manifest = PersistedAuthorityManifest::Prepared(fixture.prepared.clone());
 
     match plan_normal_commit_recovery(
         &manifest,
-        expected,
+        &fixture.local_head,
         observed_allocator(&fixture),
     )
     .unwrap()
@@ -187,7 +223,7 @@ fn happy_path_has_one_unskippable_typed_action_per_durable_phase() {
     let sealed = seal_verified_normal_commit(
         fixture.prepared.clone(),
         observation(&fixture.prepared),
-        expected,
+        &fixture.local_head,
         observed_allocator(&fixture),
     )
     .unwrap();
@@ -195,17 +231,28 @@ fn happy_path_has_one_unskippable_typed_action_per_durable_phase() {
     assert!(matches!(
         plan_normal_commit_recovery(
             &manifest,
-            expected,
+            &fixture.local_head,
             observed_allocator(&fixture),
         )
         .unwrap(),
         NormalCommitRecoveryAction::PublishExactHead { .. }
     ));
 
+    let publish = match plan_normal_commit_recovery(
+        &manifest,
+        &fixture.local_head,
+        observed_allocator(&fixture),
+    )
+    .unwrap()
+    {
+        NormalCommitRecoveryAction::PublishExactHead { publish } => publish,
+        other => panic!("unexpected SEALED action: {other:?}"),
+    };
+    assert_eq!(*publish.manifest(), sealed);
+    let candidate_local = publish.head_cas().candidate().clone();
     let committed = match classify_normal_head_publish(
-        sealed,
-        true,
-        candidate,
+        publish,
+        AuthorityLocalHeadWriteOutcome::Applied(candidate_local.clone()),
         observed_allocator(&fixture),
     )
     .unwrap()
@@ -216,7 +263,7 @@ fn happy_path_has_one_unskippable_typed_action_per_durable_phase() {
     manifest = PersistedAuthorityManifest::Committed(committed.clone());
     let completion = match plan_normal_commit_recovery(
         &manifest,
-        candidate,
+        &candidate_local,
         observed_allocator(&fixture),
     )
     .unwrap()
@@ -231,7 +278,7 @@ fn happy_path_has_one_unskippable_typed_action_per_durable_phase() {
     assert!(matches!(
         plan_normal_commit_recovery(
             &manifest,
-            candidate,
+            &candidate_local,
             observed_state(&fixture, completion.candidate()),
         )
         .unwrap(),
@@ -243,19 +290,17 @@ fn happy_path_has_one_unskippable_typed_action_per_durable_phase() {
 #[test]
 fn every_crash_boundary_resumes_from_durable_state_without_reinterpretation() {
     let fixture = fixture(2);
-    let expected = AuthorityHeadView::expected(&fixture.prepared);
-    let candidate = AuthorityHeadView::candidate(&fixture.prepared);
     let prepared = PersistedAuthorityManifest::Prepared(fixture.prepared.clone());
 
     let first = plan_normal_commit_recovery(
         &prepared,
-        expected,
+        &fixture.local_head,
         observed_allocator(&fixture),
     )
     .unwrap();
     let retry = plan_normal_commit_recovery(
         &prepared,
-        expected,
+        &fixture.local_head,
         observed_allocator(&fixture),
     )
     .unwrap();
@@ -264,20 +309,29 @@ fn every_crash_boundary_resumes_from_durable_state_without_reinterpretation() {
     let sealed = seal_verified_normal_commit(
         fixture.prepared.clone(),
         observation(&fixture.prepared),
-        expected,
+        &fixture.local_head,
         observed_allocator(&fixture),
     )
     .unwrap();
-    let recovered_committed = match plan_normal_commit_recovery(
-        &PersistedAuthorityManifest::Sealed(sealed),
-        candidate,
+    let publish = match plan_normal_commit_recovery(
+        &PersistedAuthorityManifest::Sealed(sealed.clone()),
+        &fixture.local_head,
         observed_allocator(&fixture),
     )
     .unwrap()
     {
-        NormalCommitRecoveryAction::PersistRecoveredCommitted { committed } => {
-            committed
-        }
+        NormalCommitRecoveryAction::PublishExactHead { publish } => publish,
+        other => panic!("unexpected SEALED publish plan: {other:?}"),
+    };
+    let candidate_local = publish.head_cas().candidate().clone();
+    let recovered_committed = match plan_normal_commit_recovery(
+        &PersistedAuthorityManifest::Sealed(sealed),
+        &candidate_local,
+        observed_allocator(&fixture),
+    )
+    .unwrap()
+    {
+        NormalCommitRecoveryAction::PersistRecoveredCommitted { committed } => committed,
         other => panic!("unexpected SEALED recovery: {other:?}"),
     };
     assert_eq!(
@@ -288,7 +342,7 @@ fn every_crash_boundary_resumes_from_durable_state_without_reinterpretation() {
     assert!(matches!(
         plan_normal_commit_recovery(
             &PersistedAuthorityManifest::Committed(recovered_committed),
-            candidate,
+            &candidate_local,
             observed_allocator(&fixture),
         )
         .unwrap(),
@@ -300,13 +354,19 @@ fn every_crash_boundary_resumes_from_durable_state_without_reinterpretation() {
 fn verification_or_head_conflict_cannot_publish_or_seal() {
     let other = fixture(4);
     let fixture = fixture(3);
-    let expected = AuthorityHeadView::expected(&fixture.prepared);
-    let conflict = AuthorityHeadView::candidate(&other.prepared);
+    let conflict = local_head_with_view(
+        &fixture,
+        AuthorityHeadView::candidate(&other.prepared),
+    );
+    let premature = local_head_with_view(
+        &fixture,
+        AuthorityHeadView::candidate(&fixture.prepared),
+    );
 
     assert_eq!(
         plan_normal_commit_recovery(
             &PersistedAuthorityManifest::Prepared(fixture.prepared.clone()),
-            AuthorityHeadView::candidate(&fixture.prepared),
+            &premature,
             observed_allocator(&fixture),
         )
         .unwrap_err(),
@@ -316,7 +376,7 @@ fn verification_or_head_conflict_cannot_publish_or_seal() {
         seal_verified_normal_commit(
             fixture.prepared.clone(),
             observation(&fixture.prepared),
-            conflict,
+            &conflict,
             observed_allocator(&fixture),
         )
         .unwrap_err(),
@@ -326,15 +386,24 @@ fn verification_or_head_conflict_cannot_publish_or_seal() {
     let sealed = seal_verified_normal_commit(
         fixture.prepared.clone(),
         observation(&fixture.prepared),
-        expected,
+        &fixture.local_head,
         observed_allocator(&fixture),
     )
     .unwrap();
+    let publish = match plan_normal_commit_recovery(
+        &PersistedAuthorityManifest::Sealed(sealed),
+        &fixture.local_head,
+        observed_allocator(&fixture),
+    )
+    .unwrap()
+    {
+        NormalCommitRecoveryAction::PublishExactHead { publish } => publish,
+        other => panic!("unexpected publish plan: {other:?}"),
+    };
     assert_eq!(
         classify_normal_head_publish(
-            sealed,
-            false,
-            conflict,
+            publish,
+            AuthorityLocalHeadWriteOutcome::Conflict(conflict),
             observed_allocator(&fixture),
         )
         .unwrap_err(),
@@ -345,21 +414,31 @@ fn verification_or_head_conflict_cannot_publish_or_seal() {
 #[test]
 fn head_retry_and_lost_success_have_distinct_safe_results() {
     let fixture = fixture(5);
-    let expected = AuthorityHeadView::expected(&fixture.prepared);
-    let candidate = AuthorityHeadView::candidate(&fixture.prepared);
     let sealed = seal_verified_normal_commit(
         fixture.prepared.clone(),
         observation(&fixture.prepared),
-        expected,
+        &fixture.local_head,
         observed_allocator(&fixture),
     )
     .unwrap();
 
+    let publish = match plan_normal_commit_recovery(
+        &PersistedAuthorityManifest::Sealed(sealed),
+        &fixture.local_head,
+        observed_allocator(&fixture),
+    )
+    .unwrap()
+    {
+        NormalCommitRecoveryAction::PublishExactHead { publish } => publish,
+        other => panic!("unexpected publish plan: {other:?}"),
+    };
+
     assert_eq!(
         classify_normal_head_publish(
-            sealed.clone(),
-            false,
-            expected,
+            publish.clone(),
+            AuthorityLocalHeadWriteOutcome::Conflict(
+                fixture.local_head.clone(),
+            ),
             observed_allocator(&fixture),
         )
         .unwrap(),
@@ -367,9 +446,10 @@ fn head_retry_and_lost_success_have_distinct_safe_results() {
     );
     assert!(matches!(
         classify_normal_head_publish(
-            sealed,
-            false,
-            candidate,
+            publish.clone(),
+            AuthorityLocalHeadWriteOutcome::Idempotent(
+                publish.head_cas().candidate().clone(),
+            ),
             observed_allocator(&fixture),
         )
         .unwrap(),
@@ -383,7 +463,6 @@ fn head_retry_and_lost_success_have_distinct_safe_results() {
 fn allocator_ownership_and_coordinates_are_checked_at_every_phase() {
     let other = fixture(7);
     let fixture = fixture(6);
-    let expected = AuthorityHeadView::expected(&fixture.prepared);
     let prepared = PersistedAuthorityManifest::Prepared(fixture.prepared.clone());
 
     let wrong_key = AuthorityTimestampKey::new(
@@ -396,7 +475,7 @@ fn allocator_ownership_and_coordinates_are_checked_at_every_phase() {
     assert_eq!(
         plan_normal_commit_recovery(
             &prepared,
-            expected,
+            &fixture.local_head,
             ObservedAuthorityTimestampState::from_selected_row(
                 wrong_key,
                 fixture.allocator_active,
@@ -409,7 +488,7 @@ fn allocator_ownership_and_coordinates_are_checked_at_every_phase() {
     assert_eq!(
         plan_normal_commit_recovery(
             &prepared,
-            expected,
+            &fixture.local_head,
             ObservedAuthorityTimestampState::from_selected_row(
                 fixture.prepared.identity().timestamp_key(),
                 other.allocator_active,
@@ -421,7 +500,7 @@ fn allocator_ownership_and_coordinates_are_checked_at_every_phase() {
     assert_eq!(
         plan_normal_commit_recovery(
             &prepared,
-            expected,
+            &fixture.local_head,
             observed_state(&fixture, completed_allocator(&fixture)),
         )
         .unwrap_err(),
@@ -445,10 +524,123 @@ fn allocator_ownership_and_coordinates_are_checked_at_every_phase() {
     assert_eq!(
         plan_normal_commit_recovery(
             &prepared,
-            expected,
+            &fixture.local_head,
             observed_state(&fixture, alternate),
         )
         .unwrap_err(),
         NormalCommitOrchestrationError::AllocatorCoordinatesMismatch
     );
+}
+
+#[test]
+fn durable_head_codec_binds_partition_revision_manifest_and_namespace() {
+    let fixture = fixture(8);
+    let sealed = seal_verified_normal_commit(
+        fixture.prepared.clone(),
+        observation(&fixture.prepared),
+        &fixture.local_head,
+        observed_allocator(&fixture),
+    )
+    .unwrap();
+    let publish = match plan_normal_commit_recovery(
+        &PersistedAuthorityManifest::Sealed(sealed),
+        &fixture.local_head,
+        observed_allocator(&fixture),
+    )
+    .unwrap()
+    {
+        NormalCommitRecoveryAction::PublishExactHead { publish } => publish,
+        other => panic!("unexpected publish plan: {other:?}"),
+    };
+    let candidate = publish.head_cas().candidate();
+    let payload = candidate.encode_canonical();
+    let decoded = StoredAuthorityLocalHead::<PHash>::decode_persisted(
+        fixture.prepared.identity().timestamp_key(),
+        candidate.revision().as_i64(),
+        &payload,
+    )
+    .unwrap();
+    assert_eq!(decoded, *candidate);
+    assert_eq!(
+        decoded.storage_binding(),
+        fixture.local_head.storage_binding()
+    );
+    assert_eq!(
+        decoded.manifest_digest().as_bytes(),
+        fixture.prepared.digest().as_bytes()
+    );
+
+    let aba_current = StoredAuthorityLocalHead::<PHash>::decode_persisted(
+        fixture.prepared.identity().timestamp_key(),
+        2,
+        &publish.head_cas().expected_payload(),
+    )
+    .unwrap();
+    assert!(matches!(
+        publish
+            .head_cas()
+            .classify_lwt_observation(false, aba_current),
+        Ok(AuthorityLocalHeadWriteOutcome::Conflict(current))
+            if current.revision().get() == 2
+    ));
+
+    let wrong_key = AuthorityTimestampKey::new(
+        network(),
+        AuthorityScope::Realm {
+            realm_id: 88,
+            realm_sub_id: 1,
+        },
+    );
+    assert_eq!(
+        StoredAuthorityLocalHead::<PHash>::decode_persisted(
+            wrong_key,
+            candidate.revision().as_i64(),
+            &payload,
+        )
+        .unwrap_err(),
+        AuthorityLocalHeadModelError::SelectedKeyMismatch
+    );
+
+    let mut corrupted = payload;
+    corrupted[0] ^= 1;
+    assert_eq!(
+        StoredAuthorityLocalHead::<PHash>::decode_persisted(
+            fixture.prepared.identity().timestamp_key(),
+            candidate.revision().as_i64(),
+            &corrupted,
+        )
+        .unwrap_err(),
+        AuthorityLocalHeadModelError::InvalidPayloadMagic
+    );
+}
+
+#[test]
+fn normal_head_cas_requires_timestamp_to_advance_strictly() {
+    let fixture = fixture(9);
+    let equal_timestamp_head = AuthorityLocalHeadBootstrap::seal(
+        AuthorityLocalHeadBootstrapReason::GenesisNative,
+        AuthorityHeadView::expected(&fixture.prepared),
+        fixture.prepared.commit_write_timestamp(),
+        fixture.prepared.digest(),
+        fixture.local_head.storage_binding(),
+    )
+    .candidate()
+    .clone();
+    let sealed = seal_verified_normal_commit(
+        fixture.prepared.clone(),
+        observation(&fixture.prepared),
+        &equal_timestamp_head,
+        observed_allocator(&fixture),
+    )
+    .unwrap();
+    assert!(matches!(
+        plan_normal_commit_recovery(
+            &PersistedAuthorityManifest::Sealed(sealed),
+            &equal_timestamp_head,
+            observed_allocator(&fixture),
+        ),
+        Err(NormalCommitOrchestrationError::AuthorityLocalHead(
+            AuthorityLocalHeadModelError::TimestampDidNotAdvance { .. }
+        ))
+    ));
 }

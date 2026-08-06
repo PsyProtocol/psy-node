@@ -13,6 +13,7 @@
 //! None is connected to production setup or current writers yet.
 
 mod canonical_head_prototype;
+mod authority_local_head_prototype;
 mod authority_timestamp_prototype;
 mod checkpoint_kiv;
 mod checkpoint_merkle;
@@ -34,6 +35,7 @@ mod pending_namespace_rf3_gate;
 mod confinement;
 mod namespace;
 mod namespace_prototype;
+mod normal_commit_prototype;
 mod raw_access;
 mod replay;
 mod reward_tag_tree;
@@ -42,6 +44,7 @@ mod timestamped;
 mod registry;
 
 pub use canonical_head_prototype::*;
+pub use authority_local_head_prototype::*;
 pub use authority_timestamp_prototype::*;
 pub use checkpoint_kiv::*;
 pub use checkpoint_merkle::*;
@@ -61,6 +64,7 @@ pub use pending_context::*;
 pub use confinement::*;
 pub use namespace::*;
 pub use namespace_prototype::*;
+pub use normal_commit_prototype::*;
 pub use raw_access::*;
 pub use replay::*;
 pub use reward_tag_tree::*;

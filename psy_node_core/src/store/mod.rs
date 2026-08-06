@@ -1,5 +1,6 @@
 pub mod canonical_head;
 pub mod authority_commit;
+pub mod authority_local_head;
 pub mod manifest_intent;
 pub mod manifest_lifecycle;
 pub mod manifest_record;
