@@ -21,11 +21,13 @@ use psy_node_core::store::{
 };
 use super::{
     seal_commit_put, CanonicalPhysicalMutationBatch, PreparedPayload,
-    PreparedPayloadKind, ReplayPrototypeError, ReplayRecordKind,
+    PreparedPayloadKind, ReplayPrototypeError,
     RollbackableStorePrototype, RollbackableStorePrototypeError,
     ScyllaPhysicalTableId, SealedTimestampedPut, TimestampedMutationError,
     VerifiedPersistedManifestArtifacts,
 };
+#[cfg(test)]
+use super::ReplayRecordKind;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ExpectedMerkleRow {
@@ -50,14 +52,22 @@ impl<Hash: Q256BitHash> RepresentativeRealmStateReplayPlan<Hash> {
         prepared: &PreparedAuthorityManifestRecord<Hash>,
         artifacts: &VerifiedPersistedManifestArtifacts,
     ) -> Result<Self, RepresentativeStateReplayError> {
-        Self::try_from_verified_parts(
+        let durable_prepared_payload = artifacts
+            .durable_prepared_payload()
+            .ok_or(RepresentativeStateReplayError::DurablePreparedPayloadMissing)?;
+        let payload = PreparedPayload::decode_canonical(durable_prepared_payload)?;
+        if payload.kind() != PreparedPayloadKind::Realm {
+            return Err(RepresentativeStateReplayError::RealmPreparedPayloadRequired);
+        }
+        let batch = artifacts.decode_and_expand_compact_replay()?;
+        Self::try_from_expanded_batch(
             prepared,
-            artifacts.plan().replay_record_kind(),
             *artifacts.plan().mutation_digest(),
-            artifacts.durable_prepared_payload(),
+            batch,
         )
     }
 
+    #[cfg(test)]
     fn try_from_verified_parts(
         prepared: &PreparedAuthorityManifestRecord<Hash>,
         replay_kind: Option<ReplayRecordKind>,
@@ -82,6 +92,20 @@ impl<Hash: Q256BitHash> RepresentativeRealmStateReplayPlan<Hash> {
         let batch = CanonicalPhysicalMutationBatch::try_new(
             payload.expand_physical()?,
         )?;
+        Self::try_from_expanded_batch(prepared, persisted_mutation_digest, batch)
+    }
+
+    fn try_from_expanded_batch(
+        prepared: &PreparedAuthorityManifestRecord<Hash>,
+        persisted_mutation_digest: [u8; 32],
+        batch: CanonicalPhysicalMutationBatch,
+    ) -> Result<Self, RepresentativeStateReplayError> {
+        if !matches!(prepared.identity().authority(), AuthorityScope::Realm { .. }) {
+            return Err(RepresentativeStateReplayError::RealmAuthorityRequired);
+        }
+        if !prepared.intent().state_transition().state_changed() {
+            return Err(RepresentativeStateReplayError::ChangedStateRequired);
+        }
         let mutation_digest = *batch.digest().as_bytes();
         let committed_digest = prepared.intent().artifacts().mutation_digest();
         if mutation_digest != persisted_mutation_digest

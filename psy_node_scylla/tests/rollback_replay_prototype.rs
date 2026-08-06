@@ -288,6 +288,87 @@ fn coordinator_realm_and_empty_realm_full_compact_are_equivalent() {
 }
 
 #[test]
+fn persisted_compact_records_strictly_decode_and_expand_after_restart() {
+    for fixture in [
+        materialize(coordinator_spec()).unwrap(),
+        materialize(realm_spec()).unwrap(),
+        materialize(empty_realm_spec()).unwrap(),
+    ] {
+        let compact_bytes = fixture.compact_record.encode_canonical();
+        let recovered = PreparedReferencePlusSupplementRecord::decode_canonical(&compact_bytes).unwrap();
+        assert_eq!(recovered.encode_canonical(), compact_bytes);
+        assert_eq!(recovered, fixture.compact_record);
+
+        let supplement_bytes = fixture.supplements.batch().encode_canonical();
+        let recovered_supplements = CanonicalPhysicalMutationBatch::decode_canonical(supplement_bytes).unwrap();
+        assert_eq!(recovered_supplements, *fixture.supplements.batch());
+
+        let expanded = recovered.expand(&fixture.payload_bytes).unwrap();
+        assert_eq!(expanded.encode_canonical(), fixture.full.encode_canonical());
+        assert_eq!(expanded.digest(), fixture.full.digest());
+    }
+}
+
+#[test]
+fn persisted_compact_decoder_rejects_envelope_locator_and_mutation_tampering() {
+    let fixture = materialize(coordinator_spec()).unwrap();
+    let canonical = fixture.compact_record.encode_canonical();
+
+    for cut in 0..canonical.len() {
+        assert!(PreparedReferencePlusSupplementRecord::decode_canonical(&canonical[..cut]).is_err());
+    }
+    let mut trailing = canonical.clone();
+    trailing.push(0);
+    assert_eq!(
+        PreparedReferencePlusSupplementRecord::decode_canonical(&trailing).unwrap_err(),
+        ReplayPrototypeError::InvalidCanonicalPayload("trailing compact replay bytes")
+    );
+
+    for (offset, replacement, expected) in [
+        (0, b'X', ReplayPrototypeError::InvalidCanonicalPayload("bad compact replay magic")),
+        (5, 2, ReplayPrototypeError::UnknownReplaySchemaVersion),
+        (6, 1, ReplayPrototypeError::UnexpectedReplayRecordKind),
+        (8, 2, ReplayPrototypeError::UnknownReplayAdapterVersion(2)),
+        (9, 9, ReplayPrototypeError::UnknownReplayAuthority(9)),
+        (9, 2, ReplayPrototypeError::ReceiptPayloadAuthorityMismatch),
+        (28, 9, ReplayPrototypeError::UnknownOperationalReplayAction(9)),
+    ] {
+        let mut tampered = canonical.clone();
+        tampered[offset] = replacement;
+        assert_eq!(PreparedReferencePlusSupplementRecord::decode_canonical(&tampered).unwrap_err(), expected);
+    }
+
+    let mut batch = fixture.supplements.batch().encode_canonical().to_vec();
+    let mut impossible_count = batch.clone();
+    impossible_count[6..10].copy_from_slice(&u32::MAX.to_be_bytes());
+    assert_eq!(
+        CanonicalPhysicalMutationBatch::decode_canonical(&impossible_count).unwrap_err(),
+        ReplayPrototypeError::InvalidCanonicalPayload("physical batch count exceeds encoded bytes")
+    );
+    let mutation_start = batch.windows(4).position(|window| window == b"PSRM").unwrap();
+    let locator_len = u32::from_be_bytes(batch[mutation_start + 6..mutation_start + 10].try_into().unwrap()) as usize;
+    let locator_start = mutation_start + 10;
+    let operation_offset = locator_start + locator_len;
+
+    let mut unknown_physical = batch.clone();
+    unknown_physical[locator_start + 6..locator_start + 8].copy_from_slice(&99_u16.to_be_bytes());
+    assert!(matches!(
+        CanonicalPhysicalMutationBatch::decode_canonical(&unknown_physical),
+        Err(ReplayPrototypeError::MutationDecode(MutationDecodeError::InvalidLocator(
+            "unknown physical table id"
+        )))
+    ));
+
+    batch[operation_offset] = 0xff;
+    assert!(matches!(
+        CanonicalPhysicalMutationBatch::decode_canonical(&batch),
+        Err(ReplayPrototypeError::MutationDecode(MutationDecodeError::InvalidEncoding(
+            "unknown mutation operation"
+        )))
+    ));
+}
+
+#[test]
 fn missing_supplement_and_payload_tampering_fail_closed() {
     let spec = realm_spec();
     let expected = CanonicalPhysicalMutationBatch::from_logical(spec.full.clone()).unwrap();

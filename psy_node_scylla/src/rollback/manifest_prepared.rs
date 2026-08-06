@@ -29,10 +29,13 @@ use scylla::{
 
 use super::{
     decode_manifest_artifact_plan, verify_artifact_chunks,
-    CanonicalManifestArtifact, CanonicalManifestArtifacts, CqlKeyspaceName,
+    CanonicalManifestArtifact, CanonicalManifestArtifacts,
+    CanonicalPhysicalMutationBatch, CqlKeyspaceName,
     DecodedManifestArtifactPlan, InvalidCqlKeyspaceName,
     ManifestArtifactChunk, ManifestArtifactDescriptor, ManifestArtifactError,
-    ManifestArtifactKind, MANIFEST_ARTIFACT_CHUNKS_PER_BUCKET,
+    ManifestArtifactKind, PreparedReferencePlusSupplementRecord,
+    ReplayPrototypeError, ReplayRecordKind,
+    MANIFEST_ARTIFACT_CHUNKS_PER_BUCKET,
 };
 
 pub const D03B_AUTHORITY_MANIFEST_TABLE: &str =
@@ -983,6 +986,30 @@ impl VerifiedPersistedManifestArtifacts {
 
     pub fn durable_prepared_payload(&self) -> Option<&[u8]> {
         self.durable_prepared_payload.as_deref()
+    }
+
+    /// Rebuilds the executable compact batch solely from durable bytes loaded
+    /// after restart. Both the compact record's internal commitment and the
+    /// PREPARED manifest's mutation digest must match.
+    pub fn decode_and_expand_compact_replay(
+        &self,
+    ) -> Result<CanonicalPhysicalMutationBatch, ReplayPrototypeError> {
+        if self.plan.replay_record_kind()
+            != Some(ReplayRecordKind::PreparedReferencePlusSupplement)
+        {
+            return Err(ReplayPrototypeError::CompactReplayArtifactsRequired);
+        }
+        let payload = self
+            .durable_prepared_payload()
+            .ok_or(ReplayPrototypeError::DurablePreparedPayloadMissing)?;
+        let record = PreparedReferencePlusSupplementRecord::decode_canonical(
+            self.replay_record(),
+        )?;
+        let expanded = record.expand(payload)?;
+        if expanded.digest().as_bytes() != self.plan.mutation_digest() {
+            return Err(ReplayPrototypeError::ManifestMutationDigestMismatch);
+        }
+        Ok(expanded)
     }
 }
 

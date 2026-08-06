@@ -6,7 +6,9 @@ use psy_node_core::store::typed::{
 };
 
 use super::{
-    key_domain_descriptor, resolve_key_for_rollback, RegistryReadinessError, ResolvedScyllaKey, ScyllaKeyDomain, ScyllaPhysicalTableId,
+    decode_locator_canonical, key_domain_descriptor, resolve_key_for_rollback,
+    RegistryReadinessError, ResolvedScyllaKey, ScyllaKeyDomain,
+    ScyllaPhysicalTableId,
 };
 
 /// A registry-validated Scylla mutation.  All fields are private and there is
@@ -141,6 +143,137 @@ impl ResolvedScyllaMutation {
             MutationOperation::Delete => encoded.push(7),
         }
         encoded
+    }
+
+    pub(crate) fn decode_canonical(bytes: &[u8]) -> Result<Self, MutationDecodeError> {
+        let mut cursor = MutationCursor::new(bytes);
+        if cursor.take(4)? != b"PSRM" {
+            return Err(MutationDecodeError::InvalidEncoding("bad mutation magic"));
+        }
+        if cursor.u16()? != 1 {
+            return Err(MutationDecodeError::InvalidEncoding("unknown mutation schema version"));
+        }
+        let locator = cursor.bytes()?;
+        let resolved = decode_locator_canonical(locator).map_err(MutationDecodeError::InvalidLocator)?;
+        let ready = resolve_key_for_rollback(resolved.typed_key())?;
+        if ready.locator_bytes() != locator {
+            return Err(MutationDecodeError::InvalidEncoding("ready locator differs from encoded locator"));
+        }
+
+        let operation = match cursor.u8()? {
+            1 => MutationOperation::Put(MutationValue::PsyCanonicalBytes(cursor.bytes()?.to_vec())),
+            2 => MutationOperation::Put(MutationValue::CqlU64(cursor.u64()?)),
+            3 => MutationOperation::Put(MutationValue::CqlU128(cursor.u128()?)),
+            4 => MutationOperation::Put(MutationValue::KeyOnly),
+            5 => {
+                let schema = match cursor.u8()? {
+                    1 => StructuredValueSchema::TagTreeNodeV1,
+                    2 => StructuredValueSchema::ImtLeafRowV1,
+                    3 => StructuredValueSchema::ImtKeyIndexRowV1,
+                    _ => return Err(MutationDecodeError::InvalidEncoding("unknown structured value schema")),
+                };
+                MutationOperation::Put(MutationValue::Structured { schema, canonical_bytes: cursor.bytes()?.to_vec() })
+            }
+            6 => {
+                let algorithm = match cursor.u8()? {
+                    1 => ValueDigestAlgorithm::Sha256,
+                    _ => return Err(MutationDecodeError::InvalidEncoding("unknown value digest algorithm")),
+                };
+                MutationOperation::Put(MutationValue::Digest { algorithm, digest: cursor.array_32()? })
+            }
+            7 => return Err(MutationDecodeError::MutationBuild(MutationBuildError::DeleteNotEnabled)),
+            _ => return Err(MutationDecodeError::InvalidEncoding("unknown mutation operation")),
+        };
+        if !cursor.is_empty() {
+            return Err(MutationDecodeError::InvalidEncoding("trailing mutation bytes"));
+        }
+        if let MutationOperation::Put(value) = &operation {
+            validate_put_value(&ready, value)?;
+        }
+        let decoded = build_resolved(ready, operation);
+        if decoded.encode_canonical() != bytes {
+            return Err(MutationDecodeError::InvalidEncoding("non-canonical mutation encoding"));
+        }
+        Ok(decoded)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MutationDecodeError {
+    InvalidEncoding(&'static str),
+    InvalidLocator(&'static str),
+    MutationBuild(MutationBuildError),
+}
+
+impl From<MutationBuildError> for MutationDecodeError {
+    fn from(value: MutationBuildError) -> Self {
+        Self::MutationBuild(value)
+    }
+}
+
+impl From<RegistryReadinessError> for MutationDecodeError {
+    fn from(value: RegistryReadinessError) -> Self {
+        Self::MutationBuild(MutationBuildError::Readiness(value))
+    }
+}
+
+impl fmt::Display for MutationDecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+impl Error for MutationDecodeError {}
+
+struct MutationCursor<'a> {
+    remaining: &'a [u8],
+}
+
+impl<'a> MutationCursor<'a> {
+    const fn new(bytes: &'a [u8]) -> Self {
+        Self { remaining: bytes }
+    }
+
+    fn take(&mut self, length: usize) -> Result<&'a [u8], MutationDecodeError> {
+        if self.remaining.len() < length {
+            return Err(MutationDecodeError::InvalidEncoding("truncated mutation"));
+        }
+        let (value, remaining) = self.remaining.split_at(length);
+        self.remaining = remaining;
+        Ok(value)
+    }
+
+    fn u8(&mut self) -> Result<u8, MutationDecodeError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u16(&mut self) -> Result<u16, MutationDecodeError> {
+        Ok(u16::from_be_bytes(self.take(2)?.try_into().expect("fixed length")))
+    }
+
+    fn u32(&mut self) -> Result<u32, MutationDecodeError> {
+        Ok(u32::from_be_bytes(self.take(4)?.try_into().expect("fixed length")))
+    }
+
+    fn u64(&mut self) -> Result<u64, MutationDecodeError> {
+        Ok(u64::from_be_bytes(self.take(8)?.try_into().expect("fixed length")))
+    }
+
+    fn u128(&mut self) -> Result<u128, MutationDecodeError> {
+        Ok(u128::from_be_bytes(self.take(16)?.try_into().expect("fixed length")))
+    }
+
+    fn array_32(&mut self) -> Result<[u8; 32], MutationDecodeError> {
+        Ok(self.take(32)?.try_into().expect("fixed length"))
+    }
+
+    fn bytes(&mut self) -> Result<&'a [u8], MutationDecodeError> {
+        let length = self.u32()? as usize;
+        self.take(length)
+    }
+
+    const fn is_empty(&self) -> bool {
+        self.remaining.is_empty()
     }
 }
 

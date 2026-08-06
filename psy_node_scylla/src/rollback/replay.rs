@@ -14,8 +14,9 @@ use sha2::{Digest, Sha256};
 use strum::IntoEnumIterator;
 
 use super::{
-    expand_logical_mutation, physical_descriptor, MutationBuildError, RegistryBlocker, RegistryReadiness, ResolvedScyllaMutation,
-    ScyllaPhysicalTableId,
+    expand_logical_mutation, physical_descriptor, MutationBuildError,
+    MutationDecodeError, RegistryBlocker, RegistryReadiness,
+    ResolvedScyllaMutation, ScyllaPhysicalTableId,
 };
 
 const PREPARED_MAGIC: &[u8; 4] = b"PSPP";
@@ -167,6 +168,35 @@ impl CanonicalPhysicalMutationBatch {
             resolved.extend(expand_logical_mutation(intent)?);
         }
         Self::try_new(resolved)
+    }
+
+    /// Strictly recovers a persisted physical batch. Every mutation is
+    /// reconstructed through the typed key registry and the canonical bytes
+    /// must round-trip exactly; this is not a raw-byte execution path.
+    pub fn decode_canonical(bytes: &[u8]) -> Result<Self, ReplayPrototypeError> {
+        let mut cursor = Cursor::new(bytes);
+        if cursor.take(4)? != BATCH_MAGIC {
+            return Err(ReplayPrototypeError::InvalidCanonicalPayload("bad physical batch magic"));
+        }
+        if cursor.u16()? != REPLAY_SCHEMA_VERSION {
+            return Err(ReplayPrototypeError::UnknownReplaySchemaVersion);
+        }
+        let count = cursor.u32()? as usize;
+        if count > cursor.remaining_len() / 4 {
+            return Err(ReplayPrototypeError::InvalidCanonicalPayload("physical batch count exceeds encoded bytes"));
+        }
+        let mut mutations = Vec::with_capacity(count);
+        for _ in 0..count {
+            mutations.push(ResolvedScyllaMutation::decode_canonical(cursor.bytes()?)?);
+        }
+        if !cursor.is_empty() {
+            return Err(ReplayPrototypeError::InvalidCanonicalPayload("trailing physical batch bytes"));
+        }
+        let decoded = Self::try_new(mutations)?;
+        if decoded.encode_canonical() != bytes {
+            return Err(ReplayPrototypeError::NonCanonicalPhysicalMutationBatch);
+        }
+        Ok(decoded)
     }
 
     pub fn mutations(&self) -> &[ResolvedScyllaMutation] {
@@ -332,6 +362,9 @@ impl PreparedPayload {
         let kind = PreparedPayloadKind::try_from(cursor.u8()?)?;
         resolve_replay_adapter(kind as u8, codec_version, writer_version, 1)?;
         let count = cursor.u32()? as usize;
+        if count > cursor.remaining_len() / 4 {
+            return Err(ReplayPrototypeError::InvalidCanonicalPayload("prepared mutation count exceeds encoded bytes"));
+        }
         let mut mutations = Vec::with_capacity(count);
         let mut previous_item: Option<Vec<u8>> = None;
         for _ in 0..count {
@@ -501,12 +534,37 @@ pub enum ReplayAuthority {
     Realm = 2,
 }
 
+impl TryFrom<u8> for ReplayAuthority {
+    type Error = ReplayPrototypeError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::Coordinator),
+            2 => Ok(Self::Realm),
+            _ => Err(ReplayPrototypeError::UnknownReplayAuthority(value)),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 #[repr(u8)]
 pub enum OperationalReplayAction {
     RotatePendingCheckpointNamespace = 1,
     RotatePendingProcNamespace = 2,
     RotateRewardTagNamespace = 3,
+}
+
+impl TryFrom<u8> for OperationalReplayAction {
+    type Error = ReplayPrototypeError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::RotatePendingCheckpointNamespace),
+            2 => Ok(Self::RotatePendingProcNamespace),
+            3 => Ok(Self::RotateRewardTagNamespace),
+            _ => Err(ReplayPrototypeError::UnknownOperationalReplayAction(value)),
+        }
+    }
 }
 
 /// The semantic checkpoint receipt is shared by both record strategies. It
@@ -578,6 +636,26 @@ impl ReplayReceipt {
         out.extend_from_slice(&(self.operational_actions.len() as u16).to_be_bytes());
         out.extend(self.operational_actions.iter().map(|action| *action as u8));
     }
+
+    fn decode_from(cursor: &mut Cursor<'_>) -> Result<Self, ReplayPrototypeError> {
+        let authority = ReplayAuthority::try_from(cursor.u8()?)?;
+        let checkpoint = cursor.checkpoint()?;
+        let state_mutation_count = cursor.u32()?;
+        let metadata_mutation_count = cursor.u32()?;
+        let action_count = cursor.u16()? as usize;
+        if action_count > cursor.remaining_len() {
+            return Err(ReplayPrototypeError::InvalidCanonicalPayload("operational action count exceeds encoded bytes"));
+        }
+        let mut operational_actions = Vec::with_capacity(action_count);
+        for _ in 0..action_count {
+            let action = OperationalReplayAction::try_from(cursor.u8()?)?;
+            if operational_actions.last().is_some_and(|previous| previous >= &action) {
+                return Err(ReplayPrototypeError::NonCanonicalOperationalActions);
+            }
+            operational_actions.push(action);
+        }
+        Ok(Self { authority, checkpoint, state_mutation_count, metadata_mutation_count, operational_actions })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -630,6 +708,7 @@ impl PreparedReferencePlusSupplementRecord {
         expected_full: &CanonicalPhysicalMutationBatch,
     ) -> Result<Self, ReplayPrototypeError> {
         receipt.validate_count(expected_full.mutations().len())?;
+        validate_receipt_payload_authority(&receipt, prepared.payload_kind)?;
         let record = Self {
             prepared,
             supplements,
@@ -664,6 +743,57 @@ impl PreparedReferencePlusSupplementRecord {
         out
     }
 
+    /// Decodes the compact record exactly as it is loaded from durable
+    /// manifest chunks. Expansion remains a separate step because it also
+    /// verifies the independently persisted prepared payload.
+    pub fn decode_canonical(bytes: &[u8]) -> Result<Self, ReplayPrototypeError> {
+        let mut cursor = Cursor::new(bytes);
+        if cursor.take(4)? != COMPACT_MAGIC {
+            return Err(ReplayPrototypeError::InvalidCanonicalPayload("bad compact replay magic"));
+        }
+        if cursor.u16()? != REPLAY_SCHEMA_VERSION {
+            return Err(ReplayPrototypeError::UnknownReplaySchemaVersion);
+        }
+        if ReplayRecordKind::try_from(cursor.u8()?)? != ReplayRecordKind::PreparedReferencePlusSupplement {
+            return Err(ReplayPrototypeError::UnexpectedReplayRecordKind);
+        }
+        let replay_adapter_version = cursor.u16()?;
+        let receipt = ReplayReceipt::decode_from(&mut cursor)?;
+        let payload_kind = PreparedPayloadKind::try_from(cursor.u8()?)?;
+        let codec_version = cursor.u16()?;
+        let writer_version = cursor.u16()?;
+        let payload_digest = ReplayDigest(cursor.array_32()?);
+        let payload_length = cursor.u64()?;
+        resolve_replay_adapter(payload_kind as u8, codec_version, writer_version, replay_adapter_version)?;
+        let prepared = DurablePreparedPayloadReference {
+            payload_kind,
+            codec_version,
+            writer_version,
+            payload_digest,
+            payload_length,
+        };
+        validate_receipt_payload_authority(&receipt, payload_kind)?;
+        let supplements = DerivedSupplementBatch(CanonicalPhysicalMutationBatch::decode_canonical(cursor.bytes()?)?);
+        let expected_full_digest = ReplayDigest(cursor.array_32()?);
+        let expected_mutation_count = cursor.u32()?;
+        if !cursor.is_empty() {
+            return Err(ReplayPrototypeError::InvalidCanonicalPayload("trailing compact replay bytes"));
+        }
+        receipt.validate_count(expected_mutation_count as usize)?;
+        let decoded = Self {
+            prepared,
+            supplements,
+            receipt,
+            replay_adapter_version,
+            expected_full_digest,
+            expected_mutation_count,
+        };
+        if decoded.encode_canonical() != bytes {
+            return Err(ReplayPrototypeError::NonCanonicalCompactReplayRecord);
+        }
+        Ok(decoded)
+    }
+
     pub fn expand(&self, durable_payload_bytes: &[u8]) -> Result<CanonicalPhysicalMutationBatch, ReplayPrototypeError> {
         resolve_replay_adapter(
             self.prepared.payload_kind as u8,
@@ -683,6 +813,21 @@ impl PreparedReferencePlusSupplementRecord {
             return Err(ReplayPrototypeError::ExpandedMutationDigestMismatch);
         }
         Ok(expanded)
+    }
+}
+
+fn validate_receipt_payload_authority(
+    receipt: &ReplayReceipt,
+    payload_kind: PreparedPayloadKind,
+) -> Result<(), ReplayPrototypeError> {
+    if matches!(
+        (receipt.authority(), payload_kind),
+        (ReplayAuthority::Coordinator, PreparedPayloadKind::Coordinator)
+            | (ReplayAuthority::Realm, PreparedPayloadKind::Realm)
+    ) {
+        Ok(())
+    } else {
+        Err(ReplayPrototypeError::ReceiptPayloadAuthorityMismatch)
     }
 }
 
@@ -778,12 +923,17 @@ pub fn validate_replay_coverage() -> Result<(), ReplayPrototypeError> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReplayPrototypeError {
     MutationBuild(MutationBuildError),
+    MutationDecode(MutationDecodeError),
     UnknownReplayRecordKind(u8),
     UnknownPreparedPayloadKind(u8),
     UnknownPayloadCodec(u16),
     UnknownWriterVersion(u16),
     UnknownReplayAdapterVersion(u16),
     UnknownPreparedSchemaTag(u8),
+    UnknownReplaySchemaVersion,
+    UnknownReplayAuthority(u8),
+    UnknownOperationalReplayAction(u8),
+    UnexpectedReplayRecordKind,
     InvalidCanonicalPayload(&'static str),
     NonDurablePayloadSource(&'static str),
     PreparedPayloadLengthMismatch,
@@ -791,6 +941,13 @@ pub enum ReplayPrototypeError {
     PreparedPayloadKindMismatch,
     PayloadMutationNotAllowedForAuthority,
     NonCanonicalPreparedOrdering,
+    NonCanonicalOperationalActions,
+    NonCanonicalPhysicalMutationBatch,
+    NonCanonicalCompactReplayRecord,
+    CompactReplayArtifactsRequired,
+    DurablePreparedPayloadMissing,
+    ManifestMutationDigestMismatch,
+    ReceiptPayloadAuthorityMismatch,
     ExpandedMutationDigestMismatch,
     DigestOnlyValueNotExecutable,
     DuplicatePhysicalKey,
@@ -802,6 +959,12 @@ pub enum ReplayPrototypeError {
 impl From<MutationBuildError> for ReplayPrototypeError {
     fn from(value: MutationBuildError) -> Self {
         Self::MutationBuild(value)
+    }
+}
+
+impl From<MutationDecodeError> for ReplayPrototypeError {
+    fn from(value: MutationDecodeError) -> Self {
+        Self::MutationDecode(value)
     }
 }
 
@@ -856,6 +1019,10 @@ impl<'a> Cursor<'a> {
         Ok(u64::from_be_bytes(self.take(8)?.try_into().expect("fixed length")))
     }
 
+    fn array_32(&mut self) -> Result<[u8; 32], ReplayPrototypeError> {
+        Ok(self.take(32)?.try_into().expect("fixed length"))
+    }
+
     fn checkpoint(&mut self) -> Result<CheckpointId, ReplayPrototypeError> {
         CheckpointId::try_new(self.u64()?).map_err(|_| ReplayPrototypeError::InvalidCanonicalPayload("checkpoint out of range"))
     }
@@ -867,6 +1034,10 @@ impl<'a> Cursor<'a> {
 
     const fn is_empty(&self) -> bool {
         self.remaining.is_empty()
+    }
+
+    const fn remaining_len(&self) -> usize {
+        self.remaining.len()
     }
 }
 
