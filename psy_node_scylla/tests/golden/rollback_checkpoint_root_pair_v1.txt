@@ -10,3 +10,9 @@ delete_fence_us: BIGINT,root: BLOB
 CheckpointToRoot/DeletePartition
 DELETE FROM psy_d02t4.checkpoint_root_to_checkpoint_id_table_k2 USING TIMESTAMP ? WHERE obj_id = ?
 delete_fence_us: BIGINT,checkpoint_le: BLOB
+RootToCheckpoint/ExactRead
+SELECT value FROM psy_d02t4.checkpoint_root_to_checkpoint_id_table_k1 WHERE obj_id = ?
+root: BLOB
+CheckpointToRoot/ExactRead
+SELECT value FROM psy_d02t4.checkpoint_root_to_checkpoint_id_table_k2 WHERE obj_id = ?
+checkpoint_le: BLOB

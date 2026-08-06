@@ -60,6 +60,7 @@ impl CheckpointRootPairDirection {
 pub enum CheckpointRootPairQueryKind {
     Put = 1,
     DeletePartition = 2,
+    ExactRead = 3,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -94,6 +95,8 @@ pub struct CheckpointRootPairQueries {
     k2_put: CheckpointRootPairQuery,
     k1_delete: CheckpointRootPairQuery,
     k2_delete: CheckpointRootPairQuery,
+    k1_exact_read: CheckpointRootPairQuery,
+    k2_exact_read: CheckpointRootPairQuery,
 }
 
 impl CheckpointRootPairQueries {
@@ -149,6 +152,22 @@ impl CheckpointRootPairQueries {
                 ),
                 bind_shape: &["delete_fence_us: BIGINT", "checkpoint_le: BLOB"],
             },
+            k1_exact_read: CheckpointRootPairQuery {
+                direction: CheckpointRootPairDirection::RootToCheckpoint,
+                kind: CheckpointRootPairQueryKind::ExactRead,
+                cql: format!(
+                    "SELECT value FROM {k1_qualified} WHERE obj_id = ?"
+                ),
+                bind_shape: &["root: BLOB"],
+            },
+            k2_exact_read: CheckpointRootPairQuery {
+                direction: CheckpointRootPairDirection::CheckpointToRoot,
+                kind: CheckpointRootPairQueryKind::ExactRead,
+                cql: format!(
+                    "SELECT value FROM {k2_qualified} WHERE obj_id = ?"
+                ),
+                bind_shape: &["checkpoint_le: BLOB"],
+            },
         }
     }
 
@@ -168,6 +187,14 @@ impl CheckpointRootPairQueries {
         &self.k2_delete
     }
 
+    pub const fn k1_exact_read(&self) -> &CheckpointRootPairQuery {
+        &self.k1_exact_read
+    }
+
+    pub const fn k2_exact_read(&self) -> &CheckpointRootPairQuery {
+        &self.k2_exact_read
+    }
+
     pub fn render_golden(&self) -> String {
         let mut output = String::new();
         for query in [
@@ -175,6 +202,8 @@ impl CheckpointRootPairQueries {
             self.k2_put(),
             self.k1_delete(),
             self.k2_delete(),
+            self.k1_exact_read(),
+            self.k2_exact_read(),
         ] {
             output.push_str(&format!(
                 "{:?}/{:?}\n{}\n{}\n",
@@ -277,6 +306,13 @@ impl CheckpointRootPairPutPlan {
 
     pub const fn intent_digest(&self) -> TimestampedIntentDigest {
         self.intent_digest
+    }
+
+    pub fn expected_canonical_values(&self) -> [Vec<u8>; 2] {
+        [
+            self.checkpoint.get().to_le_bytes().to_vec(),
+            self.root.to_vec(),
+        ]
     }
 
     pub fn k1_bind_values(&self) -> Vec<PrototypeBindValue> {
@@ -398,6 +434,8 @@ struct PreparedCheckpointRootPair {
     k2_put: PreparedStatement,
     k1_delete: PreparedStatement,
     k2_delete: PreparedStatement,
+    k1_exact_read: PreparedStatement,
+    k2_exact_read: PreparedStatement,
 }
 
 #[allow(dead_code)]
@@ -422,6 +460,18 @@ impl CheckpointRootPairAdapter {
                 .await?,
             k2_delete: prepare_idempotent(session, queries.k2_delete().cql(), consistency)
                 .await?,
+            k1_exact_read: prepare_idempotent(
+                session,
+                queries.k1_exact_read().cql(),
+                consistency,
+            )
+            .await?,
+            k2_exact_read: prepare_idempotent(
+                session,
+                queries.k2_exact_read().cql(),
+                consistency,
+            )
+            .await?,
         };
         Ok(Self {
             queries,
@@ -460,6 +510,32 @@ impl CheckpointRootPairAdapter {
         batch.append_statement(self.prepared.k2_delete.clone());
         session.batch(&batch, plan.driver_values()).await?;
         Ok(())
+    }
+
+    /// Read both exact physical directions and return their decompressed
+    /// canonical values in k1/k2 order. Missing directions remain explicit;
+    /// malformed stored values fail instead of being treated as absence.
+    pub(crate) async fn read_pair_exact(
+        &self,
+        session: &Session,
+        plan: &CheckpointRootPairPutPlan,
+    ) -> anyhow::Result<[Option<Vec<u8>>; 2]> {
+        let k1 = session
+            .execute_unpaged(&self.prepared.k1_exact_read, (plan.root.as_slice(),))
+            .await?
+            .into_rows_result()?
+            .maybe_first_row::<(Vec<u8>,)>()?
+            .map(|row| compression::decompress(&row.0))
+            .transpose()?;
+        let checkpoint_key = plan.checkpoint.get().to_le_bytes();
+        let k2 = session
+            .execute_unpaged(&self.prepared.k2_exact_read, (checkpoint_key.as_slice(),))
+            .await?
+            .into_rows_result()?
+            .maybe_first_row::<(Vec<u8>,)>()?
+            .map(|row| compression::decompress(&row.0))
+            .transpose()?;
+        Ok([k1, k2])
     }
 }
 

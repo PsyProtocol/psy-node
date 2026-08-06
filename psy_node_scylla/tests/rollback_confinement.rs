@@ -3,8 +3,9 @@ use std::{collections::{BTreeMap, BTreeSet}, fs, path::{Path, PathBuf}};
 use psy_node_core::store::{
     timestamp::CommitWriteTimestampUs,
     typed::{
-        CheckpointId, CheckpointLeafKey, CheckpointedObjectKey, LogicalMutation, MerkleNode,
-        MutationValue, NodeIndex, TypedTableKey, U64SingletonSlot,
+        CheckpointId, CheckpointLeafKey, CheckpointRootKey,
+        CheckpointedObjectKey, LogicalMutation, MerkleNode, MutationValue,
+        NodeIndex, TypedTableKey, U64SingletonSlot,
     },
 };
 use psy_node_scylla::rollback::*;
@@ -47,10 +48,22 @@ async fn representative_writes_cross_only_the_typed_store_boundary() {
         timestamp(1_002),
     )
     .unwrap();
+    let checkpoint_root = seal_commit_put_batch(
+        LogicalMutation::CheckpointRootMapping {
+            root: CheckpointRootKey::new(vec![0x44; 32]),
+            checkpoint: checkpoint(9),
+        },
+        timestamp(1_003),
+    )
+    .unwrap();
 
     let leaf_receipt = store.put_checkpoint_leaf(&leaf).await.unwrap();
     let merkle_receipt = store.put_global_user_merkle(&merkle).await.unwrap();
     let singleton_receipt = store.put_latest_checkpoint(&singleton).await.unwrap();
+    let checkpoint_root_receipts = store
+        .put_checkpoint_root_pair(&checkpoint_root)
+        .await
+        .unwrap();
     assert_eq!(leaf_receipt.physical_table(), ScyllaPhysicalTableId::CheckpointLeaf);
     assert_eq!(leaf_receipt.query_id(), ConfinedWriteQueryId::TimestampPrototype(TimestampPrototypeQueryId::CheckpointLeafPut));
     assert_eq!(leaf_receipt.canonical_mutation(), leaf.canonical_bytes());
@@ -63,9 +76,35 @@ async fn representative_writes_cross_only_the_typed_store_boundary() {
         ConfinedWriteQueryId::MutableSingleton(MutableSingletonQueryKind::LatestCheckpointPut)
     );
     assert_eq!(singleton_receipt.canonical_mutation(), singleton.canonical_bytes());
+    assert_eq!(checkpoint_root_receipts.len(), 2);
+    assert_eq!(
+        checkpoint_root_receipts[0].physical_table(),
+        ScyllaPhysicalTableId::CheckpointRootToCheckpointIdK1
+    );
+    assert_eq!(
+        checkpoint_root_receipts[1].physical_table(),
+        ScyllaPhysicalTableId::CheckpointRootToCheckpointIdK2
+    );
+    for receipt in &checkpoint_root_receipts {
+        assert_eq!(
+            receipt.query_id(),
+            ConfinedWriteQueryId::CheckpointRootPair(
+                CheckpointRootPairQueryKind::Put
+            )
+        );
+    }
 
     let calls = store.recorded_calls().unwrap();
-    assert_eq!(calls, vec![leaf_receipt, merkle_receipt, singleton_receipt]);
+    assert_eq!(
+        calls,
+        vec![
+            leaf_receipt,
+            merkle_receipt,
+            singleton_receipt,
+            checkpoint_root_receipts[0].clone(),
+            checkpoint_root_receipts[1].clone(),
+        ]
+    );
 }
 
 #[tokio::test]
@@ -85,6 +124,21 @@ async fn typed_store_rejects_a_ready_mutation_for_the_wrong_representative_adapt
 
     assert_eq!(
         store.read_global_user_merkle_exact(&merkle).await,
+        Err(RollbackableStorePrototypeError::ExactReadRequiresScylla)
+    );
+
+    let checkpoint_root = seal_commit_put_batch(
+        LogicalMutation::CheckpointRootMapping {
+            root: CheckpointRootKey::new(vec![0x45; 32]),
+            checkpoint: checkpoint(3),
+        },
+        timestamp(2_001),
+    )
+    .unwrap();
+    assert_eq!(
+        store
+            .read_checkpoint_root_pair_exact(&checkpoint_root)
+            .await,
         Err(RollbackableStorePrototypeError::ExactReadRequiresScylla)
     );
 }
@@ -249,14 +303,14 @@ fn lexical_inventory_is_stable_and_nontrivial() {
     assert_eq!(
         total,
         RawScyllaAccessCounts {
-            session_type: 694,
+            session_type: 695,
             session_builder: 45,
-            session_field_access: 162,
-            prepared_statement: 231,
+            session_field_access: 164,
+            prepared_statement: 233,
             prepare_call: 134,
-            execute_call: 246,
-            query_call: 112,
-            direct_cql: 345,
+            execute_call: 248,
+            query_call: 115,
+            direct_cql: 351,
         }
     );
 }

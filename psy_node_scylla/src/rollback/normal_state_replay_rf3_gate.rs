@@ -49,9 +49,9 @@ use psy_node_core::store::{
     },
     timestamp::CommitWriteTimestampUs,
     typed::{
-        CheckpointId as StorageCheckpointId, LogicalMutation, MerkleNode,
-        MutationOperation, MutationValue, NodeIndex, TypedTableKey,
-        U64SingletonSlot,
+        CheckpointId as StorageCheckpointId, CheckpointRootKey,
+        LogicalMutation, MerkleNode, MutationOperation, MutationValue,
+        NodeIndex, TypedTableKey, U64SingletonSlot,
     },
 };
 use scylla::{
@@ -76,7 +76,7 @@ use crate::utils::{
 const CONTROL_KEYSPACE: &str = "psy_d04b2c_rf3_nt";
 const ARTIFACT_KEYSPACE: &str = "psy_d04b2c_rf3_artifacts";
 const STATE_KEYSPACE: &str = "psy_d04b2c_rf3_state";
-const BASELINE: &str = "2e6f5d0b8d8ab1d87852d211a24170b23d24672a";
+const BASELINE: &str = "51f7bdb88490c7faff7667538419941a0540f73d";
 const IMAGE: &str = "scylladb/scylla@sha256:17496f2dd6e72056d0b0d7e2bd18bd62638872d1d80a5dd9db96ba017fd426fc";
 const NODE_IPS: [Ipv4Addr; 3] = [
     Ipv4Addr::new(172, 29, 86, 11),
@@ -238,16 +238,25 @@ fn fixture_from_seeds(
         ),
         value: MutationValue::CqlU64(checkpoint.get()),
     };
+    let checkpoint_root = LogicalMutation::CheckpointRootMapping {
+        root: CheckpointRootKey::new(vec![payload_seed.wrapping_add(40); 32]),
+        checkpoint,
+    };
+    logical.push(checkpoint_root.clone());
     logical.push(latest_checkpoint.clone());
     let full = CanonicalPhysicalMutationBatch::from_logical(logical).unwrap();
     let compact = PreparedReferencePlusSupplementRecord::try_v1(
         reference,
-        DerivedSupplementBatch::from_logical(vec![latest_checkpoint]).unwrap(),
+        DerivedSupplementBatch::from_logical(vec![
+            checkpoint_root,
+            latest_checkpoint,
+        ])
+        .unwrap(),
         ReplayReceipt::new(
             ReplayAuthority::Realm,
             checkpoint,
             3,
-            1,
+            3,
             vec![OperationalReplayAction::RotatePendingCheckpointNamespace],
         ),
         &payload_bytes,
@@ -377,11 +386,21 @@ async fn create_schema(session: &Session) -> anyhow::Result<()> {
             )
             .await?;
     }
+    for suffix in ["k1", "k2"] {
+        session
+            .query_unpaged(
+                format!(
+                    "CREATE TABLE IF NOT EXISTS {STATE_KEYSPACE}.checkpoint_root_to_checkpoint_id_table_{suffix} (obj_id BLOB PRIMARY KEY, value BLOB)"
+                ),
+                &[],
+            )
+            .await?;
+    }
     ScyllaPreparedManifestStore::create_schema(session, &keyspaces()?).await?;
     // `RollbackableStorePrototype` deliberately prepares the complete G0-06
-    // representative query set.  Keep the RF=3 fixture production-shaped by
+    // representative query set. Keep the RF=3 fixture production-shaped by
     // creating the KIV representative table even though this gate executes
-    // only the global-user Merkle path.
+    // Merkle, checkpoint-root pair and latest-checkpoint rows.
     session
         .query_unpaged(
             format!(
@@ -654,6 +673,12 @@ async fn read_direct_rows(
     let singleton_query = format!(
         "SELECT value FROM {STATE_KEYSPACE}.u64_singleton_table WHERE obj_id = ?"
     );
+    let checkpoint_root_k1_query = format!(
+        "SELECT value FROM {STATE_KEYSPACE}.checkpoint_root_to_checkpoint_id_table_k1 WHERE obj_id = ?"
+    );
+    let checkpoint_root_k2_query = format!(
+        "SELECT value FROM {STATE_KEYSPACE}.checkpoint_root_to_checkpoint_id_table_k2 WHERE obj_id = ?"
+    );
     let mut values = Vec::with_capacity(plan.mutation_count());
     for sealed in plan.puts() {
         let value = match sealed.resolved().mutation().key() {
@@ -687,6 +712,30 @@ async fn read_direct_rows(
             )
             .to_be_bytes()
             .to_vec(),
+            TypedTableKey::CheckpointRootByHash(root) => {
+                let stored = session
+                    .query_unpaged(
+                        checkpoint_root_k1_query.as_str(),
+                        (root.as_bytes(),),
+                    )
+                    .await?
+                    .into_rows_result()?
+                    .single_row::<(Vec<u8>,)>()?
+                    .0;
+                crate::compression::decompress(&stored)?
+            }
+            TypedTableKey::CheckpointRootByCheckpoint(checkpoint) => {
+                let stored = session
+                    .query_unpaged(
+                        checkpoint_root_k2_query.as_str(),
+                        (checkpoint.get().to_le_bytes().as_slice(),),
+                    )
+                    .await?
+                    .into_rows_result()?
+                    .single_row::<(Vec<u8>,)>()?
+                    .0;
+                crate::compression::decompress(&stored)?
+            }
             _ => bail!("representative plan exposed an unsupported typed key"),
         };
         values.push(value);
@@ -812,7 +861,7 @@ async fn d04b2c_representative_state_replay_rf3_gate() -> anyhow::Result<()> {
         finished_unix_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_millis() as u64,
-        qualification: "representative Realm global-user Merkle plus latest-checkpoint singleton replay; not production Processor integration or full 35-table replay coverage",
+        qualification: "representative Realm global-user Merkle plus checkpoint-root pair and latest-checkpoint singleton replay; not production Processor integration or full 35-table replay coverage",
     };
     let report_path = std::env::var("PSY_D04B2C_REPORT_PATH")
         .unwrap_or_else(|_| "target/d04b2c-state-replay-rf3-report.json".into());
@@ -984,7 +1033,7 @@ async fn d04b2d_combined_representative_normal_commit_rf3_gate(
         finished_unix_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_millis() as u64,
-        qualification: "representative Realm global-user Merkle plus latest-checkpoint singleton supplement and manifest/head/timestamp recovery loop; not production Processor integration or full table coverage",
+        qualification: "representative Realm global-user Merkle plus checkpoint-root pair/latest-checkpoint supplements and manifest/head/timestamp recovery loop; not production Processor integration or full table coverage",
     };
     let report_path = std::env::var("PSY_D04B2D_REPORT_PATH")
         .unwrap_or_else(|_| "target/d04b2d-combined-normal-commit-rf3-report.json".into());
@@ -1267,7 +1316,7 @@ async fn d04b2e_conflicting_normal_commit_rf3_gate() -> anyhow::Result<()> {
         finished_unix_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_millis() as u64,
-        qualification: "M20 for one representative Realm normal commit with global-user Merkle plus latest-checkpoint singleton supplement; not production Processor integration or full table coverage",
+        qualification: "M20 for one representative Realm normal commit with global-user Merkle plus checkpoint-root pair/latest-checkpoint supplements; not production Processor integration or full table coverage",
     };
     let report_path = std::env::var("PSY_D04B2E_REPORT_PATH")
         .unwrap_or_else(|_| "target/d04b2e-normal-commit-conflict-rf3-report.json".into());

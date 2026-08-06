@@ -1,12 +1,12 @@
 //! Representative D-04b2 state replay and verification boundary.
 //!
 //! This prototype supports Realm `global_user_tree_table` PUTs plus the
-//! derived latest-checkpoint singleton carried by a durable supplement. It
-//! proves that root-covered and root-independent rows share one recovery
-//! boundary without pretending that all 35 physical tables have replay
-//! adapters: every exact physical row is read back, the committed root row is
-//! compared independently, and only then can an [`AuthorityPostWriteObservation`]
-//! be produced for SEALED.
+//! checkpoint-root bidirectional mapping and latest-checkpoint singleton
+//! carried by durable supplements. It proves that root-covered state and
+//! root-independent rows share one recovery boundary without pretending that
+//! all 35 physical tables have replay adapters: every exact physical row is
+//! read back, the committed state root is compared independently, and only
+//! then can an [`AuthorityPostWriteObservation`] be produced for SEALED.
 
 use std::{error::Error, fmt};
 
@@ -18,13 +18,18 @@ use psy_node_core::store::{
         AuthorityPostWriteObservation, AuthorityProofObservation,
     },
     manifest_record::PreparedAuthorityManifestRecord,
-    typed::{LogicalMutation, MutationOperation, MutationValue, TypedTableKey},
+    typed::{
+        CheckpointRootKey, LogicalMutation, MutationOperation, MutationValue,
+        TypedTableKey,
+    },
 };
 use super::{
-    seal_commit_put, CanonicalPhysicalMutationBatch, PreparedPayload,
-    PreparedPayloadKind, ReplayPrototypeError,
+    seal_commit_put, seal_commit_put_batch, CanonicalPhysicalMutationBatch,
+    CheckpointRootPairPutPlan, PreparedPayload, PreparedPayloadKind,
+    ReplayPrototypeError,
     RollbackableStorePrototype, RollbackableStorePrototypeError,
-    ScyllaPhysicalTableId, SealedTimestampedPut, TimestampedMutationError,
+    ScyllaPhysicalTableId, SealedTimestampedPut, SealedTimestampedPutBatch,
+    TimestampedMutationError,
     VerifiedPersistedManifestArtifacts,
 };
 #[cfg(test)]
@@ -37,6 +42,12 @@ struct ExpectedStateRow {
     is_root: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExpectedCheckpointRootPair {
+    start: usize,
+    sealed: SealedTimestampedPutBatch,
+}
+
 /// A manifest-bound, timestamped replay plan for one representative Realm
 /// state transition. Construction consumes only verified durable artifact
 /// bytes and fails closed if any physical mutation is outside the supported
@@ -45,6 +56,7 @@ struct ExpectedStateRow {
 pub struct RepresentativeRealmStateReplayPlan<Hash> {
     prepared: PreparedAuthorityManifestRecord<Hash>,
     rows: Vec<ExpectedStateRow>,
+    checkpoint_root_pair: ExpectedCheckpointRootPair,
     mutation_digest: [u8; 32],
 }
 
@@ -137,6 +149,8 @@ impl<Hash: Q256BitHash> RepresentativeRealmStateReplayPlan<Hash> {
             .to_vec_32bytes();
         let mut rows = Vec::with_capacity(batch.mutations().len());
         let mut root_count = 0_usize;
+        let mut checkpoint_root_k1 = None;
+        let mut checkpoint_root_k2 = None;
 
         for resolved in batch.mutations() {
             let mutation = resolved.mutation();
@@ -200,6 +214,20 @@ impl<Hash: Q256BitHash> RepresentativeRealmStateReplayPlan<Hash> {
                     )?;
                     rows.push(ExpectedStateRow { sealed, value: value.to_be_bytes().to_vec(), is_root: false });
                 }
+                ScyllaPhysicalTableId::CheckpointRootToCheckpointIdK1 => {
+                    if checkpoint_root_k1.replace(resolved.clone()).is_some() {
+                        return Err(
+                            RepresentativeStateReplayError::DuplicateCheckpointRootDirection,
+                        );
+                    }
+                }
+                ScyllaPhysicalTableId::CheckpointRootToCheckpointIdK2 => {
+                    if checkpoint_root_k2.replace(resolved.clone()).is_some() {
+                        return Err(
+                            RepresentativeStateReplayError::DuplicateCheckpointRootDirection,
+                        );
+                    }
+                }
                 other => return Err(RepresentativeStateReplayError::UnsupportedPhysicalTable(other)),
             }
         }
@@ -209,20 +237,94 @@ impl<Hash: Q256BitHash> RepresentativeRealmStateReplayPlan<Hash> {
             });
         }
 
-        // Keep mutable singleton metadata behind all root-covered state rows.
-        // The manifest digest remains over the canonical physical batch; this
-        // ordering is only the deterministic execution order.  The durable
+        let (checkpoint_root_k1, checkpoint_root_k2) = checkpoint_root_k1
+            .zip(checkpoint_root_k2)
+            .ok_or(RepresentativeStateReplayError::ExpectedCheckpointRootPair)?;
+        let checkpoint_root = match checkpoint_root_k1.mutation().key() {
+            TypedTableKey::CheckpointRootByHash(root) => root.clone(),
+            _ => return Err(RepresentativeStateReplayError::WrongTypedKey),
+        };
+        let checkpoint = match checkpoint_root_k2.mutation().key() {
+            TypedTableKey::CheckpointRootByCheckpoint(checkpoint) => *checkpoint,
+            _ => return Err(RepresentativeStateReplayError::WrongTypedKey),
+        };
+        if checkpoint.get() != expected_checkpoint {
+            return Err(RepresentativeStateReplayError::StateCheckpointMismatch {
+                expected: expected_checkpoint,
+                actual: checkpoint.get(),
+            });
+        }
+        let sealed_checkpoint_root_pair = seal_commit_put_batch(
+            LogicalMutation::CheckpointRootMapping {
+                root: CheckpointRootKey::new(checkpoint_root.as_bytes().to_vec()),
+                checkpoint,
+            },
+            prepared.commit_write_timestamp(),
+        )?;
+        for (sealed, persisted) in sealed_checkpoint_root_pair
+            .members()
+            .iter()
+            .zip([&checkpoint_root_k1, &checkpoint_root_k2])
+        {
+            if sealed.resolved() != persisted {
+                return Err(
+                    RepresentativeStateReplayError::CheckpointRootPairMismatch,
+                );
+            }
+        }
+        let checkpoint_root_plan =
+            CheckpointRootPairPutPlan::try_from_sealed(&sealed_checkpoint_root_pair)
+                .map_err(|_| {
+                    RepresentativeStateReplayError::CheckpointRootPairMismatch
+                })?;
+        for (sealed, value) in sealed_checkpoint_root_pair
+            .members()
+            .iter()
+            .cloned()
+            .zip(checkpoint_root_plan.expected_canonical_values())
+        {
+            rows.push(ExpectedStateRow {
+                sealed,
+                value,
+                is_root: false,
+            });
+        }
+
+        // Keep the pair contiguous behind root-covered state, then place the
+        // mutable singleton last. The manifest digest remains over the
+        // canonical physical batch; this is execution order only. The durable
         // authority head remains the actual final publish marker.
         rows.sort_by_key(|row| {
-            matches!(
-                row.sealed.resolved().mutation().physical_table(),
-                ScyllaPhysicalTableId::U64Singleton
-            )
+            match row.sealed.resolved().mutation().physical_table() {
+                ScyllaPhysicalTableId::GlobalUserTree => 0,
+                ScyllaPhysicalTableId::CheckpointRootToCheckpointIdK1 => 1,
+                ScyllaPhysicalTableId::CheckpointRootToCheckpointIdK2 => 2,
+                ScyllaPhysicalTableId::U64Singleton => 3,
+                _ => 4,
+            }
         });
+        let checkpoint_root_pair_start = rows
+            .iter()
+            .position(|row| {
+                row.sealed.resolved().mutation().physical_table()
+                    == ScyllaPhysicalTableId::CheckpointRootToCheckpointIdK1
+            })
+            .ok_or(RepresentativeStateReplayError::ExpectedCheckpointRootPair)?;
+        if rows
+            .get(checkpoint_root_pair_start + 1)
+            .map(|row| row.sealed.resolved().mutation().physical_table())
+            != Some(ScyllaPhysicalTableId::CheckpointRootToCheckpointIdK2)
+        {
+            return Err(RepresentativeStateReplayError::CheckpointRootPairMismatch);
+        }
 
         Ok(Self {
             prepared: prepared.clone(),
             rows,
+            checkpoint_root_pair: ExpectedCheckpointRootPair {
+                start: checkpoint_root_pair_start,
+                sealed: sealed_checkpoint_root_pair,
+            },
             mutation_digest,
         })
     }
@@ -328,7 +430,21 @@ impl<'a> RepresentativeRealmStateReplayExecutor<'a> {
                 available: plan.mutation_count(),
             });
         }
-        for sealed in plan.puts().take(count) {
+        if count == plan.checkpoint_root_pair.start + 1 {
+            return Err(
+                RepresentativeStateExecutionError::CheckpointRootPairPrefixSplit,
+            );
+        }
+        let mut index = 0;
+        while index < count {
+            if index == plan.checkpoint_root_pair.start {
+                self.store
+                    .put_checkpoint_root_pair(&plan.checkpoint_root_pair.sealed)
+                    .await?;
+                index += 2;
+                continue;
+            }
+            let sealed = &plan.rows[index].sealed;
             match sealed.resolved().mutation().physical_table() {
                 ScyllaPhysicalTableId::GlobalUserTree => {
                     self.store.put_global_user_merkle(sealed).await?;
@@ -336,8 +452,16 @@ impl<'a> RepresentativeRealmStateReplayExecutor<'a> {
                 ScyllaPhysicalTableId::U64Singleton => {
                     self.store.put_latest_checkpoint(sealed).await?;
                 }
+                ScyllaPhysicalTableId::CheckpointRootToCheckpointIdK1
+                | ScyllaPhysicalTableId::CheckpointRootToCheckpointIdK2 => {
+                    return Err(
+                        RepresentativeStateReplayError::CheckpointRootPairMismatch
+                            .into(),
+                    )
+                }
                 other => return Err(RepresentativeStateReplayError::UnsupportedPhysicalTable(other).into()),
             }
+            index += 1;
         }
         Ok(())
     }
@@ -347,7 +471,20 @@ impl<'a> RepresentativeRealmStateReplayExecutor<'a> {
         plan: &RepresentativeRealmStateReplayPlan<Hash>,
     ) -> Result<Vec<Option<Vec<u8>>>, RepresentativeStateExecutionError> {
         let mut observed = Vec::with_capacity(plan.mutation_count());
-        for sealed in plan.puts() {
+        let mut index = 0;
+        while index < plan.mutation_count() {
+            if index == plan.checkpoint_root_pair.start {
+                observed.extend(
+                    self.store
+                        .read_checkpoint_root_pair_exact(
+                            &plan.checkpoint_root_pair.sealed,
+                        )
+                        .await?,
+                );
+                index += 2;
+                continue;
+            }
+            let sealed = &plan.rows[index].sealed;
             let value = match sealed.resolved().mutation().physical_table() {
                 ScyllaPhysicalTableId::GlobalUserTree => self.store.read_global_user_merkle_exact(sealed).await?,
                 ScyllaPhysicalTableId::U64Singleton => self
@@ -355,9 +492,17 @@ impl<'a> RepresentativeRealmStateReplayExecutor<'a> {
                     .read_latest_checkpoint_exact(sealed)
                     .await?
                     .map(|value| value.to_be_bytes().to_vec()),
+                ScyllaPhysicalTableId::CheckpointRootToCheckpointIdK1
+                | ScyllaPhysicalTableId::CheckpointRootToCheckpointIdK2 => {
+                    return Err(
+                        RepresentativeStateReplayError::CheckpointRootPairMismatch
+                            .into(),
+                    )
+                }
                 other => return Err(RepresentativeStateReplayError::UnsupportedPhysicalTable(other).into()),
             };
             observed.push(value);
+            index += 1;
         }
         Ok(observed)
     }
@@ -376,6 +521,7 @@ pub enum RepresentativeStateExecutionError {
     Store(RollbackableStorePrototypeError),
     Verification(RepresentativeStateReplayError),
     PrefixOutOfBounds { requested: usize, available: usize },
+    CheckpointRootPairPrefixSplit,
 }
 
 impl From<RollbackableStorePrototypeError>
@@ -418,6 +564,9 @@ pub enum RepresentativeStateReplayError {
     StateCheckpointMismatch { expected: u64, actual: u64 },
     ManifestRootMismatch,
     ExpectedExactlyOneRoot { actual: usize },
+    ExpectedCheckpointRootPair,
+    DuplicateCheckpointRootDirection,
+    CheckpointRootPairMismatch,
     ObservationCountMismatch { expected: usize, actual: usize },
     PhysicalRowMissing { index: usize },
     PhysicalRowValueMismatch { index: usize },
@@ -468,8 +617,9 @@ mod tests {
         manifest_lifecycle::SealedAuthorityManifest,
         timestamp::CommitWriteTimestampUs,
         typed::{
-            CheckpointId as StorageCheckpointId, LogicalMutation, MerkleNode,
-            MutationValue, NodeIndex, TypedTableKey, U64SingletonSlot,
+            CheckpointId as StorageCheckpointId, CheckpointRootKey,
+            LogicalMutation, MerkleNode, MutationValue, NodeIndex,
+            TypedTableKey, U64SingletonSlot,
         },
     };
 
@@ -538,6 +688,10 @@ mod tests {
             ),
             value: MutationValue::CqlU64(checkpoint.get()),
         };
+        let checkpoint_root = LogicalMutation::CheckpointRootMapping {
+            root: CheckpointRootKey::new(vec![0x44; 32]),
+            checkpoint,
+        };
         let logical = vec![
             LogicalMutation::Put {
                 key: TypedTableKey::GlobalUserMerkle {
@@ -553,17 +707,22 @@ mod tests {
                 },
                 value: MutationValue::PsyCanonicalBytes(vec![5; 32]),
             },
+            checkpoint_root.clone(),
             singleton.clone(),
         ];
         let full = CanonicalPhysicalMutationBatch::from_logical(logical).unwrap();
         let compact = PreparedReferencePlusSupplementRecord::try_v1(
             reference,
-            DerivedSupplementBatch::from_logical(vec![singleton]).unwrap(),
+            DerivedSupplementBatch::from_logical(vec![
+                checkpoint_root,
+                singleton,
+            ])
+            .unwrap(),
             ReplayReceipt::new(
                 ReplayAuthority::Realm,
                 checkpoint,
                 2,
-                1,
+                3,
                 vec![OperationalReplayAction::RotatePendingCheckpointNamespace],
             ),
             &payload_bytes,
@@ -629,7 +788,9 @@ mod tests {
     #[test]
     fn compact_payload_becomes_exact_timestamped_replay_and_seal_evidence() {
         let plan = plan();
-        assert_eq!(plan.mutation_count(), 3);
+        assert_eq!(plan.mutation_count(), 5);
+        assert_eq!(plan.checkpoint_root_pair.start, 2);
+        assert_eq!(plan.checkpoint_root_pair.sealed.members().len(), 2);
         assert_eq!(
             plan.puts()
                 .last()
@@ -750,6 +911,29 @@ mod tests {
     }
 
     #[test]
+    fn both_checkpoint_root_directions_are_required() {
+        let plan = plan();
+        let complete = plan
+            .rows
+            .iter()
+            .map(|row| Some(row.value.clone()))
+            .collect::<Vec<_>>();
+        for index in [
+            plan.checkpoint_root_pair.start,
+            plan.checkpoint_root_pair.start + 1,
+        ] {
+            let mut missing = complete.clone();
+            missing[index] = None;
+            assert_eq!(
+                plan.verify_observed_rows(&missing),
+                Err(RepresentativeStateReplayError::PhysicalRowMissing {
+                    index,
+                })
+            );
+        }
+    }
+
+    #[test]
     fn payload_not_covering_manifest_fails_before_any_put_is_executable() {
         let (package, payload, _) = fixture();
         assert_eq!(
@@ -802,6 +986,19 @@ mod tests {
                 requested: plan.mutation_count() + 1,
                 available: plan.mutation_count(),
             })
+        );
+        assert!(store.recorded_calls().unwrap().is_empty());
+
+        assert_eq!(
+            executor
+                .reapply_prefix_for_gate(
+                    &plan,
+                    plan.checkpoint_root_pair.start + 1,
+                )
+                .await,
+            Err(
+                RepresentativeStateExecutionError::CheckpointRootPairPrefixSplit
+            )
         );
         assert!(store.recorded_calls().unwrap().is_empty());
     }

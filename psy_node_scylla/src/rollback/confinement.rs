@@ -35,9 +35,13 @@ use std::{error::Error, fmt, sync::{Arc, Mutex}};
 use scylla::{client::session::Session, statement::Consistency};
 
 use super::{
-    CheckpointLeafPutBinding, CqlKeyspaceName, GlobalUserMerklePutBinding, PrototypeBindValue,
+    CheckpointLeafPutBinding, CheckpointRootPairAdapter,
+    CheckpointRootPairPlanError, CheckpointRootPairPutPlan,
+    CheckpointRootPairQueryKind, CqlKeyspaceName, GlobalUserMerklePutBinding,
+    PrototypeBindValue,
     MutableSingletonAdapter, MutableSingletonPlanError, MutableSingletonQueryKind,
-    ScyllaPhysicalTableId, SealedTimestampedPut, TimestampPrototypeAdapter,
+    ScyllaPhysicalTableId, SealedTimestampedPut, SealedTimestampedPutBatch,
+    TimestampPrototypeAdapter,
     TimestampPrototypePlanError, TimestampPrototypeQueryId,
     U64SingletonBeforeImage, U64SingletonTransitionPlan,
 };
@@ -46,6 +50,7 @@ use super::{
 pub enum ConfinedWriteQueryId {
     TimestampPrototype(TimestampPrototypeQueryId),
     MutableSingleton(MutableSingletonQueryKind),
+    CheckpointRootPair(CheckpointRootPairQueryKind),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -78,6 +83,7 @@ impl ConfinedWriteReceipt {
 pub enum RollbackableStorePrototypeError {
     TypedPlan(TimestampPrototypePlanError),
     MutableSingletonPlan(MutableSingletonPlanError),
+    CheckpointRootPairPlan(CheckpointRootPairPlanError),
     Driver(String),
     RecordingLockPoisoned,
     NotARecordingStore,
@@ -90,6 +96,7 @@ impl fmt::Display for RollbackableStorePrototypeError {
         match self {
             Self::TypedPlan(error) => error.fmt(f),
             Self::MutableSingletonPlan(error) => error.fmt(f),
+            Self::CheckpointRootPairPlan(error) => error.fmt(f),
             Self::Driver(error) => write!(f, "Scylla prototype adapter failed: {error}"),
             Self::RecordingLockPoisoned => write!(f, "recording prototype lock is poisoned"),
             Self::NotARecordingStore => write!(f, "prepared Scylla stores do not expose an in-memory recording"),
@@ -113,10 +120,17 @@ impl From<MutableSingletonPlanError> for RollbackableStorePrototypeError {
     }
 }
 
+impl From<CheckpointRootPairPlanError> for RollbackableStorePrototypeError {
+    fn from(value: CheckpointRootPairPlanError) -> Self {
+        Self::CheckpointRootPairPlan(value)
+    }
+}
+
 struct PrivateScyllaBackend {
     session: Arc<Session>,
     adapter: TimestampPrototypeAdapter,
     mutable_singleton: MutableSingletonAdapter,
+    checkpoint_root_pair: CheckpointRootPairAdapter,
 }
 
 enum PrivateStoreBackend {
@@ -151,10 +165,26 @@ impl RollbackableStorePrototype {
         let adapter = TimestampPrototypeAdapter::prepare_with_consistency(&session, keyspace.clone(), consistency)
             .await
             .map_err(|error| RollbackableStorePrototypeError::Driver(error.to_string()))?;
-        let mutable_singleton = MutableSingletonAdapter::prepare_with_consistency(&session, keyspace, consistency)
+        let mutable_singleton = MutableSingletonAdapter::prepare_with_consistency(
+            &session,
+            keyspace.clone(),
+            consistency,
+        )
             .await
             .map_err(|error| RollbackableStorePrototypeError::Driver(error.to_string()))?;
-        Ok(Self { backend: PrivateStoreBackend::Scylla(PrivateScyllaBackend { session, adapter, mutable_singleton }) })
+        let checkpoint_root_pair = CheckpointRootPairAdapter::prepare_with_consistency(
+            &session,
+            keyspace,
+            consistency,
+        )
+        .await
+        .map_err(|error| RollbackableStorePrototypeError::Driver(error.to_string()))?;
+        Ok(Self { backend: PrivateStoreBackend::Scylla(PrivateScyllaBackend {
+            session,
+            adapter,
+            mutable_singleton,
+            checkpoint_root_pair,
+        }) })
     }
 
     pub async fn put_checkpoint_leaf(
@@ -298,6 +328,59 @@ impl RollbackableStorePrototype {
         }
     }
 
+    pub async fn put_checkpoint_root_pair(
+        &self,
+        sealed: &SealedTimestampedPutBatch,
+    ) -> Result<Vec<ConfinedWriteReceipt>, RollbackableStorePrototypeError> {
+        let plan = CheckpointRootPairPutPlan::try_from_sealed(sealed)?;
+        let receipts = vec![
+            ConfinedWriteReceipt {
+                physical_table: ScyllaPhysicalTableId::CheckpointRootToCheckpointIdK1,
+                query_id: ConfinedWriteQueryId::CheckpointRootPair(
+                    CheckpointRootPairQueryKind::Put,
+                ),
+                bind_values: plan.k1_bind_values(),
+                canonical_mutation: sealed.members()[0].canonical_bytes().to_vec(),
+            },
+            ConfinedWriteReceipt {
+                physical_table: ScyllaPhysicalTableId::CheckpointRootToCheckpointIdK2,
+                query_id: ConfinedWriteQueryId::CheckpointRootPair(
+                    CheckpointRootPairQueryKind::Put,
+                ),
+                bind_values: plan.k2_bind_values(),
+                canonical_mutation: sealed.members()[1].canonical_bytes().to_vec(),
+            },
+        ];
+        match &self.backend {
+            PrivateStoreBackend::Recording(_) => self.record_many(receipts),
+            PrivateStoreBackend::Scylla(backend) => {
+                backend
+                    .checkpoint_root_pair
+                    .put_pair(&backend.session, &plan)
+                    .await
+                    .map_err(|error| RollbackableStorePrototypeError::Driver(error.to_string()))?;
+                Ok(receipts)
+            }
+        }
+    }
+
+    pub async fn read_checkpoint_root_pair_exact(
+        &self,
+        sealed: &SealedTimestampedPutBatch,
+    ) -> Result<[Option<Vec<u8>>; 2], RollbackableStorePrototypeError> {
+        let plan = CheckpointRootPairPutPlan::try_from_sealed(sealed)?;
+        match &self.backend {
+            PrivateStoreBackend::Recording(_) => {
+                Err(RollbackableStorePrototypeError::ExactReadRequiresScylla)
+            }
+            PrivateStoreBackend::Scylla(backend) => backend
+                .checkpoint_root_pair
+                .read_pair_exact(&backend.session, &plan)
+                .await
+                .map_err(|error| RollbackableStorePrototypeError::Driver(error.to_string())),
+        }
+    }
+
     pub fn recorded_calls(&self) -> Result<Vec<ConfinedWriteReceipt>, RollbackableStorePrototypeError> {
         match &self.backend {
             PrivateStoreBackend::Recording(calls) => calls
@@ -317,5 +400,19 @@ impl RollbackableStorePrototype {
             .map_err(|_| RollbackableStorePrototypeError::RecordingLockPoisoned)?
             .push(receipt.clone());
         Ok(receipt)
+    }
+
+    fn record_many(
+        &self,
+        receipts: Vec<ConfinedWriteReceipt>,
+    ) -> Result<Vec<ConfinedWriteReceipt>, RollbackableStorePrototypeError> {
+        let PrivateStoreBackend::Recording(calls) = &self.backend else {
+            return Err(RollbackableStorePrototypeError::NotARecordingStore);
+        };
+        calls
+            .lock()
+            .map_err(|_| RollbackableStorePrototypeError::RecordingLockPoisoned)?
+            .extend(receipts.iter().cloned());
+        Ok(receipts)
     }
 }

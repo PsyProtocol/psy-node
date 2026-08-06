@@ -85,6 +85,11 @@ fn query_catalog_uses_both_real_physical_names_and_matches_golden() {
         assert!(query.cql().contains("USING TIMESTAMP ?"));
         assert_eq!(query.cql().matches('?').count(), query.bind_shape().len());
     }
+    for query in [queries.k1_exact_read(), queries.k2_exact_read()] {
+        assert_eq!(query.kind(), CheckpointRootPairQueryKind::ExactRead);
+        assert!(query.cql().starts_with("SELECT value FROM "));
+        assert_eq!(query.cql().matches('?').count(), query.bind_shape().len());
+    }
     assert!(queries
         .k1_put()
         .cql()
@@ -106,6 +111,10 @@ fn sealed_pair_is_consistent_timestamped_and_uses_the_real_blob_codec() {
     assert_eq!(plan.checkpoint(), checkpoint(7));
     assert_eq!(plan.write_timestamp_us(), 1_000);
     assert_eq!(plan.intent_digest(), sealed.intent_digest());
+    assert_eq!(
+        plan.expected_canonical_values(),
+        [7_u64.to_le_bytes().to_vec(), root.to_vec()]
+    );
 
     let k1 = plan.k1_bind_values();
     let k2 = plan.k2_bind_values();
