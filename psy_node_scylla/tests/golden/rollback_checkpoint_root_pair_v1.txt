@@ -1,0 +1,12 @@
+RootToCheckpoint/Put
+INSERT INTO psy_d02t4.checkpoint_root_to_checkpoint_id_table_k1 (obj_id, value) VALUES (?, ?) USING TIMESTAMP ?
+root: BLOB,psz1_checkpoint: BLOB,write_timestamp_us: BIGINT
+CheckpointToRoot/Put
+INSERT INTO psy_d02t4.checkpoint_root_to_checkpoint_id_table_k2 (obj_id, value) VALUES (?, ?) USING TIMESTAMP ?
+checkpoint_le: BLOB,psz1_root: BLOB,write_timestamp_us: BIGINT
+RootToCheckpoint/DeletePartition
+DELETE FROM psy_d02t4.checkpoint_root_to_checkpoint_id_table_k1 USING TIMESTAMP ? WHERE obj_id = ?
+delete_fence_us: BIGINT,root: BLOB
+CheckpointToRoot/DeletePartition
+DELETE FROM psy_d02t4.checkpoint_root_to_checkpoint_id_table_k2 USING TIMESTAMP ? WHERE obj_id = ?
+delete_fence_us: BIGINT,checkpoint_le: BLOB
