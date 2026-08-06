@@ -132,7 +132,7 @@ fn registry_declares_three_mapping_tables_as_preserved_operational() {
 }
 
 #[test]
-fn queries_use_real_physical_names_uuid_types_and_explicit_timestamp() {
+fn queries_use_real_physical_names_lwt_owner_and_timestamped_dependents() {
     let queries = PendingContextQueries::new(
         &CqlKeyspaceName::try_new("psy_d02t8").unwrap(),
     );
@@ -142,14 +142,26 @@ fn queries_use_real_physical_names_uuid_types_and_explicit_timestamp() {
     );
     for query in [
         queries.pending_to_checkpoint_put(),
-        queries.pending_to_proc_put(),
+        queries.pending_to_proc_claim_if_absent(),
         queries.proc_to_pending_put(),
     ] {
-        assert!(query.cql().contains("USING TIMESTAMP ?"));
         assert!(!query.cql().contains("DELETE"));
         assert_eq!(query.cql().matches('?').count(), query.bind_shape().len());
     }
-    assert!(queries.pending_to_proc_put().bind_shape().contains(&"proc_id:UUID"));
+    assert!(queries.pending_to_checkpoint_put().cql().contains("USING TIMESTAMP ?"));
+    assert!(queries.proc_to_pending_put().cql().contains("USING TIMESTAMP ?"));
+    assert!(queries
+        .pending_to_proc_claim_if_absent()
+        .cql()
+        .contains("IF NOT EXISTS"));
+    assert!(!queries
+        .pending_to_proc_claim_if_absent()
+        .cql()
+        .contains("USING TIMESTAMP"));
+    assert!(queries
+        .pending_to_proc_claim_if_absent()
+        .bind_shape()
+        .contains(&"proc_id:UUID"));
     assert!(queries.proc_to_pending_put().bind_shape().contains(&"proc_id:UUID"));
 }
 
@@ -181,7 +193,6 @@ fn authority_rotation_builds_three_consistent_physical_bindings() {
         vec![
             PrototypeBindValue::BigInt(10),
             PrototypeBindValue::Uuid(0x1010_u128.to_be_bytes()),
-            PrototypeBindValue::BigInt(1_000),
         ]
     );
     assert_eq!(
@@ -369,7 +380,7 @@ fn mapping_pair_expansion_order_is_stable_and_old_namespaces_are_not_deleted() {
     let source = include_str!("../src/rollback/pending_context.rs");
     let delete_prefix = ["DELETE", "FROM"].join(" ");
     assert!(!source.contains(&delete_prefix));
-    assert!(source.contains("forward direction first"));
+    assert!(source.contains("D-02T9 LWT owner row is the authority token"));
 }
 
 #[test]

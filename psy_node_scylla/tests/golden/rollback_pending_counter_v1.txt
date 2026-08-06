@@ -1,0 +1,15 @@
+ReadCounter
+SELECT value FROM psy_d02t9_no_tablet.u64_counter_singleton_table WHERE obj_id = ?
+counter_slot:BIGINT
+InsertCounterIfAbsent
+INSERT INTO psy_d02t9_no_tablet.u64_counter_singleton_table (obj_id, value) VALUES (?, ?) IF NOT EXISTS
+counter_slot:BIGINT,candidate_pending:BIGINT
+CompareAndSetCounter
+UPDATE psy_d02t9_no_tablet.u64_counter_singleton_table SET value = ? WHERE obj_id = ? IF value = ?
+candidate_pending:BIGINT,counter_slot:BIGINT,expected_pending:BIGINT
+ReadOwnership
+SELECT value FROM psy_d02t9.pending_id_to_pending_proc_id_table_u64_to_u128 WHERE obj_id = ? LIMIT 1
+candidate_pending:BIGINT
+ClaimOwnershipIfAbsent
+INSERT INTO psy_d02t9.pending_id_to_pending_proc_id_table_u64_to_u128 (obj_id, value) VALUES (?, ?) IF NOT EXISTS
+pending_id:BIGINT,proc_id:UUID

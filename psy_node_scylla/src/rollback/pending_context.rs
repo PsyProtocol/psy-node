@@ -1,9 +1,10 @@
 //! D-02T8 timestamped rotation for monotonic pending-context mappings.
 //!
-//! A fresh pending namespace writes three physical rows: pending to checkpoint,
-//! pending to proc UUID, and proc UUID to pending. Old namespaces are preserved;
-//! this module deliberately exposes no DELETE. The monotonic counter allocation
-//! remains a separate LWT concern for a later slice.
+//! A fresh pending namespace owns three physical rows: pending to checkpoint,
+//! pending to proc UUID, and proc UUID to pending. D-02T9 claims the forward
+//! pending-to-proc row with LWT and returns a verified ownership token; only
+//! then may this adapter materialize the reverse and checkpoint mappings. Old
+//! namespaces are preserved and this module deliberately exposes no DELETE.
 //!
 //! The executable adapter is intentionally private:
 //!
@@ -30,6 +31,7 @@ use super::{
     physical_descriptor, CqlKeyspaceName, PrototypeBindValue,
     ScyllaPhysicalTableId, SealedTimestampedPut,
     SealedTimestampedPutBatch, TimestampedWriteKind,
+    VerifiedPendingOwnership,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -71,7 +73,7 @@ impl PendingContext {
 #[repr(u8)]
 pub enum PendingContextQueryKind {
     PendingToCheckpointPut = 1,
-    PendingToProcPut = 2,
+    PendingToProcClaimIfAbsent = 2,
     ProcToPendingPut = 3,
 }
 
@@ -99,7 +101,7 @@ impl PendingContextQuery {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingContextQueries {
     pending_to_checkpoint_put: PendingContextQuery,
-    pending_to_proc_put: PendingContextQuery,
+    pending_to_proc_claim_if_absent: PendingContextQuery,
     proc_to_pending_put: PendingContextQuery,
 }
 
@@ -130,16 +132,15 @@ impl PendingContextQueries {
                     "write_timestamp_us:BIGINT",
                 ],
             },
-            pending_to_proc_put: PendingContextQuery {
-                kind: PendingContextQueryKind::PendingToProcPut,
+            pending_to_proc_claim_if_absent: PendingContextQuery {
+                kind: PendingContextQueryKind::PendingToProcClaimIfAbsent,
                 cql: format!(
-                    "INSERT INTO {}.{pending_to_proc} (obj_id, value) VALUES (?, ?) USING TIMESTAMP ?",
+                    "INSERT INTO {}.{pending_to_proc} (obj_id, value) VALUES (?, ?) IF NOT EXISTS",
                     keyspace.as_str()
                 ),
                 bind_shape: &[
                     "pending_id:BIGINT",
                     "proc_id:UUID",
-                    "write_timestamp_us:BIGINT",
                 ],
             },
             proc_to_pending_put: PendingContextQuery {
@@ -161,8 +162,10 @@ impl PendingContextQueries {
         &self.pending_to_checkpoint_put
     }
 
-    pub const fn pending_to_proc_put(&self) -> &PendingContextQuery {
-        &self.pending_to_proc_put
+    pub const fn pending_to_proc_claim_if_absent(
+        &self,
+    ) -> &PendingContextQuery {
+        &self.pending_to_proc_claim_if_absent
     }
 
     pub const fn proc_to_pending_put(&self) -> &PendingContextQuery {
@@ -173,7 +176,7 @@ impl PendingContextQueries {
         let mut output = String::new();
         for query in [
             self.pending_to_checkpoint_put(),
-            self.pending_to_proc_put(),
+            self.pending_to_proc_claim_if_absent(),
             self.proc_to_pending_put(),
         ] {
             output.push_str(&format!(
@@ -225,7 +228,6 @@ impl PendingToCheckpointBinding {
 pub struct PendingToProcBinding {
     pending: UniquePendingId,
     proc_id: ProcCheckpointUniqueId,
-    write_timestamp_us: i64,
 }
 
 impl PendingToProcBinding {
@@ -233,16 +235,7 @@ impl PendingToProcBinding {
         vec![
             PrototypeBindValue::BigInt(u64_to_i64_exact(self.pending.get())),
             PrototypeBindValue::Uuid(*self.proc_id.as_bytes()),
-            PrototypeBindValue::BigInt(self.write_timestamp_us),
         ]
-    }
-
-    fn driver_values(&self) -> (i64, Uuid, i64) {
-        (
-            u64_to_i64_exact(self.pending.get()),
-            Uuid::from_u128(self.proc_id.as_u128()),
-            self.write_timestamp_us,
-        )
     }
 }
 
@@ -415,7 +408,6 @@ impl PendingContextMappingPlan {
         let pending_to_proc = PendingToProcBinding {
             pending: candidate.pending(),
             proc_id: candidate.proc_id(),
-            write_timestamp_us: timestamp,
         };
         let proc_to_pending = ProcToPendingBinding {
             proc_id: candidate.proc_id(),
@@ -472,6 +464,29 @@ impl PendingContextMappingPlan {
 
     pub const fn digest(&self) -> PendingContextPlanDigest {
         self.digest
+    }
+
+    pub fn ensure_ownership(
+        &self,
+        ownership: VerifiedPendingOwnership,
+    ) -> Result<(), PendingContextPlanError> {
+        let expected_write_kind = match self.kind {
+            PendingContextTransitionKind::AuthorityRotation => {
+                TimestampedWriteKind::AuthorityCommit
+            }
+            PendingContextTransitionKind::RollbackRotation => {
+                TimestampedWriteKind::NewBranchAfterFence
+            }
+        };
+        if ownership.pending() != self.candidate.pending()
+            || ownership.proc_id() != self.candidate.proc_id()
+            || ownership.write_timestamp_us().as_i64()
+                != self.pending_to_checkpoint.write_timestamp_us
+            || ownership.write_kind() != expected_write_kind
+        {
+            return Err(PendingContextPlanError::OwnershipMismatch);
+        }
+        Ok(())
     }
 }
 
@@ -537,7 +552,6 @@ fn plan_digest(
 
 struct PreparedPendingContext {
     pending_to_checkpoint_put: PreparedStatement,
-    pending_to_proc_put: PreparedStatement,
     proc_to_pending_put: PreparedStatement,
 }
 
@@ -562,12 +576,6 @@ impl PendingContextAdapter {
                 consistency,
             )
             .await?,
-            pending_to_proc_put: prepare(
-                session,
-                queries.pending_to_proc_put().cql(),
-                consistency,
-            )
-            .await?,
             proc_to_pending_put: prepare(
                 session,
                 queries.proc_to_pending_put().cql(),
@@ -582,20 +590,17 @@ impl PendingContextAdapter {
         &self.queries
     }
 
-    /// Writes the forward direction first because current-context readers use
-    /// it. D-04 must persist the plan before counter allocation and recover any
-    /// remaining steps before publishing the context as active.
-    pub(crate) async fn apply(
+    /// The D-02T9 LWT owner row is the authority token. This method only fills
+    /// the reverse/checkpoint rows after proving that token belongs to the exact
+    /// sealed context plan. D-04 must recover these idempotent writes before
+    /// publishing the context as active.
+    pub(crate) async fn apply_owned(
         &self,
         session: &Session,
         plan: &PendingContextMappingPlan,
+        ownership: VerifiedPendingOwnership,
     ) -> anyhow::Result<()> {
-        session
-            .execute_unpaged(
-                &self.prepared.pending_to_proc_put,
-                plan.pending_to_proc.driver_values(),
-            )
-            .await?;
+        plan.ensure_ownership(ownership)?;
         session
             .execute_unpaged(
                 &self.prepared.proc_to_pending_put,
@@ -645,6 +650,7 @@ pub enum PendingContextPlanError {
     ZeroCandidateProcId,
     ProcIdNotRotated,
     MixedWriteTimestamps,
+    OwnershipMismatch,
 }
 
 impl fmt::Display for PendingContextPlanError {

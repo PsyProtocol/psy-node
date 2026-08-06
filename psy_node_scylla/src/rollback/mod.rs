@@ -7,7 +7,8 @@
 //! active checkpoint-root bidirectional mapping. D-02T5 adds the key-only
 //! public-key projection and its non-key birth metadata. D-02T6 coordinates
 //! IMT leaf/index/cursor plans. D-02T7 adds target-restored mutable singleton
-//! plans. D-02T8 adds monotonic pending-context mapping rotation. None is
+//! plans. D-02T8 adds monotonic pending-context mapping rotation. D-02T9 adds
+//! counter LWT allocation with pending-to-proc ownership arbitration. None is
 //! connected to production setup or current writers yet.
 
 mod canonical_head_prototype;
@@ -22,6 +23,7 @@ mod identity;
 mod key;
 mod mutation;
 mod mutable_singleton;
+mod pending_counter;
 mod pending_context;
 mod confinement;
 mod namespace;
@@ -44,6 +46,7 @@ pub use identity::*;
 pub use key::*;
 pub use mutation::*;
 pub use mutable_singleton::*;
+pub use pending_counter::*;
 pub use pending_context::*;
 pub use confinement::*;
 pub use namespace::*;
