@@ -188,6 +188,8 @@ fn reconciliation_requires_counter_then_exact_owner() {
     assert_eq!(token.proc_id(), proc_id(0x111));
     assert_eq!(token.write_timestamp_us(), timestamp(1_000));
     assert_eq!(token.write_kind(), TimestampedWriteKind::AuthorityCommit);
+    assert_eq!(token.status(), PendingOwnershipStatus::CurrentCounter);
+    assert!(token.try_into_current().is_ok());
 
     assert!(matches!(
         plan.reconcile(
@@ -212,13 +214,17 @@ fn reconciliation_requires_counter_then_exact_owner() {
 #[test]
 fn exact_historical_owner_can_recover_mapping_but_other_owner_is_superseded() {
     let plan = allocation(10, 0x111, 1_000);
-    assert!(matches!(
-        plan.reconcile(
-            PendingCounterReadState::Current(pending(12)),
-            PendingOwnershipReadState::OwnedBy(proc_id(0x111)),
-        ),
-        PendingCounterReconcileAction::Owned(_)
-    ));
+    let PendingCounterReconcileAction::Owned(historical) = plan.reconcile(
+        PendingCounterReadState::Current(pending(12)),
+        PendingOwnershipReadState::OwnedBy(proc_id(0x111)),
+    ) else {
+        panic!("exact historical owner must support mapping backfill")
+    };
+    assert_eq!(
+        historical.status(),
+        PendingOwnershipStatus::HistoricalBackfill
+    );
+    assert!(historical.try_into_current().is_err());
     assert!(matches!(
         plan.reconcile(
             PendingCounterReadState::Current(pending(12)),

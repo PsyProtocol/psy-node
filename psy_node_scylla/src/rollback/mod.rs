@@ -8,8 +8,9 @@
 //! public-key projection and its non-key birth metadata. D-02T6 coordinates
 //! IMT leaf/index/cursor plans. D-02T7 adds target-restored mutable singleton
 //! plans. D-02T8 adds monotonic pending-context mapping rotation. D-02T9 adds
-//! counter LWT allocation with pending-to-proc ownership arbitration. None is
-//! connected to production setup or current writers yet.
+//! counter LWT allocation with pending-to-proc ownership arbitration. D-02T10
+//! adds current-pending writes for the operational reward tag-tree namespace.
+//! None is connected to production setup or current writers yet.
 
 mod canonical_head_prototype;
 mod checkpoint_kiv;
@@ -30,6 +31,7 @@ mod namespace;
 mod namespace_prototype;
 mod raw_access;
 mod replay;
+mod reward_tag_tree;
 mod timestamp_prototype;
 mod timestamped;
 mod registry;
@@ -53,6 +55,7 @@ pub use namespace::*;
 pub use namespace_prototype::*;
 pub use raw_access::*;
 pub use replay::*;
+pub use reward_tag_tree::*;
 pub use timestamp_prototype::*;
 pub use timestamped::*;
 pub use registry::*;

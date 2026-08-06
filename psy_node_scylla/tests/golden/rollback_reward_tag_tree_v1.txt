@@ -1,0 +1,6 @@
+FullNodePut
+INSERT INTO psy_d02t10.guta_reward_tag_tree_table (unique_pending_id, level, node_index, node_value, node_tag) VALUES (?, ?, ?, ?, ?) USING TIMESTAMP ?
+unique_pending_id:BIGINT,level:TINYINT,node_index:BIGINT,node_value:BLOB,node_tag:BLOB,write_timestamp_us:BIGINT
+ValueOnlyPut
+UPDATE psy_d02t10.guta_reward_tag_tree_table USING TIMESTAMP ? SET node_value = ? WHERE unique_pending_id = ? AND level = ? AND node_index = ?
+write_timestamp_us:BIGINT,node_value:BLOB,unique_pending_id:BIGINT,level:TINYINT,node_index:BIGINT

@@ -61,6 +61,15 @@ pub enum PendingOwnershipReadState {
     OwnedBy(ProcCheckpointUniqueId),
 }
 
+/// What the serial counter read proved when the ownership token was issued.
+/// A historical token may repair durable mappings, but it must never authorize
+/// new writes in the old pending namespace.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum PendingOwnershipStatus {
+    CurrentCounter,
+    HistoricalBackfill,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct PendingCounterPlanDigest([u8; 32]);
 
@@ -77,6 +86,7 @@ pub struct VerifiedPendingOwnership {
     write_timestamp_us: CommitWriteTimestampUs,
     write_kind: TimestampedWriteKind,
     plan_digest: PendingCounterPlanDigest,
+    status: PendingOwnershipStatus,
 }
 
 impl VerifiedPendingOwnership {
@@ -98,6 +108,74 @@ impl VerifiedPendingOwnership {
 
     pub const fn plan_digest(self) -> PendingCounterPlanDigest {
         self.plan_digest
+    }
+
+    pub const fn status(self) -> PendingOwnershipStatus {
+        self.status
+    }
+
+    /// Narrows a general mapping-repair token to the capability required by
+    /// namespace writers. The result proves that the candidate equalled the
+    /// serially observed counter when issued. D-04 must additionally hold the
+    /// processor/context-rotation guard until the write has been published.
+    pub fn try_into_current(
+        self,
+    ) -> Result<VerifiedCurrentPendingOwnership, HistoricalPendingOwnership> {
+        match self.status {
+            PendingOwnershipStatus::CurrentCounter => {
+                Ok(VerifiedCurrentPendingOwnership { ownership: self })
+            }
+            PendingOwnershipStatus::HistoricalBackfill => {
+                Err(HistoricalPendingOwnership { ownership: self })
+            }
+        }
+    }
+}
+
+/// A private-field capability accepted by active pending-namespace writers.
+/// It cannot be forged or obtained from a historical-backfill token.
+///
+/// ```compile_fail
+/// use psy_node_scylla::rollback::{VerifiedCurrentPendingOwnership, VerifiedPendingOwnership};
+/// fn forge(ownership: VerifiedPendingOwnership) {
+///     let _ = VerifiedCurrentPendingOwnership { ownership };
+/// }
+/// ```
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct VerifiedCurrentPendingOwnership {
+    ownership: VerifiedPendingOwnership,
+}
+
+impl VerifiedCurrentPendingOwnership {
+    pub const fn pending(self) -> UniquePendingId {
+        self.ownership.pending()
+    }
+
+    pub const fn proc_id(self) -> ProcCheckpointUniqueId {
+        self.ownership.proc_id()
+    }
+
+    pub const fn write_timestamp_us(self) -> CommitWriteTimestampUs {
+        self.ownership.write_timestamp_us()
+    }
+
+    pub const fn write_kind(self) -> TimestampedWriteKind {
+        self.ownership.write_kind()
+    }
+
+    pub const fn plan_digest(self) -> PendingCounterPlanDigest {
+        self.ownership.plan_digest()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct HistoricalPendingOwnership {
+    ownership: VerifiedPendingOwnership,
+}
+
+impl HistoricalPendingOwnership {
+    pub const fn ownership(self) -> VerifiedPendingOwnership {
+        self.ownership
     }
 }
 
@@ -418,7 +496,9 @@ impl SealedPendingCounterAllocation {
                         if owner == self.proc_id =>
                     {
                         PendingCounterReconcileAction::Owned(
-                            self.verified_ownership(),
+                            self.verified_ownership(
+                                PendingOwnershipStatus::CurrentCounter,
+                            ),
                         )
                     }
                     PendingOwnershipReadState::OwnedBy(owner) => {
@@ -439,7 +519,9 @@ impl SealedPendingCounterAllocation {
                         if owner == self.proc_id =>
                     {
                         PendingCounterReconcileAction::Owned(
-                            self.verified_ownership(),
+                            self.verified_ownership(
+                                PendingOwnershipStatus::HistoricalBackfill,
+                            ),
                         )
                     }
                     PendingOwnershipReadState::Unclaimed => {
@@ -472,13 +554,17 @@ impl SealedPendingCounterAllocation {
         }
     }
 
-    fn verified_ownership(&self) -> VerifiedPendingOwnership {
+    fn verified_ownership(
+        &self,
+        status: PendingOwnershipStatus,
+    ) -> VerifiedPendingOwnership {
         VerifiedPendingOwnership {
             pending: self.candidate,
             proc_id: self.proc_id,
             write_timestamp_us: self.write_timestamp_us,
             write_kind: self.write_kind,
             plan_digest: self.digest,
+            status,
         }
     }
 }
