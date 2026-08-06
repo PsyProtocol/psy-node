@@ -41,6 +41,7 @@ hashbrown = { workspace = true }
 clap = { workspace = true, optional = true }
 dashmap = { workspace = true }
 zstd = { workspace = true }
+sha2 = { workspace = true }
 
 
 # start local packages
