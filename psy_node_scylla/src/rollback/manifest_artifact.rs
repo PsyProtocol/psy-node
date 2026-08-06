@@ -24,6 +24,7 @@ pub const MANIFEST_ARTIFACT_CHUNKS_PER_BUCKET: u32 = 16;
 
 const LOCATOR_MAGIC: &[u8; 4] = b"PSLA";
 const ARTIFACT_SET_MAGIC: &[u8; 4] = b"PSAS";
+const ZERO_MUTATION_RECEIPT_MAGIC: &[u8; 4] = b"PSZR";
 const ARTIFACT_DIGEST_DOMAIN: &[u8] = b"psy.rollback.manifest-artifact.v1\0";
 const CHUNK_DIGEST_DOMAIN: &[u8] = b"psy.rollback.manifest-chunk.v1\0";
 const CHUNK_SET_DIGEST_DOMAIN: &[u8] =
@@ -253,6 +254,457 @@ pub struct CanonicalManifestArtifactSet {
     durable_prepared_payload: Option<CanonicalManifestArtifact>,
     canonical_summary: Vec<u8>,
     commitment: ManifestArtifactSetCommitment,
+}
+
+/// Compact receipt for a checkpoint that has no rollbackable or derived
+/// physical mutation. It deliberately owns no chunk, but still commits to the
+/// typed replay receipt and empty physical mutation digest.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CanonicalZeroMutationReceipt {
+    mutation_digest: [u8; 32],
+    canonical_summary: Vec<u8>,
+    commitment: ManifestArtifactSetCommitment,
+}
+
+impl CanonicalZeroMutationReceipt {
+    pub fn try_from_full(
+        record: &FullPhysicalDeltaRecord,
+    ) -> Result<Self, ManifestArtifactError> {
+        if !record.batch().mutations().is_empty() {
+            return Err(ManifestArtifactError::NonZeroMutationReceipt {
+                actual: record.batch().mutations().len(),
+            });
+        }
+        let mutation_digest = *record.batch().digest().as_bytes();
+        let replay_bytes = record.encode_canonical();
+        let replay_len = u32::try_from(replay_bytes.len()).map_err(|_| {
+            ManifestArtifactError::ZeroMutationReceiptTooLarge(
+                replay_bytes.len(),
+            )
+        })?;
+        let summary_capacity = 43usize.checked_add(replay_bytes.len()).ok_or(
+            ManifestArtifactError::ZeroMutationReceiptTooLarge(
+                replay_bytes.len(),
+            ),
+        )?;
+        let mut canonical_summary = Vec::with_capacity(summary_capacity);
+        canonical_summary.extend_from_slice(ZERO_MUTATION_RECEIPT_MAGIC);
+        canonical_summary
+            .extend_from_slice(&MANIFEST_ARTIFACT_ENCODING_VERSION.to_be_bytes());
+        canonical_summary.push(ReplayRecordKind::FullPhysicalDelta as u8);
+        canonical_summary.extend_from_slice(&mutation_digest);
+        canonical_summary.extend_from_slice(&replay_len.to_be_bytes());
+        canonical_summary.extend_from_slice(&replay_bytes);
+        let commitment =
+            ManifestArtifactSetCommitment::from_verified_artifact_summary(
+                &canonical_summary,
+                mutation_digest,
+                0,
+                0,
+                0,
+                0,
+            )?;
+        let receipt = Self {
+            mutation_digest,
+            canonical_summary,
+            commitment,
+        };
+        receipt.verify_integrity()?;
+        Ok(receipt)
+    }
+
+    pub const fn mutation_digest(&self) -> &[u8; 32] {
+        &self.mutation_digest
+    }
+
+    pub fn canonical_summary(&self) -> &[u8] {
+        &self.canonical_summary
+    }
+
+    pub const fn commitment(&self) -> ManifestArtifactSetCommitment {
+        self.commitment
+    }
+
+    pub fn verify_integrity(&self) -> Result<(), ManifestArtifactError> {
+        if self.canonical_summary.len() < 43
+            || &self.canonical_summary[..4] != ZERO_MUTATION_RECEIPT_MAGIC
+        {
+            return Err(ManifestArtifactError::InvalidZeroMutationReceipt);
+        }
+        let version = u16::from_be_bytes(
+            self.canonical_summary[4..6].try_into().expect("fixed"),
+        );
+        if version != MANIFEST_ARTIFACT_ENCODING_VERSION {
+            return Err(ManifestArtifactError::UnknownEncodingVersion(version));
+        }
+        if self.canonical_summary[6] != ReplayRecordKind::FullPhysicalDelta as u8 {
+            return Err(ManifestArtifactError::InvalidZeroMutationReceipt);
+        }
+        if self.canonical_summary[7..39] != self.mutation_digest {
+            return Err(ManifestArtifactError::ArtifactSummaryMismatch);
+        }
+        let replay_len = u32::from_be_bytes(
+            self.canonical_summary[39..43]
+                .try_into()
+                .expect("fixed"),
+        ) as usize;
+        let expected_len = 43usize.checked_add(replay_len).ok_or(
+            ManifestArtifactError::ZeroMutationReceiptTooLarge(replay_len),
+        )?;
+        if self.canonical_summary.len() != expected_len {
+            return Err(ManifestArtifactError::InvalidZeroMutationReceipt);
+        }
+        validate_zero_mutation_replay_record(
+            &self.canonical_summary[43..],
+            self.mutation_digest,
+        )?;
+        self.commitment
+            .verify_canonical_summary(&self.canonical_summary)?;
+        if self.commitment.affected_row_count() != 0
+            || self.commitment.locator_chunk_count() != 0
+            || self.commitment.replay_chunk_count() != 0
+            || self.commitment.durable_payload_chunk_count() != 0
+        {
+            return Err(ManifestArtifactError::InvalidZeroMutationReceipt);
+        }
+        Ok(())
+    }
+}
+
+/// Complete D-03 artifact outcome for one authority checkpoint.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CanonicalManifestArtifacts {
+    Chunked(CanonicalManifestArtifactSet),
+    ZeroMutation(CanonicalZeroMutationReceipt),
+}
+
+impl CanonicalManifestArtifacts {
+    pub fn try_from_full(
+        record: &FullPhysicalDeltaRecord,
+    ) -> Result<Self, ManifestArtifactError> {
+        if record.batch().mutations().is_empty() {
+            Ok(Self::ZeroMutation(
+                CanonicalZeroMutationReceipt::try_from_full(record)?,
+            ))
+        } else {
+            Ok(Self::Chunked(
+                CanonicalManifestArtifactSet::try_from_full(record)?,
+            ))
+        }
+    }
+
+    pub fn try_from_compact(
+        record: &PreparedReferencePlusSupplementRecord,
+        durable_payload_bytes: &[u8],
+    ) -> Result<Self, ManifestArtifactError> {
+        Ok(Self::Chunked(
+            CanonicalManifestArtifactSet::try_from_compact(
+                record,
+                durable_payload_bytes,
+            )?,
+        ))
+    }
+
+    pub const fn commitment(&self) -> ManifestArtifactSetCommitment {
+        match self {
+            Self::Chunked(set) => set.commitment(),
+            Self::ZeroMutation(receipt) => receipt.commitment(),
+        }
+    }
+
+    pub fn canonical_summary(&self) -> &[u8] {
+        match self {
+            Self::Chunked(set) => set.canonical_summary(),
+            Self::ZeroMutation(receipt) => receipt.canonical_summary(),
+        }
+    }
+
+    pub const fn chunked(&self) -> Option<&CanonicalManifestArtifactSet> {
+        match self {
+            Self::Chunked(set) => Some(set),
+            Self::ZeroMutation(_) => None,
+        }
+    }
+
+    pub const fn is_zero_mutation(&self) -> bool {
+        matches!(self, Self::ZeroMutation(_))
+    }
+
+    pub fn verify_integrity(&self) -> Result<(), ManifestArtifactError> {
+        match self {
+            Self::Chunked(set) => set.verify_integrity(),
+            Self::ZeroMutation(receipt) => receipt.verify_integrity(),
+        }
+    }
+}
+
+/// Strictly decoded durable artifact plan recovered from a PREPARED manifest
+/// row. It contains enough information to address and verify every immutable
+/// chunk after a process restart; no in-memory commit builder is required.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DecodedManifestArtifactPlan {
+    Chunked {
+        replay_record_kind: ReplayRecordKind,
+        mutation_digest: [u8; 32],
+        locator: ManifestArtifactDescriptor,
+        replay_record: ManifestArtifactDescriptor,
+        durable_prepared_payload: Option<ManifestArtifactDescriptor>,
+    },
+    ZeroMutation {
+        mutation_digest: [u8; 32],
+        replay_record: Vec<u8>,
+    },
+}
+
+impl DecodedManifestArtifactPlan {
+    pub const fn mutation_digest(&self) -> &[u8; 32] {
+        match self {
+            Self::Chunked {
+                mutation_digest, ..
+            }
+            | Self::ZeroMutation {
+                mutation_digest, ..
+            } => mutation_digest,
+        }
+    }
+
+    pub const fn locator(&self) -> Option<ManifestArtifactDescriptor> {
+        match self {
+            Self::Chunked { locator, .. } => Some(*locator),
+            Self::ZeroMutation { .. } => None,
+        }
+    }
+
+    pub const fn replay_record(&self) -> Option<ManifestArtifactDescriptor> {
+        match self {
+            Self::Chunked { replay_record, .. } => Some(*replay_record),
+            Self::ZeroMutation { .. } => None,
+        }
+    }
+
+    pub const fn durable_prepared_payload(
+        &self,
+    ) -> Option<ManifestArtifactDescriptor> {
+        match self {
+            Self::Chunked {
+                durable_prepared_payload,
+                ..
+            } => *durable_prepared_payload,
+            Self::ZeroMutation { .. } => None,
+        }
+    }
+
+    pub fn zero_mutation_replay_record(&self) -> Option<&[u8]> {
+        match self {
+            Self::ZeroMutation { replay_record, .. } => Some(replay_record),
+            Self::Chunked { .. } => None,
+        }
+    }
+}
+
+pub fn decode_manifest_artifact_plan(
+    canonical_summary: &[u8],
+    commitment: ManifestArtifactSetCommitment,
+) -> Result<DecodedManifestArtifactPlan, ManifestArtifactError> {
+    commitment.verify_canonical_summary(canonical_summary)?;
+    if canonical_summary.starts_with(ZERO_MUTATION_RECEIPT_MAGIC) {
+        return decode_zero_mutation_plan(canonical_summary, commitment);
+    }
+    if !canonical_summary.starts_with(ARTIFACT_SET_MAGIC) {
+        return Err(ManifestArtifactError::InvalidArtifactSummaryEncoding);
+    }
+    if canonical_summary.len() < 40 {
+        return Err(ManifestArtifactError::InvalidArtifactSummaryEncoding);
+    }
+    let version = u16::from_be_bytes(
+        canonical_summary[4..6].try_into().expect("fixed"),
+    );
+    if version != MANIFEST_ARTIFACT_ENCODING_VERSION {
+        return Err(ManifestArtifactError::UnknownEncodingVersion(version));
+    }
+    let replay_record_kind = ReplayRecordKind::try_from(canonical_summary[6])?;
+    let mutation_digest: [u8; 32] =
+        canonical_summary[7..39].try_into().expect("fixed");
+    let artifact_count = canonical_summary[39];
+    if !matches!(artifact_count, 2 | 3) {
+        return Err(ManifestArtifactError::InvalidArtifactSummaryEncoding);
+    }
+    let mut offset = 40usize;
+    let locator = decode_artifact_descriptor(canonical_summary, &mut offset)?;
+    let replay_record =
+        decode_artifact_descriptor(canonical_summary, &mut offset)?;
+    let durable_prepared_payload = if artifact_count == 3 {
+        Some(decode_artifact_descriptor(canonical_summary, &mut offset)?)
+    } else {
+        None
+    };
+    if offset != canonical_summary.len()
+        || locator.kind() != ManifestArtifactKind::Locator
+        || replay_record.kind() != ManifestArtifactKind::ReplayRecord
+        || durable_prepared_payload.is_some_and(|descriptor| {
+            descriptor.kind() != ManifestArtifactKind::DurablePreparedPayload
+        })
+        || locator.item_count() != commitment.affected_row_count()
+        || replay_record.item_count() != commitment.affected_row_count()
+        || locator.chunk_count() != commitment.locator_chunk_count()
+        || replay_record.chunk_count() != commitment.replay_chunk_count()
+        || durable_prepared_payload.map_or(0, |descriptor| descriptor.chunk_count())
+            != commitment.durable_payload_chunk_count()
+        || mutation_digest != commitment.mutation_digest()
+    {
+        return Err(ManifestArtifactError::ArtifactSummaryCardinalityMismatch);
+    }
+    Ok(DecodedManifestArtifactPlan::Chunked {
+        replay_record_kind,
+        mutation_digest,
+        locator,
+        replay_record,
+        durable_prepared_payload,
+    })
+}
+
+fn decode_zero_mutation_plan(
+    canonical_summary: &[u8],
+    commitment: ManifestArtifactSetCommitment,
+) -> Result<DecodedManifestArtifactPlan, ManifestArtifactError> {
+    if canonical_summary.len() < 43 {
+        return Err(ManifestArtifactError::InvalidZeroMutationReceipt);
+    }
+    let version = u16::from_be_bytes(
+        canonical_summary[4..6].try_into().expect("fixed"),
+    );
+    if version != MANIFEST_ARTIFACT_ENCODING_VERSION {
+        return Err(ManifestArtifactError::UnknownEncodingVersion(version));
+    }
+    if canonical_summary[6] != ReplayRecordKind::FullPhysicalDelta as u8 {
+        return Err(ManifestArtifactError::InvalidZeroMutationReceipt);
+    }
+    let mutation_digest: [u8; 32] =
+        canonical_summary[7..39].try_into().expect("fixed");
+    let replay_len = u32::from_be_bytes(
+        canonical_summary[39..43].try_into().expect("fixed"),
+    ) as usize;
+    let expected_len = 43usize.checked_add(replay_len).ok_or(
+        ManifestArtifactError::ZeroMutationReceiptTooLarge(replay_len),
+    )?;
+    if canonical_summary.len() != expected_len
+        || mutation_digest != commitment.mutation_digest()
+        || commitment.affected_row_count() != 0
+        || commitment.locator_chunk_count() != 0
+        || commitment.replay_chunk_count() != 0
+        || commitment.durable_payload_chunk_count() != 0
+    {
+        return Err(ManifestArtifactError::InvalidZeroMutationReceipt);
+    }
+    validate_zero_mutation_replay_record(
+        &canonical_summary[43..],
+        mutation_digest,
+    )?;
+    Ok(DecodedManifestArtifactPlan::ZeroMutation {
+        mutation_digest,
+        replay_record: canonical_summary[43..].to_vec(),
+    })
+}
+
+fn validate_zero_mutation_replay_record(
+    bytes: &[u8],
+    mutation_digest: [u8; 32],
+) -> Result<(), ManifestArtifactError> {
+    // FullPhysicalDelta V1: PSFD/version/kind, receipt, length-prefixed
+    // canonical physical batch. A zero receipt may retain operational actions
+    // but its state/metadata counts and physical batch must both be empty.
+    if bytes.len() < 40
+        || &bytes[..4] != b"PSFD"
+        || u16::from_be_bytes(bytes[4..6].try_into().expect("fixed")) != 1
+        || bytes[6] != ReplayRecordKind::FullPhysicalDelta as u8
+        || !matches!(bytes[7], 1 | 2)
+        || u32::from_be_bytes(bytes[16..20].try_into().expect("fixed")) != 0
+        || u32::from_be_bytes(bytes[20..24].try_into().expect("fixed")) != 0
+    {
+        return Err(ManifestArtifactError::InvalidZeroMutationReceipt);
+    }
+    let action_count =
+        u16::from_be_bytes(bytes[24..26].try_into().expect("fixed")) as usize;
+    let actions_end = 26usize.checked_add(action_count).ok_or(
+        ManifestArtifactError::InvalidZeroMutationReceipt,
+    )?;
+    let batch_length_end = actions_end.checked_add(4).ok_or(
+        ManifestArtifactError::InvalidZeroMutationReceipt,
+    )?;
+    if batch_length_end > bytes.len() {
+        return Err(ManifestArtifactError::InvalidZeroMutationReceipt);
+    }
+    let actions = &bytes[26..actions_end];
+    if actions.iter().any(|action| !matches!(action, 1..=3))
+        || actions.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+        return Err(ManifestArtifactError::InvalidZeroMutationReceipt);
+    }
+    let batch_len = u32::from_be_bytes(
+        bytes[actions_end..batch_length_end]
+            .try_into()
+            .expect("fixed"),
+    ) as usize;
+    let batch_end = batch_length_end.checked_add(batch_len).ok_or(
+        ManifestArtifactError::InvalidZeroMutationReceipt,
+    )?;
+    if batch_end != bytes.len() {
+        return Err(ManifestArtifactError::InvalidZeroMutationReceipt);
+    }
+    let empty_batch = CanonicalPhysicalMutationBatch::try_new(Vec::new())?;
+    if &bytes[batch_length_end..] != empty_batch.encode_canonical()
+        || mutation_digest != *empty_batch.digest().as_bytes()
+    {
+        return Err(ManifestArtifactError::InvalidZeroMutationReceipt);
+    }
+    Ok(())
+}
+
+fn decode_artifact_descriptor(
+    bytes: &[u8],
+    offset: &mut usize,
+) -> Result<ManifestArtifactDescriptor, ManifestArtifactError> {
+    const DESCRIPTOR_LEN: usize = 87;
+    let end = offset
+        .checked_add(DESCRIPTOR_LEN)
+        .ok_or(ManifestArtifactError::InvalidArtifactSummaryEncoding)?;
+    if end > bytes.len() {
+        return Err(ManifestArtifactError::InvalidArtifactSummaryEncoding);
+    }
+    let descriptor = &bytes[*offset..end];
+    let kind = ManifestArtifactKind::try_from(descriptor[0])?;
+    let encoding_version =
+        u16::from_be_bytes(descriptor[1..3].try_into().expect("fixed"));
+    if encoding_version != MANIFEST_ARTIFACT_ENCODING_VERSION {
+        return Err(ManifestArtifactError::UnknownEncodingVersion(
+            encoding_version,
+        ));
+    }
+    let chunk_count =
+        u32::from_be_bytes(descriptor[3..7].try_into().expect("fixed"));
+    let item_count =
+        u64::from_be_bytes(descriptor[7..15].try_into().expect("fixed"));
+    let encoded_bytes =
+        u64::from_be_bytes(descriptor[15..23].try_into().expect("fixed"));
+    if chunk_count == 0 || encoded_bytes == 0 {
+        return Err(ManifestArtifactError::InvalidArtifactDescriptor);
+    }
+    let payload_digest = ManifestArtifactDigest::from_persisted(
+        descriptor[23..55].try_into().expect("fixed"),
+    );
+    let chunk_set_digest = ManifestArtifactDigest::from_persisted(
+        descriptor[55..87].try_into().expect("fixed"),
+    );
+    *offset = end;
+    Ok(ManifestArtifactDescriptor {
+        kind,
+        encoding_version,
+        chunk_count,
+        item_count,
+        encoded_bytes,
+        payload_digest,
+        chunk_set_digest,
+    })
 }
 
 impl CanonicalManifestArtifactSet {
@@ -695,6 +1147,9 @@ pub enum ManifestArtifactError {
     UnknownEncodingVersion(u16),
     InvalidChunkLimit(usize),
     ZeroMutationReceiptNotYetSupported,
+    NonZeroMutationReceipt { actual: usize },
+    ZeroMutationReceiptTooLarge(usize),
+    InvalidZeroMutationReceipt,
     EmptyArtifactPayload(ManifestArtifactKind),
     TooManyChunks(usize),
     TooManyLocatorEntries(usize),
@@ -713,6 +1168,9 @@ pub enum ManifestArtifactError {
     NonCanonicalLocatorOrdering,
     ArtifactSummaryMismatch,
     ArtifactCommitmentMismatch,
+    InvalidArtifactSummaryEncoding,
+    InvalidArtifactDescriptor,
+    ArtifactSummaryCardinalityMismatch,
 }
 
 impl From<ReplayPrototypeError> for ManifestArtifactError {
@@ -891,6 +1349,15 @@ mod tests {
             CanonicalManifestArtifactSet::try_from_full(&record).unwrap_err(),
             ManifestArtifactError::ZeroMutationReceiptNotYetSupported
         );
+
+        let bundle = CanonicalManifestArtifacts::try_from_full(&record).unwrap();
+        assert!(bundle.is_zero_mutation());
+        assert!(bundle.chunked().is_none());
+        assert_eq!(bundle.commitment().affected_row_count(), 0);
+        assert_eq!(bundle.commitment().locator_chunk_count(), 0);
+        assert_eq!(bundle.commitment().replay_chunk_count(), 0);
+        assert_eq!(bundle.commitment().durable_payload_chunk_count(), 0);
+        bundle.verify_integrity().unwrap();
     }
 
     #[test]

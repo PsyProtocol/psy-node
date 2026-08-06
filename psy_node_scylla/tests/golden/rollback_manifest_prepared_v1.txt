@@ -1,0 +1,63 @@
+CreateManifest|
+CREATE TABLE IF NOT EXISTS psy_rollback_no_tablet.d03b_authority_checkpoint_manifest (network_chain_id bigint, authority_kind tinyint, realm_id bigint, realm_sub_id bigint, checkpoint_bucket bigint, chain_epoch bigint, checkpoint_id bigint, checkpoint_hash blob, revision bigint, status tinyint, manifest_digest blob, manifest_payload blob, PRIMARY KEY ((network_chain_id, authority_kind, realm_id, realm_sub_id, checkpoint_bucket), chain_epoch, checkpoint_id, checkpoint_hash))
+CreateLocatorChunk|
+CREATE TABLE IF NOT EXISTS psy_rollback_artifacts.d03b_authority_checkpoint_locator_chunk (network_chain_id bigint, authority_kind tinyint, realm_id bigint, realm_sub_id bigint, chain_epoch bigint, checkpoint_id bigint, checkpoint_hash blob, manifest_digest blob, chunk_bucket int, chunk_index int, encoding_version smallint, total_chunks int, payload blob, payload_hash blob, PRIMARY KEY ((network_chain_id, authority_kind, realm_id, realm_sub_id, chain_epoch, checkpoint_id, checkpoint_hash, manifest_digest, chunk_bucket), chunk_index))
+CreateReplayChunk|
+CREATE TABLE IF NOT EXISTS psy_rollback_artifacts.d03b_authority_checkpoint_replay_chunk (network_chain_id bigint, authority_kind tinyint, realm_id bigint, realm_sub_id bigint, chain_epoch bigint, checkpoint_id bigint, checkpoint_hash blob, manifest_digest blob, chunk_bucket int, chunk_index int, encoding_version smallint, total_chunks int, payload blob, payload_hash blob, PRIMARY KEY ((network_chain_id, authority_kind, realm_id, realm_sub_id, chain_epoch, checkpoint_id, checkpoint_hash, manifest_digest, chunk_bucket), chunk_index))
+CreatePreparedPayloadChunk|
+CREATE TABLE IF NOT EXISTS psy_rollback_artifacts.d03b_authority_prepared_payload_chunk (network_chain_id bigint, authority_kind tinyint, realm_id bigint, realm_sub_id bigint, chain_epoch bigint, checkpoint_id bigint, checkpoint_hash blob, manifest_digest blob, chunk_bucket int, chunk_index int, encoding_version smallint, total_chunks int, payload blob, payload_hash blob, PRIMARY KEY ((network_chain_id, authority_kind, realm_id, realm_sub_id, chain_epoch, checkpoint_id, checkpoint_hash, manifest_digest, chunk_bucket), chunk_index))
+ReadManifest|network_chain_id:BIGINT,authority_kind:TINYINT,realm_id:BIGINT,realm_sub_id:BIGINT,checkpoint_bucket:BIGINT,chain_epoch:BIGINT,checkpoint_id:BIGINT,checkpoint_hash:BLOB
+SELECT revision, status, manifest_digest, manifest_payload FROM psy_rollback_no_tablet.d03b_authority_checkpoint_manifest WHERE network_chain_id = ? AND authority_kind = ? AND realm_id = ? AND realm_sub_id = ? AND checkpoint_bucket = ? AND chain_epoch = ? AND checkpoint_id = ? AND checkpoint_hash = ?
+InsertPreparedManifest|network_chain_id:BIGINT,authority_kind:TINYINT,realm_id:BIGINT,realm_sub_id:BIGINT,checkpoint_bucket:BIGINT,chain_epoch:BIGINT,checkpoint_id:BIGINT,checkpoint_hash:BLOB,revision:BIGINT,status:TINYINT,manifest_digest:BLOB,manifest_payload:BLOB
+INSERT INTO psy_rollback_no_tablet.d03b_authority_checkpoint_manifest (network_chain_id, authority_kind, realm_id, realm_sub_id, checkpoint_bucket, chain_epoch, checkpoint_id, checkpoint_hash, revision, status, manifest_digest, manifest_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS
+PutLocatorChunk|network_chain_id:BIGINT,authority_kind:TINYINT,realm_id:BIGINT,realm_sub_id:BIGINT,chain_epoch:BIGINT,checkpoint_id:BIGINT,checkpoint_hash:BLOB,manifest_digest:BLOB,chunk_bucket:INT,chunk_index:INT,encoding_version:SMALLINT,total_chunks:INT,payload:BLOB,payload_hash:BLOB,commit_write_timestamp_us:BIGINT
+INSERT INTO psy_rollback_artifacts.d03b_authority_checkpoint_locator_chunk (network_chain_id, authority_kind, realm_id, realm_sub_id, chain_epoch, checkpoint_id, checkpoint_hash, manifest_digest, chunk_bucket, chunk_index, encoding_version, total_chunks, payload, payload_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) USING TIMESTAMP ?
+PutReplayChunk|network_chain_id:BIGINT,authority_kind:TINYINT,realm_id:BIGINT,realm_sub_id:BIGINT,chain_epoch:BIGINT,checkpoint_id:BIGINT,checkpoint_hash:BLOB,manifest_digest:BLOB,chunk_bucket:INT,chunk_index:INT,encoding_version:SMALLINT,total_chunks:INT,payload:BLOB,payload_hash:BLOB,commit_write_timestamp_us:BIGINT
+INSERT INTO psy_rollback_artifacts.d03b_authority_checkpoint_replay_chunk (network_chain_id, authority_kind, realm_id, realm_sub_id, chain_epoch, checkpoint_id, checkpoint_hash, manifest_digest, chunk_bucket, chunk_index, encoding_version, total_chunks, payload, payload_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) USING TIMESTAMP ?
+PutPreparedPayloadChunk|network_chain_id:BIGINT,authority_kind:TINYINT,realm_id:BIGINT,realm_sub_id:BIGINT,chain_epoch:BIGINT,checkpoint_id:BIGINT,checkpoint_hash:BLOB,manifest_digest:BLOB,chunk_bucket:INT,chunk_index:INT,encoding_version:SMALLINT,total_chunks:INT,payload:BLOB,payload_hash:BLOB,commit_write_timestamp_us:BIGINT
+INSERT INTO psy_rollback_artifacts.d03b_authority_prepared_payload_chunk (network_chain_id, authority_kind, realm_id, realm_sub_id, chain_epoch, checkpoint_id, checkpoint_hash, manifest_digest, chunk_bucket, chunk_index, encoding_version, total_chunks, payload, payload_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) USING TIMESTAMP ?
+ReadLocatorBucket|network_chain_id:BIGINT,authority_kind:TINYINT,realm_id:BIGINT,realm_sub_id:BIGINT,chain_epoch:BIGINT,checkpoint_id:BIGINT,checkpoint_hash:BLOB,manifest_digest:BLOB,chunk_bucket:INT
+SELECT chunk_bucket, chunk_index, encoding_version, total_chunks, payload, payload_hash FROM psy_rollback_artifacts.d03b_authority_checkpoint_locator_chunk WHERE network_chain_id = ? AND authority_kind = ? AND realm_id = ? AND realm_sub_id = ? AND chain_epoch = ? AND checkpoint_id = ? AND checkpoint_hash = ? AND manifest_digest = ? AND chunk_bucket = ?
+ReadReplayBucket|network_chain_id:BIGINT,authority_kind:TINYINT,realm_id:BIGINT,realm_sub_id:BIGINT,chain_epoch:BIGINT,checkpoint_id:BIGINT,checkpoint_hash:BLOB,manifest_digest:BLOB,chunk_bucket:INT
+SELECT chunk_bucket, chunk_index, encoding_version, total_chunks, payload, payload_hash FROM psy_rollback_artifacts.d03b_authority_checkpoint_replay_chunk WHERE network_chain_id = ? AND authority_kind = ? AND realm_id = ? AND realm_sub_id = ? AND chain_epoch = ? AND checkpoint_id = ? AND checkpoint_hash = ? AND manifest_digest = ? AND chunk_bucket = ?
+ReadPreparedPayloadBucket|network_chain_id:BIGINT,authority_kind:TINYINT,realm_id:BIGINT,realm_sub_id:BIGINT,chain_epoch:BIGINT,checkpoint_id:BIGINT,checkpoint_hash:BLOB,manifest_digest:BLOB,chunk_bucket:INT
+SELECT chunk_bucket, chunk_index, encoding_version, total_chunks, payload, payload_hash FROM psy_rollback_artifacts.d03b_authority_prepared_payload_chunk WHERE network_chain_id = ? AND authority_kind = ? AND realm_id = ? AND realm_sub_id = ? AND chain_epoch = ? AND checkpoint_id = ? AND checkpoint_hash = ? AND manifest_digest = ? AND chunk_bucket = ?
+MANIFEST_BIND
+0:BIGINT:1337
+1:TINYINT:2
+2:BIGINT:4
+3:BIGINT:2
+4:BIGINT:0
+5:BIGINT:7
+6:BIGINT:41
+7:BLOB:2222222222222222222222222222222222222222222222222222222222222222
+8:BIGINT:0
+9:TINYINT:1
+10:BLOB:088088564ceec06b48c38f20b2276e2c4b6153a6122b32ebe4df70929c31191a
+11:BLOB:5053594d505245500100010000000000000041420f00000000000404f90706c0c037deb44f541e11ab087c472816766fbf2f1a17d19638994cbe4c010000505359434d494e540100390500000204000000020050535943435245460100390500000700000000000000280000000000000001200011111111111111111111111111111111111111111111111111111111111111115053594343524546010039050000070000000000000029000000000000000120002222222222222222222222222222222222222222222222222222222222222222002800000000000000280000000000000071717171717171717171717171717171717171717171717171717171717171717171717171717171717171717171717171717171717171717171717171717171f9a4dd7bdca5c7e3ff87222ac392b7068bc442242ede650e1ab3d99bb6fa6581d8d2f4ba5a36386fdb152b9876492078daa6ea1dce8fead077e827406a50b74501000000010000000000000001000000000000000c000000555555555555555555555555d600000050534153000101d8d2f4ba5a36386fdb152b9876492078daa6ea1dce8fead077e827406a50b74502010001000000010000000000000001000000000000002a54555da665107466008c66c7a8e49631bbc1b563d4dd2b5e4e82adb49fe072e81dcaaf5add8ca495f59a7de5137eeab615b6ba34b3eca37c041297625700e6f502000100000001000000000000000100000000000000789b25df7a7281d3829af7a61e9cc3d5ec47638932320ade5cd735e44302de862d335de17c8ece3c8b03b2672f76a36e4a646cf2a6fd4a5cff9be92b68c74165a8
+LOCATOR_CHUNK_PUT_BIND
+0:BIGINT:1337
+1:TINYINT:2
+2:BIGINT:4
+3:BIGINT:2
+4:BIGINT:7
+5:BIGINT:41
+6:BLOB:2222222222222222222222222222222222222222222222222222222222222222
+7:BLOB:088088564ceec06b48c38f20b2276e2c4b6153a6122b32ebe4df70929c31191a
+8:INT:0
+9:INT:0
+10:SMALLINT:1
+11:INT:1
+12:BLOB:50534c410001000000010000001c5053524b000100010001000101010103000000080000000000000029
+13:BLOB:f53429875470fb5179286e43952c096f657338d93acdae580347dabe3b8afd77
+14:BIGINT:1000001
+LOCATOR_BUCKET_READ_BIND
+0:BIGINT:1337
+1:TINYINT:2
+2:BIGINT:4
+3:BIGINT:2
+4:BIGINT:7
+5:BIGINT:41
+6:BLOB:2222222222222222222222222222222222222222222222222222222222222222
+7:BLOB:088088564ceec06b48c38f20b2276e2c4b6153a6122b32ebe4df70929c31191a
+8:INT:0

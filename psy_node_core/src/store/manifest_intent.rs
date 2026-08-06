@@ -94,6 +94,46 @@ impl ManifestArtifactSetCommitment {
         self.affected_row_count
     }
 
+    /// Recomputes the commitment from the persisted canonical artifact-set
+    /// summary. This is the bridge between immutable chunk verification and
+    /// the driver-independent manifest record.
+    pub fn verify_canonical_summary(
+        self,
+        canonical_summary: &[u8],
+    ) -> Result<(), ManifestIntentError> {
+        let reconstructed = Self::from_verified_artifact_summary(
+            canonical_summary,
+            self.mutation_digest,
+            self.locator_chunk_count,
+            self.replay_chunk_count,
+            self.durable_payload_chunk_count,
+            self.affected_row_count,
+        )?;
+        if reconstructed == self {
+            Ok(())
+        } else {
+            Err(ManifestIntentError::ArtifactSummaryCommitmentMismatch)
+        }
+    }
+
+    fn from_canonical_fields(
+        digest: [u8; 32],
+        mutation_digest: [u8; 32],
+        locator_chunk_count: u32,
+        replay_chunk_count: u32,
+        durable_payload_chunk_count: u32,
+        affected_row_count: u64,
+    ) -> Self {
+        Self {
+            digest,
+            mutation_digest,
+            locator_chunk_count,
+            replay_chunk_count,
+            durable_payload_chunk_count,
+            affected_row_count,
+        }
+    }
+
     fn encode_into(self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.digest);
         out.extend_from_slice(&self.mutation_digest);
@@ -268,6 +308,107 @@ impl<Hash: Q256BitHash> SealedAuthorityCommitIntent<Hash> {
         self.digest
     }
 
+    /// Decode the exact canonical envelope used by a durable PREPARED
+    /// manifest. Validation is performed by reconstructing the typed intent
+    /// through the normal seal path and requiring byte-for-byte canonical
+    /// equality.
+    pub fn decode_canonical(bytes: &[u8]) -> Result<Self, ManifestIntentError> {
+        const FIXED_LEN: usize = 320;
+        if bytes.len() < FIXED_LEN {
+            return Err(ManifestIntentError::TruncatedIntent {
+                minimum: FIXED_LEN,
+                actual: bytes.len(),
+            });
+        }
+        if bytes[..8] != AUTHORITY_COMMIT_INTENT_MAGIC {
+            return Err(ManifestIntentError::InvalidIntentMagic);
+        }
+        let version = u16::from_le_bytes(bytes[8..10].try_into().expect("fixed"));
+        if version != AUTHORITY_COMMIT_INTENT_CODEC_VERSION {
+            return Err(ManifestIntentError::UnknownIntentCodecVersion(version));
+        }
+
+        let network_chain_id =
+            u32::from_le_bytes(bytes[10..14].try_into().expect("fixed"));
+        let network = psy_data::protocol::canonical_chain::NetworkId::try_from_chain_id(
+            network_chain_id,
+        )?;
+        let authority = decode_authority(&bytes[14..21])?;
+        let key = AuthorityTimestampKey::new(network, authority);
+        let expected = CanonicalChainRef::from_canonical_bytes(&bytes[21..86])?;
+        let candidate = CanonicalChainRef::from_canonical_bytes(&bytes[86..151])?;
+
+        let state_changed = match bytes[151] {
+            0 => false,
+            1 => true,
+            value => return Err(ManifestIntentError::InvalidStateChangedFlag(value)),
+        };
+        let previous_checkpoint = AuthorityStateCheckpointId::new(
+            u64::from_le_bytes(bytes[152..160].try_into().expect("fixed")),
+        );
+        let state_checkpoint = AuthorityStateCheckpointId::new(
+            u64::from_le_bytes(bytes[160..168].try_into().expect("fixed")),
+        );
+        let old_root = AuthorityStateRoot::from_local_state_root(
+            Hash::from_owned_32bytes(bytes[168..200].try_into().expect("fixed")),
+        );
+        let new_root = AuthorityStateRoot::from_local_state_root(
+            Hash::from_owned_32bytes(bytes[200..232].try_into().expect("fixed")),
+        );
+        let state_transition = if state_changed {
+            AuthorityStateTransition::Changed {
+                previous_checkpoint,
+                checkpoint: state_checkpoint,
+                old_root,
+                new_root,
+            }
+        } else {
+            AuthorityStateTransition::Unchanged {
+                checkpoint: state_checkpoint,
+                root: old_root,
+            }
+        };
+
+        let artifacts = ManifestArtifactSetCommitment::from_canonical_fields(
+            bytes[232..264].try_into().expect("fixed"),
+            bytes[264..296].try_into().expect("fixed"),
+            u32::from_le_bytes(bytes[296..300].try_into().expect("fixed")),
+            u32::from_le_bytes(bytes[300..304].try_into().expect("fixed")),
+            u32::from_le_bytes(bytes[304..308].try_into().expect("fixed")),
+            u64::from_le_bytes(bytes[308..316].try_into().expect("fixed")),
+        );
+        let payload_len =
+            u32::from_le_bytes(bytes[316..320].try_into().expect("fixed")) as usize;
+        let expected_len = FIXED_LEN
+            .checked_add(payload_len)
+            .ok_or(ManifestIntentError::IntentLengthOverflow)?;
+        if bytes.len() < expected_len {
+            return Err(ManifestIntentError::TruncatedIntent {
+                minimum: expected_len,
+                actual: bytes.len(),
+            });
+        }
+        if bytes.len() > expected_len {
+            return Err(ManifestIntentError::TrailingIntentBytes {
+                expected: expected_len,
+                actual: bytes.len(),
+            });
+        }
+        let head_payload = AuthorityHeadPayload::try_new(bytes[320..].to_vec())?;
+        let decoded = Self::seal_normal_advance(
+            key,
+            expected,
+            candidate,
+            state_transition,
+            head_payload,
+            artifacts,
+        )?;
+        if decoded.encode_canonical() != bytes {
+            return Err(ManifestIntentError::NonCanonicalIntentEncoding);
+        }
+        Ok(decoded)
+    }
+
     pub fn attach_timestamp_lease(
         self,
         lease: AuthorityTimestampLease,
@@ -433,9 +574,33 @@ fn encode_authority(authority: AuthorityScope, out: &mut Vec<u8>) {
     out.extend_from_slice(&bytes);
 }
 
+fn decode_authority(bytes: &[u8]) -> Result<AuthorityScope, ManifestIntentError> {
+    if bytes.len() != AUTHORITY_SCOPE_LEN {
+        return Err(ManifestIntentError::InvalidAuthorityScopeLength(
+            bytes.len(),
+        ));
+    }
+    match bytes[0] {
+        1 => {
+            if bytes[1..].iter().any(|byte| *byte != 0) {
+                return Err(ManifestIntentError::NonCanonicalCoordinatorScope);
+            }
+            Ok(AuthorityScope::Coordinator)
+        }
+        2 => Ok(AuthorityScope::Realm {
+            realm_id: u32::from_le_bytes(bytes[1..5].try_into().expect("fixed")),
+            realm_sub_id: u16::from_le_bytes(
+                bytes[5..7].try_into().expect("fixed"),
+            ),
+        }),
+        value => Err(ManifestIntentError::UnknownAuthorityKind(value)),
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ManifestIntentError {
     EmptyArtifactSummary,
+    ArtifactSummaryCommitmentMismatch,
     EmptyAuthorityHeadPayload,
     AuthorityHeadPayloadTooLarge { actual: usize, maximum: usize },
     NetworkMismatch,
@@ -447,6 +612,16 @@ pub enum ManifestIntentError {
     UnchangedStateCheckpointAheadOfHead { state_checkpoint: u64, expected_head: u64 },
     TimestampLeaseAuthorityMismatch,
     TimestampLeaseIntentMismatch,
+    TruncatedIntent { minimum: usize, actual: usize },
+    TrailingIntentBytes { expected: usize, actual: usize },
+    IntentLengthOverflow,
+    InvalidIntentMagic,
+    UnknownIntentCodecVersion(u16),
+    InvalidAuthorityScopeLength(usize),
+    NonCanonicalCoordinatorScope,
+    UnknownAuthorityKind(u8),
+    InvalidStateChangedFlag(u8),
+    NonCanonicalIntentEncoding,
     CanonicalChain(CanonicalChainRefCodecError),
 }
 
@@ -457,6 +632,12 @@ impl fmt::Display for ManifestIntentError {
 }
 
 impl Error for ManifestIntentError {}
+
+impl From<CanonicalChainRefCodecError> for ManifestIntentError {
+    fn from(value: CanonicalChainRefCodecError) -> Self {
+        Self::CanonicalChain(value)
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -550,6 +731,13 @@ mod tests {
         assert_eq!(first.digest(), second.digest());
         assert_ne!(first.digest(), seal(31).digest());
         assert_eq!(&first.encode_canonical()[..8], b"PSYCMINT");
+        assert_eq!(
+            SealedAuthorityCommitIntent::<PHash>::decode_canonical(
+                first.encode_canonical()
+            )
+            .unwrap(),
+            first
+        );
     }
 
     #[test]
@@ -639,5 +827,36 @@ mod tests {
             AuthorityHeadPayload::try_new(Vec::new()).unwrap_err(),
             ManifestIntentError::EmptyAuthorityHeadPayload
         );
+    }
+
+    #[test]
+    fn persisted_intent_decoder_rejects_tampering_and_noncanonical_bytes() {
+        let intent = seal(50);
+        let mut unknown_version = intent.encode_canonical().to_vec();
+        unknown_version[8..10].copy_from_slice(&2u16.to_le_bytes());
+        assert_eq!(
+            SealedAuthorityCommitIntent::<PHash>::decode_canonical(
+                &unknown_version
+            )
+            .unwrap_err(),
+            ManifestIntentError::UnknownIntentCodecVersion(2)
+        );
+
+        let mut invalid_flag = intent.encode_canonical().to_vec();
+        invalid_flag[151] = 2;
+        assert_eq!(
+            SealedAuthorityCommitIntent::<PHash>::decode_canonical(
+                &invalid_flag
+            )
+            .unwrap_err(),
+            ManifestIntentError::InvalidStateChangedFlag(2)
+        );
+
+        let mut trailing = intent.encode_canonical().to_vec();
+        trailing.push(0);
+        assert!(matches!(
+            SealedAuthorityCommitIntent::<PHash>::decode_canonical(&trailing),
+            Err(ManifestIntentError::TrailingIntentBytes { .. })
+        ));
     }
 }
