@@ -1,0 +1,45 @@
+UserLeaf/Put
+INSERT INTO psy_d02t3.user_leaf_table (obj_id, checkpoint_id, value) VALUES (?, ?, ?) USING TIMESTAMP ?
+obj_id:BIGINT,checkpoint_id:BIGINT,psz1_value:BLOB,write_timestamp_us:BIGINT
+UserLeaf/PointDelete
+DELETE FROM psy_d02t3.user_leaf_table USING TIMESTAMP ? WHERE obj_id = ? AND checkpoint_id = ?
+delete_fence_us:BIGINT,obj_id:BIGINT,checkpoint_id:BIGINT
+UserLeaf/BoundedRangeDelete
+DELETE FROM psy_d02t3.user_leaf_table USING TIMESTAMP ? WHERE obj_id = ? AND checkpoint_id > ? AND checkpoint_id <= ?
+delete_fence_us:BIGINT,obj_id:BIGINT,target_exclusive:BIGINT,old_head_inclusive:BIGINT
+UserPublicKey/Put
+INSERT INTO psy_d02t3.user_public_key_table (obj_id, checkpoint_id, value) VALUES (?, ?, ?) USING TIMESTAMP ?
+obj_id:BIGINT,checkpoint_id:BIGINT,psz1_value:BLOB,write_timestamp_us:BIGINT
+UserPublicKey/PointDelete
+DELETE FROM psy_d02t3.user_public_key_table USING TIMESTAMP ? WHERE obj_id = ? AND checkpoint_id = ?
+delete_fence_us:BIGINT,obj_id:BIGINT,checkpoint_id:BIGINT
+UserPublicKey/BoundedRangeDelete
+DELETE FROM psy_d02t3.user_public_key_table USING TIMESTAMP ? WHERE obj_id = ? AND checkpoint_id > ? AND checkpoint_id <= ?
+delete_fence_us:BIGINT,obj_id:BIGINT,target_exclusive:BIGINT,old_head_inclusive:BIGINT
+ContractStateTreeHeight/Put
+INSERT INTO psy_d02t3.contract_state_tree_height_table (obj_id, checkpoint_id, value) VALUES (?, ?, ?) USING TIMESTAMP ?
+obj_id:BIGINT,checkpoint_id:BIGINT,psz1_value:BLOB,write_timestamp_us:BIGINT
+ContractStateTreeHeight/PointDelete
+DELETE FROM psy_d02t3.contract_state_tree_height_table USING TIMESTAMP ? WHERE obj_id = ? AND checkpoint_id = ?
+delete_fence_us:BIGINT,obj_id:BIGINT,checkpoint_id:BIGINT
+ContractStateTreeHeight/BoundedRangeDelete
+DELETE FROM psy_d02t3.contract_state_tree_height_table USING TIMESTAMP ? WHERE obj_id = ? AND checkpoint_id > ? AND checkpoint_id <= ?
+delete_fence_us:BIGINT,obj_id:BIGINT,target_exclusive:BIGINT,old_head_inclusive:BIGINT
+ContractLeaf/Put
+INSERT INTO psy_d02t3.contract_leaf_table (obj_id, checkpoint_id, value) VALUES (?, ?, ?) USING TIMESTAMP ?
+obj_id:BIGINT,checkpoint_id:BIGINT,psz1_value:BLOB,write_timestamp_us:BIGINT
+ContractLeaf/PointDelete
+DELETE FROM psy_d02t3.contract_leaf_table USING TIMESTAMP ? WHERE obj_id = ? AND checkpoint_id = ?
+delete_fence_us:BIGINT,obj_id:BIGINT,checkpoint_id:BIGINT
+ContractLeaf/BoundedRangeDelete
+DELETE FROM psy_d02t3.contract_leaf_table USING TIMESTAMP ? WHERE obj_id = ? AND checkpoint_id > ? AND checkpoint_id <= ?
+delete_fence_us:BIGINT,obj_id:BIGINT,target_exclusive:BIGINT,old_head_inclusive:BIGINT
+ContractCodeDefinition/Put
+INSERT INTO psy_d02t3.contract_code_definition_table (obj_id, checkpoint_id, value) VALUES (?, ?, ?) USING TIMESTAMP ?
+obj_id:BIGINT,checkpoint_id:BIGINT,psz1_value:BLOB,write_timestamp_us:BIGINT
+ContractCodeDefinition/PointDelete
+DELETE FROM psy_d02t3.contract_code_definition_table USING TIMESTAMP ? WHERE obj_id = ? AND checkpoint_id = ?
+delete_fence_us:BIGINT,obj_id:BIGINT,checkpoint_id:BIGINT
+ContractCodeDefinition/BoundedRangeDelete
+DELETE FROM psy_d02t3.contract_code_definition_table USING TIMESTAMP ? WHERE obj_id = ? AND checkpoint_id > ? AND checkpoint_id <= ?
+delete_fence_us:BIGINT,obj_id:BIGINT,target_exclusive:BIGINT,old_head_inclusive:BIGINT
