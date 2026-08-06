@@ -164,7 +164,12 @@ impl<
 where
     N::HasherBase: 'static + Send + Sync,
 {
-    pub async fn get_reward_tree_root(&self, _checkpoint_id: u64, unique_pending_id: u64, job_id: N::JobId) -> anyhow::Result<N::QHash> {
+    pub async fn get_reward_tree_root_or_none(
+        &self,
+        _checkpoint_id: u64,
+        unique_pending_id: u64,
+        job_id: N::JobId,
+    ) -> anyhow::Result<Option<N::QHash>> {
         let temp_store_reward_tree_root: Option<N::QHash> = self
             .temp_db
             .get_proof_miner_rewards_tree_value_or_none(
@@ -176,7 +181,7 @@ where
         if temp_store_reward_tree_root.is_some() {
             let root = temp_store_reward_tree_root.unwrap();
             if root != N::QHash::get_zero_value() || unique_pending_id == 0 {
-                return Ok(root);
+                return Ok(Some(root));
             } else {
                 tracing::warn!(
                     "Temporary store returned zero value for reward tree root at unique pending ID: {}. Falling back to permanent store.",
@@ -189,9 +194,20 @@ where
             .rewards_tag_tree_get_root_at_unique_pending_id(unique_pending_id)
             .await?;
         if reward_tree_root == N::QHash::get_zero_value() && unique_pending_id != 0 {
-            anyhow::bail!("Permanent store returned zero value for reward tree root at unique pending ID: {}. This indicates an inconsistency in the database state.", unique_pending_id);
+            return Ok(None);
         }
-        Ok(reward_tree_root)
+        Ok(Some(reward_tree_root))
+    }
+
+    pub async fn get_reward_tree_root(&self, checkpoint_id: u64, unique_pending_id: u64, job_id: N::JobId) -> anyhow::Result<N::QHash> {
+        self.get_reward_tree_root_or_none(checkpoint_id, unique_pending_id, job_id)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Permanent store returned zero value for reward tree root at unique pending ID: {}. This indicates an inconsistency in the database state.",
+                    unique_pending_id,
+                )
+            })
     }
 
     pub fn print_coordinator_processor_state(&self) {

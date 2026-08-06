@@ -8,6 +8,7 @@ use psy_data::{
     worker::metadata_with_job_id::PsyProvingJobMetadataWithJobId,
 };
 use psy_io::tokio::TokioLikeFileSystem;
+use std::time::Duration;
 use psy_node_core::{
     p2p::traits::realm_coordinantor::RealmCoordinatorClient,
     psy_core_db::traits::full::{PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmProcessorStore},
@@ -23,6 +24,7 @@ use crate::realm::{
     processor::{core::PsyRealmProcessor, gatherers::realm_end_cap_gatherer::RealmGUTAEndCapGathererOutput},
     queue_key::RealmProvingWorkQueueKey,
 };
+use crate::utils::persisted_artifact::wait_for_persisted_artifact;
 
 impl<
         N: QNetworkTypesConfig<JobId = QProvingJobDataID>,
@@ -45,6 +47,7 @@ where
         jobs: &[Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>],
     ) -> anyhow::Result<()> {
         let mut timer = TraceTimer::new("publish_all_worker_jobs");
+        let root_job_id = self.get_root_job_id(jobs)?;
 
         let mut non_empty_levels = 0usize;
         for level in 0..jobs.len() {
@@ -56,8 +59,19 @@ where
             self.db.temp_db.set_psy_node_proving_state(&self.db.state.realm_identifier, &proving_state).await?;
             non_empty_levels+=1;
 
-            tracing::info!("Publishing {} jobs at level {}", jobs[level].len(), level);
-            self.db
+            tracing::info!(
+                realm_id = self.db.state.realm_id_u64,
+                realm_sub_id = self.db.state.realm_sub_id_u64,
+                checkpoint_id = self.db.state.processing_checkpoint_id,
+                unique_pending_id = self.db.state.processing_unique_pending_id,
+                proc_checkpoint_unique_id = self.db.state.processing_proc_checkpoint_unique_id,
+                task_group = 0,
+                level,
+                job_count = jobs[level].len(),
+                root_job_id = ?root_job_id,
+                "Publishing Realm worker jobs"
+            );
+            let barrier = self.db
                 .proof_work_queue
                 .publish_many_worker_queue_items(
                     queue_key,
@@ -69,7 +83,19 @@ where
                 )
                 .await?;
             timer.lap("published jobs");
-            tracing::info!("Published all jobs at level {}", level);
+            tracing::info!(
+                realm_id = self.db.state.realm_id_u64,
+                realm_sub_id = self.db.state.realm_sub_id_u64,
+                checkpoint_id = self.db.state.processing_checkpoint_id,
+                unique_pending_id = self.db.state.processing_unique_pending_id,
+                proc_checkpoint_unique_id = self.db.state.processing_proc_checkpoint_unique_id,
+                task_group = 0,
+                level,
+                job_count = jobs[level].len(),
+                root_job_id = ?root_job_id,
+                publish_barrier = ?barrier,
+                "Realm worker publication acknowledged"
+            );
 
             // We wait level-by-level because higher levels usually depend on the output of
             // lower levels.
@@ -81,11 +107,24 @@ where
                     self.db.state.realm_sub_id_u64,
                     self.db.state.processing_proc_checkpoint_unique_id,
                     0,
+                    &barrier,
                     self.proof_worker_queue_max_time_ms,
                 )
                 .await?;
             timer.lap("waited for jobs to complete");
-            tracing::info!("All jobs at level {} completed", level);
+            tracing::info!(
+                realm_id = self.db.state.realm_id_u64,
+                realm_sub_id = self.db.state.realm_sub_id_u64,
+                checkpoint_id = self.db.state.processing_checkpoint_id,
+                unique_pending_id = self.db.state.processing_unique_pending_id,
+                proc_checkpoint_unique_id = self.db.state.processing_proc_checkpoint_unique_id,
+                task_group = 0,
+                level,
+                job_count = jobs[level].len(),
+                root_job_id = ?root_job_id,
+                publish_barrier = ?barrier,
+                "Realm worker transport barrier completed"
+            );
         }
         proving_state.finish();
         self.db.temp_db.set_psy_node_proving_state(&self.db.state.realm_identifier, &proving_state).await?;
@@ -264,26 +303,56 @@ where
         tracing::info!("GUTA jobs completed!");
 
         // 5. Retrieve Proof
-        let root_job_proof = self
-            .db
-            .proof_store
-            .get_proof_bytes_by_job_id(root_job_id, self.db.state.processing_unique_pending_id)
-            .await?;
-        if root_job_proof.is_none() {
-            anyhow::bail!("No proof found for root GUTA job id: {:?}", root_job_id);
-        }
-        let root_job_proof = root_job_proof.unwrap();
+        let unique_pending_id = self.db.state.processing_unique_pending_id;
+        let proof_artifact_name = format!(
+            "Realm root proof realm={:?} checkpoint={} proc_checkpoint_unique_id={} job_id={root_job_id:?} unique_pending_id={unique_pending_id}",
+            self.db.state.realm_identifier,
+            self.db.state.processing_checkpoint_id,
+            self.db.state.processing_proc_checkpoint_unique_id,
+        );
+        let root_job_proof = wait_for_persisted_artifact(
+            &proof_artifact_name,
+            self.proof_worker_queue_max_time_ms,
+            Duration::from_millis(50),
+            || {
+                self.db
+                    .proof_store
+                    .get_proof_bytes_by_job_id(root_job_id, unique_pending_id)
+            },
+        )
+        .await?;
         timer.lap("get_root_job_proof");
 
         // 6. Get Rewards Root
-        let rewards_root = self
-            .db
-            .get_reward_tree_root(
-                self.db.state.processing_checkpoint_id,
-                self.db.state.processing_unique_pending_id,
-                root_job_id,
-            )
-            .await?;
+        let reward_artifact_name = format!(
+            "Realm root reward realm={:?} checkpoint={} proc_checkpoint_unique_id={} job_id={root_job_id:?} unique_pending_id={unique_pending_id}",
+            self.db.state.realm_identifier,
+            self.db.state.processing_checkpoint_id,
+            self.db.state.processing_proc_checkpoint_unique_id,
+        );
+        let rewards_root = wait_for_persisted_artifact(
+            &reward_artifact_name,
+            self.proof_worker_queue_max_time_ms,
+            Duration::from_millis(50),
+            || {
+                self.db.get_reward_tree_root_or_none(
+                    self.db.state.processing_checkpoint_id,
+                    unique_pending_id,
+                    root_job_id,
+                )
+            },
+        )
+        .await?;
+        tracing::info!(
+            realm_id = self.db.state.realm_id_u64,
+            realm_sub_id = self.db.state.realm_sub_id_u64,
+            checkpoint_id = self.db.state.processing_checkpoint_id,
+            unique_pending_id,
+            proc_checkpoint_unique_id = self.db.state.processing_proc_checkpoint_unique_id,
+            root_job_id = ?root_job_id,
+            proof_store_ready = true,
+            "Realm root proof and reward artifacts are ready"
+        );
 
         let submission_header = GlobalUserTreeAggregatorHeaderWithTagValueAndJobType {
             header: GlobalUserTreeAggregatorHeaderWithTagValue {

@@ -81,7 +81,7 @@ where
                     }
                     Err(e) => {
                         let error = format!("realm process_block failed at slot {}: {:#}", current_slot, e);
-                        processor.db.status.set_error(error.clone());
+                        processor.db.status.require_recovery(error.clone());
                         tracing::error!("[REALM] Fatal error processing block: {:?}, took {}ms at slot {}; processor parked in Error state until manually restarted", e, duration_ms, current_slot);
                         print_cf_log_indicator("PSY_REALM_PROCESSOR_ERROR", &format!("R{}_{}", realm_id, realm_sub_id));
                     }
