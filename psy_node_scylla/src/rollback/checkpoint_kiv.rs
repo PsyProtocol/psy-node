@@ -12,7 +12,7 @@
 //! use psy_node_scylla::rollback::CheckpointKivAdapter;
 //! ```
 
-use std::{error::Error, fmt};
+use std::{collections::BTreeSet, error::Error, fmt};
 
 use psy_node_core::store::{
     timestamp::DeleteFenceTimestampUs,
@@ -233,6 +233,7 @@ pub enum CheckpointKivPlanError {
         actual: CheckpointKivTable,
     },
     MixedWriteTimestamps { expected: i64, actual: i64 },
+    DuplicatePhysicalKey,
 }
 
 impl fmt::Display for CheckpointKivPlanError {
@@ -260,6 +261,9 @@ impl fmt::Display for CheckpointKivPlanError {
                 f,
                 "checkpoint KIV batch mixes sealed timestamps {expected} and {actual}"
             ),
+            Self::DuplicatePhysicalKey => {
+                write!(f, "checkpoint KIV batch contains a duplicate physical key")
+            }
         }
     }
 }
@@ -351,10 +355,12 @@ impl CheckpointKivPutBatch {
         sealed: &[SealedTimestampedPut],
     ) -> Result<Self, CheckpointKivPlanError> {
         let mut iter = sealed.iter();
-        let first = iter.next().ok_or(CheckpointKivPlanError::EmptyBatch)?;
-        let first = CheckpointKivPutBinding::try_from_sealed(first)?;
+        let first_sealed = iter.next().ok_or(CheckpointKivPlanError::EmptyBatch)?;
+        let first = CheckpointKivPutBinding::try_from_sealed(first_sealed)?;
         let table = first.table;
         let write_timestamp_us = first.write_timestamp_us;
+        let mut locators = BTreeSet::new();
+        locators.insert(first_sealed.resolved().locator_bytes().to_vec());
         let mut members = Vec::with_capacity(sealed.len());
         members.push(first);
         for sealed in iter {
@@ -370,6 +376,9 @@ impl CheckpointKivPutBatch {
                     expected: write_timestamp_us,
                     actual: binding.write_timestamp_us,
                 });
+            }
+            if !locators.insert(sealed.resolved().locator_bytes().to_vec()) {
+                return Err(CheckpointKivPlanError::DuplicatePhysicalKey);
             }
             members.push(binding);
         }

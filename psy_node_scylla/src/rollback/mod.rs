@@ -1,11 +1,13 @@
 //! Typed Scylla identities, primary keys, mutations, and rollback metadata.
 //!
 //! D-02a remains the registry baseline. G0-06 provides representative fence
-//! adapters and D-02T1 adds the closed checkpoint-keyed KIV family, but neither
-//! is connected to production setup or current writers yet.
+//! adapters, D-02T1 adds the closed checkpoint-keyed KIV family, and D-02T2
+//! adds the closed checkpoint-clustering Merkle family. None is connected to
+//! production setup or current writers yet.
 
 mod canonical_head_prototype;
 mod checkpoint_kiv;
+mod checkpoint_merkle;
 mod rollback_admission;
 mod identity;
 mod key;
@@ -21,6 +23,7 @@ mod registry;
 
 pub use canonical_head_prototype::*;
 pub use checkpoint_kiv::*;
+pub use checkpoint_merkle::*;
 pub use rollback_admission::*;
 pub use identity::*;
 pub use key::*;

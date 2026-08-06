@@ -201,6 +201,12 @@ fn empty_mixed_table_and_mixed_timestamp_batches_fail_closed() {
             actual: 11,
         })
     );
+
+    let duplicate = sealed(CheckpointKivTable::CheckpointLeaf, 1, &[1], 10);
+    assert_eq!(
+        CheckpointKivPutBatch::try_from_sealed(&[duplicate.clone(), duplicate]),
+        Err(CheckpointKivPlanError::DuplicatePhysicalKey)
+    );
 }
 
 #[test]
