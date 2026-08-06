@@ -6,8 +6,8 @@
 //! rollback-ready checkpoint-clustering object-single tables. D-02T4 adds the
 //! active checkpoint-root bidirectional mapping. D-02T5 adds the key-only
 //! public-key projection and its non-key birth metadata. D-02T6 coordinates
-//! IMT leaf/index/cursor plans. None is connected to production setup or
-//! current writers yet.
+//! IMT leaf/index/cursor plans. D-02T7 adds target-restored mutable singleton
+//! plans. None is connected to production setup or current writers yet.
 
 mod canonical_head_prototype;
 mod checkpoint_kiv;
@@ -20,6 +20,7 @@ mod rollback_admission;
 mod identity;
 mod key;
 mod mutation;
+mod mutable_singleton;
 mod confinement;
 mod namespace;
 mod namespace_prototype;
@@ -40,6 +41,7 @@ pub use rollback_admission::*;
 pub use identity::*;
 pub use key::*;
 pub use mutation::*;
+pub use mutable_singleton::*;
 pub use confinement::*;
 pub use namespace::*;
 pub use namespace_prototype::*;

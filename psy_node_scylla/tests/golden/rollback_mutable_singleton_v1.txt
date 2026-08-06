@@ -1,0 +1,6 @@
+LatestInfoPut
+INSERT INTO psy_d02t7.latest_info_table (obj_id, value) VALUES (?, ?) USING TIMESTAMP ?
+obj_id:BIGINT,value:BLOB,write_timestamp_us:BIGINT
+LatestCheckpointPut
+INSERT INTO psy_d02t7.u64_singleton_table (obj_id, value) VALUES (?, ?) USING TIMESTAMP ?
+obj_id:BIGINT,value:BIGINT,write_timestamp_us:BIGINT
