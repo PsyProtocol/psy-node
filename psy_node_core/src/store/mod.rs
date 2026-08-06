@@ -6,6 +6,7 @@ pub mod manifest_lifecycle;
 pub mod manifest_record;
 pub mod normal_commit;
 pub mod proof_namespace;
+pub mod realm_proof_binding;
 pub mod rollback_admin;
 pub mod rollback_admission;
 pub mod rollback_control;
