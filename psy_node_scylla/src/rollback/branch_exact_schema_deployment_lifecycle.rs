@@ -1,8 +1,8 @@
 //! Isolated durable lifecycle for branch-exact schema deployment.
 //!
 //! The lifecycle persists one canonical payload behind an exact LWT revision.
-//! It deliberately stops at `SchemaVerified`: no value in this module grants
-//! backfill, reader/writer cutover, or production activation.
+//! It authorizes a typed, resumable backfill after `SchemaVerified`, but no
+//! value in this module grants reader/writer cutover or production activation.
 
 use std::{error::Error, fmt, sync::Arc};
 
@@ -16,9 +16,15 @@ use sha2::{Digest, Sha256};
 use psy_node_core::store::branch_exact_schema::AuthorityScope;
 
 use super::{
+    BranchExactBackfillError, BranchExactBackfillPlan,
+    BranchExactBackfillProgress, BranchExactBackfillVerifiedReceipt,
     BranchExactDeploymentError, BranchExactDeploymentIntent,
     BranchExactVerifiedDeploymentReceipt, CqlKeyspaceName,
-    InvalidCqlKeyspaceName,
+    InvalidCqlKeyspaceName, SealedBranchExactBackfillChunkCas,
+    SealedBranchExactBackfillPlanCas,
+    SealedBranchExactBackfillVerifiedCas,
+    BACKFILL_PLANNED_PAYLOAD_KIND, BACKFILL_PROGRESS_PAYLOAD_KIND,
+    BACKFILL_VERIFIED_PAYLOAD_KIND,
 };
 
 pub const BRANCH_EXACT_DEPLOYMENT_LIFECYCLE_TABLE: &str =
@@ -59,7 +65,7 @@ impl BranchExactDeploymentRevision {
         self.0 as i64
     }
 
-    fn next(self) -> Result<Self, BranchExactDeploymentLifecycleError> {
+    pub(crate) fn next(self) -> Result<Self, BranchExactDeploymentLifecycleError> {
         Self::try_new(self.0 + 1)
     }
 }
@@ -104,12 +110,18 @@ impl BranchExactDeploymentSlotId {
 pub enum BranchExactDeploymentLifecyclePhase {
     Intent,
     SchemaVerified,
+    BackfillPlanned,
+    BackfillProgress,
+    BackfillVerified,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BranchExactDeploymentLifecycleState {
     Intent(BranchExactDeploymentIntent),
     SchemaVerified(BranchExactVerifiedDeploymentReceipt),
+    BackfillPlanned(BranchExactBackfillPlan),
+    BackfillProgress(BranchExactBackfillProgress),
+    BackfillVerified(BranchExactBackfillVerifiedReceipt),
 }
 
 impl BranchExactDeploymentLifecycleState {
@@ -119,6 +131,15 @@ impl BranchExactDeploymentLifecycleState {
             Self::SchemaVerified(_) => {
                 BranchExactDeploymentLifecyclePhase::SchemaVerified
             }
+            Self::BackfillPlanned(_) => {
+                BranchExactDeploymentLifecyclePhase::BackfillPlanned
+            }
+            Self::BackfillProgress(_) => {
+                BranchExactDeploymentLifecyclePhase::BackfillProgress
+            }
+            Self::BackfillVerified(_) => {
+                BranchExactDeploymentLifecyclePhase::BackfillVerified
+            }
         }
     }
 
@@ -126,6 +147,13 @@ impl BranchExactDeploymentLifecycleState {
         match self {
             Self::Intent(intent) => intent,
             Self::SchemaVerified(receipt) => receipt.intent(),
+            Self::BackfillPlanned(plan) => plan.deployment().intent(),
+            Self::BackfillProgress(progress) => {
+                progress.plan().deployment().intent()
+            }
+            Self::BackfillVerified(receipt) => {
+                receipt.plan().deployment().intent()
+            }
         }
     }
 
@@ -133,6 +161,9 @@ impl BranchExactDeploymentLifecycleState {
         match self {
             Self::Intent(intent) => intent.to_canonical_bytes(),
             Self::SchemaVerified(receipt) => receipt.to_canonical_bytes(),
+            Self::BackfillPlanned(plan) => plan.to_canonical_bytes(),
+            Self::BackfillProgress(progress) => progress.to_canonical_bytes(),
+            Self::BackfillVerified(receipt) => receipt.to_canonical_bytes(),
         }
     }
 
@@ -148,6 +179,15 @@ impl BranchExactDeploymentLifecycleState {
             )),
             VERIFIED_PAYLOAD_KIND => Ok(Self::SchemaVerified(
                 BranchExactVerifiedDeploymentReceipt::decode_persisted(bytes)?,
+            )),
+            BACKFILL_PLANNED_PAYLOAD_KIND => Ok(Self::BackfillPlanned(
+                BranchExactBackfillPlan::decode_persisted(bytes)?,
+            )),
+            BACKFILL_PROGRESS_PAYLOAD_KIND => Ok(Self::BackfillProgress(
+                BranchExactBackfillProgress::decode_persisted(bytes)?,
+            )),
+            BACKFILL_VERIFIED_PAYLOAD_KIND => Ok(Self::BackfillVerified(
+                BranchExactBackfillVerifiedReceipt::decode_persisted(bytes)?,
             )),
             value => Err(BranchExactDeploymentLifecycleError::UnknownLifecycleKind(
                 value,
@@ -165,13 +205,32 @@ pub struct StoredBranchExactDeploymentLifecycle {
 }
 
 impl StoredBranchExactDeploymentLifecycle {
-    fn try_new(
+    pub(crate) fn try_new(
         revision: BranchExactDeploymentRevision,
         state: BranchExactDeploymentLifecycleState,
     ) -> Result<Self, BranchExactDeploymentLifecycleError> {
         let expected_revision = match state.phase() {
             BranchExactDeploymentLifecyclePhase::Intent => 0,
             BranchExactDeploymentLifecyclePhase::SchemaVerified => 1,
+            BranchExactDeploymentLifecyclePhase::BackfillPlanned => 2,
+            BranchExactDeploymentLifecyclePhase::BackfillProgress => {
+                let BranchExactDeploymentLifecycleState::BackfillProgress(
+                    progress,
+                ) = &state
+                else {
+                    unreachable!()
+                };
+                2_u64 + u64::from(progress.next_chunk_index())
+            }
+            BranchExactDeploymentLifecyclePhase::BackfillVerified => {
+                let BranchExactDeploymentLifecycleState::BackfillVerified(
+                    receipt,
+                ) = &state
+                else {
+                    unreachable!()
+                };
+                3_u64 + u64::from(receipt.plan().total_chunks())
+            }
         };
         if revision.get() != expected_revision {
             return Err(BranchExactDeploymentLifecycleError::PhaseRevisionMismatch {
@@ -298,6 +357,7 @@ impl SealedBranchExactSchemaVerifiedCas {
         &self.candidate
     }
 
+    #[cfg(test)]
     fn classify_lwt_observation(
         &self,
         applied: bool,
@@ -574,12 +634,24 @@ pub struct BranchExactDeploymentLifecycleCasBinding {
 
 impl BranchExactDeploymentLifecycleCasBinding {
     pub fn from_sealed(sealed: &SealedBranchExactSchemaVerifiedCas) -> Self {
+        Self::from_parts(
+            sealed.slot(),
+            sealed.expected(),
+            sealed.candidate(),
+        )
+    }
+
+    fn from_parts(
+        slot: BranchExactDeploymentSlotId,
+        expected: &StoredBranchExactDeploymentLifecycle,
+        candidate: &StoredBranchExactDeploymentLifecycle,
+    ) -> Self {
         Self {
-            candidate_revision: sealed.candidate().revision().as_i64(),
-            candidate_lifecycle: sealed.candidate().payload().to_vec(),
-            deployment_slot: sealed.slot().as_bytes().to_vec(),
-            expected_revision: sealed.expected().revision().as_i64(),
-            expected_lifecycle: sealed.expected().payload().to_vec(),
+            candidate_revision: candidate.revision().as_i64(),
+            candidate_lifecycle: candidate.payload().to_vec(),
+            deployment_slot: slot.as_bytes().to_vec(),
+            expected_revision: expected.revision().as_i64(),
+            expected_lifecycle: expected.payload().to_vec(),
         }
     }
 
@@ -750,19 +822,76 @@ impl ScyllaBranchExactDeploymentLifecycleStore {
         &self,
         sealed: &SealedBranchExactSchemaVerifiedCas,
     ) -> Result<BranchExactDeploymentLifecycleWriteOutcome, BranchExactDeploymentLifecycleError> {
+        self.execute_transition(
+            "mark_schema_verified",
+            sealed.slot(),
+            sealed.expected(),
+            sealed.candidate(),
+        )
+        .await
+    }
+
+    pub async fn plan_backfill(
+        &self,
+        sealed: &SealedBranchExactBackfillPlanCas,
+    ) -> Result<BranchExactDeploymentLifecycleWriteOutcome, BranchExactDeploymentLifecycleError> {
+        self.execute_transition(
+            "plan_backfill",
+            sealed.slot(),
+            sealed.expected(),
+            sealed.candidate(),
+        )
+        .await
+    }
+
+    pub async fn record_backfill_chunk(
+        &self,
+        sealed: &SealedBranchExactBackfillChunkCas,
+    ) -> Result<BranchExactDeploymentLifecycleWriteOutcome, BranchExactDeploymentLifecycleError> {
+        self.execute_transition(
+            "record_backfill_chunk",
+            sealed.slot(),
+            sealed.expected(),
+            sealed.candidate(),
+        )
+        .await
+    }
+
+    pub async fn mark_backfill_verified(
+        &self,
+        sealed: &SealedBranchExactBackfillVerifiedCas,
+    ) -> Result<BranchExactDeploymentLifecycleWriteOutcome, BranchExactDeploymentLifecycleError> {
+        self.execute_transition(
+            "mark_backfill_verified",
+            sealed.slot(),
+            sealed.expected(),
+            sealed.candidate(),
+        )
+        .await
+    }
+
+    async fn execute_transition(
+        &self,
+        operation: &'static str,
+        slot: BranchExactDeploymentSlotId,
+        expected: &StoredBranchExactDeploymentLifecycle,
+        candidate: &StoredBranchExactDeploymentLifecycle,
+    ) -> Result<BranchExactDeploymentLifecycleWriteOutcome, BranchExactDeploymentLifecycleError> {
         let execution = self
             .session
             .execute_unpaged(
                 &self.compare_and_set,
-                BranchExactDeploymentLifecycleCasBinding::from_sealed(sealed),
+                BranchExactDeploymentLifecycleCasBinding::from_parts(
+                    slot, expected, candidate,
+                ),
             )
             .await;
         self.finish_write(
-            "mark_schema_verified",
+            operation,
             execution,
-            sealed.slot(),
-            sealed.candidate(),
-            |applied, current| sealed.classify_lwt_observation(applied, current),
+            slot,
+            candidate,
+            |applied, current| classify_write(applied, candidate, current),
         )
         .await
     }
@@ -889,6 +1018,7 @@ pub enum BranchExactDeploymentLifecycleError {
     InvalidKeyspace(InvalidCqlKeyspaceName),
     InvalidNoTabletKeyspace(InvalidBranchExactDeploymentNoTabletKeyspace),
     DeploymentCodec(BranchExactDeploymentError),
+    BackfillCodec(BranchExactBackfillError),
     RevisionOutOfRange,
     NegativeRevision(i64),
     MalformedDeploymentSlot,
@@ -931,6 +1061,12 @@ impl From<InvalidCqlKeyspaceName> for BranchExactDeploymentLifecycleError {
 impl From<BranchExactDeploymentError> for BranchExactDeploymentLifecycleError {
     fn from(value: BranchExactDeploymentError) -> Self {
         Self::DeploymentCodec(value)
+    }
+}
+
+impl From<BranchExactBackfillError> for BranchExactDeploymentLifecycleError {
+    fn from(value: BranchExactBackfillError) -> Self {
+        Self::BackfillCodec(value)
     }
 }
 

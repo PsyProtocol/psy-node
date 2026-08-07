@@ -168,7 +168,11 @@ impl AuthorityManifestDigest {
         &self.0
     }
 
-    pub(crate) const fn from_persisted(bytes: [u8; 32]) -> Self {
+    /// Rehydrates a digest that has already been verified by the manifest
+    /// codec/read path. This does not assert that an arbitrary byte array is a
+    /// VERIFIED manifest; callers must obtain it from durable manifest
+    /// evidence before constructing a post-genesis deployment plan.
+    pub const fn from_persisted(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
 
