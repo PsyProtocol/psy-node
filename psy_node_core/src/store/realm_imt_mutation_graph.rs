@@ -9,7 +9,7 @@
 use std::{collections::{BTreeMap, BTreeSet}, error::Error, fmt, marker::PhantomData};
 
 use parth_core::{
-    crypto::hash::traits::{FieldQHasher, MerkleHasher, QFieldHashable},
+    crypto::hash::traits::{FieldQHasher, MerkleHasher, MerkleZeroHasher, QFieldHashable},
     data::hash::{
         fast_node_serializer::{QMS_FAST_SERIALIZER_DOUBLE_ID_NODE_SIZE, QMS_FAST_SERIALIZER_SINGLE_ID_NODE_SIZE},
         merkle_node_key::{SimpleMerkleNode, PSY_OBJECT_FFS_SIZE_SIMPLE_MERKLE_NODE},
@@ -99,6 +99,65 @@ impl RealmImtBaselineNodeKey {
             }
         }
     }
+}
+
+/// One typed physical read at the predecessor authority-state checkpoint.
+///
+/// `tree_height` is part of the request because a missing physical row means
+/// the zero hash at that node's remaining depth. The Scylla adapter returns
+/// `None`; only the graph plan that owns this height can materialize the zero.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RealmImtPredecessorReadRequest {
+    key: RealmImtBaselineNodeKey,
+    tree_height: u8,
+}
+
+impl RealmImtPredecessorReadRequest {
+    pub fn try_new(
+        key: RealmImtBaselineNodeKey,
+        tree_height: u8,
+    ) -> Result<Self, RealmImtMutationGraphError> {
+        if tree_height == 0 || tree_height >= 64 || key_level(key) > tree_height {
+            return Err(RealmImtMutationGraphError::InvalidPredecessorReadHeight {
+                key,
+                tree_height,
+            });
+        }
+        validate_position(key_level(key), key_index(key), tree_height)?;
+        Ok(Self { key, tree_height })
+    }
+
+    pub const fn key(self) -> RealmImtBaselineNodeKey { self.key }
+    pub const fn tree_height(self) -> u8 { self.tree_height }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RealmImtPredecessorReadPlan {
+    checkpoint: AuthorityStateCheckpointId,
+    requests: Vec<RealmImtPredecessorReadRequest>,
+}
+
+impl RealmImtPredecessorReadPlan {
+    pub const fn checkpoint(&self) -> AuthorityStateCheckpointId { self.checkpoint }
+    pub fn requests(&self) -> &[RealmImtPredecessorReadRequest] { &self.requests }
+}
+
+/// Raw database outcome for one request. `None` is a legitimate absent row,
+/// not a missing response; it is converted to the correct zero hash by the
+/// owning graph plan.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RealmImtPredecessorReadRow<Hash> {
+    request: RealmImtPredecessorReadRequest,
+    value: Option<Hash>,
+}
+
+impl<Hash> RealmImtPredecessorReadRow<Hash> {
+    pub const fn new(request: RealmImtPredecessorReadRequest, value: Option<Hash>) -> Self {
+        Self { request, value }
+    }
+
+    pub const fn request(&self) -> RealmImtPredecessorReadRequest { self.request }
+    pub const fn value(&self) -> Option<&Hash> { self.value.as_ref() }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -257,6 +316,64 @@ impl<Hash: Q256BitHash, Hasher: MerkleHasher<Hash>> RealmImtMutationGraphPlan<Ha
 
     pub fn baseline_requests(&self) -> &[RealmImtBaselineNodeKey] { &self.baseline_requests }
     pub const fn counts(&self) -> RealmImtMutationGraphCounts { self.counts }
+
+    pub fn predecessor_read_plan(&self) -> RealmImtPredecessorReadPlan {
+        let requests = self
+            .baseline_requests
+            .iter()
+            .copied()
+            .map(|key| RealmImtPredecessorReadRequest {
+                tree_height: match key {
+                    RealmImtBaselineNodeKey::GlobalUser { .. } => self.config.global_user_tree_height,
+                    RealmImtBaselineNodeKey::UserContract { .. } => self.config.user_contract_tree_height,
+                    RealmImtBaselineNodeKey::ContractState { user_id, contract_id, .. } => {
+                        self.contract_heights[&(user_id, contract_id)]
+                    }
+                },
+                key,
+            })
+            .collect();
+        RealmImtPredecessorReadPlan { checkpoint: self.predecessor_checkpoint, requests }
+    }
+
+    /// Resolve raw predecessor rows, materialize absent rows as typed zero
+    /// hashes, then run the same full graph verification as explicit hash
+    /// observations.
+    pub fn verify_predecessor_rows_and_seal(
+        &self,
+        rows: &[RealmImtPredecessorReadRow<Hash>],
+    ) -> Result<SealedRealmImtMutationGraph<Hash, Hasher>, RealmImtMutationGraphError>
+    where
+        Hasher: MerkleZeroHasher<Hash>,
+    {
+        let expected_plan = self.predecessor_read_plan();
+        let expected = expected_plan.requests.iter().copied().collect::<BTreeSet<_>>();
+        let mut actual = BTreeMap::new();
+        for row in rows {
+            if actual.insert(row.request, row.value).is_some() {
+                return Err(RealmImtMutationGraphError::DuplicatePredecessorReadRow(row.request));
+            }
+        }
+        let actual_keys = actual.keys().copied().collect::<BTreeSet<_>>();
+        if expected != actual_keys {
+            return Err(RealmImtMutationGraphError::PredecessorReadCoverageMismatch {
+                missing: expected.difference(&actual_keys).next().copied(),
+                unexpected: actual_keys.difference(&expected).next().copied(),
+            });
+        }
+
+        let observations = expected_plan
+            .requests
+            .iter()
+            .map(|request| {
+                let value = actual[request].unwrap_or_else(|| {
+                    Hasher::get_zero_hash(usize::from(request.tree_height - key_level(request.key)))
+                });
+                (request.key, value)
+            })
+            .collect::<Vec<_>>();
+        self.verify_and_seal(&observations)
+    }
 
     pub fn verify_and_seal(
         &self,
@@ -686,6 +803,14 @@ fn key_level(key: RealmImtBaselineNodeKey) -> u8 {
     }
 }
 
+fn key_index(key: RealmImtBaselineNodeKey) -> u64 {
+    match key {
+        RealmImtBaselineNodeKey::GlobalUser { index, .. }
+        | RealmImtBaselineNodeKey::UserContract { index, .. }
+        | RealmImtBaselineNodeKey::ContractState { index, .. } => index,
+    }
+}
+
 fn left_child(key: RealmImtBaselineNodeKey) -> RealmImtBaselineNodeKey {
     match key {
         RealmImtBaselineNodeKey::GlobalUser { level, index } => RealmImtBaselineNodeKey::GlobalUser { level: level + 1, index: index << 1 },
@@ -744,6 +869,7 @@ pub enum RealmImtMutationGraphError {
     MerklePositionOutOfRange { level: u8, index: u64, height: u8 },
     ContractHeightMissing(u64),
     InvalidContractHeight { contract_id: u64, height: u8 },
+    InvalidPredecessorReadHeight { key: RealmImtBaselineNodeKey, tree_height: u8 },
     DuplicateMerkleMutation(RealmImtBaselineNodeKey),
     DuplicateUserLeaf(u64),
     ImtLeafHashMismatch { tree_id: u64, contract_id: u64, leaf_index: u64 },
@@ -760,6 +886,11 @@ pub enum RealmImtMutationGraphError {
     MutationPathNotClosed(RealmImtBaselineNodeKey),
     DuplicateBaselineObservation(RealmImtBaselineNodeKey),
     BaselineCoverageMismatch { missing: Option<RealmImtBaselineNodeKey>, unexpected: Option<RealmImtBaselineNodeKey> },
+    DuplicatePredecessorReadRow(RealmImtPredecessorReadRequest),
+    PredecessorReadCoverageMismatch {
+        missing: Option<RealmImtPredecessorReadRequest>,
+        unexpected: Option<RealmImtPredecessorReadRequest>,
+    },
     PredecessorRealmRootMismatch,
     MerkleParentMismatch(RealmImtBaselineNodeKey),
     PreparedSerializationFailed,

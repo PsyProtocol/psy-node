@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use parth_core::{
     PHash, PF, QCoreProcCheckpointUniqueId,
-    crypto::hash::traits::{MerkleHasher, QFieldHashable},
+    crypto::hash::traits::{MerkleHasher, MerkleZeroHasher, QFieldHashable},
     data::hash::{
         merkle_node_key::SimpleMerkleNode,
         merkle_store_key::{
@@ -25,6 +25,7 @@ use psy_data::{
 use psy_node_core::store::realm_imt_mutation_graph::{
     RealmImtBaselineNodeKey, RealmImtMutationGraphConfig,
     RealmImtMutationGraphError, RealmImtMutationGraphPlan,
+    RealmImtPredecessorReadRow,
 };
 use psy_serialize::FastFixedSerializable;
 
@@ -133,6 +134,7 @@ fn valid_fixture() -> Fixture {
     let imt_hash = imt_preimage.qfhash::<PoseidonHasher>();
 
     let mut cst_old_leaves = (0..(1u8 << CST_HEIGHT)).map(|i| hash(20 + i)).collect::<Vec<_>>();
+    cst_old_leaves[2] = PoseidonHasher::get_zero_hash(0);
     let cst_old = levels(cst_old_leaves.clone(), CST_HEIGHT);
     cst_old_leaves[IMT_INDEX as usize] = imt_hash;
     let cst_new = levels(cst_old_leaves, CST_HEIGHT);
@@ -321,6 +323,47 @@ fn baseline_observations_require_exact_typed_coverage() {
     assert_eq!(
         plan.verify_and_seal(&duplicate).unwrap_err(),
         RealmImtMutationGraphError::DuplicateBaselineObservation(duplicate[0].0),
+    );
+}
+
+#[test]
+fn typed_predecessor_rows_bind_checkpoint_and_materialize_absent_zero_nodes() {
+    let fixture = valid_fixture();
+    let plan = fixture.plan().unwrap();
+    let read_plan = plan.predecessor_read_plan();
+    assert_eq!(read_plan.checkpoint(), AuthorityStateCheckpointId::new(40));
+    assert_eq!(read_plan.requests().len(), plan.baseline_requests().len());
+
+    let zero = PoseidonHasher::get_zero_hash(0);
+    let rows = read_plan
+        .requests()
+        .iter()
+        .copied()
+        .map(|request| {
+            let value = fixture.baseline[&request.key()];
+            RealmImtPredecessorReadRow::new(request, (value != zero).then_some(value))
+        })
+        .collect::<Vec<_>>();
+    assert!(rows.iter().any(|row| row.value().is_none()));
+
+    let from_rows = plan.verify_predecessor_rows_and_seal(&rows).unwrap();
+    let explicit = plan.verify_and_seal(&fixture.observations(&plan)).unwrap();
+    assert_eq!(from_rows.digest(), explicit.digest());
+
+    let missing = rows[0].request();
+    assert_eq!(
+        plan.verify_predecessor_rows_and_seal(&rows[1..]).unwrap_err(),
+        RealmImtMutationGraphError::PredecessorReadCoverageMismatch {
+            missing: Some(missing),
+            unexpected: None,
+        },
+    );
+
+    let mut duplicate = rows;
+    duplicate.push(duplicate[0]);
+    assert_eq!(
+        plan.verify_predecessor_rows_and_seal(&duplicate).unwrap_err(),
+        RealmImtMutationGraphError::DuplicatePredecessorReadRow(duplicate[0].request()),
     );
 }
 

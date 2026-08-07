@@ -1,0 +1,9 @@
+GlobalUser
+SELECT value FROM psy_state.global_user_tree_table WHERE level = ? AND node_index = ? AND checkpoint_id <= ? LIMIT 1
+level:TINYINT,node_index:BIGINT,predecessor_checkpoint:BIGINT
+UserContract
+SELECT value FROM psy_state.user_contract_tree_table WHERE tree_id = ? AND level = ? AND node_index = ? AND checkpoint_id <= ? LIMIT 1
+tree_id:BIGINT,level:TINYINT,node_index:BIGINT,predecessor_checkpoint:BIGINT
+ContractState
+SELECT value FROM psy_state.contract_state_tree_table WHERE tree_id = ? AND tree_sub_id = ? AND level = ? AND node_index = ? AND checkpoint_id <= ? LIMIT 1
+tree_id:BIGINT,tree_sub_id:BIGINT,level:TINYINT,node_index:BIGINT,predecessor_checkpoint:BIGINT

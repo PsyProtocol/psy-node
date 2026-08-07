@@ -61,6 +61,7 @@ pub const RAW_SCYLLA_ACCESS_ALLOWLIST: &[RawScyllaAccessAllowance] = &[
     allow!("psy_node_scylla/src/rollback/checkpoint_object_single.rs", RollbackPrototypeAdapter),
     allow!("psy_node_scylla/src/rollback/checkpoint_root_pair.rs", RollbackPrototypeAdapter),
     allow!("psy_node_scylla/src/rollback/public_key_projection.rs", RollbackPrototypeAdapter),
+    allow!("psy_node_scylla/src/rollback/realm_imt_predecessor.rs", RollbackPrototypeAdapter),
     allow!("psy_node_scylla/src/rollback/imt_family.rs", RollbackPrototypeAdapter),
     allow!("psy_node_scylla/src/rollback/manifest_prepared.rs", DurableControlAuthority),
     allow!("psy_node_scylla/src/rollback/mutable_singleton.rs", RollbackPrototypeAdapter),
