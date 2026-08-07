@@ -30,6 +30,8 @@ use psy_data::{
 use psy_serialize::{FastFixedSerializable, PsyCanonicalDatabaseSerializeBaseSingle};
 use sha2::{Digest, Sha256};
 
+use super::realm_prepared_payload::RealmPreparedPayloadCommitment;
+
 const PREPARED_GRAPH_DOMAIN: &[u8] = b"psy.rollback.realm-imt-mutation-graph.v1\0";
 const PREPARED_PAYLOAD_DOMAIN: &[u8] = b"psy.rollback.realm-imt-prepared-payload.v1\0";
 const BASELINE_OBSERVATION_DOMAIN: &[u8] = b"psy.rollback.realm-imt-baseline-observation.v1\0";
@@ -165,6 +167,8 @@ pub struct RealmImtMutationGraphDigest([u8; 32]);
 
 impl RealmImtMutationGraphDigest {
     pub const fn as_bytes(self) -> [u8; 32] { self.0 }
+
+    pub(crate) const fn from_bytes(bytes: [u8; 32]) -> Self { Self(bytes) }
 }
 
 #[derive(Clone, Debug)]
@@ -175,9 +179,11 @@ pub struct SealedRealmImtMutationGraph<Hash, Hasher> {
     old_realm_root: Hash,
     new_realm_root: Hash,
     prepared_payload_digest: [u8; 32],
+    prepared_payload_commitment: RealmPreparedPayloadCommitment,
     baseline_observation_digest: [u8; 32],
     digest: RealmImtMutationGraphDigest,
     counts: RealmImtMutationGraphCounts,
+    config: RealmImtMutationGraphConfig,
     _hasher: PhantomData<Hasher>,
 }
 
@@ -188,9 +194,11 @@ impl<Hash, Hasher> SealedRealmImtMutationGraph<Hash, Hasher> {
     pub const fn old_realm_root(&self) -> &Hash { &self.old_realm_root }
     pub const fn new_realm_root(&self) -> &Hash { &self.new_realm_root }
     pub const fn prepared_payload_digest(&self) -> &[u8; 32] { &self.prepared_payload_digest }
+    pub const fn prepared_payload_commitment(&self) -> RealmPreparedPayloadCommitment { self.prepared_payload_commitment }
     pub const fn baseline_observation_digest(&self) -> &[u8; 32] { &self.baseline_observation_digest }
     pub const fn digest(&self) -> RealmImtMutationGraphDigest { self.digest }
     pub const fn counts(&self) -> RealmImtMutationGraphCounts { self.counts }
+    pub const fn config(&self) -> RealmImtMutationGraphConfig { self.config }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -217,6 +225,7 @@ pub struct RealmImtMutationGraphPlan<Hash, Hasher> {
     contract_heights: BTreeMap<(u64, u64), u8>,
     baseline_requests: Vec<RealmImtBaselineNodeKey>,
     prepared_payload_digest: [u8; 32],
+    prepared_payload_commitment: RealmPreparedPayloadCommitment,
     counts: RealmImtMutationGraphCounts,
     _hasher: PhantomData<Hasher>,
 }
@@ -288,6 +297,8 @@ impl<Hash: Q256BitHash, Hasher: MerkleHasher<Hash>> RealmImtMutationGraphPlan<Ha
         let prepared_bytes = prepared.psy_ser_to_bytes_vec()
             .map_err(|_| RealmImtMutationGraphError::PreparedSerializationFailed)?;
         let prepared_payload_digest = digest(PREPARED_PAYLOAD_DOMAIN, &prepared_bytes);
+        let prepared_payload_commitment =
+            RealmPreparedPayloadCommitment::from_serialized(&prepared_bytes);
         let counts = RealmImtMutationGraphCounts {
             global_nodes: global_nodes.len(),
             user_contract_nodes: user_contract_nodes.len(),
@@ -309,6 +320,7 @@ impl<Hash: Q256BitHash, Hasher: MerkleHasher<Hash>> RealmImtMutationGraphPlan<Ha
             contract_heights,
             baseline_requests,
             prepared_payload_digest,
+            prepared_payload_commitment,
             counts,
             _hasher: PhantomData,
         })
@@ -447,9 +459,11 @@ impl<Hash: Q256BitHash, Hasher: MerkleHasher<Hash>> RealmImtMutationGraphPlan<Ha
             old_realm_root: self.old_realm_root,
             new_realm_root: self.new_realm_root,
             prepared_payload_digest: self.prepared_payload_digest,
+            prepared_payload_commitment: self.prepared_payload_commitment,
             baseline_observation_digest,
             digest,
             counts: self.counts,
+            config: self.config,
             _hasher: PhantomData,
         })
     }

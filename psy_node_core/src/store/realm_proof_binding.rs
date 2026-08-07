@@ -33,6 +33,8 @@ use psy_serialize::{
 };
 use sha2::{Digest, Sha256};
 
+use super::realm_prepared_payload::RealmPreparedPayloadCommitment;
+
 pub const REALM_PROOF_BINDING_MAGIC: [u8; 8] = *b"PSYRMPB1";
 pub const REALM_PROOF_BINDING_CODEC_VERSION: u16 = 1;
 
@@ -78,6 +80,10 @@ pub struct RealmProofBindingDigest([u8; 32]);
 impl RealmProofBindingDigest {
     pub const fn as_bytes(self) -> [u8; 32] {
         self.0
+    }
+
+    pub(crate) const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
     }
 }
 
@@ -285,6 +291,7 @@ impl<Hash: Q256BitHash> PersistedRealmProofBinding<Hash> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SealedRealmProofBinding<Hash> {
     record: PersistedRealmProofBinding<Hash>,
+    prepared_payload_commitment: RealmPreparedPayloadCommitment,
 }
 
 impl<Hash: Q256BitHash> SealedRealmProofBinding<Hash> {
@@ -427,6 +434,8 @@ impl<Hash: Q256BitHash> SealedRealmProofBinding<Hash> {
         let state_checkpoint = AuthorityStateCheckpointId::new(sync.checkpoint_id);
         let prepared_payload_digest =
             digest(PREPARED_DIGEST_DOMAIN, &prepared_bytes);
+        let prepared_payload_commitment =
+            RealmPreparedPayloadCommitment::from_serialized(&prepared_bytes);
         let submission_header_digest =
             digest(SUBMISSION_DIGEST_DOMAIN, &submission_bytes);
         let proof_bytes_digest = digest(PROOF_DIGEST_DOMAIN, proof_bytes);
@@ -490,6 +499,7 @@ impl<Hash: Q256BitHash> SealedRealmProofBinding<Hash> {
                 canonical_bytes,
                 digest: RealmProofBindingDigest(binding_digest),
             },
+            prepared_payload_commitment,
         })
     }
 
@@ -499,6 +509,12 @@ impl<Hash: Q256BitHash> SealedRealmProofBinding<Hash> {
 
     pub const fn digest(&self) -> RealmProofBindingDigest {
         self.record.digest
+    }
+
+    pub const fn prepared_payload_commitment(
+        &self,
+    ) -> RealmPreparedPayloadCommitment {
+        self.prepared_payload_commitment
     }
 
     pub fn encode_canonical(&self) -> &[u8] {
