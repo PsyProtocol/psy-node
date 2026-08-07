@@ -323,6 +323,39 @@ impl BranchExactLegacyExportReceipt {
     pub const fn proof_rows(&self) -> u64 {
         self.proof_rows
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_fixture(
+        dataset_digest: BranchExactBackfillDatasetDigest,
+        pair_rows: u64,
+        proof_rows: u64,
+    ) -> Self {
+        Self {
+            permit_digest: BranchExactLegacyExportPermitDigest([1; 32]),
+            catalog_digest: BranchExactCanonicalCatalogDigest([2; 32]),
+            source_digest: BranchExactLegacySourceDigest([3; 32]),
+            dataset_digest,
+            source_chunk_digests: vec![BranchExactSourceChunkDigest([4; 32])],
+            pair_rows,
+            proof_rows,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_fixture_for_permit<Hash: Q256BitHash>(
+        permit: &BranchExactFrozenLegacyExportPermit<Hash>,
+        dataset_digest: BranchExactBackfillDatasetDigest,
+        pair_rows: u64,
+        proof_rows: u64,
+    ) -> Self {
+        let mut receipt = Self::test_fixture(
+            dataset_digest,
+            pair_rows,
+            proof_rows,
+        );
+        receipt.permit_digest = permit.digest();
+        receipt
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

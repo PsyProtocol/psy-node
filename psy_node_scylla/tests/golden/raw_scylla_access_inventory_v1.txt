@@ -15,7 +15,7 @@ psy_node_scylla/examples/tst6.rs|Example|2|2|0|0|1|1|2|3
 psy_node_scylla/examples/tst6_nobucket.rs|Example|2|2|0|0|1|1|2|3
 psy_node_scylla/examples/tst7.rs|Example|2|2|0|0|1|1|2|3
 psy_node_scylla/examples/tst7_nobucket.rs|Example|2|2|0|0|1|1|2|3
-psy_node_scylla/src/core.rs|DriverCore|2|2|12|0|0|0|2|2
+psy_node_scylla/src/core.rs|DriverCore|2|2|13|0|0|0|2|2
 psy_node_scylla/src/core_db.rs|DriverCore|0|0|97|0|0|0|0|0
 psy_node_scylla/src/rollback/authority_local_head_prototype.rs|DurableControlAuthority|6|0|3|6|2|3|1|4
 psy_node_scylla/src/rollback/authority_timestamp_prototype.rs|DurableControlAuthority|6|0|4|6|2|4|1|6
@@ -24,8 +24,11 @@ psy_node_scylla/src/rollback/branch_exact_schema_deployment.rs|RollbackPrototype
 psy_node_scylla/src/rollback/branch_exact_schema_deployment_lifecycle.rs|RollbackPrototypeAdapter|6|0|3|6|2|3|1|4
 psy_node_scylla/src/rollback/branch_exact_schema_exporter.rs|RollbackPrototypeAdapter|7|0|0|7|4|3|0|4
 psy_node_scylla/src/rollback/branch_exact_schema_migration.rs|RollbackPrototypeAdapter|12|0|0|11|1|7|2|17
-psy_node_scylla/src/rollback/branch_exact_schema_setup.rs|RollbackPrototypeAdapter|4|0|0|5|1|0|0|0
+psy_node_scylla/src/rollback/branch_exact_schema_setup.rs|RollbackPrototypeAdapter|4|0|0|8|1|0|0|0
 psy_node_scylla/src/rollback/branch_exact_schema_setup_rf3_gate.rs|TestHarness|4|2|0|0|0|0|3|3
+psy_node_scylla/src/rollback/branch_exact_shadow_audit.rs|DurableControlAuthority|6|0|3|6|2|3|1|4
+psy_node_scylla/src/rollback/branch_exact_shadow_reader.rs|RollbackPrototypeAdapter|4|0|11|15|1|11|0|6
+psy_node_scylla/src/rollback/branch_exact_shadow_reader_rf3_gate.rs|TestHarness|6|2|0|0|0|0|18|18
 psy_node_scylla/src/rollback/canonical_head_prototype.rs|CanonicalHeadAuthority|7|0|3|6|2|3|1|6
 psy_node_scylla/src/rollback/checkpoint_kiv.rs|RollbackPrototypeAdapter|6|0|0|4|1|2|0|2
 psy_node_scylla/src/rollback/checkpoint_merkle.rs|RollbackPrototypeAdapter|7|0|0|5|1|9|0|9

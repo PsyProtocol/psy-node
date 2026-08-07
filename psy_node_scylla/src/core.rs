@@ -23,6 +23,7 @@ use crate::rollback::{
     BranchExactSchemaSetupOutcome,
     CanonicalHeadNoTabletKeyspace, ScyllaCanonicalHeadStore,
     ScyllaBranchExactSchemaSetupGate, ScyllaRollbackAdmissionStore,
+    ScyllaBranchExactShadowReader,
 };
 use crate::tables::{merkle::ScyllaMerkleNodesZeroPreparedStatements, traits::ScyllaStandardPreparedTableStatements};
 use crate::tables::traits::ScyllaNoTabletPreparedTableStatements;
@@ -263,6 +264,25 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
         self.branch_exact_schema_ready.get().map(Arc::as_ref).ok_or(
             BranchExactSchemaSetupError::LifecycleUninitialized,
         )
+    }
+
+    /// Explicit h21 tooling hook.  Opening a shadow reader requires the exact
+    /// h20 setup capability; it is never invoked by normal node setup.
+    pub async fn prepare_branch_exact_shadow_reader(
+        &self,
+    ) -> Result<ScyllaBranchExactShadowReader<Hash>, crate::rollback::BranchExactShadowReadError>
+    where
+        Hash: Q256BitHash,
+    {
+        let ready = self.require_branch_exact_schema_ready().map_err(|error| {
+            crate::rollback::BranchExactShadowReadError::Driver(error.to_string())
+        })?;
+        ScyllaBranchExactShadowReader::prepare_from_ready(
+            self.session.clone(),
+            &self.keyspace,
+            ready,
+        )
+        .await
     }
 
     fn coordinator_canonical_head(&self) -> anyhow::Result<&ScyllaCanonicalHeadStore> {

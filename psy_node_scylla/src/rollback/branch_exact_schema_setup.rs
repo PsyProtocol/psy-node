@@ -2,8 +2,9 @@
 //!
 //! This module only proves that one authority's target schema and durable
 //! backfill lifecycle are ready, then prepares read statements behind an
-//! opaque token. It does not expose a reader, writer, cutover, Session, or
-//! schema-creation capability.
+//! opaque token. Its prepared reads are available only to the explicit h21
+//! shadow adapter; the token does not expose a public writer, cutover,
+//! Session, or schema-creation capability.
 
 use std::{error::Error, fmt, sync::Arc};
 
@@ -94,6 +95,15 @@ impl BranchExactSchemaReadyDigest {
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
+
+    pub(crate) const fn from_persisted(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn test_fixture(byte: u8) -> Self {
+        Self([byte; 32])
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -152,18 +162,19 @@ impl BranchExactSchemaReadyView {
     }
 }
 
-#[allow(dead_code)]
 struct PreparedBranchExactSchemaSetup {
     forward_read: PreparedStatement,
     reverse_read: PreparedStatement,
     proof_read: Option<PreparedStatement>,
 }
 
-/// Opaque setup capability. Private fields and the absence of read/write
-/// methods prevent setup readiness from becoming serving authority.
+/// Opaque setup capability. Private fields and the absence of public
+/// read/write methods prevent setup readiness from becoming serving authority;
+/// crate-private access is restricted to the fail-closed h21 shadow adapter.
 pub struct BranchExactSchemaReady {
     view: BranchExactSchemaReadyView,
-    _prepared: PreparedBranchExactSchemaSetup,
+    expected_receipt: BranchExactBackfillVerifiedReceipt,
+    prepared: PreparedBranchExactSchemaSetup,
 }
 
 impl fmt::Debug for BranchExactSchemaReady {
@@ -178,6 +189,22 @@ impl fmt::Debug for BranchExactSchemaReady {
 impl BranchExactSchemaReady {
     pub const fn view(&self) -> &BranchExactSchemaReadyView {
         &self.view
+    }
+
+    pub(crate) const fn expected_receipt(
+        &self,
+    ) -> &BranchExactBackfillVerifiedReceipt {
+        &self.expected_receipt
+    }
+
+    pub(crate) fn prepared_reads(
+        &self,
+    ) -> (&PreparedStatement, &PreparedStatement, Option<&PreparedStatement>) {
+        (
+            &self.prepared.forward_read,
+            &self.prepared.reverse_read,
+            self.prepared.proof_read.as_ref(),
+        )
     }
 }
 
@@ -309,7 +336,8 @@ impl ScyllaBranchExactSchemaSetupGate {
         };
         Ok(BranchExactSchemaReady {
             view,
-            _prepared: prepared,
+            expected_receipt: receipt.clone(),
+            prepared,
         })
     }
 }

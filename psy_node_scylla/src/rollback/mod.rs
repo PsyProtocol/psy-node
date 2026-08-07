@@ -20,6 +20,10 @@ mod branch_exact_schema_backfill;
 mod branch_exact_schema_backfill_executor;
 mod branch_exact_schema_exporter;
 mod branch_exact_schema_setup;
+mod branch_exact_shadow_reader;
+mod branch_exact_shadow_audit;
+#[cfg(test)]
+mod branch_exact_shadow_reader_rf3_gate;
 #[cfg(test)]
 mod branch_exact_schema_setup_rf3_gate;
 mod authority_local_head_prototype;
@@ -68,6 +72,8 @@ pub use branch_exact_schema_backfill::*;
 pub use branch_exact_schema_backfill_executor::*;
 pub use branch_exact_schema_exporter::*;
 pub use branch_exact_schema_setup::*;
+pub use branch_exact_shadow_reader::*;
+pub use branch_exact_shadow_audit::*;
 pub use authority_local_head_prototype::*;
 pub use authority_timestamp_prototype::*;
 pub use checkpoint_kiv::*;
