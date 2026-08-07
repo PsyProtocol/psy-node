@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::Path,
@@ -9,14 +10,55 @@ use std::{
 
 use anyhow::{bail, ensure, Context};
 use futures::future::join_all;
-use parth_core::{protocol::core_types::Q256BitHash, PHash};
-use psy_data::protocol::{
-    canonical_chain::{
-        CanonicalChainRef, ChainEpoch, CheckpointHash, CheckpointId,
-        CheckpointRef, NetworkId,
+use parth_core::{
+    crypto::hash::{
+        merkle_proof::MerkleProofCore,
+        traits::{MerkleHasher, MerkleZeroHasher, QFieldHashable},
     },
-    chain_context::{
-        AuthorityScope, AuthorityStateCheckpointId, AuthorityStateRoot,
+    data::hash::{
+        merkle_node_key::SimpleMerkleNode,
+        merkle_store_key::{
+            QMerkleStoreDoubleIdKey, QMerkleStoreDoubleIdNode,
+            QMerkleStoreSingleIdKey, QMerkleStoreSingleIdNode,
+        },
+    },
+    felt::{FromPrimitiveValuesFelt, ToU64Value, ZeroableFelt},
+    pgoldilocks::PoseidonHasher,
+    protocol::core_types::{
+        Q256BitHash, QZKProofPublicInputsHasherReader, QZKProofVerifier,
+    },
+    PHash, PF, QCoreProcCheckpointUniqueId,
+};
+use psy_data::{
+    guta::{
+        header::GlobalUserTreeAggregatorHeader,
+        header_extended::{
+            GlobalUserTreeAggregatorHeaderWithTagValue,
+            GlobalUserTreeAggregatorHeaderWithTagValueAndJobType,
+        },
+        stats::GUTAStats,
+        sub_tree_transition::SubTreeNodeStateTransition,
+    },
+    prepared_block::realm::{
+        PsyPreparedRealmBlockStateUpdates, PsyRealmCoordinatorUpdate,
+    },
+    protocol::{
+        canonical_chain::{
+            CanonicalChainRef, ChainEpoch, CheckpointHash, CheckpointId,
+            CheckpointRef, NetworkId,
+        },
+        chain_context::{
+            AuthorityScope, AuthorityStateCheckpointId, AuthorityStateRoot,
+        },
+    },
+    v1::qdata::{
+        checkpoint::{
+            PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf,
+            PQEDCheckpointLeafStats, QEDL2BlockState,
+        },
+        checkpoint_sync::PQEDCheckpointSyncInfoCompact,
+        contract::{serialize_imt_leaf_ffs_entry_v2, IMTContractStateLeaf},
+        user::PQEDUserLeaf,
     },
 };
 use psy_node_core::store::{
@@ -48,6 +90,12 @@ use psy_node_core::store::{
         NormalCommitRecoveryAction, NormalHeadPublishProgress,
         SealedNormalHeadPublish,
     },
+    realm_commit_evidence::SealedRealmCommitEvidence,
+    realm_commit_evidence_assembly::RealmCommitEvidenceAssemblyPlan,
+    realm_imt_mutation_graph::{
+        RealmImtBaselineNodeKey, RealmImtContractHeightReadPlan,
+        RealmImtMutationGraphConfig,
+    },
     timestamp::CommitWriteTimestampUs,
     typed::{
         CheckpointId as StorageCheckpointId, CheckpointRootKey,
@@ -56,6 +104,7 @@ use psy_node_core::store::{
         TreeId, TreeSubId, TypedTableKey, U64SingletonSlot,
     },
 };
+use psy_serialize::FastFixedSerializable;
 use scylla::{
     client::{
         execution_profile::ExecutionProfile, session::Session,
@@ -78,7 +127,7 @@ use crate::utils::{
 const CONTROL_KEYSPACE: &str = "psy_d04b2c_rf3_nt";
 const ARTIFACT_KEYSPACE: &str = "psy_d04b2c_rf3_artifacts";
 const STATE_KEYSPACE: &str = "psy_d04b2c_rf3_state";
-const BASELINE: &str = "01b31224f8f994a4d9940801418ba7955a8e6ca7";
+const BASELINE: &str = "976748837810bb70519e6fe6faa0ede705f0ef4e";
 const IMAGE: &str = "scylladb/scylla@sha256:17496f2dd6e72056d0b0d7e2bd18bd62638872d1d80a5dd9db96ba017fd426fc";
 const NODE_IPS: [Ipv4Addr; 3] = [
     Ipv4Addr::new(172, 29, 86, 11),
@@ -90,6 +139,15 @@ const NODE_CONTAINERS: [&str; 3] = [
     "psy-g0-02-rf3-scylla2-1",
     "psy-g0-02-rf3-scylla3-1",
 ];
+const EVIDENCE_GLOBAL_HEIGHT: u8 = 4;
+const EVIDENCE_COORDINATOR_HEIGHT: u8 = 2;
+const EVIDENCE_UCT_HEIGHT: u8 = 3;
+const EVIDENCE_CST_HEIGHT: u8 = 3;
+const EVIDENCE_REALM_SUB_ID: u64 = 2;
+const EVIDENCE_CONTRACT_ID: u64 = 2;
+const EVIDENCE_IMT_INDEX: u64 = 3;
+const EVIDENCE_PREDECESSOR: u64 = 40;
+const EVIDENCE_STATE: u64 = 41;
 
 fn hash(seed: u8) -> PHash {
     PHash::from_owned_32bytes([seed; 32])
@@ -108,6 +166,425 @@ fn chain(checkpoint: u64, seed: u8) -> CanonicalChainRef<PHash> {
             CheckpointHash::from_last_chain_hash(hash(seed)),
         ),
     )
+}
+
+fn evidence_levels(mut leaves: Vec<PHash>, height: u8) -> Vec<Vec<PHash>> {
+    assert_eq!(leaves.len(), 1usize << height);
+    let mut result = vec![Vec::new(); usize::from(height) + 1];
+    result[usize::from(height)] = std::mem::take(&mut leaves);
+    for level in (0..usize::from(height)).rev() {
+        result[level] = result[level + 1]
+            .chunks_exact(2)
+            .map(|pair| PoseidonHasher::two_to_one(&pair[0], &pair[1]))
+            .collect();
+    }
+    result
+}
+
+fn evidence_simple_path(
+    tree: &[Vec<PHash>],
+    height: u8,
+    index: u64,
+    min_level: u8,
+) -> Vec<SimpleMerkleNode<PHash>> {
+    (min_level..=height)
+        .rev()
+        .map(|level| {
+            let at_level = index >> (height - level);
+            SimpleMerkleNode::new(
+                level,
+                at_level,
+                tree[usize::from(level)][at_level as usize],
+            )
+        })
+        .collect()
+}
+
+fn evidence_single_path(
+    tree: &[Vec<PHash>],
+    height: u8,
+    tree_id: u64,
+    index: u64,
+) -> Vec<QMerkleStoreSingleIdNode<PHash>> {
+    (0..=height)
+        .rev()
+        .map(|level| {
+            let at_level = index >> (height - level);
+            QMerkleStoreSingleIdNode {
+                key: QMerkleStoreSingleIdKey {
+                    tree_id,
+                    level,
+                    index: at_level,
+                },
+                value: tree[usize::from(level)][at_level as usize],
+            }
+        })
+        .collect()
+}
+
+fn evidence_double_path(
+    tree: &[Vec<PHash>],
+    height: u8,
+    tree_id: u64,
+    tree_sub_id: u64,
+    index: u64,
+) -> Vec<QMerkleStoreDoubleIdNode<PHash>> {
+    (0..=height)
+        .rev()
+        .map(|level| {
+            let at_level = index >> (height - level);
+            QMerkleStoreDoubleIdNode {
+                key: QMerkleStoreDoubleIdKey {
+                    tree_id,
+                    tree_sub_id,
+                    level,
+                    index: at_level,
+                },
+                value: tree[usize::from(level)][at_level as usize],
+            }
+        })
+        .collect()
+}
+
+fn evidence_encode_ffs<const N: usize, T: FastFixedSerializable<N>>(
+    values: &[T],
+) -> Vec<u8> {
+    let mut result = Vec::with_capacity(values.len() * N);
+    for value in values {
+        result.extend_from_slice(&value.ffs_to_bytes());
+    }
+    result
+}
+
+fn evidence_inclusion_siblings(
+    tree: &[Vec<PHash>],
+    level: u8,
+    mut index: u64,
+) -> Vec<PHash> {
+    let mut siblings = Vec::with_capacity(usize::from(level));
+    for at_level in (1..=level).rev() {
+        siblings.push(tree[usize::from(at_level)][(index ^ 1) as usize]);
+        index >>= 1;
+    }
+    siblings
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DeterministicEvidenceProofVerifier;
+
+impl QZKProofPublicInputsHasherReader<PHash, PHash>
+    for DeterministicEvidenceProofVerifier
+{
+    fn get_proof_public_inputs_hash(proof: &PHash) -> anyhow::Result<PHash> {
+        Ok(*proof)
+    }
+
+    fn try_proof_from_slice(bytes: &[u8]) -> anyhow::Result<PHash> {
+        Ok(PHash::from_owned_32bytes(bytes.try_into()?))
+    }
+}
+
+impl QZKProofVerifier<PHash, PHash> for DeterministicEvidenceProofVerifier {
+    fn verify_zk_proof(
+        &self,
+        _circuit_type: u32,
+        proof: &PHash,
+    ) -> anyhow::Result<PHash> {
+        Ok(*proof)
+    }
+}
+
+struct RealmEvidenceFixture {
+    authority: AuthorityScope,
+    prepared: PsyPreparedRealmBlockStateUpdates<PHash>,
+    submission: GlobalUserTreeAggregatorHeaderWithTagValueAndJobType<PF, PHash>,
+    proof_bytes: Vec<u8>,
+    coordinator: PsyRealmCoordinatorUpdate<PF, PHash>,
+    baseline: BTreeMap<RealmImtBaselineNodeKey, PHash>,
+    with_imt_preimage: bool,
+}
+
+impl RealmEvidenceFixture {
+    fn assembly_plan(
+        &self,
+    ) -> anyhow::Result<
+        RealmCommitEvidenceAssemblyPlan<PHash, PoseidonHasher>,
+    > {
+        let height_plan = RealmImtContractHeightReadPlan::try_from_prepared(
+            AuthorityStateCheckpointId::new(EVIDENCE_PREDECESSOR),
+            &self.prepared,
+        )?;
+        let heights = height_plan.bind_response(
+            &height_plan
+                .contract_ids()
+                .iter()
+                .map(|contract_id| {
+                    assert_eq!(*contract_id, EVIDENCE_CONTRACT_ID);
+                    EVIDENCE_CST_HEIGHT
+                })
+                .collect::<Vec<_>>(),
+        )?;
+        Ok(RealmCommitEvidenceAssemblyPlan::try_new::<
+            PF,
+            PHash,
+            DeterministicEvidenceProofVerifier,
+        >(
+            self.authority,
+            AuthorityStateCheckpointId::new(EVIDENCE_PREDECESSOR),
+            RealmImtMutationGraphConfig::try_new(
+                EVIDENCE_GLOBAL_HEIGHT,
+                EVIDENCE_COORDINATOR_HEIGHT,
+                EVIDENCE_UCT_HEIGHT,
+            )?,
+            &heights,
+            &self.prepared,
+            &self.submission,
+            &self.proof_bytes,
+            &DeterministicEvidenceProofVerifier,
+            &self.coordinator,
+        )?)
+    }
+}
+
+fn realm_evidence_fixture(
+    realm_id: u64,
+    user_id: u64,
+    offset: u8,
+    with_imt_preimage: bool,
+) -> RealmEvidenceFixture {
+    assert_eq!(
+        user_id >> (EVIDENCE_GLOBAL_HEIGHT - EVIDENCE_COORDINATOR_HEIGHT),
+        realm_id,
+    );
+    let seeded = |seed: u8| hash(seed.wrapping_add(offset));
+    let imt_preimage = IMTContractStateLeaf::<PF, PHash> {
+        key: seeded(1),
+        value: seeded(2),
+        next_key: seeded(3),
+        next_index: PF::from_u64_value(1),
+    };
+    let imt_hash = imt_preimage.qfhash::<PoseidonHasher>();
+
+    let mut cst_old_leaves = (0..(1u8 << EVIDENCE_CST_HEIGHT))
+        .map(|i| seeded(20 + i))
+        .collect::<Vec<_>>();
+    cst_old_leaves[2] = PoseidonHasher::get_zero_hash(0);
+    let cst_old = evidence_levels(cst_old_leaves.clone(), EVIDENCE_CST_HEIGHT);
+    cst_old_leaves[EVIDENCE_IMT_INDEX as usize] = imt_hash;
+    let cst_new = evidence_levels(cst_old_leaves, EVIDENCE_CST_HEIGHT);
+
+    let mut uct_old_leaves = (0..(1u8 << EVIDENCE_UCT_HEIGHT))
+        .map(|i| seeded(40 + i))
+        .collect::<Vec<_>>();
+    uct_old_leaves[EVIDENCE_CONTRACT_ID as usize] = cst_old[0][0];
+    let uct_old = evidence_levels(uct_old_leaves.clone(), EVIDENCE_UCT_HEIGHT);
+    uct_old_leaves[EVIDENCE_CONTRACT_ID as usize] = cst_new[0][0];
+    let uct_new = evidence_levels(uct_old_leaves, EVIDENCE_UCT_HEIGHT);
+
+    let old_user = PQEDUserLeaf::<PF, PHash> {
+        public_key: seeded(60),
+        user_state_tree_root: uct_old[0][0],
+        balance: PF::from_u64_value(10),
+        nonce: PF::ZERO_VALUE,
+        last_checkpoint_id: PF::from_u64_value(EVIDENCE_PREDECESSOR),
+        event_index: PF::ZERO_VALUE,
+        user_id: PF::from_u64_value(user_id),
+    };
+    let new_user = PQEDUserLeaf::<PF, PHash> {
+        user_state_tree_root: uct_new[0][0],
+        nonce: PF::from_u64_value(1),
+        last_checkpoint_id: PF::from_u64_value(EVIDENCE_STATE),
+        ..old_user
+    };
+    let mut gut_old_leaves = (0..(1u8 << EVIDENCE_GLOBAL_HEIGHT))
+        .map(|i| seeded(80 + i))
+        .collect::<Vec<_>>();
+    gut_old_leaves[user_id as usize] = old_user.qfhash::<PoseidonHasher>();
+    let gut_old = evidence_levels(gut_old_leaves.clone(), EVIDENCE_GLOBAL_HEIGHT);
+    gut_old_leaves[user_id as usize] = new_user.qfhash::<PoseidonHasher>();
+    let gut_new = evidence_levels(gut_old_leaves, EVIDENCE_GLOBAL_HEIGHT);
+    let old_realm_root = gut_old[usize::from(EVIDENCE_COORDINATOR_HEIGHT)]
+        [realm_id as usize];
+    let new_realm_root = gut_new[usize::from(EVIDENCE_COORDINATOR_HEIGHT)]
+        [realm_id as usize];
+
+    let mut prepared = PsyPreparedRealmBlockStateUpdates {
+        realm_id,
+        realm_sub_id: EVIDENCE_REALM_SUB_ID,
+        unique_pending_id: 90 + realm_id,
+        proc_checkpoint_unique_id: QCoreProcCheckpointUniqueId::from(
+            91u128 + u128::from(realm_id),
+        ),
+        old_realm_root,
+        new_realm_root,
+        update_global_user_tree_nodes_ffs: evidence_encode_ffs(
+            &evidence_simple_path(
+                &gut_new,
+                EVIDENCE_GLOBAL_HEIGHT,
+                user_id,
+                EVIDENCE_COORDINATOR_HEIGHT,
+            ),
+        ),
+        update_user_contract_tree_nodes_ffs: evidence_encode_ffs(
+            &evidence_single_path(
+                &uct_new,
+                EVIDENCE_UCT_HEIGHT,
+                user_id,
+                EVIDENCE_CONTRACT_ID,
+            ),
+        ),
+        update_contract_state_tree_nodes_ffs: evidence_encode_ffs(
+            &evidence_double_path(
+                &cst_new,
+                EVIDENCE_CST_HEIGHT,
+                user_id,
+                EVIDENCE_CONTRACT_ID,
+                EVIDENCE_IMT_INDEX,
+            ),
+        ),
+        update_user_leaves_ffs: new_user.ffs_to_bytes().to_vec(),
+        update_contract_state_imt_leaves_ffs:
+            serialize_imt_leaf_ffs_entry_v2(
+                user_id,
+                EVIDENCE_CONTRACT_ID,
+                EVIDENCE_IMT_INDEX,
+                &imt_hash,
+                &imt_preimage.key,
+                &imt_preimage.value,
+                &imt_preimage.next_key,
+                imt_preimage.next_index.to_u64_value(),
+                false,
+            )
+            .to_vec(),
+    };
+    if !with_imt_preimage {
+        prepared.update_contract_state_imt_leaves_ffs.clear();
+    }
+
+    let submission = GlobalUserTreeAggregatorHeaderWithTagValueAndJobType {
+        header: GlobalUserTreeAggregatorHeaderWithTagValue {
+            header: GlobalUserTreeAggregatorHeader {
+                guta_circuit_whitelist: seeded(120),
+                checkpoint_tree_root: seeded(121),
+                state_transition: SubTreeNodeStateTransition {
+                    old_node_value: old_realm_root,
+                    new_node_value: new_realm_root,
+                    node_index: PF::from_u64_value(realm_id),
+                    node_level: PF::from_u64_value(u64::from(
+                        EVIDENCE_COORDINATOR_HEIGHT,
+                    )),
+                },
+                stats: GUTAStats::get_zero_value(),
+                total_aggregation_proofs_generated: PF::from_u64_value(5),
+            },
+            new_tag_tree_node_value: seeded(122),
+        },
+        // Stable wire discriminant for `ProvingJobCircuitType::GUTASingleEndCap`.
+        job_type_u32: 11,
+    };
+    let proof_bytes = submission
+        .qfhash::<PoseidonHasher>()
+        .into_owned_32bytes()
+        .to_vec();
+    let inclusion = MerkleProofCore::new_from_params::<PoseidonHasher>(
+        realm_id,
+        new_realm_root,
+        evidence_inclusion_siblings(
+            &gut_new,
+            EVIDENCE_COORDINATOR_HEIGHT,
+            realm_id,
+        ),
+    );
+    assert_eq!(inclusion.root, gut_new[0][0]);
+    let state_roots = PQEDCheckpointGlobalStateRoots {
+        contract_tree_root: seeded(130),
+        deposit_tree_root: seeded(131),
+        user_tree_root: inclusion.root,
+        withdrawal_tree_root: seeded(132),
+        user_registration_tree_root: seeded(133),
+    };
+    let checkpoint_leaf = PQEDCheckpointLeaf {
+        global_chain_root: state_roots.qfhash::<PoseidonHasher>(),
+        stats: PQEDCheckpointLeafStats::<PF, PHash>::get_empty_stats(),
+    };
+    let checkpoint_leaf_hash = checkpoint_leaf.qfhash::<PoseidonHasher>();
+    let mut block_state = QEDL2BlockState::get_genesis_value();
+    block_state.checkpoint_id = EVIDENCE_STATE;
+    let coordinator = PsyRealmCoordinatorUpdate {
+        canonical_chain_ref: CanonicalChainRef::new(
+            network(),
+            ChainEpoch::new(7),
+            CheckpointRef::new(
+                CheckpointId::new(EVIDENCE_STATE),
+                CheckpointHash::from_proof_public_inputs_hash(hash(140)),
+            ),
+        ),
+        checkpoint_sync_info: PQEDCheckpointSyncInfoCompact {
+            checkpoint_id: EVIDENCE_STATE,
+            coordinator_id: 0,
+            coordinator_sub_id: 0,
+            coordinator_unique_pending_id: 80,
+            block_state,
+            state_roots,
+            checkpoint_leaf,
+            checkpoint_leaf_hash,
+            checkpoint_tree_root: seeded(141),
+        },
+        merkle_proof_to_realm_root: inclusion,
+        reward_tree_top_proof:
+            parth_core::crypto::hash::tag_tree::TagTreeMerkleProof::new_empty(),
+    };
+
+    let mut baseline = BTreeMap::new();
+    for level in 0..=EVIDENCE_GLOBAL_HEIGHT {
+        for (index, value) in gut_old[usize::from(level)].iter().enumerate() {
+            baseline.insert(
+                RealmImtBaselineNodeKey::GlobalUser {
+                    level,
+                    index: index as u64,
+                },
+                *value,
+            );
+        }
+    }
+    for level in 0..=EVIDENCE_UCT_HEIGHT {
+        for (index, value) in uct_old[usize::from(level)].iter().enumerate() {
+            baseline.insert(
+                RealmImtBaselineNodeKey::UserContract {
+                    user_id,
+                    level,
+                    index: index as u64,
+                },
+                *value,
+            );
+        }
+    }
+    for level in 0..=EVIDENCE_CST_HEIGHT {
+        for (index, value) in cst_old[usize::from(level)].iter().enumerate() {
+            baseline.insert(
+                RealmImtBaselineNodeKey::ContractState {
+                    user_id,
+                    contract_id: EVIDENCE_CONTRACT_ID,
+                    level,
+                    index: index as u64,
+                },
+                *value,
+            );
+        }
+    }
+
+    RealmEvidenceFixture {
+        authority: AuthorityScope::Realm {
+            realm_id: realm_id as u32,
+            realm_sub_id: EVIDENCE_REALM_SUB_ID as u16,
+        },
+        prepared,
+        submission,
+        proof_bytes,
+        coordinator,
+        baseline,
+        with_imt_preimage,
+    }
 }
 
 fn imt_row(
@@ -210,18 +687,80 @@ fn fixture_from_seeds(
     high_water: i64,
     namespace_seed: u8,
 ) -> Fixture {
+    fixture_from_commit_identity(
+        AuthorityScope::Realm {
+            realm_id,
+            realm_sub_id: 2,
+        },
+        chain(checkpoint_id - 1, expected_chain_seed),
+        chain(checkpoint_id, candidate_chain_seed),
+        hash(old_root_seed),
+        hash(new_root_seed),
+        payload_seed,
+        high_water,
+        namespace_seed,
+        true,
+    )
+}
+
+fn fixture_for_realm_evidence(
+    evidence: &RealmEvidenceFixture,
+    payload_seed: u8,
+    high_water: i64,
+    namespace_seed: u8,
+) -> Fixture {
+    fixture_from_commit_identity(
+        evidence.authority,
+        CanonicalChainRef::new(
+            network(),
+            evidence.coordinator.canonical_chain_ref.chain_epoch(),
+            CheckpointRef::new(
+                CheckpointId::new(EVIDENCE_PREDECESSOR),
+                CheckpointHash::from_last_chain_hash(hash(199)),
+            ),
+        ),
+        evidence.coordinator.canonical_chain_ref,
+        evidence.prepared.old_realm_root,
+        evidence.prepared.new_realm_root,
+        payload_seed,
+        high_water,
+        namespace_seed,
+        evidence.with_imt_preimage,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fixture_from_commit_identity(
+    authority: AuthorityScope,
+    expected_chain: CanonicalChainRef<PHash>,
+    candidate_chain: CanonicalChainRef<PHash>,
+    old_root: PHash,
+    new_root: PHash,
+    payload_seed: u8,
+    high_water: i64,
+    namespace_seed: u8,
+    include_imt: bool,
+) -> Fixture {
+    let checkpoint_id = candidate_chain.checkpoint().checkpoint_id().get();
     let checkpoint = StorageCheckpointId::try_new(checkpoint_id).unwrap();
     let semantic = [
-        (MerkleNode::new(0, NodeIndex::new(0)), new_root_seed),
+        (
+            MerkleNode::new(0, NodeIndex::new(0)),
+            new_root.into_owned_32bytes().to_vec(),
+        ),
         (
             MerkleNode::new(1, NodeIndex::new(0)),
-            new_root_seed.wrapping_add(1),
+            vec![payload_seed.wrapping_add(1); 32],
         ),
         (
             MerkleNode::new(1, NodeIndex::new(1)),
-            new_root_seed.wrapping_add(2),
+            vec![payload_seed.wrapping_add(2); 32],
         ),
     ];
+    let realm_id = match authority {
+        AuthorityScope::Realm { realm_id, .. } => realm_id,
+        AuthorityScope::Coordinator => panic!("Realm fixture requires Realm authority"),
+    };
     let imt_tree = TreeId::new(9);
     let imt_sub = TreeSubId::new(realm_id as u64);
     let imt_leaf = LeafIndex::new(3);
@@ -235,21 +774,23 @@ fn fixture_from_seeds(
     );
     let mut prepared_semantic = semantic
         .iter()
-        .map(|(node, value_seed)| {
+        .map(|(node, value)| {
             PreparedSemanticMutation::GlobalUserMerkle {
                 checkpoint,
                 node: *node,
-                value: vec![*value_seed; 32],
+                value: value.clone(),
             }
         })
         .collect::<Vec<_>>();
-    prepared_semantic.push(PreparedSemanticMutation::ImtLeaf {
-        tree: imt_tree,
-        tree_sub: imt_sub,
-        leaf: imt_leaf,
-        checkpoint,
-        canonical_row: imt_row.clone(),
-    });
+    if include_imt {
+        prepared_semantic.push(PreparedSemanticMutation::ImtLeaf {
+            tree: imt_tree,
+            tree_sub: imt_sub,
+            leaf: imt_leaf,
+            checkpoint,
+            canonical_row: imt_row.clone(),
+        });
+    }
     let payload = PreparedPayload::try_v1(
         PreparedPayloadKind::Realm,
         prepared_semantic,
@@ -265,26 +806,28 @@ fn fixture_from_seeds(
     .unwrap();
     let mut logical = semantic
         .iter()
-        .map(|(node, value_seed)| LogicalMutation::Put {
+        .map(|(node, value)| LogicalMutation::Put {
             key: TypedTableKey::GlobalUserMerkle {
                 node: *node,
                 checkpoint,
             },
-            value: MutationValue::PsyCanonicalBytes(vec![*value_seed; 32]),
+            value: MutationValue::PsyCanonicalBytes(value.clone()),
         })
         .collect::<Vec<_>>();
-    logical.push(LogicalMutation::Put {
-        key: TypedTableKey::ImtLeaf {
-            tree: imt_tree,
-            tree_sub: imt_sub,
-            leaf: imt_leaf,
-            checkpoint,
-        },
-        value: MutationValue::Structured {
-            schema: StructuredValueSchema::ImtLeafRowV1,
-            canonical_bytes: imt_row,
-        },
-    });
+    if include_imt {
+        logical.push(LogicalMutation::Put {
+            key: TypedTableKey::ImtLeaf {
+                tree: imt_tree,
+                tree_sub: imt_sub,
+                leaf: imt_leaf,
+                checkpoint,
+            },
+            value: MutationValue::Structured {
+                schema: StructuredValueSchema::ImtLeafRowV1,
+                canonical_bytes: imt_row,
+            },
+        });
+    }
     let latest_checkpoint = LogicalMutation::Put {
         key: TypedTableKey::U64Singleton(
             U64SingletonSlot::LatestCheckpoint,
@@ -295,21 +838,27 @@ fn fixture_from_seeds(
         root: CheckpointRootKey::new(vec![payload_seed.wrapping_add(40); 32]),
         checkpoint,
     };
-    let imt_supplements = imt_leaf_supplements(
-        imt_tree,
-        imt_sub,
-        ImtEncodedKey::new(encode_raw_imt_key_for_sorting(imt_leaf_key)),
-        imt_leaf_key,
-        imt_leaf,
-        checkpoint,
-        3,
-        4,
-    )
-    .unwrap();
+    let imt_supplements = if include_imt {
+        imt_leaf_supplements(
+            imt_tree,
+            imt_sub,
+            ImtEncodedKey::new(encode_raw_imt_key_for_sorting(imt_leaf_key)),
+            imt_leaf_key,
+            imt_leaf,
+            checkpoint,
+            3,
+            4,
+        )
+        .unwrap()
+    } else {
+        Vec::new()
+    };
     logical.extend(imt_supplements.clone());
     logical.push(checkpoint_root.clone());
     logical.push(latest_checkpoint.clone());
     let full = CanonicalPhysicalMutationBatch::from_logical(logical).unwrap();
+    let (prepared_mutation_count, supplement_mutation_count) =
+        if include_imt { (4, 5) } else { (3, 3) };
     let compact = PreparedReferencePlusSupplementRecord::try_v1(
         reference,
         DerivedSupplementBatch::from_logical(
@@ -322,8 +871,8 @@ fn fixture_from_seeds(
         ReplayReceipt::new(
             ReplayAuthority::Realm,
             checkpoint,
-            4,
-            5,
+            prepared_mutation_count,
+            supplement_mutation_count,
             vec![OperationalReplayAction::RotatePendingCheckpointNamespace],
         ),
         &payload_bytes,
@@ -335,26 +884,19 @@ fn fixture_from_seeds(
             .unwrap();
     let key = AuthorityTimestampKey::new(
         network(),
-        AuthorityScope::Realm {
-            realm_id,
-            realm_sub_id: 2,
-        },
+        authority,
     );
     let intent = SealedAuthorityCommitIntent::seal_normal_advance(
         key,
-        chain(checkpoint_id - 1, expected_chain_seed),
-        chain(checkpoint_id, candidate_chain_seed),
+        expected_chain,
+        candidate_chain,
         AuthorityStateTransition::Changed {
             previous_checkpoint: AuthorityStateCheckpointId::new(
                 checkpoint_id - 1,
             ),
             checkpoint: AuthorityStateCheckpointId::new(checkpoint_id),
-            old_root: AuthorityStateRoot::from_local_state_root(hash(
-                old_root_seed,
-            )),
-            new_root: AuthorityStateRoot::from_local_state_root(hash(
-                new_root_seed,
-            )),
+            old_root: AuthorityStateRoot::from_local_state_root(old_root),
+            new_root: AuthorityStateRoot::from_local_state_root(new_root),
         },
         AuthorityHeadPayload::try_new(vec![payload_seed; 16]).unwrap(),
         artifacts.commitment(),
@@ -511,6 +1053,22 @@ async fn create_schema(session: &Session) -> anyhow::Result<()> {
     session
         .query_unpaged(
             format!(
+                "CREATE TABLE IF NOT EXISTS {STATE_KEYSPACE}.user_contract_tree_table (tree_id BIGINT, level TINYINT, node_index BIGINT, checkpoint_id BIGINT, value BLOB, PRIMARY KEY ((tree_id), level, node_index, checkpoint_id)) WITH CLUSTERING ORDER BY (level ASC, node_index ASC, checkpoint_id DESC)"
+            ),
+            &[],
+        )
+        .await?;
+    session
+        .query_unpaged(
+            format!(
+                "CREATE TABLE IF NOT EXISTS {STATE_KEYSPACE}.contract_state_tree_table (tree_id BIGINT, tree_sub_id BIGINT, level TINYINT, node_index BIGINT, checkpoint_id BIGINT, value BLOB, PRIMARY KEY ((tree_id, tree_sub_id), level, node_index, checkpoint_id)) WITH CLUSTERING ORDER BY (level ASC, node_index ASC, checkpoint_id DESC)"
+            ),
+            &[],
+        )
+        .await?;
+    session
+        .query_unpaged(
+            format!(
                 "CREATE TABLE IF NOT EXISTS {STATE_KEYSPACE}.u64_singleton_table (obj_id BIGINT PRIMARY KEY, value BIGINT)"
             ),
             &[],
@@ -553,10 +1111,12 @@ async fn open_stores() -> anyhow::Result<Stores> {
 }
 
 struct CombinedStores {
+    session: Arc<Session>,
     manifests: ScyllaPreparedManifestStore,
     heads: ScyllaAuthorityLocalHeadStore,
     timestamps: ScyllaAuthorityTimestampStore,
     state: RollbackableStorePrototype,
+    predecessor: RealmImtPredecessorAdapter<PHash>,
 }
 
 impl CombinedStores {
@@ -567,6 +1127,18 @@ impl CombinedStores {
             &self.timestamps,
             &self.state,
         )
+    }
+
+    async fn assemble_realm_evidence(
+        &self,
+        fixture: &RealmEvidenceFixture,
+    ) -> anyhow::Result<SealedRealmCommitEvidence<PHash, PoseidonHasher>> {
+        let plan = fixture.assembly_plan()?;
+        let rows = self
+            .predecessor
+            .read_plan(&self.session, &plan.predecessor_read_plan())
+            .await?;
+        Ok(plan.verify_predecessor_rows_and_seal(&rows)?)
     }
 }
 
@@ -587,7 +1159,14 @@ async fn create_combined_schema(session: &Session) -> anyhow::Result<()> {
 
 async fn open_combined_stores() -> anyhow::Result<CombinedStores> {
     let session = Arc::new(connect(None, Consistency::Quorum).await?);
+    let predecessor = RealmImtPredecessorAdapter::<PHash>::prepare_with_consistency(
+        &session,
+        CqlKeyspaceName::try_new(STATE_KEYSPACE)?,
+        Consistency::Quorum,
+    )
+    .await?;
     Ok(CombinedStores {
+        session: Arc::clone(&session),
         manifests: ScyllaPreparedManifestStore::prepare(
             Arc::clone(&session),
             keyspaces()?,
@@ -609,6 +1188,7 @@ async fn open_combined_stores() -> anyhow::Result<CombinedStores> {
             Consistency::Quorum,
         )
         .await?,
+        predecessor,
     })
 }
 
@@ -639,6 +1219,110 @@ async fn initialize_combined_fixture(
         psy_node_core::store::manifest_record::PreparedManifestWriteOutcome::Applied(_)
     ));
     Ok(())
+}
+
+async fn insert_predecessor_node(
+    session: &Session,
+    key: RealmImtBaselineNodeKey,
+    checkpoint: u64,
+    value: &[u8],
+) -> anyhow::Result<()> {
+    let checkpoint = i64::try_from(checkpoint)?;
+    match key {
+        RealmImtBaselineNodeKey::GlobalUser { level, index } => {
+            session
+                .query_unpaged(
+                    format!(
+                        "INSERT INTO {STATE_KEYSPACE}.global_user_tree_table (level, node_index, checkpoint_id, value) VALUES (?, ?, ?, ?)"
+                    ),
+                    (
+                        u8_to_i8_exact(level),
+                        u64_to_i64_exact(index),
+                        checkpoint,
+                        value,
+                    ),
+                )
+                .await?;
+        }
+        RealmImtBaselineNodeKey::UserContract {
+            user_id,
+            level,
+            index,
+        } => {
+            session
+                .query_unpaged(
+                    format!(
+                        "INSERT INTO {STATE_KEYSPACE}.user_contract_tree_table (tree_id, level, node_index, checkpoint_id, value) VALUES (?, ?, ?, ?, ?)"
+                    ),
+                    (
+                        u64_to_i64_exact(user_id),
+                        u8_to_i8_exact(level),
+                        u64_to_i64_exact(index),
+                        checkpoint,
+                        value,
+                    ),
+                )
+                .await?;
+        }
+        RealmImtBaselineNodeKey::ContractState {
+            user_id,
+            contract_id,
+            level,
+            index,
+        } => {
+            session
+                .query_unpaged(
+                    format!(
+                        "INSERT INTO {STATE_KEYSPACE}.contract_state_tree_table (tree_id, tree_sub_id, level, node_index, checkpoint_id, value) VALUES (?, ?, ?, ?, ?, ?)"
+                    ),
+                    (
+                        u64_to_i64_exact(user_id),
+                        u64_to_i64_exact(contract_id),
+                        u8_to_i8_exact(level),
+                        u64_to_i64_exact(index),
+                        checkpoint,
+                        value,
+                    ),
+                )
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn seed_realm_evidence_predecessor(
+    session: &Session,
+    fixture: &RealmEvidenceFixture,
+) -> anyhow::Result<usize> {
+    let plan = fixture.assembly_plan()?;
+    let zero_hashes = (0..64)
+        .map(PoseidonHasher::get_zero_hash)
+        .collect::<Vec<_>>();
+    let mut absent_count = 0;
+    for request in plan.predecessor_read_plan().requests() {
+        let key = request.key();
+        let expected = fixture.baseline[&key];
+        if zero_hashes.contains(&expected) {
+            absent_count += 1;
+        } else {
+            insert_predecessor_node(
+                session,
+                key,
+                EVIDENCE_PREDECESSOR,
+                &expected.into_owned_32bytes(),
+            )
+            .await?;
+        }
+        insert_predecessor_node(
+            session,
+            key,
+            EVIDENCE_STATE + 1,
+            &[211; 32],
+        )
+        .await?;
+    }
+    ensure!(absent_count > 0, "fixture must exercise implicit zero rows");
+    Ok(absent_count)
 }
 
 async fn load_plan(
@@ -1054,11 +1738,15 @@ struct D04b2dReport {
     regular_consistency: &'static str,
     serial_consistency: &'static str,
     restart_count: u8,
-    partial_state_recovered_into_sealed: bool,
+    with_imt_awaiting_evidence_survived_restart: bool,
+    live_evidence_lost_then_reacquired: bool,
+    with_imt_reached_sealed: bool,
+    without_imt_reached_sealed: bool,
+    implicit_zero_rows_observed_as_absent: usize,
     head_response_loss_recovered: bool,
     committed_response_loss_recovered: bool,
     timestamp_response_loss_recovered: bool,
-    one_replica_offline_drive_reached_done: bool,
+    one_replica_offline_without_imt_reached_done: bool,
     direct_one_state_replicas_equal: bool,
     scenarios_passed: Vec<&'static str>,
     finished_unix_ms: u64,
@@ -1084,12 +1772,16 @@ async fn d04b2d_combined_representative_normal_commit_rf3_gate(
     drop(initial_session);
 
     // Start from a real PREPARED row with only the physical prefix through the
-    // root present, then destroy every Session/adapter. The combined executor
-    // must reconstruct both root-covered state and the singleton supplement
-    // from durable artifacts before it can persist SEALED.
-    let crash = fixture(13, 51, 11, 1_500);
+    // root present. Exact physical replay may cross only into the explicit
+    // AwaitingRealmEvidence state; the live proof/graph capability must be
+    // reacquired after a simulated process crash before SEALED is legal.
+    let with_imt_evidence = realm_evidence_fixture(0, 1, 0, true);
+    let crash = fixture_for_realm_evidence(&with_imt_evidence, 11, 1_500, 17);
     let stores = open_combined_stores().await?;
     initialize_combined_fixture(&stores, &crash).await?;
+    let with_imt_absent =
+        seed_realm_evidence_predecessor(&stores.session, &with_imt_evidence)
+            .await?;
     let crash_plan = load_plan_from(&stores.manifests, crash.identity()).await?;
     ensure!(crash_plan.root_position() == 0);
     let crash_prefix = crash_plan.root_position() + 1;
@@ -1100,8 +1792,53 @@ async fn d04b2d_combined_representative_normal_commit_rf3_gate(
     drop(stores);
 
     let stores = open_combined_stores().await?;
+    let first_state = match stores.executor().step(crash.identity()).await? {
+        RepresentativeNormalCommitStep::StateVerifiedAwaitingRealmEvidence {
+            state,
+        } => state,
+        other => bail!("expected AwaitingRealmEvidence after replay, got {other:?}"),
+    };
+    ensure!(first_state.prepared().identity() == &crash.identity());
+    drop(stores);
+
+    // Awaiting is derived from PREPARED plus exact read-back, not a durable
+    // phase bit. Re-reading after restart must reproduce it. Acquire a valid
+    // live bundle and deliberately lose it with the process; persisted bytes
+    // alone are not allowed to cross the seal boundary.
+    let stores = open_combined_stores().await?;
+    let state_before_evidence_loss =
+        match stores.executor().step(crash.identity()).await? {
+            RepresentativeNormalCommitStep::StateVerifiedAwaitingRealmEvidence {
+                state,
+            } => state,
+            other => bail!("expected AwaitingRealmEvidence after restart, got {other:?}"),
+        };
+    ensure!(state_before_evidence_loss.prepared().identity() == &crash.identity());
+    let lost_bundle = stores.assemble_realm_evidence(&with_imt_evidence).await?;
+    ensure!(lost_bundle.graph().counts().final_imt_leaves == 1);
+    drop(lost_bundle);
+    drop(stores);
+
+    // Reconstruct both the exact physical observation and the live proof /
+    // predecessor graph bundle, then persist SEALED. Its response is also
+    // discarded so the following head publish is driven only by durable rows.
+    let stores = open_combined_stores().await?;
+    let recovered_state = match stores.executor().step(crash.identity()).await? {
+        RepresentativeNormalCommitStep::StateVerifiedAwaitingRealmEvidence {
+            state,
+        } => state,
+        other => bail!("expected re-derived AwaitingRealmEvidence, got {other:?}"),
+    };
+    let recovered_bundle =
+        stores.assemble_realm_evidence(&with_imt_evidence).await?;
     ensure!(matches!(
-        stores.executor().step(crash.identity()).await?,
+        stores
+            .executor()
+            .seal_changed_realm_state_with_bundle(
+                recovered_state,
+                recovered_bundle,
+            )
+            .await?,
         RepresentativeNormalCommitStep::StateVerifiedAndSealed { .. }
     ));
     drop(stores);
@@ -1136,15 +1873,49 @@ async fn d04b2d_combined_representative_normal_commit_rf3_gate(
     ));
     drop(stores);
 
-    // A second authority executes the same state+metadata loop while one
-    // replica is offline.  The Session is prepared first so driver topology
-    // discovery is not part of the measured fault.
-    let offline = fixture(14, 52, 21, 2_500);
+    // A second authority uses a positional contract-state update with no IMT
+    // preimage payload. It still needs the complete CST -> UCT -> user -> GUT
+    // predecessor graph and proof binding. Run the whole path with one replica
+    // unavailable after all production-shaped adapters have been prepared.
+    let without_imt_evidence = realm_evidence_fixture(1, 5, 10, false);
+    let offline =
+        fixture_for_realm_evidence(&without_imt_evidence, 21, 2_500, 27);
     let stores = open_combined_stores().await?;
     initialize_combined_fixture(&stores, &offline).await?;
+    let without_imt_absent = seed_realm_evidence_predecessor(
+        &stores.session,
+        &without_imt_evidence,
+    )
+    .await?;
     let offline_plan =
         load_plan_from(&stores.manifests, offline.identity()).await?;
+    ensure!(offline_plan.puts().all(|put| !matches!(
+        put.resolved().mutation().key(),
+        TypedTableKey::ImtLeaf { .. }
+            | TypedTableKey::ImtKeyIndex { .. }
+            | TypedTableKey::ImtCursor { .. }
+    )));
     docker_container("stop", NODE_CONTAINERS[2])?;
+    let offline_state = match stores.executor().step(offline.identity()).await? {
+        RepresentativeNormalCommitStep::StateVerifiedAwaitingRealmEvidence {
+            state,
+        } => state,
+        other => bail!("expected no-IMT AwaitingRealmEvidence, got {other:?}"),
+    };
+    let offline_bundle = stores
+        .assemble_realm_evidence(&without_imt_evidence)
+        .await?;
+    ensure!(offline_bundle.graph().counts().final_imt_leaves == 0);
+    ensure!(matches!(
+        stores
+            .executor()
+            .seal_changed_realm_state_with_bundle(
+                offline_state,
+                offline_bundle,
+            )
+            .await?,
+        RepresentativeNormalCommitStep::StateVerifiedAndSealed { .. }
+    ));
     let committed = stores
         .executor()
         .drive_to_done(offline.identity(), 8)
@@ -1187,26 +1958,34 @@ async fn d04b2d_combined_representative_normal_commit_rf3_gate(
         replication_factor: 3,
         regular_consistency: "QUORUM",
         serial_consistency: "LOCAL_SERIAL",
-        restart_count: 5,
-        partial_state_recovered_into_sealed: true,
+        restart_count: 8,
+        with_imt_awaiting_evidence_survived_restart: true,
+        live_evidence_lost_then_reacquired: true,
+        with_imt_reached_sealed: true,
+        without_imt_reached_sealed: true,
+        implicit_zero_rows_observed_as_absent:
+            with_imt_absent + without_imt_absent,
         head_response_loss_recovered: true,
         committed_response_loss_recovered: true,
         timestamp_response_loss_recovered: true,
-        one_replica_offline_drive_reached_done: true,
+        one_replica_offline_without_imt_reached_done: true,
         direct_one_state_replicas_equal,
         scenarios_passed: vec![
-            "partial exact state restart replays before SEALED",
-            "IMT leaf/index/cursor are reconstructed and verified as one replay unit",
-            "SEALED restart resumes exact head publication",
+            "partial exact state restart stops at AwaitingRealmEvidence",
+            "with-IMT proof plus predecessor graph assembles one live bundle",
+            "live evidence lost before seal is reacquired from exact inputs",
+            "with-IMT bundle is required before durable SEALED",
+            "SEALED response loss resumes exact head publication",
             "head response loss recovers COMMITTED from durable state",
             "COMMITTED response loss recovers timestamp completion",
-            "one replica offline combined drive reaches Done",
+            "positional no-IMT update still validates CST-to-GUT graph",
+            "one replica offline no-IMT combined drive reaches Done",
             "repair flush compact converges exact state rows on every replica",
         ],
         finished_unix_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_millis() as u64,
-        qualification: "representative Realm global-user Merkle plus exact IMT leaf/key-index/cursor and checkpoint-root/latest-checkpoint supplements in the manifest/head/timestamp recovery loop; not upstream IMT root proof binding, production Processor integration, or full table coverage",
+        qualification: "representative changed-Realm lifecycle with real deterministic proof verification, Coordinator inclusion, exact predecessor Scylla reads, optional IMT preimage semantics, manifest/head/timestamp crash recovery and RF=3 degradation; not production Processor input capture or full 35-table coverage",
     };
     let report_path = std::env::var("PSY_D04B2D_REPORT_PATH")
         .unwrap_or_else(|_| "target/d04b2d-combined-normal-commit-rf3-report.json".into());

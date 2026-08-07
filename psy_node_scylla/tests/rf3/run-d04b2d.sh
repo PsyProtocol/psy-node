@@ -33,6 +33,7 @@ cd "${WORKSPACE_ROOT}"
 
 PSY_D04B2D_RF3=1 \
 PSY_D04B2D_REPORT_PATH="${REPORT_PATH}" \
+RUST_MIN_STACK="${PSY_D04B2D_RUST_MIN_STACK:-16777216}" \
 cargo test -p psy_node_scylla d04b2d_combined_representative_normal_commit_rf3_gate --lib -- --ignored --nocapture
 
 echo "D-04b2d RF=3 report: ${REPORT_PATH}"
