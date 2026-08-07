@@ -1325,10 +1325,13 @@ impl Error for BranchExactWriterLifecycleError {}
 
 #[cfg(test)]
 mod tests {
-    use parth_core::PHash;
+    use parth_core::{PHash, crypto::hash::tag_tree::TagTreeMerkleProof};
     use psy_data::protocol::canonical_chain::{
         CanonicalChainRef, ChainEpoch, CheckpointHash, CheckpointId,
         CheckpointRef, NetworkId,
+    };
+    use psy_data::protocol::chain_context::{
+        AuthorityObservation, AuthorityStateCheckpointId, AuthorityStateRoot,
     };
     use psy_node_core::store::{
         authority_commit::{
@@ -1339,6 +1342,15 @@ mod tests {
         branch_exact_dual_write::BranchExactDualWriteIntent,
         branch_exact_schema::BranchExactSchemaMaterializationPlan,
         canonical_head::{CanonicalHeadBootstrap, CanonicalHeadBootstrapProfile},
+        pending_generation::ProcNamespacePrefix,
+        pending_generation_identity::{
+            PendingGenerationActivationDigest, PendingGenerationBootstrapReason,
+            PendingGenerationContext, PendingGenerationLedgerKey,
+        },
+        pending_generation_pipeline::{
+            PendingPipelineBootstrap, PendingProcessingPhase,
+            StoredPendingPipeline,
+        },
         typed::ProcCheckpointUniqueId,
     };
 
@@ -1362,6 +1374,12 @@ mod tests {
         BranchExactShadowAuditPlan, BranchExactShadowAuditState,
         BranchExactShadowVerifiedReceipt, SealedBranchExactShadowAuditCas,
     };
+    use crate::rollback::branch_exact_pending_orchestration::{
+        BranchExactPendingOrchestrationError,
+        BranchExactPendingPublishRecovery, StableEmptyPendingGeneration,
+        classify_branch_exact_publish_recovery, seal_branch_exact_begin,
+        seal_branch_exact_no_work, seal_branch_exact_publish,
+    };
 
     fn chain(epoch: u64, height: u64, seed: u64) -> CanonicalChainRef<PHash> {
         CanonicalChainRef::new(
@@ -1384,6 +1402,93 @@ mod tests {
             chain(0, height, height),
             UniquePendingId::try_new(pending).unwrap(),
         )
+    }
+
+    fn realm_observation(
+        authority: AuthorityScope,
+        chain_height: u64,
+        state_height: u64,
+        state_seed: u64,
+    ) -> AuthorityObservation<PHash> {
+        AuthorityObservation::try_new(
+            chain(0, chain_height, chain_height),
+            authority,
+            AuthorityStateCheckpointId::new(state_height),
+            AuthorityStateRoot::from_local_state_root(PHash::from_values(
+                state_seed,
+                state_seed + 1,
+                state_seed + 2,
+                state_seed + 3,
+            )),
+        )
+        .unwrap()
+    }
+
+    fn legacy_context(pending: u64, proc_id: u128) -> PendingGenerationContext {
+        PendingGenerationContext::try_from_legacy(pending, proc_id).unwrap()
+    }
+
+    /// Test-only persisted-row simulation of the same rotation candidate the
+    /// core counter reservation seals. The production API deliberately keeps
+    /// reservation construction private to the durable counter implementation.
+    fn simulate_rotation(
+        state: &StoredPendingPipeline<PHash>,
+        next_pending: u64,
+    ) -> StoredPendingPipeline<PHash> {
+        const PROCESSING_OFFSET: usize = 70;
+        const GATHERING_OFFSET: usize = 94;
+        const CONTEXT_LEN: usize = 24;
+        const PHASE_OFFSET: usize = 118;
+        const EVIDENCE_OFFSET: usize = 119;
+        const EVIDENCE_LEN: usize = 32;
+
+        let mut payload = state.canonical_payload();
+        let old_gathering = payload
+            [GATHERING_OFFSET..GATHERING_OFFSET + CONTEXT_LEN]
+            .to_vec();
+        payload[PROCESSING_OFFSET..PROCESSING_OFFSET + CONTEXT_LEN]
+            .copy_from_slice(&old_gathering);
+        let next = PendingGenerationContext::try_from_legacy(
+            next_pending,
+            state
+                .proc_namespace_prefix()
+                .derive_proc_id(UniquePendingId::try_new(next_pending).unwrap())
+                .as_u128(),
+        )
+        .unwrap();
+        payload[GATHERING_OFFSET..GATHERING_OFFSET + 8]
+            .copy_from_slice(&next.pending_id().get().to_be_bytes());
+        payload[GATHERING_OFFSET + 8..GATHERING_OFFSET + CONTEXT_LEN]
+            .copy_from_slice(next.proc_checkpoint_id().as_bytes());
+        payload[PHASE_OFFSET] = PendingProcessingPhase::Ready as u8;
+        payload[EVIDENCE_OFFSET..EVIDENCE_OFFSET + EVIDENCE_LEN].fill(0);
+        StoredPendingPipeline::decode_persisted(
+            state.key(),
+            state.revision().as_i64() + 1,
+            &payload,
+        )
+        .unwrap()
+    }
+
+    fn ready_realm_pipeline(
+        plan: &BranchExactWriterActivationPlan<PHash>,
+        authority: AuthorityScope,
+    ) -> StoredPendingPipeline<PHash> {
+        let network = plan.baseline().canonical_chain().network_id();
+        let prefix = ProcNamespacePrefix::for_authority(network, authority);
+        let bootstrap = PendingPipelineBootstrap::try_new(
+            PendingGenerationLedgerKey::new(network, authority),
+            PendingGenerationActivationDigest::try_new(*plan.digest().as_bytes())
+                .unwrap(),
+            prefix,
+            PendingGenerationBootstrapReason::LegacyActivation,
+            legacy_context(100, 9_000),
+            legacy_context(101, 9_001),
+            realm_observation(authority, 10, 10, 500),
+            100,
+        )
+        .unwrap();
+        simulate_rotation(bootstrap.candidate(), 102)
     }
 
     fn verified_shadow() -> BranchExactShadowVerifiedReceipt {
@@ -1906,5 +2011,273 @@ mod tests {
         )
         .unwrap();
         assert_eq!(unique_artifact_tip(&valid).unwrap(), mapping(11, 101));
+    }
+
+    #[test]
+    fn pending_bridge_survives_sparse_realm_no_work_and_binds_verified_publish() {
+        let authority = AuthorityScope::Realm {
+            realm_id: 7,
+            realm_sub_id: 2,
+        };
+        let shadow = verified_shadow();
+        let plan = BranchExactWriterActivationPlan::test_fixture(
+            authority,
+            mapping(10, 100),
+            CommitWriteTimestampUs::try_from_i128(1_000).unwrap(),
+            shadow.digest(),
+            backfill_receipt(authority),
+        );
+        let consumed = consumed_shadow(shadow, plan.digest());
+        let writer_bootstrap = BranchExactWriterBootstrap::new(plan.clone());
+        let active = SealedBranchExactWriterCas::activate(
+            writer_bootstrap.candidate(),
+            &consumed,
+        )
+        .unwrap();
+
+        let ready_101 = ready_realm_pipeline(&plan, authority);
+        let inflight_101 = seal_branch_exact_begin(&ready_101, active.candidate())
+            .unwrap()
+            .candidate()
+            .clone();
+        assert!(StableEmptyPendingGeneration::try_after_post_switch_barrier(
+            inflight_101.processing(),
+            0,
+            1,
+        )
+        .is_err());
+        let empty_101 = StableEmptyPendingGeneration::try_after_post_switch_barrier(
+            inflight_101.processing(),
+            0,
+            0,
+        )
+        .unwrap();
+        let no_work_101 = seal_branch_exact_no_work(
+            &inflight_101,
+            active.candidate(),
+            empty_101,
+            realm_observation(authority, 11, 10, 500),
+        )
+        .unwrap()
+        .candidate()
+        .clone();
+
+        // A second idle generation advances processed/frontier while the
+        // materialized writer intentionally remains at pending 100 / height 10.
+        let ready_102 = simulate_rotation(&no_work_101, 103);
+        let inflight_102 = seal_branch_exact_begin(&ready_102, active.candidate())
+            .unwrap()
+            .candidate()
+            .clone();
+        let no_work_102 = seal_branch_exact_no_work(
+            &inflight_102,
+            active.candidate(),
+            StableEmptyPendingGeneration::try_after_post_switch_barrier(
+                inflight_102.processing(),
+                0,
+                0,
+            )
+            .unwrap(),
+            realm_observation(authority, 12, 10, 500),
+        )
+        .unwrap()
+        .candidate()
+        .clone();
+        assert_eq!(no_work_102.processed_pending_id(), 102);
+        let BranchExactWriterState::Active(still_at_baseline) =
+            active.candidate().state()
+        else {
+            panic!("writer must remain active at its materialized baseline")
+        };
+        assert_eq!(still_at_baseline.watermark().pending_id().get(), 100);
+
+        let ready_103 = simulate_rotation(&no_work_102, 104);
+        let inflight_103 = seal_branch_exact_begin(&ready_103, active.candidate())
+            .unwrap()
+            .candidate()
+            .clone();
+        let intent = BranchExactDualWriteIntent::try_realm(
+            authority,
+            mapping(10, 100),
+            mapping(13, 103),
+            inflight_103.processing().proc_checkpoint_id(),
+            &TagTreeMerkleProof::<PHash>::new_empty(),
+        )
+        .unwrap();
+        let reservation = timestamp_reservation(&intent);
+        let allocator_active = reservation.candidate();
+        let lease = reservation.lease();
+        let sealed = intent
+            .clone()
+            .attach_timestamp_lease(lease)
+            .unwrap();
+        let prepared = SealedBranchExactWriterCas::prepare_write(
+            active.candidate(),
+            &sealed,
+            reservation,
+        )
+        .unwrap();
+        let BranchExactWriterState::WritePrepared(prepared_state) =
+            prepared.candidate().state()
+        else {
+            panic!("expected prepared writer")
+        };
+        let write_observation = crate::rollback::branch_exact_dual_write_executor::BranchExactVerifiedWriteObservation::test_fixture(prepared_state);
+        let verified = SealedBranchExactWriterCas::verify_writes(
+            prepared.candidate(),
+            &write_observation,
+        )
+        .unwrap();
+        let marker = realm_observation(authority, 13, 13, 600);
+        assert_eq!(
+            classify_branch_exact_publish_recovery(
+                &inflight_103,
+                verified.candidate(),
+                marker.clone(),
+            )
+            .unwrap(),
+            BranchExactPendingPublishRecovery::ApplyPipeline(
+                seal_branch_exact_publish(
+                    &inflight_103,
+                    verified.candidate(),
+                    marker.clone(),
+                )
+                .unwrap(),
+            )
+        );
+        assert_eq!(
+            classify_branch_exact_publish_recovery(
+                &inflight_103,
+                active.candidate(),
+                marker.clone(),
+            )
+            .unwrap(),
+            BranchExactPendingPublishRecovery::AwaitDurableAttempt,
+        );
+        let publish = seal_branch_exact_publish(
+            &inflight_103,
+            verified.candidate(),
+            marker.clone(),
+        )
+        .unwrap();
+        let retry = seal_branch_exact_publish(
+            &inflight_103,
+            verified.candidate(),
+            marker,
+        )
+        .unwrap();
+        assert_eq!(publish, retry);
+        assert_eq!(publish.candidate().processed_pending_id(), 103);
+        assert_eq!(
+            publish.candidate().phase(),
+            PendingProcessingPhase::Published
+        );
+        // The writer deliberately remains WritesVerified until after the
+        // pipeline CAS, preserving full recovery evidence in both crash gaps.
+        assert!(matches!(
+            verified.candidate().state(),
+            BranchExactWriterState::WritesVerified(_)
+        ));
+        assert_eq!(
+            classify_branch_exact_publish_recovery(
+                publish.candidate(),
+                verified.candidate(),
+                realm_observation(authority, 13, 13, 600),
+            )
+            .unwrap(),
+            BranchExactPendingPublishRecovery::FinishWriter,
+        );
+
+        let completed_allocator = allocator_active
+            .seal_completion(lease.key(), lease)
+            .unwrap()
+            .candidate();
+        let committed = SealedBranchExactWriterCas::commit_published(
+            verified.candidate(),
+            intent.candidate().canonical_chain(),
+            ObservedAuthorityTimestampState::from_selected_row(
+                lease.key(),
+                completed_allocator,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            classify_branch_exact_publish_recovery(
+                publish.candidate(),
+                committed.candidate(),
+                realm_observation(authority, 13, 13, 600),
+            )
+            .unwrap(),
+            BranchExactPendingPublishRecovery::Complete,
+        );
+        assert!(matches!(
+            classify_branch_exact_publish_recovery(
+                publish.candidate(),
+                committed.candidate(),
+                realm_observation(authority, 13, 13, 601),
+            ),
+            Err(BranchExactPendingOrchestrationError::WriterFrontierMismatch)
+        ));
+
+        // Same branch/pending with another proc/proof commitment produces a
+        // different last-intent and cannot validate the stored pipeline receipt.
+        let wrong_intent = BranchExactDualWriteIntent::try_realm(
+            authority,
+            mapping(10, 100),
+            mapping(13, 103),
+            ProcCheckpointUniqueId::from_u128(
+                inflight_103
+                    .processing()
+                    .proc_checkpoint_id()
+                    .as_u128()
+                    + 1,
+            ),
+            &TagTreeMerkleProof::<PHash>::new_empty(),
+        )
+        .unwrap();
+        let wrong_reservation = timestamp_reservation(&wrong_intent);
+        let wrong_active_allocator = wrong_reservation.candidate();
+        let wrong_lease = wrong_reservation.lease();
+        let wrong_prepared = SealedBranchExactWriterCas::prepare_write(
+            active.candidate(),
+            &wrong_intent
+                .clone()
+                .attach_timestamp_lease(wrong_lease)
+                .unwrap(),
+            wrong_reservation,
+        )
+        .unwrap();
+        let BranchExactWriterState::WritePrepared(wrong_prepared_state) =
+            wrong_prepared.candidate().state()
+        else {
+            panic!("expected wrong prepared writer fixture")
+        };
+        let wrong_write_observation = crate::rollback::branch_exact_dual_write_executor::BranchExactVerifiedWriteObservation::test_fixture(wrong_prepared_state);
+        let wrong_verified = SealedBranchExactWriterCas::verify_writes(
+            wrong_prepared.candidate(),
+            &wrong_write_observation,
+        )
+        .unwrap();
+        let wrong_completed = wrong_active_allocator
+            .seal_completion(wrong_lease.key(), wrong_lease)
+            .unwrap()
+            .candidate();
+        let wrong_committed = SealedBranchExactWriterCas::commit_published(
+            wrong_verified.candidate(),
+            wrong_intent.candidate().canonical_chain(),
+            ObservedAuthorityTimestampState::from_selected_row(
+                wrong_lease.key(),
+                wrong_completed,
+            ),
+        )
+        .unwrap();
+        assert!(matches!(
+            classify_branch_exact_publish_recovery(
+                publish.candidate(),
+                wrong_committed.candidate(),
+                realm_observation(authority, 13, 13, 600),
+            ),
+            Err(BranchExactPendingOrchestrationError::PublishReceiptMismatch)
+        ));
     }
 }
