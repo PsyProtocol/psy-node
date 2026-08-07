@@ -22,6 +22,7 @@ psy_node_scylla/src/rollback/authority_timestamp_prototype.rs|DurableControlAuth
 psy_node_scylla/src/rollback/branch_exact_schema_backfill_executor.rs|RollbackPrototypeAdapter|3|0|7|0|0|0|0|0
 psy_node_scylla/src/rollback/branch_exact_schema_deployment.rs|RollbackPrototypeAdapter|5|0|0|0|0|0|1|2
 psy_node_scylla/src/rollback/branch_exact_schema_deployment_lifecycle.rs|RollbackPrototypeAdapter|6|0|3|6|2|3|1|4
+psy_node_scylla/src/rollback/branch_exact_schema_exporter.rs|RollbackPrototypeAdapter|7|0|0|7|4|3|0|4
 psy_node_scylla/src/rollback/branch_exact_schema_migration.rs|RollbackPrototypeAdapter|12|0|0|11|1|7|2|17
 psy_node_scylla/src/rollback/canonical_head_prototype.rs|CanonicalHeadAuthority|7|0|3|6|2|3|1|6
 psy_node_scylla/src/rollback/checkpoint_kiv.rs|RollbackPrototypeAdapter|6|0|0|4|1|2|0|2
@@ -80,6 +81,7 @@ psy_node_scylla/tests/rollback_admission_inbox_rf3_gate.rs|TestHarness|5|2|0|0|0
 psy_node_scylla/tests/rollback_authority_timestamp_rf3_gate.rs|TestHarness|4|2|0|0|0|0|2|2
 psy_node_scylla/tests/rollback_branch_exact_backfill_rf3_gate.rs|TestHarness|7|2|0|0|0|0|14|8
 psy_node_scylla/tests/rollback_branch_exact_deployment_lifecycle_rf3_gate.rs|TestHarness|4|2|0|0|0|0|4|4
+psy_node_scylla/tests/rollback_branch_exact_exporter_rf3_gate.rs|TestHarness|5|2|1|0|5|7|10|18
 psy_node_scylla/tests/rollback_branch_exact_schema_rf3_gate.rs|TestHarness|4|2|0|0|0|0|5|3
 psy_node_scylla/tests/rollback_canonical_head_rf3_gate.rs|TestHarness|5|2|0|0|0|0|3|3
 psy_node_scylla/tests/rollback_checkpoint_kiv.rs|TestHarness|0|0|0|0|0|0|0|1
