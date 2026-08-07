@@ -4,9 +4,7 @@ use psy_data::protocol::{
         CanonicalChainRef, ChainEpoch, CheckpointHash, CheckpointId,
         CheckpointRef, NetworkId,
     },
-    chain_context::{
-        AuthorityScope, AuthorityStateCheckpointId, AuthorityStateRoot,
-    },
+    chain_context::{AuthorityScope, AuthorityStateCheckpointId, AuthorityStateRoot},
 };
 use psy_node_core::store::{
     authority_commit::{
@@ -80,11 +78,9 @@ fn fixture() -> (
         key,
         chain(40, 1),
         chain(41, 2),
-        AuthorityStateTransition::Changed {
-            previous_checkpoint: AuthorityStateCheckpointId::new(39),
-            checkpoint: AuthorityStateCheckpointId::new(41),
-            old_root: AuthorityStateRoot::from_local_state_root(hash(3)),
-            new_root: AuthorityStateRoot::from_local_state_root(hash(4)),
+        AuthorityStateTransition::Unchanged {
+            checkpoint: AuthorityStateCheckpointId::new(39),
+            root: AuthorityStateRoot::from_local_state_root(hash(3)),
         },
         AuthorityHeadPayload::try_new(vec![0x66; 16]).unwrap(),
         artifacts,

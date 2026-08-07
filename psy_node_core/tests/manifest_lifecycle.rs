@@ -143,13 +143,14 @@ fn prepared_with_state_change(
 }
 
 fn realm_prepared(seed: u8) -> PreparedAuthorityManifestRecord<PHash> {
-    prepared(
+    prepared_with_state_change(
         AuthorityScope::Realm {
             realm_id: 4,
             realm_sub_id: 2,
         },
         11,
         seed,
+        false,
     )
 }
 
@@ -316,6 +317,27 @@ fn unchanged_realm_state_remains_sparse_while_manifest_advances() {
     )
     .unwrap();
     assert_eq!(sealed.verified_head(), &candidate);
+}
+
+#[test]
+fn changed_realm_cannot_use_the_unchanged_proof_marker() {
+    let record = prepared_with_state_change(
+        AuthorityScope::Realm {
+            realm_id: 4,
+            realm_sub_id: 2,
+        },
+        11,
+        16,
+        true,
+    );
+    assert_eq!(
+        SealedAuthorityManifest::verify_and_seal(
+            record.clone(),
+            realm_observation(&record),
+        )
+        .unwrap_err(),
+        ManifestLifecycleError::ChangedRealmEvidenceRequired
+    );
 }
 
 #[test]
@@ -593,11 +615,11 @@ fn lifecycle_codec_is_deterministic_and_keeps_prepared_digest_immutable() {
     );
     assert_eq!(
         hex::encode(first.sealed().lifecycle_digest().as_bytes()),
-        "ffe9e4205628824fd11b7468fc3bb7655a182409e364cb606fb9811f0afc37f1"
+        "7c8328ca69d28208cfb1ac2df7f93e9a74bbfa8b30ee2632b3f623b8c002e552"
     );
     assert_eq!(
         hex::encode(first.lifecycle_digest().as_bytes()),
-        "3fcc6bd563d2a8598348fb01063087fb475e3cd62e97bde87ee18903998f5736"
+        "d47703f5825434a41e1013964811f65faf502c7c65dc29ecc4328c855b6fd469"
     );
 }
 

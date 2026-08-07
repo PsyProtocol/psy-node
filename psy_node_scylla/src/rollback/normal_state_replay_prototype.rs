@@ -7,8 +7,10 @@
 //! without pretending that all 35 physical tables have replay adapters: every
 //! exact physical row is read back, the committed state root is compared
 //! independently, and only then can an [`AuthorityPostWriteObservation`] be
-//! produced for SEALED. The representative root is not yet a proof that binds
-//! these IMT rows into the upstream contract-state commitment.
+//! produced. A changed Realm still cannot become SEALED until the caller also
+//! attaches live Realm proof-plus-mutation-graph evidence. The representative
+//! root is not yet a proof that binds these IMT rows into the upstream
+//! contract-state commitment.
 
 use std::{error::Error, fmt};
 
@@ -485,9 +487,12 @@ impl<Hash: Q256BitHash> RepresentativeRealmStateReplayPlan<Hash> {
         &self.prepared
     }
 
-    /// Convert exact physical read-back into lifecycle evidence. A root-only
-    /// check is intentionally insufficient: every manifest row must exist and
-    /// match before this constructor returns an observation.
+    /// Convert exact physical read-back into a partial lifecycle observation.
+    /// A root-only check is intentionally insufficient: every manifest row
+    /// must exist and match before this constructor returns. Because this
+    /// adapter does not verify the Realm proof or IMT mutation graph, callers
+    /// must attach `SealedRealmManifestEvidence` before a changed Realm can be
+    /// SEALED.
     pub fn verify_observed_rows(
         &self,
         observed: &[Option<Vec<u8>>],
@@ -765,7 +770,7 @@ mod tests {
             AuthorityHeadPayload, AuthorityStateTransition,
             SealedAuthorityCommitIntent,
         },
-        manifest_lifecycle::SealedAuthorityManifest,
+        manifest_lifecycle::{ManifestLifecycleError, SealedAuthorityManifest},
         timestamp::CommitWriteTimestampUs,
         typed::{
             CheckpointId as StorageCheckpointId, CheckpointRootKey,
@@ -996,7 +1001,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_payload_becomes_exact_timestamped_replay_and_seal_evidence() {
+    fn exact_timestamped_replay_still_requires_realm_manifest_evidence() {
         let plan = plan();
         assert_eq!(plan.mutation_count(), 8);
         assert_eq!(plan.checkpoint_root_pair.start, 5);
@@ -1024,11 +1029,14 @@ mod tests {
             .map(|row| Some(row.value.clone()))
             .collect::<Vec<_>>();
         let observation = plan.verify_observed_rows(&observed).unwrap();
-        SealedAuthorityManifest::verify_and_seal(
-            plan.prepared().clone(),
-            observation,
-        )
-        .unwrap();
+        assert_eq!(
+            SealedAuthorityManifest::verify_and_seal(
+                plan.prepared().clone(),
+                observation,
+            )
+            .unwrap_err(),
+            ManifestLifecycleError::ChangedRealmEvidenceRequired
+        );
     }
 
     #[test]

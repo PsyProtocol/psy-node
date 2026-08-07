@@ -39,7 +39,8 @@ use psy_node_core::store::{
     manifest_lifecycle::{
         AuthorityHeadPayloadDigest, AuthorityHeadView,
         AuthorityPostWriteObservation, AuthorityProofObservation,
-        PersistedAuthorityManifest, SealedAuthorityManifest,
+        ManifestLifecycleError, PersistedAuthorityManifest,
+        SealedAuthorityManifest,
     },
     manifest_record::AuthorityManifestIdentity,
     normal_commit::{
@@ -935,7 +936,7 @@ struct D04b2cReport {
     restart_count: u8,
     partial_root_present_before_replay: bool,
     missing_row_rejected_before_seal: bool,
-    exact_replay_sealed: bool,
+    exact_replay_verified_manifest_evidence_required: bool,
     direct_one_replicas_equal: bool,
     scenarios_passed: Vec<&'static str>,
     finished_unix_ms: u64,
@@ -991,10 +992,14 @@ async fn d04b2c_representative_state_replay_rf3_gate() -> anyhow::Result<()> {
     docker_container("stop", NODE_CONTAINERS[2])?;
     executor.reapply_all(&plan).await?;
     let observation = executor.verify_exact(&plan).await?;
-    SealedAuthorityManifest::verify_and_seal(
-        plan.prepared().clone(),
-        observation,
-    )?;
+    ensure!(
+        SealedAuthorityManifest::verify_and_seal(
+            plan.prepared().clone(),
+            observation,
+        )
+        .unwrap_err()
+            == ManifestLifecycleError::ChangedRealmEvidenceRequired
+    );
     drop(stores);
 
     docker_container("start", NODE_CONTAINERS[2])?;
@@ -1016,12 +1021,12 @@ async fn d04b2c_representative_state_replay_rf3_gate() -> anyhow::Result<()> {
         restart_count: 1,
         partial_root_present_before_replay: root_present,
         missing_row_rejected_before_seal: true,
-        exact_replay_sealed: true,
+        exact_replay_verified_manifest_evidence_required: true,
         direct_one_replicas_equal: true,
         scenarios_passed: vec![
             "M16_partial_state_write_restart_reapplies_exact_timestamped_rows",
             "M17_root_present_but_missing_non_root_row_cannot_seal",
-            "IMT_leaf_index_cursor_exact_rows_are_all_required_before_seal",
+            "IMT_leaf_index_cursor_exact_rows_are_all_required_before_realm_evidence",
             "one_replica_offline_quorum_replay_then_repair_flush_compact",
             "direct_one_all_replicas_equal_expected_rows",
         ],
@@ -1061,7 +1066,7 @@ struct D04b2dReport {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires the destructive local three-node Scylla RF=3 harness"]
+#[ignore = "requires the destructive RF=3 harness and changed-Realm supplement orchestration"]
 async fn d04b2d_combined_representative_normal_commit_rf3_gate(
 ) -> anyhow::Result<()> {
     if std::env::var_os("PSY_D04B2D_RF3").is_none() {
@@ -1236,7 +1241,7 @@ struct D04b2eReport {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires the destructive local three-node Scylla RF=3 harness"]
+#[ignore = "requires the destructive RF=3 harness and changed-Realm supplement orchestration"]
 async fn d04b2e_conflicting_normal_commit_rf3_gate() -> anyhow::Result<()> {
     if std::env::var_os("PSY_D04B2E_RF3").is_none() {
         bail!("set PSY_D04B2E_RF3=1 through run-d04b2e.sh");

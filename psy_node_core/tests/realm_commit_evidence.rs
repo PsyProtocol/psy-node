@@ -61,6 +61,11 @@ use psy_node_core::store::{
         AuthorityHeadPayload, AuthorityStateTransition,
         ManifestArtifactSetCommitment, SealedAuthorityCommitIntent,
     },
+    manifest_lifecycle::{
+        AuthorityHeadPayloadDigest, AuthorityHeadView,
+        AuthorityPostWriteObservation, AuthorityProofObservation,
+        ManifestLifecycleError, SealedAuthorityManifest,
+    },
     manifest_record::PreparedAuthorityManifestRecord,
     realm_commit_evidence::{
         PersistedRealmCommitEvidence, RealmCommitEvidenceError,
@@ -1045,5 +1050,120 @@ fn manifest_supplement_codec_fails_closed_without_recreating_live_authority() {
             &bad_outer_digest
         ),
         Err(RealmManifestEvidenceError::SupplementDigestMismatch)
+    );
+}
+
+#[test]
+fn changed_realm_lifecycle_consumes_and_persists_exact_supplement() {
+    let fixture = fixture(0, 0, COORDINATOR_HEIGHT);
+    let prepared = matching_manifest(&fixture, 70);
+    let supplement = SealedRealmManifestEvidence::try_bind(
+        &prepared,
+        bundle(&fixture).unwrap(),
+    )
+    .unwrap();
+    let expected_supplement = supplement.record().clone();
+    let observation = AuthorityPostWriteObservation::new(
+        AuthorityHeadView::candidate(&prepared),
+        prepared.intent().artifacts().mutation_digest(),
+        AuthorityHeadPayloadDigest::from_verified_payload_bytes(
+            prepared.intent().head_payload().as_bytes(),
+        ),
+        AuthorityProofObservation::NotApplicableForRealm,
+    )
+    .attach_changed_realm_evidence(supplement);
+    let sealed = SealedAuthorityManifest::verify_and_seal(
+        prepared.clone(),
+        observation,
+    )
+    .unwrap();
+    assert_eq!(
+        sealed.realm_manifest_evidence(),
+        Some(&expected_supplement)
+    );
+    assert_eq!(
+        sealed.encode_canonical()[sealed.encode_canonical().len()
+            - REALM_MANIFEST_EVIDENCE_V1_LEN
+            - 1],
+        3
+    );
+
+    let decoded = SealedAuthorityManifest::<PHash>::decode_persisted(
+        *prepared.identity(),
+        sealed.revision().as_i64(),
+        sealed.status() as i8,
+        prepared.digest().as_bytes(),
+        sealed.lifecycle_digest().as_bytes(),
+        sealed.encode_canonical(),
+    )
+    .unwrap();
+    assert_eq!(decoded, sealed);
+    assert_eq!(
+        decoded.realm_manifest_evidence(),
+        Some(&expected_supplement)
+    );
+}
+
+#[test]
+fn unchanged_realm_lifecycle_rejects_a_changed_realm_supplement() {
+    let fixture = fixture(0, 0, COORDINATOR_HEIGHT);
+    let changed = matching_manifest(&fixture, 71);
+    let supplement = SealedRealmManifestEvidence::try_bind(
+        &changed,
+        bundle(&fixture).unwrap(),
+    )
+    .unwrap();
+    let unchanged = prepared_manifest(
+        fixture.authority,
+        fixture.coordinator.canonical_chain_ref,
+        PREDECESSOR,
+        fixture.prepared.old_realm_root,
+        fixture.prepared.old_realm_root,
+        false,
+        72,
+    );
+    let observation = AuthorityPostWriteObservation::new(
+        AuthorityHeadView::candidate(&unchanged),
+        unchanged.intent().artifacts().mutation_digest(),
+        AuthorityHeadPayloadDigest::from_verified_payload_bytes(
+            unchanged.intent().head_payload().as_bytes(),
+        ),
+        AuthorityProofObservation::NotApplicableForRealm,
+    )
+    .attach_changed_realm_evidence(supplement);
+
+    assert_eq!(
+        SealedAuthorityManifest::verify_and_seal(unchanged, observation)
+            .unwrap_err(),
+        ManifestLifecycleError::UnchangedRealmEvidenceForbidden
+    );
+}
+
+#[test]
+fn changed_realm_lifecycle_rejects_supplement_for_another_prepared_record() {
+    let fixture = fixture(0, 0, COORDINATOR_HEIGHT);
+    let original = matching_manifest(&fixture, 73);
+    let supplement = SealedRealmManifestEvidence::try_bind(
+        &original,
+        bundle(&fixture).unwrap(),
+    )
+    .unwrap();
+    let other = matching_manifest(&fixture, 74);
+    let observation = AuthorityPostWriteObservation::new(
+        AuthorityHeadView::candidate(&other),
+        other.intent().artifacts().mutation_digest(),
+        AuthorityHeadPayloadDigest::from_verified_payload_bytes(
+            other.intent().head_payload().as_bytes(),
+        ),
+        AuthorityProofObservation::NotApplicableForRealm,
+    )
+    .attach_changed_realm_evidence(supplement);
+
+    assert_eq!(
+        SealedAuthorityManifest::verify_and_seal(other, observation)
+            .unwrap_err(),
+        ManifestLifecycleError::RealmManifestEvidence(
+            RealmManifestEvidenceError::PreparedManifestDigestMismatch
+        )
     );
 }

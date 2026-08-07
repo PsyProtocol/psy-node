@@ -22,6 +22,10 @@ use super::{
         AuthorityManifestStatus, ManifestRecordError, ManifestRevision,
         PreparedAuthorityManifestRecord,
     },
+    realm_manifest_evidence::{
+        PersistedRealmManifestEvidence, RealmManifestEvidenceError,
+        SealedRealmManifestEvidence, REALM_MANIFEST_EVIDENCE_V1_LEN,
+    },
 };
 
 const AUTHORITY_HEAD_PAYLOAD_DIGEST_DOMAIN: &[u8] =
@@ -209,28 +213,36 @@ impl<Hash: Q256BitHash> AuthorityHeadView<Hash> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AuthorityProofObservation<Hash> {
     CoordinatorPublicInput(CheckpointHash<Hash>),
+    /// Legal only when the Realm's authority-local state transition is
+    /// `Unchanged`. A changed Realm must attach a live manifest supplement.
     NotApplicableForRealm,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum AuthoritySealProofEvidence<Hash> {
+    Public(AuthorityProofObservation<Hash>),
+    ChangedRealm(PersistedRealmManifestEvidence<Hash>),
 }
 
 /// Raw observation returned by the state/root/proof verifier. It has no
 /// authority until `SealedAuthorityManifest::verify_and_seal` matches every
 /// field against the PREPARED record.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuthorityPostWriteObservation<Hash> {
     head: AuthorityHeadView<Hash>,
     mutation_digest: [u8; 32],
     head_payload_digest: AuthorityHeadPayloadDigest,
-    proof: AuthorityProofObservation<Hash>,
+    proof: AuthoritySealProofEvidence<Hash>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct VerifiedSealEvidence<Hash> {
     mutation_digest: [u8; 32],
     head_payload_digest: AuthorityHeadPayloadDigest,
-    proof: AuthorityProofObservation<Hash>,
+    proof: AuthoritySealProofEvidence<Hash>,
 }
 
-impl<Hash> AuthorityPostWriteObservation<Hash> {
+impl<Hash: Q256BitHash> AuthorityPostWriteObservation<Hash> {
     pub const fn new(
         head: AuthorityHeadView<Hash>,
         mutation_digest: [u8; 32],
@@ -241,7 +253,22 @@ impl<Hash> AuthorityPostWriteObservation<Hash> {
             head,
             mutation_digest,
             head_payload_digest,
-            proof,
+            proof: AuthoritySealProofEvidence::Public(proof),
+        }
+    }
+
+    /// Replace the unchanged-Realm placeholder with a capability that was
+    /// bound to one exact PREPARED manifest. The manifest lifecycle validates
+    /// the binding again before SEALED is produced.
+    pub fn attach_changed_realm_evidence(
+        self,
+        evidence: SealedRealmManifestEvidence<Hash>,
+    ) -> Self {
+        Self {
+            proof: AuthoritySealProofEvidence::ChangedRealm(
+                evidence.into_record(),
+            ),
+            ..self
         }
     }
 }
@@ -279,26 +306,7 @@ impl<Hash: Q256BitHash> SealedAuthorityManifest<Hash> {
         if observation.head_payload_digest != expected_head_payload_digest {
             return Err(ManifestLifecycleError::HeadPayloadDigestMismatch);
         }
-        match (prepared.identity().authority(), observation.proof) {
-            (
-                AuthorityScope::Coordinator,
-                AuthorityProofObservation::CoordinatorPublicInput(hash),
-            ) if hash == *candidate.chain().checkpoint().checkpoint_hash() => {}
-            (
-                AuthorityScope::Coordinator,
-                AuthorityProofObservation::CoordinatorPublicInput(_),
-            ) => return Err(ManifestLifecycleError::ProofCheckpointHashMismatch),
-            (AuthorityScope::Coordinator, _) => {
-                return Err(ManifestLifecycleError::CoordinatorProofRequired)
-            }
-            (
-                AuthorityScope::Realm { .. },
-                AuthorityProofObservation::NotApplicableForRealm,
-            ) => {}
-            (AuthorityScope::Realm { .. }, _) => {
-                return Err(ManifestLifecycleError::RealmProofMustBeAbsent)
-            }
-        }
+        validate_proof_evidence(&prepared, &candidate, &observation.proof)?;
         let evidence = VerifiedSealEvidence {
             mutation_digest: observation.mutation_digest,
             head_payload_digest: observation.head_payload_digest,
@@ -312,7 +320,7 @@ impl<Hash: Q256BitHash> SealedAuthorityManifest<Hash> {
         verified_head: AuthorityHeadView<Hash>,
         evidence: VerifiedSealEvidence<Hash>,
     ) -> Result<Self, ManifestLifecycleError> {
-        let canonical_payload = encode_sealed_payload(&prepared, evidence)?;
+        let canonical_payload = encode_sealed_payload(&prepared, &evidence)?;
         let lifecycle_digest = AuthorityLifecycleDigest::calculate(
             SEALED_MANIFEST_DIGEST_DOMAIN,
             &canonical_payload,
@@ -346,12 +354,12 @@ impl<Hash: Q256BitHash> SealedAuthorityManifest<Hash> {
             prepared_digest,
             canonical_payload,
         )?;
-        let observation = AuthorityPostWriteObservation::new(
-            AuthorityHeadView::candidate(&decoded.prepared),
-            decoded.evidence.mutation_digest,
-            decoded.evidence.head_payload_digest,
-            decoded.evidence.proof,
-        );
+        let observation = AuthorityPostWriteObservation {
+            head: AuthorityHeadView::candidate(&decoded.prepared),
+            mutation_digest: decoded.evidence.mutation_digest,
+            head_payload_digest: decoded.evidence.head_payload_digest,
+            proof: decoded.evidence.proof,
+        };
         let sealed = Self::verify_and_seal(decoded.prepared, observation)?;
         if sealed.canonical_payload != canonical_payload {
             return Err(ManifestLifecycleError::NonCanonicalLifecyclePayload);
@@ -377,6 +385,17 @@ impl<Hash: Q256BitHash> SealedAuthorityManifest<Hash> {
 
     pub const fn verified_head(&self) -> &AuthorityHeadView<Hash> {
         &self.verified_head
+    }
+
+    pub fn realm_manifest_evidence(
+        &self,
+    ) -> Option<&PersistedRealmManifestEvidence<Hash>> {
+        match &self.evidence.proof {
+            AuthoritySealProofEvidence::ChangedRealm(evidence) => {
+                Some(evidence)
+            }
+            AuthoritySealProofEvidence::Public(_) => None,
+        }
     }
 
     pub fn encode_canonical(&self) -> &[u8] {
@@ -772,9 +791,67 @@ struct DecodedSealedPayload<Hash> {
     evidence: VerifiedSealEvidence<Hash>,
 }
 
+fn validate_proof_evidence<Hash: Q256BitHash>(
+    prepared: &PreparedAuthorityManifestRecord<Hash>,
+    candidate: &AuthorityHeadView<Hash>,
+    proof: &AuthoritySealProofEvidence<Hash>,
+) -> Result<(), ManifestLifecycleError> {
+    let state_changed = prepared.intent().state_transition().state_changed();
+    match (prepared.identity().authority(), state_changed, proof) {
+        (
+            AuthorityScope::Coordinator,
+            _,
+            AuthoritySealProofEvidence::Public(
+                AuthorityProofObservation::CoordinatorPublicInput(hash),
+            ),
+        ) if hash == candidate.chain().checkpoint().checkpoint_hash() => Ok(()),
+        (
+            AuthorityScope::Coordinator,
+            _,
+            AuthoritySealProofEvidence::Public(
+                AuthorityProofObservation::CoordinatorPublicInput(_),
+            ),
+        ) => Err(ManifestLifecycleError::ProofCheckpointHashMismatch),
+        (AuthorityScope::Coordinator, _, _) => {
+            Err(ManifestLifecycleError::CoordinatorProofRequired)
+        }
+        (
+            AuthorityScope::Realm { .. },
+            false,
+            AuthoritySealProofEvidence::Public(
+                AuthorityProofObservation::NotApplicableForRealm,
+            ),
+        ) => Ok(()),
+        (
+            AuthorityScope::Realm { .. },
+            true,
+            AuthoritySealProofEvidence::ChangedRealm(evidence),
+        ) => evidence.verify_for(prepared).map_err(Into::into),
+        (
+            AuthorityScope::Realm { .. },
+            true,
+            AuthoritySealProofEvidence::Public(
+                AuthorityProofObservation::NotApplicableForRealm,
+            ),
+        ) => Err(ManifestLifecycleError::ChangedRealmEvidenceRequired),
+        (
+            AuthorityScope::Realm { .. },
+            false,
+            AuthoritySealProofEvidence::ChangedRealm(_),
+        ) => Err(ManifestLifecycleError::UnchangedRealmEvidenceForbidden),
+        (
+            AuthorityScope::Realm { .. },
+            _,
+            AuthoritySealProofEvidence::Public(
+                AuthorityProofObservation::CoordinatorPublicInput(_),
+            ),
+        ) => Err(ManifestLifecycleError::RealmProofMustBeAbsent),
+    }
+}
+
 fn encode_sealed_payload<Hash: Q256BitHash>(
     prepared: &PreparedAuthorityManifestRecord<Hash>,
-    evidence: VerifiedSealEvidence<Hash>,
+    evidence: &VerifiedSealEvidence<Hash>,
 ) -> Result<Vec<u8>, ManifestLifecycleError> {
     let prepared_payload = prepared.encode_canonical();
     let prepared_len = u32::try_from(prepared_payload.len()).map_err(|_| {
@@ -788,14 +865,22 @@ fn encode_sealed_payload<Hash: Q256BitHash>(
     out.extend_from_slice(prepared_payload);
     out.extend_from_slice(&evidence.mutation_digest);
     out.extend_from_slice(evidence.head_payload_digest.as_bytes());
-    match evidence.proof {
-        AuthorityProofObservation::CoordinatorPublicInput(hash) => {
+    match &evidence.proof {
+        AuthoritySealProofEvidence::Public(
+            AuthorityProofObservation::CoordinatorPublicInput(hash),
+        ) => {
             out.push(1);
-            out.extend_from_slice(&hash.into_inner().into_owned_32bytes());
+            out.extend_from_slice(&hash.as_inner().into_owned_32bytes());
         }
-        AuthorityProofObservation::NotApplicableForRealm => {
+        AuthoritySealProofEvidence::Public(
+            AuthorityProofObservation::NotApplicableForRealm,
+        ) => {
             out.push(2);
             out.extend_from_slice(&[0; 32]);
+        }
+        AuthoritySealProofEvidence::ChangedRealm(evidence) => {
+            out.push(3);
+            out.extend_from_slice(evidence.encode_canonical());
         }
     }
     Ok(out)
@@ -807,8 +892,8 @@ fn decode_sealed_payload<Hash: Q256BitHash>(
     bytes: &[u8],
 ) -> Result<DecodedSealedPayload<Hash>, ManifestLifecycleError> {
     const PREFIX_LEN: usize = 46;
-    const EVIDENCE_LEN: usize = 97;
-    if bytes.len() < PREFIX_LEN + EVIDENCE_LEN {
+    const EVIDENCE_PREFIX_LEN: usize = 65;
+    if bytes.len() < PREFIX_LEN + EVIDENCE_PREFIX_LEN {
         return Err(ManifestLifecycleError::TruncatedLifecyclePayload);
     }
     if bytes[..8] != SEALED_AUTHORITY_MANIFEST_MAGIC {
@@ -833,8 +918,22 @@ fn decode_sealed_payload<Hash: Q256BitHash>(
     let prepared_end = PREFIX_LEN
         .checked_add(prepared_len)
         .ok_or(ManifestLifecycleError::LifecyclePayloadLengthOverflow)?;
-    let expected_end = prepared_end
-        .checked_add(EVIDENCE_LEN)
+    let evidence_prefix_end = prepared_end
+        .checked_add(EVIDENCE_PREFIX_LEN)
+        .ok_or(ManifestLifecycleError::LifecyclePayloadLengthOverflow)?;
+    if bytes.len() < evidence_prefix_end {
+        return Err(ManifestLifecycleError::TruncatedLifecyclePayload);
+    }
+    let mutation_end = prepared_end + 32;
+    let head_payload_end = mutation_end + 32;
+    let proof_kind = bytes[head_payload_end];
+    let proof_len = match proof_kind {
+        1 | 2 => 32,
+        3 => REALM_MANIFEST_EVIDENCE_V1_LEN,
+        value => return Err(ManifestLifecycleError::UnknownProofKind(value)),
+    };
+    let expected_end = evidence_prefix_end
+        .checked_add(proof_len)
         .ok_or(ManifestLifecycleError::LifecyclePayloadLengthOverflow)?;
     if bytes.len() < expected_end {
         return Err(ManifestLifecycleError::TruncatedLifecyclePayload);
@@ -849,23 +948,25 @@ fn decode_sealed_payload<Hash: Q256BitHash>(
         selected_prepared_digest,
         &bytes[PREFIX_LEN..prepared_end],
     )?;
-    let mutation_end = prepared_end + 32;
-    let head_payload_end = mutation_end + 32;
-    let proof_kind = bytes[head_payload_end];
-    let proof_bytes: [u8; 32] = bytes[head_payload_end + 1..expected_end]
-        .try_into()
-        .expect("fixed");
+    let proof_bytes = &bytes[evidence_prefix_end..expected_end];
     let proof = match proof_kind {
-        1 => AuthorityProofObservation::CoordinatorPublicInput(
-            CheckpointHash::from_proof_public_inputs_hash(
-                Hash::from_owned_32bytes(proof_bytes),
+        1 => AuthoritySealProofEvidence::Public(
+            AuthorityProofObservation::CoordinatorPublicInput(
+                CheckpointHash::from_proof_public_inputs_hash(
+                    Hash::from_owned_32bytes(
+                        proof_bytes.try_into().expect("validated length"),
+                    ),
+                ),
             ),
         ),
-        2 if proof_bytes == [0; 32] => {
-            AuthorityProofObservation::NotApplicableForRealm
-        }
+        2 if proof_bytes == [0; 32] => AuthoritySealProofEvidence::Public(
+            AuthorityProofObservation::NotApplicableForRealm,
+        ),
         2 => return Err(ManifestLifecycleError::NonCanonicalRealmProof),
-        value => return Err(ManifestLifecycleError::UnknownProofKind(value)),
+        3 => AuthoritySealProofEvidence::ChangedRealm(
+            PersistedRealmManifestEvidence::decode_canonical(proof_bytes)?,
+        ),
+        _ => unreachable!("proof kind validated above"),
     };
     Ok(DecodedSealedPayload {
         prepared,
@@ -1011,6 +1112,9 @@ pub enum ManifestLifecycleError {
     CoordinatorProofRequired,
     ProofCheckpointHashMismatch,
     RealmProofMustBeAbsent,
+    ChangedRealmEvidenceRequired,
+    UnchangedRealmEvidenceForbidden,
+    RealmManifestEvidence(RealmManifestEvidenceError),
     AppliedHeadCasMismatch,
     HeadPublishReceiptMismatch,
     CommittedHeadMismatch,
@@ -1037,6 +1141,12 @@ pub enum ManifestLifecycleError {
 impl From<ManifestRecordError> for ManifestLifecycleError {
     fn from(value: ManifestRecordError) -> Self {
         Self::ManifestRecord(value)
+    }
+}
+
+impl From<RealmManifestEvidenceError> for ManifestLifecycleError {
+    fn from(value: RealmManifestEvidenceError) -> Self {
+        Self::RealmManifestEvidence(value)
     }
 }
 
