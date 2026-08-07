@@ -21,6 +21,7 @@ mod checkpoint_object_single;
 mod checkpoint_root_pair;
 mod public_key_projection;
 mod realm_imt_predecessor;
+mod realm_normal_commit_coverage;
 #[cfg(test)]
 mod realm_imt_predecessor_rf3_gate;
 mod imt_family;
@@ -59,6 +60,7 @@ pub use checkpoint_object_single::*;
 pub use checkpoint_root_pair::*;
 pub use public_key_projection::*;
 pub use realm_imt_predecessor::*;
+pub use realm_normal_commit_coverage::*;
 pub use imt_family::*;
 pub use rollback_admission::*;
 pub use identity::*;

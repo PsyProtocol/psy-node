@@ -10,6 +10,7 @@ pub mod realm_commit_evidence;
 pub mod realm_commit_evidence_assembly;
 pub mod realm_commit_seal;
 pub mod realm_manifest_evidence;
+pub mod realm_normal_commit_coverage;
 pub mod realm_prepared_payload;
 pub mod realm_proof_binding;
 pub mod realm_imt_mutation_graph;

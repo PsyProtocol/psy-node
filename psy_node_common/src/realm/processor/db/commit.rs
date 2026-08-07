@@ -22,7 +22,10 @@ use psy_node_core::{
     },
     psy_temp_db::StandardProcessorTempDBStoreBase,
     queue::{ephemeral::QStandardEphemeralQueueSubscriber, worker_queue::QStandardWorkerQueuePublisher},
-    store::traits::proof_store::QParthProofStore,
+    store::{
+        realm_normal_commit_coverage::RealmNormalCommitCoveragePlan,
+        traits::proof_store::QParthProofStore,
+    },
 };
 use parth_common::memory_stores::traits::PsyMemoryMerkleStoreImm;
 
@@ -234,10 +237,14 @@ where
         if commit_input.origin_kind() == RealmCommitOriginKind::LiveProof {
             // This deliberately retains all four exact live inputs at the
             // first-write boundary.  Full physical writer coverage is not yet
-            // available, so durable PREPARED persistence remains disabled;
-            // the next integration slice will consume this capability before
-            // the first mapping write below.
+            // available, so durable PREPARED persistence remains disabled.
+            // This slice only derives the exact semantic call-graph coverage;
+            // the Scylla resolver independently blocks activation until every
+            // physical writer and affected schema is ready.
             let live = commit_input.require_live_evidence()?;
+            let coverage =
+                RealmNormalCommitCoveragePlan::from_prepared(live.prepared());
+            let semantic_write_domains = coverage.domains().count();
             tracing::debug!(
                 checkpoint_id = coordinator_update.checkpoint_sync_info.checkpoint_id,
                 proof_bytes = live.proof_bytes().len(),
@@ -249,7 +256,13 @@ where
                     .checkpoint()
                     .checkpoint_id()
                     .get(),
-                "validated exact live Realm commit input boundary"
+                semantic_write_domains,
+                invokes_state_update_branch = coverage
+                    .invokes_state_update_branch(),
+                invokes_imt_branch = coverage.invokes_imt_branch(),
+                ignored_prepared_fields = coverage
+                    .ignored_prepared_field_count(),
+                "validated exact live Realm commit input and semantic write coverage"
             );
         }
         self.validate_realm_sync_context(coordinator_update)?;
