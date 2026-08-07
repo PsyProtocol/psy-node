@@ -26,6 +26,9 @@ use super::{
         SealedAuthorityManifest, SealedManifestRecoveryAction,
     },
     manifest_record::PreparedAuthorityManifestRecord,
+    realm_commit_seal::{
+        ChangedRealmCommitSealError, ChangedRealmCommitSealEvidence,
+    },
 };
 
 /// The only next durable operation permitted by the observed manifest, head
@@ -163,6 +166,25 @@ pub fn seal_verified_normal_commit<Hash: Q256BitHash>(
         .map_err(Into::into)
 }
 
+/// Cross the changed-Realm state/proof/graph verification boundary. The
+/// evidence can only have been assembled from live proof and graph seals for
+/// this exact PREPARED manifest. Head and allocator authority are re-read by
+/// the caller and checked before the lifecycle seal is recreated.
+pub fn seal_verified_changed_realm_commit<Hash: Q256BitHash>(
+    prepared: PreparedAuthorityManifestRecord<Hash>,
+    evidence: ChangedRealmCommitSealEvidence<Hash>,
+    current_head: &StoredAuthorityLocalHead<Hash>,
+    allocator: ObservedAuthorityTimestampState,
+) -> Result<SealedAuthorityManifest<Hash>, NormalCommitOrchestrationError> {
+    let observation = evidence.into_observation_for(&prepared)?;
+    seal_verified_normal_commit(
+        prepared,
+        observation,
+        current_head,
+        allocator,
+    )
+}
+
 /// Revalidate allocator ownership immediately before executing a previously
 /// sealed head-publish capability.  A planner result may have waited in a
 /// queue while another task made progress, so the Scylla adapter must not
@@ -285,6 +307,7 @@ pub enum NormalCommitOrchestrationError {
     ManifestLifecycle(ManifestLifecycleError),
     AuthorityCommit(AuthorityCommitModelError),
     AuthorityLocalHead(AuthorityLocalHeadModelError),
+    ChangedRealmCommitSeal(ChangedRealmCommitSealError),
     PreparedHeadIsNotExpected,
     AuthorityHeadChangedBeforeSeal,
     AuthorityHeadConflict,
@@ -311,6 +334,12 @@ impl From<AuthorityCommitModelError> for NormalCommitOrchestrationError {
 impl From<AuthorityLocalHeadModelError> for NormalCommitOrchestrationError {
     fn from(value: AuthorityLocalHeadModelError) -> Self {
         Self::AuthorityLocalHead(value)
+    }
+}
+
+impl From<ChangedRealmCommitSealError> for NormalCommitOrchestrationError {
+    fn from(value: ChangedRealmCommitSealError) -> Self {
+        Self::ChangedRealmCommitSeal(value)
     }
 }
 

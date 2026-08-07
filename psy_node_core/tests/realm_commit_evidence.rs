@@ -56,6 +56,12 @@ use psy_node_core::store::{
     authority_commit::{
         AuthorityClockSampleUs, AuthorityTimestampBootstrap,
         AuthorityTimestampBootstrapReason, AuthorityTimestampKey,
+        ObservedAuthorityTimestampState,
+    },
+    authority_local_head::{
+        AuthorityLocalHeadBootstrap, AuthorityLocalHeadBootstrapReason,
+        AuthorityStorageBindingGeneration, AuthorityStorageBindingRef,
+        AuthorityStorageNamespaceId, StoredAuthorityLocalHead,
     },
     manifest_intent::{
         AuthorityHeadPayload, AuthorityStateTransition,
@@ -67,10 +73,17 @@ use psy_node_core::store::{
         ManifestLifecycleError, SealedAuthorityManifest,
     },
     manifest_record::PreparedAuthorityManifestRecord,
+    normal_commit::{
+        seal_verified_changed_realm_commit,
+        NormalCommitOrchestrationError,
+    },
     realm_commit_evidence::{
         PersistedRealmCommitEvidence, RealmCommitEvidenceError,
         SealedRealmCommitEvidence, REALM_COMMIT_EVIDENCE_CODEC_VERSION,
         REALM_COMMIT_EVIDENCE_V1_LEN,
+    },
+    realm_commit_seal::{
+        ChangedRealmCommitSealError, ChangedRealmCommitSealEvidence,
     },
     realm_manifest_evidence::{
         PersistedRealmManifestEvidence, RealmManifestEvidenceError,
@@ -621,6 +634,65 @@ fn matching_manifest(
     )
 }
 
+fn post_write_observation(
+    prepared: &PreparedAuthorityManifestRecord<PHash>,
+) -> AuthorityPostWriteObservation<PHash> {
+    AuthorityPostWriteObservation::new(
+        AuthorityHeadView::candidate(prepared),
+        prepared.intent().artifacts().mutation_digest(),
+        AuthorityHeadPayloadDigest::from_verified_payload_bytes(
+            prepared.intent().head_payload().as_bytes(),
+        ),
+        AuthorityProofObservation::NotApplicableForRealm,
+    )
+}
+
+fn commit_authorities(
+    prepared: &PreparedAuthorityManifestRecord<PHash>,
+) -> (
+    StoredAuthorityLocalHead<PHash>,
+    ObservedAuthorityTimestampState,
+) {
+    let key = prepared.identity().timestamp_key();
+    let reservation = AuthorityTimestampBootstrap::new(
+        key,
+        CommitWriteTimestampUs::try_from_i128(2_000).unwrap(),
+        AuthorityTimestampBootstrapReason::GenesisNative,
+    )
+    .candidate()
+    .seal_reservation(
+        key,
+        prepared.intent().digest(),
+        AuthorityClockSampleUs::try_from_i128(2_001).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        reservation.lease().timestamp(),
+        prepared.commit_write_timestamp()
+    );
+    let head = AuthorityLocalHeadBootstrap::seal(
+        AuthorityLocalHeadBootstrapReason::GenesisNative,
+        AuthorityHeadView::expected(prepared),
+        CommitWriteTimestampUs::try_from_i128(1_999).unwrap(),
+        prepared.digest(),
+        AuthorityStorageBindingRef::new(
+            AuthorityStorageBindingGeneration::try_new(0).unwrap(),
+            AuthorityStorageNamespaceId::from_verified_namespace_id([
+                0xA9; 32
+            ]),
+        ),
+    )
+    .candidate()
+    .clone();
+    (
+        head,
+        ObservedAuthorityTimestampState::from_selected_row(
+            key,
+            reservation.candidate(),
+        ),
+    )
+}
+
 #[test]
 fn real_proof_and_graph_seals_form_one_deterministic_bundle() {
     let fixture = fixture(0, 0, COORDINATOR_HEIGHT);
@@ -1165,5 +1237,134 @@ fn changed_realm_lifecycle_rejects_supplement_for_another_prepared_record() {
         ManifestLifecycleError::RealmManifestEvidence(
             RealmManifestEvidenceError::PreparedManifestDigestMismatch
         )
+    );
+}
+
+#[test]
+fn live_proof_graph_and_post_write_observation_form_one_commit_seal_capability() {
+    let fixture = fixture(0, 0, COORDINATOR_HEIGHT);
+    let prepared = matching_manifest(&fixture, 80);
+    let evidence = ChangedRealmCommitSealEvidence::try_bind(
+        &prepared,
+        post_write_observation(&prepared),
+        fixture.proof_seal().unwrap(),
+        fixture.graph_seal().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(evidence.prepared_manifest_digest(), prepared.digest());
+    let retry = ChangedRealmCommitSealEvidence::try_bind(
+        &prepared,
+        post_write_observation(&prepared),
+        fixture.proof_seal().unwrap(),
+        fixture.graph_seal().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(retry, evidence);
+
+    let (head, allocator) = commit_authorities(&prepared);
+    let sealed = seal_verified_changed_realm_commit(
+        prepared.clone(),
+        evidence,
+        &head,
+        allocator,
+    )
+    .unwrap();
+    assert_eq!(sealed.prepared(), &prepared);
+    assert!(sealed.realm_manifest_evidence().is_some());
+}
+
+#[test]
+fn incomplete_or_mixed_changed_realm_commit_evidence_fails_before_seal() {
+    let fixture = fixture(0, 0, COORDINATOR_HEIGHT);
+    let prepared = matching_manifest(&fixture, 81);
+    let mut wrong_digest = prepared.intent().artifacts().mutation_digest();
+    wrong_digest[0] ^= 1;
+    let wrong_observation = AuthorityPostWriteObservation::new(
+        AuthorityHeadView::candidate(&prepared),
+        wrong_digest,
+        AuthorityHeadPayloadDigest::from_verified_payload_bytes(
+            prepared.intent().head_payload().as_bytes(),
+        ),
+        AuthorityProofObservation::NotApplicableForRealm,
+    );
+    assert_eq!(
+        ChangedRealmCommitSealEvidence::try_bind(
+            &prepared,
+            wrong_observation,
+            fixture.proof_seal().unwrap(),
+            fixture.graph_seal().unwrap(),
+        )
+        .unwrap_err(),
+        ChangedRealmCommitSealError::ManifestLifecycle(
+            ManifestLifecycleError::MutationDigestMismatch
+        )
+    );
+
+    let evidence = ChangedRealmCommitSealEvidence::try_bind(
+        &prepared,
+        post_write_observation(&prepared),
+        fixture.proof_seal().unwrap(),
+        fixture.graph_seal().unwrap(),
+    )
+    .unwrap();
+    let other = matching_manifest(&fixture, 82);
+    let (other_head, other_allocator) = commit_authorities(&other);
+    assert_eq!(
+        seal_verified_changed_realm_commit(
+            other,
+            evidence,
+            &other_head,
+            other_allocator,
+        )
+        .unwrap_err(),
+        NormalCommitOrchestrationError::ChangedRealmCommitSeal(
+            ChangedRealmCommitSealError::PreparedManifestDigestMismatch
+        )
+    );
+}
+
+#[test]
+fn changed_realm_seal_rechecks_head_after_live_evidence_is_bound() {
+    let fixture = fixture(0, 0, COORDINATOR_HEIGHT);
+    let prepared = matching_manifest(&fixture, 83);
+    let evidence = ChangedRealmCommitSealEvidence::try_bind(
+        &prepared,
+        post_write_observation(&prepared),
+        fixture.proof_seal().unwrap(),
+        fixture.graph_seal().unwrap(),
+    )
+    .unwrap();
+    let (expected_head, allocator) = commit_authorities(&prepared);
+    let changed_head = AuthorityLocalHeadBootstrap::seal(
+        AuthorityLocalHeadBootstrapReason::GenesisNative,
+        AuthorityHeadView::candidate(&prepared),
+        expected_head.commit_write_timestamp(),
+        prepared.digest(),
+        expected_head.storage_binding(),
+    )
+    .candidate()
+    .clone();
+    assert_eq!(
+        seal_verified_changed_realm_commit(
+            prepared.clone(),
+            evidence.clone(),
+            &changed_head,
+            allocator,
+        )
+        .unwrap_err(),
+        NormalCommitOrchestrationError::AuthorityHeadChangedBeforeSeal
+    );
+
+    let other = matching_manifest(&fixture, 84);
+    let (_, changed_allocator) = commit_authorities(&other);
+    assert_eq!(
+        seal_verified_changed_realm_commit(
+            prepared,
+            evidence,
+            &expected_head,
+            changed_allocator,
+        )
+        .unwrap_err(),
+        NormalCommitOrchestrationError::AllocatorOwnedByOtherIntent
     );
 }

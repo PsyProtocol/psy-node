@@ -22,10 +22,12 @@ use psy_node_core::store::{
     },
     normal_commit::{
         authorize_normal_head_publish, classify_normal_head_publish,
-        plan_normal_commit_recovery, seal_verified_normal_commit,
-        NormalCommitOrchestrationError, NormalCommitRecoveryAction,
-        NormalHeadPublishProgress, SealedNormalHeadPublish,
+        plan_normal_commit_recovery, seal_verified_changed_realm_commit,
+        seal_verified_normal_commit, NormalCommitOrchestrationError,
+        NormalCommitRecoveryAction, NormalHeadPublishProgress,
+        SealedNormalHeadPublish,
     },
+    realm_commit_seal::ChangedRealmCommitSealEvidence,
 };
 
 use super::{
@@ -119,6 +121,37 @@ impl<'a> ScyllaNormalCommitMetadataExecutor<'a> {
         let sealed = seal_verified_normal_commit(
             prepared,
             observation,
+            &head,
+            allocator,
+        )?;
+        self.persist_sealed(&sealed).await?;
+        Ok(sealed)
+    }
+
+    /// Re-read head and allocator authority before consuming the complete
+    /// live changed-Realm evidence and persisting SEALED. Persisted proof or
+    /// graph records cannot call this boundary because they cannot construct
+    /// `ChangedRealmCommitSealEvidence`.
+    pub async fn verify_changed_realm_and_persist_sealed<Hash: Q256BitHash>(
+        &self,
+        prepared: PreparedAuthorityManifestRecord<Hash>,
+        evidence: ChangedRealmCommitSealEvidence<Hash>,
+    ) -> Result<SealedAuthorityManifest<Hash>, NormalCommitMetadataError> {
+        let key = prepared.identity().timestamp_key();
+        let head = match self.heads.read(key).await? {
+            AuthorityLocalHeadReadState::Uninitialized => {
+                return Err(NormalCommitMetadataError::HeadUninitialized)
+            }
+            AuthorityLocalHeadReadState::Current(head) => head,
+        };
+        let allocator = self
+            .timestamps
+            .read_observed(key)
+            .await?
+            .ok_or(NormalCommitMetadataError::AllocatorUninitialized)?;
+        let sealed = seal_verified_changed_realm_commit(
+            prepared,
+            evidence,
             &head,
             allocator,
         )?;

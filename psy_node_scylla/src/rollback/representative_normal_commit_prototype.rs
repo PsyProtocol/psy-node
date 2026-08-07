@@ -10,12 +10,20 @@ use std::{error::Error, fmt};
 use parth_core::protocol::core_types::Q256BitHash;
 use psy_node_core::store::{
     manifest_lifecycle::{
-        CommittedAuthorityManifest, SealedAuthorityManifest,
+        AuthorityPostWriteObservation, CommittedAuthorityManifest,
+        SealedAuthorityManifest,
     },
-    manifest_record::AuthorityManifestIdentity,
+    manifest_record::{
+        AuthorityManifestIdentity, PreparedAuthorityManifestRecord,
+    },
     normal_commit::{
         NormalCommitRecoveryAction, NormalHeadPublishProgress,
     },
+    realm_commit_seal::{
+        ChangedRealmCommitSealError, ChangedRealmCommitSealEvidence,
+    },
+    realm_imt_mutation_graph::SealedRealmImtMutationGraph,
+    realm_proof_binding::SealedRealmProofBinding,
 };
 
 use super::{
@@ -31,6 +39,9 @@ use super::{
 /// call `step` again rather than assuming the following phase.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RepresentativeNormalCommitStep<Hash> {
+    StateVerifiedAwaitingRealmEvidence {
+        state: VerifiedRepresentativeRealmState<Hash>,
+    },
     StateVerifiedAndSealed {
         sealed: SealedAuthorityManifest<Hash>,
     },
@@ -45,6 +56,21 @@ pub enum RepresentativeNormalCommitStep<Hash> {
     Done {
         committed: CommittedAuthorityManifest<Hash>,
     },
+}
+
+/// Capability produced only after every representative physical row has
+/// been read back exactly. It deliberately contains no proof/graph evidence;
+/// callers must supply the two live seals to `seal_changed_realm_state`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedRepresentativeRealmState<Hash> {
+    prepared: PreparedAuthorityManifestRecord<Hash>,
+    observation: AuthorityPostWriteObservation<Hash>,
+}
+
+impl<Hash> VerifiedRepresentativeRealmState<Hash> {
+    pub const fn prepared(&self) -> &PreparedAuthorityManifestRecord<Hash> {
+        &self.prepared
+    }
 }
 
 /// Isolated production-shaped executor for the one currently supported Realm
@@ -92,13 +118,14 @@ impl<'a> ScyllaRepresentativeRealmNormalCommitExecutor<'a> {
                     )?;
                 self.state.reapply_all(&plan).await?;
                 let observation = self.state.verify_exact(&plan).await?;
-                let sealed = self
-                    .metadata
-                    .verify_and_persist_sealed(prepared, observation)
-                    .await?;
-                Ok(RepresentativeNormalCommitStep::StateVerifiedAndSealed {
-                    sealed,
-                })
+                Ok(
+                    RepresentativeNormalCommitStep::StateVerifiedAwaitingRealmEvidence {
+                        state: VerifiedRepresentativeRealmState {
+                            prepared,
+                            observation,
+                        },
+                    },
+                )
             }
             NormalCommitRecoveryAction::PublishExactHead { publish } => {
                 match self.metadata.publish_head(publish).await? {
@@ -134,6 +161,37 @@ impl<'a> ScyllaRepresentativeRealmNormalCommitExecutor<'a> {
         }
     }
 
+    /// Consume exact physical read-back plus the live proof and mutation-graph
+    /// seals, then re-read head/allocator state and persist the resulting
+    /// changed-Realm SEALED manifest.
+    pub async fn seal_changed_realm_state<Hash, Hasher>(
+        &self,
+        state: VerifiedRepresentativeRealmState<Hash>,
+        proof: SealedRealmProofBinding<Hash>,
+        graph: SealedRealmImtMutationGraph<Hash, Hasher>,
+    ) -> Result<RepresentativeNormalCommitStep<Hash>, RepresentativeNormalCommitError>
+    where
+        Hash: Q256BitHash,
+    {
+        let VerifiedRepresentativeRealmState {
+            prepared,
+            observation,
+        } = state;
+        let evidence = ChangedRealmCommitSealEvidence::try_bind(
+            &prepared,
+            observation,
+            proof,
+            graph,
+        )?;
+        let sealed = self
+            .metadata
+            .verify_changed_realm_and_persist_sealed(prepared, evidence)
+            .await?;
+        Ok(RepresentativeNormalCommitStep::StateVerifiedAndSealed {
+            sealed,
+        })
+    }
+
     /// Convenience loop for an uninterrupted process.  Crash tests and
     /// production recovery should prefer `step` at externally controlled
     /// boundaries.  The finite budget prevents an unexpected retry state from
@@ -145,10 +203,23 @@ impl<'a> ScyllaRepresentativeRealmNormalCommitExecutor<'a> {
     ) -> Result<CommittedAuthorityManifest<Hash>, RepresentativeNormalCommitError>
     {
         for _ in 0..max_steps {
-            if let RepresentativeNormalCommitStep::Done { committed } =
-                self.step(identity).await?
-            {
-                return Ok(committed);
+            match self.step(identity).await? {
+                RepresentativeNormalCommitStep::Done { committed } => {
+                    return Ok(committed)
+                }
+                RepresentativeNormalCommitStep::StateVerifiedAwaitingRealmEvidence {
+                    state,
+                } => {
+                    return Err(
+                        RepresentativeNormalCommitError::RealmEvidenceRequired {
+                            prepared_manifest_digest: *state
+                                .prepared()
+                                .digest()
+                                .as_bytes(),
+                        },
+                    )
+                }
+                _ => {}
             }
         }
         Err(RepresentativeNormalCommitError::StepBudgetExhausted {
@@ -163,6 +234,8 @@ pub enum RepresentativeNormalCommitError {
     Manifest(ManifestPreparedError),
     StatePlan(RepresentativeStateReplayError),
     StateExecution(RepresentativeStateExecutionError),
+    ChangedRealmCommitSeal(ChangedRealmCommitSealError),
+    RealmEvidenceRequired { prepared_manifest_digest: [u8; 32] },
     StepBudgetExhausted { max_steps: usize },
 }
 
@@ -189,6 +262,12 @@ impl From<RepresentativeStateExecutionError>
 {
     fn from(value: RepresentativeStateExecutionError) -> Self {
         Self::StateExecution(value)
+    }
+}
+
+impl From<ChangedRealmCommitSealError> for RepresentativeNormalCommitError {
+    fn from(value: ChangedRealmCommitSealError) -> Self {
+        Self::ChangedRealmCommitSeal(value)
     }
 }
 

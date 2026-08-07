@@ -7,6 +7,7 @@ pub mod manifest_record;
 pub mod normal_commit;
 pub mod proof_namespace;
 pub mod realm_commit_evidence;
+pub mod realm_commit_seal;
 pub mod realm_manifest_evidence;
 pub mod realm_prepared_payload;
 pub mod realm_proof_binding;
