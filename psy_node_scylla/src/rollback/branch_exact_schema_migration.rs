@@ -324,14 +324,14 @@ impl BranchExactQueries {
                 query(
                     BranchExactQueryId::CreateBranchToPending,
                     format!(
-                        "CREATE TABLE IF NOT EXISTS {forward} (canonical_ref blob, pending_id bigint, PRIMARY KEY ((canonical_ref), pending_id))"
+                        "CREATE TABLE IF NOT EXISTS {forward} (canonical_ref blob, pending_id bigint, mapping_digest blob, PRIMARY KEY ((canonical_ref), pending_id))"
                     ),
                     &[],
                 ),
                 query(
                     BranchExactQueryId::CreatePendingToBranch,
                     format!(
-                        "CREATE TABLE IF NOT EXISTS {reverse} (pending_id bigint, canonical_ref blob, PRIMARY KEY ((pending_id), canonical_ref))"
+                        "CREATE TABLE IF NOT EXISTS {reverse} (pending_id bigint, canonical_ref blob, mapping_digest blob, PRIMARY KEY ((pending_id), canonical_ref))"
                     ),
                     &[],
                 ),
@@ -345,16 +345,16 @@ impl BranchExactQueries {
                 query(
                     BranchExactQueryId::PutBranchToPending,
                     format!(
-                        "INSERT INTO {forward} (canonical_ref, pending_id) VALUES (?, ?) USING TIMESTAMP ?"
+                        "INSERT INTO {forward} (canonical_ref, pending_id, mapping_digest) VALUES (?, ?, ?) USING TIMESTAMP ?"
                     ),
-                    &["BLOB", "BIGINT", "BIGINT"],
+                    &["BLOB", "BIGINT", "BLOB", "BIGINT"],
                 ),
                 query(
                     BranchExactQueryId::PutPendingToBranch,
                     format!(
-                        "INSERT INTO {reverse} (pending_id, canonical_ref) VALUES (?, ?) USING TIMESTAMP ?"
+                        "INSERT INTO {reverse} (pending_id, canonical_ref, mapping_digest) VALUES (?, ?, ?) USING TIMESTAMP ?"
                     ),
-                    &["BIGINT", "BLOB", "BIGINT"],
+                    &["BIGINT", "BLOB", "BLOB", "BIGINT"],
                 ),
                 query(
                     BranchExactQueryId::PutPendingRewardProof,
@@ -366,14 +366,14 @@ impl BranchExactQueries {
                 query(
                     BranchExactQueryId::ReadBranchToPending,
                     format!(
-                        "SELECT pending_id FROM {forward} WHERE canonical_ref = ?"
+                        "SELECT pending_id, mapping_digest, writetime(mapping_digest) FROM {forward} WHERE canonical_ref = ?"
                     ),
                     &["BLOB"],
                 ),
                 query(
                     BranchExactQueryId::ReadPendingToBranch,
                     format!(
-                        "SELECT canonical_ref FROM {reverse} WHERE pending_id = ?"
+                        "SELECT canonical_ref, mapping_digest, writetime(mapping_digest) FROM {reverse} WHERE pending_id = ?"
                     ),
                     &["BIGINT"],
                 ),
@@ -392,14 +392,14 @@ impl BranchExactQueries {
                 query(
                     BranchExactQueryId::ScanBranchToPending,
                     format!(
-                        "SELECT canonical_ref, pending_id FROM {forward}"
+                        "SELECT canonical_ref, pending_id, mapping_digest FROM {forward}"
                     ),
                     &[],
                 ),
                 query(
                     BranchExactQueryId::ScanPendingToBranch,
                     format!(
-                        "SELECT pending_id, canonical_ref FROM {reverse}"
+                        "SELECT pending_id, canonical_ref, mapping_digest FROM {reverse}"
                     ),
                     &[],
                 ),
@@ -479,7 +479,7 @@ pub struct BranchExactColumnSpec {
     pub clustering_order: BranchExactClusteringOrder,
 }
 
-pub const BRANCH_EXACT_EXPECTED_COLUMNS: [BranchExactColumnSpec; 6] = [
+pub const BRANCH_EXACT_EXPECTED_COLUMNS: [BranchExactColumnSpec; 8] = [
     BranchExactColumnSpec {
         physical: BranchExactPhysicalTableId::CanonicalChainRefToPendingId,
         column_name: "canonical_ref",
@@ -497,6 +497,14 @@ pub const BRANCH_EXACT_EXPECTED_COLUMNS: [BranchExactColumnSpec; 6] = [
         clustering_order: BranchExactClusteringOrder::Asc,
     },
     BranchExactColumnSpec {
+        physical: BranchExactPhysicalTableId::CanonicalChainRefToPendingId,
+        column_name: "mapping_digest",
+        cql_type: "blob",
+        kind: BranchExactColumnKind::Regular,
+        position: -1,
+        clustering_order: BranchExactClusteringOrder::None,
+    },
+    BranchExactColumnSpec {
         physical: BranchExactPhysicalTableId::PendingIdToCanonicalChainRef,
         column_name: "pending_id",
         cql_type: "bigint",
@@ -511,6 +519,14 @@ pub const BRANCH_EXACT_EXPECTED_COLUMNS: [BranchExactColumnSpec; 6] = [
         kind: BranchExactColumnKind::Clustering,
         position: 0,
         clustering_order: BranchExactClusteringOrder::Asc,
+    },
+    BranchExactColumnSpec {
+        physical: BranchExactPhysicalTableId::PendingIdToCanonicalChainRef,
+        column_name: "mapping_digest",
+        cql_type: "blob",
+        kind: BranchExactColumnKind::Regular,
+        position: -1,
+        clustering_order: BranchExactClusteringOrder::None,
     },
     BranchExactColumnSpec {
         physical: BranchExactPhysicalTableId::PendingRewardTopProof,
@@ -827,6 +843,7 @@ pub struct BranchPendingPairPutPlan<Hash> {
     pending_id: i64,
     write_timestamp_us: i64,
     digest: BranchPendingMappingDigest,
+    mapping_digest: Vec<u8>,
 }
 
 impl<Hash: Q256BitHash> BranchPendingPairPutPlan<Hash> {
@@ -834,11 +851,13 @@ impl<Hash: Q256BitHash> BranchPendingPairPutPlan<Hash> {
         mapping: BranchPendingMapping<Hash>,
         timestamp: CommitWriteTimestampUs,
     ) -> Self {
+        let digest = mapping.digest();
         Self {
             canonical_ref: mapping.canonical_chain_bytes().to_vec(),
             pending_id: mapping.pending_id().get() as i64,
             write_timestamp_us: timestamp.as_i64(),
-            digest: mapping.digest(),
+            mapping_digest: digest.as_bytes().to_vec(),
+            digest,
             mapping,
         }
     }
@@ -859,6 +878,7 @@ impl<Hash: Q256BitHash> BranchPendingPairPutPlan<Hash> {
         vec![
             PrototypeBindValue::Blob(self.canonical_ref.clone()),
             PrototypeBindValue::BigInt(self.pending_id),
+            PrototypeBindValue::Blob(self.mapping_digest.clone()),
             PrototypeBindValue::BigInt(self.write_timestamp_us),
         ]
     }
@@ -867,6 +887,7 @@ impl<Hash: Q256BitHash> BranchPendingPairPutPlan<Hash> {
         vec![
             PrototypeBindValue::BigInt(self.pending_id),
             PrototypeBindValue::Blob(self.canonical_ref.clone()),
+            PrototypeBindValue::Blob(self.mapping_digest.clone()),
             PrototypeBindValue::BigInt(self.write_timestamp_us),
         ]
     }
@@ -881,6 +902,10 @@ impl<Hash: Q256BitHash> BranchPendingPairPutPlan<Hash> {
 
     fn canonical_ref_bytes(&self) -> &[u8] {
         &self.canonical_ref
+    }
+
+    pub(crate) fn mapping_digest_bytes(&self) -> &[u8] {
+        &self.mapping_digest
     }
 }
 
@@ -949,26 +974,34 @@ impl Error for BranchExactReadError {}
 /// conflict, not last-write-wins repair.
 pub fn verify_forward_rows<Hash: Q256BitHash>(
     plan: &BranchPendingPairPutPlan<Hash>,
-    rows: Vec<i64>,
+    rows: Vec<(i64, Vec<u8>, i64)>,
 ) -> Result<(), BranchExactReadError> {
     match rows.as_slice() {
         [] => Err(BranchExactReadError::MissingForward),
-        [pending] if *pending == plan.pending_id => Ok(()),
-        _ => Err(BranchExactReadError::ForwardConflict { rows }),
+        [(pending, digest, timestamp)]
+            if *pending == plan.pending_id
+                && digest.as_slice() == plan.mapping_digest_bytes()
+                && *timestamp == plan.write_timestamp_us => Ok(()),
+        _ => Err(BranchExactReadError::ForwardConflict {
+            rows: rows.into_iter().map(|row| row.0).collect(),
+        }),
     }
 }
 
 pub fn verify_reverse_rows<Hash: Q256BitHash>(
     plan: &BranchPendingPairPutPlan<Hash>,
-    rows: Vec<Vec<u8>>,
+    rows: Vec<(Vec<u8>, Vec<u8>, i64)>,
 ) -> Result<(), BranchExactReadError> {
     for row in &rows {
-        BranchPendingMapping::<Hash>::validate_canonical_chain_bytes(row)
+        BranchPendingMapping::<Hash>::validate_canonical_chain_bytes(&row.0)
             .map_err(|error| BranchExactReadError::MalformedCanonicalRef(error.to_string()))?;
     }
     match rows.as_slice() {
         [] => Err(BranchExactReadError::MissingReverse),
-        [canonical] if canonical.as_slice() == plan.canonical_ref_bytes() => Ok(()),
+        [(canonical, digest, timestamp)]
+            if canonical.as_slice() == plan.canonical_ref_bytes()
+                && digest.as_slice() == plan.mapping_digest_bytes()
+                && *timestamp == plan.write_timestamp_us => Ok(()),
         _ => Err(BranchExactReadError::ReverseConflict { rows: rows.len() }),
     }
 }
@@ -1191,11 +1224,13 @@ impl BranchExactSchemaMigrationAdapter {
                     (
                         plan.canonical_ref.clone(),
                         plan.pending_id,
+                        plan.mapping_digest.as_slice(),
                         plan.write_timestamp_us,
                     ),
                     (
                         plan.pending_id,
                         plan.canonical_ref.clone(),
+                        plan.mapping_digest.as_slice(),
                         plan.write_timestamp_us,
                     ),
                 ),
@@ -1217,8 +1252,8 @@ impl BranchExactSchemaMigrationAdapter {
             .await?
             .into_rows_result()?;
         let mut forward = Vec::new();
-        for row in rows.rows::<(i64,)>()? {
-            forward.push(row?.0);
+        for row in rows.rows::<(i64, Vec<u8>, i64)>()? {
+            forward.push(row?);
         }
         verify_forward_rows(plan, forward)?;
 
@@ -1227,8 +1262,8 @@ impl BranchExactSchemaMigrationAdapter {
             .await?
             .into_rows_result()?;
         let mut reverse = Vec::new();
-        for row in rows.rows::<(Vec<u8>,)>()? {
-            reverse.push(row?.0);
+        for row in rows.rows::<(Vec<u8>, Vec<u8>, i64)>()? {
+            reverse.push(row?);
         }
         verify_reverse_rows(plan, reverse)?;
         Ok(())
@@ -1283,11 +1318,11 @@ impl BranchExactSchemaMigrationAdapter {
     pub(crate) async fn scan_branch_to_pending(
         &self,
         session: &Session,
-    ) -> anyhow::Result<Vec<(Vec<u8>, i64)>> {
+    ) -> anyhow::Result<Vec<(Vec<u8>, i64, Vec<u8>)>> {
         Ok(session
             .execute_iter(self.prepared.forward_scan.clone(), ())
             .await?
-            .rows_stream::<(Vec<u8>, i64)>()?
+            .rows_stream::<(Vec<u8>, i64, Vec<u8>)>()?
             .try_collect()
             .await?)
     }
@@ -1295,11 +1330,11 @@ impl BranchExactSchemaMigrationAdapter {
     pub(crate) async fn scan_pending_to_branch(
         &self,
         session: &Session,
-    ) -> anyhow::Result<Vec<(i64, Vec<u8>)>> {
+    ) -> anyhow::Result<Vec<(i64, Vec<u8>, Vec<u8>)>> {
         Ok(session
             .execute_iter(self.prepared.reverse_scan.clone(), ())
             .await?
-            .rows_stream::<(i64, Vec<u8>)>()?
+            .rows_stream::<(i64, Vec<u8>, Vec<u8>)>()?
             .try_collect()
             .await?)
     }
@@ -1564,7 +1599,7 @@ mod tests {
         );
         let coordinator_columns =
             exact_observed_columns(AuthorityScope::Coordinator);
-        assert_eq!(coordinator_columns.len(), 4);
+        assert_eq!(coordinator_columns.len(), 6);
         assert_eq!(
             inspect_branch_exact_columns(
                 AuthorityScope::Coordinator,
@@ -1724,6 +1759,7 @@ mod tests {
             vec![
                 PrototypeBindValue::Blob(first.mapping().canonical_chain_bytes().to_vec()),
                 PrototypeBindValue::BigInt(901),
+                PrototypeBindValue::Blob(first.mapping().digest().as_bytes().to_vec()),
                 PrototypeBindValue::BigInt(1_000),
             ]
         );
@@ -1732,15 +1768,30 @@ mod tests {
     #[test]
     fn conflicting_rows_fail_closed_in_both_directions() {
         let expected = plan(4, 901);
-        assert_eq!(verify_forward_rows(&expected, vec![901]), Ok(()));
+        let digest = expected.mapping().digest().as_bytes().to_vec();
+        let timestamp = expected.write_timestamp_us();
+        assert_eq!(
+            verify_forward_rows(&expected, vec![(901, digest.clone(), timestamp)]),
+            Ok(())
+        );
         assert!(matches!(
-            verify_forward_rows(&expected, vec![901, 902]),
+            verify_forward_rows(
+                &expected,
+                vec![
+                    (901, digest.clone(), timestamp),
+                    (902, digest.clone(), timestamp),
+                ]
+            ),
             Err(BranchExactReadError::ForwardConflict { .. })
         ));
         assert_eq!(
             verify_reverse_rows(
                 &expected,
-                vec![expected.mapping().canonical_chain_bytes().to_vec()]
+                vec![(
+                    expected.mapping().canonical_chain_bytes().to_vec(),
+                    digest.clone(),
+                    timestamp,
+                )]
             ),
             Ok(())
         );
@@ -1748,8 +1799,16 @@ mod tests {
             verify_reverse_rows(
                 &expected,
                 vec![
-                    expected.mapping().canonical_chain_bytes().to_vec(),
-                    chain(5, 100, 7).to_canonical_bytes().to_vec(),
+                    (
+                        expected.mapping().canonical_chain_bytes().to_vec(),
+                        digest.clone(),
+                        timestamp,
+                    ),
+                    (
+                        chain(5, 100, 7).to_canonical_bytes().to_vec(),
+                        digest,
+                        timestamp,
+                    ),
                 ]
             ),
             Err(BranchExactReadError::ReverseConflict { .. })
@@ -1759,14 +1818,16 @@ mod tests {
     #[test]
     fn malformed_reverse_identity_is_not_treated_as_absence() {
         let expected = plan(4, 901);
+        let digest = expected.mapping().digest().as_bytes().to_vec();
+        let timestamp = expected.write_timestamp_us();
         assert!(matches!(
-            verify_reverse_rows(&expected, vec![vec![0; 65]]),
+            verify_reverse_rows(&expected, vec![(vec![0; 65], digest.clone(), timestamp)]),
             Err(BranchExactReadError::MalformedCanonicalRef(_))
         ));
         let mut unknown = expected.mapping().canonical_chain_bytes().to_vec();
         unknown[8..10].copy_from_slice(&2_u16.to_le_bytes());
         assert!(matches!(
-            verify_reverse_rows(&expected, vec![unknown]),
+            verify_reverse_rows(&expected, vec![(unknown, digest, timestamp)]),
             Err(BranchExactReadError::MalformedCanonicalRef(_))
         ));
     }
@@ -1821,13 +1882,13 @@ mod tests {
             queries
                 .get(BranchExactQueryId::ScanBranchToPending)
                 .cql(),
-            "SELECT canonical_ref, pending_id FROM ks.canonical_chain_ref_to_pending_id_table"
+            "SELECT canonical_ref, pending_id, mapping_digest FROM ks.canonical_chain_ref_to_pending_id_table"
         );
         assert_eq!(
             queries
                 .get(BranchExactQueryId::ScanPendingToBranch)
                 .cql(),
-            "SELECT pending_id, canonical_ref FROM ks.pending_id_to_canonical_chain_ref_table"
+            "SELECT pending_id, canonical_ref, mapping_digest FROM ks.pending_id_to_canonical_chain_ref_table"
         );
         assert_eq!(
             queries

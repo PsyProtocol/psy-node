@@ -19,6 +19,7 @@ mod branch_exact_schema_deployment_lifecycle;
 mod branch_exact_schema_backfill;
 mod branch_exact_schema_backfill_executor;
 mod branch_exact_schema_exporter;
+mod branch_exact_dual_write_executor;
 mod branch_exact_schema_setup;
 mod branch_exact_shadow_reader;
 mod branch_exact_shadow_audit;

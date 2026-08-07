@@ -357,14 +357,6 @@ impl BranchExactWriteObservationDigest {
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
-
-    pub(crate) fn from_verified_rows(bytes: [u8; 32]) -> Result<Self, BranchExactWriterLifecycleError> {
-        if bytes == [0; 32] {
-            Err(BranchExactWriterLifecycleError::EmptyObservationDigest)
-        } else {
-            Ok(Self(bytes))
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -626,13 +618,17 @@ impl<Hash: Q256BitHash> SealedBranchExactWriterCas<Hash> {
         Self::transition(expected, BranchExactWriterState::WritePrepared(prepared))
     }
 
-    pub fn verify_writes(
+    pub(crate) fn verify_writes(
         expected: &StoredBranchExactWriterLifecycle<Hash>,
-        observation: BranchExactWriteObservationDigest,
+        observation: &super::branch_exact_dual_write_executor::BranchExactVerifiedWriteObservation,
     ) -> Result<Self, BranchExactWriterLifecycleError> {
         let BranchExactWriterState::WritePrepared(prepared) = &expected.state else {
             return Err(BranchExactWriterLifecycleError::IllegalTransition);
         };
+        if !observation.matches_prepared(prepared) {
+            return Err(BranchExactWriterLifecycleError::ObservationIdentityMismatch);
+        }
+        let observation = BranchExactWriteObservationDigest(observation.digest());
         let verified = BranchExactWriterVerified {
             prepared: prepared.clone(),
             observation,
@@ -1130,6 +1126,7 @@ pub enum BranchExactWriterLifecycleError {
     ArtifactPendingNotMonotonic,
     EmptyArtifact,
     EmptyObservationDigest,
+    ObservationIdentityMismatch,
     EmptyBlockedReason,
     IllegalTransition,
     WriterContinuityMismatch,
@@ -1356,10 +1353,10 @@ mod tests {
         .unwrap();
         assert_eq!(&decoded, prepared.candidate());
 
-        let observation = BranchExactWriteObservationDigest::from_verified_rows([7; 32]).unwrap();
+        let observation = crate::rollback::branch_exact_dual_write_executor::BranchExactVerifiedWriteObservation::test_fixture(prepared_state);
         let verified = SealedBranchExactWriterCas::verify_writes(
             prepared.candidate(),
-            observation,
+            &observation,
         )
         .unwrap();
         let completed = allocator_active

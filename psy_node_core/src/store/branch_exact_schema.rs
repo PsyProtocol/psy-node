@@ -21,7 +21,10 @@ use super::{
 
 const BRANCH_EXACT_MATERIALIZATION_DIGEST_DOMAIN: &[u8] =
     b"psy/rollback/branch-exact-schema-materialization/v1";
-pub const BRANCH_EXACT_SCHEMA_VERSION: u16 = 1;
+/// Version 2 adds a regular mapping-digest cell to both branch/pending
+/// directions.  Primary-key-only rows cannot expose `writetime()`, so version
+/// 1 could not prove that an online dual-write used its sealed timestamp.
+pub const BRANCH_EXACT_SCHEMA_VERSION: u16 = 2;
 
 /// Logical table identities reserved immediately after the original
 /// [`super::typed::PsyLogicalTableId`] range `1..=32`.

@@ -174,6 +174,7 @@ pub enum BranchExactShadowReadError {
         direction: BranchExactShadowDirection,
         actual: usize,
     },
+    TargetMappingProvenanceMismatch(BranchExactShadowDirection),
     MissingLegacyProof(u64),
     MissingTargetProof(u64),
     LegacyReadThrough {
@@ -397,7 +398,7 @@ impl<Hash: Q256BitHash> ScyllaBranchExactShadowReader<Hash> {
             });
         }
 
-        let target_reverse = self.read_target_reverse(pending_id).await?;
+        let target_reverse = self.read_target_reverse(expected).await?;
         if &target_reverse != expected {
             return Err(BranchExactShadowReadError::ConflictingMapping {
                 direction: BranchExactShadowDirection::TargetReverse,
@@ -635,23 +636,23 @@ impl<Hash: Q256BitHash> ScyllaBranchExactShadowReader<Hash> {
             .execute_iter(self.prepared.target_forward_scan.clone(), ())
             .await
             .map_err(driver)?
-            .rows_stream::<(Vec<u8>, i64)>()
+            .rows_stream::<(Vec<u8>, i64, Vec<u8>)>()
             .map_err(driver)?
-            .map_ok(|(canonical, pending)| {
-                (canonical, u64::try_from(pending).ok())
+            .map_ok(|(canonical, pending, digest)| {
+                (canonical, u64::try_from(pending).ok(), digest)
             })
             .try_collect::<Vec<_>>()
             .await
             .map_err(driver)?;
         let observed_forward = forward
             .into_iter()
-            .map(|(canonical, pending)| {
+            .map(|(canonical, pending, digest)| {
                 let pending = pending.ok_or(
                     BranchExactShadowReadError::MalformedLegacyValue(-1),
                 )?;
                 let pending_id = UniquePendingId::try_new(pending)
                     .map_err(|error| BranchExactShadowReadError::Codec(error.to_string()))?;
-                BranchPendingMapping::<Hash>::from_canonical_chain_bytes(
+                let mapping = BranchPendingMapping::<Hash>::from_canonical_chain_bytes(
                     &canonical,
                     pending_id,
                 )
@@ -660,6 +661,13 @@ impl<Hash: Q256BitHash> ScyllaBranchExactShadowReader<Hash> {
                         error.to_string(),
                     )
                 })?;
+                if digest.as_slice() != mapping.digest().as_bytes() {
+                    return Err(
+                        BranchExactShadowReadError::TargetMappingProvenanceMismatch(
+                            BranchExactShadowDirection::TargetForward,
+                        ),
+                    );
+                }
                 Ok((canonical, pending))
             })
             .collect::<Result<BTreeSet<_>, BranchExactShadowReadError>>()?;
@@ -669,20 +677,20 @@ impl<Hash: Q256BitHash> ScyllaBranchExactShadowReader<Hash> {
             .execute_iter(self.prepared.target_reverse_scan.clone(), ())
             .await
             .map_err(driver)?
-            .rows_stream::<(i64, Vec<u8>)>()
+            .rows_stream::<(i64, Vec<u8>, Vec<u8>)>()
             .map_err(driver)?
             .try_collect::<Vec<_>>()
             .await
             .map_err(driver)?;
         let observed_reverse = reverse
             .into_iter()
-            .map(|(pending, canonical)| {
+            .map(|(pending, canonical, digest)| {
                 let pending = u64::try_from(pending).map_err(|_| {
                     BranchExactShadowReadError::MalformedLegacyValue(pending)
                 })?;
                 let pending_id = UniquePendingId::try_new(pending)
                     .map_err(|error| BranchExactShadowReadError::Codec(error.to_string()))?;
-                BranchPendingMapping::<Hash>::from_canonical_chain_bytes(
+                let mapping = BranchPendingMapping::<Hash>::from_canonical_chain_bytes(
                     &canonical,
                     pending_id,
                 )
@@ -691,6 +699,13 @@ impl<Hash: Q256BitHash> ScyllaBranchExactShadowReader<Hash> {
                         error.to_string(),
                     )
                 })?;
+                if digest.as_slice() != mapping.digest().as_bytes() {
+                    return Err(
+                        BranchExactShadowReadError::TargetMappingProvenanceMismatch(
+                            BranchExactShadowDirection::TargetReverse,
+                        ),
+                    );
+                }
                 Ok((pending, canonical))
             })
             .collect::<Result<BTreeSet<_>, BranchExactShadowReadError>>()?;
@@ -765,7 +780,7 @@ impl<Hash: Q256BitHash> ScyllaBranchExactShadowReader<Hash> {
             .into_rows_result()
             .map_err(driver)?;
         let mut values = rows
-            .rows::<(i64,)>()
+            .rows::<(i64, Vec<u8>, i64)>()
             .map_err(driver)?
             .map(|row| row.map_err(driver))
             .collect::<Result<Vec<_>, _>>()?;
@@ -775,7 +790,22 @@ impl<Hash: Q256BitHash> ScyllaBranchExactShadowReader<Hash> {
                 actual: values.len(),
             });
         }
-        let value = values.pop().expect("one value").0;
+        let (value, digest, write_timestamp) = values.pop().expect("one value");
+        let expected_timestamp = self
+            .expected_receipt
+            .plan()
+            .write_timestamp()
+            .ok_or(BranchExactShadowReadError::BackfillPlanMismatch)?
+            .as_i64();
+        if digest.as_slice() != expected.digest().as_bytes()
+            || write_timestamp != expected_timestamp
+        {
+            return Err(
+                BranchExactShadowReadError::TargetMappingProvenanceMismatch(
+                    BranchExactShadowDirection::TargetForward,
+                ),
+            );
+        }
         let value = u64::try_from(value)
             .map_err(|_| BranchExactShadowReadError::MalformedLegacyValue(value))?;
         UniquePendingId::try_new(value)
@@ -784,8 +814,9 @@ impl<Hash: Q256BitHash> ScyllaBranchExactShadowReader<Hash> {
 
     async fn read_target_reverse(
         &self,
-        pending_id: UniquePendingId,
+        expected: &BranchPendingMapping<Hash>,
     ) -> Result<BranchPendingMapping<Hash>, BranchExactShadowReadError> {
+        let pending_id = expected.pending_id();
         let rows = self
             .session
             .execute_unpaged(
@@ -797,7 +828,7 @@ impl<Hash: Q256BitHash> ScyllaBranchExactShadowReader<Hash> {
             .into_rows_result()
             .map_err(driver)?;
         let mut values = rows
-            .rows::<(Vec<u8>,)>()
+            .rows::<(Vec<u8>, Vec<u8>, i64)>()
             .map_err(driver)?
             .map(|row| row.map_err(driver))
             .collect::<Result<Vec<_>, _>>()?;
@@ -807,8 +838,24 @@ impl<Hash: Q256BitHash> ScyllaBranchExactShadowReader<Hash> {
                 actual: values.len(),
             });
         }
+        let (canonical, digest, write_timestamp) = values.pop().expect("one value");
+        let expected_timestamp = self
+            .expected_receipt
+            .plan()
+            .write_timestamp()
+            .ok_or(BranchExactShadowReadError::BackfillPlanMismatch)?
+            .as_i64();
+        if digest.as_slice() != expected.digest().as_bytes()
+            || write_timestamp != expected_timestamp
+        {
+            return Err(
+                BranchExactShadowReadError::TargetMappingProvenanceMismatch(
+                    BranchExactShadowDirection::TargetReverse,
+                ),
+            );
+        }
         BranchPendingMapping::from_canonical_chain_bytes(
-            &values.pop().expect("one value").0,
+            &canonical,
             pending_id,
         )
         .map_err(|error| {

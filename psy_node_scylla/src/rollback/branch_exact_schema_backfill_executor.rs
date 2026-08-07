@@ -645,8 +645,8 @@ impl ScyllaBranchExactBackfillExecutor {
 fn verify_complete_target_scan<Hash: Q256BitHash>(
     plan: &BranchExactBackfillPlan,
     artifact: &BranchExactBackfillArtifact<Hash>,
-    forward_rows: Vec<(Vec<u8>, i64)>,
-    reverse_rows: Vec<(i64, Vec<u8>)>,
+    forward_rows: Vec<(Vec<u8>, i64, Vec<u8>)>,
+    reverse_rows: Vec<(i64, Vec<u8>, Vec<u8>)>,
     proof_rows: Vec<(i64, Vec<u8>)>,
 ) -> anyhow::Result<BranchExactBackfillReadbackObservation> {
     artifact.validate_plan(plan)?;
@@ -676,30 +676,36 @@ fn verify_complete_target_scan<Hash: Q256BitHash>(
         .collect::<BTreeSet<_>>();
 
     let mut observed_forward = BTreeSet::new();
-    for (canonical, pending) in forward_rows {
+    for (canonical, pending, mapping_digest) in forward_rows {
         let pending_id = pending_from_cql(pending)?;
-        BranchPendingMapping::<Hash>::from_canonical_chain_bytes(
+        let mapping = BranchPendingMapping::<Hash>::from_canonical_chain_bytes(
             &canonical,
             pending_id,
         )
         .map_err(|error| {
             anyhow::anyhow!("malformed forward canonical ref: {error}")
         })?;
+        if mapping_digest.as_slice() != mapping.digest().as_bytes() {
+            anyhow::bail!("forward mapping digest mismatch in target scan");
+        }
         if !observed_forward.insert((canonical, pending_id.get())) {
             anyhow::bail!("duplicate forward row in target scan");
         }
     }
 
     let mut observed_reverse = BTreeSet::new();
-    for (pending, canonical) in reverse_rows {
+    for (pending, canonical, mapping_digest) in reverse_rows {
         let pending_id = pending_from_cql(pending)?;
-        BranchPendingMapping::<Hash>::from_canonical_chain_bytes(
+        let mapping = BranchPendingMapping::<Hash>::from_canonical_chain_bytes(
             &canonical,
             pending_id,
         )
         .map_err(|error| {
             anyhow::anyhow!("malformed reverse canonical ref: {error}")
         })?;
+        if mapping_digest.as_slice() != mapping.digest().as_bytes() {
+            anyhow::bail!("reverse mapping digest mismatch in target scan");
+        }
         if !observed_reverse.insert((pending_id.get(), canonical)) {
             anyhow::bail!("duplicate reverse row in target scan");
         }
@@ -1082,8 +1088,8 @@ mod tests {
     }
 
     type ScanRows = (
-        Vec<(Vec<u8>, i64)>,
-        Vec<(i64, Vec<u8>)>,
+        Vec<(Vec<u8>, i64, Vec<u8>)>,
+        Vec<(i64, Vec<u8>, Vec<u8>)>,
         Vec<(i64, Vec<u8>)>,
     );
 
@@ -1097,6 +1103,7 @@ mod tests {
                 (
                     row.mapping().canonical_chain_bytes().to_vec(),
                     row.mapping().pending_id().get() as i64,
+                    row.mapping().digest().as_bytes().to_vec(),
                 )
             })
             .collect();
@@ -1107,6 +1114,7 @@ mod tests {
                 (
                     row.mapping().pending_id().get() as i64,
                     row.mapping().canonical_chain_bytes().to_vec(),
+                    row.mapping().digest().as_bytes().to_vec(),
                 )
             })
             .collect();
@@ -1284,6 +1292,7 @@ mod tests {
         unexpected_forward.push((
             mapping(9, 99, 999, 9).canonical_chain_bytes().to_vec(),
             999,
+            mapping(9, 99, 999, 9).digest().as_bytes().to_vec(),
         ));
         assert!(verify_complete_target_scan(
             &plan,
