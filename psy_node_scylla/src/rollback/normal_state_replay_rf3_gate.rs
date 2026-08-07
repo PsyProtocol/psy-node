@@ -94,8 +94,9 @@ use psy_node_core::store::{
     realm_commit_evidence_assembly::RealmCommitEvidenceAssemblyPlan,
     realm_imt_mutation_graph::{
         RealmImtBaselineNodeKey, RealmImtContractHeightReadPlan,
-        RealmImtMutationGraphConfig,
+        RealmImtMutationGraphConfig, RealmImtPredecessorReadRow,
     },
+    realm_manifest_evidence::SealedRealmManifestEvidence,
     timestamp::CommitWriteTimestampUs,
     typed::{
         CheckpointId as StorageCheckpointId, CheckpointRootKey,
@@ -127,7 +128,7 @@ use crate::utils::{
 const CONTROL_KEYSPACE: &str = "psy_d04b2c_rf3_nt";
 const ARTIFACT_KEYSPACE: &str = "psy_d04b2c_rf3_artifacts";
 const STATE_KEYSPACE: &str = "psy_d04b2c_rf3_state";
-const BASELINE: &str = "976748837810bb70519e6fe6faa0ede705f0ef4e";
+const BASELINE: &str = "133b412755e0241c83b496ff023eff07180f120d";
 const IMAGE: &str = "scylladb/scylla@sha256:17496f2dd6e72056d0b0d7e2bd18bd62638872d1d80a5dd9db96ba017fd426fc";
 const NODE_IPS: [Ipv4Addr; 3] = [
     Ipv4Addr::new(172, 29, 86, 11),
@@ -352,21 +353,43 @@ fn realm_evidence_fixture(
     offset: u8,
     with_imt_preimage: bool,
 ) -> RealmEvidenceFixture {
+    realm_evidence_fixture_from_offsets(
+        realm_id,
+        user_id,
+        offset,
+        offset,
+        with_imt_preimage,
+    )
+}
+
+/// Build one changed-Realm evidence graph while allowing two competing
+/// candidates to share the exact predecessor state. `old_state_offset`
+/// controls every predecessor leaf; `mutation_offset` controls the proposed
+/// mutation, proof inputs and candidate checkpoint hash.
+fn realm_evidence_fixture_from_offsets(
+    realm_id: u64,
+    user_id: u64,
+    old_state_offset: u8,
+    mutation_offset: u8,
+    with_imt_preimage: bool,
+) -> RealmEvidenceFixture {
     assert_eq!(
         user_id >> (EVIDENCE_GLOBAL_HEIGHT - EVIDENCE_COORDINATOR_HEIGHT),
         realm_id,
     );
-    let seeded = |seed: u8| hash(seed.wrapping_add(offset));
+    let old_seeded = |seed: u8| hash(seed.wrapping_add(old_state_offset));
+    let mutation_seeded =
+        |seed: u8| hash(seed.wrapping_add(mutation_offset));
     let imt_preimage = IMTContractStateLeaf::<PF, PHash> {
-        key: seeded(1),
-        value: seeded(2),
-        next_key: seeded(3),
+        key: mutation_seeded(1),
+        value: mutation_seeded(2),
+        next_key: mutation_seeded(3),
         next_index: PF::from_u64_value(1),
     };
     let imt_hash = imt_preimage.qfhash::<PoseidonHasher>();
 
     let mut cst_old_leaves = (0..(1u8 << EVIDENCE_CST_HEIGHT))
-        .map(|i| seeded(20 + i))
+        .map(|i| old_seeded(20 + i))
         .collect::<Vec<_>>();
     cst_old_leaves[2] = PoseidonHasher::get_zero_hash(0);
     let cst_old = evidence_levels(cst_old_leaves.clone(), EVIDENCE_CST_HEIGHT);
@@ -374,7 +397,7 @@ fn realm_evidence_fixture(
     let cst_new = evidence_levels(cst_old_leaves, EVIDENCE_CST_HEIGHT);
 
     let mut uct_old_leaves = (0..(1u8 << EVIDENCE_UCT_HEIGHT))
-        .map(|i| seeded(40 + i))
+        .map(|i| old_seeded(40 + i))
         .collect::<Vec<_>>();
     uct_old_leaves[EVIDENCE_CONTRACT_ID as usize] = cst_old[0][0];
     let uct_old = evidence_levels(uct_old_leaves.clone(), EVIDENCE_UCT_HEIGHT);
@@ -382,7 +405,7 @@ fn realm_evidence_fixture(
     let uct_new = evidence_levels(uct_old_leaves, EVIDENCE_UCT_HEIGHT);
 
     let old_user = PQEDUserLeaf::<PF, PHash> {
-        public_key: seeded(60),
+        public_key: old_seeded(60),
         user_state_tree_root: uct_old[0][0],
         balance: PF::from_u64_value(10),
         nonce: PF::ZERO_VALUE,
@@ -397,7 +420,7 @@ fn realm_evidence_fixture(
         ..old_user
     };
     let mut gut_old_leaves = (0..(1u8 << EVIDENCE_GLOBAL_HEIGHT))
-        .map(|i| seeded(80 + i))
+        .map(|i| old_seeded(80 + i))
         .collect::<Vec<_>>();
     gut_old_leaves[user_id as usize] = old_user.qfhash::<PoseidonHasher>();
     let gut_old = evidence_levels(gut_old_leaves.clone(), EVIDENCE_GLOBAL_HEIGHT);
@@ -464,8 +487,8 @@ fn realm_evidence_fixture(
     let submission = GlobalUserTreeAggregatorHeaderWithTagValueAndJobType {
         header: GlobalUserTreeAggregatorHeaderWithTagValue {
             header: GlobalUserTreeAggregatorHeader {
-                guta_circuit_whitelist: seeded(120),
-                checkpoint_tree_root: seeded(121),
+                guta_circuit_whitelist: mutation_seeded(120),
+                checkpoint_tree_root: mutation_seeded(121),
                 state_transition: SubTreeNodeStateTransition {
                     old_node_value: old_realm_root,
                     new_node_value: new_realm_root,
@@ -477,7 +500,7 @@ fn realm_evidence_fixture(
                 stats: GUTAStats::get_zero_value(),
                 total_aggregation_proofs_generated: PF::from_u64_value(5),
             },
-            new_tag_tree_node_value: seeded(122),
+            new_tag_tree_node_value: mutation_seeded(122),
         },
         // Stable wire discriminant for `ProvingJobCircuitType::GUTASingleEndCap`.
         job_type_u32: 11,
@@ -497,11 +520,11 @@ fn realm_evidence_fixture(
     );
     assert_eq!(inclusion.root, gut_new[0][0]);
     let state_roots = PQEDCheckpointGlobalStateRoots {
-        contract_tree_root: seeded(130),
-        deposit_tree_root: seeded(131),
+        contract_tree_root: mutation_seeded(130),
+        deposit_tree_root: mutation_seeded(131),
         user_tree_root: inclusion.root,
-        withdrawal_tree_root: seeded(132),
-        user_registration_tree_root: seeded(133),
+        withdrawal_tree_root: mutation_seeded(132),
+        user_registration_tree_root: mutation_seeded(133),
     };
     let checkpoint_leaf = PQEDCheckpointLeaf {
         global_chain_root: state_roots.qfhash::<PoseidonHasher>(),
@@ -516,7 +539,9 @@ fn realm_evidence_fixture(
             ChainEpoch::new(7),
             CheckpointRef::new(
                 CheckpointId::new(EVIDENCE_STATE),
-                CheckpointHash::from_proof_public_inputs_hash(hash(140)),
+                CheckpointHash::from_proof_public_inputs_hash(
+                    mutation_seeded(140),
+                ),
             ),
         ),
         checkpoint_sync_info: PQEDCheckpointSyncInfoCompact {
@@ -528,7 +553,7 @@ fn realm_evidence_fixture(
             state_roots,
             checkpoint_leaf,
             checkpoint_leaf_hash,
-            checkpoint_tree_root: seeded(141),
+            checkpoint_tree_root: mutation_seeded(141),
         },
         merkle_proof_to_realm_root: inclusion,
         reward_tree_top_proof:
@@ -620,9 +645,32 @@ impl Fixture {
     }
 }
 
+fn assemble_realm_evidence_from_fixture(
+    fixture: &RealmEvidenceFixture,
+) -> anyhow::Result<SealedRealmCommitEvidence<PHash, PoseidonHasher>> {
+    let plan = fixture.assembly_plan()?;
+    let zero_hashes = (0..64)
+        .map(PoseidonHasher::get_zero_hash)
+        .collect::<Vec<_>>();
+    let rows = plan
+        .predecessor_read_plan()
+        .requests()
+        .iter()
+        .map(|request| {
+            let expected = fixture.baseline[&request.key()];
+            RealmImtPredecessorReadRow::new(
+                *request,
+                (!zero_hashes.contains(&expected)).then_some(expected),
+            )
+        })
+        .collect::<Vec<_>>();
+    Ok(plan.verify_predecessor_rows_and_seal(&rows)?)
+}
+
 fn seal_fixture_for_head_gate(
     fixture: &Fixture,
-) -> SealedAuthorityManifest<PHash> {
+    bundle: SealedRealmCommitEvidence<PHash, PoseidonHasher>,
+) -> anyhow::Result<SealedAuthorityManifest<PHash>> {
     let prepared = fixture.package.record().clone();
     let observation = AuthorityPostWriteObservation::new(
         AuthorityHeadView::candidate(&prepared),
@@ -632,7 +680,11 @@ fn seal_fixture_for_head_gate(
         ),
         AuthorityProofObservation::NotApplicableForRealm,
     );
-    SealedAuthorityManifest::verify_and_seal(prepared, observation).unwrap()
+    let supplement = SealedRealmManifestEvidence::try_bind(&prepared, bundle)?;
+    Ok(SealedAuthorityManifest::verify_and_seal(
+        prepared,
+        observation.attach_changed_realm_evidence(supplement),
+    )?)
 }
 
 fn publish_fixture_for_head_gate(
@@ -1132,11 +1184,16 @@ impl CombinedStores {
     async fn assemble_realm_evidence(
         &self,
         fixture: &RealmEvidenceFixture,
+        seed_predecessor: bool,
     ) -> anyhow::Result<SealedRealmCommitEvidence<PHash, PoseidonHasher>> {
+        let session = &self.session;
+        if seed_predecessor {
+            seed_realm_evidence_predecessor(session, fixture).await?;
+        }
         let plan = fixture.assembly_plan()?;
         let rows = self
             .predecessor
-            .read_plan(&self.session, &plan.predecessor_read_plan())
+            .read_plan(session, &plan.predecessor_read_plan())
             .await?;
         Ok(plan.verify_predecessor_rows_and_seal(&rows)?)
     }
@@ -1814,7 +1871,9 @@ async fn d04b2d_combined_representative_normal_commit_rf3_gate(
             other => bail!("expected AwaitingRealmEvidence after restart, got {other:?}"),
         };
     ensure!(state_before_evidence_loss.prepared().identity() == &crash.identity());
-    let lost_bundle = stores.assemble_realm_evidence(&with_imt_evidence).await?;
+    let lost_bundle = stores
+        .assemble_realm_evidence(&with_imt_evidence, false)
+        .await?;
     ensure!(lost_bundle.graph().counts().final_imt_leaves == 1);
     drop(lost_bundle);
     drop(stores);
@@ -1830,7 +1889,7 @@ async fn d04b2d_combined_representative_normal_commit_rf3_gate(
         other => bail!("expected re-derived AwaitingRealmEvidence, got {other:?}"),
     };
     let recovered_bundle =
-        stores.assemble_realm_evidence(&with_imt_evidence).await?;
+        stores.assemble_realm_evidence(&with_imt_evidence, false).await?;
     ensure!(matches!(
         stores
             .executor()
@@ -1903,7 +1962,7 @@ async fn d04b2d_combined_representative_normal_commit_rf3_gate(
         other => bail!("expected no-IMT AwaitingRealmEvidence, got {other:?}"),
     };
     let offline_bundle = stores
-        .assemble_realm_evidence(&without_imt_evidence)
+        .assemble_realm_evidence(&without_imt_evidence, false)
         .await?;
     ensure!(offline_bundle.graph().counts().final_imt_leaves == 0);
     ensure!(matches!(
@@ -2007,6 +2066,8 @@ struct D04b2eReport {
     serial_consistency: &'static str,
     conflicting_reservations_applied: u8,
     conflicting_reservations_rejected: u8,
+    conflicting_live_evidence_distinct: bool,
+    winner_live_bundle_read_from_rf3: bool,
     losing_publish_rejected_before_head_io: bool,
     winning_head_published: bool,
     exact_idempotent_publish_retries: usize,
@@ -2036,20 +2097,34 @@ async fn d04b2e_conflicting_normal_commit_rf3_gate() -> anyhow::Result<()> {
     .to_owned();
     drop(initial_session);
 
-    // Both requests target the same authority and exact expected head, but
-    // commit different checkpoint hashes, state roots, payloads and artifact
-    // digests.  Their independently sealed timestamp reservations therefore
-    // compete for the same idle allocator revision.
-    let left = fixture_from_seeds(
-        15, 61, 31, 32, 33, 34, 35, 4_000, 40,
-    );
-    let right = fixture_from_seeds(
-        15, 61, 31, 42, 33, 44, 45, 4_000, 40,
-    );
+    // Both requests target the same authority and exact predecessor state,
+    // but commit different prepared updates, proof inputs, mutation graphs,
+    // checkpoint hashes, state roots, payloads and artifact digests. Their
+    // independently sealed timestamp reservations therefore compete for the
+    // same idle allocator revision.
+    let left_evidence =
+        realm_evidence_fixture_from_offsets(2, 9, 30, 31, true);
+    let right_evidence =
+        realm_evidence_fixture_from_offsets(2, 9, 30, 41, true);
+    ensure!(left_evidence.prepared.old_realm_root == right_evidence.prepared.old_realm_root);
+    ensure!(left_evidence.prepared.new_realm_root != right_evidence.prepared.new_realm_root);
+    ensure!(left_evidence.coordinator.canonical_chain_ref != right_evidence.coordinator.canonical_chain_ref);
+    ensure!(left_evidence.proof_bytes != right_evidence.proof_bytes);
+    let left = fixture_for_realm_evidence(&left_evidence, 35, 4_000, 40);
+    let right = fixture_for_realm_evidence(&right_evidence, 45, 4_000, 40);
     ensure!(
         AuthorityHeadView::expected(left.package.record())
             == AuthorityHeadView::expected(right.package.record())
     );
+    ensure!(
+        left.package.record().intent().artifacts().mutation_digest()
+            != right.package.record().intent().artifacts().mutation_digest()
+    );
+    ensure!(
+        left.package.record().intent().head_payload().as_bytes()
+            != right.package.record().intent().head_payload().as_bytes()
+    );
+    ensure!(left.package.record().digest() != right.package.record().digest());
     ensure!(left.reservation.candidate() != right.reservation.candidate());
     ensure!(
         left.timestamp_bootstrap.candidate()
@@ -2060,8 +2135,11 @@ async fn d04b2e_conflicting_normal_commit_rf3_gate() -> anyhow::Result<()> {
     ensure!(
         *common_head.head() == AuthorityHeadView::expected(right.package.record())
     );
-    let left_sealed = seal_fixture_for_head_gate(&left);
-    let right_sealed = seal_fixture_for_head_gate(&right);
+    let left_bundle = assemble_realm_evidence_from_fixture(&left_evidence)?;
+    let right_bundle = assemble_realm_evidence_from_fixture(&right_evidence)?;
+    ensure!(left_bundle.digest() != right_bundle.digest());
+    let left_sealed = seal_fixture_for_head_gate(&left, left_bundle)?;
+    let right_sealed = seal_fixture_for_head_gate(&right, right_bundle)?;
     let left_publish = publish_fixture_for_head_gate(
         &left,
         &left_sealed,
@@ -2117,11 +2195,19 @@ async fn d04b2e_conflicting_normal_commit_rf3_gate() -> anyhow::Result<()> {
                 ))
     );
 
-    let (winner, loser, winner_publish, loser_publish, winner_sealed) =
+    let (
+        winner,
+        loser,
+        winner_evidence,
+        winner_publish,
+        loser_publish,
+        winner_sealed,
+    ) =
         if left_won {
             (
                 &left,
                 &right,
+                &left_evidence,
                 left_publish,
                 right_publish,
                 left_sealed,
@@ -2130,6 +2216,7 @@ async fn d04b2e_conflicting_normal_commit_rf3_gate() -> anyhow::Result<()> {
             (
                 &right,
                 &left,
+                &right_evidence,
                 right_publish,
                 left_publish,
                 right_sealed,
@@ -2142,9 +2229,21 @@ async fn d04b2e_conflicting_normal_commit_rf3_gate() -> anyhow::Result<()> {
     ));
     let winner_plan = load_plan_from(&stores.manifests, winner.identity()).await?;
     let combined = stores.executor();
-    let durable_sealed = match combined.step(winner.identity()).await? {
-        RepresentativeNormalCommitStep::StateVerifiedAndSealed { sealed } => sealed,
+    let verified_state = match combined.step(winner.identity()).await? {
+        RepresentativeNormalCommitStep::StateVerifiedAwaitingRealmEvidence {
+            state,
+        } => state,
         other => bail!("unexpected winner state step: {other:?}"),
+    };
+    let winner_bundle = stores
+        .assemble_realm_evidence(winner_evidence, true)
+        .await?;
+    let durable_sealed = match combined
+        .seal_changed_realm_state_with_bundle(verified_state, winner_bundle)
+        .await?
+    {
+        RepresentativeNormalCommitStep::StateVerifiedAndSealed { sealed } => sealed,
+        other => bail!("unexpected winner evidence seal: {other:?}"),
     };
     ensure!(durable_sealed == winner_sealed);
 
@@ -2250,6 +2349,8 @@ async fn d04b2e_conflicting_normal_commit_rf3_gate() -> anyhow::Result<()> {
         serial_consistency: "LOCAL_SERIAL",
         conflicting_reservations_applied: 1,
         conflicting_reservations_rejected: 1,
+        conflicting_live_evidence_distinct: true,
+        winner_live_bundle_read_from_rf3: true,
         losing_publish_rejected_before_head_io: true,
         winning_head_published: true,
         exact_idempotent_publish_retries: 32,
@@ -2258,8 +2359,10 @@ async fn d04b2e_conflicting_normal_commit_rf3_gate() -> anyhow::Result<()> {
         one_replica_offline: true,
         direct_one_state_replicas_equal,
         scenarios_passed: vec![
-            "two intent reservations have one durable owner",
-            "stale losing publish is rejected before head CAS",
+            "same predecessor state yields two distinct exact proof and mutation-graph bundles",
+            "two live-evidence intent reservations have one durable owner",
+            "winner reads exact predecessor rows from RF=3 before SEALED",
+            "delayed losing live-evidence publish is rejected before head CAS",
             "winning replay includes exact IMT leaf/index/cursor physical rows",
             "winning publish is the only canonical head",
             "32 exact publish retries are idempotent",
@@ -2269,7 +2372,7 @@ async fn d04b2e_conflicting_normal_commit_rf3_gate() -> anyhow::Result<()> {
         finished_unix_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_millis() as u64,
-        qualification: "M20 for one representative Realm normal commit with global-user Merkle plus exact IMT leaf/key-index/cursor and checkpoint-root/latest-checkpoint supplements; not upstream IMT root proof binding, production Processor integration, or full table coverage",
+        qualification: "M20 requalified for two changed-Realm intents with one shared predecessor head and distinct exact prepared/GUTA/proof/Coordinator-inclusion/predecessor-graph bundles; winner uses RF=3 predecessor reads and representative Merkle/IMT/root-pair/singleton replay, but this is not production Processor integration or full table coverage",
     };
     let report_path = std::env::var("PSY_D04B2E_REPORT_PATH")
         .unwrap_or_else(|_| "target/d04b2e-normal-commit-conflict-rf3-report.json".into());
