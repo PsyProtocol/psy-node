@@ -3,4 +3,5 @@ pub mod ephemeral_v0;
 pub mod worker_queue;
 pub mod gatherer;
 pub mod infrastructure;
+pub mod recoverable_artifact;
 pub mod recoverable_ephemeral;

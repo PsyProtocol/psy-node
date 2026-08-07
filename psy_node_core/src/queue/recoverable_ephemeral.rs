@@ -43,10 +43,13 @@ const NATS_SEQUENCE_SET_DOMAIN: &[u8] =
     b"psy/rollback/recoverable-queue-nats-sequences/v1";
 const SOURCE_IDENTITY_DOMAIN: &[u8] =
     b"psy/rollback/recoverable-queue-source-identity/v1";
+const ARTIFACT_IDENTITY_DOMAIN: &[u8] =
+    b"psy/rollback/recoverable-queue-artifact-identity/v1";
 
 pub const MAX_RECOVERABLE_QUEUE_BATCH_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_RECOVERABLE_QUEUE_BATCH_ITEMS: usize = 50_000;
 pub const MAX_RECOVERABLE_QUEUE_SOURCE_COMPONENT_BYTES: usize = 512;
+pub const PENDING_QUEUE_CAPTURE_CODEC_VERSION: u16 = 2;
 
 macro_rules! digest_type {
     ($name:ident) => {
@@ -124,6 +127,7 @@ impl PendingQueueCaptureContext {
 
 digest_type!(PendingQueueCaptureContextDigest);
 digest_type!(PendingQueueSourceIdentityDigest);
+digest_type!(PendingQueueArtifactIdentityDigest);
 digest_type!(PendingQueuePayloadDigest);
 digest_type!(PendingQueueBatchDigest);
 digest_type!(PendingQueueBoundaryDigest);
@@ -234,6 +238,83 @@ impl PendingQueueSourceIdentity {
     }
 }
 
+/// Exact generation + source identity used as the durable artifact owner.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct PendingQueueArtifactIdentity {
+    context: PendingQueueCaptureContext,
+    source: PendingQueueSourceIdentity,
+    digest: PendingQueueArtifactIdentityDigest,
+}
+
+impl PendingQueueArtifactIdentity {
+    pub fn try_new(
+        context: PendingQueueCaptureContext,
+        source: PendingQueueSourceIdentity,
+    ) -> Result<Self, RecoverableQueueError> {
+        let mut hasher = Sha256::new();
+        hasher.update(ARTIFACT_IDENTITY_DOMAIN);
+        hasher.update(context.digest.as_bytes());
+        hasher.update(source.digest.as_bytes());
+        let digest = PendingQueueArtifactIdentityDigest(nonzero_digest(
+            hasher.finalize().into(),
+            RecoverableQueueError::EmptyDerivedDigest,
+        )?);
+        Ok(Self {
+            context,
+            source,
+            digest,
+        })
+    }
+
+    pub const fn context(&self) -> PendingQueueCaptureContext {
+        self.context
+    }
+
+    pub const fn source(&self) -> &PendingQueueSourceIdentity {
+        &self.source
+    }
+
+    pub const fn digest(&self) -> PendingQueueArtifactIdentityDigest {
+        self.digest
+    }
+
+    pub fn to_canonical_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(192);
+        out.extend_from_slice(b"PSYQIDEN");
+        out.extend_from_slice(&1_u16.to_be_bytes());
+        encode_context_bytes(self.context, &mut out);
+        self.source
+            .encode(&mut out)
+            .expect("validated source identity must remain canonical");
+        out.extend_from_slice(self.digest.as_bytes());
+        out
+    }
+
+    pub fn decode_canonical(bytes: &[u8]) -> Result<Self, RecoverableQueueError> {
+        let mut decoder = Decoder::new(bytes);
+        if decoder.take(8)? != b"PSYQIDEN" {
+            return Err(RecoverableQueueError::InvalidMagic);
+        }
+        let version = decoder.u16()?;
+        if version != 1 {
+            return Err(RecoverableQueueError::UnknownCodecVersion(version));
+        }
+        let context = decode_context(&mut decoder)?;
+        let source = decode_source_identity(&mut decoder)?;
+        let encoded_digest = PendingQueueArtifactIdentityDigest::try_new(
+            decoder.array32()?,
+        )?;
+        if !decoder.is_done() {
+            return Err(RecoverableQueueError::TrailingBytes);
+        }
+        let identity = Self::try_new(context, source)?;
+        if identity.digest != encoded_digest {
+            return Err(RecoverableQueueError::ArtifactIdentityDigestMismatch);
+        }
+        Ok(identity)
+    }
+}
+
 /// Stable identity for one fetched, still-unacknowledged source range.
 ///
 /// NATS uses stream sequence, which survives consumer recreation. Memory and
@@ -253,16 +334,35 @@ enum PendingQueueSourceCursorValue {
         stream_sequences: Vec<u64>,
     },
     InMemory {
+        source_generation_id: [u8; 32],
         staging_capture_id: [u8; 32],
         source_revision: u64,
         item_count: u64,
         exact_prefix_digest: [u8; 32],
     },
     Redis {
+        source_generation_id: [u8; 32],
         staging_capture_id: [u8; 32],
         source_revision: u64,
         item_count: u64,
         exact_prefix_digest: [u8; 32],
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PendingQueueSourceCursorView<'a> {
+    NatsJetStream {
+        consumer_digest: &'a [u8; 32],
+        sequence_set_digest: &'a [u8; 32],
+        stream_sequences: &'a [u64],
+    },
+    Staged {
+        backend: RecoverableQueueBackendKind,
+        source_generation_id: &'a [u8; 32],
+        staging_capture_id: &'a [u8; 32],
+        source_revision: u64,
+        item_count: u64,
+        exact_prefix_digest: &'a [u8; 32],
     },
 }
 
@@ -307,15 +407,22 @@ impl PendingQueueSourceCursor {
     }
 
     pub fn in_memory(
+        source_generation_id: [u8; 32],
         staging_capture_id: [u8; 32],
         source_revision: u64,
         item_count: u64,
         exact_prefix_digest: [u8; 32],
     ) -> Result<Self, RecoverableQueueError> {
-        validate_staged_cursor(staging_capture_id, source_revision, item_count)?;
+        validate_staged_cursor(
+            source_generation_id,
+            staging_capture_id,
+            source_revision,
+            item_count,
+        )?;
         require_nonzero_source_digest(exact_prefix_digest)?;
         Ok(Self {
             value: PendingQueueSourceCursorValue::InMemory {
+                source_generation_id,
                 staging_capture_id,
                 source_revision,
                 item_count,
@@ -325,15 +432,22 @@ impl PendingQueueSourceCursor {
     }
 
     pub fn redis(
+        source_generation_id: [u8; 32],
         staging_capture_id: [u8; 32],
         source_revision: u64,
         item_count: u64,
         exact_prefix_digest: [u8; 32],
     ) -> Result<Self, RecoverableQueueError> {
-        validate_staged_cursor(staging_capture_id, source_revision, item_count)?;
+        validate_staged_cursor(
+            source_generation_id,
+            staging_capture_id,
+            source_revision,
+            item_count,
+        )?;
         require_nonzero_source_digest(exact_prefix_digest)?;
         Ok(Self {
             value: PendingQueueSourceCursorValue::Redis {
+                source_generation_id,
                 staging_capture_id,
                 source_revision,
                 item_count,
@@ -353,6 +467,48 @@ impl PendingQueueSourceCursor {
             PendingQueueSourceCursorValue::Redis { .. } => {
                 RecoverableQueueBackendKind::Redis
             }
+        }
+    }
+
+    pub fn view(&self) -> PendingQueueSourceCursorView<'_> {
+        match &self.value {
+            PendingQueueSourceCursorValue::NatsJetStream {
+                consumer_digest,
+                sequence_set_digest,
+                stream_sequences,
+            } => PendingQueueSourceCursorView::NatsJetStream {
+                consumer_digest,
+                sequence_set_digest,
+                stream_sequences,
+            },
+            PendingQueueSourceCursorValue::InMemory {
+                source_generation_id,
+                staging_capture_id,
+                source_revision,
+                item_count,
+                exact_prefix_digest,
+            } => PendingQueueSourceCursorView::Staged {
+                backend: RecoverableQueueBackendKind::InMemory,
+                source_generation_id,
+                staging_capture_id,
+                source_revision: *source_revision,
+                item_count: *item_count,
+                exact_prefix_digest,
+            },
+            PendingQueueSourceCursorValue::Redis {
+                source_generation_id,
+                staging_capture_id,
+                source_revision,
+                item_count,
+                exact_prefix_digest,
+            } => PendingQueueSourceCursorView::Staged {
+                backend: RecoverableQueueBackendKind::Redis,
+                source_generation_id,
+                staging_capture_id,
+                source_revision: *source_revision,
+                item_count: *item_count,
+                exact_prefix_digest,
+            },
         }
     }
 
@@ -376,24 +532,28 @@ impl PendingQueueSourceCursor {
                 );
             }
             PendingQueueSourceCursorValue::InMemory {
+                source_generation_id,
                 staging_capture_id,
                 source_revision,
                 item_count,
                 exact_prefix_digest,
             } => {
                 out.push(RecoverableQueueBackendKind::InMemory as u8);
+                out.extend_from_slice(source_generation_id);
                 out.extend_from_slice(staging_capture_id);
                 out.extend_from_slice(&source_revision.to_be_bytes());
                 out.extend_from_slice(&item_count.to_be_bytes());
                 out.extend_from_slice(exact_prefix_digest);
             }
             PendingQueueSourceCursorValue::Redis {
+                source_generation_id,
                 staging_capture_id,
                 source_revision,
                 item_count,
                 exact_prefix_digest,
             } => {
                 out.push(RecoverableQueueBackendKind::Redis as u8);
+                out.extend_from_slice(source_generation_id);
                 out.extend_from_slice(staging_capture_id);
                 out.extend_from_slice(&source_revision.to_be_bytes());
                 out.extend_from_slice(&item_count.to_be_bytes());
@@ -406,8 +566,7 @@ impl PendingQueueSourceCursor {
 /// Canonical payload handed to a durable artifact sink before source ACK.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingQueueCaptureCandidate {
-    context: PendingQueueCaptureContext,
-    source_identity: PendingQueueSourceIdentity,
+    identity: PendingQueueArtifactIdentity,
     source: PendingQueueSourceCursor,
     items: Vec<Vec<u8>>,
     payload_digest: PendingQueuePayloadDigest,
@@ -425,6 +584,10 @@ impl PendingQueueCaptureCandidate {
         if source_identity.backend() != source.backend() {
             return Err(RecoverableQueueError::SourceBackendMismatch);
         }
+        let identity = PendingQueueArtifactIdentity::try_new(
+            context,
+            source_identity,
+        )?;
         if let PendingQueueSourceCursorValue::NatsJetStream {
             stream_sequences, ..
         } = &source.value
@@ -450,15 +613,13 @@ impl PendingQueueCaptureCandidate {
         }
         let payload_digest = payload_digest(&items)?;
         let batch_digest = batch_digest(
-            context,
-            &source_identity,
+            &identity,
             &source,
             items.len(),
             payload_digest,
         )?;
         Ok(Self {
-            context,
-            source_identity,
+            identity,
             source,
             items,
             payload_digest,
@@ -467,7 +628,7 @@ impl PendingQueueCaptureCandidate {
     }
 
     pub const fn context(&self) -> PendingQueueCaptureContext {
-        self.context
+        self.identity.context
     }
 
     pub const fn source(&self) -> &PendingQueueSourceCursor {
@@ -475,7 +636,11 @@ impl PendingQueueCaptureCandidate {
     }
 
     pub const fn source_identity(&self) -> &PendingQueueSourceIdentity {
-        &self.source_identity
+        &self.identity.source
+    }
+
+    pub const fn artifact_identity(&self) -> &PendingQueueArtifactIdentity {
+        &self.identity
     }
 
     pub fn items(&self) -> &[Vec<u8>] {
@@ -506,9 +671,10 @@ impl PendingQueueCaptureCandidate {
     pub fn to_canonical_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.total_payload_bytes() + 192);
         out.extend_from_slice(b"PSYQCAPT");
-        out.extend_from_slice(&1_u16.to_be_bytes());
-        encode_context_bytes(self.context, &mut out);
-        self.source_identity
+        out.extend_from_slice(&PENDING_QUEUE_CAPTURE_CODEC_VERSION.to_be_bytes());
+        encode_context_bytes(self.identity.context, &mut out);
+        self.identity
+            .source
             .encode(&mut out)
             .expect("validated source identity must remain canonical");
         self.source.encode(&mut out);
@@ -528,40 +694,10 @@ impl PendingQueueCaptureCandidate {
             return Err(RecoverableQueueError::InvalidMagic);
         }
         let version = decoder.u16()?;
-        if version != 1 {
+        if version != PENDING_QUEUE_CAPTURE_CODEC_VERSION {
             return Err(RecoverableQueueError::UnknownCodecVersion(version));
         }
-        let network_chain_id = decoder.u32()?;
-        let network = NetworkId::try_from_chain_id(network_chain_id)
-            .map_err(|_| RecoverableQueueError::UnknownNetwork(network_chain_id))?;
-        let authority_kind = decoder.u8()?;
-        let realm_id = decoder.u32()?;
-        let realm_sub_id = decoder.u16()?;
-        let authority = match authority_kind {
-            1 if realm_id == 0 && realm_sub_id == 0 => AuthorityScope::Coordinator,
-            1 => return Err(RecoverableQueueError::InvalidCoordinatorPadding),
-            2 => AuthorityScope::Realm {
-                realm_id,
-                realm_sub_id,
-            },
-            value => return Err(RecoverableQueueError::UnknownAuthority(value)),
-        };
-        let activation = PendingGenerationActivationDigest::try_new(
-            decoder.array32()?,
-        )
-        .map_err(|_| RecoverableQueueError::EmptyActivationDigest)?;
-        let pending_id = decoder.u64()?;
-        let proc_id = decoder.u128()?;
-        let processing = PendingGenerationContext::try_from_legacy(
-            pending_id,
-            proc_id,
-        )
-        .map_err(|_| RecoverableQueueError::InvalidProcessingContext)?;
-        let context = PendingQueueCaptureContext::try_new(
-            PendingGenerationLedgerKey::new(network, authority),
-            activation,
-            processing,
-        )?;
+        let context = decode_context(&mut decoder)?;
 
         let source_identity = decode_source_identity(&mut decoder)?;
 
@@ -611,12 +747,14 @@ impl PendingQueueCaptureCandidate {
                 }
             }
             2 | 3 => {
+                let staging_capture_id = decoder.array32()?;
                 let source_revision = decoder.u64()?;
                 let staged_item_count = decoder.u64()?;
                 let exact_prefix_digest = decoder.array32()?;
                 if backend == 2 {
                     PendingQueueSourceCursor::in_memory(
                         primary_digest,
+                        staging_capture_id,
                         source_revision,
                         staged_item_count,
                         exact_prefix_digest,
@@ -624,6 +762,7 @@ impl PendingQueueCaptureCandidate {
                 } else {
                     PendingQueueSourceCursor::redis(
                         primary_digest,
+                        staging_capture_id,
                         source_revision,
                         staged_item_count,
                         exact_prefix_digest,
@@ -748,13 +887,13 @@ pub enum PendingQueueBoundaryObservation {
         seal_marker_digest: [u8; 32],
     },
     InMemory {
-        closed_generation_revision: u64,
-        staging_capture_id: [u8; 32],
+        source_generation_id: [u8; 32],
+        closed_source_revision: u64,
         seal_digest: [u8; 32],
     },
     Redis {
-        closed_generation_revision: u64,
-        staging_capture_id: [u8; 32],
+        source_generation_id: [u8; 32],
+        closed_source_revision: u64,
         seal_digest: [u8; 32],
     },
 }
@@ -810,6 +949,56 @@ impl PendingQueueGenerationBoundary {
     pub const fn digest(&self) -> PendingQueueBoundaryDigest {
         self.digest
     }
+
+    pub fn to_canonical_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(256);
+        out.extend_from_slice(b"PSYQBNDR");
+        out.extend_from_slice(&1_u16.to_be_bytes());
+        encode_context_bytes(self.context, &mut out);
+        self.source_identity
+            .encode(&mut out)
+            .expect("validated source identity must remain canonical");
+        out.extend_from_slice(self.close_intent.as_bytes());
+        self.observation
+            .encode(&mut out)
+            .expect("validated boundary observation must remain canonical");
+        out.extend_from_slice(self.digest.as_bytes());
+        out
+    }
+
+    pub fn decode_canonical(bytes: &[u8]) -> Result<Self, RecoverableQueueError> {
+        let mut decoder = Decoder::new(bytes);
+        if decoder.take(8)? != b"PSYQBNDR" {
+            return Err(RecoverableQueueError::InvalidMagic);
+        }
+        let version = decoder.u16()?;
+        if version != 1 {
+            return Err(RecoverableQueueError::UnknownCodecVersion(version));
+        }
+        let context = decode_context(&mut decoder)?;
+        let source = decode_source_identity(&mut decoder)?;
+        let close_intent = PendingQueueCloseIntentDigest::try_new(
+            decoder.array32()?,
+        )
+        .map_err(|_| RecoverableQueueError::EmptyCloseIntentDigest)?;
+        let observation = decode_boundary_observation(&mut decoder)?;
+        let encoded_digest = PendingQueueBoundaryDigest::try_new(
+            decoder.array32()?,
+        )?;
+        if !decoder.is_done() {
+            return Err(RecoverableQueueError::TrailingBytes);
+        }
+        let boundary = Self::try_from_backend_observation(
+            context,
+            close_intent,
+            source,
+            observation,
+        )?;
+        if boundary.digest != encoded_digest {
+            return Err(RecoverableQueueError::BoundaryDigestMismatch);
+        }
+        Ok(boundary)
+    }
 }
 
 impl PendingQueueBoundaryObservation {
@@ -843,23 +1032,23 @@ impl PendingQueueBoundaryObservation {
                 out.extend_from_slice(seal_marker_digest);
             }
             Self::InMemory {
-                closed_generation_revision,
-                staging_capture_id,
+                source_generation_id,
+                closed_source_revision,
                 seal_digest,
             }
             | Self::Redis {
-                closed_generation_revision,
-                staging_capture_id,
+                source_generation_id,
+                closed_source_revision,
                 seal_digest,
             } => {
-                if *closed_generation_revision == 0 {
+                if *closed_source_revision == 0 {
                     return Err(RecoverableQueueError::ZeroSourceRevision);
                 }
-                require_nonzero_source_digest(*staging_capture_id)?;
+                require_nonzero_source_digest(*source_generation_id)?;
                 require_nonzero_source_digest(*seal_digest)?;
                 out.push(self.backend() as u8);
-                out.extend_from_slice(&closed_generation_revision.to_be_bytes());
-                out.extend_from_slice(staging_capture_id);
+                out.extend_from_slice(source_generation_id);
+                out.extend_from_slice(&closed_source_revision.to_be_bytes());
                 out.extend_from_slice(seal_digest);
             }
         }
@@ -884,9 +1073,13 @@ pub enum RecoverableQueueError {
     InvalidSourceComponentLength(usize),
     InvalidSourceUtf8,
     ZeroSourceRevision,
+    GenerationEqualsCaptureId,
     InvalidStagedItemCount(u64),
     StagedItemCountMismatch { cursor: u64, items: usize },
     InvalidNatsBoundary { last_data: u64, seal_marker: u64 },
+    ArtifactIdentityDigestMismatch,
+    EmptyCloseIntentDigest,
+    BoundaryDigestMismatch,
     InvalidMagic,
     UnknownCodecVersion(u16),
     UnknownNetwork(u32),
@@ -964,8 +1157,7 @@ fn payload_digest(
 }
 
 fn batch_digest(
-    context: PendingQueueCaptureContext,
-    source_identity: &PendingQueueSourceIdentity,
+    identity: &PendingQueueArtifactIdentity,
     source: &PendingQueueSourceCursor,
     item_count: usize,
     payload: PendingQueuePayloadDigest,
@@ -974,8 +1166,10 @@ fn batch_digest(
     source.encode(&mut source_bytes);
     let mut hasher = Sha256::new();
     hasher.update(BATCH_DOMAIN);
-    hasher.update(context.digest.as_bytes());
-    hasher.update(source_identity.digest.as_bytes());
+    // Preserve the c0/v1 commitment exactly: artifact identity is an owner
+    // slot, not a silent change to the already-versioned batch codec.
+    hasher.update(identity.context.digest.as_bytes());
+    hasher.update(identity.source.digest.as_bytes());
     hasher.update((source_bytes.len() as u64).to_be_bytes());
     hasher.update(source_bytes);
     hasher.update((item_count as u64).to_be_bytes());
@@ -987,11 +1181,16 @@ fn batch_digest(
 }
 
 fn validate_staged_cursor(
+    source_generation_id: [u8; 32],
     staging_capture_id: [u8; 32],
     source_revision: u64,
     item_count: u64,
 ) -> Result<(), RecoverableQueueError> {
+    require_nonzero_source_digest(source_generation_id)?;
     require_nonzero_source_digest(staging_capture_id)?;
+    if source_generation_id == staging_capture_id {
+        return Err(RecoverableQueueError::GenerationEqualsCaptureId);
+    }
     if source_revision == 0 {
         return Err(RecoverableQueueError::ZeroSourceRevision);
     }
@@ -1070,6 +1269,60 @@ fn decode_source_identity(
             namespace,
             decoder.source_component()?,
         ),
+        value => Err(RecoverableQueueError::UnknownBackend(value)),
+    }
+}
+
+fn decode_context(
+    decoder: &mut Decoder<'_>,
+) -> Result<PendingQueueCaptureContext, RecoverableQueueError> {
+    let network_chain_id = decoder.u32()?;
+    let network = NetworkId::try_from_chain_id(network_chain_id)
+        .map_err(|_| RecoverableQueueError::UnknownNetwork(network_chain_id))?;
+    let authority_kind = decoder.u8()?;
+    let realm_id = decoder.u32()?;
+    let realm_sub_id = decoder.u16()?;
+    let authority = match authority_kind {
+        1 if realm_id == 0 && realm_sub_id == 0 => AuthorityScope::Coordinator,
+        1 => return Err(RecoverableQueueError::InvalidCoordinatorPadding),
+        2 => AuthorityScope::Realm {
+            realm_id,
+            realm_sub_id,
+        },
+        value => return Err(RecoverableQueueError::UnknownAuthority(value)),
+    };
+    let activation = PendingGenerationActivationDigest::try_new(decoder.array32()?)
+        .map_err(|_| RecoverableQueueError::EmptyActivationDigest)?;
+    let pending_id = decoder.u64()?;
+    let proc_id = decoder.u128()?;
+    let processing = PendingGenerationContext::try_from_legacy(pending_id, proc_id)
+        .map_err(|_| RecoverableQueueError::InvalidProcessingContext)?;
+    PendingQueueCaptureContext::try_new(
+        PendingGenerationLedgerKey::new(network, authority),
+        activation,
+        processing,
+    )
+}
+
+fn decode_boundary_observation(
+    decoder: &mut Decoder<'_>,
+) -> Result<PendingQueueBoundaryObservation, RecoverableQueueError> {
+    match decoder.u8()? {
+        1 => Ok(PendingQueueBoundaryObservation::NatsJetStream {
+            seal_marker_stream_sequence: decoder.u64()?,
+            last_data_stream_sequence: decoder.u64()?,
+            seal_marker_digest: decoder.array32()?,
+        }),
+        2 => Ok(PendingQueueBoundaryObservation::InMemory {
+            source_generation_id: decoder.array32()?,
+            closed_source_revision: decoder.u64()?,
+            seal_digest: decoder.array32()?,
+        }),
+        3 => Ok(PendingQueueBoundaryObservation::Redis {
+            source_generation_id: decoder.array32()?,
+            closed_source_revision: decoder.u64()?,
+            seal_digest: decoder.array32()?,
+        }),
         value => Err(RecoverableQueueError::UnknownBackend(value)),
     }
 }
@@ -1277,7 +1530,7 @@ mod tests {
         .is_err());
         assert!(PendingQueueSourceCursor::nats_jetstream([4; 32], &[11, 10])
             .is_err());
-        assert!(PendingQueueSourceCursor::redis([0; 32], 1, 1, [5; 32]).is_err());
+        assert!(PendingQueueSourceCursor::redis([0; 32], [6; 32], 1, 1, [5; 32]).is_err());
         assert!(PendingQueueSourceIdentity::nats_jetstream(
             "psy",
             "psy_stream",
@@ -1288,7 +1541,7 @@ mod tests {
             PendingQueueCaptureCandidate::try_new(
                 context,
                 nats_source(),
-                PendingQueueSourceCursor::redis([6; 32], 1, 1, [5; 32])
+                PendingQueueSourceCursor::redis([9; 32], [6; 32], 1, 1, [5; 32])
                     .unwrap(),
                 vec![b"one".to_vec()],
             ),
@@ -1298,7 +1551,7 @@ mod tests {
             PendingQueueCaptureCandidate::try_new(
                 context,
                 PendingQueueSourceIdentity::redis("psy", "queue:7").unwrap(),
-                PendingQueueSourceCursor::redis([6; 32], 1, 2, [5; 32])
+                PendingQueueSourceCursor::redis([9; 32], [6; 32], 1, 2, [5; 32])
                     .unwrap(),
                 vec![b"one".to_vec()],
             ),
@@ -1372,7 +1625,26 @@ mod tests {
         )
         .unwrap();
         assert_ne!(first.batch_digest(), different_subject.batch_digest());
-        assert_eq!(first.to_canonical_bytes(), candidate().to_canonical_bytes());
+        assert_eq!(
+            first.batch_digest().as_bytes(),
+            &[
+                204, 71, 105, 101, 153, 98, 155, 113, 157, 120, 38, 107, 207, 34, 36,
+                115, 95, 21, 195, 204, 123, 210, 106, 250, 45, 235, 172, 112, 23,
+                242, 222, 16,
+            ],
+        );
+        let canonical = first.to_canonical_bytes();
+        let canonical_digest: [u8; 32] = Sha256::digest(&canonical).into();
+        assert_eq!(canonical.len(), 309);
+        assert_eq!(
+            canonical_digest,
+            [
+                53, 49, 116, 213, 165, 37, 41, 7, 115, 96, 26, 218, 26, 38, 244,
+                162, 110, 30, 82, 161, 13, 226, 5, 1, 21, 186, 220, 80, 129, 87,
+                55, 212,
+            ],
+        );
+        assert_eq!(canonical, candidate().to_canonical_bytes());
     }
 
     #[test]
@@ -1391,11 +1663,17 @@ mod tests {
             PendingQueueCaptureCandidate::decode_canonical(&trailing),
             Err(RecoverableQueueError::TrailingBytes),
         );
+        let mut retired_v1 = bytes.clone();
+        retired_v1[8..10].copy_from_slice(&1_u16.to_be_bytes());
+        assert_eq!(
+            PendingQueueCaptureCandidate::decode_canonical(&retired_v1),
+            Err(RecoverableQueueError::UnknownCodecVersion(1)),
+        );
         let mut unknown_version = bytes.clone();
-        unknown_version[8..10].copy_from_slice(&2_u16.to_be_bytes());
+        unknown_version[8..10].copy_from_slice(&3_u16.to_be_bytes());
         assert_eq!(
             PendingQueueCaptureCandidate::decode_canonical(&unknown_version),
-            Err(RecoverableQueueError::UnknownCodecVersion(2)),
+            Err(RecoverableQueueError::UnknownCodecVersion(3)),
         );
         let mut changed_payload = bytes;
         let payload_offset = changed_payload
@@ -1430,7 +1708,7 @@ mod tests {
             PendingQueueCaptureCandidate::try_new(
                 context(),
                 PendingQueueSourceIdentity::in_memory("test", "q").unwrap(),
-                PendingQueueSourceCursor::in_memory([6; 32], 1, 1, [5; 32])
+                PendingQueueSourceCursor::in_memory([9; 32], [6; 32], 1, 1, [5; 32])
                     .unwrap(),
                 Vec::new(),
             ),
@@ -1440,7 +1718,7 @@ mod tests {
             PendingQueueCaptureCandidate::try_new(
                 context(),
                 PendingQueueSourceIdentity::in_memory("test", "q").unwrap(),
-                PendingQueueSourceCursor::in_memory([6; 32], 1, 1, [5; 32])
+                PendingQueueSourceCursor::in_memory([9; 32], [6; 32], 1, 1, [5; 32])
                     .unwrap(),
                 vec![Vec::new()],
             ),
@@ -1467,7 +1745,7 @@ mod tests {
             PendingQueueCaptureCandidate::try_new(
                 context(),
                 PendingQueueSourceIdentity::redis("test", "list").unwrap(),
-                PendingQueueSourceCursor::redis([6; 32], 1, 1, [5; 32])
+                PendingQueueSourceCursor::redis([9; 32], [6; 32], 1, 1, [5; 32])
                     .unwrap(),
                 too_many,
             ),
@@ -1482,14 +1760,14 @@ mod tests {
         let a = PendingQueueCaptureCandidate::try_new(
             context(),
             source.clone(),
-            PendingQueueSourceCursor::redis([1; 32], 10, 1, [5; 32]).unwrap(),
+            PendingQueueSourceCursor::redis([9; 32], [1; 32], 10, 1, [5; 32]).unwrap(),
             vec![b"same".to_vec()],
         )
         .unwrap();
         let b = PendingQueueCaptureCandidate::try_new(
             context(),
             source,
-            PendingQueueSourceCursor::redis([2; 32], 11, 1, [5; 32]).unwrap(),
+            PendingQueueSourceCursor::redis([9; 32], [2; 32], 11, 1, [5; 32]).unwrap(),
             vec![b"same".to_vec()],
         )
         .unwrap();
@@ -1529,5 +1807,129 @@ mod tests {
         .unwrap();
         assert_eq!(boundary.source_identity().backend(), RecoverableQueueBackendKind::NatsJetStream);
         assert_ne!(boundary.digest().as_bytes(), &[0; 32]);
+    }
+
+    #[test]
+    fn artifact_identity_cursor_view_and_boundary_codecs_are_strict() {
+        let nats = candidate();
+        let identity = nats.artifact_identity().clone();
+        let identity_bytes = identity.to_canonical_bytes();
+        assert_eq!(
+            PendingQueueArtifactIdentity::decode_canonical(&identity_bytes)
+                .unwrap(),
+            identity,
+        );
+        let mut tampered_identity = identity_bytes.clone();
+        *tampered_identity.last_mut().unwrap() ^= 1;
+        assert_eq!(
+            PendingQueueArtifactIdentity::decode_canonical(&tampered_identity),
+            Err(RecoverableQueueError::ArtifactIdentityDigestMismatch),
+        );
+        let mut trailing_identity = identity_bytes;
+        trailing_identity.push(0);
+        assert_eq!(
+            PendingQueueArtifactIdentity::decode_canonical(&trailing_identity),
+            Err(RecoverableQueueError::TrailingBytes),
+        );
+        let changed_source = PendingQueueArtifactIdentity::try_new(
+            context(),
+            PendingQueueSourceIdentity::nats_jetstream(
+                "psy",
+                "psy_stream",
+                "psy.pq.r7.rs2.u65.qt10.g0",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_ne!(identity.digest(), changed_source.digest());
+
+        let staged = PendingQueueCaptureCandidate::try_new(
+            context(),
+            PendingQueueSourceIdentity::redis("psy", "queue:7").unwrap(),
+            PendingQueueSourceCursor::redis(
+                [9; 32],
+                [6; 32],
+                2,
+                1,
+                [5; 32],
+            )
+            .unwrap(),
+            vec![b"staged".to_vec()],
+        )
+        .unwrap();
+        let staged_roundtrip = PendingQueueCaptureCandidate::decode_canonical(
+            &staged.to_canonical_bytes(),
+        )
+        .unwrap();
+        assert_eq!(staged_roundtrip, staged);
+        let staged_canonical = staged.to_canonical_bytes();
+        let staged_digest: [u8; 32] = Sha256::digest(&staged_canonical).into();
+        assert_eq!(staged_canonical.len(), 283);
+        assert_eq!(
+            staged_digest,
+            [
+                196, 213, 33, 51, 163, 171, 1, 18, 169, 227, 203, 155, 105, 69,
+                110, 218, 176, 28, 197, 34, 102, 188, 244, 53, 125, 141, 74, 151,
+                185, 218, 39, 59,
+            ],
+        );
+        assert!(matches!(
+            staged.source().view(),
+            PendingQueueSourceCursorView::Staged {
+                backend: RecoverableQueueBackendKind::Redis,
+                source_generation_id,
+                staging_capture_id,
+                source_revision: 2,
+                item_count: 1,
+                exact_prefix_digest,
+            } if source_generation_id == &[9; 32]
+                && staging_capture_id == &[6; 32]
+                && exact_prefix_digest == &[5; 32]
+        ));
+        assert!(matches!(
+            nats.source().view(),
+            PendingQueueSourceCursorView::NatsJetStream {
+                stream_sequences,
+                ..
+            } if stream_sequences == [10, 11]
+        ));
+
+        let close = PendingQueueCloseIntentDigest::try_new([7; 32]).unwrap();
+        assert_eq!(
+            PendingQueueGenerationBoundary::try_from_backend_observation(
+                context(),
+                close,
+                PendingQueueSourceIdentity::redis("psy", "queue:7").unwrap(),
+                PendingQueueBoundaryObservation::Redis {
+                    source_generation_id: [9; 32],
+                    closed_source_revision: 0,
+                    seal_digest: [8; 32],
+                },
+            ),
+            Err(RecoverableQueueError::ZeroSourceRevision),
+        );
+        let boundary = PendingQueueGenerationBoundary::try_from_backend_observation(
+            context(),
+            close,
+            PendingQueueSourceIdentity::redis("psy", "queue:7").unwrap(),
+            PendingQueueBoundaryObservation::Redis {
+                source_generation_id: [9; 32],
+                closed_source_revision: 3,
+                seal_digest: [8; 32],
+            },
+        )
+        .unwrap();
+        let boundary_bytes = boundary.to_canonical_bytes();
+        assert_eq!(
+            PendingQueueGenerationBoundary::decode_canonical(&boundary_bytes)
+                .unwrap(),
+            boundary,
+        );
+        let mut tampered_boundary = boundary_bytes;
+        *tampered_boundary.last_mut().unwrap() ^= 1;
+        assert_eq!(
+            PendingQueueGenerationBoundary::decode_canonical(&tampered_boundary),
+            Err(RecoverableQueueError::BoundaryDigestMismatch),
+        );
     }
 }
