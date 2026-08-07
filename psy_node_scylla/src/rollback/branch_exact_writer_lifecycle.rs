@@ -106,6 +106,18 @@ impl BranchExactWriterActivationDigest {
         &self.0
     }
 
+    pub fn try_from_hex(value: &str) -> Result<Self, BranchExactWriterLifecycleError> {
+        let bytes = hex::decode(value)
+            .map_err(|_| BranchExactWriterLifecycleError::InvalidActivationDigestHex)?;
+        let bytes: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| BranchExactWriterLifecycleError::InvalidActivationDigestHex)?;
+        if bytes == [0; 32] {
+            return Err(BranchExactWriterLifecycleError::InvalidActivationDigestHex);
+        }
+        Ok(Self(bytes))
+    }
+
     pub(crate) const fn from_persisted(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
@@ -1266,6 +1278,7 @@ pub enum BranchExactWriterLifecycleError {
     ShadowConsumptionMismatch,
     BackfillEvidenceMismatch,
     BackfillReceipt(String),
+    InvalidActivationDigestHex,
     MissingBackfillTimestamp,
     TimestampAllocatorNotReady,
     ArtifactOutsideFrozenHead,
@@ -1654,6 +1667,23 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(activated.candidate().state(), BranchExactWriterState::Active(_)));
+    }
+
+    #[test]
+    fn activation_digest_config_parser_is_strict() {
+        let digest = BranchExactWriterActivationDigest::try_from_hex(
+            &hex::encode([7_u8; 32]),
+        )
+        .unwrap();
+        assert_eq!(digest.as_bytes(), &[7; 32]);
+        assert_eq!(
+            BranchExactWriterActivationDigest::try_from_hex("07"),
+            Err(BranchExactWriterLifecycleError::InvalidActivationDigestHex)
+        );
+        assert_eq!(
+            BranchExactWriterActivationDigest::try_from_hex(&hex::encode([0_u8; 32])),
+            Err(BranchExactWriterLifecycleError::InvalidActivationDigestHex)
+        );
     }
 
     #[test]
