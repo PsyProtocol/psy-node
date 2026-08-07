@@ -7,6 +7,7 @@
 
 use std::{error::Error, fmt};
 
+use futures::TryStreamExt;
 use parth_core::{
     crypto::hash::tag_tree::TagTreeMerkleProof,
     protocol::core_types::Q256BitHash,
@@ -246,6 +247,9 @@ pub enum BranchExactQueryId {
     ReadPendingToBranch = 8,
     ReadPendingRewardProof = 9,
     InspectTableColumns = 10,
+    ScanBranchToPending = 11,
+    ScanPendingToBranch = 12,
+    ScanPendingRewardProof = 13,
 }
 
 const COORDINATOR_BRANCH_EXACT_CREATE_QUERIES: &[BranchExactQueryId] = &[
@@ -291,7 +295,7 @@ impl BranchExactQuery {
 /// Single source of CQL for the prototype adapter and query-golden tests.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BranchExactQueries {
-    queries: [BranchExactQuery; 10],
+    queries: [BranchExactQuery; 13],
 }
 
 impl BranchExactQueries {
@@ -380,6 +384,25 @@ impl BranchExactQueries {
                     BranchExactQueryId::InspectTableColumns,
                     "SELECT column_name, type, kind, position, clustering_order FROM system_schema.columns WHERE keyspace_name = ? AND table_name = ?".to_owned(),
                     &["TEXT", "TEXT"],
+                ),
+                query(
+                    BranchExactQueryId::ScanBranchToPending,
+                    format!(
+                        "SELECT canonical_ref, pending_id FROM {forward}"
+                    ),
+                    &[],
+                ),
+                query(
+                    BranchExactQueryId::ScanPendingToBranch,
+                    format!(
+                        "SELECT pending_id, canonical_ref FROM {reverse}"
+                    ),
+                    &[],
+                ),
+                query(
+                    BranchExactQueryId::ScanPendingRewardProof,
+                    format!("SELECT pending_id, value FROM {proof}"),
+                    &[],
                 ),
             ],
         }
@@ -949,10 +972,13 @@ pub fn verify_reverse_rows<Hash: Q256BitHash>(
 struct PreparedBranchExact {
     forward_put: PreparedStatement,
     reverse_put: PreparedStatement,
-    proof_put: PreparedStatement,
+    proof_put: Option<PreparedStatement>,
     forward_read: PreparedStatement,
     reverse_read: PreparedStatement,
-    proof_read: PreparedStatement,
+    proof_read: Option<PreparedStatement>,
+    forward_scan: PreparedStatement,
+    reverse_scan: PreparedStatement,
+    proof_scan: Option<PreparedStatement>,
 }
 
 /// Isolated schema materializer used by deployment tooling and future RF=3
@@ -1057,9 +1083,11 @@ impl BranchExactSchemaMigrationAdapter {
     pub(crate) async fn prepare_with_consistency(
         session: &Session,
         keyspace: CqlKeyspaceName,
+        authority: AuthorityScope,
         consistency: Consistency,
     ) -> anyhow::Result<Self> {
         let queries = BranchExactQueries::new(&keyspace);
+        let realm_proof = matches!(authority, AuthorityScope::Realm { .. });
         let prepared = PreparedBranchExact {
             forward_put: prepare(
                 session,
@@ -1073,12 +1101,18 @@ impl BranchExactSchemaMigrationAdapter {
                 consistency,
             )
             .await?,
-            proof_put: prepare(
-                session,
-                queries.get(BranchExactQueryId::PutPendingRewardProof),
-                consistency,
-            )
-            .await?,
+            proof_put: if realm_proof {
+                Some(
+                    prepare(
+                        session,
+                        queries.get(BranchExactQueryId::PutPendingRewardProof),
+                        consistency,
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            },
             forward_read: prepare(
                 session,
                 queries.get(BranchExactQueryId::ReadBranchToPending),
@@ -1091,12 +1125,42 @@ impl BranchExactSchemaMigrationAdapter {
                 consistency,
             )
             .await?,
-            proof_read: prepare(
+            proof_read: if realm_proof {
+                Some(
+                    prepare(
+                        session,
+                        queries.get(BranchExactQueryId::ReadPendingRewardProof),
+                        consistency,
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            },
+            forward_scan: prepare(
                 session,
-                queries.get(BranchExactQueryId::ReadPendingRewardProof),
+                queries.get(BranchExactQueryId::ScanBranchToPending),
                 consistency,
             )
             .await?,
+            reverse_scan: prepare(
+                session,
+                queries.get(BranchExactQueryId::ScanPendingToBranch),
+                consistency,
+            )
+            .await?,
+            proof_scan: if realm_proof {
+                Some(
+                    prepare(
+                        session,
+                        queries.get(BranchExactQueryId::ScanPendingRewardProof),
+                        consistency,
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            },
         };
         Ok(Self {
             queries,
@@ -1170,9 +1234,14 @@ impl BranchExactSchemaMigrationAdapter {
         session: &Session,
         plan: &PendingRewardProofPutPlan,
     ) -> anyhow::Result<()> {
+        let proof_put = self
+            .prepared
+            .proof_put
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("pending reward proof table is not available for Coordinator authority"))?;
         session
             .execute_unpaged(
-                &self.prepared.proof_put,
+                proof_put,
                 (
                     plan.pending_id,
                     plan.stored_value.as_slice(),
@@ -1188,8 +1257,13 @@ impl BranchExactSchemaMigrationAdapter {
         session: &Session,
         pending_id: UniquePendingId,
     ) -> anyhow::Result<Option<TagTreeMerkleProof<Hash>>> {
+        let proof_read = self
+            .prepared
+            .proof_read
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("pending reward proof table is not available for Coordinator authority"))?;
         let row = session
-            .execute_unpaged(&self.prepared.proof_read, (pending_id.get() as i64,))
+            .execute_unpaged(proof_read, (pending_id.get() as i64,))
             .await?
             .into_rows_result()?
             .maybe_first_row::<(Vec<u8>,)>()?;
@@ -1199,6 +1273,47 @@ impl BranchExactSchemaMigrationAdapter {
             )
         })
         .transpose()
+    }
+
+    pub(crate) async fn scan_branch_to_pending(
+        &self,
+        session: &Session,
+    ) -> anyhow::Result<Vec<(Vec<u8>, i64)>> {
+        Ok(session
+            .execute_iter(self.prepared.forward_scan.clone(), ())
+            .await?
+            .rows_stream::<(Vec<u8>, i64)>()?
+            .try_collect()
+            .await?)
+    }
+
+    pub(crate) async fn scan_pending_to_branch(
+        &self,
+        session: &Session,
+    ) -> anyhow::Result<Vec<(i64, Vec<u8>)>> {
+        Ok(session
+            .execute_iter(self.prepared.reverse_scan.clone(), ())
+            .await?
+            .rows_stream::<(i64, Vec<u8>)>()?
+            .try_collect()
+            .await?)
+    }
+
+    pub(crate) async fn scan_pending_reward_proofs(
+        &self,
+        session: &Session,
+    ) -> anyhow::Result<Vec<(i64, Vec<u8>)>> {
+        let proof_scan = self.prepared.proof_scan.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "pending reward proof table is not available for Coordinator authority"
+            )
+        })?;
+        Ok(session
+            .execute_iter(proof_scan.clone(), ())
+            .await?
+            .rows_stream::<(i64, Vec<u8>)>()?
+            .try_collect()
+            .await?)
     }
 
     pub(crate) const fn queries(&self) -> &BranchExactQueries {
@@ -1694,8 +1809,26 @@ mod tests {
     #[test]
     fn query_golden_is_deterministic_and_complete() {
         let queries = BranchExactQueries::new(&CqlKeyspaceName::try_new("ks").unwrap());
-        assert_eq!(queries.all().count(), 10);
+        assert_eq!(queries.all().count(), 13);
         assert_eq!(queries.golden(), queries.golden());
         assert!(queries.golden().contains("PutBranchToPending"));
+        assert_eq!(
+            queries
+                .get(BranchExactQueryId::ScanBranchToPending)
+                .cql(),
+            "SELECT canonical_ref, pending_id FROM ks.canonical_chain_ref_to_pending_id_table"
+        );
+        assert_eq!(
+            queries
+                .get(BranchExactQueryId::ScanPendingToBranch)
+                .cql(),
+            "SELECT pending_id, canonical_ref FROM ks.pending_id_to_canonical_chain_ref_table"
+        );
+        assert_eq!(
+            queries
+                .get(BranchExactQueryId::ScanPendingRewardProof)
+                .cql(),
+            "SELECT pending_id, value FROM ks.pending_reward_top_proof_table"
+        );
     }
 }

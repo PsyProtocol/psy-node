@@ -8,6 +8,7 @@ use std::{error::Error, fmt};
 use psy_node_core::store::{
     branch_exact_schema::AuthorityScope,
     canonical_head::CanonicalHeadBootstrapProfile,
+    timestamp::CommitWriteTimestampUs,
 };
 use sha2::{Digest, Sha256};
 
@@ -23,7 +24,7 @@ pub(crate) const BACKFILL_PLANNED_PAYLOAD_KIND: u8 = 3;
 pub(crate) const BACKFILL_PROGRESS_PAYLOAD_KIND: u8 = 4;
 pub(crate) const BACKFILL_VERIFIED_PAYLOAD_KIND: u8 = 5;
 
-const BACKFILL_CODEC_VERSION: u16 = 1;
+const BACKFILL_CODEC_VERSION: u16 = 2;
 const BACKFILL_PLAN_DIGEST_DOMAIN: &[u8] =
     b"psy/rollback/branch-exact-backfill-plan/v1";
 const BACKFILL_EMPTY_DATASET_DOMAIN: &[u8] =
@@ -128,6 +129,7 @@ pub struct BranchExactBackfillPlan {
     deployment: BranchExactVerifiedDeploymentReceipt,
     mode: BranchExactBackfillMode,
     dataset_digest: BranchExactBackfillDatasetDigest,
+    write_timestamp: Option<CommitWriteTimestampUs>,
     total_chunks: u32,
     pair_rows_per_direction: u64,
     proof_rows: u64,
@@ -144,6 +146,7 @@ impl BranchExactBackfillPlan {
             deployment,
             BranchExactBackfillMode::GenesisEmpty,
             BranchExactBackfillDatasetDigest::empty(),
+            None,
             0,
             0,
             0,
@@ -154,6 +157,7 @@ impl BranchExactBackfillPlan {
         request: &BranchExactSchemaMaterializationRequest,
         deployment: BranchExactVerifiedDeploymentReceipt,
         dataset_digest: BranchExactBackfillDatasetDigest,
+        write_timestamp: CommitWriteTimestampUs,
         total_chunks: u32,
         pair_rows_per_direction: u64,
         proof_rows: u64,
@@ -163,6 +167,7 @@ impl BranchExactBackfillPlan {
             deployment,
             BranchExactBackfillMode::PostGenesisArtifact,
             dataset_digest,
+            Some(write_timestamp),
             total_chunks,
             pair_rows_per_direction,
             proof_rows,
@@ -174,6 +179,7 @@ impl BranchExactBackfillPlan {
         deployment: BranchExactVerifiedDeploymentReceipt,
         mode: BranchExactBackfillMode,
         dataset_digest: BranchExactBackfillDatasetDigest,
+        write_timestamp: Option<CommitWriteTimestampUs>,
         total_chunks: u32,
         pair_rows_per_direction: u64,
         proof_rows: u64,
@@ -185,6 +191,7 @@ impl BranchExactBackfillPlan {
             deployment,
             mode,
             dataset_digest,
+            write_timestamp,
             total_chunks,
             pair_rows_per_direction,
             proof_rows,
@@ -202,6 +209,7 @@ impl BranchExactBackfillPlan {
         deployment: BranchExactVerifiedDeploymentReceipt,
         mode: BranchExactBackfillMode,
         dataset_digest: BranchExactBackfillDatasetDigest,
+        write_timestamp: Option<CommitWriteTimestampUs>,
         total_chunks: u32,
         pair_rows_per_direction: u64,
         proof_rows: u64,
@@ -216,6 +224,7 @@ impl BranchExactBackfillPlan {
                     || pair_rows_per_direction != 0
                     || proof_rows != 0
                     || dataset_digest != BranchExactBackfillDatasetDigest::empty()
+                    || write_timestamp.is_some()
                 {
                     return Err(BranchExactBackfillError::GenesisMustBeEmpty);
                 }
@@ -224,13 +233,13 @@ impl BranchExactBackfillPlan {
                 BranchExactBackfillMode::PostGenesisArtifact,
                 CanonicalHeadBootstrapProfile::PostGenesisFloor,
             ) => {
-                if total_chunks == 0 || pair_rows_per_direction == 0 {
+                if total_chunks == 0
+                    || pair_rows_per_direction == 0
+                    || write_timestamp.is_none()
+                {
                     return Err(BranchExactBackfillError::EmptyPostGenesisBackfill);
                 }
-                let mutation_groups = pair_rows_per_direction
-                    .checked_add(proof_rows)
-                    .ok_or(BranchExactBackfillError::RowCountOverflow)?;
-                if u64::from(total_chunks) > mutation_groups {
+                if u64::from(total_chunks) > pair_rows_per_direction {
                     return Err(BranchExactBackfillError::TooManyChunksForRows);
                 }
             }
@@ -251,6 +260,7 @@ impl BranchExactBackfillPlan {
             deployment,
             mode,
             dataset_digest,
+            write_timestamp,
             total_chunks,
             pair_rows_per_direction,
             proof_rows,
@@ -270,6 +280,10 @@ impl BranchExactBackfillPlan {
 
     pub const fn dataset_digest(&self) -> BranchExactBackfillDatasetDigest {
         self.dataset_digest
+    }
+
+    pub const fn write_timestamp(&self) -> Option<CommitWriteTimestampUs> {
+        self.write_timestamp
     }
 
     pub const fn total_chunks(&self) -> u32 {
@@ -310,6 +324,13 @@ fn calculate_plan_digest(plan: &BranchExactBackfillPlan) -> BranchExactBackfillP
     hasher.update(plan.deployment.to_canonical_bytes());
     hasher.update([plan.mode as u8]);
     hasher.update(plan.dataset_digest.as_bytes());
+    match plan.write_timestamp {
+        None => hasher.update([0]),
+        Some(timestamp) => {
+            hasher.update([1]);
+            hasher.update(timestamp.as_i64().to_be_bytes());
+        }
+    }
     hasher.update(plan.total_chunks.to_be_bytes());
     hasher.update(plan.pair_rows_per_direction.to_be_bytes());
     hasher.update(plan.proof_rows.to_be_bytes());
@@ -475,7 +496,10 @@ pub struct BranchExactBackfillReadbackObservation {
 }
 
 impl BranchExactBackfillReadbackObservation {
-    pub const fn new(
+    /// Only trusted Scylla read-back adapters inside this crate may construct
+    /// an observation. External deployment tooling can pass through the
+    /// opaque value returned by the scanner, but cannot forge row counts.
+    pub(crate) const fn new(
         plan_digest: BranchExactBackfillPlanDigest,
         dataset_digest: BranchExactBackfillDatasetDigest,
         forward_rows: u64,
@@ -719,13 +743,22 @@ impl SealedBranchExactBackfillVerifiedCas {
 
 fn encode_plan(plan: &BranchExactBackfillPlan) -> Vec<u8> {
     let deployment = plan.deployment.to_canonical_bytes();
-    let mut output = Vec::with_capacity(2 + 1 + 4 + deployment.len() + 1 + 32 + 4 + 8 + 8 + 32);
+    let mut output = Vec::with_capacity(
+        2 + 1 + 4 + deployment.len() + 1 + 32 + 1 + 8 + 4 + 8 + 8 + 32,
+    );
     output.extend_from_slice(&BACKFILL_CODEC_VERSION.to_be_bytes());
     output.push(BACKFILL_PLANNED_PAYLOAD_KIND);
     output.extend_from_slice(&(deployment.len() as u32).to_be_bytes());
     output.extend_from_slice(&deployment);
     output.push(plan.mode as u8);
     output.extend_from_slice(plan.dataset_digest.as_bytes());
+    match plan.write_timestamp {
+        None => output.push(0),
+        Some(timestamp) => {
+            output.push(1);
+            output.extend_from_slice(&timestamp.as_i64().to_be_bytes());
+        }
+    }
     output.extend_from_slice(&plan.total_chunks.to_be_bytes());
     output.extend_from_slice(&plan.pair_rows_per_direction.to_be_bytes());
     output.extend_from_slice(&plan.proof_rows.to_be_bytes());
@@ -741,6 +774,13 @@ fn decode_plan(bytes: &[u8]) -> Result<BranchExactBackfillPlan, BranchExactBackf
     )?;
     let mode = BranchExactBackfillMode::try_from(decoder.u8()?)?;
     let dataset_digest = BranchExactBackfillDatasetDigest::try_new(decoder.array32()?)?;
+    let write_timestamp = match decoder.u8()? {
+        0 => None,
+        1 => Some(CommitWriteTimestampUs::try_from_i128(
+            i128::from(decoder.i64()?),
+        )?),
+        value => return Err(BranchExactBackfillError::InvalidTimestampPresence(value)),
+    };
     let total_chunks = decoder.u32()?;
     let pair_rows_per_direction = decoder.u64()?;
     let proof_rows = decoder.u64()?;
@@ -750,6 +790,7 @@ fn decode_plan(bytes: &[u8]) -> Result<BranchExactBackfillPlan, BranchExactBackf
         deployment,
         mode,
         dataset_digest,
+        write_timestamp,
         total_chunks,
         pair_rows_per_direction,
         proof_rows,
@@ -925,6 +966,10 @@ impl<'a> BackfillDecoder<'a> {
         Ok(u64::from_be_bytes(self.take(8)?.try_into().unwrap()))
     }
 
+    fn i64(&mut self) -> Result<i64, BranchExactBackfillError> {
+        Ok(i64::from_be_bytes(self.take(8)?.try_into().unwrap()))
+    }
+
     fn array32(&mut self) -> Result<[u8; 32], BranchExactBackfillError> {
         Ok(self.take(32)?.try_into().unwrap())
     }
@@ -980,6 +1025,8 @@ pub enum BranchExactBackfillError {
     MissingFloorEvidence,
     ZeroDatasetDigest,
     ZeroChunkDigest,
+    TimestampOutOfRange(psy_node_core::store::timestamp::TimestampOutOfCqlRange),
+    InvalidTimestampPresence(u8),
     UnknownBackfillMode(u8),
     ProfileModeMismatch,
     GenesisMustBeEmpty,
@@ -1019,6 +1066,16 @@ impl From<super::BranchExactDeploymentError> for BranchExactBackfillError {
     }
 }
 
+impl From<psy_node_core::store::timestamp::TimestampOutOfCqlRange>
+    for BranchExactBackfillError
+{
+    fn from(
+        value: psy_node_core::store::timestamp::TimestampOutOfCqlRange,
+    ) -> Self {
+        Self::TimestampOutOfRange(value)
+    }
+}
+
 impl fmt::Display for BranchExactBackfillError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{self:?}")
@@ -1042,6 +1099,7 @@ mod tests {
         },
         canonical_head::{CanonicalHeadBootstrap, CanonicalHeadBootstrapProfile},
         manifest_record::AuthorityManifestDigest,
+        timestamp::CommitWriteTimestampUs,
     };
 
     use super::*;
@@ -1173,11 +1231,16 @@ mod tests {
             request,
             verified(request),
             BranchExactBackfillDatasetDigest::try_new([0xA5; 32]).unwrap(),
+            backfill_timestamp(),
             2,
             4,
             2,
         )
         .unwrap()
+    }
+
+    fn backfill_timestamp() -> CommitWriteTimestampUs {
+        CommitWriteTimestampUs::try_from_i128(1_700_000_000_000_000).unwrap()
     }
 
     fn chunk(
@@ -1229,6 +1292,7 @@ mod tests {
                 &genesis,
                 verified(&genesis),
                 BranchExactBackfillDatasetDigest::try_new([1; 32]).unwrap(),
+                backfill_timestamp(),
                 1,
                 1,
                 0,
@@ -1260,6 +1324,7 @@ mod tests {
                 &coordinator,
                 verified(&coordinator),
                 BranchExactBackfillDatasetDigest::try_new([1; 32]).unwrap(),
+                backfill_timestamp(),
                 1,
                 1,
                 1,
@@ -1276,6 +1341,7 @@ mod tests {
                 &realm_request,
                 verified(&realm_request),
                 BranchExactBackfillDatasetDigest::try_new([1; 32]).unwrap(),
+                backfill_timestamp(),
                 1,
                 1,
                 2,
@@ -1286,6 +1352,39 @@ mod tests {
             BranchExactBackfillDatasetDigest::try_new([0; 32]),
             Err(BranchExactBackfillError::ZeroDatasetDigest)
         );
+    }
+
+    #[test]
+    fn post_genesis_timestamp_is_durable_and_part_of_plan_identity() {
+        let request = request(
+            "psy_h17_timestamp",
+            CanonicalHeadBootstrapProfile::PostGenesisFloor,
+            realm(),
+        );
+        let first = floor_plan(&request);
+        assert_eq!(first.write_timestamp(), Some(backfill_timestamp()));
+        assert_eq!(
+            BranchExactBackfillPlan::decode_persisted(
+                &first.to_canonical_bytes()
+            )
+            .unwrap(),
+            first
+        );
+        let second = BranchExactBackfillPlan::post_genesis_artifact(
+            &request,
+            verified(&request),
+            first.dataset_digest(),
+            CommitWriteTimestampUs::try_from_i128(
+                backfill_timestamp().as_i64() as i128 + 1,
+            )
+            .unwrap(),
+            first.total_chunks(),
+            first.pair_rows_per_direction(),
+            first.proof_rows(),
+        )
+        .unwrap();
+        assert_ne!(first.digest(), second.digest());
+        assert_ne!(first.to_canonical_bytes(), second.to_canonical_bytes());
     }
 
     #[test]

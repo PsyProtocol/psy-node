@@ -18,6 +18,7 @@ use super::typed::UniquePendingId;
 
 const BRANCH_PENDING_MAPPING_DIGEST_DOMAIN: &[u8] =
     b"psy.rollback.branch-pending-mapping.v1\0";
+pub const BRANCH_PENDING_CANONICAL_REF_LEN: usize = CANONICAL_CHAIN_REF_V1_LEN;
 
 /// Content identity of one exact branch-to-pending pair.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -65,6 +66,18 @@ impl<Hash> BranchPendingMapping<Hash> {
 }
 
 impl<Hash: Q256BitHash> BranchPendingMapping<Hash> {
+    /// Rebuilds one typed mapping from the exact canonical partition bytes
+    /// used by durable migration/backfill artifacts.
+    pub fn from_canonical_chain_bytes(
+        bytes: &[u8],
+        pending_id: UniquePendingId,
+    ) -> Result<Self, CanonicalChainRefCodecError> {
+        Ok(Self::new(
+            CanonicalChainRef::<Hash>::from_canonical_bytes(bytes)?,
+            pending_id,
+        ))
+    }
+
     /// The exact 65-byte partition identity used by the migration prototype.
     pub fn canonical_chain_bytes(
         &self,
