@@ -1,6 +1,7 @@
 pub mod canonical_head;
 pub mod branch_pending_mapping;
 pub mod branch_exact_schema;
+pub mod branch_exact_dual_write;
 pub mod authority_commit;
 pub mod authority_local_head;
 pub mod manifest_intent;
