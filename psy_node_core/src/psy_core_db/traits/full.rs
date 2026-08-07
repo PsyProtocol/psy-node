@@ -18,6 +18,7 @@ use psy_data::{protocol::{chain_context::AuthorityObservation, verifiable_checkp
     public_key::PZKPublicKeyInfo,
     user::PQEDUserLeaf,
 }};
+use crate::store::pending_generation::ReservedPendingGeneration;
 
 #[async_trait]
 #[auto_impl(&, Arc)]
@@ -328,6 +329,15 @@ pub trait PsyNodeCoordinatorSpecificDatabaseWriter<F, Hash> {
 #[async_trait]
 #[auto_impl(&, Arc)]
 pub trait PsyNodeCheckpointObjectDatabaseWriter<F, Hash> {
+    /// Advance the monotonic pending counter and choose a proc namespace
+    /// without publishing the legacy pending <-> proc mapping pair.
+    ///
+    /// The caller must either publish that pair through the legacy wrapper
+    /// or bind it into a durable branch-exact write intent. Counter holes are
+    /// intentionally never rewound or reused after a crash.
+    async fn reserve_next_unique_pending_generation_without_mapping(
+        &self,
+    ) -> anyhow::Result<ReservedPendingGeneration>;
     async fn inc_unique_pending_id(&self, amount: u64) -> anyhow::Result<(u64, QCoreProcCheckpointUniqueId)>;
     async fn set_unique_pending_id_checkpoint_id_mapping(&self, unique_pending_id: u64, checkpoint_id: u64) -> anyhow::Result<()>;
     async fn set_checkpoint_id_to_unique_pending_id_mapping(

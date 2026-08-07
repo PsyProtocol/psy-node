@@ -2455,6 +2455,21 @@ impl<
         S,
     >
 {
+    async fn reserve_next_unique_pending_generation_without_mapping(
+        &self,
+    ) -> anyhow::Result<crate::store::pending_generation::ReservedPendingGeneration> {
+        let new_pending_id = self
+            .store
+            .db_inc_u64_counter(&self.u64_counter_singleton_table, U64_SINGLETON_TABLE_OBJ_ID_PENDING_ID, 1)
+            .await?;
+        let unique_id = rand::random::<u128>();
+        crate::store::pending_generation::ReservedPendingGeneration::try_new(
+            new_pending_id,
+            unique_id,
+        )
+        .map_err(Into::into)
+    }
+
     async fn inc_unique_pending_id(&self, amount: u64) -> anyhow::Result<(u64, QCoreProcCheckpointUniqueId)> {
         let new_pending_id = self
             .store

@@ -310,23 +310,10 @@ impl<Hash: Q256BitHash> ScyllaBranchExactWriterRuntime<Hash> {
         &self,
         barrier: &BranchExactPublishBarrier<Hash>,
     ) -> Result<(), BranchExactWriterRuntimeError> {
-        if barrier.key != self.key || barrier.activation_digest != self.activation_digest {
-            return Err(BranchExactWriterRuntimeError::BarrierMismatch);
-        }
-        let current = self.read_writer().await?;
-        if current.revision() != barrier.writer_revision {
-            return Err(BranchExactWriterRuntimeError::StaleBarrier);
-        }
+        let current = self.require_matching_verified(barrier).await?;
         let BranchExactWriterState::WritesVerified(verified) = current.state() else {
-            return Err(BranchExactWriterRuntimeError::StaleBarrier);
+            unreachable!("require_matching_verified accepts only WritesVerified")
         };
-        if verified.prepared().intent().candidate().canonical_chain() != &barrier.candidate
-            || verified.prepared().intent().intent_digest() != barrier.intent_digest
-            || verified.prepared().digest() != &barrier.prepared_digest
-            || verified.digest() != &barrier.verified_digest
-        {
-            return Err(BranchExactWriterRuntimeError::BarrierMismatch);
-        }
         let prepared = verified.prepared();
         let timestamp_key = AuthorityTimestampKey::new(
             prepared
@@ -344,6 +331,34 @@ impl<Hash: Q256BitHash> ScyllaBranchExactWriterRuntime<Hash> {
             .ok_or(BranchExactWriterRuntimeError::TimestampUninitialized)?;
         prepared.reseal(observed).map_err(lifecycle)?;
         Ok(())
+    }
+
+    /// Re-read and match the exact verified lifecycle state without requiring
+    /// the allocator lease to remain Active. Finalization uses this after the
+    /// authority marker is durable because a crash may have already completed
+    /// the allocator lease while leaving the writer in WritesVerified.
+    async fn require_matching_verified(
+        &self,
+        barrier: &BranchExactPublishBarrier<Hash>,
+    ) -> Result<StoredBranchExactWriterLifecycle<Hash>, BranchExactWriterRuntimeError> {
+        if barrier.key != self.key || barrier.activation_digest != self.activation_digest {
+            return Err(BranchExactWriterRuntimeError::BarrierMismatch);
+        }
+        let current = self.read_writer().await?;
+        if current.revision() != barrier.writer_revision {
+            return Err(BranchExactWriterRuntimeError::StaleBarrier);
+        }
+        let BranchExactWriterState::WritesVerified(verified) = current.state() else {
+            return Err(BranchExactWriterRuntimeError::StaleBarrier);
+        };
+        if verified.prepared().intent().candidate().canonical_chain() != &barrier.candidate
+            || verified.prepared().intent().intent_digest() != barrier.intent_digest
+            || verified.prepared().digest() != &barrier.prepared_digest
+            || verified.digest() != &barrier.verified_digest
+        {
+            return Err(BranchExactWriterRuntimeError::BarrierMismatch);
+        }
+        Ok(current)
     }
 
     /// Complete the timestamp lease only after the caller has durably
@@ -367,17 +382,9 @@ impl<Hash: Q256BitHash> ScyllaBranchExactWriterRuntime<Hash> {
             }
             return Err(BranchExactWriterRuntimeError::StaleBarrier);
         }
-        self.require_fresh_barrier(barrier).await?;
-        let current = self.read_writer().await?;
-        if let BranchExactWriterState::Active(active) = current.state() {
-            if active.watermark().canonical_chain() == published
-                && active.last_intent().map(|digest| *digest.as_bytes())
-                    == Some(*barrier.intent_digest.as_bytes())
-            {
-                return Ok(());
-            }
-            return Err(BranchExactWriterRuntimeError::StaleBarrier);
-        }
+        // Do not require an Active lease here. A previous attempt may have
+        // completed it and crashed before the writer lifecycle CAS.
+        let current = self.require_matching_verified(barrier).await?;
         let BranchExactWriterState::WritesVerified(verified) = current.state() else {
             return Err(BranchExactWriterRuntimeError::StaleBarrier);
         };
@@ -559,5 +566,20 @@ mod tests {
         let public_barrier_constructor = ["pub fn new_", "barrier"].concat();
         assert!(!source.contains(&public_barrier_constructor));
         assert!(source.contains("require_fresh_barrier"));
+    }
+
+    #[test]
+    fn finalize_does_not_require_the_allocator_lease_to_still_be_active() {
+        let source = include_str!("branch_exact_writer_runtime.rs");
+        let finish = source
+            .split("pub(crate) async fn finish_published")
+            .nth(1)
+            .unwrap()
+            .split("async fn read_writer")
+            .next()
+            .unwrap();
+        assert!(finish.contains("require_matching_verified(barrier)"));
+        assert!(!finish.contains("require_fresh_barrier(barrier)"));
+        assert!(finish.contains("AuthorityIntentObservation::Completed"));
     }
 }

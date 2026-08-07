@@ -29,7 +29,7 @@ use crate::{
         },
         v3_implementation::full::PsyUnifiedCoreDatabaseStore,
     },
-    store::traits::core_db::{CoreDatabaseStore, CoreDatabaseU64CounterWriter},
+    store::traits::core_db::CoreDatabaseStore,
 };
 
 pub struct ExPsyUnifiedStoreTestHelper<
@@ -399,15 +399,34 @@ where
         let retrieved_mapping = db.get_unique_pending_id_for_checkpoint_id(checkpoint_id).await?;
         assert_eq!(retrieved_mapping, Some((unique_pending_id, unique_id_struct)));
 
-        // Simulate a crash after incrementing the counter but before writing
-        // pending_id -> proc_checkpoint_unique_id. The strict runtime getter
-        // still exposes the corruption, while recovery resolves the newest
-        // earlier generation with a durable mapping.
-        let abandoned_pending_id = db
-            .store
-            .db_inc_u64_counter(&db.u64_counter_singleton_table, 2, 1)
+        // Branch-exact mode advances the counter and chooses the proc
+        // namespace without publishing either legacy mapping direction. A
+        // crash here leaves an intentional, never-reused counter hole.
+        let abandoned = db
+            .reserve_next_unique_pending_generation_without_mapping()
             .await?;
+        let abandoned_pending_id = abandoned.pending_id().get();
+        let abandoned_proc_id = abandoned.proc_checkpoint_id().as_u128();
         assert_eq!(abandoned_pending_id, 7);
+        assert_eq!(db.get_latest_pending_id().await?, 7);
+        assert_eq!(
+            db.store
+                .db_select_one_u128_value_by_u64(
+                    &db.pending_id_to_pending_proc_id_table,
+                    abandoned_pending_id,
+                )
+                .await?,
+            None
+        );
+        assert_eq!(
+            db.store
+                .db_select_one_u64_key_by_u128(
+                    &db.pending_id_to_pending_proc_id_table,
+                    abandoned_proc_id,
+                )
+                .await?,
+            None
+        );
         assert!(db.get_current_unique_pending_id().await.is_err());
         assert_eq!(db.get_latest_mapped_unique_pending_id().await?, (pending_id_6, unique_id_6));
 
