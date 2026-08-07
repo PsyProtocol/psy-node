@@ -966,7 +966,9 @@ impl BranchExactSchemaMaterializer {
                     cql_type,
                     kind,
                     position,
-                    clustering_order,
+                    clustering_order: normalize_system_clustering_order(
+                        clustering_order,
+                    ),
                 });
             }
         }
@@ -1013,6 +1015,15 @@ impl BranchExactSchemaMaterializer {
             schema_fingerprint: fingerprint,
         })
     }
+}
+
+// Scylla exposes this system-schema enum as `ASC`/`DESC`/`NONE`, while the
+// CQL schema model and older fixtures use lowercase. Normalize only this
+// case-insensitive enum; names, types, key kinds, positions, and the resulting
+// complete column set remain exact-match inputs.
+fn normalize_system_clustering_order(mut value: String) -> String {
+    value.make_ascii_lowercase();
+    value
 }
 
 #[allow(dead_code)]
@@ -1390,6 +1401,15 @@ mod tests {
             BranchExactSchemaInspection::Exact {
                 fingerprint: branch_exact_schema_fingerprint(realm_authority()),
             }
+        );
+    }
+
+    #[test]
+    fn system_schema_clustering_order_is_canonicalized() {
+        assert_eq!(normalize_system_clustering_order("ASC".to_owned()), "asc");
+        assert_eq!(
+            normalize_system_clustering_order("NONE".to_owned()),
+            "none"
         );
     }
 
