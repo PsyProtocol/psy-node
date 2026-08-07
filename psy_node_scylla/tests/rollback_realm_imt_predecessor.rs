@@ -141,5 +141,18 @@ fn prototype_is_not_wired_into_production_setup_or_processor() {
     ] {
         assert!(!source.contains("RealmImtPredecessorAdapter"));
         assert!(!source.contains("RealmImtPredecessorReadPlan"));
+        assert!(!source.contains("ScyllaRealmCommitEvidenceAssembler"));
     }
+
+    let process_block = include_str!(
+        "../../psy_node_common/src/realm/processor/core/process_block.rs"
+    );
+    let commit = include_str!(
+        "../../psy_node_common/src/realm/processor/db/commit.rs"
+    );
+    for source in [process_block, commit] {
+        assert!(!source.contains("RealmCommitEvidenceAssemblyPlan"));
+        assert!(!source.contains("ScyllaRealmCommitEvidenceAssembler"));
+    }
+    assert!(commit.contains("_zk_proof: Vec<u8>"));
 }

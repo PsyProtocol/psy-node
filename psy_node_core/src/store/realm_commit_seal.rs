@@ -48,6 +48,16 @@ impl<Hash: Q256BitHash> ChangedRealmCommitSealEvidence<Hash> {
         graph: SealedRealmImtMutationGraph<Hash, Hasher>,
     ) -> Result<Self, ChangedRealmCommitSealError> {
         let bundle = SealedRealmCommitEvidence::try_bind(proof, graph)?;
+        Self::try_bind_bundle(prepared, observation, bundle)
+    }
+
+    /// Bind a bundle produced by the production-shaped evidence assembler to
+    /// the exact durable PREPARED manifest and physical read-back observation.
+    pub fn try_bind_bundle<Hasher>(
+        prepared: &PreparedAuthorityManifestRecord<Hash>,
+        observation: AuthorityPostWriteObservation<Hash>,
+        bundle: SealedRealmCommitEvidence<Hash, Hasher>,
+    ) -> Result<Self, ChangedRealmCommitSealError> {
         let supplement =
             SealedRealmManifestEvidence::try_bind(prepared, bundle)?;
         let observation =

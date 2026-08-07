@@ -19,6 +19,7 @@ use psy_node_core::store::{
     normal_commit::{
         NormalCommitRecoveryAction, NormalHeadPublishProgress,
     },
+    realm_commit_evidence::SealedRealmCommitEvidence,
     realm_commit_seal::{
         ChangedRealmCommitSealError, ChangedRealmCommitSealEvidence,
     },
@@ -173,15 +174,30 @@ impl<'a> ScyllaRepresentativeRealmNormalCommitExecutor<'a> {
     where
         Hash: Q256BitHash,
     {
+        let bundle = SealedRealmCommitEvidence::try_bind(proof, graph)
+            .map_err(ChangedRealmCommitSealError::from)?;
+        self.seal_changed_realm_state_with_bundle(state, bundle)
+            .await
+    }
+
+    /// Consume a bundle produced by the production-shaped proof + predecessor
+    /// graph assembler without reopening either component.
+    pub async fn seal_changed_realm_state_with_bundle<Hash, Hasher>(
+        &self,
+        state: VerifiedRepresentativeRealmState<Hash>,
+        bundle: SealedRealmCommitEvidence<Hash, Hasher>,
+    ) -> Result<RepresentativeNormalCommitStep<Hash>, RepresentativeNormalCommitError>
+    where
+        Hash: Q256BitHash,
+    {
         let VerifiedRepresentativeRealmState {
             prepared,
             observation,
         } = state;
-        let evidence = ChangedRealmCommitSealEvidence::try_bind(
+        let evidence = ChangedRealmCommitSealEvidence::try_bind_bundle(
             &prepared,
             observation,
-            proof,
-            graph,
+            bundle,
         )?;
         let sealed = self
             .metadata

@@ -242,7 +242,7 @@ fn real_types_seal_one_deterministic_binding_and_persisted_decode_is_not_sealed(
 }
 
 #[test]
-fn prepared_authority_and_changed_imt_payload_are_mandatory() {
+fn prepared_authority_and_changed_realm_root_payload_are_mandatory() {
     let mut fixture = valid_fixture();
     fixture.authority = AuthorityScope::Coordinator;
     assert_eq!(fixture.seal(), Err(RealmProofBindingError::RealmAuthorityRequired));
@@ -257,7 +257,7 @@ fn prepared_authority_and_changed_imt_payload_are_mandatory() {
 
     let mut fixture = valid_fixture();
     fixture.prepared.update_contract_state_imt_leaves_ffs.clear();
-    assert_eq!(fixture.seal(), Err(RealmProofBindingError::ImtPreparedMutationRequired));
+    assert!(fixture.seal().is_ok());
 
     let mut fixture = valid_fixture();
     fixture.prepared.update_global_user_tree_nodes_ffs.clear();

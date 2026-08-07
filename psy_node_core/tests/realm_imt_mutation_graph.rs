@@ -234,7 +234,30 @@ fn complete_real_ffs_graph_requires_baseline_and_seals_deterministically() {
 }
 
 #[test]
+fn positional_cst_update_without_imt_preimages_still_seals_the_base_graph() {
+    let mut fixture = valid_fixture();
+    fixture.prepared.update_contract_state_imt_leaves_ffs.clear();
+
+    let plan = fixture.plan().unwrap();
+    let seal = plan
+        .verify_and_seal(&fixture.observations(&plan))
+        .unwrap();
+
+    assert_eq!(seal.counts().final_imt_leaves, 0);
+    assert_eq!(seal.counts().contract_state_nodes, 4);
+    assert_eq!(seal.counts().user_contract_nodes, 4);
+    assert_eq!(seal.counts().user_leaves, 1);
+}
+
+#[test]
 fn imt_preimage_hash_and_canonical_flag_are_checked_before_graph_edges() {
+    let mut fixture = valid_fixture();
+    fixture.prepared.update_contract_state_imt_leaves_ffs.push(0);
+    assert_eq!(
+        fixture.plan().unwrap_err(),
+        RealmImtMutationGraphError::MalformedImtLeaves
+    );
+
     let mut fixture = valid_fixture();
     fixture.prepared.update_contract_state_imt_leaves_ffs[56] ^= 1;
     assert_eq!(fixture.plan().unwrap_err(), RealmImtMutationGraphError::ImtLeafHashMismatch {

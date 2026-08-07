@@ -1,9 +1,13 @@
-//! Fail-closed verification of the Realm IMT prepared-mutation graph.
+//! Fail-closed verification of the Realm prepared-mutation graph.
 //!
 //! The prepared payload contains final rows, not the original delta proofs.
 //! Planning therefore validates every cross-table commitment and produces the
 //! exact predecessor-state sibling read-set needed to recompute every written
-//! Merkle parent.  A seal is only available after that complete read-set has
+//! Merkle parent. When a prepared payload includes IMT leaf preimages, the
+//! graph additionally verifies their hashes against the written contract-state
+//! leaves. IMT preimages are optional in the production GUTA format, so a
+//! changed Realm without IMT leaf mutations still verifies the CST -> UCT ->
+//! user -> GUT graph. A seal is only available after the complete read-set has
 //! been observed and verified.
 
 use std::{collections::{BTreeMap, BTreeSet}, error::Error, fmt, marker::PhantomData};
@@ -68,6 +72,145 @@ impl RealmImtMutationGraphConfig {
     pub const fn global_user_tree_height(self) -> u8 { self.global_user_tree_height }
     pub const fn coordinator_tree_height(self) -> u8 { self.coordinator_tree_height }
     pub const fn user_contract_tree_height(self) -> u8 { self.user_contract_tree_height }
+}
+
+/// Exact contract-height lookup required before a Realm mutation graph can be
+/// planned. Contract IDs are extracted from CST node rows and, when present,
+/// optional IMT leaf rows, then sorted and deduplicated. The lookup must be
+/// executed at the same predecessor authority-state checkpoint used by the
+/// graph.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RealmImtContractHeightReadPlan {
+    predecessor_checkpoint: AuthorityStateCheckpointId,
+    contract_ids: Vec<u64>,
+}
+
+/// Exact, predecessor-bound response to a contract-height read plan.
+///
+/// The map cannot be assembled directly by callers, so a response from another
+/// checkpoint cannot be silently reused by the evidence assembly boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RealmImtContractHeights {
+    predecessor_checkpoint: AuthorityStateCheckpointId,
+    heights: BTreeMap<u64, u8>,
+}
+
+impl RealmImtContractHeights {
+    pub const fn predecessor_checkpoint(&self) -> AuthorityStateCheckpointId {
+        self.predecessor_checkpoint
+    }
+
+    pub fn len(&self) -> usize {
+        self.heights.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.heights.is_empty()
+    }
+
+    pub fn get(&self, contract_id: u64) -> Option<u8> {
+        self.heights.get(&contract_id).copied()
+    }
+
+    pub fn contract_ids(&self) -> impl ExactSizeIterator<Item = u64> + '_ {
+        self.heights.keys().copied()
+    }
+
+    pub(crate) const fn as_map(&self) -> &BTreeMap<u64, u8> {
+        &self.heights
+    }
+}
+
+impl RealmImtContractHeightReadPlan {
+    pub fn try_from_prepared<Hash: Q256BitHash>(
+        predecessor_checkpoint: AuthorityStateCheckpointId,
+        prepared: &PsyPreparedRealmBlockStateUpdates<Hash>,
+    ) -> Result<Self, RealmImtMutationGraphError> {
+        let contract_nodes = &prepared.update_contract_state_tree_nodes_ffs;
+        if contract_nodes.is_empty()
+            || !contract_nodes
+                .len()
+                .is_multiple_of(QMS_FAST_SERIALIZER_DOUBLE_ID_NODE_SIZE)
+        {
+            return Err(RealmImtMutationGraphError::MalformedContractStateNodes);
+        }
+        let mut contract_ids = BTreeSet::new();
+        for chunk in contract_nodes
+            .chunks_exact(QMS_FAST_SERIALIZER_DOUBLE_ID_NODE_SIZE)
+        {
+            let node = QMerkleStoreDoubleIdNode::<Hash>::ffs_try_from_slice(chunk)
+                .map_err(|_| RealmImtMutationGraphError::MalformedContractStateNodes)?;
+            contract_ids.insert(node.key.tree_sub_id);
+        }
+
+        let imt_leaves = &prepared.update_contract_state_imt_leaves_ffs;
+        if !imt_leaves.len().is_multiple_of(IMT_LEAF_FFS_ENTRY_SIZE_V2) {
+            return Err(RealmImtMutationGraphError::MalformedImtLeaves);
+        }
+        for chunk in imt_leaves.chunks_exact(IMT_LEAF_FFS_ENTRY_SIZE_V2) {
+            if chunk[160] > 1 {
+                return Err(
+                    RealmImtMutationGraphError::NonCanonicalImtNewKeyFlag(
+                        chunk[160],
+                    ),
+                );
+            }
+            let (_, contract_id, _, _, _, _, _, _, _) =
+                deserialize_imt_leaf_ffs_entry_v2(chunk)
+                    .map_err(|_| RealmImtMutationGraphError::MalformedImtLeaves)?;
+            contract_ids.insert(contract_id);
+        }
+
+        Ok(Self {
+            predecessor_checkpoint,
+            contract_ids: contract_ids.into_iter().collect(),
+        })
+    }
+
+    pub const fn predecessor_checkpoint(&self) -> AuthorityStateCheckpointId {
+        self.predecessor_checkpoint
+    }
+
+    pub fn contract_ids(&self) -> &[u64] {
+        &self.contract_ids
+    }
+
+    /// Bind the ordered response from `get_contract_tree_heights` to the exact
+    /// requested IDs. A sparse/default-zero database response is not accepted
+    /// as a usable graph input.
+    pub fn bind_response(
+        &self,
+        heights: &[u8],
+    ) -> Result<RealmImtContractHeights, RealmImtMutationGraphError> {
+        if heights.len() != self.contract_ids.len() {
+            return Err(
+                RealmImtMutationGraphError::ContractHeightResponseCountMismatch {
+                    expected: self.contract_ids.len(),
+                    actual: heights.len(),
+                },
+            );
+        }
+        let heights = self
+            .contract_ids
+            .iter()
+            .copied()
+            .zip(heights.iter().copied())
+            .map(|(contract_id, height)| {
+                if height == 0 || height >= 64 {
+                    Err(RealmImtMutationGraphError::InvalidContractHeight {
+                        contract_id,
+                        height,
+                    })
+                } else {
+                    Ok((contract_id, height))
+                }
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        Ok(RealmImtContractHeights {
+            predecessor_checkpoint: self.predecessor_checkpoint,
+            heights,
+        })
+    }
 }
 
 /// Physical Merkle node required from the predecessor authority state.
@@ -584,7 +727,7 @@ where
     Hasher: FieldQHasher<F, Hash>,
 {
     let bytes = &prepared.update_contract_state_imt_leaves_ffs;
-    if bytes.is_empty() || !bytes.len().is_multiple_of(IMT_LEAF_FFS_ENTRY_SIZE_V2) {
+    if !bytes.len().is_multiple_of(IMT_LEAF_FFS_ENTRY_SIZE_V2) {
         return Err(RealmImtMutationGraphError::MalformedImtLeaves);
     }
     let mut leaves = BTreeMap::new();
@@ -882,6 +1025,7 @@ pub enum RealmImtMutationGraphError {
     UserOutsideRealm { user_id: u64, realm_id: u64 },
     MerklePositionOutOfRange { level: u8, index: u64, height: u8 },
     ContractHeightMissing(u64),
+    ContractHeightResponseCountMismatch { expected: usize, actual: usize },
     InvalidContractHeight { contract_id: u64, height: u8 },
     InvalidPredecessorReadHeight { key: RealmImtBaselineNodeKey, tree_height: u8 },
     DuplicateMerkleMutation(RealmImtBaselineNodeKey),

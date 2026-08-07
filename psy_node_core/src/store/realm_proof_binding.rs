@@ -331,9 +331,6 @@ impl<Hash: Q256BitHash> SealedRealmProofBinding<Hash> {
         if prepared.old_realm_root == prepared.new_realm_root {
             return Err(RealmProofBindingError::ChangedRealmStateRequired);
         }
-        if prepared.update_contract_state_imt_leaves_ffs.is_empty() {
-            return Err(RealmProofBindingError::ImtPreparedMutationRequired);
-        }
         if prepared.update_global_user_tree_nodes_ffs.is_empty() {
             return Err(RealmProofBindingError::RealmRootMutationRequired);
         }
@@ -642,7 +639,6 @@ pub enum RealmProofBindingError {
     RealmAuthorityRequired,
     PreparedAuthorityMismatch,
     ChangedRealmStateRequired,
-    ImtPreparedMutationRequired,
     RealmRootMutationRequired,
     InvalidRealmRootMutationEncoding,
     RealmRootMutationMissing,
@@ -686,7 +682,6 @@ impl fmt::Display for RealmProofBindingError {
             Self::RealmAuthorityRequired => write!(formatter, "Realm authority required"),
             Self::PreparedAuthorityMismatch => write!(formatter, "prepared Realm authority mismatch"),
             Self::ChangedRealmStateRequired => write!(formatter, "changed Realm state required"),
-            Self::ImtPreparedMutationRequired => write!(formatter, "prepared IMT mutation required"),
             Self::RealmRootMutationRequired => write!(formatter, "prepared Realm-root mutation required"),
             Self::InvalidRealmRootMutationEncoding => write!(formatter, "invalid prepared Realm-root FFS encoding"),
             Self::RealmRootMutationMissing => write!(formatter, "prepared Realm-root row is missing"),

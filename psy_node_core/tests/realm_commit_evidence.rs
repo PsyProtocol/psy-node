@@ -82,6 +82,10 @@ use psy_node_core::store::{
         SealedRealmCommitEvidence, REALM_COMMIT_EVIDENCE_CODEC_VERSION,
         REALM_COMMIT_EVIDENCE_V1_LEN,
     },
+    realm_commit_evidence_assembly::{
+        RealmCommitEvidenceAssemblyError,
+        RealmCommitEvidenceAssemblyPlan,
+    },
     realm_commit_seal::{
         ChangedRealmCommitSealError, ChangedRealmCommitSealEvidence,
     },
@@ -91,8 +95,10 @@ use psy_node_core::store::{
         REALM_MANIFEST_EVIDENCE_V1_LEN,
     },
     realm_imt_mutation_graph::{
-        RealmImtBaselineNodeKey, RealmImtMutationGraphConfig,
-        RealmImtMutationGraphPlan, SealedRealmImtMutationGraph,
+        RealmImtBaselineNodeKey, RealmImtContractHeightReadPlan,
+        RealmImtContractHeights, RealmImtMutationGraphConfig,
+        RealmImtMutationGraphError, RealmImtMutationGraphPlan,
+        RealmImtPredecessorReadRow, SealedRealmImtMutationGraph,
     },
     realm_proof_binding::{RealmProofBindingError, SealedRealmProofBinding},
     timestamp::CommitWriteTimestampUs,
@@ -647,6 +653,86 @@ fn post_write_observation(
     )
 }
 
+fn evidence_assembly_plan(
+    fixture: &Fixture,
+) -> Result<
+    RealmCommitEvidenceAssemblyPlan<PHash, PoseidonHasher>,
+    RealmCommitEvidenceAssemblyError,
+> {
+    let heights = bound_contract_heights(fixture, PREDECESSOR);
+    evidence_assembly_plan_with_heights(
+        fixture,
+        PREDECESSOR,
+        &heights,
+    )
+}
+
+fn bound_contract_heights(
+    fixture: &Fixture,
+    predecessor: u64,
+) -> RealmImtContractHeights {
+    let height_plan = RealmImtContractHeightReadPlan::try_from_prepared(
+        AuthorityStateCheckpointId::new(predecessor),
+        &fixture.prepared,
+    )
+    .unwrap();
+    height_plan
+        .bind_response(
+            &height_plan
+                .contract_ids()
+                .iter()
+                .map(|contract_id| fixture.heights[contract_id])
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+}
+
+fn evidence_assembly_plan_with_heights(
+    fixture: &Fixture,
+    predecessor: u64,
+    heights: &RealmImtContractHeights,
+) -> Result<
+    RealmCommitEvidenceAssemblyPlan<PHash, PoseidonHasher>,
+    RealmCommitEvidenceAssemblyError,
+> {
+    RealmCommitEvidenceAssemblyPlan::try_new::<
+        PF,
+        PHash,
+        DeterministicProofVerifier,
+    >(
+        fixture.authority,
+        AuthorityStateCheckpointId::new(predecessor),
+        RealmImtMutationGraphConfig::try_new(
+            GLOBAL_HEIGHT,
+            fixture.coordinator_height,
+            UCT_HEIGHT,
+        )
+        .unwrap(),
+        heights,
+        &fixture.prepared,
+        &fixture.submission,
+        &fixture.proof_bytes,
+        &DeterministicProofVerifier,
+        &fixture.coordinator,
+    )
+}
+
+fn predecessor_rows(
+    fixture: &Fixture,
+    plan: &RealmCommitEvidenceAssemblyPlan<PHash, PoseidonHasher>,
+) -> Vec<RealmImtPredecessorReadRow<PHash>> {
+    plan.predecessor_read_plan()
+        .requests()
+        .iter()
+        .map(|request| {
+            RealmImtPredecessorReadRow::new(
+                *request,
+                Some(fixture.baseline[&request.key()]),
+            )
+        })
+        .collect()
+}
+
 fn commit_authorities(
     prepared: &PreparedAuthorityManifestRecord<PHash>,
 ) -> (
@@ -716,6 +802,170 @@ fn real_proof_and_graph_seals_form_one_deterministic_bundle() {
     )
     .unwrap();
     assert_eq!(&persisted, first.record());
+}
+
+#[test]
+fn production_shaped_assembly_plan_matches_the_direct_live_bundle() {
+    let fixture = fixture(0, 0, COORDINATOR_HEIGHT);
+    let first_plan = evidence_assembly_plan(&fixture).unwrap();
+    assert_eq!(
+        first_plan.predecessor_read_plan().checkpoint(),
+        AuthorityStateCheckpointId::new(PREDECESSOR)
+    );
+    let first_rows = predecessor_rows(&fixture, &first_plan);
+    let first = first_plan
+        .verify_predecessor_rows_and_seal(&first_rows)
+        .unwrap();
+
+    let retry_plan = evidence_assembly_plan(&fixture).unwrap();
+    let retry_rows = predecessor_rows(&fixture, &retry_plan);
+    let retry = retry_plan
+        .verify_predecessor_rows_and_seal(&retry_rows)
+        .unwrap();
+    let direct = bundle(&fixture).unwrap();
+    assert_eq!(first.record(), retry.record());
+    assert_eq!(first.record(), direct.record());
+
+    let prepared = matching_manifest(&fixture, 85);
+    let evidence = ChangedRealmCommitSealEvidence::try_bind_bundle(
+        &prepared,
+        post_write_observation(&prepared),
+        first,
+    )
+    .unwrap();
+    let (head, allocator) = commit_authorities(&prepared);
+    let sealed = seal_verified_changed_realm_commit(
+        prepared.clone(),
+        evidence,
+        &head,
+        allocator,
+    )
+    .unwrap();
+    assert_eq!(sealed.prepared(), &prepared);
+}
+
+#[test]
+fn production_shaped_assembly_accepts_a_positional_update_without_imt_preimages() {
+    let mut fixture = fixture(0, 0, COORDINATOR_HEIGHT);
+    fixture.prepared.update_contract_state_imt_leaves_ffs.clear();
+
+    let plan = evidence_assembly_plan(&fixture).unwrap();
+    assert_eq!(plan.graph().counts().final_imt_leaves, 0);
+    let rows = predecessor_rows(&fixture, &plan);
+    let bundle = plan
+        .verify_predecessor_rows_and_seal(&rows)
+        .unwrap();
+
+    assert_eq!(
+        bundle.record().prepared_payload_commitment(),
+        fixture.proof_seal().unwrap().prepared_payload_commitment()
+    );
+}
+
+#[test]
+fn contract_height_plan_is_predecessor_bound_ordered_and_fail_closed() {
+    let fixture = fixture(0, 0, COORDINATOR_HEIGHT);
+    let height_plan = RealmImtContractHeightReadPlan::try_from_prepared(
+        AuthorityStateCheckpointId::new(PREDECESSOR),
+        &fixture.prepared,
+    )
+    .unwrap();
+    assert_eq!(
+        height_plan.predecessor_checkpoint(),
+        AuthorityStateCheckpointId::new(PREDECESSOR)
+    );
+    assert_eq!(height_plan.contract_ids(), &[CONTRACT_ID]);
+    let heights = height_plan.bind_response(&[CST_HEIGHT]).unwrap();
+    assert_eq!(
+        heights.predecessor_checkpoint(),
+        AuthorityStateCheckpointId::new(PREDECESSOR)
+    );
+    assert_eq!(heights.len(), 1);
+    assert_eq!(heights.get(CONTRACT_ID), Some(CST_HEIGHT));
+    assert_eq!(
+        height_plan.bind_response(&[]).unwrap_err(),
+        RealmImtMutationGraphError::ContractHeightResponseCountMismatch {
+            expected: 1,
+            actual: 0,
+        }
+    );
+    assert_eq!(
+        height_plan.bind_response(&[0]).unwrap_err(),
+        RealmImtMutationGraphError::InvalidContractHeight {
+            contract_id: CONTRACT_ID,
+            height: 0,
+        }
+    );
+
+    let wrong_checkpoint_heights =
+        bound_contract_heights(&fixture, PREDECESSOR - 1);
+    assert_eq!(
+        evidence_assembly_plan_with_heights(
+            &fixture,
+            PREDECESSOR,
+            &wrong_checkpoint_heights,
+        )
+        .unwrap_err(),
+        RealmCommitEvidenceAssemblyError::ContractHeightCheckpointMismatch {
+            expected: AuthorityStateCheckpointId::new(PREDECESSOR),
+            actual: AuthorityStateCheckpointId::new(PREDECESSOR - 1),
+        }
+    );
+
+    let mut alternate_prepared = fixture.prepared.clone();
+    alternate_prepared.update_contract_state_imt_leaves_ffs[8..16]
+        .copy_from_slice(&(CONTRACT_ID + 1).to_le_bytes());
+    let alternate_height_plan =
+        RealmImtContractHeightReadPlan::try_from_prepared(
+            AuthorityStateCheckpointId::new(PREDECESSOR),
+            &alternate_prepared,
+        )
+        .unwrap();
+    assert_eq!(
+        alternate_height_plan.contract_ids(),
+        &[CONTRACT_ID, CONTRACT_ID + 1]
+    );
+    let alternate_heights = alternate_height_plan
+        .bind_response(&[CST_HEIGHT, CST_HEIGHT])
+        .unwrap();
+    assert_eq!(
+        evidence_assembly_plan_with_heights(
+            &fixture,
+            PREDECESSOR,
+            &alternate_heights,
+        )
+        .unwrap_err(),
+        RealmCommitEvidenceAssemblyError::ContractHeightDomainMismatch {
+            expected: vec![CONTRACT_ID],
+            actual: vec![CONTRACT_ID, CONTRACT_ID + 1],
+        }
+    );
+}
+
+#[test]
+fn assembly_plan_rejects_bad_proof_and_incomplete_predecessor_response() {
+    let fixture = fixture(0, 0, COORDINATOR_HEIGHT);
+    let plan = evidence_assembly_plan(&fixture).unwrap();
+    let mut rows = predecessor_rows(&fixture, &plan);
+    let missing = rows.pop().unwrap().request();
+    assert!(matches!(
+        plan.verify_predecessor_rows_and_seal(&rows),
+        Err(RealmCommitEvidenceAssemblyError::Graph(
+            RealmImtMutationGraphError::PredecessorReadCoverageMismatch {
+                missing: Some(actual),
+                unexpected: None,
+            }
+        )) if actual == missing
+    ));
+
+    let mut bad_proof = fixture.clone();
+    bad_proof.proof_bytes = hash(250).into_owned_32bytes().to_vec();
+    assert_eq!(
+        evidence_assembly_plan(&bad_proof).unwrap_err(),
+        RealmCommitEvidenceAssemblyError::Proof(
+            RealmProofBindingError::ZkProofVerificationFailed
+        )
+    );
 }
 
 #[test]
