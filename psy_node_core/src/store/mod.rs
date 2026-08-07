@@ -9,6 +9,7 @@ pub mod manifest_lifecycle;
 pub mod manifest_record;
 pub mod normal_commit;
 pub mod pending_generation;
+pub mod pending_generation_ledger;
 pub mod proof_namespace;
 pub mod realm_commit_evidence;
 pub mod realm_commit_evidence_assembly;

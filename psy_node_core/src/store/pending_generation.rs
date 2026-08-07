@@ -10,6 +10,48 @@ use super::typed::{
     ProcCheckpointUniqueId, UniquePendingId, UniquePendingIdOutOfRange,
 };
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ProcNamespacePrefix(u64);
+
+impl ProcNamespacePrefix {
+    pub const fn try_new(value: u64) -> Result<Self, ProcNamespacePrefixError> {
+        if value == 0 {
+            Err(ProcNamespacePrefixError::Zero)
+        } else if value > i64::MAX as u64 {
+            Err(ProcNamespacePrefixError::OutOfCqlRange(value))
+        } else {
+            Ok(Self(value))
+        }
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    pub const fn derive_proc_id(
+        self,
+        pending_id: UniquePendingId,
+    ) -> ProcCheckpointUniqueId {
+        ProcCheckpointUniqueId::from_u128(
+            ((self.0 as u128) << 64) | pending_id.get() as u128,
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProcNamespacePrefixError {
+    Zero,
+    OutOfCqlRange(u64),
+}
+
+impl std::fmt::Display for ProcNamespacePrefixError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl std::error::Error for ProcNamespacePrefixError {}
+
 #[must_use = "an unmapped pending generation must be persisted in a durable intent or deliberately abandoned"]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ReservedPendingGeneration {
@@ -27,6 +69,17 @@ impl ReservedPendingGeneration {
             proc_checkpoint_id: ProcCheckpointUniqueId::from_u128(
                 proc_checkpoint_id,
             ),
+        })
+    }
+
+    pub(crate) fn try_from_prefix(
+        pending_id: u64,
+        prefix: ProcNamespacePrefix,
+    ) -> Result<Self, UniquePendingIdOutOfRange> {
+        let pending_id = UniquePendingId::try_new(pending_id)?;
+        Ok(Self {
+            pending_id,
+            proc_checkpoint_id: prefix.derive_proc_id(pending_id),
         })
     }
 
@@ -58,5 +111,13 @@ mod tests {
         assert_eq!(reservation.into_legacy_parts(), (17, 29));
         assert!(ReservedPendingGeneration::try_new(i64::MAX as u64 + 1, 29)
             .is_err());
+        let prefix = ProcNamespacePrefix::try_new(0x1234).unwrap();
+        let derived = ReservedPendingGeneration::try_from_prefix(17, prefix)
+            .unwrap();
+        assert_eq!(
+            derived.proc_checkpoint_id().as_u128(),
+            (0x1234_u128 << 64) | 17
+        );
+        assert_eq!(ProcNamespacePrefix::try_new(0), Err(ProcNamespacePrefixError::Zero));
     }
 }

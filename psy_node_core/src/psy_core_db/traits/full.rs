@@ -18,7 +18,9 @@ use psy_data::{protocol::{chain_context::AuthorityObservation, verifiable_checkp
     public_key::PZKPublicKeyInfo,
     user::PQEDUserLeaf,
 }};
-use crate::store::pending_generation::ReservedPendingGeneration;
+use crate::store::pending_generation::{
+    ProcNamespacePrefix, ReservedPendingGeneration,
+};
 
 #[async_trait]
 #[auto_impl(&, Arc)]
@@ -337,6 +339,7 @@ pub trait PsyNodeCheckpointObjectDatabaseWriter<F, Hash> {
     /// intentionally never rewound or reused after a crash.
     async fn reserve_next_unique_pending_generation_without_mapping(
         &self,
+        prefix: ProcNamespacePrefix,
     ) -> anyhow::Result<ReservedPendingGeneration>;
     async fn inc_unique_pending_id(&self, amount: u64) -> anyhow::Result<(u64, QCoreProcCheckpointUniqueId)>;
     async fn set_unique_pending_id_checkpoint_id_mapping(&self, unique_pending_id: u64, checkpoint_id: u64) -> anyhow::Result<()>;

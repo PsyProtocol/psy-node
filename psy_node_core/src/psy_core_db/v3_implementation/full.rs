@@ -2457,15 +2457,15 @@ impl<
 {
     async fn reserve_next_unique_pending_generation_without_mapping(
         &self,
+        prefix: crate::store::pending_generation::ProcNamespacePrefix,
     ) -> anyhow::Result<crate::store::pending_generation::ReservedPendingGeneration> {
         let new_pending_id = self
             .store
             .db_inc_u64_counter(&self.u64_counter_singleton_table, U64_SINGLETON_TABLE_OBJ_ID_PENDING_ID, 1)
             .await?;
-        let unique_id = rand::random::<u128>();
-        crate::store::pending_generation::ReservedPendingGeneration::try_new(
+        crate::store::pending_generation::ReservedPendingGeneration::try_from_prefix(
             new_pending_id,
-            unique_id,
+            prefix,
         )
         .map_err(Into::into)
     }

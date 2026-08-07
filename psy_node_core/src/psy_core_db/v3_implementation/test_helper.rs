@@ -403,7 +403,12 @@ where
         // namespace without publishing either legacy mapping direction. A
         // crash here leaves an intentional, never-reused counter hole.
         let abandoned = db
-            .reserve_next_unique_pending_generation_without_mapping()
+            .reserve_next_unique_pending_generation_without_mapping(
+                crate::store::pending_generation::ProcNamespacePrefix::try_new(
+                    0x1234,
+                )
+                .unwrap(),
+            )
             .await?;
         let abandoned_pending_id = abandoned.pending_id().get();
         let abandoned_proc_id = abandoned.proc_checkpoint_id().as_u128();
