@@ -10,8 +10,7 @@ use std::{error::Error, fmt};
 use parth_core::protocol::core_types::Q256BitHash;
 use psy_node_core::store::{
     authority_commit::{
-        AuthorityClockSampleUs,
-        AuthorityIntentObservation, AuthorityTimestampKey,
+        AuthorityClockSampleUs, AuthorityIntentObservation, AuthorityTimestampKey,
         AuthorityTimestampPhase,
         AuthorityTimestampRevision, ObservedAuthorityTimestampState,
         SealedAuthorityTimestampReservation, StoredAuthorityTimestampState,
@@ -28,6 +27,10 @@ use psy_node_core::store::{
     timestamp::CommitWriteTimestampUs,
     typed::UniquePendingId,
 };
+#[cfg(test)]
+use psy_node_core::store::authority_commit::{
+    AuthorityTimestampBootstrap, AuthorityTimestampBootstrapReason,
+};
 use sha2::{Digest, Sha256};
 
 use super::{
@@ -40,17 +43,17 @@ use super::{
 };
 
 const MAGIC: [u8; 8] = *b"PSYBEXWL";
-// v2 persists the exact h16 BACKFILL_VERIFIED receipt. A writer lifecycle row
-// must be sufficient to re-authorize h20 setup after process restart; a ready
-// digest alone cannot recover the deployment slot or prove the lifecycle row
-// is still BACKFILL_VERIFIED.
-const CODEC_VERSION: u16 = 2;
-const PLAN_DOMAIN: &[u8] = b"psy/rollback/branch-exact-writer-activation/v1";
+// v2 persisted the exact h16 BACKFILL_VERIFIED receipt. v3 additionally binds
+// the complete allocator revision/phase/high-water in the activation plan and
+// every Active state; v2 is rejected because a bare timestamp cannot support
+// exact three-row startup recovery.
+const CODEC_VERSION: u16 = 3;
+const PLAN_DOMAIN: &[u8] = b"psy/rollback/branch-exact-writer-activation/v2";
 const SLOT_DOMAIN: &[u8] = b"psy/rollback/branch-exact-writer-slot/v1";
-const PREPARED_DOMAIN: &[u8] = b"psy/rollback/branch-exact-writer-prepared/v1";
-const VERIFIED_DOMAIN: &[u8] = b"psy/rollback/branch-exact-writer-verified/v1";
+const PREPARED_DOMAIN: &[u8] = b"psy/rollback/branch-exact-writer-prepared/v2";
+const VERIFIED_DOMAIN: &[u8] = b"psy/rollback/branch-exact-writer-verified/v2";
 const BLOCKED_DOMAIN: &[u8] = b"psy/rollback/branch-exact-writer-blocked/v1";
-const STATE_DIGEST_DOMAIN: &[u8] = b"psy/rollback/branch-exact-writer-state/v1";
+const STATE_DIGEST_DOMAIN: &[u8] = b"psy/rollback/branch-exact-writer-state/v2";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct BranchExactWriterGeneration(u64);
@@ -164,7 +167,7 @@ pub struct BranchExactWriterActivationPlan<Hash> {
     source_receipt_digest: BranchExactShadowSourceReceiptDigest,
     dataset_digest: BranchExactBackfillDatasetDigest,
     baseline: BranchPendingMapping<Hash>,
-    baseline_timestamp: CommitWriteTimestampUs,
+    baseline_timestamp_state: StoredAuthorityTimestampState,
     digest: BranchExactWriterActivationDigest,
     slot: BranchExactWriterSlot,
 }
@@ -252,7 +255,7 @@ impl<Hash: Q256BitHash> BranchExactWriterActivationPlan<Hash> {
             source_receipt_digest: source_receipt_digest(source),
             dataset_digest: artifact.dataset_digest(),
             baseline,
-            baseline_timestamp: observed.high_water(),
+            baseline_timestamp_state: observed,
             digest: BranchExactWriterActivationDigest([0; 32]),
             slot: BranchExactWriterSlot([0; 32]),
         };
@@ -304,7 +307,11 @@ impl<Hash: Q256BitHash> BranchExactWriterActivationPlan<Hash> {
     }
 
     pub const fn baseline_timestamp(&self) -> CommitWriteTimestampUs {
-        self.baseline_timestamp
+        self.baseline_timestamp_state.high_water()
+    }
+
+    pub const fn baseline_timestamp_state(&self) -> StoredAuthorityTimestampState {
+        self.baseline_timestamp_state
     }
 
     pub const fn digest(&self) -> BranchExactWriterActivationDigest {
@@ -334,7 +341,15 @@ impl<Hash: Q256BitHash> BranchExactWriterActivationPlan<Hash> {
             source_receipt_digest: BranchExactShadowSourceReceiptDigest::from_persisted([8; 32]),
             dataset_digest,
             baseline,
-            baseline_timestamp,
+            baseline_timestamp_state: AuthorityTimestampBootstrap::new(
+                AuthorityTimestampKey::new(
+                    baseline.canonical_chain().network_id(),
+                    authority,
+                ),
+                baseline_timestamp,
+                AuthorityTimestampBootstrapReason::ControlledWriterCutover,
+            )
+            .candidate(),
             digest: BranchExactWriterActivationDigest([0; 32]),
             slot: BranchExactWriterSlot([0; 32]),
         };
@@ -395,7 +410,7 @@ impl BranchExactWriteObservationDigest {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BranchExactWriterActive<Hash> {
     watermark: BranchPendingMapping<Hash>,
-    timestamp_high_water: CommitWriteTimestampUs,
+    timestamp_state: StoredAuthorityTimestampState,
     committed_writes: u64,
     last_intent: Option<BranchExactWriterIntentDigest>,
 }
@@ -406,7 +421,11 @@ impl<Hash> BranchExactWriterActive<Hash> {
     }
 
     pub const fn timestamp_high_water(&self) -> CommitWriteTimestampUs {
-        self.timestamp_high_water
+        self.timestamp_state.high_water()
+    }
+
+    pub const fn timestamp_state(&self) -> StoredAuthorityTimestampState {
+        self.timestamp_state
     }
 
     pub const fn committed_writes(&self) -> u64 {
@@ -685,7 +704,7 @@ impl<Hash: Q256BitHash> SealedBranchExactWriterCas<Hash> {
         }
         let active = BranchExactWriterActive {
             watermark: *expected.plan.baseline(),
-            timestamp_high_water: expected.plan.baseline_timestamp(),
+            timestamp_state: expected.plan.baseline_timestamp_state(),
             committed_writes: 0,
             last_intent: None,
         };
@@ -705,8 +724,7 @@ impl<Hash: Q256BitHash> SealedBranchExactWriterCas<Hash> {
             || intent.predecessor() != active.watermark()
             || sealed.write_timestamp() <= active.timestamp_high_water()
             || reservation.lease() != sealed.lease()
-            || reservation.expected().high_water() != active.timestamp_high_water()
-            || !matches!(reservation.expected().phase(), AuthorityTimestampPhase::Idle { .. })
+            || reservation.expected() != active.timestamp_state()
         {
             return Err(BranchExactWriterLifecycleError::WriterContinuityMismatch);
         }
@@ -758,6 +776,13 @@ impl<Hash: Q256BitHash> SealedBranchExactWriterCas<Hash> {
         if prepared.intent().candidate().canonical_chain() != published {
             return Err(BranchExactWriterLifecycleError::PublishedHeadMismatch);
         }
+        let expected_timestamp_key = AuthorityTimestampKey::new(
+            published.network_id(),
+            prepared.intent().authority(),
+        );
+        if timestamp_state.key() != expected_timestamp_key {
+            return Err(BranchExactWriterLifecycleError::TimestampKeyMismatch);
+        }
         match timestamp_state
             .observe_intent(prepared.intent().intent_digest().authority_intent())
         {
@@ -773,7 +798,7 @@ impl<Hash: Q256BitHash> SealedBranchExactWriterCas<Hash> {
         }
         let active = BranchExactWriterActive {
             watermark: *prepared.intent().candidate(),
-            timestamp_high_water: prepared.timestamp(),
+            timestamp_state: timestamp_state.state(),
             committed_writes: prepared
                 .previous()
                 .committed_writes()
@@ -834,7 +859,8 @@ fn activation_digest<Hash: Q256BitHash>(
     hasher.update(plan.dataset_digest.as_bytes());
     hasher.update(plan.baseline.canonical_chain_bytes());
     hasher.update(plan.baseline.pending_id().get().to_be_bytes());
-    hasher.update(plan.baseline_timestamp.as_i64().to_be_bytes());
+    hasher.update(plan.baseline_timestamp_state.revision().get().to_be_bytes());
+    hasher.update(plan.baseline_timestamp_state.encode_canonical());
     BranchExactWriterActivationDigest(hasher.finalize().into())
 }
 
@@ -901,7 +927,8 @@ fn encode_mapping<Hash: Q256BitHash>(mapping: &BranchPendingMapping<Hash>, out: 
 fn encode_active<Hash: Q256BitHash>(active: &BranchExactWriterActive<Hash>, hasher: &mut Sha256) {
     hasher.update(active.watermark.canonical_chain_bytes());
     hasher.update(active.watermark.pending_id().get().to_be_bytes());
-    hasher.update(active.timestamp_high_water.as_i64().to_be_bytes());
+    hasher.update(active.timestamp_state.revision().get().to_be_bytes());
+    hasher.update(active.timestamp_state.encode_canonical());
     hasher.update(active.committed_writes.to_be_bytes());
     match active.last_intent {
         None => hasher.update([0]),
@@ -934,14 +961,16 @@ fn encode_plan<Hash: Q256BitHash>(plan: &BranchExactWriterActivationPlan<Hash>, 
     out.extend_from_slice(plan.source_receipt_digest.as_bytes());
     out.extend_from_slice(plan.dataset_digest.as_bytes());
     encode_mapping(&plan.baseline, out);
-    out.extend_from_slice(&plan.baseline_timestamp.as_i64().to_be_bytes());
+    out.extend_from_slice(&plan.baseline_timestamp_state.revision().get().to_be_bytes());
+    out.extend_from_slice(&plan.baseline_timestamp_state.encode_canonical());
     out.extend_from_slice(plan.digest.as_bytes());
     out.extend_from_slice(plan.slot.as_bytes());
 }
 
 fn encode_active_bytes<Hash: Q256BitHash>(active: &BranchExactWriterActive<Hash>, out: &mut Vec<u8>) {
     encode_mapping(&active.watermark, out);
-    out.extend_from_slice(&active.timestamp_high_water.as_i64().to_be_bytes());
+    out.extend_from_slice(&active.timestamp_state.revision().get().to_be_bytes());
+    out.extend_from_slice(&active.timestamp_state.encode_canonical());
     out.extend_from_slice(&active.committed_writes.to_be_bytes());
     match active.last_intent {
         None => out.push(0),
@@ -1024,7 +1053,7 @@ fn decode_stored<Hash: Q256BitHash>(
     let plan = decode_plan(&mut decoder)?;
     let state = match decoder.u8()? {
         1 => BranchExactWriterState::ActivationPrepared,
-        2 => BranchExactWriterState::Active(decode_active(&mut decoder)?),
+        2 => BranchExactWriterState::Active(decode_active(&mut decoder, &plan)?),
         3 => BranchExactWriterState::WritePrepared(decode_prepared(&mut decoder, &plan)?),
         4 => {
             let prepared = decode_prepared(&mut decoder, &plan)?;
@@ -1077,8 +1106,13 @@ fn decode_plan<Hash: Q256BitHash>(
     let dataset_digest = BranchExactBackfillDatasetDigest::try_new(decoder.array32()?)
         .map_err(|_| BranchExactWriterLifecycleError::ActivationDigestMismatch)?;
     let baseline = decoder.mapping()?;
-    let baseline_timestamp = CommitWriteTimestampUs::try_from_i128(decoder.i64()? as i128)
-        .map_err(|_| BranchExactWriterLifecycleError::TimestampOutOfRange)?;
+    let baseline_timestamp_revision = decoder.u64()?;
+    let baseline_timestamp_state = StoredAuthorityTimestampState::decode_persisted(
+        i64::try_from(baseline_timestamp_revision)
+            .map_err(|_| BranchExactWriterLifecycleError::TimestampOutOfRange)?,
+        decoder.take(AUTHORITY_TIMESTAMP_STATE_V1_LEN)?,
+    )
+    .map_err(|_| BranchExactWriterLifecycleError::TimestampAllocatorNotReady)?;
     let digest = BranchExactWriterActivationDigest(decoder.array32()?);
     let slot = BranchExactWriterSlot(decoder.array32()?);
     let plan = BranchExactWriterActivationPlan {
@@ -1091,12 +1125,21 @@ fn decode_plan<Hash: Q256BitHash>(
         source_receipt_digest,
         dataset_digest,
         baseline,
-        baseline_timestamp,
+        baseline_timestamp_state,
         digest,
         slot,
     };
     if plan.backfill_receipt.plan().dataset_digest() != plan.dataset_digest
         || plan.backfill_receipt.plan().deployment().intent().authority() != authority
+        || !matches!(
+            plan.baseline_timestamp_state.phase(),
+            AuthorityTimestampPhase::Idle { .. }
+        )
+        || plan
+            .backfill_receipt
+            .plan()
+            .write_timestamp()
+            .is_some_and(|timestamp| timestamp > plan.baseline_timestamp())
         || plan.digest != activation_digest(&plan)
         || plan.slot
             != writer_slot(plan.baseline.canonical_chain().network_id(), authority)
@@ -1108,19 +1151,50 @@ fn decode_plan<Hash: Q256BitHash>(
 
 fn decode_active<Hash: Q256BitHash>(
     decoder: &mut Decoder<'_>,
+    plan: &BranchExactWriterActivationPlan<Hash>,
 ) -> Result<BranchExactWriterActive<Hash>, BranchExactWriterLifecycleError> {
     let watermark = decoder.mapping()?;
-    let timestamp_high_water = CommitWriteTimestampUs::try_from_i128(decoder.i64()? as i128)
+    let timestamp_revision = i64::try_from(decoder.u64()?)
         .map_err(|_| BranchExactWriterLifecycleError::TimestampOutOfRange)?;
+    let timestamp_state = StoredAuthorityTimestampState::decode_persisted(
+        timestamp_revision,
+        decoder.take(AUTHORITY_TIMESTAMP_STATE_V1_LEN)?,
+    )
+    .map_err(|_| BranchExactWriterLifecycleError::TimestampAllocatorNotReady)?;
     let committed_writes = decoder.u64()?;
     let last_intent = match decoder.u8()? {
         0 => None,
         1 => Some(BranchExactWriterIntentDigest(decoder.array32()?)),
         value => return Err(BranchExactWriterLifecycleError::InvalidPresence(value)),
     };
+    let AuthorityTimestampPhase::Idle { last_completed } = timestamp_state.phase() else {
+        return Err(BranchExactWriterLifecycleError::TimestampAllocatorNotReady);
+    };
+    if committed_writes == 0 {
+        if last_intent.is_some()
+            || watermark != plan.baseline
+            || timestamp_state != plan.baseline_timestamp_state
+        {
+            return Err(BranchExactWriterLifecycleError::TimestampAllocatorNotReady);
+        }
+    } else {
+        let completed = last_completed.map(|digest| *digest.as_bytes());
+        let intent = last_intent.map(|digest| *digest.as_bytes());
+        if completed != intent
+            || intent.is_none()
+            || watermark.canonical_chain().network_id()
+                != plan.baseline.canonical_chain().network_id()
+            || timestamp_state.bootstrap_reason()
+                != plan.baseline_timestamp_state.bootstrap_reason()
+            || timestamp_state.revision() < plan.baseline_timestamp_state.revision()
+            || timestamp_state.high_water() < plan.baseline_timestamp_state.high_water()
+        {
+            return Err(BranchExactWriterLifecycleError::TimestampAllocatorNotReady);
+        }
+    }
     Ok(BranchExactWriterActive {
         watermark,
-        timestamp_high_water,
+        timestamp_state,
         committed_writes,
         last_intent,
     })
@@ -1130,7 +1204,7 @@ fn decode_prepared<Hash: Q256BitHash>(
     decoder: &mut Decoder<'_>,
     plan: &BranchExactWriterActivationPlan<Hash>,
 ) -> Result<BranchExactWriterPrepared<Hash>, BranchExactWriterLifecycleError> {
-    let previous = decode_active(decoder)?;
+    let previous = decode_active(decoder, plan)?;
     let intent_len = decoder.u32()? as usize;
     let intent = BranchExactDualWriteIntent::decode_persisted(decoder.take(intent_len)?)
         .map_err(|error| BranchExactWriterLifecycleError::Intent(error.to_string()))?;
@@ -1163,8 +1237,7 @@ fn decode_prepared<Hash: Q256BitHash>(
     if intent.authority() != plan.authority
         || intent.predecessor() != previous.watermark()
         || timestamp <= previous.timestamp_high_water()
-        || timestamp_predecessor.high_water() != previous.timestamp_high_water()
-        || !matches!(timestamp_predecessor.phase(), AuthorityTimestampPhase::Idle { .. })
+        || timestamp_predecessor != previous.timestamp_state()
         || reconstructed_reservation.lease().active_revision() != timestamp_revision
         || reconstructed_reservation.lease().timestamp() != timestamp
         || digest
@@ -1295,6 +1368,7 @@ pub enum BranchExactWriterLifecycleError {
     TimestampLeaseMismatch,
     TimestampReservationPredecessorMismatch,
     TimestampLeaseNotCompleted,
+    TimestampKeyMismatch,
     PublishedHeadMismatch,
     CommittedWritesOverflow,
     InvalidMagic,
@@ -1335,7 +1409,7 @@ mod tests {
     };
     use psy_node_core::store::{
         authority_commit::{
-            AuthorityClockSampleUs, AuthorityCommitIntentDigest,
+            AuthorityClockSampleUs,
             AuthorityTimestampBootstrap,
             AuthorityTimestampBootstrapReason, AuthorityTimestampKey,
         },
@@ -1348,7 +1422,7 @@ mod tests {
             PendingGenerationContext, PendingGenerationLedgerKey,
         },
         pending_generation_pipeline::{
-            PendingPipelineBootstrap, PendingProcessingPhase,
+            PendingNoWorkReceiptDigest, PendingPipelineBootstrap, PendingProcessingPhase,
             StoredPendingPipeline,
         },
         typed::ProcCheckpointUniqueId,
@@ -1376,8 +1450,11 @@ mod tests {
     };
     use crate::rollback::branch_exact_pending_orchestration::{
         BranchExactPendingOrchestrationError,
-        BranchExactPendingPublishRecovery, PendingQueueClosePlan,
+        BranchExactPendingPublishRecovery, BranchExactPendingStartupRecovery,
+        BranchExactPreparedWriterRecovery,
+        PendingQueueClosePlan,
         VerifiedPendingQueueSeal,
+        classify_branch_exact_pending_startup,
         classify_branch_exact_publish_recovery, seal_branch_exact_begin,
         seal_branch_exact_no_work, seal_branch_exact_publish,
         seal_branch_exact_queue_capture, seal_branch_exact_queue_close,
@@ -1473,7 +1550,7 @@ mod tests {
         .unwrap()
     }
 
-    fn ready_realm_pipeline(
+    fn baseline_realm_pipeline(
         plan: &BranchExactWriterActivationPlan<PHash>,
         authority: AuthorityScope,
     ) -> StoredPendingPipeline<PHash> {
@@ -1491,7 +1568,14 @@ mod tests {
             100,
         )
         .unwrap();
-        simulate_rotation(bootstrap.candidate(), 102)
+        bootstrap.candidate().clone()
+    }
+
+    fn ready_realm_pipeline(
+        plan: &BranchExactWriterActivationPlan<PHash>,
+        authority: AuthorityScope,
+    ) -> StoredPendingPipeline<PHash> {
+        simulate_rotation(&baseline_realm_pipeline(plan, authority), 102)
     }
 
     fn verified_shadow() -> BranchExactShadowVerifiedReceipt {
@@ -1619,36 +1703,36 @@ mod tests {
 
     fn timestamp_reservation(
         intent: &BranchExactDualWriteIntent<PHash>,
+        writer: &StoredBranchExactWriterLifecycle<PHash>,
     ) -> psy_node_core::store::authority_commit::SealedAuthorityTimestampReservation {
         let key = AuthorityTimestampKey::new(
             intent.candidate().canonical_chain().network_id(),
             intent.authority(),
         );
-        let bootstrap_idle = AuthorityTimestampBootstrap::new(
-            key,
-            CommitWriteTimestampUs::try_from_i128(900).unwrap(),
-            AuthorityTimestampBootstrapReason::ControlledWriterCutover,
-        )
-        .candidate();
-        let prior = bootstrap_idle
-            .seal_reservation(
-                key,
-                AuthorityCommitIntentDigest::from_sealed_commit_digest([0xA5; 32]),
-                AuthorityClockSampleUs::try_from_i128(1_000).unwrap(),
-            )
-            .unwrap();
-        let idle = prior
-            .candidate()
-            .seal_completion(key, prior.lease())
-            .unwrap()
-            .candidate();
-        idle
+        let BranchExactWriterState::Active(active) = writer.state() else {
+            panic!("timestamp reservation fixture requires active writer")
+        };
+        active.timestamp_state()
             .seal_reservation(
                 key,
                 intent.intent_digest().authority_intent(),
                 AuthorityClockSampleUs::try_from_i128(2_000).unwrap(),
             )
             .unwrap()
+    }
+
+    fn idle_timestamp(
+        authority: AuthorityScope,
+        active: &BranchExactWriterActive<PHash>,
+    ) -> ObservedAuthorityTimestampState {
+        let key = AuthorityTimestampKey::new(
+            active.watermark().canonical_chain().network_id(),
+            authority,
+        );
+        ObservedAuthorityTimestampState::from_selected_row(
+            key,
+            active.timestamp_state(),
+        )
     }
 
     #[test]
@@ -1818,7 +1902,7 @@ mod tests {
             ProcCheckpointUniqueId::from_u128(9001),
         )
         .unwrap();
-        let reservation = timestamp_reservation(&intent);
+        let reservation = timestamp_reservation(&intent, active.candidate());
         let allocator_active = reservation.candidate();
         let lease = reservation.lease();
         let sealed = intent.clone().attach_timestamp_lease(lease).unwrap();
@@ -1856,6 +1940,39 @@ mod tests {
             .seal_completion(lease.key(), lease)
             .unwrap()
             .candidate();
+        let wrong_network_key = AuthorityTimestampKey::new(
+            NetworkId::try_from_chain_id(0).unwrap(),
+            intent.authority(),
+        );
+        assert_eq!(
+            SealedBranchExactWriterCas::commit_published(
+                verified.candidate(),
+                intent.candidate().canonical_chain(),
+                ObservedAuthorityTimestampState::from_selected_row(
+                    wrong_network_key,
+                    completed,
+                ),
+            ),
+            Err(BranchExactWriterLifecycleError::TimestampKeyMismatch),
+        );
+        let wrong_authority_key = AuthorityTimestampKey::new(
+            intent.candidate().canonical_chain().network_id(),
+            AuthorityScope::Realm {
+                realm_id: 9,
+                realm_sub_id: 1,
+            },
+        );
+        assert_eq!(
+            SealedBranchExactWriterCas::commit_published(
+                verified.candidate(),
+                intent.candidate().canonical_chain(),
+                ObservedAuthorityTimestampState::from_selected_row(
+                    wrong_authority_key,
+                    completed,
+                ),
+            ),
+            Err(BranchExactWriterLifecycleError::TimestampKeyMismatch),
+        );
         let committed = SealedBranchExactWriterCas::commit_published(
             verified.candidate(),
             intent.candidate().canonical_chain(),
@@ -1893,7 +2010,7 @@ mod tests {
             ProcCheckpointUniqueId::from_u128(1),
         )
         .unwrap();
-        let wrong_reservation = timestamp_reservation(&wrong);
+        let wrong_reservation = timestamp_reservation(&wrong, active.candidate());
         let wrong = wrong
             .attach_timestamp_lease(wrong_reservation.lease())
             .unwrap();
@@ -1924,6 +2041,20 @@ mod tests {
             &consumed,
         )
         .unwrap();
+        let mut impossible_active = active.candidate().clone();
+        let BranchExactWriterState::Active(impossible) = &mut impossible_active.state else {
+            panic!("expected active state")
+        };
+        impossible.last_intent = Some(BranchExactWriterIntentDigest([0x77; 32]));
+        let impossible_bytes = impossible_active.to_canonical_bytes();
+        assert_eq!(
+            StoredBranchExactWriterLifecycle::<PHash>::decode_persisted(
+                impossible_active.slot().as_bytes(),
+                impossible_active.revision().as_i64(),
+                &impossible_bytes,
+            ),
+            Err(BranchExactWriterLifecycleError::TimestampAllocatorNotReady),
+        );
         let blocked = SealedBranchExactWriterCas::block(
             active.candidate(),
             BranchExactWriterBlockedDigest::from_reason("readback mismatch").unwrap(),
@@ -1935,6 +2066,38 @@ mod tests {
                 BranchExactWriterBlockedDigest::from_reason("again").unwrap(),
             ),
             Err(BranchExactWriterLifecycleError::IllegalTransition)
+        );
+        let mut version_two_tagged_with_v3_domain =
+            blocked.candidate().to_canonical_bytes();
+        version_two_tagged_with_v3_domain[8..10]
+            .copy_from_slice(&2_u16.to_be_bytes());
+        let body_len = version_two_tagged_with_v3_domain.len() - 32;
+        let mut hasher = Sha256::new();
+        hasher.update(STATE_DIGEST_DOMAIN);
+        hasher.update(&version_two_tagged_with_v3_domain[..body_len]);
+        let digest: [u8; 32] = hasher.finalize().into();
+        version_two_tagged_with_v3_domain[body_len..].copy_from_slice(&digest);
+        assert_eq!(
+            StoredBranchExactWriterLifecycle::<PHash>::decode_persisted(
+                blocked.candidate().slot().as_bytes(),
+                blocked.candidate().revision().as_i64(),
+                &version_two_tagged_with_v3_domain,
+            ),
+            Err(BranchExactWriterLifecycleError::UnknownCodecVersion(2)),
+        );
+        let mut actual_v2_domain = version_two_tagged_with_v3_domain.clone();
+        let mut hasher = Sha256::new();
+        hasher.update(b"psy/rollback/branch-exact-writer-state/v1");
+        hasher.update(&actual_v2_domain[..body_len]);
+        let digest: [u8; 32] = hasher.finalize().into();
+        actual_v2_domain[body_len..].copy_from_slice(&digest);
+        assert_eq!(
+            StoredBranchExactWriterLifecycle::<PHash>::decode_persisted(
+                blocked.candidate().slot().as_bytes(),
+                blocked.candidate().revision().as_i64(),
+                &actual_v2_domain,
+            ),
+            Err(BranchExactWriterLifecycleError::StateDigestMismatch),
         );
         let mut bytes = blocked.candidate().to_canonical_bytes();
         *bytes.last_mut().unwrap() ^= 1;
@@ -2037,8 +2200,53 @@ mod tests {
             &consumed,
         )
         .unwrap();
+        let BranchExactWriterState::Active(initial_active) = active.candidate().state()
+        else {
+            unreachable!()
+        };
+        let baseline_timestamp = idle_timestamp(authority, initial_active);
+        let baseline_pipeline = baseline_realm_pipeline(&plan, authority);
+        assert_eq!(
+            classify_branch_exact_pending_startup(
+                &baseline_pipeline,
+                active.candidate(),
+                baseline_timestamp,
+            )
+            .unwrap(),
+            BranchExactPendingStartupRecovery::AwaitPrimeOrRotate,
+        );
 
         let ready_101 = ready_realm_pipeline(&plan, authority);
+        assert_eq!(
+            classify_branch_exact_pending_startup(
+                &ready_101,
+                active.candidate(),
+                baseline_timestamp,
+            )
+            .unwrap(),
+            BranchExactPendingStartupRecovery::ReadyForQueueClose,
+        );
+        let wrong_key = AuthorityTimestampKey::new(
+            baseline_timestamp.key().network(),
+            authority,
+        );
+        let wrong_state = AuthorityTimestampBootstrap::new(
+            wrong_key,
+            initial_active.timestamp_high_water(),
+            AuthorityTimestampBootstrapReason::GenesisNative,
+        )
+        .candidate();
+        assert_eq!(
+            classify_branch_exact_pending_startup(
+                &ready_101,
+                active.candidate(),
+                ObservedAuthorityTimestampState::from_selected_row(
+                    wrong_key,
+                    wrong_state,
+                ),
+            ),
+            Err(BranchExactPendingOrchestrationError::TimestampMismatch),
+        );
         let close_101 = PendingQueueClosePlan::model(&ready_101)
             .unwrap();
         let wrong_authority = AuthorityScope::Realm {
@@ -2065,6 +2273,15 @@ mod tests {
             .unwrap()
             .candidate()
             .clone();
+        assert_eq!(
+            classify_branch_exact_pending_startup(
+                &sealing_101,
+                active.candidate(),
+                baseline_timestamp,
+            )
+            .unwrap(),
+            BranchExactPendingStartupRecovery::ResumeQueueSeal(close_101.digest()),
+        );
         assert!(VerifiedPendingQueueSeal::model_stable_empty(
             close_101,
             0,
@@ -2085,6 +2302,18 @@ mod tests {
         .unwrap()
         .candidate()
         .clone();
+        let empty_digest_101 = empty_seal_101.empty_digest().unwrap();
+        assert_eq!(
+            classify_branch_exact_pending_startup(
+                &empty_101,
+                active.candidate(),
+                baseline_timestamp,
+            )
+            .unwrap(),
+            BranchExactPendingStartupRecovery::ResumeNoWorkPublication(
+                empty_digest_101,
+            ),
+        );
         let no_work_101 = seal_branch_exact_no_work(
             &empty_101,
             active.candidate(),
@@ -2094,6 +2323,32 @@ mod tests {
         .unwrap()
         .candidate()
         .clone();
+        assert_eq!(
+            classify_branch_exact_pending_startup(
+                &no_work_101,
+                active.candidate(),
+                baseline_timestamp,
+            )
+            .unwrap(),
+            BranchExactPendingStartupRecovery::CompleteNoWorkAfterTrustedMarker,
+        );
+        let corrupt_no_work = empty_101
+            .seal_retire_no_work(
+                empty_digest_101,
+                PendingNoWorkReceiptDigest::try_new([0xa5; 32]).unwrap(),
+                realm_observation(authority, 11, 10, 500),
+            )
+            .unwrap()
+            .candidate()
+            .clone();
+        assert_eq!(
+            classify_branch_exact_pending_startup(
+                &corrupt_no_work,
+                active.candidate(),
+                baseline_timestamp,
+            ),
+            Err(BranchExactPendingOrchestrationError::NoWorkReceiptMismatch),
+        );
 
         // A second idle generation advances processed/frontier while the
         // materialized writer intentionally remains at pending 100 / height 10.
@@ -2164,6 +2419,18 @@ mod tests {
         .unwrap()
         .candidate()
         .clone();
+        let work_digest_103 = work_seal_103.work_digest().unwrap();
+        assert_eq!(
+            classify_branch_exact_pending_startup(
+                &captured_103,
+                active.candidate(),
+                baseline_timestamp,
+            )
+            .unwrap(),
+            BranchExactPendingStartupRecovery::AwaitRecoverableWork(
+                work_digest_103,
+            ),
+        );
         let intent = BranchExactDualWriteIntent::try_realm(
             authority,
             mapping(10, 100),
@@ -2172,7 +2439,8 @@ mod tests {
             &TagTreeMerkleProof::<PHash>::new_empty(),
         )
         .unwrap();
-        let reservation = timestamp_reservation(&intent);
+        let reservation = timestamp_reservation(&intent, active.candidate());
+        let allocator_predecessor = reservation.expected();
         let allocator_active = reservation.candidate();
         let lease = reservation.lease();
         let sealed = intent
@@ -2197,12 +2465,90 @@ mod tests {
         .unwrap()
         .candidate()
         .clone();
+        assert_eq!(
+            classify_branch_exact_pending_startup(
+                &captured_103,
+                prepared.candidate(),
+                ObservedAuthorityTimestampState::from_selected_row(
+                    lease.key(),
+                    allocator_predecessor,
+                ),
+            )
+            .unwrap(),
+            BranchExactPendingStartupRecovery::ApplyPipeline {
+                pipeline: seal_branch_exact_begin(
+                    &captured_103,
+                    prepared.candidate(),
+                )
+                .unwrap(),
+                writer: BranchExactPreparedWriterRecovery::ApplyTimestampReservation,
+            },
+        );
+        assert_eq!(
+            classify_branch_exact_pending_startup(
+                &inflight_103,
+                prepared.candidate(),
+                ObservedAuthorityTimestampState::from_selected_row(
+                    lease.key(),
+                    allocator_predecessor,
+                ),
+            )
+            .unwrap(),
+            BranchExactPendingStartupRecovery::ResumeWriterVerification(
+                BranchExactPreparedWriterRecovery::ApplyTimestampReservation,
+            ),
+        );
+        assert_eq!(
+            classify_branch_exact_pending_startup(
+                &captured_103,
+                prepared.candidate(),
+                ObservedAuthorityTimestampState::from_selected_row(
+                    lease.key(),
+                    allocator_active,
+                ),
+            )
+            .unwrap(),
+            BranchExactPendingStartupRecovery::ApplyPipeline {
+                pipeline: seal_branch_exact_begin(
+                    &captured_103,
+                    prepared.candidate(),
+                )
+                .unwrap(),
+                writer: BranchExactPreparedWriterRecovery::ResumeActiveLease,
+            },
+        );
+        assert_eq!(
+            classify_branch_exact_pending_startup(
+                &inflight_103,
+                prepared.candidate(),
+                ObservedAuthorityTimestampState::from_selected_row(
+                    lease.key(),
+                    allocator_active,
+                ),
+            )
+            .unwrap(),
+            BranchExactPendingStartupRecovery::ResumeWriterVerification(
+                BranchExactPreparedWriterRecovery::ResumeActiveLease,
+            ),
+        );
         let write_observation = crate::rollback::branch_exact_dual_write_executor::BranchExactVerifiedWriteObservation::test_fixture(prepared_state);
         let verified = SealedBranchExactWriterCas::verify_writes(
             prepared.candidate(),
             &write_observation,
         )
         .unwrap();
+        assert_eq!(
+            classify_branch_exact_pending_startup(
+                &inflight_103,
+                verified.candidate(),
+                ObservedAuthorityTimestampState::from_selected_row(
+                    lease.key(),
+                    allocator_active,
+                ),
+            )
+            .unwrap(),
+            BranchExactPendingStartupRecovery::AwaitTrustedMarker,
+        );
         let inflight_after_writer_advanced = seal_branch_exact_begin(
             &captured_103,
             verified.candidate(),
@@ -2254,6 +2600,18 @@ mod tests {
             marker.clone(),
         )
         .unwrap();
+        assert_eq!(
+            classify_branch_exact_pending_startup(
+                publish.candidate(),
+                verified.candidate(),
+                ObservedAuthorityTimestampState::from_selected_row(
+                    lease.key(),
+                    allocator_active,
+                ),
+            )
+            .unwrap(),
+            BranchExactPendingStartupRecovery::FinishWriterAfterTrustedMarker,
+        );
         let retry = seal_branch_exact_publish(
             &inflight_103,
             verified.candidate(),
@@ -2286,6 +2644,29 @@ mod tests {
             .seal_completion(lease.key(), lease)
             .unwrap()
             .candidate();
+        assert_eq!(
+            classify_branch_exact_pending_startup(
+                publish.candidate(),
+                verified.candidate(),
+                ObservedAuthorityTimestampState::from_selected_row(
+                    lease.key(),
+                    completed_allocator,
+                ),
+            )
+            .unwrap(),
+            BranchExactPendingStartupRecovery::FinishWriterAfterTrustedMarker,
+        );
+        assert_eq!(
+            classify_branch_exact_pending_startup(
+                &inflight_103,
+                verified.candidate(),
+                ObservedAuthorityTimestampState::from_selected_row(
+                    lease.key(),
+                    completed_allocator,
+                ),
+            ),
+            Err(BranchExactPendingOrchestrationError::TimestampMismatch),
+        );
         let committed = SealedBranchExactWriterCas::commit_published(
             verified.candidate(),
             intent.candidate().canonical_chain(),
@@ -2295,6 +2676,29 @@ mod tests {
             ),
         )
         .unwrap();
+        assert_eq!(
+            classify_branch_exact_pending_startup(
+                publish.candidate(),
+                committed.candidate(),
+                ObservedAuthorityTimestampState::from_selected_row(
+                    lease.key(),
+                    completed_allocator,
+                ),
+            )
+            .unwrap(),
+            BranchExactPendingStartupRecovery::CompleteAfterTrustedMarker,
+        );
+        assert_eq!(
+            classify_branch_exact_pending_startup(
+                publish.candidate(),
+                committed.candidate(),
+                ObservedAuthorityTimestampState::from_selected_row(
+                    lease.key(),
+                    allocator_active,
+                ),
+            ),
+            Err(BranchExactPendingOrchestrationError::TimestampMismatch),
+        );
         assert_eq!(
             classify_branch_exact_publish_recovery(
                 publish.candidate(),
@@ -2329,7 +2733,7 @@ mod tests {
             &TagTreeMerkleProof::<PHash>::new_empty(),
         )
         .unwrap();
-        let wrong_reservation = timestamp_reservation(&wrong_intent);
+        let wrong_reservation = timestamp_reservation(&wrong_intent, active.candidate());
         let wrong_active_allocator = wrong_reservation.candidate();
         let wrong_lease = wrong_reservation.lease();
         let wrong_prepared = SealedBranchExactWriterCas::prepare_write(

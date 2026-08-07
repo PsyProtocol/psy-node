@@ -15,6 +15,7 @@ use std::{error::Error, fmt};
 use parth_core::protocol::core_types::Q256BitHash;
 use psy_data::protocol::chain_context::{AuthorityObservation, AuthorityScope};
 use psy_node_core::store::{
+    authority_commit::{AuthorityIntentObservation, ObservedAuthorityTimestampState},
     pending_generation_identity::{
         PendingGenerationActivationDigest, PendingGenerationContext,
         PendingGenerationLedgerKey,
@@ -53,6 +54,7 @@ pub struct PendingQueueClosePlan {
 }
 
 impl PendingQueueClosePlan {
+    #[cfg(test)]
     pub(crate) fn model<Hash: Q256BitHash>(
         pipeline: &StoredPendingPipeline<Hash>,
     ) -> Result<Self, BranchExactPendingOrchestrationError> {
@@ -92,7 +94,12 @@ impl PendingQueueClosePlan {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum VerifiedPendingQueueSeal {
+pub struct VerifiedPendingQueueSeal {
+    inner: VerifiedPendingQueueSealKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum VerifiedPendingQueueSealKind {
     Work {
         plan: PendingQueueClosePlan,
         item_count: u64,
@@ -106,6 +113,7 @@ pub enum VerifiedPendingQueueSeal {
 }
 
 impl VerifiedPendingQueueSeal {
+    #[cfg(test)]
     pub(crate) fn model_work(
         plan: PendingQueueClosePlan,
         item_count: u64,
@@ -120,15 +128,18 @@ impl VerifiedPendingQueueSeal {
             item_count,
             &dataset_digest,
         )?;
-        Ok(Self::Work {
-            plan,
-            item_count,
-            dataset_digest,
-            digest: PendingWorkCaptureDigest::try_new(digest)
-                .map_err(BranchExactPendingOrchestrationError::Pipeline)?,
+        Ok(Self {
+            inner: VerifiedPendingQueueSealKind::Work {
+                plan,
+                item_count,
+                dataset_digest,
+                digest: PendingWorkCaptureDigest::try_new(digest)
+                    .map_err(BranchExactPendingOrchestrationError::Pipeline)?,
+            },
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn model_stable_empty(
         plan: PendingQueueClosePlan,
         finalized_items: usize,
@@ -141,16 +152,35 @@ impl VerifiedPendingQueueSeal {
             });
         }
         let digest = queue_seal_digest(EMPTY_SEAL_DOMAIN, &plan, 0, &[0; 32])?;
-        Ok(Self::Empty {
-            plan,
-            digest: PendingEmptyQueueSealDigest::try_new(digest)
-                .map_err(BranchExactPendingOrchestrationError::Pipeline)?,
+        Ok(Self {
+            inner: VerifiedPendingQueueSealKind::Empty {
+                plan,
+                digest: PendingEmptyQueueSealDigest::try_new(digest)
+                    .map_err(BranchExactPendingOrchestrationError::Pipeline)?,
+            },
         })
     }
 
     pub const fn plan(&self) -> PendingQueueClosePlan {
-        match self {
-            Self::Work { plan, .. } | Self::Empty { plan, .. } => *plan,
+        match self.inner {
+            VerifiedPendingQueueSealKind::Work { plan, .. }
+            | VerifiedPendingQueueSealKind::Empty { plan, .. } => plan,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn work_digest(&self) -> Option<PendingWorkCaptureDigest> {
+        match self.inner {
+            VerifiedPendingQueueSealKind::Work { digest, .. } => Some(digest),
+            VerifiedPendingQueueSealKind::Empty { .. } => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn empty_digest(&self) -> Option<PendingEmptyQueueSealDigest> {
+        match self.inner {
+            VerifiedPendingQueueSealKind::Empty { digest, .. } => Some(digest),
+            VerifiedPendingQueueSealKind::Work { .. } => None,
         }
     }
 }
@@ -199,11 +229,11 @@ pub fn seal_branch_exact_queue_capture<Hash: Q256BitHash>(
         return Err(BranchExactPendingOrchestrationError::QueueSealMismatch);
     }
     require_writer_frontier(pipeline, active)?;
-    match seal {
-        VerifiedPendingQueueSeal::Work { digest, .. } => pipeline
+    match seal.inner {
+        VerifiedPendingQueueSealKind::Work { digest, .. } => pipeline
             .seal_capture_work(plan.digest(), digest)
             .map_err(BranchExactPendingOrchestrationError::Pipeline),
-        VerifiedPendingQueueSeal::Empty { digest, .. } => pipeline
+        VerifiedPendingQueueSealKind::Empty { digest, .. } => pipeline
             .seal_empty_queue(plan.digest(), digest)
             .map_err(BranchExactPendingOrchestrationError::Pipeline),
     }
@@ -256,7 +286,7 @@ pub fn seal_branch_exact_no_work<Hash: Q256BitHash>(
     if pipeline.key().authority() == AuthorityScope::Coordinator {
         return Err(BranchExactPendingOrchestrationError::CoordinatorNoWork);
     }
-    let VerifiedPendingQueueSeal::Empty { plan, digest } = empty else {
+    let VerifiedPendingQueueSealKind::Empty { plan, digest } = empty.inner else {
         return Err(BranchExactPendingOrchestrationError::ExpectedEmptySeal);
     };
     if plan.processing != pipeline.processing()
@@ -322,6 +352,143 @@ pub enum BranchExactPendingPublishRecovery<Hash> {
     ApplyPipeline(SealedPendingPipelineTransition<Hash>),
     FinishWriter,
     Complete,
+}
+
+/// Read-only startup classification for the three durable rows owned by the
+/// pending/writer runtime.  It deliberately stops before queue access and
+/// before authority-marker publication: those operations require opaque
+/// receipts from their respective production backends.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BranchExactPendingStartupRecovery<Hash> {
+    AwaitPrimeOrRotate,
+    ReadyForQueueClose,
+    ResumeQueueSeal(PendingQueueCloseIntentDigest),
+    AwaitRecoverableWork(PendingWorkCaptureDigest),
+    ApplyPipeline {
+        pipeline: SealedPendingPipelineTransition<Hash>,
+        writer: BranchExactPreparedWriterRecovery,
+    },
+    ResumeWriterVerification(BranchExactPreparedWriterRecovery),
+    AwaitTrustedMarker,
+    ResumeNoWorkPublication(PendingEmptyQueueSealDigest),
+    CompleteNoWorkAfterTrustedMarker,
+    FinishWriterAfterTrustedMarker,
+    CompleteAfterTrustedMarker,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BranchExactPreparedWriterRecovery {
+    ApplyTimestampReservation,
+    ResumeActiveLease,
+}
+
+/// Classify a restart without mutating either row.  Every accepted pair is
+/// identity-checked.  Cross-row transitions that can be reproduced from
+/// durable evidence return their exact sealed candidate; queue and marker
+/// actions remain explicit boundaries rather than accepting a caller-supplied
+/// digest or observation.
+pub fn classify_branch_exact_pending_startup<Hash: Q256BitHash>(
+    pipeline: &StoredPendingPipeline<Hash>,
+    writer: &StoredBranchExactWriterLifecycle<Hash>,
+    timestamp: ObservedAuthorityTimestampState,
+) -> Result<BranchExactPendingStartupRecovery<Hash>, BranchExactPendingOrchestrationError> {
+    if pipeline.blocked_reason().is_some() {
+        return Err(BranchExactPendingOrchestrationError::PipelineBlocked);
+    }
+    require_common_identity(pipeline, writer)?;
+    match (pipeline.processing_state(), writer.state()) {
+        (PendingProcessingState::Baseline(_), BranchExactWriterState::Active(active)) => {
+            require_writer_frontier(pipeline, active)?;
+            require_active_timestamp(pipeline, active, timestamp)?;
+            Ok(BranchExactPendingStartupRecovery::AwaitPrimeOrRotate)
+        }
+        (PendingProcessingState::Ready, BranchExactWriterState::Active(active)) => {
+            require_writer_frontier(pipeline, active)?;
+            require_active_timestamp(pipeline, active, timestamp)?;
+            Ok(BranchExactPendingStartupRecovery::ReadyForQueueClose)
+        }
+        (PendingProcessingState::Sealing(close), BranchExactWriterState::Active(active)) => {
+            require_writer_frontier(pipeline, active)?;
+            require_active_timestamp(pipeline, active, timestamp)?;
+            Ok(BranchExactPendingStartupRecovery::ResumeQueueSeal(close))
+        }
+        (PendingProcessingState::WorkCaptured(capture), BranchExactWriterState::Active(active)) => {
+            require_writer_frontier(pipeline, active)?;
+            require_active_timestamp(pipeline, active, timestamp)?;
+            Ok(BranchExactPendingStartupRecovery::AwaitRecoverableWork(capture))
+        }
+        (PendingProcessingState::WorkCaptured(_), BranchExactWriterState::WritePrepared(prepared)) => {
+            let recovery = classify_prepared_timestamp(pipeline, prepared, timestamp)?;
+            Ok(BranchExactPendingStartupRecovery::ApplyPipeline {
+                pipeline: seal_branch_exact_begin(pipeline, writer)?,
+                writer: recovery,
+            })
+        }
+        (PendingProcessingState::WorkCaptured(_), BranchExactWriterState::WritesVerified(verified)) => {
+            require_verified_active_timestamp(pipeline, verified.prepared(), timestamp)?;
+            Ok(BranchExactPendingStartupRecovery::ApplyPipeline {
+                pipeline: seal_branch_exact_begin(pipeline, writer)?,
+                writer: BranchExactPreparedWriterRecovery::ResumeActiveLease,
+            })
+        }
+        (PendingProcessingState::InFlight { .. }, BranchExactWriterState::WritePrepared(prepared)) => {
+            require_inflight_writer(pipeline, prepared)?;
+            Ok(BranchExactPendingStartupRecovery::ResumeWriterVerification(
+                classify_prepared_timestamp(pipeline, prepared, timestamp)?,
+            ))
+        }
+        (PendingProcessingState::InFlight { .. }, BranchExactWriterState::WritesVerified(verified)) => {
+            require_inflight_writer(pipeline, verified.prepared())?;
+            require_verified_active_timestamp(pipeline, verified.prepared(), timestamp)?;
+            Ok(BranchExactPendingStartupRecovery::AwaitTrustedMarker)
+        }
+        (PendingProcessingState::EmptyQueueSealed(seal), BranchExactWriterState::Active(active)) => {
+            require_writer_frontier(pipeline, active)?;
+            require_active_timestamp(pipeline, active, timestamp)?;
+            Ok(BranchExactPendingStartupRecovery::ResumeNoWorkPublication(seal))
+        }
+        (
+            PendingProcessingState::RetiredNoWork { seal, receipt },
+            BranchExactWriterState::Active(active),
+        ) => {
+            require_writer_frontier(pipeline, active)?;
+            require_active_timestamp(pipeline, active, timestamp)?;
+            if no_work_receipt(pipeline, seal, pipeline.frontier())? != receipt {
+                return Err(BranchExactPendingOrchestrationError::NoWorkReceiptMismatch);
+            }
+            Ok(
+                BranchExactPendingStartupRecovery::CompleteNoWorkAfterTrustedMarker,
+            )
+        }
+        (PendingProcessingState::Published { .. }, BranchExactWriterState::WritesVerified(verified)) => {
+            require_published_verified_timestamp(pipeline, verified.prepared(), timestamp)?;
+            if classify_branch_exact_publish_recovery(
+                pipeline,
+                writer,
+                pipeline.frontier().clone(),
+            )? != BranchExactPendingPublishRecovery::FinishWriter
+            {
+                return Err(BranchExactPendingOrchestrationError::StartupStateMismatch);
+            }
+            Ok(BranchExactPendingStartupRecovery::FinishWriterAfterTrustedMarker)
+        }
+        (PendingProcessingState::Published { .. }, BranchExactWriterState::Active(active)) => {
+            require_active_timestamp(pipeline, active, timestamp)?;
+            if classify_branch_exact_publish_recovery(
+                pipeline,
+                writer,
+                pipeline.frontier().clone(),
+            )? != BranchExactPendingPublishRecovery::Complete
+            {
+                return Err(BranchExactPendingOrchestrationError::StartupStateMismatch);
+            }
+            Ok(BranchExactPendingStartupRecovery::CompleteAfterTrustedMarker)
+        }
+        (PendingProcessingState::InFlight { .. }, BranchExactWriterState::Active(_)) => {
+            Err(BranchExactPendingOrchestrationError::WriterAdvancedBeforePipeline)
+        }
+        _ => Err(BranchExactPendingOrchestrationError::StartupStateMismatch),
+    }
 }
 
 pub fn classify_branch_exact_publish_recovery<Hash: Q256BitHash>(
@@ -407,6 +574,20 @@ fn active_publish_receipt<Hash: Q256BitHash>(
         .map_err(BranchExactPendingOrchestrationError::Pipeline)
 }
 
+fn no_work_receipt<Hash: Q256BitHash>(
+    pipeline: &StoredPendingPipeline<Hash>,
+    seal: PendingEmptyQueueSealDigest,
+    observed: &AuthorityObservation<Hash>,
+) -> Result<PendingNoWorkReceiptDigest, BranchExactPendingOrchestrationError> {
+    let receipt = generation_receipt_digest(
+        NO_WORK_DOMAIN,
+        pipeline,
+        &[seal.as_bytes(), observed.to_canonical_bytes().as_slice()],
+    )?;
+    PendingNoWorkReceiptDigest::try_new(receipt)
+        .map_err(BranchExactPendingOrchestrationError::Pipeline)
+}
+
 fn require_active_writer<'a, Hash: Q256BitHash>(
     pipeline: &StoredPendingPipeline<Hash>,
     writer: &'a StoredBranchExactWriterLifecycle<Hash>,
@@ -486,6 +667,103 @@ fn require_inflight_begin<Hash: Q256BitHash>(
         return Err(BranchExactPendingOrchestrationError::InFlightIdentityMismatch);
     }
     Ok(intent)
+}
+
+fn require_inflight_writer<Hash: Q256BitHash>(
+    pipeline: &StoredPendingPipeline<Hash>,
+    prepared: &super::BranchExactWriterPrepared<Hash>,
+) -> Result<(), BranchExactPendingOrchestrationError> {
+    require_writer_frontier(pipeline, prepared.previous())?;
+    let intent = prepared.intent();
+    if intent.authority() != pipeline.key().authority()
+        || intent.predecessor() != prepared.previous().watermark()
+        || intent.candidate().pending_id() != pipeline.processing().pending_id()
+        || intent.proc_checkpoint_id() != pipeline.processing().proc_checkpoint_id()
+    {
+        return Err(BranchExactPendingOrchestrationError::WriterGenerationMismatch);
+    }
+    require_inflight_begin(pipeline, intent.intent_digest().as_bytes())?;
+    Ok(())
+}
+
+fn classify_prepared_timestamp<Hash: Q256BitHash>(
+    pipeline: &StoredPendingPipeline<Hash>,
+    prepared: &super::BranchExactWriterPrepared<Hash>,
+    observed: ObservedAuthorityTimestampState,
+) -> Result<BranchExactPreparedWriterRecovery, BranchExactPendingOrchestrationError> {
+    require_timestamp_key(pipeline, observed)?;
+    match prepared
+        .reconcile_timestamp_reservation(observed)
+        .map_err(|_| BranchExactPendingOrchestrationError::TimestampMismatch)?
+    {
+        super::BranchExactTimestampReservationRecovery::Active(_) => {
+            Ok(BranchExactPreparedWriterRecovery::ResumeActiveLease)
+        }
+        super::BranchExactTimestampReservationRecovery::Apply { .. } => {
+            Ok(BranchExactPreparedWriterRecovery::ApplyTimestampReservation)
+        }
+    }
+}
+
+fn require_verified_active_timestamp<Hash: Q256BitHash>(
+    pipeline: &StoredPendingPipeline<Hash>,
+    prepared: &super::BranchExactWriterPrepared<Hash>,
+    observed: ObservedAuthorityTimestampState,
+) -> Result<(), BranchExactPendingOrchestrationError> {
+    require_timestamp_key(pipeline, observed)?;
+    prepared
+        .reseal(observed)
+        .map(|_| ())
+        .map_err(|_| BranchExactPendingOrchestrationError::TimestampMismatch)
+}
+
+fn require_published_verified_timestamp<Hash: Q256BitHash>(
+    pipeline: &StoredPendingPipeline<Hash>,
+    prepared: &super::BranchExactWriterPrepared<Hash>,
+    observed: ObservedAuthorityTimestampState,
+) -> Result<(), BranchExactPendingOrchestrationError> {
+    require_timestamp_key(pipeline, observed)?;
+    match observed.observe_intent(prepared.intent().intent_digest().authority_intent()) {
+        AuthorityIntentObservation::Active(_) => {
+            prepared
+                .reseal(observed)
+                .map(|_| ())
+                .map_err(|_| BranchExactPendingOrchestrationError::TimestampMismatch)
+        }
+        AuthorityIntentObservation::Completed { timestamp, revision }
+            if timestamp == prepared.timestamp()
+                && prepared.timestamp_revision().checked_next().ok() == Some(revision) =>
+        {
+            Ok(())
+        }
+        _ => Err(BranchExactPendingOrchestrationError::TimestampMismatch),
+    }
+}
+
+fn require_active_timestamp<Hash: Q256BitHash>(
+    pipeline: &StoredPendingPipeline<Hash>,
+    active: &BranchExactWriterActive<Hash>,
+    observed: ObservedAuthorityTimestampState,
+) -> Result<(), BranchExactPendingOrchestrationError> {
+    require_timestamp_key(pipeline, observed)?;
+    if observed.state() != active.timestamp_state() {
+        return Err(BranchExactPendingOrchestrationError::TimestampMismatch);
+    }
+    Ok(())
+}
+
+fn require_timestamp_key<Hash>(
+    pipeline: &StoredPendingPipeline<Hash>,
+    observed: ObservedAuthorityTimestampState,
+) -> Result<(), BranchExactPendingOrchestrationError> {
+    let key = observed.key();
+    if key.network() != pipeline.key().network()
+        || key.authority() != pipeline.key().authority()
+    {
+        Err(BranchExactPendingOrchestrationError::TimestampMismatch)
+    } else {
+        Ok(())
+    }
 }
 
 fn begin_digest<Hash: Q256BitHash>(
@@ -602,6 +880,8 @@ fn encode_authority(hasher: &mut Sha256, authority: AuthorityScope) {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BranchExactPendingOrchestrationError {
     Pipeline(PendingPipelineError),
+    PipelineBlocked,
+    TimestampMismatch,
     ActivationMismatch,
     PipelineNotReady,
     WriterNotActive,
@@ -619,7 +899,9 @@ pub enum BranchExactPendingOrchestrationError {
     CoordinatorNoWork,
     MarkerMismatch,
     PublishReceiptMismatch,
+    NoWorkReceiptMismatch,
     PublishRecoveryStateMismatch,
+    StartupStateMismatch,
     MissingActiveIntent,
     WriterAdvancedBeforePipeline,
     GenerationNotStableEmpty {

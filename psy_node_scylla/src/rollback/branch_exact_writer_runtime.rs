@@ -14,7 +14,7 @@ use psy_data::protocol::canonical_chain::{CanonicalChainRef, NetworkId};
 use psy_node_core::store::{
     authority_commit::{
         AuthorityClockSampleUs, AuthorityTimestampKey,
-        AuthorityTimestampPhase, AuthorityTimestampWriteOutcome,
+        AuthorityTimestampWriteOutcome,
         ObservedAuthorityTimestampState,
     },
     branch_exact_dual_write::{
@@ -26,7 +26,8 @@ use scylla::client::session::Session;
 
 use super::{
     AuthorityTimestampNoTabletKeyspace, BranchExactDeploymentNoTabletKeyspace,
-    BranchExactSchemaSetupRequest, BranchExactTimestampReservationRecovery,
+    BranchExactSchemaReady, BranchExactSchemaSetupRequest,
+    BranchExactTimestampReservationRecovery,
     BranchExactWriterActivationDigest,
     BranchExactWriterAuthorityKey, BranchExactWriterLifecycleError,
     BranchExactWriterReadState, BranchExactWriterRevision,
@@ -108,6 +109,22 @@ pub struct ScyllaBranchExactWriterRuntime<Hash> {
     _hash: std::marker::PhantomData<Hash>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BranchExactWriterRecoverySample<Hash> {
+    writer: StoredBranchExactWriterLifecycle<Hash>,
+    timestamp: ObservedAuthorityTimestampState,
+}
+
+impl<Hash> BranchExactWriterRecoverySample<Hash> {
+    pub(crate) const fn writer(&self) -> &StoredBranchExactWriterLifecycle<Hash> {
+        &self.writer
+    }
+
+    pub(crate) const fn timestamp(&self) -> ObservedAuthorityTimestampState {
+        self.timestamp
+    }
+}
+
 impl<Hash: Q256BitHash> ScyllaBranchExactWriterRuntime<Hash> {
     /// Prepare-only factory. It never creates schema, bootstraps rows or
     /// activates a writer. Missing/non-active durable state fails closed.
@@ -164,6 +181,61 @@ impl<Hash: Q256BitHash> ScyllaBranchExactWriterRuntime<Hash> {
         if ready.view().digest() != expected_plan.schema_ready_digest() {
             return Err(BranchExactWriterRuntimeError::ReadyDigestMismatch);
         }
+        Self::prepare_from_ready(
+            session,
+            no_tablet_keyspace,
+            request,
+            &ready,
+        )
+        .await
+    }
+
+    /// Composition factory that consumes the exact h20 capability already
+    /// held by the node setup root. It cannot independently authorize another
+    /// receipt/schema pair and therefore cannot combine Core-ready A with
+    /// writer-plan B.
+    pub(crate) async fn prepare_from_ready(
+        session: Arc<Session>,
+        no_tablet_keyspace: &str,
+        request: BranchExactWriterRuntimeRequest<Hash>,
+        ready: &BranchExactSchemaReady,
+    ) -> Result<Self, BranchExactWriterRuntimeError> {
+        let key = BranchExactWriterAuthorityKey::new(request.network, request.authority);
+        let control_keyspace = BranchExactDeploymentNoTabletKeyspace::try_new(
+            no_tablet_keyspace.to_owned(),
+        )
+        .map_err(|error| BranchExactWriterRuntimeError::Setup(error.to_string()))?;
+        let writer = ScyllaBranchExactWriterLifecycleStore::prepare(
+            session.clone(),
+            control_keyspace,
+        )
+        .await
+        .map_err(store)?;
+        let BranchExactWriterReadState::Current(current) =
+            writer.read::<Hash>(key).await.map_err(store)?
+        else {
+            return Err(BranchExactWriterRuntimeError::WriterUninitialized);
+        };
+        if current.plan().digest() != request.expected_activation_digest {
+            return Err(BranchExactWriterRuntimeError::ActivationPlanMismatch);
+        }
+        match current.state() {
+            BranchExactWriterState::Active(_)
+            | BranchExactWriterState::WritePrepared(_)
+            | BranchExactWriterState::WritesVerified(_) => {}
+            BranchExactWriterState::ActivationPrepared => {
+                return Err(BranchExactWriterRuntimeError::WriterNotActive)
+            }
+            BranchExactWriterState::Blocked(_) => {
+                return Err(BranchExactWriterRuntimeError::WriterBlocked)
+            }
+        }
+        if ready.view().authority() != request.authority
+            || ready.view().digest() != current.plan().schema_ready_digest()
+            || ready.expected_receipt() != current.plan().backfill_receipt()
+        {
+            return Err(BranchExactWriterRuntimeError::ReadyDigestMismatch);
+        }
         let timestamp_keyspace = AuthorityTimestampNoTabletKeyspace::try_new(
             no_tablet_keyspace.to_owned(),
         )
@@ -183,7 +255,7 @@ impl<Hash: Q256BitHash> ScyllaBranchExactWriterRuntime<Hash> {
             timestamps,
             adapter,
             key,
-            activation_digest: expected_plan.digest(),
+            activation_digest: current.plan().digest(),
             _hash: std::marker::PhantomData,
         })
     }
@@ -216,9 +288,7 @@ impl<Hash: Q256BitHash> ScyllaBranchExactWriterRuntime<Hash> {
                     .map_err(timestamp)?
                     .ok_or(BranchExactWriterRuntimeError::TimestampUninitialized)?;
                 let state = observed.state();
-                if state.high_water() != active.timestamp_high_water()
-                    || !matches!(state.phase(), AuthorityTimestampPhase::Idle { .. })
-                {
+                if state != active.timestamp_state() {
                     return Err(BranchExactWriterRuntimeError::TimestampNotIdleAtWatermark);
                 }
                 let reservation = state
@@ -449,7 +519,7 @@ impl<Hash: Q256BitHash> ScyllaBranchExactWriterRuntime<Hash> {
         }
     }
 
-    async fn read_writer(
+    pub(crate) async fn read_writer(
         &self,
     ) -> Result<StoredBranchExactWriterLifecycle<Hash>, BranchExactWriterRuntimeError> {
         let BranchExactWriterReadState::Current(current) =
@@ -461,6 +531,23 @@ impl<Hash: Q256BitHash> ScyllaBranchExactWriterRuntime<Hash> {
             return Err(BranchExactWriterRuntimeError::ActivationPlanMismatch);
         }
         Ok(current)
+    }
+
+    pub(crate) async fn read_recovery_sample(
+        &self,
+    ) -> Result<BranchExactWriterRecoverySample<Hash>, BranchExactWriterRuntimeError> {
+        let writer = self.read_writer().await?;
+        let timestamp_key = AuthorityTimestampKey::new(
+            self.key.network(),
+            self.key.authority(),
+        );
+        let timestamp = self
+            .timestamps
+            .read_observed(timestamp_key)
+            .await
+            .map_err(timestamp)?
+            .ok_or(BranchExactWriterRuntimeError::TimestampUninitialized)?;
+        Ok(BranchExactWriterRecoverySample { writer, timestamp })
     }
 
     fn barrier_from_verified(
