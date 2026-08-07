@@ -25,6 +25,41 @@ use super::{
 
 pub const REALM_IMT_PREDECESSOR_CONCURRENT_LIMIT: usize = 512;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RealmImtPredecessorReadConcurrency(usize);
+
+impl RealmImtPredecessorReadConcurrency {
+    pub fn try_new(value: usize) -> Result<Self, RealmImtPredecessorReadConcurrencyOutOfRange> {
+        if (1..=REALM_IMT_PREDECESSOR_CONCURRENT_LIMIT).contains(&value) {
+            Ok(Self(value))
+        } else {
+            Err(RealmImtPredecessorReadConcurrencyOutOfRange(value))
+        }
+    }
+
+    pub const fn get(self) -> usize { self.0 }
+}
+
+impl Default for RealmImtPredecessorReadConcurrency {
+    fn default() -> Self { Self(REALM_IMT_PREDECESSOR_CONCURRENT_LIMIT) }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RealmImtPredecessorReadConcurrencyOutOfRange(pub usize);
+
+impl fmt::Display for RealmImtPredecessorReadConcurrencyOutOfRange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Realm IMT predecessor read concurrency {} is outside 1..={}",
+            self.0,
+            REALM_IMT_PREDECESSOR_CONCURRENT_LIMIT,
+        )
+    }
+}
+
+impl Error for RealmImtPredecessorReadConcurrencyOutOfRange {}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[repr(u8)]
 pub enum RealmImtPredecessorQueryId {
@@ -242,9 +277,19 @@ impl<Hash: QDBHashBase> RealmImtPredecessorAdapter<Hash> {
         session: &Session,
         plan: &RealmImtPredecessorReadPlan,
     ) -> anyhow::Result<Vec<RealmImtPredecessorReadRow<Hash>>> {
+        self.read_plan_with_concurrency(session, plan, RealmImtPredecessorReadConcurrency::default())
+            .await
+    }
+
+    pub async fn read_plan_with_concurrency(
+        &self,
+        session: &Session,
+        plan: &RealmImtPredecessorReadPlan,
+        concurrency: RealmImtPredecessorReadConcurrency,
+    ) -> anyhow::Result<Vec<RealmImtPredecessorReadRow<Hash>>> {
         let checkpoint = plan.checkpoint().get();
         let mut output = Vec::with_capacity(plan.requests().len());
-        for chunk in plan.requests().chunks(REALM_IMT_PREDECESSOR_CONCURRENT_LIMIT) {
+        for chunk in plan.requests().chunks(concurrency.get()) {
             let results = join_all(
                 chunk
                     .iter()

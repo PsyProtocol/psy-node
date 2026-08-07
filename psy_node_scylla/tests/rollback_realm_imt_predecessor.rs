@@ -6,6 +6,7 @@ use psy_node_scylla::rollback::{
     CqlKeyspaceName, RealmImtPredecessorBindValue as V,
     RealmImtPredecessorBinding, RealmImtPredecessorCheckpointOutOfRange,
     RealmImtPredecessorQueries, RealmImtPredecessorQueryId,
+    RealmImtPredecessorReadConcurrency,
     REALM_IMT_PREDECESSOR_CONCURRENT_LIMIT,
 };
 
@@ -38,6 +39,10 @@ fn query_catalog_uses_the_three_registered_production_schemas() {
         assert!(!query.cql().contains("ALLOW FILTERING"));
     }
     assert_eq!(REALM_IMT_PREDECESSOR_CONCURRENT_LIMIT, 512);
+    assert_eq!(RealmImtPredecessorReadConcurrency::default().get(), 512);
+    assert_eq!(RealmImtPredecessorReadConcurrency::try_new(1).unwrap().get(), 1);
+    assert!(RealmImtPredecessorReadConcurrency::try_new(0).is_err());
+    assert!(RealmImtPredecessorReadConcurrency::try_new(513).is_err());
 }
 
 #[test]

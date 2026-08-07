@@ -21,6 +21,8 @@ mod checkpoint_object_single;
 mod checkpoint_root_pair;
 mod public_key_projection;
 mod realm_imt_predecessor;
+#[cfg(test)]
+mod realm_imt_predecessor_rf3_gate;
 mod imt_family;
 mod rollback_admission;
 mod identity;
