@@ -5,13 +5,9 @@ use parth_core::{
         merkle_proof::MerkleProofCore
     ,
     protocol::core_types::QNetworkTypesConfig,
-    data::queue::queue_key::{PCoreSubjectQueueBase, QPBaseQueueType},
+    data::queue::queue_key::QPBaseQueueType,
 };
-use psy_core::
-    job::job_id::ProvingJobCircuitType
-;
 use psy_data::{
-    prepared_block::realm::{PsyPreparedRealmBlockStateUpdates, PsyRealmCoordinatorUpdate},
     queue_items::realm_user_update::PsyRealmUserUpdateQueueItem,
     v1::qdata::
         checkpoint_sync::PQEDCheckpointSyncInfoCompact
@@ -31,7 +27,10 @@ use psy_node_core::{
 use parth_common::memory_stores::traits::PsyMemoryMerkleStoreImm;
 
 use crate::realm::{
-    processor::db::PsyRealmDatabaseProcessor,
+    processor::{
+        commit_input::{RealmCommitInput, RealmCommitOriginKind},
+        db::PsyRealmDatabaseProcessor,
+    },
     queue_key::{RealmUserUpdateQueueKey, RealmProvingWorkQueueKey},
 };
 
@@ -216,14 +215,43 @@ where
         Ok(previous)
     }
 
-    pub async fn commit_state(
+    pub(in crate::realm::processor) async fn commit_state(
         &mut self,
-        coordinator_update: &PsyRealmCoordinatorUpdate<N::F, N::QHash>,
-        realm_update: &PsyPreparedRealmBlockStateUpdates<N::QHash>,
-        _state_transition_circuit_type: ProvingJobCircuitType,
-        _zk_proof: Vec<u8>,
-        skip_checkpoint_root_check: bool,
+        commit_input: RealmCommitInput<'_, N::F, N::QHash>,
     ) -> anyhow::Result<()> {
+        let coordinator_update = commit_input.coordinator();
+        let realm_update = commit_input.prepared();
+        let skip_checkpoint_root_check =
+            commit_input.checkpoint_tree_was_pre_synced();
+
+        commit_input.validate_processing_context(
+            self.state.realm_id_u64,
+            self.state.realm_sub_id_u64,
+            self.state.processing_unique_pending_id,
+            self.state.processing_proc_checkpoint_unique_id,
+            self.state.last_committed_realm_end_root,
+        )?;
+        if commit_input.origin_kind() == RealmCommitOriginKind::LiveProof {
+            // This deliberately retains all four exact live inputs at the
+            // first-write boundary.  Full physical writer coverage is not yet
+            // available, so durable PREPARED persistence remains disabled;
+            // the next integration slice will consume this capability before
+            // the first mapping write below.
+            let live = commit_input.require_live_evidence()?;
+            tracing::debug!(
+                checkpoint_id = coordinator_update.checkpoint_sync_info.checkpoint_id,
+                proof_bytes = live.proof_bytes().len(),
+                circuit_type = live.submission().job_type_u32,
+                realm_id = live.prepared().realm_id,
+                canonical_checkpoint = live
+                    .coordinator()
+                    .canonical_chain_ref
+                    .checkpoint()
+                    .checkpoint_id()
+                    .get(),
+                "validated exact live Realm commit input boundary"
+            );
+        }
         self.validate_realm_sync_context(coordinator_update)?;
         let checkpoint_id = coordinator_update.checkpoint_sync_info.checkpoint_id;
         if coordinator_update.merkle_proof_to_realm_root.value != realm_update.new_realm_root {

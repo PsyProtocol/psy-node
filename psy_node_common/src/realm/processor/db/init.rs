@@ -14,7 +14,7 @@ use parth_core::{
 };
 use psy_core::{
     constants::stale_checkpoint::STALE_CHECKPOINT_AGE_USER_END_CAP_TO_REALM_PROOF,
-    job::job_id::{ProvingJobCircuitType, QProvingJobDataID},
+    job::job_id::QProvingJobDataID,
 };
 use psy_data::{
     config::network_config::PsyNodeCircuitFingerprintConfig,
@@ -39,7 +39,10 @@ use crate::{
     backup::{checkpoint_tree::CheckpointTreeBackupManager, realm::generate_realm_output_from_backups},
     constants::queue::PQ_REALM_SUBMIT_USER_UPDATE_QUEUE_TOPIC_ID,
     queue::gatherer::QueueKeyStatusManager,
-    realm::processor::db::{DatabaseCheckState, PsyRealmDatabaseProcessor},
+    realm::processor::{
+        commit_input::RealmCommitInput,
+        db::{DatabaseCheckState, PsyRealmDatabaseProcessor},
+    },
     realm::processor::gatherers::realm_end_cap_gatherer::{get_new_realm_end_cap_gatherer_backup_file_path, read_realm_backup_end_root},
     utils::processor_status::ProcessorStatus,
 };
@@ -304,14 +307,11 @@ where
             tracing::info!("Applying genesis block setup data to realm processor database...");
             println!("genesis_block_update.coordinator_update: {:?}", genesis_block_update.coordinator_update);
             self.checkpoint_tree_backup_manager.append_checkpoint_leaf_hash(0, genesis_block_update.coordinator_update.checkpoint_sync_info.checkpoint_leaf_hash).await?;
-            self.commit_state(
+            let commit_input = RealmCommitInput::try_genesis(
                 &genesis_block_update.coordinator_update,
                 &genesis_block_update.prepared_updates,
-                ProvingJobCircuitType::GUTANoChange,
-                vec![],
-                false,
-            )
-            .await?;
+            )?;
+            self.commit_state(commit_input).await?;
             tracing::info!("Genesis block setup data applied.");
         }
         Ok(())
@@ -330,14 +330,11 @@ where
                     self.circuit_fingerprint_config
                         .genesis_checkpoint_state_transition_fingerprint,
                 )?;
-            self.commit_state(
+            let commit_input = RealmCommitInput::try_genesis(
                 &genesis_block_update.coordinator_update,
                 &genesis_block_update.prepared_updates,
-                ProvingJobCircuitType::GUTANoChange,
-                vec![],
-                false,
-            )
-            .await?;
+            )?;
+            self.commit_state(commit_input).await?;
             tracing::info!("Genesis block setup data applied.");
         }
         Ok(())
@@ -548,13 +545,11 @@ where
                                                         recovery_state.processing_realm_start_root;
                                                     self.state.processing_realm_end_root =
                                                         recovery_state.processing_realm_end_root;
-                                                    self.commit_state(
+                                                    let commit_input = RealmCommitInput::try_startup_recovery(
                                                         &coordinator_update,
                                                         &updates,
-                                                        ProvingJobCircuitType::GUTANoChange,
-                                                        vec![],
-                                                        true,
-                                                    ).await?;
+                                                    )?;
+                                                    self.commit_state(commit_input).await?;
                                                     tracing::info!(
                                                         "Checkpoint {} recovered from backup (pending_id={}).",
                                                         checkpoint_id,
@@ -667,13 +662,11 @@ where
                 };
 
                 // 6. Commit state to DB (for genesis, mapping, or backup recovery)
-                self.commit_state(
+                let commit_input = RealmCommitInput::try_startup_recovery(
                     &coordinator_update,
                     &prepared_updates,
-                    ProvingJobCircuitType::GUTANoChange, // Dummy type for recovery
-                    vec![],
-                    true,
-                ).await?;
+                )?;
+                self.commit_state(commit_input).await?;
 
                 tracing::info!("Checkpoint {} recovered successfully.", checkpoint_id);
 

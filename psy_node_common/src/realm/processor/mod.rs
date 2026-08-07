@@ -1,3 +1,4 @@
+mod commit_input;
 pub mod core;
 pub mod db;
 pub mod processor_shared_status;

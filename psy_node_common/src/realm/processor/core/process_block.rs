@@ -20,7 +20,11 @@ use psy_node_core::{
 };
 
 use crate::realm::{
-    processor::{core::PsyRealmProcessor, gatherers::realm_end_cap_gatherer::RealmGUTAEndCapGathererOutput},
+    processor::{
+        commit_input::RealmCommitInput,
+        core::PsyRealmProcessor,
+        gatherers::realm_end_cap_gatherer::RealmGUTAEndCapGathererOutput,
+    },
     queue_key::RealmProvingWorkQueueKey,
 };
 
@@ -339,9 +343,13 @@ where
         //self.db.print_last_10_checkpoint_roots_and_leaves("process_block before
         // commit_state").await?;
 
-        self.db
-            .commit_state(&sync_info, &db_output, root_job_id.circuit_type, root_job_proof, false)
-            .await?;
+        let commit_input = RealmCommitInput::try_live_proof(
+            &sync_info,
+            &db_output,
+            &submission_header,
+            &root_job_proof,
+        )?;
+        self.db.commit_state(commit_input).await?;
         timer.lap("commit_state");
         self.db.run_sanity_check("after commit").await?;
 
