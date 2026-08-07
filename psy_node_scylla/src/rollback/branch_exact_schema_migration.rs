@@ -536,6 +536,10 @@ impl BranchExactSchemaFingerprint {
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
+
+    pub const fn from_persisted(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -717,6 +721,21 @@ impl BranchExactSchemaOnlyReceipt {
 
     pub const fn schema_fingerprint(&self) -> BranchExactSchemaFingerprint {
         self.schema_fingerprint
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_verified_parts_for_deployment(
+        request: &BranchExactSchemaMaterializationRequest,
+        schema_fingerprint: BranchExactSchemaFingerprint,
+    ) -> Self {
+        Self {
+            keyspace: request.keyspace().clone(),
+            authority: request.plan().authority(),
+            profile: request.plan().profile(),
+            schema_version: request.plan().schema_version(),
+            plan_digest: request.plan().digest(),
+            schema_fingerprint,
+        }
     }
 }
 

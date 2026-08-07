@@ -19,6 +19,7 @@ psy_node_scylla/src/core.rs|DriverCore|2|2|11|0|0|0|2|2
 psy_node_scylla/src/core_db.rs|DriverCore|0|0|97|0|0|0|0|0
 psy_node_scylla/src/rollback/authority_local_head_prototype.rs|DurableControlAuthority|6|0|3|6|2|3|1|4
 psy_node_scylla/src/rollback/authority_timestamp_prototype.rs|DurableControlAuthority|6|0|4|6|2|4|1|6
+psy_node_scylla/src/rollback/branch_exact_schema_deployment.rs|RollbackPrototypeAdapter|5|0|0|0|0|0|1|2
 psy_node_scylla/src/rollback/branch_exact_schema_migration.rs|RollbackPrototypeAdapter|9|0|0|8|1|4|2|11
 psy_node_scylla/src/rollback/canonical_head_prototype.rs|CanonicalHeadAuthority|7|0|3|6|2|3|1|6
 psy_node_scylla/src/rollback/checkpoint_kiv.rs|RollbackPrototypeAdapter|6|0|0|4|1|2|0|2

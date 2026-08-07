@@ -124,6 +124,13 @@ impl BranchExactMaterializationPlanDigest {
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
+
+    /// Rehydrates a digest stored by the typed deployment lifecycle. The
+    /// surrounding canonical payload is responsible for binding and checking
+    /// every semantic field before the digest is trusted.
+    pub const fn from_persisted(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
 }
 
 /// Sealed release-time authorization for creating the reserved schema.
