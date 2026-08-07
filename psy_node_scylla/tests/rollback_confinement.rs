@@ -299,18 +299,18 @@ fn lexical_inventory_is_stable_and_nontrivial() {
         total.direct_cql += row.direct_cql;
         total
     });
-    assert_eq!(detected.len(), 106);
+    assert_eq!(detected.len(), 112);
     assert_eq!(
         total,
         RawScyllaAccessCounts {
-            session_type: 788,
+            session_type: 817,
             session_builder: 59,
-            session_field_access: 200,
-            prepared_statement: 294,
-            prepare_call: 151,
-            execute_call: 288,
-            query_call: 192,
-            direct_cql: 466,
+            session_field_access: 225,
+            prepared_statement: 318,
+            prepare_call: 158,
+            execute_call: 313,
+            query_call: 196,
+            direct_cql: 493,
         }
     );
 }

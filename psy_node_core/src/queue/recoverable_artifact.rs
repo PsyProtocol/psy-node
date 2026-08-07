@@ -32,6 +32,16 @@ pub const MAX_PENDING_QUEUE_ARTIFACT_HEADER_BYTES: usize = 32 * 1024;
 pub const MAX_PENDING_QUEUE_CANDIDATE_FRAGMENTS: u16 =
     (MAX_PENDING_QUEUE_CANDIDATE_CANONICAL_BYTES as usize)
         .div_ceil(PENDING_QUEUE_ARTIFACT_FRAGMENT_BYTES) as u16;
+/// Tight physical upper bound for `sum(ceil(candidate_bytes / fragment_bytes))`:
+/// `ceil(1 GiB / 4 MiB) + 1,024 - 1 = 1,279`.
+pub const MAX_PENDING_QUEUE_ARTIFACT_TOTAL_FRAGMENTS: u64 =
+    MAX_PENDING_QUEUE_ARTIFACT_CANONICAL_BYTES
+        .div_ceil(PENDING_QUEUE_ARTIFACT_FRAGMENT_BYTES as u64)
+        + MAX_PENDING_QUEUE_ARTIFACT_BATCHES as u64
+        - 1;
+pub const MAX_PENDING_QUEUE_ARTIFACT_BUCKETS: u64 =
+    MAX_PENDING_QUEUE_ARTIFACT_TOTAL_FRAGMENTS
+        .div_ceil(PENDING_QUEUE_ARTIFACT_FRAGMENTS_PER_BUCKET);
 
 const SLOT_DOMAIN: &[u8] = b"psy/rollback/pending-queue-artifact-slot/v1";
 const CANDIDATE_DOMAIN: &[u8] = b"psy/rollback/pending-queue-candidate/v1";
@@ -125,8 +135,7 @@ pub struct PendingQueueArtifactFragmentIndex(u64);
 
 impl PendingQueueArtifactFragmentIndex {
     pub const fn try_new(value: u64) -> Result<Self, PendingQueueArtifactError> {
-        let maximum = MAX_PENDING_QUEUE_ARTIFACT_BATCHES as u64
-            * MAX_PENDING_QUEUE_CANDIDATE_FRAGMENTS as u64;
+        let maximum = MAX_PENDING_QUEUE_ARTIFACT_TOTAL_FRAGMENTS;
         if value >= maximum || value > i64::MAX as u64 {
             Err(PendingQueueArtifactError::FragmentIndexOutOfRange(value))
         } else {
@@ -248,11 +257,6 @@ impl PendingQueueArtifactProgress {
             .next_fragment_index
             .checked_add(u64::from(descriptor.fragment_count))
             .ok_or(PendingQueueArtifactError::ProgressOverflow)?;
-        let maximum_fragments = MAX_PENDING_QUEUE_ARTIFACT_BATCHES as u64
-            * MAX_PENDING_QUEUE_CANDIDATE_FRAGMENTS as u64;
-        if next_fragment_index > maximum_fragments {
-            return Err(PendingQueueArtifactError::TooManyFragments);
-        }
         let selected_item_count = self
             .selected_item_count
             .checked_add(descriptor.item_count)
@@ -265,6 +269,15 @@ impl PendingQueueArtifactProgress {
             .selected_canonical_bytes
             .checked_add(descriptor.canonical_bytes)
             .ok_or(PendingQueueArtifactError::ProgressOverflow)?;
+        let maximum_for_selected_bytes = selected_canonical_bytes
+            .div_ceil(PENDING_QUEUE_ARTIFACT_FRAGMENT_BYTES as u64)
+            .checked_add(u64::from(next_batch_index).saturating_sub(1))
+            .ok_or(PendingQueueArtifactError::ProgressOverflow)?;
+        if next_fragment_index > MAX_PENDING_QUEUE_ARTIFACT_TOTAL_FRAGMENTS
+            || next_fragment_index > maximum_for_selected_bytes
+        {
+            return Err(PendingQueueArtifactError::TooManyFragments);
+        }
         if selected_canonical_bytes > MAX_PENDING_QUEUE_ARTIFACT_CANONICAL_BYTES {
             return Err(PendingQueueArtifactError::ArtifactTooLarge {
                 actual: selected_canonical_bytes,
@@ -803,6 +816,36 @@ impl PendingQueueArtifactAppendPlan {
         Ok(plan)
     }
 
+    /// Reconstructs the exact immutable fragment set after the selected-header
+    /// CAS succeeded but its response, fragment readback, or caller response
+    /// was lost. This does not authorize backend ACK by itself.
+    pub fn try_resume_selected(
+        current_selected: &StoredPendingQueueArtifact,
+        candidate: &PendingQueueCaptureCandidate,
+    ) -> Result<Self, PendingQueueArtifactError> {
+        let PendingQueueArtifactPhase::SelectedAwaitingAck { before, .. } =
+            &current_selected.phase
+        else {
+            return Err(PendingQueueArtifactError::ExpectedSelectedAwaitingAck);
+        };
+        let open_revision = current_selected
+            .revision
+            .get()
+            .checked_sub(2)
+            .ok_or(PendingQueueArtifactError::RevisionOverflow)?;
+        let expected_open = StoredPendingQueueArtifact {
+            slot: current_selected.slot,
+            identity: current_selected.identity.clone(),
+            revision: PendingQueueArtifactRevision::try_new(open_revision)?,
+            phase: PendingQueueArtifactPhase::Open(before.clone()),
+        };
+        let plan = Self::try_new(&expected_open, candidate)?;
+        if &plan.selected != current_selected {
+            return Err(PendingQueueArtifactError::SelectedCandidateConflict);
+        }
+        Ok(plan)
+    }
+
     pub const fn expected_open(&self) -> &StoredPendingQueueArtifact {
         &self.expected_open
     }
@@ -954,11 +997,32 @@ impl PendingQueueArtifactScanObservation {
         close_observed: &StoredPendingQueueArtifact,
         mut fragments: Vec<PendingQueueArtifactFragment>,
     ) -> Result<Self, PendingQueueArtifactError> {
-        let PendingQueueArtifactPhase::CloseObserved { progress, boundary } =
-            &close_observed.phase
-        else {
-            return Err(PendingQueueArtifactError::ExpectedCloseObserved);
-        };
+        let (progress, boundary, close_revision, persisted_scan_digest) =
+            match &close_observed.phase {
+                PendingQueueArtifactPhase::CloseObserved { progress, boundary } => (
+                    progress,
+                    boundary,
+                    close_observed.revision,
+                    None,
+                ),
+                PendingQueueArtifactPhase::SourceScanned {
+                    progress,
+                    boundary,
+                    scan_digest,
+                } => (
+                    progress,
+                    boundary,
+                    PendingQueueArtifactRevision::try_new(
+                        close_observed
+                            .revision
+                            .get()
+                            .checked_sub(1)
+                            .ok_or(PendingQueueArtifactError::RevisionOverflow)?,
+                    )?,
+                    Some(*scan_digest),
+                ),
+                _ => return Err(PendingQueueArtifactError::ExpectedCloseObserved),
+            };
         fragments.sort_by_key(|fragment| {
             (
                 fragment.global_index,
@@ -1070,14 +1134,17 @@ impl PendingQueueArtifactScanObservation {
         let scan_digest = PendingQueueArtifactScanDigest(hash_parts(&[
             SCAN_DOMAIN,
             close_observed.slot.as_bytes(),
-            &close_observed.revision.get().to_be_bytes(),
+            &close_revision.get().to_be_bytes(),
             progress.dataset_digest.as_bytes(),
             progress.coverage_digest.as_bytes(),
             boundary.digest().as_bytes(),
         ]));
+        if persisted_scan_digest.is_some_and(|expected| expected != scan_digest) {
+            return Err(PendingQueueArtifactError::StoredSourceScanDigestMismatch);
+        }
         Ok(Self {
             slot: close_observed.slot,
-            close_revision: close_observed.revision,
+            close_revision,
             dataset_digest: progress.dataset_digest,
             boundary_digest: *boundary.digest().as_bytes(),
             scan_digest,
@@ -1366,12 +1433,17 @@ fn decode_progress(
         .min(MAX_PENDING_QUEUE_ARTIFACT_CANONICAL_BYTES);
     if progress.next_batch_index > MAX_PENDING_QUEUE_ARTIFACT_BATCHES
         || progress.next_fragment_index
-            > MAX_PENDING_QUEUE_ARTIFACT_BATCHES as u64
-                * MAX_PENDING_QUEUE_CANDIDATE_FRAGMENTS as u64
+            > MAX_PENDING_QUEUE_ARTIFACT_TOTAL_FRAGMENTS
         || progress.selected_canonical_bytes > MAX_PENDING_QUEUE_ARTIFACT_CANONICAL_BYTES
         || progress.selected_item_count > maximum_selected_items
         || progress.selected_payload_bytes > maximum_selected_payload
         || progress.selected_canonical_bytes > maximum_selected_canonical
+        || (progress.next_batch_index > 0
+            && progress.next_fragment_index
+                > progress
+                    .selected_canonical_bytes
+                    .div_ceil(PENDING_QUEUE_ARTIFACT_FRAGMENT_BYTES as u64)
+                    .saturating_add(u64::from(progress.next_batch_index) - 1))
         || (progress.next_batch_index == 0
             && (progress.next_fragment_index != 0
                 || progress.selected_item_count != 0
@@ -1482,7 +1554,9 @@ pub enum PendingQueueArtifactError {
     ExpectedSelectedAwaitingAck,
     ExpectedCloseObserved,
     PreparedCandidateConflict,
+    SelectedCandidateConflict,
     ScanObservationMismatch,
+    StoredSourceScanDigestMismatch,
     InvalidMagic,
     UnknownCodecVersion(u16),
     PartitionSlotMismatch,
@@ -1677,8 +1751,8 @@ mod tests {
     #[test]
     fn append_is_reserved_fragmented_selected_and_ack_confirmed() {
         let open = bootstrap().candidate().clone();
-        let candidate = candidate(&[10, 11], &[b"first", b"second"]);
-        let plan = PendingQueueArtifactAppendPlan::try_new(&open, &candidate).unwrap();
+        let exact_candidate = candidate(&[10, 11], &[b"first", b"second"]);
+        let plan = PendingQueueArtifactAppendPlan::try_new(&open, &exact_candidate).unwrap();
         assert_eq!(plan.descriptor().batch_index().get(), 0);
         assert_eq!(plan.fragments().len(), 1);
         assert!(matches!(
@@ -1690,7 +1764,7 @@ mod tests {
             PendingQueueArtifactPhase::SelectedAwaitingAck { .. }
         ));
         assert_eq!(
-            PendingQueueArtifactAppendPlan::try_resume(plan.prepared(), &candidate)
+            PendingQueueArtifactAppendPlan::try_resume(plan.prepared(), &exact_candidate)
                 .unwrap(),
             plan,
         );
@@ -1704,6 +1778,46 @@ mod tests {
                 if progress.next_batch_index() == 1
         ));
         assert_eq!(ack.candidate().revision().get(), 4);
+
+        assert_eq!(
+            PendingQueueArtifactAppendPlan::try_resume_selected(
+                plan.selected(),
+                &exact_candidate,
+            )
+            .unwrap(),
+            plan,
+        );
+        let conflicting = candidate(
+            &[10, 11],
+            &[b"first".as_slice(), b"changed".as_slice()],
+        );
+        assert_eq!(
+            PendingQueueArtifactAppendPlan::try_resume_selected(
+                plan.selected(),
+                &conflicting,
+            ),
+            Err(PendingQueueArtifactError::SelectedCandidateConflict),
+        );
+        assert_eq!(
+            PendingQueueArtifactAppendPlan::try_resume_selected(&open, &exact_candidate),
+            Err(PendingQueueArtifactError::ExpectedSelectedAwaitingAck),
+        );
+    }
+
+    #[test]
+    fn physical_fragment_domain_is_tightly_bounded() {
+        assert_eq!(MAX_PENDING_QUEUE_ARTIFACT_TOTAL_FRAGMENTS, 1_279);
+        assert_eq!(MAX_PENDING_QUEUE_ARTIFACT_BUCKETS, 80);
+        assert_eq!(
+            PendingQueueArtifactFragmentIndex::try_new(1_278)
+                .unwrap()
+                .bucket(),
+            79,
+        );
+        assert_eq!(
+            PendingQueueArtifactFragmentIndex::try_new(1_279),
+            Err(PendingQueueArtifactError::FragmentIndexOutOfRange(1_279)),
+        );
     }
 
     #[test]
@@ -1771,6 +1885,14 @@ mod tests {
             verified.candidate().phase(),
             PendingQueueArtifactPhase::SourceScanned { .. }
         ));
+        assert_eq!(
+            PendingQueueArtifactScanObservation::verify(
+                verified.candidate(),
+                fragments.clone(),
+            )
+            .unwrap(),
+            observation,
+        );
 
         assert!(matches!(
             PendingQueueArtifactScanObservation::verify(

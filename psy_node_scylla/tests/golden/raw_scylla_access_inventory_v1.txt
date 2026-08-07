@@ -19,6 +19,8 @@ psy_node_scylla/src/core.rs|DriverCore|2|2|13|0|0|0|2|2
 psy_node_scylla/src/core_db.rs|DriverCore|0|0|97|0|0|0|0|0
 psy_node_scylla/src/rollback/authority_local_head_prototype.rs|DurableControlAuthority|6|0|3|6|2|3|1|4
 psy_node_scylla/src/rollback/authority_timestamp_prototype.rs|DurableControlAuthority|6|0|4|6|2|4|1|6
+psy_node_scylla/src/rollback/branch_exact_dual_write_executor.rs|RollbackPrototypeAdapter|3|0|13|3|1|13|0|11
+psy_node_scylla/src/rollback/branch_exact_pending_runtime.rs|DurableControlAuthority|4|0|0|0|0|0|0|0
 psy_node_scylla/src/rollback/branch_exact_schema_backfill_executor.rs|RollbackPrototypeAdapter|3|0|7|0|0|0|0|0
 psy_node_scylla/src/rollback/branch_exact_schema_deployment.rs|RollbackPrototypeAdapter|5|0|0|0|0|0|1|2
 psy_node_scylla/src/rollback/branch_exact_schema_deployment_lifecycle.rs|RollbackPrototypeAdapter|6|0|3|6|2|3|1|4
@@ -29,6 +31,8 @@ psy_node_scylla/src/rollback/branch_exact_schema_setup_rf3_gate.rs|TestHarness|4
 psy_node_scylla/src/rollback/branch_exact_shadow_audit.rs|DurableControlAuthority|6|0|3|6|2|3|1|4
 psy_node_scylla/src/rollback/branch_exact_shadow_reader.rs|RollbackPrototypeAdapter|4|0|11|15|1|11|0|6
 psy_node_scylla/src/rollback/branch_exact_shadow_reader_rf3_gate.rs|TestHarness|6|2|0|0|0|0|18|18
+psy_node_scylla/src/rollback/branch_exact_writer_lifecycle_store.rs|DurableControlAuthority|6|0|3|6|2|3|1|4
+psy_node_scylla/src/rollback/branch_exact_writer_runtime.rs|RollbackPrototypeAdapter|4|0|0|0|0|0|0|0
 psy_node_scylla/src/rollback/canonical_head_prototype.rs|CanonicalHeadAuthority|7|0|3|6|2|3|1|6
 psy_node_scylla/src/rollback/checkpoint_kiv.rs|RollbackPrototypeAdapter|6|0|0|4|1|2|0|2
 psy_node_scylla/src/rollback/checkpoint_merkle.rs|RollbackPrototypeAdapter|7|0|0|5|1|9|0|9
@@ -42,7 +46,9 @@ psy_node_scylla/src/rollback/namespace_prototype.rs|RollbackPrototypeAdapter|27|
 psy_node_scylla/src/rollback/normal_state_replay_rf3_gate.rs|TestHarness|7|2|3|0|0|0|22|22
 psy_node_scylla/src/rollback/pending_context.rs|RollbackPrototypeAdapter|4|0|0|4|1|2|0|3
 psy_node_scylla/src/rollback/pending_counter.rs|RollbackPrototypeAdapter|5|0|5|8|2|5|0|4
+psy_node_scylla/src/rollback/pending_generation_pipeline_store.rs|DurableControlAuthority|6|0|3|6|2|3|1|4
 psy_node_scylla/src/rollback/pending_namespace_rf3_gate.rs|TestHarness|4|2|0|0|0|0|5|5
+psy_node_scylla/src/rollback/pending_queue_artifact_store.rs|DurableControlAuthority|6|0|6|9|2|6|2|8
 psy_node_scylla/src/rollback/public_key_projection.rs|RollbackPrototypeAdapter|6|0|0|4|1|2|0|2
 psy_node_scylla/src/rollback/raw_access.rs|GuardImplementation|2|1|1|1|3|8|6|9
 psy_node_scylla/src/rollback/realm_imt_predecessor.rs|RollbackPrototypeAdapter|7|0|0|5|1|3|0|3

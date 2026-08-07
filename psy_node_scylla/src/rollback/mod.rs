@@ -30,6 +30,7 @@ mod branch_exact_pending_runtime;
 #[allow(dead_code)]
 mod branch_exact_pending_orchestration;
 mod pending_generation_pipeline_store;
+mod pending_queue_artifact_store;
 #[cfg(test)]
 mod branch_exact_shadow_reader_rf3_gate;
 #[cfg(test)]
@@ -86,6 +87,7 @@ pub use branch_exact_writer_lifecycle::*;
 pub use branch_exact_writer_lifecycle_store::*;
 pub use branch_exact_writer_runtime::*;
 pub use pending_generation_pipeline_store::*;
+pub use pending_queue_artifact_store::*;
 pub use authority_local_head_prototype::*;
 pub use authority_timestamp_prototype::*;
 pub use checkpoint_kiv::*;
