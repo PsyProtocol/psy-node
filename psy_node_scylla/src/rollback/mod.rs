@@ -22,6 +22,8 @@ mod branch_exact_schema_exporter;
 mod branch_exact_schema_setup;
 mod branch_exact_shadow_reader;
 mod branch_exact_shadow_audit;
+mod branch_exact_writer_lifecycle;
+mod branch_exact_writer_lifecycle_store;
 #[cfg(test)]
 mod branch_exact_shadow_reader_rf3_gate;
 #[cfg(test)]
@@ -74,6 +76,8 @@ pub use branch_exact_schema_exporter::*;
 pub use branch_exact_schema_setup::*;
 pub use branch_exact_shadow_reader::*;
 pub use branch_exact_shadow_audit::*;
+pub use branch_exact_writer_lifecycle::*;
+pub use branch_exact_writer_lifecycle_store::*;
 pub use authority_local_head_prototype::*;
 pub use authority_timestamp_prototype::*;
 pub use checkpoint_kiv::*;

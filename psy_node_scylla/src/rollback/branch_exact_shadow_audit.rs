@@ -38,6 +38,8 @@ const VERIFIED_DIGEST_DOMAIN: &[u8] =
     b"psy/rollback/branch-exact-shadow-verified/v1";
 const BLOCKED_DIGEST_DOMAIN: &[u8] =
     b"psy/rollback/branch-exact-shadow-blocked/v1";
+const CONSUMED_DIGEST_DOMAIN: &[u8] =
+    b"psy/rollback/branch-exact-shadow-consumed/v1";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct BranchExactShadowAuditGeneration(u64);
@@ -71,6 +73,10 @@ impl BranchExactShadowSourceReceiptDigest {
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
+
+    pub(crate) const fn from_persisted(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -79,6 +85,10 @@ pub struct BranchExactShadowAuditSlot([u8; 32]);
 impl BranchExactShadowAuditSlot {
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+
+    pub(crate) const fn from_persisted(bytes: [u8; 32]) -> Self {
+        Self(bytes)
     }
 }
 
@@ -160,6 +170,10 @@ impl BranchExactShadowVerifiedDigest {
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
+
+    pub(crate) const fn from_persisted(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -214,6 +228,51 @@ impl BranchExactShadowBlockedDigest {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct BranchExactShadowConsumedDigest([u8; 32]);
+
+impl BranchExactShadowConsumedDigest {
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BranchExactShadowConsumedReceipt {
+    verified: BranchExactShadowVerifiedReceipt,
+    writer_activation_digest: super::BranchExactWriterActivationDigest,
+    digest: BranchExactShadowConsumedDigest,
+}
+
+impl BranchExactShadowConsumedReceipt {
+    fn new(
+        verified: BranchExactShadowVerifiedReceipt,
+        writer_activation_digest: super::BranchExactWriterActivationDigest,
+    ) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(CONSUMED_DIGEST_DOMAIN);
+        hasher.update(verified.digest().as_bytes());
+        hasher.update(writer_activation_digest.as_bytes());
+        Self {
+            verified,
+            writer_activation_digest,
+            digest: BranchExactShadowConsumedDigest(hasher.finalize().into()),
+        }
+    }
+
+    pub const fn verified(&self) -> &BranchExactShadowVerifiedReceipt {
+        &self.verified
+    }
+
+    pub const fn writer_activation_digest(&self) -> super::BranchExactWriterActivationDigest {
+        self.writer_activation_digest
+    }
+
+    pub const fn digest(&self) -> BranchExactShadowConsumedDigest {
+        self.digest
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BranchExactShadowBlockedReceipt {
     plan: BranchExactShadowAuditPlan,
@@ -251,6 +310,7 @@ pub enum BranchExactShadowAuditState {
     Comparing(BranchExactShadowAuditPlan),
     Verified(BranchExactShadowVerifiedReceipt),
     Blocked(BranchExactShadowBlockedReceipt),
+    Consumed(BranchExactShadowConsumedReceipt),
 }
 
 impl BranchExactShadowAuditState {
@@ -259,6 +319,7 @@ impl BranchExactShadowAuditState {
             Self::Comparing(plan) => plan,
             Self::Verified(receipt) => receipt.plan(),
             Self::Blocked(receipt) => receipt.plan(),
+            Self::Consumed(receipt) => receipt.verified().plan(),
         }
     }
 }
@@ -360,7 +421,10 @@ impl SealedBranchExactShadowAuditCas {
         expected: &StoredBranchExactShadowAudit,
         receipt: BranchExactShadowBlockedReceipt,
     ) -> Result<Self, BranchExactShadowAuditError> {
-        if matches!(expected.state, BranchExactShadowAuditState::Blocked(_))
+        if matches!(
+            expected.state,
+            BranchExactShadowAuditState::Blocked(_) | BranchExactShadowAuditState::Consumed(_)
+        )
             || expected.state.plan() != receipt.plan()
         {
             return Err(BranchExactShadowAuditError::IllegalTransition);
@@ -373,6 +437,30 @@ impl SealedBranchExactShadowAuditCas {
                     .checked_add(1)
                     .ok_or(BranchExactShadowAuditError::RevisionOverflow)?,
                 state: BranchExactShadowAuditState::Blocked(receipt),
+            },
+        })
+    }
+
+    pub fn consume(
+        expected: &StoredBranchExactShadowAudit,
+        writer_activation_digest: super::BranchExactWriterActivationDigest,
+    ) -> Result<Self, BranchExactShadowAuditError> {
+        let BranchExactShadowAuditState::Verified(verified) = &expected.state else {
+            return Err(BranchExactShadowAuditError::IllegalTransition);
+        };
+        Ok(Self {
+            expected: expected.clone(),
+            candidate: StoredBranchExactShadowAudit {
+                revision: expected
+                    .revision
+                    .checked_add(1)
+                    .ok_or(BranchExactShadowAuditError::RevisionOverflow)?,
+                state: BranchExactShadowAuditState::Consumed(
+                    BranchExactShadowConsumedReceipt::new(
+                        verified.clone(),
+                        writer_activation_digest,
+                    ),
+                ),
             },
         })
     }
@@ -497,6 +585,11 @@ impl ScyllaBranchExactShadowAuditExecutor {
                     receipt.mismatch_digest(),
                 ))
             }
+            BranchExactShadowAuditState::Consumed(receipt) => {
+                return Err(BranchExactShadowAuditRunError::AlreadyConsumed(
+                    receipt.digest(),
+                ))
+            }
             BranchExactShadowAuditState::Comparing(_) => {}
         }
 
@@ -554,6 +647,9 @@ async fn persist_blocked(
         if matches!(current.state(), BranchExactShadowAuditState::Blocked(_)) {
             return Ok(());
         }
+        if matches!(current.state(), BranchExactShadowAuditState::Consumed(_)) {
+            return Err(BranchExactShadowAuditRunError::ConcurrentConflict);
+        }
         let sealed = SealedBranchExactShadowAuditCas::block(
             &current,
             blocked.clone(),
@@ -583,6 +679,9 @@ fn existing_terminal(
         BranchExactShadowAuditState::Comparing(_) => {
             Err(BranchExactShadowAuditRunError::ConcurrentConflict)
         }
+        BranchExactShadowAuditState::Consumed(receipt) => Err(
+            BranchExactShadowAuditRunError::AlreadyConsumed(receipt.digest()),
+        ),
     }
 }
 
@@ -594,6 +693,7 @@ pub enum BranchExactShadowAuditRunError {
         source: BranchExactShadowReadError,
     },
     PreviouslyBlocked(BranchExactShadowBlockedDigest),
+    AlreadyConsumed(BranchExactShadowConsumedDigest),
     ConcurrentConflict,
 }
 
@@ -770,7 +870,7 @@ impl ScyllaBranchExactShadowAuditStore {
     }
 }
 
-fn source_receipt_digest(
+pub(crate) fn source_receipt_digest(
     source: &BranchExactLegacyExportReceipt,
 ) -> BranchExactShadowSourceReceiptDigest {
     let mut hasher = Sha256::new();
@@ -863,6 +963,14 @@ fn encode_state(stored: &StoredBranchExactShadowAudit) -> Vec<u8> {
             encode_plan(receipt.plan(), &mut out);
             out.extend_from_slice(receipt.mismatch_digest.as_bytes());
         }
+        BranchExactShadowAuditState::Consumed(receipt) => {
+            out.push(4);
+            encode_plan(receipt.verified.plan(), &mut out);
+            out.extend_from_slice(receipt.verified.observation_digest.as_bytes());
+            out.extend_from_slice(receipt.verified.digest.as_bytes());
+            out.extend_from_slice(receipt.writer_activation_digest.as_bytes());
+            out.extend_from_slice(receipt.digest.as_bytes());
+        }
     }
     out
 }
@@ -900,14 +1008,50 @@ fn decode_state(bytes: &[u8]) -> Result<StoredBranchExactShadowAudit, BranchExac
             plan: decode_plan(&mut decoder)?,
             mismatch_digest: BranchExactShadowBlockedDigest(decoder.array32()?),
         }),
+        4 => {
+            let plan = decode_plan(&mut decoder)?;
+            let observation_digest = BranchExactShadowAuditDigest::from_persisted(decoder.array32()?);
+            let verified_digest = BranchExactShadowVerifiedDigest(decoder.array32()?);
+            let mut verified_hasher = Sha256::new();
+            verified_hasher.update(VERIFIED_DIGEST_DOMAIN);
+            verified_hasher.update(plan.digest.as_bytes());
+            verified_hasher.update(observation_digest.as_bytes());
+            if verified_digest != BranchExactShadowVerifiedDigest(verified_hasher.finalize().into()) {
+                return Err(BranchExactShadowAuditError::ReceiptDigestMismatch);
+            }
+            let writer_activation_digest = super::BranchExactWriterActivationDigest::from_persisted(decoder.array32()?);
+            let digest = BranchExactShadowConsumedDigest(decoder.array32()?);
+            let receipt = BranchExactShadowConsumedReceipt::new(
+                BranchExactShadowVerifiedReceipt {
+                    plan,
+                    observation_digest,
+                    digest: verified_digest,
+                },
+                writer_activation_digest,
+            );
+            if receipt.digest != digest {
+                return Err(BranchExactShadowAuditError::ReceiptDigestMismatch);
+            }
+            BranchExactShadowAuditState::Consumed(receipt)
+        }
         kind => return Err(BranchExactShadowAuditError::UnknownStateKind(kind)),
     };
     if !decoder.is_done() {
         return Err(BranchExactShadowAuditError::TrailingBytes);
     }
     if (revision == 0 && !matches!(state, BranchExactShadowAuditState::Comparing(_)))
-        || (revision == 1 && matches!(state, BranchExactShadowAuditState::Comparing(_)))
-        || (revision == 2 && !matches!(state, BranchExactShadowAuditState::Blocked(_)))
+        || (revision == 1
+            && !matches!(
+                state,
+                BranchExactShadowAuditState::Verified(_)
+                    | BranchExactShadowAuditState::Blocked(_)
+            ))
+        || (revision == 2
+            && !matches!(
+                state,
+                BranchExactShadowAuditState::Blocked(_)
+                    | BranchExactShadowAuditState::Consumed(_)
+            ))
         || revision > 2
     {
         return Err(BranchExactShadowAuditError::RevisionStateMismatch);
@@ -1097,6 +1241,38 @@ mod tests {
                 dominant.candidate(),
                 blocked,
             ),
+            Err(BranchExactShadowAuditError::IllegalTransition)
+        );
+    }
+
+    #[test]
+    fn writer_consumption_is_durable_and_blocks_late_mismatch() {
+        let (plan, observation) = fixture();
+        let initial = StoredBranchExactShadowAudit::comparing(plan.clone());
+        let receipt = BranchExactShadowVerifiedReceipt::try_new(plan, &observation).unwrap();
+        let verified = SealedBranchExactShadowAuditCas::verify(&initial, receipt).unwrap();
+        let activation = crate::rollback::BranchExactWriterActivationDigest::from_persisted([9; 32]);
+        let consumed = SealedBranchExactShadowAuditCas::consume(
+            verified.candidate(),
+            activation,
+        )
+        .unwrap();
+        assert_eq!(consumed.candidate().revision(), 2);
+        let bytes = consumed.candidate().encode_state();
+        let decoded = StoredBranchExactShadowAudit::decode(
+            consumed.candidate().slot().as_bytes(),
+            2,
+            &bytes,
+        )
+        .unwrap();
+        assert_eq!(&decoded, consumed.candidate());
+
+        let blocked = BranchExactShadowBlockedReceipt::from_error(
+            consumed.candidate().state().plan().clone(),
+            &BranchExactShadowReadError::DatasetMismatch,
+        );
+        assert_eq!(
+            SealedBranchExactShadowAuditCas::block(consumed.candidate(), blocked),
             Err(BranchExactShadowAuditError::IllegalTransition)
         );
     }
