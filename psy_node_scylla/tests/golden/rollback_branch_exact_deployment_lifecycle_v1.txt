@@ -1,0 +1,8 @@
+CreateTable|
+CREATE TABLE IF NOT EXISTS psy_h14_nt.branch_exact_schema_deployment_lifecycle (deployment_slot blob PRIMARY KEY, revision bigint, lifecycle blob)
+Read|deployment_slot:BLOB
+SELECT deployment_slot, revision, lifecycle FROM psy_h14_nt.branch_exact_schema_deployment_lifecycle WHERE deployment_slot = ?
+Bootstrap|deployment_slot:BLOB,candidate_revision:BIGINT,candidate_lifecycle:BLOB
+INSERT INTO psy_h14_nt.branch_exact_schema_deployment_lifecycle (deployment_slot, revision, lifecycle) VALUES (?, ?, ?) IF NOT EXISTS
+CompareAndSet|candidate_revision:BIGINT,candidate_lifecycle:BLOB,deployment_slot:BLOB,expected_revision:BIGINT,expected_lifecycle:BLOB
+UPDATE psy_h14_nt.branch_exact_schema_deployment_lifecycle SET revision = ?, lifecycle = ? WHERE deployment_slot = ? IF revision = ? AND lifecycle = ?
