@@ -12,6 +12,9 @@ use parth_core::{
     protocol::core_types::Q256BitHash,
 };
 use psy_node_core::store::{
+    branch_exact_schema::{
+        BranchExactLogicalTableId, BRANCH_EXACT_TARGET_LOGICAL_TABLE_COUNT,
+    },
     branch_pending_mapping::{
         BranchPendingMapping, BranchPendingMappingDigest,
     },
@@ -30,12 +33,200 @@ use scylla::{
 
 use super::{CqlKeyspaceName, PrototypeBindValue};
 
+pub const ACTIVE_PHYSICAL_TABLE_COUNT: usize = 35;
+pub const BRANCH_EXACT_PHYSICAL_EXTENSION_COUNT: usize = 3;
+pub const BRANCH_EXACT_TARGET_PHYSICAL_TABLE_COUNT: usize =
+    ACTIVE_PHYSICAL_TABLE_COUNT + BRANCH_EXACT_PHYSICAL_EXTENSION_COUNT;
+pub const ACTIVE_KEY_DOMAIN_COUNT: usize = 39;
+pub const BRANCH_EXACT_KEY_DOMAIN_EXTENSION_COUNT: usize = 3;
+pub const BRANCH_EXACT_TARGET_KEY_DOMAIN_COUNT: usize =
+    ACTIVE_KEY_DOMAIN_COUNT + BRANCH_EXACT_KEY_DOMAIN_EXTENSION_COUNT;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BranchExactSchemaInventoryCounts {
+    pub active_logical: usize,
+    pub active_physical: usize,
+    pub active_key_domains: usize,
+    pub target_logical: usize,
+    pub target_physical: usize,
+    pub target_key_domains: usize,
+}
+
+pub const BRANCH_EXACT_SCHEMA_INVENTORY_COUNTS: BranchExactSchemaInventoryCounts =
+    BranchExactSchemaInventoryCounts {
+        active_logical: 32,
+        active_physical: ACTIVE_PHYSICAL_TABLE_COUNT,
+        active_key_domains: ACTIVE_KEY_DOMAIN_COUNT,
+        target_logical: BRANCH_EXACT_TARGET_LOGICAL_TABLE_COUNT,
+        target_physical: BRANCH_EXACT_TARGET_PHYSICAL_TABLE_COUNT,
+        target_key_domains: BRANCH_EXACT_TARGET_KEY_DOMAIN_COUNT,
+    };
+
+/// Stable physical identities reserved after the active `1..=35` registry.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(u16)]
+pub enum BranchExactPhysicalTableId {
+    CanonicalChainRefToPendingId = 36,
+    PendingIdToCanonicalChainRef = 37,
+    PendingRewardTopProof = 38,
+}
+
+impl BranchExactPhysicalTableId {
+    pub const ALL: [Self; 3] = [
+        Self::CanonicalChainRefToPendingId,
+        Self::PendingIdToCanonicalChainRef,
+        Self::PendingRewardTopProof,
+    ];
+
+    pub const fn stable_id(self) -> u16 {
+        self as u16
+    }
+}
+
+/// Stable semantic domains reserved after the active `1..=39` registry.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(u16)]
+pub enum BranchExactKeyDomain {
+    CanonicalChainRefToPendingId = 40,
+    PendingIdToCanonicalChainRef = 41,
+    PendingRewardTopProof = 42,
+}
+
+impl BranchExactKeyDomain {
+    pub const ALL: [Self; 3] = [
+        Self::CanonicalChainRefToPendingId,
+        Self::PendingIdToCanonicalChainRef,
+        Self::PendingRewardTopProof,
+    ];
+
+    pub const fn stable_id(self) -> u16 {
+        self as u16
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BranchExactTargetAuthority {
+    Shared,
+    Realm,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BranchExactTargetClassification {
+    Operational,
+    Derived,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BranchExactTargetAxis {
+    CanonicalChainRefPartition,
+    UniquePendingPartition,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BranchExactTargetAction {
+    PreserveAppendOnly,
+    RotatePendingNamespace,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BranchExactTargetManifest {
+    PairPhysicalDirection,
+    ExactMutation,
+}
+
+/// The target is deliberately not part of production setup yet.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BranchExactTargetReadiness {
+    ReservedNotMaterialized,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BranchExactSchemaTargetDescriptor {
+    pub logical: BranchExactLogicalTableId,
+    pub physical: BranchExactPhysicalTableId,
+    pub key_domain: BranchExactKeyDomain,
+    pub physical_name: &'static str,
+    pub routing_key: u64,
+    pub cql_primary_key: &'static str,
+    pub authority: BranchExactTargetAuthority,
+    pub classification: BranchExactTargetClassification,
+    pub axis: BranchExactTargetAxis,
+    pub action: BranchExactTargetAction,
+    pub manifest: BranchExactTargetManifest,
+    pub readiness: BranchExactTargetReadiness,
+}
+
+pub const BRANCH_EXACT_SCHEMA_TARGETS: [BranchExactSchemaTargetDescriptor; 3] = [
+    BranchExactSchemaTargetDescriptor {
+        logical: BranchExactLogicalTableId::CanonicalChainRefToPendingId,
+        physical: BranchExactPhysicalTableId::CanonicalChainRefToPendingId,
+        key_domain: BranchExactKeyDomain::CanonicalChainRefToPendingId,
+        physical_name: BranchExactLogicalTableId::CanonicalChainRefToPendingId
+            .table_name(),
+        routing_key: BranchExactLogicalTableId::CanonicalChainRefToPendingId
+            .routing_key(),
+        cql_primary_key: "PRIMARY KEY ((canonical_ref), pending_id)",
+        authority: BranchExactTargetAuthority::Shared,
+        classification: BranchExactTargetClassification::Operational,
+        axis: BranchExactTargetAxis::CanonicalChainRefPartition,
+        action: BranchExactTargetAction::PreserveAppendOnly,
+        manifest: BranchExactTargetManifest::PairPhysicalDirection,
+        readiness: BranchExactTargetReadiness::ReservedNotMaterialized,
+    },
+    BranchExactSchemaTargetDescriptor {
+        logical: BranchExactLogicalTableId::PendingIdToCanonicalChainRef,
+        physical: BranchExactPhysicalTableId::PendingIdToCanonicalChainRef,
+        key_domain: BranchExactKeyDomain::PendingIdToCanonicalChainRef,
+        physical_name: BranchExactLogicalTableId::PendingIdToCanonicalChainRef
+            .table_name(),
+        routing_key: BranchExactLogicalTableId::PendingIdToCanonicalChainRef
+            .routing_key(),
+        cql_primary_key: "PRIMARY KEY ((pending_id), canonical_ref)",
+        authority: BranchExactTargetAuthority::Shared,
+        classification: BranchExactTargetClassification::Operational,
+        axis: BranchExactTargetAxis::UniquePendingPartition,
+        action: BranchExactTargetAction::PreserveAppendOnly,
+        manifest: BranchExactTargetManifest::PairPhysicalDirection,
+        readiness: BranchExactTargetReadiness::ReservedNotMaterialized,
+    },
+    BranchExactSchemaTargetDescriptor {
+        logical: BranchExactLogicalTableId::PendingRewardTopProof,
+        physical: BranchExactPhysicalTableId::PendingRewardTopProof,
+        key_domain: BranchExactKeyDomain::PendingRewardTopProof,
+        physical_name: BranchExactLogicalTableId::PendingRewardTopProof.table_name(),
+        routing_key: BranchExactLogicalTableId::PendingRewardTopProof.routing_key(),
+        cql_primary_key: "PRIMARY KEY ((pending_id))",
+        authority: BranchExactTargetAuthority::Realm,
+        classification: BranchExactTargetClassification::Derived,
+        axis: BranchExactTargetAxis::UniquePendingPartition,
+        action: BranchExactTargetAction::RotatePendingNamespace,
+        manifest: BranchExactTargetManifest::ExactMutation,
+        readiness: BranchExactTargetReadiness::ReservedNotMaterialized,
+    },
+];
+
 pub const BRANCH_TO_PENDING_TABLE: &str =
-    "d04b6h9_canonical_ref_to_pending";
+    BranchExactLogicalTableId::CanonicalChainRefToPendingId.table_name();
 pub const PENDING_TO_BRANCH_TABLE: &str =
-    "d04b6h9_pending_to_canonical_ref";
+    BranchExactLogicalTableId::PendingIdToCanonicalChainRef.table_name();
 pub const PENDING_REWARD_PROOF_TABLE: &str =
-    "d04b6h9_pending_reward_top_proof";
+    BranchExactLogicalTableId::PendingRewardTopProof.table_name();
+
+pub const fn branch_exact_schema_target(
+    logical: BranchExactLogicalTableId,
+) -> BranchExactSchemaTargetDescriptor {
+    match logical {
+        BranchExactLogicalTableId::CanonicalChainRefToPendingId => {
+            BRANCH_EXACT_SCHEMA_TARGETS[0]
+        }
+        BranchExactLogicalTableId::PendingIdToCanonicalChainRef => {
+            BRANCH_EXACT_SCHEMA_TARGETS[1]
+        }
+        BranchExactLogicalTableId::PendingRewardTopProof => {
+            BRANCH_EXACT_SCHEMA_TARGETS[2]
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[repr(u8)]
@@ -114,7 +305,7 @@ impl BranchExactQueries {
                 query(
                     BranchExactQueryId::CreatePendingRewardProof,
                     format!(
-                        "CREATE TABLE IF NOT EXISTS {proof} (pending_id bigint PRIMARY KEY, value blob)"
+                        "CREATE TABLE IF NOT EXISTS {proof} (pending_id bigint, value blob, PRIMARY KEY ((pending_id)))"
                     ),
                     &[],
                 ),
@@ -550,6 +741,8 @@ async fn prepare(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use parth_core::{
         PHash,
         crypto::hash::tag_tree::TagTreeMerkleProof,
@@ -559,9 +752,14 @@ mod tests {
         CanonicalChainRef, ChainEpoch, CheckpointHash, CheckpointId,
         CheckpointRef, NetworkId,
     };
+    use strum::IntoEnumIterator;
 
     use super::*;
-    use crate::rollback::PRODUCTION_CQL_CAPABILITIES;
+    use crate::rollback::{
+        physical_descriptor, setup_catalog, ScyllaKeyDomain,
+        ScyllaPhysicalTableId,
+        PRODUCTION_CQL_CAPABILITIES,
+    };
 
     fn chain(epoch: u64, height: u64, byte: u8) -> CanonicalChainRef<PHash> {
         CanonicalChainRef::new(
@@ -595,6 +793,96 @@ mod tests {
         assert!(reverse.contains("PRIMARY KEY ((pending_id), canonical_ref)"));
         assert!(!forward.contains("checkpoint_id"));
         assert!(!reverse.contains("checkpoint_id"));
+    }
+
+    #[test]
+    fn stable_extension_ids_are_contiguous_and_do_not_renumber_active_ids() {
+        assert_eq!(
+            ScyllaPhysicalTableId::iter()
+                .map(ScyllaPhysicalTableId::stable_id)
+                .collect::<Vec<_>>(),
+            (1_u16..=35).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            ScyllaKeyDomain::iter()
+                .map(ScyllaKeyDomain::stable_id)
+                .collect::<Vec<_>>(),
+            (1_u16..=39).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            BranchExactPhysicalTableId::ALL
+                .map(BranchExactPhysicalTableId::stable_id),
+            [36, 37, 38]
+        );
+        assert_eq!(
+            BranchExactKeyDomain::ALL.map(BranchExactKeyDomain::stable_id),
+            [40, 41, 42]
+        );
+        assert_eq!(
+            BRANCH_EXACT_SCHEMA_INVENTORY_COUNTS,
+            BranchExactSchemaInventoryCounts {
+                active_logical: 32,
+                active_physical: 35,
+                active_key_domains: 39,
+                target_logical: 35,
+                target_physical: 38,
+                target_key_domains: 42,
+            }
+        );
+    }
+
+    #[test]
+    fn target_descriptors_are_exhaustive_unique_and_not_materialized() {
+        let names = BRANCH_EXACT_SCHEMA_TARGETS
+            .iter()
+            .map(|descriptor| descriptor.physical_name)
+            .collect::<BTreeSet<_>>();
+        let active_names = ScyllaPhysicalTableId::iter()
+            .map(|physical| physical_descriptor(physical).physical_name)
+            .collect::<BTreeSet<_>>();
+        let routing_keys = BRANCH_EXACT_SCHEMA_TARGETS
+            .iter()
+            .map(|descriptor| descriptor.routing_key)
+            .collect::<Vec<_>>();
+        assert_eq!(names.len(), 3);
+        assert!(names.is_disjoint(&active_names));
+        assert_eq!(routing_keys, vec![33, 34, 35]);
+        assert_eq!(setup_catalog().len(), 32);
+        for logical in BranchExactLogicalTableId::ALL {
+            let descriptor = branch_exact_schema_target(logical);
+            assert_eq!(descriptor.logical, logical);
+            assert_eq!(
+                descriptor.readiness,
+                BranchExactTargetReadiness::ReservedNotMaterialized
+            );
+            assert_eq!(descriptor.physical_name, logical.table_name());
+            assert!(!descriptor.physical_name.starts_with("d04"));
+        }
+    }
+
+    #[test]
+    fn query_factory_uses_the_reserved_names_and_primary_keys() {
+        let queries =
+            BranchExactQueries::new(&CqlKeyspaceName::try_new("ks").unwrap());
+        for (query_id, logical) in [
+            (
+                BranchExactQueryId::CreateBranchToPending,
+                BranchExactLogicalTableId::CanonicalChainRefToPendingId,
+            ),
+            (
+                BranchExactQueryId::CreatePendingToBranch,
+                BranchExactLogicalTableId::PendingIdToCanonicalChainRef,
+            ),
+            (
+                BranchExactQueryId::CreatePendingRewardProof,
+                BranchExactLogicalTableId::PendingRewardTopProof,
+            ),
+        ] {
+            let descriptor = branch_exact_schema_target(logical);
+            let cql = queries.get(query_id).cql();
+            assert!(cql.contains(descriptor.physical_name));
+            assert!(cql.contains(descriptor.cql_primary_key));
+        }
     }
 
     #[test]
@@ -698,7 +986,7 @@ mod tests {
         assert!(queries
             .get(BranchExactQueryId::CreatePendingRewardProof)
             .cql()
-            .contains("pending_id bigint PRIMARY KEY"));
+            .contains("PRIMARY KEY ((pending_id))"));
         assert!(!queries
             .get(BranchExactQueryId::CreatePendingRewardProof)
             .cql()
