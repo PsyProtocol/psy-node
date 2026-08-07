@@ -433,6 +433,22 @@ pub struct ScyllaBranchExactBackfillExecutor {
     plan_digest: super::BranchExactBackfillPlanDigest,
 }
 
+/// Observable durable-work boundaries inside one idempotent backfill chunk.
+///
+/// The deployment runner uses these boundaries to inject process-loss errors
+/// and prove that retrying the same timestamp-bound plan is safe.  They do not
+/// grant access to the underlying session or allow callers to alter a
+/// mutation.  Returning an error from the observer stops before a chunk
+/// receipt is issued, so the durable lifecycle cannot advance past work that
+/// was not completely read back.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BranchExactBackfillExecutionBoundary {
+    ChunkStarted,
+    MappingPairWritten { row_offset: u32 },
+    RewardProofWritten { row_offset: u32 },
+    PointReadbackComplete { row_offset: u32 },
+}
+
 impl ScyllaBranchExactBackfillExecutor {
     pub async fn prepare(
         session: Arc<Session>,
@@ -468,13 +484,45 @@ impl ScyllaBranchExactBackfillExecutor {
         artifact: &BranchExactBackfillArtifact<Hash>,
         chunk_index: u32,
     ) -> anyhow::Result<BranchExactBackfillChunkReceipt> {
+        self.execute_chunk_observed(
+            plan,
+            artifact,
+            chunk_index,
+            |_| Ok(()),
+        )
+        .await
+    }
+
+    /// Executes the same production-shaped path as [`Self::execute_chunk`]
+    /// while reporting immutable crash-test boundaries.
+    ///
+    /// This remains a prototype/deployment-tooling API.  The observer cannot
+    /// change the sealed plan, timestamp, branch identity, payload, or query.
+    pub async fn execute_chunk_observed<Hash, Observe>(
+        &self,
+        plan: &BranchExactBackfillPlan,
+        artifact: &BranchExactBackfillArtifact<Hash>,
+        chunk_index: u32,
+        mut observe: Observe,
+    ) -> anyhow::Result<BranchExactBackfillChunkReceipt>
+    where
+        Hash: Q256BitHash,
+        Observe: FnMut(BranchExactBackfillExecutionBoundary) -> anyhow::Result<()>,
+    {
         self.validate_bound_plan(plan, artifact)?;
         let chunk = artifact.chunk(plan, chunk_index)?;
-        for row in chunk.rows {
-            self.write_row(plan, row).await?;
+        observe(BranchExactBackfillExecutionBoundary::ChunkStarted)?;
+        for (row_offset, row) in chunk.rows.iter().enumerate() {
+            self.write_row(plan, row, row_offset as u32, &mut observe)
+                .await?;
         }
-        for row in chunk.rows {
+        for (row_offset, row) in chunk.rows.iter().enumerate() {
             self.verify_row(plan, row).await?;
+            observe(
+                BranchExactBackfillExecutionBoundary::PointReadbackComplete {
+                    row_offset: row_offset as u32,
+                },
+            )?;
         }
         Ok(BranchExactBackfillChunkReceipt::try_new(
             plan.digest(),
@@ -523,16 +571,27 @@ impl ScyllaBranchExactBackfillExecutor {
         Ok(())
     }
 
-    async fn write_row<Hash: Q256BitHash>(
+    async fn write_row<Hash, Observe>(
         &self,
         plan: &BranchExactBackfillPlan,
         row: &BranchExactBackfillArtifactRow<Hash>,
-    ) -> anyhow::Result<()> {
+        row_offset: u32,
+        observe: &mut Observe,
+    ) -> anyhow::Result<()>
+    where
+        Hash: Q256BitHash,
+        Observe: FnMut(BranchExactBackfillExecutionBoundary) -> anyhow::Result<()>,
+    {
         let timestamp = plan
             .write_timestamp()
             .ok_or_else(|| anyhow::anyhow!("durable plan omitted write timestamp"))?;
         let pair = BranchPendingPairPutPlan::new(*row.mapping(), timestamp);
         self.adapter.put_pair(&self.session, &pair).await?;
+        observe(
+            BranchExactBackfillExecutionBoundary::MappingPairWritten {
+                row_offset,
+            },
+        )?;
         if let Some(proof) = row.decode_reward_proof()? {
             let proof_plan = PendingRewardProofPutPlan::try_new(
                 row.mapping().pending_id(),
@@ -542,6 +601,11 @@ impl ScyllaBranchExactBackfillExecutor {
             self.adapter
                 .put_pending_reward_proof(&self.session, &proof_plan)
                 .await?;
+            observe(
+                BranchExactBackfillExecutionBoundary::RewardProofWritten {
+                    row_offset,
+                },
+            )?;
         }
         Ok(())
     }
