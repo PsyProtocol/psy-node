@@ -13,15 +13,20 @@ use parth_core::{
 };
 use psy_node_core::store::{
     branch_exact_schema::{
-        BranchExactLogicalTableId, BRANCH_EXACT_TARGET_LOGICAL_TABLE_COUNT,
+        BranchExactLogicalTableId, BranchExactMaterializationPlanDigest,
+        BranchExactSchemaMaterializationPlan, AuthorityScope,
+        BRANCH_EXACT_SCHEMA_VERSION,
+        BRANCH_EXACT_TARGET_LOGICAL_TABLE_COUNT,
     },
     branch_pending_mapping::{
         BranchPendingMapping, BranchPendingMappingDigest,
     },
+    canonical_head::CanonicalHeadBootstrapProfile,
     timestamp::CommitWriteTimestampUs,
     typed::UniquePendingId,
 };
 use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
+use sha2::{Digest, Sha256};
 use scylla::{
     client::session::Session,
     statement::{
@@ -240,6 +245,26 @@ pub enum BranchExactQueryId {
     ReadBranchToPending = 7,
     ReadPendingToBranch = 8,
     ReadPendingRewardProof = 9,
+    InspectTableColumns = 10,
+}
+
+const COORDINATOR_BRANCH_EXACT_CREATE_QUERIES: &[BranchExactQueryId] = &[
+    BranchExactQueryId::CreateBranchToPending,
+    BranchExactQueryId::CreatePendingToBranch,
+];
+const REALM_BRANCH_EXACT_CREATE_QUERIES: &[BranchExactQueryId] = &[
+    BranchExactQueryId::CreateBranchToPending,
+    BranchExactQueryId::CreatePendingToBranch,
+    BranchExactQueryId::CreatePendingRewardProof,
+];
+
+pub const fn branch_exact_create_queries(
+    authority: AuthorityScope,
+) -> &'static [BranchExactQueryId] {
+    match authority {
+        AuthorityScope::Coordinator => COORDINATOR_BRANCH_EXACT_CREATE_QUERIES,
+        AuthorityScope::Realm { .. } => REALM_BRANCH_EXACT_CREATE_QUERIES,
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -266,7 +291,7 @@ impl BranchExactQuery {
 /// Single source of CQL for the prototype adapter and query-golden tests.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BranchExactQueries {
-    queries: [BranchExactQuery; 9],
+    queries: [BranchExactQuery; 10],
 }
 
 impl BranchExactQueries {
@@ -351,6 +376,11 @@ impl BranchExactQueries {
                     ),
                     &["BIGINT"],
                 ),
+                query(
+                    BranchExactQueryId::InspectTableColumns,
+                    "SELECT column_name, type, kind, position, clustering_order FROM system_schema.columns WHERE keyspace_name = ? AND table_name = ?".to_owned(),
+                    &["TEXT", "TEXT"],
+                ),
             ],
         }
     }
@@ -376,6 +406,360 @@ impl BranchExactQueries {
         output
     }
 }
+
+const BRANCH_EXACT_SCHEMA_FINGERPRINT_DOMAIN: &[u8] =
+    b"psy/rollback/branch-exact-schema-fingerprint/v1";
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum BranchExactColumnKind {
+    PartitionKey,
+    Clustering,
+    Regular,
+}
+
+impl BranchExactColumnKind {
+    const fn as_system_schema_str(self) -> &'static str {
+        match self {
+            Self::PartitionKey => "partition_key",
+            Self::Clustering => "clustering",
+            Self::Regular => "regular",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum BranchExactClusteringOrder {
+    Asc,
+    None,
+}
+
+impl BranchExactClusteringOrder {
+    const fn as_system_schema_str(self) -> &'static str {
+        match self {
+            Self::Asc => "asc",
+            Self::None => "none",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct BranchExactColumnSpec {
+    pub physical: BranchExactPhysicalTableId,
+    pub column_name: &'static str,
+    pub cql_type: &'static str,
+    pub kind: BranchExactColumnKind,
+    pub position: i32,
+    pub clustering_order: BranchExactClusteringOrder,
+}
+
+pub const BRANCH_EXACT_EXPECTED_COLUMNS: [BranchExactColumnSpec; 6] = [
+    BranchExactColumnSpec {
+        physical: BranchExactPhysicalTableId::CanonicalChainRefToPendingId,
+        column_name: "canonical_ref",
+        cql_type: "blob",
+        kind: BranchExactColumnKind::PartitionKey,
+        position: 0,
+        clustering_order: BranchExactClusteringOrder::None,
+    },
+    BranchExactColumnSpec {
+        physical: BranchExactPhysicalTableId::CanonicalChainRefToPendingId,
+        column_name: "pending_id",
+        cql_type: "bigint",
+        kind: BranchExactColumnKind::Clustering,
+        position: 0,
+        clustering_order: BranchExactClusteringOrder::Asc,
+    },
+    BranchExactColumnSpec {
+        physical: BranchExactPhysicalTableId::PendingIdToCanonicalChainRef,
+        column_name: "pending_id",
+        cql_type: "bigint",
+        kind: BranchExactColumnKind::PartitionKey,
+        position: 0,
+        clustering_order: BranchExactClusteringOrder::None,
+    },
+    BranchExactColumnSpec {
+        physical: BranchExactPhysicalTableId::PendingIdToCanonicalChainRef,
+        column_name: "canonical_ref",
+        cql_type: "blob",
+        kind: BranchExactColumnKind::Clustering,
+        position: 0,
+        clustering_order: BranchExactClusteringOrder::Asc,
+    },
+    BranchExactColumnSpec {
+        physical: BranchExactPhysicalTableId::PendingRewardTopProof,
+        column_name: "pending_id",
+        cql_type: "bigint",
+        kind: BranchExactColumnKind::PartitionKey,
+        position: 0,
+        clustering_order: BranchExactClusteringOrder::None,
+    },
+    BranchExactColumnSpec {
+        physical: BranchExactPhysicalTableId::PendingRewardTopProof,
+        column_name: "value",
+        cql_type: "blob",
+        kind: BranchExactColumnKind::Regular,
+        position: -1,
+        clustering_order: BranchExactClusteringOrder::None,
+    },
+];
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ObservedBranchExactColumn {
+    pub physical: BranchExactPhysicalTableId,
+    pub column_name: String,
+    pub cql_type: String,
+    pub kind: String,
+    pub position: i32,
+    pub clustering_order: String,
+}
+
+impl From<BranchExactColumnSpec> for ObservedBranchExactColumn {
+    fn from(spec: BranchExactColumnSpec) -> Self {
+        Self {
+            physical: spec.physical,
+            column_name: spec.column_name.to_owned(),
+            cql_type: spec.cql_type.to_owned(),
+            kind: spec.kind.as_system_schema_str().to_owned(),
+            position: spec.position,
+            clustering_order: spec
+                .clustering_order
+                .as_system_schema_str()
+                .to_owned(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct BranchExactSchemaFingerprint([u8; 32]);
+
+impl BranchExactSchemaFingerprint {
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BranchExactSchemaInspection {
+    Absent,
+    Partial {
+        present: Vec<BranchExactPhysicalTableId>,
+        missing: Vec<BranchExactPhysicalTableId>,
+    },
+    Exact {
+        fingerprint: BranchExactSchemaFingerprint,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BranchExactSchemaInspectionError {
+    IncompatibleTable {
+        physical: BranchExactPhysicalTableId,
+        expected: Vec<ObservedBranchExactColumn>,
+        observed: Vec<ObservedBranchExactColumn>,
+    },
+    UnexpectedTableForAuthority {
+        authority: AuthorityScope,
+        physical: BranchExactPhysicalTableId,
+    },
+}
+
+impl fmt::Display for BranchExactSchemaInspectionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl Error for BranchExactSchemaInspectionError {}
+
+pub fn inspect_branch_exact_columns(
+    authority: AuthorityScope,
+    observed: Vec<ObservedBranchExactColumn>,
+) -> Result<BranchExactSchemaInspection, BranchExactSchemaInspectionError> {
+    let mut present = Vec::new();
+    let mut missing = Vec::new();
+    for physical in BranchExactPhysicalTableId::ALL {
+        let required = branch_exact_physical_applies_to_authority(physical, authority);
+        let mut expected = BRANCH_EXACT_EXPECTED_COLUMNS
+            .iter()
+            .copied()
+            .filter(|column| column.physical == physical)
+            .map(ObservedBranchExactColumn::from)
+            .collect::<Vec<_>>();
+        let mut actual = observed
+            .iter()
+            .filter(|column| column.physical == physical)
+            .cloned()
+            .collect::<Vec<_>>();
+        expected.sort();
+        actual.sort();
+        if !required {
+            if !actual.is_empty() {
+                return Err(
+                    BranchExactSchemaInspectionError::UnexpectedTableForAuthority {
+                        authority,
+                        physical,
+                    },
+                );
+            }
+            continue;
+        }
+        if actual.is_empty() {
+            missing.push(physical);
+        } else if actual == expected {
+            present.push(physical);
+        } else {
+            return Err(BranchExactSchemaInspectionError::IncompatibleTable {
+                physical,
+                expected,
+                observed: actual,
+            });
+        }
+    }
+    if present.is_empty() {
+        Ok(BranchExactSchemaInspection::Absent)
+    } else if missing.is_empty() {
+        Ok(BranchExactSchemaInspection::Exact {
+            fingerprint: branch_exact_schema_fingerprint(authority),
+        })
+    } else {
+        Ok(BranchExactSchemaInspection::Partial { present, missing })
+    }
+}
+
+pub fn branch_exact_schema_fingerprint(
+    authority: AuthorityScope,
+) -> BranchExactSchemaFingerprint {
+    let mut hasher = Sha256::new();
+    hasher.update(BRANCH_EXACT_SCHEMA_FINGERPRINT_DOMAIN);
+    hasher.update(BRANCH_EXACT_SCHEMA_VERSION.to_be_bytes());
+    update_authority_fingerprint(&mut hasher, authority);
+    for spec in BRANCH_EXACT_EXPECTED_COLUMNS
+        .into_iter()
+        .filter(|spec| branch_exact_physical_applies_to_authority(spec.physical, authority))
+    {
+        hasher.update(spec.physical.stable_id().to_be_bytes());
+        update_len_prefixed(&mut hasher, spec.column_name.as_bytes());
+        update_len_prefixed(&mut hasher, spec.cql_type.as_bytes());
+        update_len_prefixed(&mut hasher, spec.kind.as_system_schema_str().as_bytes());
+        hasher.update(spec.position.to_be_bytes());
+        update_len_prefixed(
+            &mut hasher,
+            spec.clustering_order.as_system_schema_str().as_bytes(),
+        );
+    }
+    BranchExactSchemaFingerprint(hasher.finalize().into())
+}
+
+const fn branch_exact_physical_applies_to_authority(
+    physical: BranchExactPhysicalTableId,
+    authority: AuthorityScope,
+) -> bool {
+    match physical {
+        BranchExactPhysicalTableId::CanonicalChainRefToPendingId
+        | BranchExactPhysicalTableId::PendingIdToCanonicalChainRef => true,
+        BranchExactPhysicalTableId::PendingRewardTopProof => {
+            matches!(authority, AuthorityScope::Realm { .. })
+        }
+    }
+}
+
+fn update_authority_fingerprint(hasher: &mut Sha256, authority: AuthorityScope) {
+    match authority {
+        AuthorityScope::Coordinator => hasher.update([1, 0, 0, 0, 0, 0, 0]),
+        AuthorityScope::Realm {
+            realm_id,
+            realm_sub_id,
+        } => {
+            hasher.update([2]);
+            hasher.update(realm_id.to_be_bytes());
+            hasher.update(realm_sub_id.to_be_bytes());
+        }
+    }
+}
+
+fn update_len_prefixed(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+}
+
+/// Schema-only receipt. It intentionally has no conversion into a production
+/// read/write or cutover capability.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BranchExactSchemaOnlyReceipt {
+    keyspace: CqlKeyspaceName,
+    authority: AuthorityScope,
+    profile: CanonicalHeadBootstrapProfile,
+    schema_version: u16,
+    plan_digest: BranchExactMaterializationPlanDigest,
+    schema_fingerprint: BranchExactSchemaFingerprint,
+}
+
+impl BranchExactSchemaOnlyReceipt {
+    pub const fn keyspace(&self) -> &CqlKeyspaceName {
+        &self.keyspace
+    }
+
+    pub const fn authority(&self) -> AuthorityScope {
+        self.authority
+    }
+
+    pub const fn profile(&self) -> CanonicalHeadBootstrapProfile {
+        self.profile
+    }
+
+    pub const fn schema_version(&self) -> u16 {
+        self.schema_version
+    }
+
+    pub const fn plan_digest(&self) -> BranchExactMaterializationPlanDigest {
+        self.plan_digest
+    }
+
+    pub const fn schema_fingerprint(&self) -> BranchExactSchemaFingerprint {
+        self.schema_fingerprint
+    }
+}
+
+/// Binds a sealed authority/profile plan to one exact Scylla keyspace. The
+/// materializer has no overload accepting a bare keyspace.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BranchExactSchemaMaterializationRequest {
+    keyspace: CqlKeyspaceName,
+    plan: BranchExactSchemaMaterializationPlan,
+}
+
+impl BranchExactSchemaMaterializationRequest {
+    pub fn try_new(
+        keyspace: CqlKeyspaceName,
+        plan: BranchExactSchemaMaterializationPlan,
+    ) -> Result<Self, BranchExactMaterializationRequestError> {
+        if keyspace.as_str().ends_with("_no_tablet") {
+            return Err(BranchExactMaterializationRequestError::NoTabletKeyspace);
+        }
+        Ok(Self { keyspace, plan })
+    }
+
+    pub const fn keyspace(&self) -> &CqlKeyspaceName {
+        &self.keyspace
+    }
+
+    pub const fn plan(&self) -> &BranchExactSchemaMaterializationPlan {
+        &self.plan
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BranchExactMaterializationRequestError {
+    NoTabletKeyspace,
+}
+
+impl fmt::Display for BranchExactMaterializationRequestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl Error for BranchExactMaterializationRequestError {}
 
 fn query(
     id: BranchExactQueryId,
@@ -552,6 +936,85 @@ struct PreparedBranchExact {
     proof_read: PreparedStatement,
 }
 
+/// Isolated schema materializer used by deployment tooling and future RF=3
+/// tests. It is not referenced by `psy_setup.rs` or any node startup path.
+pub struct BranchExactSchemaMaterializer;
+
+impl BranchExactSchemaMaterializer {
+    pub async fn inspect_schema(
+        session: &Session,
+        keyspace: &CqlKeyspaceName,
+        authority: AuthorityScope,
+    ) -> anyhow::Result<BranchExactSchemaInspection> {
+        let queries = BranchExactQueries::new(keyspace);
+        let inspect = queries.get(BranchExactQueryId::InspectTableColumns);
+        let mut observed = Vec::new();
+        for target in BRANCH_EXACT_SCHEMA_TARGETS {
+            let rows = session
+                .query_unpaged(
+                    inspect.cql(),
+                    (keyspace.as_str(), target.physical_name),
+                )
+                .await?
+                .into_rows_result()?;
+            for row in rows.rows::<(String, String, String, i32, String)>()? {
+                let (column_name, cql_type, kind, position, clustering_order) =
+                    row?;
+                observed.push(ObservedBranchExactColumn {
+                    physical: target.physical,
+                    column_name,
+                    cql_type,
+                    kind,
+                    position,
+                    clustering_order,
+                });
+            }
+        }
+        Ok(inspect_branch_exact_columns(authority, observed)?)
+    }
+
+    pub async fn materialize_schema(
+        session: &Session,
+        request: &BranchExactSchemaMaterializationRequest,
+    ) -> anyhow::Result<BranchExactSchemaOnlyReceipt> {
+        let keyspace = request.keyspace();
+        let plan = request.plan();
+        if plan.schema_version() != BRANCH_EXACT_SCHEMA_VERSION {
+            anyhow::bail!(
+                "unsupported branch-exact schema version {}",
+                plan.schema_version()
+            );
+        }
+        let authority = plan.authority();
+        let before = Self::inspect_schema(session, keyspace, authority).await?;
+        if !matches!(before, BranchExactSchemaInspection::Exact { .. }) {
+            let queries = BranchExactQueries::new(keyspace);
+            for id in branch_exact_create_queries(authority) {
+                session
+                    .query_unpaged(queries.get(*id).cql(), &[])
+                    .await?;
+            }
+            session.await_schema_agreement().await?;
+        }
+
+        let BranchExactSchemaInspection::Exact { fingerprint } =
+            Self::inspect_schema(session, keyspace, authority).await?
+        else {
+            anyhow::bail!(
+                "branch-exact schema did not converge to the exact target"
+            );
+        };
+        Ok(BranchExactSchemaOnlyReceipt {
+            keyspace: keyspace.clone(),
+            authority,
+            profile: plan.profile(),
+            schema_version: plan.schema_version(),
+            plan_digest: plan.digest(),
+            schema_fingerprint: fingerprint,
+        })
+    }
+}
+
 #[allow(dead_code)]
 pub(crate) struct BranchExactSchemaMigrationAdapter {
     queries: BranchExactQueries,
@@ -561,21 +1024,6 @@ pub(crate) struct BranchExactSchemaMigrationAdapter {
 
 #[allow(dead_code)]
 impl BranchExactSchemaMigrationAdapter {
-    pub(crate) async fn create_schema(
-        session: &Session,
-        keyspace: CqlKeyspaceName,
-    ) -> anyhow::Result<()> {
-        let queries = BranchExactQueries::new(&keyspace);
-        for id in [
-            BranchExactQueryId::CreateBranchToPending,
-            BranchExactQueryId::CreatePendingToBranch,
-            BranchExactQueryId::CreatePendingRewardProof,
-        ] {
-            session.query_unpaged(queries.get(id).cql(), &[]).await?;
-        }
-        Ok(())
-    }
-
     pub(crate) async fn prepare_with_consistency(
         session: &Session,
         keyspace: CqlKeyspaceName,
@@ -752,6 +1200,7 @@ mod tests {
         CanonicalChainRef, ChainEpoch, CheckpointHash, CheckpointId,
         CheckpointRef, NetworkId,
     };
+    use psy_node_core::store::canonical_head::CanonicalHeadBootstrap;
     use strum::IntoEnumIterator;
 
     use super::*;
@@ -782,6 +1231,28 @@ mod tests {
             ),
             CommitWriteTimestampUs::try_from_i128(1_000).unwrap(),
         )
+    }
+
+    fn realm_authority() -> AuthorityScope {
+        AuthorityScope::Realm {
+            realm_id: 7,
+            realm_sub_id: 2,
+        }
+    }
+
+    fn exact_observed_columns(
+        authority: AuthorityScope,
+    ) -> Vec<ObservedBranchExactColumn> {
+        BRANCH_EXACT_EXPECTED_COLUMNS
+            .into_iter()
+            .filter(|column| {
+                branch_exact_physical_applies_to_authority(
+                    column.physical,
+                    authority,
+                )
+            })
+            .map(ObservedBranchExactColumn::from)
+            .collect()
     }
 
     #[test]
@@ -883,6 +1354,180 @@ mod tests {
             assert!(cql.contains(descriptor.physical_name));
             assert!(cql.contains(descriptor.cql_primary_key));
         }
+    }
+
+    #[test]
+    fn schema_inspection_distinguishes_absent_partial_and_exact() {
+        assert_eq!(
+            inspect_branch_exact_columns(realm_authority(), Vec::new()).unwrap(),
+            BranchExactSchemaInspection::Absent
+        );
+
+        let partial = exact_observed_columns(realm_authority())
+            .into_iter()
+            .filter(|column| {
+                column.physical
+                    != BranchExactPhysicalTableId::PendingRewardTopProof
+            })
+            .collect();
+        assert_eq!(
+            inspect_branch_exact_columns(realm_authority(), partial).unwrap(),
+            BranchExactSchemaInspection::Partial {
+                present: vec![
+                    BranchExactPhysicalTableId::CanonicalChainRefToPendingId,
+                    BranchExactPhysicalTableId::PendingIdToCanonicalChainRef,
+                ],
+                missing: vec![BranchExactPhysicalTableId::PendingRewardTopProof],
+            }
+        );
+
+        assert_eq!(
+            inspect_branch_exact_columns(
+                realm_authority(),
+                exact_observed_columns(realm_authority()),
+            )
+            .unwrap(),
+            BranchExactSchemaInspection::Exact {
+                fingerprint: branch_exact_schema_fingerprint(realm_authority()),
+            }
+        );
+    }
+
+    #[test]
+    fn coordinator_requires_shared_tables_and_rejects_realm_only_proof() {
+        assert_eq!(
+            branch_exact_create_queries(AuthorityScope::Coordinator),
+            COORDINATOR_BRANCH_EXACT_CREATE_QUERIES
+        );
+        assert_eq!(
+            branch_exact_create_queries(realm_authority()),
+            REALM_BRANCH_EXACT_CREATE_QUERIES
+        );
+        let coordinator_columns =
+            exact_observed_columns(AuthorityScope::Coordinator);
+        assert_eq!(coordinator_columns.len(), 4);
+        assert_eq!(
+            inspect_branch_exact_columns(
+                AuthorityScope::Coordinator,
+                coordinator_columns.clone(),
+            )
+            .unwrap(),
+            BranchExactSchemaInspection::Exact {
+                fingerprint: branch_exact_schema_fingerprint(
+                    AuthorityScope::Coordinator,
+                ),
+            }
+        );
+
+        let mut polluted = coordinator_columns;
+        polluted.extend(
+            exact_observed_columns(realm_authority())
+                .into_iter()
+                .filter(|column| {
+                    column.physical
+                        == BranchExactPhysicalTableId::PendingRewardTopProof
+                }),
+        );
+        assert_eq!(
+            inspect_branch_exact_columns(AuthorityScope::Coordinator, polluted),
+            Err(
+                BranchExactSchemaInspectionError::UnexpectedTableForAuthority {
+                    authority: AuthorityScope::Coordinator,
+                    physical: BranchExactPhysicalTableId::PendingRewardTopProof,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn partial_or_incompatible_table_shape_fails_closed() {
+        let mut missing_column = exact_observed_columns(realm_authority());
+        missing_column.retain(|column| {
+            !(column.physical
+                == BranchExactPhysicalTableId::CanonicalChainRefToPendingId
+                && column.column_name == "pending_id")
+        });
+        assert!(matches!(
+            inspect_branch_exact_columns(realm_authority(), missing_column),
+            Err(BranchExactSchemaInspectionError::IncompatibleTable {
+                physical:
+                    BranchExactPhysicalTableId::CanonicalChainRefToPendingId,
+                ..
+            })
+        ));
+
+        let mut wrong_type = exact_observed_columns(realm_authority());
+        wrong_type
+            .iter_mut()
+            .find(|column| column.column_name == "canonical_ref")
+            .unwrap()
+            .cql_type = "text".to_owned();
+        assert!(matches!(
+            inspect_branch_exact_columns(realm_authority(), wrong_type),
+            Err(BranchExactSchemaInspectionError::IncompatibleTable { .. })
+        ));
+
+        let mut duplicate = exact_observed_columns(realm_authority());
+        duplicate.push(duplicate[0].clone());
+        assert!(matches!(
+            inspect_branch_exact_columns(realm_authority(), duplicate),
+            Err(BranchExactSchemaInspectionError::IncompatibleTable { .. })
+        ));
+    }
+
+    #[test]
+    fn schema_fingerprint_and_inspection_query_are_stable() {
+        assert_eq!(
+            branch_exact_schema_fingerprint(realm_authority()),
+            branch_exact_schema_fingerprint(realm_authority())
+        );
+        assert_ne!(
+            branch_exact_schema_fingerprint(AuthorityScope::Coordinator),
+            branch_exact_schema_fingerprint(realm_authority())
+        );
+        let queries =
+            BranchExactQueries::new(&CqlKeyspaceName::try_new("ks").unwrap());
+        let inspect = queries.get(BranchExactQueryId::InspectTableColumns);
+        assert_eq!(inspect.bind_shape(), &["TEXT", "TEXT"]);
+        assert_eq!(
+            inspect.cql(),
+            "SELECT column_name, type, kind, position, clustering_order FROM system_schema.columns WHERE keyspace_name = ? AND table_name = ?"
+        );
+    }
+
+    #[test]
+    fn materialization_request_binds_one_exact_keyspace() {
+        let bootstrap = CanonicalHeadBootstrap::try_new(
+            CanonicalHeadBootstrapProfile::GenesisNative,
+            chain(0, 0, 7),
+        )
+        .unwrap();
+        let plan = BranchExactSchemaMaterializationPlan::try_new(
+            &bootstrap,
+            AuthorityScope::Coordinator,
+            None,
+        )
+        .unwrap();
+        let first = BranchExactSchemaMaterializationRequest::try_new(
+            CqlKeyspaceName::try_new("coordinator_state").unwrap(),
+            plan,
+        )
+        .unwrap();
+        let other = BranchExactSchemaMaterializationRequest::try_new(
+            CqlKeyspaceName::try_new("realm_7_state").unwrap(),
+            plan,
+        )
+        .unwrap();
+        assert_ne!(first, other);
+        assert_eq!(first.plan().authority(), AuthorityScope::Coordinator);
+        assert_eq!(first.keyspace().as_str(), "coordinator_state");
+        assert_eq!(
+            BranchExactSchemaMaterializationRequest::try_new(
+                CqlKeyspaceName::try_new("coordinator_state_no_tablet").unwrap(),
+                plan,
+            ),
+            Err(BranchExactMaterializationRequestError::NoTabletKeyspace)
+        );
     }
 
     #[test]
@@ -1010,7 +1655,7 @@ mod tests {
     #[test]
     fn query_golden_is_deterministic_and_complete() {
         let queries = BranchExactQueries::new(&CqlKeyspaceName::try_new("ks").unwrap());
-        assert_eq!(queries.all().count(), 9);
+        assert_eq!(queries.all().count(), 10);
         assert_eq!(queries.golden(), queries.golden());
         assert!(queries.golden().contains("PutBranchToPending"));
     }
