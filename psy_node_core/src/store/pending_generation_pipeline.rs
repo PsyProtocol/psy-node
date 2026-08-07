@@ -22,9 +22,11 @@ use super::{
 };
 
 pub const PENDING_PIPELINE_MAGIC: [u8; 8] = *b"PSYPGPLN";
-pub const PENDING_PIPELINE_CODEC_VERSION: u16 = 1;
-pub const PENDING_PIPELINE_V1_LEN: usize =
+pub const PENDING_PIPELINE_CODEC_VERSION: u16 = 2;
+pub const PENDING_PIPELINE_V2_LEN: usize =
     8 + 2 + 4 + 1 + 4 + 2 + 32 + 8 + 8 + 1 + 24 + 24 + 1 + 32
+        + 32
+        + 32
         + AUTHORITY_OBSERVATION_V1_LEN
         + 8;
 
@@ -86,6 +88,9 @@ macro_rules! evidence_digest {
 }
 
 evidence_digest!(PendingPipelineIntentDigest);
+evidence_digest!(PendingQueueCloseIntentDigest);
+evidence_digest!(PendingWorkCaptureDigest);
+evidence_digest!(PendingEmptyQueueSealDigest);
 evidence_digest!(PendingNoWorkReceiptDigest);
 evidence_digest!(PendingPublishReceiptDigest);
 evidence_digest!(PendingBlockedReasonDigest);
@@ -95,10 +100,12 @@ evidence_digest!(PendingBlockedReasonDigest);
 pub enum PendingProcessingPhase {
     Baseline = 1,
     Ready = 2,
-    InFlight = 3,
-    RetiredNoWork = 4,
-    Published = 5,
-    Blocked = 6,
+    Sealing = 3,
+    WorkCaptured = 4,
+    InFlight = 5,
+    EmptyQueueSealed = 6,
+    RetiredNoWork = 7,
+    Published = 8,
 }
 
 impl PendingProcessingPhase {
@@ -106,10 +113,12 @@ impl PendingProcessingPhase {
         match value {
             1 => Ok(Self::Baseline),
             2 => Ok(Self::Ready),
-            3 => Ok(Self::InFlight),
-            4 => Ok(Self::RetiredNoWork),
-            5 => Ok(Self::Published),
-            6 => Ok(Self::Blocked),
+            3 => Ok(Self::Sealing),
+            4 => Ok(Self::WorkCaptured),
+            5 => Ok(Self::InFlight),
+            6 => Ok(Self::EmptyQueueSealed),
+            7 => Ok(Self::RetiredNoWork),
+            8 => Ok(Self::Published),
             other => Err(PendingPipelineError::UnknownPhase(other)),
         }
     }
@@ -123,10 +132,21 @@ impl PendingProcessingPhase {
 pub enum PendingProcessingState {
     Baseline(PendingGenerationActivationDigest),
     Ready,
-    InFlight(PendingPipelineIntentDigest),
-    RetiredNoWork(PendingNoWorkReceiptDigest),
-    Published(PendingPublishReceiptDigest),
-    Blocked(PendingBlockedReasonDigest),
+    Sealing(PendingQueueCloseIntentDigest),
+    WorkCaptured(PendingWorkCaptureDigest),
+    InFlight {
+        capture: PendingWorkCaptureDigest,
+        intent: PendingPipelineIntentDigest,
+    },
+    EmptyQueueSealed(PendingEmptyQueueSealDigest),
+    RetiredNoWork {
+        seal: PendingEmptyQueueSealDigest,
+        receipt: PendingNoWorkReceiptDigest,
+    },
+    Published {
+        capture: PendingWorkCaptureDigest,
+        receipt: PendingPublishReceiptDigest,
+    },
 }
 
 impl PendingProcessingState {
@@ -134,21 +154,31 @@ impl PendingProcessingState {
         match self {
             Self::Baseline(_) => PendingProcessingPhase::Baseline,
             Self::Ready => PendingProcessingPhase::Ready,
-            Self::InFlight(_) => PendingProcessingPhase::InFlight,
-            Self::RetiredNoWork(_) => PendingProcessingPhase::RetiredNoWork,
-            Self::Published(_) => PendingProcessingPhase::Published,
-            Self::Blocked(_) => PendingProcessingPhase::Blocked,
+            Self::Sealing(_) => PendingProcessingPhase::Sealing,
+            Self::WorkCaptured(_) => PendingProcessingPhase::WorkCaptured,
+            Self::InFlight { .. } => PendingProcessingPhase::InFlight,
+            Self::EmptyQueueSealed(_) => PendingProcessingPhase::EmptyQueueSealed,
+            Self::RetiredNoWork { .. } => PendingProcessingPhase::RetiredNoWork,
+            Self::Published { .. } => PendingProcessingPhase::Published,
         }
     }
 
-    fn evidence_bytes(self) -> [u8; 32] {
+    fn evidence_bytes(self) -> ([u8; 32], [u8; 32]) {
         match self {
-            Self::Baseline(digest) => *digest.as_bytes(),
-            Self::Ready => [0; 32],
-            Self::InFlight(digest) => *digest.as_bytes(),
-            Self::RetiredNoWork(digest) => *digest.as_bytes(),
-            Self::Published(digest) => *digest.as_bytes(),
-            Self::Blocked(digest) => *digest.as_bytes(),
+            Self::Baseline(digest) => (*digest.as_bytes(), [0; 32]),
+            Self::Ready => ([0; 32], [0; 32]),
+            Self::Sealing(close) => (*close.as_bytes(), [0; 32]),
+            Self::WorkCaptured(capture) => (*capture.as_bytes(), [0; 32]),
+            Self::InFlight { capture, intent } => {
+                (*capture.as_bytes(), *intent.as_bytes())
+            }
+            Self::EmptyQueueSealed(seal) => (*seal.as_bytes(), [0; 32]),
+            Self::RetiredNoWork { seal, receipt } => {
+                (*seal.as_bytes(), *receipt.as_bytes())
+            }
+            Self::Published { capture, receipt } => {
+                (*capture.as_bytes(), *receipt.as_bytes())
+            }
         }
     }
 }
@@ -164,6 +194,7 @@ pub struct StoredPendingPipeline<Hash> {
     processing: PendingGenerationContext,
     gathering: PendingGenerationContext,
     processing_state: PendingProcessingState,
+    blocked_reason: Option<PendingBlockedReasonDigest>,
     frontier: AuthorityObservation<Hash>,
     processed_pending_id: u64,
 }
@@ -205,6 +236,10 @@ impl<Hash> StoredPendingPipeline<Hash> {
         self.processing_state
     }
 
+    pub const fn blocked_reason(&self) -> Option<PendingBlockedReasonDigest> {
+        self.blocked_reason
+    }
+
     pub const fn frontier(&self) -> &AuthorityObservation<Hash> {
         &self.frontier
     }
@@ -229,7 +264,7 @@ impl<Hash> StoredPendingPipeline<Hash> {
 }
 
 impl<Hash: Q256BitHash> StoredPendingPipeline<Hash> {
-    pub fn canonical_payload(&self) -> [u8; PENDING_PIPELINE_V1_LEN] {
+    pub fn canonical_payload(&self) -> [u8; PENDING_PIPELINE_V2_LEN] {
         encode_payload(self)
     }
 
@@ -238,7 +273,7 @@ impl<Hash: Q256BitHash> StoredPendingPipeline<Hash> {
         revision: i64,
         payload: &[u8],
     ) -> Result<Self, PendingPipelineError> {
-        if payload.len() != PENDING_PIPELINE_V1_LEN {
+        if payload.len() != PENDING_PIPELINE_V2_LEN {
             return Err(PendingPipelineError::InvalidPayloadLength(payload.len()));
         }
         let mut cursor = 0;
@@ -280,32 +315,66 @@ impl<Hash: Q256BitHash> StoredPendingPipeline<Hash> {
         let gathering = decode_context(payload, &mut cursor)?;
         let phase = PendingProcessingPhase::try_from_u8(payload[cursor])?;
         cursor += 1;
-        let evidence_bytes = take::<32>(payload, &mut cursor);
+        let primary_evidence = take::<32>(payload, &mut cursor);
+        let secondary_evidence = take::<32>(payload, &mut cursor);
         let processing_state = match phase {
-            PendingProcessingPhase::Baseline => PendingProcessingState::Baseline(
-                PendingGenerationActivationDigest::try_new(evidence_bytes)
+            PendingProcessingPhase::Baseline if secondary_evidence == [0; 32] => PendingProcessingState::Baseline(
+                PendingGenerationActivationDigest::try_new(primary_evidence)
                     .map_err(|_| PendingPipelineError::EmptyEvidenceDigest)?,
             ),
-            PendingProcessingPhase::Ready if evidence_bytes == [0; 32] => {
+            PendingProcessingPhase::Baseline => {
+                return Err(PendingPipelineError::UnexpectedSecondaryEvidence)
+            }
+            PendingProcessingPhase::Ready
+                if primary_evidence == [0; 32] && secondary_evidence == [0; 32] =>
+            {
                 PendingProcessingState::Ready
             }
             PendingProcessingPhase::Ready => {
                 return Err(PendingPipelineError::ReadyHasEvidence)
             }
-            PendingProcessingPhase::InFlight => PendingProcessingState::InFlight(
-                PendingPipelineIntentDigest::try_new(evidence_bytes)?,
-            ),
-            PendingProcessingPhase::RetiredNoWork => {
-                PendingProcessingState::RetiredNoWork(
-                    PendingNoWorkReceiptDigest::try_new(evidence_bytes)?,
+            PendingProcessingPhase::Sealing if secondary_evidence == [0; 32] => {
+                PendingProcessingState::Sealing(PendingQueueCloseIntentDigest::try_new(
+                    primary_evidence,
+                )?)
+            }
+            PendingProcessingPhase::Sealing => {
+                return Err(PendingPipelineError::UnexpectedSecondaryEvidence)
+            }
+            PendingProcessingPhase::WorkCaptured if secondary_evidence == [0; 32] => {
+                PendingProcessingState::WorkCaptured(PendingWorkCaptureDigest::try_new(
+                    primary_evidence,
+                )?)
+            }
+            PendingProcessingPhase::WorkCaptured => {
+                return Err(PendingPipelineError::UnexpectedSecondaryEvidence)
+            }
+            PendingProcessingPhase::InFlight => PendingProcessingState::InFlight {
+                capture: PendingWorkCaptureDigest::try_new(primary_evidence)?,
+                intent: PendingPipelineIntentDigest::try_new(secondary_evidence)?,
+            },
+            PendingProcessingPhase::EmptyQueueSealed if secondary_evidence == [0; 32] => {
+                PendingProcessingState::EmptyQueueSealed(
+                    PendingEmptyQueueSealDigest::try_new(primary_evidence)?,
                 )
             }
-            PendingProcessingPhase::Published => PendingProcessingState::Published(
-                PendingPublishReceiptDigest::try_new(evidence_bytes)?,
-            ),
-            PendingProcessingPhase::Blocked => PendingProcessingState::Blocked(
-                PendingBlockedReasonDigest::try_new(evidence_bytes)?,
-            ),
+            PendingProcessingPhase::EmptyQueueSealed => {
+                return Err(PendingPipelineError::UnexpectedSecondaryEvidence)
+            }
+            PendingProcessingPhase::RetiredNoWork => PendingProcessingState::RetiredNoWork {
+                seal: PendingEmptyQueueSealDigest::try_new(primary_evidence)?,
+                receipt: PendingNoWorkReceiptDigest::try_new(secondary_evidence)?,
+            },
+            PendingProcessingPhase::Published => PendingProcessingState::Published {
+                capture: PendingWorkCaptureDigest::try_new(primary_evidence)?,
+                receipt: PendingPublishReceiptDigest::try_new(secondary_evidence)?,
+            },
+        };
+        let blocked_bytes = take::<32>(payload, &mut cursor);
+        let blocked_reason = if blocked_bytes == [0; 32] {
+            None
+        } else {
+            Some(PendingBlockedReasonDigest::try_new(blocked_bytes)?)
         };
         let frontier = AuthorityObservation::<Hash>::from_canonical_bytes(
             &payload[cursor..cursor + AUTHORITY_OBSERVATION_V1_LEN],
@@ -324,6 +393,7 @@ impl<Hash: Q256BitHash> StoredPendingPipeline<Hash> {
             processing,
             gathering,
             processing_state,
+            blocked_reason,
             frontier,
             processed_pending_id,
         };
@@ -335,6 +405,7 @@ impl<Hash: Q256BitHash> StoredPendingPipeline<Hash> {
         &self,
         reserved: ReservedPendingGeneration,
     ) -> Result<SealedPendingPipelineTransition<Hash>, PendingPipelineError> {
+        self.require_unblocked()?;
         if self.bootstrap_reason == PendingGenerationBootstrapReason::Genesis
             && self.processing.pending_id().get() == 0
             && self.gathering.pending_id().get() == 0
@@ -378,6 +449,7 @@ impl<Hash: Q256BitHash> StoredPendingPipeline<Hash> {
         &self,
         reserved: ReservedPendingGeneration,
     ) -> Result<SealedPendingPipelineTransition<Hash>, PendingPipelineError> {
+        self.require_unblocked()?;
         if self.bootstrap_reason != PendingGenerationBootstrapReason::Genesis
             || self.phase() != PendingProcessingPhase::Baseline
             || self.processing.pending_id().get() != 0
@@ -403,29 +475,81 @@ impl<Hash: Q256BitHash> StoredPendingPipeline<Hash> {
         seal(self, candidate, PendingPipelineTransitionKind::PrimeGenesis)
     }
 
+    pub fn seal_begin_queue_close(
+        &self,
+        close: PendingQueueCloseIntentDigest,
+    ) -> Result<SealedPendingPipelineTransition<Hash>, PendingPipelineError> {
+        self.require_unblocked()?;
+        self.require_ready()?;
+        let mut candidate = self.clone();
+        candidate.revision = self.revision.next()?;
+        candidate.processing_state = PendingProcessingState::Sealing(close);
+        seal(self, candidate, PendingPipelineTransitionKind::BeginQueueClose)
+    }
+
+    pub fn seal_capture_work(
+        &self,
+        expected_close: PendingQueueCloseIntentDigest,
+        capture: PendingWorkCaptureDigest,
+    ) -> Result<SealedPendingPipelineTransition<Hash>, PendingPipelineError> {
+        self.require_unblocked()?;
+        self.require_sealing(expected_close)?;
+        let mut candidate = self.clone();
+        candidate.revision = self.revision.next()?;
+        candidate.processing_state = PendingProcessingState::WorkCaptured(capture);
+        seal(self, candidate, PendingPipelineTransitionKind::CaptureWork)
+    }
+
     pub fn seal_begin_processing(
         &self,
+        expected_capture: PendingWorkCaptureDigest,
         intent: PendingPipelineIntentDigest,
     ) -> Result<SealedPendingPipelineTransition<Hash>, PendingPipelineError> {
-        if self.processing_state != PendingProcessingState::Ready {
-            return Err(PendingPipelineError::ProcessingNotReady(self.phase()));
-        }
-        if self.processing.pending_id().get() <= self.processed_pending_id {
-            return Err(PendingPipelineError::ProcessingNotAheadOfFrontier);
+        self.require_unblocked()?;
+        if self.processing_state != PendingProcessingState::WorkCaptured(expected_capture) {
+            if self.phase() != PendingProcessingPhase::WorkCaptured {
+                return Err(PendingPipelineError::WorkNotCaptured(self.phase()));
+            }
+            return Err(PendingPipelineError::WorkCaptureMismatch);
         }
         let mut candidate = self.clone();
         candidate.revision = self.revision.next()?;
-        candidate.processing_state = PendingProcessingState::InFlight(intent);
+        candidate.processing_state = PendingProcessingState::InFlight {
+            capture: expected_capture,
+            intent,
+        };
         seal(self, candidate, PendingPipelineTransitionKind::BeginProcessing)
+    }
+
+    pub fn seal_empty_queue(
+        &self,
+        expected_close: PendingQueueCloseIntentDigest,
+        seal_digest: PendingEmptyQueueSealDigest,
+    ) -> Result<SealedPendingPipelineTransition<Hash>, PendingPipelineError> {
+        self.require_unblocked()?;
+        self.require_sealing(expected_close)?;
+        if self.key.authority() == AuthorityScope::Coordinator {
+            return Err(PendingPipelineError::CoordinatorCannotRetireNoWork);
+        }
+        let mut candidate = self.clone();
+        candidate.revision = self.revision.next()?;
+        candidate.processing_state = PendingProcessingState::EmptyQueueSealed(seal_digest);
+        seal(self, candidate, PendingPipelineTransitionKind::SealEmptyQueue)
     }
 
     pub fn seal_retire_no_work(
         &self,
-        expected_intent: PendingPipelineIntentDigest,
+        expected_seal: PendingEmptyQueueSealDigest,
         no_work_receipt: PendingNoWorkReceiptDigest,
         observed: AuthorityObservation<Hash>,
     ) -> Result<SealedPendingPipelineTransition<Hash>, PendingPipelineError> {
-        self.require_inflight(expected_intent)?;
+        self.require_unblocked()?;
+        if self.processing_state != PendingProcessingState::EmptyQueueSealed(expected_seal) {
+            if self.phase() != PendingProcessingPhase::EmptyQueueSealed {
+                return Err(PendingPipelineError::EmptyQueueNotSealed(self.phase()));
+            }
+            return Err(PendingPipelineError::EmptyQueueSealMismatch);
+        }
         if self.key.authority() == AuthorityScope::Coordinator {
             return Err(PendingPipelineError::CoordinatorCannotRetireNoWork);
         }
@@ -437,7 +561,10 @@ impl<Hash: Q256BitHash> StoredPendingPipeline<Hash> {
         }
         let mut candidate = self.clone();
         candidate.revision = self.revision.next()?;
-        candidate.processing_state = PendingProcessingState::RetiredNoWork(no_work_receipt);
+        candidate.processing_state = PendingProcessingState::RetiredNoWork {
+            seal: expected_seal,
+            receipt: no_work_receipt,
+        };
         candidate.frontier = observed;
         candidate.processed_pending_id = self.processing.pending_id().get();
         seal(self, candidate, PendingPipelineTransitionKind::RetireNoWork)
@@ -449,7 +576,8 @@ impl<Hash: Q256BitHash> StoredPendingPipeline<Hash> {
         publish_receipt: PendingPublishReceiptDigest,
         observed: AuthorityObservation<Hash>,
     ) -> Result<SealedPendingPipelineTransition<Hash>, PendingPipelineError> {
-        self.require_inflight(expected_intent)?;
+        self.require_unblocked()?;
+        let capture = self.require_inflight(expected_intent)?;
         validate_observed_advance(self, &observed, true)?;
         if observed.state_checkpoint_id().get()
             <= self.frontier.state_checkpoint_id().get()
@@ -458,7 +586,10 @@ impl<Hash: Q256BitHash> StoredPendingPipeline<Hash> {
         }
         let mut candidate = self.clone();
         candidate.revision = self.revision.next()?;
-        candidate.processing_state = PendingProcessingState::Published(publish_receipt);
+        candidate.processing_state = PendingProcessingState::Published {
+            capture,
+            receipt: publish_receipt,
+        };
         candidate.frontier = observed;
         candidate.processed_pending_id = self.processing.pending_id().get();
         seal(self, candidate, PendingPipelineTransitionKind::Publish)
@@ -468,33 +599,65 @@ impl<Hash: Q256BitHash> StoredPendingPipeline<Hash> {
         &self,
         reason: PendingBlockedReasonDigest,
     ) -> Result<SealedPendingPipelineTransition<Hash>, PendingPipelineError> {
-        if self.phase() == PendingProcessingPhase::Blocked {
+        if self.blocked_reason.is_some() {
             return Err(PendingPipelineError::AlreadyBlocked);
         }
         let mut candidate = self.clone();
         candidate.revision = self.revision.next()?;
-        candidate.processing_state = PendingProcessingState::Blocked(reason);
+        candidate.blocked_reason = Some(reason);
         seal(self, candidate, PendingPipelineTransitionKind::Block)
     }
 
     fn require_inflight(
         &self,
         expected_intent: PendingPipelineIntentDigest,
-    ) -> Result<(), PendingPipelineError> {
-        if self.processing_state != PendingProcessingState::InFlight(expected_intent) {
-            if self.phase() != PendingProcessingPhase::InFlight {
-                return Err(PendingPipelineError::ProcessingNotInFlight(self.phase()));
+    ) -> Result<PendingWorkCaptureDigest, PendingPipelineError> {
+        match self.processing_state {
+            PendingProcessingState::InFlight { capture, intent }
+                if intent == expected_intent => Ok(capture),
+            PendingProcessingState::InFlight { .. } => {
+                Err(PendingPipelineError::InFlightIntentMismatch)
             }
-            return Err(PendingPipelineError::InFlightIntentMismatch);
+            _ => Err(PendingPipelineError::ProcessingNotInFlight(self.phase())),
+        }
+    }
+
+    fn require_ready(&self) -> Result<(), PendingPipelineError> {
+        if self.processing_state != PendingProcessingState::Ready {
+            return Err(PendingPipelineError::ProcessingNotReady(self.phase()));
+        }
+        if self.processing.pending_id().get() <= self.processed_pending_id {
+            return Err(PendingPipelineError::ProcessingNotAheadOfFrontier);
         }
         Ok(())
+    }
+
+    fn require_sealing(
+        &self,
+        expected_close: PendingQueueCloseIntentDigest,
+    ) -> Result<(), PendingPipelineError> {
+        match self.processing_state {
+            PendingProcessingState::Sealing(close) if close == expected_close => Ok(()),
+            PendingProcessingState::Sealing(_) => {
+                Err(PendingPipelineError::QueueCloseIntentMismatch)
+            }
+            _ => Err(PendingPipelineError::QueueNotSealing(self.phase())),
+        }
+    }
+
+    fn require_unblocked(&self) -> Result<(), PendingPipelineError> {
+        if self.blocked_reason.is_some() {
+            Err(PendingPipelineError::PipelineBlocked)
+        } else {
+            Ok(())
+        }
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingPipelineBootstrap<Hash> {
     candidate: StoredPendingPipeline<Hash>,
-    payload: [u8; PENDING_PIPELINE_V1_LEN],
+    payload: [u8; PENDING_PIPELINE_V2_LEN],
 }
 
 impl<Hash: Q256BitHash> PendingPipelineBootstrap<Hash> {
@@ -526,6 +689,7 @@ impl<Hash: Q256BitHash> PendingPipelineBootstrap<Hash> {
             processing,
             gathering,
             processing_state: PendingProcessingState::Baseline(activation_digest),
+            blocked_reason: None,
             frontier,
             processed_pending_id,
         };
@@ -559,7 +723,7 @@ impl<Hash: Q256BitHash> PendingPipelineBootstrap<Hash> {
         &self.candidate
     }
 
-    pub const fn candidate_payload(&self) -> &[u8; PENDING_PIPELINE_V1_LEN] {
+    pub const fn candidate_payload(&self) -> &[u8; PENDING_PIPELINE_V2_LEN] {
         &self.payload
     }
 }
@@ -569,10 +733,13 @@ impl<Hash: Q256BitHash> PendingPipelineBootstrap<Hash> {
 pub enum PendingPipelineTransitionKind {
     PrimeGenesis = 1,
     Rotate = 2,
-    BeginProcessing = 3,
-    RetireNoWork = 4,
-    Publish = 5,
-    Block = 6,
+    BeginQueueClose = 3,
+    CaptureWork = 4,
+    BeginProcessing = 5,
+    SealEmptyQueue = 6,
+    RetireNoWork = 7,
+    Publish = 8,
+    Block = 9,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -580,8 +747,8 @@ pub struct SealedPendingPipelineTransition<Hash> {
     kind: PendingPipelineTransitionKind,
     expected: StoredPendingPipeline<Hash>,
     candidate: StoredPendingPipeline<Hash>,
-    expected_payload: [u8; PENDING_PIPELINE_V1_LEN],
-    candidate_payload: [u8; PENDING_PIPELINE_V1_LEN],
+    expected_payload: [u8; PENDING_PIPELINE_V2_LEN],
+    candidate_payload: [u8; PENDING_PIPELINE_V2_LEN],
 }
 
 impl<Hash> SealedPendingPipelineTransition<Hash> {
@@ -597,11 +764,11 @@ impl<Hash> SealedPendingPipelineTransition<Hash> {
         &self.candidate
     }
 
-    pub const fn expected_payload(&self) -> &[u8; PENDING_PIPELINE_V1_LEN] {
+    pub const fn expected_payload(&self) -> &[u8; PENDING_PIPELINE_V2_LEN] {
         &self.expected_payload
     }
 
-    pub const fn candidate_payload(&self) -> &[u8; PENDING_PIPELINE_V1_LEN] {
+    pub const fn candidate_payload(&self) -> &[u8; PENDING_PIPELINE_V2_LEN] {
         &self.candidate_payload
     }
 }
@@ -794,8 +961,8 @@ fn validate_observed_advance<Hash: Q256BitHash>(
 
 fn encode_payload<Hash: Q256BitHash>(
     state: &StoredPendingPipeline<Hash>,
-) -> [u8; PENDING_PIPELINE_V1_LEN] {
-    let mut bytes = Vec::with_capacity(PENDING_PIPELINE_V1_LEN);
+) -> [u8; PENDING_PIPELINE_V2_LEN] {
+    let mut bytes = Vec::with_capacity(PENDING_PIPELINE_V2_LEN);
     bytes.extend_from_slice(&PENDING_PIPELINE_MAGIC);
     bytes.extend_from_slice(&PENDING_PIPELINE_CODEC_VERSION.to_be_bytes());
     bytes.extend_from_slice(&state.key.network().chain_id().to_be_bytes());
@@ -810,7 +977,13 @@ fn encode_payload<Hash: Q256BitHash>(
     encode_context(&mut bytes, state.processing);
     encode_context(&mut bytes, state.gathering);
     bytes.push(state.phase() as u8);
-    bytes.extend_from_slice(&state.processing_state.evidence_bytes());
+    let (primary, secondary) = state.processing_state.evidence_bytes();
+    bytes.extend_from_slice(&primary);
+    bytes.extend_from_slice(&secondary);
+    let blocked_reason = state
+        .blocked_reason
+        .map_or([0; 32], |reason| *reason.as_bytes());
+    bytes.extend_from_slice(&blocked_reason);
     bytes.extend_from_slice(&state.frontier.to_canonical_bytes());
     bytes.extend_from_slice(&state.processed_pending_id.to_be_bytes());
     bytes.try_into().expect("fixed pending pipeline payload")
@@ -914,8 +1087,15 @@ pub enum PendingPipelineError {
     ProcessingNotTerminal(PendingProcessingPhase),
     ProcessingNotReady(PendingProcessingPhase),
     ProcessingNotAheadOfFrontier,
+    QueueNotSealing(PendingProcessingPhase),
+    QueueCloseIntentMismatch,
+    WorkNotCaptured(PendingProcessingPhase),
+    WorkCaptureMismatch,
+    EmptyQueueNotSealed(PendingProcessingPhase),
+    EmptyQueueSealMismatch,
     ProcessingNotInFlight(PendingProcessingPhase),
     InFlightIntentMismatch,
+    UnexpectedSecondaryEvidence,
     PendingNotMonotonic { previous: u64, candidate: u64 },
     CoordinatorCannotRetireNoWork,
     NoWorkChangedState,
@@ -926,6 +1106,7 @@ pub enum PendingPipelineError {
     SameHeightBranchMismatch,
     CoordinatorCheckpointNotContiguous { old: u64, new: u64 },
     AlreadyBlocked,
+    PipelineBlocked,
     CounterBehindLedger { counter: u64, gathering: u64 },
 }
 
@@ -1043,6 +1224,52 @@ mod tests {
         PendingPipelineIntentDigest::try_new([value; 32]).unwrap()
     }
 
+    fn close(value: u8) -> PendingQueueCloseIntentDigest {
+        PendingQueueCloseIntentDigest::try_new([value; 32]).unwrap()
+    }
+
+    fn capture(value: u8) -> PendingWorkCaptureDigest {
+        PendingWorkCaptureDigest::try_new([value; 32]).unwrap()
+    }
+
+    fn empty_seal(value: u8) -> PendingEmptyQueueSealDigest {
+        PendingEmptyQueueSealDigest::try_new([value; 32]).unwrap()
+    }
+
+    fn capture_work(
+        ready: &StoredPendingPipeline<PHash>,
+        close_value: u8,
+        capture_value: u8,
+    ) -> StoredPendingPipeline<PHash> {
+        let sealing = ready
+            .seal_begin_queue_close(close(close_value))
+            .unwrap()
+            .candidate()
+            .clone();
+        sealing
+            .seal_capture_work(close(close_value), capture(capture_value))
+            .unwrap()
+            .candidate()
+            .clone()
+    }
+
+    fn seal_empty(
+        ready: &StoredPendingPipeline<PHash>,
+        close_value: u8,
+        seal_value: u8,
+    ) -> StoredPendingPipeline<PHash> {
+        let sealing = ready
+            .seal_begin_queue_close(close(close_value))
+            .unwrap()
+            .candidate()
+            .clone();
+        sealing
+            .seal_empty_queue(close(close_value), empty_seal(seal_value))
+            .unwrap()
+            .candidate()
+            .clone()
+    }
+
     fn no_work(value: u8) -> PendingNoWorkReceiptDigest {
         PendingNoWorkReceiptDigest::try_new([value; 32]).unwrap()
     }
@@ -1104,13 +1331,9 @@ mod tests {
             .candidate()
             .clone();
         assert_eq!(ready.phase(), PendingProcessingPhase::Ready);
-        let inflight = ready
-            .seal_begin_processing(intent(1))
-            .unwrap()
-            .candidate()
-            .clone();
-        let retired = inflight
-            .seal_retire_no_work(intent(1), no_work(2), observation(10, 8, 80))
+        let empty = seal_empty(&ready, 1, 2);
+        let retired = empty
+            .seal_retire_no_work(empty_seal(2), no_work(3), observation(10, 8, 80))
             .unwrap()
             .candidate()
             .clone();
@@ -1124,13 +1347,9 @@ mod tests {
             .unwrap()
             .candidate()
             .clone();
-        let inflight = ready
-            .seal_begin_processing(intent(3))
-            .unwrap()
-            .candidate()
-            .clone();
-        let retired_same_head = inflight
-            .seal_retire_no_work(intent(3), no_work(4), observation(10, 8, 80))
+        let empty = seal_empty(&ready, 4, 5);
+        let retired_same_head = empty
+            .seal_retire_no_work(empty_seal(5), no_work(6), observation(10, 8, 80))
             .unwrap()
             .candidate()
             .clone();
@@ -1142,13 +1361,14 @@ mod tests {
             .unwrap()
             .candidate()
             .clone();
-        let inflight = ready
-            .seal_begin_processing(intent(5))
+        let captured = capture_work(&ready, 7, 8);
+        let inflight = captured
+            .seal_begin_processing(capture(8), intent(9))
             .unwrap()
             .candidate()
             .clone();
         let published = inflight
-            .seal_publish(intent(5), publish(6), observation(14, 14, 140))
+            .seal_publish(intent(9), publish(10), observation(14, 14, 140))
             .unwrap()
             .candidate()
             .clone();
@@ -1172,8 +1392,30 @@ mod tests {
             ),
             Err(PendingPipelineError::ProcessingNotTerminal(_))
         ));
-        let inflight = ready
-            .seal_begin_processing(intent(1))
+        assert!(matches!(
+            ready.seal_begin_processing(capture(2), intent(1)),
+            Err(PendingPipelineError::WorkNotCaptured(_))
+        ));
+        let sealing = ready
+            .seal_begin_queue_close(close(1))
+            .unwrap()
+            .candidate()
+            .clone();
+        assert_eq!(
+            sealing.seal_capture_work(close(2), capture(3)),
+            Err(PendingPipelineError::QueueCloseIntentMismatch)
+        );
+        let captured = sealing
+            .seal_capture_work(close(1), capture(3))
+            .unwrap()
+            .candidate()
+            .clone();
+        assert_eq!(
+            captured.seal_begin_processing(capture(4), intent(1)),
+            Err(PendingPipelineError::WorkCaptureMismatch)
+        );
+        let inflight = captured
+            .seal_begin_processing(capture(3), intent(1))
             .unwrap()
             .candidate()
             .clone();
@@ -1182,32 +1424,38 @@ mod tests {
             Err(PendingPipelineError::InFlightIntentMismatch)
         );
         assert_eq!(
-            inflight.seal_retire_no_work(intent(1), no_work(3), observation(9, 9, 90)),
-            Err(PendingPipelineError::NoWorkChangedState)
-        );
-        assert_eq!(
             inflight.seal_publish(intent(1), publish(3), observation(9, 8, 80)),
             Err(PendingPipelineError::PublishedStateDidNotAdvance)
         );
+
+        let empty = seal_empty(&ready, 5, 6);
         assert_eq!(
-            inflight.seal_retire_no_work(
-                intent(1),
+            empty.seal_retire_no_work(empty_seal(7), no_work(3), observation(9, 9, 90)),
+            Err(PendingPipelineError::EmptyQueueSealMismatch)
+        );
+        assert_eq!(
+            empty.seal_retire_no_work(empty_seal(6), no_work(3), observation(9, 9, 90)),
+            Err(PendingPipelineError::NoWorkChangedState)
+        );
+        assert_eq!(
+            empty.seal_retire_no_work(
+                empty_seal(6),
                 no_work(3),
                 observation_with_hash(8, 999, 8, 80),
             ),
             Err(PendingPipelineError::SameHeightBranchMismatch)
         );
         assert_eq!(
-            inflight.seal_retire_no_work(
-                intent(1),
+            empty.seal_retire_no_work(
+                empty_seal(6),
                 no_work(3),
                 observation_custom(key().authority(), 1, 8, 8, 8, 80),
             ),
             Err(PendingPipelineError::EpochChangedDuringNormalProcessing)
         );
         assert_eq!(
-            inflight.seal_retire_no_work(
-                intent(1),
+            empty.seal_retire_no_work(
+                empty_seal(6),
                 no_work(3),
                 observation_custom(
                     AuthorityScope::Realm {
@@ -1250,14 +1498,15 @@ mod tests {
             .unwrap()
             .candidate()
             .clone();
-        assert_eq!(blocked.phase(), PendingProcessingPhase::Blocked);
+        assert_eq!(blocked.phase(), state.phase());
+        assert_eq!(blocked.blocked_reason(), Some(block_reason(9)));
         assert!(blocked
             .seal_rotation(
                 ReservedPendingGeneration::try_from_prefix(10, prefix()).unwrap()
             )
             .is_err());
-        assert_eq!(blocked.canonical_payload().len(), PENDING_PIPELINE_V1_LEN);
-        assert_eq!(state.canonical_payload().len(), PENDING_PIPELINE_V1_LEN);
+        assert_eq!(blocked.canonical_payload().len(), PENDING_PIPELINE_V2_LEN);
+        assert_eq!(state.canonical_payload().len(), PENDING_PIPELINE_V2_LEN);
     }
 
     #[test]
@@ -1314,7 +1563,7 @@ mod tests {
         }
         assert_eq!(winners, 1);
         let advanced = current
-            .seal_begin_processing(intent(7))
+            .seal_begin_queue_close(close(7))
             .unwrap()
             .candidate()
             .clone();
@@ -1337,6 +1586,17 @@ mod tests {
     }
 
     #[test]
+    fn v1_payload_is_not_silently_reinterpreted_as_v2() {
+        let bootstrap = bootstrap();
+        let mut payload = *bootstrap.candidate_payload();
+        payload[8..10].copy_from_slice(&1_u16.to_be_bytes());
+        assert_eq!(
+            StoredPendingPipeline::<PHash>::decode_persisted(key(), 0, &payload),
+            Err(PendingPipelineError::UnknownCodecVersion(1))
+        );
+    }
+
+    #[test]
     fn ten_thousand_idle_generations_keep_one_constant_size_recoverable_row() {
         let observed = observation(8, 8, 80);
         let mut state = bootstrap().candidate().clone();
@@ -1352,21 +1612,17 @@ mod tests {
                 .unwrap()
                 .candidate()
                 .clone();
+            state = seal_empty(&state, 1, 2);
             state = state
-                .seal_begin_processing(intent(1))
+                .seal_retire_no_work(empty_seal(2), no_work(3), observed)
                 .unwrap()
                 .candidate()
                 .clone();
-            state = state
-                .seal_retire_no_work(intent(1), no_work(2), observed)
-                .unwrap()
-                .candidate()
-                .clone();
-            assert_eq!(state.canonical_payload().len(), PENDING_PIPELINE_V1_LEN);
+            assert_eq!(state.canonical_payload().len(), PENDING_PIPELINE_V2_LEN);
         }
         assert_eq!(state.processed_pending_id(), 10_008);
         assert_eq!(state.gathering().pending_id().get(), 10_009);
-        assert_eq!(state.revision().get(), 30_000);
+        assert_eq!(state.revision().get(), 40_000);
         assert_eq!(
             StoredPendingPipeline::<PHash>::decode_persisted(
                 key(),
@@ -1405,6 +1661,9 @@ mod tests {
             .candidate()
             .clone();
         assert_eq!(ready.processing(), context(1));
-        assert!(ready.seal_begin_processing(intent(1)).is_ok());
+        let captured = capture_work(&ready, 1, 2);
+        assert!(captured
+            .seal_begin_processing(capture(2), intent(1))
+            .is_ok());
     }
 }

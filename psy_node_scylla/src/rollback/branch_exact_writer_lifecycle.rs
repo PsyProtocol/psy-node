@@ -1376,9 +1376,11 @@ mod tests {
     };
     use crate::rollback::branch_exact_pending_orchestration::{
         BranchExactPendingOrchestrationError,
-        BranchExactPendingPublishRecovery, StableEmptyPendingGeneration,
+        BranchExactPendingPublishRecovery, PendingQueueClosePlan,
+        VerifiedPendingQueueSeal,
         classify_branch_exact_publish_recovery, seal_branch_exact_begin,
         seal_branch_exact_no_work, seal_branch_exact_publish,
+        seal_branch_exact_queue_capture, seal_branch_exact_queue_close,
     };
 
     fn chain(epoch: u64, height: u64, seed: u64) -> CanonicalChainRef<PHash> {
@@ -1440,7 +1442,7 @@ mod tests {
         const CONTEXT_LEN: usize = 24;
         const PHASE_OFFSET: usize = 118;
         const EVIDENCE_OFFSET: usize = 119;
-        const EVIDENCE_LEN: usize = 32;
+        const EVIDENCE_AND_BLOCK_LEN: usize = 96;
 
         let mut payload = state.canonical_payload();
         let old_gathering = payload
@@ -1461,7 +1463,8 @@ mod tests {
         payload[GATHERING_OFFSET + 8..GATHERING_OFFSET + CONTEXT_LEN]
             .copy_from_slice(next.proc_checkpoint_id().as_bytes());
         payload[PHASE_OFFSET] = PendingProcessingPhase::Ready as u8;
-        payload[EVIDENCE_OFFSET..EVIDENCE_OFFSET + EVIDENCE_LEN].fill(0);
+        payload[EVIDENCE_OFFSET..EVIDENCE_OFFSET + EVIDENCE_AND_BLOCK_LEN]
+            .fill(0);
         StoredPendingPipeline::decode_persisted(
             state.key(),
             state.revision().as_i64() + 1,
@@ -2036,26 +2039,56 @@ mod tests {
         .unwrap();
 
         let ready_101 = ready_realm_pipeline(&plan, authority);
-        let inflight_101 = seal_branch_exact_begin(&ready_101, active.candidate())
+        let close_101 = PendingQueueClosePlan::model(&ready_101)
+            .unwrap();
+        let wrong_authority = AuthorityScope::Realm {
+            realm_id: 8,
+            realm_sub_id: 2,
+        };
+        let wrong_plan = PendingQueueClosePlan::model(
+            &ready_realm_pipeline(&plan, wrong_authority),
+        )
+        .unwrap();
+        assert_eq!(
+            seal_branch_exact_queue_close(
+                &ready_101,
+                active.candidate(),
+                wrong_plan,
+            ),
+            Err(BranchExactPendingOrchestrationError::QueueClosePlanMismatch),
+        );
+        let sealing_101 = seal_branch_exact_queue_close(
+            &ready_101,
+            active.candidate(),
+            close_101,
+        )
             .unwrap()
             .candidate()
             .clone();
-        assert!(StableEmptyPendingGeneration::try_after_post_switch_barrier(
-            inflight_101.processing(),
+        assert!(VerifiedPendingQueueSeal::model_stable_empty(
+            close_101,
             0,
             1,
         )
         .is_err());
-        let empty_101 = StableEmptyPendingGeneration::try_after_post_switch_barrier(
-            inflight_101.processing(),
+        let empty_seal_101 = VerifiedPendingQueueSeal::model_stable_empty(
+            close_101,
             0,
             0,
         )
         .unwrap();
-        let no_work_101 = seal_branch_exact_no_work(
-            &inflight_101,
+        let empty_101 = seal_branch_exact_queue_capture(
+            &sealing_101,
             active.candidate(),
-            empty_101,
+            empty_seal_101,
+        )
+        .unwrap()
+        .candidate()
+        .clone();
+        let no_work_101 = seal_branch_exact_no_work(
+            &empty_101,
+            active.candidate(),
+            empty_seal_101,
             realm_observation(authority, 11, 10, 500),
         )
         .unwrap()
@@ -2065,19 +2098,34 @@ mod tests {
         // A second idle generation advances processed/frontier while the
         // materialized writer intentionally remains at pending 100 / height 10.
         let ready_102 = simulate_rotation(&no_work_101, 103);
-        let inflight_102 = seal_branch_exact_begin(&ready_102, active.candidate())
+        let close_102 = PendingQueueClosePlan::model(&ready_102)
+            .unwrap();
+        let sealing_102 = seal_branch_exact_queue_close(
+            &ready_102,
+            active.candidate(),
+            close_102,
+        )
             .unwrap()
             .candidate()
             .clone();
-        let no_work_102 = seal_branch_exact_no_work(
-            &inflight_102,
+        let empty_seal_102 = VerifiedPendingQueueSeal::model_stable_empty(
+            close_102,
+            0,
+            0,
+        )
+        .unwrap();
+        let empty_102 = seal_branch_exact_queue_capture(
+            &sealing_102,
             active.candidate(),
-            StableEmptyPendingGeneration::try_after_post_switch_barrier(
-                inflight_102.processing(),
-                0,
-                0,
-            )
-            .unwrap(),
+            empty_seal_102,
+        )
+        .unwrap()
+        .candidate()
+        .clone();
+        let no_work_102 = seal_branch_exact_no_work(
+            &empty_102,
+            active.candidate(),
+            empty_seal_102,
             realm_observation(authority, 12, 10, 500),
         )
         .unwrap()
@@ -2092,15 +2140,35 @@ mod tests {
         assert_eq!(still_at_baseline.watermark().pending_id().get(), 100);
 
         let ready_103 = simulate_rotation(&no_work_102, 104);
-        let inflight_103 = seal_branch_exact_begin(&ready_103, active.candidate())
+        let close_103 = PendingQueueClosePlan::model(&ready_103)
+            .unwrap();
+        let sealing_103 = seal_branch_exact_queue_close(
+            &ready_103,
+            active.candidate(),
+            close_103,
+        )
             .unwrap()
             .candidate()
             .clone();
+        let work_seal_103 = VerifiedPendingQueueSeal::model_work(
+            close_103,
+            1,
+            [0x33; 32],
+        )
+        .unwrap();
+        let captured_103 = seal_branch_exact_queue_capture(
+            &sealing_103,
+            active.candidate(),
+            work_seal_103,
+        )
+        .unwrap()
+        .candidate()
+        .clone();
         let intent = BranchExactDualWriteIntent::try_realm(
             authority,
             mapping(10, 100),
             mapping(13, 103),
-            inflight_103.processing().proc_checkpoint_id(),
+            captured_103.processing().proc_checkpoint_id(),
             &TagTreeMerkleProof::<PHash>::new_empty(),
         )
         .unwrap();
@@ -2122,13 +2190,40 @@ mod tests {
         else {
             panic!("expected prepared writer")
         };
+        let inflight_103 = seal_branch_exact_begin(
+            &captured_103,
+            prepared.candidate(),
+        )
+        .unwrap()
+        .candidate()
+        .clone();
         let write_observation = crate::rollback::branch_exact_dual_write_executor::BranchExactVerifiedWriteObservation::test_fixture(prepared_state);
         let verified = SealedBranchExactWriterCas::verify_writes(
             prepared.candidate(),
             &write_observation,
         )
         .unwrap();
+        let inflight_after_writer_advanced = seal_branch_exact_begin(
+            &captured_103,
+            verified.candidate(),
+        )
+        .unwrap();
+        assert_eq!(
+            inflight_after_writer_advanced.candidate(),
+            &inflight_103,
+        );
         let marker = realm_observation(authority, 13, 13, 600);
+        assert_eq!(
+            classify_branch_exact_publish_recovery(
+                &captured_103,
+                verified.candidate(),
+                marker.clone(),
+            )
+            .unwrap(),
+            BranchExactPendingPublishRecovery::ApplyPipeline(
+                inflight_after_writer_advanced,
+            )
+        );
         assert_eq!(
             classify_branch_exact_publish_recovery(
                 &inflight_103,
@@ -2150,9 +2245,8 @@ mod tests {
                 &inflight_103,
                 active.candidate(),
                 marker.clone(),
-            )
-            .unwrap(),
-            BranchExactPendingPublishRecovery::AwaitDurableAttempt,
+            ),
+            Err(BranchExactPendingOrchestrationError::WriterAdvancedBeforePipeline),
         );
         let publish = seal_branch_exact_publish(
             &inflight_103,

@@ -32,7 +32,8 @@ use scylla::{
 
 use super::BranchExactDeploymentNoTabletKeyspace;
 
-const PIPELINE_TABLE: &str = "branch_exact_pending_pipeline_v1";
+const PIPELINE_TABLE: &str = "branch_exact_pending_pipeline_v2";
+const RETIRED_V1_PIPELINE_TABLE: &str = "branch_exact_pending_pipeline_v1";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingPipelineQueries {
@@ -371,6 +372,18 @@ mod tests {
         assert!(golden.contains("IF revision = ? AND pipeline = ?"));
         assert!(golden.contains("PRIMARY KEY ((network_chain_id, authority_kind, realm_id, realm_sub_id))"));
         assert!(!golden.contains("proc_namespace_prefix_claim"));
+        assert!(!golden.contains(RETIRED_V1_PIPELINE_TABLE));
+    }
+
+    #[test]
+    fn v1_table_is_never_read_or_mutated_by_the_v2_adapter() {
+        let keyspace = BranchExactDeploymentNoTabletKeyspace::try_new(
+            "psy_h22d3_no_tablet".to_owned(),
+        )
+        .unwrap();
+        let golden = PendingPipelineQueries::new(&keyspace).golden();
+        assert_eq!(golden.matches(PIPELINE_TABLE).count(), 4);
+        assert_eq!(golden.matches(RETIRED_V1_PIPELINE_TABLE).count(), 0);
     }
 
     #[test]

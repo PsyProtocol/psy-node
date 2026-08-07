@@ -1,60 +1,136 @@
 //! Typed bridge between the durable pending pipeline and the branch-exact writer.
 //!
 //! This module performs no CQL.  It prevents processor code from inventing the
-//! 32-byte evidence carried by the pending-pipeline state machine: begin
-//! evidence is derived from the exact generation, publish evidence requires a
-//! durable `WritesVerified` writer row, and no-work evidence requires an exact
-//! post-switch empty-generation witness.
+//! 32-byte evidence carried by the pending-pipeline state machine. Queue close
+//! is a separate durable phase, materialized begin is bound to the exact
+//! `WritePrepared` intent, publish requires durable `WritesVerified`, and
+//! no-work requires an exact post-switch empty-generation seal.
 //!
-//! The module is deliberately private to `psy_node_scylla`. In h22d3b0 a
-//! generation-derived `InFlight` digest is not yet proof that dequeued work was
-//! durably captured. Production composition must add a Gathering/queue-seal
-//! boundary (or delay InFlight until `WritePrepared`) and expose only an
-//! effectful facade that rereads live durable state.
+//! The module is deliberately private to `psy_node_scylla`. The constructors
+//! below remain model-only until a queue backend can persist-before-ack and a
+//! narrow runtime facade can mint the corresponding opaque receipt.
 
 use std::{error::Error, fmt};
 
 use parth_core::protocol::core_types::Q256BitHash;
 use psy_data::protocol::chain_context::{AuthorityObservation, AuthorityScope};
 use psy_node_core::store::{
-    pending_generation_identity::PendingGenerationContext,
+    pending_generation_identity::{
+        PendingGenerationActivationDigest, PendingGenerationContext,
+        PendingGenerationLedgerKey,
+    },
     pending_generation_pipeline::{
-        PendingNoWorkReceiptDigest, PendingPipelineError,
-        PendingPipelineIntentDigest, PendingProcessingState,
-        PendingPublishReceiptDigest, SealedPendingPipelineTransition,
-        StoredPendingPipeline,
+        PendingEmptyQueueSealDigest, PendingNoWorkReceiptDigest,
+        PendingPipelineError, PendingPipelineIntentDigest,
+        PendingProcessingState, PendingPublishReceiptDigest,
+        PendingPipelineRevision, PendingQueueCloseIntentDigest,
+        PendingWorkCaptureDigest,
+        SealedPendingPipelineTransition, StoredPendingPipeline,
     },
 };
 use sha2::{Digest, Sha256};
 
-use super::{
-    BranchExactWriterActive, BranchExactWriterState,
-    StoredBranchExactWriterLifecycle,
-};
+use super::{BranchExactWriterActive, BranchExactWriterState, StoredBranchExactWriterLifecycle};
 
-const BEGIN_DOMAIN: &[u8] = b"psy/rollback/pending-pipeline-begin/v1";
-const STABLE_EMPTY_DOMAIN: &[u8] =
-    b"psy/rollback/pending-pipeline-stable-empty/v1";
-const NO_WORK_DOMAIN: &[u8] = b"psy/rollback/pending-pipeline-no-work/v1";
-const PUBLISH_DOMAIN: &[u8] = b"psy/rollback/pending-pipeline-publish/v1";
+const CLOSE_DOMAIN: &[u8] = b"psy/rollback/pending-pipeline-close/v2";
+const WORK_SEAL_DOMAIN: &[u8] = b"psy/rollback/pending-pipeline-work-seal/v2";
+const EMPTY_SEAL_DOMAIN: &[u8] = b"psy/rollback/pending-pipeline-empty-seal/v2";
+const BEGIN_DOMAIN: &[u8] = b"psy/rollback/pending-pipeline-begin/v2";
+const NO_WORK_DOMAIN: &[u8] = b"psy/rollback/pending-pipeline-no-work/v2";
+const PUBLISH_DOMAIN: &[u8] = b"psy/rollback/pending-pipeline-publish/v2";
 
-/// Evidence that both the finalized generation and the post-switch drain were
-/// empty for one exact pending/proc context.
+/// Exact, replay-stable request to close one processing queue generation.
 ///
-/// This witness is intentionally not constructible outside `psy_node_scylla`.
-/// h22d3b3 must replace its crate-private model constructor with evidence
-/// obtained by independently verifying the durable queue seal/barrier. Merely
-/// seeing an empty finalized output is not enough: the second, post-switch
-/// drain must also have completed with zero late items.
+/// The model constructor is crate-private. h22d3b3 must replace it with a plan
+/// issued by the narrow runtime immediately before the backend producer fence.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct StableEmptyPendingGeneration {
+pub struct PendingQueueClosePlan {
+    key: PendingGenerationLedgerKey,
+    activation_digest: PendingGenerationActivationDigest,
     processing: PendingGenerationContext,
-    digest: [u8; 32],
+    source_revision: PendingPipelineRevision,
+    digest: PendingQueueCloseIntentDigest,
 }
 
-impl StableEmptyPendingGeneration {
-    pub(crate) fn try_after_post_switch_barrier(
-        processing: PendingGenerationContext,
+impl PendingQueueClosePlan {
+    pub(crate) fn model<Hash: Q256BitHash>(
+        pipeline: &StoredPendingPipeline<Hash>,
+    ) -> Result<Self, BranchExactPendingOrchestrationError> {
+        let key = pipeline.key();
+        let activation_digest = pipeline.activation_digest();
+        let processing = pipeline.processing();
+        let source_revision = pipeline.revision();
+        let mut hasher = Sha256::new();
+        hasher.update(CLOSE_DOMAIN);
+        hasher.update(key.network().chain_id().to_be_bytes());
+        encode_authority(&mut hasher, key.authority());
+        hasher.update(activation_digest.as_bytes());
+        encode_context(&mut hasher, processing);
+        hasher.update(source_revision.get().to_be_bytes());
+        let digest = PendingQueueCloseIntentDigest::try_new(hasher.finalize().into())
+            .map_err(BranchExactPendingOrchestrationError::Pipeline)?;
+        Ok(Self {
+            key,
+            activation_digest,
+            processing,
+            source_revision,
+            digest,
+        })
+    }
+
+    pub const fn processing(&self) -> PendingGenerationContext {
+        self.processing
+    }
+
+    pub const fn source_revision(&self) -> PendingPipelineRevision {
+        self.source_revision
+    }
+
+    pub const fn digest(&self) -> PendingQueueCloseIntentDigest {
+        self.digest
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum VerifiedPendingQueueSeal {
+    Work {
+        plan: PendingQueueClosePlan,
+        item_count: u64,
+        dataset_digest: [u8; 32],
+        digest: PendingWorkCaptureDigest,
+    },
+    Empty {
+        plan: PendingQueueClosePlan,
+        digest: PendingEmptyQueueSealDigest,
+    },
+}
+
+impl VerifiedPendingQueueSeal {
+    pub(crate) fn model_work(
+        plan: PendingQueueClosePlan,
+        item_count: u64,
+        dataset_digest: [u8; 32],
+    ) -> Result<Self, BranchExactPendingOrchestrationError> {
+        if item_count == 0 || dataset_digest == [0; 32] {
+            return Err(BranchExactPendingOrchestrationError::InvalidWorkSeal);
+        }
+        let digest = queue_seal_digest(
+            WORK_SEAL_DOMAIN,
+            &plan,
+            item_count,
+            &dataset_digest,
+        )?;
+        Ok(Self::Work {
+            plan,
+            item_count,
+            dataset_digest,
+            digest: PendingWorkCaptureDigest::try_new(digest)
+                .map_err(BranchExactPendingOrchestrationError::Pipeline)?,
+        })
+    }
+
+    pub(crate) fn model_stable_empty(
+        plan: PendingQueueClosePlan,
         finalized_items: usize,
         post_switch_late_items: usize,
     ) -> Result<Self, BranchExactPendingOrchestrationError> {
@@ -64,71 +140,140 @@ impl StableEmptyPendingGeneration {
                 post_switch_late_items,
             });
         }
-        let mut hasher = Sha256::new();
-        hasher.update(STABLE_EMPTY_DOMAIN);
-        encode_context(&mut hasher, processing);
-        // Commit the two independently observed zero counts.  Keeping them in
-        // the domain is deliberate even though both are constrained to zero.
-        hasher.update((finalized_items as u64).to_be_bytes());
-        hasher.update((post_switch_late_items as u64).to_be_bytes());
-        Ok(Self {
-            processing,
-            digest: hasher.finalize().into(),
+        let digest = queue_seal_digest(EMPTY_SEAL_DOMAIN, &plan, 0, &[0; 32])?;
+        Ok(Self::Empty {
+            plan,
+            digest: PendingEmptyQueueSealDigest::try_new(digest)
+                .map_err(BranchExactPendingOrchestrationError::Pipeline)?,
         })
     }
 
-    pub const fn processing(&self) -> PendingGenerationContext {
-        self.processing
-    }
-
-    pub const fn digest(&self) -> &[u8; 32] {
-        &self.digest
+    pub const fn plan(&self) -> PendingQueueClosePlan {
+        match self {
+            Self::Work { plan, .. } | Self::Empty { plan, .. } => *plan,
+        }
     }
 }
 
-/// Seal `Ready -> InFlight` only when the writer and pipeline represent the
-/// same authority, activation, and durable predecessor frontier.
-pub fn seal_branch_exact_begin<Hash: Q256BitHash>(
+/// Persist the close intent before any queue backend is allowed to fetch or
+/// acknowledge the processing generation.
+pub fn seal_branch_exact_queue_close<Hash: Q256BitHash>(
     pipeline: &StoredPendingPipeline<Hash>,
     writer: &StoredBranchExactWriterLifecycle<Hash>,
+    plan: PendingQueueClosePlan,
 ) -> Result<SealedPendingPipelineTransition<Hash>, BranchExactPendingOrchestrationError> {
     let active = require_active_writer(pipeline, writer)?;
     if pipeline.processing_state() != PendingProcessingState::Ready {
         return Err(BranchExactPendingOrchestrationError::PipelineNotReady);
     }
+    if plan.processing != pipeline.processing() {
+        return Err(BranchExactPendingOrchestrationError::GenerationMismatch);
+    }
+    if plan.key != pipeline.key()
+        || plan.activation_digest != pipeline.activation_digest()
+        || plan.source_revision != pipeline.revision()
+    {
+        return Err(BranchExactPendingOrchestrationError::QueueClosePlanMismatch);
+    }
     require_writer_frontier(pipeline, active)?;
-    let digest = begin_digest(pipeline)?;
     pipeline
-        .seal_begin_processing(digest)
+        .seal_begin_queue_close(plan.digest())
+        .map_err(BranchExactPendingOrchestrationError::Pipeline)
+}
+
+/// Persist the independently verified result of the exact close plan.
+pub fn seal_branch_exact_queue_capture<Hash: Q256BitHash>(
+    pipeline: &StoredPendingPipeline<Hash>,
+    writer: &StoredBranchExactWriterLifecycle<Hash>,
+    seal: VerifiedPendingQueueSeal,
+) -> Result<SealedPendingPipelineTransition<Hash>, BranchExactPendingOrchestrationError> {
+    let active = require_active_writer(pipeline, writer)?;
+    let plan = seal.plan();
+    if plan.processing != pipeline.processing()
+        || plan.key != pipeline.key()
+        || plan.activation_digest != pipeline.activation_digest()
+        || plan.source_revision.get().checked_add(1)
+            != Some(pipeline.revision().get())
+        || pipeline.processing_state() != PendingProcessingState::Sealing(plan.digest())
+    {
+        return Err(BranchExactPendingOrchestrationError::QueueSealMismatch);
+    }
+    require_writer_frontier(pipeline, active)?;
+    match seal {
+        VerifiedPendingQueueSeal::Work { digest, .. } => pipeline
+            .seal_capture_work(plan.digest(), digest)
+            .map_err(BranchExactPendingOrchestrationError::Pipeline),
+        VerifiedPendingQueueSeal::Empty { digest, .. } => pipeline
+            .seal_empty_queue(plan.digest(), digest)
+            .map_err(BranchExactPendingOrchestrationError::Pipeline),
+    }
+}
+
+/// Seal `WorkCaptured -> InFlight` only from the exact durable
+/// `WritePrepared` writer intent retained either directly or inside
+/// `WritesVerified`. A generation-derived digest is insufficient.
+pub fn seal_branch_exact_begin<Hash: Q256BitHash>(
+    pipeline: &StoredPendingPipeline<Hash>,
+    writer: &StoredBranchExactWriterLifecycle<Hash>,
+) -> Result<SealedPendingPipelineTransition<Hash>, BranchExactPendingOrchestrationError> {
+    require_common_identity(pipeline, writer)?;
+    let prepared = match writer.state() {
+        BranchExactWriterState::WritePrepared(prepared) => prepared,
+        BranchExactWriterState::WritesVerified(verified) => verified.prepared(),
+        _ => {
+            return Err(
+                BranchExactPendingOrchestrationError::WriterNotPreparedOrVerified,
+            )
+        }
+    };
+    require_writer_frontier(pipeline, prepared.previous())?;
+    let PendingProcessingState::WorkCaptured(capture) = pipeline.processing_state() else {
+        return Err(BranchExactPendingOrchestrationError::WorkNotCaptured);
+    };
+    let intent = prepared.intent();
+    if intent.authority() != pipeline.key().authority()
+        || intent.predecessor() != prepared.previous().watermark()
+        || intent.candidate().pending_id() != pipeline.processing().pending_id()
+        || intent.proc_checkpoint_id() != pipeline.processing().proc_checkpoint_id()
+    {
+        return Err(BranchExactPendingOrchestrationError::WriterGenerationMismatch);
+    }
+    let digest = begin_digest(pipeline, intent.intent_digest().as_bytes(), capture)?;
+    pipeline
+        .seal_begin_processing(capture, digest)
         .map_err(BranchExactPendingOrchestrationError::Pipeline)
 }
 
 /// Seal a Realm no-work terminal state only from the exact active writer
-/// predecessor and a stable-empty witness for the processing generation.
+/// predecessor and the already persisted stable-empty queue seal.
 pub fn seal_branch_exact_no_work<Hash: Q256BitHash>(
     pipeline: &StoredPendingPipeline<Hash>,
     writer: &StoredBranchExactWriterLifecycle<Hash>,
-    empty: StableEmptyPendingGeneration,
+    empty: VerifiedPendingQueueSeal,
     observed: AuthorityObservation<Hash>,
 ) -> Result<SealedPendingPipelineTransition<Hash>, BranchExactPendingOrchestrationError> {
     let active = require_active_writer(pipeline, writer)?;
     if pipeline.key().authority() == AuthorityScope::Coordinator {
         return Err(BranchExactPendingOrchestrationError::CoordinatorNoWork);
     }
-    if empty.processing != pipeline.processing() {
+    let VerifiedPendingQueueSeal::Empty { plan, digest } = empty else {
+        return Err(BranchExactPendingOrchestrationError::ExpectedEmptySeal);
+    };
+    if plan.processing != pipeline.processing()
+        || pipeline.processing_state() != PendingProcessingState::EmptyQueueSealed(digest)
+    {
         return Err(BranchExactPendingOrchestrationError::GenerationMismatch);
     }
     require_writer_frontier(pipeline, active)?;
-    let expected_intent = require_inflight_begin(pipeline)?;
     let receipt = generation_receipt_digest(
         NO_WORK_DOMAIN,
         pipeline,
-        &[empty.digest.as_slice(), observed.to_canonical_bytes().as_slice()],
+        &[digest.as_bytes(), observed.to_canonical_bytes().as_slice()],
     )?;
     let receipt = PendingNoWorkReceiptDigest::try_new(receipt)
         .map_err(BranchExactPendingOrchestrationError::Pipeline)?;
     pipeline
-        .seal_retire_no_work(expected_intent, receipt, observed)
+        .seal_retire_no_work(digest, receipt, observed)
         .map_err(BranchExactPendingOrchestrationError::Pipeline)
 }
 
@@ -155,7 +300,10 @@ pub fn seal_branch_exact_publish<Hash: Q256BitHash>(
     {
         return Err(BranchExactPendingOrchestrationError::WriterGenerationMismatch);
     }
-    let expected_intent = require_inflight_begin(pipeline)?;
+    let expected_intent = require_inflight_begin(
+        pipeline,
+        intent.intent_digest().as_bytes(),
+    )?;
     let receipt = publish_receipt(pipeline, writer, &observed)?;
     pipeline
         .seal_publish(expected_intent, receipt, observed)
@@ -174,7 +322,6 @@ pub enum BranchExactPendingPublishRecovery<Hash> {
     ApplyPipeline(SealedPendingPipelineTransition<Hash>),
     FinishWriter,
     Complete,
-    AwaitDurableAttempt,
 }
 
 pub fn classify_branch_exact_publish_recovery<Hash: Q256BitHash>(
@@ -187,11 +334,15 @@ pub fn classify_branch_exact_publish_recovery<Hash: Q256BitHash>(
         return Err(BranchExactPendingOrchestrationError::MarkerMismatch);
     }
     match (pipeline.processing_state(), writer.state()) {
-        (PendingProcessingState::InFlight(_), BranchExactWriterState::WritesVerified(_)) => {
+        (PendingProcessingState::WorkCaptured(_), BranchExactWriterState::WritesVerified(_)) => {
+            seal_branch_exact_begin(pipeline, writer)
+                .map(BranchExactPendingPublishRecovery::ApplyPipeline)
+        }
+        (PendingProcessingState::InFlight { .. }, BranchExactWriterState::WritesVerified(_)) => {
             seal_branch_exact_publish(pipeline, writer, observed)
                 .map(BranchExactPendingPublishRecovery::ApplyPipeline)
         }
-        (PendingProcessingState::Published(stored), BranchExactWriterState::WritesVerified(_)) => {
+        (PendingProcessingState::Published { receipt: stored, .. }, BranchExactWriterState::WritesVerified(_)) => {
             if observed != *pipeline.frontier() {
                 return Err(BranchExactPendingOrchestrationError::MarkerMismatch);
             }
@@ -200,7 +351,7 @@ pub fn classify_branch_exact_publish_recovery<Hash: Q256BitHash>(
             }
             Ok(BranchExactPendingPublishRecovery::FinishWriter)
         }
-        (PendingProcessingState::Published(stored), BranchExactWriterState::Active(active)) => {
+        (PendingProcessingState::Published { receipt: stored, .. }, BranchExactWriterState::Active(active)) => {
             if observed != *pipeline.frontier()
                 || active.watermark().pending_id() != pipeline.processing().pending_id()
                 || active.watermark().canonical_chain() != pipeline.frontier().chain()
@@ -216,11 +367,8 @@ pub fn classify_branch_exact_publish_recovery<Hash: Q256BitHash>(
             }
             Ok(BranchExactPendingPublishRecovery::Complete)
         }
-        (PendingProcessingState::InFlight(_), BranchExactWriterState::Active(_)) => {
-            // This is still a valid pre-intent/gathering state in h22d3b0.
-            // It must never be treated as published or complete. h22d3b1 will
-            // make Gathering versus materialized InFlight explicit.
-            Ok(BranchExactPendingPublishRecovery::AwaitDurableAttempt)
+        (PendingProcessingState::InFlight { .. }, BranchExactWriterState::Active(_)) => {
+            Err(BranchExactPendingOrchestrationError::WriterAdvancedBeforePipeline)
         }
         _ => Err(BranchExactPendingOrchestrationError::PublishRecoveryStateMismatch),
     }
@@ -326,20 +474,56 @@ fn require_common_identity<Hash: Q256BitHash>(
 
 fn require_inflight_begin<Hash: Q256BitHash>(
     pipeline: &StoredPendingPipeline<Hash>,
+    writer_intent_digest: &[u8; 32],
 ) -> Result<PendingPipelineIntentDigest, BranchExactPendingOrchestrationError> {
-    let digest = begin_digest(pipeline)?;
-    if pipeline.processing_state() != PendingProcessingState::InFlight(digest) {
+    let PendingProcessingState::InFlight { capture, intent } =
+        pipeline.processing_state()
+    else {
+        return Err(BranchExactPendingOrchestrationError::InFlightIdentityMismatch);
+    };
+    let expected = begin_digest(pipeline, writer_intent_digest, capture)?;
+    if intent != expected {
         return Err(BranchExactPendingOrchestrationError::InFlightIdentityMismatch);
     }
-    Ok(digest)
+    Ok(intent)
 }
 
 fn begin_digest<Hash: Q256BitHash>(
     pipeline: &StoredPendingPipeline<Hash>,
+    writer_intent_digest: &[u8; 32],
+    capture: PendingWorkCaptureDigest,
 ) -> Result<PendingPipelineIntentDigest, BranchExactPendingOrchestrationError> {
-    let digest = receipt_digest(BEGIN_DOMAIN, pipeline, &[])?;
+    let digest = receipt_digest(
+        BEGIN_DOMAIN,
+        pipeline,
+        &[capture.as_bytes(), writer_intent_digest],
+    )?;
     PendingPipelineIntentDigest::try_new(digest)
         .map_err(BranchExactPendingOrchestrationError::Pipeline)
+}
+
+fn queue_seal_digest(
+    domain: &[u8],
+    plan: &PendingQueueClosePlan,
+    item_count: u64,
+    dataset_digest: &[u8; 32],
+) -> Result<[u8; 32], BranchExactPendingOrchestrationError> {
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update(plan.key.network().chain_id().to_be_bytes());
+    encode_authority(&mut hasher, plan.key.authority());
+    hasher.update(plan.activation_digest.as_bytes());
+    encode_context(&mut hasher, plan.processing);
+    hasher.update(plan.source_revision.get().to_be_bytes());
+    hasher.update(plan.digest.as_bytes());
+    hasher.update(item_count.to_be_bytes());
+    hasher.update(dataset_digest);
+    let digest: [u8; 32] = hasher.finalize().into();
+    if digest == [0; 32] {
+        Err(BranchExactPendingOrchestrationError::EmptyDerivedDigest)
+    } else {
+        Ok(digest)
+    }
 }
 
 fn receipt_digest<Hash: Q256BitHash>(
@@ -421,16 +605,23 @@ pub enum BranchExactPendingOrchestrationError {
     ActivationMismatch,
     PipelineNotReady,
     WriterNotActive,
+    WriterNotPreparedOrVerified,
     WriterNotWritesVerified,
     WriterFrontierMismatch,
     WriterGenerationMismatch,
     InFlightIdentityMismatch,
+    WorkNotCaptured,
+    QueueClosePlanMismatch,
+    QueueSealMismatch,
+    ExpectedEmptySeal,
+    InvalidWorkSeal,
     GenerationMismatch,
     CoordinatorNoWork,
     MarkerMismatch,
     PublishReceiptMismatch,
     PublishRecoveryStateMismatch,
     MissingActiveIntent,
+    WriterAdvancedBeforePipeline,
     GenerationNotStableEmpty {
         finalized_items: usize,
         post_switch_late_items: usize,
