@@ -1,7 +1,9 @@
 //! Isolated schema-migration prototype for the two Realm commit blockers.
 //!
-//! This module is intentionally absent from `psy_setup.rs` and every current
-//! writer.  It proves the target shape for replacing the reusable-height
+//! Its read/write adapter is intentionally absent from `psy_setup.rs` and
+//! every current writer. The h20 setup gate can only inspect the target and
+//! retain opaque prepared reads after durable verification. This module
+//! proves the target shape for replacing the reusable-height
 //! pending mapping and for removing pending-keyed reward proofs from the
 //! mixed-axis `checkpointed_object_table`.
 
@@ -140,10 +142,12 @@ pub enum BranchExactTargetManifest {
     ExactMutation,
 }
 
-/// The target is deliberately not part of production setup yet.
+/// Static migration-target readiness. Runtime setup readiness is represented
+/// by the h20 durable setup token and never changes this catalog into a
+/// serving authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BranchExactTargetReadiness {
-    ReservedNotMaterialized,
+    MigrationTargetNotActive,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -177,7 +181,7 @@ pub const BRANCH_EXACT_SCHEMA_TARGETS: [BranchExactSchemaTargetDescriptor; 3] = 
         axis: BranchExactTargetAxis::CanonicalChainRefPartition,
         action: BranchExactTargetAction::PreserveAppendOnly,
         manifest: BranchExactTargetManifest::PairPhysicalDirection,
-        readiness: BranchExactTargetReadiness::ReservedNotMaterialized,
+        readiness: BranchExactTargetReadiness::MigrationTargetNotActive,
     },
     BranchExactSchemaTargetDescriptor {
         logical: BranchExactLogicalTableId::PendingIdToCanonicalChainRef,
@@ -193,7 +197,7 @@ pub const BRANCH_EXACT_SCHEMA_TARGETS: [BranchExactSchemaTargetDescriptor; 3] = 
         axis: BranchExactTargetAxis::UniquePendingPartition,
         action: BranchExactTargetAction::PreserveAppendOnly,
         manifest: BranchExactTargetManifest::PairPhysicalDirection,
-        readiness: BranchExactTargetReadiness::ReservedNotMaterialized,
+        readiness: BranchExactTargetReadiness::MigrationTargetNotActive,
     },
     BranchExactSchemaTargetDescriptor {
         logical: BranchExactLogicalTableId::PendingRewardTopProof,
@@ -207,7 +211,7 @@ pub const BRANCH_EXACT_SCHEMA_TARGETS: [BranchExactSchemaTargetDescriptor; 3] = 
         axis: BranchExactTargetAxis::UniquePendingPartition,
         action: BranchExactTargetAction::RotatePendingNamespace,
         manifest: BranchExactTargetManifest::ExactMutation,
-        readiness: BranchExactTargetReadiness::ReservedNotMaterialized,
+        readiness: BranchExactTargetReadiness::MigrationTargetNotActive,
     },
 ];
 
@@ -981,8 +985,9 @@ struct PreparedBranchExact {
     proof_scan: Option<PreparedStatement>,
 }
 
-/// Isolated schema materializer used by deployment tooling and future RF=3
-/// tests. It is not referenced by `psy_setup.rs` or any node startup path.
+/// Isolated schema materializer used by deployment tooling and RF=3 tests.
+/// Production setup may call `inspect_schema` through the h20 default-off
+/// gate, but never calls `materialize_schema`.
 pub struct BranchExactSchemaMaterializer;
 
 impl BranchExactSchemaMaterializer {
@@ -1469,7 +1474,7 @@ mod tests {
             assert_eq!(descriptor.logical, logical);
             assert_eq!(
                 descriptor.readiness,
-                BranchExactTargetReadiness::ReservedNotMaterialized
+                BranchExactTargetReadiness::MigrationTargetNotActive
             );
             assert_eq!(descriptor.physical_name, logical.table_name());
             assert!(!descriptor.physical_name.starts_with("d04"));

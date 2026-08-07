@@ -19,6 +19,9 @@ mod branch_exact_schema_deployment_lifecycle;
 mod branch_exact_schema_backfill;
 mod branch_exact_schema_backfill_executor;
 mod branch_exact_schema_exporter;
+mod branch_exact_schema_setup;
+#[cfg(test)]
+mod branch_exact_schema_setup_rf3_gate;
 mod authority_local_head_prototype;
 mod authority_timestamp_prototype;
 mod checkpoint_kiv;
@@ -64,6 +67,7 @@ pub use branch_exact_schema_deployment_lifecycle::*;
 pub use branch_exact_schema_backfill::*;
 pub use branch_exact_schema_backfill_executor::*;
 pub use branch_exact_schema_exporter::*;
+pub use branch_exact_schema_setup::*;
 pub use authority_local_head_prototype::*;
 pub use authority_timestamp_prototype::*;
 pub use checkpoint_kiv::*;

@@ -57,6 +57,8 @@ pub const RAW_SCYLLA_ACCESS_ALLOWLIST: &[RawScyllaAccessAllowance] = &[
     allow!("psy_node_scylla/src/rollback/authority_timestamp_prototype.rs", DurableControlAuthority),
     allow!("psy_node_scylla/src/rollback/branch_exact_schema_backfill_executor.rs", RollbackPrototypeAdapter),
     allow!("psy_node_scylla/src/rollback/branch_exact_schema_exporter.rs", RollbackPrototypeAdapter),
+    allow!("psy_node_scylla/src/rollback/branch_exact_schema_setup.rs", RollbackPrototypeAdapter),
+    allow!("psy_node_scylla/src/rollback/branch_exact_schema_setup_rf3_gate.rs", TestHarness),
     allow!("psy_node_scylla/src/rollback/branch_exact_schema_deployment.rs", RollbackPrototypeAdapter),
     allow!("psy_node_scylla/src/rollback/branch_exact_schema_deployment_lifecycle.rs", RollbackPrototypeAdapter),
     allow!("psy_node_scylla/src/rollback/branch_exact_schema_migration.rs", RollbackPrototypeAdapter),

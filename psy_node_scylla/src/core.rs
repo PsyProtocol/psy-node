@@ -18,8 +18,11 @@ use psy_node_core::store::rollback_admission::{
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
 use crate::rollback::{
+    BranchExactSchemaReady, BranchExactSchemaReadyView,
+    BranchExactSchemaSetupError, BranchExactSchemaSetupMode,
+    BranchExactSchemaSetupOutcome,
     CanonicalHeadNoTabletKeyspace, ScyllaCanonicalHeadStore,
-    ScyllaRollbackAdmissionStore,
+    ScyllaBranchExactSchemaSetupGate, ScyllaRollbackAdmissionStore,
 };
 use crate::tables::{merkle::ScyllaMerkleNodesZeroPreparedStatements, traits::ScyllaStandardPreparedTableStatements};
 use crate::tables::traits::ScyllaNoTabletPreparedTableStatements;
@@ -33,6 +36,7 @@ pub struct ScyllaCoreStore<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> {
     pub realm_sub_id: u64,
     canonical_head_store: Arc<OnceLock<Arc<ScyllaCanonicalHeadStore>>>,
     rollback_admission_store: Arc<OnceLock<Arc<ScyllaRollbackAdmissionStore>>>,
+    branch_exact_schema_ready: Arc<OnceLock<Arc<BranchExactSchemaReady>>>,
     _phantom_hash: std::marker::PhantomData<Hash>,
     _phantom_hasher: std::marker::PhantomData<Hasher>,
 }
@@ -92,6 +96,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
             realm_sub_id,
             canonical_head_store: Arc::new(OnceLock::new()),
             rollback_admission_store: Arc::new(OnceLock::new()),
+            branch_exact_schema_ready: Arc::new(OnceLock::new()),
             _phantom_hash: std::marker::PhantomData,
             _phantom_hasher: std::marker::PhantomData,
         })
@@ -193,6 +198,71 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
             .set(adapter)
             .map_err(|_| anyhow::anyhow!("Coordinator rollback-admission store initialized more than once"))?;
         Ok(())
+    }
+
+    /// Default-off branch-exact schema setup gate. `Disabled` performs no
+    /// branch-exact CQL. `RequireVerified` only prepares opaque read
+    /// statements after exact durable BACKFILL_VERIFIED and live-schema
+    /// checks; it does not expose reader/writer/cutover authority.
+    pub async fn initialize_branch_exact_schema_setup(
+        &self,
+        expected_authority: psy_node_core::store::branch_exact_schema::AuthorityScope,
+        mode: BranchExactSchemaSetupMode,
+    ) -> Result<BranchExactSchemaSetupOutcome, BranchExactSchemaSetupError> {
+        let BranchExactSchemaSetupMode::RequireVerified(request) = mode else {
+            if self.branch_exact_schema_ready.get().is_some() {
+                return Err(
+                    BranchExactSchemaSetupError::AlreadyInitializedWithDifferentReceipt,
+                );
+            }
+            return Ok(BranchExactSchemaSetupOutcome::Disabled);
+        };
+        let candidate = Arc::new(
+            ScyllaBranchExactSchemaSetupGate::authorize(
+                self.session.clone(),
+                &self.keyspace,
+                &self.no_tablet_keyspace,
+                expected_authority,
+                &request,
+            )
+            .await?,
+        );
+        match self.branch_exact_schema_ready.set(candidate.clone()) {
+            Ok(()) => Ok(BranchExactSchemaSetupOutcome::Ready(
+                candidate.view().clone(),
+            )),
+            Err(_) => {
+                let current = self
+                    .branch_exact_schema_ready
+                    .get()
+                    .expect("OnceLock rejected set but has no current value");
+                if current.view() == candidate.view() {
+                    Ok(BranchExactSchemaSetupOutcome::Idempotent(
+                        current.view().clone(),
+                    ))
+                } else {
+                    Err(
+                        BranchExactSchemaSetupError::AlreadyInitializedWithDifferentReceipt,
+                    )
+                }
+            }
+        }
+    }
+
+    pub fn branch_exact_schema_setup_view(
+        &self,
+    ) -> Option<BranchExactSchemaReadyView> {
+        self.branch_exact_schema_ready
+            .get()
+            .map(|ready| ready.view().clone())
+    }
+
+    pub(crate) fn require_branch_exact_schema_ready(
+        &self,
+    ) -> Result<&BranchExactSchemaReady, BranchExactSchemaSetupError> {
+        self.branch_exact_schema_ready.get().map(Arc::as_ref).ok_or(
+            BranchExactSchemaSetupError::LifecycleUninitialized,
+        )
     }
 
     fn coordinator_canonical_head(&self) -> anyhow::Result<&ScyllaCanonicalHeadStore> {

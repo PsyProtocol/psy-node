@@ -1,10 +1,14 @@
 use std::sync::Arc;
 
 use parth_core::{data::db::table::QDatabaseTableRoutingKey, protocol::core_types::QNetworkDatabaseTypes};
-use psy_node_core::psy_core_db::v3_implementation::full::PsyUnifiedCoreDatabaseStore;
+use psy_node_core::{
+    psy_core_db::v3_implementation::full::PsyUnifiedCoreDatabaseStore,
+    store::branch_exact_schema::AuthorityScope,
+};
 
 use crate::{
     core::ScyllaCoreStore,
+    rollback::BranchExactSchemaSetupMode,
     tables::{
         blob::ScyllaBiDirectionalBlobToBlobTablePreparedStatements, bridge::{deposit_leaf::ScyllaBridgeDepositLeafPreparedStatements, next_index::ScyllaBridgeDepositNextIndexPreparedStatements}, counter::u64_counter::ScyllaU64ToU64CounterTablePreparedStatements, hash_to_many_ids::ScyllaHashToManyIdsTablePreparedStatements, imt::{imt_key_index::ScyllaIMTKeyIndexPreparedStatements, imt_leaf::ScyllaIMTLeafPreparedStatements, imt_next_append_index::ScyllaIMTNextAppendIndexPreparedStatements}, merkle::{ScyllaDoubleMerkleNodesPreparedStatements, ScyllaMerkleNodesPreparedStatements, ScyllaMerkleNodesZeroPreparedStatements}, object::{
             ScyllaGenericKeyIdValueTablePreparedStatements, ScyllaGenericObjectDoubleIdTablePreparedStatements,
@@ -320,6 +324,26 @@ pub async fn setup_coordinator_psy_scylla_database_store_from_connection_string<
     connection_string: &str,
     create_tables: bool,
 ) -> anyhow::Result<ScyllaUnifiedPsyStore<N, N::QHash, N::HasherBase>> {
+    setup_coordinator_psy_scylla_database_store_with_branch_exact_schema::<N>(
+        keyspace,
+        connection_string,
+        create_tables,
+        BranchExactSchemaSetupMode::Disabled,
+    )
+    .await
+}
+
+/// Explicit Coordinator composition root for the default-off branch-exact
+/// setup gate. The branch schema is never created here; a requested mode must
+/// already have a durable BACKFILL_VERIFIED lifecycle and exact live schema.
+pub async fn setup_coordinator_psy_scylla_database_store_with_branch_exact_schema<
+    N: QNetworkDatabaseTypes,
+>(
+    keyspace: &str,
+    connection_string: &str,
+    create_tables: bool,
+    branch_exact_mode: BranchExactSchemaSetupMode,
+) -> anyhow::Result<ScyllaUnifiedPsyStore<N, N::QHash, N::HasherBase>> {
     let db = setup_psy_scylla_database_store_from_connection_string::<N>(
         keyspace,
         connection_string,
@@ -331,6 +355,58 @@ pub async fn setup_coordinator_psy_scylla_database_store_from_connection_string<
         .await?;
     db.store
         .initialize_coordinator_rollback_admission(create_tables)
+        .await?;
+    db.store
+        .initialize_branch_exact_schema_setup(
+            AuthorityScope::Coordinator,
+            branch_exact_mode,
+        )
+        .await?;
+    Ok(db)
+}
+
+/// Explicit Realm composition root for branch-exact setup preparation. The
+/// generic setup cannot infer Realm identity and therefore cannot enable this
+/// path. Existing callers remain default-off.
+pub async fn setup_realm_psy_scylla_database_store_with_branch_exact_schema<
+    N: QNetworkDatabaseTypes,
+>(
+    keyspace: &str,
+    connection_string: &str,
+    create_tables: bool,
+    realm_id: u32,
+    realm_sub_id: u16,
+    branch_exact_mode: BranchExactSchemaSetupMode,
+) -> anyhow::Result<ScyllaUnifiedPsyStore<N, N::QHash, N::HasherBase>> {
+    if connection_string.is_empty() {
+        anyhow::bail!("Scylla Connection string is empty");
+    }
+    let addresses = connection_string
+        .split(',')
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let store = Arc::new(
+        ScyllaCoreStore::new(
+            u64::from(realm_id),
+            u64::from(realm_sub_id),
+            keyspace.to_owned(),
+            &addresses,
+        )
+        .await?,
+    );
+    let db = if create_tables {
+        setup_psy_scylla_database_store::<N>(store).await?
+    } else {
+        prepare_psy_scylla_database_store::<N>(store).await?
+    };
+    db.store
+        .initialize_branch_exact_schema_setup(
+            AuthorityScope::Realm {
+                realm_id,
+                realm_sub_id,
+            },
+            branch_exact_mode,
+        )
         .await?;
     Ok(db)
 }
