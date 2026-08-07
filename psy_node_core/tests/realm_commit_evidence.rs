@@ -38,7 +38,9 @@ use psy_data::{
             CanonicalChainRef, ChainEpoch, CheckpointHash, CheckpointId,
             CheckpointRef, NetworkId,
         },
-        chain_context::{AuthorityScope, AuthorityStateCheckpointId},
+        chain_context::{
+            AuthorityScope, AuthorityStateCheckpointId, AuthorityStateRoot,
+        },
     },
     v1::qdata::{
         checkpoint::{
@@ -51,16 +53,31 @@ use psy_data::{
     },
 };
 use psy_node_core::store::{
+    authority_commit::{
+        AuthorityClockSampleUs, AuthorityTimestampBootstrap,
+        AuthorityTimestampBootstrapReason, AuthorityTimestampKey,
+    },
+    manifest_intent::{
+        AuthorityHeadPayload, AuthorityStateTransition,
+        ManifestArtifactSetCommitment, SealedAuthorityCommitIntent,
+    },
+    manifest_record::PreparedAuthorityManifestRecord,
     realm_commit_evidence::{
         PersistedRealmCommitEvidence, RealmCommitEvidenceError,
         SealedRealmCommitEvidence, REALM_COMMIT_EVIDENCE_CODEC_VERSION,
         REALM_COMMIT_EVIDENCE_V1_LEN,
+    },
+    realm_manifest_evidence::{
+        PersistedRealmManifestEvidence, RealmManifestEvidenceError,
+        SealedRealmManifestEvidence, REALM_MANIFEST_EVIDENCE_CODEC_VERSION,
+        REALM_MANIFEST_EVIDENCE_V1_LEN,
     },
     realm_imt_mutation_graph::{
         RealmImtBaselineNodeKey, RealmImtMutationGraphConfig,
         RealmImtMutationGraphPlan, SealedRealmImtMutationGraph,
     },
     realm_proof_binding::{RealmProofBindingError, SealedRealmProofBinding},
+    timestamp::CommitWriteTimestampUs,
 };
 use psy_serialize::FastFixedSerializable;
 
@@ -517,6 +534,88 @@ fn bundle(
     )?)
 }
 
+fn prepared_manifest(
+    authority: AuthorityScope,
+    candidate_chain: CanonicalChainRef<PHash>,
+    predecessor: u64,
+    old_root: PHash,
+    new_root: PHash,
+    changed: bool,
+    seed: u8,
+) -> PreparedAuthorityManifestRecord<PHash> {
+    let key = AuthorityTimestampKey::new(candidate_chain.network_id(), authority);
+    let expected_chain = CanonicalChainRef::new(
+        candidate_chain.network_id(),
+        candidate_chain.chain_epoch(),
+        CheckpointRef::new(
+            CheckpointId::new(STATE - 1),
+            CheckpointHash::from_last_chain_hash(hash(200)),
+        ),
+    );
+    let state_transition = if changed {
+        AuthorityStateTransition::Changed {
+            previous_checkpoint: AuthorityStateCheckpointId::new(predecessor),
+            checkpoint: AuthorityStateCheckpointId::new(STATE),
+            old_root: AuthorityStateRoot::from_local_state_root(old_root),
+            new_root: AuthorityStateRoot::from_local_state_root(new_root),
+        }
+    } else {
+        AuthorityStateTransition::Unchanged {
+            checkpoint: AuthorityStateCheckpointId::new(predecessor),
+            root: AuthorityStateRoot::from_local_state_root(old_root),
+        }
+    };
+    let summary = vec![seed; 24];
+    let artifacts = ManifestArtifactSetCommitment::from_verified_artifact_summary(
+        &summary,
+        [seed.wrapping_add(2); 32],
+        1,
+        1,
+        1,
+        8,
+    )
+    .unwrap();
+    let intent = SealedAuthorityCommitIntent::seal_normal_advance(
+        key,
+        expected_chain,
+        candidate_chain,
+        state_transition,
+        AuthorityHeadPayload::try_new(vec![seed.wrapping_add(3); 16]).unwrap(),
+        artifacts,
+    )
+    .unwrap();
+    let bootstrap = AuthorityTimestampBootstrap::new(
+        key,
+        CommitWriteTimestampUs::try_from_i128(2_000).unwrap(),
+        AuthorityTimestampBootstrapReason::GenesisNative,
+    );
+    let reservation = bootstrap
+        .candidate()
+        .seal_reservation(
+            key,
+            intent.digest(),
+            AuthorityClockSampleUs::try_from_i128(2_001).unwrap(),
+        )
+        .unwrap();
+    let prepared = intent.attach_timestamp_lease(reservation.lease()).unwrap();
+    PreparedAuthorityManifestRecord::seal(&prepared, summary).unwrap()
+}
+
+fn matching_manifest(
+    fixture: &Fixture,
+    seed: u8,
+) -> PreparedAuthorityManifestRecord<PHash> {
+    prepared_manifest(
+        fixture.authority,
+        fixture.coordinator.canonical_chain_ref,
+        PREDECESSOR,
+        fixture.prepared.old_realm_root,
+        fixture.prepared.new_realm_root,
+        true,
+        seed,
+    )
+}
+
 #[test]
 fn real_proof_and_graph_seals_form_one_deterministic_bundle() {
     let fixture = fixture(0, 0, COORDINATOR_HEIGHT);
@@ -699,4 +798,252 @@ fn bundle_digest_commits_to_both_live_component_seals() {
     assert_ne!(baseline.proof().digest(), altered.proof().digest());
     assert_eq!(baseline.graph().digest(), altered.graph().digest());
     assert_ne!(baseline.digest(), altered.digest());
+}
+
+#[test]
+fn live_bundle_binds_one_exact_prepared_manifest() {
+    let fixture = fixture(0, 0, COORDINATOR_HEIGHT);
+    let prepared = matching_manifest(&fixture, 31);
+    let supplement = SealedRealmManifestEvidence::try_bind(
+        &prepared,
+        bundle(&fixture).unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        supplement.encode_canonical().len(),
+        REALM_MANIFEST_EVIDENCE_V1_LEN
+    );
+    assert_eq!(
+        supplement.record().prepared_manifest_digest(),
+        prepared.digest()
+    );
+    assert_eq!(
+        supplement
+            .record()
+            .realm_commit_evidence()
+            .canonical_chain(),
+        prepared.intent().candidate_chain()
+    );
+    supplement.record().verify_for(&prepared).unwrap();
+
+    let persisted = PersistedRealmManifestEvidence::<PHash>::decode_canonical(
+        supplement.encode_canonical(),
+    )
+    .unwrap();
+    assert_eq!(&persisted, supplement.record());
+    assert_eq!(persisted.digest(), supplement.digest());
+    persisted.verify_for(&prepared).unwrap();
+
+    let same_identity_and_state_but_different_manifest =
+        matching_manifest(&fixture, 32);
+    assert_eq!(
+        persisted
+            .verify_for(&same_identity_and_state_but_different_manifest)
+            .unwrap_err(),
+        RealmManifestEvidenceError::PreparedManifestDigestMismatch
+    );
+}
+
+#[test]
+fn manifest_identity_state_and_roots_must_match_live_bundle() {
+    let fixture = fixture(0, 0, COORDINATOR_HEIGHT);
+    let different_authority = prepared_manifest(
+        AuthorityScope::Realm {
+            realm_id: REALM_ID as u32,
+            realm_sub_id: (REALM_SUB_ID + 1) as u16,
+        },
+        fixture.coordinator.canonical_chain_ref,
+        PREDECESSOR,
+        fixture.prepared.old_realm_root,
+        fixture.prepared.new_realm_root,
+        true,
+        40,
+    );
+    assert_eq!(
+        SealedRealmManifestEvidence::try_bind(
+            &different_authority,
+            bundle(&fixture).unwrap(),
+        )
+        .unwrap_err(),
+        RealmManifestEvidenceError::AuthorityMismatch
+    );
+
+    let different_chain = CanonicalChainRef::new(
+        fixture.coordinator.canonical_chain_ref.network_id(),
+        fixture.coordinator.canonical_chain_ref.chain_epoch(),
+        CheckpointRef::new(
+            CheckpointId::new(STATE),
+            CheckpointHash::from_last_chain_hash(hash(241)),
+        ),
+    );
+    let wrong_chain = prepared_manifest(
+        fixture.authority,
+        different_chain,
+        PREDECESSOR,
+        fixture.prepared.old_realm_root,
+        fixture.prepared.new_realm_root,
+        true,
+        41,
+    );
+    assert_eq!(
+        SealedRealmManifestEvidence::try_bind(
+            &wrong_chain,
+            bundle(&fixture).unwrap(),
+        )
+        .unwrap_err(),
+        RealmManifestEvidenceError::CanonicalChainMismatch
+    );
+
+    let wrong_predecessor = prepared_manifest(
+        fixture.authority,
+        fixture.coordinator.canonical_chain_ref,
+        PREDECESSOR - 1,
+        fixture.prepared.old_realm_root,
+        fixture.prepared.new_realm_root,
+        true,
+        42,
+    );
+    assert_eq!(
+        SealedRealmManifestEvidence::try_bind(
+            &wrong_predecessor,
+            bundle(&fixture).unwrap(),
+        )
+        .unwrap_err(),
+        RealmManifestEvidenceError::PredecessorCheckpointMismatch {
+            manifest: AuthorityStateCheckpointId::new(PREDECESSOR - 1),
+            bundle: AuthorityStateCheckpointId::new(PREDECESSOR),
+        }
+    );
+
+    let wrong_old_root = prepared_manifest(
+        fixture.authority,
+        fixture.coordinator.canonical_chain_ref,
+        PREDECESSOR,
+        hash(242),
+        fixture.prepared.new_realm_root,
+        true,
+        43,
+    );
+    assert_eq!(
+        SealedRealmManifestEvidence::try_bind(
+            &wrong_old_root,
+            bundle(&fixture).unwrap(),
+        )
+        .unwrap_err(),
+        RealmManifestEvidenceError::OldRealmRootMismatch
+    );
+
+    let wrong_new_root = prepared_manifest(
+        fixture.authority,
+        fixture.coordinator.canonical_chain_ref,
+        PREDECESSOR,
+        fixture.prepared.old_realm_root,
+        hash(243),
+        true,
+        44,
+    );
+    assert_eq!(
+        SealedRealmManifestEvidence::try_bind(
+            &wrong_new_root,
+            bundle(&fixture).unwrap(),
+        )
+        .unwrap_err(),
+        RealmManifestEvidenceError::NewRealmRootMismatch
+    );
+}
+
+#[test]
+fn coordinator_or_unchanged_manifest_cannot_accept_realm_bundle() {
+    let fixture = fixture(0, 0, COORDINATOR_HEIGHT);
+    let coordinator = prepared_manifest(
+        AuthorityScope::Coordinator,
+        fixture.coordinator.canonical_chain_ref,
+        PREDECESSOR,
+        fixture.prepared.old_realm_root,
+        fixture.prepared.new_realm_root,
+        true,
+        50,
+    );
+    assert_eq!(
+        SealedRealmManifestEvidence::try_bind(
+            &coordinator,
+            bundle(&fixture).unwrap(),
+        )
+        .unwrap_err(),
+        RealmManifestEvidenceError::RealmAuthorityRequired
+    );
+
+    let unchanged = prepared_manifest(
+        fixture.authority,
+        fixture.coordinator.canonical_chain_ref,
+        PREDECESSOR,
+        fixture.prepared.old_realm_root,
+        fixture.prepared.old_realm_root,
+        false,
+        51,
+    );
+    assert_eq!(
+        SealedRealmManifestEvidence::try_bind(
+            &unchanged,
+            bundle(&fixture).unwrap(),
+        )
+        .unwrap_err(),
+        RealmManifestEvidenceError::ChangedRealmManifestRequired
+    );
+}
+
+#[test]
+fn manifest_supplement_codec_fails_closed_without_recreating_live_authority() {
+    let fixture = fixture(0, 0, COORDINATOR_HEIGHT);
+    let prepared = matching_manifest(&fixture, 60);
+    let bytes = SealedRealmManifestEvidence::try_bind(
+        &prepared,
+        bundle(&fixture).unwrap(),
+    )
+    .unwrap()
+    .encode_canonical()
+    .to_vec();
+
+    assert_eq!(
+        PersistedRealmManifestEvidence::<PHash>::decode_canonical(
+            &bytes[..bytes.len() - 1],
+        ),
+        Err(RealmManifestEvidenceError::InvalidCanonicalLength {
+            expected: REALM_MANIFEST_EVIDENCE_V1_LEN,
+            actual: REALM_MANIFEST_EVIDENCE_V1_LEN - 1,
+        })
+    );
+    let mut bad_magic = bytes.clone();
+    bad_magic[0] ^= 1;
+    assert_eq!(
+        PersistedRealmManifestEvidence::<PHash>::decode_canonical(&bad_magic),
+        Err(RealmManifestEvidenceError::InvalidMagic)
+    );
+    let mut bad_version = bytes.clone();
+    bad_version[8..10].copy_from_slice(
+        &(REALM_MANIFEST_EVIDENCE_CODEC_VERSION + 1).to_le_bytes(),
+    );
+    assert_eq!(
+        PersistedRealmManifestEvidence::<PHash>::decode_canonical(&bad_version),
+        Err(RealmManifestEvidenceError::UnknownCodecVersion(2))
+    );
+    let mut bad_nested_bundle = bytes.clone();
+    bad_nested_bundle[100] ^= 1;
+    assert!(matches!(
+        PersistedRealmManifestEvidence::<PHash>::decode_canonical(
+            &bad_nested_bundle
+        ),
+        Err(RealmManifestEvidenceError::RealmCommitEvidence(
+            RealmCommitEvidenceError::BundleDigestMismatch
+        ))
+    ));
+    let mut bad_outer_digest = bytes;
+    *bad_outer_digest.last_mut().unwrap() ^= 1;
+    assert_eq!(
+        PersistedRealmManifestEvidence::<PHash>::decode_canonical(
+            &bad_outer_digest
+        ),
+        Err(RealmManifestEvidenceError::SupplementDigestMismatch)
+    );
 }

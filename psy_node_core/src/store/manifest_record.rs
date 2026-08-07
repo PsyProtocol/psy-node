@@ -168,6 +168,10 @@ impl AuthorityManifestDigest {
         &self.0
     }
 
+    pub(crate) const fn from_persisted(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
     fn calculate(payload: &[u8]) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(PREPARED_MANIFEST_DIGEST_DOMAIN);

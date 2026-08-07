@@ -296,6 +296,10 @@ impl<Hash: Q256BitHash, Hasher> SealedRealmCommitEvidence<Hash, Hasher> {
     pub const fn record(&self) -> &PersistedRealmCommitEvidence<Hash> { &self.record }
     pub const fn digest(&self) -> RealmCommitEvidenceDigest { self.record.digest }
     pub fn encode_canonical(&self) -> &[u8] { self.record.encode_canonical() }
+
+    pub fn into_record(self) -> PersistedRealmCommitEvidence<Hash> {
+        self.record
+    }
 }
 
 fn validate_identity<Hash: Q256BitHash>(
