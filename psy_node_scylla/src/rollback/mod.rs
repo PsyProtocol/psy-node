@@ -13,6 +13,7 @@
 //! None is connected to production setup or current writers yet.
 
 mod canonical_head_prototype;
+mod branch_exact_schema_migration;
 mod authority_local_head_prototype;
 mod authority_timestamp_prototype;
 mod checkpoint_kiv;
@@ -52,6 +53,7 @@ mod timestamped;
 mod registry;
 
 pub use canonical_head_prototype::*;
+pub use branch_exact_schema_migration::*;
 pub use authority_local_head_prototype::*;
 pub use authority_timestamp_prototype::*;
 pub use checkpoint_kiv::*;

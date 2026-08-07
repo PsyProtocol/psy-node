@@ -51,6 +51,12 @@ pub enum RealmNormalCommitDurabilityBlocker {
     RetireCandidate {
         write_domain: RealmNormalCommitWriteDomain,
     },
+    /// The physical pending-keyed row does not collide, but its stored value
+    /// contains only a reusable checkpoint height. It cannot identify the
+    /// canonical branch occurrence after rollback.
+    LegacyHeightOnlyReverseMapping {
+        write_domain: RealmNormalCommitWriteDomain,
+    },
     IgnoredPreparedPayload(IgnoredRealmPreparedField),
     ExplicitProductionWriteTimestampIncomplete,
     ProductionWriterCoverageIncomplete {
@@ -177,6 +183,13 @@ pub fn resolve_realm_normal_commit_coverage(
                     write_domain,
                 },
             ),
+        }
+        if write_domain == RealmNormalCommitWriteDomain::PendingToCheckpoint {
+            blockers.push(
+                RealmNormalCommitDurabilityBlocker::LegacyHeightOnlyReverseMapping {
+                    write_domain,
+                },
+            );
         }
         if production_writer_is_typed_timestamped(write_domain) {
             production_writer_covered_domains += 1;
@@ -417,6 +430,11 @@ mod tests {
             write_domain: RealmNormalCommitWriteDomain::CheckpointToPending,
             blocker: RegistryBlocker::ReusableCheckpointHeightKey,
         }));
+        assert!(blockers.contains(
+            &RealmNormalCommitDurabilityBlocker::LegacyHeightOnlyReverseMapping {
+                write_domain: RealmNormalCommitWriteDomain::PendingToCheckpoint,
+            }
+        ));
         assert!(blockers.contains(&RealmNormalCommitDurabilityBlocker::Registry {
             write_domain: RealmNormalCommitWriteDomain::GlobalUserTopProofAtCheckpoint,
             blocker: RegistryBlocker::MixedCheckpointPendingAxis,
