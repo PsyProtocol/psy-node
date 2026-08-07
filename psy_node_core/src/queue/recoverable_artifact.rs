@@ -867,6 +867,74 @@ impl PendingQueueArtifactAppendPlan {
     }
 }
 
+/// Reconstructs the one exact batch selected by a durable header.  This is a
+/// recovery primitive, not an ACK authority: callers still need the concrete
+/// store's opaque readback receipt and the matching backend-private token.
+pub fn reconstruct_selected_candidate(
+    selected: &StoredPendingQueueArtifact,
+    mut fragments: Vec<PendingQueueArtifactFragment>,
+) -> Result<PendingQueueCaptureCandidate, PendingQueueArtifactError> {
+    let PendingQueueArtifactPhase::SelectedAwaitingAck {
+        before,
+        descriptor,
+        ..
+    } = selected.phase()
+    else {
+        return Err(PendingQueueArtifactError::ExpectedSelectedAwaitingAck);
+    };
+    if fragments.len() != usize::from(descriptor.fragment_count()) {
+        return Err(PendingQueueArtifactError::FragmentSetCardinality {
+            expected: u64::from(descriptor.fragment_count()),
+            actual: fragments.len() as u64,
+        });
+    }
+    fragments.sort_by_key(PendingQueueArtifactFragment::global_index);
+    let mut canonical = Vec::with_capacity(
+        usize::try_from(descriptor.canonical_bytes())
+            .map_err(|_| PendingQueueArtifactError::ProgressOverflow)?,
+    );
+    for (offset, fragment) in fragments.iter().enumerate() {
+        if fragment.global_index().get()
+            != descriptor.first_fragment_index().get() + offset as u64
+            || fragment.batch_index() != descriptor.batch_index()
+            || fragment.batch_fragment_index() != offset as u16
+            || fragment.batch_fragment_count() != descriptor.fragment_count()
+            || fragment.candidate_digest() != descriptor.candidate_digest()
+            || fragment.candidate_bytes() != descriptor.canonical_bytes()
+        {
+            return Err(PendingQueueArtifactError::FragmentMetadataMismatch);
+        }
+        canonical.extend_from_slice(fragment.payload());
+    }
+    if canonical.len() as u64 != descriptor.canonical_bytes()
+        || PendingQueueCandidateDigest(hash_parts(&[CANDIDATE_DOMAIN, &canonical]))
+            != descriptor.candidate_digest()
+    {
+        return Err(PendingQueueArtifactError::CandidateReassemblyMismatch);
+    }
+    let candidate = PendingQueueCaptureCandidate::decode_canonical(&canonical)
+        .map_err(|error| PendingQueueArtifactError::CaptureModel(error.to_string()))?;
+    verify_candidate_identity(selected.identity(), &candidate)?;
+
+    let predecessor_revision = selected.revision().get().checked_sub(2).ok_or(
+        PendingQueueArtifactError::SelectedRevisionUnderflow(selected.revision().get()),
+    )?;
+    let predecessor = StoredPendingQueueArtifact {
+        slot: selected.slot(),
+        identity: selected.identity().clone(),
+        revision: PendingQueueArtifactRevision::try_new(predecessor_revision)?,
+        phase: PendingQueueArtifactPhase::Open(before.clone()),
+    };
+    let rebuilt = PendingQueueArtifactAppendPlan::try_new(&predecessor, &candidate)?;
+    if rebuilt.selected() != selected || rebuilt.descriptor() != descriptor {
+        return Err(PendingQueueArtifactError::DescriptorMismatch);
+    }
+    if rebuilt.fragments() != fragments {
+        return Err(PendingQueueArtifactError::FragmentMetadataMismatch);
+    }
+    Ok(candidate)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SealedPendingQueueArtifactTransition {
     expected: StoredPendingQueueArtifact,
@@ -1040,6 +1108,7 @@ impl PendingQueueArtifactScanObservation {
             &close_observed.identity,
         );
         let mut offset = 0usize;
+        let mut nats_consumer_digest = None;
         let mut nats_last = None;
         let mut staged_generation = None;
         let mut staged_last_revision = 0u64;
@@ -1097,6 +1166,7 @@ impl PendingQueueArtifactScanObservation {
             verify_candidate_identity(&close_observed.identity, &candidate)?;
             verify_source_sequence(
                 &candidate,
+                &mut nats_consumer_digest,
                 &mut nats_last,
                 &mut staged_generation,
                 &mut staged_last_revision,
@@ -1208,6 +1278,7 @@ fn descriptor_from_fragments(
 
 fn verify_source_sequence(
     candidate: &PendingQueueCaptureCandidate,
+    nats_consumer_digest: &mut Option<[u8; 32]>,
     nats_last: &mut Option<u64>,
     staged_generation: &mut Option<[u8; 32]>,
     staged_last_revision: &mut u64,
@@ -1215,7 +1286,9 @@ fn verify_source_sequence(
 ) -> Result<(), PendingQueueArtifactError> {
     match candidate.source().view() {
         PendingQueueSourceCursorView::NatsJetStream {
-            stream_sequences, ..
+            consumer_digest,
+            stream_sequences,
+            ..
         } => {
             if staged_generation.is_some() {
                 return Err(PendingQueueArtifactError::MixedSourceCursorKinds);
@@ -1226,6 +1299,10 @@ fn verify_source_sequence(
             if nats_last.is_some_and(|last| last >= first) {
                 return Err(PendingQueueArtifactError::NatsSequenceOverlap);
             }
+            if nats_consumer_digest.is_some_and(|value| value != *consumer_digest) {
+                return Err(PendingQueueArtifactError::NatsConsumerDigestMismatch);
+            }
+            *nats_consumer_digest = Some(*consumer_digest);
             *nats_last = stream_sequences.last().copied();
         }
         PendingQueueSourceCursorView::Staged {
@@ -1552,6 +1629,7 @@ pub enum PendingQueueArtifactError {
     ExpectedOpen,
     ExpectedAppendPrepared,
     ExpectedSelectedAwaitingAck,
+    SelectedRevisionUnderflow(u64),
     ExpectedCloseObserved,
     PreparedCandidateConflict,
     SelectedCandidateConflict,
@@ -1583,6 +1661,7 @@ pub enum PendingQueueArtifactError {
     EmptySourceCursor,
     MixedSourceCursorKinds,
     NatsSequenceOverlap,
+    NatsConsumerDigestMismatch,
     StagedGenerationMismatch,
     DuplicateStagingCapture,
     StagedRevisionGap { expected: u64, actual: u64 },
@@ -1805,6 +1884,29 @@ mod tests {
     }
 
     #[test]
+    fn selected_batch_is_reconstructed_only_from_its_exact_fragment_set() {
+        let open = bootstrap().candidate().clone();
+        let exact_candidate = candidate(&[10, 11], &[b"first", b"second"]);
+        let plan = PendingQueueArtifactAppendPlan::try_new(&open, &exact_candidate).unwrap();
+        assert_eq!(
+            reconstruct_selected_candidate(plan.selected(), plan.fragments().to_vec())
+                .unwrap(),
+            exact_candidate,
+        );
+        assert_eq!(
+            reconstruct_selected_candidate(plan.selected(), Vec::new()),
+            Err(PendingQueueArtifactError::FragmentSetCardinality {
+                expected: 1,
+                actual: 0,
+            }),
+        );
+        assert_eq!(
+            reconstruct_selected_candidate(&open, plan.fragments().to_vec()),
+            Err(PendingQueueArtifactError::ExpectedSelectedAwaitingAck),
+        );
+    }
+
+    #[test]
     fn physical_fragment_domain_is_tightly_bounded() {
         assert_eq!(MAX_PENDING_QUEUE_ARTIFACT_TOTAL_FRAGMENTS, 1_279);
         assert_eq!(MAX_PENDING_QUEUE_ARTIFACT_BUCKETS, 80);
@@ -1945,6 +2047,52 @@ mod tests {
         assert_eq!(
             PendingQueueArtifactScanObservation::verify(close.candidate(), fragments),
             Err(PendingQueueArtifactError::NatsSequenceOverlap),
+        );
+    }
+
+    #[test]
+    fn scanner_rejects_consumer_identity_change_between_nats_batches() {
+        let open0 = bootstrap().candidate().clone();
+        let first = candidate(&[10], &[b"a"]);
+        let plan0 = PendingQueueArtifactAppendPlan::try_new(&open0, &first).unwrap();
+        let open1 = SealedPendingQueueArtifactTransition::confirm_selected_ack(
+            plan0.selected(),
+        )
+        .unwrap()
+        .candidate()
+        .clone();
+        let changed_consumer = PendingQueueCaptureCandidate::try_new(
+            context(),
+            source(),
+            PendingQueueSourceCursor::nats_jetstream([5; 32], &[11]).unwrap(),
+            vec![b"b".to_vec()],
+        )
+        .unwrap();
+        let plan1 = PendingQueueArtifactAppendPlan::try_new(&open1, &changed_consumer).unwrap();
+        let open2 = SealedPendingQueueArtifactTransition::confirm_selected_ack(
+            plan1.selected(),
+        )
+        .unwrap()
+        .candidate()
+        .clone();
+        let boundary = PendingQueueGenerationBoundary::try_from_backend_observation(
+            context(),
+            PendingQueueCloseIntentDigest::try_new([7; 32]).unwrap(),
+            source(),
+            PendingQueueBoundaryObservation::NatsJetStream {
+                seal_marker_stream_sequence: 12,
+                last_data_stream_sequence: 11,
+                seal_marker_digest: [8; 32],
+            },
+        )
+        .unwrap();
+        let close = SealedPendingQueueArtifactTransition::observe_close(&open2, boundary)
+            .unwrap();
+        let mut fragments = plan0.fragments().to_vec();
+        fragments.extend_from_slice(plan1.fragments());
+        assert_eq!(
+            PendingQueueArtifactScanObservation::verify(close.candidate(), fragments),
+            Err(PendingQueueArtifactError::NatsConsumerDigestMismatch),
         );
     }
 

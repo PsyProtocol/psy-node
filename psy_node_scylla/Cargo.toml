@@ -38,6 +38,7 @@ strum_macros = { workspace = true }
 scylla = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
+async-nats = { workspace = true }
 # start local packages
 pser = { workspace = true }
 pderive = { workspace = true }
@@ -48,6 +49,7 @@ psy_serialize = { workspace = true }
 # parth_crypto = { workspace = true }
 # psy_common = { workspace = true }
 psy_node_core = { workspace = true }
+psy_node_nats = { workspace = true }
 psy_data = { workspace = true }
 dashmap = { workspace = true }
 zstd = { workspace = true }

@@ -7039,6 +7039,7 @@ name = "psy_node_scylla"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-nats",
  "async-trait",
  "auto_impl",
  "bincode",
@@ -7057,6 +7058,7 @@ dependencies = [
  "pser",
  "psy_data",
  "psy_node_core",
+ "psy_node_nats",
  "psy_serialize",
  "rand 0.8.5",
  "rand_chacha 0.3.1",

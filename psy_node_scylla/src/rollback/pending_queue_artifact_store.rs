@@ -10,7 +10,7 @@ use std::{error::Error, fmt, sync::Arc};
 
 use psy_node_core::queue::{
     recoverable_artifact::{
-        slot_for, PendingQueueArtifactAppendPlan,
+        reconstruct_selected_candidate, slot_for, PendingQueueArtifactAppendPlan,
         PendingQueueArtifactBootstrap, PendingQueueArtifactError,
         PendingQueueArtifactFragment, PendingQueueArtifactFragmentIndex,
         PendingQueueArtifactPhase, PendingQueueArtifactScanDigest,
@@ -1006,6 +1006,90 @@ impl ScyllaPendingQueueArtifactStore {
         })
     }
 
+    /// Crate-private recovery path for a concrete backend composition.  It
+    /// reconstructs only the batch named by a SelectedAwaitingAck header and
+    /// mints the same opaque exact-readback receipt as the normal write path.
+    pub(super) async fn recover_selected_batch(
+        &self,
+        identity: &PendingQueueArtifactIdentity,
+    ) -> Result<
+        Option<(
+            PendingQueueCaptureCandidate,
+            DurablySelectedPendingQueueBatchReceipt,
+        )>,
+        PendingQueueArtifactStoreError,
+    > {
+        let selected = self
+            .read_header(identity)
+            .await?
+            .ok_or(PendingQueueArtifactStoreError::Uninitialized)?;
+        let PendingQueueArtifactPhase::SelectedAwaitingAck { descriptor, .. } =
+            selected.phase()
+        else {
+            return Ok(None);
+        };
+        let mut fragments = Vec::with_capacity(usize::from(descriptor.fragment_count()));
+        for offset in 0..u64::from(descriptor.fragment_count()) {
+            let index = PendingQueueArtifactFragmentIndex::try_new(
+                descriptor
+                    .first_fragment_index()
+                    .get()
+                    .checked_add(offset)
+                    .ok_or(PendingQueueArtifactStoreError::CoordinateOutOfRange)?,
+            )?;
+            let metadata = PendingQueueArtifactFragmentMetadata {
+                bucket: index.bucket(),
+                index,
+                candidate_digest: *descriptor.candidate_digest().as_bytes(),
+            };
+            fragments.push(
+                self.read_fragment_with_metadata(selected.slot(), &metadata)
+                    .await?,
+            );
+        }
+        let candidate = reconstruct_selected_candidate(&selected, fragments)?;
+        let plan = PendingQueueArtifactAppendPlan::try_resume_selected(
+            &selected,
+            &candidate,
+        )?;
+        let receipt = DurablySelectedPendingQueueBatchReceipt::from_exact_readback(
+            self.fingerprint,
+            &selected,
+            &plan,
+            &candidate,
+        );
+        Ok(Some((candidate, receipt)))
+    }
+
+    /// Applies SelectedAwaitingAck -> Open only for sibling concrete backend
+    /// compositions, after they consumed their backend token and established
+    /// an exact ACK.  It is intentionally not part of this crate's public API.
+    pub(super) async fn confirm_selected_ack_after_backend(
+        &self,
+        receipt: DurablySelectedPendingQueueBatchReceipt,
+        candidate: &PendingQueueCaptureCandidate,
+    ) -> Result<StoredPendingQueueArtifact, PendingQueueArtifactStoreError> {
+        if receipt.store_fingerprint() != self.fingerprint {
+            return Err(PendingQueueArtifactStoreError::ReceiptStoreMismatch);
+        }
+        receipt.verify_candidate(candidate)?;
+        let current = self
+            .read_header(candidate.artifact_identity())
+            .await?
+            .ok_or(PendingQueueArtifactStoreError::Uninitialized)?;
+        if current.slot() != receipt.slot()
+            || current.revision().get() != receipt.selected_revision()
+        {
+            return Err(PendingQueueArtifactStoreError::ReceiptHeaderMismatch);
+        }
+        let transition =
+            SealedPendingQueueArtifactTransition::confirm_selected_ack(&current)?;
+        let outcome = self
+            .cas_header(transition.expected(), transition.candidate())
+            .await?;
+        require_exact_header(outcome, transition.candidate())
+    }
+
     async fn cas_header(
         &self,
         expected: &StoredPendingQueueArtifact,
@@ -1450,6 +1534,8 @@ pub enum PendingQueueArtifactStoreError {
     CloseBoundaryConflict,
     SourceScanConflict,
     ReceiptCandidateMismatch,
+    ReceiptStoreMismatch,
+    ReceiptHeaderMismatch,
     IllegalBucket(u64),
     FragmentBucketMismatch,
     FragmentPrimaryKeyMismatch,

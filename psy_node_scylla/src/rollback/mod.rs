@@ -31,6 +31,8 @@ mod branch_exact_pending_runtime;
 mod branch_exact_pending_orchestration;
 mod pending_generation_pipeline_store;
 mod pending_queue_artifact_store;
+#[allow(dead_code)]
+mod pending_queue_nats_capture;
 #[cfg(test)]
 mod branch_exact_shadow_reader_rf3_gate;
 #[cfg(test)]
