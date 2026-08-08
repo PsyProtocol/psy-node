@@ -1,9 +1,9 @@
 //! Default-off durable segment lifecycle substrate.
 //!
 //! The default-off lifecycle binds one exact ledger closure and all immutable
-//! generation terminals through physical stream seal, message-set scan, and
-//! quiescent consumer inventory. It deliberately exposes no delete request,
-//! stream deletion, setup activation, or ledger-rotation authority.
+//! generation terminals through physical stream seal, message-set scan,
+//! quiescent consumer inventory, and a durable delete request. It deliberately
+//! exposes no stream deletion, setup activation, or ledger-rotation authority.
 
 #![allow(dead_code)]
 
@@ -70,6 +70,7 @@ const SEAL_REQUESTED_REVISION: u64 = 1;
 const STREAM_SEALED_REVISION: u64 = 2;
 const MESSAGES_SCAN_VERIFIED_REVISION: u64 = 3;
 const SCAN_VERIFIED_REVISION: u64 = 4;
+const DELETE_REQUESTED_REVISION: u64 = 5;
 const SLOT_DOMAIN: &[u8] = b"psy/rollback/pending-queue-segment-lifecycle-slot/v1";
 const DIGEST_DOMAIN: &[u8] = b"psy/rollback/pending-queue-segment-lifecycle/v1";
 const STORE_FINGERPRINT_DOMAIN: &[u8] =
@@ -84,6 +85,7 @@ enum PendingQueueSegmentLifecyclePhase {
     StreamSealed = 2,
     MessagesScanVerified = 3,
     ScanVerified = 4,
+    DeleteRequested = 5,
 }
 
 impl PendingQueueSegmentLifecyclePhase {
@@ -93,6 +95,7 @@ impl PendingQueueSegmentLifecyclePhase {
             2 => Ok(Self::StreamSealed),
             3 => Ok(Self::MessagesScanVerified),
             4 => Ok(Self::ScanVerified),
+            5 => Ok(Self::DeleteRequested),
             _ => Err(PendingQueueSegmentLifecycleError::UnknownPhase),
         }
     }
@@ -103,6 +106,7 @@ impl PendingQueueSegmentLifecyclePhase {
             Self::StreamSealed => STREAM_SEALED_REVISION,
             Self::MessagesScanVerified => MESSAGES_SCAN_VERIFIED_REVISION,
             Self::ScanVerified => SCAN_VERIFIED_REVISION,
+            Self::DeleteRequested => DELETE_REQUESTED_REVISION,
         }
     }
 }
@@ -289,6 +293,22 @@ impl StoredPendingQueueSegmentSealRequest {
             && self.live_state == sealed.state()
     }
 
+    fn assignments(
+        &self,
+    ) -> Result<Vec<PendingQueueGenerationSegmentAssignment>, PendingQueueSegmentLifecycleError>
+    {
+        self.terminals
+            .iter()
+            .map(|terminal| {
+                PendingQueueGenerationSegmentAssignment::decode_canonical(
+                    self.ledger_slot,
+                    &terminal.assignment_payload,
+                )
+                .map_err(|_| PendingQueueSegmentLifecycleError::AssignmentDecode)
+            })
+            .collect()
+    }
+
     fn to_stream_sealed(
         &self,
         sealed: &SealedRecoverableNatsStreamInstance,
@@ -357,6 +377,35 @@ impl StoredPendingQueueSegmentSealRequest {
         Ok(candidate)
     }
 
+    fn to_delete_requested(
+        &self,
+        scan: &PendingQueueNatsWholeStreamScanReceipt,
+        inventory: &RecoverableNatsConsumerInventoryReceipt,
+    ) -> Result<Self, PendingQueueSegmentLifecycleError> {
+        if !self.matches_reverified_scan(scan)
+            || !self.matches_consumer_inventory(inventory)
+        {
+            return Err(PendingQueueSegmentLifecycleError::EvidenceChanged);
+        }
+        self.delete_requested_candidate()
+    }
+
+    fn delete_requested_candidate(&self) -> Result<Self, PendingQueueSegmentLifecycleError> {
+        if self.phase != PendingQueueSegmentLifecyclePhase::ScanVerified
+            || self.revision != SCAN_VERIFIED_REVISION
+            || self.scan_digest.is_none()
+            || self.consumer_manifest_digest.is_none()
+            || self.consumer_inventory_digest.is_none()
+        {
+            return Err(PendingQueueSegmentLifecycleError::InvalidTransition);
+        }
+        let mut candidate = self.clone();
+        candidate.phase = PendingQueueSegmentLifecyclePhase::DeleteRequested;
+        candidate.revision = DELETE_REQUESTED_REVISION;
+        candidate.digest = lifecycle_digest(&candidate.encode_unsigned())?;
+        Ok(candidate)
+    }
+
     fn matches_scan_receipt(&self, receipt: &PendingQueueNatsWholeStreamScanReceipt) -> bool {
         self.phase == PendingQueueSegmentLifecyclePhase::MessagesScanVerified
             && self.revision == MESSAGES_SCAN_VERIFIED_REVISION
@@ -378,6 +427,36 @@ impl StoredPendingQueueSegmentSealRequest {
             && self.live_state.consumer_count() == receipt.consumer_count()
             && self.consumer_manifest_digest == Some(receipt.manifest_digest())
             && self.consumer_inventory_digest == Some(receipt.inventory_digest())
+    }
+
+    fn matches_reverified_scan(&self, receipt: &PendingQueueNatsWholeStreamScanReceipt) -> bool {
+        self.phase == PendingQueueSegmentLifecyclePhase::ScanVerified
+            && self.revision == SCAN_VERIFIED_REVISION
+            && self.stream_instance_id == *receipt.instance_id().as_bytes()
+            && self.segment_id == receipt.segment_id()
+            && self.contract_digest == receipt.contract_digest()
+            && self.live_state == receipt.state()
+            && self.manifest_digest == receipt.manifest_digest()
+            && self.scan_digest == Some(receipt.scan_digest())
+    }
+
+    fn matches_delete_request_evidence(
+        &self,
+        scan: &PendingQueueNatsWholeStreamScanReceipt,
+        inventory: &RecoverableNatsConsumerInventoryReceipt,
+    ) -> bool {
+        self.phase == PendingQueueSegmentLifecyclePhase::DeleteRequested
+            && self.revision == DELETE_REQUESTED_REVISION
+            && self.stream_instance_id == *scan.instance_id().as_bytes()
+            && self.stream_instance_id == *inventory.instance_id()
+            && self.segment_id == scan.segment_id()
+            && self.contract_digest == scan.contract_digest()
+            && self.live_state == scan.state()
+            && self.live_state.consumer_count() == inventory.consumer_count()
+            && self.manifest_digest == scan.manifest_digest()
+            && self.scan_digest == Some(scan.scan_digest())
+            && self.consumer_manifest_digest == Some(inventory.manifest_digest())
+            && self.consumer_inventory_digest == Some(inventory.inventory_digest())
     }
 
     fn encode_unsigned(&self) -> Vec<u8> {
@@ -516,7 +595,8 @@ impl StoredPendingQueueSegmentSealRequest {
             PendingQueueSegmentLifecyclePhase::SealRequested
             | PendingQueueSegmentLifecyclePhase::StreamSealed => None,
             PendingQueueSegmentLifecyclePhase::MessagesScanVerified
-            | PendingQueueSegmentLifecyclePhase::ScanVerified => Some(
+            | PendingQueueSegmentLifecyclePhase::ScanVerified
+            | PendingQueueSegmentLifecyclePhase::DeleteRequested => Some(
                 PendingQueueNatsWholeStreamScanDigest::try_from_bytes(decoder.array32()?)
                     .map_err(terminal)?,
             ),
@@ -525,7 +605,8 @@ impl StoredPendingQueueSegmentSealRequest {
             PendingQueueSegmentLifecyclePhase::SealRequested
             | PendingQueueSegmentLifecyclePhase::StreamSealed
             | PendingQueueSegmentLifecyclePhase::MessagesScanVerified => (None, None),
-            PendingQueueSegmentLifecyclePhase::ScanVerified => (
+            PendingQueueSegmentLifecyclePhase::ScanVerified
+            | PendingQueueSegmentLifecyclePhase::DeleteRequested => (
                 Some(
                     RecoverableNatsConsumerManifestDigest::try_from_bytes(decoder.array32()?)
                         .map_err(transport)?,
@@ -672,6 +753,9 @@ impl PendingQueueSegmentLifecycleCasBinding {
             ) | (
                 PendingQueueSegmentLifecyclePhase::MessagesScanVerified,
                 PendingQueueSegmentLifecyclePhase::ScanVerified,
+            ) | (
+                PendingQueueSegmentLifecyclePhase::ScanVerified,
+                PendingQueueSegmentLifecyclePhase::DeleteRequested,
             )
         );
         if expected.slot != candidate.slot
@@ -742,6 +826,16 @@ pub(super) struct PersistedPendingQueueScanVerifiedReceipt {
     current: StoredPendingQueueSegmentSealRequest,
 }
 
+/// Opaque durable authority proving that every non-destructive closure check
+/// was freshly repeated immediately before the revision-5 PONR was persisted.
+/// It is intentionally non-`Clone` and cannot be constructed outside this
+/// module.
+#[derive(Debug)]
+pub(super) struct PersistedPendingQueueDeleteRequestedReceipt {
+    store_fingerprint: PendingQueueSegmentLifecycleStoreFingerprint,
+    current: StoredPendingQueueSegmentSealRequest,
+}
+
 impl PersistedPendingQueueScanVerifiedReceipt {
     pub(super) const fn scan_digest(&self) -> Option<PendingQueueNatsWholeStreamScanDigest> {
         self.current.scan_digest
@@ -781,17 +875,7 @@ impl PersistedPendingQueueStreamSealedReceipt {
         &self,
     ) -> Result<Vec<PendingQueueGenerationSegmentAssignment>, PendingQueueSegmentLifecycleError>
     {
-        self.current
-            .terminals
-            .iter()
-            .map(|terminal| {
-                PendingQueueGenerationSegmentAssignment::decode_canonical(
-                    self.current.ledger_slot,
-                    &terminal.assignment_payload,
-                )
-                .map_err(|_| PendingQueueSegmentLifecycleError::AssignmentDecode)
-            })
-            .collect()
+        self.current.assignments()
     }
 }
 
@@ -1209,6 +1293,55 @@ impl ScyllaPendingQueueSegmentLifecycleStore {
         })
     }
 
+    async fn advance_to_delete_requested(
+        &self,
+        expected: &StoredPendingQueueSegmentSealRequest,
+        scan: &PendingQueueNatsWholeStreamScanReceipt,
+        inventory: &RecoverableNatsConsumerInventoryReceipt,
+    ) -> Result<PersistedPendingQueueDeleteRequestedReceipt, PendingQueueSegmentLifecycleError>
+    {
+        let candidate = expected.to_delete_requested(scan, inventory)?;
+        let binding = PendingQueueSegmentLifecycleCasBinding::try_new(expected, &candidate)?;
+        let execution = self
+            .session
+            .execute_unpaged(
+                &self.compare_and_set,
+                (
+                    binding.candidate_revision,
+                    binding.candidate_payload.as_slice(),
+                    binding.lifecycle_slot.as_slice(),
+                    binding.expected_revision,
+                    binding.expected_payload.as_slice(),
+                ),
+            )
+            .await;
+        let applied = match execution {
+            Ok(result) => decode_applied(result)?,
+            Err(error) => match self.read(candidate.slot).await {
+                Ok(Some(current)) if current == candidate => false,
+                Ok(_) => {
+                    return Err(PendingQueueSegmentLifecycleError::Indeterminate(
+                        error.to_string(),
+                    ));
+                }
+                Err(read) => {
+                    return Err(PendingQueueSegmentLifecycleError::Indeterminate(format!(
+                        "execute={error}; read={read}",
+                    )));
+                }
+            },
+        };
+        let current = self
+            .read(candidate.slot)
+            .await?
+            .ok_or(PendingQueueSegmentLifecycleError::MissingAfterLwt)?;
+        classify_lifecycle_cas(applied, &candidate, &current)?;
+        Ok(PersistedPendingQueueDeleteRequestedReceipt {
+            store_fingerprint: self.fingerprint,
+            current,
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn seal_requested_stream<Hash: Q256BitHash>(
         &self,
@@ -1499,6 +1632,147 @@ impl ScyllaPendingQueueSegmentLifecycleStore {
         };
         if result.store_fingerprint != self.fingerprint
             || !result.current.matches_consumer_inventory(&first)
+        {
+            return Err(PendingQueueSegmentLifecycleError::AppliedStateMismatch);
+        }
+        Ok(result)
+    }
+
+    /// Freshly repeats the complete, non-destructive message and consumer
+    /// closure before durably crossing the logical delete-request PONR. This
+    /// method never deletes or purges NATS data.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn request_delete_for_scan_verified<Hash: Q256BitHash>(
+        &self,
+        nats: &NatsJetStreamClient,
+        ledger_store: &ScyllaPendingQueueSegmentLedgerStore,
+        terminal_store: &ScyllaPendingQueueGenerationTerminalStore,
+        archive_store: &ScyllaPendingQueueSemanticAggregateStore,
+        pipeline_store: &ScyllaPendingPipelineStore,
+        writer_store: &ScyllaBranchExactWriterLifecycleStore,
+        head_store: &ScyllaAuthorityLocalHeadStore,
+        closure: &PendingQueueSegmentClosureSnapshot,
+        receipt: &PersistedPendingQueueScanVerifiedReceipt,
+        segment: RecoverableNatsStreamSegment,
+    ) -> Result<PersistedPendingQueueDeleteRequestedReceipt, PendingQueueSegmentLifecycleError>
+    {
+        if receipt.store_fingerprint != self.fingerprint
+            || segment.segment_id() != receipt.current.segment_id
+            || segment.digest() != receipt.current.contract_digest
+            || receipt.current.phase != PendingQueueSegmentLifecyclePhase::ScanVerified
+            || receipt.current.revision != SCAN_VERIFIED_REVISION
+        {
+            return Err(PendingQueueSegmentLifecycleError::ReceiptStoreMismatch);
+        }
+        let durable = self
+            .read(receipt.current.slot)
+            .await?
+            .ok_or(PendingQueueSegmentLifecycleError::MissingAfterLwt)?;
+        let durable_candidate = receipt.current.delete_requested_candidate()?;
+        if durable == durable_candidate {
+            return Ok(PersistedPendingQueueDeleteRequestedReceipt {
+                store_fingerprint: self.fingerprint,
+                current: durable,
+            });
+        }
+        if durable != receipt.current {
+            return Err(PendingQueueSegmentLifecycleError::Conflict);
+        }
+        self.revalidate_seal_evidence::<Hash>(
+            ledger_store,
+            terminal_store,
+            archive_store,
+            pipeline_store,
+            writer_store,
+            head_store,
+            closure,
+            &receipt.current,
+        )
+        .await?;
+
+        let sealed = nats
+            .observe_recoverable_sealed_segment_instance(segment.clone())
+            .await
+            .map_err(transport)?;
+        if !receipt.current.matches_sealed_instance(&sealed) {
+            return Err(PendingQueueSegmentLifecycleError::EvidenceChanged);
+        }
+        let message_manifest = PendingQueueNatsWholeStreamExpectedManifest::try_new(
+            sealed.clone(),
+            receipt.current.assignments()?,
+        )
+        .map_err(terminal)?;
+        let scan = nats
+            .scan_recoverable_sealed_segment(message_manifest)
+            .await
+            .map_err(transport)?;
+        if !receipt.current.matches_reverified_scan(&scan) {
+            return Err(PendingQueueSegmentLifecycleError::EvidenceChanged);
+        }
+        self.revalidate_seal_evidence::<Hash>(
+            ledger_store,
+            terminal_store,
+            archive_store,
+            pipeline_store,
+            writer_store,
+            head_store,
+            closure,
+            &receipt.current,
+        )
+        .await?;
+
+        let consumer_manifest = self
+            .build_expected_consumer_manifest(
+                archive_store,
+                &receipt.current,
+                &segment,
+                sealed,
+            )
+            .await?;
+        let first = nats
+            .inventory_recoverable_sealed_segment_consumers(consumer_manifest.clone())
+            .await
+            .map_err(transport)?;
+        if !receipt.current.matches_consumer_inventory(&first) {
+            return Err(PendingQueueSegmentLifecycleError::EvidenceChanged);
+        }
+        self.revalidate_seal_evidence::<Hash>(
+            ledger_store,
+            terminal_store,
+            archive_store,
+            pipeline_store,
+            writer_store,
+            head_store,
+            closure,
+            &receipt.current,
+        )
+        .await?;
+        let second = nats
+            .inventory_recoverable_sealed_segment_consumers(consumer_manifest)
+            .await
+            .map_err(transport)?;
+        if first != second || !receipt.current.matches_consumer_inventory(&second) {
+            return Err(PendingQueueSegmentLifecycleError::EvidenceChanged);
+        }
+        self.revalidate_seal_evidence::<Hash>(
+            ledger_store,
+            terminal_store,
+            archive_store,
+            pipeline_store,
+            writer_store,
+            head_store,
+            closure,
+            &receipt.current,
+        )
+        .await?;
+
+        let candidate = receipt.current.to_delete_requested(&scan, &first)?;
+        let result = self
+            .advance_to_delete_requested(&receipt.current, &scan, &first)
+            .await?;
+        if result.store_fingerprint != self.fingerprint
+            || result.current != candidate
+            || !result.current.matches_delete_request_evidence(&scan, &first)
         {
             return Err(PendingQueueSegmentLifecycleError::AppliedStateMismatch);
         }
@@ -1926,6 +2200,52 @@ mod tests {
                 &stream_sealed,
                 &scan_verified,
             ),
+            Err(PendingQueueSegmentLifecycleError::InvalidTransition),
+        );
+
+        let mut delete_requested = scan_verified.clone();
+        delete_requested.revision = DELETE_REQUESTED_REVISION;
+        delete_requested.phase = PendingQueueSegmentLifecyclePhase::DeleteRequested;
+        delete_requested.digest =
+            lifecycle_digest(&delete_requested.encode_unsigned()).unwrap();
+        assert_eq!(
+            scan_verified.delete_requested_candidate().unwrap(),
+            delete_requested,
+        );
+        let mut missing_inventory = scan_verified.clone();
+        missing_inventory.consumer_inventory_digest = None;
+        assert_eq!(
+            missing_inventory.delete_requested_candidate(),
+            Err(PendingQueueSegmentLifecycleError::InvalidTransition),
+        );
+        let delete_requested_bytes = delete_requested.to_persisted_bytes();
+        let delete_binding = PendingQueueSegmentLifecycleCasBinding::try_new(
+            &scan_verified,
+            &delete_requested,
+        )
+        .unwrap();
+        assert_eq!(delete_binding.expected_revision, 4);
+        assert_eq!(delete_binding.candidate_revision, 5);
+        assert_eq!(delete_binding.expected_payload, scan_verified_bytes);
+        assert_eq!(delete_binding.candidate_payload, delete_requested_bytes);
+        assert_eq!(
+            StoredPendingQueueSegmentSealRequest::decode_persisted(
+                delete_requested.slot,
+                DELETE_REQUESTED_REVISION as i64,
+                &delete_requested_bytes,
+            )
+            .unwrap(),
+            delete_requested,
+        );
+        assert_eq!(
+            PendingQueueSegmentLifecycleCasBinding::try_new(
+                &messages_scanned,
+                &delete_requested,
+            ),
+            Err(PendingQueueSegmentLifecycleError::InvalidTransition),
+        );
+        assert_eq!(
+            PendingQueueSegmentLifecycleCasBinding::try_new(&value, &delete_requested),
             Err(PendingQueueSegmentLifecycleError::InvalidTransition),
         );
 
