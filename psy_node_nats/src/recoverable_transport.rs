@@ -41,6 +41,7 @@ use crate::{
         SealedRecoverableNatsStreamInstance,
     },
     recoverable_terminal::{
+        PendingQueueNatsWholeStreamExpectedManifest,
         PendingQueueNatsWholeStreamScanReceipt, PendingQueueNatsWholeStreamScanner,
         PendingQueueSourceTruncationReceipt, PendingQueueSourceTruncationScanner,
         PendingQueueTerminalError,
@@ -796,8 +797,9 @@ impl NatsJetStreamClient {
     /// assignment terminal in a later milestone.
     pub async fn scan_recoverable_sealed_segment(
         &self,
-        expected: &SealedRecoverableNatsStreamInstance,
+        manifest: PendingQueueNatsWholeStreamExpectedManifest,
     ) -> Result<PendingQueueNatsWholeStreamScanReceipt, RecoverableNatsTransportError> {
+        let expected = manifest.instance().clone();
         if self.base_namespace() != expected.segment().base_namespace() {
             return Err(RecoverableNatsTransportError::ClientNamespaceMismatch);
         }
@@ -810,10 +812,11 @@ impl NatsJetStreamClient {
             .segment()
             .attest_sealed_instance(&stream.get_info().await.map_err(nats)?)
             .map_err(|error| RecoverableNatsTransportError::Core(error.to_string()))?;
-        if &before != expected {
+        if before != expected {
             return Err(RecoverableNatsTransportError::WholeStreamScanChanged);
         }
-        let mut scanner = PendingQueueNatsWholeStreamScanner::new(before);
+        let mut scanner = PendingQueueNatsWholeStreamScanner::try_new(manifest)
+            .map_err(source_scan)?;
         for sequence in 1..=expected.state().last_sequence() {
             let message = stream
                 .get_raw_message(sequence)
@@ -832,7 +835,7 @@ impl NatsJetStreamClient {
             .segment()
             .attest_sealed_instance(&stream.get_info().await.map_err(nats)?)
             .map_err(|error| RecoverableNatsTransportError::Core(error.to_string()))?;
-        if &after != expected {
+        if after != expected {
             return Err(RecoverableNatsTransportError::WholeStreamScanChanged);
         }
         Ok(receipt)
@@ -1426,7 +1429,13 @@ mod tests {
         assert_eq!(sealed_instance.instance_id(), live_instance.instance_id());
         assert_eq!(sealed_instance.state().messages(), 2);
         let whole = client
-            .scan_recoverable_sealed_segment(&sealed_instance)
+            .scan_recoverable_sealed_segment(
+                PendingQueueNatsWholeStreamExpectedManifest::try_new(
+                    sealed_instance.clone(),
+                    vec![assignment.clone()],
+                )
+                .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(whole.instance_id(), sealed_instance.instance_id());

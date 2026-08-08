@@ -11,7 +11,7 @@
 //! coverage, or an authority publish marker, and therefore cannot authorize
 //! pipeline publication, segment rotation, or garbage collection.
 
-use std::{error::Error, fmt};
+use std::{collections::BTreeMap, error::Error, fmt};
 
 use psy_node_core::queue::recoverable_ephemeral::{
     PendingQueueBoundaryObservation, PendingQueueCaptureContext,
@@ -48,6 +48,8 @@ const TRUNCATION_MANIFEST_DIGEST_DOMAIN: &[u8] =
     b"psy/rollback/pending-queue-nats-truncation-manifest/v1";
 const WHOLE_STREAM_SCAN_DOMAIN: &[u8] =
     b"psy/rollback/pending-queue-nats-whole-stream-scan/v1";
+const WHOLE_STREAM_MANIFEST_DOMAIN: &[u8] =
+    b"psy/rollback/pending-queue-nats-whole-stream-manifest/v1";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct PendingQueueSourceTruncationDigest([u8; 32]);
@@ -630,12 +632,122 @@ impl PendingQueueNatsWholeStreamScanDigest {
     }
 }
 
+/// Digest of the exact closed assignment/source set expected in one sealed
+/// stream incarnation.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct PendingQueueNatsWholeStreamManifestDigest([u8; 32]);
+
+impl PendingQueueNatsWholeStreamManifestDigest {
+    fn try_new(bytes: [u8; 32]) -> Result<Self, PendingQueueTerminalError> {
+        if bytes == [0; 32] {
+            Err(PendingQueueTerminalError::EmptyDigest)
+        } else {
+            Ok(Self(bytes))
+        }
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// Closed-world input for a whole-stream scan. The later durable lifecycle
+/// must build this from one exact ledger snapshot after revalidating every
+/// generation terminal; callers cannot ask the scanner to accept an
+/// unspecified or best-effort source set.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingQueueNatsWholeStreamExpectedManifest {
+    instance: SealedRecoverableNatsStreamInstance,
+    assignments: Vec<PendingQueueGenerationSegmentAssignment>,
+    expected_source_count: u64,
+    digest: PendingQueueNatsWholeStreamManifestDigest,
+}
+
+impl PendingQueueNatsWholeStreamExpectedManifest {
+    pub fn try_new(
+        instance: SealedRecoverableNatsStreamInstance,
+        mut assignments: Vec<PendingQueueGenerationSegmentAssignment>,
+    ) -> Result<Self, PendingQueueTerminalError> {
+        assignments.sort_by_key(|assignment| assignment.assigned_at_ledger_revision().get());
+        let segment = instance.segment();
+        let mut expected_source_count = 0_u64;
+        for (index, assignment) in assignments.iter().enumerate() {
+            let expected = expected_kinds(assignment.context());
+            if assignment.context().key() != segment.generation_key()
+                || assignment.segment_id() != segment.segment_id()
+                || assignment.contract_digest() != segment.digest()
+                || usize::from(assignment.expected_source_count()) != expected.len()
+                || assignment
+                    .source_quotas()
+                    .iter()
+                    .map(|quota| quota.publisher_kind())
+                    .ne(expected.iter().copied())
+                || index > 0
+                    && assignments[index - 1].assigned_at_ledger_revision().get()
+                        >= assignment.assigned_at_ledger_revision().get()
+            {
+                return Err(PendingQueueTerminalError::WholeStreamManifestMismatch);
+            }
+            expected_source_count = expected_source_count
+                .checked_add(expected.len() as u64)
+                .ok_or(PendingQueueTerminalError::MemberCountOverflow)?;
+        }
+        for pair in assignments.windows(2) {
+            if pair[0].digest() == pair[1].digest()
+                || pair[0].context().digest() == pair[1].context().digest()
+            {
+                return Err(PendingQueueTerminalError::WholeStreamManifestMismatch);
+            }
+        }
+        let state = instance.state();
+        if state.subject_count() != expected_source_count
+            || state.messages() < expected_source_count
+        {
+            return Err(PendingQueueTerminalError::WholeStreamManifestMismatch);
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(WHOLE_STREAM_MANIFEST_DOMAIN);
+        hasher.update(instance.instance_id().as_bytes());
+        hasher.update((assignments.len() as u64).to_be_bytes());
+        for assignment in &assignments {
+            let bytes = assignment.to_canonical_bytes();
+            hasher.update((bytes.len() as u64).to_be_bytes());
+            hasher.update(bytes);
+        }
+        Ok(Self {
+            instance,
+            assignments,
+            expected_source_count,
+            digest: PendingQueueNatsWholeStreamManifestDigest::try_new(
+                hasher.finalize().into(),
+            )?,
+        })
+    }
+
+    pub const fn instance(&self) -> &SealedRecoverableNatsStreamInstance {
+        &self.instance
+    }
+
+    pub fn assignments(&self) -> &[PendingQueueGenerationSegmentAssignment] {
+        &self.assignments
+    }
+
+    pub const fn expected_source_count(&self) -> u64 {
+        self.expected_source_count
+    }
+
+    pub const fn digest(&self) -> PendingQueueNatsWholeStreamManifestDigest {
+        self.digest
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingQueueNatsWholeStreamScanReceipt {
     instance_id: RecoverableNatsStreamInstanceId,
     segment_id: RecoverableNatsSegmentId,
     contract_digest: RecoverableNatsSegmentContractDigest,
     state: RecoverableNatsStreamStateSnapshot,
+    manifest_digest: PendingQueueNatsWholeStreamManifestDigest,
     scan_digest: PendingQueueNatsWholeStreamScanDigest,
 }
 
@@ -659,21 +771,35 @@ impl PendingQueueNatsWholeStreamScanReceipt {
     pub const fn scan_digest(&self) -> PendingQueueNatsWholeStreamScanDigest {
         self.scan_digest
     }
+
+    pub const fn manifest_digest(&self) -> PendingQueueNatsWholeStreamManifestDigest {
+        self.manifest_digest
+    }
+}
+
+struct PendingQueueNatsExpectedSource {
+    assignment_digest: PendingQueueSegmentAssignmentDigest,
+    state: PendingQueuePublishSourceState,
 }
 
 pub(crate) struct PendingQueueNatsWholeStreamScanner {
-    instance: SealedRecoverableNatsStreamInstance,
+    manifest: PendingQueueNatsWholeStreamExpectedManifest,
+    sources: BTreeMap<String, PendingQueueNatsExpectedSource>,
     next_sequence: u64,
     observed_messages: u64,
     hasher: Sha256,
 }
 
 impl PendingQueueNatsWholeStreamScanner {
-    pub(crate) fn new(instance: SealedRecoverableNatsStreamInstance) -> Self {
+    pub(crate) fn try_new(
+        manifest: PendingQueueNatsWholeStreamExpectedManifest,
+    ) -> Result<Self, PendingQueueTerminalError> {
         let mut hasher = Sha256::new();
         hasher.update(WHOLE_STREAM_SCAN_DOMAIN);
+        let instance = manifest.instance();
         hasher.update(instance.instance_id().as_bytes());
         hasher.update(instance.segment().digest().as_bytes());
+        hasher.update(manifest.digest().as_bytes());
         let state = instance.state();
         hasher.update(state.messages().to_be_bytes());
         hasher.update(state.bytes().to_be_bytes());
@@ -681,12 +807,41 @@ impl PendingQueueNatsWholeStreamScanner {
         hasher.update(state.last_sequence().to_be_bytes());
         hasher.update(state.consumer_count().to_be_bytes());
         hasher.update(state.subject_count().to_be_bytes());
-        Self {
-            instance,
+        let mut sources = BTreeMap::new();
+        for assignment in manifest.assignments() {
+            for publisher_kind in expected_kinds(assignment.context()) {
+                let route = RecoverableNatsSourceRoute::try_new(
+                    assignment.context(),
+                    *publisher_kind,
+                    instance.segment(),
+                )
+                .map_err(model)?;
+                let state = PendingQueuePublishSourceState::bootstrap(&route, assignment)
+                    .map_err(model)?;
+                if sources
+                    .insert(
+                        route.subject().to_owned(),
+                        PendingQueueNatsExpectedSource {
+                            assignment_digest: assignment.digest(),
+                            state,
+                        },
+                    )
+                    .is_some()
+                {
+                    return Err(PendingQueueTerminalError::WholeStreamManifestMismatch);
+                }
+            }
+        }
+        if sources.len() as u64 != manifest.expected_source_count() {
+            return Err(PendingQueueTerminalError::WholeStreamManifestMismatch);
+        }
+        Ok(Self {
+            manifest,
+            sources,
             next_sequence: 1,
             observed_messages: 0,
             hasher,
-        }
+        })
     }
 
     pub(crate) fn observe(
@@ -695,7 +850,7 @@ impl PendingQueueNatsWholeStreamScanner {
         subject: &str,
         canonical_envelope: &[u8],
     ) -> Result<(), PendingQueueTerminalError> {
-        let state = self.instance.state();
+        let state = self.manifest.instance().state();
         if sequence != self.next_sequence
             || sequence == 0
             || sequence > state.last_sequence()
@@ -704,15 +859,35 @@ impl PendingQueueNatsWholeStreamScanner {
         }
         let envelope = PendingQueuePublishEnvelope::decode_canonical(canonical_envelope)
             .map_err(model)?;
-        if envelope.segment_id() != self.instance.segment().segment_id()
-            || envelope.contract_digest() != self.instance.segment().digest()
+        if envelope.segment_id() != self.manifest.instance().segment().segment_id()
+            || envelope.contract_digest() != self.manifest.instance().segment().digest()
             || envelope
-                .exact_subject(self.instance.segment())
+                .exact_subject(self.manifest.instance().segment())
                 .map_err(model)?
                 != subject
         {
             return Err(PendingQueueTerminalError::WholeStreamSubjectMismatch);
         }
+        let expected = self
+            .sources
+            .get_mut(subject)
+            .ok_or(PendingQueueTerminalError::WholeStreamUnexpectedSource)?;
+        if envelope.assignment_digest() != expected.assignment_digest {
+            return Err(PendingQueueTerminalError::WholeStreamUnexpectedSource);
+        }
+        let PendingQueueSourceSelectionPlan::Advance { candidate, .. } =
+            expected.state.select(&envelope).map_err(model)?
+        else {
+            return Err(PendingQueueTerminalError::WholeStreamSourceStateMismatch);
+        };
+        expected.state = candidate
+            .record_published(sequence)
+            .map_err(model)?
+            .candidate()
+            .finalize_published()
+            .map_err(model)?
+            .candidate()
+            .clone();
         self.hasher.update(sequence.to_be_bytes());
         self.hasher.update((subject.len() as u64).to_be_bytes());
         self.hasher.update(subject.as_bytes());
@@ -733,21 +908,28 @@ impl PendingQueueNatsWholeStreamScanner {
     pub(crate) fn finish(
         self,
     ) -> Result<PendingQueueNatsWholeStreamScanReceipt, PendingQueueTerminalError> {
-        let state = self.instance.state();
+        let state = self.manifest.instance().state();
         let expected_next = state
             .last_sequence()
             .checked_add(1)
             .ok_or(PendingQueueTerminalError::WholeStreamSequenceMismatch)?;
         if self.observed_messages != state.messages()
             || self.next_sequence != expected_next
+            || self.sources.values().any(|source| {
+                !matches!(
+                    source.state.phase(),
+                    PendingQueuePublishSourcePhase::Sealed { .. }
+                )
+            })
         {
             return Err(PendingQueueTerminalError::WholeStreamStateMismatch);
         }
         Ok(PendingQueueNatsWholeStreamScanReceipt {
-            instance_id: self.instance.instance_id(),
-            segment_id: self.instance.segment().segment_id(),
-            contract_digest: self.instance.segment().digest(),
+            instance_id: self.manifest.instance().instance_id(),
+            segment_id: self.manifest.instance().segment().segment_id(),
+            contract_digest: self.manifest.instance().segment().digest(),
             state,
+            manifest_digest: self.manifest.digest(),
             scan_digest: PendingQueueNatsWholeStreamScanDigest::try_new(
                 self.hasher.finalize().into(),
             )?,
@@ -803,6 +985,9 @@ pub enum PendingQueueTerminalError {
     WholeStreamSequenceMismatch,
     WholeStreamSubjectMismatch,
     WholeStreamStateMismatch,
+    WholeStreamManifestMismatch,
+    WholeStreamUnexpectedSource,
+    WholeStreamSourceStateMismatch,
     Envelope(String),
     Assignment(String),
     Segment(String),
@@ -1152,29 +1337,75 @@ mod tests {
         .unwrap();
         let instance = segment.model_sealed_instance(1_700_000_000_000_000_000, state);
         let subject = route.subject();
-        let mut scanner = PendingQueueNatsWholeStreamScanner::new(instance.clone());
+        let manifest = || {
+            PendingQueueNatsWholeStreamExpectedManifest::try_new(
+                instance.clone(),
+                vec![assignment.clone()],
+            )
+            .unwrap()
+        };
+        let mut scanner = PendingQueueNatsWholeStreamScanner::try_new(manifest()).unwrap();
         scanner.observe(1, subject, &data.to_canonical_bytes()).unwrap();
         scanner.observe(2, subject, &seal.to_canonical_bytes()).unwrap();
         let receipt = scanner.finish().unwrap();
         assert_eq!(receipt.instance_id(), instance.instance_id());
         assert_eq!(receipt.state(), state);
         assert_eq!(receipt.segment_id(), segment.segment_id());
+        assert_eq!(receipt.manifest_digest(), manifest().digest());
 
-        let mut gap = PendingQueueNatsWholeStreamScanner::new(instance.clone());
+        let mut gap = PendingQueueNatsWholeStreamScanner::try_new(manifest()).unwrap();
         assert_eq!(
             gap.observe(2, subject, &data.to_canonical_bytes()),
             Err(PendingQueueTerminalError::WholeStreamSequenceMismatch),
         );
-        let mut wrong_subject = PendingQueueNatsWholeStreamScanner::new(instance.clone());
+        let mut wrong_subject = PendingQueueNatsWholeStreamScanner::try_new(manifest()).unwrap();
         assert_eq!(
             wrong_subject.observe(1, "PSY_BEQ_V2.wrong", &data.to_canonical_bytes()),
             Err(PendingQueueTerminalError::WholeStreamSubjectMismatch),
         );
-        let mut missing = PendingQueueNatsWholeStreamScanner::new(instance);
+        let mut missing = PendingQueueNatsWholeStreamScanner::try_new(manifest()).unwrap();
         missing.observe(1, subject, &data.to_canonical_bytes()).unwrap();
         assert_eq!(
             missing.finish(),
             Err(PendingQueueTerminalError::WholeStreamStateMismatch),
+        );
+
+        let extra = PendingQueuePublishEnvelope::data(
+            &route,
+            &assignment,
+            PendingQueuePublishIntentId::try_new([7; 32]).unwrap(),
+            PendingQueueMemberOrdinal::try_new(3).unwrap(),
+            2,
+            *seal.digest().as_bytes(),
+            vec![4],
+        )
+        .unwrap();
+        let three = RecoverableNatsStreamStateSnapshot::try_new(3, 1200, 1, 3, 0, 1)
+            .unwrap();
+        let after_seal_instance =
+            segment.model_sealed_instance(1_700_000_000_000_000_000, three);
+        let mut after_seal = PendingQueueNatsWholeStreamScanner::try_new(
+            PendingQueueNatsWholeStreamExpectedManifest::try_new(
+                after_seal_instance,
+                vec![assignment.clone()],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        after_seal
+            .observe(1, subject, &data.to_canonical_bytes())
+            .unwrap();
+        after_seal
+            .observe(2, subject, &seal.to_canonical_bytes())
+            .unwrap();
+        assert!(matches!(
+            after_seal.observe(3, subject, &extra.to_canonical_bytes()),
+            Err(PendingQueueTerminalError::Envelope(_))
+        ));
+
+        assert_eq!(
+            PendingQueueNatsWholeStreamExpectedManifest::try_new(instance, Vec::new()),
+            Err(PendingQueueTerminalError::WholeStreamManifestMismatch),
         );
     }
 
