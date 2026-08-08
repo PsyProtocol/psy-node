@@ -35,7 +35,7 @@ use tokio::sync::Mutex;
 
 use super::{
     DurablySelectedPendingQueueBatchReceipt, PendingQueueArtifactStoreError,
-    ScyllaPendingQueueArtifactStore,
+    PendingQueueArtifactOwnerPermit, ScyllaPendingQueueArtifactStore,
 };
 
 const CONSUMER_DIGEST_DOMAIN: &[u8] =
@@ -310,6 +310,7 @@ pub(super) struct ScyllaBackedRecoverableNatsSource {
     client: Arc<NatsJetStreamClient>,
     store: Arc<ScyllaPendingQueueArtifactStore>,
     contract: RecoverableNatsConsumerContract,
+    owner: PendingQueueArtifactOwnerPermit,
     fetch_expires: Duration,
     serial: Mutex<()>,
 }
@@ -319,6 +320,7 @@ impl ScyllaBackedRecoverableNatsSource {
         client: Arc<NatsJetStreamClient>,
         store: Arc<ScyllaPendingQueueArtifactStore>,
         contract: RecoverableNatsConsumerContract,
+        owner: PendingQueueArtifactOwnerPermit,
     ) -> Result<Self, PendingQueueNatsCaptureError> {
         if client.base_namespace != contract.namespace
             || client.stream_name != contract.stream
@@ -329,6 +331,7 @@ impl ScyllaBackedRecoverableNatsSource {
             client,
             store,
             contract,
+            owner,
             fetch_expires: DEFAULT_FETCH_EXPIRES,
             serial: Mutex::new(()),
         })
@@ -347,11 +350,28 @@ impl ScyllaBackedRecoverableNatsSource {
             self.contract.source_identity()?,
         )
         .map_err(|error| PendingQueueNatsCaptureError::Core(error.to_string()))?;
+        if self.owner.slot()
+            != psy_node_core::queue::recoverable_artifact::slot_for(&identity)
+        {
+            return Err(PendingQueueNatsCaptureError::OwnerPermitMismatch);
+        }
+        self.store
+            .validate_owner_permit(&self.owner, &identity)
+            .await
+            .map_err(PendingQueueNatsCaptureError::Store)?;
         let mut consumer = self.ensure_attested_consumer().await?;
+        // Consumer lookup/validation crosses systems and may take an
+        // unbounded amount of time. Revalidate immediately before either
+        // recovery fetch or a new pull so a completed takeover fences this
+        // instance before it can consume max_ack_pending capacity.
+        self.store
+            .validate_owner_permit(&self.owner, &identity)
+            .await
+            .map_err(PendingQueueNatsCaptureError::Store)?;
 
         if let Some((selected, receipt)) = self
             .store
-            .recover_selected_batch(&identity)
+            .recover_selected_batch(&self.owner, &identity)
             .await
             .map_err(PendingQueueNatsCaptureError::Store)?
         {
@@ -368,12 +388,16 @@ impl ScyllaBackedRecoverableNatsSource {
             return Ok(Some(selected));
         }
 
+        self.store
+            .validate_owner_permit(&self.owner, &identity)
+            .await
+            .map_err(PendingQueueNatsCaptureError::Store)?;
         let Some((token, candidate)) = self.fetch_new(&mut consumer, context).await? else {
             return Ok(None);
         };
         let receipt = self
             .store
-            .persist_selected_batch(&candidate)
+            .persist_selected_batch(&self.owner, &candidate)
             .await
             .map_err(PendingQueueNatsCaptureError::Store)?;
         self.ack_and_confirm(token, receipt, &candidate, &mut consumer)
@@ -595,7 +619,7 @@ impl ScyllaBackedRecoverableNatsSource {
         candidate: &PendingQueueCaptureCandidate,
     ) -> Result<(), PendingQueueNatsCaptureError> {
         self.store
-            .confirm_selected_ack_after_backend(receipt, candidate)
+            .confirm_selected_ack_after_backend(&self.owner, receipt, candidate)
             .await
             .map(|_| ())
             .map_err(PendingQueueNatsCaptureError::Store)
@@ -699,6 +723,7 @@ pub(super) enum PendingQueueNatsCaptureError {
     InvalidBatchLimit(usize),
     EmptyConsumerDigest,
     ClientContractMismatch,
+    OwnerPermitMismatch,
     StreamContract(String),
     ConsumerContract,
     SourceIdentityMismatch,
@@ -725,6 +750,7 @@ impl fmt::Display for PendingQueueNatsCaptureError {
             Self::InvalidBatchLimit(value) => write!(formatter, "invalid batch limit {value}"),
             Self::EmptyConsumerDigest => formatter.write_str("empty consumer digest"),
             Self::ClientContractMismatch => formatter.write_str("NATS client/contract mismatch"),
+            Self::OwnerPermitMismatch => formatter.write_str("artifact owner permit mismatch"),
             Self::StreamContract(reason) => write!(formatter, "unsafe stream contract: {reason}"),
             Self::ConsumerContract => formatter.write_str("dedicated consumer contract mismatch"),
             Self::SourceIdentityMismatch => formatter.write_str("source identity mismatch"),

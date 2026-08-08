@@ -13,6 +13,9 @@ use psy_node_core::queue::{
         reconstruct_selected_candidate, slot_for, PendingQueueArtifactAppendPlan,
         PendingQueueArtifactBootstrap, PendingQueueArtifactError,
         PendingQueueArtifactFragment, PendingQueueArtifactFragmentIndex,
+        PendingQueueArtifactOwnerAttemptId, PendingQueueArtifactOwnerFence,
+        PendingQueueArtifactOwnerReasonDigest, PendingQueueArtifactOwnerState,
+        PendingQueueArtifactOwnerTransition,
         PendingQueueArtifactPhase, PendingQueueArtifactScanDigest,
         PendingQueueArtifactScanObservation, PendingQueueArtifactSlot,
         SealedPendingQueueArtifactTransition, StoredPendingQueueArtifact,
@@ -441,6 +444,41 @@ impl PendingQueueArtifactHeaderCasBinding {
 
 #[derive(Clone, Debug, Eq, PartialEq, scylla::SerializeRow)]
 #[scylla(flavor = "enforce_order", skip_name_checks)]
+struct PendingQueueArtifactOwnerCasBinding {
+    candidate_revision: i64,
+    candidate_payload: Vec<u8>,
+    artifact_slot: Vec<u8>,
+    expected_revision: i64,
+    expected_payload: Vec<u8>,
+}
+
+impl PendingQueueArtifactOwnerCasBinding {
+    fn try_new(
+        transition: &PendingQueueArtifactOwnerTransition,
+    ) -> Result<Self, PendingQueueArtifactStoreError> {
+        let expected = transition.expected();
+        let candidate = transition.candidate();
+        if expected.slot() != candidate.slot()
+            || expected.identity() != candidate.identity()
+            || expected.phase() != candidate.phase()
+            || expected.revision() != candidate.revision()
+            || expected.owner() == candidate.owner()
+            || candidate.owner().fence().get() < expected.owner().fence().get()
+        {
+            return Err(PendingQueueArtifactStoreError::InvalidOwnerTransition);
+        }
+        Ok(Self {
+            candidate_revision: candidate.revision().as_i64(),
+            candidate_payload: candidate.to_persisted_bytes(),
+            artifact_slot: expected.slot().as_bytes().to_vec(),
+            expected_revision: expected.revision().as_i64(),
+            expected_payload: expected.to_persisted_bytes(),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, scylla::SerializeRow)]
+#[scylla(flavor = "enforce_order", skip_name_checks)]
 pub struct PendingQueueArtifactFragmentPutBinding {
     artifact_slot: Vec<u8>,
     fragment_bucket: i64,
@@ -609,6 +647,74 @@ fn store_fingerprint(
     PendingQueueArtifactStoreFingerprint(hasher.finalize().into())
 }
 
+/// Opaque proof that this concrete store observed one exact artifact owner.
+/// It is intentionally not `Clone`; same-attempt retries ask the store to
+/// re-read and mint a fresh permit instead of copying stale authority.
+#[derive(Debug)]
+pub struct PendingQueueArtifactOwnerPermit {
+    store_fingerprint: PendingQueueArtifactStoreFingerprint,
+    slot: PendingQueueArtifactSlot,
+    attempt_id: PendingQueueArtifactOwnerAttemptId,
+    fence: PendingQueueArtifactOwnerFence,
+}
+
+impl PendingQueueArtifactOwnerPermit {
+    pub const fn slot(&self) -> PendingQueueArtifactSlot {
+        self.slot
+    }
+
+    pub const fn attempt_id(&self) -> PendingQueueArtifactOwnerAttemptId {
+        self.attempt_id
+    }
+
+    pub const fn fence(&self) -> PendingQueueArtifactOwnerFence {
+        self.fence
+    }
+}
+
+fn owner_permit_from_current(
+    store_fingerprint: PendingQueueArtifactStoreFingerprint,
+    current: &StoredPendingQueueArtifact,
+    expected_attempt: PendingQueueArtifactOwnerAttemptId,
+) -> Result<PendingQueueArtifactOwnerPermit, PendingQueueArtifactStoreError> {
+    let PendingQueueArtifactOwnerState::Held {
+        fence, attempt_id, ..
+    } = current.owner()
+    else {
+        return Err(PendingQueueArtifactStoreError::OwnerNotHeld);
+    };
+    if *attempt_id != expected_attempt {
+        return Err(PendingQueueArtifactStoreError::OwnerAttemptMismatch);
+    }
+    Ok(PendingQueueArtifactOwnerPermit {
+        store_fingerprint,
+        slot: current.slot(),
+        attempt_id: *attempt_id,
+        fence: *fence,
+    })
+}
+
+fn require_owner_permit(
+    store_fingerprint: PendingQueueArtifactStoreFingerprint,
+    current: &StoredPendingQueueArtifact,
+    permit: &PendingQueueArtifactOwnerPermit,
+) -> Result<(), PendingQueueArtifactStoreError> {
+    let PendingQueueArtifactOwnerState::Held {
+        fence, attempt_id, ..
+    } = current.owner()
+    else {
+        return Err(PendingQueueArtifactStoreError::OwnerNotHeld);
+    };
+    if permit.store_fingerprint != store_fingerprint
+        || permit.slot != current.slot()
+        || permit.attempt_id != *attempt_id
+        || permit.fence != *fence
+    {
+        return Err(PendingQueueArtifactStoreError::OwnerPermitMismatch);
+    }
+    Ok(())
+}
+
 /// Opaque proof that the concrete store selected one exact batch header and
 /// read every immutable fragment back from Scylla. It is intentionally not
 /// `Clone` and has no public constructor. It does not itself perform ACK.
@@ -622,6 +728,8 @@ pub struct DurablySelectedPendingQueueBatchReceipt {
     store_fingerprint: PendingQueueArtifactStoreFingerprint,
     slot: PendingQueueArtifactSlot,
     selected_revision: u64,
+    owner_attempt_id: PendingQueueArtifactOwnerAttemptId,
+    owner_fence: PendingQueueArtifactOwnerFence,
     candidate_digest: [u8; 32],
     canonical_receipt_digest: [u8; 32],
 }
@@ -634,11 +742,21 @@ impl DurablySelectedPendingQueueBatchReceipt {
         candidate: &PendingQueueCaptureCandidate,
     ) -> Self {
         let canonical = candidate.to_canonical_bytes();
+        let PendingQueueArtifactOwnerState::Held {
+            attempt_id,
+            fence,
+            ..
+        } = selected.owner()
+        else {
+            unreachable!("selection receipt is minted only for an owner-held header")
+        };
         let mut hasher = Sha256::new();
         hasher.update(RECEIPT_CANDIDATE_DOMAIN);
         hasher.update(store_fingerprint.as_bytes());
         hasher.update(selected.slot().as_bytes());
         hasher.update(selected.revision().get().to_be_bytes());
+        hasher.update(attempt_id.as_bytes());
+        hasher.update(fence.get().to_be_bytes());
         hasher.update(plan.descriptor().candidate_digest().as_bytes());
         hasher.update((canonical.len() as u64).to_be_bytes());
         hasher.update(&canonical);
@@ -646,6 +764,8 @@ impl DurablySelectedPendingQueueBatchReceipt {
             store_fingerprint,
             slot: selected.slot(),
             selected_revision: selected.revision().get(),
+            owner_attempt_id: *attempt_id,
+            owner_fence: *fence,
             candidate_digest: *plan.descriptor().candidate_digest().as_bytes(),
             canonical_receipt_digest: hasher.finalize().into(),
         }
@@ -667,6 +787,14 @@ impl DurablySelectedPendingQueueBatchReceipt {
         &self.candidate_digest
     }
 
+    pub const fn owner_attempt_id(&self) -> PendingQueueArtifactOwnerAttemptId {
+        self.owner_attempt_id
+    }
+
+    pub const fn owner_fence(&self) -> PendingQueueArtifactOwnerFence {
+        self.owner_fence
+    }
+
     pub const fn canonical_receipt_digest(&self) -> &[u8; 32] {
         &self.canonical_receipt_digest
     }
@@ -684,6 +812,8 @@ impl DurablySelectedPendingQueueBatchReceipt {
         hasher.update(self.store_fingerprint.as_bytes());
         hasher.update(self.slot.as_bytes());
         hasher.update(self.selected_revision.to_be_bytes());
+        hasher.update(self.owner_attempt_id.as_bytes());
+        hasher.update(self.owner_fence.get().to_be_bytes());
         hasher.update(self.candidate_digest);
         hasher.update((canonical.len() as u64).to_be_bytes());
         hasher.update(canonical);
@@ -702,6 +832,8 @@ pub struct PersistedPendingQueueSourceScanReceipt {
     store_fingerprint: PendingQueueArtifactStoreFingerprint,
     slot: PendingQueueArtifactSlot,
     source_scan_revision: u64,
+    owner_attempt_id: PendingQueueArtifactOwnerAttemptId,
+    owner_fence: PendingQueueArtifactOwnerFence,
     scan_digest: PendingQueueArtifactScanDigest,
 }
 
@@ -720,6 +852,14 @@ impl PersistedPendingQueueSourceScanReceipt {
 
     pub const fn scan_digest(&self) -> PendingQueueArtifactScanDigest {
         self.scan_digest
+    }
+
+    pub const fn owner_attempt_id(&self) -> PendingQueueArtifactOwnerAttemptId {
+        self.owner_attempt_id
+    }
+
+    pub const fn owner_fence(&self) -> PendingQueueArtifactOwnerFence {
+        self.owner_fence
     }
 }
 
@@ -888,11 +1028,125 @@ impl ScyllaPendingQueueArtifactStore {
             .await
     }
 
+    pub async fn claim_owner(
+        &self,
+        identity: &PendingQueueArtifactIdentity,
+        attempt_id: PendingQueueArtifactOwnerAttemptId,
+        reason_digest: PendingQueueArtifactOwnerReasonDigest,
+    ) -> Result<PendingQueueArtifactOwnerPermit, PendingQueueArtifactStoreError> {
+        let current = match self.read_header(identity).await? {
+            Some(current) => current,
+            None => {
+                let bootstrap = PendingQueueArtifactBootstrap::try_new(
+                    identity.clone(),
+                    attempt_id,
+                    reason_digest,
+                )?;
+                self.bootstrap(&bootstrap).await?.current().clone()
+            }
+        };
+        match current.owner() {
+            PendingQueueArtifactOwnerState::Held {
+                attempt_id: current_attempt,
+                ..
+            } if *current_attempt == attempt_id => {
+                owner_permit_from_current(self.fingerprint, &current, attempt_id)
+            }
+            PendingQueueArtifactOwnerState::Held { .. } => {
+                Err(PendingQueueArtifactStoreError::OwnerAlreadyHeld)
+            }
+            PendingQueueArtifactOwnerState::Vacant { .. } => {
+                let transition = PendingQueueArtifactOwnerTransition::acquire_vacant(
+                    &current,
+                    attempt_id,
+                    reason_digest,
+                )?;
+                let claimed = self.cas_owner_header(&transition).await?;
+                owner_permit_from_current(self.fingerprint, &claimed, attempt_id)
+            }
+        }
+    }
+
+    /// Explicit crash/startup recovery. There is no TTL or wall-clock based
+    /// steal path. Competing startups CAS the exact current payload and only
+    /// the winner receives the new monotonic fence.
+    pub async fn startup_takeover_owner(
+        &self,
+        identity: &PendingQueueArtifactIdentity,
+        attempt_id: PendingQueueArtifactOwnerAttemptId,
+        reason_digest: PendingQueueArtifactOwnerReasonDigest,
+    ) -> Result<PendingQueueArtifactOwnerPermit, PendingQueueArtifactStoreError> {
+        let current = self
+            .read_header(identity)
+            .await?
+            .ok_or(PendingQueueArtifactStoreError::Uninitialized)?;
+        if current.owner().is_held_by(attempt_id) {
+            return owner_permit_from_current(self.fingerprint, &current, attempt_id);
+        }
+        let transition = match current.owner() {
+            PendingQueueArtifactOwnerState::Held { .. } => {
+                PendingQueueArtifactOwnerTransition::startup_takeover(
+                    &current,
+                    attempt_id,
+                    reason_digest,
+                )?
+            }
+            PendingQueueArtifactOwnerState::Vacant { .. } => {
+                PendingQueueArtifactOwnerTransition::acquire_vacant(
+                    &current,
+                    attempt_id,
+                    reason_digest,
+                )?
+            }
+        };
+        let claimed = self.cas_owner_header(&transition).await?;
+        owner_permit_from_current(self.fingerprint, &claimed, attempt_id)
+    }
+
+    pub async fn release_owner(
+        &self,
+        permit: PendingQueueArtifactOwnerPermit,
+        reason_digest: PendingQueueArtifactOwnerReasonDigest,
+    ) -> Result<StoredPendingQueueArtifact, PendingQueueArtifactStoreError> {
+        let current = self
+            .read_header_by_slot(permit.slot)
+            .await?
+            .ok_or(PendingQueueArtifactStoreError::Uninitialized)?;
+        require_owner_permit(self.fingerprint, &current, &permit)?;
+        let transition = PendingQueueArtifactOwnerTransition::release(
+            &current,
+            permit.attempt_id,
+            reason_digest,
+        )?;
+        self.cas_owner_header(&transition).await
+    }
+
+    /// Re-reads the durable artifact header and proves that this permit still
+    /// names its exact current owner attempt and fence. Cross-system callers
+    /// must perform this check immediately before touching the NATS consumer;
+    /// checking only when a fetched batch is persisted would allow a stale
+    /// owner to pull and hold messages after a startup takeover.
+    pub async fn validate_owner_permit(
+        &self,
+        permit: &PendingQueueArtifactOwnerPermit,
+        identity: &PendingQueueArtifactIdentity,
+    ) -> Result<(), PendingQueueArtifactStoreError> {
+        if permit.slot != slot_for(identity) {
+            return Err(PendingQueueArtifactStoreError::OwnerPermitMismatch);
+        }
+        let current = self
+            .read_header_by_slot(permit.slot)
+            .await?
+            .ok_or(PendingQueueArtifactStoreError::Uninitialized)?;
+        require_owner_permit(self.fingerprint, &current, permit)
+    }
+
     /// Persists one exact candidate, reads every fragment back, selects it in
     /// the header, and only then returns an opaque receipt. It does not ACK the
     /// backend and exposes no method to advance `SelectedAwaitingAck -> Open`.
     pub async fn persist_selected_batch(
         &self,
+        permit: &PendingQueueArtifactOwnerPermit,
         candidate: &PendingQueueCaptureCandidate,
     ) -> Result<DurablySelectedPendingQueueBatchReceipt, PendingQueueArtifactStoreError> {
         let identity = candidate.artifact_identity();
@@ -900,6 +1154,7 @@ impl ScyllaPendingQueueArtifactStore {
             .read_header(identity)
             .await?
             .ok_or(PendingQueueArtifactStoreError::Uninitialized)?;
+        require_owner_permit(self.fingerprint, &current, permit)?;
         let (plan, already_selected) = match current.phase() {
             PendingQueueArtifactPhase::Open(_) => {
                 let plan = PendingQueueArtifactAppendPlan::try_new(&current, candidate)?;
@@ -944,6 +1199,7 @@ impl ScyllaPendingQueueArtifactStore {
     /// The returned receipt is still per-source and non-terminal.
     pub async fn scan_closed_source(
         &self,
+        permit: &PendingQueueArtifactOwnerPermit,
         identity: &PendingQueueArtifactIdentity,
         boundary: PendingQueueGenerationBoundary,
     ) -> Result<PersistedPendingQueueSourceScanReceipt, PendingQueueArtifactStoreError> {
@@ -951,6 +1207,7 @@ impl ScyllaPendingQueueArtifactStore {
             .read_header(identity)
             .await?
             .ok_or(PendingQueueArtifactStoreError::Uninitialized)?;
+        require_owner_permit(self.fingerprint, &current, permit)?;
         let close_or_scanned = match current.phase() {
             PendingQueueArtifactPhase::Open(_) => {
                 let transition = SealedPendingQueueArtifactTransition::observe_close(
@@ -1002,6 +1259,8 @@ impl ScyllaPendingQueueArtifactStore {
             store_fingerprint: self.fingerprint,
             slot: scanned.slot(),
             source_scan_revision: scanned.revision().get(),
+            owner_attempt_id: permit.attempt_id,
+            owner_fence: permit.fence,
             scan_digest: observation.scan_digest(),
         })
     }
@@ -1011,6 +1270,7 @@ impl ScyllaPendingQueueArtifactStore {
     /// mints the same opaque exact-readback receipt as the normal write path.
     pub(super) async fn recover_selected_batch(
         &self,
+        permit: &PendingQueueArtifactOwnerPermit,
         identity: &PendingQueueArtifactIdentity,
     ) -> Result<
         Option<(
@@ -1023,6 +1283,7 @@ impl ScyllaPendingQueueArtifactStore {
             .read_header(identity)
             .await?
             .ok_or(PendingQueueArtifactStoreError::Uninitialized)?;
+        require_owner_permit(self.fingerprint, &selected, permit)?;
         let PendingQueueArtifactPhase::SelectedAwaitingAck { descriptor, .. } =
             selected.phase()
         else {
@@ -1066,6 +1327,7 @@ impl ScyllaPendingQueueArtifactStore {
     /// an exact ACK.  It is intentionally not part of this crate's public API.
     pub(super) async fn confirm_selected_ack_after_backend(
         &self,
+        permit: &PendingQueueArtifactOwnerPermit,
         receipt: DurablySelectedPendingQueueBatchReceipt,
         candidate: &PendingQueueCaptureCandidate,
     ) -> Result<StoredPendingQueueArtifact, PendingQueueArtifactStoreError> {
@@ -1079,9 +1341,12 @@ impl ScyllaPendingQueueArtifactStore {
             .ok_or(PendingQueueArtifactStoreError::Uninitialized)?;
         if current.slot() != receipt.slot()
             || current.revision().get() != receipt.selected_revision()
+            || current.owner().attempt_id() != Some(receipt.owner_attempt_id())
+            || current.owner().fence() != receipt.owner_fence()
         {
             return Err(PendingQueueArtifactStoreError::ReceiptHeaderMismatch);
         }
+        require_owner_permit(self.fingerprint, &current, permit)?;
         let transition =
             SealedPendingQueueArtifactTransition::confirm_selected_ack(&current)?;
         let outcome = self
@@ -1101,6 +1366,21 @@ impl ScyllaPendingQueueArtifactStore {
             .execute_unpaged(&self.advance_header, binding)
             .await;
         self.finish_header_write(execution, candidate).await
+    }
+
+    async fn cas_owner_header(
+        &self,
+        transition: &PendingQueueArtifactOwnerTransition,
+    ) -> Result<StoredPendingQueueArtifact, PendingQueueArtifactStoreError> {
+        let binding = PendingQueueArtifactOwnerCasBinding::try_new(transition)?;
+        let execution = self
+            .session
+            .execute_unpaged(&self.advance_header, binding)
+            .await;
+        let outcome = self
+            .finish_header_write(execution, transition.candidate())
+            .await?;
+        require_exact_header(outcome, transition.candidate())
     }
 
     async fn finish_header_write(
@@ -1528,6 +1808,11 @@ pub enum PendingQueueArtifactStoreError {
     ZeroDigest,
     HeaderRevisionOverflow,
     InvalidHeaderTransition,
+    InvalidOwnerTransition,
+    OwnerNotHeld,
+    OwnerAttemptMismatch,
+    OwnerAlreadyHeld,
+    OwnerPermitMismatch,
     Uninitialized,
     HeaderNotAppendable,
     HeaderNotClosed,
@@ -1650,6 +1935,8 @@ mod tests {
         let candidate = candidate();
         let bootstrap = PendingQueueArtifactBootstrap::try_new(
             candidate.artifact_identity().clone(),
+            PendingQueueArtifactOwnerAttemptId::try_new([21; 32]).unwrap(),
+            PendingQueueArtifactOwnerReasonDigest::try_new([22; 32]).unwrap(),
         )
         .unwrap();
         PendingQueueArtifactAppendPlan::try_new(bootstrap.candidate(), &candidate)
@@ -1757,6 +2044,47 @@ mod tests {
                 plan.expected_open().clone(),
             ),
             Err(PendingQueueArtifactStoreError::AppliedHeaderMismatch),
+        );
+    }
+
+    #[test]
+    fn owner_cas_keeps_artifact_revision_and_advances_exact_owner_fence() {
+        let initial = append_plan().expected_open().clone();
+        let takeover = PendingQueueArtifactOwnerTransition::startup_takeover(
+            &initial,
+            PendingQueueArtifactOwnerAttemptId::try_new([31; 32]).unwrap(),
+            PendingQueueArtifactOwnerReasonDigest::try_new([32; 32]).unwrap(),
+        )
+        .unwrap();
+        let binding = PendingQueueArtifactOwnerCasBinding::try_new(&takeover).unwrap();
+        assert_eq!(binding.expected_revision, binding.candidate_revision);
+        assert_eq!(binding.expected_revision, initial.revision().as_i64());
+        assert_ne!(binding.expected_payload, binding.candidate_payload);
+        assert_eq!(takeover.candidate().owner().fence().get(), 2);
+        assert_eq!(takeover.candidate().phase(), initial.phase());
+        assert!(matches!(
+            classify_header_observation(
+                false,
+                takeover.candidate(),
+                takeover.candidate().clone(),
+            )
+            .unwrap(),
+            PendingQueueArtifactHeaderWriteOutcome::Idempotent(_),
+        ));
+
+        let old_permit = owner_permit_from_current(
+            store_fingerprint(&keyspaces(), &PendingQueueArtifactQueries::new(&keyspaces())),
+            &initial,
+            PendingQueueArtifactOwnerAttemptId::try_new([21; 32]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            require_owner_permit(
+                old_permit.store_fingerprint,
+                takeover.candidate(),
+                &old_permit,
+            ),
+            Err(PendingQueueArtifactStoreError::OwnerPermitMismatch),
         );
     }
 

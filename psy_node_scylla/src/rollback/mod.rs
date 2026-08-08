@@ -31,6 +31,7 @@ mod branch_exact_pending_runtime;
 mod branch_exact_pending_orchestration;
 mod pending_generation_pipeline_store;
 mod pending_queue_artifact_store;
+mod pending_queue_segment_ledger;
 #[allow(dead_code)]
 mod pending_queue_nats_capture;
 #[cfg(test)]
@@ -90,6 +91,7 @@ pub use branch_exact_writer_lifecycle_store::*;
 pub use branch_exact_writer_runtime::*;
 pub use pending_generation_pipeline_store::*;
 pub use pending_queue_artifact_store::*;
+pub use pending_queue_segment_ledger::*;
 pub use authority_local_head_prototype::*;
 pub use authority_timestamp_prototype::*;
 pub use checkpoint_kiv::*;

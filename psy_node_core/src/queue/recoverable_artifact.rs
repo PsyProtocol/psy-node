@@ -21,7 +21,7 @@ use super::recoverable_ephemeral::{
     MAX_RECOVERABLE_QUEUE_BATCH_ITEMS,
 };
 
-pub const PENDING_QUEUE_ARTIFACT_CODEC_VERSION: u16 = 1;
+pub const PENDING_QUEUE_ARTIFACT_CODEC_VERSION: u16 = 2;
 pub const PENDING_QUEUE_ARTIFACT_FRAGMENT_BYTES: usize = 4 * 1024 * 1024;
 pub const PENDING_QUEUE_ARTIFACT_FRAGMENTS_PER_BUCKET: u64 = 16;
 pub const MAX_PENDING_QUEUE_ARTIFACT_BATCHES: u32 = 1024;
@@ -110,6 +110,105 @@ impl PendingQueueArtifactRevision {
                 .checked_add(1)
                 .ok_or(PendingQueueArtifactError::RevisionOverflow)?,
         )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct PendingQueueArtifactOwnerFence(u64);
+
+impl PendingQueueArtifactOwnerFence {
+    pub const fn try_new(value: u64) -> Result<Self, PendingQueueArtifactError> {
+        if value == 0 || value > i64::MAX as u64 {
+            Err(PendingQueueArtifactError::OwnerFenceOutOfRange(value))
+        } else {
+            Ok(Self(value))
+        }
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    fn next(self) -> Result<Self, PendingQueueArtifactError> {
+        Self::try_new(
+            self.0
+                .checked_add(1)
+                .ok_or(PendingQueueArtifactError::OwnerFenceOverflow)?,
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct PendingQueueArtifactOwnerAttemptId([u8; 32]);
+
+impl PendingQueueArtifactOwnerAttemptId {
+    pub fn try_new(bytes: [u8; 32]) -> Result<Self, PendingQueueArtifactError> {
+        if bytes == [0; 32] {
+            Err(PendingQueueArtifactError::EmptyOwnerAttemptId)
+        } else {
+            Ok(Self(bytes))
+        }
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct PendingQueueArtifactOwnerReasonDigest([u8; 32]);
+
+impl PendingQueueArtifactOwnerReasonDigest {
+    pub fn try_new(bytes: [u8; 32]) -> Result<Self, PendingQueueArtifactError> {
+        if bytes == [0; 32] {
+            Err(PendingQueueArtifactError::EmptyOwnerReasonDigest)
+        } else {
+            Ok(Self(bytes))
+        }
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PendingQueueArtifactOwnerState {
+    Held {
+        fence: PendingQueueArtifactOwnerFence,
+        attempt_id: PendingQueueArtifactOwnerAttemptId,
+        reason_digest: PendingQueueArtifactOwnerReasonDigest,
+    },
+    Vacant {
+        fence: PendingQueueArtifactOwnerFence,
+        reason_digest: PendingQueueArtifactOwnerReasonDigest,
+    },
+}
+
+impl PendingQueueArtifactOwnerState {
+    pub const fn fence(&self) -> PendingQueueArtifactOwnerFence {
+        match self {
+            Self::Held { fence, .. } | Self::Vacant { fence, .. } => *fence,
+        }
+    }
+
+    pub const fn attempt_id(&self) -> Option<PendingQueueArtifactOwnerAttemptId> {
+        match self {
+            Self::Held { attempt_id, .. } => Some(*attempt_id),
+            Self::Vacant { .. } => None,
+        }
+    }
+
+    pub const fn reason_digest(&self) -> PendingQueueArtifactOwnerReasonDigest {
+        match self {
+            Self::Held { reason_digest, .. } | Self::Vacant { reason_digest, .. } => {
+                *reason_digest
+            }
+        }
+    }
+
+    pub fn is_held_by(&self, attempt_id: PendingQueueArtifactOwnerAttemptId) -> bool {
+        matches!(self, Self::Held { attempt_id: current, .. } if current.0 == attempt_id.0)
     }
 }
 
@@ -371,6 +470,7 @@ pub enum PendingQueueArtifactPhase {
 pub struct StoredPendingQueueArtifact {
     slot: PendingQueueArtifactSlot,
     identity: PendingQueueArtifactIdentity,
+    owner: PendingQueueArtifactOwnerState,
     revision: PendingQueueArtifactRevision,
     phase: PendingQueueArtifactPhase,
 }
@@ -388,6 +488,10 @@ impl StoredPendingQueueArtifact {
         self.revision
     }
 
+    pub const fn owner(&self) -> &PendingQueueArtifactOwnerState {
+        &self.owner
+    }
+
     pub const fn phase(&self) -> &PendingQueueArtifactPhase {
         &self.phase
     }
@@ -400,6 +504,7 @@ impl StoredPendingQueueArtifact {
         let identity = self.identity.to_canonical_bytes();
         out.extend_from_slice(&(identity.len() as u32).to_be_bytes());
         out.extend_from_slice(&identity);
+        encode_owner(&self.owner, &mut out);
         out.extend_from_slice(&self.revision.get().to_be_bytes());
         match &self.phase {
             PendingQueueArtifactPhase::Open(progress) => {
@@ -465,6 +570,7 @@ impl StoredPendingQueueArtifact {
         if slot_for(&identity) != partition_slot {
             return Err(PendingQueueArtifactError::IdentitySlotMismatch);
         }
+        let owner = decode_owner(&mut decoder)?;
         let revision = PendingQueueArtifactRevision::try_new(decoder.u64()?)?;
         if revision.as_i64() != revision_column {
             return Err(PendingQueueArtifactError::RevisionColumnMismatch);
@@ -515,6 +621,7 @@ impl StoredPendingQueueArtifact {
         Ok(Self {
             slot: partition_slot,
             identity,
+            owner,
             revision,
             phase,
         })
@@ -550,6 +657,8 @@ pub struct PendingQueueArtifactBootstrap {
 impl PendingQueueArtifactBootstrap {
     pub fn try_new(
         identity: PendingQueueArtifactIdentity,
+        owner_attempt_id: PendingQueueArtifactOwnerAttemptId,
+        owner_reason_digest: PendingQueueArtifactOwnerReasonDigest,
     ) -> Result<Self, PendingQueueArtifactError> {
         let candidate = StoredPendingQueueArtifact {
             slot: slot_for(&identity),
@@ -557,6 +666,11 @@ impl PendingQueueArtifactBootstrap {
                 &identity,
             )),
             identity,
+            owner: PendingQueueArtifactOwnerState::Held {
+                fence: PendingQueueArtifactOwnerFence::try_new(1)?,
+                attempt_id: owner_attempt_id,
+                reason_digest: owner_reason_digest,
+            },
             revision: PendingQueueArtifactRevision::try_new(1)?,
         };
         let payload = candidate.to_persisted_bytes();
@@ -569,6 +683,117 @@ impl PendingQueueArtifactBootstrap {
 
     pub fn payload(&self) -> &[u8] {
         &self.payload
+    }
+}
+
+/// Sealed owner-only header transition. Owner changes share the artifact row
+/// and its revision/full-payload CAS, so an old process cannot advance the
+/// artifact after a takeover wins.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingQueueArtifactOwnerTransition {
+    expected: StoredPendingQueueArtifact,
+    candidate: StoredPendingQueueArtifact,
+}
+
+impl PendingQueueArtifactOwnerTransition {
+    pub fn acquire_vacant(
+        current: &StoredPendingQueueArtifact,
+        attempt_id: PendingQueueArtifactOwnerAttemptId,
+        reason_digest: PendingQueueArtifactOwnerReasonDigest,
+    ) -> Result<Self, PendingQueueArtifactError> {
+        let PendingQueueArtifactOwnerState::Vacant { fence, .. } = &current.owner else {
+            return Err(PendingQueueArtifactError::OwnerNotVacant);
+        };
+        Ok(Self::replace_owner(
+            current,
+            PendingQueueArtifactOwnerState::Held {
+                fence: fence.next()?,
+                attempt_id,
+                reason_digest,
+            },
+        )?)
+    }
+
+    /// Explicit startup/manual takeover. There is deliberately no TTL or
+    /// wall-clock based stealing: the caller must name the exact current row,
+    /// and the full-payload CAS linearizes competing startup attempts.
+    pub fn startup_takeover(
+        current: &StoredPendingQueueArtifact,
+        attempt_id: PendingQueueArtifactOwnerAttemptId,
+        reason_digest: PendingQueueArtifactOwnerReasonDigest,
+    ) -> Result<Self, PendingQueueArtifactError> {
+        let PendingQueueArtifactOwnerState::Held {
+            fence,
+            attempt_id: current_attempt,
+            ..
+        } = &current.owner
+        else {
+            return Err(PendingQueueArtifactError::OwnerNotHeld);
+        };
+        if *current_attempt == attempt_id {
+            return Err(PendingQueueArtifactError::OwnerAlreadyHeldByAttempt);
+        }
+        Ok(Self::replace_owner(
+            current,
+            PendingQueueArtifactOwnerState::Held {
+                fence: fence.next()?,
+                attempt_id,
+                reason_digest,
+            },
+        )?)
+    }
+
+    pub fn release(
+        current: &StoredPendingQueueArtifact,
+        attempt_id: PendingQueueArtifactOwnerAttemptId,
+        reason_digest: PendingQueueArtifactOwnerReasonDigest,
+    ) -> Result<Self, PendingQueueArtifactError> {
+        let PendingQueueArtifactOwnerState::Held {
+            fence,
+            attempt_id: current_attempt,
+            ..
+        } = &current.owner
+        else {
+            return Err(PendingQueueArtifactError::OwnerNotHeld);
+        };
+        if *current_attempt != attempt_id {
+            return Err(PendingQueueArtifactError::OwnerAttemptMismatch);
+        }
+        Ok(Self::replace_owner(
+            current,
+            PendingQueueArtifactOwnerState::Vacant {
+                fence: *fence,
+                reason_digest,
+            },
+        )?)
+    }
+
+    fn replace_owner(
+        current: &StoredPendingQueueArtifact,
+        owner: PendingQueueArtifactOwnerState,
+    ) -> Result<Self, PendingQueueArtifactError> {
+        Ok(Self {
+            expected: current.clone(),
+            candidate: StoredPendingQueueArtifact {
+                slot: current.slot,
+                identity: current.identity.clone(),
+                owner,
+                // Owner changes are a second monotonic axis carried in the
+                // same payload. Keeping the artifact revision unchanged
+                // preserves phase-recovery arithmetic; the full-payload LWT
+                // plus strictly increasing owner fence still prevents ABA.
+                revision: current.revision,
+                phase: current.phase.clone(),
+            },
+        })
+    }
+
+    pub const fn expected(&self) -> &StoredPendingQueueArtifact {
+        &self.expected
+    }
+
+    pub const fn candidate(&self) -> &StoredPendingQueueArtifact {
+        &self.candidate
     }
 }
 
@@ -730,6 +955,7 @@ impl PendingQueueArtifactAppendPlan {
         let prepared = StoredPendingQueueArtifact {
             slot: expected_open.slot,
             identity: expected_open.identity.clone(),
+            owner: expected_open.owner.clone(),
             revision: expected_open.revision.next()?,
             phase: PendingQueueArtifactPhase::AppendPrepared {
                 before: before.clone(),
@@ -739,6 +965,7 @@ impl PendingQueueArtifactAppendPlan {
         let selected = StoredPendingQueueArtifact {
             slot: expected_open.slot,
             identity: expected_open.identity.clone(),
+            owner: expected_open.owner.clone(),
             revision: prepared.revision.next()?,
             phase: PendingQueueArtifactPhase::SelectedAwaitingAck {
                 before: before.clone(),
@@ -806,6 +1033,7 @@ impl PendingQueueArtifactAppendPlan {
         let expected_open = StoredPendingQueueArtifact {
             slot: current_prepared.slot,
             identity: current_prepared.identity.clone(),
+            owner: current_prepared.owner.clone(),
             revision: PendingQueueArtifactRevision::try_new(previous_revision)?,
             phase: PendingQueueArtifactPhase::Open(before.clone()),
         };
@@ -836,6 +1064,7 @@ impl PendingQueueArtifactAppendPlan {
         let expected_open = StoredPendingQueueArtifact {
             slot: current_selected.slot,
             identity: current_selected.identity.clone(),
+            owner: current_selected.owner.clone(),
             revision: PendingQueueArtifactRevision::try_new(open_revision)?,
             phase: PendingQueueArtifactPhase::Open(before.clone()),
         };
@@ -922,6 +1151,7 @@ pub fn reconstruct_selected_candidate(
     let predecessor = StoredPendingQueueArtifact {
         slot: selected.slot(),
         identity: selected.identity().clone(),
+        owner: selected.owner().clone(),
         revision: PendingQueueArtifactRevision::try_new(predecessor_revision)?,
         phase: PendingQueueArtifactPhase::Open(before.clone()),
     };
@@ -971,6 +1201,7 @@ impl SealedPendingQueueArtifactTransition {
         let candidate = StoredPendingQueueArtifact {
             slot: selected.slot,
             identity: selected.identity.clone(),
+            owner: selected.owner.clone(),
             revision: selected.revision.next()?,
             phase: PendingQueueArtifactPhase::Open(after.clone()),
         };
@@ -988,6 +1219,7 @@ impl SealedPendingQueueArtifactTransition {
         let candidate = StoredPendingQueueArtifact {
             slot: open.slot,
             identity: open.identity.clone(),
+            owner: open.owner.clone(),
             revision: open.revision.next()?,
             phase: PendingQueueArtifactPhase::CloseObserved {
                 progress: progress.clone(),
@@ -1021,6 +1253,7 @@ impl SealedPendingQueueArtifactTransition {
         let candidate = StoredPendingQueueArtifact {
             slot: close_observed.slot,
             identity: close_observed.identity.clone(),
+            owner: close_observed.owner.clone(),
             revision: close_observed.revision.next()?,
             phase: PendingQueueArtifactPhase::SourceScanned {
                 progress: progress.clone(),
@@ -1176,6 +1409,7 @@ impl PendingQueueArtifactScanObservation {
                 &StoredPendingQueueArtifact {
                     slot: close_observed.slot,
                     identity: close_observed.identity.clone(),
+                    owner: close_observed.owner.clone(),
                     revision: PendingQueueArtifactRevision::try_new(1)?,
                     phase: PendingQueueArtifactPhase::Open(rebuilt_progress.clone()),
                 },
@@ -1464,6 +1698,46 @@ fn decode_descriptor(
     Ok(descriptor)
 }
 
+fn encode_owner(owner: &PendingQueueArtifactOwnerState, out: &mut Vec<u8>) {
+    match owner {
+        PendingQueueArtifactOwnerState::Held {
+            fence,
+            attempt_id,
+            reason_digest,
+        } => {
+            out.push(1);
+            out.extend_from_slice(&fence.get().to_be_bytes());
+            out.extend_from_slice(attempt_id.as_bytes());
+            out.extend_from_slice(reason_digest.as_bytes());
+        }
+        PendingQueueArtifactOwnerState::Vacant {
+            fence,
+            reason_digest,
+        } => {
+            out.push(2);
+            out.extend_from_slice(&fence.get().to_be_bytes());
+            out.extend_from_slice(reason_digest.as_bytes());
+        }
+    }
+}
+
+fn decode_owner(
+    decoder: &mut Decoder<'_>,
+) -> Result<PendingQueueArtifactOwnerState, PendingQueueArtifactError> {
+    match decoder.u8()? {
+        1 => Ok(PendingQueueArtifactOwnerState::Held {
+            fence: PendingQueueArtifactOwnerFence::try_new(decoder.u64()?)?,
+            attempt_id: PendingQueueArtifactOwnerAttemptId::try_new(decoder.array32()?)?,
+            reason_digest: PendingQueueArtifactOwnerReasonDigest::try_new(decoder.array32()?)?,
+        }),
+        2 => Ok(PendingQueueArtifactOwnerState::Vacant {
+            fence: PendingQueueArtifactOwnerFence::try_new(decoder.u64()?)?,
+            reason_digest: PendingQueueArtifactOwnerReasonDigest::try_new(decoder.array32()?)?,
+        }),
+        value => Err(PendingQueueArtifactError::UnknownOwnerState(value)),
+    }
+}
+
 fn encode_progress(progress: &PendingQueueArtifactProgress, out: &mut Vec<u8>) {
     out.extend_from_slice(&progress.next_batch_index.to_be_bytes());
     out.extend_from_slice(&progress.next_fragment_index.to_be_bytes());
@@ -1614,6 +1888,15 @@ pub enum PendingQueueArtifactError {
     EmptyScanDigest,
     RevisionOutOfRange(u64),
     RevisionOverflow,
+    OwnerFenceOutOfRange(u64),
+    OwnerFenceOverflow,
+    EmptyOwnerAttemptId,
+    EmptyOwnerReasonDigest,
+    UnknownOwnerState(u8),
+    OwnerNotVacant,
+    OwnerNotHeld,
+    OwnerAlreadyHeldByAttempt,
+    OwnerAttemptMismatch,
     BatchIndexOutOfRange(u32),
     FragmentIndexOutOfRange(u64),
     TooManyBatches,
@@ -1735,6 +2018,8 @@ mod tests {
     fn bootstrap() -> PendingQueueArtifactBootstrap {
         PendingQueueArtifactBootstrap::try_new(
             PendingQueueArtifactIdentity::try_new(context(), source()).unwrap(),
+            PendingQueueArtifactOwnerAttemptId::try_new([21; 32]).unwrap(),
+            PendingQueueArtifactOwnerReasonDigest::try_new([22; 32]).unwrap(),
         )
         .unwrap()
     }
@@ -1746,7 +2031,7 @@ mod tests {
         assert_eq!(stored.revision().get(), 1);
         assert!(matches!(stored.phase(), PendingQueueArtifactPhase::Open(_)));
         let header_digest: [u8; 32] = Sha256::digest(bootstrap.payload()).into();
-        assert_eq!(bootstrap.payload().len(), 309);
+        assert_eq!(bootstrap.payload().len(), 382);
         assert_eq!(
             stored.slot().as_bytes(),
             &[
@@ -1758,9 +2043,9 @@ mod tests {
         assert_eq!(
             header_digest,
             [
-                76, 75, 51, 138, 50, 110, 98, 146, 182, 74, 190, 22, 112, 73, 79,
-                159, 164, 67, 226, 75, 97, 149, 72, 83, 98, 91, 15, 81, 242,
-                107, 158, 22,
+                236, 242, 176, 49, 187, 151, 66, 96, 201, 83, 204, 161, 254,
+                25, 96, 118, 161, 91, 193, 231, 177, 93, 86, 68, 92, 171,
+                173, 48, 169, 52, 198, 190,
             ],
         );
         assert_eq!(
@@ -1824,6 +2109,74 @@ mod tests {
             Err(PendingQueueArtifactError::HeaderTooLarge(
                 MAX_PENDING_QUEUE_ARTIFACT_HEADER_BYTES + 1,
             )),
+        );
+    }
+
+    #[test]
+    fn owner_takeover_release_and_reacquire_are_fenced_without_phase_drift() {
+        let initial = bootstrap().candidate().clone();
+        let attempt_a = PendingQueueArtifactOwnerAttemptId::try_new([21; 32]).unwrap();
+        let attempt_b = PendingQueueArtifactOwnerAttemptId::try_new([31; 32]).unwrap();
+        let attempt_c = PendingQueueArtifactOwnerAttemptId::try_new([41; 32]).unwrap();
+        let reason = PendingQueueArtifactOwnerReasonDigest::try_new([32; 32]).unwrap();
+        assert!(initial.owner().is_held_by(attempt_a));
+
+        let takeover = PendingQueueArtifactOwnerTransition::startup_takeover(
+            &initial,
+            attempt_b,
+            reason,
+        )
+        .unwrap();
+        assert_eq!(takeover.candidate().revision(), initial.revision());
+        assert_eq!(takeover.candidate().phase(), initial.phase());
+        assert_eq!(takeover.candidate().owner().fence().get(), 2);
+        assert!(takeover.candidate().owner().is_held_by(attempt_b));
+        assert_eq!(
+            PendingQueueArtifactOwnerTransition::startup_takeover(
+                takeover.candidate(),
+                attempt_b,
+                reason,
+            ),
+            Err(PendingQueueArtifactError::OwnerAlreadyHeldByAttempt),
+        );
+
+        let release = PendingQueueArtifactOwnerTransition::release(
+            takeover.candidate(),
+            attempt_b,
+            reason,
+        )
+        .unwrap();
+        assert_eq!(release.candidate().revision(), initial.revision());
+        assert_eq!(release.candidate().owner().fence().get(), 2);
+        assert_eq!(release.candidate().owner().attempt_id(), None);
+        assert_eq!(
+            PendingQueueArtifactOwnerTransition::release(
+                takeover.candidate(),
+                attempt_a,
+                reason,
+            ),
+            Err(PendingQueueArtifactError::OwnerAttemptMismatch),
+        );
+
+        let reacquire = PendingQueueArtifactOwnerTransition::acquire_vacant(
+            release.candidate(),
+            attempt_c,
+            reason,
+        )
+        .unwrap();
+        assert_eq!(reacquire.candidate().owner().fence().get(), 3);
+        assert!(reacquire.candidate().owner().is_held_by(attempt_c));
+        assert_eq!(reacquire.candidate().phase(), initial.phase());
+
+        let bytes = reacquire.candidate().to_persisted_bytes();
+        assert_eq!(
+            StoredPendingQueueArtifact::decode_persisted(
+                reacquire.candidate().slot(),
+                reacquire.candidate().revision().as_i64(),
+                &bytes,
+            )
+            .unwrap(),
+            *reacquire.candidate(),
         );
     }
 
@@ -2104,7 +2457,11 @@ mod tests {
             staged_source.clone(),
         )
         .unwrap();
-        let open0 = PendingQueueArtifactBootstrap::try_new(identity)
+        let open0 = PendingQueueArtifactBootstrap::try_new(
+            identity,
+            PendingQueueArtifactOwnerAttemptId::try_new([21; 32]).unwrap(),
+            PendingQueueArtifactOwnerReasonDigest::try_new([22; 32]).unwrap(),
+        )
             .unwrap()
             .candidate()
             .clone();

@@ -50,8 +50,34 @@ impl RecoverableNatsSegmentId {
 pub struct RecoverableNatsSegmentContractDigest([u8; 32]);
 
 impl RecoverableNatsSegmentContractDigest {
+    pub fn try_new(bytes: [u8; 32]) -> Result<Self, RecoverableNatsSegmentError> {
+        if bytes == [0; 32] {
+            Err(RecoverableNatsSegmentError::EmptyContractDigest)
+        } else {
+            Ok(Self(bytes))
+        }
+    }
+
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+}
+
+/// Opaque result of structurally comparing the complete expected stream
+/// contract with a supplied configuration.
+///
+/// This token deliberately does **not** claim that the configuration came
+/// from a live NATS server. The c2b1 ledger uses it to prevent arbitrary
+/// stream addresses/config shapes; activation must additionally obtain and
+/// compare live server metadata before reserving a generation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StructurallyValidatedRecoverableNatsSegment {
+    segment: RecoverableNatsStreamSegment,
+}
+
+impl StructurallyValidatedRecoverableNatsSegment {
+    pub const fn segment(&self) -> &RecoverableNatsStreamSegment {
+        &self.segment
     }
 }
 
@@ -268,16 +294,18 @@ impl RecoverableNatsStreamSegment {
         )
     }
 
-    pub fn attest_stream_config(
+    pub fn validate_stream_config_structure(
         &self,
         actual: &StreamConfig,
-    ) -> Result<(), RecoverableNatsSegmentError> {
+    ) -> Result<StructurallyValidatedRecoverableNatsSegment, RecoverableNatsSegmentError> {
         let expected = normalized_stream_config(&self.stream_config())?;
         let actual = normalized_stream_config(actual)?;
         if actual != expected {
             return Err(RecoverableNatsSegmentError::StreamContractMismatch);
         }
-        Ok(())
+        Ok(StructurallyValidatedRecoverableNatsSegment {
+            segment: self.clone(),
+        })
     }
 }
 
@@ -407,6 +435,7 @@ fn hash_component(hasher: &mut Sha256, value: &[u8]) {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RecoverableNatsSegmentError {
     ZeroSegmentId,
+    EmptyContractDigest,
     InvalidReplicaCount(usize),
     InvalidStreamCapacity(i64),
     InvalidGenerationAdmissionBudget { budget: i64, capacity: i64 },
@@ -424,6 +453,7 @@ impl fmt::Display for RecoverableNatsSegmentError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ZeroSegmentId => formatter.write_str("segment id must be non-zero"),
+            Self::EmptyContractDigest => formatter.write_str("segment contract digest must be non-zero"),
             Self::InvalidReplicaCount(value) => write!(
                 formatter,
                 "recoverable stream replicas must be in 3..=5, got {value}"
@@ -631,7 +661,7 @@ mod tests {
         assert!(!config.allow_message_ttl);
         assert!(config.subject_delete_marker_ttl.is_none());
         assert_eq!(config.compression, Some(Compression::None));
-        segment.attest_stream_config(&config).unwrap();
+        segment.validate_stream_config_structure(&config).unwrap();
     }
 
     #[test]
@@ -660,7 +690,7 @@ mod tests {
             let mut config = segment.stream_config();
             mutate(&mut config);
             assert_eq!(
-                segment.attest_stream_config(&config),
+                segment.validate_stream_config_structure(&config),
                 Err(RecoverableNatsSegmentError::StreamContractMismatch)
             );
         }
@@ -669,11 +699,15 @@ mod tests {
         server_metadata
             .metadata
             .insert("_nats.level".into(), "1".into());
-        segment.attest_stream_config(&server_metadata).unwrap();
+        segment
+            .validate_stream_config_structure(&server_metadata)
+            .unwrap();
         server_metadata
             .metadata
             .insert("operator.override".into(), "true".into());
-        assert!(segment.attest_stream_config(&server_metadata).is_err());
+        assert!(segment
+            .validate_stream_config_structure(&server_metadata)
+            .is_err());
     }
 
     #[test]
@@ -790,12 +824,14 @@ mod tests {
         let mut typed_stream = context.create_stream(single_node_config).await.unwrap();
         let mut normalized = typed_stream.info().await.unwrap().config.clone();
         normalized.num_replicas = 3;
-        typed.attest_stream_config(&normalized).unwrap_or_else(|error| {
+        typed
+            .validate_stream_config_structure(&normalized)
+            .unwrap_or_else(|error| {
             panic!(
                 "server-normalized config failed typed attestation: {error}; actual={normalized:#?}; expected={:#?}",
                 typed.stream_config()
             )
-        });
+            });
         let typed_subject = typed.exact_subject("cas.probe").unwrap();
         let publish = async_nats::jetstream::context::Publish::build()
             .payload(Bytes::from_static(b"same-intent"))
