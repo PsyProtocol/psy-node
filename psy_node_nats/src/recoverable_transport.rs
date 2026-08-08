@@ -58,6 +58,9 @@ use crate::{
 const DURABLE_PREFIX: &str = "psy_beq_v2_";
 const DURABLE_DIGEST_DOMAIN: &[u8] = b"psy/rollback/recoverable-nats-durable/v1";
 const CONSUMER_DIGEST_DOMAIN: &[u8] = b"psy/rollback/recoverable-nats-consumer/v1";
+const CONSUMER_INSTANCE_DOMAIN: &[u8] =
+    b"psy/rollback/recoverable-nats-consumer-instance/v1";
+const CONSUMER_OPERATION_DESCRIPTION_PREFIX: &str = "psy-recoverable-operation-v1:";
 const DEFAULT_ACK_WAIT: Duration = Duration::from_secs(30);
 const CONSUMER_MANIFEST_DOMAIN: &[u8] =
     b"psy/rollback/recoverable-nats-consumer-manifest/v1";
@@ -250,6 +253,7 @@ pub struct RecoverableNatsProvisionedConsumerReceipt {
     stream_instance_id: [u8; 32],
     subject: String,
     consumer_digest: [u8; 32],
+    operation_id: RecoverableNatsConsumerProvisioningOperationId,
     consumer_instance_id: RecoverableNatsConsumerInstanceId,
 }
 
@@ -266,8 +270,77 @@ impl RecoverableNatsProvisionedConsumerReceipt {
         &self.consumer_digest
     }
 
+    pub const fn operation_id(&self) -> RecoverableNatsConsumerProvisioningOperationId {
+        self.operation_id
+    }
+
     pub const fn consumer_instance_id(&self) -> RecoverableNatsConsumerInstanceId {
         self.consumer_instance_id
+    }
+}
+
+/// Durable expectation used only to open an already-provisioned consumer.
+/// Constructing it does not grant create/update authority; the transport path
+/// performs observation-only lookup and exact created-instance attestation.
+pub struct RecoverableNatsExistingConsumerBinding {
+    stream_instance_id: RecoverableNatsStreamInstanceId,
+    subject: String,
+    consumer_digest: [u8; 32],
+    operation_id: RecoverableNatsConsumerProvisioningOperationId,
+    consumer_instance_id: RecoverableNatsConsumerInstanceId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoverableNatsExpectedStreamMode {
+    Live,
+    Sealed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoverableNatsProvisionedConsumerExpectation {
+    subject: String,
+    consumer_digest: [u8; 32],
+    operation_id: RecoverableNatsConsumerProvisioningOperationId,
+    consumer_instance_id: RecoverableNatsConsumerInstanceId,
+}
+
+impl RecoverableNatsProvisionedConsumerExpectation {
+    pub fn try_new(
+        subject: impl Into<String>,
+        consumer_digest: [u8; 32],
+        operation_id: RecoverableNatsConsumerProvisioningOperationId,
+        consumer_instance_id: RecoverableNatsConsumerInstanceId,
+    ) -> Result<Self, RecoverableNatsTransportError> {
+        let subject = subject.into();
+        if subject.is_empty() || consumer_digest == [0; 32] {
+            return Err(RecoverableNatsTransportError::ConsumerContract);
+        }
+        Ok(Self {
+            subject,
+            consumer_digest,
+            operation_id,
+            consumer_instance_id,
+        })
+    }
+}
+
+impl RecoverableNatsExistingConsumerBinding {
+    pub fn try_from_durable(
+        stream_instance_id: RecoverableNatsStreamInstanceId,
+        spec: &RecoverableNatsCaptureSpec,
+        operation_id: RecoverableNatsConsumerProvisioningOperationId,
+        consumer_instance_id: RecoverableNatsConsumerInstanceId,
+    ) -> Result<Self, RecoverableNatsTransportError> {
+        if spec.v2_segment.is_none() {
+            return Err(RecoverableNatsTransportError::ConsumerContract);
+        }
+        Ok(Self {
+            stream_instance_id,
+            subject: spec.subject.clone(),
+            consumer_digest: spec.consumer_digest,
+            operation_id,
+            consumer_instance_id,
+        })
     }
 }
 
@@ -450,6 +523,10 @@ impl RecoverableNatsCaptureSpec {
         self.max_batch_items
     }
 
+    pub const fn v2_segment(&self) -> Option<&RecoverableNatsStreamSegment> {
+        self.v2_segment.as_ref()
+    }
+
     pub fn source_identity(
         &self,
     ) -> Result<PendingQueueSourceIdentity, RecoverableNatsTransportError> {
@@ -476,6 +553,15 @@ impl RecoverableNatsCaptureSpec {
             max_batch: self.max_batch_items as i64,
             ..Default::default()
         }
+    }
+
+    fn pull_config_for_operation(
+        &self,
+        operation_id: RecoverableNatsConsumerProvisioningOperationId,
+    ) -> PullConfig {
+        let mut config = self.pull_config();
+        config.description = Some(consumer_operation_description(operation_id));
+        config
     }
 
     pub fn attest_stream(
@@ -521,7 +607,9 @@ impl RecoverableNatsCaptureSpec {
             || actual.name.as_deref() != Some(self.durable.as_str())
             || actual.deliver_subject.is_some()
             || actual.deliver_group.is_some()
-            || actual.description.is_some()
+            || actual.description.as_deref().is_some_and(|description| {
+                !is_consumer_operation_description(description)
+            })
             || actual.deliver_policy != expected.deliver_policy
             || actual.ack_policy != AckPolicy::Explicit
             || actual.ack_wait != self.ack_wait
@@ -1401,31 +1489,327 @@ impl NatsJetStreamClient {
         .await
     }
 
-    pub async fn open_recoverable_capture(
+    /// Performs the sole raw durable-consumer create operation. The caller
+    /// must have durably registered `operation_id` before entering this
+    /// method. A failed create is reconciled by exact existing-consumer
+    /// readback; the returned receipt is opaque and binds the server-created
+    /// consumer incarnation.
+    pub async fn provision_recoverable_capture_consumer(
         &self,
+        live: &LiveRecoverableNatsStreamInstance,
         spec: RecoverableNatsCaptureSpec,
-    ) -> Result<RecoverableNatsCaptureConsumer, RecoverableNatsTransportError> {
+        operation_id: RecoverableNatsConsumerProvisioningOperationId,
+    ) -> Result<RecoverableNatsProvisionedConsumerReceipt, RecoverableNatsTransportError> {
         if self.base_namespace() != spec.namespace {
             return Err(RecoverableNatsTransportError::ClientNamespaceMismatch);
         }
-        let context = self.raw_context_for_recoverable_transport();
-        let stream = context.get_stream(&spec.stream).await.map_err(nats)?;
-        let stream_info = stream.get_info().await.map_err(nats)?;
-        spec.attest_stream(&stream_info.config)?;
-        let mut consumer = stream
-            .create_consumer_strict(spec.pull_config())
-            .await
-            .map_err(nats)?;
-        let info = consumer.info().await.map_err(nats)?.clone();
-        if info.stream_name != spec.stream || info.name != spec.durable {
+        let segment = spec
+            .v2_segment()
+            .ok_or(RecoverableNatsTransportError::ConsumerContract)?;
+        if segment != live.segment() {
             return Err(RecoverableNatsTransportError::ConsumerContract);
         }
-        spec.attest_consumer(&info.config)?;
+        let context = self.raw_context_for_recoverable_transport();
+        let stream = context.get_stream(&spec.stream).await.map_err(nats)?;
+        let before = segment
+            .attest_live_instance(&stream.get_info().await.map_err(nats)?)
+            .map_err(|error| RecoverableNatsTransportError::Core(error.to_string()))?;
+        if before.instance_id() != live.instance_id() {
+            return Err(RecoverableNatsTransportError::ConsumerInstanceChanged);
+        }
+        let mut consumer = match stream
+            .create_consumer_strict(spec.pull_config_for_operation(operation_id))
+            .await
+        {
+            Ok(consumer) => consumer,
+            Err(create_error) => stream
+                .get_consumer::<PullConfig>(&spec.durable)
+                .await
+                .map_err(|read_error| {
+                    RecoverableNatsTransportError::ConsumerProvisioningIndeterminate(format!(
+                        "create={create_error}; read={read_error}"
+                    ))
+                })?,
+        };
+        let first = consumer.info().await.map_err(nats)?.clone();
+        let first_instance =
+            consumer_instance_id(live.instance_id(), &spec, operation_id, &first)?;
+        let after = segment
+            .attest_live_instance(&stream.get_info().await.map_err(nats)?)
+            .map_err(|error| RecoverableNatsTransportError::Core(error.to_string()))?;
+        if after.instance_id() != live.instance_id() {
+            return Err(RecoverableNatsTransportError::ConsumerInstanceChanged);
+        }
+        let second = stream
+            .get_consumer::<PullConfig>(&spec.durable)
+            .await
+            .map_err(nats)?
+            .info()
+            .await
+            .map_err(nats)?
+            .clone();
+        let second_instance =
+            consumer_instance_id(live.instance_id(), &spec, operation_id, &second)?;
+        if first_instance != second_instance {
+            return Err(RecoverableNatsTransportError::ConsumerInstanceChanged);
+        }
+        Ok(RecoverableNatsProvisionedConsumerReceipt {
+            stream_instance_id: *live.instance_id().as_bytes(),
+            subject: spec.subject,
+            consumer_digest: spec.consumer_digest,
+            operation_id,
+            consumer_instance_id: first_instance,
+        })
+    }
+
+    /// Opens an existing durable consumer without creating or updating it.
+    /// Both the stream and consumer server-created identities are re-attested
+    /// before the handle is returned.
+    pub async fn open_existing_recoverable_capture(
+        &self,
+        spec: RecoverableNatsCaptureSpec,
+        binding: &RecoverableNatsExistingConsumerBinding,
+    ) -> Result<RecoverableNatsCaptureConsumer, RecoverableNatsTransportError> {
+        if self.base_namespace() != spec.namespace
+            || binding.subject != spec.subject
+            || binding.consumer_digest != spec.consumer_digest
+        {
+            return Err(RecoverableNatsTransportError::ConsumerContract);
+        }
+        let segment = spec
+            .v2_segment()
+            .ok_or(RecoverableNatsTransportError::ConsumerContract)?;
+        let context = self.raw_context_for_recoverable_transport();
+        let stream = context.get_stream(&spec.stream).await.map_err(nats)?;
+        let live = segment
+            .attest_live_instance(&stream.get_info().await.map_err(nats)?)
+            .map_err(|error| RecoverableNatsTransportError::Core(error.to_string()))?;
+        if live.instance_id() != binding.stream_instance_id {
+            return Err(RecoverableNatsTransportError::ConsumerInstanceChanged);
+        }
+        let mut consumer = stream
+            .get_consumer::<PullConfig>(&spec.durable)
+            .await
+            .map_err(nats)?;
+        let first = consumer.info().await.map_err(nats)?.clone();
+        if consumer_instance_id(
+            binding.stream_instance_id,
+            &spec,
+            binding.operation_id,
+            &first,
+        )?
+            != binding.consumer_instance_id
+        {
+            return Err(RecoverableNatsTransportError::ConsumerInstanceChanged);
+        }
+        let after = segment
+            .attest_live_instance(&stream.get_info().await.map_err(nats)?)
+            .map_err(|error| RecoverableNatsTransportError::Core(error.to_string()))?;
+        if after.instance_id() != binding.stream_instance_id {
+            return Err(RecoverableNatsTransportError::ConsumerInstanceChanged);
+        }
+        let mut second_consumer = stream
+            .get_consumer::<PullConfig>(&spec.durable)
+            .await
+            .map_err(nats)?;
+        let second = second_consumer.info().await.map_err(nats)?.clone();
+        if consumer_instance_id(
+            binding.stream_instance_id,
+            &spec,
+            binding.operation_id,
+            &second,
+        )?
+            != binding.consumer_instance_id
+        {
+            return Err(RecoverableNatsTransportError::ConsumerInstanceChanged);
+        }
+        if first.stream_name != spec.stream || first.name != spec.durable {
+            return Err(RecoverableNatsTransportError::ConsumerContract);
+        }
         Ok(RecoverableNatsCaptureConsumer {
-            inner: consumer,
+            inner: second_consumer,
             spec,
         })
     }
+
+    /// Enumerates the complete consumer set twice and verifies every exact
+    /// server-created incarnation persisted by the durable mutation gate.
+    /// This performs no consumer mutation and is valid both immediately
+    /// before and immediately after physical stream seal.
+    pub async fn verify_recoverable_provisioned_consumer_set(
+        &self,
+        segment: RecoverableNatsStreamSegment,
+        stream_instance_id: RecoverableNatsStreamInstanceId,
+        mode: RecoverableNatsExpectedStreamMode,
+        mut expected: Vec<RecoverableNatsProvisionedConsumerExpectation>,
+    ) -> Result<(), RecoverableNatsTransportError> {
+        if self.base_namespace() != segment.base_namespace() {
+            return Err(RecoverableNatsTransportError::ClientNamespaceMismatch);
+        }
+        expected.sort_by(|left, right| left.subject.cmp(&right.subject));
+        if expected.windows(2).any(|pair| pair[0].subject == pair[1].subject) {
+            return Err(RecoverableNatsTransportError::ConsumerInventoryMismatch);
+        }
+        let stream = self
+            .raw_context_for_recoverable_transport()
+            .get_stream(segment.stream_name())
+            .await
+            .map_err(nats)?;
+        let before = stream.get_info().await.map_err(nats)?;
+        attest_expected_stream_instance(&segment, stream_instance_id, mode, &before)?;
+        require_exact_consumer_count(&before, expected.len())?;
+        let first = collect_exact_provisioned_consumers(
+            &stream,
+            &segment,
+            stream_instance_id,
+            &expected,
+        )
+        .await?;
+        let second = collect_exact_provisioned_consumers(
+            &stream,
+            &segment,
+            stream_instance_id,
+            &expected,
+        )
+        .await?;
+        let after = stream.get_info().await.map_err(nats)?;
+        attest_expected_stream_instance(&segment, stream_instance_id, mode, &after)?;
+        require_exact_consumer_count(&after, expected.len())?;
+        if first != second {
+            return Err(RecoverableNatsTransportError::ConsumerInventoryChanged);
+        }
+        Ok(())
+    }
+}
+
+fn require_exact_consumer_count(
+    info: &StreamInfo,
+    expected: usize,
+) -> Result<(), RecoverableNatsTransportError> {
+    require_exact_consumer_count_value(info.state.consumer_count, expected)
+}
+
+fn require_exact_consumer_count_value(
+    actual: usize,
+    expected: usize,
+) -> Result<(), RecoverableNatsTransportError> {
+    if actual != expected {
+        return Err(RecoverableNatsTransportError::ConsumerInventoryMismatch);
+    }
+    Ok(())
+}
+
+fn attest_expected_stream_instance(
+    segment: &RecoverableNatsStreamSegment,
+    instance_id: RecoverableNatsStreamInstanceId,
+    mode: RecoverableNatsExpectedStreamMode,
+    info: &StreamInfo,
+) -> Result<(), RecoverableNatsTransportError> {
+    let observed_id = match mode {
+        RecoverableNatsExpectedStreamMode::Live => segment
+            .attest_live_instance(info)
+            .map(|observed| observed.instance_id()),
+        RecoverableNatsExpectedStreamMode::Sealed => segment
+            .attest_sealed_instance(info)
+            .map(|observed| observed.instance_id()),
+    }
+    .map_err(|error| RecoverableNatsTransportError::Core(error.to_string()))?;
+    if observed_id != instance_id {
+        return Err(RecoverableNatsTransportError::ConsumerInstanceChanged);
+    }
+    Ok(())
+}
+
+async fn collect_exact_provisioned_consumers(
+    stream: &jetstream::stream::Stream,
+    segment: &RecoverableNatsStreamSegment,
+    stream_instance_id: RecoverableNatsStreamInstanceId,
+    expected: &[RecoverableNatsProvisionedConsumerExpectation],
+) -> Result<Vec<(String, RecoverableNatsConsumerInstanceId)>, RecoverableNatsTransportError> {
+    let expected = expected
+        .iter()
+        .map(|entry| (entry.subject.as_str(), entry))
+        .collect::<BTreeMap<_, _>>();
+    let mut infos = stream.consumers();
+    let mut observed = Vec::with_capacity(expected.len());
+    while let Some(info) = infos.try_next().await.map_err(nats)? {
+        let max_batch = usize::try_from(info.config.max_batch)
+            .map_err(|_| RecoverableNatsTransportError::ConsumerContract)?;
+        let spec = RecoverableNatsCaptureSpec::for_segment(
+            segment.clone(),
+            info.config.filter_subject.clone(),
+            max_batch,
+        )?;
+        let entry = expected
+            .get(spec.subject())
+            .ok_or(RecoverableNatsTransportError::ConsumerInventoryMismatch)?;
+        if spec.consumer_digest() != entry.consumer_digest
+            || consumer_instance_id(stream_instance_id, &spec, entry.operation_id, &info)?
+                != entry.consumer_instance_id
+        {
+            return Err(RecoverableNatsTransportError::ConsumerInstanceChanged);
+        }
+        observed.push((entry.subject.clone(), entry.consumer_instance_id));
+    }
+    observed.sort_by(|left, right| left.0.cmp(&right.0));
+    if observed.len() != expected.len()
+        || observed
+            .iter()
+            .map(|entry| entry.0.as_str())
+            .ne(expected.keys().copied())
+    {
+        return Err(RecoverableNatsTransportError::ConsumerInventoryMismatch);
+    }
+    Ok(observed)
+}
+
+fn consumer_instance_id(
+    stream_instance_id: RecoverableNatsStreamInstanceId,
+    spec: &RecoverableNatsCaptureSpec,
+    operation_id: RecoverableNatsConsumerProvisioningOperationId,
+    info: &jetstream::consumer::Info,
+) -> Result<RecoverableNatsConsumerInstanceId, RecoverableNatsTransportError> {
+    if info.stream_name != spec.stream || info.name != spec.durable {
+        return Err(RecoverableNatsTransportError::ConsumerContract);
+    }
+    spec.attest_consumer(&info.config)?;
+    if info.config.description.as_deref()
+        != Some(consumer_operation_description(operation_id).as_str())
+    {
+        return Err(RecoverableNatsTransportError::ConsumerContract);
+    }
+    let created_nanos = info.created.unix_timestamp_nanos();
+    if created_nanos <= 0 {
+        return Err(RecoverableNatsTransportError::ConsumerContract);
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(CONSUMER_INSTANCE_DOMAIN);
+    hasher.update(stream_instance_id.as_bytes());
+    hasher.update(spec.consumer_digest());
+    hasher.update(operation_id.as_bytes());
+    hasher.update(recoverable_consumer_config_digest(spec, &info.config));
+    hasher.update(created_nanos.to_be_bytes());
+    RecoverableNatsConsumerInstanceId::try_new(hasher.finalize().into())
+}
+
+fn consumer_operation_description(
+    operation_id: RecoverableNatsConsumerProvisioningOperationId,
+) -> String {
+    let mut value = String::with_capacity(CONSUMER_OPERATION_DESCRIPTION_PREFIX.len() + 64);
+    value.push_str(CONSUMER_OPERATION_DESCRIPTION_PREFIX);
+    for byte in operation_id.as_bytes() {
+        use std::fmt::Write as _;
+        write!(&mut value, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    value
+}
+
+fn is_consumer_operation_description(value: &str) -> bool {
+    value.len() == CONSUMER_OPERATION_DESCRIPTION_PREFIX.len() + 64
+        && value.starts_with(CONSUMER_OPERATION_DESCRIPTION_PREFIX)
+        && value[CONSUMER_OPERATION_DESCRIPTION_PREFIX.len()..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 async fn collect_recoverable_consumer_inventory(
@@ -1506,6 +1890,13 @@ fn recoverable_consumer_config_digest(
     hasher.update(CONSUMER_CONFIG_DOMAIN);
     hasher.update(spec.consumer_digest());
     hasher.update((config.num_replicas as u64).to_be_bytes());
+    match config.description.as_deref() {
+        Some(description) => {
+            hasher.update([1]);
+            hash_component(&mut hasher, description.as_bytes());
+        }
+        None => hasher.update([0]),
+    }
     let metadata = config.metadata.iter().collect::<BTreeMap<_, _>>();
     hasher.update((metadata.len() as u64).to_be_bytes());
     for (key, value) in metadata {
@@ -1746,6 +2137,8 @@ pub enum RecoverableNatsTransportError {
     ConsumerInventoryMismatch,
     ConsumerInventoryChanged,
     ConsumerNotQuiescent,
+    ConsumerInstanceChanged,
+    ConsumerProvisioningIndeterminate(String),
     SealNotApplied,
     SealRecreatedInstance,
     SealEvidenceChanged,
@@ -2041,6 +2434,14 @@ mod tests {
             first_config,
             recoverable_consumer_config_digest(&spec, &reordered),
         );
+        let mut different_operation = reordered.clone();
+        different_operation.description = Some(consumer_operation_description(
+            RecoverableNatsConsumerProvisioningOperationId::try_new([91; 32]).unwrap(),
+        ));
+        assert_ne!(
+            first_config,
+            recoverable_consumer_config_digest(&spec, &different_operation),
+        );
 
         let observed = RecoverableNatsObservedConsumer {
             subject: spec.subject().to_owned(),
@@ -2163,6 +2564,44 @@ mod tests {
         let mut unsafe_consumer = first.pull_config().into_consumer_config();
         unsafe_consumer.max_waiting = 2;
         assert!(first.attest_consumer(&unsafe_consumer).is_err());
+    }
+
+    #[test]
+    fn provisioning_operation_is_committed_in_the_physical_consumer_config() {
+        let spec = capture_spec();
+        let first = RecoverableNatsConsumerProvisioningOperationId::try_new([41; 32]).unwrap();
+        let second = RecoverableNatsConsumerProvisioningOperationId::try_new([42; 32]).unwrap();
+        let first_config = spec.pull_config_for_operation(first).into_consumer_config();
+
+        assert_eq!(
+            first_config.description.as_deref(),
+            Some(consumer_operation_description(first).as_str()),
+        );
+        assert!(spec.attest_consumer(&first_config).is_ok());
+        assert_ne!(
+            first_config.description.as_deref(),
+            Some(consumer_operation_description(second).as_str()),
+        );
+        assert!(is_consumer_operation_description(
+            first_config.description.as_deref().unwrap()
+        ));
+
+        let mut malformed = first_config;
+        malformed.description = Some("psy-recoverable-operation-v1:XYZ".to_owned());
+        assert!(spec.attest_consumer(&malformed).is_err());
+    }
+
+    #[test]
+    fn exact_set_rejects_a_consumer_added_or_deleted_after_enumeration() {
+        assert!(require_exact_consumer_count_value(2, 2).is_ok());
+        assert_eq!(
+            require_exact_consumer_count_value(3, 2),
+            Err(RecoverableNatsTransportError::ConsumerInventoryMismatch)
+        );
+        assert_eq!(
+            require_exact_consumer_count_value(1, 2),
+            Err(RecoverableNatsTransportError::ConsumerInventoryMismatch)
+        );
     }
 
     #[test]
@@ -2301,7 +2740,27 @@ mod tests {
         let subject = envelope.exact_subject(&segment).unwrap();
         let spec = RecoverableNatsCaptureSpec::for_segment(segment.clone(), subject, 16)
             .unwrap();
-        let mut consumer = client.open_recoverable_capture(spec).await.unwrap();
+        let live = client
+            .observe_recoverable_segment_instance(segment.clone())
+            .await
+            .unwrap();
+        let operation_id =
+            RecoverableNatsConsumerProvisioningOperationId::try_new([71; 32]).unwrap();
+        let provisioned = client
+            .provision_recoverable_capture_consumer(&live, spec.clone(), operation_id)
+            .await
+            .unwrap();
+        let binding = RecoverableNatsExistingConsumerBinding::try_from_durable(
+            live.instance_id(),
+            &spec,
+            operation_id,
+            provisioned.consumer_instance_id(),
+        )
+        .unwrap();
+        let mut consumer = client
+            .open_existing_recoverable_capture(spec, &binding)
+            .await
+            .unwrap();
         let batch = consumer
             .fetch(16, Duration::from_secs(2))
             .await

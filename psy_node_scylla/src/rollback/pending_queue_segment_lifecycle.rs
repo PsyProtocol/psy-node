@@ -1189,6 +1189,7 @@ impl ScyllaPendingQueueSegmentLifecycleStore {
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn persist_seal_requested<Hash: Q256BitHash>(
         &self,
+        nats: &NatsJetStreamClient,
         consumer_gate_store: &ScyllaPendingQueueConsumerGateStore,
         consumer_gate_closed: &PersistedPendingQueueConsumerGateClosedReceipt,
         ledger_store: &ScyllaPendingQueueSegmentLedgerStore,
@@ -1228,6 +1229,15 @@ impl ScyllaPendingQueueSegmentLifecycleStore {
                 consumer_gate_closed,
                 gate_identity,
                 &expected_consumers,
+            )
+            .await
+            .map_err(PendingQueueSegmentLifecycleError::ConsumerGate)?;
+        consumer_gate_store
+            .revalidate_nats_consumer_set(
+                nats,
+                consumer_gate_closed.commitment(),
+                live.segment().clone(),
+                psy_node_nats::recoverable_transport::RecoverableNatsExpectedStreamMode::Live,
             )
             .await
             .map_err(PendingQueueSegmentLifecycleError::ConsumerGate)?;
@@ -1301,6 +1311,15 @@ impl ScyllaPendingQueueSegmentLifecycleStore {
                 consumer_gate_closed,
                 gate_identity,
                 &expected_consumers,
+            )
+            .await
+            .map_err(PendingQueueSegmentLifecycleError::ConsumerGate)?;
+        consumer_gate_store
+            .revalidate_nats_consumer_set(
+                nats,
+                consumer_gate_closed.commitment(),
+                live.segment().clone(),
+                psy_node_nats::recoverable_transport::RecoverableNatsExpectedStreamMode::Live,
             )
             .await
             .map_err(PendingQueueSegmentLifecycleError::ConsumerGate)?;
@@ -1593,11 +1612,6 @@ impl ScyllaPendingQueueSegmentLifecycleStore {
             &receipt.current,
         )
         .await?;
-        consumer_gate_store
-            .revalidate_commitment(receipt.current.consumer_gate_commitment)
-            .await
-            .map_err(PendingQueueSegmentLifecycleError::ConsumerGate)?;
-
         let sealed = match nats
             .observe_recoverable_segment_instance(segment.clone())
             .await
@@ -1606,20 +1620,44 @@ impl ScyllaPendingQueueSegmentLifecycleStore {
                 if !receipt.matches_live_instance(&live) {
                     return Err(PendingQueueSegmentLifecycleError::EvidenceChanged);
                 }
+                consumer_gate_store
+                    .revalidate_nats_consumer_set(
+                        nats,
+                        receipt.current.consumer_gate_commitment,
+                        segment.clone(),
+                        psy_node_nats::recoverable_transport::RecoverableNatsExpectedStreamMode::Live,
+                    )
+                    .await
+                    .map_err(PendingQueueSegmentLifecycleError::ConsumerGate)?;
                 nats.seal_recoverable_segment_instance(&live)
                     .await
                     .map_err(transport)?
                     .sealed()
                     .clone()
             }
-            Err(live_error) => nats
-                .observe_recoverable_sealed_segment_instance(segment)
-                .await
-                .map_err(|sealed_error| {
+            Err(live_error) => {
+                let sealed = nats
+                    .observe_recoverable_sealed_segment_instance(segment.clone())
+                    .await
+                    .map_err(|sealed_error| {
                     PendingQueueSegmentLifecycleError::Transport(format!(
                         "live={live_error}; sealed={sealed_error}",
                     ))
-                })?,
+                    })?;
+                if !receipt.current.matches_sealed_instance(&sealed) {
+                    return Err(PendingQueueSegmentLifecycleError::EvidenceChanged);
+                }
+                consumer_gate_store
+                    .revalidate_nats_consumer_set(
+                        nats,
+                        receipt.current.consumer_gate_commitment,
+                        segment,
+                        psy_node_nats::recoverable_transport::RecoverableNatsExpectedStreamMode::Sealed,
+                    )
+                    .await
+                    .map_err(PendingQueueSegmentLifecycleError::ConsumerGate)?;
+                sealed
+            }
         };
         if !receipt.current.matches_sealed_instance(&sealed) {
             return Err(PendingQueueSegmentLifecycleError::EvidenceChanged);
@@ -1636,7 +1674,12 @@ impl ScyllaPendingQueueSegmentLifecycleStore {
         )
         .await?;
         consumer_gate_store
-            .revalidate_commitment(receipt.current.consumer_gate_commitment)
+            .revalidate_nats_consumer_set(
+                nats,
+                receipt.current.consumer_gate_commitment,
+                sealed.segment().clone(),
+                psy_node_nats::recoverable_transport::RecoverableNatsExpectedStreamMode::Sealed,
+            )
             .await
             .map_err(PendingQueueSegmentLifecycleError::ConsumerGate)?;
 

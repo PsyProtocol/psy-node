@@ -37,6 +37,10 @@ use tokio::sync::Mutex;
 use super::{
     DurablySelectedPendingQueueBatchReceipt, PendingQueueArtifactStoreError,
     PendingQueueArtifactOwnerPermit, PersistedPendingQueueCloseReceipt,
+    pending_queue_consumer_gate::{
+        PersistedPendingQueueConsumerProvisionedReceipt,
+        ScyllaPendingQueueConsumerGateStore,
+    },
     ScyllaPendingPipelineStore, ScyllaPendingQueueArtifactStore,
 };
 
@@ -90,7 +94,9 @@ fn verify_candidate<'candidate>(
 pub(super) struct ScyllaBackedRecoverableNatsSource {
     client: Arc<NatsJetStreamClient>,
     store: Arc<ScyllaPendingQueueArtifactStore>,
+    consumer_gate: Arc<ScyllaPendingQueueConsumerGateStore>,
     contract: RecoverableNatsConsumerContract,
+    provisioned: PersistedPendingQueueConsumerProvisionedReceipt,
     owner: PendingQueueArtifactOwnerPermit,
     fetch_expires: Duration,
     serial: Mutex<()>,
@@ -100,7 +106,9 @@ impl ScyllaBackedRecoverableNatsSource {
     pub(super) fn new(
         client: Arc<NatsJetStreamClient>,
         store: Arc<ScyllaPendingQueueArtifactStore>,
+        consumer_gate: Arc<ScyllaPendingQueueConsumerGateStore>,
         contract: RecoverableNatsConsumerContract,
+        provisioned: PersistedPendingQueueConsumerProvisionedReceipt,
         owner: PendingQueueArtifactOwnerPermit,
     ) -> Result<Self, PendingQueueNatsCaptureError> {
         if client.base_namespace() != contract.namespace() {
@@ -109,7 +117,9 @@ impl ScyllaBackedRecoverableNatsSource {
         Ok(Self {
             client,
             store,
+            consumer_gate,
             contract,
+            provisioned,
             owner,
             fetch_expires: DEFAULT_FETCH_EXPIRES,
             serial: Mutex::new(()),
@@ -262,8 +272,13 @@ impl ScyllaBackedRecoverableNatsSource {
     async fn ensure_attested_consumer(
         &self,
     ) -> Result<RecoverableNatsCaptureConsumer, PendingQueueNatsCaptureError> {
+        let binding = self
+            .consumer_gate
+            .recover_existing_binding(&self.provisioned, &self.contract)
+            .await
+            .map_err(|error| PendingQueueNatsCaptureError::ConsumerGate(error.to_string()))?;
         self.client
-            .open_recoverable_capture(self.contract.clone())
+            .open_existing_recoverable_capture(self.contract.clone(), &binding)
             .await
             .map_err(nats_transport)
     }
@@ -550,6 +565,7 @@ pub(super) enum PendingQueueNatsCaptureError {
     SourceIdentityMismatch,
     SourceCursorMismatch,
     ConsumerDigestMismatch,
+    ConsumerGate(String),
     DeliveryContract,
     Envelope(String),
     EnvelopeChainMismatch,
@@ -583,6 +599,7 @@ impl fmt::Display for PendingQueueNatsCaptureError {
             Self::SourceIdentityMismatch => formatter.write_str("source identity mismatch"),
             Self::SourceCursorMismatch => formatter.write_str("source cursor mismatch"),
             Self::ConsumerDigestMismatch => formatter.write_str("consumer digest mismatch"),
+            Self::ConsumerGate(error) => write!(formatter, "consumer gate error: {error}"),
             Self::DeliveryContract => formatter.write_str("NATS delivery contract mismatch"),
             Self::Envelope(reason) => write!(formatter, "invalid recoverable envelope: {reason}"),
             Self::EnvelopeChainMismatch => formatter.write_str("recoverable envelope chain mismatch"),

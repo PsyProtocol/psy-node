@@ -8,15 +8,25 @@
 
 #![allow(dead_code)]
 
-use std::{collections::BTreeMap, error::Error, fmt, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashSet},
+    error::Error,
+    fmt,
+    sync::Arc,
+};
 
 use psy_node_nats::{
+    queue::NatsJetStreamClient,
     recoverable_segment::{
-        RecoverableNatsSegmentContractDigest, RecoverableNatsSegmentId,
-        RecoverableNatsStreamInstanceId,
+        LiveRecoverableNatsStreamInstance, RecoverableNatsSegmentContractDigest,
+        RecoverableNatsSegmentId, RecoverableNatsStreamInstanceId,
+        RecoverableNatsStreamSegment,
     },
     recoverable_transport::{
-        RecoverableNatsConsumerInstanceId, RecoverableNatsConsumerProvisioningOperationId,
+        RecoverableNatsCaptureSpec, RecoverableNatsConsumerInstanceId,
+        RecoverableNatsConsumerProvisioningOperationId,
+        RecoverableNatsExistingConsumerBinding, RecoverableNatsExpectedStreamMode,
+        RecoverableNatsProvisionedConsumerExpectation,
         RecoverableNatsProvisionedConsumerReceipt,
     },
 };
@@ -470,6 +480,40 @@ impl StoredPendingQueueConsumerGate {
         {
             return Err(PendingQueueConsumerGateError::MalformedPayload);
         }
+        let mut operations = HashSet::with_capacity(value.entries.len());
+        let mut instances = HashSet::with_capacity(value.entries.len());
+        let mut provisioned_count = 0_u64;
+        for entry in value.entries.values() {
+            if !operations.insert(entry.operation_id()) {
+                return Err(PendingQueueConsumerGateError::OperationReused);
+            }
+            if let PendingQueueConsumerGateEntry::Provisioned {
+                consumer_instance_id,
+                ..
+            } = entry
+            {
+                provisioned_count = provisioned_count
+                    .checked_add(1)
+                    .ok_or(PendingQueueConsumerGateError::RevisionOverflow)?;
+                if !instances.insert(*consumer_instance_id) {
+                    return Err(PendingQueueConsumerGateError::ConsumerInstanceReused);
+                }
+            }
+        }
+        let expected_revision = u64::try_from(value.entries.len())
+            .map_err(|_| PendingQueueConsumerGateError::RevisionOverflow)?
+            .checked_add(provisioned_count)
+            .and_then(|revision| {
+                revision.checked_add(if value.phase == PendingQueueConsumerGatePhase::Closed {
+                    1
+                } else {
+                    0
+                })
+            })
+            .ok_or(PendingQueueConsumerGateError::RevisionOverflow)?;
+        if value.revision != expected_revision {
+            return Err(PendingQueueConsumerGateError::RevisionMismatch);
+        }
         Ok(value)
     }
 }
@@ -564,6 +608,40 @@ impl PersistedPendingQueueConsumerGateClosedReceipt {
             && self.current.identity == identity
             && self.current.phase == PendingQueueConsumerGatePhase::Closed
             && self.current.matches_expected(expected)
+    }
+}
+
+impl PersistedPendingQueueConsumerProvisionedReceipt {
+    fn existing_binding(
+        &self,
+        spec: &RecoverableNatsCaptureSpec,
+    ) -> Result<RecoverableNatsExistingConsumerBinding, PendingQueueConsumerGateError> {
+        if self.subject != spec.subject()
+            || self.consumer_digest != spec.consumer_digest()
+        {
+            return Err(PendingQueueConsumerGateError::ProvisioningReceiptMismatch);
+        }
+        let entry = self
+            .current
+            .entries
+            .get(&self.subject)
+            .ok_or(PendingQueueConsumerGateError::ProvisioningNotFound)?;
+        let operation_id = match entry {
+            PendingQueueConsumerGateEntry::Provisioned {
+                consumer_digest,
+                operation_id,
+                consumer_instance_id,
+            } if *consumer_digest == self.consumer_digest
+                && *consumer_instance_id == self.consumer_instance_id => *operation_id,
+            _ => return Err(PendingQueueConsumerGateError::ProvisioningMismatch),
+        };
+        RecoverableNatsExistingConsumerBinding::try_from_durable(
+            self.current.identity.stream_instance_id,
+            spec,
+            operation_id,
+            self.consumer_instance_id,
+        )
+        .map_err(transport)
     }
 }
 
@@ -809,7 +887,7 @@ impl ScyllaPendingQueueConsumerGateStore {
         })
     }
 
-    pub(super) async fn begin_provisioning(
+    async fn begin_provisioning(
         &self,
         open: &PersistedPendingQueueConsumerGateOpenReceipt,
         expected: PendingQueueExpectedConsumer,
@@ -890,6 +968,125 @@ impl ScyllaPendingQueueConsumerGateStore {
         Err(PendingQueueConsumerGateError::Contention)
     }
 
+    pub(super) async fn provision_capture_consumer(
+        &self,
+        nats: &NatsJetStreamClient,
+        open: &PersistedPendingQueueConsumerGateOpenReceipt,
+        live: &LiveRecoverableNatsStreamInstance,
+        spec: RecoverableNatsCaptureSpec,
+        operation_id: RecoverableNatsConsumerProvisioningOperationId,
+    ) -> Result<PersistedPendingQueueConsumerProvisionedReceipt, PendingQueueConsumerGateError> {
+        if open.store_fingerprint != self.fingerprint
+            || open.current.identity.segment_id != live.segment().segment_id()
+            || open.current.identity.contract_digest != live.segment().digest()
+            || open.current.identity.stream_instance_id != live.instance_id()
+            || spec.v2_segment() != Some(live.segment())
+        {
+            return Err(PendingQueueConsumerGateError::IdentityMismatch);
+        }
+        let expected =
+            PendingQueueExpectedConsumer::try_new(spec.subject(), spec.consumer_digest())?;
+        let start = self
+            .begin_provisioning(open, expected, operation_id)
+            .await?;
+        self.execute_provisioning_start(nats, live, spec, start)
+            .await
+    }
+
+    /// Recovers an in-flight or completed provisioning operation using only
+    /// durable gate state. The caller does not need to retain the operation
+    /// id across a process crash.
+    pub(super) async fn resume_capture_consumer(
+        &self,
+        nats: &NatsJetStreamClient,
+        open: &PersistedPendingQueueConsumerGateOpenReceipt,
+        live: &LiveRecoverableNatsStreamInstance,
+        spec: RecoverableNatsCaptureSpec,
+    ) -> Result<PersistedPendingQueueConsumerProvisionedReceipt, PendingQueueConsumerGateError> {
+        if open.store_fingerprint != self.fingerprint
+            || open.current.identity.segment_id != live.segment().segment_id()
+            || open.current.identity.contract_digest != live.segment().digest()
+            || open.current.identity.stream_instance_id != live.instance_id()
+            || spec.v2_segment() != Some(live.segment())
+        {
+            return Err(PendingQueueConsumerGateError::IdentityMismatch);
+        }
+        let expected =
+            PendingQueueExpectedConsumer::try_new(spec.subject(), spec.consumer_digest())?;
+        let current = self
+            .read(open.current.slot)
+            .await?
+            .ok_or(PendingQueueConsumerGateError::Uninitialized)?;
+        if current.identity != open.current.identity {
+            return Err(PendingQueueConsumerGateError::IdentityMismatch);
+        }
+        if current.phase != PendingQueueConsumerGatePhase::Open {
+            return Err(PendingQueueConsumerGateError::GateClosed);
+        }
+        let entry = current.entries.get(expected.subject()).cloned();
+        let start = match entry {
+            Some(PendingQueueConsumerGateEntry::Provisioning {
+                consumer_digest,
+                operation_id,
+            }) if consumer_digest == *expected.consumer_digest() => {
+                PendingQueueConsumerProvisioningStart::Lease(
+                    PersistedPendingQueueConsumerProvisioningLease {
+                        store_fingerprint: self.fingerprint,
+                        current,
+                        subject: expected.subject,
+                        consumer_digest: expected.consumer_digest,
+                        operation_id,
+                    },
+                )
+            }
+            Some(PendingQueueConsumerGateEntry::Provisioned {
+                consumer_digest,
+                consumer_instance_id,
+                ..
+            }) if consumer_digest == *expected.consumer_digest() => {
+                PendingQueueConsumerProvisioningStart::AlreadyProvisioned(
+                    PersistedPendingQueueConsumerProvisionedReceipt {
+                        store_fingerprint: self.fingerprint,
+                        current: current.clone(),
+                        subject: expected.subject,
+                        consumer_digest: expected.consumer_digest,
+                        consumer_instance_id,
+                    },
+                )
+            }
+            Some(_) => return Err(PendingQueueConsumerGateError::ConsumerConflict),
+            None => return Err(PendingQueueConsumerGateError::ProvisioningNotFound),
+        };
+        self.execute_provisioning_start(nats, live, spec, start)
+            .await
+    }
+
+    async fn execute_provisioning_start(
+        &self,
+        nats: &NatsJetStreamClient,
+        live: &LiveRecoverableNatsStreamInstance,
+        spec: RecoverableNatsCaptureSpec,
+        start: PendingQueueConsumerProvisioningStart,
+    ) -> Result<PersistedPendingQueueConsumerProvisionedReceipt, PendingQueueConsumerGateError> {
+        match start {
+            PendingQueueConsumerProvisioningStart::AlreadyProvisioned(receipt) => {
+                let binding = receipt.existing_binding(&spec)?;
+                nats.open_existing_recoverable_capture(spec, &binding)
+                    .await
+                    .map_err(transport)?;
+                Ok(receipt)
+            }
+            PendingQueueConsumerProvisioningStart::Lease(lease) => {
+                let operation_id = lease.operation_id;
+                let provisioned = nats
+                    .provision_recoverable_capture_consumer(live, spec, operation_id)
+                    .await
+                    .map_err(transport)?;
+                self.complete_provisioning(&lease, &provisioned).await
+            }
+        }
+    }
+
     pub(super) async fn complete_provisioning(
         &self,
         lease: &PersistedPendingQueueConsumerProvisioningLease,
@@ -902,6 +1099,7 @@ impl ScyllaPendingQueueConsumerGateStore {
             != lease.current.identity.stream_instance_id.as_bytes()
             || provisioned.subject() != lease.subject
             || provisioned.consumer_digest() != &lease.consumer_digest
+            || provisioned.operation_id() != lease.operation_id
         {
             return Err(PendingQueueConsumerGateError::ProvisioningReceiptMismatch);
         }
@@ -1030,6 +1228,86 @@ impl ScyllaPendingQueueConsumerGateStore {
             return Err(PendingQueueConsumerGateError::EvidenceChanged);
         }
         Ok(())
+    }
+
+    pub(super) async fn recover_existing_binding(
+        &self,
+        receipt: &PersistedPendingQueueConsumerProvisionedReceipt,
+        spec: &RecoverableNatsCaptureSpec,
+    ) -> Result<RecoverableNatsExistingConsumerBinding, PendingQueueConsumerGateError> {
+        if receipt.store_fingerprint != self.fingerprint {
+            return Err(PendingQueueConsumerGateError::StoreMismatch);
+        }
+        let current = self
+            .read(receipt.current.slot)
+            .await?
+            .ok_or(PendingQueueConsumerGateError::Uninitialized)?;
+        if current.identity != receipt.current.identity
+            || current.phase != PendingQueueConsumerGatePhase::Open
+        {
+            return Err(PendingQueueConsumerGateError::GateClosed);
+        }
+        let entry = current
+            .entries
+            .get(&receipt.subject)
+            .ok_or(PendingQueueConsumerGateError::ProvisioningNotFound)?;
+        let receipt_entry = receipt
+            .current
+            .entries
+            .get(&receipt.subject)
+            .ok_or(PendingQueueConsumerGateError::ProvisioningNotFound)?;
+        if entry != receipt_entry {
+            return Err(PendingQueueConsumerGateError::EvidenceChanged);
+        }
+        receipt.existing_binding(spec)
+    }
+
+    pub(super) async fn revalidate_nats_consumer_set(
+        &self,
+        nats: &NatsJetStreamClient,
+        commitment: PendingQueueConsumerGateCommitment,
+        segment: RecoverableNatsStreamSegment,
+        mode: RecoverableNatsExpectedStreamMode,
+    ) -> Result<(), PendingQueueConsumerGateError> {
+        self.revalidate_commitment(commitment).await?;
+        let current = self
+            .read(PendingQueueConsumerGateSlot(*commitment.slot()))
+            .await?
+            .ok_or(PendingQueueConsumerGateError::Uninitialized)?;
+        if current.identity.segment_id != segment.segment_id()
+            || current.identity.contract_digest != segment.digest()
+        {
+            return Err(PendingQueueConsumerGateError::IdentityMismatch);
+        }
+        let mut expected = Vec::with_capacity(current.entries.len());
+        for (subject, entry) in &current.entries {
+            let PendingQueueConsumerGateEntry::Provisioned {
+                consumer_digest,
+                operation_id,
+                consumer_instance_id,
+            } = entry
+            else {
+                return Err(PendingQueueConsumerGateError::GateClosed);
+            };
+            expected.push(
+                RecoverableNatsProvisionedConsumerExpectation::try_new(
+                    subject,
+                    *consumer_digest,
+                    *operation_id,
+                    *consumer_instance_id,
+                )
+                .map_err(transport)?,
+            );
+        }
+        nats.verify_recoverable_provisioned_consumer_set(
+            segment,
+            current.identity.stream_instance_id,
+            mode,
+            expected,
+        )
+        .await
+        .map_err(transport)?;
+        self.revalidate_commitment(commitment).await
     }
 
     async fn cas(
@@ -1171,9 +1449,14 @@ fn cql(error: impl fmt::Display) -> PendingQueueConsumerGateError {
     PendingQueueConsumerGateError::Cql(error.to_string())
 }
 
+fn transport(error: impl fmt::Display) -> PendingQueueConsumerGateError {
+    PendingQueueConsumerGateError::Transport(error.to_string())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum PendingQueueConsumerGateError {
     Cql(String),
+    Transport(String),
     Indeterminate(String),
     Uninitialized,
     StoreMismatch,
@@ -1211,6 +1494,7 @@ impl fmt::Display for PendingQueueConsumerGateError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Cql(error) => write!(formatter, "Scylla error: {error}"),
+            Self::Transport(error) => write!(formatter, "NATS transport error: {error}"),
             Self::Indeterminate(error) => write!(formatter, "indeterminate LWT: {error}"),
             Self::Uninitialized => formatter.write_str("consumer gate is uninitialized"),
             Self::StoreMismatch => formatter.write_str("consumer gate store mismatch"),
@@ -1415,6 +1699,96 @@ mod tests {
         assert_eq!(
             second.complete("queue.b", [7; 32], operation(8), instance(6)),
             Err(PendingQueueConsumerGateError::ConsumerInstanceReused)
+        );
+    }
+
+    #[test]
+    fn provisioning_restart_recovers_the_operation_from_the_durable_row() {
+        let open = StoredPendingQueueConsumerGate::open(identity());
+        let provisioning = open.begin(&expected("queue.a", 4), operation(5)).unwrap();
+        let bytes = provisioning.to_persisted_bytes();
+        let recovered = StoredPendingQueueConsumerGate::decode(
+            provisioning.slot,
+            provisioning.revision as i64,
+            &bytes,
+        )
+        .unwrap();
+
+        assert_eq!(
+            recovered.entries.get("queue.a"),
+            Some(&PendingQueueConsumerGateEntry::Provisioning {
+                consumer_digest: [4; 32],
+                operation_id: operation(5),
+            })
+        );
+    }
+
+    #[test]
+    fn decoder_rejects_duplicate_physical_identities_and_impossible_revisions() {
+        let mut duplicate_operation = StoredPendingQueueConsumerGate::open(identity());
+        duplicate_operation.revision = 2;
+        duplicate_operation.entries.insert(
+            "queue.a".to_owned(),
+            PendingQueueConsumerGateEntry::Provisioning {
+                consumer_digest: [4; 32],
+                operation_id: operation(5),
+            },
+        );
+        duplicate_operation.entries.insert(
+            "queue.b".to_owned(),
+            PendingQueueConsumerGateEntry::Provisioning {
+                consumer_digest: [7; 32],
+                operation_id: operation(5),
+            },
+        );
+        duplicate_operation.digest = duplicate_operation.calculate_digest();
+        assert_eq!(
+            StoredPendingQueueConsumerGate::decode(
+                duplicate_operation.slot,
+                duplicate_operation.revision as i64,
+                &duplicate_operation.to_persisted_bytes(),
+            ),
+            Err(PendingQueueConsumerGateError::OperationReused)
+        );
+
+        let mut duplicate_instance = duplicate_operation;
+        duplicate_instance.revision = 4;
+        duplicate_instance.entries.insert(
+            "queue.a".to_owned(),
+            PendingQueueConsumerGateEntry::Provisioned {
+                consumer_digest: [4; 32],
+                operation_id: operation(5),
+                consumer_instance_id: instance(6),
+            },
+        );
+        duplicate_instance.entries.insert(
+            "queue.b".to_owned(),
+            PendingQueueConsumerGateEntry::Provisioned {
+                consumer_digest: [7; 32],
+                operation_id: operation(8),
+                consumer_instance_id: instance(6),
+            },
+        );
+        duplicate_instance.digest = duplicate_instance.calculate_digest();
+        assert_eq!(
+            StoredPendingQueueConsumerGate::decode(
+                duplicate_instance.slot,
+                duplicate_instance.revision as i64,
+                &duplicate_instance.to_persisted_bytes(),
+            ),
+            Err(PendingQueueConsumerGateError::ConsumerInstanceReused)
+        );
+
+        let mut impossible_revision = StoredPendingQueueConsumerGate::open(identity());
+        impossible_revision.revision = 9;
+        impossible_revision.digest = impossible_revision.calculate_digest();
+        assert_eq!(
+            StoredPendingQueueConsumerGate::decode(
+                impossible_revision.slot,
+                impossible_revision.revision as i64,
+                &impossible_revision.to_persisted_bytes(),
+            ),
+            Err(PendingQueueConsumerGateError::RevisionMismatch)
         );
     }
 

@@ -30,12 +30,23 @@ fn raw_nats_authority_has_an_exact_lexical_inventory() {
     let direct_publish = concat!(".jetstream", ".publish(");
     let raw_update = concat!(".update_", "stream(");
     let raw_delete = concat!(".delete_", "stream(");
+    let raw_consumer_create = concat!(".create_", "consumer_strict(");
+    let typed_consumer_provision = concat!(".provision_", "recoverable_capture_consumer(");
+    let typed_consumer_open = concat!(".open_", "existing_recoverable_capture(");
+    let durable_binding_constructor = concat!(
+        "RecoverableNatsExistingConsumerBinding::",
+        "try_from_durable("
+    );
     let mut dependency_files = BTreeSet::new();
     let mut context_files = BTreeSet::new();
     let mut send_files = BTreeSet::new();
     let mut direct_publish_files = BTreeSet::new();
     let mut update_sites = Vec::new();
     let mut delete_sites = Vec::new();
+    let mut consumer_create_sites = Vec::new();
+    let mut typed_consumer_provision_sites = Vec::new();
+    let mut typed_consumer_open_sites = Vec::new();
+    let mut durable_binding_sites = Vec::new();
 
     for file in files {
         let relative = file.strip_prefix(workspace).unwrap();
@@ -59,10 +70,29 @@ fn raw_nats_authority_has_an_exact_lexical_inventory() {
         }
         let delete_count = source.matches(raw_delete).count();
         if delete_count != 0 {
-            delete_sites.push((relative, delete_count));
+            delete_sites.push((relative.clone(), delete_count));
+        }
+        let consumer_create_count = source.matches(raw_consumer_create).count();
+        if consumer_create_count != 0 {
+            consumer_create_sites.push((relative.clone(), consumer_create_count));
+        }
+        let provision_count = source.matches(typed_consumer_provision).count();
+        if provision_count != 0 {
+            typed_consumer_provision_sites.push((relative.clone(), provision_count));
+        }
+        let open_count = source.matches(typed_consumer_open).count();
+        if open_count != 0 {
+            typed_consumer_open_sites.push((relative.clone(), open_count));
+        }
+        let binding_count = source.matches(durable_binding_constructor).count();
+        if binding_count != 0 {
+            durable_binding_sites.push((relative, binding_count));
         }
     }
     delete_sites.sort();
+    typed_consumer_provision_sites.sort();
+    typed_consumer_open_sites.sort();
+    durable_binding_sites.sort();
 
     let expected_dependency_files = BTreeSet::from([
         "psy_node_nats/src/psy_queue.rs".to_owned(),
@@ -112,6 +142,60 @@ fn raw_nats_authority_has_an_exact_lexical_inventory() {
             ),
         ],
         "only historical test cleanup and the typed recoverable delete façade may delete a stream",
+    );
+    assert_eq!(
+        consumer_create_sites,
+        vec![(
+            "psy_node_nats/src/recoverable_transport.rs".to_owned(),
+            1,
+        )],
+        "only the typed recoverable provisioning façade may create a consumer",
+    );
+    assert_eq!(
+        typed_consumer_provision_sites,
+        vec![
+            (
+                "psy_node_nats/src/recoverable_transport.rs".to_owned(),
+                1,
+            ),
+            (
+                "psy_node_scylla/src/rollback/pending_queue_consumer_gate.rs".to_owned(),
+                1,
+            ),
+        ],
+        "only the RF=3 transport test and durable consumer gate may provision",
+    );
+    assert_eq!(
+        typed_consumer_open_sites,
+        vec![
+            (
+                "psy_node_nats/src/recoverable_transport.rs".to_owned(),
+                1,
+            ),
+            (
+                "psy_node_scylla/src/rollback/pending_queue_consumer_gate.rs".to_owned(),
+                1,
+            ),
+            (
+                "psy_node_scylla/src/rollback/pending_queue_nats_capture.rs".to_owned(),
+                1,
+            ),
+        ],
+        "existing-only capture is confined to the test, gate, and typed source",
+    );
+    assert_eq!(
+        durable_binding_sites,
+        vec![
+            (
+                "psy_node_nats/src/recoverable_transport.rs".to_owned(),
+                1,
+            ),
+            (
+                "psy_node_scylla/src/rollback/pending_queue_consumer_gate.rs".to_owned(),
+                1,
+            ),
+        ],
+        "only the RF=3 test and durable gate may construct an existing binding",
     );
 }
 
