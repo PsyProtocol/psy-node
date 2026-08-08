@@ -48,6 +48,12 @@ use scylla::{
 use sha2::{Digest, Sha256};
 
 use super::{
+    pending_queue_consumer_gate::{
+        PendingQueueConsumerGateCommitment, PendingQueueConsumerGateError,
+        PendingQueueConsumerGateIdentity,
+        PendingQueueExpectedConsumer, PersistedPendingQueueConsumerGateClosedReceipt,
+        ScyllaPendingQueueConsumerGateStore,
+    },
     pending_queue_generation_terminal::{
         PendingQueueGenerationTerminalError,
         PendingQueueGenerationTerminalSegmentCommitment,
@@ -66,7 +72,7 @@ use super::pending_queue_segment_ledger::{
 pub(super) const PENDING_QUEUE_SEGMENT_LIFECYCLE_TABLE: &str =
     "branch_exact_pending_queue_segment_lifecycle_v1";
 const MAGIC: &[u8; 8] = b"PSYQSLIF";
-const CODEC_VERSION: u16 = 1;
+const CODEC_VERSION: u16 = 2;
 const SEAL_REQUESTED_REVISION: u64 = 1;
 const STREAM_SEALED_REVISION: u64 = 2;
 const MESSAGES_SCAN_VERIFIED_REVISION: u64 = 3;
@@ -202,6 +208,7 @@ struct StoredPendingQueueSegmentSealRequest {
     segment_id: RecoverableNatsSegmentId,
     contract_digest: RecoverableNatsSegmentContractDigest,
     stream_instance_id: [u8; 32],
+    consumer_gate_commitment: PendingQueueConsumerGateCommitment,
     live_state: RecoverableNatsStreamStateSnapshot,
     manifest_digest: PendingQueueNatsWholeStreamManifestDigest,
     scan_digest: Option<PendingQueueNatsWholeStreamScanDigest>,
@@ -216,6 +223,7 @@ impl StoredPendingQueueSegmentSealRequest {
         closure: &PendingQueueSegmentClosureSnapshot,
         live: &LiveRecoverableNatsStreamInstance,
         commitments: Vec<PendingQueueGenerationTerminalSegmentCommitment>,
+        consumer_gate_commitment: PendingQueueConsumerGateCommitment,
     ) -> Result<Self, PendingQueueSegmentLifecycleError> {
         if live.segment().segment_id() != closure.segment_id()
             || live.segment().digest() != closure.contract_digest()
@@ -266,6 +274,7 @@ impl StoredPendingQueueSegmentSealRequest {
             segment_id: closure.segment_id(),
             contract_digest: closure.contract_digest(),
             stream_instance_id: *live.instance_id().as_bytes(),
+            consumer_gate_commitment,
             live_state: live.state(),
             manifest_digest,
             scan_digest: None,
@@ -510,6 +519,9 @@ impl StoredPendingQueueSegmentSealRequest {
         out.extend_from_slice(&self.segment_id.get().to_be_bytes());
         out.extend_from_slice(self.contract_digest.as_bytes());
         out.extend_from_slice(&self.stream_instance_id);
+        out.extend_from_slice(self.consumer_gate_commitment.slot());
+        out.extend_from_slice(&self.consumer_gate_commitment.revision().to_be_bytes());
+        out.extend_from_slice(self.consumer_gate_commitment.digest());
         encode_stream_state(self.live_state, &mut out);
         out.extend_from_slice(self.manifest_digest.as_bytes());
         out.extend_from_slice(&(self.terminals.len() as u32).to_be_bytes());
@@ -584,6 +596,22 @@ impl StoredPendingQueueSegmentSealRequest {
         if stream_instance_id == [0; 32] {
             return Err(PendingQueueSegmentLifecycleError::EmptyDigest);
         }
+        let consumer_gate_slot = decoder.array32()?;
+        let consumer_gate_revision = decoder.u64()?;
+        let consumer_gate_digest = decoder.array32()?;
+        if consumer_gate_slot == [0; 32]
+            || consumer_gate_revision == 0
+            || consumer_gate_revision > i64::MAX as u64
+            || consumer_gate_digest == [0; 32]
+        {
+            return Err(PendingQueueSegmentLifecycleError::ConsumerGateCommitment);
+        }
+        let consumer_gate_commitment = PendingQueueConsumerGateCommitment::try_new(
+            consumer_gate_slot,
+            consumer_gate_revision,
+            consumer_gate_digest,
+        )
+        .map_err(PendingQueueSegmentLifecycleError::ConsumerGate)?;
         let live_state = decode_stream_state(&mut decoder)?;
         let manifest_digest = PendingQueueNatsWholeStreamManifestDigest::try_from_bytes(
             decoder.array32()?,
@@ -681,6 +709,7 @@ impl StoredPendingQueueSegmentSealRequest {
             segment_id,
             contract_digest,
             stream_instance_id,
+            consumer_gate_commitment,
             live_state,
             manifest_digest,
             scan_digest,
@@ -1102,9 +1131,66 @@ impl ScyllaPendingQueueSegmentLifecycleStore {
             .map_err(transport)
     }
 
+    async fn build_expected_gate_consumers(
+        &self,
+        archive_store: &ScyllaPendingQueueSemanticAggregateStore,
+        closure: &PendingQueueSegmentClosureSnapshot,
+        segment: &RecoverableNatsStreamSegment,
+        commitments: &[PendingQueueGenerationTerminalSegmentCommitment],
+    ) -> Result<Vec<PendingQueueExpectedConsumer>, PendingQueueSegmentLifecycleError> {
+        if commitments.len() != closure.assignments().len()
+            || commitments.len() > MAX_ASSIGNMENTS
+        {
+            return Err(PendingQueueSegmentLifecycleError::TerminalSetMismatch);
+        }
+        let mut expected = Vec::new();
+        for (assignment_receipt, terminal) in closure.assignments().iter().zip(commitments) {
+            let assignment = assignment_receipt.assignment();
+            let consumers = archive_store
+                .observe_archived_consumers(
+                    closure.ledger_slot(),
+                    assignment,
+                    *terminal.archive_slot(),
+                    *terminal.archive_digest(),
+                )
+                .await
+                .map_err(|error| PendingQueueSegmentLifecycleError::Archive(error.to_string()))?;
+            if consumers.len() != usize::from(assignment.expected_source_count())
+                || consumers
+                    .iter()
+                    .map(|consumer| consumer.publisher_kind())
+                    .ne(assignment.source_quotas().iter().map(|quota| quota.publisher_kind()))
+            {
+                return Err(PendingQueueSegmentLifecycleError::TerminalSetMismatch);
+            }
+            for consumer in consumers {
+                let route = RecoverableNatsSourceRoute::try_new(
+                    assignment.context(),
+                    consumer.publisher_kind(),
+                    segment,
+                )
+                .map_err(transport)?;
+                expected.push(
+                    PendingQueueExpectedConsumer::try_new(
+                        route.subject(),
+                        consumer.consumer_digest(),
+                    )
+                    .map_err(PendingQueueSegmentLifecycleError::ConsumerGate)?,
+                );
+            }
+        }
+        expected.sort();
+        if expected.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(PendingQueueSegmentLifecycleError::TerminalSetMismatch);
+        }
+        Ok(expected)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn persist_seal_requested<Hash: Q256BitHash>(
         &self,
+        consumer_gate_store: &ScyllaPendingQueueConsumerGateStore,
+        consumer_gate_closed: &PersistedPendingQueueConsumerGateClosedReceipt,
         ledger_store: &ScyllaPendingQueueSegmentLedgerStore,
         terminal_store: &ScyllaPendingQueueGenerationTerminalStore,
         archive_store: &ScyllaPendingQueueSemanticAggregateStore,
@@ -1124,10 +1210,32 @@ impl ScyllaPendingQueueSegmentLifecycleStore {
             closure,
         )
         .await?;
+        let gate_identity = PendingQueueConsumerGateIdentity::new(
+            live.segment().segment_id(),
+            live.segment().digest(),
+            live.instance_id(),
+        );
+        let expected_consumers = self
+            .build_expected_gate_consumers(
+                archive_store,
+                closure,
+                live.segment(),
+                &commitments,
+            )
+            .await?;
+        consumer_gate_store
+            .revalidate_closed(
+                consumer_gate_closed,
+                gate_identity,
+                &expected_consumers,
+            )
+            .await
+            .map_err(PendingQueueSegmentLifecycleError::ConsumerGate)?;
         let candidate = StoredPendingQueueSegmentSealRequest::try_from_verified(
             closure,
             live,
             commitments,
+            consumer_gate_closed.commitment(),
         )?;
         let payload = candidate.to_persisted_bytes();
         let execution = self
@@ -1188,6 +1296,14 @@ impl ScyllaPendingQueueSegmentLifecycleStore {
         {
             return Err(PendingQueueSegmentLifecycleError::EvidenceChanged);
         }
+        consumer_gate_store
+            .revalidate_closed(
+                consumer_gate_closed,
+                gate_identity,
+                &expected_consumers,
+            )
+            .await
+            .map_err(PendingQueueSegmentLifecycleError::ConsumerGate)?;
         Ok(PersistedPendingQueueSealRequestedReceipt {
             store_fingerprint: self.fingerprint,
             current,
@@ -1440,6 +1556,7 @@ impl ScyllaPendingQueueSegmentLifecycleStore {
     pub(super) async fn seal_requested_stream<Hash: Q256BitHash>(
         &self,
         nats: &NatsJetStreamClient,
+        consumer_gate_store: &ScyllaPendingQueueConsumerGateStore,
         ledger_store: &ScyllaPendingQueueSegmentLedgerStore,
         terminal_store: &ScyllaPendingQueueGenerationTerminalStore,
         archive_store: &ScyllaPendingQueueSemanticAggregateStore,
@@ -1476,6 +1593,10 @@ impl ScyllaPendingQueueSegmentLifecycleStore {
             &receipt.current,
         )
         .await?;
+        consumer_gate_store
+            .revalidate_commitment(receipt.current.consumer_gate_commitment)
+            .await
+            .map_err(PendingQueueSegmentLifecycleError::ConsumerGate)?;
 
         let sealed = match nats
             .observe_recoverable_segment_instance(segment.clone())
@@ -1514,6 +1635,10 @@ impl ScyllaPendingQueueSegmentLifecycleStore {
             &receipt.current,
         )
         .await?;
+        consumer_gate_store
+            .revalidate_commitment(receipt.current.consumer_gate_commitment)
+            .await
+            .map_err(PendingQueueSegmentLifecycleError::ConsumerGate)?;
 
         let candidate = receipt.current.to_stream_sealed(&sealed)?;
         let result = if durable == candidate {
@@ -2151,6 +2276,8 @@ pub(super) enum PendingQueueSegmentLifecycleError {
     Nats(String),
     Transport(String),
     Archive(String),
+    ConsumerGate(PendingQueueConsumerGateError),
+    ConsumerGateCommitment,
     Ledger(super::PendingQueueSegmentLedgerStoreError),
     Terminal(PendingQueueGenerationTerminalError),
     EmptyDigest,
@@ -2225,6 +2352,10 @@ mod tests {
             segment_id,
             contract_digest: RecoverableNatsSegmentContractDigest::try_new([4; 32]).unwrap(),
             stream_instance_id,
+            consumer_gate_commitment: PendingQueueConsumerGateCommitment::try_new(
+                [41; 32], 3, [42; 32],
+            )
+            .unwrap(),
             live_state: RecoverableNatsStreamStateSnapshot::try_new(0, 0, 0, 0, 0, 0)
                 .unwrap(),
             manifest_digest:

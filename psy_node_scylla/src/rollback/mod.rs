@@ -42,6 +42,7 @@ mod pending_queue_generation_terminal;
 mod pending_queue_segment_lifecycle;
 #[allow(dead_code)]
 mod pending_queue_nats_capture;
+mod pending_queue_consumer_gate;
 #[cfg(test)]
 mod branch_exact_shadow_reader_rf3_gate;
 #[cfg(test)]

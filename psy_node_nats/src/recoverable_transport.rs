@@ -202,6 +202,75 @@ pub struct RecoverableNatsConsumerInventoryReceipt {
     consumer_count: u64,
 }
 
+/// Stable caller-supplied identity of one durable-consumer provisioning
+/// operation. The value is persisted before JetStream is mutated and must be
+/// reused verbatim after a crash or an indeterminate response.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RecoverableNatsConsumerProvisioningOperationId([u8; 32]);
+
+impl RecoverableNatsConsumerProvisioningOperationId {
+    pub fn try_new(bytes: [u8; 32]) -> Result<Self, RecoverableNatsTransportError> {
+        if bytes == [0; 32] {
+            Err(RecoverableNatsTransportError::ConsumerContract)
+        } else {
+            Ok(Self(bytes))
+        }
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// Stable identity of one server-created durable-consumer incarnation. A
+/// later milestone derives this from the exact stream, consumer configuration
+/// and server-provided creation timestamp; the gate only persists and compares
+/// the opaque non-zero commitment.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RecoverableNatsConsumerInstanceId([u8; 32]);
+
+impl RecoverableNatsConsumerInstanceId {
+    pub fn try_new(bytes: [u8; 32]) -> Result<Self, RecoverableNatsTransportError> {
+        if bytes == [0; 32] {
+            Err(RecoverableNatsTransportError::ConsumerContract)
+        } else {
+            Ok(Self(bytes))
+        }
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// Opaque proof that JetStream returned and then re-exposed one exact durable
+/// consumer incarnation. Only the transport provisioning path can mint this
+/// receipt; storage gates must not accept a caller-synthesized instance id.
+pub struct RecoverableNatsProvisionedConsumerReceipt {
+    stream_instance_id: [u8; 32],
+    subject: String,
+    consumer_digest: [u8; 32],
+    consumer_instance_id: RecoverableNatsConsumerInstanceId,
+}
+
+impl RecoverableNatsProvisionedConsumerReceipt {
+    pub const fn stream_instance_id(&self) -> &[u8; 32] {
+        &self.stream_instance_id
+    }
+
+    pub fn subject(&self) -> &str {
+        &self.subject
+    }
+
+    pub const fn consumer_digest(&self) -> &[u8; 32] {
+        &self.consumer_digest
+    }
+
+    pub const fn consumer_instance_id(&self) -> RecoverableNatsConsumerInstanceId {
+        self.consumer_instance_id
+    }
+}
+
 impl RecoverableNatsConsumerInventoryReceipt {
     pub const fn instance_id(&self) -> &[u8; 32] {
         &self.instance_id
