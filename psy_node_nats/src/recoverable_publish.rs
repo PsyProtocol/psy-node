@@ -2001,6 +2001,7 @@ mod tests {
         .unwrap();
         let segment = RecoverableNatsStreamSegment::try_new(
             "psy.mainnet",
+            key,
             RecoverableNatsSegmentId::try_new(1).unwrap(),
             retention,
         )
@@ -2093,9 +2094,9 @@ mod tests {
         assert_eq!(
             encoded_digest,
             [
-                250, 192, 132, 20, 246, 100, 62, 145, 33, 72, 97, 79, 185,
-                178, 204, 35, 50, 24, 221, 172, 154, 229, 146, 210, 130, 200,
-                122, 23, 52, 157, 154, 28,
+                204, 101, 121, 219, 1, 29, 125, 47, 67, 39, 82, 200, 193, 112,
+                83, 85, 86, 127, 89, 167, 2, 97, 151, 220, 170, 126, 99, 183,
+                108, 152, 234, 82,
             ],
         );
         assert_eq!(

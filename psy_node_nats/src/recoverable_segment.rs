@@ -14,6 +14,8 @@ use async_nats::jetstream::stream::{
     Compression, Config as StreamConfig, DiscardPolicy, RetentionPolicy,
     StorageType,
 };
+use psy_data::protocol::chain_context::AuthorityScope;
+use psy_node_core::store::pending_generation_identity::PendingGenerationLedgerKey;
 use sha2::{Digest, Sha256};
 
 const CONTRACT_DOMAIN: &[u8] = b"psy/rollback/recoverable-nats-segment/v1";
@@ -195,6 +197,7 @@ impl RecoverableNatsRetentionContract {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoverableNatsStreamSegment {
     base_namespace: String,
+    generation_key: PendingGenerationLedgerKey,
     segment_id: RecoverableNatsSegmentId,
     stream_name: String,
     subject_prefix: String,
@@ -205,6 +208,7 @@ pub struct RecoverableNatsStreamSegment {
 impl RecoverableNatsStreamSegment {
     pub fn try_new(
         base_namespace: impl Into<String>,
+        generation_key: PendingGenerationLedgerKey,
         segment_id: RecoverableNatsSegmentId,
         retention: RecoverableNatsRetentionContract,
     ) -> Result<Self, RecoverableNatsSegmentError> {
@@ -213,12 +217,16 @@ impl RecoverableNatsStreamSegment {
         // Full byte encoding is injective; unlike dot-to-underscore or a short
         // hash it cannot alias two accepted namespaces such as `a.b`/`a_b`.
         let base_tag = hex::encode(base_namespace.as_bytes());
-        let stream_name = format!("PSY_BEQ_V2_{base_tag}_SG{}", segment_id.get());
+        let authority_tag = authority_tag(generation_key);
+        let stream_name = format!(
+            "PSY_BEQ_V2_{base_tag}_{authority_tag}_SG{}",
+            segment_id.get()
+        );
         // A global reserved root plus the injective base tag prevents one
         // configured base from capturing another base's V2 traffic through a
         // legacy `<base>.>` wildcard (for example `a_beq_v2.>`).
         let subject_prefix = format!(
-            "{V2_RESERVED_SUBJECT_ROOT}.{base_tag}.SG{}",
+            "{V2_RESERVED_SUBJECT_ROOT}.{base_tag}.{authority_tag}.SG{}",
             segment_id.get()
         );
         if stream_name.len() > 255 || subject_prefix.len() > 255 {
@@ -230,9 +238,16 @@ impl RecoverableNatsStreamSegment {
             segment_id,
             retention,
         ))?;
-        let digest = contract_digest(&base_namespace, segment_id, retention, &normalized)?;
+        let digest = contract_digest(
+            &base_namespace,
+            generation_key,
+            segment_id,
+            retention,
+            &normalized,
+        )?;
         Ok(Self {
             base_namespace,
+            generation_key,
             segment_id,
             stream_name,
             subject_prefix,
@@ -243,6 +258,10 @@ impl RecoverableNatsStreamSegment {
 
     pub fn base_namespace(&self) -> &str {
         &self.base_namespace
+    }
+
+    pub const fn generation_key(&self) -> PendingGenerationLedgerKey {
+        self.generation_key
     }
 
     pub const fn segment_id(&self) -> RecoverableNatsSegmentId {
@@ -406,6 +425,7 @@ fn validate_subject_suffix(value: &str) -> Result<(), RecoverableNatsSegmentErro
 
 fn contract_digest(
     base_namespace: &str,
+    generation_key: PendingGenerationLedgerKey,
     segment_id: RecoverableNatsSegmentId,
     retention: RecoverableNatsRetentionContract,
     normalized: &StreamConfig,
@@ -415,6 +435,7 @@ fn contract_digest(
     let mut hasher = Sha256::new();
     hasher.update(CONTRACT_DOMAIN);
     hash_component(&mut hasher, base_namespace.as_bytes());
+    encode_generation_key(&mut hasher, generation_key);
     hasher.update(segment_id.get().to_be_bytes());
     hasher.update(
         retention
@@ -425,6 +446,40 @@ fn contract_digest(
     hasher.update(RECOVERABLE_NATS_CAPACITY_HEADROOM_BYTES.to_be_bytes());
     hash_component(&mut hasher, &normalized_bytes);
     Ok(RecoverableNatsSegmentContractDigest(hasher.finalize().into()))
+}
+
+fn authority_tag(key: PendingGenerationLedgerKey) -> String {
+    match key.authority() {
+        AuthorityScope::Coordinator => format!("N{}_C", key.network().chain_id()),
+        AuthorityScope::Realm {
+            realm_id,
+            realm_sub_id,
+        } => format!(
+            "N{}_R{}_{}",
+            key.network().chain_id(),
+            realm_id,
+            realm_sub_id
+        ),
+    }
+}
+
+fn encode_generation_key(hasher: &mut Sha256, key: PendingGenerationLedgerKey) {
+    hasher.update(key.network().chain_id().to_be_bytes());
+    match key.authority() {
+        AuthorityScope::Coordinator => {
+            hasher.update([1]);
+            hasher.update(0_u32.to_be_bytes());
+            hasher.update(0_u16.to_be_bytes());
+        }
+        AuthorityScope::Realm {
+            realm_id,
+            realm_sub_id,
+        } => {
+            hasher.update([2]);
+            hasher.update(realm_id.to_be_bytes());
+            hasher.update(realm_sub_id.to_be_bytes());
+        }
+    }
 }
 
 fn hash_component(hasher: &mut Sha256, value: &[u8]) {
@@ -494,6 +549,13 @@ mod tests {
 
     use super::*;
 
+    fn coordinator_key() -> PendingGenerationLedgerKey {
+        PendingGenerationLedgerKey::new(
+            psy_data::protocol::canonical_chain::NetworkId::try_from_chain_id(1337).unwrap(),
+            AuthorityScope::Coordinator,
+        )
+    }
+
     fn retention() -> RecoverableNatsRetentionContract {
         RecoverableNatsRetentionContract::try_new(
             3,
@@ -508,6 +570,7 @@ mod tests {
     fn segment(id: u64) -> RecoverableNatsStreamSegment {
         RecoverableNatsStreamSegment::try_new(
             "psy.mainnet",
+            coordinator_key(),
             RecoverableNatsSegmentId::try_new(id).unwrap(),
             retention(),
         )
@@ -524,7 +587,7 @@ mod tests {
         assert!(first.stream_name().ends_with("_SG7"));
         assert_eq!(
             first.subject_prefix(),
-            "PSY_BEQ_V2.7073792e6d61696e6e6574.SG7"
+            "PSY_BEQ_V2.7073792e6d61696e6e6574.N1337_C.SG7"
         );
         assert_ne!(first.stream_name(), next.stream_name());
         assert_ne!(first.subject_prefix(), next.subject_prefix());
@@ -538,18 +601,20 @@ mod tests {
             .unwrap();
         assert_eq!(
             exact,
-            "PSY_BEQ_V2.7073792e6d61696e6e6574.SG7.coord.r0.rs0.p100.topic1.g0"
+            "PSY_BEQ_V2.7073792e6d61696e6e6574.N1337_C.SG7.coord.r0.rs0.p100.topic1.g0"
         );
         assert!(!exact.starts_with("psy.mainnet."));
 
         let dot = RecoverableNatsStreamSegment::try_new(
             "a.b",
+            coordinator_key(),
             RecoverableNatsSegmentId::try_new(1).unwrap(),
             retention(),
         )
         .unwrap();
         let underscore = RecoverableNatsStreamSegment::try_new(
             "a_b",
+            coordinator_key(),
             RecoverableNatsSegmentId::try_new(1).unwrap(),
             retention(),
         )
@@ -559,12 +624,38 @@ mod tests {
 
         let legacy_capture_candidate = RecoverableNatsStreamSegment::try_new(
             "a_beq_v2",
+            coordinator_key(),
             RecoverableNatsSegmentId::try_new(1).unwrap(),
             retention(),
         )
         .unwrap();
         assert!(!dot.subject_prefix().starts_with("a_beq_v2."));
         assert_ne!(dot.subject_prefix(), legacy_capture_candidate.subject_prefix());
+    }
+
+    #[test]
+    fn physical_segment_identity_is_scoped_by_network_and_authority() {
+        let coordinator = segment(7);
+        let realm_key = PendingGenerationLedgerKey::new(
+            psy_data::protocol::canonical_chain::NetworkId::try_from_chain_id(1337).unwrap(),
+            AuthorityScope::Realm {
+                realm_id: 3,
+                realm_sub_id: 2,
+            },
+        );
+        let realm = RecoverableNatsStreamSegment::try_new(
+            "psy.mainnet",
+            realm_key,
+            RecoverableNatsSegmentId::try_new(7).unwrap(),
+            retention(),
+        )
+        .unwrap();
+
+        assert_ne!(coordinator.stream_name(), realm.stream_name());
+        assert_ne!(coordinator.subject_prefix(), realm.subject_prefix());
+        assert_ne!(coordinator.digest(), realm.digest());
+        assert!(realm.stream_name().contains("_N1337_R3_2_"));
+        assert!(realm.subject_prefix().contains(".N1337_R3_2."));
     }
 
     #[test]
@@ -643,7 +734,7 @@ mod tests {
         assert_eq!(config.name, segment.stream_name());
         assert_eq!(
             config.subjects,
-            vec!["PSY_BEQ_V2.7073792e6d61696e6e6574.SG7.>"]
+            vec!["PSY_BEQ_V2.7073792e6d61696e6e6574.N1337_C.SG7.>"]
         );
         assert_eq!(config.retention, RetentionPolicy::Limits);
         assert_eq!(config.storage, StorageType::File);
@@ -725,6 +816,7 @@ mod tests {
         ] {
             assert!(RecoverableNatsStreamSegment::try_new(
                 invalid,
+                coordinator_key(),
                 RecoverableNatsSegmentId::try_new(1).unwrap(),
                 retention(),
             )
@@ -744,10 +836,11 @@ mod tests {
         // contract migration, never a silent durable-identity change.
         assert_eq!(
             hex::encode(baseline.digest().as_bytes()),
-            "434bdc41463a610570b0ed70f78b9ea66fb352f18b816755eeb560acf7d9517f"
+            "397bddf98ba65071d79877190ebf67a3bfac8a966fee504afb712b55c1de722e"
         );
         let changed_capacity = RecoverableNatsStreamSegment::try_new(
             "psy.mainnet",
+            coordinator_key(),
             RecoverableNatsSegmentId::try_new(7).unwrap(),
             RecoverableNatsRetentionContract::try_new(
                 3,
@@ -761,6 +854,7 @@ mod tests {
         .unwrap();
         let changed_reserve = RecoverableNatsStreamSegment::try_new(
             "psy.mainnet",
+            coordinator_key(),
             RecoverableNatsSegmentId::try_new(7).unwrap(),
             RecoverableNatsRetentionContract::try_new(
                 3,
@@ -776,6 +870,7 @@ mod tests {
         assert_ne!(baseline.digest(), changed_reserve.digest());
         let changed_consumers = RecoverableNatsStreamSegment::try_new(
             "psy.mainnet",
+            coordinator_key(),
             RecoverableNatsSegmentId::try_new(7).unwrap(),
             RecoverableNatsRetentionContract::try_new(
                 3,
@@ -808,6 +903,7 @@ mod tests {
 
         let typed = RecoverableNatsStreamSegment::try_new(
             format!("psy_c2b0_typed_{nonce}"),
+            coordinator_key(),
             RecoverableNatsSegmentId::try_new(1).unwrap(),
             RecoverableNatsRetentionContract::try_new(
                 3,

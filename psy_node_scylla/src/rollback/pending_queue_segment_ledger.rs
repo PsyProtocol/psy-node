@@ -429,7 +429,10 @@ impl ScyllaPendingQueueSegmentLedgerStore {
         Ok(PendingQueueSegmentAssignmentReceipt {
             store_fingerprint: self.fingerprint,
             ledger_slot: current.key().slot(),
-            ledger_revision: current.revision(),
+            // The receipt identifies the immutable assignment event, not the
+            // mutable whole-ledger head. Later reservations must not change
+            // the receipt used by capture, semantic terminal, or archive.
+            ledger_revision: exact.assigned_at_ledger_revision(),
             assignment,
         })
     }
@@ -639,6 +642,7 @@ mod tests {
         .unwrap();
         let segment = RecoverableNatsStreamSegment::try_new(
             "psy.mainnet",
+            key,
             RecoverableNatsSegmentId::try_new(1).unwrap(),
             retention,
         )

@@ -32,7 +32,7 @@ use crate::recoverable_publish::{
     PendingQueueSourceQuota,
 };
 
-pub const PENDING_QUEUE_SEGMENT_LEDGER_CODEC_VERSION: u16 = 2;
+pub const PENDING_QUEUE_SEGMENT_LEDGER_CODEC_VERSION: u16 = 3;
 pub const MAX_PENDING_QUEUE_SEGMENT_LEDGER_BYTES: usize = 1024 * 1024;
 pub const MAX_GENERATIONS_PER_LIVE_SEGMENT: u32 = 4096;
 const LEDGER_SLOT_DOMAIN: &[u8] = b"psy/rollback/pending-queue-segment-ledger-slot/v1";
@@ -177,6 +177,7 @@ impl PendingQueueLiveSegment {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingQueueGenerationSegmentAssignment {
     context: PendingQueueCaptureContext,
+    assigned_at_ledger_revision: PendingQueueSegmentLedgerRevision,
     segment_id: RecoverableNatsSegmentId,
     contract_digest: RecoverableNatsSegmentContractDigest,
     reserved_bytes: i64,
@@ -189,6 +190,10 @@ pub struct PendingQueueGenerationSegmentAssignment {
 impl PendingQueueGenerationSegmentAssignment {
     pub const fn context(&self) -> PendingQueueCaptureContext {
         self.context
+    }
+
+    pub const fn assigned_at_ledger_revision(&self) -> PendingQueueSegmentLedgerRevision {
+        self.assigned_at_ledger_revision
     }
 
     pub const fn segment_id(&self) -> RecoverableNatsSegmentId {
@@ -325,8 +330,10 @@ impl StoredPendingQueueSegmentLedger {
         }
         let expected_source_count = expected_source_count(self.key.generation_key.authority());
         let source_quotas = self.generation_budget.sources().to_vec();
+        let assigned_at_ledger_revision = self.revision.next()?;
         let assignment = PendingQueueGenerationSegmentAssignment {
             context,
+            assigned_at_ledger_revision,
             segment_id: active.segment_id,
             contract_digest: active.contract_digest,
             reserved_bytes: self.generation_admission_budget_bytes,
@@ -336,6 +343,7 @@ impl StoredPendingQueueSegmentLedger {
             digest: assignment_digest(
                 self.key.slot,
                 context,
+                assigned_at_ledger_revision,
                 active.segment_id,
                 active.contract_digest,
                 self.generation_admission_budget_bytes,
@@ -345,7 +353,7 @@ impl StoredPendingQueueSegmentLedger {
             )?,
         };
         let mut candidate = self.clone();
-        candidate.revision = self.revision.next()?;
+        candidate.revision = assigned_at_ledger_revision;
         candidate.live_segments[active_index].reserved_bytes = reserved_bytes;
         candidate.live_segments[active_index].generation_count = active
             .generation_count
@@ -387,6 +395,7 @@ impl StoredPendingQueueSegmentLedger {
         out.extend_from_slice(&(self.assignments.len() as u32).to_be_bytes());
         for assignment in &self.assignments {
             encode_context(assignment.context, &mut out);
+            out.extend_from_slice(&assignment.assigned_at_ledger_revision.get().to_be_bytes());
             out.extend_from_slice(&assignment.segment_id.get().to_be_bytes());
             out.extend_from_slice(assignment.contract_digest.as_bytes());
             out.extend_from_slice(&assignment.reserved_bytes.to_be_bytes());
@@ -461,6 +470,8 @@ impl StoredPendingQueueSegmentLedger {
         let mut assignments = Vec::with_capacity(assignment_count);
         for _ in 0..assignment_count {
             let context = decode_context(&mut decoder)?;
+            let assigned_at_ledger_revision =
+                PendingQueueSegmentLedgerRevision::try_new(decoder.u64()?)?;
             let segment_id = RecoverableNatsSegmentId::try_new(decoder.u64()?)?;
             let contract_digest = RecoverableNatsSegmentContractDigest::try_new(
                 decoder.array32()?,
@@ -481,6 +492,7 @@ impl StoredPendingQueueSegmentLedger {
             }
             assignments.push(PendingQueueGenerationSegmentAssignment {
                 context,
+                assigned_at_ledger_revision,
                 segment_id,
                 contract_digest,
                 reserved_bytes,
@@ -557,6 +569,7 @@ impl StoredPendingQueueSegmentLedger {
         let mut summed_reserved = 0_i64;
         for assignment in &self.assignments {
             if assignment.context.key() != self.key.generation_key
+                || assignment.assigned_at_ledger_revision.get() > self.revision.get()
                 || assignment.segment_id != active.segment_id
                 || assignment.contract_digest != active.contract_digest
                 || assignment.reserved_bytes != self.generation_admission_budget_bytes
@@ -568,6 +581,7 @@ impl StoredPendingQueueSegmentLedger {
                     != assignment_digest(
                         self.key.slot,
                         assignment.context,
+                        assignment.assigned_at_ledger_revision,
                         assignment.segment_id,
                         assignment.contract_digest,
                         assignment.reserved_bytes,
@@ -585,6 +599,8 @@ impl StoredPendingQueueSegmentLedger {
         for pair in self.assignments.windows(2) {
             if pair[0].context.processing().pending_id().get()
                 >= pair[1].context.processing().pending_id().get()
+                || pair[0].assigned_at_ledger_revision.get()
+                    >= pair[1].assigned_at_ledger_revision.get()
             {
                 return Err(PendingQueueSegmentLedgerError::NonMonotonicGeneration);
             }
@@ -620,6 +636,9 @@ impl PendingQueueSegmentLedgerBootstrap {
         max_generations_per_segment: u32,
     ) -> Result<Self, PendingQueueSegmentLedgerError> {
         let segment = validated_segment.segment();
+        if segment.generation_key() != generation_key {
+            return Err(PendingQueueSegmentLedgerError::GenerationKeyMismatch);
+        }
         let key = PendingQueueSegmentLedgerKey::try_new(
             generation_key,
             segment.base_namespace(),
@@ -700,6 +719,7 @@ impl PendingQueueSegmentReservationPlan {
 fn assignment_digest(
     ledger_slot: PendingQueueSegmentLedgerSlot,
     context: PendingQueueCaptureContext,
+    assigned_at_ledger_revision: PendingQueueSegmentLedgerRevision,
     segment_id: RecoverableNatsSegmentId,
     contract_digest: RecoverableNatsSegmentContractDigest,
     reserved_bytes: i64,
@@ -711,6 +731,7 @@ fn assignment_digest(
     hasher.update(ASSIGNMENT_DOMAIN);
     hasher.update(ledger_slot.as_bytes());
     hasher.update(context.digest().as_bytes());
+    hasher.update(assigned_at_ledger_revision.get().to_be_bytes());
     hasher.update(segment_id.get().to_be_bytes());
     hasher.update(contract_digest.as_bytes());
     hasher.update(reserved_bytes.to_be_bytes());
@@ -1041,6 +1062,7 @@ mod tests {
         .unwrap();
         let segment = RecoverableNatsStreamSegment::try_new(
             "psy.mainnet",
+            key(authority),
             RecoverableNatsSegmentId::try_new(1).unwrap(),
             retention,
         )
@@ -1154,6 +1176,84 @@ mod tests {
     }
 
     #[test]
+    fn assignment_revision_is_immutable_after_later_reservations() {
+        let initial = bootstrap(AuthorityScope::Coordinator).candidate().clone();
+        let first_context = context(AuthorityScope::Coordinator, 1);
+        let PendingQueueSegmentReservationPlan::Advance {
+            candidate: after_first,
+            assignment: first,
+            ..
+        } = initial.reserve_generation(first_context).unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(first.assigned_at_ledger_revision(), after_first.revision());
+
+        let PendingQueueSegmentReservationPlan::Advance {
+            candidate: after_second,
+            ..
+        } = after_first
+            .reserve_generation(context(AuthorityScope::Coordinator, 2))
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        assert!(after_second.revision().get() > first.assigned_at_ledger_revision().get());
+        let PendingQueueSegmentReservationPlan::Idempotent(observed_first) =
+            after_second.reserve_generation(first_context).unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(observed_first, first);
+        assert_eq!(
+            observed_first.assigned_at_ledger_revision(),
+            first.assigned_at_ledger_revision()
+        );
+    }
+
+    #[test]
+    fn bootstrap_rejects_segment_from_another_authority() {
+        let coordinator = RecoverableNatsStreamSegment::try_new(
+            "psy.mainnet",
+            key(AuthorityScope::Coordinator),
+            RecoverableNatsSegmentId::try_new(1).unwrap(),
+            RecoverableNatsRetentionContract::try_new(
+                3,
+                1024 * 1024 * 1024,
+                128 * 1024 * 1024,
+                3,
+                16,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let validated = coordinator
+            .validate_stream_config_structure(&coordinator.stream_config())
+            .unwrap();
+        let realm = AuthorityScope::Realm {
+            realm_id: 7,
+            realm_sub_id: 2,
+        };
+        let mib = 1024 * 1024_u64;
+        let budget = PendingQueueGenerationBudgetContract::try_new(
+            realm,
+            vec![PendingQueueSourceQuota::try_new(
+                PendingQueuePublisherKind::RealmUserUpdate,
+                50_000,
+                127 * mib,
+                mib,
+            )
+            .unwrap()],
+            128 * mib,
+        )
+        .unwrap();
+        assert_eq!(
+            PendingQueueSegmentLedgerBootstrap::try_new(key(realm), &validated, budget, 64),
+            Err(PendingQueueSegmentLedgerError::GenerationKeyMismatch)
+        );
+    }
+
+    #[test]
     fn codec_round_trip_and_tamper_fail_closed() {
         let initial = bootstrap(AuthorityScope::Coordinator).candidate().clone();
         let PendingQueueSegmentReservationPlan::Advance { candidate, .. } =
@@ -1168,9 +1268,9 @@ mod tests {
         assert_eq!(
             payload_digest,
             [
-                172, 88, 59, 120, 80, 224, 7, 169, 5, 109, 69, 130, 66, 239,
-                251, 113, 242, 133, 219, 94, 102, 188, 153, 45, 36, 78, 183,
-                80, 139, 167, 36, 181,
+                12, 104, 171, 154, 245, 50, 40, 41, 70, 62, 107, 45, 68, 238,
+                90, 128, 90, 177, 74, 147, 86, 204, 187, 86, 200, 18, 43, 207,
+                53, 227, 162, 159,
             ],
         );
         let decoded = StoredPendingQueueSegmentLedger::decode_persisted(
@@ -1189,6 +1289,16 @@ mod tests {
                 &trailing,
             ),
             Err(PendingQueueSegmentLedgerError::TrailingBytes)
+        );
+        let mut legacy_v2 = bytes.clone();
+        legacy_v2[8..10].copy_from_slice(&2_u16.to_be_bytes());
+        assert_eq!(
+            StoredPendingQueueSegmentLedger::decode_persisted(
+                candidate.key().slot(),
+                candidate.revision().as_i64(),
+                &legacy_v2,
+            ),
+            Err(PendingQueueSegmentLedgerError::UnknownCodecVersion(2))
         );
         assert!(StoredPendingQueueSegmentLedger::decode_persisted(
             candidate.key().slot(),
@@ -1250,6 +1360,7 @@ mod tests {
         .unwrap();
         let segment = RecoverableNatsStreamSegment::try_new(
             "psy.mainnet",
+            key(AuthorityScope::Coordinator),
             RecoverableNatsSegmentId::try_new(1).unwrap(),
             retention,
         )

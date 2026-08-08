@@ -997,8 +997,13 @@ mod tests {
     }
 
     fn envelope() -> (RecoverableNatsStreamSegment, PendingQueuePublishEnvelope) {
+        let key = PendingGenerationLedgerKey::new(
+            NetworkId::try_from_chain_id(1337).unwrap(),
+            AuthorityScope::Coordinator,
+        );
         let segment = RecoverableNatsStreamSegment::try_new(
             "psy",
+            key,
             RecoverableNatsSegmentId::try_new(1).unwrap(),
             RecoverableNatsRetentionContract::try_new(
                 3,
@@ -1143,6 +1148,7 @@ mod tests {
 
         let other = RecoverableNatsStreamSegment::try_new(
             segment.base_namespace(),
+            segment.generation_key(),
             RecoverableNatsSegmentId::try_new(2).unwrap(),
             segment.retention(),
         )
@@ -1205,6 +1211,10 @@ mod tests {
         let retention = envelope().0.retention();
         let segment = RecoverableNatsStreamSegment::try_new(
             base.clone(),
+            PendingGenerationLedgerKey::new(
+                NetworkId::try_from_chain_id(1337).unwrap(),
+                AuthorityScope::Coordinator,
+            ),
             RecoverableNatsSegmentId::try_new(nonce.max(1)).unwrap(),
             retention,
         )

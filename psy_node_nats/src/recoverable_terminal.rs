@@ -759,6 +759,7 @@ mod tests {
         .unwrap();
         let segment = RecoverableNatsStreamSegment::try_new(
             "psy",
+            key,
             RecoverableNatsSegmentId::try_new(1).unwrap(),
             RecoverableNatsRetentionContract::try_new(
                 3,
