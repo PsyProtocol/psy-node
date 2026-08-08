@@ -51,6 +51,8 @@ pub const PENDING_QUEUE_PUBLISH_SOURCE_TABLE: &str =
     "branch_exact_pending_queue_publish_source_v1";
 pub const PENDING_QUEUE_PUBLISH_INTENT_TABLE: &str =
     "branch_exact_pending_queue_publish_intent_v1";
+pub const PENDING_QUEUE_PUBLISH_PREPARED_TABLE: &str =
+    "branch_exact_pending_queue_publish_prepared_v1";
 pub const PENDING_QUEUE_PUBLISH_FRAGMENT_TABLE: &str =
     "branch_exact_pending_queue_publish_payload_fragment_v1";
 const STORE_FINGERPRINT_DOMAIN: &[u8] =
@@ -113,6 +115,9 @@ pub enum PendingQueuePublishQueryId {
     PutFragment = 10,
     ReadFragment = 11,
     ReadFragmentBucket = 12,
+    CreatePrepared = 13,
+    ReadPrepared = 14,
+    BootstrapPrepared = 15,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -136,6 +141,13 @@ const HEADER_CAS: &[&str] = &[
     "slot:BLOB",
     "expected_revision:BIGINT",
     "expected_payload:BLOB",
+];
+const PREPARED_READ: &[&str] = &["source_slot:BLOB", "intent_slot:BLOB"];
+const PREPARED_BOOTSTRAP: &[&str] = &[
+    "source_slot:BLOB",
+    "intent_slot:BLOB",
+    "revision:BIGINT",
+    "payload:BLOB",
 ];
 const FRAGMENT_PUT: &[&str] = &[
     "intent_slot:BLOB",
@@ -161,13 +173,14 @@ const FRAGMENT_BUCKET_READ: &[&str] = &[
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingQueuePublishQueries {
-    queries: [PendingQueuePublishQuery; 12],
+    queries: [PendingQueuePublishQuery; 15],
 }
 
 impl PendingQueuePublishQueries {
     pub fn new(keyspaces: &PendingQueuePublishKeyspaces) -> Self {
         let source = format!("{}.{}", keyspaces.control().as_str(), PENDING_QUEUE_PUBLISH_SOURCE_TABLE);
         let intent = format!("{}.{}", keyspaces.control().as_str(), PENDING_QUEUE_PUBLISH_INTENT_TABLE);
+        let prepared = format!("{}.{}", keyspaces.control().as_str(), PENDING_QUEUE_PUBLISH_PREPARED_TABLE);
         let fragment = format!("{}.{}", keyspaces.data().as_str(), PENDING_QUEUE_PUBLISH_FRAGMENT_TABLE);
         Self { queries: [
             query(PendingQueuePublishQueryId::CreateSource, format!("CREATE TABLE IF NOT EXISTS {source} (source_slot blob PRIMARY KEY, revision bigint, source_payload blob)"), &[]),
@@ -182,6 +195,9 @@ impl PendingQueuePublishQueries {
             query(PendingQueuePublishQueryId::PutFragment, format!("INSERT INTO {fragment} (intent_slot, payload_digest, fragment_bucket, fragment_index, fragment_count, payload_bytes, payload, fragment_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"), FRAGMENT_PUT),
             query(PendingQueuePublishQueryId::ReadFragment, format!("SELECT payload_digest, fragment_bucket, fragment_index, fragment_count, payload_bytes, payload, fragment_digest FROM {fragment} WHERE intent_slot = ? AND payload_digest = ? AND fragment_bucket = ? AND fragment_index = ?"), FRAGMENT_READ),
             query(PendingQueuePublishQueryId::ReadFragmentBucket, format!("SELECT fragment_index, fragment_digest FROM {fragment} WHERE intent_slot = ? AND payload_digest = ? AND fragment_bucket = ?"), FRAGMENT_BUCKET_READ),
+            query(PendingQueuePublishQueryId::CreatePrepared, format!("CREATE TABLE IF NOT EXISTS {prepared} (source_slot blob, intent_slot blob, revision bigint, prepared_payload blob, PRIMARY KEY ((source_slot), intent_slot)) WITH CLUSTERING ORDER BY (intent_slot ASC)"), &[]),
+            query(PendingQueuePublishQueryId::ReadPrepared, format!("SELECT revision, prepared_payload FROM {prepared} WHERE source_slot = ? AND intent_slot = ?"), PREPARED_READ),
+            query(PendingQueuePublishQueryId::BootstrapPrepared, format!("INSERT INTO {prepared} (source_slot, intent_slot, revision, prepared_payload) VALUES (?, ?, ?, ?) IF NOT EXISTS"), PREPARED_BOOTSTRAP),
         ] }
     }
 
@@ -189,7 +205,7 @@ impl PendingQueuePublishQueries {
         &self.queries[id as usize - 1]
     }
 
-    pub fn all(&self) -> &[PendingQueuePublishQuery; 12] { &self.queries }
+    pub fn all(&self) -> &[PendingQueuePublishQuery; 15] { &self.queries }
 
     pub fn render_golden(&self) -> String {
         self.queries.iter().map(|q| format!("{:?}|{}\n{}\n", q.id, q.bind_shape.join(","), q.cql)).collect()
@@ -216,6 +232,22 @@ struct HeaderCasBinding {
     slot: Vec<u8>,
     expected_revision: i64,
     expected_payload: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, scylla::SerializeRow)]
+#[scylla(flavor = "enforce_order", skip_name_checks)]
+struct PreparedReadBinding {
+    source_slot: Vec<u8>,
+    intent_slot: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, scylla::SerializeRow)]
+#[scylla(flavor = "enforce_order", skip_name_checks)]
+struct PreparedBootstrapBinding {
+    source_slot: Vec<u8>,
+    intent_slot: Vec<u8>,
+    revision: i64,
+    payload: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, scylla::SerializeRow)]
@@ -256,6 +288,10 @@ struct HeaderDbRow { revision: i64, source_payload: Vec<u8> }
 #[derive(scylla::DeserializeRow)]
 #[scylla(flavor = "enforce_order", skip_name_checks)]
 struct IntentHeaderDbRow { revision: i64, intent_payload: Vec<u8> }
+
+#[derive(scylla::DeserializeRow)]
+#[scylla(flavor = "enforce_order", skip_name_checks)]
+struct PreparedDbRow { revision: i64, prepared_payload: Vec<u8> }
 
 #[derive(scylla::DeserializeRow)]
 #[scylla(flavor = "enforce_order", skip_name_checks)]
@@ -330,6 +366,7 @@ pub struct ScyllaPendingQueuePublishStore {
     fingerprint: PendingQueuePublishStoreFingerprint,
     read_source: PreparedStatement, bootstrap_source: PreparedStatement, cas_source: PreparedStatement,
     read_intent: PreparedStatement, bootstrap_intent: PreparedStatement, cas_intent: PreparedStatement,
+    read_prepared: PreparedStatement, bootstrap_prepared: PreparedStatement,
     put_fragment: PreparedStatement, read_fragment: PreparedStatement, read_fragment_bucket: PreparedStatement,
 }
 
@@ -343,6 +380,7 @@ impl ScyllaPendingQueuePublishStore {
             PendingQueuePublishQueryId::CreateSource,
             PendingQueuePublishQueryId::CreateIntent,
             PendingQueuePublishQueryId::CreateFragment,
+            PendingQueuePublishQueryId::CreatePrepared,
         ] {
             session.query_unpaged(queries.get(id).cql(), &[]).await.map_err(cql)?;
         }
@@ -365,6 +403,8 @@ impl ScyllaPendingQueuePublishStore {
             read_intent: prepare_regular(&session, queries.get(PendingQueuePublishQueryId::ReadIntent).cql()).await?,
             bootstrap_intent: prepare_lwt(&session, queries.get(PendingQueuePublishQueryId::BootstrapIntent).cql()).await?,
             cas_intent: prepare_lwt(&session, queries.get(PendingQueuePublishQueryId::CasIntent).cql()).await?,
+            read_prepared: prepare_regular(&session, queries.get(PendingQueuePublishQueryId::ReadPrepared).cql()).await?,
+            bootstrap_prepared: prepare_lwt(&session, queries.get(PendingQueuePublishQueryId::BootstrapPrepared).cql()).await?,
             put_fragment: prepare_regular(&session, queries.get(PendingQueuePublishQueryId::PutFragment).cql()).await?,
             read_fragment: prepare_regular(&session, queries.get(PendingQueuePublishQueryId::ReadFragment).cql()).await?,
             read_fragment_bucket: prepare_regular(&session, queries.get(PendingQueuePublishQueryId::ReadFragmentBucket).cql()).await?,
@@ -411,16 +451,7 @@ impl ScyllaPendingQueuePublishStore {
             self.persist_and_readback_fragment(candidate.slot(), fragment).await?;
         }
         self.require_exact_fragment_set(&candidate).await?;
-        let binding = HeaderBootstrapBinding {
-            slot: candidate.slot().as_bytes().to_vec(),
-            revision: candidate.revision().as_i64(),
-            payload: candidate.to_persisted_bytes(),
-        };
-        let execution = self.session.execute_unpaged(&self.bootstrap_intent, binding).await;
-        let current = self.finish_intent_write(execution, &candidate).await?;
-        if current != candidate {
-            return Err(PendingQueuePublishStoreError::IntentConflict);
-        }
+        self.persist_and_readback_prepared(&candidate).await?;
         Ok(candidate.slot())
     }
 
@@ -433,14 +464,7 @@ impl ScyllaPendingQueuePublishStore {
         let source = self.require_source(assignment_receipt, publisher_kind).await?;
         let candidate = StoredPendingQueuePublishIntent::materialize_seal(&source, intent_id)
             .map_err(model_outbox)?;
-        let binding = HeaderBootstrapBinding {
-            slot: candidate.slot().as_bytes().to_vec(),
-            revision: candidate.revision().as_i64(),
-            payload: candidate.to_persisted_bytes(),
-        };
-        let execution = self.session.execute_unpaged(&self.bootstrap_intent, binding).await;
-        let current = self.finish_intent_write(execution, &candidate).await?;
-        if current != candidate { return Err(PendingQueuePublishStoreError::IntentConflict); }
+        self.persist_and_readback_prepared(&candidate).await?;
         Ok(candidate.slot())
     }
 
@@ -452,17 +476,27 @@ impl ScyllaPendingQueuePublishStore {
     ) -> Result<DurablyBoundPendingQueuePublish, PendingQueuePublishStoreError> {
         let assignment = assignment_receipt.assignment();
         self.validate_assignment(assignment)?;
-        let mut intent = self.read_intent(intent_slot).await?
-            .ok_or(PendingQueuePublishStoreError::IntentUninitialized)?;
-        if intent.publisher_kind() != publisher_kind || intent.assignment_digest() != assignment.digest() {
-            return Err(PendingQueuePublishStoreError::AssignmentMismatch);
-        }
-        let payload = self.load_payload(&intent).await?;
         let route = RecoverableNatsSourceRoute::try_new(
             assignment.context(), publisher_kind, &self.segment,
         ).map_err(model_envelope)?;
-        let mut source = self.read_source(intent.source_slot()).await?
+        let expected_source = PendingQueuePublishSourceState::bootstrap(&route, assignment)
+            .map_err(model_envelope)?;
+        let source_slot = expected_source.slot().map_err(model_envelope)?;
+        let mut source = self.read_source(source_slot).await?
             .ok_or(PendingQueuePublishStoreError::SourceUninitialized)?;
+        let persisted_intent = self.read_intent(intent_slot).await?;
+        let mut intent = match persisted_intent {
+            Some(current) => current,
+            None => self.read_prepared(source_slot, intent_slot).await?
+                .ok_or(PendingQueuePublishStoreError::IntentUninitialized)?,
+        };
+        if intent.publisher_kind() != publisher_kind
+            || intent.assignment_digest() != assignment.digest()
+            || intent.source_slot() != source_slot
+        {
+            return Err(PendingQueuePublishStoreError::AssignmentMismatch);
+        }
+        let payload = self.load_payload(&intent).await?;
         let envelope = self.build_envelope(&route, assignment, &source, &intent, payload.clone())?;
         if matches!(intent.phase(), PendingQueuePublishIntentPhase::Materialized) {
             let source_plan = source.select(&envelope).map_err(model_envelope)?;
@@ -478,9 +512,9 @@ impl ScyllaPendingQueuePublishStore {
         }
         if matches!(intent.phase(), PendingQueuePublishIntentPhase::Materialized) {
             let intent_plan = intent.bind(&source, &envelope, &payload).map_err(model_outbox)?;
-            if let Some((expected, candidate)) = intent_plan.transition() {
-                intent = self.cas_intent_state(expected, candidate).await?;
-            }
+            let (_, candidate) = intent_plan.transition()
+                .ok_or(PendingQueuePublishStoreError::IntentPhaseMismatch)?;
+            intent = self.bootstrap_bound_intent(candidate).await?;
         }
         if intent.bound_envelope().is_none() || !self.intent_matches_envelope(&intent, &envelope) {
             return Err(PendingQueuePublishStoreError::IntentPhaseMismatch);
@@ -673,6 +707,63 @@ impl ScyllaPendingQueuePublishStore {
         row.map(|row| StoredPendingQueuePublishIntent::decode_persisted(slot, row.revision, &row.intent_payload).map_err(model_outbox)).transpose()
     }
 
+    async fn read_prepared(
+        &self,
+        source_slot: PendingQueuePublishSourceSlot,
+        intent_slot: PendingQueuePublishIntentSlot,
+    ) -> Result<Option<StoredPendingQueuePublishIntent>, PendingQueuePublishStoreError> {
+        let binding = PreparedReadBinding {
+            source_slot: source_slot.as_bytes().to_vec(),
+            intent_slot: intent_slot.as_bytes().to_vec(),
+        };
+        let row = self
+            .session
+            .execute_unpaged(&self.read_prepared, binding)
+            .await
+            .map_err(cql)?
+            .into_rows_result()
+            .map_err(cql)?
+            .maybe_first_row::<PreparedDbRow>()
+            .map_err(cql)?;
+        row.map(|row| {
+            let decoded = StoredPendingQueuePublishIntent::decode_persisted(
+                intent_slot,
+                row.revision,
+                &row.prepared_payload,
+            )
+            .map_err(model_outbox)?;
+            if decoded.source_slot() != source_slot
+                || !matches!(
+                    decoded.phase(),
+                    PendingQueuePublishIntentPhase::Materialized
+                )
+            {
+                return Err(PendingQueuePublishStoreError::PreparedDescriptorMismatch);
+            }
+            Ok(decoded)
+        })
+        .transpose()
+    }
+
+    async fn bootstrap_bound_intent(
+        &self,
+        candidate: &StoredPendingQueuePublishIntent,
+    ) -> Result<StoredPendingQueuePublishIntent, PendingQueuePublishStoreError> {
+        if !matches!(candidate.phase(), PendingQueuePublishIntentPhase::Bound(_)) {
+            return Err(PendingQueuePublishStoreError::IntentPhaseMismatch);
+        }
+        let binding = HeaderBootstrapBinding {
+            slot: candidate.slot().as_bytes().to_vec(),
+            revision: candidate.revision().as_i64(),
+            payload: candidate.to_persisted_bytes(),
+        };
+        let execution = self
+            .session
+            .execute_unpaged(&self.bootstrap_intent, binding)
+            .await;
+        self.finish_intent_write(execution, candidate).await
+    }
+
     async fn cas_source_state(&self, expected: &PendingQueuePublishSourceState, candidate: &PendingQueuePublishSourceState) -> Result<PendingQueuePublishSourceState, PendingQueuePublishStoreError> {
         if expected.slot().map_err(model_envelope)? != candidate.slot().map_err(model_envelope)?
             || candidate.revision().get() != expected.revision().get().checked_add(1).ok_or(PendingQueuePublishStoreError::RevisionOverflow)?
@@ -750,6 +841,48 @@ impl ScyllaPendingQueuePublishStore {
             Some(current) if current == *fragment => Ok(()),
             Some(_) => Err(PendingQueuePublishStoreError::FragmentMismatch),
             None => Err(PendingQueuePublishStoreError::FragmentMissing),
+        }
+    }
+
+    async fn persist_and_readback_prepared(
+        &self,
+        candidate: &StoredPendingQueuePublishIntent,
+    ) -> Result<(), PendingQueuePublishStoreError> {
+        if !matches!(candidate.phase(), PendingQueuePublishIntentPhase::Materialized) {
+            return Err(PendingQueuePublishStoreError::IntentPhaseMismatch);
+        }
+        let binding = PreparedBootstrapBinding {
+            source_slot: candidate.source_slot().as_bytes().to_vec(),
+            intent_slot: candidate.slot().as_bytes().to_vec(),
+            revision: candidate.revision().as_i64(),
+            payload: candidate.to_persisted_bytes(),
+        };
+        let execution = self
+            .session
+            .execute_unpaged(&self.bootstrap_prepared, binding)
+            .await;
+        match execution {
+            Ok(result) => {
+                let applied = decode_applied(result)?;
+                let current = self
+                    .read_prepared(candidate.source_slot(), candidate.slot())
+                    .await?
+                    .ok_or(PendingQueuePublishStoreError::MissingAfterLwt)?;
+                classify_exact(applied, candidate, current).map(|_| ())
+            }
+            Err(execute) => match self
+                .read_prepared(candidate.source_slot(), candidate.slot())
+                .await
+            {
+                Ok(Some(current)) if current == *candidate => Ok(()),
+                Ok(_) => Err(PendingQueuePublishStoreError::Indeterminate(
+                    execute.to_string(),
+                )),
+                Err(read) => Err(PendingQueuePublishStoreError::IndeterminateRead {
+                    execute: execute.to_string(),
+                    read: read.to_string(),
+                }),
+            },
         }
     }
 
@@ -913,6 +1046,7 @@ pub enum PendingQueuePublishStoreError {
     FragmentMissing,
     FragmentMismatch,
     FragmentSetMismatch,
+    PreparedDescriptorMismatch,
 }
 
 impl fmt::Display for PendingQueuePublishStoreError {
@@ -932,13 +1066,20 @@ mod tests {
             PendingQueuePublishDataKeyspace::try_new("psy_data").unwrap(),
         );
         let queries = PendingQueuePublishQueries::new(&keyspaces);
-        assert_eq!(queries.all().len(), 12);
+        assert_eq!(queries.all().len(), 15);
         let golden = queries.render_golden();
         assert!(golden.contains("psy_control_nt.branch_exact_pending_queue_publish_source_v1"));
         assert!(golden.contains("psy_control_nt.branch_exact_pending_queue_publish_intent_v1"));
+        assert!(golden.contains("psy_control_nt.branch_exact_pending_queue_publish_prepared_v1"));
         assert!(golden.contains("psy_data.branch_exact_pending_queue_publish_payload_fragment_v1"));
         assert_eq!(golden.matches("VALUES (?, ?, ?) IF NOT EXISTS").count(), 2);
         assert_eq!(golden.matches("IF revision = ? AND").count(), 2);
+        assert_eq!(
+            golden
+                .matches("VALUES (?, ?, ?, ?) IF NOT EXISTS")
+                .count(),
+            1
+        );
         assert!(!golden.contains("ALLOW FILTERING"));
         assert!(!golden.contains(" TTL "));
         assert!(!golden.contains(" BATCH "));

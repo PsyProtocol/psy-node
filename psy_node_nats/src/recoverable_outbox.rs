@@ -1158,4 +1158,57 @@ mod tests {
         assert_ne!(first.source_slot(), second.source_slot());
         assert_ne!(first, second);
     }
+
+    #[test]
+    fn seal_winner_leaves_only_generation_scoped_preparation_rebindable() {
+        let (_, assignment, route, source) = fixture(7);
+        let data_intent_id = PendingQueuePublishIntentId::try_new([21; 32]).unwrap();
+        let (prepared_data, _) = StoredPendingQueuePublishIntent::materialize_data(
+            &source,
+            data_intent_id,
+            b"prepared-before-seal",
+        )
+        .unwrap();
+        let data = PendingQueuePublishEnvelope::data(
+            &route,
+            &assignment,
+            data_intent_id,
+            PendingQueueMemberOrdinal::try_new(1).unwrap(),
+            0,
+            [0; 32],
+            b"prepared-before-seal".to_vec(),
+        )
+        .unwrap();
+        let seal_intent = StoredPendingQueuePublishIntent::materialize_seal(
+            &source,
+            PendingQueuePublishIntentId::try_new([22; 32]).unwrap(),
+        )
+        .unwrap();
+        let seal = PendingQueuePublishEnvelope::seal(
+            &route,
+            &assignment,
+            seal_intent.intent_id(),
+            PendingQueueMemberOrdinal::try_new(1).unwrap(),
+            0,
+            [0; 32],
+            source.seal_summary().unwrap(),
+        )
+        .unwrap();
+        let sealing = source.select(&seal).unwrap().current().clone();
+        assert!(sealing.select(&data).is_err());
+        assert!(matches!(
+            prepared_data.phase(),
+            PendingQueuePublishIntentPhase::Materialized
+        ));
+
+        let (_, _, _, next_source) = fixture(8);
+        let (next_prepared, _) = StoredPendingQueuePublishIntent::materialize_data(
+            &next_source,
+            data_intent_id,
+            b"prepared-before-seal",
+        )
+        .unwrap();
+        assert_eq!(prepared_data.slot(), next_prepared.slot());
+        assert_ne!(prepared_data.source_slot(), next_prepared.source_slot());
+    }
 }
