@@ -286,8 +286,13 @@ impl StoredPendingQueueGenerationTerminal {
             head_payload,
             digest,
         };
+        // Revision zero is the first explicit, durable authority-local-head
+        // bootstrap and is a valid terminal dependency.  The head payload is
+        // still decoded and bound to the exact authority observation below;
+        // treating revision zero as "missing" made the first generation after
+        // genesis/floor activation persist successfully but fail every later
+        // readback.
         if terminal.pipeline_revision == 0
-            || terminal.head_revision == 0
             || terminal_digest(&terminal.encode_unsigned())? != terminal.digest
         {
             return Err(PendingQueueGenerationTerminalError::DigestMismatch);
@@ -852,6 +857,23 @@ mod tests {
                 value.archive_slot, REVISION as i64, &trailing,
             ),
             Err(PendingQueueGenerationTerminalError::TrailingBytes),
+        );
+    }
+
+    #[test]
+    fn explicit_head_bootstrap_revision_zero_is_a_valid_terminal_dependency() {
+        let mut value = fixture();
+        value.head_revision = 0;
+        value.digest = terminal_digest(&value.encode_unsigned()).unwrap();
+        let bytes = value.to_persisted_bytes();
+        assert_eq!(
+            StoredPendingQueueGenerationTerminal::decode_persisted(
+                value.archive_slot,
+                REVISION as i64,
+                &bytes,
+            )
+            .unwrap(),
+            value,
         );
     }
 

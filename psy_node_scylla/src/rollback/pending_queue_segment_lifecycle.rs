@@ -2163,6 +2163,52 @@ impl ScyllaPendingQueueSegmentLifecycleStore {
         receipt: &PersistedPendingQueueDeleteRequestedReceipt,
         segment: RecoverableNatsStreamSegment,
     ) -> Result<PersistedPendingQueueDeletedReceipt, PendingQueueSegmentLifecycleError> {
+        self.delete_requested_stream_inner(
+            nats,
+            archive_store,
+            receipt,
+            segment,
+            DeleteCompletionMode::PersistDeleted,
+        )
+        .await?
+        .ok_or(PendingQueueSegmentLifecycleError::AppliedStateMismatch)
+    }
+
+    /// Deterministic crash-window injection for the real RF=3 lifecycle Gate.
+    /// It executes the same typed pre-read, inventory check and physical
+    /// delete as production, then stops before the revision-6 CAS.  No
+    /// production caller can select this mode.
+    #[cfg(test)]
+    pub(super) async fn delete_requested_stream_then_simulate_crash(
+        &self,
+        nats: &NatsJetStreamClient,
+        archive_store: &ScyllaPendingQueueSemanticAggregateStore,
+        receipt: &PersistedPendingQueueDeleteRequestedReceipt,
+        segment: RecoverableNatsStreamSegment,
+    ) -> Result<(), PendingQueueSegmentLifecycleError> {
+        let result = self
+            .delete_requested_stream_inner(
+                nats,
+                archive_store,
+                receipt,
+                segment,
+                DeleteCompletionMode::StopAfterPhysicalDelete,
+            )
+            .await?;
+        if result.is_some() {
+            return Err(PendingQueueSegmentLifecycleError::AppliedStateMismatch);
+        }
+        Ok(())
+    }
+
+    async fn delete_requested_stream_inner(
+        &self,
+        nats: &NatsJetStreamClient,
+        archive_store: &ScyllaPendingQueueSemanticAggregateStore,
+        receipt: &PersistedPendingQueueDeleteRequestedReceipt,
+        segment: RecoverableNatsStreamSegment,
+        completion: DeleteCompletionMode,
+    ) -> Result<Option<PersistedPendingQueueDeletedReceipt>, PendingQueueSegmentLifecycleError> {
         if receipt.store_fingerprint != self.fingerprint
             || segment.segment_id() != receipt.current.segment_id
             || segment.digest() != receipt.current.contract_digest
@@ -2177,10 +2223,10 @@ impl ScyllaPendingQueueSegmentLifecycleStore {
             .ok_or(PendingQueueSegmentLifecycleError::MissingAfterLwt)?;
         let deleted_candidate = receipt.current.deleted_candidate()?;
         if durable == deleted_candidate {
-            return Ok(PersistedPendingQueueDeletedReceipt {
+            return Ok(Some(PersistedPendingQueueDeletedReceipt {
                 store_fingerprint: self.fingerprint,
                 current: durable,
-            });
+            }));
         }
         if durable != receipt.current {
             return Err(PendingQueueSegmentLifecycleError::Conflict);
@@ -2234,6 +2280,9 @@ impl ScyllaPendingQueueSegmentLifecycleStore {
         if deleted.instance_id().as_bytes() != &receipt.current.stream_instance_id {
             return Err(PendingQueueSegmentLifecycleError::AppliedStateMismatch);
         }
+        if completion == DeleteCompletionMode::StopAfterPhysicalDelete {
+            return Ok(None);
+        }
         let result = self.advance_to_deleted(&receipt.current).await?;
         if result.store_fingerprint != self.fingerprint
             || result.current != deleted_candidate
@@ -2241,8 +2290,14 @@ impl ScyllaPendingQueueSegmentLifecycleStore {
         {
             return Err(PendingQueueSegmentLifecycleError::AppliedStateMismatch);
         }
-        Ok(result)
+        Ok(Some(result))
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeleteCompletionMode {
+    PersistDeleted,
+    StopAfterPhysicalDelete,
 }
 
 async fn observe_terminals<Hash: Q256BitHash>(
