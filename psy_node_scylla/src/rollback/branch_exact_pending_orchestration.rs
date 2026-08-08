@@ -541,6 +541,43 @@ pub fn classify_branch_exact_publish_recovery<Hash: Q256BitHash>(
     }
 }
 
+/// Exact terminal pair required before a durable queue-terminal marker may be
+/// written. This deliberately requires the writer to have reached Active;
+/// the authority-local head is checked independently by the terminal store.
+pub(crate) fn validate_branch_exact_queue_terminal_pair<Hash: Q256BitHash>(
+    pipeline: &StoredPendingPipeline<Hash>,
+    writer: &StoredBranchExactWriterLifecycle<Hash>,
+) -> Result<(), BranchExactPendingOrchestrationError> {
+    match (pipeline.processing_state(), writer.state()) {
+        (
+            PendingProcessingState::Published { .. },
+            BranchExactWriterState::Active(_),
+        ) => {
+            if classify_branch_exact_publish_recovery(
+                pipeline,
+                writer,
+                *pipeline.frontier(),
+            )? != BranchExactPendingPublishRecovery::Complete
+            {
+                return Err(BranchExactPendingOrchestrationError::StartupStateMismatch);
+            }
+            Ok(())
+        }
+        (
+            PendingProcessingState::RetiredNoWork { seal, receipt },
+            BranchExactWriterState::Active(active),
+        ) => {
+            require_common_identity(pipeline, writer)?;
+            require_writer_frontier(pipeline, active)?;
+            if no_work_receipt(pipeline, seal, pipeline.frontier())? != receipt {
+                return Err(BranchExactPendingOrchestrationError::NoWorkReceiptMismatch);
+            }
+            Ok(())
+        }
+        _ => Err(BranchExactPendingOrchestrationError::StartupStateMismatch),
+    }
+}
+
 fn publish_receipt<Hash: Q256BitHash>(
     pipeline: &StoredPendingPipeline<Hash>,
     writer: &StoredBranchExactWriterLifecycle<Hash>,

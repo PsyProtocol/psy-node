@@ -37,6 +37,7 @@ mod pending_queue_publish_store;
 mod pending_queue_semantic_terminal;
 #[allow(dead_code)]
 mod pending_queue_semantic_aggregate;
+mod pending_queue_generation_terminal;
 #[allow(dead_code)]
 mod pending_queue_nats_capture;
 #[cfg(test)]

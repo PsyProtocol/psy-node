@@ -70,7 +70,7 @@ const STORE_FINGERPRINT_DOMAIN: &[u8] =
 pub(super) struct PendingQueueSemanticGenerationSlot([u8; 32]);
 
 impl PendingQueueSemanticGenerationSlot {
-    fn try_new(bytes: [u8; 32]) -> Result<Self, PendingQueueSemanticAggregateError> {
+    pub(super) fn try_new(bytes: [u8; 32]) -> Result<Self, PendingQueueSemanticAggregateError> {
         if bytes == [0; 32] {
             Err(PendingQueueSemanticAggregateError::EmptyDigest)
         } else {
@@ -85,7 +85,7 @@ impl PendingQueueSemanticGenerationSlot {
 pub(super) struct PendingQueueSemanticGenerationDigest([u8; 32]);
 
 impl PendingQueueSemanticGenerationDigest {
-    fn try_new(bytes: [u8; 32]) -> Result<Self, PendingQueueSemanticAggregateError> {
+    pub(super) fn try_new(bytes: [u8; 32]) -> Result<Self, PendingQueueSemanticAggregateError> {
         if bytes == [0; 32] {
             Err(PendingQueueSemanticAggregateError::EmptyDigest)
         } else {
@@ -100,6 +100,14 @@ impl PendingQueueSemanticGenerationDigest {
 pub(super) struct PendingQueueSemanticAggregateStoreFingerprint([u8; 32]);
 
 impl PendingQueueSemanticAggregateStoreFingerprint {
+    pub(super) fn try_new(bytes: [u8; 32]) -> Result<Self, PendingQueueSemanticAggregateError> {
+        if bytes == [0; 32] {
+            Err(PendingQueueSemanticAggregateError::EmptyDigest)
+        } else {
+            Ok(Self(bytes))
+        }
+    }
+
     pub(super) const fn as_bytes(&self) -> &[u8; 32] { &self.0 }
 }
 
@@ -726,6 +734,42 @@ pub(super) struct PersistedPendingQueueSemanticHandoffReceipt {
     pipeline_state: PendingProcessingState,
 }
 
+/// Exact archive plus terminal pipeline readback. This receipt can authorize
+/// creation of an immutable generation-terminal row, but is deliberately not
+/// itself a pipeline-rotation or segment-GC permit.
+#[derive(Debug)]
+pub(super) struct PersistedPendingQueueTerminalArchiveReceipt<Hash> {
+    aggregate_store_fingerprint: PendingQueueSemanticAggregateStoreFingerprint,
+    aggregate_slot: PendingQueueSemanticGenerationSlot,
+    aggregate_digest: PendingQueueSemanticGenerationDigest,
+    assignment_digest: PendingQueueSegmentAssignmentDigest,
+    pipeline_store_fingerprint: [u8; 32],
+    pipeline: StoredPendingPipeline<Hash>,
+}
+
+impl<Hash> PersistedPendingQueueTerminalArchiveReceipt<Hash> {
+    pub(super) const fn aggregate_store_fingerprint(
+        &self,
+    ) -> PendingQueueSemanticAggregateStoreFingerprint {
+        self.aggregate_store_fingerprint
+    }
+    pub(super) const fn aggregate_slot(&self) -> PendingQueueSemanticGenerationSlot {
+        self.aggregate_slot
+    }
+
+    pub(super) const fn aggregate_digest(&self) -> PendingQueueSemanticGenerationDigest {
+        self.aggregate_digest
+    }
+
+    pub(super) const fn assignment_digest(&self) -> PendingQueueSegmentAssignmentDigest {
+        self.assignment_digest
+    }
+
+    pub(super) const fn pipeline(&self) -> &StoredPendingPipeline<Hash> {
+        &self.pipeline
+    }
+}
+
 impl PersistedPendingQueueSemanticHandoffReceipt {
     pub(super) const fn aggregate_digest(&self) -> PendingQueueSemanticGenerationDigest {
         self.aggregate_digest
@@ -991,6 +1035,84 @@ impl ScyllaPendingQueueSemanticAggregateStore {
             pipeline_state: current.processing_state(),
         })
     }
+
+    /// Reconstruct terminal eligibility from durable rows after the first
+    /// handoff receipt has been lost. Only exact Published/RetiredNoWork
+    /// descendants are accepted, with the expected path length from the
+    /// archived Sealing revision.
+    pub(super) async fn revalidate_terminal_archive<Hash: Q256BitHash>(
+        &self,
+        pipeline_store: &ScyllaPendingPipelineStore,
+        assignment: &PendingQueueSegmentAssignmentReceipt,
+    ) -> Result<PersistedPendingQueueTerminalArchiveReceipt<Hash>, PendingQueueSemanticAggregateError> {
+        let context = assignment.assignment().context();
+        let PendingPipelineReadState::Current(current) = pipeline_store
+            .read::<Hash>(context.key())
+            .await
+            .map_err(|error| PendingQueueSemanticAggregateError::Pipeline(error.to_string()))?
+        else {
+            return Err(PendingQueueSemanticAggregateError::PipelineHandoffMismatch);
+        };
+        if current.key() != context.key()
+            || current.activation_digest() != context.activation()
+            || current.processing() != context.processing()
+            || current.blocked_reason().is_some()
+        {
+            return Err(PendingQueueSemanticAggregateError::PipelineHandoffMismatch);
+        }
+        let (slot, observed_work, revision_delta) =
+            terminal_archive_slot(current.processing_state())?;
+        let aggregate = self
+            .read(slot)
+            .await?
+            .ok_or(PendingQueueSemanticAggregateError::ReceiptStale)?;
+        let expected_revision = aggregate
+            .pipeline_close_revision
+            .checked_add(revision_delta)
+            .ok_or(PendingQueueSemanticAggregateError::CounterOverflow)?;
+        if !aggregate.matches_assignment(assignment)
+            || aggregate.slot != slot
+            || aggregate.uses_work_handoff() != observed_work
+            || aggregate.pipeline_store_fingerprint
+                != *pipeline_store.fingerprint().as_bytes()
+            || current.revision().get() != expected_revision
+        {
+            return Err(PendingQueueSemanticAggregateError::PipelineHandoffMismatch);
+        }
+        Ok(PersistedPendingQueueTerminalArchiveReceipt {
+            aggregate_store_fingerprint: self.fingerprint,
+            aggregate_slot: aggregate.slot(),
+            aggregate_digest: aggregate.digest(),
+            assignment_digest: aggregate.assignment_digest,
+            pipeline_store_fingerprint: aggregate.pipeline_store_fingerprint,
+            pipeline: current,
+        })
+    }
+
+    pub(super) async fn revalidate_terminal_archive_receipt<Hash: Q256BitHash>(
+        &self,
+        pipeline_store: &ScyllaPendingPipelineStore,
+        assignment: &PendingQueueSegmentAssignmentReceipt,
+        receipt: &PersistedPendingQueueTerminalArchiveReceipt<Hash>,
+    ) -> Result<(), PendingQueueSemanticAggregateError> {
+        if receipt.aggregate_store_fingerprint != self.fingerprint
+            || receipt.pipeline_store_fingerprint
+                != *pipeline_store.fingerprint().as_bytes()
+        {
+            return Err(PendingQueueSemanticAggregateError::ReceiptBindingMismatch);
+        }
+        let current = self
+            .revalidate_terminal_archive::<Hash>(pipeline_store, assignment)
+            .await?;
+        if current.aggregate_slot != receipt.aggregate_slot
+            || current.aggregate_digest != receipt.aggregate_digest
+            || current.assignment_digest != receipt.assignment_digest
+            || current.pipeline != receipt.pipeline
+        {
+            return Err(PendingQueueSemanticAggregateError::ReceiptStale);
+        }
+        Ok(())
+    }
 }
 
 fn terminal_handoff_slot(
@@ -1002,6 +1124,25 @@ fn terminal_handoff_slot(
         _ => return Err(PendingQueueSemanticAggregateError::PipelineHandoffMismatch),
     };
     Ok((PendingQueueSemanticGenerationSlot::try_new(bytes)?, work))
+}
+
+fn terminal_archive_slot(
+    state: PendingProcessingState,
+) -> Result<(PendingQueueSemanticGenerationSlot, bool, u64), PendingQueueSemanticAggregateError> {
+    let (bytes, work, revision_delta) = match state {
+        PendingProcessingState::Published { capture, .. } => {
+            (*capture.as_bytes(), true, 3)
+        }
+        PendingProcessingState::RetiredNoWork { seal, .. } => {
+            (*seal.as_bytes(), false, 2)
+        }
+        _ => return Err(PendingQueueSemanticAggregateError::PipelineTerminalMismatch),
+    };
+    Ok((
+        PendingQueueSemanticGenerationSlot::try_new(bytes)?,
+        work,
+        revision_delta,
+    ))
 }
 
 fn store_fingerprint(
@@ -1065,6 +1206,7 @@ pub(super) enum PendingQueueSemanticAggregateError {
     ReceiptStale,
     PipelineHandoffMismatch,
     PipelineHandoffConflict,
+    PipelineTerminalMismatch,
     AssignmentPayloadMismatch,
     CounterOverflow,
     DigestMismatch,
@@ -1112,7 +1254,10 @@ mod tests {
             PendingGenerationActivationDigest, PendingGenerationContext,
             PendingGenerationLedgerKey,
         },
-        store::pending_generation_pipeline::PendingPipelineIntentDigest,
+        store::pending_generation_pipeline::{
+            PendingNoWorkReceiptDigest, PendingPipelineIntentDigest,
+            PendingPublishReceiptDigest,
+        },
     };
     use psy_node_nats::{
         recoverable_assignment::{
@@ -1342,6 +1487,33 @@ mod tests {
                 intent: PendingPipelineIntentDigest::try_new([91; 32]).unwrap(),
             }),
             Err(PendingQueueSemanticAggregateError::PipelineHandoffMismatch)
+        );
+    }
+
+    #[test]
+    fn terminal_archive_slot_accepts_only_exact_terminal_descendants() {
+        let slot = PendingQueueSemanticGenerationSlot::try_new([71; 32]).unwrap();
+        let capture = PendingWorkCaptureDigest::try_new(*slot.as_bytes()).unwrap();
+        let seal = PendingEmptyQueueSealDigest::try_new(*slot.as_bytes()).unwrap();
+        assert_eq!(
+            terminal_archive_slot(PendingProcessingState::Published {
+                capture,
+                receipt: PendingPublishReceiptDigest::try_new([72; 32]).unwrap(),
+            })
+            .unwrap(),
+            (slot, true, 3)
+        );
+        assert_eq!(
+            terminal_archive_slot(PendingProcessingState::RetiredNoWork {
+                seal,
+                receipt: PendingNoWorkReceiptDigest::try_new([73; 32]).unwrap(),
+            })
+            .unwrap(),
+            (slot, false, 2)
+        );
+        assert_eq!(
+            terminal_archive_slot(PendingProcessingState::WorkCaptured(capture)),
+            Err(PendingQueueSemanticAggregateError::PipelineTerminalMismatch)
         );
     }
 

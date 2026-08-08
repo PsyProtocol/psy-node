@@ -1458,6 +1458,7 @@ mod tests {
         classify_branch_exact_publish_recovery, seal_branch_exact_begin,
         seal_branch_exact_no_work, seal_branch_exact_publish,
         seal_branch_exact_queue_capture, seal_branch_exact_queue_close,
+        validate_branch_exact_queue_terminal_pair,
     };
 
     fn chain(epoch: u64, height: u64, seed: u64) -> CanonicalChainRef<PHash> {
@@ -2332,6 +2333,11 @@ mod tests {
             .unwrap(),
             BranchExactPendingStartupRecovery::CompleteNoWorkAfterTrustedMarker,
         );
+        validate_branch_exact_queue_terminal_pair(
+            &no_work_101,
+            active.candidate(),
+        )
+        .unwrap();
         let corrupt_no_work = empty_101
             .seal_retire_no_work(
                 empty_digest_101,
@@ -2708,6 +2714,11 @@ mod tests {
             .unwrap(),
             BranchExactPendingPublishRecovery::Complete,
         );
+        validate_branch_exact_queue_terminal_pair(
+            publish.candidate(),
+            committed.candidate(),
+        )
+        .unwrap();
         assert!(matches!(
             classify_branch_exact_publish_recovery(
                 publish.candidate(),
