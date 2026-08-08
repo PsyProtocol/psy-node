@@ -537,6 +537,17 @@ impl RecoverableNatsStreamSegment {
     }
 
     #[cfg(test)]
+    pub(crate) fn model_live_instance(
+        &self,
+        created_unix_nanos: i128,
+        state: RecoverableNatsStreamStateSnapshot,
+    ) -> LiveRecoverableNatsStreamInstance {
+        LiveRecoverableNatsStreamInstance(
+            self.attest_instance_parts(created_unix_nanos, state),
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn model_sealed_instance(
         &self,
         created_unix_nanos: i128,

@@ -28,10 +28,12 @@ fn raw_nats_authority_has_an_exact_lexical_inventory() {
     let raw_context = concat!("jetstream", "::Context");
     let raw_send = concat!("send_", "publish(");
     let direct_publish = concat!(".jetstream", ".publish(");
+    let raw_update = concat!(".update_", "stream(");
     let mut dependency_files = BTreeSet::new();
     let mut context_files = BTreeSet::new();
     let mut send_files = BTreeSet::new();
     let mut direct_publish_files = BTreeSet::new();
+    let mut update_sites = Vec::new();
 
     for file in files {
         let relative = file.strip_prefix(workspace).unwrap();
@@ -47,7 +49,11 @@ fn raw_nats_authority_has_an_exact_lexical_inventory() {
             send_files.insert(relative.clone());
         }
         if source.contains(direct_publish) {
-            direct_publish_files.insert(relative);
+            direct_publish_files.insert(relative.clone());
+        }
+        let update_count = source.matches(raw_update).count();
+        if update_count != 0 {
+            update_sites.push((relative, update_count));
         }
     }
 
@@ -77,6 +83,14 @@ fn raw_nats_authority_has_an_exact_lexical_inventory() {
     assert_eq!(
         direct_publish_files,
         BTreeSet::from(["psy_node_nats/src/queue.rs".to_owned()])
+    );
+    assert_eq!(
+        update_sites,
+        vec![(
+            "psy_node_nats/src/recoverable_transport.rs".to_owned(),
+            1,
+        )],
+        "only the typed recoverable seal façade may update a stream",
     );
 }
 

@@ -16,7 +16,7 @@ use async_nats::{
             ReplayPolicy,
         },
         context::Publish,
-        stream::{RawMessageErrorKind, RetentionPolicy, StorageType},
+        stream::{Info as StreamInfo, RawMessageErrorKind, RetentionPolicy, StorageType},
     },
     ToServerAddrs,
 };
@@ -508,6 +508,34 @@ pub struct RecoverablePendingQueueNatsPublisher {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoverableNatsSealDisposition {
+    Applied,
+    AlreadySealed,
+    ReconciledAfterResponseLoss,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoverableNatsSealOutcome {
+    sealed: SealedRecoverableNatsStreamInstance,
+    disposition: RecoverableNatsSealDisposition,
+}
+
+impl RecoverableNatsSealOutcome {
+    pub const fn sealed(&self) -> &SealedRecoverableNatsStreamInstance {
+        &self.sealed
+    }
+
+    pub const fn disposition(&self) -> RecoverableNatsSealDisposition {
+        self.disposition
+    }
+}
+
+enum RecoverableNatsSegmentObservation {
+    Live(LiveRecoverableNatsStreamInstance),
+    Sealed(SealedRecoverableNatsStreamInstance),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RecoverableNatsPublishDisposition {
     PubAck,
     LeaderReadback,
@@ -755,6 +783,79 @@ impl RecoverablePendingQueueNatsPublisher {
 }
 
 impl NatsJetStreamClient {
+    /// Irreversibly seals one exact server-created V2 stream incarnation.
+    ///
+    /// The caller cannot supply a raw stream name or config. A higher-level
+    /// durable lifecycle must authorize this call; this façade itself proves
+    /// only that the exact live observation became the exact sealed
+    /// observation without changing retained state.
+    pub async fn seal_recoverable_segment_instance(
+        &self,
+        expected: &LiveRecoverableNatsStreamInstance,
+    ) -> Result<RecoverableNatsSealOutcome, RecoverableNatsTransportError> {
+        if self.base_namespace() != expected.segment().base_namespace() {
+            return Err(RecoverableNatsTransportError::ClientNamespaceMismatch);
+        }
+        let context = self.raw_context_for_recoverable_transport();
+        let stream = context
+            .get_stream(expected.segment().stream_name())
+            .await
+            .map_err(nats)?;
+        let before = stream.get_info().await.map_err(nats)?;
+        match classify_segment_observation(expected, &before)? {
+            RecoverableNatsSegmentObservation::Sealed(sealed) => {
+                return Ok(RecoverableNatsSealOutcome {
+                    sealed,
+                    disposition: RecoverableNatsSealDisposition::AlreadySealed,
+                });
+            }
+            RecoverableNatsSegmentObservation::Live(live) if &live == expected => {}
+            RecoverableNatsSegmentObservation::Live(_) => {
+                return Err(RecoverableNatsTransportError::SealEvidenceChanged)
+            }
+        }
+        if before.mirror.is_some() || !before.sources.is_empty() {
+            return Err(RecoverableNatsTransportError::SealContractDrift);
+        }
+
+        let update = context
+            .update_stream(expected.segment().sealed_stream_config())
+            .await;
+        let stream = context
+            .get_stream(expected.segment().stream_name())
+            .await
+            .map_err(|error| {
+                RecoverableNatsTransportError::SealIndeterminate(format!(
+                    "update={}; readback={error}",
+                    update
+                        .as_ref()
+                        .map(|_| "ok".to_owned())
+                        .unwrap_or_else(|error| error.to_string()),
+                ))
+            })?;
+        let after = stream.get_info().await.map_err(|error| {
+            RecoverableNatsTransportError::SealIndeterminate(format!(
+                "update={}; readback={error}",
+                update
+                    .as_ref()
+                    .map(|_| "ok".to_owned())
+                    .unwrap_or_else(|error| error.to_string()),
+            ))
+        })?;
+        let outcome = classify_seal_readback(
+            update.is_ok(),
+            classify_segment_observation(expected, &after)?,
+        )?;
+        if before.created != after.created
+            || before.state != after.state
+            || before.mirror != after.mirror
+            || before.sources != after.sources
+        {
+            return Err(RecoverableNatsTransportError::SealEvidenceChanged);
+        }
+        Ok(outcome)
+    }
+
     pub async fn observe_recoverable_segment_instance(
         &self,
         segment: RecoverableNatsStreamSegment,
@@ -882,6 +983,56 @@ impl NatsJetStreamClient {
     }
 }
 
+fn classify_segment_observation(
+    expected: &LiveRecoverableNatsStreamInstance,
+    info: &StreamInfo,
+) -> Result<RecoverableNatsSegmentObservation, RecoverableNatsTransportError> {
+    if let Ok(sealed) = expected.segment().attest_sealed_instance(info) {
+        require_same_segment_evidence(
+            expected,
+            sealed.instance_id(),
+            sealed.state(),
+        )?;
+        return Ok(RecoverableNatsSegmentObservation::Sealed(sealed));
+    }
+    if let Ok(live) = expected.segment().attest_live_instance(info) {
+        require_same_segment_evidence(expected, live.instance_id(), live.state())?;
+        return Ok(RecoverableNatsSegmentObservation::Live(live));
+    }
+    Err(RecoverableNatsTransportError::SealContractDrift)
+}
+
+fn classify_seal_readback(
+    update_succeeded: bool,
+    observed: RecoverableNatsSegmentObservation,
+) -> Result<RecoverableNatsSealOutcome, RecoverableNatsTransportError> {
+    let RecoverableNatsSegmentObservation::Sealed(sealed) = observed else {
+        return Err(RecoverableNatsTransportError::SealNotApplied);
+    };
+    Ok(RecoverableNatsSealOutcome {
+        sealed,
+        disposition: if update_succeeded {
+            RecoverableNatsSealDisposition::Applied
+        } else {
+            RecoverableNatsSealDisposition::ReconciledAfterResponseLoss
+        },
+    })
+}
+
+fn require_same_segment_evidence(
+    expected: &LiveRecoverableNatsStreamInstance,
+    observed_instance: crate::recoverable_segment::RecoverableNatsStreamInstanceId,
+    observed_state: crate::recoverable_segment::RecoverableNatsStreamStateSnapshot,
+) -> Result<(), RecoverableNatsTransportError> {
+    if observed_instance != expected.instance_id() {
+        return Err(RecoverableNatsTransportError::SealRecreatedInstance);
+    }
+    if observed_state != expected.state() {
+        return Err(RecoverableNatsTransportError::SealEvidenceChanged);
+    }
+    Ok(())
+}
+
 fn classify_leader_observation(
     sealed: &SealedRecoverableNatsPublish,
     observed_subject: &str,
@@ -1004,6 +1155,11 @@ pub enum RecoverableNatsTransportError {
     SourceNotSealed,
     SourceScanChanged,
     WholeStreamScanChanged,
+    SealNotApplied,
+    SealRecreatedInstance,
+    SealEvidenceChanged,
+    SealContractDrift,
+    SealIndeterminate(String),
     SourceScan(String),
     AckMismatch {
         stream: String,
@@ -1115,6 +1271,59 @@ mod tests {
     ) -> (RecoverableNatsStreamSegment, PendingQueuePublishEnvelope) {
         let (segment, _, envelope) = fixture_for_segment(segment);
         (segment, envelope)
+    }
+
+    #[test]
+    fn typed_seal_readback_is_exact_and_response_loss_safe() {
+        let segment = envelope().0;
+        let state = crate::recoverable_segment::RecoverableNatsStreamStateSnapshot::try_new(
+            1, 100, 1, 1, 0, 1,
+        )
+        .unwrap();
+        let expected = segment.model_live_instance(1_700_000_000_000_000_000, state);
+        let sealed = segment.model_sealed_instance(1_700_000_000_000_000_000, state);
+
+        let applied = classify_seal_readback(
+            true,
+            RecoverableNatsSegmentObservation::Sealed(sealed.clone()),
+        )
+        .unwrap();
+        assert_eq!(applied.disposition(), RecoverableNatsSealDisposition::Applied);
+        assert_eq!(applied.sealed(), &sealed);
+        assert_eq!(
+            classify_seal_readback(
+                false,
+                RecoverableNatsSegmentObservation::Sealed(sealed),
+            )
+            .unwrap()
+            .disposition(),
+            RecoverableNatsSealDisposition::ReconciledAfterResponseLoss,
+        );
+        assert_eq!(
+            classify_seal_readback(
+                false,
+                RecoverableNatsSegmentObservation::Live(expected.clone()),
+            ),
+            Err(RecoverableNatsTransportError::SealNotApplied),
+        );
+
+        let recreated = segment.model_live_instance(1_700_000_000_000_000_001, state);
+        assert_eq!(
+            require_same_segment_evidence(
+                &expected,
+                recreated.instance_id(),
+                recreated.state(),
+            ),
+            Err(RecoverableNatsTransportError::SealRecreatedInstance),
+        );
+        let changed = crate::recoverable_segment::RecoverableNatsStreamStateSnapshot::try_new(
+            1, 101, 1, 1, 0, 1,
+        )
+        .unwrap();
+        assert_eq!(
+            require_same_segment_evidence(&expected, expected.instance_id(), changed),
+            Err(RecoverableNatsTransportError::SealEvidenceChanged),
+        );
     }
 
     fn fixture_for_segment(
@@ -1418,14 +1627,15 @@ mod tests {
             .observe_recoverable_segment_instance(segment.clone())
             .await
             .unwrap();
-        context
-            .update_stream(segment.sealed_stream_config())
+        let seal_outcome = client
+            .seal_recoverable_segment_instance(&live_instance)
             .await
             .unwrap();
-        let sealed_instance = client
-            .observe_recoverable_sealed_segment_instance(segment.clone())
-            .await
-            .unwrap();
+        assert_eq!(
+            seal_outcome.disposition(),
+            RecoverableNatsSealDisposition::Applied
+        );
+        let sealed_instance = seal_outcome.sealed().clone();
         assert_eq!(sealed_instance.instance_id(), live_instance.instance_id());
         assert_eq!(sealed_instance.state().messages(), 2);
         let whole = client
