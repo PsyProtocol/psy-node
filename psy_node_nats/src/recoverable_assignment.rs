@@ -365,6 +365,10 @@ impl StoredPendingQueueSegmentLedger {
         self.generation_admission_budget_bytes
     }
 
+    pub const fn max_generations_per_segment(&self) -> u32 {
+        self.max_generations_per_segment
+    }
+
     pub const fn generation_budget(&self) -> &PendingQueueGenerationBudgetContract {
         &self.generation_budget
     }

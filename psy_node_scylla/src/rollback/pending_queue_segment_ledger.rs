@@ -22,6 +22,7 @@ use psy_node_nats::recoverable_assignment::{
 };
 use psy_node_nats::recoverable_segment::{
     RecoverableNatsSegmentContractDigest, RecoverableNatsSegmentId,
+    RECOVERABLE_NATS_CAPACITY_HEADROOM_BYTES,
 };
 use scylla::{
     client::session::Session,
@@ -658,6 +659,20 @@ fn build_segment_closure(
         .iter()
         .find(|segment| segment.segment_id() == segment_id)
         .ok_or(PendingQueueSegmentLedgerStoreError::SegmentMissing)?;
+    if current.active_segment_id() == segment_id {
+        let next_reserved = segment
+            .reserved_bytes()
+            .checked_add(current.generation_admission_budget_bytes())
+            .ok_or(PendingQueueSegmentLedgerStoreError::ClosureBindingMismatch)?;
+        let next_required = next_reserved
+            .checked_add(RECOVERABLE_NATS_CAPACITY_HEADROOM_BYTES)
+            .ok_or(PendingQueueSegmentLedgerStoreError::ClosureBindingMismatch)?;
+        if segment.generation_count() < current.max_generations_per_segment()
+            && next_required <= segment.max_stream_bytes()
+        {
+            return Err(PendingQueueSegmentLedgerStoreError::SegmentStillAdmitting);
+        }
+    }
     let assignments = current
         .assignments()
         .iter()
@@ -764,6 +779,7 @@ pub enum PendingQueueSegmentLedgerStoreError {
     AssignmentMissing,
     AssignmentMismatch,
     SegmentMissing,
+    SegmentStillAdmitting,
     ClosureAssignmentMismatch,
     ClosureBindingMismatch,
     ClosureStale,
@@ -934,26 +950,35 @@ mod tests {
             PendingQueueSegmentLedgerWriteOutcome::Conflict(_)
         ));
         let fingerprint = PendingQueueSegmentLedgerStoreFingerprint([7; 32]);
-        let before = build_segment_closure(
-            fingerprint,
-            &expected,
-            expected.active_segment_id(),
-        )
-        .unwrap();
-        let after = build_segment_closure(
-            fingerprint,
-            &candidate,
-            candidate.active_segment_id(),
-        )
-        .unwrap();
-        assert!(before.assignments().is_empty());
-        assert_eq!(after.assignments().len(), 1);
-        assert_eq!(after.ledger_revision(), candidate.revision());
+        assert!(matches!(
+            build_segment_closure(fingerprint, &expected, expected.active_segment_id()),
+            Err(PendingQueueSegmentLedgerStoreError::SegmentStillAdmitting)
+        ));
+        assert!(matches!(
+            build_segment_closure(fingerprint, &candidate, candidate.active_segment_id()),
+            Err(PendingQueueSegmentLedgerStoreError::SegmentStillAdmitting)
+        ));
+        let mut closed = candidate.clone();
+        for pending in 2..=7 {
+            let PendingQueueSegmentReservationPlan::Advance { candidate, .. } =
+                closed.reserve_generation(context(pending)).unwrap()
+            else {
+                unreachable!()
+            };
+            closed = candidate;
+        }
+        assert!(matches!(
+            closed.reserve_generation(context(8)),
+            Err(PendingQueueSegmentLedgerError::SegmentCapacityExceeded)
+        ));
+        let after =
+            build_segment_closure(fingerprint, &closed, closed.active_segment_id()).unwrap();
+        assert_eq!(after.assignments().len(), 7);
+        assert_eq!(after.ledger_revision(), closed.revision());
         assert_eq!(
             after.assignments()[0].ledger_revision(),
-            candidate.assignments()[0].assigned_at_ledger_revision(),
+            closed.assignments()[0].assigned_at_ledger_revision(),
         );
-        assert_ne!(before.ledger_payload_digest(), after.ledger_payload_digest());
         assert_eq!(after.store_fingerprint(), fingerprint);
         assert_eq!(
             classify_observation(true, &candidate, expected),
