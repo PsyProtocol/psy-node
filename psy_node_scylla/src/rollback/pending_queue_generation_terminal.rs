@@ -103,6 +103,10 @@ impl PendingQueueGenerationTerminalDigest {
             Ok(Self(bytes))
         }
     }
+
+    const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -350,6 +354,12 @@ impl PendingQueueGenerationTerminalQueries {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PendingQueueGenerationTerminalStoreFingerprint([u8; 32]);
 
+impl PendingQueueGenerationTerminalStoreFingerprint {
+    const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
 pub(super) struct ScyllaPendingQueueGenerationTerminalStore {
     session: Arc<Session>,
     fingerprint: PendingQueueGenerationTerminalStoreFingerprint,
@@ -361,6 +371,40 @@ pub(super) struct ScyllaPendingQueueGenerationTerminalStore {
 pub(super) struct PersistedPendingQueueGenerationTerminalReceipt {
     store_fingerprint: PendingQueueGenerationTerminalStoreFingerprint,
     terminal: StoredPendingQueueGenerationTerminal,
+}
+
+/// Compact exact commitment consumed by the segment-level closed-world
+/// manifest. It is recreated from durable rows after restart; no ephemeral
+/// generation-terminal receipt is required.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PendingQueueGenerationTerminalSegmentCommitment {
+    terminal_store_fingerprint: [u8; 32],
+    archive_slot: [u8; 32],
+    archive_digest: [u8; 32],
+    assignment_digest: PendingQueueSegmentAssignmentDigest,
+    terminal_digest: [u8; 32],
+}
+
+impl PendingQueueGenerationTerminalSegmentCommitment {
+    pub(super) const fn terminal_store_fingerprint(&self) -> &[u8; 32] {
+        &self.terminal_store_fingerprint
+    }
+
+    pub(super) const fn archive_slot(&self) -> &[u8; 32] {
+        &self.archive_slot
+    }
+
+    pub(super) const fn archive_digest(&self) -> &[u8; 32] {
+        &self.archive_digest
+    }
+
+    pub(super) const fn assignment_digest(&self) -> PendingQueueSegmentAssignmentDigest {
+        self.assignment_digest
+    }
+
+    pub(super) const fn terminal_digest(&self) -> &[u8; 32] {
+        &self.terminal_digest
+    }
 }
 
 impl ScyllaPendingQueueGenerationTerminalStore {
@@ -524,6 +568,38 @@ impl ScyllaPendingQueueGenerationTerminalStore {
         Ok(archive)
     }
 
+    /// Reconstruct one segment-manifest member exclusively from current
+    /// durable evidence. Missing terminal rows, changed upstream evidence, or
+    /// an assignment mismatch all fail closed.
+    pub(super) async fn observe_segment_commitment<Hash: Q256BitHash>(
+        &self,
+        archive_store: &ScyllaPendingQueueSemanticAggregateStore,
+        pipeline_store: &ScyllaPendingPipelineStore,
+        writer_store: &ScyllaBranchExactWriterLifecycleStore,
+        head_store: &ScyllaAuthorityLocalHeadStore,
+        assignment: &PendingQueueSegmentAssignmentReceipt,
+    ) -> Result<PendingQueueGenerationTerminalSegmentCommitment, PendingQueueGenerationTerminalError> {
+        let (_, _, _, expected) = self
+            .observe_verified::<Hash>(
+                archive_store,
+                pipeline_store,
+                writer_store,
+                head_store,
+                assignment,
+            )
+            .await?;
+        let current = self
+            .read(expected.archive_slot)
+            .await?
+            .ok_or(PendingQueueGenerationTerminalError::ReceiptStale)?;
+        if current != expected
+            || current.assignment_digest != assignment.assignment().digest()
+        {
+            return Err(PendingQueueGenerationTerminalError::EvidenceChanged);
+        }
+        Ok(segment_commitment(self.fingerprint, &current))
+    }
+
     /// Seal (but do not execute) pipeline rotation only after exact durable
     /// terminal revalidation. Segment rotation and NATS deletion are outside
     /// this capability.
@@ -542,6 +618,19 @@ impl ScyllaPendingQueueGenerationTerminalStore {
         ).await?;
         archive.pipeline().seal_rotation(reserved)
             .map_err(|error| PendingQueueGenerationTerminalError::Pipeline(error.to_string()))
+    }
+}
+
+fn segment_commitment(
+    fingerprint: PendingQueueGenerationTerminalStoreFingerprint,
+    current: &StoredPendingQueueGenerationTerminal,
+) -> PendingQueueGenerationTerminalSegmentCommitment {
+    PendingQueueGenerationTerminalSegmentCommitment {
+        terminal_store_fingerprint: *fingerprint.as_bytes(),
+        archive_slot: *current.archive_slot.as_bytes(),
+        archive_digest: *current.archive_digest.as_bytes(),
+        assignment_digest: current.assignment_digest,
+        terminal_digest: *current.digest.as_bytes(),
     }
 }
 
@@ -721,6 +810,19 @@ mod tests {
     #[test]
     fn terminal_codec_is_deterministic_and_fail_closed() {
         let value = fixture();
+        let fingerprint = PendingQueueGenerationTerminalStoreFingerprint([11; 32]);
+        let commitment = segment_commitment(fingerprint, &value);
+        assert_eq!(
+            commitment.terminal_store_fingerprint(),
+            fingerprint.as_bytes(),
+        );
+        assert_eq!(commitment.archive_slot(), value.archive_slot.as_bytes());
+        assert_eq!(
+            commitment.assignment_digest(),
+            value.assignment_digest,
+        );
+        assert_eq!(commitment.terminal_digest(), value.digest.as_bytes());
+        assert_eq!(commitment, segment_commitment(fingerprint, &value));
         let bytes = value.to_persisted_bytes();
         assert_eq!(
             StoredPendingQueueGenerationTerminal::decode_persisted(

@@ -649,6 +649,26 @@ impl PendingQueueNatsWholeStreamManifestDigest {
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
+
+    /// Deterministic assignment-set commitment shared by the durable
+    /// SealRequested row (live observation) and the later sealed scanner.
+    /// This helper is not a seal/delete permit; callers must still prove the
+    /// assignment list came from one exact ledger snapshot.
+    pub fn for_instance_assignments(
+        instance_id: RecoverableNatsStreamInstanceId,
+        assignments: &[PendingQueueGenerationSegmentAssignment],
+    ) -> Result<Self, PendingQueueTerminalError> {
+        let mut hasher = Sha256::new();
+        hasher.update(WHOLE_STREAM_MANIFEST_DOMAIN);
+        hasher.update(instance_id.as_bytes());
+        hasher.update((assignments.len() as u64).to_be_bytes());
+        for assignment in assignments {
+            let bytes = assignment.to_canonical_bytes();
+            hasher.update((bytes.len() as u64).to_be_bytes());
+            hasher.update(bytes);
+        }
+        Self::try_new(hasher.finalize().into())
+    }
 }
 
 /// Closed-world input for a whole-stream scan. The later durable lifecycle
@@ -705,22 +725,15 @@ impl PendingQueueNatsWholeStreamExpectedManifest {
         {
             return Err(PendingQueueTerminalError::WholeStreamManifestMismatch);
         }
-        let mut hasher = Sha256::new();
-        hasher.update(WHOLE_STREAM_MANIFEST_DOMAIN);
-        hasher.update(instance.instance_id().as_bytes());
-        hasher.update((assignments.len() as u64).to_be_bytes());
-        for assignment in &assignments {
-            let bytes = assignment.to_canonical_bytes();
-            hasher.update((bytes.len() as u64).to_be_bytes());
-            hasher.update(bytes);
-        }
+        let digest = PendingQueueNatsWholeStreamManifestDigest::for_instance_assignments(
+            instance.instance_id(),
+            &assignments,
+        )?;
         Ok(Self {
             instance,
             assignments,
             expected_source_count,
-            digest: PendingQueueNatsWholeStreamManifestDigest::try_new(
-                hasher.finalize().into(),
-            )?,
+            digest,
         })
     }
 

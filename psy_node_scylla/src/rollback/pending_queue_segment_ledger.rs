@@ -20,6 +20,9 @@ use psy_node_nats::recoverable_assignment::{
     PendingQueueSegmentLedgerSlot, PendingQueueSegmentReservationPlan,
     StoredPendingQueueSegmentLedger,
 };
+use psy_node_nats::recoverable_segment::{
+    RecoverableNatsSegmentContractDigest, RecoverableNatsSegmentId,
+};
 use scylla::{
     client::session::Session,
     response::query_result::QueryResult,
@@ -33,6 +36,8 @@ use super::BranchExactDeploymentNoTabletKeyspace;
 const SEGMENT_LEDGER_TABLE: &str = "branch_exact_pending_queue_segment_ledger_v1";
 const STORE_FINGERPRINT_DOMAIN: &[u8] =
     b"psy/rollback/pending-queue-segment-ledger-store/v1";
+const CLOSURE_SNAPSHOT_DOMAIN: &[u8] =
+    b"psy/rollback/pending-queue-segment-ledger-closure/v1";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[repr(u8)]
@@ -293,6 +298,57 @@ pub struct PendingQueueSegmentAssignmentReceipt {
     assignment: PendingQueueGenerationSegmentAssignment,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) struct PendingQueueSegmentClosureDigest([u8; 32]);
+
+impl PendingQueueSegmentClosureDigest {
+    pub(super) const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// Exact, revalidatable ledger observation for one physical segment. It owns
+/// every assignment receipt selected from the same ledger revision, so a
+/// later lifecycle cannot accidentally close a caller-supplied subset.
+#[derive(Debug)]
+pub(super) struct PendingQueueSegmentClosureSnapshot {
+    store_fingerprint: PendingQueueSegmentLedgerStoreFingerprint,
+    ledger_key: PendingQueueSegmentLedgerKey,
+    ledger_revision: PendingQueueSegmentLedgerRevision,
+    segment_id: RecoverableNatsSegmentId,
+    contract_digest: RecoverableNatsSegmentContractDigest,
+    ledger_payload_digest: PendingQueueSegmentClosureDigest,
+    assignments: Vec<PendingQueueSegmentAssignmentReceipt>,
+}
+
+impl PendingQueueSegmentClosureSnapshot {
+    pub(super) const fn store_fingerprint(
+        &self,
+    ) -> PendingQueueSegmentLedgerStoreFingerprint {
+        self.store_fingerprint
+    }
+
+    pub(super) const fn ledger_revision(&self) -> PendingQueueSegmentLedgerRevision {
+        self.ledger_revision
+    }
+
+    pub(super) const fn segment_id(&self) -> RecoverableNatsSegmentId {
+        self.segment_id
+    }
+
+    pub(super) const fn contract_digest(&self) -> RecoverableNatsSegmentContractDigest {
+        self.contract_digest
+    }
+
+    pub(super) const fn ledger_payload_digest(&self) -> PendingQueueSegmentClosureDigest {
+        self.ledger_payload_digest
+    }
+
+    pub(super) fn assignments(&self) -> &[PendingQueueSegmentAssignmentReceipt] {
+        &self.assignments
+    }
+}
+
 impl PendingQueueSegmentAssignmentReceipt {
     pub const fn store_fingerprint(&self) -> PendingQueueSegmentLedgerStoreFingerprint {
         self.store_fingerprint
@@ -415,26 +471,69 @@ impl ScyllaPendingQueueSegmentLedgerStore {
         }
     }
 
+    /// Freeze the exact assignment set currently owned by one segment. The
+    /// method point-reads the ledger before and after construction and rejects
+    /// any concurrent reservation/rotation rather than returning a mixed
+    /// snapshot.
+    pub(super) async fn observe_segment_closure(
+        &self,
+        key: &PendingQueueSegmentLedgerKey,
+        segment_id: RecoverableNatsSegmentId,
+    ) -> Result<PendingQueueSegmentClosureSnapshot, PendingQueueSegmentLedgerStoreError> {
+        let PendingQueueSegmentLedgerReadState::Current(current) = self.read(key).await? else {
+            return Err(PendingQueueSegmentLedgerStoreError::Uninitialized);
+        };
+        let snapshot = self.build_segment_closure(&current, segment_id)?;
+        self.revalidate_segment_closure(&snapshot).await?;
+        Ok(snapshot)
+    }
+
+    pub(super) async fn revalidate_segment_closure(
+        &self,
+        snapshot: &PendingQueueSegmentClosureSnapshot,
+    ) -> Result<(), PendingQueueSegmentLedgerStoreError> {
+        if snapshot.store_fingerprint != self.fingerprint {
+            return Err(PendingQueueSegmentLedgerStoreError::ClosureBindingMismatch);
+        }
+        let PendingQueueSegmentLedgerReadState::Current(current) =
+            self.read(&snapshot.ledger_key).await?
+        else {
+            return Err(PendingQueueSegmentLedgerStoreError::ClosureStale);
+        };
+        let observed = self.build_segment_closure(&current, snapshot.segment_id)?;
+        if observed.store_fingerprint != snapshot.store_fingerprint
+            || observed.ledger_revision != snapshot.ledger_revision
+            || observed.contract_digest != snapshot.contract_digest
+            || observed.ledger_payload_digest != snapshot.ledger_payload_digest
+            || observed.assignments.len() != snapshot.assignments.len()
+            || observed
+                .assignments
+                .iter()
+                .zip(&snapshot.assignments)
+                .any(|(left, right)| {
+                    left.ledger_revision != right.ledger_revision
+                        || left.assignment != right.assignment
+                })
+        {
+            return Err(PendingQueueSegmentLedgerStoreError::ClosureStale);
+        }
+        Ok(())
+    }
+
+    fn build_segment_closure(
+        &self,
+        current: &StoredPendingQueueSegmentLedger,
+        segment_id: RecoverableNatsSegmentId,
+    ) -> Result<PendingQueueSegmentClosureSnapshot, PendingQueueSegmentLedgerStoreError> {
+        build_segment_closure(self.fingerprint, current, segment_id)
+    }
+
     fn receipt_from_exact(
         &self,
         current: &StoredPendingQueueSegmentLedger,
         assignment: PendingQueueGenerationSegmentAssignment,
     ) -> Result<PendingQueueSegmentAssignmentReceipt, PendingQueueSegmentLedgerStoreError> {
-        let exact = current
-            .assignment_for(assignment.context())
-            .ok_or(PendingQueueSegmentLedgerStoreError::AssignmentMissing)?;
-        if exact != &assignment {
-            return Err(PendingQueueSegmentLedgerStoreError::AssignmentMismatch);
-        }
-        Ok(PendingQueueSegmentAssignmentReceipt {
-            store_fingerprint: self.fingerprint,
-            ledger_slot: current.key().slot(),
-            // The receipt identifies the immutable assignment event, not the
-            // mutable whole-ledger head. Later reservations must not change
-            // the receipt used by capture, semantic terminal, or archive.
-            ledger_revision: exact.assigned_at_ledger_revision(),
-            assignment,
-        })
+        assignment_receipt(self.fingerprint, current, assignment)
     }
 
     async fn finish_write(
@@ -506,6 +605,68 @@ impl ScyllaPendingQueueSegmentLedgerStore {
         }
         Ok(PendingQueueSegmentLedgerReadState::Current(current))
     }
+}
+
+fn assignment_receipt(
+    fingerprint: PendingQueueSegmentLedgerStoreFingerprint,
+    current: &StoredPendingQueueSegmentLedger,
+    assignment: PendingQueueGenerationSegmentAssignment,
+) -> Result<PendingQueueSegmentAssignmentReceipt, PendingQueueSegmentLedgerStoreError> {
+    let exact = current
+        .assignment_for(assignment.context())
+        .ok_or(PendingQueueSegmentLedgerStoreError::AssignmentMissing)?;
+    if exact != &assignment {
+        return Err(PendingQueueSegmentLedgerStoreError::AssignmentMismatch);
+    }
+    Ok(PendingQueueSegmentAssignmentReceipt {
+        store_fingerprint: fingerprint,
+        ledger_slot: current.key().slot(),
+        // This is the immutable assignment revision, not the mutable ledger
+        // head revision. Later reservations cannot invalidate the receipt.
+        ledger_revision: exact.assigned_at_ledger_revision(),
+        assignment,
+    })
+}
+
+fn build_segment_closure(
+    fingerprint: PendingQueueSegmentLedgerStoreFingerprint,
+    current: &StoredPendingQueueSegmentLedger,
+    segment_id: RecoverableNatsSegmentId,
+) -> Result<PendingQueueSegmentClosureSnapshot, PendingQueueSegmentLedgerStoreError> {
+    let segment = current
+        .live_segments()
+        .iter()
+        .find(|segment| segment.segment_id() == segment_id)
+        .ok_or(PendingQueueSegmentLedgerStoreError::SegmentMissing)?;
+    let assignments = current
+        .assignments()
+        .iter()
+        .filter(|assignment| assignment.segment_id() == segment_id)
+        .cloned()
+        .map(|assignment| assignment_receipt(fingerprint, current, assignment))
+        .collect::<Result<Vec<_>, _>>()?;
+    if usize::try_from(segment.generation_count()).ok() != Some(assignments.len()) {
+        return Err(PendingQueueSegmentLedgerStoreError::ClosureAssignmentMismatch);
+    }
+    let payload = current.to_persisted_bytes();
+    let mut hasher = Sha256::new();
+    hasher.update(CLOSURE_SNAPSHOT_DOMAIN);
+    hasher.update(fingerprint.as_bytes());
+    hasher.update(current.key().slot().as_bytes());
+    hasher.update(current.revision().get().to_be_bytes());
+    hasher.update(segment_id.get().to_be_bytes());
+    hasher.update(segment.contract_digest().as_bytes());
+    hasher.update((payload.len() as u64).to_be_bytes());
+    hasher.update(payload);
+    Ok(PendingQueueSegmentClosureSnapshot {
+        store_fingerprint: fingerprint,
+        ledger_key: current.key().clone(),
+        ledger_revision: current.revision(),
+        segment_id,
+        contract_digest: segment.contract_digest(),
+        ledger_payload_digest: PendingQueueSegmentClosureDigest(hasher.finalize().into()),
+        assignments,
+    })
 }
 
 pub fn classify_observation(
@@ -582,6 +743,10 @@ pub enum PendingQueueSegmentLedgerStoreError {
     AppliedStateMismatch,
     AssignmentMissing,
     AssignmentMismatch,
+    SegmentMissing,
+    ClosureAssignmentMismatch,
+    ClosureBindingMismatch,
+    ClosureStale,
     Conflict {
         current_revision: PendingQueueSegmentLedgerRevision,
     },
@@ -748,6 +913,28 @@ mod tests {
             classify_observation(false, &candidate, expected.clone()).unwrap(),
             PendingQueueSegmentLedgerWriteOutcome::Conflict(_)
         ));
+        let fingerprint = PendingQueueSegmentLedgerStoreFingerprint([7; 32]);
+        let before = build_segment_closure(
+            fingerprint,
+            &expected,
+            expected.active_segment_id(),
+        )
+        .unwrap();
+        let after = build_segment_closure(
+            fingerprint,
+            &candidate,
+            candidate.active_segment_id(),
+        )
+        .unwrap();
+        assert!(before.assignments().is_empty());
+        assert_eq!(after.assignments().len(), 1);
+        assert_eq!(after.ledger_revision(), candidate.revision());
+        assert_eq!(
+            after.assignments()[0].ledger_revision(),
+            candidate.assignments()[0].assigned_at_ledger_revision(),
+        );
+        assert_ne!(before.ledger_payload_digest(), after.ledger_payload_digest());
+        assert_eq!(after.store_fingerprint(), fingerprint);
         assert_eq!(
             classify_observation(true, &candidate, expected),
             Err(PendingQueueSegmentLedgerStoreError::AppliedStateMismatch)
