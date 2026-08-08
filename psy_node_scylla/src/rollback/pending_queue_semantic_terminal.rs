@@ -12,7 +12,8 @@ use std::{error::Error, fmt};
 use parth_core::protocol::core_types::Q256BitHash;
 use psy_node_core::{
     queue::recoverable_ephemeral::{
-        PendingQueueCaptureCandidate, PendingQueueSourceCursorView,
+        PendingQueueCaptureCandidate, PendingQueueCaptureContextDigest,
+        PendingQueueSourceCursorView,
     },
     queue::recoverable_artifact::{
         PendingQueueArtifactOwnerAttemptId, PendingQueueArtifactOwnerFence,
@@ -22,7 +23,8 @@ use psy_node_core::{
 };
 use psy_node_nats::{
     recoverable_assignment::{
-        PendingQueueSegmentLedgerRevision, PendingQueueSegmentLedgerSlot,
+        PendingQueueSegmentAssignmentDigest, PendingQueueSegmentLedgerRevision,
+        PendingQueueSegmentLedgerSlot,
     },
     recoverable_publish::{
         PendingQueueEnvelopeBody, PendingQueuePublishEnvelope,
@@ -55,6 +57,14 @@ const SEMANTIC_SOURCE_DOMAIN: &[u8] =
 pub struct PendingQueueSemanticSourceDigest([u8; 32]);
 
 impl PendingQueueSemanticSourceDigest {
+    pub(super) fn try_new(bytes: [u8; 32]) -> Result<Self, PendingQueueSemanticSourceError> {
+        if bytes == [0; 32] {
+            Err(PendingQueueSemanticSourceError::EmptyDigest)
+        } else {
+            Ok(Self(bytes))
+        }
+    }
+
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
@@ -66,6 +76,8 @@ impl PendingQueueSemanticSourceDigest {
 #[derive(Debug)]
 pub struct PersistedPendingQueueSemanticSourceReceipt {
     publisher_kind: PendingQueuePublisherKind,
+    context_digest: PendingQueueCaptureContextDigest,
+    assignment_digest: PendingQueueSegmentAssignmentDigest,
     close_intent: PendingQueueCloseIntentDigest,
     pipeline_close_receipt_digest: [u8; 32],
     source_slot: PendingQueuePublishSourceSlot,
@@ -78,11 +90,30 @@ pub struct PersistedPendingQueueSemanticSourceReceipt {
     artifact_owner_attempt_id: PendingQueueArtifactOwnerAttemptId,
     artifact_owner_fence: PendingQueueArtifactOwnerFence,
     consumer_digest: [u8; 32],
+    data_member_count: u32,
+    data_encoded_bytes: u64,
     source_revision: u64,
     artifact_scan_revision: u64,
     artifact_scan_digest: PendingQueueArtifactScanDigest,
     nats_scan_digest: PendingQueueSourceTruncationDigest,
     semantic_digest: PendingQueueSemanticSourceDigest,
+}
+
+pub(super) struct PendingQueueSemanticSourceCommitment {
+    pub(super) publisher_kind: PendingQueuePublisherKind,
+    pub(super) context_digest: PendingQueueCaptureContextDigest,
+    pub(super) assignment_digest: PendingQueueSegmentAssignmentDigest,
+    pub(super) close_intent: PendingQueueCloseIntentDigest,
+    pub(super) pipeline_close_receipt_digest: [u8; 32],
+    pub(super) publish_store_fingerprint: [u8; 32],
+    pub(super) assignment_store_fingerprint: [u8; 32],
+    pub(super) assignment_ledger_slot: [u8; 32],
+    pub(super) assignment_ledger_revision: u64,
+    pub(super) artifact_store_fingerprint: [u8; 32],
+    pub(super) source_slot: PendingQueuePublishSourceSlot,
+    pub(super) semantic_digest: PendingQueueSemanticSourceDigest,
+    pub(super) data_member_count: u32,
+    pub(super) data_encoded_bytes: u64,
 }
 
 impl PersistedPendingQueueSemanticSourceReceipt {
@@ -100,6 +131,25 @@ impl PersistedPendingQueueSemanticSourceReceipt {
 
     pub const fn semantic_digest(&self) -> PendingQueueSemanticSourceDigest {
         self.semantic_digest
+    }
+
+    pub(super) fn into_commitment(self) -> PendingQueueSemanticSourceCommitment {
+        PendingQueueSemanticSourceCommitment {
+            publisher_kind: self.publisher_kind,
+            context_digest: self.context_digest,
+            assignment_digest: self.assignment_digest,
+            close_intent: self.close_intent,
+            pipeline_close_receipt_digest: self.pipeline_close_receipt_digest,
+            publish_store_fingerprint: *self.publish_store_fingerprint.as_bytes(),
+            assignment_store_fingerprint: *self.assignment_store_fingerprint.as_bytes(),
+            assignment_ledger_slot: *self.assignment_ledger_slot.as_bytes(),
+            assignment_ledger_revision: self.assignment_ledger_revision.get(),
+            artifact_store_fingerprint: *self.artifact_store_fingerprint.as_bytes(),
+            source_slot: self.source_slot,
+            semantic_digest: self.semantic_digest,
+            data_member_count: self.data_member_count,
+            data_encoded_bytes: self.data_encoded_bytes,
+        }
     }
 }
 
@@ -287,6 +337,8 @@ fn build_receipt(
     }
     Ok(PersistedPendingQueueSemanticSourceReceipt {
         publisher_kind: source.publisher_kind(),
+        context_digest: source.artifact_identity().context().digest(),
+        assignment_digest: source.assignment_digest(),
         close_intent: nats.close_intent(),
         pipeline_close_receipt_digest: *close_receipt.receipt_digest(),
         source_slot,
@@ -299,11 +351,13 @@ fn build_receipt(
         artifact_owner_attempt_id: artifact.owner_attempt_id(),
         artifact_owner_fence: artifact.owner_fence(),
         consumer_digest,
+        data_member_count: source.data_member_count(),
+        data_encoded_bytes: source.data_encoded_bytes(),
         source_revision: source.revision().get(),
         artifact_scan_revision: artifact.source_scan_revision(),
         artifact_scan_digest: artifact.scan_digest(),
         nats_scan_digest: nats.scan_digest(),
-        semantic_digest: PendingQueueSemanticSourceDigest(digest),
+        semantic_digest: PendingQueueSemanticSourceDigest::try_new(digest)?,
     })
 }
 
