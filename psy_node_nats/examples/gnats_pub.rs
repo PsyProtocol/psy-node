@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 use async_nats::jetstream::{self, consumer::pull::Config as PullConfig};
 use parth_core::data::queue::queue_key::{PCoreSubjectQueueBase, QPBaseQueueType, QPStandardUniqueIdQueueKey};
 use psy_core::job::job_id::QProvingJobDataID;
+use psy_node_core::queue::ephemeral::QStandardEphemeralQueuePublisher;
 use psy_node_nats::queue::NatsJetStreamClient;
 use rand::{thread_rng, RngCore};
 use tokio::task::JoinSet;
@@ -94,7 +95,7 @@ async fn main() -> Result<(), async_nats::Error> {
 
     // Spawn a task for each stream to publish messages concurrently
     for (idx, stream) in streams.into_iter().enumerate() {
-        let subject = subject.clone();
+        let qk = qk.clone();
         //let durable_name = durable_name.clone();
         join_set.spawn(async move {
             // Statistics collections
@@ -104,9 +105,23 @@ async fn main() -> Result<(), async_nats::Error> {
             let mut total_produced = 0;
 
             let random_job_data: [[u8; 24]; 1000] = core::array::from_fn(|_| random_job_data());
+            let item_refs = random_job_data
+                .iter()
+                .map(|item| item.as_slice())
+                .collect::<Vec<_>>();
             for _ in 0..1000 {
                 let msg_start = Instant::now();
-                stream.push_messages_dq_bytes_sized(&subject, &random_job_data).await.unwrap();
+                stream
+                    .publish_many_ephemeral_queue_items_bytes_ref(
+                        &qk,
+                        realm_id,
+                        realm_sub_id,
+                        unique_id,
+                        task_group as u32,
+                        &item_refs,
+                    )
+                    .await
+                    .unwrap();
                 let batch_elapsed = msg_start.elapsed();
                 total_produced += random_job_data.len();
                 producer_latencies.push(batch_elapsed.as_micros() as u64);

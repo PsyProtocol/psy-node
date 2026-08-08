@@ -32,17 +32,29 @@ pub enum JetStreamAckMode {
     AckBatchLast = 2,
 }
 pub struct NatsJetStreamClient {
-    pub base_namespace: String,
-    pub jetstream: Arc<jetstream::Context>,
-    pub stream_name: String,
-    pub standard_ephemeral_queue_pull_config: PullConfig,
-    pub worker_queue_pull_config: PullConfig,
-    pub standard_jet_stream_config: jetstream::stream::Config,
+    base_namespace: String,
+    jetstream: Arc<jetstream::Context>,
+    stream_name: String,
+    standard_ephemeral_queue_pull_config: PullConfig,
+    worker_queue_pull_config: PullConfig,
+    standard_jet_stream_config: jetstream::stream::Config,
     kv: Store,
     consumer_cache: Cache<String, PullConsumer>,
 }
 
 impl NatsJetStreamClient {
+    pub fn base_namespace(&self) -> &str {
+        &self.base_namespace
+    }
+
+    pub fn stream_name(&self) -> &str {
+        &self.stream_name
+    }
+
+    pub(crate) fn raw_context_for_recoverable_transport(&self) -> Arc<jetstream::Context> {
+        self.jetstream.clone()
+    }
+
     fn consumer_cache_key(&self, durable_name: &str) -> String {
         format!("{}:{}", self.stream_name, durable_name)
     }
@@ -210,7 +222,7 @@ impl NatsJetStreamClient {
         self.delete_consumer_by_durable_name(&durable_name).await
     }
 
-    pub async fn push_messages_dq_bytes(&self, subject: &str, data: &[&[u8]]) -> anyhow::Result<()> {
+    async fn push_messages_dq_bytes(&self, subject: &str, data: &[&[u8]]) -> anyhow::Result<()> {
 
         const BATCH_SIZE: usize = 1000; // Adjust based on testing; 1000-5000 is a good starting point
         let subject = subject.to_string();
@@ -228,44 +240,7 @@ impl NatsJetStreamClient {
 
         Ok(())
     }
-    pub async fn push_messages_dq_bytes_vec(&self, subject: &str, data: &[Vec<u8>]) -> anyhow::Result<()> {
-
-        const BATCH_SIZE: usize = 1000; // Adjust based on testing; 1000-5000 is a good starting point
-        let subject = subject.to_string();
-
-        for chunk in data.chunks(BATCH_SIZE) {
-            let mut futs = Vec::with_capacity(chunk.len());
-            for job in chunk.iter() {
-                futs.push(self.jetstream.publish(subject.clone(), Bytes::copy_from_slice(&job)));
-            }
-            let ack_futures = try_join_all(futs).await?;
-            for ack_future in ack_futures {
-                ack_future.await?;
-            }
-        }
-
-        Ok(())
-    }
-    pub async fn push_messages_dq_bytes_sized<const N: usize>(&self, subject: &str, data: &[[u8; N]]) -> anyhow::Result<()> {
-
-        const BATCH_SIZE: usize = 1000; // Adjust based on testing; 1000-5000 is a good starting point
-        let subject = subject.to_string();
-
-        for chunk in data.chunks(BATCH_SIZE) {
-            let mut futs = Vec::with_capacity(chunk.len());
-            for job in chunk.iter() {
-                futs.push(self.jetstream.publish(subject.clone(), Bytes::copy_from_slice(&job[..])));
-            }
-            let ack_futures = try_join_all(futs).await?;
-            for ack_future in ack_futures {
-                ack_future.await?;
-            }
-        }
-
-        Ok(())
-    }
-
-    pub async fn push_messages_dq_qi_ref<QueueItem: PCoreQueueItemBase + Clone + Send + Sync>(
+    async fn push_messages_dq_qi_ref<QueueItem: PCoreQueueItemBase + Clone + Send + Sync>(
         &self,
         subject: &str,
         data: &[&QueueItem],
@@ -288,7 +263,7 @@ impl NatsJetStreamClient {
 
         Ok(())
     }
-    pub async fn push_messages_dq_qi<QueueItem: PCoreQueueItemBase + Clone + Send + Sync>(
+    async fn push_messages_dq_qi<QueueItem: PCoreQueueItemBase + Clone + Send + Sync>(
         &self,
         subject: &str,
         data: &[QueueItem],
@@ -314,7 +289,7 @@ impl NatsJetStreamClient {
         Ok(())
     }
 
-    pub async fn push_message_dq_qi_ref<QueueItem: PCoreQueueItemBase + Clone + Send + Sync>(
+    async fn push_message_dq_qi_ref<QueueItem: PCoreQueueItemBase + Clone + Send + Sync>(
         &self,
         subject: &str,
         data: &QueueItem,
@@ -326,7 +301,7 @@ impl NatsJetStreamClient {
             .await?;
         Ok(())
     }
-    pub async fn push_messages_dq_qi_owned<QueueItem: PCoreQueueItemBase + Clone + Send + Sync>(
+    async fn push_messages_dq_qi_owned<QueueItem: PCoreQueueItemBase + Clone + Send + Sync>(
         &self,
         subject: &str,
         data: QueueItem,

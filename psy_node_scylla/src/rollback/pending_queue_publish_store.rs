@@ -11,8 +11,6 @@
 
 use std::{error::Error, fmt, sync::Arc};
 
-use async_nats::jetstream::{self, context::Publish};
-use bytes::Bytes;
 use psy_node_nats::{
     recoverable_assignment::PendingQueueGenerationSegmentAssignment,
     recoverable_outbox::{
@@ -31,6 +29,10 @@ use psy_node_nats::{
         PendingQueuePublisherKind, RecoverableNatsSourceRoute,
     },
     recoverable_segment::RecoverableNatsStreamSegment,
+    recoverable_transport::{
+        RecoverableNatsPublishDisposition, RecoverableNatsTransportError,
+        RecoverablePendingQueueNatsPublisher,
+    },
 };
 use scylla::{
     client::session::Session,
@@ -295,40 +297,6 @@ pub enum PendingQueueNatsPublishDisposition {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct SealedPendingQueueNatsPublish {
-    subject: String,
-    expected_stream: String,
-    expected_last_subject_sequence: u64,
-    message_id: String,
-    payload: Vec<u8>,
-    envelope_digest: [u8; 32],
-}
-
-impl SealedPendingQueueNatsPublish {
-    fn from_envelope(
-        segment: &RecoverableNatsStreamSegment,
-        envelope: &PendingQueuePublishEnvelope,
-    ) -> Result<Self, PendingQueuePublishStoreError> {
-        Ok(Self {
-            subject: envelope.exact_subject(segment).map_err(model_envelope)?,
-            expected_stream: segment.stream_name().to_owned(),
-            expected_last_subject_sequence: envelope.previous_subject_sequence(),
-            message_id: envelope.message_id(),
-            payload: envelope.to_canonical_bytes(),
-            envelope_digest: *envelope.digest().as_bytes(),
-        })
-    }
-
-    fn publish_request(&self) -> Publish {
-        Publish::build()
-            .payload(Bytes::from(self.payload.clone()))
-            .message_id(&self.message_id)
-            .expected_stream(&self.expected_stream)
-            .expected_last_subject_sequence(self.expected_last_subject_sequence)
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingQueuePublishCommitReceipt {
     intent_slot: PendingQueuePublishIntentSlot,
     subject_sequence: u64,
@@ -356,7 +324,7 @@ impl PendingQueuePublishCommitReceipt {
 
 pub struct ScyllaPendingQueuePublishStore {
     session: Arc<Session>,
-    nats: Arc<jetstream::Context>,
+    nats: Arc<RecoverablePendingQueueNatsPublisher>,
     segment: RecoverableNatsStreamSegment,
     queries: PendingQueuePublishQueries,
     fingerprint: PendingQueuePublishStoreFingerprint,
@@ -384,7 +352,7 @@ impl ScyllaPendingQueuePublishStore {
 
     pub(crate) async fn prepare(
         session: Arc<Session>,
-        nats: Arc<jetstream::Context>,
+        nats: Arc<RecoverablePendingQueueNatsPublisher>,
         segment: RecoverableNatsStreamSegment,
         keyspaces: PendingQueuePublishKeyspaces,
     ) -> Result<Self, PendingQueuePublishStoreError> {
@@ -681,60 +649,16 @@ impl ScyllaPendingQueuePublishStore {
         &self,
         envelope: &PendingQueuePublishEnvelope,
     ) -> Result<(u64, PendingQueueNatsPublishDisposition), PendingQueuePublishStoreError> {
-        let sealed = SealedPendingQueueNatsPublish::from_envelope(&self.segment, envelope)?;
-        let attempt = self
-            .nats
-            .send_publish(sealed.subject.clone(), sealed.publish_request())
-            .await;
-        match attempt {
-            Ok(ack_future) => match ack_future.await {
-                Ok(ack)
-                    if ack.stream == sealed.expected_stream
-                        && ack.domain.is_empty()
-                        && ack.sequence > sealed.expected_last_subject_sequence =>
-                {
-                    if ack.duplicate {
-                        let sequence = self.reconcile_leader(&sealed, Some(ack.sequence)).await?;
-                        Ok((sequence, PendingQueueNatsPublishDisposition::LeaderReadback))
-                    } else {
-                        Ok((ack.sequence, PendingQueueNatsPublishDisposition::PubAck))
-                    }
-                }
-                Ok(ack) => {
-                    return Err(PendingQueuePublishStoreError::NatsAckMismatch {
-                        stream: ack.stream,
-                        domain: ack.domain,
-                        sequence: ack.sequence,
-                    });
-                }
-                Err(_) => {
-                    let sequence = self.reconcile_leader(&sealed, None).await?;
-                    Ok((sequence, PendingQueueNatsPublishDisposition::LeaderReadback))
-                }
-            },
-            Err(_) => {
-                let sequence = self.reconcile_leader(&sealed, None).await?;
-                Ok((sequence, PendingQueueNatsPublishDisposition::LeaderReadback))
+        let outcome = self.nats.publish(envelope).await.map_err(nats_transport)?;
+        let disposition = match outcome.disposition() {
+            RecoverableNatsPublishDisposition::PubAck => {
+                PendingQueueNatsPublishDisposition::PubAck
             }
-        }
-    }
-
-    async fn reconcile_leader(
-        &self,
-        sealed: &SealedPendingQueueNatsPublish,
-        expected_ack_sequence: Option<u64>,
-    ) -> Result<u64, PendingQueuePublishStoreError> {
-        let stream = self.nats.get_stream_no_info(&sealed.expected_stream).await
-            .map_err(|error| PendingQueuePublishStoreError::Nats(error.to_string()))?;
-        let observed = stream.get_last_raw_message_by_subject(&sealed.subject).await
-            .map_err(|error| PendingQueuePublishStoreError::NatsIndeterminate(error.to_string()))?;
-        classify_leader_observation(
-            sealed,
-            observed.subject.as_str(),
-            observed.sequence,
-            &observed.payload,
-            expected_ack_sequence,
-        )
+            RecoverableNatsPublishDisposition::LeaderReadback => {
+                PendingQueueNatsPublishDisposition::LeaderReadback
+            }
+        };
+        Ok((outcome.subject_sequence(), disposition))
     }
 
     async fn read_source(&self, slot: PendingQueuePublishSourceSlot) -> Result<Option<PendingQueuePublishSourceState>, PendingQueuePublishStoreError> {
@@ -902,33 +826,6 @@ fn decode_fragment_row(row: FragmentDbRow) -> Result<PendingQueuePayloadFragment
     Ok(fragment)
 }
 
-fn classify_leader_observation(
-    sealed: &SealedPendingQueueNatsPublish,
-    observed_subject: &str,
-    observed_sequence: u64,
-    observed_payload: &[u8],
-    expected_ack_sequence: Option<u64>,
-) -> Result<u64, PendingQueuePublishStoreError> {
-    if observed_subject != sealed.subject
-        || observed_sequence <= sealed.expected_last_subject_sequence
-        || expected_ack_sequence.is_some_and(|sequence| sequence != observed_sequence)
-        || observed_payload != sealed.payload
-    {
-        return Err(PendingQueuePublishStoreError::NatsFenceConflict {
-            expected_previous: sealed.expected_last_subject_sequence,
-            observed: observed_sequence,
-        });
-    }
-    let decoded = PendingQueuePublishEnvelope::decode_canonical(observed_payload)
-        .map_err(model_envelope)?;
-    if decoded.digest().as_bytes() != &sealed.envelope_digest
-        || decoded.message_id() != sealed.message_id
-    {
-        return Err(PendingQueuePublishStoreError::NatsPayloadMismatch);
-    }
-    Ok(observed_sequence)
-}
-
 fn classify_exact<T: Eq>(applied: bool, candidate: &T, current: T) -> Result<T, PendingQueuePublishStoreError> {
     if &current == candidate { Ok(current) }
     else if applied { Err(PendingQueuePublishStoreError::AppliedStateMismatch) }
@@ -982,12 +879,14 @@ fn decode_applied(result: QueryResult) -> Result<bool, PendingQueuePublishStoreE
 fn cql(error: impl fmt::Display) -> PendingQueuePublishStoreError { PendingQueuePublishStoreError::Cql(error.to_string()) }
 fn model_outbox(error: PendingQueueOutboxError) -> PendingQueuePublishStoreError { PendingQueuePublishStoreError::Model(error.to_string()) }
 fn model_envelope(error: PendingQueueEnvelopeError) -> PendingQueuePublishStoreError { PendingQueuePublishStoreError::Model(error.to_string()) }
+fn nats_transport(error: RecoverableNatsTransportError) -> PendingQueuePublishStoreError {
+    PendingQueuePublishStoreError::Nats(error.to_string())
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PendingQueuePublishStoreError {
     Cql(String),
     Nats(String),
-    NatsIndeterminate(String),
     Model(String),
     InvalidKeyspace(String),
     DataKeyspaceMustUseTablets(String),
@@ -1014,9 +913,6 @@ pub enum PendingQueuePublishStoreError {
     FragmentMissing,
     FragmentMismatch,
     FragmentSetMismatch,
-    NatsPayloadMismatch,
-    NatsAckMismatch { stream: String, domain: String, sequence: u64 },
-    NatsFenceConflict { expected_previous: u64, observed: u64 },
 }
 
 impl fmt::Display for PendingQueuePublishStoreError {
@@ -1027,90 +923,7 @@ impl Error for PendingQueuePublishStoreError {}
 
 #[cfg(test)]
 mod tests {
-    use psy_data::protocol::{
-        canonical_chain::NetworkId, chain_context::AuthorityScope,
-    };
-    use psy_node_core::{
-        queue::recoverable_ephemeral::PendingQueueCaptureContext,
-        store::pending_generation_identity::{
-            PendingGenerationActivationDigest, PendingGenerationContext,
-            PendingGenerationLedgerKey,
-        },
-    };
-    use psy_node_nats::{
-        recoverable_assignment::{
-            PendingQueueSegmentLedgerBootstrap,
-            PendingQueueSegmentReservationPlan,
-        },
-        recoverable_publish::{
-            PendingQueueGenerationBudgetContract, PendingQueueSourceQuota,
-        },
-        recoverable_segment::{
-            RecoverableNatsRetentionContract, RecoverableNatsSegmentId,
-        },
-    };
-
     use super::*;
-
-    fn fixture() -> (
-        RecoverableNatsStreamSegment,
-        PendingQueueGenerationSegmentAssignment,
-        RecoverableNatsSourceRoute,
-        PendingQueuePublishSourceState,
-    ) {
-        let authority = AuthorityScope::Coordinator;
-        let key = PendingGenerationLedgerKey::new(
-            NetworkId::try_from_chain_id(1337).unwrap(),
-            authority,
-        );
-        let context = PendingQueueCaptureContext::try_new(
-            key,
-            PendingGenerationActivationDigest::try_new([3; 32]).unwrap(),
-            PendingGenerationContext::try_from_legacy(7, 99).unwrap(),
-        ).unwrap();
-        let segment = RecoverableNatsStreamSegment::try_new(
-            "psy.mainnet",
-            RecoverableNatsSegmentId::try_new(1).unwrap(),
-            RecoverableNatsRetentionContract::try_new(
-                3, 1024 * 1024 * 1024, 128 * 1024 * 1024, 3, 16,
-            ).unwrap(),
-        ).unwrap();
-        let mib = 1024 * 1024_u64;
-        let budget = PendingQueueGenerationBudgetContract::try_new(
-            authority,
-            vec![
-                PendingQueueSourceQuota::try_new(PendingQueuePublisherKind::CoordinatorRegistration, 10_000, 15 * mib, mib).unwrap(),
-                PendingQueueSourceQuota::try_new(PendingQueuePublisherKind::CoordinatorDeploy, 10_000, 47 * mib, mib).unwrap(),
-                PendingQueueSourceQuota::try_new(PendingQueuePublisherKind::CoordinatorGuta, 10_000, 63 * mib, mib).unwrap(),
-            ],
-            128 * mib,
-        ).unwrap();
-        let validated = segment.validate_stream_config_structure(&segment.stream_config()).unwrap();
-        let bootstrap = PendingQueueSegmentLedgerBootstrap::try_new(key, &validated, budget, 8).unwrap();
-        let assignment = match bootstrap.candidate().reserve_generation(context).unwrap() {
-            PendingQueueSegmentReservationPlan::Advance { assignment, .. } => assignment,
-            _ => unreachable!(),
-        };
-        let route = RecoverableNatsSourceRoute::try_new(
-            context, PendingQueuePublisherKind::CoordinatorGuta, &segment,
-        ).unwrap();
-        let source = PendingQueuePublishSourceState::bootstrap(&route, &assignment).unwrap();
-        (segment, assignment, route, source)
-    }
-
-    fn envelope() -> (RecoverableNatsStreamSegment, PendingQueuePublishEnvelope) {
-        let (segment, assignment, route, source) = fixture();
-        let envelope = PendingQueuePublishEnvelope::data(
-            &route,
-            &assignment,
-            PendingQueuePublishIntentId::try_new([9; 32]).unwrap(),
-            PendingQueueMemberOrdinal::try_new(1).unwrap(),
-            source.last_subject_sequence(),
-            source.last_envelope_digest(),
-            b"typed-outbox".to_vec(),
-        ).unwrap();
-        (segment, envelope)
-    }
 
     #[test]
     fn queries_separate_small_lwt_headers_from_immutable_fragments() {
@@ -1141,38 +954,11 @@ mod tests {
     }
 
     #[test]
-    fn sealed_transport_plan_has_no_dynamic_subject_or_timestamp_holes() {
-        let (segment, envelope) = envelope();
-        let sealed = SealedPendingQueueNatsPublish::from_envelope(&segment, &envelope).unwrap();
-        assert_eq!(sealed.expected_stream, segment.stream_name());
-        assert_eq!(sealed.expected_last_subject_sequence, 0);
-        assert_eq!(sealed.message_id, envelope.message_id());
-        assert_eq!(sealed.payload, envelope.to_canonical_bytes());
-        assert_eq!(sealed.envelope_digest, *envelope.digest().as_bytes());
-        assert!(sealed.subject.starts_with(segment.subject_prefix()));
-        assert!(sealed.subject.ends_with(".K03"));
-    }
-
-    #[test]
-    fn leader_readback_requires_exact_subject_sequence_payload_and_ack() {
-        let (segment, envelope) = envelope();
-        let sealed = SealedPendingQueueNatsPublish::from_envelope(&segment, &envelope).unwrap();
-        assert_eq!(
-            classify_leader_observation(
-                &sealed,
-                &sealed.subject,
-                7,
-                &sealed.payload,
-                Some(7),
-            ).unwrap(),
-            7,
-        );
-        assert!(classify_leader_observation(&sealed, "foreign", 7, &sealed.payload, None).is_err());
-        assert!(classify_leader_observation(&sealed, &sealed.subject, 0, &sealed.payload, None).is_err());
-        let mut foreign = sealed.payload.clone();
-        foreign[20] ^= 1;
-        assert!(classify_leader_observation(&sealed, &sealed.subject, 7, &foreign, None).is_err());
-        assert!(classify_leader_observation(&sealed, &sealed.subject, 8, &sealed.payload, Some(7)).is_err());
+    fn nats_transport_is_confined_to_psy_node_nats() {
+        let source = include_str!("pending_queue_publish_store.rs");
+        assert!(!source.contains(concat!("jetstream", "::Context")));
+        assert!(!source.contains(concat!("send_", "publish(")));
+        assert!(!source.contains(concat!("get_last_raw_message", "_by_subject")));
     }
 
     #[test]
