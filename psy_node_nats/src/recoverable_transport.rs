@@ -6,7 +6,13 @@
 //! opaque delivery batch whose raw messages can only be acknowledged through
 //! this module.
 
-use std::{error::Error, fmt, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    error::Error,
+    fmt,
+    sync::Arc,
+    time::Duration,
+};
 
 use async_nats::{
     jetstream::{
@@ -21,7 +27,7 @@ use async_nats::{
     ToServerAddrs,
 };
 use bytes::Bytes;
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use psy_node_core::queue::recoverable_ephemeral::{
     PendingQueueSourceIdentity, MAX_RECOVERABLE_QUEUE_BATCH_ITEMS,
 };
@@ -52,6 +58,182 @@ const DURABLE_PREFIX: &str = "psy_beq_v2_";
 const DURABLE_DIGEST_DOMAIN: &[u8] = b"psy/rollback/recoverable-nats-durable/v1";
 const CONSUMER_DIGEST_DOMAIN: &[u8] = b"psy/rollback/recoverable-nats-consumer/v1";
 const DEFAULT_ACK_WAIT: Duration = Duration::from_secs(30);
+const CONSUMER_MANIFEST_DOMAIN: &[u8] =
+    b"psy/rollback/recoverable-nats-consumer-manifest/v1";
+const CONSUMER_CONFIG_DOMAIN: &[u8] =
+    b"psy/rollback/recoverable-nats-consumer-config/v1";
+const CONSUMER_INVENTORY_DOMAIN: &[u8] =
+    b"psy/rollback/recoverable-nats-consumer-inventory/v1";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoverableNatsExpectedConsumer {
+    subject: String,
+    consumer_digest: [u8; 32],
+}
+
+impl RecoverableNatsExpectedConsumer {
+    pub fn try_new(
+        subject: impl Into<String>,
+        consumer_digest: [u8; 32],
+    ) -> Result<Self, RecoverableNatsTransportError> {
+        let subject = subject.into();
+        if subject.is_empty() || consumer_digest == [0; 32] {
+            return Err(RecoverableNatsTransportError::ConsumerInventoryMismatch);
+        }
+        Ok(Self {
+            subject,
+            consumer_digest,
+        })
+    }
+
+    pub fn subject(&self) -> &str {
+        &self.subject
+    }
+
+    pub const fn consumer_digest(&self) -> &[u8; 32] {
+        &self.consumer_digest
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RecoverableNatsConsumerManifestDigest([u8; 32]);
+
+impl RecoverableNatsConsumerManifestDigest {
+    fn try_new(bytes: [u8; 32]) -> Result<Self, RecoverableNatsTransportError> {
+        if bytes == [0; 32] {
+            Err(RecoverableNatsTransportError::ConsumerInventoryMismatch)
+        } else {
+            Ok(Self(bytes))
+        }
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    pub fn try_from_bytes(bytes: [u8; 32]) -> Result<Self, RecoverableNatsTransportError> {
+        Self::try_new(bytes)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoverableNatsExpectedConsumerManifest {
+    instance: SealedRecoverableNatsStreamInstance,
+    consumers: Vec<RecoverableNatsExpectedConsumer>,
+    digest: RecoverableNatsConsumerManifestDigest,
+}
+
+impl RecoverableNatsExpectedConsumerManifest {
+    pub fn try_new(
+        instance: SealedRecoverableNatsStreamInstance,
+        mut consumers: Vec<RecoverableNatsExpectedConsumer>,
+    ) -> Result<Self, RecoverableNatsTransportError> {
+        consumers.sort_by(|left, right| left.subject.cmp(&right.subject));
+        if consumers.len() as u64 != instance.state().consumer_count()
+            || consumers.windows(2).any(|pair| pair[0].subject == pair[1].subject)
+            || consumers.iter().any(|consumer| {
+                !subject_matches(
+                    &format!("{}.>", instance.segment().subject_prefix()),
+                    &consumer.subject,
+                )
+            })
+        {
+            return Err(RecoverableNatsTransportError::ConsumerInventoryMismatch);
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(CONSUMER_MANIFEST_DOMAIN);
+        hasher.update(instance.instance_id().as_bytes());
+        hasher.update(instance.segment().digest().as_bytes());
+        hasher.update((consumers.len() as u64).to_be_bytes());
+        for consumer in &consumers {
+            hash_component(&mut hasher, consumer.subject.as_bytes());
+            hasher.update(consumer.consumer_digest);
+        }
+        let digest = RecoverableNatsConsumerManifestDigest::try_new(
+            hasher.finalize().into(),
+        )?;
+        Ok(Self {
+            instance,
+            consumers,
+            digest,
+        })
+    }
+
+    pub const fn instance(&self) -> &SealedRecoverableNatsStreamInstance {
+        &self.instance
+    }
+
+    pub fn consumers(&self) -> &[RecoverableNatsExpectedConsumer] {
+        &self.consumers
+    }
+
+    pub const fn digest(&self) -> RecoverableNatsConsumerManifestDigest {
+        self.digest
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RecoverableNatsConsumerInventoryDigest([u8; 32]);
+
+impl RecoverableNatsConsumerInventoryDigest {
+    fn try_new(bytes: [u8; 32]) -> Result<Self, RecoverableNatsTransportError> {
+        if bytes == [0; 32] {
+            Err(RecoverableNatsTransportError::ConsumerInventoryMismatch)
+        } else {
+            Ok(Self(bytes))
+        }
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    pub fn try_from_bytes(bytes: [u8; 32]) -> Result<Self, RecoverableNatsTransportError> {
+        Self::try_new(bytes)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoverableNatsConsumerInventoryReceipt {
+    instance_id: [u8; 32],
+    manifest_digest: RecoverableNatsConsumerManifestDigest,
+    inventory_digest: RecoverableNatsConsumerInventoryDigest,
+    consumer_count: u64,
+}
+
+impl RecoverableNatsConsumerInventoryReceipt {
+    pub const fn instance_id(&self) -> &[u8; 32] {
+        &self.instance_id
+    }
+
+    pub const fn manifest_digest(&self) -> RecoverableNatsConsumerManifestDigest {
+        self.manifest_digest
+    }
+
+    pub const fn inventory_digest(&self) -> RecoverableNatsConsumerInventoryDigest {
+        self.inventory_digest
+    }
+
+    pub const fn consumer_count(&self) -> u64 {
+        self.consumer_count
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RecoverableNatsObservedConsumer {
+    subject: String,
+    name: String,
+    consumer_digest: [u8; 32],
+    config_digest: [u8; 32],
+    created_nanos: i128,
+    delivered_consumer_sequence: u64,
+    delivered_stream_sequence: u64,
+    delivered_last_active_nanos: Option<i128>,
+    ack_floor_consumer_sequence: u64,
+    ack_floor_stream_sequence: u64,
+    ack_floor_last_active_nanos: Option<i128>,
+    num_redelivered: usize,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoverableNatsCaptureSpec {
@@ -942,6 +1124,48 @@ impl NatsJetStreamClient {
         Ok(receipt)
     }
 
+    /// Enumerates the complete durable-consumer set of one exact sealed
+    /// stream twice and accepts it only when every expected consumer has its
+    /// exact typed contract and is fully quiescent. This is observation only;
+    /// it neither deletes consumers nor grants stream-delete authority.
+    pub async fn inventory_recoverable_sealed_segment_consumers(
+        &self,
+        manifest: RecoverableNatsExpectedConsumerManifest,
+    ) -> Result<RecoverableNatsConsumerInventoryReceipt, RecoverableNatsTransportError> {
+        let expected = manifest.instance().clone();
+        if self.base_namespace() != expected.segment().base_namespace() {
+            return Err(RecoverableNatsTransportError::ClientNamespaceMismatch);
+        }
+        let stream = self
+            .raw_context_for_recoverable_transport()
+            .get_stream(expected.segment().stream_name())
+            .await
+            .map_err(nats)?;
+        let before = expected
+            .segment()
+            .attest_sealed_instance(&stream.get_info().await.map_err(nats)?)
+            .map_err(|error| RecoverableNatsTransportError::Core(error.to_string()))?;
+        if before != expected {
+            return Err(RecoverableNatsTransportError::ConsumerInventoryChanged);
+        }
+        let first = collect_recoverable_consumer_inventory(&stream, &manifest).await?;
+        let second = collect_recoverable_consumer_inventory(&stream, &manifest).await?;
+        let after = expected
+            .segment()
+            .attest_sealed_instance(&stream.get_info().await.map_err(nats)?)
+            .map_err(|error| RecoverableNatsTransportError::Core(error.to_string()))?;
+        if first != second || after != expected {
+            return Err(RecoverableNatsTransportError::ConsumerInventoryChanged);
+        }
+        let inventory_digest = consumer_inventory_digest(manifest.digest(), &first)?;
+        Ok(RecoverableNatsConsumerInventoryReceipt {
+            instance_id: *expected.instance_id().as_bytes(),
+            manifest_digest: manifest.digest(),
+            inventory_digest,
+            consumer_count: first.len() as u64,
+        })
+    }
+
     pub async fn recoverable_pending_publisher(
         &self,
         segment: RecoverableNatsStreamSegment,
@@ -980,6 +1204,128 @@ impl NatsJetStreamClient {
             inner: consumer,
             spec,
         })
+    }
+}
+
+async fn collect_recoverable_consumer_inventory(
+    stream: &jetstream::stream::Stream,
+    manifest: &RecoverableNatsExpectedConsumerManifest,
+) -> Result<Vec<RecoverableNatsObservedConsumer>, RecoverableNatsTransportError> {
+    let expected = manifest
+        .consumers()
+        .iter()
+        .map(|consumer| (consumer.subject(), consumer.consumer_digest()))
+        .collect::<BTreeMap<_, _>>();
+    let mut infos = stream.consumers();
+    let mut observed = Vec::with_capacity(expected.len());
+    while let Some(info) = infos.try_next().await.map_err(nats)? {
+        let max_batch = usize::try_from(info.config.max_batch)
+            .map_err(|_| RecoverableNatsTransportError::ConsumerContract)?;
+        let spec = RecoverableNatsCaptureSpec::for_segment(
+            manifest.instance().segment().clone(),
+            info.config.filter_subject.clone(),
+            max_batch,
+        )?;
+        spec.attest_consumer(&info.config)?;
+        let expected_digest = expected
+            .get(spec.subject())
+            .ok_or(RecoverableNatsTransportError::ConsumerInventoryMismatch)?;
+        if info.stream_name != manifest.instance().segment().stream_name()
+            || info.name != spec.durable()
+            || expected_digest.as_slice() != spec.consumer_digest().as_slice()
+            || info.num_pending != 0
+            || info.num_ack_pending != 0
+            || info.num_waiting != 0
+            || info.push_bound
+            || info.delivered.consumer_sequence == 0
+            || info.delivered.consumer_sequence != info.ack_floor.consumer_sequence
+            || info.delivered.stream_sequence != info.ack_floor.stream_sequence
+        {
+            return Err(RecoverableNatsTransportError::ConsumerNotQuiescent);
+        }
+        observed.push(RecoverableNatsObservedConsumer {
+            subject: spec.subject().to_owned(),
+            name: info.name,
+            consumer_digest: spec.consumer_digest(),
+            config_digest: recoverable_consumer_config_digest(&spec, &info.config),
+            created_nanos: info.created.unix_timestamp_nanos(),
+            delivered_consumer_sequence: info.delivered.consumer_sequence,
+            delivered_stream_sequence: info.delivered.stream_sequence,
+            delivered_last_active_nanos: info
+                .delivered
+                .last_active
+                .map(|time| time.unix_timestamp_nanos()),
+            ack_floor_consumer_sequence: info.ack_floor.consumer_sequence,
+            ack_floor_stream_sequence: info.ack_floor.stream_sequence,
+            ack_floor_last_active_nanos: info
+                .ack_floor
+                .last_active
+                .map(|time| time.unix_timestamp_nanos()),
+            num_redelivered: info.num_redelivered,
+        });
+    }
+    observed.sort_by(|left, right| left.subject.cmp(&right.subject));
+    if observed.len() != expected.len()
+        || observed.windows(2).any(|pair| pair[0].subject == pair[1].subject)
+        || observed
+            .iter()
+            .map(|entry| entry.subject.as_str())
+            .ne(expected.keys().copied())
+    {
+        return Err(RecoverableNatsTransportError::ConsumerInventoryMismatch);
+    }
+    Ok(observed)
+}
+
+fn recoverable_consumer_config_digest(
+    spec: &RecoverableNatsCaptureSpec,
+    config: &jetstream::consumer::Config,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(CONSUMER_CONFIG_DOMAIN);
+    hasher.update(spec.consumer_digest());
+    hasher.update((config.num_replicas as u64).to_be_bytes());
+    let metadata = config.metadata.iter().collect::<BTreeMap<_, _>>();
+    hasher.update((metadata.len() as u64).to_be_bytes());
+    for (key, value) in metadata {
+        hash_component(&mut hasher, key.as_bytes());
+        hash_component(&mut hasher, value.as_bytes());
+    }
+    hasher.finalize().into()
+}
+
+fn consumer_inventory_digest(
+    manifest_digest: RecoverableNatsConsumerManifestDigest,
+    consumers: &[RecoverableNatsObservedConsumer],
+) -> Result<RecoverableNatsConsumerInventoryDigest, RecoverableNatsTransportError> {
+    let mut hasher = Sha256::new();
+    hasher.update(CONSUMER_INVENTORY_DOMAIN);
+    hasher.update(manifest_digest.as_bytes());
+    hasher.update((consumers.len() as u64).to_be_bytes());
+    for consumer in consumers {
+        hash_component(&mut hasher, consumer.subject.as_bytes());
+        hash_component(&mut hasher, consumer.name.as_bytes());
+        hasher.update(consumer.consumer_digest);
+        hasher.update(consumer.config_digest);
+        hasher.update(consumer.created_nanos.to_be_bytes());
+        hasher.update(consumer.delivered_consumer_sequence.to_be_bytes());
+        hasher.update(consumer.delivered_stream_sequence.to_be_bytes());
+        encode_optional_nanos(&mut hasher, consumer.delivered_last_active_nanos);
+        hasher.update(consumer.ack_floor_consumer_sequence.to_be_bytes());
+        hasher.update(consumer.ack_floor_stream_sequence.to_be_bytes());
+        encode_optional_nanos(&mut hasher, consumer.ack_floor_last_active_nanos);
+        hasher.update((consumer.num_redelivered as u64).to_be_bytes());
+    }
+    RecoverableNatsConsumerInventoryDigest::try_new(hasher.finalize().into())
+}
+
+fn encode_optional_nanos(hasher: &mut Sha256, value: Option<i128>) {
+    match value {
+        Some(value) => {
+            hasher.update([1]);
+            hasher.update(value.to_be_bytes());
+        }
+        None => hasher.update([0]),
     }
 }
 
@@ -1155,6 +1501,9 @@ pub enum RecoverableNatsTransportError {
     SourceNotSealed,
     SourceScanChanged,
     WholeStreamScanChanged,
+    ConsumerInventoryMismatch,
+    ConsumerInventoryChanged,
+    ConsumerNotQuiescent,
     SealNotApplied,
     SealRecreatedInstance,
     SealEvidenceChanged,
@@ -1324,6 +1673,99 @@ mod tests {
             require_same_segment_evidence(&expected, expected.instance_id(), changed),
             Err(RecoverableNatsTransportError::SealEvidenceChanged),
         );
+    }
+
+    #[test]
+    fn consumer_manifest_and_inventory_commit_exact_identity_and_config() {
+        let segment = envelope().0;
+        let subject = segment
+            .exact_subject("coord.r0.rs0.p100.topic1.g0")
+            .unwrap();
+        let spec = RecoverableNatsCaptureSpec::for_segment(
+            segment.clone(),
+            subject.clone(),
+            16,
+        )
+        .unwrap();
+        let state = crate::recoverable_segment::RecoverableNatsStreamStateSnapshot::try_new(
+            1, 100, 1, 1, 1, 1,
+        )
+        .unwrap();
+        let sealed = segment.model_sealed_instance(
+            1_700_000_000_000_000_000,
+            state,
+        );
+        let expected = RecoverableNatsExpectedConsumer::try_new(
+            subject.clone(),
+            spec.consumer_digest(),
+        )
+        .unwrap();
+        let manifest = RecoverableNatsExpectedConsumerManifest::try_new(
+            sealed.clone(),
+            vec![expected.clone()],
+        )
+        .unwrap();
+        assert_eq!(
+            manifest,
+            RecoverableNatsExpectedConsumerManifest::try_new(
+                sealed.clone(),
+                vec![expected],
+            )
+            .unwrap(),
+        );
+        assert!(RecoverableNatsExpectedConsumerManifest::try_new(
+            sealed.clone(),
+            Vec::new(),
+        )
+        .is_err());
+        assert!(RecoverableNatsExpectedConsumerManifest::try_new(
+            sealed,
+            vec![
+                RecoverableNatsExpectedConsumer::try_new(
+                    subject.clone(),
+                    spec.consumer_digest(),
+                )
+                .unwrap(),
+                RecoverableNatsExpectedConsumer::try_new(
+                    subject,
+                    spec.consumer_digest(),
+                )
+                .unwrap(),
+            ],
+        )
+        .is_err());
+
+        let mut config = spec.pull_config().into_consumer_config();
+        config.metadata.insert("_nats.b".into(), "2".into());
+        config.metadata.insert("_nats.a".into(), "1".into());
+        let first_config = recoverable_consumer_config_digest(&spec, &config);
+        let mut reordered = spec.pull_config().into_consumer_config();
+        reordered.metadata.insert("_nats.a".into(), "1".into());
+        reordered.metadata.insert("_nats.b".into(), "2".into());
+        assert_eq!(
+            first_config,
+            recoverable_consumer_config_digest(&spec, &reordered),
+        );
+
+        let observed = RecoverableNatsObservedConsumer {
+            subject: spec.subject().to_owned(),
+            name: spec.durable().to_owned(),
+            consumer_digest: spec.consumer_digest(),
+            config_digest: first_config,
+            created_nanos: 1_700_000_000_000_000_000,
+            delivered_consumer_sequence: 1,
+            delivered_stream_sequence: 1,
+            delivered_last_active_nanos: None,
+            ack_floor_consumer_sequence: 1,
+            ack_floor_stream_sequence: 1,
+            ack_floor_last_active_nanos: None,
+            num_redelivered: 0,
+        };
+        let first = consumer_inventory_digest(manifest.digest(), &[observed.clone()]).unwrap();
+        let mut recreated = observed;
+        recreated.created_nanos += 1;
+        let second = consumer_inventory_digest(manifest.digest(), &[recreated]).unwrap();
+        assert_ne!(first, second);
     }
 
     fn fixture_for_segment(

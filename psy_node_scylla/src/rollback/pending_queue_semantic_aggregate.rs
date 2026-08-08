@@ -128,6 +128,22 @@ struct SemanticSourceEntry {
     nats_scan_digest: [u8; 32],
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PendingQueueArchivedConsumerCommitment {
+    publisher_kind: PendingQueuePublisherKind,
+    consumer_digest: [u8; 32],
+}
+
+impl PendingQueueArchivedConsumerCommitment {
+    pub(super) const fn publisher_kind(&self) -> PendingQueuePublisherKind {
+        self.publisher_kind
+    }
+
+    pub(super) const fn consumer_digest(&self) -> [u8; 32] {
+        self.consumer_digest
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct StoredPendingQueueSemanticGeneration {
     slot: PendingQueueSemanticGenerationSlot,
@@ -824,6 +840,40 @@ impl ScyllaPendingQueueSemanticAggregateStore {
             revision.ok_or(PendingQueueSemanticAggregateError::MissingColumn)?,
             payload.as_deref().ok_or(PendingQueueSemanticAggregateError::MissingColumn)?,
         )?))
+    }
+
+    /// Reconstructs the expected durable-consumer commitments for one exact
+    /// archived assignment. The caller supplies the archive slot/digest that
+    /// was independently committed by the immutable generation terminal.
+    pub(super) async fn observe_archived_consumers(
+        &self,
+        ledger_slot: PendingQueueSegmentLedgerSlot,
+        assignment: &PendingQueueGenerationSegmentAssignment,
+        archive_slot: [u8; 32],
+        archive_digest: [u8; 32],
+    ) -> Result<Vec<PendingQueueArchivedConsumerCommitment>, PendingQueueSemanticAggregateError>
+    {
+        let slot = PendingQueueSemanticGenerationSlot::try_new(archive_slot)?;
+        let current = self
+            .read(slot)
+            .await?
+            .ok_or(PendingQueueSemanticAggregateError::ReceiptStale)?;
+        if current.slot != slot
+            || current.digest.as_bytes() != &archive_digest
+            || current.assignment_ledger_slot != *ledger_slot.as_bytes()
+            || current.assignment_digest != assignment.digest()
+            || current.assignment_payload != assignment.to_canonical_bytes()
+        {
+            return Err(PendingQueueSemanticAggregateError::ReceiptStale);
+        }
+        Ok(current
+            .sources
+            .iter()
+            .map(|source| PendingQueueArchivedConsumerCommitment {
+                publisher_kind: source.publisher_kind,
+                consumer_digest: source.consumer_digest,
+            })
+            .collect())
     }
 
     pub(super) async fn persist_verified<Hash: Q256BitHash>(
