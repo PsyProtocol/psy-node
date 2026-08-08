@@ -39,6 +39,8 @@ mod pending_queue_semantic_terminal;
 mod pending_queue_semantic_aggregate;
 mod pending_queue_generation_terminal;
 #[allow(dead_code)]
+mod pending_queue_segment_lifecycle;
+#[allow(dead_code)]
 mod pending_queue_nats_capture;
 #[cfg(test)]
 mod branch_exact_shadow_reader_rf3_gate;

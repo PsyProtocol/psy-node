@@ -241,6 +241,14 @@ struct LedgerDbRow {
 pub struct PendingQueueSegmentLedgerStoreFingerprint([u8; 32]);
 
 impl PendingQueueSegmentLedgerStoreFingerprint {
+    pub(super) fn try_new(bytes: [u8; 32]) -> Result<Self, PendingQueueSegmentLedgerStoreError> {
+        if bytes == [0; 32] {
+            Err(PendingQueueSegmentLedgerStoreError::ClosureBindingMismatch)
+        } else {
+            Ok(Self(bytes))
+        }
+    }
+
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
@@ -302,6 +310,14 @@ pub struct PendingQueueSegmentAssignmentReceipt {
 pub(super) struct PendingQueueSegmentClosureDigest([u8; 32]);
 
 impl PendingQueueSegmentClosureDigest {
+    pub(super) fn try_new(bytes: [u8; 32]) -> Result<Self, PendingQueueSegmentLedgerStoreError> {
+        if bytes == [0; 32] {
+            Err(PendingQueueSegmentLedgerStoreError::ClosureBindingMismatch)
+        } else {
+            Ok(Self(bytes))
+        }
+    }
+
     pub(super) const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
@@ -330,6 +346,10 @@ impl PendingQueueSegmentClosureSnapshot {
 
     pub(super) const fn ledger_revision(&self) -> PendingQueueSegmentLedgerRevision {
         self.ledger_revision
+    }
+
+    pub(super) const fn ledger_slot(&self) -> PendingQueueSegmentLedgerSlot {
+        self.ledger_key.slot()
     }
 
     pub(super) const fn segment_id(&self) -> RecoverableNatsSegmentId {

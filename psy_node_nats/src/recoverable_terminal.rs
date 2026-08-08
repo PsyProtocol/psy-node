@@ -650,6 +650,10 @@ impl PendingQueueNatsWholeStreamManifestDigest {
         &self.0
     }
 
+    pub fn try_from_bytes(bytes: [u8; 32]) -> Result<Self, PendingQueueTerminalError> {
+        Self::try_new(bytes)
+    }
+
     /// Deterministic assignment-set commitment shared by the durable
     /// SealRequested row (live observation) and the later sealed scanner.
     /// This helper is not a seal/delete permit; callers must still prove the
@@ -658,9 +662,16 @@ impl PendingQueueNatsWholeStreamManifestDigest {
         instance_id: RecoverableNatsStreamInstanceId,
         assignments: &[PendingQueueGenerationSegmentAssignment],
     ) -> Result<Self, PendingQueueTerminalError> {
+        Self::for_instance_assignments_raw(*instance_id.as_bytes(), assignments)
+    }
+
+    pub fn for_instance_assignments_raw(
+        instance_id: [u8; 32],
+        assignments: &[PendingQueueGenerationSegmentAssignment],
+    ) -> Result<Self, PendingQueueTerminalError> {
         let mut hasher = Sha256::new();
         hasher.update(WHOLE_STREAM_MANIFEST_DOMAIN);
-        hasher.update(instance_id.as_bytes());
+        hasher.update(instance_id);
         hasher.update((assignments.len() as u64).to_be_bytes());
         for assignment in assignments {
             let bytes = assignment.to_canonical_bytes();
