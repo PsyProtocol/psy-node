@@ -219,6 +219,27 @@ struct StoredPendingQueueSegmentSealRequest {
 }
 
 impl StoredPendingQueueSegmentSealRequest {
+    fn matches_closure_binding(
+        &self,
+        closure: &PendingQueueSegmentClosureSnapshot,
+    ) -> bool {
+        self.ledger_store_fingerprint == closure.store_fingerprint()
+            && self.ledger_slot == closure.ledger_slot()
+            && self.ledger_revision == closure.ledger_revision()
+            && self.ledger_payload_digest == closure.ledger_payload_digest()
+            && self.segment_id == closure.segment_id()
+            && self.contract_digest == closure.contract_digest()
+            && self.terminals.len() == closure.assignments().len()
+            && self
+                .terminals
+                .iter()
+                .zip(closure.assignments())
+                .all(|(terminal, assignment)| {
+                    terminal.assignment_payload
+                        == assignment.assignment().to_canonical_bytes()
+                })
+    }
+
     fn try_from_verified(
         closure: &PendingQueueSegmentClosureSnapshot,
         live: &LiveRecoverableNatsStreamInstance,
@@ -913,6 +934,89 @@ pub(super) struct PersistedPendingQueueDeletedReceipt {
     current: StoredPendingQueueSegmentSealRequest,
 }
 
+/// Phase-typed durable recovery result. Reconstructing this enum only proves
+/// the exact lifecycle row and ledger-closure binding; every mutating method
+/// still revalidates all terminal/archive/pipeline/writer/head evidence before
+/// it may advance the row or touch NATS.
+#[derive(Debug)]
+pub(super) enum ResumedPendingQueueSegmentLifecycle {
+    SealRequested(PersistedPendingQueueSealRequestedReceipt),
+    StreamSealed(PersistedPendingQueueStreamSealedReceipt),
+    MessagesScanVerified(PersistedPendingQueueMessagesScanVerifiedReceipt),
+    ScanVerified(PersistedPendingQueueScanVerifiedReceipt),
+    DeleteRequested(PersistedPendingQueueDeleteRequestedReceipt),
+    Deleted(PersistedPendingQueueDeletedReceipt),
+}
+
+impl ResumedPendingQueueSegmentLifecycle {
+    pub(super) const fn revision(&self) -> u64 {
+        match self {
+            Self::SealRequested(_) => SEAL_REQUESTED_REVISION,
+            Self::StreamSealed(_) => STREAM_SEALED_REVISION,
+            Self::MessagesScanVerified(_) => MESSAGES_SCAN_VERIFIED_REVISION,
+            Self::ScanVerified(_) => SCAN_VERIFIED_REVISION,
+            Self::DeleteRequested(_) => DELETE_REQUESTED_REVISION,
+            Self::Deleted(_) => DELETED_REVISION,
+        }
+    }
+}
+
+fn classify_resumed_lifecycle(
+    store_fingerprint: PendingQueueSegmentLifecycleStoreFingerprint,
+    current: StoredPendingQueueSegmentSealRequest,
+) -> ResumedPendingQueueSegmentLifecycle {
+    match current.phase {
+        PendingQueueSegmentLifecyclePhase::SealRequested => {
+            ResumedPendingQueueSegmentLifecycle::SealRequested(
+                PersistedPendingQueueSealRequestedReceipt {
+                    store_fingerprint,
+                    current,
+                },
+            )
+        }
+        PendingQueueSegmentLifecyclePhase::StreamSealed => {
+            ResumedPendingQueueSegmentLifecycle::StreamSealed(
+                PersistedPendingQueueStreamSealedReceipt {
+                    store_fingerprint,
+                    current,
+                },
+            )
+        }
+        PendingQueueSegmentLifecyclePhase::MessagesScanVerified => {
+            ResumedPendingQueueSegmentLifecycle::MessagesScanVerified(
+                PersistedPendingQueueMessagesScanVerifiedReceipt {
+                    store_fingerprint,
+                    current,
+                },
+            )
+        }
+        PendingQueueSegmentLifecyclePhase::ScanVerified => {
+            ResumedPendingQueueSegmentLifecycle::ScanVerified(
+                PersistedPendingQueueScanVerifiedReceipt {
+                    store_fingerprint,
+                    current,
+                },
+            )
+        }
+        PendingQueueSegmentLifecyclePhase::DeleteRequested => {
+            ResumedPendingQueueSegmentLifecycle::DeleteRequested(
+                PersistedPendingQueueDeleteRequestedReceipt {
+                    store_fingerprint,
+                    current,
+                },
+            )
+        }
+        PendingQueueSegmentLifecyclePhase::Deleted => {
+            ResumedPendingQueueSegmentLifecycle::Deleted(
+                PersistedPendingQueueDeletedReceipt {
+                    store_fingerprint,
+                    current,
+                },
+            )
+        }
+    }
+}
+
 impl PersistedPendingQueueScanVerifiedReceipt {
     pub(super) const fn scan_digest(&self) -> Option<PendingQueueNatsWholeStreamScanDigest> {
         self.current.scan_digest
@@ -1036,21 +1140,7 @@ impl ScyllaPendingQueueSegmentLifecycleStore {
         closure: &PendingQueueSegmentClosureSnapshot,
         expected: &StoredPendingQueueSegmentSealRequest,
     ) -> Result<(), PendingQueueSegmentLifecycleError> {
-        if expected.ledger_store_fingerprint != closure.store_fingerprint()
-            || expected.ledger_slot != closure.ledger_slot()
-            || expected.ledger_revision != closure.ledger_revision()
-            || expected.ledger_payload_digest != closure.ledger_payload_digest()
-            || expected.segment_id != closure.segment_id()
-            || expected.contract_digest != closure.contract_digest()
-            || expected.terminals.len() != closure.assignments().len()
-            || expected
-                .terminals
-                .iter()
-                .zip(closure.assignments())
-                .any(|(terminal, assignment)| {
-                    terminal.assignment_payload != assignment.assignment().to_canonical_bytes()
-                })
-        {
+        if !expected.matches_closure_binding(closure) {
             return Err(PendingQueueSegmentLifecycleError::EvidenceChanged);
         }
         ledger_store.revalidate_segment_closure(closure).await?;
@@ -1073,6 +1163,28 @@ impl ScyllaPendingQueueSegmentLifecycleStore {
             return Err(PendingQueueSegmentLifecycleError::EvidenceChanged);
         }
         Ok(())
+    }
+
+    /// Reconstructs an opaque phase-typed receipt after process restart. The
+    /// caller cannot supply a raw lifecycle slot: it is derived from the exact
+    /// durable ledger closure, which is read before and after classification.
+    pub(super) async fn resume(
+        &self,
+        ledger_store: &ScyllaPendingQueueSegmentLedgerStore,
+        closure: &PendingQueueSegmentClosureSnapshot,
+    ) -> Result<ResumedPendingQueueSegmentLifecycle, PendingQueueSegmentLifecycleError> {
+        ledger_store.revalidate_segment_closure(closure).await?;
+        let slot = lifecycle_slot(closure.ledger_slot(), closure.segment_id())?;
+        let current = self
+            .read(slot)
+            .await?
+            .ok_or(PendingQueueSegmentLifecycleError::Uninitialized)?;
+        if !current.matches_closure_binding(closure) {
+            return Err(PendingQueueSegmentLifecycleError::EvidenceChanged);
+        }
+        let resumed = classify_resumed_lifecycle(self.fingerprint, current);
+        ledger_store.revalidate_segment_closure(closure).await?;
+        Ok(resumed)
     }
 
     async fn build_expected_consumer_manifest(
@@ -2343,6 +2455,7 @@ pub(super) enum PendingQueueSegmentLifecycleError {
     Truncated,
     TrailingBytes,
     MissingColumn,
+    Uninitialized,
     MissingAppliedColumn,
     InvalidAppliedColumn,
     MissingAfterLwt,
@@ -2434,6 +2547,65 @@ mod tests {
         let setup = include_str!("../psy_setup.rs");
         assert!(!setup.contains(PENDING_QUEUE_SEGMENT_LIFECYCLE_TABLE));
         assert!(!setup.contains("ScyllaPendingQueueSegmentLifecycleStore"));
+    }
+
+    #[test]
+    fn durable_resume_is_phase_typed_for_every_revision() {
+        let fingerprint = PendingQueueSegmentLifecycleStoreFingerprint([77; 32]);
+        let mut current = fixture();
+        for (phase, revision) in [
+            (
+                PendingQueueSegmentLifecyclePhase::SealRequested,
+                SEAL_REQUESTED_REVISION,
+            ),
+            (
+                PendingQueueSegmentLifecyclePhase::StreamSealed,
+                STREAM_SEALED_REVISION,
+            ),
+            (
+                PendingQueueSegmentLifecyclePhase::MessagesScanVerified,
+                MESSAGES_SCAN_VERIFIED_REVISION,
+            ),
+            (
+                PendingQueueSegmentLifecyclePhase::ScanVerified,
+                SCAN_VERIFIED_REVISION,
+            ),
+            (
+                PendingQueueSegmentLifecyclePhase::DeleteRequested,
+                DELETE_REQUESTED_REVISION,
+            ),
+            (
+                PendingQueueSegmentLifecyclePhase::Deleted,
+                DELETED_REVISION,
+            ),
+        ] {
+            current.phase = phase;
+            current.revision = revision;
+            let resumed = classify_resumed_lifecycle(fingerprint, current.clone());
+            assert_eq!(resumed.revision(), revision);
+            assert!(matches!(
+                (&resumed, phase),
+                (
+                    ResumedPendingQueueSegmentLifecycle::SealRequested(_),
+                    PendingQueueSegmentLifecyclePhase::SealRequested,
+                ) | (
+                    ResumedPendingQueueSegmentLifecycle::StreamSealed(_),
+                    PendingQueueSegmentLifecyclePhase::StreamSealed,
+                ) | (
+                    ResumedPendingQueueSegmentLifecycle::MessagesScanVerified(_),
+                    PendingQueueSegmentLifecyclePhase::MessagesScanVerified,
+                ) | (
+                    ResumedPendingQueueSegmentLifecycle::ScanVerified(_),
+                    PendingQueueSegmentLifecyclePhase::ScanVerified,
+                ) | (
+                    ResumedPendingQueueSegmentLifecycle::DeleteRequested(_),
+                    PendingQueueSegmentLifecyclePhase::DeleteRequested,
+                ) | (
+                    ResumedPendingQueueSegmentLifecycle::Deleted(_),
+                    PendingQueueSegmentLifecyclePhase::Deleted,
+                )
+            ));
+        }
     }
 
     #[test]
