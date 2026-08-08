@@ -21,7 +21,7 @@ use async_nats::{
             pull::Config as PullConfig, AckPolicy, DeliverPolicy, PullConsumer,
             ReplayPolicy,
         },
-        context::Publish,
+        context::{GetStreamErrorKind, Publish},
         stream::{Info as StreamInfo, RawMessageErrorKind, RetentionPolicy, StorageType},
     },
     ToServerAddrs,
@@ -43,7 +43,8 @@ use crate::{
         RecoverableNatsSourceRoute,
     },
     recoverable_segment::{
-        LiveRecoverableNatsStreamInstance, RecoverableNatsStreamSegment,
+        LiveRecoverableNatsStreamInstance, RecoverableNatsStreamInstanceId,
+        RecoverableNatsStreamSegment, RecoverableNatsStreamStateSnapshot,
         SealedRecoverableNatsStreamInstance,
     },
     recoverable_terminal::{
@@ -702,6 +703,75 @@ pub struct RecoverableNatsSealOutcome {
     disposition: RecoverableNatsSealDisposition,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoverableNatsDeleteDisposition {
+    Applied,
+    AlreadyAbsent,
+    ReconciledAfterResponseLoss,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RecoverableNatsDeleteOutcome {
+    instance_id: RecoverableNatsStreamInstanceId,
+    disposition: RecoverableNatsDeleteDisposition,
+}
+
+impl RecoverableNatsDeleteOutcome {
+    pub const fn instance_id(
+        self,
+    ) -> RecoverableNatsStreamInstanceId {
+        self.instance_id
+    }
+
+    pub const fn disposition(self) -> RecoverableNatsDeleteDisposition {
+        self.disposition
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoverableNatsDeleteExpectation {
+    segment: RecoverableNatsStreamSegment,
+    instance_id: RecoverableNatsStreamInstanceId,
+    state: RecoverableNatsStreamStateSnapshot,
+}
+
+impl RecoverableNatsDeleteExpectation {
+    pub fn try_new(
+        segment: RecoverableNatsStreamSegment,
+        instance_id: RecoverableNatsStreamInstanceId,
+        state: RecoverableNatsStreamStateSnapshot,
+    ) -> Result<Self, RecoverableNatsTransportError> {
+        if *instance_id.as_bytes() == [0; 32] {
+            return Err(RecoverableNatsTransportError::DeleteContractDrift);
+        }
+        Ok(Self {
+            segment,
+            instance_id,
+            state,
+        })
+    }
+
+    pub fn from_sealed(instance: &SealedRecoverableNatsStreamInstance) -> Self {
+        Self {
+            segment: instance.segment().clone(),
+            instance_id: instance.instance_id(),
+            state: instance.state(),
+        }
+    }
+
+    pub const fn segment(&self) -> &RecoverableNatsStreamSegment {
+        &self.segment
+    }
+
+    pub const fn instance_id(&self) -> RecoverableNatsStreamInstanceId {
+        self.instance_id
+    }
+
+    pub const fn state(&self) -> RecoverableNatsStreamStateSnapshot {
+        self.state
+    }
+}
+
 impl RecoverableNatsSealOutcome {
     pub const fn sealed(&self) -> &SealedRecoverableNatsStreamInstance {
         &self.sealed
@@ -1038,6 +1108,88 @@ impl NatsJetStreamClient {
         Ok(outcome)
     }
 
+    /// Deletes one exact, already sealed V2 stream incarnation.
+    ///
+    /// JetStream only offers a name-based delete, so this façade performs an
+    /// exact created-instance/state pre-read and a mandatory absence
+    /// readback. A higher-level durable `DeleteRequested` receipt and
+    /// stream-name non-reuse fence must authorize the call; this transport
+    /// method cannot provide an atomic server-side compare-and-delete.
+    pub async fn delete_recoverable_sealed_segment_instance(
+        &self,
+        expected: &RecoverableNatsDeleteExpectation,
+    ) -> Result<RecoverableNatsDeleteOutcome, RecoverableNatsTransportError> {
+        if self.base_namespace() != expected.segment().base_namespace() {
+            return Err(RecoverableNatsTransportError::ClientNamespaceMismatch);
+        }
+        let context = self.raw_context_for_recoverable_transport();
+        match context
+            .get_stream(expected.segment().stream_name())
+            .await
+        {
+            Ok(stream) => {
+                let observed = expected
+                    .segment()
+                    .attest_sealed_instance(&stream.get_info().await.map_err(nats)?)
+                    .map_err(|_| RecoverableNatsTransportError::DeleteContractDrift)?;
+                require_same_delete_instance(expected, &observed)?;
+            }
+            Err(error) if is_stream_not_found(error.kind()) => {
+                return Ok(RecoverableNatsDeleteOutcome {
+                    instance_id: expected.instance_id(),
+                    disposition: RecoverableNatsDeleteDisposition::AlreadyAbsent,
+                });
+            }
+            Err(error) => {
+                return Err(RecoverableNatsTransportError::DeleteIndeterminate(
+                    error.to_string(),
+                ));
+            }
+        }
+
+        let deletion = context
+            .delete_stream(expected.segment().stream_name())
+            .await;
+        if deletion.as_ref().is_ok_and(|status| !status.success) {
+            return Err(RecoverableNatsTransportError::DeleteNotApplied);
+        }
+        match context
+            .get_stream(expected.segment().stream_name())
+            .await
+        {
+            Err(error) if is_stream_not_found(error.kind()) => {
+                Ok(RecoverableNatsDeleteOutcome {
+                    instance_id: expected.instance_id(),
+                    disposition: if deletion.is_ok() {
+                        RecoverableNatsDeleteDisposition::Applied
+                    } else {
+                        RecoverableNatsDeleteDisposition::ReconciledAfterResponseLoss
+                    },
+                })
+            }
+            Ok(stream) => {
+                let observed = expected
+                    .segment()
+                    .attest_sealed_instance(&stream.get_info().await.map_err(nats)?)
+                    .map_err(|_| RecoverableNatsTransportError::DeleteRecreatedInstance)?;
+                require_same_delete_instance(expected, &observed)?;
+                Err(match deletion {
+                    Ok(_) => RecoverableNatsTransportError::DeleteNotApplied,
+                    Err(error) => RecoverableNatsTransportError::DeleteIndeterminate(
+                        error.to_string(),
+                    ),
+                })
+            }
+            Err(readback) => Err(RecoverableNatsTransportError::DeleteIndeterminate(format!(
+                "delete={}; readback={readback}",
+                deletion
+                    .as_ref()
+                    .map(|_| "ok".to_owned())
+                    .unwrap_or_else(|error| error.to_string()),
+            ))),
+        }
+    }
+
     pub async fn observe_recoverable_segment_instance(
         &self,
         segment: RecoverableNatsStreamSegment,
@@ -1329,6 +1481,27 @@ fn encode_optional_nanos(hasher: &mut Sha256, value: Option<i128>) {
     }
 }
 
+fn is_stream_not_found(kind: GetStreamErrorKind) -> bool {
+    matches!(
+        kind,
+        GetStreamErrorKind::JetStream(error)
+            if error.error_code() == jetstream::ErrorCode::STREAM_NOT_FOUND
+    )
+}
+
+fn require_same_delete_instance(
+    expected: &RecoverableNatsDeleteExpectation,
+    observed: &SealedRecoverableNatsStreamInstance,
+) -> Result<(), RecoverableNatsTransportError> {
+    if expected.instance_id() != observed.instance_id() {
+        return Err(RecoverableNatsTransportError::DeleteRecreatedInstance);
+    }
+    if expected.segment() != observed.segment() || expected.state() != observed.state() {
+        return Err(RecoverableNatsTransportError::DeleteEvidenceChanged);
+    }
+    Ok(())
+}
+
 fn classify_segment_observation(
     expected: &LiveRecoverableNatsStreamInstance,
     info: &StreamInfo,
@@ -1509,6 +1682,11 @@ pub enum RecoverableNatsTransportError {
     SealEvidenceChanged,
     SealContractDrift,
     SealIndeterminate(String),
+    DeleteNotApplied,
+    DeleteRecreatedInstance,
+    DeleteEvidenceChanged,
+    DeleteContractDrift,
+    DeleteIndeterminate(String),
     SourceScan(String),
     AckMismatch {
         stream: String,
@@ -1673,6 +1851,54 @@ mod tests {
             require_same_segment_evidence(&expected, expected.instance_id(), changed),
             Err(RecoverableNatsTransportError::SealEvidenceChanged),
         );
+    }
+
+    #[test]
+    fn typed_delete_identity_and_disposition_are_exact() {
+        let segment = envelope().0;
+        let state = crate::recoverable_segment::RecoverableNatsStreamStateSnapshot::try_new(
+            1, 100, 1, 1, 0, 1,
+        )
+        .unwrap();
+        let sealed = segment.model_sealed_instance(1_700_000_000_000_000_000, state);
+        assert_eq!(
+            RecoverableNatsStreamInstanceId::try_from_bytes(*sealed.instance_id().as_bytes())
+                .unwrap(),
+            sealed.instance_id(),
+        );
+        assert!(RecoverableNatsStreamInstanceId::try_from_bytes([0; 32]).is_err());
+        let expected = RecoverableNatsDeleteExpectation::from_sealed(&sealed);
+        assert_eq!(require_same_delete_instance(&expected, &sealed), Ok(()));
+
+        let recreated = segment.model_sealed_instance(1_700_000_000_000_000_001, state);
+        assert_eq!(
+            require_same_delete_instance(&expected, &recreated),
+            Err(RecoverableNatsTransportError::DeleteRecreatedInstance),
+        );
+        let changed_state =
+            crate::recoverable_segment::RecoverableNatsStreamStateSnapshot::try_new(
+                1, 101, 1, 1, 0, 1,
+            )
+            .unwrap();
+        let changed =
+            segment.model_sealed_instance(1_700_000_000_000_000_000, changed_state);
+        assert_eq!(
+            require_same_delete_instance(&expected, &changed),
+            Err(RecoverableNatsTransportError::DeleteEvidenceChanged),
+        );
+
+        for disposition in [
+            RecoverableNatsDeleteDisposition::Applied,
+            RecoverableNatsDeleteDisposition::AlreadyAbsent,
+            RecoverableNatsDeleteDisposition::ReconciledAfterResponseLoss,
+        ] {
+            let outcome = RecoverableNatsDeleteOutcome {
+                instance_id: expected.instance_id(),
+                disposition,
+            };
+            assert_eq!(outcome.instance_id(), expected.instance_id());
+            assert_eq!(outcome.disposition(), disposition);
+        }
     }
 
     #[test]
@@ -2093,10 +2319,15 @@ mod tests {
         assert_eq!(whole.instance_id(), sealed_instance.instance_id());
         assert_eq!(whole.state(), sealed_instance.state());
         assert!(publisher.publish(&seal).await.is_err());
-        assert!(context
-            .delete_stream(segment.stream_name())
-            .await
-            .unwrap()
-            .success);
+        assert_eq!(
+            client
+                .delete_recoverable_sealed_segment_instance(
+                    &RecoverableNatsDeleteExpectation::from_sealed(&sealed_instance),
+                )
+                .await
+                .unwrap()
+                .disposition(),
+            RecoverableNatsDeleteDisposition::Applied,
+        );
     }
 }

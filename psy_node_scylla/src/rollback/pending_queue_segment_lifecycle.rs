@@ -18,7 +18,8 @@ use psy_node_nats::{
     },
     recoverable_segment::{
         LiveRecoverableNatsStreamInstance, RecoverableNatsSegmentContractDigest,
-        RecoverableNatsSegmentId, RecoverableNatsStreamSegment,
+        RecoverableNatsSegmentId, RecoverableNatsStreamInstanceId,
+        RecoverableNatsStreamSegment,
         RecoverableNatsStreamStateSnapshot,
         SealedRecoverableNatsStreamInstance,
     },
@@ -31,7 +32,7 @@ use psy_node_nats::{
         PendingQueueTerminalError,
     },
     recoverable_transport::{
-        RecoverableNatsConsumerInventoryDigest,
+        RecoverableNatsConsumerInventoryDigest, RecoverableNatsDeleteExpectation,
         RecoverableNatsConsumerInventoryReceipt,
         RecoverableNatsConsumerManifestDigest,
         RecoverableNatsExpectedConsumer,
@@ -71,6 +72,7 @@ const STREAM_SEALED_REVISION: u64 = 2;
 const MESSAGES_SCAN_VERIFIED_REVISION: u64 = 3;
 const SCAN_VERIFIED_REVISION: u64 = 4;
 const DELETE_REQUESTED_REVISION: u64 = 5;
+const DELETED_REVISION: u64 = 6;
 const SLOT_DOMAIN: &[u8] = b"psy/rollback/pending-queue-segment-lifecycle-slot/v1";
 const DIGEST_DOMAIN: &[u8] = b"psy/rollback/pending-queue-segment-lifecycle/v1";
 const STORE_FINGERPRINT_DOMAIN: &[u8] =
@@ -86,6 +88,7 @@ enum PendingQueueSegmentLifecyclePhase {
     MessagesScanVerified = 3,
     ScanVerified = 4,
     DeleteRequested = 5,
+    Deleted = 6,
 }
 
 impl PendingQueueSegmentLifecyclePhase {
@@ -96,6 +99,7 @@ impl PendingQueueSegmentLifecyclePhase {
             3 => Ok(Self::MessagesScanVerified),
             4 => Ok(Self::ScanVerified),
             5 => Ok(Self::DeleteRequested),
+            6 => Ok(Self::Deleted),
             _ => Err(PendingQueueSegmentLifecycleError::UnknownPhase),
         }
     }
@@ -107,6 +111,7 @@ impl PendingQueueSegmentLifecyclePhase {
             Self::MessagesScanVerified => MESSAGES_SCAN_VERIFIED_REVISION,
             Self::ScanVerified => SCAN_VERIFIED_REVISION,
             Self::DeleteRequested => DELETE_REQUESTED_REVISION,
+            Self::Deleted => DELETED_REVISION,
         }
     }
 }
@@ -406,6 +411,22 @@ impl StoredPendingQueueSegmentSealRequest {
         Ok(candidate)
     }
 
+    fn deleted_candidate(&self) -> Result<Self, PendingQueueSegmentLifecycleError> {
+        if self.phase != PendingQueueSegmentLifecyclePhase::DeleteRequested
+            || self.revision != DELETE_REQUESTED_REVISION
+            || self.scan_digest.is_none()
+            || self.consumer_manifest_digest.is_none()
+            || self.consumer_inventory_digest.is_none()
+        {
+            return Err(PendingQueueSegmentLifecycleError::InvalidTransition);
+        }
+        let mut candidate = self.clone();
+        candidate.phase = PendingQueueSegmentLifecyclePhase::Deleted;
+        candidate.revision = DELETED_REVISION;
+        candidate.digest = lifecycle_digest(&candidate.encode_unsigned())?;
+        Ok(candidate)
+    }
+
     fn matches_scan_receipt(&self, receipt: &PendingQueueNatsWholeStreamScanReceipt) -> bool {
         self.phase == PendingQueueSegmentLifecyclePhase::MessagesScanVerified
             && self.revision == MESSAGES_SCAN_VERIFIED_REVISION
@@ -423,7 +444,23 @@ impl StoredPendingQueueSegmentSealRequest {
     ) -> bool {
         self.phase == PendingQueueSegmentLifecyclePhase::ScanVerified
             && self.revision == SCAN_VERIFIED_REVISION
-            && self.stream_instance_id == *receipt.instance_id()
+            && self.matches_committed_consumer_inventory(receipt)
+    }
+
+    fn matches_delete_requested_consumer_inventory(
+        &self,
+        receipt: &RecoverableNatsConsumerInventoryReceipt,
+    ) -> bool {
+        self.phase == PendingQueueSegmentLifecyclePhase::DeleteRequested
+            && self.revision == DELETE_REQUESTED_REVISION
+            && self.matches_committed_consumer_inventory(receipt)
+    }
+
+    fn matches_committed_consumer_inventory(
+        &self,
+        receipt: &RecoverableNatsConsumerInventoryReceipt,
+    ) -> bool {
+        self.stream_instance_id == *receipt.instance_id()
             && self.live_state.consumer_count() == receipt.consumer_count()
             && self.consumer_manifest_digest == Some(receipt.manifest_digest())
             && self.consumer_inventory_digest == Some(receipt.inventory_digest())
@@ -596,7 +633,8 @@ impl StoredPendingQueueSegmentSealRequest {
             | PendingQueueSegmentLifecyclePhase::StreamSealed => None,
             PendingQueueSegmentLifecyclePhase::MessagesScanVerified
             | PendingQueueSegmentLifecyclePhase::ScanVerified
-            | PendingQueueSegmentLifecyclePhase::DeleteRequested => Some(
+            | PendingQueueSegmentLifecyclePhase::DeleteRequested
+            | PendingQueueSegmentLifecyclePhase::Deleted => Some(
                 PendingQueueNatsWholeStreamScanDigest::try_from_bytes(decoder.array32()?)
                     .map_err(terminal)?,
             ),
@@ -606,7 +644,8 @@ impl StoredPendingQueueSegmentSealRequest {
             | PendingQueueSegmentLifecyclePhase::StreamSealed
             | PendingQueueSegmentLifecyclePhase::MessagesScanVerified => (None, None),
             PendingQueueSegmentLifecyclePhase::ScanVerified
-            | PendingQueueSegmentLifecyclePhase::DeleteRequested => (
+            | PendingQueueSegmentLifecyclePhase::DeleteRequested
+            | PendingQueueSegmentLifecyclePhase::Deleted => (
                 Some(
                     RecoverableNatsConsumerManifestDigest::try_from_bytes(decoder.array32()?)
                         .map_err(transport)?,
@@ -756,6 +795,9 @@ impl PendingQueueSegmentLifecycleCasBinding {
             ) | (
                 PendingQueueSegmentLifecyclePhase::ScanVerified,
                 PendingQueueSegmentLifecyclePhase::DeleteRequested,
+            ) | (
+                PendingQueueSegmentLifecyclePhase::DeleteRequested,
+                PendingQueueSegmentLifecyclePhase::Deleted,
             )
         );
         if expected.slot != candidate.slot
@@ -832,6 +874,12 @@ pub(super) struct PersistedPendingQueueScanVerifiedReceipt {
 /// module.
 #[derive(Debug)]
 pub(super) struct PersistedPendingQueueDeleteRequestedReceipt {
+    store_fingerprint: PendingQueueSegmentLifecycleStoreFingerprint,
+    current: StoredPendingQueueSegmentSealRequest,
+}
+
+#[derive(Debug)]
+pub(super) struct PersistedPendingQueueDeletedReceipt {
     store_fingerprint: PendingQueueSegmentLifecycleStoreFingerprint,
     current: StoredPendingQueueSegmentSealRequest,
 }
@@ -1342,6 +1390,52 @@ impl ScyllaPendingQueueSegmentLifecycleStore {
         })
     }
 
+    async fn advance_to_deleted(
+        &self,
+        expected: &StoredPendingQueueSegmentSealRequest,
+    ) -> Result<PersistedPendingQueueDeletedReceipt, PendingQueueSegmentLifecycleError> {
+        let candidate = expected.deleted_candidate()?;
+        let binding = PendingQueueSegmentLifecycleCasBinding::try_new(expected, &candidate)?;
+        let execution = self
+            .session
+            .execute_unpaged(
+                &self.compare_and_set,
+                (
+                    binding.candidate_revision,
+                    binding.candidate_payload.as_slice(),
+                    binding.lifecycle_slot.as_slice(),
+                    binding.expected_revision,
+                    binding.expected_payload.as_slice(),
+                ),
+            )
+            .await;
+        let applied = match execution {
+            Ok(result) => decode_applied(result)?,
+            Err(error) => match self.read(candidate.slot).await {
+                Ok(Some(current)) if current == candidate => false,
+                Ok(_) => {
+                    return Err(PendingQueueSegmentLifecycleError::Indeterminate(
+                        error.to_string(),
+                    ));
+                }
+                Err(read) => {
+                    return Err(PendingQueueSegmentLifecycleError::Indeterminate(format!(
+                        "execute={error}; read={read}",
+                    )));
+                }
+            },
+        };
+        let current = self
+            .read(candidate.slot)
+            .await?
+            .ok_or(PendingQueueSegmentLifecycleError::MissingAfterLwt)?;
+        classify_lifecycle_cas(applied, &candidate, &current)?;
+        Ok(PersistedPendingQueueDeletedReceipt {
+            store_fingerprint: self.fingerprint,
+            current,
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn seal_requested_stream<Hash: Q256BitHash>(
         &self,
@@ -1773,6 +1867,97 @@ impl ScyllaPendingQueueSegmentLifecycleStore {
         if result.store_fingerprint != self.fingerprint
             || result.current != candidate
             || !result.current.matches_delete_request_evidence(&scan, &first)
+        {
+            return Err(PendingQueueSegmentLifecycleError::AppliedStateMismatch);
+        }
+        Ok(result)
+    }
+
+    /// Consumes the durable revision-5 PONR, performs the only typed
+    /// whole-stream delete, and records revision 6. It never derives delete
+    /// authority from NATS absence alone.
+    pub(super) async fn delete_requested_stream(
+        &self,
+        nats: &NatsJetStreamClient,
+        archive_store: &ScyllaPendingQueueSemanticAggregateStore,
+        receipt: &PersistedPendingQueueDeleteRequestedReceipt,
+        segment: RecoverableNatsStreamSegment,
+    ) -> Result<PersistedPendingQueueDeletedReceipt, PendingQueueSegmentLifecycleError> {
+        if receipt.store_fingerprint != self.fingerprint
+            || segment.segment_id() != receipt.current.segment_id
+            || segment.digest() != receipt.current.contract_digest
+            || receipt.current.phase != PendingQueueSegmentLifecyclePhase::DeleteRequested
+            || receipt.current.revision != DELETE_REQUESTED_REVISION
+        {
+            return Err(PendingQueueSegmentLifecycleError::ReceiptStoreMismatch);
+        }
+        let durable = self
+            .read(receipt.current.slot)
+            .await?
+            .ok_or(PendingQueueSegmentLifecycleError::MissingAfterLwt)?;
+        let deleted_candidate = receipt.current.deleted_candidate()?;
+        if durable == deleted_candidate {
+            return Ok(PersistedPendingQueueDeletedReceipt {
+                store_fingerprint: self.fingerprint,
+                current: durable,
+            });
+        }
+        if durable != receipt.current {
+            return Err(PendingQueueSegmentLifecycleError::Conflict);
+        }
+
+        let expectation = RecoverableNatsDeleteExpectation::try_new(
+            segment.clone(),
+            RecoverableNatsStreamInstanceId::try_from_bytes(
+                receipt.current.stream_instance_id,
+            )
+            .map_err(transport)?,
+            receipt.current.live_state,
+        )
+        .map_err(transport)?;
+
+        // If the stream still exists, re-prove the exact consumer inventory
+        // immediately before delete. If a prior attempt already deleted it,
+        // the typed façade below classifies absence only because revision 5
+        // is durably present.
+        if let Ok(sealed) = nats
+            .observe_recoverable_sealed_segment_instance(segment.clone())
+            .await
+        {
+            if !receipt.current.matches_sealed_instance(&sealed) {
+                return Err(PendingQueueSegmentLifecycleError::EvidenceChanged);
+            }
+            let manifest = self
+                .build_expected_consumer_manifest(
+                    archive_store,
+                    &receipt.current,
+                    &segment,
+                    sealed,
+                )
+                .await?;
+            let inventory = nats
+                .inventory_recoverable_sealed_segment_consumers(manifest)
+                .await
+                .map_err(transport)?;
+            if !receipt
+                .current
+                .matches_delete_requested_consumer_inventory(&inventory)
+            {
+                return Err(PendingQueueSegmentLifecycleError::EvidenceChanged);
+            }
+        }
+
+        let deleted = nats
+            .delete_recoverable_sealed_segment_instance(&expectation)
+            .await
+            .map_err(transport)?;
+        if deleted.instance_id().as_bytes() != &receipt.current.stream_instance_id {
+            return Err(PendingQueueSegmentLifecycleError::AppliedStateMismatch);
+        }
+        let result = self.advance_to_deleted(&receipt.current).await?;
+        if result.store_fingerprint != self.fingerprint
+            || result.current != deleted_candidate
+            || result.current.phase != PendingQueueSegmentLifecyclePhase::Deleted
         {
             return Err(PendingQueueSegmentLifecycleError::AppliedStateMismatch);
         }
@@ -2246,6 +2431,39 @@ mod tests {
         );
         assert_eq!(
             PendingQueueSegmentLifecycleCasBinding::try_new(&value, &delete_requested),
+            Err(PendingQueueSegmentLifecycleError::InvalidTransition),
+        );
+
+        let deleted = delete_requested.deleted_candidate().unwrap();
+        assert_eq!(deleted.revision, DELETED_REVISION);
+        assert_eq!(deleted.phase, PendingQueueSegmentLifecyclePhase::Deleted);
+        assert_eq!(deleted.stream_instance_id, delete_requested.stream_instance_id);
+        assert_eq!(deleted.scan_digest, delete_requested.scan_digest);
+        assert_eq!(
+            deleted.consumer_inventory_digest,
+            delete_requested.consumer_inventory_digest,
+        );
+        let deleted_bytes = deleted.to_persisted_bytes();
+        let deleted_binding = PendingQueueSegmentLifecycleCasBinding::try_new(
+            &delete_requested,
+            &deleted,
+        )
+        .unwrap();
+        assert_eq!(deleted_binding.expected_revision, 5);
+        assert_eq!(deleted_binding.candidate_revision, 6);
+        assert_eq!(deleted_binding.expected_payload, delete_requested_bytes);
+        assert_eq!(deleted_binding.candidate_payload, deleted_bytes);
+        assert_eq!(
+            StoredPendingQueueSegmentSealRequest::decode_persisted(
+                deleted.slot,
+                DELETED_REVISION as i64,
+                &deleted_bytes,
+            )
+            .unwrap(),
+            deleted,
+        );
+        assert_eq!(
+            PendingQueueSegmentLifecycleCasBinding::try_new(&scan_verified, &deleted),
             Err(PendingQueueSegmentLifecycleError::InvalidTransition),
         );
 

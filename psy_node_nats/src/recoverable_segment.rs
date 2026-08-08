@@ -85,6 +85,14 @@ pub struct StructurallyValidatedRecoverableNatsSegment {
 pub struct RecoverableNatsStreamInstanceId([u8; 32]);
 
 impl RecoverableNatsStreamInstanceId {
+    pub fn try_from_bytes(bytes: [u8; 32]) -> Result<Self, RecoverableNatsSegmentError> {
+        if bytes == [0; 32] {
+            Err(RecoverableNatsSegmentError::InvalidInstanceIdentity)
+        } else {
+            Ok(Self(bytes))
+        }
+    }
+
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
@@ -733,6 +741,7 @@ pub enum RecoverableNatsSegmentError {
     AddressTooLong,
     StreamContractMismatch,
     StreamContractEncoding,
+    InvalidInstanceIdentity,
     InvalidStreamCreatedAt,
     StreamStateOverflow,
     StreamSequenceGap,
@@ -770,6 +779,9 @@ impl fmt::Display for RecoverableNatsSegmentError {
             Self::AddressTooLong => formatter.write_str("derived NATS stream or subject address is too long"),
             Self::StreamContractMismatch => formatter.write_str("recoverable NATS stream contract mismatch"),
             Self::StreamContractEncoding => formatter.write_str("recoverable NATS stream contract encoding failed"),
+            Self::InvalidInstanceIdentity => {
+                formatter.write_str("recoverable NATS stream instance identity must be non-zero")
+            }
             Self::InvalidStreamCreatedAt => formatter.write_str("recoverable NATS stream creation timestamp is invalid"),
             Self::StreamStateOverflow => formatter.write_str("recoverable NATS stream state cannot be represented canonically"),
             Self::StreamSequenceGap => formatter.write_str("recoverable NATS stream contains a missing or truncated sequence"),

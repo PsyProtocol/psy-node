@@ -29,11 +29,13 @@ fn raw_nats_authority_has_an_exact_lexical_inventory() {
     let raw_send = concat!("send_", "publish(");
     let direct_publish = concat!(".jetstream", ".publish(");
     let raw_update = concat!(".update_", "stream(");
+    let raw_delete = concat!(".delete_", "stream(");
     let mut dependency_files = BTreeSet::new();
     let mut context_files = BTreeSet::new();
     let mut send_files = BTreeSet::new();
     let mut direct_publish_files = BTreeSet::new();
     let mut update_sites = Vec::new();
+    let mut delete_sites = Vec::new();
 
     for file in files {
         let relative = file.strip_prefix(workspace).unwrap();
@@ -53,9 +55,14 @@ fn raw_nats_authority_has_an_exact_lexical_inventory() {
         }
         let update_count = source.matches(raw_update).count();
         if update_count != 0 {
-            update_sites.push((relative, update_count));
+            update_sites.push((relative.clone(), update_count));
+        }
+        let delete_count = source.matches(raw_delete).count();
+        if delete_count != 0 {
+            delete_sites.push((relative, delete_count));
         }
     }
+    delete_sites.sort();
 
     let expected_dependency_files = BTreeSet::from([
         "psy_node_nats/src/psy_queue.rs".to_owned(),
@@ -91,6 +98,20 @@ fn raw_nats_authority_has_an_exact_lexical_inventory() {
             1,
         )],
         "only the typed recoverable seal façade may update a stream",
+    );
+    assert_eq!(
+        delete_sites,
+        vec![
+            (
+                "psy_node_nats/src/recoverable_segment.rs".to_owned(),
+                3,
+            ),
+            (
+                "psy_node_nats/src/recoverable_transport.rs".to_owned(),
+                1,
+            ),
+        ],
+        "only historical test cleanup and the typed recoverable delete façade may delete a stream",
     );
 }
 
