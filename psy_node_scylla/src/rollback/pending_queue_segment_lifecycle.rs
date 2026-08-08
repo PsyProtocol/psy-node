@@ -23,7 +23,11 @@ use psy_node_nats::{
         SealedRecoverableNatsStreamInstance,
     },
     recoverable_terminal::{
-        PendingQueueNatsWholeStreamManifestDigest, PendingQueueTerminalError,
+        PendingQueueNatsWholeStreamExpectedManifest,
+        PendingQueueNatsWholeStreamManifestDigest,
+        PendingQueueNatsWholeStreamScanDigest,
+        PendingQueueNatsWholeStreamScanReceipt,
+        PendingQueueTerminalError,
     },
 };
 use scylla::{
@@ -56,6 +60,7 @@ const MAGIC: &[u8; 8] = b"PSYQSLIF";
 const CODEC_VERSION: u16 = 1;
 const SEAL_REQUESTED_REVISION: u64 = 1;
 const STREAM_SEALED_REVISION: u64 = 2;
+const MESSAGES_SCAN_VERIFIED_REVISION: u64 = 3;
 const SLOT_DOMAIN: &[u8] = b"psy/rollback/pending-queue-segment-lifecycle-slot/v1";
 const DIGEST_DOMAIN: &[u8] = b"psy/rollback/pending-queue-segment-lifecycle/v1";
 const STORE_FINGERPRINT_DOMAIN: &[u8] =
@@ -68,6 +73,7 @@ const MAX_ASSIGNMENTS: usize = 4096;
 enum PendingQueueSegmentLifecyclePhase {
     SealRequested = 1,
     StreamSealed = 2,
+    MessagesScanVerified = 3,
 }
 
 impl PendingQueueSegmentLifecyclePhase {
@@ -75,6 +81,7 @@ impl PendingQueueSegmentLifecyclePhase {
         match value {
             1 => Ok(Self::SealRequested),
             2 => Ok(Self::StreamSealed),
+            3 => Ok(Self::MessagesScanVerified),
             _ => Err(PendingQueueSegmentLifecycleError::UnknownPhase),
         }
     }
@@ -83,6 +90,7 @@ impl PendingQueueSegmentLifecyclePhase {
         match self {
             Self::SealRequested => SEAL_REQUESTED_REVISION,
             Self::StreamSealed => STREAM_SEALED_REVISION,
+            Self::MessagesScanVerified => MESSAGES_SCAN_VERIFIED_REVISION,
         }
     }
 }
@@ -175,6 +183,7 @@ struct StoredPendingQueueSegmentSealRequest {
     stream_instance_id: [u8; 32],
     live_state: RecoverableNatsStreamStateSnapshot,
     manifest_digest: PendingQueueNatsWholeStreamManifestDigest,
+    scan_digest: Option<PendingQueueNatsWholeStreamScanDigest>,
     terminals: Vec<PendingQueueSegmentTerminalEntry>,
     digest: PendingQueueSegmentLifecycleDigest,
 }
@@ -236,6 +245,7 @@ impl StoredPendingQueueSegmentSealRequest {
             stream_instance_id: *live.instance_id().as_bytes(),
             live_state: live.state(),
             manifest_digest,
+            scan_digest: None,
             terminals,
             digest: PendingQueueSegmentLifecycleDigest([1; 32]),
         };
@@ -276,8 +286,43 @@ impl StoredPendingQueueSegmentSealRequest {
         let mut candidate = self.clone();
         candidate.phase = PendingQueueSegmentLifecyclePhase::StreamSealed;
         candidate.revision = STREAM_SEALED_REVISION;
+        candidate.scan_digest = None;
         candidate.digest = lifecycle_digest(&candidate.encode_unsigned())?;
         Ok(candidate)
+    }
+
+    fn to_messages_scan_verified(
+        &self,
+        receipt: &PendingQueueNatsWholeStreamScanReceipt,
+    ) -> Result<Self, PendingQueueSegmentLifecycleError> {
+        if self.phase != PendingQueueSegmentLifecyclePhase::StreamSealed
+            || self.revision != STREAM_SEALED_REVISION
+            || self.scan_digest.is_some()
+            || self.stream_instance_id != *receipt.instance_id().as_bytes()
+            || self.segment_id != receipt.segment_id()
+            || self.contract_digest != receipt.contract_digest()
+            || self.live_state != receipt.state()
+            || self.manifest_digest != receipt.manifest_digest()
+        {
+            return Err(PendingQueueSegmentLifecycleError::EvidenceChanged);
+        }
+        let mut candidate = self.clone();
+        candidate.phase = PendingQueueSegmentLifecyclePhase::MessagesScanVerified;
+        candidate.revision = MESSAGES_SCAN_VERIFIED_REVISION;
+        candidate.scan_digest = Some(receipt.scan_digest());
+        candidate.digest = lifecycle_digest(&candidate.encode_unsigned())?;
+        Ok(candidate)
+    }
+
+    fn matches_scan_receipt(&self, receipt: &PendingQueueNatsWholeStreamScanReceipt) -> bool {
+        self.phase == PendingQueueSegmentLifecyclePhase::MessagesScanVerified
+            && self.revision == MESSAGES_SCAN_VERIFIED_REVISION
+            && self.stream_instance_id == *receipt.instance_id().as_bytes()
+            && self.segment_id == receipt.segment_id()
+            && self.contract_digest == receipt.contract_digest()
+            && self.live_state == receipt.state()
+            && self.manifest_digest == receipt.manifest_digest()
+            && self.scan_digest == Some(receipt.scan_digest())
     }
 
     fn encode_unsigned(&self) -> Vec<u8> {
@@ -305,6 +350,9 @@ impl StoredPendingQueueSegmentSealRequest {
             out.extend_from_slice(&terminal.archive_digest);
             out.extend_from_slice(terminal.assignment_digest.as_bytes());
             out.extend_from_slice(&terminal.terminal_digest);
+        }
+        if let Some(scan_digest) = self.scan_digest {
+            out.extend_from_slice(scan_digest.as_bytes());
         }
         out
     }
@@ -402,6 +450,14 @@ impl StoredPendingQueueSegmentSealRequest {
                 terminal_digest,
             });
         }
+        let scan_digest = match phase {
+            PendingQueueSegmentLifecyclePhase::SealRequested
+            | PendingQueueSegmentLifecyclePhase::StreamSealed => None,
+            PendingQueueSegmentLifecyclePhase::MessagesScanVerified => Some(
+                PendingQueueNatsWholeStreamScanDigest::try_from_bytes(decoder.array32()?)
+                    .map_err(terminal)?,
+            ),
+        };
         let digest = PendingQueueSegmentLifecycleDigest::try_new(decoder.array32()?)?;
         if !decoder.done() {
             return Err(PendingQueueSegmentLifecycleError::TrailingBytes);
@@ -429,6 +485,7 @@ impl StoredPendingQueueSegmentSealRequest {
             stream_instance_id,
             live_state,
             manifest_digest,
+            scan_digest,
             terminals,
             digest,
         };
@@ -524,19 +581,31 @@ impl PendingQueueSegmentLifecycleCasBinding {
         expected: &StoredPendingQueueSegmentSealRequest,
         candidate: &StoredPendingQueueSegmentSealRequest,
     ) -> Result<Self, PendingQueueSegmentLifecycleError> {
+        let valid_phase = matches!(
+            (expected.phase, candidate.phase),
+            (
+                PendingQueueSegmentLifecyclePhase::SealRequested,
+                PendingQueueSegmentLifecyclePhase::StreamSealed,
+            ) | (
+                PendingQueueSegmentLifecyclePhase::StreamSealed,
+                PendingQueueSegmentLifecyclePhase::MessagesScanVerified,
+            )
+        );
         if expected.slot != candidate.slot
-            || expected.phase != PendingQueueSegmentLifecyclePhase::SealRequested
-            || candidate.phase != PendingQueueSegmentLifecyclePhase::StreamSealed
-            || expected.revision != SEAL_REQUESTED_REVISION
-            || candidate.revision != STREAM_SEALED_REVISION
+            || !valid_phase
+            || expected.phase.revision() != expected.revision
+            || candidate.phase.revision() != candidate.revision
+            || candidate.revision != expected.revision + 1
         {
             return Err(PendingQueueSegmentLifecycleError::InvalidTransition);
         }
         Ok(Self {
-            candidate_revision: STREAM_SEALED_REVISION as i64,
+            candidate_revision: i64::try_from(candidate.revision)
+                .map_err(|_| PendingQueueSegmentLifecycleError::InvalidRevision)?,
             candidate_payload: candidate.to_persisted_bytes(),
             lifecycle_slot: *candidate.slot.as_bytes(),
-            expected_revision: SEAL_REQUESTED_REVISION as i64,
+            expected_revision: i64::try_from(expected.revision)
+                .map_err(|_| PendingQueueSegmentLifecycleError::InvalidRevision)?,
             expected_payload: expected.to_persisted_bytes(),
         })
     }
@@ -578,6 +647,22 @@ pub(super) struct PersistedPendingQueueStreamSealedReceipt {
     current: StoredPendingQueueSegmentSealRequest,
 }
 
+#[derive(Debug)]
+pub(super) struct PersistedPendingQueueMessagesScanVerifiedReceipt {
+    store_fingerprint: PendingQueueSegmentLifecycleStoreFingerprint,
+    current: StoredPendingQueueSegmentSealRequest,
+}
+
+impl PersistedPendingQueueMessagesScanVerifiedReceipt {
+    pub(super) const fn manifest_digest(&self) -> PendingQueueNatsWholeStreamManifestDigest {
+        self.current.manifest_digest
+    }
+
+    pub(super) const fn scan_digest(&self) -> Option<PendingQueueNatsWholeStreamScanDigest> {
+        self.current.scan_digest
+    }
+}
+
 impl PersistedPendingQueueStreamSealedReceipt {
     pub(super) fn matches_sealed_instance(
         &self,
@@ -589,6 +674,23 @@ impl PersistedPendingQueueStreamSealedReceipt {
 
     pub(super) const fn manifest_digest(&self) -> PendingQueueNatsWholeStreamManifestDigest {
         self.current.manifest_digest
+    }
+
+    fn assignments(
+        &self,
+    ) -> Result<Vec<PendingQueueGenerationSegmentAssignment>, PendingQueueSegmentLifecycleError>
+    {
+        self.current
+            .terminals
+            .iter()
+            .map(|terminal| {
+                PendingQueueGenerationSegmentAssignment::decode_canonical(
+                    self.current.ledger_slot,
+                    &terminal.assignment_payload,
+                )
+                .map_err(|_| PendingQueueSegmentLifecycleError::AssignmentDecode)
+            })
+            .collect()
     }
 }
 
@@ -855,6 +957,54 @@ impl ScyllaPendingQueueSegmentLifecycleStore {
         })
     }
 
+    async fn advance_to_messages_scan_verified(
+        &self,
+        expected: &StoredPendingQueueSegmentSealRequest,
+        scan: &PendingQueueNatsWholeStreamScanReceipt,
+    ) -> Result<PersistedPendingQueueMessagesScanVerifiedReceipt, PendingQueueSegmentLifecycleError>
+    {
+        let candidate = expected.to_messages_scan_verified(scan)?;
+        let binding = PendingQueueSegmentLifecycleCasBinding::try_new(expected, &candidate)?;
+        let execution = self
+            .session
+            .execute_unpaged(
+                &self.compare_and_set,
+                (
+                    binding.candidate_revision,
+                    binding.candidate_payload.as_slice(),
+                    binding.lifecycle_slot.as_slice(),
+                    binding.expected_revision,
+                    binding.expected_payload.as_slice(),
+                ),
+            )
+            .await;
+        let applied = match execution {
+            Ok(result) => decode_applied(result)?,
+            Err(error) => match self.read(candidate.slot).await {
+                Ok(Some(current)) if current == candidate => false,
+                Ok(_) => {
+                    return Err(PendingQueueSegmentLifecycleError::Indeterminate(
+                        error.to_string(),
+                    ));
+                }
+                Err(read) => {
+                    return Err(PendingQueueSegmentLifecycleError::Indeterminate(format!(
+                        "execute={error}; read={read}",
+                    )));
+                }
+            },
+        };
+        let current = self
+            .read(candidate.slot)
+            .await?
+            .ok_or(PendingQueueSegmentLifecycleError::MissingAfterLwt)?;
+        classify_lifecycle_cas(applied, &candidate, &current)?;
+        Ok(PersistedPendingQueueMessagesScanVerifiedReceipt {
+            store_fingerprint: self.fingerprint,
+            current,
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn seal_requested_stream<Hash: Q256BitHash>(
         &self,
@@ -947,6 +1097,99 @@ impl ScyllaPendingQueueSegmentLifecycleStore {
             return Err(PendingQueueSegmentLifecycleError::Conflict);
         };
         if !result.matches_sealed_instance(&sealed) {
+            return Err(PendingQueueSegmentLifecycleError::AppliedStateMismatch);
+        }
+        Ok(result)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn scan_stream_sealed_messages<Hash: Q256BitHash>(
+        &self,
+        nats: &NatsJetStreamClient,
+        ledger_store: &ScyllaPendingQueueSegmentLedgerStore,
+        terminal_store: &ScyllaPendingQueueGenerationTerminalStore,
+        archive_store: &ScyllaPendingQueueSemanticAggregateStore,
+        pipeline_store: &ScyllaPendingPipelineStore,
+        writer_store: &ScyllaBranchExactWriterLifecycleStore,
+        head_store: &ScyllaAuthorityLocalHeadStore,
+        closure: &PendingQueueSegmentClosureSnapshot,
+        receipt: &PersistedPendingQueueStreamSealedReceipt,
+        segment: RecoverableNatsStreamSegment,
+    ) -> Result<PersistedPendingQueueMessagesScanVerifiedReceipt, PendingQueueSegmentLifecycleError>
+    {
+        if receipt.store_fingerprint != self.fingerprint
+            || segment.segment_id() != receipt.current.segment_id
+            || segment.digest() != receipt.current.contract_digest
+        {
+            return Err(PendingQueueSegmentLifecycleError::ReceiptStoreMismatch);
+        }
+        let durable = self
+            .read(receipt.current.slot)
+            .await?
+            .ok_or(PendingQueueSegmentLifecycleError::MissingAfterLwt)?;
+        if durable != receipt.current
+            && durable.phase != PendingQueueSegmentLifecyclePhase::MessagesScanVerified
+        {
+            return Err(PendingQueueSegmentLifecycleError::Conflict);
+        }
+        self.revalidate_seal_evidence::<Hash>(
+            ledger_store,
+            terminal_store,
+            archive_store,
+            pipeline_store,
+            writer_store,
+            head_store,
+            closure,
+            &receipt.current,
+        )
+        .await?;
+
+        let sealed = nats
+            .observe_recoverable_sealed_segment_instance(segment)
+            .await
+            .map_err(transport)?;
+        if !receipt.matches_sealed_instance(&sealed) {
+            return Err(PendingQueueSegmentLifecycleError::EvidenceChanged);
+        }
+        let manifest = PendingQueueNatsWholeStreamExpectedManifest::try_new(
+            sealed,
+            receipt.assignments()?,
+        )
+        .map_err(terminal)?;
+        if manifest.digest() != receipt.manifest_digest() {
+            return Err(PendingQueueSegmentLifecycleError::ManifestMismatch);
+        }
+        let scan = nats
+            .scan_recoverable_sealed_segment(manifest)
+            .await
+            .map_err(transport)?;
+        self.revalidate_seal_evidence::<Hash>(
+            ledger_store,
+            terminal_store,
+            archive_store,
+            pipeline_store,
+            writer_store,
+            head_store,
+            closure,
+            &receipt.current,
+        )
+        .await?;
+
+        let candidate = receipt.current.to_messages_scan_verified(&scan)?;
+        let result = if durable == candidate {
+            PersistedPendingQueueMessagesScanVerifiedReceipt {
+                store_fingerprint: self.fingerprint,
+                current: durable,
+            }
+        } else if durable == receipt.current {
+            self.advance_to_messages_scan_verified(&receipt.current, &scan)
+                .await?
+        } else {
+            return Err(PendingQueueSegmentLifecycleError::Conflict);
+        };
+        if result.store_fingerprint != self.fingerprint
+            || !result.current.matches_scan_receipt(&scan)
+        {
             return Err(PendingQueueSegmentLifecycleError::AppliedStateMismatch);
         }
         Ok(result)
@@ -1220,6 +1463,7 @@ mod tests {
                     &[],
                 )
                 .unwrap(),
+            scan_digest: None,
             terminals: Vec::new(),
             digest: PendingQueueSegmentLifecycleDigest([1; 32]),
         };
@@ -1303,6 +1547,39 @@ mod tests {
             &stream_sealed_bytes,
         )
         .is_err());
+
+        let mut messages_scanned = stream_sealed.clone();
+        messages_scanned.revision = MESSAGES_SCAN_VERIFIED_REVISION;
+        messages_scanned.phase =
+            PendingQueueSegmentLifecyclePhase::MessagesScanVerified;
+        messages_scanned.scan_digest = Some(
+            PendingQueueNatsWholeStreamScanDigest::try_from_bytes([9; 32]).unwrap(),
+        );
+        messages_scanned.digest =
+            lifecycle_digest(&messages_scanned.encode_unsigned()).unwrap();
+        let messages_scanned_bytes = messages_scanned.to_persisted_bytes();
+        let scan_binding = PendingQueueSegmentLifecycleCasBinding::try_new(
+            &stream_sealed,
+            &messages_scanned,
+        )
+        .unwrap();
+        assert_eq!(scan_binding.expected_revision, 2);
+        assert_eq!(scan_binding.candidate_revision, 3);
+        assert_eq!(scan_binding.expected_payload, stream_sealed_bytes);
+        assert_eq!(scan_binding.candidate_payload, messages_scanned_bytes);
+        assert_eq!(
+            StoredPendingQueueSegmentSealRequest::decode_persisted(
+                messages_scanned.slot,
+                MESSAGES_SCAN_VERIFIED_REVISION as i64,
+                &messages_scanned_bytes,
+            )
+            .unwrap(),
+            messages_scanned,
+        );
+        assert_eq!(
+            PendingQueueSegmentLifecycleCasBinding::try_new(&value, &messages_scanned),
+            Err(PendingQueueSegmentLifecycleError::InvalidTransition),
+        );
 
         let mut recreated = value.clone();
         recreated.stream_instance_id = [6; 32];

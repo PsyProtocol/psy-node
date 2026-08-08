@@ -630,6 +630,10 @@ impl PendingQueueNatsWholeStreamScanDigest {
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
+
+    pub fn try_from_bytes(bytes: [u8; 32]) -> Result<Self, PendingQueueTerminalError> {
+        Self::try_new(bytes)
+    }
 }
 
 /// Digest of the exact closed assignment/source set expected in one sealed
