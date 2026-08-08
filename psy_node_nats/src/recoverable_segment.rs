@@ -12,13 +12,14 @@ use std::{error::Error, fmt, num::NonZeroU64, time::Duration};
 
 use async_nats::jetstream::stream::{
     Compression, Config as StreamConfig, DiscardPolicy, RetentionPolicy,
-    StorageType,
+    Info as StreamInfo, StorageType,
 };
 use psy_data::protocol::chain_context::AuthorityScope;
 use psy_node_core::store::pending_generation_identity::PendingGenerationLedgerKey;
 use sha2::{Digest, Sha256};
 
 const CONTRACT_DOMAIN: &[u8] = b"psy/rollback/recoverable-nats-segment/v1";
+const INSTANCE_DOMAIN: &[u8] = b"psy/rollback/recoverable-nats-stream-instance/v1";
 const V2_RESERVED_SUBJECT_ROOT: &str = "PSY_BEQ_V2";
 const MAX_BASE_NAMESPACE_BYTES: usize = 96;
 const MAX_SUBJECT_SUFFIX_BYTES: usize = 256;
@@ -75,6 +76,152 @@ impl RecoverableNatsSegmentContractDigest {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StructurallyValidatedRecoverableNatsSegment {
     segment: RecoverableNatsStreamSegment,
+}
+
+/// Stable identity of one server-created stream incarnation. Recreating the
+/// same named stream with the same config yields a different value because
+/// JetStream's server-provided creation timestamp is committed.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RecoverableNatsStreamInstanceId([u8; 32]);
+
+impl RecoverableNatsStreamInstanceId {
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// Exact state snapshot bound to a live or sealed stream observation.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RecoverableNatsStreamStateSnapshot {
+    messages: u64,
+    bytes: u64,
+    first_sequence: u64,
+    last_sequence: u64,
+    consumer_count: u64,
+    subject_count: u64,
+}
+
+impl RecoverableNatsStreamStateSnapshot {
+    pub fn try_new(
+        messages: u64,
+        bytes: u64,
+        first_sequence: u64,
+        last_sequence: u64,
+        consumer_count: u64,
+        subject_count: u64,
+    ) -> Result<Self, RecoverableNatsSegmentError> {
+        let snapshot = Self {
+            messages,
+            bytes,
+            first_sequence,
+            last_sequence,
+            consumer_count,
+            subject_count,
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
+    pub const fn messages(self) -> u64 {
+        self.messages
+    }
+
+    pub const fn bytes(self) -> u64 {
+        self.bytes
+    }
+
+    pub const fn first_sequence(self) -> u64 {
+        self.first_sequence
+    }
+
+    pub const fn last_sequence(self) -> u64 {
+        self.last_sequence
+    }
+
+    pub const fn consumer_count(self) -> u64 {
+        self.consumer_count
+    }
+
+    pub const fn subject_count(self) -> u64 {
+        self.subject_count
+    }
+
+    fn from_info(info: &StreamInfo) -> Result<Self, RecoverableNatsSegmentError> {
+        if info.state.deleted_count.unwrap_or(0) != 0
+            || info.state.deleted.as_ref().is_some_and(|values| !values.is_empty())
+        {
+            return Err(RecoverableNatsSegmentError::StreamHasDeletedMessages);
+        }
+        Self::try_new(
+            info.state.messages,
+            info.state.bytes,
+            info.state.first_sequence,
+            info.state.last_sequence,
+            u64::try_from(info.state.consumer_count)
+                .map_err(|_| RecoverableNatsSegmentError::StreamStateOverflow)?,
+            info.state.subjects_count,
+        )
+    }
+
+    fn validate(self) -> Result<(), RecoverableNatsSegmentError> {
+        let contiguous = if self.messages == 0 {
+            self.first_sequence == 0 && self.last_sequence == 0 && self.subject_count == 0
+        } else {
+            self.first_sequence == 1
+                && self.last_sequence == self.messages
+                && self.subject_count > 0
+                && self.subject_count <= self.messages
+        };
+        if !contiguous {
+            return Err(RecoverableNatsSegmentError::StreamSequenceGap);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AttestedRecoverableNatsStreamInstance {
+    segment: RecoverableNatsStreamSegment,
+    instance_id: RecoverableNatsStreamInstanceId,
+    created_unix_nanos: i128,
+    state: RecoverableNatsStreamStateSnapshot,
+}
+
+/// Exact observation of the writable stream contract.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiveRecoverableNatsStreamInstance(AttestedRecoverableNatsStreamInstance);
+
+impl LiveRecoverableNatsStreamInstance {
+    pub const fn segment(&self) -> &RecoverableNatsStreamSegment {
+        &self.0.segment
+    }
+
+    pub const fn instance_id(&self) -> RecoverableNatsStreamInstanceId {
+        self.0.instance_id
+    }
+
+    pub const fn state(&self) -> RecoverableNatsStreamStateSnapshot {
+        self.0.state
+    }
+}
+
+/// Exact observation of the same contract after JetStream has irreversibly
+/// fenced new writes with `sealed=true`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SealedRecoverableNatsStreamInstance(AttestedRecoverableNatsStreamInstance);
+
+impl SealedRecoverableNatsStreamInstance {
+    pub const fn segment(&self) -> &RecoverableNatsStreamSegment {
+        &self.0.segment
+    }
+
+    pub const fn instance_id(&self) -> RecoverableNatsStreamInstanceId {
+        self.0.instance_id
+    }
+
+    pub const fn state(&self) -> RecoverableNatsStreamStateSnapshot {
+        self.0.state
+    }
 }
 
 impl StructurallyValidatedRecoverableNatsSegment {
@@ -313,6 +460,14 @@ impl RecoverableNatsStreamSegment {
         )
     }
 
+    /// Exact one-way config used by the future durable segment lifecycle.
+    /// This module does not itself execute the update.
+    pub fn sealed_stream_config(&self) -> StreamConfig {
+        let mut config = self.stream_config();
+        config.sealed = true;
+        config
+    }
+
     pub fn validate_stream_config_structure(
         &self,
         actual: &StreamConfig,
@@ -325,6 +480,71 @@ impl RecoverableNatsStreamSegment {
         Ok(StructurallyValidatedRecoverableNatsSegment {
             segment: self.clone(),
         })
+    }
+
+    pub fn attest_live_instance(
+        &self,
+        info: &StreamInfo,
+    ) -> Result<LiveRecoverableNatsStreamInstance, RecoverableNatsSegmentError> {
+        let observed = self.attest_instance(info, false)?;
+        Ok(LiveRecoverableNatsStreamInstance(observed))
+    }
+
+    pub fn attest_sealed_instance(
+        &self,
+        info: &StreamInfo,
+    ) -> Result<SealedRecoverableNatsStreamInstance, RecoverableNatsSegmentError> {
+        let observed = self.attest_instance(info, true)?;
+        Ok(SealedRecoverableNatsStreamInstance(observed))
+    }
+
+    fn attest_instance(
+        &self,
+        info: &StreamInfo,
+        sealed: bool,
+    ) -> Result<AttestedRecoverableNatsStreamInstance, RecoverableNatsSegmentError> {
+        let expected = if sealed {
+            self.sealed_stream_config()
+        } else {
+            self.stream_config()
+        };
+        if normalized_stream_config(&info.config)? != normalized_stream_config(&expected)? {
+            return Err(RecoverableNatsSegmentError::StreamContractMismatch);
+        }
+        let created_unix_nanos = info.created.unix_timestamp_nanos();
+        if created_unix_nanos <= 0 {
+            return Err(RecoverableNatsSegmentError::InvalidStreamCreatedAt);
+        }
+        let state = RecoverableNatsStreamStateSnapshot::from_info(info)?;
+        Ok(self.attest_instance_parts(created_unix_nanos, state))
+    }
+
+    fn attest_instance_parts(
+        &self,
+        created_unix_nanos: i128,
+        state: RecoverableNatsStreamStateSnapshot,
+    ) -> AttestedRecoverableNatsStreamInstance {
+        let mut hasher = Sha256::new();
+        hasher.update(INSTANCE_DOMAIN);
+        hasher.update(self.digest.as_bytes());
+        hasher.update(created_unix_nanos.to_be_bytes());
+        AttestedRecoverableNatsStreamInstance {
+            segment: self.clone(),
+            instance_id: RecoverableNatsStreamInstanceId(hasher.finalize().into()),
+            created_unix_nanos,
+            state,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn model_sealed_instance(
+        &self,
+        created_unix_nanos: i128,
+        state: RecoverableNatsStreamStateSnapshot,
+    ) -> SealedRecoverableNatsStreamInstance {
+        SealedRecoverableNatsStreamInstance(
+            self.attest_instance_parts(created_unix_nanos, state),
+        )
     }
 }
 
@@ -502,6 +722,10 @@ pub enum RecoverableNatsSegmentError {
     AddressTooLong,
     StreamContractMismatch,
     StreamContractEncoding,
+    InvalidStreamCreatedAt,
+    StreamStateOverflow,
+    StreamSequenceGap,
+    StreamHasDeletedMessages,
 }
 
 impl fmt::Display for RecoverableNatsSegmentError {
@@ -535,6 +759,10 @@ impl fmt::Display for RecoverableNatsSegmentError {
             Self::AddressTooLong => formatter.write_str("derived NATS stream or subject address is too long"),
             Self::StreamContractMismatch => formatter.write_str("recoverable NATS stream contract mismatch"),
             Self::StreamContractEncoding => formatter.write_str("recoverable NATS stream contract encoding failed"),
+            Self::InvalidStreamCreatedAt => formatter.write_str("recoverable NATS stream creation timestamp is invalid"),
+            Self::StreamStateOverflow => formatter.write_str("recoverable NATS stream state cannot be represented canonically"),
+            Self::StreamSequenceGap => formatter.write_str("recoverable NATS stream contains a missing or truncated sequence"),
+            Self::StreamHasDeletedMessages => formatter.write_str("recoverable NATS stream reports deleted messages"),
         }
     }
 }
@@ -753,6 +981,50 @@ mod tests {
         assert!(config.subject_delete_marker_ttl.is_none());
         assert_eq!(config.compression, Some(Compression::None));
         segment.validate_stream_config_structure(&config).unwrap();
+        let sealed = segment.sealed_stream_config();
+        assert!(sealed.sealed);
+        assert!(segment.validate_stream_config_structure(&sealed).is_err());
+    }
+
+    #[test]
+    fn created_instance_identity_is_stable_and_recreation_safe() {
+        let segment = segment(7);
+        let state = RecoverableNatsStreamStateSnapshot {
+            messages: 3,
+            bytes: 900,
+            first_sequence: 1,
+            last_sequence: 3,
+            consumer_count: 1,
+            subject_count: 2,
+        };
+        state.validate().unwrap();
+        let first = segment.attest_instance_parts(1_700_000_000_000_000_000, state);
+        let retry = segment.attest_instance_parts(1_700_000_000_000_000_000, state);
+        let recreated = segment.attest_instance_parts(1_700_000_000_000_000_001, state);
+        assert_eq!(first, retry);
+        assert_ne!(first.instance_id, recreated.instance_id);
+        assert_eq!(first.segment.digest(), segment.digest());
+
+        assert!(RecoverableNatsStreamStateSnapshot {
+            messages: 3,
+            bytes: 900,
+            first_sequence: 2,
+            last_sequence: 4,
+            consumer_count: 1,
+            subject_count: 2,
+        }
+        .validate()
+        .is_err());
+        assert!(RecoverableNatsStreamStateSnapshot {
+            messages: 0,
+            bytes: 0,
+            first_sequence: 1,
+            last_sequence: 1,
+            consumer_count: 0,
+            subject_count: 0,
+        }
+        .validate()
+        .is_err());
     }
 
     #[test]

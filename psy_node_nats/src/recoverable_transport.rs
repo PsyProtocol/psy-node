@@ -36,8 +36,12 @@ use crate::{
         PendingQueuePublishEnvelope, PendingQueuePublisherKind,
         RecoverableNatsSourceRoute,
     },
-    recoverable_segment::RecoverableNatsStreamSegment,
+    recoverable_segment::{
+        LiveRecoverableNatsStreamInstance, RecoverableNatsStreamSegment,
+        SealedRecoverableNatsStreamInstance,
+    },
     recoverable_terminal::{
+        PendingQueueNatsWholeStreamScanReceipt, PendingQueueNatsWholeStreamScanner,
         PendingQueueSourceTruncationReceipt, PendingQueueSourceTruncationScanner,
         PendingQueueTerminalError,
     },
@@ -750,6 +754,90 @@ impl RecoverablePendingQueueNatsPublisher {
 }
 
 impl NatsJetStreamClient {
+    pub async fn observe_recoverable_segment_instance(
+        &self,
+        segment: RecoverableNatsStreamSegment,
+    ) -> Result<LiveRecoverableNatsStreamInstance, RecoverableNatsTransportError> {
+        if self.base_namespace() != segment.base_namespace() {
+            return Err(RecoverableNatsTransportError::ClientNamespaceMismatch);
+        }
+        let stream = self
+            .raw_context_for_recoverable_transport()
+            .get_stream(segment.stream_name())
+            .await
+            .map_err(nats)?;
+        let info = stream.get_info().await.map_err(nats)?;
+        segment
+            .attest_live_instance(&info)
+            .map_err(|error| RecoverableNatsTransportError::Core(error.to_string()))
+    }
+
+    pub async fn observe_recoverable_sealed_segment_instance(
+        &self,
+        segment: RecoverableNatsStreamSegment,
+    ) -> Result<SealedRecoverableNatsStreamInstance, RecoverableNatsTransportError> {
+        if self.base_namespace() != segment.base_namespace() {
+            return Err(RecoverableNatsTransportError::ClientNamespaceMismatch);
+        }
+        let stream = self
+            .raw_context_for_recoverable_transport()
+            .get_stream(segment.stream_name())
+            .await
+            .map_err(nats)?;
+        let info = stream.get_info().await.map_err(nats)?;
+        segment
+            .attest_sealed_instance(&info)
+            .map_err(|error| RecoverableNatsTransportError::Core(error.to_string()))
+    }
+
+    /// Exhaustively reads sequence `1..=last` from one exact sealed stream
+    /// incarnation. It does not seal or delete the stream and the receipt is
+    /// not a GC permit until the Scylla segment lifecycle binds every
+    /// assignment terminal in a later milestone.
+    pub async fn scan_recoverable_sealed_segment(
+        &self,
+        expected: &SealedRecoverableNatsStreamInstance,
+    ) -> Result<PendingQueueNatsWholeStreamScanReceipt, RecoverableNatsTransportError> {
+        if self.base_namespace() != expected.segment().base_namespace() {
+            return Err(RecoverableNatsTransportError::ClientNamespaceMismatch);
+        }
+        let context = self.raw_context_for_recoverable_transport();
+        let stream = context
+            .get_stream(expected.segment().stream_name())
+            .await
+            .map_err(nats)?;
+        let before = expected
+            .segment()
+            .attest_sealed_instance(&stream.get_info().await.map_err(nats)?)
+            .map_err(|error| RecoverableNatsTransportError::Core(error.to_string()))?;
+        if &before != expected {
+            return Err(RecoverableNatsTransportError::WholeStreamScanChanged);
+        }
+        let mut scanner = PendingQueueNatsWholeStreamScanner::new(before);
+        for sequence in 1..=expected.state().last_sequence() {
+            let message = stream
+                .get_raw_message(sequence)
+                .await
+                .map_err(|_| RecoverableNatsTransportError::WholeStreamScanChanged)?;
+            scanner
+                .observe(
+                    message.sequence,
+                    message.subject.as_str(),
+                    &message.payload,
+                )
+                .map_err(source_scan)?;
+        }
+        let receipt = scanner.finish().map_err(source_scan)?;
+        let after = expected
+            .segment()
+            .attest_sealed_instance(&stream.get_info().await.map_err(nats)?)
+            .map_err(|error| RecoverableNatsTransportError::Core(error.to_string()))?;
+        if &after != expected {
+            return Err(RecoverableNatsTransportError::WholeStreamScanChanged);
+        }
+        Ok(receipt)
+    }
+
     pub async fn recoverable_pending_publisher(
         &self,
         segment: RecoverableNatsStreamSegment,
@@ -912,6 +1000,7 @@ pub enum RecoverableNatsTransportError {
     PayloadMismatch,
     SourceNotSealed,
     SourceScanChanged,
+    WholeStreamScanChanged,
     SourceScan(String),
     AckMismatch {
         stream: String,
@@ -1322,6 +1411,27 @@ mod tests {
             .unwrap();
         assert!(scan.matches_persisted_source(&sealed_source));
         assert_eq!(scan.retained_message_count(), 2);
+        let live_instance = client
+            .observe_recoverable_segment_instance(segment.clone())
+            .await
+            .unwrap();
+        context
+            .update_stream(segment.sealed_stream_config())
+            .await
+            .unwrap();
+        let sealed_instance = client
+            .observe_recoverable_sealed_segment_instance(segment.clone())
+            .await
+            .unwrap();
+        assert_eq!(sealed_instance.instance_id(), live_instance.instance_id());
+        assert_eq!(sealed_instance.state().messages(), 2);
+        let whole = client
+            .scan_recoverable_sealed_segment(&sealed_instance)
+            .await
+            .unwrap();
+        assert_eq!(whole.instance_id(), sealed_instance.instance_id());
+        assert_eq!(whole.state(), sealed_instance.state());
+        assert!(publisher.publish(&seal).await.is_err());
         assert!(context
             .delete_stream(segment.stream_name())
             .await

@@ -33,6 +33,8 @@ use crate::{
     },
     recoverable_segment::{
         RecoverableNatsSegmentContractDigest, RecoverableNatsSegmentId,
+        RecoverableNatsStreamInstanceId, RecoverableNatsStreamStateSnapshot,
+        SealedRecoverableNatsStreamInstance,
     },
 };
 
@@ -44,6 +46,8 @@ const TRUNCATION_MANIFEST_SLOT_DOMAIN: &[u8] =
     b"psy/rollback/pending-queue-nats-truncation-manifest-slot/v1";
 const TRUNCATION_MANIFEST_DIGEST_DOMAIN: &[u8] =
     b"psy/rollback/pending-queue-nats-truncation-manifest/v1";
+const WHOLE_STREAM_SCAN_DOMAIN: &[u8] =
+    b"psy/rollback/pending-queue-nats-whole-stream-scan/v1";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct PendingQueueSourceTruncationDigest([u8; 32]);
@@ -605,6 +609,152 @@ impl PendingQueueNatsGenerationTruncationManifest {
     }
 }
 
+/// Digest of every physical retained message in one exact sealed stream
+/// incarnation. This proves transport-level closure only; the later durable
+/// segment manifest must additionally bind every assignment to its immutable
+/// generation terminal before deletion can be requested.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct PendingQueueNatsWholeStreamScanDigest([u8; 32]);
+
+impl PendingQueueNatsWholeStreamScanDigest {
+    fn try_new(bytes: [u8; 32]) -> Result<Self, PendingQueueTerminalError> {
+        if bytes == [0; 32] {
+            Err(PendingQueueTerminalError::EmptyDigest)
+        } else {
+            Ok(Self(bytes))
+        }
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingQueueNatsWholeStreamScanReceipt {
+    instance_id: RecoverableNatsStreamInstanceId,
+    segment_id: RecoverableNatsSegmentId,
+    contract_digest: RecoverableNatsSegmentContractDigest,
+    state: RecoverableNatsStreamStateSnapshot,
+    scan_digest: PendingQueueNatsWholeStreamScanDigest,
+}
+
+impl PendingQueueNatsWholeStreamScanReceipt {
+    pub const fn instance_id(&self) -> RecoverableNatsStreamInstanceId {
+        self.instance_id
+    }
+
+    pub const fn segment_id(&self) -> RecoverableNatsSegmentId {
+        self.segment_id
+    }
+
+    pub const fn contract_digest(&self) -> RecoverableNatsSegmentContractDigest {
+        self.contract_digest
+    }
+
+    pub const fn state(&self) -> RecoverableNatsStreamStateSnapshot {
+        self.state
+    }
+
+    pub const fn scan_digest(&self) -> PendingQueueNatsWholeStreamScanDigest {
+        self.scan_digest
+    }
+}
+
+pub(crate) struct PendingQueueNatsWholeStreamScanner {
+    instance: SealedRecoverableNatsStreamInstance,
+    next_sequence: u64,
+    observed_messages: u64,
+    hasher: Sha256,
+}
+
+impl PendingQueueNatsWholeStreamScanner {
+    pub(crate) fn new(instance: SealedRecoverableNatsStreamInstance) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(WHOLE_STREAM_SCAN_DOMAIN);
+        hasher.update(instance.instance_id().as_bytes());
+        hasher.update(instance.segment().digest().as_bytes());
+        let state = instance.state();
+        hasher.update(state.messages().to_be_bytes());
+        hasher.update(state.bytes().to_be_bytes());
+        hasher.update(state.first_sequence().to_be_bytes());
+        hasher.update(state.last_sequence().to_be_bytes());
+        hasher.update(state.consumer_count().to_be_bytes());
+        hasher.update(state.subject_count().to_be_bytes());
+        Self {
+            instance,
+            next_sequence: 1,
+            observed_messages: 0,
+            hasher,
+        }
+    }
+
+    pub(crate) fn observe(
+        &mut self,
+        sequence: u64,
+        subject: &str,
+        canonical_envelope: &[u8],
+    ) -> Result<(), PendingQueueTerminalError> {
+        let state = self.instance.state();
+        if sequence != self.next_sequence
+            || sequence == 0
+            || sequence > state.last_sequence()
+        {
+            return Err(PendingQueueTerminalError::WholeStreamSequenceMismatch);
+        }
+        let envelope = PendingQueuePublishEnvelope::decode_canonical(canonical_envelope)
+            .map_err(model)?;
+        if envelope.segment_id() != self.instance.segment().segment_id()
+            || envelope.contract_digest() != self.instance.segment().digest()
+            || envelope
+                .exact_subject(self.instance.segment())
+                .map_err(model)?
+                != subject
+        {
+            return Err(PendingQueueTerminalError::WholeStreamSubjectMismatch);
+        }
+        self.hasher.update(sequence.to_be_bytes());
+        self.hasher.update((subject.len() as u64).to_be_bytes());
+        self.hasher.update(subject.as_bytes());
+        self.hasher
+            .update((canonical_envelope.len() as u64).to_be_bytes());
+        self.hasher.update(canonical_envelope);
+        self.observed_messages = self
+            .observed_messages
+            .checked_add(1)
+            .ok_or(PendingQueueTerminalError::MemberCountOverflow)?;
+        self.next_sequence = self
+            .next_sequence
+            .checked_add(1)
+            .ok_or(PendingQueueTerminalError::WholeStreamSequenceMismatch)?;
+        Ok(())
+    }
+
+    pub(crate) fn finish(
+        self,
+    ) -> Result<PendingQueueNatsWholeStreamScanReceipt, PendingQueueTerminalError> {
+        let state = self.instance.state();
+        let expected_next = state
+            .last_sequence()
+            .checked_add(1)
+            .ok_or(PendingQueueTerminalError::WholeStreamSequenceMismatch)?;
+        if self.observed_messages != state.messages()
+            || self.next_sequence != expected_next
+        {
+            return Err(PendingQueueTerminalError::WholeStreamStateMismatch);
+        }
+        Ok(PendingQueueNatsWholeStreamScanReceipt {
+            instance_id: self.instance.instance_id(),
+            segment_id: self.instance.segment().segment_id(),
+            contract_digest: self.instance.segment().digest(),
+            state,
+            scan_digest: PendingQueueNatsWholeStreamScanDigest::try_new(
+                self.hasher.finalize().into(),
+            )?,
+        })
+    }
+}
+
 fn expected_kinds(context: PendingQueueCaptureContext) -> &'static [PendingQueuePublisherKind] {
     use psy_data::protocol::chain_context::AuthorityScope;
     match context.key().authority() {
@@ -650,6 +800,9 @@ pub enum PendingQueueTerminalError {
     TruncatedPayload,
     TrailingBytes,
     PayloadTooLarge(usize),
+    WholeStreamSequenceMismatch,
+    WholeStreamSubjectMismatch,
+    WholeStreamStateMismatch,
     Envelope(String),
     Assignment(String),
     Segment(String),
@@ -730,6 +883,7 @@ mod tests {
         },
         recoverable_segment::{
             RecoverableNatsRetentionContract, RecoverableNatsStreamSegment,
+            RecoverableNatsStreamStateSnapshot,
         },
     };
     use psy_data::protocol::{
@@ -943,6 +1097,85 @@ mod tests {
         assert!(scan.matches_data_replay(&empty_replay));
         assert_eq!(scan.boundary().unwrap().close_intent(), scan.close_intent());
         PendingQueueNatsGenerationTruncationManifest::try_from_scans(&assignment, vec![scan]).unwrap();
+    }
+
+    #[test]
+    fn sealed_whole_stream_scan_is_instance_bound_contiguous_and_typed() {
+        let (segment, assignment) = assignment(AuthorityScope::Realm {
+            realm_id: 4,
+            realm_sub_id: 0,
+        });
+        let kind = PendingQueuePublisherKind::RealmUserUpdate;
+        let route = RecoverableNatsSourceRoute::try_new(
+            assignment.context(), kind, &segment,
+        )
+        .unwrap();
+        let data = PendingQueuePublishEnvelope::data(
+            &route,
+            &assignment,
+            PendingQueuePublishIntentId::try_new([5; 32]).unwrap(),
+            PendingQueueMemberOrdinal::try_new(1).unwrap(),
+            0,
+            [0; 32],
+            vec![1, 2, 3],
+        )
+        .unwrap();
+        let selected = PendingQueuePublishSourceState::bootstrap(&route, &assignment)
+            .unwrap()
+            .select(&data)
+            .unwrap()
+            .current()
+            .clone();
+        let committed = selected
+            .record_published(1)
+            .unwrap()
+            .candidate()
+            .finalize_published()
+            .unwrap()
+            .candidate()
+            .clone();
+        let seal = PendingQueuePublishEnvelope::seal(
+            &route,
+            &assignment,
+            PendingQueuePublishIntentId::try_new([6; 32]).unwrap(),
+            PendingQueueMemberOrdinal::try_new(2).unwrap(),
+            1,
+            *data.digest().as_bytes(),
+            committed
+                .seal_summary(PendingQueueCloseIntentDigest::try_new([9; 32]).unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        let state = RecoverableNatsStreamStateSnapshot::try_new(
+            2, 999, 1, 2, 0, 1,
+        )
+        .unwrap();
+        let instance = segment.model_sealed_instance(1_700_000_000_000_000_000, state);
+        let subject = route.subject();
+        let mut scanner = PendingQueueNatsWholeStreamScanner::new(instance.clone());
+        scanner.observe(1, subject, &data.to_canonical_bytes()).unwrap();
+        scanner.observe(2, subject, &seal.to_canonical_bytes()).unwrap();
+        let receipt = scanner.finish().unwrap();
+        assert_eq!(receipt.instance_id(), instance.instance_id());
+        assert_eq!(receipt.state(), state);
+        assert_eq!(receipt.segment_id(), segment.segment_id());
+
+        let mut gap = PendingQueueNatsWholeStreamScanner::new(instance.clone());
+        assert_eq!(
+            gap.observe(2, subject, &data.to_canonical_bytes()),
+            Err(PendingQueueTerminalError::WholeStreamSequenceMismatch),
+        );
+        let mut wrong_subject = PendingQueueNatsWholeStreamScanner::new(instance.clone());
+        assert_eq!(
+            wrong_subject.observe(1, "PSY_BEQ_V2.wrong", &data.to_canonical_bytes()),
+            Err(PendingQueueTerminalError::WholeStreamSubjectMismatch),
+        );
+        let mut missing = PendingQueueNatsWholeStreamScanner::new(instance);
+        missing.observe(1, subject, &data.to_canonical_bytes()).unwrap();
+        assert_eq!(
+            missing.finish(),
+            Err(PendingQueueTerminalError::WholeStreamStateMismatch),
+        );
     }
 
     #[test]
