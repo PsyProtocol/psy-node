@@ -8,7 +8,10 @@
 use std::{error::Error, fmt};
 
 use psy_data::protocol::chain_context::AuthorityScope;
-use psy_node_core::queue::recoverable_ephemeral::PendingQueueArtifactIdentity;
+use psy_node_core::{
+    queue::recoverable_ephemeral::PendingQueueArtifactIdentity,
+    store::pending_generation_pipeline::PendingQueueCloseIntentDigest,
+};
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -22,7 +25,7 @@ use crate::{
     },
 };
 
-pub const RECOVERABLE_PENDING_INTENT_CODEC_VERSION: u16 = 1;
+pub const RECOVERABLE_PENDING_INTENT_CODEC_VERSION: u16 = 2;
 pub const RECOVERABLE_PENDING_PAYLOAD_FRAGMENT_BYTES: usize = 4 * 1024 * 1024;
 pub const RECOVERABLE_PENDING_PAYLOAD_FRAGMENTS_PER_BUCKET: u16 = 4;
 pub const MAX_RECOVERABLE_PENDING_PAYLOAD_FRAGMENTS: u16 = 16;
@@ -197,6 +200,7 @@ pub struct StoredPendingQueuePublishIntent {
     assignment_digest: PendingQueueSegmentAssignmentDigest,
     intent_id: PendingQueuePublishIntentId,
     request_kind: PendingQueuePublishRequestKind,
+    close_intent: Option<PendingQueueCloseIntentDigest>,
     payload_digest: PendingQueuePayloadDigest,
     payload_bytes: u64,
     fragment_count: u16,
@@ -218,6 +222,7 @@ impl StoredPendingQueuePublishIntent {
             source,
             intent_id,
             PendingQueuePublishRequestKind::Data,
+            None,
             payload_digest,
             payload.len() as u64,
             fragments.len() as u16,
@@ -228,11 +233,13 @@ impl StoredPendingQueuePublishIntent {
     pub fn materialize_seal(
         source: &PendingQueuePublishSourceState,
         intent_id: PendingQueuePublishIntentId,
+        close_intent: PendingQueueCloseIntentDigest,
     ) -> Result<Self, PendingQueueOutboxError> {
         Self::materialize(
             source,
             intent_id,
             PendingQueuePublishRequestKind::Seal,
+            Some(close_intent),
             PendingQueuePayloadDigest::for_payload(&[])?,
             0,
             0,
@@ -243,6 +250,7 @@ impl StoredPendingQueuePublishIntent {
         source: &PendingQueuePublishSourceState,
         intent_id: PendingQueuePublishIntentId,
         request_kind: PendingQueuePublishRequestKind,
+        close_intent: Option<PendingQueueCloseIntentDigest>,
         payload_digest: PendingQueuePayloadDigest,
         payload_bytes: u64,
         fragment_count: u16,
@@ -262,6 +270,7 @@ impl StoredPendingQueuePublishIntent {
             assignment_digest: source.assignment_digest(),
             intent_id,
             request_kind,
+            close_intent,
             payload_digest,
             payload_bytes,
             fragment_count,
@@ -301,6 +310,10 @@ impl StoredPendingQueuePublishIntent {
 
     pub const fn request_kind(&self) -> PendingQueuePublishRequestKind {
         self.request_kind
+    }
+
+    pub const fn close_intent(&self) -> Option<PendingQueueCloseIntentDigest> {
+        self.close_intent
     }
 
     pub const fn payload_digest(&self) -> PendingQueuePayloadDigest {
@@ -451,9 +464,12 @@ impl StoredPendingQueuePublishIntent {
                     return Err(PendingQueueOutboxError::PayloadMismatch);
                 }
             }
-            (PendingQueuePublishRequestKind::Seal, PendingQueueEnvelopeBody::Seal(_)) => {
+            (PendingQueuePublishRequestKind::Seal, PendingQueueEnvelopeBody::Seal(summary)) => {
                 if !payload.is_empty() || self.payload_bytes != 0 || self.fragment_count != 0 {
                     return Err(PendingQueueOutboxError::PayloadMismatch);
+                }
+                if self.close_intent != Some(summary.close_intent()) {
+                    return Err(PendingQueueOutboxError::CloseIntentMismatch);
                 }
             }
             _ => return Err(PendingQueueOutboxError::EnvelopeBindingMismatch),
@@ -508,6 +524,15 @@ impl StoredPendingQueuePublishIntent {
             2 => PendingQueuePublishRequestKind::Seal,
             value => return Err(PendingQueueOutboxError::UnknownRequestKind(value)),
         };
+        let close_intent_bytes = decoder.array32()?;
+        let close_intent = if close_intent_bytes == [0; 32] {
+            None
+        } else {
+            Some(
+                PendingQueueCloseIntentDigest::try_new(close_intent_bytes)
+                    .map_err(|error| PendingQueueOutboxError::Core(error.to_string()))?,
+            )
+        };
         let payload_digest = PendingQueuePayloadDigest::try_new(decoder.array32()?)?;
         let payload_bytes = decoder.u64()?;
         let fragment_count = decoder.u16()?;
@@ -540,6 +565,7 @@ impl StoredPendingQueuePublishIntent {
             assignment_digest,
             intent_id,
             request_kind,
+            close_intent,
             payload_digest,
             payload_bytes,
             fragment_count,
@@ -562,6 +588,12 @@ impl StoredPendingQueuePublishIntent {
         out.extend_from_slice(self.assignment_digest.as_bytes());
         out.extend_from_slice(self.intent_id.as_bytes());
         out.push(self.request_kind as u8);
+        out.extend_from_slice(
+            self.close_intent
+                .map(|close| *close.as_bytes())
+                .unwrap_or([0; 32])
+                .as_slice(),
+        );
         out.extend_from_slice(self.payload_digest.as_bytes());
         out.extend_from_slice(&self.payload_bytes.to_be_bytes());
         out.extend_from_slice(&self.fragment_count.to_be_bytes());
@@ -610,7 +642,8 @@ impl StoredPendingQueuePublishIntent {
         }
         match self.request_kind {
             PendingQueuePublishRequestKind::Data => {
-                if self.payload_bytes == 0
+                if self.close_intent.is_some()
+                    || self.payload_bytes == 0
                     || self.fragment_count == 0
                     || self.fragment_count > MAX_RECOVERABLE_PENDING_PAYLOAD_FRAGMENTS
                 {
@@ -618,7 +651,10 @@ impl StoredPendingQueuePublishIntent {
                 }
             }
             PendingQueuePublishRequestKind::Seal => {
-                if self.payload_bytes != 0 || self.fragment_count != 0 {
+                if self.close_intent.is_none()
+                    || self.payload_bytes != 0
+                    || self.fragment_count != 0
+                {
                     return Err(PendingQueueOutboxError::InvalidFragmentPlan);
                 }
             }
@@ -909,6 +945,7 @@ pub enum PendingQueueOutboxError {
     ExtraFragment,
     FragmentMismatch,
     PayloadMismatch,
+    CloseIntentMismatch,
     IdentityMismatch,
     EnvelopeBindingMismatch,
     IntentPhaseConflict,
@@ -924,6 +961,7 @@ pub enum PendingQueueOutboxError {
     DigestMismatch,
     TrailingBytes,
     Malformed,
+    Core(String),
     Envelope(String),
 }
 
@@ -1070,6 +1108,16 @@ mod tests {
             .unwrap(),
             intent,
         );
+        let mut legacy = encoded.clone();
+        legacy[8..10].copy_from_slice(&1u16.to_be_bytes());
+        assert_eq!(
+            StoredPendingQueuePublishIntent::decode_persisted(
+                intent.slot(),
+                intent.revision().as_i64(),
+                &legacy,
+            ),
+            Err(PendingQueueOutboxError::UnknownCodecVersion(1)),
+        );
         let mut corrupted = encoded;
         corrupted[20] ^= 1;
         assert!(StoredPendingQueuePublishIntent::decode_persisted(
@@ -1182,6 +1230,7 @@ mod tests {
         let seal_intent = StoredPendingQueuePublishIntent::materialize_seal(
             &source,
             PendingQueuePublishIntentId::try_new([22; 32]).unwrap(),
+            PendingQueueCloseIntentDigest::try_new([9; 32]).unwrap(),
         )
         .unwrap();
         let seal = PendingQueuePublishEnvelope::seal(
@@ -1191,10 +1240,34 @@ mod tests {
             PendingQueueMemberOrdinal::try_new(1).unwrap(),
             0,
             [0; 32],
-            source.seal_summary().unwrap(),
+            source
+                .seal_summary(PendingQueueCloseIntentDigest::try_new([9; 32]).unwrap())
+                .unwrap(),
         )
         .unwrap();
         let sealing = source.select(&seal).unwrap().current().clone();
+        assert!(seal_intent.bind(&sealing, &seal, &[]).is_ok());
+        let wrong_close_seal = PendingQueuePublishEnvelope::seal(
+            &route,
+            &assignment,
+            seal_intent.intent_id(),
+            PendingQueueMemberOrdinal::try_new(1).unwrap(),
+            0,
+            [0; 32],
+            source
+                .seal_summary(PendingQueueCloseIntentDigest::try_new([8; 32]).unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        let wrong_sealing = source
+            .select(&wrong_close_seal)
+            .unwrap()
+            .current()
+            .clone();
+        assert!(matches!(
+            seal_intent.bind(&wrong_sealing, &wrong_close_seal, &[]),
+            Err(PendingQueueOutboxError::CloseIntentMismatch)
+        ));
         assert!(sealing.select(&data).is_err());
         assert!(matches!(
             prepared_data.phase(),

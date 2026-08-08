@@ -13,6 +13,7 @@ use psy_node_core::queue::recoverable_ephemeral::{
     PendingQueueSourceAddress, PendingQueueSourceIdentity,
     PendingQueueSourceIdentityDigest, MAX_RECOVERABLE_QUEUE_BATCH_BYTES,
 };
+use psy_node_core::store::pending_generation_pipeline::PendingQueueCloseIntentDigest;
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -26,8 +27,8 @@ use crate::{
     },
 };
 
-pub const RECOVERABLE_PENDING_ENVELOPE_CODEC_VERSION: u16 = 1;
-pub const RECOVERABLE_PENDING_SOURCE_STATE_CODEC_VERSION: u16 = 1;
+pub const RECOVERABLE_PENDING_ENVELOPE_CODEC_VERSION: u16 = 2;
+pub const RECOVERABLE_PENDING_SOURCE_STATE_CODEC_VERSION: u16 = 2;
 pub const MAX_RECOVERABLE_PENDING_ENVELOPE_BYTES: usize =
     RECOVERABLE_NATS_MAX_MESSAGE_BYTES as usize;
 const MAGIC: &[u8; 8] = b"PSYQENV1";
@@ -419,6 +420,7 @@ pub enum PendingQueueEnvelopeBody {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct PendingQueueSealSummary {
+    close_intent: PendingQueueCloseIntentDigest,
     data_member_count: u32,
     data_payload_bytes: u64,
     data_encoded_bytes: u64,
@@ -427,6 +429,7 @@ pub struct PendingQueueSealSummary {
 
 impl PendingQueueSealSummary {
     pub fn try_new(
+        close_intent: PendingQueueCloseIntentDigest,
         data_member_count: u32,
         data_payload_bytes: u64,
         data_encoded_bytes: u64,
@@ -446,11 +449,16 @@ impl PendingQueueSealSummary {
             return Err(PendingQueueEnvelopeError::InvalidSealSummary);
         }
         Ok(Self {
+            close_intent,
             data_member_count,
             data_payload_bytes,
             data_encoded_bytes,
             data_rolling_digest,
         })
+    }
+
+    pub const fn close_intent(self) -> PendingQueueCloseIntentDigest {
+        self.close_intent
     }
 
     pub const fn data_member_count(self) -> u32 {
@@ -711,6 +719,8 @@ impl PendingQueuePublishEnvelope {
                 PendingQueueEnvelopeBody::Data(decoder.take(payload_len)?.to_vec())
             }
             2 => PendingQueueEnvelopeBody::Seal(PendingQueueSealSummary::try_new(
+                PendingQueueCloseIntentDigest::try_new(decoder.array32()?)
+                    .map_err(|_| PendingQueueEnvelopeError::InvalidCloseIntent)?,
                 decoder.u32()?,
                 decoder.u64()?,
                 decoder.u64()?,
@@ -786,6 +796,7 @@ impl PendingQueuePublishEnvelope {
                 out.extend_from_slice(payload);
             }
             PendingQueueEnvelopeBody::Seal(summary) => {
+                out.extend_from_slice(summary.close_intent.as_bytes());
                 out.extend_from_slice(&summary.data_member_count.to_be_bytes());
                 out.extend_from_slice(&summary.data_payload_bytes.to_be_bytes());
                 out.extend_from_slice(&summary.data_encoded_bytes.to_be_bytes());
@@ -923,6 +934,7 @@ pub enum PendingQueuePublishSourcePhase {
         subject_sequence: u64,
     },
     Sealed {
+        close_intent: PendingQueueCloseIntentDigest,
         seal_digest: PendingQueueEnvelopeDigest,
         seal_subject_sequence: u64,
     },
@@ -1188,6 +1200,8 @@ impl PendingQueuePublishSourceState {
                 let body = match decoder.u8()? {
                     1 => PendingQueueSelectedBody::Data,
                     2 => PendingQueueSelectedBody::Seal(PendingQueueSealSummary::try_new(
+                        PendingQueueCloseIntentDigest::try_new(decoder.array32()?)
+                            .map_err(|_| PendingQueueEnvelopeError::InvalidCloseIntent)?,
                         decoder.u32()?,
                         decoder.u64()?,
                         decoder.u64()?,
@@ -1215,6 +1229,8 @@ impl PendingQueuePublishSourceState {
                 }
             }
             3 => PendingQueuePublishSourcePhase::Sealed {
+                close_intent: PendingQueueCloseIntentDigest::try_new(decoder.array32()?)
+                    .map_err(|_| PendingQueueEnvelopeError::InvalidCloseIntent)?,
                 seal_digest: PendingQueueEnvelopeDigest::try_new(decoder.array32()?)?,
                 seal_subject_sequence: decoder.u64()?,
             },
@@ -1256,8 +1272,12 @@ impl PendingQueuePublishSourceState {
         Ok(state)
     }
 
-    pub fn seal_summary(&self) -> Result<PendingQueueSealSummary, PendingQueueEnvelopeError> {
+    pub fn seal_summary(
+        &self,
+        close_intent: PendingQueueCloseIntentDigest,
+    ) -> Result<PendingQueueSealSummary, PendingQueueEnvelopeError> {
         PendingQueueSealSummary::try_new(
+            close_intent,
             self.data_member_count,
             self.data_payload_bytes,
             self.data_encoded_bytes,
@@ -1313,7 +1333,7 @@ impl PendingQueuePublishSourceState {
                 }
             }
             PendingQueueEnvelopeBody::Seal(summary) => {
-                if *summary != self.seal_summary()?
+                if *summary != self.seal_summary(summary.close_intent())?
                     || encoded_bytes > self.quota.max_seal_stored_bytes
                 {
                     return Err(PendingQueueEnvelopeError::InvalidSealSummary);
@@ -1417,8 +1437,9 @@ impl PendingQueuePublishSourceState {
                 );
                 candidate.phase = PendingQueuePublishSourcePhase::Open;
             }
-            PendingQueueSelectedBody::Seal(_) => {
+            PendingQueueSelectedBody::Seal(summary) => {
                 candidate.phase = PendingQueuePublishSourcePhase::Sealed {
+                    close_intent: summary.close_intent(),
                     seal_digest: selected.envelope_digest,
                     seal_subject_sequence: *subject_sequence,
                 };
@@ -1461,10 +1482,12 @@ impl PendingQueuePublishSourceState {
                 out.extend_from_slice(&subject_sequence.to_be_bytes());
             }
             PendingQueuePublishSourcePhase::Sealed {
+                close_intent,
                 seal_digest,
                 seal_subject_sequence,
             } => {
                 out.push(3);
+                out.extend_from_slice(close_intent.as_bytes());
                 out.extend_from_slice(seal_digest.as_bytes());
                 out.extend_from_slice(&seal_subject_sequence.to_be_bytes());
             }
@@ -1532,6 +1555,7 @@ impl PendingQueuePublishSourceState {
                 self.validate_selected(selected, Some(*subject_sequence))?;
             }
             PendingQueuePublishSourcePhase::Sealed {
+                close_intent: _,
                 seal_digest,
                 seal_subject_sequence,
             } => {
@@ -1584,7 +1608,7 @@ impl PendingQueuePublishSourceState {
             }
             PendingQueueSelectedBody::Seal(summary) => {
                 if selected.payload_bytes != 0
-                    || summary != self.seal_summary()?
+                    || summary != self.seal_summary(summary.close_intent())?
                     || selected.encoded_bytes > self.quota.max_seal_stored_bytes
                 {
                     return Err(PendingQueueEnvelopeError::InvalidSourceState);
@@ -1678,6 +1702,7 @@ fn encode_selected(selected: &PendingQueueSelectedEnvelope, out: &mut Vec<u8>) {
         PendingQueueSelectedBody::Data => out.push(1),
         PendingQueueSelectedBody::Seal(summary) => {
             out.push(2);
+            out.extend_from_slice(summary.close_intent.as_bytes());
             out.extend_from_slice(&summary.data_member_count.to_be_bytes());
             out.extend_from_slice(&summary.data_payload_bytes.to_be_bytes());
             out.extend_from_slice(&summary.data_encoded_bytes.to_be_bytes());
@@ -1699,6 +1724,8 @@ fn decode_selected(
     let body = match decoder.u8()? {
         1 => PendingQueueSelectedBody::Data,
         2 => PendingQueueSelectedBody::Seal(PendingQueueSealSummary::try_new(
+            PendingQueueCloseIntentDigest::try_new(decoder.array32()?)
+                .map_err(|_| PendingQueueEnvelopeError::InvalidCloseIntent)?,
             decoder.u32()?,
             decoder.u64()?,
             decoder.u64()?,
@@ -1911,6 +1938,7 @@ pub enum PendingQueueEnvelopeError {
     SubjectSequenceRegressed,
     SourceIdentityMismatch,
     InvalidEmptySeal,
+    InvalidCloseIntent,
     InvalidSealSummary,
     InvalidSourceState,
     SealIndexMismatch,
@@ -2065,9 +2093,9 @@ mod tests {
         assert_eq!(
             encoded_digest,
             [
-                151, 163, 33, 182, 168, 151, 219, 156, 161, 155, 64, 114, 207,
-                131, 166, 67, 41, 174, 25, 49, 129, 220, 17, 40, 76, 58, 69,
-                8, 205, 206, 203, 114,
+                250, 192, 132, 20, 246, 100, 62, 145, 33, 72, 97, 79, 185,
+                178, 204, 35, 50, 24, 221, 172, 154, 229, 146, 210, 130, 200,
+                122, 23, 52, 157, 154, 28,
             ],
         );
         assert_eq!(
@@ -2077,8 +2105,15 @@ mod tests {
         assert_eq!(data.to_canonical_bytes(), encoded);
         assert!(data.exact_subject(&segment).unwrap().contains(".G"));
         assert_eq!(data.message_id().len(), 72);
+        let mut legacy_envelope = encoded.clone();
+        legacy_envelope[8..10].copy_from_slice(&1u16.to_be_bytes());
+        assert_eq!(
+            PendingQueuePublishEnvelope::decode_canonical(&legacy_envelope),
+            Err(PendingQueueEnvelopeError::UnknownCodecVersion(1)),
+        );
 
         let summary = PendingQueueSealSummary::try_new(
+            PendingQueueCloseIntentDigest::try_new([7; 32]).unwrap(),
             1,
             data.payload_bytes() as u64,
             encoded.len() as u64,
@@ -2130,7 +2165,13 @@ mod tests {
             Err(PendingQueueEnvelopeError::DigestMismatch),
         );
         assert_eq!(
-            PendingQueueSealSummary::try_new(0, 1, 0, [0; 32]),
+            PendingQueueSealSummary::try_new(
+                PendingQueueCloseIntentDigest::try_new([7; 32]).unwrap(),
+                0,
+                1,
+                0,
+                [0; 32],
+            ),
             Err(PendingQueueEnvelopeError::InvalidEmptySeal),
         );
     }
@@ -2173,6 +2214,15 @@ mod tests {
             )
             .unwrap(),
             state,
+        );
+        let mut legacy_source = state.to_persisted_bytes();
+        legacy_source[8..10].copy_from_slice(&1u16.to_be_bytes());
+        assert_eq!(
+            PendingQueuePublishSourceState::decode_persisted(
+                state.revision().get() as i64,
+                &legacy_source,
+            ),
+            Err(PendingQueueEnvelopeError::UnknownCodecVersion(1)),
         );
         let data = PendingQueuePublishEnvelope::data(
             &route,
@@ -2227,7 +2277,9 @@ mod tests {
             PendingQueueMemberOrdinal::try_new(2).unwrap(),
             100,
             open.last_envelope_digest(),
-            open.seal_summary().unwrap(),
+            open
+                .seal_summary(PendingQueueCloseIntentDigest::try_new([7; 32]).unwrap())
+                .unwrap(),
         )
         .unwrap();
         let sealing = match open.select(&seal).unwrap() {

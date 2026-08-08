@@ -1296,8 +1296,20 @@ pub struct PendingQueueArtifactScanObservation {
 impl PendingQueueArtifactScanObservation {
     pub fn verify(
         close_observed: &StoredPendingQueueArtifact,
-        mut fragments: Vec<PendingQueueArtifactFragment>,
+        fragments: Vec<PendingQueueArtifactFragment>,
     ) -> Result<Self, PendingQueueArtifactError> {
+        Self::verify_and_reconstruct(close_observed, fragments)
+            .map(|(observation, _)| observation)
+    }
+
+    /// Performs the same exhaustive structural verification while returning
+    /// each exact candidate in durable batch order. The candidates carry no
+    /// terminal authority; a concrete store must still bind this result to
+    /// its opaque exact-readback receipt and the backend close fence.
+    pub fn verify_and_reconstruct(
+        close_observed: &StoredPendingQueueArtifact,
+        mut fragments: Vec<PendingQueueArtifactFragment>,
+    ) -> Result<(Self, Vec<PendingQueueCaptureCandidate>), PendingQueueArtifactError> {
         let (progress, boundary, close_revision, persisted_scan_digest) =
             match &close_observed.phase {
                 PendingQueueArtifactPhase::CloseObserved { progress, boundary } => (
@@ -1346,6 +1358,7 @@ impl PendingQueueArtifactScanObservation {
         let mut staged_generation = None;
         let mut staged_last_revision = 0u64;
         let mut staged_captures = BTreeSet::new();
+        let mut candidates = Vec::new();
         while offset < fragments.len() {
             let first = &fragments[offset];
             if first.global_index.get() != rebuilt_progress.next_fragment_index
@@ -1424,6 +1437,7 @@ impl PendingQueueArtifactScanObservation {
                 unreachable!()
             };
             rebuilt_progress = after;
+            candidates.push(candidate);
             offset = end;
         }
         if rebuilt_progress != *progress {
@@ -1446,13 +1460,16 @@ impl PendingQueueArtifactScanObservation {
         if persisted_scan_digest.is_some_and(|expected| expected != scan_digest) {
             return Err(PendingQueueArtifactError::StoredSourceScanDigestMismatch);
         }
-        Ok(Self {
-            slot: close_observed.slot,
-            close_revision,
-            dataset_digest: progress.dataset_digest,
-            boundary_digest: *boundary.digest().as_bytes(),
-            scan_digest,
-        })
+        Ok((
+            Self {
+                slot: close_observed.slot,
+                close_revision,
+                dataset_digest: progress.dataset_digest,
+                boundary_digest: *boundary.digest().as_bytes(),
+                scan_digest,
+            },
+            candidates,
+        ))
     }
 
     pub const fn scan_digest(&self) -> PendingQueueArtifactScanDigest {

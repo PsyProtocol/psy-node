@@ -25,6 +25,8 @@ use futures::StreamExt;
 use psy_node_core::queue::recoverable_ephemeral::{
     PendingQueueSourceIdentity, MAX_RECOVERABLE_QUEUE_BATCH_ITEMS,
 };
+#[cfg(test)]
+use psy_node_core::store::pending_generation_pipeline::PendingQueueCloseIntentDigest;
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -342,12 +344,43 @@ pub struct RecoverableNatsDeliveryBatch {
 }
 
 impl RecoverableNatsDeliveryBatch {
+    pub fn len(&self) -> usize { self.messages.len() }
+
+    pub fn is_empty(&self) -> bool { self.messages.is_empty() }
+
     pub fn stream_sequences(&self) -> &[u64] {
         &self.stream_sequences
     }
 
     pub fn payloads(&self) -> &[Vec<u8>] {
         &self.payloads
+    }
+
+    /// Splits one fetched delivery without cloning backend ACK handles. This
+    /// lets a concrete store durably confirm the Data prefix and persist a
+    /// close boundary before the trailing Seal is ACKed.
+    pub fn split_at(
+        mut self,
+        prefix_len: usize,
+    ) -> Result<(Option<Self>, Option<Self>), RecoverableNatsTransportError> {
+        if self.messages.len() != self.stream_sequences.len()
+            || self.messages.len() != self.payloads.len()
+            || prefix_len > self.messages.len()
+        {
+            return Err(RecoverableNatsTransportError::DeliveryContract);
+        }
+        let suffix_messages = self.messages.split_off(prefix_len);
+        let suffix_sequences = self.stream_sequences.split_off(prefix_len);
+        let suffix_payloads = self.payloads.split_off(prefix_len);
+        let consumer_digest = self.consumer_digest;
+        let prefix = (!self.messages.is_empty()).then_some(self);
+        let suffix = (!suffix_messages.is_empty()).then_some(Self {
+            messages: suffix_messages,
+            stream_sequences: suffix_sequences,
+            payloads: suffix_payloads,
+            consumer_digest,
+        });
+        Ok((prefix, suffix))
     }
 
     pub async fn double_ack_all(
@@ -1254,7 +1287,9 @@ mod tests {
             PendingQueueMemberOrdinal::try_new(2).unwrap(),
             data_committed.last_subject_sequence(),
             data_committed.last_envelope_digest(),
-            data_committed.seal_summary().unwrap(),
+            data_committed
+                .seal_summary(PendingQueueCloseIntentDigest::try_new([7; 32]).unwrap())
+                .unwrap(),
         )
         .unwrap();
         let seal_outcome = publisher.publish(&seal).await.unwrap();

@@ -14,13 +14,19 @@ use std::{
     time::Duration,
 };
 
+use parth_core::protocol::core_types::Q256BitHash;
 use psy_node_core::queue::recoverable_ephemeral::{
-    PendingQueueArtifactIdentity, PendingQueueCaptureCandidate,
-    PendingQueueCaptureContext, PendingQueueSourceCursor,
+    PendingQueueArtifactIdentity, PendingQueueBoundaryObservation,
+    PendingQueueCaptureCandidate, PendingQueueCaptureContext,
+    PendingQueueGenerationBoundary, PendingQueueSourceCursor,
     PendingQueueSourceCursorView,
 };
 use psy_node_nats::{
     queue::NatsJetStreamClient,
+    recoverable_publish::{
+        PendingQueueEnvelopeBody, PendingQueuePublishEnvelope,
+        PendingQueuePublisherKind,
+    },
     recoverable_transport::{
         RecoverableNatsCaptureConsumer, RecoverableNatsCaptureSpec,
         RecoverableNatsDeliveryBatch, RecoverableNatsTransportError,
@@ -30,12 +36,29 @@ use tokio::sync::Mutex;
 
 use super::{
     DurablySelectedPendingQueueBatchReceipt, PendingQueueArtifactStoreError,
-    PendingQueueArtifactOwnerPermit, ScyllaPendingQueueArtifactStore,
+    PendingQueueArtifactOwnerPermit, PersistedPendingQueueCloseReceipt,
+    ScyllaPendingPipelineStore, ScyllaPendingQueueArtifactStore,
 };
 
 const DEFAULT_FETCH_EXPIRES: Duration = Duration::from_millis(250);
 
 type RecoverableNatsConsumerContract = RecoverableNatsCaptureSpec;
+
+#[derive(Debug)]
+pub(super) enum PendingQueueNatsCaptureOutcome {
+    Data(PendingQueueCaptureCandidate),
+    Sealed {
+        data: Option<PendingQueueCaptureCandidate>,
+        boundary: PendingQueueGenerationBoundary,
+    },
+}
+
+struct ClassifiedRecoverableDelivery {
+    token: RecoverableNatsDeliveryBatch,
+    data: Option<PendingQueueCaptureCandidate>,
+    data_count: usize,
+    boundary: Option<PendingQueueGenerationBoundary>,
+}
 
 fn verify_candidate<'candidate>(
     contract: &RecoverableNatsConsumerContract,
@@ -95,11 +118,21 @@ impl ScyllaBackedRecoverableNatsSource {
 
     /// Recovers a previously selected batch first; otherwise fetches one new
     /// unacknowledged batch.  Exact Scylla readback always precedes terminal
-    /// NATS ACK, and the durable header advances only after ACK is confirmed.
-    pub(super) async fn capture_one(
+    /// Data ACK is confirmed before Data progress advances; a trailing Seal is
+    /// ACKed only after its exact CloseObserved boundary is durable.
+    pub(super) async fn capture_one<Hash: Q256BitHash>(
         &self,
+        pipeline_store: &ScyllaPendingPipelineStore,
         context: PendingQueueCaptureContext,
-    ) -> Result<Option<PendingQueueCaptureCandidate>, PendingQueueNatsCaptureError> {
+        close_receipt: &PersistedPendingQueueCloseReceipt,
+    ) -> Result<Option<PendingQueueNatsCaptureOutcome>, PendingQueueNatsCaptureError> {
+        if !close_receipt.matches_context(context) {
+            return Err(PendingQueueNatsCaptureError::CloseContextMismatch);
+        }
+        pipeline_store
+            .revalidate_queue_close_exact::<Hash>(context, close_receipt)
+            .await
+            .map_err(|error| PendingQueueNatsCaptureError::Pipeline(error.to_string()))?;
         let _serial = self.serial.lock().await;
         let identity = PendingQueueArtifactIdentity::try_new(
             context,
@@ -136,31 +169,94 @@ impl ScyllaBackedRecoverableNatsSource {
             verify_candidate(&self.contract, &selected)?;
             if self.ack_floor_covers(&mut consumer, &selected).await? {
                 self.confirm_after_ack(receipt, &selected).await?;
-                return Ok(Some(selected));
+                return Ok(Some(PendingQueueNatsCaptureOutcome::Data(selected)));
             }
             let token = self
                 .fetch_exact_candidate(&mut consumer, &selected)
                 .await?;
             self.ack_and_confirm(token, receipt, &selected, &mut consumer)
                 .await?;
-            return Ok(Some(selected));
+            return Ok(Some(PendingQueueNatsCaptureOutcome::Data(selected)));
         }
 
         self.store
             .validate_owner_permit(&self.owner, &identity)
             .await
             .map_err(PendingQueueNatsCaptureError::Store)?;
-        let Some((token, candidate)) = self.fetch_new(&mut consumer, context).await? else {
+        let Some(classified) = self.fetch_new(&mut consumer, context).await? else {
             return Ok(None);
         };
-        let receipt = self
-            .store
-            .persist_selected_batch(&self.owner, &candidate)
-            .await
-            .map_err(PendingQueueNatsCaptureError::Store)?;
-        self.ack_and_confirm(token, receipt, &candidate, &mut consumer)
-            .await?;
-        Ok(Some(candidate))
+        if classified
+            .boundary
+            .as_ref()
+            .is_some_and(|boundary| boundary.close_intent() != close_receipt.close_intent())
+        {
+            return Err(PendingQueueNatsCaptureError::CloseIntentMismatch);
+        }
+        let (data_token, seal_token) = classified
+            .token
+            .split_at(classified.data_count)
+            .map_err(nats_transport)?;
+        let receipt = match classified.data.as_ref() {
+            Some(candidate) => Some(
+                self.store
+                    .persist_selected_batch(&self.owner, candidate)
+                    .await
+                    .map_err(PendingQueueNatsCaptureError::Store)?,
+            ),
+            None => None,
+        };
+        if let (Some(receipt), Some(candidate)) =
+            (receipt, classified.data.as_ref())
+        {
+            data_token
+                .ok_or(PendingQueueNatsCaptureError::DeliveryContract)?
+                .double_ack_all(&mut consumer)
+                .await
+                .map_err(nats_transport)?;
+            if !self.ack_floor_covers(&mut consumer, candidate).await? {
+                return Err(PendingQueueNatsCaptureError::SelectedAwaitingRedelivery);
+            }
+            self.confirm_after_ack(receipt, candidate).await?;
+        } else if data_token.is_some() {
+            return Err(PendingQueueNatsCaptureError::DeliveryContract);
+        }
+        if let Some(boundary) = classified.boundary.as_ref() {
+            pipeline_store
+                .revalidate_queue_close_exact::<Hash>(context, close_receipt)
+                .await
+                .map_err(|error| PendingQueueNatsCaptureError::Pipeline(error.to_string()))?;
+            self.store
+                .observe_close_before_backend_ack(
+                    &self.owner,
+                    &identity,
+                    boundary.clone(),
+                )
+                .await
+                .map_err(PendingQueueNatsCaptureError::Store)?;
+            let seal_token =
+                seal_token.ok_or(PendingQueueNatsCaptureError::DeliveryContract)?;
+            if seal_token.len() != 1 {
+                return Err(PendingQueueNatsCaptureError::DeliveryContract);
+            }
+            seal_token
+                .double_ack_all(&mut consumer)
+                .await
+                .map_err(nats_transport)?;
+        } else if seal_token.is_some() {
+            return Err(PendingQueueNatsCaptureError::DeliveryContract);
+        }
+        Ok(Some(match classified.boundary {
+            Some(boundary) => PendingQueueNatsCaptureOutcome::Sealed {
+                data: classified.data,
+                boundary,
+            },
+            None => PendingQueueNatsCaptureOutcome::Data(
+                classified
+                    .data
+                    .ok_or(PendingQueueNatsCaptureError::DeliveryContract)?,
+            ),
+        }))
     }
 
     async fn ensure_attested_consumer(
@@ -177,7 +273,7 @@ impl ScyllaBackedRecoverableNatsSource {
         consumer: &mut RecoverableNatsCaptureConsumer,
         context: PendingQueueCaptureContext,
     ) -> Result<
-        Option<(RecoverableNatsDeliveryBatch, PendingQueueCaptureCandidate)>,
+        Option<ClassifiedRecoverableDelivery>,
         PendingQueueNatsCaptureError,
     > {
         let token = self
@@ -186,22 +282,7 @@ impl ScyllaBackedRecoverableNatsSource {
         let Some(token) = token else {
             return Ok(None);
         };
-        let items = token.payloads().to_vec();
-        let cursor = PendingQueueSourceCursor::nats_jetstream(
-            self.contract.consumer_digest(),
-            token.stream_sequences(),
-        )
-        .map_err(|error| PendingQueueNatsCaptureError::Core(error.to_string()))?;
-        let candidate = PendingQueueCaptureCandidate::try_new(
-            context,
-            self.contract
-                .source_identity()
-                .map_err(nats_transport)?,
-            cursor,
-            items,
-        )
-        .map_err(|error| PendingQueueNatsCaptureError::Core(error.to_string()))?;
-        Ok(Some((token, candidate)))
+        classify_delivery(&self.contract, context, token).map(Some)
     }
 
     async fn fetch_exact_candidate(
@@ -306,6 +387,125 @@ impl ScyllaBackedRecoverableNatsSource {
     }
 }
 
+fn classify_delivery(
+    contract: &RecoverableNatsConsumerContract,
+    context: PendingQueueCaptureContext,
+    token: RecoverableNatsDeliveryBatch,
+) -> Result<ClassifiedRecoverableDelivery, PendingQueueNatsCaptureError> {
+    let (data, boundary) = classify_payloads(
+        contract,
+        context,
+        token.stream_sequences(),
+        token.payloads(),
+    )?;
+    let data_count = usize::try_from(data.as_ref().map_or(0, |value| value.item_count()))
+        .map_err(|_| PendingQueueNatsCaptureError::DeliveryContract)?;
+    Ok(ClassifiedRecoverableDelivery {
+        token,
+        data_count,
+        data,
+        boundary,
+    })
+}
+
+fn classify_payloads(
+    contract: &RecoverableNatsConsumerContract,
+    context: PendingQueueCaptureContext,
+    stream_sequences: &[u64],
+    payloads: &[Vec<u8>],
+) -> Result<
+    (
+        Option<PendingQueueCaptureCandidate>,
+        Option<PendingQueueGenerationBoundary>,
+    ),
+    PendingQueueNatsCaptureError,
+> {
+    if stream_sequences.len() != payloads.len() || stream_sequences.is_empty() {
+        return Err(PendingQueueNatsCaptureError::DeliveryContract);
+    }
+    let source_identity = contract.source_identity().map_err(nats_transport)?;
+    let mut publisher_kind: Option<PendingQueuePublisherKind> = None;
+    let mut previous_in_batch: Option<(u64, [u8; 32])> = None;
+    let mut data_sequences = Vec::new();
+    let mut data_items = Vec::new();
+    let mut boundary = None;
+    for (stream_sequence, canonical_envelope) in stream_sequences
+        .iter()
+        .copied()
+        .zip(payloads)
+    {
+        if boundary.is_some() {
+            return Err(PendingQueueNatsCaptureError::DataAfterSeal);
+        }
+        let envelope = PendingQueuePublishEnvelope::decode_canonical(
+            canonical_envelope,
+        )
+        .map_err(|error| PendingQueueNatsCaptureError::Envelope(error.to_string()))?;
+        if envelope.artifact_identity().context() != context
+            || envelope.artifact_identity().source() != &source_identity
+            || publisher_kind.is_some_and(|kind| kind != envelope.publisher_kind())
+        {
+            return Err(PendingQueueNatsCaptureError::SourceIdentityMismatch);
+        }
+        publisher_kind.get_or_insert(envelope.publisher_kind());
+        if let Some((previous_sequence, previous_digest)) = previous_in_batch {
+            if envelope.previous_subject_sequence() != previous_sequence
+                || envelope.previous_envelope_digest() != previous_digest
+            {
+                return Err(PendingQueueNatsCaptureError::EnvelopeChainMismatch);
+            }
+        }
+        previous_in_batch = Some((stream_sequence, *envelope.digest().as_bytes()));
+        match envelope.body() {
+            PendingQueueEnvelopeBody::Data(_) => {
+                data_sequences.push(stream_sequence);
+                data_items.push(canonical_envelope.clone());
+            }
+            PendingQueueEnvelopeBody::Seal(summary) => {
+                boundary = Some(
+                    PendingQueueGenerationBoundary::try_from_backend_observation(
+                        context,
+                        summary.close_intent(),
+                        source_identity.clone(),
+                        PendingQueueBoundaryObservation::NatsJetStream {
+                            seal_marker_stream_sequence: stream_sequence,
+                            last_data_stream_sequence: envelope
+                                .previous_subject_sequence(),
+                            seal_marker_digest: *envelope.digest().as_bytes(),
+                        },
+                    )
+                    .map_err(|error| {
+                        PendingQueueNatsCaptureError::Core(error.to_string())
+                    })?,
+                );
+            }
+        }
+    }
+
+    let data = if data_items.is_empty() {
+        None
+    } else {
+        let cursor = PendingQueueSourceCursor::nats_jetstream(
+            contract.consumer_digest(),
+            &data_sequences,
+        )
+        .map_err(|error| PendingQueueNatsCaptureError::Core(error.to_string()))?;
+        Some(
+            PendingQueueCaptureCandidate::try_new(
+                context,
+                source_identity,
+                cursor,
+                data_items,
+            )
+            .map_err(|error| PendingQueueNatsCaptureError::Core(error.to_string()))?,
+        )
+    };
+    if data.is_none() && boundary.is_none() {
+        return Err(PendingQueueNatsCaptureError::DeliveryContract);
+    }
+    Ok((data, boundary))
+}
+
 fn verify_unacked_prefix<'payload>(
     expected_sequences: &[u64],
     expected_items: &[Vec<u8>],
@@ -343,18 +543,24 @@ pub(super) enum PendingQueueNatsCaptureError {
     EmptyConsumerDigest,
     ClientContractMismatch,
     OwnerPermitMismatch,
+    CloseContextMismatch,
+    CloseIntentMismatch,
     StreamContract(String),
     ConsumerContract,
     SourceIdentityMismatch,
     SourceCursorMismatch,
     ConsumerDigestMismatch,
     DeliveryContract,
+    Envelope(String),
+    EnvelopeChainMismatch,
+    DataAfterSeal,
     SelectedAwaitingRedelivery,
     RedeliveryMismatch,
     AckTokenMismatch,
     AckFloorAlreadyComplete,
     AckIndeterminate(String),
     Core(String),
+    Pipeline(String),
     Nats(String),
     Store(PendingQueueArtifactStoreError),
 }
@@ -370,18 +576,24 @@ impl fmt::Display for PendingQueueNatsCaptureError {
             Self::EmptyConsumerDigest => formatter.write_str("empty consumer digest"),
             Self::ClientContractMismatch => formatter.write_str("NATS client/contract mismatch"),
             Self::OwnerPermitMismatch => formatter.write_str("artifact owner permit mismatch"),
+            Self::CloseContextMismatch => formatter.write_str("durable close context mismatch"),
+            Self::CloseIntentMismatch => formatter.write_str("durable close intent mismatch"),
             Self::StreamContract(reason) => write!(formatter, "unsafe stream contract: {reason}"),
             Self::ConsumerContract => formatter.write_str("dedicated consumer contract mismatch"),
             Self::SourceIdentityMismatch => formatter.write_str("source identity mismatch"),
             Self::SourceCursorMismatch => formatter.write_str("source cursor mismatch"),
             Self::ConsumerDigestMismatch => formatter.write_str("consumer digest mismatch"),
             Self::DeliveryContract => formatter.write_str("NATS delivery contract mismatch"),
+            Self::Envelope(reason) => write!(formatter, "invalid recoverable envelope: {reason}"),
+            Self::EnvelopeChainMismatch => formatter.write_str("recoverable envelope chain mismatch"),
+            Self::DataAfterSeal => formatter.write_str("recoverable Data observed after Seal"),
             Self::SelectedAwaitingRedelivery => formatter.write_str("selected batch awaits redelivery"),
             Self::RedeliveryMismatch => formatter.write_str("redelivery differs from durable selection"),
             Self::AckTokenMismatch => formatter.write_str("ACK token differs from durable selection"),
             Self::AckFloorAlreadyComplete => formatter.write_str("ACK floor already covers selected batch"),
             Self::AckIndeterminate(reason) => write!(formatter, "NATS ACK is indeterminate: {reason}"),
             Self::Core(reason) => write!(formatter, "core queue contract failed: {reason}"),
+            Self::Pipeline(reason) => write!(formatter, "pipeline close fence failed: {reason}"),
             Self::Nats(reason) => write!(formatter, "NATS operation failed: {reason}"),
             Self::Store(error) => write!(formatter, "artifact store failed: {error}"),
         }
@@ -393,6 +605,33 @@ impl Error for PendingQueueNatsCaptureError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use psy_data::protocol::{
+        canonical_chain::NetworkId,
+        chain_context::AuthorityScope,
+    };
+    use psy_node_core::store::{
+        pending_generation_identity::{
+            PendingGenerationActivationDigest, PendingGenerationContext,
+            PendingGenerationLedgerKey,
+        },
+        pending_generation_pipeline::PendingQueueCloseIntentDigest,
+    };
+    use psy_node_nats::{
+        recoverable_assignment::{
+            PendingQueueGenerationSegmentAssignment,
+            PendingQueueSegmentLedgerBootstrap,
+            PendingQueueSegmentReservationPlan,
+        },
+        recoverable_publish::{
+            PendingQueueGenerationBudgetContract, PendingQueueMemberOrdinal,
+            PendingQueuePublishIntentId, PendingQueuePublishSourceState,
+            PendingQueueSourceQuota, RecoverableNatsSourceRoute,
+        },
+        recoverable_segment::{
+            RecoverableNatsRetentionContract, RecoverableNatsSegmentId,
+            RecoverableNatsStreamSegment,
+        },
+    };
 
     fn contract() -> RecoverableNatsConsumerContract {
         RecoverableNatsConsumerContract::try_new(
@@ -403,6 +642,85 @@ mod tests {
             1024,
         )
         .unwrap()
+    }
+
+    fn branch_exact_fixture() -> (
+        PendingQueueCaptureContext,
+        PendingQueueGenerationSegmentAssignment,
+        RecoverableNatsSourceRoute,
+        RecoverableNatsConsumerContract,
+    ) {
+        let authority = AuthorityScope::Realm {
+            realm_id: 3,
+            realm_sub_id: 0,
+        };
+        let key = PendingGenerationLedgerKey::new(
+            NetworkId::try_from_chain_id(1337).unwrap(),
+            authority,
+        );
+        let context = PendingQueueCaptureContext::try_new(
+            key,
+            PendingGenerationActivationDigest::try_new([3; 32]).unwrap(),
+            PendingGenerationContext::try_from_legacy(7, 99).unwrap(),
+        )
+        .unwrap();
+        let segment = RecoverableNatsStreamSegment::try_new(
+            "psy",
+            RecoverableNatsSegmentId::try_new(1).unwrap(),
+            RecoverableNatsRetentionContract::try_new(
+                3,
+                1024 * 1024 * 1024,
+                128 * 1024 * 1024,
+                3,
+                16,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let quota = PendingQueueSourceQuota::try_new(
+            PendingQueuePublisherKind::RealmUserUpdate,
+            100,
+            127 * 1024 * 1024,
+            1024 * 1024,
+        )
+        .unwrap();
+        let budget = PendingQueueGenerationBudgetContract::try_new(
+            authority,
+            vec![quota],
+            128 * 1024 * 1024,
+        )
+        .unwrap();
+        let validated = segment
+            .validate_stream_config_structure(&segment.stream_config())
+            .unwrap();
+        let bootstrap = PendingQueueSegmentLedgerBootstrap::try_new(
+            key,
+            &validated,
+            budget,
+            8,
+        )
+        .unwrap();
+        let assignment = match bootstrap
+            .candidate()
+            .reserve_generation(context)
+            .unwrap()
+        {
+            PendingQueueSegmentReservationPlan::Advance { assignment, .. } => assignment,
+            _ => unreachable!(),
+        };
+        let route = RecoverableNatsSourceRoute::try_new(
+            context,
+            PendingQueuePublisherKind::RealmUserUpdate,
+            &segment,
+        )
+        .unwrap();
+        let contract = RecoverableNatsConsumerContract::for_segment(
+            segment,
+            route.subject(),
+            1024,
+        )
+        .unwrap();
+        (context, assignment, route, contract)
     }
 
     #[test]
@@ -474,6 +792,66 @@ mod tests {
             std::iter::empty(),
         )
         .is_err());
+    }
+
+    #[test]
+    fn typed_classifier_excludes_seal_from_business_artifact() {
+        let (context, assignment, route, contract) = branch_exact_fixture();
+        let data = PendingQueuePublishEnvelope::data(
+            &route,
+            &assignment,
+            PendingQueuePublishIntentId::try_new([11; 32]).unwrap(),
+            PendingQueueMemberOrdinal::try_new(1).unwrap(),
+            0,
+            [0; 32],
+            b"payload".to_vec(),
+        )
+        .unwrap();
+        let mut source = PendingQueuePublishSourceState::bootstrap(&route, &assignment).unwrap();
+        let selected = source.select(&data).unwrap().current().clone();
+        let accepted = selected.record_published(10).unwrap();
+        source = accepted
+            .candidate()
+            .finalize_published()
+            .unwrap()
+            .candidate()
+            .clone();
+        let seal = PendingQueuePublishEnvelope::seal(
+            &route,
+            &assignment,
+            PendingQueuePublishIntentId::try_new([12; 32]).unwrap(),
+            PendingQueueMemberOrdinal::try_new(2).unwrap(),
+            10,
+            *data.digest().as_bytes(),
+            source
+                .seal_summary(PendingQueueCloseIntentDigest::try_new([9; 32]).unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        let (candidate, boundary) = classify_payloads(
+            &contract,
+            context,
+            &[10, 20],
+            &[data.to_canonical_bytes(), seal.to_canonical_bytes()],
+        )
+        .unwrap();
+        let candidate = candidate.unwrap();
+        assert_eq!(candidate.items(), &[data.to_canonical_bytes()]);
+        assert_eq!(candidate.item_count(), 1);
+        assert_eq!(
+            boundary.unwrap().close_intent(),
+            PendingQueueCloseIntentDigest::try_new([9; 32]).unwrap()
+        );
+
+        assert!(matches!(
+            classify_payloads(
+                &contract,
+                context,
+                &[20, 30],
+                &[seal.to_canonical_bytes(), data.to_canonical_bytes()],
+            ),
+            Err(PendingQueueNatsCaptureError::DataAfterSeal)
+        ));
     }
 
 }

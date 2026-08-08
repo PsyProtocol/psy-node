@@ -14,8 +14,10 @@
 use std::{error::Error, fmt};
 
 use psy_node_core::queue::recoverable_ephemeral::{
-    PendingQueueCaptureContext, PendingQueueCaptureContextDigest,
+    PendingQueueBoundaryObservation, PendingQueueCaptureContext,
+    PendingQueueCaptureContextDigest, PendingQueueGenerationBoundary,
 };
+use psy_node_core::store::pending_generation_pipeline::PendingQueueCloseIntentDigest;
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -111,6 +113,11 @@ pub struct PendingQueueSourceTruncationReceipt {
     source_state: PendingQueuePublishSourceState,
     first_stream_sequence: u64,
     retained_message_count: u32,
+    close_intent: PendingQueueCloseIntentDigest,
+    last_data_stream_sequence: u64,
+    last_data_envelope_digest: [u8; 32],
+    seal_marker_stream_sequence: u64,
+    seal_marker_digest: [u8; 32],
     scan_digest: PendingQueueSourceTruncationDigest,
 }
 
@@ -135,8 +142,60 @@ impl PendingQueueSourceTruncationReceipt {
         self.scan_digest
     }
 
+    pub const fn close_intent(&self) -> PendingQueueCloseIntentDigest {
+        self.close_intent
+    }
+
+    pub const fn last_data_stream_sequence(&self) -> u64 {
+        self.last_data_stream_sequence
+    }
+
+    pub const fn last_data_envelope_digest(&self) -> &[u8; 32] {
+        &self.last_data_envelope_digest
+    }
+
+    pub const fn seal_marker_stream_sequence(&self) -> u64 {
+        self.seal_marker_stream_sequence
+    }
+
+    pub const fn seal_marker_digest(&self) -> &[u8; 32] {
+        &self.seal_marker_digest
+    }
+
     pub fn matches_persisted_source(&self, persisted: &PendingQueuePublishSourceState) -> bool {
         &self.source_state == persisted
+    }
+
+    pub fn matches_data_replay(&self, replayed: &PendingQueuePublishSourceState) -> bool {
+        matches!(replayed.phase(), PendingQueuePublishSourcePhase::Open)
+            && replayed.artifact_identity() == self.source_state.artifact_identity()
+            && replayed.publisher_kind() == self.source_state.publisher_kind()
+            && replayed.segment_id() == self.source_state.segment_id()
+            && replayed.contract_digest() == self.source_state.contract_digest()
+            && replayed.assignment_digest() == self.source_state.assignment_digest()
+            && replayed.budget_digest() == self.source_state.budget_digest()
+            && replayed.quota() == self.source_state.quota()
+            && replayed.data_member_count() == self.source_state.data_member_count()
+            && replayed.data_payload_bytes() == self.source_state.data_payload_bytes()
+            && replayed.data_encoded_bytes() == self.source_state.data_encoded_bytes()
+            && replayed.total_encoded_bytes() == self.source_state.data_encoded_bytes()
+            && replayed.data_rolling_digest() == self.source_state.data_rolling_digest()
+            && replayed.last_subject_sequence() == self.last_data_stream_sequence
+            && replayed.last_envelope_digest() == self.last_data_envelope_digest
+    }
+
+    pub fn boundary(&self) -> Result<PendingQueueGenerationBoundary, PendingQueueTerminalError> {
+        PendingQueueGenerationBoundary::try_from_backend_observation(
+            self.source_state.artifact_identity().context(),
+            self.close_intent,
+            self.source_state.artifact_identity().source().clone(),
+            PendingQueueBoundaryObservation::NatsJetStream {
+                seal_marker_stream_sequence: self.seal_marker_stream_sequence,
+                last_data_stream_sequence: self.last_data_stream_sequence,
+                seal_marker_digest: self.seal_marker_digest,
+            },
+        )
+        .map_err(|error| PendingQueueTerminalError::Core(error.to_string()))
     }
 }
 
@@ -144,6 +203,13 @@ pub(crate) struct PendingQueueSourceTruncationScanner {
     state: PendingQueuePublishSourceState,
     first_stream_sequence: Option<u64>,
     retained_message_count: u32,
+    observed_seal: Option<(
+        PendingQueueCloseIntentDigest,
+        u64,
+        [u8; 32],
+        u64,
+        [u8; 32],
+    )>,
     scan_hasher: Sha256,
 }
 
@@ -163,6 +229,7 @@ impl PendingQueueSourceTruncationScanner {
             state,
             first_stream_sequence: None,
             retained_message_count: 0,
+            observed_seal: None,
             scan_hasher,
         })
     }
@@ -177,6 +244,20 @@ impl PendingQueueSourceTruncationScanner {
         }
         let envelope = PendingQueuePublishEnvelope::decode_canonical(canonical_envelope)
             .map_err(model)?;
+        if let crate::recoverable_publish::PendingQueueEnvelopeBody::Seal(summary) =
+            envelope.body()
+        {
+            if self.observed_seal.is_some() {
+                return Err(PendingQueueTerminalError::DuplicateMember);
+            }
+            self.observed_seal = Some((
+                summary.close_intent(),
+                envelope.previous_subject_sequence(),
+                envelope.previous_envelope_digest(),
+                stream_sequence,
+                *envelope.digest().as_bytes(),
+            ));
+        }
         let selected = match self.state.select(&envelope).map_err(model)? {
             PendingQueueSourceSelectionPlan::Idempotent(_) => {
                 return Err(PendingQueueTerminalError::DuplicateMember)
@@ -205,10 +286,24 @@ impl PendingQueueSourceTruncationScanner {
         let first_stream_sequence = self
             .first_stream_sequence
             .ok_or(PendingQueueTerminalError::SourceNotSealed)?;
+        let (
+            close_intent,
+            last_data_stream_sequence,
+            last_data_envelope_digest,
+            seal_marker_stream_sequence,
+            seal_marker_digest,
+        ) = self
+            .observed_seal
+            .ok_or(PendingQueueTerminalError::SourceNotSealed)?;
         Ok(PendingQueueSourceTruncationReceipt {
             source_state: self.state,
             first_stream_sequence,
             retained_message_count: self.retained_message_count,
+            close_intent,
+            last_data_stream_sequence,
+            last_data_envelope_digest,
+            seal_marker_stream_sequence,
+            seal_marker_digest,
             scan_digest: PendingQueueSourceTruncationDigest::try_new(
                 self.scan_hasher.finalize().into(),
             )?,
@@ -755,7 +850,9 @@ mod tests {
             PendingQueueMemberOrdinal::try_new(state.data_member_count() + 1).unwrap(),
             state.last_subject_sequence(),
             state.last_envelope_digest(),
-            state.seal_summary().unwrap(),
+            state
+                .seal_summary(PendingQueueCloseIntentDigest::try_new([9; 32]).unwrap())
+                .unwrap(),
         )
         .unwrap();
         scanner.observe(sequence, &seal.to_canonical_bytes()).unwrap();
@@ -830,6 +927,20 @@ mod tests {
         );
         assert_eq!(scan.retained_message_count(), 1);
         assert_eq!(scan.source_state().data_member_count(), 0);
+        assert_eq!(
+            scan.close_intent(),
+            PendingQueueCloseIntentDigest::try_new([9; 32]).unwrap()
+        );
+        assert_eq!(scan.last_data_stream_sequence(), 0);
+        let route = RecoverableNatsSourceRoute::try_new(
+            assignment.context(),
+            PendingQueuePublisherKind::RealmUserUpdate,
+            &segment,
+        )
+        .unwrap();
+        let empty_replay = PendingQueuePublishSourceState::bootstrap(&route, &assignment).unwrap();
+        assert!(scan.matches_data_replay(&empty_replay));
+        assert_eq!(scan.boundary().unwrap().close_intent(), scan.close_intent());
         PendingQueueNatsGenerationTruncationManifest::try_from_scans(&assignment, vec![scan]).unwrap();
     }
 
@@ -876,7 +987,14 @@ mod tests {
             PendingQueueMemberOrdinal::try_new(1).unwrap(),
             0,
             [0; 32],
-            PendingQueueSealSummary::try_new(0, 0, 0, [0; 32]).unwrap(),
+            PendingQueueSealSummary::try_new(
+                PendingQueueCloseIntentDigest::try_new([9; 32]).unwrap(),
+                0,
+                0,
+                0,
+                [0; 32],
+            )
+            .unwrap(),
         )
         .unwrap();
         sealed.observe(11, &seal.to_canonical_bytes()).unwrap();

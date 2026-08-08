@@ -11,6 +11,7 @@
 
 use std::{error::Error, fmt, sync::Arc};
 
+use parth_core::protocol::core_types::Q256BitHash;
 use psy_node_nats::{
     recoverable_assignment::PendingQueueGenerationSegmentAssignment,
     recoverable_outbox::{
@@ -44,7 +45,8 @@ use sha2::{Digest, Sha256};
 
 use super::{
     BranchExactDeploymentNoTabletKeyspace, CqlKeyspaceName,
-    PendingQueueSegmentAssignmentReceipt,
+    PendingQueueSegmentAssignmentReceipt, PersistedPendingQueueCloseReceipt,
+    ScyllaPendingPipelineStore,
 };
 
 pub const PENDING_QUEUE_PUBLISH_SOURCE_TABLE: &str =
@@ -340,6 +342,25 @@ pub struct PendingQueuePublishCommitReceipt {
     disposition: PendingQueueNatsPublishDisposition,
 }
 
+/// Opaque exact readback of one durable publisher source after Seal.  It is
+/// deliberately non-Clone and can only be minted by this store after the
+/// assignment, publisher role, and close intent all match the current row.
+#[derive(Debug)]
+pub struct PersistedPendingQueueSealedSourceReceipt {
+    store_fingerprint: PendingQueuePublishStoreFingerprint,
+    source_state: PendingQueuePublishSourceState,
+}
+
+impl PersistedPendingQueueSealedSourceReceipt {
+    pub const fn store_fingerprint(&self) -> PendingQueuePublishStoreFingerprint {
+        self.store_fingerprint
+    }
+
+    pub const fn source_state(&self) -> &PendingQueuePublishSourceState {
+        &self.source_state
+    }
+}
+
 impl PendingQueuePublishCommitReceipt {
     pub const fn intent_slot(&self) -> PendingQueuePublishIntentSlot {
         self.intent_slot
@@ -414,6 +435,33 @@ impl ScyllaPendingQueuePublishStore {
 
     pub const fn queries(&self) -> &PendingQueuePublishQueries { &self.queries }
     pub const fn fingerprint(&self) -> PendingQueuePublishStoreFingerprint { self.fingerprint }
+    pub(super) const fn segment(&self) -> &RecoverableNatsStreamSegment { &self.segment }
+
+    pub(super) async fn read_sealed_source_exact(
+        &self,
+        assignment_receipt: &PendingQueueSegmentAssignmentReceipt,
+        publisher_kind: PendingQueuePublisherKind,
+        close_receipt: &PersistedPendingQueueCloseReceipt,
+    ) -> Result<PersistedPendingQueueSealedSourceReceipt, PendingQueuePublishStoreError> {
+        if !close_receipt.matches_context(assignment_receipt.assignment().context()) {
+            return Err(PendingQueuePublishStoreError::CloseContextMismatch);
+        }
+        let source = self
+            .require_source(assignment_receipt, publisher_kind)
+            .await?;
+        match source.phase() {
+            PendingQueuePublishSourcePhase::Sealed { close_intent, .. }
+                if *close_intent == close_receipt.close_intent() => {}
+            PendingQueuePublishSourcePhase::Sealed { .. } => {
+                return Err(PendingQueuePublishStoreError::CloseIntentMismatch)
+            }
+            _ => return Err(PendingQueuePublishStoreError::SourceNotSealed),
+        }
+        Ok(PersistedPendingQueueSealedSourceReceipt {
+            store_fingerprint: self.fingerprint,
+            source_state: source,
+        })
+    }
 
     pub async fn bootstrap_source(
         &self,
@@ -455,15 +503,31 @@ impl ScyllaPendingQueuePublishStore {
         Ok(candidate.slot())
     }
 
-    pub(crate) async fn materialize_seal(
+    pub(crate) async fn materialize_seal<Hash: Q256BitHash>(
         &self,
+        pipeline_store: &ScyllaPendingPipelineStore,
         assignment_receipt: &PendingQueueSegmentAssignmentReceipt,
         publisher_kind: PendingQueuePublisherKind,
         intent_id: PendingQueuePublishIntentId,
+        close_receipt: &PersistedPendingQueueCloseReceipt,
     ) -> Result<PendingQueuePublishIntentSlot, PendingQueuePublishStoreError> {
+        if !close_receipt.matches_context(assignment_receipt.assignment().context()) {
+            return Err(PendingQueuePublishStoreError::CloseContextMismatch);
+        }
+        pipeline_store
+            .revalidate_queue_close_exact::<Hash>(
+                assignment_receipt.assignment().context(),
+                close_receipt,
+            )
+            .await
+            .map_err(|error| PendingQueuePublishStoreError::Pipeline(error.to_string()))?;
         let source = self.require_source(assignment_receipt, publisher_kind).await?;
-        let candidate = StoredPendingQueuePublishIntent::materialize_seal(&source, intent_id)
-            .map_err(model_outbox)?;
+        let candidate = StoredPendingQueuePublishIntent::materialize_seal(
+            &source,
+            intent_id,
+            close_receipt.close_intent(),
+        )
+        .map_err(model_outbox)?;
         self.persist_and_readback_prepared(&candidate).await?;
         Ok(candidate.slot())
     }
@@ -664,7 +728,9 @@ impl ScyllaPendingQueuePublishStore {
             PendingQueuePublishRequestKind::Seal => PendingQueuePublishEnvelope::seal(
                 route, assignment, intent.intent_id(), ordinal,
                 previous_subject_sequence, previous_envelope_digest,
-                source.seal_summary().map_err(model_envelope)?,
+                source.seal_summary(
+                    intent.close_intent().ok_or(PendingQueuePublishStoreError::IntentPhaseMismatch)?
+                ).map_err(model_envelope)?,
             ).map_err(model_envelope),
         }
     }
@@ -1021,10 +1087,14 @@ pub enum PendingQueuePublishStoreError {
     Cql(String),
     Nats(String),
     Model(String),
+    Pipeline(String),
     InvalidKeyspace(String),
     DataKeyspaceMustUseTablets(String),
     AssignmentMismatch,
+    CloseContextMismatch,
+    CloseIntentMismatch,
     SourceUninitialized,
+    SourceNotSealed,
     IntentUninitialized,
     IntentConflict,
     IntentPhaseMismatch,

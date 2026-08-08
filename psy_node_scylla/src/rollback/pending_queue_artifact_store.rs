@@ -837,6 +837,39 @@ pub struct PersistedPendingQueueSourceScanReceipt {
     scan_digest: PendingQueueArtifactScanDigest,
 }
 
+/// Opaque proof that the artifact header durably contains the exact source
+/// close boundary. It is persisted before the backend Seal ACK and therefore
+/// remains the restart work item if the ACK response or process is lost.
+#[derive(Debug)]
+pub struct PersistedPendingQueueCloseObservationReceipt {
+    store_fingerprint: PendingQueueArtifactStoreFingerprint,
+    slot: PendingQueueArtifactSlot,
+    header_revision: u64,
+    owner_attempt_id: PendingQueueArtifactOwnerAttemptId,
+    owner_fence: PendingQueueArtifactOwnerFence,
+    boundary: PendingQueueGenerationBoundary,
+}
+
+impl PersistedPendingQueueCloseObservationReceipt {
+    pub const fn store_fingerprint(&self) -> PendingQueueArtifactStoreFingerprint {
+        self.store_fingerprint
+    }
+
+    pub const fn slot(&self) -> PendingQueueArtifactSlot { self.slot }
+
+    pub const fn header_revision(&self) -> u64 { self.header_revision }
+
+    pub const fn owner_attempt_id(&self) -> PendingQueueArtifactOwnerAttemptId {
+        self.owner_attempt_id
+    }
+
+    pub const fn owner_fence(&self) -> PendingQueueArtifactOwnerFence {
+        self.owner_fence
+    }
+
+    pub const fn boundary(&self) -> &PendingQueueGenerationBoundary { &self.boundary }
+}
+
 impl PersistedPendingQueueSourceScanReceipt {
     pub const fn store_fingerprint(&self) -> PendingQueueArtifactStoreFingerprint {
         self.store_fingerprint
@@ -1194,10 +1227,54 @@ impl ScyllaPendingQueueArtifactStore {
         ))
     }
 
+    /// Persists the exact close boundary before a concrete backend ACKs its
+    /// trailing Seal. It performs no scan and grants no terminal authority.
+    pub(super) async fn observe_close_before_backend_ack(
+        &self,
+        permit: &PendingQueueArtifactOwnerPermit,
+        identity: &PendingQueueArtifactIdentity,
+        boundary: PendingQueueGenerationBoundary,
+    ) -> Result<PersistedPendingQueueCloseObservationReceipt, PendingQueueArtifactStoreError> {
+        let current = self
+            .read_header(identity)
+            .await?
+            .ok_or(PendingQueueArtifactStoreError::Uninitialized)?;
+        require_owner_permit(self.fingerprint, &current, permit)?;
+        let closed = match current.phase() {
+            PendingQueueArtifactPhase::Open(_) => {
+                let transition = SealedPendingQueueArtifactTransition::observe_close(
+                    &current,
+                    boundary.clone(),
+                )?;
+                let outcome = self
+                    .cas_header(transition.expected(), transition.candidate())
+                    .await?;
+                require_exact_header(outcome, transition.candidate())?
+            }
+            PendingQueueArtifactPhase::CloseObserved {
+                boundary: persisted,
+                ..
+            }
+            | PendingQueueArtifactPhase::SourceScanned {
+                boundary: persisted,
+                ..
+            } if persisted == &boundary => current,
+            _ => return Err(PendingQueueArtifactStoreError::CloseBoundaryConflict),
+        };
+        Ok(PersistedPendingQueueCloseObservationReceipt {
+            store_fingerprint: self.fingerprint,
+            slot: closed.slot(),
+            header_revision: closed.revision().get(),
+            owner_attempt_id: permit.attempt_id,
+            owner_fence: permit.fence,
+            boundary,
+        })
+    }
+
     /// Persists a structural close observation, enumerates every legal bucket,
     /// reloads the exact selected fragments, and records `SourceScanned`.
     /// The returned receipt is still per-source and non-terminal.
-    pub async fn scan_closed_source(
+    pub(super) async fn scan_closed_source(
         &self,
         permit: &PendingQueueArtifactOwnerPermit,
         identity: &PendingQueueArtifactIdentity,
@@ -1263,6 +1340,50 @@ impl ScyllaPendingQueueArtifactStore {
             owner_fence: permit.fence,
             scan_digest: observation.scan_digest(),
         })
+    }
+
+    /// Reloads and reconstructs every candidate behind an opaque SourceScanned
+    /// receipt. This is crate-private because candidates alone are not a
+    /// semantic terminal; the sibling composition must additionally match the
+    /// durable publisher source and the leader-derived Seal fence.
+    pub(super) async fn reconstruct_scanned_candidates_exact(
+        &self,
+        permit: &PendingQueueArtifactOwnerPermit,
+        identity: &PendingQueueArtifactIdentity,
+        receipt: &PersistedPendingQueueSourceScanReceipt,
+    ) -> Result<Vec<PendingQueueCaptureCandidate>, PendingQueueArtifactStoreError> {
+        if receipt.store_fingerprint != self.fingerprint
+            || receipt.slot != slot_for(identity)
+            || receipt.owner_attempt_id != permit.attempt_id
+            || receipt.owner_fence != permit.fence
+        {
+            return Err(PendingQueueArtifactStoreError::ReceiptStoreMismatch);
+        }
+        let current = self
+            .read_header(identity)
+            .await?
+            .ok_or(PendingQueueArtifactStoreError::Uninitialized)?;
+        require_owner_permit(self.fingerprint, &current, permit)?;
+        let PendingQueueArtifactPhase::SourceScanned { scan_digest, .. } =
+            current.phase()
+        else {
+            return Err(PendingQueueArtifactStoreError::HeaderNotClosed);
+        };
+        if current.revision().get() != receipt.source_scan_revision
+            || *scan_digest != receipt.scan_digest
+        {
+            return Err(PendingQueueArtifactStoreError::SourceScanConflict);
+        }
+        let fragments = self.load_exhaustive_fragment_set(&current).await?;
+        let (observation, candidates) =
+            PendingQueueArtifactScanObservation::verify_and_reconstruct(
+                &current,
+                fragments,
+            )?;
+        if observation.scan_digest() != receipt.scan_digest {
+            return Err(PendingQueueArtifactStoreError::SourceScanConflict);
+        }
+        Ok(candidates)
     }
 
     /// Crate-private recovery path for a concrete backend composition.  It

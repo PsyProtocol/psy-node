@@ -13,14 +13,19 @@ use psy_data::protocol::{
     chain_context::AuthorityScope,
 };
 use psy_node_core::store::{
-    pending_generation_identity::PendingGenerationLedgerKey,
+    pending_generation_identity::{
+        PendingGenerationActivationDigest, PendingGenerationContext,
+        PendingGenerationLedgerKey,
+    },
     pending_generation_pipeline::{
         PendingPipelineBootstrap, PendingPipelineError,
         PendingPipelineReadState, PendingPipelineRevision,
         PendingPipelineWriteOutcome, SealedPendingPipelineTransition,
-        StoredPendingPipeline,
+        StoredPendingPipeline, PendingProcessingState,
+        PendingQueueCloseIntentDigest,
     },
 };
+use psy_node_core::queue::recoverable_ephemeral::PendingQueueCaptureContext;
 use scylla::{
     client::session::Session,
     response::query_result::QueryResult,
@@ -29,11 +34,58 @@ use scylla::{
     },
     value::{CqlValue, Row},
 };
+use sha2::{Digest, Sha256};
 
 use super::BranchExactDeploymentNoTabletKeyspace;
 
 const PIPELINE_TABLE: &str = "branch_exact_pending_pipeline_v2";
 const RETIRED_V1_PIPELINE_TABLE: &str = "branch_exact_pending_pipeline_v1";
+const STORE_FINGERPRINT_DOMAIN: &[u8] =
+    b"psy/rollback/pending-pipeline-store/v1";
+const CLOSE_RECEIPT_DOMAIN: &[u8] =
+    b"psy/rollback/pending-pipeline-close-receipt/v1";
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct PendingPipelineStoreFingerprint([u8; 32]);
+
+impl PendingPipelineStoreFingerprint {
+    pub const fn as_bytes(&self) -> &[u8; 32] { &self.0 }
+}
+
+/// Exact readback of the durable pipeline's current `Sealing(close)` state.
+/// It is deliberately non-Clone and has no public constructor: executable
+/// queue Seal and semantic terminal paths must consume this authority rather
+/// than accept a caller-supplied close digest.
+#[derive(Debug)]
+pub struct PersistedPendingQueueCloseReceipt {
+    store_fingerprint: PendingPipelineStoreFingerprint,
+    key: PendingGenerationLedgerKey,
+    revision: PendingPipelineRevision,
+    activation_digest: PendingGenerationActivationDigest,
+    processing: PendingGenerationContext,
+    close_intent: PendingQueueCloseIntentDigest,
+    receipt_digest: [u8; 32],
+}
+
+impl PersistedPendingQueueCloseReceipt {
+    pub const fn store_fingerprint(&self) -> PendingPipelineStoreFingerprint {
+        self.store_fingerprint
+    }
+
+    pub const fn revision(&self) -> PendingPipelineRevision { self.revision }
+
+    pub const fn close_intent(&self) -> PendingQueueCloseIntentDigest {
+        self.close_intent
+    }
+
+    pub const fn receipt_digest(&self) -> &[u8; 32] { &self.receipt_digest }
+
+    pub fn matches_context(&self, context: PendingQueueCaptureContext) -> bool {
+        self.key == context.key()
+            && self.activation_digest == context.activation()
+            && self.processing == context.processing()
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingPipelineQueries {
@@ -73,6 +125,7 @@ impl PendingPipelineQueries {
 
 pub struct ScyllaPendingPipelineStore {
     session: Arc<Session>,
+    fingerprint: PendingPipelineStoreFingerprint,
     read: PreparedStatement,
     bootstrap: PreparedStatement,
     cas: PreparedStatement,
@@ -97,12 +150,79 @@ impl ScyllaPendingPipelineStore {
         keyspace: BranchExactDeploymentNoTabletKeyspace,
     ) -> Result<Self, PendingPipelineStoreError> {
         let queries = PendingPipelineQueries::new(&keyspace);
+        let fingerprint = pipeline_store_fingerprint(&keyspace, &queries);
         Ok(Self {
             read: prepare_read(&session, queries.read).await?,
             bootstrap: prepare_lwt(&session, queries.bootstrap).await?,
             cas: prepare_lwt(&session, queries.cas).await?,
+            fingerprint,
             session,
         })
+    }
+
+    pub const fn fingerprint(&self) -> PendingPipelineStoreFingerprint {
+        self.fingerprint
+    }
+
+    pub async fn read_queue_close_exact<Hash: Q256BitHash>(
+        &self,
+        context: PendingQueueCaptureContext,
+    ) -> Result<PersistedPendingQueueCloseReceipt, PendingPipelineStoreError> {
+        let PendingPipelineReadState::Current(current) =
+            self.read::<Hash>(context.key()).await?
+        else {
+            return Err(PendingPipelineStoreError::Uninitialized);
+        };
+        if current.activation_digest() != context.activation()
+            || current.processing() != context.processing()
+            || current.blocked_reason().is_some()
+        {
+            return Err(PendingPipelineStoreError::CloseContextMismatch);
+        }
+        let PendingProcessingState::Sealing(close_intent) =
+            current.processing_state()
+        else {
+            return Err(PendingPipelineStoreError::PipelineNotSealing);
+        };
+        let mut hasher = Sha256::new();
+        hasher.update(CLOSE_RECEIPT_DOMAIN);
+        hasher.update(self.fingerprint.as_bytes());
+        hasher.update(context.digest().as_bytes());
+        hasher.update(current.revision().as_i64().to_be_bytes());
+        hasher.update(close_intent.as_bytes());
+        let receipt_digest: [u8; 32] = hasher.finalize().into();
+        if receipt_digest == [0; 32] {
+            return Err(PendingPipelineStoreError::EmptyReceiptDigest);
+        }
+        Ok(PersistedPendingQueueCloseReceipt {
+            store_fingerprint: self.fingerprint,
+            key: current.key(),
+            revision: current.revision(),
+            activation_digest: current.activation_digest(),
+            processing: current.processing(),
+            close_intent,
+            receipt_digest,
+        })
+    }
+
+    pub async fn revalidate_queue_close_exact<Hash: Q256BitHash>(
+        &self,
+        context: PendingQueueCaptureContext,
+        receipt: &PersistedPendingQueueCloseReceipt,
+    ) -> Result<(), PendingPipelineStoreError> {
+        if receipt.store_fingerprint != self.fingerprint
+            || !receipt.matches_context(context)
+        {
+            return Err(PendingPipelineStoreError::CloseReceiptStoreMismatch);
+        }
+        let current = self.read_queue_close_exact::<Hash>(context).await?;
+        if current.revision != receipt.revision
+            || current.close_intent != receipt.close_intent
+            || current.receipt_digest != receipt.receipt_digest
+        {
+            return Err(PendingPipelineStoreError::CloseReceiptStale);
+        }
+        Ok(())
     }
 
     pub async fn read<Hash: Q256BitHash>(
@@ -252,6 +372,20 @@ fn bind_key(key: PendingGenerationLedgerKey) -> (i64, i8, i64, i32) {
     (i64::from(key.network().chain_id()), kind, realm, sub)
 }
 
+fn pipeline_store_fingerprint(
+    keyspace: &BranchExactDeploymentNoTabletKeyspace,
+    queries: &PendingPipelineQueries,
+) -> PendingPipelineStoreFingerprint {
+    let mut hasher = Sha256::new();
+    hasher.update(STORE_FINGERPRINT_DOMAIN);
+    hasher.update((keyspace.as_str().len() as u64).to_be_bytes());
+    hasher.update(keyspace.as_str().as_bytes());
+    let golden = queries.golden();
+    hasher.update((golden.len() as u64).to_be_bytes());
+    hasher.update(golden.as_bytes());
+    PendingPipelineStoreFingerprint(hasher.finalize().into())
+}
+
 fn authority_parts(authority: AuthorityScope) -> (i8, i64, i32) {
     match authority {
         AuthorityScope::Coordinator => (1, 0, 0),
@@ -339,6 +473,12 @@ pub enum PendingPipelineStoreError {
     MissingAppliedColumn,
     InvalidAppliedColumn,
     TransitionKeyMismatch,
+    Uninitialized,
+    CloseContextMismatch,
+    PipelineNotSealing,
+    EmptyReceiptDigest,
+    CloseReceiptStoreMismatch,
+    CloseReceiptStale,
     MissingAfterLwt,
     AppliedStateMismatch,
     Indeterminate {
