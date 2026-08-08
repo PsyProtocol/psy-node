@@ -27,6 +27,7 @@ use crate::{
 };
 
 pub const RECOVERABLE_PENDING_ENVELOPE_CODEC_VERSION: u16 = 1;
+pub const RECOVERABLE_PENDING_SOURCE_STATE_CODEC_VERSION: u16 = 1;
 pub const MAX_RECOVERABLE_PENDING_ENVELOPE_BYTES: usize =
     RECOVERABLE_NATS_MAX_MESSAGE_BYTES as usize;
 const MAGIC: &[u8; 8] = b"PSYQENV1";
@@ -34,6 +35,10 @@ const DIGEST_DOMAIN: &[u8] = b"psy/rollback/recoverable-pending-envelope/v1";
 const BUDGET_DOMAIN: &[u8] = b"psy/rollback/recoverable-pending-budget/v1";
 const BUDGET_MAGIC: &[u8; 8] = b"PSYQBUD1";
 const ROLLING_DOMAIN: &[u8] = b"psy/rollback/recoverable-pending-dataset/v1";
+const SOURCE_STATE_MAGIC: &[u8; 8] = b"PSYQSRC1";
+const SOURCE_STATE_DIGEST_DOMAIN: &[u8] =
+    b"psy/rollback/recoverable-pending-source-state/v1";
+const SOURCE_SLOT_DOMAIN: &[u8] = b"psy/rollback/recoverable-pending-source-slot/v1";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[repr(u8)]
@@ -807,12 +812,53 @@ impl PendingQueuePublishSourceRevision {
         self.0
     }
 
+    pub const fn as_i64(self) -> i64 {
+        self.0 as i64
+    }
+
     fn next(self) -> Result<Self, PendingQueueEnvelopeError> {
         Self::try_new(
             self.0
                 .checked_add(1)
                 .ok_or(PendingQueueEnvelopeError::RevisionOverflow)?,
         )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct PendingQueuePublishSourceSlot([u8; 32]);
+
+impl PendingQueuePublishSourceSlot {
+    pub fn for_identity(
+        identity: &PendingQueueArtifactIdentity,
+        publisher_kind: PendingQueuePublisherKind,
+        assignment_digest: PendingQueueSegmentAssignmentDigest,
+    ) -> Result<Self, PendingQueueEnvelopeError> {
+        validate_authority(publisher_kind, identity.context().key().authority())?;
+        let identity = identity.to_canonical_bytes();
+        let mut hasher = Sha256::new();
+        hasher.update(SOURCE_SLOT_DOMAIN);
+        hasher.update((identity.len() as u64).to_be_bytes());
+        hasher.update(identity);
+        hasher.update([publisher_kind as u8]);
+        hasher.update(assignment_digest.as_bytes());
+        let bytes: [u8; 32] = hasher.finalize().into();
+        if bytes == [0; 32] {
+            return Err(PendingQueueEnvelopeError::EmptyDigest);
+        }
+        Ok(Self(bytes))
+    }
+
+    pub fn try_new(bytes: [u8; 32]) -> Result<Self, PendingQueueEnvelopeError> {
+        if bytes == [0; 32] {
+            Err(PendingQueueEnvelopeError::EmptyDigest)
+        } else {
+            Ok(Self(bytes))
+        }
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
     }
 }
 
@@ -850,12 +896,32 @@ impl PendingQueueSelectedEnvelope {
     pub const fn encoded_bytes(&self) -> u64 {
         self.encoded_bytes
     }
+
+    pub const fn previous_subject_sequence(&self) -> u64 {
+        self.previous_subject_sequence
+    }
+
+    pub const fn previous_envelope_digest(&self) -> [u8; 32] {
+        self.previous_envelope_digest
+    }
+
+    pub const fn payload_bytes(&self) -> u64 {
+        self.payload_bytes
+    }
+
+    pub const fn body(&self) -> PendingQueueSelectedBody {
+        self.body
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PendingQueuePublishSourcePhase {
     Open,
     Publishing(PendingQueueSelectedEnvelope),
+    CommitPending {
+        selected: PendingQueueSelectedEnvelope,
+        subject_sequence: u64,
+    },
     Sealed {
         seal_digest: PendingQueueEnvelopeDigest,
         seal_subject_sequence: u64,
@@ -929,6 +995,38 @@ impl PendingQueuePublishSourceState {
         self.revision
     }
 
+    pub fn slot(&self) -> Result<PendingQueuePublishSourceSlot, PendingQueueEnvelopeError> {
+        PendingQueuePublishSourceSlot::for_identity(
+            &self.artifact_identity,
+            self.publisher_kind,
+            self.assignment_digest,
+        )
+    }
+
+    pub const fn artifact_identity(&self) -> &PendingQueueArtifactIdentity {
+        &self.artifact_identity
+    }
+
+    pub const fn publisher_kind(&self) -> PendingQueuePublisherKind {
+        self.publisher_kind
+    }
+
+    pub const fn segment_id(&self) -> RecoverableNatsSegmentId {
+        self.segment_id
+    }
+
+    pub const fn contract_digest(&self) -> RecoverableNatsSegmentContractDigest {
+        self.contract_digest
+    }
+
+    pub const fn assignment_digest(&self) -> PendingQueueSegmentAssignmentDigest {
+        self.assignment_digest
+    }
+
+    pub const fn budget_digest(&self) -> PendingQueueGenerationBudgetDigest {
+        self.budget_digest
+    }
+
     pub const fn phase(&self) -> &PendingQueuePublishSourcePhase {
         &self.phase
     }
@@ -965,6 +1063,199 @@ impl PendingQueuePublishSourceState {
         self.last_envelope_digest
     }
 
+    pub fn selected_envelope(&self) -> Option<&PendingQueueSelectedEnvelope> {
+        match &self.phase {
+            PendingQueuePublishSourcePhase::Publishing(selected) => Some(selected),
+            _ => None,
+        }
+    }
+
+    pub fn commit_pending(&self) -> Option<(&PendingQueueSelectedEnvelope, u64)> {
+        match &self.phase {
+            PendingQueuePublishSourcePhase::CommitPending {
+                selected,
+                subject_sequence,
+            } => Some((selected, *subject_sequence)),
+            _ => None,
+        }
+    }
+
+    pub fn selected_matches(&self, envelope: &PendingQueuePublishEnvelope) -> bool {
+        self.selected_envelope().is_some_and(|selected| {
+            selected.intent_id == envelope.intent_id
+                && selected.envelope_digest == envelope.digest
+                && selected.member_ordinal == envelope.member_ordinal
+                && selected.previous_subject_sequence
+                    == envelope.previous_subject_sequence
+                && selected.previous_envelope_digest
+                    == envelope.previous_envelope_digest
+                && selected.encoded_bytes
+                    == u64::try_from(envelope.to_canonical_bytes().len()).unwrap_or(u64::MAX)
+                && selected.payload_bytes
+                    == u64::try_from(envelope.payload_bytes()).unwrap_or(u64::MAX)
+                && selected.body
+                    == match envelope.body {
+                        PendingQueueEnvelopeBody::Data(_) => PendingQueueSelectedBody::Data,
+                        PendingQueueEnvelopeBody::Seal(summary) => {
+                            PendingQueueSelectedBody::Seal(summary)
+                        }
+                    }
+        })
+    }
+
+    pub fn inflight_matches(&self, envelope: &PendingQueuePublishEnvelope) -> bool {
+        let selected = match &self.phase {
+            PendingQueuePublishSourcePhase::Publishing(selected)
+            | PendingQueuePublishSourcePhase::CommitPending { selected, .. } => selected,
+            _ => return false,
+        };
+        selected.intent_id == envelope.intent_id
+            && selected.envelope_digest == envelope.digest
+            && selected.member_ordinal == envelope.member_ordinal
+            && selected.previous_subject_sequence == envelope.previous_subject_sequence
+            && selected.previous_envelope_digest == envelope.previous_envelope_digest
+            && selected.encoded_bytes
+                == u64::try_from(envelope.to_canonical_bytes().len()).unwrap_or(u64::MAX)
+            && selected.payload_bytes
+                == u64::try_from(envelope.payload_bytes()).unwrap_or(u64::MAX)
+            && selected.body
+                == match envelope.body {
+                    PendingQueueEnvelopeBody::Data(_) => PendingQueueSelectedBody::Data,
+                    PendingQueueEnvelopeBody::Seal(summary) => {
+                        PendingQueueSelectedBody::Seal(summary)
+                    }
+                }
+    }
+
+    pub fn to_persisted_bytes(&self) -> Vec<u8> {
+        let mut out = self
+            .encode_persisted_unsigned()
+            .expect("validated source state remains canonical");
+        out.extend_from_slice(&source_state_digest(&out));
+        out
+    }
+
+    pub fn decode_persisted(
+        revision: i64,
+        bytes: &[u8],
+    ) -> Result<Self, PendingQueueEnvelopeError> {
+        let revision = u64::try_from(revision)
+            .map_err(|_| PendingQueueEnvelopeError::RevisionOutOfRange)
+            .and_then(PendingQueuePublishSourceRevision::try_new)?;
+        let mut decoder = Decoder::new(bytes);
+        if decoder.take(8)? != SOURCE_STATE_MAGIC {
+            return Err(PendingQueueEnvelopeError::InvalidMagic);
+        }
+        let version = decoder.u16()?;
+        if version != RECOVERABLE_PENDING_SOURCE_STATE_CODEC_VERSION {
+            return Err(PendingQueueEnvelopeError::UnknownCodecVersion(version));
+        }
+        let identity_len = decoder.u32()? as usize;
+        let artifact_identity = PendingQueueArtifactIdentity::decode_canonical(
+            decoder.take(identity_len)?,
+        )
+        .map_err(|_| PendingQueueEnvelopeError::InvalidArtifactIdentity)?;
+        let publisher_kind = PendingQueuePublisherKind::try_from_u8(decoder.u8()?)?;
+        let segment_id = RecoverableNatsSegmentId::try_new(decoder.u64()?)
+            .map_err(|_| PendingQueueEnvelopeError::InvalidSegment)?;
+        let contract_digest = RecoverableNatsSegmentContractDigest::try_new(
+            decoder.array32()?,
+        )
+        .map_err(|_| PendingQueueEnvelopeError::EmptyDigest)?;
+        let assignment_digest = PendingQueueSegmentAssignmentDigest::try_new(
+            decoder.array32()?,
+        )
+        .map_err(|_| PendingQueueEnvelopeError::EmptyDigest)?;
+        let budget_digest = PendingQueueGenerationBudgetDigest::try_new(
+            decoder.array32()?,
+        )?;
+        let quota = PendingQueueSourceQuota::try_new(
+            PendingQueuePublisherKind::try_from_u8(decoder.u8()?)?,
+            decoder.u32()?,
+            decoder.u64()?,
+            decoder.u64()?,
+        )?;
+        let phase = match decoder.u8()? {
+            0 => PendingQueuePublishSourcePhase::Open,
+            1 => {
+                let intent_id = PendingQueuePublishIntentId::try_new(decoder.array32()?)?;
+                let envelope_digest = PendingQueueEnvelopeDigest::try_new(decoder.array32()?)?;
+                let member_ordinal = PendingQueueMemberOrdinal::try_new(decoder.u32()?)?;
+                let previous_subject_sequence = decoder.u64()?;
+                let previous_envelope_digest = decoder.array32()?;
+                let encoded_bytes = decoder.u64()?;
+                let payload_bytes = decoder.u64()?;
+                let body = match decoder.u8()? {
+                    1 => PendingQueueSelectedBody::Data,
+                    2 => PendingQueueSelectedBody::Seal(PendingQueueSealSummary::try_new(
+                        decoder.u32()?,
+                        decoder.u64()?,
+                        decoder.u64()?,
+                        decoder.array32()?,
+                    )?),
+                    value => return Err(PendingQueueEnvelopeError::UnknownEnvelopeKind(value)),
+                };
+                PendingQueuePublishSourcePhase::Publishing(PendingQueueSelectedEnvelope {
+                    intent_id,
+                    envelope_digest,
+                    member_ordinal,
+                    previous_subject_sequence,
+                    previous_envelope_digest,
+                    encoded_bytes,
+                    payload_bytes,
+                    body,
+                })
+            }
+            2 => {
+                let selected = decode_selected(&mut decoder)?;
+                let subject_sequence = decoder.u64()?;
+                PendingQueuePublishSourcePhase::CommitPending {
+                    selected,
+                    subject_sequence,
+                }
+            }
+            3 => PendingQueuePublishSourcePhase::Sealed {
+                seal_digest: PendingQueueEnvelopeDigest::try_new(decoder.array32()?)?,
+                seal_subject_sequence: decoder.u64()?,
+            },
+            value => return Err(PendingQueueEnvelopeError::UnknownSourcePhase(value)),
+        };
+        let data_member_count = decoder.u32()?;
+        let data_payload_bytes = decoder.u64()?;
+        let data_encoded_bytes = decoder.u64()?;
+        let total_encoded_bytes = decoder.u64()?;
+        let data_rolling_digest = decoder.array32()?;
+        let last_subject_sequence = decoder.u64()?;
+        let last_envelope_digest = decoder.array32()?;
+        let encoded_digest = decoder.array32()?;
+        if !decoder.done() {
+            return Err(PendingQueueEnvelopeError::TrailingBytes);
+        }
+        if source_state_digest(&bytes[..bytes.len() - 32]) != encoded_digest {
+            return Err(PendingQueueEnvelopeError::DigestMismatch);
+        }
+        let state = Self {
+            revision,
+            artifact_identity,
+            publisher_kind,
+            segment_id,
+            contract_digest,
+            assignment_digest,
+            budget_digest,
+            quota,
+            phase,
+            data_member_count,
+            data_payload_bytes,
+            data_encoded_bytes,
+            total_encoded_bytes,
+            data_rolling_digest,
+            last_subject_sequence,
+            last_envelope_digest,
+        };
+        state.validate_persisted_invariants()?;
+        Ok(state)
+    }
+
     pub fn seal_summary(&self) -> Result<PendingQueueSealSummary, PendingQueueEnvelopeError> {
         PendingQueueSealSummary::try_new(
             self.data_member_count,
@@ -990,6 +1281,9 @@ impl PendingQueuePublishSourceState {
         }
         if matches!(self.phase, PendingQueuePublishSourcePhase::Sealed { .. }) {
             return Err(PendingQueueEnvelopeError::SourceAlreadySealed);
+        }
+        if matches!(self.phase, PendingQueuePublishSourcePhase::CommitPending { .. }) {
+            return Err(PendingQueueEnvelopeError::CommitAlreadyPending);
         }
         self.verify_envelope_identity(envelope)?;
         if envelope.member_ordinal.get()
@@ -1057,7 +1351,7 @@ impl PendingQueuePublishSourceState {
         })
     }
 
-    pub fn apply_published(
+    pub fn record_published(
         &self,
         subject_sequence: u64,
     ) -> Result<PendingQueueSourceApplyPlan, PendingQueueEnvelopeError> {
@@ -1069,11 +1363,36 @@ impl PendingQueuePublishSourceState {
         }
         let mut candidate = self.clone();
         candidate.revision = self.revision.next()?;
+        candidate.phase = PendingQueuePublishSourcePhase::CommitPending {
+            selected: selected.clone(),
+            subject_sequence,
+        };
+        Ok(PendingQueueSourceApplyPlan {
+            expected: self.clone(),
+            candidate,
+        })
+    }
+
+    pub fn finalize_published(
+        &self,
+    ) -> Result<PendingQueueSourceApplyPlan, PendingQueueEnvelopeError> {
+        let PendingQueuePublishSourcePhase::CommitPending {
+            selected,
+            subject_sequence,
+        } = &self.phase
+        else {
+            return Err(PendingQueueEnvelopeError::NoCommitPending);
+        };
+        if *subject_sequence == 0 || *subject_sequence <= self.last_subject_sequence {
+            return Err(PendingQueueEnvelopeError::SubjectSequenceRegressed);
+        }
+        let mut candidate = self.clone();
+        candidate.revision = self.revision.next()?;
         candidate.total_encoded_bytes = self
             .total_encoded_bytes
             .checked_add(selected.encoded_bytes)
             .ok_or(PendingQueueEnvelopeError::BudgetOverflow)?;
-        candidate.last_subject_sequence = subject_sequence;
+        candidate.last_subject_sequence = *subject_sequence;
         candidate.last_envelope_digest = *selected.envelope_digest.as_bytes();
         match selected.body {
             PendingQueueSelectedBody::Data => {
@@ -1101,7 +1420,7 @@ impl PendingQueuePublishSourceState {
             PendingQueueSelectedBody::Seal(_) => {
                 candidate.phase = PendingQueuePublishSourcePhase::Sealed {
                     seal_digest: selected.envelope_digest,
-                    seal_subject_sequence: subject_sequence,
+                    seal_subject_sequence: *subject_sequence,
                 };
             }
         }
@@ -1109,6 +1428,164 @@ impl PendingQueuePublishSourceState {
             expected: self.clone(),
             candidate,
         })
+    }
+
+    fn encode_persisted_unsigned(&self) -> Result<Vec<u8>, PendingQueueEnvelopeError> {
+        self.validate_persisted_invariants()?;
+        let identity = self.artifact_identity.to_canonical_bytes();
+        let identity_len = u32::try_from(identity.len())
+            .map_err(|_| PendingQueueEnvelopeError::EnvelopeTooLarge)?;
+        let mut out = Vec::with_capacity(identity.len() + 384);
+        out.extend_from_slice(SOURCE_STATE_MAGIC);
+        out.extend_from_slice(&RECOVERABLE_PENDING_SOURCE_STATE_CODEC_VERSION.to_be_bytes());
+        out.extend_from_slice(&identity_len.to_be_bytes());
+        out.extend_from_slice(&identity);
+        out.push(self.publisher_kind as u8);
+        out.extend_from_slice(&self.segment_id.get().to_be_bytes());
+        out.extend_from_slice(self.contract_digest.as_bytes());
+        out.extend_from_slice(self.assignment_digest.as_bytes());
+        out.extend_from_slice(self.budget_digest.as_bytes());
+        encode_quota(self.quota, &mut out);
+        match &self.phase {
+            PendingQueuePublishSourcePhase::Open => out.push(0),
+            PendingQueuePublishSourcePhase::Publishing(selected) => {
+                out.push(1);
+                encode_selected(selected, &mut out);
+            }
+            PendingQueuePublishSourcePhase::CommitPending {
+                selected,
+                subject_sequence,
+            } => {
+                out.push(2);
+                encode_selected(selected, &mut out);
+                out.extend_from_slice(&subject_sequence.to_be_bytes());
+            }
+            PendingQueuePublishSourcePhase::Sealed {
+                seal_digest,
+                seal_subject_sequence,
+            } => {
+                out.push(3);
+                out.extend_from_slice(seal_digest.as_bytes());
+                out.extend_from_slice(&seal_subject_sequence.to_be_bytes());
+            }
+        }
+        out.extend_from_slice(&self.data_member_count.to_be_bytes());
+        out.extend_from_slice(&self.data_payload_bytes.to_be_bytes());
+        out.extend_from_slice(&self.data_encoded_bytes.to_be_bytes());
+        out.extend_from_slice(&self.total_encoded_bytes.to_be_bytes());
+        out.extend_from_slice(&self.data_rolling_digest);
+        out.extend_from_slice(&self.last_subject_sequence.to_be_bytes());
+        out.extend_from_slice(&self.last_envelope_digest);
+        Ok(out)
+    }
+
+    fn validate_persisted_invariants(&self) -> Result<(), PendingQueueEnvelopeError> {
+        validate_authority(
+            self.publisher_kind,
+            self.artifact_identity.context().key().authority(),
+        )?;
+        source_namespace(self.artifact_identity.source())?;
+        if self.quota.publisher_kind != self.publisher_kind
+            || self.data_member_count > self.quota.max_data_members
+            || self.data_encoded_bytes > self.quota.max_data_stored_bytes
+            || self.total_encoded_bytes > self.quota.max_source_stored_bytes()
+            || self.total_encoded_bytes < self.data_encoded_bytes
+        {
+            return Err(PendingQueueEnvelopeError::InvalidSourceState);
+        }
+        if self.data_member_count == 0 {
+            if self.data_payload_bytes != 0
+                || self.data_encoded_bytes != 0
+                || self.data_rolling_digest != [0; 32]
+                || self.last_subject_sequence != 0
+                || self.last_envelope_digest != [0; 32]
+            {
+                return Err(PendingQueueEnvelopeError::InvalidSourceState);
+            }
+        } else if self.data_payload_bytes == 0
+            || self.data_encoded_bytes == 0
+            || self.data_rolling_digest == [0; 32]
+            || self.last_subject_sequence == 0
+            || self.last_envelope_digest == [0; 32]
+        {
+            return Err(PendingQueueEnvelopeError::InvalidSourceState);
+        }
+        match &self.phase {
+            PendingQueuePublishSourcePhase::Open => {
+                if self.total_encoded_bytes != self.data_encoded_bytes {
+                    return Err(PendingQueueEnvelopeError::InvalidSourceState);
+                }
+            }
+            PendingQueuePublishSourcePhase::Publishing(selected) => {
+                self.validate_selected(selected, None)?;
+            }
+            PendingQueuePublishSourcePhase::CommitPending {
+                selected,
+                subject_sequence,
+            } => {
+                self.validate_selected(selected, Some(*subject_sequence))?;
+            }
+            PendingQueuePublishSourcePhase::Sealed {
+                seal_digest,
+                seal_subject_sequence,
+            } => {
+                if *seal_subject_sequence == 0
+                    || *seal_subject_sequence != self.last_subject_sequence
+                    || seal_digest.as_bytes() != &self.last_envelope_digest
+                    || self.total_encoded_bytes == self.data_encoded_bytes
+                    || self.total_encoded_bytes - self.data_encoded_bytes
+                        > self.quota.max_seal_stored_bytes
+                {
+                    return Err(PendingQueueEnvelopeError::InvalidSourceState);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_selected(
+        &self,
+        selected: &PendingQueueSelectedEnvelope,
+        accepted_sequence: Option<u64>,
+    ) -> Result<(), PendingQueueEnvelopeError> {
+        if selected.member_ordinal.get()
+            != self
+                .data_member_count
+                .checked_add(1)
+                .ok_or(PendingQueueEnvelopeError::MemberLimitExceeded)?
+            || selected.previous_subject_sequence != self.last_subject_sequence
+            || selected.previous_envelope_digest != self.last_envelope_digest
+            || selected.encoded_bytes == 0
+            || accepted_sequence.is_some_and(|sequence| {
+                sequence == 0 || sequence <= self.last_subject_sequence
+            })
+            || self.total_encoded_bytes != self.data_encoded_bytes
+        {
+            return Err(PendingQueueEnvelopeError::InvalidSourceState);
+        }
+        match selected.body {
+            PendingQueueSelectedBody::Data => {
+                if selected.payload_bytes == 0
+                    || self.data_member_count >= self.quota.max_data_members
+                    || self
+                        .data_encoded_bytes
+                        .checked_add(selected.encoded_bytes)
+                        .ok_or(PendingQueueEnvelopeError::BudgetOverflow)?
+                        > self.quota.max_data_stored_bytes
+                {
+                    return Err(PendingQueueEnvelopeError::InvalidSourceState);
+                }
+            }
+            PendingQueueSelectedBody::Seal(summary) => {
+                if selected.payload_bytes != 0
+                    || summary != self.seal_summary()?
+                    || selected.encoded_bytes > self.quota.max_seal_stored_bytes
+                {
+                    return Err(PendingQueueEnvelopeError::InvalidSourceState);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn verify_envelope_identity(
@@ -1174,6 +1651,73 @@ impl PendingQueueSourceApplyPlan {
     pub const fn candidate(&self) -> &PendingQueuePublishSourceState {
         &self.candidate
     }
+}
+
+fn encode_quota(quota: PendingQueueSourceQuota, out: &mut Vec<u8>) {
+    out.push(quota.publisher_kind as u8);
+    out.extend_from_slice(&quota.max_data_members.to_be_bytes());
+    out.extend_from_slice(&quota.max_data_stored_bytes.to_be_bytes());
+    out.extend_from_slice(&quota.max_seal_stored_bytes.to_be_bytes());
+}
+
+fn encode_selected(selected: &PendingQueueSelectedEnvelope, out: &mut Vec<u8>) {
+    out.extend_from_slice(selected.intent_id.as_bytes());
+    out.extend_from_slice(selected.envelope_digest.as_bytes());
+    out.extend_from_slice(&selected.member_ordinal.get().to_be_bytes());
+    out.extend_from_slice(&selected.previous_subject_sequence.to_be_bytes());
+    out.extend_from_slice(&selected.previous_envelope_digest);
+    out.extend_from_slice(&selected.encoded_bytes.to_be_bytes());
+    out.extend_from_slice(&selected.payload_bytes.to_be_bytes());
+    match selected.body {
+        PendingQueueSelectedBody::Data => out.push(1),
+        PendingQueueSelectedBody::Seal(summary) => {
+            out.push(2);
+            out.extend_from_slice(&summary.data_member_count.to_be_bytes());
+            out.extend_from_slice(&summary.data_payload_bytes.to_be_bytes());
+            out.extend_from_slice(&summary.data_encoded_bytes.to_be_bytes());
+            out.extend_from_slice(&summary.data_rolling_digest);
+        }
+    }
+}
+
+fn decode_selected(
+    decoder: &mut Decoder<'_>,
+) -> Result<PendingQueueSelectedEnvelope, PendingQueueEnvelopeError> {
+    let intent_id = PendingQueuePublishIntentId::try_new(decoder.array32()?)?;
+    let envelope_digest = PendingQueueEnvelopeDigest::try_new(decoder.array32()?)?;
+    let member_ordinal = PendingQueueMemberOrdinal::try_new(decoder.u32()?)?;
+    let previous_subject_sequence = decoder.u64()?;
+    let previous_envelope_digest = decoder.array32()?;
+    let encoded_bytes = decoder.u64()?;
+    let payload_bytes = decoder.u64()?;
+    let body = match decoder.u8()? {
+        1 => PendingQueueSelectedBody::Data,
+        2 => PendingQueueSelectedBody::Seal(PendingQueueSealSummary::try_new(
+            decoder.u32()?,
+            decoder.u64()?,
+            decoder.u64()?,
+            decoder.array32()?,
+        )?),
+        value => return Err(PendingQueueEnvelopeError::UnknownEnvelopeKind(value)),
+    };
+    Ok(PendingQueueSelectedEnvelope {
+        intent_id,
+        envelope_digest,
+        member_ordinal,
+        previous_subject_sequence,
+        previous_envelope_digest,
+        encoded_bytes,
+        payload_bytes,
+        body,
+    })
+}
+
+fn source_state_digest(unsigned: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(SOURCE_STATE_DIGEST_DOMAIN);
+    hasher.update((unsigned.len() as u64).to_be_bytes());
+    hasher.update(unsigned);
+    hasher.finalize().into()
 }
 
 fn next_rolling_digest(
@@ -1336,6 +1880,7 @@ pub enum PendingQueueEnvelopeError {
     InvalidMagic,
     UnknownCodecVersion(u16),
     UnknownEnvelopeKind(u8),
+    UnknownSourcePhase(u8),
     UnknownPublisherKind(u8),
     InvalidSegment,
     InvalidArtifactIdentity,
@@ -1353,12 +1898,15 @@ pub enum PendingQueueEnvelopeError {
     MemberLimitExceeded,
     PublishAlreadyInProgress,
     SourceAlreadySealed,
+    CommitAlreadyPending,
     SourceCursorMismatch,
     NoPublishInProgress,
+    NoCommitPending,
     SubjectSequenceRegressed,
     SourceIdentityMismatch,
     InvalidEmptySeal,
     InvalidSealSummary,
+    InvalidSourceState,
     SealIndexMismatch,
     DigestMismatch,
     TrailingBytes,
@@ -1612,6 +2160,14 @@ mod tests {
 
         let state = PendingQueuePublishSourceState::bootstrap(&route, &assignment)
             .unwrap();
+        assert_eq!(
+            PendingQueuePublishSourceState::decode_persisted(
+                state.revision().get() as i64,
+                &state.to_persisted_bytes(),
+            )
+            .unwrap(),
+            state,
+        );
         let data = PendingQueuePublishEnvelope::data(
             &route,
             &assignment,
@@ -1632,7 +2188,28 @@ mod tests {
             selected.select(&data).unwrap(),
             PendingQueueSourceSelectionPlan::Idempotent(_),
         ));
-        let open = selected.apply_published(100).unwrap().candidate().clone();
+        let commit_pending = selected
+            .record_published(100)
+            .unwrap()
+            .candidate()
+            .clone();
+        assert!(matches!(
+            commit_pending.phase(),
+            PendingQueuePublishSourcePhase::CommitPending { .. }
+        ));
+        assert_eq!(
+            PendingQueuePublishSourceState::decode_persisted(
+                commit_pending.revision().get() as i64,
+                &commit_pending.to_persisted_bytes(),
+            )
+            .unwrap(),
+            commit_pending,
+        );
+        let open = commit_pending
+            .finalize_published()
+            .unwrap()
+            .candidate()
+            .clone();
         assert_eq!(open.data_member_count(), 1);
         assert_eq!(open.data_payload_bytes(), 3);
         assert_ne!(open.data_rolling_digest(), [0; 32]);
@@ -1653,11 +2230,27 @@ mod tests {
             }
             _ => unreachable!(),
         };
-        let sealed = sealing.apply_published(101).unwrap().candidate().clone();
+        let seal_commit = sealing
+            .record_published(101)
+            .unwrap()
+            .candidate()
+            .clone();
+        let sealed = seal_commit
+            .finalize_published()
+            .unwrap()
+            .candidate()
+            .clone();
         assert!(matches!(
             sealed.phase(),
             PendingQueuePublishSourcePhase::Sealed { .. },
         ));
+        let mut corrupted = sealed.to_persisted_bytes();
+        corrupted[20] ^= 1;
+        assert!(PendingQueuePublishSourceState::decode_persisted(
+            sealed.revision().get() as i64,
+            &corrupted,
+        )
+        .is_err());
         assert_eq!(
             sealed.select(&data),
             Err(PendingQueueEnvelopeError::SourceAlreadySealed),
