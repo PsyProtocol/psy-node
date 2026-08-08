@@ -1497,8 +1497,14 @@ impl PendingQueuePublishSourceState {
             if self.data_payload_bytes != 0
                 || self.data_encoded_bytes != 0
                 || self.data_rolling_digest != [0; 32]
-                || self.last_subject_sequence != 0
-                || self.last_envelope_digest != [0; 32]
+            {
+                return Err(PendingQueueEnvelopeError::InvalidSourceState);
+            }
+            // An empty source still has one physical member once it is sealed.
+            // The final cursor therefore belongs to Seal rather than Data.
+            if matches!(&self.phase, PendingQueuePublishSourcePhase::Open)
+                && (self.last_subject_sequence != 0
+                    || self.last_envelope_digest != [0; 32])
             {
                 return Err(PendingQueueEnvelopeError::InvalidSourceState);
             }

@@ -16,7 +16,7 @@ use async_nats::{
             ReplayPolicy,
         },
         context::Publish,
-        stream::{RetentionPolicy, StorageType},
+        stream::{RawMessageErrorKind, RetentionPolicy, StorageType},
     },
     ToServerAddrs,
 };
@@ -29,8 +29,16 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     queue::NatsJetStreamClient,
-    recoverable_publish::PendingQueuePublishEnvelope,
+    recoverable_assignment::PendingQueueGenerationSegmentAssignment,
+    recoverable_publish::{
+        PendingQueuePublishEnvelope, PendingQueuePublisherKind,
+        RecoverableNatsSourceRoute,
+    },
     recoverable_segment::RecoverableNatsStreamSegment,
+    recoverable_terminal::{
+        PendingQueueSourceTruncationReceipt, PendingQueueSourceTruncationScanner,
+        PendingQueueTerminalError,
+    },
 };
 
 const DURABLE_PREFIX: &str = "psy_beq_v2_";
@@ -595,6 +603,95 @@ impl RecoverablePendingQueueNatsPublisher {
         }
     }
 
+    /// Replays the exact retained set for one typed source from the stream
+    /// leader and verifies that the last retained member is Seal.
+    ///
+    /// The before/after last-message observations reject a source that changes
+    /// during the scan. The returned receipt proves only the NATS retained set;
+    /// it is not a semantic generation terminal and cannot authorize rotation,
+    /// pipeline publication, or garbage collection.
+    pub async fn scan_source_retained_set(
+        &self,
+        assignment: &PendingQueueGenerationSegmentAssignment,
+        publisher_kind: PendingQueuePublisherKind,
+    ) -> Result<PendingQueueSourceTruncationReceipt, RecoverableNatsTransportError> {
+        if assignment.segment_id() != self.segment.segment_id()
+            || assignment.contract_digest() != self.segment.digest()
+        {
+            return Err(RecoverableNatsTransportError::StreamContract);
+        }
+        let route = RecoverableNatsSourceRoute::try_new(
+            assignment.context(),
+            publisher_kind,
+            &self.segment,
+        )
+        .map_err(|error| RecoverableNatsTransportError::Core(error.to_string()))?;
+        let subject = route.subject();
+        let mut stream = self
+            .context
+            .get_stream(self.segment.stream_name())
+            .await
+            .map_err(nats)?;
+        let info = stream.info().await.map_err(nats)?.clone();
+        self.segment
+            .validate_stream_config_structure(&info.config)
+            .map_err(|_| RecoverableNatsTransportError::StreamContract)?;
+        let before = match stream.get_last_raw_message_by_subject(subject).await {
+            Ok(message) => message,
+            Err(error) if error.kind() == RawMessageErrorKind::NoMessageFound => {
+                return Err(RecoverableNatsTransportError::SourceNotSealed)
+            }
+            Err(error) => return Err(nats(error)),
+        };
+        if before.subject.as_str() != subject || before.sequence == 0 {
+            return Err(RecoverableNatsTransportError::SourceScanChanged);
+        }
+
+        let last_sequence = before.sequence;
+        let last_payload = before.payload.clone();
+        let mut next_sequence = 1_u64;
+        let mut scanner = PendingQueueSourceTruncationScanner::try_new(
+            &route,
+            assignment,
+        )
+        .map_err(source_scan)?;
+        loop {
+            let observed = stream
+                .get_first_raw_message_by_subject(subject, next_sequence)
+                .await
+                .map_err(nats)?;
+            if observed.subject.as_str() != subject
+                || observed.sequence < next_sequence
+                || observed.sequence > last_sequence
+            {
+                return Err(RecoverableNatsTransportError::SourceScanChanged);
+            }
+            scanner
+                .observe(observed.sequence, &observed.payload)
+                .map_err(source_scan)?;
+            if observed.sequence == last_sequence {
+                break;
+            }
+            next_sequence = observed
+                .sequence
+                .checked_add(1)
+                .ok_or(RecoverableNatsTransportError::SourceScanChanged)?;
+        }
+        let receipt = scanner.finish().map_err(source_scan)?;
+
+        let after = stream
+            .get_last_raw_message_by_subject(subject)
+            .await
+            .map_err(nats)?;
+        if after.subject.as_str() != subject
+            || after.sequence != last_sequence
+            || after.payload != last_payload
+        {
+            return Err(RecoverableNatsTransportError::SourceScanChanged);
+        }
+        Ok(receipt)
+    }
+
     async fn reconcile(
         &self,
         sealed: &SealedRecoverableNatsPublish,
@@ -761,6 +858,15 @@ fn nats(error: impl fmt::Display) -> RecoverableNatsTransportError {
     RecoverableNatsTransportError::Nats(error.to_string())
 }
 
+fn source_scan(error: PendingQueueTerminalError) -> RecoverableNatsTransportError {
+    match error {
+        PendingQueueTerminalError::SourceNotSealed => {
+            RecoverableNatsTransportError::SourceNotSealed
+        }
+        other => RecoverableNatsTransportError::SourceScan(other.to_string()),
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RecoverableNatsTransportError {
     InvalidCaptureSpec,
@@ -771,6 +877,9 @@ pub enum RecoverableNatsTransportError {
     EmptyDelivery,
     BatchLimit,
     PayloadMismatch,
+    SourceNotSealed,
+    SourceScanChanged,
+    SourceScan(String),
     AckMismatch {
         stream: String,
         domain: String,
@@ -874,6 +983,17 @@ mod tests {
     fn envelope_for_segment(
         segment: RecoverableNatsStreamSegment,
     ) -> (RecoverableNatsStreamSegment, PendingQueuePublishEnvelope) {
+        let (segment, _, envelope) = fixture_for_segment(segment);
+        (segment, envelope)
+    }
+
+    fn fixture_for_segment(
+        segment: RecoverableNatsStreamSegment,
+    ) -> (
+        RecoverableNatsStreamSegment,
+        PendingQueueGenerationSegmentAssignment,
+        PendingQueuePublishEnvelope,
+    ) {
         let authority = AuthorityScope::Coordinator;
         let key = PendingGenerationLedgerKey::new(
             NetworkId::try_from_chain_id(1337).unwrap(),
@@ -946,7 +1066,7 @@ mod tests {
             b"typed-transport".to_vec(),
         )
         .unwrap();
-        (segment, envelope)
+        (segment, assignment, envelope)
     }
 
     #[test]
@@ -1059,7 +1179,7 @@ mod tests {
 
         // Rebuild the envelope with the same typed context/budget machinery
         // but the unique live segment by reusing the test helper below.
-        let (_, envelope) = envelope_for_segment(segment.clone());
+        let (_, assignment, envelope) = fixture_for_segment(segment.clone());
         let raw = async_nats::connect(url.clone()).await.unwrap();
         let context = jetstream::new(raw);
         context.create_stream(segment.stream_config()).await.unwrap();
@@ -1086,6 +1206,17 @@ mod tests {
             RecoverableNatsPublishDisposition::LeaderReadback
         );
 
+        assert_eq!(
+            publisher
+                .scan_source_retained_set(
+                    &assignment,
+                    PendingQueuePublisherKind::CoordinatorGuta,
+                )
+                .await
+                .unwrap_err(),
+            RecoverableNatsTransportError::SourceNotSealed
+        );
+
         let subject = envelope.exact_subject(&segment).unwrap();
         let spec = RecoverableNatsCaptureSpec::for_segment(segment.clone(), subject, 16)
             .unwrap();
@@ -1098,6 +1229,54 @@ mod tests {
         assert_eq!(batch.payloads(), &[envelope.to_canonical_bytes()]);
         let observation = batch.double_ack_all(&mut consumer).await.unwrap();
         assert!(observation.ack_floor_stream_sequence() >= first.subject_sequence());
+
+        let route = RecoverableNatsSourceRoute::try_new(
+            assignment.context(),
+            PendingQueuePublisherKind::CoordinatorGuta,
+            &segment,
+        )
+        .unwrap();
+        let source = PendingQueuePublishSourceState::bootstrap(&route, &assignment).unwrap();
+        let selected = source.select(&envelope).unwrap().current().clone();
+        let accepted = selected
+            .record_published(first.subject_sequence())
+            .unwrap();
+        let data_committed = accepted
+            .candidate()
+            .finalize_published()
+            .unwrap()
+            .candidate()
+            .clone();
+        let seal = PendingQueuePublishEnvelope::seal(
+            &route,
+            &assignment,
+            PendingQueuePublishIntentId::try_new([10; 32]).unwrap(),
+            PendingQueueMemberOrdinal::try_new(2).unwrap(),
+            data_committed.last_subject_sequence(),
+            data_committed.last_envelope_digest(),
+            data_committed.seal_summary().unwrap(),
+        )
+        .unwrap();
+        let seal_outcome = publisher.publish(&seal).await.unwrap();
+        let seal_selected = data_committed.select(&seal).unwrap().current().clone();
+        let seal_accepted = seal_selected
+            .record_published(seal_outcome.subject_sequence())
+            .unwrap();
+        let sealed_source = seal_accepted
+            .candidate()
+            .finalize_published()
+            .unwrap()
+            .candidate()
+            .clone();
+        let scan = publisher
+            .scan_source_retained_set(
+                &assignment,
+                PendingQueuePublisherKind::CoordinatorGuta,
+            )
+            .await
+            .unwrap();
+        assert!(scan.matches_persisted_source(&sealed_source));
+        assert_eq!(scan.retained_message_count(), 2);
         assert!(context
             .delete_stream(segment.stream_name())
             .await
