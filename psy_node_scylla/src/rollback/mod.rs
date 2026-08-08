@@ -46,6 +46,8 @@ mod pending_queue_consumer_gate;
 #[cfg(test)]
 mod branch_exact_shadow_reader_rf3_gate;
 #[cfg(test)]
+mod branch_exact_writer_rf3_gate;
+#[cfg(test)]
 mod branch_exact_schema_setup_rf3_gate;
 mod authority_local_head_prototype;
 mod authority_timestamp_prototype;

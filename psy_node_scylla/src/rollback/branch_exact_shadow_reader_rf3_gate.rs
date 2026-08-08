@@ -48,30 +48,30 @@ use crate::core::ScyllaCoreStore;
 
 use super::*;
 
-const KEYSPACE: &str = "psy_d04b6h21_realm";
+pub(super) const KEYSPACE: &str = "psy_d04b6h21_realm";
 const BASELINE: &str = "961809cbde127e126f1c7816b9d14e8b4450e043";
 const IMAGE: &str =
     "scylladb/scylla@sha256:17496f2dd6e72056d0b0d7e2bd18bd62638872d1d80a5dd9db96ba017fd426fc";
-const ROWS: usize = 64;
+pub(super) const ROWS: usize = 64;
 const CHUNKS: u32 = 4;
-const NODE_IPS: [Ipv4Addr; 3] = [
+pub(super) const NODE_IPS: [Ipv4Addr; 3] = [
     Ipv4Addr::new(172, 29, 86, 11),
     Ipv4Addr::new(172, 29, 86, 12),
     Ipv4Addr::new(172, 29, 86, 13),
 ];
-const NODE_CONTAINERS: [&str; 3] = [
+pub(super) const NODE_CONTAINERS: [&str; 3] = [
     "psy-g0-02-rf3-scylla1-1",
     "psy-g0-02-rf3-scylla2-1",
     "psy-g0-02-rf3-scylla3-1",
 ];
 
-fn control_keyspace() -> String { format!("{KEYSPACE}_no_tablet") }
+pub(super) fn control_keyspace() -> String { format!("{KEYSPACE}_no_tablet") }
 
-fn authority() -> AuthorityScope {
+pub(super) fn authority() -> AuthorityScope {
     AuthorityScope::Realm { realm_id: 7, realm_sub_id: 2 }
 }
 
-fn chain(epoch: u64, height: u64, seed: u64) -> anyhow::Result<CanonicalChainRef<PHash>> {
+pub(super) fn chain(epoch: u64, height: u64, seed: u64) -> anyhow::Result<CanonicalChainRef<PHash>> {
     Ok(CanonicalChainRef::new(
         NetworkId::try_from_chain_id(1337)?,
         ChainEpoch::new(epoch),
@@ -84,7 +84,7 @@ fn chain(epoch: u64, height: u64, seed: u64) -> anyhow::Result<CanonicalChainRef
     ))
 }
 
-fn request_and_freeze() -> anyhow::Result<(
+pub(super) fn request_and_freeze() -> anyhow::Result<(
     BranchExactSchemaMaterializationRequest,
     BranchExactFrozenLegacyExportPermit<PHash>,
 )> {
@@ -114,7 +114,7 @@ fn request_and_freeze() -> anyhow::Result<(
     Ok((request, freeze))
 }
 
-fn artifact() -> anyhow::Result<BranchExactBackfillArtifact<PHash>> {
+pub(super) fn artifact() -> anyhow::Result<BranchExactBackfillArtifact<PHash>> {
     let proof = TagTreeMerkleProof::<PHash>::new_empty();
     let rows = (0..ROWS)
         .map(|index| {
@@ -130,7 +130,7 @@ fn artifact() -> anyhow::Result<BranchExactBackfillArtifact<PHash>> {
     Ok(BranchExactBackfillArtifact::try_new(authority(), rows)?)
 }
 
-async fn connect(target: Option<Ipv4Addr>, consistency: Consistency) -> anyhow::Result<Session> {
+pub(super) async fn connect(target: Option<Ipv4Addr>, consistency: Consistency) -> anyhow::Result<Session> {
     let mut profile = ExecutionProfile::builder()
         .consistency(consistency)
         .request_timeout(Some(Duration::from_secs(180)));
@@ -151,7 +151,7 @@ async fn connect(target: Option<Ipv4Addr>, consistency: Consistency) -> anyhow::
         .await?)
 }
 
-async fn create_keyspaces(session: &Session) -> anyhow::Result<()> {
+pub(super) async fn create_keyspaces(session: &Session) -> anyhow::Result<()> {
     session.query_unpaged(
         format!("CREATE KEYSPACE IF NOT EXISTS {KEYSPACE} WITH replication = {{'class': 'NetworkTopologyStrategy', 'datacenter1': 3}}"),
         &[],
@@ -164,7 +164,7 @@ async fn create_keyspaces(session: &Session) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn create_legacy_tables(session: &Session) -> anyhow::Result<()> {
+pub(super) async fn create_legacy_tables(session: &Session) -> anyhow::Result<()> {
     for table in ["checkpoint_id_to_pending_id_table", "pending_id_to_checkpoint_id_table"] {
         session.query_unpaged(
             format!("CREATE TABLE IF NOT EXISTS {KEYSPACE}.{table} (obj_id bigint PRIMARY KEY, value bigint)"),
@@ -179,7 +179,7 @@ async fn create_legacy_tables(session: &Session) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn seed_legacy(session: &Session, artifact: &BranchExactBackfillArtifact<PHash>) -> anyhow::Result<()> {
+pub(super) async fn seed_legacy(session: &Session, artifact: &BranchExactBackfillArtifact<PHash>) -> anyhow::Result<()> {
     for row in artifact.rows() {
         let height = row.mapping().canonical_chain().checkpoint().checkpoint_id().get() as i64;
         let pending = row.mapping().pending_id().get() as i64;
@@ -210,7 +210,7 @@ async fn topology() -> anyhow::Result<BranchExactExpectedTopology> {
     Ok(BranchExactExpectedTopology::try_new(nodes)?)
 }
 
-async fn deploy_and_backfill(
+pub(super) async fn deploy_and_backfill(
     session: Arc<Session>,
     request: &BranchExactSchemaMaterializationRequest,
     artifact: &BranchExactBackfillArtifact<PHash>,
@@ -259,7 +259,7 @@ async fn deploy_and_backfill(
     Ok(receipt.clone())
 }
 
-async fn core() -> anyhow::Result<ScyllaCoreStore<PHash, PoseidonHasher>> {
+pub(super) async fn core() -> anyhow::Result<ScyllaCoreStore<PHash, PoseidonHasher>> {
     ScyllaCoreStore::new(7, 2, KEYSPACE.to_owned(), &NODE_IPS.map(|ip| ip.to_string())).await
 }
 
@@ -271,19 +271,19 @@ fn run_command(mut command: Command, label: &str) -> anyhow::Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-fn compose(file: &Path, args: &[&str], label: &str) -> anyhow::Result<String> {
+pub(super) fn compose(file: &Path, args: &[&str], label: &str) -> anyhow::Result<String> {
     let mut command = Command::new("docker");
     command.arg("compose").arg("-f").arg(file).args(args);
     run_command(command, label)
 }
 
-fn nodetool(container: &str, args: &[&str], label: &str) -> anyhow::Result<String> {
+pub(super) fn nodetool(container: &str, args: &[&str], label: &str) -> anyhow::Result<String> {
     let mut command = Command::new("docker");
     command.arg("exec").arg(container).arg("nodetool").args(args);
     run_command(command, label)
 }
 
-async fn wait_up(count: usize) -> anyhow::Result<()> {
+pub(super) async fn wait_up(count: usize) -> anyhow::Result<()> {
     for _ in 0..90 {
         let status = nodetool(NODE_CONTAINERS[0], &["status"], "h21 status")?;
         if status.lines().filter(|line| line.starts_with("UN ")).count() == count { return Ok(()); }
