@@ -1889,7 +1889,18 @@ fn recoverable_consumer_config_digest(
     let mut hasher = Sha256::new();
     hasher.update(CONSUMER_CONFIG_DOMAIN);
     hasher.update(spec.consumer_digest());
-    hasher.update((config.num_replicas as u64).to_be_bytes());
+    // JetStream may expose an inherited `num_replicas = 0` immediately after
+    // create and later normalize the same consumer to the stream's explicit
+    // replica count.  The typed spec already commits the minimum/effective
+    // replica contract, so those two server representations must share one
+    // physical identity while a genuinely different explicit value remains
+    // distinct.
+    let effective_replicas = if config.num_replicas == 0 {
+        spec.minimum_stream_replicas
+    } else {
+        config.num_replicas
+    };
+    hasher.update((effective_replicas as u64).to_be_bytes());
     match config.description.as_deref() {
         Some(description) => {
             hasher.update([1]);
@@ -1897,12 +1908,10 @@ fn recoverable_consumer_config_digest(
         }
         None => hasher.update([0]),
     }
-    let metadata = config.metadata.iter().collect::<BTreeMap<_, _>>();
-    hasher.update((metadata.len() as u64).to_be_bytes());
-    for (key, value) in metadata {
-        hash_component(&mut hasher, key.as_bytes());
-        hash_component(&mut hasher, value.as_bytes());
-    }
+    // `_nats.*` metadata is server-reserved and is not stable across the
+    // CREATE/INFO/LIST APIs or a leader failover. `attest_consumer` rejects
+    // every non-reserved key, so omitting this transport-owned view cannot
+    // hide an application-level configuration change.
     hasher.finalize().into()
 }
 
@@ -2423,18 +2432,23 @@ mod tests {
         )
         .is_err());
 
-        let mut config = spec.pull_config().into_consumer_config();
-        config.metadata.insert("_nats.b".into(), "2".into());
-        config.metadata.insert("_nats.a".into(), "1".into());
+        let config = spec.pull_config().into_consumer_config();
         let first_config = recoverable_consumer_config_digest(&spec, &config);
-        let mut reordered = spec.pull_config().into_consumer_config();
-        reordered.metadata.insert("_nats.a".into(), "1".into());
-        reordered.metadata.insert("_nats.b".into(), "2".into());
+        let mut server_annotated = spec.pull_config().into_consumer_config();
+        server_annotated
+            .metadata
+            .insert("_nats.req.level".into(), "0".into());
+        server_annotated
+            .metadata
+            .insert("_nats.level".into(), "2".into());
+        server_annotated
+            .metadata
+            .insert("_nats.ver".into(), "2.12.1".into());
         assert_eq!(
             first_config,
-            recoverable_consumer_config_digest(&spec, &reordered),
+            recoverable_consumer_config_digest(&spec, &server_annotated),
         );
-        let mut different_operation = reordered.clone();
+        let mut different_operation = server_annotated.clone();
         different_operation.description = Some(consumer_operation_description(
             RecoverableNatsConsumerProvisioningOperationId::try_new([91; 32]).unwrap(),
         ));
@@ -2589,6 +2603,29 @@ mod tests {
         let mut malformed = first_config;
         malformed.description = Some("psy-recoverable-operation-v1:XYZ".to_owned());
         assert!(spec.attest_consumer(&malformed).is_err());
+    }
+
+    #[test]
+    fn inherited_and_explicit_stream_replica_counts_share_one_physical_identity() {
+        let spec = capture_spec();
+        let operation =
+            RecoverableNatsConsumerProvisioningOperationId::try_new([41; 32]).unwrap();
+        let mut inherited = spec
+            .pull_config_for_operation(operation)
+            .into_consumer_config();
+        inherited.num_replicas = 0;
+        let mut explicit = inherited.clone();
+        explicit.num_replicas = spec.minimum_stream_replicas;
+        assert_eq!(
+            recoverable_consumer_config_digest(&spec, &inherited),
+            recoverable_consumer_config_digest(&spec, &explicit),
+        );
+
+        explicit.num_replicas += 1;
+        assert_ne!(
+            recoverable_consumer_config_digest(&spec, &inherited),
+            recoverable_consumer_config_digest(&spec, &explicit),
+        );
     }
 
     #[test]

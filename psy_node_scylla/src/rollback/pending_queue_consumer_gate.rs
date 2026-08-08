@@ -887,7 +887,7 @@ impl ScyllaPendingQueueConsumerGateStore {
         })
     }
 
-    async fn begin_provisioning(
+    pub(super) async fn begin_provisioning(
         &self,
         open: &PersistedPendingQueueConsumerGateOpenReceipt,
         expected: PendingQueueExpectedConsumer,
