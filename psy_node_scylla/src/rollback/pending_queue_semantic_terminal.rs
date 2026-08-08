@@ -110,10 +110,18 @@ pub(super) struct PendingQueueSemanticSourceCommitment {
     pub(super) assignment_ledger_slot: [u8; 32],
     pub(super) assignment_ledger_revision: u64,
     pub(super) artifact_store_fingerprint: [u8; 32],
+    pub(super) artifact_slot: [u8; 32],
+    pub(super) artifact_owner_attempt_id: [u8; 32],
+    pub(super) artifact_owner_fence: u64,
+    pub(super) consumer_digest: [u8; 32],
     pub(super) source_slot: PendingQueuePublishSourceSlot,
     pub(super) semantic_digest: PendingQueueSemanticSourceDigest,
     pub(super) data_member_count: u32,
     pub(super) data_encoded_bytes: u64,
+    pub(super) source_revision: u64,
+    pub(super) artifact_scan_revision: u64,
+    pub(super) artifact_scan_digest: [u8; 32],
+    pub(super) nats_scan_digest: [u8; 32],
 }
 
 impl PersistedPendingQueueSemanticSourceReceipt {
@@ -145,10 +153,18 @@ impl PersistedPendingQueueSemanticSourceReceipt {
             assignment_ledger_slot: *self.assignment_ledger_slot.as_bytes(),
             assignment_ledger_revision: self.assignment_ledger_revision.get(),
             artifact_store_fingerprint: *self.artifact_store_fingerprint.as_bytes(),
+            artifact_slot: *self.artifact_slot.as_bytes(),
+            artifact_owner_attempt_id: *self.artifact_owner_attempt_id.as_bytes(),
+            artifact_owner_fence: self.artifact_owner_fence.get(),
+            consumer_digest: self.consumer_digest,
             source_slot: self.source_slot,
             semantic_digest: self.semantic_digest,
             data_member_count: self.data_member_count,
             data_encoded_bytes: self.data_encoded_bytes,
+            source_revision: self.source_revision,
+            artifact_scan_revision: self.artifact_scan_revision,
+            artifact_scan_digest: *self.artifact_scan_digest.as_bytes(),
+            nats_scan_digest: *self.nats_scan_digest.as_bytes(),
         }
     }
 }

@@ -37,6 +37,8 @@ pub const MAX_PENDING_QUEUE_SEGMENT_LEDGER_BYTES: usize = 1024 * 1024;
 pub const MAX_GENERATIONS_PER_LIVE_SEGMENT: u32 = 4096;
 const LEDGER_SLOT_DOMAIN: &[u8] = b"psy/rollback/pending-queue-segment-ledger-slot/v1";
 const ASSIGNMENT_DOMAIN: &[u8] = b"psy/rollback/pending-queue-segment-assignment/v1";
+const ASSIGNMENT_CODEC_MAGIC: &[u8; 8] = b"PSYQASGN";
+const ASSIGNMENT_CODEC_VERSION: u16 = 1;
 const MAX_BASE_NAMESPACE_BYTES: usize = 96;
 const MAX_LIVE_SEGMENTS: u16 = 64;
 
@@ -222,6 +224,108 @@ impl PendingQueueGenerationSegmentAssignment {
 
     pub const fn digest(&self) -> PendingQueueSegmentAssignmentDigest {
         self.digest
+    }
+
+    /// Canonical standalone assignment payload for immutable archive rows.
+    /// Decoding also requires the ledger slot because that slot is part of the
+    /// assignment digest and prevents cross-ledger replay.
+    pub fn to_canonical_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(256);
+        out.extend_from_slice(ASSIGNMENT_CODEC_MAGIC);
+        out.extend_from_slice(&ASSIGNMENT_CODEC_VERSION.to_be_bytes());
+        let key = self.context.key();
+        out.extend_from_slice(&key.network().chain_id().to_be_bytes());
+        let (kind, realm, sub) = encode_authority(key.authority());
+        out.push(kind);
+        out.extend_from_slice(&realm.to_be_bytes());
+        out.extend_from_slice(&sub.to_be_bytes());
+        encode_context(self.context, &mut out);
+        out.extend_from_slice(&self.assigned_at_ledger_revision.get().to_be_bytes());
+        out.extend_from_slice(&self.segment_id.get().to_be_bytes());
+        out.extend_from_slice(self.contract_digest.as_bytes());
+        out.extend_from_slice(&self.reserved_bytes.to_be_bytes());
+        out.push(self.expected_source_count);
+        out.extend_from_slice(self.budget_digest.as_bytes());
+        out.push(self.source_quotas.len() as u8);
+        for quota in &self.source_quotas {
+            encode_quota(*quota, &mut out);
+        }
+        out.extend_from_slice(self.digest.as_bytes());
+        out
+    }
+
+    pub fn decode_canonical(
+        ledger_slot: PendingQueueSegmentLedgerSlot,
+        bytes: &[u8],
+    ) -> Result<Self, PendingQueueSegmentLedgerError> {
+        let mut decoder = Decoder::new(bytes);
+        if decoder.take(8)? != ASSIGNMENT_CODEC_MAGIC {
+            return Err(PendingQueueSegmentLedgerError::InvalidMagic);
+        }
+        let version = decoder.u16()?;
+        if version != ASSIGNMENT_CODEC_VERSION {
+            return Err(PendingQueueSegmentLedgerError::UnknownCodecVersion(version));
+        }
+        let network = NetworkId::try_from_chain_id(decoder.u32()?)?;
+        let authority = decode_authority(decoder.u8()?, decoder.u32()?, decoder.u16()?)?;
+        decoder.generation_key = Some(PendingGenerationLedgerKey::new(network, authority));
+        let context = decode_context(&mut decoder)?;
+        let assigned_at_ledger_revision =
+            PendingQueueSegmentLedgerRevision::try_new(decoder.u64()?)?;
+        let segment_id = RecoverableNatsSegmentId::try_new(decoder.u64()?)?;
+        let contract_digest =
+            RecoverableNatsSegmentContractDigest::try_new(decoder.array32()?)?;
+        let reserved_bytes = decoder.i64()?;
+        let encoded_source_count = decoder.u8()?;
+        let budget_digest = PendingQueueGenerationBudgetDigest::try_new(decoder.array32()?)
+            .map_err(|error| PendingQueueSegmentLedgerError::Budget(error.to_string()))?;
+        let quota_count = usize::from(decoder.u8()?);
+        if quota_count == 0 || quota_count > 3 {
+            return Err(PendingQueueSegmentLedgerError::AssignmentMismatch);
+        }
+        let mut source_quotas = Vec::with_capacity(quota_count);
+        for _ in 0..quota_count {
+            source_quotas.push(decode_quota(&mut decoder)?);
+        }
+        let digest = PendingQueueSegmentAssignmentDigest::try_new(decoder.array32()?)?;
+        let max_generation_stored_bytes = u64::try_from(reserved_bytes)
+            .map_err(|_| PendingQueueSegmentLedgerError::AssignmentMismatch)?;
+        let reconstructed_budget = PendingQueueGenerationBudgetContract::try_new(
+            authority,
+            source_quotas.clone(),
+            max_generation_stored_bytes,
+        )
+        .map_err(|error| PendingQueueSegmentLedgerError::Budget(error.to_string()))?;
+        if !decoder.is_done()
+            || encoded_source_count != expected_source_count(authority)
+            || source_quotas.len() != usize::from(encoded_source_count)
+            || reconstructed_budget.digest() != budget_digest
+            || digest
+                != assignment_digest(
+                    ledger_slot,
+                    context,
+                    assigned_at_ledger_revision,
+                    segment_id,
+                    contract_digest,
+                    reserved_bytes,
+                    encoded_source_count,
+                    budget_digest,
+                    &source_quotas,
+                )?
+        {
+            return Err(PendingQueueSegmentLedgerError::AssignmentMismatch);
+        }
+        Ok(Self {
+            context,
+            assigned_at_ledger_revision,
+            segment_id,
+            contract_digest,
+            reserved_bytes,
+            expected_source_count: encoded_source_count,
+            budget_digest,
+            source_quotas,
+            digest,
+        })
     }
 }
 
@@ -1256,7 +1360,11 @@ mod tests {
     #[test]
     fn codec_round_trip_and_tamper_fail_closed() {
         let initial = bootstrap(AuthorityScope::Coordinator).candidate().clone();
-        let PendingQueueSegmentReservationPlan::Advance { candidate, .. } =
+        let PendingQueueSegmentReservationPlan::Advance {
+            candidate,
+            assignment,
+            ..
+        } =
             initial
                 .reserve_generation(context(AuthorityScope::Coordinator, 1))
                 .unwrap()
@@ -1264,6 +1372,33 @@ mod tests {
             unreachable!()
         };
         let bytes = candidate.to_persisted_bytes();
+        let assignment_bytes = assignment.to_canonical_bytes();
+        assert_eq!(
+            PendingQueueGenerationSegmentAssignment::decode_canonical(
+                candidate.key().slot(),
+                &assignment_bytes,
+            )
+            .unwrap(),
+            assignment
+        );
+        let mut wrong_assignment_version = assignment_bytes.clone();
+        wrong_assignment_version[8..10].copy_from_slice(&2_u16.to_be_bytes());
+        assert_eq!(
+            PendingQueueGenerationSegmentAssignment::decode_canonical(
+                candidate.key().slot(),
+                &wrong_assignment_version,
+            ),
+            Err(PendingQueueSegmentLedgerError::UnknownCodecVersion(2))
+        );
+        let mut trailing_assignment = assignment_bytes;
+        trailing_assignment.push(0);
+        assert_eq!(
+            PendingQueueGenerationSegmentAssignment::decode_canonical(
+                candidate.key().slot(),
+                &trailing_assignment,
+            ),
+            Err(PendingQueueSegmentLedgerError::AssignmentMismatch)
+        );
         let payload_digest: [u8; 32] = Sha256::digest(&bytes).into();
         assert_eq!(
             payload_digest,

@@ -2,8 +2,8 @@
 //!
 //! This default-off row consumes the exact per-source semantic receipts and
 //! persists one immutable Coordinator (3 sources) or Realm (1 source)
-//! terminal with an IF-NOT-EXISTS LWT. It deliberately does not advance the
-//! pending pipeline and grants no stream rotation or GC authority.
+//! assignment archive with an IF-NOT-EXISTS LWT. It can perform the first
+//! pipeline handoff but grants no terminal, stream-rotation, or GC authority.
 
 #![allow(dead_code)]
 
@@ -16,10 +16,21 @@ use psy_data::protocol::{
 };
 use psy_node_core::{
     queue::recoverable_ephemeral::PendingQueueCaptureContextDigest,
-    store::pending_generation_pipeline::PendingQueueCloseIntentDigest,
+    store::{
+        pending_generation_pipeline::{
+            PendingEmptyQueueSealDigest, PendingPipelineReadState,
+            PendingPipelineRevision, PendingPipelineWriteOutcome,
+            PendingProcessingState, PendingQueueCloseIntentDigest,
+            PendingWorkCaptureDigest, SealedPendingPipelineTransition,
+            StoredPendingPipeline,
+        },
+    },
 };
 use psy_node_nats::{
-    recoverable_assignment::PendingQueueSegmentAssignmentDigest,
+    recoverable_assignment::{
+        PendingQueueGenerationSegmentAssignment, PendingQueueSegmentAssignmentDigest,
+        PendingQueueSegmentLedgerSlot,
+    },
     recoverable_publish::{
         PendingQueuePublishSourceSlot, PendingQueuePublisherKind,
     },
@@ -44,14 +55,14 @@ use super::{
 };
 
 pub(super) const PENDING_QUEUE_SEMANTIC_GENERATION_TABLE: &str =
-    "branch_exact_pending_queue_semantic_generation_v1";
+    "branch_exact_pending_queue_semantic_generation_v2";
 const MAGIC: &[u8; 8] = b"PSYQSGEN";
-const CODEC_VERSION: u16 = 1;
+const CODEC_VERSION: u16 = 2;
 const REVISION: u64 = 1;
-const SLOT_DOMAIN: &[u8] =
-    b"psy/rollback/pending-queue-semantic-generation-slot/v1";
+const ARCHIVE_SLOT_DOMAIN: &[u8] =
+    b"psy/rollback/pending-queue-assignment-archive-slot/v1";
 const DIGEST_DOMAIN: &[u8] =
-    b"psy/rollback/pending-queue-semantic-generation/v1";
+    b"psy/rollback/pending-queue-semantic-generation/v2";
 const STORE_FINGERPRINT_DOMAIN: &[u8] =
     b"psy/rollback/pending-queue-semantic-generation-store/v1";
 
@@ -97,8 +108,16 @@ struct SemanticSourceEntry {
     publisher_kind: PendingQueuePublisherKind,
     source_slot: PendingQueuePublishSourceSlot,
     semantic_digest: PendingQueueSemanticSourceDigest,
+    artifact_slot: [u8; 32],
+    artifact_owner_attempt_id: [u8; 32],
+    artifact_owner_fence: u64,
+    consumer_digest: [u8; 32],
     data_member_count: u32,
     data_encoded_bytes: u64,
+    source_revision: u64,
+    artifact_scan_revision: u64,
+    artifact_scan_digest: [u8; 32],
+    nats_scan_digest: [u8; 32],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -110,11 +129,14 @@ pub(super) struct StoredPendingQueueSemanticGeneration {
     context_digest: PendingQueueCaptureContextDigest,
     assignment_digest: PendingQueueSegmentAssignmentDigest,
     close_intent: PendingQueueCloseIntentDigest,
+    pipeline_store_fingerprint: [u8; 32],
+    pipeline_close_revision: u64,
     pipeline_close_receipt_digest: [u8; 32],
     publish_store_fingerprint: [u8; 32],
     assignment_store_fingerprint: [u8; 32],
     assignment_ledger_slot: [u8; 32],
     assignment_ledger_revision: u64,
+    assignment_payload: Vec<u8>,
     artifact_store_fingerprint: [u8; 32],
     total_data_members: u64,
     total_data_encoded_bytes: u64,
@@ -122,16 +144,20 @@ pub(super) struct StoredPendingQueueSemanticGeneration {
     digest: PendingQueueSemanticGenerationDigest,
 }
 
+#[derive(Clone)]
 struct SemanticGenerationBinding {
     network: NetworkId,
     authority: AuthorityScope,
     context_digest: PendingQueueCaptureContextDigest,
     assignment_digest: PendingQueueSegmentAssignmentDigest,
     close_intent: PendingQueueCloseIntentDigest,
+    pipeline_store_fingerprint: [u8; 32],
+    pipeline_close_revision: u64,
     pipeline_close_receipt_digest: [u8; 32],
     assignment_store_fingerprint: [u8; 32],
     assignment_ledger_slot: [u8; 32],
     assignment_ledger_revision: u64,
+    assignment_payload: Vec<u8>,
 }
 
 impl StoredPendingQueueSemanticGeneration {
@@ -150,10 +176,13 @@ impl StoredPendingQueueSemanticGeneration {
             context_digest: assigned.context().digest(),
             assignment_digest: assigned.digest(),
             close_intent: close.close_intent(),
+            pipeline_store_fingerprint: *close.store_fingerprint().as_bytes(),
+            pipeline_close_revision: close.revision().get(),
             pipeline_close_receipt_digest: *close.receipt_digest(),
             assignment_store_fingerprint: *assignment.store_fingerprint().as_bytes(),
             assignment_ledger_slot: *assignment.ledger_slot().as_bytes(),
             assignment_ledger_revision: assignment.ledger_revision().get(),
+            assignment_payload: assigned.to_canonical_bytes(),
         };
         Self::from_commitments(
             binding,
@@ -168,6 +197,36 @@ impl StoredPendingQueueSemanticGeneration {
         binding: SemanticGenerationBinding,
         mut commitments: Vec<PendingQueueSemanticSourceCommitment>,
     ) -> Result<Self, PendingQueueSemanticAggregateError> {
+        if binding.pipeline_store_fingerprint == [0; 32]
+            || binding.pipeline_close_revision == 0
+            || binding.pipeline_close_receipt_digest == [0; 32]
+            || binding.assignment_store_fingerprint == [0; 32]
+            || binding.assignment_ledger_revision == 0
+            || binding.assignment_payload.is_empty()
+            || u16::try_from(binding.assignment_payload.len()).is_err()
+        {
+            return Err(PendingQueueSemanticAggregateError::AssignmentPayloadMismatch);
+        }
+        let ledger_slot = PendingQueueSegmentLedgerSlot::try_new(
+            binding.assignment_ledger_slot,
+        )
+        .map_err(|_| PendingQueueSemanticAggregateError::AssignmentPayloadMismatch)?;
+        let archived_assignment =
+            PendingQueueGenerationSegmentAssignment::decode_canonical(
+                ledger_slot,
+                &binding.assignment_payload,
+            )
+            .map_err(|_| PendingQueueSemanticAggregateError::AssignmentPayloadMismatch)?;
+        if archived_assignment.context().key().network() != binding.network
+            || archived_assignment.context().key().authority() != binding.authority
+            || archived_assignment.context().digest() != binding.context_digest
+            || archived_assignment.digest() != binding.assignment_digest
+            || archived_assignment.assigned_at_ledger_revision().get()
+                != binding.assignment_ledger_revision
+            || archived_assignment.to_canonical_bytes() != binding.assignment_payload
+        {
+            return Err(PendingQueueSemanticAggregateError::AssignmentPayloadMismatch);
+        }
         let expected = expected_roles(binding.authority);
         if commitments.len() != expected.len() {
             return Err(PendingQueueSemanticAggregateError::IncompleteSourceSet);
@@ -201,6 +260,14 @@ impl StoredPendingQueueSemanticGeneration {
                 || source.assignment_ledger_revision
                     != binding.assignment_ledger_revision
                 || source.artifact_store_fingerprint != common_artifact_store
+                || source.artifact_slot == [0; 32]
+                || source.artifact_owner_attempt_id == [0; 32]
+                || source.artifact_owner_fence == 0
+                || source.consumer_digest == [0; 32]
+                || source.source_revision == 0
+                || source.artifact_scan_revision == 0
+                || source.artifact_scan_digest == [0; 32]
+                || source.nats_scan_digest == [0; 32]
             {
                 return Err(PendingQueueSemanticAggregateError::GenerationMismatch);
             }
@@ -214,14 +281,21 @@ impl StoredPendingQueueSemanticGeneration {
                 publisher_kind: source.publisher_kind,
                 source_slot: source.source_slot,
                 semantic_digest: source.semantic_digest,
+                artifact_slot: source.artifact_slot,
+                artifact_owner_attempt_id: source.artifact_owner_attempt_id,
+                artifact_owner_fence: source.artifact_owner_fence,
+                consumer_digest: source.consumer_digest,
                 data_member_count: source.data_member_count,
                 data_encoded_bytes: source.data_encoded_bytes,
+                source_revision: source.source_revision,
+                artifact_scan_revision: source.artifact_scan_revision,
+                artifact_scan_digest: source.artifact_scan_digest,
+                nats_scan_digest: source.nats_scan_digest,
             });
         }
         let slot = generation_slot(
-            binding.context_digest,
+            binding.assignment_ledger_slot,
             binding.assignment_digest,
-            binding.close_intent,
         )?;
         let mut aggregate = Self {
             slot,
@@ -231,11 +305,14 @@ impl StoredPendingQueueSemanticGeneration {
             context_digest: binding.context_digest,
             assignment_digest: binding.assignment_digest,
             close_intent: binding.close_intent,
+            pipeline_store_fingerprint: binding.pipeline_store_fingerprint,
+            pipeline_close_revision: binding.pipeline_close_revision,
             pipeline_close_receipt_digest: binding.pipeline_close_receipt_digest,
             publish_store_fingerprint: common_publish_store,
             assignment_store_fingerprint: binding.assignment_store_fingerprint,
             assignment_ledger_slot: binding.assignment_ledger_slot,
             assignment_ledger_revision: binding.assignment_ledger_revision,
+            assignment_payload: binding.assignment_payload,
             artifact_store_fingerprint: common_artifact_store,
             total_data_members,
             total_data_encoded_bytes,
@@ -254,6 +331,44 @@ impl StoredPendingQueueSemanticGeneration {
 
     pub(super) const fn has_work(&self) -> bool { self.total_data_members != 0 }
 
+    fn uses_work_handoff(&self) -> bool {
+        self.authority == AuthorityScope::Coordinator || self.has_work()
+    }
+
+    fn seal_pipeline_handoff<Hash: Q256BitHash>(
+        &self,
+        pipeline: &StoredPendingPipeline<Hash>,
+        assignment: &PendingQueueSegmentAssignmentReceipt,
+    ) -> Result<SealedPendingPipelineTransition<Hash>, PendingQueueSemanticAggregateError> {
+        let context = assignment.assignment().context();
+        if !self.matches_assignment(assignment)
+            || pipeline.key() != context.key()
+            || pipeline.activation_digest() != context.activation()
+            || pipeline.processing() != context.processing()
+            || pipeline.revision().get() != self.pipeline_close_revision
+            || pipeline.processing_state() != PendingProcessingState::Sealing(self.close_intent)
+        {
+            return Err(PendingQueueSemanticAggregateError::PipelineHandoffMismatch);
+        }
+        if self.uses_work_handoff() {
+            pipeline
+                .seal_capture_work(
+                    self.close_intent,
+                    PendingWorkCaptureDigest::try_new(*self.slot.as_bytes())
+                        .map_err(|error| PendingQueueSemanticAggregateError::Pipeline(error.to_string()))?,
+                )
+                .map_err(|error| PendingQueueSemanticAggregateError::Pipeline(error.to_string()))
+        } else {
+            pipeline
+                .seal_empty_queue(
+                    self.close_intent,
+                    PendingEmptyQueueSealDigest::try_new(*self.slot.as_bytes())
+                        .map_err(|error| PendingQueueSemanticAggregateError::Pipeline(error.to_string()))?,
+                )
+                .map_err(|error| PendingQueueSemanticAggregateError::Pipeline(error.to_string()))
+        }
+    }
+
     fn matches_generation_binding(
         &self,
         assignment: &PendingQueueSegmentAssignmentReceipt,
@@ -265,12 +380,28 @@ impl StoredPendingQueueSemanticGeneration {
             && self.context_digest == assigned.context().digest()
             && self.assignment_digest == assigned.digest()
             && self.close_intent == close.close_intent()
+            && self.pipeline_store_fingerprint == *close.store_fingerprint().as_bytes()
+            && self.pipeline_close_revision == close.revision().get()
             && self.pipeline_close_receipt_digest == *close.receipt_digest()
             && self.assignment_store_fingerprint
                 == *assignment.store_fingerprint().as_bytes()
             && self.assignment_ledger_slot == *assignment.ledger_slot().as_bytes()
             && self.assignment_ledger_revision == assignment.ledger_revision().get()
+            && self.assignment_payload == assigned.to_canonical_bytes()
             && close.matches_context(assigned.context())
+    }
+
+    fn matches_assignment(&self, assignment: &PendingQueueSegmentAssignmentReceipt) -> bool {
+        let assigned = assignment.assignment();
+        self.network == assigned.context().key().network()
+            && self.authority == assigned.context().key().authority()
+            && self.context_digest == assigned.context().digest()
+            && self.assignment_digest == assigned.digest()
+            && self.assignment_store_fingerprint
+                == *assignment.store_fingerprint().as_bytes()
+            && self.assignment_ledger_slot == *assignment.ledger_slot().as_bytes()
+            && self.assignment_ledger_revision == assignment.ledger_revision().get()
+            && self.assignment_payload == assigned.to_canonical_bytes()
     }
 
     pub(super) fn to_persisted_bytes(&self) -> Vec<u8> {
@@ -320,17 +451,24 @@ impl StoredPendingQueueSemanticGeneration {
             .map_err(|_| PendingQueueSemanticAggregateError::EmptyDigest)?;
         let close_intent = PendingQueueCloseIntentDigest::try_new(decoder.array32()?)
             .map_err(|_| PendingQueueSemanticAggregateError::EmptyDigest)?;
+        let pipeline_store_fingerprint = decoder.array32()?;
+        let pipeline_close_revision = decoder.u64()?;
         let pipeline_close_receipt_digest = decoder.array32()?;
         let publish_store_fingerprint = decoder.array32()?;
         let assignment_store_fingerprint = decoder.array32()?;
         let assignment_ledger_slot = decoder.array32()?;
         let assignment_ledger_revision = decoder.u64()?;
+        let assignment_payload_len = usize::from(decoder.u16()?);
+        let assignment_payload = decoder.take(assignment_payload_len)?.to_vec();
         let artifact_store_fingerprint = decoder.array32()?;
-        if pipeline_close_receipt_digest == [0; 32]
+        if pipeline_store_fingerprint == [0; 32]
+            || pipeline_close_revision == 0
+            || pipeline_close_receipt_digest == [0; 32]
             || publish_store_fingerprint == [0; 32]
             || assignment_store_fingerprint == [0; 32]
             || assignment_ledger_slot == [0; 32]
             || assignment_ledger_revision == 0
+            || assignment_payload.is_empty()
             || artifact_store_fingerprint == [0; 32]
         {
             return Err(PendingQueueSemanticAggregateError::EmptyDigest);
@@ -353,8 +491,16 @@ impl StoredPendingQueueSemanticGeneration {
                     .map_err(|_| PendingQueueSemanticAggregateError::EmptyDigest)?,
                 semantic_digest: PendingQueueSemanticSourceDigest::try_new(decoder.array32()?)
                     .map_err(|_| PendingQueueSemanticAggregateError::EmptyDigest)?,
+                artifact_slot: decoder.array32()?,
+                artifact_owner_attempt_id: decoder.array32()?,
+                artifact_owner_fence: decoder.u64()?,
+                consumer_digest: decoder.array32()?,
                 data_member_count: decoder.u32()?,
                 data_encoded_bytes: decoder.u64()?,
+                source_revision: decoder.u64()?,
+                artifact_scan_revision: decoder.u64()?,
+                artifact_scan_digest: decoder.array32()?,
+                nats_scan_digest: decoder.array32()?,
             });
         }
         let digest = PendingQueueSemanticGenerationDigest::try_new(decoder.array32()?)?;
@@ -369,22 +515,52 @@ impl StoredPendingQueueSemanticGeneration {
             context_digest,
             assignment_digest,
             close_intent,
+            pipeline_store_fingerprint,
+            pipeline_close_revision,
             pipeline_close_receipt_digest,
             publish_store_fingerprint,
             assignment_store_fingerprint,
             assignment_ledger_slot,
             assignment_ledger_revision,
+            assignment_payload,
             artifact_store_fingerprint,
             total_data_members,
             total_data_encoded_bytes,
             sources,
             digest,
         };
+        if aggregate.sources.iter().any(|source| {
+            source.artifact_slot == [0; 32]
+                || source.artifact_owner_attempt_id == [0; 32]
+                || source.artifact_owner_fence == 0
+                || source.consumer_digest == [0; 32]
+                || source.source_revision == 0
+                || source.artifact_scan_revision == 0
+                || source.artifact_scan_digest == [0; 32]
+                || source.nats_scan_digest == [0; 32]
+        }) {
+            return Err(PendingQueueSemanticAggregateError::EmptyDigest);
+        }
         let (computed_members, computed_bytes) = checked_source_totals(&aggregate.sources)?;
-        if generation_slot(context_digest, assignment_digest, close_intent)? != slot
+        let ledger_slot = PendingQueueSegmentLedgerSlot::try_new(assignment_ledger_slot)
+            .map_err(|_| PendingQueueSemanticAggregateError::AssignmentPayloadMismatch)?;
+        let archived_assignment = PendingQueueGenerationSegmentAssignment::decode_canonical(
+            ledger_slot,
+            &aggregate.assignment_payload,
+        )
+        .map_err(|_| PendingQueueSemanticAggregateError::AssignmentPayloadMismatch)?;
+        if generation_slot(assignment_ledger_slot, assignment_digest)? != slot
             || generation_digest(&aggregate.encode_unsigned())? != digest
             || computed_members != total_data_members
             || computed_bytes != total_data_encoded_bytes
+            || archived_assignment.digest() != assignment_digest
+            || archived_assignment.context().key().network() != network
+            || archived_assignment.context().key().authority() != authority
+            || archived_assignment.context().digest() != context_digest
+            || archived_assignment.assigned_at_ledger_revision().get()
+                != assignment_ledger_revision
+            || archived_assignment.to_canonical_bytes()
+                != aggregate.assignment_payload
         {
             return Err(PendingQueueSemanticAggregateError::DigestMismatch);
         }
@@ -405,11 +581,15 @@ impl StoredPendingQueueSemanticGeneration {
         out.extend_from_slice(self.context_digest.as_bytes());
         out.extend_from_slice(self.assignment_digest.as_bytes());
         out.extend_from_slice(self.close_intent.as_bytes());
+        out.extend_from_slice(&self.pipeline_store_fingerprint);
+        out.extend_from_slice(&self.pipeline_close_revision.to_be_bytes());
         out.extend_from_slice(&self.pipeline_close_receipt_digest);
         out.extend_from_slice(&self.publish_store_fingerprint);
         out.extend_from_slice(&self.assignment_store_fingerprint);
         out.extend_from_slice(&self.assignment_ledger_slot);
         out.extend_from_slice(&self.assignment_ledger_revision.to_be_bytes());
+        out.extend_from_slice(&(self.assignment_payload.len() as u16).to_be_bytes());
+        out.extend_from_slice(&self.assignment_payload);
         out.extend_from_slice(&self.artifact_store_fingerprint);
         out.extend_from_slice(&self.total_data_members.to_be_bytes());
         out.extend_from_slice(&self.total_data_encoded_bytes.to_be_bytes());
@@ -418,8 +598,16 @@ impl StoredPendingQueueSemanticGeneration {
             out.push(source.publisher_kind as u8);
             out.extend_from_slice(source.source_slot.as_bytes());
             out.extend_from_slice(source.semantic_digest.as_bytes());
+            out.extend_from_slice(&source.artifact_slot);
+            out.extend_from_slice(&source.artifact_owner_attempt_id);
+            out.extend_from_slice(&source.artifact_owner_fence.to_be_bytes());
+            out.extend_from_slice(&source.consumer_digest);
             out.extend_from_slice(&source.data_member_count.to_be_bytes());
             out.extend_from_slice(&source.data_encoded_bytes.to_be_bytes());
+            out.extend_from_slice(&source.source_revision.to_be_bytes());
+            out.extend_from_slice(&source.artifact_scan_revision.to_be_bytes());
+            out.extend_from_slice(&source.artifact_scan_digest);
+            out.extend_from_slice(&source.nats_scan_digest);
         }
         out
     }
@@ -450,15 +638,13 @@ fn checked_source_totals(
 }
 
 fn generation_slot(
-    context: PendingQueueCaptureContextDigest,
+    assignment_ledger_slot: [u8; 32],
     assignment: PendingQueueSegmentAssignmentDigest,
-    close: PendingQueueCloseIntentDigest,
 ) -> Result<PendingQueueSemanticGenerationSlot, PendingQueueSemanticAggregateError> {
     let mut hasher = Sha256::new();
-    hasher.update(SLOT_DOMAIN);
-    hasher.update(context.as_bytes());
+    hasher.update(ARCHIVE_SLOT_DOMAIN);
+    hasher.update(assignment_ledger_slot);
     hasher.update(assignment.as_bytes());
-    hasher.update(close.as_bytes());
     PendingQueueSemanticGenerationSlot::try_new(hasher.finalize().into())
 }
 
@@ -526,6 +712,28 @@ pub(super) struct ScyllaPendingQueueSemanticAggregateStore {
 pub(super) struct PersistedPendingQueueSemanticGenerationReceipt {
     store_fingerprint: PendingQueueSemanticAggregateStoreFingerprint,
     aggregate: StoredPendingQueueSemanticGeneration,
+}
+
+/// Opaque exact readback that the immutable semantic aggregate was durable
+/// before the pipeline left `Sealing(close)`. This is not a rotation or GC
+/// permit.
+#[derive(Debug)]
+pub(super) struct PersistedPendingQueueSemanticHandoffReceipt {
+    aggregate_store_fingerprint: PendingQueueSemanticAggregateStoreFingerprint,
+    aggregate_slot: PendingQueueSemanticGenerationSlot,
+    aggregate_digest: PendingQueueSemanticGenerationDigest,
+    pipeline_revision: PendingPipelineRevision,
+    pipeline_state: PendingProcessingState,
+}
+
+impl PersistedPendingQueueSemanticHandoffReceipt {
+    pub(super) const fn aggregate_digest(&self) -> PendingQueueSemanticGenerationDigest {
+        self.aggregate_digest
+    }
+
+    pub(super) const fn pipeline_revision(&self) -> PendingPipelineRevision {
+        self.pipeline_revision
+    }
 }
 
 impl PersistedPendingQueueSemanticGenerationReceipt {
@@ -649,6 +857,151 @@ impl ScyllaPendingQueueSemanticAggregateStore {
             .map_err(|error| PendingQueueSemanticAggregateError::Pipeline(error.to_string()))?;
         Ok(())
     }
+
+    async fn revalidate_aggregate_receipt(
+        &self,
+        assignment: &PendingQueueSegmentAssignmentReceipt,
+        close: &PersistedPendingQueueCloseReceipt,
+        receipt: &PersistedPendingQueueSemanticGenerationReceipt,
+    ) -> Result<(), PendingQueueSemanticAggregateError> {
+        if receipt.store_fingerprint != self.fingerprint
+            || !receipt.aggregate.matches_generation_binding(assignment, close)
+        {
+            return Err(PendingQueueSemanticAggregateError::ReceiptBindingMismatch);
+        }
+        let current = self
+            .read(receipt.aggregate.slot())
+            .await?
+            .ok_or(PendingQueueSemanticAggregateError::ReceiptStale)?;
+        if current != receipt.aggregate {
+            return Err(PendingQueueSemanticAggregateError::ReceiptStale);
+        }
+        Ok(())
+    }
+
+    /// Publish the already-durable semantic aggregate into the authority
+    /// pipeline. The aggregate row is the immutable pre-CAS handoff intent;
+    /// pipeline CAS response loss is classified by exact candidate readback.
+    pub(super) async fn handoff_to_pipeline<Hash: Q256BitHash>(
+        &self,
+        pipeline_store: &ScyllaPendingPipelineStore,
+        assignment: &PendingQueueSegmentAssignmentReceipt,
+        close: &PersistedPendingQueueCloseReceipt,
+        receipt: &PersistedPendingQueueSemanticGenerationReceipt,
+    ) -> Result<PersistedPendingQueueSemanticHandoffReceipt, PendingQueueSemanticAggregateError> {
+        self.revalidate_aggregate_receipt(assignment, close, receipt)
+            .await?;
+        let context = assignment.assignment().context();
+        let PendingPipelineReadState::Current(current) =
+            pipeline_store.read::<Hash>(context.key()).await
+                .map_err(|error| PendingQueueSemanticAggregateError::Pipeline(error.to_string()))?
+        else {
+            return Err(PendingQueueSemanticAggregateError::PipelineHandoffMismatch);
+        };
+        if !matches!(current.processing_state(), PendingProcessingState::Sealing(_)) {
+            let recovered = self
+                .recover_handoff_from_pipeline::<Hash>(pipeline_store, assignment)
+                .await?;
+            if recovered.aggregate_slot != receipt.aggregate.slot()
+                || recovered.aggregate_digest != receipt.aggregate.digest()
+            {
+                return Err(PendingQueueSemanticAggregateError::PipelineHandoffMismatch);
+            }
+            return Ok(recovered);
+        }
+        let transition = receipt.aggregate.seal_pipeline_handoff(&current, assignment)?;
+        let expected_candidate = transition.candidate().clone();
+        let outcome = pipeline_store.apply(&transition).await
+            .map_err(|error| PendingQueueSemanticAggregateError::Pipeline(error.to_string()))?;
+        let observed = match outcome {
+            PendingPipelineWriteOutcome::Applied(current)
+            | PendingPipelineWriteOutcome::Idempotent(current) => current,
+            PendingPipelineWriteOutcome::Conflict(_) => {
+                let recovered = self
+                    .recover_handoff_from_pipeline::<Hash>(pipeline_store, assignment)
+                    .await?;
+                if recovered.aggregate_slot != receipt.aggregate.slot()
+                    || recovered.aggregate_digest != receipt.aggregate.digest()
+                {
+                    return Err(PendingQueueSemanticAggregateError::PipelineHandoffConflict);
+                }
+                return Ok(recovered);
+            }
+        };
+        if observed != expected_candidate {
+            return Err(PendingQueueSemanticAggregateError::PipelineHandoffMismatch);
+        }
+        let exact_aggregate = self.read(receipt.aggregate.slot()).await?
+            .ok_or(PendingQueueSemanticAggregateError::ReceiptStale)?;
+        if exact_aggregate != receipt.aggregate {
+            return Err(PendingQueueSemanticAggregateError::ReceiptStale);
+        }
+        Ok(PersistedPendingQueueSemanticHandoffReceipt {
+            aggregate_store_fingerprint: self.fingerprint,
+            aggregate_slot: exact_aggregate.slot(),
+            aggregate_digest: exact_aggregate.digest(),
+            pipeline_revision: observed.revision(),
+            pipeline_state: observed.processing_state(),
+        })
+    }
+
+    /// Recover an exact handoff after the pipeline CAS committed but the
+    /// process died before returning its receipt. The pipeline evidence is the
+    /// immutable aggregate row's point-read slot, so recovery needs no scan and
+    /// does not try to recreate the stale `Sealing` receipt.
+    pub(super) async fn recover_handoff_from_pipeline<Hash: Q256BitHash>(
+        &self,
+        pipeline_store: &ScyllaPendingPipelineStore,
+        assignment: &PendingQueueSegmentAssignmentReceipt,
+    ) -> Result<PersistedPendingQueueSemanticHandoffReceipt, PendingQueueSemanticAggregateError> {
+        let context = assignment.assignment().context();
+        let PendingPipelineReadState::Current(current) =
+            pipeline_store.read::<Hash>(context.key()).await
+                .map_err(|error| PendingQueueSemanticAggregateError::Pipeline(error.to_string()))?
+        else {
+            return Err(PendingQueueSemanticAggregateError::PipelineHandoffMismatch);
+        };
+        if current.key() != context.key()
+            || current.activation_digest() != context.activation()
+            || current.processing() != context.processing()
+            || current.blocked_reason().is_some()
+        {
+            return Err(PendingQueueSemanticAggregateError::PipelineHandoffMismatch);
+        }
+        let (slot, observed_work) = terminal_handoff_slot(current.processing_state())?;
+        let aggregate = self.read(slot).await?
+            .ok_or(PendingQueueSemanticAggregateError::ReceiptStale)?;
+        let first_handoff_revision = aggregate.pipeline_close_revision
+            .checked_add(1)
+            .ok_or(PendingQueueSemanticAggregateError::CounterOverflow)?;
+        if !aggregate.matches_assignment(assignment)
+            || aggregate.slot != slot
+            || aggregate.uses_work_handoff() != observed_work
+            || aggregate.pipeline_store_fingerprint
+                != *pipeline_store.fingerprint().as_bytes()
+            || current.revision().get() != first_handoff_revision
+        {
+            return Err(PendingQueueSemanticAggregateError::PipelineHandoffMismatch);
+        }
+        Ok(PersistedPendingQueueSemanticHandoffReceipt {
+            aggregate_store_fingerprint: self.fingerprint,
+            aggregate_slot: aggregate.slot(),
+            aggregate_digest: aggregate.digest(),
+            pipeline_revision: current.revision(),
+            pipeline_state: current.processing_state(),
+        })
+    }
+}
+
+fn terminal_handoff_slot(
+    state: PendingProcessingState,
+) -> Result<(PendingQueueSemanticGenerationSlot, bool), PendingQueueSemanticAggregateError> {
+    let (bytes, work) = match state {
+        PendingProcessingState::WorkCaptured(capture) => (*capture.as_bytes(), true),
+        PendingProcessingState::EmptyQueueSealed(seal) => (*seal.as_bytes(), false),
+        _ => return Err(PendingQueueSemanticAggregateError::PipelineHandoffMismatch),
+    };
+    Ok((PendingQueueSemanticGenerationSlot::try_new(bytes)?, work))
 }
 
 fn store_fingerprint(
@@ -710,6 +1063,9 @@ pub(super) enum PendingQueueSemanticAggregateError {
     CandidateBindingMismatch,
     ReceiptBindingMismatch,
     ReceiptStale,
+    PipelineHandoffMismatch,
+    PipelineHandoffConflict,
+    AssignmentPayloadMismatch,
     CounterOverflow,
     DigestMismatch,
     TrailingBytes,
@@ -750,121 +1106,355 @@ impl<'a> Decoder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use psy_node_core::{
+        queue::recoverable_ephemeral::PendingQueueCaptureContext,
+        store::pending_generation_identity::{
+            PendingGenerationActivationDigest, PendingGenerationContext,
+            PendingGenerationLedgerKey,
+        },
+        store::pending_generation_pipeline::PendingPipelineIntentDigest,
+    };
+    use psy_node_nats::{
+        recoverable_assignment::{
+            PendingQueueSegmentLedgerBootstrap, PendingQueueSegmentReservationPlan,
+        },
+        recoverable_publish::{
+            PendingQueueGenerationBudgetContract, PendingQueueSourceQuota,
+        },
+        recoverable_segment::{
+            RecoverableNatsRetentionContract, RecoverableNatsSegmentId,
+            RecoverableNatsStreamSegment,
+        },
+    };
 
     fn binding(authority: AuthorityScope) -> SemanticGenerationBinding {
+        let key = PendingGenerationLedgerKey::new(
+            NetworkId::try_from_chain_id(1337).unwrap(),
+            authority,
+        );
+        let context = PendingQueueCaptureContext::try_new(
+            key,
+            PendingGenerationActivationDigest::try_new([0xa5; 32]).unwrap(),
+            PendingGenerationContext::try_from_legacy(7, 99).unwrap(),
+        )
+        .unwrap();
+        let retention = RecoverableNatsRetentionContract::try_new(
+            3,
+            1024 * 1024 * 1024,
+            128 * 1024 * 1024,
+            3,
+            16,
+        )
+        .unwrap();
+        let segment = RecoverableNatsStreamSegment::try_new(
+            "psy",
+            key,
+            RecoverableNatsSegmentId::try_new(1).unwrap(),
+            retention,
+        )
+        .unwrap();
+        let attested = segment
+            .validate_stream_config_structure(&segment.stream_config())
+            .unwrap();
+        let mib = 1024 * 1024_u64;
+        let quotas = match authority {
+            AuthorityScope::Coordinator => vec![
+                PendingQueueSourceQuota::try_new(
+                    PendingQueuePublisherKind::CoordinatorRegistration,
+                    10,
+                    15 * mib,
+                    mib,
+                )
+                .unwrap(),
+                PendingQueueSourceQuota::try_new(
+                    PendingQueuePublisherKind::CoordinatorDeploy,
+                    10,
+                    47 * mib,
+                    mib,
+                )
+                .unwrap(),
+                PendingQueueSourceQuota::try_new(
+                    PendingQueuePublisherKind::CoordinatorGuta,
+                    10,
+                    63 * mib,
+                    mib,
+                )
+                .unwrap(),
+            ],
+            AuthorityScope::Realm { .. } => vec![PendingQueueSourceQuota::try_new(
+                PendingQueuePublisherKind::RealmUserUpdate,
+                10,
+                127 * mib,
+                mib,
+            )
+            .unwrap()],
+        };
+        let budget = PendingQueueGenerationBudgetContract::try_new(
+            authority,
+            quotas,
+            128 * mib,
+        )
+        .unwrap();
+        let ledger = PendingQueueSegmentLedgerBootstrap::try_new(
+            key,
+            &attested,
+            budget,
+            8,
+        )
+        .unwrap();
+        let plan = ledger.candidate().reserve_generation(context).unwrap();
+        let PendingQueueSegmentReservationPlan::Advance { assignment, .. } = plan else {
+            unreachable!()
+        };
         SemanticGenerationBinding {
             network: NetworkId::try_from_chain_id(1337).unwrap(),
             authority,
-            context_digest: PendingQueueCaptureContextDigest::try_new([1; 32]).unwrap(),
-            assignment_digest: PendingQueueSegmentAssignmentDigest::try_new([2; 32]).unwrap(),
+            context_digest: context.digest(),
+            assignment_digest: assignment.digest(),
             close_intent: PendingQueueCloseIntentDigest::try_new([3; 32]).unwrap(),
+            pipeline_store_fingerprint: [7; 32],
+            pipeline_close_revision: 6,
             pipeline_close_receipt_digest: [4; 32],
             assignment_store_fingerprint: [5; 32],
-            assignment_ledger_slot: [6; 32],
-            assignment_ledger_revision: 7,
+            assignment_ledger_slot: *ledger.candidate().key().slot().as_bytes(),
+            assignment_ledger_revision: assignment.assigned_at_ledger_revision().get(),
+            assignment_payload: assignment.to_canonical_bytes(),
         }
     }
 
-    fn commitment(role: PendingQueuePublisherKind, index: u8) -> PendingQueueSemanticSourceCommitment {
+    fn commitment(
+        binding: &SemanticGenerationBinding,
+        role: PendingQueuePublisherKind,
+        index: u8,
+    ) -> PendingQueueSemanticSourceCommitment {
         PendingQueueSemanticSourceCommitment {
             publisher_kind: role,
-            context_digest: PendingQueueCaptureContextDigest::try_new([1; 32]).unwrap(),
-            assignment_digest: PendingQueueSegmentAssignmentDigest::try_new([2; 32]).unwrap(),
-            close_intent: PendingQueueCloseIntentDigest::try_new([3; 32]).unwrap(),
-            pipeline_close_receipt_digest: [4; 32],
+            context_digest: binding.context_digest,
+            assignment_digest: binding.assignment_digest,
+            close_intent: binding.close_intent,
+            pipeline_close_receipt_digest: binding.pipeline_close_receipt_digest,
             publish_store_fingerprint: [8; 32],
-            assignment_store_fingerprint: [5; 32],
-            assignment_ledger_slot: [6; 32],
-            assignment_ledger_revision: 7,
+            assignment_store_fingerprint: binding.assignment_store_fingerprint,
+            assignment_ledger_slot: binding.assignment_ledger_slot,
+            assignment_ledger_revision: binding.assignment_ledger_revision,
             artifact_store_fingerprint: [9; 32],
+            artifact_slot: [index + 20; 32],
+            artifact_owner_attempt_id: [index + 30; 32],
+            artifact_owner_fence: u64::from(index),
+            consumer_digest: [index + 40; 32],
             source_slot: PendingQueuePublishSourceSlot::try_new([index; 32]).unwrap(),
             semantic_digest: PendingQueueSemanticSourceDigest::try_new([index + 10; 32]).unwrap(),
             data_member_count: u32::from(index),
             data_encoded_bytes: u64::from(index) * 100,
+            source_revision: u64::from(index) + 50,
+            artifact_scan_revision: u64::from(index) + 60,
+            artifact_scan_digest: [index + 50; 32],
+            nats_scan_digest: [index + 60; 32],
         }
     }
 
-    fn coordinator_sources() -> Vec<PendingQueueSemanticSourceCommitment> {
+    fn coordinator_sources(
+        binding: &SemanticGenerationBinding,
+    ) -> Vec<PendingQueueSemanticSourceCommitment> {
         vec![
-            commitment(PendingQueuePublisherKind::CoordinatorGuta, 3),
-            commitment(PendingQueuePublisherKind::CoordinatorRegistration, 1),
-            commitment(PendingQueuePublisherKind::CoordinatorDeploy, 2),
+            commitment(binding, PendingQueuePublisherKind::CoordinatorGuta, 3),
+            commitment(binding, PendingQueuePublisherKind::CoordinatorRegistration, 1),
+            commitment(binding, PendingQueuePublisherKind::CoordinatorDeploy, 2),
         ]
     }
 
     #[test]
     fn fixed_three_and_one_source_sets_are_deterministic() {
+        let coordinator_binding = binding(AuthorityScope::Coordinator);
         let first = StoredPendingQueueSemanticGeneration::from_commitments(
-            binding(AuthorityScope::Coordinator), coordinator_sources(),
+            coordinator_binding.clone(),
+            coordinator_sources(&coordinator_binding),
         ).unwrap();
-        let mut reversed = coordinator_sources();
+        let mut reversed = coordinator_sources(&coordinator_binding);
         reversed.reverse();
         let second = StoredPendingQueueSemanticGeneration::from_commitments(
-            binding(AuthorityScope::Coordinator), reversed,
+            coordinator_binding,
+            reversed,
         ).unwrap();
         assert_eq!(first, second);
         assert!(first.has_work());
+        let realm_binding = binding(AuthorityScope::Realm { realm_id: 3, realm_sub_id: 0 });
         let realm = StoredPendingQueueSemanticGeneration::from_commitments(
-            binding(AuthorityScope::Realm { realm_id: 3, realm_sub_id: 0 }),
-            vec![commitment(PendingQueuePublisherKind::RealmUserUpdate, 1)],
+            realm_binding.clone(),
+            vec![commitment(&realm_binding, PendingQueuePublisherKind::RealmUserUpdate, 1)],
         ).unwrap();
         assert_eq!(realm.sources.len(), 1);
     }
 
     #[test]
+    fn pipeline_handoff_slot_is_point_readable_and_strictly_first_phase() {
+        let coordinator_binding = binding(AuthorityScope::Coordinator);
+        let mut coordinator_empty = coordinator_sources(&coordinator_binding);
+        for source in &mut coordinator_empty {
+            source.data_member_count = 0;
+            source.data_encoded_bytes = 0;
+        }
+        let coordinator = StoredPendingQueueSemanticGeneration::from_commitments(
+            coordinator_binding.clone(),
+            coordinator_empty,
+        )
+        .unwrap();
+        assert!(!coordinator.has_work());
+        assert!(coordinator.uses_work_handoff());
+        let work = PendingWorkCaptureDigest::try_new(*coordinator.slot().as_bytes()).unwrap();
+        assert_eq!(
+            terminal_handoff_slot(PendingProcessingState::WorkCaptured(work)).unwrap(),
+            (coordinator.slot(), true)
+        );
+
+        let realm_binding = binding(AuthorityScope::Realm {
+            realm_id: 3,
+            realm_sub_id: 0,
+        });
+        let mut realm_source = commitment(
+            &realm_binding,
+            PendingQueuePublisherKind::RealmUserUpdate,
+            1,
+        );
+        realm_source.data_member_count = 0;
+        realm_source.data_encoded_bytes = 0;
+        let realm = StoredPendingQueueSemanticGeneration::from_commitments(
+            realm_binding,
+            vec![realm_source],
+        )
+        .unwrap();
+        assert!(!realm.uses_work_handoff());
+        assert_ne!(coordinator.slot(), realm.slot());
+        let empty = PendingEmptyQueueSealDigest::try_new(*realm.slot().as_bytes()).unwrap();
+        assert_eq!(
+            terminal_handoff_slot(PendingProcessingState::EmptyQueueSealed(empty)).unwrap(),
+            (realm.slot(), false)
+        );
+        assert_eq!(
+            terminal_handoff_slot(PendingProcessingState::Sealing(
+                coordinator_binding.close_intent,
+            )),
+            Err(PendingQueueSemanticAggregateError::PipelineHandoffMismatch)
+        );
+        assert_eq!(
+            terminal_handoff_slot(PendingProcessingState::InFlight {
+                capture: work,
+                intent: PendingPipelineIntentDigest::try_new([91; 32]).unwrap(),
+            }),
+            Err(PendingQueueSemanticAggregateError::PipelineHandoffMismatch)
+        );
+    }
+
+    #[test]
+    fn archive_slot_is_assignment_only_and_second_close_conflicts() {
+        let first_binding = binding(AuthorityScope::Coordinator);
+        let first = StoredPendingQueueSemanticGeneration::from_commitments(
+            first_binding.clone(),
+            coordinator_sources(&first_binding),
+        )
+        .unwrap();
+        let mut second_binding = first_binding.clone();
+        second_binding.close_intent =
+            PendingQueueCloseIntentDigest::try_new([77; 32]).unwrap();
+        second_binding.pipeline_close_receipt_digest = [78; 32];
+        let second = StoredPendingQueueSemanticGeneration::from_commitments(
+            second_binding.clone(),
+            coordinator_sources(&second_binding),
+        )
+        .unwrap();
+
+        assert_eq!(first.slot(), second.slot());
+        assert_ne!(first.digest(), second.digest());
+        assert_ne!(first.to_persisted_bytes(), second.to_persisted_bytes());
+    }
+
+    #[test]
+    fn full_assignment_payload_is_required_and_bound_to_archive_identity() {
+        let valid = binding(AuthorityScope::Coordinator);
+        let mut malformed = valid.clone();
+        malformed.assignment_payload.pop();
+        assert_eq!(
+            StoredPendingQueueSemanticGeneration::from_commitments(
+                malformed.clone(),
+                coordinator_sources(&malformed),
+            ),
+            Err(PendingQueueSemanticAggregateError::AssignmentPayloadMismatch)
+        );
+
+        let aggregate = StoredPendingQueueSemanticGeneration::from_commitments(
+            valid.clone(),
+            coordinator_sources(&valid),
+        )
+        .unwrap();
+        let mut legacy_codec = aggregate.to_persisted_bytes();
+        legacy_codec[8..10].copy_from_slice(&1_u16.to_be_bytes());
+        assert_eq!(
+            StoredPendingQueueSemanticGeneration::decode_persisted(
+                aggregate.slot(),
+                REVISION as i64,
+                &legacy_codec,
+            ),
+            Err(PendingQueueSemanticAggregateError::UnknownCodecVersion)
+        );
+    }
+
+    #[test]
     fn missing_duplicate_extra_and_cross_generation_sources_fail_closed() {
-        let mut missing = coordinator_sources();
+        let binding = binding(AuthorityScope::Coordinator);
+        let mut missing = coordinator_sources(&binding);
         missing.pop();
         assert!(matches!(
-            StoredPendingQueueSemanticGeneration::from_commitments(binding(AuthorityScope::Coordinator), missing),
+            StoredPendingQueueSemanticGeneration::from_commitments(binding.clone(), missing),
             Err(PendingQueueSemanticAggregateError::IncompleteSourceSet)
         ));
         let duplicate = vec![
-            commitment(PendingQueuePublisherKind::CoordinatorRegistration, 1),
-            commitment(PendingQueuePublisherKind::CoordinatorRegistration, 2),
-            commitment(PendingQueuePublisherKind::CoordinatorGuta, 3),
+            commitment(&binding, PendingQueuePublisherKind::CoordinatorRegistration, 1),
+            commitment(&binding, PendingQueuePublisherKind::CoordinatorRegistration, 2),
+            commitment(&binding, PendingQueuePublisherKind::CoordinatorGuta, 3),
         ];
         assert!(matches!(
-            StoredPendingQueueSemanticGeneration::from_commitments(binding(AuthorityScope::Coordinator), duplicate),
+            StoredPendingQueueSemanticGeneration::from_commitments(binding.clone(), duplicate),
             Err(PendingQueueSemanticAggregateError::SourceSetMismatch)
         ));
-        let mut extra = coordinator_sources();
+        let mut extra = coordinator_sources(&binding);
         extra.push(commitment(
+            &binding,
             PendingQueuePublisherKind::RealmUserUpdate,
             4,
         ));
         assert!(matches!(
             StoredPendingQueueSemanticGeneration::from_commitments(
-                binding(AuthorityScope::Coordinator),
+                binding.clone(),
                 extra
             ),
             Err(PendingQueueSemanticAggregateError::IncompleteSourceSet)
         ));
-        let mut wrong = coordinator_sources();
+        let mut wrong = coordinator_sources(&binding);
         wrong[0].pipeline_close_receipt_digest = [9; 32];
         assert!(matches!(
-            StoredPendingQueueSemanticGeneration::from_commitments(binding(AuthorityScope::Coordinator), wrong),
+            StoredPendingQueueSemanticGeneration::from_commitments(binding, wrong),
             Err(PendingQueueSemanticAggregateError::GenerationMismatch)
         ));
     }
 
     #[test]
     fn cross_store_source_receipts_fail_closed() {
-        let mut wrong_publish_store = coordinator_sources();
+        let binding = binding(AuthorityScope::Coordinator);
+        let mut wrong_publish_store = coordinator_sources(&binding);
         wrong_publish_store[1].publish_store_fingerprint = [88; 32];
         assert!(matches!(
             StoredPendingQueueSemanticGeneration::from_commitments(
-                binding(AuthorityScope::Coordinator),
+                binding.clone(),
                 wrong_publish_store,
             ),
             Err(PendingQueueSemanticAggregateError::GenerationMismatch)
         ));
 
-        let mut wrong_artifact_store = coordinator_sources();
+        let mut wrong_artifact_store = coordinator_sources(&binding);
         wrong_artifact_store[2].artifact_store_fingerprint = [99; 32];
         assert!(matches!(
             StoredPendingQueueSemanticGeneration::from_commitments(
-                binding(AuthorityScope::Coordinator),
+                binding,
                 wrong_artifact_store,
             ),
             Err(PendingQueueSemanticAggregateError::GenerationMismatch)
@@ -873,8 +1463,10 @@ mod tests {
 
     #[test]
     fn codec_round_trip_tamper_and_trailing_bytes_fail_closed() {
+        let binding = binding(AuthorityScope::Coordinator);
         let aggregate = StoredPendingQueueSemanticGeneration::from_commitments(
-            binding(AuthorityScope::Coordinator), coordinator_sources(),
+            binding.clone(),
+            coordinator_sources(&binding),
         ).unwrap();
         let bytes = aggregate.to_persisted_bytes();
         assert_eq!(
