@@ -11,13 +11,16 @@ use std::{collections::BTreeSet, error::Error, fmt, sync::Arc};
 
 use parth_core::protocol::core_types::Q256BitHash;
 use psy_node_nats::{
+    queue::NatsJetStreamClient,
     recoverable_assignment::{
         PendingQueueGenerationSegmentAssignment, PendingQueueSegmentAssignmentDigest,
         PendingQueueSegmentLedgerRevision, PendingQueueSegmentLedgerSlot,
     },
     recoverable_segment::{
         LiveRecoverableNatsStreamInstance, RecoverableNatsSegmentContractDigest,
-        RecoverableNatsSegmentId, RecoverableNatsStreamStateSnapshot,
+        RecoverableNatsSegmentId, RecoverableNatsStreamSegment,
+        RecoverableNatsStreamStateSnapshot,
+        SealedRecoverableNatsStreamInstance,
     },
     recoverable_terminal::{
         PendingQueueNatsWholeStreamManifestDigest, PendingQueueTerminalError,
@@ -52,6 +55,7 @@ pub(super) const PENDING_QUEUE_SEGMENT_LIFECYCLE_TABLE: &str =
 const MAGIC: &[u8; 8] = b"PSYQSLIF";
 const CODEC_VERSION: u16 = 1;
 const SEAL_REQUESTED_REVISION: u64 = 1;
+const STREAM_SEALED_REVISION: u64 = 2;
 const SLOT_DOMAIN: &[u8] = b"psy/rollback/pending-queue-segment-lifecycle-slot/v1";
 const DIGEST_DOMAIN: &[u8] = b"psy/rollback/pending-queue-segment-lifecycle/v1";
 const STORE_FINGERPRINT_DOMAIN: &[u8] =
@@ -63,13 +67,22 @@ const MAX_ASSIGNMENTS: usize = 4096;
 #[repr(u8)]
 enum PendingQueueSegmentLifecyclePhase {
     SealRequested = 1,
+    StreamSealed = 2,
 }
 
 impl PendingQueueSegmentLifecyclePhase {
     fn try_from_byte(value: u8) -> Result<Self, PendingQueueSegmentLifecycleError> {
         match value {
             1 => Ok(Self::SealRequested),
+            2 => Ok(Self::StreamSealed),
             _ => Err(PendingQueueSegmentLifecycleError::UnknownPhase),
+        }
+    }
+
+    const fn revision(self) -> u64 {
+        match self {
+            Self::SealRequested => SEAL_REQUESTED_REVISION,
+            Self::StreamSealed => STREAM_SEALED_REVISION,
         }
     }
 }
@@ -240,6 +253,33 @@ impl StoredPendingQueueSegmentSealRequest {
             && self.live_state == live.state()
     }
 
+    fn matches_sealed_instance(
+        &self,
+        sealed: &SealedRecoverableNatsStreamInstance,
+    ) -> bool {
+        self.segment_id == sealed.segment().segment_id()
+            && self.contract_digest == sealed.segment().digest()
+            && self.stream_instance_id == *sealed.instance_id().as_bytes()
+            && self.live_state == sealed.state()
+    }
+
+    fn to_stream_sealed(
+        &self,
+        sealed: &SealedRecoverableNatsStreamInstance,
+    ) -> Result<Self, PendingQueueSegmentLifecycleError> {
+        if self.phase != PendingQueueSegmentLifecyclePhase::SealRequested
+            || self.revision != SEAL_REQUESTED_REVISION
+            || !self.matches_sealed_instance(sealed)
+        {
+            return Err(PendingQueueSegmentLifecycleError::EvidenceChanged);
+        }
+        let mut candidate = self.clone();
+        candidate.phase = PendingQueueSegmentLifecyclePhase::StreamSealed;
+        candidate.revision = STREAM_SEALED_REVISION;
+        candidate.digest = lifecycle_digest(&candidate.encode_unsigned())?;
+        Ok(candidate)
+    }
+
     fn encode_unsigned(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(512 + self.terminals.len() * 512);
         out.extend_from_slice(MAGIC);
@@ -294,9 +334,8 @@ impl StoredPendingQueueSegmentSealRequest {
         let revision = decoder.u64()?;
         let phase = PendingQueueSegmentLifecyclePhase::try_from_byte(decoder.u8()?)?;
         if slot != selected_slot
-            || revision != SEAL_REQUESTED_REVISION
-            || selected_revision != SEAL_REQUESTED_REVISION as i64
-            || phase != PendingQueueSegmentLifecyclePhase::SealRequested
+            || i64::try_from(revision).ok() != Some(selected_revision)
+            || phase.revision() != revision
         {
             return Err(PendingQueueSegmentLifecycleError::SelectedIdentityMismatch);
         }
@@ -438,6 +477,7 @@ struct PendingQueueSegmentLifecycleQueries {
     create: String,
     read: String,
     bootstrap: String,
+    compare_and_set: String,
 }
 
 impl PendingQueueSegmentLifecycleQueries {
@@ -453,13 +493,16 @@ impl PendingQueueSegmentLifecycleQueries {
             bootstrap: format!(
                 "INSERT INTO {table} (lifecycle_slot, revision, lifecycle_payload) VALUES (?, ?, ?) IF NOT EXISTS"
             ),
+            compare_and_set: format!(
+                "UPDATE {table} SET revision = ?, lifecycle_payload = ? WHERE lifecycle_slot = ? IF revision = ? AND lifecycle_payload = ?"
+            ),
         }
     }
 
     fn golden(&self) -> String {
         format!(
-            "create\n{}\n\nread\n{}\nBLOB\n\nbootstrap\n{}\nBLOB,BIGINT,BLOB\n",
-            self.create, self.read, self.bootstrap,
+            "create\n{}\n\nread\n{}\nBLOB\n\nbootstrap\n{}\nBLOB,BIGINT,BLOB\n\ncompare_and_set\n{}\nBIGINT,BLOB,BLOB,BIGINT,BLOB\n",
+            self.create, self.read, self.bootstrap, self.compare_and_set,
         )
     }
 }
@@ -467,10 +510,86 @@ impl PendingQueueSegmentLifecycleQueries {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PendingQueueSegmentLifecycleStoreFingerprint([u8; 32]);
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingQueueSegmentLifecycleCasBinding {
+    candidate_revision: i64,
+    candidate_payload: Vec<u8>,
+    lifecycle_slot: [u8; 32],
+    expected_revision: i64,
+    expected_payload: Vec<u8>,
+}
+
+impl PendingQueueSegmentLifecycleCasBinding {
+    fn try_new(
+        expected: &StoredPendingQueueSegmentSealRequest,
+        candidate: &StoredPendingQueueSegmentSealRequest,
+    ) -> Result<Self, PendingQueueSegmentLifecycleError> {
+        if expected.slot != candidate.slot
+            || expected.phase != PendingQueueSegmentLifecyclePhase::SealRequested
+            || candidate.phase != PendingQueueSegmentLifecyclePhase::StreamSealed
+            || expected.revision != SEAL_REQUESTED_REVISION
+            || candidate.revision != STREAM_SEALED_REVISION
+        {
+            return Err(PendingQueueSegmentLifecycleError::InvalidTransition);
+        }
+        Ok(Self {
+            candidate_revision: STREAM_SEALED_REVISION as i64,
+            candidate_payload: candidate.to_persisted_bytes(),
+            lifecycle_slot: *candidate.slot.as_bytes(),
+            expected_revision: SEAL_REQUESTED_REVISION as i64,
+            expected_payload: expected.to_persisted_bytes(),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingQueueSegmentLifecycleCasDisposition {
+    Applied,
+    Idempotent,
+}
+
+fn classify_lifecycle_cas(
+    applied: bool,
+    candidate: &StoredPendingQueueSegmentSealRequest,
+    current: &StoredPendingQueueSegmentSealRequest,
+) -> Result<PendingQueueSegmentLifecycleCasDisposition, PendingQueueSegmentLifecycleError> {
+    if current == candidate {
+        Ok(if applied {
+            PendingQueueSegmentLifecycleCasDisposition::Applied
+        } else {
+            PendingQueueSegmentLifecycleCasDisposition::Idempotent
+        })
+    } else if applied {
+        Err(PendingQueueSegmentLifecycleError::AppliedStateMismatch)
+    } else {
+        Err(PendingQueueSegmentLifecycleError::Conflict)
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct PersistedPendingQueueSealRequestedReceipt {
     store_fingerprint: PendingQueueSegmentLifecycleStoreFingerprint,
     current: StoredPendingQueueSegmentSealRequest,
+}
+
+#[derive(Debug)]
+pub(super) struct PersistedPendingQueueStreamSealedReceipt {
+    store_fingerprint: PendingQueueSegmentLifecycleStoreFingerprint,
+    current: StoredPendingQueueSegmentSealRequest,
+}
+
+impl PersistedPendingQueueStreamSealedReceipt {
+    pub(super) fn matches_sealed_instance(
+        &self,
+        sealed: &SealedRecoverableNatsStreamInstance,
+    ) -> bool {
+        self.current.phase == PendingQueueSegmentLifecyclePhase::StreamSealed
+            && self.current.matches_sealed_instance(sealed)
+    }
+
+    pub(super) const fn manifest_digest(&self) -> PendingQueueNatsWholeStreamManifestDigest {
+        self.current.manifest_digest
+    }
 }
 
 impl PersistedPendingQueueSealRequestedReceipt {
@@ -488,6 +607,7 @@ pub(super) struct ScyllaPendingQueueSegmentLifecycleStore {
     fingerprint: PendingQueueSegmentLifecycleStoreFingerprint,
     read: PreparedStatement,
     bootstrap: PreparedStatement,
+    compare_and_set: PreparedStatement,
 }
 
 impl ScyllaPendingQueueSegmentLifecycleStore {
@@ -510,6 +630,7 @@ impl ScyllaPendingQueueSegmentLifecycleStore {
             fingerprint: store_fingerprint(&keyspace, &queries),
             read: prepare_read(&session, &queries.read).await?,
             bootstrap: prepare_lwt(&session, &queries.bootstrap).await?,
+            compare_and_set: prepare_lwt(&session, &queries.compare_and_set).await?,
             session,
         })
     }
@@ -537,6 +658,57 @@ impl ScyllaPendingQueueSegmentLifecycleStore {
                 .as_deref()
                 .ok_or(PendingQueueSegmentLifecycleError::MissingColumn)?,
         )?))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn revalidate_seal_evidence<Hash: Q256BitHash>(
+        &self,
+        ledger_store: &ScyllaPendingQueueSegmentLedgerStore,
+        terminal_store: &ScyllaPendingQueueGenerationTerminalStore,
+        archive_store: &ScyllaPendingQueueSemanticAggregateStore,
+        pipeline_store: &ScyllaPendingPipelineStore,
+        writer_store: &ScyllaBranchExactWriterLifecycleStore,
+        head_store: &ScyllaAuthorityLocalHeadStore,
+        closure: &PendingQueueSegmentClosureSnapshot,
+        expected: &StoredPendingQueueSegmentSealRequest,
+    ) -> Result<(), PendingQueueSegmentLifecycleError> {
+        if expected.ledger_store_fingerprint != closure.store_fingerprint()
+            || expected.ledger_slot != closure.ledger_slot()
+            || expected.ledger_revision != closure.ledger_revision()
+            || expected.ledger_payload_digest != closure.ledger_payload_digest()
+            || expected.segment_id != closure.segment_id()
+            || expected.contract_digest != closure.contract_digest()
+            || expected.terminals.len() != closure.assignments().len()
+            || expected
+                .terminals
+                .iter()
+                .zip(closure.assignments())
+                .any(|(terminal, assignment)| {
+                    terminal.assignment_payload != assignment.assignment().to_canonical_bytes()
+                })
+        {
+            return Err(PendingQueueSegmentLifecycleError::EvidenceChanged);
+        }
+        ledger_store.revalidate_segment_closure(closure).await?;
+        let current = observe_terminals::<Hash>(
+            terminal_store,
+            archive_store,
+            pipeline_store,
+            writer_store,
+            head_store,
+            closure,
+        )
+        .await?;
+        if expected.terminals.len() != current.len()
+            || expected
+                .terminals
+                .iter()
+                .zip(current)
+                .any(|(entry, commitment)| !entry.matches_commitment(commitment))
+        {
+            return Err(PendingQueueSegmentLifecycleError::EvidenceChanged);
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -629,6 +801,155 @@ impl ScyllaPendingQueueSegmentLifecycleStore {
             store_fingerprint: self.fingerprint,
             current,
         })
+    }
+
+    async fn advance_to_stream_sealed(
+        &self,
+        expected: &StoredPendingQueueSegmentSealRequest,
+        sealed: &SealedRecoverableNatsStreamInstance,
+    ) -> Result<PersistedPendingQueueStreamSealedReceipt, PendingQueueSegmentLifecycleError> {
+        if expected.phase != PendingQueueSegmentLifecyclePhase::SealRequested
+            || expected.revision != SEAL_REQUESTED_REVISION
+        {
+            return Err(PendingQueueSegmentLifecycleError::InvalidTransition);
+        }
+        let candidate = expected.to_stream_sealed(sealed)?;
+        let binding = PendingQueueSegmentLifecycleCasBinding::try_new(expected, &candidate)?;
+        let execution = self
+            .session
+            .execute_unpaged(
+                &self.compare_and_set,
+                (
+                    binding.candidate_revision,
+                    binding.candidate_payload.as_slice(),
+                    binding.lifecycle_slot.as_slice(),
+                    binding.expected_revision,
+                    binding.expected_payload.as_slice(),
+                ),
+            )
+            .await;
+        let applied = match execution {
+            Ok(result) => decode_applied(result)?,
+            Err(error) => match self.read(candidate.slot).await {
+                Ok(Some(current)) if current == candidate => false,
+                Ok(_) => {
+                    return Err(PendingQueueSegmentLifecycleError::Indeterminate(
+                        error.to_string(),
+                    ))
+                }
+                Err(read) => {
+                    return Err(PendingQueueSegmentLifecycleError::Indeterminate(format!(
+                        "execute={error}; read={read}",
+                    )))
+                }
+            },
+        };
+        let current = self
+            .read(candidate.slot)
+            .await?
+            .ok_or(PendingQueueSegmentLifecycleError::MissingAfterLwt)?;
+        classify_lifecycle_cas(applied, &candidate, &current)?;
+        Ok(PersistedPendingQueueStreamSealedReceipt {
+            store_fingerprint: self.fingerprint,
+            current,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn seal_requested_stream<Hash: Q256BitHash>(
+        &self,
+        nats: &NatsJetStreamClient,
+        ledger_store: &ScyllaPendingQueueSegmentLedgerStore,
+        terminal_store: &ScyllaPendingQueueGenerationTerminalStore,
+        archive_store: &ScyllaPendingQueueSemanticAggregateStore,
+        pipeline_store: &ScyllaPendingPipelineStore,
+        writer_store: &ScyllaBranchExactWriterLifecycleStore,
+        head_store: &ScyllaAuthorityLocalHeadStore,
+        closure: &PendingQueueSegmentClosureSnapshot,
+        receipt: &PersistedPendingQueueSealRequestedReceipt,
+        segment: RecoverableNatsStreamSegment,
+    ) -> Result<PersistedPendingQueueStreamSealedReceipt, PendingQueueSegmentLifecycleError> {
+        if receipt.store_fingerprint != self.fingerprint
+            || segment.segment_id() != receipt.current.segment_id
+            || segment.digest() != receipt.current.contract_digest
+        {
+            return Err(PendingQueueSegmentLifecycleError::ReceiptStoreMismatch);
+        }
+        let durable = self
+            .read(receipt.current.slot)
+            .await?
+            .ok_or(PendingQueueSegmentLifecycleError::MissingAfterLwt)?;
+        if durable != receipt.current
+            && durable.phase != PendingQueueSegmentLifecyclePhase::StreamSealed
+        {
+            return Err(PendingQueueSegmentLifecycleError::Conflict);
+        }
+        self.revalidate_seal_evidence::<Hash>(
+            ledger_store,
+            terminal_store,
+            archive_store,
+            pipeline_store,
+            writer_store,
+            head_store,
+            closure,
+            &receipt.current,
+        )
+        .await?;
+
+        let sealed = match nats
+            .observe_recoverable_segment_instance(segment.clone())
+            .await
+        {
+            Ok(live) => {
+                if !receipt.matches_live_instance(&live) {
+                    return Err(PendingQueueSegmentLifecycleError::EvidenceChanged);
+                }
+                nats.seal_recoverable_segment_instance(&live)
+                    .await
+                    .map_err(transport)?
+                    .sealed()
+                    .clone()
+            }
+            Err(live_error) => nats
+                .observe_recoverable_sealed_segment_instance(segment)
+                .await
+                .map_err(|sealed_error| {
+                    PendingQueueSegmentLifecycleError::Transport(format!(
+                        "live={live_error}; sealed={sealed_error}",
+                    ))
+                })?,
+        };
+        if !receipt.current.matches_sealed_instance(&sealed) {
+            return Err(PendingQueueSegmentLifecycleError::EvidenceChanged);
+        }
+        self.revalidate_seal_evidence::<Hash>(
+            ledger_store,
+            terminal_store,
+            archive_store,
+            pipeline_store,
+            writer_store,
+            head_store,
+            closure,
+            &receipt.current,
+        )
+        .await?;
+
+        let candidate = receipt.current.to_stream_sealed(&sealed)?;
+        let result = if durable == candidate {
+            PersistedPendingQueueStreamSealedReceipt {
+                store_fingerprint: self.fingerprint,
+                current: durable,
+            }
+        } else if durable == receipt.current {
+            self.advance_to_stream_sealed(&receipt.current, &sealed)
+                .await?
+        } else {
+            return Err(PendingQueueSegmentLifecycleError::Conflict);
+        };
+        if !result.matches_sealed_instance(&sealed) {
+            return Err(PendingQueueSegmentLifecycleError::AppliedStateMismatch);
+        }
+        Ok(result)
     }
 }
 
@@ -808,14 +1129,20 @@ fn terminal(error: PendingQueueTerminalError) -> PendingQueueSegmentLifecycleErr
     PendingQueueSegmentLifecycleError::Nats(error.to_string())
 }
 
+fn transport(error: impl fmt::Display) -> PendingQueueSegmentLifecycleError {
+    PendingQueueSegmentLifecycleError::Transport(error.to_string())
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub(super) enum PendingQueueSegmentLifecycleError {
     Cql(String),
     Nats(String),
+    Transport(String),
     Ledger(super::PendingQueueSegmentLedgerStoreError),
     Terminal(PendingQueueGenerationTerminalError),
     EmptyDigest,
     InvalidRevision,
+    InvalidTransition,
     InvalidSegment,
     InvalidMagic,
     UnknownCodecVersion,
@@ -838,6 +1165,7 @@ pub(super) enum PendingQueueSegmentLifecycleError {
     MissingAfterLwt,
     AppliedStateMismatch,
     Conflict,
+    ReceiptStoreMismatch,
     EvidenceChanged,
     Indeterminate(String),
 }
@@ -909,7 +1237,9 @@ mod tests {
         assert!(queries.create.contains("psy_h22_segment_lifecycle_nt."));
         assert!(queries.bootstrap.contains("IF NOT EXISTS"));
         assert_eq!(queries.read.matches("SELECT revision").count(), 1);
-        assert!(!queries.golden().contains("UPDATE "));
+        assert!(queries
+            .compare_and_set
+            .contains("IF revision = ? AND lifecycle_payload = ?"));
         assert!(!queries.golden().contains("DELETE "));
         let setup = include_str!("../psy_setup.rs");
         assert!(!setup.contains(PENDING_QUEUE_SEGMENT_LIFECYCLE_TABLE));
@@ -930,6 +1260,49 @@ mod tests {
             value,
         );
         assert_eq!(value.to_persisted_bytes(), bytes);
+
+        let mut stream_sealed = value.clone();
+        stream_sealed.revision = STREAM_SEALED_REVISION;
+        stream_sealed.phase = PendingQueueSegmentLifecyclePhase::StreamSealed;
+        stream_sealed.digest = lifecycle_digest(&stream_sealed.encode_unsigned()).unwrap();
+        let stream_sealed_bytes = stream_sealed.to_persisted_bytes();
+        let binding = PendingQueueSegmentLifecycleCasBinding::try_new(
+            &value,
+            &stream_sealed,
+        )
+        .unwrap();
+        assert_eq!(binding.candidate_revision, 2);
+        assert_eq!(binding.expected_revision, 1);
+        assert_eq!(binding.lifecycle_slot, *value.slot.as_bytes());
+        assert_eq!(binding.candidate_payload, stream_sealed_bytes);
+        assert_eq!(binding.expected_payload, bytes);
+        assert_eq!(
+            classify_lifecycle_cas(true, &stream_sealed, &stream_sealed).unwrap(),
+            PendingQueueSegmentLifecycleCasDisposition::Applied,
+        );
+        assert_eq!(
+            classify_lifecycle_cas(false, &stream_sealed, &stream_sealed).unwrap(),
+            PendingQueueSegmentLifecycleCasDisposition::Idempotent,
+        );
+        assert_eq!(
+            classify_lifecycle_cas(false, &stream_sealed, &value),
+            Err(PendingQueueSegmentLifecycleError::Conflict),
+        );
+        assert_eq!(
+            StoredPendingQueueSegmentSealRequest::decode_persisted(
+                stream_sealed.slot,
+                STREAM_SEALED_REVISION as i64,
+                &stream_sealed_bytes,
+            )
+            .unwrap(),
+            stream_sealed,
+        );
+        assert!(StoredPendingQueueSegmentSealRequest::decode_persisted(
+            value.slot,
+            SEAL_REQUESTED_REVISION as i64,
+            &stream_sealed_bytes,
+        )
+        .is_err());
 
         let mut recreated = value.clone();
         recreated.stream_instance_id = [6; 32];
