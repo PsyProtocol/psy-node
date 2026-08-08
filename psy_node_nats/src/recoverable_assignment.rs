@@ -27,8 +27,12 @@ use crate::recoverable_segment::{
     RecoverableNatsSegmentContractDigest, StructurallyValidatedRecoverableNatsSegment,
     RecoverableNatsSegmentId, RECOVERABLE_NATS_CAPACITY_HEADROOM_BYTES,
 };
+use crate::recoverable_publish::{
+    PendingQueueGenerationBudgetContract, PendingQueueGenerationBudgetDigest,
+    PendingQueueSourceQuota,
+};
 
-pub const PENDING_QUEUE_SEGMENT_LEDGER_CODEC_VERSION: u16 = 1;
+pub const PENDING_QUEUE_SEGMENT_LEDGER_CODEC_VERSION: u16 = 2;
 pub const MAX_PENDING_QUEUE_SEGMENT_LEDGER_BYTES: usize = 1024 * 1024;
 pub const MAX_GENERATIONS_PER_LIVE_SEGMENT: u32 = 4096;
 const LEDGER_SLOT_DOMAIN: &[u8] = b"psy/rollback/pending-queue-segment-ledger-slot/v1";
@@ -177,6 +181,8 @@ pub struct PendingQueueGenerationSegmentAssignment {
     contract_digest: RecoverableNatsSegmentContractDigest,
     reserved_bytes: i64,
     expected_source_count: u8,
+    budget_digest: PendingQueueGenerationBudgetDigest,
+    source_quotas: Vec<PendingQueueSourceQuota>,
     digest: PendingQueueSegmentAssignmentDigest,
 }
 
@@ -201,6 +207,14 @@ impl PendingQueueGenerationSegmentAssignment {
         self.expected_source_count
     }
 
+    pub const fn budget_digest(&self) -> PendingQueueGenerationBudgetDigest {
+        self.budget_digest
+    }
+
+    pub fn source_quotas(&self) -> &[PendingQueueSourceQuota] {
+        &self.source_quotas
+    }
+
     pub const fn digest(&self) -> PendingQueueSegmentAssignmentDigest {
         self.digest
     }
@@ -215,6 +229,7 @@ pub struct StoredPendingQueueSegmentLedger {
     max_live_segments: u16,
     max_generations_per_segment: u32,
     generation_admission_budget_bytes: i64,
+    generation_budget: PendingQueueGenerationBudgetContract,
     capacity_headroom_bytes: i64,
     live_segments: Vec<PendingQueueLiveSegment>,
     assignments: Vec<PendingQueueGenerationSegmentAssignment>,
@@ -239,6 +254,10 @@ impl StoredPendingQueueSegmentLedger {
 
     pub const fn generation_admission_budget_bytes(&self) -> i64 {
         self.generation_admission_budget_bytes
+    }
+
+    pub const fn generation_budget(&self) -> &PendingQueueGenerationBudgetContract {
+        &self.generation_budget
     }
 
     pub fn live_segments(&self) -> &[PendingQueueLiveSegment] {
@@ -305,12 +324,15 @@ impl StoredPendingQueueSegmentLedger {
             return Err(PendingQueueSegmentLedgerError::SegmentCapacityExceeded);
         }
         let expected_source_count = expected_source_count(self.key.generation_key.authority());
+        let source_quotas = self.generation_budget.sources().to_vec();
         let assignment = PendingQueueGenerationSegmentAssignment {
             context,
             segment_id: active.segment_id,
             contract_digest: active.contract_digest,
             reserved_bytes: self.generation_admission_budget_bytes,
             expected_source_count,
+            budget_digest: self.generation_budget.digest(),
+            source_quotas: source_quotas.clone(),
             digest: assignment_digest(
                 self.key.slot,
                 context,
@@ -318,6 +340,8 @@ impl StoredPendingQueueSegmentLedger {
                 active.contract_digest,
                 self.generation_admission_budget_bytes,
                 expected_source_count,
+                self.generation_budget.digest(),
+                &source_quotas,
             )?,
         };
         let mut candidate = self.clone();
@@ -348,6 +372,9 @@ impl StoredPendingQueueSegmentLedger {
         out.extend_from_slice(&self.max_live_segments.to_be_bytes());
         out.extend_from_slice(&self.max_generations_per_segment.to_be_bytes());
         out.extend_from_slice(&self.generation_admission_budget_bytes.to_be_bytes());
+        let budget = self.generation_budget.to_canonical_bytes();
+        out.extend_from_slice(&(budget.len() as u16).to_be_bytes());
+        out.extend_from_slice(&budget);
         out.extend_from_slice(&self.capacity_headroom_bytes.to_be_bytes());
         out.extend_from_slice(&(self.live_segments.len() as u16).to_be_bytes());
         for segment in &self.live_segments {
@@ -364,6 +391,11 @@ impl StoredPendingQueueSegmentLedger {
             out.extend_from_slice(assignment.contract_digest.as_bytes());
             out.extend_from_slice(&assignment.reserved_bytes.to_be_bytes());
             out.push(assignment.expected_source_count);
+            out.extend_from_slice(assignment.budget_digest.as_bytes());
+            out.push(assignment.source_quotas.len() as u8);
+            for quota in &assignment.source_quotas {
+                encode_quota(*quota, &mut out);
+            }
             out.extend_from_slice(assignment.digest.as_bytes());
         }
         out
@@ -403,6 +435,11 @@ impl StoredPendingQueueSegmentLedger {
         let max_live_segments = decoder.u16()?;
         let max_generations_per_segment = decoder.u32()?;
         let generation_admission_budget_bytes = decoder.i64()?;
+        let budget_len = decoder.u16()? as usize;
+        let generation_budget = PendingQueueGenerationBudgetContract::decode_canonical(
+            decoder.take(budget_len)?,
+        )
+        .map_err(|error| PendingQueueSegmentLedgerError::Budget(error.to_string()))?;
         let capacity_headroom_bytes = decoder.i64()?;
         let live_count = decoder.u16()? as usize;
         let mut live_segments = Vec::with_capacity(live_count);
@@ -423,14 +460,33 @@ impl StoredPendingQueueSegmentLedger {
         }
         let mut assignments = Vec::with_capacity(assignment_count);
         for _ in 0..assignment_count {
+            let context = decode_context(&mut decoder)?;
+            let segment_id = RecoverableNatsSegmentId::try_new(decoder.u64()?)?;
+            let contract_digest = RecoverableNatsSegmentContractDigest::try_new(
+                decoder.array32()?,
+            )?;
+            let reserved_bytes = decoder.i64()?;
+            let expected_source_count = decoder.u8()?;
+            let budget_digest = PendingQueueGenerationBudgetDigest::try_new(
+                decoder.array32()?,
+            )
+            .map_err(|error| PendingQueueSegmentLedgerError::Budget(error.to_string()))?;
+            let quota_count = decoder.u8()? as usize;
+            if quota_count == 0 || quota_count > 3 {
+                return Err(PendingQueueSegmentLedgerError::AssignmentMismatch);
+            }
+            let mut source_quotas = Vec::with_capacity(quota_count);
+            for _ in 0..quota_count {
+                source_quotas.push(decode_quota(&mut decoder)?);
+            }
             assignments.push(PendingQueueGenerationSegmentAssignment {
-                context: decode_context(&mut decoder)?,
-                segment_id: RecoverableNatsSegmentId::try_new(decoder.u64()?)?,
-                contract_digest: RecoverableNatsSegmentContractDigest::try_new(
-                    decoder.array32()?,
-                )?,
-                reserved_bytes: decoder.i64()?,
-                expected_source_count: decoder.u8()?,
+                context,
+                segment_id,
+                contract_digest,
+                reserved_bytes,
+                expected_source_count,
+                budget_digest,
+                source_quotas,
                 digest: PendingQueueSegmentAssignmentDigest::try_new(decoder.array32()?)?,
             });
         }
@@ -445,6 +501,7 @@ impl StoredPendingQueueSegmentLedger {
             max_live_segments,
             max_generations_per_segment,
             generation_admission_budget_bytes,
+            generation_budget,
             capacity_headroom_bytes,
             live_segments,
             assignments,
@@ -469,6 +526,13 @@ impl StoredPendingQueueSegmentLedger {
             || self.capacity_headroom_bytes <= 0
         {
             return Err(PendingQueueSegmentLedgerError::InvalidCapacityContract);
+        }
+        if self.generation_budget.authority() != self.key.generation_key.authority()
+            || i64::try_from(self.generation_budget.max_generation_stored_bytes())
+                .map_err(|_| PendingQueueSegmentLedgerError::InvalidCapacityContract)?
+                != self.generation_admission_budget_bytes
+        {
+            return Err(PendingQueueSegmentLedgerError::BudgetMismatch);
         }
         let active = self
             .live_segments
@@ -498,6 +562,8 @@ impl StoredPendingQueueSegmentLedger {
                 || assignment.reserved_bytes != self.generation_admission_budget_bytes
                 || assignment.expected_source_count
                     != expected_source_count(self.key.generation_key.authority())
+                || assignment.budget_digest != self.generation_budget.digest()
+                || assignment.source_quotas != self.generation_budget.sources()
                 || assignment.digest
                     != assignment_digest(
                         self.key.slot,
@@ -506,6 +572,8 @@ impl StoredPendingQueueSegmentLedger {
                         assignment.contract_digest,
                         assignment.reserved_bytes,
                         assignment.expected_source_count,
+                        assignment.budget_digest,
+                        &assignment.source_quotas,
                     )?
             {
                 return Err(PendingQueueSegmentLedgerError::AssignmentMismatch);
@@ -548,6 +616,7 @@ impl PendingQueueSegmentLedgerBootstrap {
     pub fn try_new(
         generation_key: PendingGenerationLedgerKey,
         validated_segment: &StructurallyValidatedRecoverableNatsSegment,
+        generation_budget: PendingQueueGenerationBudgetContract,
         max_generations_per_segment: u32,
     ) -> Result<Self, PendingQueueSegmentLedgerError> {
         let segment = validated_segment.segment();
@@ -561,6 +630,13 @@ impl PendingQueueSegmentLedgerBootstrap {
             return Err(PendingQueueSegmentLedgerError::InvalidCapacityContract);
         }
         let retention = segment.retention();
+        if generation_budget.authority() != generation_key.authority()
+            || i64::try_from(generation_budget.max_generation_stored_bytes())
+                .map_err(|_| PendingQueueSegmentLedgerError::InvalidCapacityContract)?
+                != retention.generation_admission_budget_bytes()
+        {
+            return Err(PendingQueueSegmentLedgerError::BudgetMismatch);
+        }
         let candidate = StoredPendingQueueSegmentLedger {
             key,
             revision: PendingQueueSegmentLedgerRevision::try_new(1)?,
@@ -570,6 +646,7 @@ impl PendingQueueSegmentLedgerBootstrap {
             max_generations_per_segment,
             generation_admission_budget_bytes: retention
                 .generation_admission_budget_bytes(),
+            generation_budget,
             capacity_headroom_bytes: RECOVERABLE_NATS_CAPACITY_HEADROOM_BYTES,
             live_segments: vec![PendingQueueLiveSegment {
                 segment_id: segment.segment_id(),
@@ -627,6 +704,8 @@ fn assignment_digest(
     contract_digest: RecoverableNatsSegmentContractDigest,
     reserved_bytes: i64,
     expected_source_count: u8,
+    budget_digest: PendingQueueGenerationBudgetDigest,
+    source_quotas: &[PendingQueueSourceQuota],
 ) -> Result<PendingQueueSegmentAssignmentDigest, PendingQueueSegmentLedgerError> {
     let mut hasher = Sha256::new();
     hasher.update(ASSIGNMENT_DOMAIN);
@@ -636,6 +715,13 @@ fn assignment_digest(
     hasher.update(contract_digest.as_bytes());
     hasher.update(reserved_bytes.to_be_bytes());
     hasher.update([expected_source_count]);
+    hasher.update(budget_digest.as_bytes());
+    hasher.update([source_quotas.len() as u8]);
+    for quota in source_quotas {
+        let mut encoded = Vec::with_capacity(21);
+        encode_quota(*quota, &mut encoded);
+        hasher.update(encoded);
+    }
     PendingQueueSegmentAssignmentDigest::try_new(hasher.finalize().into())
 }
 
@@ -644,6 +730,29 @@ fn expected_source_count(authority: AuthorityScope) -> u8 {
         AuthorityScope::Coordinator => 3,
         AuthorityScope::Realm { .. } => 1,
     }
+}
+
+fn encode_quota(quota: PendingQueueSourceQuota, out: &mut Vec<u8>) {
+    out.push(quota.publisher_kind() as u8);
+    out.extend_from_slice(&quota.max_data_members().to_be_bytes());
+    out.extend_from_slice(&quota.max_data_stored_bytes().to_be_bytes());
+    out.extend_from_slice(&quota.max_seal_stored_bytes().to_be_bytes());
+}
+
+fn decode_quota(
+    decoder: &mut Decoder<'_>,
+) -> Result<PendingQueueSourceQuota, PendingQueueSegmentLedgerError> {
+    let kind = crate::recoverable_publish::PendingQueuePublisherKind::try_from_u8(
+        decoder.u8()?,
+    )
+    .map_err(|error| PendingQueueSegmentLedgerError::Budget(error.to_string()))?;
+    PendingQueueSourceQuota::try_new(
+        kind,
+        decoder.u32()?,
+        decoder.u64()?,
+        decoder.u64()?,
+    )
+    .map_err(|error| PendingQueueSegmentLedgerError::Budget(error.to_string()))
 }
 
 fn validate_base_namespace(value: &str) -> Result<(), PendingQueueSegmentLedgerError> {
@@ -842,6 +951,8 @@ pub enum PendingQueueSegmentLedgerError {
     CapacityOverflow,
     CapacityAccountingMismatch,
     AssignmentMismatch,
+    BudgetMismatch,
+    Budget(String),
     InvalidMagic,
     UnknownCodecVersion(u16),
     PartitionSlotMismatch,
@@ -904,6 +1015,10 @@ mod tests {
     use async_nats::jetstream::stream::Config as StreamConfig;
 
     use super::*;
+    use crate::recoverable_publish::{
+        PendingQueueGenerationBudgetContract, PendingQueuePublisherKind,
+        PendingQueueSourceQuota,
+    };
     use crate::recoverable_segment::{
         RecoverableNatsRetentionContract, RecoverableNatsStreamSegment,
     };
@@ -933,8 +1048,54 @@ mod tests {
         let attested = segment
             .validate_stream_config_structure(&segment.stream_config())
             .unwrap();
-        PendingQueueSegmentLedgerBootstrap::try_new(key(authority), &attested, 8)
-            .unwrap()
+        let mib = 1024 * 1024_u64;
+        let sources = match authority {
+            AuthorityScope::Coordinator => vec![
+                PendingQueueSourceQuota::try_new(
+                    PendingQueuePublisherKind::CoordinatorRegistration,
+                    10_000,
+                    15 * mib,
+                    mib,
+                )
+                .unwrap(),
+                PendingQueueSourceQuota::try_new(
+                    PendingQueuePublisherKind::CoordinatorDeploy,
+                    10_000,
+                    47 * mib,
+                    mib,
+                )
+                .unwrap(),
+                PendingQueueSourceQuota::try_new(
+                    PendingQueuePublisherKind::CoordinatorGuta,
+                    10_000,
+                    63 * mib,
+                    mib,
+                )
+                .unwrap(),
+            ],
+            AuthorityScope::Realm { .. } => vec![
+                PendingQueueSourceQuota::try_new(
+                    PendingQueuePublisherKind::RealmUserUpdate,
+                    50_000,
+                    127 * mib,
+                    mib,
+                )
+                .unwrap(),
+            ],
+        };
+        let budget = PendingQueueGenerationBudgetContract::try_new(
+            authority,
+            sources,
+            128 * mib,
+        )
+        .unwrap();
+        PendingQueueSegmentLedgerBootstrap::try_new(
+            key(authority),
+            &attested,
+            budget,
+            8,
+        )
+        .unwrap()
     }
 
     fn context(authority: AuthorityScope, pending: u64) -> PendingQueueCaptureContext {
@@ -1007,9 +1168,9 @@ mod tests {
         assert_eq!(
             payload_digest,
             [
-                196, 46, 124, 198, 163, 26, 11, 72, 148, 131, 174, 218, 0, 68,
-                196, 253, 226, 110, 239, 175, 180, 24, 6, 26, 122, 249, 51,
-                145, 2, 60, 171, 235,
+                172, 88, 59, 120, 80, 224, 7, 169, 5, 109, 69, 130, 66, 239,
+                251, 113, 242, 133, 219, 94, 102, 188, 153, 45, 36, 78, 183,
+                80, 139, 167, 36, 181,
             ],
         );
         let decoded = StoredPendingQueueSegmentLedger::decode_persisted(

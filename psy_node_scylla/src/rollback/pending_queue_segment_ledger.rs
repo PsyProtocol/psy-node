@@ -612,6 +612,10 @@ mod tests {
     };
     use psy_node_nats::{
         recoverable_assignment::PendingQueueSegmentLedgerBootstrap,
+        recoverable_publish::{
+            PendingQueueGenerationBudgetContract, PendingQueuePublisherKind,
+            PendingQueueSourceQuota,
+        },
         recoverable_segment::{
             RecoverableNatsRetentionContract, RecoverableNatsSegmentId,
             RecoverableNatsStreamSegment,
@@ -642,7 +646,42 @@ mod tests {
         let attested = segment
             .validate_stream_config_structure(&segment.stream_config())
             .unwrap();
-        PendingQueueSegmentLedgerBootstrap::try_new(key, &attested, 8).unwrap()
+        let mib = 1024 * 1024_u64;
+        let budget = PendingQueueGenerationBudgetContract::try_new(
+            AuthorityScope::Coordinator,
+            vec![
+                PendingQueueSourceQuota::try_new(
+                    PendingQueuePublisherKind::CoordinatorRegistration,
+                    10_000,
+                    15 * mib,
+                    mib,
+                )
+                .unwrap(),
+                PendingQueueSourceQuota::try_new(
+                    PendingQueuePublisherKind::CoordinatorDeploy,
+                    10_000,
+                    47 * mib,
+                    mib,
+                )
+                .unwrap(),
+                PendingQueueSourceQuota::try_new(
+                    PendingQueuePublisherKind::CoordinatorGuta,
+                    10_000,
+                    63 * mib,
+                    mib,
+                )
+                .unwrap(),
+            ],
+            128 * mib,
+        )
+        .unwrap();
+        PendingQueueSegmentLedgerBootstrap::try_new(
+            key,
+            &attested,
+            budget,
+            8,
+        )
+        .unwrap()
     }
 
     fn context(pending: u64) -> PendingQueueCaptureContext {
