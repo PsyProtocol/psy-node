@@ -370,6 +370,31 @@ impl<Hash: Q256BitHash> ScyllaBranchExactWriterRuntime<Hash> {
             _ => return Err(BranchExactWriterRuntimeError::IntentMismatch),
         };
 
+        self.verify_prepared(prepared).await
+    }
+
+    /// Resume exactly the intent and timestamp already sealed in the durable
+    /// lifecycle row. Startup recovery must never sample a new clock or accept
+    /// a caller-supplied intent after `WritePrepared` is durable.
+    pub(crate) async fn resume_prepared(
+        &self,
+    ) -> Result<BranchExactPublishBarrier<Hash>, BranchExactWriterRuntimeError> {
+        let current = self.read_writer().await?;
+        match current.state() {
+            BranchExactWriterState::WritePrepared(_) => {
+                self.verify_prepared(current).await
+            }
+            BranchExactWriterState::WritesVerified(_) => {
+                self.barrier_from_verified(&current)
+            }
+            _ => Err(BranchExactWriterRuntimeError::LifecycleConflict),
+        }
+    }
+
+    async fn verify_prepared(
+        &self,
+        prepared: StoredBranchExactWriterLifecycle<Hash>,
+    ) -> Result<BranchExactPublishBarrier<Hash>, BranchExactWriterRuntimeError> {
         if matches!(prepared.state(), BranchExactWriterState::WritesVerified(_)) {
             return self.barrier_from_verified(&prepared);
         }
@@ -415,6 +440,19 @@ impl<Hash: Q256BitHash> ScyllaBranchExactWriterRuntime<Hash> {
         .await
         .map_err(executor)?;
         self.barrier_from_verified(&verified)
+    }
+
+    /// Finish only an already-verified writer whose exact candidate has been
+    /// independently published as the durable authority head. The barrier is
+    /// reconstructed from the current durable lifecycle row, never supplied
+    /// by startup configuration.
+    pub(crate) async fn finish_verified_after_published(
+        &self,
+        published: &CanonicalChainRef<Hash>,
+    ) -> Result<(), BranchExactWriterRuntimeError> {
+        let current = self.read_writer().await?;
+        let barrier = self.barrier_from_verified(&current)?;
+        self.finish_published(&barrier, published).await
     }
 
     /// Re-read the exact lifecycle row immediately before any compatibility
@@ -716,5 +754,31 @@ mod tests {
         assert!(finish.contains("require_matching_verified(barrier)"));
         assert!(!finish.contains("require_fresh_barrier(barrier)"));
         assert!(finish.contains("AuthorityIntentObservation::Completed"));
+    }
+
+    #[test]
+    fn startup_resume_uses_only_the_persisted_intent_and_timestamp() {
+        let source = include_str!("branch_exact_writer_runtime.rs");
+        let resume = source
+            .split("pub(crate) async fn resume_prepared")
+            .nth(1)
+            .unwrap()
+            .split("async fn verify_prepared")
+            .next()
+            .unwrap();
+        assert!(resume.contains("self.read_writer().await?"));
+        assert!(resume.contains("self.verify_prepared(current).await"));
+        assert!(!resume.contains("AuthorityClockSampleUs"));
+        assert!(!resume.contains("BranchExactDualWriteIntent<Hash>"));
+
+        let verify = source
+            .split("async fn verify_prepared")
+            .nth(1)
+            .unwrap()
+            .split("finish_verified_after_published")
+            .next()
+            .unwrap();
+        assert!(verify.contains("reconcile_timestamp_reservation"));
+        assert!(verify.contains("ScyllaBranchExactDualWriteExecutor::run"));
     }
 }

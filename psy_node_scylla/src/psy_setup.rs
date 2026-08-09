@@ -527,8 +527,15 @@ where
         )
         .await?;
 
-    let expectation = lineage.seal_attempt(fresh_startup_nonce());
-    let expectation = expectation?;
+    let recovery_expectation = lineage.seal_attempt(fresh_startup_nonce())?;
+    db.store
+        .recover_realm_processor_startup(recovery_expectation)
+        .await?;
+    // Recovery admission is never serving authority. A distinct, freshly
+    // sampled nonce seals the full post-recovery preflight/run attempt.
+    let expectation = lineage.seal_attempt(fresh_startup_nonce_excluding(
+        recovery_expectation.startup_nonce(),
+    ))?;
     let provider = db
         .store
         .prepare_realm_processor_startup_preflight(expectation)
@@ -547,6 +554,15 @@ fn fresh_startup_nonce() -> [u8; 32] {
         let mut nonce = [0; 32];
         OsRng.fill_bytes(&mut nonce);
         if nonce != [0; 32] {
+            return nonce;
+        }
+    }
+}
+
+fn fresh_startup_nonce_excluding(excluded: [u8; 32]) -> [u8; 32] {
+    loop {
+        let nonce = fresh_startup_nonce();
+        if nonce != excluded {
             return nonce;
         }
     }
@@ -590,6 +606,16 @@ mod realm_startup_composition_tests {
                 < factory.find("backfill_receipt().clone()").unwrap()
         );
         assert!(factory.contains("fresh_startup_nonce()"));
+        let recovery = factory
+            .find("recover_realm_processor_startup(recovery_expectation)")
+            .unwrap();
+        let fresh_run = factory
+            .find("fresh_startup_nonce_excluding")
+            .unwrap();
+        let final_preflight = factory
+            .find("prepare_realm_processor_startup_preflight(expectation)")
+            .unwrap();
+        assert!(recovery < fresh_run && fresh_run < final_preflight);
         assert!(!factory.contains("startup_nonce:"));
     }
 
@@ -600,5 +626,8 @@ mod realm_startup_composition_tests {
         assert_ne!(first, [0; 32]);
         assert_ne!(second, [0; 32]);
         assert_ne!(first, second);
+        let third = fresh_startup_nonce_excluding(first);
+        assert_ne!(third, [0; 32]);
+        assert_ne!(third, first);
     }
 }

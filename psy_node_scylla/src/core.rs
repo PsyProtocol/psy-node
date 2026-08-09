@@ -306,8 +306,41 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
         Hash: Q256BitHash + Send + Sync + 'static,
         Hasher: Send + Sync + 'static,
     {
+        let provider = self
+            .prepare_realm_processor_startup_provider(expectation)
+            .await?;
+        Ok(Arc::new(provider))
+    }
+
+    /// Execute only the deterministic Scylla recovery subset before a fresh
+    /// run attempt is sealed. This method never returns a startup provider or
+    /// run permit, so recovery evidence cannot be reused as serving authority.
+    pub(crate) async fn recover_realm_processor_startup(
+        &self,
+        recovery_expectation: RealmProcessorStartupExpectation,
+    ) -> Result<(), RealmProcessorStartupError>
+    where
+        Hash: Q256BitHash + Send + Sync + 'static,
+        Hasher: Send + Sync + 'static,
+    {
+        self.prepare_realm_processor_startup_provider(recovery_expectation)
+            .await?
+            .recover_isolated(recovery_expectation)
+            .await
+    }
+
+    async fn prepare_realm_processor_startup_provider(
+        &self,
+        expectation: RealmProcessorStartupExpectation,
+    ) -> Result<ScyllaRealmProcessorStartupPreflightProvider<Hash>, RealmProcessorStartupError>
+    where
+        Hash: Q256BitHash + Send + Sync + 'static,
+        Hasher: Send + Sync + 'static,
+    {
         let setup_ready = self
-            .branch_exact_schema_setup_view()
+            .branch_exact_schema_ready
+            .get()
+            .cloned()
             .ok_or_else(|| {
                 RealmProcessorStartupError::DurableEvidenceNotVerified(
                     "branch-exact schema setup capability is disabled".to_owned(),
@@ -316,10 +349,10 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
         let authority = require_realm_startup_factory_identity(
             self.realm_id,
             self.realm_sub_id,
-            setup_ready.authority(),
+            setup_ready.view().authority(),
             expectation,
         )?;
-        let provider = ScyllaRealmProcessorStartupPreflightProvider::<Hash>::prepare(
+        ScyllaRealmProcessorStartupPreflightProvider::<Hash>::prepare(
             self.session.clone(),
             &self.keyspace,
             &self.no_tablet_keyspace,
@@ -327,8 +360,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
             authority,
             setup_ready,
         )
-        .await?;
-        Ok(Arc::new(provider))
+        .await
     }
 
     fn coordinator_canonical_head(&self) -> anyhow::Result<&ScyllaCanonicalHeadStore> {
@@ -532,11 +564,17 @@ mod branch_exact_startup_factory_tests {
             .unwrap();
         assert!(factory.contains("Arc<dyn RealmProcessorStartupPreflightProvider>"));
         assert!(!factory.contains("Arc<Session>"));
-        assert!(factory.contains("branch_exact_schema_setup_view"));
+        assert!(factory.contains("branch_exact_schema_ready"));
+        assert!(factory.contains("recover_realm_processor_startup"));
+        assert!(factory.contains("recover_isolated(recovery_expectation)"));
+        let provider_helper = factory
+            .split("async fn prepare_realm_processor_startup_provider")
+            .nth(1)
+            .unwrap();
         assert!(
-            factory.find("branch_exact_schema_setup_view").unwrap()
-                < factory
-                    .find("ScyllaRealmProcessorStartupPreflightProvider")
+            provider_helper.find("branch_exact_schema_ready").unwrap()
+                < provider_helper
+                    .find("ScyllaRealmProcessorStartupPreflightProvider::<Hash>::prepare")
                     .unwrap()
         );
 

@@ -1,9 +1,10 @@
-//! Read-only Scylla composition for Realm Processor startup preflight.
+//! Isolated Scylla recovery and read-only Realm Processor startup preflight.
 //!
-//! Every enabled request performs two complete composite samples. A route-only
-//! bracket is insufficient because writer, timestamp, head, shadow, or pending
-//! rows can change without a cutover CAS. This module never creates, bootstraps,
-//! repairs, or updates a row and is not wired into production setup yet.
+//! Recovery and final admission each perform two complete composite samples. A
+//! route-only bracket is insufficient because writer, timestamp, head, shadow,
+//! or pending rows can change without a cutover CAS. Recovery may consume one
+//! exact pending/timestamp/writer action per iteration; the final provider is
+//! read-only and cannot turn recovery evidence into a run permit.
 
 use std::{marker::PhantomData, sync::Arc};
 
@@ -23,7 +24,8 @@ use psy_node_core::store::{
     },
     pending_generation_identity::PendingGenerationLedgerKey,
     pending_generation_pipeline::{
-        PendingPipelineReadState, StoredPendingPipeline,
+        PendingPipelineReadState, PendingPipelineWriteOutcome,
+        StoredPendingPipeline,
     },
     realm_processor_startup::{
         RealmProcessorStartupError, RealmProcessorStartupEvidence,
@@ -40,7 +42,8 @@ use super::{
     AuthorityLocalHeadNoTabletKeyspace, AuthorityTimestampNoTabletKeyspace,
     BranchExactCutoverAuthorityKey, BranchExactCutoverPhase,
     BranchExactCutoverReadState, BranchExactDeploymentNoTabletKeyspace,
-    BranchExactSchemaReadyView, BranchExactSchemaSetupRequest,
+    BranchExactSchemaReady, BranchExactSchemaReadyView,
+    BranchExactSchemaSetupRequest,
     BranchExactShadowAuditReadState, BranchExactShadowAuditState,
     BranchExactWriterAuthorityKey, BranchExactWriterReadState,
     BranchExactWriterState, ScyllaAuthorityLocalHeadStore,
@@ -48,7 +51,8 @@ use super::{
     ScyllaBranchExactSchemaSetupGate, ScyllaBranchExactShadowAuditStore,
     ScyllaBranchExactWriterLifecycleStore, ScyllaPendingPipelineStore,
     StoredBranchExactCutover, StoredBranchExactShadowAudit,
-    StoredBranchExactWriterLifecycle,
+    StoredBranchExactWriterLifecycle, BranchExactWriterRuntimeRequest,
+    ScyllaBranchExactWriterRuntime,
 };
 use super::branch_exact_pending_orchestration::{
     classify_branch_exact_pending_startup, BranchExactPendingStartupRecovery,
@@ -62,6 +66,7 @@ const WATERMARK_DOMAIN: &[u8] =
 const RECOVERY_ADMISSION_DOMAIN: &[u8] =
     b"psy/rollback/realm-startup-recovery-admission/v1";
 const COMPOSITE_PARTS: usize = 7;
+const MAX_ISOLATED_RECOVERY_STEPS: usize = 8;
 
 /// Private schema reader. The provider does not expose or return the raw
 /// session used for live h20 authorization.
@@ -108,6 +113,7 @@ pub(crate) struct ScyllaRealmProcessorStartupPreflightProvider<Hash> {
     timestamp: ScyllaAuthorityTimestampStore,
     head: ScyllaAuthorityLocalHeadStore,
     pending: ScyllaPendingPipelineStore,
+    writer_runtime: ScyllaBranchExactWriterRuntime<Hash>,
     schema: ScyllaStartupSchemaReader,
     setup_ready: BranchExactSchemaReadyView,
     _hash: PhantomData<Hash>,
@@ -121,12 +127,12 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorStartupPreflightProvider<Hash> {
         no_tablet_keyspace: &str,
         network: NetworkId,
         authority: AuthorityScope,
-        setup_ready: BranchExactSchemaReadyView,
+        setup_ready: Arc<BranchExactSchemaReady>,
     ) -> Result<Self, RealmProcessorStartupError> {
         let AuthorityScope::Realm { .. } = authority else {
             return Err(RealmProcessorStartupError::AuthorityMismatch);
         };
-        if setup_ready.authority() != authority {
+        if setup_ready.view().authority() != authority {
             return Err(RealmProcessorStartupError::AuthorityMismatch);
         }
         let control_keyspace = BranchExactDeploymentNoTabletKeyspace::try_new(
@@ -183,6 +189,29 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorStartupPreflightProvider<Hash> {
         )
         .await
         .map_err(|error| storage("head prepare", error))?;
+        let initial_writer = match writer
+            .read::<Hash>(writer_key)
+            .await
+            .map_err(|error| storage("writer runtime seed", error))?
+        {
+            BranchExactWriterReadState::Current(current) => current,
+            BranchExactWriterReadState::Uninitialized => {
+                return Err(not_verified_message("writer row is uninitialized"))
+            }
+        };
+        let writer_runtime = ScyllaBranchExactWriterRuntime::prepare_from_ready(
+            session.clone(),
+            no_tablet_keyspace,
+            BranchExactWriterRuntimeRequest::new(
+                network,
+                authority,
+                initial_writer.plan().digest(),
+            ),
+            setup_ready.as_ref(),
+        )
+        .await
+        .map_err(|error| storage("writer runtime prepare", error))?;
+        let setup_ready_view = setup_ready.view().clone();
 
         Ok(Self {
             network,
@@ -197,13 +226,14 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorStartupPreflightProvider<Hash> {
             timestamp,
             head,
             pending,
+            writer_runtime,
             schema: ScyllaStartupSchemaReader {
                 session,
                 standard_keyspace: standard_keyspace.to_owned(),
                 no_tablet_keyspace: no_tablet_keyspace.to_owned(),
                 authority,
             },
-            setup_ready,
+            setup_ready: setup_ready_view,
             _hash: PhantomData,
         })
     }
@@ -284,11 +314,11 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorStartupPreflightProvider<Hash> {
         })
     }
 
-    fn validate_composite(
+    fn validate_static_composite(
         &self,
         expectation: RealmProcessorStartupExpectation,
         sample: &ScyllaStartupComposite<Hash>,
-    ) -> Result<ValidatedScyllaStartup, RealmProcessorStartupError> {
+    ) -> Result<ValidatedScyllaStartupStatic<Hash>, RealmProcessorStartupError> {
         if expectation.network() != self.network {
             return Err(RealmProcessorStartupError::AuthorityMismatch);
         }
@@ -365,6 +395,19 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorStartupPreflightProvider<Hash> {
             sample.timestamp,
         )
         .map_err(|error| not_verified("pending/writer/timestamp", error))?;
+        Ok(ValidatedScyllaStartupStatic { phase, recovery })
+    }
+
+    fn validate_composite(
+        &self,
+        expectation: RealmProcessorStartupExpectation,
+        sample: &ScyllaStartupComposite<Hash>,
+    ) -> Result<ValidatedScyllaStartup, RealmProcessorStartupError> {
+        let validated = self.validate_static_composite(expectation, sample)?;
+        let binding = sample.route.binding();
+        let plan = sample.writer.plan();
+        let phase = validated.phase;
+        let recovery = validated.recovery;
         let recovery_tag = require_clean_run_boundary(&recovery)?;
         let BranchExactWriterState::Active(active) = sample.writer.state() else {
             return Err(RealmProcessorStartupError::DurableRecoveryRequired(
@@ -405,6 +448,98 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorStartupPreflightProvider<Hash> {
             watermark_digest,
             readiness_digest,
         })
+    }
+
+    /// Run only deterministic Scylla crash recovery. Every iteration brackets
+    /// the complete seven-row authority state, consumes at most one sealed
+    /// action, and then starts classification again from storage.
+    pub(crate) async fn recover_isolated(
+        &self,
+        expectation: RealmProcessorStartupExpectation,
+    ) -> Result<(), RealmProcessorStartupError> {
+        for _ in 0..MAX_ISOLATED_RECOVERY_STEPS {
+            let before = self.read_composite().await?;
+            let after = self.read_composite().await?;
+            if before.fingerprint() != after.fingerprint() {
+                return Err(RealmProcessorStartupError::ConcurrentMutation);
+            }
+            let before_validated =
+                self.validate_static_composite(expectation, &before)?;
+            let after_validated =
+                self.validate_static_composite(expectation, &after)?;
+            if before_validated != after_validated {
+                return Err(RealmProcessorStartupError::ConcurrentMutation);
+            }
+            validate_recovery_head(self.network, self.authority, &after, &after_validated.recovery)?;
+
+            match seal_recovery_decision(
+                &after.fingerprint(),
+                expectation,
+                after_validated.recovery,
+            ) {
+                ScyllaStartupRecoveryDecision::Clean => {
+                    // Clean recovery classification is necessary but not
+                    // sufficient: the final run admission also verifies the
+                    // Active/Idle/head/cutover closure.
+                    self.validate_composite(expectation, &after)?;
+                    return Ok(())
+                }
+                ScyllaStartupRecoveryDecision::AwaitExternal(reason) => {
+                    return Err(RealmProcessorStartupError::DurableRecoveryRequired(
+                        format!("startup recovery awaits external capability: {reason:?}"),
+                    ))
+                }
+                ScyllaStartupRecoveryDecision::Recover(admission) => {
+                    self.execute_recovery_admission(
+                        expectation,
+                        admission,
+                        &after,
+                    )
+                    .await?;
+                }
+            }
+        }
+        Err(RealmProcessorStartupError::DurableStorageIndeterminate(
+            "isolated startup recovery exceeded its bounded action count"
+                .to_owned(),
+        ))
+    }
+
+    async fn execute_recovery_admission(
+        &self,
+        expectation: RealmProcessorStartupExpectation,
+        admission: SealedScyllaStartupRecoveryAdmission<Hash>,
+        observed: &ScyllaStartupComposite<Hash>,
+    ) -> Result<(), RealmProcessorStartupError> {
+        if !admission.matches(expectation, &observed.fingerprint()) {
+            return Err(RealmProcessorStartupError::ConcurrentMutation);
+        }
+        match admission.action {
+            ScyllaStartupRecoveryAction::ApplyPendingTransition(transition) => {
+                match self.pending.apply(&transition).await.map_err(|error| {
+                    storage("pending recovery CAS", error)
+                })? {
+                    PendingPipelineWriteOutcome::Applied(_)
+                    | PendingPipelineWriteOutcome::Idempotent(_) => Ok(()),
+                    PendingPipelineWriteOutcome::Conflict(_) => {
+                        Err(RealmProcessorStartupError::ConcurrentMutation)
+                    }
+                }
+            }
+            ScyllaStartupRecoveryAction::ResumeWriterVerification(_) => {
+                self.writer_runtime
+                    .resume_prepared()
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| storage("writer verification recovery", error))
+            }
+            ScyllaStartupRecoveryAction::FinishWriterAfterTrustedMarker => {
+                self.writer_runtime
+                    .finish_verified_after_published(observed.head.head().chain())
+                    .await
+                    .map_err(|error| storage("writer finalization recovery", error))
+            }
+        }
     }
 }
 
@@ -548,6 +683,7 @@ enum ScyllaStartupRecoveryAction<Hash> {
 /// fingerprint before consuming it and execute exactly this one action.
 struct SealedScyllaStartupRecoveryAdmission<Hash> {
     source_fingerprint: [u8; 32],
+    request_digest: [u8; 32],
     action_digest: [u8; 32],
     action: ScyllaStartupRecoveryAction<Hash>,
 }
@@ -561,8 +697,13 @@ impl<Hash> SealedScyllaStartupRecoveryAdmission<Hash> {
         &self.action_digest
     }
 
-    fn matches_source(&self, current: &ScyllaStartupCompositeFingerprint) -> bool {
-        self.source_fingerprint == current.digest()
+    fn matches(
+        &self,
+        request: RealmProcessorStartupExpectation,
+        current: &ScyllaStartupCompositeFingerprint,
+    ) -> bool {
+        self.request_digest == *request.digest().as_bytes()
+            && self.source_fingerprint == current.digest()
     }
 }
 
@@ -574,9 +715,11 @@ enum ScyllaStartupRecoveryDecision<Hash> {
 
 fn seal_recovery_decision<Hash>(
     source: &ScyllaStartupCompositeFingerprint,
+    request: RealmProcessorStartupExpectation,
     recovery: BranchExactPendingStartupRecovery<Hash>,
 ) -> ScyllaStartupRecoveryDecision<Hash> {
     let source_fingerprint = source.digest();
+    let request_digest = *request.digest().as_bytes();
     let action = match recovery {
         BranchExactPendingStartupRecovery::ReadyForQueueClose => {
             return ScyllaStartupRecoveryDecision::Clean
@@ -636,15 +779,23 @@ fn seal_recovery_decision<Hash>(
     let mut hasher = Sha256::new();
     hasher.update(RECOVERY_ADMISSION_DOMAIN);
     hasher.update(source_fingerprint);
+    hasher.update(request_digest);
     hasher.update([action_kind as u8]);
     let action_digest = hasher.finalize().into();
     ScyllaStartupRecoveryDecision::Recover(
         SealedScyllaStartupRecoveryAdmission {
             source_fingerprint,
+            request_digest,
             action_digest,
             action,
         },
     )
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ValidatedScyllaStartupStatic<Hash> {
+    phase: RealmProcessorStartupRoutePhase,
+    recovery: BranchExactPendingStartupRecovery<Hash>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -698,6 +849,55 @@ fn require_clean_run_boundary<Hash>(
                     .to_owned(),
             ))
         }
+    }
+}
+
+fn validate_recovery_head<Hash: Q256BitHash>(
+    network: NetworkId,
+    authority: AuthorityScope,
+    sample: &ScyllaStartupComposite<Hash>,
+    recovery: &BranchExactPendingStartupRecovery<Hash>,
+) -> Result<(), RealmProcessorStartupError> {
+    let observed = sample.head.head();
+    if observed.key().network() != network || observed.key().authority() != authority {
+        return Err(RealmProcessorStartupError::AuthorityMismatch);
+    }
+    let valid = match sample.writer.state() {
+        BranchExactWriterState::Active(active) => {
+            observed.chain() == active.watermark().canonical_chain()
+        }
+        BranchExactWriterState::WritePrepared(prepared) => {
+            observed.chain() == prepared.previous().watermark().canonical_chain()
+        }
+        BranchExactWriterState::WritesVerified(verified) => {
+            let prepared = verified.prepared();
+            match recovery {
+                BranchExactPendingStartupRecovery::FinishWriterAfterTrustedMarker => {
+                    observed.chain()
+                        == prepared.intent().candidate().canonical_chain()
+                }
+                BranchExactPendingStartupRecovery::AwaitTrustedMarker => {
+                    observed.chain()
+                        == prepared.previous().watermark().canonical_chain()
+                        || observed.chain()
+                            == prepared.intent().candidate().canonical_chain()
+                }
+                BranchExactPendingStartupRecovery::ApplyPipeline { .. } => {
+                    observed.chain()
+                        == prepared.previous().watermark().canonical_chain()
+                }
+                _ => false,
+            }
+        }
+        BranchExactWriterState::ActivationPrepared
+        | BranchExactWriterState::Blocked(_) => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(not_verified_message(
+            "authority head is incompatible with the classified recovery action",
+        ))
     }
 }
 
@@ -787,6 +987,19 @@ fn storage(
 mod tests {
     use super::*;
 
+    fn expectation(nonce: u8) -> RealmProcessorStartupExpectation {
+        RealmProcessorStartupExpectation::try_new(
+            NetworkId::try_from_chain_id(1337).unwrap(),
+            7,
+            3,
+            11,
+            [1; 32],
+            [2; 32],
+            [nonce; 32],
+        )
+        .unwrap()
+    }
+
     fn fingerprint() -> ScyllaStartupCompositeFingerprint {
         ScyllaStartupCompositeFingerprint::try_new(
             (1..=COMPOSITE_PARTS)
@@ -847,6 +1060,7 @@ mod tests {
         assert!(matches!(
             seal_recovery_decision::<parth_core::PHash>(
                 &source,
+                expectation(3),
                 BranchExactPendingStartupRecovery::ReadyForQueueClose,
             ),
             ScyllaStartupRecoveryDecision::Clean
@@ -866,7 +1080,7 @@ mod tests {
             ),
         ] {
             assert!(matches!(
-                seal_recovery_decision(&source, recovery),
+                seal_recovery_decision(&source, expectation(3), recovery),
                 ScyllaStartupRecoveryDecision::AwaitExternal(reason)
                     if reason == expected
             ));
@@ -875,6 +1089,7 @@ mod tests {
         let ScyllaStartupRecoveryDecision::Recover(admission) =
             seal_recovery_decision::<parth_core::PHash>(
                 &source,
+                expectation(3),
                 BranchExactPendingStartupRecovery::FinishWriterAfterTrustedMarker,
             )
         else {
@@ -882,10 +1097,11 @@ mod tests {
         };
         assert_eq!(admission.source_fingerprint(), &source.digest());
         assert_ne!(admission.action_digest(), &[0; 32]);
-        assert!(admission.matches_source(&source));
+        assert!(admission.matches(expectation(3), &source));
+        assert!(!admission.matches(expectation(4), &source));
         let mut changed = source.clone();
         changed.parts[6].push(0xff);
-        assert!(!admission.matches_source(&changed));
+        assert!(!admission.matches(expectation(3), &changed));
         assert!(matches!(
             admission.action,
             ScyllaStartupRecoveryAction::FinishWriterAfterTrustedMarker
@@ -953,7 +1169,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_is_read_only_default_off_and_full_double_sampled() {
+    fn final_preflight_is_read_only_default_off_and_full_double_sampled() {
         let source = include_str!("branch_exact_startup_preflight.rs");
         let fresh = source
             .split("async fn fresh_read(")
@@ -974,6 +1190,41 @@ mod tests {
         );
         assert!(!setup.contains("ScyllaRealmProcessorStartupPreflightProvider"));
         assert!(!common.contains("ScyllaRealmProcessorStartupPreflightProvider"));
+    }
+
+    #[test]
+    fn isolated_runner_double_samples_executes_one_action_and_reclassifies() {
+        let source = include_str!("branch_exact_startup_preflight.rs");
+        let runner = source
+            .split("pub(crate) async fn recover_isolated")
+            .nth(1)
+            .unwrap()
+            .split("async fn execute_recovery_admission")
+            .next()
+            .unwrap();
+        assert_eq!(runner.matches("self.read_composite().await?").count(), 2);
+        assert!(runner.contains("MAX_ISOLATED_RECOVERY_STEPS"));
+        assert!(runner.contains("before.fingerprint() != after.fingerprint()"));
+        assert!(runner.contains("self.execute_recovery_admission"));
+        assert!(runner.contains("AwaitExternal"));
+        assert!(runner.contains("self.validate_composite(expectation, &after)?"));
+
+        let executor = source
+            .split("async fn execute_recovery_admission")
+            .nth(1)
+            .unwrap()
+            .split("#[async_trait]")
+            .next()
+            .unwrap();
+        assert!(executor.contains("admission.matches(expectation"));
+        assert!(executor.contains("self.pending.apply(&transition)"));
+        assert!(executor.contains("resume_prepared()"));
+        assert!(executor.contains("finish_verified_after_published"));
+        assert!(executor.contains("PendingPipelineWriteOutcome::Conflict"));
+        for forbidden in ["Nats", "gatherer", "new_init", "create_realm_processor"] {
+            assert!(!runner.contains(forbidden));
+            assert!(!executor.contains(forbidden));
+        }
     }
 
     #[test]
