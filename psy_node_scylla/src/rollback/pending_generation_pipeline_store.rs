@@ -38,8 +38,8 @@ use sha2::{Digest, Sha256};
 
 use super::BranchExactDeploymentNoTabletKeyspace;
 
-const PIPELINE_TABLE: &str = "branch_exact_pending_pipeline_v2";
-const RETIRED_V1_PIPELINE_TABLE: &str = "branch_exact_pending_pipeline_v1";
+pub(super) const PIPELINE_TABLE: &str = "branch_exact_pending_pipeline_v2";
+pub(super) const RETIRED_V1_PIPELINE_TABLE: &str = "branch_exact_pending_pipeline_v1";
 const STORE_FINGERPRINT_DOMAIN: &[u8] =
     b"psy/rollback/pending-pipeline-store/v1";
 const CLOSE_RECEIPT_DOMAIN: &[u8] =

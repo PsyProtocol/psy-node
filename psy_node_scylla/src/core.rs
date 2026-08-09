@@ -27,7 +27,10 @@ use crate::rollback::{
     BranchExactSchemaSetupOutcome,
     CanonicalHeadNoTabletKeyspace, ScyllaCanonicalHeadStore,
     ScyllaBranchExactSchemaSetupGate, ScyllaRollbackAdmissionStore,
-    ScyllaBranchExactShadowReader,
+    ScyllaBranchExactShadowReader, PendingQueueSidecarKeyspaces,
+    PendingQueueSidecarLifecycleError, PendingQueueSidecarReady,
+    PendingQueueSidecarReadyView, PendingQueueSidecarSetupMode,
+    PendingQueueSidecarSetupOutcome, ScyllaPendingQueueSidecarSetupGate,
 };
 use crate::rollback::branch_exact_startup_preflight::ScyllaRealmProcessorStartupPreflightProvider;
 use crate::tables::{merkle::ScyllaMerkleNodesZeroPreparedStatements, traits::ScyllaStandardPreparedTableStatements};
@@ -43,6 +46,7 @@ pub struct ScyllaCoreStore<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> {
     canonical_head_store: Arc<OnceLock<Arc<ScyllaCanonicalHeadStore>>>,
     rollback_admission_store: Arc<OnceLock<Arc<ScyllaRollbackAdmissionStore>>>,
     branch_exact_schema_ready: Arc<OnceLock<Arc<BranchExactSchemaReady>>>,
+    pending_queue_sidecar_ready: Arc<OnceLock<Arc<PendingQueueSidecarReady>>>,
     _phantom_hash: std::marker::PhantomData<Hash>,
     _phantom_hasher: std::marker::PhantomData<Hasher>,
 }
@@ -103,6 +107,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
             canonical_head_store: Arc::new(OnceLock::new()),
             rollback_admission_store: Arc::new(OnceLock::new()),
             branch_exact_schema_ready: Arc::new(OnceLock::new()),
+            pending_queue_sidecar_ready: Arc::new(OnceLock::new()),
             _phantom_hash: std::marker::PhantomData,
             _phantom_hasher: std::marker::PhantomData,
         })
@@ -271,6 +276,73 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
         )
     }
 
+    /// Default-off queue-sidecar setup. Disabled mode executes no queue CQL;
+    /// enabled mode is inspect-only and requires an operator-created VERIFIED
+    /// lifecycle plus the exact twelve-table schema.
+    pub async fn initialize_pending_queue_sidecar_setup(
+        &self,
+        authority: psy_data::protocol::chain_context::AuthorityScope,
+        mode: PendingQueueSidecarSetupMode,
+    ) -> Result<PendingQueueSidecarSetupOutcome, PendingQueueSidecarLifecycleError> {
+        let PendingQueueSidecarSetupMode::RequireVerified = mode else {
+            if self.pending_queue_sidecar_ready.get().is_some() {
+                return Err(PendingQueueSidecarLifecycleError::AlreadyInitializedWithDifferentReceipt);
+            }
+            return Ok(PendingQueueSidecarSetupOutcome::Disabled);
+        };
+        let keyspaces = PendingQueueSidecarKeyspaces::try_new(
+            self.keyspace.clone(),
+            self.no_tablet_keyspace.clone(),
+        )
+        .map_err(|error| {
+            PendingQueueSidecarLifecycleError::InvalidKeyspace(error.to_string())
+        })?;
+        let candidate = Arc::new(
+            ScyllaPendingQueueSidecarSetupGate::authorize(
+                self.session.clone(),
+                keyspaces,
+                authority,
+            )
+            .await?,
+        );
+        match self.pending_queue_sidecar_ready.set(candidate.clone()) {
+            Ok(()) => Ok(PendingQueueSidecarSetupOutcome::Ready(
+                candidate.view().clone(),
+            )),
+            Err(_) => {
+                let current = self
+                    .pending_queue_sidecar_ready
+                    .get()
+                    .expect("OnceLock rejected set but has no current value");
+                if current.view() == candidate.view() {
+                    Ok(PendingQueueSidecarSetupOutcome::Idempotent(
+                        current.view().clone(),
+                    ))
+                } else {
+                    Err(PendingQueueSidecarLifecycleError::AlreadyInitializedWithDifferentReceipt)
+                }
+            }
+        }
+    }
+
+    pub fn pending_queue_sidecar_setup_view(
+        &self,
+    ) -> Option<PendingQueueSidecarReadyView> {
+        self.pending_queue_sidecar_ready
+            .get()
+            .map(|ready| ready.view().clone())
+    }
+
+    fn require_pending_queue_sidecar_ready(
+        &self,
+    ) -> Result<Arc<PendingQueueSidecarReady>, RealmProcessorStartupError> {
+        self.pending_queue_sidecar_ready.get().cloned().ok_or_else(|| {
+            RealmProcessorStartupError::DurableEvidenceNotVerified(
+                "pending queue sidecar setup capability is disabled".to_owned(),
+            )
+        })
+    }
+
     /// Explicit h21 tooling hook.  Opening a shadow reader requires the exact
     /// h20 setup capability; it is never invoked by normal node setup.
     pub async fn prepare_branch_exact_shadow_reader(
@@ -346,6 +418,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
                     "branch-exact schema setup capability is disabled".to_owned(),
                 )
             })?;
+        let queue_ready = self.require_pending_queue_sidecar_ready()?;
         let authority = require_realm_startup_factory_identity(
             self.realm_id,
             self.realm_sub_id,
@@ -359,6 +432,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
             expectation.network(),
             authority,
             setup_ready,
+            queue_ready,
         )
         .await
     }
@@ -565,6 +639,7 @@ mod branch_exact_startup_factory_tests {
         assert!(factory.contains("Arc<dyn RealmProcessorStartupPreflightProvider>"));
         assert!(!factory.contains("Arc<Session>"));
         assert!(factory.contains("branch_exact_schema_ready"));
+        assert!(factory.contains("pending_queue_sidecar_ready"));
         assert!(factory.contains("recover_realm_processor_startup"));
         assert!(factory.contains("recover_isolated(recovery_expectation)"));
         let provider_helper = factory
@@ -573,6 +648,12 @@ mod branch_exact_startup_factory_tests {
             .unwrap();
         assert!(
             provider_helper.find("branch_exact_schema_ready").unwrap()
+                < provider_helper
+                    .find("ScyllaRealmProcessorStartupPreflightProvider::<Hash>::prepare")
+                    .unwrap()
+        );
+        assert!(
+            provider_helper.find("require_pending_queue_sidecar_ready").unwrap()
                 < provider_helper
                     .find("ScyllaRealmProcessorStartupPreflightProvider::<Hash>::prepare")
                     .unwrap()

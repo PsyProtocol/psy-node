@@ -57,6 +57,8 @@ use super::{
     ScyllaAuthorityTimestampStore, ScyllaBranchExactCutoverStore,
     ScyllaBranchExactSchemaSetupGate, ScyllaBranchExactShadowAuditStore,
     ScyllaBranchExactWriterLifecycleStore, ScyllaPendingPipelineStore,
+    PendingQueueSidecarKeyspaces, PendingQueueSidecarReady,
+    PendingQueueSidecarReadyView, ScyllaPendingQueueSidecarFreshReader,
     StoredBranchExactCutover, StoredBranchExactShadowAudit,
     StoredBranchExactWriterLifecycle, BranchExactWriterRuntimeRequest,
     ScyllaBranchExactWriterRuntime,
@@ -72,7 +74,7 @@ const WATERMARK_DOMAIN: &[u8] =
     b"psy/rollback/realm-startup-cutover-watermark/v1";
 const RECOVERY_ADMISSION_DOMAIN: &[u8] =
     b"psy/rollback/realm-startup-recovery-admission/v1";
-const COMPOSITE_PARTS: usize = 7;
+const COMPOSITE_PARTS: usize = 8;
 const MAX_ISOLATED_RECOVERY_STEPS: usize = 8;
 
 /// Private schema reader. The provider does not expose or return the raw
@@ -123,6 +125,8 @@ pub(crate) struct ScyllaRealmProcessorStartupPreflightProvider<Hash> {
     writer_runtime: ScyllaBranchExactWriterRuntime<Hash>,
     schema: ScyllaStartupSchemaReader,
     setup_ready: BranchExactSchemaReadyView,
+    queue_schema: ScyllaPendingQueueSidecarFreshReader,
+    queue_setup_ready: PendingQueueSidecarReadyView,
     _hash: PhantomData<Hash>,
 }
 
@@ -135,11 +139,15 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorStartupPreflightProvider<Hash> {
         network: NetworkId,
         authority: AuthorityScope,
         setup_ready: Arc<BranchExactSchemaReady>,
+        queue_ready: Arc<PendingQueueSidecarReady>,
     ) -> Result<Self, RealmProcessorStartupError> {
         let AuthorityScope::Realm { .. } = authority else {
             return Err(RealmProcessorStartupError::AuthorityMismatch);
         };
         if setup_ready.view().authority() != authority {
+            return Err(RealmProcessorStartupError::AuthorityMismatch);
+        }
+        if queue_ready.view().authority() != authority {
             return Err(RealmProcessorStartupError::AuthorityMismatch);
         }
         let control_keyspace = BranchExactDeploymentNoTabletKeyspace::try_new(
@@ -219,6 +227,19 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorStartupPreflightProvider<Hash> {
         .await
         .map_err(|error| storage("writer runtime prepare", error))?;
         let setup_ready_view = setup_ready.view().clone();
+        let queue_keyspaces = PendingQueueSidecarKeyspaces::try_new(
+            standard_keyspace.to_owned(),
+            no_tablet_keyspace.to_owned(),
+        )
+        .map_err(|error| storage("queue keyspaces", error))?;
+        let queue_schema = ScyllaPendingQueueSidecarFreshReader::prepare(
+            session.clone(),
+            queue_keyspaces,
+            authority,
+        )
+        .await
+        .map_err(|error| storage("queue schema prepare", error))?;
+        let queue_setup_ready = queue_ready.view().clone();
 
         Ok(Self {
             network,
@@ -241,6 +262,8 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorStartupPreflightProvider<Hash> {
                 authority,
             },
             setup_ready: setup_ready_view,
+            queue_schema,
+            queue_setup_ready,
             _hash: PhantomData,
         })
     }
@@ -271,6 +294,11 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorStartupPreflightProvider<Hash> {
             }
         };
         let schema = self.schema.fresh(&writer).await?;
+        let queue_schema = self
+            .queue_schema
+            .fresh()
+            .await
+            .map_err(|error| not_verified("queue schema/lifecycle", error))?;
         let shadow = match self
             .shadow
             .read(writer.plan().shadow_audit_slot())
@@ -313,6 +341,7 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorStartupPreflightProvider<Hash> {
         Ok(ScyllaStartupComposite {
             route,
             schema,
+            queue_schema,
             writer,
             shadow,
             timestamp,
@@ -373,6 +402,13 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorStartupPreflightProvider<Hash> {
         {
             return Err(not_verified_message(
                 "route/schema/backfill evidence does not close",
+            ));
+        }
+        if sample.queue_schema.authority() != self.authority
+            || sample.queue_schema != self.queue_setup_ready
+        {
+            return Err(not_verified_message(
+                "queue schema/lifecycle evidence does not close",
             ));
         }
         let BranchExactShadowAuditState::Consumed(consumed) = sample.shadow.state()
@@ -458,7 +494,7 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorStartupPreflightProvider<Hash> {
     }
 
     /// Run only deterministic Scylla crash recovery. Every iteration brackets
-    /// the complete seven-row authority state, consumes at most one sealed
+    /// the complete eight-component authority state, consumes at most one sealed
     /// action, and then starts classification again from storage.
     pub(crate) async fn recover_isolated(
         &self,
@@ -632,7 +668,7 @@ where
         startup_permit: RealmProcessorFreshRunPermit,
     ) -> Result<InstalledRealmBranchExactCommitRuntime<Hash>, RealmProcessorStartupError> {
         // Authorization and runtime installation are separate linearization
-        // points. Re-read the complete seven-component composite and require
+        // points. Re-read the complete eight-component composite and require
         // byte-for-byte identical evidence before consuming the permit.
         let fresh = self.fresh_read(startup_permit.expectation()).await?;
         if fresh != startup_permit.evidence() {
@@ -647,6 +683,7 @@ where
 struct ScyllaStartupComposite<Hash> {
     route: StoredBranchExactCutover<Hash>,
     schema: BranchExactSchemaReadyView,
+    queue_schema: PendingQueueSidecarReadyView,
     writer: StoredBranchExactWriterLifecycle<Hash>,
     shadow: StoredBranchExactShadowAudit,
     timestamp: ObservedAuthorityTimestampState,
@@ -661,6 +698,16 @@ impl<Hash: Q256BitHash> ScyllaStartupComposite<Hash> {
 
         let mut schema = self.schema.lifecycle_revision().get().to_be_bytes().to_vec();
         schema.extend_from_slice(self.schema.digest().as_bytes());
+
+        let mut queue_schema = self
+            .queue_schema
+            .verified()
+            .stored()
+            .revision()
+            .get()
+            .to_be_bytes()
+            .to_vec();
+        queue_schema.extend_from_slice(self.queue_schema.ready_digest());
 
         let mut writer = self.writer.revision().get().to_be_bytes().to_vec();
         writer.extend_from_slice(&self.writer.to_canonical_bytes());
@@ -681,7 +728,7 @@ impl<Hash: Q256BitHash> ScyllaStartupComposite<Hash> {
         pending.extend_from_slice(&self.pending.canonical_payload());
 
         ScyllaStartupCompositeFingerprint::try_new(vec![
-            route, schema, writer, shadow, timestamp, head, pending,
+            route, schema, queue_schema, writer, shadow, timestamp, head, pending,
         ])
         .expect("all canonical durable rows are non-empty")
     }
@@ -744,7 +791,7 @@ enum ScyllaStartupRecoveryAction<Hash> {
 }
 
 /// One full-composite-bound action. It is intentionally non-Clone and has no
-/// public constructor or codec. h23c3c must fresh-read the seven-component
+/// public constructor or codec. Recovery must fresh-read the eight-component
 /// fingerprint before consuming it and execute exactly this one action.
 struct SealedScyllaStartupRecoveryAdmission<Hash> {
     source_fingerprint: [u8; 32],

@@ -299,18 +299,18 @@ fn lexical_inventory_is_stable_and_nontrivial() {
         total.direct_cql += row.direct_cql;
         total
     });
-    assert_eq!(detected.len(), 114);
+    assert_eq!(detected.len(), 129);
     assert_eq!(
         total,
         RawScyllaAccessCounts {
-            session_type: 829,
-            session_builder: 59,
-            session_field_access: 240,
-            prepared_statement: 336,
-            prepare_call: 162,
-            execute_call: 328,
-            query_call: 198,
-            direct_cql: 509,
+            session_type: 888,
+            session_builder: 61,
+            session_field_access: 266,
+            prepared_statement: 372,
+            prepare_call: 174,
+            execute_call: 349,
+            query_call: 234,
+            direct_cql: 570,
         }
     );
 }
@@ -335,5 +335,11 @@ fn raw_scylla_access_inventory_matches_golden() {
             counts.direct_cql,
         ));
     }
-    assert_eq!(rendered, include_str!("golden/raw_scylla_access_inventory_v1.txt"));
+    let expected = include_str!("golden/raw_scylla_access_inventory_v1.txt");
+    let actual_lines = rendered.lines().collect::<Vec<_>>();
+    let expected_lines = expected.lines().collect::<Vec<_>>();
+    assert_eq!(actual_lines.len(), expected_lines.len(), "raw-access golden line count");
+    for (line_number, (actual, expected)) in actual_lines.iter().zip(&expected_lines).enumerate() {
+        assert_eq!(actual, expected, "raw-access golden mismatch at line {}", line_number + 1);
+    }
 }

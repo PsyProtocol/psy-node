@@ -34,7 +34,8 @@ use sha2::{Digest, Sha256};
 
 use super::BranchExactDeploymentNoTabletKeyspace;
 
-const SEGMENT_LEDGER_TABLE: &str = "branch_exact_pending_queue_segment_ledger_v1";
+pub(super) const SEGMENT_LEDGER_TABLE: &str =
+    "branch_exact_pending_queue_segment_ledger_v1";
 const STORE_FINGERPRINT_DOMAIN: &[u8] =
     b"psy/rollback/pending-queue-segment-ledger-store/v1";
 const CLOSURE_SNAPSHOT_DOMAIN: &[u8] =

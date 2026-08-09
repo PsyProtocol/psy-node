@@ -22,7 +22,8 @@ use crate::{
     rollback::{
         BranchExactDeploymentNoTabletKeyspace, BranchExactSchemaSetupMode,
         BranchExactSchemaSetupRequest, BranchExactWriterAuthorityKey,
-        BranchExactWriterReadState, ScyllaBranchExactWriterLifecycleStore,
+        BranchExactWriterReadState, PendingQueueSidecarSetupMode,
+        ScyllaBranchExactWriterLifecycleStore,
     },
     tables::{
         blob::ScyllaBiDirectionalBlobToBlobTablePreparedStatements, bridge::{deposit_leaf::ScyllaBridgeDepositLeafPreparedStatements, next_index::ScyllaBridgeDepositNextIndexPreparedStatements}, counter::u64_counter::ScyllaU64ToU64CounterTablePreparedStatements, hash_to_many_ids::ScyllaHashToManyIdsTablePreparedStatements, imt::{imt_key_index::ScyllaIMTKeyIndexPreparedStatements, imt_leaf::ScyllaIMTLeafPreparedStatements, imt_next_append_index::ScyllaIMTNextAppendIndexPreparedStatements}, merkle::{ScyllaDoubleMerkleNodesPreparedStatements, ScyllaMerkleNodesPreparedStatements, ScyllaMerkleNodesZeroPreparedStatements}, object::{
@@ -423,6 +424,15 @@ pub async fn setup_realm_psy_scylla_database_store_with_branch_exact_schema<
             branch_exact_mode,
         )
         .await?;
+    db.store
+        .initialize_pending_queue_sidecar_setup(
+            AuthorityScope::Realm {
+                realm_id,
+                realm_sub_id,
+            },
+            PendingQueueSidecarSetupMode::Disabled,
+        )
+        .await?;
     Ok(db)
 }
 
@@ -536,6 +546,12 @@ where
             ),
         )
         .await?;
+    db.store
+        .initialize_pending_queue_sidecar_setup(
+            authority,
+            PendingQueueSidecarSetupMode::RequireVerified,
+        )
+        .await?;
 
     let recovery_expectation = lineage.seal_attempt(fresh_startup_nonce())?;
     db.store
@@ -625,13 +641,19 @@ mod realm_startup_composition_tests {
         let recovery = factory
             .find("recover_realm_processor_startup(recovery_expectation)")
             .unwrap();
+        let queue_ready = factory
+            .find("PendingQueueSidecarSetupMode::RequireVerified")
+            .unwrap();
         let fresh_run = factory
             .find("fresh_startup_nonce_excluding")
             .unwrap();
         let final_preflight = factory
             .find("prepare_realm_processor_startup_provider(expectation)")
             .unwrap();
+        assert!(queue_ready < recovery);
         assert!(recovery < fresh_run && fresh_run < final_preflight);
+        assert!(source.contains("PendingQueueSidecarSetupMode::Disabled"));
+        assert!(!factory.contains("PendingQueueSidecarDeploymentExecutor::deploy"));
         assert!(factory.contains("RealmBranchExactCommitRuntimeInstaller"));
         assert!(!factory.contains("startup_nonce:"));
     }
