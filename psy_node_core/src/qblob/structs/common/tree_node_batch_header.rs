@@ -2,6 +2,7 @@ use anyhow::Context;
 use parth_core::data::hash::fast_node_serializer::{QMS_FAST_SERIALIZER_DOUBLE_ID_NODE_SIZE, QMS_FAST_SERIALIZER_SINGLE_ID_NODE_SIZE, QMS_FAST_SERIALIZER_ZERO_ID_NODE_SIZE};
 
 use crate::qblob::{blob_type::{get_item_size_for_data_type, is_valid_qblob_merkle_node_batch_type, QBlobDataType, QBlobMerkleNodeTreeType, QBLOB_IMT_LEAF_ENTRY_SIZE, QBLOB_STANDARD_V1_MAGIC_U32}, traits::common::QBlobStructHeaderBase};
+use super::blob_metadata_header::QBlobWriterContextMetadataHeader;
 
 pub const QBLOB_TREE_NODE_BATCH_HEADER_SIZE: usize = 80;
 
@@ -146,6 +147,33 @@ impl QBlobMerkleTreeNodeBatchHeaderV1 {
             unique_pending_id,
             checkpoint_id: 0,
             for_target_id,
+            item_count: 0,
+            item_size: QBLOB_IMT_LEAF_ENTRY_SIZE as u32,
+        }
+    }
+
+    /// Create an IMT leaf header from an already sealed writer context.
+    ///
+    /// Unlike [`Self::new_imt_leaf_header`], this constructor does not read the
+    /// wall clock.  Every QBlob emitted for one durable user update therefore
+    /// carries exactly the same creator/time/checkpoint identity on retry.
+    pub fn new_imt_leaf_header_from_context(
+        context: &QBlobWriterContextMetadataHeader,
+        tree_type: QBlobMerkleNodeTreeType,
+    ) -> Self {
+        Self {
+            blob_magic: QBLOB_STANDARD_V1_MAGIC_U32,
+            chain_id: context.chain_id,
+            total_size: 0,
+            created_by_node_id: context.created_by_node_id,
+            created_at_seconds: context.created_at_seconds,
+            blob_type: QBlobDataType::GenericIMTLeafBatch,
+            tree_type,
+            realm_id: context.realm_id,
+            realm_sub_id: context.realm_sub_id,
+            unique_pending_id: context.unique_pending_id,
+            checkpoint_id: context.checkpoint_id,
+            for_target_id: context.for_target_id,
             item_count: 0,
             item_size: QBLOB_IMT_LEAF_ENTRY_SIZE as u32,
         }

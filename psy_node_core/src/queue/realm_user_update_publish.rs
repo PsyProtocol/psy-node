@@ -210,8 +210,8 @@ impl<F: QFelt64, Hash: Q256BitHash> RealmUserUpdatePublishRequest<F, Hash> {
         if item.job_id != expected_job_id {
             return Err(RealmUserUpdatePublishError::QueueItemIdentityMismatch);
         }
-        if item.expected_fake_checkpoint_id == 0 {
-            return Err(RealmUserUpdatePublishError::MissingStableStatus);
+        if item.expected_fake_checkpoint_id != request_digest.stable_status() {
+            return Err(RealmUserUpdatePublishError::StableStatusMismatch);
         }
         let payload = item
             .encode_queue_item_vec()
@@ -410,7 +410,7 @@ pub enum RealmUserUpdatePublishError {
     QueueItemIdentityMismatch,
     QueueItemNotCanonical,
     QueueItemCodec(String),
-    MissingStableStatus,
+    StableStatusMismatch,
     UserOutOfRange,
     PendingOutOfRange,
     InvalidGeneration(String),
@@ -495,7 +495,11 @@ mod tests {
         ).unwrap()
     }
 
-    fn queue_item(pending_id: u64, user_id: u64) -> PsyRealmUserUpdateQueueItem<PF, PHash> {
+    fn queue_item(
+        pending_id: u64,
+        user_id: u64,
+        status: u64,
+    ) -> PsyRealmUserUpdateQueueItem<PF, PHash> {
         let mut item = PsyRealmUserUpdateQueueItem::<PF, PHash>::qp_rand_gen();
         item.job_id = psy_core::job::job_id::QProvingJobDataID::try_get_realm_edge_proof_store_output_proof_id_for_end_cap(
             user_id,
@@ -503,7 +507,7 @@ mod tests {
             pending_id,
         )
         .unwrap();
-        item.expected_fake_checkpoint_id = 77;
+        item.expected_fake_checkpoint_id = status;
         item
     }
 
@@ -514,7 +518,7 @@ mod tests {
     #[test]
     fn request_is_branch_generation_user_and_payload_exact() {
         let digest = RealmUserUpdateRequestDigest::derive(b"input", b"proof").unwrap();
-        let item = queue_item(11, 13);
+        let item = queue_item(11, 13, digest.stable_status());
         let base = RealmUserUpdatePublishRequest::try_new(
             admission(1, 10, 11, 12),
             UserId::new(13),
@@ -541,13 +545,16 @@ mod tests {
             assert_ne!(base.admission(), same_intent_different_admission.admission());
         }
         for different_intent in [
-            RealmUserUpdatePublishRequest::try_new(admission(1, 10, 11, 12), UserId::new(16), digest, tree_height(), queue_item(11, 16)).unwrap(),
+            RealmUserUpdatePublishRequest::try_new(admission(1, 10, 11, 12), UserId::new(16), digest, tree_height(), queue_item(11, 16, digest.stable_status())).unwrap(),
             {
                 let mut changed = item.clone();
-                changed.expected_fake_checkpoint_id = 78;
+                changed.old_user_leaf_hash = PHash::from_owned_32bytes([42; 32]);
                 RealmUserUpdatePublishRequest::try_new(admission(1, 10, 11, 12), UserId::new(13), digest, tree_height(), changed).unwrap()
             },
-            RealmUserUpdatePublishRequest::try_new(admission(1, 10, 11, 12), UserId::new(13), RealmUserUpdateRequestDigest::derive(b"other", b"proof").unwrap(), tree_height(), item.clone()).unwrap(),
+            {
+                let other = RealmUserUpdateRequestDigest::derive(b"other", b"proof").unwrap();
+                RealmUserUpdatePublishRequest::try_new(admission(1, 10, 11, 12), UserId::new(13), other, tree_height(), queue_item(11, 13, other.stable_status())).unwrap()
+            },
         ] {
             assert_ne!(base.intent_id(), different_intent.intent_id());
         }
@@ -559,14 +566,14 @@ mod tests {
         assert!(RealmUserUpdateRequestDigest::try_new([0; 32]).is_err());
         let digest = RealmUserUpdateRequestDigest::derive(b"input", b"proof").unwrap();
         assert!(RealmUserUpdatePublishRequest::try_new(
-            admission(1, 10, 12, 12), UserId::new(13), digest, tree_height(), queue_item(11, 13)
+            admission(1, 10, 12, 12), UserId::new(13), digest, tree_height(), queue_item(11, 13, digest.stable_status())
         ).is_err());
-        let mut missing_status = queue_item(11, 13);
+        let mut missing_status = queue_item(11, 13, digest.stable_status());
         missing_status.expected_fake_checkpoint_id = 0;
         assert!(RealmUserUpdatePublishRequest::try_new(
             admission(1, 10, 11, 12), UserId::new(13), digest, tree_height(), missing_status
         ).is_err());
-        let mut wrong_group = queue_item(11, 13);
+        let mut wrong_group = queue_item(11, 13, digest.stable_status());
         wrong_group.job_id.group_id = 31;
         assert!(RealmUserUpdatePublishRequest::try_new(
             admission(1, 10, 11, 12), UserId::new(13), digest, tree_height(), wrong_group

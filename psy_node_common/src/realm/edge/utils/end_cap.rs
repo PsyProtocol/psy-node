@@ -8,7 +8,7 @@ use psy_data::{
     v1::qdata::contract::{serialize_imt_leaf_ffs_entry_v2, IMTContractStateUpdate},
 };
 use psy_node_core::qblob::{
-    blob_type::QBlobMerkleNodeTreeType,
+    blob_type::{QBlobMerkleNodeTreeType, QBLOB_IMT_LEAF_ENTRY_SIZE},
     data_views::single_merkle_node_batch::QBlobSingleIdMerkleRecorder,
     structs::common::{blob_metadata_header::QBlobWriterContextMetadataHeader, tree_node_batch_header::QBlobMerkleTreeNodeBatchHeaderV1},
 };
@@ -232,17 +232,17 @@ pub fn validate_end_cap_and_generate_node_data_for_edge<F: QFelt64, Hash: QDBHas
 
     let mut result = double_id_recorder.finalize_with_header(context);
     if !serialized_leaves.is_empty() {
-        let imt_entry_count = (serialized_leaves.len() / 161) as u64;
-        let mut imt_header = QBlobMerkleTreeNodeBatchHeaderV1::new_imt_leaf_header(
-            QBlobMerkleNodeTreeType::IMTContractStateLeaf,
-            context.chain_id,
-            context.created_by_node_id,
-            context.realm_id,
-            context.realm_sub_id,
-            context.unique_pending_id,
-            user_id,
+        let imt_entry_count =
+            (serialized_leaves.len() / QBLOB_IMT_LEAF_ENTRY_SIZE) as u64;
+        let mut imt_header =
+            QBlobMerkleTreeNodeBatchHeaderV1::new_imt_leaf_header_from_context(
+                context,
+                QBlobMerkleNodeTreeType::IMTContractStateLeaf,
+            );
+        imt_header.modify_for_final_count_and_size(
+            QBLOB_IMT_LEAF_ENTRY_SIZE as u32,
+            imt_entry_count,
         );
-        imt_header.modify_for_final_count_and_size(161, imt_entry_count);
         result.extend_from_slice(&imt_header.to_bytes_fixed_size_array());
         result.extend_from_slice(&serialized_leaves);
     }

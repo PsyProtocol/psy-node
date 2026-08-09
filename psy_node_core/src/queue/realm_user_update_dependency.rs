@@ -7,6 +7,7 @@ use parth_core::protocol::core_types::Q256BitHash;
 use sha2::{Digest, Sha256};
 
 use super::{
+    realm_user_update_artifact::ValidatedRealmUserUpdateArtifacts,
     realm_user_update_claim::{
         RealmUserUpdateClaimPhase, RealmUserUpdateClaimSlot,
         RealmUserUpdateDependencyDigest, StoredRealmUserUpdateClaim,
@@ -114,7 +115,7 @@ pub struct RealmUserUpdateDependencyBundle {
 }
 
 impl RealmUserUpdateDependencyBundle {
-    pub fn try_new<Hash: Q256BitHash>(
+    fn try_new<Hash: Q256BitHash>(
         claim: &StoredRealmUserUpdateClaim<Hash>,
         canonical_input: Vec<u8>,
         proof: Vec<u8>,
@@ -183,6 +184,28 @@ impl RealmUserUpdateDependencyBundle {
             components,
             digest,
         })
+    }
+
+    /// Build the persistable dependency set only from artifacts that already
+    /// passed the typed input/QBlob/slot/queue validation boundary.
+    pub fn try_new_validated<Hash: Q256BitHash>(
+        claim: &StoredRealmUserUpdateClaim<Hash>,
+        artifacts: &ValidatedRealmUserUpdateArtifacts<Hash>,
+    ) -> Result<Self, RealmUserUpdateDependencyError> {
+        if claim.pending() != artifacts.pending()
+            || claim.user_id() != artifacts.user_id()
+            || claim.request_digest() != artifacts.request_digest()
+        {
+            return Err(RealmUserUpdateDependencyError::RequestMismatch);
+        }
+        Self::try_new(
+            claim,
+            artifacts.canonical_input().to_vec(),
+            artifacts.proof().to_vec(),
+            artifacts.contract_updates().to_vec(),
+            artifacts.slot_updates().to_vec(),
+            artifacts.queue_payload().to_vec(),
+        )
     }
 
     pub fn reconstruct(
@@ -471,5 +494,14 @@ mod tests {
         proof[0].payload[0] ^= 1;
         assert!(reconstruct_component(RealmUserUpdateDependencyKind::Proof, proof).is_err());
         assert!(RealmUserUpdateDependencyBundle::reconstruct(bundle.claim_slot(), *bundle.request_digest(), bundle.stable_status(), bundle.created_at_seconds(), Vec::new(), bundle.digest()).is_err());
+    }
+
+    #[test]
+    fn raw_five_byte_components_are_not_a_public_bundle_constructor() {
+        let source = include_str!("realm_user_update_dependency.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        assert!(production.contains("fn try_new<Hash: Q256BitHash>("));
+        assert!(!production.contains("pub fn try_new<Hash: Q256BitHash>("));
+        assert!(production.contains("pub fn try_new_validated<Hash: Q256BitHash>("));
     }
 }
