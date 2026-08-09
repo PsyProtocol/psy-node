@@ -30,9 +30,16 @@ use psy_node_core::store::{
     realm_processor_startup::{
         RealmProcessorStartupError, RealmProcessorStartupEvidence,
         RealmProcessorStartupExpectation,
+        RealmProcessorFreshRunPermit,
         RealmProcessorStartupPreflightProvider,
         RealmProcessorStartupRouteObservation,
         RealmProcessorStartupRoutePhase,
+    },
+    realm_processor_branch_exact_runtime::{
+        InstalledRealmBranchExactCommitRuntime,
+        RealmBranchExactCommitRuntime,
+        RealmBranchExactCommitRuntimeInstaller,
+        RealmBranchExactRuntimeScope,
     },
 };
 use scylla::client::session::Session;
@@ -575,6 +582,64 @@ where
             validated_after.watermark_digest,
             validated_after.readiness_digest,
         )
+    }
+}
+
+impl<Hash> RealmBranchExactCommitRuntime<Hash>
+    for ScyllaRealmProcessorStartupPreflightProvider<Hash>
+where
+    Hash: Q256BitHash + Send + Sync + 'static,
+{
+    fn network(&self) -> NetworkId {
+        self.network
+    }
+
+    fn realm_id(&self) -> u32 {
+        match self.authority {
+            AuthorityScope::Realm { realm_id, .. } => realm_id,
+            AuthorityScope::Coordinator => {
+                unreachable!("Realm startup provider rejected Coordinator authority")
+            }
+        }
+    }
+
+    fn realm_sub_id(&self) -> u16 {
+        match self.authority {
+            AuthorityScope::Realm { realm_sub_id, .. } => realm_sub_id,
+            AuthorityScope::Coordinator => {
+                unreachable!("Realm startup provider rejected Coordinator authority")
+            }
+        }
+    }
+
+    fn writer_activation_digest(&self) -> [u8; 32] {
+        *self.writer_runtime.activation_digest().as_bytes()
+    }
+
+    fn scope(&self) -> RealmBranchExactRuntimeScope {
+        RealmBranchExactRuntimeScope::MappingAndRewardProofDualWrite
+    }
+}
+
+#[async_trait]
+impl<Hash> RealmBranchExactCommitRuntimeInstaller<Hash>
+    for ScyllaRealmProcessorStartupPreflightProvider<Hash>
+where
+    Hash: Q256BitHash + Send + Sync + 'static,
+{
+    async fn install(
+        self: Arc<Self>,
+        startup_permit: RealmProcessorFreshRunPermit,
+    ) -> Result<InstalledRealmBranchExactCommitRuntime<Hash>, RealmProcessorStartupError> {
+        // Authorization and runtime installation are separate linearization
+        // points. Re-read the complete seven-component composite and require
+        // byte-for-byte identical evidence before consuming the permit.
+        let fresh = self.fresh_read(startup_permit.expectation()).await?;
+        if fresh != startup_permit.evidence() {
+            return Err(RealmProcessorStartupError::ConcurrentMutation);
+        }
+        let runtime: Arc<dyn RealmBranchExactCommitRuntime<Hash>> = self;
+        InstalledRealmBranchExactCommitRuntime::seal(startup_permit, runtime)
     }
 }
 
@@ -1241,5 +1306,41 @@ mod tests {
             .unwrap();
         assert!(!expectation.contains("expected_watermark"));
         assert!(core.contains("hasher.update(evidence.watermark_digest.as_bytes())"));
+    }
+
+    #[test]
+    fn runtime_installation_fresh_reads_then_exactly_matches_before_seal() {
+        let source = include_str!("branch_exact_startup_preflight.rs");
+        let installer = source
+            .split("impl<Hash> RealmBranchExactCommitRuntimeInstaller<Hash>")
+            .nth(1)
+            .unwrap()
+            .split("#[derive(Clone, Debug, Eq, PartialEq)]")
+            .next()
+            .unwrap();
+
+        let fresh_read = installer
+            .find("self.fresh_read(startup_permit.expectation()).await?")
+            .expect("installation must resample the complete durable composite");
+        let exact_match = installer
+            .find("fresh != startup_permit.evidence()")
+            .expect("installation must match the authorized evidence exactly");
+        let seal = installer
+            .find("InstalledRealmBranchExactCommitRuntime::seal")
+            .expect("only an exactly matched permit may be consumed");
+        assert!(fresh_read < exact_match && exact_match < seal);
+
+        for forbidden in [
+            "compare_and_set",
+            "bootstrap(",
+            "create_schema",
+            "prepare_and_verify",
+            "finish_published",
+        ] {
+            assert!(
+                !installer.contains(forbidden),
+                "h23c4a installation must remain read-only: {forbidden}"
+            );
+        }
     }
 }

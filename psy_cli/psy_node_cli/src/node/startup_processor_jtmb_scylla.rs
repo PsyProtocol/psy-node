@@ -175,7 +175,12 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_realm_processor_node(co
                 branch_exact_lineage,
             )
             .await?;
-            let (db, startup_mode, startup_preflight) = composition.into_parts();
+            let (
+                db,
+                startup_mode,
+                startup_preflight,
+                commit_runtime_installer,
+            ) = composition.into_parts();
             tracing::info!("[REALM_BOOT] scylla store ready");
             let db = Arc::new(db);
             let tag_tree_rewards_store = db.clone();
@@ -202,6 +207,7 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_realm_processor_node(co
                 Arc::new(coordinator_client),
                 startup_mode,
                 startup_preflight,
+                commit_runtime_installer,
 
             )
             .await?;

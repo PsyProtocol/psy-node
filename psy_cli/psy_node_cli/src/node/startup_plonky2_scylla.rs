@@ -364,7 +364,12 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
                 branch_exact_lineage,
             )
             .await?;
-            let (db, startup_mode, startup_preflight) = composition.into_parts();
+            let (
+                db,
+                startup_mode,
+                startup_preflight,
+                commit_runtime_installer,
+            ) = composition.into_parts();
             let db = Arc::new(db);
             let tag_tree_rewards_store = db.clone();
             let coordinator_client = PsyRealmCoordinatorClientAPI::<N, _>::new(
@@ -389,6 +394,7 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
                 Arc::new(coordinator_client),
                 startup_mode,
                 startup_preflight,
+                commit_runtime_installer,
 
             )
             .await?;

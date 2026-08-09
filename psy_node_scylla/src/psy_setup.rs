@@ -12,6 +12,7 @@ use psy_node_core::{
             RealmProcessorStartupError, RealmProcessorStartupLineage,
             RealmProcessorStartupMode, RealmProcessorStartupPreflightProvider,
         },
+        realm_processor_branch_exact_runtime::RealmBranchExactCommitRuntimeInstaller,
     },
 };
 use rand::{rngs::OsRng, RngCore};
@@ -432,6 +433,8 @@ pub struct ScyllaRealmProcessorStartupComposition<N: QNetworkDatabaseTypes> {
     db: ScyllaUnifiedPsyStore<N, N::QHash, N::HasherBase>,
     startup_mode: RealmProcessorStartupMode,
     startup_preflight: Option<Arc<dyn RealmProcessorStartupPreflightProvider>>,
+    commit_runtime_installer:
+        Option<Arc<dyn RealmBranchExactCommitRuntimeInstaller<N::QHash>>>,
 }
 
 impl<N: QNetworkDatabaseTypes> ScyllaRealmProcessorStartupComposition<N> {
@@ -441,8 +444,14 @@ impl<N: QNetworkDatabaseTypes> ScyllaRealmProcessorStartupComposition<N> {
         ScyllaUnifiedPsyStore<N, N::QHash, N::HasherBase>,
         RealmProcessorStartupMode,
         Option<Arc<dyn RealmProcessorStartupPreflightProvider>>,
+        Option<Arc<dyn RealmBranchExactCommitRuntimeInstaller<N::QHash>>>,
     ) {
-        (self.db, self.startup_mode, self.startup_preflight)
+        (
+            self.db,
+            self.startup_mode,
+            self.startup_preflight,
+            self.commit_runtime_installer,
+        )
     }
 }
 
@@ -478,6 +487,7 @@ where
             db,
             startup_mode: RealmProcessorStartupMode::Disabled,
             startup_preflight: None,
+            commit_runtime_installer: None,
         });
     };
     if lineage.realm_id() != realm_id || lineage.realm_sub_id() != realm_sub_id {
@@ -536,16 +546,21 @@ where
     let expectation = lineage.seal_attempt(fresh_startup_nonce_excluding(
         recovery_expectation.startup_nonce(),
     ))?;
-    let provider = db
+    let provider = Arc::new(db
         .store
-        .prepare_realm_processor_startup_preflight(expectation)
-        .await?;
+        .prepare_realm_processor_startup_provider(expectation)
+        .await?);
+    let startup_preflight: Arc<dyn RealmProcessorStartupPreflightProvider> =
+        provider.clone();
+    let commit_runtime_installer:
+        Arc<dyn RealmBranchExactCommitRuntimeInstaller<N::QHash>> = provider;
     Ok(ScyllaRealmProcessorStartupComposition {
         db,
         startup_mode: RealmProcessorStartupMode::RequireBranchExact(
             expectation,
         ),
-        startup_preflight: Some(provider),
+        startup_preflight: Some(startup_preflight),
+        commit_runtime_installer: Some(commit_runtime_installer),
     })
 }
 
@@ -585,6 +600,7 @@ mod realm_startup_composition_tests {
         assert!(composition.contains("db:"));
         assert!(composition.contains("startup_mode:"));
         assert!(composition.contains("startup_preflight:"));
+        assert!(composition.contains("commit_runtime_installer:"));
         assert!(!composition.contains("pub db:"));
 
         let factory = source
@@ -613,9 +629,10 @@ mod realm_startup_composition_tests {
             .find("fresh_startup_nonce_excluding")
             .unwrap();
         let final_preflight = factory
-            .find("prepare_realm_processor_startup_preflight(expectation)")
+            .find("prepare_realm_processor_startup_provider(expectation)")
             .unwrap();
         assert!(recovery < fresh_run && fresh_run < final_preflight);
+        assert!(factory.contains("RealmBranchExactCommitRuntimeInstaller"));
         assert!(!factory.contains("startup_nonce:"));
     }
 

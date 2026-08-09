@@ -329,7 +329,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
             .await
     }
 
-    async fn prepare_realm_processor_startup_provider(
+    pub(crate) async fn prepare_realm_processor_startup_provider(
         &self,
         expectation: RealmProcessorStartupExpectation,
     ) -> Result<ScyllaRealmProcessorStartupPreflightProvider<Hash>, RealmProcessorStartupError>
@@ -553,7 +553,7 @@ mod branch_exact_startup_factory_tests {
     }
 
     #[test]
-    fn factory_returns_only_trait_object_and_is_confined_to_startup_composition() {
+    fn factory_returns_confined_trait_objects_and_is_confined_to_startup_composition() {
         let source = include_str!("core.rs");
         let factory = source
             .split("pub async fn prepare_realm_processor_startup_preflight")
@@ -568,7 +568,7 @@ mod branch_exact_startup_factory_tests {
         assert!(factory.contains("recover_realm_processor_startup"));
         assert!(factory.contains("recover_isolated(recovery_expectation)"));
         let provider_helper = factory
-            .split("async fn prepare_realm_processor_startup_provider")
+            .split("pub(crate) async fn prepare_realm_processor_startup_provider")
             .nth(1)
             .unwrap();
         assert!(
@@ -586,10 +586,11 @@ mod branch_exact_startup_factory_tests {
             .split("#[cfg(test)]")
             .next()
             .unwrap();
-        assert!(composition.contains("prepare_realm_processor_startup_preflight"));
+        assert!(composition.contains("prepare_realm_processor_startup_provider"));
+        assert!(composition.contains("RealmBranchExactCommitRuntimeInstaller"));
         assert_eq!(
             setup
-                .matches(".prepare_realm_processor_startup_preflight(")
+                .matches(".prepare_realm_processor_startup_provider(")
                 .count(),
             1
         );
