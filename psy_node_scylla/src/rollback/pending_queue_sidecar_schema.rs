@@ -1,6 +1,6 @@
 //! Exact, default-off schema boundary for the recoverable Realm queue.
 //!
-//! The thirteen target tables already have production-shaped adapters and RF=3
+//! The fourteen target tables already have production-shaped adapters and RF=3
 //! evidence, but historically only tests created them one by one.  This module
 //! gives deployment tooling one deterministic manifest/materializer and gives
 //! node startup an inspect-only capability.  Ordinary setup performs no queue
@@ -39,16 +39,18 @@ use super::{
     PendingQueuePublishKeyspaces, ScyllaPendingPipelineStore,
     ScyllaPendingQueueArtifactStore, ScyllaPendingQueuePublishStore,
     ScyllaPendingQueueSegmentLedgerStore, ScyllaRealmUserUpdateClaimStore,
+    ScyllaRealmUserUpdateDependencyStore,
     PENDING_QUEUE_ARTIFACT_FRAGMENT_TABLE,
     PENDING_QUEUE_ARTIFACT_HEADER_TABLE, PENDING_QUEUE_PUBLISH_FRAGMENT_TABLE,
     PENDING_QUEUE_PUBLISH_INTENT_TABLE, PENDING_QUEUE_PUBLISH_PREPARED_TABLE,
     PENDING_QUEUE_PUBLISH_SOURCE_TABLE, REALM_USER_UPDATE_CLAIM_TABLE,
+    REALM_USER_UPDATE_DEPENDENCY_FRAGMENT_TABLE,
 };
 
-pub const PENDING_QUEUE_SIDECAR_SCHEMA_VERSION: u16 = 2;
-pub const PENDING_QUEUE_SIDECAR_TARGET_TABLE_COUNT: usize = 13;
+pub const PENDING_QUEUE_SIDECAR_SCHEMA_VERSION: u16 = 3;
+pub const PENDING_QUEUE_SIDECAR_TARGET_TABLE_COUNT: usize = 14;
 const FINGERPRINT_DOMAIN: &[u8] =
-    b"psy/rollback/pending-queue-sidecar-schema/v2";
+    b"psy/rollback/pending-queue-sidecar-schema/v3";
 const INSPECT_COLUMNS_CQL: &str = "SELECT column_name, type, kind, position, clustering_order FROM system_schema.columns WHERE keyspace_name = ? AND table_name = ?";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -67,6 +69,7 @@ pub enum PendingQueueSidecarPhysicalTable {
     GenerationTerminal = 11,
     SegmentLifecycle = 12,
     UserUpdateClaim = 13,
+    UserUpdateDependencyFragment = 14,
 }
 
 impl PendingQueueSidecarPhysicalTable {
@@ -84,6 +87,7 @@ impl PendingQueueSidecarPhysicalTable {
         Self::GenerationTerminal,
         Self::SegmentLifecycle,
         Self::UserUpdateClaim,
+        Self::UserUpdateDependencyFragment,
     ];
 
     pub const fn table_name(self) -> &'static str {
@@ -101,12 +105,13 @@ impl PendingQueueSidecarPhysicalTable {
             Self::GenerationTerminal => PENDING_QUEUE_GENERATION_TERMINAL_TABLE,
             Self::SegmentLifecycle => PENDING_QUEUE_SEGMENT_LIFECYCLE_TABLE,
             Self::UserUpdateClaim => REALM_USER_UPDATE_CLAIM_TABLE,
+            Self::UserUpdateDependencyFragment => REALM_USER_UPDATE_DEPENDENCY_FRAGMENT_TABLE,
         }
     }
 
     pub const fn keyspace_kind(self) -> PendingQueueSidecarKeyspaceKind {
         match self {
-            Self::PublishFragment | Self::ArtifactFragment => {
+            Self::PublishFragment | Self::ArtifactFragment | Self::UserUpdateDependencyFragment => {
                 PendingQueueSidecarKeyspaceKind::StandardData
             }
             _ => PendingQueueSidecarKeyspaceKind::NoTabletControl,
@@ -253,7 +258,7 @@ const fn regular(
     PendingQueueSidecarColumnSpec { table, name, cql_type, kind: PendingQueueSidecarColumnKind::Regular, position: -1, clustering_order: PendingQueueSidecarClusteringOrder::None }
 }
 
-pub const PENDING_QUEUE_SIDECAR_EXPECTED_COLUMNS: [PendingQueueSidecarColumnSpec; 57] = [
+pub const PENDING_QUEUE_SIDECAR_EXPECTED_COLUMNS: [PendingQueueSidecarColumnSpec; 66] = [
     pk(PendingQueueSidecarPhysicalTable::Pipeline, "network_chain_id", "bigint", 0),
     pk(PendingQueueSidecarPhysicalTable::Pipeline, "authority_kind", "tinyint", 1),
     pk(PendingQueueSidecarPhysicalTable::Pipeline, "realm_id", "bigint", 2),
@@ -311,6 +316,15 @@ pub const PENDING_QUEUE_SIDECAR_EXPECTED_COLUMNS: [PendingQueueSidecarColumnSpec
     ck(PendingQueueSidecarPhysicalTable::UserUpdateClaim, "user_id", "bigint", 0),
     regular(PendingQueueSidecarPhysicalTable::UserUpdateClaim, "revision", "bigint"),
     regular(PendingQueueSidecarPhysicalTable::UserUpdateClaim, "claim_payload", "blob"),
+    pk(PendingQueueSidecarPhysicalTable::UserUpdateDependencyFragment, "dependency_slot", "blob", 0),
+    pk(PendingQueueSidecarPhysicalTable::UserUpdateDependencyFragment, "dependency_digest", "blob", 1),
+    pk(PendingQueueSidecarPhysicalTable::UserUpdateDependencyFragment, "component_kind", "smallint", 2),
+    ck(PendingQueueSidecarPhysicalTable::UserUpdateDependencyFragment, "fragment_index", "int", 0),
+    regular(PendingQueueSidecarPhysicalTable::UserUpdateDependencyFragment, "fragment_count", "int"),
+    regular(PendingQueueSidecarPhysicalTable::UserUpdateDependencyFragment, "component_bytes", "bigint"),
+    regular(PendingQueueSidecarPhysicalTable::UserUpdateDependencyFragment, "component_digest", "blob"),
+    regular(PendingQueueSidecarPhysicalTable::UserUpdateDependencyFragment, "payload", "blob"),
+    regular(PendingQueueSidecarPhysicalTable::UserUpdateDependencyFragment, "payload_digest", "blob"),
 ];
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -454,6 +468,13 @@ impl PendingQueueSidecarSchemaMaterializer {
         ScyllaPendingQueueArtifactStore::create_schema(session, &keyspaces.artifact_keyspaces()?).await.map_err(sidecar)?;
         ScyllaPendingQueuePublishStore::create_schema(session, &keyspaces.publish_keyspaces()?).await.map_err(sidecar)?;
         ScyllaRealmUserUpdateClaimStore::create_schema(session, &keyspaces.control).await.map_err(sidecar)?;
+        ScyllaRealmUserUpdateDependencyStore::create_schema(
+            session,
+            &PendingQueueArtifactDataKeyspace::try_new(keyspaces.data.as_str().to_owned())
+                .map_err(sidecar)?,
+        )
+        .await
+        .map_err(sidecar)?;
         let PendingQueueSidecarSchemaInspection::Exact { fingerprint } = Self::inspect_schema(session, keyspaces).await? else {
             return Err(PendingQueueSidecarSchemaError::DidNotConverge);
         };
@@ -492,11 +513,11 @@ mod tests {
     }
 
     #[test]
-    fn exact_manifest_is_thirteen_unique_tables_with_stable_placement() {
-        assert_eq!(PendingQueueSidecarPhysicalTable::ALL.len(), 13);
+    fn exact_manifest_is_fourteen_unique_tables_with_stable_placement() {
+        assert_eq!(PendingQueueSidecarPhysicalTable::ALL.len(), 14);
         let names = PendingQueueSidecarPhysicalTable::ALL.iter().map(|table| table.table_name()).collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(names.len(), 13);
-        assert_eq!(PendingQueueSidecarPhysicalTable::ALL.iter().filter(|table| table.keyspace_kind() == PendingQueueSidecarKeyspaceKind::StandardData).count(), 2);
+        assert_eq!(names.len(), 14);
+        assert_eq!(PendingQueueSidecarPhysicalTable::ALL.iter().filter(|table| table.keyspace_kind() == PendingQueueSidecarKeyspaceKind::StandardData).count(), 3);
         assert_eq!(PendingQueueSidecarPhysicalTable::ALL.iter().filter(|table| table.keyspace_kind() == PendingQueueSidecarKeyspaceKind::NoTabletControl).count(), 11);
         assert!(!names.contains(RETIRED_V1_PIPELINE_TABLE));
         assert_ne!(pending_queue_sidecar_schema_fingerprint().as_bytes(), &[0; 32]);
@@ -508,9 +529,12 @@ mod tests {
         let mut missing = exact_columns();
         missing.retain(|column| column.table != PendingQueueSidecarPhysicalTable::ConsumerGate);
         assert!(matches!(inspect_pending_queue_sidecar_columns(missing, false).unwrap(), PendingQueueSidecarSchemaInspection::Partial { .. }));
+        let mut old_thirteen = exact_columns();
+        old_thirteen.retain(|column| column.table != PendingQueueSidecarPhysicalTable::UserUpdateDependencyFragment);
+        assert!(matches!(inspect_pending_queue_sidecar_columns(old_thirteen, false).unwrap(), PendingQueueSidecarSchemaInspection::Partial { missing, .. } if missing == vec![PendingQueueSidecarPhysicalTable::UserUpdateDependencyFragment]));
         let mut old_twelve = exact_columns();
-        old_twelve.retain(|column| column.table != PendingQueueSidecarPhysicalTable::UserUpdateClaim);
-        assert!(matches!(inspect_pending_queue_sidecar_columns(old_twelve, false).unwrap(), PendingQueueSidecarSchemaInspection::Partial { missing, .. } if missing == vec![PendingQueueSidecarPhysicalTable::UserUpdateClaim]));
+        old_twelve.retain(|column| !matches!(column.table, PendingQueueSidecarPhysicalTable::UserUpdateClaim | PendingQueueSidecarPhysicalTable::UserUpdateDependencyFragment));
+        assert!(matches!(inspect_pending_queue_sidecar_columns(old_twelve, false).unwrap(), PendingQueueSidecarSchemaInspection::Partial { missing, .. } if missing == vec![PendingQueueSidecarPhysicalTable::UserUpdateClaim, PendingQueueSidecarPhysicalTable::UserUpdateDependencyFragment]));
         let mut incompatible = exact_columns();
         incompatible.push(ObservedPendingQueueSidecarColumn { table: PendingQueueSidecarPhysicalTable::Pipeline, name: "unexpected".to_owned(), cql_type: "blob".to_owned(), kind: "regular".to_owned(), position: -1, clustering_order: "none".to_owned() });
         assert!(matches!(inspect_pending_queue_sidecar_columns(incompatible, false), Err(PendingQueueSidecarSchemaError::IncompatibleTable { .. })));

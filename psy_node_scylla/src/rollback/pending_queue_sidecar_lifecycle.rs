@@ -1,4 +1,4 @@
-//! Durable deployment lifecycle for the thirteen recoverable-queue sidecars.
+//! Durable deployment lifecycle for the fourteen recoverable-queue sidecars.
 //!
 //! Deployment is explicit and restart-safe: first persist `Materializing`,
 //! idempotently create/inspect all target tables, then full-payload CAS to

@@ -164,7 +164,7 @@ async fn d04b6h23c4c1_queue_schema_lifecycle_rf3_gate() -> anyhow::Result<()> {
     ensure!(disabled_zero_queue_tables);
 
     let exact_receipt = PendingQueueSidecarDeploymentExecutor::deploy(session.clone(), keyspaces(EXACT)?).await?;
-    ensure!(target_table_count(&session, EXACT).await? == 14);
+    ensure!(target_table_count(&session, EXACT).await? == 15);
     let repeated = PendingQueueSidecarDeploymentExecutor::deploy(session.clone(), keyspaces(EXACT)?).await?;
     let idempotent_deploy = repeated == exact_receipt;
     ensure!(idempotent_deploy);
@@ -229,7 +229,7 @@ async fn d04b6h23c4c1_queue_schema_lifecycle_rf3_gate() -> anyhow::Result<()> {
     let report = H23c4c1Report {
         image: IMAGE,
         replication_factor: 3,
-        target_tables: 13,
+        target_tables: 14,
         lifecycle_tables: 1,
         disabled_zero_queue_tables,
         partial_retry_converged,

@@ -1,9 +1,10 @@
 //! Durable, driver-independent admission state for one Realm user update.
 //!
-//! The slot deliberately excludes the branch hash and proc identifier: a
-//! reused pending/user coordinate must conflict instead of silently accepting
-//! a different branch.  The complete [`PendingContext`] and the full request
-//! digest remain in the canonical payload and are compared on every retry.
+//! The slot deliberately includes the complete branch and proc identity. A
+//! new branch or generation therefore gets an isolated namespace, while one
+//! exact generation/user coordinate still has a single full-request winner.
+//! The complete [`PendingContext`] and request digest remain in the canonical
+//! payload and are compared on every retry.
 
 use std::{error::Error, fmt};
 
