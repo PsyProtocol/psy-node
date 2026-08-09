@@ -48,6 +48,30 @@ where
 
     loop {
         if processor.db.status.should_run() {
+            // This RAII owner covers the whole real iteration: sync may write
+            // catch-up state and process_block includes commit, authority
+            // publication, final sync, and cleanup. A controlled drain lets
+            // the current owner finish but rejects every subsequent iteration.
+            let _iteration_owner = match processor
+                .iteration_quiescence
+                .try_begin_iteration()
+            {
+                Ok(owner) => owner,
+                Err(
+                    psy_node_core::store::realm_processor_quiescence::RealmProcessorQuiescenceError::DrainInProgress,
+                ) => {
+                    sleep(std::time::Duration::from_millis(50)).await;
+                    continue;
+                }
+                Err(error) => {
+                    let error = format!(
+                        "Realm Processor iteration ownership failed closed: {error}"
+                    );
+                    processor.db.status.set_error(error.clone());
+                    tracing::error!("{error}");
+                    continue;
+                }
+            };
             // tracing::debug!("[REALM] Sync and verify starting...");
             let sync_result = processor.sync_and_verify().await;
             match sync_result {
@@ -100,6 +124,26 @@ where
     print_cf_log_indicator("PSY_REALM_PROCESSOR_STOPPED", &format!("R{}_{}", realm_id, realm_sub_id));
 
     Ok(())
+}
+
+#[cfg(test)]
+mod h23a_tests {
+    #[test]
+    fn real_loop_owner_lexically_covers_sync_and_process() {
+        let source = include_str!("runner.rs");
+        let owner_needle = concat!("let _iteration_", "owner");
+        let owner = source.find(owner_needle).unwrap();
+        let sync = source.find("processor.sync_and_verify().await").unwrap();
+        let process = source.find("processor.process_block().await").unwrap();
+        assert!(owner < sync && sync < process);
+        assert_eq!(source.matches(owner_needle).count(), 1);
+    }
+
+    #[test]
+    fn common_crate_does_not_depend_on_scylla() {
+        let cargo = include_str!("../../../../Cargo.toml");
+        assert!(!cargo.contains("psy_node_scylla"));
+    }
 }
 pub async fn run_realm_processor<
     N: QNetworkTypesConfig<JobId = QProvingJobDataID>,

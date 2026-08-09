@@ -188,7 +188,7 @@ where
         Ok(())
     }
 
-    pub async fn process_block(&mut self) -> anyhow::Result<()> {
+    pub(super) async fn process_block(&mut self) -> anyhow::Result<()> {
         self.db.run_sanity_check("process_block start").await?;
         let mut timer = TraceTimer::new("process_block");
         tracing::info!(

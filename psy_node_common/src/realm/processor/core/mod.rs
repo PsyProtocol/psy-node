@@ -4,7 +4,7 @@ use psy_data::
 ;
 use psy_io::tokio::TokioLikeFileSystem;
 use psy_node_core::{
-    p2p::traits::realm_coordinantor::RealmCoordinatorClient, psy_core_db::traits::full::{PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmProcessorStore}, psy_temp_db::StandardProcessorTempDBStoreBase, queue::{ephemeral::QStandardEphemeralQueueSubscriber, worker_queue::QStandardWorkerQueuePublisher}, store::traits::proof_store::QParthProofStore
+    p2p::traits::realm_coordinantor::RealmCoordinatorClient, psy_core_db::traits::full::{PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmProcessorStore}, psy_temp_db::StandardProcessorTempDBStoreBase, queue::{ephemeral::QStandardEphemeralQueueSubscriber, worker_queue::QStandardWorkerQueuePublisher}, store::{realm_processor_quiescence::RealmProcessorIterationGate, traits::proof_store::QParthProofStore}
 };
 
 use crate::{
@@ -49,4 +49,7 @@ pub struct PsyRealmProcessor<
         RealmGUTAEndCapGathererOutput<N::F, N::QHash, N::JobId>,
     >,
     pub proof_worker_queue_max_time_ms: u64,
+    /// The real loop owns the only iteration permit. Ordinary construction
+    /// installs `Disabled`; h23 does not open a production cutover flag.
+    pub(super) iteration_quiescence: RealmProcessorIterationGate,
 }

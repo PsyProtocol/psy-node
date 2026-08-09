@@ -112,10 +112,12 @@ where
                 db,
                 guta_queue_gatherer: guta_queue_gatherer,
                 proof_worker_queue_max_time_ms: u64::MAX,
+                iteration_quiescence: Default::default(),
             },
             guta_join_handle,
         ))
     }
+
     pub async fn get_latest_checkpoint_id_internal(&self) -> anyhow::Result<u64> {
         self.db.db.get_latest_checkpoint_id().await
     }

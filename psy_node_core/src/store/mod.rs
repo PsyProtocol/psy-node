@@ -20,6 +20,7 @@ pub mod realm_normal_commit_coverage;
 pub mod realm_prepared_payload;
 pub mod realm_proof_binding;
 pub mod realm_imt_mutation_graph;
+pub mod realm_processor_quiescence;
 pub mod rollback_admin;
 pub mod rollback_admission;
 pub mod rollback_control;
