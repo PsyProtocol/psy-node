@@ -15,6 +15,10 @@ use psy_node_core::store::rollback_admission::{
     RollbackAdmissionSlotBootstrap, RollbackAdmissionSlotReadState,
     RollbackAdmissionSlotWriteOutcome, SealedRollbackAdmissionSlotCas,
 };
+use psy_node_core::store::realm_processor_startup::{
+    RealmProcessorStartupError, RealmProcessorStartupExpectation,
+    RealmProcessorStartupPreflightProvider,
+};
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
 use crate::rollback::{
@@ -25,6 +29,7 @@ use crate::rollback::{
     ScyllaBranchExactSchemaSetupGate, ScyllaRollbackAdmissionStore,
     ScyllaBranchExactShadowReader,
 };
+use crate::rollback::branch_exact_startup_preflight::ScyllaRealmProcessorStartupPreflightProvider;
 use crate::tables::{merkle::ScyllaMerkleNodesZeroPreparedStatements, traits::ScyllaStandardPreparedTableStatements};
 use crate::tables::traits::ScyllaNoTabletPreparedTableStatements;
 
@@ -285,6 +290,47 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
         .await
     }
 
+    /// Prepare the only production-shaped Scylla provider accepted by an
+    /// enabled Realm startup. The factory is gated by the h20 in-memory ready
+    /// capability and returns only the driver-independent trait object; raw
+    /// Session ownership remains inside this crate.
+    ///
+    /// Ordinary setup never calls this method. A Coordinator-ready store or
+    /// a store whose physical Realm identity differs from the expectation is
+    /// rejected before any statement preparation.
+    pub async fn prepare_realm_processor_startup_preflight(
+        &self,
+        expectation: RealmProcessorStartupExpectation,
+    ) -> Result<Arc<dyn RealmProcessorStartupPreflightProvider>, RealmProcessorStartupError>
+    where
+        Hash: Q256BitHash + Send + Sync + 'static,
+        Hasher: Send + Sync + 'static,
+    {
+        let setup_ready = self
+            .branch_exact_schema_setup_view()
+            .ok_or_else(|| {
+                RealmProcessorStartupError::DurableEvidenceNotVerified(
+                    "branch-exact schema setup capability is disabled".to_owned(),
+                )
+            })?;
+        let authority = require_realm_startup_factory_identity(
+            self.realm_id,
+            self.realm_sub_id,
+            setup_ready.authority(),
+            expectation,
+        )?;
+        let provider = ScyllaRealmProcessorStartupPreflightProvider::<Hash>::prepare(
+            self.session.clone(),
+            &self.keyspace,
+            &self.no_tablet_keyspace,
+            expectation.network(),
+            authority,
+            setup_ready,
+        )
+        .await?;
+        Ok(Arc::new(provider))
+    }
+
     fn coordinator_canonical_head(&self) -> anyhow::Result<&ScyllaCanonicalHeadStore> {
         self.canonical_head_store
             .get()
@@ -304,6 +350,26 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
                 "Coordinator rollback-admission store was not initialized by Coordinator setup"
             ))
     }
+}
+
+fn require_realm_startup_factory_identity(
+    store_realm_id: u64,
+    store_realm_sub_id: u64,
+    setup_authority: psy_node_core::store::branch_exact_schema::AuthorityScope,
+    expectation: RealmProcessorStartupExpectation,
+) -> Result<psy_node_core::store::branch_exact_schema::AuthorityScope, RealmProcessorStartupError>
+{
+    let authority = psy_node_core::store::branch_exact_schema::AuthorityScope::Realm {
+        realm_id: expectation.realm_id(),
+        realm_sub_id: expectation.realm_sub_id(),
+    };
+    if setup_authority != authority
+        || store_realm_id != u64::from(expectation.realm_id())
+        || store_realm_sub_id != u64::from(expectation.realm_sub_id())
+    {
+        return Err(RealmProcessorStartupError::AuthorityMismatch);
+    }
+    Ok(authority)
 }
 
 #[async_trait]
@@ -387,5 +453,104 @@ where
             .coordinator_rollback_admission()?
             .compare_and_set(sealed)
             .await?)
+    }
+}
+
+#[cfg(test)]
+mod branch_exact_startup_factory_tests {
+    use psy_node_core::store::branch_exact_schema::AuthorityScope;
+
+    use super::*;
+
+    fn expectation(
+        realm_id: u32,
+        realm_sub_id: u16,
+    ) -> RealmProcessorStartupExpectation {
+        RealmProcessorStartupExpectation::try_new(
+            NetworkId::try_from_chain_id(1337).unwrap(),
+            realm_id,
+            realm_sub_id,
+            5,
+            [1; 32],
+            [2; 32],
+            [3; 32],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn factory_identity_requires_store_setup_and_expectation_to_match() {
+        let expected = AuthorityScope::Realm {
+            realm_id: 7,
+            realm_sub_id: 3,
+        };
+        assert_eq!(
+            require_realm_startup_factory_identity(
+                7,
+                3,
+                expected,
+                expectation(7, 3),
+            )
+            .unwrap(),
+            expected
+        );
+        for (store_realm, store_sub, setup) in [
+            (8, 3, expected),
+            (7, 4, expected),
+            (7, 3, AuthorityScope::Coordinator),
+            (
+                7,
+                3,
+                AuthorityScope::Realm {
+                    realm_id: 7,
+                    realm_sub_id: 4,
+                },
+            ),
+        ] {
+            assert_eq!(
+                require_realm_startup_factory_identity(
+                    store_realm,
+                    store_sub,
+                    setup,
+                    expectation(7, 3),
+                )
+                .unwrap_err(),
+                RealmProcessorStartupError::AuthorityMismatch
+            );
+        }
+    }
+
+    #[test]
+    fn factory_returns_only_trait_object_and_is_not_called_by_setup_or_cli() {
+        let source = include_str!("core.rs");
+        let factory = source
+            .split("pub async fn prepare_realm_processor_startup_preflight")
+            .nth(1)
+            .unwrap()
+            .split("fn coordinator_canonical_head")
+            .next()
+            .unwrap();
+        assert!(factory.contains("Arc<dyn RealmProcessorStartupPreflightProvider>"));
+        assert!(!factory.contains("Arc<Session>"));
+        assert!(factory.contains("branch_exact_schema_setup_view"));
+        assert!(
+            factory.find("branch_exact_schema_setup_view").unwrap()
+                < factory
+                    .find("ScyllaRealmProcessorStartupPreflightProvider")
+                    .unwrap()
+        );
+
+        let setup = include_str!("psy_setup.rs");
+        let plonky = include_str!(
+            "../../psy_cli/psy_node_cli/src/node/startup_plonky2_scylla.rs"
+        );
+        let jtmb = include_str!(
+            "../../psy_cli/psy_node_cli/src/node/startup_processor_jtmb_scylla.rs"
+        );
+        for production in [setup, plonky, jtmb] {
+            assert!(!production.contains(
+                "prepare_realm_processor_startup_preflight"
+            ));
+        }
     }
 }

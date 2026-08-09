@@ -106,6 +106,7 @@ pub(crate) struct ScyllaRealmProcessorStartupPreflightProvider<Hash> {
     head: ScyllaAuthorityLocalHeadStore,
     pending: ScyllaPendingPipelineStore,
     schema: ScyllaStartupSchemaReader,
+    setup_ready: BranchExactSchemaReadyView,
     _hash: PhantomData<Hash>,
 }
 
@@ -117,10 +118,14 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorStartupPreflightProvider<Hash> {
         no_tablet_keyspace: &str,
         network: NetworkId,
         authority: AuthorityScope,
+        setup_ready: BranchExactSchemaReadyView,
     ) -> Result<Self, RealmProcessorStartupError> {
         let AuthorityScope::Realm { .. } = authority else {
             return Err(RealmProcessorStartupError::AuthorityMismatch);
         };
+        if setup_ready.authority() != authority {
+            return Err(RealmProcessorStartupError::AuthorityMismatch);
+        }
         let control_keyspace = BranchExactDeploymentNoTabletKeyspace::try_new(
             no_tablet_keyspace.to_owned(),
         )
@@ -195,6 +200,7 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorStartupPreflightProvider<Hash> {
                 no_tablet_keyspace: no_tablet_keyspace.to_owned(),
                 authority,
             },
+            setup_ready,
             _hash: PhantomData,
         })
     }
@@ -320,6 +326,7 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorStartupPreflightProvider<Hash> {
             return Err(RealmProcessorStartupError::WriterActivationMismatch);
         }
         if binding.schema_digest_bytes() != sample.schema.digest().as_bytes()
+            || sample.schema != self.setup_ready
             || sample.schema.digest() != plan.schema_ready_digest()
             || binding.backfill_digest_bytes()
                 != plan.backfill_receipt().digest().as_bytes()
