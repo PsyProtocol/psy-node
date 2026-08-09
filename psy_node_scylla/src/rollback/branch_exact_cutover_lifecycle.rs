@@ -363,6 +363,18 @@ impl<Hash: Q256BitHash> BranchExactCutoverBinding<Hash> {
         self.writer_activation_digest.as_bytes()
     }
 
+    pub(crate) const fn schema_digest_bytes(&self) -> &[u8; 32] {
+        self.schema_digest.as_bytes()
+    }
+
+    pub(crate) const fn backfill_digest_bytes(&self) -> &[u8; 32] {
+        self.backfill_digest.as_bytes()
+    }
+
+    pub(crate) const fn shadow_consumed_digest_bytes(&self) -> &[u8; 32] {
+        self.shadow_consumed_digest.as_bytes()
+    }
+
     pub const fn authority_head_revision(&self) -> u64 {
         self.authority_head_revision
     }

@@ -32,6 +32,8 @@ mod branch_exact_shadow_audit;
 mod branch_exact_writer_lifecycle;
 mod branch_exact_writer_lifecycle_store;
 mod branch_exact_writer_runtime;
+#[allow(dead_code)]
+mod branch_exact_startup_preflight;
 mod branch_exact_pending_runtime;
 #[allow(dead_code)]
 mod branch_exact_pending_orchestration;

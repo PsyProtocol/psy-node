@@ -71,7 +71,6 @@ pub struct RealmProcessorStartupExpectation {
     expected_generation: u64,
     expected_binding_digest: RealmProcessorStartupBindingDigest,
     expected_writer_activation_digest: RealmProcessorStartupWriterActivationDigest,
-    expected_watermark_digest: RealmProcessorStartupWatermarkDigest,
     startup_nonce: [u8; 32],
     digest: RealmProcessorStartupRequestDigest,
 }
@@ -85,7 +84,6 @@ impl RealmProcessorStartupExpectation {
         expected_generation: u64,
         expected_binding_digest: [u8; 32],
         expected_writer_activation_digest: [u8; 32],
-        expected_watermark_digest: [u8; 32],
         startup_nonce: [u8; 32],
     ) -> Result<Self, RealmProcessorStartupError> {
         if expected_generation > i64::MAX as u64 {
@@ -100,8 +98,6 @@ impl RealmProcessorStartupExpectation {
             RealmProcessorStartupWriterActivationDigest::try_new(
                 expected_writer_activation_digest,
             )?;
-        let expected_watermark_digest =
-            RealmProcessorStartupWatermarkDigest::try_new(expected_watermark_digest)?;
         let digest = request_digest(
             network,
             realm_id,
@@ -109,7 +105,6 @@ impl RealmProcessorStartupExpectation {
             expected_generation,
             expected_binding_digest,
             expected_writer_activation_digest,
-            expected_watermark_digest,
             startup_nonce,
         )?;
         Ok(Self {
@@ -119,7 +114,6 @@ impl RealmProcessorStartupExpectation {
             expected_generation,
             expected_binding_digest,
             expected_writer_activation_digest,
-            expected_watermark_digest,
             startup_nonce,
             digest,
         })
@@ -149,10 +143,6 @@ impl RealmProcessorStartupExpectation {
         self,
     ) -> RealmProcessorStartupWriterActivationDigest {
         self.expected_writer_activation_digest
-    }
-
-    pub const fn expected_watermark_digest(self) -> RealmProcessorStartupWatermarkDigest {
-        self.expected_watermark_digest
     }
 
     pub const fn startup_nonce(self) -> [u8; 32] {
@@ -367,9 +357,6 @@ fn validate_evidence(
     if evidence.writer_activation_digest != expectation.expected_writer_activation_digest {
         return Err(RealmProcessorStartupError::WriterActivationMismatch);
     }
-    if evidence.watermark_digest != expectation.expected_watermark_digest {
-        return Err(RealmProcessorStartupError::WatermarkMismatch);
-    }
     Ok(())
 }
 
@@ -381,7 +368,6 @@ fn request_digest(
     generation: u64,
     binding: RealmProcessorStartupBindingDigest,
     writer: RealmProcessorStartupWriterActivationDigest,
-    watermark: RealmProcessorStartupWatermarkDigest,
     nonce: [u8; 32],
 ) -> Result<RealmProcessorStartupRequestDigest, RealmProcessorStartupError> {
     let mut hasher = Sha256::new();
@@ -392,7 +378,6 @@ fn request_digest(
     hasher.update(generation.to_be_bytes());
     hasher.update(binding.as_bytes());
     hasher.update(writer.as_bytes());
-    hasher.update(watermark.as_bytes());
     hasher.update(nonce);
     RealmProcessorStartupRequestDigest::try_new(hasher.finalize().into())
 }
@@ -421,6 +406,9 @@ pub enum RealmProcessorStartupError {
     CompositionNotIntegrated,
     UnexpectedProviderWhileDisabled,
     ProviderRejected(String),
+    DurableEvidenceNotVerified(String),
+    DurableRecoveryRequired(String),
+    DurableStorageIndeterminate(String),
     GenerationOutOfRange,
     RevisionOutOfRange,
     ZeroDigest,
@@ -430,7 +418,6 @@ pub enum RealmProcessorStartupError {
     RouteQuiescing,
     RouteMismatch,
     WriterActivationMismatch,
-    WatermarkMismatch,
 }
 
 impl fmt::Display for RealmProcessorStartupError {
@@ -462,7 +449,7 @@ mod tests {
 
     fn expectation() -> RealmProcessorStartupExpectation {
         RealmProcessorStartupExpectation::try_new(
-            network(), 7, 3, 11, [1; 32], [2; 32], [3; 32], [4; 32],
+            network(), 7, 3, 11, [1; 32], [2; 32], [4; 32],
         )
         .unwrap()
     }
@@ -646,16 +633,12 @@ mod tests {
             RealmProcessorStartupEvidence::try_new(
                 network(), 7, 3, evidence().route(), evidence().route(), [9; 32], [3; 32], [6; 32],
             ).unwrap(),
-            RealmProcessorStartupEvidence::try_new(
-                network(), 7, 3, evidence().route(), evidence().route(), [2; 32], [9; 32], [6; 32],
-            ).unwrap(),
         ];
         let expected_errors = [
             RealmProcessorStartupError::AuthorityMismatch,
             RealmProcessorStartupError::AuthorityMismatch,
             RealmProcessorStartupError::AuthorityMismatch,
             RealmProcessorStartupError::WriterActivationMismatch,
-            RealmProcessorStartupError::WatermarkMismatch,
         ];
         for (sample, expected) in fixtures.into_iter().zip(expected_errors) {
             let provider = FakeProvider {
@@ -678,21 +661,21 @@ mod tests {
     fn request_rejects_zero_and_cql_out_of_range_values() {
         assert_eq!(
             RealmProcessorStartupExpectation::try_new(
-                network(), 7, 3, i64::MAX as u64 + 1, [1; 32], [2; 32], [3; 32], [4; 32],
+                network(), 7, 3, i64::MAX as u64 + 1, [1; 32], [2; 32], [4; 32],
             )
             .unwrap_err(),
             RealmProcessorStartupError::GenerationOutOfRange
         );
         assert_eq!(
             RealmProcessorStartupExpectation::try_new(
-                network(), 7, 3, 1, [0; 32], [2; 32], [3; 32], [4; 32],
+                network(), 7, 3, 1, [0; 32], [2; 32], [4; 32],
             )
             .unwrap_err(),
             RealmProcessorStartupError::ZeroDigest
         );
         assert_eq!(
             RealmProcessorStartupExpectation::try_new(
-                network(), 7, 3, 1, [1; 32], [2; 32], [3; 32], [0; 32],
+                network(), 7, 3, 1, [1; 32], [2; 32], [0; 32],
             )
             .unwrap_err(),
             RealmProcessorStartupError::ZeroStartupNonce

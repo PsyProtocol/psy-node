@@ -350,7 +350,7 @@ impl StoredBranchExactShadowAudit {
         self.state.plan().slot()
     }
 
-    fn encode_state(&self) -> Vec<u8> {
+    pub(crate) fn encode_state(&self) -> Vec<u8> {
         encode_state(self)
     }
 
