@@ -164,12 +164,12 @@ struct H22e2bReport {
     qualification: &'static str,
 }
 
-struct ActivatedRealmWriter {
-    core: ScyllaCoreStore<PHash, PoseidonHasher>,
-    writer_store: ScyllaBranchExactWriterLifecycleStore,
-    plan: BranchExactWriterActivationPlan<PHash>,
-    predecessor: psy_node_core::store::branch_pending_mapping::BranchPendingMapping<PHash>,
-    baseline_timestamp: CommitWriteTimestampUs,
+pub(super) struct ActivatedRealmWriter {
+    pub(super) core: ScyllaCoreStore<PHash, PoseidonHasher>,
+    pub(super) writer_store: ScyllaBranchExactWriterLifecycleStore,
+    pub(super) plan: BranchExactWriterActivationPlan<PHash>,
+    pub(super) predecessor: psy_node_core::store::branch_pending_mapping::BranchPendingMapping<PHash>,
+    pub(super) baseline_timestamp: CommitWriteTimestampUs,
 }
 
 fn current_pipeline(
@@ -184,7 +184,7 @@ fn current_pipeline(
     }
 }
 
-async fn activate_realm_writer(
+pub(super) async fn activate_realm_writer(
     session: Arc<scylla::client::session::Session>,
 ) -> anyhow::Result<ActivatedRealmWriter> {
     for table in [

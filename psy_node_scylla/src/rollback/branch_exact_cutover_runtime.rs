@@ -215,13 +215,7 @@ impl<Hash: Q256BitHash> ScyllaBranchExactCutoverRuntime<Hash> {
             expected_binding_digest: request.expected_binding_digest,
         };
         let current = runtime.read_current().await?;
-        let fence = BranchExactCutoverRouteFence::try_from_current(&current)?;
-        runtime.validate_configured(&fence)?;
-        if current.binding().writer_activation_digest_bytes()
-            != runtime.writer.activation_digest().as_bytes()
-        {
-            return Err(BranchExactCutoverRuntimeError::WriterActivationMismatch);
-        }
+        runtime.validate_current_binding(&current)?;
         Ok(runtime)
     }
 
@@ -234,6 +228,16 @@ impl<Hash: Q256BitHash> ScyllaBranchExactCutoverRuntime<Hash> {
         let fence = BranchExactCutoverRouteFence::try_from_current(&current)?;
         self.validate_configured(&fence)?;
         Ok(fence)
+    }
+
+    /// Read the durable h22 writer row through the managed runtime boundary.
+    /// This is crate-visible for recovery qualification only; callers cannot
+    /// obtain the underlying store or bypass the route fence on writes.
+    pub(crate) async fn read_writer_state(
+        &self,
+    ) -> Result<super::StoredBranchExactWriterLifecycle<Hash>, BranchExactCutoverRuntimeError>
+    {
+        self.writer.read_writer().await.map_err(writer)
     }
 
     /// The route must be stable both before and after h22 writes become
@@ -440,7 +444,6 @@ pub enum BranchExactCutoverRuntimeError {
     CutoverUninitialized,
     ConfiguredEvidenceMismatch,
     AuthorityMismatch,
-    WriterActivationMismatch,
     RouteQuiescing,
     StaleRouteFence,
     ProcessorNotDrained,

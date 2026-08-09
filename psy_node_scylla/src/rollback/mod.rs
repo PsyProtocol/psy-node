@@ -56,6 +56,9 @@ mod pending_queue_consumer_gate_rf3;
 #[path = "../../tests/rf3/d04b6h22e2b_segment_lifecycle.rs"]
 mod pending_queue_segment_lifecycle_rf3;
 #[cfg(test)]
+#[path = "../../tests/rf3/d04b6h22e3_cutover.rs"]
+mod branch_exact_cutover_rf3;
+#[cfg(test)]
 mod branch_exact_shadow_reader_rf3_gate;
 #[cfg(test)]
 mod branch_exact_writer_rf3_gate;
