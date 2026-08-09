@@ -126,15 +126,6 @@ where
         // the first block and silently drop the genesis-time finalize output.
         self.db.set_new_unique_ids(None).await?;
 
-        // Sync the gatherer's queue key to the new gathering proc ID so the
-        // gatherer polls the same queue that end-cap submissions write to.
-        // set_new_unique_ids above advances gathering_proc_checkpoint_unique_id,
-        // but guta_queue_key_status_manager was initialized with the old ID
-        // and must be updated to match.
-        self.db
-            .guta_queue_key_status_manager
-            .set_unique_id(self.db.state.gathering_proc_checkpoint_unique_id)?;
-
         // Reset revert flag if it was set, as we are starting a fresh attempt
         if self.db.needs_revert {
             self.db.needs_revert = false;
@@ -142,6 +133,10 @@ where
 
         let guta_result = self
             .guta_queue_gatherer
+            // The gatherer actor owns the queue-key rotation. Mutating the
+            // shared status manager before sending this command would let a
+            // stale caller rotate a paused gatherer even though the command
+            // itself is rejected.
             .finalize_gathering_and_update_queue_key(self.db.state.gathering_proc_checkpoint_unique_id)
             .await?;
 
