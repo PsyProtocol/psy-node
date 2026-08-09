@@ -31,7 +31,11 @@ use psy_node_core::store::{
 };
 use sha2::{Digest, Sha256};
 
-use super::{BranchExactWriterActive, BranchExactWriterState, StoredBranchExactWriterLifecycle};
+use super::{
+    BranchExactWriterActive, BranchExactWriterState,
+    PersistedRealmUserUpdateGenerationQualifiedReceipt,
+    StoredBranchExactWriterLifecycle,
+};
 
 const CLOSE_DOMAIN: &[u8] = b"psy/rollback/pending-pipeline-close/v2";
 const WORK_SEAL_DOMAIN: &[u8] = b"psy/rollback/pending-pipeline-work-seal/v2";
@@ -307,6 +311,26 @@ pub fn seal_branch_exact_no_work<Hash: Q256BitHash>(
         .map_err(BranchExactPendingOrchestrationError::Pipeline)
 }
 
+/// Production-shaped no-work frontier transition. The empty processing seal
+/// is insufficient by itself: the current gathering generation must also be
+/// terminal-qualified at this exact pre-transition pipeline revision.
+pub(crate) fn seal_branch_exact_no_work_qualified<Hash: Q256BitHash>(
+    qualification: &PersistedRealmUserUpdateGenerationQualifiedReceipt<Hash>,
+    pipeline: &StoredPendingPipeline<Hash>,
+    writer: &StoredBranchExactWriterLifecycle<Hash>,
+    empty: VerifiedPendingQueueSeal,
+    observed: AuthorityObservation<Hash>,
+) -> Result<SealedPendingPipelineTransition<Hash>, BranchExactPendingOrchestrationError> {
+    qualification
+        .revalidate_pipeline(pipeline)
+        .map_err(|error| {
+            BranchExactPendingOrchestrationError::UserUpdateQualification(
+                error.to_string(),
+            )
+        })?;
+    seal_branch_exact_no_work(pipeline, writer, empty, observed)
+}
+
 /// Seal publish only from the exact durable `WritesVerified` writer state and
 /// an independently persisted authority observation for its candidate.
 pub fn seal_branch_exact_publish<Hash: Q256BitHash>(
@@ -338,6 +362,25 @@ pub fn seal_branch_exact_publish<Hash: Q256BitHash>(
     pipeline
         .seal_publish(expected_intent, receipt, observed)
         .map_err(BranchExactPendingOrchestrationError::Pipeline)
+}
+
+/// Production-shaped publish frontier transition. The opaque qualification
+/// is consumed only after a fresh revision/frontier comparison; a stale or
+/// foreign generation cannot authorize this call.
+pub(crate) fn seal_branch_exact_publish_qualified<Hash: Q256BitHash>(
+    qualification: &PersistedRealmUserUpdateGenerationQualifiedReceipt<Hash>,
+    pipeline: &StoredPendingPipeline<Hash>,
+    writer: &StoredBranchExactWriterLifecycle<Hash>,
+    observed: AuthorityObservation<Hash>,
+) -> Result<SealedPendingPipelineTransition<Hash>, BranchExactPendingOrchestrationError> {
+    qualification
+        .revalidate_pipeline(pipeline)
+        .map_err(|error| {
+            BranchExactPendingOrchestrationError::UserUpdateQualification(
+                error.to_string(),
+            )
+        })?;
+    seal_branch_exact_publish(pipeline, writer, observed)
 }
 
 /// Pure crash-gap classifier for the required cross-row publication order:
@@ -941,6 +984,7 @@ pub enum BranchExactPendingOrchestrationError {
     StartupStateMismatch,
     MissingActiveIntent,
     WriterAdvancedBeforePipeline,
+    UserUpdateQualification(String),
     GenerationNotStableEmpty {
         finalized_items: usize,
         post_switch_late_items: usize,
@@ -955,3 +999,26 @@ impl fmt::Display for BranchExactPendingOrchestrationError {
 }
 
 impl Error for BranchExactPendingOrchestrationError {}
+
+#[cfg(test)]
+mod terminal_qualification_tests {
+    #[test]
+    fn production_shaped_frontier_wrappers_require_fresh_qualification() {
+        let source = include_str!("branch_exact_pending_orchestration.rs");
+        for (qualified, legacy) in [
+            (
+                "seal_branch_exact_no_work_qualified",
+                "seal_branch_exact_no_work(",
+            ),
+            (
+                "seal_branch_exact_publish_qualified",
+                "seal_branch_exact_publish(",
+            ),
+        ] {
+            let body = source.split(qualified).nth(1).unwrap();
+            let revalidate = body.find("revalidate_pipeline").unwrap();
+            let transition = body.find(legacy).unwrap();
+            assert!(revalidate < transition);
+        }
+    }
+}

@@ -27,7 +27,9 @@ use psy_node_core::{
     },
     store::{
         pending_generation_identity::PendingGenerationLedgerKey,
-        pending_generation_pipeline::PendingPipelineReadState,
+        pending_generation_pipeline::{
+            PendingPipelineReadState, StoredPendingPipeline,
+        },
     },
 };
 use psy_node_nats::{
@@ -218,6 +220,35 @@ impl<F: QFelt64, Hash: Q256BitHash> ScyllaRealmEdgeDurablePublisher<F, Hash> {
             return Err(RealmUserUpdatePublishError::GenerationMismatch);
         }
         Ok(())
+    }
+
+    /// Fresh exact pipeline read used by terminal qualification and by its
+    /// pre-publish consumer. It never reserves, retargets or mutates a
+    /// generation.
+    pub(crate) async fn qualification_pipeline(
+        &self,
+        capture: PendingQueueCaptureContext,
+    ) -> Result<StoredPendingPipeline<Hash>, RealmUserUpdatePublishError> {
+        let key = PendingGenerationLedgerKey::new(self.network, self.authority);
+        if capture.key() != key {
+            return Err(RealmUserUpdatePublishError::GenerationMismatch);
+        }
+        let PendingPipelineReadState::Current(pipeline) =
+            self.pipeline.read::<Hash>(key).await.map_err(|error| {
+                RealmUserUpdatePublishError::Storage(error.to_string())
+            })?
+        else {
+            return Err(RealmUserUpdatePublishError::NotReady(
+                "pending pipeline is uninitialized".to_owned(),
+            ));
+        };
+        if pipeline.blocked_reason().is_some()
+            || pipeline.activation_digest() != capture.activation()
+            || pipeline.gathering() != capture.processing()
+        {
+            return Err(RealmUserUpdatePublishError::GenerationMismatch);
+        }
+        Ok(pipeline)
     }
 
     pub(crate) async fn publish_authorized(

@@ -16,7 +16,8 @@ use psy_data::protocol::{
         CheckpointRef, NetworkId,
     },
     chain_context::{
-        AuthorityScope, PendingContext, WorkProcCheckpointUniqueId,
+        AuthorityObservation, AuthorityScope, AuthorityStateCheckpointId,
+        AuthorityStateRoot, PendingContext, WorkProcCheckpointUniqueId,
         WorkUniquePendingId,
     },
 };
@@ -25,7 +26,8 @@ use psy_node_core::{
         realm_user_update_admission::{
             RealmUserUpdateAdmissionCloseIntent, RealmUserUpdateAdmissionKey,
             RealmUserUpdateAdmissionPhase, RealmUserUpdateAdmissionShard,
-            StoredRealmUserUpdateAdmission,
+            RealmUserUpdateGenerationQualification,
+            RealmUserUpdateQualificationFence, StoredRealmUserUpdateAdmission,
         },
         realm_user_update_claim::{
             RealmUserUpdateAdmissionOrdinal, RealmUserUpdateClaimBucket,
@@ -38,9 +40,14 @@ use psy_node_core::{
     },
     store::{
         pending_generation_identity::{
-            PendingGenerationActivationDigest, PendingGenerationContext,
+            PendingGenerationActivationDigest,
+            PendingGenerationBootstrapReason, PendingGenerationContext,
             PendingGenerationLedgerKey,
         },
+        pending_generation_pipeline::{
+            PendingPipelineBootstrap, StoredPendingPipeline,
+        },
+        pending_generation::ProcNamespacePrefix,
         typed::{UniquePendingId, UserId},
     },
 };
@@ -120,6 +127,51 @@ fn admission(
     Ok(RealmUserUpdatePublishAdmission::try_from_pipeline(
         pending, capture,
     )?)
+}
+
+fn qualification_pipeline(
+    admission: &RealmUserUpdatePublishAdmission<PHash>,
+) -> anyhow::Result<StoredPendingPipeline<PHash>> {
+    let capture = admission.capture();
+    let gathering = capture.processing();
+    let processing_pending = gathering
+        .pending_id()
+        .get()
+        .checked_sub(1)
+        .context("qualification fixture gathering must have a predecessor")?;
+    let processing_proc = gathering
+        .proc_checkpoint_id()
+        .as_u128()
+        .checked_sub(1)
+        .context("qualification fixture proc must have a predecessor")?;
+    let chain = *admission.pending().chain();
+    let observation = AuthorityObservation::try_new(
+        chain,
+        admission.pending().authority(),
+        AuthorityStateCheckpointId::new(chain.checkpoint().checkpoint_id().get()),
+        AuthorityStateRoot::from_local_state_root(PHash::from_owned_32bytes([
+            0x4d;
+            32
+        ])),
+    )?;
+    Ok(PendingPipelineBootstrap::try_new(
+        capture.key(),
+        capture.activation(),
+        ProcNamespacePrefix::for_authority(
+            capture.key().network(),
+            capture.key().authority(),
+        ),
+        PendingGenerationBootstrapReason::LegacyActivation,
+        PendingGenerationContext::try_from_legacy(
+            processing_pending,
+            processing_proc,
+        )?,
+        gathering,
+        observation,
+        processing_pending,
+    )?
+    .candidate()
+    .clone())
 }
 
 fn request(user: u64) -> anyhow::Result<RealmUserUpdateRequestDigest> {
@@ -728,6 +780,171 @@ async fn d04b6h23c4c2b3b2_claim_admission_close_rf3_gate(
     };
     let report_path =
         std::env::var("PSY_D04B6H23C4C2B3B2_REPORT_PATH")?;
+    std::fs::write(&report_path, serde_json::to_vec_pretty(&report)?)?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct QualificationStoreReport {
+    image: &'static str,
+    replication_factor: u8,
+    schema_version: u16,
+    target_tables: usize,
+    terminal_claims: usize,
+    concurrent_qualifiers: usize,
+    response_loss_retry: bool,
+    stale_frontier_rejected: bool,
+    one_replica_offline_qualified: bool,
+    repair_flush_compact: bool,
+    direct_one_nodes_equal: usize,
+    qualification: &'static str,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires isolated Scylla RF=3 docker-compose cluster"]
+async fn d04b6h23c4c2b3b2c2a_qualification_store_rf3_gate(
+) -> anyhow::Result<()> {
+    ensure!(
+        std::env::var("PSY_D04B6H23C4C2B3B2C2A_RF3").as_deref()
+            == Ok("1"),
+        "run through tests/rf3/run-d04b6h23c4c2b3b2c2a.sh"
+    );
+    let compose_file =
+        std::env::var("PSY_D04B6H23C4C2B3B2C2A_COMPOSE_FILE")?;
+    wait_up(3).await?;
+    let session = Arc::new(connect(None, Consistency::Quorum).await?);
+    session
+        .query_unpaged(
+            format!("CREATE KEYSPACE IF NOT EXISTS {DATA} WITH replication = {{'class': 'NetworkTopologyStrategy', 'datacenter1': 3}}"),
+            &[],
+        )
+        .await?;
+    session
+        .query_unpaged(
+            format!("CREATE KEYSPACE IF NOT EXISTS {} WITH replication = {{'class': 'NetworkTopologyStrategy', 'datacenter1': 3}} AND tablets = {{'enabled': false}}", control()),
+            &[],
+        )
+        .await?;
+    session.await_schema_agreement().await?;
+    PendingQueueSidecarDeploymentExecutor::deploy(
+        session.clone(),
+        PendingQueueSidecarKeyspaces::try_new(DATA, control())?,
+    )
+    .await?;
+
+    let (_, _, guard, publish_admission, key) = provisioned(session.clone(), 8).await?;
+    let close = close_intent(key)?;
+    let closed = guard.close_generation::<PHash>(key, close).await?;
+    ensure!(closed.phase() == RealmUserUpdateAdmissionPhase::GenerationClosed);
+    ensure!(closed.generation_manifest().unwrap().total().count() == 0);
+
+    let first = guard.qualification_input::<PHash>(key, close).await?;
+    let second = guard.qualification_input::<PHash>(key, close).await?;
+    let RealmUserUpdateQualificationInput::Closed(first) = first else {
+        bail!("first qualification input was not Closed")
+    };
+    let RealmUserUpdateQualificationInput::Closed(second) = second else {
+        bail!("second qualification input was not Closed")
+    };
+    let pipeline = qualification_pipeline(&publish_admission)?;
+    let fence = RealmUserUpdateQualificationFence::try_from_pipeline(key, &pipeline)?;
+    let membership = first
+        .header()
+        .generation_manifest()
+        .context("closed generation missing manifest")?;
+    ensure!(second.header().generation_manifest() == Some(membership));
+    let qualification = RealmUserUpdateGenerationQualification::from_terminal_evidence(
+        key,
+        close,
+        membership,
+        fence,
+        &[],
+    )?;
+
+    compose(Path::new(&compose_file), &["stop", "scylla3"])?;
+    wait_up(2).await?;
+    let (first_result, second_result) = tokio::join!(
+        guard.persist_qualification(first, qualification),
+        guard.persist_qualification(second, qualification),
+    );
+    let first_receipt = first_result?;
+    let second_receipt = second_result?;
+    first_receipt.revalidate_pipeline(&pipeline)?;
+    second_receipt.revalidate_pipeline(&pipeline)?;
+    ensure!(first_receipt.current() == second_receipt.current());
+    ensure!(
+        first_receipt.current().phase()
+            == RealmUserUpdateAdmissionPhase::GenerationQualified
+    );
+    let one_replica_offline_qualified = true;
+
+    let response_loss_retry = match guard
+        .qualification_input::<PHash>(key, close)
+        .await?
+    {
+        RealmUserUpdateQualificationInput::Qualified(receipt) => {
+            receipt.revalidate_pipeline(&pipeline)?;
+            receipt.current() == first_receipt.current()
+        }
+        RealmUserUpdateQualificationInput::Closed(_) => false,
+    };
+    ensure!(response_loss_retry);
+
+    let foreign = admission(9)?;
+    let foreign_pending = PendingContext::new(
+        *foreign.pending().chain(),
+        publish_admission.pending().authority(),
+        publish_admission.pending().unique_pending_id(),
+        publish_admission.pending().proc_checkpoint_unique_id(),
+    );
+    let foreign_frontier = RealmUserUpdatePublishAdmission::try_from_pipeline(
+        foreign_pending,
+        publish_admission.capture(),
+    )?;
+    let stale_pipeline = qualification_pipeline(&foreign_frontier)?;
+    let stale_frontier_rejected = first_receipt
+        .revalidate_pipeline(&stale_pipeline)
+        .is_err();
+    ensure!(stale_frontier_rejected);
+
+    compose(Path::new(&compose_file), &["start", "scylla3"])?;
+    wait_up(3).await?;
+    for node in NODE_CONTAINERS {
+        docker_exec_retry(node, &["nodetool", "repair", "-pr", &control()], 24)?;
+        docker_exec(node, &["nodetool", "flush", &control()])?;
+        docker_exec(node, &["nodetool", "compact", &control()])?;
+    }
+    let mut direct = Vec::new();
+    for ip in NODE_IPS {
+        let local = connect(Some(ip), Consistency::One).await?;
+        direct.push(direct_snapshot(&local, publish_admission.capture()).await?);
+    }
+    let direct_one_nodes_equal = direct
+        .windows(2)
+        .all(|pair| pair[0] == pair[1])
+        .then_some(direct.len())
+        .unwrap_or(0);
+    ensure!(direct_one_nodes_equal == 3);
+    ensure!(direct[0].gates.len() == 257);
+    ensure!(direct[0].claims.is_empty());
+
+    let report = QualificationStoreReport {
+        image: IMAGE,
+        replication_factor: 3,
+        schema_version: PENDING_QUEUE_SIDECAR_SCHEMA_VERSION,
+        target_tables: PENDING_QUEUE_SIDECAR_TARGET_TABLE_COUNT,
+        terminal_claims: 0,
+        concurrent_qualifiers: 2,
+        response_loss_retry,
+        stale_frontier_rejected,
+        one_replica_offline_qualified,
+        repair_flush_compact: true,
+        direct_one_nodes_equal,
+        qualification: "H23C4C2B3B2C2A_QUALIFICATION_STORE_RF3_PASSED",
+    };
+    let report_path =
+        std::env::var("PSY_D04B6H23C4C2B3B2C2A_REPORT_PATH")?;
     std::fs::write(&report_path, serde_json::to_vec_pretty(&report)?)?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())

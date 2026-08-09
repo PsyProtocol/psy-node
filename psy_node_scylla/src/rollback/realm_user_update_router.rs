@@ -18,6 +18,13 @@ use psy_data::protocol::{
 };
 use psy_node_core::{
     queue::{
+        realm_user_update_admission::{
+            RealmUserUpdateAdmissionCloseIntent,
+            RealmUserUpdateAdmissionKey,
+            RealmUserUpdateGenerationQualification,
+            RealmUserUpdateQualificationFence,
+            RealmUserUpdateTerminalEvidence,
+        },
         realm_user_update_artifact::{
             rehydrate_realm_user_update_artifacts,
             ValidatedRealmUserUpdateArtifacts, VerifiedRealmUserUpdateProof,
@@ -49,6 +56,8 @@ use super::{
     RealmUserUpdateClaimWriteOutcome, ScyllaRealmEdgeDurablePublisher,
     ScyllaRealmUserUpdateAdmissionGuard, ScyllaRealmUserUpdateAdmissionStore,
     ScyllaRealmUserUpdateClaimStore, ScyllaRealmUserUpdateDependencyStore,
+    PersistedRealmUserUpdateGenerationQualifiedReceipt,
+    RealmUserUpdateQualificationInput,
 };
 
 const MAX_PHASE_STEPS: usize = 8;
@@ -170,6 +179,123 @@ where
         &self,
     ) -> Result<RealmUserUpdatePublishAdmission<Hash>, RealmUserUpdateRouterError> {
         self.publisher.admit().await.map_err(router)
+    }
+
+    /// Qualify one exact, already-closed gathering generation. This path is
+    /// read-only until the final full-payload header CAS and never performs a
+    /// new NATS publish. Every claim must already be Published and recover an
+    /// exact historical SourceCommitted permit.
+    pub(crate) async fn qualify_generation(
+        &self,
+        key: RealmUserUpdateAdmissionKey,
+        close: RealmUserUpdateAdmissionCloseIntent,
+    ) -> Result<
+        PersistedRealmUserUpdateGenerationQualifiedReceipt<Hash>,
+        RealmUserUpdateRouterError,
+    > {
+        if key.capture().key().network() != self.network
+            || key.capture().key().authority() != self.authority
+        {
+            return Err(RealmUserUpdateRouterError::ScopeMismatch);
+        }
+        let input = self
+            .admission_guard
+            .qualification_input::<Hash>(key, close)
+            .await
+            .map_err(router)?;
+        if let RealmUserUpdateQualificationInput::Qualified(receipt) = input {
+            let pipeline = self
+                .publisher
+                .qualification_pipeline(key.capture())
+                .await
+                .map_err(router)?;
+            receipt.revalidate_pipeline(&pipeline).map_err(router)?;
+            return Ok(receipt);
+        }
+        let RealmUserUpdateQualificationInput::Closed(closed) = input else {
+            unreachable!("qualified input returned above")
+        };
+
+        let total = closed.claims().len();
+        let terminal = closed
+            .claims()
+            .iter()
+            .filter(|claim| {
+                claim.phase() == RealmUserUpdateClaimPhase::Published
+                    && claim.dependency_digest().is_some()
+                    && claim.publish_receipt_digest().is_some()
+            })
+            .count();
+        if terminal != total {
+            return Err(RealmUserUpdateRouterError::AwaitTerminalClaims {
+                terminal,
+                total,
+            });
+        }
+
+        let pipeline = self
+            .publisher
+            .qualification_pipeline(key.capture())
+            .await
+            .map_err(router)?;
+        let fence = RealmUserUpdateQualificationFence::try_from_pipeline(
+            key,
+            &pipeline,
+        )
+        .map_err(router)?;
+        let mut evidence = Vec::with_capacity(total);
+        for claim in closed.claims() {
+            self.validate_claim_scope(claim)?;
+            let bundle = self.read_dependencies(claim).await?;
+            let request = RealmUserUpdatePublishRequest::try_from_persisted_dependencies(
+                claim,
+                &bundle,
+                self.global_user_tree_height,
+            )
+            .map_err(router)?;
+            let permit = self
+                .publisher
+                .observe_authorized(request.clone())
+                .await
+                .map_err(router)?
+                .ok_or(RealmUserUpdateRouterError::TerminalSourceMissing)?;
+            evidence.push(
+                RealmUserUpdateTerminalEvidence::try_from_observed(
+                    key,
+                    &fence,
+                    claim,
+                    &request,
+                    permit.receipt(),
+                )
+                .map_err(router)?,
+            );
+        }
+        let membership = closed
+            .header()
+            .generation_manifest()
+            .ok_or(RealmUserUpdateRouterError::QualificationConflict)?;
+        let qualification = RealmUserUpdateGenerationQualification::from_terminal_evidence(
+            key,
+            close,
+            membership,
+            fence,
+            &evidence,
+        )
+        .map_err(router)?;
+
+        // A long 256-bucket/source scan never authorizes a stale frontier.
+        let fresh = self
+            .publisher
+            .qualification_pipeline(key.capture())
+            .await
+            .map_err(router)?;
+        if !qualification.fence().matches_pipeline(key, &fresh) {
+            return Err(RealmUserUpdateRouterError::QualificationConflict);
+        }
+        self.admission_guard
+            .persist_qualification(closed, qualification)
+            .await
+            .map_err(router)
     }
 
     /// Win or resume the exact already-verified request claim. Invalid proof
@@ -574,6 +700,12 @@ pub(crate) enum RealmUserUpdateRouterError {
     DependencyMissing,
     DependencyConflict,
     TerminalEvidenceMismatch,
+    AwaitTerminalClaims {
+        terminal: usize,
+        total: usize,
+    },
+    TerminalSourceMissing,
+    QualificationConflict,
     TransitionConflict,
     InvalidPhase,
     PhaseStepLimit,
@@ -616,6 +748,27 @@ mod tests {
         assert_eq!(RealmUserUpdateClaimPhase::DependenciesReady as u8, 3);
         assert_eq!(RealmUserUpdateClaimPhase::Published as u8, 4);
         assert_eq!(MAX_PHASE_STEPS, 8);
+    }
+
+    #[test]
+    fn qualifier_is_terminal_first_historical_only_and_full_payload_cas() {
+        let source = include_str!("realm_user_update_router.rs");
+        let start = source.find("pub(crate) async fn qualify_generation").unwrap();
+        let end = source[start..]
+            .find("    /// Win or resume")
+            .map(|offset| start + offset)
+            .unwrap();
+        let qualifier = &source[start..end];
+        let terminal_check = qualifier.find("terminal != total").unwrap();
+        let observer = qualifier.find("observe_authorized").unwrap();
+        let persist = qualifier.find("persist_qualification").unwrap();
+        assert!(terminal_check < observer && observer < persist);
+        assert!(qualifier.contains("try_from_persisted_dependencies"));
+        assert!(qualifier.contains("qualification_pipeline"));
+        assert!(qualifier.contains("matches_pipeline"));
+        assert!(!qualifier.contains("publish_authorized"));
+        assert!(!qualifier.contains("materialize_data"));
+        assert!(!qualifier.contains("publish_and_commit"));
     }
 
     #[test]
