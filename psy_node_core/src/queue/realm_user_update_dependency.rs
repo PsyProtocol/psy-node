@@ -123,7 +123,13 @@ impl RealmUserUpdateDependencyBundle {
         slot_updates: Vec<u8>,
         queue_payload: Vec<u8>,
     ) -> Result<Self, RealmUserUpdateDependencyError> {
-        if claim.phase() != RealmUserUpdateClaimPhase::Claimed {
+        if !matches!(
+            claim.phase(),
+            RealmUserUpdateClaimPhase::Claimed
+                | RealmUserUpdateClaimPhase::DependenciesPlanned
+                | RealmUserUpdateClaimPhase::DependenciesReady
+                | RealmUserUpdateClaimPhase::Published
+        ) {
             return Err(RealmUserUpdateDependencyError::ClaimNotOpen);
         }
         let total = canonical_input
@@ -192,7 +198,9 @@ impl RealmUserUpdateDependencyBundle {
         claim: &StoredRealmUserUpdateClaim<Hash>,
         artifacts: &ValidatedRealmUserUpdateArtifacts<Hash>,
     ) -> Result<Self, RealmUserUpdateDependencyError> {
-        if claim.pending() != artifacts.pending()
+        if claim.slot() != artifacts.claim_slot()
+            || claim.created_at().get() != artifacts.created_at_seconds()
+            || claim.pending() != artifacts.pending()
             || claim.user_id() != artifacts.user_id()
             || claim.request_digest() != artifacts.request_digest()
         {

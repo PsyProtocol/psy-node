@@ -47,10 +47,13 @@ use super::{
     REALM_USER_UPDATE_DEPENDENCY_FRAGMENT_TABLE,
 };
 
-pub const PENDING_QUEUE_SIDECAR_SCHEMA_VERSION: u16 = 3;
+// v4 keeps the 14-table CQL shape but binds claim payload codec v2 and the
+// DependenciesPlanned recovery phase. A v3 VERIFIED receipt cannot authorize
+// the new router even though system_schema columns are unchanged.
+pub const PENDING_QUEUE_SIDECAR_SCHEMA_VERSION: u16 = 4;
 pub const PENDING_QUEUE_SIDECAR_TARGET_TABLE_COUNT: usize = 14;
 const FINGERPRINT_DOMAIN: &[u8] =
-    b"psy/rollback/pending-queue-sidecar-schema/v3";
+    b"psy/rollback/pending-queue-sidecar-schema/v4";
 const INSPECT_COLUMNS_CQL: &str = "SELECT column_name, type, kind, position, clustering_order FROM system_schema.columns WHERE keyspace_name = ? AND table_name = ?";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

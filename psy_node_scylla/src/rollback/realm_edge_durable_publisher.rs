@@ -61,6 +61,23 @@ pub struct ScyllaRealmEdgeDurablePublisher<F, Hash> {
     _types: PhantomData<(F, Hash)>,
 }
 
+/// Authorizing publication evidence. Unlike the public DTO, this type can
+/// only be minted after the concrete Scylla/NATS publisher has completed its
+/// exact commit/readback path.
+pub(crate) struct ScyllaRealmUserUpdatePublicationPermit {
+    receipt: RealmUserUpdatePublishReceipt,
+}
+
+impl ScyllaRealmUserUpdatePublicationPermit {
+    pub(crate) const fn receipt(&self) -> &RealmUserUpdatePublishReceipt {
+        &self.receipt
+    }
+
+    fn into_receipt(self) -> RealmUserUpdatePublishReceipt {
+        self.receipt
+    }
+}
+
 impl<F: QFelt64, Hash: Q256BitHash> ScyllaRealmEdgeDurablePublisher<F, Hash> {
     pub(crate) async fn prepare(
         session: Arc<Session>,
@@ -192,10 +209,21 @@ impl<F: QFelt64, Hash: Q256BitHash> ScyllaRealmEdgeDurablePublisher<F, Hash> {
         )
     }
 
-    async fn publish_exact(
+    pub(crate) async fn revalidate_admission(
+        &self,
+        admission: &RealmUserUpdatePublishAdmission<Hash>,
+    ) -> Result<(), RealmUserUpdatePublishError> {
+        let current = self.admit_exact().await?;
+        if &current != admission {
+            return Err(RealmUserUpdatePublishError::GenerationMismatch);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn publish_authorized(
         &self,
         request: RealmUserUpdatePublishRequest<F, Hash>,
-    ) -> Result<RealmUserUpdatePublishReceipt, RealmUserUpdatePublishError> {
+    ) -> Result<ScyllaRealmUserUpdatePublicationPermit, RealmUserUpdatePublishError> {
         if request.pending().chain().network_id() != self.network {
             return Err(RealmUserUpdatePublishError::NetworkMismatch);
         }
@@ -303,7 +331,7 @@ impl<F: QFelt64, Hash: Q256BitHash> ScyllaRealmEdgeDurablePublisher<F, Hash> {
             .publish_and_commit(&assignment, permit)
             .await
             .map_err(storage)?;
-        RealmUserUpdatePublishReceipt::durable(
+        let receipt = RealmUserUpdatePublishReceipt::durable(
             request.intent_id(),
             *assignment.assignment().digest().as_bytes(),
             committed.subject_sequence(),
@@ -312,7 +340,60 @@ impl<F: QFelt64, Hash: Q256BitHash> ScyllaRealmEdgeDurablePublisher<F, Hash> {
                 committed.disposition(),
                 super::PendingQueueNatsPublishDisposition::PubAck
             ),
+        )?;
+        Ok(ScyllaRealmUserUpdatePublicationPermit { receipt })
+    }
+
+    /// Read historical committed evidence without requiring the request's
+    /// generation to remain the current gathering generation. This never
+    /// materializes, binds, or publishes a new intent.
+    pub(crate) async fn observe_authorized(
+        &self,
+        request: RealmUserUpdatePublishRequest<F, Hash>,
+    ) -> Result<Option<ScyllaRealmUserUpdatePublicationPermit>, RealmUserUpdatePublishError> {
+        if request.pending().chain().network_id() != self.network {
+            return Err(RealmUserUpdatePublishError::NetworkMismatch);
+        }
+        if request.pending().authority() != self.authority {
+            return Err(RealmUserUpdatePublishError::AuthorityMismatch);
+        }
+        let assignment = self
+            .ledger
+            .read_assignment_exact(&self.ledger_key, request.admission().capture())
+            .await
+            .map_err(|error| RealmUserUpdatePublishError::NotReady(error.to_string()))?;
+        if assignment.assignment().segment_id() != self.segment.segment_id()
+            || assignment.assignment().contract_digest() != self.segment.digest()
+        {
+            return Err(RealmUserUpdatePublishError::NotReady(
+                "historical assignment does not match configured publisher".to_owned(),
+            ));
+        }
+        let intent_id = PendingQueuePublishIntentId::try_new(
+            *request.intent_id().as_bytes(),
         )
+        .map_err(|error| RealmUserUpdatePublishError::Storage(error.to_string()))?;
+        let committed = self
+            .publish
+            .observe_committed_data(
+                &assignment,
+                PendingQueuePublisherKind::RealmUserUpdate,
+                intent_id,
+                request.payload(),
+            )
+            .await
+            .map_err(storage)?;
+        let Some(committed) = committed else {
+            return Ok(None);
+        };
+        let receipt = RealmUserUpdatePublishReceipt::durable(
+            request.intent_id(),
+            *assignment.assignment().digest().as_bytes(),
+            committed.subject_sequence(),
+            *committed.envelope_digest(),
+            true,
+        )?;
+        Ok(Some(ScyllaRealmUserUpdatePublicationPermit { receipt }))
     }
 }
 
@@ -333,7 +414,9 @@ where
         &self,
         request: RealmUserUpdatePublishRequest<F, Hash>,
     ) -> Result<RealmUserUpdatePublishReceipt, RealmUserUpdatePublishError> {
-        self.publish_exact(request).await
+        self.publish_authorized(request)
+            .await
+            .map(ScyllaRealmUserUpdatePublicationPermit::into_receipt)
     }
 }
 

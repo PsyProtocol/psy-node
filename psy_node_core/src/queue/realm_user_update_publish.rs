@@ -23,8 +23,16 @@ use crate::store::{
     pending_generation_identity::PendingGenerationContext,
     typed::{UniquePendingId, UserId},
 };
-use super::recoverable_ephemeral::{
-    PendingQueueCaptureContext, PendingQueueCaptureContextDigest,
+use super::{
+    realm_user_update_claim::{
+        RealmUserUpdateClaimPhase, StoredRealmUserUpdateClaim,
+    },
+    realm_user_update_dependency::{
+        RealmUserUpdateDependencyBundle, RealmUserUpdateDependencyKind,
+    },
+    recoverable_ephemeral::{
+        PendingQueueCaptureContext, PendingQueueCaptureContextDigest,
+    },
 };
 
 const REQUEST_DIGEST_DOMAIN: &[u8] =
@@ -176,6 +184,7 @@ pub struct RealmUserUpdatePublishRequest<F, Hash> {
     admission: RealmUserUpdatePublishAdmission<Hash>,
     generation: PendingGenerationContext,
     user_id: UserId,
+    global_user_tree_height: GlobalUserTreeHeight,
     request_digest: RealmUserUpdateRequestDigest,
     payload_digest: [u8; 32],
     payload: Vec<u8>,
@@ -252,12 +261,69 @@ impl<F: QFelt64, Hash: Q256BitHash> RealmUserUpdatePublishRequest<F, Hash> {
             admission,
             generation,
             user_id,
+            global_user_tree_height,
             request_digest,
             payload_digest,
             payload,
             intent_id,
             _felt: PhantomData,
         })
+    }
+
+    /// Rebuild the exact publish command after dependency readback.  The
+    /// caller cannot replace admission, request identity, or payload: all are
+    /// recovered from the full-payload claim and its digest-bound bundle.
+    pub fn try_from_dependencies_ready(
+        claim: &StoredRealmUserUpdateClaim<Hash>,
+        bundle: &RealmUserUpdateDependencyBundle,
+        global_user_tree_height: GlobalUserTreeHeight,
+    ) -> Result<Self, RealmUserUpdatePublishError> {
+        if claim.phase() != RealmUserUpdateClaimPhase::DependenciesReady {
+            return Err(RealmUserUpdatePublishError::DependencyMismatch);
+        }
+        Self::try_from_persisted_dependencies(
+            claim,
+            bundle,
+            global_user_tree_height,
+        )
+    }
+
+    pub fn try_from_persisted_dependencies(
+        claim: &StoredRealmUserUpdateClaim<Hash>,
+        bundle: &RealmUserUpdateDependencyBundle,
+        global_user_tree_height: GlobalUserTreeHeight,
+    ) -> Result<Self, RealmUserUpdatePublishError> {
+        if !matches!(
+            claim.phase(),
+            RealmUserUpdateClaimPhase::DependenciesReady
+                | RealmUserUpdateClaimPhase::Published
+        )
+            || claim.dependency_digest() != Some(bundle.digest())
+            || claim.slot() != bundle.claim_slot()
+            || claim.request_digest().as_bytes() != bundle.request_digest()
+            || claim.stable_status() != bundle.stable_status()
+            || claim.created_at().get() != bundle.created_at_seconds()
+        {
+            return Err(RealmUserUpdatePublishError::DependencyMismatch);
+        }
+        let payload = bundle
+            .component(RealmUserUpdateDependencyKind::QueuePayload)
+            .bytes();
+        let item = PsyRealmUserUpdateQueueItem::<F, Hash>::decode_queue_item_ref(payload)
+            .map_err(|error| RealmUserUpdatePublishError::QueueItemCodec(error.to_string()))?;
+        let request = Self::try_new(
+            claim
+                .reconstruct_admission()
+                .map_err(|error| RealmUserUpdatePublishError::Claim(error.to_string()))?,
+            claim.user_id(),
+            claim.request_digest(),
+            global_user_tree_height,
+            item,
+        )?;
+        if request.payload() != payload {
+            return Err(RealmUserUpdatePublishError::QueueItemNotCanonical);
+        }
+        Ok(request)
     }
 
     pub const fn pending(&self) -> &PendingContext<Hash> {
@@ -274,6 +340,10 @@ impl<F: QFelt64, Hash: Q256BitHash> RealmUserUpdatePublishRequest<F, Hash> {
 
     pub const fn user_id(&self) -> UserId {
         self.user_id
+    }
+
+    pub const fn global_user_tree_height(&self) -> GlobalUserTreeHeight {
+        self.global_user_tree_height
     }
 
     pub const fn request_digest(&self) -> RealmUserUpdateRequestDigest {
@@ -352,10 +422,6 @@ impl RealmUserUpdatePublishReceipt {
         hasher.update(assignment_digest);
         hasher.update(subject_sequence.to_be_bytes());
         hasher.update(envelope_digest);
-        hasher.update([match disposition {
-            RealmUserUpdatePublishDisposition::DurableApplied => 1,
-            RealmUserUpdatePublishDisposition::DurableResumed => 2,
-        }]);
         Self {
             intent_id,
             assignment_digest,
@@ -423,6 +489,8 @@ pub enum RealmUserUpdatePublishError {
     Storage(String),
     Transport(String),
     MalformedReceipt,
+    DependencyMismatch,
+    Claim(String),
 }
 
 impl fmt::Display for RealmUserUpdatePublishError {
@@ -606,7 +674,7 @@ mod tests {
         let intent = RealmUserUpdateIntentId([7; 32]);
         let first = RealmUserUpdatePublishReceipt::durable(intent, [6; 32], 9, [8; 32], false).unwrap();
         let resumed = RealmUserUpdatePublishReceipt::durable(intent, [6; 32], 9, [8; 32], true).unwrap();
-        assert_ne!(first.receipt_digest(), resumed.receipt_digest());
+        assert_eq!(first.receipt_digest(), resumed.receipt_digest());
         assert!(RealmUserUpdatePublishReceipt::durable(intent, [0; 32], 9, [8; 32], false).is_err());
         assert!(RealmUserUpdatePublishReceipt::durable(intent, [6; 32], 0, [8; 32], false).is_err());
         assert!(RealmUserUpdatePublishReceipt::durable(intent, [6; 32], 9, [0; 32], false).is_err());

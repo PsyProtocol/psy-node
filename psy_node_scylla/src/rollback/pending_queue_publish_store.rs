@@ -692,6 +692,108 @@ impl ScyllaPendingQueuePublishStore {
         })
     }
 
+    /// Reconstruct exact committed evidence for an existing data intent. This
+    /// path remains valid after the source generation has rotated. It never
+    /// selects a new source member or publishes to NATS; it may only finish
+    /// the exact CommitPending cursor CAS left after an earlier NATS commit.
+    pub(crate) async fn observe_committed_data(
+        &self,
+        assignment_receipt: &PendingQueueSegmentAssignmentReceipt,
+        publisher_kind: PendingQueuePublisherKind,
+        intent_id: PendingQueuePublishIntentId,
+        payload: &[u8],
+    ) -> Result<Option<PendingQueuePublishCommitReceipt>, PendingQueuePublishStoreError> {
+        let assignment = assignment_receipt.assignment();
+        self.validate_assignment(assignment)?;
+        let route = RecoverableNatsSourceRoute::try_new(
+            assignment.context(),
+            publisher_kind,
+            &self.segment,
+        )
+        .map_err(model_envelope)?;
+        let mut source = self.require_source(assignment_receipt, publisher_kind).await?;
+        let (expected, _) = StoredPendingQueuePublishIntent::materialize_data(
+            &source,
+            intent_id,
+            payload,
+        )
+        .map_err(model_outbox)?;
+        let Some(current) = self.read_intent(expected.slot()).await? else {
+            return Ok(None);
+        };
+        if current.artifact_identity() != expected.artifact_identity()
+            || current.source_slot() != expected.source_slot()
+            || current.publisher_kind() != expected.publisher_kind()
+            || current.assignment_digest() != expected.assignment_digest()
+            || current.intent_id() != expected.intent_id()
+            || current.request_kind() != expected.request_kind()
+            || current.payload_digest() != expected.payload_digest()
+            || current.payload_bytes() != expected.payload_bytes()
+            || current.fragment_count() != expected.fragment_count()
+        {
+            return Err(PendingQueuePublishStoreError::IntentPhaseMismatch);
+        }
+        let loaded = self.load_payload(&current).await?;
+        if loaded != payload {
+            return Err(PendingQueuePublishStoreError::PayloadMismatch);
+        }
+        if !matches!(
+            current.phase(),
+            PendingQueuePublishIntentPhase::SourceCommitted { .. }
+        ) {
+            return Ok(None);
+        }
+        let envelope = self.build_envelope(
+            &route,
+            assignment,
+            &source,
+            &current,
+            loaded,
+        )?;
+        if !self.intent_matches_envelope(&current, &envelope) {
+            return Err(PendingQueuePublishStoreError::PermitStateMismatch);
+        }
+        let subject_sequence = current
+            .accepted_subject_sequence()
+            .ok_or(PendingQueuePublishStoreError::IntentPhaseMismatch)?;
+        if let Some((_, pending_sequence)) = source.commit_pending() {
+            if pending_sequence != subject_sequence
+                || !source.inflight_matches(&envelope)
+            {
+                return Err(PendingQueuePublishStoreError::SourceCommitMismatch);
+            }
+            let plan = source.finalize_published().map_err(model_envelope)?;
+            source = match self
+                .cas_source_state(plan.expected(), plan.candidate())
+                .await
+            {
+                Ok(current) => current,
+                Err(PendingQueuePublishStoreError::CasConflict) => self
+                    .read_source(source.slot().map_err(model_envelope)?)
+                    .await?
+                    .ok_or(PendingQueuePublishStoreError::SourceUninitialized)?,
+                Err(error) => return Err(error),
+            };
+        }
+        if source.commit_pending().is_some() {
+            return Err(PendingQueuePublishStoreError::SourceCommitMismatch);
+        }
+        if source.data_member_count() < envelope.member_ordinal().get()
+            || source.last_subject_sequence() < subject_sequence
+            || (source.last_subject_sequence() == subject_sequence
+                && source.last_envelope_digest()
+                    != *envelope.digest().as_bytes())
+        {
+            return Err(PendingQueuePublishStoreError::SourceCommitMismatch);
+        }
+        Ok(Some(PendingQueuePublishCommitReceipt {
+            intent_slot: current.slot(),
+            subject_sequence,
+            envelope_digest: *envelope.digest().as_bytes(),
+            disposition: PendingQueueNatsPublishDisposition::DurableResume,
+        }))
+    }
+
     fn validate_assignment(&self, assignment: &PendingQueueGenerationSegmentAssignment) -> Result<(), PendingQueuePublishStoreError> {
         if assignment.segment_id() != self.segment.segment_id()
             || assignment.contract_digest() != self.segment.digest()
@@ -1170,6 +1272,7 @@ pub enum PendingQueuePublishStoreError {
     FragmentMissing,
     FragmentMismatch,
     FragmentSetMismatch,
+    PayloadMismatch,
     PreparedDescriptorMismatch,
 }
 

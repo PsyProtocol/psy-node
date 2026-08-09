@@ -12,14 +12,23 @@ use parth_core::protocol::core_types::Q256BitHash;
 use psy_data::protocol::chain_context::{AuthorityScope, PendingContext};
 use sha2::{Digest, Sha256};
 
-use crate::store::typed::UserId;
+use crate::store::{
+    pending_generation_identity::{
+        PendingGenerationActivationDigest, PendingGenerationContext,
+        PendingGenerationLedgerKey,
+    },
+    typed::UserId,
+};
 
-use super::realm_user_update_publish::{
-    RealmUserUpdatePublishAdmission, RealmUserUpdateRequestDigest,
+use super::{
+    realm_user_update_publish::{
+        RealmUserUpdatePublishAdmission, RealmUserUpdateRequestDigest,
+    },
+    recoverable_ephemeral::PendingQueueCaptureContext,
 };
 
 const MAGIC: &[u8; 8] = b"PSYRUCIM";
-const CODEC_VERSION: u16 = 1;
+const CODEC_VERSION: u16 = 2;
 const SLOT_DOMAIN: &[u8] = b"psy/rollback/realm-user-update-claim-slot/v1";
 const STATE_DOMAIN: &[u8] = b"psy/rollback/realm-user-update-claim-state/v1";
 
@@ -71,8 +80,9 @@ impl RealmUserUpdateClaimSlot {
     }
 }
 
-/// Fixed bucket inside one exact generation. It keeps per-user LWT traffic
-/// distributed while allowing startup to scan a closed set of 256 buckets.
+/// Fixed bucket inside one exact generation slot. It distributes per-user LWT
+/// traffic, but is not by itself a startup index: a scanner must first obtain
+/// the opaque generation slot from a separate durable locator.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct RealmUserUpdateClaimBucket(u16);
 
@@ -186,16 +196,18 @@ impl RealmUserUpdatePublishReceiptDigest {
 #[repr(u8)]
 pub enum RealmUserUpdateClaimPhase {
     Claimed = 1,
-    DependenciesReady = 2,
-    Published = 3,
+    DependenciesPlanned = 2,
+    DependenciesReady = 3,
+    Published = 4,
 }
 
 impl RealmUserUpdateClaimPhase {
     fn decode(value: u8) -> Result<Self, RealmUserUpdateClaimError> {
         match value {
             1 => Ok(Self::Claimed),
-            2 => Ok(Self::DependenciesReady),
-            3 => Ok(Self::Published),
+            2 => Ok(Self::DependenciesPlanned),
+            3 => Ok(Self::DependenciesReady),
+            4 => Ok(Self::Published),
             _ => Err(RealmUserUpdateClaimError::UnknownPhase(value)),
         }
     }
@@ -208,6 +220,7 @@ pub struct StoredRealmUserUpdateClaim<Hash> {
     bucket: RealmUserUpdateClaimBucket,
     revision: RealmUserUpdateClaimRevision,
     pending: PendingContext<Hash>,
+    capture_activation_digest: [u8; 32],
     capture_digest: [u8; 32],
     admission_digest: [u8; 32],
     user_id: UserId,
@@ -230,11 +243,14 @@ impl<Hash: Q256BitHash> StoredRealmUserUpdateClaim<Hash> {
         let slot = RealmUserUpdateClaimSlot::for_admission(&admission)?;
         let bucket = RealmUserUpdateClaimBucket::for_user(user_id);
         let pending = admission.pending().clone();
+        let capture_activation_digest =
+            *admission.capture().activation().as_bytes();
         let mut value = Self {
             slot,
             bucket,
             revision: RealmUserUpdateClaimRevision::INITIAL,
             pending,
+            capture_activation_digest,
             capture_digest: *admission.capture_digest().as_bytes(),
             admission_digest: *admission.digest(),
             user_id,
@@ -250,7 +266,7 @@ impl<Hash: Q256BitHash> StoredRealmUserUpdateClaim<Hash> {
         Ok(value)
     }
 
-    pub fn dependencies_ready(
+    pub fn dependencies_planned(
         expected: &Self,
         dependency_digest: RealmUserUpdateDependencyDigest,
     ) -> Result<Self, RealmUserUpdateClaimError> {
@@ -259,8 +275,23 @@ impl<Hash: Q256BitHash> StoredRealmUserUpdateClaim<Hash> {
         }
         let mut candidate = expected.clone();
         candidate.revision = expected.revision.next()?;
-        candidate.phase = RealmUserUpdateClaimPhase::DependenciesReady;
+        candidate.phase = RealmUserUpdateClaimPhase::DependenciesPlanned;
         candidate.dependency_digest = Some(dependency_digest);
+        candidate.state_digest = candidate.compute_state_digest();
+        Ok(candidate)
+    }
+
+    pub fn dependencies_ready(
+        expected: &Self,
+    ) -> Result<Self, RealmUserUpdateClaimError> {
+        if expected.phase != RealmUserUpdateClaimPhase::DependenciesPlanned
+            || expected.dependency_digest.is_none()
+        {
+            return Err(RealmUserUpdateClaimError::InvalidTransition);
+        }
+        let mut candidate = expected.clone();
+        candidate.revision = expected.revision.next()?;
+        candidate.phase = RealmUserUpdateClaimPhase::DependenciesReady;
         candidate.state_digest = candidate.compute_state_digest();
         Ok(candidate)
     }
@@ -286,6 +317,8 @@ impl<Hash: Q256BitHash> StoredRealmUserUpdateClaim<Hash> {
         self.slot == candidate.slot
             && self.bucket == candidate.bucket
             && self.pending == candidate.pending
+            && self.capture_activation_digest
+                == candidate.capture_activation_digest
             && self.capture_digest == candidate.capture_digest
             && self.admission_digest == candidate.admission_digest
             && self.user_id == candidate.user_id
@@ -311,6 +344,47 @@ impl<Hash: Q256BitHash> StoredRealmUserUpdateClaim<Hash> {
 
     pub const fn capture_digest(&self) -> &[u8; 32] {
         &self.capture_digest
+    }
+
+    pub const fn capture_activation_digest(&self) -> &[u8; 32] {
+        &self.capture_activation_digest
+    }
+
+    /// Rebuild the exact admission required by a startup retry. The compact
+    /// claim stores the activation digest because it cannot be recovered from
+    /// the derived capture/admission digests.
+    pub fn reconstruct_admission(
+        &self,
+    ) -> Result<RealmUserUpdatePublishAdmission<Hash>, RealmUserUpdateClaimError> {
+        let generation = PendingGenerationContext::try_from_legacy(
+            self.pending.unique_pending_id().get(),
+            self.pending.proc_checkpoint_unique_id().as_u128(),
+        )
+        .map_err(|error| RealmUserUpdateClaimError::Capture(error.to_string()))?;
+        let capture = PendingQueueCaptureContext::try_new(
+            PendingGenerationLedgerKey::new(
+                self.pending.chain().network_id(),
+                self.pending.authority(),
+            ),
+            PendingGenerationActivationDigest::try_new(
+                self.capture_activation_digest,
+            )
+            .map_err(|error| RealmUserUpdateClaimError::Capture(error.to_string()))?,
+            generation,
+        )
+        .map_err(|error| RealmUserUpdateClaimError::Capture(error.to_string()))?;
+        if capture.digest().as_bytes() != &self.capture_digest {
+            return Err(RealmUserUpdateClaimError::DigestMismatch);
+        }
+        let admission = RealmUserUpdatePublishAdmission::try_from_pipeline(
+            self.pending.clone(),
+            capture,
+        )
+        .map_err(|error| RealmUserUpdateClaimError::Request(error.to_string()))?;
+        if admission.digest() != &self.admission_digest {
+            return Err(RealmUserUpdateClaimError::DigestMismatch);
+        }
+        Ok(admission)
     }
 
     pub const fn admission_digest(&self) -> &[u8; 32] {
@@ -379,6 +453,7 @@ impl<Hash: Q256BitHash> StoredRealmUserUpdateClaim<Hash> {
             psy_data::protocol::chain_context::PENDING_CONTEXT_V1_LEN,
         )?)
         .map_err(|error| RealmUserUpdateClaimError::PendingCodec(error.to_string()))?;
+        let capture_activation_digest = decoder.array32()?;
         let capture_digest = decoder.array32()?;
         let admission_digest = decoder.array32()?;
         if capture_digest == [0; 32] || admission_digest == [0; 32] {
@@ -405,6 +480,7 @@ impl<Hash: Q256BitHash> StoredRealmUserUpdateClaim<Hash> {
             bucket,
             revision,
             pending,
+            capture_activation_digest,
             capture_digest,
             admission_digest,
             user_id,
@@ -431,7 +507,8 @@ impl<Hash: Q256BitHash> StoredRealmUserUpdateClaim<Hash> {
         {
             return Err(RealmUserUpdateClaimError::SelectedIdentityMismatch);
         }
-        if value.stable_status == 0
+        if value.capture_activation_digest == [0; 32]
+            || value.stable_status == 0
             || value.stable_status != value.request_digest.stable_status()
             || !value.phase_shape_is_valid()
         {
@@ -440,6 +517,7 @@ impl<Hash: Q256BitHash> StoredRealmUserUpdateClaim<Hash> {
         if value.compute_state_digest() != value.state_digest {
             return Err(RealmUserUpdateClaimError::DigestMismatch);
         }
+        value.reconstruct_admission()?;
         Ok(value)
     }
 
@@ -447,6 +525,7 @@ impl<Hash: Q256BitHash> StoredRealmUserUpdateClaim<Hash> {
         matches!(
             (self.phase, self.dependency_digest, self.publish_receipt_digest),
             (RealmUserUpdateClaimPhase::Claimed, None, None)
+                | (RealmUserUpdateClaimPhase::DependenciesPlanned, Some(_), None)
                 | (RealmUserUpdateClaimPhase::DependenciesReady, Some(_), None)
                 | (RealmUserUpdateClaimPhase::Published, Some(_), Some(_))
         )
@@ -460,6 +539,7 @@ impl<Hash: Q256BitHash> StoredRealmUserUpdateClaim<Hash> {
         bytes.extend_from_slice(&self.bucket.get().to_be_bytes());
         bytes.extend_from_slice(&self.revision.get().to_be_bytes());
         bytes.extend_from_slice(&self.pending.to_canonical_bytes());
+        bytes.extend_from_slice(&self.capture_activation_digest);
         bytes.extend_from_slice(&self.capture_digest);
         bytes.extend_from_slice(&self.admission_digest);
         bytes.extend_from_slice(&self.user_id.get().to_be_bytes());
@@ -574,6 +654,7 @@ pub enum RealmUserUpdateClaimError {
     SelectedIdentityMismatch,
     DigestMismatch,
     PendingCodec(String),
+    Capture(String),
     Request(String),
 }
 
@@ -674,18 +755,22 @@ mod tests {
             .unwrap(),
             claimed
         );
-        let dependencies = StoredRealmUserUpdateClaim::dependencies_ready(
+        assert_eq!(claimed.reconstruct_admission().unwrap(), admission(1, 12));
+        let planned = StoredRealmUserUpdateClaim::dependencies_planned(
             &claimed,
             RealmUserUpdateDependencyDigest::try_new([7; 32]).unwrap(),
         )
         .unwrap();
+        let dependencies =
+            StoredRealmUserUpdateClaim::dependencies_ready(&planned).unwrap();
         let published = StoredRealmUserUpdateClaim::published(
             &dependencies,
             RealmUserUpdatePublishReceiptDigest::try_new([8; 32]).unwrap(),
         )
         .unwrap();
-        assert_eq!(dependencies.revision().get(), 2);
-        assert_eq!(published.revision().get(), 3);
+        assert_eq!(planned.revision().get(), 2);
+        assert_eq!(dependencies.revision().get(), 3);
+        assert_eq!(published.revision().get(), 4);
         assert_eq!(published.phase(), RealmUserUpdateClaimPhase::Published);
         assert!(StoredRealmUserUpdateClaim::published(
             &claimed,
