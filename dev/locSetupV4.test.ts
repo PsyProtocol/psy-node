@@ -1,6 +1,22 @@
 import { describe, expect, it } from "bun:test";
-import { s3CurlArgs } from "./locSetupDefaults";
-import { runStreamingCaptureStderr } from "./locSetupV4";
+import {
+    COORDINATOR_PROCESSOR_READY_MARKER,
+    REALM_PROCESSOR_READY_MARKER,
+    isExactProcessorReadyLine,
+    s3CurlArgs,
+} from "./locSetupDefaults";
+import {
+    evaluateCompilerArtifactStamp,
+    isUsableGenesisData,
+    readGenesisContractsArtifactStamp,
+    resolveProjectsDir,
+    RunningProcess,
+    runStreamingCaptureStderr,
+    retryProcessorStartup,
+    startRealmProcessorBatchSequentially,
+    writeCompilerArtifactStamp,
+} from "./locSetupV4";
+import type { GenesisContractsArtifactFingerprint } from "./locSetupV4";
 
 describe("s3CurlArgs", () => {
     it("builds a shell-free curl argv that is fail-closed, follows redirects, and shows progress", () => {
@@ -85,5 +101,127 @@ describe("runStreamingCaptureStderr", () => {
         );
         expect(result.code).toBe(0);
         expect(result.stderr.trim()).toBe(cwd);
+    });
+});
+
+describe("processor full-readiness startup", () => {
+    it("accepts only exact processor completion markers", () => {
+        expect(isExactProcessorReadyLine(COORDINATOR_PROCESSOR_READY_MARKER, COORDINATOR_PROCESSOR_READY_MARKER)).toBe(true);
+        expect(isExactProcessorReadyLine(`INFO ${REALM_PROCESSOR_READY_MARKER}`, REALM_PROCESSOR_READY_MARKER)).toBe(true);
+        expect(isExactProcessorReadyLine("[COORD_CREATE] processor new start", COORDINATOR_PROCESSOR_READY_MARKER)).toBe(false);
+        expect(isExactProcessorReadyLine(`${COORDINATOR_PROCESSOR_READY_MARKER} trailing`, COORDINATOR_PROCESSOR_READY_MARKER)).toBe(false);
+    });
+
+    it("rejects non-transient pre-ready exits without retry", async () => {
+        let attempts = 0;
+        const startup = retryProcessorStartup("coordinator processor", async () => {
+            attempts += 1;
+            throw new Error("Process exited before initialization hint was found.\nfatal config error");
+        }, { maxRetries: 3, retryDelayMs: 0 });
+        await expect(startup).rejects.toThrow("fatal config error");
+        expect(attempts).toBe(1);
+    });
+
+    it("retries transient Scylla raft add_entry failures", async () => {
+        const attempts: number[] = [];
+        const result = await retryProcessorStartup("realm 7 processor", async (attempt) => {
+            attempts.push(attempt);
+            if (attempt === 1) throw new Error("Scylla group 0 add_entry schema operation timed out");
+            return "ready";
+        }, { maxRetries: 2, retryDelayMs: 0 });
+        expect(result).toBe("ready");
+        expect(attempts).toEqual([1, 2]);
+    });
+
+    it("resolves from the exact marker and rejects exit before it", async () => {
+        const proc = await RunningProcess.spawnWithInitializationHint(
+            [process.execPath, "-e", `process.stderr.write("${COORDINATOR_PROCESSOR_READY_MARKER}\\n", () => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0))`],
+            (line) => isExactProcessorReadyLine(line, COORDINATOR_PROCESSOR_READY_MARKER),
+            { initializationTimeoutMs: 500 },
+        );
+        expect(proc.isRunning()).toBe(true);
+        proc.kill();
+        await proc.proc.exited;
+
+        const failed = RunningProcess.spawnWithInitializationHint(
+            [process.execPath, "-e", "process.stderr.write('schema bootstrap failed\\n'); process.exit(7)"],
+            (line) => isExactProcessorReadyLine(line, REALM_PROCESSOR_READY_MARKER),
+            { initializationTimeoutMs: 500 },
+        );
+        await expect(failed).rejects.toThrow("Exit Code: 7");
+        await expect(failed).rejects.toThrow("schema bootstrap failed");
+    });
+});
+
+describe("startRealmProcessorBatchSequentially", () => {
+    it("starts realms in readiness order and stops at the first failure", async () => {
+        const started: number[] = [];
+        const startup = startRealmProcessorBatchSequentially([4, 5, 6], async (realmId) => {
+            started.push(realmId);
+            if (realmId === 5) throw new Error("realm 5 failed readiness");
+            return realmId;
+        });
+        await expect(startup).rejects.toThrow("realm 5 failed readiness");
+        expect(started).toEqual([4, 5]);
+    });
+});
+
+describe("isUsableGenesisData", () => {
+    it("accepts canonical seconds and rejects milliseconds", async () => {
+        const dir = (await Bun.$`mktemp -d`.text()).trim();
+        try {
+            const prefix = "x".repeat(70 * 1024);
+            const milliseconds = `${dir}/milliseconds.json`;
+            const seconds = `${dir}/seconds.json`;
+            await Bun.write(milliseconds, `${prefix}\n{"checkpoint_stats":{"block_time":1764248609000}}`);
+            await Bun.write(seconds, `${prefix}\n{"checkpoint_stats":{"block_time":1764248609}}`);
+            expect(await isUsableGenesisData(seconds)).toBe(true);
+            expect(await isUsableGenesisData(milliseconds)).toBe(false);
+        } finally {
+            await Bun.$`rm -rf ${dir}`.quiet();
+        }
+    });
+});
+
+describe("resolveProjectsDir", () => {
+    it("uses the explicit cohort directory when configured", () => {
+        const originalProjectsDir = process.env.PSY_PROJECTS_DIR;
+        try {
+            process.env.PSY_PROJECTS_DIR = "<workspace>/mainnet-beta";
+            expect(resolveProjectsDir()).toEndWith("<workspace>/mainnet-beta");
+        } finally {
+            if (originalProjectsDir === undefined) delete process.env.PSY_PROJECTS_DIR;
+            else process.env.PSY_PROJECTS_DIR = originalProjectsDir;
+        }
+    });
+});
+
+describe("compiler/genesis artifact stamps", () => {
+    const expected: GenesisContractsArtifactFingerprint = {
+        compilerRevision: "rev",
+        compilerSourcesHash: "sources",
+        artifactSha256: "aa".repeat(32),
+        artifactByteSize: 42,
+    };
+
+    it("matches only the exact compiler identity and artifact bytes", () => {
+        expect(evaluateCompilerArtifactStamp({ ...expected }, expected)).toBe("match");
+        expect(evaluateCompilerArtifactStamp(null, expected)).toBe("missing");
+        expect(evaluateCompilerArtifactStamp({ ...expected, artifactByteSize: 43 }, expected)).toBe("mismatch");
+        expect(evaluateCompilerArtifactStamp({ ...expected, artifactSha256: "bb".repeat(32) }, expected)).toBe("mismatch");
+    });
+
+    it("strictly reads and atomically replaces complete stamps", async () => {
+        const dir = (await Bun.$`mktemp -d`.text()).trim();
+        try {
+            const stampPath = `${dir}/.genesis_contracts.compiler-artifact.json`;
+            await Bun.write(stampPath, JSON.stringify({ compilerRevision: "rev", compilerSourcesHash: "sources" }));
+            expect(await readGenesisContractsArtifactStamp(stampPath)).toBeNull();
+            await writeCompilerArtifactStamp(stampPath, expected);
+            expect(await readGenesisContractsArtifactStamp(stampPath)).toEqual(expected);
+            expect(await Bun.file(`${stampPath}.tmp`).exists()).toBe(false);
+        } finally {
+            await Bun.$`rm -rf ${dir}`.quiet();
+        }
     });
 });

@@ -73,6 +73,17 @@ impl ContractCallData {
     }
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ViewCallData {
+    pub contract_calls: Vec<ContractCallArgs>,
+}
+
+impl ViewCallData {
+    pub fn new(contract_calls: Vec<ContractCallArgs>) -> Self {
+        Self { contract_calls }
+    }
+}
+
 pub fn parse_contract_call_args(s: &str) -> anyhow::Result<Vec<ContractCallArgs>> {
     serde_json::from_str(s).map_err(|e| anyhow::anyhow!("Failed to parse JSON: {}", e))
 }

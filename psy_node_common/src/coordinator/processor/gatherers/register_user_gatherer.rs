@@ -39,12 +39,15 @@ use crate::{
 
 pub const REGISTER_USER_GATHERER_BACKUP_V1_MAGIC_BYTES: [u8; 4] = [0x52, 0x55, 0x42, 0x31]; // 'RUB1' in ASCII
 pub const REGISTER_USER_GATHERER_BACKUP_V1_MAGIC_U32: u32 = 0x31425552; // 'RUB1' in little-endian u32
+// Millisecond-only wire format; writers must not emit this, and readers reject it.
+pub const REGISTER_USER_GATHERER_BACKUP_V2_MAGIC_U32: u32 = 0x32425552; // 'RUB2' in little-endian u32
+const MAX_BLOCK_TIME_SECONDS: u64 = (1u64 << 60) - 1;
 
-fn get_current_block_time() -> u64 {
-    let start = std::time::SystemTime::UNIX_EPOCH;
-    let now = std::time::SystemTime::now();
-    let duration = now.duration_since(start).expect("Time went backwards");
-    duration.as_millis() as u64
+fn get_current_block_time() -> anyhow::Result<u64> {
+    let duration = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map_err(|error| anyhow::anyhow!("system clock is before the Unix epoch: {error}"))?;
+    Ok(duration.as_secs())
 }
 pub fn get_new_register_user_gatherer_backup_file_path(
     backup_file_directory: &str,
@@ -96,7 +99,7 @@ pub async fn read_register_user_gatherer_backup_file<Hasher: MerkleZeroHasher<Ha
     let magic_u32 = file.read_u32_le().await?;
     if magic_u32 != REGISTER_USER_GATHERER_BACKUP_V1_MAGIC_U32 {
         return Err(anyhow::anyhow!(
-            "Backup file magic number mismatch: expected {:x}, got {:x}",
+            "Register user gatherer backup magic mismatch: expected RUB1 (0x{:08x}), got 0x{:08x}; RUB2 (millisecond-based) backups are not supported",
             REGISTER_USER_GATHERER_BACKUP_V1_MAGIC_U32,
             magic_u32
         ));
@@ -153,6 +156,13 @@ pub async fn read_register_user_gatherer_backup_file<Hasher: MerkleZeroHasher<Ha
     }
     let total_jobs = file.read_u64_le().await?;
     let block_time = file.read_u64_le().await?;
+    if block_time == 0 || block_time > MAX_BLOCK_TIME_SECONDS {
+        return Err(anyhow::anyhow!(
+            "Register user gatherer backup block_time {} must be within 1..={}",
+            block_time,
+            MAX_BLOCK_TIME_SECONDS
+        ));
+    }
     tree.commit_changes();
     let output_db = RegisterUserGathererOutputDatabase {
         start_next_user_id,
@@ -476,7 +486,7 @@ impl<
         )?;
         let total_jobs = jobs_for_queue.iter().map(|v| v.len()).sum::<usize>() as u64;
         self.new_user_public_keys_file.write_u64_le(total_jobs).await?;
-        let block_time =get_current_block_time();
+        let block_time = get_current_block_time()?;
         self.new_user_public_keys_file.write_u64_le(block_time).await?;
 
         self.config
@@ -654,6 +664,24 @@ mod tests {
     use psy_data::agg::tree_agg_v2::plan_jobs_for_tree_agg;
 
     use super::*;
+    #[test]
+    fn current_block_time_uses_unix_seconds() -> anyhow::Result<()> {
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)?
+            .as_secs();
+        let block_time = get_current_block_time()?;
+        let after = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)?
+            .as_secs();
+
+        assert!(block_time >= before);
+        assert!(block_time <= after);
+        // Protocol block_time is Unix seconds: must sit below the millisecond epoch floor.
+        assert!(block_time < 1_000_000_000_000);
+        assert!(block_time >= 1_000_000_000);
+        Ok(())
+    }
+
 
     #[test]
     fn test_fake_agg() -> anyhow::Result<()> {
@@ -1310,4 +1338,120 @@ mod tests2 {
 
     // Additional test for expected public inputs hash, etc., if needed
     // But focusing on structure as per the task
+}
+
+#[cfg(test)]
+mod tests_backup_v1 {
+    use parth_common::memory_stores::mem_tree_recorder::SimpleMemoryMerkleRecorderStore;
+    use parth_core::{pgoldilocks::PoseidonHasher, protocol::core_types::Q256BitHash, PHash};
+    use psy_node_core::file::memory_fs::SimpleMockMemoryFileSystem;
+
+    use super::read_register_user_gatherer_backup_file_path;
+
+    type Hasher = PoseidonHasher;
+    type Hash = PHash;
+
+    const RUB2_MAGIC_U32: u32 = 0x32425552;
+    const PLAUSIBLE_BLOCK_TIME_SECONDS: u64 = 1_700_000_000;
+    const MILLISECOND_BLOCK_TIME: u64 = 1_700_000_000_000;
+
+    fn build_backup_bytes(
+        magic_u32: u32,
+        start_next_user_id: u64,
+        start_root: &Hash,
+        public_keys: &[&[u8; 64]],
+        total_jobs: u64,
+        block_time: u64,
+    ) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&magic_u32.to_le_bytes());
+        data.extend_from_slice(&start_next_user_id.to_le_bytes());
+        data.extend_from_slice(&start_root.clone().into_owned_32bytes());
+        for pk in public_keys {
+            data.extend_from_slice(pk.as_slice());
+        }
+        data.extend_from_slice(&total_jobs.to_le_bytes());
+        data.extend_from_slice(&block_time.to_le_bytes());
+        data
+    }
+
+    #[tokio::test]
+    async fn rejects_rub2_millisecond_backup_before_footer_enters_checkpoint() -> anyhow::Result<()> {
+        let file_system = SimpleMockMemoryFileSystem::new();
+        let tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
+        let start_root = tree.get_root();
+        let path = "register_user_gatherer_realm_0_sub_0_pending_1.backup";
+        let data = build_backup_bytes(RUB2_MAGIC_U32, 0, &start_root, &[], 0, MILLISECOND_BLOCK_TIME);
+        file_system.files.insert(path.to_string(), data);
+
+        let mut read_tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
+        let error = read_register_user_gatherer_backup_file_path::<Hasher, Hash, SimpleMockMemoryFileSystem>(
+            &file_system,
+            path,
+            &mut read_tree,
+        )
+        .await
+        .expect_err("RUB2 backup must be rejected by the RUB1-only reader");
+        let message = error.to_string();
+        assert!(message.to_lowercase().contains("magic"));
+        assert!(message.contains("RUB1"));
+        assert!(!message.to_lowercase().contains("block_time"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_rub1_block_time_outside_protocol_field_range() -> anyhow::Result<()> {
+        for block_time in [0, (1u64 << 60)] {
+            let file_system = SimpleMockMemoryFileSystem::new();
+            let tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
+            let start_root = tree.get_root();
+            let path = format!("invalid_block_time_{block_time}.backup");
+            let data = build_backup_bytes(super::REGISTER_USER_GATHERER_BACKUP_V1_MAGIC_U32, 0, &start_root, &[], 0, block_time);
+            file_system.files.insert(path.clone(), data);
+
+            let mut read_tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
+            let error = read_register_user_gatherer_backup_file_path::<Hasher, Hash, SimpleMockMemoryFileSystem>(
+                &file_system,
+                &path,
+                &mut read_tree,
+            )
+            .await
+            .expect_err("invalid block_time must be rejected before checkpoint construction");
+            assert!(error.to_string().contains("block_time"));
+            assert_eq!(read_tree.get_root(), start_root);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn accepts_valid_rub1_seconds_backup() -> anyhow::Result<()> {
+        let file_system = SimpleMockMemoryFileSystem::new();
+        let tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
+        let start_root = tree.get_root();
+        let path = "register_user_gatherer_realm_0_sub_0_pending_2.backup";
+        let data = build_backup_bytes(
+            super::REGISTER_USER_GATHERER_BACKUP_V1_MAGIC_U32,
+            0,
+            &start_root,
+            &[],
+            0,
+            PLAUSIBLE_BLOCK_TIME_SECONDS,
+        );
+        file_system.files.insert(path.to_string(), data);
+
+        let mut read_tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
+        let output = read_register_user_gatherer_backup_file_path::<Hasher, Hash, SimpleMockMemoryFileSystem>(
+            &file_system,
+            path,
+            &mut read_tree,
+        )
+        .await?;
+        assert_eq!(output.start_next_user_id, 0);
+        assert_eq!(output.next_user_id, 0);
+        assert_eq!(output.total_jobs, 0);
+        assert_eq!(output.block_time, PLAUSIBLE_BLOCK_TIME_SECONDS);
+        assert_eq!(output.start_user_registration_tree_hash, start_root);
+        assert_eq!(read_tree.get_root(), start_root);
+        Ok(())
+    }
 }

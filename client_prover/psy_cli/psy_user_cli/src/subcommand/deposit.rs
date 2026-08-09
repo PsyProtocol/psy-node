@@ -245,6 +245,10 @@ fn decimal_limbs(values: [u64; 4]) -> [String; 4] {
     [values[0].to_string(), values[1].to_string(), values[2].to_string(), values[3].to_string()]
 }
 
+fn canonical_shield_address_metadata(raw: &str) -> anyhow::Result<String> {
+    Ok(decimal_limbs(bytes32_hex_to_u64x4(raw)?).join(":"))
+}
+
 fn parse_eth_call_u64(result: &serde_json::Value) -> anyhow::Result<u64> {
     let raw = result.as_str().ok_or_else(|| anyhow::anyhow!("expected string result from eth_call"))?;
     let raw = raw.trim().trim_start_matches("0x").trim_start_matches('0');
@@ -420,6 +424,17 @@ mod tests {
         assert_eq!(
             parse_evm_addr_or_bytes32_to_u32x8("0x0000000000000000000000000000000000000004").unwrap(),
             [0, 0, 0, 0, 0, 0, 0, 4],
+        );
+    }
+
+    #[test]
+    fn deposit_backup_shield_metadata_uses_decimal_limbs() {
+        assert_eq!(
+            canonical_shield_address_metadata(
+                "0x112233445566778899aabbccddeeff00123456789abcdef0fedcba9876543210",
+            )
+            .unwrap(),
+            "1234605616436508552:11072869122414935808:1311768467463790320:18364758544493064720",
         );
     }
 
@@ -819,7 +834,7 @@ async fn publish_deposit_backup(
         "deposit_proof": deposit_proof,
         "metadata": {
             "note_commitment": backup_id,
-            "shield_address": shield_address,
+            "shield_address": canonical_shield_address_metadata(shield_address)?,
             "token_address": args.token,
             "amount": args.amount,
             "source_chain_index": args.source_chain_index,

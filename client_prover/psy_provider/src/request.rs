@@ -1697,3 +1697,30 @@ pub enum QRPCRequest<F: RichField> {
     QLeftLeafRightAggRpcRequest((u32, QLeftLeafRightAggRpcRequest<F>)),
     QLeftAggRightLeafRpcRequest((u32, QLeftAggRightLeafRpcRequest<F>)),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn eth_personal_signature_request_round_trip_preserves_exact_bytes() {
+        let signature = PsyCompressedSecp256K1Signature {
+            public_key: core::array::from_fn(|index| index as u8),
+            signature: core::array::from_fn(|index| (index + 33) as u8),
+            message: Hash256(core::array::from_fn(|index| (255 - index) as u8)),
+        };
+        let request = RpcRequest {
+            jsonrpc: Version::V2,
+            request: RequestParams::<GoldilocksField>::EthPersonalSECPSignatureProof(QSecpSignatureProofRPCRequest { signature }),
+            id: Id::Number(7),
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"method\":\"psy_prove_eth_personal_secp_sign\""));
+        let decoded: RpcRequest<RequestParams<GoldilocksField>> = serde_json::from_str(&json).unwrap();
+        match decoded.request {
+            RequestParams::EthPersonalSECPSignatureProof(decoded_request) => assert_eq!(decoded_request.signature, signature),
+            _ => panic!("wrong request variant after round trip"),
+        }
+    }
+}

@@ -9,12 +9,16 @@ import { availableParallelism } from "node:os";
 import allConfig from "../client_prover/config.json";
 import { protocolConfig } from "../psy-contracts/protocol-config";
 import {
+    COORDINATOR_PROCESSOR_READY_MARKER,
     DEFAULT_WORKER_BATCH_SIZE,
     FAUCET_ENV_KEYS,
+    REALM_PROCESSOR_READY_MARKER,
     applyEnvioCpuSetToCompose,
     hasFaucetOperatorConfig,
     hasZstdMagic,
     parseCpuSet,
+    isExactProcessorReadyLine,
+    isTransientScyllaSchemaFailure,
     parseLscpuTopology,
     resolveCpuPartition,
     parseEnvAssignments,
@@ -29,6 +33,58 @@ import {
     isCompilerFingerprintSource,
     s3CurlArgs,
 } from "./locSetupDefaults";
+
+/**
+ * Retry processor creation only for the known transient Scylla schema family.
+ * The caller must return only after the full processor marker, so no failed
+ * pre-ready child is ever exposed to supervisor tracking.
+ */
+export async function retryProcessorStartup<T>(
+    name: string,
+    startAttempt: (attempt: number, totalAttempts: number) => Promise<T>,
+    opts?: { maxRetries?: number; retryDelayMs?: number },
+): Promise<T> {
+    const maxRetries = opts?.maxRetries ?? 3;
+    const retryDelayMs = opts?.retryDelayMs ?? 2000;
+    if (!Number.isInteger(maxRetries) || maxRetries < 0) {
+        throw new Error(`Processor readiness maxRetries must be a non-negative integer, received ${maxRetries}`);
+    }
+    if (!Number.isFinite(retryDelayMs) || retryDelayMs < 0) {
+        throw new Error(`Processor readiness retryDelayMs must be non-negative, received ${retryDelayMs}`);
+    }
+    const totalAttempts = maxRetries + 1;
+    const attemptErrors: string[] = [];
+
+    for (let attempt = 1; attempt <= totalAttempts; attempt += 1) {
+        console.log(`[DevNet] Starting ${name} readiness attempt ${attempt}/${totalAttempts}`);
+        try {
+            return await startAttempt(attempt, totalAttempts);
+        } catch (error) {
+            const context = error instanceof Error ? error.message : String(error);
+            attemptErrors.push(`Attempt ${attempt}/${totalAttempts}: ${context}`);
+            if (!isTransientScyllaSchemaFailure(context)) {
+                throw new Error(`${name} exited before full readiness.\n${attemptErrors.join("\n\n")}`);
+            }
+            if (attempt === totalAttempts) {
+                throw new Error(
+                    `${name} exhausted ${totalAttempts} readiness attempts after transient Scylla schema failures.\n`
+                    + attemptErrors.join("\n\n"),
+                );
+            }
+            console.warn(
+                `[DevNet] ${name} readiness attempt ${attempt}/${totalAttempts} hit a transient Scylla schema failure; `
+                + `retrying the whole process in ${retryDelayMs}ms`,
+            );
+            if (retryDelayMs > 0) {
+                const { promise, resolve } = Promise.withResolvers<void>();
+                setTimeout(resolve, retryDelayMs);
+                await promise;
+            }
+        }
+    }
+
+    throw new Error(`${name} processor readiness loop ended unexpectedly`);
+}
 
 type ProcessLineVisitor = (line: string, process: RunningProcess) => void;
 // this is an insecure, obviously fake private key for local devnet use only
@@ -423,7 +479,7 @@ async function readRequiredDeploymentTokenGaps(deploymentSummaryPath: string): P
     });
 }
 
-class RunningProcess {
+export class RunningProcess {
     pid: number;
     proc: Bun.Subprocess;
     stdOutLines: string[] = [];
@@ -447,15 +503,20 @@ class RunningProcess {
         allOutputVisitor?: ProcessLineVisitor;
         stdoutLogFile?: string;
         stderrLogFile?: string;
+        initializationTimeoutMs?: number;
         env?: { [key: string]: string };
         appendLogs?: boolean;
     } = {};
     hintDetector?: (line: string) => boolean;
     useInitHint: boolean = false;
+    initializationReady: boolean = false;
     initMaxRetries: number = 3;
     initRetryDelayMs: number = 2000;
     restartCount: number = 0;
     hasExited: boolean = false;
+    exitCode: number | null = null;
+    exitSignal: number | null = null;
+    supervisorObservedExit: boolean = false;
     intentionalStop: boolean = false;
     dependencyRestartRequested: boolean = false;
     /** Fatal processor error already observed and signaled for supervised restart. */
@@ -526,6 +587,7 @@ class RunningProcess {
         allOutputVisitor?: ProcessLineVisitor,
         stdoutLogFile?: string,
         stderrLogFile?: string,
+        initializationTimeoutMs?: number,
         env?: { [key: string]: string },
         appendLogs?: boolean,
         logBanner?: string,
@@ -560,6 +622,7 @@ class RunningProcess {
             allOutputVisitor: options.allOutputVisitor,
             stdoutLogFile: options.stdoutLogFile,
             stderrLogFile: options.stderrLogFile,
+            initializationTimeoutMs: options.initializationTimeoutMs,
             env: options.env,
             appendLogs: options.appendLogs,
         };
@@ -633,6 +696,8 @@ class RunningProcess {
         (async () => {
             const code = await proc.exited;
             await Promise.allSettled(outputPumps);
+            runningProcess.exitCode = code;
+            runningProcess.exitSignal = null;
             runningProcess.hasExited = true;
             runningProcess.onExit(code, null);
         })();
@@ -641,7 +706,7 @@ class RunningProcess {
     }
 
 
-    static spawnWithInitializationHint(cmds: string[], hintDetector: (line: string) => boolean, options: {
+    static async spawnWithInitializationHint(cmds: string[], hintDetector: (line: string) => boolean, options: {
         cwd?: string,
         stdOutVisitor?: ProcessLineVisitor,
         stdErrVisitor?: ProcessLineVisitor,
@@ -651,50 +716,79 @@ class RunningProcess {
         env?: { [key: string]: string },
         appendLogs?: boolean,
         logBanner?: string,
+        initializationTimeoutMs?: number,
     }): Promise<RunningProcess> {
-        return new Promise<RunningProcess>(async (resolve, reject) => {
-            let initialized = false;
-            const allOutputVisitor: ProcessLineVisitor = (line: string, process: RunningProcess) => {
-                const normalizedLine = line.replace(/\u001b\[[0-9;]*m/g, '');
-                if (!initialized && hintDetector(normalizedLine)) {
-                    initialized = true;
-                    resolve(process as RunningProcess);
-                }
-                if (options.allOutputVisitor) {
-                    options.allOutputVisitor(line, process);
-                }
-            };
-            const proc = await RunningProcess.spawn(cmds, {
-                cwd: options.cwd,
-                stdOutVisitor: options.stdOutVisitor,
-                stdErrVisitor: options.stdErrVisitor,
-                allOutputVisitor: allOutputVisitor,
-                stdoutLogFile: options.stdoutLogFile,
-                stderrLogFile: options.stderrLogFile,
-                env: options.env,
-                appendLogs: options.appendLogs,
-                logBanner: options.logBanner,
-            });
-            // Keep the ORIGINAL visitor for supervisor restarts (not the init-hint wrapper).
-            proc.spawnOptions.allOutputVisitor = options.allOutputVisitor;
-            proc.hintDetector = hintDetector;
-            proc.useInitHint = true;
-            const prevOnExit = proc.onExit.bind(proc);
-            proc.onExit = (code: number | null, signal: number | null) => {
-                if (!initialized) {
-                    const fullOut = proc.stdOutLines.join("\n");
-                    const fullErr = proc.stdErrLines.join("\n");
-                    reject(new Error(`Process exited before initialization hint was found.\n` +
-                        `Command: ${cmds.join(" ")}\n` +
-                        `Exit Code: ${code}, Signal: ${signal}\n\n` +
-                        `--- Full StdOut ---\n${fullOut}\n\n` +
-                        `--- Full StdErr ---\n${fullErr}\n\n` +
-                        `Please check the log files in the 'logs/' directory for more details.`));
-                }
-                // Always chain so supervisor still sees the exit after init.
-                prevOnExit(code, signal);
-            };
+        const { promise, resolve, reject } = Promise.withResolvers<RunningProcess>();
+        let initialized = false;
+        let settled = false;
+        let timeout: Timer | undefined;
+        const finishReady = (process: RunningProcess) => {
+            if (settled) return;
+            settled = true;
+            initialized = true;
+            clearTimeout(timeout);
+            process.initializationReady = true;
+            resolve(process);
+        };
+        const allOutputVisitor: ProcessLineVisitor = (line: string, process: RunningProcess) => {
+            const normalizedLine = line.replace(/\u001b\[[0-9;]*m/g, '');
+            if (!initialized && hintDetector(normalizedLine)) finishReady(process);
+            options.allOutputVisitor?.(line, process);
+        };
+        const proc = await RunningProcess.spawn(cmds, {
+            cwd: options.cwd,
+            stdOutVisitor: options.stdOutVisitor,
+            stdErrVisitor: options.stdErrVisitor,
+            allOutputVisitor,
+            stdoutLogFile: options.stdoutLogFile,
+            stderrLogFile: options.stderrLogFile,
+            initializationTimeoutMs: options.initializationTimeoutMs,
+            env: options.env,
+            appendLogs: options.appendLogs,
+            logBanner: options.logBanner,
         });
+        // Keep the ORIGINAL visitor for supervisor restarts (not the init-hint wrapper).
+        proc.spawnOptions.allOutputVisitor = options.allOutputVisitor;
+        proc.hintDetector = hintDetector;
+        proc.useInitHint = true;
+        const prevOnExit = proc.onExit.bind(proc);
+        proc.onExit = (code: number | null, signal: number | null) => {
+            if (!settled) {
+                settled = true;
+                clearTimeout(timeout);
+                proc.supervisorObservedExit = true;
+                const fullOut = proc.stdOutLines.join("\n");
+                const fullErr = proc.stdErrLines.join("\n");
+                reject(new Error(`Process exited before initialization hint was found.\n` +
+                    `Command: ${cmds.join(" ")}\n` +
+                    `Exit Code: ${code}, Signal: ${signal}\n\n` +
+                    `--- Full StdOut ---\n${fullOut}\n\n` +
+                    `--- Full StdErr ---\n${fullErr}\n\n` +
+                    `Please check the log files in the 'logs/' directory for more details.`));
+            }
+            // Pre-ready exits are owned by the startup retry loop. After the
+            // full marker, chain so an already-wired supervisor still sees
+            // every later exit.
+            if (proc.initializationReady) prevOnExit(code, signal);
+        };
+        if (options.initializationTimeoutMs !== undefined) {
+            timeout = setTimeout(() => {
+                if (settled) return;
+                settled = true;
+                proc.supervisorObservedExit = true;
+                proc.kill();
+                void proc.proc.exited.then(async () => {
+                    await Promise.resolve();
+                    reject(new Error(
+                        `Process did not reach its initialization marker within ${options.initializationTimeoutMs}ms.\n`
+                        + `Command: ${cmds.join(" ")}\n\n`
+                        + `--- Full StdOut ---\n${proc.stdOutLines.join("\n")}\n\n`
+                        + `--- Full StdErr ---\n${proc.stdErrLines.join("\n")}`,
+                    ));
+                });
+            }, options.initializationTimeoutMs);
+        }
+        return promise;
     }
 
     static spawnWithInitializationHintWithRetry(
@@ -707,6 +801,7 @@ class RunningProcess {
             allOutputVisitor?: ProcessLineVisitor,
             stdoutLogFile?: string,
             stderrLogFile?: string,
+            initializationTimeoutMs?: number,
             maxRetries?: number,
             retryDelayMs?: number,
             env?: { [key: string]: string },
@@ -714,44 +809,56 @@ class RunningProcess {
             logBanner?: string,
         }
     ): Promise<RunningProcess> {
-        return new Promise<RunningProcess>(async (resolve, reject) => {
-            const maxRetries = options.maxRetries ?? 3;
-            const retryDelayMs = options.retryDelayMs ?? 2000;
-            let attempt = 0;
+        const { promise, resolve, reject } = Promise.withResolvers<RunningProcess>();
+        const maxRetries = options.maxRetries ?? 3;
+        const retryDelayMs = options.retryDelayMs ?? 2000;
+        let attempt = 0;
 
-            const trySpawn = async () => {
-                attempt++;
-                console.log(`[DevNet] Starting process (attempt ${attempt}/${maxRetries + 1}): ${cmds.join(" ")}`);
+        const trySpawn = async () => {
+            attempt++;
+            console.log(`[DevNet] Starting process (attempt ${attempt}/${maxRetries + 1}): ${cmds.join(" ")}`);
 
-                try {
-                    const proc = await this.spawnWithInitializationHint(cmds, hintDetector, {
-                        cwd: options.cwd,
-                        stdOutVisitor: options.stdOutVisitor,
-                        stdErrVisitor: options.stdErrVisitor,
-                        allOutputVisitor: options.allOutputVisitor,
-                        stdoutLogFile: options.stdoutLogFile,
-                        stderrLogFile: options.stderrLogFile,
-                        env: options.env,
-                        appendLogs: options.appendLogs,
-                        logBanner: options.logBanner,
-                    });
-                    proc.initMaxRetries = maxRetries;
-                    proc.initRetryDelayMs = retryDelayMs;
-                    console.log(`[DevNet] Process initialized successfully`);
-                    resolve(proc);
-                } catch (error) {
-                    if (attempt <= maxRetries) {
-                        console.warn(`[DevNet] Process failed (attempt ${attempt}/${maxRetries + 1}), retrying in ${retryDelayMs}ms...`);
-                        setTimeout(trySpawn, retryDelayMs);
-                    } else {
-                        reject(error);
-                    }
+            try {
+                const proc = await this.spawnWithInitializationHint(cmds, hintDetector, {
+                    cwd: options.cwd,
+                    stdOutVisitor: options.stdOutVisitor,
+                    stdErrVisitor: options.stdErrVisitor,
+                    allOutputVisitor: options.allOutputVisitor,
+                    stdoutLogFile: options.stdoutLogFile,
+                    stderrLogFile: options.stderrLogFile,
+                    initializationTimeoutMs: options.initializationTimeoutMs,
+                    env: options.env,
+                    appendLogs: options.appendLogs,
+                    logBanner: options.logBanner,
+                });
+                proc.initMaxRetries = maxRetries;
+                proc.initRetryDelayMs = retryDelayMs;
+                console.log(`[DevNet] Process initialized successfully`);
+                resolve(proc);
+            } catch (error) {
+                if (attempt <= maxRetries) {
+                    console.warn(`[DevNet] Process failed (attempt ${attempt}/${maxRetries + 1}), retrying in ${retryDelayMs}ms...`);
+                    setTimeout(trySpawn, retryDelayMs);
+                } else {
+                    reject(error);
                 }
-            };
+            }
+        };
 
-            trySpawn();
-        });
+        void trySpawn();
+        return promise;
     }
+}
+
+export async function startRealmProcessorBatchSequentially<T>(
+    realmIds: readonly number[],
+    startProcessor: (realmId: number) => Promise<T>,
+): Promise<T[]> {
+    const processes: T[] = [];
+    for (const realmId of realmIds) {
+        processes.push(await startProcessor(realmId));
+    }
+    return processes;
 }
 
 
@@ -759,22 +866,11 @@ class RunningProcess {
 function dbStartedDetector(line: string): boolean {
     return line.includes('All services are running.')
 }
-function coordinatorProcessorStartedDetector(line: string): boolean {
-    return line.startsWith('[CFLI:PSY_COORDINATOR_PROCESSOR_STARTED]')
-        || line.includes('Using network:')
-}
 function coordinatorEdgeProcessorStartedDetector(line: string): boolean {
     return line.startsWith('[CFLI:PSY_COORDINATOR_EDGE_RPC_STARTED]')
         || line.includes('Coordinator edge starting with proving backend:')
 }
 function workerStartedDetector(line: string): boolean { return line.startsWith('[CFLI:PSY_PROOF_MINER_WORKER_STARTED]'); }
-function realmProcessorStartedDetector(line: string): boolean {
-    return line.startsWith('[CFLI:PSY_REALM_PROCESSOR_STARTED]')
-        || line.includes('Using network:')
-        || line.includes('[REALM_CREATE] setup_for_realm start')
-        || line.includes('[REALM_CREATE] create_and_run start')
-        || line.includes('creating keyspaces:')
-}
 function realmEdgeProcessorStartedDetector(line: string): boolean {
     return line.startsWith('[CFLI:PSY_REALM_EDGE_RPC_STARTED]')
         || line.includes('Realm edge starting...')
@@ -1167,8 +1263,9 @@ function gitWithoutLfs(...args: string[]): string[] {
     return ["git", ...GIT_NO_LFS_CONFIG_ARGS, ...args];
 }
 
-function resolveProjectsDir(): string {
-    return path.resolve(process.env.HOME || ".", "Projects");
+export function resolveProjectsDir(): string {
+    const configuredProjectsDir = process.env.PSY_PROJECTS_DIR?.trim();
+    return path.resolve(configuredProjectsDir || process.env.HOME || ".", configuredProjectsDir ? "." : "Projects");
 }
 
 function normalizeGitRemoteUrl(url: string): string {
@@ -1425,10 +1522,45 @@ async function ensureAllUiDeps(cwd: string, opts?: { force?: boolean }): Promise
     }
 }
 
-type CompilerArtifactFingerprint = {
+export type CompilerArtifactFingerprint = {
     compilerRevision: string;
     compilerSourcesHash: string;
 };
+
+export type GenesisContractsArtifactFingerprint = CompilerArtifactFingerprint & {
+    artifactSha256: string;
+    artifactByteSize: number;
+};
+
+export type CompilerArtifactStampMatch = "match" | "missing" | "mismatch";
+
+export function evaluateCompilerArtifactStamp(
+    actual: GenesisContractsArtifactFingerprint | null,
+    expected: GenesisContractsArtifactFingerprint,
+): CompilerArtifactStampMatch {
+    if (!actual) return "missing";
+    if (actual.compilerRevision !== expected.compilerRevision
+        || actual.compilerSourcesHash !== expected.compilerSourcesHash
+        || actual.artifactSha256 !== expected.artifactSha256
+        || actual.artifactByteSize !== expected.artifactByteSize) {
+        return "mismatch";
+    }
+    return "match";
+}
+
+export async function writeCompilerArtifactStamp(
+    stampPath: string,
+    fingerprint: GenesisContractsArtifactFingerprint,
+): Promise<void> {
+    const tmpPath = `${stampPath}.tmp`;
+    try {
+        await fs.promises.writeFile(tmpPath, `${JSON.stringify(fingerprint, null, 2)}\n`, "utf8");
+        await fs.promises.rename(tmpPath, stampPath);
+    } catch (error) {
+        await fs.promises.rm(tmpPath, { force: true }).catch(() => undefined);
+        throw error;
+    }
+}
 
 
 
@@ -1479,6 +1611,28 @@ async function readCompilerArtifactFingerprint(stampPath: string): Promise<Compi
         return {
             compilerRevision: parsed.compilerRevision,
             compilerSourcesHash: parsed.compilerSourcesHash,
+        };
+    } catch {
+        return null;
+    }
+}
+
+export async function readGenesisContractsArtifactStamp(
+    stampPath: string,
+): Promise<GenesisContractsArtifactFingerprint | null> {
+    try {
+        const parsed = JSON.parse(await fs.promises.readFile(stampPath, "utf8")) as Partial<GenesisContractsArtifactFingerprint>;
+        if (typeof parsed.compilerRevision !== "string"
+            || typeof parsed.compilerSourcesHash !== "string"
+            || typeof parsed.artifactSha256 !== "string"
+            || typeof parsed.artifactByteSize !== "number") {
+            return null;
+        }
+        return {
+            compilerRevision: parsed.compilerRevision,
+            compilerSourcesHash: parsed.compilerSourcesHash,
+            artifactSha256: parsed.artifactSha256,
+            artifactByteSize: parsed.artifactByteSize,
         };
     } catch {
         return null;
@@ -1651,11 +1805,27 @@ type KeystoreManifestFile = { sha256: string; size: number };
 type KeystoreManifest = { version: number; files: Record<string, KeystoreManifestFile> };
 type KeystoreGroup = { type: "zst" | "tar"; key: string; entries: string[] };
 
+async function digestFile(filePath: string): Promise<{ sha256: string; size: number }> {
+    const handle = await fs.promises.open(filePath, "r");
+    try {
+        const { size } = await handle.stat();
+        const hash = createHash("sha256");
+        const chunk = Buffer.alloc(256 * 1024);
+        let position = 0;
+        while (position < size) {
+            const { bytesRead } = await handle.read(chunk, 0, chunk.length, position);
+            if (bytesRead <= 0) break;
+            hash.update(chunk.subarray(0, bytesRead));
+            position += bytesRead;
+        }
+        return { sha256: hash.digest("hex"), size };
+    } finally {
+        await handle.close();
+    }
+}
+
 async function sha256File(filePath: string): Promise<string> {
-    const hash = createHash("sha256");
-    const stream = fs.createReadStream(filePath);
-    for await (const chunk of stream) hash.update(chunk);
-    return hash.digest("hex");
+    return (await digestFile(filePath)).sha256;
 }
 
 // Returns true iff the local file at keystoreDir/relPath exists and its
@@ -1838,6 +2008,7 @@ async function ensureKeystoreFiles(contractsDir: string): Promise<{ generated: b
             fs.renameSync(decompressedTmp, destPath);
         } else {
             // Extract the whole tar into keystoreDir; the archive carries the top-level dir.
+
             const dirPath = path.join(keystoreDir, path.dirname(group.entries[0]));
             await rm(dirPath, { recursive: true }).catch(() => undefined);
             await downloadAndExtractTar(group.key, keystoreDir);
@@ -1858,6 +2029,35 @@ async function ensureKeystoreFiles(contractsDir: string): Promise<{ generated: b
 
     return { generated };
 }
+const GENESIS_BLOCK_TIME_SECONDS = 1_764_248_609;
+const GENESIS_INSPECT_SUFFIX_BYTES = 64 * 1024;
+
+export async function isUsableGenesisData(filePath: string): Promise<boolean> {
+    try {
+        const { size } = await fs.promises.stat(filePath);
+        const len = Math.min(size, GENESIS_INSPECT_SUFFIX_BYTES);
+        if (len <= 0) return false;
+        const buf = Buffer.alloc(len);
+        const handle = await fs.promises.open(filePath, "r");
+        try {
+            const { bytesRead } = await handle.read(buf, 0, len, size - len);
+            const suffix = buf.subarray(0, bytesRead).toString("utf8");
+            const statsIdx = suffix.indexOf("\"checkpoint_stats\"");
+            if (statsIdx < 0) return false;
+            const keyIdx = suffix.indexOf("\"block_time\"", statsIdx);
+            if (keyIdx < 0) return false;
+            const after = suffix.slice(keyIdx + "\"block_time\"".length);
+            const match = after.match(/^\s*:\s*(\d+)/);
+            if (!match) return false;
+            const value = Number(match[1]);
+            return Number.isSafeInteger(value) && value === GENESIS_BLOCK_TIME_SECONDS;
+        } finally {
+            await handle.close();
+        }
+    } catch {
+        return false;
+    }
+}
 
 async function isUsableGenesisContracts(filePath: string): Promise<boolean> {
     try {
@@ -1877,6 +2077,7 @@ async function isUsableGenesisContracts(filePath: string): Promise<boolean> {
 async function ensureGenesisFiles(cwd: string): Promise<void> {
     const genesisPath = path.join(cwd, "genesis.json");
     const genesisContractsPath = path.join(cwd, "psy-genesis", "genesis_contracts.json");
+    const genesisContractsStampPath = path.join(cwd, "psy-genesis", ".genesis_contracts.compiler-artifact.json");
 
     // The canonical zstd-compressed genesis contracts artifact is owned by
     // the psy-genesis submodule. Plain JSON and Git LFS pointers are invalid.
@@ -1887,9 +2088,44 @@ async function ensureGenesisFiles(cwd: string): Promise<void> {
         );
     }
 
+    // The psy-genesis submodule commit remains the packaging authority. When a
+    // compiler provenance sidecar is present beside the payload, additionally
+    // verify that it certifies these exact bytes and, when available, the
+    // checked-out standalone compiler identity. Never synthesize a stamp for a
+    // committed payload that was not generated in this setup run.
+    if (await exists(genesisContractsStampPath)) {
+        const stamp = await readGenesisContractsArtifactStamp(genesisContractsStampPath);
+        if (!stamp) {
+            throw new Error("[AutoSetup] psy-genesis compiler artifact stamp is malformed or legacy");
+        }
+        const artifactDigest = await digestFile(genesisContractsPath);
+        let expected: GenesisContractsArtifactFingerprint = {
+            compilerRevision: stamp.compilerRevision,
+            compilerSourcesHash: stamp.compilerSourcesHash,
+            artifactSha256: artifactDigest.sha256,
+            artifactByteSize: artifactDigest.size,
+        };
+        const compilerPath = path.resolve(resolveProjectsDir(), "psy-compiler");
+        if (await exists(path.join(compilerPath, "Makefile"))) {
+            expected = {
+                ...(await resolveCompilerArtifactFingerprint(compilerPath)),
+                artifactSha256: artifactDigest.sha256,
+                artifactByteSize: artifactDigest.size,
+            };
+        }
+        if (evaluateCompilerArtifactStamp(stamp, expected) !== "match") {
+            throw new Error(
+                "[AutoSetup] psy-genesis compiler artifact stamp does not match the compiler identity or genesis_contracts.json bytes",
+            );
+        }
+    }
+
     if (await exists(genesisPath)) {
-        console.log("[AutoSetup] genesis artifacts already exist");
-        return;
+        if (await isUsableGenesisData(genesisPath)) {
+            console.log("[AutoSetup] genesis artifacts already exist");
+            return;
+        }
+        console.log("[AutoSetup] genesis.json present but not strict Unix-seconds genesis; regenerating");
     }
 
     // genesis.json: generated by cargo test in psy_plonky2_circuits
@@ -2992,32 +3228,37 @@ class DevNetProcessManager {
 
         // 3. Coordinator Processor
         if (startCoordinatorProcessor) {
-            // await cleanCheckpoint('./local_checkpoints/coordinator_0_0', cwd);
-            const coordinatorProcessorLogPath = path.join(logsDir, "coordinator_processor_logs.txt");
-            await this.track(await RunningProcess.spawnWithInitializationHintWithRetry(
-                [
-                    nodeCli, 'start-coordinator-processor',
-                    '--coordinator-id', '0',
-                    '--coordinator-sub-id', '0',
-                    '--network', this.NETWORK,
-                    '--db-namespace', 'coordinator',
-                    '--scylla-db-url', this.SCYLLA_URL,
-                    '--nats-jetstream-url', this.NATS_URL,
-                    '--redis-url', this.REDIS_URL,
-                    '--genesis-data-path', this.genesisDataPath,
-                    '--checkpoint-backup-path', './local_checkpoints',
-                    '--proving-backend', backend,
-                    '--verbose'
-                ],
-                coordinatorProcessorStartedDetector,
-                { cwd, ...getLogPaths("coordinator_processor", false), maxRetries: 3, retryDelayMs: 2000, env: this.getEnv() }
-            ));
-            console.log("[DevNet] Waiting for coordinator processor to finish genesis initialization...");
-            await waitForLogPattern(
-                coordinatorProcessorLogPath,
-                /\[COORD_CREATE\] processor new done/,
-                { attempts: 120, delayMs: 1000, name: "coordinator processor readiness" }
+            const coordinatorLogPaths = getLogPaths("coordinator_processor", false);
+            const coordinatorProcessor = await retryProcessorStartup(
+                "coordinator processor",
+                (attempt, totalAttempts) => RunningProcess.spawnWithInitializationHint(
+                    [
+                        nodeCli, 'start-coordinator-processor',
+                        '--coordinator-id', '0',
+                        '--coordinator-sub-id', '0',
+                        '--network', this.NETWORK,
+                        '--db-namespace', 'coordinator',
+                        '--scylla-db-url', this.SCYLLA_URL,
+                        '--nats-jetstream-url', this.NATS_URL,
+                        '--redis-url', this.REDIS_URL,
+                        '--genesis-data-path', this.genesisDataPath,
+                        '--checkpoint-backup-path', './local_checkpoints',
+                        '--proving-backend', backend,
+                        '--verbose'
+                    ],
+                    (line) => isExactProcessorReadyLine(line, COORDINATOR_PROCESSOR_READY_MARKER),
+                    {
+                        cwd,
+                        ...coordinatorLogPaths,
+                        initializationTimeoutMs: 120_000,
+                        env: this.getEnv(),
+                        appendLogs: attempt > 1,
+                        logBanner: `===== coordinator processor readiness attempt ${attempt}/${totalAttempts} =====`,
+                    },
+                ),
+                { maxRetries: 3, retryDelayMs: 2000 },
             );
+            this.track(coordinatorProcessor);
 
             // 4. Coordinator Edges (Scalable)
             const coordEdgePromises: Promise<RunningProcess>[] = [];
@@ -3091,49 +3332,55 @@ class DevNetProcessManager {
             //     await cleanCheckpoint('./local_checkpoints/realm_' + realmId + '_1', cwd);
             // }
 
-            // Start realm processors first, then edges
+            // Each fresh realm creates the same schema in a separate keyspace.
+            // Serialize processor readiness so Scylla's single-node group-0 Raft
+            // state is not flooded by concurrent schema changes. Edges still
+            // start in parallel after their processor batch is fully ready.
             for (let b = 0; b < realmsCount; b += 4) {
-                const realmProcessorPromises: Promise<RunningProcess>[] = [];
                 const batchSize = Math.min(4, realmsCount - b);
+                const realmIds = Array.from(
+                    { length: batchSize },
+                    (_, i) => startRealmId + b + i,
+                );
 
-                // First, start all processors in this batch
-                for (let i = 0; i < batchSize; i++) {
-                    const realmId = startRealmId + b + i;
-                    const realmProcessorLogPath = path.join(logsDir, `realm_${realmId}_processor_logs.txt`);
-
-                    // Start realm processor
-                    const processorPromise = RunningProcess.spawnWithInitializationHintWithRetry(
-                        [
-                            nodeCli, 'start-realm-processor',
-                            '--realm-id', realmId.toString(),
-                            '--realm-sub-id', '1',
-                            '--network', this.NETWORK,
-                            '--db-namespace', 'realm_' + realmId,
-                            '--scylla-db-url', this.SCYLLA_URL,
-                            '--nats-jetstream-url', this.NATS_URL,
-                            '--redis-url', this.REDIS_URL,
-                            '--genesis-data-path', this.genesisDataPath,
-                            '--checkpoint-backup-path', './local_checkpoints',
-                            '--coordinator-api-urls', this.COORD_API_URL,
-                            '--proving-backend', backend,
-                            '--verbose'
-                        ],
-                        realmProcessorStartedDetector,
-                        { cwd, ...getLogPaths(`realm_${realmId}_processor`, false), maxRetries: 3, retryDelayMs: 2000, env: this.getEnv() }
-                    ).then(async (proc) => {
-                        this.track(proc);
-                        await waitForLogPattern(
-                            realmProcessorLogPath,
-                            /\[REALM_CREATE\] processor new done/,
-                            { attempts: 180, delayMs: 1000, name: `realm ${realmId} processor readiness` }
+                await startRealmProcessorBatchSequentially(
+                    realmIds,
+                    async (realmId) => {
+                        const realmLogPaths = getLogPaths(`realm_${realmId}_processor`, false);
+                        const proc = await retryProcessorStartup(
+                            `realm ${realmId} processor`,
+                            (attempt, totalAttempts) => RunningProcess.spawnWithInitializationHint(
+                                [
+                                    nodeCli, 'start-realm-processor',
+                                    '--realm-id', realmId.toString(),
+                                    '--realm-sub-id', '1',
+                                    '--network', this.NETWORK,
+                                    '--db-namespace', 'realm_' + realmId,
+                                    '--scylla-db-url', this.SCYLLA_URL,
+                                    '--nats-jetstream-url', this.NATS_URL,
+                                    '--redis-url', this.REDIS_URL,
+                                    '--genesis-data-path', this.genesisDataPath,
+                                    '--checkpoint-backup-path', './local_checkpoints',
+                                    '--coordinator-api-urls', this.COORD_API_URL,
+                                    '--proving-backend', backend,
+                                    '--verbose'
+                                ],
+                                (line) => isExactProcessorReadyLine(line, REALM_PROCESSOR_READY_MARKER),
+                                {
+                                    cwd,
+                                    ...realmLogPaths,
+                                    initializationTimeoutMs: 180_000,
+                                    env: this.getEnv(),
+                                    appendLogs: attempt > 1,
+                                    logBanner: `===== realm ${realmId} processor readiness attempt ${attempt}/${totalAttempts} =====`,
+                                },
+                            ),
+                            { maxRetries: 3, retryDelayMs: 2000 },
                         );
+                        this.track(proc);
                         return proc;
-                    });
-                    realmProcessorPromises.push(processorPromise);
-                }
-
-                // Wait for all realm processors in this batch to start
-                await Promise.all(realmProcessorPromises);
+                    },
+                );
                 console.log(`[DevNet] Batch ${b/4 + 1} realm processors finished genesis initialization.`);
 
                 // Now start the edges for this batch

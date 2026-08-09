@@ -248,3 +248,14 @@ impl ContractFunctionCircuitId {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::LocalCircuitType;
+
+    #[test]
+    fn eth_personal_signature_type_owns_id_52() {
+        assert_eq!(LocalCircuitType::EthPersonalSecp256K1.to_u8(), 52);
+        assert_eq!(LocalCircuitType::try_from(52).unwrap(), LocalCircuitType::EthPersonalSecp256K1);
+    }
+}

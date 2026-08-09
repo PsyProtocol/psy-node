@@ -57,7 +57,7 @@ pub fn get_genesis_block_setup_data_for_local_devnet_default() -> anyhow::Result
                 register_users_completed: F::ZERO_VALUE,
                 gutas_completed: F::ZERO_VALUE,
             },
-            block_time: F::from_u64_value(1764248609350u64),
+            block_time: F::from_u64_value(1_764_248_609u64),
             random_seed: QHashOut::from_values(1, 2, 3, 4),
             pm_rewards_commitment: PPMRewardCommitment {
                 register_users_root: Hash::get_zero_value(),
@@ -166,6 +166,16 @@ mod tests {
     type F = GoldilocksField;
     type Hash = QHashOut<F>;
 
+    #[test]
+    fn local_devnet_genesis_block_time_uses_unix_seconds() -> anyhow::Result<()> {
+        let genesis = get_genesis_block_setup_data_for_local_devnet_default()?;
+        assert_eq!(
+            genesis.checkpoint_stats.block_time.to_canonical_u64(),
+            1_764_248_609
+        );
+        Ok(())
+    }
+
     fn deterministic_private_key(slot: u64) -> QHashOut<F> {
         // Stable per-slot key derivation for local devnet artifacts.
         QHashOut::from_values(
@@ -183,10 +193,21 @@ mod tests {
             .filter(|raw| !raw.is_empty())
     }
 
+    fn first_existing_explicit_keystore_path(paths: [Option<String>; 2]) -> Option<String> {
+        for path in paths.into_iter().flatten() {
+            if std::path::Path::new(&path).exists() {
+                return Some(path);
+            }
+        }
+        None
+    }
+
     fn resolve_bridge_relayer_private_key() -> anyhow::Result<Option<QHashOut<F>>> {
         let private_key = read_env("PRIVATE_KEY").or_else(|| read_env("BRIDGE_RELAYER_L2_PRIVATE_KEY"));
-        let keystore_path = read_env("KEYSTORE_PATH")
-            .or_else(|| read_env("BRIDGE_RELAYER_KEYSTORE_PATH"))
+        let keystore_path = first_existing_explicit_keystore_path([
+            read_env("KEYSTORE_PATH"),
+            read_env("BRIDGE_RELAYER_KEYSTORE_PATH"),
+        ])
             .or_else(|| {
                 // Use the daemon default only when it actually exists. A
                 // missing default keystore should not block fresh genesis
@@ -213,6 +234,34 @@ mod tests {
         };
         let info = load_wallet_key_info(&wallet_args, false)?;
         Ok(Some(QHashOut::<F>::from_str(&info.private_key.to_string())?))
+    }
+
+    #[test]
+    fn explicit_bridge_relayer_keystore_must_exist() -> anyhow::Result<()> {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let existing_path = std::env::temp_dir().join(format!(
+            "psy-bridge-relayer-keystore-{}-{unique}",
+            std::process::id()
+        ));
+        let missing_path = existing_path.with_extension("missing");
+        std::fs::write(&existing_path, b"test")?;
+        let existing_path = existing_path.to_string_lossy().into_owned();
+        let missing_path = missing_path.to_string_lossy().into_owned();
+
+        assert_eq!(
+            first_existing_explicit_keystore_path([Some(missing_path.clone()), Some(existing_path.clone())]),
+            Some(existing_path.clone())
+        );
+        assert_eq!(
+            first_existing_explicit_keystore_path([Some(existing_path.clone()), Some(missing_path.clone())]),
+            Some(existing_path.clone())
+        );
+        assert_eq!(first_existing_explicit_keystore_path([Some(missing_path), None]), None);
+
+        std::fs::remove_file(existing_path)?;
+        Ok(())
     }
 
     #[test]
@@ -297,7 +346,7 @@ mod tests {
                     register_users_completed: F::ZERO_VALUE,
                     gutas_completed: F::ZERO_VALUE,
                 },
-                block_time: F::from_u64_value(1764248609350u64),
+                block_time: F::from_u64_value(1_764_248_609u64),
                 random_seed: QHashOut::from_values(1, 2, 3, 4),
                 pm_rewards_commitment: PPMRewardCommitment {
                     register_users_root: Hash::get_zero_value(),

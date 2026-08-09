@@ -8,9 +8,13 @@ import {
     findCpuSetOverlap,
     formatCpuSet,
     hasFaucetOperatorConfig,
+    COORDINATOR_PROCESSOR_READY_MARKER,
+    REALM_PROCESSOR_READY_MARKER,
     hasZstdMagic,
     isFatalProcessorErrorLine,
     isCompilerFingerprintSource,
+    isExactProcessorReadyLine,
+    isTransientScyllaSchemaFailure,
     parseCpuSet,
     parseEnvAssignments,
     parseLscpuTopology,
@@ -272,5 +276,23 @@ describe("shouldFatalRestartProcessor", () => {
         expect(shouldFatalRestartProcessor(line, false)).toBe(true);
         expect(shouldFatalRestartProcessor(line, true)).toBe(false);
         expect(shouldFatalRestartProcessor("[CFLI:PSY_COORDINATOR_PROCESSOR_ERROR] other", true)).toBe(false);
+    });
+});
+
+
+describe("processor readiness helpers", () => {
+    it("accepts only complete readiness markers", () => {
+        expect(isExactProcessorReadyLine(COORDINATOR_PROCESSOR_READY_MARKER, COORDINATOR_PROCESSOR_READY_MARKER)).toBe(true);
+        expect(isExactProcessorReadyLine(`INFO ${REALM_PROCESSOR_READY_MARKER}`, REALM_PROCESSOR_READY_MARKER)).toBe(true);
+        expect(isExactProcessorReadyLine("[COORD_CREATE] processor new start", COORDINATOR_PROCESSOR_READY_MARKER)).toBe(false);
+        expect(isExactProcessorReadyLine(`${COORDINATOR_PROCESSOR_READY_MARKER} trailing`, COORDINATOR_PROCESSOR_READY_MARKER)).toBe(false);
+        expect(isExactProcessorReadyLine(`prefix${COORDINATOR_PROCESSOR_READY_MARKER}`, COORDINATOR_PROCESSOR_READY_MARKER)).toBe(false);
+    });
+
+    it("recognizes only transient Scylla schema timeout evidence", () => {
+        expect(isTransientScyllaSchemaFailure("Scylla schema configuration failed\nunrelated coordinator request timeout")).toBe(false);
+        expect(isTransientScyllaSchemaFailure("Scylla schema operation timed out while applying migration")).toBe(true);
+        expect(isTransientScyllaSchemaFailure("raft group-0 add_entry: operation timeout")).toBe(true);
+        expect(isTransientScyllaSchemaFailure("group [ec259ee0] raft operation [add_entry] timed out")).toBe(true);
     });
 });

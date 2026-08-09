@@ -218,6 +218,13 @@ pub struct SimulatedTxJson {
     pub metadata: SimulatedTxMetadata,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ViewCallResult {
+    pub checkpoint_id: u64,
+    pub contract_calls: Vec<ContractCallResultArgs>,
+    pub storage_reads: Vec<TxStorageRead>,
+}
+
 impl TxEndCapData {
     pub fn from_user_ec_input(input: &SubmitUserEndCapNonProofInput<F>) -> Self {
         Self {
@@ -243,6 +250,16 @@ impl TxStorageData {
         }
         storage
     }
+    pub(crate) fn from_call_witnesses(
+        current_user_id: u64,
+        current_contract_id: u64,
+        cmd_witnesses: &[PsyCmdWithInputAndWitness<F>],
+    ) -> Self {
+        let mut storage = TxStorageData::default();
+        storage.extend_from_cmd_witnesses(current_user_id, current_contract_id, cmd_witnesses);
+        storage
+    }
+
 
     pub fn from_trace(trace: &TxTrace) -> Self {
         let mut storage = Self::from_steps(trace.meta.user_id, &trace.steps);
@@ -681,7 +698,7 @@ mod simulation_tests {
     use super::*;
 
     #[test]
-    fn fee_free_view_response_omits_provable_transaction_fields() {
+    fn simulation_and_view_json_have_disjoint_required_fields() {
         let response = SimulatedTxJson {
             generated: None,
             metadata: SimulatedTxMetadata {
@@ -704,7 +721,19 @@ mod simulation_tests {
         assert!(json.get("generated").is_none());
         assert!(json["metadata"].get("tx_hash").is_none());
         assert!(json["metadata"].get("end_cap_data").is_none());
-        assert_eq!(json["metadata"]["contract_call_data"]["contract_calls"][0]["outputs"][0], 42);
-        assert_eq!(json["metadata"]["storage_data"]["writes"], serde_json::json!([]));
+
+        let view = serde_json::to_value(ViewCallResult {
+            checkpoint_id: 1,
+            contract_calls: Vec::new(),
+            storage_reads: Vec::new(),
+        })
+        .unwrap();
+        assert_eq!(view.as_object().unwrap().len(), 3);
+        assert!(view.get("checkpoint_id").is_some());
+        assert!(view.get("contract_calls").is_some());
+        assert!(view.get("storage_reads").is_some());
+        assert!(view.get("generated").is_none());
+        assert!(view.get("metadata").is_none());
+        assert!(view.get("tx_hash").is_none());
     }
 }

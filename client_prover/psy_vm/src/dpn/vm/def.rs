@@ -54,7 +54,7 @@ pub struct DPNFunctionCircuitDefinition {
 
 impl DPNFunctionCircuitDefinition {
     pub fn is_view_function(&self) -> bool {
-        self.state_commands.iter().all(|cmd| cmd.is_read_only())
+        self.events.is_empty() && self.state_commands.iter().all(|cmd| cmd.is_read_only())
     }
 }
 
@@ -131,5 +131,18 @@ mod tests {
         assert!(!definition(vec![DPNStateCmd::set_imt_contract_state_value(1, 0, 4, [0; 4], [1; 4])]).is_view_function());
         assert!(!definition(vec![DPNStateCmd::invoke_external_contract_function(1, 2, 3, Vec::new(), 0)]).is_view_function());
         assert!(!definition(vec![DPNStateCmd::invoke_external_contract_function_deferred(1, 2, 3, Vec::new())]).is_view_function());
+    }
+
+    #[test]
+    fn view_detection_rejects_event_only_definitions() {
+        let mut event_only = definition(Vec::new());
+        event_only.events.push(DPNEventRecord {
+            condition: 0,
+            checkpoint_id: 0,
+            user_id: 0,
+            contract_id: 0,
+            data: Vec::new(),
+        });
+        assert!(!event_only.is_view_function());
     }
 }

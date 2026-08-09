@@ -12,8 +12,8 @@ use jsonrpsee::{
 use parking_lot::RwLock;
 use plonky2::field::goldilocks_field::GoldilocksField;
 use psy_client_common::{
-    args::{ContractCallArgs, ContractCallData, DPNSoftwareDefinedCallData},
-    data::qhashout::QHashOut,
+    args::{ContractCallArgs, ContractCallData, DPNSoftwareDefinedCallData, ViewCallData},
+    data::{base_types::hash256::Hash256, qhashout::QHashOut},
 };
 use psy_client_data::qblock::cmds::deploy_contract::QBCDeployContract;
 use psy_crypto::signature::zk::data::ZKPublicKeyInfo;
@@ -33,6 +33,8 @@ pub trait Rpc {
     async fn generate_tx_trace(&self, public_key: QHashOut<F>, call_data: ContractCallData) -> Result<String, ErrorObjectOwned>;
     #[method(name = "simulate_contract_call")]
     async fn simulate_contract_call(&self, public_key: QHashOut<F>, call_data: ContractCallData) -> Result<String, ErrorObjectOwned>;
+    #[method(name = "call_view")]
+    async fn call_view(&self, public_key: QHashOut<F>, call_data: ViewCallData) -> Result<String, ErrorObjectOwned>;
     #[method(name = "prove_tx_trace")]
     async fn prove_tx_trace(&self, public_key: QHashOut<F>, envelope_json: String) -> Result<String, ErrorObjectOwned>;
     #[method(name = "start_session")]
@@ -45,6 +47,23 @@ pub trait Rpc {
     async fn register_user(&self, private_key: QHashOut<F>, fingerprint: QHashOut<F>) -> Result<QHashOut<F>, ErrorObjectOwned>;
     #[method(name = "add_user")]
     async fn add_user(&self, private_key: QHashOut<F>, fingerprint: QHashOut<F>) -> Result<QHashOut<F>, ErrorObjectOwned>;
+    #[method(name = "eth_personal_registration_challenge")]
+    async fn eth_personal_registration_challenge(&self, selected_evm_address: [u8; 20]) -> Result<Hash256, ErrorObjectOwned>;
+    #[method(name = "register_external_eth_personal_user")]
+    async fn register_external_eth_personal_user(
+        &self,
+        selected_evm_address: [u8; 20],
+        recovery_message: Hash256,
+        signature: Vec<u8>,
+    ) -> Result<QHashOut<F>, ErrorObjectOwned>;
+    #[method(name = "inject_eth_personal_signature")]
+    async fn inject_eth_personal_signature(
+        &self,
+        expected_public_key: QHashOut<F>,
+        selected_evm_address: [u8; 20],
+        message: Hash256,
+        signature: Vec<u8>,
+    ) -> Result<QHashOut<F>, ErrorObjectOwned>;
     #[method(name = "register_sd_key_circuit")]
     async fn register_sd_key_circuit(
         &self,
@@ -126,6 +145,17 @@ impl RpcServer for RpcServerImpl {
         .map_err(|e| ErrorObject::owned(1, e.to_string(), None::<()>))?
         .map_err(|e| ErrorObject::owned(1, e.to_string(), None::<()>))?;
         serde_json::to_string(&simulated).map_err(|e| ErrorObject::owned(1, e.to_string(), None::<()>))
+    }
+
+    async fn call_view(&self, public_key: QHashOut<F>, call_data: ViewCallData) -> Result<String, ErrorObjectOwned> {
+        let wallet_session = self.wallet_session.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            tokio::runtime::Handle::current().block_on(async move { wallet_session.read().call_view(public_key, call_data).await })
+        })
+        .await
+        .map_err(|e| ErrorObject::owned(1, e.to_string(), None::<()>))?
+        .map_err(|e| ErrorObject::owned(1, e.to_string(), None::<()>))?;
+        serde_json::to_string(&result).map_err(|e| ErrorObject::owned(1, e.to_string(), None::<()>))
     }
 
     async fn prove_tx_trace(&self, public_key: QHashOut<F>, envelope_json: String) -> Result<String, ErrorObjectOwned> {
@@ -225,6 +255,58 @@ impl RpcServer for RpcServerImpl {
         let wallet_session = self.wallet_session.clone();
         tokio::task::spawn_blocking(move || {
             tokio::runtime::Handle::current().block_on(async move { wallet_session.write().add_user(private_key, fingerprint).await })
+        })
+        .await
+        .map_err(|e| ErrorObject::owned(1, e.to_string(), None::<()>))?
+        .map_err(|e| ErrorObject::owned(1, e.to_string(), None::<()>))
+    }
+
+    async fn eth_personal_registration_challenge(&self, selected_evm_address: [u8; 20]) -> Result<Hash256, ErrorObjectOwned> {
+        WalletSession::eth_personal_registration_challenge(selected_evm_address)
+            .map_err(|e| ErrorObject::owned(1, e.to_string(), None::<()>))
+    }
+
+    async fn register_external_eth_personal_user(
+        &self,
+        selected_evm_address: [u8; 20],
+        recovery_message: Hash256,
+        signature: Vec<u8>,
+    ) -> Result<QHashOut<F>, ErrorObjectOwned> {
+        let signature: [u8; 65] = signature
+            .try_into()
+            .map_err(|signature: Vec<u8>| ErrorObject::owned(1, format!("EIP-191 signature must be 65 bytes, got {}", signature.len()), None::<()>))?;
+        let wallet_session = self.wallet_session.clone();
+        tokio::task::spawn_blocking(move || {
+            tokio::runtime::Handle::current().block_on(async move {
+                wallet_session
+                    .write()
+                    .register_external_eth_personal_user(selected_evm_address, recovery_message, signature)
+                    .await
+            })
+        })
+        .await
+        .map_err(|e| ErrorObject::owned(1, e.to_string(), None::<()>))?
+        .map_err(|e| ErrorObject::owned(1, e.to_string(), None::<()>))
+    }
+
+    async fn inject_eth_personal_signature(
+        &self,
+        expected_public_key: QHashOut<F>,
+        selected_evm_address: [u8; 20],
+        message: Hash256,
+        signature: Vec<u8>,
+    ) -> Result<QHashOut<F>, ErrorObjectOwned> {
+        let signature: [u8; 65] = signature
+            .try_into()
+            .map_err(|signature: Vec<u8>| ErrorObject::owned(1, format!("EIP-191 signature must be 65 bytes, got {}", signature.len()), None::<()>))?;
+        let wallet_session = self.wallet_session.clone();
+        tokio::task::spawn_blocking(move || {
+            tokio::runtime::Handle::current().block_on(async move {
+                wallet_session
+                    .write()
+                    .inject_eth_personal_signature(expected_public_key, selected_evm_address, message, signature)
+                    .await
+            })
         })
         .await
         .map_err(|e| ErrorObject::owned(1, e.to_string(), None::<()>))?

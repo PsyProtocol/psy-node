@@ -594,7 +594,7 @@ impl<
         let total_jobs = jobs_for_queue.iter().map(|v| v.len()).sum::<usize>() as u64;
         self.new_contracts_file.write_u64_le(total_jobs).await?;
         self.new_contracts_file.seek(SeekFrom::Start(4 + 8 + 32)).await?;
-        self.new_contracts_file.write_u32(total_new_contracts).await?;
+        self.new_contracts_file.write_u32_le(total_new_contracts).await?;
         // ensure the new total contracts length is flushed correctly
         self.config
             .file_system

@@ -293,12 +293,8 @@ fn contract_output_from_response(response: CompilerResponse) -> anyhow::Result<C
             "compiler contract_code metadata does not match DPN definition for method_id {}",
             function.method_id
         );
-        anyhow::ensure!(
-            function.vm_type == 0 || function.vm_type == VM_TYPE_STANRDARD_DAPEN_V1,
-            "compiler contract_code method_id {} has unsupported vm_type {}",
-            function.method_id,
-            function.vm_type
-        );
+        validate_contract_function_vm_type(function.method_id, function.vm_type)
+            .with_context(|| format!("compiler contract_code method_id {} has unsupported vm_type {}", function.method_id, function.vm_type))?;
         let emitted_bytes = BASE64_STANDARD
             .decode(&function.code_base64)
             .with_context(|| format!("compiler contract_code method_id {} has invalid base64 code", function.method_id))?;
@@ -326,6 +322,18 @@ fn contract_output_from_response(response: CompilerResponse) -> anyhow::Result<C
         circuit_definitions,
         abi,
     })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn validate_contract_function_vm_type(method_id: u32, vm_type: u32) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        vm_type == VM_TYPE_STANRDARD_DAPEN_V1,
+        "compiler contract_code method_id {} has non-canonical vm_type {} (expected {})",
+        method_id,
+        vm_type,
+        VM_TYPE_STANRDARD_DAPEN_V1
+    );
+    Ok(())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1197,6 +1205,32 @@ mod tests {
         };
         validate_circuit_definition(&definition)
             .expect("a circuit definition using the compiler-emitted ConstantTrue shape must validate");
+    }
+
+    #[test]
+    fn validate_contract_function_vm_type_accepts_canonical_constant() {
+        validate_contract_function_vm_type(1, VM_TYPE_STANRDARD_DAPEN_V1)
+            .expect("the canonical DAPEN VM type constant must pass the compile bridge gate");
+    }
+
+    #[test]
+    fn validate_contract_function_vm_type_rejects_legacy_zero() {
+        let err = validate_contract_function_vm_type(7, 0).unwrap_err();
+        let chain = format!("{err:#}");
+        assert!(chain.contains("method_id 7"), "the rejection must name the offending method_id; got: {chain}");
+        assert!(chain.contains("non-canonical vm_type 0"), "the rejection must report the non-canonical vm_type value; got: {chain}");
+        assert!(
+            chain.contains(&format!("expected {}", VM_TYPE_STANRDARD_DAPEN_V1)),
+            "the rejection must name the expected canonical constant; got: {chain}"
+        );
+    }
+
+    #[test]
+    fn validate_contract_function_vm_type_rejects_unknown_vm_type() {
+        let err = validate_contract_function_vm_type(3, VM_TYPE_STANRDARD_DAPEN_V1 + 1).unwrap_err();
+        let chain = format!("{err:#}");
+        assert!(chain.contains("non-canonical vm_type"), "a non-canonical vm_type must be rejected; got: {chain}");
+        assert!(chain.contains("method_id 3"), "the rejection must name the offending method_id; got: {chain}");
     }
 
     #[test]

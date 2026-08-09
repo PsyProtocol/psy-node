@@ -16,7 +16,7 @@ use plonky2::{
     },
 };
 use psy_client_common::{
-    args::{ContractCallArgs, ContractCallData, DPNSoftwareDefinedCallData},
+    args::{ContractCallArgs, ContractCallData, DPNSoftwareDefinedCallData, ViewCallData},
     data::{alt::AltVerifierOnlyCircuitData, qhashout::QHashOut},
     ups::circuits::LocalCircuitType,
 };
@@ -73,6 +73,7 @@ use psy_ups_circuit::{circuit_manager::core::PsyUPSStepCircuitManager, session::
 use psy_vm::{
     dpn::{
         contract::{dapen_fc_to_cfc_code_definition, hash_dpn_function},
+        ops::state_cmd::types::DPNStateCmdCore,
         vm::def::{derive_state_tree_height, DPNFunctionCircuitDefinition},
     },
     ups::{
@@ -520,21 +521,26 @@ impl<'a> TraceBuildSession<'a> {
         let sig_hash = user_session_mgr.get_sighash(PSY_NETWORK_MAGIC, nonce);
         let zksign_start_root = user_session_mgr.proof_tree_state.get_proof_tree_root().await;
 
-        let circuit_manager = self.wallet_session.wallet.random_circuit_manager();
-        let zk_builtin_fingerprint = circuit_manager.zk_signature_minifier_fingerprint().await?;
-        let secp_builtin_fingerprint = circuit_manager.secp_circuit_fingerprint().await?;
-        // Tolerate prove-proxies that predate the EIP-191 circuit: the lookup
-        // fails there, so eth_personal users simply can't generate traces.
-        let eth_personal_builtin_fingerprint = circuit_manager.eth_personal_secp_circuit_fingerprint().await.ok();
+        let initial_circuit_manager = self.wallet_session.wallet.random_circuit_manager();
+        let zk_builtin_fingerprint = initial_circuit_manager.zk_signature_minifier_fingerprint().await?;
+        let secp_builtin_fingerprint = initial_circuit_manager.secp_circuit_fingerprint().await?;
+        let eth_personal_builtin_fingerprint = self
+            .wallet_session
+            .circuit_info
+            .get_circuit_info_by_id(LocalCircuitType::EthPersonalSecp256K1.into())
+            .ok()
+            .map(|_| crate::wallet::memory_wallet::get_eth_personal_secp256k1_fingerprint());
+        let circuit_manager = if Some(pk_info.fingerprint) == eth_personal_builtin_fingerprint {
+            self.wallet_session.wallet.eth_personal_circuit_manager().await?
+        } else {
+            initial_circuit_manager
+        };
         let (sign_circuit_source, zksign_fingerprint) = if pk_info.fingerprint == zk_builtin_fingerprint {
             (TraceSignCircuitSource::ZkBuiltin, zk_builtin_fingerprint)
         } else if pk_info.fingerprint == secp_builtin_fingerprint {
             (TraceSignCircuitSource::SecpBuiltin, secp_builtin_fingerprint)
         } else if Some(pk_info.fingerprint) == eth_personal_builtin_fingerprint {
-            (
-                TraceSignCircuitSource::EthPersonalSecpBuiltin,
-                eth_personal_builtin_fingerprint.expect("checked above"),
-            )
+            (TraceSignCircuitSource::EthPersonalSecpBuiltin, pk_info.fingerprint)
         } else if self.wallet_session.wallet.has_psy_software_defined_circuit(&pk_info.fingerprint) {
             let sdc = self
                 .wallet_session
@@ -785,31 +791,105 @@ impl<'a> TraceBuildSession<'a> {
     }
 }
 
+fn ensure_view_definition(contract_id: u64, method_name: &str, definition: &DPNFunctionCircuitDefinition) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        definition.is_view_function(),
+        "contract {} method {} is not read-only",
+        contract_id,
+        method_name
+    );
+    Ok(())
+}
+
+fn ensure_view_execution_effects(
+    contract_id: u64,
+    method_name: &str,
+    witness: &psy_vm::vm::cfc_input::DapenContractFunctionCircuitInput<F>,
+    user_contract_update: &psy_crypto::hash::merkle::core::DeltaMerkleProofCore<QHashOut<F>>,
+) -> anyhow::Result<()> {
+    let start = &witness.tx_input_ctx.transaction_call_start_ctx;
+    let end = &witness.tx_input_ctx.transaction_end_ctx;
+    anyhow::ensure!(witness.events.is_empty(), "view call {}::{} emitted events", contract_id, method_name);
+    anyhow::ensure!(end.total_events_emitted == F::ZERO, "view call {}::{} reported emitted events", contract_id, method_name);
+    anyhow::ensure!(end.total_balance_spent == F::ZERO, "view call {}::{} spent balance", contract_id, method_name);
+    anyhow::ensure!(
+        start.start_contract_state_tree_root == end.end_contract_state_tree_root,
+        "view call {}::{} changed contract storage",
+        contract_id,
+        method_name
+    );
+    anyhow::ensure!(
+        start.start_deferred_tx_debt_tree_root == end.end_deferred_tx_debt_tree_root,
+        "view call {}::{} changed deferred transaction state",
+        contract_id,
+        method_name
+    );
+    anyhow::ensure!(
+        user_contract_update.old_root == user_contract_update.new_root && user_contract_update.old_value == user_contract_update.new_value,
+        "view call {}::{} changed user contract state",
+        contract_id,
+        method_name
+    );
+    anyhow::ensure!(
+        witness.cmd_witnesses.iter().all(|command| command.state_cmd.is_read_only()),
+        "view call {}::{} executed a non-read-only state command",
+        contract_id,
+        method_name
+    );
+    Ok(())
+}
+
 #[cfg(test)]
-mod view_simulation_classification_tests {
-    use super::SimulationCallClassification;
+mod view_validation_tests {
+    use super::*;
+    use psy_vm::dpn::ops::{
+        op_types::DPNEventRecord,
+        state_cmd::data::DPNStateCmd,
+    };
 
-    #[test]
-    fn fee_free_path_requires_one_or_more_view_calls() {
-        let empty = SimulationCallClassification::new();
-        assert!(!empty.is_fee_free_view());
-
-        let mut views = SimulationCallClassification::new();
-        views.observe(true);
-        views.observe(true);
-        assert!(views.is_fee_free_view());
+    fn definition(state_commands: Vec<DPNStateCmd<u64>>) -> DPNFunctionCircuitDefinition {
+        DPNFunctionCircuitDefinition {
+            name: "view_candidate".to_string(),
+            method_id: 1,
+            circuit_inputs: Vec::new(),
+            circuit_outputs: Vec::new(),
+            state_commands,
+            state_command_resolution_indices: Vec::new(),
+            assertions: Vec::new(),
+            definitions: Vec::new(),
+            events: Vec::new(),
+        }
     }
 
     #[test]
-    fn mixed_or_non_view_calls_require_full_fee_finalization() {
-        let mut mixed = SimulationCallClassification::new();
-        mixed.observe(true);
-        mixed.observe(false);
-        assert!(!mixed.is_fee_free_view());
+    fn call_view_preflight_accepts_pure_and_rejects_event_or_write_definitions() {
+        ensure_view_definition(7, "pure", &definition(Vec::new())).unwrap();
 
-        let mut external = SimulationCallClassification::new();
-        external.observe(false);
-        assert!(!external.is_fee_free_view());
+        let mut event_only = definition(Vec::new());
+        event_only.events.push(DPNEventRecord {
+            condition: 0,
+            checkpoint_id: 0,
+            user_id: 0,
+            contract_id: 0,
+            data: Vec::new(),
+        });
+        assert!(ensure_view_definition(7, "event_only", &event_only).is_err());
+
+        let writer = definition(vec![DPNStateCmd::set_contract_state_slot_single(1, 0, 1)]);
+        assert!(ensure_view_definition(7, "writer", &writer).is_err());
+    }
+}
+
+#[cfg(test)]
+mod personal_registration_tests {
+    use super::*;
+
+    #[test]
+    fn personal_registration_challenge_rejects_zero_and_binds_address() {
+        assert!(WalletSession::eth_personal_registration_challenge([0; 20]).is_err());
+        let first = WalletSession::eth_personal_registration_challenge([1; 20]).unwrap();
+        let second = WalletSession::eth_personal_registration_challenge([2; 20]).unwrap();
+        assert_ne!(first, second);
     }
 }
 #[cfg_attr(not(target_arch = "wasm32"), maybe_async::maybe_async)]
@@ -1011,6 +1091,34 @@ impl WalletSession {
             main_circuits.push(Box::new(PsyUPSStepCircuitManager::<C, D>::new_with_config(PSY_NETWORK_MAGIC)));
         }
 
+        let mut canonical_eth_personal_metadata = None;
+        for manager in &main_circuits {
+            match (
+                manager.eth_personal_secp_circuit_fingerprint().await,
+                manager.eth_personal_secp_circuit_verifier_config().await,
+            ) {
+                (Ok(fingerprint), Ok(verifier))
+                    if fingerprint == crate::wallet::memory_wallet::get_eth_personal_secp256k1_fingerprint() =>
+                {
+                    match &canonical_eth_personal_metadata {
+                        None => canonical_eth_personal_metadata = Some((fingerprint, verifier)),
+                        Some((_, canonical_verifier)) if verifier == *canonical_verifier => {}
+                        Some(_) => tracing::warn!("prove manager EIP-191 verifier mismatches the selected compatible cohort"),
+                    }
+                }
+                (Ok(fingerprint), Ok(_)) => {
+                    tracing::warn!(?fingerprint, "prove manager EIP-191 fingerprint does not match this client build");
+                }
+                (fingerprint, verifier) => {
+                    tracing::warn!(
+                        fingerprint = ?fingerprint.ok(),
+                        verifier_available = verifier.is_ok(),
+                        "prove manager EIP-191 metadata is unavailable; classic signing remains available"
+                    );
+                }
+            }
+        }
+
         // Load the local base circuits from the embedded `local_circuits.json`
         // (zk-sign full + privacy compact) instead of building them.
         let local_circuits = PsyWalletLocalCircuits::from_embedded_bundle()?;
@@ -1043,24 +1151,10 @@ impl WalletSession {
             main_circuits[0].shield_deposit_claim_minifier_verifier_config().await?.into(),
         );
 
-        // Register the EIP-191 (MetaMask `personal_sign`) circuit — but tolerate a
-        // prove-proxy that predates it: an old proxy doesn't expose this metadata,
-        // so we skip registration (Mode-A personal_sign is then unavailable until
-        // the proxy is updated) rather than failing session creation for everyone.
-        match (
-            main_circuits[0].eth_personal_secp_circuit_fingerprint().await,
-            main_circuits[0].eth_personal_secp_circuit_verifier_config().await,
-        ) {
-            (Ok(fingerprint), Ok(verifier_config)) => {
-                tracing::info!("register EthPersonalSecp256K1 (EIP-191) circuit info");
-                circuit_info.register_circuit(LocalCircuitType::EthPersonalSecp256K1.into(), fingerprint, verifier_config.into());
-            }
-            (fp, _) => {
-                tracing::warn!(
-                    "prove-proxy does not expose eth_personal_secp circuit metadata ({:?}); MetaMask personal_sign (Mode-A) is disabled until the proxy is updated",
-                    fp.err()
-                );
-            }
+        if let Some((fingerprint, verifier_config)) = canonical_eth_personal_metadata {
+            circuit_info.register_circuit(LocalCircuitType::EthPersonalSecp256K1.into(), fingerprint, verifier_config.into());
+        } else {
+            tracing::warn!("prove manager does not expose EIP-191 circuit metadata; personal signing is unavailable");
         }
 
         for main_circuit in main_circuits.iter() {
@@ -1134,6 +1228,15 @@ impl WalletSession {
         Ok(public_key)
     }
 
+    /// Returns the network- and address-bound EIP-191 registration challenge.
+    pub fn eth_personal_registration_challenge(selected_evm_address: [u8; 20]) -> anyhow::Result<psy_client_common::data::base_types::hash256::Hash256> {
+        anyhow::ensure!(selected_evm_address.iter().any(|byte| *byte != 0), "selected Ethereum address must not be the zero address");
+        Ok(psy_crypto::signature::secp256k1::wallet::eth_personal_registration_challenge(
+            PSY_NETWORK_MAGIC,
+            selected_evm_address,
+        ))
+    }
+
     /// Mode-A (web/MetaMask): register a secp256k1 PUBLIC key as a Psy account
     /// WITHOUT a held private key. Installs a PK-only [`ExternalSecp256K1User`]
     /// for the derived `pk_hash` and submits the SAME
@@ -1169,38 +1272,51 @@ impl WalletSession {
         Ok(expected_public_key)
     }
 
-    /// Mode-A MetaMask `personal_sign` (EIP-191): register a secp256k1 PUBLIC
-    /// key as a Psy account WITHOUT a held private key, using the EIP-191
-    /// signature type. Installs a PK-only [`ExternalEthPersonalSignUser`] under
-    /// the eth_personal circuit fingerprint, so the `pk_hash`/`user_id` is a
-    /// DISTINCT identity from the classic-secp one for the same key. Submits
-    /// the SAME `QRegisterUserRPCRequest { public_key }` (registration
-    /// needs no signature).
-    ///
-    /// After registration, the Mode-A lifecycle per transaction is:
-    /// 1. `generate_tx_trace` (needs no signature) → read the session sighash
-    /// 2. MetaMask `personal_sign` over that sighash
-    /// 3. [`Self::inject_eth_personal_signature`] with the fresh signature
-    ///    (replaces the wallet user; on-chain registration is skipped)
-    /// 4. prove / `sign_and_submit` the end cap
+    /// Mode-A MetaMask `personal_sign` registration. The selected Ethereum
+    /// address must authenticate the network-bound challenge with a canonical
+    /// 65-byte low-S signature before the recovered public key is registered.
     pub async fn register_external_eth_personal_user(
         &mut self,
-        compressed_public_key: psy_client_common::data::secp256k1::CompressedPublicKey,
+        selected_evm_address: [u8; 20],
+        recovery_message: psy_client_common::data::base_types::hash256::Hash256,
+        signature: [u8; 65],
     ) -> anyhow::Result<QHashOut<F>> {
-        let pk_info = self.wallet.register_external_eth_personal_user(compressed_public_key).await?;
-        self.register_external_pk_info_on_chain(pk_info, "external eth-personal").await
+        self.circuit_info
+            .get_circuit_info_by_id(LocalCircuitType::EthPersonalSecp256K1.into())
+            .map_err(|_| anyhow::anyhow!("external EIP-191 signing is unavailable because no compatible prove-manager cohort exposes circuit metadata"))?;
+        let expected_challenge = Self::eth_personal_registration_challenge(selected_evm_address)?;
+        anyhow::ensure!(
+            recovery_message == expected_challenge,
+            "external EIP-191 registration message does not match the network-bound account challenge"
+        );
+        let recovered = psy_crypto::signature::secp256k1::wallet::recover_eth_personal_signature(
+            selected_evm_address,
+            recovery_message,
+            signature,
+        )?;
+        let pk_info = self
+            .wallet
+            .register_external_eth_personal_user(psy_client_common::data::secp256k1::CompressedPublicKey(recovered.public_key))
+            .await?;
+        self.register_external_pk_info_on_chain(pk_info, "external EIP-191").await
     }
 
-    /// Inject a MetaMask `personal_sign` signature over the session sighash:
-    /// replaces `expected_public_key` with a signature-carrying wallet user.
-    /// Rejects signatures from any other account. See
-    /// [`Self::register_external_eth_personal_user`] for the lifecycle.
+    /// Inject a MetaMask `personal_sign` signature over the session sighash.
+    /// The recovered address and low-S signature are validated on the host
+    /// before the signature-carrying wallet user replaces the PK-only entry.
     pub async fn inject_eth_personal_signature(
         &mut self,
         expected_public_key: QHashOut<F>,
-        signature: psy_crypto::signature::secp256k1::core::PsyCompressedSecp256K1Signature,
+        selected_evm_address: [u8; 20],
+        message: psy_client_common::data::base_types::hash256::Hash256,
+        signature: [u8; 65],
     ) -> anyhow::Result<QHashOut<F>> {
-        self.wallet.inject_eth_personal_signature(expected_public_key, signature).await?;
+        let recovered = psy_crypto::signature::secp256k1::wallet::recover_eth_personal_signature(
+            selected_evm_address,
+            message,
+            signature,
+        )?;
+        self.wallet.inject_eth_personal_signature(expected_public_key, recovered).await?;
         Ok(expected_public_key)
     }
 
@@ -1278,6 +1394,15 @@ impl WalletSession {
             }
         }
 
+        let mgr = self.create_clean_user_session(user_id).await?;
+
+        self.user_session_mgrs.insert(public_key, mgr);
+        Ok(())
+    }
+    async fn create_clean_user_session(
+        &self,
+        user_id: u64,
+    ) -> anyhow::Result<UserProvingSessionManager<F, PoseidonHash, RpcProvider, C, D>> {
         let rpc_provider = self.st_provider.with_user_id_owned(user_id);
         let lps = PsyLocalProvingSessionStore::new_at(
             rpc_provider,
@@ -1289,13 +1414,13 @@ impl WalletSession {
         )
         .into_clean_for_user(F::from_canonical_u64(user_id))
         .await?;
-
         let circuit_mgr = self.wallet.random_circuit_manager();
-        let mgr =
-            UserProvingSessionManager::<F, _, _, C, D>::new(lps, self.circuit_info.clone(), circuit_mgr.ups_circuit_whitelist_root().await?).await?;
-
-        self.user_session_mgrs.insert(public_key, mgr);
-        Ok(())
+        UserProvingSessionManager::<F, PoseidonHash, RpcProvider, C, D>::new(
+            lps,
+            self.circuit_info.clone(),
+            circuit_mgr.ups_circuit_whitelist_root().await?,
+        )
+        .await
     }
 
     /// Build (or reset) a clean step proving session for `public_key`, seeded
@@ -2348,6 +2473,72 @@ impl WalletSession {
     //         tracing::info!("No checkpoints with valid rewards to claim");
     //         return Ok(Vec::new());
     //     }
+    pub async fn call_view(&self, public_key: QHashOut<F>, call_data: ViewCallData) -> anyhow::Result<crate::trace::ViewCallResult> {
+        anyhow::ensure!(!call_data.contract_calls.is_empty(), "No contract calls to execute");
+
+        let user_id = self
+            .resolve_registered_user_id(public_key)
+            .await
+            .map_err(|e| anyhow::format_err!("User {} not registered. Please register first: {}", public_key, e))?;
+        let mut view_session = self.create_clean_user_session(user_id).await?;
+        let checkpoint_id = view_session.require_lps()?.get_current_start_checkpoint_id_u64();
+        let circuit_mgr = self.wallet.random_circuit_manager();
+
+        let mut contract_calls = Vec::with_capacity(call_data.contract_calls.len());
+        let mut storage_reads = Vec::new();
+        for contract_call in call_data.contract_calls {
+            let contract_code = view_session
+                .require_lps_mut()?
+                .resolve_get_contract_code_mut(&QSRCmdGetContractCodeDefinition {
+                    contract_id: contract_call.contract_id,
+                })
+                .await?;
+            let (_, definition) = circuit_mgr
+                .resolve_contract_function_by_method_name(
+                    contract_call.contract_id,
+                    &contract_code,
+                    contract_call.method_name.clone(),
+                )
+                .await?;
+            ensure_view_definition(contract_call.contract_id, &contract_call.method_name, &definition)?;
+
+            let inputs = contract_call
+                .inputs
+                .iter()
+                .map(|input| F::from_noncanonical_u64(*input))
+                .collect::<Vec<_>>();
+            let witness = view_session
+                .exec_contract_call(F::from_canonical_u64(contract_call.contract_id), &definition, inputs)
+                .await?;
+            let user_contract_update = &view_session.require_lps()?.last_transaction_record().user_contract_tree_update_proof;
+            ensure_view_execution_effects(
+                contract_call.contract_id,
+                &contract_call.method_name,
+                &witness,
+                user_contract_update,
+            )?;
+
+            let storage = crate::trace::TxStorageData::from_call_witnesses(
+                user_id,
+                contract_call.contract_id,
+                &witness.cmd_witnesses,
+            );
+            storage_reads.extend(storage.reads);
+            contract_calls.push(crate::trace::ContractCallResultArgs {
+                contract_id: contract_call.contract_id,
+                method_name: contract_call.method_name,
+                inputs: contract_call.inputs,
+                outputs: witness.outputs.iter().map(|output| output.to_canonical_u64()).collect(),
+            });
+        }
+
+        Ok(crate::trace::ViewCallResult {
+            checkpoint_id,
+            contract_calls,
+            storage_reads,
+        })
+    }
+
 
     //     let last_checkpoint =
     // all_proofs_with_checkpoints.last().unwrap().checkpoint_id;
@@ -5616,7 +5807,6 @@ mod async_split_tests {
         assert!(simulated.metadata.end_cap_data.is_some());
         assert_eq!(simulated.metadata.contract_call_data.contract_calls.len(), 1);
         assert_eq!(simulated.metadata.contract_call_data.contract_calls[0].contract_id, contract_id);
-        assert_eq!(simulated.metadata.contract_call_data.contract_calls[0].method_name, "simple_mint");
         assert_eq!(simulated.metadata.contract_call_data.contract_calls[0].inputs, vec![1_000_000_000_000]);
         assert!(!simulated.metadata.storage_data.writes.is_empty());
 
@@ -5627,48 +5817,37 @@ mod async_split_tests {
         Ok(())
     }
 
-    /// Mode-A (MetaMask `personal_sign`, EIP-191) end-to-end against the local
-    /// network, exercising the full PK-first lifecycle at the WalletSession
-    /// layer:
-    /// 1. `register_external_eth_personal_user(compressed_pk)` — on-chain
-    ///    registration with ONLY the public key; no private key enters the
-    ///    session
-    /// 2. `generate_tx_trace` — works signature-less; read the session sighash
-    /// 3. "MetaMask" signs the sighash (simulated by the held-key signer, which
-    ///    produces the identical wire format) and the signature is injected via
-    ///    `inject_eth_personal_signature`
-    /// 4. `prove_tx_trace` proves + submits the end cap
+    /// Mode-A MetaMask `personal_sign` end-to-end: authenticate the selected
+    /// address with the network-bound registration challenge, generate the
+    /// trace without a held key, sign the exact session sighash, then inject
+    /// the 65-byte signature for proving.
     #[tokio::test]
     async fn async_external_eth_personal_user_simple_mint() -> anyhow::Result<()> {
-        use psy_client_common::data::{base_types::hash256::Hash256, secp256k1::CompressedPublicKey};
+        use psy_client_common::data::base_types::hash256::Hash256;
 
         let (mut wallet_session, _user0, _user1, contract_ids) = setup_wallet_and_users(false).await?;
         let contract_id = contract_ids[0];
-
-        // Fresh secp256k1 key acting as the "MetaMask" side. The session only
-        // ever sees the compressed public key.
         let private_key = QHashOut::<GoldilocksField>::rand();
         let signing_key = k256::ecdsa::SigningKey::from_slice(&Hash256::from(private_key).0)?;
-        let pk_bytes = signing_key.verifying_key().to_encoded_point(true).to_bytes();
-        let mut compressed_pk_bytes = [0u8; 33];
-        compressed_pk_bytes.copy_from_slice(&pk_bytes);
-        let compressed_pk = CompressedPublicKey(compressed_pk_bytes);
+        let selected_address = psy_crypto::signature::secp256k1::wallet::ethereum_address_for_verifying_key(signing_key.verifying_key());
 
-        // 1. PK-first registration on-chain; wait for it to land.
-        let public_key = wallet_session.register_external_eth_personal_user(compressed_pk).await?;
+        let challenge = WalletSession::eth_personal_registration_challenge(selected_address)?;
+        let challenge_digest = psy_crypto::signature::secp256k1::wallet::eth_personal_sign_digest(&challenge.0);
+        let (challenge_signature, challenge_recovery_id) = signing_key.sign_prehash_recoverable(&challenge_digest)?;
+        let mut challenge_signature_bytes = [0u8; 65];
+        challenge_signature_bytes[..64].copy_from_slice(&challenge_signature.to_bytes());
+        challenge_signature_bytes[64] = challenge_recovery_id.to_byte() + 27;
+        let public_key = wallet_session
+            .register_external_eth_personal_user(selected_address, challenge, challenge_signature_bytes)
+            .await?;
         let user_id = loop {
             match wallet_session.resolve_registered_user_id(public_key).await {
-                Ok(v) => break v,
+                Ok(value) => break value,
                 Err(_) => thread::sleep(Duration::from_secs(5)),
             }
         };
-        // wallet_session.update_circuit_mgr(public_key).await?;
-        // if let Some(mut mgr) = wallet_session.user_session_mgrs.get_mut(&public_key)
-        // {     mgr.require_lps_mut().unwrap().set_is_new_user(false);
-        // }
         wait_for_user_registered_on_realm(&wallet_session, user_id).await?;
 
-        // 2. Trace first — no signature needed at this stage.
         let call_data = ContractCallData::new(vec![ContractCallArgs {
             contract_id,
             method_name: "simple_mint".to_string(),
@@ -5677,12 +5856,16 @@ mod async_split_tests {
         let trace = wallet_session.generate_tx_trace(public_key, call_data).await?;
         assert!(!trace.steps.is_empty());
 
-        // 3. "MetaMask" signs the session sighash recorded in the trace, inject.
-        let sighash = trace.finalization.sig_hash;
-        let signature = wallet_session.wallet.eth_personal_secp256k1_sign(private_key, sighash)?;
-        wallet_session.inject_eth_personal_signature(public_key, signature).await?;
+        let message = Hash256::from(trace.finalization.sig_hash);
+        let digest = psy_crypto::signature::secp256k1::wallet::eth_personal_sign_digest(&message.0);
+        let (signature, recovery_id) = signing_key.sign_prehash_recoverable(&digest)?;
+        let mut signature_bytes = [0u8; 65];
+        signature_bytes[..64].copy_from_slice(&signature.to_bytes());
+        signature_bytes[64] = recovery_id.to_byte() + 27;
+        wallet_session
+            .inject_eth_personal_signature(public_key, selected_address, message, signature_bytes)
+            .await?;
 
-        // 4. Prove + submit the end cap.
         let _tx_hash = wallet_session.prove_tx_trace(public_key, &trace).await?;
         Ok(())
     }

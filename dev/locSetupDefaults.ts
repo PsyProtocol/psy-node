@@ -316,6 +316,40 @@ export function resolveRealmWorkerCount(
     return hasOnlyOptions ? 0 : 2;
 }
 
+export const COORDINATOR_PROCESSOR_READY_MARKER = "[COORD_CREATE] processor new done";
+export const REALM_PROCESSOR_READY_MARKER = "[REALM_CREATE] processor new done";
+
+/**
+ * Processor readiness is announced by these complete marker messages. The
+ * surrounding line may contain tracing metadata, but partial lifecycle
+ * messages must never make the devnet advance to dependent services.
+ */
+export function isExactProcessorReadyLine(line: string, marker: string): boolean {
+    const normalizedLine = line.replace(/\u001b\[[0-9;]*m/g, "").trimEnd();
+    const markerIndex = normalizedLine.lastIndexOf(marker);
+    const startsAtBoundary = markerIndex === 0 || /\s/.test(normalizedLine[markerIndex - 1] || "");
+    return startsAtBoundary && markerIndex + marker.length === normalizedLine.length;
+}
+
+/**
+ * Group-0 schema mutations can time out transiently on a busy single-node
+ * Scylla instance. Only that narrow failure family is safe to retry during
+ * initial processor creation; unrelated early exits must surface immediately.
+ */
+export function isTransientScyllaSchemaFailure(errorText: string): boolean {
+    return errorText.split(/\r?\n/).some((line) => {
+        const normalized = line.toLowerCase();
+        const timedOut = /\b(?:timed out|timeout)\b/.test(normalized);
+        const groupZeroAddEntry = normalized.includes("add_entry")
+            && /\bgroup[ _-]?0\b/.test(normalized);
+        const raftAddEntry = normalized.includes("raft operation")
+            && normalized.includes("add_entry");
+        const scyllaSchemaOperation = normalized.includes("schema")
+            && (normalized.includes("scylla") || normalized.includes("cassandra"));
+        return timedOut && (groupZeroAddEntry || raftAddEntry || scyllaSchemaOperation);
+    });
+}
+
 // Log markers the processor binaries emit when they hit a fatal, unrecoverable
 // error. Such a processor may keep running while producing empty blocks, so the
 // devnet supervisor must terminate it and let auto-restart recreate it.

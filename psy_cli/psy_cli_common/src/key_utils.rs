@@ -14,7 +14,7 @@ use psy_crypto::{
     },
 };
 use psy_client_data::config::store_config::PsyHasher;
-use psy_prover::wallet::memory_wallet::{get_eth_secp256k1_fingerprint, get_secp256k1_fingerprint, get_zk_fingerprint};
+use psy_prover::wallet::memory_wallet::{get_eth_personal_secp256k1_fingerprint, get_secp256k1_fingerprint, get_zk_fingerprint};
 use psy_provider::wallet::secp_wallet::Wallet;
 use psy_ups_circuit::signature::sd_key::get_sd_key_public_key_param;
 use psy_ups_circuit::signature::software_defined::get_sdc_public_key_param;
@@ -74,7 +74,7 @@ pub fn load_wallet_key_info(args: &WalletSourceArgs, allow_generate: bool) -> Re
         }
         SignType::EthPersonalSECP256K1Sign => {
             let (private_key, generated) = load_or_create_key(args, allow_generate)?;
-            let fingerprint = get_eth_secp256k1_fingerprint::<GoldilocksField>();
+            let fingerprint = get_eth_personal_secp256k1_fingerprint::<GoldilocksField>();
             let public_key_param =
                 hash_no_pad_compressed_public_key::<GoldilocksField, PoseidonPermutation<GoldilocksField>>(get_secp_public_key(private_key)?);
             let public_key_hash = ZKPublicKeyInfo {
