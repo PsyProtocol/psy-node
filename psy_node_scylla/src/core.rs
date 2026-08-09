@@ -521,7 +521,7 @@ mod branch_exact_startup_factory_tests {
     }
 
     #[test]
-    fn factory_returns_only_trait_object_and_is_not_called_by_setup_or_cli() {
+    fn factory_returns_only_trait_object_and_is_confined_to_startup_composition() {
         let source = include_str!("core.rs");
         let factory = source
             .split("pub async fn prepare_realm_processor_startup_preflight")
@@ -541,16 +541,30 @@ mod branch_exact_startup_factory_tests {
         );
 
         let setup = include_str!("psy_setup.rs");
+        let composition = setup
+            .split("pub async fn setup_realm_processor_scylla_startup_composition")
+            .nth(1)
+            .unwrap()
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(composition.contains("prepare_realm_processor_startup_preflight"));
+        assert_eq!(
+            setup
+                .matches(".prepare_realm_processor_startup_preflight(")
+                .count(),
+            1
+        );
+
         let plonky = include_str!(
             "../../psy_cli/psy_node_cli/src/node/startup_plonky2_scylla.rs"
         );
         let jtmb = include_str!(
             "../../psy_cli/psy_node_cli/src/node/startup_processor_jtmb_scylla.rs"
         );
-        for production in [setup, plonky, jtmb] {
-            assert!(!production.contains(
-                "prepare_realm_processor_startup_preflight"
-            ));
+        for cli in [plonky, jtmb] {
+            assert!(cli.contains("setup_realm_processor_scylla_startup_composition"));
+            assert!(!cli.contains(".prepare_realm_processor_startup_preflight("));
         }
     }
 }

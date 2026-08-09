@@ -73,7 +73,9 @@ where
         startup_authorization,
         RealmProcessorStartupAuthorization::BranchExact(_)
     ) {
-        return Err(RealmProcessorStartupError::CompositionNotIntegrated.into());
+        return Err(
+            RealmProcessorStartupError::ServingCompositionNotIntegrated.into(),
+        );
     }
 
     tracing::info!("[REALM_CREATE] setup_for_realm start");
@@ -282,7 +284,7 @@ mod tests {
             .nth(1)
             .expect("create_realm_processor must remain present");
         let rejection = function
-            .find("RealmProcessorStartupError::CompositionNotIntegrated")
+            .find("RealmProcessorStartupError::ServingCompositionNotIntegrated")
             .expect("enabled startup must remain fail closed");
         let first_side_effect = function
             .find("GenesisDatabaseDataBuilder::<")

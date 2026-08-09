@@ -10,13 +10,12 @@ use psy_data::{
 use psy_io::tokio::{TokioLikeFileSystem, TokioStdFileSystem};
 use psy_jtmb_testing_core::{config::poseidon_goldilocks::resolver::PsyJTMBPoseidonGoldilocksNodeConfigResolver, protocol_types::ZKTypesJTMBGoldilocksPoseidon};
 use psy_node_common::{coordinator::processor::create::create_coordinator_processor_and_run, p2p::realm_coordinator::PsyRealmCoordinatorClientAPI, realm::processor::create::create_realm_processor_and_run};
-use psy_node_core::store::realm_processor_startup::RealmProcessorStartupMode;
 use psy_node_core::config::node_start_config::{CoordinatorProcessorStartConfig, RealmProcessorStartConfig};
 use psy_node_nats::psy_queue::setup_nats_psy_queue_from_connection_str;
 use psy_node_redis::store::{new_redis_async_pool, StandardRedisStore};
 use psy_node_scylla::psy_setup::{
     setup_coordinator_psy_scylla_database_store_from_connection_string,
-    setup_psy_scylla_database_store_from_connection_string,
+    setup_realm_processor_scylla_startup_composition,
 };
 
 pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_coordinator_processor_node(config: &CoordinatorProcessorStartConfig) -> anyhow::Result<()> {
@@ -140,10 +139,23 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_realm_processor_node(co
     let guta_update_queue = nats_queue.clone();
     let proof_work_queue = nats_queue.clone();
 
+    let realm_id = u32::try_from(config.realm_id)
+        .map_err(|_| anyhow::anyhow!("Realm ID exceeds u32"))?;
     let realm_identifier = QRealmIdentifier {
-        realm_id: config.realm_id as u32,
+        realm_id,
         realm_sub_id: config.realm_sub_id,
     };
+    let branch_exact_lineage = config
+        .branch_exact_startup
+        .as_ref()
+        .map(|activation| {
+            activation.try_lineage(
+                config.network,
+                config.realm_id,
+                config.realm_sub_id,
+            )
+        })
+        .transpose()?;
     let chain_id = config.network.get_chain_id();
     if config.coordinator_api_urls.is_empty() {
         anyhow::bail!("No coordinator API URLs provided for realm processor node");
@@ -154,7 +166,16 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_realm_processor_node(co
     match config.network {
         psy_core::constants::chain_id::PsyChainNetworkType::LocalDevnet => {
             type N = QNetworkTypesConfigHelper<QProvingJobDataID, ZKTypesJTMBGoldilocksPoseidon, PsyNetworkLocalDevnetConstants>;
-            let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url, true).await?;
+            let composition = setup_realm_processor_scylla_startup_composition::<N>(
+                &config.db_namespace,
+                &config.scylla_db_url,
+                true,
+                realm_id,
+                config.realm_sub_id,
+                branch_exact_lineage,
+            )
+            .await?;
+            let (db, startup_mode, startup_preflight) = composition.into_parts();
             tracing::info!("[REALM_BOOT] scylla store ready");
             let db = Arc::new(db);
             let tag_tree_rewards_store = db.clone();
@@ -179,8 +200,8 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_realm_processor_node(co
 
                 circuit_fingerprint_config,
                 Arc::new(coordinator_client),
-                RealmProcessorStartupMode::Disabled,
-                None,
+                startup_mode,
+                startup_preflight,
 
             )
             .await?;

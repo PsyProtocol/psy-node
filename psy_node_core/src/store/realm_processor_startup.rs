@@ -75,6 +75,89 @@ pub struct RealmProcessorStartupExpectation {
     digest: RealmProcessorStartupRequestDigest,
 }
 
+/// Stable operator-selected lineage. It deliberately excludes route revision,
+/// live writer watermark, readiness state, and the per-attempt nonce.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RealmProcessorStartupLineage {
+    network: NetworkId,
+    realm_id: u32,
+    realm_sub_id: u16,
+    expected_generation: u64,
+    expected_binding_digest: RealmProcessorStartupBindingDigest,
+    expected_writer_activation_digest: RealmProcessorStartupWriterActivationDigest,
+}
+
+impl RealmProcessorStartupLineage {
+    pub fn try_new(
+        network: NetworkId,
+        realm_id: u32,
+        realm_sub_id: u16,
+        expected_generation: u64,
+        expected_binding_digest: [u8; 32],
+        expected_writer_activation_digest: [u8; 32],
+    ) -> Result<Self, RealmProcessorStartupError> {
+        if expected_generation > i64::MAX as u64 {
+            return Err(RealmProcessorStartupError::GenerationOutOfRange);
+        }
+        Ok(Self {
+            network,
+            realm_id,
+            realm_sub_id,
+            expected_generation,
+            expected_binding_digest: RealmProcessorStartupBindingDigest::try_new(
+                expected_binding_digest,
+            )?,
+            expected_writer_activation_digest:
+                RealmProcessorStartupWriterActivationDigest::try_new(
+                    expected_writer_activation_digest,
+                )?,
+        })
+    }
+
+    pub const fn network(self) -> NetworkId {
+        self.network
+    }
+
+    pub const fn realm_id(self) -> u32 {
+        self.realm_id
+    }
+
+    pub const fn realm_sub_id(self) -> u16 {
+        self.realm_sub_id
+    }
+
+    pub const fn expected_generation(self) -> u64 {
+        self.expected_generation
+    }
+
+    pub const fn expected_binding_digest(self) -> RealmProcessorStartupBindingDigest {
+        self.expected_binding_digest
+    }
+
+    pub const fn expected_writer_activation_digest(
+        self,
+    ) -> RealmProcessorStartupWriterActivationDigest {
+        self.expected_writer_activation_digest
+    }
+
+    /// Seal one process-local startup attempt. Production composition must
+    /// supply a freshly minted nonce rather than deserialize one from config.
+    pub fn seal_attempt(
+        self,
+        startup_nonce: [u8; 32],
+    ) -> Result<RealmProcessorStartupExpectation, RealmProcessorStartupError> {
+        RealmProcessorStartupExpectation::try_new(
+            self.network,
+            self.realm_id,
+            self.realm_sub_id,
+            self.expected_generation,
+            *self.expected_binding_digest.as_bytes(),
+            *self.expected_writer_activation_digest.as_bytes(),
+            startup_nonce,
+        )
+    }
+}
+
 impl RealmProcessorStartupExpectation {
     #[allow(clippy::too_many_arguments)]
     pub fn try_new(
@@ -317,7 +400,7 @@ pub async fn authorize_realm_processor_startup(
             Ok(RealmProcessorStartupAuthorization::Disabled)
         }
         RealmProcessorStartupMode::RequireBranchExact(expectation) => {
-            let provider = provider.ok_or(RealmProcessorStartupError::CompositionNotIntegrated)?;
+            let provider = provider.ok_or(RealmProcessorStartupError::StartupProviderMissing)?;
             let evidence = provider.fresh_read(expectation).await?;
             validate_evidence(expectation, evidence)?;
             let digest = permit_digest(expectation, evidence)?;
@@ -403,7 +486,8 @@ fn permit_digest(
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RealmProcessorStartupError {
-    CompositionNotIntegrated,
+    StartupProviderMissing,
+    ServingCompositionNotIntegrated,
     UnexpectedProviderWhileDisabled,
     ProviderRejected(String),
     DurableEvidenceNotVerified(String),
@@ -452,6 +536,36 @@ mod tests {
             network(), 7, 3, 11, [1; 32], [2; 32], [4; 32],
         )
         .unwrap()
+    }
+
+    fn lineage() -> RealmProcessorStartupLineage {
+        RealmProcessorStartupLineage::try_new(
+            network(), 7, 3, 11, [1; 32], [2; 32],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn stable_lineage_excludes_nonce_and_seals_fresh_attempts() {
+        let lineage = lineage();
+        let first = lineage.seal_attempt([3; 32]).unwrap();
+        let second = lineage.seal_attempt([4; 32]).unwrap();
+        assert_eq!(first.network(), lineage.network());
+        assert_eq!(first.realm_id(), lineage.realm_id());
+        assert_eq!(first.realm_sub_id(), lineage.realm_sub_id());
+        assert_eq!(first.expected_generation(), lineage.expected_generation());
+        assert_ne!(first.startup_nonce(), second.startup_nonce());
+        assert_ne!(first.digest(), second.digest());
+
+        let source = include_str!("realm_processor_startup.rs");
+        let fields = source
+            .split("pub struct RealmProcessorStartupLineage")
+            .nth(1)
+            .unwrap()
+            .split("impl RealmProcessorStartupLineage")
+            .next()
+            .unwrap();
+        assert!(!fields.contains("nonce"));
     }
 
     fn route(revision: u64, phase: RealmProcessorStartupRoutePhase) -> RealmProcessorStartupRouteObservation {
@@ -530,7 +644,7 @@ mod tests {
             )
             .await
             .unwrap_err(),
-            RealmProcessorStartupError::CompositionNotIntegrated
+            RealmProcessorStartupError::StartupProviderMissing
         );
     }
 

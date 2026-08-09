@@ -1,14 +1,28 @@
 use std::sync::Arc;
 
-use parth_core::{data::db::table::QDatabaseTableRoutingKey, protocol::core_types::QNetworkDatabaseTypes};
+use parth_core::{
+    data::db::table::QDatabaseTableRoutingKey,
+    protocol::core_types::{Q256BitHash, QNetworkDatabaseTypes},
+};
 use psy_node_core::{
     psy_core_db::v3_implementation::full::PsyUnifiedCoreDatabaseStore,
-    store::branch_exact_schema::AuthorityScope,
+    store::{
+        branch_exact_schema::AuthorityScope,
+        realm_processor_startup::{
+            RealmProcessorStartupError, RealmProcessorStartupLineage,
+            RealmProcessorStartupMode, RealmProcessorStartupPreflightProvider,
+        },
+    },
 };
+use rand::{rngs::OsRng, RngCore};
 
 use crate::{
     core::ScyllaCoreStore,
-    rollback::BranchExactSchemaSetupMode,
+    rollback::{
+        BranchExactDeploymentNoTabletKeyspace, BranchExactSchemaSetupMode,
+        BranchExactSchemaSetupRequest, BranchExactWriterAuthorityKey,
+        BranchExactWriterReadState, ScyllaBranchExactWriterLifecycleStore,
+    },
     tables::{
         blob::ScyllaBiDirectionalBlobToBlobTablePreparedStatements, bridge::{deposit_leaf::ScyllaBridgeDepositLeafPreparedStatements, next_index::ScyllaBridgeDepositNextIndexPreparedStatements}, counter::u64_counter::ScyllaU64ToU64CounterTablePreparedStatements, hash_to_many_ids::ScyllaHashToManyIdsTablePreparedStatements, imt::{imt_key_index::ScyllaIMTKeyIndexPreparedStatements, imt_leaf::ScyllaIMTLeafPreparedStatements, imt_next_append_index::ScyllaIMTNextAppendIndexPreparedStatements}, merkle::{ScyllaDoubleMerkleNodesPreparedStatements, ScyllaMerkleNodesPreparedStatements, ScyllaMerkleNodesZeroPreparedStatements}, object::{
             ScyllaGenericKeyIdValueTablePreparedStatements, ScyllaGenericObjectDoubleIdTablePreparedStatements,
@@ -409,4 +423,182 @@ pub async fn setup_realm_psy_scylla_database_store_with_branch_exact_schema<
         )
         .await?;
     Ok(db)
+}
+
+/// One indivisible Realm startup composition. Keeping DB, mode and provider
+/// together prevents a caller from pairing a provider prepared for one
+/// session/Realm with a different authority store.
+pub struct ScyllaRealmProcessorStartupComposition<N: QNetworkDatabaseTypes> {
+    db: ScyllaUnifiedPsyStore<N, N::QHash, N::HasherBase>,
+    startup_mode: RealmProcessorStartupMode,
+    startup_preflight: Option<Arc<dyn RealmProcessorStartupPreflightProvider>>,
+}
+
+impl<N: QNetworkDatabaseTypes> ScyllaRealmProcessorStartupComposition<N> {
+    pub fn into_parts(
+        self,
+    ) -> (
+        ScyllaUnifiedPsyStore<N, N::QHash, N::HasherBase>,
+        RealmProcessorStartupMode,
+        Option<Arc<dyn RealmProcessorStartupPreflightProvider>>,
+    ) {
+        (self.db, self.startup_mode, self.startup_preflight)
+    }
+}
+
+/// Default-off Realm Processor composition root. Enabled mode discovers the
+/// complete h20 receipt from the operator-pinned durable writer plan, reruns
+/// live schema authorization, mints a process-local nonce and returns the
+/// provider bound to this exact DB instance.
+pub async fn setup_realm_processor_scylla_startup_composition<
+    N: QNetworkDatabaseTypes,
+>(
+    keyspace: &str,
+    connection_string: &str,
+    create_tables: bool,
+    realm_id: u32,
+    realm_sub_id: u16,
+    lineage: Option<RealmProcessorStartupLineage>,
+) -> anyhow::Result<ScyllaRealmProcessorStartupComposition<N>>
+where
+    N::QHash: Q256BitHash + Send + Sync + 'static,
+    N::HasherBase: Send + Sync + 'static,
+{
+    let db = setup_realm_psy_scylla_database_store_with_branch_exact_schema::<N>(
+        keyspace,
+        connection_string,
+        create_tables,
+        realm_id,
+        realm_sub_id,
+        BranchExactSchemaSetupMode::Disabled,
+    )
+    .await?;
+    let Some(lineage) = lineage else {
+        return Ok(ScyllaRealmProcessorStartupComposition {
+            db,
+            startup_mode: RealmProcessorStartupMode::Disabled,
+            startup_preflight: None,
+        });
+    };
+    if lineage.realm_id() != realm_id || lineage.realm_sub_id() != realm_sub_id {
+        return Err(RealmProcessorStartupError::AuthorityMismatch.into());
+    }
+
+    let authority = AuthorityScope::Realm {
+        realm_id,
+        realm_sub_id,
+    };
+    let control_keyspace = BranchExactDeploymentNoTabletKeyspace::try_new(
+        db.store.no_tablet_keyspace.clone(),
+    )?;
+    let writer_store = ScyllaBranchExactWriterLifecycleStore::prepare(
+        db.store.session.clone(),
+        control_keyspace,
+    )
+    .await?;
+    let writer = match writer_store
+        .read::<N::QHash>(BranchExactWriterAuthorityKey::new(
+            lineage.network(),
+            authority,
+        ))
+        .await?
+    {
+        BranchExactWriterReadState::Current(writer) => writer,
+        BranchExactWriterReadState::Uninitialized => {
+            return Err(RealmProcessorStartupError::DurableEvidenceNotVerified(
+                "branch-exact writer lifecycle is uninitialized".to_owned(),
+            )
+            .into())
+        }
+    };
+    if writer.plan().digest().as_bytes()
+        != lineage.expected_writer_activation_digest().as_bytes()
+    {
+        return Err(RealmProcessorStartupError::WriterActivationMismatch.into());
+    }
+    db.store
+        .initialize_branch_exact_schema_setup(
+            authority,
+            BranchExactSchemaSetupMode::RequireVerified(
+                BranchExactSchemaSetupRequest::new(
+                    writer.plan().backfill_receipt().clone(),
+                ),
+            ),
+        )
+        .await?;
+
+    let expectation = lineage.seal_attempt(fresh_startup_nonce());
+    let expectation = expectation?;
+    let provider = db
+        .store
+        .prepare_realm_processor_startup_preflight(expectation)
+        .await?;
+    Ok(ScyllaRealmProcessorStartupComposition {
+        db,
+        startup_mode: RealmProcessorStartupMode::RequireBranchExact(
+            expectation,
+        ),
+        startup_preflight: Some(provider),
+    })
+}
+
+fn fresh_startup_nonce() -> [u8; 32] {
+    loop {
+        let mut nonce = [0; 32];
+        OsRng.fill_bytes(&mut nonce);
+        if nonce != [0; 32] {
+            return nonce;
+        }
+    }
+}
+
+#[cfg(test)]
+mod realm_startup_composition_tests {
+    use super::*;
+
+    #[test]
+    fn composition_is_default_off_indivisible_and_receipt_is_discovered() {
+        let source = include_str!("psy_setup.rs");
+        let composition = source
+            .split("pub struct ScyllaRealmProcessorStartupComposition")
+            .nth(1)
+            .unwrap()
+            .split("/// Default-off Realm Processor composition root")
+            .next()
+            .unwrap();
+        assert!(composition.contains("db:"));
+        assert!(composition.contains("startup_mode:"));
+        assert!(composition.contains("startup_preflight:"));
+        assert!(!composition.contains("pub db:"));
+
+        let factory = source
+            .split("pub async fn setup_realm_processor_scylla_startup_composition")
+            .nth(1)
+            .unwrap()
+            .split("fn fresh_startup_nonce")
+            .next()
+            .unwrap();
+        let disabled = factory.find("let Some(lineage) = lineage else").unwrap();
+        let writer_prepare = factory
+            .find("ScyllaBranchExactWriterLifecycleStore::prepare")
+            .unwrap();
+        assert!(disabled < writer_prepare);
+        assert!(factory.contains("RealmProcessorStartupMode::Disabled"));
+        assert!(factory.contains("BranchExactWriterReadState::Uninitialized"));
+        assert!(
+            factory.find("expected_writer_activation_digest").unwrap()
+                < factory.find("backfill_receipt().clone()").unwrap()
+        );
+        assert!(factory.contains("fresh_startup_nonce()"));
+        assert!(!factory.contains("startup_nonce:"));
+    }
+
+    #[test]
+    fn production_nonce_is_nonzero_and_fresh_per_attempt() {
+        let first = fresh_startup_nonce();
+        let second = fresh_startup_nonce();
+        assert_ne!(first, [0; 32]);
+        assert_ne!(second, [0; 32]);
+        assert_ne!(first, second);
+    }
 }

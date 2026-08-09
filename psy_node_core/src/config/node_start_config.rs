@@ -1,6 +1,52 @@
 use psy_core::constants::chain_id::PsyChainNetworkType;
 use crate::store::canonical_head::CanonicalHeadBootstrapProfile;
+use crate::store::realm_processor_startup::RealmProcessorStartupLineage;
+use psy_data::protocol::canonical_chain::NetworkId;
 use serde::{Deserialize, Serialize};
+
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RealmBranchExactStartupConfig {
+    pub generation: u64,
+    pub binding_digest_hex: String,
+    pub writer_activation_digest_hex: String,
+}
+
+impl RealmBranchExactStartupConfig {
+    pub fn try_lineage(
+        &self,
+        network: PsyChainNetworkType,
+        realm_id: u64,
+        realm_sub_id: u16,
+    ) -> anyhow::Result<RealmProcessorStartupLineage> {
+        let realm_id = u32::try_from(realm_id)
+            .map_err(|_| anyhow::anyhow!("branch-exact Realm ID exceeds u32"))?;
+        RealmProcessorStartupLineage::try_new(
+            NetworkId::from_network_type(network),
+            realm_id,
+            realm_sub_id,
+            self.generation,
+            decode_canonical_digest(&self.binding_digest_hex)?,
+            decode_canonical_digest(&self.writer_activation_digest_hex)?,
+        )
+        .map_err(Into::into)
+    }
+}
+
+fn decode_canonical_digest(value: &str) -> anyhow::Result<[u8; 32]> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        anyhow::bail!("branch-exact digest must be 64 lowercase hex characters");
+    }
+    let mut digest = [0; 32];
+    hex::decode_to_slice(value, &mut digest)
+        .map_err(|_| anyhow::anyhow!("invalid branch-exact digest"))?;
+    Ok(digest)
+}
 
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -16,6 +62,8 @@ pub struct RealmProcessorStartConfig {
     pub checkpoint_backup_path: String,
     pub coordinator_api_urls: Vec<String>,
     pub genesis_data_path: Option<String>,
+    #[serde(default)]
+    pub branch_exact_startup: Option<RealmBranchExactStartupConfig>,
 }
 impl RealmProcessorStartConfig {
     pub fn get_checkpoint_tree_backup_file_path(&self) -> String {
@@ -88,6 +136,82 @@ impl CoordinatorProcessorStartConfig {
             "{}/coordinator_{}_{}/guta_updates_backup",
             self.checkpoint_backup_path, self.coordinator_id, self.coordinator_sub_id
         )
+    }
+}
+
+#[cfg(test)]
+mod realm_branch_exact_startup_tests {
+    use super::*;
+
+    fn config() -> RealmBranchExactStartupConfig {
+        RealmBranchExactStartupConfig {
+            generation: 9,
+            binding_digest_hex: hex::encode([1; 32]),
+            writer_activation_digest_hex: hex::encode([2; 32]),
+        }
+    }
+
+    #[test]
+    fn lineage_is_strict_canonical_and_has_no_configured_nonce() {
+        let lineage = config()
+            .try_lineage(PsyChainNetworkType::LocalDevnet, 7, 3)
+            .unwrap();
+        assert_eq!(lineage.realm_id(), 7);
+        assert_eq!(lineage.realm_sub_id(), 3);
+        assert_eq!(lineage.expected_generation(), 9);
+
+        for digest in [
+            "01".to_owned(),
+            format!("0x{}", hex::encode([1; 32])),
+            hex::encode_upper([0xab; 32]),
+            hex::encode([0; 32]),
+        ] {
+            let mut malformed = config();
+            malformed.binding_digest_hex = digest;
+            assert!(malformed
+                .try_lineage(PsyChainNetworkType::LocalDevnet, 7, 3)
+                .is_err());
+        }
+        assert!(config()
+            .try_lineage(
+                PsyChainNetworkType::LocalDevnet,
+                u64::from(u32::MAX) + 1,
+                3,
+            )
+            .is_err());
+
+        let encoded = serde_json::to_string(&config()).unwrap();
+        assert!(!encoded.contains("nonce"));
+        assert!(serde_json::from_str::<RealmBranchExactStartupConfig>(
+            r#"{"generation":9,"binding_digest_hex":"01","writer_activation_digest_hex":"02","nonce":"forbidden"}"#,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn existing_realm_config_defaults_branch_exact_to_disabled() {
+        let config = RealmProcessorStartConfig {
+            scylla_db_url: "scylla".to_owned(),
+            nats_jetstream_url: "nats".to_owned(),
+            redis_url: "redis".to_owned(),
+            db_namespace: "psy".to_owned(),
+            realm_id: 7,
+            realm_sub_id: 3,
+            network: PsyChainNetworkType::LocalDevnet,
+            verbose: false,
+            checkpoint_backup_path: "/tmp/psy".to_owned(),
+            coordinator_api_urls: vec!["http://coordinator".to_owned()],
+            genesis_data_path: None,
+            branch_exact_startup: None,
+        };
+        let mut encoded = serde_json::to_value(config).unwrap();
+        encoded
+            .as_object_mut()
+            .unwrap()
+            .remove("branch_exact_startup");
+        let parsed: RealmProcessorStartConfig =
+            serde_json::from_value(encoded).unwrap();
+        assert!(parsed.branch_exact_startup.is_none());
     }
 }
 

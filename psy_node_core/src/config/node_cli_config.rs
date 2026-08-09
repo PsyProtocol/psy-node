@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use crate::{
     config::node_start_config::{
         CoordinatorEdgeStartConfig, CoordinatorProcessorStartConfig,
-        RealmEdgeStartConfig, RealmProcessorStartConfig,
+        RealmBranchExactStartupConfig, RealmEdgeStartConfig,
+        RealmProcessorStartConfig,
     },
     store::canonical_head::CanonicalHeadBootstrapProfile,
 };
@@ -52,6 +53,8 @@ pub struct RealmProcessorCliConfig {
     pub checkpoint_backup_path: Option<String>,
     pub coordinator_api_urls: Vec<String>,
     pub genesis_data_path: Option<String>,
+    #[serde(default)]
+    pub branch_exact_startup: Option<RealmBranchExactStartupConfig>,
 }
 impl RealmProcessorCliConfig {
     pub fn get_default_empty() -> Self {
@@ -67,6 +70,7 @@ impl RealmProcessorCliConfig {
             checkpoint_backup_path: None,
             coordinator_api_urls: Vec::new(),
             genesis_data_path: None,
+            branch_exact_startup: None,
         }
     }
     pub fn into_start_config_with_cli_args(
@@ -95,6 +99,7 @@ impl RealmProcessorCliConfig {
             checkpoint_backup_path: checkpoint_backup_path.or(self.checkpoint_backup_path).ok_or_else(|| anyhow::anyhow!("checkpoint_backup_path is required"))?,
             coordinator_api_urls: if !coordinator_api_urls.is_empty() { coordinator_api_urls } else { self.coordinator_api_urls },
             genesis_data_path: genesis_data_path.or(self.genesis_data_path),
+            branch_exact_startup: self.branch_exact_startup,
         })
     }
     pub async fn get_start_config(
