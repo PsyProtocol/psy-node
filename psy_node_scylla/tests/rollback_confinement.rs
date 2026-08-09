@@ -305,12 +305,12 @@ fn lexical_inventory_is_stable_and_nontrivial() {
         RawScyllaAccessCounts {
             session_type: 903,
             session_builder: 61,
-            session_field_access: 272,
-            prepared_statement: 382,
+            session_field_access: 273,
+            prepared_statement: 383,
             prepare_call: 177,
-            execute_call: 354,
-            query_call: 236,
-            direct_cql: 577,
+            execute_call: 355,
+            query_call: 237,
+            direct_cql: 579,
         }
     );
 }

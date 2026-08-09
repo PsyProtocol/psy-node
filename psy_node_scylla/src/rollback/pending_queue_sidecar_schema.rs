@@ -47,13 +47,16 @@ use super::{
     REALM_USER_UPDATE_DEPENDENCY_FRAGMENT_TABLE,
 };
 
-// v4 keeps the 14-table CQL shape but binds claim payload codec v2 and the
-// DependenciesPlanned recovery phase. A v3 VERIFIED receipt cannot authorize
-// the new router even though system_schema columns are unchanged.
-pub const PENDING_QUEUE_SIDECAR_SCHEMA_VERSION: u16 = 4;
+#[cfg(test)]
+use super::RETIRED_REALM_USER_UPDATE_CLAIM_V1_TABLE;
+
+// v5 replaces the opaque-slot claim v1 physical key with an addressable
+// network/authority/activation/pending/proc/bucket v2 key. A v4 VERIFIED
+// receipt cannot authorize this physically different scanner contract.
+pub const PENDING_QUEUE_SIDECAR_SCHEMA_VERSION: u16 = 5;
 pub const PENDING_QUEUE_SIDECAR_TARGET_TABLE_COUNT: usize = 14;
 const FINGERPRINT_DOMAIN: &[u8] =
-    b"psy/rollback/pending-queue-sidecar-schema/v4";
+    b"psy/rollback/pending-queue-sidecar-schema/v5";
 const INSPECT_COLUMNS_CQL: &str = "SELECT column_name, type, kind, position, clustering_order FROM system_schema.columns WHERE keyspace_name = ? AND table_name = ?";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -261,7 +264,7 @@ const fn regular(
     PendingQueueSidecarColumnSpec { table, name, cql_type, kind: PendingQueueSidecarColumnKind::Regular, position: -1, clustering_order: PendingQueueSidecarClusteringOrder::None }
 }
 
-pub const PENDING_QUEUE_SIDECAR_EXPECTED_COLUMNS: [PendingQueueSidecarColumnSpec; 66] = [
+pub const PENDING_QUEUE_SIDECAR_EXPECTED_COLUMNS: [PendingQueueSidecarColumnSpec; 72] = [
     pk(PendingQueueSidecarPhysicalTable::Pipeline, "network_chain_id", "bigint", 0),
     pk(PendingQueueSidecarPhysicalTable::Pipeline, "authority_kind", "tinyint", 1),
     pk(PendingQueueSidecarPhysicalTable::Pipeline, "realm_id", "bigint", 2),
@@ -314,8 +317,14 @@ pub const PENDING_QUEUE_SIDECAR_EXPECTED_COLUMNS: [PendingQueueSidecarColumnSpec
     pk(PendingQueueSidecarPhysicalTable::SegmentLifecycle, "lifecycle_slot", "blob", 0),
     regular(PendingQueueSidecarPhysicalTable::SegmentLifecycle, "revision", "bigint"),
     regular(PendingQueueSidecarPhysicalTable::SegmentLifecycle, "lifecycle_payload", "blob"),
-    pk(PendingQueueSidecarPhysicalTable::UserUpdateClaim, "generation_slot", "blob", 0),
-    pk(PendingQueueSidecarPhysicalTable::UserUpdateClaim, "claim_bucket", "smallint", 1),
+    pk(PendingQueueSidecarPhysicalTable::UserUpdateClaim, "network_chain_id", "bigint", 0),
+    pk(PendingQueueSidecarPhysicalTable::UserUpdateClaim, "authority_kind", "tinyint", 1),
+    pk(PendingQueueSidecarPhysicalTable::UserUpdateClaim, "realm_id", "bigint", 2),
+    pk(PendingQueueSidecarPhysicalTable::UserUpdateClaim, "realm_sub_id", "int", 3),
+    pk(PendingQueueSidecarPhysicalTable::UserUpdateClaim, "activation_digest", "blob", 4),
+    pk(PendingQueueSidecarPhysicalTable::UserUpdateClaim, "unique_pending_id", "bigint", 5),
+    pk(PendingQueueSidecarPhysicalTable::UserUpdateClaim, "proc_checkpoint_id", "blob", 6),
+    pk(PendingQueueSidecarPhysicalTable::UserUpdateClaim, "claim_bucket", "smallint", 7),
     ck(PendingQueueSidecarPhysicalTable::UserUpdateClaim, "user_id", "bigint", 0),
     regular(PendingQueueSidecarPhysicalTable::UserUpdateClaim, "revision", "bigint"),
     regular(PendingQueueSidecarPhysicalTable::UserUpdateClaim, "claim_payload", "blob"),
@@ -523,6 +532,7 @@ mod tests {
         assert_eq!(PendingQueueSidecarPhysicalTable::ALL.iter().filter(|table| table.keyspace_kind() == PendingQueueSidecarKeyspaceKind::StandardData).count(), 3);
         assert_eq!(PendingQueueSidecarPhysicalTable::ALL.iter().filter(|table| table.keyspace_kind() == PendingQueueSidecarKeyspaceKind::NoTabletControl).count(), 11);
         assert!(!names.contains(RETIRED_V1_PIPELINE_TABLE));
+        assert!(!names.contains(RETIRED_REALM_USER_UPDATE_CLAIM_V1_TABLE));
         assert_ne!(pending_queue_sidecar_schema_fingerprint().as_bytes(), &[0; 32]);
     }
 

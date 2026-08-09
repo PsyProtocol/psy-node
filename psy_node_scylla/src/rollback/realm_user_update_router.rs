@@ -24,8 +24,8 @@ use psy_node_core::{
             VerifiedRealmUserUpdateRequest,
         },
         realm_user_update_claim::{
-            RealmUserUpdateClaimBucket, RealmUserUpdateClaimPhase,
-            RealmUserUpdateClaimSlot, RealmUserUpdateCreatedAtSeconds,
+            RealmUserUpdateClaimPartition, RealmUserUpdateClaimPhase,
+            RealmUserUpdateCreatedAtSeconds,
             RealmUserUpdatePublishReceiptDigest, StoredRealmUserUpdateClaim,
         },
         realm_user_update_dependency::RealmUserUpdateDependencyBundle,
@@ -184,7 +184,7 @@ where
         // admission check.
         match self
             .claims
-            .read(candidate.slot(), candidate.bucket(), candidate.user_id())
+            .read(candidate.partition().map_err(router)?, candidate.user_id())
             .await
             .map_err(router)?
         {
@@ -294,15 +294,14 @@ where
     /// claim coordinates is intentionally left to the next milestone.
     pub(crate) async fn resume_exact(
         &self,
-        slot: RealmUserUpdateClaimSlot,
-        bucket: RealmUserUpdateClaimBucket,
+        partition: RealmUserUpdateClaimPartition,
         user_id: UserId,
         verified_proof: VerifiedRealmUserUpdateProof<Hash>,
     ) -> Result<RealmUserUpdateRouterReceipt<Hash>, RealmUserUpdateRouterError> {
         self.validate_user(user_id)?;
         let RealmUserUpdateClaimReadState::Current(mut current) = self
             .claims
-            .read(slot, bucket, user_id)
+            .read(partition, user_id)
             .await
             .map_err(router)?
         else {
@@ -461,7 +460,7 @@ where
     ) -> Result<StoredRealmUserUpdateClaim<Hash>, RealmUserUpdateRouterError> {
         let RealmUserUpdateClaimReadState::Current(current) = self
             .claims
-            .read(expected.slot(), expected.bucket(), expected.user_id())
+            .read(expected.partition().map_err(router)?, expected.user_id())
             .await
             .map_err(router)?
         else {
@@ -626,7 +625,7 @@ mod tests {
     fn new_claim_revalidation_preserves_response_loss_resume_order() {
         let source = include_str!("realm_user_update_router.rs");
         let source = source.split("#[cfg(test)]").next().unwrap();
-        let read = source.find(".read(candidate.slot()").unwrap();
+        let read = source.find(".read(candidate.partition()").unwrap();
         let revalidate = source
             .find(".revalidate_admission(&reconstructed_admission)")
             .unwrap();
@@ -640,7 +639,7 @@ mod tests {
         let source = include_str!("realm_user_update_router.rs");
         let source = source.split("#[cfg(test)]").next().unwrap();
         let validate = source.find("self.validate_user(user_id)?").unwrap();
-        let read = source.find(".read(candidate.slot()").unwrap();
+        let read = source.find(".read(candidate.partition()").unwrap();
         assert!(validate < read);
         assert!(source.contains("self.global_user_tree_height"));
         assert!(source.contains("self.realm_user_tree_height"));

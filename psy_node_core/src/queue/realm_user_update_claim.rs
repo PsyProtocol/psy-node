@@ -80,9 +80,9 @@ impl RealmUserUpdateClaimSlot {
     }
 }
 
-/// Fixed bucket inside one exact generation slot. It distributes per-user LWT
-/// traffic, but is not by itself a startup index: a scanner must first obtain
-/// the opaque generation slot from a separate durable locator.
+/// Fixed bucket inside one exact pending generation. The physical v2 claim
+/// partition also carries network/authority/activation/pending/proc, so all
+/// buckets can be enumerated without first knowing an opaque claim-slot hash.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct RealmUserUpdateClaimBucket(u16);
 
@@ -112,6 +112,47 @@ impl RealmUserUpdateClaimBucket {
 
     pub fn as_i16(self) -> Result<i16, RealmUserUpdateClaimError> {
         i16::try_from(self.0).map_err(|_| RealmUserUpdateClaimError::InvalidBucket(self.0))
+    }
+}
+
+/// Addressable physical partition for one Realm generation/bucket.
+///
+/// The branch-exact [`PendingContext`] remains in every full claim payload and
+/// is checked after readback. This key only supplies deterministic discovery
+/// from the durable pending pipeline and capture context.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RealmUserUpdateClaimPartition {
+    capture: PendingQueueCaptureContext,
+    bucket: RealmUserUpdateClaimBucket,
+}
+
+impl RealmUserUpdateClaimPartition {
+    pub fn try_new(
+        capture: PendingQueueCaptureContext,
+        bucket: RealmUserUpdateClaimBucket,
+    ) -> Result<Self, RealmUserUpdateClaimError> {
+        if !matches!(capture.key().authority(), AuthorityScope::Realm { .. })
+            || capture.processing().pending_id().get() == 0
+            || capture.processing().proc_checkpoint_id().as_u128() == 0
+        {
+            return Err(RealmUserUpdateClaimError::RealmOnly);
+        }
+        Ok(Self { capture, bucket })
+    }
+
+    pub fn from_claim<Hash: Q256BitHash>(
+        claim: &StoredRealmUserUpdateClaim<Hash>,
+    ) -> Result<Self, RealmUserUpdateClaimError> {
+        let admission = claim.reconstruct_admission()?;
+        Self::try_new(admission.capture(), claim.bucket())
+    }
+
+    pub const fn capture(self) -> PendingQueueCaptureContext {
+        self.capture
+    }
+
+    pub const fn bucket(self) -> RealmUserUpdateClaimBucket {
+        self.bucket
     }
 }
 
@@ -338,6 +379,10 @@ impl<Hash: Q256BitHash> StoredRealmUserUpdateClaim<Hash> {
         self.bucket
     }
 
+    pub fn partition(&self) -> Result<RealmUserUpdateClaimPartition, RealmUserUpdateClaimError> {
+        RealmUserUpdateClaimPartition::from_claim(self)
+    }
+
     pub const fn pending(&self) -> &PendingContext<Hash> {
         &self.pending
     }
@@ -430,8 +475,7 @@ impl<Hash: Q256BitHash> StoredRealmUserUpdateClaim<Hash> {
     }
 
     pub fn decode_selected(
-        selected_slot: RealmUserUpdateClaimSlot,
-        selected_bucket: i16,
+        selected_partition: RealmUserUpdateClaimPartition,
         selected_user_id: i64,
         selected_revision: i64,
         bytes: &[u8],
@@ -492,8 +536,8 @@ impl<Hash: Q256BitHash> StoredRealmUserUpdateClaim<Hash> {
             publish_receipt_digest,
             state_digest,
         };
-        if selected_slot != value.slot
-            || selected_bucket != value.bucket.as_i16()?
+        if selected_partition != RealmUserUpdateClaimPartition::from_claim(&value)?
+            || selected_partition.bucket() != value.bucket
             || selected_user_id
                 != i64::try_from(value.user_id.get())
                     .map_err(|_| RealmUserUpdateClaimError::UserOutOfRange)?
@@ -746,8 +790,7 @@ mod tests {
         let bytes = claimed.to_canonical_bytes();
         assert_eq!(
             StoredRealmUserUpdateClaim::decode_selected(
-                claimed.slot(),
-                claimed.bucket().as_i16().unwrap(),
+                claimed.partition().unwrap(),
                 i64::try_from(claimed.user_id().get()).unwrap(),
                 claimed.revision().as_i64().unwrap(),
                 &bytes,
@@ -783,7 +826,18 @@ mod tests {
     fn exact_generation_namespace_separates_branch_or_proc() {
         let claimed = claimed();
         let same_digest = claimed.request_digest();
-        for changed in [admission(2, 12), admission(1, 99)] {
+        let changed_frontier = StoredRealmUserUpdateClaim::claimed(
+            admission(2, 12),
+            claimed.user_id(),
+            same_digest,
+            RealmUserUpdateCreatedAtSeconds::try_new(9999).unwrap(),
+        )
+        .unwrap();
+        assert_ne!(changed_frontier.slot(), claimed.slot());
+        assert_eq!(changed_frontier.partition().unwrap(), claimed.partition().unwrap());
+        assert!(!claimed.same_request_as(&changed_frontier));
+
+        for changed in [admission(1, 99)] {
             let other = StoredRealmUserUpdateClaim::claimed(
                 changed,
                 claimed.user_id(),
@@ -792,6 +846,7 @@ mod tests {
             )
             .unwrap();
             assert_ne!(other.slot(), claimed.slot());
+            assert_ne!(other.partition().unwrap(), claimed.partition().unwrap());
             assert!(!claimed.same_request_as(&other));
         }
     }
@@ -814,8 +869,7 @@ mod tests {
         let last = malformed.len() - 1;
         malformed[last] ^= 1;
         assert!(StoredRealmUserUpdateClaim::<PHash>::decode_selected(
-            claimed.slot(),
-            claimed.bucket().as_i16().unwrap(),
+            claimed.partition().unwrap(),
             i64::try_from(claimed.user_id().get()).unwrap(),
             1,
             &malformed,

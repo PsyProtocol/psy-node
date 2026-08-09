@@ -9,8 +9,39 @@ use std::{
 };
 
 use anyhow::{bail, ensure, Context};
-use parth_core::{pgoldilocks::PoseidonHasher, PHash};
-use psy_data::protocol::chain_context::AuthorityScope;
+use parth_core::{
+    pgoldilocks::PoseidonHasher,
+    protocol::core_types::Q256BitHash,
+    PHash,
+};
+use psy_data::protocol::{
+    canonical_chain::{
+        CanonicalChainRef, ChainEpoch, CheckpointHash, CheckpointId,
+        CheckpointRef, NetworkId,
+    },
+    chain_context::{
+        AuthorityScope, PendingContext, WorkProcCheckpointUniqueId,
+        WorkUniquePendingId,
+    },
+};
+use psy_node_core::{
+    queue::{
+        realm_user_update_claim::{
+            RealmUserUpdateCreatedAtSeconds, StoredRealmUserUpdateClaim,
+        },
+        realm_user_update_publish::{
+            RealmUserUpdatePublishAdmission, RealmUserUpdateRequestDigest,
+        },
+        recoverable_ephemeral::PendingQueueCaptureContext,
+    },
+    store::{
+        pending_generation_identity::{
+            PendingGenerationActivationDigest, PendingGenerationContext,
+            PendingGenerationLedgerKey,
+        },
+        typed::{UniquePendingId, UserId},
+    },
+};
 use scylla::{
     client::{
         execution_profile::ExecutionProfile, session::Session,
@@ -47,6 +78,58 @@ const NODE_CONTAINERS: [&str; 3] = [
 fn no_tablet(keyspace: &str) -> String { format!("{keyspace}_no_tablet") }
 fn realm() -> AuthorityScope {
     AuthorityScope::Realm { realm_id: 7, realm_sub_id: 2 }
+}
+
+fn claim(epoch: u64, user_id: u64) -> anyhow::Result<StoredRealmUserUpdateClaim<PHash>> {
+    let network = NetworkId::try_from_chain_id(1337)?;
+    let authority = realm();
+    let pending_id = 77;
+    let proc_id = 0x1234_u128;
+    let pending = PendingContext::new(
+        CanonicalChainRef::new(
+            network,
+            ChainEpoch::new(epoch),
+            CheckpointRef::new(
+                CheckpointId::new(10 + epoch),
+                CheckpointHash::from_last_chain_hash(PHash::from_owned_32bytes([
+                    epoch as u8;
+                    32
+                ])),
+            ),
+        ),
+        authority,
+        WorkUniquePendingId::new(pending_id),
+        WorkProcCheckpointUniqueId::from_u128(proc_id),
+    );
+    let capture = PendingQueueCaptureContext::try_new(
+        PendingGenerationLedgerKey::new(network, authority),
+        PendingGenerationActivationDigest::try_new([9; 32])?,
+        PendingGenerationContext::try_from_legacy(
+            UniquePendingId::try_new(pending_id)?.get(),
+            proc_id,
+        )?,
+    )?;
+    let admission = RealmUserUpdatePublishAdmission::try_from_pipeline(pending, capture)?;
+    Ok(StoredRealmUserUpdateClaim::claimed(
+        admission,
+        UserId::new(user_id),
+        RealmUserUpdateRequestDigest::derive(
+            &[epoch as u8, user_id as u8],
+            &[3, 4, 5],
+        )?,
+        RealmUserUpdateCreatedAtSeconds::try_new(100 + epoch as u32)?,
+    )?)
+}
+
+fn two_users_in_one_bucket() -> (u64, u64) {
+    let mut first_by_bucket = std::collections::HashMap::new();
+    for user in 1..100_000 {
+        let bucket = psy_node_core::queue::realm_user_update_claim::RealmUserUpdateClaimBucket::for_user(UserId::new(user));
+        if let Some(first) = first_by_bucket.insert(bucket, user) {
+            return (first, user);
+        }
+    }
+    panic!("256 buckets must collide in a finite search");
 }
 
 async fn connect(target: Option<Ipv4Addr>, consistency: Consistency) -> anyhow::Result<Session> {
@@ -144,6 +227,10 @@ struct H23c4c1Report {
     one_replica_offline_ready: bool,
     direct_one_nodes_exact: usize,
     direct_one_lifecycle_equal: bool,
+    claim_v2_addressable: bool,
+    claim_lwt_conflict: bool,
+    claim_scan_one_replica_offline: bool,
+    claim_direct_one_equal: bool,
     repair_flush_compact: bool,
     ready_ms: u64,
     qualification: &'static str,
@@ -190,6 +277,27 @@ async fn d04b6h23c4c1_queue_schema_lifecycle_rf3_gate() -> anyhow::Result<()> {
     let wrong_schema_rejected = PendingQueueSidecarDeploymentExecutor::deploy(session.clone(), wrong_keys).await.is_err();
     ensure!(wrong_schema_rejected);
 
+    let claim_store = ScyllaRealmUserUpdateClaimStore::prepare(
+        session.clone(),
+        keyspaces(EXACT)?.control().clone(),
+    )
+    .await?;
+    let (first_user, second_user) = two_users_in_one_bucket();
+    let first = claim(1, first_user)?;
+    let second = claim(2, second_user)?;
+    ensure!(first.partition()? == second.partition()?);
+    ensure!(first.slot() != second.slot());
+    ensure!(matches!(claim_store.claim(&first).await?, RealmUserUpdateClaimWriteOutcome::Applied(_)));
+    ensure!(matches!(claim_store.claim(&second).await?, RealmUserUpdateClaimWriteOutcome::Applied(_)));
+    let conflict = claim(2, first_user)?;
+    let claim_lwt_conflict = matches!(claim_store.claim(&conflict).await?, RealmUserUpdateClaimWriteOutcome::Conflict(_));
+    ensure!(claim_lwt_conflict);
+    let initial_scan = claim_store.scan_bucket::<PHash>(first.partition()?).await?;
+    let claim_v2_addressable = initial_scan.len() == 2
+        && initial_scan.iter().any(|value| value == &first)
+        && initial_scan.iter().any(|value| value == &second);
+    ensure!(claim_v2_addressable);
+
     compose(Path::new(&compose_file), &["stop", "scylla3"], "stop third replica")?;
     wait_up(2).await?;
     let started = Instant::now();
@@ -198,6 +306,9 @@ async fn d04b6h23c4c1_queue_schema_lifecycle_rf3_gate() -> anyhow::Result<()> {
     let ready_ms = started.elapsed().as_millis() as u64;
     let one_replica_offline_ready = exact_core.pending_queue_sidecar_setup_view().is_some();
     ensure!(one_replica_offline_ready);
+    let claim_scan_one_replica_offline =
+        claim_store.scan_bucket::<PHash>(first.partition()?).await? == initial_scan;
+    ensure!(claim_scan_one_replica_offline);
 
     compose(Path::new(&compose_file), &["start", "scylla3"], "restart third replica")?;
     wait_up(3).await?;
@@ -211,6 +322,7 @@ async fn d04b6h23c4c1_queue_schema_lifecycle_rf3_gate() -> anyhow::Result<()> {
     }
 
     let mut direct_payloads = Vec::new();
+    let mut direct_claims = Vec::new();
     let mut direct_one_nodes_exact = 0;
     let slot = PendingQueueSidecarDeploymentSlot::for_keyspaces(&keyspaces(EXACT)?);
     for ip in NODE_IPS {
@@ -222,9 +334,39 @@ async fn d04b6h23c4c1_queue_schema_lifecycle_rf3_gate() -> anyhow::Result<()> {
             (slot.as_bytes().to_vec(),),
         ).await?.into_rows_result()?.single_row::<(i64, Vec<u8>)>()?;
         direct_payloads.push(row);
+        let partition = first.partition()?;
+        let capture = partition.capture();
+        let AuthorityScope::Realm { realm_id, realm_sub_id } = capture.key().authority() else {
+            bail!("test claim must be Realm scoped")
+        };
+        let rows = local
+            .query_unpaged(
+                format!(
+                    "SELECT user_id, revision, claim_payload FROM {}.{} WHERE network_chain_id = ? AND authority_kind = ? AND realm_id = ? AND realm_sub_id = ? AND activation_digest = ? AND unique_pending_id = ? AND proc_checkpoint_id = ? AND claim_bucket = ?",
+                    no_tablet(EXACT),
+                    REALM_USER_UPDATE_CLAIM_TABLE,
+                ),
+                (
+                    i64::from(capture.key().network().chain_id()),
+                    1_i8,
+                    i64::from(realm_id),
+                    i32::from(realm_sub_id),
+                    capture.activation().as_bytes().to_vec(),
+                    i64::try_from(capture.processing().pending_id().get())?,
+                    capture.processing().proc_checkpoint_id().as_bytes().to_vec(),
+                    partition.bucket().as_i16()?,
+                ),
+            )
+            .await?
+            .into_rows_result()?
+            .rows::<(i64, i64, Vec<u8>)>()?
+            .collect::<Result<Vec<_>, _>>()?;
+        direct_claims.push(rows);
     }
     let direct_one_lifecycle_equal = direct_payloads.windows(2).all(|pair| pair[0] == pair[1]);
     ensure!(direct_one_lifecycle_equal);
+    let claim_direct_one_equal = direct_claims.windows(2).all(|pair| pair[0] == pair[1]);
+    ensure!(claim_direct_one_equal);
 
     let report = H23c4c1Report {
         image: IMAGE,
@@ -238,9 +380,13 @@ async fn d04b6h23c4c1_queue_schema_lifecycle_rf3_gate() -> anyhow::Result<()> {
         one_replica_offline_ready,
         direct_one_nodes_exact,
         direct_one_lifecycle_equal,
+        claim_v2_addressable,
+        claim_lwt_conflict,
+        claim_scan_one_replica_offline,
+        claim_direct_one_equal,
         repair_flush_compact: true,
         ready_ms,
-        qualification: "H23C4C1_QUEUE_SCHEMA_SETUP_RF3_PASSED",
+        qualification: "H23C4C2B3B1_ADDRESSABLE_CLAIM_RF3_PASSED",
     };
     let report_path = std::env::var("PSY_D04B6H23C4C1_REPORT_PATH")?;
     std::fs::write(&report_path, serde_json::to_vec_pretty(&report)?)?;
