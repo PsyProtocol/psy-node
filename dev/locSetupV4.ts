@@ -54,7 +54,7 @@ export async function retryProcessorStartup<T>(
     }
     const totalAttempts = maxRetries + 1;
     const attemptErrors: string[] = [];
-
+    let sawTransientScyllaFailure = false;
     for (let attempt = 1; attempt <= totalAttempts; attempt += 1) {
         console.log(`[DevNet] Starting ${name} readiness attempt ${attempt}/${totalAttempts}`);
         try {
@@ -62,17 +62,21 @@ export async function retryProcessorStartup<T>(
         } catch (error) {
             const context = error instanceof Error ? error.message : String(error);
             attemptErrors.push(`Attempt ${attempt}/${totalAttempts}: ${context}`);
-            if (!isTransientScyllaSchemaFailure(context)) {
+            const isTransientScyllaFailure = isTransientScyllaSchemaFailure(context);
+            const isPostScyllaReadinessTimeout = sawTransientScyllaFailure
+                && context.includes("did not reach its initialization marker within");
+            if (!isTransientScyllaFailure && !isPostScyllaReadinessTimeout) {
                 throw new Error(`${name} exited before full readiness.\n${attemptErrors.join("\n\n")}`);
             }
+            sawTransientScyllaFailure ||= isTransientScyllaFailure;
             if (attempt === totalAttempts) {
                 throw new Error(
-                    `${name} exhausted ${totalAttempts} readiness attempts after transient Scylla schema failures.\n`
+                    `${name} exhausted ${totalAttempts} readiness attempts after transient Scylla startup failures.\n`
                     + attemptErrors.join("\n\n"),
                 );
             }
             console.warn(
-                `[DevNet] ${name} readiness attempt ${attempt}/${totalAttempts} hit a transient Scylla schema failure; `
+                `[DevNet] ${name} readiness attempt ${attempt}/${totalAttempts} hit a transient Scylla startup failure; `
                 + `retrying the whole process in ${retryDelayMs}ms`,
             );
             if (retryDelayMs > 0) {

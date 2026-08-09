@@ -133,6 +133,18 @@ describe("processor full-readiness startup", () => {
         expect(attempts).toEqual([1, 2]);
     });
 
+    it("retries a readiness timeout after a transient Scylla failure", async () => {
+        const attempts: number[] = [];
+        const result = await retryProcessorStartup("realm 1 processor", async (attempt) => {
+            attempts.push(attempt);
+            if (attempt === 1) throw new Error("Scylla group 0 add_entry schema operation timed out");
+            if (attempt === 2) throw new Error("Process did not reach its initialization marker within 180000ms");
+            return "ready";
+        }, { maxRetries: 3, retryDelayMs: 0 });
+        expect(result).toBe("ready");
+        expect(attempts).toEqual([1, 2, 3]);
+    });
+
     it("resolves from the exact marker and rejects exit before it", async () => {
         const proc = await RunningProcess.spawnWithInitializationHint(
             [process.execPath, "-e", `process.stderr.write("${COORDINATOR_PROCESSOR_READY_MARKER}\\n", () => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0))`],
