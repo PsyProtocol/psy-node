@@ -48,6 +48,7 @@ mod pending_queue_semantic_aggregate;
 mod pending_queue_generation_terminal;
 mod pending_queue_sidecar_schema;
 mod realm_edge_durable_publisher;
+mod realm_user_update_claim_store;
 mod pending_queue_sidecar_lifecycle;
 #[cfg(test)]
 #[path = "../../tests/rf3/d04b6h23c4c1_queue_schema.rs"]
@@ -132,6 +133,7 @@ pub use pending_queue_segment_ledger::*;
 pub use pending_queue_publish_store::*;
 pub use pending_queue_sidecar_schema::*;
 pub use realm_edge_durable_publisher::*;
+pub use realm_user_update_claim_store::*;
 pub use pending_queue_sidecar_lifecycle::*;
 pub use authority_local_head_prototype::*;
 pub use authority_timestamp_prototype::*;

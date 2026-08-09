@@ -6,3 +6,4 @@ pub mod infrastructure;
 pub mod recoverable_artifact;
 pub mod recoverable_ephemeral;
 pub mod realm_user_update_publish;
+pub mod realm_user_update_claim;

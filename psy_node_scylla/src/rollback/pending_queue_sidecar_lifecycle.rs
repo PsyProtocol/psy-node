@@ -1,4 +1,4 @@
-//! Durable deployment lifecycle for the twelve recoverable-queue sidecars.
+//! Durable deployment lifecycle for the thirteen recoverable-queue sidecars.
 //!
 //! Deployment is explicit and restart-safe: first persist `Materializing`,
 //! idempotently create/inspect all target tables, then full-payload CAS to
@@ -515,7 +515,7 @@ mod tests {
         let queries = PendingQueueSidecarLifecycleQueries::new(&control);
         assert!(queries.bootstrap().contains("IF NOT EXISTS"));
         assert!(queries.cas().contains("IF revision = ? AND deployment_payload = ?"));
-        let setup = include_str!("../psy_setup.rs");
+        let setup = include_str!("../psy_setup.rs").split("#[cfg(test)]").next().unwrap();
         assert!(!setup.contains("PendingQueueSidecarDeploymentExecutor::deploy"));
         assert!(setup.contains("PendingQueueSidecarSetupMode::Disabled"));
         assert!(setup.contains("PendingQueueSidecarSetupMode::RequireVerified"));

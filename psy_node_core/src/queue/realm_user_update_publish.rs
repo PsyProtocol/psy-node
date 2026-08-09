@@ -63,6 +63,18 @@ impl RealmUserUpdateRequestDigest {
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
+
+    /// Stable, non-zero legacy-compatible status for the exact semantic
+    /// request. It is derived once from canonical request/proof material so a
+    /// crash retry cannot mint a different fake checkpoint/status value.
+    pub fn stable_status(self) -> u64 {
+        let value = u64::from_be_bytes(
+            self.0[..8]
+                .try_into()
+                .expect("request digest prefix has a fixed width"),
+        );
+        if value == 0 { 1 } else { value }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -566,6 +578,20 @@ mod tests {
             12,
         )
         .is_err());
+    }
+
+    #[test]
+    fn stable_status_is_deterministic_nonzero_and_request_exact() {
+        let first = RealmUserUpdateRequestDigest::derive(b"input", b"proof").unwrap();
+        let same = RealmUserUpdateRequestDigest::derive(b"input", b"proof").unwrap();
+        let changed = RealmUserUpdateRequestDigest::derive(b"input", b"other-proof").unwrap();
+        assert_ne!(first.stable_status(), 0);
+        assert_eq!(first.stable_status(), same.stable_status());
+        assert_ne!(first.stable_status(), changed.stable_status());
+
+        let mut zero_prefix = [0; 32];
+        zero_prefix[31] = 1;
+        assert_eq!(RealmUserUpdateRequestDigest::try_new(zero_prefix).unwrap().stable_status(), 1);
     }
 
     #[test]
