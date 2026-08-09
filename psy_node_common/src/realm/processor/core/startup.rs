@@ -16,7 +16,10 @@ use crate::{
     backup::realm::load_realm_memory_trees_from_db,
     queue::gatherer::EphemeralQueueGathererWithTree,
     realm::processor::{
-        core::PsyRealmProcessor,
+        core::{
+            control::new_realm_processor_control_plane, PsyRealmProcessor,
+            RealmProcessorControlError, RealmProcessorControlHandle,
+        },
         db::PsyRealmDatabaseProcessor,
         gatherers::realm_end_cap_gatherer::{RealmGUTAEndCapGatherer, RealmGUTAEndCapGathererConfig},
     },
@@ -113,9 +116,26 @@ where
                 guta_queue_gatherer: guta_queue_gatherer,
                 proof_worker_queue_max_time_ms: u64::MAX,
                 iteration_quiescence: Default::default(),
+                control_owner: None,
             },
             guta_join_handle,
         ))
+    }
+
+    /// Install the process-local h23b2 drain owner. This is deliberately not
+    /// called by ordinary startup: h23b3 must first prove durable route and
+    /// activation readiness before a production composition root may opt in.
+    pub(crate) fn enable_process_local_drain_control(
+        &mut self,
+    ) -> Result<RealmProcessorControlHandle, RealmProcessorControlError> {
+        if self.control_owner.is_some() {
+            return Err(RealmProcessorControlError::AlreadyEnabled);
+        }
+        let (owner, handle) = new_realm_processor_control_plane();
+        self.iteration_quiescence =
+            psy_node_core::store::realm_processor_quiescence::RealmProcessorIterationGate::controlled();
+        self.control_owner = Some(owner);
+        Ok(handle)
     }
 
     pub async fn get_latest_checkpoint_id_internal(&self) -> anyhow::Result<u64> {

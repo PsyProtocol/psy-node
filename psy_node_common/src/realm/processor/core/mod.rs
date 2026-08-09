@@ -15,8 +15,15 @@ use crate::{
 };
 
 mod process_block;
+mod control;
 pub mod runner;
 pub mod startup;
+
+pub use control::{
+    RealmProcessorControlError, RealmProcessorControlHandle,
+    RealmProcessorControlPhase, RealmProcessorControlRevision,
+    RealmProcessorControlSnapshot, RealmProcessorDrainAcceptance,
+};
 
 pub struct PsyRealmProcessor<
     N: QNetworkTypesConfig,
@@ -52,4 +59,7 @@ pub struct PsyRealmProcessor<
     /// The real loop owns the only iteration permit. Ordinary construction
     /// installs `Disabled`; h23 does not open a production cutover flag.
     pub(super) iteration_quiescence: RealmProcessorIterationGate,
+    /// The sole receiver/lease owner. Ordinary startup leaves it absent; a
+    /// later composition root must opt in explicitly after durable preflight.
+    control_owner: Option<control::RealmProcessorControlOwner>,
 }

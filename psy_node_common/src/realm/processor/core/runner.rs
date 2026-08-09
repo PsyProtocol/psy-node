@@ -12,6 +12,10 @@ use psy_node_core::{
 use tokio::time::sleep;
 
 use crate::realm::processor::core::PsyRealmProcessor;
+use crate::{
+    queue::gatherer::{GathererBoundaryPhase, GathererPauseRequest},
+    realm::processor::core::control::RealmProcessorPendingContext,
+};
 
 pub async fn run_realm_processor_loop<
     N: QNetworkTypesConfig<JobId = QProvingJobDataID>,
@@ -47,6 +51,109 @@ where
     let mut last_slot: u128 = 0;
 
     loop {
+        // The command receiver is owned by this loop. Dequeue happens only
+        // between iterations, so a request can never cancel sync, proof,
+        // commit, publish, or cleanup that already owns the iteration permit.
+        if processor
+            .control_owner
+            .as_ref()
+            .is_some_and(|owner| owner.is_whole_drained())
+        {
+            sleep(std::time::Duration::from_millis(50)).await;
+            continue;
+        }
+
+        let accepted_request = match processor.control_owner.as_mut() {
+            Some(owner) => owner.try_accept_next(
+                &processor.iteration_quiescence,
+                processor.db.state.chain_id,
+                processor.db.state.realm_id_u64,
+                processor.db.state.realm_sub_id_u64,
+            ),
+            None => Ok(None),
+        };
+        let accepted_request = match accepted_request {
+            Ok(request) => request,
+            Err(error) => {
+                let message = format!(
+                    "Realm Processor drain request failed closed before iteration: {error}"
+                );
+                processor.db.status.set_error(message.clone());
+                tracing::error!("{message}");
+                sleep(std::time::Duration::from_millis(50)).await;
+                continue;
+            }
+        };
+
+        if let Some(request) = accepted_request {
+            let drain_result = async {
+                let iteration = processor
+                    .iteration_quiescence
+                    .try_mint_iteration_drained(request)?;
+                processor
+                    .control_owner
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("accepted request lost its owner"))?
+                    .mark_iteration_drained(request)?;
+
+                // This actor status is itself a command boundary: an earlier
+                // backend callback/update has finished before it returns.
+                let gatherer_status = processor.guta_queue_gatherer.status().await?;
+                if gatherer_status.phase() != GathererBoundaryPhase::Running {
+                    anyhow::bail!("gatherer was not running at drain boundary");
+                }
+                if gatherer_status.unique_id()
+                    != processor.db.state.gathering_proc_checkpoint_unique_id
+                {
+                    anyhow::bail!(
+                        "gatherer namespace differs from Realm gathering context"
+                    );
+                }
+                processor
+                    .control_owner
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("accepted request lost its owner"))?
+                    .mark_gatherer_pause_pending(request)?;
+                let gatherer = processor
+                    .guta_queue_gatherer
+                    .pause(GathererPauseRequest::new(
+                        request,
+                        gatherer_status.revision(),
+                        processor.db.state.gathering_proc_checkpoint_unique_id,
+                    ))
+                    .await?;
+                let pending_context = RealmProcessorPendingContext::new(
+                    processor.db.state.processing_unique_pending_id,
+                    processor.db.state.processing_proc_checkpoint_unique_id,
+                    processor.db.state.gathering_unique_pending_id,
+                    processor.db.state.gathering_proc_checkpoint_unique_id,
+                );
+                processor
+                    .control_owner
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("accepted request lost its owner"))?
+                    .install_whole_lease(iteration, gatherer, request, pending_context)?;
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+
+            if let Err(error) = drain_result {
+                if let Some(owner) = processor.control_owner.as_mut() {
+                    owner.fail_closed(request);
+                }
+                let message = format!(
+                    "Realm Processor whole-drain failed closed for {:?}: {error:#}",
+                    request.digest()
+                );
+                processor.db.status.set_error(message.clone());
+                tracing::error!("{message}");
+            }
+            // Successful drain is parked with both opaque leases retained;
+            // failed drain is also parked. h23b2 intentionally has no resume.
+            sleep(std::time::Duration::from_millis(50)).await;
+            continue;
+        }
+
         if processor.db.status.should_run() {
             // This RAII owner covers the whole real iteration: sync may write
             // catch-up state and process_block includes commit, authority
@@ -144,6 +251,46 @@ mod h23a_tests {
         let cargo = include_str!("../../../../Cargo.toml");
         assert!(!cargo.contains("psy_node_scylla"));
     }
+}
+
+#[cfg(test)]
+mod h23b2_tests {
+    #[test]
+    fn control_is_dequeued_before_any_new_iteration_owner() {
+        let source = include_str!("runner.rs");
+        let dequeue = source.find("owner.try_accept_next").unwrap();
+        let iteration = source.find(".try_begin_iteration()").unwrap();
+        assert!(dequeue < iteration);
+    }
+
+    #[test]
+    fn whole_drain_orders_iteration_then_actor_status_then_pause() {
+        let source = include_str!("runner.rs");
+        let iteration = source.find(".try_mint_iteration_drained(request)").unwrap();
+        let status = source.find("guta_queue_gatherer.status().await").unwrap();
+        let pause = source.find(".pause(GathererPauseRequest::new(").unwrap();
+        let install = source.find(".install_whole_lease(").unwrap();
+        assert!(iteration < status && status < pause && pause < install);
+    }
+
+    #[test]
+    fn ordinary_startup_does_not_enable_control() {
+        let startup = include_str!("startup.rs");
+        assert!(startup.contains("control_owner: None"));
+        assert_eq!(startup.matches("enable_process_local_drain_control(").count(), 1);
+        let create = include_str!("../create.rs");
+        assert!(!create.contains("enable_process_local_drain_control"));
+    }
+
+    #[test]
+    fn h23b2_exposes_no_resume_path() {
+        let control = include_str!("control.rs");
+        assert!(!control.contains("pub fn resume"));
+        assert!(!control.contains("pub async fn resume"));
+        assert!(control.contains("whole_lease: Option<RealmProcessorWholeDrainedLease>"));
+        assert!(control.contains("GathererPauseReceipt"));
+    }
+
 }
 pub async fn run_realm_processor<
     N: QNetworkTypesConfig<JobId = QProvingJobDataID>,
