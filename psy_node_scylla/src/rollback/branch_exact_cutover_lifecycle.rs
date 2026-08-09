@@ -146,6 +146,113 @@ impl BranchExactCutoverPhase {
     }
 }
 
+/// Exact route identity persisted inside an h22 WritePrepared row. This is
+/// the crash-retry fence: a prepared intent can only resume under the same
+/// cutover generation, revision, full binding/state digest, and serving phase.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BranchExactWriterCutoverFence {
+    generation: BranchExactCutoverGeneration,
+    revision: BranchExactCutoverRevision,
+    binding_digest: BranchExactCutoverBindingDigest,
+    state_digest: BranchExactCutoverStateDigest,
+    phase: BranchExactCutoverPhase,
+}
+
+impl BranchExactWriterCutoverFence {
+    pub(crate) fn try_from_current<Hash: Q256BitHash>(
+        current: &StoredBranchExactCutover<Hash>,
+    ) -> Result<Self, BranchExactCutoverError> {
+        if !matches!(
+            current.phase(),
+            BranchExactCutoverPhase::LegacyPrimaryDualWrite
+                | BranchExactCutoverPhase::TargetPrimaryDualWrite
+        ) {
+            return Err(BranchExactCutoverError::RouteQuiescing);
+        }
+        Ok(Self {
+            generation: current.binding().generation(),
+            revision: current.revision(),
+            binding_digest: current.binding().digest(),
+            state_digest: current.state_digest(),
+            phase: current.phase(),
+        })
+    }
+
+    pub(crate) fn matches<Hash: Q256BitHash>(
+        &self,
+        current: &StoredBranchExactCutover<Hash>,
+    ) -> bool {
+        self.generation == current.binding().generation()
+            && self.revision == current.revision()
+            && self.binding_digest == current.binding().digest()
+            && self.state_digest == current.state_digest()
+            && self.phase == current.phase()
+    }
+
+    pub const fn generation(&self) -> BranchExactCutoverGeneration {
+        self.generation
+    }
+
+    pub const fn revision(&self) -> BranchExactCutoverRevision {
+        self.revision
+    }
+
+    pub const fn binding_digest(&self) -> BranchExactCutoverBindingDigest {
+        self.binding_digest
+    }
+
+    pub const fn state_digest(&self) -> BranchExactCutoverStateDigest {
+        self.state_digest
+    }
+
+    pub const fn phase(&self) -> BranchExactCutoverPhase {
+        self.phase
+    }
+
+    pub(crate) fn encode_canonical(&self) -> [u8; 81] {
+        let mut bytes = [0u8; 81];
+        bytes[..8].copy_from_slice(&self.generation.get().to_be_bytes());
+        bytes[8..16].copy_from_slice(&self.revision.get().to_be_bytes());
+        bytes[16..48].copy_from_slice(self.binding_digest.as_bytes());
+        bytes[48..80].copy_from_slice(self.state_digest.as_bytes());
+        bytes[80] = self.phase as u8;
+        bytes
+    }
+
+    pub(crate) fn decode_canonical(bytes: &[u8]) -> Result<Self, BranchExactCutoverError> {
+        if bytes.len() != 81 {
+            return Err(BranchExactCutoverError::InvalidWriterFenceLength(bytes.len()));
+        }
+        let generation = BranchExactCutoverGeneration::try_new(u64::from_be_bytes(
+            bytes[..8].try_into().expect("fixed fence generation"),
+        ))?;
+        let revision = BranchExactCutoverRevision::try_new(u64::from_be_bytes(
+            bytes[8..16].try_into().expect("fixed fence revision"),
+        ))?;
+        let binding_digest = BranchExactCutoverBindingDigest::from_checked(
+            bytes[16..48].try_into().expect("fixed binding digest"),
+        )?;
+        let state_digest = BranchExactCutoverStateDigest::from_checked(
+            bytes[48..80].try_into().expect("fixed state digest"),
+        )?;
+        let phase = BranchExactCutoverPhase::try_from_u8(bytes[80])?;
+        if !matches!(
+            phase,
+            BranchExactCutoverPhase::LegacyPrimaryDualWrite
+                | BranchExactCutoverPhase::TargetPrimaryDualWrite
+        ) {
+            return Err(BranchExactCutoverError::RouteQuiescing);
+        }
+        Ok(Self {
+            generation,
+            revision,
+            binding_digest,
+            state_digest,
+            phase,
+        })
+    }
+}
+
 /// Exact h20+h21+h22+authority-head evidence selected for one cutover.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BranchExactCutoverBinding<Hash> {
@@ -250,6 +357,10 @@ impl<Hash: Q256BitHash> BranchExactCutoverBinding<Hash> {
 
     pub const fn writer_revision(&self) -> u64 {
         self.writer_revision
+    }
+
+    pub const fn writer_activation_digest_bytes(&self) -> &[u8; 32] {
+        self.writer_activation_digest.as_bytes()
     }
 
     pub const fn authority_head_revision(&self) -> u64 {
@@ -778,6 +889,8 @@ pub enum BranchExactCutoverError {
     PersistedIdentityMismatch,
     TruncatedPayload,
     TrailingBytes,
+    RouteQuiescing,
+    InvalidWriterFenceLength(usize),
 }
 
 impl fmt::Display for BranchExactCutoverError {
@@ -799,6 +912,9 @@ mod tests {
     };
 
     use super::*;
+    use crate::rollback::{
+        BranchExactCutoverRouteFence, BranchExactCutoverRuntimeError,
+    };
 
     fn binding(seed: u8) -> BranchExactCutoverBinding<PHash> {
         let chain = CanonicalChainRef::new(
@@ -1003,6 +1119,31 @@ mod tests {
             Err(BranchExactCutoverError::RevisionOutOfRange(
                 i64::MAX as u64 + 1
             ))
+        );
+    }
+
+    #[test]
+    fn runtime_route_fence_rejects_quiescing_and_detects_stale_state() {
+        let legacy = bootstrap();
+        let fence = BranchExactCutoverRouteFence::try_from_current(&legacy).unwrap();
+        assert!(fence.matches(&legacy));
+        let durable = fence.writer_fence();
+        assert_eq!(
+            BranchExactWriterCutoverFence::decode_canonical(&durable.encode_canonical()),
+            Ok(durable)
+        );
+
+        let prepared = SealedBranchExactCutoverCas::prepare_target(
+            &legacy,
+            &permit(&legacy, 1),
+        )
+        .unwrap()
+        .candidate()
+        .clone();
+        assert!(!fence.matches(&prepared));
+        assert_eq!(
+            BranchExactCutoverRouteFence::try_from_current(&prepared),
+            Err(BranchExactCutoverRuntimeError::RouteQuiescing)
         );
     }
 }

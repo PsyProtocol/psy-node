@@ -32,6 +32,7 @@ use super::{
     BranchExactWriterAuthorityKey, BranchExactWriterLifecycleError,
     BranchExactWriterReadState, BranchExactWriterRevision,
     BranchExactWriterState, BranchExactWriterWriteOutcome,
+    BranchExactWriterCutoverFence,
     ScyllaAuthorityTimestampStore, ScyllaBranchExactSchemaSetupGate,
     ScyllaBranchExactWriterLifecycleStore, SealedBranchExactWriterCas,
     StoredBranchExactWriterLifecycle,
@@ -88,6 +89,7 @@ pub struct BranchExactPublishBarrier<Hash> {
     intent_digest: BranchExactDualWriteIntentDigest,
     prepared_digest: [u8; 32],
     verified_digest: [u8; 32],
+    cutover_fence: Option<BranchExactWriterCutoverFence>,
 }
 
 impl<Hash> BranchExactPublishBarrier<Hash> {
@@ -264,10 +266,41 @@ impl<Hash: Q256BitHash> ScyllaBranchExactWriterRuntime<Hash> {
         self.key.authority()
     }
 
+    pub const fn network(&self) -> NetworkId {
+        self.key.network()
+    }
+
+    pub const fn activation_digest(&self) -> BranchExactWriterActivationDigest {
+        self.activation_digest
+    }
+
     pub(crate) async fn prepare_and_verify(
         &self,
         intent: BranchExactDualWriteIntent<Hash>,
         clock_sample: AuthorityClockSampleUs,
+    ) -> Result<BranchExactPublishBarrier<Hash>, BranchExactWriterRuntimeError> {
+        self.prepare_and_verify_inner(intent, clock_sample, None).await
+    }
+
+    pub(crate) async fn prepare_and_verify_with_cutover(
+        &self,
+        intent: BranchExactDualWriteIntent<Hash>,
+        clock_sample: AuthorityClockSampleUs,
+        cutover_fence: BranchExactWriterCutoverFence,
+    ) -> Result<BranchExactPublishBarrier<Hash>, BranchExactWriterRuntimeError> {
+        self.prepare_and_verify_inner(
+            intent,
+            clock_sample,
+            Some(cutover_fence),
+        )
+        .await
+    }
+
+    async fn prepare_and_verify_inner(
+        &self,
+        intent: BranchExactDualWriteIntent<Hash>,
+        clock_sample: AuthorityClockSampleUs,
+        cutover_fence: Option<BranchExactWriterCutoverFence>,
     ) -> Result<BranchExactPublishBarrier<Hash>, BranchExactWriterRuntimeError> {
         let current = self.read_writer().await?;
         let prepared = match current.state() {
@@ -302,26 +335,36 @@ impl<Hash: Q256BitHash> ScyllaBranchExactWriterRuntime<Hash> {
                     .clone()
                     .attach_timestamp_lease(reservation.lease())
                     .map_err(|error| BranchExactWriterRuntimeError::Model(error.to_string()))?;
-                let cas = SealedBranchExactWriterCas::prepare_write(
-                    &current,
-                    &sealed,
-                    reservation,
-                )
+                let cas = match cutover_fence.clone() {
+                    None => SealedBranchExactWriterCas::prepare_write(
+                        &current,
+                        &sealed,
+                        reservation,
+                    ),
+                    Some(fence) => SealedBranchExactWriterCas::prepare_write_with_cutover(
+                        &current,
+                        &sealed,
+                        reservation,
+                        fence,
+                    ),
+                }
                 .map_err(lifecycle)?;
                 match self.writer.compare_and_set(&cas).await.map_err(store)? {
                     BranchExactWriterWriteOutcome::Applied(next)
                     | BranchExactWriterWriteOutcome::Idempotent(next) => next,
                     BranchExactWriterWriteOutcome::Conflict(next)
-                        if state_matches_intent(&next, &intent) => next,
+                        if state_matches_intent(&next, &intent, cutover_fence.as_ref()) => next,
                     BranchExactWriterWriteOutcome::Conflict(_) => {
                         return Err(BranchExactWriterRuntimeError::LifecycleConflict)
                     }
                 }
             }
             BranchExactWriterState::WritePrepared(prepared)
-                if prepared.intent() == &intent => current,
+                if prepared.intent() == &intent
+                    && prepared.cutover_fence() == cutover_fence.as_ref() => current,
             BranchExactWriterState::WritesVerified(verified)
-                if verified.prepared().intent() == &intent => {
+                if verified.prepared().intent() == &intent
+                    && verified.prepared().cutover_fence() == cutover_fence.as_ref() => {
                     return self.barrier_from_verified(&current)
                 }
             _ => return Err(BranchExactWriterRuntimeError::IntentMismatch),
@@ -425,6 +468,7 @@ impl<Hash: Q256BitHash> ScyllaBranchExactWriterRuntime<Hash> {
             || verified.prepared().intent().intent_digest() != barrier.intent_digest
             || verified.prepared().digest() != &barrier.prepared_digest
             || verified.digest() != &barrier.verified_digest
+            || verified.prepared().cutover_fence() != barrier.cutover_fence.as_ref()
         {
             return Err(BranchExactWriterRuntimeError::BarrierMismatch);
         }
@@ -566,6 +610,7 @@ impl<Hash: Q256BitHash> ScyllaBranchExactWriterRuntime<Hash> {
             intent_digest: prepared.intent().intent_digest(),
             prepared_digest: *prepared.digest(),
             verified_digest: *verified.digest(),
+            cutover_fence: prepared.cutover_fence().cloned(),
         })
     }
 }
@@ -573,14 +618,17 @@ impl<Hash: Q256BitHash> ScyllaBranchExactWriterRuntime<Hash> {
 fn state_matches_intent<Hash: Q256BitHash>(
     state: &StoredBranchExactWriterLifecycle<Hash>,
     intent: &BranchExactDualWriteIntent<Hash>,
+    cutover_fence: Option<&BranchExactWriterCutoverFence>,
 ) -> bool {
     matches!(
         state.state(),
-        BranchExactWriterState::WritePrepared(prepared) if prepared.intent() == intent
+        BranchExactWriterState::WritePrepared(prepared)
+            if prepared.intent() == intent && prepared.cutover_fence() == cutover_fence
     ) || matches!(
         state.state(),
         BranchExactWriterState::WritesVerified(verified)
             if verified.prepared().intent() == intent
+                && verified.prepared().cutover_fence() == cutover_fence
     )
 }
 

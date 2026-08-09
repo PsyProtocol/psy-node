@@ -40,14 +40,16 @@ use super::{
     BranchExactSchemaReady,
     BranchExactSchemaReadyDigest, BranchExactShadowSourceReceiptDigest,
     BranchExactShadowVerifiedDigest, BranchExactShadowVerifiedReceipt,
+    BranchExactWriterCutoverFence,
 };
 
 const MAGIC: [u8; 8] = *b"PSYBEXWL";
 // v2 persisted the exact h16 BACKFILL_VERIFIED receipt. v3 additionally binds
 // the complete allocator revision/phase/high-water in the activation plan and
-// every Active state; v2 is rejected because a bare timestamp cannot support
-// exact three-row startup recovery.
-const CODEC_VERSION: u16 = 3;
+// every Active state. v4 persists the exact h22e3 cutover fence in each
+// managed WritePrepared/WritesVerified row. Older rows cannot safely resume
+// across a route transition and are rejected.
+const CODEC_VERSION: u16 = 4;
 const PLAN_DOMAIN: &[u8] = b"psy/rollback/branch-exact-writer-activation/v2";
 const SLOT_DOMAIN: &[u8] = b"psy/rollback/branch-exact-writer-slot/v1";
 const PREPARED_DOMAIN: &[u8] = b"psy/rollback/branch-exact-writer-prepared/v2";
@@ -444,6 +446,7 @@ pub struct BranchExactWriterPrepared<Hash> {
     timestamp_revision: AuthorityTimestampRevision,
     timestamp: CommitWriteTimestampUs,
     timestamp_predecessor: StoredAuthorityTimestampState,
+    cutover_fence: Option<BranchExactWriterCutoverFence>,
     digest: [u8; 32],
 }
 
@@ -466,6 +469,10 @@ impl<Hash: Q256BitHash> BranchExactWriterPrepared<Hash> {
 
     pub const fn timestamp_predecessor(&self) -> StoredAuthorityTimestampState {
         self.timestamp_predecessor
+    }
+
+    pub const fn cutover_fence(&self) -> Option<&BranchExactWriterCutoverFence> {
+        self.cutover_fence.as_ref()
     }
 
     pub const fn digest(&self) -> &[u8; 32] {
@@ -716,6 +723,29 @@ impl<Hash: Q256BitHash> SealedBranchExactWriterCas<Hash> {
         sealed: &SealedBranchExactDualWrite<Hash>,
         reservation: SealedAuthorityTimestampReservation,
     ) -> Result<Self, BranchExactWriterLifecycleError> {
+        Self::prepare_write_inner(expected, sealed, reservation, None)
+    }
+
+    pub(crate) fn prepare_write_with_cutover(
+        expected: &StoredBranchExactWriterLifecycle<Hash>,
+        sealed: &SealedBranchExactDualWrite<Hash>,
+        reservation: SealedAuthorityTimestampReservation,
+        cutover_fence: BranchExactWriterCutoverFence,
+    ) -> Result<Self, BranchExactWriterLifecycleError> {
+        Self::prepare_write_inner(
+            expected,
+            sealed,
+            reservation,
+            Some(cutover_fence),
+        )
+    }
+
+    fn prepare_write_inner(
+        expected: &StoredBranchExactWriterLifecycle<Hash>,
+        sealed: &SealedBranchExactDualWrite<Hash>,
+        reservation: SealedAuthorityTimestampReservation,
+        cutover_fence: Option<BranchExactWriterCutoverFence>,
+    ) -> Result<Self, BranchExactWriterLifecycleError> {
         let BranchExactWriterState::Active(active) = &expected.state else {
             return Err(BranchExactWriterLifecycleError::IllegalTransition);
         };
@@ -728,19 +758,22 @@ impl<Hash: Q256BitHash> SealedBranchExactWriterCas<Hash> {
         {
             return Err(BranchExactWriterLifecycleError::WriterContinuityMismatch);
         }
+        let digest = prepared_digest(
+            active,
+            intent,
+            sealed.lease().active_revision(),
+            sealed.write_timestamp(),
+            reservation.expected(),
+            cutover_fence.as_ref(),
+        );
         let prepared = BranchExactWriterPrepared {
             previous: active.clone(),
             intent: intent.clone(),
             timestamp_revision: sealed.lease().active_revision(),
             timestamp: sealed.write_timestamp(),
             timestamp_predecessor: reservation.expected(),
-            digest: prepared_digest(
-                active,
-                intent,
-                sealed.lease().active_revision(),
-                sealed.write_timestamp(),
-                reservation.expected(),
-            ),
+            cutover_fence,
+            digest,
         };
         Self::transition(expected, BranchExactWriterState::WritePrepared(prepared))
     }
@@ -881,6 +914,7 @@ fn prepared_digest<Hash: Q256BitHash>(
     revision: AuthorityTimestampRevision,
     timestamp: CommitWriteTimestampUs,
     timestamp_predecessor: StoredAuthorityTimestampState,
+    cutover_fence: Option<&BranchExactWriterCutoverFence>,
 ) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(PREPARED_DOMAIN);
@@ -891,6 +925,13 @@ fn prepared_digest<Hash: Q256BitHash>(
     hasher.update(timestamp.as_i64().to_be_bytes());
     hasher.update(timestamp_predecessor.revision().get().to_be_bytes());
     hasher.update(timestamp_predecessor.encode_canonical());
+    match cutover_fence {
+        None => hasher.update([0]),
+        Some(fence) => {
+            hasher.update([1]);
+            hasher.update(fence.encode_canonical());
+        }
+    }
     hasher.finalize().into()
 }
 
@@ -989,6 +1030,13 @@ fn encode_prepared<Hash: Q256BitHash>(prepared: &BranchExactWriterPrepared<Hash>
     out.extend_from_slice(&prepared.timestamp.as_i64().to_be_bytes());
     out.extend_from_slice(&prepared.timestamp_predecessor.revision().get().to_be_bytes());
     out.extend_from_slice(&prepared.timestamp_predecessor.encode_canonical());
+    match &prepared.cutover_fence {
+        None => out.push(0),
+        Some(fence) => {
+            out.push(1);
+            out.extend_from_slice(&fence.encode_canonical());
+        }
+    }
     out.extend_from_slice(&prepared.digest);
 }
 
@@ -1220,6 +1268,14 @@ fn decode_prepared<Hash: Q256BitHash>(
         decoder.take(AUTHORITY_TIMESTAMP_STATE_V1_LEN)?,
     )
     .map_err(|_| BranchExactWriterLifecycleError::TimestampReservationPredecessorMismatch)?;
+    let cutover_fence = match decoder.u8()? {
+        0 => None,
+        1 => Some(
+            BranchExactWriterCutoverFence::decode_canonical(decoder.take(81)?)
+                .map_err(|error| BranchExactWriterLifecycleError::CutoverFence(error.to_string()))?,
+        ),
+        value => return Err(BranchExactWriterLifecycleError::InvalidPresence(value)),
+    };
     let reservation_key = AuthorityTimestampKey::new(
         intent.candidate().canonical_chain().network_id(),
         intent.authority(),
@@ -1247,6 +1303,7 @@ fn decode_prepared<Hash: Q256BitHash>(
                 timestamp_revision,
                 timestamp,
                 timestamp_predecessor,
+                cutover_fence.as_ref(),
             )
     {
         return Err(BranchExactWriterLifecycleError::PreparedDigestMismatch);
@@ -1257,6 +1314,7 @@ fn decode_prepared<Hash: Q256BitHash>(
         timestamp_revision,
         timestamp,
         timestamp_predecessor,
+        cutover_fence,
         digest,
     })
 }
@@ -1387,6 +1445,7 @@ pub enum BranchExactWriterLifecycleError {
     RevisionStateMismatch,
     PersistedIdentityMismatch,
     Intent(String),
+    CutoverFence(String),
 }
 
 impl fmt::Display for BranchExactWriterLifecycleError {
@@ -1827,6 +1886,63 @@ mod tests {
             ),
             Err(BranchExactWriterLifecycleError::TimestampReservationPredecessorMismatch)
         );
+    }
+
+    #[test]
+    fn managed_prepared_row_persists_exact_cutover_fence() {
+        let shadow = verified_shadow();
+        let plan = BranchExactWriterActivationPlan::test_fixture(
+            AuthorityScope::Coordinator,
+            mapping(10, 100),
+            CommitWriteTimestampUs::try_from_i128(1_000).unwrap(),
+            shadow.digest(),
+            backfill_receipt(AuthorityScope::Coordinator),
+        );
+        let consumed = consumed_shadow(shadow, plan.digest());
+        let bootstrap = BranchExactWriterBootstrap::new(plan);
+        let active = SealedBranchExactWriterCas::activate(
+            bootstrap.candidate(),
+            &consumed,
+        )
+        .unwrap();
+        let intent = BranchExactDualWriteIntent::try_coordinator(
+            mapping(10, 100),
+            mapping(11, 101),
+            ProcCheckpointUniqueId::from_u128(9002),
+        )
+        .unwrap();
+        let reservation = timestamp_reservation(&intent, active.candidate());
+        let sealed = intent.clone().attach_timestamp_lease(reservation.lease()).unwrap();
+        let mut fence_bytes = [0u8; 81];
+        fence_bytes[..8].copy_from_slice(&9u64.to_be_bytes());
+        fence_bytes[8..16].copy_from_slice(&3u64.to_be_bytes());
+        fence_bytes[16..48].fill(0x44);
+        fence_bytes[48..80].fill(0x55);
+        fence_bytes[80] = crate::rollback::BranchExactCutoverPhase::LegacyPrimaryDualWrite as u8;
+        let fence = BranchExactWriterCutoverFence::decode_canonical(&fence_bytes).unwrap();
+        let prepared = SealedBranchExactWriterCas::prepare_write_with_cutover(
+            active.candidate(),
+            &sealed,
+            reservation,
+            fence.clone(),
+        )
+        .unwrap();
+        let bytes = prepared.candidate().to_canonical_bytes();
+        let decoded = StoredBranchExactWriterLifecycle::<PHash>::decode_persisted(
+            prepared.candidate().slot().as_bytes(),
+            prepared.candidate().revision().as_i64(),
+            &bytes,
+        )
+        .unwrap();
+        let BranchExactWriterState::WritePrepared(decoded_prepared) = decoded.state() else {
+            panic!("expected managed WritePrepared")
+        };
+        assert_eq!(decoded_prepared.cutover_fence(), Some(&fence));
+
+        let mut different = fence_bytes;
+        different[8..16].copy_from_slice(&4u64.to_be_bytes());
+        let different = BranchExactWriterCutoverFence::decode_canonical(&different).unwrap();
+        assert_ne!(decoded_prepared.cutover_fence(), Some(&different));
     }
 
     #[test]

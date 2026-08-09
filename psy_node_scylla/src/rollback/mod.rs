@@ -24,6 +24,8 @@ mod branch_exact_dual_write_executor;
 mod branch_exact_cutover_lifecycle;
 #[allow(dead_code)]
 mod branch_exact_cutover_store;
+#[allow(dead_code)]
+mod branch_exact_cutover_runtime;
 mod branch_exact_schema_setup;
 mod branch_exact_shadow_reader;
 mod branch_exact_shadow_audit;
@@ -106,6 +108,7 @@ pub use branch_exact_schema_backfill_executor::*;
 pub use branch_exact_schema_exporter::*;
 pub use branch_exact_cutover_lifecycle::*;
 pub use branch_exact_cutover_store::*;
+pub use branch_exact_cutover_runtime::*;
 pub use branch_exact_schema_setup::*;
 pub use branch_exact_shadow_reader::*;
 pub use branch_exact_shadow_audit::*;
