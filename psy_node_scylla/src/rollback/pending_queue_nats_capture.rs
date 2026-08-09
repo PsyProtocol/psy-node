@@ -126,6 +126,13 @@ impl ScyllaBackedRecoverableNatsSource {
         })
     }
 
+    /// Read-only provenance needed by the semantic terminal verifier after
+    /// capture. The permit remains owned by this composition boundary and is
+    /// never returned by value or exposed outside the rollback crate.
+    pub(super) const fn owner_permit(&self) -> &PendingQueueArtifactOwnerPermit {
+        &self.owner
+    }
+
     /// Recovers a previously selected batch first; otherwise fetches one new
     /// unacknowledged batch.  Exact Scylla readback always precedes terminal
     /// Data ACK is confirmed before Data progress advances; a trailing Seal is
