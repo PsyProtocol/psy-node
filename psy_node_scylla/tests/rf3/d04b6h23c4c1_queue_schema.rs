@@ -118,6 +118,7 @@ fn claim(epoch: u64, user_id: u64) -> anyhow::Result<StoredRealmUserUpdateClaim<
             &[3, 4, 5],
         )?,
         RealmUserUpdateCreatedAtSeconds::try_new(100 + epoch as u32)?,
+        psy_node_core::queue::realm_user_update_claim::RealmUserUpdateAdmissionOrdinal::FIRST,
     )?)
 }
 
@@ -287,10 +288,10 @@ async fn d04b6h23c4c1_queue_schema_lifecycle_rf3_gate() -> anyhow::Result<()> {
     let second = claim(2, second_user)?;
     ensure!(first.partition()? == second.partition()?);
     ensure!(first.slot() != second.slot());
-    ensure!(matches!(claim_store.claim(&first).await?, RealmUserUpdateClaimWriteOutcome::Applied(_)));
-    ensure!(matches!(claim_store.claim(&second).await?, RealmUserUpdateClaimWriteOutcome::Applied(_)));
+    ensure!(matches!(claim_store.claim_retired_v5_fixture(&first).await?, RealmUserUpdateClaimWriteOutcome::Applied(_)));
+    ensure!(matches!(claim_store.claim_retired_v5_fixture(&second).await?, RealmUserUpdateClaimWriteOutcome::Applied(_)));
     let conflict = claim(2, first_user)?;
-    let claim_lwt_conflict = matches!(claim_store.claim(&conflict).await?, RealmUserUpdateClaimWriteOutcome::Conflict(_));
+    let claim_lwt_conflict = matches!(claim_store.claim_retired_v5_fixture(&conflict).await?, RealmUserUpdateClaimWriteOutcome::Conflict(_));
     ensure!(claim_lwt_conflict);
     let initial_scan = claim_store.scan_bucket::<PHash>(first.partition()?).await?;
     let claim_v2_addressable = initial_scan.len() == 2
@@ -348,7 +349,7 @@ async fn d04b6h23c4c1_queue_schema_lifecycle_rf3_gate() -> anyhow::Result<()> {
                 ),
                 (
                     i64::from(capture.key().network().chain_id()),
-                    1_i8,
+                    crate::rollback::realm_generation_scope::REALM_AUTHORITY_KIND,
                     i64::from(realm_id),
                     i32::from(realm_sub_id),
                     capture.activation().as_bytes().to_vec(),
@@ -371,7 +372,7 @@ async fn d04b6h23c4c1_queue_schema_lifecycle_rf3_gate() -> anyhow::Result<()> {
     let report = H23c4c1Report {
         image: IMAGE,
         replication_factor: 3,
-        target_tables: 14,
+        target_tables: 15,
         lifecycle_tables: 1,
         disabled_zero_queue_tables,
         partial_retry_converged,

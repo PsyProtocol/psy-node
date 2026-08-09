@@ -479,7 +479,7 @@ mod tests {
         let pending = PendingContext::new(chain, authority, WorkUniquePendingId::new(9), WorkProcCheckpointUniqueId::from_u128(10));
         let generation = PendingGenerationContext::try_from_legacy(UniquePendingId::try_new(9).unwrap().get(), 10).unwrap();
         let capture = PendingQueueCaptureContext::try_new(PendingGenerationLedgerKey::new(chain.network_id(), authority), PendingGenerationActivationDigest::try_new([3; 32]).unwrap(), generation).unwrap();
-        StoredRealmUserUpdateClaim::claimed(RealmUserUpdatePublishAdmission::try_from_pipeline(pending, capture).unwrap(), UserId::new(11), RealmUserUpdateRequestDigest::derive(input, proof).unwrap(), RealmUserUpdateCreatedAtSeconds::try_new(12).unwrap()).unwrap()
+        StoredRealmUserUpdateClaim::claimed(RealmUserUpdatePublishAdmission::try_from_pipeline(pending, capture).unwrap(), UserId::new(11), RealmUserUpdateRequestDigest::derive(input, proof).unwrap(), RealmUserUpdateCreatedAtSeconds::try_new(12).unwrap(), crate::queue::realm_user_update_claim::RealmUserUpdateAdmissionOrdinal::FIRST).unwrap()
     }
 
     #[test]

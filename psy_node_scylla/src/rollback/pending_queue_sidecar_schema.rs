@@ -1,6 +1,6 @@
 //! Exact, default-off schema boundary for the recoverable Realm queue.
 //!
-//! The fourteen target tables already have production-shaped adapters and RF=3
+//! The fifteen target tables have production-shaped adapters and are qualified
 //! evidence, but historically only tests created them one by one.  This module
 //! gives deployment tooling one deterministic manifest/materializer and gives
 //! node startup an inspect-only capability.  Ordinary setup performs no queue
@@ -39,24 +39,25 @@ use super::{
     PendingQueuePublishKeyspaces, ScyllaPendingPipelineStore,
     ScyllaPendingQueueArtifactStore, ScyllaPendingQueuePublishStore,
     ScyllaPendingQueueSegmentLedgerStore, ScyllaRealmUserUpdateClaimStore,
-    ScyllaRealmUserUpdateDependencyStore,
+    ScyllaRealmUserUpdateAdmissionStore, ScyllaRealmUserUpdateDependencyStore,
     PENDING_QUEUE_ARTIFACT_FRAGMENT_TABLE,
     PENDING_QUEUE_ARTIFACT_HEADER_TABLE, PENDING_QUEUE_PUBLISH_FRAGMENT_TABLE,
     PENDING_QUEUE_PUBLISH_INTENT_TABLE, PENDING_QUEUE_PUBLISH_PREPARED_TABLE,
-    PENDING_QUEUE_PUBLISH_SOURCE_TABLE, REALM_USER_UPDATE_CLAIM_TABLE,
+    PENDING_QUEUE_PUBLISH_SOURCE_TABLE, REALM_USER_UPDATE_ADMISSION_TABLE,
+    REALM_USER_UPDATE_CLAIM_TABLE,
     REALM_USER_UPDATE_DEPENDENCY_FRAGMENT_TABLE,
 };
 
 #[cfg(test)]
 use super::RETIRED_REALM_USER_UPDATE_CLAIM_V1_TABLE;
 
-// v5 replaces the opaque-slot claim v1 physical key with an addressable
-// network/authority/activation/pending/proc/bucket v2 key. A v4 VERIFIED
-// receipt cannot authorize this physically different scanner contract.
-pub const PENDING_QUEUE_SIDECAR_SCHEMA_VERSION: u16 = 5;
-pub const PENDING_QUEUE_SIDECAR_TARGET_TABLE_COUNT: usize = 14;
+// v6 adds the independent, full-payload claim-admission journal. A v5
+// VERIFIED receipt cannot authorize a writer that lacks the admission-close
+// fence, ordinal and generation manifest contract.
+pub const PENDING_QUEUE_SIDECAR_SCHEMA_VERSION: u16 = 6;
+pub const PENDING_QUEUE_SIDECAR_TARGET_TABLE_COUNT: usize = 15;
 const FINGERPRINT_DOMAIN: &[u8] =
-    b"psy/rollback/pending-queue-sidecar-schema/v5";
+    b"psy/rollback/pending-queue-sidecar-schema/v6";
 const INSPECT_COLUMNS_CQL: &str = "SELECT column_name, type, kind, position, clustering_order FROM system_schema.columns WHERE keyspace_name = ? AND table_name = ?";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -76,6 +77,7 @@ pub enum PendingQueueSidecarPhysicalTable {
     SegmentLifecycle = 12,
     UserUpdateClaim = 13,
     UserUpdateDependencyFragment = 14,
+    UserUpdateAdmission = 15,
 }
 
 impl PendingQueueSidecarPhysicalTable {
@@ -94,6 +96,7 @@ impl PendingQueueSidecarPhysicalTable {
         Self::SegmentLifecycle,
         Self::UserUpdateClaim,
         Self::UserUpdateDependencyFragment,
+        Self::UserUpdateAdmission,
     ];
 
     pub const fn table_name(self) -> &'static str {
@@ -112,6 +115,7 @@ impl PendingQueueSidecarPhysicalTable {
             Self::SegmentLifecycle => PENDING_QUEUE_SEGMENT_LIFECYCLE_TABLE,
             Self::UserUpdateClaim => REALM_USER_UPDATE_CLAIM_TABLE,
             Self::UserUpdateDependencyFragment => REALM_USER_UPDATE_DEPENDENCY_FRAGMENT_TABLE,
+            Self::UserUpdateAdmission => REALM_USER_UPDATE_ADMISSION_TABLE,
         }
     }
 
@@ -264,7 +268,7 @@ const fn regular(
     PendingQueueSidecarColumnSpec { table, name, cql_type, kind: PendingQueueSidecarColumnKind::Regular, position: -1, clustering_order: PendingQueueSidecarClusteringOrder::None }
 }
 
-pub const PENDING_QUEUE_SIDECAR_EXPECTED_COLUMNS: [PendingQueueSidecarColumnSpec; 72] = [
+pub const PENDING_QUEUE_SIDECAR_EXPECTED_COLUMNS: [PendingQueueSidecarColumnSpec; 82] = [
     pk(PendingQueueSidecarPhysicalTable::Pipeline, "network_chain_id", "bigint", 0),
     pk(PendingQueueSidecarPhysicalTable::Pipeline, "authority_kind", "tinyint", 1),
     pk(PendingQueueSidecarPhysicalTable::Pipeline, "realm_id", "bigint", 2),
@@ -337,6 +341,16 @@ pub const PENDING_QUEUE_SIDECAR_EXPECTED_COLUMNS: [PendingQueueSidecarColumnSpec
     regular(PendingQueueSidecarPhysicalTable::UserUpdateDependencyFragment, "component_digest", "blob"),
     regular(PendingQueueSidecarPhysicalTable::UserUpdateDependencyFragment, "payload", "blob"),
     regular(PendingQueueSidecarPhysicalTable::UserUpdateDependencyFragment, "payload_digest", "blob"),
+    pk(PendingQueueSidecarPhysicalTable::UserUpdateAdmission, "network_chain_id", "bigint", 0),
+    pk(PendingQueueSidecarPhysicalTable::UserUpdateAdmission, "authority_kind", "tinyint", 1),
+    pk(PendingQueueSidecarPhysicalTable::UserUpdateAdmission, "realm_id", "bigint", 2),
+    pk(PendingQueueSidecarPhysicalTable::UserUpdateAdmission, "realm_sub_id", "int", 3),
+    pk(PendingQueueSidecarPhysicalTable::UserUpdateAdmission, "activation_digest", "blob", 4),
+    pk(PendingQueueSidecarPhysicalTable::UserUpdateAdmission, "unique_pending_id", "bigint", 5),
+    pk(PendingQueueSidecarPhysicalTable::UserUpdateAdmission, "proc_checkpoint_id", "blob", 6),
+    pk(PendingQueueSidecarPhysicalTable::UserUpdateAdmission, "admission_shard", "smallint", 7),
+    regular(PendingQueueSidecarPhysicalTable::UserUpdateAdmission, "revision", "bigint"),
+    regular(PendingQueueSidecarPhysicalTable::UserUpdateAdmission, "admission_payload", "blob"),
 ];
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -480,6 +494,7 @@ impl PendingQueueSidecarSchemaMaterializer {
         ScyllaPendingQueueArtifactStore::create_schema(session, &keyspaces.artifact_keyspaces()?).await.map_err(sidecar)?;
         ScyllaPendingQueuePublishStore::create_schema(session, &keyspaces.publish_keyspaces()?).await.map_err(sidecar)?;
         ScyllaRealmUserUpdateClaimStore::create_schema(session, &keyspaces.control).await.map_err(sidecar)?;
+        ScyllaRealmUserUpdateAdmissionStore::create_schema(session, &keyspaces.control).await.map_err(sidecar)?;
         ScyllaRealmUserUpdateDependencyStore::create_schema(
             session,
             &PendingQueueArtifactDataKeyspace::try_new(keyspaces.data.as_str().to_owned())
@@ -525,12 +540,12 @@ mod tests {
     }
 
     #[test]
-    fn exact_manifest_is_fourteen_unique_tables_with_stable_placement() {
-        assert_eq!(PendingQueueSidecarPhysicalTable::ALL.len(), 14);
+    fn exact_manifest_is_fifteen_unique_tables_with_stable_placement() {
+        assert_eq!(PendingQueueSidecarPhysicalTable::ALL.len(), 15);
         let names = PendingQueueSidecarPhysicalTable::ALL.iter().map(|table| table.table_name()).collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(names.len(), 14);
+        assert_eq!(names.len(), 15);
         assert_eq!(PendingQueueSidecarPhysicalTable::ALL.iter().filter(|table| table.keyspace_kind() == PendingQueueSidecarKeyspaceKind::StandardData).count(), 3);
-        assert_eq!(PendingQueueSidecarPhysicalTable::ALL.iter().filter(|table| table.keyspace_kind() == PendingQueueSidecarKeyspaceKind::NoTabletControl).count(), 11);
+        assert_eq!(PendingQueueSidecarPhysicalTable::ALL.iter().filter(|table| table.keyspace_kind() == PendingQueueSidecarKeyspaceKind::NoTabletControl).count(), 12);
         assert!(!names.contains(RETIRED_V1_PIPELINE_TABLE));
         assert!(!names.contains(RETIRED_REALM_USER_UPDATE_CLAIM_V1_TABLE));
         assert_ne!(pending_queue_sidecar_schema_fingerprint().as_bytes(), &[0; 32]);
@@ -542,6 +557,12 @@ mod tests {
         let mut missing = exact_columns();
         missing.retain(|column| column.table != PendingQueueSidecarPhysicalTable::ConsumerGate);
         assert!(matches!(inspect_pending_queue_sidecar_columns(missing, false).unwrap(), PendingQueueSidecarSchemaInspection::Partial { .. }));
+        // A complete v5 deployment is not silently authorized as v6: the
+        // admission fence is a required physical target, not an optional
+        // capability inferred from the lifecycle row.
+        let mut old_v5 = exact_columns();
+        old_v5.retain(|column| column.table != PendingQueueSidecarPhysicalTable::UserUpdateAdmission);
+        assert!(matches!(inspect_pending_queue_sidecar_columns(old_v5, false).unwrap(), PendingQueueSidecarSchemaInspection::Partial { missing, .. } if missing == vec![PendingQueueSidecarPhysicalTable::UserUpdateAdmission]));
         let mut old_thirteen = exact_columns();
         old_thirteen.retain(|column| column.table != PendingQueueSidecarPhysicalTable::UserUpdateDependencyFragment);
         assert!(matches!(inspect_pending_queue_sidecar_columns(old_thirteen, false).unwrap(), PendingQueueSidecarSchemaInspection::Partial { missing, .. } if missing == vec![PendingQueueSidecarPhysicalTable::UserUpdateDependencyFragment]));

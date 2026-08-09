@@ -1067,6 +1067,7 @@ mod tests {
             UserId::new(11),
             request_digest,
             RealmUserUpdateCreatedAtSeconds::try_new(12).unwrap(),
+            crate::queue::realm_user_update_claim::RealmUserUpdateAdmissionOrdinal::FIRST,
         )
         .unwrap();
         let queue_item = PsyRealmUserUpdateQueueItem::new(
@@ -1111,6 +1112,7 @@ mod tests {
             claim.user_id(),
             claim.request_digest(),
             RealmUserUpdateCreatedAtSeconds::try_new(13).unwrap(),
+            claim.admission_ordinal(),
         )
         .unwrap();
         assert!(claim.same_request_as(&same_request_losing_time));

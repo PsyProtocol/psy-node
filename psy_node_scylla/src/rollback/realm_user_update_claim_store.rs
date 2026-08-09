@@ -21,7 +21,11 @@ use scylla::{
     value::{CqlValue, Row},
 };
 
-use super::BranchExactDeploymentNoTabletKeyspace;
+use super::{
+    realm_generation_scope::{bind_realm_generation, RealmGenerationBindError},
+    realm_user_update_admission_store::PersistedRealmUserUpdateClaimingReceipt,
+    BranchExactDeploymentNoTabletKeyspace,
+};
 
 pub(super) const REALM_USER_UPDATE_CLAIM_TABLE: &str =
     "branch_exact_realm_user_update_claim_v2";
@@ -131,22 +135,16 @@ fn bind_partition(
     partition: RealmUserUpdateClaimPartition,
 ) -> Result<ClaimPartitionBind, RealmUserUpdateClaimStoreError> {
     let capture = partition.capture();
-    let psy_data::protocol::chain_context::AuthorityScope::Realm {
-        realm_id,
-        realm_sub_id,
-    } = capture.key().authority()
-    else {
-        return Err(RealmUserUpdateClaimStoreError::InvalidAuthority);
-    };
+    let (network, kind, realm, sub, activation, pending, proc_id) =
+        bind_realm_generation(capture).map_err(generation_bind)?;
     Ok((
-        i64::from(capture.key().network().chain_id()),
-        1,
-        i64::from(realm_id),
-        i32::from(realm_sub_id),
-        capture.activation().as_bytes().to_vec(),
-        i64::try_from(capture.processing().pending_id().get())
-            .map_err(|_| RealmUserUpdateClaimStoreError::PendingOutOfRange)?,
-        capture.processing().proc_checkpoint_id().as_bytes().to_vec(),
+        network,
+        kind,
+        realm,
+        sub,
+        activation,
+        pending,
+        proc_id,
         partition.bucket().as_i16().map_err(model)?,
     ))
 }
@@ -406,7 +404,24 @@ impl ScyllaRealmUserUpdateClaimStore {
     /// Claim one pending/user coordinate. A retry with the same full request
     /// identity resumes the winner and therefore reuses its timestamp/status;
     /// a different request returns a durable conflict.
-    pub async fn claim<Hash: Q256BitHash>(
+    pub(crate) async fn claim<Hash: Q256BitHash>(
+        &self,
+        receipt: &PersistedRealmUserUpdateClaimingReceipt<Hash>,
+    ) -> Result<RealmUserUpdateClaimWriteOutcome<Hash>, RealmUserUpdateClaimStoreError> {
+        self.claim_candidate(receipt.candidate()).await
+    }
+
+    /// Retained only so the historical v5 RF=3 fixture can compile. It is not
+    /// present in production builds and cannot authorize the v6 writer.
+    #[cfg(test)]
+    pub(crate) async fn claim_retired_v5_fixture<Hash: Q256BitHash>(
+        &self,
+        candidate: &StoredRealmUserUpdateClaim<Hash>,
+    ) -> Result<RealmUserUpdateClaimWriteOutcome<Hash>, RealmUserUpdateClaimStoreError> {
+        self.claim_candidate(candidate).await
+    }
+
+    async fn claim_candidate<Hash: Q256BitHash>(
         &self,
         candidate: &StoredRealmUserUpdateClaim<Hash>,
     ) -> Result<RealmUserUpdateClaimWriteOutcome<Hash>, RealmUserUpdateClaimStoreError> {
@@ -635,6 +650,17 @@ fn decode_applied(result: QueryResult) -> Result<bool, RealmUserUpdateClaimStore
 
 fn model(error: RealmUserUpdateClaimError) -> RealmUserUpdateClaimStoreError {
     RealmUserUpdateClaimStoreError::Claim(error.to_string())
+}
+
+fn generation_bind(error: RealmGenerationBindError) -> RealmUserUpdateClaimStoreError {
+    match error {
+        RealmGenerationBindError::RealmOnly => {
+            RealmUserUpdateClaimStoreError::InvalidAuthority
+        }
+        RealmGenerationBindError::PendingOutOfRange => {
+            RealmUserUpdateClaimStoreError::PendingOutOfRange
+        }
+    }
 }
 
 fn cql(error: impl fmt::Display) -> RealmUserUpdateClaimStoreError {

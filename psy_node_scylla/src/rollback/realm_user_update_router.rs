@@ -47,6 +47,7 @@ use super::{
     BranchExactDeploymentNoTabletKeyspace, PendingQueueArtifactDataKeyspace,
     PendingQueueSidecarReady, RealmUserUpdateClaimReadState,
     RealmUserUpdateClaimWriteOutcome, ScyllaRealmEdgeDurablePublisher,
+    ScyllaRealmUserUpdateAdmissionGuard, ScyllaRealmUserUpdateAdmissionStore,
     ScyllaRealmUserUpdateClaimStore, ScyllaRealmUserUpdateDependencyStore,
 };
 
@@ -74,7 +75,8 @@ pub(crate) struct ScyllaRealmUserUpdateDurableRouter<F, Hash, Hasher> {
     authority: AuthorityScope,
     global_user_tree_height: GlobalUserTreeHeight,
     realm_user_tree_height: u8,
-    claims: ScyllaRealmUserUpdateClaimStore,
+    claims: Arc<ScyllaRealmUserUpdateClaimStore>,
+    admission_guard: ScyllaRealmUserUpdateAdmissionGuard,
     dependencies: ScyllaRealmUserUpdateDependencyStore,
     publisher: ScyllaRealmEdgeDurablePublisher<F, Hash>,
     _hasher: PhantomData<Hasher>,
@@ -115,12 +117,24 @@ where
             keyspaces.data().as_str().to_owned(),
         )
         .map_err(router)?;
-        let claims = ScyllaRealmUserUpdateClaimStore::prepare(
+        let claims = Arc::new(ScyllaRealmUserUpdateClaimStore::prepare(
             session.clone(),
-            control,
+            control.clone(),
         )
         .await
-        .map_err(router)?;
+        .map_err(router)?);
+        let admission_gates = Arc::new(
+            ScyllaRealmUserUpdateAdmissionStore::prepare(
+                session.clone(),
+                control,
+            )
+            .await
+            .map_err(router)?,
+        );
+        let admission_guard = ScyllaRealmUserUpdateAdmissionGuard::new(
+            admission_gates,
+            claims.clone(),
+        );
         let dependencies = ScyllaRealmUserUpdateDependencyStore::prepare(
             session.clone(),
             data,
@@ -143,6 +157,7 @@ where
             global_user_tree_height,
             realm_user_tree_height,
             claims,
+            admission_guard,
             dependencies,
             publisher,
             _hasher: PhantomData,
@@ -168,54 +183,36 @@ where
     ) -> Result<StoredRealmUserUpdateClaim<Hash>, RealmUserUpdateRouterError> {
         let user_id = verified_request.user_id();
         self.validate_user(user_id)?;
-        let candidate = StoredRealmUserUpdateClaim::claimed(
-            admission,
-            user_id,
-            verified_request.request_digest(),
-            created_at,
-        )
-        .map_err(router)?;
-        self.validate_claim_scope(&candidate)?;
-
-        // Point-read the exact durable coordinate before revalidating the live
-        // generation. If IF NOT EXISTS applied but its response was lost, the
-        // same sealed request must remain resumable even after generation
-        // rotation. Only a genuinely new claim is authorized by a fresh
-        // admission check.
-        match self
-            .claims
-            .read(candidate.partition().map_err(router)?, candidate.user_id())
+        if let Some(current) = self
+            .admission_guard
+            .resume_existing(
+                admission.clone(),
+                user_id,
+                verified_request.request_digest(),
+                created_at,
+            )
             .await
             .map_err(router)?
         {
-            RealmUserUpdateClaimReadState::Current(current)
-                if current.same_request_as(&candidate) => return Ok(current),
-            RealmUserUpdateClaimReadState::Current(current) => {
-                return Err(RealmUserUpdateRouterError::ClaimConflict {
-                    current_phase: current.phase(),
-                    current_revision: current.revision().get(),
-                });
-            }
-            RealmUserUpdateClaimReadState::Uninitialized => {}
+            self.validate_claim_scope(&current)?;
+            return Ok(current);
         }
-
-        let reconstructed_admission = candidate.reconstruct_admission().map_err(router)?;
         self.publisher
-            .revalidate_admission(&reconstructed_admission)
+            .revalidate_admission(&admission)
             .await
             .map_err(router)?;
-        match self.claims.claim(&candidate).await.map_err(router)? {
-            RealmUserUpdateClaimWriteOutcome::Applied(receipt)
-            | RealmUserUpdateClaimWriteOutcome::Resumed(receipt) => {
-                Ok(receipt.current().clone())
-            }
-            RealmUserUpdateClaimWriteOutcome::Conflict(current) => {
-                Err(RealmUserUpdateRouterError::ClaimConflict {
-                    current_phase: current.phase(),
-                    current_revision: current.revision().get(),
-                })
-            }
-        }
+        let current = self
+            .admission_guard
+            .claim(
+                admission,
+                user_id,
+                verified_request.request_digest(),
+                created_at,
+            )
+            .await
+            .map_err(router)?;
+        self.validate_claim_scope(&current)?;
+        Ok(current)
     }
 
     /// Complete a live request whose five artifacts were validated against the
@@ -625,13 +622,16 @@ mod tests {
     fn new_claim_revalidation_preserves_response_loss_resume_order() {
         let source = include_str!("realm_user_update_router.rs");
         let source = source.split("#[cfg(test)]").next().unwrap();
-        let read = source.find(".read(candidate.partition()").unwrap();
+        let resume = source.find(".resume_existing(").unwrap();
         let revalidate = source
-            .find(".revalidate_admission(&reconstructed_admission)")
+            .find(".revalidate_admission(&admission)")
             .unwrap();
-        let claim = source.find("self.claims.claim(&candidate)").unwrap();
-        assert!(read < revalidate && revalidate < claim);
-        assert!(source.contains("current.same_request_as(&candidate) => return Ok(current)"));
+        let claim = source
+            .find(".claim(\n                admission,")
+            .unwrap();
+        assert!(resume < revalidate && revalidate < claim);
+        assert!(!source.contains("self.claims.claim("));
+        assert!(source.contains("self.validate_claim_scope(&current)?"));
     }
 
     #[test]
@@ -639,12 +639,11 @@ mod tests {
         let source = include_str!("realm_user_update_router.rs");
         let source = source.split("#[cfg(test)]").next().unwrap();
         let validate = source.find("self.validate_user(user_id)?").unwrap();
-        let read = source.find(".read(candidate.partition()").unwrap();
-        assert!(validate < read);
+        let guarded = source.find(".resume_existing(").unwrap();
+        assert!(validate < guarded);
         assert!(source.contains("self.global_user_tree_height"));
         assert!(source.contains("self.realm_user_tree_height"));
         assert!(source.contains("RealmUserUpdateRouterError::InvalidUserRange"));
-        assert!(source.contains("self.validate_claim_scope(&candidate)?"));
         assert!(source.contains("self.validate_claim_scope(&current)?"));
         assert!(source.contains("claim.pending().chain().network_id() != self.network"));
         assert!(source.contains("verified_request: &VerifiedRealmUserUpdateRequest"));

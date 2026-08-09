@@ -28,9 +28,11 @@ use super::{
 };
 
 const MAGIC: &[u8; 8] = b"PSYRUCIM";
-const CODEC_VERSION: u16 = 2;
+const CODEC_VERSION: u16 = 3;
 const SLOT_DOMAIN: &[u8] = b"psy/rollback/realm-user-update-claim-slot/v1";
 const STATE_DOMAIN: &[u8] = b"psy/rollback/realm-user-update-claim-state/v1";
+const ADMISSION_COMMITMENT_DOMAIN: &[u8] =
+    b"psy/rollback/realm-user-update-admission-commitment/v1";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct RealmUserUpdateClaimSlot([u8; 32]);
@@ -77,6 +79,26 @@ impl RealmUserUpdateClaimSlot {
         } else {
             Ok(Self(bytes))
         }
+    }
+}
+
+/// Immutable contribution used by the admission-close set commitment. It
+/// deliberately excludes mutable phase/revision fields, so a claim may finish
+/// after admission closes without changing the accepted set.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RealmUserUpdateAdmissionCommitment([u8; 32]);
+
+impl RealmUserUpdateAdmissionCommitment {
+    pub fn try_new(bytes: [u8; 32]) -> Result<Self, RealmUserUpdateClaimError> {
+        if bytes == [0; 32] {
+            Err(RealmUserUpdateClaimError::EmptyDigest)
+        } else {
+            Ok(Self(bytes))
+        }
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
     }
 }
 
@@ -182,6 +204,38 @@ impl RealmUserUpdateClaimRevision {
     }
 }
 
+/// Per-bucket admission order assigned by the durable admission gate.
+///
+/// The ordinal is immutable, starts at one, and is persisted in every claim
+/// phase so a closed bucket can prove there are no missing or duplicate
+/// accepted rows. It is not a physical clustering key.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RealmUserUpdateAdmissionOrdinal(u64);
+
+impl RealmUserUpdateAdmissionOrdinal {
+    pub const FIRST: Self = Self(1);
+
+    pub fn try_new(value: u64) -> Result<Self, RealmUserUpdateClaimError> {
+        if value == 0 || value > i64::MAX as u64 {
+            Err(RealmUserUpdateClaimError::InvalidAdmissionOrdinal(value))
+        } else {
+            Ok(Self(value))
+        }
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    pub fn next(self) -> Result<Self, RealmUserUpdateClaimError> {
+        Self::try_new(
+            self.0
+                .checked_add(1)
+                .ok_or(RealmUserUpdateClaimError::AdmissionOrdinalOverflow)?,
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct RealmUserUpdateCreatedAtSeconds(u32);
 
@@ -259,6 +313,7 @@ impl RealmUserUpdateClaimPhase {
 pub struct StoredRealmUserUpdateClaim<Hash> {
     slot: RealmUserUpdateClaimSlot,
     bucket: RealmUserUpdateClaimBucket,
+    admission_ordinal: RealmUserUpdateAdmissionOrdinal,
     revision: RealmUserUpdateClaimRevision,
     pending: PendingContext<Hash>,
     capture_activation_digest: [u8; 32],
@@ -280,6 +335,7 @@ impl<Hash: Q256BitHash> StoredRealmUserUpdateClaim<Hash> {
         user_id: UserId,
         request_digest: RealmUserUpdateRequestDigest,
         created_at: RealmUserUpdateCreatedAtSeconds,
+        admission_ordinal: RealmUserUpdateAdmissionOrdinal,
     ) -> Result<Self, RealmUserUpdateClaimError> {
         let slot = RealmUserUpdateClaimSlot::for_admission(&admission)?;
         let bucket = RealmUserUpdateClaimBucket::for_user(user_id);
@@ -289,6 +345,7 @@ impl<Hash: Q256BitHash> StoredRealmUserUpdateClaim<Hash> {
         let mut value = Self {
             slot,
             bucket,
+            admission_ordinal,
             revision: RealmUserUpdateClaimRevision::INITIAL,
             pending,
             capture_activation_digest,
@@ -357,6 +414,7 @@ impl<Hash: Q256BitHash> StoredRealmUserUpdateClaim<Hash> {
     pub fn same_request_as(&self, candidate: &Self) -> bool {
         self.slot == candidate.slot
             && self.bucket == candidate.bucket
+            && self.admission_ordinal == candidate.admission_ordinal
             && self.pending == candidate.pending
             && self.capture_activation_digest
                 == candidate.capture_activation_digest
@@ -365,6 +423,18 @@ impl<Hash: Q256BitHash> StoredRealmUserUpdateClaim<Hash> {
             && self.user_id == candidate.user_id
             && self.request_digest == candidate.request_digest
             && self.stable_status == candidate.stable_status
+    }
+
+    /// Compare only the immutable identity accepted by the admission gate.
+    /// Mutable phase/revision and dependency/publish receipts are excluded so
+    /// gate recovery remains valid if another retry already advanced the row.
+    pub fn same_admitted_identity_as(
+        &self,
+        candidate: &Self,
+    ) -> Result<bool, RealmUserUpdateClaimError> {
+        Ok(self.admission_ordinal == candidate.admission_ordinal
+            && self.user_id == candidate.user_id
+            && self.admission_commitment()? == candidate.admission_commitment()?)
     }
 
     pub const fn slot(&self) -> RealmUserUpdateClaimSlot {
@@ -377,6 +447,10 @@ impl<Hash: Q256BitHash> StoredRealmUserUpdateClaim<Hash> {
 
     pub const fn bucket(&self) -> RealmUserUpdateClaimBucket {
         self.bucket
+    }
+
+    pub const fn admission_ordinal(&self) -> RealmUserUpdateAdmissionOrdinal {
+        self.admission_ordinal
     }
 
     pub fn partition(&self) -> Result<RealmUserUpdateClaimPartition, RealmUserUpdateClaimError> {
@@ -468,6 +542,25 @@ impl<Hash: Q256BitHash> StoredRealmUserUpdateClaim<Hash> {
         &self.state_digest
     }
 
+    pub fn admission_commitment(
+        &self,
+    ) -> Result<RealmUserUpdateAdmissionCommitment, RealmUserUpdateClaimError> {
+        let mut hasher = Sha256::new();
+        hasher.update(ADMISSION_COMMITMENT_DOMAIN);
+        hasher.update(self.slot.as_bytes());
+        hasher.update(self.bucket.get().to_be_bytes());
+        hasher.update(self.admission_ordinal.get().to_be_bytes());
+        hasher.update(self.pending.to_canonical_bytes());
+        hasher.update(self.capture_activation_digest);
+        hasher.update(self.capture_digest);
+        hasher.update(self.admission_digest);
+        hasher.update(self.user_id.get().to_be_bytes());
+        hasher.update(self.request_digest.as_bytes());
+        hasher.update(self.stable_status.to_be_bytes());
+        hasher.update(self.created_at.get().to_be_bytes());
+        RealmUserUpdateAdmissionCommitment::try_new(hasher.finalize().into())
+    }
+
     pub fn to_canonical_bytes(&self) -> Vec<u8> {
         let mut bytes = self.encode_without_digest();
         bytes.extend_from_slice(&self.state_digest);
@@ -489,6 +582,8 @@ impl<Hash: Q256BitHash> StoredRealmUserUpdateClaim<Hash> {
         }
         let slot = RealmUserUpdateClaimSlot::try_from_bytes(decoder.array32()?)?;
         let bucket = RealmUserUpdateClaimBucket::try_new(decoder.u16()?)?;
+        let admission_ordinal =
+            RealmUserUpdateAdmissionOrdinal::try_new(decoder.u64()?)?;
         let revision = RealmUserUpdateClaimRevision(decoder.u64()?);
         if revision.get() == 0 || revision.get() > i64::MAX as u64 {
             return Err(RealmUserUpdateClaimError::RevisionOutOfRange);
@@ -522,6 +617,7 @@ impl<Hash: Q256BitHash> StoredRealmUserUpdateClaim<Hash> {
         let value = Self {
             slot,
             bucket,
+            admission_ordinal,
             revision,
             pending,
             capture_activation_digest,
@@ -581,6 +677,7 @@ impl<Hash: Q256BitHash> StoredRealmUserUpdateClaim<Hash> {
         bytes.extend_from_slice(&CODEC_VERSION.to_be_bytes());
         bytes.extend_from_slice(self.slot.as_bytes());
         bytes.extend_from_slice(&self.bucket.get().to_be_bytes());
+        bytes.extend_from_slice(&self.admission_ordinal.get().to_be_bytes());
         bytes.extend_from_slice(&self.revision.get().to_be_bytes());
         bytes.extend_from_slice(&self.pending.to_canonical_bytes());
         bytes.extend_from_slice(&self.capture_activation_digest);
@@ -686,6 +783,8 @@ pub enum RealmUserUpdateClaimError {
     InvalidCreatedAt,
     RealmOnly,
     InvalidBucket(u16),
+    InvalidAdmissionOrdinal(u64),
+    AdmissionOrdinalOverflow,
     UserOutOfRange,
     RevisionOverflow,
     RevisionOutOfRange,
@@ -780,6 +879,7 @@ mod tests {
             UserId::new(13),
             RealmUserUpdateRequestDigest::derive(b"canonical-input", b"proof").unwrap(),
             RealmUserUpdateCreatedAtSeconds::try_new(1234).unwrap(),
+            RealmUserUpdateAdmissionOrdinal::FIRST,
         )
         .unwrap()
     }
@@ -815,6 +915,11 @@ mod tests {
         assert_eq!(dependencies.revision().get(), 3);
         assert_eq!(published.revision().get(), 4);
         assert_eq!(published.phase(), RealmUserUpdateClaimPhase::Published);
+        assert_eq!(published.admission_ordinal(), RealmUserUpdateAdmissionOrdinal::FIRST);
+        assert_eq!(
+            claimed.admission_commitment().unwrap(),
+            published.admission_commitment().unwrap()
+        );
         assert!(StoredRealmUserUpdateClaim::published(
             &claimed,
             RealmUserUpdatePublishReceiptDigest::try_new([8; 32]).unwrap(),
@@ -831,6 +936,7 @@ mod tests {
             claimed.user_id(),
             same_digest,
             RealmUserUpdateCreatedAtSeconds::try_new(9999).unwrap(),
+            claimed.admission_ordinal(),
         )
         .unwrap();
         assert_ne!(changed_frontier.slot(), claimed.slot());
@@ -843,6 +949,7 @@ mod tests {
                 claimed.user_id(),
                 same_digest,
                 RealmUserUpdateCreatedAtSeconds::try_new(9999).unwrap(),
+                claimed.admission_ordinal(),
             )
             .unwrap();
             assert_ne!(other.slot(), claimed.slot());
@@ -859,11 +966,28 @@ mod tests {
             claimed.user_id(),
             claimed.request_digest(),
             RealmUserUpdateCreatedAtSeconds::try_new(9999).unwrap(),
+            claimed.admission_ordinal(),
         )
         .unwrap();
         assert_ne!(same, claimed);
         assert!(claimed.same_request_as(&same));
         assert_eq!(claimed.created_at().get(), 1234);
+
+        let different_ordinal = StoredRealmUserUpdateClaim::claimed(
+            admission(1, 12),
+            claimed.user_id(),
+            claimed.request_digest(),
+            RealmUserUpdateCreatedAtSeconds::try_new(9999).unwrap(),
+            RealmUserUpdateAdmissionOrdinal::try_new(2).unwrap(),
+        )
+        .unwrap();
+        assert!(!claimed.same_request_as(&different_ordinal));
+        assert_ne!(
+            claimed.admission_commitment().unwrap(),
+            different_ordinal.admission_commitment().unwrap()
+        );
+        assert!(RealmUserUpdateAdmissionOrdinal::try_new(0).is_err());
+        assert!(RealmUserUpdateAdmissionOrdinal::try_new(i64::MAX as u64 + 1).is_err());
 
         let mut malformed = claimed.to_canonical_bytes();
         let last = malformed.len() - 1;
