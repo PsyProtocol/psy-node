@@ -21,6 +21,7 @@ pub mod realm_prepared_payload;
 pub mod realm_proof_binding;
 pub mod realm_imt_mutation_graph;
 pub mod realm_processor_quiescence;
+pub mod realm_processor_startup;
 pub mod rollback_admin;
 pub mod rollback_admission;
 pub mod rollback_control;

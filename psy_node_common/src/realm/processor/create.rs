@@ -10,7 +10,7 @@ use psy_node_core::{
     genesis::genesis_db_data_builder::GenesisDatabaseDataBuilder, p2p::traits::realm_coordinantor::RealmCoordinatorClient, psy_core_db::traits::full::{PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmProcessorStore}, psy_temp_db::StandardProcessorTempDBStoreBase, queue::{
         ephemeral::QStandardEphemeralQueueSubscriber,
         worker_queue::{QStandardWorkerQueuePublisher, QStandardWorkerQueueSubscriber},
-    }, store::traits::proof_store::{QCanonicalProofStoreV2, QParthProofStore}
+    }, store::{realm_processor_startup::{authorize_realm_processor_startup, RealmProcessorStartupAuthorization, RealmProcessorStartupError, RealmProcessorStartupMode, RealmProcessorStartupPreflightProvider}, traits::proof_store::{QCanonicalProofStoreV2, QParthProofStore}}
 };
 
 use crate::realm::processor::{core::{PsyRealmProcessor, runner::run_realm_processor}, db::PsyRealmDatabaseProcessor};
@@ -40,6 +40,8 @@ pub async fn create_realm_processor<
     realm_identifier: QRealmIdentifier,
     circuit_fingerprint_config: PsyNodeCircuitFingerprintConfig<N::QHash>,
     coordinator_client: Arc<CoordinatorClient>,
+    startup_mode: RealmProcessorStartupMode,
+    startup_preflight: Option<Arc<dyn RealmProcessorStartupPreflightProvider>>,
 ) -> anyhow::Result<(
     PsyRealmProcessor<
         N,
@@ -57,6 +59,23 @@ pub async fn create_realm_processor<
 where
     FileSystem::File: Send + Sync,
 {
+    if let RealmProcessorStartupMode::RequireBranchExact(expectation) = startup_mode {
+        if expectation.network().chain_id() != chain_id
+            || expectation.realm_id() != realm_identifier.realm_id
+            || expectation.realm_sub_id() != realm_identifier.realm_sub_id
+        {
+            return Err(RealmProcessorStartupError::AuthorityMismatch.into());
+        }
+    }
+    let startup_authorization =
+        authorize_realm_processor_startup(startup_mode, startup_preflight.as_deref()).await?;
+    if matches!(
+        startup_authorization,
+        RealmProcessorStartupAuthorization::BranchExact(_)
+    ) {
+        return Err(RealmProcessorStartupError::CompositionNotIntegrated.into());
+    }
+
     tracing::info!("[REALM_CREATE] setup_for_realm start");
     let genesis =
         GenesisDatabaseDataBuilder::<N::F, N::QHash>::setup_for_realm::<N::HasherBase, N>(
@@ -198,6 +217,8 @@ pub async fn create_realm_processor_and_run<
     realm_identifier: QRealmIdentifier,
     circuit_fingerprint_config: PsyNodeCircuitFingerprintConfig<N::QHash>,
     coordinator_client: Arc<CoordinatorClient>,
+    startup_mode: RealmProcessorStartupMode,
+    startup_preflight: Option<Arc<dyn RealmProcessorStartupPreflightProvider>>,
 ) -> anyhow::Result<()>
 where
     FileSystem::File: Send + Sync,
@@ -218,6 +239,8 @@ where
         realm_identifier,
         circuit_fingerprint_config,
         coordinator_client,
+        startup_mode,
+        startup_preflight,
     )
     .await?;
 
@@ -225,4 +248,45 @@ where
     run_realm_processor(processor, guta_gatherer_join_handle).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn startup_preflight_precedes_every_realm_startup_side_effect() {
+        let source = include_str!("create.rs");
+        let function = source
+            .split("pub async fn create_realm_processor<")
+            .nth(1)
+            .expect("create_realm_processor must remain present");
+        let preflight = function
+            .find("authorize_realm_processor_startup(")
+            .expect("startup must authorize at the real creation entrance");
+        for side_effect in [
+            "GenesisDatabaseDataBuilder::<",
+            "PsyRealmDatabaseProcessor::<",
+            "PsyRealmProcessor::new(",
+        ] {
+            assert!(
+                preflight < function.find(side_effect).expect("startup step must remain present"),
+                "preflight must precede {side_effect}"
+            );
+        }
+    }
+
+    #[test]
+    fn enabled_permit_is_rejected_until_production_composition_is_integrated() {
+        let source = include_str!("create.rs");
+        let function = source
+            .split("pub async fn create_realm_processor<")
+            .nth(1)
+            .expect("create_realm_processor must remain present");
+        let rejection = function
+            .find("RealmProcessorStartupError::CompositionNotIntegrated")
+            .expect("enabled startup must remain fail closed");
+        let first_side_effect = function
+            .find("GenesisDatabaseDataBuilder::<")
+            .expect("genesis builder must remain present");
+        assert!(rejection < first_side_effect);
+    }
 }
