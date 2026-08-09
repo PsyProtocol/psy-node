@@ -412,7 +412,7 @@ impl ScyllaRealmUserUpdateClaimStore {
     }
 
     /// Retained only so the historical v5 RF=3 fixture can compile. It is not
-    /// present in production builds and cannot authorize the v6 writer.
+    /// present in production builds and cannot authorize the v7 writer.
     #[cfg(test)]
     pub(crate) async fn claim_retired_v5_fixture<Hash: Q256BitHash>(
         &self,

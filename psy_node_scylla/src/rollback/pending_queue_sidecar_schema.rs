@@ -51,13 +51,13 @@ use super::{
 #[cfg(test)]
 use super::RETIRED_REALM_USER_UPDATE_CLAIM_V1_TABLE;
 
-// v6 adds the independent, full-payload claim-admission journal. A v5
-// VERIFIED receipt cannot authorize a writer that lacks the admission-close
-// fence, ordinal and generation manifest contract.
-pub const PENDING_QUEUE_SIDECAR_SCHEMA_VERSION: u16 = 6;
+// v7 upgrades the admission payload to include the terminal qualification
+// state and pre-publish pipeline fence. The physical set remains 15 tables,
+// but a v6 VERIFIED receipt cannot authorize the stronger payload semantics.
+pub const PENDING_QUEUE_SIDECAR_SCHEMA_VERSION: u16 = 7;
 pub const PENDING_QUEUE_SIDECAR_TARGET_TABLE_COUNT: usize = 15;
 const FINGERPRINT_DOMAIN: &[u8] =
-    b"psy/rollback/pending-queue-sidecar-schema/v6";
+    b"psy/rollback/pending-queue-sidecar-schema/v7";
 const INSPECT_COLUMNS_CQL: &str = "SELECT column_name, type, kind, position, clustering_order FROM system_schema.columns WHERE keyspace_name = ? AND table_name = ?";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -541,6 +541,7 @@ mod tests {
 
     #[test]
     fn exact_manifest_is_fifteen_unique_tables_with_stable_placement() {
+        assert_eq!(PENDING_QUEUE_SIDECAR_SCHEMA_VERSION, 7);
         assert_eq!(PendingQueueSidecarPhysicalTable::ALL.len(), 15);
         let names = PendingQueueSidecarPhysicalTable::ALL.iter().map(|table| table.table_name()).collect::<std::collections::BTreeSet<_>>();
         assert_eq!(names.len(), 15);
@@ -557,7 +558,7 @@ mod tests {
         let mut missing = exact_columns();
         missing.retain(|column| column.table != PendingQueueSidecarPhysicalTable::ConsumerGate);
         assert!(matches!(inspect_pending_queue_sidecar_columns(missing, false).unwrap(), PendingQueueSidecarSchemaInspection::Partial { .. }));
-        // A complete v5 deployment is not silently authorized as v6: the
+        // A complete v5 deployment is not silently authorized as v7: the
         // admission fence is a required physical target, not an optional
         // capability inferred from the lifecycle row.
         let mut old_v5 = exact_columns();

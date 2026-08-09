@@ -7,10 +7,12 @@
 
 use std::{collections::HashSet, error::Error, fmt};
 
-use parth_core::protocol::core_types::Q256BitHash;
+use parth_core::{felt::QFelt64, protocol::core_types::Q256BitHash};
 use psy_data::protocol::{
     canonical_chain::NetworkId,
-    chain_context::AuthorityScope,
+    chain_context::{
+        AuthorityObservation, AuthorityScope, AUTHORITY_OBSERVATION_V1_LEN,
+    },
 };
 use sha2::{Digest, Sha256};
 
@@ -19,20 +21,27 @@ use crate::store::{
         PendingGenerationActivationDigest, PendingGenerationContext,
         PendingGenerationLedgerKey,
     },
+    pending_generation_pipeline::{PendingPipelineRevision, StoredPendingPipeline},
     typed::UserId,
 };
 
 use super::{
     realm_user_update_claim::{
+        RealmUserUpdateAdmissionCommitment, RealmUserUpdateAdmissionOrdinal,
         RealmUserUpdateClaimBucket, RealmUserUpdateClaimPartition,
-        StoredRealmUserUpdateClaim,
+        RealmUserUpdateClaimPhase, RealmUserUpdateDependencyDigest,
+        RealmUserUpdatePublishReceiptDigest, StoredRealmUserUpdateClaim,
+    },
+    realm_user_update_publish::{
+        RealmUserUpdateIntentId, RealmUserUpdatePublishReceipt,
+        RealmUserUpdatePublishRequest,
     },
     recoverable_ephemeral::PendingQueueCaptureContext,
 };
 
 const MAGIC: &[u8; 8] = b"PSYRUADM";
-const CODEC_VERSION: u16 = 1;
-const STATE_DOMAIN: &[u8] = b"psy/rollback/realm-user-update-admission-state/v1";
+const CODEC_VERSION: u16 = 2;
+const STATE_DOMAIN: &[u8] = b"psy/rollback/realm-user-update-admission-state/v2";
 const CONTRIBUTION_DOMAIN: &[u8] =
     b"psy/rollback/realm-user-update-admission-set-contribution/v1";
 const BUCKET_MANIFEST_DOMAIN: &[u8] =
@@ -41,6 +50,12 @@ const GENERATION_MANIFEST_DOMAIN: &[u8] =
     b"psy/rollback/realm-user-update-admission-generation-manifest/v1";
 const CLOSE_INTENT_DOMAIN: &[u8] =
     b"psy/rollback/realm-user-update-admission-close-intent/v1";
+const TERMINAL_EVIDENCE_DOMAIN: &[u8] =
+    b"psy/rollback/realm-user-update-terminal-evidence/v1";
+const TERMINAL_SET_DOMAIN: &[u8] =
+    b"psy/rollback/realm-user-update-terminal-set/v1";
+const QUALIFICATION_DOMAIN: &[u8] =
+    b"psy/rollback/realm-user-update-generation-qualification/v1";
 const MAX_CLAIM_PAYLOAD_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -113,6 +128,8 @@ macro_rules! digest_type {
 
 digest_type!(RealmUserUpdateAdmissionCloseIntent);
 digest_type!(RealmUserUpdateAdmissionManifestDigest);
+digest_type!(RealmUserUpdateTerminalEvidenceDigest);
+digest_type!(RealmUserUpdateQualificationDigest);
 
 impl RealmUserUpdateAdmissionCloseIntent {
     pub fn derive(
@@ -290,6 +307,309 @@ impl RealmUserUpdateGenerationManifest {
     }
 }
 
+/// Exact pending-pipeline state which a terminal claim set authorizes.
+///
+/// The admission key already binds the activation digest and gathering
+/// generation.  The additional revision and full authority observation make
+/// a qualification unusable after any frontier/pipeline transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RealmUserUpdateQualificationFence<Hash> {
+    pipeline_revision: PendingPipelineRevision,
+    frontier: AuthorityObservation<Hash>,
+}
+
+impl<Hash: Q256BitHash> RealmUserUpdateQualificationFence<Hash> {
+    pub fn try_from_pipeline(
+        key: RealmUserUpdateAdmissionKey,
+        pipeline: &StoredPendingPipeline<Hash>,
+    ) -> Result<Self, RealmUserUpdateAdmissionError> {
+        let capture = key.capture();
+        if pipeline.key() != capture.key()
+            || pipeline.activation_digest() != capture.activation()
+            || pipeline.gathering() != capture.processing()
+            || pipeline.frontier().authority() != capture.key().authority()
+            || pipeline.frontier().chain().network_id() != capture.key().network()
+            || pipeline.blocked_reason().is_some()
+        {
+            return Err(RealmUserUpdateAdmissionError::PipelineFenceMismatch);
+        }
+        Ok(Self {
+            pipeline_revision: pipeline.revision(),
+            frontier: *pipeline.frontier(),
+        })
+    }
+
+    pub const fn pipeline_revision(self) -> PendingPipelineRevision {
+        self.pipeline_revision
+    }
+
+    pub const fn frontier(&self) -> &AuthorityObservation<Hash> {
+        &self.frontier
+    }
+
+    pub fn matches_pipeline(
+        &self,
+        key: RealmUserUpdateAdmissionKey,
+        pipeline: &StoredPendingPipeline<Hash>,
+    ) -> bool {
+        Self::try_from_pipeline(key, pipeline)
+            .is_ok_and(|current| current == *self)
+    }
+}
+
+/// Deterministic commitment to one accepted claim's exact durable terminal
+/// evidence.  Construction checks the immutable admission identity, the
+/// branch/frontier fence, the reconstructed request and the observed receipt.
+/// A public receipt remains a DTO; the Scylla layer must only call this after
+/// its private exact `SourceCommitted` permit has been observed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RealmUserUpdateTerminalEvidence {
+    bucket: RealmUserUpdateClaimBucket,
+    ordinal: RealmUserUpdateAdmissionOrdinal,
+    user_id: UserId,
+    admission_commitment: RealmUserUpdateAdmissionCommitment,
+    dependency_digest: RealmUserUpdateDependencyDigest,
+    receipt_digest: RealmUserUpdatePublishReceiptDigest,
+    intent_id: RealmUserUpdateIntentId,
+    assignment_digest: [u8; 32],
+    subject_sequence: u64,
+    envelope_digest: [u8; 32],
+    digest: RealmUserUpdateTerminalEvidenceDigest,
+}
+
+impl RealmUserUpdateTerminalEvidence {
+    pub fn try_from_observed<F: QFelt64, Hash: Q256BitHash>(
+        key: RealmUserUpdateAdmissionKey,
+        fence: &RealmUserUpdateQualificationFence<Hash>,
+        claim: &StoredRealmUserUpdateClaim<Hash>,
+        request: &RealmUserUpdatePublishRequest<F, Hash>,
+        receipt: &RealmUserUpdatePublishReceipt,
+    ) -> Result<Self, RealmUserUpdateAdmissionError> {
+        let dependency_digest = claim
+            .dependency_digest()
+            .ok_or(RealmUserUpdateAdmissionError::TerminalEvidenceMismatch)?;
+        let receipt_digest = claim
+            .publish_receipt_digest()
+            .ok_or(RealmUserUpdateAdmissionError::TerminalEvidenceMismatch)?;
+        let reconstructed_admission =
+            claim.reconstruct_admission().map_err(admission)?;
+        if claim.phase() != RealmUserUpdateClaimPhase::Published
+            || claim.partition().map_err(admission)?.capture() != key.capture()
+            || request.admission() != &reconstructed_admission
+            || request.user_id() != claim.user_id()
+            || request.request_digest() != claim.request_digest()
+            || request.pending().chain() != fence.frontier().chain()
+            || request.pending().authority() != fence.frontier().authority()
+            || request.intent_id() != receipt.intent_id()
+            || receipt_digest.as_bytes() != receipt.receipt_digest()
+        {
+            return Err(RealmUserUpdateAdmissionError::TerminalEvidenceMismatch);
+        }
+        let admission_commitment = claim.admission_commitment().map_err(admission)?;
+        let mut value = Self {
+            bucket: claim.bucket(),
+            ordinal: claim.admission_ordinal(),
+            user_id: claim.user_id(),
+            admission_commitment,
+            dependency_digest,
+            receipt_digest,
+            intent_id: receipt.intent_id(),
+            assignment_digest: *receipt.assignment_digest(),
+            subject_sequence: receipt.subject_sequence(),
+            envelope_digest: *receipt.envelope_digest(),
+            digest: RealmUserUpdateTerminalEvidenceDigest::try_new([1; 32])?,
+        };
+        value.digest = RealmUserUpdateTerminalEvidenceDigest::try_new(
+            value.compute_digest(),
+        )?;
+        Ok(value)
+    }
+
+    pub const fn bucket(self) -> RealmUserUpdateClaimBucket {
+        self.bucket
+    }
+
+    pub const fn ordinal(self) -> RealmUserUpdateAdmissionOrdinal {
+        self.ordinal
+    }
+
+    pub const fn user_id(self) -> UserId {
+        self.user_id
+    }
+
+    pub const fn digest(self) -> RealmUserUpdateTerminalEvidenceDigest {
+        self.digest
+    }
+
+    fn accepted_contribution(self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(CONTRIBUTION_DOMAIN);
+        hasher.update(self.user_id.get().to_be_bytes());
+        hasher.update(self.admission_commitment.as_bytes());
+        hasher.finalize().into()
+    }
+
+    fn compute_digest(self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(TERMINAL_EVIDENCE_DOMAIN);
+        hasher.update(self.bucket.get().to_be_bytes());
+        hasher.update(self.ordinal.get().to_be_bytes());
+        hasher.update(self.user_id.get().to_be_bytes());
+        hasher.update(self.admission_commitment.as_bytes());
+        hasher.update(self.dependency_digest.as_bytes());
+        hasher.update(self.receipt_digest.as_bytes());
+        hasher.update(self.intent_id.as_bytes());
+        hasher.update(self.assignment_digest);
+        hasher.update(self.subject_sequence.to_be_bytes());
+        hasher.update(self.envelope_digest);
+        hasher.finalize().into()
+    }
+}
+
+/// Full-generation terminal qualification.  It commits exactly the stable
+/// admission membership, every Published/SourceCommitted claim, and the
+/// pre-publish pipeline fence which must be revalidated by the consumer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RealmUserUpdateGenerationQualification<Hash> {
+    membership: RealmUserUpdateGenerationManifest,
+    fence: RealmUserUpdateQualificationFence<Hash>,
+    terminal_count: u64,
+    terminal_digest: RealmUserUpdateTerminalEvidenceDigest,
+    digest: RealmUserUpdateQualificationDigest,
+}
+
+impl<Hash: Q256BitHash> RealmUserUpdateGenerationQualification<Hash> {
+    pub fn from_terminal_evidence(
+        key: RealmUserUpdateAdmissionKey,
+        close: RealmUserUpdateAdmissionCloseIntent,
+        membership: RealmUserUpdateGenerationManifest,
+        fence: RealmUserUpdateQualificationFence<Hash>,
+        evidence: &[RealmUserUpdateTerminalEvidence],
+    ) -> Result<Self, RealmUserUpdateAdmissionError> {
+        let mut ordered = evidence.to_vec();
+        ordered.sort_by_key(|item| (item.bucket().get(), item.ordinal().get()));
+        let observed_membership = membership_from_terminal_evidence(key, &ordered)?;
+        if observed_membership != membership
+            || ordered.len() as u64 != membership.total().count()
+        {
+            return Err(RealmUserUpdateAdmissionError::ClaimSetMismatch);
+        }
+        let mut terminal = Sha256::new();
+        terminal.update(TERMINAL_SET_DOMAIN);
+        terminal.update((ordered.len() as u64).to_be_bytes());
+        for item in &ordered {
+            terminal.update(item.bucket().get().to_be_bytes());
+            terminal.update(item.ordinal().get().to_be_bytes());
+            terminal.update(item.digest().as_bytes());
+        }
+        let terminal_digest = RealmUserUpdateTerminalEvidenceDigest::try_new(
+            terminal.finalize().into(),
+        )?;
+        let mut value = Self {
+            membership,
+            fence,
+            terminal_count: ordered.len() as u64,
+            terminal_digest,
+            digest: RealmUserUpdateQualificationDigest::try_new([1; 32])?,
+        };
+        value.digest = RealmUserUpdateQualificationDigest::try_new(
+            value.compute_digest(key, close),
+        )?;
+        Ok(value)
+    }
+
+    pub const fn membership(self) -> RealmUserUpdateGenerationManifest {
+        self.membership
+    }
+
+    pub const fn fence(&self) -> &RealmUserUpdateQualificationFence<Hash> {
+        &self.fence
+    }
+
+    pub const fn terminal_count(self) -> u64 {
+        self.terminal_count
+    }
+
+    pub const fn digest(self) -> RealmUserUpdateQualificationDigest {
+        self.digest
+    }
+
+    fn compute_digest(
+        &self,
+        key: RealmUserUpdateAdmissionKey,
+        close: RealmUserUpdateAdmissionCloseIntent,
+    ) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(QUALIFICATION_DOMAIN);
+        encode_key(key, &mut hasher);
+        hasher.update(close.as_bytes());
+        hasher.update(self.membership.total().count().to_be_bytes());
+        hasher.update(self.membership.total().digest());
+        hasher.update(self.membership.digest().as_bytes());
+        hasher.update(self.fence.pipeline_revision().get().to_be_bytes());
+        hasher.update(self.fence.frontier().to_canonical_bytes());
+        hasher.update(self.terminal_count.to_be_bytes());
+        hasher.update(self.terminal_digest.as_bytes());
+        hasher.finalize().into()
+    }
+}
+
+fn membership_from_terminal_evidence(
+    key: RealmUserUpdateAdmissionKey,
+    ordered: &[RealmUserUpdateTerminalEvidence],
+) -> Result<RealmUserUpdateGenerationManifest, RealmUserUpdateAdmissionError> {
+    let mut manifests = Vec::with_capacity(RealmUserUpdateClaimBucket::COUNT as usize);
+    let mut offset = 0usize;
+    for index in 0..RealmUserUpdateClaimBucket::COUNT {
+        let bucket = RealmUserUpdateClaimBucket::try_new(index).map_err(admission)?;
+        let start = offset;
+        while offset < ordered.len() && ordered[offset].bucket() == bucket {
+            offset += 1;
+        }
+        let slice = &ordered[start..offset];
+        let mut accepted = RealmUserUpdateAcceptedSet::EMPTY;
+        let mut users = HashSet::with_capacity(slice.len());
+        let mut hasher = Sha256::new();
+        hasher.update(BUCKET_MANIFEST_DOMAIN);
+        encode_key(key, &mut hasher);
+        hasher.update(bucket.get().to_be_bytes());
+        hasher.update((slice.len() as u64).to_be_bytes());
+        for item in slice {
+            let expected = accepted
+                .count()
+                .checked_add(1)
+                .ok_or(RealmUserUpdateAdmissionError::CountOverflow)?;
+            if item.ordinal().get() != expected || !users.insert(item.user_id().get()) {
+                return Err(RealmUserUpdateAdmissionError::ClaimSetMismatch);
+            }
+            let contribution = item.accepted_contribution();
+            let mut aggregate = Sha256::new();
+            aggregate.update(CONTRIBUTION_DOMAIN);
+            aggregate.update(accepted.digest());
+            aggregate.update(expected.to_be_bytes());
+            aggregate.update(contribution);
+            accepted = RealmUserUpdateAcceptedSet {
+                count: expected,
+                digest: aggregate.finalize().into(),
+            };
+            hasher.update(expected.to_be_bytes());
+            hasher.update(item.user_id().get().to_be_bytes());
+            hasher.update(contribution);
+        }
+        manifests.push(RealmUserUpdateBucketManifest {
+            bucket,
+            accepted,
+            digest: RealmUserUpdateAdmissionManifestDigest::try_new(
+                hasher.finalize().into(),
+            )?,
+        });
+    }
+    if offset != ordered.len() {
+        return Err(RealmUserUpdateAdmissionError::ClaimSetMismatch);
+    }
+    RealmUserUpdateGenerationManifest::from_buckets(&manifests)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RealmUserUpdateAdmissionRevision(u64);
 
@@ -328,6 +648,7 @@ pub enum RealmUserUpdateAdmissionPhase {
     BucketBlocked = 6,
     BucketClosed = 7,
     BucketStable = 8,
+    GenerationQualified = 9,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -339,6 +660,11 @@ enum RealmUserUpdateAdmissionState<Hash> {
     GenerationClosed {
         close: RealmUserUpdateAdmissionCloseIntent,
         manifest: RealmUserUpdateGenerationManifest,
+    },
+    GenerationQualified {
+        close: RealmUserUpdateAdmissionCloseIntent,
+        manifest: RealmUserUpdateGenerationManifest,
+        qualification: RealmUserUpdateGenerationQualification<Hash>,
     },
     BucketOpen {
         accepted: RealmUserUpdateAcceptedSet,
@@ -641,6 +967,37 @@ impl<Hash: Q256BitHash> StoredRealmUserUpdateAdmission<Hash> {
         )
     }
 
+    pub fn qualify_generation(
+        expected: &Self,
+        close: RealmUserUpdateAdmissionCloseIntent,
+        qualification: RealmUserUpdateGenerationQualification<Hash>,
+    ) -> Result<Self, RealmUserUpdateAdmissionError> {
+        let RealmUserUpdateAdmissionState::GenerationClosed {
+            close: expected_close,
+            manifest,
+        } = expected.state
+        else {
+            return Err(RealmUserUpdateAdmissionError::InvalidTransition);
+        };
+        if close != expected_close
+            || qualification.membership() != manifest
+            || qualification.compute_digest(expected.key, close)
+                != *qualification.digest().as_bytes()
+        {
+            return Err(RealmUserUpdateAdmissionError::TerminalEvidenceMismatch);
+        }
+        Self::build(
+            expected.key,
+            expected.shard,
+            expected.revision.next()?,
+            RealmUserUpdateAdmissionState::GenerationQualified {
+                close,
+                manifest,
+                qualification,
+            },
+        )
+    }
+
     pub const fn key(&self) -> RealmUserUpdateAdmissionKey {
         self.key
     }
@@ -663,6 +1020,9 @@ impl<Hash: Q256BitHash> StoredRealmUserUpdateAdmission<Hash> {
             }
             RealmUserUpdateAdmissionState::GenerationClosed { .. } => {
                 RealmUserUpdateAdmissionPhase::GenerationClosed
+            }
+            RealmUserUpdateAdmissionState::GenerationQualified { .. } => {
+                RealmUserUpdateAdmissionPhase::GenerationQualified
             }
             RealmUserUpdateAdmissionState::BucketOpen { .. } => {
                 RealmUserUpdateAdmissionPhase::BucketOpen
@@ -709,6 +1069,7 @@ impl<Hash: Q256BitHash> StoredRealmUserUpdateAdmission<Hash> {
         match self.state {
             RealmUserUpdateAdmissionState::GenerationClosing { close }
             | RealmUserUpdateAdmissionState::GenerationClosed { close, .. }
+            | RealmUserUpdateAdmissionState::GenerationQualified { close, .. }
             | RealmUserUpdateAdmissionState::BucketClosed { close, .. }
             | RealmUserUpdateAdmissionState::BucketStable { close, .. } => {
                 Some(close)
@@ -730,9 +1091,20 @@ impl<Hash: Q256BitHash> StoredRealmUserUpdateAdmission<Hash> {
         &self,
     ) -> Option<RealmUserUpdateGenerationManifest> {
         match self.state {
-            RealmUserUpdateAdmissionState::GenerationClosed { manifest, .. } => {
-                Some(manifest)
-            }
+            RealmUserUpdateAdmissionState::GenerationClosed { manifest, .. }
+            | RealmUserUpdateAdmissionState::GenerationQualified { manifest, .. } => Some(manifest),
+            _ => None,
+        }
+    }
+
+    pub const fn generation_qualification(
+        &self,
+    ) -> Option<&RealmUserUpdateGenerationQualification<Hash>> {
+        match &self.state {
+            RealmUserUpdateAdmissionState::GenerationQualified {
+                qualification,
+                ..
+            } => Some(qualification),
             _ => None,
         }
     }
@@ -812,6 +1184,22 @@ impl<Hash: Q256BitHash> StoredRealmUserUpdateAdmission<Hash> {
                 close: RealmUserUpdateAdmissionCloseIntent::try_new(decoder.array32()?)?,
                 manifest: decode_bucket_manifest(&mut decoder)?,
             },
+            9 => {
+                let close = RealmUserUpdateAdmissionCloseIntent::try_new(
+                    decoder.array32()?,
+                )?;
+                let manifest = decode_generation_manifest(&mut decoder)?;
+                RealmUserUpdateAdmissionState::GenerationQualified {
+                    close,
+                    manifest,
+                    qualification: decode_generation_qualification(
+                        key,
+                        close,
+                        manifest,
+                        &mut decoder,
+                    )?,
+                }
+            }
             other => return Err(RealmUserUpdateAdmissionError::UnknownPhase(other)),
         };
         let state_digest = decoder.array32()?;
@@ -873,6 +1261,27 @@ impl<Hash: Q256BitHash> StoredRealmUserUpdateAdmission<Hash> {
         match (&self.shard, &self.state) {
             (
                 RealmUserUpdateAdmissionShard::Generation,
+                RealmUserUpdateAdmissionState::GenerationQualified {
+                    close,
+                    manifest,
+                    qualification,
+                },
+            ) => {
+                if qualification.membership() != *manifest
+                    || qualification.compute_digest(self.key, *close)
+                        != *qualification.digest().as_bytes()
+                    || qualification.fence().frontier().authority()
+                        != self.key.capture().key().authority()
+                    || qualification.fence().frontier().chain().network_id()
+                        != self.key.capture().key().network()
+                {
+                    Err(RealmUserUpdateAdmissionError::TerminalEvidenceMismatch)
+                } else {
+                    Ok(())
+                }
+            }
+            (
+                RealmUserUpdateAdmissionShard::Generation,
                 RealmUserUpdateAdmissionState::GenerationOpen
                 | RealmUserUpdateAdmissionState::GenerationClosing { .. }
                 | RealmUserUpdateAdmissionState::GenerationClosed { .. },
@@ -916,6 +1325,15 @@ impl<Hash: Q256BitHash> StoredRealmUserUpdateAdmission<Hash> {
             RealmUserUpdateAdmissionState::GenerationClosed { close, manifest } => {
                 out.extend_from_slice(close.as_bytes());
                 encode_generation_manifest(*manifest, &mut out);
+            }
+            RealmUserUpdateAdmissionState::GenerationQualified {
+                close,
+                manifest,
+                qualification,
+            } => {
+                out.extend_from_slice(close.as_bytes());
+                encode_generation_manifest(*manifest, &mut out);
+                encode_generation_qualification(qualification, &mut out);
             }
             RealmUserUpdateAdmissionState::BucketOpen { accepted } => {
                 encode_accepted(*accepted, &mut out);
@@ -1090,6 +1508,52 @@ fn decode_generation_manifest(
     })
 }
 
+fn encode_generation_qualification<Hash: Q256BitHash>(
+    value: &RealmUserUpdateGenerationQualification<Hash>,
+    out: &mut Vec<u8>,
+) {
+    encode_generation_manifest(value.membership, out);
+    out.extend_from_slice(&value.fence.pipeline_revision().get().to_be_bytes());
+    out.extend_from_slice(&value.fence.frontier().to_canonical_bytes());
+    out.extend_from_slice(&value.terminal_count.to_be_bytes());
+    out.extend_from_slice(value.terminal_digest.as_bytes());
+    out.extend_from_slice(value.digest.as_bytes());
+}
+
+fn decode_generation_qualification<Hash: Q256BitHash>(
+    key: RealmUserUpdateAdmissionKey,
+    close: RealmUserUpdateAdmissionCloseIntent,
+    expected_membership: RealmUserUpdateGenerationManifest,
+    decoder: &mut Decoder<'_>,
+) -> Result<RealmUserUpdateGenerationQualification<Hash>, RealmUserUpdateAdmissionError> {
+    let membership = decode_generation_manifest(decoder)?;
+    let pipeline_revision = PendingPipelineRevision::try_new(decoder.u64()?)
+        .map_err(admission)?;
+    let frontier = AuthorityObservation::from_canonical_bytes(
+        decoder.take(AUTHORITY_OBSERVATION_V1_LEN)?,
+    )
+    .map_err(admission)?;
+    let value = RealmUserUpdateGenerationQualification {
+        membership,
+        fence: RealmUserUpdateQualificationFence {
+            pipeline_revision,
+            frontier,
+        },
+        terminal_count: decoder.u64()?,
+        terminal_digest: RealmUserUpdateTerminalEvidenceDigest::try_new(
+            decoder.array32()?,
+        )?,
+        digest: RealmUserUpdateQualificationDigest::try_new(decoder.array32()?)?,
+    };
+    if membership != expected_membership
+        || value.terminal_count != membership.total().count()
+        || value.compute_digest(key, close) != *value.digest.as_bytes()
+    {
+        return Err(RealmUserUpdateAdmissionError::TerminalEvidenceMismatch);
+    }
+    Ok(value)
+}
+
 fn admission(error: impl fmt::Display) -> RealmUserUpdateAdmissionError {
     RealmUserUpdateAdmissionError::Nested(error.to_string())
 }
@@ -1169,6 +1633,8 @@ pub enum RealmUserUpdateAdmissionError {
     CloseIntentMismatch,
     ClaimConflict,
     ClaimSetMismatch,
+    TerminalEvidenceMismatch,
+    PipelineFenceMismatch,
     AdmissionOrdinalMismatch,
     IncompleteBucketSet,
     CountOverflow,
@@ -1194,17 +1660,19 @@ impl Error for RealmUserUpdateAdmissionError {}
 
 #[cfg(test)]
 mod tests {
-    use parth_core::PHash;
+    use parth_core::{utils::QPGenRandom, PF, PHash};
     use psy_data::protocol::{
         canonical_chain::{
             CanonicalChainRef, ChainEpoch, CheckpointHash, CheckpointId,
             CheckpointRef, NetworkId,
         },
         chain_context::{
-            AuthorityScope, PendingContext, WorkProcCheckpointUniqueId,
+            AuthorityObservation, AuthorityScope, AuthorityStateCheckpointId,
+            AuthorityStateRoot, PendingContext, WorkProcCheckpointUniqueId,
             WorkUniquePendingId,
         },
     };
+    use psy_data::queue_items::realm_user_update::PsyRealmUserUpdateQueueItem;
 
     use super::*;
     use crate::{
@@ -1214,10 +1682,17 @@ mod tests {
                 StoredRealmUserUpdateClaim,
             },
             realm_user_update_publish::{
-                RealmUserUpdatePublishAdmission, RealmUserUpdateRequestDigest,
+                GlobalUserTreeHeight, RealmUserUpdatePublishAdmission,
+                RealmUserUpdatePublishReceipt, RealmUserUpdatePublishRequest,
+                RealmUserUpdateRequestDigest,
             },
         },
-        store::typed::UniquePendingId,
+        store::{
+            pending_generation::ProcNamespacePrefix,
+            pending_generation_identity::PendingGenerationBootstrapReason,
+            pending_generation_pipeline::PendingPipelineBootstrap,
+            typed::UniquePendingId,
+        },
     };
 
     fn admission(epoch: u64) -> RealmUserUpdatePublishAdmission<PHash> {
@@ -1275,6 +1750,69 @@ mod tests {
             RealmUserUpdateAdmissionOrdinal::try_new(ordinal).unwrap(),
         )
         .unwrap()
+    }
+
+    fn pipeline(epoch: u64) -> PendingPipelineBootstrap<PHash> {
+        let admission = admission(epoch);
+        let key = admission.capture().key();
+        let authority = key.authority();
+        let frontier = AuthorityObservation::try_new(
+            *admission.pending().chain(),
+            authority,
+            AuthorityStateCheckpointId::new(10 + epoch),
+            AuthorityStateRoot::from_local_state_root(PHash::from_owned_32bytes([
+                7 + epoch as u8;
+                32
+            ])),
+        )
+        .unwrap();
+        PendingPipelineBootstrap::try_new(
+            key,
+            admission.capture().activation(),
+            ProcNamespacePrefix::for_authority(key.network(), authority),
+            PendingGenerationBootstrapReason::LegacyActivation,
+            PendingGenerationContext::try_from_legacy(10, 10).unwrap(),
+            admission.capture().processing(),
+            frontier,
+            10,
+        )
+        .unwrap()
+    }
+
+    fn queue_item(
+        claim: &StoredRealmUserUpdateClaim<PHash>,
+    ) -> PsyRealmUserUpdateQueueItem<PF, PHash> {
+        let mut item = PsyRealmUserUpdateQueueItem::<PF, PHash>::qp_rand_gen();
+        item.job_id = psy_core::job::job_id::QProvingJobDataID::try_get_realm_edge_proof_store_output_proof_id_for_end_cap(
+            claim.user_id().get(),
+            32,
+            claim.pending().unique_pending_id().get(),
+        )
+        .unwrap();
+        item.expected_fake_checkpoint_id = claim.stable_status();
+        item
+    }
+
+    fn all_bucket_manifests(
+        key: RealmUserUpdateAdmissionKey,
+        claims: &[StoredRealmUserUpdateClaim<PHash>],
+    ) -> Vec<RealmUserUpdateBucketManifest> {
+        (0..RealmUserUpdateClaimBucket::COUNT)
+            .map(|index| {
+                let bucket = RealmUserUpdateClaimBucket::try_new(index).unwrap();
+                let bucket_claims = claims
+                    .iter()
+                    .filter(|claim| claim.bucket() == bucket)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                RealmUserUpdateBucketManifest::from_claims(
+                    RealmUserUpdateClaimPartition::try_new(key.capture(), bucket)
+                        .unwrap(),
+                    &bucket_claims,
+                )
+                .unwrap()
+            })
+            .collect()
     }
 
     fn another_user_in_same_bucket(user: u64) -> u64 {
@@ -1529,6 +2067,189 @@ mod tests {
     }
 
     #[test]
+    fn qualification_requires_exact_published_terminal_evidence_and_fence() {
+        let claimed = claim(1, 13, 1);
+        let key = RealmUserUpdateAdmissionKey::try_new(
+            claimed.partition().unwrap().capture(),
+        )
+        .unwrap();
+        let fence = RealmUserUpdateQualificationFence::try_from_pipeline(
+            key,
+            pipeline(1).candidate(),
+        )
+        .unwrap();
+        let request = RealmUserUpdatePublishRequest::try_new(
+            claimed.reconstruct_admission().unwrap(),
+            claimed.user_id(),
+            claimed.request_digest(),
+            GlobalUserTreeHeight::try_new(32).unwrap(),
+            queue_item(&claimed),
+        )
+        .unwrap();
+        let receipt = RealmUserUpdatePublishReceipt::durable(
+            request.intent_id(),
+            [6; 32],
+            9,
+            [8; 32],
+            false,
+        )
+        .unwrap();
+        assert!(RealmUserUpdateTerminalEvidence::try_from_observed(
+            key,
+            &fence,
+            &claimed,
+            &request,
+            &receipt,
+        )
+        .is_err());
+
+        let planned = StoredRealmUserUpdateClaim::dependencies_planned(
+            &claimed,
+            RealmUserUpdateDependencyDigest::try_new([4; 32]).unwrap(),
+        )
+        .unwrap();
+        let ready = StoredRealmUserUpdateClaim::dependencies_ready(&planned).unwrap();
+        let published = StoredRealmUserUpdateClaim::published(
+            &ready,
+            RealmUserUpdatePublishReceiptDigest::try_new(
+                *receipt.receipt_digest(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let evidence = RealmUserUpdateTerminalEvidence::try_from_observed(
+            key,
+            &fence,
+            &published,
+            &request,
+            &receipt,
+        )
+        .unwrap();
+        let wrong_receipt = RealmUserUpdatePublishReceipt::durable(
+            request.intent_id(),
+            [6; 32],
+            10,
+            [8; 32],
+            true,
+        )
+        .unwrap();
+        assert!(RealmUserUpdateTerminalEvidence::try_from_observed(
+            key,
+            &fence,
+            &published,
+            &request,
+            &wrong_receipt,
+        )
+        .is_err());
+
+        let manifests = all_bucket_manifests(key, &[published.clone()]);
+        let membership = RealmUserUpdateGenerationManifest::from_buckets(&manifests)
+            .unwrap();
+        let close = RealmUserUpdateAdmissionCloseIntent::derive(key, [3; 32]).unwrap();
+        let open = StoredRealmUserUpdateAdmission::<PHash>::generation_open(key).unwrap();
+        let closing = StoredRealmUserUpdateAdmission::begin_generation_close(&open, close)
+            .unwrap();
+        let closed = StoredRealmUserUpdateAdmission::close_generation(
+            &closing,
+            close,
+            &manifests,
+        )
+        .unwrap();
+        let qualification = RealmUserUpdateGenerationQualification::from_terminal_evidence(
+            key,
+            close,
+            membership,
+            fence,
+            &[evidence],
+        )
+        .unwrap();
+        let qualified = StoredRealmUserUpdateAdmission::qualify_generation(
+            &closed,
+            close,
+            qualification,
+        )
+        .unwrap();
+        assert_eq!(
+            qualified.phase(),
+            RealmUserUpdateAdmissionPhase::GenerationQualified
+        );
+        assert_eq!(qualified.generation_manifest(), Some(membership));
+        assert_eq!(
+            qualified
+                .generation_qualification()
+                .unwrap()
+                .terminal_count(),
+            1
+        );
+        assert!(qualified
+            .generation_qualification()
+            .unwrap()
+            .fence()
+            .matches_pipeline(key, pipeline(1).candidate()));
+
+        let encoded = qualified.to_canonical_bytes();
+        assert_eq!(
+            StoredRealmUserUpdateAdmission::decode_selected(
+                qualified.key(),
+                qualified.shard().as_i16().unwrap(),
+                qualified.revision().as_i64().unwrap(),
+                &encoded,
+            )
+            .unwrap(),
+            qualified
+        );
+    }
+
+    #[test]
+    fn qualification_rejects_missing_terminal_rows_and_frontier_aliases() {
+        let sample = claim(1, 13, 1);
+        let key = RealmUserUpdateAdmissionKey::try_new(
+            sample.partition().unwrap().capture(),
+        )
+        .unwrap();
+        let manifests = all_bucket_manifests(key, &[sample]);
+        let membership = RealmUserUpdateGenerationManifest::from_buckets(&manifests)
+            .unwrap();
+        let close = RealmUserUpdateAdmissionCloseIntent::derive(key, [4; 32]).unwrap();
+        let fence = RealmUserUpdateQualificationFence::try_from_pipeline(
+            key,
+            pipeline(1).candidate(),
+        )
+        .unwrap();
+        assert!(RealmUserUpdateGenerationQualification::from_terminal_evidence(
+            key,
+            close,
+            membership,
+            fence,
+            &[],
+        )
+        .is_err());
+
+        let empty_membership = RealmUserUpdateGenerationManifest::from_buckets(
+            &all_bucket_manifests(key, &[]),
+        )
+        .unwrap();
+        let empty = RealmUserUpdateGenerationQualification::from_terminal_evidence(
+            key,
+            close,
+            empty_membership,
+            fence,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(empty.terminal_count(), 0);
+        assert_ne!(empty.digest().as_bytes(), &[0; 32]);
+
+        let other_frontier = RealmUserUpdateQualificationFence::try_from_pipeline(
+            key,
+            pipeline(2).candidate(),
+        )
+        .unwrap();
+        assert_ne!(fence, other_frontier);
+        assert!(!fence.matches_pipeline(key, pipeline(2).candidate()));
+    }
+
+    #[test]
     fn malformed_or_selected_identity_mismatch_fails_closed() {
         let sample = claim(1, 13, 1);
         let open = StoredRealmUserUpdateAdmission::<PHash>::bucket_open(
@@ -1552,5 +2273,16 @@ mod tests {
             &trailing,
         )
         .is_err());
+        let mut old_codec = open.to_canonical_bytes();
+        old_codec[8..10].copy_from_slice(&1_u16.to_be_bytes());
+        assert!(matches!(
+            StoredRealmUserUpdateAdmission::<PHash>::decode_selected(
+                open.key(),
+                open.shard().as_i16().unwrap(),
+                open.revision().as_i64().unwrap(),
+                &old_codec,
+            ),
+            Err(RealmUserUpdateAdmissionError::UnknownCodecVersion)
+        ));
     }
 }
