@@ -10,7 +10,7 @@ use psy_node_core::{
     genesis::genesis_db_data_builder::GenesisDatabaseDataBuilder, p2p::traits::realm_coordinantor::RealmCoordinatorClient, psy_core_db::traits::full::{PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmProcessorStore}, psy_temp_db::StandardProcessorTempDBStoreBase, queue::{
         ephemeral::QStandardEphemeralQueueSubscriber,
         worker_queue::{QStandardWorkerQueuePublisher, QStandardWorkerQueueSubscriber},
-    }, store::{realm_processor_startup::{authorize_realm_processor_startup, RealmProcessorStartupAuthorization, RealmProcessorStartupError, RealmProcessorStartupMode, RealmProcessorStartupPreflightProvider}, traits::proof_store::{QCanonicalProofStoreV2, QParthProofStore}}
+    }, store::{realm_processor_startup::{authorize_realm_processor_startup, RealmProcessorFreshRunPermit, RealmProcessorStartupAuthorization, RealmProcessorStartupError, RealmProcessorStartupMode, RealmProcessorStartupPreflightProvider}, traits::proof_store::{QCanonicalProofStoreV2, QParthProofStore}}
 };
 
 use crate::realm::processor::{core::{PsyRealmProcessor, runner::run_realm_processor}, db::PsyRealmDatabaseProcessor};
@@ -69,13 +69,10 @@ where
     }
     let startup_authorization =
         authorize_realm_processor_startup(startup_mode, startup_preflight.as_deref()).await?;
-    if matches!(
-        startup_authorization,
-        RealmProcessorStartupAuthorization::BranchExact(_)
-    ) {
-        return Err(
-            RealmProcessorStartupError::ServingCompositionNotIntegrated.into(),
-        );
+    if let RealmProcessorStartupAuthorization::BranchExact(run_permit) =
+        startup_authorization
+    {
+        return Err(reject_unintegrated_branch_exact_serving(run_permit).into());
     }
 
     tracing::info!("[REALM_CREATE] setup_for_realm start");
@@ -192,6 +189,15 @@ where
     Ok(processor_result)
 }
 
+/// The non-Clone fresh permit is consumed at the real serving boundary. Until
+/// h23c4 replaces legacy startup/commit with the branch-aware composition,
+/// consuming it can only produce a fail-closed error.
+fn reject_unintegrated_branch_exact_serving(
+    _run_permit: RealmProcessorFreshRunPermit,
+) -> RealmProcessorStartupError {
+    RealmProcessorStartupError::ServingCompositionNotIntegrated
+}
+
 
 
 pub async fn create_realm_processor_and_run<
@@ -284,11 +290,22 @@ mod tests {
             .nth(1)
             .expect("create_realm_processor must remain present");
         let rejection = function
-            .find("RealmProcessorStartupError::ServingCompositionNotIntegrated")
+            .find("reject_unintegrated_branch_exact_serving(run_permit)")
             .expect("enabled startup must remain fail closed");
         let first_side_effect = function
             .find("GenesisDatabaseDataBuilder::<")
             .expect("genesis builder must remain present");
         assert!(rejection < first_side_effect);
+        let rejector = source
+            .split("fn reject_unintegrated_branch_exact_serving(")
+            .nth(1)
+            .unwrap()
+            .split("pub async fn create_realm_processor_and_run")
+            .next()
+            .unwrap();
+        assert!(rejector.contains("_run_permit: RealmProcessorFreshRunPermit"));
+        assert!(rejector.contains(
+            "RealmProcessorStartupError::ServingCompositionNotIntegrated"
+        ));
     }
 }

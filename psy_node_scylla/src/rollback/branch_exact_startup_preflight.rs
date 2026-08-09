@@ -362,7 +362,7 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorStartupPreflightProvider<Hash> {
             sample.timestamp,
         )
         .map_err(|error| not_verified("pending/writer/timestamp", error))?;
-        let recovery_tag = recovery_tag(&recovery);
+        let recovery_tag = require_clean_run_boundary(&recovery)?;
         let BranchExactWriterState::Active(active) = sample.writer.state() else {
             return Err(RealmProcessorStartupError::DurableRecoveryRequired(
                 "writer/pending crash recovery must complete before Realm startup"
@@ -537,19 +537,30 @@ fn route_phase(
     }
 }
 
-fn recovery_tag<Hash>(recovery: &BranchExactPendingStartupRecovery<Hash>) -> u8 {
+/// A durable state may be internally consistent without being safe for a new
+/// Processor/gatherer. Only the clean Ready boundary authorizes a run; every
+/// crash-intermediate or terminal-but-unrotated state belongs to the isolated
+/// recovery runner.
+fn require_clean_run_boundary<Hash>(
+    recovery: &BranchExactPendingStartupRecovery<Hash>,
+) -> Result<u8, RealmProcessorStartupError> {
     match recovery {
-        BranchExactPendingStartupRecovery::AwaitPrimeOrRotate => 1,
-        BranchExactPendingStartupRecovery::ReadyForQueueClose => 2,
-        BranchExactPendingStartupRecovery::ResumeQueueSeal(_) => 3,
-        BranchExactPendingStartupRecovery::AwaitRecoverableWork(_) => 4,
-        BranchExactPendingStartupRecovery::ApplyPipeline { .. } => 5,
-        BranchExactPendingStartupRecovery::ResumeWriterVerification(_) => 6,
-        BranchExactPendingStartupRecovery::AwaitTrustedMarker => 7,
-        BranchExactPendingStartupRecovery::ResumeNoWorkPublication(_) => 8,
-        BranchExactPendingStartupRecovery::CompleteNoWorkAfterTrustedMarker => 9,
-        BranchExactPendingStartupRecovery::FinishWriterAfterTrustedMarker => 10,
-        BranchExactPendingStartupRecovery::CompleteAfterTrustedMarker => 11,
+        BranchExactPendingStartupRecovery::ReadyForQueueClose => Ok(2),
+        BranchExactPendingStartupRecovery::AwaitPrimeOrRotate
+        | BranchExactPendingStartupRecovery::ResumeQueueSeal(_)
+        | BranchExactPendingStartupRecovery::AwaitRecoverableWork(_)
+        | BranchExactPendingStartupRecovery::ApplyPipeline { .. }
+        | BranchExactPendingStartupRecovery::ResumeWriterVerification(_)
+        | BranchExactPendingStartupRecovery::AwaitTrustedMarker
+        | BranchExactPendingStartupRecovery::ResumeNoWorkPublication(_)
+        | BranchExactPendingStartupRecovery::CompleteNoWorkAfterTrustedMarker
+        | BranchExactPendingStartupRecovery::FinishWriterAfterTrustedMarker
+        | BranchExactPendingStartupRecovery::CompleteAfterTrustedMarker => {
+            Err(RealmProcessorStartupError::DurableRecoveryRequired(
+                "pending pipeline is not at the clean Ready run boundary"
+                    .to_owned(),
+            ))
+        }
     }
 }
 
@@ -691,6 +702,39 @@ mod tests {
             ScyllaStartupCompositeFingerprint::try_new(parts),
             Err(RealmProcessorStartupError::DurableStorageIndeterminate(_))
         ));
+    }
+
+    #[test]
+    fn only_clean_ready_pending_boundary_can_authorize_a_run() {
+        assert_eq!(
+            require_clean_run_boundary::<parth_core::PHash>(
+                &BranchExactPendingStartupRecovery::ReadyForQueueClose,
+            ),
+            Ok(2),
+        );
+        for recovery in [
+            BranchExactPendingStartupRecovery::<parth_core::PHash>::AwaitPrimeOrRotate,
+            BranchExactPendingStartupRecovery::AwaitTrustedMarker,
+            BranchExactPendingStartupRecovery::CompleteNoWorkAfterTrustedMarker,
+            BranchExactPendingStartupRecovery::FinishWriterAfterTrustedMarker,
+            BranchExactPendingStartupRecovery::CompleteAfterTrustedMarker,
+        ] {
+            assert!(matches!(
+                require_clean_run_boundary(&recovery),
+                Err(RealmProcessorStartupError::DurableRecoveryRequired(_))
+            ));
+        }
+
+        let source = include_str!("branch_exact_startup_preflight.rs");
+        let boundary = source
+            .split("fn require_clean_run_boundary")
+            .nth(1)
+            .unwrap()
+            .split("fn require_not_behind_cutover")
+            .next()
+            .unwrap();
+        assert_eq!(boundary.matches("=> Ok(").count(), 1);
+        assert!(boundary.contains("ReadyForQueueClose => Ok(2)"));
     }
 
     #[test]

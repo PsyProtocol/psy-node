@@ -362,7 +362,7 @@ pub enum RealmProcessorStartupMode {
 }
 
 #[derive(Debug)]
-pub struct RealmProcessorStartupPermit {
+struct RealmProcessorStartupPermit {
     expectation: RealmProcessorStartupExpectation,
     evidence: RealmProcessorStartupEvidence,
     digest: RealmProcessorStartupPermitDigest,
@@ -382,10 +382,32 @@ impl RealmProcessorStartupPermit {
     }
 }
 
+/// The only branch-exact authorization that may cross from startup admission
+/// into a Processor composition. It is minted from one fresh, fully ready
+/// preflight and is deliberately non-Clone and non-serializable.
+#[derive(Debug)]
+pub struct RealmProcessorFreshRunPermit {
+    startup: RealmProcessorStartupPermit,
+}
+
+impl RealmProcessorFreshRunPermit {
+    pub const fn expectation(&self) -> RealmProcessorStartupExpectation {
+        self.startup.expectation()
+    }
+
+    pub const fn evidence(&self) -> RealmProcessorStartupEvidence {
+        self.startup.evidence()
+    }
+
+    pub const fn digest(&self) -> RealmProcessorStartupPermitDigest {
+        self.startup.digest()
+    }
+}
+
 #[derive(Debug)]
 pub enum RealmProcessorStartupAuthorization {
     Disabled,
-    BranchExact(RealmProcessorStartupPermit),
+    BranchExact(RealmProcessorFreshRunPermit),
 }
 
 pub async fn authorize_realm_processor_startup(
@@ -405,10 +427,12 @@ pub async fn authorize_realm_processor_startup(
             validate_evidence(expectation, evidence)?;
             let digest = permit_digest(expectation, evidence)?;
             Ok(RealmProcessorStartupAuthorization::BranchExact(
-                RealmProcessorStartupPermit {
-                    expectation,
-                    evidence,
-                    digest,
+                RealmProcessorFreshRunPermit {
+                    startup: RealmProcessorStartupPermit {
+                        expectation,
+                        evidence,
+                        digest,
+                    },
                 },
             ))
         }
@@ -797,21 +821,28 @@ mod tests {
     }
 
     #[test]
-    fn permit_has_no_clone_default_or_public_constructor() {
+    fn fresh_run_permit_has_no_clone_default_codec_or_public_constructor() {
         let source = include_str!("realm_processor_startup.rs");
-        let permit = source.split("pub struct RealmProcessorStartupPermit").nth(1).unwrap();
+        let permit = source
+            .split("pub struct RealmProcessorFreshRunPermit")
+            .nth(1)
+            .unwrap();
         let permit_header = source
-            .split("pub struct RealmProcessorStartupPermit")
+            .split("pub struct RealmProcessorFreshRunPermit")
             .next()
             .unwrap()
             .lines()
             .rev()
-            .take(2)
+            .take(1)
             .collect::<Vec<_>>()
             .join("\n");
         assert!(!permit_header.contains("Clone"));
         assert!(!permit_header.contains("Default"));
+        assert!(!permit_header.contains("Serialize"));
+        assert!(!permit_header.contains("Deserialize"));
         assert!(!permit.contains("pub fn new("));
         assert!(!permit.contains("pub fn try_new("));
+        let clone_impl = ["impl Clone for RealmProcessor", "FreshRunPermit"].concat();
+        assert!(!source.contains(&clone_impl));
     }
 }
