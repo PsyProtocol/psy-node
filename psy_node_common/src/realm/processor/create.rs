@@ -10,10 +10,10 @@ use psy_node_core::{
     genesis::genesis_db_data_builder::GenesisDatabaseDataBuilder, p2p::traits::realm_coordinantor::RealmCoordinatorClient, psy_core_db::traits::full::{PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmProcessorStore}, psy_temp_db::StandardProcessorTempDBStoreBase, queue::{
         ephemeral::QStandardEphemeralQueueSubscriber,
         worker_queue::{QStandardWorkerQueuePublisher, QStandardWorkerQueueSubscriber},
-    }, store::{realm_processor_branch_exact_runtime::{InstalledRealmBranchExactCommitRuntime, RealmBranchExactCommitRuntimeInstaller}, realm_processor_startup::{authorize_realm_processor_startup, RealmProcessorStartupAuthorization, RealmProcessorStartupError, RealmProcessorStartupMode, RealmProcessorStartupPreflightProvider}, traits::proof_store::{QCanonicalProofStoreV2, QParthProofStore}}
+    }, store::{realm_processor_branch_exact_runtime::{RealmBranchExactCommitRuntimeInstaller, RealmBranchExactSingleCommitOwner}, realm_processor_startup::{authorize_realm_processor_startup, RealmProcessorStartupAuthorization, RealmProcessorStartupError, RealmProcessorStartupMode, RealmProcessorStartupPreflightProvider}, traits::proof_store::{QCanonicalProofStoreV2, QParthProofStore}}
 };
 
-use crate::realm::processor::{core::{PsyRealmProcessor, runner::run_realm_processor}, db::PsyRealmDatabaseProcessor};
+use crate::realm::processor::{core::{PsyRealmProcessor, RealmNormalCommitOwner, runner::run_realm_processor}, db::PsyRealmDatabaseProcessor};
 
 pub async fn create_realm_processor<
     N: QNetworkTypesConfig<JobId = QProvingJobDataID> + 'static,
@@ -71,7 +71,7 @@ where
     }
     let startup_authorization =
         authorize_realm_processor_startup(startup_mode, startup_preflight.as_deref()).await?;
-    match startup_authorization {
+    let normal_commit_owner = match startup_authorization {
         RealmProcessorStartupAuthorization::Disabled => {
             if commit_runtime_installer.is_some() {
                 return Err(
@@ -79,14 +79,19 @@ where
                         .into(),
                 );
             }
+            RealmNormalCommitOwner::legacy_disabled()
         }
         RealmProcessorStartupAuthorization::BranchExact(run_permit) => {
             let installer = commit_runtime_installer
                 .ok_or(RealmProcessorStartupError::CommitRuntimeInstallerMissing)?;
             let installed = installer.install(run_permit).await?;
-            return Err(reject_unintegrated_branch_exact_serving(installed).into());
+            let commit_owner = RealmBranchExactSingleCommitOwner::from_installed(installed);
+            return Err(reject_unintegrated_branch_exact_serving(
+                RealmNormalCommitOwner::branch_exact(commit_owner),
+            )
+            .into());
         }
-    }
+    };
 
     tracing::info!("[REALM_CREATE] setup_for_realm start");
     let genesis =
@@ -195,6 +200,7 @@ where
         genesis,
         file_system,
         guta_gatherer_backup_directory,
+        normal_commit_owner,
     )
     .await?;
     tracing::info!("[REALM_CREATE] processor new done");
@@ -206,8 +212,11 @@ where
 /// h23c4 replaces legacy startup/commit with the branch-aware composition,
 /// consuming it can only produce a fail-closed error.
 fn reject_unintegrated_branch_exact_serving<Hash>(
-    _installed: InstalledRealmBranchExactCommitRuntime<Hash>,
+    commit_owner: RealmNormalCommitOwner<Hash>,
 ) -> RealmProcessorStartupError {
+    let RealmNormalCommitOwner::BranchExact(_commit_owner) = commit_owner else {
+        unreachable!("legacy owner cannot reach branch-exact serving guard")
+    };
     RealmProcessorStartupError::ServingCompositionNotIntegrated
 }
 
@@ -314,13 +323,24 @@ mod tests {
         let install = function
             .find("installer.install(run_permit).await")
             .expect("enabled startup must install the exact runtime");
-        let rejection = function
-            .find("reject_unintegrated_branch_exact_serving(installed)")
+        let owner = function
+            .find("RealmBranchExactSingleCommitOwner::from_installed(installed)")
+            .expect("installed runtime must have one process-local owner");
+        let routed_owner = function
+            .find("RealmNormalCommitOwner::branch_exact(commit_owner)")
             .expect("enabled startup must remain fail closed after installation");
+        let rejection = function
+            .find("reject_unintegrated_branch_exact_serving(")
+            .expect("enabled startup must remain fail closed after owner routing");
         let first_side_effect = function
             .find("GenesisDatabaseDataBuilder::<")
             .expect("genesis builder must remain present");
-        assert!(install < rejection && rejection < first_side_effect);
+        assert!(
+            install < owner
+                && owner < rejection
+                && rejection < routed_owner
+                && routed_owner < first_side_effect
+        );
         let rejector = source
             .split("fn reject_unintegrated_branch_exact_serving<Hash>(")
             .nth(1)
@@ -328,7 +348,8 @@ mod tests {
             .split("pub async fn create_realm_processor_and_run")
             .next()
             .unwrap();
-        assert!(rejector.contains("_installed: InstalledRealmBranchExactCommitRuntime<Hash>"));
+        assert!(rejector.contains("commit_owner: RealmNormalCommitOwner<Hash>"));
+        assert!(rejector.contains("RealmNormalCommitOwner::BranchExact(_commit_owner)"));
         assert!(rejector.contains(
             "RealmProcessorStartupError::ServingCompositionNotIntegrated"
         ));

@@ -344,7 +344,7 @@ where
             &submission_header,
             &root_job_proof,
         )?;
-        self.db.commit_state(commit_input).await?;
+        self.commit_live(commit_input).await?;
         timer.lap("commit_state");
         self.db.run_sanity_check("after commit").await?;
 
@@ -380,5 +380,60 @@ where
         }
 
         Ok(())
+    }
+
+    /// Unique live-proof persistence route. Keeping the match inside the
+    /// Processor prevents a future caller from selecting the legacy DB path
+    /// after branch-exact startup has been authorized.
+    async fn commit_live(
+        &mut self,
+        commit_input: RealmCommitInput<'_, N::F, N::QHash>,
+    ) -> anyhow::Result<()> {
+        match &mut self.normal_commit_owner {
+            super::RealmNormalCommitOwner::LegacyDisabled => {
+                self.db.commit_state(commit_input).await
+            }
+            super::RealmNormalCommitOwner::BranchExact(_owner) => {
+                anyhow::bail!(
+                    "REALM_BRANCH_EXACT_FULL_COMMIT_COVERAGE_NOT_INTEGRATED"
+                )
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod h23c4b_tests {
+    #[test]
+    fn live_commit_has_one_owner_route_and_no_direct_db_bypass() {
+        let source = include_str!("process_block.rs");
+        let live = source
+            .split("pub(super) async fn process_block")
+            .nth(1)
+            .unwrap()
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert_eq!(live.matches("self.commit_live(commit_input).await?").count(), 1);
+        assert_eq!(live.matches("self.db.commit_state(commit_input)").count(), 1);
+        let call = live.find("self.commit_live(commit_input).await?").unwrap();
+        let router = live.find("async fn commit_live(").unwrap();
+        assert!(call < router);
+
+        let router = live.split("async fn commit_live(").nth(1).unwrap();
+        assert!(router.contains("RealmNormalCommitOwner::LegacyDisabled"));
+        assert!(router.contains("RealmNormalCommitOwner::BranchExact(_owner)"));
+        assert!(router.contains("REALM_BRANCH_EXACT_FULL_COMMIT_COVERAGE_NOT_INTEGRATED"));
+        assert!(!router.contains("prepare_and_verify"));
+        assert!(!router.contains("finish_published"));
+    }
+
+    #[test]
+    fn genesis_and_recovery_remain_distinct_from_live_owner_route() {
+        let input = include_str!("../commit_input.rs");
+        assert!(input.contains("RealmCommitOrigin::Genesis"));
+        assert!(input.contains("RealmCommitOrigin::StartupRecovery"));
+        assert!(input.contains("RealmCommitOrigin::LiveProof"));
+        assert!(input.contains("LiveEvidenceUnavailable"));
     }
 }

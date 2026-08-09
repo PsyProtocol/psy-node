@@ -39,7 +39,7 @@ impl<
 where
     FileSystem::File: Send + Sync,
 {
-    pub async fn new(
+    pub(in crate::realm::processor) async fn new(
         mut db: PsyRealmDatabaseProcessor<
             N,
             S,
@@ -54,6 +54,7 @@ where
         genesis_block_update: PsyPreparedRealmBlockStateUpdatesWithCoordinatorUpdate<N::F, N::QHash>,
         file_system: Arc<FileSystem>,
         guta_gatherer_backup_directory: String,
+        normal_commit_owner: super::RealmNormalCommitOwner<N::QHash>,
     ) -> anyhow::Result<(Self, tokio::task::JoinHandle<Result<(), anyhow::Error>>)> {
         tracing::info!("[REALM_STARTUP] processor new start");
         db.ensure_genesis_applied(genesis_block_update.clone()).await?;
@@ -116,6 +117,7 @@ where
                 guta_queue_gatherer: guta_queue_gatherer,
                 proof_worker_queue_max_time_ms: u64::MAX,
                 iteration_quiescence: Default::default(),
+                normal_commit_owner,
                 control_owner: None,
             },
             guta_join_handle,

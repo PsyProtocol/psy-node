@@ -16,6 +16,7 @@ use super::realm_processor_startup::{
     RealmProcessorFreshRunPermit, RealmProcessorStartupError,
     RealmProcessorStartupPermitDigest,
 };
+use super::realm_processor_quiescence::RealmProcessorIterationPermit;
 
 /// Exact, deliberately narrow scope of the runtime being installed.  It does
 /// not claim full 22-domain normal-commit coverage.
@@ -85,6 +86,90 @@ pub trait RealmBranchExactCommitRuntimeInstaller<Hash>: Send + Sync {
         startup_permit: RealmProcessorFreshRunPermit,
     ) -> Result<InstalledRealmBranchExactCommitRuntime<Hash>, RealmProcessorStartupError>;
 }
+
+/// The only process-local owner allowed to grow future queue, writer and
+/// authority-marker operations.
+///
+/// It is deliberately non-Clone and owns the installed runtime by value.  The
+/// inner runtime remains identity-only even though its implementation uses an
+/// `Arc`; mutation APIs must be added to an iteration borrowing this owner,
+/// never to the shared runtime trait.
+pub struct RealmBranchExactSingleCommitOwner<Hash> {
+    installed: InstalledRealmBranchExactCommitRuntime<Hash>,
+}
+
+impl<Hash> RealmBranchExactSingleCommitOwner<Hash> {
+    pub fn from_installed(
+        installed: InstalledRealmBranchExactCommitRuntime<Hash>,
+    ) -> Self {
+        Self { installed }
+    }
+
+    pub const fn startup_permit_digest(&self) -> RealmProcessorStartupPermitDigest {
+        self.installed.startup_permit_digest()
+    }
+
+    pub fn runtime(&self) -> &dyn RealmBranchExactCommitRuntime<Hash> {
+        self.installed.runtime()
+    }
+
+    /// Bind the owner to the real loop's sole controlled iteration permit.
+    /// A disabled legacy gate can mint compatibility permits, but those may
+    /// never authorize branch-exact queue/write/publish work.
+    pub fn begin_iteration(
+        &mut self,
+        iteration_permit: RealmProcessorIterationPermit,
+    ) -> Result<RealmBranchExactCommitIteration<'_, Hash>, RealmBranchExactCommitOwnerError>
+    {
+        if !iteration_permit.is_controlled() {
+            return Err(RealmBranchExactCommitOwnerError::UncontrolledIterationPermit);
+        }
+        Ok(RealmBranchExactCommitIteration {
+            owner: self,
+            _iteration_permit: iteration_permit,
+        })
+    }
+}
+
+/// Borrowed owner of one complete `sync + queue + commit + publish`
+/// iteration.  h23c4b intentionally exposes identity only. Future queue and
+/// marker ports must require `&mut self` here and private typestate receipts;
+/// a bare checkpoint or a shared runtime reference is never sufficient.
+pub struct RealmBranchExactCommitIteration<'a, Hash> {
+    owner: &'a mut RealmBranchExactSingleCommitOwner<Hash>,
+    _iteration_permit: RealmProcessorIterationPermit,
+}
+
+impl<Hash> RealmBranchExactCommitIteration<'_, Hash> {
+    pub fn network(&self) -> NetworkId {
+        self.owner.runtime().network()
+    }
+
+    pub fn realm_id(&self) -> u32 {
+        self.owner.runtime().realm_id()
+    }
+
+    pub fn realm_sub_id(&self) -> u16 {
+        self.owner.runtime().realm_sub_id()
+    }
+
+    pub const fn startup_permit_digest(&self) -> RealmProcessorStartupPermitDigest {
+        self.owner.startup_permit_digest()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RealmBranchExactCommitOwnerError {
+    UncontrolledIterationPermit,
+}
+
+impl std::fmt::Display for RealmBranchExactCommitOwnerError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl std::error::Error for RealmBranchExactCommitOwnerError {}
 
 #[cfg(test)]
 mod tests {
@@ -267,6 +352,43 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn single_owner_requires_the_real_controlled_iteration_permit() {
+        let installed = InstalledRealmBranchExactCommitRuntime::seal(
+            permit().await,
+            runtime(
+                network(),
+                7,
+                3,
+                [2; 32],
+                Arc::new(AtomicUsize::new(0)),
+            ),
+        )
+        .unwrap();
+        let mut owner = RealmBranchExactSingleCommitOwner::from_installed(installed);
+
+        let disabled = crate::store::realm_processor_quiescence::RealmProcessorIterationGate::disabled();
+        assert!(matches!(
+            owner.begin_iteration(disabled.try_begin_iteration().unwrap()),
+            Err(RealmBranchExactCommitOwnerError::UncontrolledIterationPermit)
+        ));
+
+        let controlled = crate::store::realm_processor_quiescence::RealmProcessorIterationGate::controlled();
+        {
+            let attempt = owner
+                .begin_iteration(controlled.try_begin_iteration().unwrap())
+                .unwrap();
+            assert_eq!(attempt.network(), network());
+            assert_eq!(attempt.realm_id(), 7);
+            assert_eq!(attempt.realm_sub_id(), 3);
+            assert!(controlled.snapshot().active_iteration());
+        }
+        assert!(!controlled.snapshot().active_iteration());
+        drop(owner
+            .begin_iteration(controlled.try_begin_iteration().unwrap())
+            .unwrap());
+    }
+
     #[test]
     fn h23c4a_runtime_has_no_live_mutation_api() {
         let source = include_str!("realm_processor_branch_exact_runtime.rs");
@@ -280,5 +402,37 @@ mod tests {
         assert!(!runtime_trait.contains("async fn"));
         assert!(!runtime_trait.contains("prepare_and_verify"));
         assert!(!runtime_trait.contains("finish_published"));
+    }
+
+    #[test]
+    fn h23c4b_owner_and_attempt_are_nonclone_and_expose_no_side_effect_port() {
+        let source = include_str!("realm_processor_branch_exact_runtime.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        for declaration in [
+            "pub struct RealmBranchExactSingleCommitOwner",
+            "pub struct RealmBranchExactCommitIteration",
+        ] {
+            let before = production.split(declaration).next().unwrap();
+            let attributes = before.lines().rev().take(3).collect::<Vec<_>>().join("\n");
+            assert!(!attributes.contains("Clone"));
+            assert!(!attributes.contains("Default"));
+        }
+        assert!(!production.contains("impl Clone for RealmBranchExactSingleCommitOwner"));
+        assert!(!production.contains("impl Clone for RealmBranchExactCommitIteration"));
+
+        let attempt = production
+            .split("impl<Hash> RealmBranchExactCommitIteration")
+            .nth(1)
+            .unwrap();
+        for forbidden in [
+            "prepare_and_verify",
+            "finish_published",
+            "publish_marker",
+            "queue_close",
+            "CanonicalChainRef",
+            "Session",
+        ] {
+            assert!(!attempt.contains(forbidden));
+        }
     }
 }

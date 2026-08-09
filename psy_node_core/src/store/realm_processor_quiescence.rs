@@ -424,6 +424,15 @@ pub struct RealmProcessorIterationPermit {
     iteration_id: u64,
 }
 
+impl RealmProcessorIterationPermit {
+    /// Only the sibling branch-exact owner may distinguish an explicitly
+    /// controlled permit from the legacy disabled-mode compatibility permit.
+    /// The permit remains opaque to callers outside the store crate.
+    pub(super) const fn is_controlled(&self) -> bool {
+        self.state.is_some()
+    }
+}
+
 impl Drop for RealmProcessorIterationPermit {
     fn drop(&mut self) {
         let Some(state) = &self.state else {
