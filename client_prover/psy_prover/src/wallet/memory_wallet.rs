@@ -19,9 +19,12 @@ use psy_client_data::{
     qdata::contract::ContractCodeDefinition,
     qstore::imm::cmd_processor::PsyReadCommandProcessorSync,
 };
-use psy_common_circuit::circuits::{
-    traits::qstandard::QStandardCircuit,
-    zk_signature3::core::{PsyBasicZKSignatureCircuit, PsyBasicZKSignatureInnerCircuit},
+use psy_common_circuit::{
+    circuits::{
+        traits::qstandard::QStandardCircuit,
+        zk_signature3::core::{PsyBasicZKSignatureCircuit, PsyBasicZKSignatureInnerCircuit},
+    },
+    proof_minifier::pm_core::get_circuit_fingerprint_generic,
 };
 use psy_config::network_constants::{
     DEFAULT_CALLER_CONTRACT_ID_U64, GLOBAL_CONTRACT_TREE_HEIGHT, GLOBAL_USER_TREE_HEIGHT, MAX_CONTRACT_STATE_TREE_HEIGHT, PRIVATE_NOTE_TREE_HEIGHT,
@@ -1288,6 +1291,37 @@ mod tests {
         let proof = circuits.prove_zk_sign_inner(QHashOut::<F>::rand(), QHashOut::<F>::rand())?;
         circuits.zk_signature_inner().circuit_data.verify(proof)?;
         println!("from_embedded_bundle() load time: {:.3?}", load);
+        Ok(())
+    }
+
+    #[test]
+    fn embedded_local_circuits_match_current_sources() -> Result<()> {
+        let embedded = PsyWalletLocalCircuits::from_embedded_bundle()?;
+        let (global_user_height, global_contract_height, contract_state_height, note_height) = PRIVATE_NOTE_INCLUSION_HEIGHTS;
+        let current_private_note = PrivateNoteInclusionInnerCircuit::<C, D>::new(
+            global_user_height,
+            global_contract_height,
+            contract_state_height,
+            note_height,
+        );
+        let current_shield_deposit = ShieldDepositClaimInnerCircuit::<C, D>::new();
+        let current_zk_signature = PsyBasicZKSignatureInnerCircuit::<C, D>::new();
+
+        assert_eq!(
+            get_circuit_fingerprint_generic(&embedded.zk_signature_inner().circuit_data.verifier_only),
+            get_circuit_fingerprint_generic(&current_zk_signature.circuit_data.verifier_only),
+            "embedded zk-signature circuit is stale; regenerate local_circuits.json",
+        );
+        assert_eq!(
+            embedded.private_note_inclusion().get_fingerprint(),
+            current_private_note.get_fingerprint(),
+            "embedded private-note circuit is stale; regenerate local_circuits.json",
+        );
+        assert_eq!(
+            embedded.shield_deposit_claim().get_fingerprint(),
+            current_shield_deposit.get_fingerprint(),
+            "embedded shield-deposit circuit is stale; regenerate local_circuits.json",
+        );
         Ok(())
     }
 

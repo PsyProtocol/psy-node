@@ -865,6 +865,14 @@ export async function startRealmProcessorBatchSequentially<T>(
     return processes;
 }
 
+export async function startAfterPrerequisite<T>(
+    prerequisite: Promise<unknown>,
+    startServices: () => Promise<T>,
+): Promise<T> {
+    await prerequisite;
+    return startServices();
+}
+
 
 // --- Log Detectors ---
 function dbStartedDetector(line: string): boolean {
@@ -3290,17 +3298,13 @@ class DevNetProcessManager {
             }
             await Promise.all(coordEdgePromises);
         }
+        const startCoordinatorWorkerProcesses = async (): Promise<void> => {
+            if (!startCoordinatorWorkers || coordinatorWorkersCount === 0) return;
 
-        // 5. Coordinator Workers
-        if (startCoordinatorWorkers && coordinatorWorkersCount > 0) {
             for (let i = 0; i < coordinatorWorkersCount; i++) {
-                const coordUrls: string[] = [];
-
-                // Connect to all coordinator edges for better load distribution
+                const coordinatorUrls: string[] = [];
                 for (let edgeIndex = 0; edgeIndex < coordinatorEdgeCount; edgeIndex++) {
-                    const coordEdgePort = 1337 + edgeIndex;
-                    const coordUrl = `http://${this.host}:${coordEdgePort}`;
-                    coordUrls.push(coordUrl);
+                    coordinatorUrls.push(`http://${this.host}:${1337 + edgeIndex}`);
                 }
 
                 const workerArgs = [
@@ -3311,11 +3315,9 @@ class DevNetProcessManager {
                     '--completed-jobs-log-file', `./local_checkpoints/coordinator_worker_${i}.backup`,
                     '--batch-size', runtimeResources.workerBatchSize,
                 ];
-
-                for (const coordUrl of coordUrls) {
-                    workerArgs.push('--coordinator-api-url', coordUrl);
+                for (const coordinatorUrl of coordinatorUrls) {
+                    workerArgs.push('--coordinator-api-url', coordinatorUrl);
                 }
-
                 workerArgs.push('--private-key', FAKE_MINER_PRIVATE_KEY);
 
                 await this.track(await RunningProcess.spawnWithInitializationHintWithRetry(
@@ -3324,38 +3326,69 @@ class DevNetProcessManager {
                     { cwd, ...getLogPaths(`coordinator_worker_${i}`, true), maxRetries: 3, retryDelayMs: 2000, env: this.getEnv() }
                 ));
             }
-        }
+        };
+
+        let processorReadiness: Promise<void> = Promise.resolve();
 
         if (startRealmProcessor) {
-            console.log(`[DevNet] Starting ${realmsCount} realm processors and edges in parallel...`);
+            processorReadiness = (async () => {
+                console.log(`[DevNet] Starting ${realmsCount} realm processors and edges sequentially...`);
+                for (let b = 0; b < realmsCount; b += 4) {
+                    const batchSize = Math.min(4, realmsCount - b);
+                    const realmIds = Array.from(
+                        { length: batchSize },
+                        (_, i) => startRealmId + b + i,
+                    );
 
-            // Clean all checkpoints first
-            // console.log(`[DevNet] Cleaning checkpoints for ${realmsCount} realms...`);
-            // for (let i = 0; i < realmsCount; i++) {
-            //     const realmId = startRealmId + i;
-            //     await cleanCheckpoint('./local_checkpoints/realm_' + realmId + '_1', cwd);
-            // }
+                    await startRealmProcessorBatchSequentially(
+                        realmIds,
+                        async (realmId) => {
+                            const realmLogPaths = getLogPaths(`realm_${realmId}_processor`, false);
+                            const proc = await retryProcessorStartup(
+                                `realm ${realmId} processor`,
+                                (attempt, totalAttempts) => RunningProcess.spawnWithInitializationHint(
+                                    [
+                                        nodeCli, 'start-realm-processor',
+                                        '--realm-id', realmId.toString(),
+                                        '--realm-sub-id', '1',
+                                        '--network', this.NETWORK,
+                                        '--db-namespace', 'realm_' + realmId,
+                                        '--scylla-db-url', this.SCYLLA_URL,
+                                        '--nats-jetstream-url', this.NATS_URL,
+                                        '--redis-url', this.REDIS_URL,
+                                        '--genesis-data-path', this.genesisDataPath,
+                                        '--checkpoint-backup-path', './local_checkpoints',
+                                        '--coordinator-api-urls', this.COORD_API_URL,
+                                        '--proving-backend', backend,
+                                        '--verbose'
+                                    ],
+                                    (line) => isExactProcessorReadyLine(line, REALM_PROCESSOR_READY_MARKER),
+                                    {
+                                        cwd,
+                                        ...realmLogPaths,
+                                        initializationTimeoutMs: 180_000,
+                                        env: this.getEnv(),
+                                        appendLogs: attempt > 1,
+                                        logBanner: `===== realm ${realmId} processor readiness attempt ${attempt}/${totalAttempts} =====`,
+                                    },
+                                ),
+                                { maxRetries: 3, retryDelayMs: 2000 },
+                            );
+                            this.track(proc);
+                            return proc;
+                        },
+                    );
+                    console.log(`[DevNet] Batch ${b/4 + 1} realm processors finished genesis initialization.`);
 
-            // Each fresh realm creates the same schema in a separate keyspace.
-            // Serialize processor readiness so Scylla's single-node group-0 Raft
-            // state is not flooded by concurrent schema changes. Edges still
-            // start in parallel after their processor batch is fully ready.
-            for (let b = 0; b < realmsCount; b += 4) {
-                const batchSize = Math.min(4, realmsCount - b);
-                const realmIds = Array.from(
-                    { length: batchSize },
-                    (_, i) => startRealmId + b + i,
-                );
-
-                await startRealmProcessorBatchSequentially(
-                    realmIds,
-                    async (realmId) => {
-                        const realmLogPaths = getLogPaths(`realm_${realmId}_processor`, false);
-                        const proc = await retryProcessorStartup(
-                            `realm ${realmId} processor`,
-                            (attempt, totalAttempts) => RunningProcess.spawnWithInitializationHint(
+                    const realmEdgesPromises: Promise<RunningProcess>[] = [];
+                    for (let i = 0; i < batchSize; i++) {
+                        const realmId = startRealmId + b + i;
+                        const realmEdgeStartPort = 13380 + realmId * 10;
+                        for (let j = 0; j < realmEdgeCount; j++) {
+                            const port = realmEdgeStartPort + j;
+                            const edgePromise = RunningProcess.spawnWithInitializationHintWithRetry(
                                 [
-                                    nodeCli, 'start-realm-processor',
+                                    nodeCli, 'start-realm-edge',
                                     '--realm-id', realmId.toString(),
                                     '--realm-sub-id', '1',
                                     '--network', this.NETWORK,
@@ -3363,68 +3396,26 @@ class DevNetProcessManager {
                                     '--scylla-db-url', this.SCYLLA_URL,
                                     '--nats-jetstream-url', this.NATS_URL,
                                     '--redis-url', this.REDIS_URL,
-                                    '--genesis-data-path', this.genesisDataPath,
-                                    '--checkpoint-backup-path', './local_checkpoints',
-                                    '--coordinator-api-urls', this.COORD_API_URL,
+                                    '--port', port.toString(),
+                                    '--listen', '0.0.0.0',
                                     '--proving-backend', backend,
                                     '--verbose'
                                 ],
-                                (line) => isExactProcessorReadyLine(line, REALM_PROCESSOR_READY_MARKER),
-                                {
-                                    cwd,
-                                    ...realmLogPaths,
-                                    initializationTimeoutMs: 180_000,
-                                    env: this.getEnv(),
-                                    appendLogs: attempt > 1,
-                                    logBanner: `===== realm ${realmId} processor readiness attempt ${attempt}/${totalAttempts} =====`,
-                                },
-                            ),
-                            { maxRetries: 3, retryDelayMs: 2000 },
-                        );
-                        this.track(proc);
-                        return proc;
-                    },
-                );
-                console.log(`[DevNet] Batch ${b/4 + 1} realm processors finished genesis initialization.`);
-
-                // Now start the edges for this batch
-                const realmEdgesPromises: Promise<RunningProcess>[] = [];
-                for (let i = 0; i < batchSize; i++) {
-                    const realmId = startRealmId + b + i;
-                    const realmEdgeStartPort = 13380 + realmId * 10;
-
-                    // Start realm edges
-                    for (let j = 0; j < realmEdgeCount; j++) {
-                        const port = realmEdgeStartPort + j;
-                        const edgePromise = RunningProcess.spawnWithInitializationHintWithRetry(
-                            [
-                                nodeCli, 'start-realm-edge',
-                                '--realm-id', realmId.toString(),
-                                '--realm-sub-id', '1',
-                                '--network', this.NETWORK,
-                                '--db-namespace', 'realm_' + realmId,
-                                '--scylla-db-url', this.SCYLLA_URL,
-                                '--nats-jetstream-url', this.NATS_URL,
-                                '--redis-url', this.REDIS_URL,
-                                '--port', port.toString(),
-                                '--listen', '0.0.0.0',
-                                '--proving-backend', backend,
-                                '--verbose'
-                            ],
-                            realmEdgeProcessorStartedDetector,
-                            { cwd, ...getLogPaths(`realm_edge_${realmId}_${j}`, true), maxRetries: 3, retryDelayMs: 2000, env: this.getEnv() }
-                        ).then(proc => this.track(proc));
-                        realmEdgesPromises.push(edgePromise);
+                                realmEdgeProcessorStartedDetector,
+                                { cwd, ...getLogPaths(`realm_edge_${realmId}_${j}`, true), maxRetries: 3, retryDelayMs: 2000, env: this.getEnv() }
+                            ).then(proc => this.track(proc));
+                            realmEdgesPromises.push(edgePromise);
+                        }
                     }
+                    await Promise.all(realmEdgesPromises);
+                    console.log(`[DevNet] Batch ${b/4 + 1} realm edges started. Waiting 2 seconds before starting next batch...`);
+                    await new Promise(resolve => setTimeout(resolve, 2000));
                 }
-
-                // Wait for all realm edges in this batch to start
-                await Promise.all(realmEdgesPromises);
-                console.log(`[DevNet] Batch ${b/4 + 1} realm edges started. Waiting 2 seconds before starting next batch...`);
-                await new Promise(resolve => setTimeout(resolve, 2000));
-            }
-            console.log(`[DevNet] All realm processors and edges started`);
+                console.log(`[DevNet] All realm processors and edges started`);
+            })();
         }
+
+        await startAfterPrerequisite(processorReadiness, startCoordinatorWorkerProcesses);
 
         if (startRealmWorkers) {
             const workerPromises: Promise<RunningProcess>[] = [];

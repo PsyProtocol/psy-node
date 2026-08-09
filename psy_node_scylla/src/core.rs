@@ -44,29 +44,25 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
 
         println!("creating keyspaces: {} and {}", &keyspace, &no_tablet_keyspace);
 
-        // Create keyspace and table if not exists
-
-        let create_standard_keyspace = session
+        session
             .query_unpaged(
                 format!(
                     "CREATE KEYSPACE IF NOT EXISTS {} WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': 1}} AND tablets = {{ 'enabled': false }}",
                     &keyspace
                 ),
                 &[],
-            );
-        let create_no_tablet_keyspace = session
+            )
+            .await?;
+        session.await_schema_agreement().await?;
+        session
             .query_unpaged(
                 format!(
                     "CREATE KEYSPACE IF NOT EXISTS {} WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': 1}} AND tablets = {{ 'enabled': false }}",
                     &no_tablet_keyspace
                 ),
                 &[],
-            );
-
-        let (res_std, res_no_tablet) = tokio::join!(create_standard_keyspace, create_no_tablet_keyspace);
-
-        let _ = res_std?;
-        let _ = res_no_tablet?;
+            )
+            .await?;
         session.await_schema_agreement().await?;
         Ok(Self {
             session,

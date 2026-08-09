@@ -175,7 +175,7 @@ export function resolveCpuPartition(
     return {
         scyllaCpuSet: formatCpuSet([...resolvedScylla]),
         runtimeCpuSet: formatCpuSet([...resolvedRuntime]),
-        scyllaLogicalCpuCount: resolvedScylla.size,
+        scyllaLogicalCpuCount: physicalCoreGroups.filter((siblings) => siblings.every((cpu) => resolvedScylla.has(cpu))).length,
         runtimePhysicalCoreCount: physicalCoreGroups.filter((siblings) => siblings.every((cpu) => resolvedRuntime.has(cpu))).length,
     };
 }

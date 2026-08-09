@@ -85,13 +85,13 @@ describe("portable CPU partitioning", () => {
         expect(partition).toEqual({
             scyllaCpuSet: "0-1,16-17",
             runtimeCpuSet: "2-15,18-31",
-            scyllaLogicalCpuCount: 4,
+            scyllaLogicalCpuCount: 2,
             runtimePhysicalCoreCount: 14,
         });
     });
 
     it("adapts to 8-core hosts with and without SMT", () => {
-        expect(resolveCpuPartition(parseLscpuTopology(topology(8, 2)))?.scyllaLogicalCpuCount).toBe(4);
+        expect(resolveCpuPartition(parseLscpuTopology(topology(8, 2)))?.scyllaLogicalCpuCount).toBe(2);
         expect(resolveCpuPartition(parseLscpuTopology(topology(8, 1)))?.scyllaLogicalCpuCount).toBe(2);
     });
 
@@ -116,7 +116,7 @@ describe("portable CPU partitioning", () => {
         expect(resolveCpuPartitionForAffinity(groups, allowed)).toEqual({
             scyllaCpuSet: "0-1,16-17",
             runtimeCpuSet: "2-15,18-31",
-            scyllaLogicalCpuCount: 4,
+            scyllaLogicalCpuCount: 2,
             runtimePhysicalCoreCount: 14,
         });
         expect(resolveCpuPartitionForAffinity(groups, allowed, "0-1,16-17", "2-15,18-31")).not.toBeNull();

@@ -13,6 +13,7 @@ import {
     RunningProcess,
     runStreamingCaptureStderr,
     retryProcessorStartup,
+    startAfterPrerequisite,
     startRealmProcessorBatchSequentially,
     writeCompilerArtifactStamp,
 } from "./locSetupV4";
@@ -175,6 +176,38 @@ describe("startRealmProcessorBatchSequentially", () => {
         });
         await expect(startup).rejects.toThrow("realm 5 failed readiness");
         expect(started).toEqual([4, 5]);
+    });
+});
+
+describe("startAfterPrerequisite", () => {
+    it("does not start workers until every processor reaches readiness", async () => {
+        const order: string[] = [];
+        const { promise: readiness, resolve } = Promise.withResolvers<void>();
+        const { promise: workersStarted, resolve: resolveWorkersStarted } = Promise.withResolvers<void>();
+        const startup = startAfterPrerequisite(readiness, async () => {
+            order.push("workers");
+            resolveWorkersStarted();
+        });
+
+        expect(order).toEqual([]);
+        order.push("processors");
+        resolve();
+        await workersStarted;
+        await startup;
+        expect(order).toEqual(["processors", "workers"]);
+    });
+
+    it("does not start workers when processor readiness fails", async () => {
+        let workersStarted = false;
+        const startup = startAfterPrerequisite(
+            Promise.reject(new Error("realm readiness failed")),
+            async () => {
+                workersStarted = true;
+            },
+        );
+
+        await expect(startup).rejects.toThrow("realm readiness failed");
+        expect(workersStarted).toBe(false);
     });
 });
 
