@@ -146,7 +146,7 @@ mod tests {
 
     use parth_core::data::hash::merkle_node_nest::{MerkleLeafNode, MerkleNodeNest};
     use plonky2::{
-        field::{goldilocks_field::GoldilocksField, types::Field},
+        field::{goldilocks_field::GoldilocksField, types::{Field, PrimeField64}},
         hash::poseidon::PoseidonHash,
         plonk::config::Hasher,
     };
