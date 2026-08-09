@@ -1003,6 +1003,10 @@ impl SealedRecoverableNatsPublish {
 }
 
 impl RecoverablePendingQueueNatsPublisher {
+    pub const fn segment(&self) -> &RecoverableNatsStreamSegment {
+        &self.segment
+    }
+
     pub async fn connect<A: ToServerAddrs>(
         addresses: A,
         segment: RecoverableNatsStreamSegment,

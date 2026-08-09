@@ -493,6 +493,31 @@ impl ScyllaPendingQueueSegmentLedgerStore {
         }
     }
 
+    /// Read an assignment already reserved by the generation owner. Edge
+    /// publishers are readers of this authority: they may not create a new
+    /// reservation merely because a user request arrived.
+    pub async fn read_assignment_exact(
+        &self,
+        key: &PendingQueueSegmentLedgerKey,
+        context: PendingQueueCaptureContext,
+    ) -> Result<PendingQueueSegmentAssignmentReceipt, PendingQueueSegmentLedgerStoreError> {
+        let PendingQueueSegmentLedgerReadState::Current(current) = self.read(key).await? else {
+            return Err(PendingQueueSegmentLedgerStoreError::Uninitialized);
+        };
+        let assignment = current
+            .assignment_for(context)
+            .ok_or(PendingQueueSegmentLedgerStoreError::AssignmentMissing)?
+            .clone();
+        if assignment.context() != context {
+            return Err(PendingQueueSegmentLedgerStoreError::AssignmentContextMismatch);
+        }
+        // Assignments are append-only. A later generation may advance the
+        // ledger revision, but it cannot mutate this receipt's assignment or
+        // assigned-at revision. Requiring the whole row to remain unchanged
+        // here would create a false outage under concurrent reservations.
+        self.receipt_from_exact(&current, assignment)
+    }
+
     /// Freeze the exact assignment set currently owned by one segment. The
     /// method point-reads the ledger before and after construction and rejects
     /// any concurrent reservation/rotation rather than returning a mixed
@@ -773,11 +798,12 @@ pub enum PendingQueueSegmentLedgerStoreError {
     RevisionOverflow,
     SelectedKeyMismatch,
     Uninitialized,
+    AssignmentMissing,
+    AssignmentContextMismatch,
     MissingAppliedColumn,
     InvalidAppliedColumn,
     MissingAfterLwt,
     AppliedStateMismatch,
-    AssignmentMissing,
     AssignmentMismatch,
     SegmentMissing,
     SegmentStillAdmitting,

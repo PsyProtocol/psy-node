@@ -548,20 +548,28 @@ impl ScyllaPendingQueuePublishStore {
         let source_slot = expected_source.slot().map_err(model_envelope)?;
         let mut source = self.read_source(source_slot).await?
             .ok_or(PendingQueuePublishStoreError::SourceUninitialized)?;
-        let persisted_intent = self.read_intent(intent_slot).await?;
-        let mut intent = match persisted_intent {
-            Some(current) => current,
-            None => self.read_prepared(source_slot, intent_slot).await?
-                .ok_or(PendingQueuePublishStoreError::IntentUninitialized)?,
-        };
-        if intent.publisher_kind() != publisher_kind
-            || intent.assignment_digest() != assignment.digest()
-            || intent.source_slot() != source_slot
+        let prepared = self.read_prepared(source_slot, intent_slot).await?
+            .ok_or(PendingQueuePublishStoreError::IntentUninitialized)?;
+        if prepared.publisher_kind() != publisher_kind
+            || prepared.assignment_digest() != assignment.digest()
+            || prepared.source_slot() != source_slot
         {
             return Err(PendingQueuePublishStoreError::AssignmentMismatch);
         }
-        let payload = self.load_payload(&intent).await?;
-        let envelope = self.build_envelope(&route, assignment, &source, &intent, payload.clone())?;
+        let payload = self.load_payload(&prepared).await?;
+        let envelope = self.build_envelope(&route, assignment, &source, &prepared, payload.clone())?;
+        let persisted_intent = self.read_intent(intent_slot).await?;
+        if let Some(current) = persisted_intent.as_ref() {
+            if current.source_slot() != source_slot
+                || current.assignment_digest() != assignment.digest()
+            {
+                if source.inflight_matches(&envelope) {
+                    self.cancel_unpublished_source_selection(&source, &envelope).await?;
+                }
+                return Err(PendingQueuePublishStoreError::IntentBoundElsewhere);
+            }
+        }
+        let mut intent = persisted_intent.unwrap_or(prepared);
         if matches!(intent.phase(), PendingQueuePublishIntentPhase::Materialized) {
             let source_plan = source.select(&envelope).map_err(model_envelope)?;
             if let Some((expected, candidate)) = source_plan.transition() {
@@ -578,7 +586,23 @@ impl ScyllaPendingQueuePublishStore {
             let intent_plan = intent.bind(&source, &envelope, &payload).map_err(model_outbox)?;
             let (_, candidate) = intent_plan.transition()
                 .ok_or(PendingQueuePublishStoreError::IntentPhaseMismatch)?;
-            intent = self.bootstrap_bound_intent(candidate).await?;
+            intent = match self.bootstrap_bound_intent(candidate).await {
+                Ok(intent) => intent,
+                Err(PendingQueuePublishStoreError::CasConflict) => {
+                    let current = self.read_intent(intent_slot).await?
+                        .ok_or(PendingQueuePublishStoreError::IntentUninitialized)?;
+                    if current.source_slot() == source_slot
+                        && current.assignment_digest() == assignment.digest()
+                        && self.intent_matches_envelope(&current, &envelope)
+                    {
+                        current
+                    } else {
+                        self.cancel_unpublished_source_selection(&source, &envelope).await?;
+                        return Err(PendingQueuePublishStoreError::IntentBoundElsewhere);
+                    }
+                }
+                Err(error) => return Err(error),
+            };
         }
         if intent.bound_envelope().is_none() || !self.intent_matches_envelope(&intent, &envelope) {
             return Err(PendingQueuePublishStoreError::IntentPhaseMismatch);
@@ -855,6 +879,35 @@ impl ScyllaPendingQueuePublishStore {
         self.finish_intent_write(execution, candidate).await
     }
 
+    async fn cancel_unpublished_source_selection(
+        &self,
+        selected: &PendingQueuePublishSourceState,
+        envelope: &PendingQueuePublishEnvelope,
+    ) -> Result<(), PendingQueuePublishStoreError> {
+        let plan = selected
+            .cancel_unpublished_selection(envelope)
+            .map_err(model_envelope)?;
+        match self
+            .cas_source_state(plan.expected(), plan.candidate())
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(PendingQueuePublishStoreError::CasConflict) => {
+                let slot = selected.slot().map_err(model_envelope)?;
+                let current = self
+                    .read_source(slot)
+                    .await?
+                    .ok_or(PendingQueuePublishStoreError::SourceUninitialized)?;
+                if current.inflight_matches(envelope) {
+                    Err(PendingQueuePublishStoreError::CasConflict)
+                } else {
+                    Ok(())
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     async fn apply_intent_plan(&self, plan: PendingQueueIntentTransitionPlan) -> Result<StoredPendingQueuePublishIntent, PendingQueuePublishStoreError> {
         match plan {
             PendingQueueIntentTransitionPlan::Idempotent(current) => Ok(current),
@@ -1097,6 +1150,7 @@ pub enum PendingQueuePublishStoreError {
     SourceNotSealed,
     IntentUninitialized,
     IntentConflict,
+    IntentBoundElsewhere,
     IntentPhaseMismatch,
     SourceSelectionMismatch,
     SourceCommitMismatch,

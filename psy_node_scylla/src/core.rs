@@ -19,6 +19,11 @@ use psy_node_core::store::realm_processor_startup::{
     RealmProcessorStartupError, RealmProcessorStartupExpectation,
     RealmProcessorStartupPreflightProvider,
 };
+use psy_node_core::queue::realm_user_update_publish::RealmUserUpdatePublishError;
+use psy_node_nats::{
+    recoverable_segment::RecoverableNatsStreamSegment,
+    recoverable_transport::RecoverablePendingQueueNatsPublisher,
+};
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
 use crate::rollback::{
@@ -31,6 +36,7 @@ use crate::rollback::{
     PendingQueueSidecarLifecycleError, PendingQueueSidecarReady,
     PendingQueueSidecarReadyView, PendingQueueSidecarSetupMode,
     PendingQueueSidecarSetupOutcome, ScyllaPendingQueueSidecarSetupGate,
+    ScyllaRealmEdgeDurablePublisher,
 };
 use crate::rollback::branch_exact_startup_preflight::ScyllaRealmProcessorStartupPreflightProvider;
 use crate::tables::{merkle::ScyllaMerkleNodesZeroPreparedStatements, traits::ScyllaStandardPreparedTableStatements};
@@ -331,6 +337,45 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
         self.pending_queue_sidecar_ready
             .get()
             .map(|ready| ready.view().clone())
+    }
+
+    /// Explicit Realm Edge publisher composition. Existing node setup never
+    /// calls this method; an enabled caller must first acquire both h20 branch
+    /// schema and c4c1 queue-sidecar readiness on this exact store.
+    pub(crate) async fn prepare_realm_edge_durable_publisher<F: parth_core::felt::QFelt64>(
+        &self,
+        network: NetworkId,
+        authority: psy_data::protocol::chain_context::AuthorityScope,
+        nats: Arc<RecoverablePendingQueueNatsPublisher>,
+        segment: RecoverableNatsStreamSegment,
+    ) -> Result<Arc<ScyllaRealmEdgeDurablePublisher<F, Hash>>, RealmUserUpdatePublishError>
+    where
+        Hash: Q256BitHash,
+    {
+        let schema = self.branch_exact_schema_ready.get().ok_or_else(|| {
+            RealmUserUpdatePublishError::NotReady(
+                "branch-exact schema capability is disabled".to_owned(),
+            )
+        })?;
+        if schema.view().authority() != authority {
+            return Err(RealmUserUpdatePublishError::AuthorityMismatch);
+        }
+        let queue = self.pending_queue_sidecar_ready.get().cloned().ok_or_else(|| {
+            RealmUserUpdatePublishError::NotReady(
+                "pending queue sidecar capability is disabled".to_owned(),
+            )
+        })?;
+        Ok(Arc::new(
+            ScyllaRealmEdgeDurablePublisher::prepare(
+                self.session.clone(),
+                network,
+                authority,
+                queue,
+                nats,
+                segment,
+            )
+            .await?,
+        ))
     }
 
     fn require_pending_queue_sidecar_ready(

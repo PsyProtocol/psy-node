@@ -1393,6 +1393,30 @@ impl PendingQueuePublishSourceState {
         })
     }
 
+    /// Undo a source selection only while no network publication can have
+    /// occurred. This is used when two generation-scoped sources race to bind
+    /// one generation-independent caller intent: the global LWT winner keeps
+    /// its source, while the loser returns to the exact pre-publication Open
+    /// cursor. It must never cancel CommitPending or an unrelated envelope.
+    pub fn cancel_unpublished_selection(
+        &self,
+        envelope: &PendingQueuePublishEnvelope,
+    ) -> Result<PendingQueueSourceApplyPlan, PendingQueueEnvelopeError> {
+        let PendingQueuePublishSourcePhase::Publishing(_) = &self.phase else {
+            return Err(PendingQueueEnvelopeError::NoPublishInProgress);
+        };
+        if !self.selected_matches(envelope) {
+            return Err(PendingQueueEnvelopeError::SelectionCancelMismatch);
+        }
+        let mut candidate = self.clone();
+        candidate.revision = self.revision.next()?;
+        candidate.phase = PendingQueuePublishSourcePhase::Open;
+        Ok(PendingQueueSourceApplyPlan {
+            expected: self.clone(),
+            candidate,
+        })
+    }
+
     pub fn finalize_published(
         &self,
     ) -> Result<PendingQueueSourceApplyPlan, PendingQueueEnvelopeError> {
@@ -1930,6 +1954,7 @@ pub enum PendingQueueEnvelopeError {
     SourceQuotaExceeded,
     MemberLimitExceeded,
     PublishAlreadyInProgress,
+    SelectionCancelMismatch,
     SourceAlreadySealed,
     CommitAlreadyPending,
     SourceCursorMismatch,
@@ -2245,11 +2270,46 @@ mod tests {
             selected.select(&data).unwrap(),
             PendingQueueSourceSelectionPlan::Idempotent(_),
         ));
+        let wrong_data = PendingQueuePublishEnvelope::data(
+            &route,
+            &assignment,
+            PendingQueuePublishIntentId::try_new([43; 32]).unwrap(),
+            PendingQueueMemberOrdinal::try_new(1).unwrap(),
+            0,
+            [0; 32],
+            b"other".to_vec(),
+        )
+        .unwrap();
+        assert_eq!(
+            selected.cancel_unpublished_selection(&wrong_data),
+            Err(PendingQueueEnvelopeError::SelectionCancelMismatch),
+        );
+        let cancelled = selected
+            .cancel_unpublished_selection(&data)
+            .unwrap()
+            .candidate()
+            .clone();
+        assert!(matches!(cancelled.phase(), PendingQueuePublishSourcePhase::Open));
+        assert_eq!(cancelled.data_member_count(), 0);
+        assert_eq!(
+            cancelled.cancel_unpublished_selection(&data),
+            Err(PendingQueueEnvelopeError::NoPublishInProgress),
+        );
+        let selected = match cancelled.select(&data).unwrap() {
+            PendingQueueSourceSelectionPlan::Advance { candidate, .. } => {
+                candidate
+            }
+            _ => unreachable!(),
+        };
         let commit_pending = selected
             .record_published(100)
             .unwrap()
             .candidate()
             .clone();
+        assert_eq!(
+            commit_pending.cancel_unpublished_selection(&data),
+            Err(PendingQueueEnvelopeError::NoPublishInProgress),
+        );
         assert!(matches!(
             commit_pending.phase(),
             PendingQueuePublishSourcePhase::CommitPending { .. }
