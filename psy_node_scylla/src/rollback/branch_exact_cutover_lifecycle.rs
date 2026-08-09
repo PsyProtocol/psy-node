@@ -10,7 +10,7 @@ use std::{error::Error, fmt};
 
 use parth_core::protocol::core_types::Q256BitHash;
 use psy_data::protocol::{
-    canonical_chain::CANONICAL_CHAIN_REF_V1_LEN,
+    canonical_chain::{NetworkId, CANONICAL_CHAIN_REF_V1_LEN},
     chain_context::AuthorityScope,
 };
 use psy_node_core::store::{
@@ -240,6 +240,10 @@ impl<Hash: Q256BitHash> BranchExactCutoverBinding<Hash> {
         &self.watermark
     }
 
+    pub const fn network(&self) -> NetworkId {
+        self.watermark.canonical_chain().network_id()
+    }
+
     pub const fn digest(&self) -> BranchExactCutoverBindingDigest {
         self.digest
     }
@@ -303,6 +307,25 @@ impl<Hash: Q256BitHash> StoredBranchExactCutover<Hash> {
             .map_err(|_| BranchExactCutoverError::NegativeRevision(selected_revision))?;
         let decoded = decode_stored(payload)?;
         if decoded.binding.generation.get() != generation
+            || decoded.revision.get() != revision
+            || decoded.to_canonical_bytes() != payload
+        {
+            return Err(BranchExactCutoverError::PersistedIdentityMismatch);
+        }
+        Ok(decoded)
+    }
+
+    pub(crate) fn decode_selected(
+        selected_network: NetworkId,
+        selected_authority: AuthorityScope,
+        selected_revision: i64,
+        payload: &[u8],
+    ) -> Result<Self, BranchExactCutoverError> {
+        let revision = u64::try_from(selected_revision)
+            .map_err(|_| BranchExactCutoverError::NegativeRevision(selected_revision))?;
+        let decoded = decode_stored(payload)?;
+        if decoded.binding.network() != selected_network
+            || decoded.binding.authority != selected_authority
             || decoded.revision.get() != revision
             || decoded.to_canonical_bytes() != payload
         {
