@@ -146,7 +146,7 @@ impl Error for RealmNormalCommitCoverageResolutionError {}
 
 /// Resolve the driver-independent production call graph against the exhaustive
 /// Scylla registry. The result remains blocked until the production writer
-/// migration and the two affected schema migrations have actually landed.
+/// migration and the branch-exact target migration have actually landed.
 pub fn resolve_realm_normal_commit_coverage(
     plan: RealmNormalCommitCoveragePlan,
 ) -> Result<RealmNormalCommitCoverageReport, RealmNormalCommitCoverageResolutionError>
@@ -290,9 +290,10 @@ const fn expected_physical_table(
     }
 }
 
-/// D-02T adapters are still isolated prototypes. No production Realm writer
-/// has crossed the typed/timestamped confinement boundary yet. Keeping this
-/// match exhaustive makes adding a new semantic domain fail closed.
+/// The h22 branch-exact writer qualifies a default-off five-domain substitute,
+/// but no production Realm `commit_state` callsite has crossed the
+/// typed/timestamped confinement boundary yet. Keeping this match exhaustive
+/// makes adding a new semantic domain fail closed.
 const fn production_writer_is_typed_timestamped(
     domain: RealmNormalCommitWriteDomain,
 ) -> bool {
@@ -448,6 +449,46 @@ mod tests {
             covered_domains: 0,
             required_domains: 22,
         }));
+        assert!(report.require_durable_prepared_ready().is_err());
+    }
+
+    #[test]
+    fn h22f_reaudit_keeps_exact_global_blockers_and_zero_production_coverage() {
+        use psy_node_core::store::realm_normal_commit_coverage::H22_BRANCH_EXACT_REALM_DOMAIN_SCOPE;
+
+        let report = resolve_realm_normal_commit_coverage(
+            RealmNormalCommitCoveragePlan::from_prepared(&prepared()),
+        )
+        .unwrap();
+        assert_eq!(H22_BRANCH_EXACT_REALM_DOMAIN_SCOPE.len(), 5);
+        assert_eq!(report.resolved().len(), 22);
+        assert_eq!(report.production_writer_covered_domain_count(), 0);
+        assert_eq!(
+            report.blockers(),
+            &[
+                RealmNormalCommitDurabilityBlocker::LegacyHeightOnlyReverseMapping {
+                    write_domain: RealmNormalCommitWriteDomain::PendingToCheckpoint,
+                },
+                RealmNormalCommitDurabilityBlocker::Registry {
+                    write_domain: RealmNormalCommitWriteDomain::CheckpointToPending,
+                    blocker: RegistryBlocker::ReusableCheckpointHeightKey,
+                },
+                RealmNormalCommitDurabilityBlocker::Registry {
+                    write_domain: RealmNormalCommitWriteDomain::GlobalUserTopProofAtCheckpoint,
+                    blocker: RegistryBlocker::MixedCheckpointPendingAxis,
+                },
+                RealmNormalCommitDurabilityBlocker::Registry {
+                    write_domain: RealmNormalCommitWriteDomain::RewardsTopProofAtPending,
+                    blocker: RegistryBlocker::MixedCheckpointPendingAxis,
+                },
+                RealmNormalCommitDurabilityBlocker::ExplicitProductionWriteTimestampIncomplete,
+                RealmNormalCommitDurabilityBlocker::ProductionWriterCoverageIncomplete {
+                    covered_domains: 0,
+                    required_domains: 22,
+                },
+            ]
+        );
+        assert!(!PRODUCTION_CQL_CAPABILITIES.explicit_write_timestamp);
         assert!(report.require_durable_prepared_ready().is_err());
     }
 

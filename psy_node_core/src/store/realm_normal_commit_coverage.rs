@@ -8,6 +8,8 @@
 
 use psy_data::prepared_block::realm::PsyPreparedRealmBlockStateUpdates;
 
+use super::branch_exact_dual_write::BranchExactDualWriteMutationKind;
+
 /// One semantic write domain reached by the current Realm `commit_state`
 /// implementation.  Helper calls that fan out to two physical tables have two
 /// variants, and two logical slots sharing one physical table remain distinct.
@@ -125,6 +127,40 @@ impl RealmNormalCommitWriteDomain {
     }
 }
 
+/// The exact h8 semantic domains represented by the narrow h22 Realm
+/// branch-exact intent. This is mechanism coverage, not production-callsite
+/// coverage: h22 remains default-off until the Processor cutover in h23.
+pub const H22_BRANCH_EXACT_REALM_DOMAIN_SCOPE: [RealmNormalCommitWriteDomain; 5] = [
+    RealmNormalCommitWriteDomain::PendingToCheckpoint,
+    RealmNormalCommitWriteDomain::CheckpointToPending,
+    RealmNormalCommitWriteDomain::PendingToProc,
+    RealmNormalCommitWriteDomain::ProcToPending,
+    RealmNormalCommitWriteDomain::RewardsTopProofAtPending,
+];
+
+/// Fold each legacy/target physical leg in the h22 Realm intent back to the
+/// h8 semantic operation it implements. Keeping this match exhaustive makes
+/// a new h22 leg require an explicit coverage decision.
+pub const fn realm_normal_commit_domain_for_branch_exact_mutation(
+    mutation: BranchExactDualWriteMutationKind,
+) -> RealmNormalCommitWriteDomain {
+    use BranchExactDualWriteMutationKind as B;
+    use RealmNormalCommitWriteDomain as R;
+    match mutation {
+        B::LegacyPendingToCheckpoint | B::TargetPendingToBranch => {
+            R::PendingToCheckpoint
+        }
+        B::LegacyCheckpointToPending | B::TargetBranchToPending => {
+            R::CheckpointToPending
+        }
+        B::LegacyPendingToProc => R::PendingToProc,
+        B::LegacyProcToPending => R::ProcToPending,
+        B::LegacyPendingRewardProof | B::TargetPendingRewardProof => {
+            R::RewardsTopProofAtPending
+        }
+    }
+}
+
 /// A prepared field that the current production control flow will not write.
 /// This is evidence for the future fail-closed durable path; observing it does
 /// not alter legacy production behaviour in this integration slice.
@@ -225,6 +261,8 @@ impl RealmNormalCommitCoveragePlan {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use parth_core::{
         PHash, QCoreProcCheckpointUniqueId,
         protocol::core_types::Q256BitHash,
@@ -302,5 +340,21 @@ mod tests {
                 IgnoredRealmPreparedField::ContractStateImtLeaves,
             ]
         );
+    }
+
+    #[test]
+    fn h22_realm_intent_is_exactly_five_of_twenty_two_semantic_domains() {
+        let actual = BranchExactDualWriteMutationKind::REALM
+            .into_iter()
+            .map(realm_normal_commit_domain_for_branch_exact_mutation)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        assert_eq!(actual, H22_BRANCH_EXACT_REALM_DOMAIN_SCOPE);
+        assert_eq!(actual.len(), 5);
+        assert_eq!(RealmNormalCommitWriteDomain::ALL.len(), 22);
+        assert!(!actual.contains(
+            &RealmNormalCommitWriteDomain::GlobalUserTopProofAtCheckpoint,
+        ));
     }
 }
