@@ -52,12 +52,15 @@ use super::{
 };
 use super::branch_exact_pending_orchestration::{
     classify_branch_exact_pending_startup, BranchExactPendingStartupRecovery,
+    BranchExactPreparedWriterRecovery,
 };
 
 const READINESS_DOMAIN: &[u8] =
     b"psy/rollback/realm-startup-scylla-readiness/v1";
 const WATERMARK_DOMAIN: &[u8] =
     b"psy/rollback/realm-startup-cutover-watermark/v1";
+const RECOVERY_ADMISSION_DOMAIN: &[u8] =
+    b"psy/rollback/realm-startup-recovery-admission/v1";
 const COMPOSITE_PARTS: usize = 7;
 
 /// Private schema reader. The provider does not expose or return the raw
@@ -508,6 +511,140 @@ impl ScyllaStartupCompositeFingerprint {
         }
         out
     }
+
+    fn digest(&self) -> [u8; 32] {
+        Sha256::digest(self.canonical_bytes()).into()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum ScyllaStartupRecoveryActionKind {
+    ApplyPendingTransition = 1,
+    ResumeWriterVerification = 2,
+    FinishWriterAfterTrustedMarker = 3,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScyllaStartupAwaitExternalReason {
+    PrimeOrRotate,
+    ResumeQueueSeal,
+    RecoverCapturedWork,
+    PublishTrustedMarker,
+    PublishNoWork,
+    RotateTerminal,
+}
+
+enum ScyllaStartupRecoveryAction<Hash> {
+    ApplyPendingTransition(
+        psy_node_core::store::pending_generation_pipeline::SealedPendingPipelineTransition<Hash>,
+    ),
+    ResumeWriterVerification(BranchExactPreparedWriterRecovery),
+    FinishWriterAfterTrustedMarker,
+}
+
+/// One full-composite-bound action. It is intentionally non-Clone and has no
+/// public constructor or codec. h23c3c must fresh-read the seven-component
+/// fingerprint before consuming it and execute exactly this one action.
+struct SealedScyllaStartupRecoveryAdmission<Hash> {
+    source_fingerprint: [u8; 32],
+    action_digest: [u8; 32],
+    action: ScyllaStartupRecoveryAction<Hash>,
+}
+
+impl<Hash> SealedScyllaStartupRecoveryAdmission<Hash> {
+    fn source_fingerprint(&self) -> &[u8; 32] {
+        &self.source_fingerprint
+    }
+
+    fn action_digest(&self) -> &[u8; 32] {
+        &self.action_digest
+    }
+
+    fn matches_source(&self, current: &ScyllaStartupCompositeFingerprint) -> bool {
+        self.source_fingerprint == current.digest()
+    }
+}
+
+enum ScyllaStartupRecoveryDecision<Hash> {
+    Clean,
+    Recover(SealedScyllaStartupRecoveryAdmission<Hash>),
+    AwaitExternal(ScyllaStartupAwaitExternalReason),
+}
+
+fn seal_recovery_decision<Hash>(
+    source: &ScyllaStartupCompositeFingerprint,
+    recovery: BranchExactPendingStartupRecovery<Hash>,
+) -> ScyllaStartupRecoveryDecision<Hash> {
+    let source_fingerprint = source.digest();
+    let action = match recovery {
+        BranchExactPendingStartupRecovery::ReadyForQueueClose => {
+            return ScyllaStartupRecoveryDecision::Clean
+        }
+        BranchExactPendingStartupRecovery::ApplyPipeline { pipeline, .. } => {
+            ScyllaStartupRecoveryAction::ApplyPendingTransition(pipeline)
+        }
+        BranchExactPendingStartupRecovery::ResumeWriterVerification(recovery) => {
+            ScyllaStartupRecoveryAction::ResumeWriterVerification(recovery)
+        }
+        BranchExactPendingStartupRecovery::FinishWriterAfterTrustedMarker => {
+            ScyllaStartupRecoveryAction::FinishWriterAfterTrustedMarker
+        }
+        BranchExactPendingStartupRecovery::AwaitPrimeOrRotate => {
+            return ScyllaStartupRecoveryDecision::AwaitExternal(
+                ScyllaStartupAwaitExternalReason::PrimeOrRotate,
+            )
+        }
+        BranchExactPendingStartupRecovery::ResumeQueueSeal(_) => {
+            return ScyllaStartupRecoveryDecision::AwaitExternal(
+                ScyllaStartupAwaitExternalReason::ResumeQueueSeal,
+            )
+        }
+        BranchExactPendingStartupRecovery::AwaitRecoverableWork(_) => {
+            return ScyllaStartupRecoveryDecision::AwaitExternal(
+                ScyllaStartupAwaitExternalReason::RecoverCapturedWork,
+            )
+        }
+        BranchExactPendingStartupRecovery::AwaitTrustedMarker => {
+            return ScyllaStartupRecoveryDecision::AwaitExternal(
+                ScyllaStartupAwaitExternalReason::PublishTrustedMarker,
+            )
+        }
+        BranchExactPendingStartupRecovery::ResumeNoWorkPublication(_) => {
+            return ScyllaStartupRecoveryDecision::AwaitExternal(
+                ScyllaStartupAwaitExternalReason::PublishNoWork,
+            )
+        }
+        BranchExactPendingStartupRecovery::CompleteNoWorkAfterTrustedMarker
+        | BranchExactPendingStartupRecovery::CompleteAfterTrustedMarker => {
+            return ScyllaStartupRecoveryDecision::AwaitExternal(
+                ScyllaStartupAwaitExternalReason::RotateTerminal,
+            )
+        }
+    };
+    let action_kind = match &action {
+        ScyllaStartupRecoveryAction::ApplyPendingTransition(_) => {
+            ScyllaStartupRecoveryActionKind::ApplyPendingTransition
+        }
+        ScyllaStartupRecoveryAction::ResumeWriterVerification(_) => {
+            ScyllaStartupRecoveryActionKind::ResumeWriterVerification
+        }
+        ScyllaStartupRecoveryAction::FinishWriterAfterTrustedMarker => {
+            ScyllaStartupRecoveryActionKind::FinishWriterAfterTrustedMarker
+        }
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(RECOVERY_ADMISSION_DOMAIN);
+    hasher.update(source_fingerprint);
+    hasher.update([action_kind as u8]);
+    let action_digest = hasher.finalize().into();
+    ScyllaStartupRecoveryDecision::Recover(
+        SealedScyllaStartupRecoveryAdmission {
+            source_fingerprint,
+            action_digest,
+            action,
+        },
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -702,6 +839,84 @@ mod tests {
             ScyllaStartupCompositeFingerprint::try_new(parts),
             Err(RealmProcessorStartupError::DurableStorageIndeterminate(_))
         ));
+    }
+
+    #[test]
+    fn recovery_decision_is_exhaustive_and_bound_to_the_full_composite() {
+        let source = fingerprint();
+        assert!(matches!(
+            seal_recovery_decision::<parth_core::PHash>(
+                &source,
+                BranchExactPendingStartupRecovery::ReadyForQueueClose,
+            ),
+            ScyllaStartupRecoveryDecision::Clean
+        ));
+        for (recovery, expected) in [
+            (
+                BranchExactPendingStartupRecovery::<parth_core::PHash>::AwaitPrimeOrRotate,
+                ScyllaStartupAwaitExternalReason::PrimeOrRotate,
+            ),
+            (
+                BranchExactPendingStartupRecovery::AwaitTrustedMarker,
+                ScyllaStartupAwaitExternalReason::PublishTrustedMarker,
+            ),
+            (
+                BranchExactPendingStartupRecovery::CompleteAfterTrustedMarker,
+                ScyllaStartupAwaitExternalReason::RotateTerminal,
+            ),
+        ] {
+            assert!(matches!(
+                seal_recovery_decision(&source, recovery),
+                ScyllaStartupRecoveryDecision::AwaitExternal(reason)
+                    if reason == expected
+            ));
+        }
+
+        let ScyllaStartupRecoveryDecision::Recover(admission) =
+            seal_recovery_decision::<parth_core::PHash>(
+                &source,
+                BranchExactPendingStartupRecovery::FinishWriterAfterTrustedMarker,
+            )
+        else {
+            panic!("finish-writer must produce one sealed recovery action")
+        };
+        assert_eq!(admission.source_fingerprint(), &source.digest());
+        assert_ne!(admission.action_digest(), &[0; 32]);
+        assert!(admission.matches_source(&source));
+        let mut changed = source.clone();
+        changed.parts[6].push(0xff);
+        assert!(!admission.matches_source(&changed));
+        assert!(matches!(
+            admission.action,
+            ScyllaStartupRecoveryAction::FinishWriterAfterTrustedMarker
+        ));
+    }
+
+    #[test]
+    fn recovery_admission_is_private_nonclone_and_has_no_codec() {
+        let source = include_str!("branch_exact_startup_preflight.rs");
+        let declaration = source
+            .split("struct SealedScyllaStartupRecoveryAdmission")
+            .next()
+            .unwrap()
+            .lines()
+            .rev()
+            .take(2)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!declaration.contains("pub struct"));
+        assert!(!declaration.contains("Clone"));
+        assert!(!declaration.contains("Serialize"));
+        let public_constructor = ["pub fn ", "seal_recovery_decision"].concat();
+        assert!(!source.contains(&public_constructor));
+        let decision = source
+            .split("fn seal_recovery_decision")
+            .nth(1)
+            .unwrap()
+            .split("#[derive(Clone, Copy, Debug, Eq, PartialEq)]\nstruct ValidatedScyllaStartup")
+            .next()
+            .unwrap();
+        assert!(!decision.contains("_ =>"));
     }
 
     #[test]
