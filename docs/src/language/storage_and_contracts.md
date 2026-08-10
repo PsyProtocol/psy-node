@@ -526,7 +526,7 @@ impl Storage for Person {
 
 ### StorageRef Derive
 
-The `#[derive(StorageRef)]` attribute generates type-specific reference structs that provide `get` and `set` helper methods:
+The `#[derive(StorageRef)]` attribute generates xxxRef types that provide `get` and `set` helper methods:
 
 ```rust
 #[derive(Storage, StorageRef)]
@@ -564,7 +564,7 @@ impl TokenContractRef {
 }
 ```
 
-**Generated reference struct features:**
+**Generated xxxRef struct features:**
 - **Virtual pointer**: No data loaded until `get()` is called
 - **Automatic offsets**: Each field reference points to correct slot offset
 - **Field access**: Direct access to nested structure fields
@@ -903,4 +903,4 @@ pub struct CleanTokenContract {
 12. **Type Safety**: Automatic derives provide compile-time layout validation
 13. **No Dynamic Types**: All storage must be statically sized at compile time
 14. **Storage Pointers**: Use `ContractRef::new(ContractMetadata)` to create lightweight virtual pointers
-15. **Generated Helper Methods**: `#[derive(StorageRef)]` generates type-specific reference structs with `get` and `set` methods
+15. **Generated Helper Methods**: `#[derive(StorageRef)]` generates xxxRef types with `get` and `set` methods

@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+
 import {
   IdeWalletEnv,
   acceptApproval,
@@ -7,56 +8,134 @@ import {
   prepareDeployUser,
   shot,
   waitForContractByContentHash,
-  waitForUserDeployContractId,
   SENDER_PK,
   EXPLORER_URL,
 } from "../helpers/wallet";
 
+/**
+ * On-chain deploy + IDE wallet E2E.
+ *
+ * IDE-05 covers CLI compile-and-deploy, Services indexing, and Explorer detail.
+ * IDE-06 covers IDE compile, wallet approval, browser deploy, Services indexing,
+ * and the resulting Explorer contract link.
+ */
+
 test.describe.configure({ mode: "serial" });
+
 let env: IdeWalletEnv;
 let userId = 0;
 
 test.beforeAll(async () => {
-  const prep = await prepareDeployUser({ privateKey: SENDER_PK, l2GasAmount: "4000000000" });
+  test.setTimeout(10 * 60_000);
+  const prep = await prepareDeployUser({
+    privateKey: SENDER_PK,
+    l2GasAmount: "4000000000",
+  });
   userId = prep.userId;
   expect(userId).toBeGreaterThan(0);
 });
 
-test.afterAll(async () => env?.close());
+test.afterAll(async () => {
+  await env?.close().catch(() => undefined);
+});
 
-test("IDE-05 CLI deploy is indexed and visible in Explorer", async () => {
+test("IDE-05 CLI on-chain deploy VotingContract + explorer detail", async () => {
+  test.setTimeout(15 * 60_000);
+
+  // ── 1) Real on-chain deploy via CLI ──────────────────────────────────
   const deploy = await deployContractViaCli({ privateKey: SENDER_PK });
   expect(deploy.contentHash).toMatch(/^[0-9a-f]{64}$/);
   expect(deploy.methods).toBe(2);
+  expect(deploy.stateTreeHeight).toBeGreaterThan(0);
+  console.log("[ide-deploy] contentHash", deploy.contentHash);
+
+  // ── 2) Indexer / services resolution ─────────────────────────────────
   const indexed = await waitForContractByContentHash(deploy.contentHash);
-  env = await new IdeWalletEnv().launch();
+  expect(indexed.uuid).toBe(deploy.contentHash);
+  console.log("[ide-deploy] indexed", indexed);
+
+  // ── 3) Explorer detail for the new contract ──────────────────────────
+  env = await new IdeWalletEnv().launch({ freshProfile: true });
   await onboardWallet(env, SENDER_PK);
-  const page = await env.context.newPage();
-  const detail = indexed.contractId == null ? `/contracts/${indexed.uuid}` : `/contracts/${indexed.contractId}`;
-  await page.goto(`${EXPLORER_URL}${detail}`, { waitUntil: "domcontentloaded" });
-  await expect(page.getByText(/Contract|Methods|Deployer|VotingContract|Functions|ABI|vote|reset_voter/i).first()).toBeVisible({ timeout: 90_000 });
-  await shot(page, "ide-deploy-explorer-detail");
+
+  const explorerPage = await env.context.newPage();
+  try {
+    const detailPath =
+      indexed.contractId != null
+        ? `/contracts/${indexed.contractId}`
+        : `/contracts/${indexed.uuid}`;
+    await explorerPage.goto(`${EXPLORER_URL}${detailPath}`, {
+      waitUntil: "domcontentloaded",
+    });
+    await expect(
+      explorerPage
+        .getByText(
+          /Contract|Methods|Deployer|VotingContract|Functions|ABI|vote|reset_voter/i,
+        )
+        .first(),
+    ).toBeVisible({ timeout: 90_000 });
+    await expect(
+      explorerPage
+        .getByText(
+          new RegExp(
+            indexed.contractId != null
+              ? String(indexed.contractId)
+              : indexed.uuid.slice(0, 12),
+            "i",
+          ),
+        )
+        .first(),
+    ).toBeVisible({ timeout: 30_000 });
+    await shot(explorerPage, "ide-deploy-explorer-detail");
+  } finally {
+    await explorerPage.close().catch(() => undefined);
+  }
 });
 
-test("IDE-06 Studio compiles and deploys through the real wallet", async () => {
+test("IDE-06 IDE Studio compile + real wallet deploy", async () => {
   test.setTimeout(10 * 60_000);
-  env = await new IdeWalletEnv().launch();
+  env = await new IdeWalletEnv().launch({ freshProfile: true });
   await onboardWallet(env, SENDER_PK);
-  const page = await env.openIde("/studio");
-  const compile = page.getByRole("button", { name: /^Compile$/ });
-  await expect(compile).toBeEnabled({ timeout: 60_000 });
-  await compile.click();
-  await expect(page.getByText("Compilation successful")).toBeVisible({ timeout: 60_000 });
-  const connect = page.getByRole("button", { name: /^Connect$/ });
-  await Promise.all([acceptApproval(env, /^Connect$/), connect.click()]);
-  await expect(page.getByRole("button", { name: new RegExp(`Psy-0*${userId}|Connected|Psy-\\d{8}`, "i") })).toBeVisible({ timeout: 60_000 });
-  const deploy = page.getByRole("button", { name: /^Deploy$/ });
-  const startedAt = Date.now();
-  await Promise.all([acceptApproval(env, /^(?:Deploy|Confirm)$/), deploy.click()]);
-  const link = page.getByRole("link", { name: /Contract #\d+/ });
-  if (!(await link.isVisible({ timeout: 30_000 }).catch(() => false))) {
-    const contractId = await waitForUserDeployContractId(userId, startedAt);
-    await expect(page.getByRole("link", { name: new RegExp(`Contract #${contractId}`) })).toBeVisible({ timeout: 10 * 60_000 });
-  }
-  await shot(page, "ide-browser-deploy-confirmed");
+
+  const idePage = await env.openIde("/studio");
+  await expect(
+    idePage.getByRole("button", { name: "Studio", exact: true }),
+  ).toBeVisible({ timeout: 30_000 });
+
+  // Runtime / compile exercises the IDE path.
+  const compileBtn = idePage.getByRole("button", { name: /^Compile$/ });
+  await expect(compileBtn).toBeVisible({ timeout: 60_000 });
+  await expect(compileBtn).toBeEnabled({ timeout: 60_000 });
+  await compileBtn.click();
+  await expect(idePage.getByText("Compilation successful")).toBeVisible({
+    timeout: 60_000,
+  });
+  await shot(idePage, "ide-deploy-compiled");
+
+  // Connect wallet through the real extension approve popup.
+  const connectBtn = idePage.getByRole("button", { name: /^Connect$/ });
+  await expect(connectBtn).toBeVisible({ timeout: 15_000 });
+  await Promise.all([
+    acceptApproval(env, /^Connect$/),
+    connectBtn.click(),
+  ]);
+
+  await expect(
+    idePage.getByRole("button", {
+      name: new RegExp(`Psy-0*${userId}|Connected|Psy-\\d{8}`, "i"),
+    }),
+  ).toBeVisible({ timeout: 60_000 });
+  await shot(idePage, "ide-deploy-connected");
+  const deployBtn = idePage.getByRole("button", { name: /^Deploy$/ });
+  await expect(deployBtn).toBeEnabled({ timeout: 10_000 });
+  await Promise.all([
+    acceptApproval(env, /^(?:Deploy|Confirm)$/),
+    deployBtn.click(),
+  ]);
+  await expect(
+    idePage.getByRole("link", { name: /Contract #\d+/ }),
+  ).toBeVisible({ timeout: 10 * 60_000 });
+  await shot(idePage, "ide-browser-deploy-confirmed");
+
+  await idePage.close().catch(() => undefined);
 });

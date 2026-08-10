@@ -323,7 +323,6 @@ fn contract_output_from_response(response: CompilerResponse) -> anyhow::Result<C
         abi,
     })
 }
-
 #[cfg(not(target_arch = "wasm32"))]
 fn validate_contract_function_vm_type(method_id: u32, vm_type: u32) -> anyhow::Result<()> {
     anyhow::ensure!(
@@ -1209,16 +1208,24 @@ mod tests {
 
     #[test]
     fn validate_contract_function_vm_type_accepts_canonical_constant() {
+        // Compiler output must use the shared canonical type.
         validate_contract_function_vm_type(1, VM_TYPE_STANRDARD_DAPEN_V1)
             .expect("the canonical DAPEN VM type constant must pass the compile bridge gate");
     }
 
     #[test]
     fn validate_contract_function_vm_type_rejects_legacy_zero() {
+        // Legacy compiler output must fail before proving.
         let err = validate_contract_function_vm_type(7, 0).unwrap_err();
         let chain = format!("{err:#}");
-        assert!(chain.contains("method_id 7"), "the rejection must name the offending method_id; got: {chain}");
-        assert!(chain.contains("non-canonical vm_type 0"), "the rejection must report the non-canonical vm_type value; got: {chain}");
+        assert!(
+            chain.contains("method_id 7"),
+            "the rejection must name the offending method_id; got: {chain}"
+        );
+        assert!(
+            chain.contains("non-canonical vm_type 0"),
+            "the rejection must report the non-canonical vm_type value; got: {chain}"
+        );
         assert!(
             chain.contains(&format!("expected {}", VM_TYPE_STANRDARD_DAPEN_V1)),
             "the rejection must name the expected canonical constant; got: {chain}"
@@ -1227,10 +1234,17 @@ mod tests {
 
     #[test]
     fn validate_contract_function_vm_type_rejects_unknown_vm_type() {
+        // New VM variants require an explicit bridge upgrade.
         let err = validate_contract_function_vm_type(3, VM_TYPE_STANRDARD_DAPEN_V1 + 1).unwrap_err();
         let chain = format!("{err:#}");
-        assert!(chain.contains("non-canonical vm_type"), "a non-canonical vm_type must be rejected; got: {chain}");
-        assert!(chain.contains("method_id 3"), "the rejection must name the offending method_id; got: {chain}");
+        assert!(
+            chain.contains("non-canonical vm_type"),
+            "a non-canonical vm_type must be rejected; got: {chain}"
+        );
+        assert!(
+            chain.contains("method_id 3"),
+            "the rejection must name the offending method_id; got: {chain}"
+        );
     }
 
     #[test]

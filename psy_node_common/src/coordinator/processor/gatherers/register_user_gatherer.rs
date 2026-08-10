@@ -664,6 +664,7 @@ mod tests {
     use psy_data::agg::tree_agg_v2::plan_jobs_for_tree_agg;
 
     use super::*;
+
     #[test]
     fn current_block_time_uses_unix_seconds() -> anyhow::Result<()> {
         let before = std::time::SystemTime::now()
@@ -681,7 +682,6 @@ mod tests {
         assert!(block_time >= 1_000_000_000);
         Ok(())
     }
-
 
     #[test]
     fn test_fake_agg() -> anyhow::Result<()> {
@@ -1351,10 +1351,21 @@ mod tests_backup_v1 {
     type Hasher = PoseidonHasher;
     type Hash = PHash;
 
+    // Millisecond-only RUB2 magic. Rejected by the RUB1 seconds reader.
     const RUB2_MAGIC_U32: u32 = 0x32425552;
+
+    // A plausible Unix-second timestamp (year ~2023). Exact seconds semantics
+    // for the accepted RUB1 wire format.
     const PLAUSIBLE_BLOCK_TIME_SECONDS: u64 = 1_700_000_000;
+
+    // A plausible Unix-millisecond timestamp (year ~2023). Must never be accepted
+    // on the wire once RUB1 seconds is restored.
     const MILLISECOND_BLOCK_TIME: u64 = 1_700_000_000_000;
 
+    /// Builds the on-disk byte layout of a register-user gatherer backup for the
+    /// given magic, using the supplied tree's current root and start id. Mirrors
+    /// the writer's layout exactly (magic | start_next_user_id | start_root |
+    /// 64-byte public keys... | total_jobs | block_time).
     fn build_backup_bytes(
         magic_u32: u32,
         start_next_user_id: u64,
@@ -1381,21 +1392,49 @@ mod tests_backup_v1 {
         let tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
         let start_root = tree.get_root();
         let path = "register_user_gatherer_realm_0_sub_0_pending_1.backup";
-        let data = build_backup_bytes(RUB2_MAGIC_U32, 0, &start_root, &[], 0, MILLISECOND_BLOCK_TIME);
+
+        // A RUB2 backup carrying a millisecond block_time footer.
+        let data = build_backup_bytes(
+            RUB2_MAGIC_U32,
+            0,
+            &start_root,
+            &[],
+            0,
+            MILLISECOND_BLOCK_TIME,
+        );
+        assert!(
+            data.len() >= 4 + 8 + 32 + 8 + 8,
+            "test fixture must clear the reader's minimum-size guard so the magic is actually read"
+        );
         file_system.files.insert(path.to_string(), data);
 
         let mut read_tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
-        let error = read_register_user_gatherer_backup_file_path::<Hasher, Hash, SimpleMockMemoryFileSystem>(
-            &file_system,
-            path,
-            &mut read_tree,
-        )
-        .await
-        .expect_err("RUB2 backup must be rejected by the RUB1-only reader");
-        let message = error.to_string();
-        assert!(message.to_lowercase().contains("magic"));
-        assert!(message.contains("RUB1"));
-        assert!(!message.to_lowercase().contains("block_time"));
+        let result =
+            read_register_user_gatherer_backup_file_path::<Hasher, Hash, SimpleMockMemoryFileSystem>(
+                &file_system,
+                path,
+                &mut read_tree,
+            )
+            .await;
+
+        let err = result.expect_err("RUB2 backup must be rejected by the RUB1-only reader");
+        let message = err.to_string();
+        assert!(
+            message.to_lowercase().contains("magic"),
+            "rejection must happen at the magic check, got: {message}"
+        );
+        assert!(
+            message.contains("RUB1"),
+            "error must name the expected RUB1 format, got: {message}"
+        );
+        // The millisecond footer must never be parsed into a checkpoint: the magic
+        // check returns before total_jobs / block_time are read, so no
+        // RegisterUserGathererOutputDatabase is constructed.
+        assert!(
+            !message.to_lowercase().contains("block_time"),
+            "rejection must precede any block_time handling, got: {message}"
+        );
+
         Ok(())
     }
 
@@ -1406,20 +1445,29 @@ mod tests_backup_v1 {
             let tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
             let start_root = tree.get_root();
             let path = format!("invalid_block_time_{block_time}.backup");
-            let data = build_backup_bytes(super::REGISTER_USER_GATHERER_BACKUP_V1_MAGIC_U32, 0, &start_root, &[], 0, block_time);
+            let data = build_backup_bytes(
+                super::REGISTER_USER_GATHERER_BACKUP_V1_MAGIC_U32,
+                0,
+                &start_root,
+                &[],
+                0,
+                block_time,
+            );
             file_system.files.insert(path.clone(), data);
 
             let mut read_tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
-            let error = read_register_user_gatherer_backup_file_path::<Hasher, Hash, SimpleMockMemoryFileSystem>(
-                &file_system,
-                &path,
-                &mut read_tree,
-            )
+            let error = read_register_user_gatherer_backup_file_path::<
+                Hasher,
+                Hash,
+                SimpleMockMemoryFileSystem,
+            >(&file_system, &path, &mut read_tree)
             .await
             .expect_err("invalid block_time must be rejected before checkpoint construction");
+
             assert!(error.to_string().contains("block_time"));
             assert_eq!(read_tree.get_root(), start_root);
         }
+
         Ok(())
     }
 
@@ -1429,6 +1477,9 @@ mod tests_backup_v1 {
         let tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
         let start_root = tree.get_root();
         let path = "register_user_gatherer_realm_0_sub_0_pending_2.backup";
+
+        // A valid RUB1 backup with zero new users and a plausible seconds
+        // block_time footer.
         let data = build_backup_bytes(
             super::REGISTER_USER_GATHERER_BACKUP_V1_MAGIC_U32,
             0,
@@ -1440,18 +1491,22 @@ mod tests_backup_v1 {
         file_system.files.insert(path.to_string(), data);
 
         let mut read_tree = SimpleMemoryMerkleRecorderStore::<Hasher, Hash>::new(32);
-        let output = read_register_user_gatherer_backup_file_path::<Hasher, Hash, SimpleMockMemoryFileSystem>(
-            &file_system,
-            path,
-            &mut read_tree,
-        )
-        .await?;
+        let output =
+            read_register_user_gatherer_backup_file_path::<Hasher, Hash, SimpleMockMemoryFileSystem>(
+                &file_system,
+                path,
+                &mut read_tree,
+            )
+            .await?;
+
         assert_eq!(output.start_next_user_id, 0);
         assert_eq!(output.next_user_id, 0);
         assert_eq!(output.total_jobs, 0);
         assert_eq!(output.block_time, PLAUSIBLE_BLOCK_TIME_SECONDS);
         assert_eq!(output.start_user_registration_tree_hash, start_root);
+        // The reader must commit the (empty) tree changes and leave the root intact.
         assert_eq!(read_tree.get_root(), start_root);
+
         Ok(())
     }
 }

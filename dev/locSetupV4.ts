@@ -4512,6 +4512,8 @@ Usage: bun run dev/locSetupV4.ts [options]
    --psy-privacy-bridge           Start integrated privacy+bridge shell (psy-dapp/apps/bridge, port 5177)
    --ide                          Start IDE dev server (psy-dapp/apps/ide, port 5176)
    --explorer                     Start blockchain explorer dev server (psy-dapp/apps/explorer, port 5178)
+   --daemonlize                    Generate docker-compose.yml and start in background
+   --teardown                      Stop local devnet processes/containers and exit
    --purge                         With --teardown (or startup), also remove local_checkpoints, logs, deployments, and devnet Docker volumes
    --clean-state                   Deprecated alias for --purge during startup
    --help, -h                      Show this help message

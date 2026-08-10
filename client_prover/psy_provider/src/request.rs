@@ -1698,6 +1698,7 @@ pub enum QRPCRequest<F: RichField> {
     QLeftAggRightLeafRpcRequest((u32, QLeftAggRightLeafRpcRequest<F>)),
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;

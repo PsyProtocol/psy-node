@@ -59,7 +59,7 @@ pub fn get_genesis_block_setup_data_for_local_devnet_default() -> anyhow::Result
                 register_users_completed: F::ZERO_VALUE,
                 gutas_completed: F::ZERO_VALUE,
             },
-            block_time: F::from_u64_value(1764248609350u64),
+            block_time: F::from_u64_value(1_764_248_609u64),
             random_seed: QHashOut::from_values(1, 2, 3, 4),
             pm_rewards_commitment: PPMRewardCommitment {
                 register_users_root: Hash::get_zero_value(),
@@ -80,5 +80,22 @@ pub fn get_genesis_block_setup_data_for_local_devnet(genesis_data_path: Option<S
             let genesis_data = serde_json::from_str::<PsyGenesisBlockSetupData<F, Hash>>(&std::fs::read_to_string(path)?)?;
             Ok(genesis_data)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use parth_core::felt::ToU64Value;
+
+    use super::*;
+
+    #[test]
+    fn local_devnet_genesis_block_time_uses_unix_seconds() -> anyhow::Result<()> {
+        let genesis = get_genesis_block_setup_data_for_local_devnet_default()?;
+        assert_eq!(
+            genesis.checkpoint_stats.block_time.to_u64_value(),
+            1_764_248_609
+        );
+        Ok(())
     }
 }

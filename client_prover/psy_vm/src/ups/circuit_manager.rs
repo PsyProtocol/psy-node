@@ -111,7 +111,10 @@ where
 
     async fn prove_secp_sign(&self, signature: PsyCompressedSecp256K1Signature) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>>;
 
-    async fn prove_eth_personal_secp_sign(&self, signature: PsyCompressedSecp256K1Signature) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>>;
+    async fn prove_eth_personal_secp_sign(
+        &self,
+        signature: PsyCompressedSecp256K1Signature,
+    ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>>;
 
     async fn register_dpn_software_defined_circuit(
         &self,
@@ -299,7 +302,10 @@ where
         (**self).prove_secp_sign(signature).await
     }
 
-    async fn prove_eth_personal_secp_sign(&self, signature: PsyCompressedSecp256K1Signature) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
+    async fn prove_eth_personal_secp_sign(
+        &self,
+        signature: PsyCompressedSecp256K1Signature,
+    ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
         (**self).prove_eth_personal_secp_sign(signature).await
     }
 
@@ -543,7 +549,10 @@ where
         (**self).prove_secp_sign(signature).await
     }
 
-    async fn prove_eth_personal_secp_sign(&self, signature: PsyCompressedSecp256K1Signature) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
+    async fn prove_eth_personal_secp_sign(
+        &self,
+        signature: PsyCompressedSecp256K1Signature,
+    ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
         (**self).prove_eth_personal_secp_sign(signature).await
     }
 

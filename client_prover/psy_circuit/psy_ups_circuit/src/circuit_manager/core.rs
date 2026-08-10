@@ -474,7 +474,10 @@ where
         self.secp_circuit().prove(&signature)
     }
 
-    async fn prove_eth_personal_secp_sign(&self, signature: PsyCompressedSecp256K1Signature) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
+    async fn prove_eth_personal_secp_sign(
+        &self,
+        signature: PsyCompressedSecp256K1Signature,
+    ) -> anyhow::Result<ProofWithPublicInputs<C::F, C, D>> {
         self.eth_personal_secp_circuit()
             .prove(&signature)
             .map_err(|error| anyhow::anyhow!("failed to prove EIP-191 secp256k1 signature: {error}"))
@@ -594,11 +597,11 @@ where
         Ok(self.eth_personal_secp_circuit().get_fingerprint())
     }
 
+
     async fn eth_personal_secp_circuit_verifier_config(&self) -> anyhow::Result<VerifierOnlyCircuitData<C, D>> {
         Ok(self.eth_personal_secp_circuit().get_verifier_config_ref().clone().into())
     }
 }
-
 #[cfg(test)]
 mod eth_personal_tests {
     use plonky2::{

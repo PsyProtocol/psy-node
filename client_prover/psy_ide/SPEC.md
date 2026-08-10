@@ -107,7 +107,7 @@ struct DeployedContract {
     contract_id: u64,
     name: String,
     deployer_id: u64,
-    abi: ContractABI,
+    abi: Abi,
     circuit_definitions: Vec<DPNFunctionCircuitDefinition>,
     state_tree_height: u16,
 }
@@ -432,6 +432,13 @@ Compilation errors are shown in:
 
 For each deployed contract, auto-generate a UI from the ABI:
 
+The ABI (`Abi`) has `contract.methods[]` where each method exposes
+`name`, `state_mutability` ("view" | "external"), `inputs[]` (each with
+`name`, `type`, `felt_size`), and `outputs[]`. The `type` field is a
+`TypeRef` — an internally-tagged union: `{kind:"primitive",name:"Felt"}`,
+`{kind:"struct",name:"TokenBalance"}`, `{kind:"array",item,length,...}`,
+`{kind:"map",map_kind,...}`. Method calls are invoked by `method_id`.
+
 **Method Call UI**:
 ```
 ┌────────────────────────────────────────┐
@@ -454,6 +461,11 @@ For each deployed contract, auto-generate a UI from the ABI:
 │  Caller: [Alice ▼]                     │
 └────────────────────────────────────────┘
 ```
+
+State fields (`contract.state[]`) each expose `name`, `type` (TypeRef),
+`offset`, and `felt_size`. The state inspector expands arrays into
+`length × item_felt_size` slots and structs into their `types[]` field
+layouts; maps are virtual and skipped in slot expansion.
 
 ### 8.3 State Inspector
 

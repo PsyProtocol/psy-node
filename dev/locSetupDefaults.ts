@@ -287,7 +287,6 @@ export function isCompilerFingerprintSource(sourcePath: string): boolean {
         || lower.endsWith(".lock");
 }
 
-
 export function hasZstdMagic(bytes: Uint8Array): boolean {
     return bytes.length >= 4
         && bytes[0] === 0x28
@@ -295,6 +294,7 @@ export function hasZstdMagic(bytes: Uint8Array): boolean {
         && bytes[2] === 0x2f
         && bytes[3] === 0xfd;
 }
+
 
 export function shouldSkipBranchSync(value: string | undefined): boolean {
     return value?.trim() !== "0";

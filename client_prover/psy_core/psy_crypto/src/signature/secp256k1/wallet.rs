@@ -79,12 +79,16 @@ pub fn eth_personal_registration_challenge(network_magic: u64, selected_address:
     Hash256(challenge)
 }
 
+
 pub fn recover_eth_personal_signature(
     expected_address: [u8; 20],
     message: Hash256,
     signature_bytes: [u8; 65],
 ) -> anyhow::Result<PsyCompressedSecp256K1Signature> {
-    anyhow::ensure!(expected_address.iter().any(|byte| *byte != 0), "selected Ethereum address must not be the zero address");
+    anyhow::ensure!(
+        expected_address.iter().any(|byte| *byte != 0),
+        "selected Ethereum address must not be the zero address"
+    );
     let recovery_byte = match signature_bytes[64] {
         0 | 1 => signature_bytes[64],
         27 | 28 => signature_bytes[64] - 27,
@@ -111,6 +115,8 @@ pub fn recover_eth_personal_signature(
         message,
     })
 }
+
+
 
 pub trait CompressedPublicKeyToP2PKH {
     fn to_p2pkh_address(&self) -> Hash160;
@@ -278,38 +284,31 @@ pub fn secp256k1_sign<F: RichField>(private_key: k256::ecdsa::SigningKey, sighas
     })
 }
 
-/// EIP-191 (`personal_sign`) counterpart of [`secp256k1_sign`]. Signs
-/// `keccak256(EIP191_PREFIX_32 || raw_sighash_bytes)` — exactly what MetaMask
-/// `personal_sign` produces over the raw sighash bytes — while storing the RAW
-/// sighash in `message` so the circuit can re-derive the keccak in-circuit and
-/// still bind the sighash into `combined_hash`.
-pub fn secp256k1_sign_eth_personal<F: RichField>(private_key: k256::ecdsa::SigningKey, sighash: QHashOut<F>) -> anyhow::Result<PsyCompressedSecp256K1Signature> {
-    tracing::info!("🔔 prove_eth_personal_secp256k1_signature");
+/// Signs the EIP-191 digest of the raw 32-byte sighash while retaining the raw
+/// sighash in the proof input so the circuit can derive and verify the digest.
+pub fn secp256k1_sign_eth_personal<F: RichField>(
+    private_key: k256::ecdsa::SigningKey,
+    sighash: QHashOut<F>,
+) -> anyhow::Result<PsyCompressedSecp256K1Signature> {
+    tracing::info!("prove_eth_personal_secp256k1_signature");
 
-    let public_key = private_key.verifying_key().to_encoded_point(true).to_bytes();
-    let mut compressed = [0u8; 33];
-    if public_key.len() == 33 {
-        compressed.copy_from_slice(&public_key);
-    } else {
-        return Err(anyhow::format_err!("pub key length is not 33"));
-    }
-    let pub_compressed = CompressedPublicKey(compressed);
+    let encoded_public_key = private_key.verifying_key().to_encoded_point(true);
+    let public_key: [u8; 33] = encoded_public_key
+        .as_bytes()
+        .try_into()
+        .map_err(|_| anyhow::format_err!("secp256k1 public key length is not 33"))?;
 
     let message = Hash256::from(sighash);
-    let digest = eth_personal_sign_digest(&message.0);
-    // k256's deterministic signer normalizes `s` to the low half of the curve
-    // order, matching MetaMask's low-S output.
-    let result: k256::ecdsa::Signature = private_key.sign_prehash(&digest)?;
-    let mut rs_bytes = [0u8; 64];
-
-    let r_bytes = result.r().to_bytes();
-    let s_bytes = result.s().to_bytes();
-    rs_bytes[0..32].copy_from_slice(&r_bytes);
-    rs_bytes[32..64].copy_from_slice(&s_bytes);
+    let signature: k256::ecdsa::Signature = private_key
+        .sign_prehash(&eth_personal_sign_digest(&message.0))
+        .map_err(|error| anyhow::anyhow!("failed to sign EIP-191 digest: {error}"))?;
+    let mut signature_bytes = [0u8; 64];
+    signature_bytes[..32].copy_from_slice(&signature.r().to_bytes());
+    signature_bytes[32..].copy_from_slice(&signature.s().to_bytes());
 
     Ok(PsyCompressedSecp256K1Signature {
-        public_key: pub_compressed.0,
-        signature: rs_bytes,
+        public_key,
+        signature: signature_bytes,
         message,
     })
 }

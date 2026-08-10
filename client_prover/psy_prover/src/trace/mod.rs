@@ -250,6 +250,7 @@ impl TxStorageData {
         }
         storage
     }
+
     pub(crate) fn from_call_witnesses(
         current_user_id: u64,
         current_contract_id: u64,
@@ -259,7 +260,6 @@ impl TxStorageData {
         storage.extend_from_cmd_witnesses(current_user_id, current_contract_id, cmd_witnesses);
         storage
     }
-
 
     pub fn from_trace(trace: &TxTrace) -> Self {
         let mut storage = Self::from_steps(trace.meta.user_id, &trace.steps);
@@ -454,6 +454,7 @@ impl From<TxMetadata> for SimulatedTxMetadata {
     }
 }
 
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct UpsStartWitness {
     pub ups_header: UserProvingSessionHeader<F>,
@@ -631,9 +632,6 @@ pub struct ZkSignStep {
 pub enum TraceSignCircuitSource {
     ZkBuiltin,
     SecpBuiltin,
-    /// EIP-191 (MetaMask `personal_sign`) builtin secp256k1 circuit. Works for
-    /// both the held-key user and the externally injected (keyless) user —
-    /// proving dispatches on the fingerprint via the wallet's signature users.
     EthPersonalSecpBuiltin,
     SdKey {
         allowed_contract_ids: Vec<u64>,
@@ -716,7 +714,6 @@ mod simulation_tests {
                 storage_data: TxStorageData::default(),
             },
         };
-
         let json = serde_json::to_value(response).unwrap();
         assert!(json.get("generated").is_none());
         assert!(json["metadata"].get("tx_hash").is_none());

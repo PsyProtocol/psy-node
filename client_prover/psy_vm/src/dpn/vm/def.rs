@@ -131,10 +131,7 @@ mod tests {
         assert!(!definition(vec![DPNStateCmd::set_imt_contract_state_value(1, 0, 4, [0; 4], [1; 4])]).is_view_function());
         assert!(!definition(vec![DPNStateCmd::invoke_external_contract_function(1, 2, 3, Vec::new(), 0)]).is_view_function());
         assert!(!definition(vec![DPNStateCmd::invoke_external_contract_function_deferred(1, 2, 3, Vec::new())]).is_view_function());
-    }
 
-    #[test]
-    fn view_detection_rejects_event_only_definitions() {
         let mut event_only = definition(Vec::new());
         event_only.events.push(DPNEventRecord {
             condition: 0,

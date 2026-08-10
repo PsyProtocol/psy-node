@@ -111,6 +111,7 @@ use crate::{
 // MerkleZeroHasherWithMarkedLeaf<HashOut<C::F>> +
 // MerkleZeroHasherWithMarkedLeaf<QHashOut<C::F>>, {
 // }
+
 fn select_builtin_sign_circuit(
     fingerprint: QHashOut<F>,
     zk_fingerprint: QHashOut<F>,
@@ -128,6 +129,37 @@ fn select_builtin_sign_circuit(
     }
 }
 
+#[cfg(test)]
+mod signer_mode_selection_tests {
+    use super::*;
+
+    #[test]
+    fn selects_distinct_builtin_signer_modes() {
+        let zk = QHashOut(HashOut {
+            elements: [F::from_canonical_u64(1), F::from_canonical_u64(2), F::from_canonical_u64(3), F::from_canonical_u64(4)],
+        });
+        let secp = QHashOut(HashOut {
+            elements: [F::from_canonical_u64(5), F::from_canonical_u64(6), F::from_canonical_u64(7), F::from_canonical_u64(8)],
+        });
+        let personal = QHashOut(HashOut {
+            elements: [F::from_canonical_u64(9), F::from_canonical_u64(10), F::from_canonical_u64(11), F::from_canonical_u64(12)],
+        });
+
+        assert!(matches!(
+            select_builtin_sign_circuit(zk, zk, secp, Some(personal)),
+            Some(crate::trace::TraceSignCircuitSource::ZkBuiltin)
+        ));
+        assert!(matches!(
+            select_builtin_sign_circuit(secp, zk, secp, Some(personal)),
+            Some(crate::trace::TraceSignCircuitSource::SecpBuiltin)
+        ));
+        assert!(matches!(
+            select_builtin_sign_circuit(personal, zk, secp, Some(personal)),
+            Some(crate::trace::TraceSignCircuitSource::EthPersonalSecpBuiltin)
+        ));
+        assert!(select_builtin_sign_circuit(personal, zk, secp, None).is_none());
+    }
+}
 
 pub fn gen_contract_deploy_and_circuits_for_functions<C: GenericConfig<D>, const D: usize>(
     deployer: QHashOut<C::F>,
@@ -418,7 +450,6 @@ pub struct TraceExternalProofRef {
     pub proof_index: u64,
     pub leaf_proof: MerkleProofCore<QHashOut<F>>,
 }
-
 #[derive(Default)]
 struct SimulationCallClassification {
     call_count: usize,
@@ -446,6 +477,7 @@ impl SimulationCallClassification {
 pub struct TraceBuildSession<'a> {
     wallet_session: &'a WalletSession,
     public_key: QHashOut<F>,
+    user_session_mgr: UserProvingSessionManager<F, PoseidonHash, RpcProvider, C, D>,
     trace_arena: TraceArenaBuilder,
     ups_start_witness_input: psy_client_data::ups::start_step::UPSStartStepInput<F>,
     ups_start_registration_proof: Option<psy_crypto::hash::merkle::core::MerkleProofCore<QHashOut<F>>>,
@@ -457,24 +489,21 @@ impl<'a> TraceBuildSession<'a> {
         proof: ProofWithPublicInputs<F, C, D>,
         verifier_data: VerifierOnlyCircuitData<C, D>,
     ) -> anyhow::Result<TraceExternalProofRef> {
-        let mut user_session_mgr = self
-            .wallet_session
-            .user_session_mgrs
-            .get_mut(&self.public_key)
-            .ok_or_else(|| anyhow::format_err!("user {} not found", self.public_key.to_string()))?;
-        let (proof_index, leaf_proof) =
-            WalletSession::push_external_proof_step(&mut *user_session_mgr, &mut self.trace_arena, fingerprint, proof, verifier_data).await?;
+        let (proof_index, leaf_proof) = WalletSession::push_external_proof_step(
+            &mut self.user_session_mgr,
+            &mut self.trace_arena,
+            fingerprint,
+            proof,
+            verifier_data,
+        )
+        .await?;
         Ok(TraceExternalProofRef { proof_index, leaf_proof })
     }
 
     pub async fn trace_call(&mut self, contract_call_arg: ContractCallArgs) -> anyhow::Result<bool> {
         use psy_client_data::qstore::imm::cmd::QSRCmdGetContractCodeDefinition;
 
-        let mut user_session_mgr = self
-            .wallet_session
-            .user_session_mgrs
-            .get_mut(&self.public_key)
-            .ok_or_else(|| anyhow::format_err!("user {} not found", self.public_key.to_string()))?;
+        let user_session_mgr = &mut self.user_session_mgr;
         let cm = self.wallet_session.wallet.random_circuit_manager();
         let contract_code = user_session_mgr
             .require_lps_mut()?
@@ -514,11 +543,7 @@ impl<'a> TraceBuildSession<'a> {
             anyhow::bail!("No contract calls to execute");
         }
 
-        let mut user_session_mgr = self
-            .wallet_session
-            .user_session_mgrs
-            .get_mut(&self.public_key)
-            .ok_or_else(|| anyhow::format_err!("user {} not found", self.public_key.to_string()))?;
+        let user_session_mgr = &mut self.user_session_mgr;
         let cm = self.wallet_session.wallet.random_circuit_manager();
 
         let burn_contract_code = user_session_mgr
@@ -541,12 +566,14 @@ impl<'a> TraceBuildSession<'a> {
         let initial_circuit_manager = self.wallet_session.wallet.random_circuit_manager();
         let zk_builtin_fingerprint = initial_circuit_manager.zk_signature_minifier_fingerprint().await?;
         let secp_builtin_fingerprint = initial_circuit_manager.secp_circuit_fingerprint().await?;
-        let eth_personal_builtin_fingerprint = self
+        let eth_personal_builtin_fingerprint = match self
             .wallet_session
             .circuit_info
             .get_circuit_info_by_id(LocalCircuitType::EthPersonalSecp256K1.into())
-            .ok()
-            .map(|_| crate::wallet::memory_wallet::get_eth_personal_secp256k1_fingerprint());
+        {
+            Ok(_) => Some(crate::wallet::memory_wallet::get_eth_personal_secp256k1_fingerprint()),
+            Err(_) => None,
+        };
         let builtin_source = select_builtin_sign_circuit(
             pk_info.fingerprint,
             zk_builtin_fingerprint,
@@ -617,7 +644,7 @@ impl<'a> TraceBuildSession<'a> {
                     .build_psy_software_defined_context(
                         &software_defined_call,
                         pk_info.fingerprint,
-                        &mut user_session_mgr,
+                        user_session_mgr,
                         SignContext::new(pk_info.fingerprint),
                     )
                     .await?;
@@ -642,7 +669,7 @@ impl<'a> TraceBuildSession<'a> {
             TraceSignCircuitSource::Plonky2SoftwareDefined { .. } => {
                 let sign_context = self
                     .wallet_session
-                    .build_plonky2_software_defined_context(&software_defined_call, pk_info.fingerprint, &mut user_session_mgr)
+                    .build_plonky2_software_defined_context(&software_defined_call, pk_info.fingerprint, user_session_mgr)
                     .await?;
                 let witness = sign_context
                     .plonky2_signature_input
@@ -665,7 +692,7 @@ impl<'a> TraceBuildSession<'a> {
             TraceSignCircuitSource::SdKey { .. } => {
                 let sign_context = self
                     .wallet_session
-                    .build_sd_key_context(&software_defined_call, pk_info.fingerprint, &mut user_session_mgr)
+                    .build_sd_key_context(&software_defined_call, pk_info.fingerprint, user_session_mgr)
                     .await?;
                 let witness = sign_context
                     .sd_key_signature_input
@@ -774,13 +801,7 @@ impl<'a> TraceBuildSession<'a> {
         }
 
         if classification.is_fee_free_view() {
-            let user_id = self
-                .wallet_session
-                .user_session_mgrs
-                .get(&self.public_key)
-                .ok_or_else(|| anyhow::format_err!("user {} not found", self.public_key.to_string()))?
-                .require_lps()?
-                .get_current_user_id_64();
+            let user_id = self.user_session_mgr.require_lps()?.get_current_user_id_64();
             let metadata = crate::trace::SimulatedTxMetadata::from_view_steps(
                 user_id,
                 &self.trace_arena.steps,
@@ -898,30 +919,6 @@ mod view_validation_tests {
         assert!(ensure_view_definition(7, "writer", &writer).is_err());
     }
 }
-
-#[cfg(test)]
-mod signer_mode_selection_tests {
-    use super::*;
-
-    #[test]
-    fn selects_distinct_builtin_signer_modes() {
-        let zk = QHashOut(HashOut {
-            elements: [F::from_canonical_u64(1), F::from_canonical_u64(2), F::from_canonical_u64(3), F::from_canonical_u64(4)],
-        });
-        let secp = QHashOut(HashOut {
-            elements: [F::from_canonical_u64(5), F::from_canonical_u64(6), F::from_canonical_u64(7), F::from_canonical_u64(8)],
-        });
-        let personal = QHashOut(HashOut {
-            elements: [F::from_canonical_u64(9), F::from_canonical_u64(10), F::from_canonical_u64(11), F::from_canonical_u64(12)],
-        });
-
-        assert!(matches!(select_builtin_sign_circuit(zk, zk, secp, Some(personal)), Some(crate::trace::TraceSignCircuitSource::ZkBuiltin)));
-        assert!(matches!(select_builtin_sign_circuit(secp, zk, secp, Some(personal)), Some(crate::trace::TraceSignCircuitSource::SecpBuiltin)));
-        assert!(matches!(select_builtin_sign_circuit(personal, zk, secp, Some(personal)), Some(crate::trace::TraceSignCircuitSource::EthPersonalSecpBuiltin)));
-        assert!(select_builtin_sign_circuit(personal, zk, secp, None).is_none());
-    }
-}
-
 #[cfg(test)]
 mod personal_registration_tests {
     use super::*;
@@ -934,6 +931,7 @@ mod personal_registration_tests {
         assert_ne!(first, second);
     }
 }
+
 #[cfg_attr(not(target_arch = "wasm32"), maybe_async::maybe_async)]
 #[cfg_attr(target_arch = "wasm32", maybe_async::maybe_async(?Send))]
 impl WalletSession {
@@ -1179,6 +1177,12 @@ impl WalletSession {
             main_circuits[0].secp_circuit_verifier_config().await?.into(),
         );
 
+        if let Some((fingerprint, verifier_config)) = canonical_eth_personal_metadata {
+            circuit_info.register_circuit(LocalCircuitType::EthPersonalSecp256K1.into(), fingerprint, verifier_config.into());
+        } else {
+            tracing::warn!("prove manager does not expose EIP-191 circuit metadata; personal signing is unavailable");
+        }
+
         // Privacy circuits: the wallet produces base proofs; the (server-side) minifier
         // fingerprint/verifier come from the manager.
         circuit_info.register_circuit(
@@ -1192,12 +1196,6 @@ impl WalletSession {
             main_circuits[0].shield_deposit_claim_minifier_fingerprint().await?,
             main_circuits[0].shield_deposit_claim_minifier_verifier_config().await?.into(),
         );
-
-        if let Some((fingerprint, verifier_config)) = canonical_eth_personal_metadata {
-            circuit_info.register_circuit(LocalCircuitType::EthPersonalSecp256K1.into(), fingerprint, verifier_config.into());
-        } else {
-            tracing::warn!("prove manager does not expose EIP-191 circuit metadata; personal signing is unavailable");
-        }
 
         for main_circuit in main_circuits.iter() {
             main_circuit.as_ref().register_info(&mut circuit_info).await;
@@ -1300,7 +1298,6 @@ impl WalletSession {
         let pk_info = self.wallet.register_external_secp_user(compressed_public_key).await?;
         self.register_external_pk_info_on_chain(pk_info, "external secp").await
     }
-
     /// Inject an externally produced (MetaMask `eth_sign`-style) signature over
     /// the session sighash: replaces `expected_public_key` with a
     /// signature-carrying wallet user. Rejects signatures from any other
@@ -1464,6 +1461,77 @@ impl WalletSession {
         )
         .await
     }
+    async fn build_transaction_preview_session(
+        &self,
+        public_key: QHashOut<F>,
+    ) -> anyhow::Result<UserProvingSessionManager<F, PoseidonHash, RpcProvider, C, D>> {
+        let user_id = self
+            .resolve_registered_user_id(public_key)
+            .await
+            .map_err(|e| anyhow::format_err!("User {} not registered. Please register first: {}", public_key, e))?;
+        let mut user_session_mgr = self.create_clean_user_session(user_id).await?;
+        self.initialize_transaction_session(public_key, &mut user_session_mgr).await?;
+        Ok(user_session_mgr)
+    }
+
+    async fn initialize_transaction_session(
+        &self,
+        public_key: QHashOut<F>,
+        user_session_mgr: &mut UserProvingSessionManager<F, PoseidonHash, RpcProvider, C, D>,
+    ) -> anyhow::Result<()> {
+        let latest_block_state = user_session_mgr.require_lps()?.get_read_store().get_latest_block_state().await?;
+        let global_latest_block_state = self.st_provider.get_coordinator_latest_block_state().await?;
+
+        if latest_block_state.checkpoint_id <= global_latest_block_state.checkpoint_id {
+            tracing::info!(
+                "block state: realm latest checkpoint {}, coordinator checkpoint {}",
+                latest_block_state.checkpoint_id,
+                global_latest_block_state.checkpoint_id
+            );
+        } else {
+            tracing::error!(
+                "realm latest checkpoint {} is ahead coordinator checkpoint {}",
+                latest_block_state.checkpoint_id,
+                global_latest_block_state.checkpoint_id
+            );
+            anyhow::bail!(
+                "realm latest checkpoint {} is ahead of coordinator checkpoint {}",
+                latest_block_state.checkpoint_id,
+                global_latest_block_state.checkpoint_id
+            );
+        }
+
+        tracing::info!("local proving ups start");
+        tracing::info!("user session manager nonce: {}", user_session_mgr.require_lps()?.get_nonce());
+        user_session_mgr.prove_ups_start(self.wallet.random_circuit_manager().as_ref()).await?;
+
+        let user_id = user_session_mgr.require_lps()?.get_current_user_id_64();
+        let registration_id = get_registration_id_from_user_id(user_id);
+        let checkpoint = user_session_mgr.require_lps()?.get_current_start_checkpoint_id_u64();
+        tracing::info!(
+            "check if user {}: {} is registered at checkpoint {}, registration_id: {}",
+            user_id,
+            public_key.to_string(),
+            checkpoint,
+            registration_id
+        );
+        let registration_leaf_hash = self
+            .st_provider
+            .with_user_id_owned(user_id)
+            .get_user_registration_tree_leaf_hash(checkpoint, registration_id)
+            .await?;
+        anyhow::ensure!(
+            registration_leaf_hash != QHashOut::ZERO,
+            "user {}: {} of registration id {} is not registered at checkpoint {}, please check it first",
+            user_id,
+            public_key.to_string(),
+            registration_id,
+            checkpoint
+        );
+
+        let nonce = user_session_mgr.require_lps()?.get_nonce();
+        self.check_user_state(user_id, nonce).await
+    }
 
     /// Build (or reset) a clean step proving session for `public_key`, seeded
     /// entirely from the trace — user id, anchor checkpoint and ups_start
@@ -1587,104 +1655,44 @@ impl WalletSession {
     }
 
     pub async fn start_session(&self, public_key: QHashOut<F>) -> anyhow::Result<()> {
-        // Always refresh the session manager to get latest checkpoint state
-        // This ensures we don't reuse stale session state from previous transactions
         self.update_circuit_mgr(public_key).await?;
-
         let mut user_session_mgr = self
             .user_session_mgrs
             .get_mut(&public_key)
             .ok_or_else(|| anyhow::format_err!("user {} not found", public_key.to_string()))?;
-
-        let latest_block_state = user_session_mgr.require_lps()?.get_read_store().get_latest_block_state().await?;
-        let global_latest_block_state = self.st_provider.get_coordinator_latest_block_state().await?;
-
-        if latest_block_state.checkpoint_id <= global_latest_block_state.checkpoint_id {
-            tracing::info!(
-                "block state: realm latest checkpoint {}, coordinator checkpoint {}",
-                latest_block_state.checkpoint_id,
-                global_latest_block_state.checkpoint_id
-            );
-        } else {
-            tracing::error!(
-                "realm latest checkpoint {} is ahead coordinator checkpoint {}",
-                latest_block_state.checkpoint_id,
-                global_latest_block_state.checkpoint_id
-            );
-            return Err(anyhow::format_err!(
-                "realm latest checkpoint {} is ahead of coordinator checkpoint {}",
-                latest_block_state.checkpoint_id,
-                global_latest_block_state.checkpoint_id
-            ));
-        };
-
-        tracing::info!("local proving ups start");
-        tracing::info!("user session manager nonce: {}", user_session_mgr.require_lps()?.get_nonce());
-
-        user_session_mgr.prove_ups_start(self.wallet.random_circuit_manager().as_ref()).await?;
-
-        let user_id = user_session_mgr.require_lps()?.get_current_user_id_64();
-        let registration_id = get_registration_id_from_user_id(user_id);
-        let checkpoint = user_session_mgr.require_lps()?.get_current_start_checkpoint_id_u64();
-
-        tracing::info!(
-            "check if user {}: {} is registered at checkpoint {}, registration_id: {}",
-            user_id,
-            public_key.to_string(),
-            checkpoint,
-            registration_id
-        );
-        let registration_leaf_hash = self
-            .st_provider
-            .with_user_id_owned(user_id)
-            .get_user_registration_tree_leaf_hash(checkpoint, registration_id)
-            .await?;
-
-        if registration_leaf_hash == QHashOut::ZERO {
-            anyhow::bail!(
-                "user {}: {} of registration id {} is not registered at checkpoint {}, please check it first",
-                user_id,
-                public_key.to_string(),
-                registration_id,
-                checkpoint
-            );
-        }
-
-        let nonce = user_session_mgr.require_lps()?.get_nonce();
-        self.check_user_state(user_id, nonce).await?;
-
-        Ok(())
+        self.initialize_transaction_session(public_key, &mut user_session_mgr).await
     }
 
     pub async fn begin_trace_build(&self, public_key: QHashOut<F>) -> anyhow::Result<TraceBuildSession<'_>> {
-        self.start_session(public_key).await?;
-        let mut user_session_mgr = self
-            .user_session_mgrs
-            .get_mut(&public_key)
-            .ok_or_else(|| anyhow::format_err!("user {} not found", public_key.to_string()))?;
-        let ups_start_witness_input = user_session_mgr.get_ups_start_witness().await?;
-        let ups_start_registration_proof: Option<psy_crypto::hash::merkle::core::MerkleProofCore<QHashOut<F>>> =
-            if user_session_mgr.require_lps()?.is_new_user() {
-                let start_checkpoint_id = user_session_mgr.require_lps()?.get_current_start_checkpoint_id_u64();
-                let user_id = user_session_mgr.require_lps()?.get_current_user_id_64();
-                Some(
-                    user_session_mgr
-                        .require_lps_mut()?
-                        .resolve_get_merkle_proof_mut(&QSRMerkleCmd::GetUserRegistrationTreeMerkleProof(
-                            QSRMerkleCmdGetUserRegistrationTreeMerkleProof {
-                                checkpoint_id: start_checkpoint_id,
-                                leaf_index: get_registration_id_from_user_id(user_id),
-                            },
-                        ))
-                        .await?,
-                )
-            } else {
-                None
-            };
-        drop(user_session_mgr);
+        let mut user_session_mgr = self.build_transaction_preview_session(public_key).await?;
+        let setup_result = async {
+            let ups_start_witness_input = user_session_mgr.get_ups_start_witness().await?;
+            let ups_start_registration_proof: Option<psy_crypto::hash::merkle::core::MerkleProofCore<QHashOut<F>>> =
+                if user_session_mgr.require_lps()?.is_new_user() {
+                    let start_checkpoint_id = user_session_mgr.require_lps()?.get_current_start_checkpoint_id_u64();
+                    let user_id = user_session_mgr.require_lps()?.get_current_user_id_64();
+                    Some(
+                        user_session_mgr
+                            .require_lps_mut()?
+                            .resolve_get_merkle_proof_mut(&QSRMerkleCmd::GetUserRegistrationTreeMerkleProof(
+                                QSRMerkleCmdGetUserRegistrationTreeMerkleProof {
+                                    checkpoint_id: start_checkpoint_id,
+                                    leaf_index: get_registration_id_from_user_id(user_id),
+                                },
+                            ))
+                            .await?,
+                    )
+                } else {
+                    None
+                };
+            anyhow::Ok((ups_start_witness_input, ups_start_registration_proof))
+        }
+        .await;
+        let (ups_start_witness_input, ups_start_registration_proof) = setup_result?;
         Ok(TraceBuildSession {
             wallet_session: self,
             public_key,
+            user_session_mgr,
             trace_arena: TraceArenaBuilder::new(),
             ups_start_witness_input,
             ups_start_registration_proof,
@@ -2515,6 +2523,55 @@ impl WalletSession {
     //         tracing::info!("No checkpoints with valid rewards to claim");
     //         return Ok(Vec::new());
     //     }
+
+    //     let last_checkpoint =
+    // all_proofs_with_checkpoints.last().unwrap().checkpoint_id;
+
+    //     all_contract_calls.push(ContractCallArgs {
+    //         contract_id: MINING_REWARDS_CONTRACT_ID as u64,
+    //         method_name: "end_session".to_string(),
+    //         inputs: vec![last_checkpoint],
+    //     });
+
+    //     all_contract_calls.push(ContractCallArgs {
+    //         contract_id: TOKEN_CONTRACT_ID as u64,
+    //         method_name: "simple_claim_pow_rewards".to_string(),
+    //         inputs: vec![last_checkpoint],
+    //     });
+
+    //     if all_contract_calls.is_empty() {
+    //         tracing::info!("No rewards to claim");
+    //         return Ok(Vec::new());
+    //     }
+
+    //     tracing::info!("Executing {} contract calls in single transaction",
+    // all_contract_calls.len());     Ok(all_contract_calls)
+    // }
+
+    // pub async fn claim_rewards(&self, user_pk_hash: QHashOut<F>, job_infos:
+    // Vec<JobInfo>) -> anyhow::Result<()> {     let contract_call_args =
+    // self.get_claim_rewards_call_args(job_infos).await?;
+    //     self.exec_contract_call(user_pk_hash,
+    // ContractCallData::new(contract_call_args)).await?;     Ok(())
+    // }
+
+    pub async fn get_zk_public_key(&self, private_key: QHashOut<F>) -> anyhow::Result<ZKPublicKeyInfo<F>> {
+        self.wallet.get_zk_pk_info(private_key).await
+    }
+
+    pub async fn get_secp_public_key(&self, private_key: QHashOut<F>) -> anyhow::Result<ZKPublicKeyInfo<F>> {
+        self.wallet.get_secp_pk_info(private_key).await
+    }
+
+    pub async fn get_random_keypair(&self) -> anyhow::Result<WalletKeyPair> {
+        let private_key = QHashOut::<F>::rand();
+        let pk_info = self.get_zk_public_key(private_key).await?;
+        Ok(WalletKeyPair {
+            private_key,
+            public_key: pk_info,
+        })
+    }
+
     pub async fn call_view(&self, public_key: QHashOut<F>, call_data: ViewCallData) -> anyhow::Result<crate::trace::ViewCallResult> {
         anyhow::ensure!(!call_data.contract_calls.is_empty(), "No contract calls to execute");
 
@@ -2578,55 +2635,6 @@ impl WalletSession {
             checkpoint_id,
             contract_calls,
             storage_reads,
-        })
-    }
-
-
-    //     let last_checkpoint =
-    // all_proofs_with_checkpoints.last().unwrap().checkpoint_id;
-
-    //     all_contract_calls.push(ContractCallArgs {
-    //         contract_id: MINING_REWARDS_CONTRACT_ID as u64,
-    //         method_name: "end_session".to_string(),
-    //         inputs: vec![last_checkpoint],
-    //     });
-
-    //     all_contract_calls.push(ContractCallArgs {
-    //         contract_id: TOKEN_CONTRACT_ID as u64,
-    //         method_name: "simple_claim_pow_rewards".to_string(),
-    //         inputs: vec![last_checkpoint],
-    //     });
-
-    //     if all_contract_calls.is_empty() {
-    //         tracing::info!("No rewards to claim");
-    //         return Ok(Vec::new());
-    //     }
-
-    //     tracing::info!("Executing {} contract calls in single transaction",
-    // all_contract_calls.len());     Ok(all_contract_calls)
-    // }
-
-    // pub async fn claim_rewards(&self, user_pk_hash: QHashOut<F>, job_infos:
-    // Vec<JobInfo>) -> anyhow::Result<()> {     let contract_call_args =
-    // self.get_claim_rewards_call_args(job_infos).await?;
-    //     self.exec_contract_call(user_pk_hash,
-    // ContractCallData::new(contract_call_args)).await?;     Ok(())
-    // }
-
-    pub async fn get_zk_public_key(&self, private_key: QHashOut<F>) -> anyhow::Result<ZKPublicKeyInfo<F>> {
-        self.wallet.get_zk_pk_info(private_key).await
-    }
-
-    pub async fn get_secp_public_key(&self, private_key: QHashOut<F>) -> anyhow::Result<ZKPublicKeyInfo<F>> {
-        self.wallet.get_secp_pk_info(private_key).await
-    }
-
-    pub async fn get_random_keypair(&self) -> anyhow::Result<WalletKeyPair> {
-        let private_key = QHashOut::<F>::rand();
-        let pk_info = self.get_zk_public_key(private_key).await?;
-        Ok(WalletKeyPair {
-            private_key,
-            public_key: pk_info,
         })
     }
     pub async fn generate_tx_trace(&self, public_key: QHashOut<F>, call_data: ContractCallData) -> anyhow::Result<crate::trace::TxTrace> {
@@ -5636,13 +5644,20 @@ mod async_split_tests {
 
             #[contract]
             #[derive(Storage)]
-            pub struct DeferredWrapper {{}}
+            pub struct DeferredWrapper {{
+                pub marker: Felt,
+            }}
 
             impl DeferredWrapperRef {{
                 #[contract_method]
                 pub fn simple_deferred_mint() -> Felt {{
                     invoke_deferred(0, {built_in_simple_mint_method_id}, [500000000000]);
                     return 1;
+                }}
+
+                #[contract_method]
+                pub fn pure_view() -> Felt {{
+                    return 42;
                 }}
             }}
         "#
@@ -5842,20 +5857,78 @@ mod async_split_tests {
             method_name: "simple_mint".to_string(),
             inputs: vec![1_000_000_000_000],
         }]);
+        wallet_session.start_session(user0).await?;
+        let (before_count, before_hash) = {
+            let mgr = wallet_session.user_session_mgrs.get(&user0).unwrap();
+            (mgr.current_tx_count(), mgr.current_tx_hash_stack())
+        };
 
         let simulated = wallet_session.simulate_contract_call(user0, call_data.clone()).await?;
-        let generated = simulated.generated.as_ref().expect("external simulation must retain a provable trace envelope");
-        assert_eq!(simulated.metadata.tx_hash.as_ref().unwrap().to_string(), generated.tx_hash);
-        assert!(simulated.metadata.end_cap_data.is_some());
+        let generated = &simulated.generated;
+        assert_eq!(simulated.metadata.tx_hash.to_string(), generated.tx_hash);
+        assert!(!generated.trace.payload.is_empty());
         assert_eq!(simulated.metadata.contract_call_data.contract_calls.len(), 1);
         assert_eq!(simulated.metadata.contract_call_data.contract_calls[0].contract_id, contract_id);
+        assert_eq!(simulated.metadata.contract_call_data.contract_calls[0].method_name, "simple_mint");
         assert_eq!(simulated.metadata.contract_call_data.contract_calls[0].inputs, vec![1_000_000_000_000]);
         assert!(!simulated.metadata.storage_data.writes.is_empty());
+        let (after_count, after_hash) = {
+            let mgr = wallet_session.user_session_mgrs.get(&user0).unwrap();
+            (mgr.current_tx_count(), mgr.current_tx_hash_stack())
+        };
+        assert_eq!(before_count, after_count, "simulation must not advance shared session tx_count");
+        assert_eq!(before_hash, after_hash, "simulation must not advance shared session hash stack");
 
         let trace = wallet_session.generate_tx_trace(user0, call_data).await?;
-
         assert!(!trace.steps.is_empty());
         let _tx_hash = wallet_session.prove_tx_trace(user0, &trace).await?;
+        Ok(())
+    }
+
+
+    #[tokio::test]
+    async fn async_call_view_is_read_only_and_rejects_mutation() -> anyhow::Result<()> {
+        let (wallet_session, user0, _, contract_ids) = setup_wallet_and_users(false).await?;
+        let helper_contract_id = contract_ids[1];
+        wallet_session.start_session(user0).await?;
+        let (before_count, before_hash) = {
+            let mgr = wallet_session.user_session_mgrs.get(&user0).unwrap();
+            (mgr.current_tx_count(), mgr.current_tx_hash_stack())
+        };
+
+        let view_call = ContractCallArgs {
+            contract_id: helper_contract_id,
+            method_name: "pure_view".to_string(),
+            inputs: Vec::new(),
+        };
+        let request = ViewCallData::new(vec![view_call.clone(), view_call]);
+        let first = wallet_session.call_view(user0, request.clone()).await?;
+        let second = wallet_session.call_view(user0, request).await?;
+        assert_eq!(first.contract_calls.iter().map(|call| call.outputs.as_slice()).collect::<Vec<_>>(), vec![&[42], &[42]]);
+        assert_eq!(second.contract_calls.iter().map(|call| call.outputs.as_slice()).collect::<Vec<_>>(), vec![&[42], &[42]]);
+        assert_eq!(first.checkpoint_id, second.checkpoint_id);
+        let (after_count, after_hash) = {
+            let mgr = wallet_session.user_session_mgrs.get(&user0).unwrap();
+            (mgr.current_tx_count(), mgr.current_tx_hash_stack())
+        };
+        assert_eq!(before_count, after_count, "call_view must not advance shared session tx_count");
+        assert_eq!(before_hash, after_hash, "call_view must not advance shared session hash stack");
+
+        let mutation = wallet_session
+            .call_view(
+                user0,
+                ViewCallData::new(vec![ContractCallArgs {
+                    contract_id: 0,
+                    method_name: "simple_mint".to_string(),
+                    inputs: vec![1],
+                }]),
+            )
+            .await
+            .unwrap_err();
+        assert!(mutation.to_string().contains("not read-only"));
+
+        let empty = wallet_session.call_view(user0, ViewCallData::new(Vec::new())).await.unwrap_err();
+        assert!(empty.to_string().contains("No contract calls"));
         Ok(())
     }
 
@@ -5911,7 +5984,6 @@ mod async_split_tests {
         let _tx_hash = wallet_session.prove_tx_trace(public_key, &trace).await?;
         Ok(())
     }
-
     #[tokio::test]
     async fn async_trace_first_step_root_matches_ups_start_root() -> anyhow::Result<()> {
         let (wallet_session, user0, _, contract_ids) = setup_wallet_and_users(false).await?;

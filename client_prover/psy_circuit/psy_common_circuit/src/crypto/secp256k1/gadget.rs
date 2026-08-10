@@ -21,6 +21,7 @@ use psy_crypto::{
 };
 use psy_plonky2_common_circuits::hash::keccak::keccak256_bytes_targets;
 
+
 use super::ecdsa::gadgets::{
     biguint::BigUintTarget,
     curve::CircuitBuilderCurve,
@@ -35,7 +36,7 @@ use crate::{
     hash::base_types::hash256bytes::{CircuitBuilderHash256Bytes, Hash256BytesTarget, WitnessHash256Bytes},
     u32::arithmetic_u32::CircuitBuilderU32,
 };
-pub fn biguint_from_array(arr: [u64; 4]) -> BigUint {
+fn biguint_from_array(arr: [u64; 4]) -> BigUint {
     BigUint::from_slice(&[
         arr[0] as u32,
         (arr[0] >> 32) as u32,
@@ -200,11 +201,12 @@ impl DogePsySignatureCombinedHashGadget {
         Ok(())
     }
 }
-/// Re-exported from `psy_crypto` (single source of truth) so the in-circuit
-/// keccak preimage always matches the host-side signing preimage.
-pub use psy_crypto::signature::secp256k1::wallet::EIP191_PREFIX_32;
 
+/// No domain separation: classic secp256k1 verifies the raw sighash.
 pub const DOGE_PSY_PREFIX: &[u8] = b"";
+
+/// Shared host/circuit prefix for the fixed 32-byte EIP-191 message.
+pub use psy_crypto::signature::secp256k1::wallet::EIP191_PREFIX_32;
 
 #[derive(Debug, Clone)]
 pub struct Secp256K1Gadget {
@@ -219,36 +221,31 @@ pub struct Secp256K1Gadget {
 }
 
 impl Secp256K1Gadget {
-    pub fn add_virtual_to<H: AlgebraicHasher<F>, F: RichField + Extendable<D>, const D: usize>(builder: &mut CircuitBuilder<F, D>, prefix_bytes: &[u8]) -> Self {
+    pub fn add_virtual_to<H: AlgebraicHasher<F>, F: RichField + Extendable<D>, const D: usize>(
+        builder: &mut CircuitBuilder<F, D>,
+        prefix_bytes: &[u8],
+    ) -> Self {
         type CURVE = Secp256K1;
         let msg_bytes_target = builder.add_virtual_hash256_bytes_target();
         let msg_u32_targets = if prefix_bytes.is_empty() {
             builder.hash256_bytes_to_hash256_be(msg_bytes_target)
         } else {
-            // ── EIP-191 keccak: digest = keccak256(prefix || msg_bytes) ───────────
-            let mut preimage: Vec<Target> = prefix_bytes
-                .iter()
-                .map(|b| builder.constant(F::from_canonical_u8(*b)))
-                .collect();
+            let mut preimage = Vec::with_capacity(prefix_bytes.len() + msg_bytes_target.len());
+            preimage.extend(prefix_bytes.iter().map(|byte| builder.constant(F::from_canonical_u8(*byte))));
             preimage.extend_from_slice(&msg_bytes_target);
-            // keccak output: 8 little-endian u32 limbs (limb[i] = canonical digest
-            // bytes [4i..4i+3], little-endian within the word).
-            let keccak_out = keccak256_bytes_targets::<F, D>(builder, &preimage);
 
-            // Re-explode to canonical digest bytes [d0..d31] so the existing
-            // `hash256_bytes_to_hash256_be` helper yields the big-endian ECDSA scalar
-            // (Ethereum signs the keccak digest as a big-endian 256-bit integer).
-            let mut eth_digest_bytes: Vec<Target> = Vec::with_capacity(32);
-            for limb in keccak_out.iter() {
+            let digest_limbs = keccak256_bytes_targets(builder, &preimage);
+            let mut digest_bytes = Vec::with_capacity(32);
+            for limb in digest_limbs {
                 let bits = builder.split_le(limb.0, 32);
-                for chunk in 0..4 {
-                    eth_digest_bytes.push(builder.le_sum(bits[chunk * 8..chunk * 8 + 8].iter()));
+                for byte_index in 0..4 {
+                    digest_bytes.push(builder.le_sum(bits[byte_index * 8..(byte_index + 1) * 8].iter()));
                 }
             }
-            let eth_digest_bytes: Hash256BytesTarget = eth_digest_bytes
+            let digest_bytes: Hash256BytesTarget = digest_bytes
                 .try_into()
-                .expect("keccak digest is exactly 32 bytes");
-            builder.hash256_bytes_to_hash256_be(eth_digest_bytes)
+                .expect("Keccak-256 output must contain exactly 32 bytes");
+            builder.hash256_bytes_to_hash256_be(digest_bytes)
         };
         let msg_hash_target = builder.hash256_bytes_to_hashout(msg_bytes_target);
 
@@ -327,14 +324,21 @@ impl Secp256K1Gadget {
         witness.set_biguint_target(&self.signature_s_target, &biguint_from_array(signature.s.0))
     }
 
-    pub fn add_virtual_to_doge_psy<H: AlgebraicHasher<F>, F: RichField + Extendable<D>, const D: usize>(builder: &mut CircuitBuilder<F, D>) -> Self {
+    pub fn add_virtual_to_doge_psy<H: AlgebraicHasher<F>, F: RichField + Extendable<D>, const D: usize>(
+        builder: &mut CircuitBuilder<F, D>,
+    ) -> Self {
         Self::add_virtual_to::<H, F, D>(builder, DOGE_PSY_PREFIX)
     }
 
-    pub fn add_virtual_to_eth_personal_sign<H: AlgebraicHasher<F>, F: RichField + Extendable<D>, const D: usize>(builder: &mut CircuitBuilder<F, D>) -> Self {
+    pub fn add_virtual_to_eth_personal_sign<H: AlgebraicHasher<F>, F: RichField + Extendable<D>, const D: usize>(
+        builder: &mut CircuitBuilder<F, D>,
+    ) -> Self {
         Self::add_virtual_to::<H, F, D>(builder, EIP191_PREFIX_32)
     }
 }
+
+/// Retained as the classic circuit's public gadget name.
+pub type DogePsySignatureGadget = Secp256K1Gadget;
 
 #[cfg(test)]
 mod tests {
