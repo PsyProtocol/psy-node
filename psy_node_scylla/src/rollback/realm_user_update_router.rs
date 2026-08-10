@@ -5,7 +5,13 @@
 //! and concrete Scylla/NATS publication permit. Production Edge callsites are
 //! wired in a later milestone.
 
-use std::{error::Error, fmt, marker::PhantomData, sync::Arc};
+use std::{
+    error::Error,
+    fmt,
+    marker::PhantomData,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use parth_core::{
     crypto::hash::traits::FieldQHasher,
@@ -16,6 +22,7 @@ use psy_data::protocol::{
     canonical_chain::NetworkId,
     chain_context::AuthorityScope,
 };
+use psy_data::proof_input::guta::end_cap_input::SubmitUserEndCapNonProofInput;
 use psy_node_core::{
     queue::{
         realm_user_update_admission::{
@@ -41,6 +48,11 @@ use psy_node_core::{
             GlobalUserTreeHeight, RealmUserUpdatePublishAdmission,
             RealmUserUpdatePublishPort, RealmUserUpdatePublishReceipt,
             RealmUserUpdatePublishRequest,
+        },
+        realm_user_update_ingress::{
+            seal_realm_user_update_ingress_artifacts,
+            RealmUserUpdateArtifactFactory, RealmUserUpdateIngressReceipt,
+            RealmUserUpdateStateFence,
         },
         realm_user_update_verifier_profile::{
             RealmUserUpdateVerifierProfileId, RealmUserUpdateVerifierRegistry,
@@ -376,6 +388,81 @@ where
             .map_err(router)?;
         self.validate_claim_scope(&current)?;
         Ok(current)
+    }
+
+    /// Production-shaped high-level live submission. The full canonical input
+    /// and proof are verified on a blocking thread before any claim LWT. Only
+    /// the durable winner may seed the pure artifact factory; all returned
+    /// material is revalidated before dependency persistence/publication.
+    pub(crate) async fn submit_after_state_validation(
+        &self,
+        fence: RealmUserUpdateStateFence<Hash>,
+        input: SubmitUserEndCapNonProofInput<F, Hash>,
+        proof: Vec<u8>,
+        artifact_factory: Arc<dyn RealmUserUpdateArtifactFactory<F, Hash>>,
+    ) -> Result<RealmUserUpdateIngressReceipt<Hash>, RealmUserUpdateRouterError> {
+        let admission = fence.into_admission();
+        let bound_verifier = self
+            .verifier_profiles
+            .resolve(self.active_verifier_profile)
+            .map_err(|_| {
+                RealmUserUpdateRouterError::UnknownVerifierProfile(
+                    self.active_verifier_profile,
+                )
+            })?;
+        let height = self.global_user_tree_height;
+        let verify_input = input.clone();
+        let verified_request = run_blocking_proof_recovery(move || {
+            VerifiedRealmUserUpdateRequest::verify::<Proof, Verifier, Hasher>(
+                &verify_input,
+                proof,
+                height,
+                &bound_verifier,
+            )
+        })
+        .await?;
+
+        let created_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| {
+                RealmUserUpdateRouterError::Clock(error.to_string())
+            })?
+            .as_secs();
+        let created_at = u32::try_from(created_at)
+            .map_err(|_| RealmUserUpdateRouterError::ClockOverflow)?;
+        let winner = self
+            .claim(
+                admission.clone(),
+                &verified_request,
+                RealmUserUpdateCreatedAtSeconds::try_new(created_at)
+                    .map_err(router)?,
+            )
+            .await?;
+
+        let artifact_claim = winner.clone();
+        let artifact_verified = verified_request.clone();
+        let artifacts = tokio::task::spawn_blocking(move || {
+            let material = artifact_factory.build(&artifact_claim, &input)?;
+            seal_realm_user_update_ingress_artifacts::<F, Hash, Hasher>(
+                admission,
+                &artifact_claim,
+                &artifact_verified,
+                material,
+            )
+        })
+        .await
+        .map_err(|error| {
+            RealmUserUpdateRouterError::ArtifactTaskFailed(error.to_string())
+        })?
+        .map_err(|error| {
+            RealmUserUpdateRouterError::ArtifactBuildFailed(error.to_string())
+        })?;
+        let terminal = self.complete_live(&winner, &artifacts).await?;
+        RealmUserUpdateIngressReceipt::try_from_terminal(
+            terminal.claim,
+            terminal.publication,
+        )
+        .map_err(router)
     }
 
     /// Complete a live request whose five artifacts were validated against the
@@ -923,6 +1010,10 @@ pub(crate) enum RealmUserUpdateRouterError {
     DependencyUnavailable(String),
     ProofTaskFailed(String),
     ProofRecoveryFailed(String),
+    ArtifactTaskFailed(String),
+    ArtifactBuildFailed(String),
+    Clock(String),
+    ClockOverflow,
     DependencyMissing,
     DependencyConflict,
     TerminalEvidenceMismatch,
@@ -970,7 +1061,10 @@ mod tests {
         assert!(!source.contains("dyn RealmUserUpdatePublishPort"));
         assert!(!source.contains("legacy"));
 
-        let setup = include_str!("../psy_setup.rs");
+        let setup = include_str!("../psy_setup.rs")
+            .split("#[cfg(test)]\nmod realm_startup_composition_tests")
+            .next()
+            .unwrap();
         let core = include_str!("../core.rs");
         assert!(!setup.contains("ScyllaRealmUserUpdateDurableRouter"));
         assert!(!core.contains("prepare_realm_user_update_router"));
@@ -1019,6 +1113,37 @@ mod tests {
         assert!(resume < revalidate && revalidate < claim);
         assert!(!source.contains("self.claims.claim("));
         assert!(source.contains("self.validate_claim_scope(&current)?"));
+    }
+
+    #[test]
+    fn high_level_ingress_verifies_before_claim_and_seals_before_publish() {
+        let source = production_source();
+        let start = source
+            .find("pub(crate) async fn submit_after_state_validation")
+            .unwrap();
+        let end = source[start..]
+            .find("    /// Complete a live request")
+            .map(|offset| start + offset)
+            .unwrap();
+        let ingress = &source[start..end];
+        let verify = ingress
+            .find("VerifiedRealmUserUpdateRequest::verify")
+            .unwrap();
+        let clock = ingress.find("SystemTime::now()").unwrap();
+        let claim = ingress.find(".claim(").unwrap();
+        let build = ingress.find("artifact_factory.build").unwrap();
+        let seal = ingress
+            .find("seal_realm_user_update_ingress_artifacts")
+            .unwrap();
+        let complete = ingress.find("self.complete_live").unwrap();
+        assert!(verify < clock && clock < claim);
+        assert!(claim < build && build < seal && seal < complete);
+        assert!(ingress.contains("fence: RealmUserUpdateStateFence<Hash>"));
+        assert!(ingress.contains("input: SubmitUserEndCapNonProofInput<F, Hash>"));
+        assert!(ingress.contains("proof: Vec<u8>"));
+        assert!(!ingress.contains("request_digest:"));
+        assert!(!ingress.contains("created_at:"));
+        assert!(!ingress.contains("RealmUserUpdatePublishRequest"));
     }
 
     #[test]

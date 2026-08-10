@@ -12,3 +12,4 @@ pub mod realm_user_update_artifact;
 pub mod realm_user_update_dependency;
 pub mod realm_user_update_consumer;
 pub mod realm_user_update_verifier_profile;
+pub mod realm_user_update_ingress;

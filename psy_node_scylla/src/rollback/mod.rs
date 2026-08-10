@@ -56,6 +56,8 @@ mod realm_user_update_dependency_store;
 mod realm_user_update_durable_consumer;
 #[allow(dead_code)]
 mod realm_user_update_router;
+#[allow(dead_code)]
+mod realm_user_update_ingress;
 mod pending_queue_sidecar_lifecycle;
 #[cfg(test)]
 #[path = "../../tests/rf3/d04b6h23c4c1_queue_schema.rs"]
@@ -148,6 +150,7 @@ pub(crate) use realm_user_update_admission_store::*;
 pub use realm_user_update_dependency_store::*;
 pub(crate) use realm_user_update_durable_consumer::*;
 pub(crate) use realm_user_update_router::*;
+pub(crate) use realm_user_update_ingress::*;
 pub use pending_queue_sidecar_lifecycle::*;
 pub use authority_local_head_prototype::*;
 pub use authority_timestamp_prototype::*;
