@@ -28,6 +28,13 @@ const MAX_STREAM_REPLICAS: usize = 5;
 const MAX_CONSUMERS_PER_SEGMENT: i32 = 1_000_000;
 const RETRY_DEDUPLICATION_WINDOW: Duration = Duration::from_secs(120);
 
+/// The only application-owned JetStream metadata accepted by the recoverable
+/// segment contract. The transport binds its exact value to a durable stream
+/// provisioning operation; the segment digest intentionally remains stable
+/// across that external mutation intent.
+pub const RECOVERABLE_NATS_PROVISION_OPERATION_METADATA_KEY: &str =
+    "psy.rollback.provision-operation.v1";
+
 /// Maximum encoded queue item admitted by the current capture contract plus
 /// room for the future Data/Seal envelope.
 pub const RECOVERABLE_NATS_MAX_MESSAGE_BYTES: i32 = 64 * 1024 * 1024 + 4096;
@@ -608,16 +615,19 @@ fn stream_config_for(
 }
 
 /// NATS may add `_nats.*` metadata while normalizing an otherwise identical
-/// stream. No other server/operator metadata is accepted. Clearing only those
-/// reserved entries yields one value used by both equality and digest, so the
-/// attestation and durable identity cannot drift as two hand-maintained lists.
+/// stream. The single application-owned provisioning marker is validated by
+/// the transport against durable state and ignored only for the stable segment
+/// contract digest. No other server/operator metadata is accepted.
 fn normalized_stream_config(
     config: &StreamConfig,
 ) -> Result<StreamConfig, RecoverableNatsSegmentError> {
     if config
         .metadata
         .keys()
-        .any(|key| !key.starts_with("_nats."))
+        .any(|key| {
+            !key.starts_with("_nats.")
+                && key != RECOVERABLE_NATS_PROVISION_OPERATION_METADATA_KEY
+        })
     {
         return Err(RecoverableNatsSegmentError::StreamContractMismatch);
     }

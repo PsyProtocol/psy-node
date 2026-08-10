@@ -46,6 +46,7 @@ use crate::{
         LiveRecoverableNatsStreamInstance, RecoverableNatsStreamInstanceId,
         RecoverableNatsStreamSegment, RecoverableNatsStreamStateSnapshot,
         SealedRecoverableNatsStreamInstance,
+        RECOVERABLE_NATS_PROVISION_OPERATION_METADATA_KEY,
     },
     recoverable_terminal::{
         PendingQueueNatsWholeStreamExpectedManifest,
@@ -68,6 +69,103 @@ const CONSUMER_CONFIG_DOMAIN: &[u8] =
     b"psy/rollback/recoverable-nats-consumer-config/v1";
 const CONSUMER_INVENTORY_DOMAIN: &[u8] =
     b"psy/rollback/recoverable-nats-consumer-inventory/v1";
+
+/// Stable identity of one durable stream-provisioning attempt. Storage must
+/// persist this value before JetStream is mutated and reuse it verbatim after
+/// a crash or an indeterminate response.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RecoverableNatsStreamProvisioningOperationId([u8; 32]);
+
+impl RecoverableNatsStreamProvisioningOperationId {
+    pub fn try_new(bytes: [u8; 32]) -> Result<Self, RecoverableNatsTransportError> {
+        if bytes == [0; 32] {
+            Err(RecoverableNatsTransportError::StreamProvisioningContract)
+        } else {
+            Ok(Self(bytes))
+        }
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoverableNatsStreamProvisionDisposition {
+    Applied,
+    ReconciledExistingPristine,
+}
+
+/// Opaque transport receipt for one exact, newly-created or safely adopted
+/// pristine stream incarnation. Only a durable store may turn this receipt
+/// into a serving binding.
+pub struct RecoverableNatsProvisionedStreamReceipt {
+    segment_contract_digest: [u8; 32],
+    operation_id: RecoverableNatsStreamProvisioningOperationId,
+    live: LiveRecoverableNatsStreamInstance,
+    disposition: RecoverableNatsStreamProvisionDisposition,
+}
+
+impl RecoverableNatsProvisionedStreamReceipt {
+    pub const fn segment_contract_digest(&self) -> &[u8; 32] {
+        &self.segment_contract_digest
+    }
+
+    pub const fn operation_id(&self) -> RecoverableNatsStreamProvisioningOperationId {
+        self.operation_id
+    }
+
+    pub const fn instance_id(&self) -> RecoverableNatsStreamInstanceId {
+        self.live.instance_id()
+    }
+
+    pub const fn live(&self) -> &LiveRecoverableNatsStreamInstance {
+        &self.live
+    }
+
+    pub const fn disposition(&self) -> RecoverableNatsStreamProvisionDisposition {
+        self.disposition
+    }
+}
+
+/// Exact durable expectation used to open a serving publisher. The binding
+/// grants no stream-create authority and is rejected if the live incarnation
+/// no longer matches.
+pub struct RecoverableNatsExistingStreamBinding {
+    segment_contract_digest: [u8; 32],
+    operation_id: RecoverableNatsStreamProvisioningOperationId,
+    instance_id: RecoverableNatsStreamInstanceId,
+}
+
+impl RecoverableNatsExistingStreamBinding {
+    pub fn try_from_durable(
+        segment: &RecoverableNatsStreamSegment,
+        segment_contract_digest: [u8; 32],
+        operation_id: RecoverableNatsStreamProvisioningOperationId,
+        instance_id: RecoverableNatsStreamInstanceId,
+    ) -> Result<Self, RecoverableNatsTransportError> {
+        if segment.digest().as_bytes() != &segment_contract_digest {
+            return Err(RecoverableNatsTransportError::StreamProvisioningContract);
+        }
+        Ok(Self {
+            segment_contract_digest,
+            operation_id,
+            instance_id,
+        })
+    }
+
+    pub const fn segment_contract_digest(&self) -> &[u8; 32] {
+        &self.segment_contract_digest
+    }
+
+    pub const fn operation_id(&self) -> RecoverableNatsStreamProvisioningOperationId {
+        self.operation_id
+    }
+
+    pub const fn instance_id(&self) -> RecoverableNatsStreamInstanceId {
+        self.instance_id
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoverableNatsExpectedConsumer {
@@ -847,6 +945,66 @@ pub struct RecoverablePendingQueueNatsPublisher {
     segment: RecoverableNatsStreamSegment,
 }
 
+/// Serving publisher bound to one durable server-created stream incarnation.
+/// Every operation attests the incarnation both before and after touching
+/// JetStream. Recreating the same stream name with an identical config cannot
+/// inherit this capability.
+#[derive(Clone)]
+pub struct InstanceBoundRecoverablePendingQueueNatsPublisher {
+    inner: RecoverablePendingQueueNatsPublisher,
+    operation_id: RecoverableNatsStreamProvisioningOperationId,
+    instance_id: RecoverableNatsStreamInstanceId,
+}
+
+impl InstanceBoundRecoverablePendingQueueNatsPublisher {
+    pub const fn segment(&self) -> &RecoverableNatsStreamSegment {
+        self.inner.segment()
+    }
+
+    pub const fn instance_id(&self) -> RecoverableNatsStreamInstanceId {
+        self.instance_id
+    }
+
+    pub async fn publish(
+        &self,
+        envelope: &PendingQueuePublishEnvelope,
+    ) -> Result<RecoverableNatsPublishOutcome, RecoverableNatsTransportError> {
+        self.require_bound_instance().await?;
+        let outcome = self.inner.publish(envelope).await?;
+        self.require_bound_instance().await?;
+        Ok(outcome)
+    }
+
+    pub async fn scan_source_retained_set(
+        &self,
+        assignment: &PendingQueueGenerationSegmentAssignment,
+        publisher_kind: PendingQueuePublisherKind,
+    ) -> Result<PendingQueueSourceTruncationReceipt, RecoverableNatsTransportError> {
+        self.require_bound_instance().await?;
+        let receipt = self
+            .inner
+            .scan_source_retained_set(assignment, publisher_kind)
+            .await?;
+        self.require_bound_instance().await?;
+        Ok(receipt)
+    }
+
+    async fn require_bound_instance(
+        &self,
+    ) -> Result<LiveRecoverableNatsStreamInstance, RecoverableNatsTransportError> {
+        let observed = observe_live_instance(
+            &self.inner.context,
+            self.inner.segment.clone(),
+            Some(self.operation_id),
+        )
+        .await?;
+        if observed.instance_id() != self.instance_id {
+            return Err(RecoverableNatsTransportError::StreamInstanceChanged);
+        }
+        Ok(observed)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RecoverableNatsSealDisposition {
     Applied,
@@ -1195,7 +1353,156 @@ impl RecoverablePendingQueueNatsPublisher {
     }
 }
 
+async fn observe_live_instance(
+    context: &jetstream::Context,
+    segment: RecoverableNatsStreamSegment,
+    operation_id: Option<RecoverableNatsStreamProvisioningOperationId>,
+) -> Result<LiveRecoverableNatsStreamInstance, RecoverableNatsTransportError> {
+    let stream = context
+        .get_stream(segment.stream_name())
+        .await
+        .map_err(nats)?;
+    let info = stream.get_info().await.map_err(nats)?;
+    if let Some(operation_id) = operation_id {
+        require_stream_provision_operation(&info.config, operation_id)?;
+    }
+    segment
+        .attest_live_instance(&info)
+        .map_err(|error| RecoverableNatsTransportError::Core(error.to_string()))
+}
+
+fn stream_config_for_provisioning(
+    segment: &RecoverableNatsStreamSegment,
+    operation_id: RecoverableNatsStreamProvisioningOperationId,
+) -> async_nats::jetstream::stream::Config {
+    let mut config = segment.stream_config();
+    config.metadata.insert(
+        RECOVERABLE_NATS_PROVISION_OPERATION_METADATA_KEY.to_owned(),
+        hex::encode(operation_id.as_bytes()),
+    );
+    config
+}
+
+fn require_stream_provision_operation(
+    config: &async_nats::jetstream::stream::Config,
+    operation_id: RecoverableNatsStreamProvisioningOperationId,
+) -> Result<(), RecoverableNatsTransportError> {
+    let expected = hex::encode(operation_id.as_bytes());
+    if config
+        .metadata
+        .get(RECOVERABLE_NATS_PROVISION_OPERATION_METADATA_KEY)
+        .is_some_and(|observed| observed == &expected)
+    {
+        Ok(())
+    } else {
+        Err(RecoverableNatsTransportError::StreamProvisioningOperationMismatch)
+    }
+}
+
+fn classify_stream_provision_readback(
+    create_applied: bool,
+    first: LiveRecoverableNatsStreamInstance,
+    second: LiveRecoverableNatsStreamInstance,
+) -> Result<
+    (LiveRecoverableNatsStreamInstance, RecoverableNatsStreamProvisionDisposition),
+    RecoverableNatsTransportError,
+> {
+    if first != second {
+        return Err(RecoverableNatsTransportError::StreamProvisioningChanged);
+    }
+    let state = first.state();
+    if state.messages() != 0
+        || state.bytes() != 0
+        || state.first_sequence() != 0
+        || state.last_sequence() != 0
+        || state.consumer_count() != 0
+        || state.subject_count() != 0
+    {
+        return Err(RecoverableNatsTransportError::StreamProvisioningNotPristine);
+    }
+    Ok((
+        first,
+        if create_applied {
+            RecoverableNatsStreamProvisionDisposition::Applied
+        } else {
+            RecoverableNatsStreamProvisionDisposition::ReconciledExistingPristine
+        },
+    ))
+}
+
 impl NatsJetStreamClient {
+    /// Creates one typed segment only after the caller has persisted an exact
+    /// provisioning operation. A failed create is reconciled exclusively by
+    /// double-reading an exact, pristine live instance. A non-empty stream can
+    /// never be adopted as a response-loss retry.
+    pub async fn provision_recoverable_segment(
+        &self,
+        segment: RecoverableNatsStreamSegment,
+        operation_id: RecoverableNatsStreamProvisioningOperationId,
+    ) -> Result<RecoverableNatsProvisionedStreamReceipt, RecoverableNatsTransportError> {
+        if self.base_namespace() != segment.base_namespace() {
+            return Err(RecoverableNatsTransportError::ClientNamespaceMismatch);
+        }
+        let context = self.raw_context_for_recoverable_transport();
+        let create_applied = context
+            .create_stream(stream_config_for_provisioning(&segment, operation_id))
+            .await
+            .is_ok();
+        let first = observe_live_instance(&context, segment.clone(), Some(operation_id))
+            .await
+            .map_err(|read| {
+                RecoverableNatsTransportError::StreamProvisioningIndeterminate(
+                    read.to_string(),
+                )
+            })?;
+        let second = observe_live_instance(&context, segment.clone(), Some(operation_id))
+            .await
+            .map_err(|read| {
+                RecoverableNatsTransportError::StreamProvisioningIndeterminate(
+                    read.to_string(),
+                )
+            })?;
+        let (live, disposition) =
+            classify_stream_provision_readback(create_applied, first, second)?;
+        Ok(RecoverableNatsProvisionedStreamReceipt {
+            segment_contract_digest: *segment.digest().as_bytes(),
+            operation_id,
+            live,
+            disposition,
+        })
+    }
+
+    /// Opens a publisher from a completed durable provisioning binding. This
+    /// method never creates or updates a stream.
+    pub async fn open_existing_recoverable_pending_publisher(
+        &self,
+        segment: RecoverableNatsStreamSegment,
+        binding: &RecoverableNatsExistingStreamBinding,
+    ) -> Result<InstanceBoundRecoverablePendingQueueNatsPublisher, RecoverableNatsTransportError> {
+        if self.base_namespace() != segment.base_namespace()
+            || binding.segment_contract_digest() != segment.digest().as_bytes()
+        {
+            return Err(RecoverableNatsTransportError::StreamProvisioningContract);
+        }
+        let observed = observe_live_instance(
+            &self.raw_context_for_recoverable_transport(),
+            segment.clone(),
+            Some(binding.operation_id()),
+        )
+        .await?;
+        if observed.instance_id() != binding.instance_id() {
+            return Err(RecoverableNatsTransportError::StreamInstanceChanged);
+        }
+        Ok(InstanceBoundRecoverablePendingQueueNatsPublisher {
+            inner: RecoverablePendingQueueNatsPublisher {
+                context: self.raw_context_for_recoverable_transport(),
+                segment,
+            },
+            operation_id: binding.operation_id(),
+            instance_id: binding.instance_id(),
+        })
+    }
+
     /// Irreversibly seals one exact server-created V2 stream incarnation.
     ///
     /// The caller cannot supply a raw stream name or config. A higher-level
@@ -2139,6 +2446,12 @@ pub enum RecoverableNatsTransportError {
     InvalidCaptureSpec,
     ClientNamespaceMismatch,
     StreamContract,
+    StreamProvisioningContract,
+    StreamProvisioningOperationMismatch,
+    StreamProvisioningNotPristine,
+    StreamProvisioningChanged,
+    StreamProvisioningIndeterminate(String),
+    StreamInstanceChanged,
     ConsumerContract,
     DeliveryContract,
     EmptyDelivery,
@@ -2273,6 +2586,97 @@ mod tests {
     ) -> (RecoverableNatsStreamSegment, PendingQueuePublishEnvelope) {
         let (segment, _, envelope) = fixture_for_segment(segment);
         (segment, envelope)
+    }
+
+    #[test]
+    fn stream_provisioning_requires_exact_pristine_incarnation_and_operation() {
+        let segment = envelope().0;
+        assert!(RecoverableNatsStreamProvisioningOperationId::try_new([0; 32]).is_err());
+        let operation =
+            RecoverableNatsStreamProvisioningOperationId::try_new([91; 32]).unwrap();
+        let marked = stream_config_for_provisioning(&segment, operation);
+        require_stream_provision_operation(&marked, operation).unwrap();
+        let other =
+            RecoverableNatsStreamProvisioningOperationId::try_new([90; 32]).unwrap();
+        assert_eq!(
+            require_stream_provision_operation(&marked, other),
+            Err(RecoverableNatsTransportError::StreamProvisioningOperationMismatch),
+        );
+        assert_eq!(
+            segment.validate_stream_config_structure(&marked).unwrap().segment(),
+            &segment,
+        );
+        let empty = RecoverableNatsStreamStateSnapshot::try_new(0, 0, 0, 0, 0, 0)
+            .unwrap();
+        let live = segment.model_live_instance(1_700_000_000_000_000_000, empty);
+        let (observed, disposition) = classify_stream_provision_readback(
+            true,
+            live.clone(),
+            live.clone(),
+        )
+        .unwrap();
+        assert_eq!(observed, live);
+        assert_eq!(disposition, RecoverableNatsStreamProvisionDisposition::Applied);
+        assert_eq!(operation.as_bytes(), &[91; 32]);
+
+        assert_eq!(
+            classify_stream_provision_readback(false, live.clone(), live.clone())
+                .unwrap()
+                .1,
+            RecoverableNatsStreamProvisionDisposition::ReconciledExistingPristine,
+        );
+        let recreated =
+            segment.model_live_instance(1_700_000_000_000_000_001, empty);
+        assert_eq!(
+            classify_stream_provision_readback(false, live, recreated),
+            Err(RecoverableNatsTransportError::StreamProvisioningChanged),
+        );
+
+        let occupied_state =
+            RecoverableNatsStreamStateSnapshot::try_new(1, 100, 1, 1, 0, 1)
+                .unwrap();
+        let occupied = segment.model_live_instance(
+            1_700_000_000_000_000_000,
+            occupied_state,
+        );
+        assert_eq!(
+            classify_stream_provision_readback(
+                false,
+                occupied.clone(),
+                occupied,
+            ),
+            Err(RecoverableNatsTransportError::StreamProvisioningNotPristine),
+        );
+    }
+
+    #[test]
+    fn durable_stream_binding_commits_contract_operation_and_instance() {
+        let segment = envelope().0;
+        let operation =
+            RecoverableNatsStreamProvisioningOperationId::try_new([92; 32]).unwrap();
+        let instance = RecoverableNatsStreamInstanceId::try_from_bytes([93; 32]).unwrap();
+        let binding = RecoverableNatsExistingStreamBinding::try_from_durable(
+            &segment,
+            *segment.digest().as_bytes(),
+            operation,
+            instance,
+        )
+        .unwrap();
+        assert_eq!(binding.segment_contract_digest(), segment.digest().as_bytes());
+        assert_eq!(binding.operation_id(), operation);
+        assert_eq!(binding.instance_id(), instance);
+
+        let mut wrong_digest = *segment.digest().as_bytes();
+        wrong_digest[0] ^= 0xff;
+        assert!(matches!(
+            RecoverableNatsExistingStreamBinding::try_from_durable(
+                &segment,
+                wrong_digest,
+                operation,
+                instance,
+            ),
+            Err(RecoverableNatsTransportError::StreamProvisioningContract)
+        ));
     }
 
     #[test]
