@@ -26,7 +26,7 @@ set -euo pipefail
 # ─── Config ───────────────────────────────────────────────────────────────────
 RPC_URL="${L1_RPC_URL:-http://127.0.0.1:8545}"
 SERVICES_URL="${SERVICES_URL:-http://127.0.0.1:3000}"
-RPC_CONFIG="client_prover/config.json"
+RPC_CONFIG="psy-genesis/config.json"
 USER_PK="${USER_PK:-0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80}"
 USER_ADDR="${USER_ADDR:-0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266}"
 DEPOSIT_AMOUNT="${DEPOSIT_AMOUNT:-2000}"  # 0.002 USDT (6 decimals)

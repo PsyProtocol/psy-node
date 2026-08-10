@@ -8,30 +8,30 @@ fn main() {
             if cargo_toml.exists() {
                 if let Ok(cargo_content) = fs::read_to_string(&cargo_toml) {
                     if cargo_content.contains("[workspace]") {
+                        let genesis_config = current_dir.join("psy-genesis").join("config.json");
+                        if genesis_config.exists() {
+                            return genesis_config;
+                        }
                         let root_config = current_dir.join("config.json");
                         if root_config.exists() {
                             return root_config;
                         }
-                        let client_prover_config = current_dir.join("client_prover").join("config.json");
-                        if client_prover_config.exists() {
-                            return client_prover_config;
-                        }
-                        return root_config;
+                        return genesis_config;
                     }
                 }
             }
             if let Some(parent) = current_dir.parent() {
                 current_dir = parent.to_path_buf();
             } else {
+                let local_genesis_config = Path::new("psy-genesis").join("config.json");
+                if local_genesis_config.exists() {
+                    return local_genesis_config;
+                }
                 let local_config = Path::new("config.json").to_path_buf();
                 if local_config.exists() {
                     return local_config;
                 }
-                let local_client_prover_config = Path::new("client_prover").join("config.json");
-                if local_client_prover_config.exists() {
-                    return local_client_prover_config;
-                }
-                return local_config;
+                return local_genesis_config;
             }
         }
     });

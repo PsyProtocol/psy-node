@@ -16,7 +16,7 @@ use psy_provider::provider::QUserRpcProvider;
 async fn main() -> anyhow::Result<()> {
     setup_logging()?;
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let cfg_path = repo_root.join("client_prover/config.json");
+    let cfg_path = repo_root.join("psy-genesis/config.json");
     let keys_path = repo_root.join("private_keys.json");
 
     let psy_config = PsyConfigGoldilocks::from_file(&cfg_path.to_string_lossy())?;

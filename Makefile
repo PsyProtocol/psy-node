@@ -1,6 +1,6 @@
 PROVING_BACKEND := plonky2-poseidon-goldilocks
 BIN_PREFIX   := ./target/release/
-PSY_CONFIG_PATH := $(CURDIR)/client_prover/config.json
+PSY_CONFIG_PATH := $(CURDIR)/psy-genesis/config.json
 ifneq (,$(wildcard ./.env))
 include .env
 export
@@ -150,7 +150,7 @@ INDEXER_DB_NAME ?= envio-dev
 BRIDGE_CHAIN_INDEX ?= 0
 BRIDGE_TREE_OWNER_USER_ID ?= 524288
 BRIDGE_DEPOSIT_TREE_CONTRACT_ID ?= 2
-ROOT_RPC_CONFIG ?= client_prover/config.json
+ROOT_RPC_CONFIG ?= psy-genesis/config.json
 
 mint-relayer:
 	@RUST_LOG=$${RUST_LOG:-info} ./target/release/psy_user_cli call \

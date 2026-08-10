@@ -26,8 +26,8 @@ pub enum ChainInfoFormat {
 
 #[derive(Parser, Debug)]
 pub struct ChainInfoArgs {
-    /// Path to network config JSON (same format as client_prover/config.json)
-    #[arg(long = "config", default_value = "client_prover/config.json")]
+    /// Path to network config JSON (same format as psy-genesis/config.json)
+    #[arg(long = "config", default_value = "psy-genesis/config.json")]
     pub config: String,
 
     /// Network name inside config.json (defaults to config current network)

@@ -7,7 +7,7 @@ WORKDIR /psy-rollup
 COPY ./target/release/psy_node_cli /usr/local/bin/
 
 # Copy configuration files
-COPY config.json ./
+COPY psy-genesis/config.json ./
 COPY .env ./
 
 # Set environment variables

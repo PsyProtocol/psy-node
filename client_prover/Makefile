@@ -4,7 +4,7 @@ export SQLX_OFFLINE=true
 ROOT_DIR := $(shell cd .. && pwd)
 PROFILE := release
 BIN_DIR := $(ROOT_DIR)/target/$(PROFILE)
-ROOT_CONFIG_PATH := $(CURDIR)/config.json
+ROOT_CONFIG_PATH := $(CURDIR)/../psy-genesis/config.json
 PRIVATE_KEYS_FILE ?= $(ROOT_DIR)/private_keys.json
 CARGO := cd $(ROOT_DIR) && PSY_CONFIG_PATH=$(ROOT_CONFIG_PATH) cargo
 USER_CLI := $(BIN_DIR)/psy_user_cli

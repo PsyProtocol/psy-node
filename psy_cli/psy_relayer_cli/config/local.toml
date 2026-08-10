@@ -1,6 +1,6 @@
 # Reference template — locSetupV4 generates the actual daemon.toml at runtime
 # with absolute paths resolved from the current machine.
-rpc_config = "client_prover/config.json"
+rpc_config = "psy-genesis/config.json"
 services_url = "http://127.0.0.1:3000"
 withdraw_method_id = 3055054724
 proof_dir = "local_checkpoints/bridge_proposer"

@@ -6,7 +6,7 @@ import net from "node:net";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
 import { availableParallelism } from "node:os";
-import allConfig from "../client_prover/config.json";
+import allConfig from "../psy-genesis/config.json";
 import { protocolConfig } from "../psy-contracts/protocol-config";
 import {
     COORDINATOR_PROCESSOR_READY_MARKER,
@@ -2203,7 +2203,7 @@ async function buildProject(cwd?: string) {
     const root = cwd || ".";
     const env = {
         ...process.env,
-        PSY_CONFIG_PATH: path.join(root, "client_prover", "config.json"),
+        PSY_CONFIG_PATH: path.join(root, "psy-genesis", "config.json"),
     };
     const proc = Bun.spawn([
         "cargo",
@@ -3548,7 +3548,7 @@ class DevNetProcessManager {
                         '--listen-addr',
                         `0.0.0.0:${port}`,
                         '--rpc-config',
-                        'client_prover/config.json',
+                        'psy-genesis/config.json',
                     ],
                     proveProxyStartedDetector,
                     { cwd, ...getLogPaths(`prove_proxy_${i}`, false), maxRetries: 3, retryDelayMs: 2000, env: this.getEnv() }
@@ -3573,7 +3573,7 @@ class DevNetProcessManager {
                     '--listen-addr',
                     `0.0.0.0:${faucetPort}`,
                     '--rpc-config',
-                    'client_prover/config.json',
+                    'psy-genesis/config.json',
                 ],
                 faucetServerStartedDetector,
                 { cwd, ...getLogPaths('faucet_server', false), maxRetries: 3, retryDelayMs: 2000, env: this.getEnv() }
@@ -3824,7 +3824,7 @@ class DevNetProcessManager {
             await mkdir(proofDir, { recursive: true });
             const daemonConfigPath = path.join(proofDir, 'daemon.toml');
             const daemonConfig = [
-                `rpc_config = "client_prover/config.json"`,
+                `rpc_config = "psy-genesis/config.json"`,
                 `services_url = "http://127.0.0.1:3000"`,
                 `withdraw_method_id = 4159421846`,
                 `proof_dir = "${proofDir.replaceAll('\\', '\\\\')}"`,
@@ -4210,7 +4210,7 @@ class DevNetProcessManager {
                     ...getRuntimeServiceEntry(`prove-proxy-${i}`, [
                         "/app/bin/psy_user_cli", "prove-proxy",
                         "--listen-addr", `0.0.0.0:${port}`,
-                        "--rpc-config", "/app/workspace/client_prover/config.json"
+                        "--rpc-config", "/app/workspace/psy-genesis/config.json"
                     ]),
                     ports: [`${port}:${port}`]
                 };
@@ -4221,7 +4221,7 @@ class DevNetProcessManager {
                 ...getRuntimeServiceEntry("faucet-server", [
                     "/app/bin/psy_user_cli", "faucet-server",
                     "--listen-addr", "0.0.0.0:9998",
-                    "--rpc-config", "/app/workspace/client_prover/config.json"
+                    "--rpc-config", "/app/workspace/psy-genesis/config.json"
                 ]),
                 ports: ["9998:9998"]
             };

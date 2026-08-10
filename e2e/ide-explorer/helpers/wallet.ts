@@ -20,7 +20,7 @@ export const CLI_PATH = path.join(
   "release",
   "psy_user_cli",
 );
-export const RPC_CONFIG = path.join(REPO_ROOT, "client_prover", "config.json");
+export const RPC_CONFIG = path.join(REPO_ROOT, "psy-genesis", "config.json");
 export const PROFILE_DIR = path.resolve(__dirname, "..", ".profile");
 export const ARTIFACTS_DIR = path.resolve(__dirname, "..", "artifacts");
 

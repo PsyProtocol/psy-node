@@ -2,7 +2,7 @@
 set -euo pipefail
 
 BIN="${BIN:-target/debug/psy_user_cli}"
-RPC_CONFIG="${RPC_CONFIG:-client_prover/config.json}"
+RPC_CONFIG="${RPC_CONFIG:-psy-genesis/config.json}"
 LISTEN_ADDR="${LISTEN_ADDR:-127.0.0.1:19998}"
 SAMPLES="${SAMPLES:-20}"
 INTERVAL_SECONDS="${INTERVAL_SECONDS:-2}"
