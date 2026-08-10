@@ -183,7 +183,7 @@ impl PendingQueueSidecarKeyspaces {
         }
     }
 
-    fn artifact_keyspaces(
+    pub(crate) fn artifact_keyspaces(
         &self,
     ) -> Result<PendingQueueArtifactKeyspaces, PendingQueueSidecarSchemaError> {
         Ok(PendingQueueArtifactKeyspaces::new(

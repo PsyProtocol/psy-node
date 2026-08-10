@@ -5,7 +5,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CRATE_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 WORKSPACE_DIR="$(cd "${CRATE_DIR}/.." && pwd)"
 COMPOSE_FILE="${SCRIPT_DIR}/docker-compose.yml"
-REPORT_PATH="${WORKSPACE_DIR}/target/d04b6h23c4c2b4e3-jtmb-handler-ingress-rf3-report.json"
+REPORT_PATH="${PSY_D04B6H23C4C2B4E3_REPORT_OVERRIDE:-${WORKSPACE_DIR}/target/d04b6h23c4c2b4e3-jtmb-handler-ingress-rf3-report.json}"
+EXERCISE_DURABLE_CAPTURE="${PSY_D04B6H23C4C3A_RF3:-0}"
+EXPECTED_QUALIFICATION="H23C4C2B4E3_JTMB_HANDLER_INGRESS_RF3_PASSED"
+if [[ "${EXERCISE_DURABLE_CAPTURE}" == "1" ]]; then
+  EXPECTED_QUALIFICATION="H23C4C3A_DURABLE_CAPTURE_OWNER_RF3_PASSED"
+fi
 NATS_DIR="$(mktemp -d /tmp/psy-h23e3-nats.XXXXXX)"
 
 NATS1_PID=""
@@ -75,6 +80,7 @@ fi
 rm -f "${REPORT_PATH}"
 cd "${WORKSPACE_DIR}"
 PSY_D04B6H23C4C2B4E3_RF3=1 \
+PSY_D04B6H23C4C3A_RF3="${EXERCISE_DURABLE_CAPTURE}" \
 PSY_D04B6H23C4C2B4E3_COMPOSE_FILE="${COMPOSE_FILE}" \
 PSY_D04B6H23C4C2B4E3_REPORT_PATH="${REPORT_PATH}" \
 PSY_D04B6H23C4C2B4E3_NATS_URLS="nats://127.0.0.1:45322,nats://127.0.0.1:45323,nats://127.0.0.1:45324" \
@@ -86,8 +92,10 @@ cargo test -p psy_node_scylla \
   rollback::realm_edge_handler_ingress_rf3::d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3 \
   --lib -- --ignored --exact --nocapture
 
-jq -e '
-  .qualification == "H23C4C2B4E3_JTMB_HANDLER_INGRESS_RF3_PASSED"
+jq -e \
+  --arg expected_qualification "${EXPECTED_QUALIFICATION}" \
+  --argjson exercise_durable_capture "${EXERCISE_DURABLE_CAPTURE}" '
+  .qualification == $expected_qualification
   and .scylla_replication_factor == 3
   and .configured_nats_servers == 3
   and .nats_stream_replicas == 3
@@ -111,6 +119,16 @@ jq -e '
   and .dependency_explicit_timestamp_verified == true
   and .repair_direct_one_tables == 17
   and .repair_direct_one_equal == true
+  and (
+    if $exercise_durable_capture then
+      .durable_capture_owner_tested == true
+      and .durable_capture_items == 3
+      and .durable_capture_empty_poll_not_close == true
+      and .processor_gatherer_integrated == false
+    else
+      .durable_capture_owner_tested == false
+    end
+  )
 ' \
   "${REPORT_PATH}" >/dev/null
 echo "D-04b6h23c4c2b4e3 JTMB Handler ingress RF=3 report: ${REPORT_PATH}"

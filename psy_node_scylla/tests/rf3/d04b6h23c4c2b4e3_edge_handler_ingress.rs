@@ -75,6 +75,7 @@ use psy_node_core::{
         realm_user_update_verifier_profile::{
             RealmUserUpdateVerifierProfile, RealmUserUpdateVerifierRegistry,
         },
+        realm_processor_durable_capture::RealmProcessorDurableCaptureOutcome,
         recoverable_ephemeral::PendingQueueCaptureContext,
     },
     store::{
@@ -92,10 +93,20 @@ use psy_node_core::{
             PendingGenerationContext, PendingGenerationLedgerKey,
         },
         pending_generation_pipeline::{
+            PendingEmptyQueueSealDigest, PendingNoWorkReceiptDigest,
             PendingPipelineBootstrap, PendingPipelineWriteOutcome,
-            StoredPendingPipeline,
+            PendingQueueCloseIntentDigest, StoredPendingPipeline,
         },
-        realm_processor_startup::RealmProcessorStartupLineage,
+        realm_processor_branch_exact_runtime::{
+            RealmBranchExactCommitRuntimeInstaller,
+            RealmBranchExactSingleCommitOwner,
+        },
+        realm_processor_quiescence::RealmProcessorIterationGate,
+        realm_processor_startup::{
+            authorize_realm_processor_startup,
+            RealmProcessorStartupAuthorization, RealmProcessorStartupLineage,
+            RealmProcessorStartupMode,
+        },
         typed::UniquePendingId,
     },
 };
@@ -170,6 +181,10 @@ struct E3Report {
     repair_ms: u128,
     repair_direct_one_tables: usize,
     repair_direct_one_equal: bool,
+    durable_capture_owner_tested: bool,
+    durable_capture_items: u64,
+    durable_capture_empty_poll_not_close: bool,
+    processor_gatherer_integrated: bool,
     qualification: &'static str,
 }
 
@@ -608,6 +623,13 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
         )
         .await?,
     );
+    activated
+        .core
+        .initialize_pending_queue_sidecar_setup(
+            authority,
+            PendingQueueSidecarSetupMode::RequireVerified,
+        )
+        .await?;
 
     let state_checkpoint = AuthorityStateCheckpointId::new(
         predecessor_chain.checkpoint().checkpoint_id().get(),
@@ -849,6 +871,33 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
         *binding_digest.as_bytes(),
         *activated.plan.digest().as_bytes(),
     )?;
+    let exercise_durable_capture =
+        std::env::var("PSY_D04B6H23C4C3A_RF3").as_deref() == Ok("1");
+    let mut branch_exact_commit_owner = if exercise_durable_capture {
+        let expectation = lineage.seal_attempt([0xC3; 32])?;
+        let provider = Arc::new(
+            activated
+                .core
+                .prepare_realm_processor_startup_provider_with_capture(
+                    expectation,
+                    Arc::clone(&nats),
+                )
+                .await?,
+        );
+        let RealmProcessorStartupAuthorization::BranchExact(run_permit) =
+            authorize_realm_processor_startup(
+                RealmProcessorStartupMode::RequireBranchExact(expectation),
+                Some(provider.as_ref()),
+            )
+            .await?
+        else {
+            bail!("branch-exact startup did not return a run permit")
+        };
+        let installed = provider.install(run_permit).await?;
+        Some(RealmBranchExactSingleCommitOwner::from_installed(installed))
+    } else {
+        None
+    };
     let handler = compose_handler(
         lineage,
         Arc::clone(&verifier),
@@ -1062,6 +1111,76 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
     let restart_retry_messages = stream_messages(&jetstream, segment.stream_name()).await?;
     ensure!(restart_retry_messages == 3);
 
+    let (durable_capture_items, durable_capture_empty_poll_not_close) =
+        if let Some(owner) = branch_exact_commit_owner.as_mut() {
+            // Edge always publishes to the gathering generation. Retire the
+            // preceding processing generation through legal no-work
+            // transitions, then rotate the published generation into the
+            // Processor-owned capture slot.
+            let old_close = PendingQueueCloseIntentDigest::try_new([0xC0; 32])?;
+            let old_empty = PendingEmptyQueueSealDigest::try_new([0xC1; 32])?;
+            let old_receipt = PendingNoWorkReceiptDigest::try_new([0xC2; 32])?;
+            let old_sealing = current_pipeline(
+                pipeline_store
+                    .apply(&pipeline.seal_begin_queue_close(old_close)?)
+                    .await?,
+            )?;
+            let old_empty_sealed = current_pipeline(
+                pipeline_store
+                    .apply(&old_sealing.seal_empty_queue(old_close, old_empty)?)
+                    .await?,
+            )?;
+            let old_retired = current_pipeline(
+                pipeline_store
+                    .apply(&old_empty_sealed.seal_retire_no_work(
+                        old_empty,
+                        old_receipt,
+                        observation.clone(),
+                    )?)
+                    .await?,
+            )?;
+            let next = seed_db
+                .reserve_next_unique_pending_generation_without_mapping(prefix)
+                .await?;
+            let capture_ready = current_pipeline(
+                pipeline_store
+                    .apply(&old_retired.seal_rotation(next)?)
+                    .await?,
+            )?;
+            ensure!(capture_ready.processing() == capture.processing());
+            let sealing = current_pipeline(
+                pipeline_store
+                    .apply(&capture_ready.seal_begin_queue_close(
+                        PendingQueueCloseIntentDigest::try_new([0xC4; 32])?,
+                    )?)
+                    .await?,
+            )?;
+            ensure!(sealing.processing() == capture.processing());
+            let iteration_gate = RealmProcessorIterationGate::controlled();
+            let mut iteration = owner.begin_iteration(
+                iteration_gate.try_begin_iteration()?,
+            )?;
+            let mut capture_owner = iteration.open_durable_capture(capture).await?;
+            let first = capture_owner
+                .capture_next()
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("durable capture returned no data"))?;
+            let item_count = match first {
+                RealmProcessorDurableCaptureOutcome::Data(candidate) => {
+                    candidate.item_count()
+                }
+                RealmProcessorDurableCaptureOutcome::Sealed { data, .. } => data
+                    .as_ref()
+                    .map_or(0, |candidate| candidate.item_count()),
+            };
+            ensure!(item_count == 3, "durable owner captured {item_count} items");
+            let empty = capture_owner.capture_next().await?.is_none();
+            ensure!(empty, "empty poll unexpectedly formed a capture outcome");
+            (item_count, empty)
+        } else {
+            (0, false)
+        };
+
     fixture::compose(
         Path::new(&compose_file),
         &["start", "scylla3"],
@@ -1200,7 +1319,15 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
         repair_ms,
         repair_direct_one_tables: replicas[0].0.len(),
         repair_direct_one_equal: true,
-        qualification: "H23C4C2B4E3_JTMB_HANDLER_INGRESS_RF3_PASSED",
+        durable_capture_owner_tested: exercise_durable_capture,
+        durable_capture_items,
+        durable_capture_empty_poll_not_close,
+        processor_gatherer_integrated: false,
+        qualification: if exercise_durable_capture {
+            "H23C4C3A_DURABLE_CAPTURE_OWNER_RF3_PASSED"
+        } else {
+            "H23C4C2B4E3_JTMB_HANDLER_INGRESS_RF3_PASSED"
+        },
     };
     std::fs::write(report_path, serde_json::to_vec_pretty(&report)?)?;
     println!("{}", serde_json::to_string_pretty(&report)?);

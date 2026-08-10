@@ -4,13 +4,23 @@
 //! A fresh-run permit is deliberately insufficient on its own.  The exact
 //! storage-backed runtime must consume that permit, revalidate its identity,
 //! and return this module's non-Clone installed capability.  No live commit
-//! operation is exposed yet: h23c4a only closes the ownership hand-off while
-//! the production commit path remains fail closed.
+//! h23c4c3a adds one narrow operation: an affine durable-capture port whose
+//! concrete delivery token and ACK authority remain storage-private.  The
+//! production gatherer is still not wired, so serving remains fail closed.
 
-use std::sync::Arc;
+use std::{marker::PhantomData, sync::Arc};
 
 use async_trait::async_trait;
 use psy_data::protocol::canonical_chain::NetworkId;
+
+use crate::queue::{
+    realm_processor_durable_capture::{
+        RealmProcessorDurableCaptureError, RealmProcessorDurableCaptureFactory,
+        RealmProcessorDurableCaptureOutcome, RealmProcessorDurableCapturePort,
+        SealedRealmProcessorDurableCaptureRequest,
+    },
+    recoverable_ephemeral::PendingQueueCaptureContext,
+};
 
 use super::realm_processor_startup::{
     RealmProcessorFreshRunPermit, RealmProcessorStartupError,
@@ -27,13 +37,15 @@ pub enum RealmBranchExactRuntimeScope {
 
 /// Driver-independent identity exposed by a storage-owned runtime.
 ///
-/// The trait intentionally has no mutation method in h23c4a.  Adding live
-/// commit operations is a later, independently reviewed slice.
+/// The shared trait intentionally remains identity-only. Mutating operations
+/// are installed as separate affine factories and can only be consumed by a
+/// borrowed single-owner iteration.
 pub trait RealmBranchExactCommitRuntime<Hash>: Send + Sync {
     fn network(&self) -> NetworkId;
     fn realm_id(&self) -> u32;
     fn realm_sub_id(&self) -> u16;
     fn writer_activation_digest(&self) -> [u8; 32];
+    fn queue_readiness_digest(&self) -> [u8; 32];
     fn scope(&self) -> RealmBranchExactRuntimeScope;
 }
 
@@ -42,6 +54,7 @@ pub trait RealmBranchExactCommitRuntime<Hash>: Send + Sync {
 pub struct InstalledRealmBranchExactCommitRuntime<Hash> {
     startup_permit: RealmProcessorFreshRunPermit,
     runtime: Arc<dyn RealmBranchExactCommitRuntime<Hash>>,
+    capture_factory: Arc<dyn RealmProcessorDurableCaptureFactory>,
 }
 
 impl<Hash> InstalledRealmBranchExactCommitRuntime<Hash> {
@@ -50,6 +63,7 @@ impl<Hash> InstalledRealmBranchExactCommitRuntime<Hash> {
     pub fn seal(
         startup_permit: RealmProcessorFreshRunPermit,
         runtime: Arc<dyn RealmBranchExactCommitRuntime<Hash>>,
+        capture_factory: Arc<dyn RealmProcessorDurableCaptureFactory>,
     ) -> Result<Self, RealmProcessorStartupError> {
         let expectation = startup_permit.expectation();
         if runtime.network() != expectation.network()
@@ -59,12 +73,20 @@ impl<Hash> InstalledRealmBranchExactCommitRuntime<Hash> {
                 != *expectation.expected_writer_activation_digest().as_bytes()
             || runtime.scope()
                 != RealmBranchExactRuntimeScope::MappingAndRewardProofDualWrite
+            || capture_factory.network() != runtime.network()
+            || capture_factory.realm_id() != runtime.realm_id()
+            || capture_factory.realm_sub_id() != runtime.realm_sub_id()
+            || capture_factory.writer_activation_digest()
+                != runtime.writer_activation_digest()
+            || capture_factory.queue_readiness_digest()
+                != runtime.queue_readiness_digest()
         {
             return Err(RealmProcessorStartupError::CommitRuntimeIdentityMismatch);
         }
         Ok(Self {
             startup_permit,
             runtime,
+            capture_factory,
         })
     }
 
@@ -74,6 +96,10 @@ impl<Hash> InstalledRealmBranchExactCommitRuntime<Hash> {
 
     pub fn runtime(&self) -> &dyn RealmBranchExactCommitRuntime<Hash> {
         self.runtime.as_ref()
+    }
+
+    fn capture_factory(&self) -> &Arc<dyn RealmProcessorDurableCaptureFactory> {
+        &self.capture_factory
     }
 }
 
@@ -132,9 +158,10 @@ impl<Hash> RealmBranchExactSingleCommitOwner<Hash> {
 }
 
 /// Borrowed owner of one complete `sync + queue + commit + publish`
-/// iteration.  h23c4b intentionally exposes identity only. Future queue and
-/// marker ports must require `&mut self` here and private typestate receipts;
-/// a bare checkpoint or a shared runtime reference is never sufficient.
+/// iteration. h23c4c3a exposes only durable capture here; future writer and
+/// marker ports must likewise require `&mut self` and private typestate
+/// receipts. A bare checkpoint or shared runtime reference is never
+/// sufficient.
 pub struct RealmBranchExactCommitIteration<'a, Hash> {
     owner: &'a mut RealmBranchExactSingleCommitOwner<Hash>,
     _iteration_permit: RealmProcessorIterationPermit,
@@ -155,6 +182,47 @@ impl<Hash> RealmBranchExactCommitIteration<'_, Hash> {
 
     pub const fn startup_permit_digest(&self) -> RealmProcessorStartupPermitDigest {
         self.owner.startup_permit_digest()
+    }
+
+    /// Opens one backend-owned capture authority while borrowing this whole
+    /// iteration mutably.  The returned port cannot outlive the iteration and
+    /// no second queue mutation can be opened through the same owner until it
+    /// is dropped.
+    pub async fn open_durable_capture<'capture>(
+        &'capture mut self,
+        context: PendingQueueCaptureContext,
+    ) -> Result<RealmBranchExactDurableCapture<'capture>, RealmProcessorDurableCaptureError> {
+        let runtime = self.owner.runtime();
+        let factory = Arc::clone(self.owner.installed.capture_factory());
+        let request = SealedRealmProcessorDurableCaptureRequest::seal(
+            self.owner.startup_permit_digest(),
+            runtime.network(),
+            runtime.realm_id(),
+            runtime.realm_sub_id(),
+            runtime.writer_activation_digest(),
+            runtime.queue_readiness_digest(),
+            context,
+        )?;
+        let port = factory.open(request).await?;
+        Ok(RealmBranchExactDurableCapture {
+            port,
+            _iteration: PhantomData,
+        })
+    }
+}
+
+/// Lifetime-bound affine capture handle.  It exposes canonical outcomes only;
+/// backend delivery/ACK receipts remain private to the adapter.
+pub struct RealmBranchExactDurableCapture<'iteration> {
+    port: Box<dyn RealmProcessorDurableCapturePort>,
+    _iteration: PhantomData<&'iteration mut ()>,
+}
+
+impl RealmBranchExactDurableCapture<'_> {
+    pub async fn capture_next(
+        &mut self,
+    ) -> Result<Option<RealmProcessorDurableCaptureOutcome>, RealmProcessorDurableCaptureError> {
+        self.port.capture_next().await
     }
 }
 
@@ -177,8 +245,13 @@ mod tests {
 
     use parth_core::PHash;
     use psy_core::constants::chain_id::PsyChainNetworkType;
+    use psy_data::protocol::chain_context::AuthorityScope;
 
     use super::*;
+    use crate::store::pending_generation_identity::{
+        PendingGenerationActivationDigest, PendingGenerationContext,
+        PendingGenerationLedgerKey,
+    };
     use crate::store::realm_processor_startup::{
         authorize_realm_processor_startup, RealmProcessorStartupAuthorization,
         RealmProcessorStartupEvidence, RealmProcessorStartupExpectation,
@@ -268,6 +341,10 @@ mod tests {
             self.activation
         }
 
+        fn queue_readiness_digest(&self) -> [u8; 32] {
+            [6; 32]
+        }
+
         fn scope(&self) -> RealmBranchExactRuntimeScope {
             RealmBranchExactRuntimeScope::MappingAndRewardProofDualWrite
         }
@@ -295,6 +372,93 @@ mod tests {
         })
     }
 
+    struct CapturePort;
+
+    #[async_trait]
+    impl RealmProcessorDurableCapturePort for CapturePort {
+        async fn capture_next(
+            &mut self,
+        ) -> Result<Option<RealmProcessorDurableCaptureOutcome>, RealmProcessorDurableCaptureError>
+        {
+            Ok(None)
+        }
+    }
+
+    struct CaptureFactory {
+        network: NetworkId,
+        realm_id: u32,
+        realm_sub_id: u16,
+        activation: [u8; 32],
+    }
+
+    #[async_trait]
+    impl RealmProcessorDurableCaptureFactory for CaptureFactory {
+        fn network(&self) -> NetworkId {
+            self.network
+        }
+
+        fn realm_id(&self) -> u32 {
+            self.realm_id
+        }
+
+        fn realm_sub_id(&self) -> u16 {
+            self.realm_sub_id
+        }
+
+        fn writer_activation_digest(&self) -> [u8; 32] {
+            self.activation
+        }
+
+        fn queue_readiness_digest(&self) -> [u8; 32] {
+            [6; 32]
+        }
+
+        async fn open(
+            &self,
+            request: SealedRealmProcessorDurableCaptureRequest,
+        ) -> Result<Box<dyn RealmProcessorDurableCapturePort>, RealmProcessorDurableCaptureError>
+        {
+            if request.network() != self.network
+                || request.realm_id() != self.realm_id
+                || request.realm_sub_id() != self.realm_sub_id
+                || request.writer_activation_digest() != &self.activation
+                || request.queue_readiness_digest() != &self.queue_readiness_digest()
+            {
+                return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
+            }
+            Ok(Box::new(CapturePort))
+        }
+    }
+
+    fn capture_factory(
+        network: NetworkId,
+        realm_id: u32,
+        realm_sub_id: u16,
+        activation: [u8; 32],
+    ) -> Arc<dyn RealmProcessorDurableCaptureFactory> {
+        Arc::new(CaptureFactory {
+            network,
+            realm_id,
+            realm_sub_id,
+            activation,
+        })
+    }
+
+    fn capture_context() -> PendingQueueCaptureContext {
+        PendingQueueCaptureContext::try_new(
+            PendingGenerationLedgerKey::new(
+                network(),
+                AuthorityScope::Realm {
+                    realm_id: 7,
+                    realm_sub_id: 3,
+                },
+            ),
+            PendingGenerationActivationDigest::try_new([7; 32]).unwrap(),
+            PendingGenerationContext::try_from_legacy(17, 19).unwrap(),
+        )
+        .unwrap()
+    }
+
     #[tokio::test]
     async fn exact_runtime_consumes_permit_into_nonclone_capability() {
         let permit = permit().await;
@@ -303,6 +467,7 @@ mod tests {
         let installed = InstalledRealmBranchExactCommitRuntime::seal(
             permit,
             runtime(network(), 7, 3, [2; 32], drops.clone()),
+            capture_factory(network(), 7, 3, [2; 32]),
         )
         .unwrap();
         assert_eq!(installed.startup_permit_digest(), expected_digest);
@@ -341,6 +506,7 @@ mod tests {
                     activation,
                     Arc::new(AtomicUsize::new(0)),
                 ),
+                capture_factory(network(), 7, 3, [2; 32]),
             );
             let Err(error) = result else {
                 panic!("mismatched runtime must not install")
@@ -350,6 +516,22 @@ mod tests {
                 RealmProcessorStartupError::CommitRuntimeIdentityMismatch
             );
         }
+
+        let result = InstalledRealmBranchExactCommitRuntime::seal(
+            permit().await,
+            runtime(
+                network(),
+                7,
+                3,
+                [2; 32],
+                Arc::new(AtomicUsize::new(0)),
+            ),
+            capture_factory(network(), 7, 3, [9; 32]),
+        );
+        assert!(matches!(
+            result,
+            Err(RealmProcessorStartupError::CommitRuntimeIdentityMismatch)
+        ));
     }
 
     #[tokio::test]
@@ -363,6 +545,7 @@ mod tests {
                 [2; 32],
                 Arc::new(AtomicUsize::new(0)),
             ),
+            capture_factory(network(), 7, 3, [2; 32]),
         )
         .unwrap();
         let mut owner = RealmBranchExactSingleCommitOwner::from_installed(installed);
@@ -375,12 +558,17 @@ mod tests {
 
         let controlled = crate::store::realm_processor_quiescence::RealmProcessorIterationGate::controlled();
         {
-            let attempt = owner
+            let mut attempt = owner
                 .begin_iteration(controlled.try_begin_iteration().unwrap())
                 .unwrap();
             assert_eq!(attempt.network(), network());
             assert_eq!(attempt.realm_id(), 7);
             assert_eq!(attempt.realm_sub_id(), 3);
+            let mut capture = attempt
+                .open_durable_capture(capture_context())
+                .await
+                .unwrap();
+            assert!(capture.capture_next().await.unwrap().is_none());
             assert!(controlled.snapshot().active_iteration());
         }
         assert!(!controlled.snapshot().active_iteration());
@@ -405,7 +593,7 @@ mod tests {
     }
 
     #[test]
-    fn h23c4b_owner_and_attempt_are_nonclone_and_expose_no_side_effect_port() {
+    fn owner_and_attempt_are_nonclone_and_expose_only_affine_capture() {
         let source = include_str!("realm_processor_branch_exact_runtime.rs");
         let production = source.split("#[cfg(test)]").next().unwrap();
         for declaration in [
@@ -424,11 +612,13 @@ mod tests {
             .split("impl<Hash> RealmBranchExactCommitIteration")
             .nth(1)
             .unwrap();
+        assert_eq!(attempt.matches("pub async fn open_durable_capture").count(), 1);
         for forbidden in [
             "prepare_and_verify",
             "finish_published",
             "publish_marker",
             "queue_close",
+            "ack_token",
             "CanonicalChainRef",
             "Session",
         ] {

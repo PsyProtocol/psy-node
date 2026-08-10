@@ -21,6 +21,7 @@ use psy_node_core::store::realm_processor_startup::{
 };
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
+use psy_node_nats::queue::NatsJetStreamClient;
 use crate::rollback::{
     BranchExactSchemaReady, BranchExactSchemaReadyView,
     BranchExactSchemaSetupError, BranchExactSchemaSetupMode,
@@ -438,6 +439,44 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
         .await
     }
 
+    pub(crate) async fn prepare_realm_processor_startup_provider_with_capture(
+        &self,
+        expectation: RealmProcessorStartupExpectation,
+        nats: Arc<NatsJetStreamClient>,
+    ) -> Result<ScyllaRealmProcessorStartupPreflightProvider<Hash>, RealmProcessorStartupError>
+    where
+        Hash: Q256BitHash + Send + Sync + 'static,
+        Hasher: Send + Sync + 'static,
+    {
+        let setup_ready = self
+            .branch_exact_schema_ready
+            .get()
+            .cloned()
+            .ok_or_else(|| {
+                RealmProcessorStartupError::DurableEvidenceNotVerified(
+                    "branch-exact schema setup capability is disabled".to_owned(),
+                )
+            })?;
+        let queue_ready = self.require_pending_queue_sidecar_ready()?;
+        let authority = require_realm_startup_factory_identity(
+            self.realm_id,
+            self.realm_sub_id,
+            setup_ready.view().authority(),
+            expectation,
+        )?;
+        ScyllaRealmProcessorStartupPreflightProvider::<Hash>::prepare_with_capture(
+            self.session.clone(),
+            &self.keyspace,
+            &self.no_tablet_keyspace,
+            expectation.network(),
+            authority,
+            setup_ready,
+            queue_ready,
+            nats,
+        )
+        .await
+    }
+
     fn coordinator_canonical_head(&self) -> anyhow::Result<&ScyllaCanonicalHeadStore> {
         self.canonical_head_store
             .get()
@@ -668,11 +707,11 @@ mod branch_exact_startup_factory_tests {
             .split("#[cfg(test)]")
             .next()
             .unwrap();
-        assert!(composition.contains("prepare_realm_processor_startup_provider"));
+        assert!(composition.contains("prepare_realm_processor_startup_provider_with_capture"));
         assert!(composition.contains("RealmBranchExactCommitRuntimeInstaller"));
         assert_eq!(
             setup
-                .matches(".prepare_realm_processor_startup_provider(")
+                .matches(".prepare_realm_processor_startup_provider_with_capture(")
                 .count(),
             1
         );

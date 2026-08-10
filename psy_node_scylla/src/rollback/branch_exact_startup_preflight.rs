@@ -42,6 +42,8 @@ use psy_node_core::store::{
         RealmBranchExactRuntimeScope,
     },
 };
+use psy_node_core::queue::realm_processor_durable_capture::RealmProcessorDurableCaptureFactory;
+use psy_node_nats::queue::NatsJetStreamClient;
 use scylla::client::session::Session;
 use sha2::{Digest, Sha256};
 
@@ -63,6 +65,7 @@ use super::{
     StoredBranchExactWriterLifecycle, BranchExactWriterRuntimeRequest,
     ScyllaBranchExactWriterRuntime,
 };
+use super::realm_processor_durable_capture::ScyllaRealmProcessorDurableCaptureFactory;
 use super::branch_exact_pending_orchestration::{
     classify_branch_exact_pending_startup, BranchExactPendingStartupRecovery,
     BranchExactPreparedWriterRecovery,
@@ -127,6 +130,7 @@ pub(crate) struct ScyllaRealmProcessorStartupPreflightProvider<Hash> {
     setup_ready: BranchExactSchemaReadyView,
     queue_schema: ScyllaPendingQueueSidecarFreshReader,
     queue_setup_ready: PendingQueueSidecarReadyView,
+    capture_factory: Option<Arc<dyn RealmProcessorDurableCaptureFactory>>,
     _hash: PhantomData<Hash>,
 }
 
@@ -264,8 +268,45 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorStartupPreflightProvider<Hash> {
             setup_ready: setup_ready_view,
             queue_schema,
             queue_setup_ready,
+            capture_factory: None,
             _hash: PhantomData,
         })
+    }
+
+    /// Processor-only preparation path. A read-only provider has no NATS
+    /// capability and therefore cannot install a durable capture owner.
+    pub(crate) async fn prepare_with_capture(
+        session: Arc<Session>,
+        standard_keyspace: &str,
+        no_tablet_keyspace: &str,
+        network: NetworkId,
+        authority: AuthorityScope,
+        setup_ready: Arc<BranchExactSchemaReady>,
+        queue_ready: Arc<PendingQueueSidecarReady>,
+        nats: Arc<NatsJetStreamClient>,
+    ) -> Result<Self, RealmProcessorStartupError> {
+        let mut provider = Self::prepare(
+            session.clone(),
+            standard_keyspace,
+            no_tablet_keyspace,
+            network,
+            authority,
+            setup_ready,
+            queue_ready.clone(),
+        )
+        .await?;
+        let factory = ScyllaRealmProcessorDurableCaptureFactory::<Hash>::prepare(
+            session,
+            network,
+            authority,
+            *provider.writer_runtime.activation_digest().as_bytes(),
+            &queue_ready,
+            nats,
+        )
+        .await
+        .map_err(|error| storage("durable capture factory", error))?;
+        provider.capture_factory = Some(Arc::new(factory));
+        Ok(provider)
     }
 
     async fn read_composite(
@@ -652,6 +693,10 @@ where
         *self.writer_runtime.activation_digest().as_bytes()
     }
 
+    fn queue_readiness_digest(&self) -> [u8; 32] {
+        *self.queue_setup_ready.ready_digest()
+    }
+
     fn scope(&self) -> RealmBranchExactRuntimeScope {
         RealmBranchExactRuntimeScope::MappingAndRewardProofDualWrite
     }
@@ -674,8 +719,17 @@ where
         if fresh != startup_permit.evidence() {
             return Err(RealmProcessorStartupError::ConcurrentMutation);
         }
+        let capture_factory = self.capture_factory.clone().ok_or_else(|| {
+            RealmProcessorStartupError::DurableEvidenceNotVerified(
+                "Realm Processor durable capture factory is missing".to_owned(),
+            )
+        })?;
         let runtime: Arc<dyn RealmBranchExactCommitRuntime<Hash>> = self;
-        InstalledRealmBranchExactCommitRuntime::seal(startup_permit, runtime)
+        InstalledRealmBranchExactCommitRuntime::seal(
+            startup_permit,
+            runtime,
+            capture_factory,
+        )
     }
 }
 

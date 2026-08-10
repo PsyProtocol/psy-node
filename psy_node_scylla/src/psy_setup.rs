@@ -752,6 +752,7 @@ pub async fn setup_realm_processor_scylla_startup_composition<
     realm_id: u32,
     realm_sub_id: u16,
     lineage: Option<RealmProcessorStartupLineage>,
+    nats: Arc<NatsJetStreamClient>,
 ) -> anyhow::Result<ScyllaRealmProcessorStartupComposition<N>>
 where
     N::QHash: Q256BitHash + Send + Sync + 'static,
@@ -838,7 +839,10 @@ where
     ))?;
     let provider = Arc::new(db
         .store
-        .prepare_realm_processor_startup_provider(expectation)
+        .prepare_realm_processor_startup_provider_with_capture(
+            expectation,
+            nats,
+        )
         .await?);
     let startup_preflight: Arc<dyn RealmProcessorStartupPreflightProvider> =
         provider.clone();
@@ -1009,13 +1013,14 @@ mod realm_startup_composition_tests {
             .find("fresh_startup_nonce_excluding")
             .unwrap();
         let final_preflight = factory
-            .find("prepare_realm_processor_startup_provider(expectation)")
+            .find("prepare_realm_processor_startup_provider_with_capture")
             .unwrap();
         assert!(queue_ready < recovery);
         assert!(recovery < fresh_run && fresh_run < final_preflight);
         assert!(source.contains("PendingQueueSidecarSetupMode::Disabled"));
         assert!(!factory.contains("PendingQueueSidecarDeploymentExecutor::deploy"));
         assert!(factory.contains("RealmBranchExactCommitRuntimeInstaller"));
+        assert!(factory.contains("expectation,\n            nats,"));
         assert!(!factory.contains("startup_nonce:"));
     }
 
