@@ -12,6 +12,7 @@ use std::{
 };
 
 use anyhow::{bail, ensure, Context};
+use async_trait::async_trait;
 use async_nats::jetstream::{
     self,
     consumer::pull::Config as PullConfig,
@@ -70,6 +71,9 @@ use psy_node_core::{
         realm_user_update_dependency::{
             RealmUserUpdateDependencyBundle, RealmUserUpdateDependencyKind,
             RealmUserUpdateDependencyRecoveryPlan,
+        },
+        realm_user_update_ingress::{
+            RealmAuthorityObservationReader, RealmUserUpdateIngressError,
         },
         realm_user_update_consumer::{
             RealmUserUpdateDurableConsumerError,
@@ -321,6 +325,29 @@ fn verifier_registry() -> Arc<RealmUserUpdateVerifierRegistry<DeterministicEndCa
     )
 }
 
+struct FixedAuthorityObservationReader {
+    observation: AuthorityObservation<PHash>,
+}
+
+#[async_trait]
+impl RealmAuthorityObservationReader<PHash>
+    for FixedAuthorityObservationReader
+{
+    async fn read_authority_observation(
+        &self,
+    ) -> Result<AuthorityObservation<PHash>, RealmUserUpdateIngressError> {
+        Ok(self.observation.clone())
+    }
+}
+
+fn fixed_observation_reader(
+    admission: &RealmUserUpdatePublishAdmission<PHash>,
+) -> anyhow::Result<Arc<dyn RealmAuthorityObservationReader<PHash>>> {
+    Ok(Arc::new(FixedAuthorityObservationReader {
+        observation: qualification_pipeline(admission)?.frontier().clone(),
+    }))
+}
+
 async fn prepare_deterministic_router(
     session: Arc<Session>,
     admission: &RealmUserUpdatePublishAdmission<PHash>,
@@ -337,6 +364,7 @@ async fn prepare_deterministic_router(
         20,
         verifier_profile_id(),
         verifier_registry(),
+        fixed_observation_reader(admission)?,
         ready,
         nats,
         segment,
@@ -1920,6 +1948,7 @@ async fn run_nonempty_terminal_source_joint_rf3(
         20,
         verifier_profile_id(),
         verifier_registry(),
+        fixed_observation_reader(&expected_admission)?,
         ready.clone(),
         nats_publisher.clone(),
         segment.clone(),
@@ -2080,6 +2109,7 @@ async fn run_nonempty_terminal_source_joint_rf3(
                 20,
                 verifier_profile_id(),
                 verifier_registry(),
+                fixed_observation_reader(&expected_admission)?,
                 ready.clone(),
                 nats_publisher.clone(),
                 segment.clone(),

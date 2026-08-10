@@ -175,6 +175,35 @@ where
     ) -> Result<RealmUserUpdateArtifactMaterial, RealmUserUpdateIngressError>;
 }
 
+/// Read-only authority capability injected by the production composition.
+///
+/// The handler's before/after fence covers its state reads, but proof
+/// verification may take long enough for the authority to advance before the
+/// first claim LWT. The durable ingress therefore performs one additional
+/// fresh observation after proof verification. Implementations must read the
+/// same authoritative singleton used by the handler; caches and caller-
+/// supplied observations are not valid implementations.
+#[async_trait]
+pub trait RealmAuthorityObservationReader<Hash>: Send + Sync
+where
+    Hash: Q256BitHash,
+{
+    async fn read_authority_observation(
+        &self,
+    ) -> Result<AuthorityObservation<Hash>, RealmUserUpdateIngressError>;
+}
+
+pub fn require_fresh_realm_authority_observation<Hash: Q256BitHash>(
+    expected: &AuthorityObservation<Hash>,
+    observed: &AuthorityObservation<Hash>,
+) -> Result<(), RealmUserUpdateIngressError> {
+    if expected == observed {
+        Ok(())
+    } else {
+        Err(RealmUserUpdateIngressError::AuthorityObservationChanged)
+    }
+}
+
 /// Build and validate the five durable artifacts from the proof-verified full
 /// input, exact claim winner and pure deterministic material. Callers cannot
 /// supply a queue payload, request digest, status or branch identity.
@@ -513,6 +542,34 @@ mod tests {
                 foreign,
             ),
             Err(RealmUserUpdateIngressError::AuthorityMismatch)
+        );
+    }
+
+    #[test]
+    fn post_proof_observation_must_remain_bit_exact() {
+        let authority = AuthorityScope::Realm {
+            realm_id: 7,
+            realm_sub_id: 2,
+        };
+        let branch = chain(1337, 1, 10, 3);
+        let expected = observation(branch.clone(), authority, 4);
+        assert_eq!(
+            require_fresh_realm_authority_observation(&expected, &expected),
+            Ok(())
+        );
+
+        let advanced_state = observation(branch.clone(), authority, 5);
+        assert_eq!(
+            require_fresh_realm_authority_observation(
+                &expected,
+                &advanced_state,
+            ),
+            Err(RealmUserUpdateIngressError::AuthorityObservationChanged)
+        );
+        let new_epoch = observation(chain(1337, 2, 10, 9), authority, 4);
+        assert_eq!(
+            require_fresh_realm_authority_observation(&expected, &new_epoch),
+            Err(RealmUserUpdateIngressError::AuthorityObservationChanged)
         );
     }
 

@@ -95,6 +95,9 @@ where
                 | super::RealmUserUpdateRouterError::ProofRecoveryFailed(_) => {
                     RealmUserUpdateIngressError::Proof(error.to_string())
                 }
+                super::RealmUserUpdateRouterError::AuthorityObservationChanged => {
+                    RealmUserUpdateIngressError::AuthorityObservationChanged
+                }
                 super::RealmUserUpdateRouterError::ArtifactTaskFailed(_)
                 | super::RealmUserUpdateRouterError::ArtifactBuildFailed(_) => {
                     RealmUserUpdateIngressError::Artifact(error.to_string())

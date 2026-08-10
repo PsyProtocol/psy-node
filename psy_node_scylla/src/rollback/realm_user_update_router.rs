@@ -50,9 +50,10 @@ use psy_node_core::{
             RealmUserUpdatePublishRequest,
         },
         realm_user_update_ingress::{
+            require_fresh_realm_authority_observation,
             seal_realm_user_update_ingress_artifacts,
-            RealmUserUpdateArtifactFactory, RealmUserUpdateIngressReceipt,
-            RealmUserUpdateStateFence,
+            RealmAuthorityObservationReader, RealmUserUpdateArtifactFactory,
+            RealmUserUpdateIngressReceipt, RealmUserUpdateStateFence,
         },
         realm_user_update_verifier_profile::{
             RealmUserUpdateVerifierProfileId, RealmUserUpdateVerifierRegistry,
@@ -113,6 +114,7 @@ pub(crate) struct ScyllaRealmUserUpdateDurableRouter<
     publisher: ScyllaRealmEdgeDurablePublisher<F, Hash>,
     active_verifier_profile: RealmUserUpdateVerifierProfileId,
     verifier_profiles: Arc<RealmUserUpdateVerifierRegistry<Verifier>>,
+    authority_observations: Arc<dyn RealmAuthorityObservationReader<Hash>>,
     _proof: PhantomData<fn() -> (Hasher, Proof)>,
 }
 
@@ -136,6 +138,7 @@ where
         realm_user_tree_height: u8,
         active_verifier_profile: RealmUserUpdateVerifierProfileId,
         verifier_profiles: Arc<RealmUserUpdateVerifierRegistry<Verifier>>,
+        authority_observations: Arc<dyn RealmAuthorityObservationReader<Hash>>,
         ready: Arc<PendingQueueSidecarReady>,
         nats: Arc<RecoverablePendingQueueNatsPublisher>,
         segment: RecoverableNatsStreamSegment,
@@ -213,6 +216,7 @@ where
             publisher,
             active_verifier_profile,
             verifier_profiles,
+            authority_observations,
             _proof: PhantomData,
         })
     }
@@ -401,6 +405,7 @@ where
         proof: Vec<u8>,
         artifact_factory: Arc<dyn RealmUserUpdateArtifactFactory<F, Hash>>,
     ) -> Result<RealmUserUpdateIngressReceipt<Hash>, RealmUserUpdateRouterError> {
+        let fenced_observation = fence.observation().clone();
         let admission = fence.into_admission();
         let bound_verifier = self
             .verifier_profiles
@@ -421,6 +426,21 @@ where
             )
         })
         .await?;
+
+        let fresh_observation = self
+            .authority_observations
+            .read_authority_observation()
+            .await
+            .map_err(|error| {
+                RealmUserUpdateRouterError::AuthorityObservation(
+                    error.to_string(),
+                )
+            })?;
+        require_fresh_realm_authority_observation(
+            &fenced_observation,
+            &fresh_observation,
+        )
+        .map_err(|_| RealmUserUpdateRouterError::AuthorityObservationChanged)?;
 
         let created_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1031,6 +1051,8 @@ pub(crate) enum RealmUserUpdateRouterError {
     ScopeMismatch,
     UnknownVerifierProfile(RealmUserUpdateVerifierProfileId),
     VerifierProfileMismatch,
+    AuthorityObservation(String),
+    AuthorityObservationChanged,
 }
 
 impl fmt::Display for RealmUserUpdateRouterError {
@@ -1129,6 +1151,9 @@ mod tests {
         let verify = ingress
             .find("VerifiedRealmUserUpdateRequest::verify")
             .unwrap();
+        let observe = ingress
+            .find("read_authority_observation")
+            .unwrap();
         let clock = ingress.find("SystemTime::now()").unwrap();
         let claim = ingress.find(".claim(").unwrap();
         let build = ingress.find("artifact_factory.build").unwrap();
@@ -1136,7 +1161,7 @@ mod tests {
             .find("seal_realm_user_update_ingress_artifacts")
             .unwrap();
         let complete = ingress.find("self.complete_live").unwrap();
-        assert!(verify < clock && clock < claim);
+        assert!(verify < observe && observe < clock && clock < claim);
         assert!(claim < build && build < seal && seal < complete);
         assert!(ingress.contains("fence: RealmUserUpdateStateFence<Hash>"));
         assert!(ingress.contains("input: SubmitUserEndCapNonProofInput<F, Hash>"));
@@ -1144,6 +1169,8 @@ mod tests {
         assert!(!ingress.contains("request_digest:"));
         assert!(!ingress.contains("created_at:"));
         assert!(!ingress.contains("RealmUserUpdatePublishRequest"));
+        assert!(ingress.contains("fenced_observation"));
+        assert!(ingress.contains("require_fresh_realm_authority_observation"));
     }
 
     #[test]
