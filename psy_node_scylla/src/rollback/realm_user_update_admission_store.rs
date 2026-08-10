@@ -27,6 +27,7 @@ use psy_node_core::queue::realm_user_update_claim::{
 use psy_node_core::queue::realm_user_update_publish::{
     RealmUserUpdatePublishAdmission, RealmUserUpdateRequestDigest,
 };
+use psy_node_core::queue::realm_user_update_verifier_profile::RealmUserUpdateVerifierProfileId;
 use psy_node_core::store::{
     pending_generation_pipeline::StoredPendingPipeline, typed::UserId,
 };
@@ -912,6 +913,7 @@ impl ScyllaRealmUserUpdateAdmissionGuard {
     pub(crate) async fn resume_existing<Hash: Q256BitHash>(
         &self,
         admission: RealmUserUpdatePublishAdmission<Hash>,
+        verifier_profile_id: RealmUserUpdateVerifierProfileId,
         user_id: UserId,
         request_digest: RealmUserUpdateRequestDigest,
         created_at: RealmUserUpdateCreatedAtSeconds,
@@ -955,6 +957,7 @@ impl ScyllaRealmUserUpdateAdmissionGuard {
             partition,
             current,
             admission,
+            verifier_profile_id,
             request_digest,
             created_at,
         )
@@ -969,6 +972,7 @@ impl ScyllaRealmUserUpdateAdmissionGuard {
     pub(crate) async fn claim<Hash: Q256BitHash>(
         &self,
         admission: RealmUserUpdatePublishAdmission<Hash>,
+        verifier_profile_id: RealmUserUpdateVerifierProfileId,
         user_id: UserId,
         request_digest: RealmUserUpdateRequestDigest,
         created_at: RealmUserUpdateCreatedAtSeconds,
@@ -1016,6 +1020,7 @@ impl ScyllaRealmUserUpdateAdmissionGuard {
                     partition,
                     current,
                     admission,
+                    verifier_profile_id,
                     request_digest,
                     created_at,
                 )
@@ -1029,6 +1034,7 @@ impl ScyllaRealmUserUpdateAdmissionGuard {
             RealmUserUpdateAdmissionReadState::Uninitialized => {
                 let candidate = StoredRealmUserUpdateClaim::claimed(
                     admission,
+                    verifier_profile_id,
                     user_id,
                     request_digest,
                     created_at,
@@ -1059,6 +1065,7 @@ impl ScyllaRealmUserUpdateAdmissionGuard {
                 .map_err(guard_model)?;
                 let candidate = StoredRealmUserUpdateClaim::claimed(
                     admission,
+                    verifier_profile_id,
                     user_id,
                     request_digest,
                     created_at,
@@ -1086,6 +1093,7 @@ impl ScyllaRealmUserUpdateAdmissionGuard {
                     .ok_or(RealmUserUpdateAdmissionGuardError::MalformedGate)?;
                 let retry = StoredRealmUserUpdateClaim::claimed(
                     admission,
+                    verifier_profile_id,
                     user_id,
                     request_digest,
                     created_at,
@@ -1116,12 +1124,14 @@ impl ScyllaRealmUserUpdateAdmissionGuard {
         partition: RealmUserUpdateClaimPartition,
         current: StoredRealmUserUpdateClaim<Hash>,
         admission: RealmUserUpdatePublishAdmission<Hash>,
+        verifier_profile_id: RealmUserUpdateVerifierProfileId,
         request_digest: RealmUserUpdateRequestDigest,
         created_at: RealmUserUpdateCreatedAtSeconds,
     ) -> Result<StoredRealmUserUpdateClaim<Hash>, RealmUserUpdateAdmissionGuardError>
     {
         let retry = StoredRealmUserUpdateClaim::claimed(
             admission,
+            verifier_profile_id,
             current.user_id(),
             request_digest,
             created_at,

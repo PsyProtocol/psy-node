@@ -284,6 +284,10 @@ pub(super) async fn activate_realm_writer(
         &source,
         &freeze,
         observed,
+        BranchExactWriterVerifierProfile::for_authority(
+            fixture::authority(),
+            Some(psy_node_core::queue::realm_user_update_verifier_profile::RealmUserUpdateVerifierProfileId::try_from_persisted([0xA5; 32])?),
+        )?,
     )?;
     match ScyllaBranchExactWriterActivationExecutor::activate(
         &writer_store,

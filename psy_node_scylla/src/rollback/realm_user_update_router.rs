@@ -42,6 +42,9 @@ use psy_node_core::{
             RealmUserUpdatePublishPort, RealmUserUpdatePublishReceipt,
             RealmUserUpdatePublishRequest,
         },
+        realm_user_update_verifier_profile::{
+            RealmUserUpdateVerifierProfileId, RealmUserUpdateVerifierRegistry,
+        },
     },
     store::typed::UserId,
 };
@@ -96,7 +99,8 @@ pub(crate) struct ScyllaRealmUserUpdateDurableRouter<
     admission_guard: ScyllaRealmUserUpdateAdmissionGuard,
     dependencies: ScyllaRealmUserUpdateDependencyStore,
     publisher: ScyllaRealmEdgeDurablePublisher<F, Hash>,
-    verifier: Arc<Verifier>,
+    active_verifier_profile: RealmUserUpdateVerifierProfileId,
+    verifier_profiles: Arc<RealmUserUpdateVerifierRegistry<Verifier>>,
     _proof: PhantomData<fn() -> (Hasher, Proof)>,
 }
 
@@ -118,7 +122,8 @@ where
         authority: AuthorityScope,
         global_user_tree_height: GlobalUserTreeHeight,
         realm_user_tree_height: u8,
-        verifier: Arc<Verifier>,
+        active_verifier_profile: RealmUserUpdateVerifierProfileId,
+        verifier_profiles: Arc<RealmUserUpdateVerifierRegistry<Verifier>>,
         ready: Arc<PendingQueueSidecarReady>,
         nats: Arc<RecoverablePendingQueueNatsPublisher>,
         segment: RecoverableNatsStreamSegment,
@@ -127,6 +132,15 @@ where
             || realm_user_tree_height >= 64
         {
             return Err(RealmUserUpdateRouterError::InvalidUserRange);
+        }
+        let active = verifier_profiles
+            .resolve(active_verifier_profile)
+            .map_err(|_| RealmUserUpdateRouterError::UnknownVerifierProfile(active_verifier_profile))?;
+        if active.profile().network() != network
+            || active.profile().global_user_tree_height()
+                != global_user_tree_height.get()
+        {
+            return Err(RealmUserUpdateRouterError::VerifierProfileMismatch);
         }
         let keyspaces = ready
             .view()
@@ -185,7 +199,8 @@ where
             admission_guard,
             dependencies,
             publisher,
-            verifier,
+            active_verifier_profile,
+            verifier_profiles,
             _proof: PhantomData,
         })
     }
@@ -326,10 +341,14 @@ where
     ) -> Result<StoredRealmUserUpdateClaim<Hash>, RealmUserUpdateRouterError> {
         let user_id = verified_request.user_id();
         self.validate_user(user_id)?;
+        if verified_request.verifier_profile_id() != self.active_verifier_profile {
+            return Err(RealmUserUpdateRouterError::VerifierProfileMismatch);
+        }
         if let Some(current) = self
             .admission_guard
             .resume_existing(
                 admission.clone(),
+                self.active_verifier_profile,
                 user_id,
                 verified_request.request_digest(),
                 created_at,
@@ -348,6 +367,7 @@ where
             .admission_guard
             .claim(
                 admission,
+                self.active_verifier_profile,
                 user_id,
                 verified_request.request_digest(),
                 created_at,
@@ -518,7 +538,14 @@ where
         bundle: RealmUserUpdateDependencyBundle,
     ) -> Result<RealmUserUpdateDependencyBundle, RealmUserUpdateRouterError> {
         let claim = claim.clone();
-        let verifier = Arc::clone(&self.verifier);
+        let bound_verifier = self
+            .verifier_profiles
+            .resolve(claim.verifier_profile_id())
+            .map_err(|_| {
+                RealmUserUpdateRouterError::UnknownVerifierProfile(
+                    claim.verifier_profile_id(),
+                )
+            })?;
         let height = self.global_user_tree_height;
         run_blocking_proof_recovery(move || {
             verify_persisted_realm_user_update_request::<
@@ -527,7 +554,7 @@ where
                 Hasher,
                 Proof,
                 Verifier,
-            >(&claim, &bundle, height, verifier.as_ref())?;
+            >(&claim, &bundle, height, &bound_verifier)?;
             Ok::<_, psy_node_core::queue::realm_user_update_artifact::RealmUserUpdateArtifactError>(bundle)
         })
         .await
@@ -740,6 +767,20 @@ where
         {
             return Err(RealmUserUpdateRouterError::ScopeMismatch);
         }
+        let bound = self
+            .verifier_profiles
+            .resolve(claim.verifier_profile_id())
+            .map_err(|_| {
+                RealmUserUpdateRouterError::UnknownVerifierProfile(
+                    claim.verifier_profile_id(),
+                )
+            })?;
+        if bound.profile().network() != self.network
+            || bound.profile().global_user_tree_height()
+                != self.global_user_tree_height.get()
+        {
+            return Err(RealmUserUpdateRouterError::VerifierProfileMismatch);
+        }
         self.validate_user(claim.user_id())
     }
 }
@@ -841,6 +882,8 @@ pub(crate) enum RealmUserUpdateRouterError {
     PhaseStepLimit,
     InvalidUserRange,
     ScopeMismatch,
+    UnknownVerifierProfile(RealmUserUpdateVerifierProfileId),
+    VerifierProfileMismatch,
 }
 
 impl fmt::Display for RealmUserUpdateRouterError {
@@ -939,7 +982,11 @@ mod tests {
         let source = source.split("#[cfg(test)]").next().unwrap();
         assert!(source.contains("resume_exact"));
         assert!(source.contains("AwaitExactRequestReplay"));
-        assert!(source.contains("verifier: Arc<Verifier>"));
+        assert!(source.contains(
+            "verifier_profiles: Arc<RealmUserUpdateVerifierRegistry<Verifier>>"
+        ));
+        assert!(source.contains(".resolve(claim.verifier_profile_id())"));
+        assert!(!source.contains("verifier: Arc<Verifier>"));
         assert!(source.contains("tokio::task::spawn_blocking"));
         assert!(source.contains("verify_persisted_realm_user_update_request::<"));
         let resume = source.find("pub(crate) async fn resume_exact").unwrap();

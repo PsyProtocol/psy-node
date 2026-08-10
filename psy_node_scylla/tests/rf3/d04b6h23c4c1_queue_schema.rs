@@ -112,6 +112,7 @@ fn claim(epoch: u64, user_id: u64) -> anyhow::Result<StoredRealmUserUpdateClaim<
     let admission = RealmUserUpdatePublishAdmission::try_from_pipeline(pending, capture)?;
     Ok(StoredRealmUserUpdateClaim::claimed(
         admission,
+        psy_node_core::queue::realm_user_update_verifier_profile::RealmUserUpdateVerifierProfileId::try_from_persisted([0xA5; 32])?,
         UserId::new(user_id),
         RealmUserUpdateRequestDigest::derive(
             &[epoch as u8, user_id as u8],

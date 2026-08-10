@@ -27,6 +27,10 @@ use psy_node_core::store::{
     timestamp::CommitWriteTimestampUs,
     typed::UniquePendingId,
 };
+use psy_node_core::queue::realm_user_update_verifier_profile::{
+    BoundRealmUserUpdateVerifier, RealmUserUpdateVerifierProfileId,
+    RealmUserUpdateVerifierRegistry,
+};
 #[cfg(test)]
 use psy_node_core::store::authority_commit::{
     AuthorityTimestampBootstrap, AuthorityTimestampBootstrapReason,
@@ -47,10 +51,12 @@ const MAGIC: [u8; 8] = *b"PSYBEXWL";
 // v2 persisted the exact h16 BACKFILL_VERIFIED receipt. v3 additionally binds
 // the complete allocator revision/phase/high-water in the activation plan and
 // every Active state. v4 persists the exact h22e3 cutover fence in each
-// managed WritePrepared/WritesVerified row. Older rows cannot safely resume
-// across a route transition and are rejected.
-const CODEC_VERSION: u16 = 4;
-const PLAN_DOMAIN: &[u8] = b"psy/rollback/branch-exact-writer-activation/v2";
+// managed WritePrepared/WritesVerified row. v5 binds an explicit verifier
+// profile to every Realm activation; Coordinator activation records a typed
+// NotApplicable value. Older rows cannot safely authorize durable proof
+// recovery and are rejected.
+const CODEC_VERSION: u16 = 5;
+const PLAN_DOMAIN: &[u8] = b"psy/rollback/branch-exact-writer-activation/v3";
 const SLOT_DOMAIN: &[u8] = b"psy/rollback/branch-exact-writer-slot/v1";
 const PREPARED_DOMAIN: &[u8] = b"psy/rollback/branch-exact-writer-prepared/v2";
 const VERIFIED_DOMAIN: &[u8] = b"psy/rollback/branch-exact-writer-verified/v2";
@@ -157,6 +163,32 @@ impl BranchExactWriterIntentDigest {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum BranchExactWriterVerifierProfile {
+    NotApplicable,
+    Realm(RealmUserUpdateVerifierProfileId),
+}
+
+impl BranchExactWriterVerifierProfile {
+    pub fn for_authority(
+        authority: AuthorityScope,
+        realm_profile: Option<RealmUserUpdateVerifierProfileId>,
+    ) -> Result<Self, BranchExactWriterLifecycleError> {
+        match (authority, realm_profile) {
+            (AuthorityScope::Coordinator, None) => Ok(Self::NotApplicable),
+            (AuthorityScope::Realm { .. }, Some(profile)) => Ok(Self::Realm(profile)),
+            _ => Err(BranchExactWriterLifecycleError::VerifierProfileBindingMismatch),
+        }
+    }
+
+    pub const fn realm_profile(self) -> Option<RealmUserUpdateVerifierProfileId> {
+        match self {
+            Self::NotApplicable => None,
+            Self::Realm(profile) => Some(profile),
+        }
+    }
+}
+
 /// Evidence and baseline from which online dual-write may begin.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BranchExactWriterActivationPlan<Hash> {
@@ -170,6 +202,7 @@ pub struct BranchExactWriterActivationPlan<Hash> {
     dataset_digest: BranchExactBackfillDatasetDigest,
     baseline: BranchPendingMapping<Hash>,
     baseline_timestamp_state: StoredAuthorityTimestampState,
+    verifier_profile: BranchExactWriterVerifierProfile,
     digest: BranchExactWriterActivationDigest,
     slot: BranchExactWriterSlot,
 }
@@ -184,6 +217,7 @@ impl<Hash: Q256BitHash> BranchExactWriterActivationPlan<Hash> {
         source: &BranchExactLegacyExportReceipt,
         freeze: &BranchExactFrozenLegacyExportPermit<Hash>,
         timestamp_state: ObservedAuthorityTimestampState,
+        verifier_profile: BranchExactWriterVerifierProfile,
     ) -> Result<Self, BranchExactWriterLifecycleError> {
         let view = ready.view();
         let authority = view.authority();
@@ -246,6 +280,13 @@ impl<Hash: Q256BitHash> BranchExactWriterActivationPlan<Hash> {
         {
             return Err(BranchExactWriterLifecycleError::CoordinatorTipMismatch);
         }
+        if BranchExactWriterVerifierProfile::for_authority(
+            authority,
+            verifier_profile.realm_profile(),
+        )? != verifier_profile
+        {
+            return Err(BranchExactWriterLifecycleError::VerifierProfileBindingMismatch);
+        }
 
         let mut plan = Self {
             generation,
@@ -258,6 +299,7 @@ impl<Hash: Q256BitHash> BranchExactWriterActivationPlan<Hash> {
             dataset_digest: artifact.dataset_digest(),
             baseline,
             baseline_timestamp_state: observed,
+            verifier_profile,
             digest: BranchExactWriterActivationDigest([0; 32]),
             slot: BranchExactWriterSlot([0; 32]),
         };
@@ -316,6 +358,22 @@ impl<Hash: Q256BitHash> BranchExactWriterActivationPlan<Hash> {
         self.baseline_timestamp_state
     }
 
+    pub const fn verifier_profile(&self) -> BranchExactWriterVerifierProfile {
+        self.verifier_profile
+    }
+
+    pub fn resolve_realm_verifier<Verifier>(
+        &self,
+        registry: &RealmUserUpdateVerifierRegistry<Verifier>,
+    ) -> Result<BoundRealmUserUpdateVerifier<Verifier>, BranchExactWriterLifecycleError> {
+        let BranchExactWriterVerifierProfile::Realm(profile) = self.verifier_profile else {
+            return Err(BranchExactWriterLifecycleError::VerifierProfileBindingMismatch);
+        };
+        registry
+            .resolve(profile)
+            .map_err(|_| BranchExactWriterLifecycleError::VerifierProfileUnavailable(profile))
+    }
+
     pub const fn digest(&self) -> BranchExactWriterActivationDigest {
         self.digest
     }
@@ -352,6 +410,12 @@ impl<Hash: Q256BitHash> BranchExactWriterActivationPlan<Hash> {
                 AuthorityTimestampBootstrapReason::ControlledWriterCutover,
             )
             .candidate(),
+            verifier_profile: match authority {
+                AuthorityScope::Coordinator => BranchExactWriterVerifierProfile::NotApplicable,
+                AuthorityScope::Realm { .. } => BranchExactWriterVerifierProfile::Realm(
+                    RealmUserUpdateVerifierProfileId::try_from_persisted([0xA5; 32]).unwrap(),
+                ),
+            },
             digest: BranchExactWriterActivationDigest([0; 32]),
             slot: BranchExactWriterSlot([0; 32]),
         };
@@ -894,7 +958,21 @@ fn activation_digest<Hash: Q256BitHash>(
     hasher.update(plan.baseline.pending_id().get().to_be_bytes());
     hasher.update(plan.baseline_timestamp_state.revision().get().to_be_bytes());
     hasher.update(plan.baseline_timestamp_state.encode_canonical());
+    encode_verifier_profile_hash(plan.verifier_profile, &mut hasher);
     BranchExactWriterActivationDigest(hasher.finalize().into())
+}
+
+fn encode_verifier_profile_hash(
+    profile: BranchExactWriterVerifierProfile,
+    hasher: &mut Sha256,
+) {
+    match profile {
+        BranchExactWriterVerifierProfile::NotApplicable => hasher.update([0]),
+        BranchExactWriterVerifierProfile::Realm(profile) => {
+            hasher.update([1]);
+            hasher.update(profile.as_bytes());
+        }
+    }
 }
 
 fn writer_slot(
@@ -1004,6 +1082,13 @@ fn encode_plan<Hash: Q256BitHash>(plan: &BranchExactWriterActivationPlan<Hash>, 
     encode_mapping(&plan.baseline, out);
     out.extend_from_slice(&plan.baseline_timestamp_state.revision().get().to_be_bytes());
     out.extend_from_slice(&plan.baseline_timestamp_state.encode_canonical());
+    match plan.verifier_profile {
+        BranchExactWriterVerifierProfile::NotApplicable => out.push(0),
+        BranchExactWriterVerifierProfile::Realm(profile) => {
+            out.push(1);
+            out.extend_from_slice(profile.as_bytes());
+        }
+    }
     out.extend_from_slice(plan.digest.as_bytes());
     out.extend_from_slice(plan.slot.as_bytes());
 }
@@ -1161,6 +1246,14 @@ fn decode_plan<Hash: Q256BitHash>(
         decoder.take(AUTHORITY_TIMESTAMP_STATE_V1_LEN)?,
     )
     .map_err(|_| BranchExactWriterLifecycleError::TimestampAllocatorNotReady)?;
+    let verifier_profile = match decoder.u8()? {
+        0 => BranchExactWriterVerifierProfile::NotApplicable,
+        1 => BranchExactWriterVerifierProfile::Realm(
+            RealmUserUpdateVerifierProfileId::try_from_persisted(decoder.array32()?)
+                .map_err(|_| BranchExactWriterLifecycleError::VerifierProfileBindingMismatch)?,
+        ),
+        value => return Err(BranchExactWriterLifecycleError::InvalidPresence(value)),
+    };
     let digest = BranchExactWriterActivationDigest(decoder.array32()?);
     let slot = BranchExactWriterSlot(decoder.array32()?);
     let plan = BranchExactWriterActivationPlan {
@@ -1174,6 +1267,7 @@ fn decode_plan<Hash: Q256BitHash>(
         dataset_digest,
         baseline,
         baseline_timestamp_state,
+        verifier_profile,
         digest,
         slot,
     };
@@ -1189,6 +1283,10 @@ fn decode_plan<Hash: Q256BitHash>(
             .write_timestamp()
             .is_some_and(|timestamp| timestamp > plan.baseline_timestamp())
         || plan.digest != activation_digest(&plan)
+        || BranchExactWriterVerifierProfile::for_authority(
+            authority,
+            plan.verifier_profile.realm_profile(),
+        )? != plan.verifier_profile
         || plan.slot
             != writer_slot(plan.baseline.canonical_chain().network_id(), authority)
     {
@@ -1439,6 +1537,8 @@ pub enum BranchExactWriterLifecycleError {
     TrailingBytes,
     TimestampOutOfRange,
     ActivationDigestMismatch,
+    VerifierProfileBindingMismatch,
+    VerifierProfileUnavailable(RealmUserUpdateVerifierProfileId),
     PreparedDigestMismatch,
     VerifiedDigestMismatch,
     StateDigestMismatch,
@@ -2253,6 +2353,83 @@ mod tests {
         );
         assert_eq!(coordinator.slot(), same.slot());
         assert_ne!(coordinator.slot(), realm.slot());
+    }
+
+    #[test]
+    fn verifier_profile_binding_is_authority_exact_durable_and_resolvable() {
+        let authority = AuthorityScope::Realm {
+            realm_id: 1,
+            realm_sub_id: 0,
+        };
+        let shadow = verified_shadow();
+        let plan = BranchExactWriterActivationPlan::test_fixture(
+            authority,
+            mapping(10, 100),
+            CommitWriteTimestampUs::try_from_i128(1_000).unwrap(),
+            shadow.digest(),
+            backfill_receipt(authority),
+        );
+        let BranchExactWriterVerifierProfile::Realm(profile_id) = plan.verifier_profile() else {
+            panic!("Realm activation must carry a verifier profile")
+        };
+        assert_eq!(
+            BranchExactWriterVerifierProfile::for_authority(authority, Some(profile_id)).unwrap(),
+            plan.verifier_profile()
+        );
+        assert_eq!(
+            BranchExactWriterVerifierProfile::for_authority(authority, None),
+            Err(BranchExactWriterLifecycleError::VerifierProfileBindingMismatch)
+        );
+        assert_eq!(
+            BranchExactWriterVerifierProfile::for_authority(
+                AuthorityScope::Coordinator,
+                Some(profile_id),
+            ),
+            Err(BranchExactWriterLifecycleError::VerifierProfileBindingMismatch)
+        );
+
+        let stored = BranchExactWriterBootstrap::new(plan.clone());
+        let decoded = StoredBranchExactWriterLifecycle::<PHash>::decode_persisted(
+            stored.candidate().slot().as_bytes(),
+            stored.candidate().revision().as_i64(),
+            &stored.candidate().to_canonical_bytes(),
+        )
+        .unwrap();
+        assert_eq!(decoded.plan().verifier_profile(), plan.verifier_profile());
+
+        let profile = psy_node_core::queue::realm_user_update_verifier_profile::RealmUserUpdateVerifierProfile::try_new(
+            plan.baseline().canonical_chain().network_id(),
+            32,
+            psy_node_core::queue::realm_user_update_verifier_profile::RealmUserUpdateVerifierBackend::DeterministicTest,
+            1,
+            1,
+            [0x71; 32],
+            [0x72; 32],
+        )
+        .unwrap();
+        let mut plan_with_profile = plan.clone();
+        plan_with_profile.verifier_profile =
+            BranchExactWriterVerifierProfile::Realm(profile.id());
+        plan_with_profile.digest = activation_digest(&plan_with_profile);
+        assert_ne!(plan_with_profile.digest(), plan.digest());
+        let registry = RealmUserUpdateVerifierRegistry::try_new([(
+            profile.clone(),
+            std::sync::Arc::new(17_u8),
+        )])
+        .unwrap();
+        assert_eq!(
+            **plan_with_profile
+                .resolve_realm_verifier(&registry)
+                .unwrap()
+                .verifier(),
+            17
+        );
+        assert_eq!(
+            plan.resolve_realm_verifier(&registry).err(),
+            Some(BranchExactWriterLifecycleError::VerifierProfileUnavailable(
+                profile_id
+            ))
+        );
     }
 
     #[test]

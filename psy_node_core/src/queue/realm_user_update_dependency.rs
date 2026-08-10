@@ -19,8 +19,39 @@ const DEPENDENCY_DOMAIN: &[u8] =
     b"psy/rollback/realm-user-update-dependency/v1";
 const COMPONENT_DOMAIN: &[u8] =
     b"psy/rollback/realm-user-update-dependency-component/v1";
+const WRITE_TIMESTAMP_DOMAIN: &[u8] =
+    b"psy/rollback/realm-user-update-dependency-write-timestamp/v1";
 pub const REALM_USER_UPDATE_DEPENDENCY_COMPONENT_COUNT: usize = 5;
 pub const MAX_REALM_USER_UPDATE_DEPENDENCY_BYTES: usize = 256 * 1024 * 1024;
+
+/// Explicit CQL timestamp derived from immutable durable bundle identity.
+/// Every crash retry of the same bundle receives the same value; callers
+/// cannot substitute a wall-clock timestamp at the storage boundary.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RealmUserUpdateDependencyWriteTimestampUs(i64);
+
+impl RealmUserUpdateDependencyWriteTimestampUs {
+    pub fn derive(
+        claim_slot: RealmUserUpdateClaimSlot,
+        dependency_digest: RealmUserUpdateDependencyDigest,
+        created_at_seconds: u32,
+    ) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(WRITE_TIMESTAMP_DOMAIN);
+        hasher.update(claim_slot.as_bytes());
+        hasher.update(dependency_digest.as_bytes());
+        let offset = u32::from_be_bytes(
+            hasher.finalize()[..4]
+                .try_into()
+                .expect("fixed digest prefix"),
+        ) % 1_000_000;
+        Self(i64::from(created_at_seconds) * 1_000_000 + i64::from(offset))
+    }
+
+    pub const fn as_i64(self) -> i64 {
+        self.0
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(u8)]
@@ -287,6 +318,14 @@ impl RealmUserUpdateDependencyBundle {
         self.digest
     }
 
+    pub fn write_timestamp_us(&self) -> RealmUserUpdateDependencyWriteTimestampUs {
+        RealmUserUpdateDependencyWriteTimestampUs::derive(
+            self.claim_slot,
+            self.digest,
+            self.created_at_seconds,
+        )
+    }
+
     pub fn component(
         &self,
         kind: RealmUserUpdateDependencyKind,
@@ -534,7 +573,7 @@ mod tests {
         let pending = PendingContext::new(chain, authority, WorkUniquePendingId::new(9), WorkProcCheckpointUniqueId::from_u128(10));
         let generation = PendingGenerationContext::try_from_legacy(UniquePendingId::try_new(9).unwrap().get(), 10).unwrap();
         let capture = PendingQueueCaptureContext::try_new(PendingGenerationLedgerKey::new(chain.network_id(), authority), PendingGenerationActivationDigest::try_new([3; 32]).unwrap(), generation).unwrap();
-        StoredRealmUserUpdateClaim::claimed(RealmUserUpdatePublishAdmission::try_from_pipeline(pending, capture).unwrap(), UserId::new(11), RealmUserUpdateRequestDigest::derive(input, proof).unwrap(), RealmUserUpdateCreatedAtSeconds::try_new(12).unwrap(), crate::queue::realm_user_update_claim::RealmUserUpdateAdmissionOrdinal::FIRST).unwrap()
+        StoredRealmUserUpdateClaim::claimed(RealmUserUpdatePublishAdmission::try_from_pipeline(pending, capture).unwrap(), crate::queue::realm_user_update_verifier_profile::RealmUserUpdateVerifierProfileId::try_from_persisted([0xA5; 32]).unwrap(), UserId::new(11), RealmUserUpdateRequestDigest::derive(input, proof).unwrap(), RealmUserUpdateCreatedAtSeconds::try_new(12).unwrap(), crate::queue::realm_user_update_claim::RealmUserUpdateAdmissionOrdinal::FIRST).unwrap()
     }
 
     #[test]
@@ -544,8 +583,13 @@ mod tests {
         let bundle = RealmUserUpdateDependencyBundle::try_new(&claim(&input, &proof), input, proof, vec![3; 19], vec![4; 23], vec![5; 29]).unwrap();
         let fragments = bundle.fragments();
         assert_eq!(fragments.len(), 6);
+        let write_timestamp = bundle.write_timestamp_us();
+        assert!(write_timestamp.as_i64() >= 12_000_000);
+        assert!(write_timestamp.as_i64() < 13_000_000);
         let components = RealmUserUpdateDependencyKind::ALL.into_iter().map(|kind| reconstruct_component(kind, fragments.iter().filter(|fragment| fragment.kind() == kind).cloned().rev().collect()).unwrap()).collect();
-        assert_eq!(RealmUserUpdateDependencyBundle::reconstruct(bundle.claim_slot(), *bundle.request_digest(), bundle.stable_status(), bundle.created_at_seconds(), components, bundle.digest()).unwrap(), bundle);
+        let reconstructed = RealmUserUpdateDependencyBundle::reconstruct(bundle.claim_slot(), *bundle.request_digest(), bundle.stable_status(), bundle.created_at_seconds(), components, bundle.digest()).unwrap();
+        assert_eq!(reconstructed.write_timestamp_us(), write_timestamp);
+        assert_eq!(reconstructed, bundle);
     }
 
     #[test]

@@ -69,6 +69,10 @@ use psy_node_core::{
             RealmUserUpdatePublishDisposition, RealmUserUpdatePublishReceipt,
             RealmUserUpdatePublishRequest, RealmUserUpdateRequestDigest,
         },
+        realm_user_update_verifier_profile::{
+            RealmUserUpdateVerifierBackend, RealmUserUpdateVerifierProfile,
+            RealmUserUpdateVerifierProfileId, RealmUserUpdateVerifierRegistry,
+        },
         recoverable_ephemeral::PendingQueueCaptureContext,
     },
     store::{
@@ -264,6 +268,34 @@ impl QZKProofVerifier<PHash, PHash> for DeterministicEndCapVerifier {
     }
 }
 
+fn verifier_profile() -> RealmUserUpdateVerifierProfile {
+    RealmUserUpdateVerifierProfile::try_new(
+        NetworkId::try_from_chain_id(1337).unwrap(),
+        32,
+        RealmUserUpdateVerifierBackend::DeterministicTest,
+        1,
+        1,
+        [0x71; 32],
+        [0x72; 32],
+    )
+    .unwrap()
+}
+
+fn verifier_profile_id() -> RealmUserUpdateVerifierProfileId {
+    verifier_profile().id()
+}
+
+fn verifier_registry() -> Arc<RealmUserUpdateVerifierRegistry<DeterministicEndCapVerifier>> {
+    let profile = verifier_profile();
+    Arc::new(
+        RealmUserUpdateVerifierRegistry::try_new([(
+            profile,
+            Arc::new(DeterministicEndCapVerifier),
+        )])
+        .unwrap(),
+    )
+}
+
 fn verified_end_cap_request(
     user_id: UserId,
     height: GlobalUserTreeHeight,
@@ -282,7 +314,7 @@ fn verified_end_cap_request(
         &input,
         expected.to_vec_32bytes(),
         height,
-        &DeterministicEndCapVerifier,
+        &verifier_registry().resolve(verifier_profile_id()).unwrap(),
     )
     .map_err(Into::into)
 }
@@ -588,6 +620,7 @@ async fn claim_with_retry(
         match guard
             .claim(
                 admission.clone(),
+                verifier_profile_id(),
                 UserId::new(user),
                 request,
                 RealmUserUpdateCreatedAtSeconds::try_new(1_700_000_000)
@@ -1133,6 +1166,7 @@ async fn d04b6h23c4c2b3b2_claim_admission_close_rf3_gate(
         provisioned(session.clone(), 2).await?;
     let before = StoredRealmUserUpdateClaim::claimed(
         second.clone(),
+        verifier_profile_id(),
         UserId::new(20_001),
         request(20_001)?,
         RealmUserUpdateCreatedAtSeconds::try_new(1_700_000_001)?,
@@ -1149,6 +1183,7 @@ async fn d04b6h23c4c2b3b2_claim_admission_close_rf3_gate(
         provisioned(session.clone(), 3).await?;
     let after = StoredRealmUserUpdateClaim::claimed(
         third.clone(),
+        verifier_profile_id(),
         UserId::new(30_001),
         request(30_001)?,
         RealmUserUpdateCreatedAtSeconds::try_new(1_700_000_002)?,
@@ -1188,6 +1223,7 @@ async fn d04b6h23c4c2b3b2_claim_admission_close_rf3_gate(
     };
     let loser = StoredRealmUserUpdateClaim::claimed(
         fifth.clone(),
+        verifier_profile_id(),
         UserId::new(duplicate_user),
         RealmUserUpdateRequestDigest::derive(b"different", b"loser")?,
         RealmUserUpdateCreatedAtSeconds::try_new(1_700_000_003)?,
@@ -1247,6 +1283,7 @@ async fn d04b6h23c4c2b3b2_claim_admission_close_rf3_gate(
     let extra_user = user_in_bucket(0, 70_000);
     let extra = StoredRealmUserUpdateClaim::claimed(
         seventh,
+        verifier_profile_id(),
         UserId::new(extra_user),
         request(extra_user)?,
         RealmUserUpdateCreatedAtSeconds::try_new(1_700_000_004)?,
@@ -1709,7 +1746,8 @@ async fn run_nonempty_terminal_source_joint_rf3(
         realm(),
         height,
         20,
-        Arc::new(DeterministicEndCapVerifier),
+        verifier_profile_id(),
+        verifier_registry(),
         ready.clone(),
         nats_publisher.clone(),
         segment.clone(),
@@ -1860,7 +1898,8 @@ async fn run_nonempty_terminal_source_joint_rf3(
                 realm(),
                 height,
                 20,
-                Arc::new(DeterministicEndCapVerifier),
+                verifier_profile_id(),
+                verifier_registry(),
                 ready.clone(),
                 nats_publisher.clone(),
                 segment.clone(),
@@ -2075,7 +2114,7 @@ async fn run_nonempty_terminal_source_joint_rf3(
             segment.stream_name(),
             key,
             close,
-            "MissingFragment",
+            "DurableDependencyLoss",
         )
         .await?;
         dependency_missing_rejected = true;

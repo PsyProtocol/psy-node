@@ -51,13 +51,13 @@ use super::{
 #[cfg(test)]
 use super::RETIRED_REALM_USER_UPDATE_CLAIM_V1_TABLE;
 
-// v7 upgrades the admission payload to include the terminal qualification
-// state and pre-publish pipeline fence. The physical set remains 15 tables,
-// but a v6 VERIFIED receipt cannot authorize the stronger payload semantics.
-pub const PENDING_QUEUE_SIDECAR_SCHEMA_VERSION: u16 = 7;
+// v8 requires verifier-profile-bound claim/admission payloads. The physical
+// set remains 15 tables, but a v7 VERIFIED receipt cannot authorize the
+// stronger durable proof-recovery semantics.
+pub const PENDING_QUEUE_SIDECAR_SCHEMA_VERSION: u16 = 8;
 pub const PENDING_QUEUE_SIDECAR_TARGET_TABLE_COUNT: usize = 15;
 const FINGERPRINT_DOMAIN: &[u8] =
-    b"psy/rollback/pending-queue-sidecar-schema/v7";
+    b"psy/rollback/pending-queue-sidecar-schema/v8";
 const INSPECT_COLUMNS_CQL: &str = "SELECT column_name, type, kind, position, clustering_order FROM system_schema.columns WHERE keyspace_name = ? AND table_name = ?";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -541,7 +541,7 @@ mod tests {
 
     #[test]
     fn exact_manifest_is_fifteen_unique_tables_with_stable_placement() {
-        assert_eq!(PENDING_QUEUE_SIDECAR_SCHEMA_VERSION, 7);
+        assert_eq!(PENDING_QUEUE_SIDECAR_SCHEMA_VERSION, 8);
         assert_eq!(PendingQueueSidecarPhysicalTable::ALL.len(), 15);
         let names = PendingQueueSidecarPhysicalTable::ALL.iter().map(|table| table.table_name()).collect::<std::collections::BTreeSet<_>>();
         assert_eq!(names.len(), 15);

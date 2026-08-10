@@ -42,6 +42,9 @@ use super::{
         GlobalUserTreeHeight, RealmUserUpdatePublishRequest,
         RealmUserUpdateRequestDigest,
     },
+    realm_user_update_verifier_profile::{
+        BoundRealmUserUpdateVerifier, RealmUserUpdateVerifierProfileId,
+    },
 };
 
 const SLOT_MAGIC: &[u8; 8] = b"PSYRUSLT";
@@ -130,6 +133,7 @@ pub struct VerifiedRealmUserUpdateRequest<F, Hash> {
     user_id: UserId,
     request_digest: RealmUserUpdateRequestDigest,
     global_user_tree_height: GlobalUserTreeHeight,
+    verifier_profile_id: RealmUserUpdateVerifierProfileId,
     _felt: PhantomData<F>,
 }
 
@@ -142,13 +146,18 @@ where
         input: &SubmitUserEndCapNonProofInput<F, Hash>,
         proof_bytes: Vec<u8>,
         global_user_tree_height: GlobalUserTreeHeight,
-        verifier: &Verifier,
+        bound_verifier: &BoundRealmUserUpdateVerifier<Verifier>,
     ) -> Result<Self, RealmUserUpdateArtifactError>
     where
         Hash: std::fmt::Debug,
         Verifier: QZKProofVerifier<Hash, Proof>,
         Hasher: FieldQHasher<F, Hash>,
     {
+        if bound_verifier.profile().global_user_tree_height()
+            != global_user_tree_height.get()
+        {
+            return Err(RealmUserUpdateArtifactError::VerifierProfileMismatch);
+        }
         let canonical_input = input
             .psy_ser_to_bytes_vec()
             .map_err(|error| RealmUserUpdateArtifactError::InputCodec(error.to_string()))?;
@@ -158,12 +167,13 @@ where
         let proof = VerifiedRealmUserUpdateProof::verify(
             proof_bytes,
             expected_public_inputs_hash,
-            verifier,
+            bound_verifier.verifier().as_ref(),
         )?;
         Self::from_canonical_and_receipt::<Hasher>(
             canonical_input,
             proof,
             global_user_tree_height,
+            bound_verifier.profile_id(),
         )
     }
 
@@ -171,6 +181,7 @@ where
         canonical_input: Vec<u8>,
         proof: VerifiedRealmUserUpdateProof<Hash>,
         global_user_tree_height: GlobalUserTreeHeight,
+        verifier_profile_id: RealmUserUpdateVerifierProfileId,
     ) -> Result<Self, RealmUserUpdateArtifactError> {
         let input = SubmitUserEndCapNonProofInput::<F, Hash>::psy_ser_from_slice(
             &canonical_input,
@@ -205,6 +216,7 @@ where
             user_id: UserId::new(new_leaf_user),
             request_digest,
             global_user_tree_height,
+            verifier_profile_id,
             _felt: PhantomData,
         })
     }
@@ -224,6 +236,9 @@ where
     }
     pub const fn global_user_tree_height(&self) -> GlobalUserTreeHeight {
         self.global_user_tree_height
+    }
+    pub const fn verifier_profile_id(&self) -> RealmUserUpdateVerifierProfileId {
+        self.verifier_profile_id
     }
 }
 
@@ -472,6 +487,7 @@ impl<Hash: Q256BitHash> ValidatedRealmUserUpdateArtifacts<Hash> {
         let canonical_input = verified_request.canonical_input().to_vec();
         let request_digest = verified_request.request_digest();
         if request_digest != claim.request_digest()
+            || verified_request.verifier_profile_id() != claim.verifier_profile_id()
             || verified_request.user_id() != claim.user_id()
             || verified_request.global_user_tree_height()
                 != publish_request.global_user_tree_height()
@@ -584,7 +600,7 @@ pub fn verify_and_rehydrate_persisted_realm_user_update_artifacts<
     claim: &StoredRealmUserUpdateClaim<Hash>,
     bundle: &RealmUserUpdateDependencyBundle,
     global_user_tree_height: GlobalUserTreeHeight,
-    verifier: &Verifier,
+    bound_verifier: &BoundRealmUserUpdateVerifier<Verifier>,
 ) -> Result<RehydratedRealmUserUpdateArtifacts<F, Hash>, RealmUserUpdateArtifactError>
 where
     F: parth_core::felt::QFelt64,
@@ -598,7 +614,7 @@ where
         Hasher,
         Proof,
         Verifier,
-    >(claim, bundle, global_user_tree_height, verifier)?;
+    >(claim, bundle, global_user_tree_height, bound_verifier)?;
     rehydrate_realm_user_update_artifacts::<F, Hash, Hasher>(
         claim,
         bundle,
@@ -621,7 +637,7 @@ pub fn verify_persisted_realm_user_update_request<
     claim: &StoredRealmUserUpdateClaim<Hash>,
     bundle: &RealmUserUpdateDependencyBundle,
     global_user_tree_height: GlobalUserTreeHeight,
-    verifier: &Verifier,
+    bound_verifier: &BoundRealmUserUpdateVerifier<Verifier>,
 ) -> Result<VerifiedRealmUserUpdateRequest<F, Hash>, RealmUserUpdateArtifactError>
 where
     F: parth_core::felt::QFelt64,
@@ -637,6 +653,13 @@ where
     ) || claim.dependency_digest() != Some(bundle.digest())
     {
         return Err(RealmUserUpdateArtifactError::DependencyMismatch);
+    }
+    if claim.verifier_profile_id() != bound_verifier.profile_id()
+        || claim.pending().chain().network_id() != bound_verifier.profile().network()
+        || global_user_tree_height.get()
+            != bound_verifier.profile().global_user_tree_height()
+    {
+        return Err(RealmUserUpdateArtifactError::VerifierProfileMismatch);
     }
     let canonical_input = bundle
         .component(RealmUserUpdateDependencyKind::CanonicalInput)
@@ -656,7 +679,7 @@ where
             .bytes()
             .to_vec(),
         global_user_tree_height,
-        verifier,
+        bound_verifier,
     )?;
     if verified_request.canonical_input() != canonical_input
         || verified_request.request_digest() != claim.request_digest()
@@ -711,6 +734,7 @@ where
         canonical_input.to_vec(),
         verified_proof,
         global_user_tree_height,
+        claim.verifier_profile_id(),
     )?;
     let artifacts = ValidatedRealmUserUpdateArtifacts::try_new::<F>(
         claim,
@@ -891,6 +915,7 @@ pub enum RealmUserUpdateArtifactError {
     EmptyProof,
     ProofPublicInputsMismatch,
     ProofVerification(String),
+    VerifierProfileMismatch,
     EmptyQueuePayload,
     InputCodec(String),
     InputNotCanonical,
@@ -916,6 +941,8 @@ impl Error for RealmUserUpdateArtifactError {}
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use parth_core::{
         felt::FromPrimitiveValuesFelt,
         pgoldilocks::PoseidonHasher,
@@ -1003,12 +1030,44 @@ mod tests {
                 GlobalUserTreeHeight, RealmUserUpdatePublishAdmission,
             },
             recoverable_ephemeral::PendingQueueCaptureContext,
+            realm_user_update_verifier_profile::{
+                BoundRealmUserUpdateVerifier, RealmUserUpdateVerifierBackend,
+                RealmUserUpdateVerifierProfile, RealmUserUpdateVerifierRegistry,
+            },
         },
         store::pending_generation_identity::{
             PendingGenerationActivationDigest, PendingGenerationContext,
             PendingGenerationLedgerKey,
         },
     };
+
+    fn verifier_profile() -> RealmUserUpdateVerifierProfile {
+        RealmUserUpdateVerifierProfile::try_new(
+            NetworkId::try_from_chain_id(1337).unwrap(),
+            32,
+            RealmUserUpdateVerifierBackend::DeterministicTest,
+            1,
+            1,
+            [0x71; 32],
+            [0x72; 32],
+        )
+        .unwrap()
+    }
+
+    fn bound<Verifier>(verifier: Verifier) -> BoundRealmUserUpdateVerifier<Verifier> {
+        let profile = verifier_profile();
+        bound_with_profile(verifier, profile)
+    }
+
+    fn bound_with_profile<Verifier>(
+        verifier: Verifier,
+        profile: RealmUserUpdateVerifierProfile,
+    ) -> BoundRealmUserUpdateVerifier<Verifier> {
+        RealmUserUpdateVerifierRegistry::try_new([(profile.clone(), Arc::new(verifier))])
+            .unwrap()
+            .resolve(profile.id())
+            .unwrap()
+    }
 
     fn pending() -> PendingContext<PHash> {
         PendingContext::new(
@@ -1192,6 +1251,7 @@ mod tests {
                 )
                 .unwrap(),
                 tree_height,
+                verifier_profile().id(),
             )
             .unwrap_err(),
             RealmUserUpdateArtifactError::ProofPublicInputsMismatch,
@@ -1208,12 +1268,14 @@ mod tests {
                 )
                 .unwrap(),
                 tree_height,
+                verifier_profile().id(),
             )
             .unwrap();
         let request_digest = verified_request.request_digest();
         let admitted = admission();
         let claim = StoredRealmUserUpdateClaim::claimed(
             admitted.clone(),
+            verifier_profile().id(),
             UserId::new(11),
             request_digest,
             RealmUserUpdateCreatedAtSeconds::try_new(12).unwrap(),
@@ -1259,6 +1321,7 @@ mod tests {
 
         let same_request_losing_time = StoredRealmUserUpdateClaim::claimed(
             admission(),
+            verifier_profile().id(),
             claim.user_id(),
             claim.request_digest(),
             RealmUserUpdateCreatedAtSeconds::try_new(13).unwrap(),
@@ -1315,11 +1378,36 @@ mod tests {
                 &planned,
                 &bundle,
                 GlobalUserTreeHeight::try_new(32).unwrap(),
-                &DeterministicEndCapVerifier,
+                &bound(DeterministicEndCapVerifier),
             )
             .unwrap();
         assert_eq!(verified_from_durable.request_digest(), claim.request_digest());
         assert_eq!(verified_from_durable.canonical_input(), artifacts.canonical_input());
+        let alternate_profile = RealmUserUpdateVerifierProfile::try_new(
+            verifier_profile().network(),
+            32,
+            RealmUserUpdateVerifierBackend::DeterministicTest,
+            1,
+            2,
+            [0x71; 32],
+            [0x72; 32],
+        )
+        .unwrap();
+        assert_eq!(
+            verify_persisted_realm_user_update_request::<
+                PF,
+                PHash,
+                PoseidonHasher,
+                PHash,
+                DeterministicEndCapVerifier,
+            >(
+                &planned,
+                &bundle,
+                GlobalUserTreeHeight::try_new(32).unwrap(),
+                &bound_with_profile(DeterministicEndCapVerifier, alternate_profile),
+            ),
+            Err(RealmUserUpdateArtifactError::VerifierProfileMismatch)
+        );
         assert!(verify_persisted_realm_user_update_request::<
             PF,
             PHash,
@@ -1330,7 +1418,7 @@ mod tests {
             &planned,
             &bundle,
             GlobalUserTreeHeight::try_new(31).unwrap(),
-            &DeterministicEndCapVerifier,
+            &bound(DeterministicEndCapVerifier),
         )
         .is_err());
         assert!(matches!(
@@ -1344,7 +1432,7 @@ mod tests {
                 &planned,
                 &bundle,
                 GlobalUserTreeHeight::try_new(32).unwrap(),
-                &RejectingEndCapVerifier,
+                &bound(RejectingEndCapVerifier),
             ),
             Err(RealmUserUpdateArtifactError::ProofVerification(_)),
         ));
@@ -1358,7 +1446,7 @@ mod tests {
             &ready,
             &bundle,
             GlobalUserTreeHeight::try_new(32).unwrap(),
-            &DeterministicEndCapVerifier,
+            &bound(DeterministicEndCapVerifier),
         )
         .is_ok());
 

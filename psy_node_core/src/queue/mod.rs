@@ -10,3 +10,4 @@ pub mod realm_user_update_claim;
 pub mod realm_user_update_admission;
 pub mod realm_user_update_artifact;
 pub mod realm_user_update_dependency;
+pub mod realm_user_update_verifier_profile;

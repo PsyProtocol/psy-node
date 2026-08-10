@@ -25,10 +25,11 @@ use super::{
         RealmUserUpdatePublishAdmission, RealmUserUpdateRequestDigest,
     },
     recoverable_ephemeral::PendingQueueCaptureContext,
+    realm_user_update_verifier_profile::RealmUserUpdateVerifierProfileId,
 };
 
 const MAGIC: &[u8; 8] = b"PSYRUCIM";
-const CODEC_VERSION: u16 = 3;
+const CODEC_VERSION: u16 = 4;
 const SLOT_DOMAIN: &[u8] = b"psy/rollback/realm-user-update-claim-slot/v1";
 const STATE_DOMAIN: &[u8] = b"psy/rollback/realm-user-update-claim-state/v1";
 const ADMISSION_COMMITMENT_DOMAIN: &[u8] =
@@ -319,6 +320,7 @@ pub struct StoredRealmUserUpdateClaim<Hash> {
     capture_activation_digest: [u8; 32],
     capture_digest: [u8; 32],
     admission_digest: [u8; 32],
+    verifier_profile_id: RealmUserUpdateVerifierProfileId,
     user_id: UserId,
     request_digest: RealmUserUpdateRequestDigest,
     stable_status: u64,
@@ -332,6 +334,7 @@ pub struct StoredRealmUserUpdateClaim<Hash> {
 impl<Hash: Q256BitHash> StoredRealmUserUpdateClaim<Hash> {
     pub fn claimed(
         admission: RealmUserUpdatePublishAdmission<Hash>,
+        verifier_profile_id: RealmUserUpdateVerifierProfileId,
         user_id: UserId,
         request_digest: RealmUserUpdateRequestDigest,
         created_at: RealmUserUpdateCreatedAtSeconds,
@@ -351,6 +354,7 @@ impl<Hash: Q256BitHash> StoredRealmUserUpdateClaim<Hash> {
             capture_activation_digest,
             capture_digest: *admission.capture_digest().as_bytes(),
             admission_digest: *admission.digest(),
+            verifier_profile_id,
             user_id,
             request_digest,
             stable_status: request_digest.stable_status(),
@@ -420,6 +424,7 @@ impl<Hash: Q256BitHash> StoredRealmUserUpdateClaim<Hash> {
                 == candidate.capture_activation_digest
             && self.capture_digest == candidate.capture_digest
             && self.admission_digest == candidate.admission_digest
+            && self.verifier_profile_id == candidate.verifier_profile_id
             && self.user_id == candidate.user_id
             && self.request_digest == candidate.request_digest
             && self.stable_status == candidate.stable_status
@@ -510,6 +515,10 @@ impl<Hash: Q256BitHash> StoredRealmUserUpdateClaim<Hash> {
         &self.admission_digest
     }
 
+    pub const fn verifier_profile_id(&self) -> RealmUserUpdateVerifierProfileId {
+        self.verifier_profile_id
+    }
+
     pub const fn user_id(&self) -> UserId {
         self.user_id
     }
@@ -554,6 +563,7 @@ impl<Hash: Q256BitHash> StoredRealmUserUpdateClaim<Hash> {
         hasher.update(self.capture_activation_digest);
         hasher.update(self.capture_digest);
         hasher.update(self.admission_digest);
+        hasher.update(self.verifier_profile_id.as_bytes());
         hasher.update(self.user_id.get().to_be_bytes());
         hasher.update(self.request_digest.as_bytes());
         hasher.update(self.stable_status.to_be_bytes());
@@ -598,6 +608,9 @@ impl<Hash: Q256BitHash> StoredRealmUserUpdateClaim<Hash> {
         if capture_digest == [0; 32] || admission_digest == [0; 32] {
             return Err(RealmUserUpdateClaimError::EmptyDigest);
         }
+        let verifier_profile_id =
+            RealmUserUpdateVerifierProfileId::try_from_persisted(decoder.array32()?)
+                .map_err(|error| RealmUserUpdateClaimError::VerifierProfile(error.to_string()))?;
         let user_id = UserId::new(decoder.u64()?);
         let request_digest = RealmUserUpdateRequestDigest::try_new(decoder.array32()?)
             .map_err(|error| RealmUserUpdateClaimError::Request(error.to_string()))?;
@@ -623,6 +636,7 @@ impl<Hash: Q256BitHash> StoredRealmUserUpdateClaim<Hash> {
             capture_activation_digest,
             capture_digest,
             admission_digest,
+            verifier_profile_id,
             user_id,
             request_digest,
             stable_status,
@@ -683,6 +697,7 @@ impl<Hash: Q256BitHash> StoredRealmUserUpdateClaim<Hash> {
         bytes.extend_from_slice(&self.capture_activation_digest);
         bytes.extend_from_slice(&self.capture_digest);
         bytes.extend_from_slice(&self.admission_digest);
+        bytes.extend_from_slice(self.verifier_profile_id.as_bytes());
         bytes.extend_from_slice(&self.user_id.get().to_be_bytes());
         bytes.extend_from_slice(self.request_digest.as_bytes());
         bytes.extend_from_slice(&self.stable_status.to_be_bytes());
@@ -799,6 +814,7 @@ pub enum RealmUserUpdateClaimError {
     PendingCodec(String),
     Capture(String),
     Request(String),
+    VerifierProfile(String),
 }
 
 impl fmt::Display for RealmUserUpdateClaimError {
@@ -829,6 +845,10 @@ mod tests {
         typed::UniquePendingId,
     };
     use super::super::recoverable_ephemeral::PendingQueueCaptureContext;
+
+    fn verifier_profile() -> RealmUserUpdateVerifierProfileId {
+        RealmUserUpdateVerifierProfileId::try_from_persisted([0xA5; 32]).unwrap()
+    }
 
     fn pending(epoch: u64, proc: u128) -> PendingContext<PHash> {
         PendingContext::new(
@@ -876,6 +896,7 @@ mod tests {
     fn claimed() -> StoredRealmUserUpdateClaim<PHash> {
         StoredRealmUserUpdateClaim::claimed(
             admission(1, 12),
+            verifier_profile(),
             UserId::new(13),
             RealmUserUpdateRequestDigest::derive(b"canonical-input", b"proof").unwrap(),
             RealmUserUpdateCreatedAtSeconds::try_new(1234).unwrap(),
@@ -933,6 +954,7 @@ mod tests {
         let same_digest = claimed.request_digest();
         let changed_frontier = StoredRealmUserUpdateClaim::claimed(
             admission(2, 12),
+            verifier_profile(),
             claimed.user_id(),
             same_digest,
             RealmUserUpdateCreatedAtSeconds::try_new(9999).unwrap(),
@@ -946,6 +968,7 @@ mod tests {
         for changed in [admission(1, 99)] {
             let other = StoredRealmUserUpdateClaim::claimed(
                 changed,
+                verifier_profile(),
                 claimed.user_id(),
                 same_digest,
                 RealmUserUpdateCreatedAtSeconds::try_new(9999).unwrap(),
@@ -963,6 +986,7 @@ mod tests {
         let claimed = claimed();
         let same = StoredRealmUserUpdateClaim::claimed(
             admission(1, 12),
+            verifier_profile(),
             claimed.user_id(),
             claimed.request_digest(),
             RealmUserUpdateCreatedAtSeconds::try_new(9999).unwrap(),
@@ -975,6 +999,7 @@ mod tests {
 
         let different_ordinal = StoredRealmUserUpdateClaim::claimed(
             admission(1, 12),
+            verifier_profile(),
             claimed.user_id(),
             claimed.request_digest(),
             RealmUserUpdateCreatedAtSeconds::try_new(9999).unwrap(),
@@ -997,6 +1022,38 @@ mod tests {
             i64::try_from(claimed.user_id().get()).unwrap(),
             1,
             &malformed,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn verifier_profile_is_part_of_immutable_claim_identity_and_codec() {
+        let claimed = claimed();
+        let other_profile =
+            RealmUserUpdateVerifierProfileId::try_from_persisted([0xB6; 32]).unwrap();
+        let other = StoredRealmUserUpdateClaim::claimed(
+            admission(1, 12),
+            other_profile,
+            claimed.user_id(),
+            claimed.request_digest(),
+            RealmUserUpdateCreatedAtSeconds::try_new(9999).unwrap(),
+            claimed.admission_ordinal(),
+        )
+        .unwrap();
+        assert!(!claimed.same_request_as(&other));
+        assert_ne!(claimed.state_digest(), other.state_digest());
+        assert_ne!(
+            claimed.admission_commitment().unwrap(),
+            other.admission_commitment().unwrap()
+        );
+
+        let mut old_codec = claimed.to_canonical_bytes();
+        old_codec[8..10].copy_from_slice(&3_u16.to_be_bytes());
+        assert!(StoredRealmUserUpdateClaim::<PHash>::decode_selected(
+            claimed.partition().unwrap(),
+            i64::try_from(claimed.user_id().get()).unwrap(),
+            claimed.revision().as_i64().unwrap(),
+            &old_codec,
         )
         .is_err());
     }

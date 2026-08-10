@@ -40,8 +40,8 @@ use super::{
 };
 
 const MAGIC: &[u8; 8] = b"PSYRUADM";
-const CODEC_VERSION: u16 = 2;
-const STATE_DOMAIN: &[u8] = b"psy/rollback/realm-user-update-admission-state/v2";
+const CODEC_VERSION: u16 = 3;
+const STATE_DOMAIN: &[u8] = b"psy/rollback/realm-user-update-admission-state/v3";
 const CONTRIBUTION_DOMAIN: &[u8] =
     b"psy/rollback/realm-user-update-admission-set-contribution/v1";
 const BUCKET_MANIFEST_DOMAIN: &[u8] =
@@ -1740,6 +1740,7 @@ mod tests {
     ) -> StoredRealmUserUpdateClaim<PHash> {
         StoredRealmUserUpdateClaim::claimed(
             admission(epoch),
+            crate::queue::realm_user_update_verifier_profile::RealmUserUpdateVerifierProfileId::try_from_persisted([0xA5; 32]).unwrap(),
             UserId::new(user),
             RealmUserUpdateRequestDigest::derive(
                 &[epoch as u8, user as u8],

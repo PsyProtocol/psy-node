@@ -15,6 +15,7 @@ use psy_node_core::queue::{
         RealmUserUpdateDependencyBundle, RealmUserUpdateDependencyComponent,
         RealmUserUpdateDependencyError, RealmUserUpdateDependencyFragment,
         RealmUserUpdateDependencyKind, RealmUserUpdateDependencyRecoveryPlan,
+        RealmUserUpdateDependencyWriteTimestampUs,
     },
 };
 use scylla::{
@@ -28,8 +29,8 @@ pub const REALM_USER_UPDATE_DEPENDENCY_FRAGMENT_TABLE: &str =
     "branch_exact_realm_user_update_dependency_fragment_v1";
 
 const CREATE_TEMPLATE: &str = "CREATE TABLE IF NOT EXISTS {table} (dependency_slot blob, dependency_digest blob, component_kind smallint, fragment_index int, fragment_count int, component_bytes bigint, component_digest blob, payload blob, payload_digest blob, PRIMARY KEY ((dependency_slot, dependency_digest, component_kind), fragment_index)) WITH CLUSTERING ORDER BY (fragment_index ASC)";
-const PUT_TEMPLATE: &str = "INSERT INTO {table} (dependency_slot, dependency_digest, component_kind, fragment_index, fragment_count, component_bytes, component_digest, payload, payload_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
-const READ_TEMPLATE: &str = "SELECT fragment_index, fragment_count, component_bytes, component_digest, payload, payload_digest FROM {table} WHERE dependency_slot = ? AND dependency_digest = ? AND component_kind = ?";
+const PUT_TEMPLATE: &str = "INSERT INTO {table} (dependency_slot, dependency_digest, component_kind, fragment_index, fragment_count, component_bytes, component_digest, payload, payload_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) USING TIMESTAMP ?";
+const READ_TEMPLATE: &str = "SELECT fragment_index, fragment_count, component_bytes, component_digest, payload, payload_digest, writetime(payload) AS payload_write_timestamp_us FROM {table} WHERE dependency_slot = ? AND dependency_digest = ? AND component_kind = ?";
 
 const PUT_BIND_SHAPE: &[&str] = &[
     "dependency_slot:BLOB",
@@ -41,6 +42,7 @@ const PUT_BIND_SHAPE: &[&str] = &[
     "component_digest:BLOB",
     "payload:BLOB",
     "payload_digest:BLOB",
+    "write_timestamp_us:BIGINT",
 ];
 const READ_BIND_SHAPE: &[&str] = &[
     "dependency_slot:BLOB",
@@ -85,6 +87,7 @@ struct DependencyFragmentRow {
     component_digest: Vec<u8>,
     payload: Vec<u8>,
     payload_digest: Vec<u8>,
+    payload_write_timestamp_us: i64,
 }
 
 pub(crate) struct ScyllaRealmUserUpdateDependencyStore {
@@ -144,6 +147,10 @@ impl ScyllaRealmUserUpdateDependencyStore {
                 }
             }
         }
+        let completed = self.inspect_recovery(bundle).await?;
+        if !completed.is_complete() {
+            return Err(RealmUserUpdateDependencyStoreError::ReadbackMismatch);
+        }
         let current = self
             .read_bundle(
                 bundle.claim_slot(),
@@ -173,6 +180,7 @@ impl ScyllaRealmUserUpdateDependencyStore {
                     expected.claim_slot(),
                     expected.digest(),
                     kind,
+                    Some(expected.write_timestamp_us()),
                 )
                 .await?,
             );
@@ -214,7 +222,8 @@ impl ScyllaRealmUserUpdateDependencyStore {
     ) -> Result<RealmUserUpdateDependencyComponent, RealmUserUpdateDependencyStoreError> {
         reconstruct_component(
             kind,
-            self.read_fragments(slot, dependency_digest, kind).await?,
+            self.read_fragments(slot, dependency_digest, kind, None)
+                .await?,
         )
         .map_err(Into::into)
     }
@@ -224,6 +233,7 @@ impl ScyllaRealmUserUpdateDependencyStore {
         slot: RealmUserUpdateClaimSlot,
         dependency_digest: RealmUserUpdateDependencyDigest,
         kind: RealmUserUpdateDependencyKind,
+        expected_write_timestamp_us: Option<RealmUserUpdateDependencyWriteTimestampUs>,
     ) -> Result<Vec<RealmUserUpdateDependencyFragment>, RealmUserUpdateDependencyStoreError> {
         let result = self
             .session
@@ -241,6 +251,14 @@ impl ScyllaRealmUserUpdateDependencyStore {
         let mut fragments = Vec::new();
         for row in rows.rows::<DependencyFragmentRow>().map_err(cql)? {
             let row = row.map_err(cql)?;
+            if let Some(expected) = expected_write_timestamp_us {
+                if row.payload_write_timestamp_us != expected.as_i64() {
+                    return Err(RealmUserUpdateDependencyStoreError::TimestampMismatch {
+                        expected: expected.as_i64(),
+                        actual: row.payload_write_timestamp_us,
+                    });
+                }
+            }
             fragments.push(RealmUserUpdateDependencyFragment::decode(
                 kind,
                 row.fragment_index,
@@ -259,7 +277,7 @@ fn put_binding(
     bundle: &RealmUserUpdateDependencyBundle,
     fragment: &RealmUserUpdateDependencyFragment,
 ) -> Result<(
-    Vec<u8>, Vec<u8>, i16, i32, i32, i64, Vec<u8>, Vec<u8>, Vec<u8>
+    Vec<u8>, Vec<u8>, i16, i32, i32, i64, Vec<u8>, Vec<u8>, Vec<u8>, i64
 ), RealmUserUpdateDependencyStoreError> {
     Ok((
         bundle.claim_slot().as_bytes().to_vec(),
@@ -271,6 +289,7 @@ fn put_binding(
         fragment.component_digest().as_bytes().to_vec(),
         fragment.payload().to_vec(),
         fragment.payload_digest().to_vec(),
+        bundle.write_timestamp_us().as_i64(),
     ))
 }
 
@@ -293,6 +312,7 @@ pub enum RealmUserUpdateDependencyStoreError {
     Dependency(RealmUserUpdateDependencyError),
     CoordinateOutOfRange,
     ReadbackMismatch,
+    TimestampMismatch { expected: i64, actual: i64 },
     IndeterminateWrite(String),
     Cql(String),
 }
@@ -323,7 +343,10 @@ mod tests {
         assert_eq!(queries.read_bind_shape(), READ_BIND_SHAPE);
         assert!(!queries.put().contains("IF NOT EXISTS"));
         assert!(!queries.put().contains("TTL"));
-        assert!(!queries.put().contains("TIMESTAMP"));
+        assert!(queries.put().contains("USING TIMESTAMP ?"));
+        assert!(queries
+            .read()
+            .contains("writetime(payload) AS payload_write_timestamp_us"));
     }
 
     #[test]
@@ -343,6 +366,7 @@ mod tests {
         assert!(body.contains("self.inspect_recovery(bundle).await?"));
         assert!(body.contains("recovery.missing_fragments()"));
         assert!(body.contains("RealmUserUpdateDependencyStoreError::Dependency(_)"));
+        assert!(body.contains("put_binding(bundle, fragment)"));
         assert!(!body.contains("for fragment in bundle.fragments()"));
     }
 }

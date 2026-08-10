@@ -321,6 +321,10 @@ async fn d04b6h22e_branch_exact_writer_rf3_gate() -> anyhow::Result<()> {
         &source,
         &freeze,
         observed,
+        BranchExactWriterVerifierProfile::for_authority(
+            fixture::authority(),
+            Some(psy_node_core::queue::realm_user_update_verifier_profile::RealmUserUpdateVerifierProfileId::try_from_persisted([0xA5; 32])?),
+        )?,
     )?;
     match ScyllaBranchExactWriterActivationExecutor::activate(
         &writer_store,
