@@ -93,6 +93,11 @@ pub struct RealmEdgeStartConfig {
     pub verbose: bool,
     pub port: u16,
     pub listen: String,
+    /// Disabled by default. An enabled Edge must pass the same durable
+    /// branch-exact lineage preflight as its Realm Processor before any
+    /// production handler may be constructed.
+    #[serde(default)]
+    pub branch_exact_startup: Option<RealmBranchExactStartupConfig>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -211,6 +216,24 @@ mod realm_branch_exact_startup_tests {
             .remove("branch_exact_startup");
         let parsed: RealmProcessorStartConfig =
             serde_json::from_value(encoded).unwrap();
+        assert!(parsed.branch_exact_startup.is_none());
+    }
+
+    #[test]
+    fn existing_realm_edge_config_defaults_branch_exact_to_disabled() {
+        let json = serde_json::json!({
+            "scylla_db_url": "scylla",
+            "nats_jetstream_url": "nats",
+            "redis_url": "redis",
+            "db_namespace": "psy",
+            "realm_id": 7,
+            "realm_sub_id": 3,
+            "network": PsyChainNetworkType::LocalDevnet,
+            "verbose": false,
+            "port": 8080,
+            "listen": "127.0.0.1"
+        });
+        let parsed: RealmEdgeStartConfig = serde_json::from_value(json).unwrap();
         assert!(parsed.branch_exact_startup.is_none());
     }
 }

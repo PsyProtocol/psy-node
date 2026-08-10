@@ -149,6 +149,8 @@ pub struct RealmEdgeCliConfig {
     pub verbose: Option<bool>,
     pub port: Option<u16>,
     pub listen: Option<String>,
+    #[serde(default)]
+    pub branch_exact_startup: Option<RealmBranchExactStartupConfig>,
 }
 
 impl RealmEdgeCliConfig {
@@ -164,6 +166,7 @@ impl RealmEdgeCliConfig {
             verbose: None,
             port: None,
             listen: None,
+            branch_exact_startup: None,
         }
     }
     pub fn into_start_config_with_cli_args(
@@ -190,6 +193,7 @@ impl RealmEdgeCliConfig {
             verbose: verbose || self.verbose.unwrap_or(false),
             port: port.or(self.port).unwrap_or(8080),
             listen: listen.or(self.listen).unwrap_or_else(|| "0.0.0.0".to_string()),
+            branch_exact_startup: self.branch_exact_startup,
         })
     }
     pub async fn get_start_config(

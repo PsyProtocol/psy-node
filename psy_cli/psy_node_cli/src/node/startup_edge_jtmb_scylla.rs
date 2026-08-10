@@ -24,8 +24,8 @@ use psy_node_core::{
 use psy_node_nats::psy_queue::setup_nats_psy_queue_from_connection_str;
 use psy_node_redis::store::{new_redis_async_pool, StandardRedisStore};
 use psy_node_scylla::psy_setup::{
+    setup_realm_edge_scylla_startup_composition,
     setup_coordinator_psy_scylla_database_store_from_connection_string,
-    setup_psy_scylla_database_store_from_connection_string,
 };
 
 pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_edge_node(config: &CoordinatorEdgeStartConfig) -> anyhow::Result<()> {
@@ -154,6 +154,15 @@ where
     N: QNetworkTypesConfig<ZKVerifier = PsyJTMBZKVerifier<C>, JobId = QProvingJobDataID> + QNetworkZKTypes + 'static,
     C: JTMBCircuitConfig,
 {
+    let realm_id = u32::try_from(config.realm_id)
+        .map_err(|_| anyhow::anyhow!("Realm Edge realm_id exceeds u32"))?;
+    let branch_exact_lineage = config
+        .branch_exact_startup
+        .as_ref()
+        .map(|startup| {
+            startup.try_lineage(config.network, config.realm_id, config.realm_sub_id)
+        })
+        .transpose()?;
     let (verifier, _) = get_jtmb_circuit_library_and_prover_for_network::<C>(config.network)?;
     let pool = new_redis_async_pool(&config.redis_url, 10).await?;
     let temp_store = StandardRedisStore::new(pool, config.db_namespace.to_string(), config.realm_id, config.realm_sub_id as u64);
@@ -166,12 +175,21 @@ where
     let proof_work_queue = nats_queue.clone();
 
     let realm_identifier = QRealmIdentifier {
-        realm_id: config.realm_id as u32,
+        realm_id,
         realm_sub_id: config.realm_sub_id,
     };
     let proof_verifier = Arc::new(PsyJTMBZKVerifier::<C>::new(verifier));
     let chain_id = config.network.get_chain_id();
-    let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url, false).await?;
+    let composition = setup_realm_edge_scylla_startup_composition::<N>(
+        &config.db_namespace,
+        &config.scylla_db_url,
+        false,
+        realm_id,
+        config.realm_sub_id,
+        branch_exact_lineage,
+    )
+    .await?;
+    let db = composition.into_legacy_db()?;
     let db = Arc::new(db);
     let tag_tree_rewards_store = db.clone();
 

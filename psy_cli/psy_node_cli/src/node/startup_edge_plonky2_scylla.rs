@@ -14,8 +14,8 @@ use psy_node_core::{
 use psy_node_nats::psy_queue::setup_nats_psy_queue_from_connection_str;
 use psy_node_redis::store::{new_redis_async_pool, StandardRedisStore};
 use psy_node_scylla::psy_setup::{
+    setup_realm_edge_scylla_startup_composition,
     setup_coordinator_psy_scylla_database_store_from_connection_string,
-    setup_psy_scylla_database_store_from_connection_string,
 };
 use psy_plonky2_circuits::{
     node::config::networks::resolver::PsyPlonky2NodeConfigResolver,
@@ -120,7 +120,15 @@ pub async fn run_startup_plonky2_scylla_edge_node(config: &CoordinatorEdgeStartC
 
 
 pub async fn run_startup_plonky2_scylla_realm_edge_node(config: &RealmEdgeStartConfig) -> anyhow::Result<()> {
-
+    let realm_id = u32::try_from(config.realm_id)
+        .map_err(|_| anyhow::anyhow!("Realm Edge realm_id exceeds u32"))?;
+    let branch_exact_lineage = config
+        .branch_exact_startup
+        .as_ref()
+        .map(|startup| {
+            startup.try_lineage(config.network, config.realm_id, config.realm_sub_id)
+        })
+        .transpose()?;
 
     let pool = new_redis_async_pool(&config.redis_url, 2).await?;
 
@@ -139,7 +147,7 @@ pub async fn run_startup_plonky2_scylla_realm_edge_node(config: &RealmEdgeStartC
     let proof_work_queue = nats_queue.clone();
 
     let realm_identifier = QRealmIdentifier {
-        realm_id: config.realm_id as u32,
+        realm_id,
         realm_sub_id: config.realm_sub_id,
     };
     let proof_verifier = Arc::new(PsyPlonky2ZKVerifier::<C, D>::for_network(config.network)?);
@@ -162,7 +170,16 @@ pub async fn run_startup_plonky2_scylla_realm_edge_node(config: &RealmEdgeStartC
     match config.network {
         psy_core::constants::chain_id::PsyChainNetworkType::LocalDevnet => {
             type N = QNetworkTypesConfigHelper<QProvingJobDataID, ZKTypesPlonky2GoldilocksPoseidon, PsyNetworkLocalDevnetConstants>;
-            let db = setup_psy_scylla_database_store_from_connection_string::<N>(&config.db_namespace, &config.scylla_db_url, false).await?;
+            let composition = setup_realm_edge_scylla_startup_composition::<N>(
+                &config.db_namespace,
+                &config.scylla_db_url,
+                false,
+                realm_id,
+                config.realm_sub_id,
+                branch_exact_lineage,
+            )
+            .await?;
+            let db = composition.into_legacy_db()?;
             let db = Arc::new(db);
             let tag_tree_rewards_store = db.clone();
             

@@ -4,3 +4,42 @@ pub mod scylla_helper;
 pub mod startup_edge_plonky2_scylla;
 pub mod startup_edge_jtmb_scylla;
 pub mod startup_processor_jtmb_scylla;
+
+#[cfg(test)]
+mod realm_edge_branch_exact_startup_contract_tests {
+    fn assert_single_fail_closed_composition(source: &str) {
+        assert_eq!(
+            source
+                .matches("setup_realm_edge_scylla_startup_composition::<")
+                .count(),
+            1
+        );
+        assert_eq!(source.matches("composition.into_legacy_db()?").count(), 1);
+        let prepare = source
+            .find("setup_realm_edge_scylla_startup_composition::<")
+            .unwrap();
+        let legacy_handler = source.find("let handler = RealmEdgeHandler").unwrap();
+        assert!(prepare < legacy_handler);
+        for forbidden in [
+            "ScyllaRealmEdgeStartupAuthorization",
+            "prepare_realm_edge_durable_publisher",
+            "ScyllaRealmUserUpdateDurableRouter",
+            "RealmUserUpdatePublishPort",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "CLI bypassed the common composition with {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn plonky2_and_jtmb_share_one_default_off_edge_composition() {
+        assert_single_fail_closed_composition(include_str!(
+            "startup_edge_plonky2_scylla.rs"
+        ));
+        assert_single_fail_closed_composition(include_str!(
+            "startup_edge_jtmb_scylla.rs"
+        ));
+    }
+}

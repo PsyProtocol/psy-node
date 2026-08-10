@@ -9,8 +9,10 @@ use psy_node_core::{
     store::{
         branch_exact_schema::AuthorityScope,
         realm_processor_startup::{
-            RealmProcessorStartupError, RealmProcessorStartupLineage,
-            RealmProcessorStartupMode, RealmProcessorStartupPreflightProvider,
+            authorize_realm_processor_startup, RealmProcessorFreshRunPermit,
+            RealmProcessorStartupAuthorization, RealmProcessorStartupError,
+            RealmProcessorStartupLineage, RealmProcessorStartupMode,
+            RealmProcessorStartupPreflightProvider,
         },
         realm_processor_branch_exact_runtime::RealmBranchExactCommitRuntimeInstaller,
     },
@@ -436,6 +438,143 @@ pub async fn setup_realm_psy_scylla_database_store_with_branch_exact_schema<
     Ok(db)
 }
 
+#[derive(Debug)]
+enum ScyllaRealmEdgeStartupAuthorization {
+    Disabled,
+    BranchExact(RealmProcessorFreshRunPermit),
+}
+
+/// DB and its startup authorization remain one value until the caller reaches
+/// the real handler composition boundary. Enabled mode cannot be silently
+/// downgraded to the legacy handler.
+pub struct ScyllaRealmEdgeStartupComposition<N: QNetworkDatabaseTypes> {
+    db: ScyllaUnifiedPsyStore<N, N::QHash, N::HasherBase>,
+    authorization: ScyllaRealmEdgeStartupAuthorization,
+}
+
+impl<N: QNetworkDatabaseTypes> ScyllaRealmEdgeStartupComposition<N> {
+    /// Extract the legacy DB only when branch-exact is disabled. The enabled
+    /// permit intentionally cannot be separated from this composition and
+    /// ignored by a caller that would then construct the legacy handler.
+    pub fn into_legacy_db(
+        self,
+    ) -> anyhow::Result<ScyllaUnifiedPsyStore<N, N::QHash, N::HasherBase>> {
+        match self.authorization {
+            ScyllaRealmEdgeStartupAuthorization::Disabled => Ok(self.db),
+            ScyllaRealmEdgeStartupAuthorization::BranchExact(permit) => anyhow::bail!(
+                "REALM_EDGE_BRANCH_EXACT_HANDLER_NOT_INTEGRATED: durable storage preflight passed (permit {}) but the handler route is not installed",
+                hex::encode(permit.digest().as_bytes())
+            ),
+        }
+    }
+}
+
+/// Default-off Realm Edge storage composition. Enabled mode performs a fresh,
+/// read-only full-composite preflight after live schema/backfill and queue
+/// sidecar authorization. It deliberately stops before constructing a handler
+/// or NATS publisher; h23c4c2b4 must consume the opaque token at that boundary.
+pub async fn setup_realm_edge_scylla_startup_composition<
+    N: QNetworkDatabaseTypes,
+>(
+    keyspace: &str,
+    connection_string: &str,
+    create_tables: bool,
+    realm_id: u32,
+    realm_sub_id: u16,
+    lineage: Option<RealmProcessorStartupLineage>,
+) -> anyhow::Result<ScyllaRealmEdgeStartupComposition<N>>
+where
+    N::QHash: Q256BitHash + Send + Sync + 'static,
+    N::HasherBase: Send + Sync + 'static,
+{
+    let db = setup_realm_psy_scylla_database_store_with_branch_exact_schema::<N>(
+        keyspace,
+        connection_string,
+        create_tables,
+        realm_id,
+        realm_sub_id,
+        BranchExactSchemaSetupMode::Disabled,
+    )
+    .await?;
+    let Some(lineage) = lineage else {
+        return Ok(ScyllaRealmEdgeStartupComposition {
+            db,
+            authorization: ScyllaRealmEdgeStartupAuthorization::Disabled,
+        });
+    };
+    if lineage.realm_id() != realm_id || lineage.realm_sub_id() != realm_sub_id {
+        return Err(RealmProcessorStartupError::AuthorityMismatch.into());
+    }
+
+    let authority = AuthorityScope::Realm {
+        realm_id,
+        realm_sub_id,
+    };
+    let control_keyspace = BranchExactDeploymentNoTabletKeyspace::try_new(
+        db.store.no_tablet_keyspace.clone(),
+    )?;
+    let writer_store = ScyllaBranchExactWriterLifecycleStore::prepare(
+        db.store.session.clone(),
+        control_keyspace,
+    )
+    .await?;
+    let writer = match writer_store
+        .read::<N::QHash>(BranchExactWriterAuthorityKey::new(
+            lineage.network(),
+            authority,
+        ))
+        .await?
+    {
+        BranchExactWriterReadState::Current(writer) => writer,
+        BranchExactWriterReadState::Uninitialized => {
+            return Err(RealmProcessorStartupError::DurableEvidenceNotVerified(
+                "branch-exact writer lifecycle is uninitialized".to_owned(),
+            )
+            .into())
+        }
+    };
+    if writer.plan().digest().as_bytes()
+        != lineage.expected_writer_activation_digest().as_bytes()
+    {
+        return Err(RealmProcessorStartupError::WriterActivationMismatch.into());
+    }
+    db.store
+        .initialize_branch_exact_schema_setup(
+            authority,
+            BranchExactSchemaSetupMode::RequireVerified(
+                BranchExactSchemaSetupRequest::new(
+                    writer.plan().backfill_receipt().clone(),
+                ),
+            ),
+        )
+        .await?;
+    db.store
+        .initialize_pending_queue_sidecar_setup(
+            authority,
+            PendingQueueSidecarSetupMode::RequireVerified,
+        )
+        .await?;
+
+    let expectation = lineage.seal_attempt(fresh_startup_nonce())?;
+    let provider = db
+        .store
+        .prepare_realm_processor_startup_preflight(expectation)
+        .await?;
+    let authorization = authorize_realm_processor_startup(
+        RealmProcessorStartupMode::RequireBranchExact(expectation),
+        Some(provider.as_ref()),
+    )
+    .await?;
+    let RealmProcessorStartupAuthorization::BranchExact(permit) = authorization
+    else {
+        return Err(RealmProcessorStartupError::StartupProviderMissing.into());
+    };
+    Ok(ScyllaRealmEdgeStartupComposition {
+        db,
+        authorization: ScyllaRealmEdgeStartupAuthorization::BranchExact(permit),
+    })
+}
+
 /// One indivisible Realm startup composition. Keeping DB, mode and provider
 /// together prevents a caller from pairing a provider prepared for one
 /// session/Realm with a different authority store.
@@ -602,6 +741,64 @@ fn fresh_startup_nonce_excluding(excluded: [u8; 32]) -> [u8; 32] {
 #[cfg(test)]
 mod realm_startup_composition_tests {
     use super::*;
+
+    #[test]
+    fn edge_composition_is_default_off_full_preflight_and_non_serving() {
+        let source = include_str!("psy_setup.rs");
+        let composition = source
+            .split("pub struct ScyllaRealmEdgeStartupComposition")
+            .nth(1)
+            .unwrap()
+            .split("/// Default-off Realm Edge storage composition")
+            .next()
+            .unwrap();
+        assert!(composition.contains("db:"));
+        assert!(composition.contains("authorization:"));
+        assert!(!composition.contains("pub db:"));
+        assert!(!composition.contains("into_parts"));
+        assert!(composition.contains("into_legacy_db"));
+        assert!(composition
+            .contains("ScyllaRealmEdgeStartupAuthorization::Disabled => Ok(self.db)"));
+        assert!(composition
+            .contains("ScyllaRealmEdgeStartupAuthorization::BranchExact(permit)"));
+
+        let factory = source
+            .split("pub async fn setup_realm_edge_scylla_startup_composition")
+            .nth(1)
+            .unwrap()
+            .split("/// One indivisible Realm startup composition")
+            .next()
+            .unwrap();
+        let disabled = factory.find("let Some(lineage) = lineage else").unwrap();
+        let writer = factory
+            .find("ScyllaBranchExactWriterLifecycleStore::prepare")
+            .unwrap();
+        assert!(disabled < writer);
+        assert!(factory.contains("ScyllaRealmEdgeStartupAuthorization::Disabled"));
+        assert!(factory.contains("expected_writer_activation_digest"));
+        assert!(factory.contains("BranchExactSchemaSetupMode::RequireVerified"));
+        assert!(factory.contains("PendingQueueSidecarSetupMode::RequireVerified"));
+        assert!(factory.contains("prepare_realm_processor_startup_preflight"));
+        assert!(factory.contains("authorize_realm_processor_startup"));
+        for forbidden in [
+            "recover_realm_processor_startup",
+            "prepare_realm_edge_durable_publisher",
+            "ScyllaRealmUserUpdateDurableRouter::prepare",
+            "RealmEdgeHandler",
+            "start_realm_edge_rpc_server",
+        ] {
+            assert!(
+                !factory.contains(forbidden),
+                "storage admission gained serving capability {forbidden}"
+            );
+        }
+        let public_authorization = [
+            "pub enum ScyllaRealmEdge",
+            "StartupAuthorization",
+        ]
+        .concat();
+        assert!(!source.contains(&public_authorization));
+    }
 
     #[test]
     fn composition_is_default_off_indivisible_and_receipt_is_discovered() {
