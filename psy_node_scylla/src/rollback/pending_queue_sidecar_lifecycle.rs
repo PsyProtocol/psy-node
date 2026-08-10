@@ -1,4 +1,4 @@
-//! Durable deployment lifecycle for the sixteen recoverable-queue sidecars.
+//! Durable deployment lifecycle for the recoverable-queue sidecars.
 //!
 //! Deployment is explicit and restart-safe: first persist `Materializing`,
 //! idempotently create/inspect all target tables, then full-payload CAS to
@@ -30,7 +30,7 @@ pub const PENDING_QUEUE_SIDECAR_LIFECYCLE_TABLE: &str =
     "branch_exact_pending_queue_sidecar_lifecycle_v1";
 const MAGIC: &[u8; 8] = b"PSYQSCAR";
 const CODEC_VERSION: u16 = 1;
-const SLOT_DOMAIN: &[u8] = b"psy/rollback/pending-queue-sidecar-slot/v1";
+const SLOT_DOMAIN: &[u8] = b"psy/rollback/pending-queue-sidecar-slot/v2";
 const STATE_DOMAIN: &[u8] = b"psy/rollback/pending-queue-sidecar-state/v1";
 const READY_DOMAIN: &[u8] = b"psy/rollback/pending-queue-sidecar-ready/v1";
 
@@ -41,6 +41,8 @@ impl PendingQueueSidecarDeploymentSlot {
     pub fn for_keyspaces(keyspaces: &PendingQueueSidecarKeyspaces) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(SLOT_DOMAIN);
+        hasher.update(PENDING_QUEUE_SIDECAR_SCHEMA_VERSION.to_be_bytes());
+        hasher.update(pending_queue_sidecar_schema_fingerprint().as_bytes());
         update_len(&mut hasher, keyspaces.data().as_str().as_bytes());
         update_len(&mut hasher, keyspaces.control().as_str().as_bytes());
         Self(hasher.finalize().into())
@@ -493,13 +495,31 @@ mod tests {
         assert_eq!(first, second);
         let bytes = first.to_canonical_bytes();
         assert_eq!(StoredPendingQueueSidecarDeployment::decode_selected(first.slot, 1, &bytes).unwrap(), first);
-        let mut old_v9 = bytes.clone();
-        old_v9[19..21].copy_from_slice(&9_u16.to_be_bytes());
-        assert_eq!(StoredPendingQueueSidecarDeployment::decode_selected(first.slot, 1, &old_v9), Err(PendingQueueSidecarLifecycleError::UnknownSchemaVersion));
+        let mut old_v10 = bytes.clone();
+        old_v10[19..21].copy_from_slice(&10_u16.to_be_bytes());
+        assert_eq!(StoredPendingQueueSidecarDeployment::decode_selected(first.slot, 1, &old_v10), Err(PendingQueueSidecarLifecycleError::UnknownSchemaVersion));
         let mut tampered = bytes.clone(); tampered[20] ^= 1;
         assert!(StoredPendingQueueSidecarDeployment::decode_selected(first.slot, 1, &tampered).is_err());
         let mut trailing = bytes; trailing.push(0);
         assert_eq!(StoredPendingQueueSidecarDeployment::decode_selected(first.slot, 1, &trailing), Err(PendingQueueSidecarLifecycleError::TrailingBytes));
+    }
+
+    #[test]
+    fn schema_upgrade_uses_a_new_partition_and_preserves_v10_identity() {
+        let keyspaces = keyspaces();
+        let mut old = Sha256::new();
+        old.update(b"psy/rollback/pending-queue-sidecar-slot/v1");
+        update_len(&mut old, keyspaces.data().as_str().as_bytes());
+        update_len(&mut old, keyspaces.control().as_str().as_bytes());
+        let old_v10_slot: [u8; 32] = old.finalize().into();
+        let current = PendingQueueSidecarDeploymentSlot::for_keyspaces(&keyspaces);
+        assert_ne!(current.as_bytes(), &old_v10_slot);
+
+        let materializing = StoredPendingQueueSidecarDeployment::materializing(keyspaces);
+        assert_eq!(materializing.slot(), current);
+        let verified = StoredPendingQueueSidecarDeployment::verified_from(&materializing).unwrap();
+        assert_eq!(verified.slot(), current);
+        assert_ne!(PendingQueueSidecarVerifiedReceipt::from_verified(verified).unwrap().ready_digest(), &[0; 32]);
     }
 
     #[test]
@@ -518,6 +538,8 @@ mod tests {
         let queries = PendingQueueSidecarLifecycleQueries::new(&control);
         assert!(queries.bootstrap().contains("IF NOT EXISTS"));
         assert!(queries.cas().contains("IF revision = ? AND deployment_payload = ?"));
+        assert!(!queries.create().contains(&["DROP", " TABLE"].concat()));
+        assert!(!queries.create().contains(&["DELETE", " FROM"].concat()));
         let setup = include_str!("../psy_setup.rs").split("#[cfg(test)]").next().unwrap();
         assert!(!setup.contains("PendingQueueSidecarDeploymentExecutor::deploy"));
         assert!(setup.contains("PendingQueueSidecarSetupMode::Disabled"));

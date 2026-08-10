@@ -53,6 +53,7 @@ use scylla::{
     statement::Consistency,
 };
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use tokio::time::sleep;
 
 use crate::core::ScyllaCoreStore;
@@ -62,6 +63,7 @@ use super::*;
 const EXACT: &str = "psy_h23c4c1_exact";
 const PARTIAL: &str = "psy_h23c4c1_partial";
 const WRONG: &str = "psy_h23c4c1_wrong";
+const UPGRADE: &str = "psy_h23c4c1_upgrade";
 const IMAGE: &str =
     "scylladb/scylla@sha256:17496f2dd6e72056d0b0d7e2bd18bd62638872d1d80a5dd9db96ba017fd426fc";
 const NODE_IPS: [Ipv4Addr; 3] = [
@@ -156,7 +158,7 @@ async fn connect(target: Option<Ipv4Addr>, consistency: Consistency) -> anyhow::
 }
 
 async fn create_keyspaces(session: &Session) -> anyhow::Result<()> {
-    for keyspace in [EXACT, PARTIAL, WRONG] {
+    for keyspace in [EXACT, PARTIAL, WRONG, UPGRADE] {
         session.query_unpaged(
             format!("CREATE KEYSPACE IF NOT EXISTS {keyspace} WITH replication = {{'class': 'NetworkTopologyStrategy', 'datacenter1': 3}}"),
             &[],
@@ -230,6 +232,8 @@ struct H23c4c1Report {
     partial_retry_converged: bool,
     wrong_schema_rejected: bool,
     idempotent_deploy: bool,
+    v10_verified_does_not_authorize_v11: bool,
+    v10_lifecycle_row_preserved: bool,
     one_replica_offline_ready: bool,
     direct_one_nodes_exact: usize,
     direct_one_lifecycle_equal: bool,
@@ -240,6 +244,76 @@ struct H23c4c1Report {
     repair_flush_compact: bool,
     ready_ms: u64,
     qualification: &'static str,
+}
+
+fn historical_v10_slot(keyspaces: &PendingQueueSidecarKeyspaces) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"psy/rollback/pending-queue-sidecar-slot/v1");
+    for value in [keyspaces.data().as_str(), keyspaces.control().as_str()] {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    hasher.finalize().into()
+}
+
+fn historical_v10_fingerprint() -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"psy/rollback/pending-queue-sidecar-schema/v10");
+    hasher.update(10_u16.to_be_bytes());
+    for table in PendingQueueSidecarPhysicalTable::ALL.iter().copied().take(16) {
+        hasher.update([table as u8]);
+        hasher.update((table.table_name().len() as u64).to_be_bytes());
+        hasher.update(table.table_name().as_bytes());
+        hasher.update([match table.keyspace_kind() {
+            PendingQueueSidecarKeyspaceKind::StandardData => 1,
+            PendingQueueSidecarKeyspaceKind::NoTabletControl => 2,
+        }]);
+        for column in PENDING_QUEUE_SIDECAR_EXPECTED_COLUMNS
+            .iter()
+            .filter(|column| column.table == table)
+        {
+            for value in [
+                column.name,
+                column.cql_type,
+                match column.kind {
+                    PendingQueueSidecarColumnKind::PartitionKey => "partition_key",
+                    PendingQueueSidecarColumnKind::Clustering => "clustering",
+                    PendingQueueSidecarColumnKind::Regular => "regular",
+                },
+            ] {
+                hasher.update((value.len() as u64).to_be_bytes());
+                hasher.update(value.as_bytes());
+            }
+            hasher.update(column.position.to_be_bytes());
+            let order = match column.clustering_order {
+                PendingQueueSidecarClusteringOrder::Asc => "asc",
+                PendingQueueSidecarClusteringOrder::None => "none",
+            };
+            hasher.update((order.len() as u64).to_be_bytes());
+            hasher.update(order.as_bytes());
+        }
+    }
+    hasher.finalize().into()
+}
+
+fn historical_v10_verified_payload(keyspaces: &PendingQueueSidecarKeyspaces) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"PSYQSCAR");
+    bytes.extend_from_slice(&1_u16.to_be_bytes());
+    bytes.extend_from_slice(&2_u64.to_be_bytes());
+    bytes.push(2);
+    bytes.extend_from_slice(&10_u16.to_be_bytes());
+    bytes.extend_from_slice(&16_u16.to_be_bytes());
+    for value in [keyspaces.data().as_str(), keyspaces.control().as_str()] {
+        bytes.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        bytes.extend_from_slice(value.as_bytes());
+    }
+    bytes.extend_from_slice(&historical_v10_fingerprint());
+    let mut state = Sha256::new();
+    state.update(b"psy/rollback/pending-queue-sidecar-state/v1");
+    state.update(&bytes);
+    bytes.extend_from_slice(&<[u8; 32]>::from(state.finalize()));
+    bytes
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -261,11 +335,59 @@ async fn d04b6h23c4c1_queue_schema_lifecycle_rf3_gate() -> anyhow::Result<()> {
     ensure!(
         queue_table_count_including_lifecycle(&session, EXACT).await?
             == PENDING_QUEUE_SIDECAR_TARGET_TABLE_COUNT + 1,
-        "expected 16 target tables plus one lifecycle table"
+        "expected current target tables plus one lifecycle table"
     );
     let repeated = PendingQueueSidecarDeploymentExecutor::deploy(session.clone(), keyspaces(EXACT)?).await?;
     let idempotent_deploy = repeated == exact_receipt;
     ensure!(idempotent_deploy);
+
+    let upgrade_keys = keyspaces(UPGRADE)?;
+    ScyllaPendingQueueSidecarLifecycleStore::create_schema(
+        &session,
+        upgrade_keys.control(),
+    )
+    .await?;
+    let old_slot = historical_v10_slot(&upgrade_keys);
+    let old_payload = historical_v10_verified_payload(&upgrade_keys);
+    session
+        .query_unpaged(
+            format!(
+                "INSERT INTO {}.{} (deployment_slot, revision, deployment_payload) VALUES (?, ?, ?)",
+                upgrade_keys.control().as_str(),
+                PENDING_QUEUE_SIDECAR_LIFECYCLE_TABLE,
+            ),
+            (old_slot.to_vec(), 2_i64, old_payload.clone()),
+        )
+        .await?;
+    let v10_verified_does_not_authorize_v11 = matches!(
+        ScyllaPendingQueueSidecarSetupGate::authorize(
+            session.clone(),
+            upgrade_keys.clone(),
+            realm(),
+        )
+        .await,
+        Err(PendingQueueSidecarLifecycleError::Uninitialized),
+    );
+    ensure!(v10_verified_does_not_authorize_v11);
+    PendingQueueSidecarDeploymentExecutor::deploy(
+        session.clone(),
+        upgrade_keys.clone(),
+    )
+    .await?;
+    let preserved = session
+        .query_unpaged(
+            format!(
+                "SELECT revision, deployment_payload FROM {}.{} WHERE deployment_slot = ?",
+                upgrade_keys.control().as_str(),
+                PENDING_QUEUE_SIDECAR_LIFECYCLE_TABLE,
+            ),
+            (old_slot.to_vec(),),
+        )
+        .await?
+        .into_rows_result()?
+        .single_row::<(i64, Vec<u8>)>()?;
+    let v10_lifecycle_row_preserved = preserved == (2, old_payload);
+    ensure!(v10_lifecycle_row_preserved);
 
     let partial_keys = keyspaces(PARTIAL)?;
     ScyllaPendingQueueSidecarLifecycleStore::create_schema(&session, partial_keys.control()).await?;
@@ -389,6 +511,8 @@ async fn d04b6h23c4c1_queue_schema_lifecycle_rf3_gate() -> anyhow::Result<()> {
         partial_retry_converged,
         wrong_schema_rejected,
         idempotent_deploy,
+        v10_verified_does_not_authorize_v11,
+        v10_lifecycle_row_preserved,
         one_replica_offline_ready,
         direct_one_nodes_exact,
         direct_one_lifecycle_equal,
@@ -398,7 +522,7 @@ async fn d04b6h23c4c1_queue_schema_lifecycle_rf3_gate() -> anyhow::Result<()> {
         claim_direct_one_equal,
         repair_flush_compact: true,
         ready_ms,
-        qualification: "H23C4C2B4D2C_SIDECAR_V10_RF3_PASSED",
+        qualification: "H23C4C4A2A_SIDECAR_V11_RF3_PASSED",
     };
     let report_path = std::env::var("PSY_D04B6H23C4C1_REPORT_PATH")?;
     std::fs::write(&report_path, serde_json::to_vec_pretty(&report)?)?;

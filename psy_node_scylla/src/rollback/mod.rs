@@ -72,6 +72,8 @@ mod pending_queue_segment_lifecycle;
 #[allow(dead_code)]
 mod pending_queue_nats_capture;
 mod realm_processor_durable_capture;
+#[allow(dead_code)]
+mod realm_processor_application_archive;
 mod pending_queue_consumer_gate;
 #[cfg(test)]
 #[path = "../../tests/rf3/d04b6h22e_consumer_gate.rs"]

@@ -266,6 +266,39 @@ impl RealmProcessorSemanticOutput {
         bytes
     }
 
+    /// Exact encoded length without allocating a second copy of the payload.
+    /// Archive adapters must check their aggregate byte cap through this
+    /// method before calling `to_canonical_bytes`.
+    pub fn canonical_len(&self) -> Result<usize, RealmProcessorSemanticOutputError> {
+        // Fixed fields, six u32 byte-length prefixes, two vector counts and
+        // the trailing digest.
+        let mut len = 330_usize;
+        for bytes in [
+            &self.global_user_tree_nodes,
+            &self.user_contract_tree_nodes,
+            &self.contract_state_tree_nodes,
+            &self.user_leaves,
+            &self.contract_state_imt_leaves,
+            &self.guta_header,
+        ] {
+            len = len.checked_add(bytes.len())
+                .ok_or(RealmProcessorSemanticOutputError::CountOverflow)?;
+        }
+        for job in &self.jobs {
+            len = len.checked_add(14)
+                .and_then(|value| value.checked_add(job.metadata.len()))
+                .and_then(|value| value.checked_add(job.witness.len()))
+                .ok_or(RealmProcessorSemanticOutputError::CountOverflow)?;
+        }
+        for job in &self.deferred_jobs {
+            len = len.checked_add(12)
+                .and_then(|value| value.checked_add(job.queue_item.len()))
+                .and_then(|value| value.checked_add(job.contract_updates.len()))
+                .ok_or(RealmProcessorSemanticOutputError::CountOverflow)?;
+        }
+        Ok(len)
+    }
+
     pub const fn digest(&self) -> RealmProcessorSemanticOutputDigest { self.digest }
     pub const fn context_digest(&self) -> PendingQueueCaptureContextDigest { self.context_digest }
     pub const fn generation_digest(&self) -> RealmProcessorDurableGenerationDigest { self.generation_digest }
@@ -482,6 +515,7 @@ mod tests {
     fn canonical_roundtrip_and_tamper_fail_closed() {
         let output = RealmProcessorSemanticOutput::try_from_candidate_parts(parts(false)).unwrap();
         let bytes = output.to_canonical_bytes();
+        assert_eq!(output.canonical_len().unwrap(), bytes.len());
         assert_eq!(bytes.len(), 349);
         assert_eq!(
             hex::encode(output.digest().as_bytes()),

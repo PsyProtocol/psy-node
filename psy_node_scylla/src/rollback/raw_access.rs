@@ -104,6 +104,8 @@ pub const RAW_SCYLLA_ACCESS_ALLOWLIST: &[RawScyllaAccessAllowance] = &[
     allow!("psy_node_scylla/src/rollback/normal_state_replay_rf3_gate.rs", TestHarness),
     allow!("psy_node_scylla/src/rollback/raw_access.rs", GuardImplementation),
     allow!("psy_node_scylla/src/rollback/realm_edge_durable_publisher.rs", DurableControlAuthority),
+    allow!("psy_node_scylla/src/rollback/realm_processor_application_archive.rs", DurableControlAuthority),
+    allow!("psy_node_scylla/src/rollback/realm_processor_durable_capture.rs", DurableControlAuthority),
     allow!("psy_node_scylla/src/rollback/realm_user_update_claim_store.rs", DurableControlAuthority),
     allow!("psy_node_scylla/src/rollback/realm_user_update_admission_store.rs", DurableControlAuthority),
     allow!("psy_node_scylla/src/rollback/realm_user_update_dependency_store.rs", DurableControlAuthority),

@@ -1,6 +1,6 @@
 //! Exact, default-off schema boundary for the recoverable Realm queue.
 //!
-//! The sixteen target tables have production-shaped adapters and are qualified
+//! The eighteen target tables have production-shaped adapters and are qualified
 //! evidence, but historically only tests created them one by one.  This module
 //! gives deployment tooling one deterministic manifest/materializer and gives
 //! node startup an inspect-only capability.  Ordinary setup performs no queue
@@ -37,6 +37,11 @@ use super::{
         ScyllaPendingQueueSemanticAggregateStore,
         PENDING_QUEUE_SEMANTIC_GENERATION_TABLE,
     },
+    realm_processor_application_archive::{
+        ScyllaRealmProcessorApplicationArchiveStore,
+        REALM_PROCESSOR_APPLICATION_ARCHIVE_FRAGMENT_TABLE,
+        REALM_PROCESSOR_APPLICATION_ARCHIVE_HEADER_TABLE,
+    },
     BranchExactDeploymentNoTabletKeyspace, CqlKeyspaceName,
     PendingQueueArtifactControlKeyspace, PendingQueueArtifactDataKeyspace,
     PendingQueueArtifactKeyspaces, PendingQueuePublishDataKeyspace,
@@ -55,13 +60,13 @@ use super::{
 #[cfg(test)]
 use super::RETIRED_REALM_USER_UPDATE_CLAIM_V1_TABLE;
 
-// v10 preserves the sixteen-table physical manifest while requiring the
-// multi-live-segment ledger v4 and assignment-bound publisher route. A v9
-// VERIFIED receipt cannot authorize these stronger serving semantics.
-pub const PENDING_QUEUE_SIDECAR_SCHEMA_VERSION: u16 = 10;
-pub const PENDING_QUEUE_SIDECAR_TARGET_TABLE_COUNT: usize = 16;
+// v11 adds the Realm application-semantic header and fragment archive. A v10
+// VERIFIED receipt intentionally has a different deployment slot and cannot
+// authorize this stronger serving contract.
+pub const PENDING_QUEUE_SIDECAR_SCHEMA_VERSION: u16 = 11;
+pub const PENDING_QUEUE_SIDECAR_TARGET_TABLE_COUNT: usize = 18;
 const FINGERPRINT_DOMAIN: &[u8] =
-    b"psy/rollback/pending-queue-sidecar-schema/v10";
+    b"psy/rollback/pending-queue-sidecar-schema/v11";
 const INSPECT_COLUMNS_CQL: &str = "SELECT column_name, type, kind, position, clustering_order FROM system_schema.columns WHERE keyspace_name = ? AND table_name = ?";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -83,6 +88,8 @@ pub enum PendingQueueSidecarPhysicalTable {
     UserUpdateDependencyFragment = 14,
     UserUpdateAdmission = 15,
     StreamProvisionBinding = 16,
+    RealmApplicationArchiveHeader = 17,
+    RealmApplicationArchiveFragment = 18,
 }
 
 impl PendingQueueSidecarPhysicalTable {
@@ -103,6 +110,8 @@ impl PendingQueueSidecarPhysicalTable {
         Self::UserUpdateDependencyFragment,
         Self::UserUpdateAdmission,
         Self::StreamProvisionBinding,
+        Self::RealmApplicationArchiveHeader,
+        Self::RealmApplicationArchiveFragment,
     ];
 
     pub const fn table_name(self) -> &'static str {
@@ -123,12 +132,17 @@ impl PendingQueueSidecarPhysicalTable {
             Self::UserUpdateDependencyFragment => REALM_USER_UPDATE_DEPENDENCY_FRAGMENT_TABLE,
             Self::UserUpdateAdmission => REALM_USER_UPDATE_ADMISSION_TABLE,
             Self::StreamProvisionBinding => PENDING_QUEUE_STREAM_PROVISION_TABLE,
+            Self::RealmApplicationArchiveHeader => REALM_PROCESSOR_APPLICATION_ARCHIVE_HEADER_TABLE,
+            Self::RealmApplicationArchiveFragment => REALM_PROCESSOR_APPLICATION_ARCHIVE_FRAGMENT_TABLE,
         }
     }
 
     pub const fn keyspace_kind(self) -> PendingQueueSidecarKeyspaceKind {
         match self {
-            Self::PublishFragment | Self::ArtifactFragment | Self::UserUpdateDependencyFragment => {
+            Self::PublishFragment
+            | Self::ArtifactFragment
+            | Self::UserUpdateDependencyFragment
+            | Self::RealmApplicationArchiveFragment => {
                 PendingQueueSidecarKeyspaceKind::StandardData
             }
             _ => PendingQueueSidecarKeyspaceKind::NoTabletControl,
@@ -205,6 +219,13 @@ impl PendingQueueSidecarKeyspaces {
                 .map_err(|error| PendingQueueSidecarSchemaError::InvalidKeyspace(error.to_string()))?,
         ))
     }
+
+    fn application_data_keyspace(
+        &self,
+    ) -> Result<PendingQueueArtifactDataKeyspace, PendingQueueSidecarSchemaError> {
+        PendingQueueArtifactDataKeyspace::try_new(self.data.as_str().to_owned())
+            .map_err(|error| PendingQueueSidecarSchemaError::InvalidKeyspace(error.to_string()))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -275,7 +296,7 @@ const fn regular(
     PendingQueueSidecarColumnSpec { table, name, cql_type, kind: PendingQueueSidecarColumnKind::Regular, position: -1, clustering_order: PendingQueueSidecarClusteringOrder::None }
 }
 
-pub const PENDING_QUEUE_SIDECAR_EXPECTED_COLUMNS: [PendingQueueSidecarColumnSpec; 85] = [
+pub const PENDING_QUEUE_SIDECAR_EXPECTED_COLUMNS: [PendingQueueSidecarColumnSpec; 96] = [
     pk(PendingQueueSidecarPhysicalTable::Pipeline, "network_chain_id", "bigint", 0),
     pk(PendingQueueSidecarPhysicalTable::Pipeline, "authority_kind", "tinyint", 1),
     pk(PendingQueueSidecarPhysicalTable::Pipeline, "realm_id", "bigint", 2),
@@ -361,6 +382,17 @@ pub const PENDING_QUEUE_SIDECAR_EXPECTED_COLUMNS: [PendingQueueSidecarColumnSpec
     pk(PendingQueueSidecarPhysicalTable::StreamProvisionBinding, "provision_slot", "blob", 0),
     regular(PendingQueueSidecarPhysicalTable::StreamProvisionBinding, "revision", "bigint"),
     regular(PendingQueueSidecarPhysicalTable::StreamProvisionBinding, "provision_payload", "blob"),
+    pk(PendingQueueSidecarPhysicalTable::RealmApplicationArchiveHeader, "archive_slot", "blob", 0),
+    regular(PendingQueueSidecarPhysicalTable::RealmApplicationArchiveHeader, "revision", "bigint"),
+    regular(PendingQueueSidecarPhysicalTable::RealmApplicationArchiveHeader, "archive_payload", "blob"),
+    pk(PendingQueueSidecarPhysicalTable::RealmApplicationArchiveFragment, "archive_slot", "blob", 0),
+    pk(PendingQueueSidecarPhysicalTable::RealmApplicationArchiveFragment, "application_digest", "blob", 1),
+    pk(PendingQueueSidecarPhysicalTable::RealmApplicationArchiveFragment, "fragment_bucket", "bigint", 2),
+    ck(PendingQueueSidecarPhysicalTable::RealmApplicationArchiveFragment, "fragment_index", "int", 0),
+    regular(PendingQueueSidecarPhysicalTable::RealmApplicationArchiveFragment, "fragment_count", "int"),
+    regular(PendingQueueSidecarPhysicalTable::RealmApplicationArchiveFragment, "application_bytes", "bigint"),
+    regular(PendingQueueSidecarPhysicalTable::RealmApplicationArchiveFragment, "payload", "blob"),
+    regular(PendingQueueSidecarPhysicalTable::RealmApplicationArchiveFragment, "payload_digest", "blob"),
 ];
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -513,6 +545,13 @@ impl PendingQueueSidecarSchemaMaterializer {
         )
         .await
         .map_err(sidecar)?;
+        ScyllaRealmProcessorApplicationArchiveStore::create_schema(
+            session,
+            &keyspaces.control,
+            &keyspaces.application_data_keyspace()?,
+        )
+        .await
+        .map_err(sidecar)?;
         let PendingQueueSidecarSchemaInspection::Exact { fingerprint } = Self::inspect_schema(session, keyspaces).await? else {
             return Err(PendingQueueSidecarSchemaError::DidNotConverge);
         };
@@ -551,13 +590,13 @@ mod tests {
     }
 
     #[test]
-    fn exact_manifest_is_sixteen_unique_tables_with_stable_placement() {
-        assert_eq!(PENDING_QUEUE_SIDECAR_SCHEMA_VERSION, 10);
-        assert_eq!(PendingQueueSidecarPhysicalTable::ALL.len(), 16);
+    fn exact_manifest_is_eighteen_unique_tables_with_stable_placement() {
+        assert_eq!(PENDING_QUEUE_SIDECAR_SCHEMA_VERSION, 11);
+        assert_eq!(PendingQueueSidecarPhysicalTable::ALL.len(), 18);
         let names = PendingQueueSidecarPhysicalTable::ALL.iter().map(|table| table.table_name()).collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(names.len(), 16);
-        assert_eq!(PendingQueueSidecarPhysicalTable::ALL.iter().filter(|table| table.keyspace_kind() == PendingQueueSidecarKeyspaceKind::StandardData).count(), 3);
-        assert_eq!(PendingQueueSidecarPhysicalTable::ALL.iter().filter(|table| table.keyspace_kind() == PendingQueueSidecarKeyspaceKind::NoTabletControl).count(), 13);
+        assert_eq!(names.len(), 18);
+        assert_eq!(PendingQueueSidecarPhysicalTable::ALL.iter().filter(|table| table.keyspace_kind() == PendingQueueSidecarKeyspaceKind::StandardData).count(), 4);
+        assert_eq!(PendingQueueSidecarPhysicalTable::ALL.iter().filter(|table| table.keyspace_kind() == PendingQueueSidecarKeyspaceKind::NoTabletControl).count(), 14);
         assert!(!names.contains(RETIRED_V1_PIPELINE_TABLE));
         assert!(!names.contains(RETIRED_REALM_USER_UPDATE_CLAIM_V1_TABLE));
         assert_ne!(pending_queue_sidecar_schema_fingerprint().as_bytes(), &[0; 32]);
@@ -569,6 +608,20 @@ mod tests {
         let mut missing = exact_columns();
         missing.retain(|column| column.table != PendingQueueSidecarPhysicalTable::ConsumerGate);
         assert!(matches!(inspect_pending_queue_sidecar_columns(missing, false).unwrap(), PendingQueueSidecarSchemaInspection::Partial { .. }));
+        let mut old_v10 = exact_columns();
+        old_v10.retain(|column| !matches!(
+            column.table,
+            PendingQueueSidecarPhysicalTable::RealmApplicationArchiveHeader
+                | PendingQueueSidecarPhysicalTable::RealmApplicationArchiveFragment
+        ));
+        assert!(matches!(
+            inspect_pending_queue_sidecar_columns(old_v10, false).unwrap(),
+            PendingQueueSidecarSchemaInspection::Partial { missing, .. }
+                if missing == vec![
+                    PendingQueueSidecarPhysicalTable::RealmApplicationArchiveHeader,
+                    PendingQueueSidecarPhysicalTable::RealmApplicationArchiveFragment,
+                ]
+        ));
         let mut old_v8 = exact_columns();
         old_v8.retain(|column| column.table != PendingQueueSidecarPhysicalTable::StreamProvisionBinding);
         assert!(matches!(inspect_pending_queue_sidecar_columns(old_v8, false).unwrap(), PendingQueueSidecarSchemaInspection::Partial { missing, .. } if missing == vec![PendingQueueSidecarPhysicalTable::StreamProvisionBinding]));
