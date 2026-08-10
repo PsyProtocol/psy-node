@@ -1342,6 +1342,31 @@ impl ScyllaPendingQueueArtifactStore {
         })
     }
 
+    /// Recovers the exact structural close boundary from the durable header.
+    /// This is the ACK-to-builder crash bridge: after the Seal ACK response is
+    /// lost, the backend must not rely on another JetStream delivery to learn
+    /// that the source is already closed.
+    pub(super) async fn read_closed_boundary_exact(
+        &self,
+        permit: &PendingQueueArtifactOwnerPermit,
+        identity: &PendingQueueArtifactIdentity,
+    ) -> Result<Option<PendingQueueGenerationBoundary>, PendingQueueArtifactStoreError> {
+        let current = self
+            .read_header(identity)
+            .await?
+            .ok_or(PendingQueueArtifactStoreError::Uninitialized)?;
+        require_owner_permit(self.fingerprint, &current, permit)?;
+        match current.phase() {
+            PendingQueueArtifactPhase::CloseObserved { boundary, .. }
+            | PendingQueueArtifactPhase::SourceScanned { boundary, .. } => {
+                Ok(Some(boundary.clone()))
+            }
+            PendingQueueArtifactPhase::Open(_)
+            | PendingQueueArtifactPhase::AppendPrepared { .. }
+            | PendingQueueArtifactPhase::SelectedAwaitingAck { .. } => Ok(None),
+        }
+    }
+
     /// Reloads and reconstructs every candidate behind an opaque SourceScanned
     /// receipt. This is crate-private because candidates alone are not a
     /// semantic terminal; the sibling composition must additionally match the

@@ -4,7 +4,25 @@ use psy_data::
 ;
 use psy_io::tokio::TokioLikeFileSystem;
 use psy_node_core::{
-    p2p::traits::realm_coordinantor::RealmCoordinatorClient, psy_core_db::traits::full::{PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter, PsyRealmProcessorStore}, psy_temp_db::StandardProcessorTempDBStoreBase, queue::{ephemeral::QStandardEphemeralQueueSubscriber, worker_queue::QStandardWorkerQueuePublisher}, store::{realm_processor_branch_exact_runtime::RealmBranchExactSingleCommitOwner, realm_processor_quiescence::RealmProcessorIterationGate, traits::proof_store::QParthProofStore}
+    p2p::traits::realm_coordinantor::RealmCoordinatorClient,
+    psy_core_db::traits::full::{
+        PsyNodeCoreRewardsTagTreeStoreReader, PsyNodeCoreRewardsTagTreeStoreWriter,
+        PsyRealmProcessorStore,
+    },
+    psy_temp_db::StandardProcessorTempDBStoreBase,
+    queue::{
+        ephemeral::QStandardEphemeralQueueSubscriber,
+        worker_queue::QStandardWorkerQueuePublisher,
+    },
+    store::{
+        realm_processor_branch_exact_runtime::{
+            RealmBranchExactCommitIteration, RealmBranchExactSingleCommitOwner,
+        },
+        realm_processor_quiescence::{
+            RealmProcessorIterationGate, RealmProcessorIterationPermit,
+        },
+        traits::proof_store::QParthProofStore,
+    },
 };
 
 use crate::{
@@ -46,6 +64,31 @@ impl<Hash> RealmNormalCommitOwner<Hash> {
     ) -> Self {
         Self::BranchExact(owner)
     }
+
+    pub(super) const fn is_branch_exact(&self) -> bool {
+        matches!(self, Self::BranchExact(_))
+    }
+
+    pub(super) fn begin_iteration(
+        &mut self,
+        permit: RealmProcessorIterationPermit,
+    ) -> anyhow::Result<RealmNormalCommitIteration<'_, Hash>> {
+        match self {
+            Self::LegacyDisabled => Ok(RealmNormalCommitIteration::Legacy {
+                _permit: permit,
+            }),
+            Self::BranchExact(owner) => Ok(RealmNormalCommitIteration::BranchExact(
+                owner.begin_iteration(permit)?,
+            )),
+        }
+    }
+}
+
+pub(super) enum RealmNormalCommitIteration<'owner, Hash> {
+    Legacy {
+        _permit: RealmProcessorIterationPermit,
+    },
+    BranchExact(RealmBranchExactCommitIteration<'owner, Hash>),
 }
 
 pub struct PsyRealmProcessor<
@@ -84,7 +127,7 @@ pub struct PsyRealmProcessor<
     pub(super) iteration_quiescence: RealmProcessorIterationGate,
     /// The only route from a live `process_block` request to persistence.
     /// Genesis and startup recovery retain their separately typed DB paths.
-    normal_commit_owner: RealmNormalCommitOwner<N::QHash>,
+    normal_commit_owner: Option<RealmNormalCommitOwner<N::QHash>>,
     /// The sole receiver/lease owner. Ordinary startup leaves it absent; a
     /// later composition root must opt in explicitly after durable preflight.
     control_owner: Option<control::RealmProcessorControlOwner>,

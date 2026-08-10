@@ -276,6 +276,68 @@ impl ScyllaBackedRecoverableNatsSource {
         }))
     }
 
+    /// Reconstructs the entire closed source from Scylla.  It deliberately
+    /// does not depend on receiving Data or Seal from JetStream again: both may
+    /// already have been ACKed before the caller or gather task crashed.
+    pub(super) async fn replay_closed_source<Hash: Q256BitHash>(
+        &self,
+        pipeline_store: &ScyllaPendingPipelineStore,
+        context: PendingQueueCaptureContext,
+        close_receipt: &PersistedPendingQueueCloseReceipt,
+    ) -> Result<
+        Option<(Vec<PendingQueueCaptureCandidate>, PendingQueueGenerationBoundary)>,
+        PendingQueueNatsCaptureError,
+    > {
+        if !close_receipt.matches_context(context) {
+            return Err(PendingQueueNatsCaptureError::CloseContextMismatch);
+        }
+        pipeline_store
+            .revalidate_queue_close_exact::<Hash>(context, close_receipt)
+            .await
+            .map_err(|error| PendingQueueNatsCaptureError::Pipeline(error.to_string()))?;
+        let _serial = self.serial.lock().await;
+        let identity = PendingQueueArtifactIdentity::try_new(
+            context,
+            self.contract
+                .source_identity()
+                .map_err(nats_transport)?,
+        )
+        .map_err(|error| PendingQueueNatsCaptureError::Core(error.to_string()))?;
+        self.store
+            .validate_owner_permit(&self.owner, &identity)
+            .await
+            .map_err(PendingQueueNatsCaptureError::Store)?;
+        let Some(boundary) = self
+            .store
+            .read_closed_boundary_exact(&self.owner, &identity)
+            .await
+            .map_err(PendingQueueNatsCaptureError::Store)?
+        else {
+            return Ok(None);
+        };
+        if boundary.close_intent() != close_receipt.close_intent()
+            || boundary.context() != context
+            || boundary.source_identity() != identity.source()
+        {
+            return Err(PendingQueueNatsCaptureError::CloseIntentMismatch);
+        }
+        let scanned = self
+            .store
+            .scan_closed_source(&self.owner, &identity, boundary.clone())
+            .await
+            .map_err(PendingQueueNatsCaptureError::Store)?;
+        let candidates = self
+            .store
+            .reconstruct_scanned_candidates_exact(&self.owner, &identity, &scanned)
+            .await
+            .map_err(PendingQueueNatsCaptureError::Store)?;
+        pipeline_store
+            .revalidate_queue_close_exact::<Hash>(context, close_receipt)
+            .await
+            .map_err(|error| PendingQueueNatsCaptureError::Pipeline(error.to_string()))?;
+        Ok(Some((candidates, boundary)))
+    }
+
     async fn ensure_attested_consumer(
         &self,
     ) -> Result<RecoverableNatsCaptureConsumer, PendingQueueNatsCaptureError> {

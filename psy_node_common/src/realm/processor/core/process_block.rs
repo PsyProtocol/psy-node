@@ -14,19 +14,39 @@ use psy_node_core::{
     psy_temp_db::StandardProcessorTempDBStoreBase,
     queue::{
         ephemeral::QStandardEphemeralQueueSubscriber,
+        realm_processor_durable_capture::RealmProcessorDurableCaptureOutcome,
         worker_queue::{QStandardWorkerQueuePublisher, QStandardWorkerQueueSubscriber},
     },
-    store::traits::proof_store::{QCanonicalProofStoreV2, QParthProofStore},
+    store::{
+        pending_generation_identity::PendingGenerationContext,
+        realm_processor_quiescence::RealmProcessorIterationPermit,
+        traits::proof_store::{QCanonicalProofStoreV2, QParthProofStore},
+    },
 };
 
 use crate::realm::{
     processor::{
         commit_input::RealmCommitInput,
-        core::PsyRealmProcessor,
+        core::{PsyRealmProcessor, RealmNormalCommitIteration},
         gatherers::realm_end_cap_gatherer::RealmGUTAEndCapGathererOutput,
     },
     queue_key::RealmProvingWorkQueueKey,
 };
+
+use crate::queue::gatherer::DurableTreeGathererApplyReceipt;
+
+enum RealmGatheringOutcome<F, Hash, JobId> {
+    Legacy(RealmGUTAEndCapGathererOutput<F, Hash, JobId>),
+    BranchExactApplied(DurableTreeGathererApplyReceipt),
+    BranchExactAwaitingClosedSource,
+}
+
+pub(super) enum RealmOwnedIterationError {
+    MissingCommitOwner,
+    Begin(anyhow::Error),
+    Sync(anyhow::Error),
+    Process(anyhow::Error),
+}
 
 impl<
         N: QNetworkTypesConfig<JobId = QProvingJobDataID>,
@@ -105,7 +125,41 @@ where
         }
     }
 
-    pub async fn get_results_from_gatherers(&mut self) -> anyhow::Result<RealmGUTAEndCapGathererOutput<N::F, N::QHash, N::JobId>> {
+    async fn get_results_from_gatherers(
+        &mut self,
+        iteration: &mut RealmNormalCommitIteration<'_, N::QHash>,
+    ) -> anyhow::Result<RealmGatheringOutcome<N::F, N::QHash, N::JobId>> {
+        if let RealmNormalCommitIteration::BranchExact(iteration) = iteration {
+            let processing = PendingGenerationContext::try_from_legacy(
+                self.db.state.processing_unique_pending_id,
+                self.db.state.processing_proc_checkpoint_unique_id,
+            )?;
+            let mut capture = iteration
+                .open_durable_capture_for_processing(processing)
+                .await?;
+
+            let generation = match capture.replay_complete_generation().await? {
+                Some(generation) => Some(generation),
+                None => loop {
+                    match capture.capture_next().await? {
+                        Some(RealmProcessorDurableCaptureOutcome::Data(_)) => {}
+                        Some(RealmProcessorDurableCaptureOutcome::Sealed { .. }) => {
+                            break capture.replay_complete_generation().await?;
+                        }
+                        None => break None,
+                    }
+                },
+            };
+            let Some(generation) = generation else {
+                return Ok(RealmGatheringOutcome::BranchExactAwaitingClosedSource);
+            };
+            let receipt = self
+                .guta_queue_gatherer
+                .apply_durable_generation(generation)
+                .await?;
+            return Ok(RealmGatheringOutcome::BranchExactApplied(receipt));
+        }
+
         // Sanity: outside of genesis, init must have already rotated the unique IDs once,
         // so gathering and processing IDs must differ. If they don't, state is corrupt —
         // bail rather than silently double-rotating.
@@ -140,7 +194,7 @@ where
             .finalize_gathering_and_update_queue_key(self.db.state.gathering_proc_checkpoint_unique_id)
             .await?;
 
-        Ok(guta_result)
+        Ok(RealmGatheringOutcome::Legacy(guta_result))
     }
 
     pub async fn sync_and_verify(&mut self) -> anyhow::Result<()> {
@@ -183,7 +237,10 @@ where
         Ok(())
     }
 
-    pub(super) async fn process_block(&mut self) -> anyhow::Result<()> {
+    pub(super) async fn process_block(
+        &mut self,
+        iteration: &mut RealmNormalCommitIteration<'_, N::QHash>,
+    ) -> anyhow::Result<()> {
         self.db.run_sanity_check("process_block start").await?;
         let mut timer = TraceTimer::new("process_block");
         tracing::info!(
@@ -192,7 +249,23 @@ where
         );
 
         // 2. Gather Updates
-        let guta_output = self.get_results_from_gatherers().await?;
+        let guta_output = match self.get_results_from_gatherers(iteration).await? {
+            RealmGatheringOutcome::Legacy(output) => output,
+            RealmGatheringOutcome::BranchExactApplied(receipt) => {
+                tracing::info!(
+                    "Branch-exact durable generation applied tentatively: items={}, generation={:?}; semantic handoff remains blocked until h23c4c4a",
+                    receipt.item_count(),
+                    receipt.generation_digest().as_bytes(),
+                );
+                return Ok(());
+            }
+            RealmGatheringOutcome::BranchExactAwaitingClosedSource => {
+                tracing::debug!(
+                    "Branch-exact processing source is not durably closed yet; no semantic or commit action taken"
+                );
+                return Ok(());
+            }
+        };
         let guta_jobs = guta_output.job_ids;
         let guta_update = guta_output.db_output;
 
@@ -344,7 +417,7 @@ where
             &submission_header,
             &root_job_proof,
         )?;
-        self.commit_live(commit_input).await?;
+        self.commit_live(iteration, commit_input).await?;
         timer.lap("commit_state");
         self.db.run_sanity_check("after commit").await?;
 
@@ -387,18 +460,50 @@ where
     /// after branch-exact startup has been authorized.
     async fn commit_live(
         &mut self,
+        iteration: &mut RealmNormalCommitIteration<'_, N::QHash>,
         commit_input: RealmCommitInput<'_, N::F, N::QHash>,
     ) -> anyhow::Result<()> {
-        match &mut self.normal_commit_owner {
-            super::RealmNormalCommitOwner::LegacyDisabled => {
+        match iteration {
+            RealmNormalCommitIteration::Legacy { .. } => {
                 self.db.commit_state(commit_input).await
             }
-            super::RealmNormalCommitOwner::BranchExact(_owner) => {
+            RealmNormalCommitIteration::BranchExact(_) => {
                 anyhow::bail!(
                     "REALM_BRANCH_EXACT_FULL_COMMIT_COVERAGE_NOT_INTEGRATED"
                 )
             }
         }
+    }
+
+    /// Execute one whole real loop iteration under exactly one normal-commit
+    /// owner.  The owner is temporarily absent from `self`, so cancellation or
+    /// re-entry fails closed instead of exposing a legacy fallback.
+    pub(super) async fn run_owned_iteration(
+        &mut self,
+        permit: RealmProcessorIterationPermit,
+        should_process: bool,
+    ) -> Result<(), RealmOwnedIterationError> {
+        let mut owner = self
+            .normal_commit_owner
+            .take()
+            .ok_or(RealmOwnedIterationError::MissingCommitOwner)?;
+        let result = async {
+            let mut iteration = owner
+                .begin_iteration(permit)
+                .map_err(RealmOwnedIterationError::Begin)?;
+            self.sync_and_verify()
+                .await
+                .map_err(RealmOwnedIterationError::Sync)?;
+            if should_process {
+                self.process_block(&mut iteration)
+                    .await
+                    .map_err(RealmOwnedIterationError::Process)?;
+            }
+            Ok(())
+        }
+        .await;
+        self.normal_commit_owner = Some(owner);
+        result
     }
 }
 
@@ -414,15 +519,21 @@ mod h23c4b_tests {
             .split("#[cfg(test)]")
             .next()
             .unwrap();
-        assert_eq!(live.matches("self.commit_live(commit_input).await?").count(), 1);
+        assert_eq!(
+            live.matches("self.commit_live(iteration, commit_input).await?")
+                .count(),
+            1
+        );
         assert_eq!(live.matches("self.db.commit_state(commit_input)").count(), 1);
-        let call = live.find("self.commit_live(commit_input).await?").unwrap();
+        let call = live
+            .find("self.commit_live(iteration, commit_input).await?")
+            .unwrap();
         let router = live.find("async fn commit_live(").unwrap();
         assert!(call < router);
 
         let router = live.split("async fn commit_live(").nth(1).unwrap();
-        assert!(router.contains("RealmNormalCommitOwner::LegacyDisabled"));
-        assert!(router.contains("RealmNormalCommitOwner::BranchExact(_owner)"));
+        assert!(router.contains("RealmNormalCommitIteration::Legacy"));
+        assert!(router.contains("RealmNormalCommitIteration::BranchExact"));
         assert!(router.contains("REALM_BRANCH_EXACT_FULL_COMMIT_COVERAGE_NOT_INTEGRATED"));
         assert!(!router.contains("prepare_and_verify"));
         assert!(!router.contains("finish_published"));
@@ -435,5 +546,102 @@ mod h23c4b_tests {
         assert!(input.contains("RealmCommitOrigin::StartupRecovery"));
         assert!(input.contains("RealmCommitOrigin::LiveProof"));
         assert!(input.contains("LiveEvidenceUnavailable"));
+    }
+}
+
+#[cfg(test)]
+mod h23c4c3b_tests {
+    #[test]
+    fn real_processor_routes_branch_exact_capture_without_legacy_drain() {
+        let source = include_str!("process_block.rs");
+        let function = source
+            .split("async fn get_results_from_gatherers(")
+            .nth(1)
+            .unwrap()
+            .split("// Sanity: outside of genesis")
+            .next()
+            .unwrap();
+        assert!(function.contains("open_durable_capture_for_processing(processing)"));
+        assert!(function.contains("replay_complete_generation()"));
+        assert!(function.contains("capture.capture_next()"));
+        assert!(function.contains("apply_durable_generation(generation)"));
+        assert!(!function.contains("set_new_unique_ids"));
+        assert!(!function.contains("finalize_gathering_and_update_queue_key"));
+        assert!(!function.contains("dump_entire_ephemeral_queue_bytes"));
+        assert!(!function.contains("delete_ephemeral_queue_consumer"));
+    }
+
+    #[test]
+    fn legacy_rotation_is_preserved_but_branch_exact_stops_before_semantics() {
+        let source = include_str!("process_block.rs");
+        let legacy = source
+            .split("// Sanity: outside of genesis")
+            .nth(1)
+            .unwrap()
+            .split("pub async fn sync_and_verify")
+            .next()
+            .unwrap();
+        assert_eq!(legacy.matches("self.db.set_new_unique_ids(None).await?").count(), 1);
+        assert_eq!(
+            legacy
+                .matches(".finalize_gathering_and_update_queue_key(")
+                .count(),
+            1
+        );
+
+        let process = source
+            .split("pub(super) async fn process_block")
+            .nth(1)
+            .unwrap();
+        let applied = process.find("RealmGatheringOutcome::BranchExactApplied").unwrap();
+        let semantic_stop = process[applied..].find("return Ok(())").unwrap() + applied;
+        let proving = process.find("// 4. Proving Work").unwrap();
+        assert!(semantic_stop < proving);
+        assert!(process.contains("semantic handoff remains blocked until h23c4c4a"));
+    }
+
+    #[test]
+    fn startup_selects_command_only_actor_and_keeps_default_off_guard() {
+        let startup = include_str!("startup.rs");
+        let branch = startup
+            .split("if branch_exact {")
+            .nth(1)
+            .unwrap()
+            .split("} else {")
+            .next()
+            .unwrap();
+        assert!(branch.contains("new_durable_with_status"));
+        assert!(!branch.contains("guta_update_queue.clone()"));
+        let legacy = startup
+            .split("} else {")
+            .nth(1)
+            .unwrap()
+            .split("};")
+            .next()
+            .unwrap();
+        assert!(legacy.contains("new_with_status"));
+        assert!(legacy.contains("db.guta_update_queue.clone()"));
+
+        let create = include_str!("../create.rs");
+        assert!(create.contains("ServingCompositionNotIntegrated"));
+        assert!(create.contains("reject_unintegrated_branch_exact_serving"));
+    }
+
+    #[test]
+    fn command_only_runner_has_no_queue_backend_or_terminal_authority() {
+        let gatherer = include_str!("../../../queue/gatherer.rs");
+        let durable = gatherer
+            .split("async fn durable_gatherer_runner_for_tree")
+            .nth(1)
+            .unwrap()
+            .split("async fn gatherer_runner_for_tree")
+            .next()
+            .unwrap();
+        assert!(!durable.contains("QStandardEphemeralQueueSubscriber"));
+        assert!(!durable.contains("dump_entire_ephemeral_queue_bytes"));
+        assert!(!durable.contains("AckBatchLast"));
+        assert!(!durable.contains("delete_ephemeral_queue_consumer"));
+        assert!(!durable.contains("finalize_with_tree"));
+        assert!(durable.contains("SemanticHandoffNotIntegrated"));
     }
 }

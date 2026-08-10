@@ -12,11 +12,13 @@ use std::{marker::PhantomData, sync::Arc};
 
 use async_trait::async_trait;
 use psy_data::protocol::canonical_chain::NetworkId;
+use psy_data::protocol::chain_context::AuthorityScope;
 
 use crate::queue::{
     realm_processor_durable_capture::{
         RealmProcessorDurableCaptureError, RealmProcessorDurableCaptureFactory,
         RealmProcessorDurableCaptureOutcome, RealmProcessorDurableCapturePort,
+        RealmProcessorDurableCapturedGeneration,
         SealedRealmProcessorDurableCaptureRequest,
     },
     recoverable_ephemeral::PendingQueueCaptureContext,
@@ -25,6 +27,10 @@ use crate::queue::{
 use super::realm_processor_startup::{
     RealmProcessorFreshRunPermit, RealmProcessorStartupError,
     RealmProcessorStartupPermitDigest,
+};
+use super::pending_generation_identity::{
+    PendingGenerationActivationDigest, PendingGenerationContext,
+    PendingGenerationLedgerKey,
 };
 use super::realm_processor_quiescence::RealmProcessorIterationPermit;
 
@@ -188,7 +194,7 @@ impl<Hash> RealmBranchExactCommitIteration<'_, Hash> {
     /// iteration mutably.  The returned port cannot outlive the iteration and
     /// no second queue mutation can be opened through the same owner until it
     /// is dropped.
-    pub async fn open_durable_capture<'capture>(
+    async fn open_durable_capture<'capture>(
         &'capture mut self,
         context: PendingQueueCaptureContext,
     ) -> Result<RealmBranchExactDurableCapture<'capture>, RealmProcessorDurableCaptureError> {
@@ -209,6 +215,33 @@ impl<Hash> RealmBranchExactCommitIteration<'_, Hash> {
             _iteration: PhantomData,
         })
     }
+
+    /// Production-shaped capture entry.  The Processor supplies only its
+    /// exact durable processing pending/proc context; network, Realm scope and
+    /// activation are derived from the installed runtime and cannot be mixed
+    /// from caller-provided values.
+    pub async fn open_durable_capture_for_processing<'capture>(
+        &'capture mut self,
+        processing: PendingGenerationContext,
+    ) -> Result<RealmBranchExactDurableCapture<'capture>, RealmProcessorDurableCaptureError> {
+        let runtime = self.owner.runtime();
+        let context = PendingQueueCaptureContext::try_new(
+            PendingGenerationLedgerKey::new(
+                runtime.network(),
+                AuthorityScope::Realm {
+                    realm_id: runtime.realm_id(),
+                    realm_sub_id: runtime.realm_sub_id(),
+                },
+            ),
+            PendingGenerationActivationDigest::try_new(
+                runtime.writer_activation_digest(),
+            )
+            .map_err(|_| RealmProcessorDurableCaptureError::RuntimeCapabilityMismatch)?,
+            processing,
+        )
+        .map_err(|_| RealmProcessorDurableCaptureError::IdentityMismatch)?;
+        self.open_durable_capture(context).await
+    }
 }
 
 /// Lifetime-bound affine capture handle.  It exposes canonical outcomes only;
@@ -223,6 +256,15 @@ impl RealmBranchExactDurableCapture<'_> {
         &mut self,
     ) -> Result<Option<RealmProcessorDurableCaptureOutcome>, RealmProcessorDurableCaptureError> {
         self.port.capture_next().await
+    }
+
+    /// Reconstructs the complete closed generation from durable artifacts.
+    /// The returned input is restart-safe; individual live outcomes are not.
+    pub async fn replay_complete_generation(
+        &mut self,
+    ) -> Result<Option<RealmProcessorDurableCapturedGeneration>, RealmProcessorDurableCaptureError>
+    {
+        self.port.replay_complete_generation().await
     }
 }
 
@@ -248,10 +290,7 @@ mod tests {
     use psy_data::protocol::chain_context::AuthorityScope;
 
     use super::*;
-    use crate::store::pending_generation_identity::{
-        PendingGenerationActivationDigest, PendingGenerationContext,
-        PendingGenerationLedgerKey,
-    };
+    use crate::store::pending_generation_identity::PendingGenerationContext;
     use crate::store::realm_processor_startup::{
         authorize_realm_processor_startup, RealmProcessorStartupAuthorization,
         RealmProcessorStartupEvidence, RealmProcessorStartupExpectation,
@@ -382,6 +421,15 @@ mod tests {
         {
             Ok(None)
         }
+
+        async fn replay_complete_generation(
+            &mut self,
+        ) -> Result<
+            Option<RealmProcessorDurableCapturedGeneration>,
+            RealmProcessorDurableCaptureError,
+        > {
+            Ok(None)
+        }
     }
 
     struct CaptureFactory {
@@ -423,6 +471,13 @@ mod tests {
                 || request.realm_sub_id() != self.realm_sub_id
                 || request.writer_activation_digest() != &self.activation
                 || request.queue_readiness_digest() != &self.queue_readiness_digest()
+                || request.context().key().network() != self.network
+                || request.context().key().authority()
+                    != (AuthorityScope::Realm {
+                        realm_id: self.realm_id,
+                        realm_sub_id: self.realm_sub_id,
+                    })
+                || request.context().activation().as_bytes() != &self.activation
             {
                 return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
             }
@@ -442,21 +497,6 @@ mod tests {
             realm_sub_id,
             activation,
         })
-    }
-
-    fn capture_context() -> PendingQueueCaptureContext {
-        PendingQueueCaptureContext::try_new(
-            PendingGenerationLedgerKey::new(
-                network(),
-                AuthorityScope::Realm {
-                    realm_id: 7,
-                    realm_sub_id: 3,
-                },
-            ),
-            PendingGenerationActivationDigest::try_new([7; 32]).unwrap(),
-            PendingGenerationContext::try_from_legacy(17, 19).unwrap(),
-        )
-        .unwrap()
     }
 
     #[tokio::test]
@@ -565,7 +605,9 @@ mod tests {
             assert_eq!(attempt.realm_id(), 7);
             assert_eq!(attempt.realm_sub_id(), 3);
             let mut capture = attempt
-                .open_durable_capture(capture_context())
+                .open_durable_capture_for_processing(
+                    PendingGenerationContext::try_from_legacy(17, 19).unwrap(),
+                )
                 .await
                 .unwrap();
             assert!(capture.capture_next().await.unwrap().is_none());
@@ -613,6 +655,7 @@ mod tests {
             .nth(1)
             .unwrap();
         assert_eq!(attempt.matches("pub async fn open_durable_capture").count(), 1);
+        assert!(attempt.contains("open_durable_capture_for_processing"));
         for forbidden in [
             "prepare_and_verify",
             "finish_published",

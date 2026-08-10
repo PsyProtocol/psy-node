@@ -9,6 +9,7 @@ use std::{error::Error, fmt};
 
 use async_trait::async_trait;
 use psy_data::protocol::canonical_chain::NetworkId;
+use sha2::{Digest, Sha256};
 
 use crate::store::realm_processor_startup::{
     RealmProcessorStartupPermitDigest,
@@ -18,6 +19,151 @@ use super::recoverable_ephemeral::{
     PendingQueueCaptureCandidate, PendingQueueCaptureContext,
     PendingQueueGenerationBoundary,
 };
+
+const COMPLETE_GENERATION_DOMAIN: &[u8] =
+    b"psy/rollback/realm-processor-complete-generation/v1";
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RealmProcessorDurableGenerationDigest([u8; 32]);
+
+impl RealmProcessorDurableGenerationDigest {
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// One structurally verified artifact batch plus the exact business payloads
+/// decoded from its transport envelopes.
+///
+/// The public constructor is checked because the concrete storage adapter
+/// lives in another crate.  Possessing this value is not authority to mutate a
+/// gatherer: that method remains crate-private to the real Processor path.
+#[derive(Debug)]
+pub struct RealmProcessorDurableCapturedBatch {
+    candidate: PendingQueueCaptureCandidate,
+    business_items: Vec<Vec<u8>>,
+}
+
+impl RealmProcessorDurableCapturedBatch {
+    pub fn try_from_verified_envelopes(
+        candidate: PendingQueueCaptureCandidate,
+        business_items: Vec<Vec<u8>>,
+    ) -> Result<Self, RealmProcessorDurableCaptureError> {
+        if candidate.item_count() == 0
+            || candidate.item_count() != business_items.len() as u64
+            || business_items.iter().any(Vec::is_empty)
+        {
+            return Err(RealmProcessorDurableCaptureError::MalformedCompleteGeneration);
+        }
+        Ok(Self {
+            candidate,
+            business_items,
+        })
+    }
+
+    pub const fn candidate(&self) -> &PendingQueueCaptureCandidate {
+        &self.candidate
+    }
+
+    pub fn business_items(&self) -> &[Vec<u8>] {
+        &self.business_items
+    }
+
+    pub fn into_business_items(self) -> Vec<Vec<u8>> {
+        self.business_items
+    }
+}
+
+/// Full, ordered, restart-replayable input for one closed Realm source.
+///
+/// It is intentionally non-Clone.  The concrete adapter may return it only
+/// after exhaustive artifact reconstruction; a live `capture_next` result is
+/// insufficient because its NATS delivery may already have been ACKed.
+#[derive(Debug)]
+pub struct RealmProcessorDurableCapturedGeneration {
+    context: PendingQueueCaptureContext,
+    batches: Vec<RealmProcessorDurableCapturedBatch>,
+    boundary: PendingQueueGenerationBoundary,
+    item_count: u64,
+    digest: RealmProcessorDurableGenerationDigest,
+}
+
+impl RealmProcessorDurableCapturedGeneration {
+    pub fn try_from_exhaustive_readback(
+        context: PendingQueueCaptureContext,
+        batches: Vec<RealmProcessorDurableCapturedBatch>,
+        boundary: PendingQueueGenerationBoundary,
+    ) -> Result<Self, RealmProcessorDurableCaptureError> {
+        if boundary.context() != context
+            || batches.iter().any(|batch| {
+                batch.candidate().context() != context
+                    || batch.candidate().source_identity() != boundary.source_identity()
+            })
+        {
+            return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
+        }
+        let mut item_count = 0_u64;
+        let mut hasher = Sha256::new();
+        hasher.update(COMPLETE_GENERATION_DOMAIN);
+        hasher.update(context.digest().as_bytes());
+        hasher.update(boundary.digest().as_bytes());
+        hasher.update((batches.len() as u64).to_be_bytes());
+        for batch in &batches {
+            item_count = item_count
+                .checked_add(batch.candidate().item_count())
+                .ok_or(RealmProcessorDurableCaptureError::MalformedCompleteGeneration)?;
+            if batch.candidate().item_count() != batch.business_items().len() as u64 {
+                return Err(RealmProcessorDurableCaptureError::MalformedCompleteGeneration);
+            }
+            hasher.update(batch.candidate().batch_digest().as_bytes());
+            hasher.update(batch.candidate().payload_digest().as_bytes());
+            hasher.update(batch.candidate().item_count().to_be_bytes());
+            for item in batch.business_items() {
+                hasher.update((item.len() as u64).to_be_bytes());
+                hasher.update(item);
+            }
+        }
+        hasher.update(item_count.to_be_bytes());
+        let digest: [u8; 32] = hasher.finalize().into();
+        if digest == [0; 32] {
+            return Err(RealmProcessorDurableCaptureError::MalformedCompleteGeneration);
+        }
+        Ok(Self {
+            context,
+            batches,
+            boundary,
+            item_count,
+            digest: RealmProcessorDurableGenerationDigest(digest),
+        })
+    }
+
+    pub const fn context(&self) -> PendingQueueCaptureContext {
+        self.context
+    }
+
+    pub const fn boundary(&self) -> &PendingQueueGenerationBoundary {
+        &self.boundary
+    }
+
+    pub const fn item_count(&self) -> u64 {
+        self.item_count
+    }
+
+    pub const fn digest(&self) -> RealmProcessorDurableGenerationDigest {
+        self.digest
+    }
+
+    pub fn batches(&self) -> &[RealmProcessorDurableCapturedBatch] {
+        &self.batches
+    }
+
+    pub fn into_business_items(self) -> Vec<Vec<u8>> {
+        self.batches
+            .into_iter()
+            .flat_map(RealmProcessorDurableCapturedBatch::into_business_items)
+            .collect()
+    }
+}
 
 /// The only outcomes visible above the durable backend boundary.
 #[derive(Debug)]
@@ -36,6 +182,14 @@ pub trait RealmProcessorDurableCapturePort: Send {
     async fn capture_next(
         &mut self,
     ) -> Result<Option<RealmProcessorDurableCaptureOutcome>, RealmProcessorDurableCaptureError>;
+
+    /// Returns the complete ordered generation only after the exact source is
+    /// durably closed and every artifact fragment has been enumerated and read
+    /// back.  Implementations must make this idempotent across gather-task or
+    /// process response loss.
+    async fn replay_complete_generation(
+        &mut self,
+    ) -> Result<Option<RealmProcessorDurableCapturedGeneration>, RealmProcessorDurableCaptureError>;
 }
 
 /// Storage-owned factory installed by the same startup composition as the
@@ -131,6 +285,7 @@ impl SealedRealmProcessorDurableCaptureRequest {
 pub enum RealmProcessorDurableCaptureError {
     IdentityMismatch,
     RuntimeCapabilityMismatch,
+    MalformedCompleteGeneration,
     Backend(String),
 }
 

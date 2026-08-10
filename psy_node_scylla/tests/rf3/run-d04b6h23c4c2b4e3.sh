@@ -7,8 +7,11 @@ WORKSPACE_DIR="$(cd "${CRATE_DIR}/.." && pwd)"
 COMPOSE_FILE="${SCRIPT_DIR}/docker-compose.yml"
 REPORT_PATH="${PSY_D04B6H23C4C2B4E3_REPORT_OVERRIDE:-${WORKSPACE_DIR}/target/d04b6h23c4c2b4e3-jtmb-handler-ingress-rf3-report.json}"
 EXERCISE_DURABLE_CAPTURE="${PSY_D04B6H23C4C3A_RF3:-0}"
+EXERCISE_DURABLE_REPLAY="${PSY_D04B6H23C4C3B_RF3:-0}"
 EXPECTED_QUALIFICATION="H23C4C2B4E3_JTMB_HANDLER_INGRESS_RF3_PASSED"
-if [[ "${EXERCISE_DURABLE_CAPTURE}" == "1" ]]; then
+if [[ "${EXERCISE_DURABLE_REPLAY}" == "1" ]]; then
+  EXPECTED_QUALIFICATION="H23C4C3B_PROCESSOR_GATHERER_REPLAY_RF3_PASSED"
+elif [[ "${EXERCISE_DURABLE_CAPTURE}" == "1" ]]; then
   EXPECTED_QUALIFICATION="H23C4C3A_DURABLE_CAPTURE_OWNER_RF3_PASSED"
 fi
 NATS_DIR="$(mktemp -d /tmp/psy-h23e3-nats.XXXXXX)"
@@ -81,6 +84,7 @@ rm -f "${REPORT_PATH}"
 cd "${WORKSPACE_DIR}"
 PSY_D04B6H23C4C2B4E3_RF3=1 \
 PSY_D04B6H23C4C3A_RF3="${EXERCISE_DURABLE_CAPTURE}" \
+PSY_D04B6H23C4C3B_RF3="${EXERCISE_DURABLE_REPLAY}" \
 PSY_D04B6H23C4C2B4E3_COMPOSE_FILE="${COMPOSE_FILE}" \
 PSY_D04B6H23C4C2B4E3_REPORT_PATH="${REPORT_PATH}" \
 PSY_D04B6H23C4C2B4E3_NATS_URLS="nats://127.0.0.1:45322,nats://127.0.0.1:45323,nats://127.0.0.1:45324" \
@@ -94,7 +98,8 @@ cargo test -p psy_node_scylla \
 
 jq -e \
   --arg expected_qualification "${EXPECTED_QUALIFICATION}" \
-  --argjson exercise_durable_capture "${EXERCISE_DURABLE_CAPTURE}" '
+  --argjson exercise_durable_capture "${EXERCISE_DURABLE_CAPTURE}" \
+  --argjson exercise_durable_replay "${EXERCISE_DURABLE_REPLAY}" '
   .qualification == $expected_qualification
   and .scylla_replication_factor == 3
   and .configured_nats_servers == 3
@@ -117,16 +122,42 @@ jq -e \
   and .startup_restart_attested == true
   and .restart_retry_messages == 3
   and .dependency_explicit_timestamp_verified == true
-  and .repair_direct_one_tables == 17
+  and .repair_direct_one_tables == (if $exercise_durable_replay == 1 then 20 else 17 end)
   and .repair_direct_one_equal == true
+  and .semantic_handoff_integrated == false
+  and .generation_terminal_integrated == false
+  and .production_writer_integrated == false
+  and .authority_head_publish_integrated == false
+  and .full_node_restart_tested == false
+  and .h8_domains_closed == 0
   and (
-    if $exercise_durable_capture then
+    if $exercise_durable_capture == 1 then
       .durable_capture_owner_tested == true
       and .durable_capture_items == 3
       and .durable_capture_empty_poll_not_close == true
-      and .processor_gatherer_integrated == false
     else
       .durable_capture_owner_tested == false
+    end
+  )
+  and (
+    if $exercise_durable_replay == 1 then
+      .durable_generation_replayed == true
+      and .durable_generation_items == 3
+      and .durable_generation_digest_stable == true
+      and .gather_task_restart_replayed == true
+      and .processor_route_compiled == true
+      and .command_only_with_tree_compiled == true
+      and .processor_gatherer_integrated == true
+      and .processor_gatherer_rf3_runtime == false
+    else
+      .durable_generation_replayed == false
+      and .durable_generation_items == 0
+      and .durable_generation_digest_stable == false
+      and .gather_task_restart_replayed == false
+      and .processor_route_compiled == false
+      and .command_only_with_tree_compiled == false
+      and .processor_gatherer_integrated == false
+      and .processor_gatherer_rf3_runtime == false
     end
   )
 ' \

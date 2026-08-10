@@ -115,8 +115,8 @@ use psy_node_nats::{
     queue::NatsJetStreamClient,
     recoverable_assignment::PendingQueueSegmentLedgerBootstrap,
     recoverable_publish::{
-        PendingQueueGenerationBudgetContract, PendingQueuePublisherKind,
-        PendingQueueSourceQuota,
+        PendingQueueGenerationBudgetContract, PendingQueuePublishIntentId,
+        PendingQueuePublisherKind, PendingQueueSourceQuota,
     },
     recoverable_segment::{
         RecoverableNatsRetentionContract, RecoverableNatsSegmentId,
@@ -184,7 +184,20 @@ struct E3Report {
     durable_capture_owner_tested: bool,
     durable_capture_items: u64,
     durable_capture_empty_poll_not_close: bool,
+    durable_generation_replayed: bool,
+    durable_generation_items: u64,
+    durable_generation_digest_stable: bool,
+    gather_task_restart_replayed: bool,
+    processor_route_compiled: bool,
+    command_only_with_tree_compiled: bool,
     processor_gatherer_integrated: bool,
+    processor_gatherer_rf3_runtime: bool,
+    semantic_handoff_integrated: bool,
+    generation_terminal_integrated: bool,
+    production_writer_integrated: bool,
+    authority_head_publish_integrated: bool,
+    full_node_restart_tested: bool,
+    h8_domains_closed: u8,
     qualification: &'static str,
 }
 
@@ -209,6 +222,15 @@ const CONTROL_DIRECT_ONE_TABLES: &[&str] = &[
 const DATA_DIRECT_ONE_TABLES: &[&str] = &[
     "branch_exact_realm_user_update_dependency_fragment_v1",
     "branch_exact_pending_queue_publish_payload_fragment_v1",
+];
+
+const DURABLE_REPLAY_CONTROL_TABLES: &[&str] = &[
+    "branch_exact_pending_queue_artifact_header",
+    "branch_exact_pending_queue_consumer_gate_v1",
+];
+
+const DURABLE_REPLAY_DATA_TABLES: &[&str] = &[
+    "branch_exact_pending_queue_artifact_fragment",
 ];
 
 const HANDLER_MUTATION_CONTROL_TABLES: &[&str] = &[
@@ -275,14 +297,18 @@ async fn handler_mutation_snapshot(session: &Session) -> anyhow::Result<Physical
     .await
 }
 
-async fn direct_one_snapshot(ip: std::net::Ipv4Addr) -> anyhow::Result<PhysicalSnapshot> {
+async fn direct_one_snapshot(
+    ip: std::net::Ipv4Addr,
+    include_durable_replay: bool,
+) -> anyhow::Result<PhysicalSnapshot> {
     let session = fixture::connect(Some(ip), Consistency::One).await?;
-    snapshot_tables(
-        &session,
-        CONTROL_DIRECT_ONE_TABLES,
-        DATA_DIRECT_ONE_TABLES,
-    )
-    .await
+    let mut control = CONTROL_DIRECT_ONE_TABLES.to_vec();
+    let mut data = DATA_DIRECT_ONE_TABLES.to_vec();
+    if include_durable_replay {
+        control.extend_from_slice(DURABLE_REPLAY_CONTROL_TABLES);
+        data.extend_from_slice(DURABLE_REPLAY_DATA_TABLES);
+    }
+    snapshot_tables(&session, &control, &data).await
 }
 
 async fn dependency_timestamps_match_durable_claims(
@@ -873,6 +899,12 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
     )?;
     let exercise_durable_capture =
         std::env::var("PSY_D04B6H23C4C3A_RF3").as_deref() == Ok("1");
+    let exercise_durable_replay =
+        std::env::var("PSY_D04B6H23C4C3B_RF3").as_deref() == Ok("1");
+    ensure!(
+        !exercise_durable_replay || exercise_durable_capture,
+        "c3b replay Gate requires the c3a durable capture owner"
+    );
     let mut branch_exact_commit_owner = if exercise_durable_capture {
         let expectation = lineage.seal_attempt([0xC3; 32])?;
         let provider = Arc::new(
@@ -1111,6 +1143,10 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
     let restart_retry_messages = stream_messages(&jetstream, segment.stream_name()).await?;
     ensure!(restart_retry_messages == 3);
 
+    let mut durable_generation_replayed = false;
+    let mut durable_generation_items = 0_u64;
+    let mut durable_generation_digest_stable = false;
+    let mut gather_task_restart_replayed = false;
     let (durable_capture_items, durable_capture_empty_poll_not_close) =
         if let Some(owner) = branch_exact_commit_owner.as_mut() {
             // Edge always publishes to the gathering generation. Retire the
@@ -1156,26 +1192,142 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                     .await?,
             )?;
             ensure!(sealing.processing() == capture.processing());
+
+            if exercise_durable_replay {
+                // Publish the structural Seal through the same durable outbox
+                // and assignment used by the real Handler.  This makes the
+                // complete generation replayable after every JetStream
+                // delivery has been ACKed.
+                let close_receipt = pipeline_store
+                    .read_queue_close_exact::<PHash>(capture)
+                    .await?;
+                let publisher = Arc::new(
+                    nats.recoverable_pending_publisher(segment.clone()).await?,
+                );
+                let publish_store = ScyllaPendingQueuePublishStore::prepare(
+                    Arc::clone(&session),
+                    publisher,
+                    segment.clone(),
+                    PendingQueuePublishKeyspaces::new(
+                        control.clone(),
+                        PendingQueuePublishDataKeyspace::try_new(
+                            fixture::KEYSPACE,
+                        )?,
+                    ),
+                )
+                .await?;
+                publish_store
+                    .bootstrap_source(
+                        &assignment,
+                        PendingQueuePublisherKind::RealmUserUpdate,
+                    )
+                    .await?;
+                let seal_slot = publish_store
+                    .materialize_seal::<PHash>(
+                        &pipeline_store,
+                        &assignment,
+                        PendingQueuePublisherKind::RealmUserUpdate,
+                        PendingQueuePublishIntentId::try_new([0xC5; 32])?,
+                        &close_receipt,
+                    )
+                    .await?;
+                let seal = publish_store
+                    .bind_materialized(
+                        &assignment,
+                        PendingQueuePublisherKind::RealmUserUpdate,
+                        seal_slot,
+                    )
+                    .await?;
+                publish_store
+                    .publish_and_commit(&assignment, seal)
+                    .await?;
+                ensure!(
+                    stream_messages(&jetstream, segment.stream_name()).await? == 4,
+                    "durable close did not append exactly one Seal envelope"
+                );
+            }
+
             let iteration_gate = RealmProcessorIterationGate::controlled();
             let mut iteration = owner.begin_iteration(
                 iteration_gate.try_begin_iteration()?,
             )?;
-            let mut capture_owner = iteration.open_durable_capture(capture).await?;
-            let first = capture_owner
-                .capture_next()
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("durable capture returned no data"))?;
-            let item_count = match first {
-                RealmProcessorDurableCaptureOutcome::Data(candidate) => {
-                    candidate.item_count()
+            let mut capture_owner = iteration
+                .open_durable_capture_for_processing(capture.processing())
+                .await?;
+            let mut item_count = 0_u64;
+            let mut observed_close = false;
+            for _ in 0..8 {
+                let outcome = capture_owner.capture_next().await?;
+                match outcome {
+                    Some(RealmProcessorDurableCaptureOutcome::Data(candidate)) => {
+                        item_count = item_count
+                            .checked_add(candidate.item_count())
+                            .ok_or_else(|| anyhow::anyhow!("capture item overflow"))?;
+                    }
+                    Some(RealmProcessorDurableCaptureOutcome::Sealed { data, .. }) => {
+                        item_count = item_count
+                            .checked_add(
+                                data.as_ref()
+                                    .map_or(0, |candidate| candidate.item_count()),
+                            )
+                            .ok_or_else(|| anyhow::anyhow!("capture item overflow"))?;
+                        observed_close = true;
+                        break;
+                    }
+                    None if exercise_durable_replay => {
+                        sleep(Duration::from_millis(100)).await;
+                    }
+                    None => break,
                 }
-                RealmProcessorDurableCaptureOutcome::Sealed { data, .. } => data
-                    .as_ref()
-                    .map_or(0, |candidate| candidate.item_count()),
-            };
+            }
             ensure!(item_count == 3, "durable owner captured {item_count} items");
-            let empty = capture_owner.capture_next().await?.is_none();
-            ensure!(empty, "empty poll unexpectedly formed a capture outcome");
+            let empty = if exercise_durable_replay {
+                ensure!(observed_close, "durable owner did not observe source Seal");
+                let generation = capture_owner
+                    .replay_complete_generation()
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "closed durable source did not reconstruct a generation"
+                        )
+                    })?;
+                durable_generation_items = generation.item_count();
+                ensure!(durable_generation_items == 3);
+                let first_digest = generation.digest();
+                let first_items = generation.into_business_items();
+                durable_generation_replayed = true;
+
+                // Drop the capture/gather-task side and reconstruct solely
+                // from durable Scylla artifacts.  JetStream has already ACKed
+                // Data and Seal, so no redelivery can make this pass.
+                drop(capture_owner);
+                drop(iteration);
+                let mut restarted_iteration = owner.begin_iteration(
+                    iteration_gate.try_begin_iteration()?,
+                )?;
+                let mut restarted_capture = restarted_iteration
+                    .open_durable_capture_for_processing(capture.processing())
+                    .await?;
+                let replayed = restarted_capture
+                    .replay_complete_generation()
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "gather-task restart lost closed durable generation"
+                        )
+                    })?;
+                durable_generation_digest_stable =
+                    replayed.digest() == first_digest;
+                gather_task_restart_replayed = durable_generation_digest_stable
+                    && replayed.into_business_items() == first_items;
+                ensure!(durable_generation_digest_stable);
+                ensure!(gather_task_restart_replayed);
+                true
+            } else {
+                let empty = capture_owner.capture_next().await?.is_none();
+                ensure!(empty, "empty poll unexpectedly formed a capture outcome");
+                empty
+            };
             (item_count, empty)
         } else {
             (0, false)
@@ -1231,7 +1383,9 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
     }
     let repair_ms = repair_started.elapsed().as_millis();
     let replicas = futures::future::join_all(
-        fixture::NODE_IPS.map(direct_one_snapshot),
+        fixture::NODE_IPS.map(|ip| {
+            direct_one_snapshot(ip, exercise_durable_replay)
+        }),
     )
     .await
     .into_iter()
@@ -1244,6 +1398,12 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
     ensure!(
         replicas[0].0.len()
             == CONTROL_DIRECT_ONE_TABLES.len() + DATA_DIRECT_ONE_TABLES.len()
+                + if exercise_durable_replay {
+                    DURABLE_REPLAY_CONTROL_TABLES.len()
+                        + DURABLE_REPLAY_DATA_TABLES.len()
+                } else {
+                    0
+                }
     );
     let replica = &replicas[0];
     let control = fixture::control_keyspace();
@@ -1269,13 +1429,13 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
         replica.row_count(
             &control,
             "branch_exact_pending_queue_publish_intent_v1",
-        )? == 3
+        )? == if exercise_durable_replay { 4 } else { 3 }
     );
     ensure!(
         replica.row_count(
             &control,
             "branch_exact_pending_queue_publish_prepared_v1",
-        )? == 3
+        )? == if exercise_durable_replay { 4 } else { 3 }
     );
     ensure!(
         replica.row_count(
@@ -1322,8 +1482,26 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
         durable_capture_owner_tested: exercise_durable_capture,
         durable_capture_items,
         durable_capture_empty_poll_not_close,
-        processor_gatherer_integrated: false,
-        qualification: if exercise_durable_capture {
+        durable_generation_replayed,
+        durable_generation_items,
+        durable_generation_digest_stable,
+        gather_task_restart_replayed,
+        processor_route_compiled: exercise_durable_replay,
+        command_only_with_tree_compiled: exercise_durable_replay,
+        processor_gatherer_integrated: exercise_durable_replay,
+        // The real production types and private route compile and are covered
+        // by common-crate actor/Processor tests, but the serving guard remains
+        // intentionally closed; this RF=3 process does not run a full node.
+        processor_gatherer_rf3_runtime: false,
+        semantic_handoff_integrated: false,
+        generation_terminal_integrated: false,
+        production_writer_integrated: false,
+        authority_head_publish_integrated: false,
+        full_node_restart_tested: false,
+        h8_domains_closed: 0,
+        qualification: if exercise_durable_replay {
+            "H23C4C3B_PROCESSOR_GATHERER_REPLAY_RF3_PASSED"
+        } else if exercise_durable_capture {
             "H23C4C3A_DURABLE_CAPTURE_OWNER_RF3_PASSED"
         } else {
             "H23C4C2B4E3_JTMB_HANDLER_INGRESS_RF3_PASSED"

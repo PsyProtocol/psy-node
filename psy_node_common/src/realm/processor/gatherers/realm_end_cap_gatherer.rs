@@ -31,6 +31,7 @@ use psy_data::{
 use psy_io::tokio::{TokioFileLike, TokioLikeFileSystem};
 use psy_node_core::{
     psy_temp_db::StandardProcessorTempDBStoreBase,
+    queue::recoverable_ephemeral::PendingQueueCaptureContext,
     qblob::{
         data_views::{
             double_merkle_node_batch::QBlobDoubleMerkleNodeBatchDataView, single_merkle_node_batch::QBlobSingleMerkleNodeBatchDataView,
@@ -45,7 +46,10 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::{
     guta_planner::realm_guta_planner::{PlannedFutureEndCapJob, RealmGUTAPlanner},
-    queue::gatherer_builder::QueueGathererItemBuilderWithTree,
+    queue::{
+        gatherer::DurableTreeGathererConfig,
+        gatherer_builder::QueueGathererItemBuilderWithTree,
+    },
 };
 pub const REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_BYTES: [u8; 4] = [0x52, 0x47, 0x45, 0x31]; // 'RGE1' in ASCII
 pub const REALM_END_CAP_GATHERER_BACKUP_V1_MAGIC_U32: u32 = 0x31_45_47_52; // 'RGE1' in little-endian u32
@@ -401,6 +405,77 @@ impl<N: QNetworkTypesConfig, TempDatabase: StandardProcessorTempDBStoreBase<N::J
         }
     }
 }
+
+fn bind_processing_generation_state<Hash: Copy>(
+    mut exact: RealmProcessorCoreState<Hash>,
+    context: PendingQueueCaptureContext,
+    realm_id: u32,
+    realm_sub_id: u16,
+) -> anyhow::Result<RealmProcessorCoreState<Hash>> {
+    let processing = context.processing();
+    anyhow::ensure!(
+        context.key().network().chain_id() == exact.chain_id
+            && context.key().authority()
+                == (psy_data::protocol::chain_context::AuthorityScope::Realm {
+                    realm_id,
+                    realm_sub_id,
+                }),
+        "durable generation network/Realm does not match gatherer config"
+    );
+    anyhow::ensure!(
+        processing.pending_id().get() == exact.processing_unique_pending_id
+            && processing.proc_checkpoint_id().as_u128()
+                == exact.processing_proc_checkpoint_unique_id,
+        "durable generation does not match current processing pending context"
+    );
+
+    // The existing GUTA builder names its input fields `gathering_*`.
+    // Branch-exact replay is for the already-closed processing generation, so
+    // bind an isolated immutable snapshot rather than reading live gathering
+    // state or mutating the shared Processor status.
+    exact.gathering_checkpoint_id = exact.processing_checkpoint_id;
+    exact.gathering_unique_pending_id = exact.processing_unique_pending_id;
+    exact.gathering_proc_checkpoint_unique_id =
+        exact.processing_proc_checkpoint_unique_id;
+    exact.gathering_checkpoint_root = exact.processing_checkpoint_root;
+    exact.gathering_realm_start_root = exact.processing_realm_start_root;
+    Ok(exact)
+}
+
+impl<
+        N: QNetworkTypesConfig + 'static,
+        TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash> + 'static,
+        FileSystem: TokioLikeFileSystem + 'static,
+    > DurableTreeGathererConfig for RealmGUTAEndCapGathererConfig<N, TempDatabase, FileSystem>
+{
+    fn bind_complete_generation(
+        &self,
+        context: PendingQueueCaptureContext,
+    ) -> anyhow::Result<Self> {
+        let current = self
+            .status
+            .read()
+            .map_err(|_| anyhow::anyhow!("Realm gatherer status lock is poisoned"))?
+            .clone();
+        let exact = bind_processing_generation_state(
+            current,
+            context,
+            self.realm_id_u64 as u32,
+            self.realm_sub_id_u64 as u16,
+        )?;
+
+        let future_pending_end_cap_jobs = self
+            .future_pending_end_cap_jobs
+            .read()
+            .map_err(|_| anyhow::anyhow!("future end-cap job lock is poisoned"))?
+            .clone();
+        let mut bound = self.clone();
+        bound.status = Arc::new(RwLock::new(exact));
+        bound.future_pending_end_cap_jobs =
+            Arc::new(RwLock::new(future_pending_end_cap_jobs));
+        Ok(bound)
+    }
+}
 pub struct RealmGUTAEndCapGatherer<
     N: QNetworkTypesConfig,
     TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash>,
@@ -744,6 +819,95 @@ impl<
             db_output: RealmGUTAEndCapGathererOutputDatabase::<N::F, N::QHash>::get_empty(tree.get_root()),
             job_ids: vec![],
         })
+    }
+}
+
+#[cfg(test)]
+mod h23c4c3b_processing_binding_tests {
+    use parth_core::{node::realm_identifier::QRealmIdentifier, PHash};
+    use psy_core::constants::chain_id::PsyChainNetworkType;
+    use psy_data::protocol::{
+        canonical_chain::NetworkId, chain_context::AuthorityScope,
+    };
+    use psy_node_core::{
+        queue::recoverable_ephemeral::PendingQueueCaptureContext,
+        store::pending_generation_identity::{
+            PendingGenerationActivationDigest, PendingGenerationContext,
+            PendingGenerationLedgerKey,
+        },
+    };
+
+    use super::*;
+
+    fn context(pending: u64, proc_id: u128) -> PendingQueueCaptureContext {
+        PendingQueueCaptureContext::try_new(
+            PendingGenerationLedgerKey::new(
+                NetworkId::from_network_type(PsyChainNetworkType::LocalDevnet),
+                AuthorityScope::Realm {
+                    realm_id: 7,
+                    realm_sub_id: 3,
+                },
+            ),
+            PendingGenerationActivationDigest::try_new([9; 32]).unwrap(),
+            PendingGenerationContext::try_from_legacy(pending, proc_id).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn state() -> RealmProcessorCoreState<PHash> {
+        let network = NetworkId::from_network_type(PsyChainNetworkType::LocalDevnet);
+        let mut state = RealmProcessorCoreState::new_basic(
+            network.chain_id(),
+            QRealmIdentifier::new(7, 3),
+            5,
+            90,
+            31,
+            PHash::default(),
+            PHash::default(),
+        );
+        state.processing_checkpoint_id = 8;
+        state.processing_unique_pending_id = 101;
+        state.processing_proc_checkpoint_unique_id = 41;
+        state.gathering_checkpoint_id = 9;
+        state.gathering_unique_pending_id = 102;
+        state.gathering_proc_checkpoint_unique_id = 42;
+        state
+    }
+
+    #[test]
+    fn exact_processing_generation_is_isolated_from_live_gathering_state() {
+        let original = state();
+        let bound = bind_processing_generation_state(
+            original.clone(),
+            context(101, 41),
+            7,
+            3,
+        )
+        .unwrap();
+        assert_eq!(bound.gathering_checkpoint_id, 8);
+        assert_eq!(bound.gathering_unique_pending_id, 101);
+        assert_eq!(bound.gathering_proc_checkpoint_unique_id, 41);
+        assert_eq!(original.gathering_checkpoint_id, 9);
+        assert_eq!(original.gathering_unique_pending_id, 102);
+        assert_eq!(original.gathering_proc_checkpoint_unique_id, 42);
+    }
+
+    #[test]
+    fn stale_processing_or_wrong_realm_fails_before_builder_creation() {
+        assert!(bind_processing_generation_state(
+            state(),
+            context(100, 41),
+            7,
+            3,
+        )
+        .is_err());
+        assert!(bind_processing_generation_state(
+            state(),
+            context(101, 41),
+            8,
+            3,
+        )
+        .is_err());
     }
 }
 

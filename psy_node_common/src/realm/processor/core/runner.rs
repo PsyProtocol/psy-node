@@ -11,11 +11,24 @@ use psy_node_core::{
 };
 use tokio::time::sleep;
 
-use crate::realm::processor::core::PsyRealmProcessor;
+use crate::realm::processor::core::{
+    process_block::RealmOwnedIterationError, PsyRealmProcessor,
+};
 use crate::{
     queue::gatherer::{GathererBoundaryPhase, GathererPauseRequest},
     realm::processor::core::control::RealmProcessorPendingContext,
 };
+
+fn owned_iteration_consumes_slot(
+    should_process: bool,
+    result: &Result<(), RealmOwnedIterationError>,
+) -> bool {
+    should_process
+        && matches!(
+            result,
+            Ok(()) | Err(RealmOwnedIterationError::Process(_))
+        )
+}
 
 pub async fn run_realm_processor_loop<
     N: QNetworkTypesConfig<JobId = QProvingJobDataID>,
@@ -99,11 +112,20 @@ where
                 // This actor status is itself a command boundary: an earlier
                 // backend callback/update has finished before it returns.
                 let gatherer_status = processor.guta_queue_gatherer.status().await?;
+                let expected_gatherer_unique_id = if processor
+                    .normal_commit_owner
+                    .as_ref()
+                    .is_some_and(|owner| owner.is_branch_exact())
+                {
+                    processor.db.state.processing_proc_checkpoint_unique_id
+                } else {
+                    processor.db.state.gathering_proc_checkpoint_unique_id
+                };
                 if gatherer_status.phase() != GathererBoundaryPhase::Running {
                     anyhow::bail!("gatherer was not running at drain boundary");
                 }
                 if gatherer_status.unique_id()
-                    != processor.db.state.gathering_proc_checkpoint_unique_id
+                    != expected_gatherer_unique_id
                 {
                     anyhow::bail!(
                         "gatherer namespace differs from Realm gathering context"
@@ -119,7 +141,7 @@ where
                     .pause(GathererPauseRequest::new(
                         request,
                         gatherer_status.revision(),
-                        processor.db.state.gathering_proc_checkpoint_unique_id,
+                        expected_gatherer_unique_id,
                     ))
                     .await?;
                 let pending_context = RealmProcessorPendingContext::new(
@@ -159,7 +181,7 @@ where
             // catch-up state and process_block includes commit, authority
             // publication, final sync, and cleanup. A controlled drain lets
             // the current owner finish but rejects every subsequent iteration.
-            let _iteration_owner = match processor
+            let iteration_permit = match processor
                 .iteration_quiescence
                 .try_begin_iteration()
             {
@@ -179,45 +201,70 @@ where
                     continue;
                 }
             };
-            // tracing::debug!("[REALM] Sync and verify starting...");
-            let sync_result = processor.sync_and_verify().await;
-            match sync_result {
-                Ok(_) => {
-                    // tracing::debug!("[REALM] Sync and verify completed.");
-                }
-                Err(e) => {
-                    tracing::error!("[REALM] Sync and verify failed: {:?}, skipping block processing", e);
-                    sleep(std::time::Duration::from_secs(1)).await;
-                    continue;
-                }
-            }
-
             let now = std::time::SystemTime::now();
             let since_epoch = now.duration_since(std::time::UNIX_EPOCH).unwrap();
             let current_slot = since_epoch.as_millis() / 100;
-
-            if current_slot != last_slot && current_slot % 30 == 0 {
-                last_slot = current_slot;
-                let start_processing_at = std::time::Instant::now();
-
+            let should_process = current_slot != last_slot && current_slot % 30 == 0;
+            if should_process {
                 tracing::debug!("[REALM] Process block starting...");
-                let result = processor.process_block().await;
-                let elapsed = start_processing_at.elapsed();
-                let duration_ms = elapsed.as_millis();
-
-                match result {
-                    Ok(_) => {
-                        tracing::debug!("[REALM] Process block finished.");
-                        tracing::info!("Generated GUTA Realm update in {}ms at slot {}", duration_ms, current_slot);
-                    }
-                    Err(e) => {
-                        let error = format!("realm process_block failed at slot {}: {:#}", current_slot, e);
-                        processor.db.status.set_error(error.clone());
-                        tracing::error!("[REALM] Fatal error processing block: {:?}, took {}ms at slot {}; processor parked in Error state until manually restarted", e, duration_ms, current_slot);
-                        print_cf_log_indicator("PSY_REALM_PROCESSOR_ERROR", &format!("R{}_{}", realm_id, realm_sub_id));
-                    }
+            }
+            let started_at = std::time::Instant::now();
+            let iteration_result = processor
+                .run_owned_iteration(iteration_permit, should_process)
+                .await;
+            // Match the legacy retry boundary: begin/sync failures do not
+            // consume this slot, while entering process_block does, whether
+            // it succeeds or fails.
+            if owned_iteration_consumes_slot(should_process, &iteration_result) {
+                last_slot = current_slot;
+            }
+            match iteration_result {
+                Ok(()) if should_process => {
+                    let duration_ms = started_at.elapsed().as_millis();
+                    tracing::debug!("[REALM] Process block finished.");
+                    tracing::info!(
+                        "Generated GUTA Realm update in {}ms at slot {}",
+                        duration_ms,
+                        current_slot
+                    );
                 }
-            } else {
+                Ok(()) => {}
+                Err(RealmOwnedIterationError::Sync(error)) => {
+                    tracing::error!(
+                        "[REALM] Sync and verify failed: {:?}, skipping block processing",
+                        error
+                    );
+                    sleep(std::time::Duration::from_secs(1)).await;
+                }
+                Err(error) => {
+                    let duration_ms = started_at.elapsed().as_millis();
+                    let detail = match error {
+                        RealmOwnedIterationError::MissingCommitOwner => {
+                            "normal commit owner is already borrowed or missing".to_owned()
+                        }
+                        RealmOwnedIterationError::Begin(error)
+                        | RealmOwnedIterationError::Process(error) => {
+                            format!("{error:#}")
+                        }
+                        RealmOwnedIterationError::Sync(_) => unreachable!(),
+                    };
+                    let message = format!(
+                        "realm owned iteration failed at slot {}: {}",
+                        current_slot, detail
+                    );
+                    processor.db.status.set_error(message.clone());
+                    tracing::error!(
+                        "[REALM] Fatal error in owned iteration: {}, took {}ms; processor parked in Error state until manually restarted",
+                        message,
+                        duration_ms
+                    );
+                    print_cf_log_indicator(
+                        "PSY_REALM_PROCESSOR_ERROR",
+                        &format!("R{}_{}", realm_id, realm_sub_id),
+                    );
+                }
+            }
+            if !should_process && processor.db.status.should_run() {
                 sleep(std::time::Duration::from_millis(50)).await;
             }
         } else if processor.db.status.state() == crate::utils::processor_status::ProcessorState::Error {
@@ -235,21 +282,49 @@ where
 
 #[cfg(test)]
 mod h23a_tests {
+    use super::{owned_iteration_consumes_slot, RealmOwnedIterationError};
+
     #[test]
     fn real_loop_owner_lexically_covers_sync_and_process() {
-        let source = include_str!("runner.rs");
-        let owner_needle = concat!("let _iteration_", "owner");
-        let owner = source.find(owner_needle).unwrap();
-        let sync = source.find("processor.sync_and_verify().await").unwrap();
-        let process = source.find("processor.process_block().await").unwrap();
-        assert!(owner < sync && sync < process);
-        assert_eq!(source.matches(owner_needle).count(), 1);
+        let runner = include_str!("runner.rs");
+        let permit = runner.find("let iteration_permit").unwrap();
+        let routed = runner
+            .find(".run_owned_iteration(iteration_permit, should_process)")
+            .unwrap();
+        assert!(permit < routed);
+
+        let owned = include_str!("process_block.rs");
+        let owner = owned.find("let mut owner = self").unwrap();
+        let iteration = owned.find(".begin_iteration(permit)").unwrap();
+        let sync = owned.find("self.sync_and_verify()").unwrap();
+        let process = owned.find("self.process_block(&mut iteration)").unwrap();
+        let restore = owned.find("self.normal_commit_owner = Some(owner)").unwrap();
+        assert!(owner < iteration && iteration < sync && sync < process && process < restore);
     }
 
     #[test]
     fn common_crate_does_not_depend_on_scylla() {
         let cargo = include_str!("../../../../Cargo.toml");
         assert!(!cargo.contains("psy_node_scylla"));
+    }
+
+    #[test]
+    fn slot_consumption_preserves_legacy_sync_retry_boundary() {
+        let success: Result<(), RealmOwnedIterationError> = Ok(());
+        assert!(owned_iteration_consumes_slot(true, &success));
+        assert!(!owned_iteration_consumes_slot(false, &success));
+
+        let process = Err(RealmOwnedIterationError::Process(anyhow::anyhow!("process")));
+        assert!(owned_iteration_consumes_slot(true, &process));
+
+        let sync = Err(RealmOwnedIterationError::Sync(anyhow::anyhow!("sync")));
+        assert!(!owned_iteration_consumes_slot(true, &sync));
+
+        let begin = Err(RealmOwnedIterationError::Begin(anyhow::anyhow!("begin")));
+        assert!(!owned_iteration_consumes_slot(true, &begin));
+
+        let missing = Err(RealmOwnedIterationError::MissingCommitOwner);
+        assert!(!owned_iteration_consumes_slot(true, &missing));
     }
 }
 

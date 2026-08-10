@@ -97,19 +97,40 @@ where
             ));
         }
         */
-        let (guta_queue_gatherer, guta_join_handle) = EphemeralQueueGathererWithTree::new_with_status::<
-            GUTAUpdateQueue,
-            RealmGUTAEndCapGathererConfig<N, TempDatabase, FileSystem>,
-            N::QHash,
-            N::HasherBase,
-            RealmGUTAEndCapGatherer<N, TempDatabase, FileSystem>,
-        >(
-            db.guta_update_queue.clone(),
-            guta_create_builder_config,
-            db.guta_queue_key_status_manager.get_queue_key()?,
-            global_user_tree,
-            db.status.clone(),
-        );
+        let branch_exact = normal_commit_owner.is_branch_exact();
+        let mut gatherer_queue_key =
+            db.guta_queue_key_status_manager.get_queue_key()?;
+        let (guta_queue_gatherer, guta_join_handle) = if branch_exact {
+            // The branch-exact actor is command-only: it owns no subscriber
+            // and is bound to the already-closed processing generation.
+            gatherer_queue_key.unique_id =
+                db.state.processing_proc_checkpoint_unique_id;
+            EphemeralQueueGathererWithTree::new_durable_with_status::<
+                RealmGUTAEndCapGathererConfig<N, TempDatabase, FileSystem>,
+                N::QHash,
+                N::HasherBase,
+                RealmGUTAEndCapGatherer<N, TempDatabase, FileSystem>,
+            >(
+                guta_create_builder_config,
+                gatherer_queue_key,
+                global_user_tree,
+                db.status.clone(),
+            )
+        } else {
+            EphemeralQueueGathererWithTree::new_with_status::<
+                GUTAUpdateQueue,
+                RealmGUTAEndCapGathererConfig<N, TempDatabase, FileSystem>,
+                N::QHash,
+                N::HasherBase,
+                RealmGUTAEndCapGatherer<N, TempDatabase, FileSystem>,
+            >(
+                db.guta_update_queue.clone(),
+                guta_create_builder_config,
+                gatherer_queue_key,
+                global_user_tree,
+                db.status.clone(),
+            )
+        };
 
         Ok((
             Self {
@@ -117,7 +138,7 @@ where
                 guta_queue_gatherer: guta_queue_gatherer,
                 proof_worker_queue_max_time_ms: u64::MAX,
                 iteration_quiescence: Default::default(),
-                normal_commit_owner,
+                normal_commit_owner: Some(normal_commit_owner),
                 control_owner: None,
             },
             guta_join_handle,
