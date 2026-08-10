@@ -574,6 +574,102 @@ impl<F, Hash> RehydratedRealmUserUpdateArtifacts<F, Hash> {
 /// Decode and re-run every semantic artifact check after Scylla readback.
 /// The caller must obtain `verified_proof` from the concrete ZK verifier; a
 /// dependency digest alone is deliberately insufficient to authorize resume.
+pub fn verify_and_rehydrate_persisted_realm_user_update_artifacts<
+    F,
+    Hash,
+    Hasher,
+    Proof,
+    Verifier,
+>(
+    claim: &StoredRealmUserUpdateClaim<Hash>,
+    bundle: &RealmUserUpdateDependencyBundle,
+    global_user_tree_height: GlobalUserTreeHeight,
+    verifier: &Verifier,
+) -> Result<RehydratedRealmUserUpdateArtifacts<F, Hash>, RealmUserUpdateArtifactError>
+where
+    F: parth_core::felt::QFelt64,
+    Hash: Q256BitHash + QFHashBase<F> + std::fmt::Debug,
+    Hasher: FieldQHasher<F, Hash>,
+    Verifier: QZKProofVerifier<Hash, Proof>,
+{
+    let verified_request = verify_persisted_realm_user_update_request::<
+        F,
+        Hash,
+        Hasher,
+        Proof,
+        Verifier,
+    >(claim, bundle, global_user_tree_height, verifier)?;
+    rehydrate_realm_user_update_artifacts::<F, Hash, Hasher>(
+        claim,
+        bundle,
+        verified_request.proof,
+        global_user_tree_height,
+    )
+}
+
+/// Verify the canonical input/proof pair stored in the durable dependency
+/// bundle without constructing a publish request. This narrower boundary is
+/// valid while the claim is DependenciesPlanned and must run before the Ready
+/// CAS; publishing remains gated on Ready/Published by the rehydrate path.
+pub fn verify_persisted_realm_user_update_request<
+    F,
+    Hash,
+    Hasher,
+    Proof,
+    Verifier,
+>(
+    claim: &StoredRealmUserUpdateClaim<Hash>,
+    bundle: &RealmUserUpdateDependencyBundle,
+    global_user_tree_height: GlobalUserTreeHeight,
+    verifier: &Verifier,
+) -> Result<VerifiedRealmUserUpdateRequest<F, Hash>, RealmUserUpdateArtifactError>
+where
+    F: parth_core::felt::QFelt64,
+    Hash: Q256BitHash + QFHashBase<F> + std::fmt::Debug,
+    Hasher: FieldQHasher<F, Hash>,
+    Verifier: QZKProofVerifier<Hash, Proof>,
+{
+    if !matches!(
+        claim.phase(),
+        RealmUserUpdateClaimPhase::DependenciesPlanned
+            | RealmUserUpdateClaimPhase::DependenciesReady
+            | RealmUserUpdateClaimPhase::Published
+    ) || claim.dependency_digest() != Some(bundle.digest())
+    {
+        return Err(RealmUserUpdateArtifactError::DependencyMismatch);
+    }
+    let canonical_input = bundle
+        .component(RealmUserUpdateDependencyKind::CanonicalInput)
+        .bytes();
+    let input = SubmitUserEndCapNonProofInput::<F, Hash>::psy_ser_from_slice(
+        canonical_input,
+    )
+    .map_err(|error| RealmUserUpdateArtifactError::InputCodec(error.to_string()))?;
+    let verified_request = VerifiedRealmUserUpdateRequest::verify::<
+        Proof,
+        Verifier,
+        Hasher,
+    >(
+        &input,
+        bundle
+            .component(RealmUserUpdateDependencyKind::Proof)
+            .bytes()
+            .to_vec(),
+        global_user_tree_height,
+        verifier,
+    )?;
+    if verified_request.canonical_input() != canonical_input
+        || verified_request.request_digest() != claim.request_digest()
+        || verified_request.user_id() != claim.user_id()
+    {
+        return Err(RealmUserUpdateArtifactError::DependencyMismatch);
+    }
+    Ok(verified_request)
+}
+
+/// Rehydrate with an already verified proof receipt. New durable recovery
+/// code must prefer `verify_and_rehydrate_persisted_realm_user_update_artifacts`
+/// so the router, rather than its caller, owns proof revalidation.
 pub fn rehydrate_realm_user_update_artifacts<F, Hash, Hasher>(
     claim: &StoredRealmUserUpdateClaim<Hash>,
     bundle: &RealmUserUpdateDependencyBundle,
@@ -823,9 +919,63 @@ mod tests {
     use parth_core::{
         felt::FromPrimitiveValuesFelt,
         pgoldilocks::PoseidonHasher,
+        protocol::core_types::QZKProofPublicInputsHasherReader,
         utils::QPGenRandom,
         PHash, PF,
     };
+
+    #[derive(Clone, Copy, Debug)]
+    struct DeterministicEndCapVerifier;
+
+    impl QZKProofPublicInputsHasherReader<PHash, PHash>
+        for DeterministicEndCapVerifier
+    {
+        fn get_proof_public_inputs_hash(proof: &PHash) -> anyhow::Result<PHash> {
+            Ok(*proof)
+        }
+
+        fn try_proof_from_slice(bytes: &[u8]) -> anyhow::Result<PHash> {
+            PHash::from_slice_32bytes(bytes)
+        }
+    }
+
+    impl QZKProofVerifier<PHash, PHash> for DeterministicEndCapVerifier {
+        fn verify_zk_proof(
+            &self,
+            circuit_type: u32,
+            proof: &PHash,
+        ) -> anyhow::Result<PHash> {
+            if circuit_type != ProvingJobCircuitType::UserEndCap as u32 {
+                anyhow::bail!("unexpected circuit")
+            }
+            Ok(*proof)
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct RejectingEndCapVerifier;
+
+    impl QZKProofPublicInputsHasherReader<PHash, PHash>
+        for RejectingEndCapVerifier
+    {
+        fn get_proof_public_inputs_hash(proof: &PHash) -> anyhow::Result<PHash> {
+            Ok(*proof)
+        }
+
+        fn try_proof_from_slice(bytes: &[u8]) -> anyhow::Result<PHash> {
+            PHash::from_slice_32bytes(bytes)
+        }
+    }
+
+    impl QZKProofVerifier<PHash, PHash> for RejectingEndCapVerifier {
+        fn verify_zk_proof(
+            &self,
+            _circuit_type: u32,
+            _proof: &PHash,
+        ) -> anyhow::Result<PHash> {
+            anyhow::bail!("rejected persisted proof")
+        }
+    }
     use psy_data::{
         proof_input::guta::end_cap_input::SubmitUserEndCapNonProofInput,
         protocol::{
@@ -1024,12 +1174,12 @@ mod tests {
         let mut input = SubmitUserEndCapNonProofInput::<PF, PHash>::qp_rand_gen();
         input.core.new_user_leaf.user_id = PF::from_u64_value(11);
         input.core.state_transition.user_id = PF::from_u64_value(11);
-        let proof = vec![9; 32];
         let input_bytes = input.psy_ser_to_bytes_vec().unwrap();
         let tree_height = GlobalUserTreeHeight::try_new(32).unwrap();
         let proof_public_inputs_hash = input
             .core
             .get_proof_public_inputs_hash::<PoseidonHasher>(tree_height.get());
+        let proof = proof_public_inputs_hash.into_owned_32bytes().to_vec();
         assert_eq!(
             VerifiedRealmUserUpdateRequest::<PF, PHash>::from_canonical_and_receipt::<
                 PoseidonHasher,
@@ -1154,6 +1304,63 @@ mod tests {
             rehydrated.into_publish_request().payload(),
             artifacts.queue_payload(),
         );
+        let verified_from_durable =
+            verify_persisted_realm_user_update_request::<
+                PF,
+                PHash,
+                PoseidonHasher,
+                PHash,
+                DeterministicEndCapVerifier,
+            >(
+                &planned,
+                &bundle,
+                GlobalUserTreeHeight::try_new(32).unwrap(),
+                &DeterministicEndCapVerifier,
+            )
+            .unwrap();
+        assert_eq!(verified_from_durable.request_digest(), claim.request_digest());
+        assert_eq!(verified_from_durable.canonical_input(), artifacts.canonical_input());
+        assert!(verify_persisted_realm_user_update_request::<
+            PF,
+            PHash,
+            PoseidonHasher,
+            PHash,
+            DeterministicEndCapVerifier,
+        >(
+            &planned,
+            &bundle,
+            GlobalUserTreeHeight::try_new(31).unwrap(),
+            &DeterministicEndCapVerifier,
+        )
+        .is_err());
+        assert!(matches!(
+            verify_persisted_realm_user_update_request::<
+                PF,
+                PHash,
+                PoseidonHasher,
+                PHash,
+                RejectingEndCapVerifier,
+            >(
+                &planned,
+                &bundle,
+                GlobalUserTreeHeight::try_new(32).unwrap(),
+                &RejectingEndCapVerifier,
+            ),
+            Err(RealmUserUpdateArtifactError::ProofVerification(_)),
+        ));
+        assert!(verify_and_rehydrate_persisted_realm_user_update_artifacts::<
+            PF,
+            PHash,
+            PoseidonHasher,
+            PHash,
+            DeterministicEndCapVerifier,
+        >(
+            &ready,
+            &bundle,
+            GlobalUserTreeHeight::try_new(32).unwrap(),
+            &DeterministicEndCapVerifier,
+        )
+        .is_ok());
 
         let wrong_queue_item = PsyRealmUserUpdateQueueItem::new(
             psy_core::job::job_id::QProvingJobDataID::try_get_realm_edge_proof_store_output_proof_id_for_end_cap(11, 32, 9).unwrap(),
@@ -1197,5 +1404,8 @@ mod tests {
         assert_eq!(ProvingJobCircuitType::UserEndCap as u32, 6);
         assert!(!production.contains("pub fn try_new(\n        bytes: Vec<u8>,\n        expected_public_inputs_hash"));
         assert!(production.contains("verify_zk_proof_from_slice_check_public_inputs_hash"));
+        let module_source = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+        assert!(module_source.contains("verify_persisted_realm_user_update_request"));
+        assert!(module_source.contains("VerifiedRealmUserUpdateRequest::verify::<"));
     }
 }

@@ -1,7 +1,7 @@
 //! Immutable, driver-independent artifacts required to resume one durable
 //! Realm user update after an Edge crash.
 
-use std::{error::Error, fmt};
+use std::{collections::BTreeMap, error::Error, fmt};
 
 use parth_core::protocol::core_types::Q256BitHash;
 use sha2::{Digest, Sha256};
@@ -330,6 +330,58 @@ pub struct RealmUserUpdateDependencyFragment {
     payload_digest: [u8; 32],
 }
 
+/// Deterministic repair plan for an interrupted immutable-fragment write.
+/// Only an exact subset of the expected bundle is repairable; any duplicate,
+/// extra coordinate, or different full row fails closed instead of being
+/// overwritten. The constructor is intentionally the classifier below.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RealmUserUpdateDependencyRecoveryPlan {
+    missing: Vec<RealmUserUpdateDependencyFragment>,
+}
+
+impl RealmUserUpdateDependencyRecoveryPlan {
+    pub fn is_complete(&self) -> bool { self.missing.is_empty() }
+
+    pub fn missing_fragments(&self) -> &[RealmUserUpdateDependencyFragment] {
+        &self.missing
+    }
+}
+
+pub fn plan_realm_user_update_dependency_recovery(
+    expected: &RealmUserUpdateDependencyBundle,
+    observed: Vec<RealmUserUpdateDependencyFragment>,
+) -> Result<RealmUserUpdateDependencyRecoveryPlan, RealmUserUpdateDependencyError> {
+    let expected_fragments = expected.fragments();
+    let expected_by_coordinate = expected_fragments
+        .iter()
+        .map(|fragment| ((fragment.kind(), fragment.index()), fragment))
+        .collect::<BTreeMap<_, _>>();
+    let mut observed_by_coordinate = BTreeMap::new();
+    for fragment in observed {
+        let coordinate = (fragment.kind(), fragment.index());
+        if observed_by_coordinate
+            .insert(coordinate, fragment.clone())
+            .is_some()
+        {
+            return Err(RealmUserUpdateDependencyError::DuplicateFragment);
+        }
+        let Some(expected_fragment) = expected_by_coordinate.get(&coordinate)
+        else {
+            return Err(RealmUserUpdateDependencyError::UnexpectedFragment);
+        };
+        if **expected_fragment != fragment {
+            return Err(RealmUserUpdateDependencyError::ConflictingFragment);
+        }
+    }
+    let missing = expected_fragments
+        .into_iter()
+        .filter(|fragment| {
+            !observed_by_coordinate.contains_key(&(fragment.kind(), fragment.index()))
+        })
+        .collect();
+    Ok(RealmUserUpdateDependencyRecoveryPlan { missing })
+}
+
 impl RealmUserUpdateDependencyFragment {
     pub const fn kind(&self) -> RealmUserUpdateDependencyKind { self.kind }
     pub const fn index(&self) -> u32 { self.index }
@@ -449,6 +501,9 @@ pub enum RealmUserUpdateDependencyError {
     MalformedFragment,
     FragmentSetMismatch,
     DigestMismatch,
+    DuplicateFragment,
+    UnexpectedFragment,
+    ConflictingFragment,
 }
 
 impl fmt::Display for RealmUserUpdateDependencyError {
@@ -502,6 +557,61 @@ mod tests {
         proof[0].payload[0] ^= 1;
         assert!(reconstruct_component(RealmUserUpdateDependencyKind::Proof, proof).is_err());
         assert!(RealmUserUpdateDependencyBundle::reconstruct(bundle.claim_slot(), *bundle.request_digest(), bundle.stable_status(), bundle.created_at_seconds(), Vec::new(), bundle.digest()).is_err());
+    }
+
+    #[test]
+    fn interrupted_fragment_recovery_only_fills_an_exact_missing_subset() {
+        let input = vec![1; PENDING_QUEUE_ARTIFACT_FRAGMENT_BYTES + 3];
+        let proof = vec![2; 17];
+        let bundle = RealmUserUpdateDependencyBundle::try_new(
+            &claim(&input, &proof),
+            input,
+            proof,
+            vec![3; 19],
+            vec![4; 23],
+            vec![5; 29],
+        )
+        .unwrap();
+        let expected = bundle.fragments();
+        let observed = expected
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != 1)
+            .map(|(_, fragment)| fragment.clone())
+            .rev()
+            .collect();
+        let plan = plan_realm_user_update_dependency_recovery(&bundle, observed)
+            .unwrap();
+        assert!(!plan.is_complete());
+        assert_eq!(plan.missing_fragments(), &expected[1..2]);
+        assert!(plan_realm_user_update_dependency_recovery(
+            &bundle,
+            expected.clone(),
+        )
+        .unwrap()
+        .is_complete());
+
+        let mut duplicate = expected.clone();
+        duplicate.push(expected[0].clone());
+        assert_eq!(
+            plan_realm_user_update_dependency_recovery(&bundle, duplicate),
+            Err(RealmUserUpdateDependencyError::DuplicateFragment),
+        );
+
+        let mut conflicting = expected.clone();
+        conflicting[0].payload[0] ^= 1;
+        conflicting[0].payload_digest = Sha256::digest(&conflicting[0].payload).into();
+        assert_eq!(
+            plan_realm_user_update_dependency_recovery(&bundle, conflicting),
+            Err(RealmUserUpdateDependencyError::ConflictingFragment),
+        );
+
+        let mut unexpected = expected;
+        unexpected[0].index = unexpected[0].count;
+        assert_eq!(
+            plan_realm_user_update_dependency_recovery(&bundle, unexpected),
+            Err(RealmUserUpdateDependencyError::UnexpectedFragment),
+        );
     }
 
     #[test]
