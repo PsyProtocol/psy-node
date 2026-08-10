@@ -44,7 +44,7 @@ psy_dummy_prover = { workspace = true }
 pser = { workspace = true }
 pderive = { workspace = true }
 psy_io = { workspace = true }
+psy_node_core = { workspace = true }
 
 [dev-dependencies]
-psy_node_core = { workspace = true }
 psy_node_store_memory = { workspace = true }
