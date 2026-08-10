@@ -9,6 +9,7 @@
 
 use std::{error::Error, fmt, sync::Arc};
 
+use async_trait::async_trait;
 use psy_data::protocol::{canonical_chain::NetworkId, chain_context::AuthorityScope};
 use psy_node_core::store::pending_generation_identity::PendingGenerationLedgerKey;
 use psy_node_nats::{
@@ -37,6 +38,9 @@ use scylla::{
 use sha2::{Digest, Sha256};
 
 use super::{
+    pending_queue_publish_store::{
+        PendingQueuePublishStoreError, PendingQueuePublishTransport,
+    },
     pending_queue_segment_ledger::{
         PendingQueueSegmentAssignmentRouteReceipt,
         PendingQueueSegmentRotationActivatedReceipt,
@@ -582,6 +586,26 @@ impl AssignmentBoundRecoverablePendingQueuePublisher {
             .map_err(ledger)?;
         self.store.revalidate_provisioned(&self.provisioned).await?;
         Ok(outcome)
+    }
+}
+
+#[async_trait]
+impl PendingQueuePublishTransport for AssignmentBoundRecoverablePendingQueuePublisher {
+    fn segment(&self) -> &RecoverableNatsStreamSegment {
+        self.segment()
+    }
+
+    fn assignment_digest(&self) -> Option<PendingQueueSegmentAssignmentDigest> {
+        Some(self.assignment_digest())
+    }
+
+    async fn publish(
+        &self,
+        envelope: &PendingQueuePublishEnvelope,
+    ) -> Result<RecoverableNatsPublishOutcome, PendingQueuePublishStoreError> {
+        AssignmentBoundRecoverablePendingQueuePublisher::publish(self, envelope)
+            .await
+            .map_err(|error| PendingQueuePublishStoreError::Route(error.to_string()))
     }
 }
 

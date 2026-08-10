@@ -33,10 +33,14 @@ use psy_node_core::{
     },
 };
 use psy_node_nats::{
+    queue::NatsJetStreamClient,
     recoverable_assignment::PendingQueueSegmentLedgerKey,
     recoverable_publish::{
         PendingQueuePublishIntentId, PendingQueuePublisherKind,
     },
+};
+#[cfg(test)]
+use psy_node_nats::{
     recoverable_segment::RecoverableNatsStreamSegment,
     recoverable_transport::RecoverablePendingQueueNatsPublisher,
 };
@@ -45,8 +49,14 @@ use scylla::client::session::Session;
 use super::{
     BranchExactDeploymentNoTabletKeyspace, PendingQueuePublishDataKeyspace,
     PendingQueuePublishKeyspaces, PendingQueuePublishStoreError,
-    PendingQueueSidecarReady, ScyllaPendingPipelineStore,
-    ScyllaPendingQueuePublishStore, ScyllaPendingQueueSegmentLedgerStore,
+    PendingQueueSegmentAssignmentReceipt, PendingQueueSidecarReady,
+    ScyllaPendingPipelineStore,
+    ScyllaPendingQueuePublishStore, ScyllaPendingQueuePublishStoreFactory,
+    ScyllaPendingQueueSegmentLedgerStore,
+};
+use super::pending_queue_stream_provision::{
+    ScyllaPendingQueueAssignmentPublisherResolver,
+    ScyllaPendingQueueStreamProvisionStore,
 };
 
 const MAX_BIND_ATTEMPTS: usize = 64;
@@ -56,11 +66,20 @@ pub struct ScyllaRealmEdgeDurablePublisher<F, Hash> {
     authority: AuthorityScope,
     setup_ready_digest: [u8; 32],
     pipeline: ScyllaPendingPipelineStore,
-    ledger: ScyllaPendingQueueSegmentLedgerStore,
+    ledger: Arc<ScyllaPendingQueueSegmentLedgerStore>,
     ledger_key: PendingQueueSegmentLedgerKey,
-    publish: ScyllaPendingQueuePublishStore,
-    segment: RecoverableNatsStreamSegment,
+    publish_factory: Arc<ScyllaPendingQueuePublishStoreFactory>,
+    route: ScyllaRealmEdgePublishRoute,
     _types: PhantomData<(F, Hash)>,
+}
+
+enum ScyllaRealmEdgePublishRoute {
+    AssignmentBound(ScyllaPendingQueueAssignmentPublisherResolver),
+    #[cfg(test)]
+    Fixed {
+        nats: Arc<RecoverablePendingQueueNatsPublisher>,
+        segment: RecoverableNatsStreamSegment,
+    },
 }
 
 /// Authorizing publication evidence. Unlike the public DTO, this type can
@@ -86,8 +105,7 @@ impl<F: QFelt64, Hash: Q256BitHash> ScyllaRealmEdgeDurablePublisher<F, Hash> {
         network: NetworkId,
         authority: AuthorityScope,
         ready: Arc<PendingQueueSidecarReady>,
-        nats: Arc<RecoverablePendingQueueNatsPublisher>,
-        segment: RecoverableNatsStreamSegment,
+        nats: Arc<NatsJetStreamClient>,
     ) -> Result<Self, RealmUserUpdatePublishError> {
         let AuthorityScope::Realm { .. } = authority else {
             return Err(RealmUserUpdatePublishError::AuthorityMismatch);
@@ -96,15 +114,6 @@ impl<F: QFelt64, Hash: Q256BitHash> ScyllaRealmEdgeDurablePublisher<F, Hash> {
             return Err(RealmUserUpdatePublishError::AuthorityMismatch);
         }
         let generation_key = PendingGenerationLedgerKey::new(network, authority);
-        if segment.generation_key() != generation_key {
-            return Err(RealmUserUpdatePublishError::NetworkMismatch);
-        }
-        if nats.segment() != &segment {
-            return Err(RealmUserUpdatePublishError::NotReady(
-                "NATS publisher segment does not match the configured assignment segment"
-                    .to_owned(),
-            ));
-        }
         let keyspaces = ready
             .view()
             .verified()
@@ -124,22 +133,29 @@ impl<F: QFelt64, Hash: Q256BitHash> ScyllaRealmEdgeDurablePublisher<F, Hash> {
         );
         let ledger_key = PendingQueueSegmentLedgerKey::try_new(
             generation_key,
-            segment.base_namespace().to_owned(),
+            nats.base_namespace().to_owned(),
         )
         .map_err(|error| RealmUserUpdatePublishError::Storage(error.to_string()))?;
         let pipeline = ScyllaPendingPipelineStore::prepare(session.clone(), control.clone())
             .await
             .map_err(|error| RealmUserUpdatePublishError::Storage(error.to_string()))?;
-        let ledger = ScyllaPendingQueueSegmentLedgerStore::prepare(
+        let ledger = Arc::new(ScyllaPendingQueueSegmentLedgerStore::prepare(
             session.clone(),
-            control,
+            control.clone(),
         )
         .await
-        .map_err(|error| RealmUserUpdatePublishError::Storage(error.to_string()))?;
-        let publish = ScyllaPendingQueuePublishStore::prepare(
+        .map_err(|error| RealmUserUpdatePublishError::Storage(error.to_string()))?);
+        let provision = Arc::new(
+            ScyllaPendingQueueStreamProvisionStore::prepare_authorized(
+                session.clone(),
+                ready.as_ref(),
+                Arc::clone(&ledger),
+            )
+            .await
+            .map_err(|error| RealmUserUpdatePublishError::Storage(error.to_string()))?,
+        );
+        let publish_factory = ScyllaPendingQueuePublishStore::prepare_factory(
             session,
-            nats,
-            segment.clone(),
             publish_keyspaces,
         )
         .await
@@ -151,14 +167,129 @@ impl<F: QFelt64, Hash: Q256BitHash> ScyllaRealmEdgeDurablePublisher<F, Hash> {
             pipeline,
             ledger,
             ledger_key,
-            publish,
-            segment,
+            publish_factory,
+            route: ScyllaRealmEdgePublishRoute::AssignmentBound(
+                provision.assignment_resolver(nats),
+            ),
+            _types: PhantomData,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn prepare_fixed_for_test(
+        session: Arc<Session>,
+        network: NetworkId,
+        authority: AuthorityScope,
+        ready: Arc<PendingQueueSidecarReady>,
+        nats: Arc<RecoverablePendingQueueNatsPublisher>,
+        segment: RecoverableNatsStreamSegment,
+    ) -> Result<Self, RealmUserUpdatePublishError> {
+        let AuthorityScope::Realm { .. } = authority else {
+            return Err(RealmUserUpdatePublishError::AuthorityMismatch);
+        };
+        if ready.view().authority() != authority {
+            return Err(RealmUserUpdatePublishError::AuthorityMismatch);
+        }
+        let generation_key = PendingGenerationLedgerKey::new(network, authority);
+        if segment.generation_key() != generation_key || nats.segment() != &segment {
+            return Err(RealmUserUpdatePublishError::NetworkMismatch);
+        }
+        let keyspaces = ready.view().verified().stored().keyspaces().clone();
+        let control = BranchExactDeploymentNoTabletKeyspace::try_new(
+            keyspaces.control().as_str().to_owned(),
+        )
+        .map_err(|error| RealmUserUpdatePublishError::NotReady(error.to_string()))?;
+        let publish_keyspaces = PendingQueuePublishKeyspaces::new(
+            control.clone(),
+            PendingQueuePublishDataKeyspace::try_new(
+                keyspaces.data().as_str().to_owned(),
+            )
+            .map_err(storage)?,
+        );
+        let ledger_key = PendingQueueSegmentLedgerKey::try_new(
+            generation_key,
+            segment.base_namespace().to_owned(),
+        )
+        .map_err(|error| RealmUserUpdatePublishError::Storage(error.to_string()))?;
+        let pipeline = ScyllaPendingPipelineStore::prepare(
+            session.clone(),
+            control.clone(),
+        )
+        .await
+        .map_err(|error| RealmUserUpdatePublishError::Storage(error.to_string()))?;
+        let ledger = Arc::new(
+            ScyllaPendingQueueSegmentLedgerStore::prepare(
+                session.clone(),
+                control,
+            )
+            .await
+            .map_err(|error| RealmUserUpdatePublishError::Storage(error.to_string()))?,
+        );
+        let publish_factory = ScyllaPendingQueuePublishStore::prepare_factory(
+            session,
+            publish_keyspaces,
+        )
+        .await
+        .map_err(storage)?;
+        Ok(Self {
+            network,
+            authority,
+            setup_ready_digest: *ready.view().ready_digest(),
+            pipeline,
+            ledger,
+            ledger_key,
+            publish_factory,
+            route: ScyllaRealmEdgePublishRoute::Fixed { nats, segment },
             _types: PhantomData,
         })
     }
 
     pub const fn setup_ready_digest(&self) -> &[u8; 32] {
         &self.setup_ready_digest
+    }
+
+    async fn resolve_publish_store(
+        &self,
+        capture: PendingQueueCaptureContext,
+        expected: &PendingQueueSegmentAssignmentReceipt,
+    ) -> Result<ScyllaPendingQueuePublishStore, RealmUserUpdatePublishError> {
+        match &self.route {
+            ScyllaRealmEdgePublishRoute::AssignmentBound(resolver) => {
+                let bound = resolver
+                    .resolve(&self.ledger_key, capture)
+                    .await
+                    .map_err(|error| {
+                        RealmUserUpdatePublishError::Storage(format!(
+                            "assignment-bound route: {error}"
+                        ))
+                    })?;
+                if bound.assignment_digest()
+                    != expected.assignment().digest()
+                    || bound.segment().segment_id()
+                        != expected.assignment().segment_id()
+                    || bound.segment().digest()
+                        != expected.assignment().contract_digest()
+                {
+                    return Err(RealmUserUpdatePublishError::GenerationMismatch);
+                }
+                ScyllaPendingQueuePublishStore::bind_assignment_transport(
+                    Arc::clone(&self.publish_factory),
+                    Arc::new(bound),
+                )
+                .map_err(storage)
+            }
+            #[cfg(test)]
+            ScyllaRealmEdgePublishRoute::Fixed { nats, segment } => {
+                if expected.assignment().segment_id() != segment.segment_id()
+                    || expected.assignment().contract_digest() != segment.digest()
+                {
+                    return Err(RealmUserUpdatePublishError::GenerationMismatch);
+                }
+                self.publish_factory
+                    .bind(Arc::clone(nats), segment.clone())
+                    .map_err(storage)
+            }
+        }
     }
 
     async fn admit_exact(
@@ -191,13 +322,10 @@ impl<F: QFelt64, Hash: Q256BitHash> ScyllaRealmEdgeDurablePublisher<F, Hash> {
             .read_assignment_exact(&self.ledger_key, capture)
             .await
             .map_err(|error| RealmUserUpdatePublishError::NotReady(error.to_string()))?;
-        if assignment.assignment().segment_id() != self.segment.segment_id()
-            || assignment.assignment().contract_digest() != self.segment.digest()
-        {
-            return Err(RealmUserUpdatePublishError::NotReady(
-                "segment assignment does not match configured publisher".to_owned(),
-            ));
-        }
+        // Admission is granted only after the immutable assignment resolves
+        // to an already-Provisioned server instance. This does not create or
+        // select the current active segment.
+        self.resolve_publish_store(capture, &assignment).await?;
         RealmUserUpdatePublishAdmission::try_from_pipeline(
             PendingContext::new(
                 *pipeline.frontier().chain(),
@@ -301,15 +429,9 @@ impl<F: QFelt64, Hash: Q256BitHash> ScyllaRealmEdgeDurablePublisher<F, Hash> {
             .read_assignment_exact(&self.ledger_key, capture)
             .await
             .map_err(|error| RealmUserUpdatePublishError::NotReady(error.to_string()))?;
-        if assignment.assignment().segment_id() != self.segment.segment_id()
-            || assignment.assignment().contract_digest() != self.segment.digest()
-        {
-            return Err(RealmUserUpdatePublishError::NotReady(
-                "segment assignment does not match configured publisher".to_owned(),
-            ));
-        }
+        let publish = self.resolve_publish_store(capture, &assignment).await?;
         let kind = PendingQueuePublisherKind::RealmUserUpdate;
-        self.publish
+        publish
             .bootstrap_source(&assignment, kind)
             .await
             .map_err(|error| storage_at("bootstrap source", error))?;
@@ -317,8 +439,7 @@ impl<F: QFelt64, Hash: Q256BitHash> ScyllaRealmEdgeDurablePublisher<F, Hash> {
             *request.intent_id().as_bytes(),
         )
         .map_err(|error| RealmUserUpdatePublishError::Storage(error.to_string()))?;
-        let intent_slot = self
-            .publish
+        let intent_slot = publish
             .materialize_data(&assignment, kind, intent_id, request.payload())
             .await
             .map_err(|error| storage_at("materialize data", error))?;
@@ -342,8 +463,7 @@ impl<F: QFelt64, Hash: Q256BitHash> ScyllaRealmEdgeDurablePublisher<F, Hash> {
             let mut attempt = 0;
             loop {
                 attempt += 1;
-                match self
-                    .publish
+                match publish
                     .bind_materialized(&assignment, kind, intent_slot)
                     .await
                 {
@@ -357,8 +477,7 @@ impl<F: QFelt64, Hash: Q256BitHash> ScyllaRealmEdgeDurablePublisher<F, Hash> {
                 }
             }
         };
-        let committed = self
-            .publish
+        let committed = publish
             .publish_and_commit(&assignment, permit)
             .await
             .map_err(|error| storage_at("publish and commit", error))?;
@@ -388,24 +507,18 @@ impl<F: QFelt64, Hash: Q256BitHash> ScyllaRealmEdgeDurablePublisher<F, Hash> {
         if request.pending().authority() != self.authority {
             return Err(RealmUserUpdatePublishError::AuthorityMismatch);
         }
+        let capture = request.admission().capture();
         let assignment = self
             .ledger
-            .read_assignment_exact(&self.ledger_key, request.admission().capture())
+            .read_assignment_exact(&self.ledger_key, capture)
             .await
             .map_err(|error| RealmUserUpdatePublishError::NotReady(error.to_string()))?;
-        if assignment.assignment().segment_id() != self.segment.segment_id()
-            || assignment.assignment().contract_digest() != self.segment.digest()
-        {
-            return Err(RealmUserUpdatePublishError::NotReady(
-                "historical assignment does not match configured publisher".to_owned(),
-            ));
-        }
+        let publish = self.resolve_publish_store(capture, &assignment).await?;
         let intent_id = PendingQueuePublishIntentId::try_new(
             *request.intent_id().as_bytes(),
         )
         .map_err(|error| RealmUserUpdatePublishError::Storage(error.to_string()))?;
-        let committed = self
-            .publish
+        let committed = publish
             .observe_committed_data(
                 &assignment,
                 PendingQueuePublisherKind::RealmUserUpdate,
@@ -481,9 +594,21 @@ mod tests {
         let source = include_str!("realm_edge_durable_publisher.rs");
         assert!(source.contains("pipeline.gathering() != request.generation()"));
         assert!(source.contains("read_assignment_exact"));
+        assert!(source.contains("ScyllaRealmEdgePublishRoute::AssignmentBound"));
+        assert!(source.contains("resolver.resolve(&self.ledger_key, capture)"));
+        assert!(source.matches("resolve_publish_store(").count() >= 4);
         assert!(source.contains("materialize_data"));
         assert!(source.contains("bind_materialized"));
         assert!(source.contains("publish_and_commit"));
+        let fields = source
+            .split("pub struct ScyllaRealmEdgeDurablePublisher")
+            .nth(1)
+            .unwrap()
+            .split("enum ScyllaRealmEdgePublishRoute")
+            .next()
+            .unwrap();
+        assert!(!fields.contains("segment:"));
+        assert!(!fields.contains("RecoverablePendingQueueNatsPublisher"));
         for forbidden in [
             ["reserve", "_generation("].concat(),
             ["publish_ephemeral", "_queue"].concat(),

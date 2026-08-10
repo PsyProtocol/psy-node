@@ -62,6 +62,10 @@ use psy_node_core::{
     store::typed::UserId,
 };
 use psy_node_nats::{
+    queue::NatsJetStreamClient,
+};
+#[cfg(test)]
+use psy_node_nats::{
     recoverable_segment::RecoverableNatsStreamSegment,
     recoverable_transport::RecoverablePendingQueueNatsPublisher,
 };
@@ -140,8 +144,82 @@ where
         verifier_profiles: Arc<RealmUserUpdateVerifierRegistry<Verifier>>,
         authority_observations: Arc<dyn RealmAuthorityObservationReader<Hash>>,
         ready: Arc<PendingQueueSidecarReady>,
+        nats: Arc<NatsJetStreamClient>,
+    ) -> Result<Self, RealmUserUpdateRouterError> {
+        let publisher = ScyllaRealmEdgeDurablePublisher::prepare(
+            session.clone(),
+            network,
+            authority,
+            Arc::clone(&ready),
+            nats,
+        )
+        .await
+        .map_err(router)?;
+        Self::prepare_with_publisher(
+            session,
+            network,
+            authority,
+            global_user_tree_height,
+            realm_user_tree_height,
+            active_verifier_profile,
+            verifier_profiles,
+            authority_observations,
+            ready,
+            publisher,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn prepare_fixed_for_test(
+        session: Arc<Session>,
+        network: NetworkId,
+        authority: AuthorityScope,
+        global_user_tree_height: GlobalUserTreeHeight,
+        realm_user_tree_height: u8,
+        active_verifier_profile: RealmUserUpdateVerifierProfileId,
+        verifier_profiles: Arc<RealmUserUpdateVerifierRegistry<Verifier>>,
+        authority_observations: Arc<dyn RealmAuthorityObservationReader<Hash>>,
+        ready: Arc<PendingQueueSidecarReady>,
         nats: Arc<RecoverablePendingQueueNatsPublisher>,
         segment: RecoverableNatsStreamSegment,
+    ) -> Result<Self, RealmUserUpdateRouterError> {
+        let publisher = ScyllaRealmEdgeDurablePublisher::prepare_fixed_for_test(
+            session.clone(),
+            network,
+            authority,
+            Arc::clone(&ready),
+            nats,
+            segment,
+        )
+        .await
+        .map_err(router)?;
+        Self::prepare_with_publisher(
+            session,
+            network,
+            authority,
+            global_user_tree_height,
+            realm_user_tree_height,
+            active_verifier_profile,
+            verifier_profiles,
+            authority_observations,
+            ready,
+            publisher,
+        )
+        .await
+    }
+
+    async fn prepare_with_publisher(
+        session: Arc<Session>,
+        network: NetworkId,
+        authority: AuthorityScope,
+        global_user_tree_height: GlobalUserTreeHeight,
+        realm_user_tree_height: u8,
+        active_verifier_profile: RealmUserUpdateVerifierProfileId,
+        verifier_profiles: Arc<RealmUserUpdateVerifierRegistry<Verifier>>,
+        authority_observations: Arc<dyn RealmAuthorityObservationReader<Hash>>,
+        ready: Arc<PendingQueueSidecarReady>,
+        publisher: ScyllaRealmEdgeDurablePublisher<F, Hash>,
     ) -> Result<Self, RealmUserUpdateRouterError> {
         if !matches!(authority, AuthorityScope::Realm { .. })
             || realm_user_tree_height >= 64
@@ -192,16 +270,6 @@ where
         let dependencies = ScyllaRealmUserUpdateDependencyStore::prepare(
             session.clone(),
             data,
-        )
-        .await
-        .map_err(router)?;
-        let publisher = ScyllaRealmEdgeDurablePublisher::prepare(
-            session,
-            network,
-            authority,
-            ready,
-            nats,
-            segment,
         )
         .await
         .map_err(router)?;

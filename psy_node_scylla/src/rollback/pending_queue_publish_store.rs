@@ -11,6 +11,7 @@
 
 use std::{error::Error, fmt, sync::Arc};
 
+use async_trait::async_trait;
 use parth_core::protocol::core_types::Q256BitHash;
 use psy_node_nats::{
     recoverable_assignment::PendingQueueGenerationSegmentAssignment,
@@ -31,8 +32,8 @@ use psy_node_nats::{
     },
     recoverable_segment::RecoverableNatsStreamSegment,
     recoverable_transport::{
-        RecoverableNatsPublishDisposition, RecoverableNatsTransportError,
-        RecoverablePendingQueueNatsPublisher,
+        RecoverableNatsPublishDisposition, RecoverableNatsPublishOutcome,
+        RecoverableNatsTransportError, RecoverablePendingQueueNatsPublisher,
     },
 };
 use scylla::{
@@ -430,16 +431,68 @@ impl PendingQueuePublishCommitReceipt {
     }
 }
 
-pub struct ScyllaPendingQueuePublishStore {
+/// Transport capability bound to the exact physical segment used by one
+/// publish-store view. Production assignment-routed implementations also bind
+/// an immutable assignment digest and revalidate its provisioned server
+/// instance before and after every publish.
+#[async_trait]
+pub(super) trait PendingQueuePublishTransport: Send + Sync {
+    fn segment(&self) -> &RecoverableNatsStreamSegment;
+
+    fn assignment_digest(
+        &self,
+    ) -> Option<psy_node_nats::recoverable_assignment::PendingQueueSegmentAssignmentDigest> {
+        None
+    }
+
+    async fn publish(
+        &self,
+        envelope: &PendingQueuePublishEnvelope,
+    ) -> Result<RecoverableNatsPublishOutcome, PendingQueuePublishStoreError>;
+}
+
+#[async_trait]
+impl PendingQueuePublishTransport for RecoverablePendingQueueNatsPublisher {
+    fn segment(&self) -> &RecoverableNatsStreamSegment {
+        self.segment()
+    }
+
+    async fn publish(
+        &self,
+        envelope: &PendingQueuePublishEnvelope,
+    ) -> Result<RecoverableNatsPublishOutcome, PendingQueuePublishStoreError> {
+        RecoverablePendingQueueNatsPublisher::publish(self, envelope)
+            .await
+            .map_err(nats_transport)
+    }
+}
+
+/// Prepared CQL statements shared by short-lived assignment-bound views. A
+/// stream rotation must not prepare twelve statements for every user request;
+/// only the typed transport/segment binding changes per immutable assignment.
+pub(crate) struct ScyllaPendingQueuePublishStoreFactory {
     session: Arc<Session>,
-    nats: Arc<RecoverablePendingQueueNatsPublisher>,
-    segment: RecoverableNatsStreamSegment,
+    keyspaces: PendingQueuePublishKeyspaces,
     queries: PendingQueuePublishQueries,
-    fingerprint: PendingQueuePublishStoreFingerprint,
     read_source: PreparedStatement, bootstrap_source: PreparedStatement, cas_source: PreparedStatement,
     read_intent: PreparedStatement, bootstrap_intent: PreparedStatement, cas_intent: PreparedStatement,
     read_prepared: PreparedStatement, bootstrap_prepared: PreparedStatement,
     put_fragment: PreparedStatement, read_fragment: PreparedStatement, read_fragment_bucket: PreparedStatement,
+}
+
+pub(crate) struct ScyllaPendingQueuePublishStore {
+    prepared: Arc<ScyllaPendingQueuePublishStoreFactory>,
+    transport: Arc<dyn PendingQueuePublishTransport>,
+    segment: RecoverableNatsStreamSegment,
+    fingerprint: PendingQueuePublishStoreFingerprint,
+}
+
+impl std::ops::Deref for ScyllaPendingQueuePublishStore {
+    type Target = ScyllaPendingQueuePublishStoreFactory;
+
+    fn deref(&self) -> &Self::Target {
+        &self.prepared
+    }
 }
 
 /// Read-only historical publication observer. It prepares only SELECT
@@ -725,6 +778,102 @@ impl ScyllaPendingQueuePublishDurableReader {
     }
 }
 
+impl ScyllaPendingQueuePublishStoreFactory {
+    async fn prepare(
+        session: Arc<Session>,
+        keyspaces: PendingQueuePublishKeyspaces,
+    ) -> Result<Self, PendingQueuePublishStoreError> {
+        let queries = PendingQueuePublishQueries::new(&keyspaces);
+        Ok(Self {
+            read_source: prepare_regular(
+                &session,
+                queries.get(PendingQueuePublishQueryId::ReadSource).cql(),
+            )
+            .await?,
+            bootstrap_source: prepare_lwt(
+                &session,
+                queries
+                    .get(PendingQueuePublishQueryId::BootstrapSource)
+                    .cql(),
+            )
+            .await?,
+            cas_source: prepare_lwt(
+                &session,
+                queries.get(PendingQueuePublishQueryId::CasSource).cql(),
+            )
+            .await?,
+            read_intent: prepare_regular(
+                &session,
+                queries.get(PendingQueuePublishQueryId::ReadIntent).cql(),
+            )
+            .await?,
+            bootstrap_intent: prepare_lwt(
+                &session,
+                queries
+                    .get(PendingQueuePublishQueryId::BootstrapIntent)
+                    .cql(),
+            )
+            .await?,
+            cas_intent: prepare_lwt(
+                &session,
+                queries.get(PendingQueuePublishQueryId::CasIntent).cql(),
+            )
+            .await?,
+            read_prepared: prepare_regular(
+                &session,
+                queries.get(PendingQueuePublishQueryId::ReadPrepared).cql(),
+            )
+            .await?,
+            bootstrap_prepared: prepare_lwt(
+                &session,
+                queries
+                    .get(PendingQueuePublishQueryId::BootstrapPrepared)
+                    .cql(),
+            )
+            .await?,
+            put_fragment: prepare_regular(
+                &session,
+                queries.get(PendingQueuePublishQueryId::PutFragment).cql(),
+            )
+            .await?,
+            read_fragment: prepare_regular(
+                &session,
+                queries.get(PendingQueuePublishQueryId::ReadFragment).cql(),
+            )
+            .await?,
+            read_fragment_bucket: prepare_regular(
+                &session,
+                queries
+                    .get(PendingQueuePublishQueryId::ReadFragmentBucket)
+                    .cql(),
+            )
+            .await?,
+            session,
+            keyspaces,
+            queries,
+        })
+    }
+
+    pub(super) fn bind<T>(
+        self: &Arc<Self>,
+        transport: Arc<T>,
+        segment: RecoverableNatsStreamSegment,
+    ) -> Result<ScyllaPendingQueuePublishStore, PendingQueuePublishStoreError>
+    where
+        T: PendingQueuePublishTransport + 'static,
+    {
+        if transport.segment() != &segment {
+            return Err(PendingQueuePublishStoreError::AssignmentMismatch);
+        }
+        Ok(ScyllaPendingQueuePublishStore {
+            fingerprint: store_fingerprint(&self.keyspaces, &segment, &self.queries),
+            prepared: Arc::clone(self),
+            transport,
+            segment,
+        })
+    }
+}
+
 impl ScyllaPendingQueuePublishStore {
     pub(crate) async fn create_schema(
         session: &Session,
@@ -749,27 +898,53 @@ impl ScyllaPendingQueuePublishStore {
         segment: RecoverableNatsStreamSegment,
         keyspaces: PendingQueuePublishKeyspaces,
     ) -> Result<Self, PendingQueuePublishStoreError> {
-        let queries = PendingQueuePublishQueries::new(&keyspaces);
-        let fingerprint = store_fingerprint(&keyspaces, &segment, &queries);
-        Ok(Self {
-            read_source: prepare_regular(&session, queries.get(PendingQueuePublishQueryId::ReadSource).cql()).await?,
-            bootstrap_source: prepare_lwt(&session, queries.get(PendingQueuePublishQueryId::BootstrapSource).cql()).await?,
-            cas_source: prepare_lwt(&session, queries.get(PendingQueuePublishQueryId::CasSource).cql()).await?,
-            read_intent: prepare_regular(&session, queries.get(PendingQueuePublishQueryId::ReadIntent).cql()).await?,
-            bootstrap_intent: prepare_lwt(&session, queries.get(PendingQueuePublishQueryId::BootstrapIntent).cql()).await?,
-            cas_intent: prepare_lwt(&session, queries.get(PendingQueuePublishQueryId::CasIntent).cql()).await?,
-            read_prepared: prepare_regular(&session, queries.get(PendingQueuePublishQueryId::ReadPrepared).cql()).await?,
-            bootstrap_prepared: prepare_lwt(&session, queries.get(PendingQueuePublishQueryId::BootstrapPrepared).cql()).await?,
-            put_fragment: prepare_regular(&session, queries.get(PendingQueuePublishQueryId::PutFragment).cql()).await?,
-            read_fragment: prepare_regular(&session, queries.get(PendingQueuePublishQueryId::ReadFragment).cql()).await?,
-            read_fragment_bucket: prepare_regular(&session, queries.get(PendingQueuePublishQueryId::ReadFragmentBucket).cql()).await?,
-            session, nats, segment, queries, fingerprint,
-        })
+        let prepared = Arc::new(
+            ScyllaPendingQueuePublishStoreFactory::prepare(session, keyspaces)
+                .await?,
+        );
+        prepared.bind(nats, segment)
     }
 
-    pub const fn queries(&self) -> &PendingQueuePublishQueries { &self.queries }
+    pub fn queries(&self) -> &PendingQueuePublishQueries { &self.prepared.queries }
     pub const fn fingerprint(&self) -> PendingQueuePublishStoreFingerprint { self.fingerprint }
     pub(super) const fn segment(&self) -> &RecoverableNatsStreamSegment { &self.segment }
+
+    pub(super) fn is_assignment_bound(&self) -> bool {
+        self.transport.assignment_digest().is_some()
+    }
+
+    pub(super) fn bound_assignment_digest(
+        &self,
+    ) -> Option<psy_node_nats::recoverable_assignment::PendingQueueSegmentAssignmentDigest> {
+        self.transport.assignment_digest()
+    }
+
+    pub(super) fn prepared_factory(
+        &self,
+    ) -> Arc<ScyllaPendingQueuePublishStoreFactory> {
+        Arc::clone(&self.prepared)
+    }
+
+    pub(super) fn bind_assignment_transport<T>(
+        prepared: Arc<ScyllaPendingQueuePublishStoreFactory>,
+        transport: Arc<T>,
+    ) -> Result<Self, PendingQueuePublishStoreError>
+    where
+        T: PendingQueuePublishTransport + 'static,
+    {
+        let segment = transport.segment().clone();
+        prepared.bind(transport, segment)
+    }
+
+    pub(super) async fn prepare_factory(
+        session: Arc<Session>,
+        keyspaces: PendingQueuePublishKeyspaces,
+    ) -> Result<Arc<ScyllaPendingQueuePublishStoreFactory>, PendingQueuePublishStoreError> {
+        Ok(Arc::new(
+            ScyllaPendingQueuePublishStoreFactory::prepare(session, keyspaces)
+                .await?,
+        ))
+    }
 
     pub(super) async fn read_sealed_source_exact(
         &self,
@@ -1264,6 +1439,10 @@ impl ScyllaPendingQueuePublishStore {
     fn validate_assignment(&self, assignment: &PendingQueueGenerationSegmentAssignment) -> Result<(), PendingQueuePublishStoreError> {
         if assignment.segment_id() != self.segment.segment_id()
             || assignment.contract_digest() != self.segment.digest()
+            || self
+                .transport
+                .assignment_digest()
+                .is_some_and(|digest| digest != assignment.digest())
         {
             return Err(PendingQueuePublishStoreError::AssignmentMismatch);
         }
@@ -1342,7 +1521,7 @@ impl ScyllaPendingQueuePublishStore {
         &self,
         envelope: &PendingQueuePublishEnvelope,
     ) -> Result<(u64, PendingQueueNatsPublishDisposition), PendingQueuePublishStoreError> {
-        let outcome = self.nats.publish(envelope).await.map_err(nats_transport)?;
+        let outcome = self.transport.publish(envelope).await?;
         let disposition = match outcome.disposition() {
             RecoverableNatsPublishDisposition::PubAck => {
                 PendingQueueNatsPublishDisposition::PubAck
@@ -1763,6 +1942,7 @@ fn nats_transport(error: RecoverableNatsTransportError) -> PendingQueuePublishSt
 pub enum PendingQueuePublishStoreError {
     Cql(String),
     Nats(String),
+    Route(String),
     Model(String),
     Pipeline(String),
     InvalidKeyspace(String),
@@ -1807,6 +1987,24 @@ impl Error for PendingQueuePublishStoreError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn assignment_transport_is_part_of_the_store_fence() {
+        let source = include_str!("pending_queue_publish_store.rs");
+        let validator = source
+            .split("fn validate_assignment")
+            .nth(1)
+            .unwrap()
+            .split("async fn require_source")
+            .next()
+            .unwrap();
+        assert!(validator.contains("assignment_digest()"));
+        assert!(validator.contains("digest != assignment.digest()"));
+        assert!(source.contains("ScyllaPendingQueuePublishStoreFactory"));
+        assert!(source.contains("prepare_factory"));
+        assert!(source.contains("bind_assignment_transport"));
+        assert!(source.contains("self.transport.publish(envelope).await"));
+    }
 
     #[test]
     fn queries_separate_small_lwt_headers_from_immutable_fragments() {

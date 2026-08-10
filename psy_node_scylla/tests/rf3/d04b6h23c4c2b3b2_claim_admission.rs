@@ -356,7 +356,7 @@ async fn prepare_deterministic_router(
     nats: Arc<RecoverablePendingQueueNatsPublisher>,
     segment: RecoverableNatsStreamSegment,
 ) -> anyhow::Result<DeterministicRealmUserUpdateRouter> {
-    Ok(DeterministicRealmUserUpdateRouter::prepare(
+    Ok(DeterministicRealmUserUpdateRouter::prepare_fixed_for_test(
         session,
         admission.capture().key().network(),
         realm(),
@@ -1940,7 +1940,7 @@ async fn run_nonempty_terminal_source_joint_rf3(
         PoseidonHasher,
         PHash,
         DeterministicEndCapVerifier,
-    >::prepare(
+    >::prepare_fixed_for_test(
         session.clone(),
         capture.key().network(),
         realm(),
@@ -2101,7 +2101,7 @@ async fn run_nonempty_terminal_source_joint_rf3(
                 PoseidonHasher,
                 PHash,
                 DeterministicEndCapVerifier,
-            >::prepare(
+            >::prepare_fixed_for_test(
                 session.clone(),
                 capture.key().network(),
                 realm(),
@@ -2228,7 +2228,7 @@ async fn run_nonempty_terminal_source_joint_rf3(
             < terminals[1].publication().subject_sequence()
     );
 
-    let historical_observer = ScyllaRealmEdgeDurablePublisher::<PF, PHash>::prepare(
+    let historical_observer = ScyllaRealmEdgeDurablePublisher::<PF, PHash>::prepare_fixed_for_test(
         session.clone(),
         capture.key().network(),
         realm(),

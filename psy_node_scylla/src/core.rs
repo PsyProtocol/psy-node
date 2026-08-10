@@ -20,10 +20,7 @@ use psy_node_core::store::realm_processor_startup::{
     RealmProcessorStartupPreflightProvider,
 };
 use psy_node_core::queue::realm_user_update_publish::RealmUserUpdatePublishError;
-use psy_node_nats::{
-    recoverable_segment::RecoverableNatsStreamSegment,
-    recoverable_transport::RecoverablePendingQueueNatsPublisher,
-};
+use psy_node_nats::queue::NatsJetStreamClient;
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
 use crate::rollback::{
@@ -346,8 +343,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
         &self,
         network: NetworkId,
         authority: psy_data::protocol::chain_context::AuthorityScope,
-        nats: Arc<RecoverablePendingQueueNatsPublisher>,
-        segment: RecoverableNatsStreamSegment,
+        nats: Arc<NatsJetStreamClient>,
     ) -> Result<Arc<ScyllaRealmEdgeDurablePublisher<F, Hash>>, RealmUserUpdatePublishError>
     where
         Hash: Q256BitHash,
@@ -372,7 +368,6 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
                 authority,
                 queue,
                 nats,
-                segment,
             )
             .await?,
         ))

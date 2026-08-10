@@ -28,14 +28,10 @@ use psy_node_core::{
 };
 use psy_node_nats::{
     queue::NatsJetStreamClient,
-    recoverable_assignment::{
-        PendingQueueGenerationSegmentAssignment, PendingQueueSegmentLedgerBootstrap,
-    },
+    recoverable_assignment::PendingQueueSegmentLedgerBootstrap,
     recoverable_publish::{
-        PendingQueueGenerationBudgetContract, PendingQueueMemberOrdinal,
-        PendingQueuePublishEnvelope, PendingQueuePublishIntentId,
+        PendingQueueGenerationBudgetContract, PendingQueuePublishIntentId,
         PendingQueuePublisherKind, PendingQueueSourceQuota,
-        RecoverableNatsSourceRoute,
     },
     recoverable_segment::{
         RecoverableNatsRetentionContract, RecoverableNatsSegmentId,
@@ -55,7 +51,11 @@ use super::{
     },
     pending_queue_segment_ledger::SEGMENT_LEDGER_TABLE,
     PendingQueueSegmentLedgerReadState, ScyllaPendingQueueSegmentLedgerStore,
-    BranchExactDeploymentNoTabletKeyspace,
+    BranchExactDeploymentNoTabletKeyspace, PendingQueuePublishDataKeyspace,
+    PendingQueuePublishKeyspaces, PendingQueuePublishStoreError,
+    PendingQueueSegmentAssignmentReceipt, ScyllaPendingQueuePublishStore,
+    PENDING_QUEUE_PUBLISH_INTENT_TABLE, PENDING_QUEUE_PUBLISH_PREPARED_TABLE,
+    PENDING_QUEUE_PUBLISH_SOURCE_TABLE,
     PENDING_QUEUE_SIDECAR_SCHEMA_VERSION,
     PENDING_QUEUE_SIDECAR_TARGET_TABLE_COUNT,
 };
@@ -109,6 +109,7 @@ struct H23c4c2b4d2cReport {
     new_assignment_segment: u64,
     old_route_survived_rotation: bool,
     new_route_used_new_instance: bool,
+    assignment_bound_publish_store: bool,
     old_closure_stable_after_new_assignment: bool,
     old_closure_reconstructed_after_restart: bool,
     one_scylla_replica_offline: bool,
@@ -118,12 +119,32 @@ struct H23c4c2b4d2cReport {
     ledger_revision: u64,
     ledger_rows: usize,
     provision_rows: usize,
+    publish_source_rows: usize,
+    publish_intent_rows: usize,
+    publish_prepared_rows: usize,
     repair_direct_one_equal: bool,
     repair_ms: u64,
     rotation_ms: u64,
     handler_cli_integrated: bool,
     h8_closed_domains: u8,
     qualification: &'static str,
+}
+
+async fn publish_with_assignment_store(
+    store: &ScyllaPendingQueuePublishStore,
+    assignment: &PendingQueueSegmentAssignmentReceipt,
+    intent_byte: u8,
+    payload: &[u8],
+) -> Result<super::PendingQueuePublishCommitReceipt, PendingQueuePublishStoreError> {
+    let kind = PendingQueuePublisherKind::RealmUserUpdate;
+    store.bootstrap_source(assignment, kind).await?;
+    let intent_id = PendingQueuePublishIntentId::try_new([intent_byte; 32])
+        .map_err(|error| PendingQueuePublishStoreError::Model(error.to_string()))?;
+    let slot = store
+        .materialize_data(assignment, kind, intent_id, payload)
+        .await?;
+    let permit = store.bind_materialized(assignment, kind, slot).await?;
+    store.publish_and_commit(assignment, permit).await
 }
 
 fn retention(max_stream_bytes: i64) -> anyhow::Result<RecoverableNatsRetentionContract> {
@@ -227,30 +248,6 @@ fn capture_context(pending: u64) -> anyhow::Result<PendingQueueCaptureContext> {
     )?)
 }
 
-fn data_envelope(
-    context: PendingQueueCaptureContext,
-    assignment: &PendingQueueGenerationSegmentAssignment,
-    segment: &RecoverableNatsStreamSegment,
-    ordinal: u32,
-    previous_sequence: u64,
-    previous_digest: [u8; 32],
-) -> anyhow::Result<PendingQueuePublishEnvelope> {
-    let route = RecoverableNatsSourceRoute::try_new(
-        context,
-        PendingQueuePublisherKind::RealmUserUpdate,
-        segment,
-    )?;
-    Ok(PendingQueuePublishEnvelope::data(
-        &route,
-        assignment,
-        PendingQueuePublishIntentId::try_new([ordinal as u8; 32])?,
-        PendingQueueMemberOrdinal::try_new(ordinal)?,
-        previous_sequence,
-        previous_digest,
-        format!("segment-{}-message-{ordinal}", segment.segment_id().get()).into_bytes(),
-    )?)
-}
-
 async fn wait_for_stream_leader(
     context: &jetstream::Context,
     stream_name: &str,
@@ -332,6 +329,9 @@ async fn direct_rotation_rows(
 ) -> anyhow::Result<(
     BTreeSet<(Vec<u8>, i64, Vec<u8>)>,
     BTreeSet<(Vec<u8>, i64, Vec<u8>)>,
+    BTreeSet<(Vec<u8>, i64, Vec<u8>)>,
+    BTreeSet<(Vec<u8>, i64, Vec<u8>)>,
+    BTreeSet<(Vec<u8>, Vec<u8>, i64, Vec<u8>)>,
 )> {
     let session = fixture::connect(Some(ip), Consistency::One).await?;
     let ledger = session
@@ -360,7 +360,46 @@ async fn direct_rotation_rows(
         .into_rows_result()?
         .rows::<(Vec<u8>, i64, Vec<u8>)>()?
         .collect::<Result<BTreeSet<_>, _>>()?;
-    Ok((ledger, provision))
+    let source = session
+        .query_unpaged(
+            format!(
+                "SELECT source_slot, revision, source_payload FROM {}.{}",
+                fixture::control_keyspace(),
+                PENDING_QUEUE_PUBLISH_SOURCE_TABLE,
+            ),
+            &[],
+        )
+        .await?
+        .into_rows_result()?
+        .rows::<(Vec<u8>, i64, Vec<u8>)>()?
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let intent = session
+        .query_unpaged(
+            format!(
+                "SELECT intent_slot, revision, intent_payload FROM {}.{}",
+                fixture::control_keyspace(),
+                PENDING_QUEUE_PUBLISH_INTENT_TABLE,
+            ),
+            &[],
+        )
+        .await?
+        .into_rows_result()?
+        .rows::<(Vec<u8>, i64, Vec<u8>)>()?
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let prepared = session
+        .query_unpaged(
+            format!(
+                "SELECT source_slot, intent_slot, revision, prepared_payload FROM {}.{}",
+                fixture::control_keyspace(),
+                PENDING_QUEUE_PUBLISH_PREPARED_TABLE,
+            ),
+            &[],
+        )
+        .await?
+        .into_rows_result()?
+        .rows::<(Vec<u8>, Vec<u8>, i64, Vec<u8>)>()?
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    Ok((ledger, provision, source, intent, prepared))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -657,6 +696,17 @@ async fn d04b6h23c4c2b4d2c_rotation_route_joint_rf3() -> anyhow::Result<()> {
     )?;
     ScyllaPendingQueueStreamProvisionStore::create_schema(&session, &control).await?;
     ScyllaPendingQueueSegmentLedgerStore::create_schema(&session, &control).await?;
+    let publish_keyspaces = PendingQueuePublishKeyspaces::new(
+        control.clone(),
+        PendingQueuePublishDataKeyspace::try_new(fixture::KEYSPACE)?,
+    );
+    ScyllaPendingQueuePublishStore::create_schema(&session, &publish_keyspaces)
+        .await?;
+    let publish_factory = ScyllaPendingQueuePublishStore::prepare_factory(
+        session.clone(),
+        publish_keyspaces,
+    )
+    .await?;
     let ledger_store = Arc::new(
         ScyllaPendingQueueSegmentLedgerStore::prepare(session.clone(), control.clone()).await?,
     );
@@ -842,24 +892,38 @@ async fn d04b6h23c4c2b4d2c_rotation_route_joint_rf3() -> anyhow::Result<()> {
     ensure!(new_route.segment() == &segment2);
     ensure!(old_route.instance_id() == instance1);
     ensure!(new_route.instance_id() == instance2);
-    let old_first = data_envelope(
-        context1,
-        assignment1.assignment(),
-        &segment1,
-        1,
-        0,
-        [0; 32],
+    let old_publish = ScyllaPendingQueuePublishStore::bind_assignment_transport(
+        publish_factory.clone(),
+        Arc::new(old_route),
     )?;
-    let new_first = data_envelope(
-        context2,
-        assignment2.assignment(),
-        &segment2,
-        1,
-        0,
-        [0; 32],
+    let new_publish = ScyllaPendingQueuePublishStore::bind_assignment_transport(
+        publish_factory.clone(),
+        Arc::new(new_route),
     )?;
-    let old_outcome = old_route.publish(&old_first).await?;
-    let new_outcome = new_route.publish(&new_first).await?;
+    ensure!(old_publish.is_assignment_bound());
+    ensure!(new_publish.is_assignment_bound());
+    ensure!(
+        old_publish.bound_assignment_digest()
+            == Some(assignment1.assignment().digest())
+    );
+    ensure!(
+        new_publish.bound_assignment_digest()
+            == Some(assignment2.assignment().digest())
+    );
+    let old_first = publish_with_assignment_store(
+        &old_publish,
+        &assignment1,
+        41,
+        b"old-assignment-first",
+    )
+    .await?;
+    let new_first = publish_with_assignment_store(
+        &new_publish,
+        &assignment2,
+        51,
+        b"new-assignment-first",
+    )
+    .await?;
 
     let leader_before = wait_for_stream_leader(&context, segment2.stream_name(), None).await?;
     stop_nats_server_d2c(&leader_before)?;
@@ -871,24 +935,32 @@ async fn d04b6h23c4c2b4d2c_rotation_route_joint_rf3() -> anyhow::Result<()> {
     .await?;
     let old_after_failover = resolver.resolve(&ledger_key, context1).await?;
     let new_after_failover = resolver.resolve(&ledger_key, context2).await?;
-    let old_second = data_envelope(
-        context1,
-        assignment1.assignment(),
-        &segment1,
-        2,
-        old_outcome.subject_sequence(),
-        *old_first.digest().as_bytes(),
-    )?;
-    let new_second = data_envelope(
-        context2,
-        assignment2.assignment(),
-        &segment2,
-        2,
-        new_outcome.subject_sequence(),
-        *new_first.digest().as_bytes(),
-    )?;
-    old_after_failover.publish(&old_second).await?;
-    new_after_failover.publish(&new_second).await?;
+    let old_after_failover =
+        ScyllaPendingQueuePublishStore::bind_assignment_transport(
+            publish_factory.clone(),
+            Arc::new(old_after_failover),
+        )?;
+    let new_after_failover =
+        ScyllaPendingQueuePublishStore::bind_assignment_transport(
+            publish_factory,
+            Arc::new(new_after_failover),
+        )?;
+    let old_second = publish_with_assignment_store(
+        &old_after_failover,
+        &assignment1,
+        42,
+        b"old-assignment-second",
+    )
+    .await?;
+    let new_second = publish_with_assignment_store(
+        &new_after_failover,
+        &assignment2,
+        52,
+        b"new-assignment-second",
+    )
+    .await?;
+    ensure!(old_first.subject_sequence() < old_second.subject_sequence());
+    ensure!(new_first.subject_sequence() < new_second.subject_sequence());
     let info1 = context.get_stream(segment1.stream_name()).await?.get_info().await?;
     let info2 = context.get_stream(segment2.stream_name()).await?.get_info().await?;
     ensure!(info1.state.messages == 2 && info2.state.messages == 2);
@@ -928,6 +1000,9 @@ async fn d04b6h23c4c2b4d2c_rotation_route_joint_rf3() -> anyhow::Result<()> {
     ensure!(replicas[0].0.iter().all(|(_, revision, _)| *revision == 5));
     ensure!(replicas[0].1.len() == 2);
     ensure!(replicas[0].1.iter().all(|(_, revision, _)| *revision == 2));
+    ensure!(replicas[0].2.len() == 2);
+    ensure!(replicas[0].3.len() == 4);
+    ensure!(replicas[0].4.len() == 4);
 
     let report = H23c4c2b4d2cReport {
         scylla_image: IMAGE,
@@ -946,6 +1021,7 @@ async fn d04b6h23c4c2b4d2c_rotation_route_joint_rf3() -> anyhow::Result<()> {
         new_assignment_segment: segment2.segment_id().get(),
         old_route_survived_rotation: true,
         new_route_used_new_instance: true,
+        assignment_bound_publish_store: true,
         old_closure_stable_after_new_assignment: true,
         old_closure_reconstructed_after_restart: true,
         one_scylla_replica_offline: true,
@@ -955,6 +1031,9 @@ async fn d04b6h23c4c2b4d2c_rotation_route_joint_rf3() -> anyhow::Result<()> {
         ledger_revision: 5,
         ledger_rows: replicas[0].0.len(),
         provision_rows: replicas[0].1.len(),
+        publish_source_rows: replicas[0].2.len(),
+        publish_intent_rows: replicas[0].3.len(),
+        publish_prepared_rows: replicas[0].4.len(),
         repair_direct_one_equal: true,
         repair_ms,
         rotation_ms,
