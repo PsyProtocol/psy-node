@@ -645,6 +645,169 @@ struct DirectSnapshot {
     claims: Vec<(i16, i64, i64, Vec<u8>)>,
 }
 
+type DependencyDirectRow = (
+    Vec<u8>,
+    Vec<u8>,
+    i16,
+    i32,
+    i32,
+    i64,
+    Vec<u8>,
+    Vec<u8>,
+    Vec<u8>,
+);
+
+fn dependency_direct_row(
+    bundle: &RealmUserUpdateDependencyBundle,
+    fragment: &psy_node_core::queue::realm_user_update_dependency::RealmUserUpdateDependencyFragment,
+) -> anyhow::Result<DependencyDirectRow> {
+    Ok((
+        bundle.claim_slot().as_bytes().to_vec(),
+        bundle.digest().as_bytes().to_vec(),
+        fragment.kind().as_i16(),
+        i32::try_from(fragment.index())?,
+        i32::try_from(fragment.count())?,
+        i64::try_from(fragment.component_bytes())?,
+        fragment.component_digest().as_bytes().to_vec(),
+        fragment.payload().to_vec(),
+        fragment.payload_digest().to_vec(),
+    ))
+}
+
+fn expected_dependency_rows(
+    fixtures: &[RealmUserUpdateLiveFixture],
+) -> anyhow::Result<Vec<DependencyDirectRow>> {
+    let mut rows = Vec::new();
+    for fixture in fixtures {
+        for fragment in fixture.bundle.fragments() {
+            rows.push(dependency_direct_row(&fixture.bundle, &fragment)?);
+        }
+    }
+    rows.sort_by(|left, right| {
+        (&left.0, &left.1, left.2, left.3)
+            .cmp(&(&right.0, &right.1, right.2, right.3))
+    });
+    Ok(rows)
+}
+
+async fn direct_dependency_snapshot(
+    session: &Session,
+    fixtures: &[RealmUserUpdateLiveFixture],
+) -> anyhow::Result<Vec<DependencyDirectRow>> {
+    let mut rows = Vec::new();
+    for fixture in fixtures {
+        let slot = fixture.bundle.claim_slot().as_bytes().to_vec();
+        let digest = fixture.bundle.digest().as_bytes().to_vec();
+        let mut kinds = fixture
+            .bundle
+            .fragments()
+            .into_iter()
+            .map(|fragment| fragment.kind().as_i16())
+            .collect::<Vec<_>>();
+        kinds.sort_unstable();
+        kinds.dedup();
+        for kind in kinds {
+            let mut selected = session
+                .query_unpaged(
+                    format!(
+                        "SELECT dependency_slot, dependency_digest, component_kind, fragment_index, fragment_count, component_bytes, component_digest, payload, payload_digest FROM {DATA}.{} WHERE dependency_slot = ? AND dependency_digest = ? AND component_kind = ?",
+                        REALM_USER_UPDATE_DEPENDENCY_FRAGMENT_TABLE
+                    ),
+                    (slot.clone(), digest.clone(), kind),
+                )
+                .await?
+                .into_rows_result()?
+                .rows::<DependencyDirectRow>()?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows.append(&mut selected);
+        }
+    }
+    rows.sort_by(|left, right| {
+        (&left.0, &left.1, left.2, left.3)
+            .cmp(&(&right.0, &right.1, right.2, right.3))
+    });
+    Ok(rows)
+}
+
+async fn dependency_write_timestamp(
+    session: &Session,
+    row: &DependencyDirectRow,
+) -> anyhow::Result<i64> {
+    let timestamp = session
+        .query_unpaged(
+            format!(
+                "SELECT WRITETIME(payload) FROM {DATA}.{} WHERE dependency_slot = ? AND dependency_digest = ? AND component_kind = ? AND fragment_index = ?",
+                REALM_USER_UPDATE_DEPENDENCY_FRAGMENT_TABLE
+            ),
+            (row.0.clone(), row.1.clone(), row.2, row.3),
+        )
+        .await?
+        .into_rows_result()?
+        .maybe_first_row::<(i64,)>()?
+        .context("selected dependency fragment has no payload writetime")?;
+    Ok(timestamp.0)
+}
+
+async fn restore_dependency_row(
+    session: &Session,
+    row: &DependencyDirectRow,
+    timestamp: i64,
+) -> anyhow::Result<()> {
+    session
+        .query_unpaged(
+            format!(
+                "INSERT INTO {DATA}.{} (dependency_slot, dependency_digest, component_kind, fragment_index, fragment_count, component_bytes, component_digest, payload, payload_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) USING TIMESTAMP ?",
+                REALM_USER_UPDATE_DEPENDENCY_FRAGMENT_TABLE
+            ),
+            (
+                row.0.clone(),
+                row.1.clone(),
+                row.2,
+                row.3,
+                row.4,
+                row.5,
+                row.6.clone(),
+                row.7.clone(),
+                row.8.clone(),
+                timestamp,
+            ),
+        )
+        .await?;
+    Ok(())
+}
+
+async fn ensure_dependency_fault_rejected(
+    router: &ScyllaRealmUserUpdateDurableRouter<PF, PHash, PoseidonHasher>,
+    gates: &ScyllaRealmUserUpdateAdmissionStore,
+    jetstream: &jetstream::Context,
+    stream_name: &str,
+    key: RealmUserUpdateAdmissionKey,
+    close: RealmUserUpdateAdmissionCloseIntent,
+    expected_error: &str,
+) -> anyhow::Result<()> {
+    let before = stream_state(jetstream, stream_name).await?;
+    let error = match router.qualify_generation(key, close).await {
+        Ok(_) => bail!("dependency fault unexpectedly qualified generation"),
+        Err(error) => error,
+    };
+    ensure!(
+        error.to_string().contains(expected_error),
+        "unexpected dependency fault error: {error}"
+    );
+    let current = match gates
+        .read::<PHash>(key, RealmUserUpdateAdmissionShard::Generation)
+        .await?
+    {
+        RealmUserUpdateAdmissionReadState::Current(current) => current,
+        RealmUserUpdateAdmissionReadState::Uninitialized => {
+            bail!("dependency fault removed generation admission")
+        }
+    };
+    ensure!(current.phase() == RealmUserUpdateAdmissionPhase::GenerationClosed);
+    ensure!(stream_state(jetstream, stream_name).await? == before);
+    Ok(())
+}
+
 async fn direct_snapshot(
     session: &Session,
     capture: PendingQueueCaptureContext,
@@ -1245,16 +1408,21 @@ struct NonemptyTerminalSourceReport {
     nats_leader_before: String,
     nats_leader_after: String,
     nats_leader_failover: bool,
+    dependency_missing_rejected: bool,
+    dependency_extra_rejected: bool,
+    dependency_wrong_digest_rejected: bool,
+    dependency_exact_restore: bool,
     qualification_nats_publish_delta: i64,
     repair_flush_compact: bool,
     direct_one_nodes_equal: usize,
+    dependency_direct_one_nodes_equal: usize,
+    dependency_rows: usize,
     qualification_ms: u64,
     qualification: &'static str,
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "requires isolated Scylla RF=3 and NATS RF=3 runner"]
-async fn d04b6h23c4c2b3b2c2b_nonempty_terminal_source_joint_rf3(
+async fn run_nonempty_terminal_source_joint_rf3(
+    dependency_faults: bool,
 ) -> anyhow::Result<()> {
     ensure!(
         std::env::var("PSY_D04B6H23C4C2B3B2C2B_RF3").as_deref()
@@ -1383,7 +1551,7 @@ async fn d04b6h23c4c2b3b2c2b_nonempty_terminal_source_joint_rf3(
     )
     .await?;
     ensure!(router.admit().await? == expected_admission);
-    let (_, _, guard, provisioned_admission, key) =
+    let (gates, _, guard, provisioned_admission, key) =
         provisioned(session.clone(), generation).await?;
     ensure!(provisioned_admission == expected_admission);
 
@@ -1511,6 +1679,192 @@ async fn d04b6h23c4c2b3b2c2b_nonempty_terminal_source_joint_rf3(
     ensure!(closed.generation_manifest().unwrap().total().count() == 2);
     let nats_before = stream_state(&jetstream, segment.stream_name()).await?;
 
+    let mut dependency_missing_rejected = false;
+    let mut dependency_extra_rejected = false;
+    let mut dependency_wrong_digest_rejected = false;
+    let mut dependency_exact_restore = false;
+    if dependency_faults {
+        ensure!(
+            std::env::var("PSY_D04B6H23C4C2B3B2C2C1_RF3").as_deref()
+                == Ok("1"),
+            "run through tests/rf3/run-d04b6h23c4c2b3b2c2c1.sh"
+        );
+        let selected_fragment = fixtures[0]
+            .bundle
+            .fragments()
+            .into_iter()
+            .find(|fragment| fragment.kind().as_i16() == 2 && fragment.index() == 0)
+            .context("proof dependency fragment zero is required")?;
+        let selected = dependency_direct_row(
+            &fixtures[0].bundle,
+            &selected_fragment,
+        )?;
+
+        let original_timestamp = dependency_write_timestamp(&session, &selected).await?;
+        let missing_timestamp = original_timestamp
+            .checked_add(1)
+            .context("missing fault timestamp overflow")?;
+        let missing_restore_timestamp = missing_timestamp
+            .checked_add(1)
+            .context("missing restore timestamp overflow")?;
+        session
+            .query_unpaged(
+                format!(
+                    "DELETE FROM {DATA}.{} USING TIMESTAMP ? WHERE dependency_slot = ? AND dependency_digest = ? AND component_kind = ? AND fragment_index = ?",
+                    REALM_USER_UPDATE_DEPENDENCY_FRAGMENT_TABLE
+                ),
+                (
+                    missing_timestamp,
+                    selected.0.clone(),
+                    selected.1.clone(),
+                    selected.2,
+                    selected.3,
+                ),
+            )
+            .await?;
+        ensure_dependency_fault_rejected(
+            &router,
+            &gates,
+            &jetstream,
+            segment.stream_name(),
+            key,
+            close,
+            "MissingFragment",
+        )
+        .await?;
+        dependency_missing_rejected = true;
+        restore_dependency_row(&session, &selected, missing_restore_timestamp).await?;
+        ensure!(
+            dependency_store
+                .read_bundle(
+                    fixtures[0].bundle.claim_slot(),
+                    *terminals[0].claim().request_digest().as_bytes(),
+                    terminals[0].claim().stable_status(),
+                    terminals[0].claim().created_at().get(),
+                    fixtures[0].bundle.digest(),
+                )
+                .await?
+                == fixtures[0].bundle
+        );
+
+        let extra_timestamp = missing_restore_timestamp
+            .checked_add(1)
+            .context("extra fault timestamp overflow")?;
+        let extra_restore_timestamp = extra_timestamp
+            .checked_add(1)
+            .context("extra restore timestamp overflow")?;
+        let extra_index = selected.4;
+        session
+            .query_unpaged(
+                format!(
+                    "INSERT INTO {DATA}.{} (dependency_slot, dependency_digest, component_kind, fragment_index, fragment_count, component_bytes, component_digest, payload, payload_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) USING TIMESTAMP ?",
+                    REALM_USER_UPDATE_DEPENDENCY_FRAGMENT_TABLE
+                ),
+                (
+                    selected.0.clone(),
+                    selected.1.clone(),
+                    selected.2,
+                    extra_index,
+                    selected.4,
+                    selected.5,
+                    selected.6.clone(),
+                    selected.7.clone(),
+                    selected.8.clone(),
+                    extra_timestamp,
+                ),
+            )
+            .await?;
+        ensure_dependency_fault_rejected(
+            &router,
+            &gates,
+            &jetstream,
+            segment.stream_name(),
+            key,
+            close,
+            "MalformedFragment",
+        )
+        .await?;
+        dependency_extra_rejected = true;
+        session
+            .query_unpaged(
+                format!(
+                    "DELETE FROM {DATA}.{} USING TIMESTAMP ? WHERE dependency_slot = ? AND dependency_digest = ? AND component_kind = ? AND fragment_index = ?",
+                    REALM_USER_UPDATE_DEPENDENCY_FRAGMENT_TABLE
+                ),
+                (
+                    extra_restore_timestamp,
+                    selected.0.clone(),
+                    selected.1.clone(),
+                    selected.2,
+                    extra_index,
+                ),
+            )
+            .await?;
+        ensure!(
+            dependency_store
+                .read_bundle(
+                    fixtures[0].bundle.claim_slot(),
+                    *terminals[0].claim().request_digest().as_bytes(),
+                    terminals[0].claim().stable_status(),
+                    terminals[0].claim().created_at().get(),
+                    fixtures[0].bundle.digest(),
+                )
+                .await?
+                == fixtures[0].bundle
+        );
+
+        let wrong_timestamp = extra_restore_timestamp
+            .checked_add(1)
+            .context("wrong-digest fault timestamp overflow")?;
+        let wrong_restore_timestamp = wrong_timestamp
+            .checked_add(1)
+            .context("wrong-digest restore timestamp overflow")?;
+        let mut wrong_digest = selected.8.clone();
+        wrong_digest[0] ^= 0xff;
+        session
+            .query_unpaged(
+                format!(
+                    "UPDATE {DATA}.{} USING TIMESTAMP ? SET payload_digest = ? WHERE dependency_slot = ? AND dependency_digest = ? AND component_kind = ? AND fragment_index = ?",
+                    REALM_USER_UPDATE_DEPENDENCY_FRAGMENT_TABLE
+                ),
+                (
+                    wrong_timestamp,
+                    wrong_digest,
+                    selected.0.clone(),
+                    selected.1.clone(),
+                    selected.2,
+                    selected.3,
+                ),
+            )
+            .await?;
+        ensure_dependency_fault_rejected(
+            &router,
+            &gates,
+            &jetstream,
+            segment.stream_name(),
+            key,
+            close,
+            "MalformedFragment",
+        )
+        .await?;
+        dependency_wrong_digest_rejected = true;
+        restore_dependency_row(&session, &selected, wrong_restore_timestamp).await?;
+        ensure!(
+            dependency_store
+                .read_bundle(
+                    fixtures[0].bundle.claim_slot(),
+                    *terminals[0].claim().request_digest().as_bytes(),
+                    terminals[0].claim().stable_status(),
+                    terminals[0].claim().created_at().get(),
+                    fixtures[0].bundle.digest(),
+                )
+                .await?
+                == fixtures[0].bundle
+        );
+        dependency_exact_restore = true;
+        ensure!(stream_state(&jetstream, segment.stream_name()).await? == nats_before);
+    }
+
     let leader_before = initial_nats_leader.context("initial NATS leader missing")?;
     let leader_after_failover =
         failover_nats_leader.context("failover NATS leader missing")?;
@@ -1583,6 +1937,22 @@ async fn d04b6h23c4c2b3b2c2b_nonempty_terminal_source_joint_rf3(
     ensure!(direct[0].gates.len() == 257);
     ensure!(direct[0].claims.len() == 2);
 
+    let expected_dependencies = expected_dependency_rows(&fixtures)?;
+    let mut dependency_direct = Vec::new();
+    for ip in NODE_IPS {
+        let local = connect(Some(ip), Consistency::One).await?;
+        dependency_direct.push(
+            direct_dependency_snapshot(&local, &fixtures).await?,
+        );
+    }
+    let dependency_direct_one_nodes_equal = dependency_direct
+        .windows(2)
+        .all(|pair| pair[0] == pair[1])
+        .then_some(dependency_direct.len())
+        .unwrap_or(0);
+    ensure!(dependency_direct_one_nodes_equal == 3);
+    ensure!(dependency_direct[0] == expected_dependencies);
+
     let report = NonemptyTerminalSourceReport {
         image: IMAGE,
         scylla_replication_factor: 3,
@@ -1601,14 +1971,37 @@ async fn d04b6h23c4c2b3b2c2b_nonempty_terminal_source_joint_rf3(
         nats_leader_before: leader_before,
         nats_leader_after: leader_after_failover,
         nats_leader_failover,
+        dependency_missing_rejected,
+        dependency_extra_rejected,
+        dependency_wrong_digest_rejected,
+        dependency_exact_restore,
         qualification_nats_publish_delta,
         repair_flush_compact: true,
         direct_one_nodes_equal,
+        dependency_direct_one_nodes_equal,
+        dependency_rows: expected_dependencies.len(),
         qualification_ms,
-        qualification:
-            "H23C4C2B3B2C2B_NONEMPTY_TERMINAL_SOURCE_RF3_PASSED",
+        qualification: if dependency_faults {
+            "H23C4C2B3B2C2C1_DEPENDENCY_FAULT_RF3_PASSED"
+        } else {
+            "H23C4C2B3B2C2B_NONEMPTY_TERMINAL_SOURCE_RF3_PASSED"
+        },
     };
     std::fs::write(report_path, serde_json::to_vec_pretty(&report)?)?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires isolated Scylla RF=3 and NATS RF=3 runner"]
+async fn d04b6h23c4c2b3b2c2b_nonempty_terminal_source_joint_rf3(
+) -> anyhow::Result<()> {
+    run_nonempty_terminal_source_joint_rf3(false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires isolated Scylla RF=3 and NATS RF=3 runner"]
+async fn d04b6h23c4c2b3b2c2c1_dependency_fault_joint_rf3(
+) -> anyhow::Result<()> {
+    run_nonempty_terminal_source_joint_rf3(true).await
 }

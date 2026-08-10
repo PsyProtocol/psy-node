@@ -5,7 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CRATE_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 WORKSPACE_DIR="$(cd "${CRATE_DIR}/.." && pwd)"
 COMPOSE_FILE="${SCRIPT_DIR}/docker-compose.yml"
-REPORT_PATH="${WORKSPACE_DIR}/target/d04b6h23c4c2b3b2c2b-nonempty-terminal-source-rf3-report.json"
+REPORT_PATH="${PSY_D04B6H23C4C2B3B2C2B_REPORT_OVERRIDE:-${WORKSPACE_DIR}/target/d04b6h23c4c2b3b2c2b-nonempty-terminal-source-rf3-report.json}"
+TEST_NAME="${PSY_D04B6H23C4C2B3B2C2B_TEST_NAME:-rollback::realm_user_update_admission_rf3::d04b6h23c4c2b3b2c2b_nonempty_terminal_source_joint_rf3}"
 NATS_DIR="$(mktemp -d /tmp/psy-h23c2b-nats.XXXXXX)"
 
 NATS1_PID=""
@@ -76,7 +77,7 @@ PSY_D04B6H23C4C2B3B2C2B_NATS2_PID="${NATS2_PID}" \
 PSY_D04B6H23C4C2B3B2C2B_NATS3_PID="${NATS3_PID}" \
 RUST_MIN_STACK=67108864 \
 cargo test -p psy_node_scylla \
-  rollback::realm_user_update_admission_rf3::d04b6h23c4c2b3b2c2b_nonempty_terminal_source_joint_rf3 \
+  "${TEST_NAME}" \
   --lib -- --ignored --exact --nocapture
 
 echo "D-04b6h23c4c2b3b2c2b non-empty terminal/source RF=3 report: ${REPORT_PATH}"
