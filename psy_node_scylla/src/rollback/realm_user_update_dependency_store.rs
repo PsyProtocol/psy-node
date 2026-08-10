@@ -11,9 +11,10 @@ use psy_node_core::queue::{
         RealmUserUpdateClaimSlot, RealmUserUpdateDependencyDigest,
     },
     realm_user_update_dependency::{
-        reconstruct_component, RealmUserUpdateDependencyBundle,
-        RealmUserUpdateDependencyComponent, RealmUserUpdateDependencyError,
-        RealmUserUpdateDependencyFragment, RealmUserUpdateDependencyKind,
+        plan_realm_user_update_dependency_recovery, reconstruct_component,
+        RealmUserUpdateDependencyBundle, RealmUserUpdateDependencyComponent,
+        RealmUserUpdateDependencyError, RealmUserUpdateDependencyFragment,
+        RealmUserUpdateDependencyKind, RealmUserUpdateDependencyRecoveryPlan,
     },
 };
 use scylla::{
@@ -125,21 +126,16 @@ impl ScyllaRealmUserUpdateDependencyStore {
         &self,
         bundle: &RealmUserUpdateDependencyBundle,
     ) -> Result<RealmUserUpdateDependencyDigest, RealmUserUpdateDependencyStoreError> {
-        for fragment in bundle.fragments() {
-            let binding = put_binding(bundle, &fragment)?;
+        let recovery = self.inspect_recovery(bundle).await?;
+        for fragment in recovery.missing_fragments() {
+            let binding = put_binding(bundle, fragment)?;
             let execution = self.session.execute_unpaged(&self.put, binding).await;
             if let Err(error) = execution {
-                match self
-                    .read_bundle(
-                        bundle.claim_slot(),
-                        *bundle.request_digest(),
-                        bundle.stable_status(),
-                        bundle.created_at_seconds(),
-                        bundle.digest(),
-                    )
-                    .await
-                {
-                    Ok(current) if current == *bundle => return Ok(bundle.digest()),
+                match self.inspect_recovery(bundle).await {
+                    Ok(current) if current.is_complete() => return Ok(bundle.digest()),
+                    Err(error @ RealmUserUpdateDependencyStoreError::Dependency(_)) => {
+                        return Err(error);
+                    }
                     _ => {
                         return Err(RealmUserUpdateDependencyStoreError::IndeterminateWrite(
                             error.to_string(),
@@ -161,6 +157,28 @@ impl ScyllaRealmUserUpdateDependencyStore {
             return Err(RealmUserUpdateDependencyStoreError::ReadbackMismatch);
         }
         Ok(bundle.digest())
+    }
+
+    /// Read all five selected component partitions and classify them against
+    /// a complete typed candidate. It never mutates rows or turns malformed,
+    /// duplicate, extra, or conflicting data into a repairable gap.
+    pub(crate) async fn inspect_recovery(
+        &self,
+        expected: &RealmUserUpdateDependencyBundle,
+    ) -> Result<RealmUserUpdateDependencyRecoveryPlan, RealmUserUpdateDependencyStoreError> {
+        let mut observed = Vec::new();
+        for kind in RealmUserUpdateDependencyKind::ALL {
+            observed.extend(
+                self.read_fragments(
+                    expected.claim_slot(),
+                    expected.digest(),
+                    kind,
+                )
+                .await?,
+            );
+        }
+        plan_realm_user_update_dependency_recovery(expected, observed)
+            .map_err(Into::into)
     }
 
     pub(crate) async fn read_bundle(
@@ -194,6 +212,19 @@ impl ScyllaRealmUserUpdateDependencyStore {
         dependency_digest: RealmUserUpdateDependencyDigest,
         kind: RealmUserUpdateDependencyKind,
     ) -> Result<RealmUserUpdateDependencyComponent, RealmUserUpdateDependencyStoreError> {
+        reconstruct_component(
+            kind,
+            self.read_fragments(slot, dependency_digest, kind).await?,
+        )
+        .map_err(Into::into)
+    }
+
+    async fn read_fragments(
+        &self,
+        slot: RealmUserUpdateClaimSlot,
+        dependency_digest: RealmUserUpdateDependencyDigest,
+        kind: RealmUserUpdateDependencyKind,
+    ) -> Result<Vec<RealmUserUpdateDependencyFragment>, RealmUserUpdateDependencyStoreError> {
         let result = self
             .session
             .execute_unpaged(
@@ -220,7 +251,7 @@ impl ScyllaRealmUserUpdateDependencyStore {
                 row.payload_digest,
             )?);
         }
-        reconstruct_component(kind, fragments).map_err(Into::into)
+        Ok(fragments)
     }
 }
 
@@ -302,5 +333,16 @@ mod tests {
         assert!(source.contains("for kind in RealmUserUpdateDependencyKind::ALL"));
         assert!(source.contains("persist_and_readback"));
         assert!(!source.contains(&["Consistency", "::One"].concat()));
+
+        let persist = source.find("pub(crate) async fn persist_and_readback").unwrap();
+        let inspect = source[persist..]
+            .find("pub(crate) async fn inspect_recovery")
+            .map(|offset| persist + offset)
+            .unwrap();
+        let body = &source[persist..inspect];
+        assert!(body.contains("self.inspect_recovery(bundle).await?"));
+        assert!(body.contains("recovery.missing_fragments()"));
+        assert!(body.contains("RealmUserUpdateDependencyStoreError::Dependency(_)"));
+        assert!(!body.contains("for fragment in bundle.fragments()"));
     }
 }
