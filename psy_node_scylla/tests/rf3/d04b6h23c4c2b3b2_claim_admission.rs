@@ -918,7 +918,13 @@ async fn overwrite_claim_fixture(
 }
 
 async fn ensure_qualification_fault_rejected(
-    router: &ScyllaRealmUserUpdateDurableRouter<PF, PHash, PoseidonHasher>,
+    router: &ScyllaRealmUserUpdateDurableRouter<
+        PF,
+        PHash,
+        PoseidonHasher,
+        PHash,
+        DeterministicEndCapVerifier,
+    >,
     gates: &ScyllaRealmUserUpdateAdmissionStore,
     jetstream: &jetstream::Context,
     stream_name: &str,
@@ -1695,12 +1701,15 @@ async fn run_nonempty_terminal_source_joint_rf3(
         PF,
         PHash,
         PoseidonHasher,
+        PHash,
+        DeterministicEndCapVerifier,
     >::prepare(
         session.clone(),
         capture.key().network(),
         realm(),
         height,
         20,
+        Arc::new(DeterministicEndCapVerifier),
         ready.clone(),
         nats_publisher.clone(),
         segment.clone(),
@@ -1843,12 +1852,15 @@ async fn run_nonempty_terminal_source_joint_rf3(
                 PF,
                 PHash,
                 PoseidonHasher,
+                PHash,
+                DeterministicEndCapVerifier,
             >::prepare(
                 session.clone(),
                 capture.key().network(),
                 realm(),
                 height,
                 20,
+                Arc::new(DeterministicEndCapVerifier),
                 ready.clone(),
                 nats_publisher.clone(),
                 segment.clone(),

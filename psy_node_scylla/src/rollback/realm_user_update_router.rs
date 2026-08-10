@@ -26,16 +26,17 @@ use psy_node_core::{
             RealmUserUpdateTerminalEvidence,
         },
         realm_user_update_artifact::{
-            rehydrate_realm_user_update_artifacts,
-            ValidatedRealmUserUpdateArtifacts, VerifiedRealmUserUpdateProof,
-            VerifiedRealmUserUpdateRequest,
+            verify_persisted_realm_user_update_request,
+            ValidatedRealmUserUpdateArtifacts, VerifiedRealmUserUpdateRequest,
         },
         realm_user_update_claim::{
             RealmUserUpdateClaimPartition, RealmUserUpdateClaimPhase,
             RealmUserUpdateCreatedAtSeconds,
             RealmUserUpdatePublishReceiptDigest, StoredRealmUserUpdateClaim,
         },
-        realm_user_update_dependency::RealmUserUpdateDependencyBundle,
+        realm_user_update_dependency::{
+            RealmUserUpdateDependencyBundle, RealmUserUpdateDependencyError,
+        },
         realm_user_update_publish::{
             GlobalUserTreeHeight, RealmUserUpdatePublishAdmission,
             RealmUserUpdatePublishPort, RealmUserUpdatePublishReceipt,
@@ -56,6 +57,7 @@ use super::{
     RealmUserUpdateClaimWriteOutcome, ScyllaRealmEdgeDurablePublisher,
     ScyllaRealmUserUpdateAdmissionGuard, ScyllaRealmUserUpdateAdmissionStore,
     ScyllaRealmUserUpdateClaimStore, ScyllaRealmUserUpdateDependencyStore,
+    RealmUserUpdateDependencyStoreError,
     PersistedRealmUserUpdateGenerationQualifiedReceipt,
     RealmUserUpdateQualificationInput,
 };
@@ -79,7 +81,13 @@ impl<Hash> RealmUserUpdateRouterReceipt<Hash> {
 
 }
 
-pub(crate) struct ScyllaRealmUserUpdateDurableRouter<F, Hash, Hasher> {
+pub(crate) struct ScyllaRealmUserUpdateDurableRouter<
+    F,
+    Hash,
+    Hasher,
+    Proof,
+    Verifier,
+> {
     network: NetworkId,
     authority: AuthorityScope,
     global_user_tree_height: GlobalUserTreeHeight,
@@ -88,14 +96,21 @@ pub(crate) struct ScyllaRealmUserUpdateDurableRouter<F, Hash, Hasher> {
     admission_guard: ScyllaRealmUserUpdateAdmissionGuard,
     dependencies: ScyllaRealmUserUpdateDependencyStore,
     publisher: ScyllaRealmEdgeDurablePublisher<F, Hash>,
-    _hasher: PhantomData<Hasher>,
+    verifier: Arc<Verifier>,
+    _proof: PhantomData<fn() -> (Hasher, Proof)>,
 }
 
-impl<F, Hash, Hasher> ScyllaRealmUserUpdateDurableRouter<F, Hash, Hasher>
+impl<F, Hash, Hasher, Proof, Verifier>
+    ScyllaRealmUserUpdateDurableRouter<F, Hash, Hasher, Proof, Verifier>
 where
-    F: QFelt64 + Send + Sync,
-    Hash: Q256BitHash + QFHashBase<F>,
-    Hasher: FieldQHasher<F, Hash>,
+    F: QFelt64 + Send + Sync + 'static,
+    Hash: Q256BitHash + QFHashBase<F> + Send + Sync + 'static,
+    Hasher: FieldQHasher<F, Hash> + Send + Sync + 'static,
+    Proof: 'static,
+    Verifier: parth_core::protocol::core_types::QZKProofVerifier<Hash, Proof>
+        + Send
+        + Sync
+        + 'static,
 {
     pub(crate) async fn prepare(
         session: Arc<Session>,
@@ -103,6 +118,7 @@ where
         authority: AuthorityScope,
         global_user_tree_height: GlobalUserTreeHeight,
         realm_user_tree_height: u8,
+        verifier: Arc<Verifier>,
         ready: Arc<PendingQueueSidecarReady>,
         nats: Arc<RecoverablePendingQueueNatsPublisher>,
         segment: RecoverableNatsStreamSegment,
@@ -169,7 +185,8 @@ where
             admission_guard,
             dependencies,
             publisher,
-            _hasher: PhantomData,
+            verifier,
+            _proof: PhantomData,
         })
     }
 
@@ -412,14 +429,14 @@ where
         Err(RealmUserUpdateRouterError::PhaseStepLimit)
     }
 
-    /// Resume one already-known claim coordinate. This performs semantic
-    /// revalidation with a concrete verifier receipt. Discovery/scanning of
-    /// claim coordinates is intentionally left to the next milestone.
+    /// Resume one already-known claim coordinate. The router owns the concrete
+    /// verifier and revalidates the durable canonical input/proof on a blocking
+    /// thread. The claim and bundle are read again after verification before a
+    /// Planned claim may advance to Ready.
     pub(crate) async fn resume_exact(
         &self,
         partition: RealmUserUpdateClaimPartition,
         user_id: UserId,
-        verified_proof: VerifiedRealmUserUpdateProof<Hash>,
     ) -> Result<RealmUserUpdateRouterReceipt<Hash>, RealmUserUpdateRouterError> {
         self.validate_user(user_id)?;
         let RealmUserUpdateClaimReadState::Current(mut current) = self
@@ -435,37 +452,56 @@ where
             return Err(RealmUserUpdateRouterError::AwaitExactRequestReplay);
         }
         if current.phase() == RealmUserUpdateClaimPhase::DependenciesPlanned {
-            let persisted = self.read_dependencies(&current).await?;
-            let candidate = StoredRealmUserUpdateClaim::dependencies_ready(&current)
-                .map_err(router)?;
-            current = self.advance_claim(&current, &candidate).await?;
-            if current.dependency_digest() != Some(persisted.digest()) {
+            let sampled = current.clone();
+            let persisted_before_verify = self.read_dependencies(&sampled).await?;
+            let persisted_before_verify = self
+                .verify_persisted_request(&sampled, persisted_before_verify)
+                .await?;
+
+            // Verification may take seconds. Never use the phase or dependency
+            // rows sampled before it as CAS authority.
+            current = self.read_same_request(&sampled).await?;
+            validate_post_verification_phase(
+                sampled.phase(),
+                sampled.revision().get(),
+                current.phase(),
+                current.revision().get(),
+            )?;
+            if current.dependency_digest()
+                != Some(persisted_before_verify.digest())
+            {
                 return Err(RealmUserUpdateRouterError::DependencyConflict);
+            }
+            let persisted_after_verify = self.read_dependencies(&current).await?;
+            if persisted_after_verify != persisted_before_verify {
+                return Err(RealmUserUpdateRouterError::DependencyConflict);
+            }
+            if current.phase() == RealmUserUpdateClaimPhase::DependenciesPlanned {
+                let candidate = StoredRealmUserUpdateClaim::dependencies_ready(&current)
+                    .map_err(router)?;
+                current = self.advance_claim(&current, &candidate).await?;
+                if current.dependency_digest()
+                    != Some(persisted_after_verify.digest())
+                {
+                    return Err(RealmUserUpdateRouterError::DependencyConflict);
+                }
             }
         }
         let persisted = self.read_dependencies(&current).await?;
-        let rehydrated = rehydrate_realm_user_update_artifacts::<F, Hash, Hasher>(
-            &current,
-            &persisted,
-            verified_proof,
-            self.global_user_tree_height,
-        )
-        .map_err(router)?;
-        if rehydrated.artifacts().request_digest() != current.request_digest() {
-            return Err(RealmUserUpdateRouterError::DependencyConflict);
-        }
         match current.phase() {
             RealmUserUpdateClaimPhase::DependenciesReady => {
-                self.publish_request_and_finish(
+                self.publish_and_finish(
                     current,
-                    rehydrated.into_publish_request(),
+                    persisted,
+                    self.global_user_tree_height,
                 )
                 .await
             }
             RealmUserUpdateClaimPhase::Published => {
-                self.observe_request_terminal(
+                self.observe_terminal(
                     current,
-                    rehydrated.into_publish_request(),
+                    persisted,
+                    self.global_user_tree_height,
                 )
                 .await
             }
@@ -474,6 +510,27 @@ where
                 Err(RealmUserUpdateRouterError::InvalidPhase)
             }
         }
+    }
+
+    async fn verify_persisted_request(
+        &self,
+        claim: &StoredRealmUserUpdateClaim<Hash>,
+        bundle: RealmUserUpdateDependencyBundle,
+    ) -> Result<RealmUserUpdateDependencyBundle, RealmUserUpdateRouterError> {
+        let claim = claim.clone();
+        let verifier = Arc::clone(&self.verifier);
+        let height = self.global_user_tree_height;
+        run_blocking_proof_recovery(move || {
+            verify_persisted_realm_user_update_request::<
+                F,
+                Hash,
+                Hasher,
+                Proof,
+                Verifier,
+            >(&claim, &bundle, height, verifier.as_ref())?;
+            Ok::<_, psy_node_core::queue::realm_user_update_artifact::RealmUserUpdateArtifactError>(bundle)
+        })
+        .await
     }
 
     async fn publish_and_finish(
@@ -606,7 +663,7 @@ where
         let digest = claim
             .dependency_digest()
             .ok_or(RealmUserUpdateRouterError::DependencyMissing)?;
-        self.dependencies
+        let result = self.dependencies
             .read_bundle(
                 claim.slot(),
                 *claim.request_digest().as_bytes(),
@@ -614,8 +671,11 @@ where
                 claim.created_at().get(),
                 digest,
             )
-            .await
-            .map_err(router)
+            .await;
+        match result {
+            Ok(bundle) => Ok(bundle),
+            Err(error) => Err(classify_dependency_read_error(claim.phase(), error)),
+        }
     }
 
     async fn advance_claim(
@@ -684,6 +744,69 @@ where
     }
 }
 
+async fn run_blocking_proof_recovery<T, E, Task>(
+    task: Task,
+) -> Result<T, RealmUserUpdateRouterError>
+where
+    T: Send + 'static,
+    E: fmt::Display + Send + 'static,
+    Task: FnOnce() -> Result<T, E> + Send + 'static,
+{
+    tokio::task::spawn_blocking(task)
+        .await
+        .map_err(|error| RealmUserUpdateRouterError::ProofTaskFailed(error.to_string()))?
+        .map_err(|error| RealmUserUpdateRouterError::ProofRecoveryFailed(error.to_string()))
+}
+
+fn validate_post_verification_phase(
+    sampled_phase: RealmUserUpdateClaimPhase,
+    sampled_revision: u64,
+    fresh_phase: RealmUserUpdateClaimPhase,
+    fresh_revision: u64,
+) -> Result<(), RealmUserUpdateRouterError> {
+    let phase_is_monotonic = match sampled_phase {
+        RealmUserUpdateClaimPhase::Claimed => true,
+        RealmUserUpdateClaimPhase::DependenciesPlanned => matches!(
+            fresh_phase,
+            RealmUserUpdateClaimPhase::DependenciesPlanned
+                | RealmUserUpdateClaimPhase::DependenciesReady
+                | RealmUserUpdateClaimPhase::Published
+        ),
+        RealmUserUpdateClaimPhase::DependenciesReady => matches!(
+            fresh_phase,
+            RealmUserUpdateClaimPhase::DependenciesReady
+                | RealmUserUpdateClaimPhase::Published
+        ),
+        RealmUserUpdateClaimPhase::Published => {
+            fresh_phase == RealmUserUpdateClaimPhase::Published
+        }
+    };
+    if fresh_revision < sampled_revision || !phase_is_monotonic {
+        return Err(RealmUserUpdateRouterError::PhaseRegression);
+    }
+    Ok(())
+}
+
+fn classify_dependency_read_error(
+    phase: RealmUserUpdateClaimPhase,
+    error: RealmUserUpdateDependencyStoreError,
+) -> RealmUserUpdateRouterError {
+    match error {
+        RealmUserUpdateDependencyStoreError::Dependency(
+            RealmUserUpdateDependencyError::MissingFragment,
+        ) if phase == RealmUserUpdateClaimPhase::DependenciesPlanned => {
+            RealmUserUpdateRouterError::AwaitExactArtifactReplay
+        }
+        RealmUserUpdateDependencyStoreError::Dependency(
+            RealmUserUpdateDependencyError::MissingFragment,
+        ) => RealmUserUpdateRouterError::DurableDependencyLoss,
+        RealmUserUpdateDependencyStoreError::Cql(error) => {
+            RealmUserUpdateRouterError::DependencyUnavailable(error)
+        }
+        error => RealmUserUpdateRouterError::DependencyCorruption(error.to_string()),
+    }
+}
+
 fn router(error: impl fmt::Display) -> RealmUserUpdateRouterError {
     RealmUserUpdateRouterError::Backend(error.to_string())
 }
@@ -697,6 +820,12 @@ pub(crate) enum RealmUserUpdateRouterError {
         current_revision: u64,
     },
     AwaitExactRequestReplay,
+    AwaitExactArtifactReplay,
+    DurableDependencyLoss,
+    DependencyCorruption(String),
+    DependencyUnavailable(String),
+    ProofTaskFailed(String),
+    ProofRecoveryFailed(String),
     DependencyMissing,
     DependencyConflict,
     TerminalEvidenceMismatch,
@@ -707,6 +836,7 @@ pub(crate) enum RealmUserUpdateRouterError {
     TerminalSourceMissing,
     QualificationConflict,
     TransitionConflict,
+    PhaseRegression,
     InvalidPhase,
     PhaseStepLimit,
     InvalidUserRange,
@@ -809,6 +939,28 @@ mod tests {
         let source = source.split("#[cfg(test)]").next().unwrap();
         assert!(source.contains("resume_exact"));
         assert!(source.contains("AwaitExactRequestReplay"));
+        assert!(source.contains("verifier: Arc<Verifier>"));
+        assert!(source.contains("tokio::task::spawn_blocking"));
+        assert!(source.contains("verify_persisted_realm_user_update_request::<"));
+        let resume = source.find("pub(crate) async fn resume_exact").unwrap();
+        let verify = source[resume..]
+            .find(".verify_persisted_request(")
+            .map(|offset| resume + offset)
+            .unwrap();
+        let fresh = source[verify..]
+            .find("self.read_same_request(&sampled).await?")
+            .map(|offset| verify + offset)
+            .unwrap();
+        let ready = source[fresh..]
+            .find("StoredRealmUserUpdateClaim::dependencies_ready")
+            .map(|offset| fresh + offset)
+            .unwrap();
+        assert!(verify < fresh && fresh < ready);
+        let signature_end = source[resume..]
+            .find(") -> Result<")
+            .map(|offset| resume + offset)
+            .unwrap();
+        assert!(!source[resume..signature_end].contains("VerifiedRealmUserUpdateProof"));
         assert!(!source.contains("resume_all"));
         assert!(!source.contains("ALLOW FILTERING"));
     }
@@ -820,5 +972,116 @@ mod tests {
         for forbidden in ["unwrap_or_default", "unwrap_or(RealmUserUpdate", "fallback"] {
             assert!(!source.contains(forbidden));
         }
+    }
+
+    #[test]
+    fn post_verification_phase_must_be_monotonic() {
+        use RealmUserUpdateClaimPhase::{
+            Claimed, DependenciesPlanned, DependenciesReady, Published,
+        };
+        for fresh in [DependenciesPlanned, DependenciesReady, Published] {
+            assert!(validate_post_verification_phase(
+                DependenciesPlanned,
+                2,
+                fresh,
+                2,
+            )
+            .is_ok());
+        }
+        assert_eq!(
+            validate_post_verification_phase(
+                DependenciesPlanned,
+                2,
+                Claimed,
+                3,
+            ),
+            Err(RealmUserUpdateRouterError::PhaseRegression),
+        );
+        assert_eq!(
+            validate_post_verification_phase(
+                DependenciesPlanned,
+                2,
+                DependenciesReady,
+                1,
+            ),
+            Err(RealmUserUpdateRouterError::PhaseRegression),
+        );
+        assert!(validate_post_verification_phase(
+            DependenciesReady,
+            3,
+            Published,
+            4,
+        )
+        .is_ok());
+        assert_eq!(
+            validate_post_verification_phase(Published, 4, DependenciesReady, 5),
+            Err(RealmUserUpdateRouterError::PhaseRegression),
+        );
+    }
+
+    #[test]
+    fn dependency_read_errors_are_phase_specific() {
+        let missing = || {
+            RealmUserUpdateDependencyStoreError::Dependency(
+                RealmUserUpdateDependencyError::MissingFragment,
+            )
+        };
+        assert_eq!(
+            classify_dependency_read_error(
+                RealmUserUpdateClaimPhase::DependenciesPlanned,
+                missing(),
+            ),
+            RealmUserUpdateRouterError::AwaitExactArtifactReplay,
+        );
+        for phase in [
+            RealmUserUpdateClaimPhase::DependenciesReady,
+            RealmUserUpdateClaimPhase::Published,
+        ] {
+            assert_eq!(
+                classify_dependency_read_error(phase, missing()),
+                RealmUserUpdateRouterError::DurableDependencyLoss,
+            );
+        }
+        assert!(matches!(
+            classify_dependency_read_error(
+                RealmUserUpdateClaimPhase::DependenciesPlanned,
+                RealmUserUpdateDependencyStoreError::Dependency(
+                    RealmUserUpdateDependencyError::ConflictingFragment,
+                ),
+            ),
+            RealmUserUpdateRouterError::DependencyCorruption(_)
+        ));
+        assert_eq!(
+            classify_dependency_read_error(
+                RealmUserUpdateClaimPhase::DependenciesPlanned,
+                RealmUserUpdateDependencyStoreError::Cql("offline".to_owned()),
+            ),
+            RealmUserUpdateRouterError::DependencyUnavailable(
+                "offline".to_owned(),
+            ),
+        );
+    }
+
+    #[tokio::test]
+    async fn blocking_proof_task_reports_rejection_and_panic() {
+        let rejected = run_blocking_proof_recovery::<(), _, _>(|| {
+            Err::<(), _>("rejected")
+        })
+        .await;
+        assert_eq!(
+            rejected,
+            Err(RealmUserUpdateRouterError::ProofRecoveryFailed(
+                "rejected".to_owned(),
+            )),
+        );
+
+        let panicked = run_blocking_proof_recovery::<(), &'static str, _>(|| {
+            panic!("verifier panic")
+        })
+        .await;
+        assert!(matches!(
+            panicked,
+            Err(RealmUserUpdateRouterError::ProofTaskFailed(_))
+        ));
     }
 }
