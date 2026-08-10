@@ -5,23 +5,48 @@ use std::{
     path::Path,
     process::Command,
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{bail, ensure, Context};
-use parth_core::{protocol::core_types::Q256BitHash, PHash};
-use psy_data::protocol::{
-    canonical_chain::{
-        CanonicalChainRef, ChainEpoch, CheckpointHash, CheckpointId,
-        CheckpointRef, NetworkId,
+use async_nats::jetstream::{
+    self,
+    consumer::pull::Config as PullConfig,
+    stream::Config as StreamConfig,
+};
+use parth_core::{
+    felt::FromPrimitiveValuesFelt,
+    pgoldilocks::PoseidonHasher,
+    protocol::core_types::{
+        Q256BitHash, QZKProofPublicInputsHasherReader, QZKProofVerifier,
     },
-    chain_context::{
-        AuthorityObservation, AuthorityScope, AuthorityStateCheckpointId,
-        AuthorityStateRoot, PendingContext, WorkProcCheckpointUniqueId,
-        WorkUniquePendingId,
+    utils::QPGenRandom,
+    PHash, PF,
+};
+use psy_core::job::job_id::QProvingJobDataID;
+use psy_data::{
+    proof_input::guta::end_cap_input::SubmitUserEndCapNonProofInput,
+    protocol::{
+        canonical_chain::{
+            CanonicalChainRef, ChainEpoch, CheckpointHash, CheckpointId,
+            CheckpointRef, NetworkId,
+        },
+        chain_context::{
+            AuthorityObservation, AuthorityScope, AuthorityStateCheckpointId,
+            AuthorityStateRoot, PendingContext, WorkProcCheckpointUniqueId,
+            WorkUniquePendingId,
+        },
     },
+    queue_items::realm_user_update::PsyRealmUserUpdateQueueItem,
 };
 use psy_node_core::{
+    qblob::{
+        blob_type::QBlobMerkleNodeTreeType,
+        data_views::{
+            double_merkle_node_batch::QBlobDoubleMerkleNodeBatchDataView,
+            single_merkle_node_batch::QBlobSingleMerkleNodeBatchDataView,
+        },
+    },
     queue::{
         realm_user_update_admission::{
             RealmUserUpdateAdmissionCloseIntent, RealmUserUpdateAdmissionKey,
@@ -31,10 +56,18 @@ use psy_node_core::{
         },
         realm_user_update_claim::{
             RealmUserUpdateAdmissionOrdinal, RealmUserUpdateClaimBucket,
-            RealmUserUpdateCreatedAtSeconds, StoredRealmUserUpdateClaim,
+            RealmUserUpdateClaimPhase, RealmUserUpdateCreatedAtSeconds,
+            StoredRealmUserUpdateClaim,
         },
+        realm_user_update_artifact::{
+            deterministic_qblob_context, RealmUserUpdateSlotEnvelope,
+            ValidatedRealmUserUpdateArtifacts, VerifiedRealmUserUpdateRequest,
+        },
+        realm_user_update_dependency::RealmUserUpdateDependencyBundle,
         realm_user_update_publish::{
-            RealmUserUpdatePublishAdmission, RealmUserUpdateRequestDigest,
+            GlobalUserTreeHeight, RealmUserUpdatePublishAdmission,
+            RealmUserUpdatePublishDisposition, RealmUserUpdatePublishReceipt,
+            RealmUserUpdatePublishRequest, RealmUserUpdateRequestDigest,
         },
         recoverable_ephemeral::PendingQueueCaptureContext,
     },
@@ -45,10 +78,23 @@ use psy_node_core::{
             PendingGenerationLedgerKey,
         },
         pending_generation_pipeline::{
-            PendingPipelineBootstrap, StoredPendingPipeline,
+            PendingPipelineBootstrap, PendingPipelineWriteOutcome,
+            StoredPendingPipeline,
         },
         pending_generation::ProcNamespacePrefix,
         typed::{UniquePendingId, UserId},
+    },
+};
+use psy_node_nats::{
+    queue::NatsJetStreamClient,
+    recoverable_assignment::PendingQueueSegmentLedgerBootstrap,
+    recoverable_publish::{
+        PendingQueueGenerationBudgetContract, PendingQueuePublisherKind,
+        PendingQueueSourceQuota,
+    },
+    recoverable_segment::{
+        RecoverableNatsRetentionContract, RecoverableNatsSegmentId,
+        RecoverableNatsStreamSegment,
     },
 };
 use scylla::{
@@ -129,9 +175,9 @@ fn admission(
     )?)
 }
 
-fn qualification_pipeline(
+fn qualification_pipeline_bootstrap(
     admission: &RealmUserUpdatePublishAdmission<PHash>,
-) -> anyhow::Result<StoredPendingPipeline<PHash>> {
+) -> anyhow::Result<PendingPipelineBootstrap<PHash>> {
     let capture = admission.capture();
     let gathering = capture.processing();
     let processing_pending = gathering
@@ -169,9 +215,15 @@ fn qualification_pipeline(
         gathering,
         observation,
         processing_pending,
-    )?
-    .candidate()
-    .clone())
+    )?)
+}
+
+fn qualification_pipeline(
+    admission: &RealmUserUpdatePublishAdmission<PHash>,
+) -> anyhow::Result<StoredPendingPipeline<PHash>> {
+    Ok(qualification_pipeline_bootstrap(admission)?
+        .candidate()
+        .clone())
 }
 
 fn request(user: u64) -> anyhow::Result<RealmUserUpdateRequestDigest> {
@@ -179,6 +231,233 @@ fn request(user: u64) -> anyhow::Result<RealmUserUpdateRequestDigest> {
         &user.to_be_bytes(),
         &user.wrapping_mul(17).to_be_bytes(),
     )?)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DeterministicEndCapVerifier;
+
+impl QZKProofPublicInputsHasherReader<PHash, PHash>
+    for DeterministicEndCapVerifier
+{
+    fn get_proof_public_inputs_hash(proof: &PHash) -> anyhow::Result<PHash> {
+        Ok(*proof)
+    }
+
+    fn try_proof_from_slice(bytes: &[u8]) -> anyhow::Result<PHash> {
+        PHash::from_slice_32bytes(bytes)
+    }
+}
+
+impl QZKProofVerifier<PHash, PHash> for DeterministicEndCapVerifier {
+    fn verify_zk_proof(
+        &self,
+        _circuit_type: u32,
+        proof: &PHash,
+    ) -> anyhow::Result<PHash> {
+        Ok(*proof)
+    }
+}
+
+fn verified_end_cap_request(
+    user_id: UserId,
+    height: GlobalUserTreeHeight,
+) -> anyhow::Result<VerifiedRealmUserUpdateRequest<PF, PHash>> {
+    let mut input = SubmitUserEndCapNonProofInput::<PF, PHash>::qp_rand_gen();
+    input.core.new_user_leaf.user_id = PF::from_u64_value(user_id.get());
+    input.core.state_transition.user_id = PF::from_u64_value(user_id.get());
+    let expected = input
+        .core
+        .get_proof_public_inputs_hash::<PoseidonHasher>(height.get());
+    VerifiedRealmUserUpdateRequest::<PF, PHash>::verify::<
+        PHash,
+        DeterministicEndCapVerifier,
+        PoseidonHasher,
+    >(
+        &input,
+        expected.to_vec_32bytes(),
+        height,
+        &DeterministicEndCapVerifier,
+    )
+    .map_err(Into::into)
+}
+
+struct RealmUserUpdateLiveFixture {
+    artifacts: ValidatedRealmUserUpdateArtifacts<PHash>,
+    bundle: RealmUserUpdateDependencyBundle,
+    publish_request: RealmUserUpdatePublishRequest<PF, PHash>,
+}
+
+fn live_artifacts_for_claim(
+    admission: &RealmUserUpdatePublishAdmission<PHash>,
+    claim: &StoredRealmUserUpdateClaim<PHash>,
+    verified_request: VerifiedRealmUserUpdateRequest<PF, PHash>,
+    height: GlobalUserTreeHeight,
+) -> anyhow::Result<RealmUserUpdateLiveFixture> {
+    ensure!(verified_request.user_id() == claim.user_id());
+    ensure!(verified_request.request_digest() == claim.request_digest());
+    ensure!(verified_request.global_user_tree_height() == height);
+    ensure!(&claim.reconstruct_admission()? == admission);
+
+    let input = verified_request.decode_input()?;
+    let job_id =
+        QProvingJobDataID::try_get_realm_edge_proof_store_output_proof_id_for_end_cap(
+            claim.user_id().get(),
+            height.get(),
+            admission.pending().unique_pending_id().get(),
+        )?;
+    let queue_item = PsyRealmUserUpdateQueueItem::new(
+        job_id,
+        claim.stable_status(),
+        input.core.state_transition.start_user_leaf_hash,
+        input.core.state_transition.end_user_leaf_hash,
+        input.core.new_user_leaf.clone(),
+        input.core.stats,
+        input.events.clone(),
+    );
+    let publish_request = RealmUserUpdatePublishRequest::try_new(
+        admission.clone(),
+        claim.user_id(),
+        verified_request.request_digest(),
+        height,
+        queue_item,
+    )?;
+
+    let context = deterministic_qblob_context(claim)?;
+    let mut contract_qblob = QBlobSingleMerkleNodeBatchDataView::
+        generate_single_merkle_node_batch_blob_data_from_ref::<PHash>(
+            context,
+            QBlobMerkleNodeTreeType::UserContractTree,
+            &[],
+        );
+    contract_qblob.extend_from_slice(
+        &QBlobDoubleMerkleNodeBatchDataView::
+            generate_double_merkle_node_batch_blob_data_from_ref::<PHash>(
+                context,
+                &[],
+            ),
+    );
+    let slot = RealmUserUpdateSlotEnvelope::try_new(
+        claim.pending().clone(),
+        claim.user_id(),
+        Vec::new(),
+    )?;
+    let artifacts = ValidatedRealmUserUpdateArtifacts::try_new::<PF>(
+        claim,
+        &verified_request,
+        contract_qblob,
+        slot,
+        &publish_request,
+    )?;
+    let bundle = RealmUserUpdateDependencyBundle::try_new_validated(
+        claim,
+        &artifacts,
+    )?;
+    Ok(RealmUserUpdateLiveFixture {
+        artifacts,
+        bundle,
+        publish_request,
+    })
+}
+
+fn retention() -> anyhow::Result<RecoverableNatsRetentionContract> {
+    Ok(RecoverableNatsRetentionContract::try_new(
+        3,
+        512 * 1024 * 1024,
+        128 * 1024 * 1024,
+        2,
+        16,
+    )?)
+}
+
+fn generation_budget(
+    authority: AuthorityScope,
+) -> anyhow::Result<PendingQueueGenerationBudgetContract> {
+    let mib = 1024 * 1024_u64;
+    Ok(PendingQueueGenerationBudgetContract::try_new(
+        authority,
+        vec![PendingQueueSourceQuota::try_new(
+            PendingQueuePublisherKind::RealmUserUpdate,
+            1_000,
+            127 * mib,
+            mib,
+        )?],
+        128 * mib,
+    )?)
+}
+
+async fn wait_for_stream_leader(
+    context: &jetstream::Context,
+    stream_name: &str,
+    excluded: Option<&str>,
+) -> anyhow::Result<String> {
+    for _ in 0..90 {
+        if let Ok(stream) = context.get_stream(stream_name).await {
+            if let Ok(info) = stream.get_info().await {
+                if let Some(leader) = info.cluster.and_then(|cluster| cluster.leader) {
+                    if excluded != Some(leader.as_str()) {
+                        return Ok(leader);
+                    }
+                }
+            }
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
+    bail!("stream did not elect the expected leader")
+}
+
+fn signal_c2b_nats(server_name: &str, signal: &str) -> anyhow::Result<()> {
+    let variable = match server_name {
+        "psy-h23c2b-n1" => "PSY_D04B6H23C4C2B3B2C2B_NATS1_PID",
+        "psy-h23c2b-n2" => "PSY_D04B6H23C4C2B3B2C2B_NATS2_PID",
+        "psy-h23c2b-n3" => "PSY_D04B6H23C4C2B3B2C2B_NATS3_PID",
+        other => bail!("unexpected NATS server {other}"),
+    };
+    let pid = std::env::var(variable)?.parse::<u32>()?;
+    let status = Command::new("kill")
+        .arg(signal)
+        .arg(pid.to_string())
+        .status()?;
+    ensure!(status.success(), "failed to signal {server_name}");
+    Ok(())
+}
+
+async fn stream_state(
+    context: &jetstream::Context,
+    stream_name: &str,
+) -> anyhow::Result<(u64, u64, u64, u64, u64, u64)> {
+    let info = context.get_stream(stream_name).await?.get_info().await?;
+    Ok((
+        info.state.messages,
+        info.state.bytes,
+        info.state.first_sequence,
+        info.state.last_sequence,
+        u64::try_from(info.state.consumer_count)?,
+        info.state.subjects_count,
+    ))
+}
+
+fn current_pipeline(
+    outcome: PendingPipelineWriteOutcome<PHash>,
+) -> anyhow::Result<StoredPendingPipeline<PHash>> {
+    match outcome {
+        PendingPipelineWriteOutcome::Applied(current)
+        | PendingPipelineWriteOutcome::Idempotent(current) => Ok(current),
+        PendingPipelineWriteOutcome::Conflict(current) => {
+            bail!("pipeline conflict at revision {}", current.revision().get())
+        }
+    }
+}
+
+fn ensure_same_durable_publication(
+    expected: &RealmUserUpdatePublishReceipt,
+    observed: &RealmUserUpdatePublishReceipt,
+) -> anyhow::Result<()> {
+    ensure!(observed.intent_id() == expected.intent_id());
+    ensure!(observed.assignment_digest() == expected.assignment_digest());
+    ensure!(observed.subject_sequence() == expected.subject_sequence());
+    ensure!(observed.envelope_digest() == expected.envelope_digest());
+    ensure!(observed.receipt_digest() == expected.receipt_digest());
+    Ok(())
 }
 
 fn user_in_bucket(bucket: u16, start: u64) -> u64 {
@@ -946,6 +1225,390 @@ async fn d04b6h23c4c2b3b2c2a_qualification_store_rf3_gate(
     let report_path =
         std::env::var("PSY_D04B6H23C4C2B3B2C2A_REPORT_PATH")?;
     std::fs::write(&report_path, serde_json::to_vec_pretty(&report)?)?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct NonemptyTerminalSourceReport {
+    image: &'static str,
+    scylla_replication_factor: u8,
+    nats_servers: u8,
+    nats_stream_replicas: u8,
+    schema_version: u16,
+    target_tables: usize,
+    terminal_claims: usize,
+    source_sequences: Vec<u64>,
+    historical_intent_after_cursor_advance: bool,
+    caller_discard_exact_retry: bool,
+    scylla_one_replica_offline: bool,
+    nats_leader_before: String,
+    nats_leader_after: String,
+    nats_leader_failover: bool,
+    qualification_nats_publish_delta: i64,
+    repair_flush_compact: bool,
+    direct_one_nodes_equal: usize,
+    qualification_ms: u64,
+    qualification: &'static str,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires isolated Scylla RF=3 and NATS RF=3 runner"]
+async fn d04b6h23c4c2b3b2c2b_nonempty_terminal_source_joint_rf3(
+) -> anyhow::Result<()> {
+    ensure!(
+        std::env::var("PSY_D04B6H23C4C2B3B2C2B_RF3").as_deref()
+            == Ok("1"),
+        "run through tests/rf3/run-d04b6h23c4c2b3b2c2b.sh"
+    );
+    let compose_file =
+        std::env::var("PSY_D04B6H23C4C2B3B2C2B_COMPOSE_FILE")?;
+    let report_path =
+        std::env::var("PSY_D04B6H23C4C2B3B2C2B_REPORT_PATH")?;
+    let nats_urls =
+        std::env::var("PSY_D04B6H23C4C2B3B2C2B_NATS_URLS")?
+            .split(',')
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+    ensure!(nats_urls.len() == 3);
+
+    wait_up(3).await?;
+    let session = Arc::new(connect(None, Consistency::Quorum).await?);
+    session
+        .query_unpaged(
+            format!("CREATE KEYSPACE IF NOT EXISTS {DATA} WITH replication = {{'class': 'NetworkTopologyStrategy', 'datacenter1': 3}}"),
+            &[],
+        )
+        .await?;
+    session
+        .query_unpaged(
+            format!("CREATE KEYSPACE IF NOT EXISTS {} WITH replication = {{'class': 'NetworkTopologyStrategy', 'datacenter1': 3}} AND tablets = {{'enabled': false}}", control()),
+            &[],
+        )
+        .await?;
+    session.await_schema_agreement().await?;
+    let keyspaces = PendingQueueSidecarKeyspaces::try_new(DATA, control())?;
+    PendingQueueSidecarDeploymentExecutor::deploy(
+        session.clone(),
+        keyspaces.clone(),
+    )
+    .await?;
+    let ready = Arc::new(
+        ScyllaPendingQueueSidecarSetupGate::authorize(
+            session.clone(),
+            keyspaces,
+            realm(),
+        )
+        .await?,
+    );
+
+    let generation = 10;
+    let expected_admission = admission(generation)?;
+    let capture = expected_admission.capture();
+    let control_keyspace =
+        BranchExactDeploymentNoTabletKeyspace::try_new(control())?;
+    let pipeline_store = ScyllaPendingPipelineStore::prepare(
+        session.clone(),
+        control_keyspace.clone(),
+    )
+    .await?;
+    let pipeline = current_pipeline(
+        pipeline_store
+            .bootstrap(&qualification_pipeline_bootstrap(
+                &expected_admission,
+            )?)
+            .await?,
+    )?;
+    ensure!(pipeline.gathering() == capture.processing());
+    ensure!(pipeline.frontier().chain() == expected_admission.pending().chain());
+
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64;
+    let base = format!("psy_h23c2b_{nonce}");
+    let segment = RecoverableNatsStreamSegment::try_new(
+        base.clone(),
+        capture.key(),
+        RecoverableNatsSegmentId::try_new(1)?,
+        retention()?,
+    )?;
+    let validated =
+        segment.validate_stream_config_structure(&segment.stream_config())?;
+    let ledger_bootstrap = PendingQueueSegmentLedgerBootstrap::try_new(
+        capture.key(),
+        &validated,
+        generation_budget(realm())?,
+        1,
+    )?;
+    let ledger_key = ledger_bootstrap.candidate().key().clone();
+    let ledger = ScyllaPendingQueueSegmentLedgerStore::prepare(
+        session.clone(),
+        control_keyspace,
+    )
+    .await?;
+    ledger.bootstrap(&ledger_bootstrap).await?;
+    let assignment = ledger.reserve_generation(&ledger_key, capture).await?;
+    ensure!(assignment.assignment().context() == capture);
+
+    let raw_nats = async_nats::connect(nats_urls.clone()).await?;
+    let jetstream = jetstream::new(raw_nats);
+    jetstream.create_stream(segment.stream_config()).await?;
+    let nats_client = Arc::new(
+        NatsJetStreamClient::new_connection(
+            base,
+            nats_urls,
+            PullConfig::default(),
+            PullConfig::default(),
+            StreamConfig::default(),
+        )
+        .await?,
+    );
+    let nats_publisher = Arc::new(
+        nats_client
+            .recoverable_pending_publisher(segment.clone())
+            .await?,
+    );
+    let height = GlobalUserTreeHeight::try_new(32)?;
+    let router = ScyllaRealmUserUpdateDurableRouter::<
+        PF,
+        PHash,
+        PoseidonHasher,
+    >::prepare(
+        session.clone(),
+        capture.key().network(),
+        realm(),
+        height,
+        20,
+        ready.clone(),
+        nats_publisher.clone(),
+        segment.clone(),
+    )
+    .await?;
+    ensure!(router.admit().await? == expected_admission);
+    let (_, _, guard, provisioned_admission, key) =
+        provisioned(session.clone(), generation).await?;
+    ensure!(provisioned_admission == expected_admission);
+
+    let first_user = UserId::new((7_u64 << 20) + 11);
+    let second_user = UserId::new((7_u64 << 20) + 12);
+    let mut fixtures = Vec::new();
+    let mut terminals = Vec::new();
+    let mut initial_nats_leader = None;
+    let mut failover_nats_leader = None;
+    for (index, user) in [first_user, second_user].into_iter().enumerate() {
+        let verified = verified_end_cap_request(user, height)?;
+        let winner = router
+            .claim(
+                expected_admission.clone(),
+                &verified,
+                RealmUserUpdateCreatedAtSeconds::try_new(
+                    1_700_000_010 + u32::try_from(index)?,
+                )?,
+            )
+            .await?;
+        let fixture = live_artifacts_for_claim(
+            &expected_admission,
+            &winner,
+            verified,
+            height,
+        )?;
+        let terminal = router
+            .complete_live(&winner, &fixture.artifacts)
+            .await
+            .with_context(|| format!("complete live claim {index}"))?;
+        ensure!(terminal.claim().phase() == RealmUserUpdateClaimPhase::Published);
+        ensure!(
+            terminal.claim().publish_receipt_digest().map(|value| *value.as_bytes())
+                == Some(*terminal.publication().receipt_digest())
+        );
+        let exact_retry = router
+            .complete_live(&winner, &fixture.artifacts)
+            .await
+            .with_context(|| format!("retry complete live claim {index}"))?;
+        ensure!(exact_retry.claim() == terminal.claim());
+        ensure_same_durable_publication(
+            terminal.publication(),
+            exact_retry.publication(),
+        )?;
+        ensure!(
+            exact_retry.publication().disposition()
+                == RealmUserUpdatePublishDisposition::DurableResumed
+        );
+        fixtures.push(fixture);
+        terminals.push(terminal);
+
+        if index == 0 {
+            let leader = wait_for_stream_leader(
+                &jetstream,
+                segment.stream_name(),
+                None,
+            )
+            .await?;
+            // Terminate rather than SIGSTOP the current leader. A stopped
+            // process leaves the TCP socket half-open and can pin the client
+            // until its long request timeout; termination exercises the same
+            // JetStream replica failover while forcing prompt reconnect.
+            signal_c2b_nats(&leader, "-TERM")?;
+            let replacement = wait_for_stream_leader(
+                &jetstream,
+                segment.stream_name(),
+                Some(&leader),
+            )
+            .await?;
+            initial_nats_leader = Some(leader);
+            failover_nats_leader = Some(replacement);
+        }
+    }
+    ensure!(
+        terminals[0].publication().subject_sequence()
+            < terminals[1].publication().subject_sequence()
+    );
+
+    let historical_observer = ScyllaRealmEdgeDurablePublisher::<PF, PHash>::prepare(
+        session.clone(),
+        capture.key().network(),
+        realm(),
+        ready,
+        nats_publisher,
+        segment.clone(),
+    )
+    .await?;
+    let historical = historical_observer
+        .observe_authorized(fixtures[0].publish_request.clone())
+        .await
+        .context("observe first historical committed source")?
+        .context("first source intent must remain historically observable")?;
+    ensure_same_durable_publication(
+        terminals[0].publication(),
+        historical.receipt(),
+    )?;
+    ensure!(
+        historical.receipt().disposition()
+            == RealmUserUpdatePublishDisposition::DurableResumed
+    );
+    let historical_intent_after_cursor_advance = true;
+
+    let dependency_store = ScyllaRealmUserUpdateDependencyStore::prepare(
+        session.clone(),
+        PendingQueueArtifactDataKeyspace::try_new(DATA)?,
+    )
+    .await?;
+    for (terminal, fixture) in terminals.iter().zip(&fixtures) {
+        let readback = dependency_store
+            .read_bundle(
+                terminal.claim().slot(),
+                *terminal.claim().request_digest().as_bytes(),
+                terminal.claim().stable_status(),
+                terminal.claim().created_at().get(),
+                fixture.bundle.digest(),
+            )
+            .await
+            .context("read exact dependency bundle")?;
+        ensure!(readback == fixture.bundle);
+    }
+
+    let close = close_intent(key)?;
+    let closed = guard.close_generation::<PHash>(key, close).await?;
+    ensure!(closed.phase() == RealmUserUpdateAdmissionPhase::GenerationClosed);
+    ensure!(closed.generation_manifest().unwrap().total().count() == 2);
+    let nats_before = stream_state(&jetstream, segment.stream_name()).await?;
+
+    let leader_before = initial_nats_leader.context("initial NATS leader missing")?;
+    let leader_after_failover =
+        failover_nats_leader.context("failover NATS leader missing")?;
+    compose(Path::new(&compose_file), &["stop", "scylla3"])?;
+    wait_up(2).await?;
+    let qualification_started = Instant::now();
+    let qualified = router
+        .qualify_generation(key, close)
+        .await
+        .context("qualify non-empty generation")?;
+    let qualification_ms = qualification_started.elapsed().as_millis() as u64;
+    ensure!(
+        qualified.current().phase()
+            == RealmUserUpdateAdmissionPhase::GenerationQualified
+    );
+    let retry = router
+        .qualify_generation(key, close)
+        .await
+        .context("retry non-empty qualification")?;
+    ensure!(retry.current() == qualified.current());
+    let caller_discard_exact_retry = true;
+    let nats_after = stream_state(&jetstream, segment.stream_name()).await?;
+    ensure!(nats_before == nats_after);
+    let qualification_nats_publish_delta =
+        i64::try_from(nats_after.0)? - i64::try_from(nats_before.0)?;
+    ensure!(qualification_nats_publish_delta == 0);
+    let current_leader = wait_for_stream_leader(
+        &jetstream,
+        segment.stream_name(),
+        None,
+    )
+    .await?;
+    ensure!(current_leader == leader_after_failover);
+    let nats_leader_failover = leader_before != leader_after_failover;
+
+    compose(Path::new(&compose_file), &["start", "scylla3"])?;
+    wait_up(3).await?;
+    for server in ["psy-h23c2b-n1", "psy-h23c2b-n2", "psy-h23c2b-n3"] {
+        let _ = signal_c2b_nats(server, "-CONT");
+    }
+    sleep(Duration::from_secs(3)).await;
+    let control_name = control();
+    docker_exec_retry(
+        NODE_CONTAINERS[0],
+        &["nodetool", "cluster", "repair", DATA],
+        24,
+    )?;
+    for node in NODE_CONTAINERS {
+        docker_exec_retry(
+            node,
+            &["nodetool", "repair", "-pr", control_name.as_str()],
+            24,
+        )?;
+        for keyspace in [DATA, control_name.as_str()] {
+            docker_exec(node, &["nodetool", "flush", keyspace])?;
+            docker_exec(node, &["nodetool", "compact", keyspace])?;
+        }
+    }
+    let mut direct = Vec::new();
+    for ip in NODE_IPS {
+        let local = connect(Some(ip), Consistency::One).await?;
+        direct.push(direct_snapshot(&local, capture).await?);
+    }
+    let direct_one_nodes_equal = direct
+        .windows(2)
+        .all(|pair| pair[0] == pair[1])
+        .then_some(direct.len())
+        .unwrap_or(0);
+    ensure!(direct_one_nodes_equal == 3);
+    ensure!(direct[0].gates.len() == 257);
+    ensure!(direct[0].claims.len() == 2);
+
+    let report = NonemptyTerminalSourceReport {
+        image: IMAGE,
+        scylla_replication_factor: 3,
+        nats_servers: 3,
+        nats_stream_replicas: 3,
+        schema_version: PENDING_QUEUE_SIDECAR_SCHEMA_VERSION,
+        target_tables: PENDING_QUEUE_SIDECAR_TARGET_TABLE_COUNT,
+        terminal_claims: terminals.len(),
+        source_sequences: terminals
+            .iter()
+            .map(|terminal| terminal.publication().subject_sequence())
+            .collect(),
+        historical_intent_after_cursor_advance,
+        caller_discard_exact_retry,
+        scylla_one_replica_offline: true,
+        nats_leader_before: leader_before,
+        nats_leader_after: leader_after_failover,
+        nats_leader_failover,
+        qualification_nats_publish_delta,
+        repair_flush_compact: true,
+        direct_one_nodes_equal,
+        qualification_ms,
+        qualification:
+            "H23C4C2B3B2C2B_NONEMPTY_TERMINAL_SOURCE_RF3_PASSED",
+    };
+    std::fs::write(report_path, serde_json::to_vec_pretty(&report)?)?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }

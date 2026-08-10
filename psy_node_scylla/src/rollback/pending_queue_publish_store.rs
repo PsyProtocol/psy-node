@@ -468,6 +468,14 @@ impl ScyllaPendingQueuePublishStore {
         assignment_receipt: &PendingQueueSegmentAssignmentReceipt,
         publisher_kind: PendingQueuePublisherKind,
     ) -> Result<PendingQueuePublishSourceState, PendingQueuePublishStoreError> {
+        match self
+            .require_source(assignment_receipt, publisher_kind)
+            .await
+        {
+            Ok(current) => return Ok(current),
+            Err(PendingQueuePublishStoreError::SourceUninitialized) => {}
+            Err(error) => return Err(error),
+        }
         let assignment = assignment_receipt.assignment();
         self.validate_assignment(assignment)?;
         let route = RecoverableNatsSourceRoute::try_new(
@@ -481,7 +489,18 @@ impl ScyllaPendingQueuePublishStore {
             payload: candidate.to_persisted_bytes(),
         };
         let execution = self.session.execute_unpaged(&self.bootstrap_source, binding).await;
-        self.finish_source_write(execution, &candidate).await
+        match self.finish_source_write(execution, &candidate).await {
+            Ok(current) => Ok(current),
+            // Another exact publisher may have bootstrapped and already
+            // advanced this source between the pre-read and IF NOT EXISTS.
+            // Re-read through require_source so only the same assignment and
+            // artifact identity are accepted; a foreign source remains a
+            // hard conflict.
+            Err(PendingQueuePublishStoreError::CasConflict) => {
+                self.require_source(assignment_receipt, publisher_kind).await
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub async fn materialize_data(
@@ -711,7 +730,36 @@ impl ScyllaPendingQueuePublishStore {
             &self.segment,
         )
         .map_err(model_envelope)?;
-        let mut source = self.require_source(assignment_receipt, publisher_kind).await?;
+        let mut source = match self
+            .require_source(assignment_receipt, publisher_kind)
+            .await
+        {
+            Ok(source) => source,
+            Err(PendingQueuePublishStoreError::SourceUninitialized) => {
+                // Before the first live publish neither the source cursor nor
+                // this exact intent exists.  That is a clean "not observed"
+                // result, not recovery evidence.  Conversely, an intent with
+                // a missing source cursor is inconsistent durable state and
+                // must remain fail closed: allowing the caller to bootstrap a
+                // new cursor could duplicate an already accepted envelope.
+                let candidate = PendingQueuePublishSourceState::bootstrap(
+                    &route,
+                    assignment,
+                )
+                .map_err(model_envelope)?;
+                let (expected, _) = StoredPendingQueuePublishIntent::materialize_data(
+                    &candidate,
+                    intent_id,
+                    payload,
+                )
+                .map_err(model_outbox)?;
+                if self.read_intent(expected.slot()).await?.is_none() {
+                    return Ok(None);
+                }
+                return Err(PendingQueuePublishStoreError::SourceUninitialized);
+            }
+            Err(error) => return Err(error),
+        };
         let (expected, _) = StoredPendingQueuePublishIntent::materialize_data(
             &source,
             intent_id,

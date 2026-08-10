@@ -312,7 +312,7 @@ impl<F: QFelt64, Hash: Q256BitHash> ScyllaRealmEdgeDurablePublisher<F, Hash> {
         self.publish
             .bootstrap_source(&assignment, kind)
             .await
-            .map_err(storage)?;
+            .map_err(|error| storage_at("bootstrap source", error))?;
         let intent_id = PendingQueuePublishIntentId::try_new(
             *request.intent_id().as_bytes(),
         )
@@ -321,7 +321,7 @@ impl<F: QFelt64, Hash: Q256BitHash> ScyllaRealmEdgeDurablePublisher<F, Hash> {
             .publish
             .materialize_data(&assignment, kind, intent_id, request.payload())
             .await
-            .map_err(storage)?;
+            .map_err(|error| storage_at("materialize data", error))?;
         let PendingPipelineReadState::Current(fresh) =
             self.pipeline.read::<Hash>(key).await.map_err(|error| {
                 RealmUserUpdatePublishError::Storage(error.to_string())
@@ -353,7 +353,7 @@ impl<F: QFelt64, Hash: Q256BitHash> ScyllaRealmEdgeDurablePublisher<F, Hash> {
                     {
                         tokio::task::yield_now().await;
                     }
-                    Err(error) => return Err(storage(error)),
+                    Err(error) => return Err(storage_at("bind materialized", error)),
                 }
             }
         };
@@ -361,7 +361,7 @@ impl<F: QFelt64, Hash: Q256BitHash> ScyllaRealmEdgeDurablePublisher<F, Hash> {
             .publish
             .publish_and_commit(&assignment, permit)
             .await
-            .map_err(storage)?;
+            .map_err(|error| storage_at("publish and commit", error))?;
         let receipt = RealmUserUpdatePublishReceipt::durable(
             request.intent_id(),
             *assignment.assignment().digest().as_bytes(),
@@ -457,6 +457,18 @@ fn storage(error: PendingQueuePublishStoreError) -> RealmUserUpdatePublishError 
             RealmUserUpdatePublishError::Transport(message)
         }
         other => RealmUserUpdatePublishError::Storage(other.to_string()),
+    }
+}
+
+fn storage_at(
+    stage: &'static str,
+    error: PendingQueuePublishStoreError,
+) -> RealmUserUpdatePublishError {
+    match error {
+        PendingQueuePublishStoreError::Nats(message) => {
+            RealmUserUpdatePublishError::Transport(format!("{stage}: {message}"))
+        }
+        other => RealmUserUpdatePublishError::Storage(format!("{stage}: {other}")),
     }
 }
 
