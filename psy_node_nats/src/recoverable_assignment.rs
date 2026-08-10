@@ -2,9 +2,12 @@
 //!
 //! Capacity is reserved once per pending generation, not once per queue
 //! source. Coordinator's three expected sources and Realm's one source then
-//! bind the same immutable assignment receipt. Rotation and release are
-//! intentionally absent until c2b2/c2b3 can prove encoded Data/Seal bytes and
-//! a complete terminal member manifest.
+//! bind the same immutable assignment receipt. Active-segment rotation is a
+//! two-step durable transition: a capacity-closed active segment first stages
+//! exactly one successor, and only a separately persisted Provisioned binding
+//! may activate it. Old assignments remain bound to their original segment.
+//! Segment release remains outside this model and requires the complete
+//! terminal/lifecycle evidence owned by the storage layer.
 
 use std::{error::Error, fmt};
 
@@ -24,15 +27,16 @@ use psy_node_core::{
 use sha2::{Digest, Sha256};
 
 use crate::recoverable_segment::{
-    RecoverableNatsSegmentContractDigest, StructurallyValidatedRecoverableNatsSegment,
-    RecoverableNatsSegmentId, RECOVERABLE_NATS_CAPACITY_HEADROOM_BYTES,
+    RecoverableNatsRetentionContract, RecoverableNatsSegmentContractDigest,
+    RecoverableNatsSegmentId, RecoverableNatsStreamSegment,
+    StructurallyValidatedRecoverableNatsSegment, RECOVERABLE_NATS_CAPACITY_HEADROOM_BYTES,
 };
 use crate::recoverable_publish::{
     PendingQueueGenerationBudgetContract, PendingQueueGenerationBudgetDigest,
     PendingQueueSourceQuota,
 };
 
-pub const PENDING_QUEUE_SEGMENT_LEDGER_CODEC_VERSION: u16 = 3;
+pub const PENDING_QUEUE_SEGMENT_LEDGER_CODEC_VERSION: u16 = 4;
 pub const MAX_PENDING_QUEUE_SEGMENT_LEDGER_BYTES: usize = 1024 * 1024;
 pub const MAX_GENERATIONS_PER_LIVE_SEGMENT: u32 = 4096;
 const LEDGER_SLOT_DOMAIN: &[u8] = b"psy/rollback/pending-queue-segment-ledger-slot/v1";
@@ -149,7 +153,7 @@ impl PendingQueueSegmentLedgerKey {
 pub struct PendingQueueLiveSegment {
     segment_id: RecoverableNatsSegmentId,
     contract_digest: RecoverableNatsSegmentContractDigest,
-    max_stream_bytes: i64,
+    retention: RecoverableNatsRetentionContract,
     reserved_bytes: i64,
     generation_count: u32,
 }
@@ -164,7 +168,11 @@ impl PendingQueueLiveSegment {
     }
 
     pub const fn max_stream_bytes(&self) -> i64 {
-        self.max_stream_bytes
+        self.retention.max_stream_bytes()
+    }
+
+    pub const fn retention(&self) -> RecoverableNatsRetentionContract {
+        self.retention
     }
 
     pub const fn reserved_bytes(&self) -> i64 {
@@ -335,6 +343,7 @@ pub struct StoredPendingQueueSegmentLedger {
     revision: PendingQueueSegmentLedgerRevision,
     active_segment_id: RecoverableNatsSegmentId,
     highest_segment_id: RecoverableNatsSegmentId,
+    staged_segment_id: Option<RecoverableNatsSegmentId>,
     max_live_segments: u16,
     max_generations_per_segment: u32,
     generation_admission_budget_bytes: i64,
@@ -359,6 +368,10 @@ impl StoredPendingQueueSegmentLedger {
 
     pub const fn highest_segment_id(&self) -> RecoverableNatsSegmentId {
         self.highest_segment_id
+    }
+
+    pub const fn staged_segment_id(&self) -> Option<RecoverableNatsSegmentId> {
+        self.staged_segment_id
     }
 
     pub const fn generation_admission_budget_bytes(&self) -> i64 {
@@ -390,6 +403,58 @@ impl StoredPendingQueueSegmentLedger {
             .find(|assignment| assignment.context.digest() == context.digest())
     }
 
+    pub fn live_segment(
+        &self,
+        segment_id: RecoverableNatsSegmentId,
+    ) -> Option<&PendingQueueLiveSegment> {
+        self.live_segments
+            .iter()
+            .find(|segment| segment.segment_id == segment_id)
+    }
+
+    pub fn stream_segment(
+        &self,
+        segment_id: RecoverableNatsSegmentId,
+    ) -> Result<RecoverableNatsStreamSegment, PendingQueueSegmentLedgerError> {
+        let live = self
+            .live_segment(segment_id)
+            .ok_or(PendingQueueSegmentLedgerError::StagedSegmentMissing)?;
+        let segment = RecoverableNatsStreamSegment::try_new(
+            self.key.base_namespace.clone(),
+            self.key.generation_key,
+            live.segment_id,
+            live.retention,
+        )?;
+        if segment.digest() != live.contract_digest {
+            return Err(PendingQueueSegmentLedgerError::RotationSegmentMismatch);
+        }
+        Ok(segment)
+    }
+
+    pub const fn max_live_segments(&self) -> u16 {
+        self.max_live_segments
+    }
+
+    pub fn active_can_admit_generation(&self) -> Result<bool, PendingQueueSegmentLedgerError> {
+        if self.staged_segment_id.is_some() {
+            return Ok(false);
+        }
+        let active = self
+            .live_segment(self.active_segment_id)
+            .ok_or(PendingQueueSegmentLedgerError::ActiveSegmentMissing)?;
+        if active.generation_count >= self.max_generations_per_segment {
+            return Ok(false);
+        }
+        let next_reserved = active
+            .reserved_bytes
+            .checked_add(self.generation_admission_budget_bytes)
+            .ok_or(PendingQueueSegmentLedgerError::CapacityOverflow)?;
+        let next_required = next_reserved
+            .checked_add(self.capacity_headroom_bytes)
+            .ok_or(PendingQueueSegmentLedgerError::CapacityOverflow)?;
+        Ok(next_required <= active.max_stream_bytes())
+    }
+
     pub fn reserve_generation(
         &self,
         context: PendingQueueCaptureContext,
@@ -410,6 +475,9 @@ impl StoredPendingQueueSegmentLedger {
                 && assignment.context != context
         }) {
             return Err(PendingQueueSegmentLedgerError::GenerationIdentityConflict);
+        }
+        if self.staged_segment_id.is_some() {
+            return Err(PendingQueueSegmentLedgerError::RotationInProgress);
         }
         let active_index = self
             .live_segments
@@ -433,7 +501,7 @@ impl StoredPendingQueueSegmentLedger {
         let required_capacity = reserved_bytes
             .checked_add(self.capacity_headroom_bytes)
             .ok_or(PendingQueueSegmentLedgerError::CapacityOverflow)?;
-        if required_capacity > active.max_stream_bytes {
+        if required_capacity > active.max_stream_bytes() {
             return Err(PendingQueueSegmentLedgerError::SegmentCapacityExceeded);
         }
         let expected_source_count = expected_source_count(self.key.generation_key.authority());
@@ -476,6 +544,160 @@ impl StoredPendingQueueSegmentLedger {
         })
     }
 
+    /// Persist one exact successor before any NATS create/provision action.
+    /// This CAS is the stop-admit linearization point for the old active
+    /// segment. Until activation, neither segment accepts a new assignment.
+    pub fn stage_next_rotation(
+        &self,
+    ) -> Result<PendingQueueSegmentRotationStagePlan, PendingQueueSegmentLedgerError> {
+        if let Some(staged_segment_id) = self.staged_segment_id {
+            let staged = self.stream_segment(staged_segment_id)?;
+            return self.stage_rotation(&staged);
+        }
+        let active = self
+            .live_segment(self.active_segment_id)
+            .ok_or(PendingQueueSegmentLedgerError::ActiveSegmentMissing)?;
+        let next_id = RecoverableNatsSegmentId::try_new(
+            self.highest_segment_id
+                .get()
+                .checked_add(1)
+                .ok_or(PendingQueueSegmentLedgerError::SegmentIdOverflow)?,
+        )?;
+        let next = RecoverableNatsStreamSegment::try_new(
+            self.key.base_namespace.clone(),
+            self.key.generation_key,
+            next_id,
+            active.retention,
+        )?;
+        self.stage_rotation(&next)
+    }
+
+    pub fn stage_rotation(
+        &self,
+        segment: &RecoverableNatsStreamSegment,
+    ) -> Result<PendingQueueSegmentRotationStagePlan, PendingQueueSegmentLedgerError> {
+        self.validate_rotation_segment(segment)?;
+        if let Some(staged_id) = self.staged_segment_id {
+            let staged = self
+                .live_segment(staged_id)
+                .ok_or(PendingQueueSegmentLedgerError::StagedSegmentMissing)?;
+            return if staged.segment_id == segment.segment_id()
+                && staged.contract_digest == segment.digest()
+                && staged.retention == segment.retention()
+            {
+                Ok(PendingQueueSegmentRotationStagePlan::Idempotent {
+                    current: self.clone(),
+                    staged: staged.clone(),
+                })
+            } else {
+                Err(PendingQueueSegmentLedgerError::RotationConflict)
+            };
+        }
+        if self.active_can_admit_generation()? {
+            return Err(PendingQueueSegmentLedgerError::SegmentStillAdmitting);
+        }
+        if self.live_segments.len() >= usize::from(self.max_live_segments) {
+            return Err(PendingQueueSegmentLedgerError::LiveSegmentLimitReached);
+        }
+        let next_id = RecoverableNatsSegmentId::try_new(
+            self.highest_segment_id
+                .get()
+                .checked_add(1)
+                .ok_or(PendingQueueSegmentLedgerError::SegmentIdOverflow)?,
+        )?;
+        if segment.segment_id() != next_id
+            || self.live_segment(segment.segment_id()).is_some()
+        {
+            return Err(PendingQueueSegmentLedgerError::NonMonotonicSegmentId);
+        }
+        let staged = PendingQueueLiveSegment {
+            segment_id: segment.segment_id(),
+            contract_digest: segment.digest(),
+            retention: segment.retention(),
+            reserved_bytes: 0,
+            generation_count: 0,
+        };
+        let mut candidate = self.clone();
+        candidate.revision = self.revision.next()?;
+        candidate.highest_segment_id = segment.segment_id();
+        candidate.staged_segment_id = Some(segment.segment_id());
+        candidate.live_segments.push(staged.clone());
+        candidate.validate()?;
+        Ok(PendingQueueSegmentRotationStagePlan::Advance {
+            expected: self.clone(),
+            candidate,
+            staged,
+        })
+    }
+
+    /// Activate only the exact staged descriptor. The storage adapter calls
+    /// this builder only after fresh validation of its durable Provisioned
+    /// binding. The resulting CAS is the new-segment admit linearization.
+    pub fn activate_staged_segment(
+        &self,
+        segment: &RecoverableNatsStreamSegment,
+    ) -> Result<PendingQueueSegmentRotationActivationPlan, PendingQueueSegmentLedgerError> {
+        self.validate_rotation_segment(segment)?;
+        if self.staged_segment_id.is_none() {
+            let active = self
+                .live_segment(self.active_segment_id)
+                .ok_or(PendingQueueSegmentLedgerError::ActiveSegmentMissing)?;
+            return if active.segment_id == segment.segment_id()
+                && active.contract_digest == segment.digest()
+                && active.retention == segment.retention()
+            {
+                Ok(PendingQueueSegmentRotationActivationPlan::Idempotent {
+                    current: self.clone(),
+                    active: active.clone(),
+                })
+            } else {
+                Err(PendingQueueSegmentLedgerError::NoRotationInProgress)
+            };
+        }
+        if self.staged_segment_id != Some(segment.segment_id()) {
+            return Err(PendingQueueSegmentLedgerError::RotationConflict);
+        }
+        let staged = self
+            .live_segment(segment.segment_id())
+            .ok_or(PendingQueueSegmentLedgerError::StagedSegmentMissing)?;
+        if staged.contract_digest != segment.digest()
+            || staged.retention != segment.retention()
+            || staged.reserved_bytes != 0
+            || staged.generation_count != 0
+        {
+            return Err(PendingQueueSegmentLedgerError::RotationConflict);
+        }
+        let mut candidate = self.clone();
+        candidate.revision = self.revision.next()?;
+        candidate.active_segment_id = segment.segment_id();
+        candidate.staged_segment_id = None;
+        candidate.validate()?;
+        Ok(PendingQueueSegmentRotationActivationPlan::Advance {
+            expected: self.clone(),
+            candidate,
+            active: staged.clone(),
+        })
+    }
+
+    fn validate_rotation_segment(
+        &self,
+        segment: &RecoverableNatsStreamSegment,
+    ) -> Result<(), PendingQueueSegmentLedgerError> {
+        let active = self
+            .live_segment(self.active_segment_id)
+            .ok_or(PendingQueueSegmentLedgerError::ActiveSegmentMissing)?;
+        if segment.generation_key() != self.key.generation_key
+            || segment.base_namespace() != self.key.base_namespace
+            || segment.retention() != active.retention
+            || segment.retention().generation_admission_budget_bytes()
+                != self.generation_admission_budget_bytes
+            || segment.retention().max_live_segments() != self.max_live_segments
+        {
+            return Err(PendingQueueSegmentLedgerError::RotationSegmentMismatch);
+        }
+        Ok(())
+    }
+
     pub fn to_persisted_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(1024 + self.assignments.len() * 160);
         out.extend_from_slice(b"PSYQSEGL");
@@ -485,6 +707,13 @@ impl StoredPendingQueueSegmentLedger {
         out.extend_from_slice(&self.revision.get().to_be_bytes());
         out.extend_from_slice(&self.active_segment_id.get().to_be_bytes());
         out.extend_from_slice(&self.highest_segment_id.get().to_be_bytes());
+        match self.staged_segment_id {
+            Some(segment_id) => {
+                out.push(1);
+                out.extend_from_slice(&segment_id.get().to_be_bytes());
+            }
+            None => out.push(0),
+        }
         out.extend_from_slice(&self.max_live_segments.to_be_bytes());
         out.extend_from_slice(&self.max_generations_per_segment.to_be_bytes());
         out.extend_from_slice(&self.generation_admission_budget_bytes.to_be_bytes());
@@ -496,7 +725,21 @@ impl StoredPendingQueueSegmentLedger {
         for segment in &self.live_segments {
             out.extend_from_slice(&segment.segment_id.get().to_be_bytes());
             out.extend_from_slice(segment.contract_digest.as_bytes());
-            out.extend_from_slice(&segment.max_stream_bytes.to_be_bytes());
+            out.push(segment.retention.stream_replicas() as u8);
+            out.extend_from_slice(&segment.retention.max_stream_bytes().to_be_bytes());
+            out.extend_from_slice(
+                &segment
+                    .retention
+                    .generation_admission_budget_bytes()
+                    .to_be_bytes(),
+            );
+            out.extend_from_slice(&segment.retention.max_live_segments().to_be_bytes());
+            out.extend_from_slice(
+                &segment
+                    .retention
+                    .max_consumers_per_segment()
+                    .to_be_bytes(),
+            );
             out.extend_from_slice(&segment.reserved_bytes.to_be_bytes());
             out.extend_from_slice(&segment.generation_count.to_be_bytes());
         }
@@ -549,6 +792,11 @@ impl StoredPendingQueueSegmentLedger {
         }
         let active_segment_id = RecoverableNatsSegmentId::try_new(decoder.u64()?)?;
         let highest_segment_id = RecoverableNatsSegmentId::try_new(decoder.u64()?)?;
+        let staged_segment_id = match decoder.u8()? {
+            0 => None,
+            1 => Some(RecoverableNatsSegmentId::try_new(decoder.u64()?)?),
+            _ => return Err(PendingQueueSegmentLedgerError::InvalidLiveSegmentSet),
+        };
         let max_live_segments = decoder.u16()?;
         let max_generations_per_segment = decoder.u32()?;
         let generation_admission_budget_bytes = decoder.i64()?;
@@ -561,18 +809,29 @@ impl StoredPendingQueueSegmentLedger {
         let live_count = decoder.u16()? as usize;
         let mut live_segments = Vec::with_capacity(live_count);
         for _ in 0..live_count {
+            let segment_id = RecoverableNatsSegmentId::try_new(decoder.u64()?)?;
+            let contract_digest =
+                RecoverableNatsSegmentContractDigest::try_new(decoder.array32()?)?;
+            let retention = RecoverableNatsRetentionContract::try_new(
+                usize::from(decoder.u8()?),
+                decoder.i64()?,
+                decoder.i64()?,
+                decoder.u16()?,
+                decoder.i32()?,
+            )?;
             live_segments.push(PendingQueueLiveSegment {
-                segment_id: RecoverableNatsSegmentId::try_new(decoder.u64()?)?,
-                contract_digest: RecoverableNatsSegmentContractDigest::try_new(
-                    decoder.array32()?,
-                )?,
-                max_stream_bytes: decoder.i64()?,
+                segment_id,
+                contract_digest,
+                retention,
                 reserved_bytes: decoder.i64()?,
                 generation_count: decoder.u32()?,
             });
         }
         let assignment_count = decoder.u32()? as usize;
-        if assignment_count > MAX_GENERATIONS_PER_LIVE_SEGMENT as usize {
+        let maximum_assignments = usize::from(max_live_segments)
+            .checked_mul(max_generations_per_segment as usize)
+            .ok_or(PendingQueueSegmentLedgerError::InvalidCapacityContract)?;
+        if assignment_count > maximum_assignments {
             return Err(PendingQueueSegmentLedgerError::GenerationLimitReached);
         }
         let mut assignments = Vec::with_capacity(assignment_count);
@@ -618,6 +877,7 @@ impl StoredPendingQueueSegmentLedger {
             revision,
             active_segment_id,
             highest_segment_id,
+            staged_segment_id,
             max_live_segments,
             max_generations_per_segment,
             generation_admission_budget_bytes,
@@ -632,16 +892,17 @@ impl StoredPendingQueueSegmentLedger {
 
     fn validate(&self) -> Result<(), PendingQueueSegmentLedgerError> {
         if !(2..=MAX_LIVE_SEGMENTS).contains(&self.max_live_segments)
-            // c2b1 deliberately models the initial segment only. Rotation
-            // requires c2b2 byte accounting plus c2b3 terminal manifests.
-            || self.live_segments.len() != 1
+            || self.live_segments.is_empty()
             || self.live_segments.len() > usize::from(self.max_live_segments)
         {
             return Err(PendingQueueSegmentLedgerError::InvalidLiveSegmentSet);
         }
+        let maximum_assignments = usize::from(self.max_live_segments)
+            .checked_mul(self.max_generations_per_segment as usize)
+            .ok_or(PendingQueueSegmentLedgerError::InvalidCapacityContract)?;
         if self.max_generations_per_segment == 0
             || self.max_generations_per_segment > MAX_GENERATIONS_PER_LIVE_SEGMENT
-            || self.assignments.len() > self.max_generations_per_segment as usize
+            || self.assignments.len() > maximum_assignments
             || self.generation_admission_budget_bytes <= 0
             || self.capacity_headroom_bytes <= 0
         {
@@ -659,6 +920,16 @@ impl StoredPendingQueueSegmentLedger {
             .iter()
             .find(|segment| segment.segment_id == self.active_segment_id)
             .ok_or(PendingQueueSegmentLedgerError::ActiveSegmentMissing)?;
+        let staged = match self.staged_segment_id {
+            Some(segment_id) if segment_id == self.active_segment_id => {
+                return Err(PendingQueueSegmentLedgerError::InvalidLiveSegmentSet)
+            }
+            Some(segment_id) => Some(
+                self.live_segment(segment_id)
+                    .ok_or(PendingQueueSegmentLedgerError::StagedSegmentMissing)?,
+            ),
+            None => None,
+        };
         if self.highest_segment_id.get()
             < self
                 .live_segments
@@ -674,12 +945,21 @@ impl StoredPendingQueueSegmentLedger {
                 return Err(PendingQueueSegmentLedgerError::InvalidLiveSegmentSet);
             }
         }
-        let mut summed_reserved = 0_i64;
+        if staged.is_some_and(|segment| segment.segment_id != self.highest_segment_id) {
+            return Err(PendingQueueSegmentLedgerError::InvalidLiveSegmentSet);
+        }
+        let mut reserved_by_segment = vec![0_i64; self.live_segments.len()];
+        let mut generations_by_segment = vec![0_u32; self.live_segments.len()];
         for assignment in &self.assignments {
+            let segment_index = self
+                .live_segments
+                .iter()
+                .position(|segment| segment.segment_id == assignment.segment_id)
+                .ok_or(PendingQueueSegmentLedgerError::AssignmentMismatch)?;
+            let segment = &self.live_segments[segment_index];
             if assignment.context.key() != self.key.generation_key
                 || assignment.assigned_at_ledger_revision.get() > self.revision.get()
-                || assignment.segment_id != active.segment_id
-                || assignment.contract_digest != active.contract_digest
+                || assignment.contract_digest != segment.contract_digest
                 || assignment.reserved_bytes != self.generation_admission_budget_bytes
                 || assignment.expected_source_count
                     != expected_source_count(self.key.generation_key.authority())
@@ -700,8 +980,11 @@ impl StoredPendingQueueSegmentLedger {
             {
                 return Err(PendingQueueSegmentLedgerError::AssignmentMismatch);
             }
-            summed_reserved = summed_reserved
+            reserved_by_segment[segment_index] = reserved_by_segment[segment_index]
                 .checked_add(assignment.reserved_bytes)
+                .ok_or(PendingQueueSegmentLedgerError::CapacityOverflow)?;
+            generations_by_segment[segment_index] = generations_by_segment[segment_index]
+                .checked_add(1)
                 .ok_or(PendingQueueSegmentLedgerError::CapacityOverflow)?;
         }
         for pair in self.assignments.windows(2) {
@@ -713,15 +996,45 @@ impl StoredPendingQueueSegmentLedger {
                 return Err(PendingQueueSegmentLedgerError::NonMonotonicGeneration);
             }
         }
-        if active.reserved_bytes != summed_reserved
-            || active.generation_count as usize != self.assignments.len()
-            || active
+        for (index, segment) in self.live_segments.iter().enumerate() {
+            let reconstructed = RecoverableNatsStreamSegment::try_new(
+                self.key.base_namespace.clone(),
+                self.key.generation_key,
+                segment.segment_id,
+                segment.retention,
+            )?;
+            if reconstructed.digest() != segment.contract_digest
+                || segment.retention.max_live_segments() != self.max_live_segments
+                || segment.retention.generation_admission_budget_bytes()
+                    != self.generation_admission_budget_bytes
+                || segment.reserved_bytes != reserved_by_segment[index]
+                || segment.generation_count != generations_by_segment[index]
+                || segment.generation_count > self.max_generations_per_segment
+                || segment
+                    .reserved_bytes
+                    .checked_add(self.capacity_headroom_bytes)
+                    .ok_or(PendingQueueSegmentLedgerError::CapacityOverflow)?
+                    > segment.max_stream_bytes()
+            {
+                return Err(PendingQueueSegmentLedgerError::CapacityAccountingMismatch);
+            }
+        }
+        if let Some(staged) = staged {
+            if staged.reserved_bytes != 0 || staged.generation_count != 0 {
+                return Err(PendingQueueSegmentLedgerError::CapacityAccountingMismatch);
+            }
+            let next_reserved = active
                 .reserved_bytes
+                .checked_add(self.generation_admission_budget_bytes)
+                .ok_or(PendingQueueSegmentLedgerError::CapacityOverflow)?;
+            let next_required = next_reserved
                 .checked_add(self.capacity_headroom_bytes)
-                .ok_or(PendingQueueSegmentLedgerError::CapacityOverflow)?
-                > active.max_stream_bytes
-        {
-            return Err(PendingQueueSegmentLedgerError::CapacityAccountingMismatch);
+                .ok_or(PendingQueueSegmentLedgerError::CapacityOverflow)?;
+            if active.generation_count < self.max_generations_per_segment
+                && next_required <= active.max_stream_bytes()
+            {
+                return Err(PendingQueueSegmentLedgerError::SegmentStillAdmitting);
+            }
         }
         let encoded_len = self.to_persisted_bytes().len();
         if encoded_len > MAX_PENDING_QUEUE_SEGMENT_LEDGER_BYTES {
@@ -769,6 +1082,7 @@ impl PendingQueueSegmentLedgerBootstrap {
             revision: PendingQueueSegmentLedgerRevision::try_new(1)?,
             active_segment_id: segment.segment_id(),
             highest_segment_id: segment.segment_id(),
+            staged_segment_id: None,
             max_live_segments: retention.max_live_segments(),
             max_generations_per_segment,
             generation_admission_budget_bytes: retention
@@ -778,7 +1092,7 @@ impl PendingQueueSegmentLedgerBootstrap {
             live_segments: vec![PendingQueueLiveSegment {
                 segment_id: segment.segment_id(),
                 contract_digest: segment.digest(),
-                max_stream_bytes: retention.max_stream_bytes(),
+                retention,
                 reserved_bytes: 0,
                 generation_count: 0,
             }],
@@ -815,6 +1129,88 @@ impl PendingQueueSegmentReservationPlan {
     ) -> Option<(&StoredPendingQueueSegmentLedger, &StoredPendingQueueSegmentLedger)> {
         match self {
             Self::Idempotent(_) => None,
+            Self::Advance {
+                expected,
+                candidate,
+                ..
+            } => Some((expected, candidate)),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PendingQueueSegmentRotationStagePlan {
+    Idempotent {
+        current: StoredPendingQueueSegmentLedger,
+        staged: PendingQueueLiveSegment,
+    },
+    Advance {
+        expected: StoredPendingQueueSegmentLedger,
+        candidate: StoredPendingQueueSegmentLedger,
+        staged: PendingQueueLiveSegment,
+    },
+}
+
+impl PendingQueueSegmentRotationStagePlan {
+    pub const fn current(&self) -> &StoredPendingQueueSegmentLedger {
+        match self {
+            Self::Idempotent { current, .. } => current,
+            Self::Advance { candidate, .. } => candidate,
+        }
+    }
+
+    pub const fn staged(&self) -> &PendingQueueLiveSegment {
+        match self {
+            Self::Idempotent { staged, .. } | Self::Advance { staged, .. } => staged,
+        }
+    }
+
+    pub const fn transition(
+        &self,
+    ) -> Option<(&StoredPendingQueueSegmentLedger, &StoredPendingQueueSegmentLedger)> {
+        match self {
+            Self::Idempotent { .. } => None,
+            Self::Advance {
+                expected,
+                candidate,
+                ..
+            } => Some((expected, candidate)),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PendingQueueSegmentRotationActivationPlan {
+    Idempotent {
+        current: StoredPendingQueueSegmentLedger,
+        active: PendingQueueLiveSegment,
+    },
+    Advance {
+        expected: StoredPendingQueueSegmentLedger,
+        candidate: StoredPendingQueueSegmentLedger,
+        active: PendingQueueLiveSegment,
+    },
+}
+
+impl PendingQueueSegmentRotationActivationPlan {
+    pub const fn current(&self) -> &StoredPendingQueueSegmentLedger {
+        match self {
+            Self::Idempotent { current, .. } => current,
+            Self::Advance { candidate, .. } => candidate,
+        }
+    }
+
+    pub const fn active(&self) -> &PendingQueueLiveSegment {
+        match self {
+            Self::Idempotent { active, .. } | Self::Advance { active, .. } => active,
+        }
+    }
+
+    pub const fn transition(
+        &self,
+    ) -> Option<(&StoredPendingQueueSegmentLedger, &StoredPendingQueueSegmentLedger)> {
+        match self {
+            Self::Idempotent { .. } => None,
             Self::Advance {
                 expected,
                 candidate,
@@ -1028,6 +1424,10 @@ impl<'a> Decoder<'a> {
         Ok(u32::from_be_bytes(self.take(4)?.try_into().unwrap()))
     }
 
+    fn i32(&mut self) -> Result<i32, PendingQueueSegmentLedgerError> {
+        Ok(i32::from_be_bytes(self.take(4)?.try_into().unwrap()))
+    }
+
     fn u64(&mut self) -> Result<u64, PendingQueueSegmentLedgerError> {
         Ok(u64::from_be_bytes(self.take(8)?.try_into().unwrap()))
     }
@@ -1069,6 +1469,7 @@ pub enum PendingQueueSegmentLedgerError {
     InvalidCapacityContract,
     InvalidLiveSegmentSet,
     ActiveSegmentMissing,
+    StagedSegmentMissing,
     HighestSegmentRegressed,
     GenerationKeyMismatch,
     ContextDigestCollision,
@@ -1077,6 +1478,14 @@ pub enum PendingQueueSegmentLedgerError {
     NonMonotonicGeneration,
     GenerationLimitReached,
     SegmentCapacityExceeded,
+    SegmentStillAdmitting,
+    RotationInProgress,
+    NoRotationInProgress,
+    RotationConflict,
+    RotationSegmentMismatch,
+    LiveSegmentLimitReached,
+    NonMonotonicSegmentId,
+    SegmentIdOverflow,
     CapacityOverflow,
     CapacityAccountingMismatch,
     AssignmentMismatch,
@@ -1407,9 +1816,9 @@ mod tests {
         assert_eq!(
             payload_digest,
             [
-                12, 104, 171, 154, 245, 50, 40, 41, 70, 62, 107, 45, 68, 238,
-                90, 128, 90, 177, 74, 147, 86, 204, 187, 86, 200, 18, 43, 207,
-                53, 227, 162, 159,
+                224, 58, 7, 241, 73, 121, 127, 60, 182, 248, 30, 79, 85, 176,
+                86, 163, 70, 205, 216, 60, 160, 89, 214, 64, 184, 115, 183,
+                132, 33, 111, 83, 207,
             ],
         );
         let decoded = StoredPendingQueueSegmentLedger::decode_persisted(
@@ -1429,15 +1838,15 @@ mod tests {
             ),
             Err(PendingQueueSegmentLedgerError::TrailingBytes)
         );
-        let mut legacy_v2 = bytes.clone();
-        legacy_v2[8..10].copy_from_slice(&2_u16.to_be_bytes());
+        let mut legacy_v3 = bytes.clone();
+        legacy_v3[8..10].copy_from_slice(&3_u16.to_be_bytes());
         assert_eq!(
             StoredPendingQueueSegmentLedger::decode_persisted(
                 candidate.key().slot(),
                 candidate.revision().as_i64(),
-                &legacy_v2,
+                &legacy_v3,
             ),
-            Err(PendingQueueSegmentLedgerError::UnknownCodecVersion(2))
+            Err(PendingQueueSegmentLedgerError::UnknownCodecVersion(3))
         );
         assert!(StoredPendingQueueSegmentLedger::decode_persisted(
             candidate.key().slot(),
@@ -1484,6 +1893,115 @@ mod tests {
         assert_eq!(
             candidate.reserve_generation(context(AuthorityScope::Coordinator, 1)),
             Err(PendingQueueSegmentLedgerError::NonMonotonicGeneration)
+        );
+    }
+
+    #[test]
+    fn two_phase_rotation_preserves_per_segment_assignment_identity() {
+        let authority = AuthorityScope::Coordinator;
+        let initial = bootstrap(authority).candidate().clone();
+        let early = RecoverableNatsStreamSegment::try_new(
+            initial.key().base_namespace(),
+            initial.key().generation_key(),
+            RecoverableNatsSegmentId::try_new(2).unwrap(),
+            initial.live_segments()[0].retention(),
+        )
+        .unwrap();
+        assert_eq!(
+            initial.stage_rotation(&early),
+            Err(PendingQueueSegmentLedgerError::SegmentStillAdmitting)
+        );
+
+        let mut full = initial;
+        for pending in 1..=7 {
+            let PendingQueueSegmentReservationPlan::Advance { candidate, .. } = full
+                .reserve_generation(context(authority, pending))
+                .unwrap()
+            else {
+                unreachable!()
+            };
+            full = candidate;
+        }
+        assert!(!full.active_can_admit_generation().unwrap());
+        let wrong_id = RecoverableNatsStreamSegment::try_new(
+            full.key().base_namespace(),
+            full.key().generation_key(),
+            RecoverableNatsSegmentId::try_new(3).unwrap(),
+            full.live_segments()[0].retention(),
+        )
+        .unwrap();
+        assert_eq!(
+            full.stage_rotation(&wrong_id),
+            Err(PendingQueueSegmentLedgerError::NonMonotonicSegmentId)
+        );
+
+        let PendingQueueSegmentRotationStagePlan::Advance {
+            candidate: staged,
+            staged: staged_descriptor,
+            ..
+        } = full.stage_rotation(&early).unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(staged.staged_segment_id(), Some(early.segment_id()));
+        assert_eq!(staged.active_segment_id(), RecoverableNatsSegmentId::try_new(1).unwrap());
+        assert_eq!(staged_descriptor.segment_id(), early.segment_id());
+        assert_eq!(staged.live_segments().len(), 2);
+        assert_eq!(
+            staged.reserve_generation(context(authority, 8)),
+            Err(PendingQueueSegmentLedgerError::RotationInProgress)
+        );
+        assert!(matches!(
+            staged.stage_rotation(&early).unwrap(),
+            PendingQueueSegmentRotationStagePlan::Idempotent { .. }
+        ));
+        let PendingQueueSegmentRotationStagePlan::Idempotent {
+            current: staged_retry,
+            staged: staged_retry_descriptor,
+        } = staged.stage_next_rotation().unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(staged_retry, staged);
+        assert_eq!(staged_retry_descriptor.segment_id(), early.segment_id());
+
+        let PendingQueueSegmentRotationActivationPlan::Advance {
+            candidate: activated,
+            ..
+        } = staged.activate_staged_segment(&early).unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(activated.active_segment_id(), early.segment_id());
+        assert_eq!(activated.staged_segment_id(), None);
+        assert!(matches!(
+            activated.activate_staged_segment(&early).unwrap(),
+            PendingQueueSegmentRotationActivationPlan::Idempotent { .. }
+        ));
+        let old_reserved = activated.live_segments()[0].reserved_bytes();
+        let PendingQueueSegmentReservationPlan::Advance {
+            candidate: after_new,
+            assignment: new_assignment,
+            ..
+        } = activated
+            .reserve_generation(context(authority, 8))
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(new_assignment.segment_id(), early.segment_id());
+        assert_eq!(after_new.live_segments()[0].reserved_bytes(), old_reserved);
+        assert_eq!(after_new.live_segments()[0].generation_count(), 7);
+        assert_eq!(after_new.live_segments()[1].generation_count(), 1);
+        let encoded = after_new.to_persisted_bytes();
+        assert_eq!(
+            StoredPendingQueueSegmentLedger::decode_persisted(
+                after_new.key().slot(),
+                after_new.revision().as_i64(),
+                &encoded,
+            )
+            .unwrap(),
+            after_new
         );
     }
 

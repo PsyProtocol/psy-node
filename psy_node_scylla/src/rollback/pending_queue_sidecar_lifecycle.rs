@@ -493,9 +493,9 @@ mod tests {
         assert_eq!(first, second);
         let bytes = first.to_canonical_bytes();
         assert_eq!(StoredPendingQueueSidecarDeployment::decode_selected(first.slot, 1, &bytes).unwrap(), first);
-        let mut old_v8 = bytes.clone();
-        old_v8[19..21].copy_from_slice(&8_u16.to_be_bytes());
-        assert_eq!(StoredPendingQueueSidecarDeployment::decode_selected(first.slot, 1, &old_v8), Err(PendingQueueSidecarLifecycleError::UnknownSchemaVersion));
+        let mut old_v9 = bytes.clone();
+        old_v9[19..21].copy_from_slice(&9_u16.to_be_bytes());
+        assert_eq!(StoredPendingQueueSidecarDeployment::decode_selected(first.slot, 1, &old_v9), Err(PendingQueueSidecarLifecycleError::UnknownSchemaVersion));
         let mut tampered = bytes.clone(); tampered[20] ^= 1;
         assert!(StoredPendingQueueSidecarDeployment::decode_selected(first.slot, 1, &tampered).is_err());
         let mut trailing = bytes; trailing.push(0);

@@ -14,8 +14,9 @@ use psy_node_core::store::pending_generation_identity::PendingGenerationLedgerKe
 use psy_node_nats::{
     queue::NatsJetStreamClient,
     recoverable_assignment::{
-        PendingQueueSegmentLedgerKey,
+        PendingQueueSegmentAssignmentDigest, PendingQueueSegmentLedgerKey,
     },
+    recoverable_publish::PendingQueuePublishEnvelope,
     recoverable_segment::{
         RecoverableNatsRetentionContract, RecoverableNatsSegmentContractDigest,
         RecoverableNatsSegmentId, RecoverableNatsStreamInstanceId,
@@ -24,7 +25,7 @@ use psy_node_nats::{
     recoverable_transport::{
         InstanceBoundRecoverablePendingQueueNatsPublisher,
         RecoverableNatsExistingStreamBinding, RecoverableNatsProvisionedStreamReceipt,
-        RecoverableNatsStreamProvisioningOperationId,
+        RecoverableNatsPublishOutcome, RecoverableNatsStreamProvisioningOperationId,
     },
 };
 use scylla::{
@@ -36,7 +37,12 @@ use scylla::{
 use sha2::{Digest, Sha256};
 
 use super::{
-    pending_queue_segment_ledger::ScyllaPendingQueueSegmentLedgerStore,
+    pending_queue_segment_ledger::{
+        PendingQueueSegmentAssignmentRouteReceipt,
+        PendingQueueSegmentRotationActivatedReceipt,
+        PendingQueueSegmentRotationStagedReceipt,
+        ScyllaPendingQueueSegmentLedgerStore,
+    },
     pending_queue_sidecar_lifecycle::PendingQueueSidecarReady,
     BranchExactDeploymentNoTabletKeyspace,
 };
@@ -511,6 +517,74 @@ impl PersistedPendingQueueStreamProvisionedReceipt {
     }
 }
 
+/// Serving-only resolver. It has no method that can create a stream, begin a
+/// provision row or select the current active segment.
+pub(super) struct ScyllaPendingQueueAssignmentPublisherResolver {
+    store: Arc<ScyllaPendingQueueStreamProvisionStore>,
+    nats: Arc<NatsJetStreamClient>,
+}
+
+impl ScyllaPendingQueueAssignmentPublisherResolver {
+    pub(super) async fn resolve(
+        &self,
+        key: &PendingQueueSegmentLedgerKey,
+        context: psy_node_core::queue::recoverable_ephemeral::PendingQueueCaptureContext,
+    ) -> Result<AssignmentBoundRecoverablePendingQueuePublisher, PendingQueueStreamProvisionError> {
+        let route = self
+            .store
+            .ledger_store
+            .read_assignment_route_exact(key, context)
+            .await
+            .map_err(ledger)?;
+        self.store
+            .resolve_assignment_route(&self.nats, route)
+            .await
+    }
+}
+
+/// Opaque publisher bound simultaneously to one immutable assignment, one
+/// durable provision row and one server-created JetStream instance.
+pub(super) struct AssignmentBoundRecoverablePendingQueuePublisher {
+    store: Arc<ScyllaPendingQueueStreamProvisionStore>,
+    route: PendingQueueSegmentAssignmentRouteReceipt,
+    provisioned: PersistedPendingQueueStreamProvisionedReceipt,
+    publisher: InstanceBoundRecoverablePendingQueueNatsPublisher,
+}
+
+impl AssignmentBoundRecoverablePendingQueuePublisher {
+    pub(super) const fn assignment_digest(&self) -> PendingQueueSegmentAssignmentDigest {
+        self.route.assignment().assignment().digest()
+    }
+
+    pub(super) const fn segment(&self) -> &RecoverableNatsStreamSegment {
+        self.route.segment()
+    }
+
+    pub(super) const fn instance_id(&self) -> RecoverableNatsStreamInstanceId {
+        self.provisioned.instance_id()
+    }
+
+    pub(super) async fn publish(
+        &self,
+        envelope: &PendingQueuePublishEnvelope,
+    ) -> Result<RecoverableNatsPublishOutcome, PendingQueueStreamProvisionError> {
+        self.store
+            .ledger_store
+            .revalidate_assignment_route(&self.route)
+            .await
+            .map_err(ledger)?;
+        self.store.revalidate_provisioned(&self.provisioned).await?;
+        let outcome = self.publisher.publish(envelope).await.map_err(transport)?;
+        self.store
+            .ledger_store
+            .revalidate_assignment_route(&self.route)
+            .await
+            .map_err(ledger)?;
+        self.store.revalidate_provisioned(&self.provisioned).await?;
+        Ok(outcome)
+    }
+}
+
 pub(super) struct ScyllaPendingQueueStreamProvisionStore {
     session: Arc<Session>,
     ledger_store: Arc<ScyllaPendingQueueSegmentLedgerStore>,
@@ -576,6 +650,16 @@ impl ScyllaPendingQueueStreamProvisionStore {
         })
     }
 
+    pub(super) fn assignment_resolver(
+        self: &Arc<Self>,
+        nats: Arc<NatsJetStreamClient>,
+    ) -> ScyllaPendingQueueAssignmentPublisherResolver {
+        ScyllaPendingQueueAssignmentPublisherResolver {
+            store: Arc::clone(self),
+            nats,
+        }
+    }
+
     async fn read(&self, slot: PendingQueueStreamProvisionSlot) -> Result<Option<StoredPendingQueueStreamProvision>, PendingQueueStreamProvisionError> {
         let row = self.session.execute_unpaged(&self.read, ReadBinding { slot: slot.0.to_vec() }).await.map_err(cql)?.into_rows_result().map_err(cql)?.maybe_first_row::<DbRow>().map_err(cql)?;
         row.map(|row| StoredPendingQueueStreamProvision::decode(slot, row.revision, &row.provision_payload)).transpose()
@@ -631,6 +715,59 @@ impl ScyllaPendingQueueStreamProvisionStore {
         Ok(durable)
     }
 
+    pub(super) async fn provision_staged_rotation(
+        &self,
+        nats: &NatsJetStreamClient,
+        staged: &PendingQueueSegmentRotationStagedReceipt,
+    ) -> Result<PersistedPendingQueueStreamProvisionedReceipt, PendingQueueStreamProvisionError> {
+        self.ledger_store
+            .revalidate_staged_rotation(staged)
+            .await
+            .map_err(ledger)?;
+        self.provision(nats, staged.ledger_key(), staged.segment().clone())
+            .await
+    }
+
+    pub(super) async fn activate_staged_rotation(
+        &self,
+        nats: &NatsJetStreamClient,
+        staged: &PendingQueueSegmentRotationStagedReceipt,
+    ) -> Result<PendingQueueSegmentRotationActivatedReceipt, PendingQueueStreamProvisionError> {
+        let provisioned = self
+            .read_provisioned(staged.ledger_key(), staged.segment())
+            .await?;
+        let _ = provisioned.open_publisher(self, nats).await?;
+        self.ledger_store
+            .activate_staged_rotation(staged, &provisioned)
+            .await
+            .map_err(ledger)
+    }
+
+    async fn resolve_assignment_route(
+        self: &Arc<Self>,
+        nats: &NatsJetStreamClient,
+        route: PendingQueueSegmentAssignmentRouteReceipt,
+    ) -> Result<AssignmentBoundRecoverablePendingQueuePublisher, PendingQueueStreamProvisionError> {
+        self.ledger_store
+            .revalidate_assignment_route(&route)
+            .await
+            .map_err(ledger)?;
+        let provisioned = self
+            .read_provisioned(route.ledger_key(), route.segment())
+            .await?;
+        let publisher = provisioned.open_publisher(self, nats).await?;
+        self.ledger_store
+            .revalidate_assignment_route(&route)
+            .await
+            .map_err(ledger)?;
+        Ok(AssignmentBoundRecoverablePendingQueuePublisher {
+            store: Arc::clone(self),
+            route,
+            provisioned,
+            publisher,
+        })
+    }
+
     async fn complete(&self, expected: &StoredPendingQueueStreamProvision, receipt: &RecoverableNatsProvisionedStreamReceipt) -> Result<PersistedPendingQueueStreamProvisionedReceipt, PendingQueueStreamProvisionError> {
         let candidate = expected.complete(receipt)?;
         let execution = self.session.execute_unpaged(&self.cas, CasBinding { candidate_revision: candidate.revision as i64, candidate_payload: candidate.to_persisted_bytes(), slot: expected.slot.0.to_vec(), expected_revision: expected.revision as i64, expected_payload: expected.to_persisted_bytes() }).await;
@@ -663,7 +800,7 @@ impl ScyllaPendingQueueStreamProvisionStore {
         Ok(PersistedPendingQueueStreamProvisionedReceipt { store_fingerprint: self.fingerprint, current })
     }
 
-    async fn revalidate_provisioned(
+    pub(super) async fn revalidate_provisioned(
         &self,
         receipt: &PersistedPendingQueueStreamProvisionedReceipt,
     ) -> Result<(), PendingQueueStreamProvisionError> {

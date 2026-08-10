@@ -55,12 +55,13 @@ use super::{
 #[cfg(test)]
 use super::RETIRED_REALM_USER_UPDATE_CLAIM_V1_TABLE;
 
-// v9 adds the durable stream Provisioning -> Provisioned binding. A v8
-// VERIFIED receipt cannot authorize a live JetStream instance.
-pub const PENDING_QUEUE_SIDECAR_SCHEMA_VERSION: u16 = 9;
+// v10 preserves the sixteen-table physical manifest while requiring the
+// multi-live-segment ledger v4 and assignment-bound publisher route. A v9
+// VERIFIED receipt cannot authorize these stronger serving semantics.
+pub const PENDING_QUEUE_SIDECAR_SCHEMA_VERSION: u16 = 10;
 pub const PENDING_QUEUE_SIDECAR_TARGET_TABLE_COUNT: usize = 16;
 const FINGERPRINT_DOMAIN: &[u8] =
-    b"psy/rollback/pending-queue-sidecar-schema/v9";
+    b"psy/rollback/pending-queue-sidecar-schema/v10";
 const INSPECT_COLUMNS_CQL: &str = "SELECT column_name, type, kind, position, clustering_order FROM system_schema.columns WHERE keyspace_name = ? AND table_name = ?";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -551,7 +552,7 @@ mod tests {
 
     #[test]
     fn exact_manifest_is_sixteen_unique_tables_with_stable_placement() {
-        assert_eq!(PENDING_QUEUE_SIDECAR_SCHEMA_VERSION, 9);
+        assert_eq!(PENDING_QUEUE_SIDECAR_SCHEMA_VERSION, 10);
         assert_eq!(PendingQueueSidecarPhysicalTable::ALL.len(), 16);
         let names = PendingQueueSidecarPhysicalTable::ALL.iter().map(|table| table.table_name()).collect::<std::collections::BTreeSet<_>>();
         assert_eq!(names.len(), 16);

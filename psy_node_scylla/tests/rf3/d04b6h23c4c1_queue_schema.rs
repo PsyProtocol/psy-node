@@ -223,6 +223,7 @@ async fn wait_up(expected: usize) -> anyhow::Result<()> {
 struct H23c4c1Report {
     image: &'static str,
     replication_factor: u8,
+    schema_version: u16,
     target_tables: usize,
     lifecycle_tables: usize,
     disabled_zero_queue_tables: bool,
@@ -381,7 +382,8 @@ async fn d04b6h23c4c1_queue_schema_lifecycle_rf3_gate() -> anyhow::Result<()> {
     let report = H23c4c1Report {
         image: IMAGE,
         replication_factor: 3,
-        target_tables: 16,
+        schema_version: PENDING_QUEUE_SIDECAR_SCHEMA_VERSION,
+        target_tables: PENDING_QUEUE_SIDECAR_TARGET_TABLE_COUNT,
         lifecycle_tables: 1,
         disabled_zero_queue_tables,
         partial_retry_converged,
@@ -396,7 +398,7 @@ async fn d04b6h23c4c1_queue_schema_lifecycle_rf3_gate() -> anyhow::Result<()> {
         claim_direct_one_equal,
         repair_flush_compact: true,
         ready_ms,
-        qualification: "H23C4C2B4D2_SIDECAR_V9_RF3_PASSED",
+        qualification: "H23C4C2B4D2C_SIDECAR_V10_RF3_PASSED",
     };
     let report_path = std::env::var("PSY_D04B6H23C4C1_REPORT_PATH")?;
     std::fs::write(&report_path, serde_json::to_vec_pretty(&report)?)?;
