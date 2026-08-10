@@ -45,6 +45,16 @@ pub struct PlannedFutureEndCapJob<F, Hash> {
     pub contract_updates: Vec<u8>,
 }
 
+/// Complete result of one Realm planning generation.
+///
+/// Deferred jobs are semantic output, not live mutable input.  Returning them
+/// explicitly prevents `finalize_with_reward_ids` from silently dropping work
+/// whose source checkpoint is newer than the generation being processed.
+pub struct RealmGUTAPlannerFinalizeResult<F, Hash> {
+    pub output: Option<RealmGUTAEndCapGathererOutput<F, Hash, QProvingJobDataID>>,
+    pub deferred_jobs: Vec<PlannedFutureEndCapJob<F, Hash>>,
+}
+
 pub struct RealmGUTAPlanner<F, Hash> {
     pub realm_id_u64: u64,
     pub realm_sub_id_u64: u64,
@@ -819,11 +829,14 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
         temp_store: Arc<TempStore>,
         reward_tree_root_level: u8,
         reward_tree_root_index: u64,
-    ) -> anyhow::Result<Option<RealmGUTAEndCapGathererOutput<F, Hash, QProvingJobDataID>>> {
+    ) -> anyhow::Result<RealmGUTAPlannerFinalizeResult<F, Hash>> {
         if self.total_jobs == 0 && self.end_cap_straggler.is_none() {
             // No jobs were added.
             tracing::info!("No jobs were added during GUTA planning. Nothing to finalize.");
-            return Ok(None);
+            return Ok(RealmGUTAPlannerFinalizeResult {
+                output: None,
+                deferred_jobs: std::mem::take(&mut self.future_pending_end_cap_jobs),
+            });
         } else if self.end_cap_straggler.is_some() {
             let end_cap_straggler = self
                 .finalize_promote_end_cap_stragglers(&checkpoint_tree, global_user_tree, temp_store.clone())
@@ -895,7 +908,9 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
                     )
                     .await?;
                 self.total_jobs += 1;
-                return Ok(Some(RealmGUTAEndCapGathererOutput {
+                let deferred_jobs = std::mem::take(&mut self.future_pending_end_cap_jobs);
+                return Ok(RealmGUTAPlannerFinalizeResult {
+                    output: Some(RealmGUTAEndCapGathererOutput {
                     db_output: RealmGUTAEndCapGathererOutputDatabase {
                         total_users_updated: self.total_end_caps_processed as u64,
                         total_proofs_generated: self.total_jobs as u64,
@@ -912,7 +927,10 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
                         guta_header: new_guta_header,
                     },
                     job_ids: vec![vec![job]],
-                }));
+                    deferred_jobs: Vec::new(),
+                }),
+                    deferred_jobs,
+                });
             }
         }
         let result = self.finalize_promote_guta_stragglers::<Hasher, TempStore>(temp_store.clone()).await?;
@@ -922,7 +940,9 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
             let root_job_id = straggler.job_id;
             self.update_reward_tree_config(&root_job_id, reward_tree_root_level, reward_tree_root_index)?;
 
-            Ok(Some(RealmGUTAEndCapGathererOutput {
+            let deferred_jobs = std::mem::take(&mut self.future_pending_end_cap_jobs);
+            Ok(RealmGUTAPlannerFinalizeResult {
+                output: Some(RealmGUTAEndCapGathererOutput {
                 db_output: RealmGUTAEndCapGathererOutputDatabase {
                     total_users_updated: self.total_end_caps_processed as u64,
                     old_realm_root: self.start_realm_root,
@@ -939,7 +959,10 @@ impl<F: QFelt64, Hash: Q256BitHash + QFHashBase<F>> RealmGUTAPlanner<F, Hash> {
                     guta_header: straggler,
                 },
                 job_ids: self.planned_jobs.into_iter().filter(|x| !x.is_empty()).collect(),
-            }))
+                deferred_jobs: Vec::new(),
+            }),
+                deferred_jobs,
+            })
         } else {
             tracing::info!("No stragglers remain after finalization, but no root found. This should never happen.");
             anyhow::bail!("No stragglers remain after finalization, but no root found. This should never happen.");

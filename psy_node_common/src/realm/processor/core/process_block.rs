@@ -1,5 +1,5 @@
 use cf_utils::timer::TraceTimer;
-use parth_core::protocol::core_types::QNetworkTypesConfig;
+use parth_core::protocol::core_types::{Q256BitHash, QNetworkTypesConfig};
 use psy_core::job::job_id::QProvingJobDataID;
 use psy_data::{
     guta::header_extended::{GlobalUserTreeAggregatorHeaderWithTagValue, GlobalUserTreeAggregatorHeaderWithTagValueAndJobType},
@@ -15,6 +15,10 @@ use psy_node_core::{
     queue::{
         ephemeral::QStandardEphemeralQueueSubscriber,
         realm_processor_durable_capture::RealmProcessorDurableCaptureOutcome,
+        realm_processor_semantic_output::{
+            RealmProcessorDeferredJob, RealmProcessorSemanticJob,
+            RealmProcessorSemanticOutput, RealmProcessorSemanticOutputParts,
+        },
         worker_queue::{QStandardWorkerQueuePublisher, QStandardWorkerQueueSubscriber},
     },
     store::{
@@ -23,6 +27,7 @@ use psy_node_core::{
         traits::proof_store::{QCanonicalProofStoreV2, QParthProofStore},
     },
 };
+use psy_serialize::PsyCanonicalDatabaseSerializeBaseSingle;
 
 use crate::realm::{
     processor::{
@@ -33,11 +38,15 @@ use crate::realm::{
     queue_key::RealmProvingWorkQueueKey,
 };
 
-use crate::queue::gatherer::DurableTreeGathererApplyReceipt;
+use crate::queue::gatherer::DurableTreeGathererFinalizeReceipt;
 
 enum RealmGatheringOutcome<F, Hash, JobId> {
     Legacy(RealmGUTAEndCapGathererOutput<F, Hash, JobId>),
-    BranchExactApplied(DurableTreeGathererApplyReceipt),
+    BranchExactFinalized(
+        DurableTreeGathererFinalizeReceipt<
+            RealmGUTAEndCapGathererOutput<F, Hash, JobId>,
+        >,
+    ),
     BranchExactAwaitingClosedSource,
 }
 
@@ -125,6 +134,104 @@ where
         }
     }
 
+    /// Project a finalized command-only builder into the complete canonical
+    /// application payload that c4a2 will archive.  Every proof witness is
+    /// read back from the exact processing pending namespace; a missing
+    /// dependency fails before any pipeline handoff can exist.
+    async fn build_branch_exact_semantic_output(
+        &self,
+        receipt: &DurableTreeGathererFinalizeReceipt<
+            RealmGUTAEndCapGathererOutput<N::F, N::QHash, N::JobId>,
+        >,
+    ) -> anyhow::Result<RealmProcessorSemanticOutput> {
+        let output = receipt.output();
+        let pending_context = self
+            .db
+            .temp_db
+            .require_pending_context_for_pending_id(
+                &self.db.state.realm_identifier,
+                self.db.state.processing_unique_pending_id,
+            )
+            .await?;
+        let mut jobs = Vec::new();
+        for (level, level_jobs) in output.job_ids.iter().enumerate() {
+            let level = u16::try_from(level)?;
+            for (ordinal, job) in level_jobs.iter().enumerate() {
+                let witness = self
+                    .db
+                    .temp_db
+                    .get_tdb_proof_witness_bytes(
+                        &self.db.state.realm_identifier,
+                        &pending_context,
+                        job.job_id,
+                    )
+                    .await?;
+                jobs.push(RealmProcessorSemanticJob::try_new(
+                    level,
+                    u32::try_from(ordinal)?,
+                    job.psy_ser_to_bytes_vec()?,
+                    witness,
+                )?);
+            }
+        }
+        let deferred_jobs = output
+            .deferred_jobs
+            .iter()
+            .enumerate()
+            .map(|(ordinal, job)| {
+                Ok(RealmProcessorDeferredJob::try_new(
+                    u32::try_from(ordinal)?,
+                    job.queue_item.psy_ser_to_bytes_vec()?,
+                    job.contract_updates.clone(),
+                )?)
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        RealmProcessorSemanticOutput::try_from_candidate_parts(
+            RealmProcessorSemanticOutputParts {
+                context_digest: receipt.context_digest(),
+                generation_digest: receipt.generation_digest(),
+                boundary_digest: receipt.boundary_digest(),
+                item_count: receipt.item_count(),
+                processing_checkpoint_id: self.db.state.processing_checkpoint_id,
+                processing_checkpoint_root: self
+                    .db
+                    .state
+                    .processing_checkpoint_root
+                    .into_owned_32bytes(),
+                processing_realm_start_root: self
+                    .db
+                    .state
+                    .processing_realm_start_root
+                    .into_owned_32bytes(),
+                old_realm_root: output.db_output.old_realm_root.into_owned_32bytes(),
+                new_realm_root: output.db_output.new_realm_root.into_owned_32bytes(),
+                total_users_updated: output.db_output.total_users_updated,
+                total_proofs_generated: output.db_output.total_proofs_generated,
+                global_user_tree_nodes: output
+                    .db_output
+                    .update_global_user_tree_nodes_ffs
+                    .clone(),
+                user_contract_tree_nodes: output
+                    .db_output
+                    .update_user_contract_tree_nodes_ffs
+                    .clone(),
+                contract_state_tree_nodes: output
+                    .db_output
+                    .update_contract_state_tree_nodes_ffs
+                    .clone(),
+                user_leaves: output.db_output.update_user_leaves_ffs.clone(),
+                contract_state_imt_leaves: output
+                    .db_output
+                    .update_contract_state_imt_leaves_ffs
+                    .clone(),
+                guta_header: output.db_output.guta_header.psy_ser_to_bytes_vec()?,
+                jobs,
+                deferred_jobs,
+            },
+        )
+        .map_err(anyhow::Error::from)
+    }
+
     async fn get_results_from_gatherers(
         &mut self,
         iteration: &mut RealmNormalCommitIteration<'_, N::QHash>,
@@ -157,7 +264,11 @@ where
                 .guta_queue_gatherer
                 .apply_durable_generation(generation)
                 .await?;
-            return Ok(RealmGatheringOutcome::BranchExactApplied(receipt));
+            let finalized = self
+                .guta_queue_gatherer
+                .finalize_durable_generation(receipt)
+                .await?;
+            return Ok(RealmGatheringOutcome::BranchExactFinalized(finalized));
         }
 
         // Sanity: outside of genesis, init must have already rotated the unique IDs once,
@@ -251,11 +362,16 @@ where
         // 2. Gather Updates
         let guta_output = match self.get_results_from_gatherers(iteration).await? {
             RealmGatheringOutcome::Legacy(output) => output,
-            RealmGatheringOutcome::BranchExactApplied(receipt) => {
+            RealmGatheringOutcome::BranchExactFinalized(receipt) => {
+                let semantic = self
+                    .build_branch_exact_semantic_output(&receipt)
+                    .await?;
                 tracing::info!(
-                    "Branch-exact durable generation applied tentatively: items={}, generation={:?}; semantic handoff remains blocked until h23c4c4a",
+                    "Branch-exact durable generation finalized tentatively: items={}, generation={:?}, semantic={:?}, deferred_jobs={}; durable semantic archive/handoff remains blocked until h23c4c4a2",
                     receipt.item_count(),
                     receipt.generation_digest().as_bytes(),
+                    semantic.digest().as_bytes(),
+                    receipt.output().deferred_jobs.len(),
                 );
                 return Ok(());
             }
@@ -565,6 +681,7 @@ mod h23c4c3b_tests {
         assert!(function.contains("replay_complete_generation()"));
         assert!(function.contains("capture.capture_next()"));
         assert!(function.contains("apply_durable_generation(generation)"));
+        assert!(function.contains("finalize_durable_generation(receipt)"));
         assert!(!function.contains("set_new_unique_ids"));
         assert!(!function.contains("finalize_gathering_and_update_queue_key"));
         assert!(!function.contains("dump_entire_ephemeral_queue_bytes"));
@@ -572,7 +689,7 @@ mod h23c4c3b_tests {
     }
 
     #[test]
-    fn legacy_rotation_is_preserved_but_branch_exact_stops_before_semantics() {
+    fn legacy_rotation_is_preserved_but_branch_exact_stops_before_durable_handoff() {
         let source = include_str!("process_block.rs");
         let legacy = source
             .split("// Sanity: outside of genesis")
@@ -593,11 +710,45 @@ mod h23c4c3b_tests {
             .split("pub(super) async fn process_block")
             .nth(1)
             .unwrap();
-        let applied = process.find("RealmGatheringOutcome::BranchExactApplied").unwrap();
-        let semantic_stop = process[applied..].find("return Ok(())").unwrap() + applied;
+        let finalized = process
+            .find("RealmGatheringOutcome::BranchExactFinalized")
+            .unwrap();
+        let semantic_stop = process[finalized..].find("return Ok(())").unwrap() + finalized;
         let proving = process.find("// 4. Proving Work").unwrap();
         assert!(semantic_stop < proving);
-        assert!(process.contains("semantic handoff remains blocked until h23c4c4a"));
+        assert!(process.contains("durable semantic archive/handoff remains blocked until h23c4c4a2"));
+    }
+
+    #[test]
+    fn semantic_candidate_uses_exact_pending_witnesses_but_has_no_storage_authority() {
+        let source = include_str!("process_block.rs");
+        let builder = source
+            .split("async fn build_branch_exact_semantic_output(")
+            .nth(1)
+            .unwrap()
+            .split("async fn get_results_from_gatherers(")
+            .next()
+            .unwrap();
+        assert!(builder.contains("require_pending_context_for_pending_id"));
+        assert!(builder.contains("self.db.state.processing_unique_pending_id"));
+        assert!(builder.contains("get_tdb_proof_witness_bytes"));
+        assert!(builder.contains("job.job_id"));
+        assert!(builder.contains("RealmProcessorSemanticOutput::try_from_candidate_parts"));
+        assert!(!builder.contains("handoff_to_pipeline"));
+        assert!(!builder.contains("persist"));
+
+        let process = source
+            .split("pub(super) async fn process_block")
+            .nth(1)
+            .unwrap();
+        let finalized = process
+            .find("RealmGatheringOutcome::BranchExactFinalized")
+            .unwrap();
+        let semantic_stop = process[finalized..].find("return Ok(())").unwrap() + finalized;
+        let branch = &process[finalized..semantic_stop];
+        assert!(branch.contains("build_branch_exact_semantic_output"));
+        assert!(!branch.contains("handoff_to_pipeline"));
+        assert!(!branch.contains("commit_state"));
     }
 
     #[test]
@@ -641,7 +792,7 @@ mod h23c4c3b_tests {
         assert!(!durable.contains("dump_entire_ephemeral_queue_bytes"));
         assert!(!durable.contains("AckBatchLast"));
         assert!(!durable.contains("delete_ephemeral_queue_consumer"));
-        assert!(!durable.contains("finalize_with_tree"));
+        assert!(durable.contains("finalize_with_tree"));
         assert!(durable.contains("SemanticHandoffNotIntegrated"));
     }
 }

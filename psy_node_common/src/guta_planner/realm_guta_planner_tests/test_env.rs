@@ -482,9 +482,13 @@ impl RGPTestChainState {
             .file_like_fs_flush_file_with_path(&backup_file_path, &mut backup_file)
             .await?;
 
-        let result = realm_planner
+        let planner_result = realm_planner
             .finalize_with_reward_ids(&self.checkpoint_tree, &mut self.first_realm_global_user_tree, self.temp_db.clone(), 0, 0)
             .await?;
+        let mut result = planner_result.output;
+        if let Some(output) = result.as_mut() {
+            output.deferred_jobs = planner_result.deferred_jobs;
+        }
 
         if result.is_none() && user_ups_list.len() > 0 {
             anyhow::bail!("Expected some jobs to be processed in the checkpoint, but none were");

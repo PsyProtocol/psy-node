@@ -442,6 +442,14 @@ fn bind_processing_generation_state<Hash: Copy>(
     Ok(exact)
 }
 
+fn require_empty_branch_exact_future_lineage<T>(jobs: &[T]) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        jobs.is_empty(),
+        "branch-exact future end-cap lineage is not durable yet"
+    );
+    Ok(())
+}
+
 impl<
         N: QNetworkTypesConfig + 'static,
         TempDatabase: StandardProcessorTempDBStoreBase<N::JobId, N::QHash> + 'static,
@@ -467,12 +475,11 @@ impl<
         let future_pending_end_cap_jobs = self
             .future_pending_end_cap_jobs
             .read()
-            .map_err(|_| anyhow::anyhow!("future end-cap job lock is poisoned"))?
-            .clone();
+            .map_err(|_| anyhow::anyhow!("future end-cap job lock is poisoned"))?;
+        require_empty_branch_exact_future_lineage(future_pending_end_cap_jobs.as_slice())?;
         let mut bound = self.clone();
         bound.status = Arc::new(RwLock::new(exact));
-        bound.future_pending_end_cap_jobs =
-            Arc::new(RwLock::new(future_pending_end_cap_jobs));
+        bound.future_pending_end_cap_jobs = Arc::new(RwLock::new(Vec::new()));
         Ok(bound)
     }
 }
@@ -553,6 +560,10 @@ impl<F: QFelt64, Hash: QDBHashBase> RealmGUTAEndCapGathererOutputDatabase<F, Has
 pub struct RealmGUTAEndCapGathererOutput<F, Hash, JobId> {
     pub db_output: RealmGUTAEndCapGathererOutputDatabase<F, Hash>,
     pub job_ids: Vec<Vec<PsyProvingJobMetadataWithJobId<Hash, JobId>>>,
+    /// Jobs that are not eligible in this processing checkpoint.  They are
+    /// part of the semantic result and must be durably archived before a later
+    /// generation may consume them.
+    pub deferred_jobs: Vec<PlannedFutureEndCapJob<F, Hash>>,
 }
 #[async_trait]
 impl<
@@ -740,13 +751,22 @@ impl<
                 );
                 anyhow::bail!("GUTA updates gatherer finalize failed");
             }
-            let result = result?;
+            let planner_result = result?;
+            let deferred_jobs = planner_result.deferred_jobs;
+            {
+                let mut live_projection = self
+                    .config
+                    .future_pending_end_cap_jobs
+                    .write()
+                    .map_err(|_| anyhow::anyhow!("future end-cap job lock is poisoned"))?;
+                *live_projection = deferred_jobs.clone();
+            }
             tracing::info!(
                 "GUTA updates gatherer for pending id {} finalized planner.",
                 self.status.gathering_unique_pending_id
             );
-            if result.is_some() {
-                let result = result.unwrap();
+            if let Some(mut result) = planner_result.output {
+                result.deferred_jobs = deferred_jobs;
                 self.new_realm_end_cap_gatherer_file
                     .write_all(&result.db_output.guta_header.psy_ser_to_bytes_vec()?)
                     .await?;
@@ -818,6 +838,12 @@ impl<
         Ok(RealmGUTAEndCapGathererOutput {
             db_output: RealmGUTAEndCapGathererOutputDatabase::<N::F, N::QHash>::get_empty(tree.get_root()),
             job_ids: vec![],
+            deferred_jobs: self
+                .config
+                .future_pending_end_cap_jobs
+                .read()
+                .map_err(|_| anyhow::anyhow!("future end-cap job lock is poisoned"))?
+                .clone(),
         })
     }
 }
@@ -908,6 +934,12 @@ mod h23c4c3b_processing_binding_tests {
             3,
         )
         .is_err());
+    }
+
+    #[test]
+    fn live_future_projection_cannot_enter_branch_exact_generation() {
+        assert!(require_empty_branch_exact_future_lineage::<u8>(&[]).is_ok());
+        assert!(require_empty_branch_exact_future_lineage(&[1_u8]).is_err());
     }
 }
 

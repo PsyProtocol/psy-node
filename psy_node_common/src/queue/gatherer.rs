@@ -331,6 +331,12 @@ enum TreeGathererCommand<Output> {
             Result<DurableTreeGathererApplyReceipt, GathererPauseError>,
         >,
     },
+    FinalizeDurableGeneration {
+        receipt: DurableTreeGathererApplyReceipt,
+        responder: oneshot::Sender<
+            Result<DurableTreeGathererFinalizeReceipt<Output>, GathererPauseError>,
+        >,
+    },
 }
 
 /// A builder config used by the command-only branch-exact actor must bind its
@@ -351,6 +357,48 @@ pub struct DurableTreeGathererApplyReceipt {
     generation_digest: RealmProcessorDurableGenerationDigest,
     boundary_digest: PendingQueueBoundaryDigest,
     item_count: u64,
+}
+
+/// In-process proof that the command-only actor finalized exactly the builder
+/// selected by one durable apply receipt.
+///
+/// This is deliberately not durable storage authority.  c4a2 must persist and
+/// exactly read back the semantic output before advancing the pipeline.  The
+/// `Arc` only makes response-loss retry idempotent inside the same actor.
+pub struct DurableTreeGathererFinalizeReceipt<Output> {
+    _actor_identity: Arc<GathererActorIdentity>,
+    actor_revision: GathererActorRevision,
+    context_digest: PendingQueueCaptureContextDigest,
+    generation_digest: RealmProcessorDurableGenerationDigest,
+    boundary_digest: PendingQueueBoundaryDigest,
+    item_count: u64,
+    output: Arc<Output>,
+}
+
+impl<Output> DurableTreeGathererFinalizeReceipt<Output> {
+    pub const fn actor_revision(&self) -> GathererActorRevision {
+        self.actor_revision
+    }
+
+    pub const fn context_digest(&self) -> PendingQueueCaptureContextDigest {
+        self.context_digest
+    }
+
+    pub const fn generation_digest(&self) -> RealmProcessorDurableGenerationDigest {
+        self.generation_digest
+    }
+
+    pub const fn boundary_digest(&self) -> PendingQueueBoundaryDigest {
+        self.boundary_digest
+    }
+
+    pub const fn item_count(&self) -> u64 {
+        self.item_count
+    }
+
+    pub fn output(&self) -> &Output {
+        self.output.as_ref()
+    }
 }
 
 impl DurableTreeGathererApplyReceipt {
@@ -492,6 +540,30 @@ impl<const QUEUE_TOPIC_ID: u32, QueueItem: PCoreQueueItemBase + 'static, Output:
         self.trigger_tx
             .send(TreeGathererCommand::ApplyDurableGeneration {
                 generation,
+                responder: response_tx,
+            })
+            .await
+            .map_err(|_| GathererPauseError::ControlChannelClosed)?;
+        response_rx
+            .await
+            .map_err(|_| GathererPauseError::ResponseChannelClosed)?
+    }
+
+    /// Finalize exactly the tentative builder selected by `receipt`.
+    ///
+    /// The actor caches the result, so a response-loss retry with a freshly
+    /// replayed, identical apply receipt returns the same output without
+    /// running builder finalization twice.  This method remains crate-private;
+    /// a caller still needs c4a2's storage-owned archive receipt before it can
+    /// hand work to the durable pipeline.
+    pub(crate) async fn finalize_durable_generation(
+        &self,
+        receipt: DurableTreeGathererApplyReceipt,
+    ) -> Result<DurableTreeGathererFinalizeReceipt<Output>, GathererPauseError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.trigger_tx
+            .send(TreeGathererCommand::FinalizeDurableGeneration {
+                receipt,
                 responder: response_tx,
             })
             .await
@@ -757,6 +829,9 @@ fn reject_tree_command_at_callback_boundary<Output>(
         TreeGathererCommand::ApplyDurableGeneration { responder, .. } => {
             let _ = responder.send(Err(GathererPauseError::DurableGenerationOnLegacyActor));
         }
+        TreeGathererCommand::FinalizeDurableGeneration { responder, .. } => {
+            let _ = responder.send(Err(GathererPauseError::DurableGenerationOnLegacyActor));
+        }
     }
 }
 
@@ -779,7 +854,9 @@ async fn durable_gatherer_runner_for_tree<
     let actor_identity = Arc::new(GathererActorIdentity);
     let mut actor_revision = GathererActorRevision(0);
     let mut applied: Option<DurableTreeGathererApplyReceipt> = None;
-    let mut _tentative_builder: Option<Builder> = None;
+    let mut tentative_builder: Option<Builder> = None;
+    let mut finalized_output: Option<Arc<Builder::Output>> = None;
+    let mut finalized_revision: Option<GathererActorRevision> = None;
 
     while let Some(command) = trigger_rx.recv().await {
         match command {
@@ -879,9 +956,63 @@ async fn durable_gatherer_runner_for_tree<
                     boundary_digest: receipt.boundary_digest,
                     item_count: receipt.item_count,
                 };
-                _tentative_builder = Some(builder);
+                tentative_builder = Some(builder);
                 applied = Some(receipt);
                 let _ = responder.send(Ok(response));
+            }
+            TreeGathererCommand::FinalizeDurableGeneration { receipt, responder } => {
+                let Some(current) = applied.as_ref() else {
+                    let _ = responder.send(Err(GathererPauseError::DurableGenerationIdentityMismatch));
+                    continue;
+                };
+                if !Arc::ptr_eq(&receipt.actor_identity, &current.actor_identity)
+                    || receipt.actor_revision != current.actor_revision
+                    || receipt.context_digest != current.context_digest
+                    || receipt.generation_digest != current.generation_digest
+                    || receipt.boundary_digest != current.boundary_digest
+                    || receipt.item_count != current.item_count
+                {
+                    let _ = responder.send(Err(GathererPauseError::DurableGenerationIdentityMismatch));
+                    continue;
+                }
+                if let Some(output) = finalized_output.as_ref() {
+                    let finalized_revision = finalized_revision.ok_or_else(|| {
+                        anyhow::anyhow!("finalized output is missing its stable actor revision")
+                    })?;
+                    let _ = responder.send(Ok(DurableTreeGathererFinalizeReceipt {
+                        _actor_identity: current.actor_identity.clone(),
+                        actor_revision: finalized_revision,
+                        context_digest: current.context_digest,
+                        generation_digest: current.generation_digest,
+                        boundary_digest: current.boundary_digest,
+                        item_count: current.item_count,
+                        output: output.clone(),
+                    }));
+                    continue;
+                }
+                let Some(builder) = tentative_builder.take() else {
+                    let _ = responder.send(Err(GathererPauseError::DurableGenerationApplyFailed));
+                    return Err(anyhow::anyhow!("durable builder missing before finalize"));
+                };
+                let output = match builder.finalize_with_tree(&mut tree).await {
+                    Ok(output) => Arc::new(output),
+                    Err(error) => {
+                        let _ = responder.send(Err(GathererPauseError::DurableGenerationApplyFailed));
+                        return Err(error);
+                    }
+                };
+                actor_revision = actor_revision.checked_next()?;
+                finalized_revision = Some(actor_revision);
+                finalized_output = Some(output.clone());
+                let _ = responder.send(Ok(DurableTreeGathererFinalizeReceipt {
+                    _actor_identity: current.actor_identity.clone(),
+                    actor_revision,
+                    context_digest: current.context_digest,
+                    generation_digest: current.generation_digest,
+                    boundary_digest: current.boundary_digest,
+                    item_count: current.item_count,
+                    output,
+                }));
             }
             TreeGathererCommand::Pause { request, responder } => {
                 if request.drain_request().realm_id() as u64 != queue_key.realm_id
@@ -964,6 +1095,11 @@ async fn durable_gatherer_runner_for_tree<
                             ));
                         }
                         TreeGathererCommand::ApplyDurableGeneration { responder, .. } => {
+                            let _ = responder.send(Err(
+                                GathererPauseError::AlreadyPausedAtDifferentRequest,
+                            ));
+                        }
+                        TreeGathererCommand::FinalizeDurableGeneration { responder, .. } => {
                             let _ = responder.send(Err(
                                 GathererPauseError::AlreadyPausedAtDifferentRequest,
                             ));
@@ -1201,6 +1337,11 @@ async fn gatherer_runner_for_tree<
                                                 GathererPauseError::DurableGenerationOnLegacyActor,
                                             ));
                                         }
+                                        TreeGathererCommand::FinalizeDurableGeneration { responder, .. } => {
+                                            let _ = responder.send(Err(
+                                                GathererPauseError::DurableGenerationOnLegacyActor,
+                                            ));
+                                        }
                                     }
                                 }
                                 continue 'gathering;
@@ -1222,6 +1363,12 @@ async fn gatherer_runner_for_tree<
                             (next_unique_id, responder)
                         }
                         TreeGathererCommand::ApplyDurableGeneration { responder, .. } => {
+                            let _ = responder.send(Err(
+                                GathererPauseError::DurableGenerationOnLegacyActor,
+                            ));
+                            continue 'gathering;
+                        }
+                        TreeGathererCommand::FinalizeDurableGeneration { responder, .. } => {
                             let _ = responder.send(Err(
                                 GathererPauseError::DurableGenerationOnLegacyActor,
                             ));
@@ -1532,6 +1679,7 @@ mod h23b1_tests {
         delete_calls: AtomicUsize,
         finalize_calls: AtomicUsize,
         fail_update: AtomicBool,
+        fail_finalize: AtomicBool,
         subsequent_dump_empty: AtomicBool,
         block_delete: AtomicBool,
         dump_started: Notify,
@@ -1723,6 +1871,9 @@ mod h23b1_tests {
             _tree: &mut SimpleMemoryMerkleRecorderStore<PoseidonHasher, PHash>,
         ) -> anyhow::Result<Self::Output> {
             self.state.finalize_calls.fetch_add(1, Ordering::SeqCst);
+            if self.state.fail_finalize.load(Ordering::SeqCst) {
+                anyhow::bail!("injected finalize failure")
+            }
             Ok(self.state.update_calls.load(Ordering::SeqCst))
         }
     }
@@ -2033,6 +2184,70 @@ mod h23b1_tests {
                 .unwrap_err(),
             GathererPauseError::DurableGenerationIdentityMismatch
         );
+
+        let foreign_state = Arc::new(TestGathererState::default());
+        let (foreign_gatherer, foreign_join) =
+            start_durable_test_gatherer(foreign_state.clone());
+        foreign_state.release_update.notify_one();
+        let foreign_receipt = foreign_gatherer
+            .apply_durable_generation(durable_generation(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            gatherer
+                .finalize_durable_generation(foreign_receipt)
+                .await
+                .err()
+                .unwrap(),
+            GathererPauseError::DurableGenerationIdentityMismatch
+        );
+        drop(foreign_gatherer);
+        foreign_join.await.unwrap().unwrap();
+
+        let finalized = gatherer
+            .finalize_durable_generation(receipt)
+            .await
+            .unwrap();
+        assert_eq!(finalized.actor_revision().get(), 2);
+        assert_eq!(finalized.item_count(), 2);
+        assert_eq!(*finalized.output(), 1);
+        assert_eq!(state.finalize_calls.load(Ordering::SeqCst), 1);
+
+        let retry_apply = gatherer
+            .apply_durable_generation(durable_generation(1))
+            .await
+            .unwrap();
+        let retry_finalize = gatherer
+            .finalize_durable_generation(retry_apply)
+            .await
+            .unwrap();
+        assert_eq!(retry_finalize.actor_revision(), finalized.actor_revision());
+        assert_eq!(retry_finalize.generation_digest(), finalized.generation_digest());
+        assert_eq!(*retry_finalize.output(), 1);
+        assert_eq!(state.finalize_calls.load(Ordering::SeqCst), 1);
+
+        let pause_receipt = gatherer
+            .pause(GathererPauseRequest::new(
+                drain_request(10),
+                GathererActorRevision::try_new(2).unwrap(),
+                41,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(pause_receipt.revision().get(), 3);
+        assert_eq!(gatherer.resume(pause_receipt).await.unwrap().revision().get(), 4);
+        let post_resume_apply = gatherer
+            .apply_durable_generation(durable_generation(1))
+            .await
+            .unwrap();
+        let post_resume_finalize = gatherer
+            .finalize_durable_generation(post_resume_apply)
+            .await
+            .unwrap();
+        assert_eq!(post_resume_finalize.actor_revision(), finalized.actor_revision());
+        assert_eq!(post_resume_finalize.generation_digest(), finalized.generation_digest());
+        assert_eq!(state.finalize_calls.load(Ordering::SeqCst), 1);
+
         assert!(gatherer
             .finalize_gathering_and_update_queue_key(42)
             .await
@@ -2042,7 +2257,7 @@ mod h23b1_tests {
         assert_eq!(state.dump_calls.load(Ordering::SeqCst), 0);
         assert_eq!(state.ensure_calls.load(Ordering::SeqCst), 0);
         assert_eq!(state.delete_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(state.finalize_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(state.finalize_calls.load(Ordering::SeqCst), 1);
         drop(gatherer);
         join.await.unwrap().unwrap();
     }
@@ -2099,5 +2314,40 @@ mod h23b1_tests {
         assert_eq!(recovered.update_calls.load(Ordering::SeqCst), 1);
         drop(recovered_gatherer);
         recovered_join.await.unwrap().unwrap();
+
+        let finalize_failed = Arc::new(TestGathererState::default());
+        finalize_failed.fail_finalize.store(true, Ordering::SeqCst);
+        let (finalize_failed_gatherer, finalize_failed_join) =
+            start_durable_test_gatherer(finalize_failed.clone());
+        finalize_failed.release_update.notify_one();
+        let failed_receipt = finalize_failed_gatherer
+            .apply_durable_generation(durable_generation(5))
+            .await
+            .unwrap();
+        assert_eq!(
+            finalize_failed_gatherer
+                .finalize_durable_generation(failed_receipt)
+                .await
+                .err()
+                .unwrap(),
+            GathererPauseError::DurableGenerationApplyFailed
+        );
+        assert!(finalize_failed_join.await.unwrap().is_err());
+
+        let finalize_recovered = Arc::new(TestGathererState::default());
+        let (finalize_recovered_gatherer, finalize_recovered_join) =
+            start_durable_test_gatherer(finalize_recovered.clone());
+        finalize_recovered.release_update.notify_one();
+        let recovered_receipt = finalize_recovered_gatherer
+            .apply_durable_generation(durable_generation(5))
+            .await
+            .unwrap();
+        let recovered_output = finalize_recovered_gatherer
+            .finalize_durable_generation(recovered_receipt)
+            .await
+            .unwrap();
+        assert_eq!(*recovered_output.output(), 1);
+        drop(finalize_recovered_gatherer);
+        finalize_recovered_join.await.unwrap().unwrap();
     }
 }

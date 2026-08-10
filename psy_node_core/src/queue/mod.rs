@@ -14,3 +14,4 @@ pub mod realm_user_update_consumer;
 pub mod realm_user_update_verifier_profile;
 pub mod realm_user_update_ingress;
 pub mod realm_processor_durable_capture;
+pub mod realm_processor_semantic_output;

@@ -27,6 +27,13 @@ const COMPLETE_GENERATION_DOMAIN: &[u8] =
 pub struct RealmProcessorDurableGenerationDigest([u8; 32]);
 
 impl RealmProcessorDurableGenerationDigest {
+    pub fn try_new(bytes: [u8; 32]) -> Result<Self, RealmProcessorDurableCaptureError> {
+        if bytes == [0; 32] {
+            return Err(RealmProcessorDurableCaptureError::MalformedCompleteGeneration);
+        }
+        Ok(Self(bytes))
+    }
+
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
