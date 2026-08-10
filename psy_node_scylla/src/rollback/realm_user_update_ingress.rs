@@ -4,7 +4,7 @@
 //! for a production Edge composition; neither the raw durable router nor the
 //! low-level publisher crosses this boundary.
 
-use std::sync::Arc;
+use std::{marker::PhantomData, sync::Arc};
 
 use async_trait::async_trait;
 use parth_core::{
@@ -13,6 +13,7 @@ use parth_core::{
     protocol::core_types::{Q256BitHash, QFHashBase, QZKProofVerifier},
 };
 use psy_data::proof_input::guta::end_cap_input::SubmitUserEndCapNonProofInput;
+use psy_data::protocol::chain_context::{AuthorityObservation, AuthorityScope};
 use psy_node_core::queue::{
     realm_user_update_ingress::{
         RealmUserUpdateArtifactFactory, RealmUserUpdateIngressError,
@@ -21,8 +22,69 @@ use psy_node_core::queue::{
     },
     realm_user_update_publish::RealmUserUpdatePublishAdmission,
 };
+use psy_node_core::store::{
+    authority_commit::AuthorityTimestampKey,
+    authority_local_head::AuthorityLocalHeadReadState,
+};
 
-use super::ScyllaRealmUserUpdateDurableRouter;
+use super::{ScyllaAuthorityLocalHeadStore, ScyllaRealmUserUpdateDurableRouter};
+
+/// Read-only adapter over the same indivisible authority-local head used by
+/// startup preflight and final head publication. It owns no mutable singleton
+/// or fallback path.
+pub(crate) struct ScyllaRealmAuthorityObservationReader<Hash> {
+    store: Arc<ScyllaAuthorityLocalHeadStore>,
+    key: AuthorityTimestampKey,
+    _hash: PhantomData<fn() -> Hash>,
+}
+
+impl<Hash> ScyllaRealmAuthorityObservationReader<Hash> {
+    pub(crate) fn try_new(
+        store: Arc<ScyllaAuthorityLocalHeadStore>,
+        key: AuthorityTimestampKey,
+    ) -> Result<Self, RealmUserUpdateIngressError> {
+        if !matches!(key.authority(), AuthorityScope::Realm { .. }) {
+            return Err(RealmUserUpdateIngressError::AuthorityMismatch);
+        }
+        Ok(Self {
+            store,
+            key,
+            _hash: PhantomData,
+        })
+    }
+}
+
+#[async_trait]
+impl<Hash> psy_node_core::queue::realm_user_update_ingress::RealmAuthorityObservationReader<Hash>
+    for ScyllaRealmAuthorityObservationReader<Hash>
+where
+    Hash: Q256BitHash + Send + Sync,
+{
+    async fn read_authority_observation(
+        &self,
+    ) -> Result<AuthorityObservation<Hash>, RealmUserUpdateIngressError> {
+        let current = match self.store.read::<Hash>(self.key).await.map_err(|error| {
+            RealmUserUpdateIngressError::AuthorityObservation(error.to_string())
+        })? {
+            AuthorityLocalHeadReadState::Current(current) => current,
+            AuthorityLocalHeadReadState::Uninitialized => {
+                return Err(RealmUserUpdateIngressError::AuthorityObservation(
+                    "authority-local head is uninitialized".to_owned(),
+                ));
+            }
+        };
+        let head = current.head();
+        AuthorityObservation::try_new(
+            *head.chain(),
+            head.key().authority(),
+            head.state_checkpoint(),
+            *head.state_root(),
+        )
+        .map_err(|error| {
+            RealmUserUpdateIngressError::AuthorityObservation(error.to_string())
+        })
+    }
+}
 
 pub(crate) struct ScyllaRealmUserUpdateIngress<
     F,
@@ -65,6 +127,19 @@ where
     Proof: 'static,
     Verifier: QZKProofVerifier<Hash, Proof> + Send + Sync + 'static,
 {
+    async fn read_authority_observation(
+        &self,
+    ) -> Result<AuthorityObservation<Hash>, RealmUserUpdateIngressError> {
+        self.router
+            .read_authority_observation()
+            .await
+            .map_err(|error| {
+                RealmUserUpdateIngressError::AuthorityObservation(
+                    error.to_string(),
+                )
+            })
+    }
+
     async fn admit(
         &self,
     ) -> Result<RealmUserUpdatePublishAdmission<Hash>, RealmUserUpdateIngressError>
@@ -123,6 +198,11 @@ mod tests {
     fn facade_is_high_level_default_off_and_hides_router() {
         let source = production_source();
         assert!(source.contains("RealmUserUpdateIngressPort<F, Hash>"));
+        assert!(source.contains("ScyllaRealmAuthorityObservationReader"));
+        assert!(source.contains("ScyllaAuthorityLocalHeadStore"));
+        assert!(source.contains("AuthorityLocalHeadReadState::Uninitialized"));
+        assert!(source.contains("read_authority_observation"));
+        assert!(source.contains("self.router\n            .read_authority_observation()"));
         assert!(source.contains("submit_after_state_validation"));
         assert!(source.contains("Arc<dyn RealmUserUpdateArtifactFactory<F, Hash>>"));
         assert!(!source.contains("pub struct ScyllaRealmUserUpdateIngress"));

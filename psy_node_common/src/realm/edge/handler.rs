@@ -42,6 +42,9 @@ use psy_node_core::{
     qblob::structs::common::blob_metadata_header::QBlobWriterContextMetadataHeader,
     queue::{
         ephemeral::QStandardEphemeralQueuePublisher,
+        realm_user_update_ingress::{
+            RealmUserUpdateIngressPort, RealmUserUpdateStateFence,
+        },
         worker_queue::QStandardWorkerQueueSubscriber,
     },
     store::traits::proof_store::{QCanonicalProofStoreV2, QParthProofStore},
@@ -151,6 +154,8 @@ pub struct RealmEdgeHandler<
 
     pub user_update_queue: Arc<UserUpdateQueue>,
     pub get_proof_work_queue: Arc<GetProofWorkQueue>,
+    durable_user_update_ingress:
+        Option<Arc<dyn RealmUserUpdateIngressPort<N::F, N::QHash>>>,
 
     pub realm_identifier: QRealmIdentifier,
     pub realm_id_u64: u64,
@@ -179,6 +184,7 @@ impl<
             proof_store: self.proof_store.clone(),
             user_update_queue: self.user_update_queue.clone(),
             get_proof_work_queue: self.get_proof_work_queue.clone(),
+            durable_user_update_ingress: self.durable_user_update_ingress.clone(),
             realm_identifier: self.realm_identifier.clone(),
             realm_id_u64: self.realm_id_u64.clone(),
             realm_sub_id_u64: self.realm_sub_id_u64.clone(),
@@ -220,6 +226,7 @@ impl<
             proof_store,
             user_update_queue,
             get_proof_work_queue,
+            durable_user_update_ingress: None,
             realm_identifier,
             realm_id_u64,
             realm_sub_id_u64,
@@ -228,6 +235,18 @@ impl<
             proof_verifier,
             contract_state_tree_height_cache: Arc::new(DashMapContractHeightCache::new()),
         }
+    }
+
+    /// Install the fail-closed, proof-owning durable ingress. The legacy
+    /// constructor remains default-off; once installed, the handler cannot
+    /// access the low-level publisher and a durable error never falls back to
+    /// the ephemeral queue.
+    pub fn with_durable_user_update_ingress(
+        mut self,
+        ingress: Arc<dyn RealmUserUpdateIngressPort<N::F, N::QHash>>,
+    ) -> Self {
+        self.durable_user_update_ingress = Some(ingress);
+        self
     }
     pub fn user_belongs_to_realm(&self, user_id: u64) -> bool {
         let users_per_realm = 1u64 << N::REALM_GLOBAL_USER_TREE_HEIGHT;
@@ -445,6 +464,169 @@ impl<
         Ok(Some(payload))
     }
 
+    /// Branch-exact submission path. The handler owns only state validation;
+    /// proof verification, claim ownership, deterministic artifacts, durable
+    /// dependencies and NATS publication stay behind the high-level ingress.
+    /// The same authority observation surrounds every semantic state read,
+    /// and the ingress performs another fresh observation after proof work.
+    async fn handle_durable_user_end_cap_proof_submission(
+        &self,
+        ingress: &Arc<dyn RealmUserUpdateIngressPort<N::F, N::QHash>>,
+        user_end_cap_input: SubmitUserEndCapNonProofInput<N::F, N::QHash>,
+        proof_bytes: Vec<u8>,
+    ) -> anyhow::Result<()>
+    where
+        N::ZKVerifier: 'static,
+        N::ZKProof: 'static,
+    {
+        let admission = ingress.admit().await?;
+        let observation_before = require_realm_authority_observation(
+            Some(ingress.read_authority_observation().await?),
+            self.chain_id,
+            &self.realm_identifier,
+        )?;
+
+        // Fail before any expensive read if admission and authoritative head
+        // already refer to different branch identities.
+        RealmUserUpdateStateFence::try_seal(
+            admission.clone(),
+            observation_before.clone(),
+            observation_before.clone(),
+        )?;
+
+        // Realm state may legitimately lag the Coordinator canonical head.
+        // State/proof reads therefore use the authority-local state checkpoint,
+        // while the fence still binds the full canonical branch identity.
+        let current_checkpoint_id =
+            observation_before.state_checkpoint_id().get();
+        let end_cap_checkpoint_id =
+            user_end_cap_input.core.checkpoint_id.to_u64_value();
+        let secondary_end_cap_checkpoint_id = user_end_cap_input
+            .core
+            .new_user_leaf
+            .last_checkpoint_id
+            .to_u64_value();
+        let user_id = user_end_cap_input
+            .core
+            .state_transition
+            .user_id
+            .to_u64_value();
+
+        let global_user_tree_proof = self
+            .db_reader
+            .global_user_tree_get_merkle_proof(current_checkpoint_id, user_id)
+            .await?;
+        let old_user_leaf = self
+            .get_user_leaf_data_internal(current_checkpoint_id, user_id)
+            .await?;
+        let user_last_checkpoint_id =
+            old_user_leaf.last_checkpoint_id.to_u64_value();
+        if user_last_checkpoint_id != 0
+            && user_last_checkpoint_id > secondary_end_cap_checkpoint_id
+        {
+            anyhow::bail!(
+                "Submitted end cap for checkpoint {}, but user's last checkpoint is {}",
+                end_cap_checkpoint_id,
+                user_last_checkpoint_id
+            );
+        }
+        if end_cap_checkpoint_id > current_checkpoint_id {
+            anyhow::bail!(
+                "Submitted end cap for checkpoint {}, but current checkpoint is {}",
+                end_cap_checkpoint_id,
+                current_checkpoint_id
+            );
+        }
+
+        let old_leaf_hash = if
+            global_user_tree_proof.value == N::QHash::get_zero_value()
+        {
+            N::QHash::get_zero_value()
+        } else {
+            old_user_leaf.qfhash::<N::HasherBase>()
+        };
+        if user_end_cap_input
+            .core
+            .state_transition
+            .start_user_leaf_hash
+            != old_leaf_hash
+        {
+            anyhow::bail!(
+                "Invalid start_user_leaf_hash, left: {:?}, right: {:?}",
+                user_end_cap_input
+                    .core
+                    .state_transition
+                    .start_user_leaf_hash,
+                old_leaf_hash
+            );
+        }
+
+        let checkpoint_tree_proof: MerkleProofCore<N::QHash> = self
+            .db_reader
+            .checkpoint_tree_get_merkle_proof(
+                u64::MAX - 0xFFFF,
+                end_cap_checkpoint_id,
+            )
+            .await?;
+        let historical_root =
+            checkpoint_tree_proof.get_append_root::<N::HasherBase>();
+        if historical_root
+            != user_end_cap_input
+                .core
+                .state_transition
+                .checkpoint_tree_root_hash
+        {
+            anyhow::bail!(
+                "Invalid checkpoint tree proof historical root, left: {:?}, right: {:?}",
+                historical_root,
+                user_end_cap_input
+                    .core
+                    .state_transition
+                    .checkpoint_tree_root_hash
+            );
+        }
+
+        let expected_public_inputs_hash: N::QHash = user_end_cap_input
+            .core
+            .get_proof_public_inputs_hash::<N::HasherBase>(
+                N::GLOBAL_USER_TREE_HEIGHT,
+            );
+        let mut contract_ids = user_end_cap_input
+            .contract_state_updates
+            .iter()
+            .map(|update| update.user_contract_tree_update_proof.index as u32)
+            .collect::<Vec<_>>();
+        contract_ids.sort_unstable();
+        contract_ids.dedup();
+        self.ensure_contract_heights_in_cache(&contract_ids).await?;
+        user_end_cap_input.ensure_simple_self_consistent::<N::HasherBase, _>(
+            &old_user_leaf,
+            expected_public_inputs_hash,
+            &self.contract_state_tree_height_cache,
+            N::GLOBAL_USER_TREE_HEIGHT,
+            N::GLOBAL_CONTRACT_TREE_HEIGHT_USIZE,
+        )?;
+
+        let observation_after = require_realm_authority_observation(
+            Some(ingress.read_authority_observation().await?),
+            self.chain_id,
+            &self.realm_identifier,
+        )?;
+        let fence = RealmUserUpdateStateFence::try_seal(
+            admission,
+            observation_before,
+            observation_after,
+        )?;
+        ingress
+            .submit_after_state_validation(
+                fence,
+                user_end_cap_input,
+                proof_bytes,
+            )
+            .await?;
+        Ok(())
+    }
+
     pub async fn handle_user_end_cap_proof_submission(
         &self,
         user_end_cap_input: SubmitUserEndCapNonProofInput<N::F, N::QHash>,
@@ -471,6 +653,16 @@ impl<
         }
         if user_end_cap_input.contract_state_updates.is_empty() {
             anyhow::bail!("invalid end cap updates: contract_state_updates cannot be empty");
+        }
+
+        if let Some(ingress) = self.durable_user_update_ingress.as_ref() {
+            return self
+                .handle_durable_user_end_cap_proof_submission(
+                    ingress,
+                    user_end_cap_input,
+                    proof_bytes,
+                )
+                .await;
         }
 
         let (unique_pending_id, proc_checkpoint_id) = self.temp_db.get_gathering_unique_pending_ids(&self.realm_identifier).await?;
@@ -731,7 +923,10 @@ impl<
         // process_block.set_new_unique_ids, which may have advanced the ID
         // during the async proof verification / storage calls above. Publishing
         // to a stale (already-drained) queue silently drops the endcap.
-        let (_, live_proc_id) = self.temp_db.get_gathering_unique_pending_ids(&self.realm_identifier).await?;
+        let (_, live_proc_id) = self
+            .temp_db
+            .get_gathering_unique_pending_ids(&self.realm_identifier)
+            .await?;
 
         let queue_key = RealmUserUpdateQueueKey {
             realm_id: self.realm_id_u64,
@@ -764,21 +959,32 @@ impl<
         // The consumer we create is idempotent: if it already exists this is a
         // no-op; if it was deleted, it is recreated with DeliverPolicy::All so
         // all pending messages are replayed.
-        if let Err(e) = self.user_update_queue.ensure_consumer(
-            &queue_key,
-            self.realm_id_u64,
-            self.realm_sub_id_u64,
-            live_proc_id,
-            0,
-        ).await {
+        if let Err(e) = self
+            .user_update_queue
+            .ensure_consumer(
+                &queue_key,
+                self.realm_id_u64,
+                self.realm_sub_id_u64,
+                live_proc_id,
+                0,
+            )
+            .await
+        {
             tracing::warn!(
                 "Failed to ensure consumer for live_proc_id {} before publish (continuing): {}",
-                live_proc_id, e
+                live_proc_id,
+                e
             );
         }
-
         self.user_update_queue
-            .publish_ephemeral_queue_item_owned(&queue_key, self.realm_id_u64, self.realm_sub_id_u64, live_proc_id, 0, queue_item)
+            .publish_ephemeral_queue_item_owned(
+                &queue_key,
+                self.realm_id_u64,
+                self.realm_sub_id_u64,
+                live_proc_id,
+                0,
+                queue_item,
+            )
             .await?;
         timer.lap_micros("publish_ephemeral_queue_item_owned");
         timer.lap_group("handle_user_end_cap_proof_submission total");
@@ -1437,6 +1643,65 @@ mod authority_observation_rpc_tests {
         );
         assert!(checkpoint_tree.contains("checkpoint_tree_get_root_hash(checkpoint_id)"));
         assert!(!checkpoint_tree.contains("MAX_CHECKPOINT_ID"));
+    }
+
+    #[test]
+    fn durable_user_update_route_is_default_off_and_never_falls_back() {
+        let source = include_str!("handler.rs");
+        let constructor = rust_function_body(source, "pub fn new(");
+        assert!(constructor.contains("durable_user_update_ingress: None"));
+
+        let handler = rust_function_body(
+            source,
+            "pub async fn handle_user_end_cap_proof_submission",
+        );
+        let durable_return = handler
+            .find("handle_durable_user_end_cap_proof_submission")
+            .unwrap();
+        let legacy_temp = handler
+            .find("get_gathering_unique_pending_ids")
+            .unwrap();
+        assert!(durable_return < legacy_temp);
+
+        let durable = rust_function_body(
+            source,
+            "async fn handle_durable_user_end_cap_proof_submission",
+        );
+        let admit = durable.find("ingress.admit().await").unwrap();
+        let first_observation = durable
+            .find("ingress.read_authority_observation().await")
+            .unwrap();
+        let first_state_read = durable
+            .find("global_user_tree_get_merkle_proof")
+            .unwrap();
+        let final_submit = durable
+            .find("ingress\n            .submit_after_state_validation")
+            .unwrap();
+        assert!(admit < first_observation && first_observation < first_state_read);
+        assert!(first_state_read < final_submit);
+        assert!(durable.contains("observation_before.state_checkpoint_id().get()"));
+        assert_eq!(
+            durable
+                .matches("ingress.read_authority_observation().await")
+                .count(),
+            2
+        );
+        assert_eq!(durable.matches("RealmUserUpdateStateFence::try_seal").count(), 2);
+        for forbidden in [
+            "RealmUserUpdatePublishPort",
+            "RealmUserUpdatePublishRequest",
+            "put_proof_bytes_exact",
+            "set_contract_updates_for_user",
+            "set_submitted_status_for_pending",
+            "ensure_consumer",
+            "publish_ephemeral_queue_item_owned",
+            "verify_zk_proof",
+        ] {
+            assert!(
+                !durable.contains(forbidden),
+                "high-level ingress path leaked {forbidden}"
+            );
+        }
     }
 
     #[tokio::test]

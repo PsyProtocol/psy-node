@@ -282,6 +282,14 @@ where
     F: QFelt64,
     Hash: Q256BitHash,
 {
+    /// Read the exact authoritative head used by this ingress's post-proof
+    /// freshness check. Keeping this capability on the same high-level port
+    /// prevents the handler from fencing legacy and branch-exact singletons
+    /// against one another.
+    async fn read_authority_observation(
+        &self,
+    ) -> Result<AuthorityObservation<Hash>, RealmUserUpdateIngressError>;
+
     async fn admit(
         &self,
     ) -> Result<RealmUserUpdatePublishAdmission<Hash>, RealmUserUpdateIngressError>;
@@ -296,6 +304,7 @@ where
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RealmUserUpdateIngressError {
+    AuthorityObservation(String),
     AuthorityObservationChanged,
     NetworkMismatch,
     AuthorityMismatch,
@@ -628,6 +637,7 @@ mod tests {
         assert!(port.contains("RealmUserUpdateStateFence<Hash>"));
         assert!(port.contains("SubmitUserEndCapNonProofInput<F, Hash>"));
         assert!(port.contains("proof: Vec<u8>"));
+        assert!(port.contains("read_authority_observation"));
     }
 
     #[test]

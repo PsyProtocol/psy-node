@@ -20,7 +20,7 @@ use parth_core::{
 };
 use psy_data::protocol::{
     canonical_chain::NetworkId,
-    chain_context::AuthorityScope,
+    chain_context::{AuthorityObservation, AuthorityScope},
 };
 use psy_data::proof_input::guta::end_cap_input::SubmitUserEndCapNonProofInput;
 use psy_node_core::{
@@ -291,6 +291,19 @@ where
 
     /// Capture the exact gathering generation before proof/state work. The
     /// caller must then verify and seal a UserEndCap request before claiming.
+    pub(crate) async fn read_authority_observation(
+        &self,
+    ) -> Result<AuthorityObservation<Hash>, RealmUserUpdateRouterError> {
+        self.authority_observations
+            .read_authority_observation()
+            .await
+            .map_err(|error| {
+                RealmUserUpdateRouterError::AuthorityObservation(
+                    error.to_string(),
+                )
+            })
+    }
+
     pub(crate) async fn admit(
         &self,
     ) -> Result<RealmUserUpdatePublishAdmission<Hash>, RealmUserUpdateRouterError> {
@@ -495,15 +508,7 @@ where
         })
         .await?;
 
-        let fresh_observation = self
-            .authority_observations
-            .read_authority_observation()
-            .await
-            .map_err(|error| {
-                RealmUserUpdateRouterError::AuthorityObservation(
-                    error.to_string(),
-                )
-            })?;
+        let fresh_observation = self.read_authority_observation().await?;
         require_fresh_realm_authority_observation(
             &fenced_observation,
             &fresh_observation,
