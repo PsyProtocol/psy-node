@@ -57,7 +57,7 @@ use psy_node_core::{
         realm_user_update_claim::{
             RealmUserUpdateAdmissionOrdinal, RealmUserUpdateClaimBucket,
             RealmUserUpdateClaimPhase, RealmUserUpdateCreatedAtSeconds,
-            StoredRealmUserUpdateClaim,
+            RealmUserUpdatePublishReceiptDigest, StoredRealmUserUpdateClaim,
         },
         realm_user_update_artifact::{
             deterministic_qblob_context, RealmUserUpdateSlotEnvelope,
@@ -88,8 +88,14 @@ use psy_node_core::{
 use psy_node_nats::{
     queue::NatsJetStreamClient,
     recoverable_assignment::PendingQueueSegmentLedgerBootstrap,
+    recoverable_outbox::{
+        PendingQueuePublishIntentPhase, PendingQueuePublishIntentSlot,
+        StoredPendingQueuePublishIntent,
+    },
     recoverable_publish::{
         PendingQueueGenerationBudgetContract, PendingQueuePublisherKind,
+        PendingQueuePublishIntentId, PendingQueuePublishSourcePhase,
+        PendingQueuePublishSourceSlot, PendingQueuePublishSourceState,
         PendingQueueSourceQuota,
     },
     recoverable_segment::{
@@ -448,6 +454,20 @@ fn current_pipeline(
     }
 }
 
+fn current_claim(
+    outcome: RealmUserUpdateClaimWriteOutcome<PHash>,
+) -> anyhow::Result<StoredRealmUserUpdateClaim<PHash>> {
+    match outcome {
+        RealmUserUpdateClaimWriteOutcome::Applied(receipt)
+        | RealmUserUpdateClaimWriteOutcome::Resumed(receipt) => {
+            Ok(receipt.current().clone())
+        }
+        RealmUserUpdateClaimWriteOutcome::Conflict(current) => {
+            bail!("claim conflict at revision {}", current.revision().get())
+        }
+    }
+}
+
 fn ensure_same_durable_publication(
     expected: &RealmUserUpdatePublishReceipt,
     observed: &RealmUserUpdatePublishReceipt,
@@ -776,7 +796,128 @@ async fn restore_dependency_row(
     Ok(())
 }
 
-async fn ensure_dependency_fault_rejected(
+async fn read_publish_source_fixture(
+    session: &Session,
+    slot: PendingQueuePublishSourceSlot,
+) -> anyhow::Result<(PendingQueuePublishSourceState, i64)> {
+    let row = session
+        .query_unpaged(
+            format!(
+                "SELECT revision, source_payload, WRITETIME(source_payload) FROM {}.{} WHERE source_slot = ?",
+                control(), PENDING_QUEUE_PUBLISH_SOURCE_TABLE
+            ),
+            (slot.as_bytes().to_vec(),),
+        )
+        .await?
+        .into_rows_result()?
+        .maybe_first_row::<(i64, Vec<u8>, i64)>()?
+        .context("publish source fixture row missing")?;
+    Ok((
+        PendingQueuePublishSourceState::decode_persisted(row.0, &row.1)?,
+        row.2,
+    ))
+}
+
+async fn read_publish_intent_fixture(
+    session: &Session,
+    slot: PendingQueuePublishIntentSlot,
+) -> anyhow::Result<StoredPendingQueuePublishIntent> {
+    let row = session
+        .query_unpaged(
+            format!(
+                "SELECT revision, intent_payload FROM {}.{} WHERE intent_slot = ?",
+                control(), PENDING_QUEUE_PUBLISH_INTENT_TABLE
+            ),
+            (slot.as_bytes().to_vec(),),
+        )
+        .await?
+        .into_rows_result()?
+        .maybe_first_row::<(i64, Vec<u8>)>()?
+        .context("publish intent fixture row missing")?;
+    Ok(StoredPendingQueuePublishIntent::decode_persisted(
+        slot,
+        row.0,
+        &row.1,
+    )?)
+}
+
+fn claim_partition_binding(
+    claim: &StoredRealmUserUpdateClaim<PHash>,
+) -> anyhow::Result<(i64, i8, i64, i32, Vec<u8>, i64, Vec<u8>, i16, i64)> {
+    let partition = claim.partition()?;
+    let capture = partition.capture();
+    let AuthorityScope::Realm {
+        realm_id,
+        realm_sub_id,
+    } = capture.key().authority()
+    else {
+        bail!("RF=3 claim must be Realm-scoped")
+    };
+    Ok((
+        i64::from(capture.key().network().chain_id()),
+        REALM_AUTHORITY_KIND,
+        i64::from(realm_id),
+        i32::from(realm_sub_id),
+        capture.activation().as_bytes().to_vec(),
+        i64::try_from(capture.processing().pending_id().get())?,
+        capture.processing().proc_checkpoint_id().as_bytes().to_vec(),
+        partition.bucket().as_i16()?,
+        i64::try_from(claim.user_id().get())?,
+    ))
+}
+
+async fn claim_write_timestamp(
+    session: &Session,
+    claim: &StoredRealmUserUpdateClaim<PHash>,
+) -> anyhow::Result<i64> {
+    let key = claim_partition_binding(claim)?;
+    let row = session
+        .query_unpaged(
+            format!(
+                "SELECT WRITETIME(claim_payload) FROM {}.{} WHERE network_chain_id = ? AND authority_kind = ? AND realm_id = ? AND realm_sub_id = ? AND activation_digest = ? AND unique_pending_id = ? AND proc_checkpoint_id = ? AND claim_bucket = ? AND user_id = ?",
+                control(), REALM_USER_UPDATE_CLAIM_TABLE
+            ),
+            key,
+        )
+        .await?
+        .into_rows_result()?
+        .maybe_first_row::<(i64,)>()?
+        .context("claim fixture has no payload writetime")?;
+    Ok(row.0)
+}
+
+async fn overwrite_claim_fixture(
+    session: &Session,
+    claim: &StoredRealmUserUpdateClaim<PHash>,
+    timestamp: i64,
+) -> anyhow::Result<()> {
+    let key = claim_partition_binding(claim)?;
+    session
+        .query_unpaged(
+            format!(
+                "UPDATE {}.{} USING TIMESTAMP ? SET revision = ?, claim_payload = ? WHERE network_chain_id = ? AND authority_kind = ? AND realm_id = ? AND realm_sub_id = ? AND activation_digest = ? AND unique_pending_id = ? AND proc_checkpoint_id = ? AND claim_bucket = ? AND user_id = ?",
+                control(), REALM_USER_UPDATE_CLAIM_TABLE
+            ),
+            (
+                timestamp,
+                claim.revision().as_i64()?,
+                claim.to_canonical_bytes(),
+                key.0,
+                key.1,
+                key.2,
+                key.3,
+                key.4,
+                key.5,
+                key.6,
+                key.7,
+                key.8,
+            ),
+        )
+        .await?;
+    Ok(())
+}
+
+async fn ensure_qualification_fault_rejected(
     router: &ScyllaRealmUserUpdateDurableRouter<PF, PHash, PoseidonHasher>,
     gates: &ScyllaRealmUserUpdateAdmissionStore,
     jetstream: &jetstream::Context,
@@ -787,12 +928,12 @@ async fn ensure_dependency_fault_rejected(
 ) -> anyhow::Result<()> {
     let before = stream_state(jetstream, stream_name).await?;
     let error = match router.qualify_generation(key, close).await {
-        Ok(_) => bail!("dependency fault unexpectedly qualified generation"),
+        Ok(_) => bail!("fault unexpectedly qualified generation"),
         Err(error) => error,
     };
     ensure!(
         error.to_string().contains(expected_error),
-        "unexpected dependency fault error: {error}"
+        "unexpected qualification fault error: {error}"
     );
     let current = match gates
         .read::<PHash>(key, RealmUserUpdateAdmissionShard::Generation)
@@ -800,7 +941,7 @@ async fn ensure_dependency_fault_rejected(
     {
         RealmUserUpdateAdmissionReadState::Current(current) => current,
         RealmUserUpdateAdmissionReadState::Uninitialized => {
-            bail!("dependency fault removed generation admission")
+            bail!("fault removed generation admission")
         }
     };
     ensure!(current.phase() == RealmUserUpdateAdmissionPhase::GenerationClosed);
@@ -1412,6 +1553,14 @@ struct NonemptyTerminalSourceReport {
     dependency_extra_rejected: bool,
     dependency_wrong_digest_rejected: bool,
     dependency_exact_restore: bool,
+    commit_pending_recovered: bool,
+    commit_pending_nats_publish_delta: i64,
+    recovery_nats_publish_delta: i64,
+    source_revision_delta: u64,
+    intent_revision_delta: u64,
+    recovery_response_loss_retry: bool,
+    missing_source_rejected: bool,
+    fake_receipt_rejected: bool,
     qualification_nats_publish_delta: i64,
     repair_flush_compact: bool,
     direct_one_nodes_equal: usize,
@@ -1421,8 +1570,15 @@ struct NonemptyTerminalSourceReport {
     qualification: &'static str,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NonemptyTerminalSourceCase {
+    Positive,
+    DependencyFault,
+    SourceReceiptCommitPending,
+}
+
 async fn run_nonempty_terminal_source_joint_rf3(
-    dependency_faults: bool,
+    case: NonemptyTerminalSourceCase,
 ) -> anyhow::Result<()> {
     ensure!(
         std::env::var("PSY_D04B6H23C4C2B3B2C2B_RF3").as_deref()
@@ -1535,7 +1691,7 @@ async fn run_nonempty_terminal_source_joint_rf3(
             .await?,
     );
     let height = GlobalUserTreeHeight::try_new(32)?;
-    let router = ScyllaRealmUserUpdateDurableRouter::<
+    let mut router = ScyllaRealmUserUpdateDurableRouter::<
         PF,
         PHash,
         PoseidonHasher,
@@ -1551,7 +1707,7 @@ async fn run_nonempty_terminal_source_joint_rf3(
     )
     .await?;
     ensure!(router.admit().await? == expected_admission);
-    let (gates, _, guard, provisioned_admission, key) =
+    let (gates, claims, guard, provisioned_admission, key) =
         provisioned(session.clone(), generation).await?;
     ensure!(provisioned_admission == expected_admission);
 
@@ -1561,6 +1717,18 @@ async fn run_nonempty_terminal_source_joint_rf3(
     let mut terminals = Vec::new();
     let mut initial_nats_leader = None;
     let mut failover_nats_leader = None;
+    let dependency_store = ScyllaRealmUserUpdateDependencyStore::prepare(
+        session.clone(),
+        PendingQueueArtifactDataKeyspace::try_new(DATA)?,
+    )
+    .await?;
+    let mut commit_pending_witness = None;
+    let mut first_ready_claim = None;
+    let mut commit_pending_nats_publish_delta = 0;
+    let mut recovery_nats_publish_delta = 0;
+    let mut source_revision_delta = 0;
+    let mut intent_revision_delta = 0;
+    let mut recovery_response_loss_retry = false;
     for (index, user) in [first_user, second_user].into_iter().enumerate() {
         let verified = verified_end_cap_request(user, height)?;
         let winner = router
@@ -1578,10 +1746,179 @@ async fn run_nonempty_terminal_source_joint_rf3(
             verified,
             height,
         )?;
-        let terminal = router
-            .complete_live(&winner, &fixture.artifacts)
-            .await
-            .with_context(|| format!("complete live claim {index}"))?;
+        let terminal = if case
+            == NonemptyTerminalSourceCase::SourceReceiptCommitPending
+            && index == 0
+        {
+            let planned = StoredRealmUserUpdateClaim::dependencies_planned(
+                &winner,
+                fixture.bundle.digest(),
+            )?;
+            let planned = current_claim(
+                claims.compare_and_set(&winner, &planned).await?,
+            )?;
+            ensure!(
+                dependency_store
+                    .persist_and_readback(&fixture.bundle)
+                    .await?
+                    == fixture.bundle.digest()
+            );
+            let ready_claim = StoredRealmUserUpdateClaim::dependencies_ready(
+                &planned,
+            )?;
+            let ready_claim = current_claim(
+                claims.compare_and_set(&planned, &ready_claim).await?,
+            )?;
+            ensure!(ready_claim.phase() == RealmUserUpdateClaimPhase::DependenciesReady);
+
+            let publish_store = ScyllaPendingQueuePublishStore::prepare(
+                session.clone(),
+                nats_publisher.clone(),
+                segment.clone(),
+                PendingQueuePublishKeyspaces::new(
+                    BranchExactDeploymentNoTabletKeyspace::try_new(control())?,
+                    PendingQueuePublishDataKeyspace::try_new(DATA)?,
+                ),
+            )
+            .await?;
+            let kind = PendingQueuePublisherKind::RealmUserUpdate;
+            publish_store.bootstrap_source(&assignment, kind).await?;
+            let intent_id = PendingQueuePublishIntentId::try_new(
+                *fixture.publish_request.intent_id().as_bytes(),
+            )?;
+            let intent_slot = publish_store
+                .materialize_data(
+                    &assignment,
+                    kind,
+                    intent_id,
+                    fixture.publish_request.payload(),
+                )
+                .await?;
+            let permit = publish_store
+                .bind_materialized(&assignment, kind, intent_slot)
+                .await?;
+            let before_pending =
+                stream_state(&jetstream, segment.stream_name()).await?;
+            let witness = publish_store
+                .publish_through_commit_pending_fixture(
+                    &assignment,
+                    permit,
+                )
+                .await?;
+            let after_pending =
+                stream_state(&jetstream, segment.stream_name()).await?;
+            commit_pending_nats_publish_delta = i64::try_from(after_pending.0)?
+                - i64::try_from(before_pending.0)?;
+            ensure!(commit_pending_nats_publish_delta == 1);
+            let (pending_source, _) = read_publish_source_fixture(
+                &session,
+                witness.source_slot(),
+            )
+            .await?;
+            let pending_intent = read_publish_intent_fixture(
+                &session,
+                witness.intent_slot(),
+            )
+            .await?;
+            ensure!(matches!(
+                pending_source.phase(),
+                PendingQueuePublishSourcePhase::CommitPending { .. }
+            ));
+            ensure!(matches!(
+                pending_intent.phase(),
+                PendingQueuePublishIntentPhase::NatsAccepted { .. }
+            ));
+            ensure!(pending_source.revision().get() == witness.source_revision());
+            ensure!(pending_intent.revision().get() == witness.intent_revision());
+            ensure!(
+                pending_source.commit_pending().map(|(_, sequence)| sequence)
+                    == Some(witness.subject_sequence())
+            );
+            drop(publish_store);
+
+            // Rebuild the production-shaped router after the deterministic
+            // crash stop. It must consume the existing NATS acceptance rather
+            // than publish the envelope a second time.
+            router = ScyllaRealmUserUpdateDurableRouter::<
+                PF,
+                PHash,
+                PoseidonHasher,
+            >::prepare(
+                session.clone(),
+                capture.key().network(),
+                realm(),
+                height,
+                20,
+                ready.clone(),
+                nats_publisher.clone(),
+                segment.clone(),
+            )
+            .await?;
+            let before_recovery =
+                stream_state(&jetstream, segment.stream_name()).await?;
+            let recovered = router
+                .complete_live(&ready_claim, &fixture.artifacts)
+                .await
+                .context("recover CommitPending claim")?;
+            let after_recovery =
+                stream_state(&jetstream, segment.stream_name()).await?;
+            recovery_nats_publish_delta = i64::try_from(after_recovery.0)?
+                - i64::try_from(before_recovery.0)?;
+            ensure!(recovery_nats_publish_delta == 0);
+            ensure!(
+                recovered.publication().disposition()
+                    == RealmUserUpdatePublishDisposition::DurableResumed
+            );
+            let retry = router
+                .complete_live(&ready_claim, &fixture.artifacts)
+                .await
+                .context("retry recovered CommitPending claim")?;
+            ensure!(retry.claim() == recovered.claim());
+            ensure!(retry.publication() == recovered.publication());
+            ensure!(stream_state(&jetstream, segment.stream_name()).await? == after_recovery);
+            recovery_response_loss_retry = true;
+
+            let (final_source, _) = read_publish_source_fixture(
+                &session,
+                witness.source_slot(),
+            )
+            .await?;
+            let final_intent = read_publish_intent_fixture(
+                &session,
+                witness.intent_slot(),
+            )
+            .await?;
+            ensure!(matches!(
+                final_source.phase(),
+                PendingQueuePublishSourcePhase::Open
+            ));
+            ensure!(matches!(
+                final_intent.phase(),
+                PendingQueuePublishIntentPhase::SourceCommitted { .. }
+            ));
+            ensure!(final_source.last_subject_sequence() == witness.subject_sequence());
+            ensure!(final_source.last_envelope_digest() == *witness.envelope_digest());
+            source_revision_delta = final_source
+                .revision()
+                .get()
+                .checked_sub(witness.source_revision())
+                .context("source revision regressed")?;
+            intent_revision_delta = final_intent
+                .revision()
+                .get()
+                .checked_sub(witness.intent_revision())
+                .context("intent revision regressed")?;
+            ensure!(source_revision_delta == 1);
+            ensure!(intent_revision_delta == 1);
+            first_ready_claim = Some(ready_claim);
+            commit_pending_witness = Some(witness);
+            recovered
+        } else {
+            router
+                .complete_live(&winner, &fixture.artifacts)
+                .await
+                .with_context(|| format!("complete live claim {index}"))?
+        };
         ensure!(terminal.claim().phase() == RealmUserUpdateClaimPhase::Published);
         ensure!(
             terminal.claim().publish_receipt_digest().map(|value| *value.as_bytes())
@@ -1654,11 +1991,6 @@ async fn run_nonempty_terminal_source_joint_rf3(
     );
     let historical_intent_after_cursor_advance = true;
 
-    let dependency_store = ScyllaRealmUserUpdateDependencyStore::prepare(
-        session.clone(),
-        PendingQueueArtifactDataKeyspace::try_new(DATA)?,
-    )
-    .await?;
     for (terminal, fixture) in terminals.iter().zip(&fixtures) {
         let readback = dependency_store
             .read_bundle(
@@ -1683,7 +2015,9 @@ async fn run_nonempty_terminal_source_joint_rf3(
     let mut dependency_extra_rejected = false;
     let mut dependency_wrong_digest_rejected = false;
     let mut dependency_exact_restore = false;
-    if dependency_faults {
+    let mut missing_source_rejected = false;
+    let mut fake_receipt_rejected = false;
+    if case == NonemptyTerminalSourceCase::DependencyFault {
         ensure!(
             std::env::var("PSY_D04B6H23C4C2B3B2C2C1_RF3").as_deref()
                 == Ok("1"),
@@ -1722,7 +2056,7 @@ async fn run_nonempty_terminal_source_joint_rf3(
                 ),
             )
             .await?;
-        ensure_dependency_fault_rejected(
+        ensure_qualification_fault_rejected(
             &router,
             &gates,
             &jetstream,
@@ -1774,7 +2108,7 @@ async fn run_nonempty_terminal_source_joint_rf3(
                 ),
             )
             .await?;
-        ensure_dependency_fault_rejected(
+        ensure_qualification_fault_rejected(
             &router,
             &gates,
             &jetstream,
@@ -1837,7 +2171,7 @@ async fn run_nonempty_terminal_source_joint_rf3(
                 ),
             )
             .await?;
-        ensure_dependency_fault_rejected(
+        ensure_qualification_fault_rejected(
             &router,
             &gates,
             &jetstream,
@@ -1862,6 +2196,119 @@ async fn run_nonempty_terminal_source_joint_rf3(
                 == fixtures[0].bundle
         );
         dependency_exact_restore = true;
+        ensure!(stream_state(&jetstream, segment.stream_name()).await? == nats_before);
+    }
+    if case == NonemptyTerminalSourceCase::SourceReceiptCommitPending {
+        ensure!(
+            std::env::var("PSY_D04B6H23C4C2B3B2C2C2_RF3").as_deref()
+                == Ok("1"),
+            "run through tests/rf3/run-d04b6h23c4c2b3b2c2c2.sh"
+        );
+        let ready_claim = first_ready_claim
+            .as_ref()
+            .context("CommitPending ready claim missing")?;
+        let witness = commit_pending_witness
+            .as_ref()
+            .context("CommitPending witness missing")?;
+        let original_claim = terminals[0].claim();
+        let claim_timestamp = claim_write_timestamp(&session, original_claim).await?;
+        let fake_timestamp = claim_timestamp
+            .checked_add(1)
+            .context("fake receipt timestamp overflow")?;
+        let claim_restore_timestamp = fake_timestamp
+            .checked_add(1)
+            .context("claim restore timestamp overflow")?;
+        let fake_digest = RealmUserUpdatePublishReceiptDigest::try_new([0xa5; 32])?;
+        ensure!(
+            original_claim
+                .publish_receipt_digest()
+                .map(|digest| *digest.as_bytes())
+                != Some(*fake_digest.as_bytes())
+        );
+        let fake_claim = StoredRealmUserUpdateClaim::published(
+            ready_claim,
+            fake_digest,
+        )?;
+        ensure!(fake_claim.revision() == original_claim.revision());
+        overwrite_claim_fixture(&session, &fake_claim, fake_timestamp).await?;
+        ensure_qualification_fault_rejected(
+            &router,
+            &gates,
+            &jetstream,
+            segment.stream_name(),
+            key,
+            close,
+            "TerminalEvidenceMismatch",
+        )
+        .await?;
+        fake_receipt_rejected = true;
+        overwrite_claim_fixture(
+            &session,
+            original_claim,
+            claim_restore_timestamp,
+        )
+        .await?;
+        ensure!(
+            claims
+                .read(original_claim.partition()?, original_claim.user_id())
+                .await?
+                == RealmUserUpdateClaimReadState::Current(original_claim.clone())
+        );
+
+        let (source_state, source_timestamp) = read_publish_source_fixture(
+            &session,
+            witness.source_slot(),
+        )
+        .await?;
+        let source_delete_timestamp = source_timestamp
+            .checked_add(1)
+            .context("source delete timestamp overflow")?;
+        let source_restore_timestamp = source_delete_timestamp
+            .checked_add(1)
+            .context("source restore timestamp overflow")?;
+        session
+            .query_unpaged(
+                format!(
+                    "DELETE FROM {}.{} USING TIMESTAMP ? WHERE source_slot = ?",
+                    control(), PENDING_QUEUE_PUBLISH_SOURCE_TABLE
+                ),
+                (
+                    source_delete_timestamp,
+                    witness.source_slot().as_bytes().to_vec(),
+                ),
+            )
+            .await?;
+        ensure_qualification_fault_rejected(
+            &router,
+            &gates,
+            &jetstream,
+            segment.stream_name(),
+            key,
+            close,
+            "SourceUninitialized",
+        )
+        .await?;
+        missing_source_rejected = true;
+        session
+            .query_unpaged(
+                format!(
+                    "INSERT INTO {}.{} (source_slot, revision, source_payload) VALUES (?, ?, ?) USING TIMESTAMP ?",
+                    control(), PENDING_QUEUE_PUBLISH_SOURCE_TABLE
+                ),
+                (
+                    witness.source_slot().as_bytes().to_vec(),
+                    source_state.revision().as_i64(),
+                    source_state.to_persisted_bytes(),
+                    source_restore_timestamp,
+                ),
+            )
+            .await?;
+        ensure!(
+            read_publish_source_fixture(&session, witness.source_slot())
+                .await?
+                .0
+                == source_state
+        );
         ensure!(stream_state(&jetstream, segment.stream_name()).await? == nats_before);
     }
 
@@ -1975,16 +2422,30 @@ async fn run_nonempty_terminal_source_joint_rf3(
         dependency_extra_rejected,
         dependency_wrong_digest_rejected,
         dependency_exact_restore,
+        commit_pending_recovered: commit_pending_witness.is_some(),
+        commit_pending_nats_publish_delta,
+        recovery_nats_publish_delta,
+        source_revision_delta,
+        intent_revision_delta,
+        recovery_response_loss_retry,
+        missing_source_rejected,
+        fake_receipt_rejected,
         qualification_nats_publish_delta,
         repair_flush_compact: true,
         direct_one_nodes_equal,
         dependency_direct_one_nodes_equal,
         dependency_rows: expected_dependencies.len(),
         qualification_ms,
-        qualification: if dependency_faults {
-            "H23C4C2B3B2C2C1_DEPENDENCY_FAULT_RF3_PASSED"
-        } else {
-            "H23C4C2B3B2C2B_NONEMPTY_TERMINAL_SOURCE_RF3_PASSED"
+        qualification: match case {
+            NonemptyTerminalSourceCase::Positive => {
+                "H23C4C2B3B2C2B_NONEMPTY_TERMINAL_SOURCE_RF3_PASSED"
+            }
+            NonemptyTerminalSourceCase::DependencyFault => {
+                "H23C4C2B3B2C2C1_DEPENDENCY_FAULT_RF3_PASSED"
+            }
+            NonemptyTerminalSourceCase::SourceReceiptCommitPending => {
+                "H23C4C2B3B2C2C2_SOURCE_RECEIPT_COMMITPENDING_RF3_PASSED"
+            }
         },
     };
     std::fs::write(report_path, serde_json::to_vec_pretty(&report)?)?;
@@ -1996,12 +2457,28 @@ async fn run_nonempty_terminal_source_joint_rf3(
 #[ignore = "requires isolated Scylla RF=3 and NATS RF=3 runner"]
 async fn d04b6h23c4c2b3b2c2b_nonempty_terminal_source_joint_rf3(
 ) -> anyhow::Result<()> {
-    run_nonempty_terminal_source_joint_rf3(false).await
+    run_nonempty_terminal_source_joint_rf3(
+        NonemptyTerminalSourceCase::Positive,
+    )
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "requires isolated Scylla RF=3 and NATS RF=3 runner"]
 async fn d04b6h23c4c2b3b2c2c1_dependency_fault_joint_rf3(
 ) -> anyhow::Result<()> {
-    run_nonempty_terminal_source_joint_rf3(true).await
+    run_nonempty_terminal_source_joint_rf3(
+        NonemptyTerminalSourceCase::DependencyFault,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires isolated Scylla RF=3 and NATS RF=3 runner"]
+async fn d04b6h23c4c2b3b2c2c2_source_receipt_commitpending_joint_rf3(
+) -> anyhow::Result<()> {
+    run_nonempty_terminal_source_joint_rf3(
+        NonemptyTerminalSourceCase::SourceReceiptCommitPending,
+    )
+    .await
 }

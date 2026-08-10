@@ -342,6 +342,57 @@ pub struct PendingQueuePublishCommitReceipt {
     disposition: PendingQueueNatsPublishDisposition,
 }
 
+/// Private continuation captured after NATS acceptance and after the source
+/// cursor has reached CommitPending. The intent may still be NatsAccepted at
+/// this earliest durable crash boundary, or already SourceCommitted during an
+/// idempotent retry. Production immediately consumes it to finish both CASes.
+struct PendingQueueSourceCommitProgress {
+    source: PendingQueuePublishSourceState,
+    intent: StoredPendingQueuePublishIntent,
+    intent_slot: PendingQueuePublishIntentSlot,
+    subject_sequence: u64,
+    envelope_digest: [u8; 32],
+    disposition: PendingQueueNatsPublishDisposition,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PersistedCommitPendingFixture {
+    source_slot: PendingQueuePublishSourceSlot,
+    intent_slot: PendingQueuePublishIntentSlot,
+    source_revision: u64,
+    intent_revision: u64,
+    subject_sequence: u64,
+    envelope_digest: [u8; 32],
+}
+
+#[cfg(test)]
+impl PersistedCommitPendingFixture {
+    pub(crate) const fn source_slot(&self) -> PendingQueuePublishSourceSlot {
+        self.source_slot
+    }
+
+    pub(crate) const fn intent_slot(&self) -> PendingQueuePublishIntentSlot {
+        self.intent_slot
+    }
+
+    pub(crate) const fn source_revision(&self) -> u64 {
+        self.source_revision
+    }
+
+    pub(crate) const fn intent_revision(&self) -> u64 {
+        self.intent_revision
+    }
+
+    pub(crate) const fn subject_sequence(&self) -> u64 {
+        self.subject_sequence
+    }
+
+    pub(crate) const fn envelope_digest(&self) -> &[u8; 32] {
+        &self.envelope_digest
+    }
+}
+
 /// Opaque exact readback of one durable publisher source after Seal.  It is
 /// deliberately non-Clone and can only be minted by this store after the
 /// assignment, publisher role, and close intent all match the current row.
@@ -641,6 +692,17 @@ impl ScyllaPendingQueuePublishStore {
         assignment_receipt: &PendingQueueSegmentAssignmentReceipt,
         permit: DurablyBoundPendingQueuePublish,
     ) -> Result<PendingQueuePublishCommitReceipt, PendingQueuePublishStoreError> {
+        let progress = self
+            .persist_through_source_commit_pending(assignment_receipt, permit)
+            .await?;
+        self.finalize_source_commit(progress).await
+    }
+
+    async fn persist_through_source_commit_pending(
+        &self,
+        assignment_receipt: &PendingQueueSegmentAssignmentReceipt,
+        permit: DurablyBoundPendingQueuePublish,
+    ) -> Result<PendingQueueSourceCommitProgress, PendingQueuePublishStoreError> {
         if permit.store_fingerprint != self.fingerprint {
             return Err(PendingQueuePublishStoreError::PermitStoreMismatch);
         }
@@ -686,28 +748,102 @@ impl ScyllaPendingQueuePublishStore {
         {
             return Err(PendingQueuePublishStoreError::SourceCommitMismatch);
         }
-        if matches!(intent.phase(), PendingQueuePublishIntentPhase::NatsAccepted { .. }) {
-            let plan = intent.record_source_committed().map_err(model_outbox)?;
-            intent = self.apply_intent_plan(plan).await?;
-        }
-        if !matches!(intent.phase(), PendingQueuePublishIntentPhase::SourceCommitted { .. }) {
+        if !matches!(
+            intent.phase(),
+            PendingQueuePublishIntentPhase::NatsAccepted { .. }
+                | PendingQueuePublishIntentPhase::SourceCommitted { .. }
+        ) {
             return Err(PendingQueuePublishStoreError::IntentPhaseMismatch);
         }
-        if matches!(source.phase(), PendingQueuePublishSourcePhase::CommitPending { .. }) {
-            let plan = source.finalize_published().map_err(model_envelope)?;
-            source = self.cas_source_state(plan.expected(), plan.candidate()).await?;
-        }
-        if source.last_subject_sequence() != subject_sequence
-            || source.last_envelope_digest() != *permit.envelope.digest().as_bytes()
-        {
-            return Err(PendingQueuePublishStoreError::SourceCommitMismatch);
+        if intent.accepted_subject_sequence() != Some(subject_sequence) {
+            return Err(PendingQueuePublishStoreError::IntentPhaseMismatch);
         }
         let _ = payload;
-        Ok(PendingQueuePublishCommitReceipt {
+        Ok(PendingQueueSourceCommitProgress {
+            source,
+            intent,
             intent_slot: permit.intent_slot,
             subject_sequence,
             envelope_digest: *permit.envelope.digest().as_bytes(),
             disposition,
+        })
+    }
+
+    async fn finalize_source_commit(
+        &self,
+        mut progress: PendingQueueSourceCommitProgress,
+    ) -> Result<PendingQueuePublishCommitReceipt, PendingQueuePublishStoreError> {
+        if matches!(
+            progress.intent.phase(),
+            PendingQueuePublishIntentPhase::NatsAccepted { .. }
+        ) {
+            let plan = progress
+                .intent
+                .record_source_committed()
+                .map_err(model_outbox)?;
+            progress.intent = self.apply_intent_plan(plan).await?;
+        }
+        if !matches!(
+            progress.intent.phase(),
+            PendingQueuePublishIntentPhase::SourceCommitted { .. }
+        ) || progress.intent.accepted_subject_sequence()
+            != Some(progress.subject_sequence)
+        {
+            return Err(PendingQueuePublishStoreError::IntentPhaseMismatch);
+        }
+        if matches!(
+            progress.source.phase(),
+            PendingQueuePublishSourcePhase::CommitPending { .. }
+        ) {
+            let plan = progress
+                .source
+                .finalize_published()
+                .map_err(model_envelope)?;
+            progress.source = self
+                .cas_source_state(plan.expected(), plan.candidate())
+                .await?;
+        }
+        if progress.source.last_subject_sequence() != progress.subject_sequence
+            || progress.source.last_envelope_digest() != progress.envelope_digest
+        {
+            return Err(PendingQueuePublishStoreError::SourceCommitMismatch);
+        }
+        Ok(PendingQueuePublishCommitReceipt {
+            intent_slot: progress.intent_slot,
+            subject_sequence: progress.subject_sequence,
+            envelope_digest: progress.envelope_digest,
+            disposition: progress.disposition,
+        })
+    }
+
+    /// Test-only deterministic crash stop at the sole durable boundary used
+    /// by production. It cannot mutate an arbitrary phase or finalize/resume
+    /// the source and exposes only a read-only witness.
+    #[cfg(test)]
+    pub(crate) async fn publish_through_commit_pending_fixture(
+        &self,
+        assignment_receipt: &PendingQueueSegmentAssignmentReceipt,
+        permit: DurablyBoundPendingQueuePublish,
+    ) -> Result<PersistedCommitPendingFixture, PendingQueuePublishStoreError> {
+        let progress = self
+            .persist_through_source_commit_pending(assignment_receipt, permit)
+            .await?;
+        if !matches!(
+            progress.source.phase(),
+            PendingQueuePublishSourcePhase::CommitPending { .. }
+        ) || !matches!(
+            progress.intent.phase(),
+            PendingQueuePublishIntentPhase::NatsAccepted { .. }
+        ) {
+            return Err(PendingQueuePublishStoreError::SourceCommitMismatch);
+        }
+        Ok(PersistedCommitPendingFixture {
+            source_slot: progress.source.slot().map_err(model_envelope)?,
+            intent_slot: progress.intent.slot(),
+            source_revision: progress.source.revision().get(),
+            intent_revision: progress.intent.revision().get(),
+            subject_sequence: progress.subject_sequence,
+            envelope_digest: progress.envelope_digest,
         })
     }
 
@@ -1383,5 +1519,45 @@ mod tests {
         assert_eq!(classify_exact(false, &7_u64, 7).unwrap(), 7);
         assert_eq!(classify_exact(true, &7_u64, 8), Err(PendingQueuePublishStoreError::AppliedStateMismatch));
         assert_eq!(classify_exact(false, &7_u64, 8), Err(PendingQueuePublishStoreError::CasConflict));
+    }
+
+    #[test]
+    fn commit_pending_fixture_reuses_the_private_production_boundary() {
+        let source = include_str!("pending_queue_publish_store.rs");
+        let publish = source
+            .find("pub async fn publish_and_commit")
+            .expect("production publish method");
+        let observer = source[publish..]
+            .find("pub(crate) async fn observe_committed_data")
+            .map(|offset| publish + offset)
+            .expect("historical observer");
+        let production = &source[publish..observer];
+        let persist = production
+            .find("persist_through_source_commit_pending")
+            .expect("persist durable boundary");
+        let finalize = production
+            .find("finalize_source_commit")
+            .expect("finalize durable boundary");
+        assert!(persist < finalize);
+
+        let fixture = source
+            .find("pub(crate) async fn publish_through_commit_pending_fixture")
+            .expect("test-only durable stop");
+        let cfg_test = source[..fixture]
+            .rfind("#[cfg(test)]")
+            .expect("fixture must be cfg(test)");
+        assert!(fixture - cfg_test < 1_000);
+        let fixture_body = &source[fixture..observer];
+        assert!(fixture_body.contains("persist_through_source_commit_pending"));
+        assert!(fixture_body.contains("PendingQueuePublishSourcePhase::CommitPending"));
+        assert!(fixture_body.contains("PendingQueuePublishIntentPhase::NatsAccepted"));
+        assert!(!fixture_body.contains("finalize_source_commit"));
+
+        for forbidden in ["std::env", "DriveMode", "fault_flag", "set_phase"] {
+            assert!(
+                !production.contains(forbidden),
+                "production durable path contains forbidden seam {forbidden}"
+            );
+        }
     }
 }

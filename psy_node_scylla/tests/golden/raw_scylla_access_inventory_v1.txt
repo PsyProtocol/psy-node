@@ -109,7 +109,7 @@ psy_node_scylla/tests/rf3/d04b6h22e2b_segment_lifecycle.rs|TestHarness|1|0|0|0|0
 psy_node_scylla/tests/rf3/d04b6h22e3_cutover.rs|TestHarness|1|0|0|0|0|0|6|8
 psy_node_scylla/tests/rf3/d04b6h22e_consumer_gate.rs|TestHarness|0|0|0|0|0|0|1|1
 psy_node_scylla/tests/rf3/d04b6h23c4c1_queue_schema.rs|TestHarness|4|2|0|0|0|0|7|7
-psy_node_scylla/tests/rf3/d04b6h23c4c2b3b2_claim_admission.rs|TestHarness|8|2|0|0|0|0|16|16
+psy_node_scylla/tests/rf3/d04b6h23c4c2b3b2_claim_admission.rs|TestHarness|12|2|0|0|0|0|22|22
 psy_node_scylla/tests/rollback_admission_inbox.rs|TestHarness|0|0|0|0|0|0|0|1
 psy_node_scylla/tests/rollback_admission_inbox_rf3_gate.rs|TestHarness|5|2|0|0|0|0|3|3
 psy_node_scylla/tests/rollback_authority_timestamp_rf3_gate.rs|TestHarness|4|2|0|0|0|0|2|2
