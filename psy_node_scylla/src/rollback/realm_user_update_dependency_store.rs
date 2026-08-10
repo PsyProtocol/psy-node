@@ -12,8 +12,8 @@ use psy_node_core::queue::{
     },
     realm_user_update_dependency::{
         plan_realm_user_update_dependency_recovery, reconstruct_component,
-        RealmUserUpdateDependencyBundle, RealmUserUpdateDependencyComponent,
-        RealmUserUpdateDependencyError, RealmUserUpdateDependencyFragment,
+        RealmUserUpdateDependencyBundle, RealmUserUpdateDependencyError,
+        RealmUserUpdateDependencyFragment,
         RealmUserUpdateDependencyKind, RealmUserUpdateDependencyRecoveryPlan,
         RealmUserUpdateDependencyWriteTimestampUs,
     },
@@ -130,6 +130,14 @@ impl ScyllaRealmUserUpdateDependencyStore {
         bundle: &RealmUserUpdateDependencyBundle,
     ) -> Result<RealmUserUpdateDependencyDigest, RealmUserUpdateDependencyStoreError> {
         let recovery = self.inspect_recovery(bundle).await?;
+        self.apply_recovery_plan(bundle, &recovery).await
+    }
+
+    async fn apply_recovery_plan(
+        &self,
+        bundle: &RealmUserUpdateDependencyBundle,
+        recovery: &RealmUserUpdateDependencyRecoveryPlan,
+    ) -> Result<RealmUserUpdateDependencyDigest, RealmUserUpdateDependencyStoreError> {
         for fragment in recovery.missing_fragments() {
             let binding = put_binding(bundle, fragment)?;
             let execution = self.session.execute_unpaged(&self.put, binding).await;
@@ -166,6 +174,62 @@ impl ScyllaRealmUserUpdateDependencyStore {
         Ok(bundle.digest())
     }
 
+    /// Test-only TOCTOU seam. The caller first obtains a typed plan, injects a
+    /// competing row, and then applies that stale plan through the exact same
+    /// production PUT/post-inspection/readback implementation.
+    #[cfg(test)]
+    pub(crate) async fn apply_stale_recovery_plan_fixture(
+        &self,
+        bundle: &RealmUserUpdateDependencyBundle,
+        recovery: &RealmUserUpdateDependencyRecoveryPlan,
+    ) -> Result<RealmUserUpdateDependencyDigest, RealmUserUpdateDependencyStoreError> {
+        self.apply_recovery_plan(bundle, recovery).await
+    }
+
+    /// Test-only typed crash seam. It writes only the requested exact
+    /// coordinates through the same prepared statement and binding path as
+    /// production, then returns the durable missing-only plan without filling
+    /// the remaining fragments.
+    #[cfg(test)]
+    pub(crate) async fn persist_exact_subset_through_crash_fixture(
+        &self,
+        bundle: &RealmUserUpdateDependencyBundle,
+        coordinates: &[(RealmUserUpdateDependencyKind, u32)],
+    ) -> Result<RealmUserUpdateDependencyRecoveryPlan, RealmUserUpdateDependencyStoreError> {
+        let before = self.inspect_recovery(bundle).await?;
+        let missing = before
+            .missing_fragments()
+            .iter()
+            .map(|fragment| (fragment.kind(), fragment.index()))
+            .collect::<std::collections::BTreeSet<_>>();
+        let selected = coordinates
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        if selected.len() != coordinates.len()
+            || !selected.iter().all(|coordinate| missing.contains(coordinate))
+        {
+            return Err(RealmUserUpdateDependencyStoreError::InvalidRecoverySubset);
+        }
+        let fragments = bundle.fragments();
+        for coordinate in selected {
+            let fragment = fragments
+                .iter()
+                .find(|fragment| (fragment.kind(), fragment.index()) == coordinate)
+                .ok_or(RealmUserUpdateDependencyStoreError::InvalidRecoverySubset)?;
+            let binding = put_binding(bundle, fragment)?;
+            self.session
+                .execute_unpaged(&self.put, binding)
+                .await
+                .map_err(|error| {
+                    RealmUserUpdateDependencyStoreError::IndeterminateWrite(
+                        error.to_string(),
+                    )
+                })?;
+        }
+        self.inspect_recovery(bundle).await
+    }
+
     /// Read all five selected component partitions and classify them against
     /// a complete typed candidate. It never mutates rows or turns malformed,
     /// duplicate, extra, or conflicting data into a repairable gap.
@@ -197,10 +261,67 @@ impl ScyllaRealmUserUpdateDependencyStore {
         created_at_seconds: u32,
         dependency_digest: RealmUserUpdateDependencyDigest,
     ) -> Result<RealmUserUpdateDependencyBundle, RealmUserUpdateDependencyStoreError> {
+        self.read_bundle_with_timestamp(
+            slot,
+            request_digest,
+            stable_status,
+            created_at_seconds,
+            dependency_digest,
+            None,
+        )
+        .await
+    }
+
+    /// Planned recovery is still a write-authorizing boundary. Every existing
+    /// fragment must carry the exact timestamp derived from the durable claim
+    /// and dependency identity. Ready/Published readers remain content-only
+    /// because they never write or advance readiness.
+    pub(crate) async fn read_planned_bundle(
+        &self,
+        slot: RealmUserUpdateClaimSlot,
+        request_digest: [u8; 32],
+        stable_status: u64,
+        created_at_seconds: u32,
+        dependency_digest: RealmUserUpdateDependencyDigest,
+    ) -> Result<RealmUserUpdateDependencyBundle, RealmUserUpdateDependencyStoreError> {
+        self.read_bundle_with_timestamp(
+            slot,
+            request_digest,
+            stable_status,
+            created_at_seconds,
+            dependency_digest,
+            Some(RealmUserUpdateDependencyWriteTimestampUs::derive(
+                slot,
+                dependency_digest,
+                created_at_seconds,
+            )),
+        )
+        .await
+    }
+
+    async fn read_bundle_with_timestamp(
+        &self,
+        slot: RealmUserUpdateClaimSlot,
+        request_digest: [u8; 32],
+        stable_status: u64,
+        created_at_seconds: u32,
+        dependency_digest: RealmUserUpdateDependencyDigest,
+        expected_write_timestamp_us: Option<RealmUserUpdateDependencyWriteTimestampUs>,
+    ) -> Result<RealmUserUpdateDependencyBundle, RealmUserUpdateDependencyStoreError> {
         let mut components = Vec::with_capacity(RealmUserUpdateDependencyKind::ALL.len());
         for kind in RealmUserUpdateDependencyKind::ALL {
             components.push(
-                self.read_component(slot, dependency_digest, kind).await?,
+                reconstruct_component(
+                    kind,
+                    self.read_fragments(
+                        slot,
+                        dependency_digest,
+                        kind,
+                        expected_write_timestamp_us,
+                    )
+                    .await?,
+                )
+                .map_err(RealmUserUpdateDependencyStoreError::from)?,
             );
         }
         RealmUserUpdateDependencyBundle::reconstruct(
@@ -210,20 +331,6 @@ impl ScyllaRealmUserUpdateDependencyStore {
             created_at_seconds,
             components,
             dependency_digest,
-        )
-        .map_err(Into::into)
-    }
-
-    async fn read_component(
-        &self,
-        slot: RealmUserUpdateClaimSlot,
-        dependency_digest: RealmUserUpdateDependencyDigest,
-        kind: RealmUserUpdateDependencyKind,
-    ) -> Result<RealmUserUpdateDependencyComponent, RealmUserUpdateDependencyStoreError> {
-        reconstruct_component(
-            kind,
-            self.read_fragments(slot, dependency_digest, kind, None)
-                .await?,
         )
         .map_err(Into::into)
     }
@@ -313,6 +420,7 @@ pub enum RealmUserUpdateDependencyStoreError {
     CoordinateOutOfRange,
     ReadbackMismatch,
     TimestampMismatch { expected: i64, actual: i64 },
+    InvalidRecoverySubset,
     IndeterminateWrite(String),
     Cql(String),
 }
@@ -367,6 +475,17 @@ mod tests {
         assert!(body.contains("recovery.missing_fragments()"));
         assert!(body.contains("RealmUserUpdateDependencyStoreError::Dependency(_)"));
         assert!(body.contains("put_binding(bundle, fragment)"));
+        assert!(body.contains("let completed = self.inspect_recovery(bundle).await?"));
         assert!(!body.contains("for fragment in bundle.fragments()"));
+
+        let planned = source
+            .find("pub(crate) async fn read_planned_bundle")
+            .unwrap();
+        let planned_body = &source[planned..source[planned..]
+            .find("    async fn read_bundle_with_timestamp")
+            .map(|offset| planned + offset)
+            .unwrap()];
+        assert!(planned_body.contains("RealmUserUpdateDependencyWriteTimestampUs::derive"));
+        assert!(planned_body.contains("Some("));
     }
 }

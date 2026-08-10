@@ -472,40 +472,7 @@ where
             return Err(RealmUserUpdateRouterError::AwaitExactRequestReplay);
         }
         if current.phase() == RealmUserUpdateClaimPhase::DependenciesPlanned {
-            let sampled = current.clone();
-            let persisted_before_verify = self.read_dependencies(&sampled).await?;
-            let persisted_before_verify = self
-                .verify_persisted_request(&sampled, persisted_before_verify)
-                .await?;
-
-            // Verification may take seconds. Never use the phase or dependency
-            // rows sampled before it as CAS authority.
-            current = self.read_same_request(&sampled).await?;
-            validate_post_verification_phase(
-                sampled.phase(),
-                sampled.revision().get(),
-                current.phase(),
-                current.revision().get(),
-            )?;
-            if current.dependency_digest()
-                != Some(persisted_before_verify.digest())
-            {
-                return Err(RealmUserUpdateRouterError::DependencyConflict);
-            }
-            let persisted_after_verify = self.read_dependencies(&current).await?;
-            if persisted_after_verify != persisted_before_verify {
-                return Err(RealmUserUpdateRouterError::DependencyConflict);
-            }
-            if current.phase() == RealmUserUpdateClaimPhase::DependenciesPlanned {
-                let candidate = StoredRealmUserUpdateClaim::dependencies_ready(&current)
-                    .map_err(router)?;
-                current = self.advance_claim(&current, &candidate).await?;
-                if current.dependency_digest()
-                    != Some(persisted_after_verify.digest())
-                {
-                    return Err(RealmUserUpdateRouterError::DependencyConflict);
-                }
-            }
+            current = self.reverify_planned_to_ready(current).await?;
         }
         let persisted = self.read_dependencies(&current).await?;
         match current.phase() {
@@ -530,6 +497,73 @@ where
                 Err(RealmUserUpdateRouterError::InvalidPhase)
             }
         }
+    }
+
+    /// Test-only deterministic crash boundary immediately after the exact
+    /// persisted proof has been reverified and Planned has advanced to Ready,
+    /// but before any NATS materialization or publish is attempted.
+    #[cfg(test)]
+    pub(crate) async fn resume_through_ready_fixture(
+        &self,
+        partition: RealmUserUpdateClaimPartition,
+        user_id: UserId,
+    ) -> Result<StoredRealmUserUpdateClaim<Hash>, RealmUserUpdateRouterError> {
+        self.validate_user(user_id)?;
+        let RealmUserUpdateClaimReadState::Current(current) = self
+            .claims
+            .read(partition, user_id)
+            .await
+            .map_err(router)?
+        else {
+            return Err(RealmUserUpdateRouterError::Uninitialized);
+        };
+        self.validate_claim_scope(&current)?;
+        if current.phase() != RealmUserUpdateClaimPhase::DependenciesPlanned {
+            return Err(RealmUserUpdateRouterError::InvalidPhase);
+        }
+        self.reverify_planned_to_ready(current).await
+    }
+
+    async fn reverify_planned_to_ready(
+        &self,
+        sampled: StoredRealmUserUpdateClaim<Hash>,
+    ) -> Result<StoredRealmUserUpdateClaim<Hash>, RealmUserUpdateRouterError> {
+        let persisted_before_verify = self.read_planned_dependencies(&sampled).await?;
+        let persisted_before_verify = self
+            .verify_persisted_request(&sampled, persisted_before_verify)
+            .await?;
+
+        // Verification may take seconds. Never use the phase or dependency
+        // rows sampled before it as CAS authority.
+        let mut current = self.read_same_request(&sampled).await?;
+        validate_post_verification_phase(
+            sampled.phase(),
+            sampled.revision().get(),
+            current.phase(),
+            current.revision().get(),
+        )?;
+        if current.dependency_digest() != Some(persisted_before_verify.digest()) {
+            return Err(RealmUserUpdateRouterError::DependencyConflict);
+        }
+        let persisted_after_verify = if current.phase()
+            == RealmUserUpdateClaimPhase::DependenciesPlanned
+        {
+            self.read_planned_dependencies(&current).await?
+        } else {
+            self.read_dependencies(&current).await?
+        };
+        if persisted_after_verify != persisted_before_verify {
+            return Err(RealmUserUpdateRouterError::DependencyConflict);
+        }
+        if current.phase() == RealmUserUpdateClaimPhase::DependenciesPlanned {
+            let candidate = StoredRealmUserUpdateClaim::dependencies_ready(&current)
+                .map_err(router)?;
+            current = self.advance_claim(&current, &candidate).await?;
+            if current.dependency_digest() != Some(persisted_after_verify.digest()) {
+                return Err(RealmUserUpdateRouterError::DependencyConflict);
+            }
+        }
+        Ok(current)
     }
 
     async fn verify_persisted_request(
@@ -703,6 +737,28 @@ where
             Ok(bundle) => Ok(bundle),
             Err(error) => Err(classify_dependency_read_error(claim.phase(), error)),
         }
+    }
+
+    async fn read_planned_dependencies(
+        &self,
+        claim: &StoredRealmUserUpdateClaim<Hash>,
+    ) -> Result<RealmUserUpdateDependencyBundle, RealmUserUpdateRouterError> {
+        if claim.phase() != RealmUserUpdateClaimPhase::DependenciesPlanned {
+            return Err(RealmUserUpdateRouterError::InvalidPhase);
+        }
+        let digest = claim
+            .dependency_digest()
+            .ok_or(RealmUserUpdateRouterError::DependencyMissing)?;
+        self.dependencies
+            .read_planned_bundle(
+                claim.slot(),
+                *claim.request_digest().as_bytes(),
+                claim.stable_status(),
+                claim.created_at().get(),
+                digest,
+            )
+            .await
+            .map_err(|error| classify_dependency_read_error(claim.phase(), error))
     }
 
     async fn advance_claim(
@@ -898,10 +954,16 @@ impl Error for RealmUserUpdateRouterError {}
 mod tests {
     use super::*;
 
+    fn production_source() -> &'static str {
+        include_str!("realm_user_update_router.rs")
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap()
+    }
+
     #[test]
     fn router_is_default_off_and_concrete_permit_authorized() {
-        let source = include_str!("realm_user_update_router.rs");
-        let source = source.split("#[cfg(test)]").next().unwrap();
+        let source = production_source();
         assert!(source.contains("ScyllaRealmUserUpdateDurableRouter"));
         assert!(source.contains("publish_authorized"));
         assert!(source.contains("observe_authorized"));
@@ -946,8 +1008,7 @@ mod tests {
 
     #[test]
     fn new_claim_revalidation_preserves_response_loss_resume_order() {
-        let source = include_str!("realm_user_update_router.rs");
-        let source = source.split("#[cfg(test)]").next().unwrap();
+        let source = production_source();
         let resume = source.find(".resume_existing(").unwrap();
         let revalidate = source
             .find(".revalidate_admission(&admission)")
@@ -962,8 +1023,7 @@ mod tests {
 
     #[test]
     fn configured_authority_and_tree_heights_gate_user_before_claim_io() {
-        let source = include_str!("realm_user_update_router.rs");
-        let source = source.split("#[cfg(test)]").next().unwrap();
+        let source = production_source();
         let validate = source.find("self.validate_user(user_id)?").unwrap();
         let guarded = source.find(".resume_existing(").unwrap();
         assert!(validate < guarded);
@@ -978,8 +1038,7 @@ mod tests {
 
     #[test]
     fn exact_resume_does_not_claim_automatic_discovery() {
-        let source = include_str!("realm_user_update_router.rs");
-        let source = source.split("#[cfg(test)]").next().unwrap();
+        let source = production_source();
         assert!(source.contains("resume_exact"));
         assert!(source.contains("AwaitExactRequestReplay"));
         assert!(source.contains(
@@ -989,6 +1048,9 @@ mod tests {
         assert!(!source.contains("verifier: Arc<Verifier>"));
         assert!(source.contains("tokio::task::spawn_blocking"));
         assert!(source.contains("verify_persisted_realm_user_update_request::<"));
+        assert!(source.contains(
+            "let persisted_before_verify = self.read_planned_dependencies(&sampled).await?"
+        ));
         let resume = source.find("pub(crate) async fn resume_exact").unwrap();
         let verify = source[resume..]
             .find(".verify_persisted_request(")
@@ -1014,8 +1076,7 @@ mod tests {
 
     #[test]
     fn errors_have_no_legacy_fallback_or_default_success() {
-        let source = include_str!("realm_user_update_router.rs");
-        let source = source.split("#[cfg(test)]").next().unwrap();
+        let source = production_source();
         for forbidden in ["unwrap_or_default", "unwrap_or(RealmUserUpdate", "fallback"] {
             assert!(!source.contains(forbidden));
         }

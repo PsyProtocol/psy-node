@@ -4,7 +4,10 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::Path,
     process::Command,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -60,10 +63,14 @@ use psy_node_core::{
             RealmUserUpdatePublishReceiptDigest, StoredRealmUserUpdateClaim,
         },
         realm_user_update_artifact::{
-            deterministic_qblob_context, RealmUserUpdateSlotEnvelope,
+            deterministic_qblob_context, RealmUserUpdateContractSlots,
+            RealmUserUpdateSlotEnvelope, RealmUserUpdateSlotUpdate,
             ValidatedRealmUserUpdateArtifacts, VerifiedRealmUserUpdateRequest,
         },
-        realm_user_update_dependency::RealmUserUpdateDependencyBundle,
+        realm_user_update_dependency::{
+            RealmUserUpdateDependencyBundle, RealmUserUpdateDependencyKind,
+            RealmUserUpdateDependencyRecoveryPlan,
+        },
         realm_user_update_publish::{
             GlobalUserTreeHeight, RealmUserUpdatePublishAdmission,
             RealmUserUpdatePublishDisposition, RealmUserUpdatePublishReceipt,
@@ -74,6 +81,7 @@ use psy_node_core::{
             RealmUserUpdateVerifierProfileId, RealmUserUpdateVerifierRegistry,
         },
         recoverable_ephemeral::PendingQueueCaptureContext,
+        recoverable_artifact::PENDING_QUEUE_ARTIFACT_FRAGMENT_BYTES,
     },
     store::{
         pending_generation_identity::{
@@ -106,6 +114,7 @@ use psy_node_nats::{
         RecoverableNatsRetentionContract, RecoverableNatsSegmentId,
         RecoverableNatsStreamSegment,
     },
+    recoverable_transport::RecoverablePendingQueueNatsPublisher,
 };
 use scylla::{
     client::{
@@ -246,6 +255,17 @@ fn request(user: u64) -> anyhow::Result<RealmUserUpdateRequestDigest> {
 #[derive(Clone, Copy, Debug)]
 struct DeterministicEndCapVerifier;
 
+static DETERMINISTIC_VERIFIER_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+type DeterministicRealmUserUpdateRouter =
+    ScyllaRealmUserUpdateDurableRouter<
+        PF,
+        PHash,
+        PoseidonHasher,
+        PHash,
+        DeterministicEndCapVerifier,
+    >;
+
 impl QZKProofPublicInputsHasherReader<PHash, PHash>
     for DeterministicEndCapVerifier
 {
@@ -264,6 +284,7 @@ impl QZKProofVerifier<PHash, PHash> for DeterministicEndCapVerifier {
         _circuit_type: u32,
         proof: &PHash,
     ) -> anyhow::Result<PHash> {
+        DETERMINISTIC_VERIFIER_CALLS.fetch_add(1, Ordering::SeqCst);
         Ok(*proof)
     }
 }
@@ -294,6 +315,29 @@ fn verifier_registry() -> Arc<RealmUserUpdateVerifierRegistry<DeterministicEndCa
         )])
         .unwrap(),
     )
+}
+
+async fn prepare_deterministic_router(
+    session: Arc<Session>,
+    admission: &RealmUserUpdatePublishAdmission<PHash>,
+    height: GlobalUserTreeHeight,
+    ready: Arc<PendingQueueSidecarReady>,
+    nats: Arc<RecoverablePendingQueueNatsPublisher>,
+    segment: RecoverableNatsStreamSegment,
+) -> anyhow::Result<DeterministicRealmUserUpdateRouter> {
+    Ok(DeterministicRealmUserUpdateRouter::prepare(
+        session,
+        admission.capture().key().network(),
+        realm(),
+        height,
+        20,
+        verifier_profile_id(),
+        verifier_registry(),
+        ready,
+        nats,
+        segment,
+    )
+    .await?)
 }
 
 fn verified_end_cap_request(
@@ -330,6 +374,22 @@ fn live_artifacts_for_claim(
     claim: &StoredRealmUserUpdateClaim<PHash>,
     verified_request: VerifiedRealmUserUpdateRequest<PF, PHash>,
     height: GlobalUserTreeHeight,
+) -> anyhow::Result<RealmUserUpdateLiveFixture> {
+    live_artifacts_for_claim_with_slots(
+        admission,
+        claim,
+        verified_request,
+        height,
+        Vec::new(),
+    )
+}
+
+fn live_artifacts_for_claim_with_slots(
+    admission: &RealmUserUpdatePublishAdmission<PHash>,
+    claim: &StoredRealmUserUpdateClaim<PHash>,
+    verified_request: VerifiedRealmUserUpdateRequest<PF, PHash>,
+    height: GlobalUserTreeHeight,
+    slot_contracts: Vec<RealmUserUpdateContractSlots>,
 ) -> anyhow::Result<RealmUserUpdateLiveFixture> {
     ensure!(verified_request.user_id() == claim.user_id());
     ensure!(verified_request.request_digest() == claim.request_digest());
@@ -377,7 +437,7 @@ fn live_artifacts_for_claim(
     let slot = RealmUserUpdateSlotEnvelope::try_new(
         claim.pending().clone(),
         claim.user_id(),
-        Vec::new(),
+        slot_contracts,
     )?;
     let artifacts = ValidatedRealmUserUpdateArtifacts::try_new::<PF>(
         claim,
@@ -395,6 +455,33 @@ fn live_artifacts_for_claim(
         bundle,
         publish_request,
     })
+}
+
+fn four_fragment_slot_contracts() -> anyhow::Result<Vec<RealmUserUpdateContractSlots>> {
+    // 600,000 canonical 24-byte updates plus the fixed envelope form a
+    // 14,400,138-byte SlotUpdates component: four real 4 MiB fragments. Index
+    // 1 remains the control while 0/2/3 exercise first/middle/last gaps.
+    let updates = 600_000;
+    debug_assert!(updates * 24 > PENDING_QUEUE_ARTIFACT_FRAGMENT_BYTES * 3);
+    let mut slots = Vec::with_capacity(updates);
+    for index in 0..updates {
+        let slot = u64::try_from(index)?;
+        slots.push(RealmUserUpdateSlotUpdate::new(
+            slot,
+            slot.wrapping_mul(3),
+            slot.wrapping_mul(3).wrapping_add(1),
+        ));
+    }
+    Ok(vec![RealmUserUpdateContractSlots::try_new(0x23, slots)?])
+}
+
+fn missing_dependency_coordinates(
+    plan: &RealmUserUpdateDependencyRecoveryPlan,
+) -> Vec<(RealmUserUpdateDependencyKind, u32)> {
+    plan.missing_fragments()
+        .iter()
+        .map(|fragment| (fragment.kind(), fragment.index()))
+        .collect()
 }
 
 fn retention() -> anyhow::Result<RecoverableNatsRetentionContract> {
@@ -710,6 +797,19 @@ type DependencyDirectRow = (
     Vec<u8>,
 );
 
+type TimestampedDependencyDirectRow = (
+    Vec<u8>,
+    Vec<u8>,
+    i16,
+    i32,
+    i32,
+    i64,
+    Vec<u8>,
+    Vec<u8>,
+    Vec<u8>,
+    i64,
+);
+
 fn dependency_direct_row(
     bundle: &RealmUserUpdateDependencyBundle,
     fragment: &psy_node_core::queue::realm_user_update_dependency::RealmUserUpdateDependencyFragment,
@@ -774,6 +874,66 @@ async fn direct_dependency_snapshot(
                 .collect::<Result<Vec<_>, _>>()?;
             rows.append(&mut selected);
         }
+    }
+    rows.sort_by(|left, right| {
+        (&left.0, &left.1, left.2, left.3)
+            .cmp(&(&right.0, &right.1, right.2, right.3))
+    });
+    Ok(rows)
+}
+
+fn expected_timestamped_dependency_rows(
+    fixture: &RealmUserUpdateLiveFixture,
+) -> anyhow::Result<Vec<TimestampedDependencyDirectRow>> {
+    let timestamp = fixture.bundle.write_timestamp_us().as_i64();
+    let mut rows = fixture
+        .bundle
+        .fragments()
+        .iter()
+        .map(|fragment| {
+            let row = dependency_direct_row(&fixture.bundle, fragment)?;
+            Ok((
+                row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7,
+                row.8, timestamp,
+            ))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    rows.sort_by(|left, right| {
+        (&left.0, &left.1, left.2, left.3)
+            .cmp(&(&right.0, &right.1, right.2, right.3))
+    });
+    Ok(rows)
+}
+
+async fn direct_timestamped_dependency_snapshot(
+    session: &Session,
+    fixture: &RealmUserUpdateLiveFixture,
+) -> anyhow::Result<Vec<TimestampedDependencyDirectRow>> {
+    let slot = fixture.bundle.claim_slot().as_bytes().to_vec();
+    let digest = fixture.bundle.digest().as_bytes().to_vec();
+    let mut kinds = fixture
+        .bundle
+        .fragments()
+        .iter()
+        .map(|fragment| fragment.kind().as_i16())
+        .collect::<Vec<_>>();
+    kinds.sort_unstable();
+    kinds.dedup();
+    let mut rows = Vec::new();
+    for kind in kinds {
+        let mut selected = session
+            .query_unpaged(
+                format!(
+                    "SELECT dependency_slot, dependency_digest, component_kind, fragment_index, fragment_count, component_bytes, component_digest, payload, payload_digest, WRITETIME(payload) FROM {DATA}.{} WHERE dependency_slot = ? AND dependency_digest = ? AND component_kind = ?",
+                    REALM_USER_UPDATE_DEPENDENCY_FRAGMENT_TABLE
+                ),
+                (slot.clone(), digest.clone(), kind),
+            )
+            .await?
+            .into_rows_result()?
+            .rows::<TimestampedDependencyDirectRow>()?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.append(&mut selected);
     }
     rows.sort_by(|left, right| {
         (&left.0, &left.1, left.2, left.3)
@@ -2498,6 +2658,612 @@ async fn run_nonempty_terminal_source_joint_rf3(
                 "H23C4C2B3B2C2C2_SOURCE_RECEIPT_COMMITPENDING_RF3_PASSED"
             }
         },
+    };
+    std::fs::write(report_path, serde_json::to_vec_pretty(&report)?)?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct MultiFragmentResumeReport {
+    image: &'static str,
+    scylla_replication_factor: u8,
+    nats_servers: u8,
+    nats_stream_replicas: u8,
+    schema_version: u16,
+    slot_component_bytes: usize,
+    slot_fragment_count: usize,
+    total_dependency_rows: usize,
+    missing_stage_counts: Vec<usize>,
+    duplicate_subset_rejected: bool,
+    concurrent_exact_retries: usize,
+    planned_verifier_delta: usize,
+    ready_publish_verifier_delta: usize,
+    published_retry_verifier_delta: usize,
+    ready_nats_publish_delta: u64,
+    publish_nats_publish_delta: u64,
+    published_retry_nats_publish_delta: u64,
+    wrong_timestamp_rejected: bool,
+    stale_plan_conflict_rejected: bool,
+    poisoned_claims_remain_planned: bool,
+    one_replica_offline: bool,
+    offline_recovery_ms: u64,
+    repair_flush_compact: bool,
+    direct_one_nodes_equal: usize,
+    dependency_direct_one_nodes_equal: usize,
+    exact_writetime_rows: usize,
+    qualification: &'static str,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires isolated Scylla RF=3 and NATS RF=3 runner"]
+async fn d04b6h23c4c2b3b3e_multifragment_planned_resume_rf3(
+) -> anyhow::Result<()> {
+    ensure!(
+        std::env::var("PSY_D04B6H23C4C2B3B3E_RF3").as_deref()
+            == Ok("1"),
+        "run through tests/rf3/run-d04b6h23c4c2b3b3e.sh"
+    );
+    let compose_file =
+        std::env::var("PSY_D04B6H23C4C2B3B2C2B_COMPOSE_FILE")?;
+    let report_path =
+        std::env::var("PSY_D04B6H23C4C2B3B2C2B_REPORT_PATH")?;
+    let nats_urls =
+        std::env::var("PSY_D04B6H23C4C2B3B2C2B_NATS_URLS")?
+            .split(',')
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+    ensure!(nats_urls.len() == 3);
+
+    wait_up(3).await?;
+    let session = Arc::new(connect(None, Consistency::Quorum).await?);
+    session
+        .query_unpaged(
+            format!("CREATE KEYSPACE IF NOT EXISTS {DATA} WITH replication = {{'class': 'NetworkTopologyStrategy', 'datacenter1': 3}}"),
+            &[],
+        )
+        .await?;
+    session
+        .query_unpaged(
+            format!("CREATE KEYSPACE IF NOT EXISTS {} WITH replication = {{'class': 'NetworkTopologyStrategy', 'datacenter1': 3}} AND tablets = {{'enabled': false}}", control()),
+            &[],
+        )
+        .await?;
+    session.await_schema_agreement().await?;
+    let keyspaces = PendingQueueSidecarKeyspaces::try_new(DATA, control())?;
+    PendingQueueSidecarDeploymentExecutor::deploy(
+        session.clone(),
+        keyspaces.clone(),
+    )
+    .await?;
+    let ready = Arc::new(
+        ScyllaPendingQueueSidecarSetupGate::authorize(
+            session.clone(),
+            keyspaces,
+            realm(),
+        )
+        .await?,
+    );
+
+    let generation = 13;
+    let expected_admission = admission(generation)?;
+    let capture = expected_admission.capture();
+    let control_keyspace =
+        BranchExactDeploymentNoTabletKeyspace::try_new(control())?;
+    let pipeline_store = ScyllaPendingPipelineStore::prepare(
+        session.clone(),
+        control_keyspace.clone(),
+    )
+    .await?;
+    let pipeline = current_pipeline(
+        pipeline_store
+            .bootstrap(&qualification_pipeline_bootstrap(
+                &expected_admission,
+            )?)
+            .await?,
+    )?;
+    ensure!(pipeline.gathering() == capture.processing());
+
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64;
+    let base = format!("psy_h23b3e_{nonce}");
+    let segment = RecoverableNatsStreamSegment::try_new(
+        base.clone(),
+        capture.key(),
+        RecoverableNatsSegmentId::try_new(1)?,
+        retention()?,
+    )?;
+    let validated =
+        segment.validate_stream_config_structure(&segment.stream_config())?;
+    let ledger_bootstrap = PendingQueueSegmentLedgerBootstrap::try_new(
+        capture.key(),
+        &validated,
+        generation_budget(realm())?,
+        1,
+    )?;
+    let ledger_key = ledger_bootstrap.candidate().key().clone();
+    let ledger = ScyllaPendingQueueSegmentLedgerStore::prepare(
+        session.clone(),
+        control_keyspace,
+    )
+    .await?;
+    ledger.bootstrap(&ledger_bootstrap).await?;
+    let assignment = ledger.reserve_generation(&ledger_key, capture).await?;
+    ensure!(assignment.assignment().context() == capture);
+
+    let raw_nats = async_nats::connect(nats_urls.clone()).await?;
+    let jetstream = jetstream::new(raw_nats);
+    jetstream.create_stream(segment.stream_config()).await?;
+    let nats_client = Arc::new(
+        NatsJetStreamClient::new_connection(
+            base,
+            nats_urls,
+            PullConfig::default(),
+            PullConfig::default(),
+            StreamConfig::default(),
+        )
+        .await?,
+    );
+    let nats_publisher = Arc::new(
+        nats_client
+            .recoverable_pending_publisher(segment.clone())
+            .await?,
+    );
+    let height = GlobalUserTreeHeight::try_new(32)?;
+    let router = prepare_deterministic_router(
+        session.clone(),
+        &expected_admission,
+        height,
+        ready.clone(),
+        nats_publisher.clone(),
+        segment.clone(),
+    )
+    .await?;
+    ensure!(router.admit().await? == expected_admission);
+    let (_, claims, _, provisioned_admission, _) =
+        provisioned(session.clone(), generation).await?;
+    ensure!(provisioned_admission == expected_admission);
+
+    let users = [
+        UserId::new((7_u64 << 20) + 31),
+        UserId::new((7_u64 << 20) + 32),
+        UserId::new((7_u64 << 20) + 33),
+    ];
+    let mut planned_claims = Vec::new();
+    let mut fixtures = Vec::new();
+    for (index, user) in users.into_iter().enumerate() {
+        let verified = verified_end_cap_request(user, height)?;
+        let winner = router
+            .claim(
+                expected_admission.clone(),
+                &verified,
+                RealmUserUpdateCreatedAtSeconds::try_new(
+                    1_700_000_100 + u32::try_from(index)?,
+                )?,
+            )
+            .await?;
+        let fixture = if index == 0 {
+            live_artifacts_for_claim_with_slots(
+                &expected_admission,
+                &winner,
+                verified,
+                height,
+                four_fragment_slot_contracts()?,
+            )?
+        } else {
+            live_artifacts_for_claim(
+                &expected_admission,
+                &winner,
+                verified,
+                height,
+            )?
+        };
+        let planned = StoredRealmUserUpdateClaim::dependencies_planned(
+            &winner,
+            fixture.bundle.digest(),
+        )?;
+        let planned =
+            current_claim(claims.compare_and_set(&winner, &planned).await?)?;
+        ensure!(planned.phase() == RealmUserUpdateClaimPhase::DependenciesPlanned);
+        planned_claims.push(planned);
+        fixtures.push(fixture);
+    }
+    DETERMINISTIC_VERIFIER_CALLS.store(0, Ordering::SeqCst);
+
+    compose(Path::new(&compose_file), &["stop", "scylla3"])?;
+    wait_up(2).await?;
+    let offline_started = Instant::now();
+
+    let dependency_store = ScyllaRealmUserUpdateDependencyStore::prepare(
+        session.clone(),
+        PendingQueueArtifactDataKeyspace::try_new(DATA)?,
+    )
+    .await?;
+    let positive = &fixtures[0];
+    let positive_claim = &planned_claims[0];
+    let positive_fragments = positive.bundle.fragments();
+    let slot_coordinates = positive_fragments
+        .iter()
+        .filter(|fragment| {
+            fragment.kind() == RealmUserUpdateDependencyKind::SlotUpdates
+        })
+        .map(|fragment| (fragment.kind(), fragment.index()))
+        .collect::<Vec<_>>();
+    ensure!(slot_coordinates.len() == 4);
+    ensure!(
+        slot_coordinates
+            == vec![
+                (RealmUserUpdateDependencyKind::SlotUpdates, 0),
+                (RealmUserUpdateDependencyKind::SlotUpdates, 1),
+                (RealmUserUpdateDependencyKind::SlotUpdates, 2),
+                (RealmUserUpdateDependencyKind::SlotUpdates, 3),
+            ]
+    );
+    let non_slot_coordinates = positive_fragments
+        .iter()
+        .filter(|fragment| {
+            fragment.kind() != RealmUserUpdateDependencyKind::SlotUpdates
+        })
+        .map(|fragment| (fragment.kind(), fragment.index()))
+        .collect::<Vec<_>>();
+    ensure!(non_slot_coordinates.len() == 4);
+
+    let mut missing_stage_counts = Vec::new();
+    let first_plan = dependency_store
+        .persist_exact_subset_through_crash_fixture(
+            &positive.bundle,
+            &non_slot_coordinates,
+        )
+        .await?;
+    ensure!(missing_dependency_coordinates(&first_plan) == slot_coordinates);
+    missing_stage_counts.push(first_plan.missing_fragments().len());
+    let before_incomplete =
+        stream_state(&jetstream, segment.stream_name()).await?;
+    let incomplete = router
+        .resume_exact(positive_claim.partition()?, positive_claim.user_id())
+        .await
+        .expect_err("whole SlotUpdates component must be missing");
+    ensure!(matches!(
+        incomplete,
+        RealmUserUpdateRouterError::AwaitExactArtifactReplay
+    ));
+    ensure!(DETERMINISTIC_VERIFIER_CALLS.load(Ordering::SeqCst) == 0);
+    ensure!(
+        stream_state(&jetstream, segment.stream_name()).await?
+            == before_incomplete
+    );
+
+    let duplicate_subset_rejected = matches!(
+        dependency_store
+            .persist_exact_subset_through_crash_fixture(
+                &positive.bundle,
+                &[non_slot_coordinates[0]],
+            )
+            .await,
+        Err(RealmUserUpdateDependencyStoreError::InvalidRecoverySubset)
+    );
+    ensure!(duplicate_subset_rejected);
+
+    let plan = dependency_store
+        .persist_exact_subset_through_crash_fixture(
+            &positive.bundle,
+            &[slot_coordinates[1]],
+        )
+        .await?;
+    ensure!(
+        missing_dependency_coordinates(&plan)
+            == vec![slot_coordinates[0], slot_coordinates[2], slot_coordinates[3]]
+    );
+    missing_stage_counts.push(plan.missing_fragments().len());
+    ensure!(matches!(
+        router
+            .resume_exact(positive_claim.partition()?, positive_claim.user_id())
+            .await,
+        Err(RealmUserUpdateRouterError::AwaitExactArtifactReplay)
+    ));
+    ensure!(DETERMINISTIC_VERIFIER_CALLS.load(Ordering::SeqCst) == 0);
+
+    let plan = dependency_store
+        .persist_exact_subset_through_crash_fixture(
+            &positive.bundle,
+            &[slot_coordinates[0]],
+        )
+        .await?;
+    ensure!(
+        missing_dependency_coordinates(&plan)
+            == vec![slot_coordinates[2], slot_coordinates[3]]
+    );
+    missing_stage_counts.push(plan.missing_fragments().len());
+    let plan = dependency_store
+        .persist_exact_subset_through_crash_fixture(
+            &positive.bundle,
+            &[slot_coordinates[2]],
+        )
+        .await?;
+    ensure!(missing_dependency_coordinates(&plan) == vec![slot_coordinates[3]]);
+    missing_stage_counts.push(plan.missing_fragments().len());
+
+    let retry_store_a = ScyllaRealmUserUpdateDependencyStore::prepare(
+        session.clone(),
+        PendingQueueArtifactDataKeyspace::try_new(DATA)?,
+    )
+    .await?;
+    let retry_store_b = ScyllaRealmUserUpdateDependencyStore::prepare(
+        session.clone(),
+        PendingQueueArtifactDataKeyspace::try_new(DATA)?,
+    )
+    .await?;
+    let (retry_a, retry_b) = tokio::join!(
+        retry_store_a.persist_and_readback(&positive.bundle),
+        retry_store_b.persist_and_readback(&positive.bundle),
+    );
+    ensure!(retry_a? == positive.bundle.digest());
+    ensure!(retry_b? == positive.bundle.digest());
+    ensure!(dependency_store.inspect_recovery(&positive.bundle).await?.is_complete());
+    missing_stage_counts.push(0);
+
+    let router = prepare_deterministic_router(
+        session.clone(),
+        &expected_admission,
+        height,
+        ready.clone(),
+        nats_publisher.clone(),
+        segment.clone(),
+    )
+    .await?;
+    let before_ready_nats =
+        stream_state(&jetstream, segment.stream_name()).await?;
+    let before_ready_verifier =
+        DETERMINISTIC_VERIFIER_CALLS.load(Ordering::SeqCst);
+    let ready_claim = router
+        .resume_through_ready_fixture(
+            positive_claim.partition()?,
+            positive_claim.user_id(),
+        )
+        .await?;
+    ensure!(ready_claim.phase() == RealmUserUpdateClaimPhase::DependenciesReady);
+    let after_ready_nats =
+        stream_state(&jetstream, segment.stream_name()).await?;
+    let planned_verifier_delta =
+        DETERMINISTIC_VERIFIER_CALLS.load(Ordering::SeqCst)
+            - before_ready_verifier;
+    ensure!(planned_verifier_delta == 1);
+    ensure!(after_ready_nats.0 == before_ready_nats.0);
+
+    let router = prepare_deterministic_router(
+        session.clone(),
+        &expected_admission,
+        height,
+        ready.clone(),
+        nats_publisher.clone(),
+        segment.clone(),
+    )
+    .await?;
+    let before_publish_verifier =
+        DETERMINISTIC_VERIFIER_CALLS.load(Ordering::SeqCst);
+    let before_publish_nats =
+        stream_state(&jetstream, segment.stream_name()).await?;
+    let published = router
+        .resume_exact(positive_claim.partition()?, positive_claim.user_id())
+        .await?;
+    ensure!(published.claim().phase() == RealmUserUpdateClaimPhase::Published);
+    let after_publish_nats =
+        stream_state(&jetstream, segment.stream_name()).await?;
+    let ready_publish_verifier_delta =
+        DETERMINISTIC_VERIFIER_CALLS.load(Ordering::SeqCst)
+            - before_publish_verifier;
+    ensure!(ready_publish_verifier_delta == 0);
+    ensure!(after_publish_nats.0 == before_publish_nats.0 + 1);
+
+    let router = prepare_deterministic_router(
+        session.clone(),
+        &expected_admission,
+        height,
+        ready.clone(),
+        nats_publisher.clone(),
+        segment.clone(),
+    )
+    .await?;
+    let before_terminal_verifier =
+        DETERMINISTIC_VERIFIER_CALLS.load(Ordering::SeqCst);
+    let before_terminal_nats =
+        stream_state(&jetstream, segment.stream_name()).await?;
+    let terminal_retry = router
+        .resume_exact(positive_claim.partition()?, positive_claim.user_id())
+        .await?;
+    ensure_same_durable_publication(
+        published.publication(),
+        terminal_retry.publication(),
+    )?;
+    let after_terminal_nats =
+        stream_state(&jetstream, segment.stream_name()).await?;
+    let published_retry_verifier_delta =
+        DETERMINISTIC_VERIFIER_CALLS.load(Ordering::SeqCst)
+            - before_terminal_verifier;
+    ensure!(published_retry_verifier_delta == 0);
+    ensure!(after_terminal_nats == before_terminal_nats);
+
+    let wrong_timestamp_claim = &planned_claims[1];
+    let wrong_timestamp_fixture = &fixtures[1];
+    ensure!(
+        dependency_store
+            .persist_and_readback(&wrong_timestamp_fixture.bundle)
+            .await?
+            == wrong_timestamp_fixture.bundle.digest()
+    );
+    let wrong_row = dependency_direct_row(
+        &wrong_timestamp_fixture.bundle,
+        &wrong_timestamp_fixture.bundle.fragments()[0],
+    )?;
+    restore_dependency_row(
+        &session,
+        &wrong_row,
+        wrong_timestamp_fixture.bundle.write_timestamp_us().as_i64() + 1,
+    )
+    .await?;
+    let before_wrong_verifier =
+        DETERMINISTIC_VERIFIER_CALLS.load(Ordering::SeqCst);
+    let before_wrong_nats =
+        stream_state(&jetstream, segment.stream_name()).await?;
+    let wrong_timestamp_rejected = matches!(
+        router
+            .resume_exact(
+                wrong_timestamp_claim.partition()?,
+                wrong_timestamp_claim.user_id(),
+            )
+            .await,
+        Err(RealmUserUpdateRouterError::DependencyCorruption(_))
+    );
+    ensure!(wrong_timestamp_rejected);
+    ensure!(
+        DETERMINISTIC_VERIFIER_CALLS.load(Ordering::SeqCst)
+            == before_wrong_verifier
+    );
+    ensure!(
+        stream_state(&jetstream, segment.stream_name()).await?
+            == before_wrong_nats
+    );
+
+    let stale_claim = &planned_claims[2];
+    let stale_fixture = &fixtures[2];
+    let stale_plan = dependency_store.inspect_recovery(&stale_fixture.bundle).await?;
+    ensure!(stale_plan.missing_fragments().len() == 5);
+    let mut conflicting_row = dependency_direct_row(
+        &stale_fixture.bundle,
+        &stale_fixture.bundle.fragments()[0],
+    )?;
+    conflicting_row.8[0] ^= 0x80;
+    restore_dependency_row(
+        &session,
+        &conflicting_row,
+        stale_fixture.bundle.write_timestamp_us().as_i64() + 1,
+    )
+    .await?;
+    let stale_plan_conflict_rejected = matches!(
+        dependency_store
+            .apply_stale_recovery_plan_fixture(
+                &stale_fixture.bundle,
+                &stale_plan,
+            )
+            .await,
+        Err(RealmUserUpdateDependencyStoreError::TimestampMismatch { .. })
+    );
+    ensure!(stale_plan_conflict_rejected);
+    let before_stale_verifier =
+        DETERMINISTIC_VERIFIER_CALLS.load(Ordering::SeqCst);
+    let before_stale_nats =
+        stream_state(&jetstream, segment.stream_name()).await?;
+    ensure!(matches!(
+        router
+            .resume_exact(stale_claim.partition()?, stale_claim.user_id())
+            .await,
+        Err(RealmUserUpdateRouterError::DependencyCorruption(_))
+    ));
+    ensure!(
+        DETERMINISTIC_VERIFIER_CALLS.load(Ordering::SeqCst)
+            == before_stale_verifier
+    );
+    ensure!(
+        stream_state(&jetstream, segment.stream_name()).await?
+            == before_stale_nats
+    );
+
+    let mut poisoned_claims_remain_planned = true;
+    for claim in [&planned_claims[1], &planned_claims[2]] {
+        let state = claims
+            .read::<PHash>(claim.partition()?, claim.user_id())
+            .await?;
+        let RealmUserUpdateClaimReadState::Current(current) = state else {
+            poisoned_claims_remain_planned = false;
+            continue;
+        };
+        poisoned_claims_remain_planned &=
+            current.phase() == RealmUserUpdateClaimPhase::DependenciesPlanned;
+    }
+    ensure!(poisoned_claims_remain_planned);
+    let offline_recovery_ms = u64::try_from(offline_started.elapsed().as_millis())?;
+
+    compose(Path::new(&compose_file), &["start", "scylla3"])?;
+    wait_up(3).await?;
+    let control_name = control();
+    docker_exec_retry(
+        NODE_CONTAINERS[0],
+        &["nodetool", "cluster", "repair", DATA],
+        24,
+    )?;
+    for node in NODE_CONTAINERS {
+        docker_exec_retry(
+            node,
+            &["nodetool", "repair", "-pr", control_name.as_str()],
+            24,
+        )?;
+        for keyspace in [DATA, control_name.as_str()] {
+            docker_exec(node, &["nodetool", "flush", keyspace])?;
+            docker_exec(node, &["nodetool", "compact", keyspace])?;
+        }
+    }
+
+    let expected_timestamped = expected_timestamped_dependency_rows(positive)?;
+    let mut dependency_direct = Vec::new();
+    let mut direct = Vec::new();
+    for ip in NODE_IPS {
+        let local = connect(Some(ip), Consistency::One).await?;
+        dependency_direct.push(
+            direct_timestamped_dependency_snapshot(&local, positive).await?,
+        );
+        direct.push(direct_snapshot(&local, capture).await?);
+    }
+    let dependency_direct_one_nodes_equal = dependency_direct
+        .windows(2)
+        .all(|pair| pair[0] == pair[1])
+        .then_some(dependency_direct.len())
+        .unwrap_or(0);
+    ensure!(dependency_direct_one_nodes_equal == 3);
+    ensure!(dependency_direct[0] == expected_timestamped);
+    let direct_one_nodes_equal = direct
+        .windows(2)
+        .all(|pair| pair[0] == pair[1])
+        .then_some(direct.len())
+        .unwrap_or(0);
+    ensure!(direct_one_nodes_equal == 3);
+    ensure!(direct[0].claims.len() == 3);
+
+    let slot_component_bytes = positive
+        .bundle
+        .component(RealmUserUpdateDependencyKind::SlotUpdates)
+        .bytes()
+        .len();
+    ensure!(slot_component_bytes == 14_400_138);
+    let report = MultiFragmentResumeReport {
+        image: IMAGE,
+        scylla_replication_factor: 3,
+        nats_servers: 3,
+        nats_stream_replicas: 3,
+        schema_version: PENDING_QUEUE_SIDECAR_SCHEMA_VERSION,
+        slot_component_bytes,
+        slot_fragment_count: slot_coordinates.len(),
+        total_dependency_rows: positive_fragments.len(),
+        missing_stage_counts,
+        duplicate_subset_rejected,
+        concurrent_exact_retries: 2,
+        planned_verifier_delta,
+        ready_publish_verifier_delta,
+        published_retry_verifier_delta,
+        ready_nats_publish_delta: after_ready_nats.0 - before_ready_nats.0,
+        publish_nats_publish_delta: after_publish_nats.0
+            - before_publish_nats.0,
+        published_retry_nats_publish_delta: after_terminal_nats.0
+            - before_terminal_nats.0,
+        wrong_timestamp_rejected,
+        stale_plan_conflict_rejected,
+        poisoned_claims_remain_planned,
+        one_replica_offline: true,
+        offline_recovery_ms,
+        repair_flush_compact: true,
+        direct_one_nodes_equal,
+        dependency_direct_one_nodes_equal,
+        exact_writetime_rows: expected_timestamped.len(),
+        qualification:
+            "H23C4C2B3B3E_MULTIFRAGMENT_PLANNED_RESUME_RF3_PASSED",
     };
     std::fs::write(report_path, serde_json::to_vec_pretty(&report)?)?;
     println!("{}", serde_json::to_string_pretty(&report)?);
