@@ -111,6 +111,23 @@ use crate::{
 // MerkleZeroHasherWithMarkedLeaf<HashOut<C::F>> +
 // MerkleZeroHasherWithMarkedLeaf<QHashOut<C::F>>, {
 // }
+fn select_builtin_sign_circuit(
+    fingerprint: QHashOut<F>,
+    zk_fingerprint: QHashOut<F>,
+    secp_fingerprint: QHashOut<F>,
+    eth_personal_fingerprint: Option<QHashOut<F>>,
+) -> Option<crate::trace::TraceSignCircuitSource> {
+    if fingerprint == zk_fingerprint {
+        Some(crate::trace::TraceSignCircuitSource::ZkBuiltin)
+    } else if fingerprint == secp_fingerprint {
+        Some(crate::trace::TraceSignCircuitSource::SecpBuiltin)
+    } else if Some(fingerprint) == eth_personal_fingerprint {
+        Some(crate::trace::TraceSignCircuitSource::EthPersonalSecpBuiltin)
+    } else {
+        None
+    }
+}
+
 
 pub fn gen_contract_deploy_and_circuits_for_functions<C: GenericConfig<D>, const D: usize>(
     deployer: QHashOut<C::F>,
@@ -530,17 +547,19 @@ impl<'a> TraceBuildSession<'a> {
             .get_circuit_info_by_id(LocalCircuitType::EthPersonalSecp256K1.into())
             .ok()
             .map(|_| crate::wallet::memory_wallet::get_eth_personal_secp256k1_fingerprint());
-        let circuit_manager = if Some(pk_info.fingerprint) == eth_personal_builtin_fingerprint {
+        let builtin_source = select_builtin_sign_circuit(
+            pk_info.fingerprint,
+            zk_builtin_fingerprint,
+            secp_builtin_fingerprint,
+            eth_personal_builtin_fingerprint,
+        );
+        let circuit_manager = if matches!(builtin_source, Some(TraceSignCircuitSource::EthPersonalSecpBuiltin)) {
             self.wallet_session.wallet.eth_personal_circuit_manager().await?
         } else {
             initial_circuit_manager
         };
-        let (sign_circuit_source, zksign_fingerprint) = if pk_info.fingerprint == zk_builtin_fingerprint {
-            (TraceSignCircuitSource::ZkBuiltin, zk_builtin_fingerprint)
-        } else if pk_info.fingerprint == secp_builtin_fingerprint {
-            (TraceSignCircuitSource::SecpBuiltin, secp_builtin_fingerprint)
-        } else if Some(pk_info.fingerprint) == eth_personal_builtin_fingerprint {
-            (TraceSignCircuitSource::EthPersonalSecpBuiltin, pk_info.fingerprint)
+        let (sign_circuit_source, zksign_fingerprint) = if let Some(source) = builtin_source {
+            (source, pk_info.fingerprint)
         } else if self.wallet_session.wallet.has_psy_software_defined_circuit(&pk_info.fingerprint) {
             let sdc = self
                 .wallet_session
@@ -877,6 +896,29 @@ mod view_validation_tests {
 
         let writer = definition(vec![DPNStateCmd::set_contract_state_slot_single(1, 0, 1)]);
         assert!(ensure_view_definition(7, "writer", &writer).is_err());
+    }
+}
+
+#[cfg(test)]
+mod signer_mode_selection_tests {
+    use super::*;
+
+    #[test]
+    fn selects_distinct_builtin_signer_modes() {
+        let zk = QHashOut(HashOut {
+            elements: [F::from_canonical_u64(1), F::from_canonical_u64(2), F::from_canonical_u64(3), F::from_canonical_u64(4)],
+        });
+        let secp = QHashOut(HashOut {
+            elements: [F::from_canonical_u64(5), F::from_canonical_u64(6), F::from_canonical_u64(7), F::from_canonical_u64(8)],
+        });
+        let personal = QHashOut(HashOut {
+            elements: [F::from_canonical_u64(9), F::from_canonical_u64(10), F::from_canonical_u64(11), F::from_canonical_u64(12)],
+        });
+
+        assert!(matches!(select_builtin_sign_circuit(zk, zk, secp, Some(personal)), Some(crate::trace::TraceSignCircuitSource::ZkBuiltin)));
+        assert!(matches!(select_builtin_sign_circuit(secp, zk, secp, Some(personal)), Some(crate::trace::TraceSignCircuitSource::SecpBuiltin)));
+        assert!(matches!(select_builtin_sign_circuit(personal, zk, secp, Some(personal)), Some(crate::trace::TraceSignCircuitSource::EthPersonalSecpBuiltin)));
+        assert!(select_builtin_sign_circuit(personal, zk, secp, None).is_none());
     }
 }
 

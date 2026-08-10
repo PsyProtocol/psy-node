@@ -79,6 +79,10 @@ shadow-rs = { workspace = true }
 #reqwest = { version = "0.12", default-features = false }
 reqwest = { workspace = true, features = ["json"] }
 
+[dev-dependencies]
+serde_cbor = { workspace = true }
+zstd = { workspace = true }
+
 [features]
 default = ["gnark-wrap"]
 gnark-wrap = ["psy_prover/gnark-wrap"]

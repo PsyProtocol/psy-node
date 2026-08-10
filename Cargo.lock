@@ -7644,6 +7644,7 @@ dependencies = [
  "rpassword",
  "serde",
  "serde-wasm-bindgen",
+ "serde_cbor",
  "serde_json",
  "serde_with 3.16.1",
  "sha2",
@@ -7659,6 +7660,7 @@ dependencies = [
  "wasm-logger",
  "wasm-tracing",
  "web-sys",
+ "zstd 0.13.3",
 ]
 
 [[package]]
