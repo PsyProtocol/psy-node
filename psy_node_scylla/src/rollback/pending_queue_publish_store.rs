@@ -442,6 +442,289 @@ pub struct ScyllaPendingQueuePublishStore {
     put_fragment: PreparedStatement, read_fragment: PreparedStatement, read_fragment_bucket: PreparedStatement,
 }
 
+/// Read-only historical publication observer. It prepares only SELECT
+/// statements, owns no NATS client and has no source/intent/fragment write
+/// statements. In particular, a `CommitPending` source is reported as not
+/// terminal instead of being repaired by this reader.
+pub(crate) struct ScyllaPendingQueuePublishDurableReader {
+    session: Arc<Session>,
+    segment: RecoverableNatsStreamSegment,
+    read_source: PreparedStatement,
+    read_intent: PreparedStatement,
+    read_fragment: PreparedStatement,
+    read_fragment_bucket: PreparedStatement,
+}
+
+impl ScyllaPendingQueuePublishDurableReader {
+    pub(crate) async fn prepare(
+        session: Arc<Session>,
+        segment: RecoverableNatsStreamSegment,
+        keyspaces: PendingQueuePublishKeyspaces,
+    ) -> Result<Self, PendingQueuePublishStoreError> {
+        let queries = PendingQueuePublishQueries::new(&keyspaces);
+        Ok(Self {
+            read_source: prepare_regular(
+                &session,
+                queries.get(PendingQueuePublishQueryId::ReadSource).cql(),
+            )
+            .await?,
+            read_intent: prepare_regular(
+                &session,
+                queries.get(PendingQueuePublishQueryId::ReadIntent).cql(),
+            )
+            .await?,
+            read_fragment: prepare_regular(
+                &session,
+                queries.get(PendingQueuePublishQueryId::ReadFragment).cql(),
+            )
+            .await?,
+            read_fragment_bucket: prepare_regular(
+                &session,
+                queries
+                    .get(PendingQueuePublishQueryId::ReadFragmentBucket)
+                    .cql(),
+            )
+            .await?,
+            session,
+            segment,
+        })
+    }
+
+    pub(crate) async fn observe_committed_data(
+        &self,
+        assignment_receipt: &PendingQueueSegmentAssignmentReceipt,
+        publisher_kind: PendingQueuePublisherKind,
+        intent_id: PendingQueuePublishIntentId,
+        payload: &[u8],
+    ) -> Result<Option<PendingQueuePublishCommitReceipt>, PendingQueuePublishStoreError> {
+        let assignment = assignment_receipt.assignment();
+        if assignment.segment_id() != self.segment.segment_id()
+            || assignment.contract_digest() != self.segment.digest()
+        {
+            return Err(PendingQueuePublishStoreError::AssignmentMismatch);
+        }
+        let route = RecoverableNatsSourceRoute::try_new(
+            assignment.context(),
+            publisher_kind,
+            &self.segment,
+        )
+        .map_err(model_envelope)?;
+        let expected_source = PendingQueuePublishSourceState::bootstrap(
+            &route,
+            assignment,
+        )
+        .map_err(model_envelope)?;
+        let Some(source) = self
+            .read_source(expected_source.slot().map_err(model_envelope)?)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if source.artifact_identity() != expected_source.artifact_identity()
+            || source.assignment_digest() != expected_source.assignment_digest()
+            || source.publisher_kind() != expected_source.publisher_kind()
+        {
+            return Err(PendingQueuePublishStoreError::AssignmentMismatch);
+        }
+        // A source cursor still at CommitPending is not a terminal read. This
+        // consumer cannot perform the recovery CAS and never turns an
+        // unsettled cross-system state into projection authority.
+        if source.commit_pending().is_some() {
+            return Ok(None);
+        }
+        let (expected_intent, _) = StoredPendingQueuePublishIntent::materialize_data(
+            &source,
+            intent_id,
+            payload,
+        )
+        .map_err(model_outbox)?;
+        let Some(current) = self.read_intent(expected_intent.slot()).await? else {
+            return Ok(None);
+        };
+        if current.artifact_identity() != expected_intent.artifact_identity()
+            || current.source_slot() != expected_intent.source_slot()
+            || current.publisher_kind() != expected_intent.publisher_kind()
+            || current.assignment_digest() != expected_intent.assignment_digest()
+            || current.intent_id() != expected_intent.intent_id()
+            || current.request_kind() != expected_intent.request_kind()
+            || current.payload_digest() != expected_intent.payload_digest()
+            || current.payload_bytes() != expected_intent.payload_bytes()
+            || current.fragment_count() != expected_intent.fragment_count()
+        {
+            return Err(PendingQueuePublishStoreError::IntentPhaseMismatch);
+        }
+        let loaded = self.load_payload(&current).await?;
+        if loaded != payload {
+            return Err(PendingQueuePublishStoreError::PayloadMismatch);
+        }
+        if !matches!(
+            current.phase(),
+            PendingQueuePublishIntentPhase::SourceCommitted { .. }
+        ) {
+            return Ok(None);
+        }
+        let envelope = build_envelope_read_only(
+            &route,
+            assignment,
+            &source,
+            &current,
+            loaded,
+        )?;
+        if !intent_matches_envelope_read_only(&current, &envelope) {
+            return Err(PendingQueuePublishStoreError::PermitStateMismatch);
+        }
+        let subject_sequence = current
+            .accepted_subject_sequence()
+            .ok_or(PendingQueuePublishStoreError::IntentPhaseMismatch)?;
+        if source.data_member_count() < envelope.member_ordinal().get()
+            || source.last_subject_sequence() < subject_sequence
+            || (source.last_subject_sequence() == subject_sequence
+                && source.last_envelope_digest()
+                    != *envelope.digest().as_bytes())
+        {
+            return Err(PendingQueuePublishStoreError::SourceCommitMismatch);
+        }
+        Ok(Some(PendingQueuePublishCommitReceipt {
+            intent_slot: current.slot(),
+            subject_sequence,
+            envelope_digest: *envelope.digest().as_bytes(),
+            disposition: PendingQueueNatsPublishDisposition::DurableResume,
+        }))
+    }
+
+    async fn read_source(
+        &self,
+        slot: PendingQueuePublishSourceSlot,
+    ) -> Result<Option<PendingQueuePublishSourceState>, PendingQueuePublishStoreError> {
+        let row = self
+            .session
+            .execute_unpaged(
+                &self.read_source,
+                HeaderReadBinding {
+                    slot: slot.as_bytes().to_vec(),
+                },
+            )
+            .await
+            .map_err(cql)?
+            .into_rows_result()
+            .map_err(cql)?
+            .maybe_first_row::<HeaderDbRow>()
+            .map_err(cql)?;
+        row.map(|row| {
+            PendingQueuePublishSourceState::decode_persisted(
+                row.revision,
+                &row.source_payload,
+            )
+            .map_err(model_envelope)
+        })
+        .transpose()
+    }
+
+    async fn read_intent(
+        &self,
+        slot: PendingQueuePublishIntentSlot,
+    ) -> Result<Option<StoredPendingQueuePublishIntent>, PendingQueuePublishStoreError> {
+        let row = self
+            .session
+            .execute_unpaged(
+                &self.read_intent,
+                HeaderReadBinding {
+                    slot: slot.as_bytes().to_vec(),
+                },
+            )
+            .await
+            .map_err(cql)?
+            .into_rows_result()
+            .map_err(cql)?
+            .maybe_first_row::<IntentHeaderDbRow>()
+            .map_err(cql)?;
+        row.map(|row| {
+            StoredPendingQueuePublishIntent::decode_persisted(
+                slot,
+                row.revision,
+                &row.intent_payload,
+            )
+            .map_err(model_outbox)
+        })
+        .transpose()
+    }
+
+    async fn load_payload(
+        &self,
+        intent: &StoredPendingQueuePublishIntent,
+    ) -> Result<Vec<u8>, PendingQueuePublishStoreError> {
+        if intent.request_kind() == PendingQueuePublishRequestKind::Seal {
+            return Err(PendingQueuePublishStoreError::IntentPhaseMismatch);
+        }
+        if intent.fragment_count() == 0 {
+            return reconstruct_payload(intent, Vec::new()).map_err(model_outbox);
+        }
+        let bucket_count = intent
+            .fragment_count()
+            .div_ceil(RECOVERABLE_PENDING_PAYLOAD_FRAGMENTS_PER_BUCKET);
+        let mut observed = Vec::new();
+        for bucket in 0..bucket_count {
+            let result = self
+                .session
+                .execute_unpaged(
+                    &self.read_fragment_bucket,
+                    FragmentBucketReadBinding {
+                        intent_slot: intent.slot().as_bytes().to_vec(),
+                        payload_digest: intent.payload_digest().as_bytes().to_vec(),
+                        fragment_bucket: i64::from(bucket),
+                    },
+                )
+                .await
+                .map_err(cql)?;
+            for row in result
+                .into_rows_result()
+                .map_err(cql)?
+                .rows::<FragmentMetadataDbRow>()
+                .map_err(cql)?
+            {
+                let row = row.map_err(cql)?;
+                observed.push((row.fragment_index, row.fragment_digest));
+            }
+        }
+        observed.sort_by_key(|row| row.0);
+        if observed.len() != intent.fragment_count() as usize
+            || observed.iter().enumerate().any(|(index, row)| {
+                row.0 != index as i16 || row.1.len() != 32
+            })
+        {
+            return Err(PendingQueuePublishStoreError::FragmentSetMismatch);
+        }
+        let mut fragments = Vec::with_capacity(intent.fragment_count() as usize);
+        for index in 0..intent.fragment_count() {
+            let binding = FragmentReadBinding {
+                intent_slot: intent.slot().as_bytes().to_vec(),
+                payload_digest: intent.payload_digest().as_bytes().to_vec(),
+                fragment_bucket: i64::from(
+                    index / RECOVERABLE_PENDING_PAYLOAD_FRAGMENTS_PER_BUCKET,
+                ),
+                fragment_index: i16::try_from(index)
+                    .map_err(|_| PendingQueuePublishStoreError::CoordinateOutOfRange)?,
+            };
+            let row = self
+                .session
+                .execute_unpaged(&self.read_fragment, binding)
+                .await
+                .map_err(cql)?
+                .into_rows_result()
+                .map_err(cql)?
+                .maybe_first_row::<FragmentDbRow>()
+                .map_err(cql)?
+                .ok_or(PendingQueuePublishStoreError::FragmentMissing)?;
+            let fragment = decode_fragment_row(row)?;
+            if fragment.fragment_index() != index {
+                return Err(PendingQueuePublishStoreError::FragmentMismatch);
+            }
+            fragments.push(fragment);
+        }
+        reconstruct_payload(intent, fragments).map_err(model_outbox)
+    }
+}
+
 impl ScyllaPendingQueuePublishStore {
     pub(crate) async fn create_schema(
         session: &Session,
@@ -1364,6 +1647,61 @@ fn decode_fragment_row(row: FragmentDbRow) -> Result<PendingQueuePayloadFragment
     Ok(fragment)
 }
 
+fn build_envelope_read_only(
+    route: &RecoverableNatsSourceRoute,
+    assignment: &PendingQueueGenerationSegmentAssignment,
+    source: &PendingQueuePublishSourceState,
+    intent: &StoredPendingQueuePublishIntent,
+    payload: Vec<u8>,
+) -> Result<PendingQueuePublishEnvelope, PendingQueuePublishStoreError> {
+    let (ordinal, previous_subject_sequence, previous_envelope_digest) = intent
+        .bound_envelope()
+        .map(|bound| {
+            (
+                bound.member_ordinal(),
+                bound.previous_subject_sequence(),
+                bound.previous_envelope_digest(),
+            )
+        })
+        .ok_or(PendingQueuePublishStoreError::PermitStateMismatch)?;
+    if intent.request_kind() != PendingQueuePublishRequestKind::Data {
+        return Err(PendingQueuePublishStoreError::IntentPhaseMismatch);
+    }
+    let envelope = PendingQueuePublishEnvelope::data(
+        route,
+        assignment,
+        intent.intent_id(),
+        ordinal,
+        previous_subject_sequence,
+        previous_envelope_digest,
+        payload,
+    )
+    .map_err(model_envelope)?;
+    // `source` is intentionally used here: reconstructing an envelope from
+    // the intent cannot prove that the committed cursor belongs to the same
+    // source history.
+    if source.data_member_count() < ordinal.get() {
+        return Err(PendingQueuePublishStoreError::SourceCommitMismatch);
+    }
+    Ok(envelope)
+}
+
+fn intent_matches_envelope_read_only(
+    intent: &StoredPendingQueuePublishIntent,
+    envelope: &PendingQueuePublishEnvelope,
+) -> bool {
+    intent.bound_envelope().is_some_and(|bound| {
+        bound.envelope_digest() == envelope.digest()
+            && bound.member_ordinal() == envelope.member_ordinal()
+            && bound.previous_subject_sequence()
+                == envelope.previous_subject_sequence()
+            && bound.previous_envelope_digest()
+                == envelope.previous_envelope_digest()
+            && bound.encoded_bytes()
+                == envelope.to_canonical_bytes().len() as u64
+    })
+}
+
 fn classify_exact<T: Eq>(applied: bool, candidate: &T, current: T) -> Result<T, PendingQueuePublishStoreError> {
     if &current == candidate { Ok(current) }
     else if applied { Err(PendingQueuePublishStoreError::AppliedStateMismatch) }
@@ -1511,6 +1849,42 @@ mod tests {
         assert!(!source.contains(concat!("jetstream", "::Context")));
         assert!(!source.contains(concat!("send_", "publish(")));
         assert!(!source.contains(concat!("get_last_raw_message", "_by_subject")));
+    }
+
+    #[test]
+    fn durable_reader_prepares_only_selects_and_cannot_repair_commit_pending() {
+        let source = include_str!("pending_queue_publish_store.rs");
+        let reader = source
+            .split("pub(crate) struct ScyllaPendingQueuePublishDurableReader")
+            .nth(1)
+            .unwrap()
+            .split("impl ScyllaPendingQueuePublishStore")
+            .next()
+            .unwrap();
+        for required in [
+            "PendingQueuePublishQueryId::ReadSource",
+            "PendingQueuePublishQueryId::ReadIntent",
+            "PendingQueuePublishQueryId::ReadFragment",
+            "PendingQueuePublishQueryId::ReadFragmentBucket",
+            "if source.commit_pending().is_some()",
+        ] {
+            assert!(reader.contains(required), "missing read contract {required}");
+        }
+        for forbidden in [
+            "RecoverablePendingQueueNatsPublisher",
+            "bootstrap_source:",
+            "cas_source:",
+            "bootstrap_intent:",
+            "cas_intent:",
+            "put_fragment:",
+            "publish_exact(",
+            "finalize_published()",
+        ] {
+            assert!(
+                !reader.contains(forbidden),
+                "read-only observer contains forbidden capability {forbidden}"
+            );
+        }
     }
 
     #[test]

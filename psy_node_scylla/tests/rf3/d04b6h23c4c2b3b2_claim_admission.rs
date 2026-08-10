@@ -71,6 +71,10 @@ use psy_node_core::{
             RealmUserUpdateDependencyBundle, RealmUserUpdateDependencyKind,
             RealmUserUpdateDependencyRecoveryPlan,
         },
+        realm_user_update_consumer::{
+            RealmUserUpdateDurableConsumerError,
+            RealmUserUpdateDurableConsumerPort, RealmUserUpdateDurableItem,
+        },
         realm_user_update_publish::{
             GlobalUserTreeHeight, RealmUserUpdatePublishAdmission,
             RealmUserUpdatePublishDisposition, RealmUserUpdatePublishReceipt,
@@ -1770,6 +1774,13 @@ struct NonemptyTerminalSourceReport {
     dependency_direct_one_nodes_equal: usize,
     dependency_rows: usize,
     qualification_ms: u64,
+    direct_consumer_items: usize,
+    direct_consumer_retry_identical: bool,
+    projection_rebuild_identical: bool,
+    direct_consumer_nats_publish_delta: i64,
+    direct_consumer_ms: u64,
+    direct_consumer_phase_matrix_typed: bool,
+    direct_consumer_dependency_loss_rejected: bool,
     qualification: &'static str,
 }
 
@@ -1778,6 +1789,7 @@ enum NonemptyTerminalSourceCase {
     Positive,
     DependencyFault,
     SourceReceiptCommitPending,
+    DirectDurableConsumer,
 }
 
 async fn run_nonempty_terminal_source_joint_rf3(
@@ -1922,6 +1934,7 @@ async fn run_nonempty_terminal_source_joint_rf3(
     let second_user = UserId::new((7_u64 << 20) + 12);
     let mut fixtures = Vec::new();
     let mut terminals = Vec::new();
+    let mut phase_claims = Vec::new();
     let mut initial_nats_leader = None;
     let mut failover_nats_leader = None;
     let dependency_store = ScyllaRealmUserUpdateDependencyStore::prepare(
@@ -1953,6 +1966,13 @@ async fn run_nonempty_terminal_source_joint_rf3(
             verified,
             height,
         )?;
+        let planned_model = StoredRealmUserUpdateClaim::dependencies_planned(
+            &winner,
+            fixture.bundle.digest(),
+        )?;
+        let ready_model =
+            StoredRealmUserUpdateClaim::dependencies_ready(&planned_model)?;
+        phase_claims.push((winner.clone(), planned_model, ready_model));
         let terminal = if case
             == NonemptyTerminalSourceCase::SourceReceiptCommitPending
             && index == 0
@@ -2182,8 +2202,8 @@ async fn run_nonempty_terminal_source_joint_rf3(
         session.clone(),
         capture.key().network(),
         realm(),
-        ready,
-        nats_publisher,
+        ready.clone(),
+        nats_publisher.clone(),
         segment.clone(),
     )
     .await?;
@@ -2549,6 +2569,166 @@ async fn run_nonempty_terminal_source_joint_rf3(
     let qualification_nats_publish_delta =
         i64::try_from(nats_after.0)? - i64::try_from(nats_before.0)?;
     ensure!(qualification_nats_publish_delta == 0);
+    let mut direct_consumer_items = 0;
+    let mut direct_consumer_retry_identical = false;
+    let mut projection_rebuild_identical = false;
+    let mut direct_consumer_nats_publish_delta = 0;
+    let mut direct_consumer_ms = 0;
+    let mut direct_consumer_phase_matrix_typed = false;
+    let mut direct_consumer_dependency_loss_rejected = false;
+    if case == NonemptyTerminalSourceCase::DirectDurableConsumer {
+        let before_consume = stream_state(&jetstream, segment.stream_name()).await?;
+        let consume_started = Instant::now();
+        let consumer = ScyllaRealmUserUpdateDurableConsumer::<PF, PHash>::prepare(
+            session.clone(),
+            capture.key().network(),
+            realm(),
+            height,
+            ready.clone(),
+            segment.clone(),
+        )
+        .await?;
+        let durable = consumer
+            .read_qualified_generation(key, close)
+            .await
+            .context("read qualified generation directly from Scylla")?;
+        direct_consumer_ms = consume_started.elapsed().as_millis() as u64;
+        direct_consumer_items = durable.items().len();
+        ensure!(direct_consumer_items == terminals.len());
+        ensure!(durable.qualification() == *qualified.current().generation_qualification().context("missing stored qualification")?);
+        let projection = durable
+            .items()
+            .iter()
+            .map(|item| {
+                (
+                    item.claim().bucket().get(),
+                    item.claim().admission_ordinal().get(),
+                    item.claim().user_id().get(),
+                    item.canonical_input().to_vec(),
+                    item.proof().to_vec(),
+                    item.contract_updates().to_vec(),
+                    item.slot_updates().to_vec(),
+                    item.queue_payload().to_vec(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let rebuilt_projection = durable
+            .items()
+            .iter()
+            .map(|item| {
+                (
+                    item.claim().bucket().get(),
+                    item.claim().admission_ordinal().get(),
+                    item.claim().user_id().get(),
+                    item.canonical_input().to_vec(),
+                    item.proof().to_vec(),
+                    item.contract_updates().to_vec(),
+                    item.slot_updates().to_vec(),
+                    item.queue_payload().to_vec(),
+                )
+            })
+            .collect::<Vec<_>>();
+        projection_rebuild_identical = projection == rebuilt_projection;
+        ensure!(projection_rebuild_identical);
+        drop(consumer);
+        let restarted = ScyllaRealmUserUpdateDurableConsumer::<PF, PHash>::prepare(
+            session.clone(),
+            capture.key().network(),
+            realm(),
+            height,
+            ready.clone(),
+            segment.clone(),
+        )
+        .await?;
+        let retry = restarted
+            .read_qualified_generation(key, close)
+            .await
+            .context("retry direct durable generation read")?;
+        direct_consumer_retry_identical = retry == durable;
+        ensure!(direct_consumer_retry_identical);
+
+        let fence = qualified
+            .current()
+            .generation_qualification()
+            .context("missing qualification for phase matrix")?
+            .fence();
+        let (claimed, planned, ready_claim) = &phase_claims[0];
+        for (sample, expected) in [
+            (
+                claimed,
+                RealmUserUpdateDurableConsumerError::AwaitExactRequestReplay,
+            ),
+            (
+                planned,
+                RealmUserUpdateDurableConsumerError::AwaitProofRecovery,
+            ),
+            (
+                ready_claim,
+                RealmUserUpdateDurableConsumerError::AwaitClaimPublication,
+            ),
+        ] {
+            let error = RealmUserUpdateDurableItem::<PF, PHash>::try_from_observed(
+                key,
+                fence,
+                sample.clone(),
+                fixtures[0].bundle.clone(),
+                height,
+                terminals[0].publication().clone(),
+            )
+            .expect_err("non-Published phase must not become deliverable");
+            ensure!(error == expected);
+        }
+        direct_consumer_phase_matrix_typed = true;
+
+        let selected_fragment = fixtures[0]
+            .bundle
+            .fragments()
+            .into_iter()
+            .find(|fragment| {
+                fragment.kind() == RealmUserUpdateDependencyKind::Proof
+                    && fragment.index() == 0
+            })
+            .context("proof fragment zero is required")?;
+        let selected =
+            dependency_direct_row(&fixtures[0].bundle, &selected_fragment)?;
+        let original_timestamp =
+            dependency_write_timestamp(&session, &selected).await?;
+        let delete_timestamp = original_timestamp
+            .checked_add(1)
+            .context("consumer fault timestamp overflow")?;
+        let restore_timestamp = delete_timestamp
+            .checked_add(1)
+            .context("consumer restore timestamp overflow")?;
+        session
+            .query_unpaged(
+                format!(
+                    "DELETE FROM {DATA}.{} USING TIMESTAMP ? WHERE dependency_slot = ? AND dependency_digest = ? AND component_kind = ? AND fragment_index = ?",
+                    REALM_USER_UPDATE_DEPENDENCY_FRAGMENT_TABLE
+                ),
+                (
+                    delete_timestamp,
+                    selected.0.clone(),
+                    selected.1.clone(),
+                    selected.2,
+                    selected.3,
+                ),
+            )
+            .await?;
+        let error = restarted
+            .read_qualified_generation(key, close)
+            .await
+            .expect_err("published dependency loss must fail closed");
+        ensure!(error == RealmUserUpdateDurableConsumerError::DurableDependencyLoss);
+        direct_consumer_dependency_loss_rejected = true;
+        restore_dependency_row(&session, &selected, restore_timestamp).await?;
+        ensure!(
+            restarted.read_qualified_generation(key, close).await? == durable
+        );
+        let after_consume = stream_state(&jetstream, segment.stream_name()).await?;
+        direct_consumer_nats_publish_delta = i64::try_from(after_consume.0)?
+            - i64::try_from(before_consume.0)?;
+        ensure!(direct_consumer_nats_publish_delta == 0);
+    }
     let current_leader = wait_for_stream_leader(
         &jetstream,
         segment.stream_name(),
@@ -2647,6 +2827,13 @@ async fn run_nonempty_terminal_source_joint_rf3(
         dependency_direct_one_nodes_equal,
         dependency_rows: expected_dependencies.len(),
         qualification_ms,
+        direct_consumer_items,
+        direct_consumer_retry_identical,
+        projection_rebuild_identical,
+        direct_consumer_nats_publish_delta,
+        direct_consumer_ms,
+        direct_consumer_phase_matrix_typed,
+        direct_consumer_dependency_loss_rejected,
         qualification: match case {
             NonemptyTerminalSourceCase::Positive => {
                 "H23C4C2B3B2C2B_NONEMPTY_TERMINAL_SOURCE_RF3_PASSED"
@@ -2656,6 +2843,9 @@ async fn run_nonempty_terminal_source_joint_rf3(
             }
             NonemptyTerminalSourceCase::SourceReceiptCommitPending => {
                 "H23C4C2B3B2C2C2_SOURCE_RECEIPT_COMMITPENDING_RF3_PASSED"
+            }
+            NonemptyTerminalSourceCase::DirectDurableConsumer => {
+                "H23C4C2B3B4_DIRECT_DURABLE_CONSUMER_RF3_PASSED"
             }
         },
     };
@@ -3296,6 +3486,16 @@ async fn d04b6h23c4c2b3b2c2c2_source_receipt_commitpending_joint_rf3(
 ) -> anyhow::Result<()> {
     run_nonempty_terminal_source_joint_rf3(
         NonemptyTerminalSourceCase::SourceReceiptCommitPending,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires real Scylla RF=3 and JetStream RF=3"]
+async fn d04b6h23c4c2b3b4_direct_durable_consumer_rf3(
+) -> anyhow::Result<()> {
+    run_nonempty_terminal_source_joint_rf3(
+        NonemptyTerminalSourceCase::DirectDurableConsumer,
     )
     .await
 }

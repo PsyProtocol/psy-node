@@ -7,6 +7,7 @@
 
 use std::{error::Error, fmt, sync::Arc};
 
+use futures::future::join_all;
 use parth_core::protocol::core_types::Q256BitHash;
 use psy_node_core::queue::realm_user_update_admission::{
     RealmUserUpdateAdmissionError, RealmUserUpdateAdmissionKey,
@@ -180,6 +181,25 @@ impl<Hash: Q256BitHash> PersistedRealmUserUpdateClaimingReceipt<Hash> {
 pub(crate) struct PersistedRealmUserUpdateClosedGeneration<Hash> {
     header: StoredRealmUserUpdateAdmission<Hash>,
     claims: Vec<StoredRealmUserUpdateClaim<Hash>>,
+}
+
+/// Full physical membership of an already-qualified generation.  Unlike the
+/// small idempotency receipt, this witness is minted only after all 256 stable
+/// bucket gates and claim partitions have been rescanned against the stored
+/// generation manifest and the qualified header has been read again.
+pub(crate) struct PersistedRealmUserUpdateQualifiedGeneration<Hash> {
+    header: StoredRealmUserUpdateAdmission<Hash>,
+    claims: Vec<StoredRealmUserUpdateClaim<Hash>>,
+}
+
+impl<Hash: Q256BitHash> PersistedRealmUserUpdateQualifiedGeneration<Hash> {
+    pub(crate) const fn header(&self) -> &StoredRealmUserUpdateAdmission<Hash> {
+        &self.header
+    }
+
+    pub(crate) fn claims(&self) -> &[StoredRealmUserUpdateClaim<Hash>] {
+        &self.claims
+    }
 }
 
 impl<Hash: Q256BitHash> PersistedRealmUserUpdateClosedGeneration<Hash> {
@@ -696,9 +716,94 @@ impl ScyllaRealmUserUpdateAdmissionGuard {
             return Err(RealmUserUpdateAdmissionGuardError::GenerationConflict);
         }
 
-        let mut manifests = Vec::with_capacity(RealmUserUpdateClaimBucket::COUNT as usize);
-        let mut claims = Vec::new();
-        for index in 0..RealmUserUpdateClaimBucket::COUNT {
+        let expected = header
+            .generation_manifest()
+            .ok_or(RealmUserUpdateAdmissionGuardError::MalformedGate)?;
+        let claims = self
+            .scan_stable_membership::<Hash>(key, close, expected)
+            .await?;
+        match self
+            .gates
+            .read::<Hash>(key, RealmUserUpdateAdmissionShard::Generation)
+            .await
+            .map_err(guard_gate_store)?
+        {
+            RealmUserUpdateAdmissionReadState::Current(fresh) if fresh == header => {
+                Ok(RealmUserUpdateQualificationInput::Closed(
+                    PersistedRealmUserUpdateClosedGeneration { header, claims },
+                ))
+            }
+            RealmUserUpdateAdmissionReadState::Current(fresh)
+                if fresh.phase()
+                    == RealmUserUpdateAdmissionPhase::GenerationQualified
+                    && fresh.close_intent() == Some(close) =>
+            {
+                PersistedRealmUserUpdateGenerationQualifiedReceipt::try_from_current(
+                    fresh,
+                )
+                .map(RealmUserUpdateQualificationInput::Qualified)
+                .map_err(guard_gate_store)
+            }
+            _ => Err(RealmUserUpdateAdmissionGuardError::AdmissionRace),
+        }
+    }
+
+    /// Reconstruct the complete physical member set behind an already
+    /// qualified generation. A qualification payload by itself is not enough
+    /// for a consumer because it contains commitments rather than projection
+    /// bytes.
+    pub(crate) async fn qualified_generation<Hash: Q256BitHash>(
+        &self,
+        key: RealmUserUpdateAdmissionKey,
+        close: RealmUserUpdateAdmissionCloseIntent,
+    ) -> Result<PersistedRealmUserUpdateQualifiedGeneration<Hash>, RealmUserUpdateAdmissionGuardError>
+    {
+        let header = match self
+            .gates
+            .read::<Hash>(key, RealmUserUpdateAdmissionShard::Generation)
+            .await
+            .map_err(guard_gate_store)?
+        {
+            RealmUserUpdateAdmissionReadState::Current(current) => current,
+            RealmUserUpdateAdmissionReadState::Uninitialized => {
+                return Err(RealmUserUpdateAdmissionGuardError::GenerationUninitialized)
+            }
+        };
+        if header.phase() != RealmUserUpdateAdmissionPhase::GenerationQualified
+            || header.close_intent() != Some(close)
+        {
+            return Err(RealmUserUpdateAdmissionGuardError::GenerationConflict);
+        }
+        let expected = header
+            .generation_manifest()
+            .ok_or(RealmUserUpdateAdmissionGuardError::MalformedGate)?;
+        if header.generation_qualification().is_none() {
+            return Err(RealmUserUpdateAdmissionGuardError::MalformedGate);
+        }
+        let claims = self
+            .scan_stable_membership::<Hash>(key, close, expected)
+            .await?;
+        match self
+            .gates
+            .read::<Hash>(key, RealmUserUpdateAdmissionShard::Generation)
+            .await
+            .map_err(guard_gate_store)?
+        {
+            RealmUserUpdateAdmissionReadState::Current(fresh) if fresh == header => {
+                Ok(PersistedRealmUserUpdateQualifiedGeneration { header, claims })
+            }
+            _ => Err(RealmUserUpdateAdmissionGuardError::AdmissionRace),
+        }
+    }
+
+    async fn scan_stable_membership<Hash: Q256BitHash>(
+        &self,
+        key: RealmUserUpdateAdmissionKey,
+        close: RealmUserUpdateAdmissionCloseIntent,
+        expected: psy_node_core::queue::realm_user_update_admission::RealmUserUpdateGenerationManifest,
+    ) -> Result<Vec<StoredRealmUserUpdateClaim<Hash>>, RealmUserUpdateAdmissionGuardError>
+    {
+        let scans = (0..RealmUserUpdateClaimBucket::COUNT).map(|index| async move {
             let bucket = RealmUserUpdateClaimBucket::try_new(index)
                 .map_err(guard_model)?;
             let partition = RealmUserUpdateClaimPartition::try_new(
@@ -731,39 +836,24 @@ impl ScyllaRealmUserUpdateAdmissionGuard {
             if gate.bucket_manifest() != Some(manifest) {
                 return Err(RealmUserUpdateAdmissionGuardError::MembershipMismatch);
             }
+            Ok::<_, RealmUserUpdateAdmissionGuardError>((manifest, bucket_claims))
+        });
+        let results = join_all(scans).await;
+        let mut manifests =
+            Vec::with_capacity(RealmUserUpdateClaimBucket::COUNT as usize);
+        let mut claims = Vec::new();
+        for result in results {
+            let (manifest, bucket_claims) = result?;
             manifests.push(manifest);
             claims.extend(bucket_claims);
         }
         let observed =
             psy_node_core::queue::realm_user_update_admission::RealmUserUpdateGenerationManifest::from_buckets(&manifests)
                 .map_err(guard_admission)?;
-        if header.generation_manifest() != Some(observed) {
+        if observed != expected {
             return Err(RealmUserUpdateAdmissionGuardError::MembershipMismatch);
         }
-        match self
-            .gates
-            .read::<Hash>(key, RealmUserUpdateAdmissionShard::Generation)
-            .await
-            .map_err(guard_gate_store)?
-        {
-            RealmUserUpdateAdmissionReadState::Current(fresh) if fresh == header => {
-                Ok(RealmUserUpdateQualificationInput::Closed(
-                    PersistedRealmUserUpdateClosedGeneration { header, claims },
-                ))
-            }
-            RealmUserUpdateAdmissionReadState::Current(fresh)
-                if fresh.phase()
-                    == RealmUserUpdateAdmissionPhase::GenerationQualified
-                    && fresh.close_intent() == Some(close) =>
-            {
-                PersistedRealmUserUpdateGenerationQualifiedReceipt::try_from_current(
-                    fresh,
-                )
-                .map(RealmUserUpdateQualificationInput::Qualified)
-                .map_err(guard_gate_store)
-            }
-            _ => Err(RealmUserUpdateAdmissionGuardError::AdmissionRace),
-        }
+        Ok(claims)
     }
 
     pub(crate) async fn persist_qualification<Hash: Q256BitHash>(
@@ -1473,7 +1563,7 @@ mod tests {
     }
 
     #[test]
-    fn qualification_receipt_is_opaque_and_rescans_before_header_cas() {
+    fn qualification_and_consumer_witness_rescan_complete_membership() {
         let source = include_str!("realm_user_update_admission_store.rs");
         let receipt = source
             .split("pub(crate) struct PersistedRealmUserUpdateGenerationQualifiedReceipt")
@@ -1493,9 +1583,27 @@ mod tests {
             .split("pub(crate) async fn persist_qualification")
             .next()
             .unwrap();
-        assert!(scan.contains("0..RealmUserUpdateClaimBucket::COUNT"));
-        assert!(scan.contains("scan_bucket"));
-        assert!(scan.contains("generation_manifest() != Some(observed)"));
+        assert!(scan.contains("scan_stable_membership"));
+        let qualified = source
+            .split("pub(crate) async fn qualified_generation")
+            .nth(1)
+            .unwrap()
+            .split("async fn scan_stable_membership")
+            .next()
+            .unwrap();
+        assert!(qualified.contains("scan_stable_membership"));
+        assert!(qualified.contains("fresh == header"));
+        let physical_scan = source
+            .split("async fn scan_stable_membership")
+            .nth(1)
+            .unwrap()
+            .split("pub(crate) async fn persist_qualification")
+            .next()
+            .unwrap();
+        assert!(physical_scan.contains("0..RealmUserUpdateClaimBucket::COUNT"));
+        assert!(physical_scan.contains("join_all(scans)"));
+        assert!(physical_scan.contains("scan_bucket"));
+        assert!(physical_scan.contains("observed != expected"));
         let persist = source
             .split("pub(crate) async fn persist_qualification")
             .nth(1)

@@ -53,6 +53,8 @@ mod realm_generation_scope;
 mod realm_user_update_admission_store;
 mod realm_user_update_dependency_store;
 #[allow(dead_code)]
+mod realm_user_update_durable_consumer;
+#[allow(dead_code)]
 mod realm_user_update_router;
 mod pending_queue_sidecar_lifecycle;
 #[cfg(test)]
@@ -144,6 +146,7 @@ pub use realm_edge_durable_publisher::*;
 pub use realm_user_update_claim_store::*;
 pub(crate) use realm_user_update_admission_store::*;
 pub use realm_user_update_dependency_store::*;
+pub(crate) use realm_user_update_durable_consumer::*;
 pub(crate) use realm_user_update_router::*;
 pub use pending_queue_sidecar_lifecycle::*;
 pub use authority_local_head_prototype::*;
