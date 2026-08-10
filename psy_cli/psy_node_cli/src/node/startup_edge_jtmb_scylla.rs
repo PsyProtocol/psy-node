@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use parth_core::{
     node::realm_identifier::QRealmIdentifier,
-    protocol::core_types::{QNetworkTypesConfig, QNetworkTypesConfigHelper, QNetworkZKTypes},
+    protocol::core_types::{QNetworkHashTypes, QNetworkTypesConfig, QNetworkTypesConfigHelper, QNetworkZKTypes},
 };
 use psy_core::{job::job_id::QProvingJobDataID, network_config::{PsyNetworkLocalDevnetConstants, PsyNetworkPsyTeamDevnetConstants}};
 use psy_data::config::network_config::PsyNodeCircuitFingerprintConfigProvider;
@@ -10,15 +10,18 @@ use psy_jtmb_testing_core::{
     circuit_library::core::get_jtmb_circuit_library_and_prover_for_network,
     config::poseidon_goldilocks::resolver::PsyJTMBPoseidonGoldilocksNodeConfigResolver,
     protocol_types::{JTMBPoseidonGoldilocksConfig, ZKTypesJTMBGoldilocksPoseidon},
-    utils::jtmb_standard_circuit::JTMBCircuitConfig,
     zk_verifier::PsyJTMBZKVerifier,
 };
 use psy_node_common::{
     coordinator::edge::{handler::CoordinatorEdgeHandler, server::start_coordinator_edge_rpc_server},
-    realm::edge::{handler::RealmEdgeHandler, server::start_realm_edge_rpc_server},
+    realm::edge::{
+        durable_user_update_artifact::DeterministicRealmUserUpdateArtifactFactory,
+        handler::RealmEdgeHandler, server::start_realm_edge_rpc_server,
+    },
 };
 use psy_node_core::{
     config::node_start_config::{CoordinatorEdgeStartConfig, RealmEdgeStartConfig},
+    queue::realm_user_update_verifier_profile::RealmUserUpdateVerifierRegistry,
     store::rollback_admin::{CoordinatorRollbackAdminInbox, RollbackAdminInboxAccess},
 };
 use psy_node_nats::psy_queue::setup_nats_psy_queue_from_connection_str;
@@ -149,10 +152,13 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_edge_node(config: &Coor
     Ok(())
 }
 
-async fn start_realm_edge_rpc_server_jtmb_scylla_node<N, C>(config: &RealmEdgeStartConfig) -> anyhow::Result<()>
+async fn start_realm_edge_rpc_server_jtmb_scylla_node<N>(config: &RealmEdgeStartConfig) -> anyhow::Result<()>
 where
-    N: QNetworkTypesConfig<ZKVerifier = PsyJTMBZKVerifier<C>, JobId = QProvingJobDataID> + QNetworkZKTypes + 'static,
-    C: JTMBCircuitConfig,
+    N: QNetworkTypesConfig<
+            ZKVerifier = PsyJTMBZKVerifier<JTMBPoseidonGoldilocksConfig>,
+            JobId = QProvingJobDataID,
+        > + QNetworkZKTypes
+        + 'static,
 {
     let realm_id = u32::try_from(config.realm_id)
         .map_err(|_| anyhow::anyhow!("Realm Edge realm_id exceeds u32"))?;
@@ -163,7 +169,10 @@ where
             startup.try_lineage(config.network, config.realm_id, config.realm_sub_id)
         })
         .transpose()?;
-    let (verifier, _) = get_jtmb_circuit_library_and_prover_for_network::<C>(config.network)?;
+    let branch_exact_enabled = branch_exact_lineage.is_some();
+    let (verifier, _) = get_jtmb_circuit_library_and_prover_for_network::<
+        JTMBPoseidonGoldilocksConfig,
+    >(config.network)?;
     let pool = new_redis_async_pool(&config.redis_url, 10).await?;
     let temp_store = StandardRedisStore::new(pool, config.db_namespace.to_string(), config.realm_id, config.realm_sub_id as u64);
     let nats_queue = setup_nats_psy_queue_from_connection_str(&config.nats_jetstream_url, &config.db_namespace).await?;
@@ -178,7 +187,9 @@ where
         realm_id,
         realm_sub_id: config.realm_sub_id,
     };
-    let proof_verifier = Arc::new(PsyJTMBZKVerifier::<C>::new(verifier));
+    let proof_verifier = Arc::new(PsyJTMBZKVerifier::<
+        JTMBPoseidonGoldilocksConfig,
+    >::new(verifier));
     let chain_id = config.network.get_chain_id();
     let composition = setup_realm_edge_scylla_startup_composition::<N>(
         &config.db_namespace,
@@ -189,7 +200,33 @@ where
         branch_exact_lineage,
     )
     .await?;
-    let db = composition.into_legacy_db()?;
+    let (db, durable_user_update_ingress) = if branch_exact_enabled {
+        let profile = proof_verifier
+            .realm_user_update_verifier_profile(config.network)?;
+        let verifier_profiles = Arc::new(
+            RealmUserUpdateVerifierRegistry::try_new([(
+                profile,
+                Arc::clone(&proof_verifier),
+            )])?,
+        );
+        let artifact_factory = Arc::new(
+            DeterministicRealmUserUpdateArtifactFactory::<
+                <N as QNetworkHashTypes>::F,
+                <N as QNetworkHashTypes>::QHash,
+                <N as QNetworkHashTypes>::HasherBase,
+            >::new(),
+        );
+        let (db, ingress) = composition
+            .into_branch_exact_ingress(
+                verifier_profiles,
+                artifact_factory,
+                Arc::clone(&nats_queue),
+            )
+            .await?;
+        (db, Some(ingress))
+    } else {
+        (composition.into_legacy_db()?, None)
+    };
     let db = Arc::new(db);
     let tag_tree_rewards_store = db.clone();
 
@@ -205,6 +242,12 @@ where
         0,
         proof_verifier,
     );
+    let handler = match durable_user_update_ingress {
+        Some(installation) => {
+            handler.install_durable_user_update_ingress(installation)?
+        }
+        None => handler,
+    };
     start_realm_edge_rpc_server::<N, _, _, _, _, _, _>(handler, &config.listen, config.port).await?;
     Ok(())
 }
@@ -230,7 +273,6 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_realm_edge_node(config:
         psy_core::constants::chain_id::PsyChainNetworkType::LocalDevnet => {
             start_realm_edge_rpc_server_jtmb_scylla_node::<
                 JTMBPoseidonGoldilocksConfigHelper<PsyNetworkLocalDevnetConstants>,
-                JTMBPoseidonGoldilocksConfig,
             >(config)
             .await?;
         }

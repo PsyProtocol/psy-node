@@ -15,9 +15,9 @@ psy_node_scylla/examples/tst6.rs|Example|2|2|0|0|1|1|2|3
 psy_node_scylla/examples/tst6_nobucket.rs|Example|2|2|0|0|1|1|2|3
 psy_node_scylla/examples/tst7.rs|Example|2|2|0|0|1|1|2|3
 psy_node_scylla/examples/tst7_nobucket.rs|Example|2|2|0|0|1|1|2|3
-psy_node_scylla/src/core.rs|DriverCore|4|2|16|0|0|0|2|2
+psy_node_scylla/src/core.rs|DriverCore|4|2|15|0|0|0|2|2
 psy_node_scylla/src/core_db.rs|DriverCore|0|0|97|0|0|0|0|0
-psy_node_scylla/src/psy_setup.rs|DriverCore|0|0|2|0|0|0|0|0
+psy_node_scylla/src/psy_setup.rs|DriverCore|1|0|4|0|0|0|0|0
 psy_node_scylla/src/rollback/authority_local_head_prototype.rs|DurableControlAuthority|6|0|3|6|2|3|1|4
 psy_node_scylla/src/rollback/authority_timestamp_prototype.rs|DurableControlAuthority|6|0|4|6|2|4|1|6
 psy_node_scylla/src/rollback/branch_exact_cutover_runtime.rs|DurableControlAuthority|2|0|0|0|0|0|0|0
@@ -108,12 +108,13 @@ psy_node_scylla/src/tables/u64_table/u64_to_u64.rs|LegacyTableAdapter|11|0|0|5|4
 psy_node_scylla/src/tables/u64_table/u64_u128_bidirectional.rs|LegacyTableAdapter|12|0|0|0|0|0|0|0
 psy_node_scylla/src/tables/u64_tbl.rs|LegacyTableAdapter|41|0|0|12|11|12|0|14
 psy_node_scylla/src/utils.rs|LegacyTableAdapter|3|0|0|4|2|0|0|0
-psy_node_scylla/tests/rf3/d04b6h22e2b_segment_lifecycle.rs|TestHarness|1|0|0|0|0|0|3|3
+psy_node_scylla/tests/rf3/d04b6h22e2b_segment_lifecycle.rs|TestHarness|2|0|0|0|0|0|3|3
 psy_node_scylla/tests/rf3/d04b6h22e3_cutover.rs|TestHarness|1|0|0|0|0|0|6|8
 psy_node_scylla/tests/rf3/d04b6h22e_consumer_gate.rs|TestHarness|0|0|0|0|0|0|1|1
 psy_node_scylla/tests/rf3/d04b6h23c4c1_queue_schema.rs|TestHarness|4|2|0|0|0|0|7|7
 psy_node_scylla/tests/rf3/d04b6h23c4c2b3b2_claim_admission.rs|TestHarness|14|2|0|0|0|0|26|26
 psy_node_scylla/tests/rf3/d04b6h23c4c2b4d2_stream_provision.rs|TestHarness|0|0|0|0|0|0|6|6
+psy_node_scylla/tests/rf3/d04b6h23c4c2b4e3_edge_handler_ingress.rs|TestHarness|4|0|0|0|0|0|3|4
 psy_node_scylla/tests/rollback_admission_inbox.rs|TestHarness|0|0|0|0|0|0|0|1
 psy_node_scylla/tests/rollback_admission_inbox_rf3_gate.rs|TestHarness|5|2|0|0|0|0|3|3
 psy_node_scylla/tests/rollback_authority_timestamp_rf3_gate.rs|TestHarness|4|2|0|0|0|0|2|2

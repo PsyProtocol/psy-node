@@ -304,6 +304,45 @@ where
             })
     }
 
+    /// Prove that the complete high-level ingress is usable before a CLI
+    /// installs it and starts listening. The check is deliberately read-only:
+    /// it resolves the exact gathering assignment to an already-Provisioned
+    /// NATS instance, requires its admission header to be Open and fences the
+    /// pending branch against the same authority-local head used by Handler.
+    pub(crate) async fn attest_startup(
+        &self,
+    ) -> Result<(), RealmUserUpdateRouterError> {
+        let admission = self
+            .publisher
+            .attest_startup_route()
+            .await
+            .map_err(router)?;
+        let key = RealmUserUpdateAdmissionKey::try_new(admission.capture())
+            .map_err(router)?;
+        self.admission_guard
+            .require_generation_open::<Hash>(key)
+            .await
+            .map_err(router)?;
+        let observation = self
+            .authority_observations
+            .read_authority_observation()
+            .await
+            .map_err(|error| {
+                RealmUserUpdateRouterError::AuthorityObservation(
+                    error.to_string(),
+                )
+            })?;
+        RealmUserUpdateStateFence::try_seal(
+            admission,
+            observation.clone(),
+            observation,
+        )
+        .map_err(|error| {
+            RealmUserUpdateRouterError::AuthorityObservation(error.to_string())
+        })?;
+        Ok(())
+    }
+
     pub(crate) async fn admit(
         &self,
     ) -> Result<RealmUserUpdatePublishAdmission<Hash>, RealmUserUpdateRouterError> {
@@ -531,6 +570,27 @@ where
                     .map_err(router)?,
             )
             .await?;
+
+        // Ready/Published retries already have a complete durable dependency
+        // bundle, so resume from that authority after revalidating the caller's
+        // proof and branch fence. A Planned winner is deliberately excluded:
+        // the process may have crashed after the pointer CAS but before all
+        // fragments were written. Exact replay must rebuild the deterministic
+        // artifacts and let complete_live fill only the missing fragments.
+        if matches!(
+            winner.phase(),
+            RealmUserUpdateClaimPhase::DependenciesReady
+                | RealmUserUpdateClaimPhase::Published
+        ) {
+            let terminal = self
+                .resume_exact(winner.partition().map_err(router)?, winner.user_id())
+                .await?;
+            return RealmUserUpdateIngressReceipt::try_from_terminal(
+                terminal.claim,
+                terminal.publication,
+            )
+            .map_err(router);
+        }
 
         let artifact_claim = winner.clone();
         let artifact_verified = verified_request.clone();
@@ -1160,8 +1220,23 @@ mod tests {
             .split("#[cfg(test)]\nmod realm_startup_composition_tests")
             .next()
             .unwrap();
+        let generic_setup = setup
+            .split("pub async fn setup_psy_scylla_database_store<")
+            .nth(1)
+            .unwrap()
+            .split("pub async fn prepare_psy_scylla_database_store<")
+            .next()
+            .unwrap();
+        let edge_installation = setup
+            .split("pub struct ScyllaRealmEdgeStartupComposition")
+            .nth(1)
+            .unwrap();
         let core = include_str!("../core.rs");
-        assert!(!setup.contains("ScyllaRealmUserUpdateDurableRouter"));
+        assert!(!generic_setup.contains("ScyllaRealmUserUpdateDurableRouter"));
+        assert!(edge_installation.contains("ScyllaRealmUserUpdateDurableRouter"));
+        assert!(edge_installation.contains(
+            "RealmEdgeDurableIngressInstallation::seal_with_startup_permit"
+        ));
         assert!(!core.contains("prepare_realm_user_update_router"));
     }
 
@@ -1229,13 +1304,21 @@ mod tests {
             .unwrap();
         let clock = ingress.find("SystemTime::now()").unwrap();
         let claim = ingress.find(".claim(").unwrap();
+        let resume = ingress.find(".resume_exact(").unwrap();
         let build = ingress.find("artifact_factory.build").unwrap();
         let seal = ingress
             .find("seal_realm_user_update_ingress_artifacts")
             .unwrap();
         let complete = ingress.find("self.complete_live").unwrap();
         assert!(verify < observe && observe < clock && clock < claim);
-        assert!(claim < build && build < seal && seal < complete);
+        assert!(claim < resume && resume < build);
+        assert!(build < seal && seal < complete);
+        assert!(ingress.contains("RealmUserUpdateClaimPhase::DependenciesReady"));
+        assert!(ingress.contains("RealmUserUpdateClaimPhase::Published"));
+        assert!(!ingress.contains(
+            "winner.phase() != RealmUserUpdateClaimPhase::Claimed"
+        ));
+        assert!(ingress.contains("A Planned winner is deliberately excluded"));
         assert!(ingress.contains("fence: RealmUserUpdateStateFence<Hash>"));
         assert!(ingress.contains("input: SubmitUserEndCapNonProofInput<F, Hash>"));
         assert!(ingress.contains("proof: Vec<u8>"));

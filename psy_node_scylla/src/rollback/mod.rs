@@ -58,9 +58,7 @@ mod realm_user_update_admission_store;
 mod realm_user_update_dependency_store;
 #[allow(dead_code)]
 mod realm_user_update_durable_consumer;
-#[allow(dead_code)]
 mod realm_user_update_router;
-#[allow(dead_code)]
 mod realm_user_update_ingress;
 mod pending_queue_sidecar_lifecycle;
 #[cfg(test)]
@@ -83,6 +81,9 @@ mod pending_queue_segment_lifecycle_rf3;
 #[cfg(test)]
 #[path = "../../tests/rf3/d04b6h22e3_cutover.rs"]
 mod branch_exact_cutover_rf3;
+#[cfg(test)]
+#[path = "../../tests/rf3/d04b6h23c4c2b4e3_edge_handler_ingress.rs"]
+mod realm_edge_handler_ingress_rf3;
 #[cfg(test)]
 mod branch_exact_shadow_reader_rf3_gate;
 #[cfg(test)]

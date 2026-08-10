@@ -7,7 +7,7 @@
 //! then complete publication. This port exposes that ordering without exposing
 //! a raw publisher, claim store or storage session to the handler.
 
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, sync::Arc};
 
 use async_trait::async_trait;
 use parth_core::{
@@ -17,7 +17,10 @@ use parth_core::{
 };
 use psy_data::{
     proof_input::guta::end_cap_input::SubmitUserEndCapNonProofInput,
-    protocol::chain_context::AuthorityObservation,
+    protocol::{
+        canonical_chain::NetworkId,
+        chain_context::{AuthorityObservation, AuthorityScope},
+    },
     queue_items::realm_user_update::PsyRealmUserUpdateQueueItem,
 };
 
@@ -35,6 +38,101 @@ use super::{
         RealmUserUpdatePublishRequest,
     },
 };
+use crate::store::realm_processor_startup::{
+    RealmProcessorFreshRunPermit, RealmProcessorStartupPermitDigest,
+};
+
+/// Opaque, single-use authorization for installing a durable Realm Edge
+/// ingress. Construction consumes the same fresh startup permit used by the
+/// production storage composition and preserves its exact network/Realm scope
+/// until the Handler validates it before listening.
+///
+/// This is an affine composition boundary, not a security boundary against
+/// arbitrary trusted Rust code in the process: the port trait and startup
+/// authorization API are public so tests and alternative stores can implement
+/// them. Production callsite/source tests separately require that CLI startup
+/// obtains this value from the Scylla composition.
+///
+/// A raw high-level port is not itself an installation capability:
+///
+/// ```compile_fail
+/// use std::sync::Arc;
+/// use parth_core::{PF, PHash};
+/// use psy_node_core::queue::realm_user_update_ingress::{
+///     RealmEdgeDurableIngressInstallation, RealmUserUpdateIngressPort,
+/// };
+/// let port: Arc<dyn RealmUserUpdateIngressPort<PF, PHash>> = todo!();
+/// let _: RealmEdgeDurableIngressInstallation<PF, PHash> = port.into();
+/// ```
+///
+/// The installation is affine and cannot be cloned for a second Handler:
+///
+/// ```compile_fail
+/// use parth_core::{PF, PHash};
+/// use psy_node_core::queue::realm_user_update_ingress::RealmEdgeDurableIngressInstallation;
+/// fn duplicate(value: RealmEdgeDurableIngressInstallation<PF, PHash>) {
+///     let _second = value.clone();
+/// }
+/// ```
+pub struct RealmEdgeDurableIngressInstallation<F, Hash>
+where
+    F: QFelt64,
+    Hash: Q256BitHash,
+{
+    ingress: Arc<dyn RealmUserUpdateIngressPort<F, Hash>>,
+    permit_digest: RealmProcessorStartupPermitDigest,
+    expected_network: NetworkId,
+    expected_authority: AuthorityScope,
+}
+
+impl<F, Hash> RealmEdgeDurableIngressInstallation<F, Hash>
+where
+    F: QFelt64,
+    Hash: Q256BitHash,
+{
+    pub fn seal_with_startup_permit(
+        permit: RealmProcessorFreshRunPermit,
+        ingress: Arc<dyn RealmUserUpdateIngressPort<F, Hash>>,
+    ) -> Self {
+        let expectation = permit.expectation();
+        Self {
+            ingress,
+            permit_digest: permit.digest(),
+            expected_network: expectation.network(),
+            expected_authority: AuthorityScope::Realm {
+                realm_id: expectation.realm_id(),
+                realm_sub_id: expectation.realm_sub_id(),
+            },
+        }
+    }
+
+    pub const fn permit_digest(&self) -> RealmProcessorStartupPermitDigest {
+        self.permit_digest
+    }
+
+    pub const fn expected_network(&self) -> NetworkId { self.expected_network }
+
+    pub const fn expected_authority(&self) -> AuthorityScope {
+        self.expected_authority
+    }
+
+    /// Consume the installation only for the exact Handler scope authorized
+    /// by startup. A mismatch is rejected before the port can be extracted or
+    /// an RPC listener can be started.
+    pub fn try_into_ingress_for(
+        self,
+        actual_network: NetworkId,
+        actual_authority: AuthorityScope,
+    ) -> Result<Arc<dyn RealmUserUpdateIngressPort<F, Hash>>, RealmUserUpdateIngressError>
+    {
+        if actual_network != self.expected_network
+            || actual_authority != self.expected_authority
+        {
+            return Err(RealmUserUpdateIngressError::InstallationScopeMismatch);
+        }
+        Ok(self.ingress)
+    }
+}
 
 /// Stable authority observation surrounding all handler-side state reads.
 ///
@@ -218,7 +316,11 @@ where
     Hash: Q256BitHash + QFHashBase<F>,
     Hasher: FieldQHasher<F, Hash>,
 {
-    if claim.phase() != RealmUserUpdateClaimPhase::Claimed
+    if !matches!(
+        claim.phase(),
+        RealmUserUpdateClaimPhase::Claimed
+            | RealmUserUpdateClaimPhase::DependenciesPlanned
+    )
         || claim.reconstruct_admission().map_err(|error| {
             RealmUserUpdateIngressError::Claim(error.to_string())
         })? != admission
@@ -309,6 +411,7 @@ pub enum RealmUserUpdateIngressError {
     NetworkMismatch,
     AuthorityMismatch,
     BranchMismatch,
+    InstallationScopeMismatch,
     ClaimNotPublished,
     ReceiptMismatch,
     MalformedTerminal(String),
@@ -329,6 +432,12 @@ impl Error for RealmUserUpdateIngressError {}
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use async_trait::async_trait;
     use parth_core::{
         protocol::core_types::Q256BitHash, utils::QPGenRandom, PF, PHash,
     };
@@ -367,10 +476,184 @@ mod tests {
                 PendingGenerationLedgerKey,
             },
             typed::UserId,
+            realm_processor_startup::{
+                authorize_realm_processor_startup,
+                RealmProcessorStartupAuthorization,
+                RealmProcessorStartupError,
+                RealmProcessorStartupEvidence,
+                RealmProcessorStartupExpectation,
+                RealmProcessorStartupMode,
+                RealmProcessorStartupPreflightProvider,
+                RealmProcessorStartupRouteObservation,
+                RealmProcessorStartupRoutePhase,
+            },
         },
     };
 
     use super::*;
+
+    struct NeverCalledIngress;
+
+    #[async_trait]
+    impl RealmUserUpdateIngressPort<PF, PHash> for NeverCalledIngress {
+        async fn read_authority_observation(
+            &self,
+        ) -> Result<AuthorityObservation<PHash>, RealmUserUpdateIngressError> {
+            Err(RealmUserUpdateIngressError::AuthorityObservation(
+                "not called".to_owned(),
+            ))
+        }
+
+        async fn admit(
+            &self,
+        ) -> Result<RealmUserUpdatePublishAdmission<PHash>, RealmUserUpdateIngressError>
+        {
+            Err(RealmUserUpdateIngressError::Admission(
+                "not called".to_owned(),
+            ))
+        }
+
+        async fn submit_after_state_validation(
+            &self,
+            _fence: RealmUserUpdateStateFence<PHash>,
+            _input: SubmitUserEndCapNonProofInput<PF, PHash>,
+            _proof: Vec<u8>,
+        ) -> Result<RealmUserUpdateIngressReceipt<PHash>, RealmUserUpdateIngressError>
+        {
+            Err(RealmUserUpdateIngressError::Proof(
+                "not called".to_owned(),
+            ))
+        }
+    }
+
+    struct StableStartupProvider {
+        calls: AtomicUsize,
+        evidence: RealmProcessorStartupEvidence,
+    }
+
+    #[async_trait]
+    impl RealmProcessorStartupPreflightProvider for StableStartupProvider {
+        async fn fresh_read(
+            &self,
+            _expectation: RealmProcessorStartupExpectation,
+        ) -> Result<RealmProcessorStartupEvidence, RealmProcessorStartupError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.evidence)
+        }
+    }
+
+    async fn fresh_startup_permit(
+    ) -> crate::store::realm_processor_startup::RealmProcessorFreshRunPermit {
+        let network = NetworkId::try_from_chain_id(1337).unwrap();
+        let expectation = RealmProcessorStartupExpectation::try_new(
+            network, 7, 2, 11, [1; 32], [2; 32], [3; 32],
+        )
+        .unwrap();
+        let route = RealmProcessorStartupRouteObservation::try_new(
+            11,
+            4,
+            [1; 32],
+            [5; 32],
+            RealmProcessorStartupRoutePhase::LegacyPrimaryDualWrite,
+        )
+        .unwrap();
+        let provider = StableStartupProvider {
+            calls: AtomicUsize::new(0),
+            evidence: RealmProcessorStartupEvidence::try_new(
+                network,
+                7,
+                2,
+                route,
+                route,
+                [2; 32],
+                [6; 32],
+                [7; 32],
+            )
+            .unwrap(),
+        };
+        let RealmProcessorStartupAuthorization::BranchExact(permit) =
+            authorize_realm_processor_startup(
+                RealmProcessorStartupMode::RequireBranchExact(expectation),
+                Some(&provider),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected branch-exact permit")
+        };
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        permit
+    }
+
+    #[tokio::test]
+    async fn installation_consumes_fresh_permit_and_preserves_exact_port() {
+        let permit = fresh_startup_permit().await;
+        let expected_digest = permit.digest();
+        let expected_network = permit.expectation().network();
+        let expected_authority = AuthorityScope::Realm {
+            realm_id: permit.expectation().realm_id(),
+            realm_sub_id: permit.expectation().realm_sub_id(),
+        };
+        let concrete = Arc::new(NeverCalledIngress);
+        let port: Arc<dyn RealmUserUpdateIngressPort<PF, PHash>> = concrete;
+        let expected_port = Arc::clone(&port);
+        let installation =
+            RealmEdgeDurableIngressInstallation::seal_with_startup_permit(
+                permit, port,
+            );
+        assert_eq!(installation.permit_digest(), expected_digest);
+        assert_eq!(installation.expected_network(), expected_network);
+        assert_eq!(installation.expected_authority(), expected_authority);
+        let installed = installation
+            .try_into_ingress_for(expected_network, expected_authority)
+            .unwrap();
+        assert!(Arc::ptr_eq(&installed, &expected_port));
+    }
+
+    #[tokio::test]
+    async fn installation_rejects_wrong_handler_scope_before_port_extraction() {
+        let permit = fresh_startup_permit().await;
+        let expected_network = permit.expectation().network();
+        let concrete = Arc::new(NeverCalledIngress);
+        let port: Arc<dyn RealmUserUpdateIngressPort<PF, PHash>> = concrete;
+        let installation =
+            RealmEdgeDurableIngressInstallation::seal_with_startup_permit(
+                permit, port,
+            );
+        assert!(matches!(
+            installation.try_into_ingress_for(
+                expected_network,
+                AuthorityScope::Realm {
+                    realm_id: 8,
+                    realm_sub_id: 2,
+                },
+            ),
+            Err(RealmUserUpdateIngressError::InstallationScopeMismatch)
+        ));
+    }
+
+    #[test]
+    fn installation_is_affine_and_preserves_permit_scope() {
+        let source = include_str!("realm_user_update_ingress.rs");
+        let installation = source
+            .split("pub struct RealmEdgeDurableIngressInstallation")
+            .nth(1)
+            .unwrap()
+            .split("/// Stable authority observation")
+            .next()
+            .unwrap();
+        assert!(installation.contains("permit: RealmProcessorFreshRunPermit"));
+        assert!(!installation.contains("impl Clone"));
+        assert!(!installation.contains("impl Copy"));
+        assert!(!installation.contains("impl Default"));
+        assert!(!installation.contains("From<Arc<dyn RealmUserUpdateIngressPort"));
+        assert!(!installation.contains("pub fn new("));
+        assert!(!installation.contains("pub fn try_new("));
+        assert!(installation.contains("expected_network:"));
+        assert!(installation.contains("expected_authority:"));
+        assert!(installation.contains("try_into_ingress_for"));
+        assert!(installation.contains("InstallationScopeMismatch"));
+    }
 
     fn chain(
         network: u32,

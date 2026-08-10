@@ -612,6 +612,35 @@ impl ScyllaRealmUserUpdateAdmissionGuard {
         }
     }
 
+    /// Read-only startup attestation for the exact gathering generation.
+    /// Missing, closing or already-closed generations are not interpreted as
+    /// an empty/open generation and must be recovered by the Processor owner
+    /// before an Edge begins serving.
+    pub(crate) async fn require_generation_open<Hash: Q256BitHash>(
+        &self,
+        key: RealmUserUpdateAdmissionKey,
+    ) -> Result<StoredRealmUserUpdateAdmission<Hash>, RealmUserUpdateAdmissionGuardError>
+    {
+        let current = match self
+            .gates
+            .read::<Hash>(key, RealmUserUpdateAdmissionShard::Generation)
+            .await
+            .map_err(guard_gate_store)?
+        {
+            RealmUserUpdateAdmissionReadState::Current(current) => current,
+            RealmUserUpdateAdmissionReadState::Uninitialized => {
+                return Err(RealmUserUpdateAdmissionGuardError::GenerationUninitialized)
+            }
+        };
+        if current.key() != key
+            || current.shard() != RealmUserUpdateAdmissionShard::Generation
+            || current.phase() != RealmUserUpdateAdmissionPhase::GenerationOpen
+        {
+            return Err(RealmUserUpdateAdmissionGuardError::GenerationConflict);
+        }
+        Ok(current)
+    }
+
     /// Close all 256 lazy bucket gates, recover any winning Claiming journal,
     /// verify every physical claim row and publish one stable generation
     /// manifest. This does not qualify Published/SourceCommitted terminal

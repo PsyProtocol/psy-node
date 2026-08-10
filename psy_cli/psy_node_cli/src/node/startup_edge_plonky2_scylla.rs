@@ -1,14 +1,15 @@
 use std::sync::Arc;
 
-use parth_core::{node::realm_identifier::QRealmIdentifier, protocol::core_types::QNetworkTypesConfigHelper};
+use parth_core::{node::realm_identifier::QRealmIdentifier, protocol::core_types::{QNetworkHashTypes, QNetworkTypesConfigHelper}};
 use plonky2::plonk::config::PoseidonGoldilocksConfig;
 use psy_core::{job::job_id::QProvingJobDataID, network_config::PsyNetworkLocalDevnetConstants};
 use psy_data::
     config::network_config::PsyNodeCircuitFingerprintConfigProvider
 ;
-use psy_node_common::{coordinator::edge::{handler::CoordinatorEdgeHandler, server::start_coordinator_edge_rpc_server}, realm::edge::{handler::RealmEdgeHandler, server::start_realm_edge_rpc_server}};
+use psy_node_common::{coordinator::edge::{handler::CoordinatorEdgeHandler, server::start_coordinator_edge_rpc_server}, realm::edge::{durable_user_update_artifact::DeterministicRealmUserUpdateArtifactFactory, handler::RealmEdgeHandler, server::start_realm_edge_rpc_server}};
 use psy_node_core::{
     config::node_start_config::{CoordinatorEdgeStartConfig, RealmEdgeStartConfig},
+    queue::realm_user_update_verifier_profile::RealmUserUpdateVerifierRegistry,
     store::rollback_admin::{CoordinatorRollbackAdminInbox, RollbackAdminInboxAccess},
 };
 use psy_node_nats::psy_queue::setup_nats_psy_queue_from_connection_str;
@@ -129,6 +130,7 @@ pub async fn run_startup_plonky2_scylla_realm_edge_node(config: &RealmEdgeStartC
             startup.try_lineage(config.network, config.realm_id, config.realm_sub_id)
         })
         .transpose()?;
+    let branch_exact_enabled = branch_exact_lineage.is_some();
 
     let pool = new_redis_async_pool(&config.redis_url, 2).await?;
 
@@ -179,7 +181,33 @@ pub async fn run_startup_plonky2_scylla_realm_edge_node(config: &RealmEdgeStartC
                 branch_exact_lineage,
             )
             .await?;
-            let db = composition.into_legacy_db()?;
+            let (db, durable_user_update_ingress) = if branch_exact_enabled {
+                let profile = proof_verifier
+                    .realm_user_update_verifier_profile(config.network)?;
+                let verifier_profiles = Arc::new(
+                    RealmUserUpdateVerifierRegistry::try_new([(
+                        profile,
+                        Arc::clone(&proof_verifier),
+                    )])?,
+                );
+                let artifact_factory = Arc::new(
+                    DeterministicRealmUserUpdateArtifactFactory::<
+                        <N as QNetworkHashTypes>::F,
+                        <N as QNetworkHashTypes>::QHash,
+                        <N as QNetworkHashTypes>::HasherBase,
+                    >::new(),
+                );
+                let (db, ingress) = composition
+                    .into_branch_exact_ingress(
+                        verifier_profiles,
+                        artifact_factory,
+                        Arc::clone(&nats_queue),
+                    )
+                    .await?;
+                (db, Some(ingress))
+            } else {
+                (composition.into_legacy_db()?, None)
+            };
             let db = Arc::new(db);
             let tag_tree_rewards_store = db.clone();
             
@@ -195,6 +223,12 @@ pub async fn run_startup_plonky2_scylla_realm_edge_node(config: &RealmEdgeStartC
                 0,
                 proof_verifier,
             );
+            let handler = match durable_user_update_ingress {
+                Some(installation) => {
+                    handler.install_durable_user_update_ingress(installation)?
+                }
+                None => handler,
+            };
             start_realm_edge_rpc_server::<N, _, _, _, _, _, _>(
                 handler,
                 &config.listen,

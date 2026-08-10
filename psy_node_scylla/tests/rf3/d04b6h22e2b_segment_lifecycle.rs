@@ -187,6 +187,17 @@ fn current_pipeline(
 pub(super) async fn activate_realm_writer(
     session: Arc<scylla::client::session::Session>,
 ) -> anyhow::Result<ActivatedRealmWriter> {
+    activate_realm_writer_with_profile(
+        session,
+        psy_node_core::queue::realm_user_update_verifier_profile::RealmUserUpdateVerifierProfileId::try_from_persisted([0xA5; 32])?,
+    )
+    .await
+}
+
+pub(super) async fn activate_realm_writer_with_profile(
+    session: Arc<scylla::client::session::Session>,
+    verifier_profile: psy_node_core::queue::realm_user_update_verifier_profile::RealmUserUpdateVerifierProfileId,
+) -> anyhow::Result<ActivatedRealmWriter> {
     for table in [
         "pending_id_to_pending_proc_id_table_u64_to_u128",
         "pending_id_to_pending_proc_id_table_u128_to_u64",
@@ -286,7 +297,7 @@ pub(super) async fn activate_realm_writer(
         observed,
         BranchExactWriterVerifierProfile::for_authority(
             fixture::authority(),
-            Some(psy_node_core::queue::realm_user_update_verifier_profile::RealmUserUpdateVerifierProfileId::try_from_persisted([0xA5; 32])?),
+            Some(verifier_profile),
         )?,
     )?;
     match ScyllaBranchExactWriterActivationExecutor::activate(

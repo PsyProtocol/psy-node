@@ -172,6 +172,7 @@ pub const RAW_SCYLLA_ACCESS_ALLOWLIST: &[RawScyllaAccessAllowance] = &[
     allow!("psy_node_scylla/tests/rf3/d04b6h22e3_cutover.rs", TestHarness),
     allow!("psy_node_scylla/tests/rf3/d04b6h23c4c1_queue_schema.rs", TestHarness),
     allow!("psy_node_scylla/tests/rf3/d04b6h23c4c2b3b2_claim_admission.rs", TestHarness),
+    allow!("psy_node_scylla/tests/rf3/d04b6h23c4c2b4e3_edge_handler_ingress.rs", TestHarness),
     allow!("psy_node_scylla/tests/rf3/d04b6h23c4c2b4d2_stream_provision.rs", TestHarness),
     allow!("psy_scratchpad/src/scylla/traits.rs", Scratchpad),
 ];

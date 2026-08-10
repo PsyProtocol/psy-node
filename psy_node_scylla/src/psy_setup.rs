@@ -2,11 +2,22 @@ use std::sync::Arc;
 
 use parth_core::{
     data::db::table::QDatabaseTableRoutingKey,
-    protocol::core_types::{Q256BitHash, QNetworkDatabaseTypes},
+    protocol::core_types::{
+        Q256BitHash, QNetworkDatabaseTypes, QNetworkTypesConfig,
+    },
 };
 use psy_node_core::{
+    queue::{
+        realm_user_update_ingress::{
+            RealmEdgeDurableIngressInstallation,
+            RealmUserUpdateArtifactFactory, RealmUserUpdateIngressPort,
+        },
+        realm_user_update_publish::GlobalUserTreeHeight,
+        realm_user_update_verifier_profile::RealmUserUpdateVerifierRegistry,
+    },
     psy_core_db::v3_implementation::full::PsyUnifiedCoreDatabaseStore,
     store::{
+        authority_commit::AuthorityTimestampKey,
         branch_exact_schema::AuthorityScope,
         realm_processor_startup::{
             authorize_realm_processor_startup, RealmProcessorFreshRunPermit,
@@ -17,6 +28,7 @@ use psy_node_core::{
         realm_processor_branch_exact_runtime::RealmBranchExactCommitRuntimeInstaller,
     },
 };
+use psy_node_nats::queue::NatsJetStreamClient;
 use rand::{rngs::OsRng, RngCore};
 
 use crate::{
@@ -24,8 +36,12 @@ use crate::{
     rollback::{
         BranchExactDeploymentNoTabletKeyspace, BranchExactSchemaSetupMode,
         BranchExactSchemaSetupRequest, BranchExactWriterAuthorityKey,
-        BranchExactWriterReadState, PendingQueueSidecarSetupMode,
+        BranchExactWriterActivationPlan, BranchExactWriterReadState,
+        PendingQueueSidecarSetupMode, ScyllaAuthorityLocalHeadStore,
         ScyllaBranchExactWriterLifecycleStore,
+        ScyllaRealmAuthorityObservationReader,
+        ScyllaRealmUserUpdateDurableRouter, ScyllaRealmUserUpdateIngress,
+        AuthorityLocalHeadNoTabletKeyspace,
     },
     tables::{
         blob::ScyllaBiDirectionalBlobToBlobTablePreparedStatements, bridge::{deposit_leaf::ScyllaBridgeDepositLeafPreparedStatements, next_index::ScyllaBridgeDepositNextIndexPreparedStatements}, counter::u64_counter::ScyllaU64ToU64CounterTablePreparedStatements, hash_to_many_ids::ScyllaHashToManyIdsTablePreparedStatements, imt::{imt_key_index::ScyllaIMTKeyIndexPreparedStatements, imt_leaf::ScyllaIMTLeafPreparedStatements, imt_next_append_index::ScyllaIMTNextAppendIndexPreparedStatements}, merkle::{ScyllaDoubleMerkleNodesPreparedStatements, ScyllaMerkleNodesPreparedStatements, ScyllaMerkleNodesZeroPreparedStatements}, object::{
@@ -438,10 +454,13 @@ pub async fn setup_realm_psy_scylla_database_store_with_branch_exact_schema<
     Ok(db)
 }
 
-#[derive(Debug)]
-enum ScyllaRealmEdgeStartupAuthorization {
+enum ScyllaRealmEdgeStartupAuthorization<Hash> {
     Disabled,
-    BranchExact(RealmProcessorFreshRunPermit),
+    BranchExact {
+        permit: RealmProcessorFreshRunPermit,
+        writer_plan: BranchExactWriterActivationPlan<Hash>,
+        preflight: Arc<dyn RealmProcessorStartupPreflightProvider>,
+    },
 }
 
 /// DB and its startup authorization remain one value until the caller reaches
@@ -449,7 +468,7 @@ enum ScyllaRealmEdgeStartupAuthorization {
 /// downgraded to the legacy handler.
 pub struct ScyllaRealmEdgeStartupComposition<N: QNetworkDatabaseTypes> {
     db: ScyllaUnifiedPsyStore<N, N::QHash, N::HasherBase>,
-    authorization: ScyllaRealmEdgeStartupAuthorization,
+    authorization: ScyllaRealmEdgeStartupAuthorization<N::QHash>,
 }
 
 impl<N: QNetworkDatabaseTypes> ScyllaRealmEdgeStartupComposition<N> {
@@ -461,18 +480,130 @@ impl<N: QNetworkDatabaseTypes> ScyllaRealmEdgeStartupComposition<N> {
     ) -> anyhow::Result<ScyllaUnifiedPsyStore<N, N::QHash, N::HasherBase>> {
         match self.authorization {
             ScyllaRealmEdgeStartupAuthorization::Disabled => Ok(self.db),
-            ScyllaRealmEdgeStartupAuthorization::BranchExact(permit) => anyhow::bail!(
-                "REALM_EDGE_BRANCH_EXACT_HANDLER_NOT_INTEGRATED: durable storage preflight passed (permit {}) but the handler route is not installed",
+            ScyllaRealmEdgeStartupAuthorization::BranchExact { permit, .. } => anyhow::bail!(
+                "REALM_EDGE_BRANCH_EXACT_MODE_MISMATCH: enabled composition (permit {}) cannot be extracted as a legacy DB",
                 hex::encode(permit.digest().as_bytes())
             ),
         }
     }
 }
 
+impl<N> ScyllaRealmEdgeStartupComposition<N>
+where
+    N: QNetworkTypesConfig + 'static,
+    N::F: Send + Sync + 'static,
+    N::QHash: Q256BitHash + Send + Sync + 'static,
+    N::HasherBase: Send + Sync + 'static,
+    N::ZKProof: 'static,
+    N::ZKVerifier: 'static,
+{
+    /// Consume the fresh startup permit and build the only high-level ingress
+    /// that may reach an enabled Realm Edge handler. Network, authority,
+    /// verifier profile and sidecar readiness all come from sealed/durable
+    /// storage evidence; callers can supply only concrete implementations.
+    pub async fn into_branch_exact_ingress(
+        self,
+        verifier_profiles: Arc<
+            RealmUserUpdateVerifierRegistry<N::ZKVerifier>,
+        >,
+        artifact_factory: Arc<
+            dyn RealmUserUpdateArtifactFactory<N::F, N::QHash>,
+        >,
+        nats: Arc<NatsJetStreamClient>,
+    ) -> anyhow::Result<(
+        ScyllaUnifiedPsyStore<N, N::QHash, N::HasherBase>,
+        RealmEdgeDurableIngressInstallation<N::F, N::QHash>,
+    )> {
+        let ScyllaRealmEdgeStartupAuthorization::BranchExact {
+            permit,
+            writer_plan,
+            preflight,
+        } = self.authorization
+        else {
+            anyhow::bail!(
+                "REALM_EDGE_BRANCH_EXACT_DISABLED: no sealed startup permit"
+            );
+        };
+        let expectation = permit.expectation();
+        if writer_plan.digest().as_bytes()
+            != expectation
+                .expected_writer_activation_digest()
+                .as_bytes()
+        {
+            return Err(RealmProcessorStartupError::WriterActivationMismatch.into());
+        }
+        let authority = AuthorityScope::Realm {
+            realm_id: expectation.realm_id(),
+            realm_sub_id: expectation.realm_sub_id(),
+        };
+        let network = expectation.network();
+        let active_verifier = writer_plan
+            .resolve_realm_verifier(verifier_profiles.as_ref())?;
+        let active_verifier_profile = active_verifier.profile_id();
+        if active_verifier.profile().network() != network
+            || active_verifier.profile().global_user_tree_height()
+                != N::GLOBAL_USER_TREE_HEIGHT
+        {
+            return Err(RealmProcessorStartupError::WriterActivationMismatch.into());
+        }
+
+        let ready = self.db.store.require_pending_queue_sidecar_ready()?;
+        let authority_head = Arc::new(
+            ScyllaAuthorityLocalHeadStore::prepare(
+                self.db.store.session.clone(),
+                AuthorityLocalHeadNoTabletKeyspace::try_new(
+                    self.db.store.no_tablet_keyspace.clone(),
+                )?,
+            )
+            .await?,
+        );
+        let authority_observations = Arc::new(
+            ScyllaRealmAuthorityObservationReader::<N::QHash>::try_new(
+                authority_head,
+                AuthorityTimestampKey::new(network, authority),
+            )?,
+        );
+        let router = ScyllaRealmUserUpdateDurableRouter::<
+            N::F,
+            N::QHash,
+            N::HasherBase,
+            N::ZKProof,
+            N::ZKVerifier,
+        >::prepare(
+            self.db.store.session.clone(),
+            network,
+            authority,
+            GlobalUserTreeHeight::try_new(N::GLOBAL_USER_TREE_HEIGHT)?,
+            N::REALM_GLOBAL_USER_TREE_HEIGHT,
+            active_verifier_profile,
+            verifier_profiles,
+            authority_observations,
+            ready,
+            nats,
+        )
+        .await?;
+        router.attest_startup().await?;
+        let ingress: Arc<dyn RealmUserUpdateIngressPort<N::F, N::QHash>> =
+            Arc::new(ScyllaRealmUserUpdateIngress::new(
+                router,
+                artifact_factory,
+            ));
+        let fresh = preflight.fresh_read(expectation).await?;
+        if fresh != permit.evidence() {
+            return Err(RealmProcessorStartupError::ConcurrentMutation.into());
+        }
+        let installation =
+            RealmEdgeDurableIngressInstallation::seal_with_startup_permit(
+                permit, ingress,
+            );
+        Ok((self.db, installation))
+    }
+}
+
 /// Default-off Realm Edge storage composition. Enabled mode performs a fresh,
 /// read-only full-composite preflight after live schema/backfill and queue
-/// sidecar authorization. It deliberately stops before constructing a handler
-/// or NATS publisher; h23c4c2b4 must consume the opaque token at that boundary.
+/// sidecar authorization. The returned value remains sealed until enabled
+/// callers consume it into a high-level, permit-authorized Handler installation.
 pub async fn setup_realm_edge_scylla_startup_composition<
     N: QNetworkDatabaseTypes,
 >(
@@ -571,7 +702,11 @@ where
     };
     Ok(ScyllaRealmEdgeStartupComposition {
         db,
-        authorization: ScyllaRealmEdgeStartupAuthorization::BranchExact(permit),
+        authorization: ScyllaRealmEdgeStartupAuthorization::BranchExact {
+            permit,
+            writer_plan: writer.plan().clone(),
+            preflight: provider,
+        },
     })
 }
 
@@ -743,7 +878,7 @@ mod realm_startup_composition_tests {
     use super::*;
 
     #[test]
-    fn edge_composition_is_default_off_full_preflight_and_non_serving() {
+    fn edge_composition_is_default_off_and_seals_only_high_level_ingress() {
         let source = include_str!("psy_setup.rs");
         let composition = source
             .split("pub struct ScyllaRealmEdgeStartupComposition")
@@ -759,8 +894,35 @@ mod realm_startup_composition_tests {
         assert!(composition.contains("into_legacy_db"));
         assert!(composition
             .contains("ScyllaRealmEdgeStartupAuthorization::Disabled => Ok(self.db)"));
-        assert!(composition
-            .contains("ScyllaRealmEdgeStartupAuthorization::BranchExact(permit)"));
+        assert!(composition.contains(
+            "ScyllaRealmEdgeStartupAuthorization::BranchExact { permit, .. }"
+        ));
+        assert!(composition.contains("into_branch_exact_ingress"));
+        assert!(composition.contains("preflight.fresh_read(expectation).await"));
+        assert!(composition.contains("fresh != permit.evidence()"));
+        assert!(composition.contains(
+            "RealmEdgeDurableIngressInstallation::seal_with_startup_permit"
+        ));
+        assert!(composition.contains(".resolve_realm_verifier(verifier_profiles.as_ref())"));
+        assert!(composition.contains("require_pending_queue_sidecar_ready"));
+        assert!(composition.contains("ScyllaRealmAuthorityObservationReader"));
+        assert!(composition.contains("ScyllaRealmUserUpdateDurableRouter"));
+        assert!(composition.contains("ScyllaRealmUserUpdateIngress::new"));
+        assert!(composition.contains(
+            "Arc<dyn RealmUserUpdateIngressPort<N::F, N::QHash>>"
+        ));
+        for forbidden_parameter in [
+            "network: NetworkId",
+            "authority: AuthorityScope",
+            "active_verifier_profile:",
+            "ready: Arc<PendingQueueSidecarReady>",
+            "session: Arc<Session>",
+        ] {
+            assert!(
+                !composition.contains(forbidden_parameter),
+                "sealed composition accepted caller authority {forbidden_parameter}"
+            );
+        }
 
         let factory = source
             .split("pub async fn setup_realm_edge_scylla_startup_composition")
@@ -780,6 +942,8 @@ mod realm_startup_composition_tests {
         assert!(factory.contains("PendingQueueSidecarSetupMode::RequireVerified"));
         assert!(factory.contains("prepare_realm_processor_startup_preflight"));
         assert!(factory.contains("authorize_realm_processor_startup"));
+        assert!(factory.contains("writer_plan: writer.plan().clone()"));
+        assert!(factory.contains("preflight: provider"));
         for forbidden in [
             "recover_realm_processor_startup",
             "prepare_realm_edge_durable_publisher",

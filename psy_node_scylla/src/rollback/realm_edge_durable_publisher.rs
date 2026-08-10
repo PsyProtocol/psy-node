@@ -339,6 +339,16 @@ impl<F: QFelt64, Hash: Q256BitHash> ScyllaRealmEdgeDurablePublisher<F, Hash> {
         )
     }
 
+    /// Resolve the current gathering generation through its immutable ledger
+    /// assignment and durable Provisioned transport binding. This is a
+    /// read-only startup check: it never creates a stream, reserves a
+    /// generation or falls back to the current active segment.
+    pub(crate) async fn attest_startup_route(
+        &self,
+    ) -> Result<RealmUserUpdatePublishAdmission<Hash>, RealmUserUpdatePublishError> {
+        self.admit_exact().await
+    }
+
     pub(crate) async fn revalidate_admission(
         &self,
         admission: &RealmUserUpdatePublishAdmission<Hash>,

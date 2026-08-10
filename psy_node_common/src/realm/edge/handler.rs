@@ -24,7 +24,7 @@ use psy_api_core::{
 };
 use psy_core::job::job_id::{ProvingJobCircuitType, QProvingJobDataID};
 use psy_data::{
-    node::node_proving_state::PsyNodeProvingState, proof_input::guta::end_cap_input::SubmitUserEndCapNonProofInput, protocol::chain_context::{AuthorityObservation, AuthorityScope, CanonicalResponse}, queue_items::realm_user_update::PsyRealmUserUpdateQueueItem, v1::{
+    node::node_proving_state::PsyNodeProvingState, proof_input::guta::end_cap_input::SubmitUserEndCapNonProofInput, protocol::{canonical_chain::NetworkId, chain_context::{AuthorityObservation, AuthorityScope, CanonicalResponse}}, queue_items::realm_user_update::PsyRealmUserUpdateQueueItem, v1::{
         common_api::PsyProoffMinerRewardProof,
         qdata::{
             checkpoint::{PQEDCheckpointGlobalStateRoots, PQEDCheckpointLeaf, QEDL2BlockState},
@@ -43,6 +43,7 @@ use psy_node_core::{
     queue::{
         ephemeral::QStandardEphemeralQueuePublisher,
         realm_user_update_ingress::{
+            RealmEdgeDurableIngressInstallation, RealmUserUpdateIngressError,
             RealmUserUpdateIngressPort, RealmUserUpdateStateFence,
         },
         worker_queue::QStandardWorkerQueueSubscriber,
@@ -241,12 +242,20 @@ impl<
     /// constructor remains default-off; once installed, the handler cannot
     /// access the low-level publisher and a durable error never falls back to
     /// the ephemeral queue.
-    pub fn with_durable_user_update_ingress(
+    pub fn install_durable_user_update_ingress(
         mut self,
-        ingress: Arc<dyn RealmUserUpdateIngressPort<N::F, N::QHash>>,
-    ) -> Self {
-        self.durable_user_update_ingress = Some(ingress);
-        self
+        installation: RealmEdgeDurableIngressInstallation<N::F, N::QHash>,
+    ) -> Result<Self, RealmUserUpdateIngressError> {
+        let network = NetworkId::try_from_chain_id(self.chain_id)
+            .map_err(|_| RealmUserUpdateIngressError::InstallationScopeMismatch)?;
+        let authority = AuthorityScope::Realm {
+            realm_id: self.realm_identifier.realm_id,
+            realm_sub_id: self.realm_identifier.realm_sub_id,
+        };
+        self.durable_user_update_ingress = Some(
+            installation.try_into_ingress_for(network, authority)?,
+        );
+        Ok(self)
     }
     pub fn user_belongs_to_realm(&self, user_id: u64) -> bool {
         let users_per_realm = 1u64 << N::REALM_GLOBAL_USER_TREE_HEIGHT;
