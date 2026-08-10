@@ -180,7 +180,10 @@ async fn core(keyspace: &str) -> anyhow::Result<ScyllaCoreStore<PHash, PoseidonH
     ScyllaCoreStore::new(7, 2, keyspace.to_owned(), &nodes).await
 }
 
-async fn target_table_count(session: &Session, keyspace: &str) -> anyhow::Result<usize> {
+async fn queue_table_count_including_lifecycle(
+    session: &Session,
+    keyspace: &str,
+) -> anyhow::Result<usize> {
     let data = session.query_unpaged(
         "SELECT table_name FROM system_schema.tables WHERE keyspace_name = ?",
         (keyspace,),
@@ -249,11 +252,16 @@ async fn d04b6h23c4c1_queue_schema_lifecycle_rf3_gate() -> anyhow::Result<()> {
 
     let exact_core = core(EXACT).await?;
     ensure!(matches!(exact_core.initialize_pending_queue_sidecar_setup(realm(), PendingQueueSidecarSetupMode::Disabled).await?, PendingQueueSidecarSetupOutcome::Disabled));
-    let disabled_zero_queue_tables = target_table_count(&session, EXACT).await? == 0;
+    let disabled_zero_queue_tables =
+        queue_table_count_including_lifecycle(&session, EXACT).await? == 0;
     ensure!(disabled_zero_queue_tables);
 
     let exact_receipt = PendingQueueSidecarDeploymentExecutor::deploy(session.clone(), keyspaces(EXACT)?).await?;
-    ensure!(target_table_count(&session, EXACT).await? == 15);
+    ensure!(
+        queue_table_count_including_lifecycle(&session, EXACT).await?
+            == PENDING_QUEUE_SIDECAR_TARGET_TABLE_COUNT + 1,
+        "expected 16 target tables plus one lifecycle table"
+    );
     let repeated = PendingQueueSidecarDeploymentExecutor::deploy(session.clone(), keyspaces(EXACT)?).await?;
     let idempotent_deploy = repeated == exact_receipt;
     ensure!(idempotent_deploy);
@@ -373,7 +381,7 @@ async fn d04b6h23c4c1_queue_schema_lifecycle_rf3_gate() -> anyhow::Result<()> {
     let report = H23c4c1Report {
         image: IMAGE,
         replication_factor: 3,
-        target_tables: 15,
+        target_tables: 16,
         lifecycle_tables: 1,
         disabled_zero_queue_tables,
         partial_retry_converged,
@@ -388,7 +396,7 @@ async fn d04b6h23c4c1_queue_schema_lifecycle_rf3_gate() -> anyhow::Result<()> {
         claim_direct_one_equal,
         repair_flush_compact: true,
         ready_ms,
-        qualification: "H23C4C2B3B1_ADDRESSABLE_CLAIM_RF3_PASSED",
+        qualification: "H23C4C2B4D2_SIDECAR_V9_RF3_PASSED",
     };
     let report_path = std::env::var("PSY_D04B6H23C4C1_REPORT_PATH")?;
     std::fs::write(&report_path, serde_json::to_vec_pretty(&report)?)?;

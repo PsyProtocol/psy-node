@@ -40,6 +40,10 @@ mod branch_exact_pending_orchestration;
 mod pending_generation_pipeline_store;
 mod pending_queue_artifact_store;
 mod pending_queue_segment_ledger;
+mod pending_queue_stream_provision;
+#[cfg(test)]
+#[path = "../../tests/rf3/d04b6h23c4c2b4d2_stream_provision.rs"]
+mod pending_queue_stream_provision_rf3;
 mod pending_queue_publish_store;
 #[allow(dead_code)]
 mod pending_queue_semantic_terminal;

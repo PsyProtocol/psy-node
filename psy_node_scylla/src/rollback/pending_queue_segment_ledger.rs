@@ -22,7 +22,7 @@ use psy_node_nats::recoverable_assignment::{
 };
 use psy_node_nats::recoverable_segment::{
     RecoverableNatsSegmentContractDigest, RecoverableNatsSegmentId,
-    RECOVERABLE_NATS_CAPACITY_HEADROOM_BYTES,
+    RecoverableNatsStreamSegment, RECOVERABLE_NATS_CAPACITY_HEADROOM_BYTES,
 };
 use scylla::{
     client::session::Session,
@@ -436,6 +436,13 @@ impl ScyllaPendingQueueSegmentLedgerStore {
         self.fingerprint
     }
 
+    pub(super) fn is_bound_to_keyspace(
+        &self,
+        keyspace: &BranchExactDeploymentNoTabletKeyspace,
+    ) -> bool {
+        self.fingerprint == store_fingerprint(keyspace, &PendingQueueSegmentLedgerQueries::new(keyspace))
+    }
+
     pub async fn read(
         &self,
         key: &PendingQueueSegmentLedgerKey,
@@ -516,6 +523,39 @@ impl ScyllaPendingQueueSegmentLedgerStore {
         // assigned-at revision. Requiring the whole row to remain unchanged
         // here would create a false outage under concurrent reservations.
         self.receipt_from_exact(&current, assignment)
+    }
+
+    /// Freshly prove that one exact physical segment remains a live member of
+    /// the durable ledger. This deliberately ignores unrelated ledger
+    /// revision advances caused by append-only assignments, while rejecting a
+    /// removed segment or any contract/key drift.
+    pub(super) async fn require_live_segment_exact(
+        &self,
+        key: &PendingQueueSegmentLedgerKey,
+        segment: &RecoverableNatsStreamSegment,
+    ) -> Result<(), PendingQueueSegmentLedgerStoreError> {
+        if segment.generation_key() != key.generation_key()
+            || segment.base_namespace() != key.base_namespace()
+        {
+            return Err(PendingQueueSegmentLedgerStoreError::LiveSegmentMismatch);
+        }
+        let PendingQueueSegmentLedgerReadState::Current(current) = self.read(key).await?
+        else {
+            return Err(PendingQueueSegmentLedgerStoreError::Uninitialized);
+        };
+        let live = current
+            .live_segments()
+            .iter()
+            .find(|live| live.segment_id() == segment.segment_id())
+            .ok_or(PendingQueueSegmentLedgerStoreError::SegmentMissing)?;
+        if live.contract_digest() != segment.digest()
+            || live.max_stream_bytes() != segment.retention().max_stream_bytes()
+            || current.generation_admission_budget_bytes()
+                != segment.retention().generation_admission_budget_bytes()
+        {
+            return Err(PendingQueueSegmentLedgerStoreError::LiveSegmentMismatch);
+        }
+        Ok(())
     }
 
     /// Freeze the exact assignment set currently owned by one segment. The
@@ -806,6 +846,7 @@ pub enum PendingQueueSegmentLedgerStoreError {
     AppliedStateMismatch,
     AssignmentMismatch,
     SegmentMissing,
+    LiveSegmentMismatch,
     SegmentStillAdmitting,
     ClosureAssignmentMismatch,
     ClosureBindingMismatch,

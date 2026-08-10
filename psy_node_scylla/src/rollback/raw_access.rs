@@ -93,6 +93,7 @@ pub const RAW_SCYLLA_ACCESS_ALLOWLIST: &[RawScyllaAccessAllowance] = &[
     allow!("psy_node_scylla/src/rollback/pending_queue_generation_terminal.rs", DurableControlAuthority),
     allow!("psy_node_scylla/src/rollback/pending_queue_segment_lifecycle.rs", DurableControlAuthority),
     allow!("psy_node_scylla/src/rollback/pending_queue_segment_ledger.rs", DurableControlAuthority),
+    allow!("psy_node_scylla/src/rollback/pending_queue_stream_provision.rs", DurableControlAuthority),
     allow!("psy_node_scylla/src/rollback/pending_queue_semantic_aggregate.rs", DurableControlAuthority),
     allow!("psy_node_scylla/src/rollback/pending_queue_sidecar_lifecycle.rs", DurableControlAuthority),
     allow!("psy_node_scylla/src/rollback/pending_queue_sidecar_schema.rs", DurableControlAuthority),
@@ -106,6 +107,8 @@ pub const RAW_SCYLLA_ACCESS_ALLOWLIST: &[RawScyllaAccessAllowance] = &[
     allow!("psy_node_scylla/src/rollback/realm_user_update_claim_store.rs", DurableControlAuthority),
     allow!("psy_node_scylla/src/rollback/realm_user_update_admission_store.rs", DurableControlAuthority),
     allow!("psy_node_scylla/src/rollback/realm_user_update_dependency_store.rs", DurableControlAuthority),
+    allow!("psy_node_scylla/src/rollback/realm_user_update_durable_consumer.rs", DurableControlAuthority),
+    allow!("psy_node_scylla/src/rollback/realm_user_update_ingress.rs", DurableControlAuthority),
     allow!("psy_node_scylla/src/rollback/realm_user_update_router.rs", DurableControlAuthority),
     allow!("psy_node_scylla/src/rollback/reward_tag_tree.rs", RollbackPrototypeAdapter),
     allow!("psy_node_scylla/src/rollback/rollback_admission.rs", DurableControlAuthority),
@@ -169,6 +172,7 @@ pub const RAW_SCYLLA_ACCESS_ALLOWLIST: &[RawScyllaAccessAllowance] = &[
     allow!("psy_node_scylla/tests/rf3/d04b6h22e3_cutover.rs", TestHarness),
     allow!("psy_node_scylla/tests/rf3/d04b6h23c4c1_queue_schema.rs", TestHarness),
     allow!("psy_node_scylla/tests/rf3/d04b6h23c4c2b3b2_claim_admission.rs", TestHarness),
+    allow!("psy_node_scylla/tests/rf3/d04b6h23c4c2b4d2_stream_provision.rs", TestHarness),
     allow!("psy_scratchpad/src/scylla/traits.rs", Scratchpad),
 ];
 

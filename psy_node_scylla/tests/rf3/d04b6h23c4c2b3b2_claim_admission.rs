@@ -1580,7 +1580,7 @@ async fn d04b6h23c4c2b3b2_claim_admission_close_rf3_gate(
         image: IMAGE,
         replication_factor: 3,
         schema_version: PENDING_QUEUE_SIDECAR_SCHEMA_VERSION,
-        target_tables: 15,
+        target_tables: PENDING_QUEUE_SIDECAR_TARGET_TABLE_COUNT,
         total_claims: CLAIMS,
         claim_ms,
         close_ms,
