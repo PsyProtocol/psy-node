@@ -13,6 +13,17 @@ set -euo pipefail
 # Usage:
 #   ./e2e/bridge-e2e.sh
 #
+# The test wallet must be independent from the bridge relayer's anvil #0
+# identity. Use a non-relayer devnet wallet such as anvil account #1.
+#
+# Required env:
+#   USER_PK               private key for the test wallet
+#
+# Supported env overrides:
+#   USER_ADDR             matching address; derived from USER_PK when omitted
+#   MAX_WAIT_SECS         max seconds for relayer prove/claim waits (default 1800)
+#   POLL_INTERVAL         seconds between poll checks (default 15)
+#
 # What it tests:
 #   1. Register user
 #   2. Mint PSY for L2 fees
@@ -27,8 +38,17 @@ set -euo pipefail
 RPC_URL="${L1_RPC_URL:-http://127.0.0.1:8545}"
 SERVICES_URL="${SERVICES_URL:-http://127.0.0.1:3000}"
 RPC_CONFIG="psy-genesis/config.json"
-USER_PK="${USER_PK:-0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80}"
-USER_ADDR="${USER_ADDR:-0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266}"
+USER_PK="${USER_PK:?USER_PK is required; use a non-relayer devnet wallet such as anvil account #1}"
+DERIVED_USER_ADDR="$(cast wallet address "$USER_PK")"
+USER_ADDR="${USER_ADDR:-$DERIVED_USER_ADDR}"
+if [[ "${USER_ADDR,,}" != "${DERIVED_USER_ADDR,,}" ]]; then
+  echo "USER_ADDR does not match USER_PK" >&2
+  exit 1
+fi
+if [[ "${USER_ADDR,,}" == "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266" ]]; then
+  echo "USER_PK must not use the bridge relayer's anvil #0 identity" >&2
+  exit 1
+fi
 DEPOSIT_AMOUNT="${DEPOSIT_AMOUNT:-2000}"  # 0.002 USDT (6 decimals)
 WITHDRAW_AMOUNT="${WITHDRAW_AMOUNT:-1000}"  # 0.001 USDT (6 decimals)
 MINT_AMOUNT="${MINT_AMOUNT:-10000000000}"  # L2 PSY gas budget
@@ -36,8 +56,9 @@ R0=12345
 R1=67890
 NOTE_SECRET="${NOTE_SECRET:-$(python3 -c "import secrets; print(','.join(str(secrets.randbelow(2**64)) for _ in range(4)))")}"
 NULLIFIER_SECRET="${NULLIFIER_SECRET:-$(python3 -c "import secrets; print(','.join(str(secrets.randbelow(2**64)) for _ in range(4)))")}"
-MAX_WAIT_SECS=300
-POLL_INTERVAL=15
+# Relayer claim path can take up to 1800s (runbook); keep default conservative.
+MAX_WAIT_SECS="${MAX_WAIT_SECS:-1800}"
+POLL_INTERVAL="${POLL_INTERVAL:-15}"
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 log() { echo "[$(date +%H:%M:%S)] $*"; }
