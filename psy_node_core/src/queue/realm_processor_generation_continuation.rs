@@ -69,6 +69,16 @@ impl RealmProcessorGenerationContinuationPhase {
 pub struct RealmProcessorDeferredCarryoverDigest([u8; 32]);
 
 impl RealmProcessorDeferredCarryoverDigest {
+    pub fn try_new(
+        bytes: [u8; 32],
+    ) -> Result<Self, RealmProcessorGenerationContinuationError> {
+        if bytes == [0; 32] {
+            Err(RealmProcessorGenerationContinuationError::EmptyDigest)
+        } else {
+            Ok(Self(bytes))
+        }
+    }
+
     pub fn from_semantic(
         semantic: &RealmProcessorSemanticOutput,
     ) -> Result<Self, RealmProcessorGenerationContinuationError> {
@@ -128,6 +138,30 @@ impl RealmProcessorApplicationContinuation {
             has_application_work: semantic.has_application_work(),
             deferred_count,
             deferred_digest: RealmProcessorDeferredCarryoverDigest::from_semantic(semantic)?,
+        })
+    }
+
+    /// Rebuild the read-only commitment from an immutable storage row.
+    ///
+    /// This constructor does not grant archive, terminal, writer, head, or
+    /// rotation authority. Storage remains responsible for exact readback and
+    /// for minting any later affine capability.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_from_committed_parts(
+        archive_slot: RealmProcessorApplicationArchiveSlot,
+        archive_digest: RealmProcessorApplicationArchiveDigest,
+        semantic_digest: RealmProcessorSemanticOutputDigest,
+        has_application_work: bool,
+        deferred_count: u32,
+        deferred_digest: RealmProcessorDeferredCarryoverDigest,
+    ) -> Result<Self, RealmProcessorGenerationContinuationError> {
+        Ok(Self {
+            archive_slot,
+            archive_digest,
+            semantic_digest,
+            has_application_work,
+            deferred_count,
+            deferred_digest,
         })
     }
 

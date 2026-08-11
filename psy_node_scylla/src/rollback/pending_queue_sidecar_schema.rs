@@ -1,7 +1,6 @@
 //! Exact, default-off schema boundary for the recoverable Realm queue.
 //!
-//! The eighteen target tables have production-shaped adapters and are qualified
-//! evidence, but historically only tests created them one by one.  This module
+//! The twenty target tables have production-shaped, default-off adapters. This module
 //! gives deployment tooling one deterministic manifest/materializer and gives
 //! node startup an inspect-only capability.  Ordinary setup performs no queue
 //! CQL.  Partial materialization is retained and completed idempotently; this
@@ -42,6 +41,14 @@ use super::{
         REALM_PROCESSOR_APPLICATION_ARCHIVE_FRAGMENT_TABLE,
         REALM_PROCESSOR_APPLICATION_ARCHIVE_HEADER_TABLE,
     },
+    realm_processor_deferred_carryover::{
+        ScyllaRealmProcessorDeferredCarryoverStore,
+        REALM_PROCESSOR_DEFERRED_CARRYOVER_TABLE,
+    },
+    realm_processor_generation_terminal::{
+        ScyllaRealmProcessorGenerationTerminalStore,
+        REALM_PROCESSOR_GENERATION_TERMINAL_TABLE,
+    },
     BranchExactDeploymentNoTabletKeyspace, CqlKeyspaceName,
     PendingQueueArtifactControlKeyspace, PendingQueueArtifactDataKeyspace,
     PendingQueueArtifactKeyspaces, PendingQueuePublishDataKeyspace,
@@ -60,13 +67,13 @@ use super::{
 #[cfg(test)]
 use super::RETIRED_REALM_USER_UPDATE_CLAIM_V1_TABLE;
 
-// v11 adds the Realm application-semantic header and fragment archive. A v10
-// VERIFIED receipt intentionally has a different deployment slot and cannot
-// authorize this stronger serving contract.
-pub const PENDING_QUEUE_SIDECAR_SCHEMA_VERSION: u16 = 11;
-pub const PENDING_QUEUE_SIDECAR_TARGET_TABLE_COUNT: usize = 18;
+// v12 adds the Realm predecessor terminal/rotation intent and successor
+// deferred-carryover locator. A v11 VERIFIED receipt intentionally has a
+// different deployment slot and cannot authorize this stronger contract.
+pub const PENDING_QUEUE_SIDECAR_SCHEMA_VERSION: u16 = 12;
+pub const PENDING_QUEUE_SIDECAR_TARGET_TABLE_COUNT: usize = 20;
 const FINGERPRINT_DOMAIN: &[u8] =
-    b"psy/rollback/pending-queue-sidecar-schema/v11";
+    b"psy/rollback/pending-queue-sidecar-schema/v12";
 const INSPECT_COLUMNS_CQL: &str = "SELECT column_name, type, kind, position, clustering_order FROM system_schema.columns WHERE keyspace_name = ? AND table_name = ?";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -90,6 +97,8 @@ pub enum PendingQueueSidecarPhysicalTable {
     StreamProvisionBinding = 16,
     RealmApplicationArchiveHeader = 17,
     RealmApplicationArchiveFragment = 18,
+    RealmGenerationTerminalIntent = 19,
+    RealmDeferredCarryover = 20,
 }
 
 impl PendingQueueSidecarPhysicalTable {
@@ -112,6 +121,8 @@ impl PendingQueueSidecarPhysicalTable {
         Self::StreamProvisionBinding,
         Self::RealmApplicationArchiveHeader,
         Self::RealmApplicationArchiveFragment,
+        Self::RealmGenerationTerminalIntent,
+        Self::RealmDeferredCarryover,
     ];
 
     pub const fn table_name(self) -> &'static str {
@@ -134,6 +145,8 @@ impl PendingQueueSidecarPhysicalTable {
             Self::StreamProvisionBinding => PENDING_QUEUE_STREAM_PROVISION_TABLE,
             Self::RealmApplicationArchiveHeader => REALM_PROCESSOR_APPLICATION_ARCHIVE_HEADER_TABLE,
             Self::RealmApplicationArchiveFragment => REALM_PROCESSOR_APPLICATION_ARCHIVE_FRAGMENT_TABLE,
+            Self::RealmGenerationTerminalIntent => REALM_PROCESSOR_GENERATION_TERMINAL_TABLE,
+            Self::RealmDeferredCarryover => REALM_PROCESSOR_DEFERRED_CARRYOVER_TABLE,
         }
     }
 
@@ -296,7 +309,7 @@ const fn regular(
     PendingQueueSidecarColumnSpec { table, name, cql_type, kind: PendingQueueSidecarColumnKind::Regular, position: -1, clustering_order: PendingQueueSidecarClusteringOrder::None }
 }
 
-pub const PENDING_QUEUE_SIDECAR_EXPECTED_COLUMNS: [PendingQueueSidecarColumnSpec; 96] = [
+pub const PENDING_QUEUE_SIDECAR_EXPECTED_COLUMNS: [PendingQueueSidecarColumnSpec; 102] = [
     pk(PendingQueueSidecarPhysicalTable::Pipeline, "network_chain_id", "bigint", 0),
     pk(PendingQueueSidecarPhysicalTable::Pipeline, "authority_kind", "tinyint", 1),
     pk(PendingQueueSidecarPhysicalTable::Pipeline, "realm_id", "bigint", 2),
@@ -393,6 +406,12 @@ pub const PENDING_QUEUE_SIDECAR_EXPECTED_COLUMNS: [PendingQueueSidecarColumnSpec
     regular(PendingQueueSidecarPhysicalTable::RealmApplicationArchiveFragment, "application_bytes", "bigint"),
     regular(PendingQueueSidecarPhysicalTable::RealmApplicationArchiveFragment, "payload", "blob"),
     regular(PendingQueueSidecarPhysicalTable::RealmApplicationArchiveFragment, "payload_digest", "blob"),
+    pk(PendingQueueSidecarPhysicalTable::RealmGenerationTerminalIntent, "terminal_slot", "blob", 0),
+    regular(PendingQueueSidecarPhysicalTable::RealmGenerationTerminalIntent, "revision", "bigint"),
+    regular(PendingQueueSidecarPhysicalTable::RealmGenerationTerminalIntent, "terminal_payload", "blob"),
+    pk(PendingQueueSidecarPhysicalTable::RealmDeferredCarryover, "successor_slot", "blob", 0),
+    regular(PendingQueueSidecarPhysicalTable::RealmDeferredCarryover, "revision", "bigint"),
+    regular(PendingQueueSidecarPhysicalTable::RealmDeferredCarryover, "carryover_payload", "blob"),
 ];
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -552,6 +571,18 @@ impl PendingQueueSidecarSchemaMaterializer {
         )
         .await
         .map_err(sidecar)?;
+        ScyllaRealmProcessorGenerationTerminalStore::create_schema(
+            session,
+            &keyspaces.control,
+        )
+        .await
+        .map_err(sidecar)?;
+        ScyllaRealmProcessorDeferredCarryoverStore::create_schema(
+            session,
+            &keyspaces.control,
+        )
+        .await
+        .map_err(sidecar)?;
         let PendingQueueSidecarSchemaInspection::Exact { fingerprint } = Self::inspect_schema(session, keyspaces).await? else {
             return Err(PendingQueueSidecarSchemaError::DidNotConverge);
         };
@@ -590,13 +621,13 @@ mod tests {
     }
 
     #[test]
-    fn exact_manifest_is_eighteen_unique_tables_with_stable_placement() {
-        assert_eq!(PENDING_QUEUE_SIDECAR_SCHEMA_VERSION, 11);
-        assert_eq!(PendingQueueSidecarPhysicalTable::ALL.len(), 18);
+    fn exact_manifest_is_twenty_unique_tables_with_stable_placement() {
+        assert_eq!(PENDING_QUEUE_SIDECAR_SCHEMA_VERSION, 12);
+        assert_eq!(PendingQueueSidecarPhysicalTable::ALL.len(), 20);
         let names = PendingQueueSidecarPhysicalTable::ALL.iter().map(|table| table.table_name()).collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(names.len(), 18);
+        assert_eq!(names.len(), 20);
         assert_eq!(PendingQueueSidecarPhysicalTable::ALL.iter().filter(|table| table.keyspace_kind() == PendingQueueSidecarKeyspaceKind::StandardData).count(), 4);
-        assert_eq!(PendingQueueSidecarPhysicalTable::ALL.iter().filter(|table| table.keyspace_kind() == PendingQueueSidecarKeyspaceKind::NoTabletControl).count(), 14);
+        assert_eq!(PendingQueueSidecarPhysicalTable::ALL.iter().filter(|table| table.keyspace_kind() == PendingQueueSidecarKeyspaceKind::NoTabletControl).count(), 16);
         assert!(!names.contains(RETIRED_V1_PIPELINE_TABLE));
         assert!(!names.contains(RETIRED_REALM_USER_UPDATE_CLAIM_V1_TABLE));
         assert_ne!(pending_queue_sidecar_schema_fingerprint().as_bytes(), &[0; 32]);
@@ -608,6 +639,20 @@ mod tests {
         let mut missing = exact_columns();
         missing.retain(|column| column.table != PendingQueueSidecarPhysicalTable::ConsumerGate);
         assert!(matches!(inspect_pending_queue_sidecar_columns(missing, false).unwrap(), PendingQueueSidecarSchemaInspection::Partial { .. }));
+        let mut old_v11 = exact_columns();
+        old_v11.retain(|column| !matches!(
+            column.table,
+            PendingQueueSidecarPhysicalTable::RealmGenerationTerminalIntent
+                | PendingQueueSidecarPhysicalTable::RealmDeferredCarryover
+        ));
+        assert!(matches!(
+            inspect_pending_queue_sidecar_columns(old_v11, false).unwrap(),
+            PendingQueueSidecarSchemaInspection::Partial { missing, .. }
+                if missing == vec![
+                    PendingQueueSidecarPhysicalTable::RealmGenerationTerminalIntent,
+                    PendingQueueSidecarPhysicalTable::RealmDeferredCarryover,
+                ]
+        ));
         let mut old_v10 = exact_columns();
         old_v10.retain(|column| !matches!(
             column.table,

@@ -495,9 +495,9 @@ mod tests {
         assert_eq!(first, second);
         let bytes = first.to_canonical_bytes();
         assert_eq!(StoredPendingQueueSidecarDeployment::decode_selected(first.slot, 1, &bytes).unwrap(), first);
-        let mut old_v10 = bytes.clone();
-        old_v10[19..21].copy_from_slice(&10_u16.to_be_bytes());
-        assert_eq!(StoredPendingQueueSidecarDeployment::decode_selected(first.slot, 1, &old_v10), Err(PendingQueueSidecarLifecycleError::UnknownSchemaVersion));
+        let mut old_v11 = bytes.clone();
+        old_v11[19..21].copy_from_slice(&11_u16.to_be_bytes());
+        assert_eq!(StoredPendingQueueSidecarDeployment::decode_selected(first.slot, 1, &old_v11), Err(PendingQueueSidecarLifecycleError::UnknownSchemaVersion));
         let mut tampered = bytes.clone(); tampered[20] ^= 1;
         assert!(StoredPendingQueueSidecarDeployment::decode_selected(first.slot, 1, &tampered).is_err());
         let mut trailing = bytes; trailing.push(0);
@@ -505,15 +505,17 @@ mod tests {
     }
 
     #[test]
-    fn schema_upgrade_uses_a_new_partition_and_preserves_v10_identity() {
+    fn schema_upgrade_slot_differs_from_a_synthetic_v11_identity() {
         let keyspaces = keyspaces();
         let mut old = Sha256::new();
-        old.update(b"psy/rollback/pending-queue-sidecar-slot/v1");
+        old.update(b"psy/rollback/pending-queue-sidecar-slot/v2");
+        old.update(11_u16.to_be_bytes());
+        old.update([11; 32]);
         update_len(&mut old, keyspaces.data().as_str().as_bytes());
         update_len(&mut old, keyspaces.control().as_str().as_bytes());
-        let old_v10_slot: [u8; 32] = old.finalize().into();
+        let old_v11_slot: [u8; 32] = old.finalize().into();
         let current = PendingQueueSidecarDeploymentSlot::for_keyspaces(&keyspaces);
-        assert_ne!(current.as_bytes(), &old_v10_slot);
+        assert_ne!(current.as_bytes(), &old_v11_slot);
 
         let materializing = StoredPendingQueueSidecarDeployment::materializing(keyspaces);
         assert_eq!(materializing.slot(), current);
