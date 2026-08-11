@@ -247,6 +247,12 @@ struct E3Report {
     nats_leader_before: String,
     nats_leader_after: String,
     nats_leader_failover: bool,
+    nats_surviving_follower_current_lag_zero: bool,
+    nats_message_envelope_count: u64,
+    nats_message_envelope_dataset_digest: String,
+    deferred_actor_nats_message_count_before: u64,
+    deferred_actor_nats_message_count_after: u64,
+    deferred_actor_nats_duplicate_delta: u64,
     second_publish_messages: u64,
     startup_restart_attested: bool,
     restart_retry_messages: u64,
@@ -1049,6 +1055,80 @@ async fn stream_messages(
         "timed out reading JetStream message count for {stream_name}: {}",
         last_error.as_deref().unwrap_or("no response")
     )
+}
+
+#[derive(Debug)]
+struct NatsMessageEnvelopeDataset {
+    message_count: u64,
+    dataset_digest: String,
+}
+
+async fn nats_message_envelope_dataset(
+    context: &jetstream::Context,
+    stream_name: &str,
+) -> anyhow::Result<NatsMessageEnvelopeDataset> {
+    let stream = context.get_stream(stream_name).await?;
+    let state = stream.get_info().await?.state;
+    let mut hasher = Sha256::new();
+    hasher.update(b"psy/rf3/d04b6h23c4c4b4c2/nats-message-envelope-dataset/v1");
+    hasher.update(state.messages.to_be_bytes());
+    hasher.update(state.first_sequence.to_be_bytes());
+    hasher.update(state.last_sequence.to_be_bytes());
+
+    let mut observed = 0_u64;
+    if state.messages != 0 {
+        for sequence in state.first_sequence..=state.last_sequence {
+            let message = stream.get_raw_message(sequence).await?;
+            ensure!(
+                message.sequence == sequence,
+                "JetStream returned sequence {} for requested sequence {sequence}",
+                message.sequence,
+            );
+            hasher.update(message.sequence.to_be_bytes());
+            let subject = message.subject.as_ref().as_bytes();
+            hasher.update((subject.len() as u64).to_be_bytes());
+            hasher.update(subject);
+
+            let mut headers = message
+                .headers
+                .iter()
+                .map(|(name, values)| {
+                    let mut values = values
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>();
+                    values.sort();
+                    (name.to_string(), values)
+                })
+                .collect::<Vec<_>>();
+            headers.sort();
+            hasher.update((headers.len() as u64).to_be_bytes());
+            for (name, values) in headers {
+                hasher.update((name.len() as u64).to_be_bytes());
+                hasher.update(name.as_bytes());
+                hasher.update((values.len() as u64).to_be_bytes());
+                for value in values {
+                    hasher.update((value.len() as u64).to_be_bytes());
+                    hasher.update(value.as_bytes());
+                }
+            }
+
+            hasher.update((message.payload.len() as u64).to_be_bytes());
+            hasher.update(&message.payload);
+            observed = observed
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("NATS envelope count overflow"))?;
+        }
+    }
+    ensure!(
+        observed == state.messages,
+        "JetStream state reported {} messages but exact raw scan observed {observed}",
+        state.messages,
+    );
+    Ok(NatsMessageEnvelopeDataset {
+        message_count: observed,
+        dataset_digest: hex::encode(hasher.finalize()),
+    })
 }
 
 async fn end_cap_input(
@@ -1947,6 +2027,8 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
     let mut handoff_recovery_without_actor_rerun = false;
     let mut successor_handoff_revision = 0_u64;
     let mut actor_handoff_during_one_replica_offline = false;
+    let mut deferred_actor_nats_message_count_before = 0_u64;
+    let mut expected_nats_after_deferred_actor = 0_u64;
     let (durable_capture_items, durable_capture_empty_poll_not_close) =
         if let Some(owner) = branch_exact_commit_owner.as_mut() {
             // Edge always publishes to the gathering generation. Retire the
@@ -2806,6 +2888,8 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                                 segment.stream_name(),
                             )
                             .await?;
+                            deferred_actor_nats_message_count_before =
+                                successor_nats_before;
                             for (index, material) in
                                 successor_external_materials.iter().enumerate()
                             {
@@ -2871,9 +2955,10 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                             successor_publish_store
                                 .publish_and_commit(&successor_assignment, seal)
                                 .await?;
+                            expected_nats_after_deferred_actor = successor_nats_before + 4;
                             ensure!(
                                 stream_messages(&jetstream, segment.stream_name()).await?
-                                    == successor_nats_before + 4
+                                    == expected_nats_after_deferred_actor
                             );
                             external_generation_items = 3;
                             external_generation_nonempty_rf3 = true;
@@ -3626,6 +3711,18 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
         );
     }
 
+    let nats_envelope_dataset =
+        nats_message_envelope_dataset(&jetstream, segment.stream_name()).await?;
+    let deferred_actor_nats_duplicate_delta = if exercise_deferred_actor_archive {
+        nats_envelope_dataset
+            .message_count
+            .checked_sub(expected_nats_after_deferred_actor)
+            .ok_or_else(|| anyhow::anyhow!("deferred actor NATS message count regressed"))?
+    } else {
+        0
+    };
+    ensure!(deferred_actor_nats_duplicate_delta == 0);
+
     let report = E3Report {
         scylla_image: IMAGE,
         scylla_replication_factor: 3,
@@ -3650,6 +3747,14 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
         nats_leader_before: leader_before.clone(),
         nats_leader_after: leader_after.clone(),
         nats_leader_failover: leader_before != leader_after,
+        // wait_for_stream_leader only returns after five stable observations
+        // with a surviving current follower at lag zero.
+        nats_surviving_follower_current_lag_zero: true,
+        nats_message_envelope_count: nats_envelope_dataset.message_count,
+        nats_message_envelope_dataset_digest: nats_envelope_dataset.dataset_digest,
+        deferred_actor_nats_message_count_before,
+        deferred_actor_nats_message_count_after: expected_nats_after_deferred_actor,
+        deferred_actor_nats_duplicate_delta,
         second_publish_messages,
         startup_restart_attested: true,
         restart_retry_messages,

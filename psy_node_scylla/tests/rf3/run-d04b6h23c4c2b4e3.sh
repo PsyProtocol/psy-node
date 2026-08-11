@@ -291,6 +291,12 @@ jq -e \
       and .deferred_input_rf3 == true
       and .actor_retry_socket_response_loss_injected == false
       and .full_processor_rf3_runtime == false
+      and .nats_surviving_follower_current_lag_zero == true
+      and .deferred_actor_nats_message_count_before > 0
+      and .deferred_actor_nats_message_count_after == (.deferred_actor_nats_message_count_before + 4)
+      and .nats_message_envelope_count == .deferred_actor_nats_message_count_after
+      and (.nats_message_envelope_dataset_digest | test("^[0-9a-f]{64}$"))
+      and .deferred_actor_nats_duplicate_delta == 0
     else
       .sidecar_v13_rf3_inherited == false
       and .v13_ready_receipt_consumed == false
@@ -325,6 +331,12 @@ jq -e \
       and .deferred_input_rf3 == false
       and .actor_retry_socket_response_loss_injected == false
       and .full_processor_rf3_runtime == false
+      and .nats_surviving_follower_current_lag_zero == true
+      and .nats_message_envelope_count == .restart_retry_messages
+      and (.nats_message_envelope_dataset_digest | test("^[0-9a-f]{64}$"))
+      and .deferred_actor_nats_message_count_before == 0
+      and .deferred_actor_nats_message_count_after == 0
+      and .deferred_actor_nats_duplicate_delta == 0
     end
   )
   and (
