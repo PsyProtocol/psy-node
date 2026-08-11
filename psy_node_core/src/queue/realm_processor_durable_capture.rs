@@ -22,6 +22,10 @@ use super::recoverable_ephemeral::{
 use super::realm_processor_deferred_actor_input::{
     RealmProcessorDeferredActorInput, RealmProcessorDeferredActorInputOutcome,
 };
+use super::realm_processor_external_dependency_input::{
+    RealmProcessorExternalDependencyCommitment,
+    RealmProcessorQualifiedExternalActorInput,
+};
 use super::realm_processor_generation_continuation::RealmProcessorGenerationContinuation;
 use super::realm_processor_semantic_output::RealmProcessorSemanticOutput;
 
@@ -322,6 +326,14 @@ pub trait RealmProcessorDurableCapturePort: Send {
         &mut self,
     ) -> Result<Option<RealmProcessorDurableCapturedGeneration>, RealmProcessorDurableCaptureError>;
 
+    /// Join the complete closed transport generation to the exact dependency
+    /// commitment selected from durable predecessor evidence. The backend
+    /// consumes this route once; callers cannot provide dependency payloads.
+    async fn qualify_external_actor_input(
+        &mut self,
+        generation: RealmProcessorDurableCapturedGeneration,
+    ) -> Result<RealmProcessorQualifiedExternalActorInput, RealmProcessorDurableCaptureError>;
+
     /// Recover a first application handoff whose pipeline CAS was already
     /// committed before the caller received its response.  `None` means the
     /// exact pipeline is still in `Sealing(close)` and normal capture may
@@ -339,6 +351,22 @@ pub trait RealmProcessorDurableCapturePort: Send {
         &mut self,
         semantic: RealmProcessorSemanticOutput,
     ) -> Result<RealmProcessorApplicationHandoffObservation, RealmProcessorDurableCaptureError>;
+}
+
+/// Driver-independent boundary for rebuilding the exact external actor input
+/// committed by a predecessor terminal. Implementations must select all
+/// durable rows themselves and join them to the supplied closed transport
+/// generation; callers cannot provide dependency payloads or a projection.
+///
+/// This port is read-only and grants no actor, writer, terminal, head, or
+/// pipeline mutation authority.
+#[async_trait]
+pub trait RealmProcessorExternalDependencyLoader: Send + Sync {
+    async fn load_committed_exact(
+        &self,
+        generation: RealmProcessorDurableCapturedGeneration,
+        expected: RealmProcessorExternalDependencyCommitment,
+    ) -> Result<RealmProcessorQualifiedExternalActorInput, RealmProcessorDurableCaptureError>;
 }
 
 /// Storage-owned factory installed by the same startup composition as the

@@ -26,6 +26,7 @@ use crate::queue::{
     realm_processor_deferred_actor_input::{
         RealmProcessorDeferredActorInput, RealmProcessorDeferredActorInputOutcome,
     },
+    realm_processor_external_dependency_input::RealmProcessorQualifiedExternalActorInput,
     realm_processor_generation_continuation::RealmProcessorGenerationContinuation,
     realm_processor_continuation_restart::{
         RealmProcessorContinuationRestartFactory,
@@ -436,6 +437,16 @@ impl RealmBranchExactDurableCapture<'_> {
         self.port.replay_complete_generation().await
     }
 
+    /// Rebuilds and joins the exact external dependency bytes selected by the
+    /// predecessor terminal. The closed transport generation is consumed so
+    /// it cannot be paired with another dependency projection.
+    pub async fn qualify_external_actor_input(
+        &mut self,
+        generation: RealmProcessorDurableCapturedGeneration,
+    ) -> Result<RealmProcessorQualifiedExternalActorInput, RealmProcessorDurableCaptureError> {
+        self.port.qualify_external_actor_input(generation).await
+    }
+
     /// Recovers the exact first application handoff when the pipeline CAS
     /// committed before the Processor received its response.
     pub async fn recover_application_handoff(
@@ -657,6 +668,14 @@ mod tests {
             RealmProcessorDurableCaptureError,
         > {
             Ok(None)
+        }
+
+        async fn qualify_external_actor_input(
+            &mut self,
+            _generation: RealmProcessorDurableCapturedGeneration,
+        ) -> Result<RealmProcessorQualifiedExternalActorInput, RealmProcessorDurableCaptureError>
+        {
+            Err(RealmProcessorDurableCaptureError::IdentityMismatch)
         }
 
         async fn recover_application_handoff(

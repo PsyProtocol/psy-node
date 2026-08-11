@@ -1576,9 +1576,12 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
         let provider = Arc::new(
             activated
                 .core
-                .prepare_realm_processor_startup_provider_with_capture(
+                .prepare_realm_processor_startup_provider_with_capture::<
+                    <N as parth_core::protocol::core_types::QNetworkHashTypes>::F,
+                >(
                     expectation,
                     Arc::clone(&nats),
+                    GlobalUserTreeHeight::try_new(N::GLOBAL_USER_TREE_HEIGHT)?,
                 )
                 .await?,
         );

@@ -70,6 +70,10 @@ impl PersistedRealmProcessorExternalDependencyProjection {
     pub(super) fn projection(&self) -> &RealmProcessorExternalDependencyProjection {
         &self.projection
     }
+
+    pub(super) fn into_projection(self) -> RealmProcessorExternalDependencyProjection {
+        self.projection
+    }
 }
 
 pub(super) struct ScyllaRealmProcessorExternalDependencyProjector<F, Hash> {

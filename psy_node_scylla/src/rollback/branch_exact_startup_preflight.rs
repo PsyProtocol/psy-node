@@ -9,7 +9,10 @@
 use std::{marker::PhantomData, sync::Arc};
 
 use async_trait::async_trait;
-use parth_core::protocol::core_types::Q256BitHash;
+use parth_core::{
+    felt::QFelt64,
+    protocol::core_types::{Q256BitHash, QFHashBase},
+};
 use psy_data::protocol::{
     canonical_chain::NetworkId,
     chain_context::AuthorityScope,
@@ -47,7 +50,11 @@ use psy_node_core::queue::{
         RealmProcessorContinuationRestartFactory,
         RealmProcessorTerminalCarryoverRecoveryFactory,
     },
-    realm_processor_durable_capture::RealmProcessorDurableCaptureFactory,
+    realm_processor_durable_capture::{
+        RealmProcessorDurableCaptureFactory,
+        RealmProcessorExternalDependencyLoader,
+    },
+    realm_user_update_publish::GlobalUserTreeHeight,
 };
 use psy_node_nats::queue::NatsJetStreamClient;
 use scylla::client::session::Session;
@@ -72,6 +79,7 @@ use super::{
     ScyllaBranchExactWriterRuntime,
 };
 use super::realm_processor_durable_capture::ScyllaRealmProcessorDurableCaptureFactory;
+use super::realm_processor_external_dependency_loader::ScyllaRealmProcessorExternalDependencyLoader;
 use super::branch_exact_pending_orchestration::{
     classify_branch_exact_pending_startup, BranchExactPendingStartupRecovery,
     BranchExactPreparedWriterRecovery,
@@ -281,7 +289,7 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorStartupPreflightProvider<Hash> {
 
     /// Processor-only preparation path. A read-only provider has no NATS
     /// capability and therefore cannot install a durable capture owner.
-    pub(crate) async fn prepare_with_capture(
+    pub(crate) async fn prepare_with_capture<F>(
         session: Arc<Session>,
         standard_keyspace: &str,
         no_tablet_keyspace: &str,
@@ -290,7 +298,12 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorStartupPreflightProvider<Hash> {
         setup_ready: Arc<BranchExactSchemaReady>,
         queue_ready: Arc<PendingQueueSidecarReady>,
         nats: Arc<NatsJetStreamClient>,
-    ) -> Result<Self, RealmProcessorStartupError> {
+        global_user_tree_height: GlobalUserTreeHeight,
+    ) -> Result<Self, RealmProcessorStartupError>
+    where
+        F: QFelt64 + Send + Sync + 'static,
+        Hash: QFHashBase<F> + Send + Sync + 'static,
+    {
         let mut provider = Self::prepare(
             session.clone(),
             standard_keyspace,
@@ -301,6 +314,19 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorStartupPreflightProvider<Hash> {
             queue_ready.clone(),
         )
         .await?;
+        let external_dependency_loader: Arc<dyn RealmProcessorExternalDependencyLoader> =
+            Arc::new(
+                ScyllaRealmProcessorExternalDependencyLoader::<F, Hash>::prepare(
+                    session.clone(),
+                    network,
+                    authority,
+                    global_user_tree_height,
+                    queue_ready.clone(),
+                    nats.base_namespace().to_owned(),
+                )
+                .await
+                .map_err(|error| storage("external dependency loader", error))?,
+            );
         let factory = ScyllaRealmProcessorDurableCaptureFactory::<Hash>::prepare(
             session,
             network,
@@ -308,6 +334,7 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorStartupPreflightProvider<Hash> {
             *provider.writer_runtime.activation_digest().as_bytes(),
             &queue_ready,
             nats,
+            external_dependency_loader,
         )
         .await
         .map_err(|error| storage("durable capture factory", error))?;

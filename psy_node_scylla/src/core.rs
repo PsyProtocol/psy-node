@@ -4,7 +4,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use scylla::client::execution_profile::ExecutionProfile;
 use scylla::client::PoolSize;
-use parth_core::{crypto::hash::traits::MerkleZeroHasher, data::db::table::QDatabaseTableRoutingKey, protocol::core_types::{Q256BitHash, QHashBase}};
+use parth_core::{crypto::hash::traits::MerkleZeroHasher, data::db::table::QDatabaseTableRoutingKey, felt::QFelt64, protocol::core_types::{Q256BitHash, QFHashBase, QHashBase}};
+use psy_node_core::queue::realm_user_update_publish::GlobalUserTreeHeight;
 use psy_node_core::store::canonical_head::{
     CanonicalHeadBootstrap, CanonicalHeadReadState, CanonicalHeadWriteOutcome,
     CoordinatorCanonicalHeadReader, CoordinatorCanonicalHeadStore, NetworkId,
@@ -439,13 +440,15 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
         .await
     }
 
-    pub(crate) async fn prepare_realm_processor_startup_provider_with_capture(
+    pub(crate) async fn prepare_realm_processor_startup_provider_with_capture<F>(
         &self,
         expectation: RealmProcessorStartupExpectation,
         nats: Arc<NatsJetStreamClient>,
+        global_user_tree_height: GlobalUserTreeHeight,
     ) -> Result<ScyllaRealmProcessorStartupPreflightProvider<Hash>, RealmProcessorStartupError>
     where
-        Hash: Q256BitHash + Send + Sync + 'static,
+        F: QFelt64 + Send + Sync + 'static,
+        Hash: Q256BitHash + QFHashBase<F> + Send + Sync + 'static,
         Hasher: Send + Sync + 'static,
     {
         let setup_ready = self
@@ -464,7 +467,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
             setup_ready.view().authority(),
             expectation,
         )?;
-        ScyllaRealmProcessorStartupPreflightProvider::<Hash>::prepare_with_capture(
+        ScyllaRealmProcessorStartupPreflightProvider::<Hash>::prepare_with_capture::<F>(
             self.session.clone(),
             &self.keyspace,
             &self.no_tablet_keyspace,
@@ -473,6 +476,7 @@ impl<Hash: QHashBase, Hasher: MerkleZeroHasher<Hash>> ScyllaCoreStore<Hash, Hash
             setup_ready,
             queue_ready,
             nats,
+            global_user_tree_height,
         )
         .await
     }

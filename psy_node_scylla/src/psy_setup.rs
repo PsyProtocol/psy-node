@@ -839,9 +839,10 @@ where
     ))?;
     let provider = Arc::new(db
         .store
-        .prepare_realm_processor_startup_provider_with_capture(
+        .prepare_realm_processor_startup_provider_with_capture::<N::F>(
             expectation,
             nats,
+            GlobalUserTreeHeight::try_new(N::GLOBAL_USER_TREE_HEIGHT)?,
         )
         .await?);
     let startup_preflight: Arc<dyn RealmProcessorStartupPreflightProvider> =

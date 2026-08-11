@@ -23,12 +23,18 @@ use psy_node_core::{
             RealmProcessorDurableCapturedBatch,
             RealmProcessorDurableCapturedGeneration,
             RealmProcessorDurableCapturedItem,
+            RealmProcessorExternalDependencyLoader,
             SealedRealmProcessorDurableCaptureRequest,
             SealedRealmProcessorGenerationContinuationRequest,
         },
         realm_processor_deferred_actor_input::{
             RealmProcessorDeferredActorInput,
             RealmProcessorDeferredActorInputOutcome,
+            RealmProcessorDeferredActorInputSource,
+        },
+        realm_processor_external_dependency_input::{
+            RealmProcessorExternalDependencyCommitment,
+            RealmProcessorQualifiedExternalActorInput,
         },
         realm_processor_continuation_restart::{
             RealmProcessorContinuationRestartFactory,
@@ -193,6 +199,7 @@ pub(crate) struct ScyllaRealmProcessorDurableCaptureFactory<Hash> {
     application_archive: Arc<ScyllaRealmProcessorApplicationArchiveStore>,
     generation_terminal: Arc<ScyllaRealmProcessorGenerationTerminalStore>,
     deferred_carryover: Arc<ScyllaRealmProcessorDeferredCarryoverStore>,
+    external_dependency_loader: Arc<dyn RealmProcessorExternalDependencyLoader>,
     _hash: PhantomData<Hash>,
 }
 
@@ -204,6 +211,7 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
         writer_activation_digest: [u8; 32],
         ready: &PendingQueueSidecarReady,
         nats: Arc<NatsJetStreamClient>,
+        external_dependency_loader: Arc<dyn RealmProcessorExternalDependencyLoader>,
     ) -> Result<Self, RealmProcessorDurableCaptureError> {
         let AuthorityScope::Realm { .. } = authority else {
             return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
@@ -308,6 +316,7 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
             application_archive,
             generation_terminal,
             deferred_carryover,
+            external_dependency_loader,
             _hash: PhantomData,
         })
     }
@@ -618,6 +627,45 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
             outcome,
             pipeline: pipeline_after,
         })
+    }
+
+    async fn select_external_dependency_commitment(
+        &self,
+        pipeline: &StoredPendingPipeline<Hash>,
+        input: &RealmProcessorDeferredActorInput,
+    ) -> Result<Option<RealmProcessorExternalDependencyCommitment>, RealmProcessorDurableCaptureError>
+    {
+        let RealmProcessorDeferredActorInputSource::Predecessor {
+            predecessor,
+            terminal_digest,
+            ..
+        } = input.source()
+        else {
+            // Bootstrap generations require their own explicit dependency
+            // commitment. Until that record is added they remain fail-closed
+            // at the external-input qualification boundary.
+            return Ok(None);
+        };
+        let terminal = self
+            .generation_terminal
+            .observe_for_restart::<Hash>(
+                pipeline.key(),
+                pipeline.activation_digest(),
+                predecessor,
+            )
+            .await
+            .map_err(backend)?
+            .ok_or(RealmProcessorDurableCaptureError::IdentityMismatch)?;
+        if terminal.digest() != terminal_digest
+            || terminal.successor() != input.successor()
+            || pipeline.processing() != input.successor()
+        {
+            return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
+        }
+        let envelope = terminal
+            .terminal_authorization_envelope()
+            .map_err(backend)?;
+        Ok(Some(envelope.external_dependency()))
     }
 
     fn validate_restart_identity(
@@ -1157,6 +1205,7 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
                 deferred_pipeline: pipeline,
                 deferred_input: Some(deferred_input),
                 deferred_input_digest,
+                external_dependency_commitment: None,
                 mode: ScyllaRealmProcessorCaptureMode::Recovered(handoff),
                 _hash: PhantomData,
             });
@@ -1177,6 +1226,9 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
         {
             return Err(RealmProcessorDurableCaptureError::ConcurrentMutation);
         }
+        let external_dependency_commitment = self
+            .select_external_dependency_commitment(&fresh.pipeline, &fresh_input)
+            .await?;
         let close = self
             .pipeline
             .read_queue_close_exact::<Hash>(context)
@@ -1292,6 +1344,7 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
             deferred_pipeline: fresh.pipeline,
             deferred_input: Some(deferred_input),
             deferred_input_digest,
+            external_dependency_commitment,
             mode: ScyllaRealmProcessorCaptureMode::Active {
                 source,
                 close,
@@ -1626,6 +1679,7 @@ struct ScyllaRealmProcessorDurableCapture<Hash> {
     deferred_input: Option<RealmProcessorDeferredActorInput>,
     deferred_input_digest:
         psy_node_core::queue::realm_processor_deferred_actor_input::RealmProcessorDeferredActorInputDigest,
+    external_dependency_commitment: Option<RealmProcessorExternalDependencyCommitment>,
     mode: ScyllaRealmProcessorCaptureMode,
     _hash: PhantomData<Hash>,
 }
@@ -1736,6 +1790,35 @@ where
             boundary,
         )
             .map(Some)
+    }
+
+    async fn qualify_external_actor_input(
+        &mut self,
+        generation: RealmProcessorDurableCapturedGeneration,
+    ) -> Result<RealmProcessorQualifiedExternalActorInput, RealmProcessorDurableCaptureError> {
+        let ScyllaRealmProcessorCaptureMode::Active { .. } = &self.mode else {
+            return Err(RealmProcessorDurableCaptureError::ApplicationHandoffNotSealing);
+        };
+        if generation.context() != self.context {
+            return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
+        }
+        self.revalidate_deferred_actor_input().await?;
+        let expected = self
+            .external_dependency_commitment
+            .take()
+            .ok_or(RealmProcessorDurableCaptureError::IdentityMismatch)?;
+        let input = self
+            .factory
+            .external_dependency_loader
+            .load_committed_exact(generation, expected)
+            .await?;
+        self.revalidate_deferred_actor_input().await?;
+        if input.context() != self.context
+            || input.dependency_commitment() != expected
+        {
+            return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
+        }
+        Ok(input)
     }
 
     async fn recover_application_handoff(

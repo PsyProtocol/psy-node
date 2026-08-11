@@ -61,6 +61,8 @@ mod realm_user_update_durable_consumer;
 #[allow(dead_code)]
 mod realm_processor_external_dependency_projection;
 #[allow(dead_code)]
+mod realm_processor_external_dependency_loader;
+#[allow(dead_code)]
 mod realm_processor_terminal_authorization;
 mod realm_user_update_router;
 mod realm_user_update_ingress;
