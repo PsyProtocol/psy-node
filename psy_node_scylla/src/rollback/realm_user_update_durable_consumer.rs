@@ -19,6 +19,7 @@ use psy_node_core::{
     queue::{
         realm_user_update_admission::{
             RealmUserUpdateAdmissionCloseIntent, RealmUserUpdateAdmissionKey,
+            RealmUserUpdateQualificationDigest,
         },
         realm_user_update_claim::RealmUserUpdateClaimPhase,
         realm_user_update_consumer::{
@@ -184,6 +185,37 @@ where
         close: RealmUserUpdateAdmissionCloseIntent,
     ) -> Result<RealmUserUpdateDurableGeneration<F, Hash>, RealmUserUpdateDurableConsumerError>
     {
+        self.read_exact_with_fence(key, close, DurableGenerationFence::CurrentPipeline)
+            .await
+    }
+
+    /// Rebuild an immutable generation after its gathering pipeline has
+    /// rotated. The expected qualification digest must come from a durable
+    /// terminal authorization envelope; it replaces only the live-pipeline
+    /// comparison, never the admission, claim, dependency, publication or
+    /// assignment checks below.
+    pub(super) async fn read_historical_exact(
+        &self,
+        key: RealmUserUpdateAdmissionKey,
+        close: RealmUserUpdateAdmissionCloseIntent,
+        expected_qualification: RealmUserUpdateQualificationDigest,
+    ) -> Result<RealmUserUpdateDurableGeneration<F, Hash>, RealmUserUpdateDurableConsumerError>
+    {
+        self.read_exact_with_fence(
+            key,
+            close,
+            DurableGenerationFence::CommittedQualification(expected_qualification),
+        )
+        .await
+    }
+
+    async fn read_exact_with_fence(
+        &self,
+        key: RealmUserUpdateAdmissionKey,
+        close: RealmUserUpdateAdmissionCloseIntent,
+        fence: DurableGenerationFence,
+    ) -> Result<RealmUserUpdateDurableGeneration<F, Hash>, RealmUserUpdateDurableConsumerError>
+    {
         if key.capture().key().network() != self.network
             || key.capture().key().authority() != self.authority
         {
@@ -198,17 +230,8 @@ where
             .header()
             .generation_qualification()
             .ok_or(RealmUserUpdateDurableConsumerError::GenerationNotQualified)?;
-        let PendingPipelineReadState::Current(pipeline) = self
-            .pipeline
-            .read::<Hash>(key.capture().key())
-            .await
-            .map_err(backend)?
-        else {
-            return Err(RealmUserUpdateDurableConsumerError::PipelineFenceMismatch);
-        };
-        if !qualification.fence().matches_pipeline(key, &pipeline) {
-            return Err(RealmUserUpdateDurableConsumerError::PipelineFenceMismatch);
-        }
+        self.validate_fence(key, qualification.digest(), qualification.fence(), fence)
+            .await?;
 
         let assignment = self
             .ledger
@@ -304,17 +327,8 @@ where
         if fresh.header() != sampled.header() || fresh.claims() != sampled.claims() {
             return Err(RealmUserUpdateDurableConsumerError::ConcurrentChange);
         }
-        let PendingPipelineReadState::Current(fresh_pipeline) = self
-            .pipeline
-            .read::<Hash>(key.capture().key())
-            .await
-            .map_err(backend)?
-        else {
-            return Err(RealmUserUpdateDurableConsumerError::PipelineFenceMismatch);
-        };
-        if !qualification.fence().matches_pipeline(key, &fresh_pipeline) {
-            return Err(RealmUserUpdateDurableConsumerError::PipelineFenceMismatch);
-        }
+        self.validate_fence(key, qualification.digest(), qualification.fence(), fence)
+            .await?;
         RealmUserUpdateDurableGeneration::try_new(
             key,
             close,
@@ -322,6 +336,49 @@ where
             items,
         )
     }
+
+    async fn validate_fence(
+        &self,
+        key: RealmUserUpdateAdmissionKey,
+        qualification_digest: RealmUserUpdateQualificationDigest,
+        qualification_fence: &psy_node_core::queue::realm_user_update_admission::RealmUserUpdateQualificationFence<Hash>,
+        fence: DurableGenerationFence,
+    ) -> Result<(), RealmUserUpdateDurableConsumerError> {
+        match fence {
+            DurableGenerationFence::CurrentPipeline => {
+                let PendingPipelineReadState::Current(pipeline) = self
+                    .pipeline
+                    .read::<Hash>(key.capture().key())
+                    .await
+                    .map_err(backend)?
+                else {
+                    return Err(RealmUserUpdateDurableConsumerError::PipelineFenceMismatch);
+                };
+                if !qualification_fence.matches_pipeline(key, &pipeline) {
+                    return Err(RealmUserUpdateDurableConsumerError::PipelineFenceMismatch);
+                }
+            }
+            DurableGenerationFence::CommittedQualification(expected)
+                => require_committed_qualification(qualification_digest, expected)?,
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DurableGenerationFence {
+    CurrentPipeline,
+    CommittedQualification(RealmUserUpdateQualificationDigest),
+}
+
+fn require_committed_qualification(
+    observed: RealmUserUpdateQualificationDigest,
+    expected: RealmUserUpdateQualificationDigest,
+) -> Result<(), RealmUserUpdateDurableConsumerError> {
+    if observed != expected {
+        return Err(RealmUserUpdateDurableConsumerError::QualificationMismatch);
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -435,5 +492,33 @@ mod tests {
             )),
             RealmUserUpdateDurableConsumerError::DependencyCorruption(_),
         ));
+    }
+
+    #[test]
+    fn historical_read_requires_the_exact_terminal_committed_qualification() {
+        let observed = RealmUserUpdateQualificationDigest::try_new([7; 32]).unwrap();
+        let other = RealmUserUpdateQualificationDigest::try_new([8; 32]).unwrap();
+        assert_eq!(
+            require_committed_qualification(observed, observed),
+            Ok(()),
+        );
+        assert_eq!(
+            require_committed_qualification(observed, other),
+            Err(RealmUserUpdateDurableConsumerError::QualificationMismatch),
+        );
+
+        let source = include_str!("realm_user_update_durable_consumer.rs");
+        let historical = source
+            .split("pub(super) async fn read_historical_exact")
+            .nth(1)
+            .unwrap()
+            .split("async fn validate_fence")
+            .next()
+            .unwrap();
+        assert!(historical.contains("read_exact_with_fence"));
+        assert!(historical.contains("CommittedQualification"));
+        assert!(historical.contains("read_bundle"));
+        assert!(historical.contains("observe_committed_data"));
+        assert!(historical.contains("qualified_generation"));
     }
 }

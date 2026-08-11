@@ -189,6 +189,62 @@ where
         }
         Ok(())
     }
+
+    /// Rebuild a projection selected by a terminal authorization after the
+    /// gathering generation has rotated into processing. The complete
+    /// commitment is the expected value: a matching qualification digest
+    /// alone is insufficient.
+    pub(super) async fn read_committed_exact(
+        &self,
+        expected: RealmProcessorExternalDependencyCommitment,
+    ) -> Result<
+        PersistedRealmProcessorExternalDependencyProjection,
+        RealmProcessorExternalDependencyProjectionError,
+    > {
+        let key = RealmUserUpdateAdmissionKey::try_new(expected.context())
+            .map_err(model)?;
+        let first = self
+            .consumer
+            .read_historical_exact(
+                key,
+                expected.admission_close_intent(),
+                expected.qualification_digest(),
+            )
+            .await
+            .map_err(RealmProcessorExternalDependencyProjectionError::Consumer)?;
+        let first = RealmProcessorExternalDependencyProjection::try_from_qualified_generation(
+            expected.context(),
+            *expected.assignment_digest(),
+            &first,
+        )
+        .map_err(model)?;
+        if first.commitment() != expected {
+            return Err(RealmProcessorExternalDependencyProjectionError::CommitmentMismatch);
+        }
+
+        let second = self
+            .consumer
+            .read_historical_exact(
+                key,
+                expected.admission_close_intent(),
+                expected.qualification_digest(),
+            )
+            .await
+            .map_err(RealmProcessorExternalDependencyProjectionError::Consumer)?;
+        let second = RealmProcessorExternalDependencyProjection::try_from_qualified_generation(
+            expected.context(),
+            *expected.assignment_digest(),
+            &second,
+        )
+        .map_err(model)?;
+        if second.commitment() != expected || first != second {
+            return Err(RealmProcessorExternalDependencyProjectionError::ConcurrentMutation);
+        }
+        Ok(PersistedRealmProcessorExternalDependencyProjection {
+            projector_fingerprint: self.fingerprint,
+            projection: second,
+        })
+    }
 }
 
 fn projector_fingerprint(
@@ -232,6 +288,7 @@ fn model(error: impl fmt::Display) -> RealmProcessorExternalDependencyProjection
 #[derive(Debug)]
 pub(super) enum RealmProcessorExternalDependencyProjectionError {
     IdentityMismatch,
+    CommitmentMismatch,
     ConcurrentMutation,
     Consumer(RealmUserUpdateDurableConsumerError),
     Model(String),
@@ -279,5 +336,21 @@ mod tests {
             [5; 32],
         )
         .is_err());
+    }
+
+    #[test]
+    fn historical_projection_is_selected_by_the_complete_commitment() {
+        let source = include_str!("realm_processor_external_dependency_projection.rs");
+        let method = source
+            .split("pub(super) async fn read_committed_exact")
+            .nth(1)
+            .unwrap()
+            .split("fn projector_fingerprint")
+            .next()
+            .unwrap();
+        assert_eq!(method.matches("read_historical_exact").count(), 2);
+        assert_eq!(method.matches("commitment() != expected").count(), 2);
+        assert!(method.contains("first != second"));
+        assert!(!method.contains("read_qualified_generation("));
     }
 }
