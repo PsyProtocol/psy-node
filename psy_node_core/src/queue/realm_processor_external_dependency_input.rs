@@ -12,7 +12,16 @@ use parth_core::{
     felt::QFelt64,
     protocol::core_types::{Q256BitHash, QFHashBase},
 };
+use psy_data::protocol::{
+    canonical_chain::NetworkId,
+    chain_context::AuthorityScope,
+};
 use sha2::{Digest, Sha256};
+
+use crate::store::pending_generation_identity::{
+    PendingGenerationActivationDigest, PendingGenerationContext,
+    PendingGenerationLedgerKey,
+};
 
 use super::{
     realm_processor_durable_capture::{
@@ -33,6 +42,12 @@ const PROJECTION_DIGEST_DOMAIN: &[u8] =
     b"psy/rollback/realm-processor-external-dependency-projection/v1";
 const ACTOR_INPUT_DIGEST_DOMAIN: &[u8] =
     b"psy/rollback/realm-processor-qualified-external-actor-input/v1";
+const COMMITMENT_MAGIC: &[u8; 8] = b"PSYRDEPC";
+const COMMITMENT_CODEC_VERSION: u16 = 1;
+const COMMITMENT_UNSIGNED_LEN: usize = 209;
+const COMMITMENT_LEN: usize = COMMITMENT_UNSIGNED_LEN + 32;
+const COMMITMENT_RECORD_DIGEST_DOMAIN: &[u8] =
+    b"psy/rollback/realm-processor-external-dependency-commitment-record/v1";
 
 macro_rules! digest_type {
     ($name:ident) => {
@@ -177,6 +192,112 @@ impl RealmProcessorExternalDependencyCommitment {
         self,
     ) -> RealmProcessorExternalDependencyProjectionDigest {
         self.projection_digest
+    }
+
+    pub fn to_canonical_bytes(self) -> Vec<u8> {
+        let mut out = self.encode_unsigned();
+        out.extend_from_slice(&commitment_record_digest(&out));
+        out
+    }
+
+    pub fn decode_canonical(
+        bytes: &[u8],
+    ) -> Result<Self, RealmProcessorExternalDependencyInputError> {
+        if bytes.len() != COMMITMENT_LEN {
+            return Err(RealmProcessorExternalDependencyInputError::InvalidCommitmentLength);
+        }
+        let (unsigned, encoded_digest) = bytes.split_at(COMMITMENT_UNSIGNED_LEN);
+        if commitment_record_digest(unsigned) != encoded_digest {
+            return Err(RealmProcessorExternalDependencyInputError::CodecDigestMismatch);
+        }
+        let mut decoder = CommitmentDecoder::new(unsigned);
+        if decoder.take(8)? != COMMITMENT_MAGIC {
+            return Err(RealmProcessorExternalDependencyInputError::InvalidMagic);
+        }
+        let version = decoder.u16()?;
+        if version != COMMITMENT_CODEC_VERSION {
+            return Err(RealmProcessorExternalDependencyInputError::UnknownCodecVersion(
+                version,
+            ));
+        }
+        let network = NetworkId::try_from_chain_id(decoder.u32()?)
+            .map_err(model)?;
+        let authority = match decoder.u8()? {
+            1 => AuthorityScope::Realm {
+                realm_id: decoder.u32()?,
+                realm_sub_id: decoder.u16()?,
+            },
+            _ => return Err(RealmProcessorExternalDependencyInputError::InvalidAuthority),
+        };
+        let activation = PendingGenerationActivationDigest::try_new(decoder.array32()?)
+            .map_err(model)?;
+        let processing = PendingGenerationContext::try_from_legacy(
+            decoder.u64()?,
+            u128::from_be_bytes(decoder.array16()?),
+        )
+        .map_err(model)?;
+        let context = PendingQueueCaptureContext::try_new(
+            PendingGenerationLedgerKey::new(network, authority),
+            activation,
+            processing,
+        )
+        .map_err(model)?;
+        let admission_close_intent =
+            RealmUserUpdateAdmissionCloseIntent::try_new(decoder.array32()?)
+                .map_err(model)?;
+        let qualification_digest =
+            RealmUserUpdateQualificationDigest::try_new(decoder.array32()?)
+                .map_err(model)?;
+        let assignment_digest = decoder.array32()?;
+        if assignment_digest == [0; 32] {
+            return Err(RealmProcessorExternalDependencyInputError::AssignmentMismatch);
+        }
+        let item_count = decoder.u32()?;
+        let projection_digest =
+            RealmProcessorExternalDependencyProjectionDigest::try_new(decoder.array32()?)?;
+        if !decoder.done() {
+            return Err(RealmProcessorExternalDependencyInputError::TrailingBytes);
+        }
+        let commitment = Self {
+            context,
+            admission_close_intent,
+            qualification_digest,
+            assignment_digest,
+            item_count,
+            projection_digest,
+        };
+        if commitment.encode_unsigned() != unsigned {
+            return Err(RealmProcessorExternalDependencyInputError::NonCanonicalCommitment);
+        }
+        Ok(commitment)
+    }
+
+    fn encode_unsigned(self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(COMMITMENT_UNSIGNED_LEN);
+        out.extend_from_slice(COMMITMENT_MAGIC);
+        out.extend_from_slice(&COMMITMENT_CODEC_VERSION.to_be_bytes());
+        out.extend_from_slice(&self.context.key().network().chain_id().to_be_bytes());
+        match self.context.key().authority() {
+            AuthorityScope::Coordinator => unreachable!("validated Realm context"),
+            AuthorityScope::Realm {
+                realm_id,
+                realm_sub_id,
+            } => {
+                out.push(1);
+                out.extend_from_slice(&realm_id.to_be_bytes());
+                out.extend_from_slice(&realm_sub_id.to_be_bytes());
+            }
+        }
+        out.extend_from_slice(self.context.activation().as_bytes());
+        out.extend_from_slice(&self.context.processing().pending_id().get().to_be_bytes());
+        out.extend_from_slice(self.context.processing().proc_checkpoint_id().as_bytes());
+        out.extend_from_slice(self.admission_close_intent.as_bytes());
+        out.extend_from_slice(self.qualification_digest.as_bytes());
+        out.extend_from_slice(&self.assignment_digest);
+        out.extend_from_slice(&self.item_count.to_be_bytes());
+        out.extend_from_slice(self.projection_digest.as_bytes());
+        debug_assert_eq!(out.len(), COMMITMENT_UNSIGNED_LEN);
+        out
     }
 }
 
@@ -442,6 +563,68 @@ fn model(error: impl fmt::Display) -> RealmProcessorExternalDependencyInputError
     RealmProcessorExternalDependencyInputError::Model(error.to_string())
 }
 
+fn commitment_record_digest(bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(COMMITMENT_RECORD_DIGEST_DOMAIN);
+    hasher.update(bytes);
+    hasher.finalize().into()
+}
+
+struct CommitmentDecoder<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> CommitmentDecoder<'a> {
+    const fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn take(
+        &mut self,
+        len: usize,
+    ) -> Result<&'a [u8], RealmProcessorExternalDependencyInputError> {
+        let end = self
+            .offset
+            .checked_add(len)
+            .ok_or(RealmProcessorExternalDependencyInputError::TruncatedCommitment)?;
+        let value = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or(RealmProcessorExternalDependencyInputError::TruncatedCommitment)?;
+        self.offset = end;
+        Ok(value)
+    }
+
+    fn u8(&mut self) -> Result<u8, RealmProcessorExternalDependencyInputError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u16(&mut self) -> Result<u16, RealmProcessorExternalDependencyInputError> {
+        Ok(u16::from_be_bytes(self.take(2)?.try_into().unwrap()))
+    }
+
+    fn u32(&mut self) -> Result<u32, RealmProcessorExternalDependencyInputError> {
+        Ok(u32::from_be_bytes(self.take(4)?.try_into().unwrap()))
+    }
+
+    fn u64(&mut self) -> Result<u64, RealmProcessorExternalDependencyInputError> {
+        Ok(u64::from_be_bytes(self.take(8)?.try_into().unwrap()))
+    }
+
+    fn array16(&mut self) -> Result<[u8; 16], RealmProcessorExternalDependencyInputError> {
+        Ok(self.take(16)?.try_into().unwrap())
+    }
+
+    fn array32(&mut self) -> Result<[u8; 32], RealmProcessorExternalDependencyInputError> {
+        Ok(self.take(32)?.try_into().unwrap())
+    }
+
+    const fn done(&self) -> bool {
+        self.offset == self.bytes.len()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RealmProcessorExternalDependencyInputError {
     EmptyDigest,
@@ -452,6 +635,14 @@ pub enum RealmProcessorExternalDependencyInputError {
     GenerationMismatch,
     EnvelopeMismatch,
     PayloadMismatch,
+    InvalidCommitmentLength,
+    InvalidMagic,
+    UnknownCodecVersion(u16),
+    InvalidAuthority,
+    CodecDigestMismatch,
+    TruncatedCommitment,
+    TrailingBytes,
+    NonCanonicalCommitment,
     ItemCountOverflow,
     ComponentTooLarge,
     Model(String),
@@ -646,6 +837,27 @@ mod tests {
         assert_ne!(
             projection.commitment().projection_digest(),
             changed_updates.commitment().projection_digest(),
+        );
+
+        let encoded = projection.commitment().to_canonical_bytes();
+        assert_eq!(
+            RealmProcessorExternalDependencyCommitment::decode_canonical(&encoded)
+                .unwrap(),
+            projection.commitment(),
+        );
+        let mut tampered = encoded.clone();
+        tampered[80] ^= 1;
+        assert_eq!(
+            RealmProcessorExternalDependencyCommitment::decode_canonical(&tampered)
+                .unwrap_err(),
+            RealmProcessorExternalDependencyInputError::CodecDigestMismatch,
+        );
+        assert_eq!(
+            RealmProcessorExternalDependencyCommitment::decode_canonical(
+                &encoded[..encoded.len() - 1],
+            )
+            .unwrap_err(),
+            RealmProcessorExternalDependencyInputError::InvalidCommitmentLength,
         );
     }
 
