@@ -1,11 +1,22 @@
 use cf_utils::timer::TraceTimer;
-use parth_core::protocol::core_types::{Q256BitHash, QNetworkTypesConfig};
+use parth_core::{
+    crypto::hash::traits::ZeroableHash,
+    data::queue::queue_key::QPBaseQueueType,
+    protocol::core_types::{Q256BitHash, QNetworkTypesConfig},
+};
 use psy_core::job::job_id::QProvingJobDataID;
 use psy_data::{
-    guta::header_extended::{GlobalUserTreeAggregatorHeaderWithTagValue, GlobalUserTreeAggregatorHeaderWithTagValueAndJobType},
+    guta::header_extended::{
+        GlobalUserTreeAggregatorHeaderWithJobId,
+        GlobalUserTreeAggregatorHeaderWithTagValue,
+        GlobalUserTreeAggregatorHeaderWithTagValueAndJobType,
+    },
     node::realm_processor::RealmProcessorCoreState,
     node::node_proving_state::PsyNodeProvingState,
-    prepared_block::realm::PsyPreparedRealmBlockStateUpdates,
+    prepared_block::realm::{
+        PsyPreparedRealmBlockStateUpdates, PsyRealmCoordinatorUpdate,
+    },
+    protocol::chain_context::AuthorityScope,
     worker::metadata_with_job_id::PsyProvingJobMetadataWithJobId,
 };
 use psy_io::tokio::TokioLikeFileSystem;
@@ -16,6 +27,10 @@ use psy_node_core::{
     queue::{
         ephemeral::QStandardEphemeralQueueSubscriber,
         realm_processor_actor_input::RealmProcessorActorInput,
+        realm_processor_application_proof_work::{
+            RealmProcessorApplicationProofWork,
+            RealmProcessorApplicationProofWorkOutcome,
+        },
         realm_processor_durable_capture::{
             RealmProcessorApplicationHandoffObservation,
             RealmProcessorDurableCaptureOutcome,
@@ -25,6 +40,7 @@ use psy_node_core::{
             RealmProcessorGenerationContinuation,
             RealmProcessorGenerationContinuationPhase,
         },
+        realm_processor_narrow_writer::RealmProcessorVerifiedNarrowWriterEvidence,
         realm_processor_semantic_output::{
             RealmProcessorDeferredJob, RealmProcessorSemanticJob,
             RealmProcessorSemanticOutput, RealmProcessorSemanticOutputParts,
@@ -32,7 +48,9 @@ use psy_node_core::{
         worker_queue::{QStandardWorkerQueuePublisher, QStandardWorkerQueueSubscriber},
     },
     store::{
+        authority_commit::AuthorityClockSampleUs,
         pending_generation_identity::PendingGenerationContext,
+        realm_proof_binding::SealedRealmProofBinding,
         realm_processor_quiescence::RealmProcessorIterationPermit,
         traits::proof_store::{QCanonicalProofStoreV2, QParthProofStore},
     },
@@ -228,6 +246,484 @@ where
         }
         proving_state.finish();
         self.db.temp_db.set_psy_node_proving_state(&self.db.state.realm_identifier, &proving_state).await?;
+        Ok(())
+    }
+
+    /// Publish proof work in the storage-selected pending/proc namespace.
+    /// The legacy mutable processor singleton is deliberately not consulted.
+    async fn publish_branch_exact_worker_jobs(
+        &self,
+        mut proving_state: PsyNodeProvingState,
+        processing: PendingGenerationContext,
+        queue_key: &RealmProvingWorkQueueKey<N::QHash, N::JobId>,
+        jobs: &[Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>],
+    ) -> anyhow::Result<()> {
+        let worker_unique_id = processing.proc_checkpoint_id().as_u128();
+        let mut non_empty_levels = 0usize;
+        for (level, level_jobs) in jobs.iter().enumerate() {
+            if level_jobs.is_empty() {
+                continue;
+            }
+            proving_state.set_current_proving_level(u8::try_from(non_empty_levels)?);
+            self.db
+                .temp_db
+                .set_psy_node_proving_state(
+                    &self.db.state.realm_identifier,
+                    &proving_state,
+                )
+                .await?;
+            non_empty_levels += 1;
+            self.db
+                .proof_work_queue
+                .publish_many_worker_queue_items(
+                    queue_key,
+                    self.db.state.realm_id_u64,
+                    self.db.state.realm_sub_id_u64,
+                    worker_unique_id,
+                    0,
+                    level_jobs,
+                )
+                .await?;
+            self.db
+                .proof_work_queue
+                .wait_until_all_jobs_complete_or_timeout_worker(
+                    queue_key,
+                    self.db.state.realm_id_u64,
+                    self.db.state.realm_sub_id_u64,
+                    worker_unique_id,
+                    0,
+                    self.proof_worker_queue_max_time_ms,
+                )
+                .await?;
+            tracing::info!(
+                "Branch-exact proof level {} completed in pending={} proc={}",
+                level,
+                processing.pending_id().get(),
+                worker_unique_id,
+            );
+        }
+        proving_state.finish();
+        self.db
+            .temp_db
+            .set_psy_node_proving_state(
+                &self.db.state.realm_identifier,
+                &proving_state,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn get_branch_exact_reward_tree_root(
+        &self,
+        processing: PendingGenerationContext,
+        job_id: N::JobId,
+    ) -> anyhow::Result<N::QHash> {
+        let pending_context = self
+            .db
+            .temp_db
+            .require_pending_context_for_generation(
+                &self.db.state.realm_identifier,
+                processing,
+            )
+            .await?;
+        if let Some(root) = self
+            .db
+            .temp_db
+            .get_proof_miner_rewards_tree_value_or_none(
+                &self.db.state.realm_identifier,
+                &pending_context,
+                job_id,
+            )
+            .await?
+        {
+            if root != N::QHash::get_zero_value()
+                || processing.pending_id().get() == 0
+            {
+                return Ok(root);
+            }
+        }
+        let root = self
+            .db
+            .tag_tree_rewards_store
+            .rewards_tag_tree_get_root_at_unique_pending_id(
+                processing.pending_id().get(),
+            )
+            .await?;
+        if root == N::QHash::get_zero_value()
+            && processing.pending_id().get() != 0
+        {
+            anyhow::bail!(
+                "branch-exact reward root is missing for pending {}",
+                processing.pending_id().get()
+            );
+        }
+        Ok(root)
+    }
+
+    /// Observe the exact Coordinator inclusion without updating any legacy
+    /// Realm singleton or writing its pending-keyed reward proof. `None`
+    /// means the Coordinator is still at the expected predecessor root.
+    async fn observe_branch_exact_coordinator_update(
+        &self,
+        old_realm_root: N::QHash,
+        new_realm_root: N::QHash,
+    ) -> anyhow::Result<Option<PsyRealmCoordinatorUpdate<N::F, N::QHash>>> {
+        let checkpoint_id = self
+            .db
+            .coordinator_client
+            .rc_get_latest_checkpoint_id()
+            .await?;
+        let realm_state = self
+            .db
+            .coordinator_client
+            .rc_get_realm_root_and_last_modified_checkpoint(
+                checkpoint_id,
+                self.db.state.realm_id_u64,
+            )
+            .await?;
+        if realm_state.value == new_realm_root {
+            return self
+                .db
+                .coordinator_client
+                .rc_get_realm_sync_info(
+                    realm_state.checkpoint_id,
+                    self.db.state.realm_id_u64,
+                )
+                .await
+                .map(Some);
+        }
+        if realm_state.value != old_realm_root {
+            anyhow::bail!(
+                "branch-exact Realm root diverged: expected {:?} -> {:?}, found {:?} at checkpoint {}",
+                old_realm_root,
+                new_realm_root,
+                realm_state.value,
+                realm_state.checkpoint_id,
+            );
+        }
+        Ok(None)
+    }
+
+    /// Wait for the exact Coordinator inclusion without mutating legacy
+    /// state. A retry first observes the durable Coordinator result, so a
+    /// response loss never requires submitting the same proof a second time.
+    async fn wait_for_branch_exact_coordinator_update(
+        &self,
+        old_realm_root: N::QHash,
+        new_realm_root: N::QHash,
+    ) -> anyhow::Result<PsyRealmCoordinatorUpdate<N::F, N::QHash>> {
+        loop {
+            if let Some(update) = self
+                .observe_branch_exact_coordinator_update(
+                    old_realm_root,
+                    new_realm_root,
+                )
+                .await?
+            {
+                return Ok(update);
+            }
+            self.db
+                .coordinator_client
+                .rc_wait_for_next_checkpoint()
+                .await?;
+        }
+    }
+
+    fn branch_exact_clock_sample() -> anyhow::Result<AuthorityClockSampleUs> {
+        let micros = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_micros();
+        AuthorityClockSampleUs::try_from_i128(i128::try_from(micros)?)
+            .map_err(anyhow::Error::from)
+    }
+
+    /// Resume `WorkCaptured` from immutable storage, execute the real proof
+    /// protocol, bind the exact Coordinator response, and enter only the
+    /// narrow mapping/reward-proof writer. Full writer/head/terminal/rotation
+    /// remain later gates.
+    async fn resume_branch_exact_await_writer(
+        &mut self,
+        iteration: &mut psy_node_core::store::realm_processor_branch_exact_runtime::RealmBranchExactCommitIteration<'_, N::QHash>,
+    ) -> anyhow::Result<()> {
+        let work = match iteration.prepare_application_proof_work().await? {
+            RealmProcessorApplicationProofWorkOutcome::AwaitProoflessApplication {
+                processing,
+                application,
+            } => {
+                tracing::info!(
+                    "Branch-exact application {:?} in pending={} contains durable deferred work but no checkpoint proof; awaiting the proofless terminal path",
+                    application.archive_slot(),
+                    processing.pending_id().get(),
+                );
+                return Ok(());
+            }
+            RealmProcessorApplicationProofWorkOutcome::Ready(work) => work,
+        };
+        self.execute_branch_exact_proof_and_narrow_write(iteration, work)
+            .await
+    }
+
+    async fn execute_branch_exact_proof_and_narrow_write(
+        &mut self,
+        iteration: &mut psy_node_core::store::realm_processor_branch_exact_runtime::RealmBranchExactCommitIteration<'_, N::QHash>,
+        work: RealmProcessorApplicationProofWork,
+    ) -> anyhow::Result<()> {
+        let processing = work.processing();
+        let semantic = work.semantic();
+        let pending_context = self
+            .db
+            .temp_db
+            .require_pending_context_for_generation(
+                &self.db.state.realm_identifier,
+                processing,
+            )
+            .await?;
+
+        let mut jobs = Vec::<
+            Vec<PsyProvingJobMetadataWithJobId<N::QHash, N::JobId>>,
+        >::new();
+        let mut witnesses = Vec::with_capacity(semantic.jobs().len());
+        for stored in semantic.jobs() {
+            let level = usize::from(stored.level());
+            while jobs.len() <= level {
+                jobs.push(Vec::new());
+            }
+            if usize::try_from(stored.ordinal())? != jobs[level].len() {
+                anyhow::bail!("non-canonical branch-exact proof job ordinal");
+            }
+            let metadata = PsyProvingJobMetadataWithJobId::<
+                N::QHash,
+                N::JobId,
+            >::psy_ser_from_slice(stored.metadata())?;
+            if metadata.psy_ser_to_bytes_vec()? != stored.metadata() {
+                anyhow::bail!("non-canonical branch-exact proof metadata");
+            }
+            witnesses.push((metadata.job_id, stored.witness().to_vec()));
+            jobs[level].push(metadata);
+        }
+        self.db
+            .temp_db
+            .set_tdb_proof_witnesses_tuple_owned_raw(
+                &self.db.state.realm_identifier,
+                &pending_context,
+                witnesses,
+            )
+            .await?;
+        for (level, level_jobs) in jobs.iter().enumerate() {
+            for (ordinal, metadata) in level_jobs.iter().enumerate() {
+                let stored = semantic
+                    .jobs()
+                    .iter()
+                    .find(|job| {
+                        usize::from(job.level()) == level
+                            && usize::try_from(job.ordinal()).ok()
+                                == Some(ordinal)
+                    })
+                    .ok_or_else(|| anyhow::anyhow!("missing semantic proof job"))?;
+                let exact = self
+                    .db
+                    .temp_db
+                    .get_tdb_proof_witness_bytes(
+                        &self.db.state.realm_identifier,
+                        &pending_context,
+                        metadata.job_id,
+                    )
+                    .await?;
+                if exact != stored.witness() {
+                    anyhow::bail!("branch-exact proof witness readback mismatch");
+                }
+            }
+        }
+
+        let root_job_id = self
+            .get_root_job_id(&jobs)?
+            .ok_or_else(|| anyhow::anyhow!("proof-bearing application has no root job"))?;
+        let guta_header = GlobalUserTreeAggregatorHeaderWithJobId::<
+            N::F,
+            N::QHash,
+        >::psy_ser_from_slice(semantic.guta_header())?;
+        if guta_header.psy_ser_to_bytes_vec()? != semantic.guta_header()
+            || guta_header.job_id != root_job_id
+        {
+            anyhow::bail!("application GUTA header/root job mismatch");
+        }
+        let actual_jobs = jobs.iter().map(Vec::len).sum::<usize>();
+        let proving_state = PsyNodeProvingState::new_standard_realm(
+            self.db.state.realm_id_u64,
+            u32::try_from(self.db.state.realm_sub_id_u64)?,
+            semantic.processing_checkpoint_id(),
+            semantic.processing_checkpoint_id(),
+            semantic.total_users_updated(),
+            semantic.total_proofs_generated(),
+        );
+        if u64::try_from(actual_jobs)? != proving_state.total_guta_jobs {
+            anyhow::bail!(
+                "application proof job count {} does not match semantic total {}",
+                actual_jobs,
+                proving_state.total_guta_jobs,
+            );
+        }
+        let queue_key = RealmProvingWorkQueueKey {
+            realm_id: self.db.state.realm_id_u64,
+            realm_sub_id: self.db.state.realm_sub_id_u64,
+            unique_id: processing.proc_checkpoint_id().as_u128(),
+            task_group: 0,
+            queue_type: QPBaseQueueType::WorkerQueue,
+            _phantom_queue_item: std::marker::PhantomData,
+        };
+        let proof_address = self
+            .db
+            .proof_store
+            .resolve_proof_address(&pending_context, &root_job_id)?;
+        let recovered_root_proof = self
+            .db
+            .proof_store
+            .get_proof_bytes_exact(&proof_address)
+            .await?;
+        let root_proof = if let Some(root_proof) = recovered_root_proof {
+            tracing::info!(
+                "Recovered exact branch-exact root proof for pending={} proc={}; proof workers are not republished",
+                processing.pending_id().get(),
+                processing.proc_checkpoint_id().as_u128(),
+            );
+            root_proof
+        } else {
+            self.publish_branch_exact_worker_jobs(
+                proving_state,
+                processing,
+                &queue_key,
+                &jobs,
+            )
+            .await?;
+            self.db
+                .proof_store
+                .get_proof_bytes_exact(&proof_address)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("missing exact root GUTA proof"))?
+        };
+        let rewards_root = self
+            .get_branch_exact_reward_tree_root(processing, root_job_id)
+            .await?;
+        let submission = GlobalUserTreeAggregatorHeaderWithTagValueAndJobType {
+            header: GlobalUserTreeAggregatorHeaderWithTagValue {
+                header: guta_header.header,
+                new_tag_tree_node_value: rewards_root,
+            },
+            job_type_u32: root_job_id.circuit_type as u32,
+        };
+
+        let prepared = work.prepared_update::<N::QHash>(
+            u32::try_from(self.db.state.realm_id_u64)?,
+            u16::try_from(self.db.state.realm_sub_id_u64)?,
+        );
+        let coordinator = match self
+            .observe_branch_exact_coordinator_update(
+                prepared.old_realm_root,
+                prepared.new_realm_root,
+            )
+            .await?
+        {
+            Some(coordinator) => {
+                tracing::info!(
+                    "Recovered exact Coordinator inclusion for branch-exact application {:?}; proof is not resubmitted",
+                    work.application().archive_slot(),
+                );
+                coordinator
+            }
+            None => {
+                let submit_result = self
+                    .db
+                    .coordinator_client
+                    .rc_submit_guta_proof(
+                        submission,
+                        root_proof.clone(),
+                        self.db.state.realm_id_u64,
+                    )
+                    .await;
+                match submit_result {
+                    Ok(()) => {
+                        self.wait_for_branch_exact_coordinator_update(
+                            prepared.old_realm_root,
+                            prepared.new_realm_root,
+                        )
+                        .await?
+                    }
+                    Err(error) => {
+                        match self
+                            .observe_branch_exact_coordinator_update(
+                                prepared.old_realm_root,
+                                prepared.new_realm_root,
+                            )
+                            .await?
+                        {
+                            Some(coordinator) => coordinator,
+                            None => return Err(error.into()),
+                        }
+                    }
+                }
+            }
+        };
+        let authority = AuthorityScope::Realm {
+            realm_id: u32::try_from(self.db.state.realm_id_u64)?,
+            realm_sub_id: u16::try_from(self.db.state.realm_sub_id_u64)?,
+        };
+        let proof_verifier = self.proof_verifier.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "branch-exact proof verifier is absent from the authorized runtime"
+            )
+        })?;
+        let proof_binding = SealedRealmProofBinding::verify_and_seal::<
+            N::F,
+            N::HasherBase,
+            N::ZKProof,
+            N::ZKVerifier,
+        >(
+            authority,
+            &prepared,
+            &submission,
+            &root_proof,
+            proof_verifier,
+            &coordinator,
+            N::COORDINATOR_GLOBAL_USER_TREE_HEIGHT,
+        )?;
+        let evidence = RealmProcessorVerifiedNarrowWriterEvidence::try_from_verified(
+            u32::try_from(self.db.state.realm_id_u64)?,
+            u16::try_from(self.db.state.realm_sub_id_u64)?,
+            &work,
+            &proof_binding,
+            &coordinator,
+        )?;
+        let observation = iteration
+            .prepare_mapping_and_reward_proof(
+                &evidence,
+                Self::branch_exact_clock_sample()?,
+            )
+            .await?;
+        tracing::info!(
+            "Branch-exact narrow writer prepared application {:?}: pending={}, pipeline_revision={}, writer_revision={}, intent={:?}; full writer/head/terminal/rotation remain blocked",
+            observation.application().archive_slot(),
+            observation.processing().pending_id().get(),
+            observation.pipeline_revision().get(),
+            observation.writer_revision(),
+            observation.intent_digest(),
+        );
+        if let Err(error) = self
+            .db
+            .proof_work_queue
+            .delete_worker_queue_consumer(
+                &queue_key,
+                self.db.state.realm_id_u64,
+                self.db.state.realm_sub_id_u64,
+                processing.proc_checkpoint_id().as_u128(),
+                0,
+            )
+            .await
+        {
+            tracing::warn!(
+                "failed to delete branch-exact proof worker consumer after narrow writer commit: {}",
+                error
+            );
+        }
         Ok(())
     }
 
@@ -436,8 +932,21 @@ where
                 return Ok(());
             }
             RealmGatheringOutcome::BranchExactGenerationContinuation(continuation) => {
+                if continuation.phase()
+                    == RealmProcessorGenerationContinuationPhase::AwaitWriter
+                {
+                    let RealmNormalCommitIteration::BranchExact(iteration) = iteration
+                    else {
+                        anyhow::bail!(
+                            "branch-exact continuation observed under legacy iteration"
+                        );
+                    };
+                    return self
+                        .resume_branch_exact_await_writer(iteration)
+                        .await;
+                }
                 tracing::info!(
-                    "Branch-exact generation is durably classified as {:?}: processing_pending={}, pipeline_revision={}; terminal/rotation/writer/head remain blocked",
+                    "Branch-exact generation is durably classified as {:?}: processing_pending={}, pipeline_revision={}; its next qualified owner is not integrated yet",
                     continuation.phase(),
                     continuation.processing().pending_id().get(),
                     continuation.pipeline_revision().get(),
@@ -761,7 +1270,7 @@ mod h23c4c3b_tests {
         assert!(function.contains("recover_application_handoff()"));
         assert!(function.contains("replay_complete_generation()"));
         assert!(function.contains("capture.capture_next()"));
-        assert!(function.contains("apply_durable_generation(generation, deferred_input)"));
+        assert!(function.contains("apply_durable_generation(actor_input)"));
         assert!(function.contains("finalize_durable_generation(receipt)"));
         assert!(function.contains("build_branch_exact_semantic_output(processing, &finalized)"));
         assert!(function.contains("persist_application_and_handoff(semantic)"));
@@ -806,10 +1315,10 @@ mod h23c4c3b_tests {
     fn semantic_candidate_uses_exact_pending_witnesses_and_affine_storage_authority() {
         let source = include_str!("process_block.rs");
         let builder = source
-            .split("async fn build_branch_exact_semantic_output(")
+            .split("async fn project_branch_exact_semantic_output<")
             .nth(1)
             .unwrap()
-            .split("async fn get_results_from_gatherers(")
+            .split("/// RF=3 qualification")
             .next()
             .unwrap();
         assert!(builder.contains("require_pending_context_for_generation"));
@@ -907,7 +1416,7 @@ mod h23c4c4b1_tests {
     }
 
     #[test]
-    fn continuation_phases_stop_before_proof_writer_head_or_rotation() {
+    fn await_writer_has_one_narrow_route_and_other_continuations_stop() {
         let source = include_str!("process_block.rs");
         let process = source
             .split("pub(super) async fn process_block")
@@ -916,25 +1425,91 @@ mod h23c4c4b1_tests {
         let branch = process
             .find("RealmGatheringOutcome::BranchExactGenerationContinuation")
             .unwrap();
-        let stop = branch + process[branch..].find("return Ok(())").unwrap();
-        let proof = process.find("// 4. Proving Work").unwrap();
-        assert!(stop < proof);
-        let continuation = source
-            .split("BranchExactGenerationContinuation(continuation)")
-            .nth(1)
-            .unwrap()
-            .split("return Ok(())")
+        let continuation_arm = process[branch..]
+            .split("RealmGatheringOutcome::BranchExactAwaitingDeferredCarryover")
             .next()
             .unwrap();
+        assert!(continuation_arm.contains(
+            "RealmProcessorGenerationContinuationPhase::AwaitWriter"
+        ));
+        assert!(continuation_arm.contains("resume_branch_exact_await_writer(iteration)"));
+        let stop = branch + continuation_arm.rfind("return Ok(())").unwrap();
+        let proof = process.find("// 4. Proving Work").unwrap();
+        assert!(stop < proof);
         for forbidden in [
             "seal_begin_processing",
             "seal_retire_no_work",
             "seal_publish",
             "seal_rotation",
             "commit_state",
-            "publish_all_worker_jobs",
         ] {
-            assert!(!continuation.contains(forbidden));
+            assert!(!continuation_arm.contains(forbidden));
         }
+    }
+}
+
+#[cfg(test)]
+mod h23c4d2_tests {
+    #[test]
+    fn await_writer_reconstructs_exact_proof_and_stops_at_narrow_writer() {
+        let source = include_str!("process_block.rs");
+        let route = source
+            .split("async fn execute_branch_exact_proof_and_narrow_write(")
+            .nth(1)
+            .unwrap()
+            .split("pub fn get_root_job_id")
+            .next()
+            .unwrap();
+        for required in [
+            "require_pending_context_for_generation",
+            "set_tdb_proof_witnesses_tuple_owned_raw",
+            "get_tdb_proof_witness_bytes",
+            "publish_branch_exact_worker_jobs",
+            "get_proof_bytes_exact",
+            "observe_branch_exact_coordinator_update",
+            "wait_for_branch_exact_coordinator_update",
+            "SealedRealmProofBinding::verify_and_seal",
+            "RealmProcessorVerifiedNarrowWriterEvidence::try_from_verified",
+            "prepare_mapping_and_reward_proof",
+        ] {
+            assert!(route.contains(required), "missing {required}");
+        }
+        for forbidden in [
+            "wait_for_realm_update_sync_with_coordinator(",
+            "self.db.commit_state",
+            "seal_publish",
+            "seal_rotation",
+            "authority_head",
+        ] {
+            assert!(!route.contains(forbidden), "found {forbidden}");
+        }
+        let proof_read = route.find("let recovered_root_proof").unwrap();
+        let proof_publish = route
+            .find("self.publish_branch_exact_worker_jobs")
+            .unwrap();
+        assert!(proof_read < proof_publish);
+        let coordinator_read = route
+            .find(".observe_branch_exact_coordinator_update(")
+            .unwrap();
+        let coordinator_submit = route.find(".rc_submit_guta_proof(").unwrap();
+        assert!(coordinator_read < coordinator_submit);
+    }
+
+    #[test]
+    fn proofless_application_is_typed_await_and_not_fake_proof_work() {
+        let source = include_str!("process_block.rs");
+        let route = source
+            .split("async fn resume_branch_exact_await_writer(")
+            .nth(1)
+            .unwrap()
+            .split("async fn execute_branch_exact_proof_and_narrow_write(")
+            .next()
+            .unwrap();
+        assert!(route.contains(
+            "RealmProcessorApplicationProofWorkOutcome::AwaitProoflessApplication"
+        ));
+        assert!(route.contains("return Ok(())"));
+        assert!(!route.contains("publish_branch_exact_worker_jobs"));
+        assert!(!route.contains("prepare_mapping_and_reward_proof"));
     }
 }

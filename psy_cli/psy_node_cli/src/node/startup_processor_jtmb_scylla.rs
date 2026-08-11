@@ -8,7 +8,12 @@ use psy_data::{
     config::network_config::PsyNodeCircuitFingerprintConfigProvider, genesis::genesis_block_setup::PsyGenesisBlockSetupDataProvider,
 };
 use psy_io::tokio::{TokioLikeFileSystem, TokioStdFileSystem};
-use psy_jtmb_testing_core::{config::poseidon_goldilocks::resolver::PsyJTMBPoseidonGoldilocksNodeConfigResolver, protocol_types::ZKTypesJTMBGoldilocksPoseidon};
+use psy_jtmb_testing_core::{
+    circuit_library::core::get_jtmb_circuit_library_and_prover_for_network,
+    config::poseidon_goldilocks::resolver::PsyJTMBPoseidonGoldilocksNodeConfigResolver,
+    protocol_types::{JTMBPoseidonGoldilocksConfig, ZKTypesJTMBGoldilocksPoseidon},
+    zk_verifier::PsyJTMBZKVerifier,
+};
 use psy_node_common::{coordinator::processor::create::create_coordinator_processor_and_run, p2p::realm_coordinator::PsyRealmCoordinatorClientAPI, realm::processor::create::create_realm_processor_and_run};
 use psy_node_core::config::node_start_config::{CoordinatorProcessorStartConfig, RealmProcessorStartConfig};
 use psy_node_nats::psy_queue::setup_nats_psy_queue_from_connection_str;
@@ -105,12 +110,6 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_coordinator_processor_n
 }
 
 pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_realm_processor_node(config: &RealmProcessorStartConfig) -> anyhow::Result<()> {
-
-
-    //let (verifier, _) = get_jtmb_circuit_library_and_prover_for_network::<JTMBPoseidonGoldilocksConfig>(config.network)?;
-
-    
-
     let resolver = PsyJTMBPoseidonGoldilocksNodeConfigResolver {};
     let circuit_fingerprint_config = resolver.get_circuit_fingerprint_config_for_network(config.network)?;
     let genesis_data = resolver.get_genesis_block_setup_data_for_network(config.network, config.genesis_data_path.clone())?;
@@ -156,6 +155,16 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_realm_processor_node(co
             )
         })
         .transpose()?;
+    let proof_verifier = if branch_exact_lineage.is_some() {
+        let (verifier, _) = get_jtmb_circuit_library_and_prover_for_network::<
+            JTMBPoseidonGoldilocksConfig,
+        >(config.network)?;
+        Some(Arc::new(PsyJTMBZKVerifier::<
+            JTMBPoseidonGoldilocksConfig,
+        >::new(verifier)))
+    } else {
+        None
+    };
     let chain_id = config.network.get_chain_id();
     if config.coordinator_api_urls.is_empty() {
         anyhow::bail!("No coordinator API URLs provided for realm processor node");
@@ -199,6 +208,7 @@ pub async fn run_startup_jtmb_poseidon_goldilocks_scylla_realm_processor_node(co
                 tag_tree_rewards_store,
                 temp_db,
                 proof_store,
+                proof_verifier,
                 guta_update_queue,
 
                 proof_work_queue,

@@ -448,6 +448,35 @@ fn every_bound_input_changes_the_binding_commitment() {
 }
 
 #[test]
+fn sealed_binding_rejects_later_prepared_or_coordinator_evidence_swaps() {
+    let fixture = valid_fixture();
+    let binding = fixture.seal().unwrap();
+    assert!(binding
+        .revalidate_exact_inputs(&fixture.prepared, &fixture.coordinator)
+        .is_ok());
+
+    let mut changed_prepared = fixture.prepared.clone();
+    changed_prepared.update_user_leaves_ffs.push(0xA5);
+    assert_eq!(
+        binding.revalidate_exact_inputs(
+            &changed_prepared,
+            &fixture.coordinator,
+        ),
+        Err(RealmProofBindingError::ExactInputMismatch)
+    );
+
+    let mut changed_coordinator = fixture.coordinator.clone();
+    changed_coordinator.reward_tree_top_proof.root = hash(111);
+    assert_eq!(
+        binding.revalidate_exact_inputs(
+            &fixture.prepared,
+            &changed_coordinator,
+        ),
+        Err(RealmProofBindingError::ExactInputMismatch)
+    );
+}
+
+#[test]
 fn zero_hash_helpers_are_not_used_as_implicit_binding_defaults() {
     let fixture = valid_fixture();
     let sealed = fixture.seal().unwrap();

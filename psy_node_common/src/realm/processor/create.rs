@@ -35,6 +35,7 @@ pub async fn create_realm_processor<
     tag_tree_rewards_store: Arc<STagTreeRewards>,
     temp_db: Arc<TempDatabase>,
     proof_store: Arc<ProofStore>,
+    proof_verifier: Option<Arc<N::ZKVerifier>>,
     guta_update_queue: Arc<GUTAUpdateQueue>,
     proof_work_queue: Arc<ProofWorkQueue>,
     realm_identifier: QRealmIdentifier,
@@ -73,6 +74,12 @@ where
         authorize_realm_processor_startup(startup_mode, startup_preflight.as_deref()).await?;
     let normal_commit_owner = match startup_authorization {
         RealmProcessorStartupAuthorization::Disabled => {
+            if proof_verifier.is_some() {
+                return Err(
+                    RealmProcessorStartupError::UnexpectedProofVerifierWhileDisabled
+                        .into(),
+                );
+            }
             if commit_runtime_installer.is_some() {
                 return Err(
                     RealmProcessorStartupError::UnexpectedCommitRuntimeInstallerWhileDisabled
@@ -82,6 +89,9 @@ where
             RealmNormalCommitOwner::legacy_disabled()
         }
         RealmProcessorStartupAuthorization::BranchExact(run_permit) => {
+            if proof_verifier.is_none() {
+                return Err(RealmProcessorStartupError::ProofVerifierMissing.into());
+            }
             let installer = commit_runtime_installer
                 .ok_or(RealmProcessorStartupError::CommitRuntimeInstallerMissing)?;
             let installed = installer.install(run_permit).await?;
@@ -200,6 +210,7 @@ where
         genesis,
         file_system,
         guta_gatherer_backup_directory,
+        proof_verifier,
         normal_commit_owner,
     )
     .await?;
@@ -242,6 +253,7 @@ pub async fn create_realm_processor_and_run<
     tag_tree_rewards_store: Arc<STagTreeRewards>,
     temp_db: Arc<TempDatabase>,
     proof_store: Arc<ProofStore>,
+    proof_verifier: Option<Arc<N::ZKVerifier>>,
     guta_update_queue: Arc<GUTAUpdateQueue>,
     proof_work_queue: Arc<ProofWorkQueue>,
     realm_identifier: QRealmIdentifier,
@@ -266,6 +278,7 @@ where
         tag_tree_rewards_store,
         temp_db,
         proof_store,
+        proof_verifier,
         guta_update_queue,
         proof_work_queue,
         realm_identifier,
@@ -318,6 +331,12 @@ mod tests {
             "RealmProcessorStartupError::UnexpectedCommitRuntimeInstallerWhileDisabled"
         ));
         assert!(function.contains(
+            "RealmProcessorStartupError::UnexpectedProofVerifierWhileDisabled"
+        ));
+        assert!(function.contains(
+            "RealmProcessorStartupError::ProofVerifierMissing"
+        ));
+        assert!(function.contains(
             ".ok_or(RealmProcessorStartupError::CommitRuntimeInstallerMissing)?"
         ));
         let install = function
@@ -353,5 +372,33 @@ mod tests {
         assert!(rejector.contains(
             "RealmProcessorStartupError::ServingCompositionNotIntegrated"
         ));
+    }
+
+    #[test]
+    fn proof_verifier_is_required_only_for_branch_exact_startup() {
+        let source = include_str!("create.rs");
+        let function = source
+            .split("pub async fn create_realm_processor<")
+            .nth(1)
+            .expect("create_realm_processor must remain present");
+        let disabled = function
+            .split("RealmProcessorStartupAuthorization::Disabled =>")
+            .nth(1)
+            .unwrap()
+            .split("RealmProcessorStartupAuthorization::BranchExact")
+            .next()
+            .unwrap();
+        assert!(disabled.contains("if proof_verifier.is_some()"));
+        assert!(disabled.contains("UnexpectedProofVerifierWhileDisabled"));
+
+        let enabled = function
+            .split("RealmProcessorStartupAuthorization::BranchExact")
+            .nth(1)
+            .unwrap()
+            .split("tracing::info!(\"[REALM_CREATE] setup_for_realm start\")")
+            .next()
+            .unwrap();
+        assert!(enabled.contains("if proof_verifier.is_none()"));
+        assert!(enabled.contains("ProofVerifierMissing"));
     }
 }

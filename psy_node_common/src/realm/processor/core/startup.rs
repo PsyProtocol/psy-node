@@ -54,6 +54,7 @@ where
         genesis_block_update: PsyPreparedRealmBlockStateUpdatesWithCoordinatorUpdate<N::F, N::QHash>,
         file_system: Arc<FileSystem>,
         guta_gatherer_backup_directory: String,
+        proof_verifier: Option<Arc<N::ZKVerifier>>,
         normal_commit_owner: super::RealmNormalCommitOwner<N::QHash>,
     ) -> anyhow::Result<(Self, tokio::task::JoinHandle<Result<(), anyhow::Error>>)> {
         tracing::info!("[REALM_STARTUP] processor new start");
@@ -138,6 +139,7 @@ where
                 db,
                 guta_queue_gatherer: guta_queue_gatherer,
                 proof_worker_queue_max_time_ms: u64::MAX,
+                proof_verifier,
                 iteration_quiescence: Default::default(),
                 normal_commit_owner: Some(normal_commit_owner),
                 control_owner: None,

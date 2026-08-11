@@ -512,10 +512,12 @@ fn permit_digest(
 pub enum RealmProcessorStartupError {
     StartupProviderMissing,
     CommitRuntimeInstallerMissing,
+    ProofVerifierMissing,
     CommitRuntimeIdentityMismatch,
     ServingCompositionNotIntegrated,
     UnexpectedProviderWhileDisabled,
     UnexpectedCommitRuntimeInstallerWhileDisabled,
+    UnexpectedProofVerifierWhileDisabled,
     ProviderRejected(String),
     DurableEvidenceNotVerified(String),
     DurableRecoveryRequired(String),

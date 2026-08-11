@@ -3,6 +3,7 @@ use std::sync::Arc;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use std::time::Duration;
 use parth_core::{node::realm_identifier::QRealmIdentifier, protocol::core_types::QNetworkTypesConfigHelper};
+use plonky2::plonk::config::PoseidonGoldilocksConfig;
 use psy_core::{job::job_id::QProvingJobDataID, network_config::PsyNetworkLocalDevnetConstants};
 use psy_data::{
     config::network_config::PsyNodeCircuitFingerprintConfigProvider, genesis::genesis_block_setup::PsyGenesisBlockSetupDataProvider,
@@ -19,7 +20,11 @@ use psy_node_scylla::psy_setup::{
 use psy_plonky2_circuits::{
     node::config::networks::resolver::PsyPlonky2NodeConfigResolver,
     protocol_types::ZKTypesPlonky2GoldilocksPoseidon,
+    zk_verifier::PsyPlonky2ZKVerifier,
 };
+
+type C = PoseidonGoldilocksConfig;
+const D: usize = 2;
 
 pub async fn run_startup_plonky2_scylla_coordinator_processor_node(config: &CoordinatorProcessorStartConfig) -> anyhow::Result<()> {
     let resolver = PsyPlonky2NodeConfigResolver {};
@@ -326,6 +331,13 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
             )
         })
         .transpose()?;
+    let proof_verifier = if branch_exact_lineage.is_some() {
+        Some(Arc::new(PsyPlonky2ZKVerifier::<C, D>::for_network(
+            config.network,
+        )?))
+    } else {
+        None
+    };
     let chain_id = config.network.get_chain_id();
     if config.coordinator_api_urls.is_empty() {
         anyhow::bail!("No coordinator API URLs provided for realm processor node");
@@ -386,6 +398,7 @@ pub async fn run_startup_plonky2_scylla_realm_processor_node(config: &RealmProce
                 tag_tree_rewards_store,
                 temp_db,
                 proof_store,
+                proof_verifier,
                 guta_update_queue,
 
                 proof_work_queue,
