@@ -6,7 +6,8 @@
 //! and return this module's non-Clone installed capability.  No live commit
 //! h23c4c3a adds one narrow operation: an affine durable-capture port whose
 //! concrete delivery token and ACK authority remain storage-private.  The
-//! production gatherer is still not wired, so serving remains fail closed.
+//! production gatherer and application handoff are wired behind the serving
+//! guard, which remains fail closed until the later terminal/writer gates.
 
 use std::{marker::PhantomData, sync::Arc};
 
@@ -16,11 +17,13 @@ use psy_data::protocol::chain_context::AuthorityScope;
 
 use crate::queue::{
     realm_processor_durable_capture::{
+        RealmProcessorApplicationHandoffObservation,
         RealmProcessorDurableCaptureError, RealmProcessorDurableCaptureFactory,
         RealmProcessorDurableCaptureOutcome, RealmProcessorDurableCapturePort,
         RealmProcessorDurableCapturedGeneration,
         SealedRealmProcessorDurableCaptureRequest,
     },
+    realm_processor_semantic_output::RealmProcessorSemanticOutput,
     recoverable_ephemeral::PendingQueueCaptureContext,
 };
 
@@ -266,6 +269,27 @@ impl RealmBranchExactDurableCapture<'_> {
     {
         self.port.replay_complete_generation().await
     }
+
+    /// Recovers the exact first application handoff when the pipeline CAS
+    /// committed before the Processor received its response.
+    pub async fn recover_application_handoff(
+        &mut self,
+    ) -> Result<Option<RealmProcessorApplicationHandoffObservation>, RealmProcessorDurableCaptureError>
+    {
+        self.port.recover_application_handoff().await
+    }
+
+    /// Persists one canonical application output and performs the only first
+    /// pipeline CAS allowed by this affine capture owner.
+    pub async fn persist_application_and_handoff(
+        &mut self,
+        semantic: RealmProcessorSemanticOutput,
+    ) -> Result<RealmProcessorApplicationHandoffObservation, RealmProcessorDurableCaptureError>
+    {
+        self.port
+            .persist_application_and_handoff(semantic)
+            .await
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -429,6 +453,25 @@ mod tests {
             RealmProcessorDurableCaptureError,
         > {
             Ok(None)
+        }
+
+        async fn recover_application_handoff(
+            &mut self,
+        ) -> Result<
+            Option<RealmProcessorApplicationHandoffObservation>,
+            RealmProcessorDurableCaptureError,
+        > {
+            Ok(None)
+        }
+
+        async fn persist_application_and_handoff(
+            &mut self,
+            _semantic: RealmProcessorSemanticOutput,
+        ) -> Result<
+            RealmProcessorApplicationHandoffObservation,
+            RealmProcessorDurableCaptureError,
+        > {
+            Err(RealmProcessorDurableCaptureError::ApplicationHandoffNotSealing)
         }
     }
 

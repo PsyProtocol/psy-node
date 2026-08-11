@@ -17,7 +17,9 @@ use psy_node_nats::{
     recoverable_assignment::{
         PendingQueueSegmentAssignmentDigest, PendingQueueSegmentLedgerKey,
     },
-    recoverable_publish::PendingQueuePublishEnvelope,
+    recoverable_publish::{
+        PendingQueuePublishEnvelope, PendingQueuePublisherKind,
+    },
     recoverable_segment::{
         RecoverableNatsRetentionContract, RecoverableNatsSegmentContractDigest,
         RecoverableNatsSegmentId, RecoverableNatsStreamInstanceId,
@@ -28,6 +30,7 @@ use psy_node_nats::{
         RecoverableNatsExistingStreamBinding, RecoverableNatsProvisionedStreamReceipt,
         RecoverableNatsPublishOutcome, RecoverableNatsStreamProvisioningOperationId,
     },
+    recoverable_terminal::PendingQueueSourceTruncationReceipt,
 };
 use scylla::{
     client::session::Session,
@@ -43,6 +46,7 @@ use super::{
     },
     pending_queue_segment_ledger::{
         PendingQueueSegmentAssignmentRouteReceipt,
+        PendingQueueSegmentAssignmentReceipt,
         PendingQueueSegmentRotationActivatedReceipt,
         PendingQueueSegmentRotationStagedReceipt,
         ScyllaPendingQueueSegmentLedgerStore,
@@ -556,6 +560,12 @@ pub(super) struct AssignmentBoundRecoverablePendingQueuePublisher {
 }
 
 impl AssignmentBoundRecoverablePendingQueuePublisher {
+    pub(super) const fn assignment_receipt(
+        &self,
+    ) -> &PendingQueueSegmentAssignmentReceipt {
+        self.route.assignment()
+    }
+
     pub(super) const fn assignment_digest(&self) -> PendingQueueSegmentAssignmentDigest {
         self.route.assignment().assignment().digest()
     }
@@ -586,6 +596,34 @@ impl AssignmentBoundRecoverablePendingQueuePublisher {
             .map_err(ledger)?;
         self.store.revalidate_provisioned(&self.provisioned).await?;
         Ok(outcome)
+    }
+
+    pub(super) async fn revalidate_exact(
+        &self,
+    ) -> Result<(), PendingQueueStreamProvisionError> {
+        self.store
+            .ledger_store
+            .revalidate_assignment_route(&self.route)
+            .await
+            .map_err(ledger)?;
+        self.store.revalidate_provisioned(&self.provisioned).await
+    }
+
+    pub(super) async fn scan_source_retained_set(
+        &self,
+        publisher_kind: PendingQueuePublisherKind,
+    ) -> Result<PendingQueueSourceTruncationReceipt, PendingQueueStreamProvisionError> {
+        self.revalidate_exact().await?;
+        let receipt = self
+            .publisher
+            .scan_source_retained_set(
+                self.route.assignment().assignment(),
+                publisher_kind,
+            )
+            .await
+            .map_err(transport)?;
+        self.revalidate_exact().await?;
+        Ok(receipt)
     }
 }
 
@@ -767,7 +805,7 @@ impl ScyllaPendingQueueStreamProvisionStore {
             .map_err(ledger)
     }
 
-    async fn resolve_assignment_route(
+    pub(super) async fn resolve_assignment_route(
         self: &Arc<Self>,
         nats: &NatsJetStreamClient,
         route: PendingQueueSegmentAssignmentRouteReceipt,

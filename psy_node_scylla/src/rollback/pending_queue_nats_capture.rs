@@ -133,6 +133,14 @@ impl ScyllaBackedRecoverableNatsSource {
         &self.owner
     }
 
+    pub(super) const fn contract(&self) -> &RecoverableNatsConsumerContract {
+        &self.contract
+    }
+
+    pub(super) const fn artifact_store(&self) -> &Arc<ScyllaPendingQueueArtifactStore> {
+        &self.store
+    }
+
     /// Recovers a previously selected batch first; otherwise fetches one new
     /// unacknowledged batch.  Exact Scylla readback always precedes terminal
     /// Data ACK is confirmed before Data progress advances; a trailing Seal is

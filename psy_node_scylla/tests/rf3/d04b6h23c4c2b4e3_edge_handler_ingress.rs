@@ -76,6 +76,13 @@ use psy_node_core::{
             RealmUserUpdateVerifierProfile, RealmUserUpdateVerifierRegistry,
         },
         realm_processor_durable_capture::RealmProcessorDurableCaptureOutcome,
+        realm_processor_application_archive::{
+            RealmProcessorApplicationArchiveBinding,
+            RealmProcessorApplicationArchivePlan,
+        },
+        realm_processor_semantic_output::{
+            RealmProcessorSemanticOutput, RealmProcessorSemanticOutputParts,
+        },
         recoverable_ephemeral::PendingQueueCaptureContext,
     },
     store::{
@@ -136,6 +143,7 @@ use super::{
     branch_exact_shadow_reader_rf3_gate as fixture,
     pending_queue_stream_provision::ScyllaPendingQueueStreamProvisionStore,
     pending_queue_segment_lifecycle_rf3 as realm_fixture, *,
+    realm_processor_application_archive::ScyllaRealmProcessorApplicationArchiveStore,
 };
 
 type N = QNetworkTypesConfigHelper<
@@ -193,6 +201,14 @@ struct E3Report {
     processor_gatherer_integrated: bool,
     processor_gatherer_rf3_runtime: bool,
     semantic_handoff_integrated: bool,
+    application_archive_data_rf3: bool,
+    application_semantic_bytes: usize,
+    application_fragments: u32,
+    application_pipeline_revision: u64,
+    application_restart_recovered: bool,
+    fresh_source_assignment_close: bool,
+    first_pipeline_cas: bool,
+    missing_extra_corrupt_rf3: bool,
     generation_terminal_integrated: bool,
     production_writer_integrated: bool,
     authority_head_publish_integrated: bool,
@@ -231,6 +247,15 @@ const DURABLE_REPLAY_CONTROL_TABLES: &[&str] = &[
 
 const DURABLE_REPLAY_DATA_TABLES: &[&str] = &[
     "branch_exact_pending_queue_artifact_fragment",
+];
+
+const APPLICATION_HANDOFF_CONTROL_TABLES: &[&str] = &[
+    "branch_exact_pending_queue_semantic_generation_v2",
+    "branch_exact_realm_application_archive_header_v1",
+];
+
+const APPLICATION_HANDOFF_DATA_TABLES: &[&str] = &[
+    "branch_exact_realm_application_archive_fragment_v1",
 ];
 
 const HANDLER_MUTATION_CONTROL_TABLES: &[&str] = &[
@@ -300,6 +325,7 @@ async fn handler_mutation_snapshot(session: &Session) -> anyhow::Result<Physical
 async fn direct_one_snapshot(
     ip: std::net::Ipv4Addr,
     include_durable_replay: bool,
+    include_application_handoff: bool,
 ) -> anyhow::Result<PhysicalSnapshot> {
     let session = fixture::connect(Some(ip), Consistency::One).await?;
     let mut control = CONTROL_DIRECT_ONE_TABLES.to_vec();
@@ -307,6 +333,10 @@ async fn direct_one_snapshot(
     if include_durable_replay {
         control.extend_from_slice(DURABLE_REPLAY_CONTROL_TABLES);
         data.extend_from_slice(DURABLE_REPLAY_DATA_TABLES);
+    }
+    if include_application_handoff {
+        control.extend_from_slice(APPLICATION_HANDOFF_CONTROL_TABLES);
+        data.extend_from_slice(APPLICATION_HANDOFF_DATA_TABLES);
     }
     snapshot_tables(&session, &control, &data).await
 }
@@ -899,8 +929,10 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
     )?;
     let exercise_durable_capture =
         std::env::var("PSY_D04B6H23C4C3A_RF3").as_deref() == Ok("1");
-    let exercise_durable_replay =
-        std::env::var("PSY_D04B6H23C4C3B_RF3").as_deref() == Ok("1");
+    let exercise_application_handoff =
+        std::env::var("PSY_D04B6H23C4C4A2B_RF3").as_deref() == Ok("1");
+    let exercise_durable_replay = exercise_application_handoff
+        || std::env::var("PSY_D04B6H23C4C3B_RF3").as_deref() == Ok("1");
     ensure!(
         !exercise_durable_replay || exercise_durable_capture,
         "c3b replay Gate requires the c3a durable capture owner"
@@ -1147,6 +1179,10 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
     let mut durable_generation_items = 0_u64;
     let mut durable_generation_digest_stable = false;
     let mut gather_task_restart_replayed = false;
+    let mut application_semantic_bytes = 0_usize;
+    let mut application_fragments = 0_u32;
+    let mut application_pipeline_revision = 0_u64;
+    let mut application_restart_recovered = false;
     let (durable_capture_items, durable_capture_empty_poll_not_close) =
         if let Some(owner) = branch_exact_commit_owner.as_mut() {
             // Edge always publishes to the gathering generation. Retire the
@@ -1318,10 +1354,216 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                     })?;
                 durable_generation_digest_stable =
                     replayed.digest() == first_digest;
+                let replayed_context_digest = replayed.context().digest();
+                let replayed_generation_digest = replayed.digest();
+                let replayed_boundary_digest = replayed.boundary().digest();
+                let replayed_item_count = replayed.item_count();
                 gather_task_restart_replayed = durable_generation_digest_stable
                     && replayed.into_business_items() == first_items;
                 ensure!(durable_generation_digest_stable);
                 ensure!(gather_task_restart_replayed);
+
+                if exercise_application_handoff {
+                    // Force a real two-fragment application archive while
+                    // keeping this RF=3 fixture below the c4a2b boundary: the
+                    // semantic output is persisted and becomes the first
+                    // pipeline candidate, but no proof/writer/head path runs.
+                    let semantic = RealmProcessorSemanticOutput::try_from_candidate_parts(
+                        RealmProcessorSemanticOutputParts {
+                            context_digest: replayed_context_digest,
+                            generation_digest: replayed_generation_digest,
+                            boundary_digest: replayed_boundary_digest,
+                            item_count: replayed_item_count,
+                            processing_checkpoint_id: checkpoint_id,
+                            processing_checkpoint_root: [0xA1; 32],
+                            processing_realm_start_root: [0xA2; 32],
+                            old_realm_root: [0xA2; 32],
+                            new_realm_root: [0xA3; 32],
+                            total_users_updated: 1,
+                            total_proofs_generated: 0,
+                            global_user_tree_nodes: vec![
+                                0xA4;
+                                4 * 1024 * 1024 + 1
+                            ],
+                            user_contract_tree_nodes: Vec::new(),
+                            contract_state_tree_nodes: Vec::new(),
+                            user_leaves: Vec::new(),
+                            contract_state_imt_leaves: Vec::new(),
+                            guta_header: vec![0xA5, 0xA6],
+                            jobs: Vec::new(),
+                            deferred_jobs: Vec::new(),
+                        },
+                    )?;
+                    application_semantic_bytes = semantic.canonical_len()?;
+                    application_fragments = u32::try_from(
+                        application_semantic_bytes.div_ceil(4 * 1024 * 1024),
+                    )?;
+                    ensure!(application_fragments == 2);
+                    let handoff = restarted_capture
+                        .persist_application_and_handoff(semantic)
+                        .await?;
+                    ensure!(handoff.has_application_work());
+                    application_pipeline_revision = handoff.pipeline_revision();
+                    let same_owner_recovery = restarted_capture
+                        .recover_application_handoff()
+                        .await?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "application handoff owner did not expose its durable result"
+                            )
+                        })?;
+                    ensure!(same_owner_recovery == handoff);
+                    let expected_handoff = handoff;
+                    drop(restarted_capture);
+                    drop(restarted_iteration);
+
+                    // Re-open after the authority transition.  Recovery must
+                    // select the immutable application archive from the
+                    // current pipeline row; it must not recreate the NATS
+                    // owner or synthesize the old close receipt.
+                    let mut recovered_iteration = owner.begin_iteration(
+                        iteration_gate.try_begin_iteration()?,
+                    )?;
+                    let mut recovered_capture = recovered_iteration
+                        .open_durable_capture_for_processing(capture.processing())
+                        .await?;
+                    let recovered = recovered_capture
+                        .recover_application_handoff()
+                        .await?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "post-CAS capture reopen did not recover application handoff"
+                            )
+                        })?;
+                    ensure!(recovered == expected_handoff);
+                    application_restart_recovered = true;
+
+                    // Exercise the real Scylla scanner against three
+                    // independent, non-authoritative archive slots.  Raw CQL
+                    // is deliberately confined to this RF=3 poison fixture:
+                    // production adapters expose no delete/overwrite/extra
+                    // coordinate API.
+                    let poison_store = ScyllaRealmProcessorApplicationArchiveStore::prepare(
+                        Arc::clone(&session),
+                        control.clone(),
+                        PendingQueueArtifactDataKeyspace::try_new(fixture::KEYSPACE)?,
+                    )
+                    .await?;
+                    for poison_case in 1_u8..=3 {
+                        let binding = RealmProcessorApplicationArchiveBinding::try_new(
+                            network.chain_id(),
+                            REALM_ID,
+                            REALM_SUB_ID,
+                            [0xB0 + poison_case; 32],
+                            [0xC0 + poison_case; 32],
+                            [0xD0 + poison_case; 32],
+                            [0xE0 + poison_case; 32],
+                            [0x90 + poison_case; 32],
+                            u64::from(poison_case),
+                            [0x70 + poison_case; 32],
+                            [0x60 + poison_case; 32],
+                        )?;
+                        let semantic = RealmProcessorSemanticOutput::try_from_candidate_parts(
+                            RealmProcessorSemanticOutputParts {
+                                context_digest: replayed_context_digest,
+                                generation_digest: replayed_generation_digest,
+                                boundary_digest: replayed_boundary_digest,
+                                item_count: replayed_item_count,
+                                processing_checkpoint_id: checkpoint_id,
+                                processing_checkpoint_root: [0x40 + poison_case; 32],
+                                processing_realm_start_root: [0x50 + poison_case; 32],
+                                old_realm_root: [0x50 + poison_case; 32],
+                                new_realm_root: [0x51 + poison_case; 32],
+                                total_users_updated: 1,
+                                total_proofs_generated: 0,
+                                global_user_tree_nodes: vec![poison_case; 1024],
+                                user_contract_tree_nodes: Vec::new(),
+                                contract_state_tree_nodes: Vec::new(),
+                                user_leaves: Vec::new(),
+                                contract_state_imt_leaves: Vec::new(),
+                                guta_header: vec![poison_case],
+                                jobs: Vec::new(),
+                                deferred_jobs: Vec::new(),
+                            },
+                        )?;
+                        let plan = RealmProcessorApplicationArchivePlan::try_new(
+                            binding,
+                            &semantic,
+                        )?;
+                        ensure!(plan.fragments().len() == 1);
+                        poison_store.persist_and_readback(&plan).await?;
+                        let fragment = &plan.fragments()[0];
+                        let fragment_table = format!(
+                            "{}.branch_exact_realm_application_archive_fragment_v1",
+                            fixture::KEYSPACE,
+                        );
+                        match poison_case {
+                            1 => {
+                                session
+                                    .query_unpaged(
+                                        format!(
+                                            "INSERT INTO {fragment_table} (archive_slot, application_digest, fragment_bucket, fragment_index, fragment_count, application_bytes, payload, payload_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+                                        ),
+                                        (
+                                            fragment.slot().as_bytes().as_slice(),
+                                            fragment.semantic_digest().as_bytes().as_slice(),
+                                            i64::from(fragment.bucket()),
+                                            1_i32,
+                                            i32::try_from(fragment.fragment_count())?,
+                                            i64::try_from(fragment.semantic_bytes())?,
+                                            fragment.payload(),
+                                            fragment.payload_digest().as_bytes().as_slice(),
+                                        ),
+                                    )
+                                    .await?;
+                            }
+                            2 => {
+                                let mut corrupt = fragment.payload().to_vec();
+                                corrupt[0] ^= 1;
+                                session
+                                    .query_unpaged(
+                                        format!(
+                                            "INSERT INTO {fragment_table} (archive_slot, application_digest, fragment_bucket, fragment_index, fragment_count, application_bytes, payload, payload_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+                                        ),
+                                        (
+                                            fragment.slot().as_bytes().as_slice(),
+                                            fragment.semantic_digest().as_bytes().as_slice(),
+                                            i64::from(fragment.bucket()),
+                                            i32::try_from(fragment.index())?,
+                                            i32::try_from(fragment.fragment_count())?,
+                                            i64::try_from(fragment.semantic_bytes())?,
+                                            corrupt,
+                                            fragment.payload_digest().as_bytes().as_slice(),
+                                        ),
+                                    )
+                                    .await?;
+                            }
+                            3 => {
+                                session
+                                    .query_unpaged(
+                                        format!(
+                                            "DELETE FROM {fragment_table} WHERE archive_slot = ? AND application_digest = ? AND fragment_bucket = ? AND fragment_index = ?"
+                                        ),
+                                        (
+                                            fragment.slot().as_bytes().as_slice(),
+                                            fragment.semantic_digest().as_bytes().as_slice(),
+                                            i64::from(fragment.bucket()),
+                                            i32::try_from(fragment.index())?,
+                                        ),
+                                    )
+                                    .await?;
+                            }
+                            _ => unreachable!(),
+                        }
+                        ensure!(
+                            poison_store
+                                .read_selected(plan.header().slot())
+                                .await
+                                .is_err(),
+                            "RF=3 application scanner accepted poison case {poison_case}",
+                        );
+                    }
+                }
                 true
             } else {
                 let empty = capture_owner.capture_next().await?.is_none();
@@ -1384,7 +1626,11 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
     let repair_ms = repair_started.elapsed().as_millis();
     let replicas = futures::future::join_all(
         fixture::NODE_IPS.map(|ip| {
-            direct_one_snapshot(ip, exercise_durable_replay)
+            direct_one_snapshot(
+                ip,
+                exercise_durable_replay,
+                exercise_application_handoff,
+            )
         }),
     )
     .await
@@ -1401,6 +1647,12 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                 + if exercise_durable_replay {
                     DURABLE_REPLAY_CONTROL_TABLES.len()
                         + DURABLE_REPLAY_DATA_TABLES.len()
+                } else {
+                    0
+                }
+                + if exercise_application_handoff {
+                    APPLICATION_HANDOFF_CONTROL_TABLES.len()
+                        + APPLICATION_HANDOFF_DATA_TABLES.len()
                 } else {
                     0
                 }
@@ -1449,6 +1701,26 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
             "branch_exact_pending_queue_publish_payload_fragment_v1",
         )? == 3
     );
+    if exercise_application_handoff {
+        ensure!(
+            replica.row_count(
+                &control,
+                "branch_exact_pending_queue_semantic_generation_v2",
+            )? == 1
+        );
+        ensure!(
+            replica.row_count(
+                &control,
+                "branch_exact_realm_application_archive_header_v1",
+            )? == 4
+        );
+        ensure!(
+            replica.row_count(
+                fixture::KEYSPACE,
+                "branch_exact_realm_application_archive_fragment_v1",
+            )? == usize::try_from(application_fragments)? + 3
+        );
+    }
 
     let report = E3Report {
         scylla_image: IMAGE,
@@ -1493,13 +1765,23 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
         // by common-crate actor/Processor tests, but the serving guard remains
         // intentionally closed; this RF=3 process does not run a full node.
         processor_gatherer_rf3_runtime: false,
-        semantic_handoff_integrated: false,
+        semantic_handoff_integrated: exercise_application_handoff,
+        application_archive_data_rf3: exercise_application_handoff,
+        application_semantic_bytes,
+        application_fragments,
+        application_pipeline_revision,
+        application_restart_recovered,
+        fresh_source_assignment_close: exercise_application_handoff,
+        first_pipeline_cas: exercise_application_handoff,
+        missing_extra_corrupt_rf3: exercise_application_handoff,
         generation_terminal_integrated: false,
         production_writer_integrated: false,
         authority_head_publish_integrated: false,
         full_node_restart_tested: false,
         h8_domains_closed: 0,
-        qualification: if exercise_durable_replay {
+        qualification: if exercise_application_handoff {
+            "H23C4C4A2B_REALM_APPLICATION_HANDOFF_RF3_PASSED"
+        } else if exercise_durable_replay {
             "H23C4C3B_PROCESSOR_GATHERER_REPLAY_RF3_PASSED"
         } else if exercise_durable_capture {
             "H23C4C3A_DURABLE_CAPTURE_OWNER_RF3_PASSED"

@@ -10,14 +10,23 @@
 
 use std::{collections::BTreeSet, error::Error, fmt, sync::Arc};
 
-use psy_node_core::queue::{
-    realm_processor_application_archive::{
-        reconstruct_realm_application_archive, RealmProcessorApplicationArchiveError,
-        RealmProcessorApplicationArchiveFragment,
-        RealmProcessorApplicationArchiveHeader, RealmProcessorApplicationArchivePlan,
-        RealmProcessorApplicationArchiveSlot, REALM_APPLICATION_ARCHIVE_MAX_BUCKETS,
+use parth_core::protocol::core_types::Q256BitHash;
+use psy_data::protocol::chain_context::AuthorityScope;
+use psy_node_core::{
+    queue::{
+        realm_processor_application_archive::{
+            reconstruct_realm_application_archive, RealmProcessorApplicationArchiveError,
+            RealmProcessorApplicationArchiveFragment,
+            RealmProcessorApplicationArchiveHeader, RealmProcessorApplicationArchivePlan,
+            RealmProcessorApplicationArchiveSlot, REALM_APPLICATION_ARCHIVE_MAX_BUCKETS,
+        },
+        realm_processor_semantic_output::RealmProcessorSemanticOutput,
     },
-    realm_processor_semantic_output::RealmProcessorSemanticOutput,
+    store::pending_generation_pipeline::{
+        PendingEmptyQueueSealDigest, PendingPipelineReadState,
+        PendingPipelineRevision, PendingPipelineWriteOutcome,
+        PendingProcessingState, PendingWorkCaptureDigest, StoredPendingPipeline,
+    },
 };
 use scylla::{
     client::session::Session,
@@ -27,7 +36,11 @@ use scylla::{
 };
 use sha2::{Digest, Sha256};
 
-use super::{BranchExactDeploymentNoTabletKeyspace, PendingQueueArtifactDataKeyspace};
+use super::{
+    BranchExactDeploymentNoTabletKeyspace, PendingQueueArtifactDataKeyspace,
+    PendingQueueSegmentAssignmentReceipt, PersistedPendingQueueCloseReceipt,
+    ScyllaPendingPipelineStore,
+};
 
 pub const REALM_PROCESSOR_APPLICATION_ARCHIVE_HEADER_TABLE: &str =
     "branch_exact_realm_application_archive_header_v1";
@@ -159,6 +172,46 @@ impl PersistedRealmProcessorApplicationArchiveReceipt {
     }
     pub(super) const fn header(&self) -> &RealmProcessorApplicationArchiveHeader { &self.header }
     pub(super) const fn semantic(&self) -> &RealmProcessorSemanticOutput { &self.semantic }
+}
+
+/// Exact first-candidate pipeline readback. It deliberately grants no
+/// terminal, rotation, proof, writer or authority-head capability.
+#[derive(Debug)]
+pub(super) struct PersistedRealmProcessorApplicationHandoffReceipt {
+    application_store_fingerprint: RealmProcessorApplicationArchiveStoreFingerprint,
+    archive_slot: RealmProcessorApplicationArchiveSlot,
+    archive_digest: [u8; 32],
+    semantic_digest: [u8; 32],
+    pipeline_revision: PendingPipelineRevision,
+    pipeline_state: PendingProcessingState,
+}
+
+impl PersistedRealmProcessorApplicationHandoffReceipt {
+    pub(super) const fn archive_slot(&self) -> RealmProcessorApplicationArchiveSlot {
+        self.archive_slot
+    }
+
+    pub(super) const fn archive_digest(&self) -> &[u8; 32] {
+        &self.archive_digest
+    }
+
+    pub(super) const fn semantic_digest(&self) -> &[u8; 32] {
+        &self.semantic_digest
+    }
+
+    pub(super) const fn pipeline_revision(&self) -> PendingPipelineRevision {
+        self.pipeline_revision
+    }
+
+    pub(super) const fn has_application_work(&self) -> bool {
+        matches!(self.pipeline_state, PendingProcessingState::WorkCaptured(_))
+    }
+
+    pub(super) const fn store_fingerprint(
+        &self,
+    ) -> RealmProcessorApplicationArchiveStoreFingerprint {
+        self.application_store_fingerprint
+    }
 }
 
 #[derive(scylla::DeserializeRow)]
@@ -342,6 +395,161 @@ impl ScyllaRealmProcessorApplicationArchiveStore {
         }))
     }
 
+    /// Point-select the immutable header and exhaustively reconstruct its
+    /// selected content namespace. This is the only recovery path after the
+    /// first pipeline CAS has replaced `Sealing(close)`.
+    pub(super) async fn read_selected(
+        &self,
+        slot: RealmProcessorApplicationArchiveSlot,
+    ) -> Result<Option<PersistedRealmProcessorApplicationArchiveReceipt>, RealmProcessorApplicationArchiveStoreError> {
+        let Some(header) = self.read_header(slot).await? else {
+            return Ok(None);
+        };
+        let semantic = reconstruct_realm_application_archive(
+            &header,
+            self.scan_fragments(&header).await?,
+        )?;
+        Ok(Some(PersistedRealmProcessorApplicationArchiveReceipt {
+            store_fingerprint: self.fingerprint,
+            header,
+            semantic,
+        }))
+    }
+
+    pub(super) async fn revalidate_exact(
+        &self,
+        receipt: &PersistedRealmProcessorApplicationArchiveReceipt,
+    ) -> Result<(), RealmProcessorApplicationArchiveStoreError> {
+        if receipt.store_fingerprint != self.fingerprint {
+            return Err(RealmProcessorApplicationArchiveStoreError::HandoffMismatch);
+        }
+        let current = self
+            .read_exact(receipt.header())
+            .await?
+            .ok_or(RealmProcessorApplicationArchiveStoreError::HandoffMismatch)?;
+        if current.header != receipt.header || current.semantic != receipt.semantic {
+            return Err(RealmProcessorApplicationArchiveStoreError::HandoffMismatch);
+        }
+        Ok(())
+    }
+
+    /// Publish this exact application archive as the first pipeline candidate.
+    /// Both revision and full pipeline payload are compared by the underlying
+    /// LWT. A conflict may be recovered only when it selects this exact
+    /// archive slot and semantic digest.
+    pub(super) async fn handoff_to_pipeline<Hash: Q256BitHash>(
+        &self,
+        pipeline_store: &ScyllaPendingPipelineStore,
+        assignment: &PendingQueueSegmentAssignmentReceipt,
+        close: &PersistedPendingQueueCloseReceipt,
+        receipt: &PersistedRealmProcessorApplicationArchiveReceipt,
+    ) -> Result<PersistedRealmProcessorApplicationHandoffReceipt, RealmProcessorApplicationArchiveStoreError> {
+        self.revalidate_exact(receipt).await?;
+        validate_binding(
+            receipt.header(),
+            assignment,
+            pipeline_store,
+            Some(close),
+        )?;
+        let context = assignment.assignment().context();
+        pipeline_store
+            .revalidate_queue_close_exact::<Hash>(context, close)
+            .await
+            .map_err(pipeline)?;
+        let PendingPipelineReadState::Current(current) = pipeline_store
+            .read::<Hash>(context.key())
+            .await
+            .map_err(pipeline)?
+        else {
+            return Err(RealmProcessorApplicationArchiveStoreError::HandoffMismatch);
+        };
+        if current.revision() != close.revision()
+            || current.processing_state()
+                != PendingProcessingState::Sealing(close.close_intent())
+        {
+            return Err(RealmProcessorApplicationArchiveStoreError::HandoffMismatch);
+        }
+        let evidence = *receipt.header().slot().as_bytes();
+        let transition = if receipt.semantic().has_application_work() {
+            current.seal_capture_work(
+                close.close_intent(),
+                PendingWorkCaptureDigest::try_new(evidence).map_err(model_pipeline)?,
+            )
+        } else {
+            current.seal_empty_queue(
+                close.close_intent(),
+                PendingEmptyQueueSealDigest::try_new(evidence).map_err(model_pipeline)?,
+            )
+        }
+        .map_err(model_pipeline)?;
+        let expected = transition.candidate().clone();
+        let observed = match pipeline_store.apply(&transition).await.map_err(pipeline)? {
+            PendingPipelineWriteOutcome::Applied(current)
+            | PendingPipelineWriteOutcome::Idempotent(current) => current,
+            PendingPipelineWriteOutcome::Conflict(_) => {
+                let recovered = self
+                    .recover_handoff_from_pipeline::<Hash>(pipeline_store, assignment)
+                    .await?;
+                if recovered.archive_slot != receipt.header().slot()
+                    || recovered.archive_digest != *receipt.header().digest().as_bytes()
+                    || recovered.semantic_digest
+                        != *receipt.header().semantic_digest().as_bytes()
+                {
+                    return Err(RealmProcessorApplicationArchiveStoreError::HandoffConflict);
+                }
+                return Ok(recovered);
+            }
+        };
+        if observed != expected {
+            return Err(RealmProcessorApplicationArchiveStoreError::HandoffMismatch);
+        }
+        self.revalidate_exact(receipt).await?;
+        handoff_receipt(self.fingerprint, receipt, &observed)
+    }
+
+    /// Recover an exact first handoff after the pipeline CAS committed and the
+    /// caller lost its response. The immutable header carries the old close
+    /// identity, so recovery never fabricates a stale `Sealing` receipt.
+    pub(super) async fn recover_handoff_from_pipeline<Hash: Q256BitHash>(
+        &self,
+        pipeline_store: &ScyllaPendingPipelineStore,
+        assignment: &PendingQueueSegmentAssignmentReceipt,
+    ) -> Result<PersistedRealmProcessorApplicationHandoffReceipt, RealmProcessorApplicationArchiveStoreError> {
+        let context = assignment.assignment().context();
+        let PendingPipelineReadState::Current(current) = pipeline_store
+            .read::<Hash>(context.key())
+            .await
+            .map_err(pipeline)?
+        else {
+            return Err(RealmProcessorApplicationArchiveStoreError::HandoffMismatch);
+        };
+        if current.key() != context.key()
+            || current.activation_digest() != context.activation()
+            || current.processing() != context.processing()
+            || current.blocked_reason().is_some()
+        {
+            return Err(RealmProcessorApplicationArchiveStoreError::HandoffMismatch);
+        }
+        let (slot, observed_work) = first_handoff_slot(current.processing_state())?;
+        let archive = self
+            .read_selected(slot)
+            .await?
+            .ok_or(RealmProcessorApplicationArchiveStoreError::HandoffMismatch)?;
+        validate_binding(archive.header(), assignment, pipeline_store, None)?;
+        let expected_revision = archive
+            .header()
+            .binding()
+            .pipeline_close_revision()
+            .checked_add(1)
+            .ok_or(RealmProcessorApplicationArchiveStoreError::CounterOverflow)?;
+        if current.revision().get() != expected_revision
+            || archive.semantic().has_application_work() != observed_work
+        {
+            return Err(RealmProcessorApplicationArchiveStoreError::HandoffMismatch);
+        }
+        handoff_receipt(self.fingerprint, &archive, &current)
+    }
+
     async fn read_header(
         &self,
         slot: RealmProcessorApplicationArchiveSlot,
@@ -420,6 +628,82 @@ impl ScyllaRealmProcessorApplicationArchiveStore {
     }
 }
 
+fn validate_binding(
+    header: &RealmProcessorApplicationArchiveHeader,
+    assignment: &PendingQueueSegmentAssignmentReceipt,
+    pipeline_store: &ScyllaPendingPipelineStore,
+    close: Option<&PersistedPendingQueueCloseReceipt>,
+) -> Result<(), RealmProcessorApplicationArchiveStoreError> {
+    let context = assignment.assignment().context();
+    let AuthorityScope::Realm {
+        realm_id,
+        realm_sub_id,
+    } = context.key().authority()
+    else {
+        return Err(RealmProcessorApplicationArchiveStoreError::HandoffMismatch);
+    };
+    let binding = header.binding();
+    if binding.network_chain_id() != context.key().network().chain_id()
+        || binding.realm_id() != realm_id
+        || binding.realm_sub_id() != realm_sub_id
+        || binding.assignment_digest() != assignment.assignment().digest().as_bytes()
+        || binding.pipeline_store_fingerprint() != pipeline_store.fingerprint().as_bytes()
+        || header.context_digest() != context.digest().as_bytes()
+    {
+        return Err(RealmProcessorApplicationArchiveStoreError::HandoffMismatch);
+    }
+    if let Some(close) = close {
+        if !close.matches_context(context)
+            || binding.pipeline_close_revision() != close.revision().get()
+            || binding.pipeline_close_receipt_digest() != close.receipt_digest()
+            || binding.close_intent_digest() != close.close_intent().as_bytes()
+            || binding.pipeline_store_fingerprint() != close.store_fingerprint().as_bytes()
+        {
+            return Err(RealmProcessorApplicationArchiveStoreError::HandoffMismatch);
+        }
+    }
+    Ok(())
+}
+
+fn first_handoff_slot(
+    state: PendingProcessingState,
+) -> Result<(RealmProcessorApplicationArchiveSlot, bool), RealmProcessorApplicationArchiveStoreError>
+{
+    match state {
+        PendingProcessingState::WorkCaptured(capture) => Ok((
+            RealmProcessorApplicationArchiveSlot::try_new(*capture.as_bytes())?,
+            true,
+        )),
+        PendingProcessingState::EmptyQueueSealed(seal) => Ok((
+            RealmProcessorApplicationArchiveSlot::try_new(*seal.as_bytes())?,
+            false,
+        )),
+        _ => Err(RealmProcessorApplicationArchiveStoreError::HandoffMismatch),
+    }
+}
+
+fn handoff_receipt<Hash: Q256BitHash>(
+    fingerprint: RealmProcessorApplicationArchiveStoreFingerprint,
+    archive: &PersistedRealmProcessorApplicationArchiveReceipt,
+    pipeline: &StoredPendingPipeline<Hash>,
+) -> Result<PersistedRealmProcessorApplicationHandoffReceipt, RealmProcessorApplicationArchiveStoreError>
+{
+    let (slot, has_work) = first_handoff_slot(pipeline.processing_state())?;
+    if slot != archive.header().slot()
+        || has_work != archive.semantic().has_application_work()
+    {
+        return Err(RealmProcessorApplicationArchiveStoreError::HandoffMismatch);
+    }
+    Ok(PersistedRealmProcessorApplicationHandoffReceipt {
+        application_store_fingerprint: fingerprint,
+        archive_slot: slot,
+        archive_digest: *archive.header().digest().as_bytes(),
+        semantic_digest: *archive.header().semantic_digest().as_bytes(),
+        pipeline_revision: pipeline.revision(),
+        pipeline_state: pipeline.processing_state(),
+    })
+}
+
 fn fragment_binding(
     fragment: &RealmProcessorApplicationArchiveFragment,
 ) -> Result<(Vec<u8>, i64, i32, Vec<u8>, i32, i64, Vec<u8>, Vec<u8>), RealmProcessorApplicationArchiveStoreError> {
@@ -489,6 +773,14 @@ fn cql(error: impl fmt::Display) -> RealmProcessorApplicationArchiveStoreError {
     RealmProcessorApplicationArchiveStoreError::Cql(error.to_string())
 }
 
+fn pipeline(error: impl fmt::Display) -> RealmProcessorApplicationArchiveStoreError {
+    RealmProcessorApplicationArchiveStoreError::Pipeline(error.to_string())
+}
+
+fn model_pipeline(error: impl fmt::Display) -> RealmProcessorApplicationArchiveStoreError {
+    RealmProcessorApplicationArchiveStoreError::Pipeline(error.to_string())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum RealmProcessorApplicationArchiveStoreError {
     Archive(RealmProcessorApplicationArchiveError),
@@ -499,6 +791,10 @@ pub(super) enum RealmProcessorApplicationArchiveStoreError {
     HeaderMissingAfterLwt,
     MissingAppliedColumn,
     InvalidAppliedColumn,
+    HandoffMismatch,
+    HandoffConflict,
+    CounterOverflow,
+    Pipeline(String),
     IndeterminateWrite(String),
     Cql(String),
 }
@@ -550,5 +846,33 @@ mod tests {
         assert!(source.contains("plan.reconstruct_exact(self.scan_fragments(plan.header()).await?)"));
         assert!(!source.contains(&["Consistency", "::One"].concat()));
         assert!(!source.contains(&["DELETE", " FROM"].concat()));
+    }
+
+    #[test]
+    fn first_handoff_is_full_payload_cas_and_recovery_is_slot_selected() {
+        let source = include_str!("realm_processor_application_archive.rs");
+        let handoff = source
+            .split("pub(super) async fn handoff_to_pipeline")
+            .nth(1)
+            .unwrap()
+            .split("pub(super) async fn recover_handoff_from_pipeline")
+            .next()
+            .unwrap();
+        assert!(handoff.contains("revalidate_queue_close_exact"));
+        assert!(handoff.contains("seal_capture_work"));
+        assert!(handoff.contains("seal_empty_queue"));
+        assert!(handoff.contains("pipeline_store.apply(&transition)"));
+        assert!(handoff.contains("recover_handoff_from_pipeline"));
+        let recovery = source
+            .split("pub(super) async fn recover_handoff_from_pipeline")
+            .nth(1)
+            .unwrap()
+            .split("async fn read_header")
+            .next()
+            .unwrap();
+        assert!(recovery.contains("first_handoff_slot"));
+        assert!(recovery.contains("read_selected(slot)"));
+        assert!(recovery.contains("pipeline_close_revision()"));
+        assert!(!recovery.contains("read_queue_close_exact"));
     }
 }

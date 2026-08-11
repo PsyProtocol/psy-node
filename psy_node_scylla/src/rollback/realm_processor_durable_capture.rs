@@ -1,6 +1,6 @@
 //! Storage-owned durable capture authority for one Realm Processor iteration.
 //!
-//! This is intentionally not wired to the legacy gatherer yet.  It composes
+//! This is intentionally isolated from the legacy authority path.  It composes
 //! the already-qualified assignment, stream binding, consumer gate, artifact
 //! store and explicit-ACK transport behind the high-level core port.
 
@@ -15,6 +15,7 @@ use psy_data::protocol::{
 use psy_node_core::{
     queue::{
         realm_processor_durable_capture::{
+            RealmProcessorApplicationHandoffObservation,
             RealmProcessorDurableCaptureError,
             RealmProcessorDurableCaptureFactory,
             RealmProcessorDurableCaptureOutcome,
@@ -23,6 +24,8 @@ use psy_node_core::{
             RealmProcessorDurableCapturedGeneration,
             SealedRealmProcessorDurableCaptureRequest,
         },
+        realm_processor_application_archive::RealmProcessorApplicationArchivePlan,
+        realm_processor_semantic_output::RealmProcessorSemanticOutput,
         recoverable_artifact::{
             PendingQueueArtifactOwnerAttemptId,
             PendingQueueArtifactOwnerReasonDigest,
@@ -32,6 +35,9 @@ use psy_node_core::{
             PendingQueueCaptureCandidate, PendingQueueGenerationBoundary,
             PendingQueueSourceCursorView,
         },
+    },
+    store::pending_generation_pipeline::{
+        PendingPipelineReadState, PendingProcessingState,
     },
 };
 use psy_node_nats::{
@@ -64,6 +70,20 @@ use super::pending_queue_nats_capture::{
     PendingQueueNatsCaptureOutcome, ScyllaBackedRecoverableNatsSource,
 };
 use super::pending_queue_stream_provision::ScyllaPendingQueueStreamProvisionStore;
+use super::pending_queue_stream_provision::AssignmentBoundRecoverablePendingQueuePublisher;
+use super::pending_queue_publish_store::{
+    ScyllaPendingQueuePublishStore, ScyllaPendingQueuePublishStoreFactory,
+};
+use super::pending_queue_semantic_aggregate::{
+    PersistedPendingQueueSemanticGenerationReceipt,
+    ScyllaPendingQueueSemanticAggregateStore,
+    StoredPendingQueueSemanticGeneration,
+};
+use super::pending_queue_semantic_terminal::verify_semantic_source_terminal;
+use super::realm_processor_application_archive::{
+    PersistedRealmProcessorApplicationHandoffReceipt,
+    ScyllaRealmProcessorApplicationArchiveStore,
+};
 
 const OWNER_ATTEMPT_DOMAIN: &[u8] =
     b"psy/rollback/realm-processor-capture-owner-attempt/v1";
@@ -86,6 +106,9 @@ pub(crate) struct ScyllaRealmProcessorDurableCaptureFactory<Hash> {
     provision: Arc<ScyllaPendingQueueStreamProvisionStore>,
     artifact: Arc<ScyllaPendingQueueArtifactStore>,
     consumer_gate: Arc<ScyllaPendingQueueConsumerGateStore>,
+    publish_factory: Arc<ScyllaPendingQueuePublishStoreFactory>,
+    transport_archive: Arc<ScyllaPendingQueueSemanticAggregateStore>,
+    application_archive: Arc<ScyllaRealmProcessorApplicationArchiveStore>,
     _hash: PhantomData<Hash>,
 }
 
@@ -136,15 +159,38 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
         let consumer_gate = Arc::new(
             ScyllaPendingQueueConsumerGateStore::prepare(
                 session.clone(),
-                control,
+                control.clone(),
             )
             .await
             .map_err(backend)?,
         );
         let artifact = Arc::new(
             ScyllaPendingQueueArtifactStore::prepare(
-                session,
+                session.clone(),
                 keyspaces.artifact_keyspaces().map_err(backend)?,
+            )
+            .await
+            .map_err(backend)?,
+        );
+        let publish_factory = ScyllaPendingQueuePublishStore::prepare_factory(
+            session.clone(),
+            keyspaces.publish_keyspaces().map_err(backend)?,
+        )
+        .await
+        .map_err(backend)?;
+        let transport_archive = Arc::new(
+            ScyllaPendingQueueSemanticAggregateStore::prepare(
+                session.clone(),
+                control.clone(),
+            )
+            .await
+            .map_err(backend)?,
+        );
+        let application_archive = Arc::new(
+            ScyllaRealmProcessorApplicationArchiveStore::prepare(
+                session,
+                control,
+                keyspaces.application_data_keyspace().map_err(backend)?,
             )
             .await
             .map_err(backend)?,
@@ -160,6 +206,9 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
             provision,
             artifact,
             consumer_gate,
+            publish_factory,
+            transport_archive,
+            application_archive,
             _hash: PhantomData,
         })
     }
@@ -188,11 +237,6 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
             return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
         }
 
-        let close = self
-            .pipeline
-            .read_queue_close_exact::<Hash>(context)
-            .await
-            .map_err(backend)?;
         let ledger_key = PendingQueueSegmentLedgerKey::try_new(
             context.key(),
             self.nats.base_namespace(),
@@ -203,35 +247,108 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
             .read_assignment_route_exact(&ledger_key, context)
             .await
             .map_err(backend)?;
-        let provisioned = self
-            .provision
-            .read_provisioned(route.ledger_key(), route.segment())
+        let PendingPipelineReadState::Current(pipeline) = self
+            .pipeline
+            .read::<Hash>(context.key())
+            .await
+            .map_err(backend)?
+        else {
+            return Err(RealmProcessorDurableCaptureError::ApplicationHandoffNotSealing);
+        };
+        if pipeline.activation_digest() != context.activation()
+            || pipeline.processing() != context.processing()
+            || pipeline.blocked_reason().is_some()
+        {
+            return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
+        }
+        if matches!(
+            pipeline.processing_state(),
+            PendingProcessingState::WorkCaptured(_)
+                | PendingProcessingState::EmptyQueueSealed(_)
+        ) {
+            let handoff = self
+                .application_archive
+                .recover_handoff_from_pipeline::<Hash>(
+                    &self.pipeline,
+                    route.assignment(),
+                )
+                .await
+                .map_err(backend)?;
+            let archive = self
+                .application_archive
+                .read_selected(handoff.archive_slot())
+                .await
+                .map_err(backend)?
+                .ok_or(RealmProcessorDurableCaptureError::IdentityMismatch)?;
+            self.transport_archive
+                .revalidate_realm_application_header(
+                    route.assignment(),
+                    archive.header(),
+                )
+                .await
+                .map_err(backend)?;
+            let second = self
+                .application_archive
+                .recover_handoff_from_pipeline::<Hash>(
+                    &self.pipeline,
+                    route.assignment(),
+                )
+                .await
+                .map_err(backend)?;
+            if handoff.archive_slot() != second.archive_slot()
+                || handoff.archive_digest() != second.archive_digest()
+                || handoff.semantic_digest() != second.semantic_digest()
+                || handoff.pipeline_revision() != second.pipeline_revision()
+            {
+                return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
+            }
+            return Ok(ScyllaRealmProcessorDurableCapture {
+                pipeline: self.pipeline.clone(),
+                transport_archive: self.transport_archive.clone(),
+                application_archive: self.application_archive.clone(),
+                context,
+                mode: ScyllaRealmProcessorCaptureMode::Recovered(handoff),
+                _hash: PhantomData,
+            });
+        }
+        if !matches!(pipeline.processing_state(), PendingProcessingState::Sealing(_)) {
+            return Err(RealmProcessorDurableCaptureError::ApplicationHandoffNotSealing);
+        }
+        let close = self
+            .pipeline
+            .read_queue_close_exact::<Hash>(context)
             .await
             .map_err(backend)?;
+        let publisher = Arc::new(
+            self.provision
+                .resolve_assignment_route(&self.nats, route)
+                .await
+                .map_err(backend)?,
+        );
         let live = self
             .nats
-            .observe_recoverable_segment_instance(route.segment().clone())
+            .observe_recoverable_segment_instance(publisher.segment().clone())
             .await
             .map_err(backend)?;
-        if live.instance_id() != provisioned.instance_id() {
+        if live.instance_id() != publisher.instance_id() {
             return Err(RealmProcessorDurableCaptureError::RuntimeCapabilityMismatch);
         }
 
         let source_route = RecoverableNatsSourceRoute::try_new(
             context,
             PendingQueuePublisherKind::RealmUserUpdate,
-            route.segment(),
+            publisher.segment(),
         )
         .map_err(backend)?;
         let spec = RecoverableNatsCaptureSpec::for_segment(
-            route.segment().clone(),
+            publisher.segment().clone(),
             source_route.subject(),
             CAPTURE_BATCH_LIMIT,
         )
         .map_err(backend)?;
         let gate_identity = PendingQueueConsumerGateIdentity::new(
-            route.segment().segment_id(),
-            route.segment().digest(),
+            publisher.segment().segment_id(),
+            publisher.segment().digest(),
             live.instance_id(),
         );
         let gate_open = self
@@ -294,12 +411,24 @@ impl<Hash: Q256BitHash> ScyllaRealmProcessorDurableCaptureFactory<Hash> {
             owner,
         )
         .map_err(backend)?;
+        let publish_store = Arc::new(
+            ScyllaPendingQueuePublishStore::bind_assignment_transport(
+                self.publish_factory.clone(),
+                publisher.clone(),
+            )
+            .map_err(backend)?,
+        );
         Ok(ScyllaRealmProcessorDurableCapture {
-            source,
             pipeline: self.pipeline.clone(),
+            transport_archive: self.transport_archive.clone(),
+            application_archive: self.application_archive.clone(),
             context,
-            close,
-            assignment: route.assignment().assignment().clone(),
+            mode: ScyllaRealmProcessorCaptureMode::Active {
+                source,
+                close,
+                publisher,
+                publish_store,
+            },
             _hash: PhantomData,
         })
     }
@@ -346,12 +475,22 @@ where
 }
 
 struct ScyllaRealmProcessorDurableCapture<Hash> {
-    source: ScyllaBackedRecoverableNatsSource,
     pipeline: Arc<ScyllaPendingPipelineStore>,
+    transport_archive: Arc<ScyllaPendingQueueSemanticAggregateStore>,
+    application_archive: Arc<ScyllaRealmProcessorApplicationArchiveStore>,
     context: psy_node_core::queue::recoverable_ephemeral::PendingQueueCaptureContext,
-    close: super::PersistedPendingQueueCloseReceipt,
-    assignment: PendingQueueGenerationSegmentAssignment,
+    mode: ScyllaRealmProcessorCaptureMode,
     _hash: PhantomData<Hash>,
+}
+
+enum ScyllaRealmProcessorCaptureMode {
+    Active {
+        source: ScyllaBackedRecoverableNatsSource,
+        close: super::PersistedPendingQueueCloseReceipt,
+        publisher: Arc<AssignmentBoundRecoverablePendingQueuePublisher>,
+        publish_store: Arc<ScyllaPendingQueuePublishStore>,
+    },
+    Recovered(PersistedRealmProcessorApplicationHandoffReceipt),
 }
 
 #[async_trait]
@@ -363,8 +502,11 @@ where
     async fn capture_next(
         &mut self,
     ) -> Result<Option<RealmProcessorDurableCaptureOutcome>, RealmProcessorDurableCaptureError> {
-        self.source
-            .capture_one::<Hash>(&self.pipeline, self.context, &self.close)
+        let ScyllaRealmProcessorCaptureMode::Active { source, close, .. } = &self.mode else {
+            return Err(RealmProcessorDurableCaptureError::ApplicationHandoffNotSealing);
+        };
+        source
+            .capture_one::<Hash>(&self.pipeline, self.context, close)
             .await
             .map(|outcome| {
                 outcome.map(|outcome| match outcome {
@@ -383,17 +525,225 @@ where
         &mut self,
     ) -> Result<Option<RealmProcessorDurableCapturedGeneration>, RealmProcessorDurableCaptureError>
     {
-        let Some((candidates, boundary)) = self
-            .source
-            .replay_closed_source::<Hash>(&self.pipeline, self.context, &self.close)
+        let ScyllaRealmProcessorCaptureMode::Active { source, close, publisher, .. } = &self.mode else {
+            return Err(RealmProcessorDurableCaptureError::ApplicationHandoffNotSealing);
+        };
+        let Some((candidates, boundary)) = source
+            .replay_closed_source::<Hash>(&self.pipeline, self.context, close)
             .await
             .map_err(backend)?
         else {
             return Ok(None);
         };
-        project_complete_generation(self.context, &self.assignment, candidates, boundary)
+        project_complete_generation(
+            self.context,
+            publisher.assignment_receipt().assignment(),
+            candidates,
+            boundary,
+        )
             .map(Some)
     }
+
+    async fn recover_application_handoff(
+        &mut self,
+    ) -> Result<Option<RealmProcessorApplicationHandoffObservation>, RealmProcessorDurableCaptureError>
+    {
+        match &self.mode {
+            ScyllaRealmProcessorCaptureMode::Active { .. } => Ok(None),
+            ScyllaRealmProcessorCaptureMode::Recovered(receipt) => {
+                handoff_observation(receipt).map(Some)
+            }
+        }
+    }
+
+    async fn persist_application_and_handoff(
+        &mut self,
+        semantic: RealmProcessorSemanticOutput,
+    ) -> Result<RealmProcessorApplicationHandoffObservation, RealmProcessorDurableCaptureError>
+    {
+        let handoff = {
+            let ScyllaRealmProcessorCaptureMode::Active {
+                source,
+                close,
+                publisher,
+                publish_store,
+            } = &self.mode
+            else {
+                return Err(RealmProcessorDurableCaptureError::ApplicationHandoffNotSealing);
+            };
+            let (fresh_generation, transport_receipt) = verify_transport_archive::<Hash>(
+                &self.pipeline,
+                &self.transport_archive,
+                self.context,
+                source,
+                close,
+                publisher,
+                publish_store,
+            )
+            .await?;
+            require_semantic_matches_generation(&semantic, &fresh_generation)?;
+            let binding = transport_receipt
+                .realm_application_binding(
+                    publisher.assignment_receipt(),
+                    close,
+                    &semantic,
+                )
+                .map_err(backend)?;
+            let plan = RealmProcessorApplicationArchivePlan::try_new(binding, &semantic)
+                .map_err(backend)?;
+            let archive = self
+                .application_archive
+                .persist_and_readback(&plan)
+                .await
+                .map_err(backend)?;
+
+            // Fresh B: re-read the closed source, NATS retained set,
+            // assignment route, transport aggregate and close fence after the
+            // immutable application header is visible but before the CAS.
+            let (second_generation, second_transport) = verify_transport_archive::<Hash>(
+                &self.pipeline,
+                &self.transport_archive,
+                self.context,
+                source,
+                close,
+                publisher,
+                publish_store,
+            )
+            .await?;
+            require_semantic_matches_generation(&semantic, &second_generation)?;
+            if transport_receipt.slot() != second_transport.slot()
+                || transport_receipt.digest() != second_transport.digest()
+            {
+                return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
+            }
+            let handoff = self.application_archive
+                .handoff_to_pipeline::<Hash>(
+                    &self.pipeline,
+                    publisher.assignment_receipt(),
+                    close,
+                    &archive,
+                )
+                .await
+                .map_err(backend)?;
+            self.transport_archive
+                .revalidate_realm_application_header(
+                    publisher.assignment_receipt(),
+                    archive.header(),
+                )
+                .await
+                .map_err(backend)?;
+            let recovered = self.application_archive
+                .recover_handoff_from_pipeline::<Hash>(
+                    &self.pipeline,
+                    publisher.assignment_receipt(),
+                )
+                .await
+                .map_err(backend)?;
+            if handoff.archive_slot() != recovered.archive_slot()
+                || handoff.archive_digest() != recovered.archive_digest()
+                || handoff.semantic_digest() != recovered.semantic_digest()
+                || handoff.pipeline_revision() != recovered.pipeline_revision()
+            {
+                return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
+            }
+            handoff
+        };
+        let observation = handoff_observation(&handoff)?;
+        self.mode = ScyllaRealmProcessorCaptureMode::Recovered(handoff);
+        Ok(observation)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn verify_transport_archive<Hash: Q256BitHash>(
+    pipeline: &ScyllaPendingPipelineStore,
+    transport_archive: &ScyllaPendingQueueSemanticAggregateStore,
+    context: psy_node_core::queue::recoverable_ephemeral::PendingQueueCaptureContext,
+    source: &ScyllaBackedRecoverableNatsSource,
+    close: &super::PersistedPendingQueueCloseReceipt,
+    publisher: &AssignmentBoundRecoverablePendingQueuePublisher,
+    publish_store: &ScyllaPendingQueuePublishStore,
+) -> Result<
+    (
+        RealmProcessorDurableCapturedGeneration,
+        PersistedPendingQueueSemanticGenerationReceipt,
+    ),
+    RealmProcessorDurableCaptureError,
+> {
+    publisher.revalidate_exact().await.map_err(backend)?;
+    let Some((candidates, boundary)) = source
+        .replay_closed_source::<Hash>(pipeline, context, close)
+        .await
+        .map_err(backend)?
+    else {
+        return Err(RealmProcessorDurableCaptureError::MalformedCompleteGeneration);
+    };
+    let generation = project_complete_generation(
+        context,
+        publisher.assignment_receipt().assignment(),
+        candidates,
+        boundary,
+    )?;
+    let nats_scan = publisher
+        .scan_source_retained_set(PendingQueuePublisherKind::RealmUserUpdate)
+        .await
+        .map_err(backend)?;
+    let source_receipt = verify_semantic_source_terminal::<Hash>(
+        pipeline,
+        publish_store,
+        source.artifact_store(),
+        publisher.assignment_receipt(),
+        source.owner_permit(),
+        close,
+        source.contract(),
+        PendingQueuePublisherKind::RealmUserUpdate,
+        nats_scan,
+    )
+    .await
+    .map_err(backend)?;
+    let aggregate = StoredPendingQueueSemanticGeneration::try_from_source_receipts(
+        publisher.assignment_receipt(),
+        close,
+        vec![source_receipt],
+    )
+    .map_err(backend)?;
+    let receipt = transport_archive
+        .persist_verified::<Hash>(
+            pipeline,
+            publisher.assignment_receipt(),
+            close,
+            &aggregate,
+        )
+        .await
+        .map_err(backend)?;
+    publisher.revalidate_exact().await.map_err(backend)?;
+    Ok((generation, receipt))
+}
+
+fn require_semantic_matches_generation(
+    semantic: &RealmProcessorSemanticOutput,
+    generation: &RealmProcessorDurableCapturedGeneration,
+) -> Result<(), RealmProcessorDurableCaptureError> {
+    if semantic.context_digest() != generation.context().digest()
+        || semantic.generation_digest() != generation.digest()
+        || semantic.boundary_digest() != generation.boundary().digest()
+        || semantic.item_count() != generation.item_count()
+    {
+        return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
+    }
+    Ok(())
+}
+
+fn handoff_observation(
+    receipt: &PersistedRealmProcessorApplicationHandoffReceipt,
+) -> Result<RealmProcessorApplicationHandoffObservation, RealmProcessorDurableCaptureError> {
+    RealmProcessorApplicationHandoffObservation::try_from_storage(
+        *receipt.archive_slot().as_bytes(),
+        *receipt.archive_digest(),
+        *receipt.semantic_digest(),
+        receipt.pipeline_revision().get(),
+        receipt.has_application_work(),
+    )
 }
 
 fn project_complete_generation(
@@ -840,5 +1190,48 @@ mod tests {
         assert!(!port.contains("Session"));
         assert!(!production.contains("pub fn new("));
         assert!(!production.contains("impl Clone for ScyllaRealmProcessorDurableCapture"));
+    }
+
+    #[test]
+    fn application_handoff_revalidates_transport_before_and_after_archive() {
+        let source = include_str!("realm_processor_durable_capture.rs");
+        let method = source
+            .split("async fn persist_application_and_handoff")
+            .nth(1)
+            .unwrap()
+            .split("async fn verify_transport_archive")
+            .next()
+            .unwrap();
+        assert_eq!(method.matches("verify_transport_archive::<Hash>").count(), 2);
+        let first = method.find("verify_transport_archive::<Hash>").unwrap();
+        let archive = method.find("persist_and_readback(&plan)").unwrap();
+        let second = method.rfind("verify_transport_archive::<Hash>").unwrap();
+        let cas = method.find("handoff_to_pipeline::<Hash>").unwrap();
+        assert!(first < archive && archive < second && second < cas);
+        assert!(method.contains("revalidate_realm_application_header"));
+        assert!(method.contains("recover_handoff_from_pipeline::<Hash>"));
+    }
+
+    #[test]
+    fn post_cas_open_recovers_without_recreating_close_or_nats_owner() {
+        let source = include_str!("realm_processor_durable_capture.rs");
+        let open = source
+            .split("async fn open_exact")
+            .nth(1)
+            .unwrap()
+            .split("#[async_trait]")
+            .next()
+            .unwrap();
+        let recovered = open
+            .split("PendingProcessingState::WorkCaptured")
+            .nth(1)
+            .unwrap()
+            .split("if !matches!(pipeline.processing_state()")
+            .next()
+            .unwrap();
+        assert!(recovered.contains("recover_handoff_from_pipeline"));
+        assert!(recovered.contains("revalidate_realm_application_header"));
+        assert!(!recovered.contains("claim_owner"));
+        assert!(!recovered.contains("read_queue_close_exact"));
     }
 }

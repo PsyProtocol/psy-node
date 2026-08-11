@@ -19,6 +19,7 @@ use super::recoverable_ephemeral::{
     PendingQueueCaptureCandidate, PendingQueueCaptureContext,
     PendingQueueGenerationBoundary,
 };
+use super::realm_processor_semantic_output::RealmProcessorSemanticOutput;
 
 const COMPLETE_GENERATION_DOMAIN: &[u8] =
     b"psy/rollback/realm-processor-complete-generation/v1";
@@ -182,6 +183,52 @@ pub enum RealmProcessorDurableCaptureOutcome {
     },
 }
 
+/// Read-only observation that the immutable application archive is the exact
+/// first candidate published by the durable pending-generation pipeline.
+///
+/// This value deliberately grants no terminal, rotation, proof, writer or
+/// authority-head capability.  It is only the stop boundary for the current
+/// Processor slice.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RealmProcessorApplicationHandoffObservation {
+    archive_slot: [u8; 32],
+    archive_digest: [u8; 32],
+    semantic_digest: [u8; 32],
+    pipeline_revision: u64,
+    has_application_work: bool,
+}
+
+impl RealmProcessorApplicationHandoffObservation {
+    pub fn try_from_storage(
+        archive_slot: [u8; 32],
+        archive_digest: [u8; 32],
+        semantic_digest: [u8; 32],
+        pipeline_revision: u64,
+        has_application_work: bool,
+    ) -> Result<Self, RealmProcessorDurableCaptureError> {
+        if archive_slot == [0; 32]
+            || archive_digest == [0; 32]
+            || semantic_digest == [0; 32]
+            || pipeline_revision == 0
+        {
+            return Err(RealmProcessorDurableCaptureError::MalformedApplicationHandoff);
+        }
+        Ok(Self {
+            archive_slot,
+            archive_digest,
+            semantic_digest,
+            pipeline_revision,
+            has_application_work,
+        })
+    }
+
+    pub const fn archive_slot(&self) -> &[u8; 32] { &self.archive_slot }
+    pub const fn archive_digest(&self) -> &[u8; 32] { &self.archive_digest }
+    pub const fn semantic_digest(&self) -> &[u8; 32] { &self.semantic_digest }
+    pub const fn pipeline_revision(&self) -> u64 { self.pipeline_revision }
+    pub const fn has_application_work(&self) -> bool { self.has_application_work }
+}
+
 /// One non-Clone backend owner.  Implementations must persist and exactly
 /// read back a selected batch before consuming their private ACK token.
 #[async_trait]
@@ -197,6 +244,24 @@ pub trait RealmProcessorDurableCapturePort: Send {
     async fn replay_complete_generation(
         &mut self,
     ) -> Result<Option<RealmProcessorDurableCapturedGeneration>, RealmProcessorDurableCaptureError>;
+
+    /// Recover a first application handoff whose pipeline CAS was already
+    /// committed before the caller received its response.  `None` means the
+    /// exact pipeline is still in `Sealing(close)` and normal capture may
+    /// continue; every other non-matching phase fails closed.
+    async fn recover_application_handoff(
+        &mut self,
+    ) -> Result<Option<RealmProcessorApplicationHandoffObservation>, RealmProcessorDurableCaptureError>;
+
+    /// Persist and exactly read back the application semantic archive, then
+    /// perform the one allowed `Sealing -> first candidate` pipeline CAS.
+    /// Implementations must fresh-reconstruct the closed transport generation
+    /// and revalidate storage-owned source/assignment/close evidence rather
+    /// than treating this public semantic value as mutation authority.
+    async fn persist_application_and_handoff(
+        &mut self,
+        semantic: RealmProcessorSemanticOutput,
+    ) -> Result<RealmProcessorApplicationHandoffObservation, RealmProcessorDurableCaptureError>;
 }
 
 /// Storage-owned factory installed by the same startup composition as the
@@ -293,6 +358,8 @@ pub enum RealmProcessorDurableCaptureError {
     IdentityMismatch,
     RuntimeCapabilityMismatch,
     MalformedCompleteGeneration,
+    MalformedApplicationHandoff,
+    ApplicationHandoffNotSealing,
     Backend(String),
 }
 

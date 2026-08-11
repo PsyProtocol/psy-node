@@ -15,7 +15,12 @@ use psy_data::protocol::{
     chain_context::AuthorityScope,
 };
 use psy_node_core::{
-    queue::recoverable_ephemeral::PendingQueueCaptureContextDigest,
+    queue::{
+        realm_processor_application_archive::RealmProcessorApplicationArchiveBinding,
+        realm_processor_application_archive::RealmProcessorApplicationArchiveHeader,
+        realm_processor_semantic_output::RealmProcessorSemanticOutput,
+        recoverable_ephemeral::PendingQueueCaptureContextDigest,
+    },
     store::{
         pending_generation_pipeline::{
             PendingEmptyQueueSealDigest, PendingPipelineReadState,
@@ -364,6 +369,9 @@ impl StoredPendingQueueSemanticGeneration {
         pipeline: &StoredPendingPipeline<Hash>,
         assignment: &PendingQueueSegmentAssignmentReceipt,
     ) -> Result<SealedPendingPipelineTransition<Hash>, PendingQueueSemanticAggregateError> {
+        if matches!(self.authority, AuthorityScope::Realm { .. }) {
+            return Err(PendingQueueSemanticAggregateError::RealmApplicationArchiveRequired);
+        }
         let context = assignment.assignment().context();
         if !self.matches_assignment(assignment)
             || pipeline.key() != context.key()
@@ -800,6 +808,49 @@ impl PersistedPendingQueueSemanticGenerationReceipt {
     pub(super) const fn authority(&self) -> AuthorityScope { self.aggregate.authority }
 
     pub(super) const fn has_data_work(&self) -> bool { self.aggregate.has_work() }
+
+    pub(super) const fn slot(&self) -> PendingQueueSemanticGenerationSlot {
+        self.aggregate.slot
+    }
+
+    pub(super) const fn digest(&self) -> PendingQueueSemanticGenerationDigest {
+        self.aggregate.digest
+    }
+
+    pub(super) fn realm_application_binding(
+        &self,
+        assignment: &PendingQueueSegmentAssignmentReceipt,
+        close: &PersistedPendingQueueCloseReceipt,
+        semantic: &RealmProcessorSemanticOutput,
+    ) -> Result<RealmProcessorApplicationArchiveBinding, PendingQueueSemanticAggregateError> {
+        let AuthorityScope::Realm {
+            realm_id,
+            realm_sub_id,
+        } = self.aggregate.authority
+        else {
+            return Err(PendingQueueSemanticAggregateError::RealmApplicationArchiveRequired);
+        };
+        if !self.aggregate.matches_generation_binding(assignment, close)
+            || self.aggregate.context_digest.as_bytes()
+                != semantic.context_digest().as_bytes()
+        {
+            return Err(PendingQueueSemanticAggregateError::ReceiptBindingMismatch);
+        }
+        RealmProcessorApplicationArchiveBinding::try_new(
+            self.aggregate.network.chain_id(),
+            realm_id,
+            realm_sub_id,
+            *self.store_fingerprint.as_bytes(),
+            *self.aggregate.slot.as_bytes(),
+            *self.aggregate.digest.as_bytes(),
+            *self.aggregate.assignment_digest.as_bytes(),
+            self.aggregate.pipeline_store_fingerprint,
+            self.aggregate.pipeline_close_revision,
+            self.aggregate.pipeline_close_receipt_digest,
+            *self.aggregate.close_intent.as_bytes(),
+        )
+        .map_err(|error| PendingQueueSemanticAggregateError::ApplicationArchive(error.to_string()))
+    }
 }
 
 impl ScyllaPendingQueueSemanticAggregateStore {
@@ -825,6 +876,50 @@ impl ScyllaPendingQueueSemanticAggregateStore {
             session,
             fingerprint,
         })
+    }
+
+    /// CAS-response-loss recovery cannot recreate the old `Sealing` receipt.
+    /// Instead it point-reads the immutable transport aggregate committed by
+    /// the selected application header and checks every persisted binding.
+    pub(super) async fn revalidate_realm_application_header(
+        &self,
+        assignment: &PendingQueueSegmentAssignmentReceipt,
+        header: &RealmProcessorApplicationArchiveHeader,
+    ) -> Result<(), PendingQueueSemanticAggregateError> {
+        let binding = header.binding();
+        if binding.transport_store_fingerprint() != self.fingerprint.as_bytes() {
+            return Err(PendingQueueSemanticAggregateError::ReceiptBindingMismatch);
+        }
+        let slot = PendingQueueSemanticGenerationSlot::try_new(*binding.transport_slot())?;
+        let current = self
+            .read(slot)
+            .await?
+            .ok_or(PendingQueueSemanticAggregateError::ReceiptStale)?;
+        let context = assignment.assignment().context();
+        let AuthorityScope::Realm {
+            realm_id,
+            realm_sub_id,
+        } = current.authority
+        else {
+            return Err(PendingQueueSemanticAggregateError::RealmApplicationArchiveRequired);
+        };
+        if current.slot != slot
+            || current.digest.as_bytes() != binding.transport_digest()
+            || !current.matches_assignment(assignment)
+            || current.network != context.key().network()
+            || realm_id != binding.realm_id()
+            || realm_sub_id != binding.realm_sub_id()
+            || current.context_digest.as_bytes() != header.context_digest()
+            || current.assignment_digest.as_bytes() != binding.assignment_digest()
+            || current.pipeline_store_fingerprint != *binding.pipeline_store_fingerprint()
+            || current.pipeline_close_revision != binding.pipeline_close_revision()
+            || current.pipeline_close_receipt_digest
+                != *binding.pipeline_close_receipt_digest()
+            || current.close_intent.as_bytes() != binding.close_intent_digest()
+        {
+            return Err(PendingQueueSemanticAggregateError::ReceiptBindingMismatch);
+        }
+        Ok(())
     }
 
     async fn read(
@@ -1049,6 +1144,9 @@ impl ScyllaPendingQueueSemanticAggregateStore {
         assignment: &PendingQueueSegmentAssignmentReceipt,
     ) -> Result<PersistedPendingQueueSemanticHandoffReceipt, PendingQueueSemanticAggregateError> {
         let context = assignment.assignment().context();
+        if matches!(context.key().authority(), AuthorityScope::Realm { .. }) {
+            return Err(PendingQueueSemanticAggregateError::RealmApplicationArchiveRequired);
+        }
         let PendingPipelineReadState::Current(current) =
             pipeline_store.read::<Hash>(context.key()).await
                 .map_err(|error| PendingQueueSemanticAggregateError::Pipeline(error.to_string()))?
@@ -1096,6 +1194,9 @@ impl ScyllaPendingQueueSemanticAggregateStore {
         assignment: &PendingQueueSegmentAssignmentReceipt,
     ) -> Result<PersistedPendingQueueTerminalArchiveReceipt<Hash>, PendingQueueSemanticAggregateError> {
         let context = assignment.assignment().context();
+        if matches!(context.key().authority(), AuthorityScope::Realm { .. }) {
+            return Err(PendingQueueSemanticAggregateError::RealmApplicationArchiveRequired);
+        }
         let PendingPipelineReadState::Current(current) = pipeline_store
             .read::<Hash>(context.key())
             .await
@@ -1257,6 +1358,8 @@ pub(super) enum PendingQueueSemanticAggregateError {
     PipelineHandoffMismatch,
     PipelineHandoffConflict,
     PipelineTerminalMismatch,
+    RealmApplicationArchiveRequired,
+    ApplicationArchive(String),
     AssignmentPayloadMismatch,
     CounterOverflow,
     DigestMismatch,
@@ -1321,6 +1424,35 @@ mod tests {
             RecoverableNatsStreamSegment,
         },
     };
+
+    #[test]
+    fn realm_transport_archive_cannot_bypass_application_archive_handoff() {
+        let source = include_str!("pending_queue_semantic_aggregate.rs");
+        let seal = source
+            .split("fn seal_pipeline_handoff")
+            .nth(1)
+            .unwrap()
+            .split("fn matches_generation_binding")
+            .next()
+            .unwrap();
+        assert!(seal.contains("RealmApplicationArchiveRequired"));
+        let recovery = source
+            .split("pub(super) async fn recover_handoff_from_pipeline")
+            .nth(1)
+            .unwrap()
+            .split("pub(super) async fn revalidate_terminal_archive")
+            .next()
+            .unwrap();
+        assert!(recovery.contains("RealmApplicationArchiveRequired"));
+        let terminal = source
+            .split("pub(super) async fn revalidate_terminal_archive")
+            .nth(1)
+            .unwrap()
+            .split("pub(super) async fn revalidate_terminal_archive_receipt")
+            .next()
+            .unwrap();
+        assert!(terminal.contains("RealmApplicationArchiveRequired"));
+    }
 
     fn binding(authority: AuthorityScope) -> SemanticGenerationBinding {
         let key = PendingGenerationLedgerKey::new(

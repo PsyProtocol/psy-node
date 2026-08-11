@@ -210,7 +210,7 @@ impl PendingQueueSidecarKeyspaces {
         ))
     }
 
-    fn publish_keyspaces(
+    pub(crate) fn publish_keyspaces(
         &self,
     ) -> Result<PendingQueuePublishKeyspaces, PendingQueueSidecarSchemaError> {
         Ok(PendingQueuePublishKeyspaces::new(
@@ -220,7 +220,7 @@ impl PendingQueueSidecarKeyspaces {
         ))
     }
 
-    fn application_data_keyspace(
+    pub(crate) fn application_data_keyspace(
         &self,
     ) -> Result<PendingQueueArtifactDataKeyspace, PendingQueueSidecarSchemaError> {
         PendingQueueArtifactDataKeyspace::try_new(self.data.as_str().to_owned())

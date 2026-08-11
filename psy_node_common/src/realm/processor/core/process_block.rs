@@ -14,7 +14,10 @@ use psy_node_core::{
     psy_temp_db::StandardProcessorTempDBStoreBase,
     queue::{
         ephemeral::QStandardEphemeralQueueSubscriber,
-        realm_processor_durable_capture::RealmProcessorDurableCaptureOutcome,
+        realm_processor_durable_capture::{
+            RealmProcessorApplicationHandoffObservation,
+            RealmProcessorDurableCaptureOutcome,
+        },
         realm_processor_semantic_output::{
             RealmProcessorDeferredJob, RealmProcessorSemanticJob,
             RealmProcessorSemanticOutput, RealmProcessorSemanticOutputParts,
@@ -42,11 +45,7 @@ use crate::queue::gatherer::DurableTreeGathererFinalizeReceipt;
 
 enum RealmGatheringOutcome<F, Hash, JobId> {
     Legacy(RealmGUTAEndCapGathererOutput<F, Hash, JobId>),
-    BranchExactFinalized(
-        DurableTreeGathererFinalizeReceipt<
-            RealmGUTAEndCapGathererOutput<F, Hash, JobId>,
-        >,
-    ),
+    BranchExactApplicationHandoff(RealmProcessorApplicationHandoffObservation),
     BranchExactAwaitingClosedSource,
 }
 
@@ -244,6 +243,11 @@ where
             let mut capture = iteration
                 .open_durable_capture_for_processing(processing)
                 .await?;
+            if let Some(recovered) = capture.recover_application_handoff().await? {
+                return Ok(RealmGatheringOutcome::BranchExactApplicationHandoff(
+                    recovered,
+                ));
+            }
 
             let generation = match capture.replay_complete_generation().await? {
                 Some(generation) => Some(generation),
@@ -268,7 +272,15 @@ where
                 .guta_queue_gatherer
                 .finalize_durable_generation(receipt)
                 .await?;
-            return Ok(RealmGatheringOutcome::BranchExactFinalized(finalized));
+            let semantic = self
+                .build_branch_exact_semantic_output(&finalized)
+                .await?;
+            let handoff = capture
+                .persist_application_and_handoff(semantic)
+                .await?;
+            return Ok(RealmGatheringOutcome::BranchExactApplicationHandoff(
+                handoff,
+            ));
         }
 
         // Sanity: outside of genesis, init must have already rotated the unique IDs once,
@@ -362,16 +374,14 @@ where
         // 2. Gather Updates
         let guta_output = match self.get_results_from_gatherers(iteration).await? {
             RealmGatheringOutcome::Legacy(output) => output,
-            RealmGatheringOutcome::BranchExactFinalized(receipt) => {
-                let semantic = self
-                    .build_branch_exact_semantic_output(&receipt)
-                    .await?;
+            RealmGatheringOutcome::BranchExactApplicationHandoff(handoff) => {
                 tracing::info!(
-                    "Branch-exact durable generation finalized tentatively: items={}, generation={:?}, semantic={:?}, deferred_jobs={}; durable semantic archive/handoff remains blocked until h23c4c4a2",
-                    receipt.item_count(),
-                    receipt.generation_digest().as_bytes(),
-                    semantic.digest().as_bytes(),
-                    receipt.output().deferred_jobs.len(),
+                    "Branch-exact application archive is the first durable pipeline candidate: archive={:?}, archive_digest={:?}, semantic={:?}, pipeline_revision={}, has_work={}; proof/writer/head remain blocked",
+                    handoff.archive_slot(),
+                    handoff.archive_digest(),
+                    handoff.semantic_digest(),
+                    handoff.pipeline_revision(),
+                    handoff.has_application_work(),
                 );
                 return Ok(());
             }
@@ -678,10 +688,13 @@ mod h23c4c3b_tests {
             .next()
             .unwrap();
         assert!(function.contains("open_durable_capture_for_processing(processing)"));
+        assert!(function.contains("recover_application_handoff()"));
         assert!(function.contains("replay_complete_generation()"));
         assert!(function.contains("capture.capture_next()"));
         assert!(function.contains("apply_durable_generation(generation)"));
         assert!(function.contains("finalize_durable_generation(receipt)"));
+        assert!(function.contains("build_branch_exact_semantic_output(&finalized)"));
+        assert!(function.contains("persist_application_and_handoff(semantic)"));
         assert!(!function.contains("set_new_unique_ids"));
         assert!(!function.contains("finalize_gathering_and_update_queue_key"));
         assert!(!function.contains("dump_entire_ephemeral_queue_bytes"));
@@ -689,7 +702,7 @@ mod h23c4c3b_tests {
     }
 
     #[test]
-    fn legacy_rotation_is_preserved_but_branch_exact_stops_before_durable_handoff() {
+    fn legacy_rotation_is_preserved_but_branch_exact_stops_after_first_handoff() {
         let source = include_str!("process_block.rs");
         let legacy = source
             .split("// Sanity: outside of genesis")
@@ -711,16 +724,16 @@ mod h23c4c3b_tests {
             .nth(1)
             .unwrap();
         let finalized = process
-            .find("RealmGatheringOutcome::BranchExactFinalized")
+            .find("RealmGatheringOutcome::BranchExactApplicationHandoff")
             .unwrap();
         let semantic_stop = process[finalized..].find("return Ok(())").unwrap() + finalized;
         let proving = process.find("// 4. Proving Work").unwrap();
         assert!(semantic_stop < proving);
-        assert!(process.contains("durable semantic archive/handoff remains blocked until h23c4c4a2"));
+        assert!(process.contains("proof/writer/head remain blocked"));
     }
 
     #[test]
-    fn semantic_candidate_uses_exact_pending_witnesses_but_has_no_storage_authority() {
+    fn semantic_candidate_uses_exact_pending_witnesses_and_affine_storage_authority() {
         let source = include_str!("process_block.rs");
         let builder = source
             .split("async fn build_branch_exact_semantic_output(")
@@ -737,18 +750,22 @@ mod h23c4c3b_tests {
         assert!(!builder.contains("handoff_to_pipeline"));
         assert!(!builder.contains("persist"));
 
-        let process = source
-            .split("pub(super) async fn process_block")
+        let gather = source
+            .split("async fn get_results_from_gatherers(")
             .nth(1)
+            .unwrap()
+            .split("// Sanity: outside of genesis")
+            .next()
             .unwrap();
-        let finalized = process
-            .find("RealmGatheringOutcome::BranchExactFinalized")
+        let build = gather
+            .find("build_branch_exact_semantic_output(&finalized)")
             .unwrap();
-        let semantic_stop = process[finalized..].find("return Ok(())").unwrap() + finalized;
-        let branch = &process[finalized..semantic_stop];
-        assert!(branch.contains("build_branch_exact_semantic_output"));
-        assert!(!branch.contains("handoff_to_pipeline"));
-        assert!(!branch.contains("commit_state"));
+        let persist = gather
+            .find("persist_application_and_handoff(semantic)")
+            .unwrap();
+        assert!(build < persist);
+        assert!(!gather.contains("commit_state"));
+        assert!(!gather.contains("publish_all_worker_jobs"));
     }
 
     #[test]
