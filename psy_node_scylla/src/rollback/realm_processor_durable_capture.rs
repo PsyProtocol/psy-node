@@ -83,6 +83,54 @@ use psy_node_nats::{
 use scylla::client::session::Session;
 use sha2::{Digest, Sha256};
 
+#[cfg(all(test, feature = "rf3-test-support"))]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(all(test, feature = "rf3-test-support"))]
+use tokio::sync::Notify;
+
+#[cfg(all(test, feature = "rf3-test-support"))]
+static QUALIFICATION_PAUSE_AFTER_RECOVERY_SNAPSHOT_A: AtomicBool =
+    AtomicBool::new(false);
+#[cfg(all(test, feature = "rf3-test-support"))]
+static QUALIFICATION_RECOVERY_SNAPSHOT_A_REACHED: Notify = Notify::const_new();
+#[cfg(all(test, feature = "rf3-test-support"))]
+static QUALIFICATION_RECOVERY_SNAPSHOT_A_RELEASED: Notify = Notify::const_new();
+#[cfg(all(test, feature = "rf3-test-support"))]
+static QUALIFICATION_FAIL_AFTER_CARRYOVER_PERSIST: AtomicBool =
+    AtomicBool::new(false);
+
+/// Qualification-only deterministic pause used by the RF=3 harness. Release
+/// builds expose no hook and no way to inject a caller-selected mutation.
+#[cfg(all(test, feature = "rf3-test-support"))]
+pub(super) fn qualification_pause_after_recovery_snapshot_a_once() {
+    QUALIFICATION_PAUSE_AFTER_RECOVERY_SNAPSHOT_A.store(true, Ordering::SeqCst);
+}
+
+#[cfg(all(test, feature = "rf3-test-support"))]
+pub(super) async fn qualification_wait_for_recovery_snapshot_a() {
+    QUALIFICATION_RECOVERY_SNAPSHOT_A_REACHED.notified().await;
+}
+
+#[cfg(all(test, feature = "rf3-test-support"))]
+pub(super) fn qualification_release_recovery_snapshot_a() {
+    QUALIFICATION_RECOVERY_SNAPSHOT_A_RELEASED.notify_one();
+}
+
+/// Inject a process/caller failure after the real carryover LWT path returns.
+/// This is deliberately not described as a socket-level response loss.
+#[cfg(all(test, feature = "rf3-test-support"))]
+pub(super) fn qualification_fail_after_carryover_persist_once() {
+    QUALIFICATION_FAIL_AFTER_CARRYOVER_PERSIST.store(true, Ordering::SeqCst);
+}
+
+#[cfg(all(test, feature = "rf3-test-support"))]
+async fn qualification_pause_after_snapshot_a_if_armed() {
+    if QUALIFICATION_PAUSE_AFTER_RECOVERY_SNAPSHOT_A.swap(false, Ordering::SeqCst) {
+        QUALIFICATION_RECOVERY_SNAPSHOT_A_REACHED.notify_one();
+        QUALIFICATION_RECOVERY_SNAPSHOT_A_RELEASED.notified().await;
+    }
+}
+
 use super::{
     PendingQueueArtifactStoreError, PendingQueueSidecarReady,
     ScyllaPendingPipelineStore, ScyllaPendingQueueArtifactStore,
@@ -1258,6 +1306,8 @@ where
         self.factory
             .validate_terminal_carryover_recovery_identity(&self.request)?;
         let first = self.factory.observe_restart_snapshot().await?;
+        #[cfg(all(test, feature = "rf3-test-support"))]
+        qualification_pause_after_snapshot_a_if_armed().await;
         let repairs_carryover = matches!(
             first.preparation.terminal(),
             RealmProcessorTerminalCarryoverObservation::UnqualifiedTerminalObservedAwaitCarryover
@@ -1273,6 +1323,12 @@ where
                 )
                 .await
                 .map_err(backend)?;
+            #[cfg(all(test, feature = "rf3-test-support"))]
+            if QUALIFICATION_FAIL_AFTER_CARRYOVER_PERSIST.swap(false, Ordering::SeqCst) {
+                return Err(RealmProcessorDurableCaptureError::Backend(
+                    "qualification-only failure after carryover persist".to_owned(),
+                ));
+            }
         }
 
         let second = self.factory.observe_restart_snapshot().await?;

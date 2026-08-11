@@ -118,7 +118,7 @@ psy_node_scylla/tests/rf3/d04b6h22e_consumer_gate.rs|TestHarness|0|0|0|0|0|0|1|1
 psy_node_scylla/tests/rf3/d04b6h23c4c1_queue_schema.rs|TestHarness|4|2|0|0|0|0|9|9
 psy_node_scylla/tests/rf3/d04b6h23c4c2b3b2_claim_admission.rs|TestHarness|14|2|0|0|0|0|26|26
 psy_node_scylla/tests/rf3/d04b6h23c4c2b4d2_stream_provision.rs|TestHarness|0|0|0|0|0|0|6|6
-psy_node_scylla/tests/rf3/d04b6h23c4c2b4e3_edge_handler_ingress.rs|TestHarness|4|0|0|0|0|0|6|7
+psy_node_scylla/tests/rf3/d04b6h23c4c2b4e3_edge_handler_ingress.rs|TestHarness|5|0|0|0|0|0|9|10
 psy_node_scylla/tests/rf3/d04b6h23c4c4b2b_terminal_carryover.rs|TestHarness|10|2|0|0|0|0|17|17
 psy_node_scylla/tests/rollback_admission_inbox.rs|TestHarness|0|0|0|0|0|0|0|1
 psy_node_scylla/tests/rollback_admission_inbox_rf3_gate.rs|TestHarness|5|2|0|0|0|0|3|3

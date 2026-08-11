@@ -23,9 +23,12 @@ use psy_core::{
     network_config::PsyNetworkLocalDevnetConstants,
 };
 use psy_data::{
-    protocol::chain_context::{
-        AuthorityObservation, AuthorityStateCheckpointId, AuthorityStateRoot,
-        PendingContext, WorkProcCheckpointUniqueId, WorkUniquePendingId,
+    protocol::{
+        canonical_chain::{CanonicalChainRef, CheckpointHash, CheckpointId, CheckpointRef},
+        chain_context::{
+            AuthorityObservation, AuthorityStateCheckpointId, AuthorityStateRoot,
+            PendingContext, WorkProcCheckpointUniqueId, WorkUniquePendingId,
+        },
     },
     v1::qdata::contract::{DashMapContractHeightCache, PSimpleContractHeightCache},
 };
@@ -76,6 +79,10 @@ use psy_node_core::{
             RealmUserUpdateVerifierProfile, RealmUserUpdateVerifierRegistry,
         },
         realm_processor_durable_capture::RealmProcessorDurableCaptureOutcome,
+        realm_processor_continuation_restart::RealmProcessorTerminalCarryoverRecoveryOutcome,
+        realm_processor_generation_terminal::{
+            RealmProcessorDeferredCarryover, RealmProcessorGenerationTerminal,
+        },
         realm_processor_application_archive::{
             RealmProcessorApplicationArchiveBinding,
             RealmProcessorApplicationArchivePlan,
@@ -94,15 +101,17 @@ use psy_node_core::{
         },
         manifest_lifecycle::AuthorityHeadView,
         manifest_record::AuthorityManifestDigest,
-        pending_generation::ProcNamespacePrefix,
+        pending_generation::{ProcNamespacePrefix, ReservedPendingGeneration},
         pending_generation_identity::{
             PendingGenerationActivationDigest, PendingGenerationBootstrapReason,
             PendingGenerationContext, PendingGenerationLedgerKey,
         },
         pending_generation_pipeline::{
             PendingEmptyQueueSealDigest, PendingNoWorkReceiptDigest,
-            PendingPipelineBootstrap, PendingPipelineWriteOutcome,
-            PendingQueueCloseIntentDigest, StoredPendingPipeline,
+            PendingPipelineBootstrap, PendingPipelineIntentDigest,
+            PendingPipelineWriteOutcome, PendingPublishReceiptDigest,
+            PendingQueueCloseIntentDigest, PendingWorkCaptureDigest,
+            StoredPendingPipeline,
         },
         realm_processor_branch_exact_runtime::{
             RealmBranchExactCommitRuntimeInstaller,
@@ -132,7 +141,9 @@ use psy_node_nats::{
 };
 use scylla::{client::session::Session, statement::Consistency};
 use serde::Serialize;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
+#[cfg(feature = "rf3-test-support")]
+use tokio::sync::oneshot;
 
 use crate::psy_setup::{
     setup_psy_scylla_database_store, setup_realm_edge_scylla_startup_composition,
@@ -144,6 +155,22 @@ use super::{
     pending_queue_stream_provision::ScyllaPendingQueueStreamProvisionStore,
     pending_queue_segment_lifecycle_rf3 as realm_fixture, *,
     realm_processor_application_archive::ScyllaRealmProcessorApplicationArchiveStore,
+    realm_processor_deferred_carryover::{
+        RealmProcessorDeferredCarryoverStoreError,
+        ScyllaRealmProcessorDeferredCarryoverStore,
+        REALM_PROCESSOR_DEFERRED_CARRYOVER_TABLE,
+    },
+    realm_processor_generation_terminal::{
+        ScyllaRealmProcessorGenerationTerminalStore,
+        REALM_PROCESSOR_GENERATION_TERMINAL_TABLE,
+    },
+};
+#[cfg(feature = "rf3-test-support")]
+use super::realm_processor_durable_capture::{
+    qualification_fail_after_carryover_persist_once,
+    qualification_pause_after_recovery_snapshot_a_once,
+    qualification_release_recovery_snapshot_a,
+    qualification_wait_for_recovery_snapshot_a,
 };
 
 type N = QNetworkTypesConfigHelper<
@@ -209,10 +236,37 @@ struct E3Report {
     fresh_source_assignment_close: bool,
     first_pipeline_cas: bool,
     missing_extra_corrupt_rf3: bool,
+    affine_terminal_carryover_recovery: bool,
+    qualification_seeded_terminal: bool,
+    inbound_missing_zero_write: bool,
+    nonterminal_zero_write: bool,
+    terminal_absent_zero_write: bool,
+    terminal_only_repaired: bool,
+    post_persist_failure_recovered: bool,
+    already_complete_recovered: bool,
+    affine_retry_count: usize,
+    derived_same_retry_count: usize,
+    derived_different_contender_conflict: bool,
+    application_toctou_rejected: bool,
+    terminal_recovery_pipeline_unchanged: bool,
+    terminal_recovery_nats_delta: u64,
+    terminal_recovery_socket_response_loss_injected: bool,
     generation_terminal_integrated: bool,
+    production_terminal_mint: bool,
+    writer_head_provenance_verified: bool,
+    terminal_authorization_qualified: bool,
+    processor_recovery_invocation: bool,
+    production_terminal_transition: bool,
+    production_pipeline_rotation: bool,
+    carryover_replay: bool,
+    successor_actor_injection: bool,
+    proof_publish: bool,
+    mapping_reward_writer_integrated: bool,
+    full_22_domain_writer: bool,
     production_writer_integrated: bool,
     authority_head_publish_integrated: bool,
     full_node_restart_tested: bool,
+    production_serving: bool,
     h8_domains_closed: u8,
     qualification: &'static str,
 }
@@ -256,6 +310,11 @@ const APPLICATION_HANDOFF_CONTROL_TABLES: &[&str] = &[
 
 const APPLICATION_HANDOFF_DATA_TABLES: &[&str] = &[
     "branch_exact_realm_application_archive_fragment_v1",
+];
+
+const TERMINAL_RECOVERY_CONTROL_TABLES: &[&str] = &[
+    REALM_PROCESSOR_GENERATION_TERMINAL_TABLE,
+    REALM_PROCESSOR_DEFERRED_CARRYOVER_TABLE,
 ];
 
 const HANDLER_MUTATION_CONTROL_TABLES: &[&str] = &[
@@ -326,6 +385,7 @@ async fn direct_one_snapshot(
     ip: std::net::Ipv4Addr,
     include_durable_replay: bool,
     include_application_handoff: bool,
+    include_terminal_recovery: bool,
 ) -> anyhow::Result<PhysicalSnapshot> {
     let session = fixture::connect(Some(ip), Consistency::One).await?;
     let mut control = CONTROL_DIRECT_ONE_TABLES.to_vec();
@@ -338,7 +398,21 @@ async fn direct_one_snapshot(
         control.extend_from_slice(APPLICATION_HANDOFF_CONTROL_TABLES);
         data.extend_from_slice(APPLICATION_HANDOFF_DATA_TABLES);
     }
+    if include_terminal_recovery {
+        control.extend_from_slice(TERMINAL_RECOVERY_CONTROL_TABLES);
+    }
     snapshot_tables(&session, &control, &data).await
+}
+
+async fn terminal_recovery_snapshot(session: &Session) -> anyhow::Result<PhysicalSnapshot> {
+    let mut control = CONTROL_DIRECT_ONE_TABLES.to_vec();
+    control.extend_from_slice(DURABLE_REPLAY_CONTROL_TABLES);
+    control.extend_from_slice(APPLICATION_HANDOFF_CONTROL_TABLES);
+    control.extend_from_slice(TERMINAL_RECOVERY_CONTROL_TABLES);
+    let mut data = DATA_DIRECT_ONE_TABLES.to_vec();
+    data.extend_from_slice(DURABLE_REPLAY_DATA_TABLES);
+    data.extend_from_slice(APPLICATION_HANDOFF_DATA_TABLES);
+    snapshot_tables(session, &control, &data).await
 }
 
 async fn dependency_timestamps_match_durable_claims(
@@ -419,6 +493,39 @@ fn current_pipeline(
     }
 }
 
+fn next_terminal_observation(
+    previous: &AuthorityObservation<PHash>,
+    marker: u8,
+) -> anyhow::Result<AuthorityObservation<PHash>> {
+    let checkpoint_id = previous
+        .chain()
+        .checkpoint()
+        .checkpoint_id()
+        .get()
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("terminal checkpoint overflow"))?;
+    let chain = CanonicalChainRef::new(
+        previous.chain().network_id(),
+        previous.chain().chain_epoch(),
+        CheckpointRef::new(
+            CheckpointId::new(checkpoint_id),
+            CheckpointHash::from_last_chain_hash(PHash::from_owned_32bytes([
+                marker;
+                32
+            ])),
+        ),
+    );
+    Ok(AuthorityObservation::try_new(
+        chain,
+        previous.authority(),
+        AuthorityStateCheckpointId::new(checkpoint_id),
+        AuthorityStateRoot::from_local_state_root(PHash::from_owned_32bytes([
+            marker.wrapping_add(1);
+            32
+        ])),
+    )?)
+}
+
 fn current_cutover(
     outcome: BranchExactCutoverWriteOutcome<PHash>,
 ) -> anyhow::Result<StoredBranchExactCutover<PHash>> {
@@ -474,19 +581,50 @@ async fn wait_for_stream_leader(
     stream_name: &str,
     excluded: Option<&str>,
 ) -> anyhow::Result<String> {
-    for _ in 0..90 {
+    // Before terminating the original leader, require both followers to be
+    // current.  After failover, require the surviving follower to be current
+    // with the newly elected leader.  Merely observing a different leader can
+    // race replica catch-up and briefly expose a leader without write quorum.
+    let required_current_replicas = if excluded.is_some() { 1 } else { 2 };
+    let mut stable_leader = None;
+    let mut stable_observations = 0_u8;
+    for _ in 0..180 {
         if let Ok(stream) = context.get_stream(stream_name).await {
             if let Ok(info) = stream.get_info().await {
-                if let Some(leader) = info.cluster.and_then(|cluster| cluster.leader) {
-                    if excluded != Some(leader.as_str()) {
-                        return Ok(leader);
+                if let Some(cluster) = info.cluster {
+                    if let Some(leader) = cluster.leader {
+                        let current_replicas = cluster
+                            .replicas
+                            .iter()
+                            .filter(|replica| {
+                                replica.current
+                                    && !replica.offline
+                                    && replica.lag.unwrap_or_default() == 0
+                            })
+                            .count();
+                        if excluded != Some(leader.as_str())
+                            && current_replicas >= required_current_replicas
+                        {
+                            if stable_leader.as_deref() == Some(leader.as_str()) {
+                                stable_observations += 1;
+                            } else {
+                                stable_leader = Some(leader.clone());
+                                stable_observations = 1;
+                            }
+                            if stable_observations >= 5 {
+                                return Ok(leader);
+                            }
+                        } else {
+                            stable_leader = None;
+                            stable_observations = 0;
+                        }
                     }
                 }
             }
         }
-        sleep(Duration::from_secs(1)).await;
+        sleep(Duration::from_millis(500)).await;
     }
-    bail!("stream did not elect a different leader")
+    bail!("stream did not reach stable leader/quorum readiness")
 }
 
 fn terminate_nats_leader(server_name: &str) -> anyhow::Result<()> {
@@ -931,11 +1069,17 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
         std::env::var("PSY_D04B6H23C4C3A_RF3").as_deref() == Ok("1");
     let exercise_application_handoff =
         std::env::var("PSY_D04B6H23C4C4A2B_RF3").as_deref() == Ok("1");
+    let exercise_terminal_recovery =
+        std::env::var("PSY_D04B6H23C4C4B3B2_RF3").as_deref() == Ok("1");
     let exercise_durable_replay = exercise_application_handoff
         || std::env::var("PSY_D04B6H23C4C3B_RF3").as_deref() == Ok("1");
     ensure!(
         !exercise_durable_replay || exercise_durable_capture,
         "c3b replay Gate requires the c3a durable capture owner"
+    );
+    ensure!(
+        !exercise_terminal_recovery || exercise_application_handoff,
+        "c4b3b2 recovery Gate requires the c4a2b application handoff"
     );
     let mut branch_exact_commit_owner = if exercise_durable_capture {
         let expectation = lineage.seal_attempt([0xC3; 32])?;
@@ -962,7 +1106,7 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
     } else {
         None
     };
-    let handler = compose_handler(
+    let mut handler = compose_handler(
         lineage,
         Arc::clone(&verifier),
         profile.clone(),
@@ -1129,14 +1273,57 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
         Some(&leader_before),
     )
     .await?;
+    // Reopen the production-shaped publisher from the durable assignment and
+    // stream binding after the client connection to the terminated leader is
+    // lost. This is the crash/restart contract; a stale in-memory connection
+    // is not itself durable recovery authority.
+    let failover_nats = Arc::new(
+        NatsJetStreamClient::new_connection(
+            fixture::KEYSPACE.to_owned(),
+            nats_urls.clone(),
+            PullConfig::default(),
+            PullConfig::default(),
+            StreamConfig::default(),
+        )
+        .await?,
+    );
+    handler = compose_handler(
+        lineage,
+        Arc::clone(&verifier),
+        profile.clone(),
+        failover_nats,
+    )
+    .await?;
     handler
         .handle_user_end_cap_proof_submission(input_b.clone(), proof_a.clone())
         .await
         .expect_err("proof A paired with input B must fail");
     let proof_b = prover.prove_end_cap_dummy_ups(N::GLOBAL_USER_TREE_HEIGHT, &input_b)?;
-    handler
-        .handle_user_end_cap_proof_submission(input_b, proof_b)
-        .await?;
+    // A client connected to the terminated leader may observe one
+    // indeterminate JetStream request while async-nats reconnects.  Retry the
+    // exact verified request; the durable ingress path must converge without
+    // changing its payload or publishing twice.
+    let mut failover_publish_error = String::from("not attempted");
+    let mut published_after_failover = false;
+    for _ in 0..10 {
+        match handler
+            .handle_user_end_cap_proof_submission(input_b.clone(), proof_b.clone())
+            .await
+        {
+            Ok(()) => {
+                published_after_failover = true;
+                break;
+            }
+            Err(error) => {
+                failover_publish_error = format!("{error:#}");
+                sleep(Duration::from_millis(500)).await;
+            }
+        }
+    }
+    ensure!(
+        published_after_failover,
+        "durable ingress did not recover after JetStream leader failover: {failover_publish_error}"
+    );
     let second_publish_messages = stream_messages(&jetstream, segment.stream_name()).await?;
     ensure!(second_publish_messages == 3);
 
@@ -1183,6 +1370,19 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
     let mut application_fragments = 0_u32;
     let mut application_pipeline_revision = 0_u64;
     let mut application_restart_recovered = false;
+    let mut qualification_seeded_terminal = false;
+    let mut inbound_missing_zero_write = false;
+    let mut nonterminal_zero_write = false;
+    let mut terminal_absent_zero_write = false;
+    let mut terminal_only_repaired = false;
+    let mut post_persist_failure_recovered = false;
+    let mut already_complete_recovered = false;
+    let mut affine_retry_count = 0_usize;
+    let mut derived_same_retry_count = 0_usize;
+    let mut derived_different_contender_conflict = false;
+    let mut application_toctou_rejected = false;
+    let mut terminal_recovery_pipeline_unchanged = false;
+    let mut terminal_recovery_nats_delta = 0_u64;
     let (durable_capture_items, durable_capture_empty_poll_not_close) =
         if let Some(owner) = branch_exact_commit_owner.as_mut() {
             // Edge always publishes to the gathering generation. Retire the
@@ -1438,6 +1638,475 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                     ensure!(recovered == expected_handoff);
                     application_restart_recovered = true;
 
+                    #[cfg(feature = "rf3-test-support")]
+                    if exercise_terminal_recovery {
+                        drop(recovered_capture);
+                        drop(recovered_iteration);
+
+                        let application_store = Arc::new(
+                            ScyllaRealmProcessorApplicationArchiveStore::prepare(
+                                Arc::clone(&session),
+                                control.clone(),
+                                PendingQueueArtifactDataKeyspace::try_new(
+                                    fixture::KEYSPACE,
+                                )?,
+                            )
+                            .await?,
+                        );
+                        let terminal_store = Arc::new(
+                            ScyllaRealmProcessorGenerationTerminalStore::prepare(
+                                Arc::clone(&session),
+                                control.clone(),
+                            )
+                            .await?,
+                        );
+                        let carryover_store = Arc::new(
+                            ScyllaRealmProcessorDeferredCarryoverStore::prepare(
+                                Arc::clone(&session),
+                                control.clone(),
+                            )
+                            .await?,
+                        );
+                        let recovery_nats_before =
+                            stream_messages(&jetstream, segment.stream_name()).await?;
+
+                        // WorkCaptured has no inbound carryover in this fresh
+                        // activation. Missing is an explicit zero-write await,
+                        // never an implicit empty lineage.
+                        let before_missing = terminal_recovery_snapshot(&session).await?;
+                        let mut missing_iteration = owner.begin_iteration(
+                            iteration_gate.try_begin_iteration()?,
+                        )?;
+                        let missing_recovery = missing_iteration
+                            .open_terminal_carryover_recovery()
+                            .await?;
+                        ensure!(matches!(
+                            missing_recovery.recover_and_prepare().await?,
+                            RealmProcessorTerminalCarryoverRecoveryOutcome::AwaitExplicitInboundCarryover(_)
+                        ));
+                        drop(missing_iteration);
+                        inbound_missing_zero_write =
+                            before_missing == terminal_recovery_snapshot(&session).await?
+                                && recovery_nats_before
+                                    == stream_messages(&jetstream, segment.stream_name()).await?;
+                        ensure!(inbound_missing_zero_write);
+
+                        let (work_continuation, _, work_captured) = application_store
+                            .observe_generation_continuation::<PHash>(
+                                &pipeline_store,
+                                &assignment,
+                            )
+                            .await?;
+                        let application = work_continuation
+                            .application()
+                            .ok_or_else(|| anyhow::anyhow!(
+                                "WorkCaptured continuation lost its application"
+                            ))?;
+                        let bootstrap_inbound =
+                            RealmProcessorDeferredCarryover::try_bootstrap_empty(
+                                work_captured.key(),
+                                work_captured.activation_digest(),
+                                work_captured.processing(),
+                                PendingGenerationBootstrapReason::LegacyActivation,
+                            )?;
+                        carryover_store
+                            .qualification_persist(bootstrap_inbound)
+                            .await?;
+
+                        let before_nonterminal = terminal_recovery_snapshot(&session).await?;
+                        let mut nonterminal_iteration = owner.begin_iteration(
+                            iteration_gate.try_begin_iteration()?,
+                        )?;
+                        let nonterminal_recovery = nonterminal_iteration
+                            .open_terminal_carryover_recovery()
+                            .await?;
+                        ensure!(matches!(
+                            nonterminal_recovery.recover_and_prepare().await?,
+                            RealmProcessorTerminalCarryoverRecoveryOutcome::AwaitTerminalPhase(_)
+                        ));
+                        drop(nonterminal_iteration);
+                        nonterminal_zero_write =
+                            before_nonterminal == terminal_recovery_snapshot(&session).await?;
+                        ensure!(nonterminal_zero_write);
+
+                        // Qualification-only writer/head stand-in. These two
+                        // pipeline transitions establish a real Published row
+                        // for the recovery Gate; they are not production
+                        // terminal authorization or part of the recovery API.
+                        let intent = PendingPipelineIntentDigest::try_new([0xB3; 32])?;
+                        let inflight = current_pipeline(
+                            pipeline_store
+                                .apply(&work_captured.seal_begin_processing(
+                                    PendingWorkCaptureDigest::try_new(
+                                        *application.archive_slot().as_bytes(),
+                                    )?,
+                                    intent,
+                                )?)
+                                .await?,
+                        )?;
+                        let published_observation =
+                            next_terminal_observation(&observation, 0xB4)?;
+                        let published = current_pipeline(
+                            pipeline_store
+                                .apply(&inflight.seal_publish(
+                                    intent,
+                                    PendingPublishReceiptDigest::try_new([0xB5; 32])?,
+                                    published_observation,
+                                )?)
+                                .await?,
+                        )?;
+
+                        let before_terminal_absent =
+                            terminal_recovery_snapshot(&session).await?;
+                        let mut absent_iteration = owner.begin_iteration(
+                            iteration_gate.try_begin_iteration()?,
+                        )?;
+                        let absent_recovery = absent_iteration
+                            .open_terminal_carryover_recovery()
+                            .await?;
+                        ensure!(matches!(
+                            absent_recovery.recover_and_prepare().await?,
+                            RealmProcessorTerminalCarryoverRecoveryOutcome::AwaitVerifiedTerminalAuthorization(_)
+                        ));
+                        drop(absent_iteration);
+                        terminal_absent_zero_write = before_terminal_absent
+                            == terminal_recovery_snapshot(&session).await?;
+                        ensure!(terminal_absent_zero_write);
+
+                        let terminal = RealmProcessorGenerationTerminal::try_new(
+                            &published,
+                            ReservedPendingGeneration::qualification_from_prefix(
+                                published
+                                    .gathering()
+                                    .pending_id()
+                                    .get()
+                                    .checked_add(1)
+                                    .ok_or_else(|| anyhow::anyhow!(
+                                        "qualification successor overflow"
+                                    ))?,
+                                prefix,
+                            )?,
+                            *assignment.assignment().digest().as_bytes(),
+                            *application_store.fingerprint().as_bytes(),
+                            application,
+                            vec![0xB6; 96],
+                        )?;
+                        terminal_store
+                            .qualification_persist(terminal.clone())
+                            .await?;
+                        qualification_seeded_terminal = true;
+                        let expected_carryover =
+                            RealmProcessorDeferredCarryover::try_from_terminal_commitment(
+                                &terminal,
+                                terminal_store.qualification_fingerprint(),
+                            )?;
+
+                        // The real derived LWT commits, then the owner loses
+                        // control before snapshots B/C. A fresh affine owner
+                        // must converge on the same immutable row.
+                        qualification_fail_after_carryover_persist_once();
+                        let mut failed_iteration = owner.begin_iteration(
+                            iteration_gate.try_begin_iteration()?,
+                        )?;
+                        let failed_recovery = failed_iteration
+                            .open_terminal_carryover_recovery()
+                            .await?;
+                        ensure!(failed_recovery.recover_and_prepare().await.is_err());
+                        drop(failed_iteration);
+                        ensure!(
+                            carryover_store
+                                .qualification_read(expected_carryover.slot())
+                                .await?
+                                == Some(expected_carryover)
+                        );
+                        let mut recovered_iteration = owner.begin_iteration(
+                            iteration_gate.try_begin_iteration()?,
+                        )?;
+                        let recovered_owner = recovered_iteration
+                            .open_terminal_carryover_recovery()
+                            .await?;
+                        ensure!(matches!(
+                            recovered_owner.recover_and_prepare().await?,
+                            RealmProcessorTerminalCarryoverRecoveryOutcome::Prepared(_)
+                        ));
+                        drop(recovered_iteration);
+                        terminal_only_repaired = true;
+                        post_persist_failure_recovered = true;
+
+                        // Same selected terminal may be retried concurrently
+                        // only through the high-level derived store path. All
+                        // contenders converge on the same revision-1 row.
+                        let mut contenders = Vec::new();
+                        for _ in 0..32 {
+                            let terminal_store = Arc::clone(&terminal_store);
+                            let carryover_store = Arc::clone(&carryover_store);
+                            let key = published.key();
+                            let activation = published.activation_digest();
+                            let predecessor = published.processing();
+                            contenders.push(tokio::spawn(async move {
+                                carryover_store
+                                    .persist_from_selected_terminal::<PHash>(
+                                        terminal_store.as_ref(),
+                                        key,
+                                        activation,
+                                        predecessor,
+                                    )
+                                    .await
+                            }));
+                        }
+                        for contender in contenders {
+                            contender.await??;
+                            derived_same_retry_count += 1;
+                        }
+                        ensure!(derived_same_retry_count == 32);
+
+                        // Repeated affine reopen is serialized by the real
+                        // single-commit owner and remains read-only once the
+                        // exact carryover exists.
+                        let before_complete = terminal_recovery_snapshot(&session).await?;
+                        for _ in 0..8 {
+                            let mut retry_iteration = owner.begin_iteration(
+                                iteration_gate.try_begin_iteration()?,
+                            )?;
+                            let retry = retry_iteration
+                                .open_terminal_carryover_recovery()
+                                .await?;
+                            ensure!(matches!(
+                                retry.recover_and_prepare().await?,
+                                RealmProcessorTerminalCarryoverRecoveryOutcome::Prepared(_)
+                            ));
+                            drop(retry_iteration);
+                            affine_retry_count += 1;
+                        }
+                        already_complete_recovered = before_complete
+                            == terminal_recovery_snapshot(&session).await?;
+                        ensure!(already_complete_recovered && affine_retry_count == 8);
+
+                        // Deterministic A/B/C TOCTOU: pause after snapshot A,
+                        // corrupt the selected application fragment, let B
+                        // fail closed, restore exact bytes, then retry.
+                        qualification_pause_after_recovery_snapshot_a_once();
+                        let mut toctou_iteration = owner.begin_iteration(
+                            iteration_gate.try_begin_iteration()?,
+                        )?;
+                        let toctou_owner = toctou_iteration
+                            .open_terminal_carryover_recovery()
+                            .await?;
+                        let archive_slot = expected_handoff.archive_slot().to_vec();
+                        let semantic_digest = expected_handoff.semantic_digest().to_vec();
+                        let fragment_table = format!(
+                            "{}.branch_exact_realm_application_archive_fragment_v1",
+                            fixture::KEYSPACE,
+                        );
+                        let (done_tx, done_rx) = oneshot::channel();
+                        let recovery_future = async move {
+                            let result = toctou_owner.recover_and_prepare().await;
+                            let _ = done_tx.send(());
+                            result
+                        };
+                        let mutation_future = async {
+                            if timeout(
+                                Duration::from_secs(30),
+                                qualification_wait_for_recovery_snapshot_a(),
+                            )
+                            .await
+                            .is_err()
+                            {
+                                qualification_release_recovery_snapshot_a();
+                                bail!("terminal recovery did not reach snapshot-A barrier");
+                            }
+                            let mutation_result = async {
+                                let original = session
+                                    .query_unpaged(
+                                        format!(
+                                            "SELECT payload FROM {fragment_table} WHERE archive_slot = ? AND application_digest = ? AND fragment_bucket = ? AND fragment_index = ?"
+                                        ),
+                                        (
+                                            archive_slot.as_slice(),
+                                            semantic_digest.as_slice(),
+                                            0_i64,
+                                            0_i32,
+                                        ),
+                                    )
+                                    .await?
+                                    .into_rows_result()?
+                                    .single_row::<(Vec<u8>,)>()?
+                                    .0;
+                                let mut corrupt = original.clone();
+                                corrupt[0] ^= 0xFF;
+                                session
+                                    .query_unpaged(
+                                        format!(
+                                            "UPDATE {fragment_table} SET payload = ? WHERE archive_slot = ? AND application_digest = ? AND fragment_bucket = ? AND fragment_index = ?"
+                                        ),
+                                        (
+                                            corrupt.as_slice(),
+                                            archive_slot.as_slice(),
+                                            semantic_digest.as_slice(),
+                                            0_i64,
+                                            0_i32,
+                                        ),
+                                    )
+                                    .await?;
+                                anyhow::Ok(original)
+                            }
+                            .await;
+                            qualification_release_recovery_snapshot_a();
+                            let original = mutation_result?;
+                            let _ = done_rx.await;
+                            session
+                                .query_unpaged(
+                                    format!(
+                                        "UPDATE {fragment_table} SET payload = ? WHERE archive_slot = ? AND application_digest = ? AND fragment_bucket = ? AND fragment_index = ?"
+                                    ),
+                                    (
+                                        original.as_slice(),
+                                        archive_slot.as_slice(),
+                                        semantic_digest.as_slice(),
+                                        0_i64,
+                                        0_i32,
+                                    ),
+                                )
+                                .await?;
+                            anyhow::Ok(())
+                        };
+                        let (toctou_result, mutation_result) =
+                            tokio::join!(recovery_future, mutation_future);
+                        mutation_result?;
+                        ensure!(toctou_result.is_err());
+                        drop(toctou_iteration);
+                        let mut restored_iteration = owner.begin_iteration(
+                            iteration_gate.try_begin_iteration()?,
+                        )?;
+                        let restored = restored_iteration
+                            .open_terminal_carryover_recovery()
+                            .await?;
+                        ensure!(matches!(
+                            restored.recover_and_prepare().await?,
+                            RealmProcessorTerminalCarryoverRecoveryOutcome::Prepared(_)
+                        ));
+                        drop(restored_iteration);
+                        application_toctou_rejected = true;
+
+                        // Different-content poison uses an isolated synthetic
+                        // successor. The production high-level repair path
+                        // must reject the preoccupied locator and preserve it.
+                        let synthetic_ready = terminal.candidate_pipeline().clone();
+                        let synthetic_close =
+                            PendingQueueCloseIntentDigest::try_new([0xC0; 32])?;
+                        let synthetic_intent =
+                            PendingPipelineIntentDigest::try_new([0xC1; 32])?;
+                        let synthetic_captured = synthetic_ready
+                            .seal_begin_queue_close(synthetic_close)?
+                            .candidate()
+                            .seal_capture_work(
+                                synthetic_close,
+                                PendingWorkCaptureDigest::try_new(
+                                    *application.archive_slot().as_bytes(),
+                                )?,
+                            )?
+                            .candidate()
+                            .clone();
+                        let synthetic_inflight = synthetic_captured
+                            .seal_begin_processing(
+                                PendingWorkCaptureDigest::try_new(
+                                    *application.archive_slot().as_bytes(),
+                                )?,
+                                synthetic_intent,
+                            )?
+                            .candidate()
+                            .clone();
+                        let synthetic_published = synthetic_inflight
+                            .seal_publish(
+                                synthetic_intent,
+                                PendingPublishReceiptDigest::try_new([0xC2; 32])?,
+                                next_terminal_observation(
+                                    synthetic_inflight.frontier(),
+                                    0xC3,
+                                )?,
+                            )?
+                            .candidate()
+                            .clone();
+                        let synthetic_reserved =
+                            ReservedPendingGeneration::qualification_from_prefix(
+                                synthetic_published
+                                    .gathering()
+                                    .pending_id()
+                                    .get()
+                                    .checked_add(1)
+                                    .ok_or_else(|| anyhow::anyhow!(
+                                        "synthetic successor overflow"
+                                    ))?,
+                                prefix,
+                            )?;
+                        let synthetic_winner = RealmProcessorGenerationTerminal::try_new(
+                            &synthetic_published,
+                            synthetic_reserved,
+                            *assignment.assignment().digest().as_bytes(),
+                            *application_store.fingerprint().as_bytes(),
+                            application,
+                            vec![0xC4; 96],
+                        )?;
+                        let synthetic_loser = RealmProcessorGenerationTerminal::try_new(
+                            &synthetic_published,
+                            synthetic_reserved,
+                            *assignment.assignment().digest().as_bytes(),
+                            *application_store.fingerprint().as_bytes(),
+                            application,
+                            vec![0xC5; 96],
+                        )?;
+                        terminal_store
+                            .qualification_persist(synthetic_winner.clone())
+                            .await?;
+                        let loser_carryover =
+                            RealmProcessorDeferredCarryover::try_from_terminal_commitment(
+                                &synthetic_loser,
+                                terminal_store.qualification_fingerprint(),
+                            )?;
+                        carryover_store
+                            .qualification_persist(loser_carryover)
+                            .await?;
+                        derived_different_contender_conflict = matches!(
+                            carryover_store
+                                .persist_from_selected_terminal::<PHash>(
+                                    terminal_store.as_ref(),
+                                    synthetic_published.key(),
+                                    synthetic_published.activation_digest(),
+                                    synthetic_published.processing(),
+                                )
+                                .await,
+                            Err(RealmProcessorDeferredCarryoverStoreError::Conflict)
+                        ) && carryover_store
+                            .qualification_read(loser_carryover.slot())
+                            .await?
+                            == Some(loser_carryover);
+                        ensure!(derived_different_contender_conflict);
+
+                        let (_, _, pipeline_after_recovery) = application_store
+                            .observe_generation_continuation::<PHash>(
+                                &pipeline_store,
+                                &assignment,
+                            )
+                            .await?;
+                        terminal_recovery_pipeline_unchanged =
+                            pipeline_after_recovery == published;
+                        ensure!(terminal_recovery_pipeline_unchanged);
+                        terminal_recovery_nats_delta = stream_messages(
+                            &jetstream,
+                            segment.stream_name(),
+                        )
+                        .await?
+                        .checked_sub(recovery_nats_before)
+                        .ok_or_else(|| anyhow::anyhow!("NATS message count regressed"))?;
+                        ensure!(terminal_recovery_nats_delta == 0);
+                    }
+
+                    #[cfg(not(feature = "rf3-test-support"))]
+                    ensure!(
+                        !exercise_terminal_recovery,
+                        "c4b3b2 requires the explicit rf3-test-support feature"
+                    );
+
                     // Exercise the real Scylla scanner against three
                     // independent, non-authoritative archive slots.  Raw CQL
                     // is deliberately confined to this RF=3 poison fixture:
@@ -1630,6 +2299,7 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                 ip,
                 exercise_durable_replay,
                 exercise_application_handoff,
+                exercise_terminal_recovery,
             )
         }),
     )
@@ -1653,6 +2323,11 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
                 + if exercise_application_handoff {
                     APPLICATION_HANDOFF_CONTROL_TABLES.len()
                         + APPLICATION_HANDOFF_DATA_TABLES.len()
+                } else {
+                    0
+                }
+                + if exercise_terminal_recovery {
+                    TERMINAL_RECOVERY_CONTROL_TABLES.len()
                 } else {
                     0
                 }
@@ -1721,6 +2396,20 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
             )? == usize::try_from(application_fragments)? + 3
         );
     }
+    if exercise_terminal_recovery {
+        ensure!(
+            replica.row_count(
+                &control,
+                REALM_PROCESSOR_GENERATION_TERMINAL_TABLE,
+            )? == 2
+        );
+        ensure!(
+            replica.row_count(
+                &control,
+                REALM_PROCESSOR_DEFERRED_CARRYOVER_TABLE,
+            )? == 3
+        );
+    }
 
     let report = E3Report {
         scylla_image: IMAGE,
@@ -1774,12 +2463,41 @@ async fn d04b6h23c4c2b4e3_jtmb_handler_ingress_joint_rf3() -> anyhow::Result<()>
         fresh_source_assignment_close: exercise_application_handoff,
         first_pipeline_cas: exercise_application_handoff,
         missing_extra_corrupt_rf3: exercise_application_handoff,
+        affine_terminal_carryover_recovery: exercise_terminal_recovery,
+        qualification_seeded_terminal,
+        inbound_missing_zero_write,
+        nonterminal_zero_write,
+        terminal_absent_zero_write,
+        terminal_only_repaired,
+        post_persist_failure_recovered,
+        already_complete_recovered,
+        affine_retry_count,
+        derived_same_retry_count,
+        derived_different_contender_conflict,
+        application_toctou_rejected,
+        terminal_recovery_pipeline_unchanged,
+        terminal_recovery_nats_delta,
+        terminal_recovery_socket_response_loss_injected: false,
         generation_terminal_integrated: false,
+        production_terminal_mint: false,
+        writer_head_provenance_verified: false,
+        terminal_authorization_qualified: false,
+        processor_recovery_invocation: false,
+        production_terminal_transition: false,
+        production_pipeline_rotation: false,
+        carryover_replay: false,
+        successor_actor_injection: false,
+        proof_publish: false,
+        mapping_reward_writer_integrated: false,
+        full_22_domain_writer: false,
         production_writer_integrated: false,
         authority_head_publish_integrated: false,
         full_node_restart_tested: false,
+        production_serving: false,
         h8_domains_closed: 0,
-        qualification: if exercise_application_handoff {
+        qualification: if exercise_terminal_recovery {
+            "H23C4C4B3B2_TERMINAL_CARRYOVER_RECOVERY_RF3_PASSED"
+        } else if exercise_application_handoff {
             "H23C4C4A2B_REALM_APPLICATION_HANDOFF_RF3_PASSED"
         } else if exercise_durable_replay {
             "H23C4C3B_PROCESSOR_GATHERER_REPLAY_RF3_PASSED"
