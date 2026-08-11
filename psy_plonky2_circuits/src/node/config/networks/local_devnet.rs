@@ -447,7 +447,7 @@ mod tests {
 
         std::fs::write(
             &format!(
-                "{}/../client_prover/psy-privacy-bridge/src/config/faucetOperators.json",
+                "{}/../psy-dapp/apps/bridge/src/config/faucetOperators.json",
                 project_dir
             ),
             serde_json::to_string_pretty(&faucet_operators)?,

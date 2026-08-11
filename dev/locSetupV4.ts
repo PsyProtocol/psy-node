@@ -441,6 +441,9 @@ async function fundDevTestAccounts(
     const summary = await Bun.file(deploymentSummaryPath).json() as any;
     const usdt = summary?.protocol?.tokens?.USDT?.l1Address as string | undefined;
     const psy = summary?.protocol?.tokens?.PSY?.l1Address as string | undefined;
+    const psySource = (process.env.DEV_PSY_SOURCE_ADDRESS
+        ?? summary?.verify?.PsyToken?.constructorArgs?.[0]
+        ?? deployer.address) as string;
     if (!usdt || !psy) {
         console.log("[DevNet] skipping fundDevTestAccounts: USDT/PSY address missing");
         return;
@@ -451,19 +454,27 @@ async function fundDevTestAccounts(
         .filter(Boolean);
     const targets = [...DEV_TEST_ADDRESSES, ...extra];
     const hundredEthHex = "0x56BC75E2D63100000";
+    const sources = [...new Set([deployer.address, psySource])];
     for (const addr of targets) {
         await anvilRpc(rpcUrl, "anvil_setBalance", [addr, hundredEthHex]);
     }
-    await anvilRpc(rpcUrl, "anvil_impersonateAccount", [deployer.address]);
+    for (const source of sources) {
+        await anvilRpc(rpcUrl, "anvil_setBalance", [source, hundredEthHex]);
+    }
+    for (const source of sources) {
+        await anvilRpc(rpcUrl, "anvil_impersonateAccount", [source]);
+    }
     try {
         const usdtAmtHex = `0x${(1_000_000n * 1_000_000n).toString(16)}`;
         const psyAmtHex = `0x${(1_000_000n * 1_000_000_000n).toString(16)}`;
         for (const addr of targets) {
             await sendTokenTransfer(rpcUrl, deployer.address, usdt, addr, usdtAmtHex);
-            await sendTokenTransfer(rpcUrl, deployer.address, psy, addr, psyAmtHex);
+            await sendTokenTransfer(rpcUrl, psySource, psy, addr, psyAmtHex);
         }
     } finally {
-        await anvilRpc(rpcUrl, "anvil_stopImpersonatingAccount", [deployer.address]);
+        for (const source of sources) {
+            await anvilRpc(rpcUrl, "anvil_stopImpersonatingAccount", [source]);
+        }
     }
     console.log(`[DevNet] funded ${targets.length} dev test accounts with ETH+USDT+PSY`);
 }
@@ -4083,6 +4094,10 @@ class DevNetProcessManager {
                         ...this.getEnv(),
                         VITE_NETWORK: l1Network,
                         VITE_FORK: String(l1Fork),
+                        // Point @deployments at the root psy-contracts deployments the
+                        // L1 deploy flow actually writes; the nested psy-dapp copy is
+                        // only for standalone dapp runs and is not synced by devnet.
+                        PSY_DEPLOYMENTS_DIR: path.resolve(cwd, 'psy-contracts', 'deployments'),
                     },
                     maxRetries: 3,
                     retryDelayMs: 2000
@@ -4127,6 +4142,10 @@ class DevNetProcessManager {
                         ...this.getEnv(),
                         VITE_NETWORK: l1Network,
                         VITE_FORK: String(l1Fork),
+                        // Same as the bridge shell: read the root psy-contracts
+                        // deployments the L1 deploy flow writes, not the
+                        // unsynced nested psy-dapp copy.
+                        PSY_DEPLOYMENTS_DIR: path.resolve(cwd, 'psy-contracts', 'deployments'),
                     },
                     maxRetries: 3,
                     retryDelayMs: 2000
