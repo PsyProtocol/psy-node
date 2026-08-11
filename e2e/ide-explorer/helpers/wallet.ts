@@ -256,6 +256,31 @@ export class IdeWalletEnv {
   }
 }
 
+/** Re-resolve confirmation buttons because extension popup renders replace their DOM nodes. */
+async function clickConfirmation(
+  popup: Page,
+  label: RegExp,
+  timeoutMs: number,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let lastError: unknown;
+  while (Date.now() < deadline) {
+    const remaining = Math.max(1, deadline - Date.now());
+    const confirm = popup.getByRole("button", { name: label }).first();
+    try {
+      await expect(confirm).toBeVisible({ timeout: remaining });
+      await expect(confirm).toBeEnabled({ timeout: remaining });
+      // Bounded click attempt: covers a brief detach/rerender, then re-gate.
+      await confirm.click({ timeout: Math.min(10_000, remaining) });
+      return;
+    } catch (err: unknown) {
+      lastError = err;
+    }
+  }
+  if (lastError instanceof Error) throw lastError;
+  throw new Error("clickConfirmation timed out");
+}
+
 export async function onboardWallet(
   env: IdeWalletEnv,
   privateKey = SENDER_PK,
@@ -310,7 +335,7 @@ export async function onboardWallet(
         exact: true,
       })
       .fill(WALLET_PASSWORD);
-    await popup.getByRole("button", { name: /^Confirm$/ }).click();
+    await clickConfirmation(popup, /^Confirm$/, 120_000);
     await expect(totalBalance).toBeVisible({ timeout: 180_000 });
   } finally {
     await popup.close().catch(() => undefined);
@@ -349,16 +374,12 @@ export async function acceptApproval(
   try {
     await popup.waitForLoadState("domcontentloaded");
     await unlockIfNeeded(popup);
-    let confirm = popup.getByRole("button", { name: label }).first();
-    if (!(await confirm.isVisible({ timeout: 5_000 }).catch(() => false))) {
-      confirm = popup
-        .getByRole("button", {
-          name: /^(Connect|Deploy|Confirm(?:\s+\d+)?|Approve|Allow)$/,
-        })
-        .first();
+    let confirmLabel = label;
+    const primary = popup.getByRole("button", { name: label }).first();
+    if (!(await primary.isVisible({ timeout: 5_000 }).catch(() => false))) {
+      confirmLabel = /^(Connect|Deploy|Confirm(?:\s+\d+)?|Approve|Allow)$/;
     }
-    await expect(confirm).toBeVisible({ timeout: 60_000 });
-    await confirm.click();
+    await clickConfirmation(popup, confirmLabel, 60_000);
     const { promise, resolve } = Promise.withResolvers<void>();
     popup.once("close", () => resolve());
     await Promise.race([promise, sleep(45_000)]);
