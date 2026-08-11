@@ -18,6 +18,10 @@ use psy_node_core::{
             RealmProcessorApplicationHandoffObservation,
             RealmProcessorDurableCaptureOutcome,
         },
+        realm_processor_generation_continuation::{
+            RealmProcessorGenerationContinuation,
+            RealmProcessorGenerationContinuationPhase,
+        },
         realm_processor_semantic_output::{
             RealmProcessorDeferredJob, RealmProcessorSemanticJob,
             RealmProcessorSemanticOutput, RealmProcessorSemanticOutputParts,
@@ -46,6 +50,7 @@ use crate::queue::gatherer::DurableTreeGathererFinalizeReceipt;
 enum RealmGatheringOutcome<F, Hash, JobId> {
     Legacy(RealmGUTAEndCapGathererOutput<F, Hash, JobId>),
     BranchExactApplicationHandoff(RealmProcessorApplicationHandoffObservation),
+    BranchExactGenerationContinuation(RealmProcessorGenerationContinuation),
     BranchExactAwaitingClosedSource,
 }
 
@@ -139,6 +144,7 @@ where
     /// dependency fails before any pipeline handoff can exist.
     async fn build_branch_exact_semantic_output(
         &self,
+        processing: PendingGenerationContext,
         receipt: &DurableTreeGathererFinalizeReceipt<
             RealmGUTAEndCapGathererOutput<N::F, N::QHash, N::JobId>,
         >,
@@ -147,10 +153,7 @@ where
         let pending_context = self
             .db
             .temp_db
-            .require_pending_context_for_pending_id(
-                &self.db.state.realm_identifier,
-                self.db.state.processing_unique_pending_id,
-            )
+            .require_pending_context_for_generation(&self.db.state.realm_identifier, processing)
             .await?;
         let mut jobs = Vec::new();
         for (level, level_jobs) in output.job_ids.iter().enumerate() {
@@ -236,10 +239,15 @@ where
         iteration: &mut RealmNormalCommitIteration<'_, N::QHash>,
     ) -> anyhow::Result<RealmGatheringOutcome<N::F, N::QHash, N::JobId>> {
         if let RealmNormalCommitIteration::BranchExact(iteration) = iteration {
-            let processing = PendingGenerationContext::try_from_legacy(
-                self.db.state.processing_unique_pending_id,
-                self.db.state.processing_proc_checkpoint_unique_id,
-            )?;
+            let continuation = iteration.observe_generation_continuation().await?;
+            if continuation.phase()
+                != RealmProcessorGenerationContinuationPhase::CaptureClosedSource
+            {
+                return Ok(RealmGatheringOutcome::BranchExactGenerationContinuation(
+                    continuation,
+                ));
+            }
+            let processing = continuation.processing();
             let mut capture = iteration
                 .open_durable_capture_for_processing(processing)
                 .await?;
@@ -273,7 +281,7 @@ where
                 .finalize_durable_generation(receipt)
                 .await?;
             let semantic = self
-                .build_branch_exact_semantic_output(&finalized)
+                .build_branch_exact_semantic_output(processing, &finalized)
                 .await?;
             let handoff = capture
                 .persist_application_and_handoff(semantic)
@@ -382,6 +390,15 @@ where
                     handoff.semantic_digest(),
                     handoff.pipeline_revision(),
                     handoff.has_application_work(),
+                );
+                return Ok(());
+            }
+            RealmGatheringOutcome::BranchExactGenerationContinuation(continuation) => {
+                tracing::info!(
+                    "Branch-exact generation is durably classified as {:?}: processing_pending={}, pipeline_revision={}; terminal/rotation/writer/head remain blocked",
+                    continuation.phase(),
+                    continuation.processing().pending_id().get(),
+                    continuation.pipeline_revision().get(),
                 );
                 return Ok(());
             }
@@ -687,13 +704,14 @@ mod h23c4c3b_tests {
             .split("// Sanity: outside of genesis")
             .next()
             .unwrap();
+        assert!(function.contains("observe_generation_continuation().await?"));
         assert!(function.contains("open_durable_capture_for_processing(processing)"));
         assert!(function.contains("recover_application_handoff()"));
         assert!(function.contains("replay_complete_generation()"));
         assert!(function.contains("capture.capture_next()"));
         assert!(function.contains("apply_durable_generation(generation)"));
         assert!(function.contains("finalize_durable_generation(receipt)"));
-        assert!(function.contains("build_branch_exact_semantic_output(&finalized)"));
+        assert!(function.contains("build_branch_exact_semantic_output(processing, &finalized)"));
         assert!(function.contains("persist_application_and_handoff(semantic)"));
         assert!(!function.contains("set_new_unique_ids"));
         assert!(!function.contains("finalize_gathering_and_update_queue_key"));
@@ -742,8 +760,10 @@ mod h23c4c3b_tests {
             .split("async fn get_results_from_gatherers(")
             .next()
             .unwrap();
-        assert!(builder.contains("require_pending_context_for_pending_id"));
-        assert!(builder.contains("self.db.state.processing_unique_pending_id"));
+        assert!(builder.contains("require_pending_context_for_generation"));
+        assert!(builder.contains("processing)"));
+        assert!(!builder.contains("self.db.state.processing_unique_pending_id"));
+        assert!(!builder.contains("self.db.state.processing_proc_checkpoint_unique_id"));
         assert!(builder.contains("get_tdb_proof_witness_bytes"));
         assert!(builder.contains("job.job_id"));
         assert!(builder.contains("RealmProcessorSemanticOutput::try_from_candidate_parts"));
@@ -758,7 +778,7 @@ mod h23c4c3b_tests {
             .next()
             .unwrap();
         let build = gather
-            .find("build_branch_exact_semantic_output(&finalized)")
+            .find("build_branch_exact_semantic_output(processing, &finalized)")
             .unwrap();
         let persist = gather
             .find("persist_application_and_handoff(semantic)")
@@ -811,5 +831,57 @@ mod h23c4c3b_tests {
         assert!(!durable.contains("delete_ephemeral_queue_consumer"));
         assert!(durable.contains("finalize_with_tree"));
         assert!(durable.contains("SemanticHandoffNotIntegrated"));
+    }
+}
+
+#[cfg(test)]
+mod h23c4c4b1_tests {
+    #[test]
+    fn branch_exact_generation_identity_comes_from_durable_pipeline() {
+        let source = include_str!("process_block.rs");
+        let gather = source
+            .split("async fn get_results_from_gatherers(")
+            .nth(1)
+            .unwrap()
+            .split("// Sanity: outside of genesis")
+            .next()
+            .unwrap();
+        assert!(gather.contains("observe_generation_continuation().await?"));
+        assert!(gather.contains("let processing = continuation.processing()"));
+        assert!(gather.contains("open_durable_capture_for_processing(processing)"));
+        assert!(!gather.contains("self.db.state.processing_unique_pending_id"));
+        assert!(!gather.contains("self.db.state.processing_proc_checkpoint_unique_id"));
+    }
+
+    #[test]
+    fn continuation_phases_stop_before_proof_writer_head_or_rotation() {
+        let source = include_str!("process_block.rs");
+        let process = source
+            .split("pub(super) async fn process_block")
+            .nth(1)
+            .unwrap();
+        let branch = process
+            .find("RealmGatheringOutcome::BranchExactGenerationContinuation")
+            .unwrap();
+        let stop = branch + process[branch..].find("return Ok(())").unwrap();
+        let proof = process.find("// 4. Proving Work").unwrap();
+        assert!(stop < proof);
+        let continuation = source
+            .split("BranchExactGenerationContinuation(continuation)")
+            .nth(1)
+            .unwrap()
+            .split("return Ok(())")
+            .next()
+            .unwrap();
+        for forbidden in [
+            "seal_begin_processing",
+            "seal_retire_no_work",
+            "seal_publish",
+            "seal_rotation",
+            "commit_state",
+            "publish_all_worker_jobs",
+        ] {
+            assert!(!continuation.contains(forbidden));
+        }
     }
 }

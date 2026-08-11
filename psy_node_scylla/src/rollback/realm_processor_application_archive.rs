@@ -20,6 +20,11 @@ use psy_node_core::{
             RealmProcessorApplicationArchiveHeader, RealmProcessorApplicationArchivePlan,
             RealmProcessorApplicationArchiveSlot, REALM_APPLICATION_ARCHIVE_MAX_BUCKETS,
         },
+        realm_processor_generation_continuation::{
+            RealmProcessorApplicationContinuation,
+            RealmProcessorGenerationContinuation,
+            RealmProcessorGenerationContinuationPhase,
+        },
         realm_processor_semantic_output::RealmProcessorSemanticOutput,
     },
     store::pending_generation_pipeline::{
@@ -550,6 +555,70 @@ impl ScyllaRealmProcessorApplicationArchiveStore {
         handoff_receipt(self.fingerprint, &archive, &current)
     }
 
+    /// Read-only recovery for every application-backed successor phase. This
+    /// is intentionally distinct from `recover_handoff_from_pipeline`, whose
+    /// strict close-revision+1 contract remains limited to the first CAS.
+    pub(super) async fn observe_generation_continuation<Hash: Q256BitHash>(
+        &self,
+        pipeline_store: &ScyllaPendingPipelineStore,
+        assignment: &PendingQueueSegmentAssignmentReceipt,
+    ) -> Result<
+        (
+            RealmProcessorGenerationContinuation,
+            PersistedRealmProcessorApplicationArchiveReceipt,
+            psy_node_core::store::pending_generation_pipeline::StoredPendingPipeline<Hash>,
+        ),
+        RealmProcessorApplicationArchiveStoreError,
+    > {
+        let context = assignment.assignment().context();
+        let PendingPipelineReadState::Current(current) = pipeline_store
+            .read::<Hash>(context.key())
+            .await
+            .map_err(pipeline)?
+        else {
+            return Err(RealmProcessorApplicationArchiveStoreError::HandoffMismatch);
+        };
+        if current.key() != context.key()
+            || current.activation_digest() != context.activation()
+            || current.processing() != context.processing()
+            || current.blocked_reason().is_some()
+        {
+            return Err(RealmProcessorApplicationArchiveStoreError::HandoffMismatch);
+        }
+        let (slot, phase, expected_work, revision_delta) =
+            application_continuation_slot(current.processing_state())?;
+        let archive = self
+            .read_selected(slot)
+            .await?
+            .ok_or(RealmProcessorApplicationArchiveStoreError::HandoffMismatch)?;
+        validate_binding(archive.header(), assignment, pipeline_store, None)?;
+        let expected_revision = archive
+            .header()
+            .binding()
+            .pipeline_close_revision()
+            .checked_add(revision_delta)
+            .ok_or(RealmProcessorApplicationArchiveStoreError::CounterOverflow)?;
+        if current.revision().get() != expected_revision
+            || archive.semantic().has_application_work() != expected_work
+        {
+            return Err(RealmProcessorApplicationArchiveStoreError::HandoffMismatch);
+        }
+        let application = RealmProcessorApplicationContinuation::try_from_storage(
+            archive.header().slot(),
+            archive.header().digest(),
+            archive.semantic(),
+        )
+        .map_err(|_| RealmProcessorApplicationArchiveStoreError::HandoffMismatch)?;
+        let observation = RealmProcessorGenerationContinuation::try_from_storage(
+            current.processing(),
+            current.revision(),
+            phase,
+            Some(application),
+        )
+        .map_err(|_| RealmProcessorApplicationArchiveStoreError::HandoffMismatch)?;
+        Ok((observation, archive, current))
+    }
+
     async fn read_header(
         &self,
         slot: RealmProcessorApplicationArchiveSlot,
@@ -679,6 +748,56 @@ fn first_handoff_slot(
             false,
         )),
         _ => Err(RealmProcessorApplicationArchiveStoreError::HandoffMismatch),
+    }
+}
+
+fn application_continuation_slot(
+    state: PendingProcessingState,
+) -> Result<
+    (
+        RealmProcessorApplicationArchiveSlot,
+        RealmProcessorGenerationContinuationPhase,
+        bool,
+        u64,
+    ),
+    RealmProcessorApplicationArchiveStoreError,
+> {
+    match state {
+        PendingProcessingState::WorkCaptured(capture) => Ok((
+            RealmProcessorApplicationArchiveSlot::try_new(*capture.as_bytes())?,
+            RealmProcessorGenerationContinuationPhase::AwaitWriter,
+            true,
+            1,
+        )),
+        PendingProcessingState::InFlight { capture, .. } => Ok((
+            RealmProcessorApplicationArchiveSlot::try_new(*capture.as_bytes())?,
+            RealmProcessorGenerationContinuationPhase::AwaitWriterCompletion,
+            true,
+            2,
+        )),
+        PendingProcessingState::EmptyQueueSealed(seal) => Ok((
+            RealmProcessorApplicationArchiveSlot::try_new(*seal.as_bytes())?,
+            RealmProcessorGenerationContinuationPhase::AwaitNoWorkTerminal,
+            false,
+            1,
+        )),
+        PendingProcessingState::Published { capture, .. } => Ok((
+            RealmProcessorApplicationArchiveSlot::try_new(*capture.as_bytes())?,
+            RealmProcessorGenerationContinuationPhase::AwaitPublishedTerminal,
+            true,
+            3,
+        )),
+        PendingProcessingState::RetiredNoWork { seal, .. } => Ok((
+            RealmProcessorApplicationArchiveSlot::try_new(*seal.as_bytes())?,
+            RealmProcessorGenerationContinuationPhase::AwaitRetiredNoWorkTerminal,
+            false,
+            2,
+        )),
+        PendingProcessingState::Baseline(_)
+        | PendingProcessingState::Ready
+        | PendingProcessingState::Sealing(_) => {
+            Err(RealmProcessorApplicationArchiveStoreError::HandoffMismatch)
+        }
     }
 }
 
@@ -874,5 +993,85 @@ mod tests {
         assert!(recovery.contains("read_selected(slot)"));
         assert!(recovery.contains("pipeline_close_revision()"));
         assert!(!recovery.contains("read_queue_close_exact"));
+    }
+
+    #[test]
+    fn post_handoff_selector_is_exhaustive_without_widening_first_handoff() {
+        use psy_node_core::store::pending_generation_pipeline::{
+            PendingEmptyQueueSealDigest, PendingNoWorkReceiptDigest,
+            PendingPipelineIntentDigest, PendingPublishReceiptDigest,
+            PendingWorkCaptureDigest,
+        };
+
+        let capture = PendingWorkCaptureDigest::try_new([1; 32]).unwrap();
+        let seal = PendingEmptyQueueSealDigest::try_new([2; 32]).unwrap();
+        let intent = PendingPipelineIntentDigest::try_new([3; 32]).unwrap();
+        let publish = PendingPublishReceiptDigest::try_new([4; 32]).unwrap();
+        let no_work = PendingNoWorkReceiptDigest::try_new([5; 32]).unwrap();
+        for (state, phase, work, delta) in [
+            (
+                PendingProcessingState::WorkCaptured(capture),
+                RealmProcessorGenerationContinuationPhase::AwaitWriter,
+                true,
+                1,
+            ),
+            (
+                PendingProcessingState::InFlight { capture, intent },
+                RealmProcessorGenerationContinuationPhase::AwaitWriterCompletion,
+                true,
+                2,
+            ),
+            (
+                PendingProcessingState::EmptyQueueSealed(seal),
+                RealmProcessorGenerationContinuationPhase::AwaitNoWorkTerminal,
+                false,
+                1,
+            ),
+            (
+                PendingProcessingState::Published {
+                    capture,
+                    receipt: publish,
+                },
+                RealmProcessorGenerationContinuationPhase::AwaitPublishedTerminal,
+                true,
+                3,
+            ),
+            (
+                PendingProcessingState::RetiredNoWork {
+                    seal,
+                    receipt: no_work,
+                },
+                RealmProcessorGenerationContinuationPhase::AwaitRetiredNoWorkTerminal,
+                false,
+                2,
+            ),
+        ] {
+            let (_, observed_phase, observed_work, observed_delta) =
+                application_continuation_slot(state).unwrap();
+            assert_eq!(observed_phase, phase);
+            assert_eq!(observed_work, work);
+            assert_eq!(observed_delta, delta);
+        }
+        assert!(first_handoff_slot(PendingProcessingState::InFlight {
+            capture,
+            intent,
+        })
+        .is_err());
+        assert!(first_handoff_slot(PendingProcessingState::Published {
+            capture,
+            receipt: publish,
+        })
+        .is_err());
+        for state in [
+            PendingProcessingState::Baseline(
+                psy_node_core::store::pending_generation_identity::PendingGenerationActivationDigest::try_new([6; 32]).unwrap(),
+            ),
+            PendingProcessingState::Ready,
+            PendingProcessingState::Sealing(
+                psy_node_core::store::pending_generation_pipeline::PendingQueueCloseIntentDigest::try_new([7; 32]).unwrap(),
+            ),
+        ] {
+            assert!(application_continuation_slot(state).is_err());
+        }
     }
 }

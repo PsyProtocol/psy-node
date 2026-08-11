@@ -1,6 +1,8 @@
 use async_trait::async_trait;
 use parth_core::{node::realm_identifier::QRealmIdentifier, protocol::core_types::Q256BitHash};
-use psy_data::protocol::chain_context::PendingContext;
+use psy_data::protocol::chain_context::{AuthorityScope, PendingContext};
+
+use crate::store::pending_generation_identity::PendingGenerationContext;
 
 /// Atomic current-work namespace observed by Edge.
 ///
@@ -32,6 +34,40 @@ pub trait QTempDBPendingContextReader<Hash: Q256BitHash> {
                 context.unique_pending_id().get(),
                 expected_unique_pending_id
             );
+        }
+        Ok(context)
+    }
+
+    /// Resolve one exact durable processing namespace.
+    ///
+    /// A pending ID alone is not sufficient: the same numeric pending ID can
+    /// otherwise select a stale proc-checkpoint proof namespace. Realm
+    /// identity is checked at the same boundary so a context stored under the
+    /// wrong authority cannot be used to construct proof-work keys.
+    async fn require_pending_context_for_generation(
+        &self,
+        rid: &QRealmIdentifier,
+        expected: PendingGenerationContext,
+    ) -> anyhow::Result<PendingContext<Hash>> {
+        let context = self
+            .require_pending_context_for_pending_id(rid, expected.pending_id().get())
+            .await?;
+        if context.proc_checkpoint_unique_id().as_u128()
+            != expected.proc_checkpoint_id().as_u128()
+        {
+            anyhow::bail!(
+                "current pending context proc ID {} does not match durable processing proc ID {}",
+                context.proc_checkpoint_unique_id().as_u128(),
+                expected.proc_checkpoint_id().as_u128(),
+            );
+        }
+        if context.authority()
+            != (AuthorityScope::Realm {
+                realm_id: rid.realm_id,
+                realm_sub_id: rid.realm_sub_id,
+            })
+        {
+            anyhow::bail!("current pending context authority does not match realm identifier");
         }
         Ok(context)
     }

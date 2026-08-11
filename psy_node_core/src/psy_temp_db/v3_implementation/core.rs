@@ -848,6 +848,7 @@ mod tests {
         proof_store::QCanonicalProofStoreV2,
         temp_db::QTempDatabaseRawKVWriterBase,
     };
+    use crate::store::pending_generation_identity::PendingGenerationContext;
 
     fn pending_context() -> PendingContext<PHash> {
         PendingContext::new(
@@ -969,6 +970,66 @@ mod tests {
             .await
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn durable_generation_context_rejects_same_pending_with_wrong_proc() {
+        let store = SimpleMemoryTempStore::new();
+        let rid = QRealmIdentifier {
+            realm_id: 9,
+            realm_sub_id: 2,
+        };
+        let context = pending_context();
+        store
+            .set_current_pending_context(&rid, &context)
+            .await
+            .unwrap();
+
+        let exact = PendingGenerationContext::try_from_legacy(
+            context.unique_pending_id().get(),
+            context.proc_checkpoint_unique_id().as_u128(),
+        )
+        .unwrap();
+        assert_eq!(
+            <SimpleMemoryTempStore as QTempDBPendingContextReader<PHash>>::require_pending_context_for_generation(
+                &store, &rid, exact,
+            )
+            .await
+            .unwrap(),
+            context,
+        );
+
+        let wrong_proc = PendingGenerationContext::try_from_legacy(
+            context.unique_pending_id().get(),
+            context.proc_checkpoint_unique_id().as_u128() + 1,
+        )
+        .unwrap();
+        assert!(<SimpleMemoryTempStore as QTempDBPendingContextReader<PHash>>::require_pending_context_for_generation(
+            &store,
+            &rid,
+            wrong_proc,
+        )
+        .await
+        .is_err());
+
+        let foreign_authority = PendingContext::new(
+            *context.chain(),
+            AuthorityScope::Realm {
+                realm_id: rid.realm_id + 1,
+                realm_sub_id: rid.realm_sub_id,
+            },
+            context.unique_pending_id(),
+            context.proc_checkpoint_unique_id(),
+        );
+        store
+            .set_current_pending_context(&rid, &foreign_authority)
+            .await
+            .unwrap();
+        assert!(<SimpleMemoryTempStore as QTempDBPendingContextReader<PHash>>::require_pending_context_for_generation(
+            &store, &rid, exact,
+        )
+        .await
+        .is_err());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

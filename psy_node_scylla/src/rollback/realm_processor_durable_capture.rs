@@ -23,8 +23,13 @@ use psy_node_core::{
             RealmProcessorDurableCapturedBatch,
             RealmProcessorDurableCapturedGeneration,
             SealedRealmProcessorDurableCaptureRequest,
+            SealedRealmProcessorGenerationContinuationRequest,
         },
         realm_processor_application_archive::RealmProcessorApplicationArchivePlan,
+        realm_processor_generation_continuation::{
+            RealmProcessorGenerationContinuation,
+            RealmProcessorGenerationContinuationPhase,
+        },
         realm_processor_semantic_output::RealmProcessorSemanticOutput,
         recoverable_artifact::{
             PendingQueueArtifactOwnerAttemptId,
@@ -32,13 +37,15 @@ use psy_node_core::{
         },
         recoverable_ephemeral::{
             PendingQueueArtifactIdentity, PendingQueueBoundaryObservation,
-            PendingQueueCaptureCandidate, PendingQueueGenerationBoundary,
+            PendingQueueCaptureCandidate, PendingQueueCaptureContext,
+            PendingQueueGenerationBoundary,
             PendingQueueSourceCursorView,
         },
     },
     store::pending_generation_pipeline::{
         PendingPipelineReadState, PendingProcessingState,
     },
+    store::pending_generation_identity::PendingGenerationLedgerKey,
 };
 use psy_node_nats::{
     queue::NatsJetStreamClient,
@@ -464,6 +471,129 @@ where
 
     fn queue_readiness_digest(&self) -> [u8; 32] {
         self.queue_readiness_digest
+    }
+
+    async fn observe_generation_continuation(
+        &self,
+        request: SealedRealmProcessorGenerationContinuationRequest,
+    ) -> Result<RealmProcessorGenerationContinuation, RealmProcessorDurableCaptureError> {
+        let AuthorityScope::Realm {
+            realm_id,
+            realm_sub_id,
+        } = self.authority
+        else {
+            return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
+        };
+        if request.network() != self.network
+            || request.realm_id() != realm_id
+            || request.realm_sub_id() != realm_sub_id
+            || request.writer_activation_digest() != &self.writer_activation_digest
+            || request.queue_readiness_digest() != &self.queue_readiness_digest
+        {
+            return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
+        }
+        let key = PendingGenerationLedgerKey::new(self.network, self.authority);
+        let PendingPipelineReadState::Current(pipeline) =
+            self.pipeline.read::<Hash>(key).await.map_err(backend)?
+        else {
+            return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
+        };
+        if pipeline.activation_digest().as_bytes() != &self.writer_activation_digest
+            || pipeline.blocked_reason().is_some()
+        {
+            return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
+        }
+        let phase = match pipeline.processing_state() {
+            PendingProcessingState::Baseline(_) => {
+                RealmProcessorGenerationContinuationPhase::AwaitPrimeOrRotate
+            }
+            PendingProcessingState::Ready => {
+                RealmProcessorGenerationContinuationPhase::AwaitQueueClose
+            }
+            PendingProcessingState::Sealing(_) => {
+                RealmProcessorGenerationContinuationPhase::CaptureClosedSource
+            }
+            PendingProcessingState::WorkCaptured(_)
+            | PendingProcessingState::InFlight { .. }
+            | PendingProcessingState::EmptyQueueSealed(_)
+            | PendingProcessingState::RetiredNoWork { .. }
+            | PendingProcessingState::Published { .. } => {
+                let context = PendingQueueCaptureContext::try_new(
+                    pipeline.key(),
+                    pipeline.activation_digest(),
+                    pipeline.processing(),
+                )
+                .map_err(backend)?;
+                let ledger_key = PendingQueueSegmentLedgerKey::try_new(
+                    pipeline.key(),
+                    self.nats.base_namespace(),
+                )
+                .map_err(backend)?;
+                let route = self
+                    .ledger
+                    .read_assignment_route_exact(&ledger_key, context)
+                    .await
+                    .map_err(backend)?;
+                self.ledger
+                    .revalidate_assignment_route(&route)
+                    .await
+                    .map_err(backend)?;
+                let (first, archive, first_pipeline) = self
+                    .application_archive
+                    .observe_generation_continuation::<Hash>(
+                        &self.pipeline,
+                        route.assignment(),
+                    )
+                    .await
+                    .map_err(backend)?;
+                self.transport_archive
+                    .revalidate_realm_application_header(
+                        route.assignment(),
+                        archive.header(),
+                    )
+                    .await
+                    .map_err(backend)?;
+                self.ledger
+                    .revalidate_assignment_route(&route)
+                    .await
+                    .map_err(backend)?;
+                let (second, second_archive, second_pipeline) = self
+                    .application_archive
+                    .observe_generation_continuation::<Hash>(
+                        &self.pipeline,
+                        route.assignment(),
+                    )
+                    .await
+                    .map_err(backend)?;
+                self.transport_archive
+                    .revalidate_realm_application_header(
+                        route.assignment(),
+                        second_archive.header(),
+                    )
+                    .await
+                    .map_err(backend)?;
+                self.ledger
+                    .revalidate_assignment_route(&route)
+                    .await
+                    .map_err(backend)?;
+                if first != second
+                    || pipeline.revision() != first_pipeline.revision()
+                    || first_pipeline.revision() != second_pipeline.revision()
+                    || pipeline.canonical_payload() != first_pipeline.canonical_payload()
+                    || first_pipeline.canonical_payload() != second_pipeline.canonical_payload()
+                {
+                    return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
+                }
+                return Ok(first);
+            }
+        };
+        RealmProcessorGenerationContinuation::try_from_storage(
+            pipeline.processing(),
+            pipeline.revision(),
+            phase,
+            None,
+        )
+        .map_err(backend)
     }
 
     async fn open(
@@ -1210,6 +1340,31 @@ mod tests {
         assert!(first < archive && archive < second && second < cas);
         assert!(method.contains("revalidate_realm_application_header"));
         assert!(method.contains("recover_handoff_from_pipeline::<Hash>"));
+    }
+
+    #[test]
+    fn continuation_observer_brackets_full_pipeline_and_assignment_route() {
+        let source = include_str!("realm_processor_durable_capture.rs");
+        let method = source
+            .split("async fn observe_generation_continuation(")
+            .nth(1)
+            .unwrap()
+            .split("async fn open(")
+            .next()
+            .unwrap();
+        assert_eq!(method.matches("revalidate_assignment_route(&route)").count(), 3);
+        assert!(method.contains("pipeline.revision() != first_pipeline.revision()"));
+        assert!(method.contains("first_pipeline.revision() != second_pipeline.revision()"));
+        assert!(method.contains(
+            "pipeline.canonical_payload() != first_pipeline.canonical_payload()"
+        ));
+        assert!(method.contains(
+            "first_pipeline.canonical_payload() != second_pipeline.canonical_payload()"
+        ));
+        assert!(method.contains("PendingProcessingState::Baseline(_)"));
+        assert!(method.contains("AwaitPrimeOrRotate"));
+        assert!(method.contains("PendingProcessingState::Ready"));
+        assert!(method.contains("AwaitQueueClose"));
     }
 
     #[test]

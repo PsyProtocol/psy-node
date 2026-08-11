@@ -19,6 +19,7 @@ use super::recoverable_ephemeral::{
     PendingQueueCaptureCandidate, PendingQueueCaptureContext,
     PendingQueueGenerationBoundary,
 };
+use super::realm_processor_generation_continuation::RealmProcessorGenerationContinuation;
 use super::realm_processor_semantic_output::RealmProcessorSemanticOutput;
 
 const COMPLETE_GENERATION_DOMAIN: &[u8] =
@@ -275,10 +276,75 @@ pub trait RealmProcessorDurableCaptureFactory: Send + Sync {
     fn writer_activation_digest(&self) -> [u8; 32];
     fn queue_readiness_digest(&self) -> [u8; 32];
 
+    /// Freshly classify the storage-selected processing generation. This
+    /// read-only observation grants no terminal, writer, head, or rotation
+    /// capability.
+    async fn observe_generation_continuation(
+        &self,
+        request: SealedRealmProcessorGenerationContinuationRequest,
+    ) -> Result<RealmProcessorGenerationContinuation, RealmProcessorDurableCaptureError>;
+
     async fn open(
         &self,
         request: SealedRealmProcessorDurableCaptureRequest,
     ) -> Result<Box<dyn RealmProcessorDurableCapturePort>, RealmProcessorDurableCaptureError>;
+}
+
+/// Identity-only request for a fresh durable-pipeline continuation read.
+/// Processing pending/proc identity is deliberately absent: storage selects
+/// it from the current pipeline rather than trusting legacy mutable state.
+#[derive(Debug)]
+pub struct SealedRealmProcessorGenerationContinuationRequest {
+    startup_permit_digest: RealmProcessorStartupPermitDigest,
+    network: NetworkId,
+    realm_id: u32,
+    realm_sub_id: u16,
+    writer_activation_digest: [u8; 32],
+    queue_readiness_digest: [u8; 32],
+}
+
+impl SealedRealmProcessorGenerationContinuationRequest {
+    pub(crate) fn seal(
+        startup_permit_digest: RealmProcessorStartupPermitDigest,
+        network: NetworkId,
+        realm_id: u32,
+        realm_sub_id: u16,
+        writer_activation_digest: [u8; 32],
+        queue_readiness_digest: [u8; 32],
+    ) -> Self {
+        Self {
+            startup_permit_digest,
+            network,
+            realm_id,
+            realm_sub_id,
+            writer_activation_digest,
+            queue_readiness_digest,
+        }
+    }
+
+    pub const fn startup_permit_digest(&self) -> RealmProcessorStartupPermitDigest {
+        self.startup_permit_digest
+    }
+
+    pub const fn network(&self) -> NetworkId {
+        self.network
+    }
+
+    pub const fn realm_id(&self) -> u32 {
+        self.realm_id
+    }
+
+    pub const fn realm_sub_id(&self) -> u16 {
+        self.realm_sub_id
+    }
+
+    pub const fn writer_activation_digest(&self) -> &[u8; 32] {
+        &self.writer_activation_digest
+    }
+
+    pub const fn queue_readiness_digest(&self) -> &[u8; 32] {
+        &self.queue_readiness_digest
+    }
 }
 
 /// Unforgeable outside `psy_node_core`: all identity axes come from the
@@ -382,5 +448,8 @@ mod tests {
         assert!(!production.contains("ack_token"));
         assert!(!production.contains("NatsJetStreamClient"));
         assert!(!production.contains("impl Clone for SealedRealmProcessorDurableCaptureRequest"));
+        assert!(!production.contains(
+            "impl Clone for SealedRealmProcessorGenerationContinuationRequest"
+        ));
     }
 }

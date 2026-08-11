@@ -22,7 +22,9 @@ use crate::queue::{
         RealmProcessorDurableCaptureOutcome, RealmProcessorDurableCapturePort,
         RealmProcessorDurableCapturedGeneration,
         SealedRealmProcessorDurableCaptureRequest,
+        SealedRealmProcessorGenerationContinuationRequest,
     },
+    realm_processor_generation_continuation::RealmProcessorGenerationContinuation,
     realm_processor_semantic_output::RealmProcessorSemanticOutput,
     recoverable_ephemeral::PendingQueueCaptureContext,
 };
@@ -191,6 +193,28 @@ impl<Hash> RealmBranchExactCommitIteration<'_, Hash> {
 
     pub const fn startup_permit_digest(&self) -> RealmProcessorStartupPermitDigest {
         self.owner.startup_permit_digest()
+    }
+
+    /// Freshly observes the storage-selected processing generation. This is
+    /// the only branch-exact source of pending/proc identity; the legacy DB
+    /// singleton is intentionally not an input.
+    pub async fn observe_generation_continuation(
+        &mut self,
+    ) -> Result<RealmProcessorGenerationContinuation, RealmProcessorDurableCaptureError> {
+        let runtime = self.owner.runtime();
+        let factory = Arc::clone(self.owner.installed.capture_factory());
+        factory
+            .observe_generation_continuation(
+                SealedRealmProcessorGenerationContinuationRequest::seal(
+                    self.owner.startup_permit_digest(),
+                    runtime.network(),
+                    runtime.realm_id(),
+                    runtime.realm_sub_id(),
+                    runtime.writer_activation_digest(),
+                    runtime.queue_readiness_digest(),
+                ),
+            )
+            .await
     }
 
     /// Opens one backend-owned capture authority while borrowing this whole
@@ -504,6 +528,28 @@ mod tests {
             [6; 32]
         }
 
+        async fn observe_generation_continuation(
+            &self,
+            request: SealedRealmProcessorGenerationContinuationRequest,
+        ) -> Result<RealmProcessorGenerationContinuation, RealmProcessorDurableCaptureError> {
+            if request.network() != self.network
+                || request.realm_id() != self.realm_id
+                || request.realm_sub_id() != self.realm_sub_id
+                || request.writer_activation_digest() != &self.activation
+                || request.queue_readiness_digest() != &self.queue_readiness_digest()
+            {
+                return Err(RealmProcessorDurableCaptureError::IdentityMismatch);
+            }
+            RealmProcessorGenerationContinuation::try_from_storage(
+                PendingGenerationContext::try_from_legacy(17, 19).unwrap(),
+                crate::store::pending_generation_pipeline::PendingPipelineRevision::try_new(3)
+                    .unwrap(),
+                crate::queue::realm_processor_generation_continuation::RealmProcessorGenerationContinuationPhase::CaptureClosedSource,
+                None,
+            )
+            .map_err(|_| RealmProcessorDurableCaptureError::IdentityMismatch)
+        }
+
         async fn open(
             &self,
             request: SealedRealmProcessorDurableCaptureRequest,
@@ -647,6 +693,8 @@ mod tests {
             assert_eq!(attempt.network(), network());
             assert_eq!(attempt.realm_id(), 7);
             assert_eq!(attempt.realm_sub_id(), 3);
+            let continuation = attempt.observe_generation_continuation().await.unwrap();
+            assert_eq!(continuation.processing().pending_id().get(), 17);
             let mut capture = attempt
                 .open_durable_capture_for_processing(
                     PendingGenerationContext::try_from_legacy(17, 19).unwrap(),
