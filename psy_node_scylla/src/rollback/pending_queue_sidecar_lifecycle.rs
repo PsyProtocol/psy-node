@@ -252,6 +252,21 @@ pub(super) struct HistoricalV12VerifiedLifecycleFixture {
 }
 
 #[cfg(all(test, feature = "rf3-test-support"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct HistoricalV13VerifiedLifecycleFixture {
+    slot: [u8; 32],
+    revision: i64,
+    payload: Vec<u8>,
+}
+
+#[cfg(all(test, feature = "rf3-test-support"))]
+impl HistoricalV13VerifiedLifecycleFixture {
+    pub(super) const fn slot(&self) -> &[u8; 32] { &self.slot }
+    pub(super) const fn revision(&self) -> i64 { self.revision }
+    pub(super) fn payload(&self) -> &[u8] { &self.payload }
+}
+
+#[cfg(all(test, feature = "rf3-test-support"))]
 impl HistoricalV12VerifiedLifecycleFixture {
     pub(super) const fn slot(&self) -> &[u8; 32] { &self.slot }
     pub(super) const fn revision(&self) -> i64 { self.revision }
@@ -283,14 +298,60 @@ impl ScyllaPendingQueueSidecarLifecycleStore {
     ) -> Result<HistoricalV12VerifiedLifecycleFixture, PendingQueueSidecarLifecycleError> {
         use super::pending_queue_sidecar_schema::historical_v12_schema_fingerprint;
 
-        const HISTORICAL_SCHEMA_VERSION: u16 = 12;
-        const HISTORICAL_TARGET_TABLES: u16 = 20;
-
         let fingerprint = historical_v12_schema_fingerprint();
+        let (slot, revision, payload) = self
+            .qualification_persist_historical_verified(
+                keyspaces,
+                12,
+                20,
+                fingerprint.as_bytes(),
+            )
+            .await?;
+        Ok(HistoricalV12VerifiedLifecycleFixture {
+            slot,
+            revision,
+            payload,
+        })
+    }
+
+    /// Qualification-only seed for the exact historical v13 lifecycle
+    /// identity. v13 and v14 share the same physical manifest, while v14
+    /// requires semantic v3's complete actor-input binding.
+    #[cfg(all(test, feature = "rf3-test-support"))]
+    pub(super) async fn qualification_persist_historical_v13_verified(
+        &self,
+        keyspaces: &PendingQueueSidecarKeyspaces,
+    ) -> Result<HistoricalV13VerifiedLifecycleFixture, PendingQueueSidecarLifecycleError> {
+        use super::pending_queue_sidecar_schema::historical_v13_schema_fingerprint;
+
+        let fingerprint = historical_v13_schema_fingerprint();
+        let (slot, revision, payload) = self
+            .qualification_persist_historical_verified(
+                keyspaces,
+                13,
+                20,
+                fingerprint.as_bytes(),
+            )
+            .await?;
+        Ok(HistoricalV13VerifiedLifecycleFixture {
+            slot,
+            revision,
+            payload,
+        })
+    }
+
+    #[cfg(all(test, feature = "rf3-test-support"))]
+    async fn qualification_persist_historical_verified(
+        &self,
+        keyspaces: &PendingQueueSidecarKeyspaces,
+        historical_schema_version: u16,
+        historical_target_tables: u16,
+        fingerprint: &[u8; 32],
+    ) -> Result<([u8; 32], i64, Vec<u8>), PendingQueueSidecarLifecycleError> {
         let mut slot_hasher = Sha256::new();
         slot_hasher.update(SLOT_DOMAIN);
-        slot_hasher.update(HISTORICAL_SCHEMA_VERSION.to_be_bytes());
-        slot_hasher.update(fingerprint.as_bytes());
+        slot_hasher.update(historical_schema_version.to_be_bytes());
+        slot_hasher.update(fingerprint);
         update_len(&mut slot_hasher, keyspaces.data().as_str().as_bytes());
         update_len(&mut slot_hasher, keyspaces.control().as_str().as_bytes());
         let slot: [u8; 32] = slot_hasher.finalize().into();
@@ -305,11 +366,11 @@ impl ScyllaPendingQueueSidecarLifecycleStore {
                 .to_be_bytes(),
         );
         payload.push(PendingQueueSidecarDeploymentPhase::Verified as u8);
-        payload.extend_from_slice(&HISTORICAL_SCHEMA_VERSION.to_be_bytes());
-        payload.extend_from_slice(&HISTORICAL_TARGET_TABLES.to_be_bytes());
+        payload.extend_from_slice(&historical_schema_version.to_be_bytes());
+        payload.extend_from_slice(&historical_target_tables.to_be_bytes());
         put_string(&mut payload, keyspaces.data().as_str());
         put_string(&mut payload, keyspaces.control().as_str());
-        payload.extend_from_slice(fingerprint.as_bytes());
+        payload.extend_from_slice(fingerprint);
         let mut state = Sha256::new();
         state.update(STATE_DOMAIN);
         state.update(&payload);
@@ -349,11 +410,7 @@ impl ScyllaPendingQueueSidecarLifecycleStore {
                 None => Err(PendingQueueSidecarLifecycleError::DeploymentConflict),
             };
         }
-        Ok(HistoricalV12VerifiedLifecycleFixture {
-            slot,
-            revision,
-            payload,
-        })
+        Ok((slot, revision, payload))
     }
 
     pub async fn read(&self, slot: PendingQueueSidecarDeploymentSlot) -> Result<PendingQueueSidecarDeploymentReadState, PendingQueueSidecarLifecycleError> {

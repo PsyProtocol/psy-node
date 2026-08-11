@@ -66,6 +66,8 @@ const WRONG: &str = "psy_h23c4c1_wrong";
 const UPGRADE: &str = "psy_h23c4c1_upgrade";
 const V13_UPGRADE: &str = "psy_h23c4c4b4c1_upgrade";
 const V13_CONFLICT: &str = "psy_h23c4c4b4c1_conflict";
+const V14_UPGRADE: &str = "psy_h23c4c4b4c2a_upgrade";
+const V14_CONFLICT: &str = "psy_h23c4c4b4c2a_conflict";
 const IMAGE: &str =
     "scylladb/scylla@sha256:17496f2dd6e72056d0b0d7e2bd18bd62638872d1d80a5dd9db96ba017fd426fc";
 const NODE_IPS: [Ipv4Addr; 3] = [
@@ -167,6 +169,8 @@ async fn create_keyspaces(session: &Session) -> anyhow::Result<()> {
         UPGRADE,
         V13_UPGRADE,
         V13_CONFLICT,
+        V14_UPGRADE,
+        V14_CONFLICT,
     ] {
         session.query_unpaged(
             format!("CREATE KEYSPACE IF NOT EXISTS {keyspace} WITH replication = {{'class': 'NetworkTopologyStrategy', 'datacenter1': 3}}"),
@@ -256,7 +260,7 @@ struct H23c4c1Report {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-struct HistoricalV12RepresentativeRows {
+struct HistoricalRepresentativeRows {
     pipeline: (i64, Vec<u8>),
     application_header: (i64, Vec<u8>),
     application_fragment: (i32, i64, Vec<u8>, Vec<u8>),
@@ -264,7 +268,7 @@ struct HistoricalV12RepresentativeRows {
     carryover: (i64, Vec<u8>),
 }
 
-impl HistoricalV12RepresentativeRows {
+impl HistoricalRepresentativeRows {
     const fn row_count(&self) -> usize { 5 }
 }
 
@@ -272,7 +276,20 @@ impl HistoricalV12RepresentativeRows {
 struct V12V13DirectDataset {
     historical_v12_lifecycle: (i64, Vec<u8>),
     current_v13_lifecycle: (i64, Vec<u8>),
-    representative: HistoricalV12RepresentativeRows,
+    representative: HistoricalRepresentativeRows,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct V13V14DirectDataset {
+    historical_v13_lifecycle: (i64, Vec<u8>),
+    current_v14_lifecycle: (i64, Vec<u8>),
+    representative: HistoricalRepresentativeRows,
+}
+
+impl V13V14DirectDataset {
+    const fn row_count(&self) -> usize {
+        2 + self.representative.row_count()
+    }
 }
 
 impl V12V13DirectDataset {
@@ -315,6 +332,52 @@ struct H23c4c4b4c1Report {
     direct_one_dataset_digest: String,
     direct_one_equal: bool,
     sidecar_v13_rf3: bool,
+    deferred_input_rf3: bool,
+    production_terminal_transition: bool,
+    production_pipeline_rotation: bool,
+    production_writer_integrated: bool,
+    authority_head_publish_integrated: bool,
+    full_node_restart_tested: bool,
+    production_serving: bool,
+    h8_domains_closed: u8,
+    h8_domains_total: u8,
+    qualification: &'static str,
+}
+
+#[derive(Serialize)]
+struct H23c4c4b4c2aReport {
+    image: &'static str,
+    replication_factor: u8,
+    historical_schema_version: u16,
+    current_schema_version: u16,
+    target_tables: usize,
+    lifecycle_tables: usize,
+    control_targets: usize,
+    data_targets: usize,
+    expected_columns: usize,
+    historical_schema_fingerprint: String,
+    current_schema_fingerprint: String,
+    same_physical_shape: bool,
+    v13_verified_rejected_for_v14: bool,
+    v13_payload_rejected_by_v14_decoder: bool,
+    v14_slot_differs_from_v13: bool,
+    v14_deploy_idempotent: bool,
+    different_current_rejected: bool,
+    v13_lifecycle_preserved: bool,
+    v13_representative_rows_preserved: bool,
+    one_replica_offline_deploy: bool,
+    caller_discard_retry: bool,
+    socket_response_loss_injected: bool,
+    representative_rows_preserved_and_current_manifest_unchanged: bool,
+    repair_flush_compact: bool,
+    repair_ms: u64,
+    direct_one_nodes: usize,
+    direct_one_table_names: Vec<String>,
+    direct_one_table_count: usize,
+    direct_one_row_count: usize,
+    direct_one_dataset_digest: String,
+    direct_one_equal: bool,
+    sidecar_v14_rf3: bool,
     deferred_input_rf3: bool,
     production_terminal_transition: bool,
     production_pipeline_rotation: bool,
@@ -397,11 +460,15 @@ fn historical_v10_verified_payload(keyspaces: &PendingQueueSidecarKeyspaces) -> 
     bytes
 }
 
-async fn seed_historical_v12_representative_rows(
+async fn seed_historical_representative_rows(
     session: &Session,
     keyspaces: &PendingQueueSidecarKeyspaces,
-) -> anyhow::Result<HistoricalV12RepresentativeRows> {
-    let pipeline = (12_i64, b"historical-v12-pipeline".to_vec());
+    historical_version: u16,
+) -> anyhow::Result<HistoricalRepresentativeRows> {
+    let pipeline = (
+        i64::from(historical_version),
+        format!("historical-v{historical_version}-pipeline").into_bytes(),
+    );
     session
         .query_unpaged(
             format!(
@@ -422,7 +489,10 @@ async fn seed_historical_v12_representative_rows(
 
     let application_slot = vec![0xA1_u8; 32];
     let application_digest = vec![0xA2_u8; 32];
-    let application_header = (1_i64, b"historical-v12-application-header".to_vec());
+    let application_header = (
+        1_i64,
+        format!("historical-v{historical_version}-application-header").into_bytes(),
+    );
     session
         .query_unpaged(
             format!(
@@ -440,7 +510,7 @@ async fn seed_historical_v12_representative_rows(
     let application_fragment = (
         1_i32,
         23_i64,
-        b"historical-v12-fragment".to_vec(),
+        format!("historical-v{historical_version}-fragment").into_bytes(),
         vec![0xA3_u8; 32],
     );
     session
@@ -463,7 +533,10 @@ async fn seed_historical_v12_representative_rows(
         )
         .await?;
 
-    let terminal = (1_i64, b"historical-v12-terminal".to_vec());
+    let terminal = (
+        1_i64,
+        format!("historical-v{historical_version}-terminal").into_bytes(),
+    );
     session
         .query_unpaged(
             format!(
@@ -474,7 +547,10 @@ async fn seed_historical_v12_representative_rows(
             (vec![0xB1_u8; 32], terminal.0, terminal.1.clone()),
         )
         .await?;
-    let carryover = (1_i64, b"historical-v12-carryover".to_vec());
+    let carryover = (
+        1_i64,
+        format!("historical-v{historical_version}-carryover").into_bytes(),
+    );
     session
         .query_unpaged(
             format!(
@@ -485,7 +561,7 @@ async fn seed_historical_v12_representative_rows(
             (vec![0xC1_u8; 32], carryover.0, carryover.1.clone()),
         )
         .await?;
-    Ok(HistoricalV12RepresentativeRows {
+    Ok(HistoricalRepresentativeRows {
         pipeline,
         application_header,
         application_fragment,
@@ -494,10 +570,10 @@ async fn seed_historical_v12_representative_rows(
     })
 }
 
-async fn read_historical_v12_representative_rows(
+async fn read_historical_representative_rows(
     session: &Session,
     keyspaces: &PendingQueueSidecarKeyspaces,
-) -> anyhow::Result<HistoricalV12RepresentativeRows> {
+) -> anyhow::Result<HistoricalRepresentativeRows> {
     let pipeline = session
         .query_unpaged(
             format!(
@@ -563,7 +639,7 @@ async fn read_historical_v12_representative_rows(
         .await?
         .into_rows_result()?
         .single_row::<(i64, Vec<u8>)>()?;
-    Ok(HistoricalV12RepresentativeRows {
+    Ok(HistoricalRepresentativeRows {
         pipeline,
         application_header,
         application_fragment,
@@ -853,7 +929,7 @@ async fn d04b6h23c4c4b4c1_sidecar_v13_lifecycle_rf3_gate() -> anyhow::Result<()>
         historical.payload().to_vec(),
     );
     let representative =
-        seed_historical_v12_representative_rows(&session, &upgrade_keys).await?;
+        seed_historical_representative_rows(&session, &upgrade_keys, 12).await?;
 
     let current_slot = PendingQueueSidecarDeploymentSlot::for_keyspaces(&upgrade_keys);
     let v13_slot_differs_from_v12 = current_slot.as_bytes() != historical.slot();
@@ -953,7 +1029,7 @@ async fn d04b6h23c4c4b4c1_sidecar_v13_lifecycle_rf3_gate() -> anyhow::Result<()>
         == historical_row;
     ensure!(v12_lifecycle_preserved);
     let v12_representative_rows_preserved =
-        read_historical_v12_representative_rows(&session, &upgrade_keys).await?
+        read_historical_representative_rows(&session, &upgrade_keys).await?
             == representative;
     ensure!(v12_representative_rows_preserved);
 
@@ -1024,7 +1100,7 @@ async fn d04b6h23c4c4b4c1_sidecar_v13_lifecycle_rf3_gate() -> anyhow::Result<()>
                 current_slot.as_bytes(),
             )
             .await?,
-            representative: read_historical_v12_representative_rows(
+            representative: read_historical_representative_rows(
                 &local,
                 &upgrade_keys,
             )
@@ -1131,6 +1207,334 @@ async fn d04b6h23c4c4b4c1_sidecar_v13_lifecycle_rf3_gate() -> anyhow::Result<()>
         qualification: "H23C4C4B4C1_SIDECAR_V13_RF3_PASSED",
     };
     let report_path = std::env::var("PSY_D04B6H23C4C4B4C1_REPORT_PATH")?;
+    std::fs::write(&report_path, serde_json::to_vec_pretty(&report)?)?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+#[cfg(feature = "rf3-test-support")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires isolated Scylla RF=3 docker-compose cluster"]
+async fn d04b6h23c4c4b4c2a_sidecar_v14_lifecycle_rf3_gate() -> anyhow::Result<()> {
+    ensure!(
+        std::env::var("PSY_D04B6H23C4C4B4C2A_RF3").as_deref() == Ok("1"),
+        "run through tests/rf3/run-d04b6h23c4c4b4c2a.sh"
+    );
+    let compose_file = std::env::var("PSY_D04B6H23C4C4B4C2A_COMPOSE_FILE")?;
+    wait_up(3).await?;
+    let session = Arc::new(connect(None, Consistency::Quorum).await?);
+    create_keyspaces(&session).await?;
+    let upgrade_keys = keyspaces(V14_UPGRADE)?;
+
+    let physical = PendingQueueSidecarSchemaMaterializer::materialize_schema(
+        &session,
+        &upgrade_keys,
+    )
+    .await?;
+    ensure!(
+        matches!(
+            PendingQueueSidecarSchemaMaterializer::inspect_schema(
+                &session,
+                &upgrade_keys,
+            )
+            .await?,
+            PendingQueueSidecarSchemaInspection::Exact { .. }
+        ),
+        "v13/v14 shared physical schema is not exact"
+    );
+    ScyllaPendingQueueSidecarLifecycleStore::create_schema(
+        &session,
+        upgrade_keys.control(),
+    )
+    .await?;
+    let lifecycle = ScyllaPendingQueueSidecarLifecycleStore::prepare(
+        Arc::clone(&session),
+        upgrade_keys.control().clone(),
+    )
+    .await?;
+    let historical = lifecycle
+        .qualification_persist_historical_v13_verified(&upgrade_keys)
+        .await?;
+    let historical_row = (historical.revision(), historical.payload().to_vec());
+    let representative =
+        seed_historical_representative_rows(&session, &upgrade_keys, 13).await?;
+
+    let current_slot = PendingQueueSidecarDeploymentSlot::for_keyspaces(&upgrade_keys);
+    let v14_slot_differs_from_v13 = current_slot.as_bytes() != historical.slot();
+    ensure!(v14_slot_differs_from_v13);
+    let v13_verified_rejected_for_v14 = matches!(
+        ScyllaPendingQueueSidecarSetupGate::authorize(
+            Arc::clone(&session),
+            upgrade_keys.clone(),
+            realm(),
+        )
+        .await,
+        Err(PendingQueueSidecarLifecycleError::Uninitialized),
+    );
+    ensure!(v13_verified_rejected_for_v14);
+    let v13_payload_rejected_by_v14_decoder = matches!(
+        StoredPendingQueueSidecarDeployment::decode_selected(
+            current_slot,
+            historical.revision(),
+            historical.payload(),
+        ),
+        Err(PendingQueueSidecarLifecycleError::UnknownSchemaVersion),
+    );
+    ensure!(v13_payload_rejected_by_v14_decoder);
+
+    let conflict_keys = keyspaces(V14_CONFLICT)?;
+    PendingQueueSidecarSchemaMaterializer::materialize_schema(&session, &conflict_keys)
+        .await?;
+    ScyllaPendingQueueSidecarLifecycleStore::create_schema(
+        &session,
+        conflict_keys.control(),
+    )
+    .await?;
+    let conflict = StoredPendingQueueSidecarDeployment::materializing(conflict_keys.clone());
+    let mut poisoned = conflict.to_canonical_bytes();
+    let last = poisoned
+        .last_mut()
+        .ok_or_else(|| anyhow::anyhow!("empty lifecycle payload"))?;
+    *last ^= 0xFF;
+    session
+        .query_unpaged(
+            format!(
+                "INSERT INTO {}.{} (deployment_slot, revision, deployment_payload) VALUES (?, ?, ?)",
+                conflict_keys.control().as_str(),
+                PENDING_QUEUE_SIDECAR_LIFECYCLE_TABLE,
+            ),
+            (
+                conflict.slot().as_bytes().to_vec(),
+                i64::try_from(conflict.revision().get())?,
+                poisoned,
+            ),
+        )
+        .await?;
+    let different_current_rejected = PendingQueueSidecarDeploymentExecutor::deploy(
+        Arc::clone(&session),
+        conflict_keys,
+    )
+    .await
+    .is_err();
+    ensure!(different_current_rejected);
+
+    compose(
+        Path::new(&compose_file),
+        &["stop", "scylla3"],
+        "stop third replica for v14 lifecycle",
+    )?;
+    wait_up(2).await?;
+    let first = PendingQueueSidecarDeploymentExecutor::deploy(
+        Arc::clone(&session),
+        upgrade_keys.clone(),
+    )
+    .await?;
+    let first_ready_digest = *first.ready_digest();
+    drop(first);
+    let second = PendingQueueSidecarDeploymentExecutor::deploy(
+        Arc::clone(&session),
+        upgrade_keys.clone(),
+    )
+    .await?;
+    let v14_deploy_idempotent = second.ready_digest() == &first_ready_digest;
+    ensure!(v14_deploy_idempotent);
+    let caller_discard_retry = v14_deploy_idempotent;
+    let ready = ScyllaPendingQueueSidecarSetupGate::authorize(
+        Arc::clone(&session),
+        upgrade_keys.clone(),
+        realm(),
+    )
+    .await?;
+    ensure!(ready.view().verified().ready_digest() == &first_ready_digest);
+    let one_replica_offline_deploy = true;
+
+    let v13_lifecycle_preserved = read_lifecycle_row(
+        &session,
+        &upgrade_keys,
+        historical.slot(),
+    )
+    .await?
+        == historical_row;
+    ensure!(v13_lifecycle_preserved);
+    let v13_representative_rows_preserved =
+        read_historical_representative_rows(&session, &upgrade_keys).await?
+            == representative;
+    ensure!(v13_representative_rows_preserved);
+
+    compose(
+        Path::new(&compose_file),
+        &["start", "scylla3"],
+        "restart third replica after v14 lifecycle",
+    )?;
+    wait_up(3).await?;
+    let repair_started = Instant::now();
+    docker_exec(
+        NODE_CONTAINERS[0],
+        &["nodetool", "cluster", "repair", V14_UPGRADE],
+        "repair v14 representative data",
+    )?;
+    for node in NODE_CONTAINERS {
+        docker_exec(
+            node,
+            &["nodetool", "repair", "-pr", &no_tablet(V14_UPGRADE)],
+            "repair v14 lifecycle/control",
+        )?;
+        docker_exec(
+            node,
+            &["nodetool", "flush", V14_UPGRADE],
+            "flush v14 representative data",
+        )?;
+        docker_exec(
+            node,
+            &["nodetool", "flush", &no_tablet(V14_UPGRADE)],
+            "flush v14 lifecycle/control",
+        )?;
+        docker_exec(
+            node,
+            &["nodetool", "compact", V14_UPGRADE],
+            "compact v14 representative data",
+        )?;
+        docker_exec(
+            node,
+            &["nodetool", "compact", &no_tablet(V14_UPGRADE)],
+            "compact v14 lifecycle/control",
+        )?;
+    }
+    let repair_ms = repair_started.elapsed().as_millis() as u64;
+
+    let mut datasets = Vec::new();
+    let mut direct_one_nodes = 0;
+    for ip in NODE_IPS {
+        let local = connect(Some(ip), Consistency::One).await?;
+        ensure!(matches!(
+            PendingQueueSidecarSchemaMaterializer::inspect_schema(
+                &local,
+                &upgrade_keys,
+            )
+            .await?,
+            PendingQueueSidecarSchemaInspection::Exact { fingerprint }
+                if fingerprint == physical.fingerprint()
+        ));
+        datasets.push(V13V14DirectDataset {
+            historical_v13_lifecycle: read_lifecycle_row(
+                &local,
+                &upgrade_keys,
+                historical.slot(),
+            )
+            .await?,
+            current_v14_lifecycle: read_lifecycle_row(
+                &local,
+                &upgrade_keys,
+                current_slot.as_bytes(),
+            )
+            .await?,
+            representative: read_historical_representative_rows(
+                &local,
+                &upgrade_keys,
+            )
+            .await?,
+        });
+        direct_one_nodes += 1;
+    }
+    let direct_one_equal = datasets.windows(2).all(|pair| pair[0] == pair[1]);
+    ensure!(direct_one_equal);
+    let direct_one_dataset_digest = hex::encode(Sha256::digest(
+        serde_json::to_vec(
+            datasets
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("missing direct-ONE dataset"))?,
+        )?,
+    ));
+    let direct_one_table_names = vec![
+        PENDING_QUEUE_SIDECAR_LIFECYCLE_TABLE.to_owned(),
+        PendingQueueSidecarPhysicalTable::Pipeline
+            .table_name()
+            .to_owned(),
+        PendingQueueSidecarPhysicalTable::RealmApplicationArchiveHeader
+            .table_name()
+            .to_owned(),
+        PendingQueueSidecarPhysicalTable::RealmApplicationArchiveFragment
+            .table_name()
+            .to_owned(),
+        PendingQueueSidecarPhysicalTable::RealmGenerationTerminalIntent
+            .table_name()
+            .to_owned(),
+        PendingQueueSidecarPhysicalTable::RealmDeferredCarryover
+            .table_name()
+            .to_owned(),
+    ];
+    let control_targets = PendingQueueSidecarPhysicalTable::ALL
+        .iter()
+        .filter(|table| {
+            table.keyspace_kind()
+                == PendingQueueSidecarKeyspaceKind::NoTabletControl
+        })
+        .count();
+    let data_targets = PendingQueueSidecarPhysicalTable::ALL.len() - control_targets;
+    let same_physical_shape = current_physical_schema_matches_historical_v13()
+        && PENDING_QUEUE_SIDECAR_TARGET_TABLE_COUNT == 20
+        && PENDING_QUEUE_SIDECAR_EXPECTED_COLUMNS.len() == 102
+        && control_targets == 16
+        && data_targets == 4;
+    ensure!(same_physical_shape);
+    let representative_rows_preserved_and_current_manifest_unchanged = same_physical_shape
+        && v13_lifecycle_preserved
+        && v13_representative_rows_preserved;
+    ensure!(representative_rows_preserved_and_current_manifest_unchanged);
+    let direct_one_row_count = datasets
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("missing direct-ONE dataset"))?
+        .row_count();
+
+    let report = H23c4c4b4c2aReport {
+        image: IMAGE,
+        replication_factor: 3,
+        historical_schema_version: 13,
+        current_schema_version: PENDING_QUEUE_SIDECAR_SCHEMA_VERSION,
+        target_tables: PENDING_QUEUE_SIDECAR_TARGET_TABLE_COUNT,
+        lifecycle_tables: 1,
+        control_targets,
+        data_targets,
+        expected_columns: PENDING_QUEUE_SIDECAR_EXPECTED_COLUMNS.len(),
+        historical_schema_fingerprint: hex::encode(
+            historical_v13_schema_fingerprint().as_bytes(),
+        ),
+        current_schema_fingerprint: hex::encode(
+            pending_queue_sidecar_schema_fingerprint().as_bytes(),
+        ),
+        same_physical_shape,
+        v13_verified_rejected_for_v14,
+        v13_payload_rejected_by_v14_decoder,
+        v14_slot_differs_from_v13,
+        v14_deploy_idempotent,
+        different_current_rejected,
+        v13_lifecycle_preserved,
+        v13_representative_rows_preserved,
+        one_replica_offline_deploy,
+        caller_discard_retry,
+        socket_response_loss_injected: false,
+        representative_rows_preserved_and_current_manifest_unchanged,
+        repair_flush_compact: true,
+        repair_ms,
+        direct_one_nodes,
+        direct_one_table_count: direct_one_table_names.len(),
+        direct_one_table_names,
+        direct_one_row_count,
+        direct_one_dataset_digest,
+        direct_one_equal,
+        sidecar_v14_rf3: true,
+        deferred_input_rf3: false,
+        production_terminal_transition: false,
+        production_pipeline_rotation: false,
+        production_writer_integrated: false,
+        authority_head_publish_integrated: false,
+        full_node_restart_tested: false,
+        production_serving: false,
+        h8_domains_closed: 0,
+        h8_domains_total: 22,
+        qualification: "H23C4C4B4C2A_SIDECAR_V14_RF3_PASSED",
+    };
+    let report_path = std::env::var("PSY_D04B6H23C4C4B4C2A_REPORT_PATH")?;
     std::fs::write(&report_path, serde_json::to_vec_pretty(&report)?)?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
